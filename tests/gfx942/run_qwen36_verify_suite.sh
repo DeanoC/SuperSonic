@@ -11,6 +11,7 @@ REPEATS="${REPEATS:-3}"
 TIMEOUT="${TIMEOUT:-900}"
 PG19_SOURCE="${PG19_SOURCE:-synthetic}"
 OUT="${OUT:-target/qwen36_verify_results.json}"
+MOE_ISLAND_CAP_EXPERTS="${MOE_ISLAND_CAP_EXPERTS:-}"
 if [[ -z "${PYTHON_BIN:-}" ]]; then
   if [[ -x ".venv-verify/bin/python" ]]; then
     PYTHON_BIN=".venv-verify/bin/python"
@@ -20,6 +21,11 @@ if [[ -z "${PYTHON_BIN:-}" ]]; then
 fi
 
 cargo build --release --bin supersonic
+
+extra_args=()
+if [[ -n "${MOE_ISLAND_CAP_EXPERTS}" ]]; then
+  extra_args+=(--moe-island-cap-experts "${MOE_ISLAND_CAP_EXPERTS}")
+fi
 
 "${PYTHON_BIN}" oracle/qwen36_verify_suite.py \
   --binary "${BINARY}" \
@@ -33,4 +39,5 @@ cargo build --release --bin supersonic
   --timeout "${TIMEOUT}" \
   --pg19-source "${PG19_SOURCE}" \
   --emit-stage-timings \
-  --out "${OUT}"
+  --out "${OUT}" \
+  "${extra_args[@]}"

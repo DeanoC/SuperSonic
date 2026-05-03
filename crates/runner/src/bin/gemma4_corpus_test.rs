@@ -110,8 +110,6 @@ struct ExpectedEntry {
     prompt_token_ids: Option<Vec<u32>>,
     #[serde(default)]
     expected_generated_token_ids: Option<Vec<u32>>,
-    #[serde(default)]
-    expect_error: bool,
     max_new_tokens: usize,
 }
 

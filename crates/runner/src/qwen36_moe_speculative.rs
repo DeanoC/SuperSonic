@@ -57,6 +57,7 @@
 //!   MTP path matches byte-for-byte (Phase 6.2c.x parity tests).
 //! - `tests/fixtures/qwen36_moe/mtp_vllm_reference.json` — vLLM cross-
 //!   check confirms our drafts match `vllm.spec_decode.eagle.propose`.
+#![allow(dead_code)]
 
 /// Outcome of greedy-speculative accept-prefix logic.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -408,14 +409,12 @@ where
     //   call to `base_step`.
 
     let mut emitted: Vec<u32> = Vec::with_capacity(num_drafts + 1);
-    let mut last_final_hidden: Vec<u8> = h_base_in.to_vec();
     let mut input = first_token_id;
 
     for k in 0..num_drafts {
         let pos = base_position + (k as i32);
         let (predicted, fh) = base_step(pos, input)
             .with_context(|| format!("speculative: base verify k={k} pos={pos}"))?;
-        last_final_hidden = fh;
         if predicted == drafts[k] {
             // Accept drafts[k]. Carry forward as next iter's input.
             emitted.push(drafts[k]);
@@ -426,7 +425,7 @@ where
             return Ok(SpeculativeStepResult {
                 emitted_tokens: emitted,
                 n_accepted: k,
-                final_hidden_bytes: last_final_hidden,
+                final_hidden_bytes: fh,
             });
         }
     }

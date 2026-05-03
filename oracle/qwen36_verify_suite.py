@@ -328,6 +328,27 @@ def parse_stage_timings(output: str) -> dict[str, float]:
     return out
 
 
+def load_vmm_residency(path: Path) -> dict[str, Any]:
+    payload = json.loads(path.read_text())
+    summary = payload.get("summary") or {}
+    keys = [
+        "decode_path",
+        "max_resident_pages",
+        "final_resident_pages",
+        "peak_resident_pages",
+        "peak_resident_bytes",
+        "moe_resident_bytes",
+        "moe_reserved_bytes",
+        "kv_layers",
+        "kv_resident_bytes",
+        "kv_reserved_bytes",
+        "total_vmm_resident_bytes",
+        "total_vmm_reserved_bytes",
+        "total_vmm_logical_resident_bytes",
+    ]
+    return {k: summary[k] for k in keys if k in summary}
+
+
 def run_once(
     args: argparse.Namespace,
     case: Case,
@@ -341,10 +362,17 @@ def run_once(
     # bit-identity check below diff's their SHA256s.
     logits = tmp / f"{case.case_id}_{mode}_{decode_path}_{repeat_idx}_logits.bin"
     hidden = tmp / f"{case.case_id}_{mode}_{decode_path}_{repeat_idx}_hidden.bin"
+    vmm_telemetry = tmp / f"{case.case_id}_{mode}_{decode_path}_{repeat_idx}_vmm.json"
     env = os.environ.copy()
     env["SUPERSONIC_QWEN36_DUMP_LOGITS"] = str(logits)
     env["SUPERSONIC_QWEN36_DUMP_FINAL_HIDDEN"] = str(hidden)
     env.setdefault("SUPERSONIC_BACKENDS", args.backend)
+    moe_island_cap = getattr(args, "moe_island_cap_experts", None)
+    collect_vmm_telemetry = moe_island_cap is not None and mode == "int4"
+    if collect_vmm_telemetry:
+        env["SUPERSONIC_VMM_MOE_ISLANDS"] = "1"
+        env["SUPERSONIC_MOE_ISLAND_CAP_EXPERTS"] = str(moe_island_cap)
+        env["SUPERSONIC_MOE_ISLAND_TELEMETRY_JSON"] = str(vmm_telemetry)
 
     cmd = [
         str(args.binary),
@@ -400,6 +428,7 @@ def run_once(
             "wall_seconds": wall,
             "generated_ids": parse_generated_ids(output),
             "stage": parse_stage_timings(output),
+            "vmm_residency": load_vmm_residency(vmm_telemetry) if vmm_telemetry.exists() else None,
             "stdout_tail": stdout[-1200:],
             "stderr_tail": stderr[-1200:],
             "error": f"supersonic timed out after {args.timeout}s",
@@ -414,6 +443,7 @@ def run_once(
         "wall_seconds": wall,
         "generated_ids": parse_generated_ids(output),
         "stage": parse_stage_timings(output),
+        "vmm_residency": load_vmm_residency(vmm_telemetry) if vmm_telemetry.exists() else None,
         "stdout_tail": proc.stdout[-1200:],
         "stderr_tail": proc.stderr[-1200:],
     }
@@ -452,6 +482,29 @@ def _stage_mean(rows: list[dict[str, Any]], key: str) -> float | None:
     return statistics.mean(vals) if vals else None
 
 
+def _vmm_values(rows: list[dict[str, Any]], key: str) -> list[float]:
+    vals: list[float] = []
+    for row in rows:
+        residency = row.get("vmm_residency")
+        if not isinstance(residency, dict) or key not in residency:
+            continue
+        try:
+            vals.append(float(residency[key]))
+        except (TypeError, ValueError):
+            pass
+    return vals
+
+
+def _vmm_mean(rows: list[dict[str, Any]], key: str) -> float | None:
+    vals = _vmm_values(rows, key)
+    return statistics.mean(vals) if vals else None
+
+
+def _vmm_max(rows: list[dict[str, Any]], key: str) -> float | None:
+    vals = _vmm_values(rows, key)
+    return max(vals) if vals else None
+
+
 def summarize_case(case: Case, runs: list[dict[str, Any]]) -> dict[str, Any]:
     # Two-axis grouping: cell = (mode × decode_path). Each cell gets its
     # own determinism + perf stats. The `chained_vs_persistent` block
@@ -488,6 +541,11 @@ def summarize_case(case: Case, runs: list[dict[str, Any]]) -> dict[str, Any]:
             "wall_seconds_mean": statistics.mean(wall) if wall else None,
             "chain_ms_avg_mean": _stage_mean(ok_rows, "chain_ms_avg"),
             "total_ms_avg_mean": _stage_mean(ok_rows, "total_ms_avg"),
+            "vmm_total_resident_bytes_mean": _vmm_mean(ok_rows, "total_vmm_resident_bytes"),
+            "vmm_total_resident_bytes_max": _vmm_max(ok_rows, "total_vmm_resident_bytes"),
+            "vmm_total_reserved_bytes_mean": _vmm_mean(ok_rows, "total_vmm_reserved_bytes"),
+            "vmm_moe_resident_bytes_mean": _vmm_mean(ok_rows, "moe_resident_bytes"),
+            "vmm_kv_resident_bytes_mean": _vmm_mean(ok_rows, "kv_resident_bytes"),
             "errors": [r.get("error") for r in rows if r.get("error") or r.get("returncode") != 0],
         }
         summary["modes"][cell] = cell_summary
@@ -634,6 +692,14 @@ def main() -> int:
     parser.add_argument("--out", type=Path, default=Path("qwen36_verify_results.json"))
     parser.add_argument("--tmp-dir", type=Path)
     parser.add_argument("--emit-stage-timings", action="store_true")
+    parser.add_argument(
+        "--moe-island-cap-experts",
+        type=int,
+        help=(
+            "enable sparse INT4 MoE island residency with the given expert cap "
+            "and fold the runner's VMM telemetry JSON into each run/summary"
+        ),
+    )
     parser.add_argument("--fail-on-nondeterminism", action="store_true", default=True)
     parser.add_argument("--no-fail-on-nondeterminism", dest="fail_on_nondeterminism", action="store_false")
     parser.add_argument("--continue-on-error", action="store_true")
@@ -700,7 +766,8 @@ def main() -> int:
                             f"  {cell_label:<18} repeat={repeat_idx} {status} "
                             f"ids={row.get('generated_ids')} "
                             f"logits={str(row.get('logits_sha256', ''))[:12]} "
-                            f"zero={(row.get('logits_stats') or {}).get('all_zero')}",
+                            f"zero={(row.get('logits_stats') or {}).get('all_zero')} "
+                            f"vmm_resident={((row.get('vmm_residency') or {}).get('total_vmm_resident_bytes'))}",
                             flush=True,
                         )
                         if status != "ok" and not args.continue_on_error:
@@ -708,10 +775,12 @@ def main() -> int:
             case_summary = summarize_case(case, case_runs)
             summary.append(case_summary)
             for cell, row in case_summary["modes"].items():
+                vmm_resident = row.get("vmm_total_resident_bytes_mean")
                 print(
                     f"  summary {cell:<18} logits_det={row['deterministic_logits']} "
                     f"hidden_det={row['deterministic_hidden']} ids_det={row['deterministic_generated_ids']} "
-                    f"all_zero={row['any_all_zero_logits']}",
+                    f"all_zero={row['any_all_zero_logits']} "
+                    f"vmm_resident_mean={vmm_resident}",
                     flush=True,
                 )
             cvp = case_summary.get("chained_vs_persistent")
@@ -744,6 +813,7 @@ def main() -> int:
             "decode_paths": decode_paths,
             "repeats": args.repeats,
             "max_new_tokens": args.max_new_tokens,
+            "moe_island_cap_experts": args.moe_island_cap_experts,
             "summary": summary,
             "runs": all_runs,
         }

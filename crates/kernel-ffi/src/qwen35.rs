@@ -157,6 +157,7 @@ unsafe extern "C" {
         out: *mut c_void,
     ) -> c_int;
 
+    #[cfg(supersonic_backend_hip)]
     fn supersonic_query_gpu_info(
         device_ordinal: c_int,
         arch_name_out: *mut u8,
@@ -256,6 +257,7 @@ fn backend_error(backend: Backend, what: &str, status: c_int) -> GpuError {
     }
 }
 
+#[cfg(supersonic_backend_hip)]
 fn ffi_error(msg: String) -> GpuError {
     match gpu_hal::current_backend() {
         Backend::Hip => GpuError::backend(Backend::Hip, msg),
@@ -1009,7 +1011,7 @@ pub fn metal_lm_head_argmax_bf16(
 pub fn metal_lm_head_argmax_bf16_into(
     hidden: &GpuBuffer,
     weight: &GpuBuffer,
-    mut out_index: &mut GpuBuffer,
+    out_index: &mut GpuBuffer,
     hidden_dim: usize,
     vocab_size: usize,
 ) -> Result<(), GpuError> {
@@ -1056,9 +1058,9 @@ pub fn metal_lm_head_argmax_bf16_into(
 pub fn metal_lm_head_argmax_bf16_with_partials_into(
     hidden: &GpuBuffer,
     weight: &GpuBuffer,
-    mut partial_values: &mut GpuBuffer,
-    mut partial_indices: &mut GpuBuffer,
-    mut out_index: &mut GpuBuffer,
+    partial_values: &mut GpuBuffer,
+    partial_indices: &mut GpuBuffer,
+    out_index: &mut GpuBuffer,
     hidden_dim: usize,
     vocab_size: usize,
 ) -> Result<(), GpuError> {
@@ -1130,7 +1132,7 @@ pub fn metal_lm_head_argmax_bf16_with_partials_into(
 
 pub fn metal_argmax_bf16_into(
     logits: &GpuBuffer,
-    mut out_index: &mut GpuBuffer,
+    out_index: &mut GpuBuffer,
     n: usize,
 ) -> Result<(), GpuError> {
     if logits.backend() != Backend::Metal || out_index.backend() != Backend::Metal {

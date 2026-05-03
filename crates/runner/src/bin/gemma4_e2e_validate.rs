@@ -1562,11 +1562,9 @@ fn run_prefill(
     // Final norm + lm_head + softcap on the last-position hidden only.
     let last_byte_off = (seq_len - 1) * hidden_size * 2;
     let mut last_hidden = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
-    unsafe {
-        let src_ptr = h_running.offset_ptr(last_byte_off);
-        gpu_hal::copy_d2d(0, last_hidden.as_mut_ptr(), src_ptr, hidden_size * 2)
-            .map_err(|e| anyhow!("copy last hidden: {e}"))?;
-    }
+    let src_ptr = h_running.offset_ptr(last_byte_off);
+    gpu_hal::copy_d2d(0, last_hidden.as_mut_ptr(), src_ptr, hidden_size * 2)
+        .map_err(|e| anyhow!("copy last hidden: {e}"))?;
 
     let mut post_norm = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
     g4::rms_norm(

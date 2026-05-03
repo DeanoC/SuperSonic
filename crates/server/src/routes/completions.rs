@@ -1,17 +1,17 @@
 //! `POST /v1/completions` — raw text prompt, no chat template.
 
-use std::convert::Infallible;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::State;
-use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::sse::{KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use futures::stream::Stream;
 
+use super::sse;
 use crate::errors::ApiError;
-use crate::generate::{self, GenEvent, GenParams};
+use crate::generate::{self, GenParams};
+use crate::ids;
 use crate::schemas::{
     CompletionChoice, CompletionRequest, CompletionResponse, CompletionStreamChoice,
     CompletionStreamChunk, Usage,
@@ -42,8 +42,8 @@ pub async fn completions(
     let prompt_ids = generate::prepare(&state, &prompt, add_special_tokens, params.max_tokens)
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
 
-    let id = make_id();
-    let created = epoch_secs();
+    let id = ids::completion_id();
+    let created = ids::epoch_secs();
     let model = state.model_id.clone();
 
     if req.stream {
@@ -79,66 +79,38 @@ pub async fn completions(
 }
 
 fn completion_sse_stream(
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<GenEvent>,
+    rx: tokio::sync::mpsc::UnboundedReceiver<generate::GenEvent>,
     id: String,
     created: u64,
     model: String,
-) -> impl Stream<Item = Result<Event, Infallible>> {
-    async_stream::stream! {
-        while let Some(ev) = rx.recv().await {
-            match ev {
-                GenEvent::Token(text) => {
-                    let chunk = CompletionStreamChunk {
-                        id: id.clone(),
-                        object: "text_completion",
-                        created,
-                        model: model.clone(),
-                        choices: vec![CompletionStreamChoice {
-                            text,
-                            index: 0,
-                            logprobs: None,
-                            finish_reason: None,
-                        }],
-                    };
-                    yield Ok::<_, Infallible>(Event::default().data(serde_json::to_string(&chunk).unwrap()));
-                }
-                GenEvent::Done { reason, .. } => {
-                    let chunk = CompletionStreamChunk {
-                        id: id.clone(),
-                        object: "text_completion",
-                        created,
-                        model: model.clone(),
-                        choices: vec![CompletionStreamChoice {
-                            text: String::new(),
-                            index: 0,
-                            logprobs: None,
-                            finish_reason: Some(reason.as_str()),
-                        }],
-                    };
-                    yield Ok(Event::default().data(serde_json::to_string(&chunk).unwrap()));
-                    yield Ok(Event::default().data("[DONE]"));
-                    return;
-                }
-                GenEvent::Error(msg) => {
-                    let payload = serde_json::json!({
-                        "error": { "message": msg, "type": "internal_error" }
-                    });
-                    yield Ok(Event::default().data(payload.to_string()));
-                    return;
-                }
-            }
-        }
-    }
-}
-
-fn make_id() -> String {
-    let ts = epoch_secs();
-    format!("cmpl-{ts:x}{:04x}", rand::random::<u16>())
-}
-
-fn epoch_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+) -> impl Stream<Item = sse::SseEvent> {
+    let token_id = id.clone();
+    let token_model = model.clone();
+    sse::generation_events(
+        rx,
+        move |text| CompletionStreamChunk {
+            id: token_id.clone(),
+            object: "text_completion",
+            created,
+            model: token_model.clone(),
+            choices: vec![CompletionStreamChoice {
+                text,
+                index: 0,
+                logprobs: None,
+                finish_reason: None,
+            }],
+        },
+        move |reason| CompletionStreamChunk {
+            id: id.clone(),
+            object: "text_completion",
+            created,
+            model: model.clone(),
+            choices: vec![CompletionStreamChoice {
+                text: String::new(),
+                index: 0,
+                logprobs: None,
+                finish_reason: Some(reason.as_str()),
+            }],
+        },
+    )
 }

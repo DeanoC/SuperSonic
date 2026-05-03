@@ -11,6 +11,7 @@
 //!
 //! The engine does not load any oracle state — `prefill` builds the caches
 //! entirely from the provided prompt token IDs.
+#![allow(dead_code)]
 
 use std::ffi::{c_int, c_void};
 use std::fs::File;
@@ -1741,11 +1742,9 @@ impl Gemma4Engine {
         // Last-position hidden → final norm + lm_head + softcap.
         let last_byte_off = (seq_len - 1) * hidden_size * 2;
         let mut last_hidden = GpuBuffer::zeros(device, dtype, &[hidden_size])?;
-        unsafe {
-            let src_ptr = h_running.offset_ptr(last_byte_off);
-            gpu_hal::copy_d2d(device, last_hidden.as_mut_ptr(), src_ptr, hidden_size * 2)
-                .map_err(|e| anyhow!("copy last hidden: {e}"))?;
-        }
+        let src_ptr = h_running.offset_ptr(last_byte_off);
+        gpu_hal::copy_d2d(device, last_hidden.as_mut_ptr(), src_ptr, hidden_size * 2)
+            .map_err(|e| anyhow!("copy last hidden: {e}"))?;
         let mut post_norm = GpuBuffer::zeros(device, dtype, &[hidden_size])?;
         g4::rms_norm(
             device,
@@ -2156,11 +2155,9 @@ impl Gemma4Engine {
         for seq in 0..b {
             let row_off_bytes = seq * hidden_size * 2;
             let mut seq_hidden = GpuBuffer::zeros(device, dtype, &[hidden_size])?;
-            unsafe {
-                let src_ptr = hidden_io.offset_ptr(row_off_bytes);
-                gpu_hal::copy_d2d(device, seq_hidden.as_mut_ptr(), src_ptr, hidden_size * 2)
-                    .map_err(|e| anyhow!("copy seq {seq} hidden: {e}"))?;
-            }
+            let src_ptr = hidden_io.offset_ptr(row_off_bytes);
+            gpu_hal::copy_d2d(device, seq_hidden.as_mut_ptr(), src_ptr, hidden_size * 2)
+                .map_err(|e| anyhow!("copy seq {seq} hidden: {e}"))?;
             let mut post_norm = GpuBuffer::zeros(device, dtype, &[hidden_size])?;
             g4::rms_norm(
                 device,

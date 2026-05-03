@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::env;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};

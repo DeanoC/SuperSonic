@@ -14,6 +14,7 @@
 //! Public API mirrors `Gemma4Engine`: `load`, `prefill(&[u32]) -> logits`,
 //! `decode_step(token, pos) -> logits`, `greedy_sample`. Intended to be a
 //! drop-in for `run_gemma4` when `--int4` is set.
+#![allow(dead_code)]
 
 use std::ffi::{c_int, c_void};
 use std::path::{Path, PathBuf};
@@ -441,8 +442,10 @@ pub struct Gemma4Int4Engine {
     // `load()`. Shared-KV layers alias their source layer's K/V cache
     // pointers so the megakernel sees a single coherent cache buffer for
     // the source→shared dependency (identical aliasing as BF16 megakernel).
+    #[allow(dead_code)]
     layer_descs: Vec<Gemma4DecodeLayerDesc>,
     layers_gpu: GpuBuffer,
+    #[allow(dead_code)]
     int4_scale_descs: Vec<Gemma4Int4ScaleDesc>,
     int4_scales_gpu: GpuBuffer,
 }
@@ -1888,11 +1891,9 @@ impl Gemma4Int4Engine {
         for seq in 0..b {
             let row_off_bytes = seq * hidden_size * 2;
             let mut seq_hidden = GpuBuffer::zeros(device, dtype, &[hidden_size])?;
-            unsafe {
-                let src_ptr = hidden_io.offset_ptr(row_off_bytes);
-                gpu_hal::copy_d2d(device, seq_hidden.as_mut_ptr(), src_ptr, hidden_size * 2)
-                    .map_err(|e| anyhow!("int4 copy seq {seq} hidden: {e}"))?;
-            }
+            let src_ptr = hidden_io.offset_ptr(row_off_bytes);
+            gpu_hal::copy_d2d(device, seq_hidden.as_mut_ptr(), src_ptr, hidden_size * 2)
+                .map_err(|e| anyhow!("int4 copy seq {seq} hidden: {e}"))?;
             let mut post_norm = GpuBuffer::zeros(device, dtype, &[hidden_size])?;
             g4::rms_norm(
                 device,

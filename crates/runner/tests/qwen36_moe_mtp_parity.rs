@@ -1171,10 +1171,8 @@ fn qwen36_moe_speculative_driver_batched_reject_at_last_index() {
     // Post-fix: n_accepted=0 != K → no bonus, emitted=[bad_pred].
     let bad_pred_k1: u32 = 7777;
     let synth_fh_k1 = synth_fh.clone();
-    let mut k1_calls = 0usize;
     let base_step_k1 = move |inputs: &[(i32, u32)]| -> anyhow::Result<Vec<(u32, Vec<u8>)>> {
         assert_eq!(inputs.len(), 2, "K=1 → K+1=2 verify inputs");
-        k1_calls += 1;
         // K+1 = 2 predictions: index 0 mismatches drafts[0],
         // index 1 (bonus) is filler — must NOT appear in emitted.
         Ok(vec![

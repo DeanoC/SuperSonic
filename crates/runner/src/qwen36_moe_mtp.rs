@@ -20,6 +20,7 @@
 //! and produces the next draft token. Nothing in the production decode
 //! path calls this module today — wiring lands in the speculative driver
 //! (Phase 6.3).
+#![allow(dead_code)]
 
 use anyhow::{anyhow, Context, Result};
 use gpu_hal::{copy_d2d, copy_d2h, GpuBuffer, ScalarType};

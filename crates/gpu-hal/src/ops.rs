@@ -6,9 +6,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
-use crate::backend::{
-    current_backend, current_strategy_for, AllocStrategy, Backend, BufferKind, DeviceInfo,
-};
+#[cfg(supersonic_backend_hip)]
+use crate::backend::AllocStrategy;
+use crate::backend::{current_backend, current_strategy_for, Backend, BufferKind, DeviceInfo};
 #[cfg(supersonic_backend_cuda)]
 use crate::cuda_sys::*;
 use crate::error::{backend_error, GpuError, Result};
@@ -316,6 +316,7 @@ pub(crate) enum AllocatorKind {
     /// path, and weights are write-once-from-baker / read-many-from-decode
     /// so coherence buys nothing). The pointer addresses system RAM directly.
     /// Free with `hipHostFree(host_ptr)`.
+    #[allow(dead_code)]
     UnifiedHost { host_ptr: NonNull<c_void> },
 }
 
@@ -342,6 +343,7 @@ pub(crate) fn alloc(
     if len_bytes == 0 {
         return Err(GpuError::InvalidArg("allocation size must be > 0".into()));
     }
+    #[allow(unused_variables)]
     let strategy = current_strategy_for(kind);
     hal_profile_time("alloc", len_bytes, || {
         let backend = current_backend();

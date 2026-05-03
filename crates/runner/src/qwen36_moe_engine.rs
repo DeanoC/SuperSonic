@@ -1284,11 +1284,25 @@ impl MoeSparseTelemetry {
         }));
     }
 
-    fn write_json(&self, manager: &MoeExpertResidencyManager, generated_ids: &[u32]) -> Result<()> {
+    fn write_json(
+        &self,
+        manager: &MoeExpertResidencyManager,
+        virtual_kv_stats: VirtualKvStats,
+        generated_ids: &[u32],
+    ) -> Result<()> {
         let Some(path) = self.dump_path.as_ref() else {
             return Ok(());
         };
         let final_snapshot = MoeSparseTelemetrySnapshot::capture(manager);
+        let total_vmm_logical_bytes =
+            final_snapshot.arena.logical_bytes + virtual_kv_stats.logical_bytes;
+        let total_vmm_logical_resident_bytes =
+            final_snapshot.arena.logical_resident_bytes + virtual_kv_stats.logical_resident_bytes;
+        let total_vmm_resident_bytes =
+            final_snapshot.arena.resident_bytes + virtual_kv_stats.resident_bytes;
+        let total_vmm_reserved_bytes =
+            final_snapshot.arena.reserved_bytes + virtual_kv_stats.reserved_bytes;
+        let total_vmm_mappings = final_snapshot.arena.mapping_count + virtual_kv_stats.mappings;
         let payload = serde_json::json!({
             "schema": "supersonic-qwen36-moe-sparse-vmm-telemetry-v1",
             "summary": {
@@ -1305,6 +1319,22 @@ impl MoeSparseTelemetry {
                 "peak_logical_resident_bytes": self.peak_logical_resident_bytes,
                 "reserved_bytes": final_snapshot.arena.reserved_bytes,
                 "logical_bytes": final_snapshot.arena.logical_bytes,
+                "moe_logical_bytes": final_snapshot.arena.logical_bytes,
+                "moe_logical_resident_bytes": final_snapshot.arena.logical_resident_bytes,
+                "moe_resident_bytes": final_snapshot.arena.resident_bytes,
+                "moe_reserved_bytes": final_snapshot.arena.reserved_bytes,
+                "moe_mappings": final_snapshot.arena.mapping_count,
+                "kv_layers": virtual_kv_stats.layers,
+                "kv_mappings": virtual_kv_stats.mappings,
+                "kv_logical_bytes": virtual_kv_stats.logical_bytes,
+                "kv_logical_resident_bytes": virtual_kv_stats.logical_resident_bytes,
+                "kv_resident_bytes": virtual_kv_stats.resident_bytes,
+                "kv_reserved_bytes": virtual_kv_stats.reserved_bytes,
+                "total_vmm_logical_bytes": total_vmm_logical_bytes,
+                "total_vmm_logical_resident_bytes": total_vmm_logical_resident_bytes,
+                "total_vmm_resident_bytes": total_vmm_resident_bytes,
+                "total_vmm_reserved_bytes": total_vmm_reserved_bytes,
+                "total_vmm_mappings": total_vmm_mappings,
                 "hits": final_snapshot.stats.hits,
                 "misses": final_snapshot.stats.misses,
                 "page_hits": final_snapshot.stats.page_hits,
@@ -3262,13 +3292,16 @@ fn decode_text(
     if let Some(manager) = _moe_expert_residency.as_ref() {
         let residency = manager.stats();
         let arena = manager.arena().stats();
+        let total_resident_bytes = arena.resident_bytes + virtual_kv_stats.resident_bytes;
+        let total_reserved_bytes = arena.reserved_bytes + virtual_kv_stats.reserved_bytes;
         if let Some(telemetry) = moe_sparse_telemetry.as_ref() {
             println!(
                 "  [vmm] MoE island residency: resident_slices={} peak_slices={} \
                  resident_pages={} peak_pages={} page_backed_slices={} \
                  hits={} misses={} page_hits={} page_misses={} evicted_slices={} evicted_pages={} \
                  uploaded={:.2}MiB unmapped={:.2}MiB \
-                 resident={:.2}MiB peak_resident={:.2}MiB reserved={:.2}MiB",
+                 resident={:.2}MiB peak_resident={:.2}MiB reserved={:.2}MiB \
+                 kv_resident={:.2}MiB total_vmm_resident={:.2}MiB total_vmm_reserved={:.2}MiB",
                 residency.resident_slices,
                 telemetry.peak_resident_slices,
                 residency.resident_pages,
@@ -3285,14 +3318,18 @@ fn decode_text(
                 arena.resident_bytes as f64 / MIB,
                 telemetry.peak_resident_bytes as f64 / MIB,
                 arena.reserved_bytes as f64 / MIB,
+                virtual_kv_stats.resident_bytes as f64 / MIB,
+                total_resident_bytes as f64 / MIB,
+                total_reserved_bytes as f64 / MIB,
             );
-            telemetry.write_json(manager, &generated_ids)?;
+            telemetry.write_json(manager, virtual_kv_stats, &generated_ids)?;
         } else {
             println!(
                 "  [vmm] MoE island residency: resident_slices={} resident_pages={} \
                  page_backed_slices={} hits={} misses={} page_hits={} page_misses={} \
                  evicted_slices={} evicted_pages={} uploaded={:.2}MiB unmapped={:.2}MiB \
-                 resident={:.2}MiB reserved={:.2}MiB",
+                 resident={:.2}MiB reserved={:.2}MiB kv_resident={:.2}MiB \
+                 total_vmm_resident={:.2}MiB total_vmm_reserved={:.2}MiB",
                 residency.resident_slices,
                 residency.resident_pages,
                 residency.page_backed_slices,
@@ -3306,6 +3343,9 @@ fn decode_text(
                 residency.unmapped_bytes as f64 / MIB,
                 arena.resident_bytes as f64 / MIB,
                 arena.reserved_bytes as f64 / MIB,
+                virtual_kv_stats.resident_bytes as f64 / MIB,
+                total_resident_bytes as f64 / MIB,
+                total_reserved_bytes as f64 / MIB,
             );
         }
     }
