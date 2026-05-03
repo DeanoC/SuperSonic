@@ -296,12 +296,13 @@ extern "C" {
         num_layers: c_int,
         layers: *const Qwen36MoeDecodeLayerDesc,
         int4_scales: *const Qwen36MoeInt4ScaleDesc,
-        // Null when KV-FP8 is off. Otherwise an array of `num_layers`
-        // entries parallel to `layers`; full-attention layers populate
-        // `kv_scale_k` / `kv_scale_v`, linear-attention layers leave
-        // both null. The kernel ignores entries whose `kv_scale_k` is
-        // null even on full-attn layers (defensive — should not happen
-        // in practice).
+        // Null when KV-FP8 is off globally. Otherwise an array of
+        // `num_layers` entries parallel to `layers`. Full-attention
+        // layers populate `kv_scale_k` / `kv_scale_v` together (both
+        // set, or both null to disable KV-FP8 for that layer specifically
+        // — a valid mixed-mode configuration). Linear-attention layers
+        // must leave both null. The bridge validates these invariants
+        // and rejects malformed descriptors before kernel launch.
         kv_fp8_descs: *const Qwen36MoeKVCacheFp8Desc,
         hidden: c_int,
         num_heads: c_int,
@@ -1928,6 +1929,14 @@ mod tests {
         assert!(
             int4_sz >= 192 && int4_sz <= 256,
             "Qwen36MoeInt4ScaleDesc size drift: got {int4_sz} bytes",
+        );
+
+        // Two raw pointers — pinned to match the C++ static_assert in
+        // kernels/qwen36_moe_bridge.cpp.
+        let kv_fp8_sz = size_of::<Qwen36MoeKVCacheFp8Desc>();
+        assert_eq!(
+            kv_fp8_sz, 16,
+            "Qwen36MoeKVCacheFp8Desc size drift: got {kv_fp8_sz} bytes (expected 16)",
         );
     }
 
