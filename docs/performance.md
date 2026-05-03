@@ -11,8 +11,7 @@ issue with your GPU arch, ROCm/CUDA versions, and the exact command line.
 
 Discrete dGPU; 96 CUs, RDNA3 WMMA. The full quant matrix (BF16, INT4 GPTQ,
 FP8 runtime, FP8 KV cache) is supported across every shipping model on
-this arch. Measurements recorded 2026-04-30 at the
-[`gemma4-fp8-runtime`](https://github.com/DeanoC/SuperSonic/pull/51) merge,
+this arch. Measurements last refreshed 2026-05-03 (was 2026-04-30 at the gemma4-fp8-runtime merge),
 6-token prompt, 16-token generation, single sequence, `--batch-size 1`.
 Each cell is `ms/step` from the runner's `[result] ms_per_step=N` /
 `ms_per_tok=N` line after one warm-up run; reproduce with
@@ -20,13 +19,14 @@ Each cell is `ms/step` from the runner's `[result] ms_per_step=N` /
 
 | Model           | BF16  | INT4  | FP8r  | KV-FP8 |
 |-----------------|------:|------:|------:|-------:|
-| qwen3.5-0.8b    |   8   |  10   |  10   |   85¹  |
-| qwen3.5-2b      |  11   |  11   |  15   |  126¹  |
-| qwen3.5-4b      |  21   |  15   |  30   |  223¹  |
-| qwen3.5-9b      |  32   |  26   |  48   |  347¹  |
-| gemma4-e2b      |  33   |  36   |  40   |   33   |
-| gemma4-e4b      |  54   |  51   |  66   |   52   |
-| phi4-mini       |  38.5 |  40.2 |  45.9 |   78.0 |
+| qwen3.5-0.8b    |   8   |  10   |  10   |   83¹  |
+| qwen3.5-2b      |  11   |  10   |  28   |  122¹  |
+| qwen3.5-4b      |  20   |  15   |  61   |  220¹  |
+| qwen3.5-9b      |  32   |  26   |  89   |  462¹  |
+| gemma4-e2b      |  31   |  30   |  35   |   29   |
+| gemma4-e4b      |  47   |  51   |  60   |   47   |
+| phi4-mini       |  38.2 |  39.7 |  53.1 |   78.0 |
+| qwen3.6-35b-a3b |   —²  |  28.3 |   —²  |   28.5 |
 
 ¹ Qwen 3.5 `--kv-fp8` falls back to a *replayed-prefill* decode path
 ("`single-sequence CUDA KV-FP8 uses replayed GPU prefill for
@@ -36,6 +36,12 @@ self-consistent. KV-FP8 on Qwen is currently a memory feature
 (headroom for longer contexts), not a throughput feature. Gemma 4 's
 `--kv-fp8` is wired into the persistent kernel directly and is
 ~free vs BF16.
+
+² qwen3.6-35b-a3b doesn't ship a BF16 lane (the source FP8 weights would
+  expand to ~70 GiB which exceeds 24 GiB), and FP8 runtime isn't wired
+  for the MoE family. INT4-GPTQ is the only viable lane on gfx1100 for
+  this model. The dedicated [Qwen3.6-MoE on gfx1100](#qwen36-moe-on-gfx1100)
+  section below has the per-stage breakdown.
 
 ### Translated to tokens/sec
 
@@ -717,15 +723,39 @@ and validated for correctness but the perf measurement script hasn't
 landed. Open an issue with reproduction notes if you want to fill one
 in.
 
-| Feature | Canonical workload | Baseline | With feature | Source |
-|---|---|---|---|---|
-| KV-FP8 | qwen3.5-9b INT4 + 1024-token prompt + 16 generated tokens, gfx1100 | ~26 ms/step | ~22 ms/step (15% lower) | tests/gfx1100/bench_matrix.sh |
-| KV-FP8 sidecar window | qwen3.6-35b-a3b INT4 + 4096-token context | TBM ms/step | TBM ms/step | (script TBM) |
-| VMM | qwen3.6-35b-a3b INT4 + 8192-token context, gfx1100 | OOM (24 GiB exceeded) | runs | tests/gfx1100/bench_qwen36_sparse_caps.py |
-| SpecPrefill (keep=0.50) | qwen3.5-9b BF16 + ~225-token prompt, gfx1100 | ~270 ms prefill | TBM ms prefill (speculator amortizes ~700 ms; net win is prompt-length-dependent) | crates/runner/tests/specprefill_qwen35_9b_parity.rs |
-| DFlash (B=3) | qwen3.5-9b INT4 greedy decode, gfx1100 | ~32 ms/step | ~12 ms/step (effective; 2.5–3× speedup) | docs/dflash.md M4.3 numbers |
-| MoE prefetch | qwen3.6-35b-a3b INT4 decode, gfx1100 | TBM ms/step | TBM ms/step | (script TBM) |
-| Certified KV (shadow-validate) | llama3.1-8b INT8 + 1024-token prompt, sm86 | TBM ms/step | TBM ms/step | (script TBM) |
+| Feature | Canonical workload | Baseline | With feature | Delta | Source |
+|---|---|---|---|---|---|
+| KV-FP8 | qwen3.5-9b INT4 + 6-token prompt + 16 generated tokens, gfx1100 | 26 ms/step | 462 ms/step¹ | 17.7× SLOWER (decode replay-prefill path) | tests/gfx1100/bench_matrix.sh, 2026-05-03 v2 |
+| KV-FP8 | qwen3.6-35b-a3b INT4 + 6-token prompt + 16 generated tokens, gfx1100 | 28.3 ms/step | 28.5 ms/step | +0.7% (effectively free; the win is VRAM headroom for long contexts) | manual run, 2026-05-03 |
+| KV-FP8 sidecar window | qwen3.6-35b-a3b INT4 + 22-token context (test prompt + 16 gen) | 28.5 ms/step | 28.5 ms/step | identical at this context length (window=256 covers all 22 tokens; the BF16 sidecar is the win at LONG contexts not measured here) | manual run, 2026-05-03 |
+| VMM | qwen3.6-35b-a3b INT4 + 8192-token context, gfx1100 | OOM (24 GiB exceeded) | runs | enables the workload | tests/gfx1100/bench_qwen36_sparse_caps.py |
+| SpecPrefill (keep=0.50) | qwen3.5-9b BF16 + 1353-token prompt, gfx1100 | 5057 ms TTFT | 5729 ms speculator + 2010 ms target prefill = 7739 ms TTFT | **1.53× SLOWER**² | manual run, 2026-05-03 |
+| SpecPrefill (keep=0.30) | qwen3.5-9b BF16 + 1353-token prompt, gfx1100 | 5057 ms TTFT | 5743 ms speculator + 1301 ms target prefill = 7044 ms TTFT | **1.39× SLOWER**² | manual run, 2026-05-03 |
+| SpecPrefill + KV-FP8 | qwen3.5-9b BF16 + KV-FP8 + 1353-token prompt | — | runtime error³ | **BROKEN** | manual run, 2026-05-03 |
+| DFlash (B=3) | qwen3.5-9b INT4 greedy decode, gfx1100 | ~32 ms/step | ~12 ms/step (effective; 2.5-3× speedup) | 2.5-3× FASTER | docs/dflash.md M4.3 numbers |
+| MoE prefetch | qwen3.6-35b-a3b INT4 decode, gfx1100 | included | (default-on) | — | the 28.3 ms/step row above already includes prefetch — the persistent megakernel default path uses it. A/B vs no-prefetch needs `--no-persistent-decode` which falls back to a different decode path entirely. |
+| Certified KV (shadow-validate) | llama3.1-8b INT8 + 1024-token prompt, sm86 | TBM ms/step | TBM ms/step | TBM | (script TBM, sm86-only — not measurable on a HIP-only dev box) |
+
+¹ Qwen3.5 KV-FP8 falls back to the *replayed-prefill* decode path (see
+  the gfx1100 main matrix's footnote on KV-FP8). The decode kernel itself
+  is fine; the slow column is the per-step prefill replay needed to keep
+  the FP8 KV cache self-consistent. KV-FP8 on Qwen3.5 is currently a
+  memory feature (headroom for longer contexts), not a throughput feature.
+
+² SpecPrefill on gfx1100 is currently NET SLOWER than dense prefill at
+  measured prompt lengths because the speculator's lookahead decode
+  routes through the component decode path (per-head D2D K/V copy
+  fallback added in PR #177) instead of the persistent megakernel.
+  Speculator overhead at 1353 tokens is ~5.7s, eclipsing the savings on
+  the reduced target prefill. Correctness is validated; the speedup is
+  a Phase D follow-up. See `project_specprefill_phase_d_followups.md` in
+  memory for the fix path.
+
+³ SpecPrefill + KV-FP8 combo trips a runtime error on the first decode
+  step: `certified KV BF16 step copy expects BF16 buffers, got src BF16/BF16
+  dst U8/U8`. The PR #177 fallback assumes BF16 dst; FP8 (U8) destination
+  isn't handled. Validation should reject the combo until the fallback
+  grows an FP8-quantising path.
 
 The DFlash numbers are pulled from [dflash.md](dflash.md)'s M4.3
 single-pass fused-verify section. The KV-FP8 number is the gfx1100
