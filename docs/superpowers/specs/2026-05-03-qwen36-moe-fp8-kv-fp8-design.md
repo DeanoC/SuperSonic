@@ -146,8 +146,9 @@ Following `crates/qwen35/src/state.rs` and `qwen35_vmm_smoke.rs`:
   as decode advances.
 - Scale buffers and BF16 sidecars stay as dense `GpuBuffer`s for v1
   (small footprint, no growth pattern, no eviction value).
-- Gate path on `SUPERSONIC_VMM_KV` env var, default 0 for v1; flip
-  default to 1 once the KV-FP8 path is green on gfx1100 + gfx942 in CI.
+- Gate path on `SUPERSONIC_VMM_KV` env var. HIP auto-enables when the
+  variable is unset and VMM support probes successfully; `0` disables and
+  `1` forces/request on any backend. CUDA still requires the explicit opt-in.
 - `lowlevel-memory.md` is updated to remove "FP8-KV disabled" from the
   Qwen3.6-MoE row.
 

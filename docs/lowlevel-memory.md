@@ -32,8 +32,8 @@ Current scope:
 
 - Decode-active VMM is enabled internally for Qwen3.5 BF16 dense KV, for
   Qwen3.6-MoE INT4 routed expert slabs when the VMM expert mode is active,
-  and for Qwen3.6-MoE full-attention KV (BF16 or FP8, opt-in via
-  `SUPERSONIC_VMM_KV=1`).
+  and for Qwen3.6-MoE full-attention KV (BF16 or FP8; default on HIP when
+  VMM is supported, opt-in on CUDA via `SUPERSONIC_VMM_KV=1`).
 - Disabled for certified-KV, batch decode, Qwen3.5 4B/component decode,
   DFlash cloned states, Gemma4, and Llama3.1. Qwen3.5 KV-FP8 also remains
   disabled — enabling it is a separate effort.
@@ -98,9 +98,9 @@ Current scope:
 - `SUPERSONIC_MOE_ISLAND_CAP_EXPERTS=N` switches Qwen3.6-MoE INT4 decode from
   fully resident virtual expert slabs to sparse router-prefetched islands with
   at most `N` experts' two routed projections tracked resident at once.
-- `SUPERSONIC_VMM_KV=0` disables the Qwen3.5 integration.
-- `SUPERSONIC_VMM_KV=1` requests it and logs if the backend cannot support it.
-  HIP may auto-enable when unset; CUDA requires this explicit opt-in.
+- `SUPERSONIC_VMM_KV=0` disables the Qwen3.5 and Qwen3.6 KV integrations.
+- `SUPERSONIC_VMM_KV=1` requests KV VMM and logs if the backend cannot support
+  it. HIP may auto-enable when unset; CUDA requires this explicit opt-in.
 - `SUPERSONIC_VMM_KV_EVICT_AFTER_PREFILL=1` backs virtual KV to host RAM after
   prefill, unmaps the device pages, reports zero resident bytes, then restores
   decode state before decode. By default this uses a compact logical-prefix

@@ -1,8 +1,9 @@
 //! VMM-backed vs dense BF16 KV bit-exact smoke for Qwen3.6-35B-A3B.
 //!
-//! Same prompt, same args, run twice via the supersonic binary: once
-//! with SUPERSONIC_VMM_KV=1, once with SUPERSONIC_VMM_KV=0. Last-step
-//! logits must be bit-exact because VMM changes only the cache backing.
+//! Same prompt, same args, run via the supersonic binary with dense KV
+//! (`SUPERSONIC_VMM_KV=0`), forced VMM (`SUPERSONIC_VMM_KV=1`), and HIP
+//! default VMM (`SUPERSONIC_VMM_KV` unset). Last-step logits must be
+//! bit-exact because VMM changes only the cache backing.
 //!
 //! Skipped silently when:
 //!  - HIP backend is not compiled
@@ -25,6 +26,7 @@ fn run_supersonic_capture_logits(
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_supersonic"));
     cmd.args(args);
     cmd.arg("--dump-last-logits");
+    cmd.env_remove("SUPERSONIC_VMM_KV");
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
@@ -92,6 +94,7 @@ fn qwen36_moe_bf16_kv_vmm_dense_bit_exact() {
         run_supersonic_capture_logits(&args, &[("SUPERSONIC_VMM_KV", "0")]).expect("dense decode");
     let vmm =
         run_supersonic_capture_logits(&args, &[("SUPERSONIC_VMM_KV", "1")]).expect("vmm decode");
+    let auto_vmm = run_supersonic_capture_logits(&args, &[]).expect("auto vmm decode");
 
     assert!(
         vmm.combined_output
@@ -99,16 +102,35 @@ fn qwen36_moe_bf16_kv_vmm_dense_bit_exact() {
         "VMM run did not report Qwen3.6 BF16 KV VMM activation:\n{}",
         vmm.combined_output
     );
+    assert!(
+        auto_vmm
+            .combined_output
+            .contains("[vmm] Qwen3.6-MoE BF16 KV active"),
+        "unset-env HIP run did not auto-enable Qwen3.6 BF16 KV VMM:\n{}",
+        auto_vmm.combined_output
+    );
     assert_eq!(
         dense.logits.len(),
         vmm.logits.len(),
         "logits length mismatch"
+    );
+    assert_eq!(
+        dense.logits.len(),
+        auto_vmm.logits.len(),
+        "auto-vmm logits length mismatch"
     );
     for (i, (a, b)) in dense.logits.iter().zip(&vmm.logits).enumerate() {
         assert_eq!(
             a.to_bits(),
             b.to_bits(),
             "VMM-backed BF16 KV logits diverged at index {i}: dense={a} vmm={b}",
+        );
+    }
+    for (i, (a, b)) in dense.logits.iter().zip(&auto_vmm.logits).enumerate() {
+        assert_eq!(
+            a.to_bits(),
+            b.to_bits(),
+            "auto VMM-backed BF16 KV logits diverged at index {i}: dense={a} auto_vmm={b}",
         );
     }
 }
