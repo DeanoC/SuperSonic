@@ -905,7 +905,7 @@ fn main() -> Result<()> {
     // Run before family dispatch so DFlash flags are not silently ignored by
     // non-Qwen branches.
     validate_dflash_flags(&cli, &model_variant)?;
-    validate_specprefill_flags(&cli, &model_variant)?;
+    validate_specprefill_flags(&cli, &model_variant, backend)?;
 
     match model_variant.family() {
         ModelFamily::Gemma4 => return run_gemma4(&cli, &model_variant, entry, ordinal, total_vram),

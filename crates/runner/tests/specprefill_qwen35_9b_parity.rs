@@ -184,6 +184,8 @@ fn run_parity_check(
     // ~225-token paraphrase of the Phase A2 prompt-1 content.
     let prompt = "The transformer architecture has revolutionized natural language processing through its self-attention mechanism, allowing models to weigh the importance of different parts of the input sequence dynamically. Unlike recurrent networks, transformers can process all tokens in parallel during training, making them highly efficient on modern accelerator hardware. The attention computation involves three projections — query, key, and value — followed by a softmax-normalized dot product that produces a weighted combination of value vectors. Multi-head attention extends this by performing several attention operations in parallel across different learned subspaces, then concatenating and projecting the results. Feed-forward networks between attention layers introduce non-linearity. Residual connections and layer normalization stabilize gradients during training. The overall result is";
     let common: Vec<&str> = vec![
+        "--backend",
+        "hip",
         "--model",
         "qwen3.5-9b",
         "--model-dir",
@@ -277,6 +279,8 @@ fn specprefill_qwen35_9b_keep_100_multitoken_identity() {
     };
     let prompt = "The transformer architecture has revolutionized natural language processing through its self-attention mechanism, allowing models to weigh the importance of different parts of the input sequence dynamically. Unlike recurrent networks, transformers can process all tokens in parallel during training, making them highly efficient on modern accelerator hardware. The attention computation involves three projections — query, key, and value — followed by a softmax-normalized dot product that produces a weighted combination of value vectors. Multi-head attention extends this by performing several attention operations in parallel across different learned subspaces, then concatenating and projecting the results. Feed-forward networks between attention layers introduce non-linearity. Residual connections and layer normalization stabilize gradients during training. The overall result is";
     let common: Vec<&str> = vec![
+        "--backend",
+        "hip",
         "--model",
         "qwen3.5-9b",
         "--model-dir",

@@ -85,6 +85,7 @@ pub(crate) fn validate_dflash_flags(cli: &Cli, model_variant: &ModelVariant) -> 
 pub(crate) fn validate_specprefill_flags(
     cli: &Cli,
     model_variant: &ModelVariant,
+    backend: Backend,
 ) -> Result<()> {
     let any_specprefill_flag = cli.specprefill_draft_dir.is_some()
         || cli.specprefill_unload_draft
@@ -95,6 +96,12 @@ pub(crate) fn validate_specprefill_flags(
         || cli.specprefill_always_keep_prefix.is_some()
         || cli.specprefill_always_keep_suffix.is_some();
     if cli.specprefill_draft_dir.is_some() {
+        if backend != Backend::Hip {
+            anyhow::bail!(
+                "SpecPrefill is HIP-only in Phase C (got backend={backend:?}). Re-run with \
+                 `--backend hip` or omit --specprefill-draft-dir to use the dense path."
+            );
+        }
         if !matches!(model_variant, ModelVariant::Qwen3_5_9B) {
             anyhow::bail!(
                 "--specprefill-draft-dir is only supported on --model qwen3.5-9b in Phase C \
