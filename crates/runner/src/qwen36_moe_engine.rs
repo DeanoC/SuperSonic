@@ -25,6 +25,7 @@ use crate::qwen36_moe_dry_run::{print_report, run_qwen36_moe_dry_run, DryRunRepo
 use crate::qwen36_moe_geom::build_multi_layer_geom;
 use crate::qwen36_moe_host::lookup_embed_row;
 use crate::qwen36_moe_lm_head::{launch_lm_head_from_final_hidden_bytes, LmHeadBuffers};
+use crate::qwen36_moe_loop::Qwen36DecodeLoopState;
 use crate::qwen36_moe_output::{
     dump_final_hidden_if_requested, dump_logits_if_requested, print_decode_stream_start,
     print_decoded_token, print_generation_summary, print_last_logits_if_requested,
@@ -253,17 +254,7 @@ fn decode_text(
 
     print_decode_stream_start(tokenizer.as_ref(), &prompt_ids, max_new);
 
-    let mut generated_ids: Vec<u32> = Vec::with_capacity(max_new);
-    // Track the BF16 logits bytes from the last decode step for --dump-last-logits.
-    let mut last_logits_bytes: Vec<u8> = Vec::new();
-    let mut current_token: u32 = prompt_ids[0];
-    let mut position: i32 = 0;
-    // Standard prefill+generate shape: feed prompt[0..N-1] as prefill (logits
-    // discarded), then prompt[N-1] is the first forward whose logits we
-    // sample. Subsequent gen steps feed the just-sampled token. Total
-    // forwards = (prompt_len - 1) prefill + max_new generation = prompt_len
-    // + max_new - 1.
-    let total_steps = prompt_ids.len() + max_new - 1;
+    let mut loop_state = Qwen36DecodeLoopState::new(&prompt_ids, max_new);
     let mut rng = XorshiftRng::new(sampling.seed);
     print_sampling_summary(sampling);
 
@@ -283,7 +274,7 @@ fn decode_text(
         moe_runtime.transition_min_observations,
     );
 
-    for step in 0..total_steps {
+    for step in 0..loop_state.total_steps {
         // When speculative decode is on, each iteration can commit
         // multiple tokens (up to K+1), so the standard `total_steps =
         // prompt_len + max_new - 1` count over-shoots. Break here once
@@ -292,7 +283,7 @@ fn decode_text(
         // `kv_max_t = prompt_len + max_new` (status 120). Plain decode
         // stays bit-identical because it always emits exactly one
         // token per iteration.
-        if generated_ids.len() >= max_new {
+        if loop_state.reached_max_new() {
             break;
         }
         // Embed lookup for the current token.
@@ -300,10 +291,15 @@ fn decode_text(
         let initial_hidden = lookup_embed_row(
             &store,
             weight_prefix,
-            current_token as usize,
+            loop_state.current_token as usize,
             geom.hidden as usize,
         )
-        .with_context(|| format!("embed lookup token {current_token} (step {step})"))?;
+        .with_context(|| {
+            format!(
+                "embed lookup token {} (step {step})",
+                loop_state.current_token
+            )
+        })?;
         let t_embed_step = t0.elapsed();
 
         // Run the chain. Linear-attn state mutates in `layers` in place.
@@ -375,20 +371,24 @@ fn decode_text(
                     .run_sparse_with_expert_prefetch(
                         ordinal,
                         &initial_hidden,
-                        position,
+                        loop_state.position,
                         &mut prefetch,
                     )
                     .with_context(|| {
                         format!(
-                            "segmented persistent sparse decode (step {step}, position {position})"
+                            "segmented persistent sparse decode (step {step}, position {})",
+                            loop_state.position
                         )
                     })?
             } else {
                 lm_head_folded = fold.is_some();
                 scratch
-                    .run(ordinal, &initial_hidden, position, fold)
+                    .run(ordinal, &initial_hidden, loop_state.position, fold)
                     .with_context(|| {
-                        format!("persistent decode (step {step}, position {position})")
+                        format!(
+                            "persistent decode (step {step}, position {})",
+                            loop_state.position
+                        )
                     })?
             }
         } else {
@@ -421,7 +421,7 @@ fn decode_text(
                     &geom,
                     &mut layers,
                     &initial_hidden,
-                    position,
+                    loop_state.position,
                     emit_stage_timings,
                     &mut prefetch,
                 )
@@ -431,11 +431,16 @@ fn decode_text(
                     &geom,
                     &mut layers,
                     &initial_hidden,
-                    position,
+                    loop_state.position,
                     emit_stage_timings,
                 )
             }
-            .with_context(|| format!("chained decode (step {step}, position {position})"))?
+            .with_context(|| {
+                format!(
+                    "chained decode (step {step}, position {})",
+                    loop_state.position
+                )
+            })?
         };
         moe_routes.advance(track_moe_routes, next_moe_topk_by_layer);
         if let (Some(telemetry), Some(before), Some(manager)) = (
@@ -444,10 +449,10 @@ fn decode_text(
             _moe_expert_residency.as_ref(),
         ) {
             let after = MoeSparseTelemetrySnapshot::capture(manager);
-            telemetry.record_step(step, position, is_gen_step, before, after);
+            telemetry.record_step(step, loop_state.position, is_gen_step, before, after);
         }
         let t_chain_step = t1.elapsed();
-        position += 1;
+        loop_state.position += 1;
 
         // KV-FP8 sidecar descriptors stay fixed across decode. The
         // persistent kernel computes the rolling covered range from
@@ -456,12 +461,12 @@ fn decode_text(
 
         // Prefill steps: feed the next prompt token without computing logits.
         if step + 1 < prompt_ids.len() {
-            current_token = prompt_ids[step + 1];
+            loop_state.current_token = prompt_ids[step + 1];
             continue;
         }
 
         // Optional dump for the host-side post-chain debug harness.
-        dump_final_hidden_if_requested(step, position, &outputs.final_hidden_bytes)?;
+        dump_final_hidden_if_requested(step, loop_state.position, &outputs.final_hidden_bytes)?;
 
         // Generation step: when the megakernel didn't fold lm_head
         // (chained path), launch the standalone final RMSnorm +
@@ -489,7 +494,7 @@ fn decode_text(
             .context("standalone GPU lm_head")?
         };
         if dump_last_logits {
-            last_logits_bytes.clone_from(&logits);
+            loop_state.record_last_logits(&logits);
         }
         let t_lm_head_step = t2.elapsed();
         dump_logits_if_requested(step, &logits)?;
@@ -502,7 +507,7 @@ fn decode_text(
             &mut rng,
         );
         let t_sample_step = t3.elapsed();
-        generated_ids.push(next_token);
+        loop_state.generated_ids.push(next_token);
 
         // Stream-decode and print.
         let t4 = std::time::Instant::now();
@@ -522,7 +527,7 @@ fn decode_text(
         if Some(next_token) == eos_id {
             break;
         }
-        current_token = next_token;
+        loop_state.current_token = next_token;
 
         // Phase 6.3d: speculative extension. After the regular sample,
         // try to commit additional tokens via MTP draft chain +
@@ -542,7 +547,7 @@ fn decode_text(
             mtp_chain_scratch.as_mut(),
             embed_w_buf.as_ref(),
         ) {
-            if generated_ids.len() >= max_new {
+            if loop_state.reached_max_new() {
                 break;
             }
             // Cap K to the remaining max_new headroom so the verify
@@ -552,7 +557,7 @@ fn decode_text(
             // available draft count is `headroom - 1`. If headroom <=
             // 1 we can still emit 1 token via the K=0 fallback; if
             // headroom == 0 we already broke out above.
-            let headroom = max_new - generated_ids.len();
+            let headroom = loop_state.remaining_generation_slots();
             let dynamic_k = QWEN36_NUM_SPECULATIVE_TOKENS.min(headroom.saturating_sub(1));
             let h_base = outputs.final_hidden_bytes.clone();
             // P2: thread spec-verify timings into the engine-level
@@ -585,7 +590,7 @@ fn decode_text(
                     &lm_head_w_buf,
                     &h_base,
                     next_token,
-                    position,
+                    loop_state.position,
                     dynamic_k,
                     |inputs| -> anyhow::Result<Vec<(u32, Vec<u8>)>> {
                         let n = inputs.len();
@@ -678,12 +683,13 @@ fn decode_text(
                 if r.n_accepted < dynamic_k {
                     restore_linear_attn_state(ordinal, &mut layers, snapshot)
                         .context("restore linear-attn state after partial-accept")?;
-                    // Replay (j+1) chains: first_token at `position`,
-                    // then the j accepted drafts at `position+1..position+j`.
+                    // Replay (j+1) chains: first_token at the current
+                    // position, then the j accepted drafts at the
+                    // following positions.
                     let mut replay: Vec<(i32, u32)> = Vec::with_capacity(r.n_accepted + 1);
-                    replay.push((position, next_token));
+                    replay.push((loop_state.position, next_token));
                     for (i, &tok) in r.emitted_tokens.iter().take(r.n_accepted).enumerate() {
-                        replay.push((position + 1 + i as i32, tok));
+                        replay.push((loop_state.position + 1 + i as i32, tok));
                     }
                     for &(pos, input) in &replay {
                         let t_embed_start = std::time::Instant::now();
@@ -730,7 +736,7 @@ fn decode_text(
                     &lm_head_w_buf,
                     &h_base,
                     next_token,
-                    position,
+                    loop_state.position,
                     dynamic_k,
                     |pos, input| -> anyhow::Result<(u32, Vec<u8>)> {
                         // Embed lookup is its own stage in the timing
@@ -799,11 +805,11 @@ fn decode_text(
             // breaking out cleanly mid-emission.
             let mut hit_stop = false;
             for tok in result.emitted_tokens.iter().copied() {
-                if generated_ids.len() >= max_new {
+                if loop_state.reached_max_new() {
                     hit_stop = true;
                     break;
                 }
-                generated_ids.push(tok);
+                loop_state.generated_ids.push(tok);
                 print_decoded_token(tokenizer.as_ref(), tok);
                 if Some(tok) == eos_id {
                     hit_stop = true;
@@ -811,24 +817,24 @@ fn decode_text(
                 }
             }
             std::io::stdout().flush().ok();
-            position += result.emitted_tokens.len() as i32;
+            loop_state.position += result.emitted_tokens.len() as i32;
             if hit_stop {
                 break;
             }
-            current_token = *result
+            loop_state.current_token = *result
                 .emitted_tokens
                 .last()
                 .expect("speculative step must emit at least one token (K=0 fallback ensured)");
         }
     }
 
-    print_last_logits_if_requested(dump_last_logits, &last_logits_bytes);
-    print_generation_summary(&generated_ids, prompt_ids.len(), eos_id);
+    print_last_logits_if_requested(dump_last_logits, &loop_state.last_logits_bytes);
+    print_generation_summary(&loop_state.generated_ids, prompt_ids.len(), eos_id);
     if let Some(manager) = _moe_expert_residency.as_ref() {
         print_and_write_moe_residency_summary(
             manager,
             virtual_kv_stats,
-            &generated_ids,
+            &loop_state.generated_ids,
             moe_routes.route_telemetry.as_ref(),
             moe_runtime.sparse_telemetry.as_ref(),
         )?;
