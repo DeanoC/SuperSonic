@@ -42,8 +42,7 @@ use crate::qwen36_moe_speculative::{
 };
 use crate::qwen36_moe_state::{refresh_linear_attn_state, restore_linear_attn_state};
 use crate::qwen36_moe_telemetry::{
-    print_and_write_moe_residency_summary, MoeRouteTelemetry, MoeSparseTelemetrySnapshot,
-    MoeTransitionPredictor,
+    print_and_write_moe_residency_summary, MoeRouteRuntime, MoeSparseTelemetrySnapshot,
 };
 use crate::qwen36_moe_timing::{Qwen36StageTimingTotals, SamplingParams};
 use crate::qwen36_moe_vmm::{
@@ -314,21 +313,13 @@ fn decode_text(
     // is a real GPU+sync measurement. CPU-side stages (embed lookup, lm_head
     // GEMV, sampling, detokenize) are pure host work.
     let mut stage_timings = Qwen36StageTimingTotals::default();
-    let mut previous_moe_topk_by_layer: Vec<Vec<usize>> =
-        vec![Vec::new(); geom.num_layers as usize];
-    let mut moe_route_telemetry = moe_runtime
-        .sparse_requested
-        .then(|| MoeRouteTelemetry::new(geom.top_k as usize));
-    let mut moe_transition_predictors =
-        moe_runtime.prefetch_mode.transition_weighted().then(|| {
-            vec![
-                MoeTransitionPredictor::new(
-                    geom.top_k as usize,
-                    moe_runtime.transition_min_observations,
-                );
-                geom.num_layers as usize
-            ]
-        });
+    let mut moe_routes = MoeRouteRuntime::new(
+        geom.num_layers as usize,
+        geom.top_k as usize,
+        moe_runtime.sparse_requested,
+        moe_runtime.prefetch_mode,
+        moe_runtime.transition_min_observations,
+    );
 
     for step in 0..total_steps {
         // When speculative decode is on, each iteration can commit
@@ -389,13 +380,8 @@ fn decode_text(
         let moe_telemetry_before = _moe_expert_residency
             .as_ref()
             .map(MoeSparseTelemetrySnapshot::capture);
-        let track_moe_routes =
-            moe_runtime.prefetch_mode.uses_previous_token_routes() || moe_route_telemetry.is_some();
-        let mut next_moe_topk_by_layer = if track_moe_routes {
-            previous_moe_topk_by_layer.clone()
-        } else {
-            Vec::new()
-        };
+        let track_moe_routes = moe_routes.should_track_routes(moe_runtime.prefetch_mode);
+        let mut next_moe_topk_by_layer = moe_routes.next_topk_buffer(track_moe_routes);
         let outputs = if let Some(scratch) = persistent_scratch.as_mut() {
             if let Some(manager) = _moe_expert_residency.as_mut() {
                 // Sparse VMM needs a host remap point after each layer's
@@ -413,11 +399,11 @@ fn decode_text(
                         &store,
                         moe_runtime.prefetch_mode,
                         moe_runtime.prefetch_ranks,
-                        &previous_moe_topk_by_layer,
+                        &moe_routes.previous_topk_by_layer,
                         &mut next_moe_topk_by_layer,
                         track_moe_routes,
-                        moe_route_telemetry.as_mut(),
-                        moe_transition_predictors.as_deref_mut(),
+                        moe_routes.route_telemetry.as_mut(),
+                        moe_routes.transition_predictors.as_deref_mut(),
                         phase,
                         layer_idx,
                         routes,
@@ -458,11 +444,11 @@ fn decode_text(
                         &store,
                         moe_runtime.prefetch_mode,
                         moe_runtime.prefetch_ranks,
-                        &previous_moe_topk_by_layer,
+                        &moe_routes.previous_topk_by_layer,
                         &mut next_moe_topk_by_layer,
                         track_moe_routes,
-                        moe_route_telemetry.as_mut(),
-                        moe_transition_predictors.as_deref_mut(),
+                        moe_routes.route_telemetry.as_mut(),
+                        moe_routes.transition_predictors.as_deref_mut(),
                         phase,
                         layer_idx,
                         routes,
@@ -489,9 +475,7 @@ fn decode_text(
             }
             .with_context(|| format!("chained decode (step {step}, position {position})"))?
         };
-        if track_moe_routes {
-            previous_moe_topk_by_layer = next_moe_topk_by_layer;
-        }
+        moe_routes.advance(track_moe_routes, next_moe_topk_by_layer);
         if let (Some(telemetry), Some(before), Some(manager)) = (
             moe_runtime.sparse_telemetry.as_mut(),
             moe_telemetry_before,
@@ -883,7 +867,7 @@ fn decode_text(
             manager,
             virtual_kv_stats,
             &generated_ids,
-            moe_route_telemetry.as_ref(),
+            moe_routes.route_telemetry.as_ref(),
             moe_runtime.sparse_telemetry.as_ref(),
         )?;
     }

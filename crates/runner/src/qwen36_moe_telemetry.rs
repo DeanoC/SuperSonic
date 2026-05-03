@@ -394,6 +394,50 @@ impl MoeTransitionPredictor {
     }
 }
 
+pub(crate) struct MoeRouteRuntime {
+    pub(crate) previous_topk_by_layer: Vec<Vec<usize>>,
+    pub(crate) route_telemetry: Option<MoeRouteTelemetry>,
+    pub(crate) transition_predictors: Option<Vec<MoeTransitionPredictor>>,
+}
+
+impl MoeRouteRuntime {
+    pub(crate) fn new(
+        num_layers: usize,
+        top_k: usize,
+        sparse_moe_requested: bool,
+        prefetch_mode: MoeIslandPrefetchMode,
+        transition_min_observations: u32,
+    ) -> Self {
+        let route_telemetry = sparse_moe_requested.then(|| MoeRouteTelemetry::new(top_k));
+        let transition_predictors = prefetch_mode.transition_weighted().then(|| {
+            vec![MoeTransitionPredictor::new(top_k, transition_min_observations); num_layers]
+        });
+        Self {
+            previous_topk_by_layer: vec![Vec::new(); num_layers],
+            route_telemetry,
+            transition_predictors,
+        }
+    }
+
+    pub(crate) fn should_track_routes(&self, prefetch_mode: MoeIslandPrefetchMode) -> bool {
+        prefetch_mode.uses_previous_token_routes() || self.route_telemetry.is_some()
+    }
+
+    pub(crate) fn next_topk_buffer(&self, track_routes: bool) -> Vec<Vec<usize>> {
+        if track_routes {
+            self.previous_topk_by_layer.clone()
+        } else {
+            Vec::new()
+        }
+    }
+
+    pub(crate) fn advance(&mut self, track_routes: bool, next_topk_by_layer: Vec<Vec<usize>>) {
+        if track_routes {
+            self.previous_topk_by_layer = next_topk_by_layer;
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct VirtualKvStats {
     pub(crate) layers: usize,
