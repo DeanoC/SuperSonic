@@ -60,6 +60,7 @@ pub struct MoeExpertResidencyStats {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct MoeExpertTensorReservation {
     pub allocation_id: usize,
     pub ptr: *const c_void,
@@ -128,6 +129,7 @@ impl MoeExpertResidencyManager {
         &self.arena
     }
 
+    #[allow(dead_code)]
     pub fn arena_mut(&mut self) -> &mut VirtualArena {
         &mut self.arena
     }
@@ -213,6 +215,7 @@ impl MoeExpertResidencyManager {
         })
     }
 
+    #[allow(dead_code)]
     pub fn is_resident(&self, key: MoeExpertKey) -> bool {
         self.resident.contains_key(&key)
     }
