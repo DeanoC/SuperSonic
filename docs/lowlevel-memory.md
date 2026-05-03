@@ -112,6 +112,10 @@ Current scope:
   the missing pages, the runtime records `prefetch_skipped` counters and leaves
   resident demand pages untouched. This is a measurement hook for future
   overlapped prefetch work, not a default path.
+- `SUPERSONIC_MOE_ISLAND_PREFETCH=previous-token-resident` is the conservative
+  variant: it only refreshes the previous-token expert pair when both routed
+  projections are already resident. It never uploads missing pages, so it can
+  measure LRU refresh value without changing residency admission.
 - `SUPERSONIC_VMM_KV=0` disables the Qwen3.5 and Qwen3.6 KV integrations.
 - `SUPERSONIC_VMM_KV=1` requests KV VMM and logs if the backend cannot support
   it. HIP may auto-enable when unset; CUDA requires this explicit opt-in.

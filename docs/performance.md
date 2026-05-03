@@ -285,6 +285,9 @@ the miss rate substantially.
 The sweep helper can also compare previous-token prefetch policies in one run:
 add `--prefetch-rank-sweep none,1,2,4,all` to expand every sparse cap across
 no lookahead, rank-limited lookahead, and full top-k lookahead rows.
+Use `--prefetch previous-token-resident --prefetch-ranks 1` to isolate LRU
+refresh of already resident previous-token routes without uploading missing
+pages.
 
 **Sparse MoE previous-token prefetch sweep** — measured 2026-05-03 after
 non-evicting prefetch admission landed. Same host/GPU/model/prompt as above,
@@ -296,13 +299,17 @@ no warmup:
 | dense | 28.73 | 34.81 | 15.04 | - | - | - | - | - | - | - | - | yes |
 | cap320-none | 108.66 | 9.20 | 1.29 | disabled | 0 | 8357 | 0 | 0 | 52.4% | 52.3% | 7717 | yes |
 | cap320-r1 | 119.62 | 8.36 | 1.29 | previous-token | 1 | 9815 | 0 | 616 | 42.6% | 52.3% | 9175 | yes |
+| cap320-r1-resident | 116.18 | 8.61 | 1.29 | previous-token-resident | 1 | 9752 | 0 | 0 | 43.9% | 52.3% | 9112 | yes |
 | cap320-r2 | 131.78 | 7.59 | 1.29 | previous-token | 2 | 11190 | 0 | 2196 | 25.8% | 52.3% | 10550 | yes |
 | cap320-r4 | 140.39 | 7.12 | 1.29 | previous-token | 4 | 12310 | 0 | 5511 | 9.5% | 52.3% | 11670 | yes |
 | cap320-all | 147.75 | 6.77 | 1.29 | previous-token | 8 | 12927 | 0 | 11961 | 0.6% | 52.3% | 12287 | yes |
 
 Non-evicting admission successfully prevents prefetch page misses, but this
 previous-token policy is still a regression on the fox prompt. As ranks
-increase, skipped prefetches and demand page misses rise monotonically. Treat
+increase, skipped prefetches and demand page misses rise monotonically. The
+resident-only row keeps prefetch page misses and skipped prefetches at zero,
+but still regresses versus no lookahead, so even refreshing previous-token
+residents perturbs LRU in the wrong direction for this prompt. Treat
 previous-token prefetch as diagnostic only; the next useful policy needs a
 stronger admission signal than "same layer's previous token top-k".
 
