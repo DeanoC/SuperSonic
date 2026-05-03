@@ -1,9 +1,13 @@
 use anyhow::Result;
+use std::borrow::Cow;
+
 use model_store::BakedStore;
 
 use crate::qwen36_moe_decode::{ExpertPrefetchPhase, ExpertRoute};
 use crate::qwen36_moe_residency::{MoeExpertKey, MoeExpertProjection, MoeExpertResidencyManager};
-use crate::qwen36_moe_telemetry::{MoeIslandPrefetchMode, MoeRouteTelemetry};
+use crate::qwen36_moe_telemetry::{
+    MoeIslandPrefetchMode, MoeRouteTelemetry, MoeTransitionPredictor,
+};
 
 pub(crate) fn handle_moe_expert_prefetch(
     manager: &mut MoeExpertResidencyManager,
@@ -14,6 +18,7 @@ pub(crate) fn handle_moe_expert_prefetch(
     next_topk_by_layer: &mut [Vec<usize>],
     track_routes: bool,
     route_telemetry: Option<&mut MoeRouteTelemetry>,
+    transition_predictors: Option<&mut [MoeTransitionPredictor]>,
     phase: ExpertPrefetchPhase,
     layer_idx: usize,
     routes: &[ExpertRoute],
@@ -26,6 +31,7 @@ pub(crate) fn handle_moe_expert_prefetch(
                 mode,
                 prefetch_ranks,
                 previous_topk_by_layer,
+                transition_predictors,
                 layer_idx,
             )?;
         }
@@ -38,6 +44,7 @@ pub(crate) fn handle_moe_expert_prefetch(
                 next_topk_by_layer,
                 track_routes,
                 route_telemetry,
+                transition_predictors,
                 layer_idx,
                 routes,
             )?;
@@ -52,15 +59,26 @@ fn prefetch_previous_token_routes(
     mode: MoeIslandPrefetchMode,
     prefetch_ranks: usize,
     previous_topk_by_layer: &[Vec<usize>],
+    transition_predictors: Option<&mut [MoeTransitionPredictor]>,
     layer_idx: usize,
 ) -> Result<()> {
-    for &expert_idx in previous_topk_by_layer
+    let previous_routes = previous_topk_by_layer
         .get(layer_idx)
         .map(Vec::as_slice)
-        .unwrap_or(&[])
-        .iter()
-        .take(prefetch_ranks)
-    {
+        .unwrap_or(&[]);
+    let transition_candidates;
+    let candidate_experts: Cow<'_, [usize]> = if mode.transition_weighted() {
+        transition_candidates = transition_predictors
+            .as_ref()
+            .and_then(|predictors| predictors.get(layer_idx))
+            .map(|predictor| predictor.candidates(previous_routes, prefetch_ranks))
+            .unwrap_or_default();
+        Cow::Owned(transition_candidates)
+    } else {
+        Cow::Borrowed(&previous_routes[..previous_routes.len().min(prefetch_ranks)])
+    };
+
+    for &expert_idx in candidate_experts.iter() {
         let gate_up = expert_key(layer_idx, expert_idx, MoeExpertProjection::GateUp);
         let down = expert_key(layer_idx, expert_idx, MoeExpertProjection::Down);
         if mode.resident_only() && !(manager.is_resident(gate_up) && manager.is_resident(down)) {
@@ -79,6 +97,7 @@ fn ensure_demand_routes(
     next_topk_by_layer: &mut [Vec<usize>],
     track_routes: bool,
     route_telemetry: Option<&mut MoeRouteTelemetry>,
+    transition_predictors: Option<&mut [MoeTransitionPredictor]>,
     layer_idx: usize,
     routes: &[ExpertRoute],
 ) -> Result<()> {
@@ -88,6 +107,11 @@ fn ensure_demand_routes(
         .unwrap_or(&[]);
     if let Some(route_telemetry) = route_telemetry {
         route_telemetry.record(manager, layer_idx, routes, previous_routes);
+    }
+    if let Some(predictors) = transition_predictors {
+        if let Some(predictor) = predictors.get_mut(layer_idx) {
+            predictor.update(routes, previous_routes);
+        }
     }
     for route in routes {
         let expert_idx = route.expert_idx;

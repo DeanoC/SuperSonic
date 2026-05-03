@@ -12,6 +12,7 @@ pub(crate) enum MoeIslandPrefetchMode {
     Disabled,
     PreviousToken,
     PreviousTokenResidentOnly,
+    Transition,
 }
 
 impl MoeIslandPrefetchMode {
@@ -20,15 +21,23 @@ impl MoeIslandPrefetchMode {
             Self::Disabled => "disabled",
             Self::PreviousToken => "previous-token",
             Self::PreviousTokenResidentOnly => "previous-token-resident",
+            Self::Transition => "transition",
         }
     }
 
     pub(crate) fn uses_previous_token_routes(self) -> bool {
-        matches!(self, Self::PreviousToken | Self::PreviousTokenResidentOnly)
+        matches!(
+            self,
+            Self::PreviousToken | Self::PreviousTokenResidentOnly | Self::Transition
+        )
     }
 
     pub(crate) fn resident_only(self) -> bool {
         matches!(self, Self::PreviousTokenResidentOnly)
+    }
+
+    pub(crate) fn transition_weighted(self) -> bool {
+        matches!(self, Self::Transition)
     }
 
     pub(crate) fn from_env() -> Result<Self> {
@@ -49,13 +58,72 @@ impl MoeIslandPrefetchMode {
             | Some("previous_token_resident")
             | Some("prev-token-resident")
             | Some("resident-previous-token") => Ok(Self::PreviousTokenResidentOnly),
+            Some("transition") | Some("transition-weighted") | Some("transition_weighted") => {
+                Ok(Self::Transition)
+            }
             Some(other) => anyhow::bail!(
                 "SUPERSONIC_MOE_ISLAND_PREFETCH must be unset, 0, off, disabled, \
                  previous-token, previous_token, prev-token, previous-token-resident, \
-                 previous_token_resident, prev-token-resident, or resident-previous-token; \
+                 previous_token_resident, prev-token-resident, resident-previous-token, \
+                 transition, transition-weighted, or transition_weighted; \
                  got {other:?}"
             ),
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct MoeTransitionPredictor {
+    top_k: usize,
+    min_observations: u32,
+    observations_by_previous_rank: Vec<u32>,
+    repeated_current_by_previous_rank: Vec<u32>,
+}
+
+impl MoeTransitionPredictor {
+    pub(crate) fn new(top_k: usize, min_observations: u32) -> Self {
+        Self {
+            top_k,
+            min_observations,
+            observations_by_previous_rank: vec![0; top_k],
+            repeated_current_by_previous_rank: vec![0; top_k],
+        }
+    }
+
+    pub(crate) fn update(&mut self, routes: &[ExpertRoute], previous_routes: &[usize]) {
+        for (previous_rank, &expert_idx) in previous_routes.iter().take(self.top_k).enumerate() {
+            self.observations_by_previous_rank[previous_rank] =
+                self.observations_by_previous_rank[previous_rank].saturating_add(1);
+            if routes.iter().any(|route| route.expert_idx == expert_idx) {
+                self.repeated_current_by_previous_rank[previous_rank] =
+                    self.repeated_current_by_previous_rank[previous_rank].saturating_add(1);
+            }
+        }
+    }
+
+    pub(crate) fn candidates(&self, previous_routes: &[usize], limit: usize) -> Vec<usize> {
+        let mut scored = Vec::new();
+        for (previous_rank, &expert_idx) in previous_routes.iter().take(self.top_k).enumerate() {
+            let observations = self.observations_by_previous_rank[previous_rank];
+            if observations < self.min_observations {
+                continue;
+            }
+            let repeats = self.repeated_current_by_previous_rank[previous_rank];
+            if repeats == 0 {
+                continue;
+            }
+            scored.push((repeats, observations, previous_rank, expert_idx));
+        }
+        scored.sort_by(|a, b| {
+            let lhs = (a.0 as u64) * (b.1 as u64);
+            let rhs = (b.0 as u64) * (a.1 as u64);
+            rhs.cmp(&lhs).then_with(|| a.2.cmp(&b.2))
+        });
+        scored
+            .into_iter()
+            .take(limit)
+            .map(|(_, _, _, expert_idx)| expert_idx)
+            .collect()
     }
 }
 
