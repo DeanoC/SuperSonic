@@ -92,6 +92,16 @@ __device__ inline void qwen36_moe_attn_step_device(
     // tokens. When null, falls back to the kv_len=1 self-attention path.
     T* __restrict__                kv_cache_k,
     T* __restrict__                kv_cache_v,
+    // KV-FP8: when these are non-null the cache is FP8 E4M3 bytes (so
+    // the T* pointers above point at U8 — the kernel reinterprets in
+    // place). When null, the cache is BF16 and the FP8 path is skipped.
+    float* __restrict__            kv_scale_k,
+    float* __restrict__            kv_scale_v,
+    // BF16 sidecar (optional; requires KV-FP8 to be active). When null
+    // the kernel always dequantises from FP8.
+    void* __restrict__             kv_shadow_k,
+    void* __restrict__             kv_shadow_v,
+    int                            kv_shadow_start,
     int                            kv_max_t,
     unsigned int* __restrict__     counters,
     unsigned int* __restrict__     barrier_counter,

@@ -361,7 +361,11 @@ __global__ void qwen36_moe_attn_step_kernel(
         v_proj_scale, v_proj_zero,
         o_proj_scale, o_proj_zero,
         output, workspace,
-        kv_cache_k, kv_cache_v, kv_max_t,
+        kv_cache_k, kv_cache_v,
+        /*kv_scale_k*/ nullptr, /*kv_scale_v*/ nullptr,
+        /*kv_shadow_k*/ nullptr, /*kv_shadow_v*/ nullptr,
+        /*kv_shadow_start*/ -1,
+        kv_max_t,
         counters, barrier_counter, barrier_flag);
 }
 
