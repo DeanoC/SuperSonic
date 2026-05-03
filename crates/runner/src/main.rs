@@ -17,6 +17,7 @@ mod qwen36_moe_bake;
 mod qwen36_moe_decode;
 mod qwen36_moe_dry_run;
 mod qwen36_moe_engine;
+mod qwen36_moe_geom;
 mod qwen36_moe_host;
 mod qwen36_moe_layers;
 mod qwen36_moe_mtp;

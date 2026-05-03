@@ -72,6 +72,183 @@ impl MoeIslandPrefetchMode {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{MoeIslandPrefetchMode, MoeRouteTelemetry, MoeTransitionPredictor};
+    use crate::qwen36_moe_decode::ExpertRoute;
+
+    #[test]
+    fn moe_prefetch_mode_env_accepts_disabled_and_previous_token_aliases() {
+        assert_eq!(
+            MoeIslandPrefetchMode::from_env_value(None).unwrap(),
+            MoeIslandPrefetchMode::Disabled
+        );
+        assert_eq!(
+            MoeIslandPrefetchMode::from_env_value(Some("disabled")).unwrap(),
+            MoeIslandPrefetchMode::Disabled
+        );
+        assert_eq!(
+            MoeIslandPrefetchMode::from_env_value(Some("previous-token")).unwrap(),
+            MoeIslandPrefetchMode::PreviousToken
+        );
+        assert_eq!(
+            MoeIslandPrefetchMode::from_env_value(Some("prev-token")).unwrap(),
+            MoeIslandPrefetchMode::PreviousToken
+        );
+    }
+
+    #[test]
+    fn moe_prefetch_mode_env_accepts_resident_only_aliases() {
+        assert_eq!(
+            MoeIslandPrefetchMode::from_env_value(Some("previous-token-resident")).unwrap(),
+            MoeIslandPrefetchMode::PreviousTokenResidentOnly
+        );
+        assert_eq!(
+            MoeIslandPrefetchMode::from_env_value(Some("previous_token_resident")).unwrap(),
+            MoeIslandPrefetchMode::PreviousTokenResidentOnly
+        );
+        assert_eq!(
+            MoeIslandPrefetchMode::from_env_value(Some("resident-previous-token")).unwrap(),
+            MoeIslandPrefetchMode::PreviousTokenResidentOnly
+        );
+        assert!(MoeIslandPrefetchMode::from_env_value(Some("resident")).is_err());
+    }
+
+    #[test]
+    fn moe_prefetch_mode_env_accepts_transition_aliases() {
+        assert_eq!(
+            MoeIslandPrefetchMode::from_env_value(Some("transition")).unwrap(),
+            MoeIslandPrefetchMode::Transition
+        );
+        assert_eq!(
+            MoeIslandPrefetchMode::from_env_value(Some("transition-weighted")).unwrap(),
+            MoeIslandPrefetchMode::Transition
+        );
+        assert_eq!(MoeIslandPrefetchMode::Transition.as_str(), "transition");
+        assert!(MoeIslandPrefetchMode::Transition.uses_previous_token_routes());
+        assert!(MoeIslandPrefetchMode::Transition.transition_weighted());
+    }
+
+    #[test]
+    fn moe_transition_predictor_waits_for_warmup_and_scores_repeats() {
+        let mut predictor = MoeTransitionPredictor::new(3, 2);
+        let previous_routes = [10, 20, 30];
+        let routes = [
+            ExpertRoute {
+                rank: 0,
+                expert_idx: 20,
+                weight: 0.5,
+            },
+            ExpertRoute {
+                rank: 1,
+                expert_idx: 99,
+                weight: 0.25,
+            },
+        ];
+
+        predictor.update(&routes, &previous_routes);
+        assert!(predictor.candidates(&previous_routes, 2).is_empty());
+
+        predictor.update(&routes, &previous_routes);
+        assert_eq!(predictor.candidates(&previous_routes, 2), vec![20]);
+
+        let later_routes = [
+            ExpertRoute {
+                rank: 0,
+                expert_idx: 10,
+                weight: 0.5,
+            },
+            ExpertRoute {
+                rank: 1,
+                expert_idx: 20,
+                weight: 0.25,
+            },
+        ];
+        predictor.update(&later_routes, &previous_routes);
+        assert_eq!(predictor.candidates(&previous_routes, 2), vec![20, 10]);
+    }
+
+    #[test]
+    fn moe_route_telemetry_records_previous_rank_transition_matrix() {
+        let mut telemetry = MoeRouteTelemetry::new(3);
+        let previous_routes = [7, 11, 13];
+        telemetry.record_route_observation(
+            &ExpertRoute {
+                rank: 0,
+                expert_idx: 11,
+                weight: 0.5,
+            },
+            &previous_routes,
+        );
+        telemetry.record_route_observation(
+            &ExpertRoute {
+                rank: 1,
+                expert_idx: 7,
+                weight: 0.25,
+            },
+            &previous_routes,
+        );
+        telemetry.record_route_observation(
+            &ExpertRoute {
+                rank: 2,
+                expert_idx: 99,
+                weight: 0.125,
+            },
+            &previous_routes,
+        );
+
+        assert_eq!(telemetry.observations_by_rank, vec![1, 1, 1]);
+        assert_eq!(telemetry.repeated_previous_by_rank, vec![1, 1, 0]);
+        assert_eq!(
+            telemetry.repeated_previous_rank_by_current_rank,
+            vec![vec![0, 1, 0], vec![1, 0, 0], vec![0, 0, 0]]
+        );
+        assert_eq!(
+            telemetry
+                .to_json()
+                .get("repeated_previous_rank_by_current_rank")
+                .unwrap(),
+            &serde_json::json!([[0, 1, 0], [1, 0, 0], [0, 0, 0]])
+        );
+        let json = telemetry.to_json();
+        assert_eq!(
+            json.get("repeated_previous_probability_by_current_rank")
+                .unwrap(),
+            &serde_json::json!([1.0, 1.0, 0.0])
+        );
+        assert_eq!(
+            json.get("same_rank_repeat_probability_by_rank").unwrap(),
+            &serde_json::json!([0.0, 0.0, 0.0])
+        );
+        assert_eq!(
+            json.get("repeated_current_by_previous_rank").unwrap(),
+            &serde_json::json!([1, 1, 0])
+        );
+        assert_eq!(
+            json.get("repeated_current_probability_by_previous_rank")
+                .unwrap(),
+            &serde_json::json!([1.0, 1.0, 0.0])
+        );
+        assert_eq!(
+            json.get("best_previous_rank_by_current_rank").unwrap(),
+            &serde_json::json!([1, 0, null])
+        );
+        assert_eq!(
+            json.get("best_current_rank_by_previous_rank").unwrap(),
+            &serde_json::json!([1, 0, null])
+        );
+        assert_eq!(
+            json.get("best_transition").unwrap(),
+            &serde_json::json!({
+                "current_rank": 0,
+                "previous_rank": 1,
+                "count": 1,
+                "probability_by_current_rank": 1.0,
+            })
+        );
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct MoeTransitionPredictor {
     top_k: usize,
