@@ -288,7 +288,8 @@ lookahead, rank-limited lookahead, and full top-k lookahead rows. Use
 `--prefetch-mode-sweep disabled,previous-token,previous-token-resident`
 together with `--prefetch-rank-sweep none,1,all` to compare normal
 previous-token prefetch with resident-only LRU refresh without hand-running
-separate commands.
+separate commands. The markdown table includes same-rank repeat, previous-rank
+reuse, and best-transition columns derived from the route transition matrix.
 
 **Sparse MoE previous-token prefetch sweep** — measured 2026-05-03 after
 non-evicting prefetch admission landed. Same host/GPU/model/prompt as above,
