@@ -1017,6 +1017,236 @@ pub fn prefill_kept(
     )
 }
 
+// ---- SpecPrefill Phase C: speculator-side prefill with attention export ----
+
+/// Per-layer attention score tensor returned from
+/// `prefill_with_lookahead_attention`: F32 with shape
+/// `[q_heads, lookahead_count, kv_len]` flattened, where `kv_len ==
+/// prompt_len` (the kernel attends to the prompt context only).
+pub type LookaheadLayerScores = Vec<f32>;
+
+pub struct PrefillWithLookaheadResult {
+    /// The dense prefill's last-step logits + traces (currently unused
+    /// downstream; preserved for symmetry with `prefill`).
+    pub base: PrefillResult,
+    /// Per full-attention layer (in source-layer-index ascending order):
+    /// F32 scores `[q_heads, lookahead_count, kv_len]` flattened. The
+    /// number of vec entries equals the number of full-attention layers
+    /// in the speculator.
+    pub layer_scores: Vec<LookaheadLayerScores>,
+    /// Equals `lookahead + 1` — the number of query rows scored.
+    pub lookahead_count: usize,
+}
+
+/// SpecPrefill (arXiv 2502.02789) speculator-side prefill with attention
+/// export. Runs dense prefill on the first `prompt_len - 1` tokens, then
+/// drives `lookahead_count` decode steps (via
+/// `DecodeEngine::decode_step_with_query_capture`) on the speculator —
+/// the first decode step processes the prompt's final token, the rest
+/// are greedy-sampled lookahead tokens. Per full-attention layer, runs
+/// the `lookahead_attention_scores` kernel with the captured Q rows and
+/// the layer's K cache (truncated to the prompt context, `kv_len =
+/// prompt_len`).
+///
+/// `lookahead_count` must be `>= 1`; the typical value is `lookahead +
+/// 1` where `lookahead` is the paper's N (default 4).
+///
+/// Post-conditions:
+/// - The `decode_engine`'s state has been mutated by `lookahead_count`
+///   decode steps. Caller must NOT reuse it for further decoding without
+///   resetting/recreating the state.
+/// - Returned `layer_scores[k]` corresponds to the k-th full-attention
+///   layer in source-index ascending order.
+pub fn prefill_with_lookahead_attention(
+    weights: &Qwen35Weights,
+    state: &mut ModelState,
+    rotary: &RotaryTables,
+    prompt_ids: &[u32],
+    ordinal: usize,
+    kv_chunk_size: usize,
+    prefill_chunk_size: usize,
+    use_4b_kernel: bool,
+    lookahead_count: usize,
+    decode_engine: &mut crate::decode_engine::DecodeEngine,
+) -> Result<PrefillWithLookaheadResult> {
+    if lookahead_count < 1 {
+        anyhow::bail!("prefill_with_lookahead_attention: lookahead_count must be >= 1");
+    }
+    let prompt_len = prompt_ids.len();
+    if prompt_len < 2 {
+        anyhow::bail!(
+            "prefill_with_lookahead_attention: prompt_len ({prompt_len}) must be >= 2 to leave \
+             at least one prefill token + the last-token decode"
+        );
+    }
+    let config = &weights.config;
+
+    // 1. Dense prefill on the first prompt_len - 1 tokens.
+    let prefill_ids = &prompt_ids[..prompt_len - 1];
+    let base = prefill(
+        weights,
+        state,
+        rotary,
+        prefill_ids,
+        ordinal,
+        kv_chunk_size,
+        prefill_chunk_size,
+        false, // kv_fp8 — speculator is BF16
+        use_4b_kernel,
+        false, // trace_layers
+        None,  // debug_linear_layer
+    )?;
+
+    // 2. Identify full-attention layer indices in source order.
+    let full_layer_idxs: Vec<usize> = (0..config.num_hidden_layers)
+        .filter(|&i| config.is_full_attention(i))
+        .collect();
+    if full_layer_idxs.is_empty() {
+        anyhow::bail!(
+            "prefill_with_lookahead_attention: no full-attention layers in the speculator"
+        );
+    }
+
+    // 3. Run lookahead_count decode steps with Q capture per full-attn layer.
+    //    Step 0 processes the prompt's last token; subsequent steps are
+    //    greedy lookahead tokens. After each step the per-layer Q row is
+    //    pushed into per_layer_q_rows[slot].
+    let q_heads = config.num_attention_heads;
+    let head_dim = config.head_dim;
+    let q_row_bytes = q_heads * head_dim * ScalarType::BF16.size_in_bytes();
+    let mut per_layer_q_rows: Vec<Vec<Vec<u8>>> =
+        vec![Vec::with_capacity(lookahead_count); full_layer_idxs.len()];
+
+    let mut next_id: u32 = prompt_ids[prompt_len - 1];
+    let mut last_logits: Vec<f32> = base.logits.clone();
+    for step in 0..lookahead_count {
+        if step > 0 {
+            // Greedy-sample the next token from the previous step's logits.
+            next_id = greedy_argmax_u32(&last_logits);
+        }
+        let seqlen_offset = prompt_len - 1 + step;
+        let (logits, q_rows) = decode_engine.decode_step_with_query_capture(
+            next_id,
+            seqlen_offset,
+            &full_layer_idxs,
+        )?;
+        if q_rows.len() != full_layer_idxs.len() {
+            anyhow::bail!(
+                "decode_step_with_query_capture returned {} q_rows, expected {}",
+                q_rows.len(),
+                full_layer_idxs.len()
+            );
+        }
+        for (slot, row) in q_rows.into_iter().enumerate() {
+            if row.len() != q_row_bytes {
+                anyhow::bail!(
+                    "decode_step_with_query_capture returned {} bytes per Q row, expected {}",
+                    row.len(),
+                    q_row_bytes
+                );
+            }
+            per_layer_q_rows[slot].push(row);
+        }
+        last_logits = logits;
+    }
+
+    // 4. Per full-attention layer: launch lookahead_attention_scores.
+    let kv_heads = config.num_key_value_heads;
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+    let mut layer_scores: Vec<LookaheadLayerScores> = Vec::with_capacity(full_layer_idxs.len());
+
+    for (slot, &li) in full_layer_idxs.iter().enumerate() {
+        // Build [lookahead_count, q_heads, head_dim] BF16 Q buffer.
+        let mut q_host: Vec<u8> = Vec::with_capacity(lookahead_count * q_row_bytes);
+        for row in &per_layer_q_rows[slot] {
+            q_host.extend_from_slice(row);
+        }
+        let mut q_buf = GpuBuffer::zeros(
+            ordinal,
+            ScalarType::BF16,
+            &[lookahead_count, q_heads, head_dim],
+        )
+        .map_err(|e| anyhow::anyhow!("layer {li} q_buf alloc: {e}"))?;
+        copy_h2d(
+            ordinal,
+            q_buf.as_mut_ptr(),
+            q_host.as_ptr() as *const _,
+            q_host.len(),
+        )
+        .map_err(|e| anyhow::anyhow!("layer {li} q_buf h2d: {e}"))?;
+
+        // K cache. Lives at state.layers[li].kv_cache_k. Read kv_len =
+        // prompt_len (the kernel ignores rows past kv_len even though
+        // the cache may have lookahead_count - 1 extra rows from the
+        // decode steps). The cache shape is [1, kv_heads, cap, head_dim]
+        // (batch=1); with batch dim = 1, as_ptr() aliases the flat
+        // [kv_heads, cap, head_dim] layout the kernel expects. The
+        // kernel validates elem_count >= kv_heads * kv_len * head_dim,
+        // which holds because cap >= prompt_len at this point.
+        let k_cache = state.layers[li]
+            .kv_cache_k
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!(
+                "layer {li}: kv_cache_k missing after prefill — speculator must have full-attention KV"
+            ))?;
+
+        let mut scores = GpuBuffer::zeros(
+            ordinal,
+            ScalarType::F32,
+            &[q_heads, lookahead_count, prompt_len],
+        )
+        .map_err(|e| anyhow::anyhow!("layer {li} scores alloc: {e}"))?;
+
+        prefill_ffi::lookahead_attention_scores(
+            ordinal,
+            ScalarType::BF16,
+            q_heads,
+            kv_heads,
+            lookahead_count,
+            prompt_len,
+            head_dim,
+            scale,
+            &q_buf,
+            k_cache,
+            &mut scores,
+        )?;
+
+        let scores_bytes = scores
+            .to_host_bytes()
+            .map_err(|e| anyhow::anyhow!("layer {li} scores d2h: {e}"))?;
+        if scores_bytes.len() != q_heads * lookahead_count * prompt_len * 4 {
+            anyhow::bail!(
+                "layer {li} scores d2h size {} != expected {}",
+                scores_bytes.len(),
+                q_heads * lookahead_count * prompt_len * 4
+            );
+        }
+        let mut host_scores = vec![0.0_f32; q_heads * lookahead_count * prompt_len];
+        for (i, chunk) in scores_bytes.chunks_exact(4).enumerate() {
+            host_scores[i] = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        }
+        layer_scores.push(host_scores);
+    }
+
+    Ok(PrefillWithLookaheadResult {
+        base,
+        layer_scores,
+        lookahead_count,
+    })
+}
+
+fn greedy_argmax_u32(logits: &[f32]) -> u32 {
+    logits
+        .iter()
+        .enumerate()
+        .fold((0usize, f32::NEG_INFINITY), |acc, (i, &v)| {
+            if v > acc.1 { (i, v) } else { acc }
+        })
+        .0 as u32
+}
+
+// ---- End SpecPrefill Phase C ----
+
 fn prefill_inner(
     weights: &Qwen35Weights,
     state: &mut ModelState,
