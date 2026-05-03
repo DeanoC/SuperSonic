@@ -42,7 +42,7 @@ use crate::qwen36_moe_speculative::{
 use crate::qwen36_moe_state::{refresh_linear_attn_state, restore_linear_attn_state};
 use crate::qwen36_moe_telemetry::{
     MoeIslandPrefetchMode, MoeRouteTelemetry, MoeSparseTelemetry, MoeSparseTelemetrySnapshot,
-    VirtualKvStats,
+    MoeTransitionPredictor, VirtualKvStats,
 };
 use crate::registry::{FamilyParams, Qwen36MoeKernelParams, RegistryEntry};
 
@@ -1102,35 +1102,63 @@ fn moe_island_prefetch_ranks_from_env_value(
             if raw.is_some() {
                 anyhow::bail!(
                     "SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS requires \
-                     SUPERSONIC_MOE_ISLAND_PREFETCH=previous-token or previous-token-resident"
+                     SUPERSONIC_MOE_ISLAND_PREFETCH=previous-token, \
+                     previous-token-resident, or transition"
                 );
             }
             Ok(0)
         }
-        MoeIslandPrefetchMode::PreviousToken | MoeIslandPrefetchMode::PreviousTokenResidentOnly => {
-            match raw {
-                None | Some("all") => Ok(top_k),
-                Some(value) => {
-                    let ranks = value.parse::<usize>().with_context(|| {
-                        format!(
+        MoeIslandPrefetchMode::PreviousToken
+        | MoeIslandPrefetchMode::PreviousTokenResidentOnly
+        | MoeIslandPrefetchMode::Transition => match raw {
+            None | Some("all") => Ok(top_k),
+            Some(value) => {
+                let ranks = value.parse::<usize>().with_context(|| {
+                    format!(
                         "parse SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS={value:?} as positive integer"
                     )
-                    })?;
-                    if ranks == 0 || ranks > top_k {
-                        anyhow::bail!(
+                })?;
+                if ranks == 0 || ranks > top_k {
+                    anyhow::bail!(
                         "SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS must be in 1..={top_k}; got {ranks}"
                     );
-                    }
-                    Ok(ranks)
                 }
+                Ok(ranks)
             }
-        }
+        },
     }
 }
 
 fn moe_island_prefetch_ranks_from_env(mode: MoeIslandPrefetchMode, top_k: usize) -> Result<usize> {
     let raw = std::env::var("SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS").ok();
     moe_island_prefetch_ranks_from_env_value(raw.as_deref(), mode, top_k)
+}
+
+fn moe_island_prefetch_transition_min_observations_from_env_value(
+    raw: Option<&str>,
+    mode: MoeIslandPrefetchMode,
+) -> Result<u32> {
+    if !mode.transition_weighted() {
+        if raw.is_some() {
+            anyhow::bail!(
+                "SUPERSONIC_MOE_ISLAND_PREFETCH_TRANSITION_MIN_OBS requires \
+                 SUPERSONIC_MOE_ISLAND_PREFETCH=transition"
+            );
+        }
+        return Ok(0);
+    }
+
+    let Some(value) = raw else {
+        return Ok(32);
+    };
+    value.parse::<u32>().with_context(|| {
+        format!("parse SUPERSONIC_MOE_ISLAND_PREFETCH_TRANSITION_MIN_OBS={value:?} as integer")
+    })
+}
+
+fn moe_island_prefetch_transition_min_observations(mode: MoeIslandPrefetchMode) -> Result<u32> {
+    let raw = std::env::var("SUPERSONIC_MOE_ISLAND_PREFETCH_TRANSITION_MIN_OBS").ok();
+    moe_island_prefetch_transition_min_observations_from_env_value(raw.as_deref(), mode)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2130,6 +2158,8 @@ fn decode_text(
     let moe_prefetch_mode = MoeIslandPrefetchMode::from_env()?;
     let moe_prefetch_ranks =
         moe_island_prefetch_ranks_from_env(moe_prefetch_mode, geom.top_k as usize)?;
+    let moe_transition_min_observations =
+        moe_island_prefetch_transition_min_observations(moe_prefetch_mode)?;
     if moe_prefetch_mode != MoeIslandPrefetchMode::Disabled && !sparse_moe_requested {
         anyhow::bail!("SUPERSONIC_MOE_ISLAND_PREFETCH requires SUPERSONIC_MOE_ISLAND_CAP_EXPERTS");
     }
@@ -2207,6 +2237,12 @@ fn decode_text(
                 moe_prefetch_mode.as_str(),
                 geom.top_k
             );
+            if moe_prefetch_mode.transition_weighted() {
+                println!(
+                    "  [vmm] sparse MoE transition predictor warmup \
+                     min_observations={moe_transition_min_observations}"
+                );
+            }
         }
         _moe_expert_residency = Some(manager);
         layers
@@ -2540,6 +2576,12 @@ fn decode_text(
         vec![Vec::new(); geom.num_layers as usize];
     let mut moe_route_telemetry =
         sparse_moe_requested.then(|| MoeRouteTelemetry::new(geom.top_k as usize));
+    let mut moe_transition_predictors = moe_prefetch_mode.transition_weighted().then(|| {
+        vec![
+            MoeTransitionPredictor::new(geom.top_k as usize, moe_transition_min_observations,);
+            geom.num_layers as usize
+        ]
+    });
 
     for step in 0..total_steps {
         // When speculative decode is on, each iteration can commit
@@ -2628,6 +2670,7 @@ fn decode_text(
                         &mut next_moe_topk_by_layer,
                         track_moe_routes,
                         moe_route_telemetry.as_mut(),
+                        moe_transition_predictors.as_deref_mut(),
                         phase,
                         layer_idx,
                         routes,
@@ -2672,6 +2715,7 @@ fn decode_text(
                         &mut next_moe_topk_by_layer,
                         track_moe_routes,
                         moe_route_telemetry.as_mut(),
+                        moe_transition_predictors.as_deref_mut(),
                         phase,
                         layer_idx,
                         routes,
@@ -3506,8 +3550,10 @@ fn decode_first_token(model_dir: &Path, report: &DryRunReport, kv_fp8: bool) -> 
 #[cfg(test)]
 mod tests {
     use super::{
-        moe_island_prefetch_ranks_from_env_value, qwen36_kv_vmm_mode_from_env_value, ExpertRoute,
-        MoeIslandPrefetchMode, MoeRouteTelemetry, Qwen36KvVmmMode,
+        moe_island_prefetch_ranks_from_env_value,
+        moe_island_prefetch_transition_min_observations_from_env_value,
+        qwen36_kv_vmm_mode_from_env_value, ExpertRoute, MoeIslandPrefetchMode, MoeRouteTelemetry,
+        MoeTransitionPredictor, Qwen36KvVmmMode,
     };
     use gpu_hal::Backend;
 
@@ -3578,6 +3624,21 @@ mod tests {
     }
 
     #[test]
+    fn moe_prefetch_mode_env_accepts_transition_aliases() {
+        assert_eq!(
+            MoeIslandPrefetchMode::from_env_value(Some("transition")).unwrap(),
+            MoeIslandPrefetchMode::Transition
+        );
+        assert_eq!(
+            MoeIslandPrefetchMode::from_env_value(Some("transition-weighted")).unwrap(),
+            MoeIslandPrefetchMode::Transition
+        );
+        assert_eq!(MoeIslandPrefetchMode::Transition.as_str(), "transition");
+        assert!(MoeIslandPrefetchMode::Transition.uses_previous_token_routes());
+        assert!(MoeIslandPrefetchMode::Transition.transition_weighted());
+    }
+
+    #[test]
     fn moe_prefetch_ranks_default_to_all_previous_token_routes() {
         assert_eq!(
             moe_island_prefetch_ranks_from_env_value(
@@ -3619,6 +3680,15 @@ mod tests {
             .unwrap(),
             4
         );
+        assert_eq!(
+            moe_island_prefetch_ranks_from_env_value(
+                Some("2"),
+                MoeIslandPrefetchMode::Transition,
+                8,
+            )
+            .unwrap(),
+            2
+        );
     }
 
     #[test]
@@ -3642,10 +3712,84 @@ mod tests {
         .is_err());
         assert!(moe_island_prefetch_ranks_from_env_value(
             Some("9"),
-            MoeIslandPrefetchMode::PreviousToken,
+            MoeIslandPrefetchMode::Transition,
             8,
         )
         .is_err());
+    }
+
+    #[test]
+    fn moe_transition_min_observations_defaults_only_for_transition_mode() {
+        assert_eq!(
+            moe_island_prefetch_transition_min_observations_from_env_value(
+                None,
+                MoeIslandPrefetchMode::Transition,
+            )
+            .unwrap(),
+            32
+        );
+        assert_eq!(
+            moe_island_prefetch_transition_min_observations_from_env_value(
+                Some("4"),
+                MoeIslandPrefetchMode::Transition,
+            )
+            .unwrap(),
+            4
+        );
+        assert_eq!(
+            moe_island_prefetch_transition_min_observations_from_env_value(
+                None,
+                MoeIslandPrefetchMode::PreviousToken,
+            )
+            .unwrap(),
+            0
+        );
+        assert!(
+            moe_island_prefetch_transition_min_observations_from_env_value(
+                Some("4"),
+                MoeIslandPrefetchMode::PreviousToken,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn moe_transition_predictor_waits_for_warmup_and_scores_repeats() {
+        let mut predictor = MoeTransitionPredictor::new(3, 2);
+        let previous_routes = [10, 20, 30];
+        let routes = [
+            ExpertRoute {
+                rank: 0,
+                expert_idx: 20,
+                weight: 0.5,
+            },
+            ExpertRoute {
+                rank: 1,
+                expert_idx: 99,
+                weight: 0.25,
+            },
+        ];
+
+        predictor.update(&routes, &previous_routes);
+        assert!(predictor.candidates(&previous_routes, 2).is_empty());
+
+        predictor.update(&routes, &previous_routes);
+        assert_eq!(predictor.candidates(&previous_routes, 2), vec![20]);
+
+        let later_routes = [
+            ExpertRoute {
+                rank: 0,
+                expert_idx: 10,
+                weight: 0.5,
+            },
+            ExpertRoute {
+                rank: 1,
+                expert_idx: 20,
+                weight: 0.25,
+            },
+        ];
+        predictor.update(&later_routes, &previous_routes);
+        assert_eq!(predictor.candidates(&previous_routes, 2), vec![20, 10]);
     }
 
     #[test]

@@ -42,11 +42,15 @@ class Qwen36SparseCapBenchTests(unittest.TestCase):
     def test_parse_prefetch_mode_policies_accepts_aliases_and_dedupes(self):
         parse = bench_qwen36_sparse_caps.parse_prefetch_mode_policies
         self.assertEqual(
-            parse("disabled,previous-token,previous_token,previous-token-resident"),
+            parse(
+                "disabled,previous-token,previous_token,previous-token-resident,"
+                "transition,transition_weighted"
+            ),
             [
                 ("none", None),
                 ("previous-token", "previous-token"),
                 ("previous-token-resident", "previous-token-resident"),
+                ("transition", "transition"),
             ],
         )
         with self.assertRaises(ValueError):
@@ -83,7 +87,7 @@ class Qwen36SparseCapBenchTests(unittest.TestCase):
         self.assert_cases_equal(
             build_cases(
                 [320],
-                "disabled,previous-token,previous-token-resident",
+                "disabled,previous-token,previous-token-resident,transition",
                 "none,1,all",
                 None,
                 None,
@@ -105,6 +109,8 @@ class Qwen36SparseCapBenchTests(unittest.TestCase):
                     "previous-token-resident",
                     "all",
                 ),
+                ("cap320-transition-r1", 320, "transition", "1"),
+                ("cap320-transition-all", 320, "transition", "all"),
             ],
         )
 

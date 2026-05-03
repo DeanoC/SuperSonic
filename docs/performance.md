@@ -285,11 +285,12 @@ the miss rate substantially.
 The sweep helper can compare prefetch policies in one run. Use
 `--prefetch-rank-sweep none,1,2,4,all` to expand every sparse cap across no
 lookahead, rank-limited lookahead, and full top-k lookahead rows. Use
-`--prefetch-mode-sweep disabled,previous-token,previous-token-resident`
+`--prefetch-mode-sweep disabled,previous-token,previous-token-resident,transition`
 together with `--prefetch-rank-sweep none,1,all` to compare normal
-previous-token prefetch with resident-only LRU refresh without hand-running
-separate commands. The markdown table includes same-rank repeat, previous-rank
-reuse, and best-transition columns derived from the route transition matrix.
+previous-token prefetch, resident-only LRU refresh, and online transition-aware
+admission without hand-running separate commands. The markdown table includes
+same-rank repeat, previous-rank reuse, and best-transition columns derived from
+the route transition matrix.
 
 **Sparse MoE previous-token prefetch sweep** — measured 2026-05-03 after
 non-evicting prefetch admission landed. Same host/GPU/model/prompt as above,
@@ -314,6 +315,16 @@ but still regresses versus no lookahead, so even refreshing previous-token
 residents perturbs LRU in the wrong direction for this prompt. Treat
 previous-token prefetch as diagnostic only; the next useful policy needs a
 stronger admission signal than "same layer's previous token top-k".
+
+**Sparse MoE transition-prefetch smoke** — measured 2026-05-03 with
+`SUPERSONIC_MOE_ISLAND_CAP_EXPERTS=320`, 8 generated tokens, no warmup, and
+`--prefetch-transition-min-obs 1` to force the online predictor path to admit
+within the short run. IDs matched across all rows. The transition path remained
+non-evicting and recorded zero prefetch page misses, but it regressed this short
+fox prompt (`126.31 ms/tok`) versus no lookahead (`108.63 ms/tok`) and
+previous-token rank-1 (`122.00 ms/tok`). Treat transition prefetch as an
+experimental policy that needs longer prompts and prompt diversity before it can
+be considered for defaults.
 
 Reproduce:
 
