@@ -3335,14 +3335,10 @@ __device__ void g4_persistent_decode_body(
         g4_prof = g4_profile_begin(profile_cycles);
         g4_profile_end(profile_cycles, G4_PROFILE_B3_GELU_UP, g4_prof);
 
-        // B4: work-stealing down_proj.
+        // B4: static down_proj matvec.
         g4_prof = g4_profile_begin(profile_cycles);
-        if (blockIdx.x == 0 && tid == 0) {
-            __atomic_store_n(matvec_counter, 0u, __ATOMIC_RELAXED);
-        }
-        g4_grid_barrier(barrier_counter, barrier_flag, nb);
-
-        // B4 wave-per-row.
+        // B4 static wave-per-row. All down_proj rows have the same width, so
+        // static row assignment avoids per-row atomic claims.
         {
             const int lane = tid % warpSize;
             const int warp_id = tid / warpSize;
@@ -3351,23 +3347,12 @@ __device__ void g4_persistent_decode_body(
             const int group_id = warp_id / warps_per_row;
             const int group_lane = (warp_id % warps_per_row) * warpSize + lane;
             const int vd4 = intermediate_size & ~3;
-            __shared__ unsigned int claimed_rows[rows_per_block];
-            while (true) {
-                if (group_lane == 0) {
-                    claimed_rows[group_id] = atomicAdd(matvec_counter, 1u);
-                }
-                __syncthreads();
-
-                const unsigned int row = claimed_rows[group_id];
-                bool any_active = false;
-                for (int i = 0; i < rows_per_block; ++i) {
-                    any_active = any_active ||
-                        claimed_rows[i] < static_cast<unsigned int>(hidden_size);
-                }
-                if (!any_active) break;
-
+            for (int row_base = blockIdx.x * rows_per_block;
+                 row_base < hidden_size;
+                 row_base += nb * rows_per_block) {
+                const int row = row_base + group_id;
                 float p = 0.0f;
-                const bool active = row < static_cast<unsigned int>(hidden_size);
+                const bool active = row < hidden_size;
                 if (active && use_fp8_w) {
                     const void* wbase = static_cast<const void*>(down_proj_w);
                     const void* sbase = Sfp8.down_proj_scale;
