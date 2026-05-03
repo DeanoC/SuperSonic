@@ -1051,6 +1051,9 @@ extern "C" int qwen36_moe_hip_persistent_decode_launch(
     int           dtype,
     size_t        device_ordinal,
     int           num_layers,
+    int           start_layer,
+    int           end_layer_exclusive,
+    int           mode,
     const qwen36_moe::DecodeLayerDesc* layers,
     const qwen36_moe::Int4ScaleDesc*   int4_scales,    // nullable
     int           hidden,
@@ -1094,6 +1097,19 @@ extern "C" int qwen36_moe_hip_persistent_decode_launch(
     // caller downloads `hidden_ping` for the result.
     if (layers == nullptr) return 133;
     if (hidden <= 0 || num_experts <= 0 || top_k <= 0) return 134;
+    if (mode < 0 || mode > 2) return 140;
+    if (start_layer < 0 || start_layer >= num_layers) return 141;
+    if (mode == 0) {
+        if (end_layer_exclusive <= start_layer ||
+            end_layer_exclusive > num_layers) {
+            return 142;
+        }
+    } else {
+        // Router-only and FFN-only are single-layer segmented sparse-VMM
+        // entry points. The host remaps between the two launches, so folded
+        // lm_head is intentionally available only to the full-step mode.
+        end_layer_exclusive = start_layer + 1;
+    }
     // FFN's concurrent-experts dispatch uses counters[group_id] for Phase G
     // and counters[top_k + group_id] for Phase I — i.e., 2*top_k slots.
     // sync_buf provisions exactly 16 u32 counters (also matches
@@ -1114,6 +1130,7 @@ extern "C" int qwen36_moe_hip_persistent_decode_launch(
     const bool lm_head_complete = (final_norm_w != nullptr) && (lm_head_w != nullptr) &&
                                   (logits_out != nullptr) && (vocab > 0);
     if (lm_head_on && !lm_head_complete) return 139;
+    if (lm_head_on && (mode != 0 || end_layer_exclusive != num_layers)) return 143;
 
     ScopedHipDevice scoped(static_cast<int>(device_ordinal));
 
@@ -1164,7 +1181,8 @@ extern "C" int qwen36_moe_hip_persistent_decode_launch(
             dim3(static_cast<unsigned int>(num_blocks)),
             dim3(block_size),
             lds_bytes, 0,
-            num_layers, layers, int4_scales,
+            num_layers, start_layer, end_layer_exclusive, mode,
+            layers, int4_scales,
             hidden, num_heads, num_kv_heads, head_dim, rotary_dim,
             num_k_heads, num_v_heads, head_k_dim, head_v_dim, conv_kernel_dim,
             num_experts, moe_intermediate, shared_intermediate, top_k,
@@ -1182,7 +1200,8 @@ extern "C" int qwen36_moe_hip_persistent_decode_launch(
             dim3(static_cast<unsigned int>(num_blocks)),
             dim3(block_size),
             lds_bytes, 0,
-            num_layers, layers, int4_scales,
+            num_layers, start_layer, end_layer_exclusive, mode,
+            layers, int4_scales,
             hidden, num_heads, num_kv_heads, head_dim, rotary_dim,
             num_k_heads, num_v_heads, head_k_dim, head_v_dim, conv_kernel_dim,
             num_experts, moe_intermediate, shared_intermediate, top_k,
