@@ -111,6 +111,19 @@ pub struct Qwen36MoeDecodeLayerDesc {
     /// 1 if router applies `softmax(top_k_logits)` renormalization
     /// (`norm_topk_prob=true` in config). 0 otherwise.
     pub norm_topk_prob: c_int,
+
+    // --- KV-FP8 sidecar (read iff is_full_attention == 1 AND
+    // matching kv_fp8_descs[layer].kv_scale_k != null) ---------------
+    /// BF16 sidecar buffer `[num_kv_heads, window, head_dim]`. Null when
+    /// the sidecar is disabled. The kernel reads from the sidecar (instead
+    /// of dequantising FP8) when `t >= kv_shadow_start`.
+    pub kv_shadow_k: *mut c_void,
+    /// BF16 sidecar buffer `[num_kv_heads, window, head_dim]`.
+    pub kv_shadow_v: *mut c_void,
+    /// First absolute KV position covered by the sidecar. `-1` when the
+    /// sidecar is disabled (or no positions are covered yet); the kernel
+    /// reads `t >= kv_shadow_start && kv_shadow_start >= 0` to decide.
+    pub kv_shadow_start: c_int,
 }
 
 unsafe impl Send for Qwen36MoeDecodeLayerDesc {}
@@ -7184,3 +7197,14 @@ mod tests {
         );
     }
 }
+
+// ABI sanity — every time `Qwen36MoeDecodeLayerDesc` grows, both this
+// const and the C++ side `static_assert` in `kernels/qwen36_moe_bridge.cpp`
+// must move together. Keep the values pinned: a silent drift here is the
+// most common Rust↔C++ bug class for this codebase.
+#[cfg(target_pointer_width = "64")]
+const _ASSERT_DECODE_LAYER_DESC_SIZE: () = {
+    // 24 bytes added (2 ptrs + 1 int padded to 8 bytes).
+    assert!(std::mem::size_of::<Qwen36MoeDecodeLayerDesc>() <= 512);
+    assert!(std::mem::size_of::<Qwen36MoeDecodeLayerDesc>() >= 256);
+};
