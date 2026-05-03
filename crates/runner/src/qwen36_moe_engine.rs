@@ -26,6 +26,11 @@ use crate::qwen36_moe_dry_run::{
 };
 use crate::qwen36_moe_geom::build_multi_layer_geom;
 use crate::qwen36_moe_host::lookup_embed_row;
+use crate::qwen36_moe_output::{
+    dump_final_hidden_if_requested, dump_logits_if_requested, print_decode_stream_start,
+    print_decoded_token, print_generation_summary, print_last_logits_if_requested,
+    print_sampling_summary,
+};
 use crate::qwen36_moe_prefetch::handle_moe_expert_prefetch;
 use crate::qwen36_moe_prompt::{
     prepare_prompt, print_prompt_summary, validate_speculative_sampling,
@@ -334,21 +339,7 @@ fn decode_text(
         mut persistent_scratch,
     } = session;
 
-    println!(
-        "  decoding {} prompt token{} + generating ≤{} new token{}…",
-        prompt_ids.len(),
-        if prompt_ids.len() == 1 { "" } else { "s" },
-        max_new,
-        if max_new == 1 { "" } else { "s" },
-    );
-    println!();
-    print!("> ");
-    if let Some(tok) = &tokenizer {
-        if let Ok(prompt_text) = tok.decode(&prompt_ids, false) {
-            print!("{prompt_text}");
-        }
-    }
-    std::io::stdout().flush().ok();
+    print_decode_stream_start(tokenizer.as_ref(), &prompt_ids, max_new);
 
     let mut generated_ids: Vec<u32> = Vec::with_capacity(max_new);
     // Track the BF16 logits bytes from the last decode step for --dump-last-logits.
@@ -362,10 +353,7 @@ fn decode_text(
     // + max_new - 1.
     let total_steps = prompt_ids.len() + max_new - 1;
     let mut rng = XorshiftRng::new(sampling.seed);
-    println!(
-        "  sampling: temp={} top_k={} top_p={} seed={}",
-        sampling.temperature, sampling.top_k, sampling.top_p, sampling.seed,
-    );
+    print_sampling_summary(sampling);
 
     // Per-stage wall-clock accumulators. Aggregated across generation steps
     // only (prefill steps run the chain but skip the lm_head/sample stages,
@@ -571,14 +559,7 @@ fn decode_text(
         }
 
         // Optional dump for the host-side post-chain debug harness.
-        if let Ok(dump_path) = std::env::var("SUPERSONIC_QWEN36_DUMP_FINAL_HIDDEN") {
-            std::fs::write(&dump_path, &outputs.final_hidden_bytes)
-                .with_context(|| format!("write final_hidden dump to {dump_path}"))?;
-            eprintln!(
-                "[debug] dumped step={step} position={position} final_hidden ({} BF16 bytes) to {dump_path}",
-                outputs.final_hidden_bytes.len()
-            );
-        }
+        dump_final_hidden_if_requested(step, position, &outputs.final_hidden_bytes)?;
 
         // Generation step: when the megakernel didn't fold lm_head
         // (chained path), launch the standalone final RMSnorm +
@@ -615,14 +596,7 @@ fn decode_text(
             last_logits_bytes.clone_from(&logits);
         }
         let t_lm_head_step = t2.elapsed();
-        if let Ok(dump_path) = std::env::var("SUPERSONIC_QWEN36_DUMP_LOGITS") {
-            std::fs::write(&dump_path, &logits)
-                .with_context(|| format!("write logits dump to {dump_path}"))?;
-            eprintln!(
-                "[debug] dumped step={step} logits ({} BF16 bytes) to {dump_path}",
-                logits.len()
-            );
-        }
+        dump_logits_if_requested(step, &logits)?;
         let t3 = std::time::Instant::now();
         let next_token = sample_bf16_logits(
             &logits,
@@ -636,12 +610,8 @@ fn decode_text(
 
         // Stream-decode and print.
         let t4 = std::time::Instant::now();
-        if let Some(tok) = &tokenizer {
-            if let Ok(text) = tok.decode(&[next_token], false) {
-                print!("{text}");
-                std::io::stdout().flush().ok();
-            }
-        }
+        print_decoded_token(tokenizer.as_ref(), next_token);
+        std::io::stdout().flush().ok();
         let t_detok_step = t4.elapsed();
 
         stage_timings.record_generation_step(
@@ -946,11 +916,7 @@ fn decode_text(
                     break;
                 }
                 generated_ids.push(tok);
-                if let Some(t) = &tokenizer {
-                    if let Ok(text) = t.decode(&[tok], false) {
-                        print!("{text}");
-                    }
-                }
+                print_decoded_token(tokenizer.as_ref(), tok);
                 if Some(tok) == eos_id {
                     hit_stop = true;
                     break;
@@ -968,51 +934,8 @@ fn decode_text(
         }
     }
 
-    // Emit last-step logits for integration parity tests (--dump-last-logits).
-    // Printed BEFORE any other post-loop output so the test parser can grep for
-    // the first line starting with "LAST_LOGITS: ".
-    if dump_last_logits && !last_logits_bytes.is_empty() {
-        use std::io::Write as _;
-        let logits_f32 = crate::qwen36_moe_decode::bf16_bytes_to_f32(&last_logits_bytes);
-        // Lead with `\n` so the marker lands at the start of its own line —
-        // the streamed-token print path uses `print!` without a trailing
-        // newline, so `LAST_LOGITS:` would otherwise concatenate onto the
-        // last generated text and `lines().find(...starts_with...)` in the
-        // parity/smoke tests wouldn't match.
-        // Format with `{}` (Display) instead of `{:.6}` to preserve full
-        // f32 precision — the VMM bit-exact smoke compares via
-        // `a.to_bits() == b.to_bits()`, which fails on rounded values.
-        print!("\nLAST_LOGITS: ");
-        for (i, x) in logits_f32.iter().enumerate() {
-            if i > 0 {
-                print!(",");
-            }
-            print!("{}", x);
-        }
-        println!();
-        std::io::stdout().flush().ok();
-    }
-
-    println!();
-    println!();
-    println!(
-        "Generated {} token{} ({} prompt + {} new). EOS: {}.",
-        generated_ids.len(),
-        if generated_ids.len() == 1 { "" } else { "s" },
-        prompt_ids.len(),
-        generated_ids.len(),
-        if eos_id
-            .map(|e| generated_ids.last() == Some(&e))
-            .unwrap_or(false)
-        {
-            "yes"
-        } else {
-            "no (max_new_tokens hit)"
-        },
-    );
-    if !generated_ids.is_empty() {
-        println!("  Generated ids: {generated_ids:?}");
-    }
+    print_last_logits_if_requested(dump_last_logits, &last_logits_bytes);
+    print_generation_summary(&generated_ids, prompt_ids.len(), eos_id);
     if let Some(manager) = _moe_expert_residency.as_ref() {
         print_and_write_moe_residency_summary(
             manager,
