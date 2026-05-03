@@ -268,6 +268,7 @@ extern "C" {
         moe_intermediate: c_int,
         shared_intermediate: c_int,
         top_k: c_int,
+        vocab: c_int,
         rope_theta: f32,
         rms_norm_eps: f32,
         position: c_int,
@@ -275,6 +276,13 @@ extern "C" {
         hidden_pong: *mut c_void,
         workspace: *mut f32,
         ffn_topk_idx_scratch: *mut c_int,
+        // Phase 3f folded final RMSnorm + lm_head GEMV. Pass nullptr
+        // triple + vocab=0 to skip (prefill steps); otherwise the
+        // megakernel writes logits to `logits_out` and the host can
+        // skip the separate `lm_head_launch` call.
+        final_norm_w: *const c_void,
+        lm_head_w: *const c_void,
+        logits_out: *mut c_void,
         counters: *mut c_uint,
         barrier_counter: *mut c_uint,
         barrier_flag: *mut c_uint,
@@ -694,6 +702,24 @@ pub struct Qwen36MoePersistentGeom {
 ///   inert, but must be valid).
 /// - `sync_buf` is at least 96 zeroed bytes (counters[0..16] + barrier
 ///   counter/flag); the bridge defensively re-zeros it on entry.
+/// Phase 3f folded final RMSnorm + lm_head GEMV. Pass `Some(...)` on
+/// generation steps to write logits directly from the megakernel and
+/// skip the separate `lm_head_launch` call; pass `None` on prefill
+/// steps where the caller doesn't need logits. Bundled rather than
+/// scattered as ~4 args so the call site stays readable.
+pub struct Qwen36MoePersistentLmHeadFold<'a> {
+    /// `[hidden]` BF16. Same final_norm tensor the standalone
+    /// `lm_head_launch` consumes.
+    pub final_norm_w: &'a GpuBuffer,
+    /// `[vocab, hidden]` BF16. Pre-dequantized at engine startup from
+    /// the bake's INT4 lm_head; the kernel reads BF16 only.
+    pub lm_head_w: &'a GpuBuffer,
+    /// `[vocab]` BF16 output buffer. Kernel writes one logit per row.
+    pub logits_out: &'a mut GpuBuffer,
+    /// Vocab size. Must be `> 0` and match `lm_head_w.shape()[0]`.
+    pub vocab: i32,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn persistent_decode_launch(
     ordinal: usize,
@@ -708,6 +734,7 @@ pub fn persistent_decode_launch(
     workspace: &mut GpuBuffer,
     ffn_topk_idx_scratch: &mut GpuBuffer,
     sync_buf: &mut GpuBuffer,
+    lm_head_fold: Option<Qwen36MoePersistentLmHeadFold<'_>>,
 ) -> Result<(), GpuError> {
     if dtype != ScalarType::BF16 {
         return Err(GpuError::InvalidArg(format!(
@@ -721,6 +748,23 @@ pub fn persistent_decode_launch(
     let int4_ptr: *const Qwen36MoeInt4ScaleDesc = int4_scales_device
         .map(|b| b.as_ptr() as *const Qwen36MoeInt4ScaleDesc)
         .unwrap_or(std::ptr::null());
+
+    // Fold pointers default to null; the kernel skips the lm_head phase
+    // when any of the three is null.
+    let (vocab, final_norm_w_ptr, lm_head_w_ptr, logits_out_ptr) = match lm_head_fold {
+        Some(mut f) => (
+            f.vocab,
+            f.final_norm_w.as_ptr(),
+            f.lm_head_w.as_ptr(),
+            f.logits_out.as_mut_ptr(),
+        ),
+        None => (
+            0,
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null_mut(),
+        ),
+    };
 
     let status: c_int = match backend {
         Backend::Hip => {
@@ -746,6 +790,7 @@ pub fn persistent_decode_launch(
                     geom.moe_intermediate,
                     geom.shared_intermediate,
                     geom.top_k,
+                    vocab,
                     geom.rope_theta,
                     geom.rms_norm_eps,
                     position,
@@ -753,6 +798,9 @@ pub fn persistent_decode_launch(
                     hidden_pong.as_mut_ptr(),
                     workspace.as_mut_ptr() as *mut f32,
                     ffn_topk_idx_scratch.as_mut_ptr() as *mut c_int,
+                    final_norm_w_ptr,
+                    lm_head_w_ptr,
+                    logits_out_ptr,
                     counters,
                     barrier_counter,
                     barrier_flag,

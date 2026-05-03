@@ -30,10 +30,20 @@ use anyhow::{anyhow, Context, Result};
 use gpu_hal::{copy_d2h, copy_h2d, GpuBuffer, GpuError, ScalarType};
 use kernel_ffi::qwen36_moe::{
     persistent_decode_launch, Qwen36MoeDecodeLayerDesc, Qwen36MoeInt4ScaleDesc,
-    Qwen36MoePersistentGeom,
+    Qwen36MoePersistentGeom, Qwen36MoePersistentLmHeadFold,
 };
 use std::ffi::c_void;
 use std::os::raw::c_int;
+
+/// Phase 3f folded final RMSnorm + lm_head GEMV. Pass to
+/// [`PersistentScratch::run`] on generation steps to write logits
+/// directly from the megakernel; pass `None` on prefill steps.
+pub struct LmHeadFold<'a> {
+    pub final_norm_w: &'a GpuBuffer,
+    pub lm_head_w: &'a GpuBuffer,
+    pub logits_out: &'a mut GpuBuffer,
+    pub vocab: i32,
+}
 
 use crate::qwen36_moe_decode::{
     ffn_workspace_floats, full_attn_workspace_floats, linear_attn_workspace_floats,
@@ -163,14 +173,21 @@ impl PersistentScratch {
 
     /// One decode step. H2D the freshly-embedded `initial_hidden` into
     /// `hidden_ping`, run the megakernel, D2H the final hidden back.
-    /// Mutates the linear-attn state in place (via the pointers cached in
-    /// `layer_descs_dev`) — same semantics as
+    /// Mutates the linear-attn state in place (via the pointers cached
+    /// in `layer_descs_dev`) — same semantics as
     /// `run_chained_decode_fast`.
+    ///
+    /// `lm_head_fold`: when `Some`, runs the folded final RMSnorm +
+    /// lm_head GEMV phase (Phase 3f) at the tail of the megakernel,
+    /// writing logits to `fold.logits_out`. The host can then D2H
+    /// logits directly without a separate `lm_head_launch`. Pass
+    /// `None` on prefill steps.
     pub fn run(
         &mut self,
         ordinal: usize,
         initial_hidden_bytes: &[u8],
         position: i32,
+        lm_head_fold: Option<LmHeadFold<'_>>,
     ) -> Result<DecodeOutputs> {
         let hidden_bytes = self.geom.hidden as usize * 2;
         if initial_hidden_bytes.len() != hidden_bytes {
@@ -188,6 +205,13 @@ impl PersistentScratch {
         )
         .context("h2d initial_hidden -> hidden_ping")?;
 
+        let ffi_fold = lm_head_fold.map(|f| Qwen36MoePersistentLmHeadFold {
+            final_norm_w: f.final_norm_w,
+            lm_head_w: f.lm_head_w,
+            logits_out: f.logits_out,
+            vocab: f.vocab,
+        });
+
         let t_launch = std::time::Instant::now();
         persistent_decode_launch(
             ordinal,
@@ -202,6 +226,7 @@ impl PersistentScratch {
             &mut self.workspace,
             &mut self.ffn_topk_idx_scratch,
             &mut self.sync_buf,
+            ffi_fold,
         )
         .map_err(|e: GpuError| anyhow!(e))
         .context("persistent_decode_launch")?;

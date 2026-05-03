@@ -54,6 +54,7 @@
 #include "qwen36_moe_persistent/full_attn_phase.cuh"
 #include "qwen36_moe_persistent/linear_attn_phase.cuh"
 #include "qwen36_moe_persistent/ffn_phase.cuh"
+#include "qwen36_moe_persistent/lm_head_phase.cuh"
 
 namespace qwen36_moe {
 
@@ -121,6 +122,7 @@ __global__ void qwen36_moe_persistent_decode_kernel(
     int                                  moe_intermediate,
     int                                  shared_intermediate,
     int                                  top_k,
+    int                                  vocab,                  // 0 if no lm_head fold
     float                                rope_theta,
     float                                rms_norm_eps,
     int                                  position,
@@ -128,6 +130,14 @@ __global__ void qwen36_moe_persistent_decode_kernel(
     T*    __restrict__                   hidden_pong,            // [hidden] BF16
     float* __restrict__                  workspace,              // shared scratch
     int*   __restrict__                  ffn_topk_idx_scratch,   // [top_k]
+    // Phase 3f: optional folded final RMSnorm + lm_head GEMV. When all
+    // three are non-null and vocab > 0, the megakernel runs the lm_head
+    // phase after the last layer's FFN and writes logits to
+    // `logits_out`. Pass nullptr to skip — prefill steps don't need
+    // logits, the engine sets logits_out=null on those.
+    const T* __restrict__                final_norm_w,           // [hidden] BF16, nullable
+    const T* __restrict__                lm_head_w,              // [vocab, hidden] BF16, nullable
+    T*       __restrict__                logits_out,             // [vocab] BF16, nullable
     unsigned int* __restrict__           counters,
     unsigned int* __restrict__           barrier_counter,
     unsigned int* __restrict__           barrier_flag) {
@@ -262,6 +272,23 @@ __global__ void qwen36_moe_persistent_decode_kernel(
     // Each iteration does TWO swaps that cancel, so after every layer
     // `in_buf == hidden_ping`. The host downloads `hidden_ping` as the
     // final hidden regardless of `num_layers` parity.
+
+    // Phase 3f: folded final RMSnorm + lm_head GEMV. Skipped when any
+    // of the three buffers is null (the engine sets them all null on
+    // prefill steps to short-circuit the lm_head work).
+    if (final_norm_w != nullptr && lm_head_w != nullptr && logits_out != nullptr
+        && vocab > 0) {
+        // counters[0..16] are dirty from the last layer's ffn phase;
+        // reset_counters_16 syncs across blocks AND publishes the layer
+        // loop's writes to in_buf (= hidden_ping after the per-layer
+        // double-swap) before the lm_head reads from it as activation.
+        reset_counters_16(counters, barrier_counter, barrier_flag, num_blocks);
+
+        qwen36_moe_lm_head_device<T, USE_WMMA>(
+            hidden, vocab, rms_norm_eps,
+            in_buf, final_norm_w, lm_head_w, logits_out,
+            counters);
+    }
 }
 
 }  // namespace qwen36_moe

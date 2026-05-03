@@ -611,8 +611,11 @@ fn multilayer_persistent_decode_matches_chained() {
     // ---- Persistent megakernel run via the production wrapper ----
     let mut scratch = PersistentScratch::new(ordinal, &geom, &mut layers)
         .expect("alloc PersistentScratch");
+    // Parity test only checks the layer chain — no lm_head fold here
+    // (the host-side `host_final_norm_lm_head` does the lm_head step
+    // for the chained-vs-oracle test).
     let persistent_outputs = scratch
-        .run(ordinal, &initial_hidden, position)
+        .run(ordinal, &initial_hidden, position, None)
         .expect("PersistentScratch::run");
     let persistent_final = persistent_outputs.final_hidden_bytes;
 
