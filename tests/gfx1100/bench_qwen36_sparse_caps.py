@@ -87,10 +87,13 @@ def run_case(
     env["SUPERSONIC_VMM_MOE_ISLANDS"] = "1"
     env.pop("SUPERSONIC_MOE_ISLAND_CAP_EXPERTS", None)
     env.pop("SUPERSONIC_MOE_ISLAND_TELEMETRY_JSON", None)
+    env.pop("SUPERSONIC_MOE_ISLAND_PREFETCH", None)
     telemetry_path = tmp / f"{label}_telemetry.json"
     if cap is not None:
         env["SUPERSONIC_MOE_ISLAND_CAP_EXPERTS"] = str(cap)
         env["SUPERSONIC_MOE_ISLAND_TELEMETRY_JSON"] = str(telemetry_path)
+        if args.prefetch:
+            env["SUPERSONIC_MOE_ISLAND_PREFETCH"] = args.prefetch
 
     cmd = [
         str(args.binary),
@@ -160,15 +163,15 @@ def run_case(
 
 def markdown(rows: list[dict[str, Any]]) -> str:
     out = [
-        "| Mode | total ms/tok | tok/s | total resident GiB | MoE resident GiB | KV resident GiB | peak pages | page misses | evicted pages | ids match |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|:---:|",
+        "| Mode | total ms/tok | tok/s | total resident GiB | MoE resident GiB | KV resident GiB | peak pages | page misses | prefetch page misses | evicted pages | ids match |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|",
     ]
     for row in rows:
         residency = row.get("vmm_residency") or {}
         stage = row.get("stage") or {}
         ids_match = row.get("generated_ids_match")
         out.append(
-            "| {label} | {ms} | {tok} | {total_gib} | {moe_gib} | {kv_gib} | {peak_pages} | {page_misses} | {evicted_pages} | {ids_match} |".format(
+            "| {label} | {ms} | {tok} | {total_gib} | {moe_gib} | {kv_gib} | {peak_pages} | {page_misses} | {prefetch_page_misses} | {evicted_pages} | {ids_match} |".format(
                 label=row["label"],
                 ms=fmt_num(stage.get("total_ms_avg")),
                 tok=fmt_num(row.get("tok_per_s")),
@@ -177,6 +180,7 @@ def markdown(rows: list[dict[str, Any]]) -> str:
                 kv_gib=fmt_gib(residency.get("kv_resident_bytes")),
                 peak_pages=residency.get("peak_resident_pages", "-"),
                 page_misses=residency.get("page_misses", "-"),
+                prefetch_page_misses=residency.get("prefetch_page_misses", "-"),
                 evicted_pages=residency.get("evicted_pages", "-"),
                 ids_match="yes" if ids_match else "NO",
             )
@@ -198,6 +202,11 @@ def main() -> int:
     parser.add_argument("--timeout", type=int, default=600)
     parser.add_argument("--no-warmup", action="store_true")
     parser.add_argument("--no-persistent-decode", action="store_true")
+    parser.add_argument(
+        "--prefetch",
+        choices=["previous-token"],
+        help="set SUPERSONIC_MOE_ISLAND_PREFETCH for sparse cap rows",
+    )
     parser.add_argument("--out-json", type=Path, default=Path("target/qwen36_sparse_cap_sweep.json"))
     parser.add_argument("--out-md", type=Path, default=Path("target/qwen36_sparse_cap_sweep.md"))
     args = parser.parse_args()

@@ -333,6 +333,7 @@ def load_vmm_residency(path: Path) -> dict[str, Any]:
     summary = payload.get("summary") or {}
     keys = [
         "decode_path",
+        "prefetch_mode",
         "max_resident_pages",
         "final_resident_pages",
         "peak_resident_pages",
@@ -345,6 +346,12 @@ def load_vmm_residency(path: Path) -> dict[str, Any]:
         "total_vmm_resident_bytes",
         "total_vmm_reserved_bytes",
         "total_vmm_logical_resident_bytes",
+        "prefetch_requests",
+        "prefetch_hits",
+        "prefetch_misses",
+        "prefetch_page_hits",
+        "prefetch_page_misses",
+        "prefetch_uploaded_bytes",
     ]
     return {k: summary[k] for k in keys if k in summary}
 

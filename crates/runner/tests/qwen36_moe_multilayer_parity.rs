@@ -754,7 +754,12 @@ fn multilayer_persistent_decode_matches_chained() {
     restore_linear_attn_state(ordinal, &mut layers, &snapshot)
         .expect("restore_linear_attn_state before segmented persistent");
     let segmented_outputs = scratch
-        .run_sparse_with_expert_prefetch(ordinal, &initial_hidden, position, |_layer, _topk| Ok(()))
+        .run_sparse_with_expert_prefetch(
+            ordinal,
+            &initial_hidden,
+            position,
+            |_phase, _layer, _topk| Ok(()),
+        )
         .expect("PersistentScratch::run_sparse_with_expert_prefetch");
     assert_parity_bf16(
         "segmented persistent sparse vs chained final_hidden",

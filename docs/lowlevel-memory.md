@@ -100,6 +100,11 @@ Current scope:
 - `SUPERSONIC_MOE_ISLAND_CAP_EXPERTS=N` switches Qwen3.6-MoE INT4 decode from
   fully resident virtual expert slabs to sparse router-prefetched islands with
   at most `N` experts' two routed projections tracked resident at once.
+- `SUPERSONIC_MOE_ISLAND_PREFETCH=previous-token` enables experimental
+  previous-token routed-expert lookahead for sparse MoE islands. It preloads
+  each layer's previous top-k before that layer's router runs, then records
+  prefetch hit/miss/page counters in the sparse telemetry JSON. This is a
+  measurement hook for future overlapped prefetch work, not a default path.
 - `SUPERSONIC_VMM_KV=0` disables the Qwen3.5 and Qwen3.6 KV integrations.
 - `SUPERSONIC_VMM_KV=1` requests KV VMM and logs if the backend cannot support
   it. HIP may auto-enable when unset; CUDA requires this explicit opt-in.
