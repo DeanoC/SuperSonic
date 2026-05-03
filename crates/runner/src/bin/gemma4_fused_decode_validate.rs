@@ -937,10 +937,8 @@ fn main() -> Result<()> {
             // constructing a temporary GpuBuffer whose ptr aliases the right
             // offset. Simpler: copy the slice into a dedicated scratch buffer
             // owned at outer scope and pass that.
-            unsafe {
-                gpu_hal::copy_d2d(0, pli_slot.as_mut_ptr(), pli_slice_ptr, ple_hidden * 2)
-                    .map_err(|e| anyhow!("copy pli slice: {e}"))?;
-            }
+            gpu_hal::copy_d2d(0, pli_slot.as_mut_ptr(), pli_slice_ptr, ple_hidden * 2)
+                .map_err(|e| anyhow!("copy pli slice: {e}"))?;
 
             let mut h_new = GpuBuffer::zeros(0, dtype, &[hidden_size])?;
             g4::fused_mlp_ple(

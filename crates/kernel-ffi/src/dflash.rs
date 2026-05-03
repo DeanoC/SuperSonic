@@ -4,7 +4,11 @@
 //! reused from the existing Qwen3.5 primitives exposed by `prefill_ffi`.
 //! This file houses only what's genuinely new for DFlash M2.
 
-use std::ffi::{c_int, c_void};
+#![cfg_attr(not(supersonic_backend_hip), allow(unused_variables, unreachable_code))]
+
+use std::ffi::c_int;
+#[cfg(supersonic_backend_hip)]
+use std::ffi::c_void;
 
 use gpu_hal::{Backend, GpuBuffer, GpuError, ScalarType};
 

@@ -1,14 +1,13 @@
 //! SuperSonic HTTP server — an OpenAI-compatible inference endpoint
-//! wrapping the `runner` crate's decode engines.
+//! wrapping the shared `supersonic-runtime` crate.
 
-pub mod chat_template;
 pub mod errors;
-pub mod generate;
 pub mod routes;
-pub mod sampling;
 pub mod schemas;
-pub mod session;
-pub mod state;
+
+pub use supersonic_runtime::{
+    backend, capabilities, chat_template, generate, ids, registry, sampling, session, state,
+};
 
 use std::sync::Arc;
 

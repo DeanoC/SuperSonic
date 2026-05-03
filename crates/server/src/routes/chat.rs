@@ -1,19 +1,19 @@
 //! `POST /v1/chat/completions` — streaming and non-streaming.
 
-use std::convert::Infallible;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::State;
-use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::sse::{KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use futures::stream::{self, Stream};
 use futures::StreamExt;
 
+use super::sse;
 use crate::chat_template::ChatMessage;
 use crate::errors::ApiError;
-use crate::generate::{self, GenEvent, GenParams};
+use crate::generate::{self, GenParams};
+use crate::ids;
 use crate::schemas::{
     ChatCompletionChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse,
     ChatStreamChoice, ChatStreamChunk, ChatStreamDelta, Usage,
@@ -54,8 +54,8 @@ pub async fn completions(
     let prompt_ids = generate::prepare(&state, &prompt_text, add_special_tokens, params.max_tokens)
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
 
-    let id = make_id();
-    let created = epoch_secs();
+    let id = ids::chat_completion_id();
+    let created = ids::epoch_secs();
     let model = state.model_id.clone();
 
     if req.stream {
@@ -93,11 +93,11 @@ pub async fn completions(
 }
 
 fn chat_sse_stream(
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<GenEvent>,
+    rx: tokio::sync::mpsc::UnboundedReceiver<generate::GenEvent>,
     id: String,
     created: u64,
     model: String,
-) -> impl Stream<Item = Result<Event, Infallible>> {
+) -> impl Stream<Item = sse::SseEvent> {
     let role_chunk = ChatStreamChunk {
         id: id.clone(),
         object: "chat.completion.chunk",
@@ -112,66 +112,41 @@ fn chat_sse_stream(
             finish_reason: None,
         }],
     };
-    let role_event = Event::default().data(serde_json::to_string(&role_chunk).unwrap());
+    let role_event = sse::json_event(&role_chunk);
 
-    let body = async_stream::stream! {
-        while let Some(ev) = rx.recv().await {
-            match ev {
-                GenEvent::Token(text) => {
-                    let chunk = ChatStreamChunk {
-                        id: id.clone(),
-                        object: "chat.completion.chunk",
-                        created,
-                        model: model.clone(),
-                        choices: vec![ChatStreamChoice {
-                            index: 0,
-                            delta: ChatStreamDelta {
-                                role: None,
-                                content: Some(text),
-                            },
-                            finish_reason: None,
-                        }],
-                    };
-                    yield Ok::<_, Infallible>(Event::default().data(serde_json::to_string(&chunk).unwrap()));
-                }
-                GenEvent::Done { reason, .. } => {
-                    let chunk = ChatStreamChunk {
-                        id: id.clone(),
-                        object: "chat.completion.chunk",
-                        created,
-                        model: model.clone(),
-                        choices: vec![ChatStreamChoice {
-                            index: 0,
-                            delta: ChatStreamDelta { role: None, content: None },
-                            finish_reason: Some(reason.as_str()),
-                        }],
-                    };
-                    yield Ok(Event::default().data(serde_json::to_string(&chunk).unwrap()));
-                    yield Ok(Event::default().data("[DONE]"));
-                    return;
-                }
-                GenEvent::Error(msg) => {
-                    let payload = serde_json::json!({
-                        "error": { "message": msg, "type": "internal_error" }
-                    });
-                    yield Ok(Event::default().data(payload.to_string()));
-                    return;
-                }
-            }
-        }
-    };
+    let token_id = id.clone();
+    let token_model = model.clone();
+    let body = sse::generation_events(
+        rx,
+        move |text| ChatStreamChunk {
+            id: token_id.clone(),
+            object: "chat.completion.chunk",
+            created,
+            model: token_model.clone(),
+            choices: vec![ChatStreamChoice {
+                index: 0,
+                delta: ChatStreamDelta {
+                    role: None,
+                    content: Some(text),
+                },
+                finish_reason: None,
+            }],
+        },
+        move |reason| ChatStreamChunk {
+            id: id.clone(),
+            object: "chat.completion.chunk",
+            created,
+            model: model.clone(),
+            choices: vec![ChatStreamChoice {
+                index: 0,
+                delta: ChatStreamDelta {
+                    role: None,
+                    content: None,
+                },
+                finish_reason: Some(reason.as_str()),
+            }],
+        },
+    );
 
     stream::once(async move { Ok(role_event) }).chain(body)
-}
-
-fn make_id() -> String {
-    let ts = epoch_secs();
-    format!("chatcmpl-{ts:x}{:04x}", rand::random::<u16>())
-}
-
-fn epoch_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }

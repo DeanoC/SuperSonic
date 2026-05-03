@@ -1,8 +1,13 @@
+#[cfg(target_os = "macos")]
 use std::fs;
+#[cfg(target_os = "macos")]
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
 use std::process::Command;
+#[cfg(target_os = "macos")]
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(target_os = "macos")]
 use serde_json::Value;
 
 #[cfg(target_os = "macos")]

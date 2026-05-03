@@ -73,6 +73,7 @@ name = "llama31_certified_kv_microbench"
 path = "src/bin/llama31_certified_kv_microbench.rs"
 
 [dependencies]
+supersonic-core = { path = "../core" }
 gpu-hal = { path = "../gpu-hal" }
 kernel-ffi = { path = "../kernel-ffi" }
 model-store = { path = "../model-store" }

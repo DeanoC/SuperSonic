@@ -794,6 +794,7 @@ struct PrefillScratch {
     /// [seq_len, intermediate_size] BF16 — MLP intermediate
     mlp_buf: GpuBuffer,
     /// [1, vocab_size] BF16 — logits output
+    #[allow(dead_code)]
     logits_buf: GpuBuffer,
     // Full attention scratch:
     /// [num_q_heads, seq_len, head_dim] BF16 — transposed Q for attention
@@ -1534,6 +1535,7 @@ pub fn gpu_reference_replay_step(
 /// each layer in `tap_layers`. The taps are 1:1 with `tap_layers` (BF16 bytes,
 /// length `hidden_dim` each). Used by the DFlash speculative decoder to feed
 /// fused multi-layer target context into the small bidirectional draft model.
+#[allow(dead_code)]
 pub fn gpu_reference_replay_step_with_taps(
     weights: &Qwen35Weights,
     rotary: &RotaryTables,
@@ -2975,7 +2977,7 @@ fn prefill_linear_attention_layer(
     let state_elems = nv * khd * vhd;
     let elem_bytes_f32 = ScalarType::F32.size_in_bytes();
     let out_rows = chunk_len + khd;
-    let mut recurrent_f32 = GpuBuffer::zeros(ordinal, ScalarType::F32, &[nv, khd, vhd])
+    let recurrent_f32 = GpuBuffer::zeros(ordinal, ScalarType::F32, &[nv, khd, vhd])
         .map_err(|e| anyhow::anyhow!("recurrent_f32 alloc: {e}"))?;
     let mut delta_out = GpuBuffer::zeros(ordinal, ScalarType::F32, &[nv, out_rows, vhd])
         .map_err(|e| anyhow::anyhow!("delta_out alloc: {e}"))?;

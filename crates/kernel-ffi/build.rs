@@ -12,6 +12,10 @@ fn command_exists(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn verbose_build_warnings() -> bool {
+    env::var_os("SUPERSONIC_BUILD_VERBOSE").is_some()
+}
+
 fn detect_hip_archs() -> Vec<String> {
     if let Ok(arch) = env::var("HIP_ARCH") {
         let list: Vec<String> = arch
@@ -234,7 +238,7 @@ fn compile_hip(kernel_dir: &Path, out_dir: &Path) {
     let archs = detect_hip_archs();
     if archs.is_empty() {
         println!("cargo:warning=no HIP arch detected (set HIP_ARCH or install rocminfo); kernel binary may not run on the target GPU");
-    } else {
+    } else if verbose_build_warnings() {
         println!(
             "cargo:warning=building HIP kernels for arch(es): {}",
             archs.join(", ")
@@ -315,10 +319,12 @@ fn compile_cuda(kernel_dir: &Path, out_dir: &Path) {
         ),
     ];
     let archs = detect_cuda_archs();
-    println!(
-        "cargo:warning=building CUDA kernels for arch(es): {}",
-        archs.join(", ")
-    );
+    if verbose_build_warnings() {
+        println!(
+            "cargo:warning=building CUDA kernels for arch(es): {}",
+            archs.join(", ")
+        );
+    }
 
     let mut objects = Vec::new();
     for (src_name, obj_name, context) in sources {

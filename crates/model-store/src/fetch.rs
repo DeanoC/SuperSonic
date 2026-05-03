@@ -80,6 +80,35 @@ impl fmt::Display for BakeVariant {
     }
 }
 
+/// Pick the bake variant implied by frontend flags. Low-bit modes take
+/// priority over FP8, matching the runner/runtime validation order.
+pub fn variant_from_flags(
+    q4km_gptq: bool,
+    q4km: bool,
+    int4: bool,
+    fp8_runtime: bool,
+) -> BakeVariant {
+    if q4km_gptq {
+        BakeVariant::Q4KmGptq
+    } else if q4km {
+        BakeVariant::Q4Km
+    } else if int4 {
+        BakeVariant::Int4Gptq
+    } else if fp8_runtime {
+        BakeVariant::Fp8Native
+    } else {
+        BakeVariant::Bf16
+    }
+}
+
+pub fn version_ok_for_variant(variant: BakeVariant, bake_dir: &Path) -> bool {
+    match variant {
+        BakeVariant::Q4Km => crate::version_ok_q4km(bake_dir),
+        BakeVariant::Q4KmGptq => crate::version_ok_q4km_gptq(bake_dir),
+        _ => crate::version_ok(bake_dir),
+    }
+}
+
 /// Where to fetch from. `tag` defaults to `bakes-v{FORMAT_VERSION}`.
 #[derive(Debug, Clone)]
 pub struct ReleaseSource {
@@ -862,6 +891,30 @@ mod tests {
         assert_ne!(
             BakeVariant::Fp8Native.bake_dir(md),
             BakeVariant::Int4Gptq.bake_dir(md)
+        );
+    }
+
+    #[test]
+    fn variant_from_flags_matches_runtime_priority() {
+        assert_eq!(
+            variant_from_flags(false, false, false, false),
+            BakeVariant::Bf16
+        );
+        assert_eq!(
+            variant_from_flags(false, false, false, true),
+            BakeVariant::Fp8Native
+        );
+        assert_eq!(
+            variant_from_flags(false, false, true, true),
+            BakeVariant::Int4Gptq
+        );
+        assert_eq!(
+            variant_from_flags(false, true, true, true),
+            BakeVariant::Q4Km
+        );
+        assert_eq!(
+            variant_from_flags(true, true, true, true),
+            BakeVariant::Q4KmGptq
         );
     }
 

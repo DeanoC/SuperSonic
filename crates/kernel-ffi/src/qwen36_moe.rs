@@ -12,6 +12,11 @@
 //! stub also serves as a smoke test for descriptor field layout — a
 //! Rust↔C++ struct-mismatch bug found here saves hours later.
 
+#![cfg_attr(
+    not(supersonic_backend_hip),
+    allow(unused_variables, unused_mut, unreachable_code)
+)]
+
 use std::ffi::{c_int, c_void};
 use std::os::raw::c_uint;
 
@@ -786,6 +791,7 @@ pub enum Qwen36MoePersistentMode {
 }
 
 impl Qwen36MoePersistentMode {
+    #[allow(dead_code)]
     fn as_ffi(self) -> c_int {
         match self {
             Self::Full => 0,

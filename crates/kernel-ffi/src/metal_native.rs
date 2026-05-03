@@ -1,4 +1,6 @@
-use std::ffi::{c_char, c_int, c_void, CString};
+use std::ffi::c_void;
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+use std::ffi::{c_char, c_int, CString};
 
 use gpu_hal::{Backend, GpuBuffer, GpuError, ScalarType};
 
@@ -3460,6 +3462,7 @@ impl MetalBatchGuard {
     }
 
     pub(crate) fn finish(self) -> Result<(), GpuError> {
+        let _ = self.active;
         Ok(())
     }
 }
@@ -3915,6 +3918,7 @@ pub(crate) fn qwen_full_projections_bf16(
 }
 
 #[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[allow(dead_code)]
 pub(crate) fn lm_head_argmax_bf16(
     _hidden: &GpuBuffer,
     _weight: &GpuBuffer,
@@ -3929,6 +3933,7 @@ pub(crate) fn lm_head_argmax_bf16(
 }
 
 #[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[allow(dead_code)]
 pub(crate) fn argmax_bf16(
     _logits: &GpuBuffer,
     _out_index: &mut GpuBuffer,
