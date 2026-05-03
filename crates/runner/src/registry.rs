@@ -806,16 +806,20 @@ static REGISTRY: &[RegistryEntry] = &[
             shared_expert_intermediate_size: 512,
         }),
     },
-    // Qwen3.6-35B-A3B INT4 GPTQ on AMD gfx942. CDNA bring-up reuses the
-    // HIP Qwen3.6-MoE kernels and the same baked tensor layout as gfx1100;
-    // the larger VRAM budget reflects MI300X-class cards rather than a
-    // memory-tight 24 GiB target.
+    // Qwen3.6-35B-A3B INT4/FP8-runtime/KV-FP8 on AMD gfx942. CDNA bring-up
+    // reuses the HIP Qwen3.6-MoE kernels and the same baked tensor layout as
+    // gfx1100. Budget covers FP8 weights (~35 GiB) + KV/scales/scratch +
+    // headroom. INT4 mode also uses this entry; the over-reservation is
+    // informational only (registry::lookup keys on (model, backend, arch) and
+    // returns the first match — we cannot add a second entry distinguished only
+    // by weight mode without changing the lookup signature, out of scope for
+    // this branch).
     RegistryEntry {
         model: ModelVariant::Qwen3_6_35B_A3B,
         backend: Backend::Hip,
         arch: GpuArch::Gfx942,
         vram: VramBudget {
-            fixed_bytes: 24 * GIB,
+            fixed_bytes: 48 * GIB,
             overhead_factor: 1.1,
         },
         params: FamilyParams::Qwen36Moe(Qwen36MoeKernelParams {
@@ -1014,8 +1018,14 @@ mod tests {
                 }
                 _ => panic!("qwen3.6-35b-a3b must use Qwen36Moe family params"),
             }
-            // VRAM budget must leave headroom on a 24 GiB card.
-            assert!(entry.vram.fixed_bytes <= 24 * GIB);
+            // VRAM budget: gfx942 (MI300X-class) is bumped to 48 GiB to cover
+            // FP8 weights (~35 GiB) + KV/scales/scratch + headroom. Other
+            // targets must still leave headroom on a 24 GiB card.
+            if arch == GpuArch::Gfx942 {
+                assert_eq!(entry.vram.fixed_bytes, 48 * GIB);
+            } else {
+                assert!(entry.vram.fixed_bytes <= 24 * GIB);
+            }
         }
     }
 
