@@ -28,20 +28,7 @@ use kernel_ffi::gemma4 as g4;
 use kernel_ffi::gemma4::{Gemma4BatchSeqDesc, Gemma4DecodeLayerDesc, Gemma4Int4ScaleDesc};
 use model_store::BakedStore;
 
-fn bf16_bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
-    bytes
-        .chunks_exact(2)
-        .map(|c| bf16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
-        .collect()
-}
-
-fn f32_to_bf16_bytes(vals: &[f32]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(vals.len() * 2);
-    for &v in vals {
-        out.extend_from_slice(&bf16::from_f32(v).to_bits().to_le_bytes());
-    }
-    out
-}
+use crate::tensor_bytes::{bf16_bytes_to_f32, f32_to_bf16_bytes};
 
 fn upload_bf16(device: usize, shape: &[usize], host: &[f32]) -> Result<GpuBuffer> {
     let bytes = f32_to_bf16_bytes(host);

@@ -47,8 +47,9 @@ pub struct LmHeadFold<'a> {
 }
 
 use crate::qwen36_moe_decode::{
-    ffn_workspace_floats, full_attn_workspace_floats, linear_attn_workspace_floats,
-    AttnLayerBuffers, DecodeOutputs, LayerBuffers, MultiLayerGeom,
+    bf16_bytes_to_f32, ffn_workspace_floats, full_attn_workspace_floats,
+    linear_attn_workspace_floats, AttnLayerBuffers, DecodeOutputs, ExpertPrefetchPhase,
+    ExpertRoute, LayerBuffers, MultiLayerGeom,
 };
 
 /// Pre-allocated scratch + cached descriptor arrays for the persistent
@@ -286,7 +287,7 @@ impl PersistentScratch {
         mut prefetch: F,
     ) -> Result<DecodeOutputs>
     where
-        F: FnMut(usize, &[usize]) -> Result<()>,
+        F: FnMut(ExpertPrefetchPhase, usize, &[ExpertRoute]) -> Result<()>,
     {
         let hidden_bytes = self.geom.hidden as usize * 2;
         if initial_hidden_bytes.len() != hidden_bytes {
@@ -306,6 +307,9 @@ impl PersistentScratch {
 
         let t_launch = std::time::Instant::now();
         for layer_idx in 0..self.num_layers {
+            prefetch(ExpertPrefetchPhase::Lookahead, layer_idx, &[]).with_context(|| {
+                format!("lookahead prefetch routed experts (layer {layer_idx})")
+            })?;
             persistent_decode_launch_range(
                 ordinal,
                 ScalarType::BF16,
@@ -328,10 +332,10 @@ impl PersistentScratch {
             .map_err(|e: GpuError| anyhow!(e))
             .with_context(|| format!("persistent router-only launch (layer {layer_idx})"))?;
 
-            let topk = self
-                .download_topk_indices(ordinal)
-                .with_context(|| format!("download FFN top-k indices (layer {layer_idx})"))?;
-            prefetch(layer_idx, &topk)
+            let routes = self
+                .download_topk_routes(ordinal)
+                .with_context(|| format!("download FFN top-k routes (layer {layer_idx})"))?;
+            prefetch(ExpertPrefetchPhase::Demand, layer_idx, &routes)
                 .with_context(|| format!("prefetch routed experts (layer {layer_idx})"))?;
 
             persistent_decode_launch_range(
@@ -388,6 +392,30 @@ impl PersistentScratch {
         )
         .context("d2h ffn_topk_idx_scratch")?;
         Ok(host.into_iter().map(|idx| idx as usize).collect())
+    }
+
+    fn download_topk_routes(&self, ordinal: usize) -> Result<Vec<ExpertRoute>> {
+        let top_k = self.geom.top_k as usize;
+        let idx = self.download_topk_indices(ordinal)?;
+        let mut weight_bytes = vec![0u8; top_k * std::mem::size_of::<u16>()];
+        copy_d2h(
+            ordinal,
+            weight_bytes.as_mut_ptr() as *mut _,
+            self.hidden_ping.as_ptr(),
+            weight_bytes.len(),
+        )
+        .context("d2h ffn top-k route weights")?;
+        let weights = bf16_bytes_to_f32(&weight_bytes);
+        Ok(idx
+            .into_iter()
+            .zip(weights)
+            .enumerate()
+            .map(|(rank, (expert_idx, weight))| ExpertRoute {
+                rank,
+                expert_idx,
+                weight,
+            })
+            .collect())
     }
 }
 

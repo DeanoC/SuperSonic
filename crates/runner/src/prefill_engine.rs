@@ -14,6 +14,10 @@ use qwen35::rotary::RotaryTables;
 use qwen35::state::{kv_fp8_bf16_sidecar_enabled, kv_fp8_bf16_sidecar_window_tokens, ModelState};
 use qwen35::weights::Qwen35Weights;
 
+use crate::tensor_bytes::{
+    bf16_bytes_to_f32 as decode_bf16_le, f32_bytes_to_f32 as decode_f32_le,
+    f32_to_bf16_bytes as encode_bf16_le, f32_to_f32_bytes as encode_f32_le,
+};
 use kernel_ffi::prefill_ffi;
 
 /// D2D copy that stays correctly sequenced with pending GPU work when an
@@ -37,42 +41,12 @@ fn copy_d2d_batched(
     }
 }
 
-fn decode_bf16_le(bytes: &[u8]) -> Vec<f32> {
-    bytes
-        .chunks_exact(2)
-        .map(|chunk| bf16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
-        .collect()
-}
-
-fn encode_bf16_le(values: &[f32]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(values.len() * 2);
-    for &v in values {
-        out.extend_from_slice(&bf16::from_f32(v).to_le_bytes());
-    }
-    out
-}
-
-fn encode_f32_le(values: &[f32]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(values.len() * 4);
-    for &v in values {
-        out.extend_from_slice(&v.to_le_bytes());
-    }
-    out
-}
-
 fn encode_u32_le(values: &[usize]) -> Vec<u8> {
     let mut out = Vec::with_capacity(values.len() * 4);
     for &v in values {
         out.extend_from_slice(&(v as u32).to_le_bytes());
     }
     out
-}
-
-fn decode_f32_le(bytes: &[u8]) -> Vec<f32> {
-    bytes
-        .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-        .collect()
 }
 
 fn detect_outlier_cols(lhs_bf16: &[f32], rows: usize, cols: usize, threshold: f32) -> Vec<usize> {

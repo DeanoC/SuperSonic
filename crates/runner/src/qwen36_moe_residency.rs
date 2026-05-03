@@ -61,6 +61,14 @@ pub struct MoeExpertResidencyStats {
     pub evicted_pages: u64,
     pub uploaded_bytes: usize,
     pub unmapped_bytes: usize,
+    pub prefetch_requests: u64,
+    pub prefetch_hits: u64,
+    pub prefetch_misses: u64,
+    pub prefetch_page_hits: u64,
+    pub prefetch_page_misses: u64,
+    pub prefetch_skipped: u64,
+    pub prefetch_skipped_pages: u64,
+    pub prefetch_uploaded_bytes: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -133,6 +141,20 @@ pub struct MoeExpertResidencyManager {
     evicted_pages: u64,
     uploaded_bytes: usize,
     unmapped_bytes: usize,
+    prefetch_requests: u64,
+    prefetch_hits: u64,
+    prefetch_misses: u64,
+    prefetch_page_hits: u64,
+    prefetch_page_misses: u64,
+    prefetch_skipped: u64,
+    prefetch_skipped_pages: u64,
+    prefetch_uploaded_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResidencyAccessKind {
+    Demand,
+    Prefetch,
 }
 
 impl MoeExpertResidencyManager {
@@ -153,6 +175,14 @@ impl MoeExpertResidencyManager {
             evicted_pages: 0,
             uploaded_bytes: 0,
             unmapped_bytes: 0,
+            prefetch_requests: 0,
+            prefetch_hits: 0,
+            prefetch_misses: 0,
+            prefetch_page_hits: 0,
+            prefetch_page_misses: 0,
+            prefetch_skipped: 0,
+            prefetch_skipped_pages: 0,
+            prefetch_uploaded_bytes: 0,
         }
     }
 
@@ -179,6 +209,14 @@ impl MoeExpertResidencyManager {
             evicted_pages: self.evicted_pages,
             uploaded_bytes: self.uploaded_bytes,
             unmapped_bytes: self.unmapped_bytes,
+            prefetch_requests: self.prefetch_requests,
+            prefetch_hits: self.prefetch_hits,
+            prefetch_misses: self.prefetch_misses,
+            prefetch_page_hits: self.prefetch_page_hits,
+            prefetch_page_misses: self.prefetch_page_misses,
+            prefetch_skipped: self.prefetch_skipped,
+            prefetch_skipped_pages: self.prefetch_skipped_pages,
+            prefetch_uploaded_bytes: self.prefetch_uploaded_bytes,
         }
     }
 
@@ -301,6 +339,22 @@ impl MoeExpertResidencyManager {
     }
 
     pub fn ensure_resident(&mut self, store: &BakedStore, key: MoeExpertKey) -> Result<()> {
+        self.ensure_resident_with_kind(store, key, ResidencyAccessKind::Demand)
+    }
+
+    pub fn prefetch_resident(&mut self, store: &BakedStore, key: MoeExpertKey) -> Result<()> {
+        self.ensure_resident_with_kind(store, key, ResidencyAccessKind::Prefetch)
+    }
+
+    fn ensure_resident_with_kind(
+        &mut self,
+        store: &BakedStore,
+        key: MoeExpertKey,
+        kind: ResidencyAccessKind,
+    ) -> Result<()> {
+        if kind == ResidencyAccessKind::Prefetch {
+            self.prefetch_requests += 1;
+        }
         let tensor_idx = self.tensor_idx(key.layer_idx, key.projection)?;
         let (name, allocation_id, logical_offset, logical_len, pages) = {
             let tensor = &self.tensors[tensor_idx];
@@ -359,8 +413,14 @@ impl MoeExpertResidencyManager {
             });
             if all_pages_resident {
                 self.hits += 1;
+                if kind == ResidencyAccessKind::Prefetch {
+                    self.prefetch_hits += 1;
+                }
                 for span in &pages {
                     self.page_hits += 1;
+                    if kind == ResidencyAccessKind::Prefetch {
+                        self.prefetch_page_hits += 1;
+                    }
                     if let Some(page) = self.resident_pages.get_mut(&ResidentPageKey {
                         tensor_idx,
                         page_offset: span.offset,
@@ -374,6 +434,9 @@ impl MoeExpertResidencyManager {
         }
 
         self.misses += 1;
+        if kind == ResidencyAccessKind::Prefetch {
+            self.prefetch_misses += 1;
+        }
         let mut missing_pages = Vec::new();
         for span in &pages {
             let page_key = ResidentPageKey {
@@ -383,12 +446,29 @@ impl MoeExpertResidencyManager {
             if let Some(page) = self.resident_pages.get_mut(&page_key) {
                 page.last_used = self.clock;
                 self.page_hits += 1;
+                if kind == ResidencyAccessKind::Prefetch {
+                    self.prefetch_page_hits += 1;
+                }
             } else {
                 missing_pages.push(*span);
             }
         }
 
+        if kind == ResidencyAccessKind::Prefetch {
+            let free_pages = self
+                .config
+                .max_resident_pages
+                .saturating_sub(self.resident_pages.len());
+            if missing_pages.len() > free_pages {
+                self.prefetch_skipped += 1;
+                self.prefetch_skipped_pages += missing_pages.len() as u64;
+                return Ok(());
+            }
+        }
         self.page_misses += missing_pages.len() as u64;
+        if kind == ResidencyAccessKind::Prefetch {
+            self.prefetch_page_misses += missing_pages.len() as u64;
+        }
         for span in missing_pages {
             while self.resident_pages.len() >= self.config.max_resident_pages {
                 self.evict_lru_page()?;
@@ -409,6 +489,9 @@ impl MoeExpertResidencyManager {
                     )
                 })?;
             self.uploaded_bytes += span.copy_len;
+            if kind == ResidencyAccessKind::Prefetch {
+                self.prefetch_uploaded_bytes += span.copy_len;
+            }
             self.resident_pages.insert(
                 ResidentPageKey {
                     tensor_idx,
@@ -857,6 +940,70 @@ mod tests {
                 .expect("read expert 1");
             assert!(bytes.iter().all(|b| *b == 2));
         });
+    }
+
+    #[test]
+    fn prefetch_does_not_evict_when_page_budget_is_full() {
+        with_supported_vmm_backend(
+            "prefetch_does_not_evict_when_page_budget_is_full",
+            |_backend| {
+                let probe_tmp = synthetic_store(1, 4096);
+                let probe_store = BakedStore::open(probe_tmp.path()).expect("open probe store");
+                let mut probe =
+                    MoeExpertResidencyManager::new(0, MoeExpertResidencyConfig::new(1).unwrap());
+                probe
+                    .register_tensor(
+                        &probe_store,
+                        0,
+                        MoeExpertProjection::GateUp,
+                        "model.layers.0.mlp.experts.gate_up_proj",
+                        1,
+                    )
+                    .expect("register probe tensor");
+                let expert_bytes = probe.tensors[0].page_bytes;
+
+                let tmp = synthetic_store(2, expert_bytes);
+                let store = BakedStore::open(tmp.path()).expect("open synthetic store");
+                let mut manager =
+                    MoeExpertResidencyManager::new(0, MoeExpertResidencyConfig::new(1).unwrap());
+                manager
+                    .register_tensor(
+                        &store,
+                        0,
+                        MoeExpertProjection::GateUp,
+                        "model.layers.0.mlp.experts.gate_up_proj",
+                        2,
+                    )
+                    .expect("register tensor");
+
+                let e0 = MoeExpertKey {
+                    layer_idx: 0,
+                    expert_idx: 0,
+                    projection: MoeExpertProjection::GateUp,
+                };
+                let e1 = MoeExpertKey {
+                    layer_idx: 0,
+                    expert_idx: 1,
+                    projection: MoeExpertProjection::GateUp,
+                };
+
+                manager.ensure_resident(&store, e0).expect("load expert 0");
+                manager
+                    .prefetch_resident(&store, e1)
+                    .expect("prefetch expert 1");
+
+                assert!(manager.is_resident(e0));
+                assert!(!manager.is_resident(e1));
+                assert_eq!(manager.stats().resident_pages, 1);
+                assert_eq!(manager.stats().evicted_pages, 0);
+                assert_eq!(manager.stats().page_misses, 1);
+                assert_eq!(manager.stats().prefetch_requests, 1);
+                assert_eq!(manager.stats().prefetch_misses, 1);
+                assert_eq!(manager.stats().prefetch_page_misses, 0);
+                assert_eq!(manager.stats().prefetch_skipped, 1);
+                assert_eq!(manager.stats().prefetch_skipped_pages, 1);
+            },
+        );
     }
 
     #[test]

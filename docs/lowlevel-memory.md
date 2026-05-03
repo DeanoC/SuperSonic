@@ -99,7 +99,32 @@ Current scope:
   loading a hard error.
 - `SUPERSONIC_MOE_ISLAND_CAP_EXPERTS=N` switches Qwen3.6-MoE INT4 decode from
   fully resident virtual expert slabs to sparse router-prefetched islands with
-  at most `N` experts' two routed projections tracked resident at once.
+  at most `N` experts' two routed projections tracked resident at once. Sparse
+  telemetry records ordered router rank summaries, including per-rank resident
+  hits before demand loading, previous-token repeats, previous-rank to
+  current-rank repeat transitions, derived transition probabilities, and
+  average router weight.
+- `SUPERSONIC_MOE_ISLAND_PREFETCH=previous-token` enables experimental
+  previous-token routed-expert lookahead for sparse MoE islands. It preloads
+  each layer's previous top-k before that layer's router runs. Set
+  `SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS=N` to prefetch only the first N ordered
+  router ranks, for example N=1 for rank-0-only lookahead. Sparse telemetry
+  records the effective prefetch rank count plus prefetch hit/miss/page
+  counters. Prefetch is non-evicting: if the sparse page budget has no room for
+  the missing pages, the runtime records `prefetch_skipped` counters and leaves
+  resident demand pages untouched. This is a measurement hook for future
+  overlapped prefetch work, not a default path.
+- `SUPERSONIC_MOE_ISLAND_PREFETCH=previous-token-resident` is the conservative
+  variant: it only refreshes the previous-token expert pair when both routed
+  projections are already resident. It never uploads missing pages, so it can
+  measure LRU refresh value without changing residency admission.
+- `SUPERSONIC_MOE_ISLAND_PREFETCH=transition` enables online transition-aware
+  admission for sparse MoE islands. Each layer tracks how often a previous-token
+  routed rank is reused by the current token, waits for
+  `SUPERSONIC_MOE_ISLAND_PREFETCH_TRANSITION_MIN_OBS` observations per previous
+  rank (default 32), then prefetches only ranks with observed repeats. Candidate
+  ordering uses repeat probability and still honors
+  `SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS` as the maximum candidate count.
 - `SUPERSONIC_VMM_KV=0` disables the Qwen3.5 and Qwen3.6 KV integrations.
 - `SUPERSONIC_VMM_KV=1` requests KV VMM and logs if the backend cannot support
   it. HIP may auto-enable when unset; CUDA requires this explicit opt-in.

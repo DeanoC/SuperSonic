@@ -258,6 +258,74 @@ carry, so the bake is produced on a bigger box and distributed via
 GitHub releases (see [bake-distribution.md](bake-distribution.md));
 consumers pull it automatically on first run.
 
+**Sparse MoE VMM residency sweep** — measured 2026-05-03 on the same
+RX 7900 XTX with `tests/gfx1100/bench_qwen36_sparse_caps.py`, the
+canonical fox prompt, 16 generated tokens, INT4 weights, persistent decode,
+and `--emit-stage-timings`. The dense row is fully resident virtual expert
+slabs; sparse rows set `SUPERSONIC_MOE_ISLAND_CAP_EXPERTS=N` and capture the
+runner's VMM telemetry JSON.
+
+| Mode | total ms/tok | tok/s | total resident GiB | MoE resident GiB | KV resident GiB | peak pages | page misses | evicted pages | ids match |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|:---:|
+| dense | 28.71 | 34.83 | 15.04 | 15.00 | 0.04 | - | - | - | yes |
+| cap8 | 137.95 | 7.25 | 0.07 | 0.03 | 0.04 | 16 | 13099 | 13083 | yes |
+| cap32 | 140.26 | 7.13 | 0.16 | 0.12 | 0.04 | 64 | 13099 | 13035 | yes |
+| cap64 | 152.71 | 6.55 | 0.29 | 0.25 | 0.04 | 128 | 13099 | 12971 | yes |
+| cap128 | 140.89 | 7.10 | 0.54 | 0.50 | 0.04 | 256 | 13099 | 12843 | yes |
+| cap256 | 142.70 | 7.01 | 1.04 | 1.00 | 0.04 | 512 | 13099 | 12587 | yes |
+| cap320 | 104.52 | 9.57 | 1.29 | 1.25 | 0.04 | 640 | 8357 | 7717 | yes |
+
+The curve is a memory win but not a throughput win: cap320 cuts total VMM
+resident memory from ~15.0 GiB to ~1.3 GiB, but it is still ~3.6× slower than
+dense on this short prompt because page misses dominate. Sparse islands remain
+an opt-in small-VRAM mode for now; the runtime should not auto-default to
+`SUPERSONIC_MOE_ISLAND_CAP_EXPERTS` on gfx1100 until prefetching/reuse reduces
+the miss rate substantially.
+
+The sweep helper can compare prefetch policies in one run. Use
+`--prefetch-rank-sweep none,1,2,4,all` to expand every sparse cap across no
+lookahead, rank-limited lookahead, and full top-k lookahead rows. Use
+`--prefetch-mode-sweep disabled,previous-token,previous-token-resident,transition`
+together with `--prefetch-rank-sweep none,1,all` to compare normal
+previous-token prefetch, resident-only LRU refresh, and online transition-aware
+admission without hand-running separate commands. The markdown table includes
+same-rank repeat, previous-rank reuse, and best-transition columns derived from
+the route transition matrix.
+
+**Sparse MoE previous-token prefetch sweep** — measured 2026-05-03 after
+non-evicting prefetch admission landed. Same host/GPU/model/prompt as above,
+cap fixed at `SUPERSONIC_MOE_ISLAND_CAP_EXPERTS=320`, 16 generated tokens,
+no warmup:
+
+| Mode | total ms/tok | tok/s | total resident GiB | prefetch | ranks | page misses | prefetch page misses | prefetch skipped | rank0 resident | rank0 repeat | evicted pages | ids match |
+|---|---:|---:|---:|:---:|---:|---:|---:|---:|---:|---:|---:|:---:|
+| dense | 28.73 | 34.81 | 15.04 | - | - | - | - | - | - | - | - | yes |
+| cap320-none | 108.66 | 9.20 | 1.29 | disabled | 0 | 8357 | 0 | 0 | 52.4% | 52.3% | 7717 | yes |
+| cap320-r1 | 119.62 | 8.36 | 1.29 | previous-token | 1 | 9815 | 0 | 616 | 42.6% | 52.3% | 9175 | yes |
+| cap320-r1-resident | 116.18 | 8.61 | 1.29 | previous-token-resident | 1 | 9752 | 0 | 0 | 43.9% | 52.3% | 9112 | yes |
+| cap320-r2 | 131.78 | 7.59 | 1.29 | previous-token | 2 | 11190 | 0 | 2196 | 25.8% | 52.3% | 10550 | yes |
+| cap320-r4 | 140.39 | 7.12 | 1.29 | previous-token | 4 | 12310 | 0 | 5511 | 9.5% | 52.3% | 11670 | yes |
+| cap320-all | 147.75 | 6.77 | 1.29 | previous-token | 8 | 12927 | 0 | 11961 | 0.6% | 52.3% | 12287 | yes |
+
+Non-evicting admission successfully prevents prefetch page misses, but this
+previous-token policy is still a regression on the fox prompt. As ranks
+increase, skipped prefetches and demand page misses rise monotonically. The
+resident-only row keeps prefetch page misses and skipped prefetches at zero,
+but still regresses versus no lookahead, so even refreshing previous-token
+residents perturbs LRU in the wrong direction for this prompt. Treat
+previous-token prefetch as diagnostic only; the next useful policy needs a
+stronger admission signal than "same layer's previous token top-k".
+
+**Sparse MoE transition-prefetch smoke** — measured 2026-05-03 with
+`SUPERSONIC_MOE_ISLAND_CAP_EXPERTS=320`, 8 generated tokens, no warmup, and
+`--prefetch-transition-min-obs 1` to force the online predictor path to admit
+within the short run. IDs matched across all rows. The transition path remained
+non-evicting and recorded zero prefetch page misses, but it regressed this short
+fox prompt (`126.31 ms/tok`) versus no lookahead (`108.63 ms/tok`) and
+previous-token rank-1 (`122.00 ms/tok`). Treat transition prefetch as an
+experimental policy that needs longer prompts and prompt diversity before it can
+be considered for defaults.
+
 Reproduce:
 
 ```bash

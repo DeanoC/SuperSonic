@@ -28,17 +28,22 @@ use qwen36_moe::weights::{
 use crate::qwen36_moe_decode::{
     argmax_bf16_logits, dequant_int4_to_bf16_bytes, host_final_norm_lm_head, run_chained_decode,
     run_chained_decode_fast, run_chained_decode_fast_with_expert_prefetch, sample_bf16_logits,
-    AttnLayerBuffers, FfnInt4Sidecars, FfnLayerBuffers, FullAttnInt4Sidecars, FullAttnKvCache,
-    LayerBuffers, LinearAttnInt4Sidecars, MtpLayerBuffers, MultiLayerGeom, ResidentWeight,
-    XorshiftRng,
+    AttnLayerBuffers, ExpertPrefetchPhase, ExpertRoute, FfnInt4Sidecars, FfnLayerBuffers,
+    FullAttnInt4Sidecars, FullAttnKvCache, LayerBuffers, LinearAttnInt4Sidecars, MtpLayerBuffers,
+    MultiLayerGeom, ResidentWeight, XorshiftRng,
 };
+use crate::qwen36_moe_prefetch::handle_moe_expert_prefetch;
 use crate::qwen36_moe_residency::{
-    MoeExpertKey, MoeExpertProjection, MoeExpertResidencyConfig, MoeExpertResidencyManager,
+    MoeExpertProjection, MoeExpertResidencyConfig, MoeExpertResidencyManager,
 };
 use crate::qwen36_moe_speculative::{
     run_speculative_decode_step, run_speculative_decode_step_batched,
 };
 use crate::qwen36_moe_state::{refresh_linear_attn_state, restore_linear_attn_state};
+use crate::qwen36_moe_telemetry::{
+    MoeIslandPrefetchMode, MoeRouteTelemetry, MoeSparseTelemetry, MoeSparseTelemetrySnapshot,
+    MoeTransitionPredictor, VirtualKvStats,
+};
 use crate::registry::{FamilyParams, Qwen36MoeKernelParams, RegistryEntry};
 
 const GIB: f64 = (1024 * 1024 * 1024) as f64;
@@ -128,16 +133,6 @@ pub struct VirtualBakeProbe {
     pub mapping_count: usize,
     pub loaded_tensors: Vec<String>,
     pub failed_tensors: Vec<String>,
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-struct VirtualKvStats {
-    layers: usize,
-    logical_bytes: usize,
-    reserved_bytes: usize,
-    resident_bytes: usize,
-    logical_resident_bytes: usize,
-    mappings: usize,
 }
 
 pub fn run_qwen36_moe_dry_run(
@@ -1097,6 +1092,75 @@ fn moe_island_cap_experts_from_env() -> Result<Option<usize>> {
     Ok(Some(cap))
 }
 
+fn moe_island_prefetch_ranks_from_env_value(
+    raw: Option<&str>,
+    mode: MoeIslandPrefetchMode,
+    top_k: usize,
+) -> Result<usize> {
+    match mode {
+        MoeIslandPrefetchMode::Disabled => {
+            if raw.is_some() {
+                anyhow::bail!(
+                    "SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS requires \
+                     SUPERSONIC_MOE_ISLAND_PREFETCH=previous-token, \
+                     previous-token-resident, or transition"
+                );
+            }
+            Ok(0)
+        }
+        MoeIslandPrefetchMode::PreviousToken
+        | MoeIslandPrefetchMode::PreviousTokenResidentOnly
+        | MoeIslandPrefetchMode::Transition => match raw {
+            None | Some("all") => Ok(top_k),
+            Some(value) => {
+                let ranks = value.parse::<usize>().with_context(|| {
+                    format!(
+                        "parse SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS={value:?} as positive integer"
+                    )
+                })?;
+                if ranks == 0 || ranks > top_k {
+                    anyhow::bail!(
+                        "SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS must be in 1..={top_k}; got {ranks}"
+                    );
+                }
+                Ok(ranks)
+            }
+        },
+    }
+}
+
+fn moe_island_prefetch_ranks_from_env(mode: MoeIslandPrefetchMode, top_k: usize) -> Result<usize> {
+    let raw = std::env::var("SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS").ok();
+    moe_island_prefetch_ranks_from_env_value(raw.as_deref(), mode, top_k)
+}
+
+fn moe_island_prefetch_transition_min_observations_from_env_value(
+    raw: Option<&str>,
+    mode: MoeIslandPrefetchMode,
+) -> Result<u32> {
+    if !mode.transition_weighted() {
+        if raw.is_some() {
+            anyhow::bail!(
+                "SUPERSONIC_MOE_ISLAND_PREFETCH_TRANSITION_MIN_OBS requires \
+                 SUPERSONIC_MOE_ISLAND_PREFETCH=transition"
+            );
+        }
+        return Ok(0);
+    }
+
+    let Some(value) = raw else {
+        return Ok(32);
+    };
+    value.parse::<u32>().with_context(|| {
+        format!("parse SUPERSONIC_MOE_ISLAND_PREFETCH_TRANSITION_MIN_OBS={value:?} as integer")
+    })
+}
+
+fn moe_island_prefetch_transition_min_observations(mode: MoeIslandPrefetchMode) -> Result<u32> {
+    let raw = std::env::var("SUPERSONIC_MOE_ISLAND_PREFETCH_TRANSITION_MIN_OBS").ok();
+    moe_island_prefetch_transition_min_observations_from_env_value(raw.as_deref(), mode)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Qwen36KvVmmMode {
     Auto,
@@ -1176,181 +1240,6 @@ fn virtual_kv_stats_for_layers(layers: &[LayerBuffers]) -> VirtualKvStats {
         }
     }
     out
-}
-
-#[derive(Debug, Clone, Copy)]
-struct MoeSparseTelemetrySnapshot {
-    stats: crate::qwen36_moe_residency::MoeExpertResidencyStats,
-    arena: gpu_hal::VirtualArenaStats,
-}
-
-impl MoeSparseTelemetrySnapshot {
-    fn capture(manager: &MoeExpertResidencyManager) -> Self {
-        Self {
-            stats: manager.stats(),
-            arena: manager.arena().stats(),
-        }
-    }
-}
-
-#[derive(Debug)]
-struct MoeSparseTelemetry {
-    dump_path: Option<PathBuf>,
-    decode_path: &'static str,
-    steps: Vec<serde_json::Value>,
-    peak_resident_slices: usize,
-    peak_resident_pages: usize,
-    peak_page_backed_slices: usize,
-    peak_resident_bytes: usize,
-    peak_logical_resident_bytes: usize,
-}
-
-impl MoeSparseTelemetry {
-    fn from_env(active: bool, persistent_decode: bool) -> Result<Option<Self>> {
-        if !active {
-            return Ok(None);
-        }
-        let dump_path = std::env::var_os("SUPERSONIC_MOE_ISLAND_TELEMETRY_JSON").map(PathBuf::from);
-        Ok(Some(Self {
-            dump_path,
-            decode_path: if persistent_decode {
-                "segmented_persistent"
-            } else {
-                "chained"
-            },
-            steps: Vec::new(),
-            peak_resident_slices: 0,
-            peak_resident_pages: 0,
-            peak_page_backed_slices: 0,
-            peak_resident_bytes: 0,
-            peak_logical_resident_bytes: 0,
-        }))
-    }
-
-    fn record_step(
-        &mut self,
-        step: usize,
-        position: i32,
-        is_generation_step: bool,
-        before: MoeSparseTelemetrySnapshot,
-        after: MoeSparseTelemetrySnapshot,
-    ) {
-        self.peak_resident_slices = self.peak_resident_slices.max(after.stats.resident_slices);
-        self.peak_resident_pages = self.peak_resident_pages.max(after.stats.resident_pages);
-        self.peak_page_backed_slices = self
-            .peak_page_backed_slices
-            .max(after.stats.page_backed_slices);
-        self.peak_resident_bytes = self.peak_resident_bytes.max(after.arena.resident_bytes);
-        self.peak_logical_resident_bytes = self
-            .peak_logical_resident_bytes
-            .max(after.arena.logical_resident_bytes);
-
-        if self.dump_path.is_none() {
-            return;
-        }
-
-        self.steps.push(serde_json::json!({
-            "step": step,
-            "position": position,
-            "kind": if is_generation_step { "generate" } else { "prefill" },
-            "delta": {
-                "hits": after.stats.hits.saturating_sub(before.stats.hits),
-                "misses": after.stats.misses.saturating_sub(before.stats.misses),
-                "page_hits": after.stats.page_hits.saturating_sub(before.stats.page_hits),
-                "page_misses": after.stats.page_misses.saturating_sub(before.stats.page_misses),
-                "evicted_slices": after.stats.evicted_slices.saturating_sub(before.stats.evicted_slices),
-                "evicted_pages": after.stats.evicted_pages.saturating_sub(before.stats.evicted_pages),
-                "uploaded_bytes": after.stats.uploaded_bytes.saturating_sub(before.stats.uploaded_bytes),
-                "unmapped_bytes": after.stats.unmapped_bytes.saturating_sub(before.stats.unmapped_bytes),
-            },
-            "resident": {
-                "slices": after.stats.resident_slices,
-                "pages": after.stats.resident_pages,
-                "page_backed_slices": after.stats.page_backed_slices,
-                "logical_bytes": after.arena.logical_resident_bytes,
-                "physical_bytes": after.arena.resident_bytes,
-                "mappings": after.arena.mapping_count,
-            },
-            "cumulative": {
-                "hits": after.stats.hits,
-                "misses": after.stats.misses,
-                "page_hits": after.stats.page_hits,
-                "page_misses": after.stats.page_misses,
-                "evicted_slices": after.stats.evicted_slices,
-                "evicted_pages": after.stats.evicted_pages,
-                "uploaded_bytes": after.stats.uploaded_bytes,
-                "unmapped_bytes": after.stats.unmapped_bytes,
-            }
-        }));
-    }
-
-    fn write_json(
-        &self,
-        manager: &MoeExpertResidencyManager,
-        virtual_kv_stats: VirtualKvStats,
-        generated_ids: &[u32],
-    ) -> Result<()> {
-        let Some(path) = self.dump_path.as_ref() else {
-            return Ok(());
-        };
-        let final_snapshot = MoeSparseTelemetrySnapshot::capture(manager);
-        let total_vmm_logical_bytes =
-            final_snapshot.arena.logical_bytes + virtual_kv_stats.logical_bytes;
-        let total_vmm_logical_resident_bytes =
-            final_snapshot.arena.logical_resident_bytes + virtual_kv_stats.logical_resident_bytes;
-        let total_vmm_resident_bytes =
-            final_snapshot.arena.resident_bytes + virtual_kv_stats.resident_bytes;
-        let total_vmm_reserved_bytes =
-            final_snapshot.arena.reserved_bytes + virtual_kv_stats.reserved_bytes;
-        let total_vmm_mappings = final_snapshot.arena.mapping_count + virtual_kv_stats.mappings;
-        let payload = serde_json::json!({
-            "schema": "supersonic-qwen36-moe-sparse-vmm-telemetry-v1",
-            "summary": {
-                "decode_path": self.decode_path,
-                "registered_tensors": final_snapshot.stats.registered_tensors,
-                "max_resident_pages": manager.max_resident_pages(),
-                "final_resident_slices": final_snapshot.stats.resident_slices,
-                "final_resident_pages": final_snapshot.stats.resident_pages,
-                "final_page_backed_slices": final_snapshot.stats.page_backed_slices,
-                "peak_resident_slices": self.peak_resident_slices,
-                "peak_resident_pages": self.peak_resident_pages,
-                "peak_page_backed_slices": self.peak_page_backed_slices,
-                "peak_resident_bytes": self.peak_resident_bytes,
-                "peak_logical_resident_bytes": self.peak_logical_resident_bytes,
-                "reserved_bytes": final_snapshot.arena.reserved_bytes,
-                "logical_bytes": final_snapshot.arena.logical_bytes,
-                "moe_logical_bytes": final_snapshot.arena.logical_bytes,
-                "moe_logical_resident_bytes": final_snapshot.arena.logical_resident_bytes,
-                "moe_resident_bytes": final_snapshot.arena.resident_bytes,
-                "moe_reserved_bytes": final_snapshot.arena.reserved_bytes,
-                "moe_mappings": final_snapshot.arena.mapping_count,
-                "kv_layers": virtual_kv_stats.layers,
-                "kv_mappings": virtual_kv_stats.mappings,
-                "kv_logical_bytes": virtual_kv_stats.logical_bytes,
-                "kv_logical_resident_bytes": virtual_kv_stats.logical_resident_bytes,
-                "kv_resident_bytes": virtual_kv_stats.resident_bytes,
-                "kv_reserved_bytes": virtual_kv_stats.reserved_bytes,
-                "total_vmm_logical_bytes": total_vmm_logical_bytes,
-                "total_vmm_logical_resident_bytes": total_vmm_logical_resident_bytes,
-                "total_vmm_resident_bytes": total_vmm_resident_bytes,
-                "total_vmm_reserved_bytes": total_vmm_reserved_bytes,
-                "total_vmm_mappings": total_vmm_mappings,
-                "hits": final_snapshot.stats.hits,
-                "misses": final_snapshot.stats.misses,
-                "page_hits": final_snapshot.stats.page_hits,
-                "page_misses": final_snapshot.stats.page_misses,
-                "evicted_slices": final_snapshot.stats.evicted_slices,
-                "evicted_pages": final_snapshot.stats.evicted_pages,
-                "uploaded_bytes": final_snapshot.stats.uploaded_bytes,
-                "unmapped_bytes": final_snapshot.stats.unmapped_bytes,
-            },
-            "generated_ids": generated_ids,
-            "steps": self.steps,
-        });
-        let bytes = serde_json::to_vec_pretty(&payload)?;
-        std::fs::write(path, bytes)
-            .with_context(|| format!("write MoE sparse VMM telemetry to {}", path.display()))
-    }
 }
 
 /// Build one layer's worth of GPU-resident weight + state buffers from a
@@ -2266,8 +2155,20 @@ fn decode_text(
     let mut _moe_expert_arena = None;
     let mut _moe_expert_residency = None;
     let sparse_moe_requested = moe_island_cap_experts.is_some();
-    let mut moe_sparse_telemetry =
-        MoeSparseTelemetry::from_env(sparse_moe_requested, persistent_decode)?;
+    let moe_prefetch_mode = MoeIslandPrefetchMode::from_env()?;
+    let moe_prefetch_ranks =
+        moe_island_prefetch_ranks_from_env(moe_prefetch_mode, geom.top_k as usize)?;
+    let moe_transition_min_observations =
+        moe_island_prefetch_transition_min_observations(moe_prefetch_mode)?;
+    if moe_prefetch_mode != MoeIslandPrefetchMode::Disabled && !sparse_moe_requested {
+        anyhow::bail!("SUPERSONIC_MOE_ISLAND_PREFETCH requires SUPERSONIC_MOE_ISLAND_CAP_EXPERTS");
+    }
+    let mut moe_sparse_telemetry = MoeSparseTelemetry::from_env(
+        sparse_moe_requested,
+        persistent_decode,
+        moe_prefetch_mode,
+        moe_prefetch_ranks,
+    )?;
     if let Some(path) = moe_sparse_telemetry
         .as_ref()
         .and_then(|telemetry| telemetry.dump_path.as_ref())
@@ -2328,6 +2229,20 @@ fn decode_text(
                 "  [vmm] sparse MoE residency will use segmented persistent decode \
                  (router prefetch + FFN resume per layer)"
             );
+        }
+        if moe_prefetch_mode.uses_previous_token_routes() {
+            println!(
+                "  [vmm] sparse MoE {} lookahead prefetch active \
+                 (ranks={moe_prefetch_ranks}/{})",
+                moe_prefetch_mode.as_str(),
+                geom.top_k
+            );
+            if moe_prefetch_mode.transition_weighted() {
+                println!(
+                    "  [vmm] sparse MoE transition predictor warmup \
+                     min_observations={moe_transition_min_observations}"
+                );
+            }
         }
         _moe_expert_residency = Some(manager);
         layers
@@ -2657,6 +2572,16 @@ fn decode_text(
     let mut t_chain_full_attn_us: u64 = 0;
     let mut t_chain_linear_attn_us: u64 = 0;
     let mut t_chain_ffn_us: u64 = 0;
+    let mut previous_moe_topk_by_layer: Vec<Vec<usize>> =
+        vec![Vec::new(); geom.num_layers as usize];
+    let mut moe_route_telemetry =
+        sparse_moe_requested.then(|| MoeRouteTelemetry::new(geom.top_k as usize));
+    let mut moe_transition_predictors = moe_prefetch_mode.transition_weighted().then(|| {
+        vec![
+            MoeTransitionPredictor::new(geom.top_k as usize, moe_transition_min_observations,);
+            geom.num_layers as usize
+        ]
+    });
 
     for step in 0..total_steps {
         // When speculative decode is on, each iteration can commit
@@ -2717,6 +2642,13 @@ fn decode_text(
         let moe_telemetry_before = _moe_expert_residency
             .as_ref()
             .map(MoeSparseTelemetrySnapshot::capture);
+        let track_moe_routes =
+            moe_prefetch_mode.uses_previous_token_routes() || moe_route_telemetry.is_some();
+        let mut next_moe_topk_by_layer = if track_moe_routes {
+            previous_moe_topk_by_layer.clone()
+        } else {
+            Vec::new()
+        };
         let outputs = if let Some(scratch) = persistent_scratch.as_mut() {
             if let Some(manager) = _moe_expert_residency.as_mut() {
                 // Sparse VMM needs a host remap point after each layer's
@@ -2725,26 +2657,24 @@ fn decode_text(
                 // standalone lm_head launch below consumes final_hidden_bytes.
                 lm_head_folded = false;
                 drop(fold);
-                let mut prefetch = |layer_idx: usize, topk: &[usize]| -> Result<()> {
-                    for &expert_idx in topk {
-                        manager.ensure_resident(
-                            &store,
-                            MoeExpertKey {
-                                layer_idx,
-                                expert_idx,
-                                projection: MoeExpertProjection::GateUp,
-                            },
-                        )?;
-                        manager.ensure_resident(
-                            &store,
-                            MoeExpertKey {
-                                layer_idx,
-                                expert_idx,
-                                projection: MoeExpertProjection::Down,
-                            },
-                        )?;
-                    }
-                    Ok(())
+                let mut prefetch = |phase: ExpertPrefetchPhase,
+                                    layer_idx: usize,
+                                    routes: &[ExpertRoute]|
+                 -> Result<()> {
+                    handle_moe_expert_prefetch(
+                        manager,
+                        &store,
+                        moe_prefetch_mode,
+                        moe_prefetch_ranks,
+                        &previous_moe_topk_by_layer,
+                        &mut next_moe_topk_by_layer,
+                        track_moe_routes,
+                        moe_route_telemetry.as_mut(),
+                        moe_transition_predictors.as_deref_mut(),
+                        phase,
+                        layer_idx,
+                        routes,
+                    )
                 };
                 scratch
                     .run_sparse_with_expert_prefetch(
@@ -2772,26 +2702,24 @@ fn decode_text(
             lm_head_folded = false;
             drop(fold);
             if let Some(manager) = _moe_expert_residency.as_mut() {
-                let mut prefetch = |layer_idx: usize, topk: &[usize]| -> Result<()> {
-                    for &expert_idx in topk {
-                        manager.ensure_resident(
-                            &store,
-                            MoeExpertKey {
-                                layer_idx,
-                                expert_idx,
-                                projection: MoeExpertProjection::GateUp,
-                            },
-                        )?;
-                        manager.ensure_resident(
-                            &store,
-                            MoeExpertKey {
-                                layer_idx,
-                                expert_idx,
-                                projection: MoeExpertProjection::Down,
-                            },
-                        )?;
-                    }
-                    Ok(())
+                let mut prefetch = |phase: ExpertPrefetchPhase,
+                                    layer_idx: usize,
+                                    routes: &[ExpertRoute]|
+                 -> Result<()> {
+                    handle_moe_expert_prefetch(
+                        manager,
+                        &store,
+                        moe_prefetch_mode,
+                        moe_prefetch_ranks,
+                        &previous_moe_topk_by_layer,
+                        &mut next_moe_topk_by_layer,
+                        track_moe_routes,
+                        moe_route_telemetry.as_mut(),
+                        moe_transition_predictors.as_deref_mut(),
+                        phase,
+                        layer_idx,
+                        routes,
+                    )
                 };
                 run_chained_decode_fast_with_expert_prefetch(
                     ordinal,
@@ -2814,6 +2742,9 @@ fn decode_text(
             }
             .with_context(|| format!("chained decode (step {step}, position {position})"))?
         };
+        if track_moe_routes {
+            previous_moe_topk_by_layer = next_moe_topk_by_layer;
+        }
         if let (Some(telemetry), Some(before), Some(manager)) = (
             moe_sparse_telemetry.as_mut(),
             moe_telemetry_before,
@@ -3299,6 +3230,9 @@ fn decode_text(
                 "  [vmm] MoE island residency: resident_slices={} peak_slices={} \
                  resident_pages={} peak_pages={} page_backed_slices={} \
                  hits={} misses={} page_hits={} page_misses={} evicted_slices={} evicted_pages={} \
+                 prefetch_requests={} prefetch_hits={} prefetch_misses={} \
+                 prefetch_page_hits={} prefetch_page_misses={} \
+                 prefetch_skipped={} prefetch_skipped_pages={} \
                  uploaded={:.2}MiB unmapped={:.2}MiB \
                  resident={:.2}MiB peak_resident={:.2}MiB reserved={:.2}MiB \
                  kv_resident={:.2}MiB total_vmm_resident={:.2}MiB total_vmm_reserved={:.2}MiB",
@@ -3313,6 +3247,13 @@ fn decode_text(
                 residency.page_misses,
                 residency.evicted_slices,
                 residency.evicted_pages,
+                residency.prefetch_requests,
+                residency.prefetch_hits,
+                residency.prefetch_misses,
+                residency.prefetch_page_hits,
+                residency.prefetch_page_misses,
+                residency.prefetch_skipped,
+                residency.prefetch_skipped_pages,
                 residency.uploaded_bytes as f64 / MIB,
                 residency.unmapped_bytes as f64 / MIB,
                 arena.resident_bytes as f64 / MIB,
@@ -3322,12 +3263,20 @@ fn decode_text(
                 total_resident_bytes as f64 / MIB,
                 total_reserved_bytes as f64 / MIB,
             );
-            telemetry.write_json(manager, virtual_kv_stats, &generated_ids)?;
+            telemetry.write_json(
+                manager,
+                virtual_kv_stats,
+                &generated_ids,
+                moe_route_telemetry.as_ref(),
+            )?;
         } else {
             println!(
                 "  [vmm] MoE island residency: resident_slices={} resident_pages={} \
                  page_backed_slices={} hits={} misses={} page_hits={} page_misses={} \
-                 evicted_slices={} evicted_pages={} uploaded={:.2}MiB unmapped={:.2}MiB \
+                 evicted_slices={} evicted_pages={} prefetch_requests={} \
+                 prefetch_hits={} prefetch_misses={} prefetch_page_hits={} \
+                 prefetch_page_misses={} prefetch_skipped={} prefetch_skipped_pages={} \
+                 uploaded={:.2}MiB unmapped={:.2}MiB \
                  resident={:.2}MiB reserved={:.2}MiB kv_resident={:.2}MiB \
                  total_vmm_resident={:.2}MiB total_vmm_reserved={:.2}MiB",
                 residency.resident_slices,
@@ -3339,6 +3288,13 @@ fn decode_text(
                 residency.page_misses,
                 residency.evicted_slices,
                 residency.evicted_pages,
+                residency.prefetch_requests,
+                residency.prefetch_hits,
+                residency.prefetch_misses,
+                residency.prefetch_page_hits,
+                residency.prefetch_page_misses,
+                residency.prefetch_skipped,
+                residency.prefetch_skipped_pages,
                 residency.uploaded_bytes as f64 / MIB,
                 residency.unmapped_bytes as f64 / MIB,
                 arena.resident_bytes as f64 / MIB,
@@ -3593,7 +3549,12 @@ fn decode_first_token(model_dir: &Path, report: &DryRunReport, kv_fp8: bool) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::{qwen36_kv_vmm_mode_from_env_value, Qwen36KvVmmMode};
+    use super::{
+        moe_island_prefetch_ranks_from_env_value,
+        moe_island_prefetch_transition_min_observations_from_env_value,
+        qwen36_kv_vmm_mode_from_env_value, ExpertRoute, MoeIslandPrefetchMode, MoeRouteTelemetry,
+        MoeTransitionPredictor, Qwen36KvVmmMode,
+    };
     use gpu_hal::Backend;
 
     #[test]
@@ -3623,5 +3584,291 @@ mod tests {
             Qwen36KvVmmMode::Force
         );
         assert!(qwen36_kv_vmm_mode_from_env_value(Some("yes"), Backend::Hip).is_err());
+    }
+
+    #[test]
+    fn moe_prefetch_mode_env_accepts_disabled_and_previous_token_aliases() {
+        assert_eq!(
+            MoeIslandPrefetchMode::from_env_value(None).unwrap(),
+            MoeIslandPrefetchMode::Disabled
+        );
+        assert_eq!(
+            MoeIslandPrefetchMode::from_env_value(Some("disabled")).unwrap(),
+            MoeIslandPrefetchMode::Disabled
+        );
+        assert_eq!(
+            MoeIslandPrefetchMode::from_env_value(Some("previous-token")).unwrap(),
+            MoeIslandPrefetchMode::PreviousToken
+        );
+        assert_eq!(
+            MoeIslandPrefetchMode::from_env_value(Some("prev-token")).unwrap(),
+            MoeIslandPrefetchMode::PreviousToken
+        );
+    }
+
+    #[test]
+    fn moe_prefetch_mode_env_accepts_resident_only_aliases() {
+        assert_eq!(
+            MoeIslandPrefetchMode::from_env_value(Some("previous-token-resident")).unwrap(),
+            MoeIslandPrefetchMode::PreviousTokenResidentOnly
+        );
+        assert_eq!(
+            MoeIslandPrefetchMode::from_env_value(Some("previous_token_resident")).unwrap(),
+            MoeIslandPrefetchMode::PreviousTokenResidentOnly
+        );
+        assert_eq!(
+            MoeIslandPrefetchMode::from_env_value(Some("resident-previous-token")).unwrap(),
+            MoeIslandPrefetchMode::PreviousTokenResidentOnly
+        );
+        assert!(MoeIslandPrefetchMode::from_env_value(Some("resident")).is_err());
+    }
+
+    #[test]
+    fn moe_prefetch_mode_env_accepts_transition_aliases() {
+        assert_eq!(
+            MoeIslandPrefetchMode::from_env_value(Some("transition")).unwrap(),
+            MoeIslandPrefetchMode::Transition
+        );
+        assert_eq!(
+            MoeIslandPrefetchMode::from_env_value(Some("transition-weighted")).unwrap(),
+            MoeIslandPrefetchMode::Transition
+        );
+        assert_eq!(MoeIslandPrefetchMode::Transition.as_str(), "transition");
+        assert!(MoeIslandPrefetchMode::Transition.uses_previous_token_routes());
+        assert!(MoeIslandPrefetchMode::Transition.transition_weighted());
+    }
+
+    #[test]
+    fn moe_prefetch_ranks_default_to_all_previous_token_routes() {
+        assert_eq!(
+            moe_island_prefetch_ranks_from_env_value(
+                None,
+                MoeIslandPrefetchMode::PreviousToken,
+                8,
+            )
+            .unwrap(),
+            8
+        );
+        assert_eq!(
+            moe_island_prefetch_ranks_from_env_value(
+                Some("all"),
+                MoeIslandPrefetchMode::PreviousTokenResidentOnly,
+                8,
+            )
+            .unwrap(),
+            8
+        );
+    }
+
+    #[test]
+    fn moe_prefetch_ranks_accept_rank_limited_previous_token_routes() {
+        assert_eq!(
+            moe_island_prefetch_ranks_from_env_value(
+                Some("1"),
+                MoeIslandPrefetchMode::PreviousToken,
+                8,
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            moe_island_prefetch_ranks_from_env_value(
+                Some("4"),
+                MoeIslandPrefetchMode::PreviousTokenResidentOnly,
+                8,
+            )
+            .unwrap(),
+            4
+        );
+        assert_eq!(
+            moe_island_prefetch_ranks_from_env_value(
+                Some("2"),
+                MoeIslandPrefetchMode::Transition,
+                8,
+            )
+            .unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn moe_prefetch_ranks_reject_disabled_or_out_of_range_values() {
+        assert_eq!(
+            moe_island_prefetch_ranks_from_env_value(None, MoeIslandPrefetchMode::Disabled, 8)
+                .unwrap(),
+            0
+        );
+        assert!(moe_island_prefetch_ranks_from_env_value(
+            Some("1"),
+            MoeIslandPrefetchMode::Disabled,
+            8,
+        )
+        .is_err());
+        assert!(moe_island_prefetch_ranks_from_env_value(
+            Some("0"),
+            MoeIslandPrefetchMode::PreviousToken,
+            8,
+        )
+        .is_err());
+        assert!(moe_island_prefetch_ranks_from_env_value(
+            Some("9"),
+            MoeIslandPrefetchMode::Transition,
+            8,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn moe_transition_min_observations_defaults_only_for_transition_mode() {
+        assert_eq!(
+            moe_island_prefetch_transition_min_observations_from_env_value(
+                None,
+                MoeIslandPrefetchMode::Transition,
+            )
+            .unwrap(),
+            32
+        );
+        assert_eq!(
+            moe_island_prefetch_transition_min_observations_from_env_value(
+                Some("4"),
+                MoeIslandPrefetchMode::Transition,
+            )
+            .unwrap(),
+            4
+        );
+        assert_eq!(
+            moe_island_prefetch_transition_min_observations_from_env_value(
+                None,
+                MoeIslandPrefetchMode::PreviousToken,
+            )
+            .unwrap(),
+            0
+        );
+        assert!(
+            moe_island_prefetch_transition_min_observations_from_env_value(
+                Some("4"),
+                MoeIslandPrefetchMode::PreviousToken,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn moe_transition_predictor_waits_for_warmup_and_scores_repeats() {
+        let mut predictor = MoeTransitionPredictor::new(3, 2);
+        let previous_routes = [10, 20, 30];
+        let routes = [
+            ExpertRoute {
+                rank: 0,
+                expert_idx: 20,
+                weight: 0.5,
+            },
+            ExpertRoute {
+                rank: 1,
+                expert_idx: 99,
+                weight: 0.25,
+            },
+        ];
+
+        predictor.update(&routes, &previous_routes);
+        assert!(predictor.candidates(&previous_routes, 2).is_empty());
+
+        predictor.update(&routes, &previous_routes);
+        assert_eq!(predictor.candidates(&previous_routes, 2), vec![20]);
+
+        let later_routes = [
+            ExpertRoute {
+                rank: 0,
+                expert_idx: 10,
+                weight: 0.5,
+            },
+            ExpertRoute {
+                rank: 1,
+                expert_idx: 20,
+                weight: 0.25,
+            },
+        ];
+        predictor.update(&later_routes, &previous_routes);
+        assert_eq!(predictor.candidates(&previous_routes, 2), vec![20, 10]);
+    }
+
+    #[test]
+    fn moe_route_telemetry_records_previous_rank_transition_matrix() {
+        let mut telemetry = MoeRouteTelemetry::new(3);
+        let previous_routes = [7, 11, 13];
+        telemetry.record_route_observation(
+            &ExpertRoute {
+                rank: 0,
+                expert_idx: 11,
+                weight: 0.5,
+            },
+            &previous_routes,
+        );
+        telemetry.record_route_observation(
+            &ExpertRoute {
+                rank: 1,
+                expert_idx: 7,
+                weight: 0.25,
+            },
+            &previous_routes,
+        );
+        telemetry.record_route_observation(
+            &ExpertRoute {
+                rank: 2,
+                expert_idx: 99,
+                weight: 0.125,
+            },
+            &previous_routes,
+        );
+
+        assert_eq!(telemetry.observations_by_rank, vec![1, 1, 1]);
+        assert_eq!(telemetry.repeated_previous_by_rank, vec![1, 1, 0]);
+        assert_eq!(
+            telemetry.repeated_previous_rank_by_current_rank,
+            vec![vec![0, 1, 0], vec![1, 0, 0], vec![0, 0, 0]]
+        );
+        assert_eq!(
+            telemetry
+                .to_json()
+                .get("repeated_previous_rank_by_current_rank")
+                .unwrap(),
+            &serde_json::json!([[0, 1, 0], [1, 0, 0], [0, 0, 0]])
+        );
+        let json = telemetry.to_json();
+        assert_eq!(
+            json.get("repeated_previous_probability_by_current_rank")
+                .unwrap(),
+            &serde_json::json!([1.0, 1.0, 0.0])
+        );
+        assert_eq!(
+            json.get("same_rank_repeat_probability_by_rank").unwrap(),
+            &serde_json::json!([0.0, 0.0, 0.0])
+        );
+        assert_eq!(
+            json.get("repeated_current_by_previous_rank").unwrap(),
+            &serde_json::json!([1, 1, 0])
+        );
+        assert_eq!(
+            json.get("repeated_current_probability_by_previous_rank")
+                .unwrap(),
+            &serde_json::json!([1.0, 1.0, 0.0])
+        );
+        assert_eq!(
+            json.get("best_previous_rank_by_current_rank").unwrap(),
+            &serde_json::json!([1, 0, null])
+        );
+        assert_eq!(
+            json.get("best_current_rank_by_previous_rank").unwrap(),
+            &serde_json::json!([1, 0, null])
+        );
+        assert_eq!(
+            json.get("best_transition").unwrap(),
+            &serde_json::json!({
+                "current_rank": 0,
+                "previous_rank": 1,
+                "count": 1,
+                "probability_by_current_rank": 1.0,
+            })
+        );
     }
 }

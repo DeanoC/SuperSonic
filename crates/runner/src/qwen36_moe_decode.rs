@@ -37,6 +37,8 @@ use kernel_ffi::qwen36_moe::{
     Qwen36MoeLinearStepParams, Qwen36MoeLinearStepWeights,
 };
 
+use crate::tensor_bytes;
+
 /// Hybrid pattern: every 4th layer is full attention. Indices 3, 7, 11, ...
 /// are full; everything else is linear. Matches Qwen3.6-MoE 35B-A3B.
 pub const HYBRID_FULL_ATTN_STRIDE: i32 = 4;
@@ -633,7 +635,21 @@ pub fn run_chained_decode_fast(
     )
 }
 
-pub type ExpertPrefetchCallback<'a> = dyn FnMut(usize, &[usize]) -> Result<()> + 'a;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpertPrefetchPhase {
+    Lookahead,
+    Demand,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ExpertRoute {
+    pub rank: usize,
+    pub expert_idx: usize,
+    pub weight: f32,
+}
+
+pub type ExpertPrefetchCallback<'a> =
+    dyn FnMut(ExpertPrefetchPhase, usize, &[ExpertRoute]) -> Result<()> + 'a;
 
 /// Production chained decode with a host-side hook between router top-k and
 /// routed expert GEMVs. The hook is intended for sparse VMM MoE residency:
@@ -1087,6 +1103,9 @@ fn run_chained_decode_impl(
             None => Qwen36MoeFfnStepInt4::disabled(),
         };
         if let Some(prefetch) = expert_prefetch.as_mut() {
+            prefetch(ExpertPrefetchPhase::Lookahead, layer_idx, &[]).with_context(|| {
+                format!("lookahead prefetch routed experts (layer {layer_idx})")
+            })?;
             let params_stage1 = Qwen36MoeFfnStepParams {
                 stage: 1,
                 ..params_stage5
@@ -1110,9 +1129,9 @@ fn run_chained_decode_impl(
             }
             t_ffn += t_router.elapsed();
 
-            let topk = download_topk_indices(&ffn_output_idx, geom.top_k as usize)
-                .with_context(|| format!("download FFN top-k indices (layer {layer_idx})"))?;
-            prefetch(layer_idx, &topk)
+            let routes = download_topk_routes(&ffn_output_idx, &ffn_output, geom.top_k as usize)
+                .with_context(|| format!("download FFN top-k routes (layer {layer_idx})"))?;
+            prefetch(ExpertPrefetchPhase::Demand, layer_idx, &routes)
                 .with_context(|| format!("prefetch routed experts (layer {layer_idx})"))?;
             reset_sync_buf(ordinal, &mut sync_buf)
                 .context("reset sync_buf (ffn after prefetch)")?;
@@ -1193,6 +1212,34 @@ fn download_topk_indices(buf: &GpuBuffer, top_k: usize) -> Result<Vec<usize>> {
         .collect())
 }
 
+fn download_topk_routes(
+    idx_buf: &GpuBuffer,
+    weight_buf: &GpuBuffer,
+    top_k: usize,
+) -> Result<Vec<ExpertRoute>> {
+    let idx = download_topk_indices(idx_buf, top_k)?;
+    let needed = top_k * std::mem::size_of::<u16>();
+    let mut weight_bytes = vec![0u8; needed];
+    copy_d2h(
+        weight_buf.device_ordinal(),
+        weight_bytes.as_mut_ptr() as *mut _,
+        weight_buf.as_ptr(),
+        needed,
+    )
+    .context("d2h top-k route weights")?;
+    let weights = bf16_bytes_to_f32(&weight_bytes);
+    Ok(idx
+        .into_iter()
+        .zip(weights)
+        .enumerate()
+        .map(|(rank, (expert_idx, weight))| ExpertRoute {
+            rank,
+            expert_idx,
+            weight,
+        })
+        .collect())
+}
+
 // ---------------------------------------------------------------------------
 // Host-side final RMSnorm + lm_head GEMV. The plan recommends host execution
 // for PR 4c; lifting to a dedicated kernel is PR 4d.
@@ -1202,13 +1249,7 @@ fn download_topk_indices(buf: &GpuBuffer, top_k: usize) -> Result<Vec<usize>> {
 /// BF16 as raw int16 → bytes; this is the inverse.
 pub fn bf16_bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
     assert!(bytes.len() % 2 == 0, "BF16 bytes must be even");
-    bytes
-        .chunks_exact(2)
-        .map(|c| {
-            let bits = u32::from(c[0]) | (u32::from(c[1]) << 8);
-            f32::from_bits(bits << 16)
-        })
-        .collect()
+    tensor_bytes::bf16_bytes_to_f32(bytes)
 }
 
 /// Round an F32 to BF16 (RNE), returning the 16 raw bits. Matches PyTorch's
@@ -1228,13 +1269,7 @@ pub fn f32_to_bf16_bits(x: f32) -> u16 {
 
 /// Encode a slice of F32 values to BF16 little-endian bytes (RNE).
 pub fn f32_to_bf16_bytes(vals: &[f32]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(vals.len() * 2);
-    for &v in vals {
-        let bits = f32_to_bf16_bits(v);
-        out.push((bits & 0xFF) as u8);
-        out.push((bits >> 8) as u8);
-    }
-    out
+    tensor_bytes::f32_to_bf16_bytes(vals)
 }
 
 /// Apply RMSnorm + lm_head GEMV on the host. Mirrors the multi-layer
