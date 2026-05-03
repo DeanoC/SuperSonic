@@ -101,10 +101,12 @@ int lookahead_attention_scores_device(int device_ordinal,
     ScopedHipDevice scoped(device_ordinal);
     const int num_kv_groups = q_heads / kv_heads;
     const dim3 grid(static_cast<unsigned int>(q_heads * lookahead_count));
-    // gfx1100 HIP defaults to wave32. Match the existing prefill kernels'
-    // convention (full_attention.hip's `if (lane >= warpSize) return;`)
-    // by launching exactly one warp per block.
-    const dim3 block(32); // wave32 on gfx1100
+    // Launch one full warp. On wave32 (gfx1100, RDNA3) the kernel's
+    // `if (lane >= warpSize) return;` early-return makes the extra
+    // 32 lanes idle out cleanly. On wave64 (gfx9xx, RDNA1/2) all 64
+    // lanes participate so pfx_wave_sum's full reduction is well-defined.
+    // Use the maximum of the two so the same launch works on both.
+    const dim3 block(64);
     const size_t shared_bytes = static_cast<size_t>(kv_len) * sizeof(float);
     hipLaunchKernelGGL(
         HIP_KERNEL_NAME(pfx_lookahead_attention_scores_kernel<T>),

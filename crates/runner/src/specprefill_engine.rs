@@ -169,6 +169,20 @@ pub fn run_specprefill(
 
     // ---- Selection ----
     let kept_positions: Vec<u32> = select_kept_positions(&importance, &cfg);
+
+    // Invariant: the last prompt position must always be kept so that the first
+    // decode token is sampled from the correct context.  The validator rejects
+    // --specprefill-always-keep-suffix 0, but this assert catches any future
+    // regression in select_kept_positions itself.
+    if kept_positions.last().copied() != Some((prompt_ids.len() - 1) as u32) {
+        bail!(
+            "specprefill: kept_positions must include the last prompt position \
+             (got last={:?}, expected={}). Increase --specprefill-always-keep-suffix.",
+            kept_positions.last(),
+            prompt_ids.len() - 1
+        );
+    }
+
     eprintln!(
         "[specprefill] kept {}/{} tokens ({:.1}%)",
         kept_positions.len(),

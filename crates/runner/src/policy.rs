@@ -121,6 +121,14 @@ pub(crate) fn validate_specprefill_flags(
                 );
             }
         }
+        if let Some(suffix) = cli.specprefill_always_keep_suffix {
+            if suffix == 0 {
+                anyhow::bail!(
+                    "--specprefill-always-keep-suffix must be >= 1 (the last prompt \
+                     token must be kept; the first decode logits come from this slot)"
+                );
+            }
+        }
         if let Some(lookahead) = cli.specprefill_lookahead {
             if !(1..=16).contains(&lookahead) {
                 anyhow::bail!(
