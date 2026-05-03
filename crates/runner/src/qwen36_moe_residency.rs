@@ -9,7 +9,10 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 
 use anyhow::{anyhow, Context, Result};
-use gpu_hal::{ScalarType, VirtualAllocationRole, VirtualArena, VirtualBacking};
+use gpu_hal::{
+    copy_h2d_async, memset_zeros_async, Backend, GpuEvent, GpuStream, PinnedHostBuffer, ScalarType,
+    VirtualAllocationRole, VirtualArena, VirtualBacking,
+};
 use model_store::BakedStore;
 
 use crate::qwen36_moe_decode::ResidentWeight;
@@ -76,6 +79,13 @@ pub struct MoeExpertResidencyStats {
     pub protect_misses: u64,
     pub protect_demotions: u64,
     pub protected_evicted_pages: u64,
+    pub async_scheduled_pages: u64,
+    pub async_completed_pages: u64,
+    pub async_waited_pages: u64,
+    pub async_skipped_no_slot: u64,
+    pub async_skipped_no_capacity: u64,
+    pub async_uploaded_bytes: usize,
+    pub async_pending_pages_peak: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -125,6 +135,26 @@ struct ResidentPage {
     last_used: u64,
 }
 
+struct PendingPage {
+    tensor_idx: usize,
+    page_offset: usize,
+    page_len: usize,
+    copy_len: usize,
+    last_used: u64,
+    slot_idx: usize,
+}
+
+struct AsyncStagingSlot {
+    buffer: PinnedHostBuffer,
+    event: GpuEvent,
+    pending: Option<ResidentPageKey>,
+}
+
+struct AsyncPageIn {
+    stream: GpuStream,
+    slots: Vec<AsyncStagingSlot>,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct PageSpan {
     offset: usize,
@@ -163,6 +193,15 @@ pub struct MoeExpertResidencyManager {
     protect_misses: u64,
     protect_demotions: u64,
     protected_evicted_pages: u64,
+    async_page_in: Option<AsyncPageIn>,
+    pending_pages: HashMap<ResidentPageKey, PendingPage>,
+    async_scheduled_pages: u64,
+    async_completed_pages: u64,
+    async_waited_pages: u64,
+    async_skipped_no_slot: u64,
+    async_skipped_no_capacity: u64,
+    async_uploaded_bytes: usize,
+    async_pending_pages_peak: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -204,6 +243,15 @@ impl MoeExpertResidencyManager {
             protect_misses: 0,
             protect_demotions: 0,
             protected_evicted_pages: 0,
+            async_page_in: None,
+            pending_pages: HashMap::new(),
+            async_scheduled_pages: 0,
+            async_completed_pages: 0,
+            async_waited_pages: 0,
+            async_skipped_no_slot: 0,
+            async_skipped_no_capacity: 0,
+            async_uploaded_bytes: 0,
+            async_pending_pages_peak: 0,
         }
     }
 
@@ -245,7 +293,45 @@ impl MoeExpertResidencyManager {
             protect_misses: self.protect_misses,
             protect_demotions: self.protect_demotions,
             protected_evicted_pages: self.protected_evicted_pages,
+            async_scheduled_pages: self.async_scheduled_pages,
+            async_completed_pages: self.async_completed_pages,
+            async_waited_pages: self.async_waited_pages,
+            async_skipped_no_slot: self.async_skipped_no_slot,
+            async_skipped_no_capacity: self.async_skipped_no_capacity,
+            async_uploaded_bytes: self.async_uploaded_bytes,
+            async_pending_pages_peak: self.async_pending_pages_peak,
         }
+    }
+
+    pub fn enable_async_prefetch(&mut self, staging_pages: usize) -> Result<()> {
+        if staging_pages == 0 {
+            return Err(anyhow!("async MoE staging page count must be > 0"));
+        }
+        if gpu_hal::current_backend() != Backend::Hip {
+            return Err(anyhow!(
+                "SUPERSONIC_MOE_ISLAND_ASYNC_PREFETCH=1 is HIP-only in v1"
+            ));
+        }
+        let page_bytes = self
+            .tensors
+            .iter()
+            .map(|tensor| tensor.page_bytes)
+            .max()
+            .ok_or_else(|| anyhow!("async MoE prefetch requires registered expert tensors"))?;
+        let stream = GpuStream::new_nonblocking(self.arena.device_ordinal())
+            .context("create MoE async prefetch stream")?;
+        let mut slots = Vec::with_capacity(staging_pages);
+        for _ in 0..staging_pages {
+            slots.push(AsyncStagingSlot {
+                buffer: PinnedHostBuffer::new(self.arena.device_ordinal(), page_bytes)
+                    .context("allocate MoE async pinned staging page")?,
+                event: GpuEvent::new(self.arena.device_ordinal())
+                    .context("create MoE async prefetch event")?,
+                pending: None,
+            });
+        }
+        self.async_page_in = Some(AsyncPageIn { stream, slots });
+        Ok(())
     }
 
     pub fn max_resident_pages(&self) -> usize {
@@ -254,7 +340,8 @@ impl MoeExpertResidencyManager {
 
     pub fn set_max_resident_pages(&mut self, max_resident_pages: usize) -> Result<()> {
         self.config = MoeExpertResidencyConfig::new(max_resident_pages)?;
-        while self.resident_pages.len() > self.config.max_resident_pages {
+        while self.resident_pages.len() + self.pending_pages.len() > self.config.max_resident_pages
+        {
             self.evict_lru_page()?;
         }
         self.clamp_protected_pages();
@@ -479,6 +566,7 @@ impl MoeExpertResidencyManager {
             .map(|page| page.offset + page.len)
             .unwrap_or(logical_offset + logical_len);
 
+        self.promote_completed_pending_pages()?;
         self.clock += 1;
         if self.resident.contains_key(&key) {
             let all_pages_resident = pages.iter().all(|span| {
@@ -526,7 +614,21 @@ impl MoeExpertResidencyManager {
                     self.prefetch_page_hits += 1;
                 }
             } else {
-                missing_pages.push(*span);
+                let page_key = ResidentPageKey {
+                    tensor_idx,
+                    page_offset: span.offset,
+                };
+                if self.pending_pages.contains_key(&page_key) {
+                    if kind == ResidencyAccessKind::Demand {
+                        self.wait_pending_page(page_key)?;
+                    }
+                    self.page_hits += 1;
+                    if kind == ResidencyAccessKind::Prefetch {
+                        self.prefetch_page_hits += 1;
+                    }
+                } else {
+                    missing_pages.push(*span);
+                }
             }
         }
 
@@ -534,10 +636,13 @@ impl MoeExpertResidencyManager {
             let free_pages = self
                 .config
                 .max_resident_pages
-                .saturating_sub(self.resident_pages.len());
+                .saturating_sub(self.resident_pages.len() + self.pending_pages.len());
             if missing_pages.len() > free_pages {
                 self.prefetch_skipped += 1;
                 self.prefetch_skipped_pages += missing_pages.len() as u64;
+                if self.async_page_in.is_some() {
+                    self.async_skipped_no_capacity += missing_pages.len() as u64;
+                }
                 return Ok(());
             }
         }
@@ -546,7 +651,14 @@ impl MoeExpertResidencyManager {
             self.prefetch_page_misses += missing_pages.len() as u64;
         }
         for span in missing_pages {
-            while self.resident_pages.len() >= self.config.max_resident_pages {
+            if kind == ResidencyAccessKind::Prefetch
+                && self.schedule_async_page(store, tensor_idx, allocation_id, &name, span)?
+            {
+                continue;
+            }
+            while self.resident_pages.len() + self.pending_pages.len()
+                >= self.config.max_resident_pages
+            {
                 self.evict_lru_page()?;
             }
 
@@ -581,15 +693,183 @@ impl MoeExpertResidencyManager {
                 },
             );
         }
-        self.resident.insert(
-            key,
-            ResidentSlice {
+        if pages.iter().all(|span| {
+            self.resident_pages.contains_key(&ResidentPageKey {
                 tensor_idx,
-                page_offset: slice_page_offset,
-                page_len: slice_page_end - slice_page_offset,
+                page_offset: span.offset,
+            })
+        }) {
+            self.resident.insert(
+                key,
+                ResidentSlice {
+                    tensor_idx,
+                    page_offset: slice_page_offset,
+                    page_len: slice_page_end - slice_page_offset,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    fn schedule_async_page(
+        &mut self,
+        store: &BakedStore,
+        tensor_idx: usize,
+        allocation_id: usize,
+        name: &str,
+        span: PageSpan,
+    ) -> Result<bool> {
+        if self.async_page_in.is_none() {
+            return Ok(false);
+        }
+        self.promote_completed_pending_pages()?;
+        if self.resident_pages.len() + self.pending_pages.len() >= self.config.max_resident_pages {
+            self.async_skipped_no_capacity += 1;
+            return Ok(false);
+        }
+        let page_key = ResidentPageKey {
+            tensor_idx,
+            page_offset: span.offset,
+        };
+        if self.pending_pages.contains_key(&page_key) {
+            return Ok(true);
+        }
+        let async_page_in = self.async_page_in.as_mut().expect("checked async_page_in");
+        let Some((slot_idx, slot)) = async_page_in
+            .slots
+            .iter_mut()
+            .enumerate()
+            .find(|(_, slot)| slot.pending.is_none())
+        else {
+            self.async_skipped_no_slot += 1;
+            return Ok(false);
+        };
+        if span.copy_len > slot.buffer.len() {
+            return Err(anyhow!(
+                "MoE async staging page too small: copy_len={} staging_len={}",
+                span.copy_len,
+                slot.buffer.len()
+            ));
+        }
+        let src = store
+            .raw_byte_range(name, span.offset, span.copy_len)
+            .with_context(|| {
+                format!(
+                    "read baked MoE expert page for async prefetch tensor={name} offset={} len={}",
+                    span.offset, span.copy_len
+                )
+            })?;
+        slot.buffer.as_mut_slice()[..span.copy_len].copy_from_slice(src);
+        let ordinal = self.arena.device_ordinal();
+        let allocation = self
+            .arena
+            .allocation_mut(allocation_id)
+            .ok_or_else(|| anyhow!("virtual allocation id {allocation_id} missing"))?;
+        let buffer = allocation.buffer_mut();
+        buffer
+            .map_range_bytes_no_sync(span.offset, span.len)
+            .with_context(|| {
+                format!(
+                    "async map MoE expert page tensor={name} offset={}",
+                    span.offset
+                )
+            })?;
+        memset_zeros_async(
+            ordinal,
+            &async_page_in.stream,
+            buffer.offset_mut_ptr(span.offset),
+            span.len,
+        )
+        .context("async memset MoE expert page")?;
+        copy_h2d_async(
+            ordinal,
+            &async_page_in.stream,
+            buffer.offset_mut_ptr(span.offset),
+            slot.buffer.as_ptr(),
+            span.copy_len,
+        )
+        .context("async H2D MoE expert page")?;
+        slot.event
+            .record_on_stream(&async_page_in.stream)
+            .context("record MoE async prefetch event")?;
+        slot.pending = Some(page_key);
+        self.pending_pages.insert(
+            page_key,
+            PendingPage {
+                tensor_idx,
+                page_offset: span.offset,
+                page_len: span.len,
+                copy_len: span.copy_len,
+                last_used: self.clock,
+                slot_idx,
             },
         );
+        self.async_scheduled_pages += 1;
+        self.async_uploaded_bytes += span.copy_len;
+        self.prefetch_uploaded_bytes += span.copy_len;
+        self.async_pending_pages_peak = self.async_pending_pages_peak.max(self.pending_pages.len());
+        Ok(true)
+    }
+
+    fn promote_completed_pending_pages(&mut self) -> Result<()> {
+        let Some(async_page_in) = self.async_page_in.as_mut() else {
+            return Ok(());
+        };
+        let mut completed = Vec::new();
+        for slot in &async_page_in.slots {
+            if let Some(key) = slot.pending {
+                if slot
+                    .event
+                    .query()
+                    .context("query MoE async prefetch event")?
+                {
+                    completed.push(key);
+                }
+            }
+        }
+        for key in completed {
+            self.finish_pending_page(key, None);
+        }
         Ok(())
+    }
+
+    fn wait_pending_page(&mut self, key: ResidentPageKey) -> Result<()> {
+        let Some(pending) = self.pending_pages.get(&key) else {
+            return Ok(());
+        };
+        let slot_idx = pending.slot_idx;
+        let Some(async_page_in) = self.async_page_in.as_mut() else {
+            return Ok(());
+        };
+        async_page_in.slots[slot_idx]
+            .event
+            .synchronize()
+            .context("wait MoE async prefetch page")?;
+        self.async_waited_pages += 1;
+        self.finish_pending_page(key, Some(self.clock));
+        Ok(())
+    }
+
+    fn finish_pending_page(&mut self, key: ResidentPageKey, last_used: Option<u64>) {
+        let Some(pending) = self.pending_pages.remove(&key) else {
+            return;
+        };
+        if let Some(async_page_in) = self.async_page_in.as_mut() {
+            if let Some(slot) = async_page_in.slots.get_mut(pending.slot_idx) {
+                slot.pending = None;
+            }
+        }
+        self.resident_pages.insert(
+            key,
+            ResidentPage {
+                tensor_idx: pending.tensor_idx,
+                page_offset: pending.page_offset,
+                page_len: pending.page_len,
+                last_used: last_used.unwrap_or(pending.last_used),
+            },
+        );
+        self.uploaded_bytes += pending.copy_len;
+        self.async_completed_pages += 1;
     }
 
     fn evict_lru_page(&mut self) -> Result<()> {
@@ -606,6 +886,9 @@ impl MoeExpertResidencyManager {
             })
             .map(|(key, page)| (*key, page.clone()))
         else {
+            if let Some(key) = self.pending_pages.keys().next().copied() {
+                self.wait_pending_page(key)?;
+            }
             return Ok(());
         };
         let victim_was_protected = self.protected_pages.contains_key(&victim);
@@ -1183,6 +1466,83 @@ mod tests {
                 assert_eq!(manager.stats().prefetch_skipped_pages, 1);
             },
         );
+    }
+
+    #[test]
+    fn async_prefetch_promotes_before_demand() {
+        with_supported_vmm_backend("async_prefetch_promotes_before_demand", |backend| {
+            if backend != Backend::Hip {
+                return;
+            }
+            let probe_tmp = synthetic_store(1, 4096);
+            let probe_store = BakedStore::open(probe_tmp.path()).expect("open probe store");
+            let mut probe =
+                MoeExpertResidencyManager::new(0, MoeExpertResidencyConfig::new(1).unwrap());
+            probe
+                .register_tensor(
+                    &probe_store,
+                    0,
+                    MoeExpertProjection::GateUp,
+                    "model.layers.0.mlp.experts.gate_up_proj",
+                    1,
+                )
+                .expect("register probe tensor");
+            let expert_bytes = probe.tensors[0].page_bytes;
+
+            let tmp = synthetic_store(2, expert_bytes);
+            let store = BakedStore::open(tmp.path()).expect("open synthetic store");
+            let mut manager =
+                MoeExpertResidencyManager::new(0, MoeExpertResidencyConfig::new(1).unwrap());
+            manager
+                .register_tensor(
+                    &store,
+                    0,
+                    MoeExpertProjection::GateUp,
+                    "model.layers.0.mlp.experts.gate_up_proj",
+                    2,
+                )
+                .expect("register tensor");
+            manager
+                .enable_async_prefetch(1)
+                .expect("enable async prefetch");
+
+            let e1 = MoeExpertKey {
+                layer_idx: 0,
+                expert_idx: 1,
+                projection: MoeExpertProjection::GateUp,
+            };
+            manager
+                .prefetch_resident(&store, e1)
+                .expect("async prefetch expert 1");
+            assert_eq!(manager.stats().async_scheduled_pages, 1);
+            manager
+                .ensure_resident(&store, e1)
+                .expect("demand async expert 1");
+            assert!(manager.is_resident(e1));
+            assert_eq!(manager.stats().async_completed_pages, 1);
+            let promoted = manager
+                .resident_pages
+                .get(&ResidentPageKey {
+                    tensor_idx: 0,
+                    page_offset: expert_bytes,
+                })
+                .expect("promoted pending page");
+            assert_eq!(promoted.last_used, manager.clock);
+
+            let allocation_id = manager
+                .resident_weight(0, MoeExpertProjection::GateUp)
+                .expect("resident weight")
+                .allocation_id()
+                .expect("virtual allocation");
+            let bytes = manager
+                .arena()
+                .allocation(allocation_id)
+                .expect("allocation")
+                .buffer()
+                .to_host_range_bytes(expert_bytes, 4096)
+                .expect("read expert 1");
+            assert!(bytes.iter().all(|b| *b == 2));
+        });
     }
 
     #[test]

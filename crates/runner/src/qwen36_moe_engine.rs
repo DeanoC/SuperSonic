@@ -45,10 +45,12 @@ use crate::qwen36_moe_telemetry::{
     MoeTransitionPredictor,
 };
 use crate::qwen36_moe_vmm::{
-    moe_island_cap_experts_from_env, moe_island_prefetch_ranks_from_env,
-    moe_island_prefetch_transition_min_observations, moe_island_protected_experts_from_env,
-    should_try_moe_expert_vmm, should_use_qwen36_kv_vmm, virtual_kv_stats_for_layers,
-    MoeExpertVmmMode,
+    moe_island_async_prefetch_from_env, moe_island_async_staging_pages_from_env,
+    moe_island_cap_experts_from_env, moe_island_prefetch_mode_from_env_for_sparse,
+    moe_island_prefetch_ranks_from_env_for_sparse,
+    moe_island_prefetch_transition_min_observations_for_sparse,
+    moe_island_protected_experts_from_env, should_try_moe_expert_vmm, should_use_qwen36_kv_vmm,
+    virtual_kv_stats_for_layers, MoeExpertVmmMode,
 };
 use crate::registry::{FamilyParams, Qwen36MoeKernelParams, RegistryEntry};
 
@@ -1710,6 +1712,8 @@ fn load_decode_layers_with_vmm_strategy(
     moe_prefetch_mode: MoeIslandPrefetchMode,
     moe_prefetch_ranks: usize,
     moe_transition_min_observations: u32,
+    moe_async_prefetch: bool,
+    moe_async_staging_pages: usize,
     persistent_decode: bool,
 ) -> Result<Qwen36DecodeLayers> {
     if let Some(cap_experts) = moe_island_cap_experts {
@@ -1751,6 +1755,16 @@ fn load_decode_layers_with_vmm_strategy(
         manager
             .set_max_resident_pages(max_resident_pages)
             .context("apply sparse MoE page budget")?;
+        if moe_async_prefetch {
+            if backend != Backend::Hip {
+                anyhow::bail!(
+                    "SUPERSONIC_MOE_ISLAND_ASYNC_PREFETCH=1 is HIP-only in v1; backend={backend}"
+                );
+            }
+            manager
+                .enable_async_prefetch(moe_async_staging_pages)
+                .context("enable sparse MoE async prefetch")?;
+        }
         let max_protected_pages = if let Some(protected_experts) = moe_island_protected_experts {
             let pages = manager
                 .page_budget_for_routed_experts(protected_experts)
@@ -1795,6 +1809,11 @@ fn load_decode_layers_with_vmm_strategy(
                      min_observations={moe_transition_min_observations}"
                 );
             }
+        }
+        if moe_async_prefetch {
+            println!(
+                "  [vmm] sparse MoE async page-in active (staging_pages={moe_async_staging_pages})"
+            );
         }
         return Ok(Qwen36DecodeLayers {
             layers,
@@ -2374,13 +2393,38 @@ fn decode_text(
         );
     }
     let sparse_moe_requested = moe_island_cap_experts.is_some();
-    let moe_prefetch_mode = MoeIslandPrefetchMode::from_env()?;
-    let moe_prefetch_ranks =
-        moe_island_prefetch_ranks_from_env(moe_prefetch_mode, geom.top_k as usize)?;
+    let moe_prefetch_mode = moe_island_prefetch_mode_from_env_for_sparse(sparse_moe_requested)?;
+    let moe_prefetch_ranks = moe_island_prefetch_ranks_from_env_for_sparse(
+        moe_prefetch_mode,
+        geom.top_k as usize,
+        sparse_moe_requested,
+    )?;
     let moe_transition_min_observations =
-        moe_island_prefetch_transition_min_observations(moe_prefetch_mode)?;
+        moe_island_prefetch_transition_min_observations_for_sparse(
+            moe_prefetch_mode,
+            sparse_moe_requested,
+        )?;
+    let moe_async_prefetch = moe_island_async_prefetch_from_env()?;
+    let moe_async_staging_pages = moe_island_async_staging_pages_from_env()?;
     if moe_prefetch_mode != MoeIslandPrefetchMode::Disabled && !sparse_moe_requested {
         anyhow::bail!("SUPERSONIC_MOE_ISLAND_PREFETCH requires SUPERSONIC_MOE_ISLAND_CAP_EXPERTS");
+    }
+    if moe_async_prefetch {
+        if !sparse_moe_requested {
+            anyhow::bail!(
+                "SUPERSONIC_MOE_ISLAND_ASYNC_PREFETCH requires SUPERSONIC_MOE_ISLAND_CAP_EXPERTS"
+            );
+        }
+        if backend != Backend::Hip {
+            anyhow::bail!(
+                "SUPERSONIC_MOE_ISLAND_ASYNC_PREFETCH=1 is HIP-only in v1; backend={backend}"
+            );
+        }
+        if moe_prefetch_mode == MoeIslandPrefetchMode::Disabled {
+            anyhow::bail!(
+                "SUPERSONIC_MOE_ISLAND_ASYNC_PREFETCH=1 requires SUPERSONIC_MOE_ISLAND_PREFETCH=previous-token, previous-token-resident, or transition"
+            );
+        }
     }
     if moe_island_protected_experts.is_some() && !sparse_moe_requested {
         anyhow::bail!(
@@ -2420,6 +2464,8 @@ fn decode_text(
         moe_prefetch_mode,
         moe_prefetch_ranks,
         moe_transition_min_observations,
+        moe_async_prefetch,
+        moe_async_staging_pages,
         persistent_decode,
     )?;
     let mut layers = loaded_layers.layers;

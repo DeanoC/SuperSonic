@@ -4,6 +4,9 @@ use gpu_hal::Backend;
 use crate::qwen36_moe_decode::{AttnLayerBuffers, LayerBuffers};
 use crate::qwen36_moe_telemetry::{MoeIslandPrefetchMode, VirtualKvStats};
 
+pub(crate) const DEFAULT_SPARSE_MOE_PREFETCH_RANKS: usize = 4;
+pub(crate) const DEFAULT_SPARSE_MOE_TRANSITION_MIN_OBSERVATIONS: u32 = 1;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MoeExpertVmmMode {
     Auto,
@@ -98,11 +101,25 @@ pub(crate) fn moe_island_prefetch_ranks_from_env_value(
     }
 }
 
-pub(crate) fn moe_island_prefetch_ranks_from_env(
+pub(crate) fn moe_island_prefetch_mode_from_env_for_sparse(
+    sparse_moe_requested: bool,
+) -> Result<MoeIslandPrefetchMode> {
+    let raw = std::env::var("SUPERSONIC_MOE_ISLAND_PREFETCH").ok();
+    match raw.as_deref() {
+        None if sparse_moe_requested => Ok(MoeIslandPrefetchMode::Transition),
+        _ => MoeIslandPrefetchMode::from_env_value(raw.as_deref()),
+    }
+}
+
+pub(crate) fn moe_island_prefetch_ranks_from_env_for_sparse(
     mode: MoeIslandPrefetchMode,
     top_k: usize,
+    sparse_moe_requested: bool,
 ) -> Result<usize> {
     let raw = std::env::var("SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS").ok();
+    if raw.is_none() && sparse_moe_requested && mode == MoeIslandPrefetchMode::Transition {
+        return Ok(DEFAULT_SPARSE_MOE_PREFETCH_RANKS.min(top_k));
+    }
     moe_island_prefetch_ranks_from_env_value(raw.as_deref(), mode, top_k)
 }
 
@@ -128,11 +145,48 @@ pub(crate) fn moe_island_prefetch_transition_min_observations_from_env_value(
     })
 }
 
-pub(crate) fn moe_island_prefetch_transition_min_observations(
+pub(crate) fn moe_island_prefetch_transition_min_observations_for_sparse(
     mode: MoeIslandPrefetchMode,
+    sparse_moe_requested: bool,
 ) -> Result<u32> {
     let raw = std::env::var("SUPERSONIC_MOE_ISLAND_PREFETCH_TRANSITION_MIN_OBS").ok();
+    if raw.is_none() && sparse_moe_requested && mode == MoeIslandPrefetchMode::Transition {
+        return Ok(DEFAULT_SPARSE_MOE_TRANSITION_MIN_OBSERVATIONS);
+    }
     moe_island_prefetch_transition_min_observations_from_env_value(raw.as_deref(), mode)
+}
+
+pub(crate) fn moe_island_async_prefetch_from_env_value(raw: Option<&str>) -> Result<bool> {
+    match raw {
+        None | Some("0") | Some("off") | Some("disabled") | Some("false") => Ok(false),
+        Some("1") | Some("on") | Some("enabled") | Some("true") => Ok(true),
+        Some(other) => Err(anyhow!(
+            "SUPERSONIC_MOE_ISLAND_ASYNC_PREFETCH must be unset, 0, 1, off, on, disabled, enabled, false, or true; got {other:?}"
+        )),
+    }
+}
+
+pub(crate) fn moe_island_async_prefetch_from_env() -> Result<bool> {
+    let raw = std::env::var("SUPERSONIC_MOE_ISLAND_ASYNC_PREFETCH").ok();
+    moe_island_async_prefetch_from_env_value(raw.as_deref())
+}
+
+pub(crate) fn moe_island_async_staging_pages_from_env_value(raw: Option<&str>) -> Result<usize> {
+    let Some(raw) = raw else {
+        return Ok(4);
+    };
+    let pages = raw.parse::<usize>().with_context(|| {
+        format!("parse SUPERSONIC_MOE_ISLAND_ASYNC_STAGING_PAGES={raw:?} as positive integer")
+    })?;
+    if pages == 0 {
+        anyhow::bail!("SUPERSONIC_MOE_ISLAND_ASYNC_STAGING_PAGES must be > 0");
+    }
+    Ok(pages)
+}
+
+pub(crate) fn moe_island_async_staging_pages_from_env() -> Result<usize> {
+    let raw = std::env::var("SUPERSONIC_MOE_ISLAND_ASYNC_STAGING_PAGES").ok();
+    moe_island_async_staging_pages_from_env_value(raw.as_deref())
 }
 
 pub(crate) fn qwen36_kv_vmm_mode_from_env_value(
@@ -242,7 +296,9 @@ pub(crate) fn virtual_kv_stats_for_layers(layers: &[LayerBuffers]) -> VirtualKvS
 #[cfg(test)]
 mod tests {
     use super::{
-        moe_island_prefetch_ranks_from_env_value,
+        moe_island_async_prefetch_from_env_value, moe_island_async_staging_pages_from_env_value,
+        moe_island_prefetch_ranks_from_env_for_sparse, moe_island_prefetch_ranks_from_env_value,
+        moe_island_prefetch_transition_min_observations_for_sparse,
         moe_island_prefetch_transition_min_observations_from_env_value,
         moe_island_protected_experts_from_env_value, qwen36_kv_vmm_mode_from_env_value,
         Qwen36KvVmmMode,
@@ -409,5 +465,90 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn moe_sparse_prefetch_tuned_defaults_apply_only_to_sparse_transition() {
+        assert_eq!(
+            moe_island_prefetch_ranks_from_env_for_sparse(
+                MoeIslandPrefetchMode::Transition,
+                8,
+                true,
+            )
+            .unwrap(),
+            4
+        );
+        assert_eq!(
+            moe_island_prefetch_ranks_from_env_for_sparse(
+                MoeIslandPrefetchMode::Transition,
+                2,
+                true,
+            )
+            .unwrap(),
+            2
+        );
+        assert_eq!(
+            moe_island_prefetch_ranks_from_env_for_sparse(
+                MoeIslandPrefetchMode::PreviousToken,
+                8,
+                true,
+            )
+            .unwrap(),
+            8
+        );
+        assert_eq!(
+            moe_island_prefetch_ranks_from_env_for_sparse(
+                MoeIslandPrefetchMode::Transition,
+                8,
+                false,
+            )
+            .unwrap(),
+            8
+        );
+
+        assert_eq!(
+            moe_island_prefetch_transition_min_observations_for_sparse(
+                MoeIslandPrefetchMode::Transition,
+                true,
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            moe_island_prefetch_transition_min_observations_for_sparse(
+                MoeIslandPrefetchMode::Transition,
+                false,
+            )
+            .unwrap(),
+            32
+        );
+        assert_eq!(
+            moe_island_prefetch_transition_min_observations_for_sparse(
+                MoeIslandPrefetchMode::PreviousToken,
+                true,
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn moe_async_prefetch_env_parses_bool_and_staging_pages() {
+        assert!(!moe_island_async_prefetch_from_env_value(None).unwrap());
+        assert!(!moe_island_async_prefetch_from_env_value(Some("0")).unwrap());
+        assert!(moe_island_async_prefetch_from_env_value(Some("1")).unwrap());
+        assert!(moe_island_async_prefetch_from_env_value(Some("true")).unwrap());
+        assert!(moe_island_async_prefetch_from_env_value(Some("bad")).is_err());
+
+        assert_eq!(
+            moe_island_async_staging_pages_from_env_value(None).unwrap(),
+            4
+        );
+        assert_eq!(
+            moe_island_async_staging_pages_from_env_value(Some("8")).unwrap(),
+            8
+        );
+        assert!(moe_island_async_staging_pages_from_env_value(Some("0")).is_err());
+        assert!(moe_island_async_staging_pages_from_env_value(Some("bad")).is_err());
     }
 }

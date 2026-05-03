@@ -28,6 +28,8 @@ class BenchCase(NamedTuple):
     prefetch_mode: str | None
     prefetch_ranks: str | None
     protected_experts: str | None
+    async_prefetch: bool
+    async_staging_pages: int | None
 
 
 def parse_protected_policy(raw: str) -> tuple[str, str | None]:
@@ -119,8 +121,10 @@ def build_cases(
     prefetch_mode: str | None,
     prefetch_ranks: str | None,
     protected_experts: str | None,
+    async_prefetch: bool = False,
+    async_staging_pages: int | None = None,
 ) -> list[BenchCase]:
-    cases: list[BenchCase] = [BenchCase("dense", None, None, None, None)]
+    cases: list[BenchCase] = [BenchCase("dense", None, None, None, None, False, None)]
     protected_policies = (
         parse_protected_policies(protected_sweep)
         if protected_sweep
@@ -135,7 +139,18 @@ def build_cases(
     ) -> None:
         for protected_label, protected in protected_policies:
             suffix = "" if protected is None and not protected_sweep else f"-{protected_label}"
-            cases.append(BenchCase(f"{label}{suffix}", cap, mode, ranks, protected))
+            async_suffix = "-async" if async_prefetch else ""
+            cases.append(
+                BenchCase(
+                    f"{label}{suffix}{async_suffix}",
+                    cap,
+                    mode,
+                    ranks,
+                    protected,
+                    async_prefetch,
+                    async_staging_pages,
+                )
+            )
 
     if prefetch_mode_sweep:
         mode_policies = parse_prefetch_mode_policies(prefetch_mode_sweep)
@@ -302,6 +317,8 @@ def run_case(
     env.pop("SUPERSONIC_MOE_ISLAND_PREFETCH", None)
     env.pop("SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS", None)
     env.pop("SUPERSONIC_MOE_ISLAND_PROTECTED_EXPERTS", None)
+    env.pop("SUPERSONIC_MOE_ISLAND_ASYNC_PREFETCH", None)
+    env.pop("SUPERSONIC_MOE_ISLAND_ASYNC_STAGING_PAGES", None)
     transition_min_obs = env.pop("SUPERSONIC_MOE_ISLAND_PREFETCH_TRANSITION_MIN_OBS", None)
     telemetry_path = tmp / f"{case.label}_telemetry.json"
     if case.cap is not None:
@@ -313,6 +330,12 @@ def run_case(
             env["SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS"] = case.prefetch_ranks
         if case.protected_experts is not None:
             env["SUPERSONIC_MOE_ISLAND_PROTECTED_EXPERTS"] = case.protected_experts
+        if case.async_prefetch:
+            env["SUPERSONIC_MOE_ISLAND_ASYNC_PREFETCH"] = "1"
+            if case.async_staging_pages is not None:
+                env["SUPERSONIC_MOE_ISLAND_ASYNC_STAGING_PAGES"] = str(
+                    case.async_staging_pages
+                )
         if case.prefetch_mode == "transition":
             configured_min_obs = args.prefetch_transition_min_obs
             if configured_min_obs is None:
@@ -354,6 +377,8 @@ def run_case(
         "prefetch_mode_requested": case.prefetch_mode,
         "prefetch_ranks_requested": case.prefetch_ranks,
         "protected_experts_requested": case.protected_experts,
+        "async_prefetch_requested": case.async_prefetch,
+        "async_staging_pages_requested": case.async_staging_pages,
         "returncode": proc.returncode,
         "generated_ids": parse_generated_ids(output),
         "stage": parse_stage_timings(output),
@@ -393,16 +418,22 @@ def run_case(
 
 def markdown(rows: list[dict[str, Any]]) -> str:
     out = [
-        "| Mode | total ms/tok | tok/s | total resident GiB | MoE resident GiB | KV resident GiB | protected pages | protect hits | prefetch | ranks | peak pages | page misses | prefetch page misses | prefetch skipped | rank0 resident | rank0 repeat | rank0 same-rank | prev-rank0 reused | best transition | evicted pages | ids match |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|:---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|---:|:---:|",
+        "| Mode | total ms/tok | tok/s | total resident GiB | MoE resident GiB | KV resident GiB | protected pages | protect hits | prefetch | ranks | async scheduled | async completed | async waited | async skipped | peak pages | page misses | prefetch page misses | prefetch skipped | rank0 resident | rank0 repeat | rank0 same-rank | prev-rank0 reused | best transition | evicted pages | ids match |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|:---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|---:|:---:|",
     ]
     for row in rows:
         residency = row.get("vmm_residency") or {}
         route_summary = residency.get("route_summary") or {}
         stage = row.get("stage") or {}
         ids_match = row.get("generated_ids_match")
+        async_skipped = "-"
+        if residency:
+            async_skipped = (
+                int(residency.get("async_skipped_no_slot") or 0)
+                + int(residency.get("async_skipped_no_capacity") or 0)
+            )
         out.append(
-            "| {label} | {ms} | {tok} | {total_gib} | {moe_gib} | {kv_gib} | {protected_pages} | {protect_hits} | {prefetch_mode} | {prefetch_ranks} | {peak_pages} | {page_misses} | {prefetch_page_misses} | {prefetch_skipped} | {rank0_resident} | {rank0_repeat} | {rank0_same_rank} | {prev_rank0_reused} | {best_transition} | {evicted_pages} | {ids_match} |".format(
+            "| {label} | {ms} | {tok} | {total_gib} | {moe_gib} | {kv_gib} | {protected_pages} | {protect_hits} | {prefetch_mode} | {prefetch_ranks} | {async_scheduled} | {async_completed} | {async_waited} | {async_skipped} | {peak_pages} | {page_misses} | {prefetch_page_misses} | {prefetch_skipped} | {rank0_resident} | {rank0_repeat} | {rank0_same_rank} | {prev_rank0_reused} | {best_transition} | {evicted_pages} | {ids_match} |".format(
                 label=row["label"],
                 ms=fmt_num(stage.get("total_ms_avg")),
                 tok=fmt_num(row.get("tok_per_s")),
@@ -413,6 +444,10 @@ def markdown(rows: list[dict[str, Any]]) -> str:
                 protect_hits=residency.get("protect_hits", "-"),
                 prefetch_mode=residency.get("prefetch_mode", "-"),
                 prefetch_ranks=residency.get("prefetch_ranks", "-"),
+                async_scheduled=residency.get("async_scheduled_pages", "-"),
+                async_completed=residency.get("async_completed_pages", "-"),
+                async_waited=residency.get("async_waited_pages", "-"),
+                async_skipped=async_skipped,
                 peak_pages=residency.get("peak_resident_pages", "-"),
                 page_misses=residency.get("page_misses", "-"),
                 prefetch_page_misses=residency.get("prefetch_page_misses", "-"),
@@ -482,6 +517,16 @@ def main() -> int:
             "none,32,64,96,128"
         ),
     )
+    parser.add_argument(
+        "--async-prefetch",
+        action="store_true",
+        help="set SUPERSONIC_MOE_ISLAND_ASYNC_PREFETCH=1 for sparse cap rows",
+    )
+    parser.add_argument(
+        "--async-staging-pages",
+        type=int,
+        help="set SUPERSONIC_MOE_ISLAND_ASYNC_STAGING_PAGES for sparse cap rows",
+    )
     parser.add_argument("--out-json", type=Path, default=Path("target/qwen36_sparse_cap_sweep.json"))
     parser.add_argument("--out-md", type=Path, default=Path("target/qwen36_sparse_cap_sweep.md"))
     args = parser.parse_args()
@@ -512,6 +557,10 @@ def main() -> int:
         args.protected_experts = protected
     if args.prefetch_transition_min_obs is not None and args.prefetch_transition_min_obs < 0:
         parser.error("--prefetch-transition-min-obs must be >= 0")
+    if args.async_staging_pages is not None and args.async_staging_pages <= 0:
+        parser.error("--async-staging-pages must be > 0")
+    if args.async_prefetch and not (args.prefetch or args.prefetch_mode_sweep or args.prefetch_rank_sweep):
+        parser.error("--async-prefetch requires --prefetch, --prefetch-mode-sweep, or --prefetch-rank-sweep")
     if not args.binary.exists():
         raise FileNotFoundError(args.binary)
     if not args.model_dir.exists():
@@ -533,6 +582,8 @@ def main() -> int:
             prefetch_mode,
             args.prefetch_ranks,
             args.protected_experts,
+            args.async_prefetch,
+            args.async_staging_pages,
         )
     except ValueError as exc:
         parser.error(str(exc))
@@ -575,6 +626,8 @@ def main() -> int:
         "prefetch_transition_min_obs": args.prefetch_transition_min_obs,
         "protected_experts": args.protected_experts,
         "protected_sweep": args.protected_sweep,
+        "async_prefetch": args.async_prefetch,
+        "async_staging_pages": args.async_staging_pages,
         "rows": rows,
     }
     args.out_json.parent.mkdir(parents=True, exist_ok=True)
