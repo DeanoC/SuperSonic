@@ -37,6 +37,7 @@ use crate::qwen36_moe_telemetry::{
     MoeIslandPrefetchMode, MoeRouteTelemetry, MoeSparseTelemetry, MoeSparseTelemetrySnapshot,
     MoeTransitionPredictor,
 };
+use crate::qwen36_moe_timing::{Qwen36StageTimingTotals, SamplingParams};
 use crate::qwen36_moe_vmm::{
     load_decode_layers_with_vmm_strategy, moe_island_cap_experts_from_env,
     moe_island_prefetch_ranks_from_env, moe_island_prefetch_transition_min_observations,
@@ -196,18 +197,6 @@ fn ensure_qwen36_bake(cli: &crate::Cli, entry: &RegistryEntry) -> Result<()> {
     Ok(())
 }
 
-/// Bundles the sampling knobs for the multi-token decode loop. `temperature
-/// <= 0` ⇔ greedy argmax (the deterministic default — bit-identical with
-/// any seed). At temperature > 0, `top_k`/`top_p` filter the distribution
-/// before sampling, then `seed` drives the xorshift RNG.
-#[derive(Debug, Clone, Copy)]
-pub struct SamplingParams {
-    pub temperature: f32,
-    pub top_k: usize,
-    pub top_p: f32,
-    pub seed: u64,
-}
-
 /// Build the geometry the chained decoder needs from the parsed config +
 /// the registry's per-family params. Mirrors what
 /// `oracle/qwen36_moe_multilayer_oracle.py` puts in `config` and what
@@ -238,66 +227,6 @@ fn build_multi_layer_geom(
         moe_intermediate: kernel_params.moe_intermediate_size as i32,
         shared_intermediate: kernel_params.shared_expert_intermediate_size as i32,
         top_k: kernel_params.top_k as i32,
-    }
-}
-
-#[derive(Default)]
-struct Qwen36StageTimingTotals {
-    gen_steps: usize,
-    embed: std::time::Duration,
-    chain: std::time::Duration,
-    lm_head: std::time::Duration,
-    sample: std::time::Duration,
-    detok: std::time::Duration,
-    chain_full_attn_us: u64,
-    chain_linear_attn_us: u64,
-    chain_ffn_us: u64,
-}
-
-impl Qwen36StageTimingTotals {
-    fn record_generation_step(
-        &mut self,
-        embed: std::time::Duration,
-        chain: std::time::Duration,
-        lm_head: std::time::Duration,
-        sample: std::time::Duration,
-        detok: std::time::Duration,
-        outputs: &crate::qwen36_moe_decode::DecodeOutputs,
-    ) {
-        self.count_generation_step();
-        self.embed += embed;
-        self.chain += chain;
-        self.lm_head += lm_head;
-        self.sample += sample;
-        self.detok += detok;
-        self.record_chain_breakdown(outputs);
-    }
-
-    fn record_embed(&mut self, elapsed: std::time::Duration) {
-        self.embed += elapsed;
-    }
-
-    fn record_chain(
-        &mut self,
-        elapsed: std::time::Duration,
-        outputs: &crate::qwen36_moe_decode::DecodeOutputs,
-    ) {
-        self.chain += elapsed;
-        self.record_chain_breakdown(outputs);
-    }
-
-    fn record_lm_head(&mut self, elapsed: std::time::Duration) {
-        self.lm_head += elapsed;
-    }
-
-    fn count_generation_step(&mut self) {
-        self.gen_steps += 1;
-    }
-
-    fn record_chain_breakdown(&mut self, outputs: &crate::qwen36_moe_decode::DecodeOutputs) {
-        self.chain_full_attn_us += outputs.kernel_full_attn_us;
-        self.chain_linear_attn_us += outputs.kernel_linear_attn_us;
-        self.chain_ffn_us += outputs.kernel_ffn_us;
     }
 }
 

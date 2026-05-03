@@ -27,6 +27,7 @@ mod qwen36_moe_session;
 mod qwen36_moe_speculative;
 mod qwen36_moe_state;
 mod qwen36_moe_telemetry;
+mod qwen36_moe_timing;
 mod qwen36_moe_vmm;
 mod registry;
 mod tensor_bytes;
