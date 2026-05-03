@@ -4508,9 +4508,7 @@ impl DecodeEngine {
             None,
             Some(rope_pos),
         )?;
-        logits.ok_or_else(|| {
-            anyhow::anyhow!("decode_step_with_rope_pos: missing logits")
-        })
+        logits.ok_or_else(|| anyhow::anyhow!("decode_step_with_rope_pos: missing logits"))
     }
 
     fn component_decode_full_attention_layer(
@@ -12785,9 +12783,7 @@ impl DecodeEngine {
         lookahead_count: usize,
     ) -> Result<prefill_engine::PrefillWithLookaheadResult> {
         if lookahead_count < 1 {
-            anyhow::bail!(
-                "prefill_with_lookahead_attention: lookahead_count must be >= 1"
-            );
+            anyhow::bail!("prefill_with_lookahead_attention: lookahead_count must be >= 1");
         }
         let prompt_len = prompt_ids.len();
         if prompt_len < 2 {
@@ -12822,7 +12818,9 @@ impl DecodeEngine {
             .filter(|&i| config.is_full_attention(i))
             .collect();
         if full_layer_idxs.is_empty() {
-            anyhow::bail!("prefill_with_lookahead_attention: no full-attention layers in the speculator");
+            anyhow::bail!(
+                "prefill_with_lookahead_attention: no full-attention layers in the speculator"
+            );
         }
         let q_heads = config.num_attention_heads;
         let head_dim = config.head_dim;
@@ -12892,41 +12890,42 @@ impl DecodeEngine {
             // directly (when cap == prompt_len) or assemble a contiguous buffer.
             let cap = self.state.layers[li].kv_capacity();
             let kv_k_contig;
-            let k_kernel_input: &GpuBuffer =
-                if !self.state.layers[li].has_virtual_kv_cache() && cap == prompt_len {
-                    self.state.layers[li].kv_cache_k.as_ref().ok_or_else(|| {
+            let k_kernel_input: &GpuBuffer = if !self.state.layers[li].has_virtual_kv_cache()
+                && cap == prompt_len
+            {
+                self.state.layers[li].kv_cache_k.as_ref().ok_or_else(|| {
                         anyhow::anyhow!(
                             "layer {li}: kv_cache_k missing after prefill — speculator must have full-attention KV"
                         )
                     })?
-                } else {
-                    kv_k_contig = GpuBuffer::zeros(
+            } else {
+                kv_k_contig = GpuBuffer::zeros(
+                    self.ordinal,
+                    ScalarType::BF16,
+                    &[kv_heads, prompt_len, head_dim],
+                )
+                .map_err(|e| anyhow::anyhow!("layer {li} kv_k_contig alloc: {e}"))?;
+                let cap_stride = cap * head_dim * elem_bytes;
+                let contig_stride = prompt_len * head_dim * elem_bytes;
+                let copy_bytes = prompt_len * head_dim * elem_bytes;
+                for h in 0..kv_heads {
+                    let src_k = self.state.layers[li]
+                        .kv_cache_k_offset_ptr(h * cap_stride)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "layer {li}: kv_cache_k_offset_ptr missing for head {h}"
+                            )
+                        })?;
+                    gpu_hal::copy_d2d(
                         self.ordinal,
-                        ScalarType::BF16,
-                        &[kv_heads, prompt_len, head_dim],
+                        kv_k_contig.offset_ptr(h * contig_stride) as *mut std::ffi::c_void,
+                        src_k,
+                        copy_bytes,
                     )
-                    .map_err(|e| anyhow::anyhow!("layer {li} kv_k_contig alloc: {e}"))?;
-                    let cap_stride = cap * head_dim * elem_bytes;
-                    let contig_stride = prompt_len * head_dim * elem_bytes;
-                    let copy_bytes = prompt_len * head_dim * elem_bytes;
-                    for h in 0..kv_heads {
-                        let src_k = self.state.layers[li]
-                            .kv_cache_k_offset_ptr(h * cap_stride)
-                            .ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "layer {li}: kv_cache_k_offset_ptr missing for head {h}"
-                                )
-                            })?;
-                        gpu_hal::copy_d2d(
-                            self.ordinal,
-                            kv_k_contig.offset_ptr(h * contig_stride) as *mut std::ffi::c_void,
-                            src_k,
-                            copy_bytes,
-                        )
-                        .map_err(|e| anyhow::anyhow!("layer {li} K assemble h={h}: {e}"))?;
-                    }
-                    &kv_k_contig
-                };
+                    .map_err(|e| anyhow::anyhow!("layer {li} K assemble h={h}: {e}"))?;
+                }
+                &kv_k_contig
+            };
 
             let mut scores = GpuBuffer::zeros(
                 self.ordinal,
@@ -12979,7 +12978,11 @@ fn greedy_argmax_u32(logits: &[f32]) -> u32 {
         .iter()
         .enumerate()
         .fold((0usize, f32::NEG_INFINITY), |acc, (i, &v)| {
-            if v > acc.1 { (i, v) } else { acc }
+            if v > acc.1 {
+                (i, v)
+            } else {
+                acc
+            }
         })
         .0 as u32
 }

@@ -983,11 +983,11 @@ pub fn prefill_kept(
         prefill_chunk_size,
         kv_fp8,
         use_4b_kernel,
-        false,                 // trace_layers
-        None,                  // debug_linear_layer
-        None,                  // tap_layers
-        None,                  // target_nll
-        Some(kept_positions),  // kept_positions
+        false,                // trace_layers
+        None,                 // debug_linear_layer
+        None,                 // tap_layers
+        None,                 // target_nll
+        Some(kept_positions), // kept_positions
     )
 }
 
@@ -1029,14 +1029,12 @@ fn prefill_inner(
     debug_linear_layer: Option<usize>,
     tap_layers: Option<&[usize]>,
     target_nll: Option<(usize, &[u32])>,
-    kept_positions: Option<&[u32]>,  // NEW
+    kept_positions: Option<&[u32]>, // NEW
 ) -> Result<PrefillResult> {
     let config = &weights.config;
     let seq_len = if let Some(kept) = kept_positions {
         if kept.is_empty() {
-            return Err(anyhow::anyhow!(
-                "prefill_inner: kept_positions is empty"
-            ));
+            return Err(anyhow::anyhow!("prefill_inner: kept_positions is empty"));
         }
         let max_pos = *kept.iter().max().unwrap() as usize;
         if max_pos >= prompt_ids.len() {
@@ -1222,8 +1220,7 @@ fn prefill_inner(
                     ordinal,
                     kv_chunk_size,
                     /* commit_kv_filled */ true,
-                    kept_positions
-                        .map(|k| &k[chunk_start..chunk_start + chunk_len]),  // NEW
+                    kept_positions.map(|k| &k[chunk_start..chunk_start + chunk_len]), // NEW
                 )?;
             } else {
                 let mut no_debug_trace = None;
@@ -1781,7 +1778,7 @@ fn metal_v2_decode_step_body(
                 ordinal,
                 kv_chunk_size,
                 /* commit_kv_filled */ true,
-                None,  // NEW: metal v2 decode never sparsifies
+                None, // NEW: metal v2 decode never sparsifies
             )?;
         } else {
             let mut no_debug_trace = None;
@@ -2008,7 +2005,7 @@ fn prefill_full_attention_layer(
     ordinal: usize,
     kv_chunk_size: usize,
     commit_kv_filled: bool,
-    kept_positions_chunk: Option<&[u32]>,  // NEW
+    kept_positions_chunk: Option<&[u32]>, // NEW
 ) -> Result<()> {
     let fw = weights.layers[idx]
         .full
@@ -2045,11 +2042,15 @@ fn prefill_full_attention_layer(
         }
         let mut buf = GpuBuffer::zeros(ordinal, ScalarType::U32, &[kept.len()])
             .map_err(|e| anyhow::anyhow!("layer {idx} pos_ids alloc: {e}"))?;
-        let bytes = unsafe {
-            std::slice::from_raw_parts(kept.as_ptr() as *const u8, kept.len() * 4)
-        };
-        copy_h2d(ordinal, buf.as_mut_ptr(), bytes.as_ptr() as *const _, bytes.len())
-            .map_err(|e| anyhow::anyhow!("layer {idx} pos_ids upload: {e}"))?;
+        let bytes =
+            unsafe { std::slice::from_raw_parts(kept.as_ptr() as *const u8, kept.len() * 4) };
+        copy_h2d(
+            ordinal,
+            buf.as_mut_ptr(),
+            bytes.as_ptr() as *const _,
+            bytes.len(),
+        )
+        .map_err(|e| anyhow::anyhow!("layer {idx} pos_ids upload: {e}"))?;
         Some(buf)
     } else {
         None

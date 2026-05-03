@@ -62,12 +62,15 @@ pub fn run_specprefill(
     };
 
     // ---- VRAM budget (rough) ----
-    let context_tokens = cli.context_size.unwrap_or(prompt_ids.len() + cli.max_new_tokens);
+    let context_tokens = cli
+        .context_size
+        .unwrap_or(prompt_ids.len() + cli.max_new_tokens);
     let kv_per_token = target_text_config.kv_bytes_per_token(ScalarType::BF16.size_in_bytes());
     let target_fixed = entry.vram.fixed_bytes;
     let draft_fixed: u64 = 2 * 1024 * 1024 * 1024; // ~1.6 GiB BF16 + scratch
     let kv_budget = kv_per_token * context_tokens as u64;
-    let estimated = ((target_fixed + draft_fixed + kv_budget) as f64 * entry.vram.overhead_factor) as u64;
+    let estimated =
+        ((target_fixed + draft_fixed + kv_budget) as f64 * entry.vram.overhead_factor) as u64;
     let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
     eprintln!(
         "[specprefill] vram estimate target={:.2}GiB draft={:.2}GiB kv={:.2}GiB total={:.2}GiB available={:.2}GiB",
@@ -100,14 +103,13 @@ pub fn run_specprefill(
         );
     }
     let t0 = Instant::now();
-    let draft_weights = Qwen35Weights::load(
-        draft_dir,
-        &draft_text_config,
-        ordinal,
-        params.weight_prefix,
-    )
-    .map_err(|e| anyhow!("load draft weights: {e}"))?;
-    eprintln!("[specprefill] draft weights loaded in {:.0}ms", t0.elapsed().as_millis());
+    let draft_weights =
+        Qwen35Weights::load(draft_dir, &draft_text_config, ordinal, params.weight_prefix)
+            .map_err(|e| anyhow!("load draft weights: {e}"))?;
+    eprintln!(
+        "[specprefill] draft weights loaded in {:.0}ms",
+        t0.elapsed().as_millis()
+    );
 
     // Build draft decode engine.
     let lookahead_count = cli.specprefill_lookahead.unwrap_or(4) + 1;
@@ -125,8 +127,8 @@ pub fn run_specprefill(
         params.kv_chunk_size,
         params.use_4b_kernel,
         cli.prefill_chunk_size,
-        false,  // kv_fp8
-        1,      // batch_size
+        false, // kv_fp8
+        1,     // batch_size
     )?;
     draft_engine.set_decode_context_limit(prompt_ids.len() + lookahead_count);
 
@@ -224,7 +226,7 @@ pub fn run_specprefill(
         params.use_4b_kernel,
         cli.prefill_chunk_size,
         cli.kv_fp8,
-        1,  // batch_size
+        1, // batch_size
     )?;
     target_engine.set_decode_context_limit(context_tokens);
 
@@ -279,7 +281,11 @@ pub fn run_specprefill(
     }
 
     // ---- Detokenise + print ----
-    let all: Vec<u32> = prompt_ids.iter().copied().chain(generated.iter().copied()).collect();
+    let all: Vec<u32> = prompt_ids
+        .iter()
+        .copied()
+        .chain(generated.iter().copied())
+        .collect();
     let text = tokenizer
         .decode(&all, true)
         .map_err(|e| anyhow!("detokenize: {e}"))?;

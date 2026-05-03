@@ -116,16 +116,12 @@ pub(crate) fn validate_specprefill_flags(
         }
         if let Some(keep) = cli.specprefill_keep_ratio {
             if !(0.05..=1.0).contains(&keep) {
-                anyhow::bail!(
-                    "--specprefill-keep-ratio must be in [0.05, 1.0] (got {keep})"
-                );
+                anyhow::bail!("--specprefill-keep-ratio must be in [0.05, 1.0] (got {keep})");
             }
         }
         if let Some(window) = cli.specprefill_pool_window {
             if window % 2 != 1 || window == 0 {
-                anyhow::bail!(
-                    "--specprefill-pool-window must be odd and > 0 (got {window})"
-                );
+                anyhow::bail!("--specprefill-pool-window must be odd and > 0 (got {window})");
             }
         }
         if let Some(suffix) = cli.specprefill_always_keep_suffix {
@@ -138,9 +134,7 @@ pub(crate) fn validate_specprefill_flags(
         }
         if let Some(lookahead) = cli.specprefill_lookahead {
             if !(1..=16).contains(&lookahead) {
-                anyhow::bail!(
-                    "--specprefill-lookahead must be in [1, 16] (got {lookahead})"
-                );
+                anyhow::bail!("--specprefill-lookahead must be in [1, 16] (got {lookahead})");
             }
         }
     } else if any_specprefill_flag {

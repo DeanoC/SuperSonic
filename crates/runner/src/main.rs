@@ -13,15 +13,30 @@ mod policy;
 mod prefill_engine;
 mod qwen35_dflash_engine;
 mod qwen35_runtime;
+mod qwen36_moe_bake;
 mod qwen36_moe_decode;
+mod qwen36_moe_dry_run;
 mod qwen36_moe_engine;
+mod qwen36_moe_generation;
+mod qwen36_moe_geom;
+mod qwen36_moe_host;
+mod qwen36_moe_layers;
+mod qwen36_moe_legacy;
+mod qwen36_moe_lm_head;
+mod qwen36_moe_loop;
 mod qwen36_moe_mtp;
+mod qwen36_moe_mtp_loader;
+mod qwen36_moe_output;
 mod qwen36_moe_persistent_decode;
+mod qwen36_moe_policy;
 mod qwen36_moe_prefetch;
+mod qwen36_moe_prompt;
 mod qwen36_moe_residency;
+mod qwen36_moe_session;
 mod qwen36_moe_speculative;
 mod qwen36_moe_state;
 mod qwen36_moe_telemetry;
+mod qwen36_moe_timing;
 mod qwen36_moe_vmm;
 mod registry;
 mod specprefill;
@@ -45,7 +60,10 @@ use gemma4_runtime::{
     check_gemma4_vram, load_gemma4_runtime, load_gemma4_startup, validate_gemma4_startup,
     Gemma4Runtime, Gemma4Startup,
 };
-use policy::{q4km_like, validate_dflash_flags, validate_gfx942_policy, validate_global_flags, validate_specprefill_flags};
+use policy::{
+    q4km_like, validate_dflash_flags, validate_gfx942_policy, validate_global_flags,
+    validate_specprefill_flags,
+};
 use qwen35::state::{LayerState, ModelState};
 use qwen35_runtime::{
     check_qwen35_vram, load_qwen35_engine, load_qwen35_startup, qwen35_oracle_script_path,

@@ -41,11 +41,14 @@ fn make_data(
         .collect();
     let mut buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[seq_len, num_heads, head_dim])
         .expect("alloc data");
-    let bytes = unsafe {
-        std::slice::from_raw_parts(host.as_ptr() as *const u8, host.len() * 2)
-    };
-    gpu_hal::copy_h2d(ordinal, buf.as_mut_ptr(), bytes.as_ptr() as *const _, bytes.len())
-        .expect("h2d data");
+    let bytes = unsafe { std::slice::from_raw_parts(host.as_ptr() as *const u8, host.len() * 2) };
+    gpu_hal::copy_h2d(
+        ordinal,
+        buf.as_mut_ptr(),
+        bytes.as_ptr() as *const _,
+        bytes.len(),
+    )
+    .expect("h2d data");
     buf
 }
 
@@ -75,12 +78,8 @@ fn make_rope_tables(
         GpuBuffer::zeros(ordinal, ScalarType::BF16, &[max_pos, half_rot]).expect("alloc cos");
     let mut sin_buf =
         GpuBuffer::zeros(ordinal, ScalarType::BF16, &[max_pos, half_rot]).expect("alloc sin");
-    let cos_bytes = unsafe {
-        std::slice::from_raw_parts(cos.as_ptr() as *const u8, cos.len() * 2)
-    };
-    let sin_bytes = unsafe {
-        std::slice::from_raw_parts(sin.as_ptr() as *const u8, sin.len() * 2)
-    };
+    let cos_bytes = unsafe { std::slice::from_raw_parts(cos.as_ptr() as *const u8, cos.len() * 2) };
+    let sin_bytes = unsafe { std::slice::from_raw_parts(sin.as_ptr() as *const u8, sin.len() * 2) };
     gpu_hal::copy_h2d(
         ordinal,
         cos_buf.as_mut_ptr(),
@@ -99,13 +98,17 @@ fn make_rope_tables(
 }
 
 fn upload_pos_ids(ordinal: usize, pos_ids: &[u32]) -> GpuBuffer {
-    let mut buf = GpuBuffer::zeros(ordinal, ScalarType::U32, &[pos_ids.len()])
-        .expect("alloc pos_ids");
-    let bytes = unsafe {
-        std::slice::from_raw_parts(pos_ids.as_ptr() as *const u8, pos_ids.len() * 4)
-    };
-    gpu_hal::copy_h2d(ordinal, buf.as_mut_ptr(), bytes.as_ptr() as *const _, bytes.len())
-        .expect("h2d pos_ids");
+    let mut buf =
+        GpuBuffer::zeros(ordinal, ScalarType::U32, &[pos_ids.len()]).expect("alloc pos_ids");
+    let bytes =
+        unsafe { std::slice::from_raw_parts(pos_ids.as_ptr() as *const u8, pos_ids.len() * 4) };
+    gpu_hal::copy_h2d(
+        ordinal,
+        buf.as_mut_ptr(),
+        bytes.as_ptr() as *const _,
+        bytes.len(),
+    )
+    .expect("h2d pos_ids");
     buf
 }
 
@@ -141,8 +144,7 @@ fn rope_indirect_identity_matches_dense() {
     let max_pos = seq_len; // identity ⇒ pos_ids in [0, seq_len)
     let base = 10_000.0_f32;
 
-    let (cos_buf, sin_buf) =
-        make_rope_tables(ordinal, max_pos, half_rot, rotary_dim, base);
+    let (cos_buf, sin_buf) = make_rope_tables(ordinal, max_pos, half_rot, rotary_dim, base);
 
     // Two identical-input data buffers — one for dense, one for indirect.
     let mut data_dense = make_data(ordinal, seq_len, num_heads, head_dim, 0);
@@ -209,8 +211,7 @@ fn rope_indirect_sparse_matches_gathered_dense() {
     let max_pos = (*pos_ids.iter().max().unwrap() as usize) + 1;
     let base = 10_000.0_f32;
 
-    let (cos_buf, sin_buf) =
-        make_rope_tables(ordinal, max_pos, half_rot, rotary_dim, base);
+    let (cos_buf, sin_buf) = make_rope_tables(ordinal, max_pos, half_rot, rotary_dim, base);
 
     // Build a "full" data tensor of length max_pos with the same per-element
     // value rule, so slot `pos_ids[i]` of the dense output corresponds to
@@ -222,15 +223,11 @@ fn rope_indirect_sparse_matches_gathered_dense() {
         .map(|j| half::bf16::from_f32(((j as f32) * 0.0017).sin() + 0.5))
         .collect();
 
-    let mut full_data = GpuBuffer::zeros(
-        ordinal,
-        ScalarType::BF16,
-        &[max_pos, num_heads, head_dim],
-    )
-    .expect("alloc full");
-    let full_bytes = unsafe {
-        std::slice::from_raw_parts(full_host.as_ptr() as *const u8, full_host.len() * 2)
-    };
+    let mut full_data =
+        GpuBuffer::zeros(ordinal, ScalarType::BF16, &[max_pos, num_heads, head_dim])
+            .expect("alloc full");
+    let full_bytes =
+        unsafe { std::slice::from_raw_parts(full_host.as_ptr() as *const u8, full_host.len() * 2) };
     gpu_hal::copy_h2d(
         ordinal,
         full_data.as_mut_ptr(),
@@ -247,15 +244,11 @@ fn rope_indirect_sparse_matches_gathered_dense() {
         kept_host[i * row_elems..(i + 1) * row_elems]
             .copy_from_slice(&full_host[p * row_elems..(p + 1) * row_elems]);
     }
-    let mut kept_data = GpuBuffer::zeros(
-        ordinal,
-        ScalarType::BF16,
-        &[seq_kept, num_heads, head_dim],
-    )
-    .expect("alloc kept");
-    let kept_bytes = unsafe {
-        std::slice::from_raw_parts(kept_host.as_ptr() as *const u8, kept_host.len() * 2)
-    };
+    let mut kept_data =
+        GpuBuffer::zeros(ordinal, ScalarType::BF16, &[seq_kept, num_heads, head_dim])
+            .expect("alloc kept");
+    let kept_bytes =
+        unsafe { std::slice::from_raw_parts(kept_host.as_ptr() as *const u8, kept_host.len() * 2) };
     gpu_hal::copy_h2d(
         ordinal,
         kept_data.as_mut_ptr(),

@@ -7,11 +7,7 @@
 use gpu_hal::{Backend, GpuBuffer, ScalarType};
 use kernel_ffi::prefill_ffi::lookahead_attention_scores;
 
-fn make_bf16_buf(
-    ordinal: usize,
-    shape: &[usize],
-    seed_offset: usize,
-) -> GpuBuffer {
+fn make_bf16_buf(ordinal: usize, shape: &[usize], seed_offset: usize) -> GpuBuffer {
     let total: usize = shape.iter().product();
     let host: Vec<half::bf16> = (0..total)
         .map(|i| {
@@ -19,13 +15,15 @@ fn make_bf16_buf(
             half::bf16::from_f32(v)
         })
         .collect();
-    let mut buf =
-        GpuBuffer::zeros(ordinal, ScalarType::BF16, shape).expect("alloc bf16");
-    let bytes = unsafe {
-        std::slice::from_raw_parts(host.as_ptr() as *const u8, host.len() * 2)
-    };
-    gpu_hal::copy_h2d(ordinal, buf.as_mut_ptr(), bytes.as_ptr() as *const _, bytes.len())
-        .expect("h2d bf16");
+    let mut buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, shape).expect("alloc bf16");
+    let bytes = unsafe { std::slice::from_raw_parts(host.as_ptr() as *const u8, host.len() * 2) };
+    gpu_hal::copy_h2d(
+        ordinal,
+        buf.as_mut_ptr(),
+        bytes.as_ptr() as *const _,
+        bytes.len(),
+    )
+    .expect("h2d bf16");
     buf
 }
 
@@ -72,11 +70,7 @@ fn lookahead_attention_matches_cpu_softmax() {
     let num_kv_groups = q_heads / kv_heads;
     let scale = 1.0_f32 / (head_dim as f32).sqrt();
 
-    let q = make_bf16_buf(
-        ordinal,
-        &[lookahead_count, q_heads, head_dim],
-        0,
-    );
+    let q = make_bf16_buf(ordinal, &[lookahead_count, q_heads, head_dim], 0);
     let k = make_bf16_buf(ordinal, &[kv_heads, kv_len, head_dim], 1000);
     let mut scores = GpuBuffer::zeros(
         ordinal,

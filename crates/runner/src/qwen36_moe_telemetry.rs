@@ -7,6 +7,8 @@ use anyhow::{Context, Result};
 use crate::qwen36_moe_decode::ExpertRoute;
 use crate::qwen36_moe_residency::{MoeExpertKey, MoeExpertProjection, MoeExpertResidencyManager};
 
+const MIB: f64 = (1024 * 1024) as f64;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MoeIslandPrefetchMode {
     Disabled,
@@ -72,6 +74,271 @@ impl MoeIslandPrefetchMode {
     }
 }
 
+pub(crate) fn print_and_write_moe_residency_summary(
+    manager: &MoeExpertResidencyManager,
+    virtual_kv_stats: VirtualKvStats,
+    generated_ids: &[u32],
+    route_telemetry: Option<&MoeRouteTelemetry>,
+    telemetry: Option<&MoeSparseTelemetry>,
+) -> Result<()> {
+    let residency = manager.stats();
+    let arena = manager.arena().stats();
+    let total_resident_bytes = arena.resident_bytes + virtual_kv_stats.resident_bytes;
+    let total_reserved_bytes = arena.reserved_bytes + virtual_kv_stats.reserved_bytes;
+    if let Some(telemetry) = telemetry {
+        println!(
+            "  [vmm] MoE island residency: resident_slices={} peak_slices={} \
+             resident_pages={} peak_pages={} page_backed_slices={} \
+             hits={} misses={} page_hits={} page_misses={} evicted_slices={} evicted_pages={} \
+             prefetch_requests={} prefetch_hits={} prefetch_misses={} \
+             prefetch_page_hits={} prefetch_page_misses={} \
+             prefetch_skipped={} prefetch_skipped_pages={} \
+             uploaded={:.2}MiB unmapped={:.2}MiB \
+             resident={:.2}MiB peak_resident={:.2}MiB reserved={:.2}MiB \
+             kv_resident={:.2}MiB total_vmm_resident={:.2}MiB total_vmm_reserved={:.2}MiB",
+            residency.resident_slices,
+            telemetry.peak_resident_slices,
+            residency.resident_pages,
+            telemetry.peak_resident_pages,
+            residency.page_backed_slices,
+            residency.hits,
+            residency.misses,
+            residency.page_hits,
+            residency.page_misses,
+            residency.evicted_slices,
+            residency.evicted_pages,
+            residency.prefetch_requests,
+            residency.prefetch_hits,
+            residency.prefetch_misses,
+            residency.prefetch_page_hits,
+            residency.prefetch_page_misses,
+            residency.prefetch_skipped,
+            residency.prefetch_skipped_pages,
+            residency.uploaded_bytes as f64 / MIB,
+            residency.unmapped_bytes as f64 / MIB,
+            arena.resident_bytes as f64 / MIB,
+            telemetry.peak_resident_bytes as f64 / MIB,
+            arena.reserved_bytes as f64 / MIB,
+            virtual_kv_stats.resident_bytes as f64 / MIB,
+            total_resident_bytes as f64 / MIB,
+            total_reserved_bytes as f64 / MIB,
+        );
+        telemetry.write_json(manager, virtual_kv_stats, generated_ids, route_telemetry)?;
+    } else {
+        println!(
+            "  [vmm] MoE island residency: resident_slices={} resident_pages={} \
+             page_backed_slices={} hits={} misses={} page_hits={} page_misses={} \
+             evicted_slices={} evicted_pages={} prefetch_requests={} \
+             prefetch_hits={} prefetch_misses={} prefetch_page_hits={} \
+             prefetch_page_misses={} prefetch_skipped={} prefetch_skipped_pages={} \
+             uploaded={:.2}MiB unmapped={:.2}MiB \
+             resident={:.2}MiB reserved={:.2}MiB kv_resident={:.2}MiB \
+             total_vmm_resident={:.2}MiB total_vmm_reserved={:.2}MiB",
+            residency.resident_slices,
+            residency.resident_pages,
+            residency.page_backed_slices,
+            residency.hits,
+            residency.misses,
+            residency.page_hits,
+            residency.page_misses,
+            residency.evicted_slices,
+            residency.evicted_pages,
+            residency.prefetch_requests,
+            residency.prefetch_hits,
+            residency.prefetch_misses,
+            residency.prefetch_page_hits,
+            residency.prefetch_page_misses,
+            residency.prefetch_skipped,
+            residency.prefetch_skipped_pages,
+            residency.uploaded_bytes as f64 / MIB,
+            residency.unmapped_bytes as f64 / MIB,
+            arena.resident_bytes as f64 / MIB,
+            arena.reserved_bytes as f64 / MIB,
+            virtual_kv_stats.resident_bytes as f64 / MIB,
+            total_resident_bytes as f64 / MIB,
+            total_reserved_bytes as f64 / MIB,
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MoeIslandPrefetchMode, MoeRouteTelemetry, MoeTransitionPredictor};
+    use crate::qwen36_moe_decode::ExpertRoute;
+
+    #[test]
+    fn moe_prefetch_mode_env_accepts_disabled_and_previous_token_aliases() {
+        assert_eq!(
+            MoeIslandPrefetchMode::from_env_value(None).unwrap(),
+            MoeIslandPrefetchMode::Disabled
+        );
+        assert_eq!(
+            MoeIslandPrefetchMode::from_env_value(Some("disabled")).unwrap(),
+            MoeIslandPrefetchMode::Disabled
+        );
+        assert_eq!(
+            MoeIslandPrefetchMode::from_env_value(Some("previous-token")).unwrap(),
+            MoeIslandPrefetchMode::PreviousToken
+        );
+        assert_eq!(
+            MoeIslandPrefetchMode::from_env_value(Some("prev-token")).unwrap(),
+            MoeIslandPrefetchMode::PreviousToken
+        );
+    }
+
+    #[test]
+    fn moe_prefetch_mode_env_accepts_resident_only_aliases() {
+        assert_eq!(
+            MoeIslandPrefetchMode::from_env_value(Some("previous-token-resident")).unwrap(),
+            MoeIslandPrefetchMode::PreviousTokenResidentOnly
+        );
+        assert_eq!(
+            MoeIslandPrefetchMode::from_env_value(Some("previous_token_resident")).unwrap(),
+            MoeIslandPrefetchMode::PreviousTokenResidentOnly
+        );
+        assert_eq!(
+            MoeIslandPrefetchMode::from_env_value(Some("resident-previous-token")).unwrap(),
+            MoeIslandPrefetchMode::PreviousTokenResidentOnly
+        );
+        assert!(MoeIslandPrefetchMode::from_env_value(Some("resident")).is_err());
+    }
+
+    #[test]
+    fn moe_prefetch_mode_env_accepts_transition_aliases() {
+        assert_eq!(
+            MoeIslandPrefetchMode::from_env_value(Some("transition")).unwrap(),
+            MoeIslandPrefetchMode::Transition
+        );
+        assert_eq!(
+            MoeIslandPrefetchMode::from_env_value(Some("transition-weighted")).unwrap(),
+            MoeIslandPrefetchMode::Transition
+        );
+        assert_eq!(MoeIslandPrefetchMode::Transition.as_str(), "transition");
+        assert!(MoeIslandPrefetchMode::Transition.uses_previous_token_routes());
+        assert!(MoeIslandPrefetchMode::Transition.transition_weighted());
+    }
+
+    #[test]
+    fn moe_transition_predictor_waits_for_warmup_and_scores_repeats() {
+        let mut predictor = MoeTransitionPredictor::new(3, 2);
+        let previous_routes = [10, 20, 30];
+        let routes = [
+            ExpertRoute {
+                rank: 0,
+                expert_idx: 20,
+                weight: 0.5,
+            },
+            ExpertRoute {
+                rank: 1,
+                expert_idx: 99,
+                weight: 0.25,
+            },
+        ];
+
+        predictor.update(&routes, &previous_routes);
+        assert!(predictor.candidates(&previous_routes, 2).is_empty());
+
+        predictor.update(&routes, &previous_routes);
+        assert_eq!(predictor.candidates(&previous_routes, 2), vec![20]);
+
+        let later_routes = [
+            ExpertRoute {
+                rank: 0,
+                expert_idx: 10,
+                weight: 0.5,
+            },
+            ExpertRoute {
+                rank: 1,
+                expert_idx: 20,
+                weight: 0.25,
+            },
+        ];
+        predictor.update(&later_routes, &previous_routes);
+        assert_eq!(predictor.candidates(&previous_routes, 2), vec![20, 10]);
+    }
+
+    #[test]
+    fn moe_route_telemetry_records_previous_rank_transition_matrix() {
+        let mut telemetry = MoeRouteTelemetry::new(3);
+        let previous_routes = [7, 11, 13];
+        telemetry.record_route_observation(
+            &ExpertRoute {
+                rank: 0,
+                expert_idx: 11,
+                weight: 0.5,
+            },
+            &previous_routes,
+        );
+        telemetry.record_route_observation(
+            &ExpertRoute {
+                rank: 1,
+                expert_idx: 7,
+                weight: 0.25,
+            },
+            &previous_routes,
+        );
+        telemetry.record_route_observation(
+            &ExpertRoute {
+                rank: 2,
+                expert_idx: 99,
+                weight: 0.125,
+            },
+            &previous_routes,
+        );
+
+        assert_eq!(telemetry.observations_by_rank, vec![1, 1, 1]);
+        assert_eq!(telemetry.repeated_previous_by_rank, vec![1, 1, 0]);
+        assert_eq!(
+            telemetry.repeated_previous_rank_by_current_rank,
+            vec![vec![0, 1, 0], vec![1, 0, 0], vec![0, 0, 0]]
+        );
+        assert_eq!(
+            telemetry
+                .to_json()
+                .get("repeated_previous_rank_by_current_rank")
+                .unwrap(),
+            &serde_json::json!([[0, 1, 0], [1, 0, 0], [0, 0, 0]])
+        );
+        let json = telemetry.to_json();
+        assert_eq!(
+            json.get("repeated_previous_probability_by_current_rank")
+                .unwrap(),
+            &serde_json::json!([1.0, 1.0, 0.0])
+        );
+        assert_eq!(
+            json.get("same_rank_repeat_probability_by_rank").unwrap(),
+            &serde_json::json!([0.0, 0.0, 0.0])
+        );
+        assert_eq!(
+            json.get("repeated_current_by_previous_rank").unwrap(),
+            &serde_json::json!([1, 1, 0])
+        );
+        assert_eq!(
+            json.get("repeated_current_probability_by_previous_rank")
+                .unwrap(),
+            &serde_json::json!([1.0, 1.0, 0.0])
+        );
+        assert_eq!(
+            json.get("best_previous_rank_by_current_rank").unwrap(),
+            &serde_json::json!([1, 0, null])
+        );
+        assert_eq!(
+            json.get("best_current_rank_by_previous_rank").unwrap(),
+            &serde_json::json!([1, 0, null])
+        );
+        assert_eq!(
+            json.get("best_transition").unwrap(),
+            &serde_json::json!({
+                "current_rank": 0,
+                "previous_rank": 1,
+                "count": 1,
+                "probability_by_current_rank": 1.0,
+            })
+        );
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct MoeTransitionPredictor {
     top_k: usize,
@@ -124,6 +391,50 @@ impl MoeTransitionPredictor {
             .take(limit)
             .map(|(_, _, _, expert_idx)| expert_idx)
             .collect()
+    }
+}
+
+pub(crate) struct MoeRouteRuntime {
+    pub(crate) previous_topk_by_layer: Vec<Vec<usize>>,
+    pub(crate) route_telemetry: Option<MoeRouteTelemetry>,
+    pub(crate) transition_predictors: Option<Vec<MoeTransitionPredictor>>,
+}
+
+impl MoeRouteRuntime {
+    pub(crate) fn new(
+        num_layers: usize,
+        top_k: usize,
+        sparse_moe_requested: bool,
+        prefetch_mode: MoeIslandPrefetchMode,
+        transition_min_observations: u32,
+    ) -> Self {
+        let route_telemetry = sparse_moe_requested.then(|| MoeRouteTelemetry::new(top_k));
+        let transition_predictors = prefetch_mode.transition_weighted().then(|| {
+            vec![MoeTransitionPredictor::new(top_k, transition_min_observations); num_layers]
+        });
+        Self {
+            previous_topk_by_layer: vec![Vec::new(); num_layers],
+            route_telemetry,
+            transition_predictors,
+        }
+    }
+
+    pub(crate) fn should_track_routes(&self, prefetch_mode: MoeIslandPrefetchMode) -> bool {
+        prefetch_mode.uses_previous_token_routes() || self.route_telemetry.is_some()
+    }
+
+    pub(crate) fn next_topk_buffer(&self, track_routes: bool) -> Vec<Vec<usize>> {
+        if track_routes {
+            self.previous_topk_by_layer.clone()
+        } else {
+            Vec::new()
+        }
+    }
+
+    pub(crate) fn advance(&mut self, track_routes: bool, next_topk_by_layer: Vec<Vec<usize>>) {
+        if track_routes {
+            self.previous_topk_by_layer = next_topk_by_layer;
+        }
     }
 }
 

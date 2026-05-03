@@ -55,9 +55,7 @@ fn run_supersonic_capture_logits(args: &[&str]) -> anyhow::Result<Vec<f32>> {
 /// in both the dense and sparse paths. The dense path additionally
 /// emits `[tokens] ...` and `[result] ...` diagnostic lines after that
 /// which we ignore here.
-fn run_supersonic_capture_logits_and_text(
-    args: &[&str],
-) -> anyhow::Result<(Vec<f32>, String)> {
+fn run_supersonic_capture_logits_and_text(args: &[&str]) -> anyhow::Result<(Vec<f32>, String)> {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_supersonic"));
     cmd.args(args);
     cmd.arg("--dump-last-logits");
@@ -101,7 +99,9 @@ fn run_supersonic_capture_logits_and_text(
     }
     let logits = logits.ok_or_else(|| anyhow::anyhow!("LAST_LOGITS line not found"))?;
     if text.is_empty() {
-        anyhow::bail!("generated text not found in stdout (no non-diagnostic line after LAST_LOGITS)");
+        anyhow::bail!(
+            "generated text not found in stdout (no non-diagnostic line after LAST_LOGITS)"
+        );
     }
     Ok((logits, text))
 }
@@ -136,9 +136,7 @@ fn argmax(v: &[f32]) -> usize {
 
 fn top5(v: &[f32]) -> HashSet<usize> {
     let mut idx: Vec<(usize, f32)> = v.iter().copied().enumerate().collect();
-    idx.sort_unstable_by(|a, b| {
-        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-    });
+    idx.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     idx.into_iter().take(5).map(|p| p.0).collect()
 }
 
@@ -291,8 +289,7 @@ fn specprefill_qwen35_9b_keep_100_multitoken_identity() {
         "8",
     ];
 
-    let (_, dense_text) =
-        run_supersonic_capture_logits_and_text(&common).expect("dense run");
+    let (_, dense_text) = run_supersonic_capture_logits_and_text(&common).expect("dense run");
 
     let mut sparse_args = common.clone();
     sparse_args.extend_from_slice(&[
