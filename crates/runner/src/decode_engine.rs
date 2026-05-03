@@ -3617,7 +3617,7 @@ impl DecodeEngine {
             &mut self.normed_buf,
             &format!("layer {idx} component full-attn input rms_norm"),
         )?;
-        self.component_decode_full_attention_layer(idx, seqlen_offset, true, None, None)?
+        self.component_decode_full_attention_layer(idx, seqlen_offset, true, None, None, None)?
             .ok_or_else(|| anyhow::anyhow!("layer {idx} missing full-attention trace"))
     }
 
@@ -3694,6 +3694,7 @@ impl DecodeEngine {
         accumulate_target_nll: bool,
         mut timings: Option<&mut DecodeStageTimings>,
         mut full_attn_q_capture: Option<(&[usize], &mut Vec<Option<Vec<u8>>>)>,
+        rope_offset: Option<usize>,
     ) -> Result<(
         Option<Vec<f32>>,
         Option<u32>,
@@ -3757,6 +3758,7 @@ impl DecodeEngine {
                     want_q_capture,
                     certified_kv_decode,
                     timings.as_deref_mut(),
+                    rope_offset,
                 )?;
                 if want_q_capture {
                     let q_rope = trace
@@ -4079,6 +4081,7 @@ impl DecodeEngine {
             false,
             None,
             None,
+            None,
         )?;
         logits.ok_or_else(|| anyhow::anyhow!("component decode missing logits"))
     }
@@ -4100,6 +4103,7 @@ impl DecodeEngine {
             None,
             false,
             Some(&mut timings),
+            None,
             None,
         )?;
         let logits =
@@ -4137,6 +4141,7 @@ impl DecodeEngine {
             false,
             timing_slot,
             None,
+            None,
         )?;
         let sampled_token = sampled_token
             .ok_or_else(|| anyhow::anyhow!("component CUDA fast greedy missing sampled token"))?;
@@ -4161,6 +4166,7 @@ impl DecodeEngine {
             false,
             None,
             None,
+            None,
         )?;
         logits.ok_or_else(|| anyhow::anyhow!("certified KV decode missing logits"))
     }
@@ -4183,6 +4189,7 @@ impl DecodeEngine {
             None,
             false,
             Some(&mut timings),
+            None,
             None,
         )?;
         let logits = logits.ok_or_else(|| anyhow::anyhow!("certified KV decode missing logits"))?;
@@ -4214,6 +4221,7 @@ impl DecodeEngine {
             Some(target_token),
             false,
             timing_slot,
+            None,
             None,
         )?;
         let nll = nll.ok_or_else(|| anyhow::anyhow!("component target NLL missing output"))?;
@@ -4265,6 +4273,7 @@ impl DecodeEngine {
             true,
             timing_slot,
             None,
+            None,
         )?;
         nll.ok_or_else(|| anyhow::anyhow!("component accumulated target NLL missing marker"))?;
         Ok(timings)
@@ -4298,6 +4307,7 @@ impl DecodeEngine {
             false,
             timing_slot,
             None,
+            None,
         )?;
         let sampled_token = sampled_token
             .ok_or_else(|| anyhow::anyhow!("certified KV fast greedy missing sampled token"))?;
@@ -4320,6 +4330,7 @@ impl DecodeEngine {
             None,
             None,
             false,
+            None,
             None,
             None,
         )?;
@@ -4347,6 +4358,7 @@ impl DecodeEngine {
             false,
             None,
             None,
+            None,
         )?;
         let logits =
             logits.ok_or_else(|| anyhow::anyhow!("component layer trace missing logits"))?;
@@ -4371,6 +4383,7 @@ impl DecodeEngine {
             None,
             None,
             false,
+            None,
             None,
             None,
         )?;
@@ -4434,6 +4447,7 @@ impl DecodeEngine {
             false,
             None,
             Some((layers, &mut slots)),
+            None,
         )?;
         let logits = logits
             .ok_or_else(|| anyhow::anyhow!("decode_step_with_query_capture: missing logits"))?;
@@ -4455,6 +4469,50 @@ impl DecodeEngine {
         Ok((logits, captures))
     }
 
+    /// SpecPrefill (arXiv 2502.02789) sparse-decode entry point: a single
+    /// decode step where the KV write/read cursor (`kv_slot`) is decoupled
+    /// from the RoPE position (`rope_pos`). This is required because
+    /// after sparse target prefill the layer's K cache has only
+    /// `kept_positions.len()` rows — the (k+1)-th decode token must write
+    /// into slot `kept_count + k` (the next available cache slot), but
+    /// must rotate by RoPE position `original_T + k` (its actual sequence
+    /// position) for attention math to remain correct.
+    ///
+    /// For dense decode the two are equal and you should use the standard
+    /// `decode_step` instead.
+    ///
+    /// Requires `use_4b_kernel = true` and `batch_size = 1`.
+    pub fn decode_step_with_rope_pos(
+        &mut self,
+        token_id: u32,
+        kv_slot: usize,
+        rope_pos: usize,
+    ) -> Result<Vec<f32>> {
+        if !self.use_4b_kernel {
+            anyhow::bail!("decode_step_with_rope_pos requires use_4b_kernel");
+        }
+        if self.batch_size != 1 {
+            anyhow::bail!("decode_step_with_rope_pos requires batch_size=1");
+        }
+        let (logits, _, _, _, _, _) = self.component_decode_step_4b_impl(
+            token_id,
+            kv_slot,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            false,
+            None,
+            None,
+            Some(rope_pos),
+        )?;
+        logits.ok_or_else(|| {
+            anyhow::anyhow!("decode_step_with_rope_pos: missing logits")
+        })
+    }
+
     fn component_decode_full_attention_layer(
         &mut self,
         idx: usize,
@@ -4462,7 +4520,12 @@ impl DecodeEngine {
         trace_output: bool,
         certified_kv_decode: Option<CertifiedKvDecodeParams>,
         mut timings: Option<&mut DecodeStageTimings>,
+        rope_offset: Option<usize>,
     ) -> Result<Option<ComponentFullAttentionTrace>> {
+        // `rope_pos` overrides `seqlen_offset` ONLY for RoPE rotation of Q and K.
+        // All other uses (KV cache write slot, kv_len, kernel descriptors) keep
+        // using `seqlen_offset` unchanged, which is the correct KV cursor.
+        let rope_pos = rope_offset.unwrap_or(seqlen_offset);
         if self.state.layers[idx].has_virtual_kv_cache() {
             anyhow::bail!(
                 "component full-attention decode for layer {idx} requires legacy dense KV buffers; disable SUPERSONIC_VMM_KV for this debug/component path"
@@ -4862,7 +4925,7 @@ impl DecodeEngine {
                 rotary_dim,
                 &self.rotary.cos,
                 &self.rotary.sin,
-                seqlen_offset,
+                rope_pos,
                 query_buf,
             )
             .map_err(|e| anyhow::anyhow!("layer {idx} q rope: {e}"))?;
@@ -4875,7 +4938,7 @@ impl DecodeEngine {
                 rotary_dim,
                 &self.rotary.cos,
                 &self.rotary.sin,
-                seqlen_offset,
+                rope_pos,
                 k_buf,
             )
             .map_err(|e| anyhow::anyhow!("layer {idx} k rope: {e}"))?;

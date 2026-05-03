@@ -236,13 +236,17 @@ pub fn run_specprefill(
         std::io::stdout().flush().ok();
     }
 
-    // ---- Decode loop. Position cursor starts at prompt_ids.len() (NOT
-    //      kept_positions.len()) — every new generated token sees the
-    //      full original prompt context via its source-position RoPE
-    //      rotation, even though only kept K rows live in the cache. ----
+    // ---- Decode loop. KV slot and RoPE position are decoupled:
+    //      - kv_slot = kept_count + step  (next available slot in the sparse KV cache)
+    //      - rope_pos = prompt_len + step  (actual sequence position for RoPE rotation)
+    //      This fixes attention math after sparse target prefill: the KV cache only
+    //      has kept_count rows, so each new token must write to slot kept_count+step,
+    //      but must use its true sequence position for RoPE. ----
+    let kept_count = kept_positions.len();
+    let prompt_len = prompt_ids.len();
     let mut next_id = DecodeEngine::greedy_sample(&prefill_result.logits);
     let mut generated: Vec<u32> = Vec::new();
-    let mut pos = prompt_ids.len();
+    let mut step: usize = 0;
     let eos_ids = target_text_config.eos_token_ids();
     while generated.len() < cli.max_new_tokens {
         if eos_ids.contains(&next_id) {
@@ -253,9 +257,11 @@ pub fn run_specprefill(
         if generated.len() >= cli.max_new_tokens {
             break;
         }
-        let logits = target_engine.decode_step(next_id, pos)?;
+        let kv_slot = kept_count + step;
+        let rope_pos = prompt_len + step;
+        let logits = target_engine.decode_step_with_rope_pos(next_id, kv_slot, rope_pos)?;
         next_id = DecodeEngine::greedy_sample(&logits);
-        pos += 1;
+        step += 1;
     }
 
     // ---- Detokenise + print ----
