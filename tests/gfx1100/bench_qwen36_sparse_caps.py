@@ -220,8 +220,8 @@ def run_case(
 
 def markdown(rows: list[dict[str, Any]]) -> str:
     out = [
-        "| Mode | total ms/tok | tok/s | total resident GiB | MoE resident GiB | KV resident GiB | prefetch | ranks | peak pages | page misses | prefetch page misses | rank0 resident | rank0 repeat | evicted pages | ids match |",
-        "|---|---:|---:|---:|---:|---:|:---:|---:|---:|---:|---:|---:|---:|---:|:---:|",
+        "| Mode | total ms/tok | tok/s | total resident GiB | MoE resident GiB | KV resident GiB | prefetch | ranks | peak pages | page misses | prefetch page misses | prefetch skipped | rank0 resident | rank0 repeat | evicted pages | ids match |",
+        "|---|---:|---:|---:|---:|---:|:---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|",
     ]
     for row in rows:
         residency = row.get("vmm_residency") or {}
@@ -229,7 +229,7 @@ def markdown(rows: list[dict[str, Any]]) -> str:
         stage = row.get("stage") or {}
         ids_match = row.get("generated_ids_match")
         out.append(
-            "| {label} | {ms} | {tok} | {total_gib} | {moe_gib} | {kv_gib} | {prefetch_mode} | {prefetch_ranks} | {peak_pages} | {page_misses} | {prefetch_page_misses} | {rank0_resident} | {rank0_repeat} | {evicted_pages} | {ids_match} |".format(
+            "| {label} | {ms} | {tok} | {total_gib} | {moe_gib} | {kv_gib} | {prefetch_mode} | {prefetch_ranks} | {peak_pages} | {page_misses} | {prefetch_page_misses} | {prefetch_skipped} | {rank0_resident} | {rank0_repeat} | {evicted_pages} | {ids_match} |".format(
                 label=row["label"],
                 ms=fmt_num(stage.get("total_ms_avg")),
                 tok=fmt_num(row.get("tok_per_s")),
@@ -241,6 +241,7 @@ def markdown(rows: list[dict[str, Any]]) -> str:
                 peak_pages=residency.get("peak_resident_pages", "-"),
                 page_misses=residency.get("page_misses", "-"),
                 prefetch_page_misses=residency.get("prefetch_page_misses", "-"),
+                prefetch_skipped=residency.get("prefetch_skipped", "-"),
                 rank0_resident=fmt_rank_pct(route_summary, "resident_before_by_rank"),
                 rank0_repeat=fmt_rank_pct(route_summary, "repeated_previous_by_rank"),
                 evicted_pages=residency.get("evicted_pages", "-"),

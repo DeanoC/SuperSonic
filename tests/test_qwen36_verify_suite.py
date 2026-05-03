@@ -212,6 +212,8 @@ class Qwen36VerifySuiteTests(unittest.TestCase):
                     "moe_resident_bytes": 10,
                     "kv_resident_bytes": 3,
                     "total_vmm_resident_bytes": 13,
+                    "prefetch_skipped": 4,
+                    "prefetch_skipped_pages": 9,
                     "route_summary": {
                         "observations_by_rank": [2],
                         "resident_before_by_rank": [1],
@@ -227,6 +229,8 @@ class Qwen36VerifySuiteTests(unittest.TestCase):
                     "moe_resident_bytes": 10,
                     "kv_resident_bytes": 3,
                     "total_vmm_resident_bytes": 13,
+                    "prefetch_skipped": 4,
+                    "prefetch_skipped_pages": 9,
                     "route_summary": {
                         "observations_by_rank": [2],
                         "resident_before_by_rank": [1],
