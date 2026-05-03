@@ -17,6 +17,7 @@ struct SmokeCase {
 
 #[cfg(target_os = "linux")]
 fn run_supersonic(
+    backend: &str,
     model_dir: &str,
     case: &SmokeCase,
     vmm: &str,
@@ -26,7 +27,7 @@ fn run_supersonic(
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_supersonic"));
     cmd.env("SUPERSONIC_VMM_KV", vmm).args([
         "--backend",
-        "hip",
+        backend,
         "--model",
         "qwen3.5-0.8b",
         "--model-dir",
@@ -49,7 +50,8 @@ fn run_supersonic(
     if let Some(chunk_size) = case.prefill_chunk_size {
         cmd.args(["--prefill-chunk-size", chunk_size]);
     }
-    cmd.output().expect("run supersonic qwen35 HIP smoke")
+    cmd.output()
+        .unwrap_or_else(|e| panic!("run supersonic qwen35 {backend} smoke: {e}"))
 }
 
 #[cfg(target_os = "linux")]
@@ -70,9 +72,23 @@ fn tokens_line(output: &str) -> &str {
 }
 
 #[cfg(target_os = "linux")]
-#[test]
-#[ignore = "requires HIP and a local Qwen3.5-0.8B model dir via SUPERSONIC_TEST_QWEN35_08B_MODEL_DIR"]
-fn qwen35_hip_virtual_kv_matches_dense_tokens() {
+fn backend_vmm_supported(backend: &str) -> bool {
+    let backend = match backend {
+        "hip" => gpu_hal::Backend::Hip,
+        "cuda" => gpu_hal::Backend::Cuda,
+        other => panic!("unsupported smoke backend {other}"),
+    };
+    gpu_hal::set_backend(backend);
+    gpu_hal::vmm_is_supported(backend, 0)
+}
+
+#[cfg(target_os = "linux")]
+fn qwen35_virtual_kv_matches_dense_tokens_for_backend(backend: &str) {
+    if !backend_vmm_supported(backend) {
+        eprintln!("skipping: {backend} VMM unsupported on this device/runtime");
+        return;
+    }
+
     let Some(model_dir) = model_dir() else {
         eprintln!("skipping: SUPERSONIC_TEST_QWEN35_08B_MODEL_DIR is not set");
         return;
@@ -105,11 +121,11 @@ fn qwen35_hip_virtual_kv_matches_dense_tokens() {
     ];
 
     for case in cases {
-        let dense = run_supersonic(&model_dir, &case, "0", false, false);
+        let dense = run_supersonic(backend, &model_dir, &case, "0", false, false);
         let dense_combined = combined_output(&dense);
         assert!(
             dense.status.success(),
-            "dense Qwen3.5 HIP smoke case={} failed with status {:?}:\n{}",
+            "dense Qwen3.5 {backend} smoke case={} failed with status {:?}:\n{}",
             case.name,
             dense.status.code(),
             dense_combined
@@ -121,11 +137,11 @@ fn qwen35_hip_virtual_kv_matches_dense_tokens() {
             dense_combined
         );
 
-        let virtual_kv = run_supersonic(&model_dir, &case, "1", false, false);
+        let virtual_kv = run_supersonic(backend, &model_dir, &case, "1", false, false);
         let virtual_combined = combined_output(&virtual_kv);
         assert!(
             virtual_kv.status.success(),
-            "virtual-KV Qwen3.5 HIP smoke case={} failed with status {:?}:\n{}",
+            "virtual-KV Qwen3.5 {backend} smoke case={} failed with status {:?}:\n{}",
             case.name,
             virtual_kv.status.code(),
             virtual_combined
@@ -151,7 +167,7 @@ fn qwen35_hip_virtual_kv_matches_dense_tokens() {
         );
 
         if case.name == "chunked_prefill" {
-            let evicted = run_supersonic(&model_dir, &case, "1", true, false);
+            let evicted = run_supersonic(backend, &model_dir, &case, "1", true, false);
             let evicted_combined = combined_output(&evicted);
             assert!(
                 evicted.status.success(),
@@ -180,7 +196,7 @@ fn qwen35_hip_virtual_kv_matches_dense_tokens() {
                 case.name
             );
 
-            let restored_vmm = run_supersonic(&model_dir, &case, "1", true, true);
+            let restored_vmm = run_supersonic(backend, &model_dir, &case, "1", true, true);
             let restored_vmm_combined = combined_output(&restored_vmm);
             assert!(
                 restored_vmm.status.success(),
@@ -205,4 +221,18 @@ fn qwen35_hip_virtual_kv_matches_dense_tokens() {
             );
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires HIP and a local Qwen3.5-0.8B model dir via SUPERSONIC_TEST_QWEN35_08B_MODEL_DIR"]
+fn qwen35_hip_virtual_kv_matches_dense_tokens() {
+    qwen35_virtual_kv_matches_dense_tokens_for_backend("hip");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires CUDA and a local Qwen3.5-0.8B model dir via SUPERSONIC_TEST_QWEN35_08B_MODEL_DIR"]
+fn qwen35_cuda_virtual_kv_matches_dense_tokens() {
+    qwen35_virtual_kv_matches_dense_tokens_for_backend("cuda");
 }
