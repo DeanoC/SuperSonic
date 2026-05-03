@@ -211,6 +211,10 @@ class Qwen36VerifySuiteTests(unittest.TestCase):
                     "moe_resident_bytes": 10,
                     "kv_resident_bytes": 3,
                     "total_vmm_resident_bytes": 13,
+                    "route_summary": {
+                        "observations_by_rank": [2],
+                        "resident_before_by_rank": [1],
+                    },
                     "unrelated": "ignored",
                 }
             }))
@@ -221,6 +225,10 @@ class Qwen36VerifySuiteTests(unittest.TestCase):
                     "moe_resident_bytes": 10,
                     "kv_resident_bytes": 3,
                     "total_vmm_resident_bytes": 13,
+                    "route_summary": {
+                        "observations_by_rank": [2],
+                        "resident_before_by_rank": [1],
+                    },
                 },
             )
 

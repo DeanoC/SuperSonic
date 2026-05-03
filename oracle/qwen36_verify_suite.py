@@ -352,6 +352,7 @@ def load_vmm_residency(path: Path) -> dict[str, Any]:
         "prefetch_page_hits",
         "prefetch_page_misses",
         "prefetch_uploaded_bytes",
+        "route_summary",
     ]
     return {k: summary[k] for k in keys if k in summary}
 
