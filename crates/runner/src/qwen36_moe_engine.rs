@@ -12,11 +12,11 @@
 
 use std::path::Path;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use gpu_hal::{set_backend, Backend};
 use model_store::BakedStore;
 
-use crate::qwen36_moe_bake::ensure_qwen36_bake;
+use crate::qwen36_moe_bake::{ensure_qwen36_bake, select_decode_bake};
 use crate::qwen36_moe_decode::{
     argmax_bf16_logits, run_chained_decode_fast, run_chained_decode_fast_with_expert_prefetch,
     sample_bf16_logits, ExpertPrefetchPhase, ExpertRoute, XorshiftRng,
@@ -26,8 +26,10 @@ use crate::qwen36_moe_dry_run::{
 };
 use crate::qwen36_moe_geom::build_multi_layer_geom;
 use crate::qwen36_moe_host::lookup_embed_row;
-use crate::qwen36_moe_layers::Qwen36WeightMode;
 use crate::qwen36_moe_prefetch::handle_moe_expert_prefetch;
+use crate::qwen36_moe_prompt::{
+    prepare_prompt, print_prompt_summary, validate_speculative_sampling,
+};
 use crate::qwen36_moe_session::{prepare_decode_session, Qwen36DecodeSession};
 use crate::qwen36_moe_speculative::{
     run_speculative_decode_step, run_speculative_decode_step_batched,
@@ -193,116 +195,24 @@ fn decode_text(
 ) -> Result<()> {
     use std::io::Write as _;
 
-    // Greedy-only gate for speculative decode. The Phase 6.3 protocol
-    // verifies MTP drafts via greedy argmax against the base model's
-    // logits — extending it to non-greedy sampling needs rejection
-    // sampling (Speculative Decoding §3 in vLLM's reference), which
-    // hasn't been implemented. Reject up front rather than silently
-    // mix `argmax` (verify) with `sample_bf16_logits` (regular sample),
-    // which would emit a different distribution than plain decode and
-    // break reproducibility.
-    //
-    // `sample_bf16_logits` falls back to argmax when `temperature <= 0`
-    // (or `top_k == 1`), so any non-trivial sampling configuration —
-    // any of `temperature > 0`, `top_k != 1`, `top_p < 1.0` — counts
-    // as non-greedy and is rejected here.
-    if speculative_decode {
-        let is_greedy = sampling.temperature <= 0.0 || sampling.top_k == 1;
-        if !is_greedy {
-            anyhow::bail!(
-                "--speculative-decode currently supports greedy sampling \
-                 only (temperature ≤ 0 or top_k == 1). Got temperature={}, \
-                 top_k={}, top_p={}. Phase 6.4 will add sampling-consistent \
-                 verification (rejection sampling); until then, re-run with \
-                 `--temperature 0` for speculative decode, or drop \
-                 `--speculative-decode` for non-greedy sampling.",
-                sampling.temperature,
-                sampling.top_k,
-                sampling.top_p
-            );
-        }
-    }
+    validate_speculative_sampling(speculative_decode, sampling)?;
 
     let weight_prefix = report.kernel_params.weight_prefix;
 
-    // Tokenizer first — without it we can't tokenize the prompt or stream
-    // decoded text. Falls back to BOS-only if the tokenizer can't load.
-    let tokenizer_path = model_dir.join("tokenizer.json");
-    let tokenizer = crate::load_tokenizer(&tokenizer_path).ok();
+    let prompt_setup = prepare_prompt(model_dir, &report.config.text_config, prompt)?;
+    let tokenizer = prompt_setup.tokenizer;
+    let prompt_ids = prompt_setup.prompt_ids;
+    let eos_id = prompt_setup.eos_id;
+    print_prompt_summary(prompt, &prompt_ids);
 
-    let bos_id = report
-        .config
-        .text_config
-        .bos_token_id
-        .as_ref()
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0) as u32;
-    let eos_id = report
-        .config
-        .text_config
-        .eos_token_id
-        .as_ref()
-        .and_then(|v| v.as_u64())
-        .map(|v| v as u32);
-
-    let prompt_ids: Vec<u32> = match (&tokenizer, prompt.is_empty()) {
-        (Some(tok), false) => {
-            let enc = tok
-                .encode(prompt, true)
-                .map_err(|e| anyhow!("tokenize prompt: {e}"))?;
-            let ids: Vec<u32> = enc.get_ids().to_vec();
-            if ids.is_empty() {
-                vec![bos_id]
-            } else {
-                ids
-            }
-        }
-        _ => vec![bos_id],
-    };
-    println!(
-        "  prompt: {prompt:?} → {} token{} ({:?}{}…)",
-        prompt_ids.len(),
-        if prompt_ids.len() == 1 { "" } else { "s" },
-        &prompt_ids[..prompt_ids.len().min(8)],
-        if prompt_ids.len() > 8 { ", " } else { "" },
-    );
-
-    // Pick the bake. INT4 remains the default small-VRAM path; explicit
-    // --fp8-runtime selects the native FP8 bake.
-    let fp8_dir = model_store::bake_dir_fp8(model_dir);
-    let int4_dir = model_store::bake_dir_int4(model_dir);
-    let bf16_dir = model_store::bake_dir(model_dir);
-    let (bake_dir, weight_mode) = if fp8_runtime {
-        if !fp8_dir.exists() {
-            return Err(anyhow!(
-                "--fp8-runtime requested but no FP8-native bake exists at {}. \
-                 Create one with `python3 oracle/bake_fp8.py --model-dir {}`.",
-                fp8_dir.display(),
-                model_dir.display()
-            ));
-        }
-        (fp8_dir, Qwen36WeightMode::Fp8)
-    } else if int4_dir.exists() {
-        (int4_dir, Qwen36WeightMode::Int4)
-    } else if bf16_dir.exists() {
-        (bf16_dir, Qwen36WeightMode::Bf16)
-    } else {
-        return Err(anyhow!(
-            "decode requires a baked package — neither FP8-native ({}), \
-             INT4-GPTQ ({}) nor BF16 ({}) exists. Create one with the standard bake pipeline \
-             or re-run with --dry-run for analytic accounting only.",
-            fp8_dir.display(),
-            int4_dir.display(),
-            bf16_dir.display()
-        ));
-    };
+    let bake = select_decode_bake(model_dir, fp8_runtime)?;
     println!(
         "  loading from bake: {} ({})",
-        bake_dir.display(),
-        weight_mode.display_name(),
+        bake.bake_dir.display(),
+        bake.weight_mode.display_name(),
     );
-    let store = BakedStore::open(&bake_dir)
-        .with_context(|| format!("open BakedStore at {}", bake_dir.display()))?;
+    let store = BakedStore::open(&bake.bake_dir)
+        .with_context(|| format!("open BakedStore at {}", bake.bake_dir.display()))?;
 
     let geom = build_multi_layer_geom(&report.config.text_config, &report.kernel_params);
 
@@ -316,7 +226,7 @@ fn decode_text(
     println!(
         "  loading {} layers ({} INT4 sidecar sets, KV cache cap = {} tokens)…",
         geom.num_layers,
-        if weight_mode.is_int4() {
+        if bake.weight_mode.is_int4() {
             geom.num_layers
         } else {
             0
@@ -368,7 +278,7 @@ fn decode_text(
         &geom,
         &report.config.text_config,
         weight_prefix,
-        weight_mode,
+        bake.weight_mode,
         kv_max_t,
         kv_fp8,
         kv_vmm,

@@ -1,6 +1,14 @@
+use std::path::{Path, PathBuf};
+
 use anyhow::{anyhow, Result};
 
+use crate::qwen36_moe_layers::Qwen36WeightMode;
 use crate::registry::RegistryEntry;
+
+pub(crate) struct DecodeBakeSelection {
+    pub(crate) bake_dir: PathBuf,
+    pub(crate) weight_mode: Qwen36WeightMode,
+}
 
 pub(crate) fn ensure_qwen36_bake(cli: &crate::Cli, entry: &RegistryEntry) -> Result<()> {
     // Auto-download the requested release bake if missing or stale. 35B-A3B
@@ -37,4 +45,44 @@ pub(crate) fn ensure_qwen36_bake(cli: &crate::Cli, entry: &RegistryEntry) -> Res
         }
     }
     Ok(())
+}
+
+pub(crate) fn select_decode_bake(
+    model_dir: &Path,
+    fp8_runtime: bool,
+) -> Result<DecodeBakeSelection> {
+    // INT4 remains the default small-VRAM path; explicit --fp8-runtime
+    // selects the native FP8 bake.
+    let fp8_dir = model_store::bake_dir_fp8(model_dir);
+    let int4_dir = model_store::bake_dir_int4(model_dir);
+    let bf16_dir = model_store::bake_dir(model_dir);
+    let (bake_dir, weight_mode) = if fp8_runtime {
+        if !fp8_dir.exists() {
+            return Err(anyhow!(
+                "--fp8-runtime requested but no FP8-native bake exists at {}. \
+                 Create one with `python3 oracle/bake_fp8.py --model-dir {}`.",
+                fp8_dir.display(),
+                model_dir.display()
+            ));
+        }
+        (fp8_dir, Qwen36WeightMode::Fp8)
+    } else if int4_dir.exists() {
+        (int4_dir, Qwen36WeightMode::Int4)
+    } else if bf16_dir.exists() {
+        (bf16_dir, Qwen36WeightMode::Bf16)
+    } else {
+        return Err(anyhow!(
+            "decode requires a baked package — neither FP8-native ({}), \
+             INT4-GPTQ ({}) nor BF16 ({}) exists. Create one with the standard bake pipeline \
+             or re-run with --dry-run for analytic accounting only.",
+            fp8_dir.display(),
+            int4_dir.display(),
+            bf16_dir.display()
+        ));
+    };
+
+    Ok(DecodeBakeSelection {
+        bake_dir,
+        weight_mode,
+    })
 }
