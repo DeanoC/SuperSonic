@@ -86,6 +86,49 @@ impl BakedStore {
         Some(slice)
     }
 
+    pub fn raw_byte_range(
+        &self,
+        name: &str,
+        byte_offset: usize,
+        byte_len: usize,
+    ) -> Result<&[u8], Error> {
+        let meta = self
+            .index
+            .get(name)
+            .ok_or_else(|| Error::NotFound(name.to_string()))?;
+        let tensor_end = (meta.offset as usize)
+            .checked_add(meta.byte_len as usize)
+            .ok_or_else(|| {
+                Error::Other(format!(
+                    "tensor '{name}' byte range overflows (offset={}, len={})",
+                    meta.offset, meta.byte_len
+                ))
+            })?;
+        if tensor_end > self.data_len {
+            return Err(Error::Other(format!(
+                "tensor '{}' extends past end of weights.bin (offset={}, len={}, file_len={})",
+                name, meta.offset, meta.byte_len, self.data_len,
+            )));
+        }
+        let range_end = byte_offset.checked_add(byte_len).ok_or_else(|| {
+            Error::Other(format!(
+                "tensor '{name}' raw range overflows: offset={byte_offset} len={byte_len}"
+            ))
+        })?;
+        if range_end > meta.byte_len as usize {
+            return Err(Error::Other(format!(
+                "tensor '{name}' raw range [{byte_offset}, {range_end}) exceeds byte_len={}",
+                meta.byte_len
+            )));
+        }
+        Ok(unsafe {
+            std::slice::from_raw_parts(
+                self.data.add(meta.offset as usize).add(byte_offset),
+                byte_len,
+            )
+        })
+    }
+
     /// Load a tensor from the baked store directly to GPU memory.
     /// One memcpy (H2D), zero parsing or transformation.
     pub fn load_to_gpu(&self, name: &str, ordinal: usize) -> Result<GpuBuffer, Error> {

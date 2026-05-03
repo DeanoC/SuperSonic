@@ -3,6 +3,8 @@ use std::ffi::{c_int, c_uint, c_ulonglong, c_void};
 pub(crate) const HIP_MEMCPY_HOST_TO_DEVICE: c_int = 1;
 pub(crate) const HIP_MEMCPY_DEVICE_TO_HOST: c_int = 2;
 pub(crate) const HIP_MEMCPY_DEVICE_TO_DEVICE: c_int = 3;
+pub(crate) const HIP_STREAM_NON_BLOCKING: c_uint = 1;
+pub(crate) const HIP_ERROR_NOT_READY: c_int = 600;
 #[allow(dead_code)]
 pub(crate) const HIP_HOST_REGISTER_MAPPED: c_uint = 0x2;
 // hipHostMalloc flag bits (matching hip_runtime_api.h).
@@ -69,7 +71,20 @@ unsafe extern "C" {
         size: usize,
         kind: c_int,
     ) -> c_int;
+    pub(crate) fn hipMemcpyAsync(
+        dst: *mut c_void,
+        src: *const c_void,
+        size: usize,
+        kind: c_int,
+        stream: *mut c_void,
+    ) -> c_int;
     pub(crate) fn hipMemset(dst: *mut c_void, value: c_int, size: usize) -> c_int;
+    pub(crate) fn hipMemsetAsync(
+        dst: *mut c_void,
+        value: c_int,
+        size: usize,
+        stream: *mut c_void,
+    ) -> c_int;
     pub(crate) fn hipMemAddressReserve(
         ptr: *mut *mut c_void,
         size: usize,
@@ -105,9 +120,18 @@ unsafe extern "C" {
         count: usize,
     ) -> c_int;
     pub(crate) fn hipDeviceSynchronize() -> c_int;
+    pub(crate) fn hipStreamCreateWithFlags(stream: *mut *mut c_void, flags: c_uint) -> c_int;
+    pub(crate) fn hipStreamDestroy(stream: *mut c_void) -> c_int;
+    pub(crate) fn hipStreamSynchronize(stream: *mut c_void) -> c_int;
+    pub(crate) fn hipStreamWaitEvent(
+        stream: *mut c_void,
+        event: *mut c_void,
+        flags: c_uint,
+    ) -> c_int;
     pub(crate) fn hipEventCreate(event: *mut *mut c_void) -> c_int;
     pub(crate) fn hipEventDestroy(event: *mut c_void) -> c_int;
     pub(crate) fn hipEventRecord(event: *mut c_void, stream: *mut c_void) -> c_int;
+    pub(crate) fn hipEventQuery(event: *mut c_void) -> c_int;
     pub(crate) fn hipEventSynchronize(event: *mut c_void) -> c_int;
     pub(crate) fn hipEventElapsedTime(ms: *mut f32, start: *mut c_void, end: *mut c_void) -> c_int;
 }
