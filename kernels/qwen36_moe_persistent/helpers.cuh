@@ -312,6 +312,40 @@ __device__ inline float fp8_e4m3_to_float(uint8_t byte) {
     return sign * ldexpf(1.0f + static_cast<float>(mant) / 8.0f, exp - 7);
 }
 
+__device__ inline uint8_t float_to_fp8_e4m3(float val) {
+    if (val != val) return 0x7Fu; // NaN → max positive (matches CUDA __nv_fp8_e4m3 saturation)
+    if (val ==  INFINITY) return 0x7Eu;
+    if (val == -INFINITY) return 0xFEu;
+    const uint8_t sign = (val < 0.f) ? 0x80u : 0x00u;
+    float a = fabsf(val);
+    if (a > 448.0f) a = 448.0f;
+    if (a == 0.0f) return sign;
+    int e_unbiased;
+    float m = frexpf(a, &e_unbiased);
+    int exp_field = e_unbiased - 1 + 7;
+    uint32_t mant_field;
+    if (exp_field <= 0) {
+        const float scale = ldexpf(1.0f, -6 - exp_field);
+        const float mant_f = a * scale;
+        mant_field = static_cast<uint32_t>(mant_f + 0.5f);
+        if (mant_field >= 8u) {
+            mant_field -= 8u;
+            exp_field = 1;
+        } else {
+            exp_field = 0;
+        }
+    } else {
+        const float mant_f = (m * 2.0f - 1.0f) * 8.0f;
+        mant_field = static_cast<uint32_t>(mant_f + 0.5f);
+        if (mant_field >= 8u) {
+            mant_field -= 8u;
+            exp_field += 1;
+        }
+    }
+    if (exp_field >= 0xF) return sign | 0x7Eu;
+    return static_cast<uint8_t>(sign | (exp_field << 3) | (mant_field & 0x7u));
+}
+
 __device__ inline float fp8_dequant_scalar(
     const void* w_ptr, const void* scale_ptr,
     int row, int col, int cols, int block_size

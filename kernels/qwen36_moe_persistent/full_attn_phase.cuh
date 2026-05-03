@@ -113,16 +113,6 @@ __device__ inline void qwen36_moe_attn_step_device(
     (void)rotary_dim;
     (void)rope_theta;
     // `position` is now read in Phase G when KV cache is enabled.
-    // KV-FP8 sidecar params are wired through but unused until Tasks 6/7
-    // add the FP8 quant/dequant logic. Suppress unused-parameter warnings
-    // so a future -Wall flag during Task 6 development doesn't drown in
-    // pre-existing noise.
-    (void)kv_scale_k;
-    (void)kv_scale_v;
-    (void)kv_shadow_k;
-    (void)kv_shadow_v;
-    (void)kv_shadow_start;
-
     const int num_blocks = static_cast<int>(gridDim.x);
     const int tid        = threadIdx.x;
     const int block_size = static_cast<int>(blockDim.x);
@@ -744,15 +734,97 @@ __device__ inline void qwen36_moe_attn_step_device(
         if (use_kv_cache) {
             const int slot_base = eff_cache_pos * Hkv * d;
             const int total = Hkv * d;
-            for (int idx = blockIdx.x * block_size + tid;
-                 idx < total;
-                 idx += num_blocks * block_size) {
-                const int h_kv = idx / d;
-                const int i    = idx % d;
-                const float kv = workspace[OFF_K_ROT + h_kv * d + i];
-                const float vv = workspace[OFF_V_RAW + h_kv * d + i];
-                kv_cache_k[slot_base + h_kv * d + i] = static_cast<T>(kv);
-                kv_cache_v[slot_base + h_kv * d + i] = static_cast<T>(vv);
+            const bool use_fp8_kv = (kv_scale_k != nullptr && kv_scale_v != nullptr);
+
+            if (!use_fp8_kv) {
+                // BF16 path — unchanged from before KV-FP8 landed.
+                for (int idx = blockIdx.x * block_size + tid;
+                     idx < total;
+                     idx += num_blocks * block_size) {
+                    const int h_kv = idx / d;
+                    const int i    = idx % d;
+                    const float kv = workspace[OFF_K_ROT + h_kv * d + i];
+                    const float vv = workspace[OFF_V_RAW + h_kv * d + i];
+                    kv_cache_k[slot_base + h_kv * d + i] = static_cast<T>(kv);
+                    kv_cache_v[slot_base + h_kv * d + i] = static_cast<T>(vv);
+                }
+            } else {
+                // FP8 path — per-(h_kv, position) absmax → F32 scale, then
+                // quantise each element of the head's d-dim vector. One
+                // block covers one (h_kv, position) pair so absmax can run
+                // as a block-wide reduction in shared_scratch.
+                uint8_t* fp8_k = reinterpret_cast<uint8_t*>(kv_cache_k);
+                uint8_t* fp8_v = reinterpret_cast<uint8_t*>(kv_cache_v);
+                for (int h_kv = blockIdx.x; h_kv < Hkv; h_kv += num_blocks) {
+                    // Absmax(K) and Absmax(V) over the head's d-dim vector.
+                    float local_max_k = 0.f, local_max_v = 0.f;
+                    for (int i = tid; i < d; i += block_size) {
+                        const float kv = workspace[OFF_K_ROT + h_kv * d + i];
+                        const float vv = workspace[OFF_V_RAW + h_kv * d + i];
+                        local_max_k = fmaxf(local_max_k, fabsf(kv));
+                        local_max_v = fmaxf(local_max_v, fabsf(vv));
+                    }
+                    shared_scratch[tid] = local_max_k;
+                    __syncthreads();
+                    for (int s = block_size / 2; s > 0; s >>= 1) {
+                        if (tid < s) {
+                            shared_scratch[tid] = fmaxf(shared_scratch[tid], shared_scratch[tid + s]);
+                        }
+                        __syncthreads();
+                    }
+                    const float head_max_k = shared_scratch[0];
+                    __syncthreads();
+                    shared_scratch[tid] = local_max_v;
+                    __syncthreads();
+                    for (int s = block_size / 2; s > 0; s >>= 1) {
+                        if (tid < s) {
+                            shared_scratch[tid] = fmaxf(shared_scratch[tid], shared_scratch[tid + s]);
+                        }
+                        __syncthreads();
+                    }
+                    const float head_max_v = shared_scratch[0];
+                    __syncthreads();
+
+                    // 448.f is FP8 E4M3 max finite. Floor scale at a tiny
+                    // positive value to avoid division by zero on
+                    // zero-vectors (legal at position 0 of a fresh layer).
+                    const float scale_k = fmaxf(head_max_k / 448.0f, 1.0e-12f);
+                    const float scale_v = fmaxf(head_max_v / 448.0f, 1.0e-12f);
+                    const float inv_k = 1.0f / scale_k;
+                    const float inv_v = 1.0f / scale_v;
+
+                    if (tid == 0) {
+                        kv_scale_k[h_kv * kv_max_t + eff_cache_pos] = scale_k;
+                        kv_scale_v[h_kv * kv_max_t + eff_cache_pos] = scale_v;
+                    }
+
+                    // Quantise + write FP8 bytes. Optionally also write
+                    // BF16 sidecar at the same head/position when the
+                    // sidecar is configured to cover this position.
+                    const bool sidecar_active =
+                        (kv_shadow_k != nullptr && kv_shadow_v != nullptr &&
+                         kv_shadow_start >= 0 && eff_cache_pos >= kv_shadow_start);
+                    T* shadow_k = sidecar_active ? static_cast<T*>(kv_shadow_k) : nullptr;
+                    T* shadow_v = sidecar_active ? static_cast<T*>(kv_shadow_v) : nullptr;
+                    const int shadow_slot =
+                        sidecar_active ? (eff_cache_pos - kv_shadow_start) : 0;
+
+                    for (int i = tid; i < d; i += block_size) {
+                        const float kv = workspace[OFF_K_ROT + h_kv * d + i];
+                        const float vv = workspace[OFF_V_RAW + h_kv * d + i];
+                        fp8_k[slot_base + h_kv * d + i] = float_to_fp8_e4m3(kv * inv_k);
+                        fp8_v[slot_base + h_kv * d + i] = float_to_fp8_e4m3(vv * inv_v);
+                        if (sidecar_active) {
+                            // Sidecar window is forced equal to kv_max_t in v1
+                            // (full sidecar). If a future change shrinks the
+                            // window, add a kv_shadow_window kernel arg and
+                            // replace kv_max_t in the offset below.
+                            shadow_k[h_kv * kv_max_t * d + shadow_slot * d + i] = static_cast<T>(kv);
+                            shadow_v[h_kv * kv_max_t * d + shadow_slot * d + i] = static_cast<T>(vv);
+                        }
+                    }
+                    __syncthreads();
+                }
             }
             // Ensure all blocks' writes are visible before the read-side
             // attention reduction reads cache[0..=position].
