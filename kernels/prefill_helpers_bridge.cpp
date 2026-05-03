@@ -99,15 +99,35 @@ int lookahead_attention_scores_device(int device_ordinal,
         return 319; // q_heads must be a multiple of kv_heads
     }
     ScopedHipDevice scoped(device_ordinal);
+    // Query the device's wavefront size so we launch exactly one full
+    // wave: 32 threads on wave32 (gfx1100, RDNA3), 64 on wave64
+    // (gfx9xx, RDNA1/2). This avoids divergent __syncthreads()
+    // participation that would happen with a fixed block size when
+    // the kernel uses `if (lane >= warpSize) return;` followed by
+    // block-wide barriers.
+    hipDeviceProp_t prop;
+    if (hipGetDeviceProperties(&prop, device_ordinal) != hipSuccess) {
+        return 323; // device-properties query failed
+    }
+    const int wave = prop.warpSize;
+    if (wave != 32 && wave != 64) {
+        return 324; // unexpected wavefront size
+    }
     const int num_kv_groups = q_heads / kv_heads;
     const dim3 grid(static_cast<unsigned int>(q_heads * lookahead_count));
-    // Launch one full warp. On wave32 (gfx1100, RDNA3) the kernel's
-    // `if (lane >= warpSize) return;` early-return makes the extra
-    // 32 lanes idle out cleanly. On wave64 (gfx9xx, RDNA1/2) all 64
-    // lanes participate so pfx_wave_sum's full reduction is well-defined.
-    // Use the maximum of the two so the same launch works on both.
-    const dim3 block(64);
+    const dim3 block(static_cast<unsigned int>(wave));
     const size_t shared_bytes = static_cast<size_t>(kv_len) * sizeof(float);
+    // Per-block dynamic shared memory cap. gfx1100 has 64 KiB LDS but
+    // some is used by other allocations; 32 KiB is a conservative bound
+    // that gives ~8000 tokens of headroom (32768 / 4 = 8192). Long
+    // prompts above this limit need a tiled / online-softmax kernel
+    // that doesn't store the per-row exponentials in LDS — out of
+    // scope for Phase C. Bail loudly so the caller gets a clear error
+    // instead of a runtime kernel-launch failure.
+    constexpr size_t kMaxSharedBytes = 32 * 1024;
+    if (shared_bytes > kMaxSharedBytes) {
+        return 325; // kv_len exceeds shared-mem budget
+    }
     hipLaunchKernelGGL(
         HIP_KERNEL_NAME(pfx_lookahead_attention_scores_kernel<T>),
         grid, block, shared_bytes, 0,

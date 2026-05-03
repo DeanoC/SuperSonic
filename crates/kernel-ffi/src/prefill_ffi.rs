@@ -2965,6 +2965,19 @@ pub fn lookahead_attention_scores(
             "lookahead_attention_scores: q_heads ({q_heads}) must be a multiple of kv_heads ({kv_heads})"
         )));
     }
+    // gfx1100 LDS is 64 KiB per block; the kernel allocates kv_len * f32
+    // for the per-row exponentials. We cap at 32 KiB (8000 tokens) to
+    // leave room for compiler-allocated shared memory. Long prompts
+    // beyond this need a tiled/online-softmax kernel — Phase D work.
+    const MAX_KV_LEN_LOOKAHEAD: usize = 8 * 1024;
+    if kv_len > MAX_KV_LEN_LOOKAHEAD {
+        return Err(ffi_error(format!(
+            "lookahead_attention_scores: kv_len ({kv_len}) exceeds the LDS-bounded \
+             maximum of {MAX_KV_LEN_LOOKAHEAD}. Long prompts need a tiled scoring \
+             kernel — currently a Phase C limitation. Reduce prompt length or use \
+             a smaller --specprefill-keep-ratio so the speculator's K cache fits."
+        )));
+    }
     let expected_q = lookahead_count * q_heads * head_dim;
     if q.elem_count() < expected_q {
         return Err(ffi_error(format!(
