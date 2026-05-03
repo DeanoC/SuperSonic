@@ -48,11 +48,11 @@ use crate::qwen36_moe_timing::{Qwen36StageTimingTotals, SamplingParams};
 use crate::qwen36_moe_vmm::{
     load_decode_layers_with_vmm_strategy, moe_island_cap_experts_from_env,
     moe_island_prefetch_ranks_from_env, moe_island_prefetch_transition_min_observations,
-    should_use_qwen36_kv_vmm, virtual_kv_stats_for_layers, MoeExpertVmmMode,
+    print_virtual_kv_stats_if_active, should_use_qwen36_kv_vmm, virtual_kv_stats_for_layers,
+    MoeExpertVmmMode,
 };
 use crate::registry::RegistryEntry;
 
-const MIB: f64 = (1024 * 1024) as f64;
 const QWEN36_NUM_SPECULATIVE_TOKENS: usize = 3;
 
 pub fn run(cli: &crate::Cli, entry: &RegistryEntry, total_vram: u64) -> Result<()> {
@@ -298,21 +298,7 @@ fn decode_text(
     let _moe_expert_arena = loaded_layers.moe_expert_arena;
     let mut _moe_expert_residency = loaded_layers.moe_expert_residency;
     let virtual_kv_stats = virtual_kv_stats_for_layers(&layers);
-    if virtual_kv_stats.layers > 0 {
-        println!(
-            "  [vmm] Qwen3.6-MoE {} KV active on backend={} device {ordinal}: \
-             layers={} mappings={} logical={:.2}MiB logical_resident={:.2}MiB \
-             resident={:.2}MiB reserved={:.2}MiB",
-            if kv_fp8 { "FP8" } else { "BF16" },
-            backend,
-            virtual_kv_stats.layers,
-            virtual_kv_stats.mappings,
-            virtual_kv_stats.logical_bytes as f64 / MIB,
-            virtual_kv_stats.logical_resident_bytes as f64 / MIB,
-            virtual_kv_stats.resident_bytes as f64 / MIB,
-            virtual_kv_stats.reserved_bytes as f64 / MIB,
-        );
-    }
+    print_virtual_kv_stats_if_active(virtual_kv_stats, kv_fp8, backend, ordinal);
     let session = prepare_decode_session(
         &store,
         ordinal,

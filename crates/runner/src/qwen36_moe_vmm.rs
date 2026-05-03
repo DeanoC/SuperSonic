@@ -400,6 +400,31 @@ pub(crate) fn virtual_kv_stats_for_layers(layers: &[LayerBuffers]) -> VirtualKvS
     out
 }
 
+pub(crate) fn print_virtual_kv_stats_if_active(
+    stats: VirtualKvStats,
+    kv_fp8: bool,
+    backend: Backend,
+    ordinal: usize,
+) {
+    if stats.layers == 0 {
+        return;
+    }
+
+    println!(
+        "  [vmm] Qwen3.6-MoE {} KV active on backend={} device {ordinal}: \
+         layers={} mappings={} logical={:.2}MiB logical_resident={:.2}MiB \
+         resident={:.2}MiB reserved={:.2}MiB",
+        if kv_fp8 { "FP8" } else { "BF16" },
+        backend,
+        stats.layers,
+        stats.mappings,
+        stats.logical_bytes as f64 / MIB,
+        stats.logical_resident_bytes as f64 / MIB,
+        stats.resident_bytes as f64 / MIB,
+        stats.reserved_bytes as f64 / MIB,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
