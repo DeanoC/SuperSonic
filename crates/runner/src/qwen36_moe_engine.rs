@@ -3095,12 +3095,20 @@ fn decode_text(
     if dump_last_logits && !last_logits_bytes.is_empty() {
         use std::io::Write as _;
         let logits_f32 = crate::qwen36_moe_decode::bf16_bytes_to_f32(&last_logits_bytes);
-        print!("LAST_LOGITS: ");
+        // Lead with `\n` so the marker lands at the start of its own line —
+        // the streamed-token print path uses `print!` without a trailing
+        // newline, so `LAST_LOGITS:` would otherwise concatenate onto the
+        // last generated text and `lines().find(...starts_with...)` in the
+        // parity/smoke tests wouldn't match.
+        // Format with `{}` (Display) instead of `{:.6}` to preserve full
+        // f32 precision — the VMM bit-exact smoke compares via
+        // `a.to_bits() == b.to_bits()`, which fails on rounded values.
+        print!("\nLAST_LOGITS: ");
         for (i, x) in logits_f32.iter().enumerate() {
             if i > 0 {
                 print!(",");
             }
-            print!("{:.6}", x);
+            print!("{}", x);
         }
         println!();
         std::io::stdout().flush().ok();
