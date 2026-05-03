@@ -644,11 +644,6 @@ pub fn copy_step_bf16(
     dst_value_bf16: &mut GpuBuffer,
     dst_token: usize,
 ) -> Result<(), GpuError> {
-    if src_key_bf16.backend() != Backend::Cuda {
-        return Err(GpuError::InvalidArg(
-            "certified KV BF16 step copy is currently CUDA-only".into(),
-        ));
-    }
     if src_key_bf16.dtype() != ScalarType::BF16
         || src_value_bf16.dtype() != ScalarType::BF16
         || dst_key_bf16.dtype() != ScalarType::BF16
@@ -691,30 +686,80 @@ pub fn copy_step_bf16(
         )));
     }
 
-    #[cfg(supersonic_backend_cuda)]
-    unsafe {
-        let status = supersonic_llama31_certified_kv_copy_step_bf16(
-            ordinal,
-            src_key_bf16.as_ptr(),
-            src_value_bf16.as_ptr(),
-            dst_key_bf16.as_mut_ptr(),
-            dst_value_bf16.as_mut_ptr(),
-            kv_heads as c_int,
-            dst_stride_tokens as c_int,
-            dst_token as c_int,
-            head_dim as c_int,
-        );
-        if status != 0 {
-            return Err(certified_kv_error(
-                Backend::Cuda,
-                format!("certified KV CUDA BF16 step copy failed: {status}"),
-            ));
+    let elem_bytes = ScalarType::BF16.size_in_bytes(); // = 2
+    let row_bytes = head_dim * elem_bytes;
+    let backend = src_key_bf16.backend();
+
+    match backend {
+        Backend::Cuda => {
+            #[cfg(supersonic_backend_cuda)]
+            unsafe {
+                let status = supersonic_llama31_certified_kv_copy_step_bf16(
+                    ordinal,
+                    src_key_bf16.as_ptr(),
+                    src_value_bf16.as_ptr(),
+                    dst_key_bf16.as_mut_ptr(),
+                    dst_value_bf16.as_mut_ptr(),
+                    kv_heads as c_int,
+                    dst_stride_tokens as c_int,
+                    dst_token as c_int,
+                    head_dim as c_int,
+                );
+                if status != 0 {
+                    return Err(certified_kv_error(
+                        Backend::Cuda,
+                        format!("certified KV CUDA BF16 step copy failed: {status}"),
+                    ));
+                }
+                Ok(())
+            }
+            #[cfg(not(supersonic_backend_cuda))]
+            {
+                Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
+            }
         }
-        Ok(())
-    }
-    #[cfg(not(supersonic_backend_cuda))]
-    {
-        Err(GpuError::InvalidArg("CUDA backend not compiled".into()))
+        _ => {
+            // Backend-agnostic fallback: kv_heads independent D2D copies.
+            // src layout: [kv_heads, 1, head_dim], so head h's row starts at
+            //   offset (h * head_dim) elements = (h * row_bytes) bytes.
+            // dst layout: [kv_heads, cap, head_dim], head h's slot at
+            //   dst_token starts at offset
+            //   (h * cap + dst_token) * head_dim elements
+            //   = (h * dst_stride_tokens + dst_token) * row_bytes bytes.
+            for h in 0..kv_heads {
+                let src_off_bytes = h * row_bytes;
+                let dst_off_bytes = (h * dst_stride_tokens + dst_token) * row_bytes;
+                gpu_hal::copy_d2d(
+                    ordinal,
+                    unsafe { dst_key_bf16.as_mut_ptr().byte_add(dst_off_bytes) }
+                        as *mut std::ffi::c_void,
+                    unsafe { src_key_bf16.as_ptr().byte_add(src_off_bytes) }
+                        as *const std::ffi::c_void,
+                    row_bytes,
+                )
+                .map_err(|e| {
+                    GpuError::InvalidArg(format!(
+                        "certified KV BF16 step copy K head {h} on {:?}: {e}",
+                        backend
+                    ))
+                })?;
+                gpu_hal::copy_d2d(
+                    ordinal,
+                    unsafe { dst_value_bf16.as_mut_ptr().byte_add(dst_off_bytes) }
+                        as *mut std::ffi::c_void,
+                    unsafe { src_value_bf16.as_ptr().byte_add(src_off_bytes) }
+                        as *const std::ffi::c_void,
+                    row_bytes,
+                )
+                .map_err(|e| {
+                    GpuError::InvalidArg(format!(
+                        "certified KV BF16 step copy V head {h} on {:?}: {e}",
+                        backend
+                    ))
+                })?;
+            }
+            Ok(())
+        }
     }
 }
 

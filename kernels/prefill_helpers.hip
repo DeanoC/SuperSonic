@@ -106,6 +106,133 @@ __global__ void pfx_apply_rope_prefill_kernel(
     data[base + half_rot + i] = pfx_from_float<T>(x0 * s + x1 * c);
 }
 
+// ---- Kernel 2b: RoPE for prefill with per-token position IDs ----
+// Same math as `pfx_apply_rope_prefill_kernel`, but the cos/sin lookup
+// position is `pos_ids[slot]` instead of the slot index itself. Used by
+// SpecPrefill (arXiv 2502.02789): the target's prefill runs on a
+// compacted subset of prompt tokens, but each token must rotate by its
+// ORIGINAL prompt position so the attention math sees the same RoPE
+// frequencies as the full-prefill baseline.
+//
+// When `pos_ids[slot] == slot` for all slots, this kernel produces
+// byte-identical output to `pfx_apply_rope_prefill_kernel` — the
+// parity test in `crates/runner/tests/specprefill_rope_indirect_parity.rs`
+// pins this invariant.
+template <typename T>
+__global__ void pfx_apply_rope_prefill_indirect_kernel(
+    int seq_len,
+    int num_heads,
+    int head_dim,
+    int half_rot,           // rotary_dim / 2
+    const T* cos_table,     // [max_pos, half_rot]
+    const T* sin_table,     // [max_pos, half_rot]
+    const int* pos_ids,     // [seq_len] — original prompt position per slot
+    T* data                 // [seq_len, num_heads, head_dim] — modified in-place
+) {
+    const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t total = static_cast<size_t>(seq_len) * num_heads * half_rot;
+    if (idx >= total) return;
+
+    const int i    = static_cast<int>(idx % half_rot);
+    const int h    = static_cast<int>((idx / half_rot) % num_heads);
+    const int slot = static_cast<int>(idx / (static_cast<size_t>(half_rot) * num_heads));
+    const int pos  = pos_ids[slot];   // ← only difference vs the dense kernel
+
+    const size_t cos_off = static_cast<size_t>(pos) * half_rot + i;
+    const float c = pfx_to_float(cos_table[cos_off]);
+    const float s = pfx_to_float(sin_table[cos_off]);
+
+    const size_t base = static_cast<size_t>(slot) * num_heads * head_dim
+                      + static_cast<size_t>(h) * head_dim;
+    const float x0 = pfx_to_float(data[base + i]);
+    const float x1 = pfx_to_float(data[base + half_rot + i]);
+
+    data[base + i]            = pfx_from_float<T>(x0 * c - x1 * s);
+    data[base + half_rot + i] = pfx_from_float<T>(x0 * s + x1 * c);
+}
+
+// ---- Kernel 2c: per-row softmax(Q · Kᵀ) for SpecPrefill look-ahead ----
+// Computes the post-softmax attention weights for the last `lookahead_count`
+// query rows of a single full-attention layer against the prompt-only K
+// cache. No V, no causality. Used by SpecPrefill (arXiv 2502.02789) to
+// harvest the importance signal for token selection.
+//
+// Grid: (q_heads * lookahead_count) blocks, each one warp (warpSize threads).
+// Shared memory: kv_len floats for the per-row exponentials. Caller
+// must size dynamic shared mem at launch.
+//
+// q:      [lookahead_count, q_heads, head_dim]  BF16, post-RoPE
+// k:      [kv_heads, kv_len, head_dim]          BF16
+// scores: [q_heads, lookahead_count, kv_len]    F32
+template <typename T>
+__global__ void pfx_lookahead_attention_scores_kernel(
+    int q_heads,
+    int kv_heads,
+    int lookahead_count,
+    int kv_len,
+    int head_dim,
+    int num_kv_groups,
+    float scale,
+    const T* __restrict__ q,
+    const T* __restrict__ k,
+    float* __restrict__ scores
+) {
+    extern __shared__ float lds[]; // kv_len floats
+    const int lane = threadIdx.x;
+    if (lane >= warpSize) return;
+
+    const int row_idx = blockIdx.x;                  // 0 .. q_heads * lookahead_count
+    const int q_row = row_idx % lookahead_count;
+    const int q_head = row_idx / lookahead_count;
+    if (q_head >= q_heads) return;
+    const int kv_head = q_head / num_kv_groups;
+    if (kv_head >= kv_heads) return;
+
+    // q layout: [lookahead_count, q_heads, head_dim]
+    const T* q_ptr = q + (static_cast<size_t>(q_row) * q_heads + q_head) * head_dim;
+    // k layout: [kv_heads, kv_len, head_dim]
+    const T* k_head = k + static_cast<size_t>(kv_head) * kv_len * head_dim;
+    // scores layout: [q_heads, lookahead_count, kv_len]
+    float* out_row = scores +
+        (static_cast<size_t>(q_head) * lookahead_count + q_row) * kv_len;
+
+    // Pass 1: compute scaled dot-products into LDS, track running max.
+    __shared__ float shared_max;
+    if (lane == 0) shared_max = -INFINITY;
+    __syncthreads();
+
+    for (int k_pos = 0; k_pos < kv_len; ++k_pos) {
+        const T* k_row = k_head + k_pos * head_dim;
+        float partial = 0.0f;
+        for (int d = lane; d < head_dim; d += warpSize) {
+            partial += pfx_to_float(q_ptr[d]) * pfx_to_float(k_row[d]);
+        }
+        const float score = pfx_wave_sum(partial) * scale;
+        if (lane == 0) {
+            lds[k_pos] = score;
+            if (score > shared_max) shared_max = score;
+        }
+        __syncthreads();
+    }
+
+    // Pass 2: exponentiate (centred on shared_max), accumulate denom.
+    __shared__ float shared_denom;
+    if (lane == 0) shared_denom = 0.0f;
+    __syncthreads();
+    for (int k_pos = lane; k_pos < kv_len; k_pos += warpSize) {
+        const float e = expf(lds[k_pos] - shared_max);
+        lds[k_pos] = e;
+        atomicAdd(&shared_denom, e);
+    }
+    __syncthreads();
+
+    // Pass 3: normalise and store.
+    const float inv_denom = shared_denom > 0.0f ? 1.0f / shared_denom : 0.0f;
+    for (int k_pos = lane; k_pos < kv_len; k_pos += warpSize) {
+        out_row[k_pos] = lds[k_pos] * inv_denom;
+    }
+}
+
 // ---- Kernel 3: Transpose [S, H, D] <-> [H, S, D] ----
 // src layout: [S, H, D] — element(s, h, d) at s*H*D + h*D + d
 // dst layout: [H, S, D] — element(h, s, d) at h*S*D + s*D + d

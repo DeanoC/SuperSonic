@@ -879,6 +879,7 @@ pub fn prefill(
         debug_linear_layer,
         None,
         None,
+        None,
     )
 }
 
@@ -914,6 +915,7 @@ pub fn prefill_with_taps(
         debug_linear_layer,
         Some(tap_layers),
         None,
+        None,
     )
 }
 
@@ -943,8 +945,75 @@ pub fn prefill_with_target_nll(
         None,
         None,
         Some((score_hidden_start, score_targets)),
+        None,
     )
 }
+
+/// SpecPrefill (arXiv 2502.02789) target sparse prefill: like `prefill`,
+/// but consumes a sorted ascending `kept_positions` slice. The compacted
+/// embedding sequence is `prompt_ids[kept_positions[i]] for i in 0..len`,
+/// each token rotates by its ORIGINAL prompt position via the
+/// RoPE-indirect kernel (Phase B), and the lower-triangular causal mask
+/// over the compacted sequence is exactly the right semantics — Phase B
+/// parity tests pin this.
+///
+/// Post-condition: `kv_filled` on every full-attention layer equals
+/// `kept_positions.len()`. The caller's decode-position cursor must
+/// nonetheless start at `prompt_ids.len()` (the original prompt's last
+/// position + 1), NOT `kept_positions.len()`.
+pub fn prefill_kept(
+    weights: &Qwen35Weights,
+    state: &mut ModelState,
+    rotary: &RotaryTables,
+    prompt_ids: &[u32],
+    kept_positions: &[u32],
+    ordinal: usize,
+    kv_chunk_size: usize,
+    prefill_chunk_size: usize,
+    kv_fp8: bool,
+    use_4b_kernel: bool,
+) -> Result<PrefillResult> {
+    prefill_inner(
+        weights,
+        state,
+        rotary,
+        prompt_ids,
+        ordinal,
+        kv_chunk_size,
+        prefill_chunk_size,
+        kv_fp8,
+        use_4b_kernel,
+        false,                 // trace_layers
+        None,                  // debug_linear_layer
+        None,                  // tap_layers
+        None,                  // target_nll
+        Some(kept_positions),  // kept_positions
+    )
+}
+
+// ---- SpecPrefill Phase C: speculator-side prefill with attention export ----
+
+/// Per-layer attention score tensor returned from
+/// `prefill_with_lookahead_attention`: F32 with shape
+/// `[q_heads, lookahead_count, kv_len]` flattened, where `kv_len ==
+/// prompt_len` (the kernel attends to the prompt context only).
+pub type LookaheadLayerScores = Vec<f32>;
+
+pub struct PrefillWithLookaheadResult {
+    /// The dense prefill's last-step logits + traces (currently unused
+    /// downstream; preserved for symmetry with `prefill`).
+    pub base: PrefillResult,
+    /// Per full-attention layer (in source-layer-index ascending order):
+    /// F32 scores `[q_heads, lookahead_count, kv_len]` flattened. The
+    /// number of vec entries equals the number of full-attention layers
+    /// in the speculator.
+    pub layer_scores: Vec<LookaheadLayerScores>,
+    /// The number of query rows scored (passed-in `lookahead_count`; typically `paper_N + 1`).
+    pub lookahead_count: usize,
+}
+
+// ---- End SpecPrefill Phase C ----
+// Implementation: see `DecodeEngine::prefill_with_lookahead_attention` in decode_engine.rs.
 
 fn prefill_inner(
     weights: &Qwen35Weights,
@@ -960,9 +1029,37 @@ fn prefill_inner(
     debug_linear_layer: Option<usize>,
     tap_layers: Option<&[usize]>,
     target_nll: Option<(usize, &[u32])>,
+    kept_positions: Option<&[u32]>,  // NEW
 ) -> Result<PrefillResult> {
     let config = &weights.config;
-    let seq_len = prompt_ids.len();
+    let seq_len = if let Some(kept) = kept_positions {
+        if kept.is_empty() {
+            return Err(anyhow::anyhow!(
+                "prefill_inner: kept_positions is empty"
+            ));
+        }
+        let max_pos = *kept.iter().max().unwrap() as usize;
+        if max_pos >= prompt_ids.len() {
+            return Err(anyhow::anyhow!(
+                "prefill_inner: kept_positions max {} out of range (prompt_len={})",
+                max_pos,
+                prompt_ids.len()
+            ));
+        }
+        // Strict ascending uniqueness — the selection layer already
+        // guarantees this; we re-check defensively so future callers
+        // that hand-build kept lists fail loudly on bad input.
+        for w in kept.windows(2) {
+            if w[0] >= w[1] {
+                return Err(anyhow::anyhow!(
+                    "prefill_inner: kept_positions must be strictly ascending"
+                ));
+            }
+        }
+        kept.len()
+    } else {
+        prompt_ids.len()
+    };
     let hidden_dim = config.hidden_size;
 
     // Determine effective chunk size: 0 = no chunking (full seq_len).
@@ -1068,8 +1165,19 @@ fn prefill_inner(
         let is_last_chunk = chunk_start + chunk_len >= seq_len;
         last_chunk_len = chunk_len;
 
-        // Upload token IDs for this chunk
-        let chunk_ids = &prompt_ids[chunk_start..chunk_start + chunk_len];
+        // Upload token IDs for this chunk. When `kept_positions` is set,
+        // chunk_start/chunk_len index into the compacted kept sequence;
+        // each compacted slot's actual token ID is prompt_ids[kept_positions[slot]].
+        let chunk_ids_storage: Vec<u32>;
+        let chunk_ids: &[u32] = if let Some(kept) = kept_positions {
+            chunk_ids_storage = kept[chunk_start..chunk_start + chunk_len]
+                .iter()
+                .map(|&p| prompt_ids[p as usize])
+                .collect();
+            &chunk_ids_storage
+        } else {
+            &prompt_ids[chunk_start..chunk_start + chunk_len]
+        };
         let id_bytes: Vec<u8> = chunk_ids.iter().flat_map(|id| id.to_le_bytes()).collect();
         let token_ids_gpu =
             GpuBuffer::from_host_bytes(ordinal, ScalarType::U32, &[chunk_len], &id_bytes)
@@ -1114,6 +1222,8 @@ fn prefill_inner(
                     ordinal,
                     kv_chunk_size,
                     /* commit_kv_filled */ true,
+                    kept_positions
+                        .map(|k| &k[chunk_start..chunk_start + chunk_len]),  // NEW
                 )?;
             } else {
                 let mut no_debug_trace = None;
@@ -1671,6 +1781,7 @@ fn metal_v2_decode_step_body(
                 ordinal,
                 kv_chunk_size,
                 /* commit_kv_filled */ true,
+                None,  // NEW: metal v2 decode never sparsifies
             )?;
         } else {
             let mut no_debug_trace = None;
@@ -1897,6 +2008,7 @@ fn prefill_full_attention_layer(
     ordinal: usize,
     kv_chunk_size: usize,
     commit_kv_filled: bool,
+    kept_positions_chunk: Option<&[u32]>,  // NEW
 ) -> Result<()> {
     let fw = weights.layers[idx]
         .full
@@ -1923,6 +2035,25 @@ fn prefill_full_attention_layer(
     let rotary_dim = config.rotary_dim();
     let elem_bytes = ScalarType::BF16.size_in_bytes();
     let kv_len = chunk_start + chunk_len; // total KV length after this chunk
+
+    let pos_ids_buf: Option<GpuBuffer> = if let Some(kept) = kept_positions_chunk {
+        if kept.len() != chunk_len {
+            return Err(anyhow::anyhow!(
+                "layer {idx}: kept_positions_chunk has {} entries but chunk_len is {chunk_len}",
+                kept.len()
+            ));
+        }
+        let mut buf = GpuBuffer::zeros(ordinal, ScalarType::U32, &[kept.len()])
+            .map_err(|e| anyhow::anyhow!("layer {idx} pos_ids alloc: {e}"))?;
+        let bytes = unsafe {
+            std::slice::from_raw_parts(kept.as_ptr() as *const u8, kept.len() * 4)
+        };
+        copy_h2d(ordinal, buf.as_mut_ptr(), bytes.as_ptr() as *const _, bytes.len())
+            .map_err(|e| anyhow::anyhow!("layer {idx} pos_ids upload: {e}"))?;
+        Some(buf)
+    } else {
+        None
+    };
 
     // 1. Q projection
     let mut q_full = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[chunk_len, q_proj_dim])
@@ -2044,33 +2175,66 @@ fn prefill_full_attention_layer(
         .map_err(|e| anyhow::anyhow!("layer {idx} K norm copy: {e}"))?;
     }
 
-    // 6. RoPE on query and K — use pos_offset = chunk_start for correct position indexing
-    prefill_ffi::apply_rope_prefill(
-        ordinal,
-        ScalarType::BF16,
-        chunk_len,
-        num_q_heads,
-        head_dim,
-        rotary_dim,
-        &rotary.cos,
-        &rotary.sin,
-        chunk_start,
-        &mut query_buf,
-    )
-    .map_err(|e| anyhow::anyhow!("layer {idx} Q RoPE: {e}"))?;
-    prefill_ffi::apply_rope_prefill(
-        ordinal,
-        ScalarType::BF16,
-        chunk_len,
-        num_kv_heads,
-        head_dim,
-        rotary_dim,
-        &rotary.cos,
-        &rotary.sin,
-        chunk_start,
-        &mut scratch.proj_buf2,
-    )
-    .map_err(|e| anyhow::anyhow!("layer {idx} K RoPE: {e}"))?;
+    // 6. RoPE on query — use pos_offset = chunk_start for the dense path,
+    //    or apply_rope_prefill_indirect with the kept positions for SpecPrefill.
+    if let Some(pos_ids) = pos_ids_buf.as_ref() {
+        prefill_ffi::apply_rope_prefill_indirect(
+            ordinal,
+            ScalarType::BF16,
+            chunk_len,
+            num_q_heads,
+            head_dim,
+            rotary_dim,
+            &rotary.cos,
+            &rotary.sin,
+            pos_ids,
+            &mut query_buf,
+        )
+        .map_err(|e| anyhow::anyhow!("layer {idx} Q RoPE (indirect): {e}"))?;
+    } else {
+        prefill_ffi::apply_rope_prefill(
+            ordinal,
+            ScalarType::BF16,
+            chunk_len,
+            num_q_heads,
+            head_dim,
+            rotary_dim,
+            &rotary.cos,
+            &rotary.sin,
+            chunk_start,
+            &mut query_buf,
+        )
+        .map_err(|e| anyhow::anyhow!("layer {idx} Q RoPE: {e}"))?;
+    }
+    if let Some(pos_ids) = pos_ids_buf.as_ref() {
+        prefill_ffi::apply_rope_prefill_indirect(
+            ordinal,
+            ScalarType::BF16,
+            chunk_len,
+            num_kv_heads,
+            head_dim,
+            rotary_dim,
+            &rotary.cos,
+            &rotary.sin,
+            pos_ids,
+            &mut scratch.proj_buf2,
+        )
+        .map_err(|e| anyhow::anyhow!("layer {idx} K RoPE (indirect): {e}"))?;
+    } else {
+        prefill_ffi::apply_rope_prefill(
+            ordinal,
+            ScalarType::BF16,
+            chunk_len,
+            num_kv_heads,
+            head_dim,
+            rotary_dim,
+            &rotary.cos,
+            &rotary.sin,
+            chunk_start,
+            &mut scratch.proj_buf2,
+        )
+        .map_err(|e| anyhow::anyhow!("layer {idx} K RoPE: {e}"))?;
+    }
 
     // 7. V projection
     let mut v_buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[chunk_len, kv_dim])

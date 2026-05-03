@@ -24,6 +24,8 @@ mod qwen36_moe_state;
 mod qwen36_moe_telemetry;
 mod qwen36_moe_vmm;
 mod registry;
+mod specprefill;
+mod specprefill_engine;
 mod tensor_bytes;
 mod validate;
 
@@ -43,7 +45,7 @@ use gemma4_runtime::{
     check_gemma4_vram, load_gemma4_runtime, load_gemma4_startup, validate_gemma4_startup,
     Gemma4Runtime, Gemma4Startup,
 };
-use policy::{q4km_like, validate_dflash_flags, validate_gfx942_policy, validate_global_flags};
+use policy::{q4km_like, validate_dflash_flags, validate_gfx942_policy, validate_global_flags, validate_specprefill_flags};
 use qwen35::state::{LayerState, ModelState};
 use qwen35_runtime::{
     check_qwen35_vram, load_qwen35_engine, load_qwen35_startup, qwen35_oracle_script_path,
@@ -591,6 +593,51 @@ pub(crate) struct Cli {
     /// checkpoint's `dflash_config.target_layer_ids`.
     #[arg(long)]
     dflash_tap_layers: Option<String>,
+
+    /// Path to the SpecPrefill (arXiv 2502.02789) draft model directory
+    /// (e.g. `/mnt/data/models/Qwen3.5-0.8B`). Presence of this flag
+    /// enables sparse target prefill via the speculator's importance
+    /// signal. Currently only supported for `--model qwen3.5-9b`.
+    #[arg(long)]
+    specprefill_draft_dir: Option<PathBuf>,
+
+    /// SpecPrefill keep ratio per chunk: fraction of tokens kept by the
+    /// chunked top-K selection. Phase A2 measurements pin 0.50 as the
+    /// quality-stable default on Qwen3.5-9B (cossim ≥ 0.927, argmax
+    /// match). Range: [0.05, 1.0]. Default applied in run_specprefill: 0.50.
+    #[arg(long)]
+    specprefill_keep_ratio: Option<f32>,
+
+    /// SpecPrefill chunk size for top-K selection (paper §3.4).
+    /// Default applied in run_specprefill: 32.
+    #[arg(long)]
+    specprefill_chunk_size: Option<usize>,
+
+    /// SpecPrefill 1-D average-pool window for score smoothing. Must be
+    /// odd. Paper uses 5-10. Default applied in run_specprefill: 5.
+    #[arg(long)]
+    specprefill_pool_window: Option<usize>,
+
+    /// SpecPrefill look-ahead decode steps on the draft (paper §3.3
+    /// default 4). Total query rows harvested = lookahead + 1.
+    /// Default applied in run_specprefill: 4.
+    #[arg(long)]
+    specprefill_lookahead: Option<usize>,
+
+    /// SpecPrefill always-keep prefix (BOS + system) length.
+    /// Default applied in run_specprefill: 4.
+    #[arg(long)]
+    specprefill_always_keep_prefix: Option<usize>,
+
+    /// SpecPrefill always-keep suffix (final query) length.
+    /// Default applied in run_specprefill: 4.
+    #[arg(long)]
+    specprefill_always_keep_suffix: Option<usize>,
+
+    /// Free the draft weights after selection runs and before the target
+    /// prefill, to claw back ~1.6 GiB on a tight 24 GiB budget.
+    #[arg(long, default_value_t = false)]
+    specprefill_unload_draft: bool,
 }
 
 #[cfg(test)]
@@ -859,6 +906,7 @@ fn main() -> Result<()> {
     // Run before family dispatch so DFlash flags are not silently ignored by
     // non-Qwen branches.
     validate_dflash_flags(&cli, &model_variant)?;
+    validate_specprefill_flags(&cli, &model_variant, backend)?;
 
     match model_variant.family() {
         ModelFamily::Gemma4 => return run_gemma4(&cli, &model_variant, entry, ordinal, total_vram),
@@ -921,6 +969,19 @@ fn main() -> Result<()> {
         );
     }
     // --dflash-* guard already ran before the family dispatch above.
+
+    // --specprefill-* dispatch. Validation already ran in
+    // validate_specprefill_flags; the presence of --specprefill-draft-dir
+    // is the gate that switches to the SpecPrefill orchestrator.
+    if cli.specprefill_draft_dir.is_some() {
+        return specprefill_engine::run_specprefill(
+            &cli,
+            &model_variant,
+            entry,
+            ordinal,
+            total_vram,
+        );
+    }
 
     let params = match &entry.params {
         FamilyParams::Qwen35(p) => p,
@@ -1016,6 +1077,19 @@ fn main() -> Result<()> {
         host_lm_head_rescorer.as_ref(),
         allow_host_lm_head_rescore,
     )?;
+
+    if cli.dump_last_logits {
+        use std::io::Write as _;
+        print!("\nLAST_LOGITS: ");
+        for (i, x) in prefill_logits.iter().enumerate() {
+            if i > 0 {
+                print!(",");
+            }
+            print!("{}", x);
+        }
+        println!();
+        std::io::stdout().flush().ok();
+    }
 
     report_qwen35_virtual_kv_after_prefill(&mut engine)?;
 
