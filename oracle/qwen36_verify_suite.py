@@ -334,6 +334,7 @@ def load_vmm_residency(path: Path) -> dict[str, Any]:
     keys = [
         "decode_path",
         "prefetch_mode",
+        "prefetch_ranks",
         "max_resident_pages",
         "final_resident_pages",
         "peak_resident_pages",

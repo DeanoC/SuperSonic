@@ -104,9 +104,12 @@ Current scope:
   hits before demand loading, previous-token repeats, and average router weight.
 - `SUPERSONIC_MOE_ISLAND_PREFETCH=previous-token` enables experimental
   previous-token routed-expert lookahead for sparse MoE islands. It preloads
-  each layer's previous top-k before that layer's router runs, then records
-  prefetch hit/miss/page counters in the sparse telemetry JSON. This is a
-  measurement hook for future overlapped prefetch work, not a default path.
+  each layer's previous top-k before that layer's router runs. Set
+  `SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS=N` to prefetch only the first N ordered
+  router ranks, for example N=1 for rank-0-only lookahead. Sparse telemetry
+  records the effective prefetch rank count plus prefetch hit/miss/page
+  counters. This is a measurement hook for future overlapped prefetch work, not
+  a default path.
 - `SUPERSONIC_VMM_KV=0` disables the Qwen3.5 and Qwen3.6 KV integrations.
 - `SUPERSONIC_VMM_KV=1` requests KV VMM and logs if the backend cannot support
   it. HIP may auto-enable when unset; CUDA requires this explicit opt-in.
