@@ -679,6 +679,19 @@ unsafe extern "C" {
         data: *mut c_void,
     ) -> c_int;
 
+    fn supersonic_qwen35_hip_apply_rope_prefill_indirect(
+        dtype: c_int,
+        device_ordinal: usize,
+        seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+        half_rot: usize,
+        cos_table: *const c_void,
+        sin_table: *const c_void,
+        pos_ids: *const c_int,
+        data: *mut c_void,
+    ) -> c_int;
+
     fn supersonic_qwen35_hip_transpose_shd_hsd(
         dtype: c_int,
         device_ordinal: usize,
@@ -2823,6 +2836,77 @@ pub fn apply_rope_prefill(
     };
     if status != 0 {
         return Err(ffi_error(format!("apply_rope_prefill failed: {status}")));
+    }
+    Ok(())
+}
+
+/// SpecPrefill (arXiv 2502.02789): apply RoPE in-place using a per-token
+/// position-ID array. `pos_ids[slot]` selects the cos/sin table row each
+/// token gets rotated by, instead of using `slot` directly.
+///
+/// Layout:
+///   - `data`: `[seq_len, num_heads, head_dim]` of `dtype` — modified in place.
+///   - `cos_table` / `sin_table`: `[max_positions, half_rot]` of `dtype`.
+///     Pre-built for the full prompt's position range; the kernel just
+///     gathers from row `pos_ids[slot]`.
+///   - `pos_ids`: `[seq_len]` `i32` — the original prompt position each
+///     compacted slot belongs to. All values must be in `[0, max_positions)`.
+///
+/// Parity guarantee: when `pos_ids = [0, 1, ..., seq_len-1]`, output is
+/// byte-identical to [`apply_rope_prefill`] with `pos_offset=0`. See
+/// `crates/runner/tests/specprefill_rope_indirect_parity.rs`.
+///
+/// HIP-only at this stage; the CUDA path returns status 316. Metal stubs
+/// return -1.
+pub fn apply_rope_prefill_indirect(
+    ordinal: usize,
+    dtype: ScalarType,
+    seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    cos_table: &GpuBuffer,
+    sin_table: &GpuBuffer,
+    pos_ids: &GpuBuffer,
+    data: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    // Position IDs are stored as `ScalarType::U32` (4-byte unsigned) on the
+    // host side because gpu-hal doesn't carry an i32 variant; the kernel
+    // reinterprets the buffer as `const int*` (signed). This is safe
+    // because position IDs are always non-negative and well below 2^31.
+    if pos_ids.dtype() != ScalarType::U32 {
+        return Err(ffi_error(format!(
+            "apply_rope_prefill_indirect: pos_ids must be ScalarType::U32 (treated as i32 \
+             by the kernel), got {:?}",
+            pos_ids.dtype()
+        )));
+    }
+    if pos_ids.elem_count() < seq_len {
+        return Err(ffi_error(format!(
+            "apply_rope_prefill_indirect: pos_ids has {} elements but seq_len is {}",
+            pos_ids.elem_count(),
+            seq_len
+        )));
+    }
+    let half_rot = rotary_dim / 2;
+    let status = unsafe {
+        supersonic_qwen35_hip_apply_rope_prefill_indirect(
+            dtype.kernel_dtype_code(),
+            ordinal,
+            seq_len,
+            num_heads,
+            head_dim,
+            half_rot,
+            cos_table.as_ptr(),
+            sin_table.as_ptr(),
+            pos_ids.as_ptr() as *const c_int,
+            data.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(ffi_error(format!(
+            "apply_rope_prefill_indirect failed: {status}"
+        )));
     }
     Ok(())
 }

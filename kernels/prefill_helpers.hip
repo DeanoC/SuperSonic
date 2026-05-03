@@ -106,6 +106,51 @@ __global__ void pfx_apply_rope_prefill_kernel(
     data[base + half_rot + i] = pfx_from_float<T>(x0 * s + x1 * c);
 }
 
+// ---- Kernel 2b: RoPE for prefill with per-token position IDs ----
+// Same math as `pfx_apply_rope_prefill_kernel`, but the cos/sin lookup
+// position is `pos_ids[slot]` instead of the slot index itself. Used by
+// SpecPrefill (arXiv 2502.02789): the target's prefill runs on a
+// compacted subset of prompt tokens, but each token must rotate by its
+// ORIGINAL prompt position so the attention math sees the same RoPE
+// frequencies as the full-prefill baseline.
+//
+// When `pos_ids[slot] == slot` for all slots, this kernel produces
+// byte-identical output to `pfx_apply_rope_prefill_kernel` — the
+// parity test in `crates/runner/tests/specprefill_rope_indirect_parity.rs`
+// pins this invariant.
+template <typename T>
+__global__ void pfx_apply_rope_prefill_indirect_kernel(
+    int seq_len,
+    int num_heads,
+    int head_dim,
+    int half_rot,           // rotary_dim / 2
+    const T* cos_table,     // [max_pos, half_rot]
+    const T* sin_table,     // [max_pos, half_rot]
+    const int* pos_ids,     // [seq_len] — original prompt position per slot
+    T* data                 // [seq_len, num_heads, head_dim] — modified in-place
+) {
+    const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t total = static_cast<size_t>(seq_len) * num_heads * half_rot;
+    if (idx >= total) return;
+
+    const int i    = static_cast<int>(idx % half_rot);
+    const int h    = static_cast<int>((idx / half_rot) % num_heads);
+    const int slot = static_cast<int>(idx / (static_cast<size_t>(half_rot) * num_heads));
+    const int pos  = pos_ids[slot];   // ← only difference vs the dense kernel
+
+    const size_t cos_off = static_cast<size_t>(pos) * half_rot + i;
+    const float c = pfx_to_float(cos_table[cos_off]);
+    const float s = pfx_to_float(sin_table[cos_off]);
+
+    const size_t base = static_cast<size_t>(slot) * num_heads * head_dim
+                      + static_cast<size_t>(h) * head_dim;
+    const float x0 = pfx_to_float(data[base + i]);
+    const float x1 = pfx_to_float(data[base + half_rot + i]);
+
+    data[base + i]            = pfx_from_float<T>(x0 * c - x1 * s);
+    data[base + half_rot + i] = pfx_from_float<T>(x0 * s + x1 * c);
+}
+
 // ---- Kernel 3: Transpose [S, H, D] <-> [H, S, D] ----
 // src layout: [S, H, D] — element(s, h, d) at s*H*D + h*D + d
 // dst layout: [H, S, D] — element(h, s, d) at h*S*D + s*D + d
