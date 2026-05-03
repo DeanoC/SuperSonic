@@ -78,10 +78,12 @@ struct ScopedHipDevice {
 // Pin Rust↔C++ struct layout. If this fails at compile time, someone
 // reordered fields on one side without the other. Update both sides
 // together.
-static_assert(sizeof(qwen36_moe::DecodeLayerDesc) >= 256,
-              "Qwen36MoeDecodeLayerDesc shrunk unexpectedly");
-static_assert(sizeof(qwen36_moe::DecodeLayerDesc) <= 512,
-              "Qwen36MoeDecodeLayerDesc grew unexpectedly");
+static_assert(sizeof(qwen36_moe::DecodeLayerDesc) == 344,
+              "Qwen36MoeDecodeLayerDesc size drift — Rust side is pinned to 344 bytes; "
+              "if you appended a field, update both sides in the same commit");
+
+static_assert(sizeof(qwen36_moe::KVCacheFp8Desc) == 16,
+              "Qwen36MoeKVCacheFp8Desc layout drift — must be exactly 2 pointers");
 
 } // namespace
 
@@ -1056,6 +1058,7 @@ extern "C" int qwen36_moe_hip_persistent_decode_launch(
     int           mode,
     const qwen36_moe::DecodeLayerDesc* layers,
     const qwen36_moe::Int4ScaleDesc*   int4_scales,    // nullable
+    const qwen36_moe::KVCacheFp8Desc*  kv_fp8_descs,   // nullable
     int           hidden,
     int           num_heads,
     int           num_kv_heads,
@@ -1132,6 +1135,40 @@ extern "C" int qwen36_moe_hip_persistent_decode_launch(
     if (lm_head_on && !lm_head_complete) return 139;
     if (lm_head_on && (mode != 0 || end_layer_exclusive != num_layers)) return 143;
 
+    // KV-FP8 desc validation: when present, every full-attn layer must
+    // carry both kv_scale_k and kv_scale_v (or neither). Linear-attn
+    // layers must carry null pointers in this struct.
+    if (kv_fp8_descs != nullptr) {
+        for (int li = 0; li < static_cast<int>(num_layers); ++li) {
+            const auto& d  = layers[li];
+            const auto& kf = kv_fp8_descs[li];
+            const bool full = (d.is_full_attention == 1);
+            const bool both = (kf.kv_scale_k != nullptr && kf.kv_scale_v != nullptr);
+            const bool none = (kf.kv_scale_k == nullptr && kf.kv_scale_v == nullptr);
+            if (full && !(both || none)) {
+                fprintf(stderr,
+                    "[qwen36_moe] KV-FP8 layer %d: kv_scale_k/v must both be "
+                    "set or both null (got %p / %p)\n",
+                    li, kf.kv_scale_k, kf.kv_scale_v);
+                return 140;
+            }
+            if (!full && !none) {
+                fprintf(stderr,
+                    "[qwen36_moe] KV-FP8 layer %d (linear): kv_scale_k/v "
+                    "must be null (got %p / %p)\n",
+                    li, kf.kv_scale_k, kf.kv_scale_v);
+                return 141;
+            }
+            if (full && both && ((d.kv_shadow_k != nullptr) != (d.kv_shadow_v != nullptr))) {
+                fprintf(stderr,
+                    "[qwen36_moe] KV-FP8 layer %d: kv_shadow_k/v must agree "
+                    "(got %p / %p)\n",
+                    li, d.kv_shadow_k, d.kv_shadow_v);
+                return 142;
+            }
+        }
+    }
+
     ScopedHipDevice scoped(static_cast<int>(device_ordinal));
 
     hipDeviceProp_t props;
@@ -1182,7 +1219,7 @@ extern "C" int qwen36_moe_hip_persistent_decode_launch(
             dim3(block_size),
             lds_bytes, 0,
             num_layers, start_layer, end_layer_exclusive, mode,
-            layers, int4_scales,
+            layers, int4_scales, kv_fp8_descs,
             hidden, num_heads, num_kv_heads, head_dim, rotary_dim,
             num_k_heads, num_v_heads, head_k_dim, head_v_dim, conv_kernel_dim,
             num_experts, moe_intermediate, shared_intermediate, top_k,
@@ -1201,7 +1238,7 @@ extern "C" int qwen36_moe_hip_persistent_decode_launch(
             dim3(block_size),
             lds_bytes, 0,
             num_layers, start_layer, end_layer_exclusive, mode,
-            layers, int4_scales,
+            layers, int4_scales, kv_fp8_descs,
             hidden, num_heads, num_kv_heads, head_dim, rotary_dim,
             num_k_heads, num_v_heads, head_k_dim, head_v_dim, conv_kernel_dim,
             num_experts, moe_intermediate, shared_intermediate, top_k,

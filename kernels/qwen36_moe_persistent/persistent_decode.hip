@@ -117,6 +117,7 @@ __global__ void qwen36_moe_persistent_decode_kernel(
     int                                  mode,
     const DecodeLayerDesc* __restrict__  layers,
     const Int4ScaleDesc*   __restrict__  int4_scales,           // nullable
+    const KVCacheFp8Desc*  __restrict__  kv_fp8_descs,          // nullable
     int                                  hidden,
     int                                  num_heads,
     int                                  num_kv_heads,
@@ -200,6 +201,8 @@ __global__ void qwen36_moe_persistent_decode_kernel(
         const Int4ScaleDesc* i4 =
             (int4_scales != nullptr) ? &int4_scales[li] : nullptr;
         const int i4_gs = (i4 != nullptr) ? i4->group_size : 0;
+        const KVCacheFp8Desc* kv_fp8 =
+            (kv_fp8_descs != nullptr) ? &kv_fp8_descs[li] : nullptr;
 
         // ---- attn or linear-attn ----
         if (d.is_full_attention != 0) {
@@ -229,6 +232,13 @@ __global__ void qwen36_moe_persistent_decode_kernel(
                 workspace,
                 static_cast<T*>(d.kv_cache_k),
                 static_cast<T*>(d.kv_cache_v),
+                /* kv_scale_k */ (kv_fp8 != nullptr)
+                    ? static_cast<float*>(kv_fp8->kv_scale_k) : nullptr,
+                /* kv_scale_v */ (kv_fp8 != nullptr)
+                    ? static_cast<float*>(kv_fp8->kv_scale_v) : nullptr,
+                /* kv_shadow_k */ d.kv_shadow_k,
+                /* kv_shadow_v */ d.kv_shadow_v,
+                /* kv_shadow_start */ d.kv_shadow_start,
                 d.kv_max_t,
                 counters, barrier_counter, barrier_flag);
         } else {

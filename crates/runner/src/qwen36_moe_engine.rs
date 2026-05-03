@@ -156,7 +156,20 @@ pub fn run_qwen36_moe_dry_run(
     let checkpoint = CheckpointAccount::from_config(&config.text_config);
     let int4_projected_bytes = checkpoint.project_int4_total_bytes(&config.text_config, 128);
 
-    let layout = StateLayout::new(context_size, batch_size, kv_fp8);
+    // The sidecar window is consulted only when --kv-fp8 is on AND the
+    // env-var helper is enabled. v1 forces the runtime allocation to
+    // window=kv_max_t (matches the kernel hard-coding); the env helper
+    // would only matter for VRAM accounting if the kernel grew a
+    // kv_shadow_window arg later.
+    let sidecar_window = if kv_fp8
+        && qwen35::state::kv_fp8_bf16_sidecar_enabled()
+    {
+        Some(qwen35::state::kv_fp8_bf16_sidecar_window_tokens()
+            .unwrap_or(context_size))
+    } else {
+        None
+    };
+    let layout = StateLayout::new(context_size, batch_size, kv_fp8, sidecar_window);
     let state = StateAccount::from_config(&config.text_config, layout);
 
     let bake = inspect_bake(model_dir, &config.text_config, weight_prefix, ordinal);
@@ -770,6 +783,14 @@ pub fn run(cli: &crate::Cli, entry: &RegistryEntry, total_vram: u64) -> Result<(
     } else {
         (max_new, ContextSizeSource::MaxNewTokensOnly)
     };
+    if cli.kv_fp8 && cli.no_persistent_decode {
+        anyhow::bail!(
+            "--kv-fp8 for Qwen3.6-35B-A3B requires the persistent megakernel; \
+             remove --no-persistent-decode (persistent is on by default). The \
+             back-compat step kernels stay BF16-KV."
+        );
+    }
+
     let report = run_qwen36_moe_dry_run(
         &cli.model_dir,
         entry,
@@ -846,6 +867,8 @@ pub fn run(cli: &crate::Cli, entry: &RegistryEntry, total_vram: u64) -> Result<(
         // back-compat); `--no-persistent-decode` is the documented
         // opt-out for A/B comparison or bisecting megakernel regressions.
         !cli.no_persistent_decode,
+        cli.kv_fp8,
+        cli.dump_last_logits,
     )?;
     Ok(())
 }
@@ -1235,6 +1258,11 @@ fn load_layer_buffers(
     // `recurrent_state` instead (always allocated). 0 = no KV cache,
     // kernel falls back to kv_len=1 (back-compat for the parity test).
     kv_max_t: usize,
+    // When true, the layer's KV cache is allocated as FP8 E4M3 bytes
+    // with F32 per-(head, position) scales and an optional BF16
+    // sidecar (gated by `qwen35::state::kv_fp8_bf16_sidecar_*` env
+    // helpers).
+    kv_fp8: bool,
     mut expert_arena: Option<&mut VirtualArena>,
     mut expert_residency: Option<&mut MoeExpertResidencyManager>,
 ) -> Result<LayerBuffers> {
@@ -1300,17 +1328,115 @@ fn load_layer_buffers(
             Qwen36WeightMode::Bf16 => None,
         };
         // KV cache: allocate per-layer when multi-token decode is requested.
-        // Layout: BF16 [kv_max_t, num_kv_heads * head_dim] for both K and V.
+        // BF16 path: [kv_max_t, num_kv_heads * head_dim] BF16 for K and V.
+        // FP8 path: same shape but U8 (FP8 E4M3 bytes) plus F32 scales
+        // [num_kv_heads, kv_max_t] for K and V, plus optional BF16 sidecar
+        // [num_kv_heads, sidecar_window, head_dim] when enabled.
+        // VMM-FP8 path (SUPERSONIC_VMM_KV=1): same as FP8 but K/V are
+        // VirtualBuffer reservations with a mapped prefix; dense k/v are None.
         let kv_dim = (geom.num_kv_heads as usize) * (geom.head_dim as usize);
         let kv_cache = if kv_max_t > 0 {
-            let k = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[kv_max_t, kv_dim])
-                .with_context(|| format!("alloc kv_cache_k (layer {layer_idx})"))?;
-            let v = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[kv_max_t, kv_dim])
-                .with_context(|| format!("alloc kv_cache_v (layer {layer_idx})"))?;
+            let num_kv_heads = geom.num_kv_heads as usize;
+            let head_dim = geom.head_dim as usize;
+
+            let want_vmm = std::env::var_os("SUPERSONIC_VMM_KV")
+                .and_then(|v| v.into_string().ok())
+                .map(|v| v == "1")
+                .unwrap_or(false);
+            let vmm_active = kv_fp8
+                && want_vmm
+                && gpu_hal::vmm_is_supported(gpu_hal::current_backend(), ordinal);
+
+            let (k, v, virtual_kv_cache_k, virtual_kv_cache_v, virtual_kv_max_t,
+                 kv_scale_k, kv_scale_v) = if vmm_active {
+                // VMM-backed: reserve full logical capacity AND map all of
+                // it up front. We don't evict KV-FP8 in v1 (CpuBackup is off
+                // — VirtualBacking::Discard), and the kernel writes K/V at
+                // arbitrary `eff_cache_pos` between 0 and kv_max_t-1, so any
+                // unmapped page would page-fault mid-launch. The benefit of
+                // lazy mapping was VRAM pressure relief — but at typical
+                // sizes (e.g. ~128 MiB per K-cache, 2.56 GiB across 10
+                // full-attn layers for max_t=262144) the savings don't
+                // justify decode-time map_range_bytes calls. Map the full
+                // logical bytes once at construction.
+                let map_full_bytes = kv_max_t * kv_dim;
+                let vk = gpu_hal::VirtualBuffer::reserve_and_map_prefix(
+                    ordinal,
+                    ScalarType::U8,
+                    &[kv_max_t, kv_dim],
+                    map_full_bytes,
+                    gpu_hal::VirtualBacking::Discard,
+                )
+                .with_context(|| format!("vmm reserve kv_cache_k (layer {layer_idx})"))?;
+                let vv = gpu_hal::VirtualBuffer::reserve_and_map_prefix(
+                    ordinal,
+                    ScalarType::U8,
+                    &[kv_max_t, kv_dim],
+                    map_full_bytes,
+                    gpu_hal::VirtualBacking::Discard,
+                )
+                .with_context(|| format!("vmm reserve kv_cache_v (layer {layer_idx})"))?;
+                let sk = GpuBuffer::zeros(ordinal, ScalarType::F32, &[num_kv_heads, kv_max_t])
+                    .with_context(|| format!("alloc kv_scale_k (layer {layer_idx})"))?;
+                let sv = GpuBuffer::zeros(ordinal, ScalarType::F32, &[num_kv_heads, kv_max_t])
+                    .with_context(|| format!("alloc kv_scale_v (layer {layer_idx})"))?;
+                (None, None, Some(vk), Some(vv), Some(kv_max_t), Some(sk), Some(sv))
+            } else if kv_fp8 {
+                // dense FP8 path
+                let k = GpuBuffer::zeros(ordinal, ScalarType::U8, &[kv_max_t, kv_dim])
+                    .with_context(|| format!("alloc kv_cache_k FP8 (layer {layer_idx})"))?;
+                let v = GpuBuffer::zeros(ordinal, ScalarType::U8, &[kv_max_t, kv_dim])
+                    .with_context(|| format!("alloc kv_cache_v FP8 (layer {layer_idx})"))?;
+                let sk = GpuBuffer::zeros(ordinal, ScalarType::F32, &[num_kv_heads, kv_max_t])
+                    .with_context(|| format!("alloc kv_scale_k (layer {layer_idx})"))?;
+                let sv = GpuBuffer::zeros(ordinal, ScalarType::F32, &[num_kv_heads, kv_max_t])
+                    .with_context(|| format!("alloc kv_scale_v (layer {layer_idx})"))?;
+                (Some(k), Some(v), None, None, None, Some(sk), Some(sv))
+            } else {
+                // BF16 path
+                let k = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[kv_max_t, kv_dim])
+                    .with_context(|| format!("alloc kv_cache_k (layer {layer_idx})"))?;
+                let v = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[kv_max_t, kv_dim])
+                    .with_context(|| format!("alloc kv_cache_v (layer {layer_idx})"))?;
+                (Some(k), Some(v), None, None, None, None, None)
+            };
+            let (kv_shadow_k, kv_shadow_v) = if kv_fp8
+                && qwen35::state::kv_fp8_bf16_sidecar_enabled()
+            {
+                // Window is hard-coded to kv_max_t in v1 (matches the
+                // kernel's stride). The env-var window helper is consulted
+                // by Task 11 only for VRAM accounting; the actual buffer
+                // size always equals kv_max_t until the kernel grows a
+                // kv_shadow_window arg.
+                let window = kv_max_t;
+                let sk = GpuBuffer::zeros(
+                    ordinal,
+                    ScalarType::BF16,
+                    &[num_kv_heads, window, head_dim],
+                )
+                .with_context(|| format!("alloc kv_shadow_k (layer {layer_idx})"))?;
+                let sv = GpuBuffer::zeros(
+                    ordinal,
+                    ScalarType::BF16,
+                    &[num_kv_heads, window, head_dim],
+                )
+                .with_context(|| format!("alloc kv_shadow_v (layer {layer_idx})"))?;
+                (Some(sk), Some(sv))
+            } else {
+                (None, None)
+            };
             Some(FullAttnKvCache {
                 k,
                 v,
                 kv_max_t: kv_max_t as i32,
+                kv_scale_k,
+                kv_scale_v,
+                kv_shadow_k,
+                kv_shadow_v,
+                kv_shadow_start: -1,
+                virtual_kv_cache_k,
+                virtual_kv_cache_v,
+                virtual_kv_max_t,
             })
         } else {
             None
@@ -1599,6 +1725,7 @@ fn load_all_layer_buffers(
     weight_prefix: &str,
     weight_mode: Qwen36WeightMode,
     kv_max_t: usize,
+    kv_fp8: bool,
     mut expert_arena: Option<&mut VirtualArena>,
     mut expert_residency: Option<&mut MoeExpertResidencyManager>,
 ) -> Result<Vec<LayerBuffers>> {
@@ -1613,6 +1740,7 @@ fn load_all_layer_buffers(
             weight_prefix,
             weight_mode,
             kv_max_t,
+            kv_fp8,
             expert_arena.as_deref_mut(),
             expert_residency.as_deref_mut(),
         )
@@ -1720,9 +1848,18 @@ fn load_mtp_buffers(
         let v = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[kv_max_t, kv_dim])
             .context("alloc mtp kv_cache_v")?;
         Some(FullAttnKvCache {
-            k,
-            v,
+            k: Some(k),
+            v: Some(v),
             kv_max_t: kv_max_t as i32,
+            // MTP keeps BF16 KV — KV-FP8 + MTP combo not yet validated.
+            kv_scale_k: None,
+            kv_scale_v: None,
+            kv_shadow_k: None,
+            kv_shadow_v: None,
+            kv_shadow_start: -1,
+            virtual_kv_cache_k: None,
+            virtual_kv_cache_v: None,
+            virtual_kv_max_t: None,
         })
     } else {
         None
@@ -1838,6 +1975,8 @@ fn decode_text(
     backend: Backend,
     ordinal: usize,
     persistent_decode: bool,
+    kv_fp8: bool,
+    dump_last_logits: bool,
 ) -> Result<()> {
     use std::io::Write as _;
 
@@ -2023,6 +2162,7 @@ fn decode_text(
             weight_prefix,
             weight_mode,
             kv_max_t,
+            kv_fp8,
             None,
             Some(&mut manager),
         )
@@ -2063,6 +2203,7 @@ fn decode_text(
             weight_prefix,
             weight_mode,
             kv_max_t,
+            kv_fp8,
             Some(&mut arena),
             None,
         ) {
@@ -2094,6 +2235,7 @@ fn decode_text(
                     weight_prefix,
                     weight_mode,
                     kv_max_t,
+                    kv_fp8,
                     None,
                     None,
                 )?
@@ -2109,6 +2251,7 @@ fn decode_text(
             weight_prefix,
             weight_mode,
             kv_max_t,
+            kv_fp8,
             None,
             None,
         )?
@@ -2324,6 +2467,8 @@ fn decode_text(
     std::io::stdout().flush().ok();
 
     let mut generated_ids: Vec<u32> = Vec::with_capacity(max_new);
+    // Track the BF16 logits bytes from the last decode step for --dump-last-logits.
+    let mut last_logits_bytes: Vec<u8> = Vec::new();
     let mut current_token: u32 = prompt_ids[0];
     let mut position: i32 = 0;
     // Standard prefill+generate shape: feed prompt[0..N-1] as prefill (logits
@@ -2523,6 +2668,13 @@ fn decode_text(
         let t_chain_step = t1.elapsed();
         position += 1;
 
+        // (KV-FP8 sidecar shadow cursor is set at desc-build time in
+        // build_layer_descs — see qwen36_moe_persistent_decode.rs. v1
+        // forces the sidecar window equal to kv_max_t, so the cursor
+        // is `0` from step 0 onward and the descs never need re-upload.
+        // A future windowed-mode kernel would need decode-time updates
+        // to the device-side desc; flag for that work then.)
+
         // Prefill steps: feed the next prompt token without computing logits.
         if step + 1 < prompt_ids.len() {
             current_token = prompt_ids[step + 1];
@@ -2570,6 +2722,9 @@ fn decode_text(
         let logits = logits_buf
             .to_host_bytes()
             .context("d2h logits from GPU lm_head")?;
+        if dump_last_logits {
+            last_logits_bytes.clone_from(&logits);
+        }
         let t_lm_head_step = t2.elapsed();
         if let Ok(dump_path) = std::env::var("SUPERSONIC_QWEN36_DUMP_LOGITS") {
             std::fs::write(&dump_path, &logits)
@@ -2934,6 +3089,31 @@ fn decode_text(
         }
     }
 
+    // Emit last-step logits for integration parity tests (--dump-last-logits).
+    // Printed BEFORE any other post-loop output so the test parser can grep for
+    // the first line starting with "LAST_LOGITS: ".
+    if dump_last_logits && !last_logits_bytes.is_empty() {
+        use std::io::Write as _;
+        let logits_f32 = crate::qwen36_moe_decode::bf16_bytes_to_f32(&last_logits_bytes);
+        // Lead with `\n` so the marker lands at the start of its own line —
+        // the streamed-token print path uses `print!` without a trailing
+        // newline, so `LAST_LOGITS:` would otherwise concatenate onto the
+        // last generated text and `lines().find(...starts_with...)` in the
+        // parity/smoke tests wouldn't match.
+        // Format with `{}` (Display) instead of `{:.6}` to preserve full
+        // f32 precision — the VMM bit-exact smoke compares via
+        // `a.to_bits() == b.to_bits()`, which fails on rounded values.
+        print!("\nLAST_LOGITS: ");
+        for (i, x) in logits_f32.iter().enumerate() {
+            if i > 0 {
+                print!(",");
+            }
+            print!("{}", x);
+        }
+        println!();
+        std::io::stdout().flush().ok();
+    }
+
     println!();
     println!();
     println!(
@@ -3095,7 +3275,7 @@ fn load_lm_head_bf16(
 /// callable so the path stays exercised. Currently unused but documents the
 /// minimal one-step decode shape.
 #[allow(dead_code)]
-fn decode_first_token(model_dir: &Path, report: &DryRunReport) -> Result<u32> {
+fn decode_first_token(model_dir: &Path, report: &DryRunReport, kv_fp8: bool) -> Result<u32> {
     let weight_prefix = report.kernel_params.weight_prefix;
 
     // Pick the bake. INT4 is the realistic path on 24 GiB VRAM.
@@ -3153,6 +3333,7 @@ fn decode_first_token(model_dir: &Path, report: &DryRunReport) -> Result<u32> {
             weight_prefix,
             weight_mode,
             0, // legacy single-token path: no KV cache, kv_len=1 fast path.
+            kv_fp8,
             None,
             None,
         )

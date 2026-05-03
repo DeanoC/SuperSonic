@@ -312,6 +312,39 @@ __device__ inline float fp8_e4m3_to_float(uint8_t byte) {
     return sign * ldexpf(1.0f + static_cast<float>(mant) / 8.0f, exp - 7);
 }
 
+// Convert F32 to FP8 E4M3 byte (inverse of fp8_e4m3_to_float).
+// Verbatim port of full_attention_4b.hip:205-232 — keeps KV-FP8 quant
+// bit-exact with the reference 4B path so existing parity tests apply.
+// Clamps to representable range [-448, 448], rounds to nearest.
+__device__ inline uint8_t float_to_fp8_e4m3(float val) {
+    uint8_t sign = 0;
+    if (val < 0.0f) { sign = 0x80; val = -val; }
+    // Clamp to max representable E4M3 value
+    if (val >= 448.0f) return sign | 0x7E;  // max normal: stored-exp=15, mantissa=6 → 2^8*(1+6/8)=448
+    if (val < 1.52587890625e-2f * 0.125f) return sign;  // too small → ±0
+    // Subnormal range: val < 2^(-6) = 0.015625
+    if (val < 0.015625f) {
+        int mantissa = __float2int_rn(val / 1.52587890625e-2f * 8.0f);
+        if (mantissa < 0) mantissa = 0;
+        if (mantissa >= 8) return sign | 0x08;  // rounds up to the smallest normal
+        return sign | static_cast<uint8_t>(mantissa);
+    }
+    // Normal range
+    float log2_val = log2f(val);
+    int exp = static_cast<int>(floorf(log2_val)) + 7;
+    if (exp < 1) exp = 1;
+    if (exp > 14) exp = 14;  // would be NaN range — clamp
+    float pow2 = exp2f(static_cast<float>(exp - 7));
+    int mantissa = __float2int_rn((val / pow2 - 1.0f) * 8.0f);
+    if (mantissa < 0) mantissa = 0;
+    if (mantissa >= 8) {
+        mantissa = 0;
+        exp += 1;
+        if (exp > 14) return sign | 0x7E;
+    }
+    return sign | (static_cast<uint8_t>(exp) << 3) | static_cast<uint8_t>(mantissa);
+}
+
 __device__ inline float fp8_dequant_scalar(
     const void* w_ptr, const void* scale_ptr,
     int row, int col, int cols, int block_size

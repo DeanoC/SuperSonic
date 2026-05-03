@@ -30,8 +30,8 @@ use anyhow::{anyhow, Context, Result};
 use gpu_hal::{copy_d2h, copy_h2d, GpuBuffer, GpuError, ScalarType};
 use kernel_ffi::qwen36_moe::{
     persistent_decode_launch, persistent_decode_launch_range, Qwen36MoeDecodeLayerDesc,
-    Qwen36MoeInt4ScaleDesc, Qwen36MoePersistentGeom, Qwen36MoePersistentLmHeadFold,
-    Qwen36MoePersistentMode,
+    Qwen36MoeInt4ScaleDesc, Qwen36MoeKVCacheFp8Desc, Qwen36MoePersistentGeom,
+    Qwen36MoePersistentLmHeadFold, Qwen36MoePersistentMode,
 };
 use std::ffi::c_void;
 use std::os::raw::c_int;
@@ -67,6 +67,9 @@ pub struct PersistentScratch {
     pub layer_descs_dev: GpuBuffer,
     /// `[num_layers]` INT4 sidecar descriptors. `None` for BF16 bakes.
     pub int4_scales_dev: Option<GpuBuffer>,
+    /// Optional GPU upload of `Vec<Qwen36MoeKVCacheFp8Desc>` (one entry
+    /// per layer). `Some` when KV-FP8 is active.
+    pub kv_fp8_descs_dev: Option<GpuBuffer>,
     /// Two `[hidden]` BF16 buffers — kernel ping-pongs residuals through
     /// them. Per-step, host uploads the fresh `initial_hidden` into
     /// `hidden_ping`; the kernel returns the final hidden in
@@ -98,6 +101,12 @@ impl PersistentScratch {
             upload_descs(ordinal, &descs).context("upload layer descriptor array")?;
         let int4_scales_dev = match build_int4_descs(layers) {
             Some(int4) => Some(upload_descs(ordinal, &int4).context("upload int4 scale descs")?),
+            None => None,
+        };
+        let kv_fp8_descs_dev = match build_kv_fp8_descs(layers) {
+            Some(descs) => {
+                Some(upload_descs(ordinal, &descs).context("upload kv_fp8 scale descs")?)
+            }
             None => None,
         };
 
@@ -161,6 +170,7 @@ impl PersistentScratch {
             num_layers,
             layer_descs_dev,
             int4_scales_dev,
+            kv_fp8_descs_dev,
             hidden_ping,
             hidden_pong,
             workspace,
@@ -218,6 +228,7 @@ impl PersistentScratch {
             position,
             &self.layer_descs_dev,
             self.int4_scales_dev.as_ref(),
+            self.kv_fp8_descs_dev.as_ref(),
             self.num_layers,
             &mut self.hidden_ping,
             &mut self.hidden_pong,
@@ -305,6 +316,7 @@ impl PersistentScratch {
                 position,
                 &self.layer_descs_dev,
                 self.int4_scales_dev.as_ref(),
+                self.kv_fp8_descs_dev.as_ref(),
                 self.num_layers,
                 &mut self.hidden_ping,
                 &mut self.hidden_pong,
@@ -332,6 +344,7 @@ impl PersistentScratch {
                 position,
                 &self.layer_descs_dev,
                 self.int4_scales_dev.as_ref(),
+                self.kv_fp8_descs_dev.as_ref(),
                 self.num_layers,
                 &mut self.hidden_ping,
                 &mut self.hidden_pong,
@@ -407,9 +420,30 @@ pub fn build_layer_descs(layers: &mut [LayerBuffers]) -> Vec<Qwen36MoeDecodeLaye
                 d.k_norm_w = k_norm_w.as_ptr() as *const c_void;
                 d.o_proj_w = o_proj_w.as_ptr() as *const c_void;
                 if let Some(c) = kv_cache.as_mut() {
-                    d.kv_cache_k = c.k.as_mut_ptr();
-                    d.kv_cache_v = c.v.as_mut_ptr();
+                    d.kv_cache_k = c.k_device_ptr();
+                    d.kv_cache_v = c.v_device_ptr();
                     d.kv_max_t = c.kv_max_t;
+                    d.kv_shadow_k = c.kv_shadow_k.as_mut()
+                        .map(|b| b.as_mut_ptr())
+                        .unwrap_or(std::ptr::null_mut());
+                    d.kv_shadow_v = c.kv_shadow_v.as_mut()
+                        .map(|b| b.as_mut_ptr())
+                        .unwrap_or(std::ptr::null_mut());
+                    // Sidecar window is forced equal to kv_max_t in v1 —
+                    // every position is covered, so the kernel guard
+                    // `t >= kv_shadow_start && kv_shadow_start >= 0`
+                    // resolves to "always read sidecar" once any sidecar
+                    // buffer is allocated. Set start = 0 from the get-go;
+                    // the descs are uploaded once and never re-uploaded.
+                    // (`c.kv_shadow_start` is left at -1 in the host
+                    // struct for v1 — it's only meaningful if a future
+                    // windowed-mode lands and the kernel grows a
+                    // kv_shadow_window arg.)
+                    d.kv_shadow_start = if c.kv_shadow_k.is_some() {
+                        0
+                    } else {
+                        -1
+                    };
                 }
             }
             AttnLayerBuffers::Linear {
@@ -509,6 +543,42 @@ pub fn build_int4_descs(layers: &[LayerBuffers]) -> Option<Vec<Qwen36MoeInt4Scal
         int4.push(d);
     }
     Some(int4)
+}
+
+/// Build the parallel `Qwen36MoeKVCacheFp8Desc[num_layers]`. Returns
+/// `None` when no layer carries FP8 KV scales (BF16 or INT4 bake
+/// without KV-FP8). Linear-attn layers emit a zeroed descriptor
+/// (null scale pointers); the kernel checks `is_full_attention != 0`
+/// before dereferencing them.
+pub fn build_kv_fp8_descs(
+    layers: &mut [LayerBuffers],
+) -> Option<Vec<Qwen36MoeKVCacheFp8Desc>> {
+    let any_fp8 = layers.iter().any(|l| match &l.attn {
+        AttnLayerBuffers::Full {
+            kv_cache: Some(c), ..
+        } => c.kv_scale_k.is_some(),
+        _ => false,
+    });
+    if !any_fp8 {
+        return None;
+    }
+    let mut v = Vec::with_capacity(layers.len());
+    for layer in layers.iter_mut() {
+        let mut d = Qwen36MoeKVCacheFp8Desc::default();
+        if let AttnLayerBuffers::Full {
+            kv_cache: Some(c), ..
+        } = &mut layer.attn
+        {
+            if let Some(sk) = c.kv_scale_k.as_mut() {
+                d.kv_scale_k = sk.as_mut_ptr();
+            }
+            if let Some(sv) = c.kv_scale_v.as_mut() {
+                d.kv_scale_v = sv.as_mut_ptr();
+            }
+        }
+        v.push(d);
+    }
+    Some(v)
 }
 
 /// Upload a `[T]` slice to a GPU buffer as opaque U8 bytes — the kernel

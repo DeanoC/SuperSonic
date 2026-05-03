@@ -30,10 +30,17 @@ by allocation role.
 
 Current scope:
 
-- Decode-active VMM is enabled internally for Qwen3.5 BF16 dense KV and for
-  Qwen3.6-MoE INT4 routed expert slabs when the VMM expert mode is active.
-- Disabled for FP8-KV, certified-KV, batch decode, Qwen3.5 4B/component
-  decode, DFlash cloned states, Gemma4, and Llama3.1.
+- Decode-active VMM is enabled internally for Qwen3.5 BF16 dense KV, for
+  Qwen3.6-MoE INT4 routed expert slabs when the VMM expert mode is active,
+  and for Qwen3.6-MoE FP8 KV (opt-in via `SUPERSONIC_VMM_KV=1`).
+- Disabled for certified-KV, batch decode, Qwen3.5 4B/component decode,
+  DFlash cloned states, Gemma4, and Llama3.1. Qwen3.5 KV-FP8 also remains
+  disabled — enabling it is a separate effort.
+- Qwen3.6-MoE FP8 KV reserves U8 K/V VMM allocations (full logical
+  capacity, mapped prefix at kv_chunk_size=256) per full-attn layer.
+  Scale buffers (F32 [num_kv_heads, max_T]) and the optional BF16 sidecar
+  ([num_kv_heads, kv_max_t, head_dim]) stay as dense `GpuBuffer` for v1.
+  See Tasks 9–11 of `docs/superpowers/plans/2026-05-03-qwen36-moe-fp8-kv-fp8.md`.
 - Baked tensors can now be loaded into `VirtualArena` allocations through
   `model-store::BakedStore::load_to_virtual_arena`. `BakedStore` also exposes
   split reserve/upload APIs so a tensor can reserve a stable virtual base while

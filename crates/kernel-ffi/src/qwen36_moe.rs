@@ -111,6 +111,20 @@ pub struct Qwen36MoeDecodeLayerDesc {
     /// 1 if router applies `softmax(top_k_logits)` renormalization
     /// (`norm_topk_prob=true` in config). 0 otherwise.
     pub norm_topk_prob: c_int,
+
+    // --- KV-FP8 sidecar (read iff is_full_attention == 1 AND
+    // matching kv_fp8_descs[layer].kv_scale_k != null) ---------------
+    /// BF16 sidecar buffer `[num_kv_heads, window, head_dim]`. Null when
+    /// the sidecar is disabled. The kernel reads from the sidecar (instead
+    /// of dequantising FP8) when `t >= kv_shadow_start`.
+    pub kv_shadow_k: *mut c_void,
+    /// BF16 sidecar buffer `[num_kv_heads, window, head_dim]`. Paired with
+    /// [`Self::kv_shadow_k`]; null under the same conditions.
+    pub kv_shadow_v: *mut c_void,
+    /// First absolute KV position covered by the sidecar. `-1` when the
+    /// sidecar is disabled (or no positions are covered yet); the kernel
+    /// reads `t >= kv_shadow_start && kv_shadow_start >= 0` to decide.
+    pub kv_shadow_start: c_int,
 }
 
 unsafe impl Send for Qwen36MoeDecodeLayerDesc {}
@@ -168,6 +182,34 @@ unsafe impl Send for Qwen36MoeInt4ScaleDesc {}
 unsafe impl Sync for Qwen36MoeInt4ScaleDesc {}
 
 impl Default for Qwen36MoeInt4ScaleDesc {
+    fn default() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
+}
+
+/// Per-layer KV cache FP8 scale pointers for Qwen3.6-MoE.
+///
+/// Parallel struct to [`Qwen36MoeDecodeLayerDesc`] — one entry per layer,
+/// passed as a separate kernel argument (same pattern as
+/// [`Qwen36MoeInt4ScaleDesc`]). Linear-attention layers leave both
+/// pointers null. When KV-FP8 is off, the entire
+/// `*const Qwen36MoeKVCacheFp8Desc` array argument is null.
+///
+/// Mirrors the qwen35 `KVCacheFp8Desc` shape: F32 absmax scale per
+/// (kv_head, position).
+#[repr(C)]
+#[derive(Debug, Clone)]
+pub struct Qwen36MoeKVCacheFp8Desc {
+    /// `[num_kv_heads, max_T]` F32. Null for linear-attn layers.
+    pub kv_scale_k: *mut c_void,
+    /// `[num_kv_heads, max_T]` F32. Null for linear-attn layers.
+    pub kv_scale_v: *mut c_void,
+}
+
+unsafe impl Send for Qwen36MoeKVCacheFp8Desc {}
+unsafe impl Sync for Qwen36MoeKVCacheFp8Desc {}
+
+impl Default for Qwen36MoeKVCacheFp8Desc {
     fn default() -> Self {
         unsafe { std::mem::zeroed() }
     }
@@ -257,6 +299,14 @@ extern "C" {
         mode: c_int,
         layers: *const Qwen36MoeDecodeLayerDesc,
         int4_scales: *const Qwen36MoeInt4ScaleDesc,
+        // Null when KV-FP8 is off globally. Otherwise an array of
+        // `num_layers` entries parallel to `layers`. Full-attention
+        // layers populate `kv_scale_k` / `kv_scale_v` together (both
+        // set, or both null to disable KV-FP8 for that layer specifically
+        // — a valid mixed-mode configuration). Linear-attention layers
+        // must leave both null. The bridge validates these invariants
+        // and rejects malformed descriptors before kernel launch.
+        kv_fp8_descs: *const Qwen36MoeKVCacheFp8Desc,
         hidden: c_int,
         num_heads: c_int,
         num_kv_heads: c_int,
@@ -748,6 +798,7 @@ pub fn persistent_decode_launch(
     position: i32,
     layers_device: &GpuBuffer,
     int4_scales_device: Option<&GpuBuffer>,
+    kv_fp8_descs_device: Option<&GpuBuffer>,
     num_layers: usize,
     hidden_ping: &mut GpuBuffer,
     hidden_pong: &mut GpuBuffer,
@@ -766,6 +817,7 @@ pub fn persistent_decode_launch(
         position,
         layers_device,
         int4_scales_device,
+        kv_fp8_descs_device,
         num_layers,
         hidden_ping,
         hidden_pong,
@@ -787,6 +839,7 @@ pub fn persistent_decode_launch_range(
     position: i32,
     layers_device: &GpuBuffer,
     int4_scales_device: Option<&GpuBuffer>,
+    kv_fp8_descs_device: Option<&GpuBuffer>,
     num_layers: usize,
     hidden_ping: &mut GpuBuffer,
     hidden_pong: &mut GpuBuffer,
@@ -806,6 +859,9 @@ pub fn persistent_decode_launch_range(
     let barrier_flag = unsafe { (counters as *mut u8).add(68) as *mut c_uint };
     let int4_ptr: *const Qwen36MoeInt4ScaleDesc = int4_scales_device
         .map(|b| b.as_ptr() as *const Qwen36MoeInt4ScaleDesc)
+        .unwrap_or(std::ptr::null());
+    let kv_fp8_ptr: *const Qwen36MoeKVCacheFp8Desc = kv_fp8_descs_device
+        .map(|b| b.as_ptr() as *const Qwen36MoeKVCacheFp8Desc)
         .unwrap_or(std::ptr::null());
 
     // Fold pointers default to null; the kernel skips the lm_head phase
@@ -833,6 +889,7 @@ pub fn persistent_decode_launch_range(
                     mode.as_ffi(),
                     layers_device.as_ptr() as *const Qwen36MoeDecodeLayerDesc,
                     int4_ptr,
+                    kv_fp8_ptr,
                     geom.hidden,
                     geom.num_heads,
                     geom.num_kv_heads,
@@ -1924,19 +1981,30 @@ mod tests {
     #[test]
     fn descriptor_layout_offsets_documented() {
         // Pin the size so a future field-reorder is loud. If you need to
-        // grow the struct, append fields and update this number — never
-        // reorder existing ones.
+        // grow the struct, append fields and update this exact number —
+        // never reorder existing ones. Loose ranges (e.g. [256, 512])
+        // silently absorbed forgotten field appends; we use exact sizes
+        // and the matching C++ `static_assert` ranges in
+        // `kernels/qwen36_moe_bridge.cpp` to catch drift on both sides.
         // (Numbers verified on x86_64 Linux. Pointers are 8 bytes.)
         let sz = size_of::<Qwen36MoeDecodeLayerDesc>();
-        assert!(
-            sz >= 256 && sz <= 512,
-            "Qwen36MoeDecodeLayerDesc size drift: got {sz} bytes",
+        assert_eq!(
+            sz, 344,
+            "Qwen36MoeDecodeLayerDesc size drift: got {sz} bytes (expected 344)",
         );
 
         let int4_sz = size_of::<Qwen36MoeInt4ScaleDesc>();
         assert!(
             int4_sz >= 192 && int4_sz <= 256,
             "Qwen36MoeInt4ScaleDesc size drift: got {int4_sz} bytes",
+        );
+
+        // Two raw pointers — pinned to match the C++ static_assert in
+        // kernels/qwen36_moe_bridge.cpp.
+        let kv_fp8_sz = size_of::<Qwen36MoeKVCacheFp8Desc>();
+        assert_eq!(
+            kv_fp8_sz, 16,
+            "Qwen36MoeKVCacheFp8Desc size drift: got {kv_fp8_sz} bytes (expected 16)",
         );
     }
 
@@ -7218,3 +7286,17 @@ mod tests {
         );
     }
 }
+
+// ABI sanity — every time `Qwen36MoeDecodeLayerDesc` grows, both this
+// const and the C++ side `static_assert` in `kernels/qwen36_moe_bridge.cpp`
+// must move together. Keep the bound pinned tightly: a loose range
+// (e.g. [256, 512]) silently absorbs forgotten field appends. If you
+// add or remove a field, update this exact size and the C++ side in
+// the same commit.
+#[cfg(target_pointer_width = "64")]
+const _ASSERT_DECODE_LAYER_DESC_SIZE: () = {
+    let sz = std::mem::size_of::<Qwen36MoeDecodeLayerDesc>();
+    assert!(sz == _DECODE_LAYER_DESC_EXPECTED_BYTES);
+};
+#[cfg(target_pointer_width = "64")]
+const _DECODE_LAYER_DESC_EXPECTED_BYTES: usize = 344;

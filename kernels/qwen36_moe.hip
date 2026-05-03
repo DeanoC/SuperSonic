@@ -112,6 +112,12 @@ struct DecodeLayerDesc {
     int         moe_intermediate_size;
     int         shared_expert_intermediate_size;
     int         norm_topk_prob;
+
+    // --- KV-FP8 sidecar (read iff is_full_attention == 1 AND
+    // matching kv_fp8_descs[layer].kv_scale_k != null) ---------------
+    void* kv_shadow_k;       // BF16 [num_kv_heads, window, head_dim]
+    void* kv_shadow_v;       // BF16 [num_kv_heads, window, head_dim]
+    int   kv_shadow_start;   // first KV position covered by the sidecar; -1 = disabled
 };
 
 // -- Int4 scale/zero parallel struct (mirror of Rust Qwen36MoeInt4ScaleDesc) -
@@ -151,6 +157,15 @@ struct Int4ScaleDesc {
     const void* shared_expert_down_proj_zero;
 
     int group_size;
+};
+
+// -- KV cache FP8 scale parallel struct (mirror of Rust
+//    Qwen36MoeKVCacheFp8Desc). One entry per layer. Linear-attention
+//    layers carry null pointers and the kernel skips them. The whole
+//    array argument is null when KV-FP8 is off.
+struct KVCacheFp8Desc {
+    void* kv_scale_k;   // F32 [num_kv_heads, max_T]
+    void* kv_scale_v;   // F32 [num_kv_heads, max_T]
 };
 
 // `grid_barrier` and `grid_barrier_reset_counter` live in
@@ -346,7 +361,11 @@ __global__ void qwen36_moe_attn_step_kernel(
         v_proj_scale, v_proj_zero,
         o_proj_scale, o_proj_zero,
         output, workspace,
-        kv_cache_k, kv_cache_v, kv_max_t,
+        kv_cache_k, kv_cache_v,
+        /*kv_scale_k*/ nullptr, /*kv_scale_v*/ nullptr,
+        /*kv_shadow_k*/ nullptr, /*kv_shadow_v*/ nullptr,
+        /*kv_shadow_start*/ -1,
+        kv_max_t,
         counters, barrier_counter, barrier_flag);
 }
 
