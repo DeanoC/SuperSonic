@@ -74,11 +74,12 @@ fn vmm_sparse_range_round_trip_stable_pointer() {
         return;
     }
 
-    let mut buf = VirtualBuffer::reserve(0, ScalarType::U8, &[1 << 20], VirtualBacking::Discard)
+    let mut buf = VirtualBuffer::reserve(0, ScalarType::U8, &[8 << 20], VirtualBacking::Discard)
         .expect("reserve virtual buffer");
     let base = buf.as_ptr();
+    let page = buf.granularity();
     let first_offset = 0;
-    let second_offset = 512 * 1024;
+    let second_offset = 2 * page;
     let len = 4096;
 
     buf.map_range_bytes(first_offset, len)
@@ -86,6 +87,11 @@ fn vmm_sparse_range_round_trip_stable_pointer() {
     buf.map_range_bytes(second_offset, len)
         .expect("map second island");
     assert_eq!(buf.as_ptr(), base, "sparse mapping changed base VA");
+    assert_eq!(
+        buf.mapping_count(),
+        2,
+        "disjoint sparse VMM islands should remain separate mappings"
+    );
 
     let first = pattern_bytes(len);
     let second = pattern_bytes(len)
