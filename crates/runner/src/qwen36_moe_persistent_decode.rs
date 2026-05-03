@@ -89,11 +89,7 @@ impl PersistentScratch {
     /// `layers` only for descriptor construction (mutable state pointers
     /// are cached into the descs); subsequent [`Self::run`] calls don't
     /// need `&mut layers`.
-    pub fn new(
-        ordinal: usize,
-        geom: &MultiLayerGeom,
-        layers: &mut [LayerBuffers],
-    ) -> Result<Self> {
+    pub fn new(ordinal: usize, geom: &MultiLayerGeom, layers: &mut [LayerBuffers]) -> Result<Self> {
         let num_layers = layers.len();
         let descs = build_layer_descs(layers);
         let layer_descs_dev =
@@ -403,4 +399,101 @@ pub fn upload_descs<T: Sized>(ordinal: usize, descs: &[T]) -> Result<GpuBuffer, 
         bytes.extend_from_slice(unsafe { std::slice::from_raw_parts(p, per) });
     }
     GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[bytes.len()], &bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::qwen36_moe_decode::{FfnLayerBuffers, ResidentWeight};
+    use gpu_hal::{Backend, VirtualAllocationRole, VirtualArena, VirtualBacking};
+
+    fn stub_bf16(ordinal: usize) -> Result<GpuBuffer> {
+        Ok(GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1])?)
+    }
+
+    fn stub_u8(ordinal: usize) -> Result<GpuBuffer> {
+        Ok(GpuBuffer::zeros(ordinal, ScalarType::U8, &[1])?)
+    }
+
+    #[test]
+    fn layer_desc_uses_virtual_expert_weight_pointers() {
+        if !gpu_hal::is_backend_compiled(Backend::Hip) {
+            eprintln!("skip: HIP backend not compiled");
+            return;
+        }
+        gpu_hal::set_backend(Backend::Hip);
+        let ordinal = 0usize;
+        if !gpu_hal::vmm_is_supported(Backend::Hip, ordinal) {
+            eprintln!("skip: HIP VMM unsupported on this device/runtime");
+            return;
+        }
+
+        let mut arena = VirtualArena::new(ordinal, VirtualBacking::CpuBackup);
+        let gate_up_id = arena
+            .reserve(
+                "test.gate_up_proj",
+                VirtualAllocationRole::MoeExpert,
+                ScalarType::U8,
+                &[4096],
+            )
+            .expect("reserve virtual gate_up");
+        let down_id = arena
+            .reserve(
+                "test.down_proj",
+                VirtualAllocationRole::MoeExpert,
+                ScalarType::U8,
+                &[4096],
+            )
+            .expect("reserve virtual down");
+        let gate_up_buf = arena.allocation(gate_up_id).unwrap().buffer();
+        let down_buf = arena.allocation(down_id).unwrap().buffer();
+        let gate_up_ptr = gate_up_buf.as_ptr();
+        let down_ptr = down_buf.as_ptr();
+
+        let mut layers = vec![LayerBuffers {
+            attn: AttnLayerBuffers::Linear {
+                input_norm_w: stub_bf16(ordinal).unwrap(),
+                in_proj_qkv_w: stub_u8(ordinal).unwrap(),
+                in_proj_z_w: stub_u8(ordinal).unwrap(),
+                in_proj_a_w: stub_bf16(ordinal).unwrap(),
+                in_proj_b_w: stub_bf16(ordinal).unwrap(),
+                conv1d_w: stub_bf16(ordinal).unwrap(),
+                conv1d_bias: None,
+                dt_bias: stub_bf16(ordinal).unwrap(),
+                a_log: stub_bf16(ordinal).unwrap(),
+                norm_w: stub_bf16(ordinal).unwrap(),
+                out_proj_w: stub_u8(ordinal).unwrap(),
+                conv_state: stub_bf16(ordinal).unwrap(),
+                recurrent_state: GpuBuffer::zeros(ordinal, ScalarType::F32, &[1]).unwrap(),
+                int4: None,
+            },
+            ffn: FfnLayerBuffers {
+                post_attn_norm_w: stub_bf16(ordinal).unwrap(),
+                gate_w: stub_bf16(ordinal).unwrap(),
+                gate_up_proj_w: ResidentWeight::Virtual {
+                    allocation_id: gate_up_id,
+                    ptr: gate_up_ptr,
+                    dtype: gate_up_buf.dtype(),
+                    shape: gate_up_buf.shape().to_vec(),
+                    len_bytes: gate_up_buf.len_bytes(),
+                },
+                down_proj_w: ResidentWeight::Virtual {
+                    allocation_id: down_id,
+                    ptr: down_ptr,
+                    dtype: down_buf.dtype(),
+                    shape: down_buf.shape().to_vec(),
+                    len_bytes: down_buf.len_bytes(),
+                },
+                shared_gate_proj_w: stub_u8(ordinal).unwrap(),
+                shared_up_proj_w: stub_u8(ordinal).unwrap(),
+                shared_down_proj_w: stub_u8(ordinal).unwrap(),
+                shared_expert_gate_w: stub_bf16(ordinal).unwrap(),
+                int4: None,
+            },
+        }];
+
+        let descs = build_layer_descs(&mut layers);
+        assert_eq!(descs[0].experts_gate_up_w, gate_up_ptr);
+        assert_eq!(descs[0].experts_down_w, down_ptr);
+    }
 }

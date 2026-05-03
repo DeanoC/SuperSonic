@@ -34,20 +34,24 @@ Current scope:
   decode, DFlash cloned states, Gemma4, Qwen3.6-MoE decode descriptors, and
   Llama3.1.
 - Baked tensors can now be loaded into `VirtualArena` allocations through
-  `model-store::BakedStore::load_to_virtual_arena`. This is the first real
-  virtual-weight/MoE-island path: it uses the bake mmap as the source of truth,
-  assigns allocation roles (`Weights` or `MoeExpert`), maps stable VMM
-  addresses, and uploads tensor bytes into those mappings. This is not yet a
-  decode-active weight path; existing Qwen3.6-MoE decode descriptors still own
-  and consume dense `GpuBuffer` weights.
+  `model-store::BakedStore::load_to_virtual_arena`. Qwen3.6-MoE INT4 decode
+  auto-uses this path for routed expert slabs on HIP devices with VMM support:
+  descriptors consume stable virtual pointers for `mlp.experts.gate_up_proj`
+  and `mlp.experts.down_proj`, while all pages remain resident for this first
+  decode-active identity milestone. Other weights still use dense
+  `GpuBuffer`s.
 - `SUPERSONIC_VMM_WEIGHT_PROBE=1` makes Qwen3.6-MoE dry-run load
   `lm_head.weight` into a virtual `Weights` allocation when an INT4 bake is
   present.
 - `SUPERSONIC_VMM_MOE_ISLAND_PROBE=1` or
   `SUPERSONIC_VMM_MOE_ISLAND_PROBE_LAYERS=N` makes Qwen3.6-MoE dry-run load
   the first N layers' fused expert slabs into virtual `MoeExpert` allocations
-  and report logical/resident/reserved bytes. This is a residency probe only;
-  decode still uses the existing `GpuBuffer` descriptors.
+  and report logical/resident/reserved bytes without running decode.
+- `SUPERSONIC_VMM_MOE_ISLANDS=0` disables Qwen3.6-MoE decode-active virtual
+  expert slabs. When unset, Qwen3.6-MoE INT4 decode auto-enables them on
+  supported HIP devices and falls back to dense expert buffers if VMM loading
+  fails. `SUPERSONIC_VMM_MOE_ISLANDS=1` makes unsupported or failed VMM expert
+  loading a hard error.
 - `SUPERSONIC_VMM_KV=0` disables the Qwen3.5 integration.
 - `SUPERSONIC_VMM_KV=1` requests it and logs if the backend cannot support it.
 - `SUPERSONIC_VMM_KV_EVICT_AFTER_PREFILL=1` backs virtual KV to host RAM after

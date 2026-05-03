@@ -24,6 +24,7 @@
 //! [`run_chained_decode`] core — the only difference is how the
 //! [`LayerBuffers`] vec gets populated.
 
+use std::ffi::c_void;
 use std::ptr;
 
 use anyhow::{anyhow, Context, Result};
@@ -172,14 +173,78 @@ pub struct FfnInt4Sidecars {
     pub shared_down_proj_zero: GpuBuffer,
 }
 
+/// GPU-resident weight pointer used by decode descriptors.
+///
+/// Most Qwen3.6-MoE weights are ordinary `GpuBuffer`s. Routed expert slabs can
+/// also live in a `VirtualArena`; in that case the engine owns the arena and
+/// this wrapper carries the stable virtual pointer plus shape metadata.
+#[allow(dead_code)]
+pub enum ResidentWeight {
+    Dense(GpuBuffer),
+    Virtual {
+        allocation_id: usize,
+        ptr: *const c_void,
+        dtype: ScalarType,
+        shape: Vec<usize>,
+        len_bytes: usize,
+    },
+}
+
+unsafe impl Send for ResidentWeight {}
+unsafe impl Sync for ResidentWeight {}
+
+#[allow(dead_code)]
+impl ResidentWeight {
+    pub fn as_ptr(&self) -> *const c_void {
+        match self {
+            Self::Dense(buf) => buf.as_ptr(),
+            Self::Virtual { ptr, .. } => *ptr,
+        }
+    }
+
+    pub fn len_bytes(&self) -> usize {
+        match self {
+            Self::Dense(buf) => buf.len_bytes(),
+            Self::Virtual { len_bytes, .. } => *len_bytes,
+        }
+    }
+
+    pub fn shape(&self) -> &[usize] {
+        match self {
+            Self::Dense(buf) => buf.shape(),
+            Self::Virtual { shape, .. } => shape.as_slice(),
+        }
+    }
+
+    pub fn dtype(&self) -> ScalarType {
+        match self {
+            Self::Dense(buf) => buf.dtype(),
+            Self::Virtual { dtype, .. } => *dtype,
+        }
+    }
+
+    pub fn allocation_id(&self) -> Option<usize> {
+        match self {
+            Self::Dense(_) => None,
+            Self::Virtual { allocation_id, .. } => Some(*allocation_id),
+        }
+    }
+}
+
+impl From<GpuBuffer> for ResidentWeight {
+    fn from(value: GpuBuffer) -> Self {
+        Self::Dense(value)
+    }
+}
+
 /// Per-layer MoE FFN weight buffers. Always present (every layer has an
 /// FFN block). When `int4` is `Some`, every `*_proj_w` field carries
 /// packed nibbles instead of BF16 weights.
 pub struct FfnLayerBuffers {
     pub post_attn_norm_w: GpuBuffer,
     pub gate_w: GpuBuffer,
-    pub gate_up_proj_w: GpuBuffer,
-    pub down_proj_w: GpuBuffer,
+    pub gate_up_proj_w: ResidentWeight,
+    pub down_proj_w: ResidentWeight,
     pub shared_gate_proj_w: GpuBuffer,
     pub shared_up_proj_w: GpuBuffer,
     pub shared_down_proj_w: GpuBuffer,

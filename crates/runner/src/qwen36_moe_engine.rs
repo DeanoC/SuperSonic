@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
-use gpu_hal::{set_backend, Backend, GpuBuffer, ScalarType, VirtualAllocationRole};
+use gpu_hal::{set_backend, Backend, GpuBuffer, ScalarType, VirtualAllocationRole, VirtualArena};
 use model_store::manifest::LayoutTag;
 use model_store::BakedStore;
 use qwen36_moe::config::{Config, TextConfig};
@@ -29,7 +29,7 @@ use crate::qwen36_moe_decode::{
     argmax_bf16_logits, dequant_int4_to_bf16_bytes, host_final_norm_lm_head, run_chained_decode,
     run_chained_decode_fast, sample_bf16_logits, AttnLayerBuffers, FfnInt4Sidecars,
     FfnLayerBuffers, FullAttnInt4Sidecars, FullAttnKvCache, LayerBuffers, LinearAttnInt4Sidecars,
-    MtpLayerBuffers, MultiLayerGeom, XorshiftRng,
+    MtpLayerBuffers, MultiLayerGeom, ResidentWeight, XorshiftRng,
 };
 use crate::qwen36_moe_speculative::{
     run_speculative_decode_step, run_speculative_decode_step_batched,
@@ -835,6 +835,7 @@ pub fn run(cli: &crate::Cli, entry: &RegistryEntry, total_vram: u64) -> Result<(
         cli.speculative_decode,
         cli.fp8_runtime,
         cli.batched_spec_verify,
+        cli.device,
         // Phase 3e.4: persistent decode is now the default. The legacy
         // `--persistent-decode` flag is a hidden no-op (kept for harness
         // back-compat); `--no-persistent-decode` is the documented
@@ -937,6 +938,36 @@ fn load_to_gpu(store: &BakedStore, ordinal: usize, name: &str) -> Result<GpuBuff
         .with_context(|| format!("BakedStore::load_to_gpu({name})"))
 }
 
+fn load_to_resident_weight(
+    store: &BakedStore,
+    ordinal: usize,
+    name: &str,
+) -> Result<ResidentWeight> {
+    load_to_gpu(store, ordinal, name).map(ResidentWeight::Dense)
+}
+
+fn load_to_virtual_resident_weight(
+    store: &BakedStore,
+    arena: &mut VirtualArena,
+    name: &str,
+) -> Result<ResidentWeight> {
+    let resolved = resolve_qwen36_store_name(store, name);
+    let id = store
+        .load_to_virtual_arena(arena, resolved.as_ref(), VirtualAllocationRole::MoeExpert)
+        .with_context(|| format!("BakedStore::load_to_virtual_arena({name})"))?;
+    let allocation = arena
+        .allocation(id)
+        .ok_or_else(|| anyhow!("virtual allocation id {id} disappeared after loading {name}"))?;
+    let buffer = allocation.buffer();
+    Ok(ResidentWeight::Virtual {
+        allocation_id: id,
+        ptr: buffer.as_ptr(),
+        dtype: buffer.dtype(),
+        shape: buffer.shape().to_vec(),
+        len_bytes: buffer.len_bytes(),
+    })
+}
+
 fn store_contains_qwen36(store: &BakedStore, name: &str) -> bool {
     store.contains(resolve_qwen36_store_name(store, name).as_ref())
 }
@@ -974,6 +1005,26 @@ enum Qwen36WeightMode {
     Fp8,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MoeExpertVmmMode {
+    Auto,
+    Disabled,
+    Force,
+}
+
+impl MoeExpertVmmMode {
+    fn from_env() -> Result<Self> {
+        match std::env::var("SUPERSONIC_VMM_MOE_ISLANDS").ok().as_deref() {
+            None => Ok(Self::Auto),
+            Some("0") => Ok(Self::Disabled),
+            Some("1") => Ok(Self::Force),
+            Some(other) => Err(anyhow!(
+                "SUPERSONIC_VMM_MOE_ISLANDS must be unset, 0, or 1; got {other:?}"
+            )),
+        }
+    }
+}
+
 /// Build one layer's worth of GPU-resident weight + state buffers from a
 /// BakedStore. Decides full-attn vs linear-attn by consulting the config's
 /// `layer_types` (every 4th layer is full per the standard hybrid pattern).
@@ -998,6 +1049,7 @@ fn load_layer_buffers(
     // `recurrent_state` instead (always allocated). 0 = no KV cache,
     // kernel falls back to kv_len=1 (back-compat for the parity test).
     kv_max_t: usize,
+    mut expert_arena: Option<&mut VirtualArena>,
 ) -> Result<LayerBuffers> {
     let lp = format!("{weight_prefix}.layers.{layer_idx}");
 
@@ -1284,8 +1336,22 @@ fn load_layer_buffers(
         gate_w: load_to_gpu(store, ordinal, &format!("{mp}.gate.weight"))?,
         // Note: experts.gate_up_proj / experts.down_proj have NO `.weight`
         // suffix in the published checkpoint — see expected_tensor_specs.
-        gate_up_proj_w: load_to_gpu(store, ordinal, &format!("{mp}.experts.gate_up_proj"))?,
-        down_proj_w: load_to_gpu(store, ordinal, &format!("{mp}.experts.down_proj"))?,
+        gate_up_proj_w: match expert_arena.as_mut() {
+            Some(arena) => load_to_virtual_resident_weight(
+                store,
+                &mut **arena,
+                &format!("{mp}.experts.gate_up_proj"),
+            )?,
+            None => load_to_resident_weight(store, ordinal, &format!("{mp}.experts.gate_up_proj"))?,
+        },
+        down_proj_w: match expert_arena.as_mut() {
+            Some(arena) => load_to_virtual_resident_weight(
+                store,
+                &mut **arena,
+                &format!("{mp}.experts.down_proj"),
+            )?,
+            None => load_to_resident_weight(store, ordinal, &format!("{mp}.experts.down_proj"))?,
+        },
         shared_gate_proj_w: load_to_gpu(
             store,
             ordinal,
@@ -1310,6 +1376,63 @@ fn load_layer_buffers(
     };
 
     Ok(LayerBuffers { attn, ffn })
+}
+
+fn load_all_layer_buffers(
+    store: &BakedStore,
+    ordinal: usize,
+    geom: &MultiLayerGeom,
+    text_config: &TextConfig,
+    weight_prefix: &str,
+    weight_mode: Qwen36WeightMode,
+    kv_max_t: usize,
+    mut expert_arena: Option<&mut VirtualArena>,
+) -> Result<Vec<LayerBuffers>> {
+    let mut layers = Vec::with_capacity(geom.num_layers as usize);
+    for li in 0..geom.num_layers as usize {
+        let layer = load_layer_buffers(
+            store,
+            ordinal,
+            li,
+            geom,
+            text_config,
+            weight_prefix,
+            weight_mode,
+            kv_max_t,
+            expert_arena.as_deref_mut(),
+        )
+        .with_context(|| format!("load layer {li} weights"))?;
+        layers.push(layer);
+    }
+    Ok(layers)
+}
+
+fn should_try_moe_expert_vmm(
+    mode: MoeExpertVmmMode,
+    weight_mode: Qwen36WeightMode,
+    ordinal: usize,
+) -> Result<bool> {
+    if mode == MoeExpertVmmMode::Disabled {
+        return Ok(false);
+    }
+    if weight_mode != Qwen36WeightMode::Int4 {
+        if mode == MoeExpertVmmMode::Force {
+            anyhow::bail!(
+                "SUPERSONIC_VMM_MOE_ISLANDS=1 requires Qwen3.6-MoE INT4 weights; got {weight_mode:?}"
+            );
+        }
+        return Ok(false);
+    }
+    let supported = gpu_hal::vmm_is_supported(Backend::Hip, ordinal);
+    if !supported {
+        if mode == MoeExpertVmmMode::Force {
+            anyhow::bail!(
+                "SUPERSONIC_VMM_MOE_ISLANDS=1 requested but HIP VMM is unsupported on device {ordinal}"
+            );
+        }
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 /// Load the Qwen3.6-MoE multi-token-prediction (MTP) head from the bake.
@@ -1496,6 +1619,7 @@ fn decode_text(
     speculative_decode: bool,
     fp8_runtime: bool,
     batched_spec_verify: bool,
+    ordinal: usize,
     persistent_decode: bool,
 ) -> Result<()> {
     use std::io::Write as _;
@@ -1618,14 +1742,12 @@ fn decode_text(
     let geom = build_multi_layer_geom(&report.config.text_config, &report.kernel_params);
 
     set_backend(Backend::Hip);
-    let ordinal = 0usize;
 
     // KV cache size: needs to fit prompt_len + max_new past tokens. Sized
     // generously here since per-layer KV is small (10 full-attn layers ×
     // [kv_max_t, Hkv*d=512] BF16 = 10 KiB per token of context).
     let kv_max_t = prompt_ids.len() + max_new;
 
-    let mut layers = Vec::with_capacity(geom.num_layers as usize);
     println!(
         "  loading {} layers ({} INT4 sidecar sets, KV cache cap = {} tokens)…",
         geom.num_layers,
@@ -1636,20 +1758,65 @@ fn decode_text(
         },
         kv_max_t,
     );
-    for li in 0..geom.num_layers as usize {
-        let layer = load_layer_buffers(
+
+    let moe_vmm_mode = MoeExpertVmmMode::from_env()?;
+    let mut _moe_expert_arena = None;
+    let mut layers = if should_try_moe_expert_vmm(moe_vmm_mode, weight_mode, ordinal)? {
+        let mut arena = BakedStore::virtual_weight_arena(ordinal);
+        match load_all_layer_buffers(
             &store,
             ordinal,
-            li,
             &geom,
             &report.config.text_config,
             weight_prefix,
             weight_mode,
             kv_max_t,
-        )
-        .with_context(|| format!("load layer {li} weights"))?;
-        layers.push(layer);
-    }
+            Some(&mut arena),
+        ) {
+            Ok(layers) => {
+                let stats = arena.stats();
+                println!(
+                    "  [vmm] Qwen3.6-MoE routed expert slabs active on device {ordinal}: \
+                     allocations={} mappings={} logical={:.2}MiB resident={:.2}MiB reserved={:.2}MiB",
+                    stats.allocations,
+                    stats.mapping_count,
+                    stats.logical_bytes as f64 / MIB,
+                    stats.resident_bytes as f64 / MIB,
+                    stats.reserved_bytes as f64 / MIB,
+                );
+                _moe_expert_arena = Some(arena);
+                layers
+            }
+            Err(err) if moe_vmm_mode == MoeExpertVmmMode::Auto => {
+                eprintln!(
+                    "[vmm] Qwen3.6-MoE routed expert VMM load failed ({err:#}); falling back to dense expert buffers"
+                );
+                drop(arena);
+                load_all_layer_buffers(
+                    &store,
+                    ordinal,
+                    &geom,
+                    &report.config.text_config,
+                    weight_prefix,
+                    weight_mode,
+                    kv_max_t,
+                    None,
+                )?
+            }
+            Err(err) => return Err(err.context("load Qwen3.6-MoE routed experts into VMM")),
+        }
+    } else {
+        load_all_layer_buffers(
+            &store,
+            ordinal,
+            &geom,
+            &report.config.text_config,
+            weight_prefix,
+            weight_mode,
+            kv_max_t,
+            None,
+        )?
+    };
 
     // Phase 6 self-speculative decode: load the multi-token-prediction
     // (MTP) head from the bake when --speculative-decode is set.
@@ -2553,6 +2720,7 @@ fn decode_first_token(model_dir: &Path, report: &DryRunReport) -> Result<u32> {
             weight_prefix,
             weight_mode,
             0, // legacy single-token path: no KV cache, kv_len=1 fast path.
+            None,
         )
         .with_context(|| format!("load layer {li} weights"))?;
         layers.push(layer);
