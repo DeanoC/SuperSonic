@@ -9,6 +9,7 @@ from oracle.qwen36_verify_suite import (
     Case,
     build_ruler_cases,
     evaluate_failures,
+    load_vmm_residency,
     parse_contexts,
     parse_generated_ids,
     run_once,
@@ -145,6 +146,7 @@ class Qwen36VerifySuiteTests(unittest.TestCase):
         self.assertTrue(cvp["hidden_bit_identical"])
         self.assertTrue(cvp["generated_ids_match"])
         self.assertAlmostEqual(cvp["chain_speedup_pct"], 10.0, places=4)
+        self.assertIsNone(summary["modes"]["int4/chained"]["vmm_total_resident_bytes_mean"])
 
         # Divergent hashes should fail the bit-identity gate.
         runs[1]["logits_sha256"] = "BBB"
@@ -159,6 +161,68 @@ class Qwen36VerifySuiteTests(unittest.TestCase):
             any("chained vs persistent logits diverged" in f for f in failures),
             f"expected divergence failure, got: {failures}",
         )
+
+    def test_summary_rolls_up_vmm_residency(self):
+        case = Case("vmm", "pg19", 512, "prompt", [], 511)
+        common = {
+            "mode": "int4",
+            "decode_path": "persistent",
+            "returncode": 0,
+            "generated_ids": [1],
+            "logits_sha256": "a",
+            "hidden_sha256": "h",
+            "logits_stats": {"all_zero": False},
+            "wall_seconds": 1.0,
+        }
+        runs = [
+            {
+                "repeat_idx": 0,
+                "vmm_residency": {
+                    "moe_resident_bytes": 10,
+                    "kv_resident_bytes": 3,
+                    "total_vmm_resident_bytes": 13,
+                    "total_vmm_reserved_bytes": 100,
+                },
+                **common,
+            },
+            {
+                "repeat_idx": 1,
+                "vmm_residency": {
+                    "moe_resident_bytes": 20,
+                    "kv_resident_bytes": 3,
+                    "total_vmm_resident_bytes": 23,
+                    "total_vmm_reserved_bytes": 100,
+                },
+                **common,
+            },
+        ]
+        cell = summarize_case(case, runs)["modes"]["int4/persistent"]
+        self.assertEqual(cell["vmm_total_resident_bytes_mean"], 18)
+        self.assertEqual(cell["vmm_total_resident_bytes_max"], 23)
+        self.assertEqual(cell["vmm_moe_resident_bytes_mean"], 15)
+        self.assertEqual(cell["vmm_kv_resident_bytes_mean"], 3)
+
+    def test_load_vmm_residency_keeps_report_fields(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "vmm.json"
+            path.write_text(json.dumps({
+                "summary": {
+                    "decode_path": "segmented_persistent",
+                    "moe_resident_bytes": 10,
+                    "kv_resident_bytes": 3,
+                    "total_vmm_resident_bytes": 13,
+                    "unrelated": "ignored",
+                }
+            }))
+            self.assertEqual(
+                load_vmm_residency(path),
+                {
+                    "decode_path": "segmented_persistent",
+                    "moe_resident_bytes": 10,
+                    "kv_resident_bytes": 3,
+                    "total_vmm_resident_bytes": 13,
+                },
+            )
 
     def test_run_once_records_timeout_as_failed_row(self):
         def fake_run(*args, **kwargs):
@@ -192,6 +256,60 @@ class Qwen36VerifySuiteTests(unittest.TestCase):
         self.assertEqual(row["returncode"], None)
         self.assertEqual(row["generated_ids"], [7])
         self.assertIn("timed out", row["error"])
+
+    def test_run_once_captures_sparse_vmm_telemetry_for_int4(self):
+        def fake_run(*args, **kwargs):
+            del args
+            telemetry_path = Path(kwargs["env"]["SUPERSONIC_MOE_ISLAND_TELEMETRY_JSON"])
+            self.assertEqual(kwargs["env"]["SUPERSONIC_VMM_MOE_ISLANDS"], "1")
+            self.assertEqual(kwargs["env"]["SUPERSONIC_MOE_ISLAND_CAP_EXPERTS"], "8")
+            telemetry_path.write_text(json.dumps({
+                "summary": {
+                    "moe_resident_bytes": 10,
+                    "kv_resident_bytes": 3,
+                    "total_vmm_resident_bytes": 13,
+                    "total_vmm_reserved_bytes": 100,
+                }
+            }))
+            Path(kwargs["env"]["SUPERSONIC_QWEN36_DUMP_LOGITS"]).write_bytes(b"\0\0")
+            Path(kwargs["env"]["SUPERSONIC_QWEN36_DUMP_FINAL_HIDDEN"]).write_bytes(b"\0\0")
+            argv = kwargs.get("args") or []
+            del argv
+            completed = subprocess.CompletedProcess(
+                args=["supersonic"],
+                returncode=0,
+                stdout="Generated ids: [7]\n",
+                stderr="",
+            )
+            return completed
+
+        old_run = verify_suite.subprocess.run
+        old_sha = verify_suite.sha256_file
+        old_stats = verify_suite.vector_stats
+        verify_suite.subprocess.run = fake_run
+        verify_suite.sha256_file = lambda path: f"sha:{Path(path).name}"
+        verify_suite.vector_stats = lambda path: {"all_zero": False}
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                args = Namespace(
+                    binary=Path("target/release/supersonic"),
+                    backend="hip",
+                    model_dir=Path("/tmp/model"),
+                    max_new_tokens=1,
+                    seed=42,
+                    timeout=3,
+                    emit_stage_timings=False,
+                    moe_island_cap_experts=8,
+                )
+                case = Case("c_vmm", "pg19", 8, "hello", [], 7)
+                row = run_once(args, case, "int4", "persistent", 0, Path(td))
+        finally:
+            verify_suite.subprocess.run = old_run
+            verify_suite.sha256_file = old_sha
+            verify_suite.vector_stats = old_stats
+
+        self.assertEqual(row["returncode"], 0)
+        self.assertEqual(row["vmm_residency"]["total_vmm_resident_bytes"], 13)
 
 
 if __name__ == "__main__":

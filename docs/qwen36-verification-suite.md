@@ -69,6 +69,17 @@ OUT=target/qwen36_verify_results.json \
 tests/gfx942/run_qwen36_verify_suite.sh
 ```
 
+To include sparse INT4 MoE island resident VRAM accounting in the result JSON,
+set an expert cap. The wrapper passes this to
+`--moe-island-cap-experts`, which enables the runner's sparse VMM telemetry
+for INT4 rows and records `vmm_total_resident_bytes_*`,
+`vmm_moe_resident_bytes_mean`, and `vmm_kv_resident_bytes_mean` in each
+summary cell:
+
+```bash
+MOE_ISLAND_CAP_EXPERTS=256 MODES=int4 tests/gfx942/run_qwen36_verify_suite.sh
+```
+
 For a real PG-19 run:
 
 ```bash
@@ -97,9 +108,10 @@ MODES=fp8,int4 FAMILIES=pg19,ruler tests/gfx942/run_qwen36_verify_long_context.s
 The output JSON has:
 
 - `summary`: per case and mode, including deterministic flags for logits,
-  hidden state, and generated ids.
+  hidden state, generated ids, timing means, and optional VMM resident VRAM
+  means/maxes when sparse INT4 telemetry is enabled.
 - `runs`: per subprocess run, including dump hashes, generated ids, vector
-  stats, timing, and stdout/stderr tails.
+  stats, timing, optional `vmm_residency`, and stdout/stderr tails.
 - `failures`: the exact gate failures that caused a non-zero exit.
 
 FP8 and INT4 now pass the repeatability gate through 2K context, so FP8 is the
