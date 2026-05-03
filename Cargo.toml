@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/core",
     "crates/gemma4",
     "crates/gpu-hal",
     "crates/kernel-ffi",
@@ -8,6 +9,7 @@ members = [
     "crates/qwen35",
     "crates/qwen35_dflash",
     "crates/qwen36_moe",
+    "crates/runtime",
     "crates/runner",
     "crates/server",
 ]

@@ -410,7 +410,6 @@ pub fn run_phi4(
     let mut debug_direct_argmax_samples: Vec<serde_json::Value> = Vec::new();
     let head_dim = config.head_dim();
     let num_heads = config.num_attention_heads;
-    let num_kv_heads = config.num_key_value_heads;
     let rms_eps = config.rms_norm_eps as f32;
 
     // Workspace sizing. Mirrors phi4.hip workspace layout exactly:

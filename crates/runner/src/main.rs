@@ -1,12 +1,15 @@
 #![recursion_limit = "512"]
 
+mod bakes;
 mod certified_kv;
 mod decode_engine;
 mod gemma4_engine;
 mod gemma4_int4_engine;
+mod gemma4_runtime;
 mod llama31_engine;
 mod oracle;
 mod phi4_engine;
+mod policy;
 mod prefill_engine;
 mod qwen35_dflash_engine;
 mod qwen36_moe_decode;
@@ -29,106 +32,18 @@ use anyhow::Result;
 use base64::Engine as _;
 use clap::Parser;
 
+use bakes::{ensure_hf_metadata_present, load_qwen35_weights};
+pub(crate) use bakes::{should_fetch_exact_bake, try_download_bake};
 use decode_engine::{DecodeEngine, DecodeStageTimings};
+use gemma4_runtime::{
+    check_gemma4_vram, load_gemma4_runtime, load_gemma4_startup, validate_gemma4_startup,
+    Gemma4Runtime, Gemma4Startup,
+};
+use policy::{q4km_like, validate_dflash_flags, validate_gfx942_policy, validate_global_flags};
 use qwen35::loader::WeightLoader;
 use qwen35::state::{LayerState, ModelState};
 use registry::{Backend, FamilyParams, GpuArch, ModelFamily, ModelVariant};
-
-/// Dispatcher over Gemma 4 runtime engines. BF16 runs through the persistent
-/// megakernel; INT4 runs through the primitive chain backed by the GPTQ bake.
-enum Gemma4Runtime {
-    Bf16(gemma4_engine::Gemma4Engine),
-    Int4(gemma4_int4_engine::Gemma4Int4Engine),
-}
-
-impl Gemma4Runtime {
-    fn prefill(&mut self, prompt_token_ids: &[u32]) -> anyhow::Result<Vec<f32>> {
-        match self {
-            Self::Bf16(e) => e.prefill(prompt_token_ids),
-            Self::Int4(e) => e.prefill(prompt_token_ids),
-        }
-    }
-
-    fn decode_step(&mut self, token: u32, pos: usize) -> anyhow::Result<Vec<f32>> {
-        match self {
-            Self::Bf16(e) => e.decode_step(token, pos),
-            Self::Int4(e) => e.decode_step(token, pos),
-        }
-    }
-
-    /// Run one decode step on every sequence in the batch. Both BF16 and
-    /// INT4 engines honour `--batch-size > 1` via their batched persistent
-    /// megakernels (BF16: `g4::persistent_decode_batch`, INT4:
-    /// `g4::persistent_decode_batch_int4`).
-    fn decode_step_batch(
-        &mut self,
-        input_tokens: &[u32],
-        positions: &[usize],
-    ) -> anyhow::Result<Vec<Vec<f32>>> {
-        match self {
-            Self::Bf16(e) => e.decode_step_batch(input_tokens, positions),
-            Self::Int4(e) => e.decode_step_batch(input_tokens, positions),
-        }
-    }
-
-    fn decode_step_batch_greedy_cuda(
-        &mut self,
-        input_tokens: &[u32],
-        positions: &[usize],
-    ) -> anyhow::Result<Option<Vec<u32>>> {
-        match self {
-            Self::Bf16(e) => {
-                if input_tokens.len() == 1 && positions.len() == 1 {
-                    Ok(
-                        e.decode_step_seq_greedy_cuda(0, input_tokens[0], positions[0])?
-                            .map(|tok| vec![tok]),
-                    )
-                } else {
-                    Ok(None)
-                }
-            }
-            Self::Int4(_) => Ok(None),
-        }
-    }
-
-    /// Replicate seq 0's K/V cache contents into every other sequence's
-    /// caches. Applies to both BF16 and INT4 engines.
-    fn replicate_seq0_kv(&mut self) -> anyhow::Result<()> {
-        match self {
-            Self::Bf16(e) => e.replicate_seq0_kv(),
-            Self::Int4(e) => e.replicate_seq0_kv(),
-        }
-    }
-
-    fn batch_size(&self) -> usize {
-        match self {
-            Self::Bf16(e) => e.batch_size(),
-            Self::Int4(e) => e.batch_size(),
-        }
-    }
-
-    fn greedy_sample(logits: &[f32]) -> u32 {
-        gemma4_engine::Gemma4Engine::greedy_sample(logits)
-    }
-}
-
-#[derive(Clone, Copy)]
-enum BackendChoice {
-    Auto,
-    Explicit(Backend),
-}
-
-impl BackendChoice {
-    fn parse(s: &str) -> Option<Self> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "auto" => Some(Self::Auto),
-            "hip" => Some(Self::Explicit(Backend::Hip)),
-            "cuda" => Some(Self::Explicit(Backend::Cuda)),
-            "metal" => Some(Self::Explicit(Backend::Metal)),
-            _ => None,
-        }
-    }
-}
+use supersonic_core::backend::{compiled_backends_display, BackendChoice, BACKEND_CHOICES};
 
 fn resolve_backend(choice: BackendChoice, ordinal: usize) -> Result<Backend> {
     match choice {
@@ -136,11 +51,7 @@ fn resolve_backend(choice: BackendChoice, ordinal: usize) -> Result<Backend> {
             if !gpu_hal::is_backend_compiled(backend) {
                 anyhow::bail!(
                     "Requested backend {backend} is not compiled into this build. Compiled backends: [{}]",
-                    gpu_hal::compiled_backends()
-                        .into_iter()
-                        .map(|b| b.to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ")
+                    compiled_backends_display()
                 );
             }
             Ok(backend)
@@ -163,11 +74,7 @@ fn resolve_backend(choice: BackendChoice, ordinal: usize) -> Result<Backend> {
             }
             anyhow::bail!(
                 "No usable GPU backend available for device {ordinal}. Compiled backends: [{}]",
-                gpu_hal::compiled_backends()
-                    .into_iter()
-                    .map(|b| b.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                compiled_backends_display()
             )
         }
     }
@@ -795,129 +702,6 @@ pub(crate) struct Cli {
     dflash_tap_layers: Option<String>,
 }
 
-fn resolve_release_source(cli: &Cli) -> Result<model_store::fetch::ReleaseSource> {
-    let raw = cli
-        .bake_release
-        .clone()
-        .or_else(|| env::var("SUPERSONIC_BAKE_RELEASE").ok());
-    match raw {
-        Some(s) if !s.is_empty() => model_store::fetch::ReleaseSource::from_override(&s)
-            .map_err(|e| anyhow::anyhow!("invalid --bake-release: {e}")),
-        _ => Ok(model_store::fetch::ReleaseSource::default_for_format_version()),
-    }
-}
-
-fn log_fetch_progress() -> impl Fn(model_store::fetch::FetchProgress) {
-    use std::cell::Cell;
-    let last_pct = Cell::new(i32::MIN);
-    let last_part = Cell::new(u32::MAX);
-    move |p| {
-        use model_store::fetch::FetchProgress::*;
-        match p {
-            ResolvingIndex => eprintln!("[fetch] resolving release index..."),
-            Downloading {
-                part,
-                total_parts,
-                bytes_done,
-                bytes_total,
-            } => {
-                let pct = if bytes_total > 0 {
-                    (bytes_done * 100 / bytes_total) as i32
-                } else {
-                    0
-                };
-                if part != last_part.get() {
-                    last_part.set(part);
-                    last_pct.set(i32::MIN);
-                    eprintln!(
-                        "[fetch] downloading part {part}/{total_parts} ({} MiB)",
-                        bytes_total / (1024 * 1024)
-                    );
-                }
-                if pct / 5 != last_pct.get() / 5 {
-                    last_pct.set(pct);
-                    eprintln!(
-                        "[fetch]   {pct}% ({} / {} MiB)",
-                        bytes_done / (1024 * 1024),
-                        bytes_total / (1024 * 1024)
-                    );
-                }
-            }
-            Verifying => eprintln!("[fetch] verifying SHA-256..."),
-            Extracting => eprintln!("[fetch] extracting tarball..."),
-            Done => eprintln!("[fetch] done"),
-        }
-    }
-}
-
-pub(crate) fn try_download_bake(
-    cli: &Cli,
-    variant: model_store::fetch::BakeVariant,
-    model_cli_name: &str,
-    target: &std::path::Path,
-) -> Result<bool> {
-    if cli.no_download {
-        return Ok(false);
-    }
-    let source = resolve_release_source(cli)?;
-    eprintln!(
-        "[fetch] downloading {model_cli_name} {variant} from {}/{}",
-        source.repo_slug, source.tag
-    );
-    let progress = log_fetch_progress();
-    let req = model_store::fetch::FetchRequest {
-        source: &source,
-        model_cli_name,
-        variant,
-        target_bake_dir: target,
-        target_model_dir: &cli.model_dir,
-        progress: &progress,
-    };
-    model_store::fetch::fetch_bake(req).map_err(|e| anyhow::anyhow!("fetch bake: {e}"))?;
-    Ok(true)
-}
-
-/// Pick the variant the CLI flags imply, using the same INT4 > FP8 > BF16
-/// priority order as the rest of the runner.
-fn cli_variant(cli: &Cli) -> model_store::fetch::BakeVariant {
-    if cli.q4km_gptq {
-        model_store::fetch::BakeVariant::Q4KmGptq
-    } else if cli.q4km {
-        model_store::fetch::BakeVariant::Q4Km
-    } else if cli.int4 {
-        model_store::fetch::BakeVariant::Int4Gptq
-    } else if cli.fp8_runtime {
-        model_store::fetch::BakeVariant::Fp8Native
-    } else {
-        model_store::fetch::BakeVariant::Bf16
-    }
-}
-
-fn variant_version_ok(
-    variant: model_store::fetch::BakeVariant,
-    bake_dir: &std::path::Path,
-) -> bool {
-    if variant == model_store::fetch::BakeVariant::Q4Km {
-        model_store::version_ok_q4km(bake_dir)
-    } else if variant == model_store::fetch::BakeVariant::Q4KmGptq {
-        model_store::version_ok_q4km_gptq(bake_dir)
-    } else {
-        model_store::version_ok(bake_dir)
-    }
-}
-
-fn should_fetch_bake(
-    download_bake: bool,
-    bootstrap_downloaded: bool,
-    local_version_ok: bool,
-) -> bool {
-    (download_bake && !bootstrap_downloaded) || !local_version_ok
-}
-
-pub(crate) fn should_fetch_exact_bake(download_bake: bool, local_version_ok: bool) -> bool {
-    download_bake || !local_version_ok
-}
-
 fn effective_fixed_vram(
     fixed_bytes: u64,
     q4km: bool,
@@ -945,31 +729,8 @@ mod tests {
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{
-        effective_fixed_vram, resolve_phi4_oracle_model_id, should_fetch_bake,
-        should_fetch_exact_bake,
-    };
+    use super::{effective_fixed_vram, resolve_phi4_oracle_model_id};
     use crate::registry::ModelVariant;
-
-    #[test]
-    fn bootstrap_download_satisfies_forced_bake_download() {
-        assert!(!should_fetch_bake(true, true, true));
-    }
-
-    #[test]
-    fn forced_bake_download_still_fetches_without_bootstrap() {
-        assert!(should_fetch_bake(true, false, true));
-    }
-
-    #[test]
-    fn invalid_local_bake_fetches_even_after_bootstrap_attempt() {
-        assert!(should_fetch_bake(false, true, false));
-    }
-
-    #[test]
-    fn forced_exact_bake_fetch_ignores_metadata_bootstrap() {
-        assert!(should_fetch_exact_bake(true, true));
-    }
 
     #[test]
     fn q4km_gptq_uses_int4_vram_estimate() {
@@ -1021,75 +782,6 @@ mod tests {
             .as_nanos();
         std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
     }
-}
-
-fn repo_root() -> Result<PathBuf> {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    manifest_dir
-        .parent()
-        .and_then(|p| p.parent())
-        .map(PathBuf::from)
-        .ok_or_else(|| anyhow::anyhow!("could not resolve repository root from CARGO_MANIFEST_DIR"))
-}
-
-fn run_q4km_baker(cli: &Cli, bake_dir: &std::path::Path) -> Result<()> {
-    let gguf_file = cli
-        .gguf_file
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("--q4km local bake requires --gguf-file"))?;
-    let script = repo_root()?.join("oracle/bake_q4km.py");
-    let python = std::env::var("PYTHON").unwrap_or_else(|_| "python3".to_string());
-    eprintln!(
-        "[bake] translating GGUF {} into native q4km bake at {}",
-        gguf_file.display(),
-        bake_dir.display()
-    );
-    let status = std::process::Command::new(&python)
-        .arg(&script)
-        .arg("--model-dir")
-        .arg(&cli.model_dir)
-        .arg("--model")
-        .arg(&cli.model)
-        .arg("--gguf-file")
-        .arg(gguf_file)
-        .arg("--out-dir")
-        .arg(bake_dir)
-        .status()
-        .map_err(|e| anyhow::anyhow!("launch q4km baker {script:?}: {e}"))?;
-    if !status.success() {
-        anyhow::bail!("q4km baker failed with status {status}");
-    }
-    Ok(())
-}
-
-/// When `--model-dir` has no `config.json`, we can't load the tokenizer or
-/// the model config — so fetch the bake first. The tarball bundles HF
-/// metadata under `hf/`, which the downloader extracts into `--model-dir`
-/// before anything else reads from it. This is the "fresh empty model dir"
-/// path that makes release-hosted bakes self-sufficient.
-fn ensure_hf_metadata_present(cli: &Cli, model_variant: &ModelVariant) -> Result<bool> {
-    if cli.no_bake || cli.no_download {
-        return Ok(false);
-    }
-    if cli.model_dir.join("config.json").exists() {
-        return Ok(false);
-    }
-    let variant = cli_variant(cli);
-    let bake_dir = variant.bake_dir(&cli.model_dir);
-    let _lock = model_store::BakeLock::acquire(&cli.model_dir)
-        .map_err(|e| anyhow::anyhow!("acquire bake lock: {e}"))?;
-    // Race: another process might have populated config between our check
-    // above and the lock acquisition.
-    if cli.model_dir.join("config.json").exists() {
-        return Ok(false);
-    }
-    let canonical_model = model_variant.to_string();
-    eprintln!(
-        "[fetch] --model-dir has no config.json; downloading bake to populate \
-         HF metadata and weights in one pass"
-    );
-    try_download_bake(cli, variant, &canonical_model, &bake_dir)?;
-    Ok(true)
 }
 
 /// RAII scope that enables Metal/HAL profiling when SUPERSONIC_METAL_PROFILE
@@ -1185,8 +877,9 @@ fn main() -> Result<()> {
     let ordinal = cli.device;
     let backend_choice = BackendChoice::parse(&cli.backend).ok_or_else(|| {
         anyhow::anyhow!(
-            "Unknown backend '{}'. Expected one of: auto, hip, cuda, metal",
-            cli.backend
+            "Unknown backend '{}'. Expected one of: {}",
+            cli.backend,
+            BACKEND_CHOICES
         )
     })?;
     let backend = resolve_backend(backend_choice, ordinal)?;
@@ -1201,55 +894,8 @@ fn main() -> Result<()> {
         )
     })?;
 
-    let q4km_like = cli.q4km || cli.q4km_gptq;
-    if cli.q4km && cli.q4km_gptq {
-        anyhow::bail!("--q4km is mutually exclusive with --q4km-gptq");
-    }
-    if q4km_like && (cli.int4 || cli.int8 || cli.fp8_runtime) {
-        anyhow::bail!(
-            "--q4km/--q4km-gptq are mutually exclusive with --int4, --int8, and --fp8-runtime"
-        );
-    }
-    if q4km_like
-        && !matches!(
-            model_variant.family(),
-            ModelFamily::Qwen35 | ModelFamily::Qwen36Moe
-        )
-    {
-        anyhow::bail!("--q4km/--q4km-gptq are currently supported only for Qwen models");
-    }
-    if q4km_like && backend != Backend::Cuda {
-        anyhow::bail!("--q4km/--q4km-gptq are currently supported only on CUDA");
-    }
-    if cli.gguf_file.is_some() && !cli.q4km {
-        anyhow::bail!("--gguf-file requires --q4km");
-    }
-    if cli.no_bake && q4km_like {
-        anyhow::bail!("--q4km/--q4km-gptq require a baked package; omit --no-bake");
-    }
-    if cli.int8 && (cli.int4 || cli.fp8_runtime) {
-        anyhow::bail!("--int8 is mutually exclusive with --int4 and --fp8-runtime");
-    }
-    if cli.int8 && model_variant.family() != ModelFamily::Llama31 {
-        anyhow::bail!("--int8 is currently supported only for llama3.1-8b on CUDA");
-    }
-    if cli.certified_kv {
-        if model_variant.family() != ModelFamily::Llama31 {
-            anyhow::bail!("--certified-kv is currently supported only for llama3.1-8b on CUDA");
-        }
-        if backend != Backend::Cuda {
-            anyhow::bail!("--certified-kv requires --backend cuda");
-        }
-        if !cli.int8 {
-            anyhow::bail!("--certified-kv requires the Llama 3.1 INT8 bake path (--int8)");
-        }
-        if cli.batch_size != 1 {
-            anyhow::bail!("--certified-kv is single-sequence at launch (--batch-size must be 1)");
-        }
-        let _ = certified_kv::CertifiedKvConfig::from_cli(&cli)?;
-    } else if cli.certified_kv_shadow_validate {
-        anyhow::bail!("--certified-kv-shadow-validate requires --certified-kv");
-    }
+    validate_global_flags(&cli, &model_variant, backend)?;
+    let q4km_like = q4km_like(&cli);
     // PR 4c step 2 wires the host-orchestrated chained-launch decode path
     // for Qwen3.6-MoE — qwen36_moe_engine::run handles both --dry-run and
     // the BF16 decode path (one token from the bake) so this early bail is
@@ -1320,73 +966,7 @@ fn main() -> Result<()> {
             }
         }
     };
-    if backend == Backend::Hip && gpu_arch == GpuArch::Gfx942 {
-        if !matches!(
-            model_variant,
-            ModelVariant::Qwen3_5_0_8B
-                | ModelVariant::Qwen3_5_2B
-                | ModelVariant::Qwen3_5_4B
-                | ModelVariant::Qwen3_5_9B
-                | ModelVariant::Qwen3_6_35B_A3B
-                | ModelVariant::Gemma4_E2B
-                | ModelVariant::Gemma4_E4B
-                | ModelVariant::Phi4_Mini
-        ) {
-            anyhow::bail!(
-                "HIP gfx942 bring-up currently validates only Qwen3.5 models up to 9B BF16/INT4/FP8-runtime/KV-FP8, Qwen3.6 35B A3B INT4/FP8-runtime, Gemma 4 E2B BF16/INT4, Gemma 4 E4B BF16, and Phi-4-mini BF16/INT4/FP8-runtime/KV-FP8"
-            );
-        }
-        let qwen35_model = matches!(
-            model_variant,
-            ModelVariant::Qwen3_5_0_8B
-                | ModelVariant::Qwen3_5_2B
-                | ModelVariant::Qwen3_5_4B
-                | ModelVariant::Qwen3_5_9B
-        );
-        if (cli.fp8_runtime
-            && !(qwen35_model
-                || matches!(
-                    model_variant,
-                    ModelVariant::Qwen3_6_35B_A3B | ModelVariant::Phi4_Mini
-                )))
-            || (cli.kv_fp8
-                && !(qwen35_model
-                    || matches!(
-                        model_variant,
-                        ModelVariant::Qwen3_6_35B_A3B | ModelVariant::Phi4_Mini
-                    )))
-            || cli.q4km
-            || cli.q4km_gptq
-        {
-            anyhow::bail!(
-                "HIP gfx942 bring-up currently validates only BF16/INT4/FP8-runtime/KV-FP8 Qwen3.5 lanes, Qwen3.6 35B A3B INT4/FP8-runtime/KV-FP8, Gemma 4 E2B BF16/INT4, Gemma 4 E4B BF16, and Phi-4-mini BF16/INT4/FP8-runtime/KV-FP8"
-            );
-        }
-        if matches!(model_variant, ModelVariant::Qwen3_6_35B_A3B)
-            && !(cli.int4 || cli.fp8_runtime || cli.kv_fp8)
-        {
-            anyhow::bail!(
-                "HIP gfx942 Qwen3.6 35B A3B bring-up currently validates only --int4, --fp8-runtime, or --kv-fp8"
-            );
-        }
-        if matches!(model_variant, ModelVariant::Gemma4_E4B) && cli.int4 {
-            anyhow::bail!("HIP gfx942 Gemma 4 E4B bring-up currently validates only BF16");
-        }
-        if cli.batch_size != 1 {
-            anyhow::bail!("HIP gfx942 bring-up currently supports only --batch-size 1");
-        }
-    }
-    if backend == Backend::Hip
-        && gpu_arch == GpuArch::Gfx1100
-        && matches!(model_variant, ModelVariant::Qwen3_6_35B_A3B)
-        && cli.fp8_runtime
-    {
-        anyhow::bail!(
-            "FP8 weights for Qwen3.6-35B-A3B require gfx942 or larger; on \
-             gfx1100 use --int4 (+ optional --kv-fp8). 35 GiB FP8 weights do \
-             not fit 24 GiB VRAM; expert streaming is tracked separately."
-        );
-    }
+    validate_gfx942_policy(&cli, &model_variant, backend, &gpu_arch)?;
 
     // Install per-arch policy so gpu_hal::alloc dispatches correctly.
     // `MemoryArchitecture` is informational (used downstream for VRAM
@@ -1412,25 +992,9 @@ fn main() -> Result<()> {
         strategy_label(arch_profile.buffer_policy.scratch),
     );
 
-    // DFlash validation runs BEFORE the family dispatch so a misconfig on
-    // non-Qwen families fails fast. The dispatch below returns for Gemma4/
-    // Phi4 — if we deferred these checks until the Qwen branch, callers
-    // would see --dflash / --dflash-draft-dir / etc. silently ignored on
-    // other model families and think speculative decoding was enabled
-    // when it wasn't.
-    if cli.dflash && !matches!(model_variant.family(), ModelFamily::Qwen35) {
-        anyhow::bail!(
-            "--dflash is only supported on Qwen3.5 family models (got family={:?}, model={model_variant}).",
-            model_variant.family(),
-        );
-    }
-    if !cli.dflash
-        && (cli.dflash_draft_dir.is_some()
-            || cli.dflash_block.is_some()
-            || cli.dflash_tap_layers.is_some())
-    {
-        anyhow::bail!("--dflash-* flags require --dflash");
-    }
+    // Run before family dispatch so DFlash flags are not silently ignored by
+    // non-Qwen branches.
+    validate_dflash_flags(&cli, &model_variant)?;
 
     match model_variant.family() {
         ModelFamily::Gemma4 => return run_gemma4(&cli, &model_variant, entry, ordinal, total_vram),
@@ -1706,126 +1270,15 @@ fn main() -> Result<()> {
 
     // Load weights (baked format with auto-bake, or raw safetensors with --no-bake)
     let t0 = Instant::now();
-    let weights = if cli.no_bake {
-        eprintln!("[weights] loading from safetensors (--no-bake)...");
-        qwen35::weights::Qwen35Weights::load(
-            &cli.model_dir,
-            &text_config,
-            ordinal,
-            params.weight_prefix,
-        )
-        .map_err(|e| anyhow::anyhow!("load weights: {e}"))?
-    } else {
-        let variant = if cli.int4 {
-            model_store::fetch::BakeVariant::Int4Gptq
-        } else if cli.fp8_runtime {
-            model_store::fetch::BakeVariant::Fp8Native
-        } else {
-            cli_variant(&cli)
-        };
-        let mut bake_dir = variant.bake_dir(&cli.model_dir);
-        let _lock = model_store::BakeLock::acquire(&cli.model_dir)
-            .map_err(|e| anyhow::anyhow!("acquire bake lock: {e}"))?;
-
-        if should_fetch_bake(
-            cli.download_bake,
-            bootstrap_downloaded,
-            variant_version_ok(variant, &bake_dir),
-        ) {
-            let local_bake_ok = matches!(
-                variant,
-                model_store::fetch::BakeVariant::Bf16 | model_store::fetch::BakeVariant::Fp8Native
-            ) || (variant == model_store::fetch::BakeVariant::Q4Km
-                && cli.gguf_file.is_some());
-            let canonical_model = model_variant.to_string();
-            match try_download_bake(&cli, variant, &canonical_model, &bake_dir) {
-                Ok(true) => {
-                    eprintln!("[fetch] installed {variant} bake at {}", bake_dir.display());
-                }
-                Ok(false) => {
-                    if !local_bake_ok {
-                        if q4km_like {
-                            anyhow::bail!(
-                                "no {variant} bake at {} and --no-download set.\n\
-                                 Rerun with --gguf-file /path/to/model.gguf to create a local raw GGML q4km bake, \
-                                 or provide/download a q4km-gptq bake.",
-                                bake_dir.display(),
-                            );
-                        } else {
-                            anyhow::bail!(
-                                "no {variant} bake at {} and --no-download set.\n\
-                                 Run on a bigger machine:\n  python oracle/bake_int4.py --model-dir {}",
-                                bake_dir.display(),
-                                cli.model_dir.display(),
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    if local_bake_ok {
-                        eprintln!("[fetch] {e}; falling back to local bake");
-                    } else {
-                        if q4km_like {
-                            anyhow::bail!(
-                                "could not obtain {variant} bake: {e}\n\n\
-                                 Rerun with --gguf-file /path/to/model.gguf to create a local raw GGML q4km bake, \
-                                 or provide/download a q4km-gptq bake.",
-                            );
-                        } else {
-                            anyhow::bail!(
-                                "could not obtain {variant} bake: {e}\n\n\
-                                 INT4 baking requires a GPTQ calibration pass in Python. \
-                                 Run on a bigger machine:\n  python oracle/bake_int4.py --model-dir {}\n\
-                                 then `python oracle/upload_bake.py --model {} --int4 --model-dir {}` to publish.",
-                                cli.model_dir.display(),
-                                cli.model,
-                                cli.model_dir.display(),
-                            );
-                        }
-                    }
-                }
-            }
-            if !variant_version_ok(variant, &bake_dir) && local_bake_ok {
-                let bake_start = Instant::now();
-                if cli.q4km {
-                    bake_dir = model_store::bake_dir_q4km(&cli.model_dir);
-                    if !model_store::version_ok_q4km(&bake_dir) {
-                        run_q4km_baker(&cli, &bake_dir)?;
-                    }
-                } else {
-                    let mode_str = if cli.fp8_runtime { " (FP8 native)" } else { "" };
-                    eprintln!(
-                        "[bake] no baked package found — baking weights{mode_str} (one-time)..."
-                    );
-                    let layer_is_full: Vec<bool> = (0..text_config.num_hidden_layers)
-                        .map(|i| text_config.is_full_attention(i))
-                        .collect();
-                    model_store::bake_qwen35(
-                        &cli.model_dir,
-                        params.weight_prefix,
-                        text_config.num_hidden_layers,
-                        &layer_is_full,
-                        cli.fp8_runtime,
-                        &|msg| eprintln!("{msg}"),
-                    )
-                    .map_err(|e| anyhow::anyhow!("bake weights: {e}"))?;
-                }
-                eprintln!("[bake] done in {:.1}s", bake_start.elapsed().as_secs_f64());
-            }
-        }
-        if variant_version_ok(variant, &bake_dir) {
-            eprintln!("[weights] found baked package at {}", bake_dir.display());
-        }
-        let store = model_store::BakedStore::open(&bake_dir)
-            .map_err(|e| anyhow::anyhow!("open baked store: {e}"))?;
-        qwen35::weights::Qwen35Weights::load_baked(
-            &store,
-            &text_config,
-            ordinal,
-            params.weight_prefix,
-        )
-        .map_err(|e| anyhow::anyhow!("load baked weights: {e}"))?
-    };
+    let weights = load_qwen35_weights(
+        &cli,
+        &model_variant,
+        &text_config,
+        ordinal,
+        params.weight_prefix,
+        bootstrap_downloaded,
+        q4km_like,
+    )?;
     if weights.is_fp8 {
         eprintln!(
             "[weights] FP8 runtime dequant active (block_size={})",
@@ -3100,250 +2553,30 @@ fn run_gemma4(
         FamilyParams::Llama31(_) => unreachable!("dispatch filtered to Gemma4"),
     };
 
-    if entry.backend == Backend::Cuda {
-        if !matches!(model_variant, ModelVariant::Gemma4_E2B) {
-            anyhow::bail!("Gemma 4 CUDA v1 supports only --model gemma4-e2b on sm86");
-        }
-        if cli.int4 {
-            anyhow::bail!("Gemma 4 CUDA v1 supports BF16 only; --int4 is not wired");
-        }
-        if cli.fp8_runtime {
-            anyhow::bail!("Gemma 4 CUDA v1 supports BF16 only; --fp8-runtime is not wired");
-        }
-        if cli.kv_fp8 {
-            anyhow::bail!("Gemma 4 CUDA v1 supports BF16 KV only; --kv-fp8 is not wired");
-        }
-        if cli.batch_size != 1 {
-            anyhow::bail!("Gemma 4 CUDA v1 supports only --batch-size=1");
-        }
-    }
-
-    if cli.fp8_runtime && cli.int4 {
-        anyhow::bail!(
-            "Gemma 4 --fp8-runtime cannot combine with --int4 (the INT4 kernel \
-             does not yet route the FP8 weight-dequant path)"
-        );
-    }
-    if cli.fp8_runtime && cli.batch_size != 1 {
-        anyhow::bail!(
-            "Gemma 4 --fp8-runtime currently requires --batch-size=1 (FP8 weight \
-             dequant is wired into the single-batch persistent decode kernel only)"
-        );
-    }
-    if cli.kv_fp8 && cli.int4 {
-        anyhow::bail!(
-            "Gemma 4 --kv-fp8 cannot combine with --int4 yet (kernel FP8 KV \
-             path lives in the BF16 single-batch persistent decode kernel; \
-             INT4 + FP8-KV would need the INT4 kernel updated too)"
-        );
-    }
-    if cli.kv_fp8 && cli.batch_size != 1 {
-        anyhow::bail!(
-            "Gemma 4 --kv-fp8 currently requires --batch-size=1 (FP8 KV path \
-             only wired into the single-batch persistent decode kernel)"
-        );
-    }
-    if cli.batch_size < 1 || cli.batch_size > kernel_ffi::MAX_BATCH_SIZE {
-        anyhow::bail!("--batch-size must be 1..{}", kernel_ffi::MAX_BATCH_SIZE);
-    }
-    if cli.oracle_prefill || cli.gpu_validate {
-        anyhow::bail!("Gemma 4 does not yet support --oracle-prefill / --gpu-validate");
-    }
-    if cli.prefill_chunk_size != 0 {
-        anyhow::bail!(
-            "Gemma 4 does not yet support --prefill-chunk-size (single-shot prefill only)"
-        );
-    }
-    if cli.no_bake && !cli.int4 {
-        eprintln!(
-            "[gemma4] note: --no-bake is implied for BF16 (Gemma 4 has no BF16 bake format). \
-             Loading directly from safetensors."
-        );
-    }
+    validate_gemma4_startup(cli, model_variant, entry.backend)?;
 
     // Fetch first if --model-dir is pristine so HF metadata lands before config load.
     let bootstrap_downloaded = ensure_hf_metadata_present(cli, model_variant)?;
 
-    let cfg = gemma4::config::load_config(&cli.model_dir)
-        .map_err(|e| anyhow::anyhow!("loading Gemma 4 config.json: {e}"))?;
-    let t = &cfg.text_config;
-    eprintln!(
-        "[gemma4] variant={model_variant} weight_prefix={} kv_chunk={}",
-        params.weight_prefix, params.kv_chunk_size
-    );
-    eprintln!(
-        "[gemma4] hidden={} layers={} vocab={} heads={}/{} head_dim={}/{} window={} kv_shared_layers={} softcap={:?} ple_dim={} tied_lm_head={}",
-        t.hidden_size,
-        t.num_hidden_layers,
-        t.vocab_size,
-        t.num_attention_heads,
-        t.num_key_value_heads,
-        t.head_dim,
-        t.global_head_dim,
-        t.sliding_window,
-        t.num_kv_shared_layers,
-        t.final_logit_softcapping,
-        t.hidden_size_per_layer_input,
-        cfg.tie_word_embeddings || t.tie_word_embeddings,
-    );
-
-    let tokenizer_path = cli.model_dir.join("tokenizer.json");
-    let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
-        .map_err(|e| anyhow::anyhow!("load tokenizer: {e}"))?;
-    let encoding = tokenizer
-        .encode(cli.prompt.as_str(), !cli.prompt_no_special_tokens)
-        .map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
-    let prompt_ids: Vec<u32> = encoding.get_ids().to_vec();
-    eprintln!("[tokenizer] prompt_tokens={}", prompt_ids.len());
-    if prompt_ids.is_empty() {
-        anyhow::bail!("empty prompt after tokenization");
-    }
-
-    let context_tokens = cli
-        .context_size
-        .unwrap_or(prompt_ids.len() + cli.max_new_tokens);
-    if context_tokens < prompt_ids.len() + cli.max_new_tokens {
-        anyhow::bail!(
-            "--context-size {context_tokens} < prompt_tokens {} + max_new_tokens {}",
-            prompt_ids.len(),
-            cli.max_new_tokens,
-        );
-    }
-
-    // Per-token KV element count (across owned layers; shared layers alias).
-    let mut kv_elems_per_token: u64 = 0;
-    let mut owned_layers: u64 = 0;
-    for l in 0..t.num_hidden_layers {
-        if t.kv_source_layer(l).is_none() {
-            let kind = t
-                .attn_kind(l)
-                .ok_or_else(|| anyhow::anyhow!("layer {l}: no attention kind"))?;
-            let hd = t.head_dim_for(kind);
-            // 2× because we count both K and V.
-            kv_elems_per_token += (t.num_key_value_heads * hd * 2) as u64;
-            owned_layers += 1;
-        }
-    }
-    // Element width: 2 B BF16, 1 B FP8. Under --kv-fp8 we also allocate
-    // F32 scale buffers `[num_kv_heads, max_t]` per (K, V) per owned layer
-    // — small but non-zero.
-    let kv_dtype_bytes: u64 = if cli.kv_fp8 { 1 } else { 2 };
-    let scale_bytes_per_seq: u64 = if cli.kv_fp8 {
-        // 2 (K + V) * num_kv_heads * max_t * 4 B per owned layer.
-        2 * (t.num_key_value_heads as u64) * (context_tokens as u64) * 4 * owned_layers
-    } else {
-        0
-    };
-    // Both BF16 and INT4 engines allocate `batch_size` parallel KV cache sets
-    // (one per decode sequence); scale accordingly so `--batch-size > 1` can't
-    // pass the preflight check and then OOM during engine load.
-    let batch_size_u64 = cli.batch_size as u64;
-    let kv_bytes_per_seq =
-        kv_elems_per_token * context_tokens as u64 * kv_dtype_bytes + scale_bytes_per_seq;
-    let kv_bytes = kv_bytes_per_seq * batch_size_u64;
-    // The registry's `fixed_bytes` budget is sized for BF16 weights + scratch.
-    // Under `--int4` the weight footprint drops to ~1/4 BF16; under
-    // `--fp8-runtime` to ~1/2 (plus a tiny scale_inv overhead). Mirror the
-    // 0.37× / 0.6× scaling used in phi4_engine.rs so memory-constrained cards
-    // can actually run these flags.
-    let quant_fixed_bytes: u64 = if cli.int4 {
-        (entry.vram.fixed_bytes as f64 * 0.37) as u64
-    } else if cli.fp8_runtime {
-        (entry.vram.fixed_bytes as f64 * 0.6) as u64
-    } else {
-        entry.vram.fixed_bytes
-    };
-    let estimated_vram =
-        ((quant_fixed_bytes + kv_bytes) as f64 * entry.vram.overhead_factor) as u64;
-    let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
-    let weight_label = if cli.int4 {
-        "weights+scratch (INT4-scaled)"
-    } else if cli.fp8_runtime {
-        "weights+scratch (FP8-scaled)"
-    } else {
-        "weights+scratch"
-    };
-    eprintln!(
-        "[vram] estimated={:.2}GiB ({}={:.2}GiB + kv_cache={:.2}GiB for {}tok x B={}) available={:.1}GiB",
-        gib(estimated_vram),
-        weight_label,
-        gib(quant_fixed_bytes),
-        gib(kv_bytes),
+    let Gemma4Startup {
+        cfg,
+        tokenizer,
+        prompt_ids,
         context_tokens,
-        cli.batch_size,
-        gib(total_vram),
-    );
-    if estimated_vram > total_vram {
-        let reduce_hint = if cli.batch_size > 1 {
-            "Reduce --context-size, --max-new-tokens, or --batch-size."
-        } else {
-            "Reduce --context-size or --max-new-tokens."
-        };
-        anyhow::bail!(
-            "Insufficient VRAM for {context_tokens}-token context at batch_size={}: need ~{:.2}GiB, GPU has {:.1}GiB. {reduce_hint}",
-            cli.batch_size,
-            gib(estimated_vram),
-            gib(total_vram),
-        );
-    }
+    } = load_gemma4_startup(cli, model_variant, params)?;
+    let t = &cfg.text_config;
+
+    check_gemma4_vram(cli, t, &entry.vram, context_tokens, total_vram)?;
 
     let t0 = Instant::now();
-    let mut engine: Gemma4Runtime = if cli.int4 {
-        let target = gemma4_int4_engine::int4_bake_dir(&cli.model_dir);
-        let _lock = model_store::BakeLock::acquire(&cli.model_dir)
-            .map_err(|e| anyhow::anyhow!("acquire bake lock: {e}"))?;
-        if should_fetch_bake(
-            cli.download_bake,
-            bootstrap_downloaded,
-            gemma4_int4_engine::int4_bake_ok(&cli.model_dir),
-        ) {
-            let canonical_model = model_variant.to_string();
-            match try_download_bake(
-                cli,
-                model_store::fetch::BakeVariant::Int4Gptq,
-                &canonical_model,
-                &target,
-            ) {
-                Ok(true) => eprintln!(
-                    "[fetch] installed Gemma 4 INT4 bake at {}",
-                    target.display()
-                ),
-                Ok(false) => {
-                    anyhow::bail!(
-                        "No INT4 bake at {} and --no-download set.\nRun on a bigger machine:\n  python oracle/bake_int4_gemma4.py --model-dir {}",
-                        target.display(),
-                        cli.model_dir.display(),
-                    );
-                }
-                Err(e) => {
-                    anyhow::bail!(
-                        "could not obtain Gemma 4 INT4 bake: {e}\n\nRun on a bigger machine:\n  python oracle/bake_int4_gemma4.py --model-dir {}\nthen `python oracle/upload_bake.py --model {} --int4 --model-dir {}` to publish.",
-                        cli.model_dir.display(),
-                        cli.model,
-                        cli.model_dir.display(),
-                    );
-                }
-            }
-        }
-        eprintln!("[gemma4] loading INT4 GPTQ bake (primitive-chain decode)");
-        Gemma4Runtime::Int4(gemma4_int4_engine::Gemma4Int4Engine::load_with_batch(
-            &cli.model_dir,
-            params.weight_prefix,
-            context_tokens,
-            ordinal,
-            cli.batch_size,
-        )?)
-    } else {
-        Gemma4Runtime::Bf16(gemma4_engine::Gemma4Engine::load_with_quant(
-            &cli.model_dir,
-            params.weight_prefix,
-            context_tokens,
-            ordinal,
-            cli.batch_size,
-            cli.kv_fp8,
-            cli.fp8_runtime,
-        )?)
-    };
+    let mut engine = load_gemma4_runtime(
+        cli,
+        model_variant,
+        params,
+        context_tokens,
+        ordinal,
+        bootstrap_downloaded,
+    )?;
     eprintln!("[weights] loaded in {:.0}ms", t0.elapsed().as_millis());
 
     let oracle_output = if cli.validate {
@@ -5027,7 +4260,6 @@ fn trace_persistent_linear_layer(
         )
     };
     let isolated_tail_windows = {
-        let final_layer_idx = text_config.num_hidden_layers.saturating_sub(1);
         let starts = [4usize, 5, 6, 7, 8];
         let mut samples = Vec::new();
         for &start_layer in &starts {

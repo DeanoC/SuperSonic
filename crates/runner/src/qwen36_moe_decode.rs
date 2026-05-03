@@ -23,6 +23,7 @@
 //! engine's real-decode path (weights from the bake) call into the same
 //! [`run_chained_decode`] core — the only difference is how the
 //! [`LayerBuffers`] vec gets populated.
+#![allow(dead_code)]
 
 use std::ffi::c_void;
 use std::ptr;

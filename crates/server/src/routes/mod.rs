@@ -15,6 +15,7 @@ use crate::state::ServerState;
 pub mod chat;
 pub mod completions;
 pub mod models;
+mod sse;
 
 pub fn router(state: Arc<ServerState>) -> Router {
     Router::new()

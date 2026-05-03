@@ -46,6 +46,7 @@
 //! [`refresh_linear_attn_state`] reuses the snapshot's buffers without
 //! re-allocating; [`save_linear_attn_state`] does both alloc and copy
 //! in one call (convenience for the first save).
+#![allow(dead_code)]
 
 use anyhow::{Context, Result};
 use gpu_hal::{copy_d2d, GpuBuffer};

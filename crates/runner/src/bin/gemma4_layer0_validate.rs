@@ -629,7 +629,7 @@ fn main() -> Result<()> {
             bf16_bytes_to_f32(bytes)[0]
         };
 
-        let mut h_in = upload_bf16(&[hidden_size], &h_running_host)?;
+        let h_in = upload_bf16(&[hidden_size], &h_running_host)?;
 
         println!(
             "  [layer{}] kind={:?} head_dim={head_dim} imm={intermediate_size} rope_theta={rope_theta} partial_rotary_factor={partial_rotary_factor} layer_scalar={layer_scalar_value:.4} shared_kv={} kv_slot={kv_slot}",

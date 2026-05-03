@@ -1736,6 +1736,7 @@ dependencies = [
  "safetensors",
  "serde",
  "serde_json",
+ "supersonic-core",
  "tempfile",
  "tokenizers",
 ]
@@ -1917,20 +1918,10 @@ dependencies = [
  "axum",
  "clap",
  "futures",
- "gemma4",
- "gpu-hal",
- "kernel-ffi",
- "minijinja",
- "minijinja-contrib",
- "model-store",
- "qwen35",
- "rand 0.8.6",
- "rand_chacha 0.3.1",
  "reqwest",
- "runner",
  "serde",
  "serde_json",
- "tokenizers",
+ "supersonic-runtime",
  "tokio",
  "tokio-stream",
  "tower",
@@ -2032,6 +2023,36 @@ name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
+
+[[package]]
+name = "supersonic-core"
+version = "0.1.0"
+dependencies = [
+ "gpu-hal",
+]
+
+[[package]]
+name = "supersonic-runtime"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "gemma4",
+ "gpu-hal",
+ "kernel-ffi",
+ "minijinja",
+ "minijinja-contrib",
+ "model-store",
+ "qwen35",
+ "rand 0.8.6",
+ "rand_chacha 0.3.1",
+ "runner",
+ "serde",
+ "serde_json",
+ "supersonic-core",
+ "tokenizers",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "syn"
