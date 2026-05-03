@@ -101,7 +101,8 @@ Current scope:
   fully resident virtual expert slabs to sparse router-prefetched islands with
   at most `N` experts' two routed projections tracked resident at once. Sparse
   telemetry records ordered router rank summaries, including per-rank resident
-  hits before demand loading, previous-token repeats, and average router weight.
+  hits before demand loading, previous-token repeats, previous-rank to
+  current-rank repeat transitions, and average router weight.
 - `SUPERSONIC_MOE_ISLAND_PREFETCH=previous-token` enables experimental
   previous-token routed-expert lookahead for sparse MoE islands. It preloads
   each layer's previous top-k before that layer's router runs. Set
@@ -112,6 +113,10 @@ Current scope:
   the missing pages, the runtime records `prefetch_skipped` counters and leaves
   resident demand pages untouched. This is a measurement hook for future
   overlapped prefetch work, not a default path.
+- `SUPERSONIC_MOE_ISLAND_PREFETCH=previous-token-resident` is the conservative
+  variant: it only refreshes the previous-token expert pair when both routed
+  projections are already resident. It never uploads missing pages, so it can
+  measure LRU refresh value without changing residency admission.
 - `SUPERSONIC_VMM_KV=0` disables the Qwen3.5 and Qwen3.6 KV integrations.
 - `SUPERSONIC_VMM_KV=1` requests KV VMM and logs if the backend cannot support
   it. HIP may auto-enable when unset; CUDA requires this explicit opt-in.

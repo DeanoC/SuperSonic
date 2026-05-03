@@ -11,6 +11,7 @@ use crate::qwen36_moe_residency::{MoeExpertKey, MoeExpertProjection, MoeExpertRe
 pub(crate) enum MoeIslandPrefetchMode {
     Disabled,
     PreviousToken,
+    PreviousTokenResidentOnly,
 }
 
 impl MoeIslandPrefetchMode {
@@ -18,21 +19,41 @@ impl MoeIslandPrefetchMode {
         match self {
             Self::Disabled => "disabled",
             Self::PreviousToken => "previous-token",
+            Self::PreviousTokenResidentOnly => "previous-token-resident",
         }
     }
 
+    pub(crate) fn uses_previous_token_routes(self) -> bool {
+        matches!(self, Self::PreviousToken | Self::PreviousTokenResidentOnly)
+    }
+
+    pub(crate) fn resident_only(self) -> bool {
+        matches!(self, Self::PreviousTokenResidentOnly)
+    }
+
     pub(crate) fn from_env() -> Result<Self> {
-        match std::env::var("SUPERSONIC_MOE_ISLAND_PREFETCH")
-            .ok()
-            .as_deref()
-        {
+        Self::from_env_value(
+            std::env::var("SUPERSONIC_MOE_ISLAND_PREFETCH")
+                .ok()
+                .as_deref(),
+        )
+    }
+
+    pub(crate) fn from_env_value(raw: Option<&str>) -> Result<Self> {
+        match raw {
             None | Some("0") | Some("off") | Some("disabled") => Ok(Self::Disabled),
             Some("previous-token") | Some("previous_token") | Some("prev-token") => {
                 Ok(Self::PreviousToken)
             }
+            Some("previous-token-resident")
+            | Some("previous_token_resident")
+            | Some("prev-token-resident")
+            | Some("resident-previous-token") => Ok(Self::PreviousTokenResidentOnly),
             Some(other) => anyhow::bail!(
                 "SUPERSONIC_MOE_ISLAND_PREFETCH must be unset, 0, off, disabled, \
-                 previous-token, previous_token, or prev-token; got {other:?}"
+                 previous-token, previous_token, prev-token, previous-token-resident, \
+                 previous_token_resident, prev-token-resident, or resident-previous-token; \
+                 got {other:?}"
             ),
         }
     }
@@ -79,10 +100,11 @@ pub(crate) struct MoeSparseTelemetry {
 
 #[derive(Debug, Clone)]
 pub(crate) struct MoeRouteTelemetry {
-    observations_by_rank: Vec<u64>,
-    resident_before_by_rank: Vec<u64>,
-    repeated_previous_by_rank: Vec<u64>,
-    weight_sum_by_rank: Vec<f64>,
+    pub(crate) observations_by_rank: Vec<u64>,
+    pub(crate) resident_before_by_rank: Vec<u64>,
+    pub(crate) repeated_previous_by_rank: Vec<u64>,
+    pub(crate) repeated_previous_rank_by_current_rank: Vec<Vec<u64>>,
+    pub(crate) weight_sum_by_rank: Vec<f64>,
 }
 
 impl MoeRouteTelemetry {
@@ -91,7 +113,34 @@ impl MoeRouteTelemetry {
             observations_by_rank: vec![0; top_k],
             resident_before_by_rank: vec![0; top_k],
             repeated_previous_by_rank: vec![0; top_k],
+            repeated_previous_rank_by_current_rank: vec![vec![0; top_k]; top_k],
             weight_sum_by_rank: vec![0.0; top_k],
+        }
+    }
+
+    pub(crate) fn record_route_observation(
+        &mut self,
+        route: &ExpertRoute,
+        previous_routes: &[usize],
+    ) {
+        if route.rank >= self.observations_by_rank.len() {
+            return;
+        }
+        self.observations_by_rank[route.rank] += 1;
+        self.weight_sum_by_rank[route.rank] += route.weight as f64;
+        if let Some(previous_rank) = previous_routes
+            .iter()
+            .position(|&expert_idx| expert_idx == route.expert_idx)
+        {
+            self.repeated_previous_by_rank[route.rank] += 1;
+            if let Some(row) = self
+                .repeated_previous_rank_by_current_rank
+                .get_mut(route.rank)
+            {
+                if let Some(cell) = row.get_mut(previous_rank) {
+                    *cell += 1;
+                }
+            }
         }
     }
 
@@ -106,11 +155,7 @@ impl MoeRouteTelemetry {
             if route.rank >= self.observations_by_rank.len() {
                 continue;
             }
-            self.observations_by_rank[route.rank] += 1;
-            self.weight_sum_by_rank[route.rank] += route.weight as f64;
-            if previous_routes.contains(&route.expert_idx) {
-                self.repeated_previous_by_rank[route.rank] += 1;
-            }
+            self.record_route_observation(route, previous_routes);
             let gate_up = MoeExpertKey {
                 layer_idx,
                 expert_idx: route.expert_idx,
@@ -127,7 +172,7 @@ impl MoeRouteTelemetry {
         }
     }
 
-    fn to_json(&self) -> serde_json::Value {
+    pub(crate) fn to_json(&self) -> serde_json::Value {
         let avg_weight_by_rank: Vec<f64> = self
             .weight_sum_by_rank
             .iter()
@@ -144,6 +189,7 @@ impl MoeRouteTelemetry {
             "observations_by_rank": &self.observations_by_rank,
             "resident_before_by_rank": &self.resident_before_by_rank,
             "repeated_previous_by_rank": &self.repeated_previous_by_rank,
+            "repeated_previous_rank_by_current_rank": &self.repeated_previous_rank_by_current_rank,
             "avg_weight_by_rank": avg_weight_by_rank,
         })
     }

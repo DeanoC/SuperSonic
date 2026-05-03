@@ -1101,27 +1101,29 @@ fn moe_island_prefetch_ranks_from_env_value(
             if raw.is_some() {
                 anyhow::bail!(
                     "SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS requires \
-                     SUPERSONIC_MOE_ISLAND_PREFETCH=previous-token"
+                     SUPERSONIC_MOE_ISLAND_PREFETCH=previous-token or previous-token-resident"
                 );
             }
             Ok(0)
         }
-        MoeIslandPrefetchMode::PreviousToken => match raw {
-            None | Some("all") => Ok(top_k),
-            Some(value) => {
-                let ranks = value.parse::<usize>().with_context(|| {
-                    format!(
+        MoeIslandPrefetchMode::PreviousToken | MoeIslandPrefetchMode::PreviousTokenResidentOnly => {
+            match raw {
+                None | Some("all") => Ok(top_k),
+                Some(value) => {
+                    let ranks = value.parse::<usize>().with_context(|| {
+                        format!(
                         "parse SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS={value:?} as positive integer"
                     )
-                })?;
-                if ranks == 0 || ranks > top_k {
-                    anyhow::bail!(
+                    })?;
+                    if ranks == 0 || ranks > top_k {
+                        anyhow::bail!(
                         "SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS must be in 1..={top_k}; got {ranks}"
                     );
+                    }
+                    Ok(ranks)
                 }
-                Ok(ranks)
             }
-        },
+        }
     }
 }
 
@@ -2197,10 +2199,11 @@ fn decode_text(
                  (router prefetch + FFN resume per layer)"
             );
         }
-        if moe_prefetch_mode == MoeIslandPrefetchMode::PreviousToken {
+        if moe_prefetch_mode.uses_previous_token_routes() {
             println!(
-                "  [vmm] sparse MoE previous-token lookahead prefetch active \
+                "  [vmm] sparse MoE {} lookahead prefetch active \
                  (ranks={moe_prefetch_ranks}/{})",
+                moe_prefetch_mode.as_str(),
                 geom.top_k
             );
         }
@@ -2596,8 +2599,8 @@ fn decode_text(
         let moe_telemetry_before = _moe_expert_residency
             .as_ref()
             .map(MoeSparseTelemetrySnapshot::capture);
-        let track_moe_routes = moe_prefetch_mode == MoeIslandPrefetchMode::PreviousToken
-            || moe_route_telemetry.is_some();
+        let track_moe_routes =
+            moe_prefetch_mode.uses_previous_token_routes() || moe_route_telemetry.is_some();
         let mut next_moe_topk_by_layer = if track_moe_routes {
             previous_moe_topk_by_layer.clone()
         } else {
@@ -2617,7 +2620,7 @@ fn decode_text(
                  -> Result<()> {
                     match phase {
                         ExpertPrefetchPhase::Lookahead
-                            if moe_prefetch_mode == MoeIslandPrefetchMode::PreviousToken =>
+                            if moe_prefetch_mode.uses_previous_token_routes() =>
                         {
                             for &expert_idx in previous_moe_topk_by_layer
                                 .get(layer_idx)
@@ -2636,6 +2639,11 @@ fn decode_text(
                                     expert_idx,
                                     projection: MoeExpertProjection::Down,
                                 };
+                                if moe_prefetch_mode.resident_only()
+                                    && !(manager.is_resident(gate_up) && manager.is_resident(down))
+                                {
+                                    continue;
+                                }
                                 manager.prefetch_resident(&store, gate_up)?;
                                 manager.prefetch_resident(&store, down)?;
                             }
@@ -2710,7 +2718,7 @@ fn decode_text(
                  -> Result<()> {
                     match phase {
                         ExpertPrefetchPhase::Lookahead
-                            if moe_prefetch_mode == MoeIslandPrefetchMode::PreviousToken =>
+                            if moe_prefetch_mode.uses_previous_token_routes() =>
                         {
                             for &expert_idx in previous_moe_topk_by_layer
                                 .get(layer_idx)
@@ -2729,6 +2737,11 @@ fn decode_text(
                                     expert_idx,
                                     projection: MoeExpertProjection::Down,
                                 };
+                                if moe_prefetch_mode.resident_only()
+                                    && !(manager.is_resident(gate_up) && manager.is_resident(down))
+                                {
+                                    continue;
+                                }
                                 manager.prefetch_resident(&store, gate_up)?;
                                 manager.prefetch_resident(&store, down)?;
                             }
@@ -3600,8 +3613,8 @@ fn decode_first_token(model_dir: &Path, report: &DryRunReport, kv_fp8: bool) -> 
 #[cfg(test)]
 mod tests {
     use super::{
-        moe_island_prefetch_ranks_from_env_value, qwen36_kv_vmm_mode_from_env_value,
-        MoeIslandPrefetchMode, Qwen36KvVmmMode,
+        moe_island_prefetch_ranks_from_env_value, qwen36_kv_vmm_mode_from_env_value, ExpertRoute,
+        MoeIslandPrefetchMode, MoeRouteTelemetry, Qwen36KvVmmMode,
     };
     use gpu_hal::Backend;
 
@@ -3635,6 +3648,43 @@ mod tests {
     }
 
     #[test]
+    fn moe_prefetch_mode_env_accepts_disabled_and_previous_token_aliases() {
+        assert_eq!(
+            MoeIslandPrefetchMode::from_env_value(None).unwrap(),
+            MoeIslandPrefetchMode::Disabled
+        );
+        assert_eq!(
+            MoeIslandPrefetchMode::from_env_value(Some("disabled")).unwrap(),
+            MoeIslandPrefetchMode::Disabled
+        );
+        assert_eq!(
+            MoeIslandPrefetchMode::from_env_value(Some("previous-token")).unwrap(),
+            MoeIslandPrefetchMode::PreviousToken
+        );
+        assert_eq!(
+            MoeIslandPrefetchMode::from_env_value(Some("prev-token")).unwrap(),
+            MoeIslandPrefetchMode::PreviousToken
+        );
+    }
+
+    #[test]
+    fn moe_prefetch_mode_env_accepts_resident_only_aliases() {
+        assert_eq!(
+            MoeIslandPrefetchMode::from_env_value(Some("previous-token-resident")).unwrap(),
+            MoeIslandPrefetchMode::PreviousTokenResidentOnly
+        );
+        assert_eq!(
+            MoeIslandPrefetchMode::from_env_value(Some("previous_token_resident")).unwrap(),
+            MoeIslandPrefetchMode::PreviousTokenResidentOnly
+        );
+        assert_eq!(
+            MoeIslandPrefetchMode::from_env_value(Some("resident-previous-token")).unwrap(),
+            MoeIslandPrefetchMode::PreviousTokenResidentOnly
+        );
+        assert!(MoeIslandPrefetchMode::from_env_value(Some("resident")).is_err());
+    }
+
+    #[test]
     fn moe_prefetch_ranks_default_to_all_previous_token_routes() {
         assert_eq!(
             moe_island_prefetch_ranks_from_env_value(
@@ -3648,7 +3698,7 @@ mod tests {
         assert_eq!(
             moe_island_prefetch_ranks_from_env_value(
                 Some("all"),
-                MoeIslandPrefetchMode::PreviousToken,
+                MoeIslandPrefetchMode::PreviousTokenResidentOnly,
                 8,
             )
             .unwrap(),
@@ -3670,7 +3720,7 @@ mod tests {
         assert_eq!(
             moe_island_prefetch_ranks_from_env_value(
                 Some("4"),
-                MoeIslandPrefetchMode::PreviousToken,
+                MoeIslandPrefetchMode::PreviousTokenResidentOnly,
                 8,
             )
             .unwrap(),
@@ -3703,5 +3753,49 @@ mod tests {
             8,
         )
         .is_err());
+    }
+
+    #[test]
+    fn moe_route_telemetry_records_previous_rank_transition_matrix() {
+        let mut telemetry = MoeRouteTelemetry::new(3);
+        let previous_routes = [7, 11, 13];
+        telemetry.record_route_observation(
+            &ExpertRoute {
+                rank: 0,
+                expert_idx: 11,
+                weight: 0.5,
+            },
+            &previous_routes,
+        );
+        telemetry.record_route_observation(
+            &ExpertRoute {
+                rank: 1,
+                expert_idx: 7,
+                weight: 0.25,
+            },
+            &previous_routes,
+        );
+        telemetry.record_route_observation(
+            &ExpertRoute {
+                rank: 2,
+                expert_idx: 99,
+                weight: 0.125,
+            },
+            &previous_routes,
+        );
+
+        assert_eq!(telemetry.observations_by_rank, vec![1, 1, 1]);
+        assert_eq!(telemetry.repeated_previous_by_rank, vec![1, 1, 0]);
+        assert_eq!(
+            telemetry.repeated_previous_rank_by_current_rank,
+            vec![vec![0, 1, 0], vec![1, 0, 0], vec![0, 0, 0]]
+        );
+        assert_eq!(
+            telemetry
+                .to_json()
+                .get("repeated_previous_rank_by_current_rank")
+                .unwrap(),
+            &serde_json::json!([[0, 1, 0], [1, 0, 0], [0, 0, 0]])
+        );
     }
 }
