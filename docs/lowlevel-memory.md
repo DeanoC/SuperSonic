@@ -50,8 +50,21 @@ Current scope:
   slices, then runs the normal stage-5 FFN launch against the stable virtual
   slab pointers. The cap is expressed in experts and reserves `2*N` logical
   resident slices because each expert needs both fused projections. Sparse
-  islands currently disable the persistent megakernel for that run; persistent
-  router prefetch needs a future split or in-kernel residency protocol.
+  islands copy the full VMM backing page for any touched expert slice, so every
+  expert sharing that resident page contains real bake data rather than zero
+  fill. Sparse islands currently disable the persistent megakernel for that
+  run; persistent router prefetch needs a future split or in-kernel residency
+  protocol.
+- `SUPERSONIC_MOE_ISLAND_TELEMETRY_JSON=/path/report.json` records sparse
+  MoE residency telemetry for Qwen3.6-MoE runs: per-forward hits, misses,
+  uploads, evictions, resident slices, resident physical bytes, plus summary
+  peaks. This is intended for tuning `SUPERSONIC_MOE_ISLAND_CAP_EXPERTS`
+  against real prompts instead of relying on one-token smoke numbers.
+- On the HIP/gfx1100 validation machine, sparse MoE caps through 312 experts
+  passed the two-token Qwen3.6-MoE smoke, while caps around 316+ reproduced a
+  HIP page-not-present fault after retaining roughly a full token's routed
+  expert working set. Keep validation caps below that high-water mark until the
+  ROCm VMM mapping-limit behavior is isolated further.
 - `SUPERSONIC_VMM_WEIGHT_PROBE=1` makes Qwen3.6-MoE dry-run load
   `lm_head.weight` into a virtual `Weights` allocation when an INT4 bake is
   present.
@@ -106,6 +119,14 @@ on CUDA devices with `SUPERSONIC_VMM_KV=1`:
   `SUPERSONIC_BACKENDS=hip SUPERSONIC_VMM_MOE_ISLANDS=1 SUPERSONIC_MOE_ISLAND_CAP_EXPERTS=8 cargo run --release --bin supersonic -- --backend hip --model qwen3.6-35b-a3b --model-dir /mnt/data/models/Qwen3.6-35B-A3B --int4 --prompt "Hello" --max-new-tokens 1`
   generated `[11]` and reported `resident=32.00MiB` for the 15 GiB routed
   expert VA reservation after the run.
+- Qwen3.6-MoE sparse-vs-dense VMM e2e gate:
+  `SUPERSONIC_BACKENDS=hip SUPERSONIC_TEST_QWEN36_MOE_MODEL_DIR=/mnt/data/models/Qwen3.6-35B-A3B cargo test --release -p runner --test qwen36_moe_sparse_vmm_smoke -- --ignored --nocapture`
+  compares dense virtual expert slabs with sparse router-prefetched slabs over
+  multiple generated tokens and validates the telemetry JSON cap/peak fields.
+  The default test cap is 256 experts; override with
+  `SUPERSONIC_TEST_QWEN36_MOE_SPARSE_CAP_EXPERTS=8` for the smallest
+  top-k-sized residency window, or with a larger value when investigating HIP
+  live-mapping limits.
 - Qwen3.5 virtual KV e2e with eviction and restore-to-VMM:
   `SUPERSONIC_VMM_KV=1 SUPERSONIC_VMM_KV_EVICT_AFTER_PREFILL=1 SUPERSONIC_VMM_KV_RESTORE_TO_VMM=1 ... --validate`
   passed and kept stable VMM pointers through decode.

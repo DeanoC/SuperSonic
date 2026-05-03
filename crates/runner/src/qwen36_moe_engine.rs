@@ -1065,6 +1065,120 @@ fn moe_island_cap_experts_from_env() -> Result<Option<usize>> {
     Ok(Some(cap))
 }
 
+#[derive(Debug, Clone, Copy)]
+struct MoeSparseTelemetrySnapshot {
+    stats: crate::qwen36_moe_residency::MoeExpertResidencyStats,
+    arena: gpu_hal::VirtualArenaStats,
+}
+
+impl MoeSparseTelemetrySnapshot {
+    fn capture(manager: &MoeExpertResidencyManager) -> Self {
+        Self {
+            stats: manager.stats(),
+            arena: manager.arena().stats(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct MoeSparseTelemetry {
+    dump_path: Option<PathBuf>,
+    steps: Vec<serde_json::Value>,
+    peak_resident_slices: usize,
+    peak_resident_bytes: usize,
+    peak_logical_resident_bytes: usize,
+}
+
+impl MoeSparseTelemetry {
+    fn from_env(active: bool) -> Result<Option<Self>> {
+        if !active {
+            return Ok(None);
+        }
+        let dump_path = std::env::var_os("SUPERSONIC_MOE_ISLAND_TELEMETRY_JSON").map(PathBuf::from);
+        Ok(Some(Self {
+            dump_path,
+            steps: Vec::new(),
+            peak_resident_slices: 0,
+            peak_resident_bytes: 0,
+            peak_logical_resident_bytes: 0,
+        }))
+    }
+
+    fn record_step(
+        &mut self,
+        step: usize,
+        position: i32,
+        is_generation_step: bool,
+        before: MoeSparseTelemetrySnapshot,
+        after: MoeSparseTelemetrySnapshot,
+    ) {
+        self.peak_resident_slices = self.peak_resident_slices.max(after.stats.resident_slices);
+        self.peak_resident_bytes = self.peak_resident_bytes.max(after.arena.resident_bytes);
+        self.peak_logical_resident_bytes = self
+            .peak_logical_resident_bytes
+            .max(after.arena.logical_resident_bytes);
+
+        if self.dump_path.is_none() {
+            return;
+        }
+
+        self.steps.push(serde_json::json!({
+            "step": step,
+            "position": position,
+            "kind": if is_generation_step { "generate" } else { "prefill" },
+            "delta": {
+                "hits": after.stats.hits.saturating_sub(before.stats.hits),
+                "misses": after.stats.misses.saturating_sub(before.stats.misses),
+                "evicted_slices": after.stats.evicted_slices.saturating_sub(before.stats.evicted_slices),
+                "uploaded_bytes": after.stats.uploaded_bytes.saturating_sub(before.stats.uploaded_bytes),
+                "unmapped_bytes": after.stats.unmapped_bytes.saturating_sub(before.stats.unmapped_bytes),
+            },
+            "resident": {
+                "slices": after.stats.resident_slices,
+                "logical_bytes": after.arena.logical_resident_bytes,
+                "physical_bytes": after.arena.resident_bytes,
+                "mappings": after.arena.mapping_count,
+            },
+            "cumulative": {
+                "hits": after.stats.hits,
+                "misses": after.stats.misses,
+                "evicted_slices": after.stats.evicted_slices,
+                "uploaded_bytes": after.stats.uploaded_bytes,
+                "unmapped_bytes": after.stats.unmapped_bytes,
+            }
+        }));
+    }
+
+    fn write_json(&self, manager: &MoeExpertResidencyManager, generated_ids: &[u32]) -> Result<()> {
+        let Some(path) = self.dump_path.as_ref() else {
+            return Ok(());
+        };
+        let final_snapshot = MoeSparseTelemetrySnapshot::capture(manager);
+        let payload = serde_json::json!({
+            "schema": "supersonic-qwen36-moe-sparse-vmm-telemetry-v1",
+            "summary": {
+                "registered_tensors": final_snapshot.stats.registered_tensors,
+                "final_resident_slices": final_snapshot.stats.resident_slices,
+                "peak_resident_slices": self.peak_resident_slices,
+                "peak_resident_bytes": self.peak_resident_bytes,
+                "peak_logical_resident_bytes": self.peak_logical_resident_bytes,
+                "reserved_bytes": final_snapshot.arena.reserved_bytes,
+                "logical_bytes": final_snapshot.arena.logical_bytes,
+                "hits": final_snapshot.stats.hits,
+                "misses": final_snapshot.stats.misses,
+                "evicted_slices": final_snapshot.stats.evicted_slices,
+                "uploaded_bytes": final_snapshot.stats.uploaded_bytes,
+                "unmapped_bytes": final_snapshot.stats.unmapped_bytes,
+            },
+            "generated_ids": generated_ids,
+            "steps": self.steps,
+        });
+        let bytes = serde_json::to_vec_pretty(&payload)?;
+        std::fs::write(path, bytes)
+            .with_context(|| format!("write MoE sparse VMM telemetry to {}", path.display()))
+    }
+}
+
 /// Build one layer's worth of GPU-resident weight + state buffers from a
 /// BakedStore. Decides full-attn vs linear-attn by consulting the config's
 /// `layer_types` (every 4th layer is full per the standard hybrid pattern).
@@ -1843,6 +1957,16 @@ fn decode_text(
     let mut _moe_expert_arena = None;
     let mut _moe_expert_residency = None;
     let sparse_moe_requested = moe_island_cap_experts.is_some();
+    let mut moe_sparse_telemetry = MoeSparseTelemetry::from_env(sparse_moe_requested)?;
+    if let Some(path) = moe_sparse_telemetry
+        .as_ref()
+        .and_then(|telemetry| telemetry.dump_path.as_ref())
+    {
+        println!(
+            "  [vmm] sparse MoE residency telemetry will be written to {}",
+            path.display()
+        );
+    }
     let mut layers = if let Some(cap_experts) = moe_island_cap_experts {
         if cap_experts < geom.top_k as usize {
             anyhow::bail!(
@@ -2250,6 +2374,9 @@ fn decode_text(
             None
         };
         let lm_head_folded;
+        let moe_telemetry_before = _moe_expert_residency
+            .as_ref()
+            .map(MoeSparseTelemetrySnapshot::capture);
         let outputs = if let Some(scratch) = persistent_scratch.as_mut() {
             lm_head_folded = fold.is_some();
             scratch
@@ -2303,6 +2430,14 @@ fn decode_text(
             }
             .with_context(|| format!("chained decode (step {step}, position {position})"))?
         };
+        if let (Some(telemetry), Some(before), Some(manager)) = (
+            moe_sparse_telemetry.as_mut(),
+            moe_telemetry_before,
+            _moe_expert_residency.as_ref(),
+        ) {
+            let after = MoeSparseTelemetrySnapshot::capture(manager);
+            telemetry.record_step(step, position, is_gen_step, before, after);
+        }
         let t_chain_step = t1.elapsed();
         position += 1;
 
@@ -2740,18 +2875,37 @@ fn decode_text(
     if let Some(manager) = _moe_expert_residency.as_ref() {
         let residency = manager.stats();
         let arena = manager.arena().stats();
-        println!(
-            "  [vmm] MoE island residency: resident_slices={} hits={} misses={} \
-             evicted_slices={} uploaded={:.2}MiB unmapped={:.2}MiB resident={:.2}MiB reserved={:.2}MiB",
-            residency.resident_slices,
-            residency.hits,
-            residency.misses,
-            residency.evicted_slices,
-            residency.uploaded_bytes as f64 / MIB,
-            residency.unmapped_bytes as f64 / MIB,
-            arena.resident_bytes as f64 / MIB,
-            arena.reserved_bytes as f64 / MIB,
-        );
+        if let Some(telemetry) = moe_sparse_telemetry.as_ref() {
+            println!(
+                "  [vmm] MoE island residency: resident_slices={} peak_slices={} \
+                 hits={} misses={} evicted_slices={} uploaded={:.2}MiB unmapped={:.2}MiB \
+                 resident={:.2}MiB peak_resident={:.2}MiB reserved={:.2}MiB",
+                residency.resident_slices,
+                telemetry.peak_resident_slices,
+                residency.hits,
+                residency.misses,
+                residency.evicted_slices,
+                residency.uploaded_bytes as f64 / MIB,
+                residency.unmapped_bytes as f64 / MIB,
+                arena.resident_bytes as f64 / MIB,
+                telemetry.peak_resident_bytes as f64 / MIB,
+                arena.reserved_bytes as f64 / MIB,
+            );
+            telemetry.write_json(manager, &generated_ids)?;
+        } else {
+            println!(
+                "  [vmm] MoE island residency: resident_slices={} hits={} misses={} \
+                 evicted_slices={} uploaded={:.2}MiB unmapped={:.2}MiB resident={:.2}MiB reserved={:.2}MiB",
+                residency.resident_slices,
+                residency.hits,
+                residency.misses,
+                residency.evicted_slices,
+                residency.uploaded_bytes as f64 / MIB,
+                residency.unmapped_bytes as f64 / MIB,
+                arena.resident_bytes as f64 / MIB,
+                arena.reserved_bytes as f64 / MIB,
+            );
+        }
     }
     if emit_stage_timings && gen_steps > 0 {
         let to_ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;

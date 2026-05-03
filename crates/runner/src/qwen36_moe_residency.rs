@@ -222,7 +222,7 @@ impl MoeExpertResidencyManager {
 
     pub fn ensure_resident(&mut self, store: &BakedStore, key: MoeExpertKey) -> Result<()> {
         let tensor_idx = self.tensor_idx(key.layer_idx, key.projection)?;
-        let (name, allocation_id, logical_offset, logical_len, page_offset, page_len) = {
+        let (name, allocation_id, logical_offset, logical_len, page_offset, page_len, copy_len) = {
             let tensor = &self.tensors[tensor_idx];
             if key.expert_idx >= tensor.expert_count {
                 return Err(anyhow!(
@@ -237,6 +237,7 @@ impl MoeExpertResidencyManager {
             let logical_len = tensor.expert_bytes;
             let (page_offset, page_len) =
                 page_range(tensor.page_bytes, logical_offset, logical_len);
+            let copy_len = page_len.min(tensor.len_bytes.saturating_sub(page_offset));
             (
                 tensor.name.clone(),
                 tensor.allocation_id,
@@ -244,6 +245,7 @@ impl MoeExpertResidencyManager {
                 logical_len,
                 page_offset,
                 page_len,
+                copy_len,
             )
         };
 
@@ -264,8 +266,8 @@ impl MoeExpertResidencyManager {
                 &mut self.arena,
                 allocation_id,
                 &name,
-                logical_offset,
-                logical_len,
+                page_offset,
+                copy_len,
             )
             .with_context(|| {
                 format!(
@@ -273,7 +275,7 @@ impl MoeExpertResidencyManager {
                     key.layer_idx, key.expert_idx, key.projection
                 )
             })?;
-        self.uploaded_bytes += logical_len;
+        self.uploaded_bytes += copy_len;
         self.resident.insert(
             key,
             ResidentSlice {

@@ -378,11 +378,6 @@ impl VirtualBuffer {
             ops::sync(self.device_ordinal)?;
         }
         for (seg_offset, seg_len) in self.missing_segments(aligned_offset, aligned_end) {
-            let prefix_end = self.contiguous_prefix_end();
-            if seg_offset == prefix_end && prefix_end > 0 {
-                self.remap_contiguous_prefix(seg_offset + seg_len)?;
-                continue;
-            }
             let mapping = hal_profile_time("vmm_map", seg_len, || {
                 map_physical(
                     self.backend,
@@ -793,76 +788,6 @@ impl VirtualBuffer {
             return false;
         }
         self.missing_segments(offset, end).is_empty()
-    }
-
-    fn contiguous_prefix_end(&self) -> usize {
-        let mut ranges: Vec<(usize, usize)> = self
-            .mappings
-            .iter()
-            .map(|mapping| (mapping.offset, mapping.offset + mapping.len))
-            .collect();
-        ranges.sort_by_key(|(start, _)| *start);
-
-        let mut cursor = 0;
-        for (start, end) in ranges {
-            if start > cursor {
-                break;
-            }
-            cursor = cursor.max(end);
-        }
-        cursor
-    }
-
-    fn remap_contiguous_prefix(&mut self, new_end: usize) -> Result<()> {
-        let old_end = self.contiguous_prefix_end();
-        if old_end == 0 || new_end <= old_end {
-            return Ok(());
-        }
-
-        let mut old = vec![0u8; old_end];
-        ops::copy_d2h(
-            self.device_ordinal,
-            old.as_mut_ptr() as *mut c_void,
-            self.ptr.as_ptr(),
-            old.len(),
-        )?;
-        ops::sync(self.device_ordinal)?;
-
-        let mut i = 0;
-        while i < self.mappings.len() {
-            let map_end = self.mappings[i].offset + self.mappings[i].len;
-            if self.mappings[i].offset < old_end && map_end <= old_end {
-                let mapping = self.mappings.remove(i);
-                hal_profile_time("vmm_unmap", mapping.len, || {
-                    unmap_and_release(self.backend, self.device_ordinal, self.ptr, mapping)
-                })?;
-            } else {
-                i += 1;
-            }
-        }
-
-        let mapping = hal_profile_time("vmm_map", new_end, || {
-            map_physical(
-                self.backend,
-                self.device_ordinal,
-                self.ptr,
-                0,
-                new_end,
-                0,
-                new_end,
-            )
-        })?;
-        self.mappings.push(mapping);
-        self.mapped_bytes = self.mapped_bytes.max(new_end);
-        ops::memset_zeros(self.device_ordinal, self.ptr.as_ptr(), new_end)?;
-        ops::sync(self.device_ordinal)?;
-        ops::copy_h2d(
-            self.device_ordinal,
-            self.ptr.as_ptr(),
-            old.as_ptr() as *const c_void,
-            old.len(),
-        )?;
-        Ok(())
     }
 }
 
