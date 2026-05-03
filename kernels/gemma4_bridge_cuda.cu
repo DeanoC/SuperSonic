@@ -918,8 +918,14 @@ int persistent_decode_fused_input_argmax_device(
     if (cudaGetDeviceProperties(&props, device_ordinal) != cudaSuccess) return 741;
     const int num_blocks =
         props.multiProcessorCount > 0 ? props.multiProcessorCount : 1;
+    // The decode megakernel uses grid barriers, so keep it resident-sized.
+    // The split LM-head tail has no grid barrier and can oversubscribe rows.
+    const int argmax_blocks =
+        props.multiProcessorCount > 0 ? props.multiProcessorCount * 4 : 1;
     constexpr int BLOCK = 256;
     const size_t lds_bytes = (BLOCK + 256) * sizeof(float);
+    const size_t norm_lds_bytes = BLOCK * sizeof(float);
+    const size_t reduce_lds_bytes = 2 * BLOCK * sizeof(float);
 
     if (cudaMemset(barrier_counter, 0, sizeof(unsigned int)) != cudaSuccess) return 742;
     if (cudaMemset(barrier_flag, 0, sizeof(unsigned int)) != cudaSuccess) return 743;
@@ -942,11 +948,39 @@ int persistent_decode_fused_input_argmax_device(
         static_cast<T*>(per_layer_inputs),
         static_cast<float*>(workspace),
         matvec_counter, barrier_counter, barrier_flag,
-        static_cast<const T*>(final_norm_w),
-        static_cast<const T*>(lm_head_w),
-        out_token,
+        nullptr,
+        nullptr,
+        nullptr,
         profile_cycles);
     if (cudaGetLastError() != cudaSuccess) return 744;
+
+    float* normed_f32 = static_cast<float*>(workspace);
+    float* partial_vals = normed_f32 + hidden_size;
+    float* partial_idx_bits = partial_vals + argmax_blocks;
+    g4_final_norm_argmax_norm_kernel<T><<<dim3(1), dim3(BLOCK), norm_lds_bytes, 0>>>(
+        hidden_size, eps,
+        static_cast<const T*>(hidden_io),
+        static_cast<const T*>(final_norm_w),
+        normed_f32,
+        profile_cycles);
+    if (cudaGetLastError() != cudaSuccess) return 746;
+
+    g4_lm_head_argmax_partial_kernel<T><<<dim3(argmax_blocks), dim3(BLOCK), reduce_lds_bytes, 0>>>(
+        hidden_size, vocab_size,
+        static_cast<const T*>(lm_head_w),
+        normed_f32,
+        partial_vals,
+        partial_idx_bits,
+        profile_cycles);
+    if (cudaGetLastError() != cudaSuccess) return 747;
+
+    g4_lm_head_argmax_reduce_kernel<<<dim3(1), dim3(BLOCK), reduce_lds_bytes, 0>>>(
+        argmax_blocks,
+        partial_vals,
+        partial_idx_bits,
+        out_token,
+        profile_cycles);
+    if (cudaGetLastError() != cudaSuccess) return 748;
     if (cudaDeviceSynchronize() != cudaSuccess) return 745;
     g4_cuda_profile.collect(profile_cycles);
     return 0;

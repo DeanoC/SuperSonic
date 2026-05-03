@@ -3740,6 +3740,148 @@ __device__ void g4_final_norm_lm_head_argmax_body(
 }
 
 template <typename T>
+__global__ void g4_final_norm_argmax_norm_kernel(
+    int hidden_size,
+    float eps,
+    const T* __restrict__ hidden_io,
+    const T* __restrict__ final_norm_w,
+    float* __restrict__ normed_f32,
+    unsigned long long* __restrict__ profile_cycles
+) __launch_bounds__(256, 1) {
+    extern __shared__ float lds[];
+    const unsigned long long g4_prof = g4_profile_begin(profile_cycles);
+    g4_block_rms_norm_t_to_f32<T>(
+        normed_f32, hidden_io, final_norm_w, hidden_size, eps, lds);
+    g4_profile_end(profile_cycles, G4_PROFILE_ARGMAX_TAIL, g4_prof);
+}
+
+template <typename T>
+__global__ void g4_lm_head_argmax_partial_kernel(
+    int hidden_size,
+    int vocab_size,
+    const T* __restrict__ lm_head_w,
+    const float* __restrict__ normed_f32,
+    float* __restrict__ partial_vals,
+    float* __restrict__ partial_idx_bits,
+    unsigned long long* __restrict__ profile_cycles
+) __launch_bounds__(256, 1) {
+    extern __shared__ float lds[];
+    const int tid = threadIdx.x;
+    const int bs = blockDim.x;
+    const int lane = tid % warpSize;
+    const int warp_id = tid / warpSize;
+    const int warps_per_block = bs / warpSize;
+    const int partial_id = blockIdx.x;
+
+    const unsigned long long g4_prof = g4_profile_begin(profile_cycles);
+    float best = -INFINITY;
+    unsigned int best_idx = 0u;
+    const int vd4 = hidden_size & ~3;
+    for (int row = blockIdx.x * warps_per_block + warp_id;
+         row < vocab_size;
+         row += gridDim.x * warps_per_block) {
+        const T* wr = lm_head_w + static_cast<size_t>(row) * hidden_size;
+        float p = 0.0f;
+        for (int c = lane * 4; c < vd4; c += warpSize * 4) {
+            float w0, w1, w2, w3;
+            g4_load_pair_as_float(wr + c, w0, w1);
+            g4_load_pair_as_float(wr + c + 2, w2, w3);
+            p += w0 * normed_f32[c]
+               + w1 * normed_f32[c + 1]
+               + w2 * normed_f32[c + 2]
+               + w3 * normed_f32[c + 3];
+        }
+        for (int c = vd4 + lane; c < hidden_size; c += warpSize) {
+            p += g4_to_float(wr[c]) * normed_f32[c];
+        }
+        const float result = g4_wave_reduce_sum_f32(p);
+        if (lane == 0) {
+            const float rounded = g4_to_float(g4_from_float<T>(result));
+            const unsigned int urow = static_cast<unsigned int>(row);
+            if (rounded > best || (rounded == best && urow < best_idx)) {
+                best = rounded;
+                best_idx = urow;
+            }
+        }
+    }
+
+    float* idx_bits = lds + bs;
+    if (lane == 0) {
+        lds[warp_id] = best;
+        idx_bits[warp_id] = __uint_as_float(best_idx);
+    }
+    __syncthreads();
+    if (tid >= warps_per_block) {
+        lds[tid] = -INFINITY;
+        idx_bits[tid] = __uint_as_float(0u);
+    }
+    __syncthreads();
+    for (int s = bs / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            const float other_v = lds[tid + s];
+            const unsigned int other_idx = __float_as_uint(idx_bits[tid + s]);
+            const unsigned int cur_idx = __float_as_uint(idx_bits[tid]);
+            if (other_v > lds[tid] ||
+                (other_v == lds[tid] && other_idx < cur_idx)) {
+                lds[tid] = other_v;
+                idx_bits[tid] = __uint_as_float(other_idx);
+            }
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        partial_vals[partial_id] = lds[0];
+        partial_idx_bits[partial_id] = idx_bits[0];
+    }
+    g4_profile_end(profile_cycles, G4_PROFILE_ARGMAX_TAIL, g4_prof);
+}
+
+__global__ void g4_lm_head_argmax_reduce_kernel(
+    int num_partials,
+    const float* __restrict__ partial_vals,
+    const float* __restrict__ partial_idx_bits,
+    unsigned int* __restrict__ out_token,
+    unsigned long long* __restrict__ profile_cycles
+) {
+    extern __shared__ float lds[];
+    const int tid = threadIdx.x;
+    const int bs = blockDim.x;
+    float* idx_bits = lds + bs;
+
+    const unsigned long long g4_prof = g4_profile_begin(profile_cycles);
+    float best = -INFINITY;
+    unsigned int best_idx = 0u;
+    for (int i = tid; i < num_partials; i += bs) {
+        const float v = partial_vals[i];
+        const unsigned int idx = __float_as_uint(partial_idx_bits[i]);
+        if (v > best || (v == best && idx < best_idx)) {
+            best = v;
+            best_idx = idx;
+        }
+    }
+    lds[tid] = best;
+    idx_bits[tid] = __uint_as_float(best_idx);
+    __syncthreads();
+    for (int s = bs / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            const float other_v = lds[tid + s];
+            const unsigned int other_idx = __float_as_uint(idx_bits[tid + s]);
+            const unsigned int cur_idx = __float_as_uint(idx_bits[tid]);
+            if (other_v > lds[tid] ||
+                (other_v == lds[tid] && other_idx < cur_idx)) {
+                lds[tid] = other_v;
+                idx_bits[tid] = __uint_as_float(other_idx);
+            }
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {
+        out_token[0] = __float_as_uint(idx_bits[0]);
+    }
+    g4_profile_end(profile_cycles, G4_PROFILE_ARGMAX_TAIL, g4_prof);
+}
+
+template <typename T>
 __global__ void g4_persistent_decode_fused_input_kernel(
     int num_layers,
     int hidden_size,
