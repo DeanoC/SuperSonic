@@ -1002,6 +1002,11 @@ fn load_layer_buffers(
     // `recurrent_state` instead (always allocated). 0 = no KV cache,
     // kernel falls back to kv_len=1 (back-compat for the parity test).
     kv_max_t: usize,
+    // When true, the layer's KV cache is allocated as FP8 E4M3 bytes
+    // with F32 per-(head, position) scales and an optional BF16
+    // sidecar (gated by `qwen35::state::kv_fp8_bf16_sidecar_*` env
+    // helpers).
+    kv_fp8: bool,
 ) -> Result<LayerBuffers> {
     let lp = format!("{weight_prefix}.layers.{layer_idx}");
 
@@ -1065,17 +1070,65 @@ fn load_layer_buffers(
             Qwen36WeightMode::Bf16 => None,
         };
         // KV cache: allocate per-layer when multi-token decode is requested.
-        // Layout: BF16 [kv_max_t, num_kv_heads * head_dim] for both K and V.
+        // BF16 path: [kv_max_t, num_kv_heads * head_dim] BF16 for K and V.
+        // FP8 path: same shape but U8 (FP8 E4M3 bytes) plus F32 scales
+        // [num_kv_heads, kv_max_t] for K and V, plus optional BF16 sidecar
+        // [num_kv_heads, sidecar_window, head_dim] when enabled.
         let kv_dim = (geom.num_kv_heads as usize) * (geom.head_dim as usize);
         let kv_cache = if kv_max_t > 0 {
-            let k = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[kv_max_t, kv_dim])
-                .with_context(|| format!("alloc kv_cache_k (layer {layer_idx})"))?;
-            let v = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[kv_max_t, kv_dim])
-                .with_context(|| format!("alloc kv_cache_v (layer {layer_idx})"))?;
+            let num_kv_heads = geom.num_kv_heads as usize;
+            let head_dim = geom.head_dim as usize;
+            let (k, v, kv_scale_k, kv_scale_v) = if kv_fp8 {
+                let k = GpuBuffer::zeros(ordinal, ScalarType::U8, &[kv_max_t, kv_dim])
+                    .with_context(|| format!("alloc kv_cache_k FP8 (layer {layer_idx})"))?;
+                let v = GpuBuffer::zeros(ordinal, ScalarType::U8, &[kv_max_t, kv_dim])
+                    .with_context(|| format!("alloc kv_cache_v FP8 (layer {layer_idx})"))?;
+                let sk = GpuBuffer::zeros(ordinal, ScalarType::F32, &[num_kv_heads, kv_max_t])
+                    .with_context(|| format!("alloc kv_scale_k (layer {layer_idx})"))?;
+                let sv = GpuBuffer::zeros(ordinal, ScalarType::F32, &[num_kv_heads, kv_max_t])
+                    .with_context(|| format!("alloc kv_scale_v (layer {layer_idx})"))?;
+                (k, v, Some(sk), Some(sv))
+            } else {
+                let k = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[kv_max_t, kv_dim])
+                    .with_context(|| format!("alloc kv_cache_k (layer {layer_idx})"))?;
+                let v = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[kv_max_t, kv_dim])
+                    .with_context(|| format!("alloc kv_cache_v (layer {layer_idx})"))?;
+                (k, v, None, None)
+            };
+            let (kv_shadow_k, kv_shadow_v) = if kv_fp8
+                && qwen35::state::kv_fp8_bf16_sidecar_enabled()
+            {
+                // Window is hard-coded to kv_max_t in v1 (matches the
+                // kernel's stride). The env-var window helper is consulted
+                // by Task 11 only for VRAM accounting; the actual buffer
+                // size always equals kv_max_t until the kernel grows a
+                // kv_shadow_window arg.
+                let window = kv_max_t;
+                let sk = GpuBuffer::zeros(
+                    ordinal,
+                    ScalarType::BF16,
+                    &[num_kv_heads, window, head_dim],
+                )
+                .with_context(|| format!("alloc kv_shadow_k (layer {layer_idx})"))?;
+                let sv = GpuBuffer::zeros(
+                    ordinal,
+                    ScalarType::BF16,
+                    &[num_kv_heads, window, head_dim],
+                )
+                .with_context(|| format!("alloc kv_shadow_v (layer {layer_idx})"))?;
+                (Some(sk), Some(sv))
+            } else {
+                (None, None)
+            };
             Some(FullAttnKvCache {
                 k,
                 v,
                 kv_max_t: kv_max_t as i32,
+                kv_scale_k,
+                kv_scale_v,
+                kv_shadow_k,
+                kv_shadow_v,
+                kv_shadow_start: -1,
             })
         } else {
             None
@@ -1388,6 +1441,12 @@ fn load_mtp_buffers(
             k,
             v,
             kv_max_t: kv_max_t as i32,
+            // MTP keeps BF16 KV — KV-FP8 + MTP combo not yet validated.
+            kv_scale_k: None,
+            kv_scale_v: None,
+            kv_shadow_k: None,
+            kv_shadow_v: None,
+            kv_shadow_start: -1,
         })
     } else {
         None
@@ -1650,6 +1709,7 @@ fn decode_text(
             weight_prefix,
             weight_mode,
             kv_max_t,
+            false, // Task 11 will switch to cli.kv_fp8
         )
         .with_context(|| format!("load layer {li} weights"))?;
         layers.push(layer);
@@ -2557,6 +2617,7 @@ fn decode_first_token(model_dir: &Path, report: &DryRunReport) -> Result<u32> {
             weight_prefix,
             weight_mode,
             0, // legacy single-token path: no KV cache, kv_len=1 fast path.
+            false, // Task 11 will switch to cli.kv_fp8
         )
         .with_context(|| format!("load layer {li} weights"))?;
         layers.push(layer);

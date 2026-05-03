@@ -118,13 +118,34 @@ pub enum AttnLayerBuffers {
 }
 
 /// PR 4d KV cache for a full-attention layer. `[kv_max_t, num_kv_heads *
-/// head_dim]` BF16 each, mutated by the kernel: at decode position `p` it
-/// writes the current step's K/V at slot `p` then attends over
-/// `kv_len = p + 1` past tokens. Lifetime tied to one decode session.
+/// head_dim]` BF16 each (or U8 FP8 bytes when `kv_fp8` is on), mutated
+/// by the kernel: at decode position `p` it writes the current step's
+/// K/V at slot `p` then attends over `kv_len = p + 1` past tokens.
+/// Lifetime tied to one decode session.
+///
+/// When KV-FP8 is active (`kv_scale_k.is_some()`):
+///   - `k` and `v` are dtype `U8` with the same shape; the kernel
+///     reinterprets the pointer in place to read/write FP8 E4M3 bytes.
+///   - `kv_scale_k` / `kv_scale_v` are F32 `[num_kv_heads, kv_max_t]`
+///     per-(head, position) absmax scales.
+///   - `kv_shadow_k` / `kv_shadow_v` are an optional BF16 sidecar at
+///     shape `[num_kv_heads, sidecar_window, head_dim]` for
+///     parity-sensitive recent reads.
+///   - `kv_shadow_start` is the first absolute position covered by the
+///     sidecar (`-1` when the sidecar is disabled).
 pub struct FullAttnKvCache {
     pub k: GpuBuffer,
     pub v: GpuBuffer,
     pub kv_max_t: i32,
+    /// Some only when KV-FP8 is on.
+    pub kv_scale_k: Option<GpuBuffer>,
+    pub kv_scale_v: Option<GpuBuffer>,
+    /// Some only when KV-FP8 is on AND the sidecar is enabled.
+    pub kv_shadow_k: Option<GpuBuffer>,
+    pub kv_shadow_v: Option<GpuBuffer>,
+    /// First absolute KV position covered by the sidecar (`-1` when
+    /// the sidecar is disabled).
+    pub kv_shadow_start: i32,
 }
 
 /// INT4 sidecars for a full-attention layer. Mirrors the per-block FFI
