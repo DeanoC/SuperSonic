@@ -12,6 +12,8 @@ mod phi4_engine;
 mod policy;
 mod prefill_engine;
 mod qwen35_dflash_engine;
+mod specprefill;
+mod specprefill_engine;
 mod qwen36_moe_decode;
 mod qwen36_moe_engine;
 mod qwen36_moe_mtp;
