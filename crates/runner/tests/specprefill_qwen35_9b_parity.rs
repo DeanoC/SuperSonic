@@ -49,6 +49,63 @@ fn run_supersonic_capture_logits(args: &[&str]) -> anyhow::Result<Vec<f32>> {
         .collect()
 }
 
+/// Run supersonic and return (logits, generated_text). The generated
+/// text is the FIRST line after `LAST_LOGITS:` that doesn't start with
+/// a known diagnostic prefix — i.e., the line printed by `println!("{text}")`
+/// in both the dense and sparse paths. The dense path additionally
+/// emits `[tokens] ...` and `[result] ...` diagnostic lines after that
+/// which we ignore here.
+fn run_supersonic_capture_logits_and_text(
+    args: &[&str],
+) -> anyhow::Result<(Vec<f32>, String)> {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_supersonic"));
+    cmd.args(args);
+    cmd.arg("--dump-last-logits");
+    let out = cmd.output()?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "supersonic exited {}: stderr=\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let stdout = String::from_utf8(out.stdout)?;
+
+    let mut lines = stdout.lines();
+    let mut logits: Option<Vec<f32>> = None;
+    let mut text: String = String::new();
+    while let Some(line) = lines.next() {
+        if let Some(csv) = line.strip_prefix("LAST_LOGITS:") {
+            logits = Some(
+                csv.trim()
+                    .split(',')
+                    .map(|s| s.trim().parse::<f32>())
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+            // Find the next line that's the actual decoded output (skip
+            // empty lines and known diagnostic prefixes).
+            for next in lines.by_ref() {
+                let trimmed = next.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if trimmed.starts_with('[') {
+                    // [tokens] ..., [result] ..., etc. — diagnostics.
+                    continue;
+                }
+                text = next.to_string();
+                break;
+            }
+            break;
+        }
+    }
+    let logits = logits.ok_or_else(|| anyhow::anyhow!("LAST_LOGITS line not found"))?;
+    if text.is_empty() {
+        anyhow::bail!("generated text not found in stdout (no non-diagnostic line after LAST_LOGITS)");
+    }
+    Ok((logits, text))
+}
+
 fn cossim(a: &[f32], b: &[f32]) -> f64 {
     let dot: f64 = a
         .iter()
@@ -202,4 +259,55 @@ fn specprefill_qwen35_9b_keep_100_identity() {
     // 0.999 cossim floor for identity — kept_positions = [0..T] should
     // produce numerics identical to dense up to compaction-loop ordering.
     run_parity_check(&target, &draft, "1.00", "keep=1.00 (identity)", 0.999);
+}
+
+#[test]
+fn specprefill_qwen35_9b_keep_100_multitoken_identity() {
+    // Multi-token decode parity at keep_ratio=1.0. The kept set is [0..T]
+    // so the sparse path takes the RoPE-indirect kernel with identity
+    // positions, which Phase B parity verified is bit-identical to
+    // dense. The generated text for max_new_tokens=8 must match exactly.
+    //
+    // This test catches any regression in the sparse decode loop
+    // (e.g., RoPE position vs KV slot conflation) that wouldn't surface
+    // on the single-token tests above.
+    let (target, draft) = match check_specprefill_env() {
+        Some(t) => t,
+        None => return,
+    };
+    let prompt = "The transformer architecture has revolutionized natural language processing through its self-attention mechanism, allowing models to weigh the importance of different parts of the input sequence dynamically. Unlike recurrent networks, transformers can process all tokens in parallel during training, making them highly efficient on modern accelerator hardware. The attention computation involves three projections — query, key, and value — followed by a softmax-normalized dot product that produces a weighted combination of value vectors. Multi-head attention extends this by performing several attention operations in parallel across different learned subspaces, then concatenating and projecting the results. Feed-forward networks between attention layers introduce non-linearity. Residual connections and layer normalization stabilize gradients during training. The overall result is";
+    let common: Vec<&str> = vec![
+        "--model",
+        "qwen3.5-9b",
+        "--model-dir",
+        &target,
+        "--prompt",
+        prompt,
+        "--max-new-tokens",
+        "8",
+    ];
+
+    let (_, dense_text) =
+        run_supersonic_capture_logits_and_text(&common).expect("dense run");
+
+    let mut sparse_args = common.clone();
+    sparse_args.extend_from_slice(&[
+        "--specprefill-draft-dir",
+        &draft,
+        "--specprefill-keep-ratio",
+        "1.00",
+    ]);
+    let (_, sparse_text) =
+        run_supersonic_capture_logits_and_text(&sparse_args).expect("sparse run");
+
+    eprintln!("[multitoken-identity] dense text: {:?}", dense_text);
+    eprintln!("[multitoken-identity] sparse text: {:?}", sparse_text);
+
+    assert_eq!(
+        dense_text.trim(),
+        sparse_text.trim(),
+        "[multitoken-identity] dense and sparse generations differ on \
+         max_new_tokens=8 with keep_ratio=1.00 (kept=[0..T] so sparse \
+         path should be bit-identical to dense)"
+    );
 }
