@@ -2949,6 +2949,12 @@ pub fn lookahead_attention_scores(
     k: &GpuBuffer,
     scores: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    if !matches!(dtype, ScalarType::BF16 | ScalarType::F16) {
+        return Err(ffi_error(format!(
+            "lookahead_attention_scores: dtype must be ScalarType::BF16 or ScalarType::F16, got {:?}",
+            dtype
+        )));
+    }
     if q_heads == 0 || kv_heads == 0 || lookahead_count == 0 || kv_len == 0 || head_dim == 0 {
         return Err(ffi_error(
             "lookahead_attention_scores: all dimensions must be > 0".into(),
