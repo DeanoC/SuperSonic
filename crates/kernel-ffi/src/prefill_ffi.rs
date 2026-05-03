@@ -692,6 +692,20 @@ unsafe extern "C" {
         data: *mut c_void,
     ) -> c_int;
 
+    fn supersonic_qwen35_hip_lookahead_attention_scores(
+        dtype: c_int,
+        device_ordinal: usize,
+        q_heads: usize,
+        kv_heads: usize,
+        lookahead_count: usize,
+        kv_len: usize,
+        head_dim: usize,
+        scale: f32,
+        q: *const c_void,
+        k: *const c_void,
+        scores: *mut c_void,
+    ) -> c_int;
+
     fn supersonic_qwen35_hip_transpose_shd_hsd(
         dtype: c_int,
         device_ordinal: usize,
@@ -2906,6 +2920,93 @@ pub fn apply_rope_prefill_indirect(
     if status != 0 {
         return Err(ffi_error(format!(
             "apply_rope_prefill_indirect failed: {status}"
+        )));
+    }
+    Ok(())
+}
+
+/// SpecPrefill (arXiv 2502.02789): per-row softmax(Q · Kᵀ) for the last
+/// `lookahead_count` query rows of a single full-attention layer.
+/// Computes the importance signal the host-side selection consumes.
+///
+/// Layouts:
+/// - `q`: BF16 `[lookahead_count, q_heads, head_dim]` (post-RoPE)
+/// - `k`: BF16 `[kv_heads, kv_len, head_dim]`
+/// - `scores`: F32 `[q_heads, lookahead_count, kv_len]` (output)
+///
+/// `q_heads` must be a multiple of `kv_heads` (GQA broadcasting handled
+/// inside the kernel via `num_kv_groups = q_heads / kv_heads`).
+pub fn lookahead_attention_scores(
+    ordinal: usize,
+    dtype: ScalarType,
+    q_heads: usize,
+    kv_heads: usize,
+    lookahead_count: usize,
+    kv_len: usize,
+    head_dim: usize,
+    scale: f32,
+    q: &GpuBuffer,
+    k: &GpuBuffer,
+    scores: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if q_heads == 0 || kv_heads == 0 || lookahead_count == 0 || kv_len == 0 || head_dim == 0 {
+        return Err(ffi_error(
+            "lookahead_attention_scores: all dimensions must be > 0".into(),
+        ));
+    }
+    if q_heads % kv_heads != 0 {
+        return Err(ffi_error(format!(
+            "lookahead_attention_scores: q_heads ({q_heads}) must be a multiple of kv_heads ({kv_heads})"
+        )));
+    }
+    let expected_q = lookahead_count * q_heads * head_dim;
+    if q.elem_count() < expected_q {
+        return Err(ffi_error(format!(
+            "lookahead_attention_scores: q has {} elems, expected >= {}",
+            q.elem_count(),
+            expected_q
+        )));
+    }
+    let expected_k = kv_heads * kv_len * head_dim;
+    if k.elem_count() < expected_k {
+        return Err(ffi_error(format!(
+            "lookahead_attention_scores: k has {} elems, expected >= {}",
+            k.elem_count(),
+            expected_k
+        )));
+    }
+    if scores.dtype() != ScalarType::F32 {
+        return Err(ffi_error(format!(
+            "lookahead_attention_scores: scores must be ScalarType::F32, got {:?}",
+            scores.dtype()
+        )));
+    }
+    let expected_scores = q_heads * lookahead_count * kv_len;
+    if scores.elem_count() < expected_scores {
+        return Err(ffi_error(format!(
+            "lookahead_attention_scores: scores has {} elems, expected >= {}",
+            scores.elem_count(),
+            expected_scores
+        )));
+    }
+    let status = unsafe {
+        supersonic_qwen35_hip_lookahead_attention_scores(
+            dtype.kernel_dtype_code(),
+            ordinal,
+            q_heads,
+            kv_heads,
+            lookahead_count,
+            kv_len,
+            head_dim,
+            scale,
+            q.as_ptr(),
+            k.as_ptr(),
+            scores.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(ffi_error(format!(
+            "lookahead_attention_scores failed: {status}"
         )));
     }
     Ok(())
