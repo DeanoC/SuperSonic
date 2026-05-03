@@ -17,10 +17,8 @@ use gpu_hal::{set_backend, Backend};
 use model_store::BakedStore;
 
 use crate::qwen36_moe_bake::{ensure_qwen36_bake, select_decode_bake};
-use crate::qwen36_moe_decode::{
-    argmax_bf16_logits, run_chained_decode_fast, run_chained_decode_fast_with_expert_prefetch,
-    ExpertPrefetchPhase, ExpertRoute, XorshiftRng,
-};
+use crate::qwen36_moe_chain::{run_chain_step, Qwen36ChainStep};
+use crate::qwen36_moe_decode::{argmax_bf16_logits, run_chained_decode_fast, XorshiftRng};
 use crate::qwen36_moe_dry_run::{print_report, run_qwen36_moe_dry_run, DryRunReport};
 use crate::qwen36_moe_generation::{run_generation_step, Qwen36GenerationStep};
 use crate::qwen36_moe_geom::build_multi_layer_geom;
@@ -34,7 +32,6 @@ use crate::qwen36_moe_output::{
 use crate::qwen36_moe_policy::{
     resolve_context_size, validate_decode_backend, validate_persistent_kv_fp8_flags,
 };
-use crate::qwen36_moe_prefetch::handle_moe_expert_prefetch;
 use crate::qwen36_moe_prompt::{
     prepare_prompt, print_prompt_summary, validate_speculative_sampling,
 };
@@ -43,9 +40,7 @@ use crate::qwen36_moe_speculative::{
     run_speculative_decode_step, run_speculative_decode_step_batched,
 };
 use crate::qwen36_moe_state::{refresh_linear_attn_state, restore_linear_attn_state};
-use crate::qwen36_moe_telemetry::{
-    print_and_write_moe_residency_summary, MoeRouteRuntime, MoeSparseTelemetrySnapshot,
-};
+use crate::qwen36_moe_telemetry::{print_and_write_moe_residency_summary, MoeRouteRuntime};
 use crate::qwen36_moe_timing::{Qwen36StageTimingTotals, SamplingParams};
 use crate::qwen36_moe_vmm::{
     load_decode_layers_with_vmm_strategy, prepare_moe_runtime_config,
@@ -341,123 +336,24 @@ fn decode_text(
         } else {
             None
         };
-        let lm_head_folded;
-        let moe_telemetry_before = _moe_expert_residency
-            .as_ref()
-            .map(MoeSparseTelemetrySnapshot::capture);
-        let track_moe_routes = moe_routes.should_track_routes(moe_runtime.prefetch_mode);
-        let mut next_moe_topk_by_layer = moe_routes.next_topk_buffer(track_moe_routes);
-        let outputs = if let Some(scratch) = persistent_scratch.as_mut() {
-            if let Some(manager) = _moe_expert_residency.as_mut() {
-                // Sparse VMM needs a host remap point after each layer's
-                // router top-k is known. The segmented persistent path keeps
-                // the persistent phase bodies but skips folded lm_head; the
-                // standalone lm_head launch below consumes final_hidden_bytes.
-                lm_head_folded = false;
-                drop(fold);
-                let mut prefetch = |phase: ExpertPrefetchPhase,
-                                    layer_idx: usize,
-                                    routes: &[ExpertRoute]|
-                 -> Result<()> {
-                    handle_moe_expert_prefetch(
-                        manager,
-                        &store,
-                        moe_runtime.prefetch_mode,
-                        moe_runtime.prefetch_ranks,
-                        &moe_routes.previous_topk_by_layer,
-                        &mut next_moe_topk_by_layer,
-                        track_moe_routes,
-                        moe_routes.route_telemetry.as_mut(),
-                        moe_routes.transition_predictors.as_deref_mut(),
-                        phase,
-                        layer_idx,
-                        routes,
-                    )
-                };
-                scratch
-                    .run_sparse_with_expert_prefetch(
-                        ordinal,
-                        &initial_hidden,
-                        loop_state.position,
-                        &mut prefetch,
-                    )
-                    .with_context(|| {
-                        format!(
-                            "segmented persistent sparse decode (step {step}, position {})",
-                            loop_state.position
-                        )
-                    })?
-            } else {
-                lm_head_folded = fold.is_some();
-                scratch
-                    .run(ordinal, &initial_hidden, loop_state.position, fold)
-                    .with_context(|| {
-                        format!(
-                            "persistent decode (step {step}, position {})",
-                            loop_state.position
-                        )
-                    })?
-            }
-        } else {
-            // Chained path doesn't support the fold; lm_head still
-            // launches separately below on gen steps.
-            lm_head_folded = false;
-            drop(fold);
-            if let Some(manager) = _moe_expert_residency.as_mut() {
-                let mut prefetch = |phase: ExpertPrefetchPhase,
-                                    layer_idx: usize,
-                                    routes: &[ExpertRoute]|
-                 -> Result<()> {
-                    handle_moe_expert_prefetch(
-                        manager,
-                        &store,
-                        moe_runtime.prefetch_mode,
-                        moe_runtime.prefetch_ranks,
-                        &moe_routes.previous_topk_by_layer,
-                        &mut next_moe_topk_by_layer,
-                        track_moe_routes,
-                        moe_routes.route_telemetry.as_mut(),
-                        moe_routes.transition_predictors.as_deref_mut(),
-                        phase,
-                        layer_idx,
-                        routes,
-                    )
-                };
-                run_chained_decode_fast_with_expert_prefetch(
-                    ordinal,
-                    &geom,
-                    &mut layers,
-                    &initial_hidden,
-                    loop_state.position,
-                    emit_stage_timings,
-                    &mut prefetch,
-                )
-            } else {
-                run_chained_decode_fast(
-                    ordinal,
-                    &geom,
-                    &mut layers,
-                    &initial_hidden,
-                    loop_state.position,
-                    emit_stage_timings,
-                )
-            }
-            .with_context(|| {
-                format!(
-                    "chained decode (step {step}, position {})",
-                    loop_state.position
-                )
-            })?
-        };
-        moe_routes.advance(track_moe_routes, next_moe_topk_by_layer);
-        if let (Some(telemetry), Some(before), Some(manager)) = (
-            moe_runtime.sparse_telemetry.as_mut(),
-            moe_telemetry_before,
-            _moe_expert_residency.as_ref(),
-        ) {
-            let after = MoeSparseTelemetrySnapshot::capture(manager);
-            telemetry.record_step(step, loop_state.position, is_gen_step, before, after);
-        }
+        let chain_step = run_chain_step(Qwen36ChainStep {
+            ordinal,
+            geom: &geom,
+            store: &store,
+            layers: &mut layers,
+            persistent_scratch: persistent_scratch.as_mut(),
+            moe_expert_residency: _moe_expert_residency.as_mut(),
+            moe_runtime: &mut moe_runtime,
+            moe_routes: &mut moe_routes,
+            initial_hidden: &initial_hidden,
+            position: loop_state.position,
+            step,
+            is_gen_step,
+            emit_stage_timings,
+            fold,
+        })?;
+        let outputs = chain_step.outputs;
+        let lm_head_folded = chain_step.lm_head_folded;
         let t_chain_step = t1.elapsed();
         loop_state.position += 1;
 

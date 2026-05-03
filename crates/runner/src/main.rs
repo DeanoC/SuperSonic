@@ -14,6 +14,7 @@ mod prefill_engine;
 mod qwen35_dflash_engine;
 mod qwen35_runtime;
 mod qwen36_moe_bake;
+mod qwen36_moe_chain;
 mod qwen36_moe_decode;
 mod qwen36_moe_dry_run;
 mod qwen36_moe_engine;
