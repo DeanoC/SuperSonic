@@ -19,17 +19,17 @@ use model_store::BakedStore;
 use crate::qwen36_moe_bake::{ensure_qwen36_bake, select_decode_bake};
 use crate::qwen36_moe_decode::{
     argmax_bf16_logits, run_chained_decode_fast, run_chained_decode_fast_with_expert_prefetch,
-    sample_bf16_logits, ExpertPrefetchPhase, ExpertRoute, XorshiftRng,
+    ExpertPrefetchPhase, ExpertRoute, XorshiftRng,
 };
 use crate::qwen36_moe_dry_run::{print_report, run_qwen36_moe_dry_run, DryRunReport};
+use crate::qwen36_moe_generation::{run_generation_step, Qwen36GenerationStep};
 use crate::qwen36_moe_geom::build_multi_layer_geom;
 use crate::qwen36_moe_host::lookup_embed_row;
 use crate::qwen36_moe_lm_head::{launch_lm_head_from_final_hidden_bytes, LmHeadBuffers};
 use crate::qwen36_moe_loop::Qwen36DecodeLoopState;
 use crate::qwen36_moe_output::{
-    dump_final_hidden_if_requested, dump_logits_if_requested, print_decode_stream_start,
-    print_decoded_token, print_generation_summary, print_last_logits_if_requested,
-    print_sampling_summary,
+    print_decode_stream_start, print_decoded_token, print_generation_summary,
+    print_last_logits_if_requested, print_sampling_summary,
 };
 use crate::qwen36_moe_policy::{
     resolve_context_size, validate_decode_backend, validate_persistent_kv_fp8_flags,
@@ -465,64 +465,26 @@ fn decode_text(
             continue;
         }
 
-        // Optional dump for the host-side post-chain debug harness.
-        dump_final_hidden_if_requested(step, loop_state.position, &outputs.final_hidden_bytes)?;
-
-        // Generation step: when the megakernel didn't fold lm_head
-        // (chained path), launch the standalone final RMSnorm +
-        // lm_head GEMV here. When folded (persistent + gen), skip the
-        // launch — `logits_buf` is already populated by the
-        // megakernel.
-        let t2 = std::time::Instant::now();
-        let logits = if lm_head_folded {
-            logits_buf
-                .to_host_bytes()
-                .context("d2h logits from folded GPU lm_head")?
-        } else {
-            launch_lm_head_from_final_hidden_bytes(
-                ordinal,
-                &geom,
-                &outputs.final_hidden_bytes,
-                LmHeadBuffers {
-                    final_norm_w: &final_norm_w_buf,
-                    lm_head_w: &lm_head_w_buf,
-                    final_hidden: &mut final_hidden_buf,
-                    logits: &mut logits_buf,
-                    counter: &mut counter_buf,
-                },
-            )
-            .context("standalone GPU lm_head")?
-        };
-        if dump_last_logits {
-            loop_state.record_last_logits(&logits);
-        }
-        let t_lm_head_step = t2.elapsed();
-        dump_logits_if_requested(step, &logits)?;
-        let t3 = std::time::Instant::now();
-        let next_token = sample_bf16_logits(
-            &logits,
-            sampling.temperature,
-            sampling.top_k,
-            sampling.top_p,
-            &mut rng,
-        );
-        let t_sample_step = t3.elapsed();
-        loop_state.generated_ids.push(next_token);
-
-        // Stream-decode and print.
-        let t4 = std::time::Instant::now();
-        print_decoded_token(tokenizer.as_ref(), next_token);
-        std::io::stdout().flush().ok();
-        let t_detok_step = t4.elapsed();
-
-        stage_timings.record_generation_step(
+        let next_token = run_generation_step(Qwen36GenerationStep {
+            ordinal,
+            geom: &geom,
+            step,
+            lm_head_folded,
+            dump_last_logits,
+            tokenizer: tokenizer.as_ref(),
+            sampling,
             t_embed_step,
             t_chain_step,
-            t_lm_head_step,
-            t_sample_step,
-            t_detok_step,
-            &outputs,
-        );
+            outputs: &outputs,
+            final_norm_w_buf: &final_norm_w_buf,
+            lm_head_w_buf: &lm_head_w_buf,
+            final_hidden_buf: &mut final_hidden_buf,
+            logits_buf: &mut logits_buf,
+            counter_buf: &mut counter_buf,
+            loop_state: &mut loop_state,
+            rng: &mut rng,
+            stage_timings: &mut stage_timings,
+        })?;
 
         if Some(next_token) == eos_id {
             break;
