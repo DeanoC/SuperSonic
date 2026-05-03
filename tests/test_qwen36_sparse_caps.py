@@ -13,7 +13,16 @@ SPEC.loader.exec_module(bench_qwen36_sparse_caps)
 class Qwen36SparseCapBenchTests(unittest.TestCase):
     def assert_cases_equal(self, actual, expected):
         self.assertEqual(
-            [(case.label, case.cap, case.prefetch_mode, case.prefetch_ranks) for case in actual],
+            [
+                (
+                    case.label,
+                    case.cap,
+                    case.prefetch_mode,
+                    case.prefetch_ranks,
+                    case.protected_experts,
+                )
+                for case in actual
+            ],
             expected,
         )
 
@@ -56,29 +65,38 @@ class Qwen36SparseCapBenchTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             parse("unknown")
 
+    def test_parse_protected_policies_accepts_none_positive_and_dedupes(self):
+        parse = bench_qwen36_sparse_caps.parse_protected_policies
+        self.assertEqual(
+            parse("none,32,64,32,0"),
+            [("p0", None), ("p32", "32"), ("p64", "64")],
+        )
+        with self.assertRaises(ValueError):
+            parse("-1")
+
     def test_build_cases_expands_prefetch_rank_sweep_per_cap(self):
         build_cases = bench_qwen36_sparse_caps.build_cases
         self.assert_cases_equal(
-            build_cases([8, 320], None, "none,1,all", "previous-token", None),
+            build_cases([8, 320], None, "none,1,all", None, "previous-token", None, None),
             [
-                ("dense", None, None, None),
-                ("cap8-none", 8, None, None),
-                ("cap8-r1", 8, "previous-token", "1"),
-                ("cap8-all", 8, "previous-token", "all"),
-                ("cap320-none", 320, None, None),
-                ("cap320-r1", 320, "previous-token", "1"),
-                ("cap320-all", 320, "previous-token", "all"),
+                ("dense", None, None, None, None),
+                ("cap8-none", 8, None, None, None),
+                ("cap8-r1", 8, "previous-token", "1", None),
+                ("cap8-all", 8, "previous-token", "all", None),
+                ("cap320-none", 320, None, None, None),
+                ("cap320-r1", 320, "previous-token", "1", None),
+                ("cap320-all", 320, "previous-token", "all", None),
             ],
         )
 
     def test_build_cases_preserves_single_policy_mode(self):
         build_cases = bench_qwen36_sparse_caps.build_cases
         self.assert_cases_equal(
-            build_cases([64, 128], None, None, "previous-token-resident", "4"),
+            build_cases([64, 128], None, None, None, "previous-token-resident", "4", "32"),
             [
-                ("dense", None, None, None),
-                ("cap64", 64, "previous-token-resident", "4"),
-                ("cap128", 128, "previous-token-resident", "4"),
+                ("dense", None, None, None, None),
+                ("cap64-p32", 64, "previous-token-resident", "4", "32"),
+                ("cap128-p32", 128, "previous-token-resident", "4", "32"),
             ],
         )
 
@@ -91,26 +109,41 @@ class Qwen36SparseCapBenchTests(unittest.TestCase):
                 "none,1,all",
                 None,
                 None,
+                None,
+                None,
             ),
             [
-                ("dense", None, None, None),
-                ("cap320-none", 320, None, None),
-                ("cap320-previous-token-r1", 320, "previous-token", "1"),
-                ("cap320-previous-token-all", 320, "previous-token", "all"),
+                ("dense", None, None, None, None),
+                ("cap320-none", 320, None, None, None),
+                ("cap320-previous-token-r1", 320, "previous-token", "1", None),
+                ("cap320-previous-token-all", 320, "previous-token", "all", None),
                 (
                     "cap320-previous-token-resident-r1",
                     320,
                     "previous-token-resident",
                     "1",
+                    None,
                 ),
                 (
                     "cap320-previous-token-resident-all",
                     320,
                     "previous-token-resident",
                     "all",
+                    None,
                 ),
-                ("cap320-transition-r1", 320, "transition", "1"),
-                ("cap320-transition-all", 320, "transition", "all"),
+                ("cap320-transition-r1", 320, "transition", "1", None),
+                ("cap320-transition-all", 320, "transition", "all", None),
+            ],
+        )
+
+    def test_build_cases_expands_protected_sweep_per_sparse_case(self):
+        build_cases = bench_qwen36_sparse_caps.build_cases
+        self.assert_cases_equal(
+            build_cases([320], None, None, "none,64", None, None, None),
+            [
+                ("dense", None, None, None, None),
+                ("cap320-p0", 320, None, None, None),
+                ("cap320-p64", 320, None, None, "64"),
             ],
         )
 

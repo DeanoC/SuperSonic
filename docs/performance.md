@@ -291,6 +291,17 @@ previous-token prefetch, resident-only LRU refresh, and online transition-aware
 admission without hand-running separate commands. The markdown table includes
 same-rank repeat, previous-rank reuse, and best-transition columns derived from
 the route transition matrix.
+Use `--protected-sweep none,32,64,96,128` to expand each sparse row across
+protected eviction-band sizes; this sets
+`SUPERSONIC_MOE_ISLAND_PROTECTED_EXPERTS` for sparse rows only and adds
+protected-page/protect-hit columns to the markdown output.
+
+Short protected-band smoke on 2026-05-03 (`cap320`, 8 generated tokens,
+no warmup) kept resident memory fixed at 1.29 GiB and preserved greedy output,
+but it did not improve throughput: `p0` measured 110.43 ms/tok, `p32` 112.54,
+`p64` 113.81, `p96` 113.87, and `p128` 123.97. Larger protected bands also
+increased demand misses on this prompt, so the protected band is telemetry and
+tuning infrastructure for now, not a default policy.
 
 **Sparse MoE previous-token prefetch sweep** — measured 2026-05-03 after
 non-evicting prefetch admission landed. Same host/GPU/model/prompt as above,

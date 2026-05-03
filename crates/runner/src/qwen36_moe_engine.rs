@@ -1092,6 +1092,21 @@ fn moe_island_cap_experts_from_env() -> Result<Option<usize>> {
     Ok(Some(cap))
 }
 
+fn moe_island_protected_experts_from_env_value(raw: Option<&str>) -> Result<Option<usize>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let value = raw.parse::<usize>().with_context(|| {
+        format!("parse SUPERSONIC_MOE_ISLAND_PROTECTED_EXPERTS={raw:?} as non-negative integer")
+    })?;
+    Ok((value > 0).then_some(value))
+}
+
+fn moe_island_protected_experts_from_env() -> Result<Option<usize>> {
+    let raw = std::env::var("SUPERSONIC_MOE_ISLAND_PROTECTED_EXPERTS").ok();
+    moe_island_protected_experts_from_env_value(raw.as_deref())
+}
+
 fn moe_island_prefetch_ranks_from_env_value(
     raw: Option<&str>,
     mode: MoeIslandPrefetchMode,
@@ -2142,6 +2157,7 @@ fn decode_text(
 
     let moe_vmm_mode = MoeExpertVmmMode::from_env()?;
     let moe_island_cap_experts = moe_island_cap_experts_from_env()?;
+    let moe_island_protected_experts = moe_island_protected_experts_from_env()?;
     if moe_island_cap_experts.is_some() && speculative_decode {
         anyhow::bail!(
             "SUPERSONIC_MOE_ISLAND_CAP_EXPERTS sparse residency is not wired through speculative decode yet"
@@ -2162,6 +2178,11 @@ fn decode_text(
         moe_island_prefetch_transition_min_observations(moe_prefetch_mode)?;
     if moe_prefetch_mode != MoeIslandPrefetchMode::Disabled && !sparse_moe_requested {
         anyhow::bail!("SUPERSONIC_MOE_ISLAND_PREFETCH requires SUPERSONIC_MOE_ISLAND_CAP_EXPERTS");
+    }
+    if moe_island_protected_experts.is_some() && !sparse_moe_requested {
+        anyhow::bail!(
+            "SUPERSONIC_MOE_ISLAND_PROTECTED_EXPERTS requires SUPERSONIC_MOE_ISLAND_CAP_EXPERTS"
+        );
     }
     let mut moe_sparse_telemetry = MoeSparseTelemetry::from_env(
         sparse_moe_requested,
@@ -2212,14 +2233,27 @@ fn decode_text(
         manager
             .set_max_resident_pages(max_resident_pages)
             .context("apply sparse MoE page budget")?;
+        let max_protected_pages = if let Some(protected_experts) = moe_island_protected_experts {
+            let pages = manager
+                .page_budget_for_routed_experts(protected_experts)
+                .context(
+                    "derive sparse MoE protected page budget from routed expert tensor layout",
+                )?
+                .min(max_resident_pages);
+            manager.set_max_protected_pages(pages);
+            pages
+        } else {
+            0
+        };
         let arena_stats = manager.arena().stats();
         let residency_stats = manager.stats();
         println!(
             "  [vmm] Qwen3.6-MoE sparse routed expert residency active on backend={} device {ordinal}: \
-             tensors={} max_pages={} logical={:.2}MiB resident={:.2}MiB reserved={:.2}MiB",
+             tensors={} max_pages={} protected_pages={} logical={:.2}MiB resident={:.2}MiB reserved={:.2}MiB",
             backend,
             residency_stats.registered_tensors,
             max_resident_pages,
+            max_protected_pages,
             arena_stats.logical_bytes as f64 / MIB,
             arena_stats.resident_bytes as f64 / MIB,
             arena_stats.reserved_bytes as f64 / MIB,
@@ -3552,8 +3586,9 @@ mod tests {
     use super::{
         moe_island_prefetch_ranks_from_env_value,
         moe_island_prefetch_transition_min_observations_from_env_value,
-        qwen36_kv_vmm_mode_from_env_value, ExpertRoute, MoeIslandPrefetchMode, MoeRouteTelemetry,
-        MoeTransitionPredictor, Qwen36KvVmmMode,
+        moe_island_protected_experts_from_env_value, qwen36_kv_vmm_mode_from_env_value,
+        ExpertRoute, MoeIslandPrefetchMode, MoeRouteTelemetry, MoeTransitionPredictor,
+        Qwen36KvVmmMode,
     };
     use gpu_hal::Backend;
 
@@ -3716,6 +3751,23 @@ mod tests {
             8,
         )
         .is_err());
+    }
+
+    #[test]
+    fn moe_protected_experts_env_accepts_unset_zero_and_positive_values() {
+        assert_eq!(
+            moe_island_protected_experts_from_env_value(None).unwrap(),
+            None
+        );
+        assert_eq!(
+            moe_island_protected_experts_from_env_value(Some("0")).unwrap(),
+            None
+        );
+        assert_eq!(
+            moe_island_protected_experts_from_env_value(Some("64")).unwrap(),
+            Some(64)
+        );
+        assert!(moe_island_protected_experts_from_env_value(Some("bad")).is_err());
     }
 
     #[test]

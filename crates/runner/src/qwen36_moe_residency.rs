@@ -69,6 +69,13 @@ pub struct MoeExpertResidencyStats {
     pub prefetch_skipped: u64,
     pub prefetch_skipped_pages: u64,
     pub prefetch_uploaded_bytes: usize,
+    pub protected_pages: usize,
+    pub protected_page_budget: usize,
+    pub protect_requests: u64,
+    pub protect_hits: u64,
+    pub protect_misses: u64,
+    pub protect_demotions: u64,
+    pub protected_evicted_pages: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -132,6 +139,8 @@ pub struct MoeExpertResidencyManager {
     tensor_by_layer_projection: HashMap<(usize, MoeExpertProjection), usize>,
     resident: HashMap<MoeExpertKey, ResidentSlice>,
     resident_pages: HashMap<ResidentPageKey, ResidentPage>,
+    protected_pages: HashMap<ResidentPageKey, u64>,
+    max_protected_pages: usize,
     clock: u64,
     hits: u64,
     misses: u64,
@@ -149,6 +158,11 @@ pub struct MoeExpertResidencyManager {
     prefetch_skipped: u64,
     prefetch_skipped_pages: u64,
     prefetch_uploaded_bytes: usize,
+    protect_requests: u64,
+    protect_hits: u64,
+    protect_misses: u64,
+    protect_demotions: u64,
+    protected_evicted_pages: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,6 +180,8 @@ impl MoeExpertResidencyManager {
             tensor_by_layer_projection: HashMap::new(),
             resident: HashMap::new(),
             resident_pages: HashMap::new(),
+            protected_pages: HashMap::new(),
+            max_protected_pages: 0,
             clock: 0,
             hits: 0,
             misses: 0,
@@ -183,6 +199,11 @@ impl MoeExpertResidencyManager {
             prefetch_skipped: 0,
             prefetch_skipped_pages: 0,
             prefetch_uploaded_bytes: 0,
+            protect_requests: 0,
+            protect_hits: 0,
+            protect_misses: 0,
+            protect_demotions: 0,
+            protected_evicted_pages: 0,
         }
     }
 
@@ -217,6 +238,13 @@ impl MoeExpertResidencyManager {
             prefetch_skipped: self.prefetch_skipped,
             prefetch_skipped_pages: self.prefetch_skipped_pages,
             prefetch_uploaded_bytes: self.prefetch_uploaded_bytes,
+            protected_pages: self.protected_pages.len(),
+            protected_page_budget: self.max_protected_pages,
+            protect_requests: self.protect_requests,
+            protect_hits: self.protect_hits,
+            protect_misses: self.protect_misses,
+            protect_demotions: self.protect_demotions,
+            protected_evicted_pages: self.protected_evicted_pages,
         }
     }
 
@@ -229,7 +257,17 @@ impl MoeExpertResidencyManager {
         while self.resident_pages.len() > self.config.max_resident_pages {
             self.evict_lru_page()?;
         }
+        self.clamp_protected_pages();
         Ok(())
+    }
+
+    pub fn max_protected_pages(&self) -> usize {
+        self.max_protected_pages
+    }
+
+    pub fn set_max_protected_pages(&mut self, max_protected_pages: usize) {
+        self.max_protected_pages = max_protected_pages.min(self.config.max_resident_pages);
+        self.clamp_protected_pages();
     }
 
     pub fn page_budget_for_routed_experts(&self, routed_experts: usize) -> Result<usize> {
@@ -344,6 +382,44 @@ impl MoeExpertResidencyManager {
 
     pub fn prefetch_resident(&mut self, store: &BakedStore, key: MoeExpertKey) -> Result<()> {
         self.ensure_resident_with_kind(store, key, ResidencyAccessKind::Prefetch)
+    }
+
+    pub fn protect_resident(&mut self, key: MoeExpertKey) -> Result<()> {
+        self.protect_requests += 1;
+        if self.max_protected_pages == 0 {
+            self.protect_misses += 1;
+            return Ok(());
+        }
+        let Some(resident) = self.resident.get(&key).cloned() else {
+            self.protect_misses += 1;
+            return Ok(());
+        };
+        let tensor = &self.tensors[resident.tensor_idx];
+        let pages = page_spans(
+            tensor.page_bytes,
+            resident.page_offset,
+            resident.page_len,
+            tensor.len_bytes,
+        );
+        let mut protected = 0usize;
+        self.clock += 1;
+        for span in pages {
+            let page_key = ResidentPageKey {
+                tensor_idx: resident.tensor_idx,
+                page_offset: span.offset,
+            };
+            if self.resident_pages.contains_key(&page_key) {
+                self.protected_pages.insert(page_key, self.clock);
+                protected += 1;
+            }
+        }
+        if protected == 0 {
+            self.protect_misses += 1;
+        } else {
+            self.protect_hits += 1;
+        }
+        self.clamp_protected_pages();
+        Ok(())
     }
 
     fn ensure_resident_with_kind(
@@ -520,11 +596,19 @@ impl MoeExpertResidencyManager {
         let Some((victim, page)) = self
             .resident_pages
             .iter()
-            .min_by_key(|(_, page)| page.last_used)
+            .min_by_key(|(key, page)| {
+                (
+                    self.protected_pages.contains_key(key),
+                    page.last_used,
+                    page.tensor_idx,
+                    page.page_offset,
+                )
+            })
             .map(|(key, page)| (*key, page.clone()))
         else {
             return Ok(());
         };
+        let victim_was_protected = self.protected_pages.contains_key(&victim);
 
         let tensor = &self.tensors[page.tensor_idx];
         let allocation = self
@@ -543,6 +627,9 @@ impl MoeExpertResidencyManager {
         self.unmapped_bytes += removed_ranges.iter().map(|(_, len)| *len).sum::<usize>();
         if removed_ranges.is_empty() {
             self.resident_pages.remove(&victim);
+            if self.protected_pages.remove(&victim).is_some() {
+                self.protected_evicted_pages += 1;
+            }
             let removed_slices = self.remove_resident_slices_overlapping(
                 page.tensor_idx,
                 page.page_offset,
@@ -557,9 +644,35 @@ impl MoeExpertResidencyManager {
             self.remove_resident_pages_overlapping(page.tensor_idx, &removed_ranges);
         let removed_slices =
             self.remove_resident_slices_overlapping_ranges(page.tensor_idx, &removed_ranges);
+        self.prune_protected_pages();
+        if victim_was_protected {
+            self.protected_evicted_pages += 1;
+        }
         self.evicted_pages += removed_pages as u64;
         self.evicted_slices += removed_slices as u64;
         Ok(())
+    }
+
+    fn clamp_protected_pages(&mut self) {
+        while self.protected_pages.len() > self.max_protected_pages {
+            let Some(victim) = self
+                .protected_pages
+                .iter()
+                .min_by_key(|(_, protected_at)| **protected_at)
+                .map(|(key, _)| *key)
+            else {
+                return;
+            };
+            self.protected_pages.remove(&victim);
+            self.protect_demotions += 1;
+        }
+    }
+
+    fn prune_protected_pages(&mut self) {
+        let before = self.protected_pages.len();
+        self.protected_pages
+            .retain(|key, _| self.resident_pages.contains_key(key));
+        self.protect_demotions += (before - self.protected_pages.len()) as u64;
     }
 
     fn remove_resident_pages_overlapping(
@@ -940,6 +1053,72 @@ mod tests {
                 .expect("read expert 1");
             assert!(bytes.iter().all(|b| *b == 2));
         });
+    }
+
+    #[test]
+    fn protected_pages_are_evicted_after_unprotected_pages() {
+        with_supported_vmm_backend(
+            "protected_pages_are_evicted_after_unprotected_pages",
+            |_backend| {
+                let probe_tmp = synthetic_store(1, 4096);
+                let probe_store = BakedStore::open(probe_tmp.path()).expect("open probe store");
+                let mut probe =
+                    MoeExpertResidencyManager::new(0, MoeExpertResidencyConfig::new(1).unwrap());
+                probe
+                    .register_tensor(
+                        &probe_store,
+                        0,
+                        MoeExpertProjection::GateUp,
+                        "model.layers.0.mlp.experts.gate_up_proj",
+                        1,
+                    )
+                    .expect("register probe tensor");
+                let expert_bytes = probe.tensors[0].page_bytes;
+
+                let tmp = synthetic_store(3, expert_bytes);
+                let store = BakedStore::open(tmp.path()).expect("open synthetic store");
+                let mut manager =
+                    MoeExpertResidencyManager::new(0, MoeExpertResidencyConfig::new(2).unwrap());
+                manager.set_max_protected_pages(1);
+                manager
+                    .register_tensor(
+                        &store,
+                        0,
+                        MoeExpertProjection::GateUp,
+                        "model.layers.0.mlp.experts.gate_up_proj",
+                        3,
+                    )
+                    .expect("register tensor");
+
+                let e0 = MoeExpertKey {
+                    layer_idx: 0,
+                    expert_idx: 0,
+                    projection: MoeExpertProjection::GateUp,
+                };
+                let e1 = MoeExpertKey {
+                    layer_idx: 0,
+                    expert_idx: 1,
+                    projection: MoeExpertProjection::GateUp,
+                };
+                let e2 = MoeExpertKey {
+                    layer_idx: 0,
+                    expert_idx: 2,
+                    projection: MoeExpertProjection::GateUp,
+                };
+
+                manager.ensure_resident(&store, e0).expect("load expert 0");
+                manager.protect_resident(e0).expect("protect expert 0");
+                manager.ensure_resident(&store, e1).expect("load expert 1");
+                manager.ensure_resident(&store, e2).expect("load expert 2");
+
+                assert!(manager.is_resident(e0));
+                assert!(!manager.is_resident(e1));
+                assert!(manager.is_resident(e2));
+                assert_eq!(manager.stats().protected_pages, 1);
+                assert_eq!(manager.stats().protect_hits, 1);
+                assert!(manager.stats().evicted_pages >= 1);
+            },
+        );
     }
 
     #[test]
