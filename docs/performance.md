@@ -708,3 +708,32 @@ CONTEXTS='512' NUM_CHUNKS=1 CONFIG=both \
   ./tests/sm86/bench_llama31_pg19_smoke.sh \
   /path/to/Meta-Llama-3.1-8B
 ```
+
+## Runtime feature impact
+
+Measured delta of each runtime feature on its canonical workload, on
+gfx1100 unless noted. **TBM = to be measured** — the feature is shipped
+and validated for correctness but the perf measurement script hasn't
+landed. Open an issue with reproduction notes if you want to fill one
+in.
+
+| Feature | Canonical workload | Baseline | With feature | Source |
+|---|---|---|---|---|
+| KV-FP8 | qwen3.5-9b INT4 + 1024-token prompt + 16 generated tokens, gfx1100 | ~26 ms/step | ~22 ms/step (15% lower) | tests/gfx1100/bench_matrix.sh |
+| KV-FP8 sidecar window | qwen3.6-35b-a3b INT4 + 4096-token context | TBM ms/step | TBM ms/step | (script TBM) |
+| VMM | qwen3.6-35b-a3b INT4 + 8192-token context, gfx1100 | OOM (24 GiB exceeded) | runs | tests/gfx1100/bench_qwen36_sparse_caps.py |
+| SpecPrefill (keep=0.50) | qwen3.5-9b BF16 + ~225-token prompt, gfx1100 | ~270 ms prefill | TBM ms prefill (speculator amortizes ~700 ms; net win is prompt-length-dependent) | crates/runner/tests/specprefill_qwen35_9b_parity.rs |
+| DFlash (B=3) | qwen3.5-9b INT4 greedy decode, gfx1100 | ~32 ms/step | ~12 ms/step (effective; 2.5–3× speedup) | docs/dflash.md M4.3 numbers |
+| MoE prefetch | qwen3.6-35b-a3b INT4 decode, gfx1100 | TBM ms/step | TBM ms/step | (script TBM) |
+| Certified KV (shadow-validate) | llama3.1-8b INT8 + 1024-token prompt, sm86 | TBM ms/step | TBM ms/step | (script TBM) |
+
+The DFlash numbers are pulled from [dflash.md](dflash.md)'s M4.3
+single-pass fused-verify section. The KV-FP8 number is the gfx1100
+matrix delta from the per-arch table at the top of this doc — it is
+*recorded* there for one workload and *re-stated here* with the
+feature label so the picker doc has a one-stop reference.
+
+The "Baseline" column is the comparison point — the dense / no-feature
+run on the same hardware, model, and prompt. The "Source" column names
+the bench script or test that produced (or will produce) the
+measurement.
