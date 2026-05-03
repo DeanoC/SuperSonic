@@ -267,7 +267,7 @@ def main() -> int:
     parser.add_argument("--no-persistent-decode", action="store_true")
     parser.add_argument(
         "--prefetch",
-        choices=["previous-token"],
+        choices=["previous-token", "previous-token-resident"],
         help="set SUPERSONIC_MOE_ISLAND_PREFETCH for sparse cap rows",
     )
     parser.add_argument(
@@ -288,7 +288,7 @@ def main() -> int:
     if args.prefetch_rank_sweep and (args.prefetch or args.prefetch_ranks is not None):
         parser.error("--prefetch-rank-sweep cannot be combined with --prefetch/--prefetch-ranks")
     if args.prefetch_ranks is not None and not args.prefetch:
-        parser.error("--prefetch-ranks requires --prefetch previous-token")
+        parser.error("--prefetch-ranks requires --prefetch")
     if args.prefetch_ranks is not None:
         try:
             _, ranks = parse_prefetch_rank_policy(args.prefetch_ranks)

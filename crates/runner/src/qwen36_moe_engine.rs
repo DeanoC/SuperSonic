@@ -1101,6 +1101,7 @@ fn moe_island_cap_experts_from_env() -> Result<Option<usize>> {
 enum MoeIslandPrefetchMode {
     Disabled,
     PreviousToken,
+    PreviousTokenResidentOnly,
 }
 
 impl MoeIslandPrefetchMode {
@@ -1108,21 +1109,41 @@ impl MoeIslandPrefetchMode {
         match self {
             Self::Disabled => "disabled",
             Self::PreviousToken => "previous-token",
+            Self::PreviousTokenResidentOnly => "previous-token-resident",
         }
     }
 
+    fn uses_previous_token_routes(self) -> bool {
+        matches!(self, Self::PreviousToken | Self::PreviousTokenResidentOnly)
+    }
+
+    fn resident_only(self) -> bool {
+        matches!(self, Self::PreviousTokenResidentOnly)
+    }
+
     fn from_env() -> Result<Self> {
-        match std::env::var("SUPERSONIC_MOE_ISLAND_PREFETCH")
-            .ok()
-            .as_deref()
-        {
+        Self::from_env_value(
+            std::env::var("SUPERSONIC_MOE_ISLAND_PREFETCH")
+                .ok()
+                .as_deref(),
+        )
+    }
+
+    fn from_env_value(raw: Option<&str>) -> Result<Self> {
+        match raw {
             None | Some("0") | Some("off") | Some("disabled") => Ok(Self::Disabled),
             Some("previous-token") | Some("previous_token") | Some("prev-token") => {
                 Ok(Self::PreviousToken)
             }
+            Some("previous-token-resident")
+            | Some("previous_token_resident")
+            | Some("prev-token-resident")
+            | Some("resident-previous-token") => Ok(Self::PreviousTokenResidentOnly),
             Some(other) => Err(anyhow!(
                 "SUPERSONIC_MOE_ISLAND_PREFETCH must be unset, 0, off, disabled, \
-                 previous-token, previous_token, or prev-token; got {other:?}"
+                 previous-token, previous_token, prev-token, previous-token-resident, \
+                 previous_token_resident, prev-token-resident, or resident-previous-token; \
+                 got {other:?}"
             )),
         }
     }
@@ -1138,27 +1159,29 @@ fn moe_island_prefetch_ranks_from_env_value(
             if raw.is_some() {
                 anyhow::bail!(
                     "SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS requires \
-                     SUPERSONIC_MOE_ISLAND_PREFETCH=previous-token"
+                     SUPERSONIC_MOE_ISLAND_PREFETCH=previous-token or previous-token-resident"
                 );
             }
             Ok(0)
         }
-        MoeIslandPrefetchMode::PreviousToken => match raw {
-            None | Some("all") => Ok(top_k),
-            Some(value) => {
-                let ranks = value.parse::<usize>().with_context(|| {
-                    format!(
+        MoeIslandPrefetchMode::PreviousToken | MoeIslandPrefetchMode::PreviousTokenResidentOnly => {
+            match raw {
+                None | Some("all") => Ok(top_k),
+                Some(value) => {
+                    let ranks = value.parse::<usize>().with_context(|| {
+                        format!(
                         "parse SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS={value:?} as positive integer"
                     )
-                })?;
-                if ranks == 0 || ranks > top_k {
-                    anyhow::bail!(
+                    })?;
+                    if ranks == 0 || ranks > top_k {
+                        anyhow::bail!(
                         "SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS must be in 1..={top_k}; got {ranks}"
                     );
+                    }
+                    Ok(ranks)
                 }
-                Ok(ranks)
             }
-        },
+        }
     }
 }
 
@@ -2518,10 +2541,11 @@ fn decode_text(
                  (router prefetch + FFN resume per layer)"
             );
         }
-        if moe_prefetch_mode == MoeIslandPrefetchMode::PreviousToken {
+        if moe_prefetch_mode.uses_previous_token_routes() {
             println!(
-                "  [vmm] sparse MoE previous-token lookahead prefetch active \
+                "  [vmm] sparse MoE {} lookahead prefetch active \
                  (ranks={moe_prefetch_ranks}/{})",
+                moe_prefetch_mode.as_str(),
                 geom.top_k
             );
         }
@@ -2917,8 +2941,8 @@ fn decode_text(
         let moe_telemetry_before = _moe_expert_residency
             .as_ref()
             .map(MoeSparseTelemetrySnapshot::capture);
-        let track_moe_routes = moe_prefetch_mode == MoeIslandPrefetchMode::PreviousToken
-            || moe_route_telemetry.is_some();
+        let track_moe_routes =
+            moe_prefetch_mode.uses_previous_token_routes() || moe_route_telemetry.is_some();
         let mut next_moe_topk_by_layer = if track_moe_routes {
             previous_moe_topk_by_layer.clone()
         } else {
@@ -2938,7 +2962,7 @@ fn decode_text(
                  -> Result<()> {
                     match phase {
                         ExpertPrefetchPhase::Lookahead
-                            if moe_prefetch_mode == MoeIslandPrefetchMode::PreviousToken =>
+                            if moe_prefetch_mode.uses_previous_token_routes() =>
                         {
                             for &expert_idx in previous_moe_topk_by_layer
                                 .get(layer_idx)
@@ -2957,6 +2981,11 @@ fn decode_text(
                                     expert_idx,
                                     projection: MoeExpertProjection::Down,
                                 };
+                                if moe_prefetch_mode.resident_only()
+                                    && !(manager.is_resident(gate_up) && manager.is_resident(down))
+                                {
+                                    continue;
+                                }
                                 manager.prefetch_resident(&store, gate_up)?;
                                 manager.prefetch_resident(&store, down)?;
                             }
@@ -3031,7 +3060,7 @@ fn decode_text(
                  -> Result<()> {
                     match phase {
                         ExpertPrefetchPhase::Lookahead
-                            if moe_prefetch_mode == MoeIslandPrefetchMode::PreviousToken =>
+                            if moe_prefetch_mode.uses_previous_token_routes() =>
                         {
                             for &expert_idx in previous_moe_topk_by_layer
                                 .get(layer_idx)
@@ -3050,6 +3079,11 @@ fn decode_text(
                                     expert_idx,
                                     projection: MoeExpertProjection::Down,
                                 };
+                                if moe_prefetch_mode.resident_only()
+                                    && !(manager.is_resident(gate_up) && manager.is_resident(down))
+                                {
+                                    continue;
+                                }
                                 manager.prefetch_resident(&store, gate_up)?;
                                 manager.prefetch_resident(&store, down)?;
                             }
@@ -3956,6 +3990,43 @@ mod tests {
     }
 
     #[test]
+    fn moe_prefetch_mode_env_accepts_disabled_and_previous_token_aliases() {
+        assert_eq!(
+            MoeIslandPrefetchMode::from_env_value(None).unwrap(),
+            MoeIslandPrefetchMode::Disabled
+        );
+        assert_eq!(
+            MoeIslandPrefetchMode::from_env_value(Some("disabled")).unwrap(),
+            MoeIslandPrefetchMode::Disabled
+        );
+        assert_eq!(
+            MoeIslandPrefetchMode::from_env_value(Some("previous-token")).unwrap(),
+            MoeIslandPrefetchMode::PreviousToken
+        );
+        assert_eq!(
+            MoeIslandPrefetchMode::from_env_value(Some("prev-token")).unwrap(),
+            MoeIslandPrefetchMode::PreviousToken
+        );
+    }
+
+    #[test]
+    fn moe_prefetch_mode_env_accepts_resident_only_aliases() {
+        assert_eq!(
+            MoeIslandPrefetchMode::from_env_value(Some("previous-token-resident")).unwrap(),
+            MoeIslandPrefetchMode::PreviousTokenResidentOnly
+        );
+        assert_eq!(
+            MoeIslandPrefetchMode::from_env_value(Some("previous_token_resident")).unwrap(),
+            MoeIslandPrefetchMode::PreviousTokenResidentOnly
+        );
+        assert_eq!(
+            MoeIslandPrefetchMode::from_env_value(Some("resident-previous-token")).unwrap(),
+            MoeIslandPrefetchMode::PreviousTokenResidentOnly
+        );
+        assert!(MoeIslandPrefetchMode::from_env_value(Some("resident")).is_err());
+    }
+
+    #[test]
     fn moe_prefetch_ranks_default_to_all_previous_token_routes() {
         assert_eq!(
             moe_island_prefetch_ranks_from_env_value(
@@ -3969,7 +4040,7 @@ mod tests {
         assert_eq!(
             moe_island_prefetch_ranks_from_env_value(
                 Some("all"),
-                MoeIslandPrefetchMode::PreviousToken,
+                MoeIslandPrefetchMode::PreviousTokenResidentOnly,
                 8,
             )
             .unwrap(),
@@ -3991,7 +4062,7 @@ mod tests {
         assert_eq!(
             moe_island_prefetch_ranks_from_env_value(
                 Some("4"),
-                MoeIslandPrefetchMode::PreviousToken,
+                MoeIslandPrefetchMode::PreviousTokenResidentOnly,
                 8,
             )
             .unwrap(),
