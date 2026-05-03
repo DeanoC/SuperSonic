@@ -3693,6 +3693,7 @@ impl DecodeEngine {
         target_nll_token: Option<u32>,
         accumulate_target_nll: bool,
         mut timings: Option<&mut DecodeStageTimings>,
+        mut full_attn_q_capture: Option<(&[usize], &mut Vec<Option<Vec<u8>>>)>,
     ) -> Result<(
         Option<Vec<f32>>,
         Option<u32>,
@@ -3746,13 +3747,29 @@ impl DecodeEngine {
 
             if self.weights.config.is_full_attention(i) {
                 let full_attn_start = Instant::now();
-                let _ = self.component_decode_full_attention_layer(
+                let want_q_capture = full_attn_q_capture
+                    .as_ref()
+                    .map(|(layers, _)| layers.contains(&i))
+                    .unwrap_or(false);
+                let trace = self.component_decode_full_attention_layer(
                     i,
                     seqlen_offset,
-                    false,
+                    want_q_capture,
                     certified_kv_decode,
                     timings.as_deref_mut(),
                 )?;
+                if want_q_capture {
+                    let q_rope = trace
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "layer {i}: full-attn Q capture requested but trace missing"
+                            )
+                        })?
+                        .q_rope;
+                    if let Some((_, slots)) = full_attn_q_capture.as_mut() {
+                        slots[i] = Some(q_rope);
+                    }
+                }
                 self.sync_stage_if_requested(
                     collect_timings,
                     &format!("layer {i} full attention"),
@@ -4061,6 +4078,7 @@ impl DecodeEngine {
             None,
             false,
             None,
+            None,
         )?;
         logits.ok_or_else(|| anyhow::anyhow!("component decode missing logits"))
     }
@@ -4082,6 +4100,7 @@ impl DecodeEngine {
             None,
             false,
             Some(&mut timings),
+            None,
         )?;
         let logits =
             logits.ok_or_else(|| anyhow::anyhow!("component decode timings missing logits"))?;
@@ -4117,6 +4136,7 @@ impl DecodeEngine {
             None,
             false,
             timing_slot,
+            None,
         )?;
         let sampled_token = sampled_token
             .ok_or_else(|| anyhow::anyhow!("component CUDA fast greedy missing sampled token"))?;
@@ -4140,6 +4160,7 @@ impl DecodeEngine {
             None,
             false,
             None,
+            None,
         )?;
         logits.ok_or_else(|| anyhow::anyhow!("certified KV decode missing logits"))
     }
@@ -4162,6 +4183,7 @@ impl DecodeEngine {
             None,
             false,
             Some(&mut timings),
+            None,
         )?;
         let logits = logits.ok_or_else(|| anyhow::anyhow!("certified KV decode missing logits"))?;
         Ok((logits, timings))
@@ -4192,6 +4214,7 @@ impl DecodeEngine {
             Some(target_token),
             false,
             timing_slot,
+            None,
         )?;
         let nll = nll.ok_or_else(|| anyhow::anyhow!("component target NLL missing output"))?;
         Ok((nll, timings))
@@ -4241,6 +4264,7 @@ impl DecodeEngine {
             Some(target_token),
             true,
             timing_slot,
+            None,
         )?;
         nll.ok_or_else(|| anyhow::anyhow!("component accumulated target NLL missing marker"))?;
         Ok(timings)
@@ -4273,6 +4297,7 @@ impl DecodeEngine {
             None,
             false,
             timing_slot,
+            None,
         )?;
         let sampled_token = sampled_token
             .ok_or_else(|| anyhow::anyhow!("certified KV fast greedy missing sampled token"))?;
@@ -4295,6 +4320,7 @@ impl DecodeEngine {
             None,
             None,
             false,
+            None,
             None,
         )?;
         let logits = logits.ok_or_else(|| anyhow::anyhow!("component trace missing logits"))?;
@@ -4319,6 +4345,7 @@ impl DecodeEngine {
             None,
             None,
             false,
+            None,
             None,
         )?;
         let logits =
@@ -4345,12 +4372,87 @@ impl DecodeEngine {
             None,
             false,
             None,
+            None,
         )?;
         let logits =
             logits.ok_or_else(|| anyhow::anyhow!("component linear trace missing logits"))?;
         let trace =
             trace.ok_or_else(|| anyhow::anyhow!("missing linear trace for layer {trace_layer}"))?;
         Ok((logits, trace))
+    }
+
+    /// SpecPrefill (arXiv 2502.02789): single decode step that captures the
+    /// post-RoPE Q row at every full-attention layer named in `layers`.
+    ///
+    /// Returns `(logits_f32, q_rows)` where `q_rows[k]` is the BF16-byte
+    /// `[1, num_q_heads, head_dim]` row for `layers[k]`, in the same order
+    /// as `layers` (input order is preserved).
+    ///
+    /// # Invariants
+    /// - Requires `use_4b_kernel = true`.
+    /// - Requires `batch_size = 1`.
+    /// - All indices in `layers` must be full-attention layers
+    ///   (`config.is_full_attention(li) == true`).
+    pub fn decode_step_with_query_capture(
+        &mut self,
+        token_id: u32,
+        seqlen_offset: usize,
+        layers: &[usize],
+    ) -> Result<(Vec<f32>, Vec<Vec<u8>>)> {
+        if !self.use_4b_kernel {
+            anyhow::bail!("decode_step_with_query_capture requires use_4b_kernel");
+        }
+        if self.batch_size != 1 {
+            anyhow::bail!("decode_step_with_query_capture requires batch_size=1");
+        }
+        let num_layers = self.weights.config.num_hidden_layers;
+        for &li in layers {
+            if li >= num_layers {
+                anyhow::bail!(
+                    "decode_step_with_query_capture: layer {li} out of range \
+                     (num_hidden_layers={num_layers})"
+                );
+            }
+            if !self.weights.config.is_full_attention(li) {
+                anyhow::bail!(
+                    "decode_step_with_query_capture: layer {li} is not a full-attention layer"
+                );
+            }
+        }
+        // Allocate one slot per layer index; the loop writes `slots[i] = Some(q_rope)`.
+        // Post-processing harvests in `layers` order, giving captures[k] == layers[k].
+        let mut slots: Vec<Option<Vec<u8>>> = vec![None; num_layers];
+        let (logits, _, _, _, _, _) = self.component_decode_step_4b_impl(
+            token_id,
+            seqlen_offset,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            false,
+            None,
+            Some((layers, &mut slots)),
+        )?;
+        let logits = logits
+            .ok_or_else(|| anyhow::anyhow!("decode_step_with_query_capture: missing logits"))?;
+        let captures: Vec<Vec<u8>> = layers
+            .iter()
+            .map(|&li| {
+                slots[li].take().ok_or_else(|| {
+                    anyhow::anyhow!("decode_step_with_query_capture: layer {li} not captured")
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if captures.len() != layers.len() {
+            anyhow::bail!(
+                "decode_step_with_query_capture: captured {} layers, expected {}",
+                captures.len(),
+                layers.len()
+            );
+        }
+        Ok((logits, captures))
     }
 
     fn component_decode_full_attention_layer(
