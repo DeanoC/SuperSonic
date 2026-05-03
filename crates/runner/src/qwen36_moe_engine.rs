@@ -42,12 +42,18 @@ use crate::qwen36_moe_speculative::{
 use crate::qwen36_moe_state::{refresh_linear_attn_state, restore_linear_attn_state};
 use crate::qwen36_moe_telemetry::{
     MoeIslandPrefetchMode, MoeRouteTelemetry, MoeSparseTelemetry, MoeSparseTelemetrySnapshot,
-    MoeTransitionPredictor, VirtualKvStats,
+    MoeTransitionPredictor,
+};
+use crate::qwen36_moe_vmm::{
+    moe_island_cap_experts_from_env, moe_island_prefetch_ranks_from_env,
+    moe_island_prefetch_transition_min_observations, should_try_moe_expert_vmm,
+    should_use_qwen36_kv_vmm, virtual_kv_stats_for_layers, MoeExpertVmmMode,
 };
 use crate::registry::{FamilyParams, Qwen36MoeKernelParams, RegistryEntry};
 
 const GIB: f64 = (1024 * 1024 * 1024) as f64;
 const MIB: f64 = (1024 * 1024) as f64;
+const QWEN36_NUM_SPECULATIVE_TOKENS: usize = 3;
 
 pub struct DryRunReport {
     pub config: Config,
@@ -1059,187 +1065,18 @@ enum Qwen36WeightMode {
     Fp8,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MoeExpertVmmMode {
-    Auto,
-    Disabled,
-    Force,
-}
+impl Qwen36WeightMode {
+    fn is_int4(self) -> bool {
+        self == Self::Int4
+    }
 
-impl MoeExpertVmmMode {
-    fn from_env() -> Result<Self> {
-        match std::env::var("SUPERSONIC_VMM_MOE_ISLANDS").ok().as_deref() {
-            None => Ok(Self::Auto),
-            Some("0") => Ok(Self::Disabled),
-            Some("1") => Ok(Self::Force),
-            Some(other) => Err(anyhow!(
-                "SUPERSONIC_VMM_MOE_ISLANDS must be unset, 0, or 1; got {other:?}"
-            )),
+    fn display_name(self) -> &'static str {
+        match self {
+            Self::Bf16 => "BF16",
+            Self::Int4 => "INT4 GPTQ",
+            Self::Fp8 => "FP8 native",
         }
     }
-}
-
-fn moe_island_cap_experts_from_env() -> Result<Option<usize>> {
-    let Some(raw) = std::env::var("SUPERSONIC_MOE_ISLAND_CAP_EXPERTS").ok() else {
-        return Ok(None);
-    };
-    let cap = raw.parse::<usize>().with_context(|| {
-        format!("parse SUPERSONIC_MOE_ISLAND_CAP_EXPERTS={raw:?} as positive integer")
-    })?;
-    if cap == 0 {
-        anyhow::bail!("SUPERSONIC_MOE_ISLAND_CAP_EXPERTS must be > 0");
-    }
-    Ok(Some(cap))
-}
-
-fn moe_island_prefetch_ranks_from_env_value(
-    raw: Option<&str>,
-    mode: MoeIslandPrefetchMode,
-    top_k: usize,
-) -> Result<usize> {
-    match mode {
-        MoeIslandPrefetchMode::Disabled => {
-            if raw.is_some() {
-                anyhow::bail!(
-                    "SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS requires \
-                     SUPERSONIC_MOE_ISLAND_PREFETCH=previous-token, \
-                     previous-token-resident, or transition"
-                );
-            }
-            Ok(0)
-        }
-        MoeIslandPrefetchMode::PreviousToken
-        | MoeIslandPrefetchMode::PreviousTokenResidentOnly
-        | MoeIslandPrefetchMode::Transition => match raw {
-            None | Some("all") => Ok(top_k),
-            Some(value) => {
-                let ranks = value.parse::<usize>().with_context(|| {
-                    format!(
-                        "parse SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS={value:?} as positive integer"
-                    )
-                })?;
-                if ranks == 0 || ranks > top_k {
-                    anyhow::bail!(
-                        "SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS must be in 1..={top_k}; got {ranks}"
-                    );
-                }
-                Ok(ranks)
-            }
-        },
-    }
-}
-
-fn moe_island_prefetch_ranks_from_env(mode: MoeIslandPrefetchMode, top_k: usize) -> Result<usize> {
-    let raw = std::env::var("SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS").ok();
-    moe_island_prefetch_ranks_from_env_value(raw.as_deref(), mode, top_k)
-}
-
-fn moe_island_prefetch_transition_min_observations_from_env_value(
-    raw: Option<&str>,
-    mode: MoeIslandPrefetchMode,
-) -> Result<u32> {
-    if !mode.transition_weighted() {
-        if raw.is_some() {
-            anyhow::bail!(
-                "SUPERSONIC_MOE_ISLAND_PREFETCH_TRANSITION_MIN_OBS requires \
-                 SUPERSONIC_MOE_ISLAND_PREFETCH=transition"
-            );
-        }
-        return Ok(0);
-    }
-
-    let Some(value) = raw else {
-        return Ok(32);
-    };
-    value.parse::<u32>().with_context(|| {
-        format!("parse SUPERSONIC_MOE_ISLAND_PREFETCH_TRANSITION_MIN_OBS={value:?} as integer")
-    })
-}
-
-fn moe_island_prefetch_transition_min_observations(mode: MoeIslandPrefetchMode) -> Result<u32> {
-    let raw = std::env::var("SUPERSONIC_MOE_ISLAND_PREFETCH_TRANSITION_MIN_OBS").ok();
-    moe_island_prefetch_transition_min_observations_from_env_value(raw.as_deref(), mode)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Qwen36KvVmmMode {
-    Auto,
-    Disabled,
-    Force,
-}
-
-fn qwen36_kv_vmm_mode_from_env_value(
-    raw: Option<&str>,
-    backend: Backend,
-) -> Result<Qwen36KvVmmMode> {
-    match raw {
-        None if backend == Backend::Hip => Ok(Qwen36KvVmmMode::Auto),
-        None => Ok(Qwen36KvVmmMode::Disabled),
-        Some("0") => Ok(Qwen36KvVmmMode::Disabled),
-        Some("1") => Ok(Qwen36KvVmmMode::Force),
-        Some(other) => Err(anyhow!(
-            "SUPERSONIC_VMM_KV must be unset, 0, or 1 for Qwen3.6-MoE; got {other:?}"
-        )),
-    }
-}
-
-fn should_use_qwen36_kv_vmm(backend: Backend, ordinal: usize) -> Result<bool> {
-    let mode = qwen36_kv_vmm_mode_from_env_value(
-        std::env::var("SUPERSONIC_VMM_KV").ok().as_deref(),
-        backend,
-    )?;
-    let requested = match mode {
-        Qwen36KvVmmMode::Disabled => return Ok(false),
-        Qwen36KvVmmMode::Auto | Qwen36KvVmmMode::Force => true,
-    };
-    if !gpu_hal::vmm_is_supported(backend, ordinal) {
-        if mode == Qwen36KvVmmMode::Force {
-            eprintln!(
-                "[vmm] SUPERSONIC_VMM_KV=1 requested for Qwen3.6-MoE but backend={backend} \
-                 device {ordinal} does not support VMM; using dense KV buffers"
-            );
-        } else {
-            eprintln!(
-                "[vmm] Qwen3.6-MoE HIP KV VMM auto-enable skipped because backend={backend} \
-                 device {ordinal} does not support VMM; using dense KV buffers"
-            );
-        }
-        return Ok(false);
-    }
-    Ok(requested)
-}
-
-fn virtual_kv_stats_for_layers(layers: &[LayerBuffers]) -> VirtualKvStats {
-    let mut out = VirtualKvStats::default();
-    for layer in layers {
-        let AttnLayerBuffers::Full {
-            kv_cache: Some(cache),
-            ..
-        } = &layer.attn
-        else {
-            continue;
-        };
-        let mut layer_has_virtual_kv = false;
-        for buffer in [
-            cache.virtual_kv_cache_k.as_ref(),
-            cache.virtual_kv_cache_v.as_ref(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            let stats = buffer.stats();
-            out.logical_bytes += stats.logical_bytes;
-            out.reserved_bytes += stats.reserved_bytes;
-            out.resident_bytes += stats.resident_bytes;
-            out.logical_resident_bytes += stats.logical_resident_bytes;
-            out.mappings += stats.mapping_count;
-            layer_has_virtual_kv = true;
-        }
-        if layer_has_virtual_kv {
-            out.layers += 1;
-        }
-    }
-    out
 }
 
 /// Build one layer's worth of GPU-resident weight + state buffers from a
@@ -1774,33 +1611,405 @@ fn load_all_layer_buffers(
     Ok(layers)
 }
 
-fn should_try_moe_expert_vmm(
-    mode: MoeExpertVmmMode,
-    backend: Backend,
-    weight_mode: Qwen36WeightMode,
+struct Qwen36DecodeLayers {
+    layers: Vec<LayerBuffers>,
+    moe_expert_arena: Option<VirtualArena>,
+    moe_expert_residency: Option<MoeExpertResidencyManager>,
+}
+
+struct Qwen36DecodeSession {
+    final_norm_w_buf: GpuBuffer,
+    lm_head_w_buf: GpuBuffer,
+    logits_buf: GpuBuffer,
+    counter_buf: GpuBuffer,
+    final_hidden_buf: GpuBuffer,
+    mtp_buffers: Option<MtpLayerBuffers>,
+    mtp_forward_scratch: Option<crate::qwen36_moe_mtp::MtpForwardScratch>,
+    mtp_chain_scratch: Option<crate::qwen36_moe_mtp::MtpChainScratch>,
+    embed_w_buf: Option<GpuBuffer>,
+    linear_attn_snapshot: Option<crate::qwen36_moe_state::LinearAttnSnapshot>,
+    persistent_scratch: Option<crate::qwen36_moe_persistent_decode::PersistentScratch>,
+}
+
+#[derive(Default)]
+struct Qwen36StageTimingTotals {
+    gen_steps: usize,
+    embed: std::time::Duration,
+    chain: std::time::Duration,
+    lm_head: std::time::Duration,
+    sample: std::time::Duration,
+    detok: std::time::Duration,
+    chain_full_attn_us: u64,
+    chain_linear_attn_us: u64,
+    chain_ffn_us: u64,
+}
+
+impl Qwen36StageTimingTotals {
+    fn record_generation_step(
+        &mut self,
+        embed: std::time::Duration,
+        chain: std::time::Duration,
+        lm_head: std::time::Duration,
+        sample: std::time::Duration,
+        detok: std::time::Duration,
+        outputs: &crate::qwen36_moe_decode::DecodeOutputs,
+    ) {
+        self.count_generation_step();
+        self.embed += embed;
+        self.chain += chain;
+        self.lm_head += lm_head;
+        self.sample += sample;
+        self.detok += detok;
+        self.record_chain_breakdown(outputs);
+    }
+
+    fn record_embed(&mut self, elapsed: std::time::Duration) {
+        self.embed += elapsed;
+    }
+
+    fn record_chain(
+        &mut self,
+        elapsed: std::time::Duration,
+        outputs: &crate::qwen36_moe_decode::DecodeOutputs,
+    ) {
+        self.chain += elapsed;
+        self.record_chain_breakdown(outputs);
+    }
+
+    fn record_lm_head(&mut self, elapsed: std::time::Duration) {
+        self.lm_head += elapsed;
+    }
+
+    fn count_generation_step(&mut self) {
+        self.gen_steps += 1;
+    }
+
+    fn record_chain_breakdown(&mut self, outputs: &crate::qwen36_moe_decode::DecodeOutputs) {
+        self.chain_full_attn_us += outputs.kernel_full_attn_us;
+        self.chain_linear_attn_us += outputs.kernel_linear_attn_us;
+        self.chain_ffn_us += outputs.kernel_ffn_us;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_decode_layers_with_vmm_strategy(
+    store: &BakedStore,
     ordinal: usize,
-) -> Result<bool> {
-    if mode == MoeExpertVmmMode::Disabled {
-        return Ok(false);
-    }
-    if weight_mode != Qwen36WeightMode::Int4 {
-        if mode == MoeExpertVmmMode::Force {
+    backend: Backend,
+    geom: &MultiLayerGeom,
+    text_config: &TextConfig,
+    weight_prefix: &str,
+    weight_mode: Qwen36WeightMode,
+    kv_max_t: usize,
+    kv_fp8: bool,
+    kv_vmm: bool,
+    moe_vmm_mode: MoeExpertVmmMode,
+    moe_island_cap_experts: Option<usize>,
+    moe_prefetch_mode: MoeIslandPrefetchMode,
+    moe_prefetch_ranks: usize,
+    moe_transition_min_observations: u32,
+    persistent_decode: bool,
+) -> Result<Qwen36DecodeLayers> {
+    if let Some(cap_experts) = moe_island_cap_experts {
+        if cap_experts < geom.top_k as usize {
             anyhow::bail!(
-                "SUPERSONIC_VMM_MOE_ISLANDS=1 requires Qwen3.6-MoE INT4 weights; got {weight_mode:?}"
+                "SUPERSONIC_MOE_ISLAND_CAP_EXPERTS={cap_experts} is smaller than model top_k={}; \
+                 sparse decode needs at least one layer's routed experts resident",
+                geom.top_k
             );
         }
-        return Ok(false);
-    }
-    let supported = gpu_hal::vmm_is_supported(backend, ordinal);
-    if !supported {
-        if mode == MoeExpertVmmMode::Force {
-            anyhow::bail!(
-                "SUPERSONIC_VMM_MOE_ISLANDS=1 requested but backend={backend} VMM is unsupported on device {ordinal}"
+        if !should_try_moe_expert_vmm(
+            MoeExpertVmmMode::Force,
+            backend,
+            weight_mode.is_int4(),
+            &format!("{weight_mode:?}"),
+            ordinal,
+        )? {
+            unreachable!("forced VMM expert check should either return true or error");
+        }
+        let config = MoeExpertResidencyConfig::new(1)?;
+        let mut manager = MoeExpertResidencyManager::new(ordinal, config);
+        let layers = load_all_layer_buffers(
+            store,
+            ordinal,
+            geom,
+            text_config,
+            weight_prefix,
+            weight_mode,
+            kv_max_t,
+            kv_fp8,
+            kv_vmm,
+            None,
+            Some(&mut manager),
+        )
+        .context("reserve Qwen3.6-MoE routed experts for sparse VMM residency")?;
+        let max_resident_pages = manager
+            .page_budget_for_routed_experts(cap_experts)
+            .context("derive sparse MoE page budget from routed expert tensor layout")?;
+        manager
+            .set_max_resident_pages(max_resident_pages)
+            .context("apply sparse MoE page budget")?;
+        let arena_stats = manager.arena().stats();
+        let residency_stats = manager.stats();
+        println!(
+            "  [vmm] Qwen3.6-MoE sparse routed expert residency active on backend={} device {ordinal}: \
+             tensors={} max_pages={} logical={:.2}MiB resident={:.2}MiB reserved={:.2}MiB",
+            backend,
+            residency_stats.registered_tensors,
+            max_resident_pages,
+            arena_stats.logical_bytes as f64 / MIB,
+            arena_stats.resident_bytes as f64 / MIB,
+            arena_stats.reserved_bytes as f64 / MIB,
+        );
+        if persistent_decode {
+            println!(
+                "  [vmm] sparse MoE residency will use segmented persistent decode \
+                 (router prefetch + FFN resume per layer)"
             );
         }
-        return Ok(false);
+        if moe_prefetch_mode.uses_previous_token_routes() {
+            println!(
+                "  [vmm] sparse MoE {} lookahead prefetch active \
+                 (ranks={moe_prefetch_ranks}/{})",
+                moe_prefetch_mode.as_str(),
+                geom.top_k
+            );
+            if moe_prefetch_mode.transition_weighted() {
+                println!(
+                    "  [vmm] sparse MoE transition predictor warmup \
+                     min_observations={moe_transition_min_observations}"
+                );
+            }
+        }
+        return Ok(Qwen36DecodeLayers {
+            layers,
+            moe_expert_arena: None,
+            moe_expert_residency: Some(manager),
+        });
     }
-    Ok(true)
+
+    if should_try_moe_expert_vmm(
+        moe_vmm_mode,
+        backend,
+        weight_mode.is_int4(),
+        &format!("{weight_mode:?}"),
+        ordinal,
+    )? {
+        let mut arena = BakedStore::virtual_weight_arena(ordinal);
+        match load_all_layer_buffers(
+            store,
+            ordinal,
+            geom,
+            text_config,
+            weight_prefix,
+            weight_mode,
+            kv_max_t,
+            kv_fp8,
+            kv_vmm,
+            Some(&mut arena),
+            None,
+        ) {
+            Ok(layers) => {
+                let stats = arena.stats();
+                println!(
+                    "  [vmm] Qwen3.6-MoE routed expert slabs active on backend={} device {ordinal}: \
+                     allocations={} mappings={} logical={:.2}MiB resident={:.2}MiB reserved={:.2}MiB",
+                    backend,
+                    stats.allocations,
+                    stats.mapping_count,
+                    stats.logical_bytes as f64 / MIB,
+                    stats.resident_bytes as f64 / MIB,
+                    stats.reserved_bytes as f64 / MIB,
+                );
+                return Ok(Qwen36DecodeLayers {
+                    layers,
+                    moe_expert_arena: Some(arena),
+                    moe_expert_residency: None,
+                });
+            }
+            Err(err) if moe_vmm_mode == MoeExpertVmmMode::Auto => {
+                eprintln!(
+                    "[vmm] Qwen3.6-MoE routed expert VMM load failed ({err:#}); falling back to dense expert buffers"
+                );
+                drop(arena);
+            }
+            Err(err) => return Err(err.context("load Qwen3.6-MoE routed experts into VMM")),
+        }
+    }
+
+    let layers = load_all_layer_buffers(
+        store,
+        ordinal,
+        geom,
+        text_config,
+        weight_prefix,
+        weight_mode,
+        kv_max_t,
+        kv_fp8,
+        kv_vmm,
+        None,
+        None,
+    )?;
+    Ok(Qwen36DecodeLayers {
+        layers,
+        moe_expert_arena: None,
+        moe_expert_residency: None,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_decode_session(
+    store: &BakedStore,
+    ordinal: usize,
+    geom: &MultiLayerGeom,
+    text_config: &TextConfig,
+    weight_prefix: &str,
+    kv_max_t: usize,
+    speculative_decode: bool,
+    batched_spec_verify: bool,
+    persistent_decode: bool,
+    layers: &mut Vec<LayerBuffers>,
+) -> Result<Qwen36DecodeSession> {
+    let mtp_buffers_opt = if speculative_decode {
+        match load_mtp_buffers(store, ordinal, geom, kv_max_t).context("load MTP head from bake")? {
+            Some(mtp) => {
+                println!(
+                    "  MTP head: loaded 19 mtp.* tensors (~1.6 GiB BF16) — \
+                     speculative draft + sequential-verify path active. \
+                     NOTE: sequential verification has zero amortized speedup \
+                     over plain greedy decode (Phase 6.4's batched verify \
+                     kernel is what delivers throughput); this path is the \
+                     correctness foundation."
+                );
+                Some(mtp)
+            }
+            None => {
+                anyhow::bail!(
+                    "--speculative-decode requested but the bake doesn't \
+                     include mtp.* tensors. Re-bake against the post-#84 \
+                     `oracle/bake_int4.py`, or pull the new release tarball \
+                     once the producer workflow at GitHub issue #87 lands."
+                );
+            }
+        }
+    } else {
+        None
+    };
+
+    let final_norm_bytes = host_load_bytes(store, &format!("{weight_prefix}.norm.weight"))
+        .context("load final norm")?;
+    let lm_head_bf16_bytes = load_lm_head_bf16(store, text_config, weight_prefix, geom)
+        .context("prepare lm_head BF16 buffer")?;
+    println!(
+        "  uploading lm_head BF16 ({:.1} MiB) and final norm ({:.1} KiB) to GPU…",
+        lm_head_bf16_bytes.len() as f64 / MIB,
+        final_norm_bytes.len() as f64 / 1024.0,
+    );
+    let final_norm_w_buf = GpuBuffer::from_host_bytes(
+        ordinal,
+        ScalarType::BF16,
+        &[geom.hidden as usize],
+        &final_norm_bytes,
+    )
+    .context("upload final_norm_w to GPU")?;
+    let lm_head_w_buf = GpuBuffer::from_host_bytes(
+        ordinal,
+        ScalarType::BF16,
+        &[geom.vocab as usize, geom.hidden as usize],
+        &lm_head_bf16_bytes,
+    )
+    .context("upload lm_head BF16 to GPU")?;
+    let logits_buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[geom.vocab as usize])
+        .context("alloc logits_buf on GPU")?;
+    let counter_buf = GpuBuffer::zeros(ordinal, ScalarType::U32, &[1])
+        .context("alloc lm_head counter_buf on GPU")?;
+    let final_hidden_buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[geom.hidden as usize])
+        .context("alloc final_hidden_buf on GPU")?;
+    drop(lm_head_bf16_bytes);
+    drop(final_norm_bytes);
+
+    let mtp_buffers = mtp_buffers_opt;
+    let mtp_forward_scratch = if mtp_buffers.is_some() {
+        Some(
+            crate::qwen36_moe_mtp::alloc_mtp_forward_scratch(ordinal, geom, kv_max_t)
+                .context("alloc MTP forward scratch")?,
+        )
+    } else {
+        None
+    };
+    let mtp_chain_scratch = if mtp_buffers.is_some() {
+        Some(
+            crate::qwen36_moe_mtp::alloc_mtp_chain_scratch(ordinal, geom)
+                .context("alloc MTP chain scratch")?,
+        )
+    } else {
+        None
+    };
+    let embed_w_buf = if mtp_buffers.is_some() {
+        let embed_name = format!("{weight_prefix}.embed_tokens.weight");
+        let embed = load_to_gpu(store, ordinal, &embed_name)
+            .with_context(|| format!("upload {embed_name} to GPU"))?;
+        println!(
+            "  uploaded embed_tokens ({:.0} MiB BF16) and allocated MTP \
+             scratches (K={} drafts/step)",
+            (geom.vocab as f64 * geom.hidden as f64 * 2.0) / MIB,
+            QWEN36_NUM_SPECULATIVE_TOKENS,
+        );
+        Some(embed)
+    } else {
+        None
+    };
+
+    let linear_attn_snapshot = if speculative_decode && batched_spec_verify {
+        Some(
+            crate::qwen36_moe_state::save_linear_attn_state(ordinal, layers)
+                .context("alloc linear-attn state snapshot for batched spec verify")?,
+        )
+    } else {
+        None
+    };
+    if linear_attn_snapshot.is_some() {
+        println!(
+            "  --batched-spec-verify: linear-attn state snapshot allocated \
+             (K+1 chains run per spec iter; restore + replay accepted prefix \
+             on partial accept)"
+        );
+    }
+
+    let persistent_scratch = if persistent_decode {
+        let scratch =
+            crate::qwen36_moe_persistent_decode::PersistentScratch::new(ordinal, geom, layers)
+                .context("alloc PersistentScratch for --persistent-decode")?;
+        println!(
+            "  --persistent-decode: megakernel scratch allocated \
+             (descs={}KiB, workspace={}KiB, ping/pong={}KiB){}",
+            scratch.layer_descs_dev.len_bytes() / 1024,
+            scratch.workspace.len_bytes() / 1024,
+            scratch.hidden_ping.len_bytes() / 1024,
+            if speculative_decode {
+                " — also routes spec-verify chains through persistent"
+            } else {
+                ""
+            },
+        );
+        Some(scratch)
+    } else {
+        None
+    };
+
+    Ok(Qwen36DecodeSession {
+        final_norm_w_buf,
+        lm_head_w_buf,
+        logits_buf,
+        counter_buf,
+        final_hidden_buf,
+        mtp_buffers,
+        mtp_forward_scratch,
+        mtp_chain_scratch,
+        embed_w_buf,
+        linear_attn_snapshot,
+        persistent_scratch,
+    })
 }
 
 /// Load the Qwen3.6-MoE multi-token-prediction (MTP) head from the bake.
@@ -2111,11 +2320,7 @@ fn decode_text(
     println!(
         "  loading from bake: {} ({})",
         bake_dir.display(),
-        match weight_mode {
-            Qwen36WeightMode::Bf16 => "BF16",
-            Qwen36WeightMode::Int4 => "INT4 GPTQ",
-            Qwen36WeightMode::Fp8 => "FP8 native",
-        }
+        weight_mode.display_name(),
     );
     let store = BakedStore::open(&bake_dir)
         .with_context(|| format!("open BakedStore at {}", bake_dir.display()))?;
@@ -2132,7 +2337,7 @@ fn decode_text(
     println!(
         "  loading {} layers ({} INT4 sidecar sets, KV cache cap = {} tokens)…",
         geom.num_layers,
-        if weight_mode == Qwen36WeightMode::Int4 {
+        if weight_mode.is_int4() {
             geom.num_layers
         } else {
             0
@@ -2152,8 +2357,6 @@ fn decode_text(
             "SUPERSONIC_MOE_ISLAND_CAP_EXPERTS requires VMM expert slabs; unset SUPERSONIC_VMM_MOE_ISLANDS=0"
         );
     }
-    let mut _moe_expert_arena = None;
-    let mut _moe_expert_residency = None;
     let sparse_moe_requested = moe_island_cap_experts.is_some();
     let moe_prefetch_mode = MoeIslandPrefetchMode::from_env()?;
     let moe_prefetch_ranks =
@@ -2179,139 +2382,27 @@ fn decode_text(
         );
     }
     let kv_vmm = should_use_qwen36_kv_vmm(backend, ordinal)?;
-    let mut layers = if let Some(cap_experts) = moe_island_cap_experts {
-        if cap_experts < geom.top_k as usize {
-            anyhow::bail!(
-                "SUPERSONIC_MOE_ISLAND_CAP_EXPERTS={cap_experts} is smaller than model top_k={}; \
-                 sparse decode needs at least one layer's routed experts resident",
-                geom.top_k
-            );
-        }
-        if !should_try_moe_expert_vmm(MoeExpertVmmMode::Force, backend, weight_mode, ordinal)? {
-            unreachable!("forced VMM expert check should either return true or error");
-        }
-        let config = MoeExpertResidencyConfig::new(1)?;
-        let mut manager = MoeExpertResidencyManager::new(ordinal, config);
-        let layers = load_all_layer_buffers(
-            &store,
-            ordinal,
-            &geom,
-            &report.config.text_config,
-            weight_prefix,
-            weight_mode,
-            kv_max_t,
-            kv_fp8,
-            kv_vmm,
-            None,
-            Some(&mut manager),
-        )
-        .context("reserve Qwen3.6-MoE routed experts for sparse VMM residency")?;
-        let max_resident_pages = manager
-            .page_budget_for_routed_experts(cap_experts)
-            .context("derive sparse MoE page budget from routed expert tensor layout")?;
-        manager
-            .set_max_resident_pages(max_resident_pages)
-            .context("apply sparse MoE page budget")?;
-        let arena_stats = manager.arena().stats();
-        let residency_stats = manager.stats();
-        println!(
-            "  [vmm] Qwen3.6-MoE sparse routed expert residency active on backend={} device {ordinal}: \
-             tensors={} max_pages={} logical={:.2}MiB resident={:.2}MiB reserved={:.2}MiB",
-            backend,
-            residency_stats.registered_tensors,
-            max_resident_pages,
-            arena_stats.logical_bytes as f64 / MIB,
-            arena_stats.resident_bytes as f64 / MIB,
-            arena_stats.reserved_bytes as f64 / MIB,
-        );
-        if persistent_decode {
-            println!(
-                "  [vmm] sparse MoE residency will use segmented persistent decode \
-                 (router prefetch + FFN resume per layer)"
-            );
-        }
-        if moe_prefetch_mode.uses_previous_token_routes() {
-            println!(
-                "  [vmm] sparse MoE {} lookahead prefetch active \
-                 (ranks={moe_prefetch_ranks}/{})",
-                moe_prefetch_mode.as_str(),
-                geom.top_k
-            );
-            if moe_prefetch_mode.transition_weighted() {
-                println!(
-                    "  [vmm] sparse MoE transition predictor warmup \
-                     min_observations={moe_transition_min_observations}"
-                );
-            }
-        }
-        _moe_expert_residency = Some(manager);
-        layers
-    } else if should_try_moe_expert_vmm(moe_vmm_mode, backend, weight_mode, ordinal)? {
-        let mut arena = BakedStore::virtual_weight_arena(ordinal);
-        match load_all_layer_buffers(
-            &store,
-            ordinal,
-            &geom,
-            &report.config.text_config,
-            weight_prefix,
-            weight_mode,
-            kv_max_t,
-            kv_fp8,
-            kv_vmm,
-            Some(&mut arena),
-            None,
-        ) {
-            Ok(layers) => {
-                let stats = arena.stats();
-                println!(
-                    "  [vmm] Qwen3.6-MoE routed expert slabs active on backend={} device {ordinal}: \
-                     allocations={} mappings={} logical={:.2}MiB resident={:.2}MiB reserved={:.2}MiB",
-                    backend,
-                    stats.allocations,
-                    stats.mapping_count,
-                    stats.logical_bytes as f64 / MIB,
-                    stats.resident_bytes as f64 / MIB,
-                    stats.reserved_bytes as f64 / MIB,
-                );
-                _moe_expert_arena = Some(arena);
-                layers
-            }
-            Err(err) if moe_vmm_mode == MoeExpertVmmMode::Auto => {
-                eprintln!(
-                    "[vmm] Qwen3.6-MoE routed expert VMM load failed ({err:#}); falling back to dense expert buffers"
-                );
-                drop(arena);
-                load_all_layer_buffers(
-                    &store,
-                    ordinal,
-                    &geom,
-                    &report.config.text_config,
-                    weight_prefix,
-                    weight_mode,
-                    kv_max_t,
-                    kv_fp8,
-                    kv_vmm,
-                    None,
-                    None,
-                )?
-            }
-            Err(err) => return Err(err.context("load Qwen3.6-MoE routed experts into VMM")),
-        }
-    } else {
-        load_all_layer_buffers(
-            &store,
-            ordinal,
-            &geom,
-            &report.config.text_config,
-            weight_prefix,
-            weight_mode,
-            kv_max_t,
-            kv_fp8,
-            kv_vmm,
-            None,
-            None,
-        )?
-    };
+    let loaded_layers = load_decode_layers_with_vmm_strategy(
+        &store,
+        ordinal,
+        backend,
+        &geom,
+        &report.config.text_config,
+        weight_prefix,
+        weight_mode,
+        kv_max_t,
+        kv_fp8,
+        kv_vmm,
+        moe_vmm_mode,
+        moe_island_cap_experts,
+        moe_prefetch_mode,
+        moe_prefetch_ranks,
+        moe_transition_min_observations,
+        persistent_decode,
+    )?;
+    let mut layers = loaded_layers.layers;
+    let _moe_expert_arena = loaded_layers.moe_expert_arena;
+    let mut _moe_expert_residency = loaded_layers.moe_expert_residency;
     let virtual_kv_stats = virtual_kv_stats_for_layers(&layers);
     if virtual_kv_stats.layers > 0 {
         println!(
@@ -2328,199 +2419,31 @@ fn decode_text(
             virtual_kv_stats.reserved_bytes as f64 / MIB,
         );
     }
-    // Phase 6 self-speculative decode: load the multi-token-prediction
-    // (MTP) head from the bake when --speculative-decode is set.
-    //
-    // The buffers cost ~1.6 GiB BF16 + a per-MTP-layer KV cache, which
-    // matters on memory-tight 24 GiB configs (the 17 GiB INT4 base bake
-    // already fills most of VRAM; an extra 1.6 GiB unused buffer can
-    // tip larger context_size / max_new runs into OOM). So we only load
-    // when the user opts in via `--speculative-decode`. When the flag
-    // isn't set, MTP weights are skipped entirely — production decode
-    // gets the full VRAM headroom.
-    //
-    // The loader still returns Ok(None) gracefully if the bake is pre-
-    // PR-#84 and lacks mtp.* tensors. Erroring out loudly when the user
-    // explicitly asked for speculative decode but the bake can't support
-    // it is the right move — silent fallback to non-speculative would
-    // hide the bake-staleness from a downstream perf-sensitive user.
-    //
-    // Phase 6.2c+ wires the consumer side into the decode loop.
-    let mtp_buffers_opt = if speculative_decode {
-        match load_mtp_buffers(&store, ordinal, &geom, kv_max_t)
-            .context("load MTP head from bake")?
-        {
-            Some(mtp) => {
-                println!(
-                    "  MTP head: loaded 19 mtp.* tensors (~1.6 GiB BF16) — \
-                     speculative draft + sequential-verify path active. \
-                     NOTE: sequential verification has zero amortized speedup \
-                     over plain greedy decode (Phase 6.4's batched verify \
-                     kernel is what delivers throughput); this path is the \
-                     correctness foundation."
-                );
-                Some(mtp)
-            }
-            None => {
-                anyhow::bail!(
-                    "--speculative-decode requested but the bake doesn't \
-                     include mtp.* tensors. Re-bake against the post-#84 \
-                     `oracle/bake_int4.py`, or pull the new release tarball \
-                     once the producer workflow at GitHub issue #87 lands."
-                );
-            }
-        }
-    } else {
-        None
-    };
-
-    // Upload final_norm + dequantized lm_head to the GPU once. The
-    // GPU lm_head kernel (`qwen36_moe::lm_head_launch`) does
-    // RMSNorm + GEMV in BF16 in one shot, replacing the previous
-    // host-side F32 GEMV that dominated per-token wall-clock at
-    // ~233 ms / 360 ms total on 35B-A3B greedy decode (PR #68
-    // stage-timings).
-    //
-    // VRAM cost: ~970 MiB for lm_head BF16 + 4 KiB for final_norm +
-    // 500 KiB for the logits buffer. Comfortably within the 24 GiB
-    // budget alongside the 17 GiB INT4 weight bake.
-    let final_norm_bytes = host_load_bytes(&store, &format!("{weight_prefix}.norm.weight"))
-        .context("load final norm")?;
-    let lm_head_bf16_bytes =
-        load_lm_head_bf16(&store, &report.config.text_config, weight_prefix, &geom)
-            .context("prepare lm_head BF16 buffer")?;
-    println!(
-        "  uploading lm_head BF16 ({:.1} MiB) and final norm ({:.1} KiB) to GPU…",
-        lm_head_bf16_bytes.len() as f64 / MIB,
-        final_norm_bytes.len() as f64 / 1024.0,
-    );
-    let final_norm_w_buf = GpuBuffer::from_host_bytes(
+    let session = prepare_decode_session(
+        &store,
         ordinal,
-        ScalarType::BF16,
-        &[geom.hidden as usize],
-        &final_norm_bytes,
-    )
-    .context("upload final_norm_w to GPU")?;
-    let lm_head_w_buf = GpuBuffer::from_host_bytes(
-        ordinal,
-        ScalarType::BF16,
-        &[geom.vocab as usize, geom.hidden as usize],
-        &lm_head_bf16_bytes,
-    )
-    .context("upload lm_head BF16 to GPU")?;
-    let mut logits_buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[geom.vocab as usize])
-        .context("alloc logits_buf on GPU")?;
-    let mut counter_buf = GpuBuffer::zeros(ordinal, ScalarType::U32, &[1])
-        .context("alloc lm_head counter_buf on GPU")?;
-    let mut final_hidden_buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[geom.hidden as usize])
-        .context("alloc final_hidden_buf on GPU")?;
-    drop(lm_head_bf16_bytes);
-    drop(final_norm_bytes);
-
-    // Phase 6.3d speculative-decode setup. When `--speculative-decode` is
-    // set, allocate the MTP forward + chain scratches and upload the
-    // base model's `embed_tokens.weight` to GPU (the MTP draft chain
-    // does GPU-side embed gathering via D2D copy from this buffer).
-    //
-    // The hardcoded num_speculative_tokens=3 mirrors the public Qwen3.6
-    // MTP card's recommendation; making it CLI-tunable is a follow-up.
-    // Memory: ~970 MiB embed_tokens BF16 + ~50 MiB MTP scratches.
-    // Combined with the 17 GiB INT4 base bake + 970 MiB lm_head + 1.6
-    // GiB MTP head, this lands at ~21 GiB GPU resident — within budget
-    // on 24 GiB 7900 XTX with headroom for the per-token activation
-    // buffers.
-    const NUM_SPECULATIVE_TOKENS: usize = 3;
-    let mut mtp_buffers = mtp_buffers_opt;
-    let mut mtp_forward_scratch = if mtp_buffers.is_some() {
-        Some(
-            crate::qwen36_moe_mtp::alloc_mtp_forward_scratch(ordinal, &geom, kv_max_t)
-                .context("alloc MTP forward scratch")?,
-        )
-    } else {
-        None
-    };
-    let mut mtp_chain_scratch = if mtp_buffers.is_some() {
-        Some(
-            crate::qwen36_moe_mtp::alloc_mtp_chain_scratch(ordinal, &geom)
-                .context("alloc MTP chain scratch")?,
-        )
-    } else {
-        None
-    };
-    let embed_w_buf = if mtp_buffers.is_some() {
-        let embed_name = format!("{weight_prefix}.embed_tokens.weight");
-        let embed = load_to_gpu(&store, ordinal, &embed_name)
-            .with_context(|| format!("upload {embed_name} to GPU"))?;
-        println!(
-            "  uploaded embed_tokens ({:.0} MiB BF16) and allocated MTP \
-             scratches (K={NUM_SPECULATIVE_TOKENS} drafts/step)",
-            (geom.vocab as f64 * geom.hidden as f64 * 2.0) / MIB
-        );
-        Some(embed)
-    } else {
-        None
-    };
-
-    // Phase 6.4c.2: pre-allocate the linear-attn state snapshot when
-    // `--batched-spec-verify` is set. The snapshot's shadow buffers
-    // are sized once against the live `layers` vec; per-spec-iter
-    // updates use `refresh_linear_attn_state` (D2D copies only).
-    // Restoration on partial-accept overwrites the live state then
-    // we replay the accepted draft sequence sequentially to advance
-    // state to the post-accepted-prefix point.
-    let mut linear_attn_snapshot = if speculative_decode && batched_spec_verify {
-        Some(
-            crate::qwen36_moe_state::save_linear_attn_state(ordinal, &layers)
-                .context("alloc linear-attn state snapshot for batched spec verify")?,
-        )
-    } else {
-        None
-    };
-    if linear_attn_snapshot.is_some() {
-        println!(
-            "  --batched-spec-verify: linear-attn state snapshot allocated \
-             (K+1 chains run per spec iter; restore + replay accepted prefix \
-             on partial accept)"
-        );
-    }
-
-    // Phase 3e.2: pre-allocate the persistent megakernel's scratch
-    // (descriptor array + ping/pong residual + workspace + sync_buf) once
-    // before the decode loop. Reused for every step.
-    //
-    // Phase 3e.3: also enabled under `--speculative-decode`. Each verify
-    // chain (K+1 of them per spec iter, plus replay chains on partial-
-    // accept) currently pays the same 80 step-launch overhead as a plain
-    // base step, so the persistent path saves the same ~2.7 ms/chain
-    // there as on the plain decode path. The persistent kernel mutates
-    // linear-attn state in-place via cached descriptor pointers, so the
-    // existing `save_linear_attn_state` / `restore_linear_attn_state`
-    // round-trip works transparently — the kernel reads the latest state
-    // through the same pointers after the host D2D-copies fresh state
-    // back into the LayerBuffer slots.
-    let mut persistent_scratch = if persistent_decode {
-        let scratch = crate::qwen36_moe_persistent_decode::PersistentScratch::new(
-            ordinal,
-            &geom,
-            &mut layers,
-        )
-        .context("alloc PersistentScratch for --persistent-decode")?;
-        println!(
-            "  --persistent-decode: megakernel scratch allocated \
-             (descs={}KiB, workspace={}KiB, ping/pong={}KiB){}",
-            scratch.layer_descs_dev.len_bytes() / 1024,
-            scratch.workspace.len_bytes() / 1024,
-            scratch.hidden_ping.len_bytes() / 1024,
-            if speculative_decode {
-                " — also routes spec-verify chains through persistent"
-            } else {
-                ""
-            },
-        );
-        Some(scratch)
-    } else {
-        None
-    };
+        &geom,
+        &report.config.text_config,
+        weight_prefix,
+        kv_max_t,
+        speculative_decode,
+        batched_spec_verify,
+        persistent_decode,
+        &mut layers,
+    )?;
+    let Qwen36DecodeSession {
+        final_norm_w_buf,
+        lm_head_w_buf,
+        mut logits_buf,
+        mut counter_buf,
+        mut final_hidden_buf,
+        mut mtp_buffers,
+        mut mtp_forward_scratch,
+        mut mtp_chain_scratch,
+        embed_w_buf,
+        mut linear_attn_snapshot,
+        mut persistent_scratch,
+    } = session;
 
     println!(
         "  decoding {} prompt token{} + generating ≤{} new token{}…",
@@ -2562,16 +2485,7 @@ fn decode_text(
     // — `run_chained_decode` syncs before returning, so the wall-clock here
     // is a real GPU+sync measurement. CPU-side stages (embed lookup, lm_head
     // GEMV, sampling, detokenize) are pure host work.
-    let mut gen_steps: usize = 0;
-    let mut t_embed = std::time::Duration::ZERO;
-    let mut t_chain = std::time::Duration::ZERO;
-    let mut t_lm_head = std::time::Duration::ZERO;
-    let mut t_sample = std::time::Duration::ZERO;
-    let mut t_detok = std::time::Duration::ZERO;
-    // Within-chain breakdown by kernel class (microseconds).
-    let mut t_chain_full_attn_us: u64 = 0;
-    let mut t_chain_linear_attn_us: u64 = 0;
-    let mut t_chain_ffn_us: u64 = 0;
+    let mut stage_timings = Qwen36StageTimingTotals::default();
     let mut previous_moe_topk_by_layer: Vec<Vec<usize>> =
         vec![Vec::new(); geom.num_layers as usize];
     let mut moe_route_telemetry =
@@ -2841,15 +2755,14 @@ fn decode_text(
         }
         let t_detok_step = t4.elapsed();
 
-        gen_steps += 1;
-        t_embed += t_embed_step;
-        t_chain += t_chain_step;
-        t_lm_head += t_lm_head_step;
-        t_sample += t_sample_step;
-        t_detok += t_detok_step;
-        t_chain_full_attn_us += outputs.kernel_full_attn_us;
-        t_chain_linear_attn_us += outputs.kernel_linear_attn_us;
-        t_chain_ffn_us += outputs.kernel_ffn_us;
+        stage_timings.record_generation_step(
+            t_embed_step,
+            t_chain_step,
+            t_lm_head_step,
+            t_sample_step,
+            t_detok_step,
+            &outputs,
+        );
 
         if Some(next_token) == eos_id {
             break;
@@ -2885,7 +2798,7 @@ fn decode_text(
             // 1 we can still emit 1 token via the K=0 fallback; if
             // headroom == 0 we already broke out above.
             let headroom = max_new - generated_ids.len();
-            let dynamic_k = NUM_SPECULATIVE_TOKENS.min(headroom.saturating_sub(1));
+            let dynamic_k = QWEN36_NUM_SPECULATIVE_TOKENS.min(headroom.saturating_sub(1));
             let h_base = outputs.final_hidden_bytes.clone();
             // P2: thread spec-verify timings into the engine-level
             // accumulators so `--emit-stage-timings` reports honest
@@ -2936,7 +2849,7 @@ fn decode_text(
                                 input as usize,
                                 geom.hidden as usize,
                             )?;
-                            t_embed += t_embed_start.elapsed();
+                            stage_timings.record_embed(t_embed_start.elapsed());
 
                             let t_chain_start = std::time::Instant::now();
                             let chain_outputs = if let Some(scratch) = persistent_scratch.as_mut() {
@@ -2951,11 +2864,8 @@ fn decode_text(
                                     emit_stage_timings,
                                 )?
                             };
-                            t_chain += t_chain_start.elapsed();
-                            t_chain_full_attn_us += chain_outputs.kernel_full_attn_us;
-                            t_chain_linear_attn_us += chain_outputs.kernel_linear_attn_us;
-                            t_chain_ffn_us += chain_outputs.kernel_ffn_us;
-                            gen_steps += 1;
+                            stage_timings.record_chain(t_chain_start.elapsed(), &chain_outputs);
+                            stage_timings.count_generation_step();
                             final_hiddens.push(chain_outputs.final_hidden_bytes);
                         }
 
@@ -2990,7 +2900,7 @@ fn decode_text(
                         )?;
                         let logits_bytes =
                             logits_buf_b.to_host_bytes().context("d2h batched logits")?;
-                        t_lm_head += t_lm_head_start.elapsed();
+                        stage_timings.record_lm_head(t_lm_head_start.elapsed());
 
                         let row_bytes = geom.vocab as usize * 2;
                         let mut results: Vec<(u32, Vec<u8>)> = Vec::with_capacity(n);
@@ -3028,7 +2938,7 @@ fn decode_text(
                             input as usize,
                             geom.hidden as usize,
                         )?;
-                        t_embed += t_embed_start.elapsed();
+                        stage_timings.record_embed(t_embed_start.elapsed());
                         let t_chain_start = std::time::Instant::now();
                         let replay_outputs = if let Some(scratch) = persistent_scratch.as_mut() {
                             scratch.run(ordinal, &initial_hidden, pos, None)?
@@ -3042,7 +2952,7 @@ fn decode_text(
                                 emit_stage_timings,
                             )?
                         };
-                        t_chain += t_chain_start.elapsed();
+                        stage_timings.record_chain(t_chain_start.elapsed(), &replay_outputs);
                         // Per-kernel-class breakdown for replay chains
                         // contributes to the same accumulators as the
                         // verify chains so `--emit-stage-timings` reports
@@ -3050,10 +2960,7 @@ fn decode_text(
                         // partial-accept iters. Without this the reported
                         // chain breakdown undercounts actual work as the
                         // accept rate falls.
-                        t_chain_full_attn_us += replay_outputs.kernel_full_attn_us;
-                        t_chain_linear_attn_us += replay_outputs.kernel_linear_attn_us;
-                        t_chain_ffn_us += replay_outputs.kernel_ffn_us;
-                        gen_steps += 1;
+                        stage_timings.count_generation_step();
                     }
                 }
                 r
@@ -3083,7 +2990,7 @@ fn decode_text(
                             input as usize,
                             geom.hidden as usize,
                         )?;
-                        t_embed += t_embed_start.elapsed();
+                        stage_timings.record_embed(t_embed_start.elapsed());
 
                         let t_chain_start = std::time::Instant::now();
                         let outputs = if let Some(scratch) = persistent_scratch.as_mut() {
@@ -3098,10 +3005,7 @@ fn decode_text(
                                 emit_stage_timings,
                             )?
                         };
-                        t_chain += t_chain_start.elapsed();
-                        t_chain_full_attn_us += outputs.kernel_full_attn_us;
-                        t_chain_linear_attn_us += outputs.kernel_linear_attn_us;
-                        t_chain_ffn_us += outputs.kernel_ffn_us;
+                        stage_timings.record_chain(t_chain_start.elapsed(), &outputs);
 
                         let t_lm_head_start = std::time::Instant::now();
                         gpu_hal::copy_h2d(
@@ -3125,7 +3029,7 @@ fn decode_text(
                         let logits_bytes = logits_buf
                             .to_host_bytes()
                             .context("d2h logits from spec verify lm_head")?;
-                        t_lm_head += t_lm_head_start.elapsed();
+                        stage_timings.record_lm_head(t_lm_head_start.elapsed());
                         // Each verify base step counts as one decode step
                         // for the per-token average — emitted_tokens.len()
                         // tokens are committed per spec call, and
@@ -3134,7 +3038,7 @@ fn decode_text(
                         // bonus) cases. Bumping here is equivalent to
                         // "one closure call = one decode step worth of
                         // base work."
-                        gen_steps += 1;
+                        stage_timings.count_generation_step();
                         Ok((
                             argmax_bf16_logits(&logits_bytes),
                             outputs.final_hidden_bytes,
@@ -3305,23 +3209,24 @@ fn decode_text(
             );
         }
     }
-    if emit_stage_timings && gen_steps > 0 {
+    if emit_stage_timings && stage_timings.gen_steps > 0 {
         let to_ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
-        let chain_ms = to_ms(t_chain);
-        let embed_ms = to_ms(t_embed);
-        let lm_head_ms = to_ms(t_lm_head);
-        let sample_ms = to_ms(t_sample);
-        let detok_ms = to_ms(t_detok);
+        let chain_ms = to_ms(stage_timings.chain);
+        let embed_ms = to_ms(stage_timings.embed);
+        let lm_head_ms = to_ms(stage_timings.lm_head);
+        let sample_ms = to_ms(stage_timings.sample);
+        let detok_ms = to_ms(stage_timings.detok);
         let total_ms = chain_ms + embed_ms + lm_head_ms + sample_ms + detok_ms;
-        let n = gen_steps as f64;
-        let full_attn_ms = (t_chain_full_attn_us as f64) / 1000.0;
-        let linear_attn_ms = (t_chain_linear_attn_us as f64) / 1000.0;
-        let ffn_ms = (t_chain_ffn_us as f64) / 1000.0;
+        let n = stage_timings.gen_steps as f64;
+        let full_attn_ms = (stage_timings.chain_full_attn_us as f64) / 1000.0;
+        let linear_attn_ms = (stage_timings.chain_linear_attn_us as f64) / 1000.0;
+        let ffn_ms = (stage_timings.chain_ffn_us as f64) / 1000.0;
         eprintln!(
-            "[qwen36-moe stage-timings] gen_steps={gen_steps} \
+            "[qwen36-moe stage-timings] gen_steps={} \
              embed_ms_avg={:.3} chain_ms_avg={:.3} lm_head_ms_avg={:.3} \
              sample_ms_avg={:.3} detok_ms_avg={:.3} total_ms_avg={:.3} \
              (chain_total_ms={:.1} lm_head_total_ms={:.1})",
+            stage_timings.gen_steps,
             embed_ms / n,
             chain_ms / n,
             lm_head_ms / n,
@@ -3332,9 +3237,10 @@ fn decode_text(
             lm_head_ms,
         );
         eprintln!(
-            "[qwen36-moe chain-breakdown] gen_steps={gen_steps} \
+            "[qwen36-moe chain-breakdown] gen_steps={} \
              full_attn_ms_avg={:.3} linear_attn_ms_avg={:.3} ffn_ms_avg={:.3} \
              (full_attn_total_ms={:.1} linear_attn_total_ms={:.1} ffn_total_ms={:.1})",
+            stage_timings.gen_steps,
             full_attn_ms / n,
             linear_attn_ms / n,
             ffn_ms / n,
@@ -3549,42 +3455,7 @@ fn decode_first_token(model_dir: &Path, report: &DryRunReport, kv_fp8: bool) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        moe_island_prefetch_ranks_from_env_value,
-        moe_island_prefetch_transition_min_observations_from_env_value,
-        qwen36_kv_vmm_mode_from_env_value, ExpertRoute, MoeIslandPrefetchMode, MoeRouteTelemetry,
-        MoeTransitionPredictor, Qwen36KvVmmMode,
-    };
-    use gpu_hal::Backend;
-
-    #[test]
-    fn qwen36_kv_vmm_defaults_to_auto_on_hip_only() {
-        assert_eq!(
-            qwen36_kv_vmm_mode_from_env_value(None, Backend::Hip).unwrap(),
-            Qwen36KvVmmMode::Auto
-        );
-        assert_eq!(
-            qwen36_kv_vmm_mode_from_env_value(None, Backend::Cuda).unwrap(),
-            Qwen36KvVmmMode::Disabled
-        );
-        assert_eq!(
-            qwen36_kv_vmm_mode_from_env_value(None, Backend::Metal).unwrap(),
-            Qwen36KvVmmMode::Disabled
-        );
-    }
-
-    #[test]
-    fn qwen36_kv_vmm_env_override_is_explicit() {
-        assert_eq!(
-            qwen36_kv_vmm_mode_from_env_value(Some("0"), Backend::Hip).unwrap(),
-            Qwen36KvVmmMode::Disabled
-        );
-        assert_eq!(
-            qwen36_kv_vmm_mode_from_env_value(Some("1"), Backend::Cuda).unwrap(),
-            Qwen36KvVmmMode::Force
-        );
-        assert!(qwen36_kv_vmm_mode_from_env_value(Some("yes"), Backend::Hip).is_err());
-    }
+    use super::{ExpertRoute, MoeIslandPrefetchMode, MoeRouteTelemetry, MoeTransitionPredictor};
 
     #[test]
     fn moe_prefetch_mode_env_accepts_disabled_and_previous_token_aliases() {
@@ -3636,121 +3507,6 @@ mod tests {
         assert_eq!(MoeIslandPrefetchMode::Transition.as_str(), "transition");
         assert!(MoeIslandPrefetchMode::Transition.uses_previous_token_routes());
         assert!(MoeIslandPrefetchMode::Transition.transition_weighted());
-    }
-
-    #[test]
-    fn moe_prefetch_ranks_default_to_all_previous_token_routes() {
-        assert_eq!(
-            moe_island_prefetch_ranks_from_env_value(
-                None,
-                MoeIslandPrefetchMode::PreviousToken,
-                8,
-            )
-            .unwrap(),
-            8
-        );
-        assert_eq!(
-            moe_island_prefetch_ranks_from_env_value(
-                Some("all"),
-                MoeIslandPrefetchMode::PreviousTokenResidentOnly,
-                8,
-            )
-            .unwrap(),
-            8
-        );
-    }
-
-    #[test]
-    fn moe_prefetch_ranks_accept_rank_limited_previous_token_routes() {
-        assert_eq!(
-            moe_island_prefetch_ranks_from_env_value(
-                Some("1"),
-                MoeIslandPrefetchMode::PreviousToken,
-                8,
-            )
-            .unwrap(),
-            1
-        );
-        assert_eq!(
-            moe_island_prefetch_ranks_from_env_value(
-                Some("4"),
-                MoeIslandPrefetchMode::PreviousTokenResidentOnly,
-                8,
-            )
-            .unwrap(),
-            4
-        );
-        assert_eq!(
-            moe_island_prefetch_ranks_from_env_value(
-                Some("2"),
-                MoeIslandPrefetchMode::Transition,
-                8,
-            )
-            .unwrap(),
-            2
-        );
-    }
-
-    #[test]
-    fn moe_prefetch_ranks_reject_disabled_or_out_of_range_values() {
-        assert_eq!(
-            moe_island_prefetch_ranks_from_env_value(None, MoeIslandPrefetchMode::Disabled, 8)
-                .unwrap(),
-            0
-        );
-        assert!(moe_island_prefetch_ranks_from_env_value(
-            Some("1"),
-            MoeIslandPrefetchMode::Disabled,
-            8,
-        )
-        .is_err());
-        assert!(moe_island_prefetch_ranks_from_env_value(
-            Some("0"),
-            MoeIslandPrefetchMode::PreviousToken,
-            8,
-        )
-        .is_err());
-        assert!(moe_island_prefetch_ranks_from_env_value(
-            Some("9"),
-            MoeIslandPrefetchMode::Transition,
-            8,
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn moe_transition_min_observations_defaults_only_for_transition_mode() {
-        assert_eq!(
-            moe_island_prefetch_transition_min_observations_from_env_value(
-                None,
-                MoeIslandPrefetchMode::Transition,
-            )
-            .unwrap(),
-            32
-        );
-        assert_eq!(
-            moe_island_prefetch_transition_min_observations_from_env_value(
-                Some("4"),
-                MoeIslandPrefetchMode::Transition,
-            )
-            .unwrap(),
-            4
-        );
-        assert_eq!(
-            moe_island_prefetch_transition_min_observations_from_env_value(
-                None,
-                MoeIslandPrefetchMode::PreviousToken,
-            )
-            .unwrap(),
-            0
-        );
-        assert!(
-            moe_island_prefetch_transition_min_observations_from_env_value(
-                Some("4"),
-                MoeIslandPrefetchMode::PreviousToken,
-            )
-            .is_err()
-        );
     }
 
     #[test]
