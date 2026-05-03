@@ -99,7 +99,9 @@ Current scope:
   loading a hard error.
 - `SUPERSONIC_MOE_ISLAND_CAP_EXPERTS=N` switches Qwen3.6-MoE INT4 decode from
   fully resident virtual expert slabs to sparse router-prefetched islands with
-  at most `N` experts' two routed projections tracked resident at once.
+  at most `N` experts' two routed projections tracked resident at once. Sparse
+  telemetry records ordered router rank summaries, including per-rank resident
+  hits before demand loading, previous-token repeats, and average router weight.
 - `SUPERSONIC_MOE_ISLAND_PREFETCH=previous-token` enables experimental
   previous-token routed-expert lookahead for sparse MoE islands. It preloads
   each layer's previous top-k before that layer's router runs, then records

@@ -639,8 +639,15 @@ pub enum ExpertPrefetchPhase {
     Demand,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct ExpertRoute {
+    pub rank: usize,
+    pub expert_idx: usize,
+    pub weight: f32,
+}
+
 pub type ExpertPrefetchCallback<'a> =
-    dyn FnMut(ExpertPrefetchPhase, usize, &[usize]) -> Result<()> + 'a;
+    dyn FnMut(ExpertPrefetchPhase, usize, &[ExpertRoute]) -> Result<()> + 'a;
 
 /// Production chained decode with a host-side hook between router top-k and
 /// routed expert GEMVs. The hook is intended for sparse VMM MoE residency:
@@ -1120,9 +1127,9 @@ fn run_chained_decode_impl(
             }
             t_ffn += t_router.elapsed();
 
-            let topk = download_topk_indices(&ffn_output_idx, geom.top_k as usize)
-                .with_context(|| format!("download FFN top-k indices (layer {layer_idx})"))?;
-            prefetch(ExpertPrefetchPhase::Demand, layer_idx, &topk)
+            let routes = download_topk_routes(&ffn_output_idx, &ffn_output, geom.top_k as usize)
+                .with_context(|| format!("download FFN top-k routes (layer {layer_idx})"))?;
+            prefetch(ExpertPrefetchPhase::Demand, layer_idx, &routes)
                 .with_context(|| format!("prefetch routed experts (layer {layer_idx})"))?;
             reset_sync_buf(ordinal, &mut sync_buf)
                 .context("reset sync_buf (ffn after prefetch)")?;
@@ -1199,6 +1206,34 @@ fn download_topk_indices(buf: &GpuBuffer, top_k: usize) -> Result<Vec<usize>> {
         .map(|chunk| {
             let raw = u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
             raw as usize
+        })
+        .collect())
+}
+
+fn download_topk_routes(
+    idx_buf: &GpuBuffer,
+    weight_buf: &GpuBuffer,
+    top_k: usize,
+) -> Result<Vec<ExpertRoute>> {
+    let idx = download_topk_indices(idx_buf, top_k)?;
+    let needed = top_k * std::mem::size_of::<u16>();
+    let mut weight_bytes = vec![0u8; needed];
+    copy_d2h(
+        weight_buf.device_ordinal(),
+        weight_bytes.as_mut_ptr() as *mut _,
+        weight_buf.as_ptr(),
+        needed,
+    )
+    .context("d2h top-k route weights")?;
+    let weights = bf16_bytes_to_f32(&weight_bytes);
+    Ok(idx
+        .into_iter()
+        .zip(weights)
+        .enumerate()
+        .map(|(rank, (expert_idx, weight))| ExpertRoute {
+            rank,
+            expert_idx,
+            weight,
         })
         .collect())
 }

@@ -28,9 +28,9 @@ use qwen36_moe::weights::{
 use crate::qwen36_moe_decode::{
     argmax_bf16_logits, dequant_int4_to_bf16_bytes, host_final_norm_lm_head, run_chained_decode,
     run_chained_decode_fast, run_chained_decode_fast_with_expert_prefetch, sample_bf16_logits,
-    AttnLayerBuffers, ExpertPrefetchPhase, FfnInt4Sidecars, FfnLayerBuffers, FullAttnInt4Sidecars,
-    FullAttnKvCache, LayerBuffers, LinearAttnInt4Sidecars, MtpLayerBuffers, MultiLayerGeom,
-    ResidentWeight, XorshiftRng,
+    AttnLayerBuffers, ExpertPrefetchPhase, ExpertRoute, FfnInt4Sidecars, FfnLayerBuffers,
+    FullAttnInt4Sidecars, FullAttnKvCache, LayerBuffers, LinearAttnInt4Sidecars, MtpLayerBuffers,
+    MultiLayerGeom, ResidentWeight, XorshiftRng,
 };
 use crate::qwen36_moe_residency::{
     MoeExpertKey, MoeExpertProjection, MoeExpertResidencyConfig, MoeExpertResidencyManager,
@@ -1237,6 +1237,78 @@ struct MoeSparseTelemetry {
     peak_logical_resident_bytes: usize,
 }
 
+#[derive(Debug, Clone)]
+struct MoeRouteTelemetry {
+    observations_by_rank: Vec<u64>,
+    resident_before_by_rank: Vec<u64>,
+    repeated_previous_by_rank: Vec<u64>,
+    weight_sum_by_rank: Vec<f64>,
+}
+
+impl MoeRouteTelemetry {
+    fn new(top_k: usize) -> Self {
+        Self {
+            observations_by_rank: vec![0; top_k],
+            resident_before_by_rank: vec![0; top_k],
+            repeated_previous_by_rank: vec![0; top_k],
+            weight_sum_by_rank: vec![0.0; top_k],
+        }
+    }
+
+    fn record(
+        &mut self,
+        manager: &MoeExpertResidencyManager,
+        layer_idx: usize,
+        routes: &[ExpertRoute],
+        previous_routes: &[usize],
+    ) {
+        for route in routes {
+            if route.rank >= self.observations_by_rank.len() {
+                continue;
+            }
+            self.observations_by_rank[route.rank] += 1;
+            self.weight_sum_by_rank[route.rank] += route.weight as f64;
+            if previous_routes.contains(&route.expert_idx) {
+                self.repeated_previous_by_rank[route.rank] += 1;
+            }
+            let gate_up = MoeExpertKey {
+                layer_idx,
+                expert_idx: route.expert_idx,
+                projection: MoeExpertProjection::GateUp,
+            };
+            let down = MoeExpertKey {
+                layer_idx,
+                expert_idx: route.expert_idx,
+                projection: MoeExpertProjection::Down,
+            };
+            if manager.is_resident(gate_up) && manager.is_resident(down) {
+                self.resident_before_by_rank[route.rank] += 1;
+            }
+        }
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        let avg_weight_by_rank: Vec<f64> = self
+            .weight_sum_by_rank
+            .iter()
+            .zip(&self.observations_by_rank)
+            .map(|(sum, count)| {
+                if *count == 0 {
+                    0.0
+                } else {
+                    sum / *count as f64
+                }
+            })
+            .collect();
+        serde_json::json!({
+            "observations_by_rank": &self.observations_by_rank,
+            "resident_before_by_rank": &self.resident_before_by_rank,
+            "repeated_previous_by_rank": &self.repeated_previous_by_rank,
+            "avg_weight_by_rank": avg_weight_by_rank,
+        })
+    }
+}
+
 impl MoeSparseTelemetry {
     fn from_env(
         active: bool,
@@ -1338,6 +1410,7 @@ impl MoeSparseTelemetry {
         manager: &MoeExpertResidencyManager,
         virtual_kv_stats: VirtualKvStats,
         generated_ids: &[u32],
+        route_telemetry: Option<&MoeRouteTelemetry>,
     ) -> Result<()> {
         let Some(path) = self.dump_path.as_ref() else {
             return Ok(());
@@ -1399,6 +1472,7 @@ impl MoeSparseTelemetry {
                 "prefetch_page_hits": final_snapshot.stats.prefetch_page_hits,
                 "prefetch_page_misses": final_snapshot.stats.prefetch_page_misses,
                 "prefetch_uploaded_bytes": final_snapshot.stats.prefetch_uploaded_bytes,
+                "route_summary": route_telemetry.map(MoeRouteTelemetry::to_json),
             },
             "generated_ids": generated_ids,
             "steps": self.steps,
@@ -2722,6 +2796,8 @@ fn decode_text(
     let mut t_chain_ffn_us: u64 = 0;
     let mut previous_moe_topk_by_layer: Vec<Vec<usize>> =
         vec![Vec::new(); geom.num_layers as usize];
+    let mut moe_route_telemetry =
+        sparse_moe_requested.then(|| MoeRouteTelemetry::new(geom.top_k as usize));
 
     for step in 0..total_steps {
         // When speculative decode is on, each iteration can commit
@@ -2782,12 +2858,13 @@ fn decode_text(
         let moe_telemetry_before = _moe_expert_residency
             .as_ref()
             .map(MoeSparseTelemetrySnapshot::capture);
-        let mut next_moe_topk_by_layer =
-            if moe_prefetch_mode == MoeIslandPrefetchMode::PreviousToken {
-                previous_moe_topk_by_layer.clone()
-            } else {
-                Vec::new()
-            };
+        let track_moe_routes = moe_prefetch_mode == MoeIslandPrefetchMode::PreviousToken
+            || moe_route_telemetry.is_some();
+        let mut next_moe_topk_by_layer = if track_moe_routes {
+            previous_moe_topk_by_layer.clone()
+        } else {
+            Vec::new()
+        };
         let outputs = if let Some(scratch) = persistent_scratch.as_mut() {
             if let Some(manager) = _moe_expert_residency.as_mut() {
                 // Sparse VMM needs a host remap point after each layer's
@@ -2796,52 +2873,71 @@ fn decode_text(
                 // standalone lm_head launch below consumes final_hidden_bytes.
                 lm_head_folded = false;
                 drop(fold);
-                let mut prefetch =
-                    |phase: ExpertPrefetchPhase, layer_idx: usize, topk: &[usize]| -> Result<()> {
-                        let experts = match phase {
-                            ExpertPrefetchPhase::Lookahead
-                                if moe_prefetch_mode == MoeIslandPrefetchMode::PreviousToken =>
-                            {
-                                previous_moe_topk_by_layer
-                                    .get(layer_idx)
-                                    .map(Vec::as_slice)
-                                    .unwrap_or(&[])
-                            }
-                            ExpertPrefetchPhase::Lookahead => &[],
-                            ExpertPrefetchPhase::Demand => topk,
-                        };
-                        for &expert_idx in experts {
-                            let gate_up = MoeExpertKey {
-                                layer_idx,
-                                expert_idx,
-                                projection: MoeExpertProjection::GateUp,
-                            };
-                            let down = MoeExpertKey {
-                                layer_idx,
-                                expert_idx,
-                                projection: MoeExpertProjection::Down,
-                            };
-                            match phase {
-                                ExpertPrefetchPhase::Lookahead => {
-                                    manager.prefetch_resident(&store, gate_up)?;
-                                    manager.prefetch_resident(&store, down)?;
-                                }
-                                ExpertPrefetchPhase::Demand => {
-                                    manager.ensure_resident(&store, gate_up)?;
-                                    manager.ensure_resident(&store, down)?;
-                                }
-                            }
-                        }
-                        if phase == ExpertPrefetchPhase::Demand
-                            && moe_prefetch_mode == MoeIslandPrefetchMode::PreviousToken
+                let mut prefetch = |phase: ExpertPrefetchPhase,
+                                    layer_idx: usize,
+                                    routes: &[ExpertRoute]|
+                 -> Result<()> {
+                    match phase {
+                        ExpertPrefetchPhase::Lookahead
+                            if moe_prefetch_mode == MoeIslandPrefetchMode::PreviousToken =>
                         {
-                            if let Some(slot) = next_moe_topk_by_layer.get_mut(layer_idx) {
-                                slot.clear();
-                                slot.extend_from_slice(topk);
+                            for &expert_idx in previous_moe_topk_by_layer
+                                .get(layer_idx)
+                                .map(Vec::as_slice)
+                                .unwrap_or(&[])
+                            {
+                                let gate_up = MoeExpertKey {
+                                    layer_idx,
+                                    expert_idx,
+                                    projection: MoeExpertProjection::GateUp,
+                                };
+                                let down = MoeExpertKey {
+                                    layer_idx,
+                                    expert_idx,
+                                    projection: MoeExpertProjection::Down,
+                                };
+                                manager.prefetch_resident(&store, gate_up)?;
+                                manager.prefetch_resident(&store, down)?;
                             }
                         }
-                        Ok(())
-                    };
+                        ExpertPrefetchPhase::Lookahead => {}
+                        ExpertPrefetchPhase::Demand => {
+                            if let Some(route_telemetry) = moe_route_telemetry.as_mut() {
+                                route_telemetry.record(
+                                    manager,
+                                    layer_idx,
+                                    routes,
+                                    previous_moe_topk_by_layer
+                                        .get(layer_idx)
+                                        .map(Vec::as_slice)
+                                        .unwrap_or(&[]),
+                                );
+                            }
+                            for route in routes {
+                                let expert_idx = route.expert_idx;
+                                let gate_up = MoeExpertKey {
+                                    layer_idx,
+                                    expert_idx,
+                                    projection: MoeExpertProjection::GateUp,
+                                };
+                                let down = MoeExpertKey {
+                                    layer_idx,
+                                    expert_idx,
+                                    projection: MoeExpertProjection::Down,
+                                };
+                                manager.ensure_resident(&store, gate_up)?;
+                                manager.ensure_resident(&store, down)?;
+                            }
+                            if track_moe_routes {
+                                if let Some(slot) = next_moe_topk_by_layer.get_mut(layer_idx) {
+                                    slot.clear();
+                                    slot.extend(routes.iter().map(|route| route.expert_idx));
+                                }
+                            }
+                        }
+                    }
+                    Ok(())
+                };
                 scratch
                     .run_sparse_with_expert_prefetch(
                         ordinal,
@@ -2868,52 +2964,71 @@ fn decode_text(
             lm_head_folded = false;
             drop(fold);
             if let Some(manager) = _moe_expert_residency.as_mut() {
-                let mut prefetch =
-                    |phase: ExpertPrefetchPhase, layer_idx: usize, topk: &[usize]| -> Result<()> {
-                        let experts = match phase {
-                            ExpertPrefetchPhase::Lookahead
-                                if moe_prefetch_mode == MoeIslandPrefetchMode::PreviousToken =>
-                            {
-                                previous_moe_topk_by_layer
-                                    .get(layer_idx)
-                                    .map(Vec::as_slice)
-                                    .unwrap_or(&[])
-                            }
-                            ExpertPrefetchPhase::Lookahead => &[],
-                            ExpertPrefetchPhase::Demand => topk,
-                        };
-                        for &expert_idx in experts {
-                            let gate_up = MoeExpertKey {
-                                layer_idx,
-                                expert_idx,
-                                projection: MoeExpertProjection::GateUp,
-                            };
-                            let down = MoeExpertKey {
-                                layer_idx,
-                                expert_idx,
-                                projection: MoeExpertProjection::Down,
-                            };
-                            match phase {
-                                ExpertPrefetchPhase::Lookahead => {
-                                    manager.prefetch_resident(&store, gate_up)?;
-                                    manager.prefetch_resident(&store, down)?;
-                                }
-                                ExpertPrefetchPhase::Demand => {
-                                    manager.ensure_resident(&store, gate_up)?;
-                                    manager.ensure_resident(&store, down)?;
-                                }
-                            }
-                        }
-                        if phase == ExpertPrefetchPhase::Demand
-                            && moe_prefetch_mode == MoeIslandPrefetchMode::PreviousToken
+                let mut prefetch = |phase: ExpertPrefetchPhase,
+                                    layer_idx: usize,
+                                    routes: &[ExpertRoute]|
+                 -> Result<()> {
+                    match phase {
+                        ExpertPrefetchPhase::Lookahead
+                            if moe_prefetch_mode == MoeIslandPrefetchMode::PreviousToken =>
                         {
-                            if let Some(slot) = next_moe_topk_by_layer.get_mut(layer_idx) {
-                                slot.clear();
-                                slot.extend_from_slice(topk);
+                            for &expert_idx in previous_moe_topk_by_layer
+                                .get(layer_idx)
+                                .map(Vec::as_slice)
+                                .unwrap_or(&[])
+                            {
+                                let gate_up = MoeExpertKey {
+                                    layer_idx,
+                                    expert_idx,
+                                    projection: MoeExpertProjection::GateUp,
+                                };
+                                let down = MoeExpertKey {
+                                    layer_idx,
+                                    expert_idx,
+                                    projection: MoeExpertProjection::Down,
+                                };
+                                manager.prefetch_resident(&store, gate_up)?;
+                                manager.prefetch_resident(&store, down)?;
                             }
                         }
-                        Ok(())
-                    };
+                        ExpertPrefetchPhase::Lookahead => {}
+                        ExpertPrefetchPhase::Demand => {
+                            if let Some(route_telemetry) = moe_route_telemetry.as_mut() {
+                                route_telemetry.record(
+                                    manager,
+                                    layer_idx,
+                                    routes,
+                                    previous_moe_topk_by_layer
+                                        .get(layer_idx)
+                                        .map(Vec::as_slice)
+                                        .unwrap_or(&[]),
+                                );
+                            }
+                            for route in routes {
+                                let expert_idx = route.expert_idx;
+                                let gate_up = MoeExpertKey {
+                                    layer_idx,
+                                    expert_idx,
+                                    projection: MoeExpertProjection::GateUp,
+                                };
+                                let down = MoeExpertKey {
+                                    layer_idx,
+                                    expert_idx,
+                                    projection: MoeExpertProjection::Down,
+                                };
+                                manager.ensure_resident(&store, gate_up)?;
+                                manager.ensure_resident(&store, down)?;
+                            }
+                            if track_moe_routes {
+                                if let Some(slot) = next_moe_topk_by_layer.get_mut(layer_idx) {
+                                    slot.clear();
+                                    slot.extend(routes.iter().map(|route| route.expert_idx));
+                                }
+                            }
+                        }
+                    }
+                    Ok(())
+                };
                 run_chained_decode_fast_with_expert_prefetch(
                     ordinal,
                     &geom,
@@ -2935,7 +3050,7 @@ fn decode_text(
             }
             .with_context(|| format!("chained decode (step {step}, position {position})"))?
         };
-        if moe_prefetch_mode == MoeIslandPrefetchMode::PreviousToken {
+        if track_moe_routes {
             previous_moe_topk_by_layer = next_moe_topk_by_layer;
         }
         if let (Some(telemetry), Some(before), Some(manager)) = (
@@ -3453,7 +3568,12 @@ fn decode_text(
                 total_resident_bytes as f64 / MIB,
                 total_reserved_bytes as f64 / MIB,
             );
-            telemetry.write_json(manager, virtual_kv_stats, &generated_ids)?;
+            telemetry.write_json(
+                manager,
+                virtual_kv_stats,
+                &generated_ids,
+                moe_route_telemetry.as_ref(),
+            )?;
         } else {
             println!(
                 "  [vmm] MoE island residency: resident_slices={} resident_pages={} \
