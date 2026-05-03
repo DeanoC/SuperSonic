@@ -98,10 +98,13 @@ __device__ inline void qwen36_moe_attn_step_device(
     float* __restrict__            kv_scale_k,
     float* __restrict__            kv_scale_v,
     // BF16 sidecar (optional; requires KV-FP8 to be active). When null
-    // the kernel always dequantises from FP8.
+    // or window==0 the kernel always dequantises from FP8. When enabled,
+    // the sidecar is a rolling circular buffer of the most recent
+    // kv_shadow_window positions.
     void* __restrict__             kv_shadow_k,
     void* __restrict__             kv_shadow_v,
     int                            kv_shadow_start,
+    int                            kv_shadow_window,
     int                            kv_max_t,
     unsigned int* __restrict__     counters,
     unsigned int* __restrict__     barrier_counter,
@@ -803,11 +806,11 @@ __device__ inline void qwen36_moe_attn_step_device(
                     // sidecar is configured to cover this position.
                     const bool sidecar_active =
                         (kv_shadow_k != nullptr && kv_shadow_v != nullptr &&
-                         kv_shadow_start >= 0 && eff_cache_pos >= kv_shadow_start);
+                         kv_shadow_start >= 0 && kv_shadow_window > 0);
                     T* shadow_k = sidecar_active ? static_cast<T*>(kv_shadow_k) : nullptr;
                     T* shadow_v = sidecar_active ? static_cast<T*>(kv_shadow_v) : nullptr;
                     const int shadow_slot =
-                        sidecar_active ? (eff_cache_pos - kv_shadow_start) : 0;
+                        sidecar_active ? (eff_cache_pos % kv_shadow_window) : 0;
 
                     for (int i = tid; i < d; i += block_size) {
                         const float kv = workspace[OFF_K_ROT + h_kv * d + i];
@@ -815,12 +818,10 @@ __device__ inline void qwen36_moe_attn_step_device(
                         fp8_k[slot_base + h_kv * d + i] = float_to_fp8_e4m3(kv * inv_k);
                         fp8_v[slot_base + h_kv * d + i] = float_to_fp8_e4m3(vv * inv_v);
                         if (sidecar_active) {
-                            // Sidecar window is forced equal to kv_max_t in v1
-                            // (full sidecar). If a future change shrinks the
-                            // window, add a kv_shadow_window kernel arg and
-                            // replace kv_max_t in the offset below.
-                            shadow_k[h_kv * kv_max_t * d + shadow_slot * d + i] = static_cast<T>(kv);
-                            shadow_v[h_kv * kv_max_t * d + shadow_slot * d + i] = static_cast<T>(vv);
+                            shadow_k[h_kv * kv_shadow_window * d + shadow_slot * d + i] =
+                                static_cast<T>(kv);
+                            shadow_v[h_kv * kv_shadow_window * d + shadow_slot * d + i] =
+                                static_cast<T>(vv);
                         }
                     }
                     __syncthreads();
@@ -888,14 +889,26 @@ __device__ inline void qwen36_moe_attn_step_device(
             // null), so checking only kv_shadow_k here is sufficient and
             // matches the kv_shadow_v check on the V read side.
             const bool sidecar_active =
-                (kv_shadow_k != nullptr && kv_shadow_start >= 0);
+                (kv_shadow_k != nullptr && kv_shadow_start >= 0 && kv_shadow_window > 0);
+            const int rolling_shadow_start =
+                sidecar_active
+                    ? ((eff_cache_pos + 1 > kv_shadow_window)
+                        ? (eff_cache_pos + 1 - kv_shadow_window)
+                        : 0)
+                    : 0;
+            const int shadow_start =
+                sidecar_active
+                    ? ((rolling_shadow_start > kv_shadow_start)
+                        ? rolling_shadow_start
+                        : kv_shadow_start)
+                    : 0;
             const T* shadow_k = sidecar_active ? static_cast<const T*>(kv_shadow_k) : nullptr;
             const uint8_t* fp8_ck = use_fp8_kv ? reinterpret_cast<const uint8_t*>(kv_cache_k) : nullptr;
             const float* sk_buf = use_fp8_kv ? kv_scale_k : nullptr;
 
             for (int t = 0; t < kv_len; t++) {
                 float partial = 0.0f;
-                const bool use_sidecar = sidecar_active && (t >= kv_shadow_start);
+                const bool use_sidecar = sidecar_active && (t >= shadow_start);
                 const float scale_k_t =
                     (use_fp8_kv && !use_sidecar) ? sk_buf[h_kv * kv_max_t + t] : 0.f;
                 for (int i = tid; i < d; i += block_size) {
@@ -904,15 +917,9 @@ __device__ inline void qwen36_moe_attn_step_device(
                     if (!use_fp8_kv) {
                         k = static_cast<float>(kv_cache_k[t * Hkv * d + h_kv * d + i]);
                     } else if (use_sidecar) {
-                        // Sidecar window is forced equal to kv_max_t in v1
-                        // (full sidecar). If a future change shrinks the
-                        // window, add a kv_shadow_window kernel arg and
-                        // replace kv_max_t in the offset below — must
-                        // stay in sync with the write site at line 822
-                        // and the V read site below.
-                        const int shadow_slot = t - kv_shadow_start;
+                        const int shadow_slot = t % kv_shadow_window;
                         k = static_cast<float>(
-                            shadow_k[h_kv * kv_max_t * d + shadow_slot * d + i]);
+                            shadow_k[h_kv * kv_shadow_window * d + shadow_slot * d + i]);
                     } else {
                         const uint8_t byte =
                             fp8_ck[t * Hkv * d + h_kv * d + i];
@@ -957,7 +964,19 @@ __device__ inline void qwen36_moe_attn_step_device(
             const float inv_sum = 1.0f / exp_sum;
             const bool use_fp8_kv_v = (kv_scale_v != nullptr);
             const bool sidecar_active_v =
-                (kv_shadow_v != nullptr && kv_shadow_start >= 0);
+                (kv_shadow_v != nullptr && kv_shadow_start >= 0 && kv_shadow_window > 0);
+            const int rolling_shadow_start_v =
+                sidecar_active_v
+                    ? ((eff_cache_pos + 1 > kv_shadow_window)
+                        ? (eff_cache_pos + 1 - kv_shadow_window)
+                        : 0)
+                    : 0;
+            const int shadow_start_v =
+                sidecar_active_v
+                    ? ((rolling_shadow_start_v > kv_shadow_start)
+                        ? rolling_shadow_start_v
+                        : kv_shadow_start)
+                    : 0;
             const T* shadow_v = sidecar_active_v ? static_cast<const T*>(kv_shadow_v) : nullptr;
             const uint8_t* fp8_cv =
                 use_fp8_kv_v ? reinterpret_cast<const uint8_t*>(kv_cache_v) : nullptr;
@@ -967,19 +986,14 @@ __device__ inline void qwen36_moe_attn_step_device(
                 float acc = 0.0f;
                 for (int t = 0; t < kv_len; t++) {
                     const float w = workspace[score_base + t] * inv_sum;
-                    const bool use_sidecar = sidecar_active_v && (t >= kv_shadow_start);
+                    const bool use_sidecar = sidecar_active_v && (t >= shadow_start_v);
                     float v;
                     if (!use_fp8_kv_v) {
                         v = static_cast<float>(kv_cache_v[t * Hkv * d + h_kv * d + i]);
                     } else if (use_sidecar) {
-                        // Sidecar window is forced equal to kv_max_t in v1
-                        // (full sidecar). If a future change shrinks the
-                        // window, see the K-side comment for the
-                        // kv_shadow_window arg threading — all three
-                        // sidecar offset sites must stay in sync.
-                        const int shadow_slot = t - kv_shadow_start;
+                        const int shadow_slot = t % kv_shadow_window;
                         v = static_cast<float>(
-                            shadow_v[h_kv * kv_max_t * d + shadow_slot * d + i]);
+                            shadow_v[h_kv * kv_shadow_window * d + shadow_slot * d + i]);
                     } else {
                         const float scale_v_t = sv_buf[h_kv * kv_max_t + t];
                         const uint8_t byte = fp8_cv[t * Hkv * d + h_kv * d + i];

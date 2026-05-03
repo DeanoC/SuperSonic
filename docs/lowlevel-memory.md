@@ -39,8 +39,8 @@ Current scope:
   disabled — enabling it is a separate effort.
 - Qwen3.6-MoE full-attention KV reserves BF16 or U8 K/V VMM allocations
   (full logical capacity mapped up front) per full-attn layer. FP8 scale
-  buffers (F32 [num_kv_heads, max_T]) and the optional BF16 sidecar
-  ([num_kv_heads, kv_max_t, head_dim]) stay as dense `GpuBuffer` for v1.
+  buffers (F32 [num_kv_heads, max_T]) and the optional rolling BF16 sidecar
+  ([num_kv_heads, sidecar_window, head_dim]) stay as dense `GpuBuffer`.
   See Tasks 9–11 of `docs/superpowers/plans/2026-05-03-qwen36-moe-fp8-kv-fp8.md`.
 - Baked tensors can now be loaded into `VirtualArena` allocations through
   `model-store::BakedStore::load_to_virtual_arena`. `BakedStore` also exposes
@@ -155,6 +155,10 @@ on CUDA devices with `SUPERSONIC_VMM_KV=1`:
 - Qwen3.6-MoE FP8-KV VMM backing parity:
   `SUPERSONIC_QWEN36_35B_A3B_DIR=/mnt/data/models/Qwen3.6-35B-A3B cargo test --release -p runner --test qwen36_moe_kv_fp8_vmm_smoke -- --nocapture`
   runs the same backing-equivalence check with `--kv-fp8`.
+- Qwen3.6-MoE FP8-KV rolling BF16 sidecar window parity:
+  `SUPERSONIC_QWEN36_35B_A3B_DIR=/mnt/data/models/Qwen3.6-35B-A3B cargo test --release -p runner --test qwen36_moe_kv_fp8_sidecar_window_smoke -- --nocapture`
+  forces `SUPERSONIC_DEBUG_KV_FP8_BF16_SIDECAR_WINDOW=2` inside the test and
+  compares dense FP8 KV with VMM-backed FP8 KV bit-exactly.
 - Qwen3.5 virtual KV e2e with eviction and restore-to-VMM:
   `SUPERSONIC_VMM_KV=1 SUPERSONIC_VMM_KV_EVICT_AFTER_PREFILL=1 SUPERSONIC_VMM_KV_RESTORE_TO_VMM=1 ... --validate`
   passed and kept stable VMM pointers through decode.

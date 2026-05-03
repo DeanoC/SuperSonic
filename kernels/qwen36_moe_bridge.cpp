@@ -1166,6 +1166,20 @@ extern "C" int qwen36_moe_hip_persistent_decode_launch(
                     li, d.kv_shadow_k, d.kv_shadow_v);
                 return 142;
             }
+            if (full && both && d.kv_shadow_k != nullptr && d.kv_shadow_window <= 0) {
+                fprintf(stderr,
+                    "[qwen36_moe] KV-FP8 layer %d: kv_shadow_window must be > 0 "
+                    "when kv_shadow_k/v are set (got %d)\n",
+                    li, d.kv_shadow_window);
+                return 144;
+            }
+            if ((!full || none || d.kv_shadow_k == nullptr) && d.kv_shadow_window != 0) {
+                fprintf(stderr,
+                    "[qwen36_moe] KV-FP8 layer %d: kv_shadow_window must be 0 "
+                    "when the BF16 sidecar is disabled (got %d)\n",
+                    li, d.kv_shadow_window);
+                return 145;
+            }
         }
     }
 

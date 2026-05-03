@@ -115,9 +115,10 @@ struct DecodeLayerDesc {
 
     // --- KV-FP8 sidecar (read iff is_full_attention == 1 AND
     // matching kv_fp8_descs[layer].kv_scale_k != null) ---------------
-    void* kv_shadow_k;       // BF16 [num_kv_heads, window, head_dim]
-    void* kv_shadow_v;       // BF16 [num_kv_heads, window, head_dim]
-    int   kv_shadow_start;   // first KV position covered by the sidecar; -1 = disabled
+    void* kv_shadow_k;       // BF16 [num_kv_heads, kv_shadow_window, head_dim]
+    void* kv_shadow_v;       // BF16 [num_kv_heads, kv_shadow_window, head_dim]
+    int   kv_shadow_start;   // earliest KV position the sidecar may cover; -1 = disabled
+    int   kv_shadow_window;  // rolling BF16 sidecar capacity in positions; 0 = disabled
 };
 
 // -- Int4 scale/zero parallel struct (mirror of Rust Qwen36MoeInt4ScaleDesc) -
@@ -364,7 +365,7 @@ __global__ void qwen36_moe_attn_step_kernel(
         kv_cache_k, kv_cache_v,
         /*kv_scale_k*/ nullptr, /*kv_scale_v*/ nullptr,
         /*kv_shadow_k*/ nullptr, /*kv_shadow_v*/ nullptr,
-        /*kv_shadow_start*/ -1,
+        /*kv_shadow_start*/ -1, /*kv_shadow_window*/ 0,
         kv_max_t,
         counters, barrier_counter, barrier_flag);
 }

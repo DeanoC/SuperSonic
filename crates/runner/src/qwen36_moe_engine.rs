@@ -167,12 +167,13 @@ pub fn run_qwen36_moe_dry_run(
     let int4_projected_bytes = checkpoint.project_int4_total_bytes(&config.text_config, 128);
 
     // The sidecar window is consulted only when --kv-fp8 is on AND the
-    // env-var helper is enabled. v1 forces the runtime allocation to
-    // window=kv_max_t (matches the kernel hard-coding); the env helper
-    // would only matter for VRAM accounting if the kernel grew a
-    // kv_shadow_window arg later.
+    // env-var helper is enabled. The persistent kernel treats it as a
+    // rolling recent-token window.
     let sidecar_window = if kv_fp8 && qwen35::state::kv_fp8_bf16_sidecar_enabled() {
-        Some(qwen35::state::kv_fp8_bf16_sidecar_window_tokens().unwrap_or(context_size))
+        let window = qwen35::state::kv_fp8_bf16_sidecar_window_tokens()
+            .unwrap_or(context_size)
+            .min(context_size);
+        (window > 0).then_some(window)
     } else {
         None
     };
@@ -1476,25 +1477,31 @@ fn load_layer_buffers(
                     .with_context(|| format!("alloc kv_cache_v (layer {layer_idx})"))?;
                 (Some(k), Some(v), None, None, None, None, None)
             };
-            let (kv_shadow_k, kv_shadow_v) = if kv_fp8
-                && qwen35::state::kv_fp8_bf16_sidecar_enabled()
-            {
-                // Window is hard-coded to kv_max_t in v1 (matches the
-                // kernel's stride). The env-var window helper is consulted
-                // by Task 11 only for VRAM accounting; the actual buffer
-                // size always equals kv_max_t until the kernel grows a
-                // kv_shadow_window arg.
-                let window = kv_max_t;
-                let sk =
-                    GpuBuffer::zeros(ordinal, ScalarType::BF16, &[num_kv_heads, window, head_dim])
+            let (kv_shadow_k, kv_shadow_v, kv_shadow_window) =
+                if kv_fp8 && qwen35::state::kv_fp8_bf16_sidecar_enabled() {
+                    let window = qwen35::state::kv_fp8_bf16_sidecar_window_tokens()
+                        .unwrap_or(kv_max_t)
+                        .min(kv_max_t);
+                    if window == 0 {
+                        (None, None, 0)
+                    } else {
+                        let sk = GpuBuffer::zeros(
+                            ordinal,
+                            ScalarType::BF16,
+                            &[num_kv_heads, window, head_dim],
+                        )
                         .with_context(|| format!("alloc kv_shadow_k (layer {layer_idx})"))?;
-                let sv =
-                    GpuBuffer::zeros(ordinal, ScalarType::BF16, &[num_kv_heads, window, head_dim])
+                        let sv = GpuBuffer::zeros(
+                            ordinal,
+                            ScalarType::BF16,
+                            &[num_kv_heads, window, head_dim],
+                        )
                         .with_context(|| format!("alloc kv_shadow_v (layer {layer_idx})"))?;
-                (Some(sk), Some(sv))
-            } else {
-                (None, None)
-            };
+                        (Some(sk), Some(sv), window as i32)
+                    }
+                } else {
+                    (None, None, 0)
+                };
             Some(FullAttnKvCache {
                 k,
                 v,
@@ -1504,6 +1511,7 @@ fn load_layer_buffers(
                 kv_shadow_k,
                 kv_shadow_v,
                 kv_shadow_start: -1,
+                kv_shadow_window,
                 virtual_kv_cache_k,
                 virtual_kv_cache_v,
                 virtual_kv_max_t,
@@ -1929,6 +1937,7 @@ fn load_mtp_buffers(
             kv_shadow_k: None,
             kv_shadow_v: None,
             kv_shadow_start: -1,
+            kv_shadow_window: 0,
             virtual_kv_cache_k: None,
             virtual_kv_cache_v: None,
             virtual_kv_max_t: None,
@@ -2761,12 +2770,10 @@ fn decode_text(
         let t_chain_step = t1.elapsed();
         position += 1;
 
-        // (KV-FP8 sidecar shadow cursor is set at desc-build time in
-        // build_layer_descs — see qwen36_moe_persistent_decode.rs. v1
-        // forces the sidecar window equal to kv_max_t, so the cursor
-        // is `0` from step 0 onward and the descs never need re-upload.
-        // A future windowed-mode kernel would need decode-time updates
-        // to the device-side desc; flag for that work then.)
+        // KV-FP8 sidecar descriptors stay fixed across decode. The
+        // persistent kernel computes the rolling covered range from
+        // `position` and `kv_shadow_window`, so no descriptor re-upload is
+        // needed when old sidecar slots roll over.
 
         // Prefill steps: feed the next prompt token without computing logits.
         if step + 1 < prompt_ids.len() {

@@ -114,17 +114,22 @@ pub struct Qwen36MoeDecodeLayerDesc {
 
     // --- KV-FP8 sidecar (read iff is_full_attention == 1 AND
     // matching kv_fp8_descs[layer].kv_scale_k != null) ---------------
-    /// BF16 sidecar buffer `[num_kv_heads, window, head_dim]`. Null when
-    /// the sidecar is disabled. The kernel reads from the sidecar (instead
-    /// of dequantising FP8) when `t >= kv_shadow_start`.
+    /// BF16 sidecar buffer `[num_kv_heads, kv_shadow_window, head_dim]`.
+    /// Null when the sidecar is disabled. The kernel reads from the sidecar
+    /// (instead of dequantising FP8) for positions covered by the rolling
+    /// sidecar window.
     pub kv_shadow_k: *mut c_void,
-    /// BF16 sidecar buffer `[num_kv_heads, window, head_dim]`. Paired with
-    /// [`Self::kv_shadow_k`]; null under the same conditions.
+    /// BF16 sidecar buffer `[num_kv_heads, kv_shadow_window, head_dim]`.
+    /// Paired with [`Self::kv_shadow_k`]; null under the same conditions.
     pub kv_shadow_v: *mut c_void,
-    /// First absolute KV position covered by the sidecar. `-1` when the
-    /// sidecar is disabled (or no positions are covered yet); the kernel
-    /// reads `t >= kv_shadow_start && kv_shadow_start >= 0` to decide.
+    /// Earliest absolute KV position the sidecar may cover. `-1` when the
+    /// sidecar is disabled. Runtime coverage is
+    /// `max(kv_shadow_start, position + 1 - kv_shadow_window)..=position`.
     pub kv_shadow_start: c_int,
+    /// Number of recent KV positions physically stored in the BF16 sidecar.
+    /// Zero when the sidecar is disabled. The kernel uses modulo indexing so
+    /// the descriptor can remain fixed across decode steps.
+    pub kv_shadow_window: c_int,
 }
 
 unsafe impl Send for Qwen36MoeDecodeLayerDesc {}
