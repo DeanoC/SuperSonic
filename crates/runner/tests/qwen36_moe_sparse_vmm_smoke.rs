@@ -145,7 +145,9 @@ fn qwen36_moe_sparse_vmm_matches_dense_virtual_slabs() {
         "supersonic-qwen36-moe-sparse-vmm-telemetry-v1"
     );
     let summary = &json["summary"];
-    let max_pages = (cap_experts * 2) as u64;
+    let max_pages = summary["max_resident_pages"]
+        .as_u64()
+        .expect("sparse telemetry summary should report max_resident_pages");
     assert!(
         summary["peak_resident_pages"].as_u64().unwrap() <= max_pages,
         "peak pages exceeded sparse cap: {summary:?}"

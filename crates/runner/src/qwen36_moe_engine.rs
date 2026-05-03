@@ -1175,6 +1175,7 @@ impl MoeSparseTelemetry {
             "schema": "supersonic-qwen36-moe-sparse-vmm-telemetry-v1",
             "summary": {
                 "registered_tensors": final_snapshot.stats.registered_tensors,
+                "max_resident_pages": manager.max_resident_pages(),
                 "final_resident_slices": final_snapshot.stats.resident_slices,
                 "final_resident_pages": final_snapshot.stats.resident_pages,
                 "final_page_backed_slices": final_snapshot.stats.page_backed_slices,
@@ -2004,10 +2005,7 @@ fn decode_text(
         if !should_try_moe_expert_vmm(MoeExpertVmmMode::Force, backend, weight_mode, ordinal)? {
             unreachable!("forced VMM expert check should either return true or error");
         }
-        let max_resident_pages = cap_experts
-            .checked_mul(2)
-            .ok_or_else(|| anyhow!("SUPERSONIC_MOE_ISLAND_CAP_EXPERTS overflows page cap"))?;
-        let config = MoeExpertResidencyConfig::new(max_resident_pages)?;
+        let config = MoeExpertResidencyConfig::new(1)?;
         let mut manager = MoeExpertResidencyManager::new(ordinal, config);
         let layers = load_all_layer_buffers(
             &store,
@@ -2021,6 +2019,12 @@ fn decode_text(
             Some(&mut manager),
         )
         .context("reserve Qwen3.6-MoE routed experts for sparse VMM residency")?;
+        let max_resident_pages = manager
+            .page_budget_for_routed_experts(cap_experts)
+            .context("derive sparse MoE page budget from routed expert tensor layout")?;
+        manager
+            .set_max_resident_pages(max_resident_pages)
+            .context("apply sparse MoE page budget")?;
         let arena_stats = manager.arena().stats();
         let residency_stats = manager.stats();
         println!(

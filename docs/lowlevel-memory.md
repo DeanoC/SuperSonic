@@ -52,14 +52,15 @@ Current scope:
   islands for Qwen3.6-MoE INT4 decode. The chained decode path runs FFN stage 1
   first, downloads the `top_k` expert ids, pins those experts' gate/up and down
   slices, then runs the normal stage-5 FFN launch against the stable virtual
-  slab pointers. The cap is expressed in experts, but the residency budget is
-  `2*N` VMM pages because each expert may touch both fused projections. Logical
-  slice hit/miss counters still track router demand; page hit/miss counters
-  track physical residency. Sparse islands copy the full VMM backing page for
-  any touched expert slice, so every expert sharing that resident page contains
-  real bake data rather than zero fill. Sparse islands currently disable the
-  persistent megakernel for that run; persistent router prefetch needs a future
-  split or in-kernel residency protocol.
+  slab pointers. The cap is expressed in experts; after all sparse expert
+  tensors are registered, SuperSonic derives the VMM page budget from the
+  actual worst-case gate/up and down page footprint for one routed expert.
+  Logical slice hit/miss counters still track router demand; page hit/miss
+  counters track physical residency. Sparse islands copy the full VMM backing
+  page for any touched expert slice, so every expert sharing that resident page
+  contains real bake data rather than zero fill. Sparse islands currently
+  disable the persistent megakernel for that run; persistent router prefetch
+  needs a future split or in-kernel residency protocol.
 - `SUPERSONIC_MOE_ISLAND_TELEMETRY_JSON=/path/report.json` records sparse
   MoE residency telemetry for Qwen3.6-MoE runs: per-forward hits, misses,
   uploads, evictions, resident slices, resident pages, page-backed slice count,

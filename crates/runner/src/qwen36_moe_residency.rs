@@ -78,6 +78,7 @@ pub struct MoeExpertTensorReservation {
 #[derive(Debug, Clone)]
 struct ExpertTensor {
     name: String,
+    projection: MoeExpertProjection,
     allocation_id: usize,
     ptr: *const c_void,
     dtype: ScalarType,
@@ -181,6 +182,49 @@ impl MoeExpertResidencyManager {
         }
     }
 
+    pub fn max_resident_pages(&self) -> usize {
+        self.config.max_resident_pages
+    }
+
+    pub fn set_max_resident_pages(&mut self, max_resident_pages: usize) -> Result<()> {
+        self.config = MoeExpertResidencyConfig::new(max_resident_pages)?;
+        while self.resident_pages.len() > self.config.max_resident_pages {
+            self.evict_lru_page()?;
+        }
+        Ok(())
+    }
+
+    pub fn page_budget_for_routed_experts(&self, routed_experts: usize) -> Result<usize> {
+        if routed_experts == 0 {
+            return Err(anyhow!("routed_experts must be > 0"));
+        }
+        let mut pages_by_projection: HashMap<MoeExpertProjection, usize> = HashMap::new();
+        for tensor in &self.tensors {
+            let pages_per_slice = tensor.max_pages_per_expert_slice();
+            pages_by_projection
+                .entry(tensor.projection)
+                .and_modify(|current| *current = (*current).max(pages_per_slice))
+                .or_insert(pages_per_slice);
+        }
+        let pages_per_routed_expert = pages_by_projection
+            .values()
+            .try_fold(0usize, |acc, pages| acc.checked_add(*pages))
+            .ok_or_else(|| anyhow!("routed expert page footprint overflows"))?;
+        if pages_per_routed_expert == 0 {
+            return Err(anyhow!(
+                "cannot derive sparse MoE page budget before registering expert tensors"
+            ));
+        }
+        routed_experts
+            .checked_mul(pages_per_routed_expert)
+            .ok_or_else(|| {
+                anyhow!(
+                    "sparse MoE page budget overflows: routed_experts={routed_experts} \
+                     pages_per_routed_expert={pages_per_routed_expert}"
+                )
+            })
+    }
+
     pub fn register_tensor(
         &mut self,
         store: &BakedStore,
@@ -218,6 +262,7 @@ impl MoeExpertResidencyManager {
 
         let tensor = ExpertTensor {
             name: name.to_string(),
+            projection,
             allocation_id,
             ptr: buffer.as_ptr(),
             dtype: buffer.dtype(),
@@ -541,6 +586,21 @@ impl ExpertTensor {
             expert_bytes: self.expert_bytes,
         }
     }
+
+    fn max_pages_per_expert_slice(&self) -> usize {
+        (0..self.expert_count)
+            .map(|expert_idx| {
+                page_spans(
+                    self.page_bytes,
+                    expert_idx * self.expert_bytes,
+                    self.expert_bytes,
+                    self.len_bytes,
+                )
+                .len()
+            })
+            .max()
+            .unwrap_or(0)
+    }
 }
 
 fn page_spans(page_bytes: usize, offset: usize, len: usize, total_len: usize) -> Vec<PageSpan> {
@@ -797,6 +857,60 @@ mod tests {
                 .expect("read expert 1");
             assert!(bytes.iter().all(|b| *b == 2));
         });
+    }
+
+    #[test]
+    fn page_budget_uses_registered_projection_footprint() {
+        with_supported_vmm_backend(
+            "page_budget_uses_registered_projection_footprint",
+            |_backend| {
+                let probe_tmp = synthetic_store(1, 4096);
+                let probe_store = BakedStore::open(probe_tmp.path()).expect("open probe store");
+                let mut probe =
+                    MoeExpertResidencyManager::new(0, MoeExpertResidencyConfig::new(1).unwrap());
+                probe
+                    .register_tensor(
+                        &probe_store,
+                        0,
+                        MoeExpertProjection::GateUp,
+                        "model.layers.0.mlp.experts.gate_up_proj",
+                        1,
+                    )
+                    .expect("register probe tensor");
+                let page_bytes = probe.tensors[0].page_bytes;
+
+                let expert_bytes = page_bytes + 1;
+                let tmp = synthetic_store(2, expert_bytes);
+                let store = BakedStore::open(tmp.path()).expect("open synthetic store");
+                let mut manager =
+                    MoeExpertResidencyManager::new(0, MoeExpertResidencyConfig::new(1).unwrap());
+                manager
+                    .register_tensor(
+                        &store,
+                        0,
+                        MoeExpertProjection::GateUp,
+                        "model.layers.0.mlp.experts.gate_up_proj",
+                        2,
+                    )
+                    .expect("register gate/up tensor");
+                manager
+                    .register_tensor(
+                        &store,
+                        0,
+                        MoeExpertProjection::Down,
+                        "model.layers.0.mlp.experts.gate_up_proj",
+                        2,
+                    )
+                    .expect("register down tensor");
+
+                assert_eq!(
+                    manager
+                        .page_budget_for_routed_experts(3)
+                        .expect("derive page budget"),
+                    12
+                );
+            },
+        );
     }
 
     #[test]
