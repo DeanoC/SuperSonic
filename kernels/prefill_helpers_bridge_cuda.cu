@@ -651,6 +651,19 @@ extern "C" int supersonic_qwen35_hip_apply_rope_prefill_indirect(
     return 316;
 }
 
+extern "C" int supersonic_qwen35_hip_lookahead_attention_scores(
+    int /*dtype*/, size_t /*device_ordinal*/,
+    size_t /*q_heads*/, size_t /*kv_heads*/,
+    size_t /*lookahead_count*/, size_t /*kv_len*/, size_t /*head_dim*/,
+    float /*scale*/,
+    const void* /*q*/, const void* /*k*/, void* /*scores*/
+) {
+    // SpecPrefill (arXiv 2502.02789) is HIP-first; CUDA wiring lands
+    // alongside the Phase C end-to-end work. Returning a distinct status
+    // so a caller hitting this path on CUDA gets a clear error.
+    return 318;
+}
+
 extern "C" int supersonic_qwen35_hip_transpose_shd_hsd(
     int dtype, size_t device_ordinal,
     size_t S, size_t H, size_t D,

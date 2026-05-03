@@ -84,6 +84,41 @@ int apply_rope_prefill_indirect_device(int device_ordinal,
     return 0;
 }
 
+// ---- lookahead_attention_scores (SpecPrefill — arXiv 2502.02789) ----
+
+template <typename T>
+int lookahead_attention_scores_device(int device_ordinal,
+                                      int q_heads, int kv_heads,
+                                      int lookahead_count, int kv_len, int head_dim,
+                                      float scale,
+                                      const void* q, const void* k, void* scores) {
+    if (q_heads <= 0 || kv_heads <= 0 || lookahead_count <= 0 || kv_len <= 0 || head_dim <= 0) {
+        return 318; // invalid shape
+    }
+    if (q_heads % kv_heads != 0) {
+        return 319; // q_heads must be a multiple of kv_heads
+    }
+    ScopedHipDevice scoped(device_ordinal);
+    const int num_kv_groups = q_heads / kv_heads;
+    const dim3 grid(static_cast<unsigned int>(q_heads * lookahead_count));
+    // gfx1100 HIP defaults to wave32. Match the existing prefill kernels'
+    // convention (full_attention.hip's `if (lane >= warpSize) return;`)
+    // by launching exactly one warp per block.
+    const dim3 block(32); // wave32 on gfx1100
+    const size_t shared_bytes = static_cast<size_t>(kv_len) * sizeof(float);
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(pfx_lookahead_attention_scores_kernel<T>),
+        grid, block, shared_bytes, 0,
+        q_heads, kv_heads, lookahead_count, kv_len, head_dim, num_kv_groups,
+        scale,
+        static_cast<const T*>(q),
+        static_cast<const T*>(k),
+        static_cast<float*>(scores));
+    if (hipGetLastError() != hipSuccess) return 316;
+    if (hipDeviceSynchronize() != hipSuccess) return 317;
+    return 0;
+}
+
 // ---- transpose [S,H,D] -> [H,S,D] ----
 
 template <typename T>
@@ -356,6 +391,28 @@ extern "C" int supersonic_qwen35_hip_apply_rope_prefill_indirect(
                 static_cast<int>(head_dim), static_cast<int>(half_rot),
                 cos_table, sin_table, pos_ids, data);
     default: return 315;
+    }
+}
+
+extern "C" int supersonic_qwen35_hip_lookahead_attention_scores(
+    int dtype, size_t device_ordinal,
+    size_t q_heads, size_t kv_heads,
+    size_t lookahead_count, size_t kv_len, size_t head_dim,
+    float scale,
+    const void* q, const void* k, void* scores
+) {
+    switch (dtype) {
+    case 0: return lookahead_attention_scores_device<half>(
+                static_cast<int>(device_ordinal),
+                static_cast<int>(q_heads), static_cast<int>(kv_heads),
+                static_cast<int>(lookahead_count), static_cast<int>(kv_len),
+                static_cast<int>(head_dim), scale, q, k, scores);
+    case 2: return lookahead_attention_scores_device<hip_bfloat16>(
+                static_cast<int>(device_ordinal),
+                static_cast<int>(q_heads), static_cast<int>(kv_heads),
+                static_cast<int>(lookahead_count), static_cast<int>(kv_len),
+                static_cast<int>(head_dim), scale, q, k, scores);
+    default: return 320;
     }
 }
 
