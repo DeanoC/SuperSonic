@@ -21,6 +21,7 @@ mod qwen36_moe_geom;
 mod qwen36_moe_host;
 mod qwen36_moe_layers;
 mod qwen36_moe_legacy;
+mod qwen36_moe_lm_head;
 mod qwen36_moe_mtp;
 mod qwen36_moe_mtp_loader;
 mod qwen36_moe_output;

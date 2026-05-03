@@ -26,6 +26,7 @@ use crate::qwen36_moe_dry_run::{
 };
 use crate::qwen36_moe_geom::build_multi_layer_geom;
 use crate::qwen36_moe_host::lookup_embed_row;
+use crate::qwen36_moe_lm_head::{launch_lm_head_from_final_hidden_bytes, LmHeadBuffers};
 use crate::qwen36_moe_output::{
     dump_final_hidden_if_requested, dump_logits_if_requested, print_decode_stream_start,
     print_decoded_token, print_generation_summary, print_last_logits_if_requested,
@@ -553,31 +554,25 @@ fn decode_text(
         // launch — `logits_buf` is already populated by the
         // megakernel.
         let t2 = std::time::Instant::now();
-        if !lm_head_folded {
-            gpu_hal::copy_h2d(
+        let logits = if lm_head_folded {
+            logits_buf
+                .to_host_bytes()
+                .context("d2h logits from folded GPU lm_head")?
+        } else {
+            launch_lm_head_from_final_hidden_bytes(
                 ordinal,
-                final_hidden_buf.as_mut_ptr(),
-                outputs.final_hidden_bytes.as_ptr() as *const _,
-                outputs.final_hidden_bytes.len(),
+                &geom,
+                &outputs.final_hidden_bytes,
+                LmHeadBuffers {
+                    final_norm_w: &final_norm_w_buf,
+                    lm_head_w: &lm_head_w_buf,
+                    final_hidden: &mut final_hidden_buf,
+                    logits: &mut logits_buf,
+                    counter: &mut counter_buf,
+                },
             )
-            .context("h2d final_hidden -> final_hidden_buf")?;
-            kernel_ffi::qwen36_moe::lm_head_launch(
-                ordinal,
-                geom.hidden,
-                geom.vocab,
-                geom.rms_norm_eps,
-                &final_hidden_buf,
-                &final_norm_w_buf,
-                &lm_head_w_buf,
-                &mut logits_buf,
-                None, // base decode doesn't capture h_post — that's MTP-only
-                &mut counter_buf,
-            )
-            .context("gpu lm_head launch")?;
-        }
-        let logits = logits_buf
-            .to_host_bytes()
-            .context("d2h logits from GPU lm_head")?;
+            .context("standalone GPU lm_head")?
+        };
         if dump_last_logits {
             last_logits_bytes.clone_from(&logits);
         }
@@ -853,27 +848,19 @@ fn decode_text(
                         stage_timings.record_chain(t_chain_start.elapsed(), &outputs);
 
                         let t_lm_head_start = std::time::Instant::now();
-                        gpu_hal::copy_h2d(
+                        let logits_bytes = launch_lm_head_from_final_hidden_bytes(
                             ordinal,
-                            final_hidden_buf.as_mut_ptr(),
-                            outputs.final_hidden_bytes.as_ptr() as *const _,
-                            outputs.final_hidden_bytes.len(),
-                        )?;
-                        kernel_ffi::qwen36_moe::lm_head_launch(
-                            ordinal,
-                            geom.hidden,
-                            geom.vocab,
-                            geom.rms_norm_eps,
-                            &final_hidden_buf,
-                            &final_norm_w_buf,
-                            &lm_head_w_buf,
-                            &mut logits_buf,
-                            None,
-                            &mut counter_buf,
-                        )?;
-                        let logits_bytes = logits_buf
-                            .to_host_bytes()
-                            .context("d2h logits from spec verify lm_head")?;
+                            &geom,
+                            &outputs.final_hidden_bytes,
+                            LmHeadBuffers {
+                                final_norm_w: &final_norm_w_buf,
+                                lm_head_w: &lm_head_w_buf,
+                                final_hidden: &mut final_hidden_buf,
+                                logits: &mut logits_buf,
+                                counter: &mut counter_buf,
+                            },
+                        )
+                        .context("spec verify GPU lm_head")?;
                         stage_timings.record_lm_head(t_lm_head_start.elapsed());
                         // Each verify base step counts as one decode step
                         // for the per-token average — emitted_tokens.len()
