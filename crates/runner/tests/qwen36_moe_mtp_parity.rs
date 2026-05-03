@@ -141,11 +141,23 @@ fn load_mtp_buffers_from_bake(
     let kv_dim = (geom.num_kv_heads as usize) * (geom.head_dim as usize);
     let kv_cache = if kv_max_t > 0 {
         Some(FullAttnKvCache {
-            k: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[kv_max_t, kv_dim])
-                .context("alloc mtp kv_cache_k")?,
-            v: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[kv_max_t, kv_dim])
-                .context("alloc mtp kv_cache_v")?,
+            k: Some(
+                GpuBuffer::zeros(ordinal, ScalarType::BF16, &[kv_max_t, kv_dim])
+                    .context("alloc mtp kv_cache_k")?,
+            ),
+            v: Some(
+                GpuBuffer::zeros(ordinal, ScalarType::BF16, &[kv_max_t, kv_dim])
+                    .context("alloc mtp kv_cache_v")?,
+            ),
             kv_max_t: kv_max_t as i32,
+            kv_scale_k: None,
+            kv_scale_v: None,
+            kv_shadow_k: None,
+            kv_shadow_v: None,
+            kv_shadow_start: -1,
+            virtual_kv_cache_k: None,
+            virtual_kv_cache_v: None,
+            virtual_kv_max_t: None,
         })
     } else {
         None
