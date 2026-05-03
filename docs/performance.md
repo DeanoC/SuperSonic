@@ -282,6 +282,10 @@ an opt-in small-VRAM mode for now; the runtime should not auto-default to
 `SUPERSONIC_MOE_ISLAND_CAP_EXPERTS` on gfx1100 until prefetching/reuse reduces
 the miss rate substantially.
 
+The sweep helper can also compare previous-token prefetch policies in one run:
+add `--prefetch-rank-sweep none,1,2,4,all` to expand every sparse cap across
+no lookahead, rank-limited lookahead, and full top-k lookahead rows.
+
 Reproduce:
 
 ```bash

@@ -22,6 +22,48 @@ MIB = 1024 * 1024
 GIB = 1024 * MIB
 
 
+def parse_prefetch_rank_policy(raw: str) -> tuple[str, str | None]:
+    value = raw.strip().lower()
+    if value in {"none", "off", "disabled", "0"}:
+        return ("none", None)
+    if value == "all":
+        return ("all", "all")
+    ranks = int(value)
+    if ranks <= 0:
+        raise ValueError("prefetch ranks must be positive")
+    return (f"r{ranks}", str(ranks))
+
+
+def parse_prefetch_rank_policies(raw: str) -> list[tuple[str, str | None]]:
+    policies = [parse_prefetch_rank_policy(part) for part in raw.split(",") if part.strip()]
+    if not policies:
+        raise ValueError("prefetch rank policy list is empty")
+    seen: set[str] = set()
+    deduped: list[tuple[str, str | None]] = []
+    for label, ranks in policies:
+        if label in seen:
+            continue
+        seen.add(label)
+        deduped.append((label, ranks))
+    return deduped
+
+
+def build_cases(
+    caps: list[int],
+    prefetch_rank_sweep: str | None,
+    prefetch_ranks: str | None,
+) -> list[tuple[str, int | None, str | None]]:
+    cases: list[tuple[str, int | None, str | None]] = [("dense", None, None)]
+    if prefetch_rank_sweep:
+        rank_policies = parse_prefetch_rank_policies(prefetch_rank_sweep)
+        for cap in caps:
+            for policy_label, ranks in rank_policies:
+                cases.append((f"cap{cap}-{policy_label}", cap, ranks))
+    else:
+        cases.extend((f"cap{cap}", cap, prefetch_ranks) for cap in caps)
+    return cases
+
+
 def parse_stage_timings(output: str) -> dict[str, float]:
     match = re.search(r"\[qwen36-moe stage-timings\]\s+(.+)", output)
     if not match:
@@ -87,6 +129,7 @@ def run_case(
     args: argparse.Namespace,
     label: str,
     cap: int | None,
+    prefetch_ranks: str | None,
     tmp: Path,
     warmup: bool,
 ) -> dict[str, Any]:
@@ -103,8 +146,10 @@ def run_case(
         env["SUPERSONIC_MOE_ISLAND_TELEMETRY_JSON"] = str(telemetry_path)
         if args.prefetch:
             env["SUPERSONIC_MOE_ISLAND_PREFETCH"] = args.prefetch
-        if args.prefetch_ranks is not None:
-            env["SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS"] = str(args.prefetch_ranks)
+        elif prefetch_ranks is not None:
+            env["SUPERSONIC_MOE_ISLAND_PREFETCH"] = "previous-token"
+        if prefetch_ranks is not None:
+            env["SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS"] = prefetch_ranks
 
     cmd = [
         str(args.binary),
@@ -135,6 +180,7 @@ def run_case(
     row: dict[str, Any] = {
         "label": label,
         "cap_experts": cap,
+        "prefetch_ranks_requested": prefetch_ranks,
         "returncode": proc.returncode,
         "generated_ids": parse_generated_ids(output),
         "stage": parse_stage_timings(output),
@@ -174,8 +220,8 @@ def run_case(
 
 def markdown(rows: list[dict[str, Any]]) -> str:
     out = [
-        "| Mode | total ms/tok | tok/s | total resident GiB | MoE resident GiB | KV resident GiB | prefetch ranks | peak pages | page misses | prefetch page misses | rank0 resident | rank0 repeat | evicted pages | ids match |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|",
+        "| Mode | total ms/tok | tok/s | total resident GiB | MoE resident GiB | KV resident GiB | prefetch | ranks | peak pages | page misses | prefetch page misses | rank0 resident | rank0 repeat | evicted pages | ids match |",
+        "|---|---:|---:|---:|---:|---:|:---:|---:|---:|---:|---:|---:|---:|---:|:---:|",
     ]
     for row in rows:
         residency = row.get("vmm_residency") or {}
@@ -183,13 +229,14 @@ def markdown(rows: list[dict[str, Any]]) -> str:
         stage = row.get("stage") or {}
         ids_match = row.get("generated_ids_match")
         out.append(
-            "| {label} | {ms} | {tok} | {total_gib} | {moe_gib} | {kv_gib} | {prefetch_ranks} | {peak_pages} | {page_misses} | {prefetch_page_misses} | {rank0_resident} | {rank0_repeat} | {evicted_pages} | {ids_match} |".format(
+            "| {label} | {ms} | {tok} | {total_gib} | {moe_gib} | {kv_gib} | {prefetch_mode} | {prefetch_ranks} | {peak_pages} | {page_misses} | {prefetch_page_misses} | {rank0_resident} | {rank0_repeat} | {evicted_pages} | {ids_match} |".format(
                 label=row["label"],
                 ms=fmt_num(stage.get("total_ms_avg")),
                 tok=fmt_num(row.get("tok_per_s")),
                 total_gib=fmt_gib(residency.get("total_vmm_resident_bytes")),
                 moe_gib=fmt_gib(residency.get("moe_resident_bytes")),
                 kv_gib=fmt_gib(residency.get("kv_resident_bytes")),
+                prefetch_mode=residency.get("prefetch_mode", "-"),
                 prefetch_ranks=residency.get("prefetch_ranks", "-"),
                 peak_pages=residency.get("peak_resident_pages", "-"),
                 page_misses=residency.get("page_misses", "-"),
@@ -224,15 +271,31 @@ def main() -> int:
     )
     parser.add_argument(
         "--prefetch-ranks",
-        type=int,
         help="set SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS for sparse cap rows",
+    )
+    parser.add_argument(
+        "--prefetch-rank-sweep",
+        help=(
+            "comma-separated sparse prefetch policies to sweep per cap, e.g. "
+            "none,1,2,4,all; overrides --prefetch/--prefetch-ranks"
+        ),
     )
     parser.add_argument("--out-json", type=Path, default=Path("target/qwen36_sparse_cap_sweep.json"))
     parser.add_argument("--out-md", type=Path, default=Path("target/qwen36_sparse_cap_sweep.md"))
     args = parser.parse_args()
 
+    if args.prefetch_rank_sweep and (args.prefetch or args.prefetch_ranks is not None):
+        parser.error("--prefetch-rank-sweep cannot be combined with --prefetch/--prefetch-ranks")
     if args.prefetch_ranks is not None and not args.prefetch:
         parser.error("--prefetch-ranks requires --prefetch previous-token")
+    if args.prefetch_ranks is not None:
+        try:
+            _, ranks = parse_prefetch_rank_policy(args.prefetch_ranks)
+        except ValueError as exc:
+            parser.error(str(exc))
+        if ranks is None:
+            parser.error("--prefetch-ranks must be a positive integer or all")
+        args.prefetch_ranks = ranks
     if not args.binary.exists():
         raise FileNotFoundError(args.binary)
     if not args.model_dir.exists():
@@ -242,16 +305,18 @@ def main() -> int:
     tmp_owner = tempfile.TemporaryDirectory(prefix="qwen36-sparse-cap-sweep-")
     tmp = Path(tmp_owner.name)
 
-    cases: list[tuple[str, int | None]] = [("dense", None)]
-    cases.extend((f"cap{cap}", cap) for cap in caps)
+    try:
+        cases = build_cases(caps, args.prefetch_rank_sweep, args.prefetch_ranks)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     rows: list[dict[str, Any]] = []
-    for label, cap in cases:
+    for label, cap, prefetch_ranks in cases:
         if not args.no_warmup:
             print(f"[warmup] {label}", flush=True)
-            run_case(args, label, cap, tmp, warmup=True)
+            run_case(args, label, cap, prefetch_ranks, tmp, warmup=True)
         print(f"[bench] {label}", flush=True)
-        row = run_case(args, label, cap, tmp, warmup=False)
+        row = run_case(args, label, cap, prefetch_ranks, tmp, warmup=False)
         if row.get("returncode") != 0:
             print(row.get("error") or row.get("stderr_tail") or "run failed", file=sys.stderr)
             return 1
