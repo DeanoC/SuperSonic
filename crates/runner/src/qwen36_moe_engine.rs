@@ -25,13 +25,14 @@ use qwen36_moe::weights::{
 };
 
 use crate::qwen36_moe_decode::{
-    argmax_bf16_logits, dequant_int4_to_bf16_bytes, host_final_norm_lm_head, run_chained_decode,
-    run_chained_decode_fast, run_chained_decode_fast_with_expert_prefetch, sample_bf16_logits,
-    ExpertPrefetchPhase, ExpertRoute, LayerBuffers, MtpLayerBuffers, MultiLayerGeom, XorshiftRng,
+    argmax_bf16_logits, host_final_norm_lm_head, run_chained_decode, run_chained_decode_fast,
+    run_chained_decode_fast_with_expert_prefetch, sample_bf16_logits, ExpertPrefetchPhase,
+    ExpertRoute, LayerBuffers, MtpLayerBuffers, MultiLayerGeom, XorshiftRng,
 };
+use crate::qwen36_moe_host::{host_load_bytes, load_lm_head_bf16, lookup_embed_row};
 use crate::qwen36_moe_layers::{
     load_all_layer_buffers, load_layer_buffers, load_to_gpu, resolve_qwen36_store_name,
-    store_contains_qwen36, store_layout_qwen36, Qwen36WeightMode, QWEN36_MOE_INT4_GROUP_SIZE,
+    store_contains_qwen36, store_layout_qwen36, Qwen36WeightMode,
 };
 use crate::qwen36_moe_prefetch::handle_moe_expert_prefetch;
 use crate::qwen36_moe_residency::{MoeExpertResidencyConfig, MoeExpertResidencyManager};
@@ -1366,44 +1367,6 @@ fn prepare_decode_session(
     })
 }
 
-/// Look up one row of the embedding table on the host. For the
-/// "first decode token" smoke path we use token 0 (or BOS if defined) so
-/// the path runs end-to-end without a tokenizer. The full embed_tokens
-/// tensor is BF16 `[vocab, hidden]`; we slice the first `hidden*2` bytes
-/// out of its mmap-backed raw payload to avoid a full GPU upload of the
-/// embedding table.
-fn lookup_embed_row(
-    store: &BakedStore,
-    weight_prefix: &str,
-    token_id: usize,
-    hidden: usize,
-) -> Result<Vec<u8>> {
-    let name = format!("{weight_prefix}.embed_tokens.weight");
-    let bytes = store
-        .raw_bytes(&name)
-        .ok_or_else(|| anyhow!("missing {name} in bake"))?;
-    let row_bytes = hidden * 2;
-    let start = token_id * row_bytes;
-    let end = start + row_bytes;
-    if end > bytes.len() {
-        return Err(anyhow!(
-            "embed_tokens row {token_id} out of bounds (need {end} bytes, have {})",
-            bytes.len()
-        ));
-    }
-    Ok(bytes[start..end].to_vec())
-}
-
-/// Pull the host-side bytes for a small tensor (final norm, lm_head). For
-/// lm_head with vocab=248K × hidden=2048 BF16 that's ~1 GiB — host RAM is
-/// fine but a future revision should run lm_head on the GPU (PR 4d).
-fn host_load_bytes(store: &BakedStore, name: &str) -> Result<Vec<u8>> {
-    let raw = store
-        .raw_bytes(name)
-        .ok_or_else(|| anyhow!("missing {name} in bake"))?;
-    Ok(raw.to_vec())
-}
-
 /// Tokenize the prompt and run the multi-token decode loop end-to-end:
 /// prefill the prompt one token at a time, then generate `max_new`
 /// tokens via greedy argmax against the (cached) host-side lm_head
@@ -2477,50 +2440,6 @@ fn decode_text(
 }
 
 /// Load + dequantize lm_head into a BF16 byte buffer that the host-side
-/// GEMV in `host_final_norm_lm_head` consumes. Handles the three layouts:
-/// tied embeddings (BF16 from embed_tokens), standalone BF16, or INT4
-/// GPTQ (packed nibbles + scale/zero sidecars). The dequant runs once per
-/// process; the result is reused across all decode steps.
-fn load_lm_head_bf16(
-    store: &BakedStore,
-    text_config: &TextConfig,
-    weight_prefix: &str,
-    geom: &MultiLayerGeom,
-) -> Result<Vec<u8>> {
-    let (lm_name, lm_packed) = if text_config.tie_word_embeddings {
-        let n = format!("{weight_prefix}.embed_tokens.weight");
-        let b = host_load_bytes(store, &n).context("load tied lm_head from embed_tokens")?;
-        (n, b)
-    } else {
-        let n = "lm_head.weight";
-        let b = host_load_bytes(store, n).context("load lm_head")?;
-        (n.to_string(), b)
-    };
-    let scale_name = format!("{lm_name}_int4_scale");
-    if store.contains(&scale_name) {
-        let zero_name = format!("{lm_name}_int4_zero");
-        let scale = host_load_bytes(store, &scale_name).context("load lm_head INT4 scale")?;
-        let zero = host_load_bytes(store, &zero_name).context("load lm_head INT4 zero")?;
-        let vocab = geom.vocab as usize;
-        let hidden = geom.hidden as usize;
-        println!(
-            "  dequantizing lm_head INT4 [{vocab}, {hidden}] (≈{:.1} MiB → {:.1} MiB BF16)…",
-            lm_packed.len() as f64 / MIB,
-            (vocab * hidden * 2) as f64 / MIB,
-        );
-        Ok(dequant_int4_to_bf16_bytes(
-            &lm_packed,
-            &scale,
-            &zero,
-            vocab,
-            hidden,
-            QWEN36_MOE_INT4_GROUP_SIZE as usize,
-        ))
-    } else {
-        Ok(lm_packed)
-    }
-}
-
 /// Legacy single-token entry point — keeps the original `decode_first_token`
 /// callable so the path stays exercised. Currently unused but documents the
 /// minimal one-step decode shape.
@@ -2623,46 +2542,9 @@ fn decode_first_token(model_dir: &Path, report: &DryRunReport, kv_fp8: bool) -> 
 
     let final_norm_bytes = host_load_bytes(&store, &format!("{weight_prefix}.norm.weight"))
         .context("load final norm")?;
-
-    // lm_head: may be tied to embed_tokens (BF16), standalone BF16, or
-    // INT4-quantized in the bake. Dequantize to BF16 host-side when needed
-    // (kernel-side INT4 lm_head is PR 4d).
-    let (lm_name, lm_packed) = if report.config.text_config.tie_word_embeddings {
-        // Tied: lm_head bytes == embed_tokens bytes (BF16 either way; the
-        // bake doesn't INT4 the embed table). Use the same blob.
-        let n = format!("{weight_prefix}.embed_tokens.weight");
-        let b = host_load_bytes(&store, &n).context("load tied lm_head from embed_tokens")?;
-        (n, b)
-    } else {
-        let n = "lm_head.weight";
-        let b = host_load_bytes(&store, n).context("load lm_head")?;
-        (n.to_string(), b)
-    };
-    // INT4 detection: if a `*_int4_scale` sidecar exists for this name, the
-    // packed payload above is u8 nibbles (in_dim folded by 2).
-    let scale_name = format!("{lm_name}_int4_scale");
-    let lm_head_bf16_bytes = if store.contains(&scale_name) {
-        let zero_name = format!("{lm_name}_int4_zero");
-        let scale = host_load_bytes(&store, &scale_name).context("load lm_head INT4 scale")?;
-        let zero = host_load_bytes(&store, &zero_name).context("load lm_head INT4 zero")?;
-        let vocab = geom.vocab as usize;
-        let hidden = geom.hidden as usize;
-        println!(
-            "  dequantizing lm_head INT4 [{vocab}, {hidden}] (≈{:.1} MiB → {:.1} MiB BF16)…",
-            lm_packed.len() as f64 / MIB,
-            (vocab * hidden * 2) as f64 / MIB,
-        );
-        dequant_int4_to_bf16_bytes(
-            &lm_packed,
-            &scale,
-            &zero,
-            vocab,
-            hidden,
-            QWEN36_MOE_INT4_GROUP_SIZE as usize,
-        )
-    } else {
-        lm_packed
-    };
+    let lm_head_bf16_bytes =
+        load_lm_head_bf16(&store, &report.config.text_config, weight_prefix, &geom)
+            .context("prepare lm_head BF16 buffer")?;
 
     println!("  computing host-side norm + lm_head GEMV…");
     let logits = host_final_norm_lm_head(
