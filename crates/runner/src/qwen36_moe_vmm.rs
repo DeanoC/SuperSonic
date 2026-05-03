@@ -44,6 +44,23 @@ pub(crate) fn moe_island_cap_experts_from_env() -> Result<Option<usize>> {
     Ok(Some(cap))
 }
 
+pub(crate) fn moe_island_protected_experts_from_env_value(
+    raw: Option<&str>,
+) -> Result<Option<usize>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let value = raw.parse::<usize>().with_context(|| {
+        format!("parse SUPERSONIC_MOE_ISLAND_PROTECTED_EXPERTS={raw:?} as non-negative integer")
+    })?;
+    Ok((value > 0).then_some(value))
+}
+
+pub(crate) fn moe_island_protected_experts_from_env() -> Result<Option<usize>> {
+    let raw = std::env::var("SUPERSONIC_MOE_ISLAND_PROTECTED_EXPERTS").ok();
+    moe_island_protected_experts_from_env_value(raw.as_deref())
+}
+
 pub(crate) fn moe_island_prefetch_ranks_from_env_value(
     raw: Option<&str>,
     mode: MoeIslandPrefetchMode,
@@ -227,7 +244,8 @@ mod tests {
     use super::{
         moe_island_prefetch_ranks_from_env_value,
         moe_island_prefetch_transition_min_observations_from_env_value,
-        qwen36_kv_vmm_mode_from_env_value, Qwen36KvVmmMode,
+        moe_island_protected_experts_from_env_value, qwen36_kv_vmm_mode_from_env_value,
+        Qwen36KvVmmMode,
     };
     use crate::qwen36_moe_telemetry::MoeIslandPrefetchMode;
     use gpu_hal::Backend;
@@ -339,6 +357,23 @@ mod tests {
             8,
         )
         .is_err());
+    }
+
+    #[test]
+    fn moe_protected_experts_env_accepts_unset_zero_and_positive_values() {
+        assert_eq!(
+            moe_island_protected_experts_from_env_value(None).unwrap(),
+            None
+        );
+        assert_eq!(
+            moe_island_protected_experts_from_env_value(Some("0")).unwrap(),
+            None
+        );
+        assert_eq!(
+            moe_island_protected_experts_from_env_value(Some("64")).unwrap(),
+            Some(64)
+        );
+        assert!(moe_island_protected_experts_from_env_value(Some("bad")).is_err());
     }
 
     #[test]

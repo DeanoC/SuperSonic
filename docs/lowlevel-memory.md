@@ -125,6 +125,13 @@ Current scope:
   rank (default 32), then prefetches only ranks with observed repeats. Candidate
   ordering uses repeat probability and still honors
   `SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS` as the maximum candidate count.
+- `SUPERSONIC_MOE_ISLAND_PROTECTED_EXPERTS=N` enables a protected sparse MoE
+  eviction band. Demand-loaded routed experts that repeat from the previous
+  token are marked protected after both projections are resident. The page
+  budget is derived from `N` routed experts and capped by
+  `SUPERSONIC_MOE_ISLAND_CAP_EXPERTS`; eviction chooses unprotected LRU pages
+  first and only evicts protected pages when the whole sparse island is
+  protected. This does not upload speculative pages.
 - `SUPERSONIC_VMM_KV=0` disables the Qwen3.5 and Qwen3.6 KV integrations.
 - `SUPERSONIC_VMM_KV=1` requests KV VMM and logs if the backend cannot support
   it. HIP may auto-enable when unset; CUDA requires this explicit opt-in.

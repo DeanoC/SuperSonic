@@ -46,8 +46,9 @@ use crate::qwen36_moe_telemetry::{
 };
 use crate::qwen36_moe_vmm::{
     moe_island_cap_experts_from_env, moe_island_prefetch_ranks_from_env,
-    moe_island_prefetch_transition_min_observations, should_try_moe_expert_vmm,
-    should_use_qwen36_kv_vmm, virtual_kv_stats_for_layers, MoeExpertVmmMode,
+    moe_island_prefetch_transition_min_observations, moe_island_protected_experts_from_env,
+    should_try_moe_expert_vmm, should_use_qwen36_kv_vmm, virtual_kv_stats_for_layers,
+    MoeExpertVmmMode,
 };
 use crate::registry::{FamilyParams, Qwen36MoeKernelParams, RegistryEntry};
 
@@ -1705,6 +1706,7 @@ fn load_decode_layers_with_vmm_strategy(
     kv_vmm: bool,
     moe_vmm_mode: MoeExpertVmmMode,
     moe_island_cap_experts: Option<usize>,
+    moe_island_protected_experts: Option<usize>,
     moe_prefetch_mode: MoeIslandPrefetchMode,
     moe_prefetch_ranks: usize,
     moe_transition_min_observations: u32,
@@ -1749,14 +1751,27 @@ fn load_decode_layers_with_vmm_strategy(
         manager
             .set_max_resident_pages(max_resident_pages)
             .context("apply sparse MoE page budget")?;
+        let max_protected_pages = if let Some(protected_experts) = moe_island_protected_experts {
+            let pages = manager
+                .page_budget_for_routed_experts(protected_experts)
+                .context(
+                    "derive sparse MoE protected page budget from routed expert tensor layout",
+                )?
+                .min(max_resident_pages);
+            manager.set_max_protected_pages(pages);
+            pages
+        } else {
+            0
+        };
         let arena_stats = manager.arena().stats();
         let residency_stats = manager.stats();
         println!(
             "  [vmm] Qwen3.6-MoE sparse routed expert residency active on backend={} device {ordinal}: \
-             tensors={} max_pages={} logical={:.2}MiB resident={:.2}MiB reserved={:.2}MiB",
+             tensors={} max_pages={} protected_pages={} logical={:.2}MiB resident={:.2}MiB reserved={:.2}MiB",
             backend,
             residency_stats.registered_tensors,
             max_resident_pages,
+            max_protected_pages,
             arena_stats.logical_bytes as f64 / MIB,
             arena_stats.resident_bytes as f64 / MIB,
             arena_stats.reserved_bytes as f64 / MIB,
@@ -2347,6 +2362,7 @@ fn decode_text(
 
     let moe_vmm_mode = MoeExpertVmmMode::from_env()?;
     let moe_island_cap_experts = moe_island_cap_experts_from_env()?;
+    let moe_island_protected_experts = moe_island_protected_experts_from_env()?;
     if moe_island_cap_experts.is_some() && speculative_decode {
         anyhow::bail!(
             "SUPERSONIC_MOE_ISLAND_CAP_EXPERTS sparse residency is not wired through speculative decode yet"
@@ -2365,6 +2381,11 @@ fn decode_text(
         moe_island_prefetch_transition_min_observations(moe_prefetch_mode)?;
     if moe_prefetch_mode != MoeIslandPrefetchMode::Disabled && !sparse_moe_requested {
         anyhow::bail!("SUPERSONIC_MOE_ISLAND_PREFETCH requires SUPERSONIC_MOE_ISLAND_CAP_EXPERTS");
+    }
+    if moe_island_protected_experts.is_some() && !sparse_moe_requested {
+        anyhow::bail!(
+            "SUPERSONIC_MOE_ISLAND_PROTECTED_EXPERTS requires SUPERSONIC_MOE_ISLAND_CAP_EXPERTS"
+        );
     }
     let mut moe_sparse_telemetry = MoeSparseTelemetry::from_env(
         sparse_moe_requested,
@@ -2395,6 +2416,7 @@ fn decode_text(
         kv_vmm,
         moe_vmm_mode,
         moe_island_cap_experts,
+        moe_island_protected_experts,
         moe_prefetch_mode,
         moe_prefetch_ranks,
         moe_transition_min_observations,

@@ -119,6 +119,13 @@ fn ensure_demand_routes(
         let down = expert_key(layer_idx, expert_idx, MoeExpertProjection::Down);
         manager.ensure_resident(store, gate_up)?;
         manager.ensure_resident(store, down)?;
+        if previous_routes
+            .iter()
+            .any(|&previous_expert| previous_expert == expert_idx)
+        {
+            manager.protect_resident(gate_up)?;
+            manager.protect_resident(down)?;
+        }
     }
     if track_routes {
         if let Some(slot) = next_topk_by_layer.get_mut(layer_idx) {
