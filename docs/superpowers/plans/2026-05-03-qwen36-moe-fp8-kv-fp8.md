@@ -76,7 +76,7 @@ impl Default for Qwen36MoeKVCacheFp8Desc {
 
 - [ ] **Step 2: Verify it compiles in isolation**
 
-Run: `cargo check -p kernel-ffi --features hip`
+Run: `cargo check -p kernel-ffi `
 Expected: clean build, no warnings about the new struct.
 
 - [ ] **Step 3: Commit**
@@ -133,7 +133,7 @@ const _ASSERT_DECODE_LAYER_DESC_SIZE: () = {
 
 - [ ] **Step 3: Verify build**
 
-Run: `cargo check -p kernel-ffi --features hip`
+Run: `cargo check -p kernel-ffi `
 Expected: clean build. (Bridge static_assert will not fire yet — same lower bound, same upper bound.)
 
 - [ ] **Step 4: Commit**
@@ -205,7 +205,7 @@ static_assert(sizeof(qwen36_moe::KVCacheFp8Desc) == 16,
 
 - [ ] **Step 4: Build the kernel-ffi crate (rebuilds hipcc)**
 
-Run: `cargo build -p kernel-ffi --features hip --release`
+Run: `cargo build -p kernel-ffi --release`
 Expected: hipcc recompiles `qwen36_moe.hip` and `qwen36_moe_bridge.cpp` cleanly. No `static_assert` failures.
 
 - [ ] **Step 5: Commit**
@@ -310,7 +310,7 @@ kernel_ffi::qwen36_moe::qwen36_moe_hip_persistent_decode_launch(
 
 - [ ] **Step 5: Build everything that depends on the FFI**
 
-Run: `cargo build -p runner --features hip --release`
+Run: `cargo build -p runner --release`
 Expected: clean build. No silent missing-arg errors.
 
 - [ ] **Step 6: Commit**
@@ -372,7 +372,7 @@ Forward all five fields from the persistent kernel through to `qwen36_moe_attn_s
 
 - [ ] **Step 4: Build kernel-ffi**
 
-Run: `cargo build -p kernel-ffi --features hip --release`
+Run: `cargo build -p kernel-ffi --release`
 Expected: clean. Per-block parity tests untouched (their staged-step kernel doesn't use the persistent path).
 
 - [ ] **Step 5: Commit**
@@ -557,7 +557,7 @@ Adjust the offset accordingly — replace the `/* sidecar_window */ kv_max_t` pl
 
 - [ ] **Step 3: Build**
 
-Run: `cargo build -p kernel-ffi --features hip --release`
+Run: `cargo build -p kernel-ffi --release`
 Expected: clean. The persistent kernel still passes nulls for the new params at the call site (engine wiring lands in Task 11), so the new branch is dead code.
 
 - [ ] **Step 4: Commit**
@@ -667,7 +667,7 @@ Find the V-cache read in the V-weighted reduction block (search for `kv_cache_v[
 
 - [ ] **Step 3: Build**
 
-Run: `cargo build -p kernel-ffi --features hip --release`
+Run: `cargo build -p kernel-ffi --release`
 Expected: clean.
 
 - [ ] **Step 4: Commit**
@@ -886,7 +886,7 @@ Pass `kv_fp8` through (default `false` until Task 11 wires the CLI).
 
 - [ ] **Step 5: Build**
 
-Run: `cargo build -p runner --features hip --release`
+Run: `cargo build -p runner --release`
 Expected: clean.
 
 - [ ] **Step 6: Commit**
@@ -980,7 +980,7 @@ impl Qwen36MoeLayerState {
 
 - [ ] **Step 5: Build**
 
-Run: `cargo build -p runner --features hip --release`
+Run: `cargo build -p runner --release`
 Expected: clean.
 
 - [ ] **Step 6: Commit**
@@ -1125,7 +1125,7 @@ for layer in state.layers.iter_mut() {
 
 - [ ] **Step 8: Build**
 
-Run: `cargo build -p runner --features hip --release`
+Run: `cargo build -p runner --release`
 Expected: clean.
 
 - [ ] **Step 9: Commit**
@@ -1203,7 +1203,7 @@ if matches!(model_variant, ModelVariant::Qwen3_6_35B_A3B)
 
 - [ ] **Step 4: Build**
 
-Run: `cargo build -p runner --features hip --release`
+Run: `cargo build -p runner --release`
 Expected: clean.
 
 - [ ] **Step 5: Commit**
