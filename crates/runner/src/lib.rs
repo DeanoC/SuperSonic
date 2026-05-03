@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 //! SuperSonic runner library — exposes the decode engines, prefill engine,
 //! model/backend registry, and validation helpers so downstream crates (the
 //! `server` crate in particular) can reuse them without duplicating the
@@ -22,6 +24,7 @@ pub mod qwen36_moe_persistent_decode;
 pub mod qwen36_moe_residency;
 pub mod qwen36_moe_speculative;
 pub mod qwen36_moe_state;
+pub mod qwen36_moe_telemetry;
 pub mod registry;
 pub mod tensor_bytes;
 pub mod validate;
