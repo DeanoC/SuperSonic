@@ -122,6 +122,24 @@ impl BakedStore {
         name: &str,
         role: VirtualAllocationRole,
     ) -> Result<usize, Error> {
+        let id = self.reserve_virtual_arena(arena, name, role)?;
+        let len = self
+            .index
+            .get(name)
+            .ok_or_else(|| Error::NotFound(name.to_string()))?
+            .byte_len as usize;
+        self.load_range_to_virtual_arena(arena, id, name, 0, len)?;
+        Ok(id)
+    }
+
+    /// Reserve a stable virtual address range for one baked tensor without
+    /// making any physical pages resident yet.
+    pub fn reserve_virtual_arena(
+        &self,
+        arena: &mut VirtualArena,
+        name: &str,
+        role: VirtualAllocationRole,
+    ) -> Result<usize, Error> {
         let meta = self
             .index
             .get(name)
@@ -159,21 +177,72 @@ impl BakedStore {
                 expected_len,
             )));
         }
+        arena
+            .reserve(name.to_string(), role, dtype, &meta.shape)
+            .map_err(Error::from)
+    }
+
+    /// Upload a byte range from a baked tensor into an existing virtual
+    /// allocation. The allocation must have been reserved from the same tensor.
+    pub fn load_range_to_virtual_arena(
+        &self,
+        arena: &mut VirtualArena,
+        allocation_id: usize,
+        name: &str,
+        byte_offset: usize,
+        byte_len: usize,
+    ) -> Result<(), Error> {
+        let meta = self
+            .index
+            .get(name)
+            .ok_or_else(|| Error::NotFound(name.to_string()))?;
+        let tensor_end = (meta.offset as usize)
+            .checked_add(meta.byte_len as usize)
+            .ok_or_else(|| {
+                Error::Other(format!(
+                    "tensor '{name}' byte range overflows (offset={}, len={})",
+                    meta.offset, meta.byte_len
+                ))
+            })?;
+        if tensor_end > self.data_len {
+            return Err(Error::Other(format!(
+                "tensor '{}' extends past end of weights.bin (offset={}, len={}, file_len={})",
+                name, meta.offset, meta.byte_len, self.data_len,
+            )));
+        }
+        let range_end = byte_offset.checked_add(byte_len).ok_or_else(|| {
+            Error::Other(format!(
+                "tensor '{name}' load range overflows: offset={byte_offset} len={byte_len}"
+            ))
+        })?;
+        if range_end > meta.byte_len as usize {
+            return Err(Error::Other(format!(
+                "tensor '{name}' load range [{byte_offset}, {range_end}) exceeds byte_len={}",
+                meta.byte_len
+            )));
+        }
+
+        let dtype = parse_dtype(&meta.dtype)?;
         let ordinal = arena.device_ordinal();
-        let id = arena.reserve(name.to_string(), role, dtype, &meta.shape)?;
-        let allocation = arena
-            .allocation_mut(id)
-            .ok_or_else(|| Error::Other(format!("virtual allocation id {id} disappeared")))?;
+        let allocation = arena.allocation_mut(allocation_id).ok_or_else(|| {
+            Error::Other(format!("virtual allocation id {allocation_id} missing"))
+        })?;
         let buffer = allocation.buffer_mut();
-        buffer.map_prefix_bytes(buffer.len_bytes())?;
-        copy_h2d(
-            ordinal,
-            buffer.as_mut_ptr(),
-            slice.as_ptr() as *const _,
-            slice.len(),
-        )?;
+        if buffer.dtype() != dtype || buffer.shape() != meta.shape.as_slice() {
+            return Err(Error::Other(format!(
+                "virtual allocation id {allocation_id} does not match tensor '{name}' \
+                 (allocation dtype={:?} shape={:?}, tensor dtype={} shape={:?})",
+                buffer.dtype(),
+                buffer.shape(),
+                meta.dtype,
+                meta.shape
+            )));
+        }
+        buffer.map_range_bytes(byte_offset, byte_len)?;
+        let src = unsafe { self.data.add(meta.offset as usize).add(byte_offset) as *const _ };
+        copy_h2d(ordinal, buffer.offset_mut_ptr(byte_offset), src, byte_len)?;
         sync(ordinal)?;
-        Ok(id)
+        Ok(())
     }
 
     /// Convenience constructor for a virtual arena using this store's common

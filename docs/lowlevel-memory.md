@@ -29,17 +29,22 @@ by allocation role.
 
 Current scope:
 
-- Decode-active VMM is enabled internally for Qwen3.5 BF16 dense KV only.
+- Decode-active VMM is enabled internally for Qwen3.5 BF16 dense KV and for
+  Qwen3.6-MoE INT4 routed expert slabs when the VMM expert mode is active.
 - Disabled for FP8-KV, certified-KV, batch decode, Qwen3.5 4B/component
-  decode, DFlash cloned states, Gemma4, Qwen3.6-MoE decode descriptors, and
-  Llama3.1.
+  decode, DFlash cloned states, Gemma4, and Llama3.1.
 - Baked tensors can now be loaded into `VirtualArena` allocations through
-  `model-store::BakedStore::load_to_virtual_arena`. Qwen3.6-MoE INT4 decode
-  auto-uses this path for routed expert slabs on HIP devices with VMM support:
-  descriptors consume stable virtual pointers for `mlp.experts.gate_up_proj`
-  and `mlp.experts.down_proj`, while all pages remain resident for this first
-  decode-active identity milestone. Other weights still use dense
-  `GpuBuffer`s.
+  `model-store::BakedStore::load_to_virtual_arena`. `BakedStore` also exposes
+  split reserve/upload APIs so a tensor can reserve a stable virtual base while
+  only selected byte ranges are made resident.
+- Qwen3.6-MoE has a sparse routed-expert residency manager in
+  `runner::qwen36_moe_residency`. It reserves the fused
+  `mlp.experts.gate_up_proj` / `mlp.experts.down_proj` slabs, pins individual
+  `(layer, expert, projection)` slices from the mmap-backed bake, evicts with a
+  bounded LRU policy, and invalidates every resident slice covered by an
+  unmapped VMM page. This is the foundation for router-driven MoE islands; the
+  current decode path still maps all routed expert slabs when
+  `SUPERSONIC_VMM_MOE_ISLANDS` is active.
 - `SUPERSONIC_VMM_WEIGHT_PROBE=1` makes Qwen3.6-MoE dry-run load
   `lm_head.weight` into a virtual `Weights` allocation when an INT4 bake is
   present.
@@ -80,6 +85,8 @@ The branch was validated on HIP/gfx1100 with ROCm VMM support:
   `SUPERSONIC_BACKENDS=hip cargo test -p gpu-hal --test vmm_round_trip vmm_arena_ -- --nocapture`
 - Baked tensor VMM upload test:
   `SUPERSONIC_BACKENDS=hip cargo test -p model-store virtual_arena_loads_baked_weight_and_expert_tensors -- --nocapture`
+- Qwen3.6-MoE sparse residency manager tests:
+  `SUPERSONIC_BACKENDS=hip cargo test -p runner qwen36_moe_residency -- --nocapture`
 - Qwen3.5 virtual KV e2e with eviction and restore-to-VMM:
   `SUPERSONIC_VMM_KV=1 SUPERSONIC_VMM_KV_EVICT_AFTER_PREFILL=1 SUPERSONIC_VMM_KV_RESTORE_TO_VMM=1 ... --validate`
   passed and kept stable VMM pointers through decode.
