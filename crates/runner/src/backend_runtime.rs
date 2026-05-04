@@ -4,6 +4,8 @@ use supersonic_core::backend::{compiled_backends_display, BackendChoice};
 use crate::registry::{self, Backend, GpuArch, ModelVariant, RegistryEntry};
 
 pub(crate) struct GpuInfo {
+    #[cfg_attr(not(feature = "bughunt"), allow(dead_code))]
+    pub(crate) arch_name: String,
     pub(crate) gpu_arch: GpuArch,
     pub(crate) total_vram: u64,
 }
@@ -80,6 +82,7 @@ pub(crate) fn query_gpu_info(backend: Backend, ordinal: usize) -> Result<GpuInfo
         total_vram as f64 / (1024.0 * 1024.0 * 1024.0)
     );
     Ok(GpuInfo {
+        arch_name,
         gpu_arch,
         total_vram,
     })

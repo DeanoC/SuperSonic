@@ -13,11 +13,13 @@ use qwen35::state::ModelState;
 use qwen35::weights::Qwen35Weights;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use supersonic_core::backend::BackendChoice;
 
+use crate::backend_runtime;
 use crate::decode_engine::{decode_f32_le, DecodeEngine};
 use crate::oracle;
 use crate::prefill_engine;
-use crate::registry::{self, FamilyParams, GpuArch, ModelVariant};
+use crate::registry::{FamilyParams, ModelVariant};
 use crate::validate;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -31,6 +33,17 @@ pub enum BackendArg {
 impl Default for BackendArg {
     fn default() -> Self {
         Self::Metal
+    }
+}
+
+impl From<BackendArg> for BackendChoice {
+    fn from(value: BackendArg) -> Self {
+        match value {
+            BackendArg::Auto => Self::Auto,
+            BackendArg::Cuda => Self::Explicit(Backend::Cuda),
+            BackendArg::Hip => Self::Explicit(Backend::Hip),
+            BackendArg::Metal => Self::Explicit(Backend::Metal),
+        }
     }
 }
 
@@ -659,22 +672,13 @@ impl QwenBughuntRuntime {
         ordinal: usize,
         oracle_device_spec: &str,
     ) -> Result<Self> {
-        let backend = resolve_backend(backend_choice, ordinal)?;
+        let backend = backend_runtime::resolve_backend(backend_choice.into(), ordinal)?;
         gpu_hal::set_backend(backend);
 
-        let (arch_name, _, _) = query_backend_device(backend, ordinal)?;
+        let gpu = backend_runtime::query_gpu_info(backend, ordinal)?;
         let model_variant = ModelVariant::Qwen3_5_0_8B;
-        let gpu_arch = GpuArch::from_backend_name(&backend, &arch_name);
-        let entry = registry::lookup(&model_variant, &backend, &gpu_arch).ok_or_else(|| {
-            let supported = registry::supported_archs_for(&model_variant, &backend);
-            anyhow::anyhow!(
-                "No registry entry for model={} backend={} arch={}. Supported archs: [{}]",
-                model_variant,
-                backend,
-                gpu_arch,
-                supported.join(", ")
-            )
-        })?;
+        let entry =
+            backend_runtime::lookup_registry_entry(&model_variant, backend, &gpu.gpu_arch, None)?;
         let params = match entry.params {
             FamilyParams::Qwen35(params) => params,
             _ => bail!("bughunt harness only supports Qwen3.5"),
@@ -696,9 +700,13 @@ impl QwenBughuntRuntime {
         Ok(Self {
             backend,
             ordinal,
-            arch_name,
+            arch_name: gpu.arch_name,
             model_dir: model_dir.to_path_buf(),
-            oracle_device: resolve_oracle_device(oracle_device_spec, backend, ordinal),
+            oracle_device: backend_runtime::resolve_oracle_device(
+                oracle_device_spec,
+                backend,
+                ordinal,
+            ),
             model_variant,
             weights,
             rotary,
@@ -752,81 +760,6 @@ impl QwenBughuntRuntime {
             false,
             1,
         )
-    }
-}
-
-fn resolve_backend(choice: BackendArg, ordinal: usize) -> Result<Backend> {
-    match choice {
-        BackendArg::Cuda => require_backend(Backend::Cuda),
-        BackendArg::Hip => require_backend(Backend::Hip),
-        BackendArg::Metal => require_backend(Backend::Metal),
-        BackendArg::Auto => {
-            if gpu_hal::is_backend_compiled(Backend::Cuda)
-                && gpu_hal::query_device_info(Backend::Cuda, ordinal).is_ok()
-            {
-                return Ok(Backend::Cuda);
-            }
-            if gpu_hal::is_backend_compiled(Backend::Hip)
-                && kernel_ffi::query_gpu_info(ordinal).is_ok()
-            {
-                return Ok(Backend::Hip);
-            }
-            if gpu_hal::is_backend_compiled(Backend::Metal)
-                && gpu_hal::query_device_info(Backend::Metal, ordinal).is_ok()
-            {
-                return Ok(Backend::Metal);
-            }
-            bail!(
-                "No usable GPU backend available for device {}. Compiled backends: [{}]",
-                ordinal,
-                gpu_hal::compiled_backends()
-                    .into_iter()
-                    .map(|backend| backend.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-        }
-    }
-}
-
-fn require_backend(backend: Backend) -> Result<Backend> {
-    if !gpu_hal::is_backend_compiled(backend) {
-        bail!(
-            "Requested backend {} is not compiled into this build. Compiled backends: [{}]",
-            backend,
-            gpu_hal::compiled_backends()
-                .into_iter()
-                .map(|candidate| candidate.to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-    }
-    Ok(backend)
-}
-
-fn resolve_oracle_device(spec: &str, backend: Backend, ordinal: usize) -> String {
-    match spec.trim().to_ascii_lowercase().as_str() {
-        "auto" => match backend {
-            Backend::Cuda => format!("cuda:{ordinal}"),
-            Backend::Hip => "cpu".to_string(),
-            Backend::Metal => "cpu".to_string(),
-        },
-        other => other.to_string(),
-    }
-}
-
-fn query_backend_device(backend: Backend, ordinal: usize) -> Result<(String, u64, u32)> {
-    match backend {
-        Backend::Hip => {
-            let (arch_name, total_vram) = kernel_ffi::query_gpu_info(ordinal)
-                .map_err(|e| anyhow::anyhow!("GPU query failed for device {ordinal}: {e}"))?;
-            Ok((arch_name, total_vram, 32))
-        }
-        Backend::Cuda | Backend::Metal => {
-            let info = gpu_hal::query_device_info(backend, ordinal)
-                .map_err(|e| anyhow::anyhow!("GPU query failed for device {ordinal}: {e}"))?;
-            Ok((info.arch_name, info.total_vram_bytes, info.warp_size))
-        }
     }
 }
 
