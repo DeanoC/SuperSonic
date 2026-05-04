@@ -1,6 +1,7 @@
 //! Page-level bookkeeping helpers for Qwen3.6-MoE sparse residency.
 
 use std::collections::HashMap;
+use std::hash::Hash;
 
 use gpu_hal::{GpuEvent, GpuStream, PinnedHostBuffer};
 
@@ -103,4 +104,72 @@ pub(crate) fn oldest_protected_page(
         .iter()
         .min_by_key(|(_, protected_at)| **protected_at)
         .map(|(key, _)| *key)
+}
+
+pub(crate) fn prune_protected_pages(
+    protected_pages: &mut HashMap<ResidentPageKey, u64>,
+    resident_pages: &HashMap<ResidentPageKey, ResidentPage>,
+) -> usize {
+    let before = protected_pages.len();
+    protected_pages.retain(|key, _| resident_pages.contains_key(key));
+    before - protected_pages.len()
+}
+
+pub(crate) fn remove_pages_overlapping(
+    resident_pages: &mut HashMap<ResidentPageKey, ResidentPage>,
+    tensor_idx: usize,
+    ranges: &[(usize, usize)],
+) -> usize {
+    let before = resident_pages.len();
+    resident_pages.retain(|_, page| {
+        page.tensor_idx != tensor_idx
+            || !ranges.iter().any(|(offset, len)| {
+                ranges_overlap(
+                    page.page_offset,
+                    page.page_offset + page.page_len,
+                    *offset,
+                    *offset + *len,
+                )
+            })
+    });
+    before - resident_pages.len()
+}
+
+pub(crate) fn remove_slices_overlapping_ranges<K: Eq + Hash>(
+    resident_slices: &mut HashMap<K, ResidentSlice>,
+    tensor_idx: usize,
+    ranges: &[(usize, usize)],
+) -> usize {
+    let before = resident_slices.len();
+    resident_slices.retain(|_, resident| {
+        resident.tensor_idx != tensor_idx
+            || !ranges.iter().any(|(offset, len)| {
+                ranges_overlap(
+                    resident.page_offset,
+                    resident.page_offset + resident.page_len,
+                    *offset,
+                    *offset + *len,
+                )
+            })
+    });
+    before - resident_slices.len()
+}
+
+pub(crate) fn remove_slices_overlapping<K: Eq + Hash>(
+    resident_slices: &mut HashMap<K, ResidentSlice>,
+    tensor_idx: usize,
+    offset: usize,
+    end: usize,
+) -> usize {
+    let before = resident_slices.len();
+    resident_slices.retain(|_, resident| {
+        resident.tensor_idx != tensor_idx
+            || !ranges_overlap(
+                resident.page_offset,
+                resident.page_offset + resident.page_len,
+                offset,
+                end,
+            )
+    });
+    before - resident_slices.len()
 }

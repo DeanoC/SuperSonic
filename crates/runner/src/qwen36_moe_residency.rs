@@ -16,8 +16,10 @@ use gpu_hal::{
 use model_store::BakedStore;
 
 use crate::qwen36_moe_residency_pages::{
-    oldest_protected_page, page_spans, ranges_overlap, select_lru_resident_page, AsyncPageIn,
-    AsyncStagingSlot, PageSpan, PendingPage, ResidentPage, ResidentPageKey, ResidentSlice,
+    oldest_protected_page, page_spans, prune_protected_pages, ranges_overlap,
+    remove_pages_overlapping, remove_slices_overlapping, remove_slices_overlapping_ranges,
+    select_lru_resident_page, AsyncPageIn, AsyncStagingSlot, PageSpan, PendingPage, ResidentPage,
+    ResidentPageKey, ResidentSlice,
 };
 use crate::qwen36_moe_types::ResidentWeight;
 
@@ -859,7 +861,8 @@ impl MoeExpertResidencyManager {
             if self.protected_pages.remove(&victim).is_some() {
                 self.protected_evicted_pages += 1;
             }
-            let removed_slices = self.remove_resident_slices_overlapping(
+            let removed_slices = remove_slices_overlapping(
+                &mut self.resident,
                 page.tensor_idx,
                 page.page_offset,
                 page.page_offset + page.page_len,
@@ -870,10 +873,11 @@ impl MoeExpertResidencyManager {
         }
 
         let removed_pages =
-            self.remove_resident_pages_overlapping(page.tensor_idx, &removed_ranges);
+            remove_pages_overlapping(&mut self.resident_pages, page.tensor_idx, &removed_ranges);
         let removed_slices =
-            self.remove_resident_slices_overlapping_ranges(page.tensor_idx, &removed_ranges);
-        self.prune_protected_pages();
+            remove_slices_overlapping_ranges(&mut self.resident, page.tensor_idx, &removed_ranges);
+        let demoted = prune_protected_pages(&mut self.protected_pages, &self.resident_pages);
+        self.protect_demotions += demoted as u64;
         if victim_was_protected {
             self.protected_evicted_pages += 1;
         }
@@ -890,72 +894,6 @@ impl MoeExpertResidencyManager {
             self.protected_pages.remove(&victim);
             self.protect_demotions += 1;
         }
-    }
-
-    fn prune_protected_pages(&mut self) {
-        let before = self.protected_pages.len();
-        self.protected_pages
-            .retain(|key, _| self.resident_pages.contains_key(key));
-        self.protect_demotions += (before - self.protected_pages.len()) as u64;
-    }
-
-    fn remove_resident_pages_overlapping(
-        &mut self,
-        tensor_idx: usize,
-        ranges: &[(usize, usize)],
-    ) -> usize {
-        let before = self.resident_pages.len();
-        self.resident_pages.retain(|_, page| {
-            page.tensor_idx != tensor_idx
-                || !ranges.iter().any(|(offset, len)| {
-                    ranges_overlap(
-                        page.page_offset,
-                        page.page_offset + page.page_len,
-                        *offset,
-                        *offset + *len,
-                    )
-                })
-        });
-        before - self.resident_pages.len()
-    }
-
-    fn remove_resident_slices_overlapping_ranges(
-        &mut self,
-        tensor_idx: usize,
-        ranges: &[(usize, usize)],
-    ) -> usize {
-        let before = self.resident.len();
-        self.resident.retain(|_, resident| {
-            resident.tensor_idx != tensor_idx
-                || !ranges.iter().any(|(offset, len)| {
-                    ranges_overlap(
-                        resident.page_offset,
-                        resident.page_offset + resident.page_len,
-                        *offset,
-                        *offset + *len,
-                    )
-                })
-        });
-        before - self.resident.len()
-    }
-
-    fn remove_resident_slices_overlapping(
-        &mut self,
-        tensor_idx: usize,
-        offset: usize,
-        end: usize,
-    ) -> usize {
-        let before = self.resident.len();
-        self.resident.retain(|_, resident| {
-            resident.tensor_idx != tensor_idx
-                || !ranges_overlap(
-                    resident.page_offset,
-                    resident.page_offset + resident.page_len,
-                    offset,
-                    end,
-                )
-        });
-        before - self.resident.len()
     }
 
     fn tensor(&self, layer_idx: usize, projection: MoeExpertProjection) -> Result<&ExpertTensor> {
