@@ -1085,6 +1085,9 @@ extern "C" int qwen36_moe_hip_persistent_decode_launch(
     float         rope_theta,
     float         rms_norm_eps,
     int           position,
+    int           cache_pos,    // -1 ⇒ inherit from `position` (dense base
+                                //      decode); ≥ 0 ⇒ decoupled KV slot
+                                //      (SpecPrefill sparse-prefill / MTP).
     void*         hidden_ping,
     void*         hidden_pong,
     float*        workspace,
@@ -1245,7 +1248,7 @@ extern "C" int qwen36_moe_hip_persistent_decode_launch(
             hidden, num_heads, num_kv_heads, head_dim, rotary_dim,
             num_k_heads, num_v_heads, head_k_dim, head_v_dim, conv_kernel_dim,
             num_experts, moe_intermediate, shared_intermediate, top_k,
-            vocab, rope_theta, rms_norm_eps, position,
+            vocab, rope_theta, rms_norm_eps, position, cache_pos,
             static_cast<hip_bfloat16*>(hidden_ping),
             static_cast<hip_bfloat16*>(hidden_pong),
             workspace, ffn_topk_idx_scratch,
@@ -1264,7 +1267,7 @@ extern "C" int qwen36_moe_hip_persistent_decode_launch(
             hidden, num_heads, num_kv_heads, head_dim, rotary_dim,
             num_k_heads, num_v_heads, head_k_dim, head_v_dim, conv_kernel_dim,
             num_experts, moe_intermediate, shared_intermediate, top_k,
-            vocab, rope_theta, rms_norm_eps, position,
+            vocab, rope_theta, rms_norm_eps, position, cache_pos,
             static_cast<hip_bfloat16*>(hidden_ping),
             static_cast<hip_bfloat16*>(hidden_pong),
             workspace, ffn_topk_idx_scratch,

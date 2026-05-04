@@ -136,6 +136,12 @@ __global__ void qwen36_moe_persistent_decode_kernel(
     float                                rope_theta,
     float                                rms_norm_eps,
     int                                  position,
+    // RoPE rotation uses `position`; the KV-cache slot uses
+    // `cache_pos` when ≥ 0, otherwise inherits `position` (the dense
+    // base-decode case). SpecPrefill sparse-prefill and MTP both rely
+    // on the decoupled-slot path so kept tokens land in compact KV
+    // slots while still rotating at their original prompt positions.
+    int                                  cache_pos,
     T*    __restrict__                   hidden_ping,            // [hidden] BF16
     T*    __restrict__                   hidden_pong,            // [hidden] BF16
     float* __restrict__                  workspace,              // shared scratch
@@ -210,7 +216,7 @@ __global__ void qwen36_moe_persistent_decode_kernel(
                 /*stage*/ 5,
                 hidden, num_heads, num_kv_heads, head_dim,
                 rotary_dim, rope_theta, rms_norm_eps,
-                position, /*cache_pos*/ -1,
+                position, cache_pos,
                 in_buf,
                 static_cast<const T*>(d.input_norm_w),
                 static_cast<const T*>(d.q_proj_w),

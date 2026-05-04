@@ -729,7 +729,13 @@ fn multilayer_persistent_decode_matches_chained() {
     // (the host-side `host_final_norm_lm_head` does the lm_head step
     // for the chained-vs-oracle test).
     let persistent_outputs = scratch
-        .run(ordinal, &initial_hidden, position, None)
+        .run(
+            ordinal,
+            &initial_hidden,
+            position,
+            runner::qwen36_moe_persistent_decode::CACHE_POS_INHERIT,
+            None,
+        )
         .expect("PersistentScratch::run");
     let persistent_final = persistent_outputs.final_hidden_bytes;
 
@@ -759,6 +765,7 @@ fn multilayer_persistent_decode_matches_chained() {
             ordinal,
             &initial_hidden,
             position,
+            runner::qwen36_moe_persistent_decode::CACHE_POS_INHERIT,
             |_phase, _layer, _topk| Ok(()),
         )
         .expect("PersistentScratch::run_sparse_with_expert_prefetch");
