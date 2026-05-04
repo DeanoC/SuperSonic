@@ -26,8 +26,8 @@ use crate::qwen36_moe_host::lookup_embed_row;
 use crate::qwen36_moe_lm_head::{launch_lm_head_from_final_hidden_bytes, LmHeadBuffers};
 use crate::qwen36_moe_loop::Qwen36DecodeLoopState;
 use crate::qwen36_moe_output::{
-    print_decode_stream_start, print_decoded_token, print_generation_summary,
-    print_last_logits_if_requested, print_sampling_summary,
+    print_decode_stream_start, print_generation_summary, print_last_logits_if_requested,
+    print_sampling_summary,
 };
 use crate::qwen36_moe_policy::{
     resolve_context_size, validate_decode_backend, validate_persistent_kv_fp8_flags,
@@ -154,8 +154,6 @@ fn decode_text(
     kv_fp8: bool,
     dump_last_logits: bool,
 ) -> Result<()> {
-    use std::io::Write as _;
-
     validate_speculative_sampling(speculative_decode, sampling)?;
 
     let weight_prefix = report.kernel_params.weight_prefix;
@@ -666,30 +664,9 @@ fn decode_text(
                 .context("speculative decode step")?
             };
 
-            // Append emitted tokens. Honour `max_new` and EOS by
-            // breaking out cleanly mid-emission.
-            let mut hit_stop = false;
-            for tok in result.emitted_tokens.iter().copied() {
-                if loop_state.reached_max_new() {
-                    hit_stop = true;
-                    break;
-                }
-                loop_state.generated_ids.push(tok);
-                print_decoded_token(tokenizer.as_ref(), tok);
-                if Some(tok) == eos_id {
-                    hit_stop = true;
-                    break;
-                }
-            }
-            std::io::stdout().flush().ok();
-            loop_state.position += result.emitted_tokens.len() as i32;
-            if hit_stop {
+            if loop_state.append_speculative_emissions(&result, tokenizer.as_ref(), eos_id) {
                 break;
             }
-            loop_state.current_token = *result
-                .emitted_tokens
-                .last()
-                .expect("speculative step must emit at least one token (K=0 fallback ensured)");
         }
     }
 
