@@ -5,6 +5,7 @@ use crate::bakes::ensure_hf_metadata_present;
 use crate::decode_engine::{DecodeEngine, DecodeStageTimings};
 use crate::prefill_engine;
 use crate::qwen35_decode_modes::{report_qwen35_decode_modes, resolve_qwen35_decode_modes};
+use crate::qwen35_decode_util::{token_history, token_history_with_next};
 use crate::qwen35_engine_setup::{load_qwen35_engine, Qwen35EngineSetup};
 use crate::qwen35_kv_trace::trace_kv_cache;
 use crate::qwen35_prefill::{
@@ -298,12 +299,8 @@ pub(crate) fn run_qwen35(
 
         if cli.batch_size > 1 {
             if let Some(trace_layer) = cli.trace_persistent_linear_state_layer {
-                let trace_token_ids: Vec<u32> = prompt_ids
-                    .iter()
-                    .copied()
-                    .chain(generated_ids.iter().copied())
-                    .chain(std::iter::once(next_token))
-                    .collect();
+                let trace_token_ids =
+                    token_history_with_next(&prompt_ids, &generated_ids, next_token);
                 let trace_tokens = vec![next_token; cli.batch_size];
                 let _ = engine.decode_step_batch_trace_hidden_after_layers(
                     &trace_tokens,
@@ -323,12 +320,8 @@ pub(crate) fn run_qwen35(
                 engine.rebuild_prefill_state(&trace_token_ids, true)?;
             }
             if let Some(trace_layer) = cli.trace_persistent_input_layer {
-                let trace_token_ids: Vec<u32> = prompt_ids
-                    .iter()
-                    .copied()
-                    .chain(generated_ids.iter().copied())
-                    .chain(std::iter::once(next_token))
-                    .collect();
+                let trace_token_ids =
+                    token_history_with_next(&prompt_ids, &generated_ids, next_token);
                 let trace_tokens = vec![next_token; cli.batch_size];
                 let native_hidden = engine.decode_step_batch_trace_hidden_after_layers(
                     &trace_tokens,
@@ -349,12 +342,8 @@ pub(crate) fn run_qwen35(
                 engine.rebuild_prefill_state(&trace_token_ids, true)?;
             }
             if let Some(trace_layer) = cli.trace_persistent_full_attn_layer {
-                let trace_token_ids: Vec<u32> = prompt_ids
-                    .iter()
-                    .copied()
-                    .chain(generated_ids.iter().copied())
-                    .chain(std::iter::once(next_token))
-                    .collect();
+                let trace_token_ids =
+                    token_history_with_next(&prompt_ids, &generated_ids, next_token);
                 let trace_tokens = vec![next_token; cli.batch_size];
                 trace_persistent_full_attn_layer(
                     &mut engine,
@@ -370,12 +359,8 @@ pub(crate) fn run_qwen35(
                 engine.rebuild_prefill_state(&trace_token_ids, true)?;
             }
             if let Some(trace_layer) = cli.trace_persistent_linear_layer {
-                let trace_token_ids: Vec<u32> = prompt_ids
-                    .iter()
-                    .copied()
-                    .chain(generated_ids.iter().copied())
-                    .chain(std::iter::once(next_token))
-                    .collect();
+                let trace_token_ids =
+                    token_history_with_next(&prompt_ids, &generated_ids, next_token);
                 let trace_tokens = vec![next_token; cli.batch_size];
                 trace_persistent_linear_layer(
                     &mut engine,
@@ -391,12 +376,7 @@ pub(crate) fn run_qwen35(
                 engine.rebuild_prefill_state(&trace_token_ids, true)?;
             }
             let (batch_logits, batch_timings) = if decode_modes.replay_kv_fp8_enabled {
-                let token_ids: Vec<u32> = prompt_ids
-                    .iter()
-                    .copied()
-                    .chain(generated_ids.iter().copied())
-                    .chain(std::iter::once(next_token))
-                    .collect();
+                let token_ids = token_history_with_next(&prompt_ids, &generated_ids, next_token);
                 let logits = engine.rebuild_prefill_state(&token_ids, true)?;
                 (vec![logits; cli.batch_size], None)
             } else if cli.emit_stage_timings {
@@ -444,11 +424,7 @@ pub(crate) fn run_qwen35(
 
             generated_ids.push(next_token);
             if trace_kv_cache_enabled {
-                let cache_token_ids: Vec<u32> = prompt_ids
-                    .iter()
-                    .copied()
-                    .chain(generated_ids.iter().copied())
-                    .collect();
+                let cache_token_ids = token_history(&prompt_ids, &generated_ids);
                 trace_kv_cache(
                     &engine,
                     &cache_token_ids,
@@ -485,12 +461,7 @@ pub(crate) fn run_qwen35(
                 maybe_fast_token = Some(token);
                 Vec::new()
             } else if decode_modes.replay_decode_enabled {
-                let token_ids: Vec<u32> = prompt_ids
-                    .iter()
-                    .copied()
-                    .chain(generated_ids.iter().copied())
-                    .chain(std::iter::once(next_token))
-                    .collect();
+                let token_ids = token_history_with_next(&prompt_ids, &generated_ids, next_token);
                 prefill_engine::gpu_reference_replay_step(
                     &engine.weights(),
                     &engine.rotary(),
@@ -501,24 +472,15 @@ pub(crate) fn run_qwen35(
                     use_4b_kernel,
                 )?
             } else if decode_modes.replay_kv_fp8_enabled {
-                let token_ids: Vec<u32> = prompt_ids
-                    .iter()
-                    .copied()
-                    .chain(generated_ids.iter().copied())
-                    .chain(std::iter::once(next_token))
-                    .collect();
+                let token_ids = token_history_with_next(&prompt_ids, &generated_ids, next_token);
                 engine.rebuild_prefill_state(&token_ids, false)?
             } else if decode_modes.component_single_decode_enabled {
                 if let Some(trace_layer) = cli.trace_component_linear_state_layer {
+                    let trace_token_ids = token_history(&prompt_ids, &generated_ids);
                     trace_component_linear_state_layer(
                         &engine,
                         trace_layer,
-                        prompt_ids
-                            .iter()
-                            .copied()
-                            .chain(generated_ids.iter().copied())
-                            .collect::<Vec<_>>()
-                            .as_slice(),
+                        trace_token_ids.as_slice(),
                         ordinal,
                         params.kv_chunk_size,
                         cli.prefill_chunk_size,
@@ -535,13 +497,7 @@ pub(crate) fn run_qwen35(
                         &engine,
                         &hidden_trace,
                         trace_layer,
-                        prompt_ids
-                            .iter()
-                            .copied()
-                            .chain(generated_ids.iter().copied())
-                            .chain(std::iter::once(next_token))
-                            .collect::<Vec<_>>()
-                            .as_slice(),
+                        token_history_with_next(&prompt_ids, &generated_ids, next_token).as_slice(),
                         ordinal,
                         params.kv_chunk_size,
                         cli.prefill_chunk_size,
@@ -558,13 +514,7 @@ pub(crate) fn run_qwen35(
                         &engine,
                         trace_layer,
                         &layer_trace,
-                        prompt_ids
-                            .iter()
-                            .copied()
-                            .chain(generated_ids.iter().copied())
-                            .chain(std::iter::once(next_token))
-                            .collect::<Vec<_>>()
-                            .as_slice(),
+                        token_history_with_next(&prompt_ids, &generated_ids, next_token).as_slice(),
                         ordinal,
                         params.kv_chunk_size,
                         cli.prefill_chunk_size,
@@ -582,13 +532,7 @@ pub(crate) fn run_qwen35(
                         &engine,
                         trace_layer,
                         &linear_trace,
-                        prompt_ids
-                            .iter()
-                            .copied()
-                            .chain(generated_ids.iter().copied())
-                            .chain(std::iter::once(next_token))
-                            .collect::<Vec<_>>()
-                            .as_slice(),
+                        token_history_with_next(&prompt_ids, &generated_ids, next_token).as_slice(),
                         ordinal,
                         params.kv_chunk_size,
                         cli.prefill_chunk_size,
@@ -600,12 +544,8 @@ pub(crate) fn run_qwen35(
                 }
             } else if decode_modes.kernel_single_decode_enabled {
                 if let Some(trace_layer) = cli.trace_persistent_linear_state_layer {
-                    let trace_token_ids: Vec<u32> = prompt_ids
-                        .iter()
-                        .copied()
-                        .chain(generated_ids.iter().copied())
-                        .chain(std::iter::once(next_token))
-                        .collect();
+                    let trace_token_ids =
+                        token_history_with_next(&prompt_ids, &generated_ids, next_token);
                     let _ = engine.decode_step_batch_trace_hidden_after_layers(
                         &[next_token],
                         seqlen_offset,
@@ -624,12 +564,8 @@ pub(crate) fn run_qwen35(
                     engine.rebuild_prefill_state(&trace_token_ids, false)?;
                 }
                 if let Some(trace_layer) = cli.trace_persistent_input_layer {
-                    let trace_token_ids: Vec<u32> = prompt_ids
-                        .iter()
-                        .copied()
-                        .chain(generated_ids.iter().copied())
-                        .chain(std::iter::once(next_token))
-                        .collect();
+                    let trace_token_ids =
+                        token_history_with_next(&prompt_ids, &generated_ids, next_token);
                     let native_hidden = engine.decode_step_batch_trace_hidden_after_layers(
                         &[next_token],
                         seqlen_offset,
@@ -649,12 +585,8 @@ pub(crate) fn run_qwen35(
                     engine.rebuild_prefill_state(&trace_token_ids, false)?;
                 }
                 if let Some(trace_layer) = cli.trace_persistent_full_attn_layer {
-                    let trace_token_ids: Vec<u32> = prompt_ids
-                        .iter()
-                        .copied()
-                        .chain(generated_ids.iter().copied())
-                        .chain(std::iter::once(next_token))
-                        .collect();
+                    let trace_token_ids =
+                        token_history_with_next(&prompt_ids, &generated_ids, next_token);
                     trace_persistent_full_attn_layer(
                         &mut engine,
                         trace_layer,
@@ -669,12 +601,8 @@ pub(crate) fn run_qwen35(
                     engine.rebuild_prefill_state(&trace_token_ids, false)?;
                 }
                 if let Some(trace_layer) = cli.trace_persistent_linear_layer {
-                    let trace_token_ids: Vec<u32> = prompt_ids
-                        .iter()
-                        .copied()
-                        .chain(generated_ids.iter().copied())
-                        .chain(std::iter::once(next_token))
-                        .collect();
+                    let trace_token_ids =
+                        token_history_with_next(&prompt_ids, &generated_ids, next_token);
                     trace_persistent_linear_layer(
                         &mut engine,
                         trace_layer,
@@ -743,12 +671,8 @@ pub(crate) fn run_qwen35(
             }
 
             if gpu_validate_enabled {
-                let gpu_token_ids: Vec<u32> = prompt_ids
-                    .iter()
-                    .copied()
-                    .chain(generated_ids.iter().copied())
-                    .chain(std::iter::once(next_token))
-                    .collect();
+                let gpu_token_ids =
+                    token_history_with_next(&prompt_ids, &generated_ids, next_token);
                 let gpu_logits = prefill_engine::gpu_reference_replay_step(
                     &engine.weights(),
                     &engine.rotary(),
@@ -777,11 +701,7 @@ pub(crate) fn run_qwen35(
             next_token = native_token;
 
             if trace_kv_cache_enabled {
-                let cache_token_ids: Vec<u32> = prompt_ids
-                    .iter()
-                    .copied()
-                    .chain(generated_ids.iter().copied())
-                    .collect();
+                let cache_token_ids = token_history(&prompt_ids, &generated_ids);
                 trace_kv_cache(
                     &engine,
                     &cache_token_ids,
