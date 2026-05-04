@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use anyhow::{bail, Result};
 use clap::ValueEnum;
 use gpu_hal::Backend;
 use qwen35::config::TextConfig;
@@ -96,4 +97,23 @@ pub struct BughuntArgs {
     pub bench_warmup: usize,
     pub bench_decode_tokens: usize,
     pub bench_profile_ops: bool,
+}
+
+pub(crate) fn validate_args(args: &BughuntArgs) -> Result<()> {
+    if args.layer.is_some() && args.layer_kind.is_none() {
+        bail!("--layer-kind is required when --layer is provided");
+    }
+    if args.layer.is_none() && args.layer_kind.is_some() {
+        bail!("--layer-kind requires --layer");
+    }
+    if matches!(args.mode, BughuntMode::Dump) && args.prompt.is_none() {
+        bail!("--prompt is required in dump mode");
+    }
+    if matches!(args.mode, BughuntMode::Bench) && args.bench_iterations == 0 {
+        bail!("--iters must be greater than zero in bench mode");
+    }
+    if matches!(args.mode, BughuntMode::DecodeGate) && args.bench_decode_tokens == 0 {
+        bail!("--decode-tokens must be greater than zero in decode-gate mode");
+    }
+    Ok(())
 }

@@ -17,6 +17,7 @@ mod report;
 mod runtime;
 mod util;
 pub use args::*;
+use args::validate_args;
 use manifest::load_prompt_manifest;
 use output::{print_report_summary, write_report_json};
 use profile::{
@@ -134,25 +135,6 @@ pub fn run(args: BughuntArgs) -> Result<BughuntReport> {
         println!("report_json={}", path.display());
     }
     Ok(report)
-}
-
-fn validate_args(args: &BughuntArgs) -> Result<()> {
-    if args.layer.is_some() && args.layer_kind.is_none() {
-        bail!("--layer-kind is required when --layer is provided");
-    }
-    if args.layer.is_none() && args.layer_kind.is_some() {
-        bail!("--layer-kind requires --layer");
-    }
-    if matches!(args.mode, BughuntMode::Dump) && args.prompt.is_none() {
-        bail!("--prompt is required in dump mode");
-    }
-    if matches!(args.mode, BughuntMode::Bench) && args.bench_iterations == 0 {
-        bail!("--iters must be greater than zero in bench mode");
-    }
-    if matches!(args.mode, BughuntMode::DecodeGate) && args.bench_decode_tokens == 0 {
-        bail!("--decode-tokens must be greater than zero in decode-gate mode");
-    }
-    Ok(())
 }
 
 fn run_gate_mode(
