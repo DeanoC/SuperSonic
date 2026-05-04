@@ -28,7 +28,11 @@ PROMPT=$(cat "$PROMPT_FILE")
 extract_ttft() {
     local raw="$1"
     local spec_ms target_ms dense_ms
-    spec_ms=$(printf '%s' "$raw" | sed -n 's/.*speculator (cosine|lookahead) done in \([0-9]*\)ms.*/\1/p' | tail -n1)
+    # Use grep -oE for the speculator line (sed BRE alternation `(a|b)`
+    # doesn't match without -E). The line looks like:
+    #   [specprefill] speculator (cosine) done in 448ms (block_size=32)
+    #   [specprefill] speculator (lookahead) done in 5729ms (full layers=6)
+    spec_ms=$(printf '%s' "$raw" | grep -oE 'speculator \([a-z]+\) done in [0-9]+ms' | head -n1 | grep -oE '[0-9]+')
     target_ms=$(printf '%s' "$raw" | sed -n 's/.*target prefill done in \([0-9]*\)ms.*/\1/p' | tail -n1)
     dense_ms=$(printf '%s' "$raw" | sed -n 's/.*native GPU prefill done in \([0-9]*\)ms.*/\1/p' | tail -n1)
     if [ -n "$spec_ms" ] && [ -n "$target_ms" ]; then
