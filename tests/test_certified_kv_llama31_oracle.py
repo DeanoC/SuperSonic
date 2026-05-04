@@ -79,6 +79,29 @@ class CertifiedKvOracleTests(unittest.TestCase):
         captured = (mass_frac * mask.float()).sum(dim=1)
         self.assertTrue(torch.allclose(tail_mass, 1.0 - captured))
 
+    def test_adaptive_topk_unclamped_k_max_selects_by_tau_only(self):
+        m_b = torch.tensor([[5.0, 4.0, 3.0, 2.0, 1.0]])
+        s_b = torch.ones_like(m_b)
+        cfg = CertifiedKvConfig(tau_cov=0.99, k_min=1, k_max=None)
+        mask, k_star, _, _ = adaptive_topk_mask(m_b, s_b, cfg)
+
+        self.assertEqual(k_star.tolist(), [5])
+        self.assertEqual(mask.sum(dim=1).tolist(), [5])
+
+    def test_paper_v2_values_are_explicitly_representable(self):
+        cfg = CertifiedKvConfig(
+            v_tol=0.5,
+            rung1_threshold=0.02,
+            tau_cov=0.995,
+            k_min=2,
+            k_max=None,
+            rung1_multiplier=2.0,
+        )
+
+        self.assertEqual(cfg.k_max, None)
+        self.assertEqual(cfg.v_tol, 0.5)
+        self.assertEqual(cfg.rung1_threshold, 0.02)
+
     def test_value_bound_covers_int4_value_error_when_all_keys_fp16(self):
         cfg = CertifiedKvConfig(
             tau_cov=1.0,
@@ -133,6 +156,18 @@ class CertifiedKvOracleTests(unittest.TestCase):
 
         self.assertTrue(telemetry["rung2_fired"])
         self.assertTrue(all(v == 0.0 for v in telemetry["e_val"]))
+
+    def test_value_bound_uses_final_block_mass_times_per_block_error(self):
+        mass_frac = torch.tensor([[0.70, 0.20, 0.10], [0.10, 0.60, 0.30]])
+        value_errors = torch.tensor([[0.50, 0.25, 0.10]])
+
+        e_val = value_error_bound(mass_frac, value_errors, gqa_group=2)
+
+        expected = torch.tensor([
+            0.70 * 0.50 + 0.20 * 0.25 + 0.10 * 0.10,
+            0.10 * 0.50 + 0.60 * 0.25 + 0.30 * 0.10,
+        ])
+        self.assertTrue(torch.allclose(e_val.cpu(), expected, atol=1e-7))
 
     def test_ranking_boundary_check_uses_delta_not_eps_guard(self):
         int8_m = torch.tensor([[10.0, 9.8]])

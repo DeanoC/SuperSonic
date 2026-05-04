@@ -23,7 +23,7 @@ class CertifiedKvConfig:
     value_group_size: int = 16
     tau_cov: float = 0.995
     k_min: int = 2
-    k_max: int = 128
+    k_max: int | None = 128
     v_tol: float = 0.05
     ranking_r: int = 1
     rung1_threshold: float = 0.005
@@ -318,7 +318,7 @@ def adaptive_topk_mask(
     cumsum = sorted_mass.cumsum(dim=1)
     target = torch.full((q_heads, 1), config.tau_cov, device=m_b.device)
     k_star = torch.searchsorted(cumsum.contiguous(), target).squeeze(1) + 1
-    hi = min(config.k_max, num_blocks)
+    hi = num_blocks if config.k_max is None else min(config.k_max, num_blocks)
     lo = min(config.k_min, hi)
     k_star = k_star.clamp(min=lo, max=hi).to(torch.int64)
 
@@ -665,10 +665,12 @@ def main() -> None:
     ap.add_argument("--value-group-size", type=int, default=16)
     ap.add_argument("--tau-cov", type=float, default=0.995)
     ap.add_argument("--k-min", type=int, default=2)
-    ap.add_argument("--k-max", type=int, default=128)
+    ap.add_argument("--k-max", type=int, default=128, help="0 means unclamped")
     ap.add_argument("--v-tol", type=float, default=0.05)
     ap.add_argument("--allow-uncertified-tail", action="store_true")
     args = ap.parse_args()
+    if args.k_max == 0:
+        args.k_max = None
     if not args.self_test:
         raise SystemExit("pass --self-test for the current synthetic oracle harness")
     print(json.dumps(_self_test_json(args), indent=2))

@@ -371,6 +371,10 @@ pub(crate) struct Cli {
     #[arg(long)]
     certified_kv: bool,
 
+    /// Hidden research preset for certified KV defaults.
+    #[arg(long, default_value = "legacy", hide = true)]
+    certified_kv_preset: certified_kv::CertifiedKvPreset,
+
     /// Optional JSONL telemetry path for certified KV stage and fallback counters.
     #[arg(long)]
     certified_kv_telemetry: Option<PathBuf>,
@@ -407,7 +411,7 @@ pub(crate) struct Cli {
     #[arg(long, default_value = "2", hide = true)]
     certified_kv_k_min: usize,
 
-    /// Certified KV maximum FP16 key blocks per head before Rung 1 expansion.
+    /// Certified KV maximum FP16 key blocks per head before Rung 1 expansion (0 = unclamped).
     #[arg(long, default_value = "128", hide = true)]
     certified_kv_k_max: usize,
 
