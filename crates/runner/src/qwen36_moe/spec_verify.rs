@@ -6,7 +6,7 @@ use crate::qwen36_moe_cli::decode_loop::Qwen36DecodeLoopState;
 use crate::qwen36_moe_cli::host::lookup_embed_row;
 use crate::qwen36_moe_cli::lm_head::{launch_lm_head_from_final_hidden_bytes, LmHeadBuffers};
 use crate::qwen36_moe_cli::timing::Qwen36StageTimingTotals;
-use crate::qwen36_moe_decode::run_chained_decode_fast;
+use crate::qwen36_moe_decode::{run_chained_decode_fast, run_chained_decode_fast_with_cache_pos};
 use crate::qwen36_moe_logits::argmax_bf16_logits;
 use crate::qwen36_moe_mtp::{MtpChainScratch, MtpForwardScratch};
 use crate::qwen36_moe_persistent_decode::PersistentScratch;
@@ -16,7 +16,9 @@ use crate::qwen36_moe_speculative::{
 use crate::qwen36_moe_state::{
     refresh_linear_attn_state, restore_linear_attn_state, LinearAttnSnapshot,
 };
-use crate::qwen36_moe_types::{DecodeOutputs, LayerBuffers, MtpLayerBuffers, MultiLayerGeom};
+use crate::qwen36_moe_types::{
+    DecodeOutputs, LayerBuffers, MtpLayerBuffers, MultiLayerGeom, PositionPair,
+};
 
 const QWEN36_NUM_SPECULATIVE_TOKENS: usize = 3;
 
@@ -28,7 +30,10 @@ pub(crate) struct Qwen36SpecChainStep<'a> {
     pub(crate) layers: &'a mut [LayerBuffers],
     pub(crate) persistent_scratch: Option<&'a mut PersistentScratch>,
     pub(crate) stage_timings: &'a mut Qwen36StageTimingTotals,
-    pub(crate) position: i32,
+    /// `(rope, cache)` for this verify-replay step. In dense MTP
+    /// the two agree; in SpecPrefill+MTP the rope is on the
+    /// absolute prompt timeline while cache is the compact slot.
+    pub(crate) position: PositionPair,
     pub(crate) input: u32,
     pub(crate) emit_stage_timings: bool,
 }
@@ -43,24 +48,31 @@ pub(crate) fn run_spec_chain_step(args: Qwen36SpecChainStep<'_>) -> Result<Decod
     )
     .with_context(|| {
         format!(
-            "spec verify embed lookup token {} at position {}",
-            args.input, args.position
+            "spec verify embed lookup token {} at rope {} cache {}",
+            args.input, args.position.rope, args.position.cache
         )
     })?;
     args.stage_timings.record_embed(t_embed_start.elapsed());
 
+    let rope = args.position.rope;
+    let cache = args.position.cache;
     let t_chain_start = std::time::Instant::now();
     let outputs = if let Some(scratch) = args.persistent_scratch {
-        // Spec-verify replay never decouples the KV slot from the RoPE
-        // position — it walks accepted draft tokens at their final
-        // committed positions. Pass CACHE_POS_INHERIT so the kernel
-        // mirrors the previous behaviour bit-for-bit.
-        scratch.run(
+        // The persistent kernel takes (rope, cache) directly. In dense
+        // MTP rope == cache and the kernel produces the same output
+        // as the pre-PR-#211 inherit-from-position path; in
+        // SpecPrefill+MTP the verify replay writes accepted draft
+        // tokens at the compact slot while RoPE rotates absolute.
+        scratch.run(args.ordinal, &initial_hidden, rope, cache, None)?
+    } else if !args.position.is_dense() {
+        run_chained_decode_fast_with_cache_pos(
             args.ordinal,
+            args.geom,
+            args.layers,
             &initial_hidden,
-            args.position,
-            crate::qwen36_moe_persistent_decode::CACHE_POS_INHERIT,
-            None,
+            rope,
+            cache,
+            args.emit_stage_timings,
         )?
     } else {
         run_chained_decode_fast(
@@ -68,7 +80,7 @@ pub(crate) fn run_spec_chain_step(args: Qwen36SpecChainStep<'_>) -> Result<Decod
             args.geom,
             args.layers,
             &initial_hidden,
-            args.position,
+            rope,
             args.emit_stage_timings,
         )?
     };
@@ -87,7 +99,7 @@ pub(crate) struct Qwen36SpecReplayAccepted<'a> {
     pub(crate) snapshot: &'a LinearAttnSnapshot,
     pub(crate) persistent_scratch: Option<&'a mut PersistentScratch>,
     pub(crate) stage_timings: &'a mut Qwen36StageTimingTotals,
-    pub(crate) replay_inputs: &'a [(i32, u32)],
+    pub(crate) replay_inputs: &'a [(PositionPair, u32)],
     pub(crate) emit_stage_timings: bool,
 }
 
@@ -123,7 +135,7 @@ pub(crate) struct Qwen36BatchedSpecVerifyInputs<'a> {
     pub(crate) final_norm_w: &'a GpuBuffer,
     pub(crate) lm_head_w: &'a GpuBuffer,
     pub(crate) stage_timings: &'a mut Qwen36StageTimingTotals,
-    pub(crate) inputs: &'a [(i32, u32)],
+    pub(crate) inputs: &'a [(PositionPair, u32)],
     pub(crate) emit_stage_timings: bool,
 }
 
@@ -205,7 +217,7 @@ pub(crate) struct Qwen36SequentialSpecVerifyInput<'a> {
     pub(crate) logits: &'a mut GpuBuffer,
     pub(crate) counter: &'a mut GpuBuffer,
     pub(crate) stage_timings: &'a mut Qwen36StageTimingTotals,
-    pub(crate) position: i32,
+    pub(crate) position: PositionPair,
     pub(crate) input: u32,
     pub(crate) emit_stage_timings: bool,
 }
@@ -258,6 +270,13 @@ pub(crate) struct Qwen36SpeculativeExtension<'a> {
     pub(crate) counter: &'a mut GpuBuffer,
     pub(crate) linear_attn_snapshot: Option<&'a mut LinearAttnSnapshot>,
     pub(crate) loop_state: &'a Qwen36DecodeLoopState,
+    /// `(rope, cache)` of the just-sampled token that the
+    /// speculative pass starts from. The speculative driver uses
+    /// `rope + k` for RoPE rotation of draft step k, and
+    /// `cache + k` for the KV slot. In dense MTP they agree; in
+    /// SpecPrefill+MTP rope is the absolute prompt timeline while
+    /// cache is the compact slot.
+    pub(crate) base_position: PositionPair,
     pub(crate) h_base_in: &'a [u8],
     pub(crate) first_token: u32,
     pub(crate) stage_timings: &'a mut Qwen36StageTimingTotals,
@@ -285,7 +304,8 @@ pub(crate) fn run_speculative_extension(
             args.lm_head_w,
             args.h_base_in,
             args.first_token,
-            args.loop_state.position,
+            args.base_position.rope,
+            args.base_position.cache,
             dynamic_k,
             |inputs| -> Result<Vec<(u32, Vec<u8>)>> {
                 run_batched_spec_verify_inputs(Qwen36BatchedSpecVerifyInputs {
@@ -305,10 +325,12 @@ pub(crate) fn run_speculative_extension(
         )
         .context("batched speculative decode step")?;
 
-        if let Some(replay) =
-            args.loop_state
-                .partial_accept_replay_inputs(args.first_token, &result, dynamic_k)
-        {
+        if let Some(replay) = args.loop_state.partial_accept_replay_inputs(
+            args.first_token,
+            args.base_position,
+            &result,
+            dynamic_k,
+        ) {
             restore_and_replay_accepted_prefix(Qwen36SpecReplayAccepted {
                 ordinal: args.ordinal,
                 geom: args.geom,
@@ -334,7 +356,8 @@ pub(crate) fn run_speculative_extension(
             args.lm_head_w,
             args.h_base_in,
             args.first_token,
-            args.loop_state.position,
+            args.base_position.rope,
+            args.base_position.cache,
             dynamic_k,
             |position, input| -> Result<(u32, Vec<u8>)> {
                 run_sequential_spec_verify_input(Qwen36SequentialSpecVerifyInput {

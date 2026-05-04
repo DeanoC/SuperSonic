@@ -562,6 +562,7 @@ fn decode_text(
                 counter: &mut counter_buf,
                 linear_attn_snapshot: linear_attn_snapshot.as_mut(),
                 loop_state: &loop_state,
+                base_position: position,
                 h_base_in: &h_base,
                 first_token: next_token,
                 stage_timings: &mut stage_timings,
