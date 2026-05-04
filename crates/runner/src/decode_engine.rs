@@ -110,7 +110,7 @@ fn certified_kv_select_blocks_from_scores(
     delta_blocks: Option<&[f32]>,
     tau_cov: f32,
     k_min: usize,
-    k_max: usize,
+    k_max: Option<usize>,
     rung1_threshold: f32,
     rung1_multiplier: f32,
     delta_guard_factor: f32,
@@ -135,7 +135,7 @@ fn certified_kv_select_block_indices_from_scores(
     delta_blocks: Option<&[f32]>,
     tau_cov: f32,
     k_min: usize,
-    k_max: usize,
+    k_max: Option<usize>,
     rung1_threshold: f32,
     rung1_multiplier: f32,
     delta_guard_factor: f32,
@@ -196,7 +196,7 @@ fn certified_kv_select_block_indices_from_scores(
         }
     }
     let min_k = k_min.min(num_blocks);
-    let max_k = k_max.min(num_blocks).max(min_k);
+    let max_k = k_max.unwrap_or(num_blocks).min(num_blocks).max(min_k);
     selected = selected.max(min_k).min(max_k);
     covered = order.iter().take(selected).map(|&idx| probs[idx]).sum();
     let certified_tail = |selected: usize, covered: f32| -> f32 {
@@ -1269,7 +1269,7 @@ pub struct CertifiedKvDecodeParams {
     pub bf16_values: bool,
     pub tau_cov: f32,
     pub k_min: usize,
-    pub k_max: usize,
+    pub k_max: Option<usize>,
     pub v_tol: f32,
     pub value_cache_blocks: usize,
     pub ranking_r: usize,
@@ -1290,7 +1290,7 @@ impl CertifiedKvDecodeParams {
             bf16_values,
             tau_cov: 0.995,
             k_min: 2,
-            k_max: 128,
+            k_max: Some(128),
             v_tol: 0.05,
             value_cache_blocks: 128,
             ranking_r: 1,
@@ -1791,7 +1791,7 @@ impl DecodeEngine {
         value_group_size: usize,
         tau_cov: f32,
         k_min: usize,
-        k_max: usize,
+        k_max: Option<usize>,
         v_tol: f32,
         rung1_threshold: f32,
         rung1_multiplier: f32,
@@ -6153,11 +6153,14 @@ impl DecodeEngine {
                     let trace_cert_phases =
                         std::env::var_os("SUPERSONIC_CERTIFIED_TRACE_PHASES").is_some();
                     let cert_selector_start = Instant::now();
+                    let mut max_device_promoted_blocks = max_promoted_blocks;
                     if use_device_selector {
-                        let max_device_promoted_blocks = cfg
+                        let k_max_effective = cfg
                             .k_max
+                            .unwrap_or(num_blocks)
                             .max(cfg.k_min)
-                            .min(num_blocks)
+                            .min(num_blocks);
+                        max_device_promoted_blocks = k_max_effective
                             .saturating_mul(cfg.rung1_multiplier.ceil().max(1.0) as usize)
                             .clamp(1, num_blocks);
                         max_promoted_blocks = max_device_promoted_blocks;
@@ -6339,7 +6342,7 @@ impl DecodeEngine {
                             scratch.certified_selector_true_tail.as_mut().unwrap(),
                             gqa_group,
                             cfg.k_min,
-                            cfg.k_max,
+                            k_max_effective,
                             max_device_promoted_blocks,
                             q_scale,
                             cfg.tau_cov,
@@ -6931,6 +6934,66 @@ impl DecodeEngine {
                             key_cache_overflows,
                             max_promoted_blocks
                         );
+                    }
+                    if use_key_page_cache && cfg.k_max.is_none() {
+                        if use_device_selector {
+                            if max_device_promoted_blocks > key_cache_capacity {
+                                dense_fallback_qhead_flags.fill(true);
+                            }
+                        } else {
+                            for (qh, selected) in selected_by_head.iter().enumerate() {
+                                if selected.len() > key_cache_capacity {
+                                    dense_fallback_qhead_flags[qh] = true;
+                                }
+                            }
+                        }
+                        if dense_fallback_qhead_flags.iter().any(|&flag| flag) {
+                            let fallback_flag_shape = [num_q_heads];
+                            if scratch
+                                .certified_ranking_fallback_head_flags
+                                .as_ref()
+                                .map(|buf| buf.shape() != fallback_flag_shape)
+                                .unwrap_or(true)
+                            {
+                                scratch.certified_ranking_fallback_head_flags = Some(
+                                    GpuBuffer::zeros(
+                                        self.ordinal,
+                                        ScalarType::U32,
+                                        &fallback_flag_shape,
+                                    )
+                                    .map_err(|e| {
+                                        anyhow::anyhow!(
+                                            "layer {idx} certified KV fallback head flags alloc: {e}"
+                                        )
+                                    })?,
+                                );
+                            }
+                            let fallback_flags_u32: Vec<u32> = dense_fallback_qhead_flags
+                                .iter()
+                                .map(|&flag| if flag { 1 } else { 0 })
+                                .collect();
+                            let fallback_flags_bytes = unsafe {
+                                std::slice::from_raw_parts(
+                                    fallback_flags_u32.as_ptr() as *const u8,
+                                    fallback_flags_u32.len() * std::mem::size_of::<u32>(),
+                                )
+                            };
+                            gpu_hal::copy_h2d(
+                                self.ordinal,
+                                scratch
+                                    .certified_ranking_fallback_head_flags
+                                    .as_mut()
+                                    .unwrap()
+                                    .as_mut_ptr(),
+                                fallback_flags_bytes.as_ptr() as *const c_void,
+                                fallback_flags_bytes.len(),
+                            )
+                            .map_err(|e| {
+                                anyhow::anyhow!(
+                                    "layer {idx} certified KV fallback head flags H2D: {e}"
+                                )
+                            })?;
+                        }
                     }
                     if let Some(t) = timings.as_mut() {
                         t.certified_kv_selector_ms +=
