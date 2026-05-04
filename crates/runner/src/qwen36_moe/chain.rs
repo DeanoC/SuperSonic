@@ -8,7 +8,7 @@ use crate::qwen36_moe_decode::{
     run_chained_decode_fast_with_expert_prefetch,
     run_chained_decode_fast_with_expert_prefetch_and_cache_pos,
 };
-use crate::qwen36_moe_persistent_decode::{LmHeadFold, PersistentScratch};
+use crate::qwen36_moe_persistent_decode::{LmHeadFold, PersistentScratch, CACHE_POS_INHERIT};
 use crate::qwen36_moe_residency::MoeExpertResidencyManager;
 use crate::qwen36_moe_telemetry::{MoeRouteRuntime, MoeSparseTelemetrySnapshot};
 use crate::qwen36_moe_types::{
@@ -29,14 +29,13 @@ pub(crate) struct Qwen36ChainStep<'a> {
     /// Optional KV-cache slot override. When `None`, the kernel uses
     /// `position` for both RoPE rotation and the KV slot (the dense
     /// decode case, bit-equal to before this field existed). When
-    /// `Some(slot)`, the chained-decode path is forced and the kernel
-    /// uses `position` for RoPE rotation and `slot` for the KV slot —
-    /// this is the SpecPrefill sparse-prefill case where kept tokens
-    /// land in compact KV slots but rotate at their original prompt
-    /// positions. The persistent decode kernel does not yet support
-    /// this split (it takes only `position`), so when this field is
-    /// `Some` we route through `run_chained_decode_fast_with_cache_pos`
-    /// even if `persistent_scratch` would otherwise be used.
+    /// `Some(slot)`, the kernel uses `position` for RoPE rotation and
+    /// `slot` for the KV slot — this is the SpecPrefill sparse-prefill
+    /// case where kept tokens land in compact KV slots but rotate at
+    /// their original prompt positions. Both the persistent and chained
+    /// decode paths support the split: when `persistent_scratch` is
+    /// available we pass the slot straight through; otherwise we route
+    /// through the `run_chained_decode_fast_with_cache_pos` siblings.
     pub(crate) cache_pos: Option<i32>,
     pub(crate) step: usize,
     pub(crate) is_gen_step: bool,
@@ -60,63 +59,12 @@ pub(crate) fn run_chain_step(mut args: Qwen36ChainStep<'_>) -> Result<Qwen36Chai
     let mut next_moe_topk_by_layer = args.moe_routes.next_topk_buffer(track_moe_routes);
 
     let mut lm_head_folded = false;
-    let outputs = if let Some(cache_pos) = args.cache_pos {
-        // SpecPrefill sparse-prefill path. The persistent decode kernel
-        // takes only `position` (used for both KV slot and RoPE), so we
-        // force the chained path here — it constructs per-layer
-        // `Qwen36MoeAttnStepParams` and supports the kv_slot / rope_pos
-        // split natively (the kernel already uses this for MTP). lm_head
-        // fold is irrelevant on prefill steps (the MoE engine always sets
-        // `fold = None` on prefill) so we drop it.
-        drop(args.fold);
-        if let Some(manager) = args.moe_expert_residency.as_deref_mut() {
-            let mut prefetch = |phase: ExpertPrefetchPhase,
-                                layer_idx: usize,
-                                routes: &[ExpertRoute]|
-             -> Result<()> {
-                handle_moe_expert_prefetch(
-                    manager,
-                    args.store,
-                    args.moe_runtime.prefetch_mode,
-                    args.moe_runtime.prefetch_ranks,
-                    &args.moe_routes.previous_topk_by_layer,
-                    &mut next_moe_topk_by_layer,
-                    track_moe_routes,
-                    args.moe_routes.route_telemetry.as_mut(),
-                    args.moe_routes.transition_predictors.as_deref_mut(),
-                    phase,
-                    layer_idx,
-                    routes,
-                )
-            };
-            run_chained_decode_fast_with_expert_prefetch_and_cache_pos(
-                args.ordinal,
-                args.geom,
-                args.layers,
-                args.initial_hidden,
-                args.position,
-                cache_pos,
-                args.emit_stage_timings,
-                &mut prefetch,
-            )
-        } else {
-            run_chained_decode_fast_with_cache_pos(
-                args.ordinal,
-                args.geom,
-                args.layers,
-                args.initial_hidden,
-                args.position,
-                cache_pos,
-                args.emit_stage_timings,
-            )
-        }
-        .with_context(|| {
-            format!(
-                "chained sparse-prefill decode (step {}, position {}, cache_pos {})",
-                args.step, args.position, cache_pos
-            )
-        })?
-    } else if let Some(scratch) = args.persistent_scratch.as_deref_mut() {
+    let outputs = if let Some(scratch) = args.persistent_scratch.as_deref_mut() {
+        // Persistent decode covers both dense (cache_pos = None) and
+        // SpecPrefill sparse-prefill (cache_pos = Some(slot)) since
+        // the kernel decouples RoPE position from the KV slot.
+        // CACHE_POS_INHERIT (-1) sentinel ⇒ inherit from `position`.
+        let cache_pos_arg = args.cache_pos.unwrap_or(CACHE_POS_INHERIT);
         if let Some(manager) = args.moe_expert_residency.as_deref_mut() {
             drop(args.fold);
             let mut prefetch = |phase: ExpertPrefetchPhase,
@@ -143,28 +91,88 @@ pub(crate) fn run_chain_step(mut args: Qwen36ChainStep<'_>) -> Result<Qwen36Chai
                     args.ordinal,
                     args.initial_hidden,
                     args.position,
+                    cache_pos_arg,
                     &mut prefetch,
                 )
                 .with_context(|| {
                     format!(
-                        "segmented persistent sparse decode (step {}, position {})",
-                        args.step, args.position
+                        "segmented persistent sparse decode (step {}, position {}, cache_pos {})",
+                        args.step, args.position, cache_pos_arg
                     )
                 })?
         } else {
             lm_head_folded = args.fold.is_some();
             scratch
-                .run(args.ordinal, args.initial_hidden, args.position, args.fold)
+                .run(
+                    args.ordinal,
+                    args.initial_hidden,
+                    args.position,
+                    cache_pos_arg,
+                    args.fold,
+                )
                 .with_context(|| {
                     format!(
-                        "persistent decode (step {}, position {})",
-                        args.step, args.position
+                        "persistent decode (step {}, position {}, cache_pos {})",
+                        args.step, args.position, cache_pos_arg
                     )
                 })?
         }
     } else {
+        // Chained fallback for when the persistent megakernel isn't
+        // available (engine started without --persistent-decode, or
+        // a dispatch path that the persistent kernel doesn't yet
+        // support). The chained driver has parallel cache_pos siblings
+        // so the SpecPrefill / MTP slot split keeps working here too.
         drop(args.fold);
-        if let Some(manager) = args.moe_expert_residency.as_deref_mut() {
+        if let Some(cache_pos) = args.cache_pos {
+            if let Some(manager) = args.moe_expert_residency.as_deref_mut() {
+                let mut prefetch = |phase: ExpertPrefetchPhase,
+                                    layer_idx: usize,
+                                    routes: &[ExpertRoute]|
+                 -> Result<()> {
+                    handle_moe_expert_prefetch(
+                        manager,
+                        args.store,
+                        args.moe_runtime.prefetch_mode,
+                        args.moe_runtime.prefetch_ranks,
+                        &args.moe_routes.previous_topk_by_layer,
+                        &mut next_moe_topk_by_layer,
+                        track_moe_routes,
+                        args.moe_routes.route_telemetry.as_mut(),
+                        args.moe_routes.transition_predictors.as_deref_mut(),
+                        phase,
+                        layer_idx,
+                        routes,
+                    )
+                };
+                run_chained_decode_fast_with_expert_prefetch_and_cache_pos(
+                    args.ordinal,
+                    args.geom,
+                    args.layers,
+                    args.initial_hidden,
+                    args.position,
+                    cache_pos,
+                    args.emit_stage_timings,
+                    &mut prefetch,
+                )
+            } else {
+                run_chained_decode_fast_with_cache_pos(
+                    args.ordinal,
+                    args.geom,
+                    args.layers,
+                    args.initial_hidden,
+                    args.position,
+                    cache_pos,
+                    args.emit_stage_timings,
+                )
+            }
+            .with_context(|| {
+                format!(
+                    "chained sparse-prefill decode (step {}, position {}, cache_pos {})",
+                    args.step, args.position, cache_pos
+                )
+            })?
+        } else if let Some(manager) = args.moe_expert_residency.as_deref_mut() {
             let mut prefetch = |phase: ExpertPrefetchPhase,
                                 layer_idx: usize,
                                 routes: &[ExpertRoute]|
@@ -193,6 +201,12 @@ pub(crate) fn run_chain_step(mut args: Qwen36ChainStep<'_>) -> Result<Qwen36Chai
                 args.emit_stage_timings,
                 &mut prefetch,
             )
+            .with_context(|| {
+                format!(
+                    "chained decode (step {}, position {})",
+                    args.step, args.position
+                )
+            })?
         } else {
             run_chained_decode_fast(
                 args.ordinal,
@@ -202,13 +216,13 @@ pub(crate) fn run_chain_step(mut args: Qwen36ChainStep<'_>) -> Result<Qwen36Chai
                 args.position,
                 args.emit_stage_timings,
             )
+            .with_context(|| {
+                format!(
+                    "chained decode (step {}, position {})",
+                    args.step, args.position
+                )
+            })?
         }
-        .with_context(|| {
-            format!(
-                "chained decode (step {}, position {})",
-                args.step, args.position
-            )
-        })?
     };
 
     args.moe_routes

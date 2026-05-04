@@ -29,10 +29,16 @@
 use anyhow::{anyhow, Context, Result};
 use gpu_hal::{copy_d2h, copy_h2d, GpuBuffer, GpuError, ScalarType};
 use kernel_ffi::qwen36_moe::{
-    persistent_decode_launch, persistent_decode_launch_range, Qwen36MoeDecodeLayerDesc,
-    Qwen36MoeInt4ScaleDesc, Qwen36MoeKVCacheFp8Desc, Qwen36MoePersistentGeom,
-    Qwen36MoePersistentLmHeadFold, Qwen36MoePersistentMode,
+    persistent_decode_launch, persistent_decode_launch_range, Qwen36MoeAttnStepParams,
+    Qwen36MoeDecodeLayerDesc, Qwen36MoeInt4ScaleDesc, Qwen36MoeKVCacheFp8Desc,
+    Qwen36MoePersistentGeom, Qwen36MoePersistentLmHeadFold, Qwen36MoePersistentMode,
 };
+
+/// Sentinel passed to the persistent kernel when the caller has no
+/// decoupled KV slot — the kernel inherits `position` for both RoPE
+/// and the cache slot. Re-exported so the runner-side glue doesn't
+/// have to reach across to `kernel_ffi::qwen36_moe` for a single i32.
+pub const CACHE_POS_INHERIT: i32 = Qwen36MoeAttnStepParams::CACHE_POS_INHERIT;
 use std::ffi::c_void;
 use std::os::raw::c_int;
 
@@ -198,6 +204,12 @@ impl PersistentScratch {
         ordinal: usize,
         initial_hidden_bytes: &[u8],
         position: i32,
+        // `CACHE_POS_INHERIT` (-1) ⇒ inherit from `position` (dense
+        // base decode). `≥ 0` ⇒ decoupled KV slot: kept tokens land at
+        // `cache_pos` while RoPE rotates at `position`. SpecPrefill
+        // sparse-prefill drives this; MTP draft layers use the same
+        // shape.
+        cache_pos: i32,
         lm_head_fold: Option<LmHeadFold<'_>>,
     ) -> Result<DecodeOutputs> {
         let hidden_bytes = self.geom.hidden as usize * 2;
@@ -229,6 +241,7 @@ impl PersistentScratch {
             ScalarType::BF16,
             self.geom,
             position,
+            cache_pos,
             &self.layer_descs_dev,
             self.int4_scales_dev.as_ref(),
             self.kv_fp8_descs_dev.as_ref(),
@@ -286,6 +299,12 @@ impl PersistentScratch {
         ordinal: usize,
         initial_hidden_bytes: &[u8],
         position: i32,
+        // See [`Self::run`] for cache_pos semantics. The two
+        // segmented launches (RouterOnly + FfnOnly) share one
+        // cache_pos — RoPE rotates at `position` regardless of which
+        // mode is active, and the KV slot is only written by the
+        // attn pre-router phase (slot = effective cache_pos).
+        cache_pos: i32,
         mut prefetch: F,
     ) -> Result<DecodeOutputs>
     where
@@ -320,6 +339,7 @@ impl PersistentScratch {
                 layer_idx + 1,
                 Qwen36MoePersistentMode::RouterOnly,
                 position,
+                cache_pos,
                 &self.layer_descs_dev,
                 self.int4_scales_dev.as_ref(),
                 self.kv_fp8_descs_dev.as_ref(),
@@ -348,6 +368,7 @@ impl PersistentScratch {
                 layer_idx + 1,
                 Qwen36MoePersistentMode::FfnOnly,
                 position,
+                cache_pos,
                 &self.layer_descs_dev,
                 self.int4_scales_dev.as_ref(),
                 self.kv_fp8_descs_dev.as_ref(),

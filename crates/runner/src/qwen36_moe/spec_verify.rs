@@ -51,7 +51,17 @@ pub(crate) fn run_spec_chain_step(args: Qwen36SpecChainStep<'_>) -> Result<Decod
 
     let t_chain_start = std::time::Instant::now();
     let outputs = if let Some(scratch) = args.persistent_scratch {
-        scratch.run(args.ordinal, &initial_hidden, args.position, None)?
+        // Spec-verify replay never decouples the KV slot from the RoPE
+        // position — it walks accepted draft tokens at their final
+        // committed positions. Pass CACHE_POS_INHERIT so the kernel
+        // mirrors the previous behaviour bit-for-bit.
+        scratch.run(
+            args.ordinal,
+            &initial_hidden,
+            args.position,
+            crate::qwen36_moe_persistent_decode::CACHE_POS_INHERIT,
+            None,
+        )?
     } else {
         run_chained_decode_fast(
             args.ordinal,

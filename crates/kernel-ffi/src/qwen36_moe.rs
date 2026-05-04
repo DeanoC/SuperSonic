@@ -335,6 +335,10 @@ extern "C" {
         rope_theta: f32,
         rms_norm_eps: f32,
         position: c_int,
+        // -1 ⇒ inherit from `position` (dense base-decode case);
+        // ≥ 0 ⇒ decoupled KV slot for SpecPrefill sparse-prefill or
+        // MTP draft layers.
+        cache_pos: c_int,
         hidden_ping: *mut c_void,
         hidden_pong: *mut c_void,
         workspace: *mut f32,
@@ -802,6 +806,7 @@ pub fn persistent_decode_launch(
     dtype: ScalarType,
     geom: Qwen36MoePersistentGeom,
     position: i32,
+    cache_pos: i32,
     layers_device: &GpuBuffer,
     int4_scales_device: Option<&GpuBuffer>,
     kv_fp8_descs_device: Option<&GpuBuffer>,
@@ -821,6 +826,7 @@ pub fn persistent_decode_launch(
         num_layers,
         Qwen36MoePersistentMode::Full,
         position,
+        cache_pos,
         layers_device,
         int4_scales_device,
         kv_fp8_descs_device,
@@ -843,6 +849,10 @@ pub fn persistent_decode_launch_range(
     end_layer_exclusive: usize,
     mode: Qwen36MoePersistentMode,
     position: i32,
+    // `-1` (`Qwen36MoeAttnStepParams::CACHE_POS_INHERIT`) ⇒ inherit
+    // from `position` (dense base decode). `≥ 0` ⇒ decoupled KV slot
+    // for SpecPrefill sparse-prefill or MTP draft layers.
+    cache_pos: i32,
     layers_device: &GpuBuffer,
     int4_scales_device: Option<&GpuBuffer>,
     kv_fp8_descs_device: Option<&GpuBuffer>,
@@ -914,6 +924,7 @@ pub fn persistent_decode_launch_range(
                     geom.rope_theta,
                     geom.rms_norm_eps,
                     position,
+                    cache_pos,
                     hidden_ping.as_mut_ptr(),
                     hidden_pong.as_mut_ptr(),
                     workspace.as_mut_ptr() as *mut f32,
