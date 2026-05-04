@@ -61,19 +61,21 @@ def rocm_smi_snapshot() -> tuple[int | None, int | None, list[int], str]:
     if proc.returncode != 0:
         return None, None, [], output
 
-    gpu_use = None
-    mem_use = None
+    gpu_uses: list[int] = []
+    mem_uses: list[int] = []
     pids: list[int] = []
     for line in output.splitlines():
         gpu_match = re.search(r"GPU use \(%\):\s*([0-9]+)", line)
         if gpu_match:
-            gpu_use = int(gpu_match.group(1))
+            gpu_uses.append(int(gpu_match.group(1)))
         mem_match = re.search(r"VRAM%\):\s*([0-9]+)", line)
         if mem_match:
-            mem_use = int(mem_match.group(1))
-        pid_match = re.search(r"PID\s+([0-9]+)\s+is using", line)
-        if pid_match:
+            mem_uses.append(int(mem_match.group(1)))
+        pid_match = re.search(r"PID\s+([0-9]+)\s+is using\s+([0-9]+)\s+DRM", line)
+        if pid_match and int(pid_match.group(2)) > 0:
             pids.append(int(pid_match.group(1)))
+    gpu_use = max(gpu_uses) if gpu_uses else None
+    mem_use = max(mem_uses) if mem_uses else None
     return gpu_use, mem_use, pids, output
 
 

@@ -22,7 +22,9 @@ profile row unless `rocm-smi --showuse --showmemuse --showpidgpus` shows:
 - no listed GPU PIDs
 
 The wrapper `tests/gfx1100/profile_qwen36_longctx_vmm_fp8.py` enforces this
-before each benchmark row.
+before each benchmark row, using the maximum parsed GPU and VRAM use across all
+reported GPU rows and ignoring `showpidgpus` PID rows that report zero attached
+DRM devices.
 
 ## Primary Profile
 
