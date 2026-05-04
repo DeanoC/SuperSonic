@@ -854,3 +854,58 @@ fn qwen35_prefill_state_delta(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::resolve_qwen_oracle_model_id;
+    use crate::registry::ModelVariant;
+
+    #[test]
+    fn qwen_oracle_uses_hf_id_without_local_safetensors() {
+        let model_dir = unique_temp_dir("qwen-oracle-no-raw");
+        fs::create_dir_all(&model_dir).unwrap();
+
+        let resolved = resolve_qwen_oracle_model_id(None, &model_dir, &ModelVariant::Qwen3_5_0_8B);
+
+        assert_eq!(resolved, "Qwen/Qwen3.5-0.8B");
+        let _ = fs::remove_dir_all(model_dir);
+    }
+
+    #[test]
+    fn qwen_oracle_uses_local_dir_when_safetensors_present() {
+        let model_dir = unique_temp_dir("qwen-oracle-raw");
+        fs::create_dir_all(&model_dir).unwrap();
+        fs::write(model_dir.join("model.safetensors.index.json"), "{}").unwrap();
+
+        let resolved = resolve_qwen_oracle_model_id(None, &model_dir, &ModelVariant::Qwen3_5_0_8B);
+
+        assert_eq!(resolved, model_dir.to_string_lossy());
+        let _ = fs::remove_dir_all(model_dir);
+    }
+
+    #[test]
+    fn qwen_oracle_explicit_model_id_wins() {
+        let model_dir = unique_temp_dir("qwen-oracle-explicit");
+        fs::create_dir_all(&model_dir).unwrap();
+
+        let resolved = resolve_qwen_oracle_model_id(
+            Some("local-or-remote/override"),
+            &model_dir,
+            &ModelVariant::Qwen3_5_0_8B,
+        );
+
+        assert_eq!(resolved, "local-or-remote/override");
+        let _ = fs::remove_dir_all(model_dir);
+    }
+
+    fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
+    }
+}
