@@ -13,6 +13,8 @@
 
 #[cfg(feature = "bughunt")]
 pub mod bughunt;
+#[cfg(feature = "bughunt")]
+pub mod backend_runtime;
 pub mod decode_engine;
 pub mod gemma4_engine;
 pub mod gemma4_int4_engine;

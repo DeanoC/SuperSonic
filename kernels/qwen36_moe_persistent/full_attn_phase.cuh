@@ -718,10 +718,9 @@ __device__ inline void qwen36_moe_attn_step_device(
     //
     // 2) KV cache enabled (kv_cache != null): write current (K_rot, V_raw)
     //    at slot `position`, then attend over kv_len = position + 1 past
-    //    tokens with real softmax (max-stabilised, F32 exp). Per-Q-head
-    //    work-stealing; per-head scores live at workspace[OFF_SCORES +
-    //    hq * kv_max_t] so concurrent blocks computing different heads
-    //    don't race. Cap: kv_max_t must accommodate position + 1.
+    //    tokens with real softmax. Short cached reads use online softmax;
+    //    long cached reads reuse the old score workspace for tile partials
+    //    instead of materialising every score.
     {
         const int rep   = H / Hkv;
         const float scale = rsqrtf(static_cast<float>(d));
@@ -833,10 +832,187 @@ __device__ inline void qwen36_moe_attn_step_device(
                                        &counters[0]);
         }
 
-        // Step 2: per-Q-head attention reduction. Each block claims one head
-        // via atomicAdd on counters[0]; the write phase above already reset
-        // it (via grid_barrier_reset_counter when use_kv_cache, or by leaving
-        // it untouched when not).
+        // Step 2: per-Q-head attention reduction. Short contexts use one
+        // block per head. Long cached contexts split KV into tiles so all CUs
+        // can work on one head's history before a second pass combines the
+        // tile-local softmax partials.
+        const int attn_tile_t = 384;
+        const int attn_tile_stride = d + 2;
+        const int attn_tile_count =
+            (kv_len + attn_tile_t - 1) / attn_tile_t;
+        const bool use_tiled_attn =
+            (kv_cache_k != nullptr) && (kv_len > attn_tile_t) &&
+            (d <= block_size) &&
+            (attn_tile_count * attn_tile_stride <= kv_max_t);
+
+        if (use_tiled_attn) {
+            const bool use_fp8_kv = (kv_scale_k != nullptr);
+            const bool sidecar_active =
+                (kv_shadow_k != nullptr && kv_shadow_start >= 0 && kv_shadow_window > 0);
+            const int rolling_shadow_start =
+                sidecar_active
+                    ? ((eff_cache_pos + 1 > kv_shadow_window)
+                        ? (eff_cache_pos + 1 - kv_shadow_window)
+                        : 0)
+                    : 0;
+            const int shadow_start =
+                sidecar_active
+                    ? ((rolling_shadow_start > kv_shadow_start)
+                        ? rolling_shadow_start
+                        : kv_shadow_start)
+                    : 0;
+            const T* shadow_k = sidecar_active ? static_cast<const T*>(kv_shadow_k) : nullptr;
+            const uint8_t* fp8_ck = use_fp8_kv ? reinterpret_cast<const uint8_t*>(kv_cache_k) : nullptr;
+            const float* sk_buf = use_fp8_kv ? kv_scale_k : nullptr;
+            const bool use_fp8_kv_v = (kv_scale_v != nullptr);
+            const bool sidecar_active_v =
+                (kv_shadow_v != nullptr && kv_shadow_start >= 0 && kv_shadow_window > 0);
+            const int rolling_shadow_start_v =
+                sidecar_active_v
+                    ? ((eff_cache_pos + 1 > kv_shadow_window)
+                        ? (eff_cache_pos + 1 - kv_shadow_window)
+                        : 0)
+                    : 0;
+            const int shadow_start_v =
+                sidecar_active_v
+                    ? ((rolling_shadow_start_v > kv_shadow_start)
+                        ? rolling_shadow_start_v
+                        : kv_shadow_start)
+                    : 0;
+            const T* shadow_v = sidecar_active_v ? static_cast<const T*>(kv_shadow_v) : nullptr;
+            const uint8_t* fp8_cv =
+                use_fp8_kv_v ? reinterpret_cast<const uint8_t*>(kv_cache_v) : nullptr;
+            const float* sv_buf = use_fp8_kv_v ? kv_scale_v : nullptr;
+
+            for (;;) {
+                __shared__ unsigned int tile_task_s;
+                if (tid == 0) {
+                    tile_task_s = atomicAdd(&counters[0], 1u);
+                }
+                __syncthreads();
+                const int task = static_cast<int>(tile_task_s);
+                if (task >= H * attn_tile_count) break;
+
+                const int hq = task / attn_tile_count;
+                const int tile = task - hq * attn_tile_count;
+                const int h_kv = hq / rep;
+                const int t0 = tile * attn_tile_t;
+                const int t1 = (t0 + attn_tile_t < kv_len) ? (t0 + attn_tile_t) : kv_len;
+                float* partials =
+                    workspace + OFF_SCORES + hq * kv_max_t + tile * attn_tile_stride;
+
+                float tile_m = -INFINITY;
+                float tile_l = 0.0f;
+                float tile_acc = 0.0f;
+
+                for (int t = t0; t < t1; t++) {
+                    float partial = 0.0f;
+                    const bool use_sidecar_k = sidecar_active && (t >= shadow_start);
+                    const float scale_k_t =
+                        (use_fp8_kv && !use_sidecar_k) ? sk_buf[h_kv * kv_max_t + t] : 0.f;
+                    for (int i = tid; i < d; i += block_size) {
+                        const float q = workspace[OFF_Q_ROT + hq * d + i];
+                        float k;
+                        if (!use_fp8_kv) {
+                            k = static_cast<float>(kv_cache_k[t * Hkv * d + h_kv * d + i]);
+                        } else if (use_sidecar_k) {
+                            const int shadow_slot = t % kv_shadow_window;
+                            k = static_cast<float>(
+                                shadow_k[h_kv * kv_shadow_window * d + shadow_slot * d + i]);
+                        } else {
+                            const uint8_t byte = fp8_ck[t * Hkv * d + h_kv * d + i];
+                            k = fp8_e4m3_to_float(byte) * scale_k_t;
+                        }
+                        partial += q * k;
+                    }
+                    shared_scratch[tid] = partial;
+                    __syncthreads();
+                    for (int s = block_size / 2; s > 0; s >>= 1) {
+                        if (tid < s) shared_scratch[tid] += shared_scratch[tid + s];
+                        __syncthreads();
+                    }
+                    __shared__ float tile_score_s;
+                    if (tid == 0) {
+                        tile_score_s = shared_scratch[0] * scale;
+                    }
+                    __syncthreads();
+
+                    const float new_m = fmaxf(tile_m, tile_score_s);
+                    const float old_scale = expf(tile_m - new_m);
+                    const float new_weight = expf(tile_score_s - new_m);
+                    tile_l = tile_l * old_scale + new_weight;
+
+                    float v = 0.0f;
+                    if (tid < d) {
+                        const bool use_sidecar_v = sidecar_active_v && (t >= shadow_start_v);
+                        if (!use_fp8_kv_v) {
+                            v = static_cast<float>(kv_cache_v[t * Hkv * d + h_kv * d + tid]);
+                        } else if (use_sidecar_v) {
+                            const int shadow_slot = t % kv_shadow_window;
+                            v = static_cast<float>(
+                                shadow_v[h_kv * kv_shadow_window * d + shadow_slot * d + tid]);
+                        } else {
+                            const float scale_v_t = sv_buf[h_kv * kv_max_t + t];
+                            const uint8_t byte = fp8_cv[t * Hkv * d + h_kv * d + tid];
+                            v = fp8_e4m3_to_float(byte) * scale_v_t;
+                        }
+                    }
+                    tile_acc = tile_acc * old_scale + new_weight * v;
+                    tile_m = new_m;
+                    __syncthreads();
+                }
+
+                if (tid == 0) {
+                    partials[0] = tile_m;
+                    partials[1] = tile_l;
+                }
+                if (tid < d) {
+                    partials[2 + tid] = tile_acc;
+                }
+                __syncthreads();
+            }
+
+            grid_barrier_reset_counter(barrier_counter, barrier_flag, num_blocks,
+                                       &counters[0]);
+
+            for (;;) {
+                __shared__ unsigned int head_s;
+                if (tid == 0) {
+                    head_s = atomicAdd(&counters[0], 1u);
+                }
+                __syncthreads();
+                const int hq = static_cast<int>(head_s);
+                if (hq >= H) break;
+
+                float global_m = -INFINITY;
+                for (int tile = 0; tile < attn_tile_count; tile++) {
+                    const float* partials =
+                        workspace + OFF_SCORES + hq * kv_max_t + tile * attn_tile_stride;
+                    global_m = fmaxf(global_m, partials[0]);
+                }
+
+                float global_l = 0.0f;
+                float global_acc = 0.0f;
+                for (int tile = 0; tile < attn_tile_count; tile++) {
+                    const float* partials =
+                        workspace + OFF_SCORES + hq * kv_max_t + tile * attn_tile_stride;
+                    const float w = expf(partials[0] - global_m);
+                    global_l += partials[1] * w;
+                    if (tid < d) {
+                        global_acc += partials[2 + tid] * w;
+                    }
+                }
+
+                if (tid < d) {
+                    const float acc = global_l > 0.0f ? (global_acc / global_l) : 0.0f;
+                    workspace[OFF_ATTN + hq * d + tid] = acc;
+                    if (stage == 4) {
+                        output[hq * d + tid] = static_cast<T>(acc);
+                    }
+                }
+                __syncthreads();
+            }
+        } else {
         for (;;) {
             __shared__ unsigned int head_s;
             if (tid == 0) {
@@ -880,10 +1056,10 @@ __device__ inline void qwen36_moe_attn_step_device(
                 continue;
             }
 
-            // KV-cache path. Compute scores[t] = (q · K_cache[t]) * scale
-            // for t in 0..=position. Per-head scores live at
-            // workspace[OFF_SCORES + hq * kv_max_t + t].
-            const int score_base = OFF_SCORES + hq * kv_max_t;
+            // KV-cache path. Stream scores and V through an online softmax:
+            // m' = max(m, score), l' = l*exp(m-m') + exp(score-m'),
+            // acc' = acc*exp(m-m') + V*exp(score-m'). This removes the
+            // previous score write/read and the serial softmax pass.
             const bool use_fp8_kv = (kv_scale_k != nullptr);
             // The bridge guarantees kv_shadow_k/v are paired (or both
             // null), so checking only kv_shadow_k here is sufficient and
@@ -905,63 +1081,6 @@ __device__ inline void qwen36_moe_attn_step_device(
             const T* shadow_k = sidecar_active ? static_cast<const T*>(kv_shadow_k) : nullptr;
             const uint8_t* fp8_ck = use_fp8_kv ? reinterpret_cast<const uint8_t*>(kv_cache_k) : nullptr;
             const float* sk_buf = use_fp8_kv ? kv_scale_k : nullptr;
-
-            for (int t = 0; t < kv_len; t++) {
-                float partial = 0.0f;
-                const bool use_sidecar = sidecar_active && (t >= shadow_start);
-                const float scale_k_t =
-                    (use_fp8_kv && !use_sidecar) ? sk_buf[h_kv * kv_max_t + t] : 0.f;
-                for (int i = tid; i < d; i += block_size) {
-                    const float q = workspace[OFF_Q_ROT + hq * d + i];
-                    float k;
-                    if (!use_fp8_kv) {
-                        k = static_cast<float>(kv_cache_k[t * Hkv * d + h_kv * d + i]);
-                    } else if (use_sidecar) {
-                        const int shadow_slot = t % kv_shadow_window;
-                        k = static_cast<float>(
-                            shadow_k[h_kv * kv_shadow_window * d + shadow_slot * d + i]);
-                    } else {
-                        const uint8_t byte =
-                            fp8_ck[t * Hkv * d + h_kv * d + i];
-                        k = fp8_e4m3_to_float(byte) * scale_k_t;
-                    }
-                    partial += q * k;
-                }
-                shared_scratch[tid] = partial;
-                __syncthreads();
-                for (int s = block_size / 2; s > 0; s >>= 1) {
-                    if (tid < s) shared_scratch[tid] += shared_scratch[tid + s];
-                    __syncthreads();
-                }
-                if (tid == 0) {
-                    workspace[score_base + t] = shared_scratch[0] * scale;
-                }
-                __syncthreads();
-            }
-
-            // Softmax with max-stabilisation. Done by tid==0 to keep the
-            // reduction simple — kv_len is small (≤ context window) and the
-            // remaining work (V-weighted reduction) is the bulk of the cost.
-            __shared__ float max_score;
-            __shared__ float exp_sum;
-            if (tid == 0) {
-                float m = workspace[score_base];
-                for (int t = 1; t < kv_len; t++) {
-                    m = fmaxf(m, workspace[score_base + t]);
-                }
-                max_score = m;
-                float s = 0.0f;
-                for (int t = 0; t < kv_len; t++) {
-                    const float e = expf(workspace[score_base + t] - m);
-                    workspace[score_base + t] = e;
-                    s += e;
-                }
-                exp_sum = s;
-            }
-            __syncthreads();
-
-            // Weighted sum of V over t. Each thread handles a slice of d.
-            const float inv_sum = 1.0f / exp_sum;
             const bool use_fp8_kv_v = (kv_scale_v != nullptr);
             const bool sidecar_active_v =
                 (kv_shadow_v != nullptr && kv_shadow_start >= 0 && kv_shadow_window > 0);
@@ -982,31 +1101,76 @@ __device__ inline void qwen36_moe_attn_step_device(
                 use_fp8_kv_v ? reinterpret_cast<const uint8_t*>(kv_cache_v) : nullptr;
             const float* sv_buf = use_fp8_kv_v ? kv_scale_v : nullptr;
 
-            for (int i = tid; i < d; i += block_size) {
-                float acc = 0.0f;
-                for (int t = 0; t < kv_len; t++) {
-                    const float w = workspace[score_base + t] * inv_sum;
-                    const bool use_sidecar = sidecar_active_v && (t >= shadow_start_v);
-                    float v;
+            float online_m = -INFINITY;
+            float online_l = 0.0f;
+            float online_acc = 0.0f;
+
+            for (int t = 0; t < kv_len; t++) {
+                float partial = 0.0f;
+                const bool use_sidecar_k = sidecar_active && (t >= shadow_start);
+                const float scale_k_t =
+                    (use_fp8_kv && !use_sidecar_k) ? sk_buf[h_kv * kv_max_t + t] : 0.f;
+                for (int i = tid; i < d; i += block_size) {
+                    const float q = workspace[OFF_Q_ROT + hq * d + i];
+                    float k;
+                    if (!use_fp8_kv) {
+                        k = static_cast<float>(kv_cache_k[t * Hkv * d + h_kv * d + i]);
+                    } else if (use_sidecar_k) {
+                        const int shadow_slot = t % kv_shadow_window;
+                        k = static_cast<float>(
+                            shadow_k[h_kv * kv_shadow_window * d + shadow_slot * d + i]);
+                    } else {
+                        const uint8_t byte = fp8_ck[t * Hkv * d + h_kv * d + i];
+                        k = fp8_e4m3_to_float(byte) * scale_k_t;
+                    }
+                    partial += q * k;
+                }
+                shared_scratch[tid] = partial;
+                __syncthreads();
+                for (int s = block_size / 2; s > 0; s >>= 1) {
+                    if (tid < s) shared_scratch[tid] += shared_scratch[tid + s];
+                    __syncthreads();
+                }
+                __shared__ float head_score;
+                if (tid == 0) {
+                    head_score = shared_scratch[0] * scale;
+                }
+                __syncthreads();
+
+                const float new_m = fmaxf(online_m, head_score);
+                const float old_scale = expf(online_m - new_m);
+                const float new_weight = expf(head_score - new_m);
+                online_l = online_l * old_scale + new_weight;
+
+                float v = 0.0f;
+                if (tid < d) {
+                    const bool use_sidecar_v = sidecar_active_v && (t >= shadow_start_v);
                     if (!use_fp8_kv_v) {
-                        v = static_cast<float>(kv_cache_v[t * Hkv * d + h_kv * d + i]);
-                    } else if (use_sidecar) {
+                        v = static_cast<float>(kv_cache_v[t * Hkv * d + h_kv * d + tid]);
+                    } else if (use_sidecar_v) {
                         const int shadow_slot = t % kv_shadow_window;
                         v = static_cast<float>(
-                            shadow_v[h_kv * kv_shadow_window * d + shadow_slot * d + i]);
+                            shadow_v[h_kv * kv_shadow_window * d + shadow_slot * d + tid]);
                     } else {
                         const float scale_v_t = sv_buf[h_kv * kv_max_t + t];
-                        const uint8_t byte = fp8_cv[t * Hkv * d + h_kv * d + i];
+                        const uint8_t byte = fp8_cv[t * Hkv * d + h_kv * d + tid];
                         v = fp8_e4m3_to_float(byte) * scale_v_t;
                     }
-                    acc += w * v;
                 }
-                workspace[OFF_ATTN + hq * d + i] = acc;
+                online_acc = online_acc * old_scale + new_weight * v;
+                online_m = new_m;
+                __syncthreads();
+            }
+
+            if (tid < d) {
+                const float acc = online_l > 0.0f ? (online_acc / online_l) : 0.0f;
+                workspace[OFF_ATTN + hq * d + tid] = acc;
                 if (stage == 4) {
-                    output[hq * d + i] = static_cast<T>(acc);
+                    output[hq * d + tid] = static_cast<T>(acc);
                 }
             }
             __syncthreads();
+        }
         }
     }
 
