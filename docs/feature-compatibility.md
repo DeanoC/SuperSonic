@@ -187,9 +187,9 @@ combo (or one feature implicitly requires the other to be off).
 |                  | Quant | KV-FP8 | VMM | SpecPrefill | DFlash | MoE prefetch | Certified KV |
 |------------------|:-----:|:------:|:---:|:-----------:|:------:|:------------:|:------------:|
 | **Quant**        |   —   |   ✅¹  | ✅  |     ✅      |   ✅   |     ✅       |     ✅²      |
-| **KV-FP8**       |  ✅¹  |   —    | ✅³ |     ❌⁵     |   ❌   |     ✅       |     ✅       |
+| **KV-FP8**       |  ✅¹  |   —    | ✅³ |     ✅⁵     |   ❌   |     ✅       |     ✅       |
 | **VMM**          |  ✅   |   ✅³  |  —  |     —⁴      |   —⁴   |     ✅       |     —⁴       |
-| **SpecPrefill**  |  ✅   |   ❌⁵  | —⁴  |      —      |   ❌   |     —⁴       |     —⁴       |
+| **SpecPrefill**  |  ✅   |   ✅⁵  | —⁴  |      —      |   ❌   |     —⁴       |     —⁴       |
 | **DFlash**       |  ✅   |   ❌   | —⁴  |     ❌      |   —    |     —⁴       |     —⁴       |
 | **MoE prefetch** |  ✅   |   ✅   | ✅  |     —⁴      |   —⁴   |      —       |     —⁴       |
 | **Certified KV** |  ✅²  |   ✅   | —⁴  |     —⁴      |   —⁴   |     —⁴       |      —       |
@@ -201,13 +201,16 @@ combo (or one feature implicitly requires the other to be off).
 ⁴ Dash means "no validated combo exists today" — the underlying
   features apply to disjoint model families (e.g. SpecPrefill is
   Qwen3.5-9B; MoE prefetch is Qwen3.6-MoE).
-⁵ SpecPrefill + KV-FP8 is rejected upfront by `validate_specprefill_flags`
-  (since 2026-05-04). The underlying issue: the BF16 step-copy fallback
-  added in PR #177 to unblock SpecPrefill on HIP requires BF16 dst
-  buffers, but `--kv-fp8` makes them U8 (FP8). Lifting the gate is a
-  Phase D follow-up — the per-head D2D fallback in
-  `kernel_ffi::certified_kv::copy_step_bf16` (non-CUDA branch) needs
-  a BF16→FP8 quantise-on-the-fly path.
+⁵ SpecPrefill + KV-FP8 is supported on the default `cosine` algorithm
+  (since 2026-05-04). The first prefill stays sparse via `prefill_kept`
+  so the SpecPrefill TTFT win is preserved; each decode step then runs
+  a dense replay-prefill (`rebuild_prefill_state`) on the full
+  unsparsified history — the same fallback plain `--kv-fp8` already
+  uses on Qwen3.5-9B because component decode lacks an FP8 attention
+  path. Per-token decode is bounded by replay-prefill cost. The
+  legacy `--specprefill-algorithm lookahead` + `--kv-fp8` combo is
+  still rejected upfront because the speculator's drafter decode
+  has no replay-prefill workaround.
 
 ## Picker recipes — "I want to ..."
 

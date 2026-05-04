@@ -756,7 +756,8 @@ in.
 | SpecPrefill (cosine, keep=0.50) | qwen3.5-9b BF16 + 1353-token prompt, gfx1100 | 4941 ms TTFT | 2385 ms TTFT (default `--specprefill-algorithm cosine`, shallowest layer + drafter early-exit) | **2.07× FASTER** | tests/gfx1100/bench_specprefill_cosine.sh, 2026-05-04 |
 | SpecPrefill (cosine all_max, keep=0.50) | qwen3.5-9b BF16 + 1353-token prompt, gfx1100 | 4941 ms TTFT | 4144 ms TTFT (`SUPERSONIC_SPECPREFILL_LAYERS=all_max`) | **1.19× FASTER** | tests/gfx1100/bench_specprefill_cosine.sh, 2026-05-04 |
 | SpecPrefill (lookahead, keep=0.50) | qwen3.5-9b BF16 + 1353-token prompt, gfx1100 | 4941 ms TTFT | 7846 ms TTFT (legacy `--specprefill-algorithm lookahead`) | **1.59× SLOWER**² | tests/gfx1100/bench_specprefill_cosine.sh, 2026-05-04 |
-| SpecPrefill + KV-FP8 | qwen3.5-9b BF16 + KV-FP8 + 1353-token prompt | — | rejected by validation³ | **REJECTED** | n/a (CLI guard since 2026-05-04) |
+| SpecPrefill + KV-FP8 (cosine) | qwen3.5-9b BF16 + KV-FP8 + 1353-token prompt | dense + KV-FP8 (replay-prefill decode) | sparse target prefill (TTFT win preserved) + replay-prefill decode³ | TTFT win same as cosine without KV-FP8; decode bounded by KV-FP8 replay cost | crates/runner/tests/specprefill_qwen35_9b_cosine_kvfp8_parity.rs, 2026-05-04 |
+| SpecPrefill + KV-FP8 (lookahead) | qwen3.5-9b BF16 + KV-FP8 + 1353-token prompt | — | rejected by validation⁴ | **REJECTED** | n/a (CLI guard, lookahead-only since 2026-05-04) |
 | DFlash (B=3) | qwen3.5-9b INT4 greedy decode, gfx1100 | ~32 ms/step | ~12 ms/step (effective; 2.5-3× speedup) | 2.5-3× FASTER | docs/dflash.md M4.3 numbers |
 | MoE prefetch | qwen3.6-35b-a3b INT4 decode, gfx1100 | included | (default-on) | — | the 28.3 ms/step row above already includes prefetch — the persistent megakernel default path uses it. A/B vs no-prefetch needs `--no-persistent-decode` which falls back to a different decode path entirely. |
 | Certified KV (shadow-validate) | llama3.1-8b INT8 + 1024-token prompt, sm86 | TBM ms/step | TBM ms/step | TBM | (script TBM, sm86-only — not measurable on a HIP-only dev box) |
@@ -789,12 +790,24 @@ in.
   [specprefill.md § Performance](specprefill.md#performance) for the
   full prompt-length sweep.
 
-³ SpecPrefill + KV-FP8 is rejected upfront by `validate_specprefill_flags`
-  (since 2026-05-04). The underlying issue: the BF16 step-copy fallback
-  added in PR #177 assumes BF16 destination buffers; `--kv-fp8` makes the
-  K/V cache U8 (FP8). Lifting the gate is a Phase D follow-up — the
-  per-head D2D fallback in `kernel_ffi::certified_kv::copy_step_bf16`
-  (non-CUDA branch) needs a BF16→FP8 quantise-on-the-fly path.
+³ For the cosine path, SpecPrefill + KV-FP8 reuses the same
+  replay-prefill decode strategy plain `--kv-fp8` already uses on
+  Qwen3.5-9B (`replay_kv_fp8_enabled` in main.rs). The first prefill
+  is sparse via `prefill_kept` (TTFT win preserved); each subsequent
+  decode step rebuilds the KV cache from the full unsparsified history
+  via `rebuild_prefill_state`. Per-token decode cost matches plain
+  KV-FP8 decode — bounded by replay-prefill, same as footnote ¹.
+
+⁴ The lookahead path's SpecPrefill + KV-FP8 combo remains rejected
+  upfront by `validate_specprefill_flags`. The underlying issue: the
+  speculator's lookahead decode runs through the component decode path
+  with `copy_step_bf16` (BF16-only) as its K/V step write, and the
+  drafter has no replay-prefill workaround (it doesn't rebuild a
+  scratch state per step like the target does). Lifting it would need
+  a BF16→FP8 quantise-on-the-fly K/V step write plus an FP8 attention
+  read in component decode — a much bigger kernel job. Since the
+  cosine path is the default and works with KV-FP8, the lookahead
+  combo is documented-unsupported, not an active follow-up.
 
 The DFlash numbers are pulled from [dflash.md](dflash.md)'s M4.3
 single-pass fused-verify section. The KV-FP8 number is the gfx1100
