@@ -5,11 +5,12 @@ use crate::bakes::ensure_hf_metadata_present;
 use crate::decode_engine::{DecodeEngine, DecodeStageTimings};
 use crate::prefill_engine;
 use crate::qwen35_decode_modes::{report_qwen35_decode_modes, resolve_qwen35_decode_modes};
+use crate::qwen35_decode_report::{emit_qwen35_decode_report, Qwen35DecodeReport};
 use crate::qwen35_decode_util::{token_history, token_history_with_next};
 use crate::qwen35_engine_setup::{load_qwen35_engine, Qwen35EngineSetup};
 use crate::qwen35_kv_trace::trace_kv_cache;
 use crate::qwen35_prefill::{
-    sample_qwen_logits_with_rescore, run_qwen35_prefill, HostLmHeadRescorer, Qwen35Prefill,
+    run_qwen35_prefill, sample_qwen_logits_with_rescore, HostLmHeadRescorer, Qwen35Prefill,
 };
 use crate::qwen35_startup::{
     load_qwen35_startup, validate_qwen35_startup, Qwen35Policy, Qwen35Startup,
@@ -718,71 +719,19 @@ pub(crate) fn run_qwen35(
     }
     let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
 
-    // Decode generated tokens to text
-    let all_ids: Vec<u32> = prompt_ids
-        .iter()
-        .copied()
-        .chain(generated_ids.iter().copied())
-        .collect();
-    let text = tokenizer
-        .decode(&all_ids, true)
-        .map_err(|e| anyhow::anyhow!("detokenize: {e}"))?;
-    let generated_text = tokenizer
-        .decode(&generated_ids, true)
-        .map_err(|e| anyhow::anyhow!("detokenize generated suffix: {e}"))?;
-
-    println!("{text}");
-    if cli.emit_generated_json {
-        println!(
-            "[generated_json] {}",
-            serde_json::to_string(&generated_text)?
-        );
-    }
-    println!(
-        "[tokens] {}",
-        generated_ids
-            .iter()
-            .map(|id| id.to_string())
-            .collect::<Vec<_>>()
-            .join(" ")
-    );
-    eprintln!(
-        "[result] prompt_tokens={} generated_tokens={} decode_ms={decode_ms:.0} ms_per_tok={:.0} decode_max_delta={max_delta:.4} gpu_oracle_max_delta={gpu_max_delta:.4} batch_size={}",
-        prompt_ids.len(),
-        generated_ids.len(),
-        if generated_ids.is_empty() { 0.0 } else { decode_ms / generated_ids.len() as f64 },
-        cli.batch_size,
-    );
-    if cli.emit_stage_timings {
-        if native_decode_timing_steps > 0 {
-            eprintln!(
-                "[stage-timings] steps={} persistent_ms={:.3} rms_norm_ms={:.3} lm_head_ms={:.3} logits_d2h_ms={:.3} host_sampling_ms={:.3} gpu_argmax_ms={:.3} token_d2h_ms={:.3} total_native_decode_ms={:.3} persistent_full_attn_ms={:.3} persistent_full_attn_proj_ms={:.3} persistent_full_attn_core_ms={:.3} persistent_full_attn_out_ms={:.3} persistent_linear_proj_ms={:.3} persistent_linear_core_ms={:.3} persistent_linear_core_conv_ms={:.3} persistent_linear_core_recurrent_ms={:.3} persistent_linear_core_post_ms={:.3} persistent_linear_out_ms={:.3} persistent_mlp_gate_up_ms={:.3} persistent_mlp_down_ms={:.3}",
-                native_decode_timing_steps,
-                native_decode_timings.persistent_ms,
-                native_decode_timings.rms_norm_ms,
-                native_decode_timings.lm_head_ms,
-                native_decode_timings.logits_d2h_ms,
-                native_decode_timings.host_sampling_ms,
-                native_decode_timings.gpu_argmax_ms,
-                native_decode_timings.token_d2h_ms,
-                native_decode_timings.total_ms(),
-                native_decode_timings.persistent_full_attn_ms,
-                native_decode_timings.persistent_full_attn_proj_ms,
-                native_decode_timings.persistent_full_attn_core_ms,
-                native_decode_timings.persistent_full_attn_out_ms,
-                native_decode_timings.persistent_linear_proj_ms,
-                native_decode_timings.persistent_linear_core_ms,
-                native_decode_timings.persistent_linear_core_conv_ms,
-                native_decode_timings.persistent_linear_core_recurrent_ms,
-                native_decode_timings.persistent_linear_core_post_ms,
-                native_decode_timings.persistent_linear_out_ms,
-                native_decode_timings.persistent_mlp_gate_up_ms,
-                native_decode_timings.persistent_mlp_down_ms,
-            );
-        } else {
-            eprintln!("[stage-timings] steps=0 note=no native decode stage timings collected for this path");
-        }
-    }
+    emit_qwen35_decode_report(Qwen35DecodeReport {
+        tokenizer: &tokenizer,
+        prompt_ids: &prompt_ids,
+        generated_ids: &generated_ids,
+        emit_generated_json: cli.emit_generated_json,
+        decode_ms,
+        max_delta,
+        gpu_max_delta,
+        batch_size: cli.batch_size,
+        emit_stage_timings: cli.emit_stage_timings,
+        native_decode_timings: &native_decode_timings,
+        native_decode_timing_steps,
+    })?;
 
     Ok(())
 }
