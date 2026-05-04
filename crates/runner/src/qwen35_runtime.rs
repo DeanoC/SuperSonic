@@ -1,13 +1,14 @@
 use anyhow::Result;
 use std::env;
-use std::path::Path;
 use std::time::Instant;
 
 use crate::bakes::{ensure_hf_metadata_present, load_qwen35_weights};
 use crate::decode_engine::{DecodeEngine, DecodeStageTimings};
-use crate::model_files::model_dir_has_raw_safetensors;
-use crate::prefill_engine::{self, PrefillResult};
+use crate::prefill_engine;
 use crate::qwen35_kv_trace::trace_kv_cache;
+use crate::qwen35_prefill::{
+    sample_qwen_logits_with_rescore, run_qwen35_prefill, HostLmHeadRescorer, Qwen35Prefill,
+};
 use crate::qwen35_trace::{
     trace_component_input_layer, trace_component_layer, trace_component_linear_layer,
     trace_component_linear_state_layer, trace_persistent_full_attn_layer,
@@ -16,16 +17,15 @@ use crate::qwen35_trace::{
 };
 use crate::qwen35_validation::{
     qwen35_oracle_script_path, resolve_qwen_oracle_model_id, run_qwen35_oracle_validation,
-    trace_qwen35_oracle_prefill_layer, Qwen35NativePrefillTrace,
+    trace_qwen35_oracle_prefill_layer,
 };
 use crate::qwen35_vram::check_qwen35_vram;
 use crate::registry::{
     self, Backend, FamilyParams, GpuArch, ModelVariant, Qwen35KernelParams, RegistryEntry,
 };
-use crate::tensor_bytes::bf16_bytes_to_f32 as decode_bf16_le;
 use crate::{
-    oracle, qwen35_dflash_engine, resolve_oracle_device, should_fetch_exact_bake,
-    specprefill_engine, try_download_bake, validate, Cli,
+    qwen35_dflash_engine, resolve_oracle_device, should_fetch_exact_bake, specprefill_engine,
+    try_download_bake, validate, Cli,
 };
 
 pub(crate) struct Qwen35Startup {
@@ -44,189 +44,6 @@ pub(crate) struct Qwen35EngineSetup {
 
 pub(crate) struct Qwen35Policy {
     pub(crate) trace_kv_cache_enabled: bool,
-}
-
-pub(crate) struct Qwen35Prefill {
-    pub(crate) logits: Vec<f32>,
-    pub(crate) native_trace: Option<Qwen35NativePrefillTrace>,
-    pub(crate) next_token: u32,
-}
-
-pub(crate) struct HostLmHeadRescorer {
-    loader: qwen35::loader::WeightLoader,
-    tensor_name: String,
-}
-
-impl HostLmHeadRescorer {
-    pub(crate) fn from_model_dir(model_dir: &Path) -> Result<Option<Self>> {
-        if !model_dir_has_raw_safetensors(model_dir) {
-            return Ok(None);
-        }
-        let loader = qwen35::loader::WeightLoader::from_dir(model_dir)
-            .map_err(|e| anyhow::anyhow!("open raw lm_head weights: {e}"))?;
-        let tensor_name = if loader.contains("lm_head.weight") {
-            "lm_head.weight".to_string()
-        } else if loader.contains("model.embed_tokens.weight") {
-            "model.embed_tokens.weight".to_string()
-        } else {
-            return Ok(None);
-        };
-        Ok(Some(Self {
-            loader,
-            tensor_name,
-        }))
-    }
-
-    fn rescore(&self, normed: &[f32], candidate_ids: &[usize]) -> Result<u32> {
-        let mut best_idx = 0usize;
-        let mut best_val = f32::NEG_INFINITY;
-        for &candidate in candidate_ids {
-            let row = self
-                .loader
-                .load_bf16_row_f32(&self.tensor_name, candidate)
-                .map_err(|e| anyhow::anyhow!("load lm_head row {candidate}: {e}"))?;
-            anyhow::ensure!(
-                row.len() == normed.len(),
-                "lm_head row len {} != normed len {}",
-                row.len(),
-                normed.len()
-            );
-            let score = row
-                .iter()
-                .zip(normed.iter())
-                .map(|(w, x)| w * x)
-                .sum::<f32>();
-            if score > best_val {
-                best_val = score;
-                best_idx = candidate;
-            }
-        }
-        Ok(best_idx as u32)
-    }
-}
-
-pub(crate) fn sample_qwen_logits_with_rescore(
-    logits: &[f32],
-    normed: Option<&[f32]>,
-    rescorer: Option<&HostLmHeadRescorer>,
-) -> Result<u32> {
-    let greedy = DecodeEngine::greedy_sample(logits);
-    let Some(normed) = normed else {
-        return Ok(greedy);
-    };
-    let Some(rescorer) = rescorer else {
-        return Ok(greedy);
-    };
-
-    const RESCORE_MARGIN: f32 = 0.25;
-    const RESCORE_TOP_K: usize = 4;
-
-    let candidates = top_k_candidate_ids(logits, RESCORE_TOP_K);
-    if candidates.len() < 2 {
-        return Ok(greedy);
-    }
-    let top0 = logits[candidates[0]];
-    let top1 = logits[candidates[1]];
-    if top0 - top1 > RESCORE_MARGIN {
-        return Ok(greedy);
-    }
-
-    let rescored = rescorer.rescore(normed, &candidates)?;
-    if rescored != greedy {
-        eprintln!(
-            "[sample-rescore] token {} -> {} (top_margin={:.4})",
-            greedy,
-            rescored,
-            top0 - top1
-        );
-    }
-    Ok(rescored)
-}
-
-fn top_k_candidate_ids(logits: &[f32], k: usize) -> Vec<usize> {
-    let mut best: Vec<(usize, f32)> = Vec::new();
-    for (idx, &val) in logits.iter().enumerate() {
-        let pos = best
-            .iter()
-            .position(|&(_, best_val)| val > best_val)
-            .unwrap_or(best.len());
-        if pos < k {
-            best.insert(pos, (idx, val));
-            if best.len() > k {
-                best.pop();
-            }
-        }
-    }
-    best.into_iter().map(|(idx, _)| idx).collect()
-}
-
-pub(crate) fn run_qwen35_prefill(
-    cli: &Cli,
-    engine: &mut DecodeEngine,
-    prompt_ids: &[u32],
-    oracle_model_id: &str,
-    oracle_device: &str,
-    fp8_oracle_dir: Option<&Path>,
-    host_lm_head_rescorer: Option<&HostLmHeadRescorer>,
-    allow_host_lm_head_rescore: bool,
-) -> Result<Qwen35Prefill> {
-    let prefill_start = Instant::now();
-    if cli.oracle_prefill {
-        let oracle_script = qwen35_oracle_script_path();
-        let output = oracle::run_oracle(
-            &oracle_script,
-            oracle_model_id,
-            prompt_ids,
-            cli.max_new_tokens,
-            &cli.oracle_dtype,
-            oracle_device,
-            true,
-            false,
-            fp8_oracle_dir,
-            None,
-        )?;
-        engine.load_prefill_state(&output)?;
-        let first = output.generated_token_ids.first().copied().ok_or_else(|| {
-            anyhow::anyhow!(
-                "oracle prefill produced no generated tokens; --oracle-prefill requires --max-new-tokens > 0"
-            )
-        })?;
-        eprintln!(
-            "[prefill] oracle prefill done in {:.0}ms",
-            prefill_start.elapsed().as_millis()
-        );
-        return Ok(Qwen35Prefill {
-            logits: output.prefill_logits,
-            native_trace: None,
-            next_token: first,
-        });
-    }
-
-    let prefill_result = if cli.trace_prefill_layers {
-        engine.prefill_native_with_trace(prompt_ids)?
-    } else {
-        engine.prefill_native_with_final_norm(prompt_ids)?
-    };
-    let first = sample_qwen_prefill_token(
-        &prefill_result,
-        host_lm_head_rescorer.filter(|_| allow_host_lm_head_rescore),
-    )?;
-    eprintln!(
-        "[prefill] native GPU prefill done in {:.0}ms",
-        prefill_start.elapsed().as_millis()
-    );
-
-    Ok(Qwen35Prefill {
-        logits: prefill_result.logits,
-        native_trace: Some((
-            prefill_result.final_norm_trace,
-            prefill_result.layer_attn_trace,
-            prefill_result.layer_post_attn_norm_trace,
-            prefill_result.layer_mlp_out_trace,
-            prefill_result.layer_hidden_trace,
-        )),
-        next_token: first,
-    })
 }
 
 pub(crate) fn report_qwen35_virtual_kv_after_prefill(engine: &mut DecodeEngine) -> Result<()> {
@@ -369,21 +186,6 @@ fn first_qwen35_virtual_kv_mismatch(
         }
     }
     None
-}
-
-fn sample_qwen_prefill_token(
-    prefill_result: &PrefillResult,
-    host_lm_head_rescorer: Option<&HostLmHeadRescorer>,
-) -> Result<u32> {
-    let prefill_normed = prefill_result
-        .final_norm_trace
-        .as_deref()
-        .map(decode_bf16_le);
-    sample_qwen_logits_with_rescore(
-        &prefill_result.logits,
-        prefill_normed.as_deref(),
-        host_lm_head_rescorer,
-    )
 }
 
 pub(crate) fn load_qwen35_startup(cli: &Cli) -> Result<Qwen35Startup> {
