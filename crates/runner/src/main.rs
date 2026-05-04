@@ -1051,7 +1051,14 @@ fn main() -> Result<()> {
         prompt_ids,
         context_tokens,
     } = load_qwen35_startup(&cli)?;
-    check_qwen35_vram(&cli, &text_config, &entry.vram, context_tokens, total_vram)?;
+    check_qwen35_vram(
+        &cli,
+        &text_config,
+        &entry.vram,
+        context_tokens,
+        params.kv_chunk_size,
+        total_vram,
+    )?;
 
     let gpu_validate_enabled = cli.gpu_validate && cli.batch_size == 1;
     if cli.gpu_validate && cli.batch_size > 1 {
