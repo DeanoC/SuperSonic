@@ -18,7 +18,7 @@ use model_store::BakedStore;
 
 use crate::qwen36_moe_bake::{ensure_qwen36_bake, select_decode_bake};
 use crate::qwen36_moe_chain::{run_chain_step, Qwen36ChainStep};
-use crate::qwen36_moe_decode::{argmax_bf16_logits, run_chained_decode_fast, XorshiftRng};
+use crate::qwen36_moe_decode::{argmax_bf16_logits, XorshiftRng};
 use crate::qwen36_moe_dry_run::{print_report, run_qwen36_moe_dry_run, DryRunReport};
 use crate::qwen36_moe_generation::{run_generation_step, Qwen36GenerationStep};
 use crate::qwen36_moe_geom::build_multi_layer_geom;
@@ -36,6 +36,7 @@ use crate::qwen36_moe_prompt::{
     prepare_prompt, print_prompt_summary, validate_speculative_sampling,
 };
 use crate::qwen36_moe_session::{prepare_decode_session, Qwen36DecodeSession};
+use crate::qwen36_moe_spec_verify::{run_spec_chain_step, Qwen36SpecChainStep};
 use crate::qwen36_moe_speculative::{
     run_speculative_decode_step, run_speculative_decode_step_batched,
 };
@@ -464,30 +465,18 @@ fn decode_text(
                         // K+1 sequential chains, accumulate final_hiddens.
                         let mut final_hiddens: Vec<Vec<u8>> = Vec::with_capacity(n);
                         for &(pos, input) in inputs {
-                            let t_embed_start = std::time::Instant::now();
-                            let initial_hidden = lookup_embed_row(
-                                &store,
+                            let chain_outputs = run_spec_chain_step(Qwen36SpecChainStep {
+                                ordinal,
+                                geom: &geom,
+                                store: &store,
                                 weight_prefix,
-                                input as usize,
-                                geom.hidden as usize,
-                            )?;
-                            stage_timings.record_embed(t_embed_start.elapsed());
-
-                            let t_chain_start = std::time::Instant::now();
-                            let chain_outputs = if let Some(scratch) = persistent_scratch.as_mut() {
-                                scratch.run(ordinal, &initial_hidden, pos, None)?
-                            } else {
-                                run_chained_decode_fast(
-                                    ordinal,
-                                    &geom,
-                                    &mut layers,
-                                    &initial_hidden,
-                                    pos,
-                                    emit_stage_timings,
-                                )?
-                            };
-                            stage_timings.record_chain(t_chain_start.elapsed(), &chain_outputs);
-                            stage_timings.count_generation_step();
+                                layers: &mut layers,
+                                persistent_scratch: persistent_scratch.as_mut(),
+                                stage_timings: &mut stage_timings,
+                                position: pos,
+                                input,
+                                emit_stage_timings,
+                            })?;
                             final_hiddens.push(chain_outputs.final_hidden_bytes);
                         }
 
@@ -550,28 +539,18 @@ fn decode_text(
                     // following positions.
                     let replay = loop_state.speculative_replay_inputs(next_token, &r);
                     for &(pos, input) in &replay {
-                        let t_embed_start = std::time::Instant::now();
-                        let initial_hidden = lookup_embed_row(
-                            &store,
+                        run_spec_chain_step(Qwen36SpecChainStep {
+                            ordinal,
+                            geom: &geom,
+                            store: &store,
                             weight_prefix,
-                            input as usize,
-                            geom.hidden as usize,
-                        )?;
-                        stage_timings.record_embed(t_embed_start.elapsed());
-                        let t_chain_start = std::time::Instant::now();
-                        let replay_outputs = if let Some(scratch) = persistent_scratch.as_mut() {
-                            scratch.run(ordinal, &initial_hidden, pos, None)?
-                        } else {
-                            run_chained_decode_fast(
-                                ordinal,
-                                &geom,
-                                &mut layers,
-                                &initial_hidden,
-                                pos,
-                                emit_stage_timings,
-                            )?
-                        };
-                        stage_timings.record_chain(t_chain_start.elapsed(), &replay_outputs);
+                            layers: &mut layers,
+                            persistent_scratch: persistent_scratch.as_mut(),
+                            stage_timings: &mut stage_timings,
+                            position: pos,
+                            input,
+                            emit_stage_timings,
+                        })?;
                         // Per-kernel-class breakdown for replay chains
                         // contributes to the same accumulators as the
                         // verify chains so `--emit-stage-timings` reports
@@ -579,7 +558,6 @@ fn decode_text(
                         // partial-accept iters. Without this the reported
                         // chain breakdown undercounts actual work as the
                         // accept rate falls.
-                        stage_timings.count_generation_step();
                     }
                 }
                 r
@@ -597,34 +575,18 @@ fn decode_text(
                     loop_state.position,
                     dynamic_k,
                     |pos, input| -> anyhow::Result<(u32, Vec<u8>)> {
-                        // Embed lookup is its own stage in the timing
-                        // breakdown — bundling it into `t_chain` (as the
-                        // first cut of this closure did) systematically
-                        // inflates `chain_ms_avg` and deflates
-                        // `embed_ms_avg` as the MTP accept rate rises.
-                        let t_embed_start = std::time::Instant::now();
-                        let initial_hidden = lookup_embed_row(
-                            &store,
+                        let outputs = run_spec_chain_step(Qwen36SpecChainStep {
+                            ordinal,
+                            geom: &geom,
+                            store: &store,
                             weight_prefix,
-                            input as usize,
-                            geom.hidden as usize,
-                        )?;
-                        stage_timings.record_embed(t_embed_start.elapsed());
-
-                        let t_chain_start = std::time::Instant::now();
-                        let outputs = if let Some(scratch) = persistent_scratch.as_mut() {
-                            scratch.run(ordinal, &initial_hidden, pos, None)?
-                        } else {
-                            run_chained_decode_fast(
-                                ordinal,
-                                &geom,
-                                &mut layers,
-                                &initial_hidden,
-                                pos,
-                                emit_stage_timings,
-                            )?
-                        };
-                        stage_timings.record_chain(t_chain_start.elapsed(), &outputs);
+                            layers: &mut layers,
+                            persistent_scratch: persistent_scratch.as_mut(),
+                            stage_timings: &mut stage_timings,
+                            position: pos,
+                            input,
+                            emit_stage_timings,
+                        })?;
 
                         let t_lm_head_start = std::time::Instant::now();
                         let logits_bytes = launch_lm_head_from_final_hidden_bytes(
@@ -641,15 +603,6 @@ fn decode_text(
                         )
                         .context("spec verify GPU lm_head")?;
                         stage_timings.record_lm_head(t_lm_head_start.elapsed());
-                        // Each verify base step counts as one decode step
-                        // for the per-token average — emitted_tokens.len()
-                        // tokens are committed per spec call, and
-                        // closure-call-count == emitted_tokens.len() in
-                        // both the partial-accept and full-accept (with
-                        // bonus) cases. Bumping here is equivalent to
-                        // "one closure call = one decode step worth of
-                        // base work."
-                        stage_timings.count_generation_step();
                         Ok((
                             argmax_bf16_logits(&logits_bytes),
                             outputs.final_hidden_bytes,
