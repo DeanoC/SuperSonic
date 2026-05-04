@@ -36,9 +36,9 @@ use crate::qwen36_moe_prompt::{
 };
 use crate::qwen36_moe_session::{prepare_decode_session, Qwen36DecodeSession};
 use crate::qwen36_moe_spec_verify::{
-    restore_and_replay_accepted_prefix, run_batched_spec_verify_inputs, run_single_lm_head_top1,
-    run_spec_chain_step, Qwen36BatchedSpecVerifyInputs, Qwen36SingleLmHeadTop1,
-    Qwen36SpecChainStep, Qwen36SpecReplayAccepted,
+    restore_and_replay_accepted_prefix, run_batched_spec_verify_inputs,
+    run_sequential_spec_verify_input, Qwen36BatchedSpecVerifyInputs,
+    Qwen36SequentialSpecVerifyInput, Qwen36SpecReplayAccepted,
 };
 use crate::qwen36_moe_speculative::{
     run_speculative_decode_step, run_speculative_decode_step_batched,
@@ -515,32 +515,24 @@ fn decode_text(
                     next_token,
                     loop_state.position,
                     dynamic_k,
-                    |pos, input| -> anyhow::Result<(u32, Vec<u8>)> {
-                        let outputs = run_spec_chain_step(Qwen36SpecChainStep {
+                    |position, input| -> anyhow::Result<(u32, Vec<u8>)> {
+                        run_sequential_spec_verify_input(Qwen36SequentialSpecVerifyInput {
                             ordinal,
                             geom: &geom,
                             store: &store,
                             weight_prefix,
                             layers: &mut layers,
                             persistent_scratch: persistent_scratch.as_mut(),
-                            stage_timings: &mut stage_timings,
-                            position: pos,
-                            input,
-                            emit_stage_timings,
-                        })?;
-
-                        let top1 = run_single_lm_head_top1(Qwen36SingleLmHeadTop1 {
-                            ordinal,
-                            geom: &geom,
                             final_norm_w: &final_norm_w_buf,
                             lm_head_w: &lm_head_w_buf,
                             final_hidden: &mut final_hidden_buf,
                             logits: &mut logits_buf,
                             counter: &mut counter_buf,
                             stage_timings: &mut stage_timings,
-                            final_hidden_bytes: &outputs.final_hidden_bytes,
-                        })?;
-                        Ok((top1, outputs.final_hidden_bytes))
+                            position,
+                            input,
+                            emit_stage_timings,
+                        })
                     },
                 )
                 .context("speculative decode step")?

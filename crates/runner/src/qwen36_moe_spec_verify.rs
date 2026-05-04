@@ -173,6 +173,54 @@ pub(crate) fn run_single_lm_head_top1(args: Qwen36SingleLmHeadTop1<'_>) -> Resul
     Ok(argmax_bf16_logits(&logits_bytes))
 }
 
+pub(crate) struct Qwen36SequentialSpecVerifyInput<'a> {
+    pub(crate) ordinal: usize,
+    pub(crate) geom: &'a MultiLayerGeom,
+    pub(crate) store: &'a BakedStore,
+    pub(crate) weight_prefix: &'a str,
+    pub(crate) layers: &'a mut [LayerBuffers],
+    pub(crate) persistent_scratch: Option<&'a mut PersistentScratch>,
+    pub(crate) final_norm_w: &'a GpuBuffer,
+    pub(crate) lm_head_w: &'a GpuBuffer,
+    pub(crate) final_hidden: &'a mut GpuBuffer,
+    pub(crate) logits: &'a mut GpuBuffer,
+    pub(crate) counter: &'a mut GpuBuffer,
+    pub(crate) stage_timings: &'a mut Qwen36StageTimingTotals,
+    pub(crate) position: i32,
+    pub(crate) input: u32,
+    pub(crate) emit_stage_timings: bool,
+}
+
+pub(crate) fn run_sequential_spec_verify_input(
+    args: Qwen36SequentialSpecVerifyInput<'_>,
+) -> Result<(u32, Vec<u8>)> {
+    let outputs = run_spec_chain_step(Qwen36SpecChainStep {
+        ordinal: args.ordinal,
+        geom: args.geom,
+        store: args.store,
+        weight_prefix: args.weight_prefix,
+        layers: args.layers,
+        persistent_scratch: args.persistent_scratch,
+        stage_timings: args.stage_timings,
+        position: args.position,
+        input: args.input,
+        emit_stage_timings: args.emit_stage_timings,
+    })?;
+
+    let top1 = run_single_lm_head_top1(Qwen36SingleLmHeadTop1 {
+        ordinal: args.ordinal,
+        geom: args.geom,
+        final_norm_w: args.final_norm_w,
+        lm_head_w: args.lm_head_w,
+        final_hidden: args.final_hidden,
+        logits: args.logits,
+        counter: args.counter,
+        stage_timings: args.stage_timings,
+        final_hidden_bytes: &outputs.final_hidden_bytes,
+    })?;
+    Ok((top1, outputs.final_hidden_bytes))
+}
+
 pub(crate) struct Qwen36BatchedLmHeadTop1<'a> {
     pub(crate) ordinal: usize,
     pub(crate) geom: &'a MultiLayerGeom,
