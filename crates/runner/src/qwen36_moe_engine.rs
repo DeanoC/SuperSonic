@@ -35,15 +35,7 @@ use crate::qwen36_moe_prompt::{
     prepare_prompt, print_prompt_summary, validate_speculative_sampling,
 };
 use crate::qwen36_moe_session::{prepare_decode_session, Qwen36DecodeSession};
-use crate::qwen36_moe_spec_verify::{
-    restore_and_replay_accepted_prefix, run_batched_spec_verify_inputs, run_single_lm_head_top1,
-    run_spec_chain_step, Qwen36BatchedSpecVerifyInputs, Qwen36SingleLmHeadTop1,
-    Qwen36SpecChainStep, Qwen36SpecReplayAccepted,
-};
-use crate::qwen36_moe_speculative::{
-    run_speculative_decode_step, run_speculative_decode_step_batched,
-};
-use crate::qwen36_moe_state::refresh_linear_attn_state;
+use crate::qwen36_moe_spec_verify::{run_speculative_extension, Qwen36SpeculativeExtension};
 use crate::qwen36_moe_telemetry::{print_and_write_moe_residency_summary, MoeRouteRuntime};
 use crate::qwen36_moe_timing::{Qwen36StageTimingTotals, SamplingParams};
 use crate::qwen36_moe_vmm::{
@@ -51,8 +43,6 @@ use crate::qwen36_moe_vmm::{
     print_virtual_kv_stats_if_active, should_use_qwen36_kv_vmm, virtual_kv_stats_for_layers,
 };
 use crate::registry::RegistryEntry;
-
-const QWEN36_NUM_SPECULATIVE_TOKENS: usize = 3;
 
 pub fn run(cli: &crate::Cli, entry: &RegistryEntry, total_vram: u64) -> Result<()> {
     ensure_qwen36_bake(cli, entry)?;
@@ -396,18 +386,6 @@ fn decode_text(
         }
         loop_state.current_token = next_token;
 
-        // Phase 6.3d: speculative extension. After the regular sample,
-        // try to commit additional tokens via MTP draft chain +
-        // sequential base verification. The closure wraps one base
-        // decode step (embed → chain → lm_head → host argmax). Honors
-        // `max_new` and EOS by truncating emitted tokens; the
-        // outer-loop counter advances normally because each iteration
-        // still runs at least one base step.
-        //
-        // Sequential verify gives no amortized speedup vs plain greedy
-        // (each accepted draft costs one base step to produce the next
-        // prediction). Phase 6.4's batched verification is what lifts
-        // tok/s. This wiring is the correctness foundation.
         if let (Some(mtp), Some(fwd_scratch), Some(chain_scratch), Some(embed_w)) = (
             mtp_buffers.as_mut(),
             mtp_forward_scratch.as_mut(),
@@ -417,134 +395,33 @@ fn decode_text(
             if loop_state.reached_max_new() {
                 break;
             }
-            // Cap K to the remaining max_new headroom so the verify
-            // loop never writes cache slots beyond what we'll
-            // actually commit to `generated_ids`. Spec emits up to
-            // K+1 tokens (K accepted + 1 corrected/bonus), so the
-            // available draft count is `headroom - 1`. If headroom <=
-            // 1 we can still emit 1 token via the K=0 fallback; if
-            // headroom == 0 we already broke out above.
-            let dynamic_k = loop_state.speculative_draft_count(QWEN36_NUM_SPECULATIVE_TOKENS);
+
             let h_base = outputs.final_hidden_bytes.clone();
-            // P2: thread spec-verify timings into the engine-level
-            // accumulators so `--emit-stage-timings` reports honest
-            // per-token costs under speculative decode. Without these
-            // captures, every base step inside the verify loop would
-            // be invisible to `gen_steps` / `t_chain` / `t_lm_head`,
-            // making the speculative path look ~K+1× faster than it
-            // really is on stage-timings dashboards.
-            //
-            // Phase 6.4c.2: route through the BATCHED driver when
-            // `--batched-spec-verify` is set. The batched closure runs
-            // K+1 chains sequentially (state mutates through them),
-            // accumulates K+1 final_hidden bytes, runs ONE batched
-            // lm_head over [K+1, hidden], does K+1 host argmaxes. On
-            // partial-accept the engine restores linear-attn state
-            // from the pre-spec snapshot then replays the accepted
-            // prefix sequentially to advance state correctly.
-            let result = if let Some(snapshot) = linear_attn_snapshot.as_mut() {
-                refresh_linear_attn_state(ordinal, &layers, snapshot)
-                    .context("refresh linear-attn snapshot before batched verify")?;
-
-                let r = run_speculative_decode_step_batched(
-                    ordinal,
-                    &geom,
-                    mtp,
-                    fwd_scratch,
-                    chain_scratch,
-                    embed_w,
-                    &lm_head_w_buf,
-                    &h_base,
-                    next_token,
-                    loop_state.position,
-                    dynamic_k,
-                    |inputs| -> anyhow::Result<Vec<(u32, Vec<u8>)>> {
-                        run_batched_spec_verify_inputs(Qwen36BatchedSpecVerifyInputs {
-                            ordinal,
-                            geom: &geom,
-                            store: &store,
-                            weight_prefix,
-                            layers: &mut layers,
-                            persistent_scratch: persistent_scratch.as_mut(),
-                            final_norm_w: &final_norm_w_buf,
-                            lm_head_w: &lm_head_w_buf,
-                            stage_timings: &mut stage_timings,
-                            inputs,
-                            emit_stage_timings,
-                        })
-                    },
-                )
-                .context("batched speculative decode step")?;
-
-                // State mgmt: on partial-accept, restore + replay the
-                // accepted prefix to advance linear-attn state correctly.
-                // Full-accept (n_accepted == dynamic_k) needs no fixup —
-                // K+1 chains advanced state through K+1 inputs which is
-                // exactly what we committed (drafts + bonus's input was
-                // drafts[K-1], one more chain's worth advances naturally
-                // when next iter feeds the bonus token).
-                if r.n_accepted < dynamic_k {
-                    // Replay (j+1) chains: first_token at the current
-                    // position, then the j accepted drafts at the
-                    // following positions.
-                    let replay = loop_state.speculative_replay_inputs(next_token, &r);
-                    restore_and_replay_accepted_prefix(Qwen36SpecReplayAccepted {
-                        ordinal,
-                        geom: &geom,
-                        store: &store,
-                        weight_prefix,
-                        layers: &mut layers,
-                        snapshot,
-                        persistent_scratch: persistent_scratch.as_mut(),
-                        stage_timings: &mut stage_timings,
-                        replay_inputs: &replay,
-                        emit_stage_timings,
-                    })?;
-                }
-                r
-            } else {
-                run_speculative_decode_step(
-                    ordinal,
-                    &geom,
-                    mtp,
-                    fwd_scratch,
-                    chain_scratch,
-                    embed_w,
-                    &lm_head_w_buf,
-                    &h_base,
-                    next_token,
-                    loop_state.position,
-                    dynamic_k,
-                    |pos, input| -> anyhow::Result<(u32, Vec<u8>)> {
-                        let outputs = run_spec_chain_step(Qwen36SpecChainStep {
-                            ordinal,
-                            geom: &geom,
-                            store: &store,
-                            weight_prefix,
-                            layers: &mut layers,
-                            persistent_scratch: persistent_scratch.as_mut(),
-                            stage_timings: &mut stage_timings,
-                            position: pos,
-                            input,
-                            emit_stage_timings,
-                        })?;
-
-                        let top1 = run_single_lm_head_top1(Qwen36SingleLmHeadTop1 {
-                            ordinal,
-                            geom: &geom,
-                            final_norm_w: &final_norm_w_buf,
-                            lm_head_w: &lm_head_w_buf,
-                            final_hidden: &mut final_hidden_buf,
-                            logits: &mut logits_buf,
-                            counter: &mut counter_buf,
-                            stage_timings: &mut stage_timings,
-                            final_hidden_bytes: &outputs.final_hidden_bytes,
-                        })?;
-                        Ok((top1, outputs.final_hidden_bytes))
-                    },
-                )
-                .context("speculative decode step")?
-            };
+            // Runs either batched or sequential speculative verify depending on
+            // whether session setup allocated a linear-attn snapshot.
+            let result = run_speculative_extension(Qwen36SpeculativeExtension {
+                ordinal,
+                geom: &geom,
+                store: &store,
+                weight_prefix,
+                layers: &mut layers,
+                persistent_scratch: persistent_scratch.as_mut(),
+                mtp,
+                forward_scratch: fwd_scratch,
+                chain_scratch,
+                embed_w,
+                final_norm_w: &final_norm_w_buf,
+                lm_head_w: &lm_head_w_buf,
+                final_hidden: &mut final_hidden_buf,
+                logits: &mut logits_buf,
+                counter: &mut counter_buf,
+                linear_attn_snapshot: linear_attn_snapshot.as_mut(),
+                loop_state: &loop_state,
+                h_base_in: &h_base,
+                first_token: next_token,
+                stage_timings: &mut stage_timings,
+                emit_stage_timings,
+            })?;
 
             if loop_state.append_speculative_emissions(&result, tokenizer.as_ref(), eos_id) {
                 break;
