@@ -45,6 +45,33 @@ The final 8192 candidate row:
 prefill_ms=313238.480 total_ms=56.389 tok/s=17.734 generated_ids=[271,248068,271,248069]
 ```
 
+## Median Gate
+
+After committing the code as `cfb1b26`, a clean 3-run 8192 gate compared the
+original base commit `d3a86a1` against candidate commit `cfb1b26`. All runs used
+the same model directory, benchmark harness, `int4-vmm`, `--max-new-tokens 4`,
+`--no-warmup`, and generated IDs `[271,248068,271,248069]`.
+
+| Build | prefill s runs | median prefill s | ms/tok runs | median ms/tok | median wall s |
+|:---|:---|---:|:---|---:|---:|
+| baseline `d3a86a1` | 578.02, 575.57, 575.78 | 575.78 | 126.26, 125.04, 124.99 | 125.04 | 579.16 |
+| candidate `cfb1b26` | 314.00, 313.61, 313.81 | 313.81 | 56.40, 56.50, 56.42 | 56.42 | 316.90 |
+
+Median deltas:
+
+| Metric | Delta |
+|:---|---:|
+| prefill seconds | -45.5% |
+| ms/token | -54.9% |
+| wall seconds | -45.3% |
+
+Artifacts:
+
+```text
+/home/deano/projects/SuperSonicBase-qwen36-longctx-baseline-gate/target/longctx_gate/baseline_8192_run{1,2,3}.json
+/home/deano/projects/SuperSonicBase-qwen36-longctx-perf/target/longctx_gate/candidate_8192_run{1,2,3}.json
+```
+
 The 512 row remains effectively unchanged. Depending on the exact allocated
 `kv_max_t`, it either stays on the online path throughout or only reaches the
 tiled path for the tail end of the 418-token measured prompt.
@@ -113,8 +140,7 @@ asserts the deterministic generated IDs for that prompt.
 
 ## Interpretation
 
-The tiled partial path produces a decisive single-run 8192 improvement relative
-to the prior report and to the online-only candidate. It should still get a clean
-baseline/candidate median gate before being claimed as a final benchmark number,
-but the delta is far beyond the plus/minus 10-15% within-session noise band that
-the prior hipfire comparison warned about.
+The tiled partial path produces a decisive 8192 improvement relative to the
+prior report and to the online-only candidate. The 3-run median gate confirms
+the delta is far beyond the plus/minus 10-15% within-session noise band that the
+prior hipfire comparison warned about.
