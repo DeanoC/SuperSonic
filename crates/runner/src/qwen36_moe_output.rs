@@ -2,6 +2,7 @@ use std::io::Write as _;
 
 use anyhow::{Context, Result};
 
+use crate::qwen36_moe_logits::bf16_bytes_to_f32;
 use crate::qwen36_moe_timing::SamplingParams;
 
 pub(crate) fn print_decode_stream_start(
@@ -76,7 +77,7 @@ pub(crate) fn print_last_logits_if_requested(dump_last_logits: bool, last_logits
         return;
     }
 
-    let logits_f32 = crate::qwen36_moe_decode::bf16_bytes_to_f32(last_logits_bytes);
+    let logits_f32 = bf16_bytes_to_f32(last_logits_bytes);
     // Lead with `\n` so the marker lands at the start of its own line: the
     // streamed-token path uses `print!` without a trailing newline.
     print!("\nLAST_LOGITS: ");

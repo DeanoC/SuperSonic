@@ -1,18 +1,14 @@
-//! Qwen3.6-MoE self-speculative decoding — Phase 6.3 building blocks.
+//! Qwen3.6-MoE self-speculative decoding.
 //!
 //! This module hosts the orchestration layer that ties the MTP draft
 //! chain (`crate::qwen36_moe_mtp`) to the base-model verifier.
 //!
-//! Phase 6.3b shipped the pure-logic accept-prefix helpers
-//! ([`accept_prefix_greedy`], [`accept_prefix_greedy_partial`]).
-//! Phase 6.3c (this module after the next round) adds
-//! [`run_speculative_decode_step`], which orchestrates one full
-//! speculative iteration: MTP draft chain → sequential base
-//! verification with early termination → accept-prefix → emitted
-//! tokens. The base stepper is injected as a callback so the
-//! orchestration is testable with a mock that doesn't need the
-//! full Qwen3.6-MoE model loaded; engine wiring under
-//! `--speculative-decode` is Phase 6.3d.
+//! [`run_speculative_decode_step`] orchestrates a sequential verify pass:
+//! MTP draft chain -> base verification with early termination ->
+//! accept-prefix -> emitted tokens. [`run_speculative_decode_step_batched`]
+//! uses the same protocol but asks the injected verifier to process the K+1
+//! base inputs as one batch. The base stepper is injected as a callback so
+//! the orchestration is testable without a full Qwen3.6-MoE model loaded.
 //!
 //! ## Performance note
 //!
@@ -21,10 +17,10 @@
 //! (to produce the next prediction), and rejected drafts incur a
 //! base step too (for the rejection check). Total base steps per
 //! emitted token stays at 1.0 on average. The actual throughput
-//! win comes from Phase 6.4's batched verification kernel, which
-//! runs all K verify steps in a single base call (multi-query
-//! attention). Phase 6.3 builds the protocol and validates
-//! correctness; Phase 6.4 makes it fast.
+//! win comes from the batched verification path, which runs all K+1 verify
+//! inputs through one verifier call and batches the lm-head work. On prompts
+//! with low accept rates, speculative decode can still narrow or invert the
+//! speedup because rejected drafts pay extra draft-chain work.
 //!
 //! Speculative decoding (greedy) at a glance:
 //!

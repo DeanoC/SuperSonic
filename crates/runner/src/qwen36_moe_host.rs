@@ -2,8 +2,9 @@ use anyhow::{anyhow, Context, Result};
 use model_store::BakedStore;
 use qwen36_moe::config::TextConfig;
 
-use crate::qwen36_moe_decode::{dequant_int4_to_bf16_bytes, MultiLayerGeom};
+use crate::qwen36_moe_decode::MultiLayerGeom;
 use crate::qwen36_moe_layers::QWEN36_MOE_INT4_GROUP_SIZE;
+use crate::qwen36_moe_logits::dequant_int4_to_bf16_bytes;
 
 const MIB: f64 = (1024 * 1024) as f64;
 

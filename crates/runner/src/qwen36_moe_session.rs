@@ -42,13 +42,14 @@ pub(crate) fn prepare_decode_session(
             .context("load MTP head from bake")?
         {
             Some(mtp) => {
+                let verify_mode = if batched_spec_verify {
+                    "batched verify"
+                } else {
+                    "sequential verify"
+                };
                 println!(
                     "  MTP head: loaded 19 mtp.* tensors (~1.6 GiB BF16) — \
-                     speculative draft + sequential-verify path active. \
-                     NOTE: sequential verification has zero amortized speedup \
-                     over plain greedy decode (Phase 6.4's batched verify \
-                     kernel is what delivers throughput); this path is the \
-                     correctness foundation."
+                     speculative draft + {verify_mode} path active."
                 );
                 Some(mtp)
             }

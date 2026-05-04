@@ -31,10 +31,10 @@
 use base64::Engine;
 use gpu_hal::{is_backend_compiled, set_backend, Backend, GpuBuffer, ScalarType};
 use runner::qwen36_moe_decode::{
-    bf16_bytes_to_f32, host_final_norm_lm_head, is_full_attn_layer, run_chained_decode,
-    AttnLayerBuffers, FfnInt4Sidecars, FfnLayerBuffers, FullAttnInt4Sidecars, LayerBuffers,
-    LinearAttnInt4Sidecars, MultiLayerGeom, ResidentWeight,
+    is_full_attn_layer, run_chained_decode, AttnLayerBuffers, FfnInt4Sidecars, FfnLayerBuffers,
+    FullAttnInt4Sidecars, LayerBuffers, LinearAttnInt4Sidecars, MultiLayerGeom, ResidentWeight,
 };
+use runner::qwen36_moe_logits::{bf16_bytes_to_f32, host_final_norm_lm_head};
 use runner::qwen36_moe_persistent_decode::PersistentScratch;
 use runner::qwen36_moe_state::{restore_linear_attn_state, save_linear_attn_state};
 use serde_json::Value;

@@ -154,8 +154,8 @@ pub fn run_qwen36_moe_dry_run(
     let mut dtype_mismatches = Vec::new();
     let mut loader_warning = None;
     if !no_bake_only_safetensors(model_dir, no_bake) {
-        // No safetensors expected — bake-only path. PR 3 doesn't yet open
-        // the baked store; revisit once PR 6 lands the INT4 reader.
+        // Bake-only dry-run path. Today the detailed tensor/dtype audit still
+        // uses safetensors; bake inspection below covers on-disk package size.
     } else if !has_safetensors(model_dir) {
         // Safetensors missing AND no bake support yet — caller probably
         // needs to download. Surface a helpful note rather than failing,
@@ -382,8 +382,9 @@ fn inspect_bake_vmm_probe(
 }
 
 fn no_bake_only_safetensors(_model_dir: &Path, no_bake: bool) -> bool {
-    // PR 3 only supports safetensors. Future PRs will route to the baked
-    // store when `no_bake` is false and a bake is on disk.
+    // The detailed dry-run tensor audit currently reads safetensors even when
+    // decode itself would use a bake. Keep this helper as the future switch
+    // point for a bake-manifest-backed audit.
     let _ = no_bake;
     true
 }

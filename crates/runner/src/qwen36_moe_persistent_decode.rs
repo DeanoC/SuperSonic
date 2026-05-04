@@ -47,10 +47,11 @@ pub struct LmHeadFold<'a> {
 }
 
 use crate::qwen36_moe_decode::{
-    bf16_bytes_to_f32, ffn_workspace_floats, full_attn_workspace_floats,
-    linear_attn_workspace_floats, AttnLayerBuffers, DecodeOutputs, ExpertPrefetchPhase,
-    ExpertRoute, LayerBuffers, MultiLayerGeom,
+    ffn_workspace_floats, full_attn_workspace_floats, linear_attn_workspace_floats,
+    AttnLayerBuffers, DecodeOutputs, ExpertPrefetchPhase, ExpertRoute, LayerBuffers,
+    MultiLayerGeom,
 };
+use crate::qwen36_moe_logits::bf16_bytes_to_f32;
 
 /// Pre-allocated scratch + cached descriptor arrays for the persistent
 /// decode megakernel. Built once before the decode loop; reused for every

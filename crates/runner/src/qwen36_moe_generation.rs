@@ -4,8 +4,9 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use gpu_hal::GpuBuffer;
 
-use crate::qwen36_moe_decode::{sample_bf16_logits, DecodeOutputs, MultiLayerGeom, XorshiftRng};
+use crate::qwen36_moe_decode::{DecodeOutputs, MultiLayerGeom};
 use crate::qwen36_moe_lm_head::{launch_lm_head_from_final_hidden_bytes, LmHeadBuffers};
+use crate::qwen36_moe_logits::{sample_bf16_logits, XorshiftRng};
 use crate::qwen36_moe_loop::Qwen36DecodeLoopState;
 use crate::qwen36_moe_output::{
     dump_final_hidden_if_requested, dump_logits_if_requested, print_decoded_token,

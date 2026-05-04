@@ -1,14 +1,10 @@
 //! Qwen3.6-MoE runtime engine.
 //!
-//! PR 3 stage: dry-run only. Loads `config.json`, enumerates the safetensors
-//! checkpoint, computes the analytic weight + state footprint, and reports
-//! it against the registry's VRAM budget. No GPU allocation, no kernel —
-//! that lands in PR 4 (CUDA) and PR 6 (HIP).
-//!
-//! The reason for the enumerate-only dry-run is the BF16 35B-A3B checkpoint
-//! is ~65 GiB and won't fit a 24 GiB GPU. Until the INT4/q4km bake exists,
-//! the only meaningful runtime check is "did the safetensors index match
-//! what we expect from the config" plus a budget comparison.
+//! Owns the CLI-facing Qwen3.6-MoE flow: bake selection, dry-run/budget
+//! reporting, prompt setup, layer loading, session allocation, prefill,
+//! generation, optional speculative extension, and final telemetry. The
+//! GPU launch details live in the lower-level chain, persistent-decode,
+//! generation, and spec-verify modules.
 
 use std::path::Path;
 
@@ -18,11 +14,11 @@ use model_store::BakedStore;
 
 use crate::qwen36_moe_bake::{ensure_qwen36_bake, select_decode_bake};
 use crate::qwen36_moe_chain::{run_chain_step, Qwen36ChainStep};
-use crate::qwen36_moe_decode::XorshiftRng;
 use crate::qwen36_moe_dry_run::{print_report, run_qwen36_moe_dry_run, DryRunReport};
 use crate::qwen36_moe_generation::{run_generation_step, Qwen36GenerationStep};
 use crate::qwen36_moe_geom::build_multi_layer_geom;
 use crate::qwen36_moe_host::lookup_embed_row;
+use crate::qwen36_moe_logits::XorshiftRng;
 use crate::qwen36_moe_loop::Qwen36DecodeLoopState;
 use crate::qwen36_moe_output::{
     print_decode_stream_start, print_generation_summary, print_last_logits_if_requested,
@@ -68,26 +64,8 @@ pub fn run(cli: &crate::Cli, entry: &RegistryEntry, total_vram: u64) -> Result<(
 
     validate_decode_backend(entry)?;
 
-    // Real decode path (PR 4c step 2). Uses the host-orchestrated chained
-    // launches in `crate::qwen36_moe_decode::run_chained_decode` against
-    // per-layer weight buffers loaded from the baked package. INT4 GPTQ
-    // is the realistic path on 24 GiB VRAM; the BF16 fallback is wired
-    // for completeness but won't fit the 65 GiB 35B model. The multi-layer
-    // parity test in `crates/runner/tests/qwen36_moe_multilayer_parity.rs`
-    // gates the decode core against the Python multi-layer oracle for both
-    // BF16 (cos_sim 0.9999) and INT4 (cos_sim 0.9999) modes.
-    //
-    // Caveats for PR 4c step 2:
-    //  - One token, fresh state. Conv + recurrent state start zeroed; the
-    //    full-attn KV cache isn't allocated (single-block kernels run with
-    //    `kv_len=1`). Multi-token generation needs prefill + state
-    //    persistence which land later.
-    //  - lm_head INT4 dequant runs host-side (~1 GiB BF16 buffer); the
-    //    lm_head GEMV likewise. Lifting both to the GPU is PR 4d.
-    //  - Tokenizer not wired — the produced token is printed as a raw vocab
-    //    id so the "doesn't bail" criterion is verifiable end-to-end.
     println!();
-    println!("=== Decode (PR 4c step 2: host-orchestrated chained launches) ===");
+    println!("=== Decode (Qwen3.6-MoE) ===");
     let sampling = SamplingParams {
         temperature: cli.temperature,
         top_k: cli.top_k,
@@ -119,19 +97,21 @@ pub fn run(cli: &crate::Cli, entry: &RegistryEntry, total_vram: u64) -> Result<(
 
 /// Tokenize the prompt and run the multi-token decode loop end-to-end:
 /// prefill the prompt one token at a time, then generate `max_new`
-/// tokens via greedy argmax against the (cached) host-side lm_head
-/// GEMV. Streams decoded text to stdout as each token arrives.
+/// tokens via the configured sampling policy. Streams decoded text to stdout
+/// as each token arrives.
 ///
 /// State persistence across decode steps:
 ///  - Linear-attn `conv_state` + `recurrent_state` mutated in place by
 ///    the kernel.
-///  - Full-attn KV cache (PR 4d): per-layer `[kv_max_t, Hkv*d]` BF16
-///    buffers; the kernel writes the current step's K/V at slot
-///    `position` and attends over `kv_len = position + 1` past tokens.
-///    `kv_max_t` sized for `prompt_len + max_new` here.
-///
-/// Greedy decoding only — sampling (temperature/top-p) and GPU-side
-/// lm_head GEMV (currently host F32) are next perf/quality steps.
+///  - Full-attn KV cache: per-layer `[kv_max_t, Hkv*d]` buffers; the kernel
+///    writes the current step's K/V at slot `position` and attends over
+///    `kv_len = position + 1` past tokens. `kv_max_t` is sized for
+///    `prompt_len + max_new` here.
+///  - Persistent decode is the default path. The host-orchestrated chained
+///    path remains available behind `--no-persistent-decode` for parity and
+///    regression isolation.
+///  - When self-speculative decode is enabled, each generation iteration can
+///    append extra accepted MTP drafts after the regular base-model sample.
 fn decode_text(
     model_dir: &Path,
     report: &DryRunReport,
