@@ -22,6 +22,7 @@ mod qwen35_runtime;
 mod qwen35_trace;
 mod qwen35_trace_utils;
 mod qwen35_validation;
+mod qwen35_virtual_kv;
 mod qwen35_vram;
 #[path = "qwen36_moe/mod.rs"]
 mod qwen36_moe_cli;
