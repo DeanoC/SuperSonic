@@ -42,6 +42,33 @@ use crate::qwen36_moe_telemetry::{print_and_write_moe_residency_summary, MoeRout
 use crate::registry::RegistryEntry;
 
 pub fn run(cli: &crate::Cli, entry: &RegistryEntry, total_vram: u64) -> Result<()> {
+    run_inner(cli, entry, total_vram, None)
+}
+
+/// SpecPrefill sparse-prefill variant. `keep_mask[i] == true` means the
+/// drafter selected prompt token `i` to be included in the target's
+/// prefill; pruned positions are skipped entirely. The mask must be the
+/// same length as the tokenized prompt (validated downstream); the
+/// drafter side guarantees the last prompt token is kept (its logits
+/// produce the first generation token). Inside the prefill loop, kept
+/// tokens use their original prompt position for RoPE rotation but land
+/// in compact KV-cache slots via `Qwen36MoeAttnStepParams::cache_pos`,
+/// the same kernel-side split MTP already uses for draft-step rotation.
+pub fn run_with_sparse_prefill(
+    cli: &crate::Cli,
+    entry: &RegistryEntry,
+    total_vram: u64,
+    keep_mask: Vec<bool>,
+) -> Result<()> {
+    run_inner(cli, entry, total_vram, Some(keep_mask))
+}
+
+fn run_inner(
+    cli: &crate::Cli,
+    entry: &RegistryEntry,
+    total_vram: u64,
+    keep_mask: Option<Vec<bool>>,
+) -> Result<()> {
     ensure_qwen36_bake(cli, entry)?;
 
     let (context_size, context_size_source) = resolve_context_size(cli);
@@ -92,6 +119,7 @@ pub fn run(cli: &crate::Cli, entry: &RegistryEntry, total_vram: u64) -> Result<(
         !cli.no_persistent_decode,
         cli.kv_fp8,
         cli.dump_last_logits,
+        keep_mask,
     )?;
     Ok(())
 }
@@ -128,8 +156,20 @@ fn decode_text(
     persistent_decode: bool,
     kv_fp8: bool,
     dump_last_logits: bool,
+    keep_mask: Option<Vec<bool>>,
 ) -> Result<()> {
     validate_speculative_sampling(speculative_decode, sampling)?;
+
+    if keep_mask.is_some() && speculative_decode {
+        anyhow::bail!(
+            "SpecPrefill (sparse prefill via --specprefill-draft-dir) cannot be \
+             combined with --speculative-decode (MTP self-speculative). MTP uses \
+             the persistent decode kernel, which takes only `position` (no \
+             `cache_pos` decoupling), so it would write at wrong KV slots when \
+             the prompt has been pruned. R1 follow-up: plumb cache_pos through \
+             MTP too."
+        );
+    }
 
     let decode_wall_start = std::time::Instant::now();
     let weight_prefix = report.kernel_params.weight_prefix;
@@ -238,7 +278,60 @@ fn decode_text(
 
     print_decode_stream_start(tokenizer.as_ref(), &prompt_ids, max_new);
 
+    // Sparse-prefill setup. `kept_positions[i]` holds the original prompt
+    // position of the i-th kept token; the prefill loop iterates over
+    // these positions instead of every prompt token. In the dense case
+    // (keep_mask=None) it's just `0..prompt_ids.len()` and the loop is
+    // bit-equal to before. The drafter side (run_specprefill_qwen36_moe)
+    // guarantees `keep_mask.last() == true` and `keep_mask.len() ==
+    // prompt_ids.len()`; we re-validate as a defence against future
+    // mis-wiring.
+    let kept_positions: Vec<usize> = match &keep_mask {
+        Some(mask) => {
+            if mask.len() != prompt_ids.len() {
+                anyhow::bail!(
+                    "sparse-prefill: keep_mask.len()={} != prompt_ids.len()={}",
+                    mask.len(),
+                    prompt_ids.len(),
+                );
+            }
+            let kept: Vec<usize> = mask
+                .iter()
+                .enumerate()
+                .filter_map(|(i, &k)| k.then_some(i))
+                .collect();
+            if kept.is_empty() {
+                anyhow::bail!("sparse-prefill: keep_mask kept zero positions");
+            }
+            if *kept.last().unwrap() != prompt_ids.len() - 1 {
+                anyhow::bail!(
+                    "sparse-prefill: last prompt position must be kept (got last kept={})",
+                    kept.last().unwrap()
+                );
+            }
+            kept
+        }
+        None => (0..prompt_ids.len()).collect(),
+    };
+    let effective_prompt_len = kept_positions.len();
+    if keep_mask.is_some() {
+        eprintln!(
+            "[specprefill] sparse prefill: {}/{} prompt tokens kept",
+            effective_prompt_len,
+            prompt_ids.len(),
+        );
+    }
+
+    // `Qwen36DecodeLoopState::new` assumes dense (every position kept).
+    // For sparse, override the initial token to be the first *kept*
+    // prompt token and shrink `total_steps` to `effective_prompt_len +
+    // max_new - 1`. `position` (the loop's compact KV-slot counter) and
+    // `current_token` advance per chain-step iteration.
     let mut loop_state = Qwen36DecodeLoopState::new(&prompt_ids, max_new);
+    if keep_mask.is_some() {
+        loop_state.current_token = prompt_ids[kept_positions[0]];
+        loop_state.total_steps = effective_prompt_len + max_new - 1;
+    }
     let mut rng = XorshiftRng::new(sampling.seed);
     print_sampling_summary(sampling);
 
@@ -274,10 +367,28 @@ fn decode_text(
         if loop_state.reached_max_new() {
             break;
         }
-        let is_gen_step = step + 1 >= prompt_ids.len();
+        let is_gen_step = step + 1 >= effective_prompt_len;
         if is_gen_step && generation_wall_start.is_none() {
             generation_wall_start = Some(std::time::Instant::now());
         }
+        // Per-step (rope_pos, cache_pos) for the chain step. In dense
+        // mode they equal `loop_state.position`. In sparse mode rope_pos
+        // is the original prompt position of the kept token (during
+        // prefill) or `prompt_ids.len() + gen_offset` (during gen);
+        // cache_pos is always `loop_state.position` (the compact slot
+        // index that advances by 1 per processed step).
+        let (rope_pos, chain_cache_pos): (i32, Option<i32>) = match &keep_mask {
+            None => (loop_state.position, None),
+            Some(_) => {
+                let rp = if step < effective_prompt_len {
+                    kept_positions[step] as i32
+                } else {
+                    let gen_off = step - effective_prompt_len;
+                    (prompt_ids.len() + gen_off) as i32
+                };
+                (rp, Some(loop_state.position))
+            }
+        };
         // Embed lookup for the current token.
         let t0 = std::time::Instant::now();
         let initial_hidden = lookup_embed_row(
@@ -335,7 +446,8 @@ fn decode_text(
             moe_runtime: &mut moe_runtime,
             moe_routes: &mut moe_routes,
             initial_hidden: &initial_hidden,
-            position: loop_state.position,
+            position: rope_pos,
+            cache_pos: chain_cache_pos,
             step,
             is_gen_step,
             emit_stage_timings,
@@ -352,11 +464,14 @@ fn decode_text(
         // needed when old sidecar slots roll over.
 
         // Prefill steps: feed the next prompt token without computing logits.
-        if step + 1 < prompt_ids.len() {
+        // For sparse-prefill, the next "prompt token" is the next *kept*
+        // prompt token (`kept_positions[step + 1]` indexes into the
+        // original prompt).
+        if step + 1 < effective_prompt_len {
             prefill_steps += 1;
             prefill_embed_elapsed += t_embed_step;
             prefill_chain_elapsed += t_chain_step;
-            loop_state.current_token = prompt_ids[step + 1];
+            loop_state.current_token = prompt_ids[kept_positions[step + 1]];
             continue;
         }
 

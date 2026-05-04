@@ -13,7 +13,7 @@ use gpu_hal::ScalarType;
 use qwen35::weights::Qwen35Weights;
 
 use crate::decode_engine::DecodeEngine;
-use crate::registry::{FamilyParams, ModelVariant, RegistryEntry};
+use crate::registry::{self, FamilyParams, ModelVariant, RegistryEntry};
 use crate::specprefill::{select_kept_positions, SelectionConfig};
 use crate::Cli;
 
@@ -165,6 +165,202 @@ fn score_blocks_cosine(
     Ok(importance)
 }
 
+/// Cross-family SpecPrefill orchestrator: Qwen3.5-0.8B drafter scoring
+/// against a Qwen3.6-MoE target. The drafter is loaded, runs cosine
+/// scoring on the prompt, and is dropped before the MoE target loads —
+/// 24 GiB on gfx1100 cannot fit drafter + 35B-A3B target + KV
+/// concurrently. The keep-mask handed to `qwen36_moe::run_with_sparse_prefill`
+/// is what the MoE engine's prefill loop will follow when the
+/// loop-side sparse stepping is wired (R1 Step 3).
+fn run_specprefill_qwen36_moe(
+    cli: &Cli,
+    entry: &RegistryEntry,
+    ordinal: usize,
+    _total_vram: u64,
+    draft_dir: &std::path::Path,
+) -> Result<()> {
+    // Drafter kernel params: Qwen3.5-0.8B is in the Qwen35 family, so
+    // we look it up directly rather than try to reuse the Qwen36Moe
+    // target's params (which are Qwen36MoeKernelParams, a different
+    // shape). Backend + arch match the target's so the right HIP
+    // build is selected.
+    let drafter_entry =
+        registry::lookup(&ModelVariant::Qwen3_5_0_8B, &entry.backend, &entry.arch)
+            .ok_or_else(|| {
+                anyhow!(
+                    "specprefill cross-family: no Qwen3.5-0.8B drafter entry registered \
+                     for backend={:?} arch={:?}",
+                    entry.backend,
+                    entry.arch,
+                )
+            })?;
+    let drafter_params = match &drafter_entry.params {
+        FamilyParams::Qwen35(p) => *p,
+        _ => unreachable!("Qwen3.5-0.8B drafter not in Qwen35 family"),
+    };
+
+    // Tokenize prompt with target's tokenizer. Vocab parity between
+    // Qwen3.5 and Qwen3.6 (vocab_size=248320) is what makes cross-family
+    // drafting work without a tokenizer bridge.
+    //
+    // `add_special_tokens = true` mirrors `qwen36_moe_cli::prompt::prepare_prompt`
+    // which hard-codes `tok.encode(prompt, true)`. The Qwen3.6-MoE engine
+    // re-tokenizes the prompt downstream when it loads the model, so the
+    // scorer-side tokenization MUST match the engine-side tokenization or
+    // the keep-mask we hand off would be aligned with a different token
+    // sequence than the engine processes — the keep-mask length / last-token
+    // checks in `decode_text` would then trip even on a valid prompt. We
+    // intentionally ignore `cli.prompt_no_special_tokens` here for the same
+    // reason; the MoE engine ignores it too.
+    let tokenizer_path = cli.model_dir.join("tokenizer.json");
+    let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
+        .map_err(|e| anyhow!("load tokenizer: {e}"))?;
+    let encoding = tokenizer
+        .encode(cli.prompt.as_str(), true)
+        .map_err(|e| anyhow!("tokenize prompt: {e}"))?;
+    let prompt_ids: Vec<u32> = encoding.get_ids().to_vec();
+    if prompt_ids.is_empty() {
+        bail!("specprefill: empty prompt");
+    }
+    eprintln!(
+        "[specprefill] cross-family: prompt_tokens={} (Qwen3.5-0.8B drafter → {} target)",
+        prompt_ids.len(),
+        entry.model,
+    );
+
+    let cfg = SelectionConfig {
+        keep_ratio: cli.specprefill_keep_ratio.unwrap_or(0.50),
+        chunk_size: cli.specprefill_chunk_size.unwrap_or(32),
+        pool_window: cli.specprefill_pool_window.unwrap_or(5),
+        always_keep_prefix: cli.specprefill_always_keep_prefix.unwrap_or(4),
+        always_keep_suffix: cli.specprefill_always_keep_suffix.unwrap_or(4),
+    };
+
+    gpu_hal::set_device(ordinal).map_err(|e| anyhow!("set_device: {e}"))?;
+
+    // Drafter setup, scoring, and selection — scoped so the drafter
+    // weights and decode engine are dropped before we hand off to the
+    // MoE engine. On 24 GiB the MoE target won't load if the drafter
+    // is still resident.
+    let kept_positions: Vec<u32> = {
+        let draft_text_config = qwen35::config::load_config(draft_dir)
+            .map_err(|e| anyhow!("load draft config: {e}"))?
+            .text_config;
+
+        // Validate the drafter is actually Qwen3.5-0.8B before applying
+        // 0.8B-tuned kernel sizing (`drafter_params.proj_buf_floats`,
+        // `attn_scratch_floats`). Qwen3.5-0.8B is the only same-family
+        // drafter that fits on 24 GiB alongside Qwen3.6-MoE INT4 + KV;
+        // a larger drafter (4B/9B) pointed at by `--specprefill-draft-dir`
+        // would still load but be undersized for its scratch and projection
+        // buffers, leading to opaque kernel launch / memory errors deep
+        // inside the chained-decode dispatch. Fail-fast here with a clear
+        // error.
+        const QWEN35_0_8B_HIDDEN: usize = 1024;
+        const QWEN35_0_8B_LAYERS: usize = 24;
+        if draft_text_config.hidden_size != QWEN35_0_8B_HIDDEN
+            || draft_text_config.num_hidden_layers != QWEN35_0_8B_LAYERS
+        {
+            bail!(
+                "specprefill cross-family: --specprefill-draft-dir must point at \
+                 Qwen3.5-0.8B (hidden_size={}, num_hidden_layers={}). Got \
+                 hidden_size={}, num_hidden_layers={} from {}. Larger Qwen3.5 \
+                 variants don't fit on 24 GiB alongside the Qwen3.6-MoE target \
+                 and would receive undersized 0.8B-tuned kernel scratch buffers.",
+                QWEN35_0_8B_HIDDEN,
+                QWEN35_0_8B_LAYERS,
+                draft_text_config.hidden_size,
+                draft_text_config.num_hidden_layers,
+                draft_dir.display(),
+            );
+        }
+
+        let t0 = Instant::now();
+        let draft_weights = Qwen35Weights::load(
+            draft_dir,
+            &draft_text_config,
+            ordinal,
+            drafter_params.weight_prefix,
+        )
+        .map_err(|e| anyhow!("load draft weights: {e}"))?;
+        eprintln!(
+            "[specprefill] draft weights loaded in {:.0}ms",
+            t0.elapsed().as_millis()
+        );
+
+        let lookahead_count = cli.specprefill_lookahead.unwrap_or(4) + 1;
+        let draft_attn_scratch = qwen35::scratch::required_attn_scratch_floats(
+            draft_text_config.num_attention_heads,
+            draft_text_config.head_dim,
+            prompt_ids.len() + lookahead_count,
+            drafter_params.kv_chunk_size,
+        );
+        let mut draft_engine = DecodeEngine::new(
+            draft_weights,
+            ordinal,
+            drafter_params.proj_buf_floats,
+            draft_attn_scratch.max(drafter_params.attn_scratch_floats),
+            drafter_params.kv_chunk_size,
+            drafter_params.use_4b_kernel,
+            cli.prefill_chunk_size,
+            false, // kv_fp8 — drafter doesn't carry FP8 KV
+            1,     // batch_size
+        )?;
+        draft_engine.set_decode_context_limit(prompt_ids.len() + lookahead_count);
+
+        let block_size_for_scoring = cli.specprefill_chunk_size.unwrap_or(32);
+        let speculator_start = Instant::now();
+        let importance: Vec<f32> = match cli.specprefill_algorithm.as_str() {
+            "cosine" => {
+                let imp = score_blocks_cosine(
+                    &mut draft_engine,
+                    &prompt_ids,
+                    block_size_for_scoring,
+                )?;
+                eprintln!(
+                    "[specprefill] speculator (cosine) done in {:.0}ms (block_size={})",
+                    speculator_start.elapsed().as_millis(),
+                    block_size_for_scoring,
+                );
+                imp
+            }
+            other => bail!(
+                "specprefill cross-family on Qwen3.6-MoE supports only \
+                 --specprefill-algorithm=cosine (got {other:?}). The lookahead \
+                 path runs drafter decode and is gated to same-family targets."
+            ),
+        };
+
+        let kept = select_kept_positions(&importance, &cfg);
+        if kept.last().copied() != Some((prompt_ids.len() - 1) as u32) {
+            bail!(
+                "specprefill: kept_positions must include the last prompt position \
+                 (got last={:?}); the first decode logits come from that slot",
+                kept.last(),
+            );
+        }
+        eprintln!(
+            "[specprefill] kept {}/{} tokens ({:.1}%)",
+            kept.len(),
+            prompt_ids.len(),
+            100.0 * kept.len() as f32 / prompt_ids.len() as f32
+        );
+        kept
+        // draft_engine and draft_weights drop here, freeing drafter VRAM.
+    };
+
+    let mut keep_mask = vec![false; prompt_ids.len()];
+    for &p in &kept_positions {
+        keep_mask[p as usize] = true;
+    }
+
+    // Hand off to the MoE engine. It re-tokenizes (same tokenizer file +
+    // same prompt → identical IDs), sets up the target weights with VMM,
+    // and runs the prefill+decode loop with sparse stepping driven by
+    // `keep_mask`.
+    crate::qwen36_moe_cli::run_with_sparse_prefill(cli, entry, _total_vram, keep_mask)
+}
+
 pub fn run_specprefill(
     cli: &Cli,
     model_variant: &ModelVariant,
@@ -181,7 +377,16 @@ pub fn run_specprefill(
 
     let params = match &entry.params {
         FamilyParams::Qwen35(p) => *p,
-        _ => unreachable!("specprefill dispatched for non-qwen35 variant"),
+        FamilyParams::Qwen36Moe(_) => {
+            // Cross-family path: Qwen3.5-0.8B drafter → Qwen3.6-MoE target.
+            // Target setup is structurally different (MoE expert paging via
+            // VMM, single-token-at-a-time prefill in qwen36_moe::engine),
+            // so we score with the drafter here and hand the resulting
+            // keep-mask off to qwen36_moe::run_with_sparse_prefill instead
+            // of falling through to the Qwen3.5 target path below.
+            return run_specprefill_qwen36_moe(cli, entry, ordinal, total_vram, draft_dir);
+        }
+        _ => unreachable!("specprefill dispatched for non-qwen35-family variant"),
     };
 
     // ---- Tokeniser + target config ----

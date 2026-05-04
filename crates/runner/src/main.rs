@@ -138,7 +138,24 @@ fn main() -> Result<()> {
         ModelFamily::Llama31 => {
             llama31_engine::run_llama31(&cli, &model_variant, entry, ordinal, gpu.total_vram)
         }
-        ModelFamily::Qwen36Moe => qwen36_moe_cli::run(&cli, entry, gpu.total_vram),
+        ModelFamily::Qwen36Moe => {
+            // Route Qwen3.6-MoE through the SpecPrefill orchestrator when the
+            // drafter flag is set, so the cross-family R1 path
+            // (Qwen3.5-0.8B drafter -> Qwen3.6-35B-A3B target) actually engages.
+            // Without this branch `--specprefill-draft-dir` would be silently
+            // ignored — the dense MoE path runs and the user gets no signal.
+            if cli.specprefill_draft_dir.is_some() {
+                specprefill_engine::run_specprefill(
+                    &cli,
+                    &model_variant,
+                    entry,
+                    ordinal,
+                    gpu.total_vram,
+                )
+            } else {
+                qwen36_moe_cli::run(&cli, entry, gpu.total_vram)
+            }
+        }
         ModelFamily::Qwen35 => run_qwen35(
             &cli,
             &model_variant,
