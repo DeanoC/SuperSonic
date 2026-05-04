@@ -233,6 +233,93 @@ __global__ void pfx_lookahead_attention_scores_kernel(
     }
 }
 
+// ---- Kernel 2d: per-block cosine(block_mean_K, last_K) for SpecPrefill ----
+// PFlash-style importance scoring (hipfire's algorithm, BF16 variant). Reads
+// the drafter's K cache after dense prefill, computes per-block cosine
+// similarity between the block-mean K vector (over consecutive prompt
+// positions) and the K vector at the last prompt position. Used by
+// SpecPrefill (Phase D fast-path) to derive per-token importance without
+// running the speculator's lookahead decode steps.
+//
+// k_cache layout (qwen35::state::ensure_kv_capacity):
+//   [1, kv_heads, cap, head_dim] BF16 — per-kv-head stride is `cap * head_dim`.
+// We only read positions [0, n_pos), where n_pos == prompt_len.
+//
+// Grid: n_blocks workgroups, each one warp (warpSize threads).
+// Output: scores[b] = cosine(mean_d K[block_start..block_end][d],
+//                            K[last_pos][d])  for d in 0..kv_dim.
+template <typename T>
+__global__ void pfx_pflash_cosine_score_kernel(
+    const T* __restrict__ k_cache,
+    float* __restrict__ scores,
+    int n_pos,
+    int kv_heads,
+    int cap,
+    int head_dim,
+    int block_size,
+    int n_blocks,
+    int last_pos
+) {
+    const int lane = threadIdx.x;
+    if (lane >= warpSize) return;
+
+    const int block_idx = blockIdx.x;
+    if (block_idx >= n_blocks) return;
+
+    const int block_start = block_idx * block_size;
+    int block_end = block_start + block_size;
+    if (block_end > n_pos) block_end = n_pos;
+    const int block_len = block_end - block_start;
+    if (block_len <= 0) {
+        if (lane == 0) scores[block_idx] = 0.0f;
+        return;
+    }
+
+    const int kv_dim = kv_heads * head_dim;
+
+    // Lane-strided over kv_dim. Each lane folds (dot, ||mean||^2, ||last||^2)
+    // for its share of dimensions.
+    float dot_acc = 0.0f;
+    float nb_acc = 0.0f;
+    float nl_acc = 0.0f;
+
+    for (int d = lane; d < kv_dim; d += warpSize) {
+        const int h = d / head_dim;
+        const int dim_in_head = d - h * head_dim;
+        // Per-position K[d] for this kv-head sits at:
+        //   k_cache[(h * cap + pos) * head_dim + dim_in_head]
+        const size_t base_h = static_cast<size_t>(h) * cap * head_dim
+                            + static_cast<size_t>(dim_in_head);
+
+        const float last_v = pfx_to_float(
+            k_cache[base_h + static_cast<size_t>(last_pos) * head_dim]);
+
+        // Block-mean K[d]: sum over positions in the block, divide by length.
+        float sum = 0.0f;
+        for (int pos = block_start; pos < block_end; ++pos) {
+            sum += pfx_to_float(
+                k_cache[base_h + static_cast<size_t>(pos) * head_dim]);
+        }
+        const float mean = sum / static_cast<float>(block_len);
+
+        dot_acc += mean * last_v;
+        nb_acc  += mean * mean;
+        nl_acc  += last_v * last_v;
+    }
+
+    // Three-way warp reduction (each pfx_wave_sum returns full-warp sum
+    // in every lane; we only use lane 0's result).
+    const float dot = pfx_wave_sum(dot_acc);
+    const float nb  = pfx_wave_sum(nb_acc);
+    const float nl  = pfx_wave_sum(nl_acc);
+
+    if (lane == 0) {
+        float denom = sqrtf(nb) * sqrtf(nl);
+        if (denom < 1e-12f) denom = 1e-12f;
+        scores[block_idx] = dot / denom;
+    }
+}
+
 // ---- Kernel 3: Transpose [S, H, D] <-> [H, S, D] ----
 // src layout: [S, H, D] — element(s, h, d) at s*H*D + h*D + d
 // dst layout: [H, S, D] — element(h, s, d) at h*S*D + s*D + d
