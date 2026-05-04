@@ -12,6 +12,10 @@ use crate::qwen35_decode_traces::{
     Qwen35PersistentDecodeTrace,
 };
 use crate::qwen35_decode_util::{token_history, token_history_with_next};
+use crate::qwen35_decode_validation::{
+    update_qwen35_gpu_decode_validation, update_qwen35_oracle_decode_delta,
+    Qwen35GpuDecodeValidation,
+};
 use crate::qwen35_engine_setup::{load_qwen35_engine, Qwen35EngineSetup};
 use crate::qwen35_kv_trace::trace_kv_cache;
 use crate::qwen35_prefill::{
@@ -29,7 +33,7 @@ use crate::qwen35_vram::check_qwen35_vram;
 use crate::registry::{self, Backend, FamilyParams, GpuArch, ModelVariant, RegistryEntry};
 use crate::{
     qwen35_dflash_engine, resolve_oracle_device, should_fetch_exact_bake, specprefill_engine,
-    try_download_bake, validate, Cli,
+    try_download_bake, Cli,
 };
 
 pub(crate) fn run_qwen35(
@@ -339,19 +343,15 @@ pub(crate) fn run_qwen35(
             // Use sequence 0's logits for output and validation
             let logits = &batch_logits[0];
 
-            if let Some(ref oracle) = oracle_output {
-                if step < oracle.decode_logits.len() {
-                    let oracle_logits = &oracle.decode_logits[step];
-                    let delta = validate::max_abs_delta(logits, oracle_logits);
-                    if delta > max_delta {
-                        max_delta = delta;
-                    }
-                    eprintln!(
-                        "[decode] step={step} seq_off={seqlen_offset} delta={delta:.4} token={next_token} batch_size={}",
-                        cli.batch_size
-                    );
-                }
-            }
+            update_qwen35_oracle_decode_delta(
+                oracle_output.as_ref(),
+                logits,
+                step,
+                seqlen_offset,
+                next_token,
+                Some(cli.batch_size),
+                &mut max_delta,
+            );
 
             // Sample next tokens for all sequences
             let sampling_start = Instant::now();
@@ -488,44 +488,34 @@ pub(crate) fn run_qwen35(
                 )?
             };
 
-            if let Some(ref oracle) = oracle_output {
-                if step < oracle.decode_logits.len() {
-                    let oracle_logits = &oracle.decode_logits[step];
-                    let delta = validate::max_abs_delta(&logits, oracle_logits);
-                    if delta > max_delta {
-                        max_delta = delta;
-                    }
-                    eprintln!(
-                        "[decode] step={step} seq_off={seqlen_offset} delta={delta:.4} token={next_token}"
-                    );
-                }
-            }
+            update_qwen35_oracle_decode_delta(
+                oracle_output.as_ref(),
+                &logits,
+                step,
+                seqlen_offset,
+                next_token,
+                None,
+                &mut max_delta,
+            );
 
             if gpu_validate_enabled {
-                let gpu_token_ids =
-                    token_history_with_next(&prompt_ids, &generated_ids, next_token);
-                let gpu_logits = prefill_engine::gpu_reference_replay_step(
-                    &engine.weights(),
-                    &engine.rotary(),
-                    &gpu_token_ids,
-                    ordinal,
-                    params.kv_chunk_size,
-                    cli.prefill_chunk_size,
-                    use_4b_kernel,
+                update_qwen35_gpu_decode_validation(
+                    Qwen35GpuDecodeValidation {
+                        engine: &engine,
+                        logits: &logits,
+                        prompt_ids: &prompt_ids,
+                        generated_ids: &generated_ids,
+                        next_token,
+                        native_token,
+                        step,
+                        seqlen_offset,
+                        ordinal,
+                        kv_chunk_size: params.kv_chunk_size,
+                        prefill_chunk_size: cli.prefill_chunk_size,
+                        use_4b_kernel,
+                    },
+                    &mut gpu_max_delta,
                 )?;
-                let delta = validate::max_abs_delta(&logits, &gpu_logits);
-                let gpu_token = DecodeEngine::greedy_sample(&gpu_logits);
-                let token_match = if gpu_token == native_token {
-                    ""
-                } else {
-                    " MISMATCH"
-                };
-                if delta > gpu_max_delta {
-                    gpu_max_delta = delta;
-                }
-                eprintln!(
-                    "[gpu-validate] step={step} seq_off={seqlen_offset} delta={delta:.4} native_token={native_token} gpu_token={gpu_token}{token_match}"
-                );
             }
 
             generated_ids.push(next_token);
