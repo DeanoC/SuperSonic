@@ -21,6 +21,7 @@ mod qwen35_decode_batch;
 mod qwen35_decode_loop;
 mod qwen35_decode_modes;
 mod qwen35_decode_report;
+mod qwen35_decode_single;
 mod qwen35_decode_traces;
 mod qwen35_decode_util;
 mod qwen35_decode_validation;

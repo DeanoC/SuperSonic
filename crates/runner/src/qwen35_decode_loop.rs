@@ -3,23 +3,14 @@ use std::time::Instant;
 
 use crate::decode_engine::{DecodeEngine, DecodeStageTimings};
 use crate::oracle;
-use crate::prefill_engine;
-use crate::qwen35_component_decode::{run_qwen35_component_single_decode, Qwen35ComponentDecode};
 use crate::qwen35_decode_batch::{
     run_qwen35_batch_decode_step, Qwen35BatchDecodeState, Qwen35BatchDecodeStep,
 };
 use crate::qwen35_decode_modes::Qwen35DecodeModes;
-use crate::qwen35_decode_traces::{
-    qwen35_persistent_decode_trace_enabled, run_qwen35_persistent_decode_traces,
-    Qwen35PersistentDecodeTrace,
+use crate::qwen35_decode_single::{
+    run_qwen35_single_decode_step, Qwen35SingleDecodeState, Qwen35SingleDecodeStep,
 };
-use crate::qwen35_decode_util::{token_history, token_history_with_next};
-use crate::qwen35_decode_validation::{
-    update_qwen35_gpu_decode_validation, update_qwen35_oracle_decode_delta,
-    Qwen35GpuDecodeValidation,
-};
-use crate::qwen35_kv_trace::trace_kv_cache;
-use crate::qwen35_prefill::{sample_qwen_logits_with_rescore, HostLmHeadRescorer};
+use crate::qwen35_prefill::HostLmHeadRescorer;
 use crate::Cli;
 
 pub(crate) struct Qwen35DecodeLoop<'a> {
@@ -94,169 +85,33 @@ pub(crate) fn run_qwen35_decode_loop(
                 },
             )?;
         } else {
-            let mut maybe_fast_token = None;
-            let mut can_rescore_with_normed = false;
-            let logits = if decode.decode_modes.cuda_fast_greedy_enabled {
-                let (token, timings) = decode
-                    .engine
-                    .decode_step_cuda_fast_greedy(next_token, seqlen_offset)?;
-                native_decode_timings.add_assign(timings);
-                native_decode_timing_steps += 1;
-                maybe_fast_token = Some(token);
-                Vec::new()
-            } else if decode.decode_modes.metal_fast_greedy_enabled {
-                let token = decode
-                    .engine
-                    .decode_step_metal_fast_greedy(next_token, seqlen_offset)?;
-                maybe_fast_token = Some(token);
-                Vec::new()
-            } else if decode.cuda_08b_hero_enabled {
-                let (token, timings) = decode
-                    .engine
-                    .decode_step_cuda_08b_hero(next_token, seqlen_offset)?;
-                native_decode_timings.add_assign(timings);
-                native_decode_timing_steps += 1;
-                maybe_fast_token = Some(token);
-                Vec::new()
-            } else if decode.decode_modes.replay_decode_enabled {
-                let token_ids =
-                    token_history_with_next(decode.prompt_ids, &generated_ids, next_token);
-                prefill_engine::gpu_reference_replay_step(
-                    &decode.engine.weights(),
-                    &decode.engine.rotary(),
-                    &token_ids,
-                    decode.ordinal,
-                    decode.kv_chunk_size,
-                    decode.cli.prefill_chunk_size,
-                    decode.use_4b_kernel,
-                )?
-            } else if decode.decode_modes.replay_kv_fp8_enabled {
-                let token_ids =
-                    token_history_with_next(decode.prompt_ids, &generated_ids, next_token);
-                decode.engine.rebuild_prefill_state(&token_ids, false)?
-            } else if decode.decode_modes.component_single_decode_enabled {
-                run_qwen35_component_single_decode(
-                    decode.engine,
-                    Qwen35ComponentDecode {
-                        cli: decode.cli,
-                        prompt_ids: decode.prompt_ids,
-                        generated_ids: &generated_ids,
-                        next_token,
-                        seqlen_offset,
-                        ordinal: decode.ordinal,
-                        kv_chunk_size: decode.kv_chunk_size,
-                        use_4b_kernel: decode.use_4b_kernel,
-                    },
-                )?
-            } else if decode.decode_modes.kernel_single_decode_enabled {
-                if qwen35_persistent_decode_trace_enabled(decode.cli) {
-                    let trace_token_ids =
-                        token_history_with_next(decode.prompt_ids, &generated_ids, next_token);
-                    run_qwen35_persistent_decode_traces(
-                        decode.engine,
-                        Qwen35PersistentDecodeTrace {
-                            cli: decode.cli,
-                            trace_token_ids: trace_token_ids.as_slice(),
-                            trace_tokens: &[next_token],
-                            seqlen_offset,
-                            ordinal: decode.ordinal,
-                            kv_chunk_size: decode.kv_chunk_size,
-                            use_4b_kernel: decode.use_4b_kernel,
-                            batch_mode: false,
-                        },
-                    )?;
-                }
-                if decode.cli.emit_stage_timings {
-                    let (logits, timings) = decode
-                        .engine
-                        .decode_step_4b_single_kernel_with_timings(next_token, seqlen_offset)?;
-                    native_decode_timings.add_assign(timings);
-                    native_decode_timing_steps += 1;
-                    can_rescore_with_normed = true;
-                    logits
-                } else {
-                    can_rescore_with_normed = true;
-                    decode
-                        .engine
-                        .decode_step_batch(&[next_token], seqlen_offset)?
-                        .remove(0)
-                }
-            } else if decode.cli.emit_stage_timings {
-                let (logits, timings) = decode
-                    .engine
-                    .decode_step_with_timings(next_token, seqlen_offset)?;
-                native_decode_timings.add_assign(timings);
-                native_decode_timing_steps += 1;
-                can_rescore_with_normed = true;
-                logits
-            } else {
-                can_rescore_with_normed = true;
-                decode.engine.decode_step(next_token, seqlen_offset)?
-            };
-            let native_token = if let Some(token) = maybe_fast_token {
-                token
-            } else {
-                let normed = if can_rescore_with_normed && decode.allow_host_lm_head_rescore {
-                    Some(decode.engine.last_normed_host_f32()?)
-                } else {
-                    None
-                };
-                sample_qwen_logits_with_rescore(
-                    &logits,
-                    normed.as_deref(),
-                    decode
-                        .host_lm_head_rescorer
-                        .filter(|_| decode.allow_host_lm_head_rescore),
-                )?
-            };
-
-            update_qwen35_oracle_decode_delta(
-                decode.oracle_output,
-                &logits,
-                step,
-                seqlen_offset,
-                next_token,
-                None,
-                &mut max_delta,
-            );
-
-            if decode.gpu_validate_enabled {
-                update_qwen35_gpu_decode_validation(
-                    Qwen35GpuDecodeValidation {
-                        engine: decode.engine,
-                        logits: &logits,
-                        prompt_ids: decode.prompt_ids,
-                        generated_ids: &generated_ids,
-                        next_token,
-                        native_token,
-                        step,
-                        seqlen_offset,
-                        ordinal: decode.ordinal,
-                        kv_chunk_size: decode.kv_chunk_size,
-                        prefill_chunk_size: decode.cli.prefill_chunk_size,
-                        use_4b_kernel: decode.use_4b_kernel,
-                    },
-                    &mut gpu_max_delta,
-                )?;
-            }
-
-            generated_ids.push(next_token);
-            next_token = native_token;
-
-            if decode.trace_kv_cache_enabled {
-                let cache_token_ids = token_history(decode.prompt_ids, &generated_ids);
-                trace_kv_cache(
-                    decode.engine,
-                    &cache_token_ids,
-                    decode.ordinal,
-                    decode.kv_chunk_size,
-                    decode.cli.prefill_chunk_size,
-                    decode.use_4b_kernel,
-                    decode.cli.kv_fp8,
-                    decode.cli.batch_size,
+            next_token = run_qwen35_single_decode_step(
+                Qwen35SingleDecodeStep {
+                    cli: decode.cli,
+                    engine: decode.engine,
+                    decode_modes: decode.decode_modes,
+                    prompt_ids: decode.prompt_ids,
+                    generated_ids: &mut generated_ids,
+                    next_token,
                     step,
-                )?;
-            }
+                    seqlen_offset,
+                    oracle_output: decode.oracle_output,
+                    host_lm_head_rescorer: decode.host_lm_head_rescorer,
+                    allow_host_lm_head_rescore: decode.allow_host_lm_head_rescore,
+                    trace_kv_cache_enabled: decode.trace_kv_cache_enabled,
+                    gpu_validate_enabled: decode.gpu_validate_enabled,
+                    cuda_08b_hero_enabled: decode.cuda_08b_hero_enabled,
+                    ordinal: decode.ordinal,
+                    kv_chunk_size: decode.kv_chunk_size,
+                    use_4b_kernel: decode.use_4b_kernel,
+                },
+                Qwen35SingleDecodeState {
+                    max_delta: &mut max_delta,
+                    gpu_max_delta: &mut gpu_max_delta,
+                    native_decode_timings: &mut native_decode_timings,
+                    native_decode_timing_steps: &mut native_decode_timing_steps,
+                },
+            )?;
         }
     }
 
