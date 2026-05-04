@@ -248,7 +248,7 @@ impl Default for Qwen36MoeBatchSeqDesc {
     }
 }
 
-#[cfg(supersonic_backend_hip)]
+#[cfg(any(supersonic_backend_hip, supersonic_backend_cuda))]
 extern "C" {
     /// Stub launch entry. Walks the descriptor array, validates field
     /// integrity by writing recognizable sentinel values into the workspace
@@ -683,8 +683,8 @@ pub fn stub_launch(
     let barrier_flag = unsafe { (counters as *mut u8).add(68) as *mut c_uint };
 
     let status: c_int = match backend {
-        Backend::Hip => {
-            #[cfg(supersonic_backend_hip)]
+        Backend::Hip | Backend::Cuda => {
+            #[cfg(any(supersonic_backend_hip, supersonic_backend_cuda))]
             unsafe {
                 qwen36_moe_hip_stub_launch(
                     dtype.kernel_dtype_code(),
@@ -697,17 +697,12 @@ pub fn stub_launch(
                     barrier_flag,
                 )
             }
-            #[cfg(not(supersonic_backend_hip))]
+            #[cfg(not(any(supersonic_backend_hip, supersonic_backend_cuda)))]
             {
                 return Err(GpuError::InvalidArg(
-                    "qwen36_moe::stub_launch: HIP backend not compiled".into(),
+                    "qwen36_moe::stub_launch: GPU backend not compiled".into(),
                 ));
             }
-        }
-        Backend::Cuda => {
-            return Err(GpuError::InvalidArg(
-                "qwen36_moe::stub_launch: CUDA backend not yet wired".into(),
-            ));
         }
         Backend::Metal => {
             return Err(GpuError::InvalidArg(
@@ -888,8 +883,8 @@ pub fn persistent_decode_launch_range(
     };
 
     let status: c_int = match backend {
-        Backend::Hip => {
-            #[cfg(supersonic_backend_hip)]
+        Backend::Hip | Backend::Cuda => {
+            #[cfg(any(supersonic_backend_hip, supersonic_backend_cuda))]
             unsafe {
                 qwen36_moe_hip_persistent_decode_launch(
                     dtype.kernel_dtype_code(),
@@ -931,17 +926,12 @@ pub fn persistent_decode_launch_range(
                     barrier_flag,
                 )
             }
-            #[cfg(not(supersonic_backend_hip))]
+            #[cfg(not(any(supersonic_backend_hip, supersonic_backend_cuda)))]
             {
                 return Err(GpuError::InvalidArg(
-                    "qwen36_moe::persistent_decode_launch: HIP backend not compiled".into(),
+                    "qwen36_moe::persistent_decode_launch: GPU backend not compiled".into(),
                 ));
             }
-        }
-        Backend::Cuda => {
-            return Err(GpuError::InvalidArg(
-                "qwen36_moe::persistent_decode_launch: CUDA backend not yet wired".into(),
-            ));
         }
         Backend::Metal => {
             return Err(GpuError::InvalidArg(
@@ -1114,8 +1104,8 @@ pub fn attn_step_launch(
     let barrier_flag = unsafe { (counters as *mut u8).add(68) as *mut c_uint };
 
     let status: c_int = match backend {
-        Backend::Hip => {
-            #[cfg(supersonic_backend_hip)]
+        Backend::Hip | Backend::Cuda => {
+            #[cfg(any(supersonic_backend_hip, supersonic_backend_cuda))]
             unsafe {
                 qwen36_moe_hip_attn_step_launch(
                     dtype.kernel_dtype_code(),
@@ -1157,17 +1147,12 @@ pub fn attn_step_launch(
                     barrier_flag,
                 )
             }
-            #[cfg(not(supersonic_backend_hip))]
+            #[cfg(not(any(supersonic_backend_hip, supersonic_backend_cuda)))]
             {
                 return Err(GpuError::InvalidArg(
-                    "qwen36_moe::attn_step_launch: HIP backend not compiled".into(),
+                    "qwen36_moe::attn_step_launch: GPU backend not compiled".into(),
                 ));
             }
-        }
-        Backend::Cuda => {
-            return Err(GpuError::InvalidArg(
-                "qwen36_moe::attn_step_launch: CUDA backend not yet wired".into(),
-            ));
         }
         Backend::Metal => {
             return Err(GpuError::InvalidArg(
@@ -1294,8 +1279,8 @@ pub fn linear_step_launch(
     let barrier_flag = unsafe { (counters as *mut u8).add(68) as *mut c_uint };
 
     let status: c_int = match backend {
-        Backend::Hip => {
-            #[cfg(supersonic_backend_hip)]
+        Backend::Hip | Backend::Cuda => {
+            #[cfg(any(supersonic_backend_hip, supersonic_backend_cuda))]
             unsafe {
                 qwen36_moe_hip_linear_step_launch(
                     dtype.kernel_dtype_code(),
@@ -1336,17 +1321,12 @@ pub fn linear_step_launch(
                     barrier_flag,
                 )
             }
-            #[cfg(not(supersonic_backend_hip))]
+            #[cfg(not(any(supersonic_backend_hip, supersonic_backend_cuda)))]
             {
                 return Err(GpuError::InvalidArg(
-                    "qwen36_moe::linear_step_launch: HIP backend not compiled".into(),
+                    "qwen36_moe::linear_step_launch: GPU backend not compiled".into(),
                 ));
             }
-        }
-        Backend::Cuda => {
-            return Err(GpuError::InvalidArg(
-                "qwen36_moe::linear_step_launch: CUDA backend not yet wired".into(),
-            ));
         }
         Backend::Metal => {
             return Err(GpuError::InvalidArg(
@@ -1506,8 +1486,8 @@ pub fn ffn_step_launch(
     let barrier_flag = unsafe { (counters as *mut u8).add(68) as *mut c_uint };
 
     let status: c_int = match backend {
-        Backend::Hip => {
-            #[cfg(supersonic_backend_hip)]
+        Backend::Hip | Backend::Cuda => {
+            #[cfg(any(supersonic_backend_hip, supersonic_backend_cuda))]
             unsafe {
                 qwen36_moe_hip_ffn_step_launch(
                     dtype.kernel_dtype_code(),
@@ -1547,17 +1527,12 @@ pub fn ffn_step_launch(
                     barrier_flag,
                 )
             }
-            #[cfg(not(supersonic_backend_hip))]
+            #[cfg(not(any(supersonic_backend_hip, supersonic_backend_cuda)))]
             {
                 return Err(GpuError::InvalidArg(
-                    "qwen36_moe::ffn_step_launch: HIP backend not compiled".into(),
+                    "qwen36_moe::ffn_step_launch: GPU backend not compiled".into(),
                 ));
             }
-        }
-        Backend::Cuda => {
-            return Err(GpuError::InvalidArg(
-                "qwen36_moe::ffn_step_launch: CUDA backend not yet wired".into(),
-            ));
         }
         Backend::Metal => {
             return Err(GpuError::InvalidArg(
@@ -1621,8 +1596,8 @@ pub fn int4_dequant_smoke_launch(
 
     let backend = packed_buf.backend();
     let status: c_int = match backend {
-        Backend::Hip => {
-            #[cfg(supersonic_backend_hip)]
+        Backend::Hip | Backend::Cuda => {
+            #[cfg(any(supersonic_backend_hip, supersonic_backend_cuda))]
             unsafe {
                 qwen36_moe_hip_int4_dequant_smoke_launch(
                     ordinal,
@@ -1636,17 +1611,12 @@ pub fn int4_dequant_smoke_launch(
                     dq_scalar_out.as_mut_ptr() as *mut f32,
                 )
             }
-            #[cfg(not(supersonic_backend_hip))]
+            #[cfg(not(any(supersonic_backend_hip, supersonic_backend_cuda)))]
             {
                 return Err(GpuError::InvalidArg(
-                    "qwen36_moe::int4_dequant_smoke_launch: HIP backend not compiled".into(),
+                    "qwen36_moe::int4_dequant_smoke_launch: GPU backend not compiled".into(),
                 ));
             }
-        }
-        Backend::Cuda => {
-            return Err(GpuError::InvalidArg(
-                "qwen36_moe::int4_dequant_smoke_launch: CUDA backend not yet wired".into(),
-            ));
         }
         Backend::Metal => {
             return Err(GpuError::InvalidArg(
@@ -1711,8 +1681,8 @@ pub fn lm_head_launch(
         .map(|b| b.as_mut_ptr())
         .unwrap_or(std::ptr::null_mut());
     let status: c_int = match backend {
-        Backend::Hip => {
-            #[cfg(supersonic_backend_hip)]
+        Backend::Hip | Backend::Cuda => {
+            #[cfg(any(supersonic_backend_hip, supersonic_backend_cuda))]
             unsafe {
                 qwen36_moe_hip_lm_head_launch(
                     /* dtype = bf16 */ 2,
@@ -1728,17 +1698,12 @@ pub fn lm_head_launch(
                     counter_buf.as_mut_ptr() as *mut c_uint,
                 )
             }
-            #[cfg(not(supersonic_backend_hip))]
+            #[cfg(not(any(supersonic_backend_hip, supersonic_backend_cuda)))]
             {
                 return Err(GpuError::InvalidArg(
-                    "qwen36_moe::lm_head_launch: HIP backend not compiled".into(),
+                    "qwen36_moe::lm_head_launch: GPU backend not compiled".into(),
                 ));
             }
-        }
-        Backend::Cuda => {
-            return Err(GpuError::InvalidArg(
-                "qwen36_moe::lm_head_launch: CUDA backend not yet wired".into(),
-            ));
         }
         Backend::Metal => {
             return Err(GpuError::InvalidArg(
@@ -1832,8 +1797,8 @@ pub fn lm_head_batched_launch(
         .map(|b| b.as_mut_ptr())
         .unwrap_or(std::ptr::null_mut());
     let status: c_int = match backend {
-        Backend::Hip => {
-            #[cfg(supersonic_backend_hip)]
+        Backend::Hip | Backend::Cuda => {
+            #[cfg(any(supersonic_backend_hip, supersonic_backend_cuda))]
             unsafe {
                 qwen36_moe_hip_lm_head_batched_launch(
                     /* dtype = bf16 */ 2,
@@ -1849,17 +1814,12 @@ pub fn lm_head_batched_launch(
                     x_normed_ptr,
                 )
             }
-            #[cfg(not(supersonic_backend_hip))]
+            #[cfg(not(any(supersonic_backend_hip, supersonic_backend_cuda)))]
             {
                 return Err(GpuError::InvalidArg(
-                    "qwen36_moe::lm_head_batched_launch: HIP backend not compiled".into(),
+                    "qwen36_moe::lm_head_batched_launch: GPU backend not compiled".into(),
                 ));
             }
-        }
-        Backend::Cuda => {
-            return Err(GpuError::InvalidArg(
-                "qwen36_moe::lm_head_batched_launch: CUDA backend not yet wired".into(),
-            ));
         }
         Backend::Metal => {
             return Err(GpuError::InvalidArg(
@@ -1939,8 +1899,8 @@ pub fn mtp_pre_fusion_launch(
 
     let backend = fc_w_buf.backend();
     let status: c_int = match backend {
-        Backend::Hip => {
-            #[cfg(supersonic_backend_hip)]
+        Backend::Hip | Backend::Cuda => {
+            #[cfg(any(supersonic_backend_hip, supersonic_backend_cuda))]
             unsafe {
                 qwen36_moe_hip_mtp_pre_fusion_launch(
                     /* dtype = bf16 */ 2,
@@ -1957,17 +1917,12 @@ pub fn mtp_pre_fusion_launch(
                     fused_out_buf.as_mut_ptr(),
                 )
             }
-            #[cfg(not(supersonic_backend_hip))]
+            #[cfg(not(any(supersonic_backend_hip, supersonic_backend_cuda)))]
             {
                 return Err(GpuError::InvalidArg(
-                    "qwen36_moe::mtp_pre_fusion_launch: HIP backend not compiled".into(),
+                    "qwen36_moe::mtp_pre_fusion_launch: GPU backend not compiled".into(),
                 ));
             }
-        }
-        Backend::Cuda => {
-            return Err(GpuError::InvalidArg(
-                "qwen36_moe::mtp_pre_fusion_launch: CUDA backend not yet wired".into(),
-            ));
         }
         Backend::Metal => {
             return Err(GpuError::InvalidArg(
@@ -6395,7 +6350,7 @@ mod tests {
     /// BF16 round-to-nearest-even of an F32 value, returning the 16-bit
     /// big-end-of-F32 representation. Same math as the kernel's
     /// `bf16_round_rne_f32`.
-    #[cfg(supersonic_backend_hip)]
+    #[cfg(any(supersonic_backend_hip, supersonic_backend_cuda))]
     fn bf16_round_bits(x: f32) -> u16 {
         let bits = x.to_bits();
         let rounding_bias = 0x7FFFu32 + ((bits >> 16) & 1);
@@ -6404,7 +6359,7 @@ mod tests {
     }
 
     /// Reverse: F32 from a BF16 bit pattern.
-    #[cfg(supersonic_backend_hip)]
+    #[cfg(any(supersonic_backend_hip, supersonic_backend_cuda))]
     fn f32_from_bf16(b: u16) -> f32 {
         f32::from_bits((b as u32) << 16)
     }
@@ -6413,7 +6368,7 @@ mod tests {
     /// of `minmax_int4_packed_and_recon` in the FFN oracle. Returns
     /// `(packed [out, in/2] u8, scale [out/gs, in/gs] u16-as-BF16,
     /// zero [out/gs, in/gs] u16-as-BF16)`.
-    #[cfg(supersonic_backend_hip)]
+    #[cfg(any(supersonic_backend_hip, supersonic_backend_cuda))]
     fn host_minmax_int4(
         w: &[f32],
         out_rows: usize,
@@ -6473,7 +6428,7 @@ mod tests {
 
     /// Reference reconstruction: `bf16(q*s - z*s)` per element. Returns
     /// F32 values whose lower 16 bits are zero (i.e. exactly BF16-precision).
-    #[cfg(supersonic_backend_hip)]
+    #[cfg(any(supersonic_backend_hip, supersonic_backend_cuda))]
     fn host_dequant_recon(
         packed: &[u8],
         scale: &[u16],
@@ -6503,7 +6458,7 @@ mod tests {
     }
 
     /// Encode a slice of BF16 16-bit values to LE bytes for `from_host_bytes`.
-    #[cfg(supersonic_backend_hip)]
+    #[cfg(any(supersonic_backend_hip, supersonic_backend_cuda))]
     fn bf16_bits_to_bytes(bits: &[u16]) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(bits.len() * 2);
         for b in bits {
@@ -6515,10 +6470,15 @@ mod tests {
     /// Drives one (out_rows, in_cols, gsz) configuration through the smoke
     /// kernel and asserts both helper outputs match the host reference
     /// exactly.
-    #[cfg(supersonic_backend_hip)]
+    #[cfg(any(supersonic_backend_hip, supersonic_backend_cuda))]
     fn run_int4_dequant_smoke(out_rows: usize, in_cols: usize, gsz: usize, label: &str) {
-        use gpu_hal::{set_backend, Backend, GpuBuffer, ScalarType};
-        set_backend(Backend::Hip);
+        use gpu_hal::{is_backend_compiled, set_backend, Backend, GpuBuffer, ScalarType};
+        let backend = if is_backend_compiled(Backend::Cuda) {
+            Backend::Cuda
+        } else {
+            Backend::Hip
+        };
+        set_backend(backend);
         let ordinal = 0usize;
 
         // Deterministic synthetic weights: a 32-bit LCG seeded by config so
@@ -6603,7 +6563,7 @@ mod tests {
         }
     }
 
-    #[cfg(supersonic_backend_hip)]
+    #[cfg(any(supersonic_backend_hip, supersonic_backend_cuda))]
     #[test]
     fn qwen36_moe_int4_dequant_smoke_fast_path() {
         // gsz=8, in_cols=16 → every 8-col span lies in one group, so
@@ -6611,7 +6571,7 @@ mod tests {
         run_int4_dequant_smoke(8, 16, 8, "fast (gsz=8)");
     }
 
-    #[cfg(supersonic_backend_hip)]
+    #[cfg(any(supersonic_backend_hip, supersonic_backend_cuda))]
     #[test]
     fn qwen36_moe_int4_dequant_smoke_slow_path() {
         // gsz=4, in_cols=16 → 8-col spans starting at col=0 cross from
@@ -6632,12 +6592,17 @@ mod tests {
     /// strictly less precise than the host F32-throughout reference. A
     /// high cos_sim catches any systematic kernel bug while tolerating
     /// the inherent BF16 rounding noise.
-    #[cfg(supersonic_backend_hip)]
+    #[cfg(any(supersonic_backend_hip, supersonic_backend_cuda))]
     #[test]
     fn qwen36_moe_lm_head_matches_host_f32_reference() {
-        use gpu_hal::{copy_d2h, set_backend, Backend, GpuBuffer, ScalarType};
+        use gpu_hal::{copy_d2h, is_backend_compiled, set_backend, Backend, GpuBuffer, ScalarType};
 
-        set_backend(Backend::Hip);
+        let backend = if is_backend_compiled(Backend::Cuda) {
+            Backend::Cuda
+        } else {
+            Backend::Hip
+        };
+        set_backend(backend);
         let ordinal = 0usize;
         let hidden: i32 = 256;
         let vocab: i32 = 512;

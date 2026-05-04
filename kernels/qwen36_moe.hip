@@ -20,11 +20,7 @@
 // fragile, merging this with full_attention*.hip caused codegen
 // regressions in the past. Keep this file standalone.
 
-#include <hip/hip_bf16.h>
-#include <hip/hip_bfloat16.h>
-#include <hip/hip_runtime.h>
-#include <math.h>
-#include <stdint.h>
+#include "qwen36_moe_cuda_prelude.cuh"
 
 // Phase 3a: shared __device__ primitives (bf16 rounding, INT4 dequant,
 // WMMA tile, grid_barrier, load_as_float). Lives in

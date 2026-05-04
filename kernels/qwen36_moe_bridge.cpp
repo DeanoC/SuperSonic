@@ -15,7 +15,10 @@
 #include "qwen36_moe_persistent/persistent_decode.hip"
 
 #include <cstdlib>
+#include <cstdio>
+#ifndef SUPERSONIC_QWEN36_CUDA_BRIDGE
 #include <hip/hip_runtime.h>
+#endif
 #include <mutex>
 #include <stdint.h>
 
@@ -31,6 +34,10 @@ namespace {
 // shared with the qwen35-4b/Gemma 4 prefill paths) so a single env var
 // disables every WMMA route in the runtime; useful for A/B perf work.
 bool device_supports_wmma_bf16(int device_ordinal) {
+#ifdef SUPERSONIC_QWEN36_CUDA_BRIDGE
+    (void)device_ordinal;
+    return false;
+#else
     static std::once_flag env_once;
     static bool env_disabled = false;
     std::call_once(env_once, [] {
@@ -56,6 +63,7 @@ bool device_supports_wmma_bf16(int device_ordinal) {
         cached[device_ordinal] = probe_arch(device_ordinal);
     });
     return cached[device_ordinal];
+#endif
 }
 
 
