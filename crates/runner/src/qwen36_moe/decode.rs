@@ -328,6 +328,85 @@ fn run_chained_decode_impl(
     initial_hidden_bytes: &[u8],
     position: i32,
     options: ChainedDecodeOptions,
+    expert_prefetch: Option<&mut ExpertPrefetchCallback<'_>>,
+) -> Result<DecodeOutputs> {
+    run_chained_decode_impl_with_cache_pos(
+        ordinal,
+        geom,
+        layers,
+        initial_hidden_bytes,
+        position,
+        Qwen36MoeAttnStepParams::CACHE_POS_INHERIT,
+        options,
+        expert_prefetch,
+    )
+}
+
+/// Sparse-prefill entry point: like `run_chained_decode_fast` but with an
+/// explicit `cache_pos` (KV-cache slot index) decoupled from `position`
+/// (RoPE rotation). Used when the prompt has been pruned by SpecPrefill —
+/// kept tokens land in compact KV slots (`cache_pos = compacted_idx`) but
+/// rotate to their original prompt positions (`position = original_pos`).
+/// Pass `Qwen36MoeAttnStepParams::CACHE_POS_INHERIT` for `cache_pos` to
+/// reproduce the dense `run_chained_decode_fast` behavior bit-equally.
+pub fn run_chained_decode_fast_with_cache_pos(
+    ordinal: usize,
+    geom: &MultiLayerGeom,
+    layers: &mut [LayerBuffers],
+    initial_hidden_bytes: &[u8],
+    position: i32,
+    cache_pos: i32,
+    accurate_stage_timings: bool,
+) -> Result<DecodeOutputs> {
+    let mut options = ChainedDecodeOptions::from_env();
+    options.accurate_stage_timings = accurate_stage_timings;
+    run_chained_decode_impl_with_cache_pos(
+        ordinal,
+        geom,
+        layers,
+        initial_hidden_bytes,
+        position,
+        cache_pos,
+        options,
+        None,
+    )
+}
+
+/// Sparse-prefill + MoE-residency variant. Combines
+/// `run_chained_decode_fast_with_cache_pos` with the host-side expert
+/// prefetch hook from `run_chained_decode_fast_with_expert_prefetch`.
+pub fn run_chained_decode_fast_with_expert_prefetch_and_cache_pos(
+    ordinal: usize,
+    geom: &MultiLayerGeom,
+    layers: &mut [LayerBuffers],
+    initial_hidden_bytes: &[u8],
+    position: i32,
+    cache_pos: i32,
+    accurate_stage_timings: bool,
+    expert_prefetch: &mut ExpertPrefetchCallback<'_>,
+) -> Result<DecodeOutputs> {
+    let mut options = ChainedDecodeOptions::from_env();
+    options.accurate_stage_timings = accurate_stage_timings;
+    run_chained_decode_impl_with_cache_pos(
+        ordinal,
+        geom,
+        layers,
+        initial_hidden_bytes,
+        position,
+        cache_pos,
+        options,
+        Some(expert_prefetch),
+    )
+}
+
+fn run_chained_decode_impl_with_cache_pos(
+    ordinal: usize,
+    geom: &MultiLayerGeom,
+    layers: &mut [LayerBuffers],
+    initial_hidden_bytes: &[u8],
+    position: i32,
+    cache_pos: i32,
+    options: ChainedDecodeOptions,
     mut expert_prefetch: Option<&mut ExpertPrefetchCallback<'_>>,
 ) -> Result<DecodeOutputs> {
     let hidden = geom.hidden as usize;
@@ -462,7 +541,7 @@ fn run_chained_decode_impl(
                     rope_theta: geom.rope_theta,
                     rms_norm_eps: geom.rms_norm_eps,
                     position,
-                    cache_pos: Qwen36MoeAttnStepParams::CACHE_POS_INHERIT,
+                    cache_pos,
                 };
                 let (kv_k_ptr, kv_v_ptr, kv_max_t) = match kv_cache {
                     Some(c) => (c.k_device_ptr(), c.v_device_ptr(), c.kv_max_t),

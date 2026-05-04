@@ -20,4 +20,4 @@ pub(crate) mod timing;
 pub(crate) mod vmm;
 pub(crate) mod vmm_config;
 
-pub(crate) use engine::run;
+pub(crate) use engine::{run, run_with_sparse_prefill};
