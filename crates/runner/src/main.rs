@@ -26,6 +26,7 @@ mod qwen35_decode_validation;
 mod qwen35_dflash_engine;
 mod qwen35_engine_setup;
 mod qwen35_kv_trace;
+mod qwen35_oracle_prefill_trace;
 mod qwen35_prefill;
 mod qwen35_runtime;
 mod qwen35_startup;
