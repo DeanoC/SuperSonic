@@ -1,6 +1,7 @@
 #![recursion_limit = "512"]
 
 mod bakes;
+mod backend_runtime;
 mod certified_kv;
 mod decode_engine;
 mod gemma4_engine;
@@ -53,12 +54,14 @@ use clap::Parser;
 
 use bakes::ensure_hf_metadata_present;
 pub(crate) use bakes::{should_fetch_exact_bake, try_download_bake};
+use backend_runtime::resolve_backend;
 use decode_engine::{DecodeEngine, DecodeStageTimings};
 use gemma4_runtime::{
     check_gemma4_vram, load_gemma4_runtime, load_gemma4_startup, validate_gemma4_startup,
     Gemma4Runtime, Gemma4Startup,
 };
 pub(crate) use model_files::{load_tokenizer, resolve_prompt_token_ids};
+pub(crate) use backend_runtime::resolve_oracle_device;
 use policy::{
     q4km_like, validate_dflash_flags, validate_gfx942_policy, validate_global_flags,
     validate_specprefill_flags,
@@ -72,56 +75,10 @@ use qwen35_runtime::{
     Qwen35EngineSetup, Qwen35Policy, Qwen35Prefill, Qwen35Startup,
 };
 use registry::{Backend, FamilyParams, GpuArch, ModelFamily, ModelVariant};
-use supersonic_core::backend::{compiled_backends_display, BackendChoice, BACKEND_CHOICES};
+use supersonic_core::backend::{BackendChoice, BACKEND_CHOICES};
 use tensor_bytes::{
     bf16_bytes_to_f32 as decode_bf16_le, f32_bytes_to_f32 as decode_f32_le, f32_to_bf16_bytes,
 };
-
-fn resolve_backend(choice: BackendChoice, ordinal: usize) -> Result<Backend> {
-    match choice {
-        BackendChoice::Explicit(backend) => {
-            if !gpu_hal::is_backend_compiled(backend) {
-                anyhow::bail!(
-                    "Requested backend {backend} is not compiled into this build. Compiled backends: [{}]",
-                    compiled_backends_display()
-                );
-            }
-            Ok(backend)
-        }
-        BackendChoice::Auto => {
-            if gpu_hal::is_backend_compiled(Backend::Cuda)
-                && gpu_hal::query_device_info(Backend::Cuda, ordinal).is_ok()
-            {
-                return Ok(Backend::Cuda);
-            }
-            if gpu_hal::is_backend_compiled(Backend::Hip)
-                && kernel_ffi::query_gpu_info(ordinal).is_ok()
-            {
-                return Ok(Backend::Hip);
-            }
-            if gpu_hal::is_backend_compiled(Backend::Metal)
-                && gpu_hal::query_device_info(Backend::Metal, ordinal).is_ok()
-            {
-                return Ok(Backend::Metal);
-            }
-            anyhow::bail!(
-                "No usable GPU backend available for device {ordinal}. Compiled backends: [{}]",
-                compiled_backends_display()
-            )
-        }
-    }
-}
-
-fn resolve_oracle_device(spec: &str, backend: Backend, ordinal: usize) -> String {
-    match spec.trim().to_ascii_lowercase().as_str() {
-        "auto" => match backend {
-            Backend::Cuda => format!("cuda:{ordinal}"),
-            Backend::Hip => "cpu".to_string(),
-            Backend::Metal => "cpu".to_string(),
-        },
-        other => other.to_string(),
-    }
-}
 
 #[derive(Parser)]
 #[command(name = "supersonic", about = "SuperSonic — optimized LLM inference")]
