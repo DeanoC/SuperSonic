@@ -15,16 +15,27 @@ mod qwen35_dflash_engine;
 mod qwen35_runtime;
 #[path = "qwen36_moe/mod.rs"]
 mod qwen36_moe_cli;
+#[path = "qwen36_moe/decode.rs"]
 mod qwen36_moe_decode;
+#[path = "qwen36_moe/logits.rs"]
 mod qwen36_moe_logits;
+#[path = "qwen36_moe/mtp.rs"]
 mod qwen36_moe_mtp;
+#[path = "qwen36_moe/persistent_decode.rs"]
 mod qwen36_moe_persistent_decode;
+#[path = "qwen36_moe/residency.rs"]
 mod qwen36_moe_residency;
+#[path = "qwen36_moe/residency_pages.rs"]
 mod qwen36_moe_residency_pages;
+#[path = "qwen36_moe/residency_types.rs"]
 mod qwen36_moe_residency_types;
+#[path = "qwen36_moe/speculative.rs"]
 mod qwen36_moe_speculative;
+#[path = "qwen36_moe/state.rs"]
 mod qwen36_moe_state;
+#[path = "qwen36_moe/telemetry.rs"]
 mod qwen36_moe_telemetry;
+#[path = "qwen36_moe/types.rs"]
 mod qwen36_moe_types;
 mod registry;
 mod specprefill;
