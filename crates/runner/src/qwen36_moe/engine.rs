@@ -192,13 +192,10 @@ fn decode_text(
     validate_speculative_sampling(speculative_decode, sampling)?;
 
     if keep_mask.is_some() && speculative_decode {
-        anyhow::bail!(
-            "SpecPrefill (sparse prefill via --specprefill-draft-dir) cannot be \
-             combined with --speculative-decode (MTP self-speculative). MTP uses \
-             the persistent decode kernel, which takes only `position` (no \
-             `cache_pos` decoupling), so it would write at wrong KV slots when \
-             the prompt has been pruned. R1 follow-up: plumb cache_pos through \
-             MTP too."
+        eprintln!(
+            "[specprefill+mtp] composed run: rope on absolute prompt timeline, \
+             cache on compact KV slot. See \
+             docs/research/2026-05-04-qwen36-mtp-specprefill-audit.md."
         );
     }
 
