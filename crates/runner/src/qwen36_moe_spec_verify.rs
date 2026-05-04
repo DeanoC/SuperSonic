@@ -6,6 +6,7 @@ use crate::qwen36_moe_decode::{
     argmax_bf16_logits, run_chained_decode_fast, DecodeOutputs, LayerBuffers, MultiLayerGeom,
 };
 use crate::qwen36_moe_host::lookup_embed_row;
+use crate::qwen36_moe_lm_head::{launch_lm_head_from_final_hidden_bytes, LmHeadBuffers};
 use crate::qwen36_moe_persistent_decode::PersistentScratch;
 use crate::qwen36_moe_state::{restore_linear_attn_state, LinearAttnSnapshot};
 use crate::qwen36_moe_timing::Qwen36StageTimingTotals;
@@ -91,6 +92,37 @@ pub(crate) fn restore_and_replay_accepted_prefix(
         })?;
     }
     Ok(())
+}
+
+pub(crate) struct Qwen36SingleLmHeadTop1<'a> {
+    pub(crate) ordinal: usize,
+    pub(crate) geom: &'a MultiLayerGeom,
+    pub(crate) final_norm_w: &'a GpuBuffer,
+    pub(crate) lm_head_w: &'a GpuBuffer,
+    pub(crate) final_hidden: &'a mut GpuBuffer,
+    pub(crate) logits: &'a mut GpuBuffer,
+    pub(crate) counter: &'a mut GpuBuffer,
+    pub(crate) stage_timings: &'a mut Qwen36StageTimingTotals,
+    pub(crate) final_hidden_bytes: &'a [u8],
+}
+
+pub(crate) fn run_single_lm_head_top1(args: Qwen36SingleLmHeadTop1<'_>) -> Result<u32> {
+    let t_lm_head_start = std::time::Instant::now();
+    let logits_bytes = launch_lm_head_from_final_hidden_bytes(
+        args.ordinal,
+        args.geom,
+        args.final_hidden_bytes,
+        LmHeadBuffers {
+            final_norm_w: args.final_norm_w,
+            lm_head_w: args.lm_head_w,
+            final_hidden: args.final_hidden,
+            logits: args.logits,
+            counter: args.counter,
+        },
+    )
+    .context("spec verify GPU lm_head")?;
+    args.stage_timings.record_lm_head(t_lm_head_start.elapsed());
+    Ok(argmax_bf16_logits(&logits_bytes))
 }
 
 pub(crate) struct Qwen36BatchedLmHeadTop1<'a> {

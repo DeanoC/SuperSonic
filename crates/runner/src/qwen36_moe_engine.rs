@@ -18,12 +18,11 @@ use model_store::BakedStore;
 
 use crate::qwen36_moe_bake::{ensure_qwen36_bake, select_decode_bake};
 use crate::qwen36_moe_chain::{run_chain_step, Qwen36ChainStep};
-use crate::qwen36_moe_decode::{argmax_bf16_logits, XorshiftRng};
+use crate::qwen36_moe_decode::XorshiftRng;
 use crate::qwen36_moe_dry_run::{print_report, run_qwen36_moe_dry_run, DryRunReport};
 use crate::qwen36_moe_generation::{run_generation_step, Qwen36GenerationStep};
 use crate::qwen36_moe_geom::build_multi_layer_geom;
 use crate::qwen36_moe_host::lookup_embed_row;
-use crate::qwen36_moe_lm_head::{launch_lm_head_from_final_hidden_bytes, LmHeadBuffers};
 use crate::qwen36_moe_loop::Qwen36DecodeLoopState;
 use crate::qwen36_moe_output::{
     print_decode_stream_start, print_generation_summary, print_last_logits_if_requested,
@@ -37,8 +36,9 @@ use crate::qwen36_moe_prompt::{
 };
 use crate::qwen36_moe_session::{prepare_decode_session, Qwen36DecodeSession};
 use crate::qwen36_moe_spec_verify::{
-    restore_and_replay_accepted_prefix, run_batched_lm_head_top1, run_spec_chain_step,
-    Qwen36BatchedLmHeadTop1, Qwen36SpecChainStep, Qwen36SpecReplayAccepted,
+    restore_and_replay_accepted_prefix, run_batched_lm_head_top1, run_single_lm_head_top1,
+    run_spec_chain_step, Qwen36BatchedLmHeadTop1, Qwen36SingleLmHeadTop1, Qwen36SpecChainStep,
+    Qwen36SpecReplayAccepted,
 };
 use crate::qwen36_moe_speculative::{
     run_speculative_decode_step, run_speculative_decode_step_batched,
@@ -546,25 +546,18 @@ fn decode_text(
                             emit_stage_timings,
                         })?;
 
-                        let t_lm_head_start = std::time::Instant::now();
-                        let logits_bytes = launch_lm_head_from_final_hidden_bytes(
+                        let top1 = run_single_lm_head_top1(Qwen36SingleLmHeadTop1 {
                             ordinal,
-                            &geom,
-                            &outputs.final_hidden_bytes,
-                            LmHeadBuffers {
-                                final_norm_w: &final_norm_w_buf,
-                                lm_head_w: &lm_head_w_buf,
-                                final_hidden: &mut final_hidden_buf,
-                                logits: &mut logits_buf,
-                                counter: &mut counter_buf,
-                            },
-                        )
-                        .context("spec verify GPU lm_head")?;
-                        stage_timings.record_lm_head(t_lm_head_start.elapsed());
-                        Ok((
-                            argmax_bf16_logits(&logits_bytes),
-                            outputs.final_hidden_bytes,
-                        ))
+                            geom: &geom,
+                            final_norm_w: &final_norm_w_buf,
+                            lm_head_w: &lm_head_w_buf,
+                            final_hidden: &mut final_hidden_buf,
+                            logits: &mut logits_buf,
+                            counter: &mut counter_buf,
+                            stage_timings: &mut stage_timings,
+                            final_hidden_bytes: &outputs.final_hidden_bytes,
+                        })?;
+                        Ok((top1, outputs.final_hidden_bytes))
                     },
                 )
                 .context("speculative decode step")?
