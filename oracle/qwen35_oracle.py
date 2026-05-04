@@ -3,8 +3,10 @@
 import argparse
 import json
 import time
+from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM
@@ -38,6 +40,22 @@ def parse_args() -> argparse.Namespace:
         type=int,
         help="Optional prompt-token position whose prefill final-norm/logit row should be emitted.",
     )
+    parser.add_argument(
+        "--kv-quant-capture-npz",
+        type=Path,
+        help="Optional path to write full-attention prefill q/k/v tensors for kv_quant_research.py.",
+    )
+    parser.add_argument(
+        "--kv-quant-capture-position",
+        type=int,
+        default=-1,
+        help="Prompt-token position to use for captured query rows; negative indexes from the end.",
+    )
+    parser.add_argument(
+        "--kv-quant-capture-only",
+        action="store_true",
+        help="After writing --kv-quant-capture-npz, emit a small status payload and skip oracle trace JSON.",
+    )
     return parser.parse_args()
 
 
@@ -51,6 +69,8 @@ def repeat_kv_local(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
 
 def main() -> None:
     args = parse_args()
+    if args.kv_quant_capture_only and args.kv_quant_capture_npz is None:
+        raise SystemExit("--kv-quant-capture-only requires --kv-quant-capture-npz")
     prompt_ids = [int(part) for part in args.prompt_ids.split(",") if part]
     if not prompt_ids:
         raise SystemExit("prompt ids must not be empty")
@@ -68,6 +88,140 @@ def main() -> None:
     load_elapsed_ms = (time.perf_counter() - load_started) * 1000.0
 
     input_ids = torch.tensor([prompt_ids], dtype=torch.long, device=target_device)
+    if args.kv_quant_capture_only:
+        capture_phase = "prefill"
+        kv_capture: dict[int, dict[str, torch.Tensor]] = {}
+        rotary_cos = None
+        rotary_sin = None
+
+        def capture_tensor_local(output):
+            tensor = output[0] if isinstance(output, tuple) else output
+            return tensor.detach().to(dtype=torch.float32).cpu()
+
+        def make_capture_hooks(layer_idx: int):
+            layer = model.model.layers[layer_idx]
+            attn = layer.self_attn
+            kv_capture[layer_idx] = {}
+
+            def q_proj_hook(_module, _inputs, output):
+                if capture_phase == "prefill":
+                    kv_capture[layer_idx]["q"] = capture_tensor_local(output)
+
+            def k_proj_hook(_module, _inputs, output):
+                if capture_phase == "prefill":
+                    kv_capture[layer_idx]["k"] = capture_tensor_local(output)
+
+            def v_proj_hook(_module, _inputs, output):
+                if capture_phase == "prefill":
+                    kv_capture[layer_idx]["v"] = capture_tensor_local(output)
+
+            return [
+                attn.q_proj.register_forward_hook(q_proj_hook),
+                attn.k_proj.register_forward_hook(k_proj_hook),
+                attn.v_proj.register_forward_hook(v_proj_hook),
+            ]
+
+        def rotary_hook(_module, _inputs, output):
+            nonlocal rotary_cos
+            nonlocal rotary_sin
+            if capture_phase != "prefill":
+                return
+            cos, sin = output
+            rotary_cos = cos.detach().to(dtype=torch.float32).cpu()
+            rotary_sin = sin.detach().to(dtype=torch.float32).cpu()
+
+        handles = []
+        for layer_idx, layer in enumerate(model.model.layers):
+            if hasattr(layer, "self_attn"):
+                handles.extend(make_capture_hooks(layer_idx))
+        rotary_handle = model.model.rotary_emb.register_forward_hook(rotary_hook)
+        try:
+            with torch.no_grad():
+                model(input_ids=input_ids, use_cache=True)
+        finally:
+            for handle in handles:
+                handle.remove()
+            rotary_handle.remove()
+
+        if rotary_cos is None or rotary_sin is None:
+            raise RuntimeError("missing rotary_emb output for KV quantization capture")
+        seq_len = input_ids.shape[1]
+        capture_position = args.kv_quant_capture_position
+        if capture_position < 0:
+            capture_position += seq_len
+        if capture_position < 0 or capture_position >= seq_len:
+            raise RuntimeError(
+                f"kv-quant-capture-position={args.kv_quant_capture_position} is out of range "
+                f"for prompt length {seq_len}"
+            )
+        cos = rotary_cos.to(device=input_ids.device, dtype=model.dtype)
+        sin = rotary_sin.to(device=input_ids.device, dtype=model.dtype)
+        q_layers = []
+        k_layers = []
+        v_layers = []
+        layer_ids = []
+        for layer_idx in sorted(kv_capture):
+            layer_capture = kv_capture[layer_idx]
+            if not {"q", "k", "v"}.issubset(layer_capture):
+                continue
+            attn = model.model.layers[layer_idx].self_attn
+            head_dim = int(attn.head_dim)
+            q_raw = layer_capture["q"]
+            k_raw = layer_capture["k"]
+            v_raw = layer_capture["v"]
+            num_heads = q_raw.shape[-1] // (head_dim * 2)
+            num_kv_heads = k_raw.shape[-1] // head_dim
+            q = q_raw.reshape(input_ids.shape[0], seq_len, num_heads, head_dim * 2)[..., :head_dim]
+            k = k_raw.reshape(input_ids.shape[0], seq_len, num_kv_heads, head_dim)
+            value = (
+                v_raw.reshape(input_ids.shape[0], seq_len, num_kv_heads, head_dim)
+                .transpose(1, 2)
+                .contiguous()
+            )
+            q_weight = attn.q_norm.weight.detach().to(dtype=torch.float32).cpu()
+            k_weight = attn.k_norm.weight.detach().to(dtype=torch.float32).cpu()
+            q_eps = getattr(attn.q_norm, "variance_epsilon", getattr(attn.q_norm, "eps"))
+            k_eps = getattr(attn.k_norm, "variance_epsilon", getattr(attn.k_norm, "eps"))
+            q_normed = q * torch.rsqrt(q.pow(2).mean(dim=-1, keepdim=True) + q_eps)
+            k_normed = k * torch.rsqrt(k.pow(2).mean(dim=-1, keepdim=True) + k_eps)
+            q_prepared = (q_normed * (q_weight + 1.0)).transpose(1, 2).contiguous()
+            k_prepared = (k_normed * (k_weight + 1.0)).transpose(1, 2).contiguous()
+            q_rot, k_rot = apply_rotary_pos_emb(
+                q_prepared.to(device=input_ids.device, dtype=model.dtype),
+                k_prepared.to(device=input_ids.device, dtype=model.dtype),
+                cos,
+                sin,
+            )
+            q_layers.append(q_rot[0, :, capture_position, :].to(dtype=torch.float32).cpu().numpy())
+            k_layers.append(k_rot[0].to(dtype=torch.float32).cpu().numpy())
+            v_layers.append(value[0].to(dtype=torch.float32).cpu().numpy())
+            layer_ids.append(layer_idx)
+        if not q_layers:
+            raise RuntimeError("no full-attention q/k/v tensors were captured")
+        capture_path = args.kv_quant_capture_npz
+        capture_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez(
+            capture_path,
+            q=np.stack(q_layers, axis=0),
+            k=np.stack(k_layers, axis=0),
+            v=np.stack(v_layers, axis=0),
+            layer_ids=np.asarray(layer_ids, dtype=np.int32),
+            prompt_position=np.asarray(capture_position, dtype=np.int32),
+            prompt_tokens=np.asarray(prompt_ids, dtype=np.int32),
+        )
+        print(
+            json.dumps(
+                {
+                    "kv_quant_capture_npz": str(capture_path),
+                    "captured_full_attention_layers": layer_ids,
+                    "prompt_tokens": prompt_ids,
+                    "prompt_position": capture_position,
+                    "load_ms": load_elapsed_ms,
+                }
+            )
+        )
+        return
+
     prefill_started = time.perf_counter()
     with torch.no_grad():
         outputs = model(input_ids=input_ids, use_cache=True)
@@ -217,6 +371,8 @@ def main() -> None:
     trace_full_rotated_key_output = None
     trace_full_raw_attention_output = None
     trace_full_attention_output = None
+    kv_quant_capture: dict[int, dict[str, torch.Tensor]] = {}
+    kv_quant_capture_saved_path = None
     trace_mlp_post_attention_layernorm_input = None
     trace_mlp_post_attention_layernorm_output = None
     trace_mlp_gate_proj_output = None
@@ -554,7 +710,11 @@ def main() -> None:
         first_layer_linear_post_conv_output = post_conv
         if first_layer_linear_qkv_output is None:
             raise RuntimeError("linear_qkv hook must run before linear_conv hook")
-        qkv = first_layer_linear_qkv_output.transpose(1, 2).contiguous()
+        qkv = (
+            first_layer_linear_qkv_output.transpose(1, 2)
+            .contiguous()
+            .to(device=_module.weight.device, dtype=torch.float32)
+        )
         direct_conv = F.conv1d(
             qkv,
             _module.weight.detach().to(dtype=torch.float32),
@@ -855,14 +1015,112 @@ def main() -> None:
             attn.o_proj.register_forward_pre_hook(o_proj_pre_hook),
         ]
 
+    def make_kv_quant_capture_hooks(layer_idx: int):
+        layer = model.model.layers[layer_idx]
+        attn = layer.self_attn
+        kv_quant_capture[layer_idx] = {}
+
+        def q_proj_hook(_module, _inputs, output):
+            if capture_phase != "prefill":
+                return
+            kv_quant_capture[layer_idx]["q"] = capture_tensor(output)
+
+        def k_proj_hook(_module, _inputs, output):
+            if capture_phase != "prefill":
+                return
+            kv_quant_capture[layer_idx]["k"] = capture_tensor(output)
+
+        def v_proj_hook(_module, _inputs, output):
+            if capture_phase != "prefill":
+                return
+            kv_quant_capture[layer_idx]["v"] = capture_tensor(output)
+
+        return [
+            attn.q_proj.register_forward_hook(q_proj_hook),
+            attn.k_proj.register_forward_hook(k_proj_hook),
+            attn.v_proj.register_forward_hook(v_proj_hook),
+        ]
+
     def trace_rotary_emb_hook(_module, _inputs, output):
         nonlocal trace_full_rotary_cos
         nonlocal trace_full_rotary_sin
-        if capture_phase != "prefill" or trace_full_layer_idx is None:
+        if (
+            capture_phase != "prefill"
+            or (trace_full_layer_idx is None and args.kv_quant_capture_npz is None)
+        ):
             return
         cos, sin = output
         trace_full_rotary_cos = cos.detach().to(dtype=torch.float32).cpu()
         trace_full_rotary_sin = sin.detach().to(dtype=torch.float32).cpu()
+
+    def save_kv_quant_capture(path: Path) -> None:
+        nonlocal kv_quant_capture_saved_path
+        if trace_full_rotary_cos is None or trace_full_rotary_sin is None:
+            raise RuntimeError("missing rotary_emb output for KV quantization capture")
+        seq_len = input_ids.shape[1]
+        capture_position = args.kv_quant_capture_position
+        if capture_position < 0:
+            capture_position += seq_len
+        if capture_position < 0 or capture_position >= seq_len:
+            raise RuntimeError(
+                f"kv-quant-capture-position={args.kv_quant_capture_position} is out of range "
+                f"for prompt length {seq_len}"
+            )
+        cos = trace_full_rotary_cos.to(device=input_ids.device, dtype=model.dtype)
+        sin = trace_full_rotary_sin.to(device=input_ids.device, dtype=model.dtype)
+        q_layers = []
+        k_layers = []
+        v_layers = []
+        layer_ids = []
+        for layer_idx in sorted(kv_quant_capture):
+            layer_capture = kv_quant_capture[layer_idx]
+            if not {"q", "k", "v"}.issubset(layer_capture):
+                continue
+            attn = model.model.layers[layer_idx].self_attn
+            head_dim = int(attn.head_dim)
+            q_raw = layer_capture["q"]
+            k_raw = layer_capture["k"]
+            v_raw = layer_capture["v"]
+            num_heads = q_raw.shape[-1] // (head_dim * 2)
+            num_kv_heads = k_raw.shape[-1] // head_dim
+            q = q_raw.reshape(input_ids.shape[0], seq_len, num_heads, head_dim * 2)[..., :head_dim]
+            k = k_raw.reshape(input_ids.shape[0], seq_len, num_kv_heads, head_dim)
+            value = (
+                v_raw.reshape(input_ids.shape[0], seq_len, num_kv_heads, head_dim)
+                .transpose(1, 2)
+                .contiguous()
+            )
+            q_weight = attn.q_norm.weight.detach().to(dtype=torch.float32).cpu()
+            k_weight = attn.k_norm.weight.detach().to(dtype=torch.float32).cpu()
+            q_eps = getattr(attn.q_norm, "variance_epsilon", getattr(attn.q_norm, "eps"))
+            k_eps = getattr(attn.k_norm, "variance_epsilon", getattr(attn.k_norm, "eps"))
+            q_normed = q * torch.rsqrt(q.pow(2).mean(dim=-1, keepdim=True) + q_eps)
+            k_normed = k * torch.rsqrt(k.pow(2).mean(dim=-1, keepdim=True) + k_eps)
+            q_prepared = (q_normed * (q_weight + 1.0)).transpose(1, 2).contiguous()
+            k_prepared = (k_normed * (k_weight + 1.0)).transpose(1, 2).contiguous()
+            q_rot, k_rot = apply_rotary_pos_emb(
+                q_prepared.to(device=input_ids.device, dtype=model.dtype),
+                k_prepared.to(device=input_ids.device, dtype=model.dtype),
+                cos,
+                sin,
+            )
+            q_layers.append(q_rot[0, :, capture_position, :].to(dtype=torch.float32).cpu().numpy())
+            k_layers.append(k_rot[0].to(dtype=torch.float32).cpu().numpy())
+            v_layers.append(value[0].to(dtype=torch.float32).cpu().numpy())
+            layer_ids.append(layer_idx)
+        if not q_layers:
+            raise RuntimeError("no full-attention q/k/v tensors were captured")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez(
+            path,
+            q=np.stack(q_layers, axis=0),
+            k=np.stack(k_layers, axis=0),
+            v=np.stack(v_layers, axis=0),
+            layer_ids=np.asarray(layer_ids, dtype=np.int32),
+            prompt_position=np.asarray(capture_position, dtype=np.int32),
+            prompt_tokens=np.asarray(prompt_ids, dtype=np.int32),
+        )
+        kv_quant_capture_saved_path = str(path)
 
     def make_trace_mlp_hooks(layer_idx: int):
         layer = model.model.layers[layer_idx]
@@ -1398,6 +1656,13 @@ def main() -> None:
             )
         trace_full_handles = make_trace_full_hooks(trace_full_layer_idx)
         trace_rotary_handle = model.model.rotary_emb.register_forward_hook(trace_rotary_emb_hook)
+    kv_quant_capture_handles: list[Any] = []
+    if args.kv_quant_capture_npz is not None:
+        for layer_idx, layer in enumerate(model.model.layers):
+            if hasattr(layer, "self_attn"):
+                kv_quant_capture_handles.extend(make_kv_quant_capture_hooks(layer_idx))
+        if trace_rotary_handle is None:
+            trace_rotary_handle = model.model.rotary_emb.register_forward_hook(trace_rotary_emb_hook)
     trace_mlp_handles: list[Any] = []
     if trace_mlp_layer_idx is not None:
         if trace_mlp_layer_idx < 0 or trace_mlp_layer_idx >= len(model.model.layers):
@@ -1504,6 +1769,8 @@ def main() -> None:
             handle.remove()
         for handle in trace_full_handles:
             handle.remove()
+        for handle in kv_quant_capture_handles:
+            handle.remove()
         if trace_rotary_handle is not None:
             trace_rotary_handle.remove()
         for handle in trace_mlp_handles:
@@ -1512,6 +1779,21 @@ def main() -> None:
             handle.remove()
         for handle in decoder_layer_handles:
             handle.remove()
+
+    if args.kv_quant_capture_npz is not None:
+        save_kv_quant_capture(args.kv_quant_capture_npz)
+        if args.kv_quant_capture_only:
+            print(
+                json.dumps(
+                    {
+                        "kv_quant_capture_npz": kv_quant_capture_saved_path,
+                        "captured_full_attention_layers": sorted(kv_quant_capture.keys()),
+                        "prompt_tokens": prompt_ids,
+                        "kv_quant_capture_position": args.kv_quant_capture_position,
+                    }
+                )
+            )
+            return
 
     if trace_full_q_and_gate_output is not None and trace_full_k_proj_output is not None:
         trace_full_attn = model.model.layers[trace_full_layer_idx].self_attn
@@ -1879,6 +2161,7 @@ def main() -> None:
         "trace_full_layer": trace_full_layer_idx,
         "trace_mlp_layer": trace_mlp_layer_idx,
         "trace_position": trace_position_idx,
+        "kv_quant_capture_npz": kv_quant_capture_saved_path,
         "trace_position_prefill_final_norm_output": trace_position_prefill_final_norm_output,
         "trace_position_prefill_logits": trace_position_prefill_logits,
         "trace_linear_input_layernorm_output": trace_linear_input_layernorm_output.tolist() if trace_linear_input_layernorm_output is not None else None,
