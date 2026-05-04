@@ -45,7 +45,6 @@ mod tensor_bytes;
 mod validate;
 
 use std::env;
-use std::path::Path;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -59,6 +58,7 @@ use gemma4_runtime::{
     check_gemma4_vram, load_gemma4_runtime, load_gemma4_startup, validate_gemma4_startup,
     Gemma4Runtime, Gemma4Startup,
 };
+pub(crate) use model_files::{load_tokenizer, resolve_prompt_token_ids};
 use policy::{
     q4km_like, validate_dflash_flags, validate_gfx942_policy, validate_global_flags,
     validate_specprefill_flags,
@@ -121,22 +121,6 @@ fn resolve_oracle_device(spec: &str, backend: Backend, ordinal: usize) -> String
         },
         other => other.to_string(),
     }
-}
-
-fn load_tokenizer(tokenizer_path: &Path) -> Result<tokenizers::Tokenizer> {
-    tokenizers::Tokenizer::from_file(tokenizer_path)
-        .map_err(|e| anyhow::anyhow!("loading tokenizer {}: {e}", tokenizer_path.display()))
-}
-
-fn resolve_prompt_token_ids(cli: &Cli, tokenizer: &tokenizers::Tokenizer) -> Result<Vec<u32>> {
-    let encoding = tokenizer
-        .encode(cli.prompt.as_str(), !cli.prompt_no_special_tokens)
-        .map_err(|e| anyhow::anyhow!("tokenizer encode failed: {e}"))?;
-    let prompt_ids: Vec<u32> = encoding.get_ids().to_vec();
-    if prompt_ids.is_empty() {
-        anyhow::bail!("prompt tokenization produced 0 tokens");
-    }
-    Ok(prompt_ids)
 }
 
 #[derive(Parser)]
