@@ -4,6 +4,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <cuda/atomic>
 #include <math.h>
 #include <stdint.h>
 #include <string.h>
@@ -26,27 +27,38 @@ using hip_bfloat16 = __nv_bfloat16;
 #define hipDeviceSynchronize cudaDeviceSynchronize
 
 __device__ __forceinline__ unsigned int supersonic_cuda_atomic_load_u32(
-    const unsigned int* ptr,
+    unsigned int* ptr,
     int order) {
-    unsigned int value = *(const volatile unsigned int*)ptr;
-    if (order != __ATOMIC_RELAXED) {
-        __threadfence();
+    cuda::atomic_ref<unsigned int, cuda::thread_scope_device> atom(*ptr);
+    switch (order) {
+        case __ATOMIC_ACQUIRE:
+        case __ATOMIC_ACQ_REL:
+        case __ATOMIC_SEQ_CST:
+            return atom.load(cuda::memory_order_acquire);
+        default:
+            return atom.load(cuda::memory_order_relaxed);
     }
-    return value;
 }
 
 __device__ __forceinline__ void supersonic_cuda_atomic_store_u32(
     unsigned int* ptr,
     unsigned int value,
     int order) {
-    if (order != __ATOMIC_RELAXED) {
-        __threadfence();
+    cuda::atomic_ref<unsigned int, cuda::thread_scope_device> atom(*ptr);
+    switch (order) {
+        case __ATOMIC_RELEASE:
+        case __ATOMIC_ACQ_REL:
+        case __ATOMIC_SEQ_CST:
+            atom.store(value, cuda::memory_order_release);
+            break;
+        default:
+            atom.store(value, cuda::memory_order_relaxed);
+            break;
     }
-    *(volatile unsigned int*)ptr = value;
 }
 
 #define __atomic_load_n(ptr, order) \
-    supersonic_cuda_atomic_load_u32((const unsigned int*)(ptr), (order))
+    supersonic_cuda_atomic_load_u32((unsigned int*)(ptr), (order))
 #define __atomic_store_n(ptr, val, order) \
     supersonic_cuda_atomic_store_u32((unsigned int*)(ptr), (unsigned int)(val), (order))
 
