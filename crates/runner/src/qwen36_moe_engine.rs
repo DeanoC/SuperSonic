@@ -18,16 +18,15 @@ use model_store::BakedStore;
 
 use crate::qwen36_moe_bake::{ensure_qwen36_bake, select_decode_bake};
 use crate::qwen36_moe_chain::{run_chain_step, Qwen36ChainStep};
-use crate::qwen36_moe_decode::{argmax_bf16_logits, run_chained_decode_fast, XorshiftRng};
+use crate::qwen36_moe_decode::XorshiftRng;
 use crate::qwen36_moe_dry_run::{print_report, run_qwen36_moe_dry_run, DryRunReport};
 use crate::qwen36_moe_generation::{run_generation_step, Qwen36GenerationStep};
 use crate::qwen36_moe_geom::build_multi_layer_geom;
 use crate::qwen36_moe_host::lookup_embed_row;
-use crate::qwen36_moe_lm_head::{launch_lm_head_from_final_hidden_bytes, LmHeadBuffers};
 use crate::qwen36_moe_loop::Qwen36DecodeLoopState;
 use crate::qwen36_moe_output::{
-    print_decode_stream_start, print_decoded_token, print_generation_summary,
-    print_last_logits_if_requested, print_sampling_summary,
+    print_decode_stream_start, print_generation_summary, print_last_logits_if_requested,
+    print_sampling_summary,
 };
 use crate::qwen36_moe_policy::{
     resolve_context_size, validate_decode_backend, validate_persistent_kv_fp8_flags,
@@ -36,10 +35,15 @@ use crate::qwen36_moe_prompt::{
     prepare_prompt, print_prompt_summary, validate_speculative_sampling,
 };
 use crate::qwen36_moe_session::{prepare_decode_session, Qwen36DecodeSession};
+use crate::qwen36_moe_spec_verify::{
+    restore_and_replay_accepted_prefix, run_batched_spec_verify_inputs, run_single_lm_head_top1,
+    run_spec_chain_step, Qwen36BatchedSpecVerifyInputs, Qwen36SingleLmHeadTop1,
+    Qwen36SpecChainStep, Qwen36SpecReplayAccepted,
+};
 use crate::qwen36_moe_speculative::{
     run_speculative_decode_step, run_speculative_decode_step_batched,
 };
-use crate::qwen36_moe_state::{refresh_linear_attn_state, restore_linear_attn_state};
+use crate::qwen36_moe_state::refresh_linear_attn_state;
 use crate::qwen36_moe_telemetry::{print_and_write_moe_residency_summary, MoeRouteRuntime};
 use crate::qwen36_moe_timing::{Qwen36StageTimingTotals, SamplingParams};
 use crate::qwen36_moe_vmm::{
@@ -154,8 +158,6 @@ fn decode_text(
     kv_fp8: bool,
     dump_last_logits: bool,
 ) -> Result<()> {
-    use std::io::Write as _;
-
     validate_speculative_sampling(speculative_decode, sampling)?;
 
     let weight_prefix = report.kernel_params.weight_prefix;
@@ -422,8 +424,7 @@ fn decode_text(
             // available draft count is `headroom - 1`. If headroom <=
             // 1 we can still emit 1 token via the K=0 fallback; if
             // headroom == 0 we already broke out above.
-            let headroom = loop_state.remaining_generation_slots();
-            let dynamic_k = QWEN36_NUM_SPECULATIVE_TOKENS.min(headroom.saturating_sub(1));
+            let dynamic_k = loop_state.speculative_draft_count(QWEN36_NUM_SPECULATIVE_TOKENS);
             let h_base = outputs.final_hidden_bytes.clone();
             // P2: thread spec-verify timings into the engine-level
             // accumulators so `--emit-stage-timings` reports honest
@@ -458,82 +459,19 @@ fn decode_text(
                     loop_state.position,
                     dynamic_k,
                     |inputs| -> anyhow::Result<Vec<(u32, Vec<u8>)>> {
-                        let n = inputs.len();
-                        if n == 0 {
-                            return Ok(Vec::new());
-                        }
-                        let hidden = geom.hidden as usize;
-
-                        // K+1 sequential chains, accumulate final_hiddens.
-                        let mut final_hiddens: Vec<Vec<u8>> = Vec::with_capacity(n);
-                        for &(pos, input) in inputs {
-                            let t_embed_start = std::time::Instant::now();
-                            let initial_hidden = lookup_embed_row(
-                                &store,
-                                weight_prefix,
-                                input as usize,
-                                geom.hidden as usize,
-                            )?;
-                            stage_timings.record_embed(t_embed_start.elapsed());
-
-                            let t_chain_start = std::time::Instant::now();
-                            let chain_outputs = if let Some(scratch) = persistent_scratch.as_mut() {
-                                scratch.run(ordinal, &initial_hidden, pos, None)?
-                            } else {
-                                run_chained_decode_fast(
-                                    ordinal,
-                                    &geom,
-                                    &mut layers,
-                                    &initial_hidden,
-                                    pos,
-                                    emit_stage_timings,
-                                )?
-                            };
-                            stage_timings.record_chain(t_chain_start.elapsed(), &chain_outputs);
-                            stage_timings.count_generation_step();
-                            final_hiddens.push(chain_outputs.final_hidden_bytes);
-                        }
-
-                        // ONE batched lm_head over [n, hidden].
-                        let t_lm_head_start = std::time::Instant::now();
-                        let mut concat = Vec::with_capacity(n * hidden * 2);
-                        for fh in &final_hiddens {
-                            concat.extend_from_slice(fh);
-                        }
-                        let fh_buf = gpu_hal::GpuBuffer::from_host_bytes(
+                        run_batched_spec_verify_inputs(Qwen36BatchedSpecVerifyInputs {
                             ordinal,
-                            gpu_hal::ScalarType::BF16,
-                            &[n, hidden],
-                            &concat,
-                        )?;
-                        let mut logits_buf_b = gpu_hal::GpuBuffer::zeros(
-                            ordinal,
-                            gpu_hal::ScalarType::BF16,
-                            &[n, geom.vocab as usize],
-                        )?;
-                        kernel_ffi::qwen36_moe::lm_head_batched_launch(
-                            ordinal,
-                            n as i32,
-                            geom.hidden,
-                            geom.vocab,
-                            geom.rms_norm_eps,
-                            &fh_buf,
-                            &final_norm_w_buf,
-                            &lm_head_w_buf,
-                            &mut logits_buf_b,
-                            None,
-                        )?;
-                        let logits_bytes =
-                            logits_buf_b.to_host_bytes().context("d2h batched logits")?;
-                        stage_timings.record_lm_head(t_lm_head_start.elapsed());
-
-                        let row_bytes = geom.vocab as usize * 2;
-                        let mut results: Vec<(u32, Vec<u8>)> = Vec::with_capacity(n);
-                        for (i, fh) in final_hiddens.into_iter().enumerate() {
-                            let row = &logits_bytes[i * row_bytes..(i + 1) * row_bytes];
-                            results.push((argmax_bf16_logits(row), fh));
-                        }
-                        Ok(results)
+                            geom: &geom,
+                            store: &store,
+                            weight_prefix,
+                            layers: &mut layers,
+                            persistent_scratch: persistent_scratch.as_mut(),
+                            final_norm_w: &final_norm_w_buf,
+                            lm_head_w: &lm_head_w_buf,
+                            stage_timings: &mut stage_timings,
+                            inputs,
+                            emit_stage_timings,
+                        })
                     },
                 )
                 .context("batched speculative decode step")?;
@@ -546,48 +484,22 @@ fn decode_text(
                 // drafts[K-1], one more chain's worth advances naturally
                 // when next iter feeds the bonus token).
                 if r.n_accepted < dynamic_k {
-                    restore_linear_attn_state(ordinal, &mut layers, snapshot)
-                        .context("restore linear-attn state after partial-accept")?;
                     // Replay (j+1) chains: first_token at the current
                     // position, then the j accepted drafts at the
                     // following positions.
-                    let mut replay: Vec<(i32, u32)> = Vec::with_capacity(r.n_accepted + 1);
-                    replay.push((loop_state.position, next_token));
-                    for (i, &tok) in r.emitted_tokens.iter().take(r.n_accepted).enumerate() {
-                        replay.push((loop_state.position + 1 + i as i32, tok));
-                    }
-                    for &(pos, input) in &replay {
-                        let t_embed_start = std::time::Instant::now();
-                        let initial_hidden = lookup_embed_row(
-                            &store,
-                            weight_prefix,
-                            input as usize,
-                            geom.hidden as usize,
-                        )?;
-                        stage_timings.record_embed(t_embed_start.elapsed());
-                        let t_chain_start = std::time::Instant::now();
-                        let replay_outputs = if let Some(scratch) = persistent_scratch.as_mut() {
-                            scratch.run(ordinal, &initial_hidden, pos, None)?
-                        } else {
-                            run_chained_decode_fast(
-                                ordinal,
-                                &geom,
-                                &mut layers,
-                                &initial_hidden,
-                                pos,
-                                emit_stage_timings,
-                            )?
-                        };
-                        stage_timings.record_chain(t_chain_start.elapsed(), &replay_outputs);
-                        // Per-kernel-class breakdown for replay chains
-                        // contributes to the same accumulators as the
-                        // verify chains so `--emit-stage-timings` reports
-                        // honest full-attn/linear-attn/ffn averages on
-                        // partial-accept iters. Without this the reported
-                        // chain breakdown undercounts actual work as the
-                        // accept rate falls.
-                        stage_timings.count_generation_step();
-                    }
+                    let replay = loop_state.speculative_replay_inputs(next_token, &r);
+                    restore_and_replay_accepted_prefix(Qwen36SpecReplayAccepted {
+                        ordinal,
+                        geom: &geom,
+                        store: &store,
+                        weight_prefix,
+                        layers: &mut layers,
+                        snapshot,
+                        persistent_scratch: persistent_scratch.as_mut(),
+                        stage_timings: &mut stage_timings,
+                        replay_inputs: &replay,
+                        emit_stage_timings,
+                    })?;
                 }
                 r
             } else {
@@ -604,92 +516,39 @@ fn decode_text(
                     loop_state.position,
                     dynamic_k,
                     |pos, input| -> anyhow::Result<(u32, Vec<u8>)> {
-                        // Embed lookup is its own stage in the timing
-                        // breakdown — bundling it into `t_chain` (as the
-                        // first cut of this closure did) systematically
-                        // inflates `chain_ms_avg` and deflates
-                        // `embed_ms_avg` as the MTP accept rate rises.
-                        let t_embed_start = std::time::Instant::now();
-                        let initial_hidden = lookup_embed_row(
-                            &store,
-                            weight_prefix,
-                            input as usize,
-                            geom.hidden as usize,
-                        )?;
-                        stage_timings.record_embed(t_embed_start.elapsed());
-
-                        let t_chain_start = std::time::Instant::now();
-                        let outputs = if let Some(scratch) = persistent_scratch.as_mut() {
-                            scratch.run(ordinal, &initial_hidden, pos, None)?
-                        } else {
-                            run_chained_decode_fast(
-                                ordinal,
-                                &geom,
-                                &mut layers,
-                                &initial_hidden,
-                                pos,
-                                emit_stage_timings,
-                            )?
-                        };
-                        stage_timings.record_chain(t_chain_start.elapsed(), &outputs);
-
-                        let t_lm_head_start = std::time::Instant::now();
-                        let logits_bytes = launch_lm_head_from_final_hidden_bytes(
+                        let outputs = run_spec_chain_step(Qwen36SpecChainStep {
                             ordinal,
-                            &geom,
-                            &outputs.final_hidden_bytes,
-                            LmHeadBuffers {
-                                final_norm_w: &final_norm_w_buf,
-                                lm_head_w: &lm_head_w_buf,
-                                final_hidden: &mut final_hidden_buf,
-                                logits: &mut logits_buf,
-                                counter: &mut counter_buf,
-                            },
-                        )
-                        .context("spec verify GPU lm_head")?;
-                        stage_timings.record_lm_head(t_lm_head_start.elapsed());
-                        // Each verify base step counts as one decode step
-                        // for the per-token average — emitted_tokens.len()
-                        // tokens are committed per spec call, and
-                        // closure-call-count == emitted_tokens.len() in
-                        // both the partial-accept and full-accept (with
-                        // bonus) cases. Bumping here is equivalent to
-                        // "one closure call = one decode step worth of
-                        // base work."
-                        stage_timings.count_generation_step();
-                        Ok((
-                            argmax_bf16_logits(&logits_bytes),
-                            outputs.final_hidden_bytes,
-                        ))
+                            geom: &geom,
+                            store: &store,
+                            weight_prefix,
+                            layers: &mut layers,
+                            persistent_scratch: persistent_scratch.as_mut(),
+                            stage_timings: &mut stage_timings,
+                            position: pos,
+                            input,
+                            emit_stage_timings,
+                        })?;
+
+                        let top1 = run_single_lm_head_top1(Qwen36SingleLmHeadTop1 {
+                            ordinal,
+                            geom: &geom,
+                            final_norm_w: &final_norm_w_buf,
+                            lm_head_w: &lm_head_w_buf,
+                            final_hidden: &mut final_hidden_buf,
+                            logits: &mut logits_buf,
+                            counter: &mut counter_buf,
+                            stage_timings: &mut stage_timings,
+                            final_hidden_bytes: &outputs.final_hidden_bytes,
+                        })?;
+                        Ok((top1, outputs.final_hidden_bytes))
                     },
                 )
                 .context("speculative decode step")?
             };
 
-            // Append emitted tokens. Honour `max_new` and EOS by
-            // breaking out cleanly mid-emission.
-            let mut hit_stop = false;
-            for tok in result.emitted_tokens.iter().copied() {
-                if loop_state.reached_max_new() {
-                    hit_stop = true;
-                    break;
-                }
-                loop_state.generated_ids.push(tok);
-                print_decoded_token(tokenizer.as_ref(), tok);
-                if Some(tok) == eos_id {
-                    hit_stop = true;
-                    break;
-                }
-            }
-            std::io::stdout().flush().ok();
-            loop_state.position += result.emitted_tokens.len() as i32;
-            if hit_stop {
+            if loop_state.append_speculative_emissions(&result, tokenizer.as_ref(), eos_id) {
                 break;
             }
-            loop_state.current_token = *result
-                .emitted_tokens
-                .last()
-                .expect("speculative step must emit at least one token (K=0 fallback ensured)");
         }
     }
 

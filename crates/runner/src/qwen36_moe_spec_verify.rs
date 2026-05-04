@@ -1,0 +1,227 @@
+use anyhow::{Context, Result};
+use gpu_hal::{GpuBuffer, ScalarType};
+use model_store::BakedStore;
+
+use crate::qwen36_moe_decode::{
+    argmax_bf16_logits, run_chained_decode_fast, DecodeOutputs, LayerBuffers, MultiLayerGeom,
+};
+use crate::qwen36_moe_host::lookup_embed_row;
+use crate::qwen36_moe_lm_head::{launch_lm_head_from_final_hidden_bytes, LmHeadBuffers};
+use crate::qwen36_moe_persistent_decode::PersistentScratch;
+use crate::qwen36_moe_state::{restore_linear_attn_state, LinearAttnSnapshot};
+use crate::qwen36_moe_timing::Qwen36StageTimingTotals;
+
+pub(crate) struct Qwen36SpecChainStep<'a> {
+    pub(crate) ordinal: usize,
+    pub(crate) geom: &'a MultiLayerGeom,
+    pub(crate) store: &'a BakedStore,
+    pub(crate) weight_prefix: &'a str,
+    pub(crate) layers: &'a mut [LayerBuffers],
+    pub(crate) persistent_scratch: Option<&'a mut PersistentScratch>,
+    pub(crate) stage_timings: &'a mut Qwen36StageTimingTotals,
+    pub(crate) position: i32,
+    pub(crate) input: u32,
+    pub(crate) emit_stage_timings: bool,
+}
+
+pub(crate) fn run_spec_chain_step(args: Qwen36SpecChainStep<'_>) -> Result<DecodeOutputs> {
+    let t_embed_start = std::time::Instant::now();
+    let initial_hidden = lookup_embed_row(
+        args.store,
+        args.weight_prefix,
+        args.input as usize,
+        args.geom.hidden as usize,
+    )
+    .with_context(|| {
+        format!(
+            "spec verify embed lookup token {} at position {}",
+            args.input, args.position
+        )
+    })?;
+    args.stage_timings.record_embed(t_embed_start.elapsed());
+
+    let t_chain_start = std::time::Instant::now();
+    let outputs = if let Some(scratch) = args.persistent_scratch {
+        scratch.run(args.ordinal, &initial_hidden, args.position, None)?
+    } else {
+        run_chained_decode_fast(
+            args.ordinal,
+            args.geom,
+            args.layers,
+            &initial_hidden,
+            args.position,
+            args.emit_stage_timings,
+        )?
+    };
+    args.stage_timings
+        .record_chain(t_chain_start.elapsed(), &outputs);
+    args.stage_timings.count_generation_step();
+    Ok(outputs)
+}
+
+pub(crate) struct Qwen36SpecReplayAccepted<'a> {
+    pub(crate) ordinal: usize,
+    pub(crate) geom: &'a MultiLayerGeom,
+    pub(crate) store: &'a BakedStore,
+    pub(crate) weight_prefix: &'a str,
+    pub(crate) layers: &'a mut [LayerBuffers],
+    pub(crate) snapshot: &'a LinearAttnSnapshot,
+    pub(crate) persistent_scratch: Option<&'a mut PersistentScratch>,
+    pub(crate) stage_timings: &'a mut Qwen36StageTimingTotals,
+    pub(crate) replay_inputs: &'a [(i32, u32)],
+    pub(crate) emit_stage_timings: bool,
+}
+
+pub(crate) fn restore_and_replay_accepted_prefix(
+    mut args: Qwen36SpecReplayAccepted<'_>,
+) -> Result<()> {
+    restore_linear_attn_state(args.ordinal, args.layers, args.snapshot)
+        .context("restore linear-attn state after partial-accept")?;
+    for &(position, input) in args.replay_inputs {
+        run_spec_chain_step(Qwen36SpecChainStep {
+            ordinal: args.ordinal,
+            geom: args.geom,
+            store: args.store,
+            weight_prefix: args.weight_prefix,
+            layers: args.layers,
+            persistent_scratch: args.persistent_scratch.as_deref_mut(),
+            stage_timings: args.stage_timings,
+            position,
+            input,
+            emit_stage_timings: args.emit_stage_timings,
+        })?;
+    }
+    Ok(())
+}
+
+pub(crate) struct Qwen36BatchedSpecVerifyInputs<'a> {
+    pub(crate) ordinal: usize,
+    pub(crate) geom: &'a MultiLayerGeom,
+    pub(crate) store: &'a BakedStore,
+    pub(crate) weight_prefix: &'a str,
+    pub(crate) layers: &'a mut [LayerBuffers],
+    pub(crate) persistent_scratch: Option<&'a mut PersistentScratch>,
+    pub(crate) final_norm_w: &'a GpuBuffer,
+    pub(crate) lm_head_w: &'a GpuBuffer,
+    pub(crate) stage_timings: &'a mut Qwen36StageTimingTotals,
+    pub(crate) inputs: &'a [(i32, u32)],
+    pub(crate) emit_stage_timings: bool,
+}
+
+pub(crate) fn run_batched_spec_verify_inputs(
+    mut args: Qwen36BatchedSpecVerifyInputs<'_>,
+) -> Result<Vec<(u32, Vec<u8>)>> {
+    if args.inputs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut final_hiddens = Vec::with_capacity(args.inputs.len());
+    for &(position, input) in args.inputs {
+        let chain_outputs = run_spec_chain_step(Qwen36SpecChainStep {
+            ordinal: args.ordinal,
+            geom: args.geom,
+            store: args.store,
+            weight_prefix: args.weight_prefix,
+            layers: args.layers,
+            persistent_scratch: args.persistent_scratch.as_deref_mut(),
+            stage_timings: args.stage_timings,
+            position,
+            input,
+            emit_stage_timings: args.emit_stage_timings,
+        })?;
+        final_hiddens.push(chain_outputs.final_hidden_bytes);
+    }
+
+    run_batched_lm_head_top1(Qwen36BatchedLmHeadTop1 {
+        ordinal: args.ordinal,
+        geom: args.geom,
+        final_norm_w: args.final_norm_w,
+        lm_head_w: args.lm_head_w,
+        stage_timings: args.stage_timings,
+        final_hiddens,
+    })
+}
+
+pub(crate) struct Qwen36SingleLmHeadTop1<'a> {
+    pub(crate) ordinal: usize,
+    pub(crate) geom: &'a MultiLayerGeom,
+    pub(crate) final_norm_w: &'a GpuBuffer,
+    pub(crate) lm_head_w: &'a GpuBuffer,
+    pub(crate) final_hidden: &'a mut GpuBuffer,
+    pub(crate) logits: &'a mut GpuBuffer,
+    pub(crate) counter: &'a mut GpuBuffer,
+    pub(crate) stage_timings: &'a mut Qwen36StageTimingTotals,
+    pub(crate) final_hidden_bytes: &'a [u8],
+}
+
+pub(crate) fn run_single_lm_head_top1(args: Qwen36SingleLmHeadTop1<'_>) -> Result<u32> {
+    let t_lm_head_start = std::time::Instant::now();
+    let logits_bytes = launch_lm_head_from_final_hidden_bytes(
+        args.ordinal,
+        args.geom,
+        args.final_hidden_bytes,
+        LmHeadBuffers {
+            final_norm_w: args.final_norm_w,
+            lm_head_w: args.lm_head_w,
+            final_hidden: args.final_hidden,
+            logits: args.logits,
+            counter: args.counter,
+        },
+    )
+    .context("spec verify GPU lm_head")?;
+    args.stage_timings.record_lm_head(t_lm_head_start.elapsed());
+    Ok(argmax_bf16_logits(&logits_bytes))
+}
+
+pub(crate) struct Qwen36BatchedLmHeadTop1<'a> {
+    pub(crate) ordinal: usize,
+    pub(crate) geom: &'a MultiLayerGeom,
+    pub(crate) final_norm_w: &'a GpuBuffer,
+    pub(crate) lm_head_w: &'a GpuBuffer,
+    pub(crate) stage_timings: &'a mut Qwen36StageTimingTotals,
+    pub(crate) final_hiddens: Vec<Vec<u8>>,
+}
+
+pub(crate) fn run_batched_lm_head_top1(
+    args: Qwen36BatchedLmHeadTop1<'_>,
+) -> Result<Vec<(u32, Vec<u8>)>> {
+    let n = args.final_hiddens.len();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+
+    let hidden = args.geom.hidden as usize;
+    let t_lm_head_start = std::time::Instant::now();
+    let mut concat = Vec::with_capacity(n * hidden * 2);
+    for fh in &args.final_hiddens {
+        concat.extend_from_slice(fh);
+    }
+    let fh_buf = GpuBuffer::from_host_bytes(args.ordinal, ScalarType::BF16, &[n, hidden], &concat)?;
+    let mut logits_buf = GpuBuffer::zeros(
+        args.ordinal,
+        ScalarType::BF16,
+        &[n, args.geom.vocab as usize],
+    )?;
+    kernel_ffi::qwen36_moe::lm_head_batched_launch(
+        args.ordinal,
+        n as i32,
+        args.geom.hidden,
+        args.geom.vocab,
+        args.geom.rms_norm_eps,
+        &fh_buf,
+        args.final_norm_w,
+        args.lm_head_w,
+        &mut logits_buf,
+        None,
+    )?;
+    let logits_bytes = logits_buf.to_host_bytes().context("d2h batched logits")?;
+    args.stage_timings.record_lm_head(t_lm_head_start.elapsed());
+
+    let row_bytes = args.geom.vocab as usize * 2;
+    let mut results = Vec::with_capacity(n);
+    for (i, fh) in args.final_hiddens.into_iter().enumerate() {
+        let row = &logits_bytes[i * row_bytes..(i + 1) * row_bytes];
+        results.push((argmax_bf16_logits(row), fh));
+    }
+    Ok(results)
+}
