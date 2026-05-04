@@ -18,24 +18,40 @@ through the existing `supersonic` CLI and records:
 - dense or sparse VMM residency fields, including total, MoE, and KV bytes
 - JSON plus Markdown summaries under `target/`
 
-Default sweep:
+Preset sweeps:
 
 ```bash
 .venv/bin/python tests/gfx1100/bench_qwen36_longctx.py \
   --binary target/release/supersonic \
   --model-dir /mnt/data/models/Qwen3.6-35B-A3B \
-  --contexts 8192,16384,32768 \
-  --modes int4-vmm,int4-kv-fp8 \
-  --max-new-tokens 16
+  --preset comparison \
+  --out-json target/qwen36_longctx_comparison.json \
+  --out-md target/qwen36_longctx_comparison.md
 ```
+
+`--preset comparison` covers `512,2048,4096,8192` contexts across
+`int4-vmm` and `int4-kv-fp8` with short generation.  It is the first pass to
+run after a merge because it gives a fast answer to "which stage is next?"
+without committing to the 16k/32k profile.  `--preset smoke` is the one-row
+GPU sanity check, `--preset full` keeps the previous 8k/16k/32k sweep, and
+`--preset sparse-comparison` adds sparse MoE cap rows.
 
 Optional sparse-MoE rows can be added with:
 
 ```bash
 .venv/bin/python tests/gfx1100/bench_qwen36_longctx.py \
-  --modes int4-vmm,int4-kv-fp8,sparse,sparse-kv-fp8 \
-  --sparse-caps 320
+  --preset sparse-comparison \
+  --sparse-caps 320 \
+  --out-json target/qwen36_longctx_sparse_comparison.json \
+  --out-md target/qwen36_longctx_sparse_comparison.md
 ```
+
+The Markdown report now starts with a summary table that ranks the best mode
+per context, compares it to the `int4-vmm` baseline, records prefill and
+generation wall timing, and names the likely bottleneck from the chain
+breakdown (`full_attn`, `linear_attn`, `ffn`, or host/output tail fields).
+The JSON report stores the same summary and recommendation alongside raw rows
+so follow-up PRs can quote one artifact instead of manually interpreting logs.
 
 ## VMM Baseline
 
