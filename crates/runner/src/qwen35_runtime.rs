@@ -6,6 +6,10 @@ use crate::decode_engine::{DecodeEngine, DecodeStageTimings};
 use crate::prefill_engine;
 use crate::qwen35_decode_modes::{report_qwen35_decode_modes, resolve_qwen35_decode_modes};
 use crate::qwen35_decode_report::{emit_qwen35_decode_report, Qwen35DecodeReport};
+use crate::qwen35_decode_traces::{
+    qwen35_persistent_decode_trace_enabled, run_qwen35_persistent_decode_traces,
+    Qwen35PersistentDecodeTrace,
+};
 use crate::qwen35_decode_util::{token_history, token_history_with_next};
 use crate::qwen35_engine_setup::{load_qwen35_engine, Qwen35EngineSetup};
 use crate::qwen35_kv_trace::trace_kv_cache;
@@ -17,9 +21,7 @@ use crate::qwen35_startup::{
 };
 use crate::qwen35_trace::{
     trace_component_input_layer, trace_component_layer, trace_component_linear_layer,
-    trace_component_linear_state_layer, trace_persistent_full_attn_layer,
-    trace_persistent_input_layer, trace_persistent_linear_layer,
-    trace_persistent_linear_state_layer,
+    trace_component_linear_state_layer,
 };
 use crate::qwen35_validation::{
     qwen35_oracle_script_path, resolve_qwen_oracle_model_id, run_qwen35_oracle_validation,
@@ -299,82 +301,23 @@ pub(crate) fn run_qwen35(
         let seqlen_offset = seqlen_start + step;
 
         if cli.batch_size > 1 {
-            if let Some(trace_layer) = cli.trace_persistent_linear_state_layer {
+            if qwen35_persistent_decode_trace_enabled(cli) {
                 let trace_token_ids =
                     token_history_with_next(&prompt_ids, &generated_ids, next_token);
                 let trace_tokens = vec![next_token; cli.batch_size];
-                let _ = engine.decode_step_batch_trace_hidden_after_layers(
-                    &trace_tokens,
-                    seqlen_offset,
-                    trace_layer + 1,
-                    0,
-                )?;
-                trace_persistent_linear_state_layer(
-                    &engine,
-                    trace_layer,
-                    trace_token_ids.as_slice(),
-                    ordinal,
-                    params.kv_chunk_size,
-                    cli.prefill_chunk_size,
-                    use_4b_kernel,
-                )?;
-                engine.rebuild_prefill_state(&trace_token_ids, true)?;
-            }
-            if let Some(trace_layer) = cli.trace_persistent_input_layer {
-                let trace_token_ids =
-                    token_history_with_next(&prompt_ids, &generated_ids, next_token);
-                let trace_tokens = vec![next_token; cli.batch_size];
-                let native_hidden = engine.decode_step_batch_trace_hidden_after_layers(
-                    &trace_tokens,
-                    seqlen_offset,
-                    trace_layer,
-                    0,
-                )?;
-                trace_persistent_input_layer(
-                    &engine,
-                    &native_hidden,
-                    trace_layer,
-                    trace_token_ids.as_slice(),
-                    ordinal,
-                    params.kv_chunk_size,
-                    cli.prefill_chunk_size,
-                    use_4b_kernel,
-                )?;
-                engine.rebuild_prefill_state(&trace_token_ids, true)?;
-            }
-            if let Some(trace_layer) = cli.trace_persistent_full_attn_layer {
-                let trace_token_ids =
-                    token_history_with_next(&prompt_ids, &generated_ids, next_token);
-                let trace_tokens = vec![next_token; cli.batch_size];
-                trace_persistent_full_attn_layer(
+                run_qwen35_persistent_decode_traces(
                     &mut engine,
-                    trace_layer,
-                    trace_token_ids.as_slice(),
-                    trace_tokens.as_slice(),
-                    seqlen_offset,
-                    ordinal,
-                    params.kv_chunk_size,
-                    cli.prefill_chunk_size,
-                    use_4b_kernel,
+                    Qwen35PersistentDecodeTrace {
+                        cli,
+                        trace_token_ids: trace_token_ids.as_slice(),
+                        trace_tokens: trace_tokens.as_slice(),
+                        seqlen_offset,
+                        ordinal,
+                        kv_chunk_size: params.kv_chunk_size,
+                        use_4b_kernel,
+                        batch_mode: true,
+                    },
                 )?;
-                engine.rebuild_prefill_state(&trace_token_ids, true)?;
-            }
-            if let Some(trace_layer) = cli.trace_persistent_linear_layer {
-                let trace_token_ids =
-                    token_history_with_next(&prompt_ids, &generated_ids, next_token);
-                let trace_tokens = vec![next_token; cli.batch_size];
-                trace_persistent_linear_layer(
-                    &mut engine,
-                    trace_layer,
-                    trace_token_ids.as_slice(),
-                    trace_tokens.as_slice(),
-                    seqlen_offset,
-                    ordinal,
-                    params.kv_chunk_size,
-                    cli.prefill_chunk_size,
-                    use_4b_kernel,
-                )?;
-                engine.rebuild_prefill_state(&trace_token_ids, true)?;
             }
             let (batch_logits, batch_timings) = if decode_modes.replay_kv_fp8_enabled {
                 let token_ids = token_history_with_next(&prompt_ids, &generated_ids, next_token);
@@ -544,78 +487,22 @@ pub(crate) fn run_qwen35(
                     engine.decode_step(next_token, seqlen_offset)?
                 }
             } else if decode_modes.kernel_single_decode_enabled {
-                if let Some(trace_layer) = cli.trace_persistent_linear_state_layer {
+                if qwen35_persistent_decode_trace_enabled(cli) {
                     let trace_token_ids =
                         token_history_with_next(&prompt_ids, &generated_ids, next_token);
-                    let _ = engine.decode_step_batch_trace_hidden_after_layers(
-                        &[next_token],
-                        seqlen_offset,
-                        trace_layer + 1,
-                        0,
-                    )?;
-                    trace_persistent_linear_state_layer(
-                        &engine,
-                        trace_layer,
-                        trace_token_ids.as_slice(),
-                        ordinal,
-                        params.kv_chunk_size,
-                        cli.prefill_chunk_size,
-                        use_4b_kernel,
-                    )?;
-                    engine.rebuild_prefill_state(&trace_token_ids, false)?;
-                }
-                if let Some(trace_layer) = cli.trace_persistent_input_layer {
-                    let trace_token_ids =
-                        token_history_with_next(&prompt_ids, &generated_ids, next_token);
-                    let native_hidden = engine.decode_step_batch_trace_hidden_after_layers(
-                        &[next_token],
-                        seqlen_offset,
-                        trace_layer,
-                        0,
-                    )?;
-                    trace_persistent_input_layer(
-                        &engine,
-                        &native_hidden,
-                        trace_layer,
-                        trace_token_ids.as_slice(),
-                        ordinal,
-                        params.kv_chunk_size,
-                        cli.prefill_chunk_size,
-                        use_4b_kernel,
-                    )?;
-                    engine.rebuild_prefill_state(&trace_token_ids, false)?;
-                }
-                if let Some(trace_layer) = cli.trace_persistent_full_attn_layer {
-                    let trace_token_ids =
-                        token_history_with_next(&prompt_ids, &generated_ids, next_token);
-                    trace_persistent_full_attn_layer(
+                    run_qwen35_persistent_decode_traces(
                         &mut engine,
-                        trace_layer,
-                        trace_token_ids.as_slice(),
-                        &[next_token],
-                        seqlen_offset,
-                        ordinal,
-                        params.kv_chunk_size,
-                        cli.prefill_chunk_size,
-                        use_4b_kernel,
+                        Qwen35PersistentDecodeTrace {
+                            cli,
+                            trace_token_ids: trace_token_ids.as_slice(),
+                            trace_tokens: &[next_token],
+                            seqlen_offset,
+                            ordinal,
+                            kv_chunk_size: params.kv_chunk_size,
+                            use_4b_kernel,
+                            batch_mode: false,
+                        },
                     )?;
-                    engine.rebuild_prefill_state(&trace_token_ids, false)?;
-                }
-                if let Some(trace_layer) = cli.trace_persistent_linear_layer {
-                    let trace_token_ids =
-                        token_history_with_next(&prompt_ids, &generated_ids, next_token);
-                    trace_persistent_linear_layer(
-                        &mut engine,
-                        trace_layer,
-                        trace_token_ids.as_slice(),
-                        &[next_token],
-                        seqlen_offset,
-                        ordinal,
-                        params.kv_chunk_size,
-                        cli.prefill_chunk_size,
-                        use_4b_kernel,
-                    )?;
-                    engine.rebuild_prefill_state(&trace_token_ids, false)?;
                 }
                 if cli.emit_stage_timings {
                     let (logits, timings) = engine

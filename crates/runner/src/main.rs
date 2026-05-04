@@ -17,6 +17,7 @@ mod prefill_engine;
 mod profiling;
 mod qwen35_decode_modes;
 mod qwen35_decode_report;
+mod qwen35_decode_traces;
 mod qwen35_decode_util;
 mod qwen35_dflash_engine;
 mod qwen35_engine_setup;
