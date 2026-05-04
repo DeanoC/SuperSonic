@@ -195,11 +195,13 @@ combo (or one feature implicitly requires the other to be off).
 ⁴ Dash means "no validated combo exists today" — the underlying
   features apply to disjoint model families (e.g. SpecPrefill is
   Qwen3.5-9B; MoE prefetch is Qwen3.6-MoE).
-⁵ SpecPrefill + KV-FP8 trips a runtime error on the first decode step:
-  the BF16 step-copy fallback added in PR #177 to unblock SpecPrefill
-  on HIP requires BF16 dst buffers, but --kv-fp8 makes them U8 (FP8).
-  Validation should reject the combo until the fallback grows an
-  FP8-quantising path.
+⁵ SpecPrefill + KV-FP8 is rejected upfront by `validate_specprefill_flags`
+  (since 2026-05-04). The underlying issue: the BF16 step-copy fallback
+  added in PR #177 to unblock SpecPrefill on HIP requires BF16 dst
+  buffers, but `--kv-fp8` makes them U8 (FP8). Lifting the gate is a
+  Phase D follow-up — the per-head D2D fallback in
+  `kernel_ffi::certified_kv::copy_step_bf16` (non-CUDA branch) needs
+  a BF16→FP8 quantise-on-the-fly path.
 
 ## Picker recipes — "I want to ..."
 

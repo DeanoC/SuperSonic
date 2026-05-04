@@ -114,6 +114,16 @@ pub(crate) fn validate_specprefill_flags(
         if cli.dflash {
             anyhow::bail!("--specprefill-* and --dflash cannot be combined");
         }
+        if cli.kv_fp8 {
+            anyhow::bail!(
+                "--specprefill-draft-dir cannot be combined with --kv-fp8 today: the \
+                 BF16 step-copy fallback used by the speculator's lookahead decode \
+                 (`kernel_ffi::certified_kv::copy_step_bf16`, added in PR #177) requires \
+                 BF16 destination buffers, but --kv-fp8 makes the K/V cache U8. The combo \
+                 trips a runtime error several seconds into decode. Tracked as a Phase D \
+                 follow-up: extend the per-head D2D fallback to BF16→FP8 quantise on the fly."
+            );
+        }
         if let Some(keep) = cli.specprefill_keep_ratio {
             if !(0.05..=1.0).contains(&keep) {
                 anyhow::bail!("--specprefill-keep-ratio must be in [0.05, 1.0] (got {keep})");
