@@ -55,7 +55,9 @@ use clap::Parser;
 
 pub(crate) use cli::Cli;
 pub(crate) use bakes::{should_fetch_exact_bake, try_download_bake};
-use backend_runtime::resolve_backend;
+use backend_runtime::{
+    install_arch_profile, lookup_registry_entry, query_gpu_info, resolve_backend,
+};
 use gemma4_runtime::run_gemma4;
 pub(crate) use model_files::{load_tokenizer, resolve_prompt_token_ids};
 pub(crate) use backend_runtime::resolve_oracle_device;
@@ -65,7 +67,7 @@ use policy::{
 };
 use profiling::MetalProfileScope;
 use qwen35_runtime::run_qwen35;
-use registry::{Backend, GpuArch, ModelFamily, ModelVariant};
+use registry::{ModelFamily, ModelVariant};
 use supersonic_core::backend::{BackendChoice, BACKEND_CHOICES};
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -93,95 +95,17 @@ fn main() -> Result<()> {
     validate_global_flags(&cli, &model_variant, backend)?;
     let q4km_like = q4km_like(&cli);
     // 2. Detect GPU
-    let (arch_name, total_vram, warp_size) = match backend {
-        Backend::Hip => {
-            let (arch_name, total_vram) = kernel_ffi::query_gpu_info(ordinal)
-                .map_err(|e| anyhow::anyhow!("GPU query failed for device {ordinal}: {e}"))?;
-            let base_arch = arch_name.split(':').next().unwrap_or(&arch_name);
-            let warp_size = if base_arch.starts_with("gfx9") {
-                64
-            } else {
-                32
-            };
-            (arch_name, total_vram, warp_size)
-        }
-        Backend::Cuda => {
-            let info = gpu_hal::query_device_info(backend, ordinal)
-                .map_err(|e| anyhow::anyhow!("GPU query failed for device {ordinal}: {e}"))?;
-            (info.arch_name, info.total_vram_bytes, info.warp_size)
-        }
-        Backend::Metal => {
-            let info = gpu_hal::query_device_info(backend, ordinal)
-                .map_err(|e| anyhow::anyhow!("GPU query failed for device {ordinal}: {e}"))?;
-            (info.arch_name, info.total_vram_bytes, info.warp_size)
-        }
-    };
-    let gpu_arch = GpuArch::from_backend_name(&backend, &arch_name);
-    eprintln!(
-        "[gpu] backend={backend} device={ordinal} arch={arch_name} warp={} vram={:.1}GiB",
-        warp_size,
-        total_vram as f64 / (1024.0 * 1024.0 * 1024.0)
-    );
+    let gpu = query_gpu_info(backend, ordinal)?;
 
     // 3. Registry lookup
-    let entry = match registry::lookup(&model_variant, &backend, &gpu_arch) {
-        Some(e) => e,
-        None => {
-            if let Some(override_arch) = cli.allow_untested_gpu.as_deref() {
-                let reuse_arch = GpuArch::from_backend_name(&backend, override_arch);
-                let e =
-                    registry::lookup(&model_variant, &backend, &reuse_arch).ok_or_else(|| {
-                        let supported_archs =
-                            registry::supported_archs_for(&model_variant, &backend);
-                        anyhow::anyhow!(
-                            "--allow-untested-gpu={override_arch}: no registry entry for \
-                         model={model_variant} backend={backend} arch={reuse_arch}. \
-                         Pass one of: [{}]",
-                            supported_archs.join(", ")
-                        )
-                    })?;
-                eprintln!(
-                    "[gpu] WARNING: detected arch={gpu_arch} has no registry entry; \
-                     reusing {reuse_arch} kernel as requested by --allow-untested-gpu. \
-                     Correctness is not guaranteed."
-                );
-                e
-            } else {
-                let supported_archs = registry::supported_archs_for(&model_variant, &backend);
-                anyhow::bail!(
-                    "No optimized kernel for model={model_variant} backend={backend} arch={gpu_arch}. \
-                     Supported GPU architectures for this model: [{}]. \
-                     To force-reuse another arch's kernel, pass --allow-untested-gpu=<arch>.",
-                    supported_archs.join(", ")
-                );
-            }
-        }
-    };
-    validate_gfx942_policy(&cli, &model_variant, backend, &gpu_arch)?;
-
-    // Install per-arch policy so gpu_hal::alloc dispatches correctly.
-    // `MemoryArchitecture` is informational (used downstream for VRAM
-    // budgeting on APUs); `BufferPolicy` maps caller-side `BufferKind`
-    // intent to the actual `AllocStrategy`. Persistent always uses the
-    // classic device allocator (GPU-cacheable); Scratch may opt into
-    // host-mapped on arches where that's a win — today only gfx1150.
-    // Must be set before any GpuBuffer::alloc, which starts during weight
-    // loading below.
-    let arch_profile = registry::ArchProfile::for_arch(&entry.arch);
-    gpu_hal::set_memory_architecture(arch_profile.memory);
-    gpu_hal::set_buffer_policy(arch_profile.buffer_policy);
-    fn strategy_label(s: gpu_hal::AllocStrategy) -> &'static str {
-        match s {
-            gpu_hal::AllocStrategy::Default => "hipMalloc / cudaMalloc / metal",
-            gpu_hal::AllocStrategy::HostMapped => "hipHostMalloc(MAPPED) + GetDevicePointer",
-        }
-    }
-    eprintln!(
-        "[gpu] memory={:?}, buffer_policy: persistent={} scratch={}",
-        arch_profile.memory,
-        strategy_label(arch_profile.buffer_policy.persistent),
-        strategy_label(arch_profile.buffer_policy.scratch),
-    );
+    let entry = lookup_registry_entry(
+        &model_variant,
+        backend,
+        &gpu.gpu_arch,
+        cli.allow_untested_gpu.as_deref(),
+    )?;
+    validate_gfx942_policy(&cli, &model_variant, backend, &gpu.gpu_arch)?;
+    install_arch_profile(entry);
 
     // Run before family dispatch so DFlash flags are not silently ignored by
     // non-Qwen branches.
@@ -189,20 +113,22 @@ fn main() -> Result<()> {
     validate_specprefill_flags(&cli, &model_variant, backend)?;
 
     match model_variant.family() {
-        ModelFamily::Gemma4 => run_gemma4(&cli, &model_variant, entry, ordinal, total_vram),
-        ModelFamily::Phi4 => phi4_engine::run_phi4(&cli, &model_variant, entry, ordinal, total_vram),
-        ModelFamily::Llama31 => {
-            llama31_engine::run_llama31(&cli, &model_variant, entry, ordinal, total_vram)
+        ModelFamily::Gemma4 => run_gemma4(&cli, &model_variant, entry, ordinal, gpu.total_vram),
+        ModelFamily::Phi4 => {
+            phi4_engine::run_phi4(&cli, &model_variant, entry, ordinal, gpu.total_vram)
         }
-        ModelFamily::Qwen36Moe => qwen36_moe_cli::run(&cli, entry, total_vram),
+        ModelFamily::Llama31 => {
+            llama31_engine::run_llama31(&cli, &model_variant, entry, ordinal, gpu.total_vram)
+        }
+        ModelFamily::Qwen36Moe => qwen36_moe_cli::run(&cli, entry, gpu.total_vram),
         ModelFamily::Qwen35 => run_qwen35(
             &cli,
             &model_variant,
             entry,
             backend,
-            gpu_arch,
+            gpu.gpu_arch,
             ordinal,
-            total_vram,
+            gpu.total_vram,
             q4km_like,
         ),
     }
