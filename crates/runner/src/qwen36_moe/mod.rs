@@ -1,0 +1,23 @@
+pub(crate) mod bake;
+pub(crate) mod chain;
+pub(crate) mod decode_loop;
+pub(crate) mod dry_run;
+pub(crate) mod engine;
+pub(crate) mod generation;
+pub(crate) mod geom;
+pub(crate) mod host;
+pub(crate) mod layers;
+pub(crate) mod legacy;
+pub(crate) mod lm_head;
+pub(crate) mod mtp_loader;
+pub(crate) mod output;
+pub(crate) mod policy;
+pub(crate) mod prefetch;
+pub(crate) mod prompt;
+pub(crate) mod session;
+pub(crate) mod spec_verify;
+pub(crate) mod timing;
+pub(crate) mod vmm;
+pub(crate) mod vmm_config;
+
+pub(crate) use engine::run;

@@ -2,7 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use gpu_hal::{GpuBuffer, ScalarType};
 use model_store::BakedStore;
 
-use crate::qwen36_moe_layers::load_to_gpu;
+use crate::qwen36_moe_cli::layers::load_to_gpu;
 use crate::qwen36_moe_types::{FullAttnKvCache, MtpLayerBuffers, MultiLayerGeom};
 
 /// Load the Qwen3.6-MoE multi-token-prediction (MTP) head from the bake.

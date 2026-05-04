@@ -3,12 +3,12 @@ use gpu_hal::{Backend, VirtualArena};
 use model_store::BakedStore;
 use qwen36_moe::config::TextConfig;
 
-use crate::qwen36_moe_layers::{load_all_layer_buffers, Qwen36WeightMode};
+use crate::qwen36_moe_cli::layers::{load_all_layer_buffers, Qwen36WeightMode};
+use crate::qwen36_moe_cli::vmm_config::{should_try_moe_expert_vmm, MoeExpertVmmMode};
 use crate::qwen36_moe_residency::MoeExpertResidencyManager;
 use crate::qwen36_moe_residency_types::MoeExpertResidencyConfig;
 use crate::qwen36_moe_telemetry::{MoeIslandPrefetchMode, VirtualKvStats};
 use crate::qwen36_moe_types::{AttnLayerBuffers, LayerBuffers, MultiLayerGeom};
-use crate::qwen36_moe_vmm_config::{should_try_moe_expert_vmm, MoeExpertVmmMode};
 
 const MIB: f64 = (1024 * 1024) as f64;
 

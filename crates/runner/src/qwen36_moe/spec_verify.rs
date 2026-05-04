@@ -2,11 +2,12 @@ use anyhow::{Context, Result};
 use gpu_hal::{GpuBuffer, ScalarType};
 use model_store::BakedStore;
 
+use crate::qwen36_moe_cli::decode_loop::Qwen36DecodeLoopState;
+use crate::qwen36_moe_cli::host::lookup_embed_row;
+use crate::qwen36_moe_cli::lm_head::{launch_lm_head_from_final_hidden_bytes, LmHeadBuffers};
+use crate::qwen36_moe_cli::timing::Qwen36StageTimingTotals;
 use crate::qwen36_moe_decode::run_chained_decode_fast;
-use crate::qwen36_moe_host::lookup_embed_row;
-use crate::qwen36_moe_lm_head::{launch_lm_head_from_final_hidden_bytes, LmHeadBuffers};
 use crate::qwen36_moe_logits::argmax_bf16_logits;
-use crate::qwen36_moe_loop::Qwen36DecodeLoopState;
 use crate::qwen36_moe_mtp::{MtpChainScratch, MtpForwardScratch};
 use crate::qwen36_moe_persistent_decode::PersistentScratch;
 use crate::qwen36_moe_speculative::{
@@ -15,7 +16,6 @@ use crate::qwen36_moe_speculative::{
 use crate::qwen36_moe_state::{
     refresh_linear_attn_state, restore_linear_attn_state, LinearAttnSnapshot,
 };
-use crate::qwen36_moe_timing::Qwen36StageTimingTotals;
 use crate::qwen36_moe_types::{DecodeOutputs, LayerBuffers, MtpLayerBuffers, MultiLayerGeom};
 
 const QWEN36_NUM_SPECULATIVE_TOKENS: usize = 3;
