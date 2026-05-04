@@ -36,9 +36,9 @@ use crate::qwen36_moe_prompt::{
 };
 use crate::qwen36_moe_session::{prepare_decode_session, Qwen36DecodeSession};
 use crate::qwen36_moe_spec_verify::{
-    restore_and_replay_accepted_prefix, run_batched_lm_head_top1, run_single_lm_head_top1,
-    run_spec_chain_step, Qwen36BatchedLmHeadTop1, Qwen36SingleLmHeadTop1, Qwen36SpecChainStep,
-    Qwen36SpecReplayAccepted,
+    restore_and_replay_accepted_prefix, run_batched_spec_verify_inputs, run_single_lm_head_top1,
+    run_spec_chain_step, Qwen36BatchedSpecVerifyInputs, Qwen36SingleLmHeadTop1,
+    Qwen36SpecChainStep, Qwen36SpecReplayAccepted,
 };
 use crate::qwen36_moe_speculative::{
     run_speculative_decode_step, run_speculative_decode_step_batched,
@@ -459,35 +459,18 @@ fn decode_text(
                     loop_state.position,
                     dynamic_k,
                     |inputs| -> anyhow::Result<Vec<(u32, Vec<u8>)>> {
-                        let n = inputs.len();
-                        if n == 0 {
-                            return Ok(Vec::new());
-                        }
-                        // K+1 sequential chains, accumulate final_hiddens.
-                        let mut final_hiddens: Vec<Vec<u8>> = Vec::with_capacity(n);
-                        for &(pos, input) in inputs {
-                            let chain_outputs = run_spec_chain_step(Qwen36SpecChainStep {
-                                ordinal,
-                                geom: &geom,
-                                store: &store,
-                                weight_prefix,
-                                layers: &mut layers,
-                                persistent_scratch: persistent_scratch.as_mut(),
-                                stage_timings: &mut stage_timings,
-                                position: pos,
-                                input,
-                                emit_stage_timings,
-                            })?;
-                            final_hiddens.push(chain_outputs.final_hidden_bytes);
-                        }
-
-                        run_batched_lm_head_top1(Qwen36BatchedLmHeadTop1 {
+                        run_batched_spec_verify_inputs(Qwen36BatchedSpecVerifyInputs {
                             ordinal,
                             geom: &geom,
+                            store: &store,
+                            weight_prefix,
+                            layers: &mut layers,
+                            persistent_scratch: persistent_scratch.as_mut(),
                             final_norm_w: &final_norm_w_buf,
                             lm_head_w: &lm_head_w_buf,
                             stage_timings: &mut stage_timings,
-                            final_hiddens,
+                            inputs,
+                            emit_stage_timings,
                         })
                     },
                 )

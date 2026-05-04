@@ -94,6 +94,54 @@ pub(crate) fn restore_and_replay_accepted_prefix(
     Ok(())
 }
 
+pub(crate) struct Qwen36BatchedSpecVerifyInputs<'a> {
+    pub(crate) ordinal: usize,
+    pub(crate) geom: &'a MultiLayerGeom,
+    pub(crate) store: &'a BakedStore,
+    pub(crate) weight_prefix: &'a str,
+    pub(crate) layers: &'a mut [LayerBuffers],
+    pub(crate) persistent_scratch: Option<&'a mut PersistentScratch>,
+    pub(crate) final_norm_w: &'a GpuBuffer,
+    pub(crate) lm_head_w: &'a GpuBuffer,
+    pub(crate) stage_timings: &'a mut Qwen36StageTimingTotals,
+    pub(crate) inputs: &'a [(i32, u32)],
+    pub(crate) emit_stage_timings: bool,
+}
+
+pub(crate) fn run_batched_spec_verify_inputs(
+    mut args: Qwen36BatchedSpecVerifyInputs<'_>,
+) -> Result<Vec<(u32, Vec<u8>)>> {
+    if args.inputs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut final_hiddens = Vec::with_capacity(args.inputs.len());
+    for &(position, input) in args.inputs {
+        let chain_outputs = run_spec_chain_step(Qwen36SpecChainStep {
+            ordinal: args.ordinal,
+            geom: args.geom,
+            store: args.store,
+            weight_prefix: args.weight_prefix,
+            layers: args.layers,
+            persistent_scratch: args.persistent_scratch.as_deref_mut(),
+            stage_timings: args.stage_timings,
+            position,
+            input,
+            emit_stage_timings: args.emit_stage_timings,
+        })?;
+        final_hiddens.push(chain_outputs.final_hidden_bytes);
+    }
+
+    run_batched_lm_head_top1(Qwen36BatchedLmHeadTop1 {
+        ordinal: args.ordinal,
+        geom: args.geom,
+        final_norm_w: args.final_norm_w,
+        lm_head_w: args.lm_head_w,
+        stage_timings: args.stage_timings,
+        final_hiddens,
+    })
+}
+
 pub(crate) struct Qwen36SingleLmHeadTop1<'a> {
     pub(crate) ordinal: usize,
     pub(crate) geom: &'a MultiLayerGeom,
