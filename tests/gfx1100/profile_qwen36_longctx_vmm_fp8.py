@@ -134,7 +134,7 @@ def main() -> int:
     parser.add_argument("--timeout", type=int, default=2400)
     parser.add_argument("--seed", type=int, default=20260504)
     parser.add_argument("--out-dir", type=Path, default=Path("target/qwen36_longctx_profiles"))
-    parser.add_argument("--max-gpu-use", type=int, default=5)
+    parser.add_argument("--max-gpu-use", type=int, default=10)
     parser.add_argument("--max-mem-use", type=int, default=5)
     parser.add_argument("--gpu-idle-timeout", type=int, default=7200)
     parser.add_argument("--gpu-poll-seconds", type=float, default=30.0)

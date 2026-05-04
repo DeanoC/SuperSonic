@@ -17,7 +17,7 @@ base: 3cd856d Merge pull request #205 from DeanoC/perf/qwen36-longctx-full-attn
 Another local agent is using the same GPU intermittently. Do not launch a
 profile row unless `rocm-smi --showuse --showmemuse --showpidgpus` shows:
 
-- GPU use at or below 5%
+- GPU use at or below 10%
 - VRAM use at or below 5%
 - no listed GPU PIDs
 

@@ -27,6 +27,8 @@ Raw outputs:
 - `target/qwen36_longctx_profiles/vmm-fp8-large/vmm-fp8-large_combined.json`
 - `target/qwen36_longctx_profiles/vmm-fp8-large/vmm-fp8-large_*.json`
 - `target/qwen36_longctx_profiles/vmm-fp8-large/vmm-fp8-large_*.md`
+- `target/qwen36_longctx_profiles/sparse-vmm-fp8/sparse-vmm-fp8_8192_sparse.json`
+- `target/qwen36_longctx_profiles/sparse-vmm-fp8/sparse-vmm-fp8_8192_sparse.md`
 
 ## Results
 
@@ -36,6 +38,12 @@ Raw outputs:
 | 8192 | `int4-kv-fp8` | 313.67 | 56.35 | 55.86 | 17.75 | 15.08 | 0.08 | - | NO |
 | 16384 | `int4-vmm` | 808.80 | 79.41 | 78.97 | 12.59 | 15.27 | 0.27 | yes | NO |
 | 16384 | `int4-kv-fp8` | 814.04 | 80.69 | 80.25 | 12.39 | 15.16 | 0.16 | - | NO |
+
+Partial sparse follow-up:
+
+| Context | Mode | Prefill s | Decode ms/tok | Full-attn ms/tok | Tok/s | Total resident GiB | MoE resident GiB | KV resident GiB | NIAH hit |
+|---:|:---|---:|---:|---:|---:|---:|---:|---:|:---:|
+| 8192 | `cap320` | 1135.73 | 179.79 | 164.66 | 5.56 | 1.41 | 1.25 | 0.16 | NO |
 
 ## Readout
 
@@ -53,6 +61,12 @@ Full attention remains the measured decode bottleneck. `full_attn_ms_avg`
 accounts for almost all `total_ms_avg` in every row, and FFN timing is not
 visible in the per-token chain breakdown for these measured decode steps.
 
+The sparse `cap320` row cut total residency from 15.16 GiB to 1.41 GiB at 8k,
+but it was much slower: prefill was 3.63x dense and decode ms/token was 3.19x
+dense. The sparse sweep was stopped after this row while the wrapper was
+idle-waiting, because the 16k sparse rows would be expensive and the first row
+already showed the sparse path is not currently performance-competitive.
+
 The NIAH hit was false for all rows despite identical generated IDs across the
 dense and KV-FP8 rows at each context. These runs used only 4 generated tokens,
 so they are useful for performance and ID agreement, not for validating long
@@ -60,6 +74,7 @@ answer recovery.
 
 ## Next
 
-Run `sparse-vmm-fp8` before attempting 32k. The dense 16k prefill already took
-about 13.5 minutes per row, and 32k should only be attempted after confirming
-the sparse path does not introduce a residency or prefill regression.
+Do not spend the next pass on 16k sparse timings until the sparse prefill and
+full-attention decode regressions are understood. The higher-value next step is
+to inspect why `cap320` makes full-attention decode 3x slower despite the much
+smaller MoE residency, then rerun only the 8k sparse and sparse+KV-FP8 rows.
