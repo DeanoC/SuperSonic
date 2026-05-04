@@ -15,7 +15,7 @@ use gpu_hal::{
 };
 use model_store::BakedStore;
 
-use crate::qwen36_moe_decode::ResidentWeight;
+use crate::qwen36_moe_types::ResidentWeight;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MoeExpertProjection {

@@ -37,7 +37,6 @@ use base64::Engine;
 use gpu_hal::{copy_d2h, is_backend_compiled, set_backend, Backend, GpuBuffer, ScalarType};
 use memmap2::Mmap;
 use model_store::BakedStore;
-use runner::qwen36_moe_decode::{FullAttnKvCache, MtpLayerBuffers, MultiLayerGeom};
 use runner::qwen36_moe_mtp::{
     alloc_mtp_chain_scratch, alloc_mtp_forward_scratch, run_mtp_draft_chain, run_mtp_draft_step,
     run_mtp_layer_step,
@@ -45,6 +44,7 @@ use runner::qwen36_moe_mtp::{
 use runner::qwen36_moe_speculative::{
     run_speculative_decode_step, run_speculative_decode_step_batched, SpeculativeStepResult,
 };
+use runner::qwen36_moe_types::{FullAttnKvCache, MtpLayerBuffers, MultiLayerGeom};
 use safetensors::SafeTensors;
 use serde_json::Value;
 

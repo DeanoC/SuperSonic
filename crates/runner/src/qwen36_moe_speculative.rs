@@ -248,8 +248,8 @@ pub fn accept_prefix_greedy_partial(
 use anyhow::{Context, Result};
 use gpu_hal::{GpuBuffer, ScalarType};
 
-use crate::qwen36_moe_decode::{MtpLayerBuffers, MultiLayerGeom};
 use crate::qwen36_moe_mtp::{run_mtp_draft_chain, MtpChainScratch, MtpForwardScratch};
+use crate::qwen36_moe_types::{MtpLayerBuffers, MultiLayerGeom};
 
 /// Result of one speculative-decode step.
 #[derive(Debug, Clone)]

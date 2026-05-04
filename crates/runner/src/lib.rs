@@ -26,6 +26,7 @@ pub mod qwen36_moe_residency;
 pub mod qwen36_moe_speculative;
 pub mod qwen36_moe_state;
 pub mod qwen36_moe_telemetry;
+pub mod qwen36_moe_types;
 pub mod registry;
 pub mod specprefill;
 pub mod tensor_bytes;

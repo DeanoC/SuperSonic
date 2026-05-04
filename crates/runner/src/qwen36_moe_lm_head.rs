@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use gpu_hal::GpuBuffer;
 
-use crate::qwen36_moe_decode::MultiLayerGeom;
+use crate::qwen36_moe_types::MultiLayerGeom;
 
 pub(crate) struct LmHeadBuffers<'a> {
     pub(crate) final_norm_w: &'a GpuBuffer,

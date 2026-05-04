@@ -6,11 +6,11 @@ use model_store::manifest::LayoutTag;
 use model_store::BakedStore;
 use qwen36_moe::config::TextConfig;
 
-use crate::qwen36_moe_decode::{
+use crate::qwen36_moe_residency::{MoeExpertProjection, MoeExpertResidencyManager};
+use crate::qwen36_moe_types::{
     AttnLayerBuffers, FfnInt4Sidecars, FfnLayerBuffers, FullAttnInt4Sidecars, FullAttnKvCache,
     LayerBuffers, LinearAttnInt4Sidecars, MultiLayerGeom, ResidentWeight,
 };
-use crate::qwen36_moe_residency::{MoeExpertProjection, MoeExpertResidencyManager};
 
 /// Open a BakedStore from the bake dir, loading one tensor by name to a
 /// fresh GpuBuffer. The wrapper exists to attach a useful context message

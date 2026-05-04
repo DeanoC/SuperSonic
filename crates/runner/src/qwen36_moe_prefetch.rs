@@ -3,11 +3,11 @@ use std::borrow::Cow;
 
 use model_store::BakedStore;
 
-use crate::qwen36_moe_decode::{ExpertPrefetchPhase, ExpertRoute};
 use crate::qwen36_moe_residency::{MoeExpertKey, MoeExpertProjection, MoeExpertResidencyManager};
 use crate::qwen36_moe_telemetry::{
     MoeIslandPrefetchMode, MoeRouteTelemetry, MoeTransitionPredictor,
 };
+use crate::qwen36_moe_types::{ExpertPrefetchPhase, ExpertRoute};
 
 pub(crate) fn handle_moe_expert_prefetch(
     manager: &mut MoeExpertResidencyManager,

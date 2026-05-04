@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crate::qwen36_moe_decode::DecodeOutputs;
+use crate::qwen36_moe_types::DecodeOutputs;
 
 /// Bundles the sampling knobs for the multi-token decode loop. `temperature
 /// <= 0` means greedy argmax, the deterministic default. At temperature > 0,

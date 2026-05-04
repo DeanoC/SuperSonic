@@ -51,7 +51,7 @@
 use anyhow::{Context, Result};
 use gpu_hal::{copy_d2d, GpuBuffer};
 
-use crate::qwen36_moe_decode::{AttnLayerBuffers, LayerBuffers};
+use crate::qwen36_moe_types::{AttnLayerBuffers, LayerBuffers};
 
 /// Per-linear-attn-layer state shadow buffers. Only `Linear` layers
 /// have state; `Full` layers are represented as `None` in the parent

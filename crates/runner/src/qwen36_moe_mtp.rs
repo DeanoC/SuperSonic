@@ -30,8 +30,9 @@ use kernel_ffi::qwen36_moe::{
 
 use crate::qwen36_moe_decode::{
     ffn_output_elems, ffn_workspace_floats, full_attn_output_elems, full_attn_workspace_floats,
-    reset_sync_buf, MtpLayerBuffers, MultiLayerGeom,
+    reset_sync_buf,
 };
+use crate::qwen36_moe_types::{MtpLayerBuffers, MultiLayerGeom};
 
 /// Pre-allocated GPU scratch buffers for one MTP forward call. The MTP
 /// session reuses the same scratch across all `K` draft steps — allocate
