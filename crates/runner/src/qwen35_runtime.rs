@@ -4,6 +4,7 @@ use std::time::Instant;
 use crate::bakes::ensure_hf_metadata_present;
 use crate::decode_engine::{DecodeEngine, DecodeStageTimings};
 use crate::prefill_engine;
+use crate::qwen35_component_decode::{run_qwen35_component_single_decode, Qwen35ComponentDecode};
 use crate::qwen35_decode_modes::{report_qwen35_decode_modes, resolve_qwen35_decode_modes};
 use crate::qwen35_decode_report::{emit_qwen35_decode_report, Qwen35DecodeReport};
 use crate::qwen35_decode_traces::{
@@ -18,10 +19,6 @@ use crate::qwen35_prefill::{
 };
 use crate::qwen35_startup::{
     load_qwen35_startup, validate_qwen35_startup, Qwen35Policy, Qwen35Startup,
-};
-use crate::qwen35_trace::{
-    trace_component_input_layer, trace_component_layer, trace_component_linear_layer,
-    trace_component_linear_state_layer,
 };
 use crate::qwen35_validation::{
     qwen35_oracle_script_path, resolve_qwen_oracle_model_id, run_qwen35_oracle_validation,
@@ -419,73 +416,19 @@ pub(crate) fn run_qwen35(
                 let token_ids = token_history_with_next(&prompt_ids, &generated_ids, next_token);
                 engine.rebuild_prefill_state(&token_ids, false)?
             } else if decode_modes.component_single_decode_enabled {
-                if let Some(trace_layer) = cli.trace_component_linear_state_layer {
-                    let trace_token_ids = token_history(&prompt_ids, &generated_ids);
-                    trace_component_linear_state_layer(
-                        &engine,
-                        trace_layer,
-                        trace_token_ids.as_slice(),
-                        ordinal,
-                        params.kv_chunk_size,
-                        cli.prefill_chunk_size,
-                        use_4b_kernel,
-                    )?;
-                }
-                if let Some(trace_layer) = cli.trace_component_input_layer {
-                    let (logits, hidden_trace) = engine.component_decode_step_4b_traced(
+                run_qwen35_component_single_decode(
+                    &mut engine,
+                    Qwen35ComponentDecode {
+                        cli,
+                        prompt_ids: &prompt_ids,
+                        generated_ids: &generated_ids,
                         next_token,
                         seqlen_offset,
-                        trace_layer,
-                    )?;
-                    trace_component_input_layer(
-                        &engine,
-                        &hidden_trace,
-                        trace_layer,
-                        token_history_with_next(&prompt_ids, &generated_ids, next_token).as_slice(),
                         ordinal,
-                        params.kv_chunk_size,
-                        cli.prefill_chunk_size,
+                        kv_chunk_size: params.kv_chunk_size,
                         use_4b_kernel,
-                    )?;
-                    logits
-                } else if let Some(trace_layer) = cli.trace_component_layer {
-                    let (logits, layer_trace) = engine.component_decode_step_4b_trace_layer(
-                        next_token,
-                        seqlen_offset,
-                        trace_layer,
-                    )?;
-                    trace_component_layer(
-                        &engine,
-                        trace_layer,
-                        &layer_trace,
-                        token_history_with_next(&prompt_ids, &generated_ids, next_token).as_slice(),
-                        ordinal,
-                        params.kv_chunk_size,
-                        cli.prefill_chunk_size,
-                        use_4b_kernel,
-                    )?;
-                    logits
-                } else if let Some(trace_layer) = cli.trace_component_linear_layer {
-                    let (logits, linear_trace) = engine
-                        .component_decode_step_4b_trace_linear_layer(
-                            next_token,
-                            seqlen_offset,
-                            trace_layer,
-                        )?;
-                    trace_component_linear_layer(
-                        &engine,
-                        trace_layer,
-                        &linear_trace,
-                        token_history_with_next(&prompt_ids, &generated_ids, next_token).as_slice(),
-                        ordinal,
-                        params.kv_chunk_size,
-                        cli.prefill_chunk_size,
-                        use_4b_kernel,
-                    )?;
-                    logits
-                } else {
-                    engine.decode_step(next_token, seqlen_offset)?
-                }
+                    },
+                )?
             } else if decode_modes.kernel_single_decode_enabled {
                 if qwen35_persistent_decode_trace_enabled(cli) {
                     let trace_token_ids =
