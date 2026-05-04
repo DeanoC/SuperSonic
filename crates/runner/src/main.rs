@@ -44,6 +44,7 @@ mod qwen36_moe_telemetry;
 mod qwen36_moe_timing;
 mod qwen36_moe_types;
 mod qwen36_moe_vmm;
+mod qwen36_moe_vmm_config;
 mod registry;
 mod specprefill;
 mod specprefill_engine;
