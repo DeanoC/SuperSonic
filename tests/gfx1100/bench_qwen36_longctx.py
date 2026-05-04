@@ -25,6 +25,38 @@ MIB = 1024 * 1024
 GIB = 1024 * MIB
 TOKEN_CHARS = 2
 
+PRESETS: dict[str, dict[str, Any]] = {
+    "smoke": {
+        "contexts": "512",
+        "modes": "int4-vmm",
+        "max_new_tokens": 1,
+        "warmup": False,
+        "timeout": 600,
+    },
+    "comparison": {
+        "contexts": "512,2048,4096,8192",
+        "modes": "int4-vmm,int4-kv-fp8",
+        "max_new_tokens": 4,
+        "warmup": True,
+        "timeout": 1800,
+    },
+    "full": {
+        "contexts": "8192,16384,32768",
+        "modes": "int4-vmm,int4-kv-fp8",
+        "max_new_tokens": 16,
+        "warmup": True,
+        "timeout": 1800,
+    },
+    "sparse-comparison": {
+        "contexts": "2048,4096,8192",
+        "modes": "int4-vmm,int4-kv-fp8,sparse,sparse-kv-fp8",
+        "sparse_caps": "320",
+        "max_new_tokens": 4,
+        "warmup": True,
+        "timeout": 1800,
+    },
+}
+
 
 @dataclass(frozen=True)
 class BenchMode:
@@ -128,8 +160,26 @@ def parse_stage_timings(output: str) -> dict[str, float]:
     match = re.search(r"\[qwen36-moe stage-timings\]\s+(.+)", output)
     if not match:
         return {}
+    return parse_key_value_floats(match.group(1))
+
+
+def parse_chain_breakdown(output: str) -> dict[str, float]:
+    match = re.search(r"\[qwen36-moe chain-breakdown\]\s+(.+)", output)
+    if not match:
+        return {}
+    return parse_key_value_floats(match.group(1))
+
+
+def parse_lifecycle_timings(output: str) -> dict[str, float]:
+    match = re.search(r"\[qwen36-moe lifecycle-timings\]\s+(.+)", output)
+    if not match:
+        return {}
+    return parse_key_value_floats(match.group(1))
+
+
+def parse_key_value_floats(raw: str) -> dict[str, float]:
     timings: dict[str, float] = {}
-    for part in match.group(1).split():
+    for part in raw.split():
         if "=" not in part:
             continue
         key, value = part.strip("()").split("=", 1)
@@ -237,6 +287,18 @@ def fmt_gib(value: float | int | None) -> str:
     return f"{float(value) / GIB:.2f}"
 
 
+def apply_preset_defaults(args: argparse.Namespace) -> argparse.Namespace:
+    preset = PRESETS.get(args.preset or "full", {})
+    args.contexts = args.contexts or preset.get("contexts") or "8192,16384,32768"
+    args.modes = args.modes or preset.get("modes") or "int4-vmm,int4-kv-fp8"
+    args.sparse_caps = args.sparse_caps or preset.get("sparse_caps") or "320"
+    args.max_new_tokens = args.max_new_tokens or preset.get("max_new_tokens") or 16
+    args.timeout = args.timeout or preset.get("timeout") or 1800
+    if args.warmup is None:
+        args.warmup = bool(preset.get("warmup", True))
+    return args
+
+
 def build_run_env(
     base_env: dict[str, str],
     args: argparse.Namespace,
@@ -333,6 +395,8 @@ def run_one(
             "niah_contains_expected": False,
             "generated_ids": parse_tokens(output),
             "stage": parse_stage_timings(output),
+            "chain_breakdown": parse_chain_breakdown(output),
+            "lifecycle": parse_lifecycle_timings(output),
             "result": parse_result(output),
             "vmm_residency": dense_vmm_residency(output),
             "stdout_tail": stdout[-1600:],
@@ -358,6 +422,8 @@ def run_one(
         ),
         "generated_ids": parse_tokens(output),
         "stage": parse_stage_timings(output),
+        "chain_breakdown": parse_chain_breakdown(output),
+        "lifecycle": parse_lifecycle_timings(output),
         "result": parse_result(output),
         "stdout_tail": proc.stdout[-1600:],
         "stderr_tail": proc.stderr[-3200:],
@@ -374,11 +440,136 @@ def run_one(
     return row
 
 
-def markdown(rows: list[dict[str, Any]]) -> str:
+def row_ms_per_tok(row: dict[str, Any]) -> float | None:
+    stage = row.get("stage") or {}
+    result = row.get("result") or {}
+    value = stage.get("total_ms_avg") or result.get("ms_per_tok")
+    return float(value) if value is not None else None
+
+
+def row_prefill_seconds(row: dict[str, Any]) -> float | None:
+    lifecycle = row.get("lifecycle") or {}
+    value = lifecycle.get("prefill_total_ms")
+    return float(value) / 1000.0 if value is not None else None
+
+
+def row_generation_wall_ms(row: dict[str, Any]) -> float | None:
+    lifecycle = row.get("lifecycle") or {}
+    value = lifecycle.get("generation_wall_ms")
+    return float(value) if value is not None else None
+
+
+def likely_bottleneck(row: dict[str, Any]) -> str:
+    chain = row.get("chain_breakdown") or {}
+    stage = row.get("stage") or {}
+    candidates = {
+        "full_attn": chain.get("full_attn_ms_avg"),
+        "linear_attn": chain.get("linear_attn_ms_avg"),
+        "ffn": chain.get("ffn_ms_avg"),
+        "lm_head": stage.get("lm_head_ms_avg"),
+        "sampling": stage.get("sample_ms_avg"),
+        "detok": stage.get("detok_ms_avg"),
+    }
+    candidates = {key: value for key, value in candidates.items() if value is not None}
+    if not candidates:
+        return "-"
+    return max(candidates, key=lambda key: float(candidates[key]))
+
+
+def summarize(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    summaries: list[dict[str, Any]] = []
+    contexts = sorted({row["context_tokens_requested"] for row in rows})
+    for context in contexts:
+        context_rows = [
+            row
+            for row in rows
+            if row["context_tokens_requested"] == context
+            and row.get("returncode") == 0
+            and row_ms_per_tok(row) is not None
+        ]
+        if not context_rows:
+            summaries.append({"context_tokens_requested": context, "status": "no-successful-runs"})
+            continue
+        baseline = next((row for row in context_rows if row["mode"] == "int4-vmm"), None)
+        best = min(context_rows, key=lambda row: row_ms_per_tok(row) or float("inf"))
+        baseline_ms = row_ms_per_tok(baseline) if baseline else None
+        best_ms = row_ms_per_tok(best)
+        delta_pct = (
+            ((best_ms - baseline_ms) / baseline_ms) * 100.0
+            if baseline_ms and best_ms is not None
+            else None
+        )
+        summaries.append(
+            {
+                "context_tokens_requested": context,
+                "status": "ok",
+                "best_mode": best["mode"],
+                "best_ms_per_tok": best_ms,
+                "baseline_ms_per_tok": baseline_ms,
+                "best_vs_baseline_pct": delta_pct,
+                "prefill_seconds": row_prefill_seconds(best),
+                "generation_wall_ms": row_generation_wall_ms(best),
+                "likely_bottleneck": likely_bottleneck(best),
+            }
+        )
+    return summaries
+
+
+def recommendation(summary: list[dict[str, Any]]) -> str:
+    ok = [row for row in summary if row.get("status") == "ok"]
+    if not ok:
+        return "No successful runs; inspect stderr_tail in the JSON report first."
+    bottlenecks: dict[str, int] = {}
+    for row in ok:
+        bottleneck = row.get("likely_bottleneck") or "-"
+        bottlenecks[bottleneck] = bottlenecks.get(bottleneck, 0) + 1
+    top_bottleneck = max(bottlenecks, key=bottlenecks.get)
+    if top_bottleneck == "full_attn":
+        return "Prioritize full-attention/KV bandwidth work for longer contexts."
+    if top_bottleneck == "ffn":
+        return "Prioritize routed expert FFN residency, prefetch, or matvec work."
+    if top_bottleneck in {"lm_head", "sampling", "detok"}:
+        return f"Prioritize host/output tail work; {top_bottleneck} dominates the best rows."
+    return f"Use the detailed rows before kernel work; current top bottleneck is {top_bottleneck}."
+
+
+def markdown(rows: list[dict[str, Any]], summary: list[dict[str, Any]] | None = None) -> str:
+    if summary is None:
+        summary = summarize(rows)
     out = [
-        "| Context | Mode | wall s | total ms/tok | tok/s | prompt tokens | total resident GiB | MoE resident GiB | KV resident GiB | generated ids match | NIAH hit |",
-        "|---:|:---|---:|---:|---:|---:|---:|---:|---:|:---:|:---:|",
+        "## Summary",
+        "",
+        f"Recommendation: {recommendation(summary)}",
+        "",
+        "| Context | best mode | baseline ms/tok | best ms/tok | best vs baseline | prefill s | gen wall ms | likely bottleneck |",
+        "|---:|:---|---:|---:|---:|---:|---:|:---|",
     ]
+    for item in summary:
+        out.append(
+            "| {context} | {best_mode} | {baseline} | {best} | {delta} | {prefill} | {gen_wall} | {bottleneck} |".format(
+                context=item["context_tokens_requested"],
+                best_mode=item.get("best_mode", "-"),
+                baseline=fmt_num(item.get("baseline_ms_per_tok")),
+                best=fmt_num(item.get("best_ms_per_tok")),
+                delta=(
+                    f"{float(item['best_vs_baseline_pct']):+.1f}%"
+                    if item.get("best_vs_baseline_pct") is not None
+                    else "-"
+                ),
+                prefill=fmt_num(item.get("prefill_seconds")),
+                gen_wall=fmt_num(item.get("generation_wall_ms")),
+                bottleneck=item.get("likely_bottleneck", "-"),
+            )
+        )
+    out.extend(
+        [
+            "",
+            "## Detail",
+            "",
+        "| Context | Mode | wall s | prefill s | gen wall s | total ms/tok | tok/s | prompt tokens | total resident GiB | MoE resident GiB | KV resident GiB | generated ids match | NIAH hit |",
+        "|---:|:---|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|:---:|",
+        ]
+    )
     baseline_ids_by_context: dict[int, list[int]] = {}
     for row in rows:
         if row["mode"] == "int4-vmm":
@@ -386,6 +577,7 @@ def markdown(rows: list[dict[str, Any]]) -> str:
     for row in rows:
         residency = row.get("vmm_residency") or {}
         stage = row.get("stage") or {}
+        lifecycle = row.get("lifecycle") or {}
         result = row.get("result") or {}
         context = row["context_tokens_requested"]
         generated_ids = row.get("generated_ids") or []
@@ -393,10 +585,20 @@ def markdown(rows: list[dict[str, Any]]) -> str:
         ids_match = baseline_ids == generated_ids if baseline_ids is not None else None
         row["generated_ids_match_baseline"] = ids_match
         out.append(
-            "| {context} | {mode} | {wall} | {ms} | {tok} | {prompt_tokens} | {total_gib} | {moe_gib} | {kv_gib} | {ids_match} | {niah} |".format(
+            "| {context} | {mode} | {wall} | {prefill_s} | {gen_wall_s} | {ms} | {tok} | {prompt_tokens} | {total_gib} | {moe_gib} | {kv_gib} | {ids_match} | {niah} |".format(
                 context=context,
                 mode=row["mode"],
                 wall=fmt_num(row.get("wall_seconds")),
+                prefill_s=fmt_num(
+                    (lifecycle.get("prefill_total_ms") or 0) / 1000.0
+                    if lifecycle.get("prefill_total_ms") is not None
+                    else None
+                ),
+                gen_wall_s=fmt_num(
+                    (lifecycle.get("generation_wall_ms") or 0) / 1000.0
+                    if lifecycle.get("generation_wall_ms") is not None
+                    else None
+                ),
                 ms=fmt_num(stage.get("total_ms_avg") or result.get("ms_per_tok")),
                 tok=fmt_num(row.get("tok_per_s")),
                 prompt_tokens=fmt_num(result.get("prompt_tokens"), digits=0),
@@ -412,17 +614,27 @@ def markdown(rows: list[dict[str, Any]]) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--preset",
+        choices=sorted(PRESETS),
+        help="named sweep defaults; explicit CLI flags override preset values",
+    )
     parser.add_argument("--binary", type=Path, default=Path("target/release/supersonic"))
     parser.add_argument("--model-dir", type=Path, default=Path("/mnt/data/models/Qwen3.6-35B-A3B"))
     parser.add_argument("--backend", default="hip")
-    parser.add_argument("--contexts", default="8192,16384,32768")
-    parser.add_argument("--modes", default="int4-vmm,int4-kv-fp8")
-    parser.add_argument("--sparse-caps", default="320")
-    parser.add_argument("--max-new-tokens", type=int, default=16)
+    parser.add_argument("--contexts")
+    parser.add_argument("--modes")
+    parser.add_argument("--sparse-caps")
+    parser.add_argument("--max-new-tokens", type=int)
     parser.add_argument("--warmup-new-tokens", type=int, default=2)
     parser.add_argument("--seed", type=int, default=20260504)
-    parser.add_argument("--timeout", type=int, default=1800)
-    parser.add_argument("--no-warmup", action="store_true")
+    parser.add_argument("--timeout", type=int)
+    parser.add_argument(
+        "--warmup",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="run one short warmup before each measured row",
+    )
     parser.add_argument("--no-persistent-decode", action="store_true")
     parser.add_argument(
         "--force-moe-vmm",
@@ -432,7 +644,7 @@ def main() -> int:
     )
     parser.add_argument("--out-json", type=Path, default=Path("target/qwen36_longctx.json"))
     parser.add_argument("--out-md", type=Path, default=Path("target/qwen36_longctx.md"))
-    args = parser.parse_args()
+    args = apply_preset_defaults(parser.parse_args())
 
     try:
         contexts = parse_int_list(args.contexts)
@@ -458,7 +670,7 @@ def main() -> int:
     for context in contexts:
         prompt, expected = prompts[context]
         for mode in modes:
-            if not args.no_warmup:
+            if args.warmup:
                 print(f"[warmup] context={context} mode={mode.label}", flush=True)
                 run_one(args, mode, context, prompt, expected, tmp, warmup=True)
             print(f"[bench] context={context} mode={mode.label}", flush=True)
@@ -468,24 +680,30 @@ def main() -> int:
                 print(row.get("error") or row.get("stderr_tail") or "run failed", file=sys.stderr)
                 break
             stage = row.get("stage") or {}
+            lifecycle = row.get("lifecycle") or {}
             residency = row.get("vmm_residency") or {}
             print(
                 f"  total_ms={stage.get('total_ms_avg')} tok/s={row.get('tok_per_s')} "
+                f"prefill_ms={lifecycle.get('prefill_total_ms')} "
                 f"resident_gib={fmt_gib(residency.get('total_vmm_resident_bytes'))} "
                 f"niah={row.get('niah_contains_expected')} ids={row.get('generated_ids')}",
                 flush=True,
             )
 
-    md = markdown(rows)
+    summary = summarize(rows)
+    md = markdown(rows, summary)
     payload = {
-        "schema": "qwen36-moe-longctx-bench-v1",
+        "schema": "qwen36-moe-longctx-bench-v3",
         "model": "qwen3.6-35b-a3b",
         "model_dir": str(args.model_dir),
         "backend": args.backend,
+        "preset": args.preset,
         "contexts": contexts,
         "modes": [mode.label for mode in modes],
         "max_new_tokens": args.max_new_tokens,
         "seed": args.seed,
+        "summary": summary,
+        "recommendation": recommendation(summary),
         "rows": rows,
     }
     args.out_json.parent.mkdir(parents=True, exist_ok=True)

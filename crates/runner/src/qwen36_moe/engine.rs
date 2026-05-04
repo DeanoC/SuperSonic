@@ -131,14 +131,18 @@ fn decode_text(
 ) -> Result<()> {
     validate_speculative_sampling(speculative_decode, sampling)?;
 
+    let decode_wall_start = std::time::Instant::now();
     let weight_prefix = report.kernel_params.weight_prefix;
 
+    let prompt_setup_start = std::time::Instant::now();
     let prompt_setup = prepare_prompt(model_dir, &report.config.text_config, prompt)?;
+    let prompt_setup_elapsed = prompt_setup_start.elapsed();
     let tokenizer = prompt_setup.tokenizer;
     let prompt_ids = prompt_setup.prompt_ids;
     let eos_id = prompt_setup.eos_id;
     print_prompt_summary(prompt, &prompt_ids);
 
+    let bake_open_start = std::time::Instant::now();
     let bake = select_decode_bake(model_dir, fp8_runtime)?;
     println!(
         "  loading from bake: {} ({})",
@@ -147,6 +151,7 @@ fn decode_text(
     );
     let store = BakedStore::open(&bake.bake_dir)
         .with_context(|| format!("open BakedStore at {}", bake.bake_dir.display()))?;
+    let bake_open_elapsed = bake_open_start.elapsed();
 
     let geom = build_multi_layer_geom(&report.config.text_config, &report.kernel_params);
 
@@ -168,6 +173,7 @@ fn decode_text(
         kv_max_t,
     );
 
+    let layer_load_start = std::time::Instant::now();
     let mut moe_runtime = prepare_moe_runtime_config(
         speculative_decode,
         persistent_decode,
@@ -196,11 +202,13 @@ fn decode_text(
         moe_runtime.async_staging_pages,
         persistent_decode,
     )?;
+    let layer_load_elapsed = layer_load_start.elapsed();
     let mut layers = loaded_layers.layers;
     let _moe_expert_arena = loaded_layers.moe_expert_arena;
     let mut _moe_expert_residency = loaded_layers.moe_expert_residency;
     let virtual_kv_stats = virtual_kv_stats_for_layers(&layers);
     print_virtual_kv_stats_if_active(virtual_kv_stats, kv_fp8, backend, ordinal);
+    let session_start = std::time::Instant::now();
     let session = prepare_decode_session(
         &store,
         ordinal,
@@ -213,6 +221,7 @@ fn decode_text(
         persistent_decode,
         &mut layers,
     )?;
+    let session_elapsed = session_start.elapsed();
     let Qwen36DecodeSession {
         final_norm_w_buf,
         lm_head_w_buf,
@@ -241,6 +250,10 @@ fn decode_text(
     // is a real GPU+sync measurement. CPU-side stages (embed lookup, lm_head
     // GEMV, sampling, detokenize) are pure host work.
     let mut stage_timings = Qwen36StageTimingTotals::default();
+    let mut prefill_steps = 0usize;
+    let mut prefill_embed_elapsed = std::time::Duration::ZERO;
+    let mut prefill_chain_elapsed = std::time::Duration::ZERO;
+    let mut generation_wall_start = None;
     let mut moe_routes = MoeRouteRuntime::new(
         geom.num_layers as usize,
         geom.top_k as usize,
@@ -260,6 +273,10 @@ fn decode_text(
         // token per iteration.
         if loop_state.reached_max_new() {
             break;
+        }
+        let is_gen_step = step + 1 >= prompt_ids.len();
+        if is_gen_step && generation_wall_start.is_none() {
+            generation_wall_start = Some(std::time::Instant::now());
         }
         // Embed lookup for the current token.
         let t0 = std::time::Instant::now();
@@ -298,7 +315,6 @@ fn decode_text(
         // into final_hidden_buf. The host then D2Hs `logits_buf`
         // directly. On prefill steps logits aren't needed; on the
         // chained path the explicit lm_head_launch path stays.
-        let is_gen_step = step + 1 >= prompt_ids.len();
         let fold = if is_gen_step {
             Some(crate::qwen36_moe_persistent_decode::LmHeadFold {
                 final_norm_w: &final_norm_w_buf,
@@ -337,6 +353,9 @@ fn decode_text(
 
         // Prefill steps: feed the next prompt token without computing logits.
         if step + 1 < prompt_ids.len() {
+            prefill_steps += 1;
+            prefill_embed_elapsed += t_embed_step;
+            prefill_chain_elapsed += t_chain_step;
             loop_state.current_token = prompt_ids[step + 1];
             continue;
         }
@@ -422,6 +441,30 @@ fn decode_text(
         )?;
     }
     stage_timings.print_if_requested(emit_stage_timings);
+    if emit_stage_timings {
+        let to_ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+        let prefill_total_ms = to_ms(prefill_embed_elapsed + prefill_chain_elapsed);
+        let generation_wall_ms = generation_wall_start
+            .as_ref()
+            .map(|start| to_ms(start.elapsed()))
+            .unwrap_or(0.0);
+        eprintln!(
+            "[qwen36-moe lifecycle-timings] prompt_setup_ms={:.3} \
+             bake_open_ms={:.3} layer_load_ms={:.3} session_ms={:.3} \
+             prefill_steps={} prefill_embed_ms={:.3} prefill_chain_ms={:.3} \
+             prefill_total_ms={:.3} generation_wall_ms={:.3} total_wall_ms={:.3}",
+            to_ms(prompt_setup_elapsed),
+            to_ms(bake_open_elapsed),
+            to_ms(layer_load_elapsed),
+            to_ms(session_elapsed),
+            prefill_steps,
+            to_ms(prefill_embed_elapsed),
+            to_ms(prefill_chain_elapsed),
+            prefill_total_ms,
+            generation_wall_ms,
+            to_ms(decode_wall_start.elapsed()),
+        );
+    }
 
     Ok(())
 }

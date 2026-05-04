@@ -43,12 +43,66 @@ class Qwen36LongContextBenchTests(unittest.TestCase):
             "[tokens] [1, 2, 3]\n"
             "[result] prompt_tokens=8190 generated_tokens=3 decode_ms=30 ms_per_tok=10\n"
             "[qwen36-moe stage-timings] gen_steps=3 total_ms_avg=10.5 attn_ms_avg=2 (chain_total_ms=30)\n"
+            "[qwen36-moe chain-breakdown] gen_steps=3 full_attn_ms_avg=7.0 "
+            "linear_attn_ms_avg=1.0 ffn_ms_avg=2.0\n"
+            "[qwen36-moe lifecycle-timings] prompt_setup_ms=1.0 bake_open_ms=2.0 "
+            "layer_load_ms=3.0 session_ms=4.0 prefill_steps=8190 "
+            "prefill_embed_ms=5.0 prefill_chain_ms=6000.0 prefill_total_ms=6005.0 "
+            "generation_wall_ms=30.0 total_wall_ms=7000.0\n"
         )
         self.assertEqual(bench_qwen36_longctx.parse_generated_json(output), "SSB-NEEDLE-00007\n")
         self.assertEqual(bench_qwen36_longctx.parse_tokens(output), [1, 2, 3])
         self.assertEqual(bench_qwen36_longctx.parse_result(output)["prompt_tokens"], 8190)
         self.assertEqual(bench_qwen36_longctx.parse_stage_timings(output)["total_ms_avg"], 10.5)
         self.assertEqual(bench_qwen36_longctx.parse_stage_timings(output)["chain_total_ms"], 30)
+        chain = bench_qwen36_longctx.parse_chain_breakdown(output)
+        self.assertEqual(chain["full_attn_ms_avg"], 7.0)
+        self.assertEqual(bench_qwen36_longctx.likely_bottleneck({"chain_breakdown": chain}), "full_attn")
+        lifecycle = bench_qwen36_longctx.parse_lifecycle_timings(output)
+        self.assertEqual(lifecycle["prefill_steps"], 8190)
+        self.assertEqual(lifecycle["prefill_total_ms"], 6005.0)
+        self.assertEqual(lifecycle["generation_wall_ms"], 30.0)
+
+    def test_apply_preset_defaults_allows_explicit_overrides(self):
+        args = SimpleNamespace(
+            preset="comparison",
+            contexts=None,
+            modes="int4-vmm",
+            sparse_caps=None,
+            max_new_tokens=None,
+            timeout=None,
+            warmup=None,
+        )
+        applied = bench_qwen36_longctx.apply_preset_defaults(args)
+        self.assertEqual(applied.contexts, "512,2048,4096,8192")
+        self.assertEqual(applied.modes, "int4-vmm")
+        self.assertEqual(applied.max_new_tokens, 4)
+        self.assertTrue(applied.warmup)
+
+    def test_summarize_ranks_best_mode_and_recommendation(self):
+        rows = [
+            {
+                "context_tokens_requested": 512,
+                "mode": "int4-vmm",
+                "returncode": 0,
+                "stage": {"total_ms_avg": 40.0},
+                "chain_breakdown": {"full_attn_ms_avg": 30.0, "ffn_ms_avg": 5.0},
+                "lifecycle": {"prefill_total_ms": 1000.0, "generation_wall_ms": 41.0},
+            },
+            {
+                "context_tokens_requested": 512,
+                "mode": "int4-kv-fp8",
+                "returncode": 0,
+                "stage": {"total_ms_avg": 35.0},
+                "chain_breakdown": {"full_attn_ms_avg": 27.0, "ffn_ms_avg": 4.0},
+                "lifecycle": {"prefill_total_ms": 900.0, "generation_wall_ms": 36.0},
+            },
+        ]
+        summary = bench_qwen36_longctx.summarize(rows)
+        self.assertEqual(summary[0]["best_mode"], "int4-kv-fp8")
+        self.assertEqual(summary[0]["best_vs_baseline_pct"], -12.5)
+        self.assertEqual(summary[0]["likely_bottleneck"], "full_attn")
+        self.assertIn("full-attention", bench_qwen36_longctx.recommendation(summary))
 
     def test_parse_result_accepts_qwen36_generated_summary(self):
         output = "Generated 1 token (418 prompt + 1 new). EOS: no (max_new_tokens hit)."

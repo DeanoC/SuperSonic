@@ -18,10 +18,11 @@ Currently shipping for Qwen3.5-9B target + Qwen3.5-0.8B draft on HIP
   poor at low keep ratios — see Phase A2 measurements.
 - Cross-family draft (e.g. Qwen3.5-0.8B → Qwen3.6-MoE). Deferred —
   see [research/2026-05-03-specprefill-phase-a2-cross-target.md](research/2026-05-03-specprefill-phase-a2-cross-target.md).
-- Very long prompts (>8192 tokens). The look-ahead kernel is bounded
-  by per-block LDS; longer prompts trip a clear FFI error today.
-  (Cosine scoring has no comparable bound, but the rest of the
-  pipeline has not been measured beyond ~1500 tokens yet.)
+- Very long prompts (>8192 tokens). The legacy `lookahead` kernel is
+  bounded by per-block LDS and trips a clear FFI error past that
+  point. The default `cosine` path has no comparable bound and has
+  been measured cleanly at 8k tokens (3.36× faster than dense — see
+  Performance below); beyond 8k is untested.
 - 24 GiB GPU + a model larger than Qwen3.5-9B in BF16. Doesn't fit.
 
 ## Flags
@@ -52,15 +53,19 @@ selection (`keep_ratio` × `chunk_size`) and produce the same kept-token
 schedule downstream:
 
 - `cosine` (default, Phase D): per-block `cosine(block_mean_K, last_K)`
-  computed from one drafter K cache. The drafter does a single dense
-  prefill (megakernel fast path), the orchestrator picks one
-  full-attention layer, and a HIP kernel emits per-block cosine scores
-  in one launch. The default scoring layer is the **shallowest**
-  full-attention layer (env var `SUPERSONIC_SPECPREFILL_SCORE_LAYER=N`
-  overrides). The default aggregation mode is `shallowest`; set
+  computed from one drafter K cache. The drafter prefill stops after
+  the deepest scoring layer (early-exit through `prefill_kv_through`)
+  — for `shallowest` mode on Qwen3.5-0.8B that prunes ~26 of 28 layers.
+  The orchestrator then picks one full-attention layer and a HIP kernel
+  emits per-block cosine scores in one launch. The default scoring
+  layer is the **shallowest** full-attention layer (env var
+  `SUPERSONIC_SPECPREFILL_SCORE_LAYER=N` overrides). The default
+  aggregation mode is `shallowest`; set
   `SUPERSONIC_SPECPREFILL_LAYERS=all_max` to take the per-block max
-  across all full-attention layers (marginal quality bump in our
-  measurements; see Performance below).
+  across all full-attention layers — `all_max` doesn't benefit from
+  early-exit (the deepest full-attention layer is near the end of the
+  drafter), so it ends up at roughly dense-baseline TTFT in our
+  measurements (see Performance below).
 - `lookahead` (legacy, Phase C): per-layer `softmax(Q·Kᵀ)` over
   look-ahead query rows from `--specprefill-lookahead` decode steps on
   the draft. Correctness-validated and structurally faithful to the
@@ -75,20 +80,37 @@ faster TTFT than dense.
 
 ## Performance
 
-Measured on gfx1100 with Qwen3.5-9B target + Qwen3.5-0.8B draft, a
-1353-token prompt, 4 generated tokens, warmup pass + 3 measurement
-runs (median reported), `--specprefill-keep-ratio 0.50`:
+Measured on gfx1100 with Qwen3.5-9B target + Qwen3.5-0.8B draft,
+warmup pass + 3 measurement runs (median reported),
+`--specprefill-keep-ratio 0.50`. Three prompt lengths: 1.3k tokens
+(the original measurement) plus 4k and 8k (the regimes SpecPrefill is
+actually meant for):
 
-| Mode | TTFT (ms) | vs dense |
-|---|---|---|
-| dense (no SpecPrefill) | 5192 | 1.00× |
-| `--specprefill-algorithm cosine`, `shallowest` (default) | 4134 | **1.26× faster** |
-| `--specprefill-algorithm cosine`, `all_max` | 4099 | 1.27× faster |
-| `--specprefill-algorithm lookahead` | 7895 | 0.66× (slower than dense) |
+| Mode | 1.3k tok | 4k tok | 8k tok |
+|---|---:|---:|---:|
+| dense (no SpecPrefill) | 4941 ms | 29374 ms | 124220 ms |
+| `cosine`, `shallowest` (default) | **2385 ms** | **11157 ms** | **36939 ms** |
+| `cosine`, `all_max` | 4144 ms | 20893 ms | 74948 ms |
+| `lookahead` (legacy) | 7846 ms | 24950 ms | 80363 ms |
 
-Quality at the same `keep_ratio=0.50` (against the dense reference; same
-1353-token prompt; cossim is a regression backstop, argmax-match is
-the primary correctness gate):
+Speedup vs dense:
+
+| Mode | 1.3k | 4k | 8k |
+|---|---:|---:|---:|
+| `cosine`, `shallowest` (default) | **2.07×** | **2.63×** | **3.36×** |
+| `cosine`, `all_max` | 1.19× | 1.41× | 1.66× |
+| `lookahead` (legacy) | 0.63× (slower) | 1.18× | 1.55× |
+
+The default `cosine` + `shallowest` path's speedup *compounds with
+prompt length*: 2.07× at 1.3k → 3.36× at 8k, saving ~87 seconds of
+TTFT on a single 8k prefill. This is the regime SpecPrefill is
+designed for. The legacy `lookahead` path is slower than dense at
+short prompts but pulls ahead of dense at ≥4k tokens; it is still
+beaten by `cosine` at every measured length.
+
+Quality at `keep_ratio=0.50` on the 1353-token prompt (against the
+dense reference; cossim is a regression backstop, argmax-match is the
+primary correctness gate):
 
 | Algorithm | argmax match | cossim |
 |---|---|---|
@@ -96,9 +118,8 @@ the primary correctness gate):
 | `lookahead` | ✓ | 0.708 |
 
 Cosine is the default for new SpecPrefill runs because it is both
-faster *and* more accurate on this configuration. The single-token
-`keep_ratio=0.50` measurement is end-to-end; multi-token keep=1.00 runs
-through cosine produce byte-equal text against dense.
+faster *and* more accurate on this configuration. Multi-token
+`keep=1.00` runs through cosine produce byte-equal text against dense.
 
 ## Quality
 

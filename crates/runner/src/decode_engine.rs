@@ -10420,6 +10420,39 @@ impl DecodeEngine {
         Ok(result)
     }
 
+    /// SpecPrefill cosine fast path: prefill the prompt through layer
+    /// `last_layer`, writing KV caches for layers `0..=last_layer`, and
+    /// stop. Skips final norm + lm_head + KV-FP8 conversion. Caller
+    /// reads the K caches directly via `state_mut().layers[i]`.
+    ///
+    /// Used by the speculator when scoring with cosine similarity —
+    /// only the K caches for the chosen scoring layer(s) are needed,
+    /// and running the rest of the model wastes time. For Qwen3.5-0.8B
+    /// + shallowest-layer scoring (default), this prunes ~27 of 28
+    /// drafter layers.
+    pub fn prefill_native_kv_through(
+        &mut self,
+        prompt_ids: &[u32],
+        last_layer: usize,
+    ) -> Result<()> {
+        prefill_engine::prefill_kv_through(
+            &self.weights,
+            &mut self.state,
+            &self.rotary,
+            prompt_ids,
+            self.ordinal,
+            self.kv_chunk_size,
+            self.prefill_chunk_size,
+            self.kv_fp8,
+            self.use_4b_kernel,
+            last_layer,
+        )?;
+        self.scratch
+            .reset_sync()
+            .map_err(|e| anyhow::anyhow!("reset sync after prefill_kv_through: {e}"))?;
+        Ok(())
+    }
+
     /// SpecPrefill (arXiv 2502.02789) target sparse prefill via the engine's
     /// own state/weights/rotary. See `prefill_engine::prefill_kept` for the
     /// `kept_positions` invariants.

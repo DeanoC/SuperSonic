@@ -886,6 +886,7 @@ pub fn prefill(
         None,
         None,
         None,
+        None, // last_layer
     )
 }
 
@@ -922,6 +923,7 @@ pub fn prefill_with_taps(
         Some(tap_layers),
         None,
         None,
+        None, // last_layer
     )
 }
 
@@ -952,6 +954,7 @@ pub fn prefill_with_target_nll(
         None,
         Some((score_hidden_start, score_targets)),
         None,
+        None, // last_layer
     )
 }
 
@@ -994,7 +997,52 @@ pub fn prefill_kept(
         None,                 // tap_layers
         None,                 // target_nll
         Some(kept_positions), // kept_positions
+        None,                 // last_layer
     )
+}
+
+/// SpecPrefill cosine fast path: drafter prefill that only writes K/V
+/// caches for layers `0..=last_layer` and then returns. Skips final
+/// norm + lm_head + target_nll + BF16→FP8 KV conversion. Caller reads
+/// the K cache from `state.layers[i]` for each scored layer `i`.
+///
+/// Required: `last_layer < num_hidden_layers`.
+pub fn prefill_kv_through(
+    weights: &Qwen35Weights,
+    state: &mut ModelState,
+    rotary: &RotaryTables,
+    prompt_ids: &[u32],
+    ordinal: usize,
+    kv_chunk_size: usize,
+    prefill_chunk_size: usize,
+    kv_fp8: bool,
+    use_4b_kernel: bool,
+    last_layer: usize,
+) -> Result<()> {
+    if last_layer >= weights.config.num_hidden_layers {
+        return Err(anyhow::anyhow!(
+            "prefill_kv_through: last_layer {last_layer} out of range (num_hidden_layers={})",
+            weights.config.num_hidden_layers
+        ));
+    }
+    prefill_inner(
+        weights,
+        state,
+        rotary,
+        prompt_ids,
+        ordinal,
+        kv_chunk_size,
+        prefill_chunk_size,
+        kv_fp8,
+        use_4b_kernel,
+        false, // trace_layers
+        None,  // debug_linear_layer
+        None,  // tap_layers
+        None,  // target_nll
+        None,  // kept_positions
+        Some(last_layer),
+    )?;
+    Ok(())
 }
 
 // ---- SpecPrefill Phase C: speculator-side prefill with attention export ----
@@ -1037,7 +1085,17 @@ fn prefill_inner(
     debug_linear_layer: Option<usize>,
     tap_layers: Option<&[usize]>,
     target_nll: Option<(usize, &[u32])>,
-    kept_positions: Option<&[u32]>, // NEW
+    kept_positions: Option<&[u32]>,
+    // SpecPrefill cosine fast path: when Some(N), the per-chunk layer
+    // loop stops after layer N (KV caches for layers 0..=N are written;
+    // layers N+1.. are skipped). Final norm + lm_head + target_nll +
+    // kv_fp8 conversion are all skipped — caller reads the KV caches
+    // directly from `state`. The returned PrefillResult has empty
+    // logits and None traces in this mode. Required: `tap_layers`,
+    // `target_nll`, `debug_linear_layer`, `trace_layers`, and
+    // `kept_positions` must all be unused (None / false) — early-exit
+    // mode is K-only.
+    last_layer: Option<usize>,
 ) -> Result<PrefillResult> {
     let config = &weights.config;
     let seq_len = if let Some(kept) = kept_positions {
@@ -1201,8 +1259,12 @@ fn prefill_inner(
             &mut scratch.hidden,
         )?;
 
-        // Layer loop (all layers for this chunk)
-        for idx in 0..config.num_hidden_layers {
+        // Layer loop (all layers for this chunk, or 0..=last_layer when
+        // the SpecPrefill cosine fast path requests early exit).
+        let last_layer_idx = last_layer
+            .map(|n| n.min(config.num_hidden_layers - 1))
+            .unwrap_or(config.num_hidden_layers - 1);
+        for idx in 0..=last_layer_idx {
             // Input RMSNorm
             rms_norm_rows_model(
                 config,
@@ -1402,6 +1464,25 @@ fn prefill_inner(
         }
 
         chunk_start += chunk_len;
+    }
+
+    // SpecPrefill cosine fast path: caller asked for KV-only prefill
+    // through `last_layer`. Skip final norm + lm_head + target_nll + the
+    // BF16→FP8 KV conversion. Caller reads K caches directly from
+    // `state` for the layers it scored.
+    if last_layer.is_some() {
+        return Ok(PrefillResult {
+            logits: Vec::new(),
+            final_norm_trace: None,
+            layer_attn_trace,
+            layer_post_attn_norm_trace,
+            layer_mlp_swiglu_trace,
+            layer_mlp_out_trace,
+            layer_hidden_trace,
+            tap_hiddens,
+            linear_debug_trace,
+            target_nll: None,
+        });
     }
 
     // Extract logits for the last token of the final chunk. Refactored out
