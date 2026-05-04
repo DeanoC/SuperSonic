@@ -54,6 +54,16 @@ impl Qwen36DecodeLoopState {
         replay
     }
 
+    pub fn partial_accept_replay_inputs(
+        &self,
+        first_token: u32,
+        result: &SpeculativeStepResult,
+        draft_count: usize,
+    ) -> Option<Vec<(i32, u32)>> {
+        (result.n_accepted < draft_count)
+            .then(|| self.speculative_replay_inputs(first_token, result))
+    }
+
     pub fn record_last_logits(&mut self, logits: &[u8]) {
         self.last_logits_bytes.clear();
         self.last_logits_bytes.extend_from_slice(logits);

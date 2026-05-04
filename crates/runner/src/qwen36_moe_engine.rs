@@ -476,18 +476,9 @@ fn decode_text(
                 )
                 .context("batched speculative decode step")?;
 
-                // State mgmt: on partial-accept, restore + replay the
-                // accepted prefix to advance linear-attn state correctly.
-                // Full-accept (n_accepted == dynamic_k) needs no fixup —
-                // K+1 chains advanced state through K+1 inputs which is
-                // exactly what we committed (drafts + bonus's input was
-                // drafts[K-1], one more chain's worth advances naturally
-                // when next iter feeds the bonus token).
-                if r.n_accepted < dynamic_k {
-                    // Replay (j+1) chains: first_token at the current
-                    // position, then the j accepted drafts at the
-                    // following positions.
-                    let replay = loop_state.speculative_replay_inputs(next_token, &r);
+                if let Some(replay) =
+                    loop_state.partial_accept_replay_inputs(next_token, &r, dynamic_k)
+                {
                     restore_and_replay_accepted_prefix(Qwen36SpecReplayAccepted {
                         ordinal,
                         geom: &geom,
