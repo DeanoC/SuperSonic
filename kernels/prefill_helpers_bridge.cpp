@@ -141,6 +141,45 @@ int lookahead_attention_scores_device(int device_ordinal,
     return 0;
 }
 
+// ---- pflash_cosine_score (SpecPrefill — Phase D PFlash-style scoring) ----
+
+template <typename T>
+int pflash_cosine_score_device(int device_ordinal,
+                               int n_pos, int kv_heads, int cap, int head_dim,
+                               int block_size, int n_blocks, int last_pos,
+                               const void* k_cache, void* scores) {
+    if (n_pos <= 0 || kv_heads <= 0 || cap <= 0 || head_dim <= 0
+        || block_size <= 0 || n_blocks <= 0) {
+        return 326; // invalid shape
+    }
+    if (last_pos < 0 || last_pos >= n_pos || cap < n_pos) {
+        return 327; // out-of-range positions
+    }
+    ScopedHipDevice scoped(device_ordinal);
+    // Query the device's wavefront size at runtime — same pattern as
+    // lookahead_attention_scores_device. wave32 on gfx1100 (RDNA3),
+    // wave64 on gfx9xx/RDNA1/RDNA2.
+    hipDeviceProp_t prop;
+    if (hipGetDeviceProperties(&prop, device_ordinal) != hipSuccess) {
+        return 328; // device-properties query failed
+    }
+    const int wave = prop.warpSize;
+    if (wave != 32 && wave != 64) {
+        return 333; // unexpected wavefront size
+    }
+    const dim3 grid(static_cast<unsigned int>(n_blocks));
+    const dim3 block(static_cast<unsigned int>(wave));
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(pfx_pflash_cosine_score_kernel<T>),
+        grid, block, 0, 0,
+        static_cast<const T*>(k_cache),
+        static_cast<float*>(scores),
+        n_pos, kv_heads, cap, head_dim, block_size, n_blocks, last_pos);
+    if (hipGetLastError() != hipSuccess) return 334;
+    if (hipDeviceSynchronize() != hipSuccess) return 335;
+    return 0;
+}
+
 // ---- transpose [S,H,D] -> [H,S,D] ----
 
 template <typename T>
@@ -435,6 +474,29 @@ extern "C" int supersonic_qwen35_hip_lookahead_attention_scores(
                 static_cast<int>(lookahead_count), static_cast<int>(kv_len),
                 static_cast<int>(head_dim), scale, q, k, scores);
     default: return 310;
+    }
+}
+
+extern "C" int supersonic_qwen35_hip_pflash_cosine_score(
+    int dtype, size_t device_ordinal,
+    size_t n_pos, size_t kv_heads, size_t cap, size_t head_dim,
+    size_t block_size, size_t n_blocks, size_t last_pos,
+    const void* k_cache, void* scores
+) {
+    switch (dtype) {
+    case 0: return pflash_cosine_score_device<half>(
+                static_cast<int>(device_ordinal),
+                static_cast<int>(n_pos), static_cast<int>(kv_heads),
+                static_cast<int>(cap), static_cast<int>(head_dim),
+                static_cast<int>(block_size), static_cast<int>(n_blocks),
+                static_cast<int>(last_pos), k_cache, scores);
+    case 2: return pflash_cosine_score_device<hip_bfloat16>(
+                static_cast<int>(device_ordinal),
+                static_cast<int>(n_pos), static_cast<int>(kv_heads),
+                static_cast<int>(cap), static_cast<int>(head_dim),
+                static_cast<int>(block_size), static_cast<int>(n_blocks),
+                static_cast<int>(last_pos), k_cache, scores);
+    default: return 336; // unsupported dtype
     }
 }
 
