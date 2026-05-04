@@ -4,12 +4,28 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 
-use super::report::PromptManifest;
+use super::report::{PromptManifest, PromptManifestEntry};
 
 pub(crate) fn load_prompt_manifest(path: &Path) -> Result<PromptManifest> {
     let manifest_text = fs::read_to_string(path)
         .with_context(|| format!("read prompt manifest {}", path.display()))?;
     parse_prompt_manifest_str(&manifest_text)
+}
+
+pub(crate) fn select_prompts<'a>(
+    manifest: &'a PromptManifest,
+    selected_prompt: Option<&str>,
+) -> Result<Vec<&'a PromptManifestEntry>> {
+    if let Some(name) = selected_prompt {
+        let prompt = manifest
+            .prompts
+            .iter()
+            .find(|entry| entry.name == name)
+            .ok_or_else(|| anyhow::anyhow!("prompt '{}' not found in manifest", name))?;
+        Ok(vec![prompt])
+    } else {
+        Ok(manifest.prompts.iter().collect())
+    }
 }
 
 fn parse_prompt_manifest_str(manifest_text: &str) -> Result<PromptManifest> {

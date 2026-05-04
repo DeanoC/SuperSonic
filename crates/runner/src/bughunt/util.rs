@@ -4,6 +4,21 @@ use serde_json::Value;
 
 use super::report::TopDeltaDim;
 
+pub(crate) fn bench_stats(values: &[f64]) -> (f64, f64, f64) {
+    let min = values.iter().copied().fold(f64::INFINITY, f64::min);
+    let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    (min, max, mean)
+}
+
+pub(crate) fn optional_bench_stats(values: &[f64]) -> (Option<f64>, Option<f64>, Option<f64>) {
+    if values.is_empty() {
+        return (None, None, None);
+    }
+    let (min, max, mean) = bench_stats(values);
+    (Some(min), Some(max), Some(mean))
+}
+
 pub(crate) fn mean_abs_delta(lhs: &[f32], rhs: &[f32]) -> f32 {
     let len = lhs.len().min(rhs.len());
     if len == 0 {

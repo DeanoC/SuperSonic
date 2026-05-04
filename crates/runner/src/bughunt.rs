@@ -18,7 +18,7 @@ mod runtime;
 mod util;
 pub use args::*;
 use args::validate_args;
-use manifest::load_prompt_manifest;
+use manifest::{load_prompt_manifest, select_prompts};
 use output::{print_report_summary, write_report_json};
 use profile::{
     collect_profiles, reset_profiles, snapshot_profiles, ProfileGuard, ProfileReports,
@@ -26,9 +26,9 @@ use profile::{
 pub use report::*;
 use runtime::QwenBughuntRuntime;
 use util::{
-    decode_bf16_le, encode_bf16_le, extract_causal_conv_window_bsd, flatten_bsh,
+    bench_stats, decode_bf16_le, encode_bf16_le, extract_causal_conv_window_bsd, flatten_bsh,
     flatten_token_bsd, max_abs_delta_details, mean_abs_delta, mean_square, mean_square_delta,
-    read_buffer_all_f32, top_abs_delta_dims,
+    optional_bench_stats, read_buffer_all_f32, top_abs_delta_dims,
 };
 
 #[derive(Debug, Clone)]
@@ -548,21 +548,6 @@ fn run_bench_mode(
     })
 }
 
-fn bench_stats(values: &[f64]) -> (f64, f64, f64) {
-    let min = values.iter().copied().fold(f64::INFINITY, f64::min);
-    let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    let mean = values.iter().sum::<f64>() / values.len() as f64;
-    (min, max, mean)
-}
-
-fn optional_bench_stats(values: &[f64]) -> (Option<f64>, Option<f64>, Option<f64>) {
-    if values.is_empty() {
-        return (None, None, None);
-    }
-    let (min, max, mean) = bench_stats(values);
-    (Some(min), Some(max), Some(mean))
-}
-
 fn collect_replay_decode_profile(
     runtime: &QwenBughuntRuntime,
     prompt_ids: &[u32],
@@ -917,22 +902,6 @@ fn run_dump_mode(
             traced_metrics,
         },
     })
-}
-
-fn select_prompts<'a>(
-    manifest: &'a PromptManifest,
-    selected_prompt: Option<&str>,
-) -> Result<Vec<&'a PromptManifestEntry>> {
-    if let Some(name) = selected_prompt {
-        let prompt = manifest
-            .prompts
-            .iter()
-            .find(|entry| entry.name == name)
-            .ok_or_else(|| anyhow::anyhow!("prompt '{}' not found in manifest", name))?;
-        Ok(vec![prompt])
-    } else {
-        Ok(manifest.prompts.iter().collect())
-    }
 }
 
 fn analyze_gate_prompt(
