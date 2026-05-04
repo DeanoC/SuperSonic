@@ -3,13 +3,23 @@ use gpu_hal::{GpuBuffer, ScalarType};
 use model_store::BakedStore;
 
 use crate::qwen36_moe_decode::{
-    argmax_bf16_logits, run_chained_decode_fast, DecodeOutputs, LayerBuffers, MultiLayerGeom,
+    argmax_bf16_logits, run_chained_decode_fast, DecodeOutputs, LayerBuffers, MtpLayerBuffers,
+    MultiLayerGeom,
 };
 use crate::qwen36_moe_host::lookup_embed_row;
 use crate::qwen36_moe_lm_head::{launch_lm_head_from_final_hidden_bytes, LmHeadBuffers};
+use crate::qwen36_moe_loop::Qwen36DecodeLoopState;
+use crate::qwen36_moe_mtp::{MtpChainScratch, MtpForwardScratch};
 use crate::qwen36_moe_persistent_decode::PersistentScratch;
-use crate::qwen36_moe_state::{restore_linear_attn_state, LinearAttnSnapshot};
+use crate::qwen36_moe_speculative::{
+    run_speculative_decode_step, run_speculative_decode_step_batched, SpeculativeStepResult,
+};
+use crate::qwen36_moe_state::{
+    refresh_linear_attn_state, restore_linear_attn_state, LinearAttnSnapshot,
+};
 use crate::qwen36_moe_timing::Qwen36StageTimingTotals;
+
+const QWEN36_NUM_SPECULATIVE_TOKENS: usize = 3;
 
 pub(crate) struct Qwen36SpecChainStep<'a> {
     pub(crate) ordinal: usize,
@@ -219,6 +229,126 @@ pub(crate) fn run_sequential_spec_verify_input(
         final_hidden_bytes: &outputs.final_hidden_bytes,
     })?;
     Ok((top1, outputs.final_hidden_bytes))
+}
+
+pub(crate) struct Qwen36SpeculativeExtension<'a> {
+    pub(crate) ordinal: usize,
+    pub(crate) geom: &'a MultiLayerGeom,
+    pub(crate) store: &'a BakedStore,
+    pub(crate) weight_prefix: &'a str,
+    pub(crate) layers: &'a mut [LayerBuffers],
+    pub(crate) persistent_scratch: Option<&'a mut PersistentScratch>,
+    pub(crate) mtp: &'a mut MtpLayerBuffers,
+    pub(crate) forward_scratch: &'a mut MtpForwardScratch,
+    pub(crate) chain_scratch: &'a mut MtpChainScratch,
+    pub(crate) embed_w: &'a GpuBuffer,
+    pub(crate) final_norm_w: &'a GpuBuffer,
+    pub(crate) lm_head_w: &'a GpuBuffer,
+    pub(crate) final_hidden: &'a mut GpuBuffer,
+    pub(crate) logits: &'a mut GpuBuffer,
+    pub(crate) counter: &'a mut GpuBuffer,
+    pub(crate) linear_attn_snapshot: Option<&'a mut LinearAttnSnapshot>,
+    pub(crate) loop_state: &'a Qwen36DecodeLoopState,
+    pub(crate) h_base_in: &'a [u8],
+    pub(crate) first_token: u32,
+    pub(crate) stage_timings: &'a mut Qwen36StageTimingTotals,
+    pub(crate) emit_stage_timings: bool,
+}
+
+pub(crate) fn run_speculative_extension(
+    mut args: Qwen36SpeculativeExtension<'_>,
+) -> Result<SpeculativeStepResult> {
+    let dynamic_k = args
+        .loop_state
+        .speculative_draft_count(QWEN36_NUM_SPECULATIVE_TOKENS);
+
+    if let Some(snapshot) = args.linear_attn_snapshot.as_deref_mut() {
+        refresh_linear_attn_state(args.ordinal, args.layers, snapshot)
+            .context("refresh linear-attn snapshot before batched verify")?;
+
+        let result = run_speculative_decode_step_batched(
+            args.ordinal,
+            args.geom,
+            args.mtp,
+            args.forward_scratch,
+            args.chain_scratch,
+            args.embed_w,
+            args.lm_head_w,
+            args.h_base_in,
+            args.first_token,
+            args.loop_state.position,
+            dynamic_k,
+            |inputs| -> Result<Vec<(u32, Vec<u8>)>> {
+                run_batched_spec_verify_inputs(Qwen36BatchedSpecVerifyInputs {
+                    ordinal: args.ordinal,
+                    geom: args.geom,
+                    store: args.store,
+                    weight_prefix: args.weight_prefix,
+                    layers: args.layers,
+                    persistent_scratch: args.persistent_scratch.as_deref_mut(),
+                    final_norm_w: args.final_norm_w,
+                    lm_head_w: args.lm_head_w,
+                    stage_timings: args.stage_timings,
+                    inputs,
+                    emit_stage_timings: args.emit_stage_timings,
+                })
+            },
+        )
+        .context("batched speculative decode step")?;
+
+        if let Some(replay) =
+            args.loop_state
+                .partial_accept_replay_inputs(args.first_token, &result, dynamic_k)
+        {
+            restore_and_replay_accepted_prefix(Qwen36SpecReplayAccepted {
+                ordinal: args.ordinal,
+                geom: args.geom,
+                store: args.store,
+                weight_prefix: args.weight_prefix,
+                layers: args.layers,
+                snapshot,
+                persistent_scratch: args.persistent_scratch.as_deref_mut(),
+                stage_timings: args.stage_timings,
+                replay_inputs: &replay,
+                emit_stage_timings: args.emit_stage_timings,
+            })?;
+        }
+        Ok(result)
+    } else {
+        run_speculative_decode_step(
+            args.ordinal,
+            args.geom,
+            args.mtp,
+            args.forward_scratch,
+            args.chain_scratch,
+            args.embed_w,
+            args.lm_head_w,
+            args.h_base_in,
+            args.first_token,
+            args.loop_state.position,
+            dynamic_k,
+            |position, input| -> Result<(u32, Vec<u8>)> {
+                run_sequential_spec_verify_input(Qwen36SequentialSpecVerifyInput {
+                    ordinal: args.ordinal,
+                    geom: args.geom,
+                    store: args.store,
+                    weight_prefix: args.weight_prefix,
+                    layers: args.layers,
+                    persistent_scratch: args.persistent_scratch.as_deref_mut(),
+                    final_norm_w: args.final_norm_w,
+                    lm_head_w: args.lm_head_w,
+                    final_hidden: args.final_hidden,
+                    logits: args.logits,
+                    counter: args.counter,
+                    stage_timings: args.stage_timings,
+                    position,
+                    input,
+                    emit_stage_timings: args.emit_stage_timings,
+                })
+            },
+        )
+        .context("speculative decode step")
+    }
 }
 
 pub(crate) struct Qwen36BatchedLmHeadTop1<'a> {
