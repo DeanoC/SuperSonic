@@ -419,18 +419,33 @@ pub fn run_specprefill(
         std::io::stdout().flush().ok();
     }
 
-    // ---- Decode loop. KV slot and RoPE position are decoupled:
-    //      - kv_slot = kept_count + step  (next available slot in the sparse KV cache)
-    //      - rope_pos = prompt_len + step  (actual sequence position for RoPE rotation)
-    //      This fixes attention math after sparse target prefill: the KV cache only
-    //      has kept_count rows, so each new token must write to slot kept_count+step,
-    //      but must use its true sequence position for RoPE. ----
+    // ---- Decode loop. Two paths:
+    //
+    // (1) Default (BF16 KV cache): incremental decode via
+    //     `decode_step_with_rope_pos`. KV slot and RoPE position are
+    //     decoupled:
+    //       - kv_slot = kept_count + step  (next available slot in the sparse cache)
+    //       - rope_pos = prompt_len + step  (actual sequence position for RoPE)
+    //     The KV cache only has kept_count rows after sparse prefill, so each new
+    //     token writes to slot kept_count+step with its true RoPE rotation.
+    //
+    // (2) `--kv-fp8`: replay-prefill per step. Component decode (the path
+    //     `decode_step_with_rope_pos` takes for use_4b_kernel models) writes
+    //     K/V via `copy_step_bf16` and reads via the BF16 attention kernel
+    //     `full_attention_decode_flat`; neither has an FP8 path. Plain
+    //     `--kv-fp8` already replays prefill per decode step (see main.rs's
+    //     `replay_kv_fp8_enabled`); we mirror that here. The first prefill
+    //     keeps SpecPrefill's TTFT win (sparse `prefill_kept`); each decode
+    //     step then runs a dense replay-prefill on the full unsparsified
+    //     history. Decode tokens-per-second is bounded by replay-prefill
+    //     cost, same as plain `--kv-fp8` decode on Qwen3.5-9B. ----
     let kept_count = kept_positions.len();
     let prompt_len = prompt_ids.len();
     let mut next_id = DecodeEngine::greedy_sample(&prefill_result.logits);
     let mut generated: Vec<u32> = Vec::new();
     let mut step: usize = 0;
     let eos_ids = target_text_config.eos_token_ids();
+    let kv_fp8_replay = cli.kv_fp8;
     while generated.len() < cli.max_new_tokens {
         if eos_ids.contains(&next_id) {
             generated.push(next_id);
@@ -440,9 +455,16 @@ pub fn run_specprefill(
         if generated.len() >= cli.max_new_tokens {
             break;
         }
-        let kv_slot = kept_count + step;
-        let rope_pos = prompt_len + step;
-        let logits = target_engine.decode_step_with_rope_pos(next_id, kv_slot, rope_pos)?;
+        let logits = if kv_fp8_replay {
+            let mut token_ids: Vec<u32> = Vec::with_capacity(prompt_len + generated.len());
+            token_ids.extend_from_slice(&prompt_ids);
+            token_ids.extend_from_slice(&generated);
+            target_engine.rebuild_prefill_state(&token_ids, false)?
+        } else {
+            let kv_slot = kept_count + step;
+            let rope_pos = prompt_len + step;
+            target_engine.decode_step_with_rope_pos(next_id, kv_slot, rope_pos)?
+        };
         next_id = DecodeEngine::greedy_sample(&logits);
         step += 1;
     }
