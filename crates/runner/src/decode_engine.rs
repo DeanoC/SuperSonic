@@ -10520,6 +10520,11 @@ impl DecodeEngine {
         Ok(logits)
     }
 
+    pub fn rebuild_prefill_state_greedy_token(&mut self, token_ids: &[u32]) -> Result<u32> {
+        let logits = self.rebuild_prefill_state(token_ids, false)?;
+        Ok(Self::greedy_sample(&logits))
+    }
+
     /// DFlash prefill: runs `prefill_with_taps` against the engine's own
     /// target state + weights, returning the regular PrefillResult with
     /// its `tap_hiddens` populated for the layers in `tap_layers`.
@@ -10928,6 +10933,16 @@ impl DecodeEngine {
             self.ordinal,
             self.kv_chunk_size,
         )
+    }
+
+    pub fn decode_step_metal_component_greedy(
+        &mut self,
+        token_id: u32,
+        seqlen_offset: usize,
+    ) -> Result<(u32, f64)> {
+        let start = Instant::now();
+        let next = self.decode_step_metal_fast_greedy(token_id, seqlen_offset)?;
+        Ok((next, start.elapsed().as_secs_f64() * 1000.0))
     }
 
     fn decode_step_non_4b_metal(
