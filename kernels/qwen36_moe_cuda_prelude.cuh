@@ -25,8 +25,30 @@ using hip_bfloat16 = __nv_bfloat16;
 #define hipGetLastError cudaGetLastError
 #define hipDeviceSynchronize cudaDeviceSynchronize
 
-#define __atomic_load_n(ptr, order) (*(volatile unsigned int*)(ptr))
-#define __atomic_store_n(ptr, val, order) (*(volatile unsigned int*)(ptr) = (val))
+__device__ __forceinline__ unsigned int supersonic_cuda_atomic_load_u32(
+    const unsigned int* ptr,
+    int order) {
+    unsigned int value = *(const volatile unsigned int*)ptr;
+    if (order != __ATOMIC_RELAXED) {
+        __threadfence();
+    }
+    return value;
+}
+
+__device__ __forceinline__ void supersonic_cuda_atomic_store_u32(
+    unsigned int* ptr,
+    unsigned int value,
+    int order) {
+    if (order != __ATOMIC_RELAXED) {
+        __threadfence();
+    }
+    *(volatile unsigned int*)ptr = value;
+}
+
+#define __atomic_load_n(ptr, order) \
+    supersonic_cuda_atomic_load_u32((const unsigned int*)(ptr), (order))
+#define __atomic_store_n(ptr, val, order) \
+    supersonic_cuda_atomic_store_u32((unsigned int*)(ptr), (unsigned int)(val), (order))
 
 #ifndef __HIP_PLATFORM_AMD__
 #define __shfl(val, lane) __shfl_sync(0xffffffffu, val, lane)
