@@ -15,6 +15,7 @@ mod phi4_engine;
 mod policy;
 mod prefill_engine;
 mod profiling;
+mod qwen35_decode_modes;
 mod qwen35_dflash_engine;
 mod qwen35_engine_setup;
 mod qwen35_kv_trace;

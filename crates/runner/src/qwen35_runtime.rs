@@ -1,10 +1,10 @@
 use anyhow::Result;
-use std::env;
 use std::time::Instant;
 
 use crate::bakes::ensure_hf_metadata_present;
 use crate::decode_engine::{DecodeEngine, DecodeStageTimings};
 use crate::prefill_engine;
+use crate::qwen35_decode_modes::{report_qwen35_decode_modes, resolve_qwen35_decode_modes};
 use crate::qwen35_engine_setup::{load_qwen35_engine, Qwen35EngineSetup};
 use crate::qwen35_kv_trace::trace_kv_cache;
 use crate::qwen35_prefill::{
@@ -264,98 +264,16 @@ pub(crate) fn run_qwen35(
             "[gpu-validate] replaying full token history through GPU prefill for reference..."
         );
     }
-    // Replay-prefill path used to be the default for 4B single-seq decode
-    // (safety net for numerical-parity work during the CUDA sm86 bring-up)
-    // but it scales O(N) per step with context length and was ~7x slower
-    // than the persistent megakernel at 64-token generations. Default is now
-    // the megakernel; --force-replay-decode re-enables the replay path for
-    // the rare case where someone genuinely wants to reproduce the older
-    // numeric semantics.
-    let cuda_qwen2b_replay_default = backend == Backend::Cuda
-        && *model_variant == ModelVariant::Qwen3_5_2B
-        && cli.batch_size == 1
-        && use_4b_kernel
-        && !cli.kv_fp8
-        && !cli.force_kernel_decode
-        && !cli.force_component_decode;
-    // Metal v2 wires per-op incremental decode through the standard
-    // `engine.decode_step` path; only the legacy 4B / qwen3.5-2b CUDA replay
-    // gates remain.
-    let metal_v2_incremental = backend == Backend::Metal && cli.batch_size == 1;
-    let replay_decode_enabled = cli.batch_size == 1
-        && !cli.force_kernel_decode
-        && !cli.force_component_decode
-        && !cli.kv_fp8
-        && use_4b_kernel
-        && (cli.force_replay_decode || cuda_qwen2b_replay_default);
-    let replay_kv_fp8_enabled =
-        use_4b_kernel && cli.kv_fp8 && cli.batch_size == 1 && !cli.force_kernel_decode;
-    let component_single_decode_enabled =
-        cli.batch_size == 1 && use_4b_kernel && cli.force_component_decode;
-    // Use the batched persistent megakernel path (decode_step_batch with b=1)
-    // for 4B single-seq decode by default — measured ~300 ms/tok on gfx1150
-    // vs ~500 ms/tok for decode_step() and ~2500 ms/tok for the legacy
-    // replay path. Opt-out via --force-replay-decode (legacy parity) or
-    // --force-component-decode (primitive-chain correctness).
-    let kernel_single_decode_enabled = cli.batch_size == 1
-        && use_4b_kernel
-        && !cli.force_replay_decode
-        && !cli.force_component_decode;
-    let cuda_fast_greedy_disabled = env::var_os("SUPERSONIC_DISABLE_CUDA_FAST_GREEDY").is_some();
-    let cuda_fast_greedy_enabled = backend == Backend::Cuda
-        && !use_4b_kernel
-        && cli.batch_size == 1
-        && !cli.validate
-        && !gpu_validate_enabled
-        && !cli.force_component_decode
-        && !cli.force_kernel_decode
-        && !cli.kv_fp8
-        && oracle_output.is_none()
-        && !cuda_08b_hero_enabled
-        && !cuda_fast_greedy_disabled;
-    // Metal fast-greedy: same trigger conditions as CUDA's fast-greedy. Uses the
-    // fused lm_head + argmax kernel and returns just the sampled token, skipping
-    // the per-token 250k-element BF16 D2H + host argmax loop. Disable via env
-    // var for bring-up/bisect.
-    let metal_fast_greedy_disabled = env::var_os("SUPERSONIC_DISABLE_METAL_FAST_GREEDY").is_some();
-    let metal_fast_greedy_enabled = backend == Backend::Metal
-        && metal_v2_incremental
-        && !cli.validate
-        && !gpu_validate_enabled
-        && !cli.force_component_decode
-        && !cli.force_kernel_decode
-        && oracle_output.is_none()
-        && !metal_fast_greedy_disabled;
-    if metal_v2_incremental {
-        if metal_fast_greedy_enabled {
-            eprintln!("[decode] Metal v2 incremental decode (fast-greedy: fused argmax)");
-        } else {
-            eprintln!("[decode] Metal v2 incremental decode");
-        }
-    }
-    if replay_decode_enabled {
-        if cuda_qwen2b_replay_default {
-            eprintln!(
-                "[decode] single-sequence CUDA qwen3.5-2b uses replayed GPU prefill for correctness"
-            );
-        } else {
-            eprintln!("[decode] single-sequence 4B uses replayed GPU prefill for correctness");
-        }
-    } else if replay_kv_fp8_enabled && cli.batch_size == 1 {
-        eprintln!("[decode] single-sequence KV-FP8 uses replayed GPU prefill for correctness");
-    } else if cli.batch_size > 1 && use_4b_kernel && cli.kv_fp8 {
-        eprintln!("[decode] batched KV-FP8 uses the persistent kernel path");
-    } else if component_single_decode_enabled {
-        eprintln!("[decode] WARNING: forcing single-sequence 4B onto the component decode path");
-    } else if cli.batch_size == 1 && use_4b_kernel && cli.force_kernel_decode {
-        eprintln!("[decode] WARNING: forcing single-sequence 4B onto the kernel decode path");
-    } else if cli.batch_size == 1 && use_4b_kernel && cli.kv_fp8 {
-        eprintln!("[decode] WARNING: single-sequence KV-FP8 uses the b=1 kernel path");
-    } else if cuda_08b_hero_enabled {
-        eprintln!("[decode] CUDA 0.8B sm86 hero path enabled");
-    } else if cuda_fast_greedy_enabled {
-        eprintln!("[decode] CUDA fast greedy sampling enabled for the non-4B native decode path");
-    }
+    let decode_modes = resolve_qwen35_decode_modes(
+        &cli,
+        backend,
+        &model_variant,
+        use_4b_kernel,
+        gpu_validate_enabled,
+        oracle_output.is_some(),
+        cuda_08b_hero_enabled,
+    );
+    report_qwen35_decode_modes(&cli, &decode_modes, use_4b_kernel, cuda_08b_hero_enabled);
 
     // Decode loop
     let seqlen_start = prompt_ids.len();
@@ -472,7 +390,7 @@ pub(crate) fn run_qwen35(
                 )?;
                 engine.rebuild_prefill_state(&trace_token_ids, true)?;
             }
-            let (batch_logits, batch_timings) = if replay_kv_fp8_enabled {
+            let (batch_logits, batch_timings) = if decode_modes.replay_kv_fp8_enabled {
                 let token_ids: Vec<u32> = prompt_ids
                     .iter()
                     .copied()
@@ -548,14 +466,14 @@ pub(crate) fn run_qwen35(
             // Single-sequence decode (original path)
             let mut maybe_fast_token = None;
             let mut can_rescore_with_normed = false;
-            let logits = if cuda_fast_greedy_enabled {
+            let logits = if decode_modes.cuda_fast_greedy_enabled {
                 let (token, timings) =
                     engine.decode_step_cuda_fast_greedy(next_token, seqlen_offset)?;
                 native_decode_timings.add_assign(timings);
                 native_decode_timing_steps += 1;
                 maybe_fast_token = Some(token);
                 Vec::new()
-            } else if metal_fast_greedy_enabled {
+            } else if decode_modes.metal_fast_greedy_enabled {
                 let token = engine.decode_step_metal_fast_greedy(next_token, seqlen_offset)?;
                 maybe_fast_token = Some(token);
                 Vec::new()
@@ -566,7 +484,7 @@ pub(crate) fn run_qwen35(
                 native_decode_timing_steps += 1;
                 maybe_fast_token = Some(token);
                 Vec::new()
-            } else if replay_decode_enabled {
+            } else if decode_modes.replay_decode_enabled {
                 let token_ids: Vec<u32> = prompt_ids
                     .iter()
                     .copied()
@@ -582,7 +500,7 @@ pub(crate) fn run_qwen35(
                     cli.prefill_chunk_size,
                     use_4b_kernel,
                 )?
-            } else if replay_kv_fp8_enabled {
+            } else if decode_modes.replay_kv_fp8_enabled {
                 let token_ids: Vec<u32> = prompt_ids
                     .iter()
                     .copied()
@@ -590,7 +508,7 @@ pub(crate) fn run_qwen35(
                     .chain(std::iter::once(next_token))
                     .collect();
                 engine.rebuild_prefill_state(&token_ids, false)?
-            } else if component_single_decode_enabled {
+            } else if decode_modes.component_single_decode_enabled {
                 if let Some(trace_layer) = cli.trace_component_linear_state_layer {
                     trace_component_linear_state_layer(
                         &engine,
@@ -680,7 +598,7 @@ pub(crate) fn run_qwen35(
                 } else {
                     engine.decode_step(next_token, seqlen_offset)?
                 }
-            } else if kernel_single_decode_enabled {
+            } else if decode_modes.kernel_single_decode_enabled {
                 if let Some(trace_layer) = cli.trace_persistent_linear_state_layer {
                     let trace_token_ids: Vec<u32> = prompt_ids
                         .iter()
