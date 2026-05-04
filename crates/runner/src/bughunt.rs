@@ -4,15 +4,12 @@ use std::process::Command;
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
-use clap::ValueEnum;
 use gpu_hal::{Backend, GpuBuffer, ScalarType};
 use qwen35::config::{self, TextConfig};
 use qwen35::rotary::RotaryTables;
 use qwen35::state::ModelState;
 use qwen35::weights::Qwen35Weights;
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use supersonic_core::backend::BackendChoice;
 
 use crate::backend_runtime;
 use crate::decode_engine::{decode_f32_le, DecodeEngine};
@@ -21,100 +18,10 @@ use crate::prefill_engine;
 use crate::registry::{FamilyParams, ModelVariant};
 use crate::validate;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum BackendArg {
-    Auto,
-    Cuda,
-    Hip,
-    Metal,
-}
-
-impl Default for BackendArg {
-    fn default() -> Self {
-        Self::Metal
-    }
-}
-
-impl From<BackendArg> for BackendChoice {
-    fn from(value: BackendArg) -> Self {
-        match value {
-            BackendArg::Auto => Self::Auto,
-            BackendArg::Cuda => Self::Explicit(Backend::Cuda),
-            BackendArg::Hip => Self::Explicit(Backend::Hip),
-            BackendArg::Metal => Self::Explicit(Backend::Metal),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
-#[serde(rename_all = "snake_case")]
-pub enum BughuntMode {
-    Gate,
-    DecodeGate,
-    Localize,
-    Dump,
-    Bench,
-}
-
-impl BughuntMode {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Gate => "gate",
-            Self::DecodeGate => "decode_gate",
-            Self::Localize => "localize",
-            Self::Dump => "dump",
-            Self::Bench => "bench",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
-#[serde(rename_all = "snake_case")]
-pub enum BughuntLayerKind {
-    Linear,
-    Full,
-    Mlp,
-}
-
-impl BughuntLayerKind {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Linear => "linear",
-            Self::Full => "full",
-            Self::Mlp => "mlp",
-        }
-    }
-
-    fn from_model_layer(config: &TextConfig, layer: usize) -> Self {
-        if config.is_full_attention(layer) {
-            Self::Full
-        } else {
-            Self::Linear
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct BughuntArgs {
-    pub mode: BughuntMode,
-    pub model_dir: PathBuf,
-    pub backend: BackendArg,
-    pub ordinal: usize,
-    pub oracle_device: String,
-    pub prompt_manifest: PathBuf,
-    pub prompt: Option<String>,
-    pub report_json: Option<PathBuf>,
-    pub position: Option<usize>,
-    pub layer: Option<usize>,
-    pub layer_kind: Option<BughuntLayerKind>,
-    pub bench_iterations: usize,
-    pub bench_warmup: usize,
-    pub bench_decode_tokens: usize,
-    pub bench_profile_ops: bool,
-}
-
+mod args;
 mod manifest;
 mod report;
+pub use args::*;
 use manifest::load_prompt_manifest;
 pub use report::*;
 
