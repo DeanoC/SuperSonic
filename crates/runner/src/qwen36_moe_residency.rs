@@ -6,11 +6,10 @@
 //! maps the expert pages that are explicitly pinned resident.
 
 use std::collections::{HashMap, HashSet};
-use std::ffi::c_void;
 
 use anyhow::{anyhow, Context, Result};
 use gpu_hal::{
-    copy_h2d_async, memset_zeros_async, Backend, GpuEvent, GpuStream, PinnedHostBuffer, ScalarType,
+    copy_h2d_async, memset_zeros_async, Backend, GpuEvent, GpuStream, PinnedHostBuffer,
     VirtualAllocationRole, VirtualArena, VirtualBacking,
 };
 use model_store::BakedStore;
@@ -21,104 +20,12 @@ use crate::qwen36_moe_residency_pages::{
     select_lru_resident_page, AsyncPageIn, AsyncStagingSlot, PageSpan, PendingPage, ResidentPage,
     ResidentPageKey, ResidentSlice,
 };
+use crate::qwen36_moe_residency_types::ExpertTensor;
+pub use crate::qwen36_moe_residency_types::{
+    MoeExpertKey, MoeExpertProjection, MoeExpertResidencyConfig, MoeExpertResidencyStats,
+    MoeExpertTensorReservation,
+};
 use crate::qwen36_moe_types::ResidentWeight;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum MoeExpertProjection {
-    GateUp,
-    Down,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct MoeExpertKey {
-    pub layer_idx: usize,
-    pub expert_idx: usize,
-    pub projection: MoeExpertProjection,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MoeExpertResidencyConfig {
-    /// Maximum number of VMM backing pages resident at once.
-    ///
-    /// The environment knob is still expressed in experts because the router
-    /// naturally speaks in `(layer, expert)` terms, but physical residency is
-    /// page-granular on HIP/CUDA. The engine converts that expert cap into this
-    /// page budget conservatively.
-    pub max_resident_pages: usize,
-}
-
-impl MoeExpertResidencyConfig {
-    pub fn new(max_resident_pages: usize) -> Result<Self> {
-        if max_resident_pages == 0 {
-            return Err(anyhow!("max_resident_pages must be > 0"));
-        }
-        Ok(Self { max_resident_pages })
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct MoeExpertResidencyStats {
-    pub registered_tensors: usize,
-    pub resident_slices: usize,
-    pub resident_pages: usize,
-    pub page_backed_slices: usize,
-    pub hits: u64,
-    pub misses: u64,
-    pub page_hits: u64,
-    pub page_misses: u64,
-    pub evicted_slices: u64,
-    pub evicted_pages: u64,
-    pub uploaded_bytes: usize,
-    pub unmapped_bytes: usize,
-    pub prefetch_requests: u64,
-    pub prefetch_hits: u64,
-    pub prefetch_misses: u64,
-    pub prefetch_page_hits: u64,
-    pub prefetch_page_misses: u64,
-    pub prefetch_skipped: u64,
-    pub prefetch_skipped_pages: u64,
-    pub prefetch_uploaded_bytes: usize,
-    pub protected_pages: usize,
-    pub protected_page_budget: usize,
-    pub protect_requests: u64,
-    pub protect_hits: u64,
-    pub protect_misses: u64,
-    pub protect_demotions: u64,
-    pub protected_evicted_pages: u64,
-    pub async_scheduled_pages: u64,
-    pub async_completed_pages: u64,
-    pub async_waited_pages: u64,
-    pub async_skipped_no_slot: u64,
-    pub async_skipped_no_capacity: u64,
-    pub async_uploaded_bytes: usize,
-    pub async_pending_pages_peak: usize,
-}
-
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct MoeExpertTensorReservation {
-    pub allocation_id: usize,
-    pub ptr: *const c_void,
-    pub dtype: ScalarType,
-    pub shape: Vec<usize>,
-    pub len_bytes: usize,
-    pub expert_count: usize,
-    pub expert_bytes: usize,
-}
-
-#[derive(Debug, Clone)]
-struct ExpertTensor {
-    name: String,
-    projection: MoeExpertProjection,
-    allocation_id: usize,
-    ptr: *const c_void,
-    dtype: ScalarType,
-    shape: Vec<usize>,
-    len_bytes: usize,
-    expert_count: usize,
-    expert_bytes: usize,
-    page_bytes: usize,
-}
 
 pub struct MoeExpertResidencyManager {
     arena: VirtualArena,
@@ -929,35 +836,6 @@ impl MoeExpertResidencyManager {
             }
         }
         backed.len()
-    }
-}
-
-impl ExpertTensor {
-    fn reservation(&self) -> MoeExpertTensorReservation {
-        MoeExpertTensorReservation {
-            allocation_id: self.allocation_id,
-            ptr: self.ptr,
-            dtype: self.dtype,
-            shape: self.shape.clone(),
-            len_bytes: self.len_bytes,
-            expert_count: self.expert_count,
-            expert_bytes: self.expert_bytes,
-        }
-    }
-
-    fn max_pages_per_expert_slice(&self) -> usize {
-        (0..self.expert_count)
-            .map(|expert_idx| {
-                page_spans(
-                    self.page_bytes,
-                    expert_idx * self.expert_bytes,
-                    self.expert_bytes,
-                    self.len_bytes,
-                )
-                .len()
-            })
-            .max()
-            .unwrap_or(0)
     }
 }
 

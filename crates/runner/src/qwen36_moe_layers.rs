@@ -6,7 +6,8 @@ use model_store::manifest::LayoutTag;
 use model_store::BakedStore;
 use qwen36_moe::config::TextConfig;
 
-use crate::qwen36_moe_residency::{MoeExpertProjection, MoeExpertResidencyManager};
+use crate::qwen36_moe_residency::MoeExpertResidencyManager;
+use crate::qwen36_moe_residency_types::MoeExpertProjection;
 use crate::qwen36_moe_types::{
     AttnLayerBuffers, FfnInt4Sidecars, FfnLayerBuffers, FullAttnInt4Sidecars, FullAttnKvCache,
     LayerBuffers, LinearAttnInt4Sidecars, MultiLayerGeom, ResidentWeight,
