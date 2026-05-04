@@ -2,7 +2,7 @@ use anyhow::Result;
 
 use crate::bakes::load_qwen35_weights;
 use crate::decode_engine::DecodeEngine;
-use crate::registry::{Backend, GpuArch, ModelVariant, Qwen35KernelParams};
+use crate::registry::{self, Backend, GpuArch, ModelVariant, Qwen35KernelParams, RegistryEntry};
 use crate::Cli;
 
 pub(crate) struct Qwen35EngineSetup {
@@ -10,6 +10,20 @@ pub(crate) struct Qwen35EngineSetup {
     pub(crate) use_4b_kernel: bool,
     pub(crate) cuda_08b_hero_enabled: bool,
     pub(crate) allow_host_lm_head_rescore: bool,
+}
+
+pub(crate) fn install_qwen35_launch_preset(entry: &RegistryEntry) {
+    // Install the per-(arch, model) HIP launch preset (grid size +
+    // cooperative flag) if one is registered. User env vars still override
+    // inside the bridge. Always called: `(0, false)` clears any stale
+    // preset from a prior run, so switching models doesn't inherit the
+    // previous one's grid. No-op on CUDA builds.
+    let preset = registry::qwen35_4b_launch_preset(&entry.arch, &entry.model);
+    let (blocks, coop) = preset.unwrap_or((0, false));
+    kernel_ffi::set_qwen35_4b_launch_preset(blocks, coop);
+    if let Some((blocks, coop)) = preset {
+        eprintln!("[preset] qwen35_4b launch: blocks={blocks} cooperative={coop}");
+    }
 }
 
 pub(crate) fn load_qwen35_engine(

@@ -1,6 +1,7 @@
 use anyhow::Result;
 
 use crate::decode_engine::DecodeStageTimings;
+use crate::Cli;
 
 pub(crate) struct Qwen35DecodeReport<'a> {
     pub(crate) tokenizer: &'a tokenizers::Tokenizer,
@@ -14,6 +15,23 @@ pub(crate) struct Qwen35DecodeReport<'a> {
     pub(crate) emit_stage_timings: bool,
     pub(crate) native_decode_timings: &'a DecodeStageTimings,
     pub(crate) native_decode_timing_steps: usize,
+}
+
+pub(crate) fn emit_qwen35_last_logits_if_requested(cli: &Cli, logits: &[f32]) {
+    if !cli.dump_last_logits {
+        return;
+    }
+
+    use std::io::Write as _;
+    print!("\nLAST_LOGITS: ");
+    for (i, x) in logits.iter().enumerate() {
+        if i > 0 {
+            print!(",");
+        }
+        print!("{}", x);
+    }
+    println!();
+    std::io::stdout().flush().ok();
 }
 
 pub(crate) fn emit_qwen35_decode_report(report: Qwen35DecodeReport<'_>) -> Result<()> {

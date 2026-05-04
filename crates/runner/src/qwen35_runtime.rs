@@ -4,8 +4,12 @@ use crate::bakes::ensure_hf_metadata_present;
 use crate::qwen35_alt_runtime::run_qwen35_alt_runtime_if_requested;
 use crate::qwen35_decode_loop::{run_qwen35_decode_loop, Qwen35DecodeLoop};
 use crate::qwen35_decode_modes::{report_qwen35_decode_modes, resolve_qwen35_decode_modes};
-use crate::qwen35_decode_report::{emit_qwen35_decode_report, Qwen35DecodeReport};
-use crate::qwen35_engine_setup::{load_qwen35_engine, Qwen35EngineSetup};
+use crate::qwen35_decode_report::{
+    emit_qwen35_decode_report, emit_qwen35_last_logits_if_requested, Qwen35DecodeReport,
+};
+use crate::qwen35_engine_setup::{
+    install_qwen35_launch_preset, load_qwen35_engine, Qwen35EngineSetup,
+};
 use crate::qwen35_prefill::{run_qwen35_prefill, HostLmHeadRescorer, Qwen35Prefill};
 use crate::qwen35_startup::{
     load_qwen35_startup, validate_qwen35_startup, Qwen35Policy, Qwen35Startup,
@@ -16,7 +20,7 @@ use crate::qwen35_validation::{
 };
 use crate::qwen35_virtual_kv::report_qwen35_virtual_kv_after_prefill;
 use crate::qwen35_vram::check_qwen35_vram;
-use crate::registry::{self, Backend, FamilyParams, GpuArch, ModelVariant, RegistryEntry};
+use crate::registry::{Backend, FamilyParams, GpuArch, ModelVariant, RegistryEntry};
 use crate::{resolve_oracle_device, Cli};
 
 pub(crate) fn run_qwen35(
@@ -42,19 +46,7 @@ pub(crate) fn run_qwen35(
     };
     let host_lm_head_rescorer = HostLmHeadRescorer::from_model_dir(&cli.model_dir)?;
 
-    // Install the per-(arch, model) HIP launch preset (grid size +
-    // cooperative flag) if one is registered. User env vars still override
-    // inside the bridge. Always called — `(0, false)` clears any stale
-    // preset from a prior run, so switching models doesn't inherit the
-    // previous one's grid. No-op on CUDA builds.
-    {
-        let preset = registry::qwen35_4b_launch_preset(&entry.arch, &entry.model);
-        let (blocks, coop) = preset.unwrap_or((0, false));
-        kernel_ffi::set_qwen35_4b_launch_preset(blocks, coop);
-        if let Some((blocks, coop)) = preset {
-            eprintln!("[preset] qwen35_4b launch: blocks={blocks} cooperative={coop}");
-        }
-    }
+    install_qwen35_launch_preset(entry);
 
     let Qwen35Policy {
         trace_kv_cache_enabled,
@@ -135,18 +127,7 @@ pub(crate) fn run_qwen35(
         allow_host_lm_head_rescore,
     )?;
 
-    if cli.dump_last_logits {
-        use std::io::Write as _;
-        print!("\nLAST_LOGITS: ");
-        for (i, x) in prefill_logits.iter().enumerate() {
-            if i > 0 {
-                print!(",");
-            }
-            print!("{}", x);
-        }
-        println!();
-        std::io::stdout().flush().ok();
-    }
+    emit_qwen35_last_logits_if_requested(cli, &prefill_logits);
 
     report_qwen35_virtual_kv_after_prefill(&mut engine)?;
 
