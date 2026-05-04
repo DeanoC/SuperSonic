@@ -37,12 +37,13 @@ use crate::qwen36_moe_prompt::{
 };
 use crate::qwen36_moe_session::{prepare_decode_session, Qwen36DecodeSession};
 use crate::qwen36_moe_spec_verify::{
-    run_batched_lm_head_top1, run_spec_chain_step, Qwen36BatchedLmHeadTop1, Qwen36SpecChainStep,
+    restore_and_replay_accepted_prefix, run_batched_lm_head_top1, run_spec_chain_step,
+    Qwen36BatchedLmHeadTop1, Qwen36SpecChainStep, Qwen36SpecReplayAccepted,
 };
 use crate::qwen36_moe_speculative::{
     run_speculative_decode_step, run_speculative_decode_step_batched,
 };
-use crate::qwen36_moe_state::{refresh_linear_attn_state, restore_linear_attn_state};
+use crate::qwen36_moe_state::refresh_linear_attn_state;
 use crate::qwen36_moe_telemetry::{print_and_write_moe_residency_summary, MoeRouteRuntime};
 use crate::qwen36_moe_timing::{Qwen36StageTimingTotals, SamplingParams};
 use crate::qwen36_moe_vmm::{
@@ -500,33 +501,22 @@ fn decode_text(
                 // drafts[K-1], one more chain's worth advances naturally
                 // when next iter feeds the bonus token).
                 if r.n_accepted < dynamic_k {
-                    restore_linear_attn_state(ordinal, &mut layers, snapshot)
-                        .context("restore linear-attn state after partial-accept")?;
                     // Replay (j+1) chains: first_token at the current
                     // position, then the j accepted drafts at the
                     // following positions.
                     let replay = loop_state.speculative_replay_inputs(next_token, &r);
-                    for &(pos, input) in &replay {
-                        run_spec_chain_step(Qwen36SpecChainStep {
-                            ordinal,
-                            geom: &geom,
-                            store: &store,
-                            weight_prefix,
-                            layers: &mut layers,
-                            persistent_scratch: persistent_scratch.as_mut(),
-                            stage_timings: &mut stage_timings,
-                            position: pos,
-                            input,
-                            emit_stage_timings,
-                        })?;
-                        // Per-kernel-class breakdown for replay chains
-                        // contributes to the same accumulators as the
-                        // verify chains so `--emit-stage-timings` reports
-                        // honest full-attn/linear-attn/ffn averages on
-                        // partial-accept iters. Without this the reported
-                        // chain breakdown undercounts actual work as the
-                        // accept rate falls.
-                    }
+                    restore_and_replay_accepted_prefix(Qwen36SpecReplayAccepted {
+                        ordinal,
+                        geom: &geom,
+                        store: &store,
+                        weight_prefix,
+                        layers: &mut layers,
+                        snapshot,
+                        persistent_scratch: persistent_scratch.as_mut(),
+                        stage_timings: &mut stage_timings,
+                        replay_inputs: &replay,
+                        emit_stage_timings,
+                    })?;
                 }
                 r
             } else {

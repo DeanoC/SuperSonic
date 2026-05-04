@@ -7,6 +7,7 @@ use crate::qwen36_moe_decode::{
 };
 use crate::qwen36_moe_host::lookup_embed_row;
 use crate::qwen36_moe_persistent_decode::PersistentScratch;
+use crate::qwen36_moe_state::{restore_linear_attn_state, LinearAttnSnapshot};
 use crate::qwen36_moe_timing::Qwen36StageTimingTotals;
 
 pub(crate) struct Qwen36SpecChainStep<'a> {
@@ -55,6 +56,41 @@ pub(crate) fn run_spec_chain_step(args: Qwen36SpecChainStep<'_>) -> Result<Decod
         .record_chain(t_chain_start.elapsed(), &outputs);
     args.stage_timings.count_generation_step();
     Ok(outputs)
+}
+
+pub(crate) struct Qwen36SpecReplayAccepted<'a> {
+    pub(crate) ordinal: usize,
+    pub(crate) geom: &'a MultiLayerGeom,
+    pub(crate) store: &'a BakedStore,
+    pub(crate) weight_prefix: &'a str,
+    pub(crate) layers: &'a mut [LayerBuffers],
+    pub(crate) snapshot: &'a LinearAttnSnapshot,
+    pub(crate) persistent_scratch: Option<&'a mut PersistentScratch>,
+    pub(crate) stage_timings: &'a mut Qwen36StageTimingTotals,
+    pub(crate) replay_inputs: &'a [(i32, u32)],
+    pub(crate) emit_stage_timings: bool,
+}
+
+pub(crate) fn restore_and_replay_accepted_prefix(
+    mut args: Qwen36SpecReplayAccepted<'_>,
+) -> Result<()> {
+    restore_linear_attn_state(args.ordinal, args.layers, args.snapshot)
+        .context("restore linear-attn state after partial-accept")?;
+    for &(position, input) in args.replay_inputs {
+        run_spec_chain_step(Qwen36SpecChainStep {
+            ordinal: args.ordinal,
+            geom: args.geom,
+            store: args.store,
+            weight_prefix: args.weight_prefix,
+            layers: args.layers,
+            persistent_scratch: args.persistent_scratch.as_deref_mut(),
+            stage_timings: args.stage_timings,
+            position,
+            input,
+            emit_stage_timings: args.emit_stage_timings,
+        })?;
+    }
+    Ok(())
 }
 
 pub(crate) struct Qwen36BatchedLmHeadTop1<'a> {
