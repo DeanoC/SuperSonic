@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::{anyhow, Result};
 use qwen36_moe::config::TextConfig;
 
-use crate::qwen36_moe_timing::SamplingParams;
+use crate::qwen36_moe_cli::timing::SamplingParams;
 
 pub(crate) struct Qwen36PromptSetup {
     pub(crate) tokenizer: Option<tokenizers::Tokenizer>,

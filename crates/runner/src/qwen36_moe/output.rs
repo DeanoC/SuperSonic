@@ -2,8 +2,8 @@ use std::io::Write as _;
 
 use anyhow::{Context, Result};
 
+use crate::qwen36_moe_cli::timing::SamplingParams;
 use crate::qwen36_moe_logits::bf16_bytes_to_f32;
-use crate::qwen36_moe_timing::SamplingParams;
 
 pub(crate) fn print_decode_stream_start(
     tokenizer: Option<&tokenizers::Tokenizer>,

@@ -12,7 +12,7 @@ use qwen36_moe::weights::{
     checkpoint_dtype_acceptable, expected_tensor_specs, CheckpointAccount, CheckpointDtype,
 };
 
-use crate::qwen36_moe_layers::{
+use crate::qwen36_moe_cli::layers::{
     resolve_qwen36_store_name, store_contains_qwen36, store_layout_qwen36,
 };
 use crate::registry::{FamilyParams, Qwen36MoeKernelParams, RegistryEntry};

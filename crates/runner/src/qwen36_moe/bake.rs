@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Result};
 
-use crate::qwen36_moe_layers::Qwen36WeightMode;
+use crate::qwen36_moe_cli::layers::Qwen36WeightMode;
 use crate::registry::RegistryEntry;
 
 pub(crate) struct DecodeBakeSelection {

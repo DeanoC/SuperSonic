@@ -840,5 +840,5 @@ impl MoeExpertResidencyManager {
 }
 
 #[cfg(test)]
-#[path = "qwen36_moe_residency_tests.rs"]
+#[path = "residency_tests.rs"]
 mod tests;

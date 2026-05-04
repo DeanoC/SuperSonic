@@ -4,11 +4,11 @@ use anyhow::{anyhow, Context, Result};
 use gpu_hal::{set_backend, Backend};
 use model_store::BakedStore;
 
+use crate::qwen36_moe_cli::dry_run::DryRunReport;
+use crate::qwen36_moe_cli::geom::build_multi_layer_geom;
+use crate::qwen36_moe_cli::host::{host_load_bytes, load_lm_head_bf16, lookup_embed_row};
+use crate::qwen36_moe_cli::layers::{load_layer_buffers, Qwen36WeightMode};
 use crate::qwen36_moe_decode::run_chained_decode;
-use crate::qwen36_moe_dry_run::DryRunReport;
-use crate::qwen36_moe_geom::build_multi_layer_geom;
-use crate::qwen36_moe_host::{host_load_bytes, load_lm_head_bf16, lookup_embed_row};
-use crate::qwen36_moe_layers::{load_layer_buffers, Qwen36WeightMode};
 use crate::qwen36_moe_logits::{argmax_bf16_logits, host_final_norm_lm_head};
 
 /// Legacy single-token entry point. Currently unused, but it documents and

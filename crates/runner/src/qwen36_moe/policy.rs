@@ -1,7 +1,7 @@
 use anyhow::Result;
 use gpu_hal::Backend;
 
-use crate::qwen36_moe_dry_run::ContextSizeSource;
+use crate::qwen36_moe_cli::dry_run::ContextSizeSource;
 use crate::registry::RegistryEntry;
 
 pub fn resolve_context_size(cli: &crate::Cli) -> (usize, ContextSizeSource) {

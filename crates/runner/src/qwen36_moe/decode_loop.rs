@@ -1,6 +1,6 @@
 use std::io::Write as _;
 
-use crate::qwen36_moe_output::print_decoded_token;
+use crate::qwen36_moe_cli::output::print_decoded_token;
 use crate::qwen36_moe_speculative::SpeculativeStepResult;
 
 pub struct Qwen36DecodeLoopState {

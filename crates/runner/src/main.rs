@@ -13,38 +13,30 @@ mod policy;
 mod prefill_engine;
 mod qwen35_dflash_engine;
 mod qwen35_runtime;
-mod qwen36_moe_bake;
-mod qwen36_moe_chain;
+#[path = "qwen36_moe/mod.rs"]
+mod qwen36_moe_cli;
+#[path = "qwen36_moe/decode.rs"]
 mod qwen36_moe_decode;
-mod qwen36_moe_dry_run;
-mod qwen36_moe_engine;
-mod qwen36_moe_generation;
-mod qwen36_moe_geom;
-mod qwen36_moe_host;
-mod qwen36_moe_layers;
-mod qwen36_moe_legacy;
-mod qwen36_moe_lm_head;
+#[path = "qwen36_moe/logits.rs"]
 mod qwen36_moe_logits;
-mod qwen36_moe_loop;
+#[path = "qwen36_moe/mtp.rs"]
 mod qwen36_moe_mtp;
-mod qwen36_moe_mtp_loader;
-mod qwen36_moe_output;
+#[path = "qwen36_moe/persistent_decode.rs"]
 mod qwen36_moe_persistent_decode;
-mod qwen36_moe_policy;
-mod qwen36_moe_prefetch;
-mod qwen36_moe_prompt;
+#[path = "qwen36_moe/residency.rs"]
 mod qwen36_moe_residency;
+#[path = "qwen36_moe/residency_pages.rs"]
 mod qwen36_moe_residency_pages;
+#[path = "qwen36_moe/residency_types.rs"]
 mod qwen36_moe_residency_types;
-mod qwen36_moe_session;
-mod qwen36_moe_spec_verify;
+#[path = "qwen36_moe/speculative.rs"]
 mod qwen36_moe_speculative;
+#[path = "qwen36_moe/state.rs"]
 mod qwen36_moe_state;
+#[path = "qwen36_moe/telemetry.rs"]
 mod qwen36_moe_telemetry;
-mod qwen36_moe_timing;
+#[path = "qwen36_moe/types.rs"]
 mod qwen36_moe_types;
-mod qwen36_moe_vmm;
-mod qwen36_moe_vmm_config;
 mod registry;
 mod specprefill;
 mod specprefill_engine;
@@ -957,7 +949,7 @@ fn main() -> Result<()> {
             return llama31_engine::run_llama31(&cli, &model_variant, entry, ordinal, total_vram);
         }
         ModelFamily::Qwen36Moe => {
-            return qwen36_moe_engine::run(&cli, entry, total_vram);
+            return qwen36_moe_cli::run(&cli, entry, total_vram);
         }
         ModelFamily::Qwen35 => {}
     }
