@@ -122,14 +122,15 @@ pub(crate) fn validate_specprefill_flags(
                 );
             }
         }
-        if cli.kv_fp8 {
+        if cli.kv_fp8 && cli.specprefill_algorithm == "lookahead" {
             anyhow::bail!(
-                "--specprefill-draft-dir cannot be combined with --kv-fp8 today: the \
+                "--specprefill-algorithm lookahead cannot be combined with --kv-fp8: the \
                  BF16 step-copy fallback used by the speculator's lookahead decode \
                  (`kernel_ffi::certified_kv::copy_step_bf16`, added in PR #177) requires \
                  BF16 destination buffers, but --kv-fp8 makes the K/V cache U8. The combo \
-                 trips a runtime error several seconds into decode. Tracked as a Phase D \
-                 follow-up: extend the per-head D2D fallback to BF16→FP8 quantise on the fly."
+                 trips a runtime error several seconds into decode. Use \
+                 `--specprefill-algorithm cosine` (the default) to combine SpecPrefill \
+                 with --kv-fp8 — the cosine path doesn't run drafter decode."
             );
         }
         if let Some(keep) = cli.specprefill_keep_ratio {
