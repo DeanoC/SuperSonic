@@ -11,7 +11,7 @@ use crate::qwen36_moe_telemetry::{MoeRouteRuntime, MoeSparseTelemetrySnapshot};
 use crate::qwen36_moe_types::{
     DecodeOutputs, ExpertPrefetchPhase, ExpertRoute, LayerBuffers, MultiLayerGeom,
 };
-use crate::qwen36_moe_vmm::MoeRuntimeConfig;
+use crate::qwen36_moe_vmm_config::MoeRuntimeConfig;
 
 pub(crate) struct Qwen36ChainStep<'a> {
     pub(crate) ordinal: usize,

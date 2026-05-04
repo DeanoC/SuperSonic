@@ -35,9 +35,10 @@ use crate::qwen36_moe_spec_verify::{run_speculative_extension, Qwen36Speculative
 use crate::qwen36_moe_telemetry::{print_and_write_moe_residency_summary, MoeRouteRuntime};
 use crate::qwen36_moe_timing::{Qwen36StageTimingTotals, SamplingParams};
 use crate::qwen36_moe_vmm::{
-    load_decode_layers_with_vmm_strategy, prepare_moe_runtime_config,
-    print_virtual_kv_stats_if_active, should_use_qwen36_kv_vmm, virtual_kv_stats_for_layers,
+    load_decode_layers_with_vmm_strategy, print_virtual_kv_stats_if_active,
+    virtual_kv_stats_for_layers,
 };
+use crate::qwen36_moe_vmm_config::{prepare_moe_runtime_config, should_use_qwen36_kv_vmm};
 use crate::registry::RegistryEntry;
 
 pub fn run(cli: &crate::Cli, entry: &RegistryEntry, total_vram: u64) -> Result<()> {
