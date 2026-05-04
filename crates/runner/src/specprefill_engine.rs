@@ -27,10 +27,8 @@ fn score_blocks_cosine(
         anyhow::bail!("score_blocks_cosine: empty prompt");
     }
 
-    // 1. Drafter dense prefill (fast megakernel path; no decode steps).
-    let _base = draft_engine.prefill_native_with_final_norm(prompt_ids)?;
-
-    // 2. Pick scoring layer + mode.
+    // 1. Pick scoring layer(s). Resolve BEFORE prefill so we can stop
+    //    drafter execution after the deepest scoring layer.
     // Clone the config out of the borrow chain so we can re-borrow draft_engine
     // mutably below (state_mut + cosine kernel launch).
     let config = draft_engine.weights().config.clone();
@@ -53,6 +51,17 @@ fn score_blocks_cosine(
         // "shallowest" or any other value: single layer (override or shallowest).
         _ => vec![layer_override.unwrap_or(shallowest)],
     };
+
+    // 2. Drafter prefill, stopping after the deepest scored layer.
+    //    For shallowest mode (default) on Qwen3.5-0.8B this prunes most
+    //    drafter layers — only layers 0..=shallowest execute. For
+    //    all_max mode, runs through the deepest full-attention layer.
+    //    Skips final norm + lm_head + KV-FP8 conversion entirely.
+    let last_layer = *layers_to_score
+        .iter()
+        .max()
+        .expect("layers_to_score non-empty");
+    draft_engine.prefill_native_kv_through(prompt_ids, last_layer)?;
 
     let n_blocks = (prompt_len + block_size - 1) / block_size;
     let last_pos = prompt_len - 1;
