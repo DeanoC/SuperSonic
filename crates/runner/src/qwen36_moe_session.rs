@@ -3,9 +3,9 @@ use gpu_hal::{GpuBuffer, ScalarType};
 use model_store::BakedStore;
 use qwen36_moe::config::TextConfig;
 
-use crate::qwen36_moe_decode::{LayerBuffers, MtpLayerBuffers, MultiLayerGeom};
 use crate::qwen36_moe_host::{host_load_bytes, load_lm_head_bf16};
 use crate::qwen36_moe_layers::load_to_gpu;
+use crate::qwen36_moe_types::{LayerBuffers, MtpLayerBuffers, MultiLayerGeom};
 
 const MIB: f64 = (1024 * 1024) as f64;
 const QWEN36_NUM_SPECULATIVE_TOKENS: usize = 3;
@@ -42,13 +42,14 @@ pub(crate) fn prepare_decode_session(
             .context("load MTP head from bake")?
         {
             Some(mtp) => {
+                let verify_mode = if batched_spec_verify {
+                    "batched verify"
+                } else {
+                    "sequential verify"
+                };
                 println!(
                     "  MTP head: loaded 19 mtp.* tensors (~1.6 GiB BF16) — \
-                     speculative draft + sequential-verify path active. \
-                     NOTE: sequential verification has zero amortized speedup \
-                     over plain greedy decode (Phase 6.4's batched verify \
-                     kernel is what delivers throughput); this path is the \
-                     correctness foundation."
+                     speculative draft + {verify_mode} path active."
                 );
                 Some(mtp)
             }

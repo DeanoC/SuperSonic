@@ -24,6 +24,7 @@ mod qwen36_moe_host;
 mod qwen36_moe_layers;
 mod qwen36_moe_legacy;
 mod qwen36_moe_lm_head;
+mod qwen36_moe_logits;
 mod qwen36_moe_loop;
 mod qwen36_moe_mtp;
 mod qwen36_moe_mtp_loader;
@@ -39,6 +40,7 @@ mod qwen36_moe_speculative;
 mod qwen36_moe_state;
 mod qwen36_moe_telemetry;
 mod qwen36_moe_timing;
+mod qwen36_moe_types;
 mod qwen36_moe_vmm;
 mod registry;
 mod specprefill;
@@ -227,15 +229,12 @@ pub(crate) struct Cli {
     #[arg(long)]
     emit_stage_timings: bool,
 
-    /// Enable Qwen3.6-MoE self-speculative decode (Phase 6).
+    /// Enable Qwen3.6-MoE self-speculative decode.
     ///
     /// When set, the engine loads the multi-token-prediction (MTP) head
-    /// from the bake (an extra ~1.6 GiB BF16 + per-MTP-layer KV cache).
-    /// Wiring lands incrementally — Phase 6.2b (this PR) just loads the
-    /// buffers; Phase 6.2c+ wires the actual draft pass and verification.
-    /// When unset (default), MTP weights aren't loaded and self-spec
-    /// decode isn't available, but ~1.6 GiB of VRAM stays free for KV
-    /// cache and scratch on memory-tight 24 GiB configurations.
+    /// from the bake and runs draft generation plus base-model verification.
+    /// When unset (default), MTP weights are not loaded and self-spec decode
+    /// is unavailable, leaving the extra VRAM for KV cache and scratch.
     ///
     /// Currently HIP/qwen3.6-MoE only; ignored for other model families.
     #[arg(long)]
@@ -573,8 +572,7 @@ pub(crate) struct Cli {
     allow_untested_gpu: Option<String>,
 
     /// Enumerate the model checkpoint, compute analytic + on-disk VRAM
-    /// accounting, and exit. Currently only honored on `qwen3.6-35b-a3b`
-    /// (the runtime is still being built up; see PR 3 of the MoE plan).
+    /// accounting, print the decode budget report, and exit.
     #[arg(long)]
     dry_run: bool,
 
@@ -831,11 +829,6 @@ fn main() -> Result<()> {
 
     validate_global_flags(&cli, &model_variant, backend)?;
     let q4km_like = q4km_like(&cli);
-    // PR 4c step 2 wires the host-orchestrated chained-launch decode path
-    // for Qwen3.6-MoE — qwen36_moe_engine::run handles both --dry-run and
-    // the BF16 decode path (one token from the bake) so this early bail is
-    // no longer needed.
-
     // 2. Detect GPU
     let (arch_name, total_vram, warp_size) = match backend {
         Backend::Hip => {

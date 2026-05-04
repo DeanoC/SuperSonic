@@ -4,8 +4,8 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
-use crate::qwen36_moe_decode::ExpertRoute;
 use crate::qwen36_moe_residency::{MoeExpertKey, MoeExpertProjection, MoeExpertResidencyManager};
+use crate::qwen36_moe_types::ExpertRoute;
 
 const MIB: f64 = (1024 * 1024) as f64;
 
@@ -165,7 +165,7 @@ pub(crate) fn print_and_write_moe_residency_summary(
 #[cfg(test)]
 mod tests {
     use super::{MoeIslandPrefetchMode, MoeRouteTelemetry, MoeTransitionPredictor};
-    use crate::qwen36_moe_decode::ExpertRoute;
+    use crate::qwen36_moe_types::ExpertRoute;
 
     #[test]
     fn moe_prefetch_mode_env_accepts_disabled_and_previous_token_aliases() {

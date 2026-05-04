@@ -16,12 +16,12 @@
 
 use anyhow::Result;
 use gpu_hal::{copy_d2h, is_backend_compiled, set_backend, Backend, GpuBuffer, ScalarType};
-use runner::qwen36_moe_decode::{
-    AttnLayerBuffers, FfnLayerBuffers, FullAttnInt4Sidecars, FullAttnKvCache, LayerBuffers,
-    ResidentWeight,
-};
 use runner::qwen36_moe_state::{
     refresh_linear_attn_state, restore_linear_attn_state, save_linear_attn_state,
+};
+use runner::qwen36_moe_types::{
+    AttnLayerBuffers, FfnLayerBuffers, FullAttnInt4Sidecars, FullAttnKvCache, LayerBuffers,
+    ResidentWeight,
 };
 
 fn stub_bf16(ordinal: usize) -> Result<GpuBuffer> {

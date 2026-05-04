@@ -1,4 +1,4 @@
-//! Qwen3.6-MoE multi-token-prediction (MTP) forward pass — Phase 6.2c.2.
+//! Qwen3.6-MoE multi-token-prediction (MTP) forward pass.
 //!
 //! Builds on top of the Phase 6.2b weight loader (`MtpLayerBuffers`) and
 //! the Phase 6.2c.1 pre-fusion kernel. Drives one MTP draft step's
@@ -12,14 +12,12 @@
 //!
 //!   1. The cache is per-MTP-session (fresh per draft chain).
 //!   2. RoPE rotates at absolute position `base_seq_len + k` while the
-//!      cache slot is just `k` — handled by the `cache_pos` parameter
-//!      added to [`Qwen36MoeAttnStepParams`] in this PR.
+//!      cache slot is just `k`, handled by the `cache_pos` parameter on
+//!      [`Qwen36MoeAttnStepParams`].
 //!
-//! The pre-fusion kernel (Phase 6.2c.1) feeds `fused_in` into this
-//! function; the post-norm + lm_head (Phase 6.2c.3) consumes the output
-//! and produces the next draft token. Nothing in the production decode
-//! path calls this module today — wiring lands in the speculative driver
-//! (Phase 6.3).
+//! The pre-fusion kernel feeds `fused_in` into this function; the post-norm
+//! + lm_head consumes the output and produces the next draft token. The
+//! speculative driver calls this module for each draft-chain step.
 #![allow(dead_code)]
 
 use anyhow::{anyhow, Context, Result};
@@ -32,8 +30,9 @@ use kernel_ffi::qwen36_moe::{
 
 use crate::qwen36_moe_decode::{
     ffn_output_elems, ffn_workspace_floats, full_attn_output_elems, full_attn_workspace_floats,
-    reset_sync_buf, MtpLayerBuffers, MultiLayerGeom,
+    reset_sync_buf,
 };
+use crate::qwen36_moe_types::{MtpLayerBuffers, MultiLayerGeom};
 
 /// Pre-allocated GPU scratch buffers for one MTP forward call. The MTP
 /// session reuses the same scratch across all `K` draft steps — allocate

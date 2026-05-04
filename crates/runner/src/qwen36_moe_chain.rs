@@ -2,13 +2,15 @@ use anyhow::{Context, Result};
 use model_store::BakedStore;
 
 use crate::qwen36_moe_decode::{
-    run_chained_decode_fast, run_chained_decode_fast_with_expert_prefetch, DecodeOutputs,
-    ExpertPrefetchPhase, ExpertRoute, LayerBuffers, MultiLayerGeom,
+    run_chained_decode_fast, run_chained_decode_fast_with_expert_prefetch,
 };
 use crate::qwen36_moe_persistent_decode::{LmHeadFold, PersistentScratch};
 use crate::qwen36_moe_prefetch::handle_moe_expert_prefetch;
 use crate::qwen36_moe_residency::MoeExpertResidencyManager;
 use crate::qwen36_moe_telemetry::{MoeRouteRuntime, MoeSparseTelemetrySnapshot};
+use crate::qwen36_moe_types::{
+    DecodeOutputs, ExpertPrefetchPhase, ExpertRoute, LayerBuffers, MultiLayerGeom,
+};
 use crate::qwen36_moe_vmm::MoeRuntimeConfig;
 
 pub(crate) struct Qwen36ChainStep<'a> {

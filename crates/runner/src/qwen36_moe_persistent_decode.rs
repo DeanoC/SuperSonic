@@ -12,7 +12,7 @@
 //! [`PersistentScratch::run`] is a drop-in replacement for
 //! [`crate::qwen36_moe_decode::run_chained_decode_fast`]: same signature
 //! shape (`initial_hidden`, `position`), same return type
-//! ([`crate::qwen36_moe_decode::DecodeOutputs`]). The chained path runs 80
+//! ([`crate::qwen36_moe_types::DecodeOutputs`]). The chained path runs 80
 //! step launches/token (40 attn + 40 ffn); the persistent path runs 1
 //! cooperative launch.
 //!
@@ -47,9 +47,11 @@ pub struct LmHeadFold<'a> {
 }
 
 use crate::qwen36_moe_decode::{
-    bf16_bytes_to_f32, ffn_workspace_floats, full_attn_workspace_floats,
-    linear_attn_workspace_floats, AttnLayerBuffers, DecodeOutputs, ExpertPrefetchPhase,
-    ExpertRoute, LayerBuffers, MultiLayerGeom,
+    ffn_workspace_floats, full_attn_workspace_floats, linear_attn_workspace_floats,
+};
+use crate::qwen36_moe_logits::bf16_bytes_to_f32;
+use crate::qwen36_moe_types::{
+    AttnLayerBuffers, DecodeOutputs, ExpertPrefetchPhase, ExpertRoute, LayerBuffers, MultiLayerGeom,
 };
 
 /// Pre-allocated scratch + cached descriptor arrays for the persistent
@@ -622,7 +624,7 @@ pub fn upload_descs<T: Sized>(ordinal: usize, descs: &[T]) -> Result<GpuBuffer, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::qwen36_moe_decode::{FfnLayerBuffers, ResidentWeight};
+    use crate::qwen36_moe_types::{FfnLayerBuffers, ResidentWeight};
     use gpu_hal::{Backend, VirtualAllocationRole, VirtualArena, VirtualBacking};
 
     fn stub_bf16(ordinal: usize) -> Result<GpuBuffer> {

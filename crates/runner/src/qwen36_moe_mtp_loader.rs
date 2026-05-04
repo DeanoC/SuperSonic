@@ -2,8 +2,8 @@ use anyhow::{anyhow, Context, Result};
 use gpu_hal::{GpuBuffer, ScalarType};
 use model_store::BakedStore;
 
-use crate::qwen36_moe_decode::{FullAttnKvCache, MtpLayerBuffers, MultiLayerGeom};
 use crate::qwen36_moe_layers::load_to_gpu;
+use crate::qwen36_moe_types::{FullAttnKvCache, MtpLayerBuffers, MultiLayerGeom};
 
 /// Load the Qwen3.6-MoE multi-token-prediction (MTP) head from the bake.
 /// Used by Phase 6 self-speculative decode (`oracle/qwen36_moe_mtp_oracle.py`

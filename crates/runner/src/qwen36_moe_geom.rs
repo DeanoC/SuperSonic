@@ -1,6 +1,6 @@
 use qwen36_moe::config::TextConfig;
 
-use crate::qwen36_moe_decode::MultiLayerGeom;
+use crate::qwen36_moe_types::MultiLayerGeom;
 use crate::registry::Qwen36MoeKernelParams;
 
 /// Build the geometry the chained decoder needs from the parsed config and
