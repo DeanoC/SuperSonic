@@ -342,7 +342,6 @@ pub(crate) fn trace_qwen35_oracle_prefill_layer(
         let head_dim = engine.weights().config.head_dim;
         let num_heads = engine.weights().config.num_attention_heads;
         let num_kv_heads = engine.weights().config.num_key_value_heads;
-        let kv_groups = num_heads / num_kv_heads;
         let pre_gate_host = decode_bf16_le(&stage_out.pre_gate);
         let q_rope_host = decode_bf16_le(&stage.q_rope);
         let k_rope_step = decode_bf16_le(&stage.k_rope);
@@ -377,101 +376,45 @@ pub(crate) fn trace_qwen35_oracle_prefill_layer(
             prefix_ids.len(),
         );
         let kv_len = prefix_len + 1;
-        let mut full_k = vec![0.0f32; num_kv_heads * kv_len * head_dim];
-        let mut full_v = vec![0.0f32; num_kv_heads * kv_len * head_dim];
-        for kvh in 0..num_kv_heads {
-            let prefix_base = kvh * prefix_len * head_dim;
-            let full_base = kvh * kv_len * head_dim;
-            let step_base = kvh * head_dim;
-            full_k[full_base..full_base + prefix_len * head_dim]
-                .copy_from_slice(&prefix_k[prefix_base..prefix_base + prefix_len * head_dim]);
-            full_v[full_base..full_base + prefix_len * head_dim]
-                .copy_from_slice(&prefix_v[prefix_base..prefix_base + prefix_len * head_dim]);
-            full_k[full_base + prefix_len * head_dim..full_base + kv_len * head_dim]
-                .copy_from_slice(&k_rope_step[step_base..step_base + head_dim]);
-            full_v[full_base + prefix_len * head_dim..full_base + kv_len * head_dim]
-                .copy_from_slice(&v_step[step_base..step_base + head_dim]);
-        }
-        let mut host_attn_pre_gate = vec![0.0f32; num_heads * head_dim];
         let scale = 1.0f32 / (head_dim as f32).sqrt();
-        for qh in 0..num_heads {
-            let kvh = qh / kv_groups;
-            let q_base = qh * head_dim;
-            let mut scores = vec![0.0f32; kv_len];
-            for (t, score) in scores.iter_mut().enumerate() {
-                let k_base = (kvh * kv_len + t) * head_dim;
-                let mut acc = 0.0f32;
-                for d in 0..head_dim {
-                    acc += q_rope_host[q_base + d] * full_k[k_base + d];
-                }
-                *score = acc * scale;
-            }
-            let row_max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let mut denom = 0.0f32;
-            let mut weights = vec![0.0f32; kv_len];
-            for (idx, score) in scores.iter().copied().enumerate() {
-                let w = (score - row_max).exp();
-                weights[idx] = w;
-                denom += w;
-            }
-            let out_base = qh * head_dim;
-            for d in 0..head_dim {
-                let mut acc = 0.0f32;
-                for (t, &w) in weights.iter().enumerate() {
-                    let v_base = (kvh * kv_len + t) * head_dim;
-                    acc += w * full_v[v_base + d];
-                }
-                host_attn_pre_gate[out_base + d] = if denom > 0.0 { acc / denom } else { 0.0 };
-            }
-        }
-        let mut oracle_host_pre_gate = vec![0.0f32; num_heads * head_dim];
-        let mut oracle_full_k = vec![0.0f32; num_kv_heads * kv_len * head_dim];
-        let mut oracle_full_v = vec![0.0f32; num_kv_heads * kv_len * head_dim];
-        for kvh in 0..num_kv_heads {
-            let prefix_base = kvh * prefix_len * head_dim;
-            let full_base = kvh * kv_len * head_dim;
-            let step_base = kvh * head_dim;
-            oracle_full_k[full_base..full_base + prefix_len * head_dim].copy_from_slice(
-                &oracle_prefix_k[prefix_base..prefix_base + prefix_len * head_dim],
-            );
-            oracle_full_v[full_base..full_base + prefix_len * head_dim].copy_from_slice(
-                &oracle_prefix_v[prefix_base..prefix_base + prefix_len * head_dim],
-            );
-            oracle_full_k[full_base + prefix_len * head_dim..full_base + kv_len * head_dim]
-                .copy_from_slice(&oracle_k_rope[step_base..step_base + head_dim]);
-            oracle_full_v[full_base + prefix_len * head_dim..full_base + kv_len * head_dim]
-                .copy_from_slice(&oracle_v_proj[step_base..step_base + head_dim]);
-        }
-        for qh in 0..num_heads {
-            let kvh = qh / kv_groups;
-            let q_base = qh * head_dim;
-            let mut scores = vec![0.0f32; kv_len];
-            for (t, score) in scores.iter_mut().enumerate() {
-                let k_base = (kvh * kv_len + t) * head_dim;
-                let mut acc = 0.0f32;
-                for d in 0..head_dim {
-                    acc += oracle_q_rope[q_base + d] * oracle_full_k[k_base + d];
-                }
-                *score = acc * scale;
-            }
-            let row_max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let mut denom = 0.0f32;
-            let mut weights = vec![0.0f32; kv_len];
-            for (idx, score) in scores.iter().copied().enumerate() {
-                let w = (score - row_max).exp();
-                weights[idx] = w;
-                denom += w;
-            }
-            let out_base = qh * head_dim;
-            for d in 0..head_dim {
-                let mut acc = 0.0f32;
-                for (t, &w) in weights.iter().enumerate() {
-                    let v_base = (kvh * kv_len + t) * head_dim;
-                    acc += w * oracle_full_v[v_base + d];
-                }
-                oracle_host_pre_gate[out_base + d] = if denom > 0.0 { acc / denom } else { 0.0 };
-            }
-        }
+        let (full_k, full_v) = append_decode_kv_step(
+            &prefix_k,
+            &prefix_v,
+            &k_rope_step,
+            &v_step,
+            num_kv_heads,
+            prefix_len,
+            head_dim,
+        );
+        let host_attn_pre_gate = reconstruct_attention_pre_gate(
+            &q_rope_host,
+            &full_k,
+            &full_v,
+            num_heads,
+            num_kv_heads,
+            kv_len,
+            head_dim,
+            scale,
+        );
+        let (oracle_full_k, oracle_full_v) = append_decode_kv_step(
+            &oracle_prefix_k,
+            &oracle_prefix_v,
+            &oracle_k_rope,
+            &oracle_v_proj,
+            num_kv_heads,
+            prefix_len,
+            head_dim,
+        );
+        let oracle_host_pre_gate = reconstruct_attention_pre_gate(
+            &oracle_q_rope,
+            &oracle_full_k,
+            &oracle_full_v,
+            num_heads,
+            num_kv_heads,
+            kv_len,
+            head_dim,
+            scale,
+        );
         let host_pre_gate_vs_stage = validate::max_abs_delta(&host_attn_pre_gate, &pre_gate_host);
         let host_pre_gate_vs_oracle =
             validate::max_abs_delta(&host_attn_pre_gate, &oracle_pre_gate);
@@ -551,4 +494,77 @@ pub(crate) fn trace_qwen35_oracle_prefill_layer(
         );
     }
     Ok(())
+}
+
+fn append_decode_kv_step(
+    prefix_k: &[f32],
+    prefix_v: &[f32],
+    step_k: &[f32],
+    step_v: &[f32],
+    num_kv_heads: usize,
+    prefix_len: usize,
+    head_dim: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    let kv_len = prefix_len + 1;
+    let mut full_k = vec![0.0f32; num_kv_heads * kv_len * head_dim];
+    let mut full_v = vec![0.0f32; num_kv_heads * kv_len * head_dim];
+    for kvh in 0..num_kv_heads {
+        let prefix_base = kvh * prefix_len * head_dim;
+        let full_base = kvh * kv_len * head_dim;
+        let step_base = kvh * head_dim;
+        full_k[full_base..full_base + prefix_len * head_dim]
+            .copy_from_slice(&prefix_k[prefix_base..prefix_base + prefix_len * head_dim]);
+        full_v[full_base..full_base + prefix_len * head_dim]
+            .copy_from_slice(&prefix_v[prefix_base..prefix_base + prefix_len * head_dim]);
+        full_k[full_base + prefix_len * head_dim..full_base + kv_len * head_dim]
+            .copy_from_slice(&step_k[step_base..step_base + head_dim]);
+        full_v[full_base + prefix_len * head_dim..full_base + kv_len * head_dim]
+            .copy_from_slice(&step_v[step_base..step_base + head_dim]);
+    }
+    (full_k, full_v)
+}
+
+fn reconstruct_attention_pre_gate(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    num_heads: usize,
+    num_kv_heads: usize,
+    kv_len: usize,
+    head_dim: usize,
+    scale: f32,
+) -> Vec<f32> {
+    let kv_groups = num_heads / num_kv_heads;
+    let mut pre_gate = vec![0.0f32; num_heads * head_dim];
+    for qh in 0..num_heads {
+        let kvh = qh / kv_groups;
+        let q_base = qh * head_dim;
+        let mut scores = vec![0.0f32; kv_len];
+        for (t, score) in scores.iter_mut().enumerate() {
+            let k_base = (kvh * kv_len + t) * head_dim;
+            let mut acc = 0.0f32;
+            for d in 0..head_dim {
+                acc += q[q_base + d] * k[k_base + d];
+            }
+            *score = acc * scale;
+        }
+        let row_max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut denom = 0.0f32;
+        let mut weights = vec![0.0f32; kv_len];
+        for (idx, score) in scores.iter().copied().enumerate() {
+            let w = (score - row_max).exp();
+            weights[idx] = w;
+            denom += w;
+        }
+        let out_base = qh * head_dim;
+        for d in 0..head_dim {
+            let mut acc = 0.0f32;
+            for (t, &w) in weights.iter().enumerate() {
+                let v_base = (kvh * kv_len + t) * head_dim;
+                acc += w * v[v_base + d];
+            }
+            pre_gate[out_base + d] = if denom > 0.0 { acc / denom } else { 0.0 };
+        }
+    }
+    pre_gate
 }
