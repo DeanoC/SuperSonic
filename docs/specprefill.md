@@ -52,15 +52,19 @@ selection (`keep_ratio` × `chunk_size`) and produce the same kept-token
 schedule downstream:
 
 - `cosine` (default, Phase D): per-block `cosine(block_mean_K, last_K)`
-  computed from one drafter K cache. The drafter does a single dense
-  prefill (megakernel fast path), the orchestrator picks one
-  full-attention layer, and a HIP kernel emits per-block cosine scores
-  in one launch. The default scoring layer is the **shallowest**
-  full-attention layer (env var `SUPERSONIC_SPECPREFILL_SCORE_LAYER=N`
-  overrides). The default aggregation mode is `shallowest`; set
+  computed from one drafter K cache. The drafter prefill stops after
+  the deepest scoring layer (early-exit through `prefill_kv_through`)
+  — for `shallowest` mode on Qwen3.5-0.8B that prunes ~26 of 28 layers.
+  The orchestrator then picks one full-attention layer and a HIP kernel
+  emits per-block cosine scores in one launch. The default scoring
+  layer is the **shallowest** full-attention layer (env var
+  `SUPERSONIC_SPECPREFILL_SCORE_LAYER=N` overrides). The default
+  aggregation mode is `shallowest`; set
   `SUPERSONIC_SPECPREFILL_LAYERS=all_max` to take the per-block max
-  across all full-attention layers (marginal quality bump in our
-  measurements; see Performance below).
+  across all full-attention layers — `all_max` doesn't benefit from
+  early-exit (the deepest full-attention layer is near the end of the
+  drafter), so it ends up at roughly dense-baseline TTFT in our
+  measurements (see Performance below).
 - `lookahead` (legacy, Phase C): per-layer `softmax(Q·Kᵀ)` over
   look-ahead query rows from `--specprefill-lookahead` decode steps on
   the draft. Correctness-validated and structurally faithful to the
@@ -81,10 +85,10 @@ runs (median reported), `--specprefill-keep-ratio 0.50`:
 
 | Mode | TTFT (ms) | vs dense |
 |---|---|---|
-| dense (no SpecPrefill) | 5192 | 1.00× |
-| `--specprefill-algorithm cosine`, `shallowest` (default) | 4134 | **1.26× faster** |
-| `--specprefill-algorithm cosine`, `all_max` | 4099 | 1.27× faster |
-| `--specprefill-algorithm lookahead` | 7895 | 0.66× (slower than dense) |
+| dense (no SpecPrefill) | 4941 | 1.00× |
+| `--specprefill-algorithm cosine`, `shallowest` (default) | 2385 | **2.07× faster** |
+| `--specprefill-algorithm cosine`, `all_max` | 4144 | 1.19× faster |
+| `--specprefill-algorithm lookahead` | 7846 | 0.63× (slower than dense) |
 
 Quality at the same `keep_ratio=0.50` (against the dense reference; same
 1353-token prompt; cossim is a regression backstop, argmax-match is
