@@ -4,7 +4,8 @@ use model_store::BakedStore;
 use qwen36_moe::config::TextConfig;
 
 use crate::qwen36_moe_layers::{load_all_layer_buffers, Qwen36WeightMode};
-use crate::qwen36_moe_residency::{MoeExpertResidencyConfig, MoeExpertResidencyManager};
+use crate::qwen36_moe_residency::MoeExpertResidencyManager;
+use crate::qwen36_moe_residency_types::MoeExpertResidencyConfig;
 use crate::qwen36_moe_telemetry::{MoeIslandPrefetchMode, MoeSparseTelemetry, VirtualKvStats};
 use crate::qwen36_moe_types::{AttnLayerBuffers, LayerBuffers, MultiLayerGeom};
 

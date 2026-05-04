@@ -3,7 +3,8 @@ use std::borrow::Cow;
 
 use model_store::BakedStore;
 
-use crate::qwen36_moe_residency::{MoeExpertKey, MoeExpertProjection, MoeExpertResidencyManager};
+use crate::qwen36_moe_residency::MoeExpertResidencyManager;
+use crate::qwen36_moe_residency_types::{MoeExpertKey, MoeExpertProjection};
 use crate::qwen36_moe_telemetry::{
     MoeIslandPrefetchMode, MoeRouteTelemetry, MoeTransitionPredictor,
 };

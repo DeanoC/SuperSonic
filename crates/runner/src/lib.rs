@@ -23,6 +23,8 @@ pub mod qwen36_moe_logits;
 pub mod qwen36_moe_mtp;
 pub mod qwen36_moe_persistent_decode;
 pub mod qwen36_moe_residency;
+pub mod qwen36_moe_residency_pages;
+pub mod qwen36_moe_residency_types;
 pub mod qwen36_moe_speculative;
 pub mod qwen36_moe_state;
 pub mod qwen36_moe_telemetry;

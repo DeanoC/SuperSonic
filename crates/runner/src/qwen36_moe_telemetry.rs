@@ -4,7 +4,8 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
-use crate::qwen36_moe_residency::{MoeExpertKey, MoeExpertProjection, MoeExpertResidencyManager};
+use crate::qwen36_moe_residency::MoeExpertResidencyManager;
+use crate::qwen36_moe_residency_types::{MoeExpertKey, MoeExpertProjection};
 use crate::qwen36_moe_types::ExpertRoute;
 
 const MIB: f64 = (1024 * 1024) as f64;
@@ -450,7 +451,7 @@ pub(crate) struct VirtualKvStats {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct MoeSparseTelemetrySnapshot {
-    stats: crate::qwen36_moe_residency::MoeExpertResidencyStats,
+    stats: crate::qwen36_moe_residency_types::MoeExpertResidencyStats,
     arena: gpu_hal::VirtualArenaStats,
 }
 
