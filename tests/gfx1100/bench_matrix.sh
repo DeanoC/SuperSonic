@@ -4,9 +4,13 @@
 # stdout. Mirrors the gfx1150 numbers in `docs/performance.md` (same prompt,
 # same `MAX_NEW`) so cross-arch comparisons stay apples-to-apples.
 #
-# Each cell records `ms/step` from the `[result] decode_ms=N ms_per_step=M`
-# line emitted by the runner. Runs serial; full sweep on a 7900 XTX with
-# warm bakes is ~1 minute.
+# Each cell: 3s cooldown → 1 warmup run → median of 3 measurement runs.
+# The cooldown + median was added 2026-05-04 after a previous version of
+# the matrix without these controls produced numbers biased upward by
+# thermal accumulation across cells (see docs/performance.md § Methodology).
+#
+# Full sweep on a 7900 XTX with warm bakes is ~3 minutes (was ~1 minute
+# before the 3-run-median; the extra runs stabilize the larger-model cells).
 #
 # Usage:
 #   tests/gfx1100/bench_matrix.sh > /tmp/gfx1100_matrix.md
@@ -42,27 +46,40 @@ bench_one() {
         echo "skip"
         return 0
     fi
-    # Warm up once (kernel JIT, page cache) then take a steady-state run.
+    # 3s cooldown to bleed thermal state from the previous cell. Without
+    # this, serial benches over 7 models accumulate enough heat that the
+    # larger Qwen3.5 cells measure 1.5-2x slower than steady-state. See
+    # docs/performance.md § Methodology.
+    sleep 3
+    # Warm up once (kernel JIT, page cache).
     "$SUPERSONIC" --model "$model" --model-dir "$model_dir" \
         --prompt "$PROMPT" --max-new-tokens "$WARMUP_NEW" "$@" \
         >/dev/null 2>&1 || true
-    local out
-    out="$("$SUPERSONIC" --model "$model" --model-dir "$model_dir" \
-        --prompt "$PROMPT" --max-new-tokens "$MAX_NEW" "$@" 2>&1 || true)"
-    # Runner emits either `ms_per_step=N` (Gemma 4, Phi-4) or
-    # `ms_per_tok=N` (Qwen 3.5). Both are per-decode-step timings.
-    local mspt
-    mspt="$(printf '%s' "$out" | sed -n 's/.*ms_per_step=\([0-9.]*\).*/\1/p' | tail -n1)"
-    if [ -z "$mspt" ]; then
-        mspt="$(printf '%s' "$out" | sed -n 's/.*ms_per_tok=\([0-9.]*\).*/\1/p' | tail -n1)"
-    fi
-    if [ -z "$mspt" ]; then
-        # Some FP8 / INT4 combos may bail with a clear message (e.g. unsupported
-        # combo) — record as "—" rather than fail the whole sweep.
+    # Median of 3 measurement runs.
+    local m1 m2 m3
+    extract_ms() {
+        local raw="$1"
+        local val
+        val="$(printf '%s' "$raw" | sed -n 's/.*ms_per_step=\([0-9.]*\).*/\1/p' | tail -n1)"
+        if [ -z "$val" ]; then
+            val="$(printf '%s' "$raw" | sed -n 's/.*ms_per_tok=\([0-9.]*\).*/\1/p' | tail -n1)"
+        fi
+        printf '%s' "$val"
+    }
+    m1=$(extract_ms "$("$SUPERSONIC" --model "$model" --model-dir "$model_dir" \
+        --prompt "$PROMPT" --max-new-tokens "$MAX_NEW" "$@" 2>&1 || true)")
+    sleep 1
+    m2=$(extract_ms "$("$SUPERSONIC" --model "$model" --model-dir "$model_dir" \
+        --prompt "$PROMPT" --max-new-tokens "$MAX_NEW" "$@" 2>&1 || true)")
+    sleep 1
+    m3=$(extract_ms "$("$SUPERSONIC" --model "$model" --model-dir "$model_dir" \
+        --prompt "$PROMPT" --max-new-tokens "$MAX_NEW" "$@" 2>&1 || true)")
+    if [ -z "$m1" ] && [ -z "$m2" ] && [ -z "$m3" ]; then
         echo "—"
-    else
-        echo "$mspt"
+        return 0
     fi
+    # Median: sort numerically, take middle.
+    printf '%s\n' "$m1" "$m2" "$m3" | grep -v '^$' | sort -n | sed -n '2p'
 }
 
 row() {
