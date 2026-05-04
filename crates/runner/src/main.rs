@@ -15,6 +15,7 @@ mod phi4_engine;
 mod policy;
 mod prefill_engine;
 mod profiling;
+mod qwen35_alt_runtime;
 mod qwen35_component_decode;
 mod qwen35_decode_modes;
 mod qwen35_decode_report;

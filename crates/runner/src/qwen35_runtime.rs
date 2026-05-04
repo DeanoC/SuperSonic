@@ -4,6 +4,7 @@ use std::time::Instant;
 use crate::bakes::ensure_hf_metadata_present;
 use crate::decode_engine::{DecodeEngine, DecodeStageTimings};
 use crate::prefill_engine;
+use crate::qwen35_alt_runtime::run_qwen35_alt_runtime_if_requested;
 use crate::qwen35_component_decode::{run_qwen35_component_single_decode, Qwen35ComponentDecode};
 use crate::qwen35_decode_modes::{report_qwen35_decode_modes, resolve_qwen35_decode_modes};
 use crate::qwen35_decode_report::{emit_qwen35_decode_report, Qwen35DecodeReport};
@@ -31,10 +32,7 @@ use crate::qwen35_validation::{
 use crate::qwen35_virtual_kv::report_qwen35_virtual_kv_after_prefill;
 use crate::qwen35_vram::check_qwen35_vram;
 use crate::registry::{self, Backend, FamilyParams, GpuArch, ModelVariant, RegistryEntry};
-use crate::{
-    qwen35_dflash_engine, resolve_oracle_device, should_fetch_exact_bake, specprefill_engine,
-    try_download_bake, Cli,
-};
+use crate::{resolve_oracle_device, Cli};
 
 pub(crate) fn run_qwen35(
     cli: &Cli,
@@ -46,65 +44,8 @@ pub(crate) fn run_qwen35(
     total_vram: u64,
     q4km_like: bool,
 ) -> Result<()> {
-    if cli.dflash {
-        // DFlash needs the target's HF metadata (config.json + tokenizer.json)
-        // and the INT4 bake. Reuse the same download hooks as the regular
-        // Qwen35 path so the dflash dispatch is self-contained on a fresh
-        // machine: ensure_hf_metadata_present fetches HF metadata from the
-        // bake tarball if config.json is missing, then we verify or download
-        // the INT4 bake itself.
-        ensure_hf_metadata_present(&cli, &model_variant)?;
-        if !cli.no_bake {
-            let variant = model_store::fetch::BakeVariant::Int4Gptq;
-            let bake_dir = variant.bake_dir(&cli.model_dir);
-            let _lock = model_store::BakeLock::acquire(&cli.model_dir)
-                .map_err(|e| anyhow::anyhow!("acquire bake lock: {e}"))?;
-            if should_fetch_exact_bake(cli.download_bake, model_store::version_ok(&bake_dir)) {
-                let canonical_model = model_variant.to_string();
-                match try_download_bake(&cli, variant, &canonical_model, &bake_dir) {
-                    Ok(true) => {
-                        eprintln!("[fetch] installed {variant} bake at {}", bake_dir.display());
-                    }
-                    Ok(false) => {
-                        anyhow::bail!(
-                            "no INT4 bake at {} and --no-download set.\n\
-                             Run:\n  python oracle/bake_int4.py --model-dir {}",
-                            bake_dir.display(),
-                            cli.model_dir.display(),
-                        );
-                    }
-                    Err(e) => {
-                        anyhow::bail!(
-                            "could not obtain INT4 bake for --dflash: {e}\n\n\
-                             INT4 baking requires a GPTQ calibration pass in Python. \
-                             Run on a bigger machine:\n  python oracle/bake_int4.py --model-dir {}",
-                            cli.model_dir.display(),
-                        );
-                    }
-                }
-            }
-        }
-        return qwen35_dflash_engine::run_qwen35_dflash(
-            &cli,
-            &model_variant,
-            entry,
-            ordinal,
-            total_vram,
-        );
-    }
-    // --dflash-* guard already ran before the family dispatch above.
-
-    // --specprefill-* dispatch. Validation already ran in
-    // validate_specprefill_flags; the presence of --specprefill-draft-dir
-    // is the gate that switches to the SpecPrefill orchestrator.
-    if cli.specprefill_draft_dir.is_some() {
-        return specprefill_engine::run_specprefill(
-            &cli,
-            &model_variant,
-            entry,
-            ordinal,
-            total_vram,
-        );
+    if run_qwen35_alt_runtime_if_requested(cli, model_variant, entry, ordinal, total_vram)? {
+        return Ok(());
     }
 
     let params = match &entry.params {
