@@ -3087,6 +3087,24 @@ fn prefill_linear_attention_layer(
             .map_err(|e| anyhow::anyhow!("layer {idx} conv pad fill ch={ch}: {e}"))?;
         }
     }
+    if trace_linear_debug {
+        let trace = linear_debug_trace
+            .as_mut()
+            .expect("linear debug trace missing");
+        let bytes = scratch
+            .conv_input
+            .to_host_bytes()
+            .map_err(|e| anyhow::anyhow!("layer {idx} debug conv_window D2H: {e}"))?;
+        let elem_bytes = ScalarType::BF16.size_in_bytes();
+        let total_len = chunk_len + pad;
+        let window_start = chunk_len - 1;
+        trace.conv_window = Vec::with_capacity(qkv_dim * kern * elem_bytes);
+        for ch in 0..qkv_dim {
+            let start = (ch * total_len + window_start) * elem_bytes;
+            let end = start + kern * elem_bytes;
+            trace.conv_window.extend_from_slice(&bytes[start..end]);
+        }
+    }
 
     // 6. Conv1d + SiLU: [qkv_dim, pad+chunk] → [chunk, qkv_dim]
     let total_len = chunk_len + pad;
@@ -3103,6 +3121,18 @@ fn prefill_linear_attention_layer(
         &mut scratch.proj_buf,
     )
     .map_err(|e| anyhow::anyhow!("layer {idx} conv: {e}"))?;
+    if trace_linear_debug {
+        let trace = linear_debug_trace
+            .as_mut()
+            .expect("linear debug trace missing");
+        let bytes = scratch
+            .proj_buf
+            .to_host_bytes()
+            .map_err(|e| anyhow::anyhow!("layer {idx} debug post_conv D2H: {e}"))?;
+        let row_bytes = qkv_dim * ScalarType::BF16.size_in_bytes();
+        let start = (chunk_len - 1) * row_bytes;
+        trace.post_conv = bytes[start..start + row_bytes].to_vec();
+    }
 
     // Now (post-conv1d) update the inter-chunk and persistent conv tail
     // buffers from the new_tail we computed earlier. Order matters: this MUST
