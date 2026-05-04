@@ -4,13 +4,13 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use gpu_hal::GpuBuffer;
 
-use crate::qwen36_moe_lm_head::{launch_lm_head_from_final_hidden_bytes, LmHeadBuffers};
-use crate::qwen36_moe_logits::{sample_bf16_logits, XorshiftRng};
-use crate::qwen36_moe_loop::Qwen36DecodeLoopState;
-use crate::qwen36_moe_output::{
+use crate::qwen36_moe_cli::decode_loop::Qwen36DecodeLoopState;
+use crate::qwen36_moe_cli::lm_head::{launch_lm_head_from_final_hidden_bytes, LmHeadBuffers};
+use crate::qwen36_moe_cli::output::{
     dump_final_hidden_if_requested, dump_logits_if_requested, print_decoded_token,
 };
-use crate::qwen36_moe_timing::{Qwen36StageTimingTotals, SamplingParams};
+use crate::qwen36_moe_cli::timing::{Qwen36StageTimingTotals, SamplingParams};
+use crate::qwen36_moe_logits::{sample_bf16_logits, XorshiftRng};
 use crate::qwen36_moe_types::{DecodeOutputs, MultiLayerGeom};
 
 pub(crate) struct Qwen36GenerationStep<'a> {

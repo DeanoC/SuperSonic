@@ -12,33 +12,33 @@ use anyhow::{Context, Result};
 use gpu_hal::{set_backend, Backend};
 use model_store::BakedStore;
 
-use crate::qwen36_moe_bake::{ensure_qwen36_bake, select_decode_bake};
-use crate::qwen36_moe_chain::{run_chain_step, Qwen36ChainStep};
-use crate::qwen36_moe_dry_run::{print_report, run_qwen36_moe_dry_run, DryRunReport};
-use crate::qwen36_moe_generation::{run_generation_step, Qwen36GenerationStep};
-use crate::qwen36_moe_geom::build_multi_layer_geom;
-use crate::qwen36_moe_host::lookup_embed_row;
-use crate::qwen36_moe_logits::XorshiftRng;
-use crate::qwen36_moe_loop::Qwen36DecodeLoopState;
-use crate::qwen36_moe_output::{
+use crate::qwen36_moe_cli::bake::{ensure_qwen36_bake, select_decode_bake};
+use crate::qwen36_moe_cli::chain::{run_chain_step, Qwen36ChainStep};
+use crate::qwen36_moe_cli::decode_loop::Qwen36DecodeLoopState;
+use crate::qwen36_moe_cli::dry_run::{print_report, run_qwen36_moe_dry_run, DryRunReport};
+use crate::qwen36_moe_cli::generation::{run_generation_step, Qwen36GenerationStep};
+use crate::qwen36_moe_cli::geom::build_multi_layer_geom;
+use crate::qwen36_moe_cli::host::lookup_embed_row;
+use crate::qwen36_moe_cli::output::{
     print_decode_stream_start, print_generation_summary, print_last_logits_if_requested,
     print_sampling_summary,
 };
-use crate::qwen36_moe_policy::{
+use crate::qwen36_moe_cli::policy::{
     resolve_context_size, validate_decode_backend, validate_persistent_kv_fp8_flags,
 };
-use crate::qwen36_moe_prompt::{
+use crate::qwen36_moe_cli::prompt::{
     prepare_prompt, print_prompt_summary, validate_speculative_sampling,
 };
-use crate::qwen36_moe_session::{prepare_decode_session, Qwen36DecodeSession};
-use crate::qwen36_moe_spec_verify::{run_speculative_extension, Qwen36SpeculativeExtension};
-use crate::qwen36_moe_telemetry::{print_and_write_moe_residency_summary, MoeRouteRuntime};
-use crate::qwen36_moe_timing::{Qwen36StageTimingTotals, SamplingParams};
-use crate::qwen36_moe_vmm::{
+use crate::qwen36_moe_cli::session::{prepare_decode_session, Qwen36DecodeSession};
+use crate::qwen36_moe_cli::spec_verify::{run_speculative_extension, Qwen36SpeculativeExtension};
+use crate::qwen36_moe_cli::timing::{Qwen36StageTimingTotals, SamplingParams};
+use crate::qwen36_moe_cli::vmm::{
     load_decode_layers_with_vmm_strategy, print_virtual_kv_stats_if_active,
     virtual_kv_stats_for_layers,
 };
-use crate::qwen36_moe_vmm_config::{prepare_moe_runtime_config, should_use_qwen36_kv_vmm};
+use crate::qwen36_moe_cli::vmm_config::{prepare_moe_runtime_config, should_use_qwen36_kv_vmm};
+use crate::qwen36_moe_logits::XorshiftRng;
+use crate::qwen36_moe_telemetry::{print_and_write_moe_residency_summary, MoeRouteRuntime};
 use crate::registry::RegistryEntry;
 
 pub fn run(cli: &crate::Cli, entry: &RegistryEntry, total_vram: u64) -> Result<()> {
