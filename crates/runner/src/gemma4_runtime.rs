@@ -1,8 +1,10 @@
 use anyhow::Result;
+use std::path::PathBuf;
+use std::time::Instant;
 
-use crate::bakes::ensure_gemma4_int4_bake;
-use crate::registry::{self, Backend, Gemma4KernelParams, ModelVariant};
-use crate::{gemma4_engine, gemma4_int4_engine, Cli};
+use crate::bakes::{ensure_gemma4_int4_bake, ensure_hf_metadata_present};
+use crate::registry::{self, Backend, FamilyParams, Gemma4KernelParams, ModelVariant};
+use crate::{gemma4_engine, gemma4_int4_engine, oracle, validate, Cli};
 
 pub(crate) struct Gemma4Startup {
     pub(crate) cfg: gemma4::config::Config,
@@ -115,6 +117,260 @@ pub(crate) fn load_gemma4_runtime(
             )?,
         ))
     }
+}
+
+pub(crate) fn run_gemma4(
+    cli: &Cli,
+    model_variant: &ModelVariant,
+    entry: &registry::RegistryEntry,
+    ordinal: usize,
+    total_vram: u64,
+) -> Result<()> {
+    let params = match &entry.params {
+        FamilyParams::Gemma4(p) => p,
+        FamilyParams::Qwen35(_) => unreachable!("dispatch filtered to Gemma4"),
+        FamilyParams::Qwen36Moe(_) => unreachable!("dispatch filtered to Gemma4"),
+        FamilyParams::Phi4(_) => unreachable!("dispatch filtered to Gemma4"),
+        FamilyParams::Llama31(_) => unreachable!("dispatch filtered to Gemma4"),
+    };
+
+    validate_gemma4_startup(cli, model_variant, entry.backend)?;
+
+    // Fetch first if --model-dir is pristine so HF metadata lands before config load.
+    let bootstrap_downloaded = ensure_hf_metadata_present(cli, model_variant)?;
+
+    let Gemma4Startup {
+        cfg,
+        tokenizer,
+        prompt_ids,
+        context_tokens,
+    } = load_gemma4_startup(cli, model_variant, params)?;
+    let t = &cfg.text_config;
+
+    check_gemma4_vram(cli, t, &entry.vram, context_tokens, total_vram)?;
+
+    let t0 = Instant::now();
+    let mut engine = load_gemma4_runtime(
+        cli,
+        model_variant,
+        params,
+        context_tokens,
+        ordinal,
+        bootstrap_downloaded,
+    )?;
+    eprintln!("[weights] loaded in {:.0}ms", t0.elapsed().as_millis());
+
+    let oracle_output = if cli.validate {
+        let oracle_script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .unwrap()
+            .join("oracle/gemma4_oracle.py");
+        let oracle = oracle::run_gemma4_oracle(
+            &oracle_script,
+            &cli.model_dir,
+            &cli.prompt,
+            cli.max_new_tokens,
+            &cli.oracle_dtype,
+        )?;
+        if let Some(ref oracle_ids) = oracle.prompt_token_ids {
+            if oracle_ids != &prompt_ids {
+                anyhow::bail!(
+                    "tokenizer mismatch between Rust and Python oracle: rust={prompt_ids:?} oracle={oracle_ids:?}"
+                );
+            }
+        }
+        Some(oracle)
+    } else {
+        None
+    };
+
+    let prefill_start = Instant::now();
+    let prefill_logits = engine.prefill(&prompt_ids)?;
+    let prefill_token = Gemma4Runtime::greedy_sample(&prefill_logits);
+    eprintln!(
+        "[prefill] native GPU prefill done in {:.0}ms",
+        prefill_start.elapsed().as_millis()
+    );
+
+    let batch_size = engine.batch_size();
+    if batch_size > 1 {
+        eprintln!(
+            "[batch] replicating prefill K/V across {} sequences",
+            batch_size
+        );
+        engine.replicate_seq0_kv()?;
+    }
+
+    if let Some(ref oracle) = oracle_output {
+        let prefill_delta = validate::max_abs_delta(&prefill_logits, &oracle.prefill_logits);
+        eprintln!("[validate] prefill logit delta={prefill_delta:.4}");
+        if let Some(&oracle_first) = oracle.generated_token_ids.first() {
+            if oracle_first != prefill_token {
+                eprintln!(
+                    "[validate] WARNING: prefill token mismatch! native={prefill_token} oracle={oracle_first}"
+                );
+            }
+        }
+        if batch_size > 1 {
+            eprintln!("[validate] WARNING: --validate compares oracle vs sequence 0 only when --batch-size > 1");
+        }
+    }
+
+    let seqlen_start = prompt_ids.len();
+    let eos_ids = t.eos_token_ids();
+    let mut max_delta = 0.0f32;
+    let mut token_mismatches = 0usize;
+
+    // Per-sequence decode state. All sequences start from the same prefill
+    // token; greedy sampling will keep them identical unless something
+    // diverges (useful sanity check until Phase 2 adds true per-sequence
+    // prompts).
+    let mut next_tokens: Vec<u32> = vec![prefill_token; batch_size];
+    let mut generated_per_seq: Vec<Vec<u32>> = vec![Vec::new(); batch_size];
+    let mut seq_done: Vec<bool> = vec![false; batch_size];
+    let mut steps_done: usize = 0;
+
+    let decode_start = Instant::now();
+    for step in 0..cli.max_new_tokens {
+        // Mark any newly-EOSed sequences but keep stepping until ALL sequences
+        // have stopped - the megakernel still has to handle the active ones.
+        for b in 0..batch_size {
+            if !seq_done[b] && eos_ids.contains(&next_tokens[b]) {
+                seq_done[b] = true;
+            }
+        }
+        if seq_done.iter().all(|d| *d) {
+            break;
+        }
+        let pos = seqlen_start + step;
+        let positions: Vec<usize> = vec![pos; batch_size];
+        let fast_sampled = if oracle_output.is_none() {
+            engine.decode_step_batch_greedy_cuda(&next_tokens, &positions)?
+        } else {
+            None
+        };
+        let logits_per_seq = if fast_sampled.is_none() {
+            Some(engine.decode_step_batch(&next_tokens, &positions)?)
+        } else {
+            None
+        };
+
+        if let (Some(ref oracle), Some(ref logits_per_seq)) = (&oracle_output, &logits_per_seq) {
+            if step < oracle.decode_logits.len() {
+                let oracle_logits = &oracle.decode_logits[step];
+                // Always compare against sequence 0 (canonical run).
+                let delta = validate::max_abs_delta(&logits_per_seq[0], oracle_logits);
+                if delta > max_delta {
+                    max_delta = delta;
+                }
+                let oracle_next = if step + 1 < oracle.generated_token_ids.len() {
+                    Some(oracle.generated_token_ids[step + 1])
+                } else {
+                    None
+                };
+                let rust_next = Gemma4Runtime::greedy_sample(&logits_per_seq[0]);
+                let mismatch_tag = match oracle_next {
+                    Some(ot) if ot != rust_next => {
+                        token_mismatches += 1;
+                        format!(" MISMATCH (oracle_next={ot})")
+                    }
+                    _ => String::new(),
+                };
+                eprintln!(
+                    "[validate] step={step} pos={pos} delta={delta:.4} input_tok={} rust_next={rust_next}{mismatch_tag}",
+                    next_tokens[0]
+                );
+            }
+        }
+
+        // Sample per sequence and roll forward - but only record sampled
+        // tokens for sequences that haven't already hit EOS.
+        for b in 0..batch_size {
+            if seq_done[b] {
+                continue;
+            }
+            let sampled = if let Some(ref sampled_tokens) = fast_sampled {
+                sampled_tokens[b]
+            } else {
+                let logits_per_seq = logits_per_seq
+                    .as_ref()
+                    .expect("full logits populated when fast sampling is unavailable");
+                Gemma4Runtime::greedy_sample(&logits_per_seq[b])
+            };
+            generated_per_seq[b].push(next_tokens[b]);
+            next_tokens[b] = sampled;
+        }
+        steps_done = step + 1;
+    }
+    let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
+
+    // Print every sequence. For batch_size == 1 the output matches the
+    // pre-batched format (no `[seq=N]` prefix).
+    for b in 0..batch_size {
+        let all_ids: Vec<u32> = prompt_ids
+            .iter()
+            .copied()
+            .chain(generated_per_seq[b].iter().copied())
+            .collect();
+        let text = tokenizer
+            .decode(&all_ids, true)
+            .map_err(|e| anyhow::anyhow!("detokenize: {e}"))?;
+        let generated_text = tokenizer
+            .decode(&generated_per_seq[b], true)
+            .map_err(|e| anyhow::anyhow!("detokenize generated suffix: {e}"))?;
+        if batch_size == 1 {
+            println!("{text}");
+            if cli.emit_generated_json {
+                println!(
+                    "[generated_json] {}",
+                    serde_json::to_string(&generated_text)?
+                );
+            }
+            println!(
+                "[tokens] {}",
+                generated_per_seq[b]
+                    .iter()
+                    .map(|id| id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+        } else {
+            println!("[seq={b}] {text}");
+            if cli.emit_generated_json {
+                println!(
+                    "[seq={b}][generated_json] {}",
+                    serde_json::to_string(&generated_text)?
+                );
+            }
+            println!(
+                "[seq={b}][tokens] {}",
+                generated_per_seq[b]
+                    .iter()
+                    .map(|id| id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+        }
+    }
+
+    let total_generated: usize = generated_per_seq.iter().map(|v| v.len()).sum();
+    eprintln!(
+        "[result] prompt_tokens={} generated_tokens={} steps={steps_done} batch_size={batch_size} decode_ms={decode_ms:.0} ms_per_step={:.0}{}",
+        prompt_ids.len(),
+        total_generated,
+        if steps_done == 0 {
+            0.0
+        } else {
+            decode_ms / steps_done as f64
+        },
+        if oracle_output.is_some() {
+            format!(" decode_max_delta={max_delta:.4} token_mismatches={token_mismatches}")
+        } else {
+            String::new()
+        },
+    );
+    Ok(())
 }
 
 pub(crate) fn validate_gemma4_startup(
