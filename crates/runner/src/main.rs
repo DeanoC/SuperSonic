@@ -662,6 +662,23 @@ pub(crate) struct Cli {
     /// prefill, to claw back ~1.6 GiB on a tight 24 GiB budget.
     #[arg(long, default_value_t = false)]
     specprefill_unload_draft: bool,
+
+    /// SpecPrefill scoring algorithm.
+    ///
+    /// - `lookahead` (Phase C, default): per-layer softmax(Q·Kᵀ) over
+    ///   look-ahead query rows. Correctness-validated but currently NET
+    ///   SLOWER than dense prefill on gfx1100 — the lookahead decode
+    ///   routes through the component decode path. See
+    ///   docs/performance.md § Runtime feature impact footnote ².
+    /// - `cosine` (Phase D): per-block cosine(block_mean_K, last_K) from
+    ///   one drafter K cache. Drops the lookahead decode steps entirely.
+    ///   Default scoring layer is the shallowest full-attention layer;
+    ///   override via env var `SUPERSONIC_SPECPREFILL_SCORE_LAYER=N`.
+    ///   Per-layer aggregation mode controlled by env var
+    ///   `SUPERSONIC_SPECPREFILL_LAYERS=shallowest|all_max` (default
+    ///   `shallowest`).
+    #[arg(long, default_value = "lookahead")]
+    specprefill_algorithm: String,
 }
 
 #[cfg(test)]
