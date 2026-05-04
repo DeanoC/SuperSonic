@@ -43,12 +43,20 @@ class Qwen36LongContextBenchTests(unittest.TestCase):
             "[tokens] [1, 2, 3]\n"
             "[result] prompt_tokens=8190 generated_tokens=3 decode_ms=30 ms_per_tok=10\n"
             "[qwen36-moe stage-timings] gen_steps=3 total_ms_avg=10.5 attn_ms_avg=2 (chain_total_ms=30)\n"
+            "[qwen36-moe lifecycle-timings] prompt_setup_ms=1.0 bake_open_ms=2.0 "
+            "layer_load_ms=3.0 session_ms=4.0 prefill_steps=8190 "
+            "prefill_embed_ms=5.0 prefill_chain_ms=6000.0 prefill_total_ms=6005.0 "
+            "generation_wall_ms=30.0 total_wall_ms=7000.0\n"
         )
         self.assertEqual(bench_qwen36_longctx.parse_generated_json(output), "SSB-NEEDLE-00007\n")
         self.assertEqual(bench_qwen36_longctx.parse_tokens(output), [1, 2, 3])
         self.assertEqual(bench_qwen36_longctx.parse_result(output)["prompt_tokens"], 8190)
         self.assertEqual(bench_qwen36_longctx.parse_stage_timings(output)["total_ms_avg"], 10.5)
         self.assertEqual(bench_qwen36_longctx.parse_stage_timings(output)["chain_total_ms"], 30)
+        lifecycle = bench_qwen36_longctx.parse_lifecycle_timings(output)
+        self.assertEqual(lifecycle["prefill_steps"], 8190)
+        self.assertEqual(lifecycle["prefill_total_ms"], 6005.0)
+        self.assertEqual(lifecycle["generation_wall_ms"], 30.0)
 
     def test_parse_result_accepts_qwen36_generated_summary(self):
         output = "Generated 1 token (418 prompt + 1 new). EOS: no (max_new_tokens hit)."

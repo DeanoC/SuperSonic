@@ -12,6 +12,9 @@ through the existing `supersonic` CLI and records:
 - requested context size, prompt token count, generated ids, and NIAH substring hit
 - wall-clock run time, so prefill-heavy long prompts are visible
 - `[qwen36-moe stage-timings]` fields and derived tok/s
+- `[qwen36-moe lifecycle-timings]` fields for prompt setup, bake open,
+  layer/session preparation, prefill embed/chain work, generation wall time,
+  and total decode wall time
 - dense or sparse VMM residency fields, including total, MoE, and KV bytes
 - JSON plus Markdown summaries under `target/`
 

@@ -128,8 +128,19 @@ def parse_stage_timings(output: str) -> dict[str, float]:
     match = re.search(r"\[qwen36-moe stage-timings\]\s+(.+)", output)
     if not match:
         return {}
+    return parse_key_value_floats(match.group(1))
+
+
+def parse_lifecycle_timings(output: str) -> dict[str, float]:
+    match = re.search(r"\[qwen36-moe lifecycle-timings\]\s+(.+)", output)
+    if not match:
+        return {}
+    return parse_key_value_floats(match.group(1))
+
+
+def parse_key_value_floats(raw: str) -> dict[str, float]:
     timings: dict[str, float] = {}
-    for part in match.group(1).split():
+    for part in raw.split():
         if "=" not in part:
             continue
         key, value = part.strip("()").split("=", 1)
@@ -333,6 +344,7 @@ def run_one(
             "niah_contains_expected": False,
             "generated_ids": parse_tokens(output),
             "stage": parse_stage_timings(output),
+            "lifecycle": parse_lifecycle_timings(output),
             "result": parse_result(output),
             "vmm_residency": dense_vmm_residency(output),
             "stdout_tail": stdout[-1600:],
@@ -358,6 +370,7 @@ def run_one(
         ),
         "generated_ids": parse_tokens(output),
         "stage": parse_stage_timings(output),
+        "lifecycle": parse_lifecycle_timings(output),
         "result": parse_result(output),
         "stdout_tail": proc.stdout[-1600:],
         "stderr_tail": proc.stderr[-3200:],
@@ -376,8 +389,8 @@ def run_one(
 
 def markdown(rows: list[dict[str, Any]]) -> str:
     out = [
-        "| Context | Mode | wall s | total ms/tok | tok/s | prompt tokens | total resident GiB | MoE resident GiB | KV resident GiB | generated ids match | NIAH hit |",
-        "|---:|:---|---:|---:|---:|---:|---:|---:|---:|:---:|:---:|",
+        "| Context | Mode | wall s | prefill s | gen wall s | total ms/tok | tok/s | prompt tokens | total resident GiB | MoE resident GiB | KV resident GiB | generated ids match | NIAH hit |",
+        "|---:|:---|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|:---:|",
     ]
     baseline_ids_by_context: dict[int, list[int]] = {}
     for row in rows:
@@ -386,6 +399,7 @@ def markdown(rows: list[dict[str, Any]]) -> str:
     for row in rows:
         residency = row.get("vmm_residency") or {}
         stage = row.get("stage") or {}
+        lifecycle = row.get("lifecycle") or {}
         result = row.get("result") or {}
         context = row["context_tokens_requested"]
         generated_ids = row.get("generated_ids") or []
@@ -393,10 +407,20 @@ def markdown(rows: list[dict[str, Any]]) -> str:
         ids_match = baseline_ids == generated_ids if baseline_ids is not None else None
         row["generated_ids_match_baseline"] = ids_match
         out.append(
-            "| {context} | {mode} | {wall} | {ms} | {tok} | {prompt_tokens} | {total_gib} | {moe_gib} | {kv_gib} | {ids_match} | {niah} |".format(
+            "| {context} | {mode} | {wall} | {prefill_s} | {gen_wall_s} | {ms} | {tok} | {prompt_tokens} | {total_gib} | {moe_gib} | {kv_gib} | {ids_match} | {niah} |".format(
                 context=context,
                 mode=row["mode"],
                 wall=fmt_num(row.get("wall_seconds")),
+                prefill_s=fmt_num(
+                    (lifecycle.get("prefill_total_ms") or 0) / 1000.0
+                    if lifecycle.get("prefill_total_ms") is not None
+                    else None
+                ),
+                gen_wall_s=fmt_num(
+                    (lifecycle.get("generation_wall_ms") or 0) / 1000.0
+                    if lifecycle.get("generation_wall_ms") is not None
+                    else None
+                ),
                 ms=fmt_num(stage.get("total_ms_avg") or result.get("ms_per_tok")),
                 tok=fmt_num(row.get("tok_per_s")),
                 prompt_tokens=fmt_num(result.get("prompt_tokens"), digits=0),
@@ -468,9 +492,11 @@ def main() -> int:
                 print(row.get("error") or row.get("stderr_tail") or "run failed", file=sys.stderr)
                 break
             stage = row.get("stage") or {}
+            lifecycle = row.get("lifecycle") or {}
             residency = row.get("vmm_residency") or {}
             print(
                 f"  total_ms={stage.get('total_ms_avg')} tok/s={row.get('tok_per_s')} "
+                f"prefill_ms={lifecycle.get('prefill_total_ms')} "
                 f"resident_gib={fmt_gib(residency.get('total_vmm_resident_bytes'))} "
                 f"niah={row.get('niah_contains_expected')} ids={row.get('generated_ids')}",
                 flush=True,
@@ -478,7 +504,7 @@ def main() -> int:
 
     md = markdown(rows)
     payload = {
-        "schema": "qwen36-moe-longctx-bench-v1",
+        "schema": "qwen36-moe-longctx-bench-v2",
         "model": "qwen3.6-35b-a3b",
         "model_dir": str(args.model_dir),
         "backend": args.backend,
