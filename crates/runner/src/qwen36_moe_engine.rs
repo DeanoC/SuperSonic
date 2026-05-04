@@ -36,7 +36,9 @@ use crate::qwen36_moe_prompt::{
     prepare_prompt, print_prompt_summary, validate_speculative_sampling,
 };
 use crate::qwen36_moe_session::{prepare_decode_session, Qwen36DecodeSession};
-use crate::qwen36_moe_spec_verify::{run_spec_chain_step, Qwen36SpecChainStep};
+use crate::qwen36_moe_spec_verify::{
+    run_batched_lm_head_top1, run_spec_chain_step, Qwen36BatchedLmHeadTop1, Qwen36SpecChainStep,
+};
 use crate::qwen36_moe_speculative::{
     run_speculative_decode_step, run_speculative_decode_step_batched,
 };
@@ -460,8 +462,6 @@ fn decode_text(
                         if n == 0 {
                             return Ok(Vec::new());
                         }
-                        let hidden = geom.hidden as usize;
-
                         // K+1 sequential chains, accumulate final_hiddens.
                         let mut final_hiddens: Vec<Vec<u8>> = Vec::with_capacity(n);
                         for &(pos, input) in inputs {
@@ -480,46 +480,14 @@ fn decode_text(
                             final_hiddens.push(chain_outputs.final_hidden_bytes);
                         }
 
-                        // ONE batched lm_head over [n, hidden].
-                        let t_lm_head_start = std::time::Instant::now();
-                        let mut concat = Vec::with_capacity(n * hidden * 2);
-                        for fh in &final_hiddens {
-                            concat.extend_from_slice(fh);
-                        }
-                        let fh_buf = gpu_hal::GpuBuffer::from_host_bytes(
+                        run_batched_lm_head_top1(Qwen36BatchedLmHeadTop1 {
                             ordinal,
-                            gpu_hal::ScalarType::BF16,
-                            &[n, hidden],
-                            &concat,
-                        )?;
-                        let mut logits_buf_b = gpu_hal::GpuBuffer::zeros(
-                            ordinal,
-                            gpu_hal::ScalarType::BF16,
-                            &[n, geom.vocab as usize],
-                        )?;
-                        kernel_ffi::qwen36_moe::lm_head_batched_launch(
-                            ordinal,
-                            n as i32,
-                            geom.hidden,
-                            geom.vocab,
-                            geom.rms_norm_eps,
-                            &fh_buf,
-                            &final_norm_w_buf,
-                            &lm_head_w_buf,
-                            &mut logits_buf_b,
-                            None,
-                        )?;
-                        let logits_bytes =
-                            logits_buf_b.to_host_bytes().context("d2h batched logits")?;
-                        stage_timings.record_lm_head(t_lm_head_start.elapsed());
-
-                        let row_bytes = geom.vocab as usize * 2;
-                        let mut results: Vec<(u32, Vec<u8>)> = Vec::with_capacity(n);
-                        for (i, fh) in final_hiddens.into_iter().enumerate() {
-                            let row = &logits_bytes[i * row_bytes..(i + 1) * row_bytes];
-                            results.push((argmax_bf16_logits(row), fh));
-                        }
-                        Ok(results)
+                            geom: &geom,
+                            final_norm_w: &final_norm_w_buf,
+                            lm_head_w: &lm_head_w_buf,
+                            stage_timings: &mut stage_timings,
+                            final_hiddens,
+                        })
                     },
                 )
                 .context("batched speculative decode step")?;

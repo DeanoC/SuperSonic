@@ -1,8 +1,9 @@
 use anyhow::{Context, Result};
+use gpu_hal::{GpuBuffer, ScalarType};
 use model_store::BakedStore;
 
 use crate::qwen36_moe_decode::{
-    run_chained_decode_fast, DecodeOutputs, LayerBuffers, MultiLayerGeom,
+    argmax_bf16_logits, run_chained_decode_fast, DecodeOutputs, LayerBuffers, MultiLayerGeom,
 };
 use crate::qwen36_moe_host::lookup_embed_row;
 use crate::qwen36_moe_persistent_decode::PersistentScratch;
@@ -54,4 +55,57 @@ pub(crate) fn run_spec_chain_step(args: Qwen36SpecChainStep<'_>) -> Result<Decod
         .record_chain(t_chain_start.elapsed(), &outputs);
     args.stage_timings.count_generation_step();
     Ok(outputs)
+}
+
+pub(crate) struct Qwen36BatchedLmHeadTop1<'a> {
+    pub(crate) ordinal: usize,
+    pub(crate) geom: &'a MultiLayerGeom,
+    pub(crate) final_norm_w: &'a GpuBuffer,
+    pub(crate) lm_head_w: &'a GpuBuffer,
+    pub(crate) stage_timings: &'a mut Qwen36StageTimingTotals,
+    pub(crate) final_hiddens: Vec<Vec<u8>>,
+}
+
+pub(crate) fn run_batched_lm_head_top1(
+    args: Qwen36BatchedLmHeadTop1<'_>,
+) -> Result<Vec<(u32, Vec<u8>)>> {
+    let n = args.final_hiddens.len();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+
+    let hidden = args.geom.hidden as usize;
+    let t_lm_head_start = std::time::Instant::now();
+    let mut concat = Vec::with_capacity(n * hidden * 2);
+    for fh in &args.final_hiddens {
+        concat.extend_from_slice(fh);
+    }
+    let fh_buf = GpuBuffer::from_host_bytes(args.ordinal, ScalarType::BF16, &[n, hidden], &concat)?;
+    let mut logits_buf = GpuBuffer::zeros(
+        args.ordinal,
+        ScalarType::BF16,
+        &[n, args.geom.vocab as usize],
+    )?;
+    kernel_ffi::qwen36_moe::lm_head_batched_launch(
+        args.ordinal,
+        n as i32,
+        args.geom.hidden,
+        args.geom.vocab,
+        args.geom.rms_norm_eps,
+        &fh_buf,
+        args.final_norm_w,
+        args.lm_head_w,
+        &mut logits_buf,
+        None,
+    )?;
+    let logits_bytes = logits_buf.to_host_bytes().context("d2h batched logits")?;
+    args.stage_timings.record_lm_head(t_lm_head_start.elapsed());
+
+    let row_bytes = args.geom.vocab as usize * 2;
+    let mut results = Vec::with_capacity(n);
+    for (i, fh) in args.final_hiddens.into_iter().enumerate() {
+        let row = &logits_bytes[i * row_bytes..(i + 1) * row_bytes];
+        results.push((argmax_bf16_logits(row), fh));
+    }
+    Ok(results)
 }
