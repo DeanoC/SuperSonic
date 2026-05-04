@@ -253,7 +253,7 @@ fn decode_text(
     let mut prefill_steps = 0usize;
     let mut prefill_embed_elapsed = std::time::Duration::ZERO;
     let mut prefill_chain_elapsed = std::time::Duration::ZERO;
-    let generation_wall_start = std::time::Instant::now();
+    let mut generation_wall_start = None;
     let mut moe_routes = MoeRouteRuntime::new(
         geom.num_layers as usize,
         geom.top_k as usize,
@@ -273,6 +273,10 @@ fn decode_text(
         // token per iteration.
         if loop_state.reached_max_new() {
             break;
+        }
+        let is_gen_step = step + 1 >= prompt_ids.len();
+        if is_gen_step && generation_wall_start.is_none() {
+            generation_wall_start = Some(std::time::Instant::now());
         }
         // Embed lookup for the current token.
         let t0 = std::time::Instant::now();
@@ -311,7 +315,6 @@ fn decode_text(
         // into final_hidden_buf. The host then D2Hs `logits_buf`
         // directly. On prefill steps logits aren't needed; on the
         // chained path the explicit lm_head_launch path stays.
-        let is_gen_step = step + 1 >= prompt_ids.len();
         let fold = if is_gen_step {
             Some(crate::qwen36_moe_persistent_decode::LmHeadFold {
                 final_norm_w: &final_norm_w_buf,
@@ -441,6 +444,10 @@ fn decode_text(
     if emit_stage_timings {
         let to_ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
         let prefill_total_ms = to_ms(prefill_embed_elapsed + prefill_chain_elapsed);
+        let generation_wall_ms = generation_wall_start
+            .as_ref()
+            .map(|start| to_ms(start.elapsed()))
+            .unwrap_or(0.0);
         eprintln!(
             "[qwen36-moe lifecycle-timings] prompt_setup_ms={:.3} \
              bake_open_ms={:.3} layer_load_ms={:.3} session_ms={:.3} \
@@ -454,7 +461,7 @@ fn decode_text(
             to_ms(prefill_embed_elapsed),
             to_ms(prefill_chain_elapsed),
             prefill_total_ms,
-            to_ms(generation_wall_start.elapsed()) - prefill_total_ms,
+            generation_wall_ms,
             to_ms(decode_wall_start.elapsed()),
         );
     }
