@@ -7,7 +7,7 @@
 //! BF16 only at launch; INT4/FP8 hooks live in [`kernel_ffi::phi4`] for a
 //! later flag-flip pass.
 use std::ffi::{c_int, c_void};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{anyhow, bail, Result};
@@ -17,10 +17,25 @@ use kernel_ffi::phi4 as phi4_ffi;
 use crate::oracle::OracleOutput;
 use crate::registry::{FamilyParams, ModelVariant, RegistryEntry};
 use crate::{oracle as oracle_mod, should_fetch_exact_bake, try_download_bake, validate};
+use crate::model_files::model_dir_has_raw_safetensors;
 use phi4::config::{load_config, Phi4Config};
 use phi4::rope::Phi4LongRope;
 use phi4::state::Phi4ModelState;
 use phi4::weights::Phi4Weights;
+
+fn resolve_phi4_oracle_model_id(
+    explicit_model_id: Option<&str>,
+    model_dir: &Path,
+    model_variant: &ModelVariant,
+) -> String {
+    if let Some(model_id) = explicit_model_id {
+        return model_id.to_string();
+    }
+    if model_dir_has_raw_safetensors(model_dir) {
+        return model_dir.to_string_lossy().into_owned();
+    }
+    model_variant.hf_model_id().to_string()
+}
 
 fn phi4_bootstrap_bake_variant(
     config_present: bool,
@@ -212,11 +227,8 @@ pub fn run_phi4(
             .join("oracle/phi4_oracle.py");
         let oracle_device =
             crate::resolve_oracle_device(&cli.oracle_device, entry.backend, ordinal);
-        let oracle_model = crate::resolve_phi4_oracle_model_id(
-            cli.model_id.as_deref(),
-            &cli.model_dir,
-            model_variant,
-        );
+        let oracle_model =
+            resolve_phi4_oracle_model_id(cli.model_id.as_deref(), &cli.model_dir, model_variant);
         let oracle = oracle_mod::run_phi4_oracle(
             &oracle_script,
             &oracle_model,
@@ -1043,7 +1055,7 @@ pub fn run_phi4(
 }
 
 #[cfg(test)]
-mod tests {
+mod bootstrap_tests {
     use super::phi4_bootstrap_bake_variant;
     use model_store::fetch::BakeVariant;
 
@@ -1071,6 +1083,61 @@ mod tests {
             phi4_bootstrap_bake_variant(false, false, false, false),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod oracle_tests {
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::resolve_phi4_oracle_model_id;
+    use crate::registry::ModelVariant;
+
+    #[test]
+    fn phi4_oracle_uses_hf_id_without_local_safetensors() {
+        let model_dir = unique_temp_dir("phi4-oracle-no-raw");
+        fs::create_dir_all(&model_dir).unwrap();
+
+        let resolved = resolve_phi4_oracle_model_id(None, &model_dir, &ModelVariant::Phi4_Mini);
+
+        assert_eq!(resolved, "microsoft/Phi-4-mini-instruct");
+        let _ = fs::remove_dir_all(model_dir);
+    }
+
+    #[test]
+    fn phi4_oracle_uses_local_dir_when_safetensors_present() {
+        let model_dir = unique_temp_dir("phi4-oracle-raw");
+        fs::create_dir_all(&model_dir).unwrap();
+        fs::write(model_dir.join("model.safetensors.index.json"), "{}").unwrap();
+
+        let resolved = resolve_phi4_oracle_model_id(None, &model_dir, &ModelVariant::Phi4_Mini);
+
+        assert_eq!(resolved, model_dir.to_string_lossy());
+        let _ = fs::remove_dir_all(model_dir);
+    }
+
+    #[test]
+    fn phi4_oracle_explicit_model_id_wins() {
+        let model_dir = unique_temp_dir("phi4-oracle-explicit");
+        fs::create_dir_all(&model_dir).unwrap();
+
+        let resolved = resolve_phi4_oracle_model_id(
+            Some("local-or-remote/override"),
+            &model_dir,
+            &ModelVariant::Phi4_Mini,
+        );
+
+        assert_eq!(resolved, "local-or-remote/override");
+        let _ = fs::remove_dir_all(model_dir);
+    }
+
+    fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
     }
 }
 

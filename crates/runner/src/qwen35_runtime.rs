@@ -5,12 +5,13 @@ use std::time::Instant;
 
 use crate::bakes::load_qwen35_weights;
 use crate::decode_engine::DecodeEngine;
+use crate::model_files::model_dir_has_raw_safetensors;
 use crate::prefill_engine::PrefillResult;
 use crate::registry::{Backend, GpuArch, ModelVariant, Qwen35KernelParams, VramBudget};
 use crate::tensor_bytes::{
     bf16_bytes_to_f32 as decode_bf16_le, f32_bytes_to_f32 as decode_f32_le, f32_to_bf16_bytes,
 };
-use crate::{model_dir_has_raw_safetensors, oracle, validate, Cli};
+use crate::{oracle, validate, Cli};
 
 pub(crate) struct Qwen35Startup {
     pub(crate) text_config: qwen35::config::TextConfig,

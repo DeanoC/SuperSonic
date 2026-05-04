@@ -7,6 +7,7 @@ mod gemma4_engine;
 mod gemma4_int4_engine;
 mod gemma4_runtime;
 mod llama31_engine;
+mod model_files;
 mod oracle;
 mod phi4_engine;
 mod policy;
@@ -44,7 +45,6 @@ mod tensor_bytes;
 mod validate;
 
 use std::env;
-use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -137,31 +137,6 @@ fn resolve_prompt_token_ids(cli: &Cli, tokenizer: &tokenizers::Tokenizer) -> Res
         anyhow::bail!("prompt tokenization produced 0 tokens");
     }
     Ok(prompt_ids)
-}
-
-fn model_dir_has_raw_safetensors(model_dir: &Path) -> bool {
-    let Ok(entries) = fs::read_dir(model_dir) else {
-        return false;
-    };
-    entries.filter_map(Result::ok).any(|entry| {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        name.ends_with(".safetensors") || name.ends_with(".safetensors.index.json")
-    })
-}
-
-fn resolve_phi4_oracle_model_id(
-    explicit_model_id: Option<&str>,
-    model_dir: &Path,
-    model_variant: &ModelVariant,
-) -> String {
-    if let Some(model_id) = explicit_model_id {
-        return model_id.to_string();
-    }
-    if model_dir_has_raw_safetensors(model_dir) {
-        return model_dir.to_string_lossy().into_owned();
-    }
-    model_variant.hf_model_id().to_string()
 }
 
 #[derive(Parser)]
@@ -675,61 +650,6 @@ pub(crate) struct Cli {
     ///   coverage and future research.
     #[arg(long, default_value = "cosine")]
     specprefill_algorithm: String,
-}
-
-#[cfg(test)]
-mod tests {
-    use std::fs;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    use super::resolve_phi4_oracle_model_id;
-    use crate::registry::ModelVariant;
-
-    #[test]
-    fn phi4_oracle_uses_hf_id_without_local_safetensors() {
-        let model_dir = unique_temp_dir("phi4-oracle-no-raw");
-        fs::create_dir_all(&model_dir).unwrap();
-
-        let resolved = resolve_phi4_oracle_model_id(None, &model_dir, &ModelVariant::Phi4_Mini);
-
-        assert_eq!(resolved, "microsoft/Phi-4-mini-instruct");
-        let _ = fs::remove_dir_all(model_dir);
-    }
-
-    #[test]
-    fn phi4_oracle_uses_local_dir_when_safetensors_present() {
-        let model_dir = unique_temp_dir("phi4-oracle-raw");
-        fs::create_dir_all(&model_dir).unwrap();
-        fs::write(model_dir.join("model.safetensors.index.json"), "{}").unwrap();
-
-        let resolved = resolve_phi4_oracle_model_id(None, &model_dir, &ModelVariant::Phi4_Mini);
-
-        assert_eq!(resolved, model_dir.to_string_lossy());
-        let _ = fs::remove_dir_all(model_dir);
-    }
-
-    #[test]
-    fn phi4_oracle_explicit_model_id_wins() {
-        let model_dir = unique_temp_dir("phi4-oracle-explicit");
-        fs::create_dir_all(&model_dir).unwrap();
-
-        let resolved = resolve_phi4_oracle_model_id(
-            Some("local-or-remote/override"),
-            &model_dir,
-            &ModelVariant::Phi4_Mini,
-        );
-
-        assert_eq!(resolved, "local-or-remote/override");
-        let _ = fs::remove_dir_all(model_dir);
-    }
-
-    fn unique_temp_dir(prefix: &str) -> std::path::PathBuf {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
-    }
 }
 
 /// RAII scope that enables Metal/HAL profiling when SUPERSONIC_METAL_PROFILE
