@@ -237,6 +237,31 @@ def fmt_gib(value: float | int | None) -> str:
     return f"{float(value) / GIB:.2f}"
 
 
+def build_run_env(
+    base_env: dict[str, str],
+    args: argparse.Namespace,
+    mode: BenchMode,
+    telemetry_path: Path,
+) -> dict[str, str]:
+    env = base_env.copy()
+    env["SUPERSONIC_BACKENDS"] = args.backend
+    env.pop("SUPERSONIC_MOE_ISLAND_CAP_EXPERTS", None)
+    env.pop("SUPERSONIC_MOE_ISLAND_TELEMETRY_JSON", None)
+    env.pop("SUPERSONIC_MOE_ISLAND_PREFETCH", None)
+    env.pop("SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS", None)
+    env.pop("SUPERSONIC_VMM_MOE_ISLANDS", None)
+    if args.force_moe_vmm or mode.sparse_cap is not None:
+        env["SUPERSONIC_VMM_MOE_ISLANDS"] = "1"
+    if mode.sparse_cap is not None:
+        env["SUPERSONIC_MOE_ISLAND_CAP_EXPERTS"] = str(mode.sparse_cap)
+        env["SUPERSONIC_MOE_ISLAND_TELEMETRY_JSON"] = str(telemetry_path)
+        if mode.prefetch_mode:
+            env["SUPERSONIC_MOE_ISLAND_PREFETCH"] = mode.prefetch_mode
+        if mode.prefetch_ranks:
+            env["SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS"] = mode.prefetch_ranks
+    return env
+
+
 def run_one(
     args: argparse.Namespace,
     mode: BenchMode,
@@ -246,22 +271,8 @@ def run_one(
     tmp: Path,
     warmup: bool,
 ) -> dict[str, Any]:
-    env = os.environ.copy()
-    env["SUPERSONIC_BACKENDS"] = args.backend
-    env.pop("SUPERSONIC_MOE_ISLAND_CAP_EXPERTS", None)
-    env.pop("SUPERSONIC_MOE_ISLAND_TELEMETRY_JSON", None)
-    env.pop("SUPERSONIC_MOE_ISLAND_PREFETCH", None)
-    env.pop("SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS", None)
-    if args.force_moe_vmm or mode.sparse_cap is not None:
-        env["SUPERSONIC_VMM_MOE_ISLANDS"] = "1"
     telemetry_path = tmp / f"{mode.label}-{context_tokens}.json"
-    if mode.sparse_cap is not None:
-        env["SUPERSONIC_MOE_ISLAND_CAP_EXPERTS"] = str(mode.sparse_cap)
-        env["SUPERSONIC_MOE_ISLAND_TELEMETRY_JSON"] = str(telemetry_path)
-        if mode.prefetch_mode:
-            env["SUPERSONIC_MOE_ISLAND_PREFETCH"] = mode.prefetch_mode
-        if mode.prefetch_ranks:
-            env["SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS"] = mode.prefetch_ranks
+    env = build_run_env(os.environ, args, mode, telemetry_path)
 
     cmd = [
         str(args.binary),

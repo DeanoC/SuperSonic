@@ -2,6 +2,7 @@ import importlib.util
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 
 SCRIPT = Path(__file__).parent / "gfx1100" / "bench_qwen36_longctx.py"
@@ -55,6 +56,36 @@ class Qwen36LongContextBenchTests(unittest.TestCase):
         self.assertEqual(result["generated_tokens"], 1)
         self.assertEqual(result["prompt_tokens"], 418)
         self.assertEqual(result["new_tokens"], 1)
+
+    def test_build_run_env_clears_inherited_vmm_when_force_disabled(self):
+        base_env = {
+            "SUPERSONIC_VMM_MOE_ISLANDS": "1",
+            "SUPERSONIC_MOE_ISLAND_CAP_EXPERTS": "320",
+            "SUPERSONIC_MOE_ISLAND_TELEMETRY_JSON": "old.json",
+        }
+        args = SimpleNamespace(backend="hip", force_moe_vmm=False)
+        mode = bench_qwen36_longctx.BenchMode("int4-vmm", kv_fp8=False)
+        env = bench_qwen36_longctx.build_run_env(base_env, args, mode, Path("new.json"))
+        self.assertEqual(env["SUPERSONIC_BACKENDS"], "hip")
+        self.assertNotIn("SUPERSONIC_VMM_MOE_ISLANDS", env)
+        self.assertNotIn("SUPERSONIC_MOE_ISLAND_CAP_EXPERTS", env)
+        self.assertNotIn("SUPERSONIC_MOE_ISLAND_TELEMETRY_JSON", env)
+
+    def test_build_run_env_forces_vmm_for_sparse_mode(self):
+        args = SimpleNamespace(backend="hip", force_moe_vmm=False)
+        mode = bench_qwen36_longctx.BenchMode(
+            "cap320",
+            kv_fp8=False,
+            sparse_cap=320,
+            prefetch_mode="transition",
+            prefetch_ranks="4",
+        )
+        env = bench_qwen36_longctx.build_run_env({}, args, mode, Path("telemetry.json"))
+        self.assertEqual(env["SUPERSONIC_VMM_MOE_ISLANDS"], "1")
+        self.assertEqual(env["SUPERSONIC_MOE_ISLAND_CAP_EXPERTS"], "320")
+        self.assertEqual(env["SUPERSONIC_MOE_ISLAND_TELEMETRY_JSON"], "telemetry.json")
+        self.assertEqual(env["SUPERSONIC_MOE_ISLAND_PREFETCH"], "transition")
+        self.assertEqual(env["SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS"], "4")
 
 
 if __name__ == "__main__":
