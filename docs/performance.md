@@ -47,13 +47,13 @@ self-consistent. KV-FP8 on Qwen is currently a memory feature
 
 | Model           | BF16   | INT4   | FP8r   | KV-FP8 |
 |-----------------|-------:|-------:|-------:|-------:|
-| qwen3.5-0.8b    | 125.0  | 100.0  | 100.0  |  11.8  |
-| qwen3.5-2b      |  90.9  |  90.9  |  66.7  |   7.9  |
-| qwen3.5-4b      |  47.6  |  66.7  |  33.3  |   4.5  |
-| qwen3.5-9b      |  31.3  |  38.5  |  20.8  |   2.9  |
-| gemma4-e2b      |  30.3  |  27.8  |  25.0  |  30.3  |
-| gemma4-e4b      |  18.5  |  19.6  |  15.2  |  19.2  |
-| phi4-mini       |  26.0  |  24.9  |  21.8  |  12.8  |
+| qwen3.5-0.8b    | 125.0  | 100.0  | 100.0  |  12.0  |
+| qwen3.5-2b      |  90.9  | 100.0  |  35.7  |   8.2  |
+| qwen3.5-4b      |  50.0  |  66.7  |  16.4  |   4.5  |
+| qwen3.5-9b      |  31.3  |  38.5  |  11.2  |   2.2  |
+| gemma4-e2b      |  32.3  |  33.3  |  28.6  |  34.5  |
+| gemma4-e4b      |  21.3  |  19.6  |  16.7  |  21.3  |
+| phi4-mini       |  26.2  |  25.2  |  18.8  |  12.8  |
 
 ### Cross-row notes
 
@@ -63,15 +63,21 @@ self-consistent. KV-FP8 on Qwen is currently a memory feature
   read per step. INT4 is roughly neutral or slightly slower on small
   models (Qwen 0.8B/2B, Gemma E2B, Phi-4-mini) where the per-step
   dequant overhead matches the bandwidth savings.
-- **FP8 runtime overhead** — FP8r runs 1.0–1.4× the BF16 ms/step on
-  every model. The slowdown is the LDS-LUT-driven per-element FP8
-  dequant in the matmul inner loops (`g4_fp8_dequant_weight_lut` /
-  `fp8_dequant_weight_lut`); on bandwidth-saturated configs this is
-  partly hidden by the 2× weight-bytes-saved, but on compute-tight
-  Qwen 0.8B / Gemma E2B the dequant cost wins. FP8 runtime is a
-  memory feature first (~half the weight footprint, see VRAM table
-  below) and a throughput feature only when paired with KV-FP8 on
-  Gemma 4 to free up KV headroom.
+- **FP8 runtime overhead** — split picture as of the 2026-05-03 v2
+  refresh. Smallest Qwen, Gemma 4, and Phi-4-mini stay in the
+  1.0–1.4× BF16 ms/step range originally claimed: qwen3.5-0.8b 1.25×,
+  gemma4-e2b 1.13×, gemma4-e4b 1.28×, phi4-mini 1.39×. **Qwen3.5-2B/4B/9B
+  regressed to 2.5–3.0×** (qwen3.5-2b 2.55×, qwen3.5-4b 3.05×,
+  qwen3.5-9b 2.78×) — somewhere between the original 2026-04-30
+  measurements and today, the FP8-runtime path on the larger Qwen3.5
+  models lost roughly half its throughput. Root cause is unidentified
+  and tracked separately. The slowdown shape is still the LDS-LUT-driven
+  per-element FP8 dequant in the matmul inner loops
+  (`g4_fp8_dequant_weight_lut` / `fp8_dequant_weight_lut`) but the
+  Qwen3.5-side regression suggests something extra has changed. FP8
+  runtime stays a memory feature first (~half the weight footprint,
+  see VRAM table below); the throughput-feature claim only holds when
+  paired with KV-FP8 on Gemma 4.
 - **`--fp8-runtime` cannot combine with `--int4`** on any model
   (separate kernel families). Gemma 4 `--fp8-runtime` and `--kv-fp8`
   additionally require `--batch-size=1` because the FP8 paths are
