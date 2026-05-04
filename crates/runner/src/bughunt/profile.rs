@@ -172,3 +172,57 @@ pub(crate) fn print_hal_profile_summary(
 fn bytes_to_mb(bytes: u64) -> f64 {
     bytes as f64 / (1024.0 * 1024.0)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metal_profile_report_preserves_dispatch_summary() {
+        let report = metal_profile_report(kernel_ffi::prefill_ffi::MetalProfileSnapshot {
+            total_calls: 3,
+            native_calls: 2,
+            host_calls: 1,
+            total_ms: 4.0,
+            native_ms: 3.0,
+            host_ms: 1.0,
+            entries: vec![kernel_ffi::prefill_ffi::MetalProfileEntry {
+                op: "cast".to_string(),
+                path: "native".to_string(),
+                calls: 2,
+                total_ms: 3.0,
+                max_ms: 2.0,
+            }],
+        });
+        assert_eq!(report.total_calls, 3);
+        assert_eq!(report.native_calls, 2);
+        assert_eq!(report.host_calls, 1);
+        assert_eq!(report.entries[0].mean_ms, 1.5);
+    }
+
+    #[test]
+    fn hal_profile_report_preserves_memory_summary() {
+        let report = hal_profile_report(gpu_hal::HalProfileSnapshot {
+            total_calls: 2,
+            total_ms: 5.0,
+            alloc_calls: 1,
+            alloc_bytes: 4096,
+            free_calls: 1,
+            h2d_bytes: 128,
+            d2h_bytes: 256,
+            d2d_bytes: 512,
+            memset_bytes: 1024,
+            sync_calls: 1,
+            entries: vec![gpu_hal::HalProfileEntry {
+                op: "alloc".to_string(),
+                calls: 1,
+                total_ms: 4.0,
+                max_ms: 4.0,
+                total_bytes: 4096,
+            }],
+        });
+        assert_eq!(report.alloc_calls, 1);
+        assert_eq!(report.alloc_bytes, 4096);
+        assert_eq!(report.entries[0].mean_ms, 4.0);
+    }
+}
