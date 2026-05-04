@@ -9,7 +9,6 @@ use qwen35::config::{self, TextConfig};
 use qwen35::rotary::RotaryTables;
 use qwen35::state::ModelState;
 use qwen35::weights::Qwen35Weights;
-use serde_json::Value;
 
 use crate::backend_runtime;
 use crate::decode_engine::{decode_f32_le, DecodeEngine};
@@ -21,9 +20,15 @@ use crate::validate;
 mod args;
 mod manifest;
 mod report;
+mod util;
 pub use args::*;
 use manifest::load_prompt_manifest;
 pub use report::*;
+use util::{
+    decode_bf16_le, encode_bf16_le, extract_causal_conv_window_bsd, flatten_bsh,
+    flatten_token_bsd, max_abs_delta_details, mean_abs_delta, mean_square, mean_square_delta,
+    read_buffer_all_f32, top_abs_delta_dims,
+};
 
 #[derive(Debug, Clone)]
 struct PromptGateAnalysis {
@@ -2549,174 +2554,6 @@ fn bytes_to_mb(bytes: u64) -> f64 {
 fn write_report_json(path: &Path, report: &BughuntReport) -> Result<()> {
     let text = serde_json::to_string_pretty(report).context("serialize bughunt report JSON")?;
     fs::write(path, text).with_context(|| format!("write bughunt report {}", path.display()))
-}
-
-fn mean_abs_delta(lhs: &[f32], rhs: &[f32]) -> f32 {
-    let len = lhs.len().min(rhs.len());
-    if len == 0 {
-        return 0.0;
-    }
-    lhs.iter()
-        .copied()
-        .zip(rhs.iter().copied())
-        .take(len)
-        .map(|(lhs, rhs)| (lhs - rhs).abs())
-        .sum::<f32>()
-        / len as f32
-}
-
-fn mean_square_delta(lhs: &[f32], rhs: &[f32]) -> f32 {
-    let len = lhs.len().min(rhs.len());
-    if len == 0 {
-        return 0.0;
-    }
-    lhs.iter()
-        .copied()
-        .zip(rhs.iter().copied())
-        .take(len)
-        .map(|(lhs, rhs)| {
-            let delta = lhs - rhs;
-            delta * delta
-        })
-        .sum::<f32>()
-        / len as f32
-}
-
-fn mean_square(values: &[f32]) -> f32 {
-    let sum_sq: f32 = values.iter().map(|value| value * value).sum();
-    sum_sq / values.len() as f32
-}
-
-fn max_abs_delta_details(lhs: &[f32], rhs: &[f32]) -> (usize, f32, f32, f32) {
-    let mut best = (0usize, 0.0f32, 0.0f32, 0.0f32);
-    for (index, (lhs, rhs)) in lhs.iter().copied().zip(rhs.iter().copied()).enumerate() {
-        let delta = (lhs - rhs).abs();
-        if delta > best.3 {
-            best = (index, lhs, rhs, delta);
-        }
-    }
-    best
-}
-
-fn top_abs_delta_dims(lhs: &[f32], rhs: &[f32], top_k: usize) -> Vec<TopDeltaDim> {
-    let mut dims = lhs
-        .iter()
-        .copied()
-        .zip(rhs.iter().copied())
-        .enumerate()
-        .map(|(index, (native, oracle))| TopDeltaDim {
-            index,
-            native,
-            oracle,
-            delta: (native - oracle).abs(),
-        })
-        .collect::<Vec<_>>();
-    dims.sort_by(|lhs, rhs| {
-        rhs.delta
-            .total_cmp(&lhs.delta)
-            .then_with(|| lhs.index.cmp(&rhs.index))
-    });
-    dims.truncate(top_k.min(dims.len()));
-    dims
-}
-
-fn decode_bf16_le(bytes: &[u8]) -> Vec<f32> {
-    bytes
-        .chunks_exact(2)
-        .map(|chunk| half::bf16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
-        .collect()
-}
-
-fn encode_bf16_le(values: &[f32]) -> Vec<u8> {
-    values
-        .iter()
-        .flat_map(|value| half::bf16::from_f32(*value).to_le_bytes())
-        .collect()
-}
-
-fn flatten_json_numbers(value: &Value, out: &mut Vec<f32>) {
-    match value {
-        Value::Array(values) => {
-            for value in values {
-                flatten_json_numbers(value, out);
-            }
-        }
-        Value::Number(number) => {
-            if let Some(value) = number.as_f64() {
-                out.push(value as f32);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn flatten_bsh(value: &Value) -> Option<Vec<f32>> {
-    value.as_array()?;
-    let mut out = Vec::new();
-    flatten_json_numbers(value, &mut out);
-    Some(out)
-}
-
-fn flatten_json_vector(value: &Value) -> Option<Vec<f32>> {
-    let array = value.as_array()?;
-    let mut out = Vec::with_capacity(array.len());
-    for elem in array {
-        out.push(elem.as_f64()? as f32);
-    }
-    Some(out)
-}
-
-fn flatten_token_bsd(value: &Value, position: Option<usize>) -> Option<Vec<f32>> {
-    let batch = value.as_array()?.first()?.as_array()?;
-    let token = match position {
-        Some(position) => batch.get(position)?,
-        None => batch.last()?,
-    };
-    let mut out = Vec::new();
-    flatten_json_numbers(token, &mut out);
-    Some(out)
-}
-
-fn extract_causal_conv_window_bsd(
-    value: &Value,
-    position: usize,
-    dim: usize,
-    kernel_size: usize,
-) -> Option<Vec<f32>> {
-    let batch = value.as_array()?.first()?.as_array()?;
-    if position >= batch.len() {
-        return None;
-    }
-    let pad = kernel_size.saturating_sub(1);
-    let mut out = vec![0.0f32; dim * kernel_size];
-    for tap in 0..kernel_size {
-        let src_pos = position as isize - pad as isize + tap as isize;
-        if src_pos < 0 {
-            continue;
-        }
-        let row = flatten_json_vector(batch.get(src_pos as usize)?)?;
-        if row.len() != dim {
-            return None;
-        }
-        for channel in 0..dim {
-            out[channel * kernel_size + tap] = row[channel];
-        }
-    }
-    Some(out)
-}
-
-fn read_buffer_all_f32(buf: &GpuBuffer) -> Result<Vec<f32>> {
-    let bytes = buf
-        .to_host_bytes()
-        .map_err(|e| anyhow::anyhow!("buffer D2H: {e}"))?;
-    match buf.dtype() {
-        ScalarType::BF16 => Ok(decode_bf16_le(&bytes)),
-        ScalarType::F32 => Ok(bytes
-            .chunks_exact(4)
-            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-            .collect()),
-        other => bail!("unsupported buffer dtype for debug read: {other:?}"),
-    }
 }
 
 fn compute_qwen_logits_from_hidden_row(
