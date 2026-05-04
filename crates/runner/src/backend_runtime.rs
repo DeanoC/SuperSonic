@@ -4,9 +4,10 @@ use supersonic_core::backend::{compiled_backends_display, BackendChoice};
 use crate::registry::{self, Backend, GpuArch, ModelVariant, RegistryEntry};
 
 pub(crate) struct GpuInfo {
-    #[cfg_attr(not(feature = "bughunt"), allow(dead_code))]
+    #[allow(dead_code)]
     pub(crate) arch_name: String,
     pub(crate) gpu_arch: GpuArch,
+    #[cfg_attr(feature = "bughunt", allow(dead_code))]
     pub(crate) total_vram: u64,
 }
 
@@ -126,6 +127,7 @@ pub(crate) fn lookup_registry_entry(
     );
 }
 
+#[cfg_attr(feature = "bughunt", allow(dead_code))]
 pub(crate) fn install_arch_profile(entry: &RegistryEntry) {
     // Install per-arch policy so gpu_hal::alloc dispatches correctly.
     // `MemoryArchitecture` is informational (used downstream for VRAM
@@ -146,6 +148,7 @@ pub(crate) fn install_arch_profile(entry: &RegistryEntry) {
     );
 }
 
+#[cfg_attr(feature = "bughunt", allow(dead_code))]
 fn strategy_label(s: gpu_hal::AllocStrategy) -> &'static str {
     match s {
         gpu_hal::AllocStrategy::Default => "hipMalloc / cudaMalloc / metal",

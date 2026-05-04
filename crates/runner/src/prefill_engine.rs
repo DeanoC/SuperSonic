@@ -745,8 +745,14 @@ pub struct PrefillResult {
 }
 
 pub struct LinearLayerDebugTrace {
+    #[allow(dead_code)]
+    pub normed: Vec<u8>,
     pub qkv: Vec<u8>,
     pub qkv_tail: Vec<u8>,
+    #[allow(dead_code)]
+    pub conv_window: Vec<u8>,
+    #[allow(dead_code)]
+    pub post_conv: Vec<u8>,
     pub z: Vec<u8>,
     pub packed: Vec<u8>,
     pub rec_apply: Vec<u8>,
@@ -2539,15 +2545,24 @@ fn prefill_linear_attention_layer(
         weights.int4_group_size,
     )?;
     if trace_linear_debug {
-        let bytes = scratch
+        let normed_bytes = scratch
+            .normed
+            .to_host_bytes()
+            .map_err(|e| anyhow::anyhow!("layer {idx} debug normed D2H: {e}"))?;
+        let qkv_bytes = scratch
             .proj_buf
             .to_host_bytes()
             .map_err(|e| anyhow::anyhow!("layer {idx} debug qkv D2H: {e}"))?;
+        let normed_row_bytes = hidden_dim * ScalarType::BF16.size_in_bytes();
         let row_bytes = qkv_dim * ScalarType::BF16.size_in_bytes();
-        let start = (chunk_len - 1) * row_bytes;
+        let normed_start = (chunk_len - 1) * normed_row_bytes;
+        let qkv_start = (chunk_len - 1) * row_bytes;
         *linear_debug_trace = Some(LinearLayerDebugTrace {
-            qkv: bytes[start..start + row_bytes].to_vec(),
+            normed: normed_bytes[normed_start..normed_start + normed_row_bytes].to_vec(),
+            qkv: qkv_bytes[qkv_start..qkv_start + row_bytes].to_vec(),
             qkv_tail: Vec::new(),
+            conv_window: Vec::new(),
+            post_conv: Vec::new(),
             z: Vec::new(),
             packed: Vec::new(),
             rec_apply: Vec::new(),

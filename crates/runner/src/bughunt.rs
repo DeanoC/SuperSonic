@@ -2583,453 +2583,23 @@ fn build_linear_stage_metrics(
 }
 
 fn build_full_stage_metrics(
-    runtime: &QwenBughuntRuntime,
+    _runtime: &QwenBughuntRuntime,
     layer: usize,
-    position: usize,
-    native: &prefill_engine::PrefillResult,
-    trace: &oracle::Qwen35TraceOutput,
+    _position: usize,
+    _native: &prefill_engine::PrefillResult,
+    _trace: &oracle::Qwen35TraceOutput,
 ) -> Result<Vec<StageMetricReport>> {
-    let native = native
-        .layer3_full_attn_trace
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("native full-attention debug trace missing"))?;
-    let config = &runtime.weights.config;
-    let hidden_dim = config.hidden_size;
-    let num_q_heads = config.num_attention_heads;
-    let head_dim = config.head_dim;
-    let q_dim = num_q_heads * head_dim;
-
-    let oracle_input_hidden = if layer == 0 {
-        bail!("full-attention trace requires layer >= 1");
-    } else {
-        trace
-            .decoder_layer_outputs
-            .get(layer - 1)
-            .and_then(|value| flatten_token_bsd(value, Some(position)))
-            .ok_or_else(|| {
-                anyhow::anyhow!("missing oracle input hidden for full layer {}", layer)
-            })?
-    };
-    let oracle_input_norm = compute_qwen_rms_norm_from_hidden_row(
-        &oracle_input_hidden,
-        &runtime.weights.layers[layer].input_norm_w,
-        runtime.weights.config.rms_norm_eps as f32,
-    )?;
-    let oracle_q_and_gate = require_trace_vec(
-        trace
-            .trace_full_q_and_gate_output
-            .as_ref()
-            .and_then(|value| flatten_token_bsd(value, Some(position))),
-        "trace_full_q_and_gate_output",
-    )?;
-    if oracle_q_and_gate.len() != q_dim * 2 {
-        bail!(
-            "trace_full_q_and_gate_output len {} did not match expected {}",
-            oracle_q_and_gate.len(),
-            q_dim * 2
-        );
-    }
-    let (oracle_q_proj, oracle_gate_from_q_and_gate) =
-        split_qgate_heads(&oracle_q_and_gate, num_q_heads, head_dim)?;
-    let oracle_gate = require_trace_vec(
-        trace
-            .trace_full_gate_output
-            .as_ref()
-            .and_then(|value| flatten_token_bsd(value, Some(position))),
-        "trace_full_gate_output",
-    )?;
-    let oracle_k_proj = require_trace_vec(
-        trace
-            .trace_full_k_proj_output
-            .as_ref()
-            .and_then(|value| flatten_token_bsd(value, Some(position))),
-        "trace_full_k_proj_output",
-    )?;
-    let oracle_v_proj = require_trace_vec(
-        trace
-            .trace_full_v_proj_output
-            .as_ref()
-            .and_then(|value| flatten_token_bsd(value, Some(position))),
-        "trace_full_v_proj_output",
-    )?;
-    let oracle_q_prepared = require_trace_vec(
-        trace
-            .trace_full_prepared_query_output
-            .as_ref()
-            .and_then(|value| flatten_token_bhsd(value, Some(position))),
-        "trace_full_prepared_query_output",
-    )?;
-    let oracle_k_prepared = require_trace_vec(
-        trace
-            .trace_full_prepared_key_output
-            .as_ref()
-            .and_then(|value| flatten_token_bhsd(value, Some(position))),
-        "trace_full_prepared_key_output",
-    )?;
-    let oracle_v_prepared = require_trace_vec(
-        trace
-            .trace_full_prepared_value_output
-            .as_ref()
-            .and_then(|value| flatten_token_bhsd(value, Some(position))),
-        "trace_full_prepared_value_output",
-    )?;
-    let oracle_q_rotated = require_trace_vec(
-        trace
-            .trace_full_rotated_query_output
-            .as_ref()
-            .and_then(|value| flatten_token_bhsd(value, Some(position))),
-        "trace_full_rotated_query_output",
-    )?;
-    let oracle_k_rotated = require_trace_vec(
-        trace
-            .trace_full_rotated_key_output
-            .as_ref()
-            .and_then(|value| flatten_token_bhsd(value, Some(position))),
-        "trace_full_rotated_key_output",
-    )?;
-    let oracle_attn_pregate = require_trace_vec(
-        trace
-            .trace_full_raw_attention_output
-            .as_ref()
-            .and_then(|value| flatten_token_bsd(value, Some(position))),
-        "trace_full_raw_attention_output",
-    )?;
-    let oracle_attn_output = require_trace_vec(
-        trace
-            .trace_full_attention_output
-            .as_ref()
-            .and_then(|value| flatten_token_bsd(value, Some(position))),
-        "trace_full_attention_output",
-    )?;
-    let native_q_and_gate = decode_bf16_le(&native.q_and_gate);
-    let native_q_proj = decode_bf16_le(&native.q_proj);
-    let native_gate_proj = decode_bf16_le(&native.gate_proj);
-    let (native_q_slice, native_gate_slice) =
-        split_qgate_heads(&native_q_and_gate, num_q_heads, head_dim)?;
-
-    if oracle_input_norm.len() != hidden_dim {
-        bail!(
-            "oracle input norm len {} did not match hidden size {}",
-            oracle_input_norm.len(),
-            hidden_dim
-        );
-    }
-
-    Ok(vec![
-        compare_stage(
-            "input_norm",
-            "input_norm",
-            "decoder_layer_outputs[layer-1] -> rms_norm(input_layernorm)",
-            decode_bf16_le(&native.input_norm),
-            oracle_input_norm,
-        )?,
-        compare_stage(
-            "q_and_gate",
-            "q_and_gate",
-            "trace_full_q_and_gate_output",
-            native_q_and_gate.clone(),
-            oracle_q_and_gate,
-        )?,
-        compare_stage(
-            "q_proj",
-            "q_proj",
-            "split(trace_full_q_and_gate_output).q",
-            native_q_proj.clone(),
-            oracle_q_proj,
-        )?,
-        compare_stage(
-            "gate_proj",
-            "gate_proj",
-            "trace_full_gate_output",
-            native_gate_proj.clone(),
-            oracle_gate,
-        )?,
-        compare_stage(
-            "oracle_gate_consistency",
-            "trace_full_gate_output",
-            "split(trace_full_q_and_gate_output).gate",
-            native_gate_proj.clone(),
-            oracle_gate_from_q_and_gate,
-        )?,
-        compare_stage(
-            "native_q_slice_consistency",
-            "q_proj",
-            "split(native.q_and_gate).q",
-            native_q_proj,
-            native_q_slice,
-        )?,
-        compare_stage(
-            "native_gate_slice_consistency",
-            "gate_proj",
-            "split(native.q_and_gate).gate",
-            native_gate_proj,
-            native_gate_slice,
-        )?,
-        compare_stage(
-            "k_proj",
-            "k_proj",
-            "trace_full_k_proj_output",
-            decode_bf16_le(&native.k_proj),
-            oracle_k_proj,
-        )?,
-        compare_stage(
-            "v_proj",
-            "v_proj",
-            "trace_full_v_proj_output",
-            decode_bf16_le(&native.v_proj),
-            oracle_v_proj,
-        )?,
-        compare_stage(
-            "q_prepared",
-            "q_prepared",
-            "trace_full_prepared_query_output",
-            decode_bf16_le(&native.q_prepared),
-            oracle_q_prepared,
-        )?,
-        compare_stage(
-            "k_prepared",
-            "k_prepared",
-            "trace_full_prepared_key_output",
-            decode_bf16_le(&native.k_prepared),
-            oracle_k_prepared,
-        )?,
-        compare_stage(
-            "q_rotated",
-            "q_rotated",
-            "trace_full_rotated_query_output",
-            decode_bf16_le(&native.q_rotated),
-            oracle_q_rotated,
-        )?,
-        compare_stage(
-            "k_rotated",
-            "k_rotated",
-            "trace_full_rotated_key_output",
-            decode_bf16_le(&native.k_rotated),
-            oracle_k_rotated,
-        )?,
-        compare_stage(
-            "v_prepared",
-            "v_prepared",
-            "trace_full_prepared_value_output",
-            decode_bf16_le(&native.v_prepared),
-            oracle_v_prepared,
-        )?,
-        compare_stage(
-            "attn_pregate",
-            "attn_raw",
-            "trace_full_raw_attention_output",
-            decode_bf16_le(&native.attn_raw),
-            oracle_attn_pregate,
-        )?,
-        compare_stage(
-            "attn_output",
-            "attn_output",
-            "trace_full_attention_output",
-            decode_bf16_le(&native.attn_output),
-            oracle_attn_output,
-        )?,
-    ])
+    bail!("full-attention stage metrics for layer {layer} require removed native debug taps")
 }
 
 fn build_mlp_stage_metrics(
-    runtime: &QwenBughuntRuntime,
+    _runtime: &QwenBughuntRuntime,
     layer: usize,
-    position: usize,
-    native: &prefill_engine::PrefillResult,
-    trace: &oracle::Qwen35TraceOutput,
+    _position: usize,
+    _native: &prefill_engine::PrefillResult,
+    _trace: &oracle::Qwen35TraceOutput,
 ) -> Result<Vec<StageMetricReport>> {
-    let native = native
-        .mlp_debug_trace
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("native mlp debug trace missing"))?;
-    let oracle_pre_mlp_hidden = require_trace_vec(
-        trace
-            .trace_mlp_post_attention_layernorm_input
-            .as_ref()
-            .and_then(|value| flatten_token_bsd(value, Some(position))),
-        "trace_mlp_post_attention_layernorm_input",
-    )?;
-    let oracle_post_norm = require_trace_vec(
-        trace
-            .trace_mlp_post_attention_layernorm_output
-            .as_ref()
-            .and_then(|value| flatten_token_bsd(value, Some(position))),
-        "trace_mlp_post_attention_layernorm_output",
-    )?;
-    let oracle_gate_proj = require_trace_vec(
-        trace
-            .trace_mlp_gate_proj_output
-            .as_ref()
-            .and_then(|value| flatten_token_bsd(value, Some(position))),
-        "trace_mlp_gate_proj_output",
-    )?;
-    let oracle_up_proj = require_trace_vec(
-        trace
-            .trace_mlp_up_proj_output
-            .as_ref()
-            .and_then(|value| flatten_token_bsd(value, Some(position))),
-        "trace_mlp_up_proj_output",
-    )?;
-    let oracle_swiglu = require_trace_vec(
-        trace
-            .trace_mlp_activated_hidden
-            .as_ref()
-            .and_then(|value| flatten_token_bsd(value, Some(position))),
-        "trace_mlp_activated_hidden",
-    )?;
-    let oracle_down_proj = require_trace_vec(
-        trace
-            .trace_mlp_down_proj_output
-            .as_ref()
-            .and_then(|value| flatten_token_bsd(value, Some(position))),
-        "trace_mlp_down_proj_output",
-    )?;
-    let layer_weights = &runtime.weights.layers[layer];
-    let hidden_dim = runtime.weights.config.hidden_size;
-    let intermediate_dim = runtime.weights.config.intermediate_size;
-
-    let native_pre_mlp_hidden = decode_bf16_le(&native.pre_mlp_hidden);
-    let native_post_norm = decode_bf16_le(&native.post_norm);
-    let native_gate_proj = decode_bf16_le(&native.gate_proj);
-    let native_up_proj = decode_bf16_le(&native.up_proj);
-    let native_swiglu = decode_bf16_le(&native.swiglu);
-    let native_down_proj = decode_bf16_le(&native.down_proj);
-    let host_post_norm_from_native_hidden = bf16_round_vec(&compute_qwen_rms_norm_from_hidden_row(
-        &native_pre_mlp_hidden,
-        &layer_weights.post_attn_norm_w,
-        runtime.weights.config.rms_norm_eps as f32,
-    )?);
-    let host_post_norm_from_oracle_hidden = bf16_round_vec(&compute_qwen_rms_norm_from_hidden_row(
-        &oracle_pre_mlp_hidden,
-        &layer_weights.post_attn_norm_w,
-        runtime.weights.config.rms_norm_eps as f32,
-    )?);
-
-    let host_gate_from_native_post_norm = host_projection_bf16_rounded(
-        &native_post_norm,
-        &layer_weights.gate_proj_w,
-        intermediate_dim,
-    )?;
-    let host_gate_from_oracle_post_norm = host_projection_bf16_rounded(
-        &oracle_post_norm,
-        &layer_weights.gate_proj_w,
-        intermediate_dim,
-    )?;
-    let host_up_from_native_post_norm = host_projection_bf16_rounded(
-        &native_post_norm,
-        &layer_weights.up_proj_w,
-        intermediate_dim,
-    )?;
-    let host_up_from_oracle_post_norm = host_projection_bf16_rounded(
-        &oracle_post_norm,
-        &layer_weights.up_proj_w,
-        intermediate_dim,
-    )?;
-    let host_down_from_native_swiglu =
-        host_projection_bf16_rounded(&native_swiglu, &layer_weights.down_proj_w, hidden_dim)?;
-    let host_down_from_oracle_swiglu =
-        host_projection_bf16_rounded(&oracle_swiglu, &layer_weights.down_proj_w, hidden_dim)?;
-
-    Ok(vec![
-        compare_stage(
-            "pre_mlp_hidden",
-            "pre_mlp_hidden",
-            "trace_mlp_post_attention_layernorm_input",
-            native_pre_mlp_hidden,
-            oracle_pre_mlp_hidden,
-        )?,
-        compare_stage(
-            "post_norm",
-            "post_norm",
-            "trace_mlp_post_attention_layernorm_output",
-            native_post_norm.clone(),
-            oracle_post_norm.clone(),
-        )?,
-        compare_stage(
-            "post_norm_host_from_native_hidden_consistency",
-            "post_norm",
-            "host_bf16_round(rms_norm(native_pre_mlp_hidden))",
-            native_post_norm.clone(),
-            host_post_norm_from_native_hidden,
-        )?,
-        compare_stage(
-            "post_norm_host_from_oracle_hidden_consistency",
-            "trace_mlp_post_attention_layernorm_output",
-            "host_bf16_round(rms_norm(oracle_pre_mlp_hidden))",
-            oracle_post_norm.clone(),
-            host_post_norm_from_oracle_hidden,
-        )?,
-        compare_stage(
-            "gate_proj",
-            "gate_proj",
-            "trace_mlp_gate_proj_output",
-            native_gate_proj.clone(),
-            oracle_gate_proj.clone(),
-        )?,
-        compare_stage(
-            "gate_proj_host_from_native_post_norm_consistency",
-            "gate_proj",
-            "host_bf16_round(native_post_norm @ gate_proj_w)",
-            native_gate_proj,
-            host_gate_from_native_post_norm,
-        )?,
-        compare_stage(
-            "gate_proj_host_from_oracle_post_norm_consistency",
-            "trace_mlp_gate_proj_output",
-            "host_bf16_round(oracle_post_norm @ gate_proj_w)",
-            oracle_gate_proj.clone(),
-            host_gate_from_oracle_post_norm,
-        )?,
-        compare_stage(
-            "up_proj",
-            "up_proj",
-            "trace_mlp_up_proj_output",
-            native_up_proj.clone(),
-            oracle_up_proj.clone(),
-        )?,
-        compare_stage(
-            "up_proj_host_from_native_post_norm_consistency",
-            "up_proj",
-            "host_bf16_round(native_post_norm @ up_proj_w)",
-            native_up_proj,
-            host_up_from_native_post_norm,
-        )?,
-        compare_stage(
-            "up_proj_host_from_oracle_post_norm_consistency",
-            "trace_mlp_up_proj_output",
-            "host_bf16_round(oracle_post_norm @ up_proj_w)",
-            oracle_up_proj.clone(),
-            host_up_from_oracle_post_norm,
-        )?,
-        compare_stage(
-            "swiglu",
-            "swiglu",
-            "trace_mlp_activated_hidden",
-            native_swiglu.clone(),
-            oracle_swiglu.clone(),
-        )?,
-        compare_stage(
-            "down_proj",
-            "down_proj",
-            "trace_mlp_down_proj_output",
-            native_down_proj.clone(),
-            oracle_down_proj.clone(),
-        )?,
-        compare_stage(
-            "down_proj_host_from_native_swiglu_consistency",
-            "down_proj",
-            "host_bf16_round(native_swiglu @ down_proj_w)",
-            native_down_proj,
-            host_down_from_native_swiglu,
-        )?,
-        compare_stage(
-            "down_proj_host_from_oracle_swiglu_consistency",
-            "trace_mlp_down_proj_output",
-            "host_bf16_round(oracle_swiglu @ down_proj_w)",
-            oracle_down_proj,
-            host_down_from_oracle_swiglu,
-        )?,
-    ])
+    bail!("MLP stage metrics for layer {layer} require removed native debug taps")
 }
 
 fn require_trace_vec(value: Option<Vec<f32>>, label: &str) -> Result<Vec<f32>> {
@@ -3066,33 +2636,6 @@ fn compare_stage(
         oracle_at_max,
         top_dims: top_abs_delta_dims(&native, &oracle, 6),
     })
-}
-
-fn split_qgate_heads(
-    values: &[f32],
-    num_heads: usize,
-    head_dim: usize,
-) -> Result<(Vec<f32>, Vec<f32>)> {
-    let expected = num_heads * head_dim * 2;
-    if values.len() != expected {
-        bail!(
-            "q_and_gate len {} did not match expected {} for {} heads x {} head_dim",
-            values.len(),
-            expected,
-            num_heads,
-            head_dim
-        );
-    }
-
-    let mut q = Vec::with_capacity(num_heads * head_dim);
-    let mut gate = Vec::with_capacity(num_heads * head_dim);
-    for head in 0..num_heads {
-        let base = head * head_dim * 2;
-        q.extend_from_slice(&values[base..base + head_dim]);
-        gate.extend_from_slice(&values[base + head_dim..base + head_dim * 2]);
-    }
-
-    Ok((q, gate))
 }
 
 fn split_linear_qkv(
@@ -3190,13 +2733,6 @@ fn qwen_silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
 }
 
-fn bf16_round_vec(values: &[f32]) -> Vec<f32> {
-    values
-        .iter()
-        .map(|value| half::bf16::from_f32(*value).to_f32())
-        .collect()
-}
-
 fn run_native_prefill(
     runtime: &QwenBughuntRuntime,
     prompt_ids: &[u32],
@@ -3215,8 +2751,6 @@ fn run_native_prefill(
         runtime.use_4b_kernel,
         false,
         None,
-        None,
-        None,
     )
 }
 
@@ -3226,7 +2760,7 @@ fn run_native_prefill_greedy_token_with_state(
     prompt_ids: &[u32],
 ) -> Result<u32> {
     state.reset_for_prefill_reuse();
-    prefill_engine::prefill_greedy_token(
+    let result = prefill_engine::prefill(
         &runtime.weights,
         state,
         &runtime.rotary,
@@ -3236,7 +2770,10 @@ fn run_native_prefill_greedy_token_with_state(
         runtime.prefill_chunk_size,
         false,
         runtime.use_4b_kernel,
-    )
+        false,
+        None,
+    )?;
+    Ok(DecodeEngine::greedy_sample(&result.logits))
 }
 
 fn run_native_prefill_with_trace(
@@ -3246,11 +2783,15 @@ fn run_native_prefill_with_trace(
     debug_layer: Option<usize>,
     debug_kind: Option<BughuntLayerKind>,
 ) -> Result<prefill_engine::PrefillResult> {
+    let _ = trace_position;
     let mut state = ModelState::new(&runtime.weights.config, runtime.ordinal)
         .map_err(|e| anyhow::anyhow!("native traced prefill model state init: {e}"))?;
     let (debug_linear_layer, debug_full_layer, debug_mlp_layer) =
         debug_layer_flags(debug_layer, debug_kind);
-    prefill_engine::prefill_with_trace_position(
+    if debug_full_layer.is_some() || debug_mlp_layer.is_some() {
+        bail!("native full-attention/MLP debug traces are not available in the current prefill API");
+    }
+    prefill_engine::prefill(
         &runtime.weights,
         &mut state,
         &runtime.rotary,
@@ -3262,9 +2803,6 @@ fn run_native_prefill_with_trace(
         runtime.use_4b_kernel,
         true,
         debug_linear_layer,
-        debug_full_layer,
-        debug_mlp_layer,
-        trace_position,
     )
 }
 
@@ -3276,27 +2814,15 @@ fn run_tail_replay_with_trace(
     debug_layer: Option<usize>,
     debug_kind: Option<BughuntLayerKind>,
 ) -> Result<prefill_engine::PrefillResult> {
-    let mut state = ModelState::new(&runtime.weights.config, runtime.ordinal)
-        .map_err(|e| anyhow::anyhow!("tail replay model state init: {e}"))?;
-    let (debug_linear_layer, debug_full_layer, debug_mlp_layer) =
-        debug_layer_flags(debug_layer, debug_kind);
-    prefill_engine::prefill_tail_from_hidden_with_trace_position(
-        &runtime.weights,
-        &mut state,
-        &runtime.rotary,
+    let _ = (
+        runtime,
         hidden_bf16,
         start_layer,
-        runtime.ordinal,
-        runtime.kv_chunk_size,
-        runtime.prefill_chunk_size,
-        false,
-        runtime.use_4b_kernel,
-        true,
-        debug_linear_layer,
-        debug_full_layer,
-        debug_mlp_layer,
         trace_position,
-    )
+        debug_layer,
+        debug_kind,
+    );
+    bail!("tail replay tracing is not available in the current prefill API")
 }
 
 fn run_trace_oracle(
@@ -3734,20 +3260,6 @@ fn flatten_token_bsd(value: &Value, position: Option<usize>) -> Option<Vec<f32>>
     Some(out)
 }
 
-fn flatten_token_bhsd(value: &Value, position: Option<usize>) -> Option<Vec<f32>> {
-    let batch = value.as_array()?.first()?.as_array()?;
-    let mut out = Vec::new();
-    for head in batch {
-        let tokens = head.as_array()?;
-        let token = match position {
-            Some(position) => tokens.get(position)?,
-            None => tokens.last()?,
-        };
-        flatten_json_numbers(token, &mut out);
-    }
-    Some(out)
-}
-
 fn extract_causal_conv_window_bsd(
     value: &Value,
     position: usize,
@@ -3788,27 +3300,6 @@ fn read_buffer_all_f32(buf: &GpuBuffer) -> Result<Vec<f32>> {
             .collect()),
         other => bail!("unsupported buffer dtype for debug read: {other:?}"),
     }
-}
-
-fn compute_qwen_rms_norm_from_hidden_row(
-    hidden_row: &[f32],
-    weight_buf: &GpuBuffer,
-    eps: f32,
-) -> Result<Vec<f32>> {
-    let weights = read_buffer_all_f32(weight_buf)?;
-    if weights.len() != hidden_row.len() {
-        bail!(
-            "norm weight length {} did not match hidden size {}",
-            weights.len(),
-            hidden_row.len()
-        );
-    }
-    let inv_rms = 1.0f32 / (mean_square(hidden_row) + eps).sqrt();
-    Ok(hidden_row
-        .iter()
-        .zip(weights.iter())
-        .map(|(hidden, weight)| hidden * inv_rms * (weight + 1.0))
-        .collect())
 }
 
 fn compute_qwen_logits_from_hidden_row(
