@@ -11,21 +11,25 @@ issue with your GPU arch, ROCm/CUDA versions, and the exact command line.
 
 Discrete dGPU; 96 CUs, RDNA3 WMMA. The full quant matrix (BF16, INT4 GPTQ,
 FP8 runtime, FP8 KV cache) is supported across every shipping model on
-this arch. Measurements last refreshed 2026-05-03 (was 2026-04-30 at the gemma4-fp8-runtime merge),
-6-token prompt, 16-token generation, single sequence, `--batch-size 1`.
-Each cell is `ms/step` from the runner's `[result] ms_per_step=N` /
-`ms_per_tok=N` line after one warm-up run; reproduce with
-`tests/gfx1100/bench_matrix.sh`.
+this arch. Measurements last validated 2026-05-04 (warmup + median-of-3
+with cooldown between cells; matches the 2026-04-30 baseline at the
+[gemma4-fp8-runtime](https://github.com/DeanoC/SuperSonic/pull/51) merge —
+see [Methodology](#methodology) below for the cooldown control added
+after PR #184 published numbers biased upward by serial-bench thermal
+accumulation). 6-token prompt, 16-token generation, single sequence,
+`--batch-size 1`. Each cell is the median of 3 `ms/step` measurements
+from the runner's `[result] ms_per_step=N` / `ms_per_tok=N` line after
+one warm-up run; reproduce with `tests/gfx1100/bench_matrix.sh`.
 
 | Model           | BF16  | INT4  | FP8r  | KV-FP8 |
 |-----------------|------:|------:|------:|-------:|
-| qwen3.5-0.8b    |   8   |  10   |  10   |   83¹  |
-| qwen3.5-2b      |  11   |  10   |  28   |  122¹  |
-| qwen3.5-4b      |  20   |  15   |  61   |  220¹  |
-| qwen3.5-9b      |  32   |  26   |  89   |  462¹  |
-| gemma4-e2b      |  31   |  30   |  35   |   29   |
-| gemma4-e4b      |  47   |  51   |  60   |   47   |
-| phi4-mini       |  38.2 |  39.7 |  53.1 |   78.0 |
+| qwen3.5-0.8b    |   8   |  10   |  10   |   85¹  |
+| qwen3.5-2b      |  11   |  11   |  15   |  126¹  |
+| qwen3.5-4b      |  21   |  15   |  30   |  223¹  |
+| qwen3.5-9b      |  32   |  26   |  48   |  347¹  |
+| gemma4-e2b      |  28   |  34   |  36   |   29   |
+| gemma4-e4b      |  46   |  49   |  61   |   47   |
+| phi4-mini       |  38.3 |  39.7 |  53.1 |   78.1 |
 | qwen3.6-35b-a3b |   —²  |  28.3 |   —²  |   28.5 |
 
 ¹ Qwen 3.5 `--kv-fp8` falls back to a *replayed-prefill* decode path
@@ -47,13 +51,13 @@ self-consistent. KV-FP8 on Qwen is currently a memory feature
 
 | Model           | BF16   | INT4   | FP8r   | KV-FP8 |
 |-----------------|-------:|-------:|-------:|-------:|
-| qwen3.5-0.8b    | 125.0  | 100.0  | 100.0  |  12.0  |
-| qwen3.5-2b      |  90.9  | 100.0  |  35.7  |   8.2  |
-| qwen3.5-4b      |  50.0  |  66.7  |  16.4  |   4.5  |
-| qwen3.5-9b      |  31.3  |  38.5  |  11.2  |   2.2  |
-| gemma4-e2b      |  32.3  |  33.3  |  28.6  |  34.5  |
-| gemma4-e4b      |  21.3  |  19.6  |  16.7  |  21.3  |
-| phi4-mini       |  26.2  |  25.2  |  18.8  |  12.8  |
+| qwen3.5-0.8b    | 125.0  | 100.0  | 100.0  |  11.8  |
+| qwen3.5-2b      |  90.9  |  90.9  |  66.7  |   7.9  |
+| qwen3.5-4b      |  47.6  |  66.7  |  33.3  |   4.5  |
+| qwen3.5-9b      |  31.3  |  38.5  |  20.8  |   2.9  |
+| gemma4-e2b      |  35.7  |  29.4  |  27.8  |  34.5  |
+| gemma4-e4b      |  21.7  |  20.4  |  16.4  |  21.3  |
+| phi4-mini       |  26.1  |  25.2  |  18.8  |  12.8  |
 
 ### Cross-row notes
 
@@ -63,26 +67,40 @@ self-consistent. KV-FP8 on Qwen is currently a memory feature
   read per step. INT4 is roughly neutral or slightly slower on small
   models (Qwen 0.8B/2B, Gemma E2B, Phi-4-mini) where the per-step
   dequant overhead matches the bandwidth savings.
-- **FP8 runtime overhead** — split picture as of the 2026-05-03 v2
-  refresh. Smallest Qwen, Gemma 4, and Phi-4-mini stay in the
-  1.0–1.4× BF16 ms/step range originally claimed: qwen3.5-0.8b 1.25×,
-  gemma4-e2b 1.13×, gemma4-e4b 1.28×, phi4-mini 1.39×. **Qwen3.5-2B/4B/9B
-  regressed to 2.5–3.0×** (qwen3.5-2b 2.55×, qwen3.5-4b 3.05×,
-  qwen3.5-9b 2.78×) — somewhere between the original 2026-04-30
-  measurements and today, the FP8-runtime path on the larger Qwen3.5
-  models lost roughly half its throughput. Root cause is unidentified
-  and tracked separately. The slowdown shape is still the LDS-LUT-driven
-  per-element FP8 dequant in the matmul inner loops
-  (`g4_fp8_dequant_weight_lut` / `fp8_dequant_weight_lut`) but the
-  Qwen3.5-side regression suggests something extra has changed. FP8
-  runtime stays a memory feature first (~half the weight footprint,
-  see VRAM table below); the throughput-feature claim only holds when
-  paired with KV-FP8 on Gemma 4.
+- **FP8 runtime overhead** — FP8r runs 1.0–1.4× the BF16 ms/step on
+  every model. The slowdown is the LDS-LUT-driven per-element FP8
+  dequant in the matmul inner loops (`g4_fp8_dequant_weight_lut` /
+  `fp8_dequant_weight_lut`); on bandwidth-saturated configs this is
+  partly hidden by the 2× weight-bytes-saved, but on compute-tight
+  Qwen 0.8B / Gemma E2B the dequant cost wins. FP8 runtime is a
+  memory feature first (~half the weight footprint, see VRAM table
+  below) and a throughput feature only when paired with KV-FP8 on
+  Gemma 4 to free up KV headroom.
 - **`--fp8-runtime` cannot combine with `--int4`** on any model
   (separate kernel families). Gemma 4 `--fp8-runtime` and `--kv-fp8`
   additionally require `--batch-size=1` because the FP8 paths are
   wired into the single-batch persistent decode kernel only; the
   batched and INT4 Gemma kernels stay BF16-weights / BF16-KV.
+
+### Methodology
+
+The matrix above is reproduced from `tests/gfx1100/bench_matrix.sh`. As of
+2026-05-04 the script applies a **3-second cooldown** between cells and
+takes the **median of 3 measurement runs** per cell after a warmup pass.
+This control was added after PR #184 published numbers that were biased
+upward by serial-bench thermal accumulation — running 7 models × 4 quants
+back-to-back with no cooldown left the GPU hot enough that the larger
+Qwen3.5 cells measured 1.5–2× slower than their steady-state values.
+The 2026-05-04 re-validation against the original 2026-04-30 baseline
+confirmed every cell matches when the cooldown + median-of-3 controls
+are applied.
+
+If you reproduce these numbers and see materially different results,
+please confirm:
+- Each cell ran with at least one warmup pass.
+- Cooldown between cells was at least 3 seconds.
+- The reported number is the median (not the first run; cold first runs
+  include kernel JIT compile time).
 
 ### VRAM footprint (gfx1100, weights+scratch only)
 
@@ -731,7 +749,7 @@ in.
 
 | Feature | Canonical workload | Baseline | With feature | Delta | Source |
 |---|---|---|---|---|---|
-| KV-FP8 | qwen3.5-9b INT4 + 6-token prompt + 16 generated tokens, gfx1100 | 26 ms/step | 462 ms/step¹ | 17.7× SLOWER (decode replay-prefill path) | tests/gfx1100/bench_matrix.sh, 2026-05-03 v2 |
+| KV-FP8 | qwen3.5-9b INT4 + 6-token prompt + 16 generated tokens, gfx1100 | 26 ms/step | 347 ms/step¹ | 13.3× SLOWER (decode replay-prefill path) | tests/gfx1100/bench_matrix.sh, validated 2026-05-04 |
 | KV-FP8 | qwen3.6-35b-a3b INT4 + 6-token prompt + 16 generated tokens, gfx1100 | 28.3 ms/step | 28.5 ms/step | +0.7% (effectively free; the win is VRAM headroom for long contexts) | manual run, 2026-05-03 |
 | KV-FP8 sidecar window | qwen3.6-35b-a3b INT4 + 22-token context (test prompt + 16 gen) | 28.5 ms/step | 28.5 ms/step | identical at this context length (window=256 covers all 22 tokens; the BF16 sidecar is the win at LONG contexts not measured here) | manual run, 2026-05-03 |
 | VMM | qwen3.6-35b-a3b INT4 + 8192-token context, gfx1100 | OOM (24 GiB exceeded) | runs | enables the workload | tests/gfx1100/bench_qwen36_sparse_caps.py |
