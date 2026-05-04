@@ -18,6 +18,7 @@ mod qwen35_dflash_engine;
 mod qwen35_kv_trace;
 mod qwen35_runtime;
 mod qwen35_trace;
+mod qwen35_trace_utils;
 #[path = "qwen36_moe/mod.rs"]
 mod qwen36_moe_cli;
 #[path = "qwen36_moe/decode.rs"]
@@ -79,6 +80,10 @@ use qwen35_runtime::{
 use qwen35_trace::{
     trace_component_input_layer, trace_persistent_input_layer,
     trace_persistent_linear_state_layer,
+};
+use qwen35_trace_utils::{
+    bf16_residual_sum, bf16_round, build_linear_decode_v_reference, fp8_e4m3_to_f32_host,
+    sigmoid_fast,
 };
 use registry::{Backend, FamilyParams, GpuArch, ModelFamily, ModelVariant};
 use supersonic_core::backend::{BackendChoice, BACKEND_CHOICES};
@@ -1642,37 +1647,6 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn bf16_residual_sum(lhs_bf16: &[u8], rhs_bf16: &[u8]) -> Vec<f32> {
-    lhs_bf16
-        .chunks_exact(2)
-        .zip(rhs_bf16.chunks_exact(2))
-        .map(|(l, r)| {
-            let sum = half::bf16::from_le_bytes([l[0], l[1]]).to_f32()
-                + half::bf16::from_le_bytes([r[0], r[1]]).to_f32();
-            half::bf16::from_f32(sum).to_f32()
-        })
-        .collect()
-}
-
-fn fp8_e4m3_to_f32_host(byte: u8) -> f32 {
-    let sign = (byte >> 7) & 1;
-    let exp = (byte >> 3) & 0xF;
-    let mantissa = byte & 0x7;
-    if byte == 0x7F || byte == 0xFF {
-        return 0.0;
-    }
-    let val = if exp == 0 {
-        f32::from(mantissa) / 8.0 * 1.52587890625e-2
-    } else {
-        (1.0 + f32::from(mantissa) / 8.0) * (2.0f32).powi(exp as i32 - 7)
-    };
-    if sign != 0 {
-        -val
-    } else {
-        val
-    }
-}
-
 fn trace_persistent_full_attn_layer(
     engine: &mut DecodeEngine,
     trace_layer: usize,
@@ -3186,89 +3160,6 @@ fn trace_component_linear_layer(
         "[trace-component-linear] layer={trace_layer} qkv_delta={qkv_delta:.6} z_delta={z_delta:.6} packed_delta={packed_delta:.6} q_delta={q_delta:.6} k_delta={k_delta:.6} v_delta={v_delta:.6} state_vs_tail_delta={state_vs_tail_delta:.6} v_ref_native_delta={v_ref_native_delta:.6} v_ref_replay_delta={v_ref_replay_delta:.6} beta_delta={beta_delta:.6} gexp_delta={gexp_delta:.6} rec_apply_delta={rec_apply_delta:.6} attn_delta={attn_delta:.6} gated_delta={gated_delta:.6} proj_out_delta={proj_out_delta:.6}"
     );
     Ok(())
-}
-
-fn build_linear_decode_v_reference(
-    engine: &DecodeEngine,
-    trace_layer: usize,
-    qkv_bytes: &[u8],
-) -> Result<Vec<f32>> {
-    let cfg = &engine.weights().config;
-    let layer = engine
-        .weights()
-        .layers
-        .get(trace_layer)
-        .ok_or_else(|| anyhow::anyhow!("missing weights for layer {trace_layer}"))?
-        .linear
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("layer {trace_layer} is not linear"))?;
-    let state = engine
-        .state_for_batch(0)
-        .layers
-        .get(trace_layer)
-        .ok_or_else(|| anyhow::anyhow!("missing state for layer {trace_layer}"))?;
-
-    let nk = cfg.linear_num_key_heads;
-    let nv = cfg.linear_num_value_heads;
-    let vhd = cfg.linear_value_head_dim;
-    let state_len = cfg.linear_conv_kernel_dim - 1;
-    let kernel_size = cfg.linear_conv_kernel_dim;
-    let key_dim = nk * cfg.linear_key_head_dim;
-
-    let qkv = decode_bf16_le(qkv_bytes);
-    let conv_state = decode_bf16_le(
-        &state
-            .conv_state
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("layer {trace_layer} missing conv_state"))?
-            .to_host_bytes()
-            .map_err(|e| anyhow::anyhow!("conv_state D2H: {e}"))?,
-    );
-    let conv_w = decode_bf16_le(
-        &layer
-            .conv1d_w
-            .to_host_bytes()
-            .map_err(|e| anyhow::anyhow!("conv1d_w D2H: {e}"))?,
-    );
-    let conv_channel = |channel: usize| -> f32 {
-        let weight_base = channel * kernel_size;
-        let state_base = channel * state_len;
-        let mut acc = 0.0f32;
-        for tap in 0..kernel_size {
-            let x = if tap + 1 == kernel_size {
-                qkv[channel]
-            } else if tap < state_len {
-                conv_state[state_base + tap]
-            } else {
-                0.0
-            };
-            acc += x * conv_w[weight_base + tap];
-        }
-        bf16_round(acc * sigmoid_fast(acc))
-    };
-
-    let mut v = vec![0.0f32; nv * vhd];
-    for v_head in 0..nv {
-        let v_base = key_dim * 2 + v_head * vhd;
-        for i in 0..vhd {
-            v[v_head * vhd + i] = conv_channel(v_base + i);
-        }
-    }
-    Ok(v)
-}
-
-fn sigmoid_fast(x: f32) -> f32 {
-    if x >= 0.0 {
-        let e = (-x).exp();
-        1.0 / (1.0 + e)
-    } else {
-        let e = x.exp();
-        e / (1.0 + e)
-    }
-}
-
-fn bf16_round(x: f32) -> f32 {
-    half::bf16::from_f32(x).to_f32()
 }
 
 fn trace_component_linear_state_layer(
