@@ -950,6 +950,21 @@ fn main() -> Result<()> {
             return llama31_engine::run_llama31(&cli, &model_variant, entry, ordinal, total_vram);
         }
         ModelFamily::Qwen36Moe => {
+            // SpecPrefill on Qwen3.6-MoE is research-in-progress (R1 Step 1b);
+            // route through the SpecPrefill orchestrator when the drafter flag
+            // is set so it can either bail with a clear TODO or, once wired,
+            // do cross-model drafting. Without this branch the flag would be
+            // silently ignored — the dense MoE path runs and the user gets no
+            // signal that SpecPrefill didn't engage.
+            if cli.specprefill_draft_dir.is_some() {
+                return specprefill_engine::run_specprefill(
+                    &cli,
+                    &model_variant,
+                    entry,
+                    ordinal,
+                    total_vram,
+                );
+            }
             return qwen36_moe_cli::run(&cli, entry, total_vram);
         }
         ModelFamily::Qwen35 => {}

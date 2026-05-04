@@ -102,10 +102,20 @@ pub(crate) fn validate_specprefill_flags(
                  `--backend hip` or omit --specprefill-draft-dir to use the dense path."
             );
         }
-        if !matches!(model_variant, ModelVariant::Qwen3_5_9B) {
+        // SpecPrefill is enabled for Qwen3.5-9B (Phase C/D) and Qwen3.6-35B-A3B
+        // (cross-model drafting research, R1). The 27B variant is excluded:
+        // its weights (~27 GiB FP8) don't fit on 24 GiB and the Qwen36Moe-family
+        // VMM relief is unavailable to it (it sits in `ModelFamily::Qwen35`,
+        // not `Qwen36Moe`). Qwen3.6-35B-A3B (MoE) fits via INT4 + expert VMM
+        // and is the only viable Qwen3.6 target on gfx1100.
+        if !matches!(
+            model_variant,
+            ModelVariant::Qwen3_5_9B | ModelVariant::Qwen3_6_35B_A3B
+        ) {
             anyhow::bail!(
-                "--specprefill-draft-dir is only supported on --model qwen3.5-9b in Phase C \
-                 (got {model_variant})."
+                "--specprefill-draft-dir is supported on qwen3.5-9b and qwen3.6-35b-a3b \
+                 (got {model_variant}). Qwen3.6-27B is excluded: doesn't fit on 24 GiB \
+                 and its Qwen35 family lacks VMM relief."
             );
         }
         if cli.batch_size != 1 {
