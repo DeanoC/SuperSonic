@@ -5,6 +5,9 @@ use crate::decode_engine::{DecodeEngine, DecodeStageTimings};
 use crate::oracle;
 use crate::prefill_engine;
 use crate::qwen35_component_decode::{run_qwen35_component_single_decode, Qwen35ComponentDecode};
+use crate::qwen35_decode_batch::{
+    run_qwen35_batch_decode_step, Qwen35BatchDecodeState, Qwen35BatchDecodeStep,
+};
 use crate::qwen35_decode_modes::Qwen35DecodeModes;
 use crate::qwen35_decode_traces::{
     qwen35_persistent_decode_trace_enabled, run_qwen35_persistent_decode_traces,
@@ -67,83 +70,29 @@ pub(crate) fn run_qwen35_decode_loop(
         let seqlen_offset = seqlen_start + step;
 
         if decode.cli.batch_size > 1 {
-            if qwen35_persistent_decode_trace_enabled(decode.cli) {
-                let trace_token_ids =
-                    token_history_with_next(decode.prompt_ids, &generated_ids, next_token);
-                let trace_tokens = vec![next_token; decode.cli.batch_size];
-                run_qwen35_persistent_decode_traces(
-                    decode.engine,
-                    Qwen35PersistentDecodeTrace {
-                        cli: decode.cli,
-                        trace_token_ids: trace_token_ids.as_slice(),
-                        trace_tokens: trace_tokens.as_slice(),
-                        seqlen_offset,
-                        ordinal: decode.ordinal,
-                        kv_chunk_size: decode.kv_chunk_size,
-                        use_4b_kernel: decode.use_4b_kernel,
-                        batch_mode: true,
-                    },
-                )?;
-            }
-            let (batch_logits, batch_timings) = if decode.decode_modes.replay_kv_fp8_enabled {
-                let token_ids =
-                    token_history_with_next(decode.prompt_ids, &generated_ids, next_token);
-                let logits = decode.engine.rebuild_prefill_state(&token_ids, true)?;
-                (vec![logits; decode.cli.batch_size], None)
-            } else if decode.cli.emit_stage_timings {
-                let (logits, timings) = decode
-                    .engine
-                    .decode_step_batch_with_timings(&batch_next_tokens, seqlen_offset)?;
-                (logits, Some(timings))
-            } else {
-                (
-                    decode
-                        .engine
-                        .decode_step_batch(&batch_next_tokens, seqlen_offset)?,
-                    None,
-                )
-            };
-            if let Some(timings) = batch_timings {
-                native_decode_timings.add_assign(timings);
-                native_decode_timing_steps += 1;
-            }
-
-            let logits = &batch_logits[0];
-            update_qwen35_oracle_decode_delta(
-                decode.oracle_output,
-                logits,
-                step,
-                seqlen_offset,
-                next_token,
-                Some(decode.cli.batch_size),
-                &mut max_delta,
-            );
-
-            let sampling_start = Instant::now();
-            for (bi, seq_logits) in batch_logits.iter().enumerate() {
-                batch_next_tokens[bi] = DecodeEngine::greedy_sample(seq_logits);
-            }
-            if batch_timings.is_some() {
-                native_decode_timings.host_sampling_ms +=
-                    sampling_start.elapsed().as_secs_f64() * 1000.0;
-            }
-
-            generated_ids.push(next_token);
-            if decode.trace_kv_cache_enabled {
-                let cache_token_ids = token_history(decode.prompt_ids, &generated_ids);
-                trace_kv_cache(
-                    decode.engine,
-                    &cache_token_ids,
-                    decode.ordinal,
-                    decode.kv_chunk_size,
-                    decode.cli.prefill_chunk_size,
-                    decode.use_4b_kernel,
-                    decode.cli.kv_fp8,
-                    decode.cli.batch_size,
+            next_token = run_qwen35_batch_decode_step(
+                Qwen35BatchDecodeStep {
+                    cli: decode.cli,
+                    engine: decode.engine,
+                    decode_modes: decode.decode_modes,
+                    prompt_ids: decode.prompt_ids,
+                    generated_ids: &mut generated_ids,
+                    batch_next_tokens: &mut batch_next_tokens,
+                    next_token,
                     step,
-                )?;
-            }
-            next_token = batch_next_tokens[0];
+                    seqlen_offset,
+                    oracle_output: decode.oracle_output,
+                    trace_kv_cache_enabled: decode.trace_kv_cache_enabled,
+                    ordinal: decode.ordinal,
+                    kv_chunk_size: decode.kv_chunk_size,
+                    use_4b_kernel: decode.use_4b_kernel,
+                },
+                Qwen35BatchDecodeState {
+                    max_delta: &mut max_delta,
+                    native_decode_timings: &mut native_decode_timings,
+                    native_decode_timing_steps: &mut native_decode_timing_steps,
+                },
+            )?;
         } else {
             let mut maybe_fast_token = None;
             let mut can_rescore_with_normed = false;
