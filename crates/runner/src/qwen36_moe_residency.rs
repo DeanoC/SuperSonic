@@ -15,6 +15,10 @@ use gpu_hal::{
 };
 use model_store::BakedStore;
 
+use crate::qwen36_moe_residency_pages::{
+    oldest_protected_page, page_spans, ranges_overlap, select_lru_resident_page, AsyncPageIn,
+    AsyncStagingSlot, PageSpan, PendingPage, ResidentPage, ResidentPageKey, ResidentSlice,
+};
 use crate::qwen36_moe_types::ResidentWeight;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -112,54 +116,6 @@ struct ExpertTensor {
     expert_count: usize,
     expert_bytes: usize,
     page_bytes: usize,
-}
-
-#[derive(Debug, Clone)]
-struct ResidentSlice {
-    tensor_idx: usize,
-    page_offset: usize,
-    page_len: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct ResidentPageKey {
-    tensor_idx: usize,
-    page_offset: usize,
-}
-
-#[derive(Debug, Clone)]
-struct ResidentPage {
-    tensor_idx: usize,
-    page_offset: usize,
-    page_len: usize,
-    last_used: u64,
-}
-
-struct PendingPage {
-    tensor_idx: usize,
-    page_offset: usize,
-    page_len: usize,
-    copy_len: usize,
-    last_used: u64,
-    slot_idx: usize,
-}
-
-struct AsyncStagingSlot {
-    buffer: PinnedHostBuffer,
-    event: GpuEvent,
-    pending: Option<ResidentPageKey>,
-}
-
-struct AsyncPageIn {
-    stream: GpuStream,
-    slots: Vec<AsyncStagingSlot>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct PageSpan {
-    offset: usize,
-    len: usize,
-    copy_len: usize,
 }
 
 pub struct MoeExpertResidencyManager {
@@ -873,18 +829,8 @@ impl MoeExpertResidencyManager {
     }
 
     fn evict_lru_page(&mut self) -> Result<()> {
-        let Some((victim, page)) = self
-            .resident_pages
-            .iter()
-            .min_by_key(|(key, page)| {
-                (
-                    self.protected_pages.contains_key(key),
-                    page.last_used,
-                    page.tensor_idx,
-                    page.page_offset,
-                )
-            })
-            .map(|(key, page)| (*key, page.clone()))
+        let Some((victim, page)) =
+            select_lru_resident_page(&self.resident_pages, &self.protected_pages)
         else {
             if let Some(key) = self.pending_pages.keys().next().copied() {
                 self.wait_pending_page(key)?;
@@ -938,12 +884,7 @@ impl MoeExpertResidencyManager {
 
     fn clamp_protected_pages(&mut self) {
         while self.protected_pages.len() > self.max_protected_pages {
-            let Some(victim) = self
-                .protected_pages
-                .iter()
-                .min_by_key(|(_, protected_at)| **protected_at)
-                .map(|(key, _)| *key)
-            else {
+            let Some(victim) = oldest_protected_page(&self.protected_pages) else {
                 return;
             };
             self.protected_pages.remove(&victim);
@@ -1080,28 +1021,6 @@ impl ExpertTensor {
             .max()
             .unwrap_or(0)
     }
-}
-
-fn page_spans(page_bytes: usize, offset: usize, len: usize, total_len: usize) -> Vec<PageSpan> {
-    let end = offset + len;
-    let mut cursor = offset / page_bytes * page_bytes;
-    let page_end = end.div_ceil(page_bytes) * page_bytes;
-    let mut spans = Vec::new();
-    while cursor < page_end {
-        let len = page_bytes.min(page_end - cursor);
-        let copy_len = len.min(total_len.saturating_sub(cursor));
-        spans.push(PageSpan {
-            offset: cursor,
-            len,
-            copy_len,
-        });
-        cursor += len;
-    }
-    spans
-}
-
-fn ranges_overlap(a_start: usize, a_end: usize, b_start: usize, b_end: usize) -> bool {
-    a_start < b_end && b_start < a_end
 }
 
 #[cfg(test)]
