@@ -32,6 +32,28 @@ impl Qwen36DecodeLoopState {
         self.max_new.saturating_sub(self.generated_ids.len())
     }
 
+    pub fn speculative_draft_count(&self, max_drafts: usize) -> usize {
+        max_drafts.min(self.remaining_generation_slots().saturating_sub(1))
+    }
+
+    pub fn speculative_replay_inputs(
+        &self,
+        first_token: u32,
+        result: &SpeculativeStepResult,
+    ) -> Vec<(i32, u32)> {
+        let mut replay = Vec::with_capacity(result.n_accepted + 1);
+        replay.push((self.position, first_token));
+        for (i, &tok) in result
+            .emitted_tokens
+            .iter()
+            .take(result.n_accepted)
+            .enumerate()
+        {
+            replay.push((self.position + 1 + i as i32, tok));
+        }
+        replay
+    }
+
     pub fn record_last_logits(&mut self, logits: &[u8]) {
         self.last_logits_bytes.clear();
         self.last_logits_bytes.extend_from_slice(logits);

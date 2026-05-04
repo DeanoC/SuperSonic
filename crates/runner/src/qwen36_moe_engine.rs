@@ -420,8 +420,7 @@ fn decode_text(
             // available draft count is `headroom - 1`. If headroom <=
             // 1 we can still emit 1 token via the K=0 fallback; if
             // headroom == 0 we already broke out above.
-            let headroom = loop_state.remaining_generation_slots();
-            let dynamic_k = QWEN36_NUM_SPECULATIVE_TOKENS.min(headroom.saturating_sub(1));
+            let dynamic_k = loop_state.speculative_draft_count(QWEN36_NUM_SPECULATIVE_TOKENS);
             let h_base = outputs.final_hidden_bytes.clone();
             // P2: thread spec-verify timings into the engine-level
             // accumulators so `--emit-stage-timings` reports honest
@@ -549,11 +548,7 @@ fn decode_text(
                     // Replay (j+1) chains: first_token at the current
                     // position, then the j accepted drafts at the
                     // following positions.
-                    let mut replay: Vec<(i32, u32)> = Vec::with_capacity(r.n_accepted + 1);
-                    replay.push((loop_state.position, next_token));
-                    for (i, &tok) in r.emitted_tokens.iter().take(r.n_accepted).enumerate() {
-                        replay.push((loop_state.position + 1 + i as i32, tok));
-                    }
+                    let replay = loop_state.speculative_replay_inputs(next_token, &r);
                     for &(pos, input) in &replay {
                         let t_embed_start = std::time::Instant::now();
                         let initial_hidden = lookup_embed_row(
