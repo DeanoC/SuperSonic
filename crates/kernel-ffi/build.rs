@@ -317,6 +317,11 @@ fn compile_cuda(kernel_dir: &Path, out_dir: &Path) {
             "gemma4_cuda.o",
             "building Gemma 4 CUDA bridge",
         ),
+        (
+            "qwen36_moe_bridge_cuda.cu",
+            "qwen36_moe_cuda.o",
+            "building Qwen3.6-MoE CUDA bridge",
+        ),
     ];
     let archs = detect_cuda_archs();
     if verbose_build_warnings() {
@@ -419,7 +424,9 @@ fn main() {
         "dflash_draft.hip",
         "dflash_draft_bridge.cpp",
         "qwen36_moe.hip",
+        "qwen36_moe_cuda_prelude.cuh",
         "qwen36_moe_bridge.cpp",
+        "qwen36_moe_bridge_cuda.cu",
         "qwen36_moe_persistent/helpers.cuh",
         "qwen36_moe_persistent/full_attn_phase.cuh",
         "qwen36_moe_persistent/linear_attn_phase.cuh",

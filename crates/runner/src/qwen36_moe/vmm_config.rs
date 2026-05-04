@@ -207,7 +207,16 @@ pub(crate) fn prepare_moe_runtime_config(
     backend: Backend,
     top_k: usize,
 ) -> Result<MoeRuntimeConfig> {
-    let vmm_mode = MoeExpertVmmMode::from_env()?;
+    let mut vmm_mode = MoeExpertVmmMode::from_env()?;
+    if backend == Backend::Cuda {
+        if vmm_mode == MoeExpertVmmMode::Force {
+            anyhow::bail!(
+                "SUPERSONIC_VMM_MOE_ISLANDS=1 is not supported for Qwen3.6-MoE CUDA v1; \
+                 unset it or use SUPERSONIC_VMM_MOE_ISLANDS=0"
+            );
+        }
+        vmm_mode = MoeExpertVmmMode::Disabled;
+    }
     let island_cap_experts = moe_island_cap_experts_from_env()?;
     let protected_experts = moe_island_protected_experts_from_env()?;
     if island_cap_experts.is_some() && speculative_decode {

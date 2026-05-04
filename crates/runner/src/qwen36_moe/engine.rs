@@ -24,7 +24,8 @@ use crate::qwen36_moe_cli::output::{
     print_sampling_summary,
 };
 use crate::qwen36_moe_cli::policy::{
-    resolve_context_size, validate_decode_backend, validate_persistent_kv_fp8_flags,
+    resolve_context_size, validate_cuda_v1_flags, validate_decode_backend,
+    validate_persistent_kv_fp8_flags,
 };
 use crate::qwen36_moe_cli::prompt::{
     prepare_prompt, print_prompt_summary, validate_speculative_sampling,
@@ -73,6 +74,7 @@ fn run_inner(
 
     let (context_size, context_size_source) = resolve_context_size(cli);
     validate_persistent_kv_fp8_flags(cli)?;
+    validate_cuda_v1_flags(cli, entry)?;
 
     let report = run_qwen36_moe_dry_run(
         &cli.model_dir,
@@ -184,6 +186,13 @@ fn decode_text(
 
     let bake_open_start = std::time::Instant::now();
     let bake = select_decode_bake(model_dir, fp8_runtime)?;
+    if backend == Backend::Cuda && !bake.weight_mode.is_int4() {
+        anyhow::bail!(
+            "Qwen3.6-35B-A3B CUDA v1 requires an INT4/q4km bake; selected {} from {}",
+            bake.weight_mode.display_name(),
+            bake.bake_dir.display(),
+        );
+    }
     println!(
         "  loading from bake: {} ({})",
         bake.bake_dir.display(),

@@ -20,11 +20,7 @@
 
 #pragma once
 
-#include <hip/hip_bf16.h>
-#include <hip/hip_bfloat16.h>
-#include <hip/hip_runtime.h>
-#include <math.h>
-#include <stdint.h>
+#include "../qwen36_moe_cuda_prelude.cuh"
 
 namespace qwen36_moe {
 

@@ -843,7 +843,7 @@ static REGISTRY: &[RegistryEntry] = &[
         backend: Backend::Cuda,
         arch: GpuArch::Sm86,
         vram: VramBudget {
-            fixed_bytes: 22 * GIB,
+            fixed_bytes: 20 * GIB,
             overhead_factor: 1.1,
         },
         params: FamilyParams::Qwen36Moe(Qwen36MoeKernelParams {
