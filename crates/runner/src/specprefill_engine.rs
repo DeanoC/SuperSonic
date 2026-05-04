@@ -202,11 +202,21 @@ fn run_specprefill_qwen36_moe(
     // Tokenize prompt with target's tokenizer. Vocab parity between
     // Qwen3.5 and Qwen3.6 (vocab_size=248320) is what makes cross-family
     // drafting work without a tokenizer bridge.
+    //
+    // `add_special_tokens = true` mirrors `qwen36_moe_cli::prompt::prepare_prompt`
+    // which hard-codes `tok.encode(prompt, true)`. The Qwen3.6-MoE engine
+    // re-tokenizes the prompt downstream when it loads the model, so the
+    // scorer-side tokenization MUST match the engine-side tokenization or
+    // the keep-mask we hand off would be aligned with a different token
+    // sequence than the engine processes — the keep-mask length / last-token
+    // checks in `decode_text` would then trip even on a valid prompt. We
+    // intentionally ignore `cli.prompt_no_special_tokens` here for the same
+    // reason; the MoE engine ignores it too.
     let tokenizer_path = cli.model_dir.join("tokenizer.json");
     let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
         .map_err(|e| anyhow!("load tokenizer: {e}"))?;
     let encoding = tokenizer
-        .encode(cli.prompt.as_str(), !cli.prompt_no_special_tokens)
+        .encode(cli.prompt.as_str(), true)
         .map_err(|e| anyhow!("tokenize prompt: {e}"))?;
     let prompt_ids: Vec<u32> = encoding.get_ids().to_vec();
     if prompt_ids.is_empty() {
@@ -236,6 +246,35 @@ fn run_specprefill_qwen36_moe(
         let draft_text_config = qwen35::config::load_config(draft_dir)
             .map_err(|e| anyhow!("load draft config: {e}"))?
             .text_config;
+
+        // Validate the drafter is actually Qwen3.5-0.8B before applying
+        // 0.8B-tuned kernel sizing (`drafter_params.proj_buf_floats`,
+        // `attn_scratch_floats`). Qwen3.5-0.8B is the only same-family
+        // drafter that fits on 24 GiB alongside Qwen3.6-MoE INT4 + KV;
+        // a larger drafter (4B/9B) pointed at by `--specprefill-draft-dir`
+        // would still load but be undersized for its scratch and projection
+        // buffers, leading to opaque kernel launch / memory errors deep
+        // inside the chained-decode dispatch. Fail-fast here with a clear
+        // error.
+        const QWEN35_0_8B_HIDDEN: usize = 1024;
+        const QWEN35_0_8B_LAYERS: usize = 24;
+        if draft_text_config.hidden_size != QWEN35_0_8B_HIDDEN
+            || draft_text_config.num_hidden_layers != QWEN35_0_8B_LAYERS
+        {
+            bail!(
+                "specprefill cross-family: --specprefill-draft-dir must point at \
+                 Qwen3.5-0.8B (hidden_size={}, num_hidden_layers={}). Got \
+                 hidden_size={}, num_hidden_layers={} from {}. Larger Qwen3.5 \
+                 variants don't fit on 24 GiB alongside the Qwen3.6-MoE target \
+                 and would receive undersized 0.8B-tuned kernel scratch buffers.",
+                QWEN35_0_8B_HIDDEN,
+                QWEN35_0_8B_LAYERS,
+                draft_text_config.hidden_size,
+                draft_text_config.num_hidden_layers,
+                draft_dir.display(),
+            );
+        }
+
         let t0 = Instant::now();
         let draft_weights = Qwen35Weights::load(
             draft_dir,
