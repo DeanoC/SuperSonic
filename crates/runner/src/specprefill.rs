@@ -171,6 +171,7 @@ pub fn select_kept_positions(scores: &[f32], cfg: &SelectionConfig) -> Vec<u32> 
 
 /// Convenience: number of positions a given config + length would keep.
 /// Useful for VRAM/scratch sizing without running the full selection.
+#[allow(dead_code)]
 pub fn keep_count(scores_len: usize, cfg: &SelectionConfig) -> usize {
     if scores_len == 0 {
         return 0;

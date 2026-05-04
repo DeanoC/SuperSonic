@@ -1002,6 +1002,7 @@ pub type LookaheadLayerScores = Vec<f32>;
 pub struct PrefillWithLookaheadResult {
     /// The dense prefill's last-step logits + traces (currently unused
     /// downstream; preserved for symmetry with `prefill`).
+    #[allow(dead_code)]
     pub base: PrefillResult,
     /// Per full-attention layer (in source-layer-index ascending order):
     /// F32 scores `[q_heads, lookahead_count, kv_len]` flattened. The
@@ -1009,6 +1010,7 @@ pub struct PrefillWithLookaheadResult {
     /// in the speculator.
     pub layer_scores: Vec<LookaheadLayerScores>,
     /// The number of query rows scored (passed-in `lookahead_count`; typically `paper_N + 1`).
+    #[allow(dead_code)]
     pub lookahead_count: usize,
 }
 
