@@ -1,5 +1,12 @@
 //! End-to-end parity: Qwen3.5-9B sparse SpecPrefill (keep=0.50,
-//! Qwen3.5-0.8B draft) vs the same prompt's dense prefill. Asserts:
+//! Qwen3.5-0.8B draft) vs the same prompt's dense prefill.
+//!
+//! Pinned to `--specprefill-algorithm lookahead` to keep coverage for
+//! the legacy Phase C scoring path now that the default flipped to
+//! `cosine` (Phase D). The cosine algorithm's parity bars are verified
+//! by `specprefill_qwen35_9b_cosine_parity.rs`.
+//!
+//! Asserts:
 //!  - argmax(last-prefill-step logits) matches (PRIMARY correctness gate
 //!    for greedy decoding — what determines the next generated token).
 //!  - cossim >= 0.65 (regression backstop). Phase A2 measured cossim on
@@ -202,6 +209,8 @@ fn run_parity_check(
         draft,
         "--specprefill-keep-ratio",
         keep_ratio,
+        "--specprefill-algorithm",
+        "lookahead",
     ]);
     let sparse_logits = run_supersonic_capture_logits(&sparse_args).expect("sparse run");
 
@@ -297,6 +306,8 @@ fn specprefill_qwen35_9b_keep_100_multitoken_identity() {
         &draft,
         "--specprefill-keep-ratio",
         "1.00",
+        "--specprefill-algorithm",
+        "lookahead",
     ]);
     let (_, sparse_text) =
         run_supersonic_capture_logits_and_text(&sparse_args).expect("sparse run");
