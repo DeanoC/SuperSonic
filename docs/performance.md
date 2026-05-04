@@ -753,9 +753,9 @@ in.
 | KV-FP8 | qwen3.6-35b-a3b INT4 + 6-token prompt + 16 generated tokens, gfx1100 | 28.3 ms/step | 28.5 ms/step | +0.7% (effectively free; the win is VRAM headroom for long contexts) | manual run, 2026-05-03 |
 | KV-FP8 sidecar window | qwen3.6-35b-a3b INT4 + 22-token context (test prompt + 16 gen) | 28.5 ms/step | 28.5 ms/step | identical at this context length (window=256 covers all 22 tokens; the BF16 sidecar is the win at LONG contexts not measured here) | manual run, 2026-05-03 |
 | VMM | qwen3.6-35b-a3b INT4 + 8192-token context, gfx1100 | OOM (24 GiB exceeded) | runs | enables the workload | tests/gfx1100/bench_qwen36_sparse_caps.py |
-| SpecPrefill (cosine, keep=0.50) | qwen3.5-9b BF16 + 1353-token prompt, gfx1100 | 5192 ms TTFT | 4134 ms TTFT (default `--specprefill-algorithm cosine`, shallowest layer) | **1.26× FASTER** | tests/gfx1100/bench_specprefill_cosine.sh, 2026-05-03 |
-| SpecPrefill (cosine all_max, keep=0.50) | qwen3.5-9b BF16 + 1353-token prompt, gfx1100 | 5192 ms TTFT | 4099 ms TTFT (`SUPERSONIC_SPECPREFILL_LAYERS=all_max`) | **1.27× FASTER** | tests/gfx1100/bench_specprefill_cosine.sh, 2026-05-03 |
-| SpecPrefill (lookahead, keep=0.50) | qwen3.5-9b BF16 + 1353-token prompt, gfx1100 | 5192 ms TTFT | 7895 ms TTFT (legacy `--specprefill-algorithm lookahead`) | **1.52× SLOWER**² | tests/gfx1100/bench_specprefill_cosine.sh, 2026-05-03 |
+| SpecPrefill (cosine, keep=0.50) | qwen3.5-9b BF16 + 1353-token prompt, gfx1100 | 4941 ms TTFT | 2385 ms TTFT (default `--specprefill-algorithm cosine`, shallowest layer + drafter early-exit) | **2.07× FASTER** | tests/gfx1100/bench_specprefill_cosine.sh, 2026-05-04 |
+| SpecPrefill (cosine all_max, keep=0.50) | qwen3.5-9b BF16 + 1353-token prompt, gfx1100 | 4941 ms TTFT | 4144 ms TTFT (`SUPERSONIC_SPECPREFILL_LAYERS=all_max`) | **1.19× FASTER** | tests/gfx1100/bench_specprefill_cosine.sh, 2026-05-04 |
+| SpecPrefill (lookahead, keep=0.50) | qwen3.5-9b BF16 + 1353-token prompt, gfx1100 | 4941 ms TTFT | 7846 ms TTFT (legacy `--specprefill-algorithm lookahead`) | **1.59× SLOWER**² | tests/gfx1100/bench_specprefill_cosine.sh, 2026-05-04 |
 | SpecPrefill + KV-FP8 | qwen3.5-9b BF16 + KV-FP8 + 1353-token prompt | — | rejected by validation³ | **REJECTED** | n/a (CLI guard since 2026-05-04) |
 | DFlash (B=3) | qwen3.5-9b INT4 greedy decode, gfx1100 | ~32 ms/step | ~12 ms/step (effective; 2.5-3× speedup) | 2.5-3× FASTER | docs/dflash.md M4.3 numbers |
 | MoE prefetch | qwen3.6-35b-a3b INT4 decode, gfx1100 | included | (default-on) | — | the 28.3 ms/step row above already includes prefetch — the persistent megakernel default path uses it. A/B vs no-prefetch needs `--no-persistent-decode` which falls back to a different decode path entirely. |
@@ -773,9 +773,12 @@ in.
   K/V copy fallback added in PR #177) instead of the persistent
   megakernel. Phase D (2026-05-04) replaced the default scoring
   algorithm with `cosine` — a hipfire-PFlash-style single-layer
-  cosine-similarity score that does one drafter dense prefill and a
-  single small HIP kernel launch, dropping the lookahead decode steps
-  entirely. The new default is 1.26× faster than dense at the same
+  cosine-similarity score that does one drafter prefill and a
+  single small HIP kernel launch, dropping the lookahead decode
+  steps entirely. A follow-on change in the same PR series wired in
+  a drafter early-exit (`prefill_kv_through`) so the drafter stops
+  after the chosen scoring layer and skips the rest of its model.
+  The combined default is 2.07× faster than dense at the same
   workload and also scores marginally higher on correctness (cossim
   0.820 vs 0.708 against the dense reference at keep=0.50). See
   [specprefill.md § Algorithm](specprefill.md#algorithm) and
