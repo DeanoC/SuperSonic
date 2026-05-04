@@ -99,14 +99,17 @@ for the design.
 Flags: `--specprefill-draft-dir <path>` plus tuning flags (see
 specprefill.md).
 
-**Performance note:** On gfx1100 today, SpecPrefill is NET SLOWER than
-dense prefill at measured prompt lengths (1353-token prompt, Qwen3.5-9B
-BF16: 7.7s with SpecPrefill vs 5.1s dense). The speculator's lookahead
-decode routes through the component decode path instead of the persistent
-megakernel — correctness-validated but a Phase D follow-up to reach the
-expected speedup. See [performance.md § Runtime feature impact](performance.md#runtime-feature-impact)
-footnote ². SpecPrefill is currently shipped for correctness research,
-not as a recommended production flag.
+**Performance note:** As of Phase D (2026-05-04), SpecPrefill defaults
+to cosine-similarity scoring (`--specprefill-algorithm cosine`) and is
+**1.26× faster than dense prefill** on gfx1100 at the measured prompt
+length (1353-token prompt, Qwen3.5-9B BF16: 4.13s with SpecPrefill vs
+5.19s dense, `keep_ratio=0.50`). The legacy `lookahead` algorithm
+remains available but is NET SLOWER than dense (7.90s) because its
+draft decode steps route through the component decode path instead of
+the persistent megakernel — kept for parity-test coverage and future
+research, not recommended for production. See
+[specprefill.md § Performance](specprefill.md#performance) for the full
+table.
 
 Support:
 
@@ -207,11 +210,11 @@ combo (or one feature implicitly requires the other to be off).
 
 ### ... validate the SpecPrefill correctness chain on Qwen3.5-9B (HIP)
 
-SpecPrefill ships correctness-validated but is currently NET SLOWER than
-dense prefill on gfx1100 (see [performance.md § Runtime feature impact](performance.md#runtime-feature-impact)
-footnote ²). Use the flag if you want to exercise the kernel chain or
-contribute to the speedup work; for production TTFT today, prefer dense
-prefill or DFlash decode.
+The default `cosine` algorithm runs 1.26× faster than dense prefill on
+gfx1100; the legacy `lookahead` algorithm remains slower than dense
+(see [specprefill.md § Performance](specprefill.md#performance)). For
+production TTFT use the default; pass `--specprefill-algorithm
+lookahead` only if you're actively researching the legacy path.
 
 ```bash
 supersonic --backend hip --model qwen3.5-9b --model-dir /path/to/9B \

@@ -663,6 +663,26 @@ pub(crate) struct Cli {
     /// prefill, to claw back ~1.6 GiB on a tight 24 GiB budget.
     #[arg(long, default_value_t = false)]
     specprefill_unload_draft: bool,
+
+    /// SpecPrefill scoring algorithm.
+    ///
+    /// - `cosine` (Phase D, default): per-block cosine(block_mean_K,
+    ///   last_K) from one drafter K cache. Fast path — drops the
+    ///   lookahead decode steps entirely. Default scoring layer is the
+    ///   shallowest full-attention layer; override via env var
+    ///   `SUPERSONIC_SPECPREFILL_SCORE_LAYER=N`. Per-layer aggregation
+    ///   mode controlled by env var `SUPERSONIC_SPECPREFILL_LAYERS=
+    ///   shallowest|all_max` (default `shallowest`). Measured 4134 ms
+    ///   TTFT on a 1353-token prompt vs 5192 ms dense (1.26× faster)
+    ///   on gfx1100. See docs/specprefill.md § Algorithm.
+    /// - `lookahead` (Phase C, legacy): per-layer softmax(Q·Kᵀ) over
+    ///   look-ahead query rows. Correctness-validated but NET SLOWER
+    ///   than dense prefill on gfx1100 (7895 ms in the same
+    ///   measurement) because the lookahead decode steps route through
+    ///   the component decode path. Kept available for parity-test
+    ///   coverage and future research.
+    #[arg(long, default_value = "cosine")]
+    specprefill_algorithm: String,
 }
 
 #[cfg(test)]

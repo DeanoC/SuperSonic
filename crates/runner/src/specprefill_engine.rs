@@ -17,6 +17,145 @@ use crate::registry::{FamilyParams, ModelVariant, RegistryEntry};
 use crate::specprefill::{select_kept_positions, SelectionConfig};
 use crate::Cli;
 
+fn score_blocks_cosine(
+    draft_engine: &mut DecodeEngine,
+    prompt_ids: &[u32],
+    block_size: usize,
+) -> Result<Vec<f32>> {
+    let prompt_len = prompt_ids.len();
+    if prompt_len == 0 {
+        anyhow::bail!("score_blocks_cosine: empty prompt");
+    }
+
+    // 1. Drafter dense prefill (fast megakernel path; no decode steps).
+    let _base = draft_engine.prefill_native_with_final_norm(prompt_ids)?;
+
+    // 2. Pick scoring layer + mode.
+    // Clone the config out of the borrow chain so we can re-borrow draft_engine
+    // mutably below (state_mut + cosine kernel launch).
+    let config = draft_engine.weights().config.clone();
+    let full_layer_idxs: Vec<usize> = (0..config.num_hidden_layers)
+        .filter(|&i| config.is_full_attention(i))
+        .collect();
+    if full_layer_idxs.is_empty() {
+        anyhow::bail!("score_blocks_cosine: no full-attention layers in drafter");
+    }
+    let shallowest = full_layer_idxs[0];
+    let layer_override = std::env::var("SUPERSONIC_SPECPREFILL_SCORE_LAYER")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|i| full_layer_idxs.contains(i));
+    let mode_env = std::env::var("SUPERSONIC_SPECPREFILL_LAYERS").ok();
+    let mode = mode_env.as_deref().unwrap_or("shallowest");
+
+    let layers_to_score: Vec<usize> = match mode {
+        "all_max" => full_layer_idxs.clone(),
+        // "shallowest" or any other value: single layer (override or shallowest).
+        _ => vec![layer_override.unwrap_or(shallowest)],
+    };
+
+    let n_blocks = (prompt_len + block_size - 1) / block_size;
+    let last_pos = prompt_len - 1;
+    let kv_heads = config.num_key_value_heads;
+    let head_dim = config.head_dim;
+    let ordinal = draft_engine.ordinal();
+
+    // 3. Per-layer cosine launch; max-reduce across layers element-wise.
+    //
+    // K access has to be virtual-aware. With VMM KV enabled (the default
+    // on HIP whenever `vmm_is_supported` and `SUPERSONIC_VMM_KV != 0`),
+    // the drafter's K is held in `virtual_kv_cache_k` and `kv_cache_k`
+    // is None. Mirror the lookahead path's strategy: prefer the dense
+    // GpuBuffer when it exists (zero-copy), otherwise materialize a
+    // fresh `[1, kv_heads, cap, head_dim]` BF16 GpuBuffer and copy from
+    // the virtual backing in one D2D (~kv_heads × cap × head_dim × 2
+    // bytes; ~1-2 MB for the 0.8B drafter — negligible vs TTFT).
+    let mut block_scores = vec![f32::NEG_INFINITY; n_blocks];
+    for li in &layers_to_score {
+        let cap = draft_engine.state_mut().layers[*li].kv_capacity();
+        let materialized_k: Option<gpu_hal::GpuBuffer> = {
+            let layer = &draft_engine.state_mut().layers[*li];
+            if layer.kv_cache_k.is_some() {
+                None
+            } else if layer.has_virtual_kv_cache() {
+                let src_ptr = layer.kv_cache_k_offset_ptr(0).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "score_blocks_cosine: layer {li}: virtual K cache pointer missing after prefill"
+                    )
+                })?;
+                let bytes_total = kv_heads * cap * head_dim * 2; // BF16
+                let mut buf = gpu_hal::GpuBuffer::zeros(
+                    ordinal,
+                    gpu_hal::ScalarType::BF16,
+                    &[1, kv_heads, cap, head_dim],
+                )
+                .map_err(|e| {
+                    anyhow::anyhow!("score_blocks_cosine: layer {li}: kv_k_contig alloc: {e}")
+                })?;
+                gpu_hal::copy_d2d(ordinal, buf.as_mut_ptr(), src_ptr, bytes_total).map_err(
+                    |e| anyhow::anyhow!("score_blocks_cosine: layer {li}: kv_k_contig copy: {e}"),
+                )?;
+                Some(buf)
+            } else {
+                anyhow::bail!(
+                    "score_blocks_cosine: layer {li}: K cache missing after prefill"
+                );
+            }
+        };
+        let k_kernel_input: &gpu_hal::GpuBuffer = if let Some(b) = materialized_k.as_ref() {
+            b
+        } else {
+            draft_engine.state_mut().layers[*li]
+                .kv_cache_k
+                .as_ref()
+                .expect("kv_cache_k present on this branch")
+        };
+
+        let mut scores_buf =
+            gpu_hal::GpuBuffer::zeros(ordinal, gpu_hal::ScalarType::F32, &[n_blocks])
+                .map_err(|e| anyhow::anyhow!("scores alloc layer {li}: {e}"))?;
+
+        kernel_ffi::prefill_ffi::pflash_cosine_score(
+            ordinal,
+            gpu_hal::ScalarType::BF16,
+            prompt_len,
+            kv_heads,
+            cap,
+            head_dim,
+            block_size,
+            last_pos,
+            k_kernel_input,
+            &mut scores_buf,
+        )?;
+
+        let bytes = scores_buf
+            .to_host_bytes()
+            .map_err(|e| anyhow::anyhow!("scores d2h layer {li}: {e}"))?;
+        let layer_scores: Vec<f32> = bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+
+        for (i, s) in layer_scores.iter().enumerate() {
+            if *s > block_scores[i] {
+                block_scores[i] = *s;
+            }
+        }
+    }
+
+    // 4. Project per-block scores → per-token vector.
+    let mut importance = vec![0.0_f32; prompt_len];
+    for b in 0..n_blocks {
+        let start = b * block_size;
+        let end = ((b + 1) * block_size).min(prompt_len);
+        for pos in start..end {
+            importance[pos] = block_scores[b];
+        }
+    }
+
+    Ok(importance)
+}
+
 pub fn run_specprefill(
     cli: &Cli,
     model_variant: &ModelVariant,
@@ -111,7 +250,9 @@ pub fn run_specprefill(
         t0.elapsed().as_millis()
     );
 
-    // Build draft decode engine.
+    // Build draft decode engine. lookahead_count is used by both the
+    // legacy lookahead path AND for sizing the draft engine's decode
+    // context (in case the cosine path also exercises decode in future).
     let lookahead_count = cli.specprefill_lookahead.unwrap_or(4) + 1;
     let draft_attn_scratch = qwen35::scratch::required_attn_scratch_floats(
         draft_text_config.num_attention_heads,
@@ -132,42 +273,59 @@ pub fn run_specprefill(
     )?;
     draft_engine.set_decode_context_limit(prompt_ids.len() + lookahead_count);
 
-    // ---- Speculator phase: prefill + lookahead + per-layer attention export ----
+    // ---- Speculator phase: route on --specprefill-algorithm ----
+    let block_size_for_scoring = cli.specprefill_chunk_size.unwrap_or(32);
     let speculator_start = Instant::now();
-    let look = draft_engine.prefill_with_lookahead_attention(&prompt_ids, lookahead_count)?;
-    eprintln!(
-        "[specprefill] speculator done in {:.0}ms (full layers={})",
-        speculator_start.elapsed().as_millis(),
-        look.layer_scores.len(),
-    );
-
-    // ---- Aggregate per-token importance host-side ----
-    // Formula (paper §3.3, oracle/specprefill_oracle.py):
-    // max over heads → max over layers → mean over lookahead steps.
-    let t = prompt_ids.len();
-    let q_heads = draft_text_config.num_attention_heads;
-    let mut importance = vec![0.0_f32; t];
-    for q_row in 0..lookahead_count {
-        let mut row = vec![f32::NEG_INFINITY; t];
-        for layer_scores in &look.layer_scores {
-            // [q_heads, lookahead_count, t] flat
-            for q_head in 0..q_heads {
-                let base = (q_head * lookahead_count + q_row) * t;
-                for k_pos in 0..t {
-                    let v = layer_scores[base + k_pos];
-                    if v > row[k_pos] {
-                        row[k_pos] = v;
+    let importance: Vec<f32> = match cli.specprefill_algorithm.as_str() {
+        "cosine" => {
+            let imp = score_blocks_cosine(
+                &mut draft_engine,
+                &prompt_ids,
+                block_size_for_scoring,
+            )?;
+            eprintln!(
+                "[specprefill] speculator (cosine) done in {:.0}ms (block_size={})",
+                speculator_start.elapsed().as_millis(),
+                block_size_for_scoring,
+            );
+            imp
+        }
+        _ => {
+            // Legacy Phase C lookahead path.
+            let look = draft_engine
+                .prefill_with_lookahead_attention(&prompt_ids, lookahead_count)?;
+            eprintln!(
+                "[specprefill] speculator (lookahead) done in {:.0}ms (full layers={})",
+                speculator_start.elapsed().as_millis(),
+                look.layer_scores.len(),
+            );
+            // Aggregation: max over heads → max over layers → mean over lookahead steps.
+            let t = prompt_ids.len();
+            let q_heads = draft_text_config.num_attention_heads;
+            let mut imp = vec![0.0_f32; t];
+            for q_row in 0..lookahead_count {
+                let mut row = vec![f32::NEG_INFINITY; t];
+                for layer_scores in &look.layer_scores {
+                    for q_head in 0..q_heads {
+                        let base = (q_head * lookahead_count + q_row) * t;
+                        for k_pos in 0..t {
+                            let v = layer_scores[base + k_pos];
+                            if v > row[k_pos] {
+                                row[k_pos] = v;
+                            }
+                        }
                     }
                 }
+                for k_pos in 0..t {
+                    imp[k_pos] += row[k_pos];
+                }
             }
+            for v in imp.iter_mut() {
+                *v /= lookahead_count as f32;
+            }
+            imp
         }
-        for k_pos in 0..t {
-            importance[k_pos] += row[k_pos];
-        }
-    }
-    for v in importance.iter_mut() {
-        *v /= lookahead_count as f32;
-    }
+    };
 
     // ---- Selection ----
     let kept_positions: Vec<u32> = select_kept_positions(&importance, &cfg);
@@ -188,8 +346,8 @@ pub fn run_specprefill(
     eprintln!(
         "[specprefill] kept {}/{} tokens ({:.1}%)",
         kept_positions.len(),
-        t,
-        100.0 * kept_positions.len() as f32 / t as f32
+        prompt_ids.len(),
+        100.0 * kept_positions.len() as f32 / prompt_ids.len() as f32
     );
 
     // ---- (Optional) unload draft to recover VRAM ----

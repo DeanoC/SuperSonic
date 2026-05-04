@@ -706,6 +706,20 @@ unsafe extern "C" {
         scores: *mut c_void,
     ) -> c_int;
 
+    fn supersonic_qwen35_hip_pflash_cosine_score(
+        dtype: c_int,
+        device_ordinal: usize,
+        n_pos: usize,
+        kv_heads: usize,
+        cap: usize,
+        head_dim: usize,
+        block_size: usize,
+        n_blocks: usize,
+        last_pos: usize,
+        k_cache: *const c_void,
+        scores: *mut c_void,
+    ) -> c_int;
+
     fn supersonic_qwen35_hip_transpose_shd_hsd(
         dtype: c_int,
         device_ordinal: usize,
@@ -3027,6 +3041,102 @@ pub fn lookahead_attention_scores(
         return Err(ffi_error(format!(
             "lookahead_attention_scores failed: {status}"
         )));
+    }
+    Ok(())
+}
+
+/// SpecPrefill (Phase D PFlash-style): per-block cosine similarity
+/// between the block-mean K vector and the K at the last prompt
+/// position, computed from the drafter's K cache after dense prefill.
+/// Replaces the lookahead-attention scoring of Phase C with a single
+/// kernel pass that doesn't need decode steps.
+///
+/// Layout: `k_cache` is the drafter's full-attention K cache for one
+/// layer, BF16 with shape `[1, kv_heads, cap, head_dim]` (the standard
+/// `qwen35::state::LayerState::kv_cache_k` allocation).
+///
+/// `last_pos` must be in `[0, n_pos)` and `cap >= n_pos`. The kernel
+/// reads positions `[0, n_pos)` only — the prompt context, not any
+/// decode-side appends.
+///
+/// Output: `scores` is F32 of length `n_blocks` where
+/// `n_blocks = (n_pos + block_size - 1) / block_size`. Each cell is
+/// the cosine in `[-1, 1]`.
+pub fn pflash_cosine_score(
+    ordinal: usize,
+    dtype: ScalarType,
+    n_pos: usize,
+    kv_heads: usize,
+    cap: usize,
+    head_dim: usize,
+    block_size: usize,
+    last_pos: usize,
+    k_cache: &GpuBuffer,
+    scores: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if !matches!(dtype, ScalarType::BF16 | ScalarType::F16) {
+        return Err(ffi_error(format!(
+            "pflash_cosine_score: dtype must be ScalarType::BF16 or ScalarType::F16, got {:?}",
+            dtype
+        )));
+    }
+    if n_pos == 0 || kv_heads == 0 || cap == 0 || head_dim == 0 || block_size == 0 {
+        return Err(ffi_error(
+            "pflash_cosine_score: all dimensions must be > 0".into(),
+        ));
+    }
+    if last_pos >= n_pos {
+        return Err(ffi_error(format!(
+            "pflash_cosine_score: last_pos ({last_pos}) must be < n_pos ({n_pos})"
+        )));
+    }
+    if cap < n_pos {
+        return Err(ffi_error(format!(
+            "pflash_cosine_score: cap ({cap}) must be >= n_pos ({n_pos})"
+        )));
+    }
+    if scores.dtype() != ScalarType::F32 {
+        return Err(ffi_error(format!(
+            "pflash_cosine_score: scores must be ScalarType::F32, got {:?}",
+            scores.dtype()
+        )));
+    }
+    let n_blocks = (n_pos + block_size - 1) / block_size;
+    if scores.elem_count() < n_blocks {
+        return Err(ffi_error(format!(
+            "pflash_cosine_score: scores has {} elems, expected >= {}",
+            scores.elem_count(),
+            n_blocks
+        )));
+    }
+    let expected_k = kv_heads * cap * head_dim;
+    if k_cache.elem_count() < expected_k {
+        return Err(ffi_error(format!(
+            "pflash_cosine_score: k_cache has {} elems, expected >= {} ([1, {}, {}, {}])",
+            k_cache.elem_count(),
+            expected_k,
+            kv_heads,
+            cap,
+            head_dim
+        )));
+    }
+    let status = unsafe {
+        supersonic_qwen35_hip_pflash_cosine_score(
+            dtype.kernel_dtype_code(),
+            ordinal,
+            n_pos,
+            kv_heads,
+            cap,
+            head_dim,
+            block_size,
+            n_blocks,
+            last_pos,
+            k_cache.as_ptr(),
+            scores.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(ffi_error(format!("pflash_cosine_score failed: {status}")));
     }
     Ok(())
 }

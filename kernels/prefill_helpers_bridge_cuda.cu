@@ -665,6 +665,15 @@ extern "C" int supersonic_qwen35_hip_lookahead_attention_scores(
     return 99;
 }
 
+extern "C" int supersonic_qwen35_hip_pflash_cosine_score(
+    int /*dtype*/, size_t /*device_ordinal*/,
+    size_t /*n_pos*/, size_t /*kv_heads*/, size_t /*cap*/, size_t /*head_dim*/,
+    size_t /*block_size*/, size_t /*n_blocks*/, size_t /*last_pos*/,
+    const void* /*k_cache*/, void* /*scores*/
+) {
+    return 99; // not implemented on this backend (HIP-only Phase D)
+}
+
 extern "C" int supersonic_qwen35_hip_transpose_shd_hsd(
     int dtype, size_t device_ordinal,
     size_t S, size_t H, size_t D,
