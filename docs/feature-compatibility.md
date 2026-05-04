@@ -41,7 +41,10 @@ bytes), halving KV VRAM. Optional sidecar window keeps the most-recent
 N tokens in BF16 for higher decode quality. Used when context length
 × layers × heads makes the KV cache the binding VRAM constraint.
 
-Flags: `--kv-fp8`, `--kv-fp8-sidecar-window <N>` (Qwen3.6-MoE only).
+Flags: `--kv-fp8`. The BF16 sidecar window is enabled by default for
+Qwen3.6-MoE; window size can be overridden via env var
+`SUPERSONIC_DEBUG_KV_FP8_BF16_SIDECAR_WINDOW=N` (debug knob, not a
+stable CLI surface).
 
 Support:
 
@@ -51,7 +54,7 @@ Support:
 | qwen3.5-2b       |    ✅   |   ✅    |  ✅¹  |  ✅   |    —     |
 | qwen3.5-4b       |    ✅   |   ✅    |  ✅¹  |  ✅   |    —     |
 | qwen3.5-9b       |    ✅   |   ✅    |  ✅¹  |  ✅   |    —     |
-| qwen3.6-35b-a3b  |    —    |    —    |   —   |   —   |    —     |
+| qwen3.6-35b-a3b  |   ✅⁴   |    —    |   —   |   —   |    —     |
 | gemma4-e2b       |   ✅²   |    —    |   —   |   —   |    —     |
 | gemma4-e4b       |   ✅²   |    —    |   —   |   —   |    —     |
 | phi4-mini        |    ✅   |   ✅    |  ✅²  |  ✅   |    —     |
@@ -61,6 +64,11 @@ Support:
 ² Gemma 4 KV-FP8 requires `--batch-size 1`, cannot combine with `--int4`.
    Phi-4-mini gfx942 KV-FP8 uses the correctness-first single-block fallback.
 ³ Llama 3.1 8B KV-FP8 only validated alongside `--int8` and certified-KV.
+⁴ qwen3.6-35b-a3b KV-FP8 requires --int4 (the only quant lane shipped
+  for this model). Sidecar window is configured via env var
+  `SUPERSONIC_DEBUG_KV_FP8_BF16_SIDECAR_WINDOW=N`, NOT a CLI flag —
+  the earlier "--kv-fp8-sidecar-window" mention in this doc was wrong.
+  Default sidecar enables full BF16 coverage for the resident KV slice.
 
 ### 3. VMM (virtual KV cache)
 
@@ -90,6 +98,15 @@ for the design.
 
 Flags: `--specprefill-draft-dir <path>` plus tuning flags (see
 specprefill.md).
+
+**Performance note:** On gfx1100 today, SpecPrefill is NET SLOWER than
+dense prefill at measured prompt lengths (1353-token prompt, Qwen3.5-9B
+BF16: 7.7s with SpecPrefill vs 5.1s dense). The speculator's lookahead
+decode routes through the component decode path instead of the persistent
+megakernel — correctness-validated but a Phase D follow-up to reach the
+expected speedup. See [performance.md § Runtime feature impact](performance.md#runtime-feature-impact)
+footnote ². SpecPrefill is currently shipped for correctness research,
+not as a recommended production flag.
 
 Support:
 
@@ -164,9 +181,9 @@ combo (or one feature implicitly requires the other to be off).
 |                  | Quant | KV-FP8 | VMM | SpecPrefill | DFlash | MoE prefetch | Certified KV |
 |------------------|:-----:|:------:|:---:|:-----------:|:------:|:------------:|:------------:|
 | **Quant**        |   —   |   ✅¹  | ✅  |     ✅      |   ✅   |     ✅       |     ✅²      |
-| **KV-FP8**       |  ✅¹  |   —    | ✅³ |     TBM     |   ❌   |     ✅       |     ✅       |
+| **KV-FP8**       |  ✅¹  |   —    | ✅³ |     ❌⁵     |   ❌   |     ✅       |     ✅       |
 | **VMM**          |  ✅   |   ✅³  |  —  |     —⁴      |   —⁴   |     ✅       |     —⁴       |
-| **SpecPrefill**  |  ✅   |   TBM  | —⁴  |      —      |   ❌   |     —⁴       |     —⁴       |
+| **SpecPrefill**  |  ✅   |   ❌⁵  | —⁴  |      —      |   ❌   |     —⁴       |     —⁴       |
 | **DFlash**       |  ✅   |   ❌   | —⁴  |     ❌      |   —    |     —⁴       |     —⁴       |
 | **MoE prefetch** |  ✅   |   ✅   | ✅  |     —⁴      |   —⁴   |      —       |     —⁴       |
 | **Certified KV** |  ✅²  |   ✅   | —⁴  |     —⁴      |   —⁴   |     —⁴       |      —       |
@@ -178,13 +195,21 @@ combo (or one feature implicitly requires the other to be off).
 ⁴ Dash means "no validated combo exists today" — the underlying
   features apply to disjoint model families (e.g. SpecPrefill is
   Qwen3.5-9B; MoE prefetch is Qwen3.6-MoE).
+⁵ SpecPrefill + KV-FP8 trips a runtime error on the first decode step:
+  the BF16 step-copy fallback added in PR #177 to unblock SpecPrefill
+  on HIP requires BF16 dst buffers, but --kv-fp8 makes them U8 (FP8).
+  Validation should reject the combo until the fallback grows an
+  FP8-quantising path.
 
 ## Picker recipes — "I want to ..."
 
-### ... reduce time-to-first-token on a long Qwen3.5-9B prompt (HIP)
+### ... validate the SpecPrefill correctness chain on Qwen3.5-9B (HIP)
 
-Use SpecPrefill at default keep ratio. The 0.8B draft amortizes
-selection in ~700 ms; target then prefills only ~50% of the prompt.
+SpecPrefill ships correctness-validated but is currently NET SLOWER than
+dense prefill on gfx1100 (see [performance.md § Runtime feature impact](performance.md#runtime-feature-impact)
+footnote ²). Use the flag if you want to exercise the kernel chain or
+contribute to the speedup work; for production TTFT today, prefer dense
+prefill or DFlash decode.
 
 ```bash
 supersonic --backend hip --model qwen3.5-9b --model-dir /path/to/9B \
@@ -204,8 +229,10 @@ supersonic --backend hip --model qwen3.5-9b --model-dir /path/to/9B \
 
 ### ... fit Qwen3.6-35B-A3B in 24 GiB on gfx1100
 
-Use INT4 GPTQ + VMM (default ON for this model on HIP). KV-FP8
-optional for additional KV headroom on long contexts.
+Use INT4 GPTQ + VMM (default ON for this model on HIP). For long
+contexts, add `--kv-fp8` for additional KV headroom (validated
+2026-05-03; ~1% step-time overhead, see
+[performance.md § Runtime feature impact](performance.md#runtime-feature-impact)).
 
 ```bash
 supersonic --backend hip --model qwen3.6-35b-a3b \
