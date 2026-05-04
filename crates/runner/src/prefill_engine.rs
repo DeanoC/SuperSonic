@@ -1001,6 +1001,271 @@ pub fn prefill_kept(
     )
 }
 
+#[allow(dead_code)]
+fn copy_bf16_row(
+    ordinal: usize,
+    source: &GpuBuffer,
+    row: usize,
+    cols: usize,
+    label: &str,
+) -> Result<Vec<u8>> {
+    let bytes = cols * ScalarType::BF16.size_in_bytes();
+    let row_buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, cols])
+        .map_err(|e| anyhow::anyhow!("{label} alloc: {e}"))?;
+    copy_d2d_batched(
+        ordinal,
+        row_buf.as_ptr() as *mut c_void,
+        source.offset_ptr(row * bytes),
+        bytes,
+    )
+    .map_err(|e| anyhow::anyhow!("{label} copy: {e}"))?;
+    row_buf
+        .to_host_bytes()
+        .map_err(|e| anyhow::anyhow!("{label} D2H: {e}"))
+}
+
+#[allow(dead_code)]
+pub fn prefill_tail_from_hidden_with_trace_position(
+    weights: &Qwen35Weights,
+    state: &mut ModelState,
+    rotary: &RotaryTables,
+    hidden_bf16: &[u8],
+    start_layer: usize,
+    ordinal: usize,
+    kv_chunk_size: usize,
+    _prefill_chunk_size: usize,
+    kv_fp8: bool,
+    use_4b_kernel: bool,
+    trace_layers: bool,
+    debug_linear_layer: Option<usize>,
+    debug_full_layer: Option<usize>,
+    debug_mlp_layer: Option<usize>,
+    trace_position: Option<usize>,
+) -> Result<PrefillResult> {
+    let config = &weights.config;
+    let hidden_dim = config.hidden_size;
+    let row_bytes = hidden_dim * ScalarType::BF16.size_in_bytes();
+    if row_bytes == 0 || hidden_bf16.is_empty() || hidden_bf16.len() % row_bytes != 0 {
+        anyhow::bail!(
+            "tail replay hidden bytes length {} is not a non-empty multiple of hidden row bytes {}",
+            hidden_bf16.len(),
+            row_bytes
+        );
+    }
+    if start_layer >= config.num_hidden_layers {
+        anyhow::bail!(
+            "tail replay start_layer {} out of range (num_hidden_layers={})",
+            start_layer,
+            config.num_hidden_layers
+        );
+    }
+    if debug_linear_layer.is_some() || debug_full_layer.is_some() || debug_mlp_layer.is_some() {
+        anyhow::bail!("tail replay debug stage traces are not available in the current prefill API");
+    }
+
+    let seq_len = hidden_bf16.len() / row_bytes;
+    let trace_row = trace_position.unwrap_or(seq_len - 1);
+    if trace_row >= seq_len {
+        anyhow::bail!(
+            "tail replay trace position {} out of range for sequence length {}",
+            trace_row,
+            seq_len
+        );
+    }
+
+    let mut scratch = PrefillScratch::new(config, seq_len, ordinal)?;
+    copy_h2d(
+        ordinal,
+        scratch.hidden.as_ptr() as *mut c_void,
+        hidden_bf16.as_ptr() as *const c_void,
+        hidden_bf16.len(),
+    )
+    .map_err(|e| anyhow::anyhow!("tail replay hidden upload: {e}"))?;
+
+    let mut layer_attn_trace = if trace_layers {
+        Some(Vec::with_capacity(config.num_hidden_layers - start_layer))
+    } else {
+        None
+    };
+    let mut layer_post_attn_norm_trace = if trace_layers {
+        Some(Vec::with_capacity(config.num_hidden_layers - start_layer))
+    } else {
+        None
+    };
+    let mut layer_mlp_swiglu_trace = if trace_layers {
+        Some(Vec::with_capacity(config.num_hidden_layers - start_layer))
+    } else {
+        None
+    };
+    let mut layer_mlp_out_trace = if trace_layers {
+        Some(Vec::with_capacity(config.num_hidden_layers - start_layer))
+    } else {
+        None
+    };
+    let mut layer_hidden_trace = if trace_layers {
+        Some(Vec::with_capacity(config.num_hidden_layers - start_layer))
+    } else {
+        None
+    };
+
+    let kern = config.linear_conv_kernel_dim;
+    let qkv_dim = config.linear_num_key_heads * config.linear_key_head_dim * 2
+        + config.linear_num_value_heads * config.linear_value_head_dim;
+    let mut chunk_conv_tail: Vec<Option<GpuBuffer>> = (0..config.num_hidden_layers)
+        .map(|i| {
+            if config.is_full_attention(i) {
+                Ok(None)
+            } else {
+                GpuBuffer::zeros(ordinal, ScalarType::BF16, &[qkv_dim, kern - 1])
+                    .map(Some)
+                    .map_err(|e| anyhow::anyhow!("tail replay conv_tail alloc: {e}"))
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    for idx in start_layer..config.num_hidden_layers {
+        rms_norm_rows_model(
+            config,
+            ordinal,
+            seq_len,
+            hidden_dim,
+            &scratch.hidden,
+            &weights.layers[idx].input_norm_w,
+            &mut scratch.normed,
+            &format!("tail replay layer {idx} input norm"),
+        )?;
+
+        if config.is_full_attention(idx) {
+            prefill_full_attention_layer(
+                weights,
+                state,
+                rotary,
+                &mut scratch,
+                config,
+                idx,
+                seq_len,
+                0,
+                ordinal,
+                kv_chunk_size,
+                /* commit_kv_filled */ true,
+                None,
+            )?;
+        } else {
+            let mut no_debug_trace = None;
+            prefill_linear_attention_layer(
+                weights,
+                state,
+                &mut scratch,
+                config,
+                idx,
+                seq_len,
+                0,
+                true,
+                chunk_conv_tail[idx].as_mut().unwrap(),
+                ordinal,
+                false,
+                &mut no_debug_trace,
+            )?;
+        }
+
+        if let Some(trace) = layer_attn_trace.as_mut() {
+            trace.push(copy_bf16_row(
+                ordinal,
+                &scratch.hidden,
+                trace_row,
+                hidden_dim,
+                &format!("tail replay attn trace layer {idx}"),
+            )?);
+        }
+
+        rms_norm_rows_model(
+            config,
+            ordinal,
+            seq_len,
+            hidden_dim,
+            &scratch.hidden,
+            &weights.layers[idx].post_attn_norm_w,
+            &mut scratch.normed,
+            &format!("tail replay layer {idx} post-attn norm"),
+        )?;
+
+        if let Some(trace) = layer_post_attn_norm_trace.as_mut() {
+            trace.push(copy_bf16_row(
+                ordinal,
+                &scratch.normed,
+                trace_row,
+                hidden_dim,
+                &format!("tail replay post-attn norm trace layer {idx}"),
+            )?);
+        }
+
+        prefill_mlp_layer(weights, &mut scratch, config, idx, seq_len, ordinal)?;
+
+        if let Some(trace) = layer_mlp_swiglu_trace.as_mut() {
+            trace.push(copy_bf16_row(
+                ordinal,
+                &scratch.mlp_buf,
+                trace_row,
+                config.intermediate_size,
+                &format!("tail replay mlp swiglu trace layer {idx}"),
+            )?);
+        }
+        if let Some(trace) = layer_mlp_out_trace.as_mut() {
+            trace.push(copy_bf16_row(
+                ordinal,
+                &scratch.proj_buf,
+                trace_row,
+                hidden_dim,
+                &format!("tail replay mlp out trace layer {idx}"),
+            )?);
+        }
+        if let Some(trace) = layer_hidden_trace.as_mut() {
+            trace.push(copy_bf16_row(
+                ordinal,
+                &scratch.hidden,
+                trace_row,
+                hidden_dim,
+                &format!("tail replay hidden trace layer {idx}"),
+            )?);
+        }
+    }
+
+    let (mut logits_per_pos, normed_last) = compute_logits_for_range(
+        &scratch.hidden,
+        weights,
+        config,
+        seq_len - 1,
+        1,
+        use_4b_kernel,
+        ordinal,
+    )?;
+    let logits = logits_per_pos
+        .pop()
+        .expect("count=1 produces exactly one row");
+    let final_norm_trace = Some(
+        normed_last
+            .to_host_bytes()
+            .map_err(|e| anyhow::anyhow!("tail replay final norm D2H: {e}"))?,
+    );
+
+    if kv_fp8 {
+        convert_kv_caches_to_fp8(state, config, ordinal)?;
+    }
+
+    Ok(PrefillResult {
+        logits,
+        final_norm_trace,
+        layer_attn_trace,
+        layer_post_attn_norm_trace,
+        layer_mlp_swiglu_trace,
+        layer_mlp_out_trace,
+        layer_hidden_trace,
+        tap_hiddens: None,
+        linear_debug_trace: None,
+        target_nll: None,
+    })
+}
+
 /// SpecPrefill cosine fast path: drafter prefill that only writes K/V
 /// caches for layers `0..=last_layer` and then returns. Skips final
 /// norm + lm_head + target_nll + BF16→FP8 KV conversion. Caller reads

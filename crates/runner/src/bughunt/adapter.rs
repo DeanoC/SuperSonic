@@ -59,7 +59,7 @@ pub(crate) fn run_native_prefill_with_trace(
     debug_layer: Option<usize>,
     debug_kind: Option<BughuntLayerKind>,
 ) -> Result<prefill_engine::PrefillResult> {
-    let _ = trace_position;
+    let prompt_ids = trace_prompt_prefix(prompt_ids, trace_position)?;
     let mut state = ModelState::new(&runtime.weights.config, runtime.ordinal)
         .map_err(|e| anyhow::anyhow!("native traced prefill model state init: {e}"))?;
     let (debug_linear_layer, debug_full_layer, debug_mlp_layer) =
@@ -90,15 +90,27 @@ pub(crate) fn run_tail_replay_with_trace(
     debug_layer: Option<usize>,
     debug_kind: Option<BughuntLayerKind>,
 ) -> Result<prefill_engine::PrefillResult> {
-    let _ = (
-        runtime,
+    let mut state = ModelState::new(&runtime.weights.config, runtime.ordinal)
+        .map_err(|e| anyhow::anyhow!("tail replay model state init: {e}"))?;
+    let (debug_linear_layer, debug_full_layer, debug_mlp_layer) =
+        debug_layer_flags(debug_layer, debug_kind);
+    prefill_engine::prefill_tail_from_hidden_with_trace_position(
+        &runtime.weights,
+        &mut state,
+        &runtime.rotary,
         hidden_bf16,
         start_layer,
+        runtime.ordinal,
+        runtime.kv_chunk_size,
+        runtime.prefill_chunk_size,
+        false,
+        runtime.use_4b_kernel,
+        true,
+        debug_linear_layer,
+        debug_full_layer,
+        debug_mlp_layer,
         trace_position,
-        debug_layer,
-        debug_kind,
-    );
-    bail!("tail replay tracing is not available in the current prefill API")
+    )
 }
 
 pub(crate) fn run_trace_oracle(
@@ -167,4 +179,18 @@ fn debug_layer_flags(
         (Some(layer), Some(BughuntLayerKind::Mlp)) => (None, None, Some(layer)),
         _ => (None, None, None),
     }
+}
+
+fn trace_prompt_prefix(prompt_ids: &[u32], trace_position: Option<usize>) -> Result<&[u32]> {
+    let Some(position) = trace_position else {
+        return Ok(prompt_ids);
+    };
+    if position >= prompt_ids.len() {
+        bail!(
+            "trace position {} out of range for prompt length {}",
+            position,
+            prompt_ids.len()
+        );
+    }
+    Ok(&prompt_ids[..=position])
 }
