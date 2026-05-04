@@ -102,16 +102,17 @@ specprefill.md).
 **Performance note:** As of Phase D (2026-05-04), SpecPrefill defaults
 to cosine-similarity scoring (`--specprefill-algorithm cosine`) plus
 drafter early-exit (the drafter stops after the scoring layer instead
-of running its full model), and is **2.07× faster than dense prefill**
-on gfx1100 at the measured prompt length (1353-token prompt,
-Qwen3.5-9B BF16: 2.39s with SpecPrefill vs 4.94s dense,
-`keep_ratio=0.50`). The legacy `lookahead` algorithm remains available
-but is NET SLOWER than dense (7.85s) because its draft decode steps
-route through the component decode path instead of the persistent
-megakernel — kept for parity-test coverage and future research, not
-recommended for production. See
-[specprefill.md § Performance](specprefill.md#performance) for the full
-table.
+of running its full model), and the speedup **compounds with prompt
+length** on gfx1100 (Qwen3.5-9B BF16, `keep_ratio=0.50`):
+**2.07× faster than dense at 1.3k tokens, 2.63× at 4k, 3.36× at 8k**
+(2.39s / 11.16s / 36.94s with SpecPrefill vs 4.94s / 29.37s / 124.22s
+dense — saving ~87 seconds on a single 8k-prompt prefill). The legacy
+`lookahead` algorithm remains available but is slower than dense at
+short prompts and only pulls ahead at ≥4k tokens (still beaten by
+`cosine` at every measured length) — kept for parity-test coverage
+and future research, not recommended for production. See
+[specprefill.md § Performance](specprefill.md#performance) for the
+full prompt-length sweep.
 
 Support:
 

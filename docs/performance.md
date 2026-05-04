@@ -767,22 +767,27 @@ in.
   the FP8 KV cache self-consistent. KV-FP8 on Qwen3.5 is currently a
   memory feature (headroom for longer contexts), not a throughput feature.
 
-² The legacy `--specprefill-algorithm lookahead` path remains slower
-  than dense prefill on gfx1100 because the speculator's lookahead
-  decode steps route through the component decode path (per-head D2D
-  K/V copy fallback added in PR #177) instead of the persistent
-  megakernel. Phase D (2026-05-04) replaced the default scoring
-  algorithm with `cosine` — a hipfire-PFlash-style single-layer
-  cosine-similarity score that does one drafter prefill and a
-  single small HIP kernel launch, dropping the lookahead decode
-  steps entirely. A follow-on change in the same PR series wired in
-  a drafter early-exit (`prefill_kv_through`) so the drafter stops
-  after the chosen scoring layer and skips the rest of its model.
-  The combined default is 2.07× faster than dense at the same
-  workload and also scores marginally higher on correctness (cossim
+² The legacy `--specprefill-algorithm lookahead` path is slower than
+  dense prefill on gfx1100 *at short prompts* because the speculator's
+  lookahead decode steps route through the component decode path
+  (per-head D2D K/V copy fallback added in PR #177) instead of the
+  persistent megakernel. At ≥4k-token prompts the target-prefill
+  savings overtake the speculator overhead and lookahead does pull
+  ahead of dense (1.18× at 4k, 1.55× at 8k) — but it is still beaten
+  by the default `cosine` path at every measured length. Phase D
+  (2026-05-04) replaced the default scoring algorithm with `cosine`
+  — a hipfire-PFlash-style single-layer cosine-similarity score that
+  does one drafter prefill and a single small HIP kernel launch,
+  dropping the lookahead decode steps entirely. A follow-on change
+  wired in a drafter early-exit (`prefill_kv_through`) so the drafter
+  stops after the chosen scoring layer and skips the rest of its
+  model. The combined default is 2.07× faster than dense at 1.3k
+  tokens, **3.36× faster at 8k tokens** (the speedup compounds with
+  prompt length), and scores marginally higher on correctness (cossim
   0.820 vs 0.708 against the dense reference at keep=0.50). See
   [specprefill.md § Algorithm](specprefill.md#algorithm) and
-  [specprefill.md § Performance](specprefill.md#performance).
+  [specprefill.md § Performance](specprefill.md#performance) for the
+  full prompt-length sweep.
 
 ³ SpecPrefill + KV-FP8 is rejected upfront by `validate_specprefill_flags`
   (since 2026-05-04). The underlying issue: the BF16 step-copy fallback
