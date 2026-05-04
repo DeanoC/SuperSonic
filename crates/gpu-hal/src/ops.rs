@@ -1031,11 +1031,11 @@ unsafe impl Send for GpuStream {}
 impl GpuStream {
     pub fn new_nonblocking(ordinal: usize) -> Result<Self> {
         let backend = current_backend();
-        let mut raw: *mut c_void = std::ptr::null_mut();
-        with_device_impl(backend, ordinal, || match backend {
+        let raw = with_device_impl(backend, ordinal, || match backend {
             Backend::Hip => {
                 #[cfg(supersonic_backend_hip)]
                 {
+                    let mut raw: *mut c_void = std::ptr::null_mut();
                     let status =
                         unsafe { hipStreamCreateWithFlags(&mut raw, HIP_STREAM_NON_BLOCKING) };
                     if status != 0 {
@@ -1045,7 +1045,7 @@ impl GpuStream {
                             status,
                         ));
                     }
-                    Ok(())
+                    Ok(raw)
                 }
                 #[cfg(not(supersonic_backend_hip))]
                 Err(GpuError::InvalidArg("HIP backend not compiled".into()))
