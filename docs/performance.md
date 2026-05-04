@@ -737,7 +737,7 @@ in.
 | VMM | qwen3.6-35b-a3b INT4 + 8192-token context, gfx1100 | OOM (24 GiB exceeded) | runs | enables the workload | tests/gfx1100/bench_qwen36_sparse_caps.py |
 | SpecPrefill (keep=0.50) | qwen3.5-9b BF16 + 1353-token prompt, gfx1100 | 5057 ms TTFT | 5729 ms speculator + 2010 ms target prefill = 7739 ms TTFT | **1.53× SLOWER**² | manual run, 2026-05-03 |
 | SpecPrefill (keep=0.30) | qwen3.5-9b BF16 + 1353-token prompt, gfx1100 | 5057 ms TTFT | 5743 ms speculator + 1301 ms target prefill = 7044 ms TTFT | **1.39× SLOWER**² | manual run, 2026-05-03 |
-| SpecPrefill + KV-FP8 | qwen3.5-9b BF16 + KV-FP8 + 1353-token prompt | — | runtime error³ | **BROKEN** | manual run, 2026-05-03 |
+| SpecPrefill + KV-FP8 | qwen3.5-9b BF16 + KV-FP8 + 1353-token prompt | — | rejected by validation³ | **REJECTED** | n/a (CLI guard since 2026-05-04) |
 | DFlash (B=3) | qwen3.5-9b INT4 greedy decode, gfx1100 | ~32 ms/step | ~12 ms/step (effective; 2.5-3× speedup) | 2.5-3× FASTER | docs/dflash.md M4.3 numbers |
 | MoE prefetch | qwen3.6-35b-a3b INT4 decode, gfx1100 | included | (default-on) | — | the 28.3 ms/step row above already includes prefetch — the persistent megakernel default path uses it. A/B vs no-prefetch needs `--no-persistent-decode` which falls back to a different decode path entirely. |
 | Certified KV (shadow-validate) | llama3.1-8b INT8 + 1024-token prompt, sm86 | TBM ms/step | TBM ms/step | TBM | (script TBM, sm86-only — not measurable on a HIP-only dev box) |
@@ -757,11 +757,12 @@ in.
   a Phase D follow-up. See `project_specprefill_phase_d_followups.md` in
   memory for the fix path.
 
-³ SpecPrefill + KV-FP8 combo trips a runtime error on the first decode
-  step: `certified KV BF16 step copy expects BF16 buffers, got src BF16/BF16
-  dst U8/U8`. The PR #177 fallback assumes BF16 dst; FP8 (U8) destination
-  isn't handled. Validation should reject the combo until the fallback
-  grows an FP8-quantising path.
+³ SpecPrefill + KV-FP8 is rejected upfront by `validate_specprefill_flags`
+  (since 2026-05-04). The underlying issue: the BF16 step-copy fallback
+  added in PR #177 assumes BF16 destination buffers; `--kv-fp8` makes the
+  K/V cache U8 (FP8). Lifting the gate is a Phase D follow-up — the
+  per-head D2D fallback in `kernel_ffi::certified_kv::copy_step_bf16`
+  (non-CUDA branch) needs a BF16→FP8 quantise-on-the-fly path.
 
 The DFlash numbers are pulled from [dflash.md](dflash.md)'s M4.3
 single-pass fused-verify section. The KV-FP8 number is the gfx1100
