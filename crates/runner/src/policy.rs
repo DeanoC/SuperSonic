@@ -114,6 +114,14 @@ pub(crate) fn validate_specprefill_flags(
         if cli.dflash {
             anyhow::bail!("--specprefill-* and --dflash cannot be combined");
         }
+        match cli.specprefill_algorithm.as_str() {
+            "cosine" | "lookahead" => {}
+            other => {
+                anyhow::bail!(
+                    "--specprefill-algorithm must be \"cosine\" or \"lookahead\" (got {other:?})"
+                );
+            }
+        }
         if cli.kv_fp8 {
             anyhow::bail!(
                 "--specprefill-draft-dir cannot be combined with --kv-fp8 today: the \
