@@ -15,13 +15,13 @@ use crate::qwen35_startup::{
     load_qwen35_startup, validate_qwen35_startup, Qwen35Policy, Qwen35Startup,
 };
 use crate::qwen35_validation::{
-    qwen35_oracle_script_path, resolve_qwen_oracle_model_id, run_qwen35_oracle_validation,
-    trace_qwen35_oracle_prefill_layer,
+    resolve_qwen35_oracle_context, run_qwen35_oracle_validation,
+    trace_qwen35_oracle_prefill_layer_if_requested,
 };
 use crate::qwen35_virtual_kv::report_qwen35_virtual_kv_after_prefill;
 use crate::qwen35_vram::check_qwen35_vram;
 use crate::registry::{Backend, FamilyParams, GpuArch, ModelVariant, RegistryEntry};
-use crate::{resolve_oracle_device, Cli};
+use crate::Cli;
 
 pub(crate) fn run_qwen35(
     cli: &Cli,
@@ -100,18 +100,7 @@ pub(crate) fn run_qwen35(
         context_tokens,
     )?;
 
-    // When using FP8 runtime weights, tell the oracle to use the same FP8 weights
-    // (dequanted to BF16) so we compare apples-to-apples.
-    let fp8_oracle_dir = if cli.fp8_runtime {
-        Some(cli.model_dir.clone())
-    } else {
-        None
-    };
-    let oracle_device = resolve_oracle_device(&cli.oracle_device, backend, ordinal);
-
-    // Run prefill (native GPU or oracle)
-    let qwen_oracle_model_id =
-        resolve_qwen_oracle_model_id(cli.model_id.as_deref(), &cli.model_dir, &model_variant);
+    let oracle_context = resolve_qwen35_oracle_context(cli, backend, ordinal, model_variant);
     let Qwen35Prefill {
         logits: prefill_logits,
         native_trace: native_prefill_trace,
@@ -120,9 +109,9 @@ pub(crate) fn run_qwen35(
         &cli,
         &mut engine,
         &prompt_ids,
-        &qwen_oracle_model_id,
-        &oracle_device,
-        fp8_oracle_dir.as_deref(),
+        &oracle_context.model_id,
+        &oracle_context.device,
+        oracle_context.fp8_oracle_dir.as_deref(),
         host_lm_head_rescorer.as_ref(),
         allow_host_lm_head_rescore,
     )?;
@@ -137,30 +126,21 @@ pub(crate) fn run_qwen35(
         &engine,
         &text_config,
         &prompt_ids,
-        &qwen_oracle_model_id,
-        &oracle_device,
-        fp8_oracle_dir.as_deref(),
+        &oracle_context.model_id,
+        &oracle_context.device,
+        oracle_context.fp8_oracle_dir.as_deref(),
         &prefill_logits,
         native_prefill_trace.as_ref(),
         next_token,
     )?;
 
-    if let (Some(trace_layer), Some(output)) =
-        (cli.trace_oracle_prefill_layer, oracle_output.as_ref())
-    {
-        let oracle_script = qwen35_oracle_script_path();
-        trace_qwen35_oracle_prefill_layer(
-            &mut engine,
-            trace_layer,
-            &prompt_ids,
-            &oracle_script,
-            &qwen_oracle_model_id,
-            &cli.oracle_dtype,
-            &oracle_device,
-            fp8_oracle_dir.as_deref(),
-            output,
-        )?;
-    }
+    trace_qwen35_oracle_prefill_layer_if_requested(
+        cli,
+        &mut engine,
+        &prompt_ids,
+        &oracle_context,
+        oracle_output.as_ref(),
+    )?;
 
     // Replicate prefill state to batch items if batch_size > 1
     if cli.batch_size > 1 {

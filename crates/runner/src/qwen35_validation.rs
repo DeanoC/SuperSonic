@@ -5,11 +5,11 @@ use std::path::{Path, PathBuf};
 
 use crate::decode_engine::DecodeEngine;
 use crate::model_files::model_dir_has_raw_safetensors;
-use crate::registry::ModelVariant;
+use crate::registry::{Backend, ModelVariant};
 use crate::tensor_bytes::{
     bf16_bytes_to_f32 as decode_bf16_le, f32_bytes_to_f32 as decode_f32_le, f32_to_bf16_bytes,
 };
-use crate::{oracle, validate, Cli};
+use crate::{oracle, resolve_oracle_device, validate, Cli};
 
 pub(crate) type Qwen35NativePrefillTrace = (
     Option<Vec<u8>>,
@@ -18,6 +18,12 @@ pub(crate) type Qwen35NativePrefillTrace = (
     Option<Vec<Vec<u8>>>,
     Option<Vec<Vec<u8>>>,
 );
+
+pub(crate) struct Qwen35OracleContext {
+    pub(crate) model_id: String,
+    pub(crate) device: String,
+    pub(crate) fp8_oracle_dir: Option<PathBuf>,
+}
 
 pub(crate) fn qwen35_oracle_script_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -39,6 +45,23 @@ pub(crate) fn resolve_qwen_oracle_model_id(
         return model_dir.to_string_lossy().into_owned();
     }
     model_variant.hf_model_id().to_string()
+}
+
+pub(crate) fn resolve_qwen35_oracle_context(
+    cli: &Cli,
+    backend: Backend,
+    ordinal: usize,
+    model_variant: &ModelVariant,
+) -> Qwen35OracleContext {
+    Qwen35OracleContext {
+        model_id: resolve_qwen_oracle_model_id(
+            cli.model_id.as_deref(),
+            &cli.model_dir,
+            model_variant,
+        ),
+        device: resolve_oracle_device(&cli.oracle_device, backend, ordinal),
+        fp8_oracle_dir: cli.fp8_runtime.then(|| cli.model_dir.clone()),
+    }
 }
 
 pub(crate) fn run_qwen35_oracle_validation(
@@ -84,6 +107,31 @@ pub(crate) fn run_qwen35_oracle_validation(
     )?;
 
     Ok(Some(output))
+}
+
+pub(crate) fn trace_qwen35_oracle_prefill_layer_if_requested(
+    cli: &Cli,
+    engine: &mut DecodeEngine,
+    prompt_ids: &[u32],
+    oracle_context: &Qwen35OracleContext,
+    oracle_output: Option<&oracle::OracleOutput>,
+) -> Result<()> {
+    let (Some(trace_layer), Some(output)) = (cli.trace_oracle_prefill_layer, oracle_output) else {
+        return Ok(());
+    };
+
+    let oracle_script = qwen35_oracle_script_path();
+    trace_qwen35_oracle_prefill_layer(
+        engine,
+        trace_layer,
+        prompt_ids,
+        &oracle_script,
+        &oracle_context.model_id,
+        &cli.oracle_dtype,
+        &oracle_context.device,
+        oracle_context.fp8_oracle_dir.as_deref(),
+        output,
+    )
 }
 
 pub(crate) fn trace_qwen35_oracle_prefill_layer(
