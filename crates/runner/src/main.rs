@@ -20,6 +20,7 @@ mod qwen35_kv_trace;
 mod qwen35_runtime;
 mod qwen35_trace;
 mod qwen35_trace_utils;
+mod qwen35_validation;
 #[path = "qwen36_moe/mod.rs"]
 mod qwen36_moe_cli;
 #[path = "qwen36_moe/decode.rs"]
