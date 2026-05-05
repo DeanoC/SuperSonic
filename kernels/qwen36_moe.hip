@@ -60,6 +60,14 @@
 // expert against.
 #include "qwen36_moe_persistent/batched_prefill_router_permute.cuh"
 
+// Stage B (M10): grouped-expert INT4 GEMM kernel. One launch processes
+// all `num_experts` experts via persistent-block work-stealing on the
+// expert id. Reuses int4_dq8_matvec_partial / wmma_int4_matvec_partial_16rows
+// from helpers.cuh — math is identical to ffn_phase.cuh's Phase G + I,
+// restructured around an outer per-expert loop instead of per-top-k
+// dispatch from the persistent megakernel.
+#include "qwen36_moe_persistent/batched_prefill_grouped_expert.cuh"
+
 namespace qwen36_moe {
 
 // -- Layer descriptor (mirror of Rust Qwen36MoeDecodeLayerDesc) ----------

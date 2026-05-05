@@ -725,6 +725,57 @@ extern "C" {
         permuted_kpos: *mut c_void,
         permuted_weight: *mut c_void,
     ) -> c_int;
+
+    /// Stage B (M10) grouped-expert INT4 GEMM kernel. One launch processes
+    /// ALL `num_experts` experts via persistent-block work-stealing on the
+    /// expert id; for each expert it walks the segment of permuted rows
+    /// produced by the M9 router permutation kernel and runs gate_up +
+    /// silu*mul + down INT4 matmuls per row.
+    ///
+    /// Inputs (GPU buffers):
+    /// - `x_norm`              : `[n_tokens, hidden]` BF16 — post-input-RMSnorm
+    ///                            hidden states; gathered by `permuted_token_idx`.
+    /// - `expert_offsets`      : `[num_experts + 1]` i32 — M9 prefix sum.
+    /// - `permuted_token_idx`  : `[n_tokens * top_k]` i32 — M9 sort output.
+    /// - `experts_gate_up_w/s/z` : `[E, 2*I, hidden/2]` u8 + `[E, 2*I/gs, hidden/gs]` BF16.
+    /// - `experts_down_w/s/z`    : `[E, hidden, I/2]` u8 + `[E, hidden/gs, I/gs]` BF16.
+    ///
+    /// Caller-owned buffers:
+    /// - `expert_out` : `[n_tokens * top_k, hidden]` BF16 — per-permuted-row
+    ///                   expert output; M11 unpermutes + combines.
+    /// - `counters`   : `[1]` u32 — work-stealing claim counter; CALLER MUST
+    ///                   ZERO BEFORE LAUNCH.
+    ///
+    /// Status codes (non-zero = failure):
+    ///   150 invalid args (zero/negative dims)
+    ///   151 num_experts > 256
+    ///   152 hidden / moe_intermediate not divisible by group_size (or 16)
+    ///   153 group_size != 128
+    ///   154 top_k * n_tokens > 16384
+    ///   155 dtype != bf16
+    ///   156 LDS overflow
+    ///   254 launch error                255 sync error
+    pub fn qwen36_moe_hip_batched_prefill_grouped_expert_launch(
+        dtype: c_int,
+        device_ordinal: usize,
+        n_tokens: c_int,
+        top_k: c_int,
+        num_experts: c_int,
+        hidden: c_int,
+        moe_intermediate: c_int,
+        group_size: c_int,
+        x_norm: *const c_void,
+        expert_offsets: *const c_void,
+        permuted_token_idx: *const c_void,
+        experts_gate_up_w: *const c_void,
+        experts_gate_up_scale: *const c_void,
+        experts_gate_up_zero: *const c_void,
+        experts_down_w: *const c_void,
+        experts_down_scale: *const c_void,
+        experts_down_zero: *const c_void,
+        expert_out: *mut c_void,
+        counters: *mut c_void,
+    ) -> c_int;
 }
 
 /// Safe wrapper over the stub launch. The engine pre-allocates `sync_buf`
@@ -2182,6 +2233,126 @@ pub fn batched_prefill_router_permute_launch(
             ),
         ));
     }
+    Ok(())
+}
+
+/// Stage B (M10) grouped-expert INT4 GEMM safe wrapper.
+///
+/// Runs gate_up + silu*mul + down for ALL `num_experts` experts in one
+/// launch via persistent-block work-stealing. Per-expert the kernel walks
+/// the rows assigned to it by the M9 router permutation and writes
+/// `down(silu(gate(x_norm[token])) * up(x_norm[token]))` into
+/// `expert_out[row, hidden]`. M11's orchestrator wires this into the
+/// batched prefill pipeline.
+///
+/// Buffer requirements:
+/// - `x_norm`              : BF16, `[n_tokens, hidden]`. Caller-produced
+///                            (post-input-RMSnorm).
+/// - `expert_offsets`      : i32 (stored as U32 in `GpuBuffer`),
+///                            `[num_experts + 1]`. M9 output.
+/// - `permuted_token_idx`  : i32 (U32 storage), `[n_tokens * top_k]`. M9.
+/// - `experts_gate_up_w`   : u8 (U8 storage), `[E, 2*I, hidden/2]`.
+/// - `experts_gate_up_scale/zero` : BF16, `[E, 2*I/gs, hidden/gs]`.
+/// - `experts_down_w`      : u8, `[E, hidden, I/2]`.
+/// - `experts_down_scale/zero` : BF16, `[E, hidden/gs, I/gs]`.
+/// - `expert_out`          : BF16, `[n_tokens * top_k, hidden]`.
+/// - `counters`            : u32, `[1]`. CALLER MUST ZERO BEFORE LAUNCH —
+///                            this is the work-stealing claim counter.
+#[allow(clippy::too_many_arguments)]
+pub fn batched_prefill_grouped_expert_launch(
+    ordinal: usize,
+    n_tokens: usize,
+    top_k: usize,
+    num_experts: usize,
+    hidden: usize,
+    moe_intermediate: usize,
+    group_size: usize,
+    x_norm: &GpuBuffer,
+    expert_offsets: &GpuBuffer,
+    permuted_token_idx: &GpuBuffer,
+    experts_gate_up_w: &GpuBuffer,
+    experts_gate_up_scale: &GpuBuffer,
+    experts_gate_up_zero: &GpuBuffer,
+    experts_down_w: &GpuBuffer,
+    experts_down_scale: &GpuBuffer,
+    experts_down_zero: &GpuBuffer,
+    expert_out: &mut GpuBuffer,
+    counters: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    let backend = x_norm.backend();
+    if backend != Backend::Hip && backend != Backend::Cuda {
+        return Err(GpuError::backend(
+            backend,
+            "qwen36_moe::batched_prefill_grouped_expert_launch requires HIP or CUDA backend"
+                .to_string(),
+        ));
+    }
+    let status: c_int = match backend {
+        Backend::Hip | Backend::Cuda => {
+            #[cfg(any(supersonic_backend_hip, supersonic_backend_cuda))]
+            unsafe {
+                qwen36_moe_hip_batched_prefill_grouped_expert_launch(
+                    2, // bf16
+                    ordinal,
+                    n_tokens as c_int,
+                    top_k as c_int,
+                    num_experts as c_int,
+                    hidden as c_int,
+                    moe_intermediate as c_int,
+                    group_size as c_int,
+                    x_norm.as_ptr(),
+                    expert_offsets.as_ptr(),
+                    permuted_token_idx.as_ptr(),
+                    experts_gate_up_w.as_ptr(),
+                    experts_gate_up_scale.as_ptr(),
+                    experts_gate_up_zero.as_ptr(),
+                    experts_down_w.as_ptr(),
+                    experts_down_scale.as_ptr(),
+                    experts_down_zero.as_ptr(),
+                    expert_out.as_mut_ptr(),
+                    counters.as_mut_ptr(),
+                )
+            }
+            #[cfg(not(any(supersonic_backend_hip, supersonic_backend_cuda)))]
+            {
+                let _ = (
+                    ordinal,
+                    n_tokens,
+                    top_k,
+                    num_experts,
+                    hidden,
+                    moe_intermediate,
+                    group_size,
+                    x_norm,
+                    expert_offsets,
+                    permuted_token_idx,
+                    experts_gate_up_w,
+                    experts_gate_up_scale,
+                    experts_gate_up_zero,
+                    experts_down_w,
+                    experts_down_scale,
+                    experts_down_zero,
+                    expert_out,
+                    counters,
+                );
+                return Err(GpuError::backend(
+                    backend,
+                    "qwen36_moe::batched_prefill_grouped_expert_launch: backend not compiled"
+                        .to_string(),
+                ));
+            }
+        }
+        _ => unreachable!(),
+    };
+    if status != 0 {
+        return Err(GpuError::backend(
+            backend,
+            format!(
+                "qwen36_moe batched_prefill_grouped_expert_launch failed with status {status}"
+            ),
+        ));
+    }
+    let _ = (ordinal, n_tokens, top_k, num_experts, hidden, moe_intermediate, group_size);
     Ok(())
 }
 
