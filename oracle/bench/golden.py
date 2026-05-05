@@ -1,7 +1,6 @@
 """Golden-prompt diff: score (model, quant) generated text against the BF16 reference."""
 from __future__ import annotations
 import json
-import re
 import subprocess
 from collections import Counter
 from dataclasses import dataclass
@@ -96,15 +95,16 @@ def run_golden(req: GoldenRequest) -> dict:
             "extras": {**agg, "per_prompt": per_prompt}}
 
 
-_GENERATED = re.compile(r"^\[generated\] (.*)$", re.MULTILINE)
-
-
 def _generate(req: GoldenRequest, prompt: dict) -> str:
     cmd = [str(req.binary), "--model", req.model, "--model-dir", str(req.model_dir),
            "--prompt", prompt["prompt"], "--max-new-tokens", str(prompt["max_new_tokens"])]
     cmd.extend({"bf16": [], "int4": ["--int4"], "fp8r": ["--fp8-runtime"],
                 "kv-fp8": ["--kv-fp8"], "int8": ["--int8"]}[req.quant])
     res = subprocess.run(cmd, capture_output=True, text=True, check=False)
-    text = (res.stdout or "") + "\n" + (res.stderr or "")
-    m = _GENERATED.search(text)
-    return m.group(1) if m else text.strip().split("\n")[-1]
+    # Supersonic prints the prompt+generation as plain stdout lines, with
+    # status lines like `[gpu] ...`, `[tokens] ...`, `[result] ...` mixed in.
+    # Filter to the lines that don't start with a `[bracket]` tag — what
+    # remains is the actual model output.
+    lines = (res.stdout or "").splitlines()
+    text_lines = [l for l in lines if not l.lstrip().startswith("[")]
+    return "\n".join(text_lines).strip()
