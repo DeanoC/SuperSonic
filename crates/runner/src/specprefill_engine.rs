@@ -8,7 +8,7 @@
 use std::time::Instant;
 
 use anyhow::{anyhow, bail, Result};
-use gpu_hal::ScalarType;
+use gpu_hal::{Backend, ScalarType};
 
 use qwen35::weights::Qwen35Weights;
 
@@ -16,6 +16,41 @@ use crate::decode_engine::DecodeEngine;
 use crate::registry::{self, FamilyParams, ModelVariant, RegistryEntry};
 use crate::specprefill::{select_kept_positions, SelectionConfig};
 use crate::Cli;
+
+fn default_keep_ratio_for_specprefill(entry: &RegistryEntry) -> f32 {
+    if entry.backend == Backend::Cuda && matches!(entry.model, ModelVariant::Qwen3_6_35B_A3B) {
+        0.75
+    } else {
+        0.50
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gpu_hal::Backend;
+
+    use super::*;
+    use crate::registry::GpuArch;
+
+    #[test]
+    fn qwen36_cuda_cross_family_defaults_to_conservative_keep_ratio() {
+        let cuda_entry = registry::lookup(
+            &ModelVariant::Qwen3_6_35B_A3B,
+            &Backend::Cuda,
+            &GpuArch::Sm86,
+        )
+        .expect("Qwen3.6 CUDA sm86 registry entry");
+        assert_eq!(default_keep_ratio_for_specprefill(cuda_entry), 0.75);
+
+        let hip_entry = registry::lookup(
+            &ModelVariant::Qwen3_6_35B_A3B,
+            &Backend::Hip,
+            &GpuArch::Gfx1100,
+        )
+        .expect("Qwen3.6 HIP gfx1100 registry entry");
+        assert_eq!(default_keep_ratio_for_specprefill(hip_entry), 0.50);
+    }
+}
 
 fn score_blocks_cosine(
     draft_engine: &mut DecodeEngine,
@@ -106,9 +141,7 @@ fn score_blocks_cosine(
                 )?;
                 Some(buf)
             } else {
-                anyhow::bail!(
-                    "score_blocks_cosine: layer {li}: K cache missing after prefill"
-                );
+                anyhow::bail!("score_blocks_cosine: layer {li}: K cache missing after prefill");
             }
         };
         let k_kernel_input: &gpu_hal::GpuBuffer = if let Some(b) = materialized_k.as_ref() {
@@ -184,16 +217,15 @@ fn run_specprefill_qwen36_moe(
     // target's params (which are Qwen36MoeKernelParams, a different
     // shape). Backend + arch match the target's so the right HIP
     // build is selected.
-    let drafter_entry =
-        registry::lookup(&ModelVariant::Qwen3_5_0_8B, &entry.backend, &entry.arch)
-            .ok_or_else(|| {
-                anyhow!(
-                    "specprefill cross-family: no Qwen3.5-0.8B drafter entry registered \
+    let drafter_entry = registry::lookup(&ModelVariant::Qwen3_5_0_8B, &entry.backend, &entry.arch)
+        .ok_or_else(|| {
+            anyhow!(
+                "specprefill cross-family: no Qwen3.5-0.8B drafter entry registered \
                      for backend={:?} arch={:?}",
-                    entry.backend,
-                    entry.arch,
-                )
-            })?;
+                entry.backend,
+                entry.arch,
+            )
+        })?;
     let drafter_params = match &drafter_entry.params {
         FamilyParams::Qwen35(p) => *p,
         _ => unreachable!("Qwen3.5-0.8B drafter not in Qwen35 family"),
@@ -229,7 +261,9 @@ fn run_specprefill_qwen36_moe(
     );
 
     let cfg = SelectionConfig {
-        keep_ratio: cli.specprefill_keep_ratio.unwrap_or(0.50),
+        keep_ratio: cli
+            .specprefill_keep_ratio
+            .unwrap_or_else(|| default_keep_ratio_for_specprefill(entry)),
         chunk_size: cli.specprefill_chunk_size.unwrap_or(32),
         pool_window: cli.specprefill_pool_window.unwrap_or(5),
         always_keep_prefix: cli.specprefill_always_keep_prefix.unwrap_or(4),
@@ -312,11 +346,8 @@ fn run_specprefill_qwen36_moe(
         let speculator_start = Instant::now();
         let importance: Vec<f32> = match cli.specprefill_algorithm.as_str() {
             "cosine" => {
-                let imp = score_blocks_cosine(
-                    &mut draft_engine,
-                    &prompt_ids,
-                    block_size_for_scoring,
-                )?;
+                let imp =
+                    score_blocks_cosine(&mut draft_engine, &prompt_ids, block_size_for_scoring)?;
                 eprintln!(
                     "[specprefill] speculator (cosine) done in {:.0}ms (block_size={})",
                     speculator_start.elapsed().as_millis(),
@@ -492,11 +523,7 @@ pub fn run_specprefill(
     let speculator_start = Instant::now();
     let importance: Vec<f32> = match cli.specprefill_algorithm.as_str() {
         "cosine" => {
-            let imp = score_blocks_cosine(
-                &mut draft_engine,
-                &prompt_ids,
-                block_size_for_scoring,
-            )?;
+            let imp = score_blocks_cosine(&mut draft_engine, &prompt_ids, block_size_for_scoring)?;
             eprintln!(
                 "[specprefill] speculator (cosine) done in {:.0}ms (block_size={})",
                 speculator_start.elapsed().as_millis(),
@@ -506,8 +533,8 @@ pub fn run_specprefill(
         }
         _ => {
             // Legacy Phase C lookahead path.
-            let look = draft_engine
-                .prefill_with_lookahead_attention(&prompt_ids, lookahead_count)?;
+            let look =
+                draft_engine.prefill_with_lookahead_attention(&prompt_ids, lookahead_count)?;
             eprintln!(
                 "[specprefill] speculator (lookahead) done in {:.0}ms (full layers={})",
                 speculator_start.elapsed().as_millis(),

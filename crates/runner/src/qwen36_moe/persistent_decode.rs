@@ -27,18 +27,13 @@
 //! gates on `--persistent-decode`).
 
 use anyhow::{anyhow, Context, Result};
-use gpu_hal::{copy_d2h, copy_h2d, GpuBuffer, GpuError, ScalarType};
+use gpu_hal::{copy_d2h, copy_h2d, sync, GpuBuffer, GpuError, ScalarType};
 use kernel_ffi::qwen36_moe::{
-    persistent_decode_launch, persistent_decode_launch_range, Qwen36MoeAttnStepParams,
-    Qwen36MoeDecodeLayerDesc, Qwen36MoeInt4ScaleDesc, Qwen36MoeKVCacheFp8Desc,
-    Qwen36MoePersistentGeom, Qwen36MoePersistentLmHeadFold, Qwen36MoePersistentMode,
+    persistent_decode_launch, persistent_decode_launch_range, Qwen36MoeDecodeLayerDesc,
+    Qwen36MoeInt4ScaleDesc, Qwen36MoeKVCacheFp8Desc, Qwen36MoePersistentGeom,
+    Qwen36MoePersistentLmHeadFold, Qwen36MoePersistentMode,
 };
 
-/// Sentinel passed to the persistent kernel when the caller has no
-/// decoupled KV slot — the kernel inherits `position` for both RoPE
-/// and the cache slot. Re-exported so the runner-side glue doesn't
-/// have to reach across to `kernel_ffi::qwen36_moe` for a single i32.
-pub const CACHE_POS_INHERIT: i32 = Qwen36MoeAttnStepParams::CACHE_POS_INHERIT;
 use std::ffi::c_void;
 use std::os::raw::c_int;
 
@@ -204,11 +199,9 @@ impl PersistentScratch {
         ordinal: usize,
         initial_hidden_bytes: &[u8],
         position: i32,
-        // `CACHE_POS_INHERIT` (-1) ⇒ inherit from `position` (dense
-        // base decode). `≥ 0` ⇒ decoupled KV slot: kept tokens land at
-        // `cache_pos` while RoPE rotates at `position`. SpecPrefill
-        // sparse-prefill drives this; MTP draft layers use the same
-        // shape.
+        // `-1` inherits from `position` (dense base decode). `>= 0`
+        // decouples the KV slot from RoPE position; SpecPrefill sparse
+        // prefill and MTP draft layers use that shape.
         cache_pos: i32,
         lm_head_fold: Option<LmHeadFold<'_>>,
     ) -> Result<DecodeOutputs> {
@@ -284,6 +277,104 @@ impl PersistentScratch {
         })
     }
 
+    /// Dense prefill fast path. The kernel loads `embed_tokens[token_id]`
+    /// directly into `hidden_ping`, runs the persistent chain, and leaves the
+    /// final hidden on device. Prompt-prefill callers do not consume
+    /// `final_hidden_bytes`, so skipping the host embed lookup, H2D upload,
+    /// and D2H download lets the default stream carry the state dependency.
+    pub fn run_from_device_embedding_no_download(
+        &mut self,
+        ordinal: usize,
+        embed_w: &GpuBuffer,
+        token_id: u32,
+        position: i32,
+        cache_pos: i32,
+    ) -> Result<std::time::Duration> {
+        let t_launch = std::time::Instant::now();
+        persistent_decode_launch_range(
+            ordinal,
+            ScalarType::BF16,
+            self.geom,
+            0,
+            self.num_layers,
+            Qwen36MoePersistentMode::Full,
+            position,
+            cache_pos,
+            &self.layer_descs_dev,
+            self.int4_scales_dev.as_ref(),
+            self.kv_fp8_descs_dev.as_ref(),
+            self.num_layers,
+            &mut self.hidden_ping,
+            &mut self.hidden_pong,
+            &mut self.workspace,
+            &mut self.ffn_topk_idx_scratch,
+            &mut self.sync_buf,
+            Some(embed_w),
+            token_id as i32,
+            None,
+            1,
+            None,
+        )
+        .map_err(|e: GpuError| anyhow!(e))
+        .context("persistent_decode_launch from device embedding")?;
+        Ok(t_launch.elapsed())
+    }
+
+    pub fn run_dense_prefill_tokens_from_device_embedding(
+        &mut self,
+        ordinal: usize,
+        embed_w: &GpuBuffer,
+        token_ids: &[u32],
+        start_position: i32,
+        start_cache_pos: i32,
+    ) -> Result<std::time::Duration> {
+        if token_ids.is_empty() {
+            return Ok(std::time::Duration::ZERO);
+        }
+        if token_ids.len() > i32::MAX as usize {
+            return Err(anyhow!("dense prefill token count exceeds i32::MAX"));
+        }
+        let token_bytes = unsafe {
+            std::slice::from_raw_parts(
+                token_ids.as_ptr() as *const u8,
+                token_ids.len() * std::mem::size_of::<u32>(),
+            )
+        };
+        let token_ids_dev =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::U32, &[token_ids.len()], token_bytes)
+                .context("upload dense prefill token ids")?;
+
+        let t_launch = std::time::Instant::now();
+        persistent_decode_launch_range(
+            ordinal,
+            ScalarType::BF16,
+            self.geom,
+            0,
+            self.num_layers,
+            Qwen36MoePersistentMode::Full,
+            start_position,
+            start_cache_pos,
+            &self.layer_descs_dev,
+            self.int4_scales_dev.as_ref(),
+            self.kv_fp8_descs_dev.as_ref(),
+            self.num_layers,
+            &mut self.hidden_ping,
+            &mut self.hidden_pong,
+            &mut self.workspace,
+            &mut self.ffn_topk_idx_scratch,
+            &mut self.sync_buf,
+            Some(embed_w),
+            -1,
+            Some(&token_ids_dev),
+            token_ids.len() as i32,
+            None,
+        )
+        .map_err(|e: GpuError| anyhow!(e))
+        .context("persistent dense prefill token loop")?;
+        sync(ordinal).context("sync persistent dense prefill token loop")?;
+        Ok(t_launch.elapsed())
+    }
+
     /// Sparse MoE residency variant. Each layer is split into:
     ///
     /// 1. attention/linear-attention + router top-k
@@ -350,6 +441,10 @@ impl PersistentScratch {
                 &mut self.ffn_topk_idx_scratch,
                 &mut self.sync_buf,
                 None,
+                -1,
+                None,
+                1,
+                None,
             )
             .map_err(|e: GpuError| anyhow!(e))
             .with_context(|| format!("persistent router-only launch (layer {layer_idx})"))?;
@@ -378,6 +473,10 @@ impl PersistentScratch {
                 &mut self.workspace,
                 &mut self.ffn_topk_idx_scratch,
                 &mut self.sync_buf,
+                None,
+                -1,
+                None,
+                1,
                 None,
             )
             .map_err(|e: GpuError| anyhow!(e))

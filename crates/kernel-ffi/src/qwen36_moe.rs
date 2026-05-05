@@ -339,6 +339,10 @@ extern "C" {
         // ≥ 0 ⇒ decoupled KV slot for SpecPrefill sparse-prefill or
         // MTP draft layers.
         cache_pos: c_int,
+        embed_w: *const c_void,
+        token_id: c_int,
+        token_ids: *const c_uint,
+        prefill_len: c_int,
         hidden_ping: *mut c_void,
         hidden_pong: *mut c_void,
         workspace: *mut f32,
@@ -836,6 +840,10 @@ pub fn persistent_decode_launch(
         workspace,
         ffn_topk_idx_scratch,
         sync_buf,
+        None,
+        -1,
+        None,
+        1,
         lm_head_fold,
     )
 }
@@ -862,6 +870,10 @@ pub fn persistent_decode_launch_range(
     workspace: &mut GpuBuffer,
     ffn_topk_idx_scratch: &mut GpuBuffer,
     sync_buf: &mut GpuBuffer,
+    embed_w: Option<&GpuBuffer>,
+    token_id: i32,
+    token_ids: Option<&GpuBuffer>,
+    prefill_len: i32,
     lm_head_fold: Option<Qwen36MoePersistentLmHeadFold<'_>>,
 ) -> Result<(), GpuError> {
     if dtype != ScalarType::BF16 {
@@ -879,6 +891,10 @@ pub fn persistent_decode_launch_range(
     let kv_fp8_ptr: *const Qwen36MoeKVCacheFp8Desc = kv_fp8_descs_device
         .map(|b| b.as_ptr() as *const Qwen36MoeKVCacheFp8Desc)
         .unwrap_or(std::ptr::null());
+    let embed_w_ptr = embed_w.map(|b| b.as_ptr()).unwrap_or(std::ptr::null());
+    let token_ids_ptr = token_ids
+        .map(|b| b.as_ptr() as *const c_uint)
+        .unwrap_or(std::ptr::null());
 
     // Fold pointers default to null; the kernel skips the lm_head phase
     // when any of the three is null.
@@ -892,71 +908,82 @@ pub fn persistent_decode_launch_range(
         None => (0, std::ptr::null(), std::ptr::null(), std::ptr::null_mut()),
     };
 
-    let status: c_int = match backend {
-        Backend::Hip | Backend::Cuda => {
-            #[cfg(any(supersonic_backend_hip, supersonic_backend_cuda))]
-            unsafe {
-                qwen36_moe_hip_persistent_decode_launch(
-                    dtype.kernel_dtype_code(),
-                    ordinal,
-                    num_layers as c_int,
-                    start_layer as c_int,
-                    end_layer_exclusive as c_int,
-                    mode.as_ffi(),
-                    layers_device.as_ptr() as *const Qwen36MoeDecodeLayerDesc,
-                    int4_ptr,
-                    kv_fp8_ptr,
-                    geom.hidden,
-                    geom.num_heads,
-                    geom.num_kv_heads,
-                    geom.head_dim,
-                    geom.rotary_dim,
-                    geom.num_k_heads,
-                    geom.num_v_heads,
-                    geom.head_k_dim,
-                    geom.head_v_dim,
-                    geom.conv_kernel_dim,
-                    geom.num_experts,
-                    geom.moe_intermediate,
-                    geom.shared_intermediate,
-                    geom.top_k,
-                    vocab,
-                    geom.rope_theta,
-                    geom.rms_norm_eps,
-                    position,
-                    cache_pos,
-                    hidden_ping.as_mut_ptr(),
-                    hidden_pong.as_mut_ptr(),
-                    workspace.as_mut_ptr() as *mut f32,
-                    ffn_topk_idx_scratch.as_mut_ptr() as *mut c_int,
-                    final_norm_w_ptr,
-                    lm_head_w_ptr,
-                    logits_out_ptr,
-                    counters,
-                    barrier_counter,
-                    barrier_flag,
-                )
+    let op = match mode {
+        Qwen36MoePersistentMode::Full => "qwen36.persistent_decode",
+        Qwen36MoePersistentMode::RouterOnly => "qwen36.persistent_router_only",
+        Qwen36MoePersistentMode::FfnOnly => "qwen36.persistent_ffn_only",
+    };
+    crate::prefill_ffi::ffi_profile_time_result(op, ordinal, || {
+        let status: c_int = match backend {
+            Backend::Hip | Backend::Cuda => {
+                #[cfg(any(supersonic_backend_hip, supersonic_backend_cuda))]
+                unsafe {
+                    qwen36_moe_hip_persistent_decode_launch(
+                        dtype.kernel_dtype_code(),
+                        ordinal,
+                        num_layers as c_int,
+                        start_layer as c_int,
+                        end_layer_exclusive as c_int,
+                        mode.as_ffi(),
+                        layers_device.as_ptr() as *const Qwen36MoeDecodeLayerDesc,
+                        int4_ptr,
+                        kv_fp8_ptr,
+                        geom.hidden,
+                        geom.num_heads,
+                        geom.num_kv_heads,
+                        geom.head_dim,
+                        geom.rotary_dim,
+                        geom.num_k_heads,
+                        geom.num_v_heads,
+                        geom.head_k_dim,
+                        geom.head_v_dim,
+                        geom.conv_kernel_dim,
+                        geom.num_experts,
+                        geom.moe_intermediate,
+                        geom.shared_intermediate,
+                        geom.top_k,
+                        vocab,
+                        geom.rope_theta,
+                        geom.rms_norm_eps,
+                        position,
+                        cache_pos,
+                        embed_w_ptr,
+                        token_id as c_int,
+                        token_ids_ptr,
+                        prefill_len as c_int,
+                        hidden_ping.as_mut_ptr(),
+                        hidden_pong.as_mut_ptr(),
+                        workspace.as_mut_ptr() as *mut f32,
+                        ffn_topk_idx_scratch.as_mut_ptr() as *mut c_int,
+                        final_norm_w_ptr,
+                        lm_head_w_ptr,
+                        logits_out_ptr,
+                        counters,
+                        barrier_counter,
+                        barrier_flag,
+                    )
+                }
+                #[cfg(not(any(supersonic_backend_hip, supersonic_backend_cuda)))]
+                {
+                    return Err(GpuError::InvalidArg(
+                        "qwen36_moe::persistent_decode_launch: GPU backend not compiled".into(),
+                    ));
+                }
             }
-            #[cfg(not(any(supersonic_backend_hip, supersonic_backend_cuda)))]
-            {
+            Backend::Metal => {
                 return Err(GpuError::InvalidArg(
-                    "qwen36_moe::persistent_decode_launch: GPU backend not compiled".into(),
+                    "qwen36_moe::persistent_decode_launch: Metal backend not yet wired".into(),
                 ));
             }
-        }
-        Backend::Metal => {
-            return Err(GpuError::InvalidArg(
-                "qwen36_moe::persistent_decode_launch: Metal backend not yet wired".into(),
+        };
+        if status != 0 {
+            return Err(GpuError::backend(
+                backend,
+                format!("qwen36_moe persistent decode launch failed with status {status}"),
             ));
         }
-    };
-    if status != 0 {
-        return Err(GpuError::backend(
-            backend,
-            format!("qwen36_moe persistent decode launch failed with status {status}"),
-        ));
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 /// Geometry + position state for the staged-attention parity launcher.

@@ -54,6 +54,13 @@ __device__ inline hip_bfloat16 pfx_from_float<hip_bfloat16>(float value) {
     return hip_bfloat16(value);
 }
 
+__device__ inline float pfx_wave_sum(float value) {
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        value += __shfl_down(value, offset);
+    }
+    return value;
+}
+
 // ---- Kernel 1: Element-wise addition ----
 // out[i] = lhs[i] + rhs[i]
 
@@ -315,4 +322,71 @@ __global__ void pfx_repeat_interleave_heads_kernel(
     const size_t src_off = static_cast<size_t>(s) * n_heads * head_dim
                          + static_cast<size_t>(src_h) * head_dim + d;
     dst[idx] = src[src_off];
+}
+
+// ---- Kernel 11: per-block cosine(block_mean_K, last_K) for SpecPrefill ----
+// PFlash-style importance scoring. k_cache layout:
+//   [1, kv_heads, cap, head_dim], with per-head stride cap * head_dim.
+
+template <typename T>
+__global__ void pfx_pflash_cosine_score_kernel(
+    const T* __restrict__ k_cache,
+    float* __restrict__ scores,
+    int n_pos,
+    int kv_heads,
+    int cap,
+    int head_dim,
+    int block_size,
+    int n_blocks,
+    int last_pos
+) {
+    const int lane = threadIdx.x;
+    if (lane >= warpSize) return;
+
+    const int block_idx = blockIdx.x;
+    if (block_idx >= n_blocks) return;
+
+    const int block_start = block_idx * block_size;
+    int block_end = block_start + block_size;
+    if (block_end > n_pos) block_end = n_pos;
+    const int block_len = block_end - block_start;
+    if (block_len <= 0) {
+        if (lane == 0) scores[block_idx] = 0.0f;
+        return;
+    }
+
+    const int kv_dim = kv_heads * head_dim;
+    float dot_acc = 0.0f;
+    float nb_acc = 0.0f;
+    float nl_acc = 0.0f;
+
+    for (int d = lane; d < kv_dim; d += warpSize) {
+        const int h = d / head_dim;
+        const int dim_in_head = d - h * head_dim;
+        const size_t base_h = static_cast<size_t>(h) * cap * head_dim
+                            + static_cast<size_t>(dim_in_head);
+
+        const float last_v = pfx_to_float(
+            k_cache[base_h + static_cast<size_t>(last_pos) * head_dim]);
+
+        float sum = 0.0f;
+        for (int pos = block_start; pos < block_end; ++pos) {
+            sum += pfx_to_float(k_cache[base_h + static_cast<size_t>(pos) * head_dim]);
+        }
+        const float mean = sum / static_cast<float>(block_len);
+
+        dot_acc += mean * last_v;
+        nb_acc += mean * mean;
+        nl_acc += last_v * last_v;
+    }
+
+    const float dot = pfx_wave_sum(dot_acc);
+    const float nb = pfx_wave_sum(nb_acc);
+    const float nl = pfx_wave_sum(nl_acc);
+
+    if (lane == 0) {
+        float denom = sqrtf(nb) * sqrtf(nl);
+        if (denom < 1e-12f) denom = 1e-12f;
+        scores[block_idx] = dot / denom;
+    }
 }

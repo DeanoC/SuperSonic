@@ -96,10 +96,14 @@ pub(crate) fn validate_specprefill_flags(
         || cli.specprefill_always_keep_prefix.is_some()
         || cli.specprefill_always_keep_suffix.is_some();
     if cli.specprefill_draft_dir.is_some() {
-        if backend != Backend::Hip {
+        let qwen36_cross_family_cuda =
+            backend == Backend::Cuda && matches!(model_variant, ModelVariant::Qwen3_6_35B_A3B);
+        if backend != Backend::Hip && !qwen36_cross_family_cuda {
             anyhow::bail!(
-                "SpecPrefill is HIP-only in Phase C (got backend={backend:?}). Re-run with \
-                 `--backend hip` or omit --specprefill-draft-dir to use the dense path."
+                "SpecPrefill is supported on HIP, plus CUDA for the Qwen3.6-35B-A3B \
+                 cross-family cosine path (got backend={backend:?}, model={model_variant}). \
+                 Re-run with a supported backend or omit --specprefill-draft-dir to use \
+                 the dense path."
             );
         }
         // SpecPrefill is enabled for Qwen3.5-9B (Phase C/D) and Qwen3.6-35B-A3B

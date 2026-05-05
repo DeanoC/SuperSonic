@@ -66,6 +66,10 @@ bool device_supports_wmma_bf16(int device_ordinal) {
 #endif
 }
 
+bool sync_each_kernel_enabled() {
+    const char* env = std::getenv("SUPERSONIC_SYNC_EACH_KERNEL");
+    return env != nullptr && env[0] != '\0' && env[0] != '0';
+}
 
 struct ScopedHipDevice {
     int  previous = -1;
@@ -143,7 +147,8 @@ extern "C" int qwen36_moe_hip_stub_launch(
                        barrier_counter,
                        barrier_flag);
     hipError_t launch_err = hipGetLastError();
-    hipError_t sync_err   = hipDeviceSynchronize();
+    hipError_t sync_err =
+        sync_each_kernel_enabled() ? hipDeviceSynchronize() : hipSuccess;
     if (launch_err != hipSuccess) return 254;
     if (sync_err != hipSuccess) return 255;
     return 0;
@@ -762,7 +767,8 @@ extern "C" int qwen36_moe_hip_int4_dequant_smoke_launch(
                        out_rows, in_cols, gsz,
                        dq_8_out, dq_scalar_out);
     hipError_t launch_err = hipGetLastError();
-    hipError_t sync_err   = hipDeviceSynchronize();
+    hipError_t sync_err =
+        sync_each_kernel_enabled() ? hipDeviceSynchronize() : hipSuccess;
     if (launch_err != hipSuccess) return 254;
     if (sync_err != hipSuccess) return 255;
     return 0;
@@ -844,7 +850,8 @@ extern "C" int qwen36_moe_hip_lm_head_launch(
         // No counter needed by the WMMA path (one block per tile, no
         // atomic claim). The host-passed counter buffer is ignored here.
         hipError_t launch_err = hipGetLastError();
-        hipError_t sync_err   = hipDeviceSynchronize();
+        hipError_t sync_err =
+            sync_each_kernel_enabled() ? hipDeviceSynchronize() : hipSuccess;
         if (launch_err != hipSuccess) return 254;
         if (sync_err != hipSuccess) return 255;
         return 0;
@@ -877,7 +884,8 @@ extern "C" int qwen36_moe_hip_lm_head_launch(
                        vocab,
                        rms_norm_eps);
     hipError_t launch_err = hipGetLastError();
-    hipError_t sync_err   = hipDeviceSynchronize();
+    hipError_t sync_err =
+        sync_each_kernel_enabled() ? hipDeviceSynchronize() : hipSuccess;
     if (launch_err != hipSuccess) return 254;
     if (sync_err != hipSuccess) return 255;
     return 0;
@@ -959,7 +967,8 @@ extern "C" int qwen36_moe_hip_lm_head_batched_launch(
         rms_norm_eps);
 
     hipError_t launch_err = hipGetLastError();
-    hipError_t sync_err   = hipDeviceSynchronize();
+    hipError_t sync_err =
+        sync_each_kernel_enabled() ? hipDeviceSynchronize() : hipSuccess;
     if (launch_err != hipSuccess) return 254;
     if (sync_err != hipSuccess) return 255;
     return 0;
@@ -1024,7 +1033,8 @@ extern "C" int qwen36_moe_hip_mtp_pre_fusion_launch(
         static_cast<hip_bfloat16*>(fused_out));
 
     hipError_t launch_err = hipGetLastError();
-    hipError_t sync_err   = hipDeviceSynchronize();
+    hipError_t sync_err =
+        sync_each_kernel_enabled() ? hipDeviceSynchronize() : hipSuccess;
     if (launch_err != hipSuccess) return 254;
     if (sync_err != hipSuccess) return 255;
     return 0;
@@ -1088,6 +1098,10 @@ extern "C" int qwen36_moe_hip_persistent_decode_launch(
     int           cache_pos,    // -1 ⇒ inherit from `position` (dense base
                                 //      decode); ≥ 0 ⇒ decoupled KV slot
                                 //      (SpecPrefill sparse-prefill / MTP).
+    const void*   embed_w,      // [vocab, hidden] BF16, nullable
+    int           token_id,     // >=0 => kernel loads embed_w[token_id]
+    const unsigned int* token_ids, // [prefill_len], nullable
+    int           prefill_len,
     void*         hidden_ping,
     void*         hidden_pong,
     float*        workspace,
@@ -1130,6 +1144,14 @@ extern "C" int qwen36_moe_hip_persistent_decode_launch(
     // reset_counters_16's clear width), so top_k must be ≤ 8.
     if (top_k > 8) return 135;
     if (hidden_ping == nullptr || hidden_pong == nullptr) return 136;
+    if ((token_ids == nullptr && prefill_len > 1) ||
+        (token_ids != nullptr && prefill_len <= 0)) return 147;
+    if (token_ids == nullptr) {
+        if ((embed_w == nullptr && token_id >= 0) ||
+            (embed_w != nullptr && token_id < 0)) return 146;
+    } else if (embed_w == nullptr) {
+        return 148;
+    }
     if (workspace == nullptr || ffn_topk_idx_scratch == nullptr) return 137;
     if (counters == nullptr || barrier_counter == nullptr ||
         barrier_flag == nullptr) {
@@ -1145,6 +1167,7 @@ extern "C" int qwen36_moe_hip_persistent_decode_launch(
                                   (logits_out != nullptr) && (vocab > 0);
     if (lm_head_on && !lm_head_complete) return 139;
     if (lm_head_on && (mode != 0 || end_layer_exclusive != num_layers)) return 143;
+    if (token_ids != nullptr && lm_head_on) return 149;
 
     // KV-FP8 desc validation: when present, every full-attn layer must
     // carry both kv_scale_k and kv_scale_v (or neither). Linear-attn
@@ -1249,6 +1272,8 @@ extern "C" int qwen36_moe_hip_persistent_decode_launch(
             num_k_heads, num_v_heads, head_k_dim, head_v_dim, conv_kernel_dim,
             num_experts, moe_intermediate, shared_intermediate, top_k,
             vocab, rope_theta, rms_norm_eps, position, cache_pos,
+            static_cast<const hip_bfloat16*>(embed_w), token_id,
+            token_ids, prefill_len,
             static_cast<hip_bfloat16*>(hidden_ping),
             static_cast<hip_bfloat16*>(hidden_pong),
             workspace, ffn_topk_idx_scratch,
@@ -1268,6 +1293,8 @@ extern "C" int qwen36_moe_hip_persistent_decode_launch(
             num_k_heads, num_v_heads, head_k_dim, head_v_dim, conv_kernel_dim,
             num_experts, moe_intermediate, shared_intermediate, top_k,
             vocab, rope_theta, rms_norm_eps, position, cache_pos,
+            static_cast<const hip_bfloat16*>(embed_w), token_id,
+            token_ids, prefill_len,
             static_cast<hip_bfloat16*>(hidden_ping),
             static_cast<hip_bfloat16*>(hidden_pong),
             workspace, ffn_topk_idx_scratch,
@@ -1278,7 +1305,8 @@ extern "C" int qwen36_moe_hip_persistent_decode_launch(
     }
 
     hipError_t launch_err = hipGetLastError();
-    hipError_t sync_err   = hipDeviceSynchronize();
+    hipError_t sync_err =
+        sync_each_kernel_enabled() ? hipDeviceSynchronize() : hipSuccess;
     if (launch_err != hipSuccess) return 254;
     if (sync_err != hipSuccess) return 255;
     return 0;

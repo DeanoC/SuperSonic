@@ -12,6 +12,7 @@ use anyhow::{Context, Result};
 use gpu_hal::{set_backend, Backend};
 use model_store::BakedStore;
 
+use crate::profiling::PrefillProfileScope;
 use crate::qwen36_moe_cli::bake::{ensure_qwen36_bake, select_decode_bake};
 use crate::qwen36_moe_cli::chain::{run_chain_step, Qwen36ChainStep};
 use crate::qwen36_moe_cli::decode_loop::Qwen36DecodeLoopState;
@@ -150,6 +151,9 @@ fn run_inner(
         !cli.no_persistent_decode,
         cli.kv_fp8,
         cli.dump_last_logits,
+        cli.profile_prefill,
+        cli.profile_prefill_json.as_deref(),
+        &cli.model,
         keep_mask,
     )?;
     Ok(())
@@ -187,6 +191,9 @@ fn decode_text(
     persistent_decode: bool,
     kv_fp8: bool,
     dump_last_logits: bool,
+    profile_prefill: bool,
+    profile_prefill_json: Option<&Path>,
+    model_name: &str,
     keep_mask: Option<Vec<bool>>,
 ) -> Result<()> {
     validate_speculative_sampling(speculative_decode, sampling)?;
@@ -356,6 +363,15 @@ fn decode_text(
             prompt_ids.len(),
         );
     }
+    let backend_label = format!("{backend:?}");
+    let mut prefill_profile = Some(PrefillProfileScope::new(
+        profile_prefill,
+        profile_prefill_json,
+        "qwen3.6-moe",
+        model_name,
+        &backend_label,
+        effective_prompt_len,
+    ));
 
     // `Qwen36DecodeLoopState::new` assumes dense (every position kept).
     // For sparse, override the initial token to be the first *kept*
@@ -389,8 +405,35 @@ fn decode_text(
         moe_runtime.prefetch_mode,
         moe_runtime.transition_min_observations,
     );
+    let mut prefilled_steps = 0usize;
+    let dense_prefill_token_loop =
+        std::env::var_os("SUPERSONIC_QWEN36_DENSE_PREFILL_TOKEN_LOOP").is_some();
+    if dense_prefill_token_loop
+        && keep_mask.is_none()
+        && _moe_expert_residency.is_none()
+        && effective_prompt_len > 1
+    {
+        if let (Some(scratch), Some(embed_w)) = (persistent_scratch.as_mut(), embed_w_buf.as_ref())
+        {
+            let dense_prefill_count = effective_prompt_len - 1;
+            let t_prefill = scratch
+                .run_dense_prefill_tokens_from_device_embedding(
+                    ordinal,
+                    embed_w,
+                    &prompt_ids[..dense_prefill_count],
+                    0,
+                    0,
+                )
+                .context("persistent dense prefill token loop")?;
+            prefilled_steps = dense_prefill_count;
+            prefill_steps += dense_prefill_count;
+            prefill_chain_elapsed += t_prefill;
+            loop_state.position += dense_prefill_count as i32;
+            loop_state.current_token = prompt_ids[dense_prefill_count];
+        }
+    }
 
-    for step in 0..loop_state.total_steps {
+    for step in prefilled_steps..loop_state.total_steps {
         // When speculative decode is on, each iteration can commit
         // multiple tokens (up to K+1), so the standard `total_steps =
         // prompt_len + max_new - 1` count over-shoots. Break here once
@@ -417,6 +460,37 @@ fn decode_text(
             effective_prompt_len,
             prompt_ids.len(),
         );
+        if dense_prefill_token_loop
+            && !is_gen_step
+            && keep_mask.is_none()
+            && _moe_expert_residency.is_none()
+        {
+            if let (Some(scratch), Some(embed_w)) =
+                (persistent_scratch.as_mut(), embed_w_buf.as_ref())
+            {
+                let t_chain_step = scratch
+                    .run_from_device_embedding_no_download(
+                        ordinal,
+                        embed_w,
+                        loop_state.current_token,
+                        position.rope,
+                        position.cache,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "persistent dense prefill from device embedding \
+                             (step {}, rope {}, cache {})",
+                            step, position.rope, position.cache
+                        )
+                    })?;
+                loop_state.position += 1;
+                prefill_steps += 1;
+                prefill_chain_elapsed += t_chain_step;
+                loop_state.current_token = prompt_ids[kept_positions[step + 1]];
+                continue;
+            }
+        }
+
         // Embed lookup for the current token.
         let t0 = std::time::Instant::now();
         let initial_hidden = lookup_embed_row(
@@ -522,6 +596,9 @@ fn decode_text(
             rng: &mut rng,
             stage_timings: &mut stage_timings,
         })?;
+        if let Some(profile) = prefill_profile.take() {
+            profile.finish()?;
+        }
 
         if Some(next_token) == eos_id {
             break;

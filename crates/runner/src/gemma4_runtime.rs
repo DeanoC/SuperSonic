@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use crate::bakes::{ensure_gemma4_int4_bake, ensure_hf_metadata_present};
+use crate::profiling::PrefillProfileScope;
 use crate::registry::{self, Backend, FamilyParams, Gemma4KernelParams, ModelVariant};
 use crate::{gemma4_engine, gemma4_int4_engine, oracle, validate, Cli};
 
@@ -186,12 +187,21 @@ pub(crate) fn run_gemma4(
     };
 
     let prefill_start = Instant::now();
+    let profile = PrefillProfileScope::new(
+        cli.profile_prefill,
+        cli.profile_prefill_json.as_deref(),
+        "gemma4",
+        &cli.model,
+        &cli.backend,
+        prompt_ids.len(),
+    );
     let prefill_logits = engine.prefill(&prompt_ids)?;
     let prefill_token = Gemma4Runtime::greedy_sample(&prefill_logits);
     eprintln!(
         "[prefill] native GPU prefill done in {:.0}ms",
         prefill_start.elapsed().as_millis()
     );
+    profile.finish()?;
 
     let batch_size = engine.batch_size();
     if batch_size > 1 {
