@@ -1,17 +1,18 @@
-//! Kernel-direct parity test for `full_attention_prefill`.
+//! Parity sweep for the legacy single-warp online-softmax prefill attention
+//! kernel — the one that ran before the K-tiled kernel was promoted to
+//! default. Forces `SUPERSONIC_PREFILL_ATTN_TILED=0` at the top of the test
+//! so the dispatcher routes to the legacy path.
 //!
-//! Compares the HIP/CUDA prefill attention kernel against a CPU fp32
-//! reference across a sweep of (q_len, kv_len, head_dim) shapes
-//! representative of Qwen 3.5 prefill. Used as the regression gate for
-//! the Stage 2 (online softmax) and Stage 3 (K-tiled) rewrites.
+//! Lives in its own test file (and therefore its own cargo-test binary)
+//! because the C++ dispatcher caches the env value in a function-scope
+//! `static const bool` on first call. Running default-vs-legacy parity in
+//! the same process would race on which value got cached first.
 //!
-//! Skipped silently when HIP backend isn't compiled (matches the pattern
-//! in specprefill_lookahead_attention_parity.rs etc.).
+//! Skipped silently when HIP backend isn't compiled.
 
 use gpu_hal::{Backend, GpuBuffer, ScalarType};
 use kernel_ffi::prefill_ffi;
 
-/// Upload a typed BF16 host vector into a fresh GpuBuffer of the given shape.
 fn upload_bf16(ordinal: usize, host: &[half::bf16], shape: &[usize]) -> GpuBuffer {
     assert_eq!(host.len(), shape.iter().product::<usize>());
     let mut buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, shape).expect("alloc bf16");
@@ -21,7 +22,6 @@ fn upload_bf16(ordinal: usize, host: &[half::bf16], shape: &[usize]) -> GpuBuffe
     buf
 }
 
-/// Download an F32 GpuBuffer to host.
 fn download_f32(buf: &GpuBuffer) -> Vec<f32> {
     let n = buf.elem_count();
     let mut bytes = vec![0u8; n * 4];
@@ -39,8 +39,6 @@ fn download_f32(buf: &GpuBuffer) -> Vec<f32> {
     out
 }
 
-/// Deterministic bf16-round-tripped reference data so CPU and GPU see the
-/// exact same input bit pattern.
 fn make_host_bf16(n: usize, seed: usize) -> (Vec<half::bf16>, Vec<f32>) {
     let bf: Vec<half::bf16> = (0..n)
         .map(|i| {
@@ -156,35 +154,37 @@ fn run_one_shape(
 }
 
 #[test]
-fn full_attention_prefill_parity_sweep() {
+fn full_attention_prefill_legacy_parity_sweep() {
     if !gpu_hal::is_backend_compiled(Backend::Hip) {
         eprintln!("skipped: HIP backend not compiled");
         return;
     }
-    let ordinal = 0usize;
-    // head_dim=256 is the production case (every shipping Qwen 3.5/3.6 model
-    // and Gemma 4 sliding layer). hd=64/128 are kept so the small/medium
-    // head-dim regime stays covered for future models like Phi-4-mini.
+    // Force the dispatcher to take the legacy single-warp online-softmax
+    // path by setting the env var BEFORE the first FFI call. The C++
+    // dispatcher caches this on first call via a function-scope static.
     //
-    // q_len values 15, 17, 33 are deliberately not multiples of BM=4 — they
-    // exercise the tail block where some warps in a block have qr >= q_len
-    // (active=false) and must still participate in cooperative loads +
-    // __syncthreads() while skipping output. Without these, the inactive-warp
-    // code path of the K-tiled kernel goes uncovered.
+    // SAFETY: this test binary is single-threaded with respect to
+    // setting/reading SUPERSONIC_PREFILL_ATTN_TILED. We set it once, before
+    // any FFI call could read it.
+    unsafe { std::env::set_var("SUPERSONIC_PREFILL_ATTN_TILED", "0"); }
+
+    let ordinal = 0usize;
+    // Same sweep as the default-path test (full_attention_prefill_parity.rs);
+    // any divergence between the two means the kernels disagree.
     for (q_len, kv_len, head_dim) in [
         (16usize, 16usize, 64usize),
         (16, 16, 128),
         (16, 16, 256),
-        (15, 15, 256),    // tail: q_len % BM (=4) == 3
-        (17, 17, 256),    // tail: q_len % BM == 1
-        (33, 64, 256),    // tail with kv_len > q_len
+        (15, 15, 256),
+        (17, 17, 256),
+        (33, 64, 256),
         (64, 64, 256),
         (256, 256, 64),
         (256, 256, 256),
         (1024, 1024, 128),
         (1024, 1024, 256),
-        (16, 256, 64),   // q_len < kv_len with seqlen_offset
-        (16, 256, 256),  // same, hd=256
+        (16, 256, 64),
+        (16, 256, 256),
     ] {
         let seqlen_offset = if kv_len > q_len { kv_len - q_len } else { 0 };
         run_one_shape(ordinal, q_len, kv_len, head_dim, seqlen_offset, 0xCAFE);

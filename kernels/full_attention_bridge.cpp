@@ -176,6 +176,16 @@ int full_attention_prefill_tiled_device(
 
     ScopedHipDevice scoped(device_ordinal);
 
+    // The kernel hardcodes block.x = 32 and the per-lane acc_dim/load
+    // strides assume warpSize == 32. On wave64 (CDNA gfx9xx) the kernel
+    // would launch with only 32 of 64 lanes per warp doing useful work and
+    // the strided loops would skip half of head_dim. Refuse the launch so
+    // the dispatcher falls through to the legacy single-warp kernel, which
+    // does adapt to props.warpSize.
+    hipDeviceProp_t props;
+    if (hipGetDeviceProperties(&props, device_ordinal) != hipSuccess) return 136;
+    if (props.warpSize != 32) return 137;
+
     if (head_dim <= 64) {
         return launch_tiled<T, BM, 128>(batch_size, q_heads, kv_heads,
             q_len, kv_len, head_dim, num_kv_groups, scale, seqlen_offset,
