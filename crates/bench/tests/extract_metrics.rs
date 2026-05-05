@@ -1,3 +1,4 @@
+#[allow(unused_imports)]
 use supersonic_bench::perf::{extract_metrics, ExtractedMetrics};
 
 const MODERN: &str = include_str!("fixtures/runner_output_modern.txt");
@@ -23,7 +24,7 @@ fn returns_none_when_no_result_line() {
 }
 
 #[test]
-fn returns_none_when_only_legacy_ms_per_tok_field() {
+fn accepts_ms_per_tok_as_ms_per_step_for_legacy_batch1_runners() {
     // Per spec: do not silently fall back; missing both means something broke.
     // qwen35_decode_report.rs emits ms_per_tok-only — verify we still surface ms_per_tok
     // but only when paired with ms_per_step. This format-change-detector test asserts
@@ -35,4 +36,11 @@ fn returns_none_when_only_legacy_ms_per_tok_field() {
     assert!(m.is_some(), "ms_per_tok should be accepted as ms_per_step for batch=1");
     let m = m.unwrap();
     assert!((m.ms_per_step - 8.0).abs() < 1e-6);
+}
+
+#[test]
+fn last_result_line_wins_when_multiple_present() {
+    let s = "[result] ms_per_step=5\n[result] ms_per_step=9\n";
+    let m = extract_metrics(s).unwrap();
+    assert!((m.ms_per_step - 9.0).abs() < 1e-6);
 }
