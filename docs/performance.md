@@ -22,6 +22,10 @@ from the runner's `[result] ms_per_step=N` / `ms_per_tok=N` line after
 one warm-up run; reproduce with `tests/gfx1100/bench_matrix.sh`.
 
 <!-- AUTOGEN BELOW: bench-perf-matrix -->
+| Model           |  BF16 |
+| --------------- | ----: |
+| qwen3.5-0.8b    |   8.0 |
+
 <!-- AUTOGEN END: bench-perf-matrix -->
 
 | Model           | BF16  | INT4  | FP8r  | KV-FP8 |

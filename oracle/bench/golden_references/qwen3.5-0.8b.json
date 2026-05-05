@@ -1,0 +1,25 @@
+{
+  "model": "qwen3.5-0.8b",
+  "outputs": {
+    "fox_one_line": "The quick brown fox jumps over the green hedge.\nThe quick brown fox jumps over the green hedge.\nThe quick brown fox jumps over the green hedge.\nThe quick brown fox jumps",
+    "code_python_hello": "def hello():\n     print(\"Hello, World!\")\n\nhello()\n\ndef hello2():\n     print(\"Hello, World!\")\n\nhello2()\n\ndef hello3():",
+    "code_rust_main": "fn main() {\n    println!(\n        \"Hello, World! This is a test of the `std::",
+    "story_open": "Once upon a time, in a land far away, there was a very special place called the \"Museum of the Future\". It was a place where people could see and learn about the future of technology.\n\nIn this museum, there was a special exhibition called \"The Future of Technology\". And there were some very interesting things happening there.\n\nOne day, a group",
+    "math_arith": "What is 47 + 35? The answer is 82.\n\nWhat is",
+    "qa_capital": "Q: What is the capital of France?\nA: The capital of France is Paris.",
+    "list_completion": "Three primary colors are red, blue, and yellow. What is",
+    "translate_en_de": "English: Good morning.\nGerman: Guten Morgen.\nFrench: Bonjour.",
+    "wiki_factual": "The largest planet in our solar system is the Sun.",
+    "code_complete_for": "for i in range(10):\n    print(10-i)\nprint(\"The last number is 0\")\nprint",
+    "json_emit": "{\"name\": \"Alice\", \"age\": 25,",
+    "longer_paragraph": "The sun set slowly over the mountains, casting long shadows across the valley. The air was cool and crisp, with a hint of pine needles and the distant hum of birds.\nThe sun was setting slowly over the mountains, casting long shadows across the valley. The air was cool and crisp, with a hint of pine needles and the distant hum of birds.\nThe sun was",
+    "instruction_summarize": "Summarize: The cat sat on the mat. The mat was red.\nSummary: The cat sat on the mat. The mat was red.\nThe cat sat on the mat. The mat was red",
+    "list_count": "Count to five: 1, 2, 3, 4, 5.\nCount",
+    "syllogism": "All birds can fly. A penguin is a bird. Can a penguin fly?\n\n<think>\n\n</think>\n\nYes, a penguin can fly.\n\nWhile p",
+    "code_recursive": "def fact(n):\n    if n <= 1:\n        return 1\n    return n * fact(n-1)\n\nprint(fact(5))\nprint",
+    "bullet_list": "Three benefits of exercise:\n- 1. It is a good idea to exercise.\n- 2. It is a good idea to exercise.\n- 3. It is a good idea to exercise.\nWhich of the following is the correct answer?",
+    "completion_sentence": "The reason the sky appears blue is due to the scattering of sunlight by the atmosphere.\n\n<think>\n\n</think>\n\nThe reason the sky appears blue is primarily due to **Rayleigh scattering**.\n\nHere",
+    "punctuation": "Hello, world! How are you?\n\nHello! I am Qwen",
+    "long_repeat_check": "Tell me a short story about a robot.\n\n<think>\n\n</think>\n\nThe hum of the machine was not a sound, but a low, steady vibration that seemed to fill the entire room. It was the sound of a thousand gears grinding together, a rhythmic heartbeat that matched the heartbeat of the city above.\n\nElara sat in the center of the room, her fingers hovering over the console. She was a **Nexus-9**, a humanoid robot designed to serve as the city's primary data processor. Her eyes"
+  }
+}

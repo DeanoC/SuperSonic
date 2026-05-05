@@ -21,4 +21,8 @@ The heavy lane (NIAH, RULER, lm-evaluation-harness) lives separately and is
 opt-in via `python -m oracle.bench.heavy.heavy_main`.
 
 <!-- AUTOGEN BELOW: bench-quality-table -->
+| Model | Quant | golden | perplexity_pg19 | perplexity_wikitext2 |
+|---|---|---|---|---|
+| qwen3.5-0.8b | bf16 | 1.000 | 18.912 | 21.906 |
+
 <!-- AUTOGEN END: bench-quality-table -->
