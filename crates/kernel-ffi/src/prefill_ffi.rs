@@ -3037,8 +3037,7 @@ pub fn apply_rope_prefill(
 /// byte-identical to [`apply_rope_prefill`] with `pos_offset=0`. See
 /// `crates/runner/tests/specprefill_rope_indirect_parity.rs`.
 ///
-/// HIP-only at this stage; the CUDA path returns status 316. Metal stubs
-/// return -1.
+/// Supported on HIP and CUDA. Metal stubs return -1.
 pub fn apply_rope_prefill_indirect(
     ordinal: usize,
     dtype: ScalarType,

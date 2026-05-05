@@ -68,6 +68,29 @@ int apply_rope_prefill_device(int device_ordinal,
     return 0;
 }
 
+// ---- apply_rope_prefill_indirect ----
+
+template <typename T>
+int apply_rope_prefill_indirect_device(int device_ordinal,
+                                       int seq_len, int num_heads, int head_dim, int half_rot,
+                                       const void* cos_table, const void* sin_table,
+                                       const int* pos_ids, void* data) {
+    ScopedHipDevice scoped(device_ordinal);
+    const size_t total = static_cast<size_t>(seq_len) * num_heads * half_rot;
+    constexpr int block = 256;
+    const unsigned int grid = static_cast<unsigned int>((total + block - 1) / block);
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(pfx_apply_rope_prefill_indirect_kernel<T>),
+        dim3(grid), dim3(block), 0, 0,
+        seq_len, num_heads, head_dim, half_rot,
+        static_cast<const T*>(cos_table),
+        static_cast<const T*>(sin_table),
+        pos_ids,
+        static_cast<T*>(data));
+    if (cudaGetLastError() != cudaSuccess) return 313;
+    return 0;
+}
+
 // ---- transpose [S,H,D] -> [H,S,D] ----
 
 template <typename T>
@@ -672,15 +695,26 @@ extern "C" int supersonic_qwen35_hip_apply_rope_prefill(
 }
 
 extern "C" int supersonic_qwen35_hip_apply_rope_prefill_indirect(
-    int /*dtype*/, size_t /*device_ordinal*/,
-    size_t /*seq_len*/, size_t /*num_heads*/, size_t /*head_dim*/, size_t /*half_rot*/,
-    const void* /*cos_table*/, const void* /*sin_table*/,
-    const int* /*pos_ids*/, void* /*data*/
+    int dtype, size_t device_ordinal,
+    size_t seq_len, size_t num_heads, size_t head_dim, size_t half_rot,
+    const void* cos_table, const void* sin_table,
+    const int* pos_ids, void* data
 ) {
-    // SpecPrefill (arXiv 2502.02789) is HIP-first; CUDA wiring lands
-    // alongside the Phase C end-to-end work. Returning a distinct status
-    // so a caller hitting this path on CUDA gets a clear error.
-    return 316;
+    switch (dtype) {
+    case 0: return apply_rope_prefill_indirect_device<half>(static_cast<int>(device_ordinal),
+                static_cast<int>(seq_len), static_cast<int>(num_heads),
+                static_cast<int>(head_dim), static_cast<int>(half_rot),
+                cos_table, sin_table, pos_ids, data);
+    case 1: return apply_rope_prefill_indirect_device<float>(static_cast<int>(device_ordinal),
+                static_cast<int>(seq_len), static_cast<int>(num_heads),
+                static_cast<int>(head_dim), static_cast<int>(half_rot),
+                cos_table, sin_table, pos_ids, data);
+    case 2: return apply_rope_prefill_indirect_device<hip_bfloat16>(static_cast<int>(device_ordinal),
+                static_cast<int>(seq_len), static_cast<int>(num_heads),
+                static_cast<int>(head_dim), static_cast<int>(half_rot),
+                cos_table, sin_table, pos_ids, data);
+    default: return 310;
+    }
 }
 
 extern "C" int supersonic_qwen35_hip_lookahead_attention_scores(

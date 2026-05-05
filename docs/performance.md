@@ -885,6 +885,6 @@ measurement.
 <!-- AUTOGEN BELOW: bench-perf-matrix -->
 | Model           |  INT4 | Spec050 | Spec075 |
 | --------------- | ----: | ----: | ----: |
-| qwen3.6-35b-a3b | 11100.9 | 8037.7 | 12124.2 |
+| qwen3.6-35b-a3b | 11138.5 | 6599.2 | 9497.7 |
 
 <!-- AUTOGEN END: bench-perf-matrix -->

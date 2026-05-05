@@ -17,10 +17,20 @@
 //!     the dense kernel on a full prompt of length max(pos_ids)+1 and
 //!     gathering the matching rows.
 //!
-//! Skipped silently when HIP is not compiled.
+//! Skipped silently when neither HIP nor CUDA is compiled.
 
 use gpu_hal::{Backend, GpuBuffer, ScalarType};
 use kernel_ffi::prefill_ffi::{apply_rope_prefill, apply_rope_prefill_indirect};
+
+fn select_backend() -> Option<Backend> {
+    if gpu_hal::is_backend_compiled(Backend::Hip) {
+        Some(Backend::Hip)
+    } else if gpu_hal::is_backend_compiled(Backend::Cuda) {
+        Some(Backend::Cuda)
+    } else {
+        None
+    }
+}
 
 /// Build a deterministic [seq_len, num_heads, head_dim] BF16 input on the GPU.
 /// Values are bf16-rounded f32 sequence so the per-element rotation is
@@ -131,10 +141,11 @@ fn d2h_bf16(buf: &GpuBuffer) -> Vec<half::bf16> {
 
 #[test]
 fn rope_indirect_identity_matches_dense() {
-    if !gpu_hal::is_backend_compiled(Backend::Hip) {
-        eprintln!("skipped: HIP backend not compiled");
+    let Some(backend) = select_backend() else {
+        eprintln!("skipped: neither HIP nor CUDA backend compiled");
         return;
-    }
+    };
+    gpu_hal::set_backend(backend);
     let ordinal = 0usize;
     let seq_len = 16usize;
     let num_heads = 4usize;
@@ -196,10 +207,11 @@ fn rope_indirect_identity_matches_dense() {
 
 #[test]
 fn rope_indirect_sparse_matches_gathered_dense() {
-    if !gpu_hal::is_backend_compiled(Backend::Hip) {
-        eprintln!("skipped: HIP backend not compiled");
+    let Some(backend) = select_backend() else {
+        eprintln!("skipped: neither HIP nor CUDA backend compiled");
         return;
-    }
+    };
+    gpu_hal::set_backend(backend);
     let ordinal = 0usize;
     let num_heads = 4usize;
     let head_dim = 64usize;

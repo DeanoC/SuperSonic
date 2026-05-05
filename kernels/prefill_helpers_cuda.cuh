@@ -117,6 +117,44 @@ __global__ void pfx_apply_rope_prefill_kernel(
     data[base + d1] = pfx_from_float<T>(x0 * s + x1 * c);
 }
 
+// Same as pfx_apply_rope_prefill_kernel, but cos/sin rows are selected by
+// per-slot original prompt positions. Sparse SpecPrefill uses compact
+// sequence slots while preserving absolute RoPE positions.
+template <typename T>
+__global__ void pfx_apply_rope_prefill_indirect_kernel(
+    int seq_len,
+    int num_heads,
+    int head_dim,
+    int half_rot,
+    const T* cos_table,
+    const T* sin_table,
+    const int* pos_ids,
+    T* data
+) {
+    const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t total = static_cast<size_t>(seq_len) * num_heads * half_rot;
+    if (idx >= total) return;
+
+    const int i    = static_cast<int>(idx % half_rot);
+    const int h    = static_cast<int>((idx / half_rot) % num_heads);
+    const int slot = static_cast<int>(idx / (static_cast<size_t>(half_rot) * num_heads));
+    const int pos  = pos_ids[slot];
+
+    const size_t cos_off = static_cast<size_t>(pos) * half_rot + i;
+    const float c = pfx_to_float(cos_table[cos_off]);
+    const float s = pfx_to_float(sin_table[cos_off]);
+
+    const size_t base = static_cast<size_t>(slot) * num_heads * head_dim
+                      + static_cast<size_t>(h) * head_dim;
+    const int d0 = i;
+    const int d1 = half_rot + i;
+    const float x0 = pfx_to_float(data[base + d0]);
+    const float x1 = pfx_to_float(data[base + d1]);
+
+    data[base + d0] = pfx_from_float<T>(x0 * c - x1 * s);
+    data[base + d1] = pfx_from_float<T>(x0 * s + x1 * c);
+}
+
 // ---- Kernel 3: Transpose [S, H, D] <-> [H, S, D] ----
 // src layout: [S, H, D] — element(s, h, d) at s*H*D + h*D + d
 // dst layout: [H, S, D] — element(h, s, d) at h*S*D + s*D + d
