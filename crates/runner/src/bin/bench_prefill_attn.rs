@@ -62,11 +62,21 @@ fn main() {
     let ordinal = 0usize;
     println!("ordinal: {ordinal}");
 
-    // (q_heads, kv_heads, head_dim) configs:
-    //   - (16, 8, 64)    — qwen3.5-0.8b
-    //   - (16, 8, 128)   — qwen3.5-4b
-    //   - (32, 8, 128)   — qwen3.5-9b
-    let configs = [(16usize, 8usize, 64usize), (16, 8, 128), (32, 8, 128)];
+    // (q_heads, kv_heads, head_dim) configs reflect the real shipping configs.
+    // All flagship models (Qwen 3.5 *, Qwen 3.6 35B-A3B, Gemma 4 sliding) use
+    // head_dim=256 — that's the row that matters for production. The hd=64/128
+    // rows are kept synthetic so future small-head-dim models (e.g. Phi-4-mini)
+    // are covered without a third bench edit.
+    //   - (8,  2, 256)   — qwen3.5-0.8b / 2b
+    //   - (16, 4, 256)   — qwen3.5-4b / 9b   and qwen3.6-35b-a3b
+    //   - (16, 8,  64)   — synthetic (small head_dim regime)
+    //   - (16, 8, 128)   — synthetic (medium head_dim regime)
+    let configs = [
+        (8usize, 2usize, 256usize),
+        (16, 4, 256),
+        (16, 8, 64),
+        (16, 8, 128),
+    ];
 
     for (q_heads, kv_heads, head_dim) in configs {
         println!("\n=== q_heads={q_heads} kv_heads={kv_heads} head_dim={head_dim} ===");

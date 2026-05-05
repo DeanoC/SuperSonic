@@ -162,15 +162,20 @@ fn full_attention_prefill_parity_sweep() {
         return;
     }
     let ordinal = 0usize;
-    // head_dim=64 covers Qwen 0.8B/2B; head_dim=128 covers 4B/9B.
+    // head_dim=256 is the production case (every shipping Qwen 3.5/3.6 model
+    // and Gemma 4 sliding layer). hd=64/128 are kept so the small/medium
+    // head-dim regime stays covered for future models like Phi-4-mini.
     for (q_len, kv_len, head_dim) in [
         (16usize, 16usize, 64usize),
         (16, 16, 128),
-        (64, 64, 64),
+        (16, 16, 256),
+        (64, 64, 256),
         (256, 256, 64),
-        (1024, 1024, 64),
+        (256, 256, 256),
         (1024, 1024, 128),
-        (16, 256, 64),  // q_len < kv_len with seqlen_offset
+        (1024, 1024, 256),
+        (16, 256, 64),   // q_len < kv_len with seqlen_offset
+        (16, 256, 256),  // same, hd=256
     ] {
         let seqlen_offset = if kv_len > q_len { kv_len - q_len } else { 0 };
         run_one_shape(ordinal, q_len, kv_len, head_dim, seqlen_offset, 0xCAFE);

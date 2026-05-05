@@ -120,6 +120,39 @@ int full_attention_prefill_device(
     return 0;
 }
 
+// Dispatch the K-tiled kernel with the right BK template instantiation for
+// the given head_dim. BK is picked to keep LDS (= 2 * BK * head_dim * sizeof(T))
+// under the 48 KiB safety cap on RDNA3:
+//   head_dim <=  64 → BK=128 (32 KiB at BF16, max amortization)
+//   head_dim <= 128 → BK=64  (32 KiB at BF16)
+//   head_dim <= 256 → BK=32  (32 KiB at BF16; this is the Qwen 3.5 / 3.6 / Gemma 4 case)
+// head_dim > 256 unsupported (ACC_MAX=8 × warpSize=32 cap).
+template <typename T, int BM, int BK>
+static int launch_tiled(
+    int batch_size, int q_heads, int kv_heads,
+    int q_len, int kv_len, int head_dim, int num_kv_groups,
+    float scale, int seqlen_offset,
+    const void* query, const void* key, const void* value, void* out
+) {
+    const int grid_x = (q_len + BM - 1) / BM;
+    dim3 grid(grid_x, q_heads, batch_size);
+    dim3 block(32, BM, 1);
+    const size_t lds_bytes = (size_t)2 * BK * head_dim * sizeof(T);
+    if (lds_bytes > 48 * 1024) return 133;
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(supersonic_qwen35_full_attention_prefill_tiled_kernel<T, BM, BK>),
+        grid, block, lds_bytes, 0,
+        batch_size, q_heads, kv_heads, q_len, kv_len, head_dim,
+        num_kv_groups, scale, seqlen_offset,
+        static_cast<const T*>(query),
+        static_cast<const T*>(key),
+        static_cast<const T*>(value),
+        static_cast<float*>(out));
+    if (hipGetLastError() != hipSuccess) return 134;
+    if (hipDeviceSynchronize() != hipSuccess) return 135;
+    return 0;
+}
+
 template <typename T>
 int full_attention_prefill_tiled_device(
     int device_ordinal,
@@ -138,31 +171,24 @@ int full_attention_prefill_tiled_device(
     void* out
 ) {
     constexpr int BM = 4;
-    constexpr int BK = 64;
     if (head_dim > 8 * 32) return 132;       // ACC_MAX=8 × warpSize=32 cap
     if (q_len <= 0) return 0;
 
     ScopedHipDevice scoped(device_ordinal);
 
-    const int grid_x = (q_len + BM - 1) / BM;
-    dim3 grid(grid_x, q_heads, batch_size);
-    dim3 block(32, BM, 1);   // warpSize × BM warps
-    const size_t lds_bytes = (size_t)2 * BK * head_dim * sizeof(T);
-    if (lds_bytes > 48 * 1024) return 133;   // safety cap
-
-    hipLaunchKernelGGL(
-        HIP_KERNEL_NAME(supersonic_qwen35_full_attention_prefill_tiled_kernel<T, BM, BK>),
-        grid, block, lds_bytes, 0,
-        batch_size, q_heads, kv_heads, q_len, kv_len, head_dim,
-        num_kv_groups, scale, seqlen_offset,
-        static_cast<const T*>(query),
-        static_cast<const T*>(key),
-        static_cast<const T*>(value),
-        static_cast<float*>(out));
-
-    if (hipGetLastError() != hipSuccess) return 134;
-    if (hipDeviceSynchronize() != hipSuccess) return 135;
-    return 0;
+    if (head_dim <= 64) {
+        return launch_tiled<T, BM, 128>(batch_size, q_heads, kv_heads,
+            q_len, kv_len, head_dim, num_kv_groups, scale, seqlen_offset,
+            query, key, value, out);
+    } else if (head_dim <= 128) {
+        return launch_tiled<T, BM, 64>(batch_size, q_heads, kv_heads,
+            q_len, kv_len, head_dim, num_kv_groups, scale, seqlen_offset,
+            query, key, value, out);
+    } else {
+        return launch_tiled<T, BM, 32>(batch_size, q_heads, kv_heads,
+            q_len, kv_len, head_dim, num_kv_groups, scale, seqlen_offset,
+            query, key, value, out);
+    }
 }
 
 template <typename T>
@@ -1946,12 +1972,15 @@ extern "C" int supersonic_qwen35_hip_full_attention_prefill(
     const void* value,
     void* out) {
 
-    static const bool use_tiled = []{
+    // Default: use the K-tiled FlashAttention-style kernel for BF16 prefill.
+    // SUPERSONIC_PREFILL_ATTN_TILED=0 forces the legacy single-warp
+    // online-softmax kernel (kept as a bisect/escape hatch).
+    static const bool disable_tiled = []{
         const char* e = std::getenv("SUPERSONIC_PREFILL_ATTN_TILED");
-        return e && e[0] != '\0' && e[0] != '0';
+        return e != nullptr && e[0] == '0';
     }();
 
-    if (use_tiled && dtype == 2) {  // BF16 only for the tiled path; non-BF16 falls through
+    if (!disable_tiled && dtype == 2) {  // BF16 only for the tiled path; non-BF16 falls through
         int rc = full_attention_prefill_tiled_device<hip_bfloat16>(
             static_cast<int>(device_ordinal),
             static_cast<int>(batch_size),
