@@ -312,6 +312,9 @@ def build_run_env(
     env.pop("SUPERSONIC_MOE_ISLAND_PREFETCH", None)
     env.pop("SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS", None)
     env.pop("SUPERSONIC_VMM_MOE_ISLANDS", None)
+    env.pop("SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL", None)
+    env.pop("SUPERSONIC_QWEN36_MOE_BATCHED_ATTN", None)
+    env.pop("SUPERSONIC_QWEN36_MOE_GROUPED_FFN", None)
     if args.force_moe_vmm or mode.sparse_cap is not None:
         env["SUPERSONIC_VMM_MOE_ISLANDS"] = "1"
     if mode.sparse_cap is not None:
@@ -321,6 +324,13 @@ def build_run_env(
             env["SUPERSONIC_MOE_ISLAND_PREFETCH"] = mode.prefetch_mode
         if mode.prefetch_ranks:
             env["SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS"] = mode.prefetch_ranks
+    if args.no_batched_prefill:
+        # M13: batched prefill is the default; this flag disables all three
+        # stages of the batched path for A/B comparison against the legacy
+        # per-token persistent decode prefill loop.
+        env["SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL"] = "0"
+        env["SUPERSONIC_QWEN36_MOE_BATCHED_ATTN"] = "0"
+        env["SUPERSONIC_QWEN36_MOE_GROUPED_FFN"] = "0"
     return env
 
 
@@ -641,6 +651,14 @@ def main() -> int:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="set SUPERSONIC_VMM_MOE_ISLANDS=1 for non-sparse modes too",
+    )
+    parser.add_argument(
+        "--no-batched-prefill",
+        action="store_true",
+        help="M13+: batched-Q prefill is the DEFAULT for Qwen 3.6 MoE. "
+             "This flag forces SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL=0 "
+             "(plus _BATCHED_ATTN=0 and _GROUPED_FFN=0) to bench against "
+             "the legacy per-token persistent-decode path for A/B comparison.",
     )
     parser.add_argument("--out-json", type=Path, default=Path("target/qwen36_longctx.json"))
     parser.add_argument("--out-md", type=Path, default=Path("target/qwen36_longctx.md"))

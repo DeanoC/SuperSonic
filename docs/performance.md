@@ -387,6 +387,58 @@ cargo build --release --bin supersonic
   --max-new-tokens 16 --emit-stage-timings
 ```
 
+#### Long-context prefill (batched-Q, default since 2026-05-05)
+
+Long-context prefill on `qwen3.6-35b-a3b` was the dominant wall-clock
+cost for the research workload that drove this work — 9.6 minutes to
+prefill 8K tokens on the per-token persistent megakernel. The
+batched-Q prefill path (now the default) chunks the prompt and runs
+all 32 full-attention layers' attention through a K-tiled
+FlashAttention-style kernel that shares K/V tile loads across the
+chunk's queries, plus a permute-by-expert grouped INT4 GEMM for the
+MoE FFN that runs all 256 experts in one launch per layer per chunk.
+
+Bench (gfx1100, qwen3.6-35b-a3b INT4, NIAH-style synthetic prompts,
+`prefill_total_ms` from `--emit-stage-timings`):
+
+| Context | Per-token (legacy) | Batched-Q (default) | Speedup |
+|--------:|-------------------:|--------------------:|--------:|
+|     512 |             13.4 s |               8.9 s |   1.50× |
+|    2048 |             61.1 s |              38.6 s |   1.58× |
+|    4096 |            134.4 s |              75.0 s |  **1.79×** |
+
+Chunk size is chosen at runtime from the prompt's prefix context,
+capped at the largest size that gives 100% WMMA utilization in the
+grouped MoE GEMM (`chunk = 16 × num_experts / top_k = 512` for
+`top_k=8` and `num_experts=256`); larger chunks land marginal extra
+K-tile-share in attention. Trailing partial chunks use the exact
+remaining size in one call.
+
+Bisect/escape hatches (each defaults OFF — i.e. batched is on):
+  - `SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL=0` — revert entire prefill
+    loop to the legacy per-token persistent megakernel.
+  - `SUPERSONIC_QWEN36_MOE_BATCHED_ATTN=0` — keep the chunked
+    orchestrator but call per-token chain step inside each chunk
+    (no perf benefit, just structural).
+  - `SUPERSONIC_QWEN36_MOE_GROUPED_FFN=0` — keep batched attention
+    but fall back to per-token FFN inside the chunk.
+
+FP8 KV cache and SpecPrefill / sparse-prefill modes automatically
+fall through to the per-token path (`supports_batched_path()` in
+`crates/runner/src/qwen36_moe/batched_prefill.rs`).
+
+Reproduce the A/B:
+
+```bash
+# Baseline (legacy per-token):
+python3 tests/gfx1100/bench_qwen36_longctx.py --no-batched-prefill \
+  --contexts 512,2048,4096 --modes int4-vmm --max-new-tokens 4
+
+# Batched (default):
+python3 tests/gfx1100/bench_qwen36_longctx.py \
+  --contexts 512,2048,4096 --modes int4-vmm --max-new-tokens 4
+```
+
 ## HIP — `gfx1150` (AMD Radeon 890M iGPU)
 
 16 CUs, 2.9 GHz core, shared with system memory. Measurements on

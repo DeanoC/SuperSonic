@@ -169,6 +169,8 @@ impl<'a> PrefillProfileScope<'a> {
                 entry.total_bytes,
             );
         }
+        disable_prefill_profiles();
+        self.active = false;
         if let Some(path) = self.json_path {
             let ffi_entries: Vec<_> = ffi
                 .entries
@@ -224,8 +226,6 @@ impl<'a> PrefillProfileScope<'a> {
             });
             std::fs::write(path, serde_json::to_vec_pretty(&payload)?)?;
         }
-        disable_prefill_profiles();
-        self.active = false;
         Ok(())
     }
 }

@@ -50,7 +50,7 @@ use crate::registry::RegistryEntry;
 /// position (during prefill of kept tokens) or the absolute
 /// generation position (after prefill ends) while the cache slot
 /// is the compact `loop_state_position`.
-fn current_position(
+pub(crate) fn current_position(
     step: usize,
     loop_state_position: i32,
     keep_mask: Option<&Vec<bool>>,
@@ -405,10 +405,25 @@ fn decode_text(
         moe_runtime.prefetch_mode,
         moe_runtime.transition_min_observations,
     );
-    let mut prefilled_steps = 0usize;
+    // Batched-Q prefill opt-in. Read once. When set the new chunked
+    // host orchestrator drives the prefill range
+    // `[0, effective_prompt_len - 1)` instead of the engine's main
+    // per-step loop — see
+    // docs/superpowers/plans/2026-05-05-qwen36-moe-batched-prefill-phase1.md.
+    // M13: batched-prefill is the DEFAULT for Qwen 3.6 MoE. Bench at
+    // 4K context (gfx1100, qwen3.6-35b-a3b INT4) shows 1.79x prefill
+    // speedup vs the per-token persistent megakernel. Set
+    // SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL=0 to revert to the legacy
+    // per-token path (kept as a bisect/escape hatch).
+    let batched_prefill_disabled = std::env::var("SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL")
+        .map(|v| v == "0")
+        .unwrap_or(false);
+
+    let mut start_step = 0usize;
     let dense_prefill_token_loop =
         std::env::var_os("SUPERSONIC_QWEN36_DENSE_PREFILL_TOKEN_LOOP").is_some();
-    if dense_prefill_token_loop
+    if batched_prefill_disabled
+        && dense_prefill_token_loop
         && keep_mask.is_none()
         && _moe_expert_residency.is_none()
         && effective_prompt_len > 1
@@ -425,7 +440,7 @@ fn decode_text(
                     0,
                 )
                 .context("persistent dense prefill token loop")?;
-            prefilled_steps = dense_prefill_count;
+            start_step = dense_prefill_count;
             prefill_steps += dense_prefill_count;
             prefill_chain_elapsed += t_prefill;
             loop_state.position += dense_prefill_count as i32;
@@ -433,7 +448,45 @@ fn decode_text(
         }
     }
 
-    for step in prefilled_steps..loop_state.total_steps {
+    if start_step == 0 && !batched_prefill_disabled && effective_prompt_len > 1 {
+        let timings = crate::qwen36_moe_cli::batched_prefill::run_batched_prefill_stub(
+            ordinal,
+            &geom,
+            &store,
+            weight_prefix,
+            &mut layers,
+            persistent_scratch.as_mut(),
+            _moe_expert_residency.as_mut(),
+            &mut moe_runtime,
+            &mut moe_routes,
+            &mut loop_state,
+            &prompt_ids,
+            keep_mask.as_ref(),
+            &kept_positions,
+            effective_prompt_len,
+            emit_stage_timings,
+        )?;
+        eprintln!(
+            "[qwen36-moe batched-prefill] chunks={} tokens={} embed_ms={:.1} chain_ms={:.1}",
+            timings.chunks,
+            timings.tokens,
+            timings.embed_total.as_secs_f64() * 1000.0,
+            timings.chain_total.as_secs_f64() * 1000.0,
+        );
+        prefill_steps += timings.tokens;
+        prefill_embed_elapsed += timings.embed_total;
+        prefill_chain_elapsed += timings.chain_total;
+        // After the orchestrator processes prefill steps
+        // [0, effective_prompt_len - 1), the engine's main loop must
+        // resume at the FIRST generation step (where logits are
+        // computed). At that point `loop_state.position ==
+        // effective_prompt_len - 1` (incremented once per processed
+        // token) and `loop_state.current_token` is the LAST prompt
+        // token (the one to fold into logits in the gen step).
+        start_step = effective_prompt_len - 1;
+    }
+
+    for step in start_step..loop_state.total_steps {
         // When speculative decode is on, each iteration can commit
         // multiple tokens (up to K+1), so the standard `total_steps =
         // prompt_len + max_new - 1` count over-shoots. Break here once
@@ -460,7 +513,8 @@ fn decode_text(
             effective_prompt_len,
             prompt_ids.len(),
         );
-        if dense_prefill_token_loop
+        if batched_prefill_disabled
+            && dense_prefill_token_loop
             && !is_gen_step
             && keep_mask.is_none()
             && _moe_expert_residency.is_none()
