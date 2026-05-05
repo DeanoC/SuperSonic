@@ -54,3 +54,13 @@ fn extracts_qwen36_prefill_lifecycle_when_result_line_is_absent() {
     let m = extract_metrics(s).unwrap();
     assert!((m.ms_per_step - 2441.711).abs() < 1e-6);
 }
+
+#[test]
+fn extracts_qwen36_batched_prefill_lines_when_result_line_is_absent() {
+    let s = "\
+[qwen36-moe batched-prefill] chunks=1 tokens=119 embed_ms=0.2 chain_ms=3472.0
+[qwen36-moe batched-prefill] chunks=1 tokens=8 embed_ms=0.1 chain_ms=42.3
+";
+    let m = extract_metrics(s).unwrap();
+    assert!((m.ms_per_step - 3514.6).abs() < 1e-6);
+}

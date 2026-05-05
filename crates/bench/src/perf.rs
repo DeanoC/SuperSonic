@@ -14,7 +14,7 @@ pub struct ExtractedMetrics {
 /// Parse the last `[result] ms_per_step=N ...` line from the combined
 /// stdout+stderr output of a `supersonic` subprocess. Most runner engines
 /// emit `[result]` via `eprintln!`, so callers MUST pass the merged stream.
-/// Returns `None` if no `[result]` line is present.
+/// Returns `None` if no recognized metric line is present.
 /// Falls back to `ms_per_tok` for batch=1 paths that only emit that field
 /// (qwen35_decode_report.rs).
 pub fn extract_metrics(output: &str) -> Option<ExtractedMetrics> {
@@ -34,14 +34,36 @@ pub fn extract_metrics(output: &str) -> Option<ExtractedMetrics> {
         };
     }
 
-    let lifecycle_line = output
+    if let Some(lifecycle_line) = output
         .lines()
         .rev()
-        .find(|l| l.starts_with("[qwen36-moe lifecycle-timings]"))?;
-    parse_field(lifecycle_line, "prefill_total_ms").map(|s| ExtractedMetrics {
-        ms_per_step: s,
-        ms_per_tok: Some(s),
-    })
+        .find(|l| l.starts_with("[qwen36-moe lifecycle-timings]"))
+    {
+        return parse_field(lifecycle_line, "prefill_total_ms").map(|s| ExtractedMetrics {
+            ms_per_step: s,
+            ms_per_tok: Some(s),
+        });
+    }
+
+    let mut batched_prefill_total_ms = 0.0;
+    let mut saw_batched_prefill = false;
+    for line in output
+        .lines()
+        .filter(|l| l.starts_with("[qwen36-moe batched-prefill]"))
+    {
+        let embed_ms = parse_field(line, "embed_ms").unwrap_or(0.0);
+        let chain_ms = parse_field(line, "chain_ms")?;
+        batched_prefill_total_ms += embed_ms + chain_ms;
+        saw_batched_prefill = true;
+    }
+    if saw_batched_prefill {
+        return Some(ExtractedMetrics {
+            ms_per_step: batched_prefill_total_ms,
+            ms_per_tok: Some(batched_prefill_total_ms),
+        });
+    }
+
+    None
 }
 
 fn parse_field(line: &str, key: &str) -> Option<f64> {
@@ -150,7 +172,7 @@ fn invoke_supersonic(
             .rev()
             .collect::<Vec<_>>()
             .join("\n");
-        format!("no [result] line; tail:\n{tail}")
+        format!("no recognized metric line; tail:\n{tail}")
     })
 }
 
