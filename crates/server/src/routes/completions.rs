@@ -8,7 +8,7 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use futures::stream::Stream;
 
-use super::chat::{generation_error, queue_error};
+use super::chat::{cache_request, generation_error, queue_error, usage};
 use super::sse;
 use crate::compat::validate_model;
 use crate::errors::ApiError;
@@ -16,7 +16,7 @@ use crate::generate::{self, GenParams};
 use crate::ids;
 use crate::schemas::{
     CompletionChoice, CompletionRequest, CompletionResponse, CompletionStreamChoice,
-    CompletionStreamChunk, SinglePrompt, Usage,
+    CompletionStreamChunk, SinglePrompt,
 };
 use crate::state::ServerState;
 
@@ -60,13 +60,27 @@ pub async fn completions(
         .unwrap_or(false);
 
     if req.stream {
-        let rx = generate::spawn(state.clone(), prompt_ids, params).map_err(queue_error)?;
+        let cache = cache_request(
+            &state,
+            req.user.as_deref(),
+            req.metadata.as_ref(),
+            req.prompt_cache_key.as_deref(),
+            req.prompt_cache_retention.as_deref(),
+        );
+        let rx = generate::spawn(state.clone(), prompt_ids, params, cache).map_err(queue_error)?;
         let stream = completion_sse_stream(rx, id, created, model, include_usage);
         Ok(Sse::new(stream)
             .keep_alive(KeepAlive::default())
             .into_response())
     } else {
-        let rx = generate::spawn(state.clone(), prompt_ids, params).map_err(queue_error)?;
+        let cache = cache_request(
+            &state,
+            req.user.as_deref(),
+            req.metadata.as_ref(),
+            req.prompt_cache_key.as_deref(),
+            req.prompt_cache_retention.as_deref(),
+        );
+        let rx = generate::spawn(state.clone(), prompt_ids, params, cache).map_err(queue_error)?;
         let result = generate::collect(rx).await.map_err(generation_error)?;
         let resp = CompletionResponse {
             id,
@@ -79,11 +93,11 @@ pub async fn completions(
                 logprobs: None,
                 finish_reason: result.finish.as_str(),
             }],
-            usage: Usage {
-                prompt_tokens: result.prompt_tokens,
-                completion_tokens: result.completion_tokens,
-                total_tokens: result.prompt_tokens + result.completion_tokens,
-            },
+            usage: usage(
+                result.prompt_tokens,
+                result.completion_tokens,
+                result.cached_prompt_tokens,
+            ),
         };
         Ok(Json(resp).into_response())
     }

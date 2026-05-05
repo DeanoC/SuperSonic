@@ -597,6 +597,33 @@ pub struct Gemma4Engine {
     fp8_scale_descs_gpu: Option<GpuBuffer>,
 }
 
+pub struct Gemma4EngineSnapshot {
+    k_caches: Vec<GpuBuffer>,
+    v_caches: Vec<GpuBuffer>,
+    pub logits: Vec<f32>,
+}
+
+impl Gemma4EngineSnapshot {
+    pub fn try_clone(&self) -> Result<Self> {
+        Ok(Self {
+            k_caches: clone_buffers(&self.k_caches, "Gemma 4 K snapshot")?,
+            v_caches: clone_buffers(&self.v_caches, "Gemma 4 V snapshot")?,
+            logits: self.logits.clone(),
+        })
+    }
+}
+
+fn clone_buffers(buffers: &[GpuBuffer], label: &str) -> Result<Vec<GpuBuffer>> {
+    buffers
+        .iter()
+        .enumerate()
+        .map(|(i, b)| {
+            b.clone_device()
+                .map_err(|e| anyhow!("{label} layer {i}: {e}"))
+        })
+        .collect()
+}
+
 impl Gemma4Engine {
     /// Load all weights for a Gemma 4 dense variant and initialize GPU state
     /// for a single decoding sequence (`batch_size = 1`). Convenience wrapper
@@ -1163,6 +1190,39 @@ impl Gemma4Engine {
     /// Number of parallel sequences this engine was sized for.
     pub fn batch_size(&self) -> usize {
         self.batch_size
+    }
+
+    pub fn snapshot_prefix(&self, logits: Vec<f32>) -> Result<Gemma4EngineSnapshot> {
+        Ok(Gemma4EngineSnapshot {
+            k_caches: clone_buffers(&self.k_caches[0], "Gemma 4 K prefix")?,
+            v_caches: clone_buffers(&self.v_caches[0], "Gemma 4 V prefix")?,
+            logits,
+        })
+    }
+
+    pub fn restore_prefix(&mut self, snapshot: &Gemma4EngineSnapshot) -> Result<Vec<f32>> {
+        if snapshot.k_caches.len() != self.k_caches[0].len()
+            || snapshot.v_caches.len() != self.v_caches[0].len()
+        {
+            bail!("Gemma 4 prefix snapshot layer count mismatch");
+        }
+        for (i, src) in snapshot.k_caches.iter().enumerate() {
+            let dst = &mut self.k_caches[0][i];
+            if dst.len_bytes() != src.len_bytes() {
+                bail!("Gemma 4 K prefix snapshot size mismatch at layer {i}");
+            }
+            gpu_hal::copy_d2d(self.device, dst.as_mut_ptr(), src.as_ptr(), src.len_bytes())
+                .map_err(|e| anyhow!("restore Gemma 4 K prefix layer {i}: {e}"))?;
+        }
+        for (i, src) in snapshot.v_caches.iter().enumerate() {
+            let dst = &mut self.v_caches[0][i];
+            if dst.len_bytes() != src.len_bytes() {
+                bail!("Gemma 4 V prefix snapshot size mismatch at layer {i}");
+            }
+            gpu_hal::copy_d2d(self.device, dst.as_mut_ptr(), src.as_ptr(), src.len_bytes())
+                .map_err(|e| anyhow!("restore Gemma 4 V prefix layer {i}: {e}"))?;
+        }
+        Ok(snapshot.logits.clone())
     }
 
     pub fn text_config(&self) -> &TextConfig {

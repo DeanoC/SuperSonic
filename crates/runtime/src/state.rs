@@ -17,6 +17,7 @@ use crate::bakes::ensure_hf_metadata_present;
 use crate::builders::{build_gemma4, build_qwen};
 use crate::chat_template::ChatTemplate;
 use crate::generate::MockGeneration;
+use crate::prefix_cache::{PrefixCache, PrefixCacheConfig};
 use crate::session::InferenceSession;
 use supersonic_core::capabilities::{capabilities_for_variant, ModelCapabilities};
 
@@ -39,6 +40,7 @@ pub struct ServerState {
     pub response_store_max_entries: usize,
     pub scheduler: Arc<GenerationScheduler>,
     pub capabilities: ModelCapabilities,
+    pub prefix_cache: Arc<PrefixCache>,
 }
 
 pub struct GenerationScheduler {
@@ -81,6 +83,12 @@ pub struct LoaderConfig {
     /// Disable automatic bake download from the GitHub release. Air-gapped
     /// or reproducibility-focused deploys should set this.
     pub no_download: bool,
+    pub prefix_cache_enabled: bool,
+    pub prefix_cache_dir: Option<PathBuf>,
+    pub prefix_cache_min_tokens: usize,
+    pub prefix_cache_max_entries: usize,
+    pub prefix_cache_memory_ttl_secs: u64,
+    pub prefix_cache_disk_ttl_secs: u64,
 }
 
 /// Preferred runtime-facing name for loader configuration. `LoaderConfig`
@@ -179,6 +187,11 @@ pub fn build(cfg: LoaderConfig) -> Result<ServerState> {
         "server state ready"
     );
 
+    let cache_dir = cfg
+        .prefix_cache_dir
+        .clone()
+        .unwrap_or_else(|| cfg.model_dir.join(".supersonic/serve-cache/v1"));
+
     Ok(ServerState {
         server_instance_id: NEXT_SERVER_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
         model_id: variant.to_string(),
@@ -197,6 +210,14 @@ pub fn build(cfg: LoaderConfig) -> Result<ServerState> {
             cfg.queue_timeout_ms,
         )),
         capabilities,
+        prefix_cache: Arc::new(PrefixCache::new(PrefixCacheConfig {
+            enabled: cfg.prefix_cache_enabled,
+            dir: cache_dir,
+            min_tokens: cfg.prefix_cache_min_tokens,
+            max_entries: cfg.prefix_cache_max_entries,
+            memory_ttl_secs: cfg.prefix_cache_memory_ttl_secs,
+            disk_ttl_secs: cfg.prefix_cache_disk_ttl_secs,
+        })),
     })
 }
 
@@ -280,6 +301,12 @@ mod tests {
             max_queued_requests: 32,
             queue_timeout_ms: 30_000,
             no_download: true,
+            prefix_cache_enabled: true,
+            prefix_cache_dir: None,
+            prefix_cache_min_tokens: 128,
+            prefix_cache_max_entries: 1,
+            prefix_cache_memory_ttl_secs: 600,
+            prefix_cache_disk_ttl_secs: 86_400,
         }
     }
 

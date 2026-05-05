@@ -81,6 +81,14 @@ pub struct ChatCompletionRequest {
     pub n: Option<u32>,
     #[serde(default)]
     pub logprobs: Option<bool>,
+    #[serde(default)]
+    pub user: Option<String>,
+    #[serde(default)]
+    pub metadata: Option<JsonValue>,
+    #[serde(default)]
+    pub prompt_cache_key: Option<String>,
+    #[serde(default)]
+    pub prompt_cache_retention: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -105,6 +113,13 @@ pub struct Usage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PromptTokensDetails {
+    pub cached_tokens: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -232,6 +247,14 @@ pub struct CompletionRequest {
     pub logprobs: Option<JsonValue>,
     #[serde(default)]
     pub echo: Option<bool>,
+    #[serde(default)]
+    pub user: Option<String>,
+    #[serde(default)]
+    pub metadata: Option<JsonValue>,
+    #[serde(default)]
+    pub prompt_cache_key: Option<String>,
+    #[serde(default)]
+    pub prompt_cache_retention: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

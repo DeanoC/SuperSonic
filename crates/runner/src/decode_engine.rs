@@ -863,6 +863,23 @@ pub struct DecodeEngine {
     metal_v2_scratch: Option<prefill_engine::MetalV2DecodeScratch>,
 }
 
+pub struct DecodeEngineSnapshot {
+    state: ModelState,
+    pub logits: Vec<f32>,
+}
+
+impl DecodeEngineSnapshot {
+    pub fn try_clone(&self) -> Result<Self> {
+        Ok(Self {
+            state: self
+                .state
+                .clone_gpu()
+                .map_err(|e| anyhow::anyhow!("clone Qwen prefix snapshot: {e}"))?,
+            logits: self.logits.clone(),
+        })
+    }
+}
+
 /// Per-call workspace for `DecodeEngine::verify_block_fused_decode`.
 ///
 /// The fused verify path needs a B-sized workspace (F32 projection +
@@ -10370,6 +10387,35 @@ impl DecodeEngine {
             .reset_sync()
             .map_err(|e| anyhow::anyhow!("reset sync: {e}"))?;
         Ok(())
+    }
+
+    pub fn snapshot_prefix(&self, logits: Vec<f32>) -> Result<DecodeEngineSnapshot> {
+        Ok(DecodeEngineSnapshot {
+            state: self
+                .state
+                .clone_gpu()
+                .map_err(|e| anyhow::anyhow!("snapshot Qwen prefix state: {e}"))?,
+            logits,
+        })
+    }
+
+    pub fn restore_prefix(&mut self, snapshot: &DecodeEngineSnapshot) -> Result<Vec<f32>> {
+        self.state = snapshot
+            .state
+            .clone_gpu()
+            .map_err(|e| anyhow::anyhow!("restore Qwen prefix state: {e}"))?;
+        self.scratch
+            .reset_sync()
+            .map_err(|e| anyhow::anyhow!("reset sync after prefix restore: {e}"))?;
+        Ok(snapshot.logits.clone())
+    }
+
+    pub fn restore_prefix_owned(&mut self, snapshot: DecodeEngineSnapshot) -> Result<Vec<f32>> {
+        self.state = snapshot.state;
+        self.scratch
+            .reset_sync()
+            .map_err(|e| anyhow::anyhow!("reset sync after prefix restore: {e}"))?;
+        Ok(snapshot.logits)
     }
 
     /// Run native GPU prefill on the prompt, returning logits for the last token.

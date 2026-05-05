@@ -12,6 +12,7 @@ use serde::Serialize;
 use crate::compat::validate_model;
 use crate::errors::ApiError;
 use crate::generate;
+use crate::prefix_cache::PrefixCacheStats;
 use crate::schemas::{ListModelsResponse, ModelObject};
 use crate::state::ServerState;
 
@@ -53,12 +54,14 @@ pub struct HealthResponse {
     pub active_requests: usize,
     pub queued_requests: usize,
     pub max_queued_requests: usize,
+    pub prefix_cache_entries: usize,
 }
 
 pub async fn health(
     State(state): State<Arc<ServerState>>,
 ) -> Result<Json<HealthResponse>, ApiError> {
     let queue = generate::scheduler_snapshot(&state);
+    let cache = state.prefix_cache.stats();
     Ok(Json(HealthResponse {
         status: "ok",
         model: state.model_id.clone(),
@@ -66,6 +69,7 @@ pub async fn health(
         active_requests: queue.active,
         queued_requests: queue.queued,
         max_queued_requests: queue.max_queue,
+        prefix_cache_entries: cache.entries,
     }))
 }
 
@@ -84,6 +88,7 @@ pub struct CapabilitiesResponse {
     pub tools: bool,
     pub reasoning: bool,
     pub scheduler: SchedulerCapabilities,
+    pub prefix_cache: PrefixCacheStats,
 }
 
 #[derive(Debug, Serialize)]
@@ -98,6 +103,7 @@ pub async fn capabilities(
     State(state): State<Arc<ServerState>>,
 ) -> Result<Json<CapabilitiesResponse>, ApiError> {
     let queue = generate::scheduler_snapshot(&state);
+    let cache = state.prefix_cache.stats();
     Ok(Json(CapabilitiesResponse {
         model: state.model_id.clone(),
         family: state.model_family.to_string(),
@@ -131,11 +137,13 @@ pub async fn capabilities(
             max_queued_requests: queue.max_queue,
             queue_timeout_ms: queue.queue_timeout_ms,
         },
+        prefix_cache: cache,
     }))
 }
 
 pub async fn metrics(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
     let queue = generate::scheduler_snapshot(&state);
+    let cache = state.prefix_cache.stats();
     let body = format!(
         "# TYPE supersonic_active_requests gauge\n\
          supersonic_active_requests {}\n\
@@ -146,8 +154,33 @@ pub async fn metrics(State(state): State<Arc<ServerState>>) -> impl IntoResponse
          # TYPE supersonic_queue_timeout_ms gauge\n\
          supersonic_queue_timeout_ms {}\n\
          # TYPE supersonic_max_context gauge\n\
-         supersonic_max_context {}\n",
-        queue.active, queue.queued, queue.max_queue, queue.queue_timeout_ms, state.max_context
+         supersonic_max_context {}\n\
+         # TYPE supersonic_prefix_cache_entries gauge\n\
+         supersonic_prefix_cache_entries {}\n\
+         # TYPE supersonic_prefix_cache_hits counter\n\
+         supersonic_prefix_cache_hits {}\n\
+         # TYPE supersonic_prefix_cache_misses counter\n\
+         supersonic_prefix_cache_misses {}\n\
+         # TYPE supersonic_prefix_cache_cached_tokens counter\n\
+         supersonic_prefix_cache_cached_tokens {}\n\
+         # TYPE supersonic_prefix_cache_evictions counter\n\
+         supersonic_prefix_cache_evictions {}\n\
+         # TYPE supersonic_prefix_cache_disk_writes counter\n\
+         supersonic_prefix_cache_disk_writes {}\n\
+         # TYPE supersonic_prefix_cache_restore_failures counter\n\
+         supersonic_prefix_cache_restore_failures {}\n",
+        queue.active,
+        queue.queued,
+        queue.max_queue,
+        queue.queue_timeout_ms,
+        state.max_context,
+        cache.entries,
+        cache.hits,
+        cache.misses,
+        cache.cached_tokens,
+        cache.evictions,
+        cache.disk_writes,
+        cache.restore_failures,
     );
     ([(CONTENT_TYPE, "text/plain; version=0.0.4")], body)
 }

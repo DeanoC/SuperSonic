@@ -17,9 +17,9 @@ use crate::errors::ApiError;
 use crate::generate::{self, GenParams};
 use crate::output::{parse_assistant_output, AssistantOutput};
 use crate::routes::chat::{
-    apply_response_format_hint, content_to_text, generation_error, has_incomplete_control_block,
-    normalize_tool_calls_for_template, queue_error, reasoning_enabled, response_format_json_object,
-    validate_tools,
+    apply_response_format_hint, cache_request, content_to_text, generation_error,
+    has_incomplete_control_block, normalize_tool_calls_for_template, queue_error,
+    reasoning_enabled, response_format_json_object, usage, validate_tools,
 };
 use crate::schemas::{OpenAiToolCall, StopParam, Usage};
 use crate::state::ServerState;
@@ -78,6 +78,8 @@ pub struct StoredResponse {
     pub status: &'static str,
     pub output: Vec<ResponseOutputItem>,
     pub usage: Usage,
+    #[serde(skip_serializing)]
+    pub cache_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -147,6 +149,14 @@ pub struct ResponseRequest {
     pub reasoning: Option<ResponseReasoning>,
     #[serde(default)]
     pub previous_response_id: Option<String>,
+    #[serde(default)]
+    pub user: Option<String>,
+    #[serde(default)]
+    pub metadata: Option<Value>,
+    #[serde(default)]
+    pub prompt_cache_key: Option<String>,
+    #[serde(default)]
+    pub prompt_cache_retention: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -196,6 +206,11 @@ pub async fn create(
             .join("\n")
     };
 
+    let id = next_response_id(state.server_instance_id);
+    let created_at = crate::ids::epoch_secs();
+    let model = state.model_id.clone();
+    let response_cache_key = response_cache_key(&req, state.server_instance_id, &id);
+
     let params = GenParams {
         temperature: req.temperature.unwrap_or(1.0),
         top_p: req.top_p.unwrap_or(1.0),
@@ -211,12 +226,15 @@ pub async fn create(
     )
     .map_err(|e| ApiError::bad_request(e.to_string()))?;
 
-    let id = next_response_id(state.server_instance_id);
-    let created_at = crate::ids::epoch_secs();
-    let model = state.model_id.clone();
-
     if req.stream {
-        let rx = generate::spawn(state.clone(), prompt_ids, params).map_err(queue_error)?;
+        let cache = cache_request(
+            &state,
+            req.user.as_deref(),
+            req.metadata.as_ref(),
+            response_cache_key.as_deref(),
+            req.prompt_cache_retention.as_deref(),
+        );
+        let rx = generate::spawn(state.clone(), prompt_ids, params, cache).map_err(queue_error)?;
         let stream = response_sse_stream(
             rx,
             id,
@@ -224,12 +242,20 @@ pub async fn create(
             created_at,
             state.server_instance_id,
             state.response_store_max_entries,
+            response_cache_key,
         );
         Ok(Sse::new(stream)
             .keep_alive(KeepAlive::default())
             .into_response())
     } else {
-        let rx = generate::spawn(state.clone(), prompt_ids, params).map_err(queue_error)?;
+        let cache = cache_request(
+            &state,
+            req.user.as_deref(),
+            req.metadata.as_ref(),
+            response_cache_key.as_deref(),
+            req.prompt_cache_retention.as_deref(),
+        );
+        let rx = generate::spawn(state.clone(), prompt_ids, params, cache).map_err(queue_error)?;
         let result = generate::collect(rx).await.map_err(generation_error)?;
         let parsed = parse_assistant_output(&result.text);
         let stored = build_response(
@@ -237,11 +263,12 @@ pub async fn create(
             model,
             created_at,
             parsed,
-            Usage {
-                prompt_tokens: result.prompt_tokens,
-                completion_tokens: result.completion_tokens,
-                total_tokens: result.prompt_tokens + result.completion_tokens,
-            },
+            usage(
+                result.prompt_tokens,
+                result.completion_tokens,
+                result.cached_prompt_tokens,
+            ),
+            response_cache_key,
         );
         insert_response(
             state.server_instance_id,
@@ -283,6 +310,7 @@ fn response_sse_stream(
     created_at: u64,
     server_instance_id: u64,
     response_store_max_entries: usize,
+    cache_key: Option<String>,
 ) -> impl Stream<Item = super::sse::SseEvent> {
     async_stream::stream! {
         yield Ok(Event::default()
@@ -317,18 +345,15 @@ fn response_sse_stream(
                         }
                     }
                 }
-                generate::GenEvent::Done { prompt_tokens, completion_tokens, .. } => {
+                generate::GenEvent::Done { prompt_tokens, completion_tokens, cached_prompt_tokens, .. } => {
                     let parsed = parse_assistant_output(&raw);
                     let stored = build_response(
                         id.clone(),
                         model.clone(),
                         created_at,
                         parsed,
-                        Usage {
-                            prompt_tokens,
-                            completion_tokens,
-                            total_tokens: prompt_tokens + completion_tokens,
-                        },
+                        usage(prompt_tokens, completion_tokens, cached_prompt_tokens),
+                        cache_key.clone(),
                     );
                     insert_response(
                         server_instance_id,
@@ -523,12 +548,29 @@ fn response_format_value(req: &ResponseRequest) -> Option<&Value> {
         .or_else(|| req.text.as_ref().and_then(|text| text.get("format")))
 }
 
+fn response_cache_key(
+    req: &ResponseRequest,
+    server_instance_id: u64,
+    current_response_id: &str,
+) -> Option<String> {
+    if let Some(key) = req.prompt_cache_key.as_ref() {
+        return Some(key.clone());
+    }
+    if let Some(previous_response_id) = req.previous_response_id.as_ref() {
+        return get_response(server_instance_id, previous_response_id)
+            .and_then(|prev| prev.cache_key)
+            .or_else(|| Some(previous_response_id.clone()));
+    }
+    Some(current_response_id.to_string())
+}
+
 fn build_response(
     id: String,
     model: String,
     created_at: u64,
     parsed: AssistantOutput,
     usage: Usage,
+    cache_key: Option<String>,
 ) -> StoredResponse {
     let mut output = Vec::new();
     if let Some(reasoning) = parsed.reasoning_content {
@@ -558,6 +600,7 @@ fn build_response(
         status: "completed",
         output,
         usage,
+        cache_key,
     }
 }
 
@@ -645,7 +688,9 @@ mod tests {
                 prompt_tokens: 1,
                 completion_tokens: 2,
                 total_tokens: 3,
+                prompt_tokens_details: None,
             },
+            Some("thread-cache".to_string()),
         );
         assert!(matches!(
             resp.output[0],
@@ -666,6 +711,74 @@ mod tests {
 
         assert!(store.get("first").is_none());
         assert!(store.get("second").is_some());
+    }
+
+    #[test]
+    fn response_cache_key_inherits_previous_chain_key() {
+        let server_instance_id = 900_001;
+        let first_id = "resp-first".to_string();
+        insert_response(
+            server_instance_id,
+            first_id.clone(),
+            empty_response_with_cache_key(&first_id, Some("resp-first")),
+            8,
+        );
+        let req = ResponseRequest {
+            model: None,
+            input: json!("next"),
+            instructions: None,
+            temperature: None,
+            top_p: None,
+            max_output_tokens: None,
+            stream: false,
+            stop: None,
+            seed: None,
+            tools: None,
+            tool_choice: None,
+            response_format: None,
+            text: None,
+            reasoning: None,
+            previous_response_id: Some(first_id),
+            user: None,
+            metadata: None,
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
+        };
+
+        assert_eq!(
+            response_cache_key(&req, server_instance_id, "resp-second").as_deref(),
+            Some("resp-first")
+        );
+    }
+
+    #[test]
+    fn response_cache_key_prefers_explicit_request_key() {
+        let req = ResponseRequest {
+            model: None,
+            input: json!("next"),
+            instructions: None,
+            temperature: None,
+            top_p: None,
+            max_output_tokens: None,
+            stream: false,
+            stop: None,
+            seed: None,
+            tools: None,
+            tool_choice: None,
+            response_format: None,
+            text: None,
+            reasoning: None,
+            previous_response_id: Some("resp-prev".to_string()),
+            user: None,
+            metadata: None,
+            prompt_cache_key: Some("stable-thread".to_string()),
+            prompt_cache_retention: None,
+        };
+
+        assert_eq!(
+            response_cache_key(&req, 0, "resp-current").as_deref(),
+            Some("stable-thread")
+        );
     }
 
     #[test]
@@ -696,6 +809,10 @@ mod tests {
             text: None,
             reasoning: None,
             previous_response_id: None,
+            user: None,
+            metadata: None,
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
         };
         let messages = response_messages(&req, 0).unwrap();
         assert_eq!(messages[0].role, "system");
@@ -723,6 +840,10 @@ mod tests {
             text: None,
             reasoning: None,
             previous_response_id: None,
+            user: None,
+            metadata: None,
+            prompt_cache_key: None,
+            prompt_cache_retention: None,
         };
         let messages = response_messages(&req, 0).unwrap();
         assert_eq!(messages[0].role, "user");
@@ -776,6 +897,10 @@ mod tests {
     }
 
     fn empty_response(id: &str) -> StoredResponse {
+        empty_response_with_cache_key(id, None)
+    }
+
+    fn empty_response_with_cache_key(id: &str, cache_key: Option<&str>) -> StoredResponse {
         StoredResponse {
             id: id.to_string(),
             object: "response",
@@ -787,7 +912,9 @@ mod tests {
                 prompt_tokens: 0,
                 completion_tokens: 0,
                 total_tokens: 0,
+                prompt_tokens_details: None,
             },
+            cache_key: cache_key.map(ToOwned::to_owned),
         }
     }
 }

@@ -65,6 +65,15 @@ fn load_test_config() -> Option<LoaderConfig> {
         max_queued_requests: 32,
         queue_timeout_ms: 30_000,
         no_download: std::env::var("SUPERSONIC_TEST_NO_DOWNLOAD").is_ok(),
+        prefix_cache_enabled: true,
+        prefix_cache_dir: None,
+        prefix_cache_min_tokens: std::env::var("SUPERSONIC_TEST_PREFIX_CACHE_MIN_TOKENS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(32),
+        prefix_cache_max_entries: 1,
+        prefix_cache_memory_ttl_secs: 600,
+        prefix_cache_disk_ttl_secs: 86_400,
     })
 }
 
@@ -405,6 +414,55 @@ async fn test_seed_determinism(h: &Harness) {
     eprintln!("[scenario] seed determinism → OK ({:?})", ta);
 }
 
+async fn test_prefix_cache_reuse(h: &Harness) {
+    let prompt = "Please answer briefly. ".repeat(80);
+    let body = json!({
+        "prompt": prompt,
+        "max_tokens": 1,
+        "temperature": 0,
+        "prompt_cache_key": "integration-prefix-cache",
+        "prompt_cache_retention": "in_memory",
+        "user": "integration-test"
+    });
+    let first: Value = h
+        .client
+        .post(format!("{}/v1/completions", h.base))
+        .json(&body)
+        .send()
+        .await
+        .expect("prefix cache first")
+        .json()
+        .await
+        .expect("first json");
+    let second: Value = h
+        .client
+        .post(format!("{}/v1/completions", h.base))
+        .json(&body)
+        .send()
+        .await
+        .expect("prefix cache second")
+        .json()
+        .await
+        .expect("second json");
+
+    let first_cached = first["usage"]["prompt_tokens_details"]["cached_tokens"]
+        .as_u64()
+        .expect("first cached_tokens");
+    let second_cached = second["usage"]["prompt_tokens_details"]["cached_tokens"]
+        .as_u64()
+        .expect("second cached_tokens");
+    assert_eq!(first_cached, 0, "first request should miss prefix cache");
+    assert!(
+        second_cached > 0,
+        "second request should hit prefix cache: {second}"
+    );
+    assert_eq!(
+        first["choices"][0]["text"], second["choices"][0]["text"],
+        "cached and uncached deterministic outputs should match"
+    );
+    eprintln!("[scenario] prefix cache reuse → OK ({second_cached} cached tokens)");
+}
+
 async fn test_multi_turn(h: &Harness) {
     // Conversation with explicit assistant history — exercises the chat
     // template's handling of assistant turns.
@@ -640,6 +698,7 @@ async fn comprehensive_chat_suite() {
     test_completions_non_stream(&h).await;
     test_completions_stream(&h).await;
     test_seed_determinism(&h).await;
+    test_prefix_cache_reuse(&h).await;
     test_stop_sequence(&h).await;
     test_concurrent_requests(&h).await;
     test_max_tokens_zero(&h).await;

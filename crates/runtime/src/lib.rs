@@ -11,6 +11,7 @@ pub(crate) mod builders;
 pub mod chat_template;
 pub mod generate;
 pub mod ids;
+pub mod prefix_cache;
 pub mod sampling;
 pub mod session;
 pub mod state;

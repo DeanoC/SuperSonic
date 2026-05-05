@@ -13,9 +13,12 @@ use tokenizers::Tokenizer;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::{OwnedSemaphorePermit, TryAcquireError};
 
+use crate::prefix_cache::CacheRequest;
 use crate::sampling::{rng_from_seed, sample};
 use crate::session::InferenceSession;
 use crate::state::ServerState;
+
+const CACHE_ANCHOR_SUFFIX_TOKENS: usize = 16;
 
 /// What a caller can tune per request. Missing fields fall back to
 /// permissive defaults so clients that only supply `messages` still work.
@@ -49,6 +52,7 @@ pub enum GenEvent {
         reason: FinishReason,
         prompt_tokens: u32,
         completion_tokens: u32,
+        cached_prompt_tokens: u32,
     },
     /// Terminal error event: generation failed; no more events will arrive.
     Error(String),
@@ -144,6 +148,7 @@ pub fn spawn(
     state: Arc<ServerState>,
     prompt_ids: Vec<u32>,
     params: GenParams,
+    cache: Option<CacheRequest>,
 ) -> Result<UnboundedReceiver<GenEvent>> {
     let (tx, rx) = mpsc::unbounded_channel();
 
@@ -151,7 +156,7 @@ pub fn spawn(
     match scheduler.permits.clone().try_acquire_owned() {
         Ok(permit) => {
             tokio::spawn(run_with_permit(
-                scheduler, state, prompt_ids, params, tx, permit,
+                scheduler, state, prompt_ids, params, cache, tx, permit,
             ));
             return Ok(rx);
         }
@@ -195,7 +200,7 @@ pub fn spawn(
             }
         };
         scheduler.queued.fetch_sub(1, Ordering::SeqCst);
-        run_with_permit(scheduler, state, prompt_ids, params, tx, permit).await;
+        run_with_permit(scheduler, state, prompt_ids, params, cache, tx, permit).await;
     });
     Ok(rx)
 }
@@ -205,6 +210,7 @@ async fn run_with_permit(
     state: Arc<ServerState>,
     prompt_ids: Vec<u32>,
     params: GenParams,
+    cache: Option<CacheRequest>,
     tx: UnboundedSender<GenEvent>,
     permit: OwnedSemaphorePermit,
 ) {
@@ -223,7 +229,7 @@ async fn run_with_permit(
 
     let scheduler_done = scheduler.clone();
     let join = tokio::task::spawn_blocking(move || {
-        let result = run(state, prompt_ids, params, tx.clone());
+        let result = run(state, prompt_ids, params, cache, tx.clone());
         if let Err(e) = result {
             let _ = tx.send(GenEvent::Error(e.to_string()));
         }
@@ -273,6 +279,7 @@ async fn run_mock(
         } else {
             completion_tokens
         },
+        cached_prompt_tokens: 0,
     });
 }
 
@@ -280,10 +287,12 @@ fn run(
     state: Arc<ServerState>,
     prompt_ids: Vec<u32>,
     params: GenParams,
+    cache: Option<CacheRequest>,
     tx: UnboundedSender<GenEvent>,
 ) -> Result<()> {
     let tokenizer = state.tokenizer.clone();
     let prompt_tokens = prompt_ids.len() as u32;
+    let mut cached_prompt_tokens = 0u32;
 
     // Zero-token request: return an empty completion without touching the
     // engine. OpenAI semantics: `max_tokens=0` means no completion tokens.
@@ -292,6 +301,7 @@ fn run(
             reason: FinishReason::Length,
             prompt_tokens,
             completion_tokens: 0,
+            cached_prompt_tokens: 0,
         });
         return Ok(());
     }
@@ -301,16 +311,64 @@ fn run(
         .as_ref()
         .ok_or_else(|| anyhow!("no inference session configured"))?;
     let mut guard = session.blocking_lock();
-    guard.reset()?;
-    let prefill_logits = guard.prefill(&prompt_ids)?;
+    let prefill_logits = if let Some(cache_req) = cache.as_ref() {
+        if let Some(hit) = state.prefix_cache.lookup(cache_req, &prompt_ids) {
+            match guard.restore_prefix(hit.snapshot) {
+                Ok(mut logits) => {
+                    cached_prompt_tokens = hit.cached_tokens as u32;
+                    for (idx, token) in prompt_ids
+                        .iter()
+                        .copied()
+                        .enumerate()
+                        .skip(hit.cached_tokens)
+                    {
+                        logits = guard.decode_step(token, idx)?;
+                    }
+                    logits
+                }
+                Err(e) => {
+                    tracing::warn!("prefix cache restore failed: {e}");
+                    state.prefix_cache.record_restore_failure();
+                    guard.reset()?;
+                    guard.prefill(&prompt_ids)?
+                }
+            }
+        } else {
+            guard.reset()?;
+            prefill_with_cache_anchor(&mut guard, &state, cache_req, &prompt_ids)?
+        }
+    } else {
+        guard.reset()?;
+        guard.prefill(&prompt_ids)?
+    };
+
+    if let Some(cache_req) = cache.as_ref() {
+        match guard.snapshot_prefix(prefill_logits.clone()) {
+            Ok(snapshot) => {
+                if let Err(e) = state.prefix_cache.insert(cache_req, &prompt_ids, snapshot) {
+                    tracing::warn!("prefix cache insert failed: {e}");
+                }
+            }
+            Err(e) => tracing::debug!("prefix cache snapshot skipped: {e}"),
+        }
+    }
 
     let mut rng = rng_from_seed(params.seed);
 
-    // Sample the first new token from prefill's final logits.
-    let mut logits = prefill_logits;
-    let mut next_token = sample(&mut logits, params.temperature, params.top_p, &mut rng);
+    // Sample the first new token from prefill's final logits. Keep an
+    // unmodified logits row for prefix-cache snapshots; `sample` mutates
+    // its input for non-greedy settings.
+    let mut current_logits = prefill_logits;
+    let mut sample_logits = current_logits.clone();
+    let mut next_token = sample(
+        &mut sample_logits,
+        params.temperature,
+        params.top_p,
+        &mut rng,
+    );
 
     let mut emitted_ids: Vec<u32> = Vec::with_capacity(params.max_tokens);
+    let mut state_token_ids = prompt_ids.clone();
     let mut prev_decoded = String::new();
     let mut completion_tokens: u32 = 0;
 
@@ -357,16 +415,73 @@ fn run(
         }
 
         let pos = prompt_ids.len() + emitted_ids.len() - 1;
-        let mut next_logits = guard.decode_step(next_token, pos)?;
-        next_token = sample(&mut next_logits, params.temperature, params.top_p, &mut rng);
+        let raw_next_logits = guard.decode_step(next_token, pos)?;
+        state_token_ids.push(next_token);
+        current_logits = raw_next_logits;
+        let mut sample_logits = current_logits.clone();
+        next_token = sample(
+            &mut sample_logits,
+            params.temperature,
+            params.top_p,
+            &mut rng,
+        );
     };
+
+    if state_token_ids.len() > prompt_ids.len() {
+        if let Some(cache_req) = cache.as_ref() {
+            match guard.snapshot_prefix(current_logits.clone()) {
+                Ok(snapshot) => {
+                    if let Err(e) = state
+                        .prefix_cache
+                        .insert(cache_req, &state_token_ids, snapshot)
+                    {
+                        tracing::warn!("prefix cache generated-prefix insert failed: {e}");
+                    }
+                }
+                Err(e) => tracing::debug!("generated prefix cache snapshot skipped: {e}"),
+            }
+        }
+    }
 
     let _ = tx.send(GenEvent::Done {
         reason: finish,
         prompt_tokens,
         completion_tokens,
+        cached_prompt_tokens,
     });
     Ok(())
+}
+
+fn prefill_with_cache_anchor(
+    guard: &mut InferenceSession,
+    state: &ServerState,
+    cache_req: &CacheRequest,
+    prompt_ids: &[u32],
+) -> Result<Vec<f32>> {
+    let min_tokens = state.prefix_cache.config().min_tokens;
+    let Some(anchor_len) = prompt_ids.len().checked_sub(CACHE_ANCHOR_SUFFIX_TOKENS) else {
+        return guard.prefill(prompt_ids);
+    };
+    if anchor_len < min_tokens || anchor_len == 0 {
+        return guard.prefill(prompt_ids);
+    }
+
+    let mut logits = guard.prefill(&prompt_ids[..anchor_len])?;
+    match guard.snapshot_prefix(logits.clone()) {
+        Ok(snapshot) => {
+            if let Err(e) = state
+                .prefix_cache
+                .insert(cache_req, &prompt_ids[..anchor_len], snapshot)
+            {
+                tracing::warn!("prefix cache anchor insert failed: {e}");
+            }
+        }
+        Err(e) => tracing::debug!("prefix cache anchor snapshot skipped: {e}"),
+    }
+    for (idx, token) in prompt_ids.iter().copied().enumerate().skip(anchor_len) {
+        logits = guard.decode_step(token, idx)?;
+    }
+    Ok(logits)
 }
 
 fn detokenize(tokenizer: &Tokenizer, ids: &[u32]) -> String {
@@ -422,6 +537,7 @@ pub async fn collect(mut rx: UnboundedReceiver<GenEvent>) -> Result<CollectedRes
     let mut finish: Option<FinishReason> = None;
     let mut prompt_tokens = 0;
     let mut completion_tokens = 0;
+    let mut cached_prompt_tokens = 0;
     while let Some(ev) = rx.recv().await {
         match ev {
             GenEvent::Token(s) => text.push_str(&s),
@@ -429,10 +545,12 @@ pub async fn collect(mut rx: UnboundedReceiver<GenEvent>) -> Result<CollectedRes
                 reason,
                 prompt_tokens: p,
                 completion_tokens: c,
+                cached_prompt_tokens: cached,
             } => {
                 finish = Some(reason);
                 prompt_tokens = p;
                 completion_tokens = c;
+                cached_prompt_tokens = cached;
                 break;
             }
             GenEvent::Error(msg) => return Err(anyhow!(msg)),
@@ -446,6 +564,7 @@ pub async fn collect(mut rx: UnboundedReceiver<GenEvent>) -> Result<CollectedRes
         finish,
         prompt_tokens,
         completion_tokens,
+        cached_prompt_tokens,
     })
 }
 
@@ -454,6 +573,7 @@ pub struct CollectedResult {
     pub finish: FinishReason,
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
+    pub cached_prompt_tokens: u32,
 }
 
 /// Re-export kept so downstream route modules can name the session type.

@@ -1,0 +1,391 @@
+use std::collections::{HashMap, VecDeque};
+use std::fs;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use anyhow::{Context, Result};
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+
+use crate::session::SessionSnapshot;
+
+const FORMAT_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheRetention {
+    None,
+    InMemory,
+    TwentyFourHours,
+}
+
+impl CacheRetention {
+    pub fn from_openai(value: Option<&str>) -> Self {
+        match value.unwrap_or("in_memory").to_ascii_lowercase().as_str() {
+            "none" | "no-cache" | "disabled" | "off" => Self::None,
+            "24h" | "24_h" | "disk" => Self::TwentyFourHours,
+            _ => Self::InMemory,
+        }
+    }
+
+    pub fn ttl(self, cfg: &PrefixCacheConfig) -> Duration {
+        match self {
+            Self::None => Duration::ZERO,
+            Self::InMemory => Duration::from_secs(cfg.memory_ttl_secs),
+            Self::TwentyFourHours => Duration::from_secs(cfg.disk_ttl_secs),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CacheRequest {
+    pub key: Option<String>,
+    pub retention: CacheRetention,
+    pub scope: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct PrefixCacheConfig {
+    pub enabled: bool,
+    pub dir: PathBuf,
+    pub min_tokens: usize,
+    pub max_entries: usize,
+    pub memory_ttl_secs: u64,
+    pub disk_ttl_secs: u64,
+}
+
+pub struct PrefixCache {
+    cfg: PrefixCacheConfig,
+    entries: Mutex<PrefixCacheInner>,
+    hits: AtomicU64,
+    misses: AtomicU64,
+    cached_tokens: AtomicU64,
+    evictions: AtomicU64,
+    disk_writes: AtomicU64,
+    restore_failures: AtomicU64,
+}
+
+#[derive(Default)]
+struct PrefixCacheInner {
+    entries: HashMap<String, PrefixCacheEntry>,
+    lru: VecDeque<String>,
+}
+
+pub struct PrefixCacheEntry {
+    namespace: String,
+    token_ids: Vec<u32>,
+    snapshot: SessionSnapshot,
+    expires_at_secs: u64,
+    last_used_secs: u64,
+}
+
+pub struct PrefixCacheHit {
+    pub cached_tokens: usize,
+    pub snapshot: SessionSnapshot,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PrefixCacheStats {
+    pub enabled: bool,
+    pub dir: String,
+    pub min_tokens: usize,
+    pub max_entries: usize,
+    pub entries: usize,
+    pub hits: u64,
+    pub misses: u64,
+    pub cached_tokens: u64,
+    pub evictions: u64,
+    pub disk_writes: u64,
+    pub restore_failures: u64,
+}
+
+#[derive(Serialize)]
+struct DiskEntry<'a> {
+    format_version: u32,
+    namespace_hash: &'a str,
+    token_hash: &'a str,
+    token_count: usize,
+    expires_at_secs: u64,
+    retention: &'static str,
+}
+
+impl PrefixCache {
+    pub fn new(cfg: PrefixCacheConfig) -> Self {
+        if cfg.enabled && !cfg.dir.as_os_str().is_empty() {
+            if let Err(e) = fs::create_dir_all(&cfg.dir) {
+                tracing::warn!(dir = %cfg.dir.display(), "prefix cache dir create failed: {e}");
+            }
+        }
+        Self {
+            cfg,
+            entries: Mutex::new(PrefixCacheInner::default()),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+            cached_tokens: AtomicU64::new(0),
+            evictions: AtomicU64::new(0),
+            disk_writes: AtomicU64::new(0),
+            restore_failures: AtomicU64::new(0),
+        }
+    }
+
+    pub fn config(&self) -> &PrefixCacheConfig {
+        &self.cfg
+    }
+
+    pub fn lookup(&self, req: &CacheRequest, prompt_ids: &[u32]) -> Option<PrefixCacheHit> {
+        if !self.cfg.enabled || req.retention == CacheRetention::None {
+            return None;
+        }
+        let now = epoch_secs();
+        let namespace = namespace(req);
+        let mut inner = self.entries.lock().ok()?;
+        self.prune_locked(&mut inner, now);
+
+        let mut best_key: Option<String> = None;
+        let mut best_len = 0usize;
+        for (key, entry) in &inner.entries {
+            if entry.namespace != namespace || entry.expires_at_secs <= now {
+                continue;
+            }
+            let len = entry.token_ids.len();
+            if len > best_len && len <= prompt_ids.len() && prompt_ids.starts_with(&entry.token_ids)
+            {
+                best_key = Some(key.clone());
+                best_len = len;
+            }
+        }
+
+        let Some(key) = best_key else {
+            self.misses.fetch_add(1, Ordering::Relaxed);
+            return None;
+        };
+        let Some(entry) = inner.entries.get_mut(&key) else {
+            self.misses.fetch_add(1, Ordering::Relaxed);
+            return None;
+        };
+        entry.last_used_secs = now;
+        let snapshot = match entry.snapshot.try_clone() {
+            Ok(snapshot) => snapshot,
+            Err(e) => {
+                tracing::warn!("prefix cache snapshot clone failed: {e}");
+                self.restore_failures.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+        };
+        touch_lru(&mut inner.lru, &key);
+        self.hits.fetch_add(1, Ordering::Relaxed);
+        self.cached_tokens
+            .fetch_add(best_len as u64, Ordering::Relaxed);
+        Some(PrefixCacheHit {
+            cached_tokens: best_len,
+            snapshot,
+        })
+    }
+
+    pub fn insert(
+        &self,
+        req: &CacheRequest,
+        token_ids: &[u32],
+        snapshot: SessionSnapshot,
+    ) -> Result<()> {
+        if !self.cfg.enabled
+            || req.retention == CacheRetention::None
+            || token_ids.len() < self.cfg.min_tokens
+        {
+            return Ok(());
+        }
+        let now = epoch_secs();
+        let namespace = namespace(req);
+        let token_hash = token_hash(token_ids);
+        let key = format!("{namespace}:{token_hash}");
+        let expires_at_secs = now.saturating_add(req.retention.ttl(&self.cfg).as_secs());
+        let entry = PrefixCacheEntry {
+            namespace: namespace.clone(),
+            token_ids: token_ids.to_vec(),
+            snapshot,
+            expires_at_secs,
+            last_used_secs: now,
+        };
+
+        let mut inner = self
+            .entries
+            .lock()
+            .map_err(|_| anyhow::anyhow!("prefix cache lock poisoned"))?;
+        inner.entries.insert(key.clone(), entry);
+        touch_lru(&mut inner.lru, &key);
+        self.prune_locked(&mut inner, now);
+        while inner.entries.len() > self.cfg.max_entries {
+            if let Some(old) = inner.lru.pop_front() {
+                if inner.entries.remove(&old).is_some() {
+                    self.evictions.fetch_add(1, Ordering::Relaxed);
+                }
+            } else {
+                break;
+            }
+        }
+        drop(inner);
+
+        if req.retention == CacheRetention::TwentyFourHours {
+            self.write_disk_metadata(&namespace, &token_hash, token_ids.len(), expires_at_secs)?;
+        }
+        Ok(())
+    }
+
+    pub fn record_restore_failure(&self) {
+        self.restore_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn stats(&self) -> PrefixCacheStats {
+        let entries = self.entries.lock().map(|e| e.entries.len()).unwrap_or(0);
+        PrefixCacheStats {
+            enabled: self.cfg.enabled,
+            dir: self.cfg.dir.display().to_string(),
+            min_tokens: self.cfg.min_tokens,
+            max_entries: self.cfg.max_entries,
+            entries,
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+            cached_tokens: self.cached_tokens.load(Ordering::Relaxed),
+            evictions: self.evictions.load(Ordering::Relaxed),
+            disk_writes: self.disk_writes.load(Ordering::Relaxed),
+            restore_failures: self.restore_failures.load(Ordering::Relaxed),
+        }
+    }
+
+    fn prune_locked(&self, inner: &mut PrefixCacheInner, now: u64) {
+        let mut expired = Vec::new();
+        for (key, entry) in &inner.entries {
+            if entry.expires_at_secs <= now {
+                expired.push(key.clone());
+            }
+        }
+        for key in expired {
+            if inner.entries.remove(&key).is_some() {
+                self.evictions.fetch_add(1, Ordering::Relaxed);
+            }
+            inner.lru.retain(|k| k != &key);
+        }
+    }
+
+    fn write_disk_metadata(
+        &self,
+        namespace: &str,
+        token_hash: &str,
+        token_count: usize,
+        expires_at_secs: u64,
+    ) -> Result<()> {
+        fs::create_dir_all(&self.cfg.dir)
+            .with_context(|| format!("create prefix cache dir {}", self.cfg.dir.display()))?;
+        let path = disk_metadata_path(&self.cfg.dir, namespace, token_hash);
+        let entry = DiskEntry {
+            format_version: FORMAT_VERSION,
+            namespace_hash: namespace,
+            token_hash,
+            token_count,
+            expires_at_secs,
+            retention: "24h",
+        };
+        let bytes = serde_json::to_vec_pretty(&entry)?;
+        fs::write(&path, bytes).with_context(|| format!("write {}", path.display()))?;
+        self.disk_writes.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+fn namespace(req: &CacheRequest) -> String {
+    let mut h = Sha256::new();
+    h.update(req.scope.as_bytes());
+    h.update([0]);
+    if let Some(key) = req.key.as_ref() {
+        h.update(key.as_bytes());
+    }
+    format!("{:x}", h.finalize())
+}
+
+fn token_hash(token_ids: &[u32]) -> String {
+    let mut h = Sha256::new();
+    for id in token_ids {
+        h.update(id.to_le_bytes());
+    }
+    format!("{:x}", h.finalize())
+}
+
+fn disk_metadata_path(dir: &std::path::Path, namespace: &str, token_hash: &str) -> PathBuf {
+    let short_namespace = namespace.get(..16).unwrap_or(namespace);
+    dir.join(format!("{short_namespace}-{token_hash}.json"))
+}
+
+fn touch_lru(lru: &mut VecDeque<String>, key: &str) {
+    lru.retain(|k| k != key);
+    lru.push_back(key.to_string());
+}
+
+fn epoch_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+pub fn scope_from_parts(model_id: &str, api_key: Option<&str>, user: Option<&str>) -> String {
+    let mut h = Sha256::new();
+    h.update(model_id.as_bytes());
+    h.update([0]);
+    if let Some(api_key) = api_key {
+        h.update(api_key.as_bytes());
+    }
+    h.update([0]);
+    if let Some(user) = user {
+        h.update(user.as_bytes());
+    }
+    format!("{:x}", h.finalize())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retention_parser_accepts_openai_shapes() {
+        assert_eq!(CacheRetention::from_openai(None), CacheRetention::InMemory);
+        assert_eq!(
+            CacheRetention::from_openai(Some("in_memory")),
+            CacheRetention::InMemory
+        );
+        assert_eq!(
+            CacheRetention::from_openai(Some("24h")),
+            CacheRetention::TwentyFourHours
+        );
+        assert_eq!(CacheRetention::from_openai(Some("disk")), CacheRetention::TwentyFourHours);
+        assert_eq!(CacheRetention::from_openai(Some("none")), CacheRetention::None);
+        assert_eq!(CacheRetention::from_openai(Some("off")), CacheRetention::None);
+    }
+
+    #[test]
+    fn scope_hash_includes_model_key_and_user() {
+        let base = scope_from_parts("model-a", Some("key-a"), Some("user-a"));
+        assert_eq!(base, scope_from_parts("model-a", Some("key-a"), Some("user-a")));
+        assert_ne!(base, scope_from_parts("model-b", Some("key-a"), Some("user-a")));
+        assert_ne!(base, scope_from_parts("model-a", Some("key-b"), Some("user-a")));
+        assert_ne!(base, scope_from_parts("model-a", Some("key-a"), Some("user-b")));
+    }
+
+    #[test]
+    fn token_hash_is_exact_order_sensitive() {
+        assert_eq!(token_hash(&[1, 2, 3]), token_hash(&[1, 2, 3]));
+        assert_ne!(token_hash(&[1, 2, 3]), token_hash(&[1, 3, 2]));
+        assert_ne!(token_hash(&[1, 2, 3]), token_hash(&[1, 2, 3, 4]));
+    }
+
+    #[test]
+    fn disk_metadata_path_is_namespace_qualified() {
+        let dir = PathBuf::from("/tmp/cache");
+        let token = "abcd";
+        let a = disk_metadata_path(&dir, "11112222333344445555", token);
+        let b = disk_metadata_path(&dir, "99998888777766665555", token);
+        assert_ne!(a, b);
+        assert_eq!(a.file_name().unwrap(), "1111222233334444-abcd.json");
+        assert_eq!(b.file_name().unwrap(), "9999888877776666-abcd.json");
+    }
+}
