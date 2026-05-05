@@ -31,6 +31,7 @@ opt-in via `python -m oracle.bench.heavy.heavy_main`.
 <!-- AUTOGEN BELOW: bench-quality-table -->
 | Model | Quant | specprefill_logits |
 |---|---|---|
+| qwen3.6-35b-a3b | int4-spec050 | 0.714 |
 | qwen3.6-35b-a3b | int4-spec075 | 1.000 |
 
 <!-- AUTOGEN END: bench-quality-table -->

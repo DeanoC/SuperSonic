@@ -883,8 +883,8 @@ the bench script or test that produced (or will produce) the
 measurement.
 
 <!-- AUTOGEN BELOW: bench-perf-matrix -->
-| Model           |  INT4 | Spec075 |
-| --------------- | ----: | ----: |
-| qwen3.6-35b-a3b | 3438.6 | 3622.3 |
+| Model           |  INT4 | Spec050 | Spec075 |
+| --------------- | ----: | ----: | ----: |
+| qwen3.6-35b-a3b | 11100.9 | 8037.7 | 12124.2 |
 
 <!-- AUTOGEN END: bench-perf-matrix -->
