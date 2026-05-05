@@ -5,6 +5,7 @@
 //! on incoming requests are ignored (serde default).
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 
 use crate::chat_template::IncomingChatMessage;
 
@@ -53,7 +54,12 @@ pub struct ChatCompletionRequest {
     pub temperature: Option<f32>,
     #[serde(default)]
     pub top_p: Option<f32>,
-    #[serde(default)]
+    #[serde(
+        default,
+        alias = "max_completion_tokens",
+        alias = "maxCompletionTokens",
+        alias = "maxTokens"
+    )]
     pub max_tokens: Option<usize>,
     #[serde(default)]
     pub stream: bool,
@@ -61,12 +67,30 @@ pub struct ChatCompletionRequest {
     pub stop: Option<StopParam>,
     #[serde(default)]
     pub seed: Option<u64>,
+    #[serde(default)]
+    pub tools: Option<JsonValue>,
+    #[serde(default)]
+    pub tool_choice: Option<JsonValue>,
+    #[serde(default)]
+    pub response_format: Option<JsonValue>,
+    #[serde(default, alias = "reasoningEffort")]
+    pub reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub stream_options: Option<StreamOptions>,
+    #[serde(default)]
+    pub n: Option<u32>,
+    #[serde(default)]
+    pub logprobs: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct ChatCompletionMessage {
     pub role: &'static str,
-    pub content: String,
+    pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<OpenAiToolCall>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -76,11 +100,31 @@ pub struct ChatCompletionChoice {
     pub finish_reason: &'static str,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Usage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct StreamOptions {
+    #[serde(default)]
+    pub include_usage: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OpenAiFunctionCall {
+    pub name: String,
+    pub arguments: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OpenAiToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub type_: &'static str,
+    pub function: OpenAiFunctionCall,
 }
 
 #[derive(Debug, Serialize)]
@@ -101,6 +145,10 @@ pub struct ChatStreamDelta {
     pub role: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<OpenAiToolCall>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -118,6 +166,8 @@ pub struct ChatStreamChunk {
     pub created: u64,
     pub model: String,
     pub choices: Vec<ChatStreamChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
 }
 
 /* ---------- /v1/completions ---------- */
@@ -127,16 +177,29 @@ pub struct ChatStreamChunk {
 pub enum PromptParam {
     One(String),
     Many(Vec<String>),
+    Tokens(Vec<u32>),
+    TokenBatches(Vec<Vec<u32>>),
 }
 
 impl PromptParam {
-    pub fn into_single(self) -> Option<String> {
+    pub fn into_single(self) -> Option<SinglePrompt> {
         match self {
-            Self::One(s) => Some(s),
-            Self::Many(mut v) if v.len() == 1 => v.pop(),
+            Self::One(s) => Some(SinglePrompt::Text(s)),
+            Self::Many(mut v) if v.len() == 1 => v.pop().map(SinglePrompt::Text),
             Self::Many(_) => None,
+            Self::Tokens(ids) => Some(SinglePrompt::Tokens(ids)),
+            Self::TokenBatches(mut batches) if batches.len() == 1 => {
+                batches.pop().map(SinglePrompt::Tokens)
+            }
+            Self::TokenBatches(_) => None,
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub enum SinglePrompt {
+    Text(String),
+    Tokens(Vec<u32>),
 }
 
 #[derive(Debug, Deserialize)]
@@ -148,7 +211,12 @@ pub struct CompletionRequest {
     pub temperature: Option<f32>,
     #[serde(default)]
     pub top_p: Option<f32>,
-    #[serde(default)]
+    #[serde(
+        default,
+        alias = "max_completion_tokens",
+        alias = "maxCompletionTokens",
+        alias = "maxTokens"
+    )]
     pub max_tokens: Option<usize>,
     #[serde(default)]
     pub stream: bool,
@@ -156,6 +224,14 @@ pub struct CompletionRequest {
     pub stop: Option<StopParam>,
     #[serde(default)]
     pub seed: Option<u64>,
+    #[serde(default)]
+    pub stream_options: Option<StreamOptions>,
+    #[serde(default)]
+    pub n: Option<u32>,
+    #[serde(default)]
+    pub logprobs: Option<JsonValue>,
+    #[serde(default)]
+    pub echo: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -192,4 +268,96 @@ pub struct CompletionStreamChunk {
     pub created: u64,
     pub model: String,
     pub choices: Vec<CompletionStreamChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
+}
+
+/* ---------- /v1/tokenize + /v1/detokenize ---------- */
+
+#[derive(Debug, Deserialize)]
+pub struct TokenizeRequest {
+    #[serde(default)]
+    pub model: Option<String>,
+    pub input: String,
+    #[serde(default)]
+    pub add_special_tokens: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TokenizeResponse {
+    pub object: &'static str,
+    pub model: String,
+    pub tokens: Vec<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DetokenizeRequest {
+    #[serde(default)]
+    pub model: Option<String>,
+    pub tokens: Vec<u32>,
+    #[serde(default)]
+    pub skip_special_tokens: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DetokenizeResponse {
+    pub object: &'static str,
+    pub model: String,
+    pub text: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn chat_max_token_aliases_deserialize() {
+        for key in [
+            "max_tokens",
+            "max_completion_tokens",
+            "maxCompletionTokens",
+            "maxTokens",
+        ] {
+            let value = json!({
+                "messages": [{"role": "user", "content": "hi"}],
+                key: 7
+            });
+            let req: ChatCompletionRequest = serde_json::from_value(value).unwrap();
+            assert_eq!(req.max_tokens, Some(7));
+        }
+    }
+
+    #[test]
+    fn completion_stream_usage_deserializes() {
+        let req: CompletionRequest = serde_json::from_value(json!({
+            "prompt": "hi",
+            "stream": true,
+            "stream_options": {"include_usage": true}
+        }))
+        .unwrap();
+        assert!(req.stream_options.unwrap().include_usage);
+    }
+
+    #[test]
+    fn completion_prompt_accepts_token_arrays() {
+        let req: CompletionRequest = serde_json::from_value(json!({
+            "prompt": [1, 2, 3]
+        }))
+        .unwrap();
+        assert!(matches!(
+            req.prompt.into_single(),
+            Some(SinglePrompt::Tokens(ids)) if ids == vec![1, 2, 3]
+        ));
+
+        let req: CompletionRequest = serde_json::from_value(json!({
+            "prompt": [[1, 2, 3]]
+        }))
+        .unwrap();
+        assert!(matches!(
+            req.prompt.into_single(),
+            Some(SinglePrompt::Tokens(ids)) if ids == vec![1, 2, 3]
+        ));
+    }
 }

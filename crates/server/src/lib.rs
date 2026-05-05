@@ -1,7 +1,9 @@
 //! SuperSonic HTTP server — an OpenAI-compatible inference endpoint
 //! wrapping the shared `supersonic-runtime` crate.
 
+pub mod compat;
 pub mod errors;
+pub mod output;
 pub mod routes;
 pub mod schemas;
 

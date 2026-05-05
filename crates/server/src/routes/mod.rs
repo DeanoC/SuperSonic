@@ -3,11 +3,12 @@
 use std::sync::Arc;
 
 use axum::extract::{Request, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::Response;
 use axum::routing::{get, post};
 use axum::Router;
+use tower_http::cors::{Any, CorsLayer};
 
 use crate::errors::{ApiError, ApiErrorBody, ApiErrorEnvelope};
 use crate::state::ServerState;
@@ -15,18 +16,61 @@ use crate::state::ServerState;
 pub mod chat;
 pub mod completions;
 pub mod models;
+pub mod responses;
 mod sse;
+pub mod tokenizer;
 
 pub fn router(state: Arc<ServerState>) -> Router {
-    Router::new()
+    let app = Router::new()
+        .route("/", get(models::health))
+        .route("/v1", get(models::health))
+        .route("/ready", get(models::health))
+        .route("/v1/ready", get(models::health))
         .route("/v1/models", get(models::list))
+        .route("/v1/models/:model", get(models::retrieve))
+        .route("/health", get(models::health))
+        .route("/v1/health", get(models::health))
+        .route("/v1/capabilities", get(models::capabilities))
+        .route("/metrics", get(models::metrics))
         .route("/v1/chat/completions", post(chat::completions))
         .route("/v1/completions", post(completions::completions))
+        .route("/tokenize", post(tokenizer::tokenize))
+        .route("/v1/tokenize", post(tokenizer::tokenize))
+        .route("/detokenize", post(tokenizer::detokenize))
+        .route("/v1/detokenize", post(tokenizer::detokenize))
+        .route("/v1/responses", post(responses::create))
+        .route(
+            "/v1/responses/:response_id",
+            get(responses::get).delete(responses::delete),
+        )
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
         ))
-        .with_state(state)
+        .with_state(state.clone());
+
+    if let Some(origin) = state.cors_allow_origin.as_deref() {
+        if origin == "*" {
+            app.layer(
+                CorsLayer::new()
+                    .allow_origin(Any)
+                    .allow_methods(Any)
+                    .allow_headers(Any),
+            )
+        } else if let Ok(header) = origin.parse::<HeaderValue>() {
+            app.layer(
+                CorsLayer::new()
+                    .allow_origin(header)
+                    .allow_methods(Any)
+                    .allow_headers(Any),
+            )
+        } else {
+            tracing::warn!(origin, "ignoring invalid CORS allow-origin");
+            app
+        }
+    } else {
+        app
+    }
 }
 
 async fn auth_middleware(

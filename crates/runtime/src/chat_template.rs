@@ -17,7 +17,42 @@ use serde_json::Value as JsonValue;
 #[derive(Debug, Clone, Serialize)]
 pub struct ChatMessage {
     pub role: String,
-    pub content: String,
+    pub content: JsonValue,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<JsonValue>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+impl ChatMessage {
+    pub fn text(role: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: role.into(),
+            content: JsonValue::String(content.into()),
+            reasoning_content: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct RenderOptions {
+    pub add_generation_prompt: bool,
+    pub tools: Option<JsonValue>,
+    pub enable_thinking: bool,
+}
+
+impl Default for RenderOptions {
+    fn default() -> Self {
+        Self {
+            add_generation_prompt: true,
+            tools: None,
+            enable_thinking: false,
+        }
+    }
 }
 
 pub struct ChatTemplate {
@@ -27,6 +62,10 @@ pub struct ChatTemplate {
 }
 
 impl ChatTemplate {
+    pub fn from_template_source(tpl_src: impl Into<String>) -> Result<Arc<Self>> {
+        Self::compile(tpl_src.into(), None, None)
+    }
+
     /// Load `{model_dir}/tokenizer_config.json` and compile its
     /// `chat_template` field. Returns `Ok(None)` if the file or field is
     /// missing — the server can still serve `/v1/completions` in that case.
@@ -55,6 +94,17 @@ impl ChatTemplate {
             _ => return Ok(None),
         };
 
+        let bos_token = extract_token(&cfg, "bos_token");
+        let eos_token = extract_token(&cfg, "eos_token");
+
+        Self::compile(tpl_src, bos_token, eos_token).map(Some)
+    }
+
+    fn compile(
+        tpl_src: String,
+        bos_token: Option<String>,
+        eos_token: Option<String>,
+    ) -> Result<Arc<Self>> {
         let mut env = Environment::new();
         // HF chat templates routinely use Python string methods like
         // `.startswith` / `.endswith` / `.strip` that aren't part of the
@@ -65,32 +115,42 @@ impl ChatTemplate {
         env.add_template_owned("chat", tpl_src)
             .with_context(|| "compile chat_template")?;
 
-        let bos_token = extract_token(&cfg, "bos_token");
-        let eos_token = extract_token(&cfg, "eos_token");
-
-        Ok(Some(Arc::new(Self {
+        Ok(Arc::new(Self {
             env,
             bos_token,
             eos_token,
-        })))
+        }))
     }
 
     /// Render the template against a list of messages. Returns the prompt
     /// text to feed into the tokenizer.
     pub fn render(&self, messages: &[ChatMessage], add_generation_prompt: bool) -> Result<String> {
+        self.render_with_options(
+            messages,
+            RenderOptions {
+                add_generation_prompt,
+                ..RenderOptions::default()
+            },
+        )
+    }
+
+    /// Render the template with optional OpenAI-compatible tool definitions
+    /// and model-family thinking controls.
+    pub fn render_with_options(
+        &self,
+        messages: &[ChatMessage],
+        opts: RenderOptions,
+    ) -> Result<String> {
         let tpl = self.env.get_template("chat")?;
-        let msgs: Vec<Value> = messages
-            .iter()
-            .map(|m| {
-                Value::from_serialize(&serde_json::json!({
-                    "role": m.role,
-                    "content": m.content,
-                }))
-            })
-            .collect();
+        let msgs: Vec<Value> = messages.iter().map(Value::from_serialize).collect();
+        let tools = opts.tools.unwrap_or(JsonValue::Null);
         let ctx = context! {
             messages => msgs,
-            add_generation_prompt => add_generation_prompt,
+            add_generation_prompt => opts.add_generation_prompt,
+            tools => Value::from_serialize(&tools),
+            enable_thinking => opts.enable_thinking,
+            preserve_thinking => opts.enable_thinking,
+            add_vision_id => false,
             bos_token => self.bos_token.clone().unwrap_or_default(),
             eos_token => self.eos_token.clone().unwrap_or_default(),
         };
@@ -115,7 +175,13 @@ fn extract_token(cfg: &JsonValue, key: &str) -> Option<String> {
 pub struct IncomingChatMessage {
     pub role: String,
     #[serde(default)]
-    pub content: String,
+    pub content: JsonValue,
+    #[serde(default)]
+    pub reasoning_content: Option<String>,
+    #[serde(default)]
+    pub tool_calls: Option<JsonValue>,
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
 }
 
 impl From<IncomingChatMessage> for ChatMessage {
@@ -123,6 +189,9 @@ impl From<IncomingChatMessage> for ChatMessage {
         Self {
             role: m.role,
             content: m.content,
+            reasoning_content: m.reasoning_content,
+            tool_calls: m.tool_calls,
+            tool_call_id: m.tool_call_id,
         }
     }
 }
