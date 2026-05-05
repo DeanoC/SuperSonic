@@ -649,6 +649,10 @@ fn decode_text(
         }
     }
 
+    if let Some(profile) = prefill_profile.take() {
+        profile.finish()?;
+    }
+
     print_last_logits_if_requested(dump_last_logits, &loop_state.last_logits_bytes);
     print_generation_summary(&loop_state.generated_ids, prompt_ids.len(), eos_id);
     if let Some(manager) = _moe_expert_residency.as_ref() {

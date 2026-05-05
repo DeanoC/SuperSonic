@@ -29,13 +29,19 @@
 use anyhow::{anyhow, Context, Result};
 use gpu_hal::{copy_d2h, copy_h2d, sync, GpuBuffer, GpuError, ScalarType};
 use kernel_ffi::qwen36_moe::{
-    persistent_decode_launch, persistent_decode_launch_range, Qwen36MoeDecodeLayerDesc,
-    Qwen36MoeInt4ScaleDesc, Qwen36MoeKVCacheFp8Desc, Qwen36MoePersistentGeom,
-    Qwen36MoePersistentLmHeadFold, Qwen36MoePersistentMode,
+    persistent_decode_launch, persistent_decode_launch_range, Qwen36MoeAttnStepParams,
+    Qwen36MoeDecodeLayerDesc, Qwen36MoeInt4ScaleDesc, Qwen36MoeKVCacheFp8Desc,
+    Qwen36MoePersistentGeom, Qwen36MoePersistentLmHeadFold, Qwen36MoePersistentMode,
 };
 
 use std::ffi::c_void;
 use std::os::raw::c_int;
+
+/// Compatibility alias for callers that use the persistent module's
+/// historical cache-position sentinel. Prefer
+/// `Qwen36MoeAttnStepParams::CACHE_POS_INHERIT` in new code.
+#[allow(dead_code)]
+pub const CACHE_POS_INHERIT: i32 = Qwen36MoeAttnStepParams::CACHE_POS_INHERIT;
 
 /// Phase 3f folded final RMSnorm + lm_head GEMV. Pass to
 /// [`PersistentScratch::run`] on generation steps to write logits
