@@ -122,7 +122,7 @@ impl<'a> PrefillProfileScope<'a> {
         }
     }
 
-    pub(crate) fn finish(self) -> anyhow::Result<()> {
+    pub(crate) fn finish(mut self) -> anyhow::Result<()> {
         if !self.active {
             return Ok(());
         }
@@ -224,8 +224,21 @@ impl<'a> PrefillProfileScope<'a> {
             });
             std::fs::write(path, serde_json::to_vec_pretty(&payload)?)?;
         }
-        kernel_ffi::prefill_ffi::ffi_profile_set_enabled(false);
-        gpu_hal::hal_profile_set_enabled(false);
+        disable_prefill_profiles();
+        self.active = false;
         Ok(())
     }
+}
+
+impl Drop for PrefillProfileScope<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            disable_prefill_profiles();
+        }
+    }
+}
+
+fn disable_prefill_profiles() {
+    kernel_ffi::prefill_ffi::ffi_profile_set_enabled(false);
+    gpu_hal::hal_profile_set_enabled(false);
 }

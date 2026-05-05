@@ -136,6 +136,14 @@ pub(crate) fn validate_specprefill_flags(
                 );
             }
         }
+        if matches!(model_variant, ModelVariant::Qwen3_6_35B_A3B)
+            && cli.specprefill_algorithm == "lookahead"
+        {
+            anyhow::bail!(
+                "--specprefill-algorithm lookahead is not supported for qwen3.6-35b-a3b; \
+                 use cosine, the default cross-family scorer"
+            );
+        }
         if cli.kv_fp8 && cli.specprefill_algorithm == "lookahead" {
             anyhow::bail!(
                 "--specprefill-algorithm lookahead cannot be combined with --kv-fp8: the \
