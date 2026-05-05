@@ -25,10 +25,10 @@ def render_perf_table(perf_dir: Path) -> str:
 
     quants_present = [q for q in QUANT_COL_ORDER if any(q in m for m in by_model.values())]
     headers = ["Model"] + [QUANT_LABELS[q] for q in quants_present]
-    sep = ["-" * len("Model")] + ["-" * len(QUANT_LABELS[q]) + ":" for q in quants_present]
+    sep_cells = ["-" * 15] + ["-" * 4 + ":" for _ in quants_present]
 
     rows = ["| " + " | ".join(h.ljust(15) if i == 0 else h.rjust(5) for i, h in enumerate(headers)) + " |",
-            "|" + "|".join("-" * (len(s) + 2) for s in sep) + "|"]
+            "| " + " | ".join(sep_cells) + " |"]
     for model in sorted(by_model):
         cells_for_model = by_model[model]
         cols = []

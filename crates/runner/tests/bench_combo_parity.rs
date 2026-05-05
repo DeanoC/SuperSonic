@@ -46,4 +46,19 @@ fn bench_combo_table_mentions_every_runner_supported_pair() {
                  and if support was REMOVED upstream also remove the corresponding entry from \
                  the expected_pairs list in this file.");
     }
+
+    // Bidirectional gate: the bench combo table must not have unexpected extras.
+    // If a new row was added to SUPPORTED_COMBOS without updating expected_pairs,
+    // this assertion catches it. Counts entry rows by the `model: "` literal that
+    // only appears in the static table (struct field declarations use a different
+    // shape: `pub model: &'static str`).
+    let actual_count = bench_text.matches("model: \"").count();
+    assert_eq!(
+        actual_count,
+        expected_pairs.len(),
+        "matrix.rs has {actual_count} combo rows but expected_pairs has {} entries; \
+         either remove the extra rows from SUPPORTED_COMBOS or add the corresponding (model, quant) \
+         pairs to expected_pairs in this file.",
+        expected_pairs.len()
+    );
 }

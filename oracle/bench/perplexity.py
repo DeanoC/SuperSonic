@@ -50,7 +50,7 @@ def score_perplexity(req: PerplexityRequest) -> dict:
         if not m:
             continue
         d = json.loads(m.group(1))
-        chunk_results.append({"nll": d["nll"], "tokens": d["scored_tokens"]})
+        chunk_results.append({"nll": d["total_nll"], "tokens": d["scored_tokens"]})
     agg = aggregate_ppl_from_chunks(chunk_results)
     return {
         "schema_version": 1,
