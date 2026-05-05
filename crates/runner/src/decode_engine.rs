@@ -18,8 +18,12 @@ use qwen35::rotary::RotaryTables;
 use qwen35::scratch::{
     PersistentDecodeScratch, PERSISTENT_4B_TIMING_SLOTS_PER_LAYER, PERSISTENT_SYNC_COUNTER_BYTES,
 };
-use qwen35::state::{kv_fp8_bf16_sidecar_enabled, kv_fp8_bf16_sidecar_window_tokens, ModelState};
+use qwen35::state::{
+    kv_fp8_bf16_sidecar_enabled, kv_fp8_bf16_sidecar_window_tokens, ModelState,
+    ModelStateDiskSnapshot,
+};
 use qwen35::weights::{LayerKind, Qwen35Weights};
+use serde::{Deserialize, Serialize};
 
 use crate::oracle::OracleOutput;
 use crate::prefill_engine;
@@ -868,6 +872,12 @@ pub struct DecodeEngineSnapshot {
     pub logits: Vec<f32>,
 }
 
+#[derive(Serialize, Deserialize)]
+struct DecodeEngineDiskSnapshot {
+    state: ModelStateDiskSnapshot,
+    logits: Vec<f32>,
+}
+
 impl DecodeEngineSnapshot {
     pub fn resident_bytes(&self) -> usize {
         self.state
@@ -883,6 +893,17 @@ impl DecodeEngineSnapshot {
                 .map_err(|e| anyhow::anyhow!("clone Qwen prefix snapshot: {e}"))?,
             logits: self.logits.clone(),
         })
+    }
+
+    pub fn to_disk_bytes(&self) -> Result<Vec<u8>> {
+        let disk = DecodeEngineDiskSnapshot {
+            state: self
+                .state
+                .to_disk_snapshot()
+                .map_err(|e| anyhow::anyhow!("snapshot Qwen state to disk: {e}"))?,
+            logits: self.logits.clone(),
+        };
+        serde_json::to_vec(&disk).map_err(Into::into)
     }
 }
 
@@ -10428,6 +10449,15 @@ impl DecodeEngine {
             .reset_sync()
             .map_err(|e| anyhow::anyhow!("reset sync after prefix restore: {e}"))?;
         Ok(snapshot.logits)
+    }
+
+    pub fn load_prefix_snapshot_bytes(&self, bytes: &[u8]) -> Result<DecodeEngineSnapshot> {
+        let disk: DecodeEngineDiskSnapshot = serde_json::from_slice(bytes)?;
+        Ok(DecodeEngineSnapshot {
+            state: ModelState::from_disk_snapshot(disk.state, &self.weights.config, self.ordinal)
+                .map_err(|e| anyhow::anyhow!("load Qwen prefix snapshot from disk: {e}"))?,
+            logits: disk.logits,
+        })
     }
 
     /// Run native GPU prefill on the prompt, returning logits for the last token.

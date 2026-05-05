@@ -7,6 +7,7 @@ const prompt =
   "Please answer briefly. ".repeat(80);
 const mode = process.env.SUPERSONIC_PREFIX_CACHE_MODE ?? "auto";
 const retention = process.env.SUPERSONIC_PROMPT_CACHE_RETENTION ?? "in_memory";
+const phase = process.env.SUPERSONIC_PREFIX_CACHE_SMOKE_PHASE ?? "full";
 
 const headers = { "content-type": "application/json" };
 if (apiKey) headers.authorization = `Bearer ${apiKey}`;
@@ -61,6 +62,11 @@ function promptTokens(resp) {
   return resp?.usage?.prompt_tokens ?? 0;
 }
 
+function metricValue(metrics, name) {
+  const match = metrics.match(new RegExp(`^${name}\\s+(\\d+)`, "m"));
+  return match ? Number(match[1]) : 0;
+}
+
 async function selectEndpoint() {
   if (mode === "completions" || mode === "chat") {
     return mode;
@@ -93,6 +99,31 @@ async function main() {
           ...cacheFields,
         };
   const path = endpoint === "chat" ? "/chat/completions" : "/completions";
+
+  if (phase === "restart-probe") {
+    const resp = await postJSON(path, body);
+    const cached = cachedTokens(resp);
+    if (cached <= 0) {
+      throw new Error(`expected restart probe to hit disk prefix cache, got ${cached}`);
+    }
+    const metrics = await getText("/metrics");
+    const diskReads = metricValue(metrics, "supersonic_prefix_cache_disk_reads");
+    if (diskReads <= 0) {
+      throw new Error("restart probe did not report a disk prefix-cache read");
+    }
+    console.log(
+      "prefix_cache_smoke",
+      JSON.stringify({
+        phase,
+        cached_tokens: cached,
+        disk_reads: diskReads,
+        endpoint,
+        retention,
+        text: outputText(resp),
+      }),
+    );
+    return;
+  }
 
   const first = await postJSON(path, body);
   const second = await postJSON(path, body);

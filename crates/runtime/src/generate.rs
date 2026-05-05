@@ -333,6 +333,35 @@ fn run(
                     guard.prefill(&prompt_ids)?
                 }
             }
+        } else if let Some(hit) = state.prefix_cache.lookup_disk_bytes(cache_req, &prompt_ids) {
+            match guard.load_disk_prefix(&hit.bytes) {
+                Ok(snapshot) => match guard.restore_prefix(snapshot) {
+                    Ok(mut logits) => {
+                        cached_prompt_tokens = hit.cached_tokens as u32;
+                        for (idx, token) in prompt_ids
+                            .iter()
+                            .copied()
+                            .enumerate()
+                            .skip(hit.cached_tokens)
+                        {
+                            logits = guard.decode_step(token, idx)?;
+                        }
+                        logits
+                    }
+                    Err(e) => {
+                        tracing::warn!("prefix cache disk restore failed: {e}");
+                        state.prefix_cache.record_restore_failure();
+                        guard.reset()?;
+                        prefill_with_cache_anchor(&mut guard, &state, cache_req, &prompt_ids)?
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!("prefix cache disk load failed: {e}");
+                    state.prefix_cache.record_restore_failure();
+                    guard.reset()?;
+                    prefill_with_cache_anchor(&mut guard, &state, cache_req, &prompt_ids)?
+                }
+            }
         } else {
             guard.reset()?;
             prefill_with_cache_anchor(&mut guard, &state, cache_req, &prompt_ids)?
