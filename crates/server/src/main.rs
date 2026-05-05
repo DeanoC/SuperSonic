@@ -100,6 +100,48 @@ struct Cli {
     /// produces a hard error instead of a fetch.
     #[arg(long)]
     no_download: bool,
+
+    /// Disable exact-prefix cache reuse for chat/agent loops.
+    #[arg(long, env = "SUPERSONIC_PREFIX_CACHE_DISABLE")]
+    prefix_cache_disable: bool,
+
+    /// Prefix cache directory. Defaults to
+    /// `{model-dir}/.supersonic/serve-cache/v1`.
+    #[arg(long, env = "SUPERSONIC_PREFIX_CACHE_DIR")]
+    prefix_cache_dir: Option<PathBuf>,
+
+    /// Minimum prompt prefix length eligible for caching.
+    #[arg(
+        long,
+        env = "SUPERSONIC_PREFIX_CACHE_MIN_TOKENS",
+        default_value_t = 128
+    )]
+    prefix_cache_min_tokens: usize,
+
+    /// Maximum number of resident prefix snapshots. Snapshots clone model
+    /// state on GPU, so the default is intentionally conservative.
+    #[arg(
+        long,
+        env = "SUPERSONIC_PREFIX_CACHE_MAX_ENTRIES",
+        default_value_t = 1
+    )]
+    prefix_cache_max_entries: usize,
+
+    /// In-memory prefix cache TTL in seconds.
+    #[arg(
+        long,
+        env = "SUPERSONIC_PREFIX_CACHE_MEMORY_TTL_SECS",
+        default_value_t = 600
+    )]
+    prefix_cache_memory_ttl_secs: u64,
+
+    /// Disk-retained prefix cache metadata TTL in seconds.
+    #[arg(
+        long,
+        env = "SUPERSONIC_PREFIX_CACHE_DISK_TTL_SECS",
+        default_value_t = 86_400
+    )]
+    prefix_cache_disk_ttl_secs: u64,
 }
 
 fn main() -> Result<()> {
@@ -128,6 +170,12 @@ fn main() -> Result<()> {
         max_queued_requests: cli.max_queued_requests,
         queue_timeout_ms: cli.queue_timeout_ms,
         no_download: cli.no_download,
+        prefix_cache_enabled: !cli.prefix_cache_disable,
+        prefix_cache_dir: cli.prefix_cache_dir,
+        prefix_cache_min_tokens: cli.prefix_cache_min_tokens,
+        prefix_cache_max_entries: cli.prefix_cache_max_entries,
+        prefix_cache_memory_ttl_secs: cli.prefix_cache_memory_ttl_secs,
+        prefix_cache_disk_ttl_secs: cli.prefix_cache_disk_ttl_secs,
     };
 
     let st = state::build(loader).context("build server state")?;

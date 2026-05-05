@@ -16,6 +16,30 @@ pub enum InferenceSession {
     Gemma4Int4(Gemma4Int4Engine),
 }
 
+pub enum SessionSnapshot {
+    Qwen(runner::decode_engine::DecodeEngineSnapshot),
+    Gemma4Bf16(runner::gemma4_engine::Gemma4EngineSnapshot),
+    Gemma4Int4(runner::gemma4_int4_engine::Gemma4Int4EngineSnapshot),
+}
+
+impl SessionSnapshot {
+    pub fn try_clone(&self) -> Result<Self> {
+        match self {
+            Self::Qwen(s) => Ok(Self::Qwen(s.try_clone()?)),
+            Self::Gemma4Bf16(s) => Ok(Self::Gemma4Bf16(s.try_clone()?)),
+            Self::Gemma4Int4(s) => Ok(Self::Gemma4Int4(s.try_clone()?)),
+        }
+    }
+
+    pub fn logits(&self) -> &[f32] {
+        match self {
+            Self::Qwen(s) => &s.logits,
+            Self::Gemma4Bf16(s) => &s.logits,
+            Self::Gemma4Int4(s) => &s.logits,
+        }
+    }
+}
+
 impl InferenceSession {
     /// Reset per-prompt state (KV caches, conv/recurrent). Weights and
     /// scratch allocations stay resident.
@@ -57,6 +81,25 @@ impl InferenceSession {
             Self::Qwen(e) => e.decode_step_replay(token_history),
             Self::Gemma4Bf16(_) | Self::Gemma4Int4(_) => Err(anyhow!(
                 "replay-prefill decode is only implemented for the Qwen3.5 engine"
+            )),
+        }
+    }
+
+    pub fn snapshot_prefix(&self, logits: Vec<f32>) -> Result<SessionSnapshot> {
+        match self {
+            Self::Qwen(e) => Ok(SessionSnapshot::Qwen(e.snapshot_prefix(logits)?)),
+            Self::Gemma4Bf16(e) => Ok(SessionSnapshot::Gemma4Bf16(e.snapshot_prefix(logits)?)),
+            Self::Gemma4Int4(e) => Ok(SessionSnapshot::Gemma4Int4(e.snapshot_prefix(logits)?)),
+        }
+    }
+
+    pub fn restore_prefix(&mut self, snapshot: SessionSnapshot) -> Result<Vec<f32>> {
+        match (self, snapshot) {
+            (Self::Qwen(e), SessionSnapshot::Qwen(s)) => e.restore_prefix_owned(s),
+            (Self::Gemma4Bf16(e), SessionSnapshot::Gemma4Bf16(s)) => e.restore_prefix(&s),
+            (Self::Gemma4Int4(e), SessionSnapshot::Gemma4Int4(s)) => e.restore_prefix(&s),
+            _ => Err(anyhow!(
+                "prefix cache snapshot does not match loaded model family"
             )),
         }
     }

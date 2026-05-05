@@ -2050,6 +2050,7 @@ dependencies = [
  "runner",
  "serde",
  "serde_json",
+ "sha2",
  "supersonic-core",
  "tokenizers",
  "tokio",

@@ -17,9 +17,10 @@ use crate::errors::ApiError;
 use crate::generate::{self, GenParams};
 use crate::ids;
 use crate::output::{parse_assistant_output, AssistantOutput};
+use crate::prefix_cache::{self, CacheRequest, CacheRetention};
 use crate::schemas::{
     ChatCompletionChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse,
-    ChatStreamChoice, ChatStreamChunk, ChatStreamDelta, Usage,
+    ChatStreamChoice, ChatStreamChunk, ChatStreamDelta, PromptTokensDetails, Usage,
 };
 use crate::state::ServerState;
 
@@ -77,13 +78,27 @@ pub async fn completions(
     let model = state.model_id.clone();
 
     if req.stream {
-        let rx = generate::spawn(state.clone(), prompt_ids, params).map_err(queue_error)?;
+        let cache = cache_request(
+            &state,
+            req.user.as_deref(),
+            req.metadata.as_ref(),
+            req.prompt_cache_key.as_deref(),
+            req.prompt_cache_retention.as_deref(),
+        );
+        let rx = generate::spawn(state.clone(), prompt_ids, params, cache).map_err(queue_error)?;
         let stream = chat_sse_stream(rx, id, created, model, include_usage);
         Ok(Sse::new(stream)
             .keep_alive(KeepAlive::default())
             .into_response())
     } else {
-        let rx = generate::spawn(state.clone(), prompt_ids, params).map_err(queue_error)?;
+        let cache = cache_request(
+            &state,
+            req.user.as_deref(),
+            req.metadata.as_ref(),
+            req.prompt_cache_key.as_deref(),
+            req.prompt_cache_retention.as_deref(),
+        );
+        let rx = generate::spawn(state.clone(), prompt_ids, params, cache).map_err(queue_error)?;
         let result = generate::collect(rx).await.map_err(generation_error)?;
         let parsed = parse_assistant_output(&result.text);
         let resp = ChatCompletionResponse {
@@ -105,10 +120,60 @@ pub async fn completions(
                 prompt_tokens: result.prompt_tokens,
                 completion_tokens: result.completion_tokens,
                 total_tokens: result.prompt_tokens + result.completion_tokens,
+                prompt_tokens_details: Some(PromptTokensDetails {
+                    cached_tokens: result.cached_prompt_tokens,
+                }),
             },
         };
         Ok(Json(resp).into_response())
     }
+}
+
+pub(crate) fn usage(
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    cached_prompt_tokens: u32,
+) -> Usage {
+    Usage {
+        prompt_tokens,
+        completion_tokens,
+        total_tokens: prompt_tokens + completion_tokens,
+        prompt_tokens_details: Some(PromptTokensDetails {
+            cached_tokens: cached_prompt_tokens,
+        }),
+    }
+}
+
+pub(crate) fn cache_request(
+    state: &ServerState,
+    user: Option<&str>,
+    metadata: Option<&Value>,
+    prompt_cache_key: Option<&str>,
+    retention: Option<&str>,
+) -> Option<CacheRequest> {
+    let retention = CacheRetention::from_openai(retention);
+    if retention == CacheRetention::None || !state.prefix_cache.config().enabled {
+        return None;
+    }
+    let thread = metadata
+        .and_then(|m| {
+            m.get("thread_id")
+                .or_else(|| m.get("conversation_id"))
+                .or_else(|| m.get("session_id"))
+        })
+        .and_then(Value::as_str);
+    let scoped_user = user.or(thread);
+    Some(CacheRequest {
+        key: prompt_cache_key
+            .map(ToOwned::to_owned)
+            .or_else(|| thread.map(ToOwned::to_owned)),
+        retention,
+        scope: prefix_cache::scope_from_parts(
+            &state.model_id,
+            state.api_key.as_deref(),
+            scoped_user,
+        ),
+    })
 }
 
 pub(crate) fn queue_error(err: anyhow::Error) -> ApiError {
@@ -216,7 +281,12 @@ fn parsed_chat_events(
                         }
                     }
                 }
-                generate::GenEvent::Done { reason, prompt_tokens, completion_tokens } => {
+                generate::GenEvent::Done {
+                    reason,
+                    prompt_tokens,
+                    completion_tokens,
+                    cached_prompt_tokens,
+                } => {
                     let parsed = parse_assistant_output(&raw);
                     let done_reason = finish_reason(reason.as_str(), &parsed);
                     yield Ok(sse::json_event(&chat_chunk(
@@ -239,11 +309,11 @@ fn parsed_chat_events(
                             created,
                             model: model.clone(),
                             choices: Vec::new(),
-                            usage: Some(Usage {
+                            usage: Some(usage(
                                 prompt_tokens,
                                 completion_tokens,
-                                total_tokens: prompt_tokens + completion_tokens,
-                            }),
+                                cached_prompt_tokens,
+                            )),
                         }));
                     }
                     yield Ok(Event::default().data("[DONE]"));

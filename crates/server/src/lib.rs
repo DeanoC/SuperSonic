@@ -8,7 +8,8 @@ pub mod routes;
 pub mod schemas;
 
 pub use supersonic_runtime::{
-    backend, capabilities, chat_template, generate, ids, registry, sampling, session, state,
+    backend, capabilities, chat_template, generate, ids, prefix_cache, registry, sampling, session,
+    state,
 };
 
 use std::sync::Arc;

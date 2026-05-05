@@ -4,6 +4,7 @@ use futures::StreamExt;
 use reqwest::Client;
 use serde_json::{json, Value};
 use server::generate::MockGeneration;
+use server::prefix_cache::{PrefixCache, PrefixCacheConfig};
 use server::state::{GenerationScheduler, ServerState};
 use server::{capabilities, chat_template, registry};
 
@@ -58,6 +59,14 @@ fn test_state_with_scheduler(
             false,
             false,
         ),
+        prefix_cache: Arc::new(PrefixCache::new(PrefixCacheConfig {
+            enabled: true,
+            dir: std::env::temp_dir().join("supersonic-test-prefix-cache"),
+            min_tokens: 1,
+            max_entries: 1,
+            memory_ttl_secs: 600,
+            disk_ttl_secs: 86_400,
+        })),
     })
 }
 
@@ -294,6 +303,9 @@ async fn mock_chat_stream_buffers_reasoning_and_includes_usage() {
             "reasoning_effort": "medium",
             "stream": true,
             "stream_options": {"include_usage": true},
+            "prompt_cache_key": "protocol-mock",
+            "prompt_cache_retention": "in_memory",
+            "metadata": {"thread_id": "thread-a"},
             "max_tokens": 8
         }))
         .send()
@@ -319,6 +331,7 @@ async fn mock_chat_stream_buffers_reasoning_and_includes_usage() {
         }
         if event.get("usage").is_some_and(|u| !u.is_null()) {
             saw_usage = true;
+            assert_eq!(event["usage"]["prompt_tokens_details"]["cached_tokens"], 0);
         }
         let serialized = event.to_string();
         assert!(
@@ -416,6 +429,19 @@ async fn mock_auth_cors_and_model_mismatch() {
         .expect("model json");
     assert_eq!(model["id"], "qwen3.5-0.8b");
 
+    let capabilities: Value = h
+        .client
+        .get(format!("{}/v1/capabilities", h.base))
+        .bearer_auth("secret")
+        .send()
+        .await
+        .expect("capabilities")
+        .json()
+        .await
+        .expect("capabilities json");
+    assert_eq!(capabilities["prefix_cache"]["enabled"], true);
+    assert_eq!(capabilities["prefix_cache"]["min_tokens"], 1);
+
     let missing_model = h
         .client
         .get(format!("{}/v1/models/gpt-4.1", h.base))
@@ -437,6 +463,8 @@ async fn mock_auth_cors_and_model_mismatch() {
         .expect("metrics text");
     assert!(metrics.contains("supersonic_active_requests"));
     assert!(metrics.contains("supersonic_queued_requests"));
+    assert!(metrics.contains("supersonic_prefix_cache_hits"));
+    assert!(metrics.contains("supersonic_prefix_cache_cached_tokens"));
 
     let cors = h
         .client
@@ -722,6 +750,7 @@ async fn mock_completions_accept_token_prompt() {
         .expect("json");
     assert_eq!(resp["choices"][0]["text"], "hello");
     assert_eq!(resp["usage"]["prompt_tokens"], 2);
+    assert_eq!(resp["usage"]["prompt_tokens_details"]["cached_tokens"], 0);
 
     let batched = h
         .client
