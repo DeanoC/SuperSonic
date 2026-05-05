@@ -533,6 +533,37 @@ pub fn run_phi4(
         None
     };
 
+    // Teacher-forced scoring: run before the normal decode loop.
+    if cli.teacher_forced {
+        return run_phi4_teacher_forced_inner(
+            cli,
+            model_variant,
+            &config,
+            &weights,
+            &mut state,
+            &rope,
+            ordinal,
+            kv_chunk,
+            hidden_size,
+            intermediate_size,
+            launch_layers,
+            proj_buf_floats,
+            attn_scratch_floats,
+            rms_eps,
+            &mut workspace,
+            &mut sync_buf,
+            &mut matvec_counter,
+            &mut hidden_io,
+            &mut normed_buf,
+            &mut logits_buf,
+            &mut desc_device,
+            kv_fp8_desc_device.as_mut(),
+            int4_scale_device.as_ref(),
+            fp8_scale_device.as_ref(),
+            &prompt_ids,
+        );
+    }
+
     let total_steps = prompt_ids.len() + cli.max_new_tokens;
     let eos_ids: Vec<u32> = config.eos_token_ids();
 
@@ -1051,6 +1082,351 @@ pub fn run_phi4(
         eprintln!("[validate] max_delta={max_delta:.4} token_mismatches={token_mismatches}");
     }
 
+    Ok(())
+}
+
+/// Compute the negative log-likelihood of `target_token` under the distribution
+/// implied by `logits` (numerically stable log-softmax).
+fn phi4_target_nll(logits: &[f32], target_token: u32) -> Result<f64> {
+    let target_idx = target_token as usize;
+    let target_logit = logits.get(target_idx).ok_or_else(|| {
+        anyhow!(
+            "target token {target_token} outside logits len {}",
+            logits.len()
+        )
+    })?;
+    let max_logit = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+    let sum_exp = logits
+        .iter()
+        .map(|&x| ((x as f64) - max_logit).exp())
+        .sum::<f64>();
+    Ok(max_logit + sum_exp.ln() - *target_logit as f64)
+}
+
+/// Run one Phi-4 decode step at `pos` using `input_token` and return the full
+/// logit vector (BF16 → f32).  Used by the teacher-forced scoring path.
+///
+/// # Safety
+/// All GPU buffers must be live and appropriately sized for the given position.
+#[allow(clippy::too_many_arguments)]
+fn phi4_decode_step_logits(
+    config: &Phi4Config,
+    weights: &Phi4Weights,
+    state: &mut Phi4ModelState,
+    rope: &Phi4LongRope,
+    ordinal: usize,
+    kv_chunk: usize,
+    hidden_size: usize,
+    intermediate_size: usize,
+    launch_layers: usize,
+    proj_buf_floats: usize,
+    attn_scratch_floats: usize,
+    rms_eps: f32,
+    kv_fp8: bool,
+    workspace: &mut GpuBuffer,
+    sync_buf: &mut GpuBuffer,
+    matvec_counter: &mut GpuBuffer,
+    hidden_io: &mut GpuBuffer,
+    normed_buf: &mut GpuBuffer,
+    logits_buf: &mut GpuBuffer,
+    desc_device: &mut GpuBuffer,
+    mut kv_fp8_desc_device: Option<&mut GpuBuffer>,
+    int4_scale_device: Option<&GpuBuffer>,
+    fp8_scale_device: Option<&GpuBuffer>,
+    input_token: u32,
+    pos: usize,
+) -> Result<Vec<f32>> {
+    let row_bytes = hidden_size * ScalarType::BF16.size_in_bytes();
+
+    // 1. Embedding gather.
+    let src_offset = input_token as usize * row_bytes;
+    gpu_hal::copy_d2d(
+        ordinal,
+        hidden_io.as_mut_ptr(),
+        weights.embed_tokens.offset_ptr(src_offset),
+        row_bytes,
+    )
+    .map_err(|e| anyhow!("embedding lookup at pos {pos}: {e}"))?;
+
+    // 2. Ensure KV capacity.
+    for ls in state.layers.iter_mut() {
+        ls.ensure_kv_capacity(pos, ordinal, config, kv_chunk, kv_fp8)
+            .map_err(|e| anyhow!("ensure KV capacity at pos {pos}: {e}"))?;
+    }
+
+    // 3. Build and upload layer descriptors.
+    let descs = build_descs(config, weights, state, pos);
+    let desc_bytes = descriptor_bytes(&descs);
+    gpu_hal::copy_h2d(
+        ordinal,
+        desc_device.as_mut_ptr(),
+        desc_bytes.as_ptr() as *const c_void,
+        desc_bytes.len(),
+    )
+    .map_err(|e| anyhow!("upload layer descs at pos {pos}: {e}"))?;
+
+    // KV-FP8 scale descs when applicable.
+    if kv_fp8 {
+        if let Some(buf) = kv_fp8_desc_device.as_mut() {
+            let kv_fp8_descs = build_kv_fp8_descs(state);
+            let bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    kv_fp8_descs.as_ptr() as *const u8,
+                    kv_fp8_descs.len() * std::mem::size_of::<phi4_ffi::Phi4KVCacheFp8Desc>(),
+                )
+            };
+            gpu_hal::copy_h2d(
+                ordinal,
+                buf.as_mut_ptr(),
+                bytes.as_ptr() as *const c_void,
+                bytes.len(),
+            )
+            .map_err(|e| anyhow!("upload kv_fp8 descs at pos {pos}: {e}"))?;
+        }
+    }
+
+    // 4. Reset scratch.
+    gpu_hal::memset_zeros(ordinal, workspace.as_mut_ptr(), workspace.len_bytes())
+        .map_err(|e| anyhow!("clear workspace at pos {pos}: {e}"))?;
+    gpu_hal::memset_zeros(ordinal, sync_buf.as_mut_ptr(), sync_buf.len_bytes())
+        .map_err(|e| anyhow!("reset sync_buf at pos {pos}: {e}"))?;
+
+    // 5. Pick LongRoPE table for this position.
+    let (cos_table, sin_table) = rope.tables_for_kv_len(pos);
+
+    // 6. Launch persistent decode megakernel.
+    phi4_ffi::persistent_decode(
+        ordinal,
+        ScalarType::BF16,
+        launch_layers,
+        hidden_size,
+        intermediate_size,
+        pos,
+        desc_device,
+        hidden_io,
+        workspace,
+        sync_buf,
+        cos_table,
+        sin_table,
+        proj_buf_floats,
+        attn_scratch_floats,
+        fp8_scale_device,
+        kv_fp8_desc_device.as_deref(),
+        1,
+        None,
+        int4_scale_device,
+        None,
+        0,
+    )
+    .map_err(|e| anyhow!("phi4 persistent_decode at pos {pos}: {e}"))?;
+
+    // 7. Mark KV slot filled.
+    for ls in state.layers.iter_mut() {
+        ls.set_kv_filled(pos + 1);
+    }
+
+    // 8. Final RMS norm + lm_head → logits.
+    phi4_ffi::rms_norm(
+        ordinal,
+        ScalarType::BF16,
+        normed_buf,
+        hidden_io,
+        &weights.norm_weight,
+        rms_eps,
+        hidden_size,
+    )
+    .map_err(|e| anyhow!("final rms_norm at pos {pos}: {e}"))?;
+
+    kernel_ffi::standalone_matvec_4b(
+        ordinal,
+        ScalarType::BF16,
+        logits_buf,
+        normed_buf,
+        &*weights.lm_head,
+        hidden_size,
+        config.vocab_size,
+        matvec_counter,
+    )
+    .map_err(|e| anyhow!("lm_head matvec at pos {pos}: {e}"))?;
+
+    let logits_bytes = logits_buf
+        .to_host_bytes()
+        .map_err(|e| anyhow!("logits D2H at pos {pos}: {e}"))?;
+    let logits_f32: Vec<f32> = logits_bytes
+        .chunks_exact(2)
+        .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
+        .collect();
+    Ok(logits_f32)
+}
+
+/// Inner implementation of teacher-forced scoring for Phi-4-mini.
+///
+/// Called from within `run_phi4` after all GPU buffers and model state are
+/// set up.  Mirrors the Gemma 4 decode-step-only path: prefills on the first
+/// prompt token, then steps through the remaining tokens scoring each one from
+/// the logits of the previous position.
+///
+/// See `run_gemma4_teacher_forced` for the reference implementation.
+#[allow(clippy::too_many_arguments)]
+fn run_phi4_teacher_forced_inner(
+    cli: &crate::Cli,
+    model_variant: &ModelVariant,
+    config: &Phi4Config,
+    weights: &Phi4Weights,
+    state: &mut Phi4ModelState,
+    rope: &Phi4LongRope,
+    ordinal: usize,
+    kv_chunk: usize,
+    hidden_size: usize,
+    intermediate_size: usize,
+    launch_layers: usize,
+    proj_buf_floats: usize,
+    attn_scratch_floats: usize,
+    rms_eps: f32,
+    workspace: &mut GpuBuffer,
+    sync_buf: &mut GpuBuffer,
+    matvec_counter: &mut GpuBuffer,
+    hidden_io: &mut GpuBuffer,
+    normed_buf: &mut GpuBuffer,
+    logits_buf: &mut GpuBuffer,
+    desc_device: &mut GpuBuffer,
+    mut kv_fp8_desc_device: Option<&mut GpuBuffer>,
+    int4_scale_device: Option<&GpuBuffer>,
+    fp8_scale_device: Option<&GpuBuffer>,
+    prompt_ids: &[u32],
+) -> Result<()> {
+    if prompt_ids.len() < 2 {
+        bail!("--teacher-forced requires at least 2 prompt tokens");
+    }
+    if cli.validate || cli.gpu_validate {
+        bail!("--teacher-forced does not currently support --validate or --gpu-validate");
+    }
+
+    let score_start = Instant::now();
+    let prefill_start = Instant::now();
+
+    // Phi-4 uses the decode-step-by-step path (no prefill_native_with_target_nll):
+    // prefill on the first token, then step through the remaining tokens scoring
+    // each from its logits.  Equivalent to Qwen3.5's --teacher-forced-decode-step
+    // branch and identical in semantics to run_gemma4_teacher_forced.
+    let mut logits = phi4_decode_step_logits(
+        config,
+        weights,
+        state,
+        rope,
+        ordinal,
+        kv_chunk,
+        hidden_size,
+        intermediate_size,
+        launch_layers,
+        proj_buf_floats,
+        attn_scratch_floats,
+        rms_eps,
+        cli.kv_fp8,
+        workspace,
+        sync_buf,
+        matvec_counter,
+        hidden_io,
+        normed_buf,
+        logits_buf,
+        desc_device,
+        kv_fp8_desc_device.as_deref_mut(),
+        int4_scale_device,
+        fp8_scale_device,
+        prompt_ids[0],
+        0,
+    )?;
+    let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
+
+    let mut total_nll = 0.0f64;
+    let mut scored_tokens = 0usize;
+    let mut decode_steps = 0usize;
+
+    for target_idx in 1..prompt_ids.len() {
+        total_nll += phi4_target_nll(&logits, prompt_ids[target_idx])?;
+        scored_tokens += 1;
+        if target_idx + 1 < prompt_ids.len() {
+            let input_token = prompt_ids[target_idx];
+            let pos = target_idx;
+            // Re-borrow kv_fp8_desc_device each step so the KV-FP8 scale
+            // descriptors are re-uploaded whenever ensure_kv_capacity may
+            // have grown the cache (matches the behaviour of the main decode
+            // loop in run_phi4).
+            logits = phi4_decode_step_logits(
+                config,
+                weights,
+                state,
+                rope,
+                ordinal,
+                kv_chunk,
+                hidden_size,
+                intermediate_size,
+                launch_layers,
+                proj_buf_floats,
+                attn_scratch_floats,
+                rms_eps,
+                cli.kv_fp8,
+                workspace,
+                sync_buf,
+                matvec_counter,
+                hidden_io,
+                normed_buf,
+                logits_buf,
+                desc_device,
+                kv_fp8_desc_device.as_deref_mut(),
+                int4_scale_device,
+                fp8_scale_device,
+                input_token,
+                pos,
+            )?;
+            decode_steps += 1;
+        }
+    }
+
+    if scored_tokens == 0 {
+        bail!("--teacher-forced scored zero tokens");
+    }
+
+    let total_ms = score_start.elapsed().as_secs_f64() * 1000.0;
+    let avg_nll = total_nll / scored_tokens as f64;
+    let perplexity = avg_nll.exp();
+    let bits_per_token = avg_nll / std::f64::consts::LN_2;
+    let ms_per_token = total_ms / scored_tokens as f64;
+    eprintln!(
+        "[teacher_forced] tokens={} scored_tokens={} decode_steps={} nll={:.6} avg_nll={:.6} ppl={:.6} bpt={:.6} prefill_ms={:.1} total_ms={:.1} ms_per_token={:.2}",
+        prompt_ids.len(),
+        scored_tokens,
+        decode_steps,
+        total_nll,
+        avg_nll,
+        perplexity,
+        bits_per_token,
+        prefill_ms,
+        total_ms,
+        ms_per_token,
+    );
+    println!(
+        "[teacher_forced_json] {}",
+        serde_json::to_string(&serde_json::json!({
+            "backend": "hip",
+            "model": model_variant.to_string(),
+            "mode": "dense",
+            "teacher_forced_scoring": "decode_step_logits",
+            "prompt_tokens": prompt_ids.len(),
+            "scored_tokens": scored_tokens,
+            "skipped_boundary_tokens": 0,
+            "dense_prefix_len": 0,
+            "decode_steps": decode_steps,
+            "certified_decode_steps": 0,
+            "total_nll": total_nll,
+            "avg_nll": avg_nll,
+            "perplexity": perplexity,
+            "bits_per_token": bits_per_token,
+            "prefill_ms": prefill_ms,
+            "total_ms": total_ms,
+            "ms_per_token": ms_per_token,
+        }))?
+    );
     Ok(())
 }
 
