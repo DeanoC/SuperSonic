@@ -439,15 +439,20 @@ fn process_chunk_batched(
     scratch: &mut FullAttnBatchScratch,
     timings: &mut BatchedPrefillTimings,
 ) -> Result<()> {
-    let use_batched_attn = std::env::var("SUPERSONIC_QWEN36_MOE_BATCHED_ATTN")
-        .map(|v| !v.is_empty() && v != "0")
+    // M13: batched M3 attention is the DEFAULT inside the orchestrator.
+    // Set SUPERSONIC_QWEN36_MOE_BATCHED_ATTN=0 to fall back to the
+    // per-token chain step inside the chunk (kept as a bisect/escape
+    // hatch — the orchestrator still runs but each chunk's tokens go
+    // through the existing per-token persistent megakernel one at a
+    // time, so the chunking adds no perf benefit, just structure).
+    let batched_attn_disabled = std::env::var("SUPERSONIC_QWEN36_MOE_BATCHED_ATTN")
+        .map(|v| v == "0")
         .unwrap_or(false);
 
-    if !use_batched_attn {
-        // Default: per-token chain step inside the chunk. Mirrors the
-        // engine main loop's prefill iterations exactly, so M1 parity
-        // continues to pass while the M3 batched-attn path is being
-        // brought up under SUPERSONIC_QWEN36_MOE_BATCHED_ATTN=1.
+    if batched_attn_disabled {
+        // Per-token chain step inside the chunk. Mirrors the engine main
+        // loop's prefill iterations exactly, so M1 parity continues to
+        // pass while bisecting against the M3 batched-attn path.
         let _ = (rotary, scratch);
         for inner in 0..n {
             let step = chunk_start + inner;
@@ -527,13 +532,13 @@ fn process_chunk_batched(
     let t_embed = t0.elapsed();
     timings.embed_total += t_embed;
 
-    // M11: sub-env-var to bisect grouped vs per-token FFN.
-    // Default ON when SUPERSONIC_QWEN36_MOE_BATCHED_ATTN=1 (i.e. we got
-    // here via the batched path); =0 falls back to per-token FFN inside
-    // the chunk while keeping the batched attention.
-    let use_grouped_ffn = std::env::var("SUPERSONIC_QWEN36_MOE_GROUPED_FFN")
-        .map(|v| !v.is_empty() && v != "0")
-        .unwrap_or(true);
+    // M13: grouped MoE FFN is the DEFAULT once we're on the batched-attn
+    // path. Set SUPERSONIC_QWEN36_MOE_GROUPED_FFN=0 to fall back to per-token
+    // FFN inside the chunk while keeping the batched attention.
+    let grouped_ffn_disabled = std::env::var("SUPERSONIC_QWEN36_MOE_GROUPED_FFN")
+        .map(|v| v == "0")
+        .unwrap_or(false);
+    let use_grouped_ffn = !grouped_ffn_disabled;
 
     // Per-token fallback workspaces. Always allocated — used either by
     // linear-attn (always) or by per-token FFN (when grouped FFN is off).

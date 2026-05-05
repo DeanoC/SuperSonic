@@ -1,16 +1,11 @@
 //! End-to-end parity gate for the Qwen 3.6 MoE batched-Q prefill path.
 //!
-//! Runs `supersonic` twice on the same prompt — once with the legacy
-//! per-token persistent-decode prefill loop (env var unset), once with
-//! `SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL=1` (the new chunked path).
-//! Compares the dumped post-prefill last-token logits.
-//!
-//! While the new path is still a stub that delegates back to the
-//! per-token kernels (Milestones 1–5), this test passes trivially —
-//! it exists to lock in the regression gate before any real kernel
-//! work lands. From Milestone 6 onward (when the orchestrator actually
-//! runs the new batched kernels), this test becomes the load-bearing
-//! correctness signal.
+//! M13: batched prefill is now the default for Qwen 3.6 MoE. This test
+//! runs `supersonic` twice on the same prompt — once with the LEGACY
+//! per-token persistent-decode prefill loop forced via
+//! `SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL=0`, once with the default
+//! (no env vars set, batched path active) — and compares the dumped
+//! post-prefill last-token logits.
 //!
 //! Subprocess-spawn pattern lives at:
 //!   crates/runner/tests/specprefill_qwen36_moe_cosine_parity.rs
@@ -93,20 +88,21 @@ fn batched_prefill_matches_per_token() {
         "--max-new-tokens", "1",
     ];
 
-    let baseline = run_supersonic_capture_logits(&common, &[]).expect("baseline (per-token)");
-    let batched = run_supersonic_capture_logits(
+    // M13: explicitly disable all three stages to get the LEGACY per-token
+    // persistent-decode behavior (the pre-PR path).
+    let baseline = run_supersonic_capture_logits(
         &common,
         &[
-            ("SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL", "1"),
-            ("SUPERSONIC_QWEN36_MOE_BATCHED_ATTN", "1"),
-            // M11: enable the grouped MoE FFN path (router permute + grouped
-            // expert GEMM + unpermute combine). When unset the orchestrator
-            // also defaults to ON; setting it explicitly here documents the
-            // expected configuration.
-            ("SUPERSONIC_QWEN36_MOE_GROUPED_FFN", "1"),
+            ("SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL", "0"),
+            ("SUPERSONIC_QWEN36_MOE_BATCHED_ATTN", "0"),
+            ("SUPERSONIC_QWEN36_MOE_GROUPED_FFN", "0"),
         ],
     )
-    .expect("batched");
+    .expect("baseline (per-token, env=0 forced)");
+    // No env vars set → the new default: batched prefill + batched attn +
+    // grouped FFN all active.
+    let batched = run_supersonic_capture_logits(&common, &[])
+        .expect("batched (default)");
 
     assert_eq!(
         baseline.len(),

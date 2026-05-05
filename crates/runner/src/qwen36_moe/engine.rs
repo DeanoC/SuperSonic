@@ -395,16 +395,17 @@ fn decode_text(
     // `[0, effective_prompt_len - 1)` instead of the engine's main
     // per-step loop — see
     // docs/superpowers/plans/2026-05-05-qwen36-moe-batched-prefill-phase1.md.
-    // M6.1 SKELETON: the orchestrator still calls the existing
-    // per-token persistent megakernel inside each chunk; M6.3+ swaps
-    // those inner per-token launches for true batched kernels.
-    // Treat unset / empty / "0" as off; anything else as on.
-    let batched_prefill_requested = std::env::var("SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL")
-        .map(|v| !v.is_empty() && v != "0")
+    // M13: batched-prefill is the DEFAULT for Qwen 3.6 MoE. Bench at
+    // 4K context (gfx1100, qwen3.6-35b-a3b INT4) shows 1.79x prefill
+    // speedup vs the per-token persistent megakernel. Set
+    // SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL=0 to revert to the legacy
+    // per-token path (kept as a bisect/escape hatch).
+    let batched_prefill_disabled = std::env::var("SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL")
+        .map(|v| v == "0")
         .unwrap_or(false);
 
     let mut start_step = 0usize;
-    if batched_prefill_requested && effective_prompt_len > 1 {
+    if !batched_prefill_disabled && effective_prompt_len > 1 {
         let timings = crate::qwen36_moe_cli::batched_prefill::run_batched_prefill_stub(
             ordinal,
             &geom,
