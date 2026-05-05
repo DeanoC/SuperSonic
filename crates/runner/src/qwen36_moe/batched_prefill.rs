@@ -67,9 +67,40 @@ use crate::qwen36_moe_types::{
     AttnLayerBuffers, FullAttnInt4Sidecars, FullAttnKvCache, LayerBuffers, MultiLayerGeom,
 };
 
-/// Number of prompt tokens per outer chunk. M6.2: this is the actual
-/// `q_len` per M3 launch.
-pub(crate) const PREFILL_CHUNK_SIZE: usize = 64;
+/// Three compile-time chunk-size variants the orchestrator dispatches
+/// among at runtime based on remaining prompt tokens. The kernel templates
+/// (M3 attention, M9 router permute, M10 grouped expert GEMM, M11 unpermute
+/// combine) all take `n_tokens` as a runtime arg and work for any size in
+/// [1, MAX]; the rationale for picking from a small set of fixed sizes:
+///
+///   - **64**: small for the last partial chunk and for very-short prompts.
+///     Avg tokens-per-expert = 64×8/256 = 2 — INT4 WMMA tiles 12% utilized;
+///     useful only when the chunk would otherwise be smaller.
+///   - **256**: medium. Avg tokens/expert = 8 — half-utilized 16×16 WMMA.
+///     Sweet spot for prompts in the 256–1023 range.
+///   - **1024**: large. Avg tokens/expert = 32 — fully-utilized 16×16 WMMA
+///     tiles. Best for the bulk of long prompts (>=1024 remaining).
+///
+/// Scratch buffers (`FullAttnBatchScratch`) are sized for `MAX` and the
+/// per-chunk code uses only the prefix needed.
+pub(crate) const PREFILL_CHUNK_SIZE_SMALL: usize = 64;
+pub(crate) const PREFILL_CHUNK_SIZE_MEDIUM: usize = 256;
+pub(crate) const PREFILL_CHUNK_SIZE_LARGE: usize = 1024;
+pub(crate) const PREFILL_CHUNK_SIZE_MAX: usize = PREFILL_CHUNK_SIZE_LARGE;
+
+/// Pick the largest of {SMALL, MEDIUM, LARGE} that fits `remaining`. The
+/// last partial chunk uses the smallest variant that still covers it.
+fn pick_chunk_size(remaining: usize) -> usize {
+    if remaining >= PREFILL_CHUNK_SIZE_LARGE {
+        PREFILL_CHUNK_SIZE_LARGE
+    } else if remaining >= PREFILL_CHUNK_SIZE_MEDIUM {
+        PREFILL_CHUNK_SIZE_MEDIUM
+    } else {
+        // remaining < 256: just process whatever's left in one shot. Cap
+        // by SMALL so the loop's per-call sizing stays bounded above.
+        remaining.min(PREFILL_CHUNK_SIZE_SMALL)
+    }
+}
 
 /// Native INT4 quant_type code (matches qwen35::weights::LOWBIT_NATIVE_INT4).
 const QUANT_TYPE_NATIVE_INT4: i32 = 4;
@@ -299,9 +330,13 @@ pub(crate) fn run_batched_prefill_stub(
     )
     .context("build rotary tables")?;
 
-    let chunk_n = PREFILL_CHUNK_SIZE.min(prefill_count);
-    let mut scratch = FullAttnBatchScratch::alloc(ordinal, geom, chunk_n, max_kv_t)
-        .context("alloc full-attn batched scratch")?;
+    // Allocate scratch sized for the LARGEST chunk we might use; per-chunk
+    // code uses only the `n` prefix needed. At hidden=2048 hd=256 H=16 and
+    // MAX=1024 the heaviest buffer is q_thsd [H, N, hd] = 8 MB — fine for
+    // the 24 GiB target.
+    let scratch_n = PREFILL_CHUNK_SIZE_MAX.min(prefill_count.max(1));
+    let mut scratch = FullAttnBatchScratch::alloc(ordinal, geom, scratch_n, max_kv_t)
+        .context("alloc full-attn batched scratch (max chunk)")?;
 
     let full_prompt_len = prompt_ids.len();
 
@@ -312,8 +347,12 @@ pub(crate) fn run_batched_prefill_stub(
 
     let mut step = 0usize;
     while step < prefill_count {
-        let chunk_end = (step + PREFILL_CHUNK_SIZE).min(prefill_count);
-        let n = chunk_end - step;
+        // Runtime dispatch among compile-time chunk-size options. picked is
+        // one of {64, 256, 1024} or `remaining` for the trailing partial.
+        // Each kernel accepts `n_tokens` as a runtime arg so we just pass
+        // the actual chunk size; the dispatch pre-shapes scratch usage.
+        let remaining = prefill_count - step;
+        let n = pick_chunk_size(remaining).min(remaining);
         timings.chunks += 1;
 
         let t_chunk = Instant::now();
@@ -342,7 +381,7 @@ pub(crate) fn run_batched_prefill_stub(
         )?;
         let _ = t_chunk;
 
-        step = chunk_end;
+        step += n;
     }
 
     Ok(timings)
@@ -721,7 +760,8 @@ fn run_pertoken_chunked(
 
     let mut step = 0usize;
     while step < prefill_count {
-        let chunk_end = (step + PREFILL_CHUNK_SIZE).min(prefill_count);
+        let remaining = prefill_count - step;
+        let chunk_end = step + pick_chunk_size(remaining).min(remaining);
         timings.chunks += 1;
 
         while step < chunk_end {
