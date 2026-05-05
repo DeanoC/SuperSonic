@@ -33,7 +33,10 @@ fn accepts_ms_per_tok_as_ms_per_step_for_legacy_batch1_runners() {
     let m = extract_metrics(legacy);
     // ms_per_step is the canonical field we extract; if a runner only emits ms_per_tok,
     // we accept ms_per_tok as ms_per_step (they are equivalent for batch=1) but flag it.
-    assert!(m.is_some(), "ms_per_tok should be accepted as ms_per_step for batch=1");
+    assert!(
+        m.is_some(),
+        "ms_per_tok should be accepted as ms_per_step for batch=1"
+    );
     let m = m.unwrap();
     assert!((m.ms_per_step - 8.0).abs() < 1e-6);
 }
@@ -43,4 +46,11 @@ fn last_result_line_wins_when_multiple_present() {
     let s = "[result] ms_per_step=5\n[result] ms_per_step=9\n";
     let m = extract_metrics(s).unwrap();
     assert!((m.ms_per_step - 9.0).abs() < 1e-6);
+}
+
+#[test]
+fn extracts_qwen36_prefill_lifecycle_when_result_line_is_absent() {
+    let s = "[qwen36-moe lifecycle-timings] prompt_setup_ms=1 prefill_total_ms=2441.711 total_wall_ms=7603\n";
+    let m = extract_metrics(s).unwrap();
+    assert!((m.ms_per_step - 2441.711).abs() < 1e-6);
 }

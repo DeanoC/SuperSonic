@@ -13,6 +13,8 @@ use gpu_hal::{Backend, GpuBuffer, GpuError, ScalarType};
 
 static METAL_PROFILE_ENABLED: AtomicBool = AtomicBool::new(false);
 static METAL_PROFILE: OnceLock<Mutex<MetalProfileAccumulator>> = OnceLock::new();
+static FFI_PROFILE_ENABLED: AtomicBool = AtomicBool::new(false);
+static FFI_PROFILE: OnceLock<Mutex<FfiProfileAccumulator>> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 pub struct MetalProfileEntry {
@@ -47,6 +49,36 @@ pub struct MetalProfileSnapshot {
 #[derive(Debug, Default)]
 struct MetalProfileAccumulator {
     entries: BTreeMap<(String, String), MetalProfileEntry>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FfiProfileEntry {
+    pub op: String,
+    pub calls: u64,
+    pub total_ms: f64,
+    pub max_ms: f64,
+}
+
+impl FfiProfileEntry {
+    pub fn mean_ms(&self) -> f64 {
+        if self.calls == 0 {
+            0.0
+        } else {
+            self.total_ms / self.calls as f64
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FfiProfileSnapshot {
+    pub total_calls: u64,
+    pub total_ms: f64,
+    pub entries: Vec<FfiProfileEntry>,
+}
+
+#[derive(Debug, Default)]
+struct FfiProfileAccumulator {
+    entries: BTreeMap<String, FfiProfileEntry>,
 }
 
 pub fn metal_profile_set_enabled(enabled: bool) {
@@ -132,6 +164,89 @@ where
     entry.total_ms += elapsed_ms;
     entry.max_ms = entry.max_ms.max(elapsed_ms);
     result
+}
+
+pub fn ffi_profile_set_enabled(enabled: bool) {
+    FFI_PROFILE_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+pub fn ffi_profile_enabled() -> bool {
+    FFI_PROFILE_ENABLED.load(Ordering::Relaxed)
+        || std::env::var_os("SUPERSONIC_PREFILL_FFI_PROFILE").is_some()
+}
+
+pub fn ffi_profile_reset() {
+    if let Some(profile) = FFI_PROFILE.get() {
+        profile
+            .lock()
+            .expect("ffi profile mutex poisoned")
+            .entries
+            .clear();
+    }
+}
+
+pub fn ffi_profile_snapshot() -> FfiProfileSnapshot {
+    let mut snapshot = FfiProfileSnapshot::default();
+    let Some(profile) = FFI_PROFILE.get() else {
+        return snapshot;
+    };
+    let mut entries: Vec<_> = profile
+        .lock()
+        .expect("ffi profile mutex poisoned")
+        .entries
+        .values()
+        .cloned()
+        .collect();
+    entries.sort_by(|lhs, rhs| {
+        rhs.total_ms
+            .partial_cmp(&lhs.total_ms)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| lhs.op.cmp(&rhs.op))
+    });
+    for entry in &entries {
+        snapshot.total_calls += entry.calls;
+        snapshot.total_ms += entry.total_ms;
+    }
+    snapshot.entries = entries;
+    snapshot
+}
+
+pub(crate) fn ffi_profile_time_result<T, F>(
+    op: &'static str,
+    ordinal: usize,
+    f: F,
+) -> Result<T, GpuError>
+where
+    F: FnOnce() -> Result<T, GpuError>,
+{
+    if !ffi_profile_enabled() {
+        return f();
+    }
+
+    gpu_hal::sync(ordinal)?;
+    let start = Instant::now();
+    let result = f();
+    let sync_result = gpu_hal::sync(ordinal);
+    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+    let profile = FFI_PROFILE.get_or_init(|| Mutex::new(FfiProfileAccumulator::default()));
+    let mut profile = profile.lock().expect("ffi profile mutex poisoned");
+    let entry = profile
+        .entries
+        .entry(op.to_string())
+        .or_insert_with(|| FfiProfileEntry {
+            op: op.to_string(),
+            calls: 0,
+            total_ms: 0.0,
+            max_ms: 0.0,
+        });
+    entry.calls += 1;
+    entry.total_ms += elapsed_ms;
+    entry.max_ms = entry.max_ms.max(elapsed_ms);
+
+    let value = result?;
+    sync_result?;
+    Ok(value)
 }
 
 #[no_mangle]
@@ -1180,23 +1295,25 @@ pub fn embedding_lookup(
             )
         });
     }
-    let status = unsafe {
-        supersonic_qwen35_hip_embedding_lookup(
-            dtype.kernel_dtype_code(),
-            1, // index_dtype=1 → uint32
-            ordinal,
-            token_count,
-            vocab_size,
-            hidden_size,
-            embeddings.as_ptr(),
-            indexes.as_ptr(),
-            out.as_mut_ptr(),
-        )
-    };
-    if status != 0 {
-        return Err(ffi_error(format!("embedding_lookup failed: {status}")));
-    }
-    Ok(())
+    ffi_profile_time_result("qwen.embedding_lookup", ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_hip_embedding_lookup(
+                dtype.kernel_dtype_code(),
+                1, // index_dtype=1 → uint32
+                ordinal,
+                token_count,
+                vocab_size,
+                hidden_size,
+                embeddings.as_ptr(),
+                indexes.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!("embedding_lookup failed: {status}")));
+        }
+        Ok(())
+    })
 }
 
 /// Batched matrix multiply: lhs [batch, m, k] × rhs [batch, k, n] → out [batch, m, n].
@@ -1220,27 +1337,29 @@ pub fn batched_matmul(
     }
     // Simple rank-1 batch (no broadcasting)
     let batch_dims = [batch_elems as c_int];
-    let status = unsafe {
-        supersonic_qwen35_hip_batched_matmul(
-            dtype.kernel_dtype_code(),
-            ordinal,
-            1, // batch_rank
-            batch_elems,
-            m as c_int,
-            n as c_int,
-            k as c_int,
-            batch_dims.as_ptr(),
-            batch_dims.as_ptr(),
-            batch_dims.as_ptr(),
-            lhs.as_ptr(),
-            rhs.as_ptr(),
-            out.as_mut_ptr(),
-        )
-    };
-    if status != 0 {
-        return Err(ffi_error(format!("batched_matmul failed: {status}")));
-    }
-    Ok(())
+    ffi_profile_time_result("qwen.batched_matmul", ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_hip_batched_matmul(
+                dtype.kernel_dtype_code(),
+                ordinal,
+                1, // batch_rank
+                batch_elems,
+                m as c_int,
+                n as c_int,
+                k as c_int,
+                batch_dims.as_ptr(),
+                batch_dims.as_ptr(),
+                batch_dims.as_ptr(),
+                lhs.as_ptr(),
+                rhs.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!("batched_matmul failed: {status}")));
+        }
+        Ok(())
+    })
 }
 
 /// Full causal attention for prefill.
@@ -1305,31 +1424,33 @@ pub fn full_attention_prefill(
         });
     }
     let num_kv_groups = q_heads / kv_heads;
-    let status = unsafe {
-        supersonic_qwen35_hip_full_attention_prefill(
-            dtype.kernel_dtype_code(),
-            ordinal,
-            batch_size,
-            q_heads,
-            kv_heads,
-            q_len,
-            kv_len,
-            head_dim,
-            num_kv_groups,
-            scale,
-            seqlen_offset,
-            query.as_ptr(),
-            key.as_ptr(),
-            value.as_ptr(),
-            out.as_mut_ptr(),
-        )
-    };
-    if status != 0 {
-        return Err(ffi_error(format!(
-            "full_attention_prefill failed: {status}"
-        )));
-    }
-    Ok(())
+    ffi_profile_time_result("qwen.full_attention_prefill", ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_hip_full_attention_prefill(
+                dtype.kernel_dtype_code(),
+                ordinal,
+                batch_size,
+                q_heads,
+                kv_heads,
+                q_len,
+                kv_len,
+                head_dim,
+                num_kv_groups,
+                scale,
+                seqlen_offset,
+                query.as_ptr(),
+                key.as_ptr(),
+                value.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!(
+                "full_attention_prefill failed: {status}"
+            )));
+        }
+        Ok(())
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1541,26 +1662,28 @@ pub fn linear_prefill_conv_pack(
             )
         });
     }
-    let status = unsafe {
-        supersonic_qwen35_hip_linear_prefill_conv_pack(
-            dtype.kernel_dtype_code(),
-            ordinal,
-            batch_size,
-            conv_dim,
-            total_len,
-            seq_len,
-            kernel_size,
-            mixed_qkv.as_ptr(),
-            weights.as_ptr(),
-            out.as_mut_ptr(),
-        )
-    };
-    if status != 0 {
-        return Err(ffi_error(format!(
-            "linear_prefill_conv_pack failed: {status}"
-        )));
-    }
-    Ok(())
+    ffi_profile_time_result("qwen.linear_prefill_conv_pack", ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_hip_linear_prefill_conv_pack(
+                dtype.kernel_dtype_code(),
+                ordinal,
+                batch_size,
+                conv_dim,
+                total_len,
+                seq_len,
+                kernel_size,
+                mixed_qkv.as_ptr(),
+                weights.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!(
+                "linear_prefill_conv_pack failed: {status}"
+            )));
+        }
+        Ok(())
+    })
 }
 
 /// Linear attention single-step decode prep.
@@ -1870,29 +1993,31 @@ pub fn delta_recurrent_prefill(
             )
         });
     }
-    let status = unsafe {
-        supersonic_qwen35_hip_delta_recurrent_prefill(
-            dtype.kernel_dtype_code(),
-            ordinal,
-            batch_heads,
-            seq_len,
-            k_head_dim,
-            v_head_dim,
-            initial_state.as_ptr(),
-            query.as_ptr(),
-            key.as_ptr(),
-            value.as_ptr(),
-            beta.as_ptr(),
-            g.as_ptr(),
-            out.as_mut_ptr(),
-        )
-    };
-    if status != 0 {
-        return Err(ffi_error(format!(
-            "delta_recurrent_prefill failed: {status}"
-        )));
-    }
-    Ok(())
+    ffi_profile_time_result("qwen.delta_recurrent_prefill", ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_hip_delta_recurrent_prefill(
+                dtype.kernel_dtype_code(),
+                ordinal,
+                batch_heads,
+                seq_len,
+                k_head_dim,
+                v_head_dim,
+                initial_state.as_ptr(),
+                query.as_ptr(),
+                key.as_ptr(),
+                value.as_ptr(),
+                beta.as_ptr(),
+                g.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!(
+                "delta_recurrent_prefill failed: {status}"
+            )));
+        }
+        Ok(())
+    })
 }
 
 /// L2 normalization per row.
@@ -1919,21 +2044,23 @@ pub fn l2norm(
             metal_host::l2norm(dtype, n_rows, n_cols, eps, input, out)
         });
     }
-    let status = unsafe {
-        supersonic_qwen35_hip_l2norm(
-            dtype.kernel_dtype_code(),
-            ordinal,
-            n_rows,
-            n_cols,
-            eps,
-            input.as_ptr(),
-            out.as_mut_ptr(),
-        )
-    };
-    if status != 0 {
-        return Err(ffi_error(format!("l2norm failed: {status}")));
-    }
-    Ok(())
+    ffi_profile_time_result("qwen.l2norm", ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_hip_l2norm(
+                dtype.kernel_dtype_code(),
+                ordinal,
+                n_rows,
+                n_cols,
+                eps,
+                input.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!("l2norm failed: {status}")));
+        }
+        Ok(())
+    })
 }
 
 /// SwiGLU: out = silu(gate) * up, element-wise.
@@ -1959,20 +2086,22 @@ pub fn swiglu_mul(
             metal_host::swiglu_mul(dtype, elem_count, gate, up, out)
         });
     }
-    let status = unsafe {
-        supersonic_qwen35_hip_swiglu_mul(
-            dtype.kernel_dtype_code(),
-            ordinal,
-            elem_count,
-            gate.as_ptr(),
-            up.as_ptr(),
-            out.as_mut_ptr(),
-        )
-    };
-    if status != 0 {
-        return Err(ffi_error(format!("swiglu_mul failed: {status}")));
-    }
-    Ok(())
+    ffi_profile_time_result("qwen.swiglu_mul", ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_hip_swiglu_mul(
+                dtype.kernel_dtype_code(),
+                ordinal,
+                elem_count,
+                gate.as_ptr(),
+                up.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!("swiglu_mul failed: {status}")));
+        }
+        Ok(())
+    })
 }
 
 /// RMSNorm with SiLU gating: out = rms_norm(hidden) * weight * silu(gate).
@@ -2015,23 +2144,25 @@ pub fn rms_norm_gated(
             metal_host::rms_norm_gated(dtype, n_rows, n_cols, eps, hidden, gate, weight, out)
         });
     }
-    let status = unsafe {
-        supersonic_qwen35_hip_rms_norm_gated(
-            dtype.kernel_dtype_code(),
-            ordinal,
-            n_rows,
-            n_cols,
-            eps,
-            hidden.as_ptr(),
-            gate.as_ptr(),
-            weight.as_ptr(),
-            out.as_mut_ptr(),
-        )
-    };
-    if status != 0 {
-        return Err(ffi_error(format!("rms_norm_gated failed: {status}")));
-    }
-    Ok(())
+    ffi_profile_time_result("qwen.rms_norm_gated", ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_hip_rms_norm_gated(
+                dtype.kernel_dtype_code(),
+                ordinal,
+                n_rows,
+                n_cols,
+                eps,
+                hidden.as_ptr(),
+                gate.as_ptr(),
+                weight.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!("rms_norm_gated failed: {status}")));
+        }
+        Ok(())
+    })
 }
 
 /// Multiply all elements by a scalar: out = xs * scalar.
@@ -2057,20 +2188,22 @@ pub fn mul_scalar(
             metal_host::mul_scalar(dtype, total_elems, scalar, input, out)
         });
     }
-    let status = unsafe {
-        supersonic_qwen35_hip_mul_scalar(
-            dtype.kernel_dtype_code(),
-            ordinal,
-            total_elems,
-            scalar,
-            input.as_ptr(),
-            out.as_mut_ptr(),
-        )
-    };
-    if status != 0 {
-        return Err(ffi_error(format!("mul_scalar failed: {status}")));
-    }
-    Ok(())
+    ffi_profile_time_result("qwen.mul_scalar", ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_hip_mul_scalar(
+                dtype.kernel_dtype_code(),
+                ordinal,
+                total_elems,
+                scalar,
+                input.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!("mul_scalar failed: {status}")));
+        }
+        Ok(())
+    })
 }
 
 // ---- Fused RMSNorm + linear projection (F32 intermediate) ----
@@ -2215,23 +2348,25 @@ pub fn matmul_rhs_transposed(
             metal_host::matmul_rhs_transposed(dtype, batch_elems, m, n, k, lhs, rhs, out)
         });
     }
-    let status = unsafe {
-        supersonic_qwen35_4b_hip_matmul_rhs_transposed_tiled(
-            dtype.kernel_dtype_code(),
-            ordinal,
-            batch_elems,
-            m as c_int,
-            n as c_int,
-            k as c_int,
-            lhs.as_ptr(),
-            rhs.as_ptr(),
-            out.as_mut_ptr(),
-        )
-    };
-    if status != 0 {
-        return Err(ffi_error(format!("matmul_rhs_transposed failed: {status}")));
-    }
-    Ok(())
+    ffi_profile_time_result("qwen.matmul_rhs_transposed", ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_4b_hip_matmul_rhs_transposed_tiled(
+                dtype.kernel_dtype_code(),
+                ordinal,
+                batch_elems,
+                m as c_int,
+                n as c_int,
+                k as c_int,
+                lhs.as_ptr(),
+                rhs.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!("matmul_rhs_transposed failed: {status}")));
+        }
+        Ok(())
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2273,27 +2408,29 @@ pub fn matmul_rhs_transposed_fp8(
     block_size: usize,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
-    let status = unsafe {
-        supersonic_qwen35_4b_hip_matmul_fp8_dequant(
-            ScalarType::BF16.kernel_dtype_code(),
-            ordinal,
-            batch_elems,
-            m as c_int,
-            n as c_int,
-            k as c_int,
-            lhs.as_ptr(),
-            rhs_fp8.as_ptr(),
-            scale.as_ptr(),
-            block_size as c_int,
-            out.as_mut_ptr(),
-        )
-    };
-    if status != 0 {
-        return Err(ffi_error(format!(
-            "matmul_rhs_transposed_fp8 failed: {status}"
-        )));
-    }
-    Ok(())
+    ffi_profile_time_result("qwen.matmul_rhs_transposed_fp8", ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_4b_hip_matmul_fp8_dequant(
+                ScalarType::BF16.kernel_dtype_code(),
+                ordinal,
+                batch_elems,
+                m as c_int,
+                n as c_int,
+                k as c_int,
+                lhs.as_ptr(),
+                rhs_fp8.as_ptr(),
+                scale.as_ptr(),
+                block_size as c_int,
+                out.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!(
+                "matmul_rhs_transposed_fp8 failed: {status}"
+            )));
+        }
+        Ok(())
+    })
 }
 
 /// INT4 dequant matmul: out [batch, m, n] = lhs [batch, m, k] × dequant(rhs_int4 [batch, n, k/2])^T
@@ -2367,29 +2504,31 @@ pub fn matmul_rhs_transposed_int4(
             )
         });
     }
-    let status = unsafe {
-        supersonic_qwen35_4b_hip_matmul_int4_dequant(
-            ScalarType::BF16.kernel_dtype_code(),
-            ordinal,
-            batch_elems,
-            m as c_int,
-            n as c_int,
-            k as c_int,
-            lhs.as_ptr(),
-            rhs_int4.as_ptr(),
-            scale.as_ptr(),
-            zero.as_ptr(),
-            group_size as c_int,
-            quant_type as c_int,
-            out.as_mut_ptr(),
-        )
-    };
-    if status != 0 {
-        return Err(ffi_error(format!(
-            "matmul_rhs_transposed_int4 failed: {status}"
-        )));
-    }
-    Ok(())
+    ffi_profile_time_result("qwen.matmul_rhs_transposed_int4", ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_4b_hip_matmul_int4_dequant(
+                ScalarType::BF16.kernel_dtype_code(),
+                ordinal,
+                batch_elems,
+                m as c_int,
+                n as c_int,
+                k as c_int,
+                lhs.as_ptr(),
+                rhs_int4.as_ptr(),
+                scale.as_ptr(),
+                zero.as_ptr(),
+                group_size as c_int,
+                quant_type as c_int,
+                out.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!(
+                "matmul_rhs_transposed_int4 failed: {status}"
+            )));
+        }
+        Ok(())
+    })
 }
 
 pub fn matmul_rhs_transposed_int8(
@@ -2418,26 +2557,28 @@ pub fn matmul_rhs_transposed_int8(
             ));
         }
 
-        let status = unsafe {
-            supersonic_qwen35_4b_hip_matmul_int8(
-                ScalarType::BF16.kernel_dtype_code(),
-                ordinal,
-                batch_elems,
-                m as c_int,
-                n as c_int,
-                k as c_int,
-                lhs.as_ptr(),
-                rhs_int8.as_ptr(),
-                scale.as_ptr(),
-                out.as_mut_ptr(),
-            )
-        };
-        if status != 0 {
-            return Err(ffi_error(format!(
-                "matmul_rhs_transposed_int8 failed: {status}"
-            )));
-        }
-        Ok(())
+        ffi_profile_time_result("qwen.matmul_rhs_transposed_int8", ordinal, || {
+            let status = unsafe {
+                supersonic_qwen35_4b_hip_matmul_int8(
+                    ScalarType::BF16.kernel_dtype_code(),
+                    ordinal,
+                    batch_elems,
+                    m as c_int,
+                    n as c_int,
+                    k as c_int,
+                    lhs.as_ptr(),
+                    rhs_int8.as_ptr(),
+                    scale.as_ptr(),
+                    out.as_mut_ptr(),
+                )
+            };
+            if status != 0 {
+                return Err(ffi_error(format!(
+                    "matmul_rhs_transposed_int8 failed: {status}"
+                )));
+            }
+            Ok(())
+        })
     }
 }
 
@@ -2468,25 +2609,27 @@ pub fn int8_outlier_add(
             ));
         }
 
-        let status = unsafe {
-            supersonic_qwen35_4b_hip_int8_outlier_add(
-                ScalarType::BF16.kernel_dtype_code(),
-                ordinal,
-                rows as c_int,
-                n as c_int,
-                k as c_int,
-                sub_cols as c_int,
-                rhs_int8.as_ptr(),
-                scale.as_ptr(),
-                outlier_cols.as_ptr(),
-                outlier_vals.as_ptr(),
-                out.as_mut_ptr(),
-            )
-        };
-        if status != 0 {
-            return Err(ffi_error(format!("int8_outlier_add failed: {status}")));
-        }
-        Ok(())
+        ffi_profile_time_result("qwen.int8_outlier_add", ordinal, || {
+            let status = unsafe {
+                supersonic_qwen35_4b_hip_int8_outlier_add(
+                    ScalarType::BF16.kernel_dtype_code(),
+                    ordinal,
+                    rows as c_int,
+                    n as c_int,
+                    k as c_int,
+                    sub_cols as c_int,
+                    rhs_int8.as_ptr(),
+                    scale.as_ptr(),
+                    outlier_cols.as_ptr(),
+                    outlier_vals.as_ptr(),
+                    out.as_mut_ptr(),
+                )
+            };
+            if status != 0 {
+                return Err(ffi_error(format!("int8_outlier_add failed: {status}")));
+            }
+            Ok(())
+        })
     }
 }
 
@@ -2532,23 +2675,25 @@ pub fn rms_norm_rows(
             metal_host::rms_norm_rows(dtype, n_rows, n_cols, eps, true, input, weight, out)
         });
     }
-    let status = unsafe {
-        supersonic_qwen35_hip_rms_norm(
-            dtype.kernel_dtype_code(),
-            ordinal,
-            n_rows,
-            n_cols,
-            eps,
-            1, // add_unit_offset
-            input.as_ptr(),
-            weight.as_ptr(),
-            out.as_mut_ptr(),
-        )
-    };
-    if status != 0 {
-        return Err(ffi_error(format!("rms_norm_rows failed: {status}")));
-    }
-    Ok(())
+    ffi_profile_time_result("qwen.rms_norm_rows", ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_hip_rms_norm(
+                dtype.kernel_dtype_code(),
+                ordinal,
+                n_rows,
+                n_cols,
+                eps,
+                1, // add_unit_offset
+                input.as_ptr(),
+                weight.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!("rms_norm_rows failed: {status}")));
+        }
+        Ok(())
+    })
 }
 
 /// Multi-row RMSNorm WITHOUT add_unit_offset. Qwen3 (the dflash draft base)
@@ -2592,23 +2737,25 @@ pub fn rms_norm_rows_plain(
             metal_host::rms_norm_rows(dtype, n_rows, n_cols, eps, false, input, weight, out)
         });
     }
-    let status = unsafe {
-        supersonic_qwen35_hip_rms_norm(
-            dtype.kernel_dtype_code(),
-            ordinal,
-            n_rows,
-            n_cols,
-            eps,
-            0,
-            input.as_ptr(),
-            weight.as_ptr(),
-            out.as_mut_ptr(),
-        )
-    };
-    if status != 0 {
-        return Err(ffi_error(format!("rms_norm_rows_plain failed: {status}")));
-    }
-    Ok(())
+    ffi_profile_time_result("qwen.rms_norm_rows_plain", ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_hip_rms_norm(
+                dtype.kernel_dtype_code(),
+                ordinal,
+                n_rows,
+                n_cols,
+                eps,
+                0,
+                input.as_ptr(),
+                weight.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!("rms_norm_rows_plain failed: {status}")));
+        }
+        Ok(())
+    })
 }
 
 /// In-place variant of [`rms_norm_rows_plain`]. The underlying kernel reads
@@ -2747,20 +2894,22 @@ pub fn cast(
             metal_host::cast(input_dtype, output_dtype, total_elems, input, out)
         });
     }
-    let status = unsafe {
-        supersonic_qwen35_hip_cast(
-            input_dtype.kernel_dtype_code(),
-            output_dtype.kernel_dtype_code(),
-            ordinal,
-            total_elems,
-            input.as_ptr(),
-            out.as_mut_ptr(),
-        )
-    };
-    if status != 0 {
-        return Err(ffi_error(format!("cast failed: {status}")));
-    }
-    Ok(())
+    ffi_profile_time_result("qwen.cast", ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_hip_cast(
+                input_dtype.kernel_dtype_code(),
+                output_dtype.kernel_dtype_code(),
+                ordinal,
+                total_elems,
+                input.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!("cast failed: {status}")));
+        }
+        Ok(())
+    })
 }
 
 // ---- Element-wise add ----
@@ -2788,20 +2937,22 @@ pub fn element_add(
             metal_host::element_add(dtype, total_elems, lhs, rhs, out)
         });
     }
-    let status = unsafe {
-        supersonic_qwen35_hip_element_add(
-            dtype.kernel_dtype_code(),
-            ordinal,
-            total_elems,
-            lhs.as_ptr(),
-            rhs.as_ptr(),
-            out.as_mut_ptr(),
-        )
-    };
-    if status != 0 {
-        return Err(ffi_error(format!("element_add failed: {status}")));
-    }
-    Ok(())
+    ffi_profile_time_result("qwen.element_add", ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_hip_element_add(
+                dtype.kernel_dtype_code(),
+                ordinal,
+                total_elems,
+                lhs.as_ptr(),
+                rhs.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!("element_add failed: {status}")));
+        }
+        Ok(())
+    })
 }
 
 // ---- RoPE for prefill ----
@@ -2849,23 +3000,25 @@ pub fn apply_rope_prefill(
     let table_byte_offset = pos_offset * half_rot * dtype.size_in_bytes();
     let cos_ptr = cos_table.offset_ptr(table_byte_offset);
     let sin_ptr = sin_table.offset_ptr(table_byte_offset);
-    let status = unsafe {
-        supersonic_qwen35_hip_apply_rope_prefill(
-            dtype.kernel_dtype_code(),
-            ordinal,
-            seq_len,
-            num_heads,
-            head_dim,
-            half_rot,
-            cos_ptr,
-            sin_ptr,
-            data.as_mut_ptr(),
-        )
-    };
-    if status != 0 {
-        return Err(ffi_error(format!("apply_rope_prefill failed: {status}")));
-    }
-    Ok(())
+    ffi_profile_time_result("qwen.apply_rope_prefill", ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_hip_apply_rope_prefill(
+                dtype.kernel_dtype_code(),
+                ordinal,
+                seq_len,
+                num_heads,
+                head_dim,
+                half_rot,
+                cos_ptr,
+                sin_ptr,
+                data.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!("apply_rope_prefill failed: {status}")));
+        }
+        Ok(())
+    })
 }
 
 /// SpecPrefill (arXiv 2502.02789): apply RoPE in-place using a per-token
@@ -3167,21 +3320,23 @@ pub fn transpose_shd_hsd(
             metal_host::transpose_shd_hsd(dtype, s, h, d, src, dst)
         });
     }
-    let status = unsafe {
-        supersonic_qwen35_hip_transpose_shd_hsd(
-            dtype.kernel_dtype_code(),
-            ordinal,
-            s,
-            h,
-            d,
-            src.as_ptr(),
-            dst.as_mut_ptr(),
-        )
-    };
-    if status != 0 {
-        return Err(ffi_error(format!("transpose_shd_hsd failed: {status}")));
-    }
-    Ok(())
+    ffi_profile_time_result("qwen.transpose_shd_hsd", ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_hip_transpose_shd_hsd(
+                dtype.kernel_dtype_code(),
+                ordinal,
+                s,
+                h,
+                d,
+                src.as_ptr(),
+                dst.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!("transpose_shd_hsd failed: {status}")));
+        }
+        Ok(())
+    })
 }
 
 // ---- Transpose + pad for conv input ----
@@ -3211,21 +3366,23 @@ pub fn transpose_pad_conv(
             metal_host::transpose_pad_conv(dtype, s, c, pad, src, dst)
         });
     }
-    let status = unsafe {
-        supersonic_qwen35_hip_transpose_pad_conv(
-            dtype.kernel_dtype_code(),
-            ordinal,
-            s,
-            c,
-            pad,
-            src.as_ptr(),
-            dst.as_mut_ptr(),
-        )
-    };
-    if status != 0 {
-        return Err(ffi_error(format!("transpose_pad_conv failed: {status}")));
-    }
-    Ok(())
+    ffi_profile_time_result("qwen.transpose_pad_conv", ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_hip_transpose_pad_conv(
+                dtype.kernel_dtype_code(),
+                ordinal,
+                s,
+                c,
+                pad,
+                src.as_ptr(),
+                dst.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!("transpose_pad_conv failed: {status}")));
+        }
+        Ok(())
+    })
 }
 
 // ---- Extract conv state after prefill ----
@@ -3254,21 +3411,23 @@ pub fn extract_conv_state(
             metal_host::extract_conv_state(dtype, s, c, kern_minus_1, src, dst)
         });
     }
-    let status = unsafe {
-        supersonic_qwen35_hip_extract_conv_state(
-            dtype.kernel_dtype_code(),
-            ordinal,
-            s,
-            c,
-            kern_minus_1,
-            src.as_ptr(),
-            dst.as_mut_ptr(),
-        )
-    };
-    if status != 0 {
-        return Err(ffi_error(format!("extract_conv_state failed: {status}")));
-    }
-    Ok(())
+    ffi_profile_time_result("qwen.extract_conv_state", ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_hip_extract_conv_state(
+                dtype.kernel_dtype_code(),
+                ordinal,
+                s,
+                c,
+                kern_minus_1,
+                src.as_ptr(),
+                dst.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!("extract_conv_state failed: {status}")));
+        }
+        Ok(())
+    })
 }
 
 // ---- Sigmoid-gate multiply ----
@@ -3296,20 +3455,22 @@ pub fn sigmoid_mul(
             metal_host::sigmoid_mul(dtype, total_elems, data, gate, out)
         });
     }
-    let status = unsafe {
-        supersonic_qwen35_hip_sigmoid_mul(
-            dtype.kernel_dtype_code(),
-            ordinal,
-            total_elems,
-            data.as_ptr(),
-            gate.as_ptr(),
-            out.as_mut_ptr(),
-        )
-    };
-    if status != 0 {
-        return Err(ffi_error(format!("sigmoid_mul failed: {status}")));
-    }
-    Ok(())
+    ffi_profile_time_result("qwen.sigmoid_mul", ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_hip_sigmoid_mul(
+                dtype.kernel_dtype_code(),
+                ordinal,
+                total_elems,
+                data.as_ptr(),
+                gate.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!("sigmoid_mul failed: {status}")));
+        }
+        Ok(())
+    })
 }
 
 // ---- Compute beta/g for delta recurrent ----
@@ -3343,24 +3504,26 @@ pub fn compute_beta_g(
             metal_host::compute_beta_g(dtype, seq_len, nv, b, a, dt_bias, a_log_exp, beta, g)
         });
     }
-    let status = unsafe {
-        supersonic_qwen35_hip_compute_beta_g(
-            dtype.kernel_dtype_code(),
-            ordinal,
-            seq_len,
-            nv,
-            b.as_ptr(),
-            a.as_ptr(),
-            dt_bias.as_ptr(),
-            a_log_exp.as_ptr(),
-            beta.as_mut_ptr(),
-            g.as_mut_ptr(),
-        )
-    };
-    if status != 0 {
-        return Err(ffi_error(format!("compute_beta_g failed: {status}")));
-    }
-    Ok(())
+    ffi_profile_time_result("qwen.compute_beta_g", ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_hip_compute_beta_g(
+                dtype.kernel_dtype_code(),
+                ordinal,
+                seq_len,
+                nv,
+                b.as_ptr(),
+                a.as_ptr(),
+                dt_bias.as_ptr(),
+                a_log_exp.as_ptr(),
+                beta.as_mut_ptr(),
+                g.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!("compute_beta_g failed: {status}")));
+        }
+        Ok(())
+    })
 }
 
 // ---- Split gated Q projection ----
@@ -3390,22 +3553,24 @@ pub fn split_qgate(
             metal_host::split_qgate(dtype, s, num_heads, head_dim, src, query_out, gate_out)
         });
     }
-    let status = unsafe {
-        supersonic_qwen35_hip_split_qgate(
-            dtype.kernel_dtype_code(),
-            ordinal,
-            s,
-            num_heads,
-            head_dim,
-            src.as_ptr(),
-            query_out.as_mut_ptr(),
-            gate_out.as_mut_ptr(),
-        )
-    };
-    if status != 0 {
-        return Err(ffi_error(format!("split_qgate failed: {status}")));
-    }
-    Ok(())
+    ffi_profile_time_result("qwen.split_qgate", ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_hip_split_qgate(
+                dtype.kernel_dtype_code(),
+                ordinal,
+                s,
+                num_heads,
+                head_dim,
+                src.as_ptr(),
+                query_out.as_mut_ptr(),
+                gate_out.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!("split_qgate failed: {status}")));
+        }
+        Ok(())
+    })
 }
 
 // ---- Split interleaved QKV ----
@@ -3437,23 +3602,25 @@ pub fn split_qkv(
             metal_host::split_qkv(dtype, s, key_dim, val_dim, src, q, k, v)
         });
     }
-    let status = unsafe {
-        supersonic_qwen35_hip_split_qkv(
-            dtype.kernel_dtype_code(),
-            ordinal,
-            s,
-            key_dim,
-            val_dim,
-            src.as_ptr(),
-            q.as_mut_ptr(),
-            k.as_mut_ptr(),
-            v.as_mut_ptr(),
-        )
-    };
-    if status != 0 {
-        return Err(ffi_error(format!("split_qkv failed: {status}")));
-    }
-    Ok(())
+    ffi_profile_time_result("qwen.split_qkv", ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_hip_split_qkv(
+                dtype.kernel_dtype_code(),
+                ordinal,
+                s,
+                key_dim,
+                val_dim,
+                src.as_ptr(),
+                q.as_mut_ptr(),
+                k.as_mut_ptr(),
+                v.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!("split_qkv failed: {status}")));
+        }
+        Ok(())
+    })
 }
 
 // ---- Repeat interleave heads ----
@@ -3486,24 +3653,26 @@ pub fn repeat_interleave_heads(
             metal_host::repeat_interleave_heads(dtype, s, n_heads, head_dim, repeats, src, dst)
         });
     }
-    let status = unsafe {
-        supersonic_qwen35_hip_repeat_interleave_heads(
-            dtype.kernel_dtype_code(),
-            ordinal,
-            s,
-            n_heads,
-            head_dim,
-            repeats,
-            src.as_ptr(),
-            dst.as_mut_ptr(),
-        )
-    };
-    if status != 0 {
-        return Err(ffi_error(format!(
-            "repeat_interleave_heads failed: {status}"
-        )));
-    }
-    Ok(())
+    ffi_profile_time_result("qwen.repeat_interleave_heads", ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_hip_repeat_interleave_heads(
+                dtype.kernel_dtype_code(),
+                ordinal,
+                s,
+                n_heads,
+                head_dim,
+                repeats,
+                src.as_ptr(),
+                dst.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!(
+                "repeat_interleave_heads failed: {status}"
+            )));
+        }
+        Ok(())
+    })
 }
 
 /// Quantize BF16 K or V tensor to FP8 E4M3 KV cache with per-head-per-position absmax scaling.
@@ -3522,24 +3691,26 @@ pub fn quantize_kv_to_fp8(
     max_t: usize,
     pos_offset: usize,
 ) -> Result<(), GpuError> {
-    let status = unsafe {
-        supersonic_qwen35_4b_hip_quantize_kv_to_fp8(
-            dtype.kernel_dtype_code(),
-            ordinal,
-            src.as_ptr(),
-            dst_fp8.as_mut_ptr(),
-            dst_scale.as_mut_ptr() as *mut c_void,
-            num_kv_heads as c_int,
-            seq_len as c_int,
-            head_dim as c_int,
-            max_t as c_int,
-            pos_offset as c_int,
-        )
-    };
-    if status != 0 {
-        return Err(ffi_error(format!("quantize_kv_to_fp8 failed: {status}")));
-    }
-    Ok(())
+    ffi_profile_time_result("qwen.quantize_kv_to_fp8", ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_4b_hip_quantize_kv_to_fp8(
+                dtype.kernel_dtype_code(),
+                ordinal,
+                src.as_ptr(),
+                dst_fp8.as_mut_ptr(),
+                dst_scale.as_mut_ptr() as *mut c_void,
+                num_kv_heads as c_int,
+                seq_len as c_int,
+                head_dim as c_int,
+                max_t as c_int,
+                pos_offset as c_int,
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!("quantize_kv_to_fp8 failed: {status}")));
+        }
+        Ok(())
+    })
 }
 
 #[cfg(all(test, target_os = "macos", supersonic_backend_metal))]

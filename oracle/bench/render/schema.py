@@ -1,5 +1,8 @@
 """Shared JSON schema for run-dir artifacts. Mirrors crates/bench/src/runs.rs."""
-import jsonschema
+try:
+    import jsonschema
+except ModuleNotFoundError:  # pragma: no cover - local bare env fallback
+    jsonschema = None
 
 META_SCHEMA = {
     "type": "object",
@@ -89,16 +92,46 @@ EXTERNAL_CELL_SCHEMA = {
 
 
 def validate_meta(d: dict) -> None:
-    jsonschema.validate(d, META_SCHEMA)
+    _validate(d, META_SCHEMA)
 
 
 def validate_perf_cell(d: dict) -> None:
-    jsonschema.validate(d, PERF_CELL_SCHEMA)
+    if jsonschema is None:
+        _validate_one_of(d, PERF_CELL_SCHEMA)
+        return
+    _validate(d, PERF_CELL_SCHEMA)
 
 
 def validate_quality_cell(d: dict) -> None:
-    jsonschema.validate(d, QUALITY_CELL_SCHEMA)
+    _validate(d, QUALITY_CELL_SCHEMA)
 
 
 def validate_external_cell(d: dict) -> None:
-    jsonschema.validate(d, EXTERNAL_CELL_SCHEMA)
+    _validate(d, EXTERNAL_CELL_SCHEMA)
+
+
+def _validate(d: dict, schema: dict) -> None:
+    if jsonschema is not None:
+        jsonschema.validate(d, schema)
+        return
+    for key in schema.get("required", []):
+        if key not in d:
+            raise ValueError(f"missing required field {key!r}")
+
+
+def _validate_one_of(d: dict, schema: dict) -> None:
+    failures = []
+    for variant in schema.get("oneOf", []):
+        try:
+            _validate(d, variant)
+            _validate_consts(d, variant)
+            return
+        except Exception as exc:
+            failures.append(str(exc))
+    raise ValueError("object did not match any schema variant: " + "; ".join(failures))
+
+
+def _validate_consts(d: dict, schema: dict) -> None:
+    for key, prop in schema.get("properties", {}).items():
+        if key in d and "const" in prop and d[key] != prop["const"]:
+            raise ValueError(f"field {key!r} expected {prop['const']!r}, got {d[key]!r}")

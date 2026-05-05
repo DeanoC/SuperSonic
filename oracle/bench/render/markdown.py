@@ -6,8 +6,26 @@ from typing import Iterable
 
 from .schema import validate_perf_cell
 
-QUANT_COL_ORDER = ["bf16", "int4", "fp8r", "kv-fp8", "int8"]
-QUANT_LABELS = {"bf16": "BF16", "int4": "INT4", "fp8r": "FP8r", "kv-fp8": "KV-FP8", "int8": "INT8"}
+QUANT_COL_ORDER = [
+    "bf16",
+    "int4",
+    "int4-spec025",
+    "int4-spec050",
+    "int4-spec075",
+    "fp8r",
+    "kv-fp8",
+    "int8",
+]
+QUANT_LABELS = {
+    "bf16": "BF16",
+    "int4": "INT4",
+    "int4-spec025": "Spec025",
+    "int4-spec050": "Spec050",
+    "int4-spec075": "Spec075",
+    "fp8r": "FP8r",
+    "kv-fp8": "KV-FP8",
+    "int8": "INT8",
+}
 
 
 def render_perf_table(perf_dir: Path) -> str:

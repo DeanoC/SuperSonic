@@ -13,7 +13,12 @@ use std::path::PathBuf;
 use std::process::Command;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum BenchArch { Gfx1100, Gfx1150, Sm86, AppleM4 }
+pub enum BenchArch {
+    Gfx1100,
+    Gfx1150,
+    Sm86,
+    AppleM4,
+}
 
 impl BenchArch {
     pub fn parse(s: &str) -> Option<Self> {
@@ -33,12 +38,20 @@ impl BenchArch {
             Self::AppleM4 => "apple-m4",
         }
     }
+
+    pub fn backend(&self) -> Option<&'static str> {
+        match self {
+            Self::Gfx1100 | Self::Gfx1150 => Some("hip"),
+            Self::Sm86 => Some("cuda"),
+            Self::AppleM4 => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ComboDescriptor {
-    pub model: &'static str,        // e.g. "qwen3.5-0.8b"
-    pub quant: &'static str,        // "bf16" | "int4" | "fp8r" | "kv-fp8" | "int8"
+    pub model: &'static str, // e.g. "qwen3.5-0.8b"
+    pub quant: &'static str, // "bf16" | "int4" | "fp8r" | "kv-fp8" | "int8"
     pub arch: BenchArch,
     pub min_vram_gib: f64,
 }
@@ -46,43 +59,219 @@ pub struct ComboDescriptor {
 /// Mirrors docs/feature-compatibility.md + docs/performance.md as of 2026-05-05.
 pub static SUPPORTED_COMBOS: &[ComboDescriptor] = &[
     // Qwen3.5 — full BF16/INT4/FP8r/KV-FP8 quad on gfx1100.
-    ComboDescriptor { model: "qwen3.5-0.8b", quant: "bf16", arch: BenchArch::Gfx1100, min_vram_gib: 2.0 },
-    ComboDescriptor { model: "qwen3.5-0.8b", quant: "int4", arch: BenchArch::Gfx1100, min_vram_gib: 0.7 },
-    ComboDescriptor { model: "qwen3.5-0.8b", quant: "fp8r", arch: BenchArch::Gfx1100, min_vram_gib: 1.2 },
-    ComboDescriptor { model: "qwen3.5-0.8b", quant: "kv-fp8", arch: BenchArch::Gfx1100, min_vram_gib: 2.0 },
-    ComboDescriptor { model: "qwen3.5-2b", quant: "bf16", arch: BenchArch::Gfx1100, min_vram_gib: 5.0 },
-    ComboDescriptor { model: "qwen3.5-2b", quant: "int4", arch: BenchArch::Gfx1100, min_vram_gib: 1.9 },
-    ComboDescriptor { model: "qwen3.5-2b", quant: "fp8r", arch: BenchArch::Gfx1100, min_vram_gib: 3.0 },
-    ComboDescriptor { model: "qwen3.5-2b", quant: "kv-fp8", arch: BenchArch::Gfx1100, min_vram_gib: 5.0 },
-    ComboDescriptor { model: "qwen3.5-4b", quant: "bf16", arch: BenchArch::Gfx1100, min_vram_gib: 10.0 },
-    ComboDescriptor { model: "qwen3.5-4b", quant: "int4", arch: BenchArch::Gfx1100, min_vram_gib: 3.7 },
-    ComboDescriptor { model: "qwen3.5-4b", quant: "fp8r", arch: BenchArch::Gfx1100, min_vram_gib: 6.0 },
-    ComboDescriptor { model: "qwen3.5-4b", quant: "kv-fp8", arch: BenchArch::Gfx1100, min_vram_gib: 10.0 },
-    ComboDescriptor { model: "qwen3.5-9b", quant: "bf16", arch: BenchArch::Gfx1100, min_vram_gib: 18.0 },
-    ComboDescriptor { model: "qwen3.5-9b", quant: "int4", arch: BenchArch::Gfx1100, min_vram_gib: 6.7 },
-    ComboDescriptor { model: "qwen3.5-9b", quant: "fp8r", arch: BenchArch::Gfx1100, min_vram_gib: 10.8 },
-    ComboDescriptor { model: "qwen3.5-9b", quant: "kv-fp8", arch: BenchArch::Gfx1100, min_vram_gib: 18.0 },
+    ComboDescriptor {
+        model: "qwen3.5-0.8b",
+        quant: "bf16",
+        arch: BenchArch::Gfx1100,
+        min_vram_gib: 2.0,
+    },
+    ComboDescriptor {
+        model: "qwen3.5-0.8b",
+        quant: "int4",
+        arch: BenchArch::Gfx1100,
+        min_vram_gib: 0.7,
+    },
+    ComboDescriptor {
+        model: "qwen3.5-0.8b",
+        quant: "fp8r",
+        arch: BenchArch::Gfx1100,
+        min_vram_gib: 1.2,
+    },
+    ComboDescriptor {
+        model: "qwen3.5-0.8b",
+        quant: "kv-fp8",
+        arch: BenchArch::Gfx1100,
+        min_vram_gib: 2.0,
+    },
+    ComboDescriptor {
+        model: "qwen3.5-2b",
+        quant: "bf16",
+        arch: BenchArch::Gfx1100,
+        min_vram_gib: 5.0,
+    },
+    ComboDescriptor {
+        model: "qwen3.5-2b",
+        quant: "int4",
+        arch: BenchArch::Gfx1100,
+        min_vram_gib: 1.9,
+    },
+    ComboDescriptor {
+        model: "qwen3.5-2b",
+        quant: "fp8r",
+        arch: BenchArch::Gfx1100,
+        min_vram_gib: 3.0,
+    },
+    ComboDescriptor {
+        model: "qwen3.5-2b",
+        quant: "kv-fp8",
+        arch: BenchArch::Gfx1100,
+        min_vram_gib: 5.0,
+    },
+    ComboDescriptor {
+        model: "qwen3.5-4b",
+        quant: "bf16",
+        arch: BenchArch::Gfx1100,
+        min_vram_gib: 10.0,
+    },
+    ComboDescriptor {
+        model: "qwen3.5-4b",
+        quant: "int4",
+        arch: BenchArch::Gfx1100,
+        min_vram_gib: 3.7,
+    },
+    ComboDescriptor {
+        model: "qwen3.5-4b",
+        quant: "fp8r",
+        arch: BenchArch::Gfx1100,
+        min_vram_gib: 6.0,
+    },
+    ComboDescriptor {
+        model: "qwen3.5-4b",
+        quant: "kv-fp8",
+        arch: BenchArch::Gfx1100,
+        min_vram_gib: 10.0,
+    },
+    ComboDescriptor {
+        model: "qwen3.5-9b",
+        quant: "bf16",
+        arch: BenchArch::Gfx1100,
+        min_vram_gib: 18.0,
+    },
+    ComboDescriptor {
+        model: "qwen3.5-9b",
+        quant: "int4",
+        arch: BenchArch::Gfx1100,
+        min_vram_gib: 6.7,
+    },
+    ComboDescriptor {
+        model: "qwen3.5-9b",
+        quant: "fp8r",
+        arch: BenchArch::Gfx1100,
+        min_vram_gib: 10.8,
+    },
+    ComboDescriptor {
+        model: "qwen3.5-9b",
+        quant: "kv-fp8",
+        arch: BenchArch::Gfx1100,
+        min_vram_gib: 18.0,
+    },
     // Gemma 4 — fp8r and kv-fp8 are wired into the single-batch persistent
     // decode kernel only (require --batch-size=1, cannot combine with --int4).
     // See docs/supported-matrix.md footnote 2.
-    ComboDescriptor { model: "gemma4-e2b", quant: "bf16", arch: BenchArch::Gfx1100, min_vram_gib: 11.0 },
-    ComboDescriptor { model: "gemma4-e2b", quant: "int4", arch: BenchArch::Gfx1100, min_vram_gib: 4.1 },
-    ComboDescriptor { model: "gemma4-e2b", quant: "fp8r", arch: BenchArch::Gfx1100, min_vram_gib: 6.6 },
-    ComboDescriptor { model: "gemma4-e2b", quant: "kv-fp8", arch: BenchArch::Gfx1100, min_vram_gib: 11.0 },
-    ComboDescriptor { model: "gemma4-e4b", quant: "bf16", arch: BenchArch::Gfx1100, min_vram_gib: 10.0 },
-    ComboDescriptor { model: "gemma4-e4b", quant: "int4", arch: BenchArch::Gfx1100, min_vram_gib: 3.7 },
-    ComboDescriptor { model: "gemma4-e4b", quant: "fp8r", arch: BenchArch::Gfx1100, min_vram_gib: 6.0 },
-    ComboDescriptor { model: "gemma4-e4b", quant: "kv-fp8", arch: BenchArch::Gfx1100, min_vram_gib: 10.0 },
+    ComboDescriptor {
+        model: "gemma4-e2b",
+        quant: "bf16",
+        arch: BenchArch::Gfx1100,
+        min_vram_gib: 11.0,
+    },
+    ComboDescriptor {
+        model: "gemma4-e2b",
+        quant: "int4",
+        arch: BenchArch::Gfx1100,
+        min_vram_gib: 4.1,
+    },
+    ComboDescriptor {
+        model: "gemma4-e2b",
+        quant: "fp8r",
+        arch: BenchArch::Gfx1100,
+        min_vram_gib: 6.6,
+    },
+    ComboDescriptor {
+        model: "gemma4-e2b",
+        quant: "kv-fp8",
+        arch: BenchArch::Gfx1100,
+        min_vram_gib: 11.0,
+    },
+    ComboDescriptor {
+        model: "gemma4-e4b",
+        quant: "bf16",
+        arch: BenchArch::Gfx1100,
+        min_vram_gib: 10.0,
+    },
+    ComboDescriptor {
+        model: "gemma4-e4b",
+        quant: "int4",
+        arch: BenchArch::Gfx1100,
+        min_vram_gib: 3.7,
+    },
+    ComboDescriptor {
+        model: "gemma4-e4b",
+        quant: "fp8r",
+        arch: BenchArch::Gfx1100,
+        min_vram_gib: 6.0,
+    },
+    ComboDescriptor {
+        model: "gemma4-e4b",
+        quant: "kv-fp8",
+        arch: BenchArch::Gfx1100,
+        min_vram_gib: 10.0,
+    },
     // Phi-4-mini — full quad
-    ComboDescriptor { model: "phi4-mini", quant: "bf16", arch: BenchArch::Gfx1100, min_vram_gib: 8.0 },
-    ComboDescriptor { model: "phi4-mini", quant: "int4", arch: BenchArch::Gfx1100, min_vram_gib: 3.0 },
-    ComboDescriptor { model: "phi4-mini", quant: "fp8r", arch: BenchArch::Gfx1100, min_vram_gib: 4.8 },
-    ComboDescriptor { model: "phi4-mini", quant: "kv-fp8", arch: BenchArch::Gfx1100, min_vram_gib: 8.0 },
+    ComboDescriptor {
+        model: "phi4-mini",
+        quant: "bf16",
+        arch: BenchArch::Gfx1100,
+        min_vram_gib: 8.0,
+    },
+    ComboDescriptor {
+        model: "phi4-mini",
+        quant: "int4",
+        arch: BenchArch::Gfx1100,
+        min_vram_gib: 3.0,
+    },
+    ComboDescriptor {
+        model: "phi4-mini",
+        quant: "fp8r",
+        arch: BenchArch::Gfx1100,
+        min_vram_gib: 4.8,
+    },
+    ComboDescriptor {
+        model: "phi4-mini",
+        quant: "kv-fp8",
+        arch: BenchArch::Gfx1100,
+        min_vram_gib: 8.0,
+    },
     // Qwen3.6-MoE — INT4 + KV-FP8 only on gfx1100 (24 GiB cap).
     // KV-FP8 lane requires --int4 simultaneously (only quant lane shipped).
     // See docs/feature-compatibility.md footnote 4.
-    ComboDescriptor { model: "qwen3.6-35b-a3b", quant: "int4", arch: BenchArch::Gfx1100, min_vram_gib: 21.0 },
-    ComboDescriptor { model: "qwen3.6-35b-a3b", quant: "kv-fp8", arch: BenchArch::Gfx1100, min_vram_gib: 21.0 },
+    ComboDescriptor {
+        model: "qwen3.6-35b-a3b",
+        quant: "int4",
+        arch: BenchArch::Gfx1100,
+        min_vram_gib: 21.0,
+    },
+    ComboDescriptor {
+        model: "qwen3.6-35b-a3b",
+        quant: "kv-fp8",
+        arch: BenchArch::Gfx1100,
+        min_vram_gib: 21.0,
+    },
+    // CUDA sm86 Qwen3.6-MoE prefill lanes. `int4-specNNN` is INT4 plus
+    // Qwen3.5-0.8B cross-family SpecPrefill cosine keep ratio NNN/100.
+    ComboDescriptor {
+        model: "qwen3.6-35b-a3b",
+        quant: "int4",
+        arch: BenchArch::Sm86,
+        min_vram_gib: 21.0,
+    },
+    ComboDescriptor {
+        model: "qwen3.6-35b-a3b",
+        quant: "int4-spec025",
+        arch: BenchArch::Sm86,
+        min_vram_gib: 21.0,
+    },
+    ComboDescriptor {
+        model: "qwen3.6-35b-a3b",
+        quant: "int4-spec050",
+        arch: BenchArch::Sm86,
+        min_vram_gib: 21.0,
+    },
+    ComboDescriptor {
+        model: "qwen3.6-35b-a3b",
+        quant: "int4-spec075",
+        arch: BenchArch::Sm86,
+        min_vram_gib: 21.0,
+    },
 ];
 
 pub fn combos_for_arch(arch: BenchArch) -> Vec<&'static ComboDescriptor> {
@@ -103,6 +292,7 @@ pub struct MatrixConfig {
     pub quants: Vec<String>,
     pub binary: PathBuf,
     pub model_dir_resolver: Box<dyn Fn(&str) -> PathBuf>,
+    pub specprefill_draft_dir_resolver: Box<dyn Fn(&str) -> Option<PathBuf>>,
     pub prompt: String,
     pub max_new_tokens: u32,
     pub warmup_tokens: u32,
@@ -117,7 +307,12 @@ pub fn run_matrix(cfg: &MatrixConfig, rd: &RunDir) -> Result<()> {
 
     let mut meta = MetaJson {
         schema_version: SCHEMA_VERSION,
-        run_id: rd.root().file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string(),
+        run_id: rd
+            .root()
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string(),
         timestamp_utc: Utc::now().to_rfc3339(),
         git_sha: cfg.git_sha.clone(),
         hostname: hostname_or_unknown(),
@@ -160,9 +355,11 @@ pub fn run_matrix(cfg: &MatrixConfig, rd: &RunDir) -> Result<()> {
 
             let invocation = ComboInvocation {
                 binary: cfg.binary.clone(),
+                backend: cfg.arch.backend().map(str::to_string),
                 model: model.clone(),
                 model_dir: (cfg.model_dir_resolver)(model),
                 quant: quant.clone(),
+                specprefill_draft_dir: (cfg.specprefill_draft_dir_resolver)(model),
                 prompt: cfg.prompt.clone(),
                 max_new_tokens: cfg.max_new_tokens,
                 warmup_tokens: cfg.warmup_tokens,

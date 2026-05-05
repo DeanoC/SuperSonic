@@ -115,16 +115,25 @@ pub(crate) fn prepare_decode_session(
     } else {
         None
     };
-    let embed_w_buf = if mtp_buffers.is_some() {
+    let dense_prefill_token_loop =
+        std::env::var_os("SUPERSONIC_QWEN36_DENSE_PREFILL_TOKEN_LOOP").is_some();
+    let embed_w_buf = if mtp_buffers.is_some() || (persistent_decode && dense_prefill_token_loop) {
         let embed_name = format!("{weight_prefix}.embed_tokens.weight");
         let embed = load_to_gpu(store, ordinal, &embed_name)
             .with_context(|| format!("upload {embed_name} to GPU"))?;
-        println!(
-            "  uploaded embed_tokens ({:.0} MiB BF16) and allocated MTP \
-             scratches (K={} drafts/step)",
-            (geom.vocab as f64 * geom.hidden as f64 * 2.0) / MIB,
-            QWEN36_NUM_SPECULATIVE_TOKENS,
-        );
+        if mtp_buffers.is_some() {
+            println!(
+                "  uploaded embed_tokens ({:.0} MiB BF16) and allocated MTP \
+                 scratches (K={} drafts/step)",
+                (geom.vocab as f64 * geom.hidden as f64 * 2.0) / MIB,
+                QWEN36_NUM_SPECULATIVE_TOKENS,
+            );
+        } else {
+            println!(
+                "  uploaded embed_tokens ({:.0} MiB BF16) for device-side dense prefill",
+                (geom.vocab as f64 * geom.hidden as f64 * 2.0) / MIB,
+            );
+        }
         Some(embed)
     } else {
         None

@@ -55,7 +55,7 @@ __global__ void qwen36_moe_batched_prefill_unpermute_combine_kernel(
     int                                  top_k,
     int                                  hidden,
     const int*          __restrict__     permuted_inverse,    // [N * top_k]
-    const __hip_bfloat16* __restrict__   permuted_weight,     // [N * top_k]
+    const hip_bfloat16* __restrict__   permuted_weight,     // [N * top_k]
     const T*            __restrict__     expert_out,          // [N * top_k, hidden]
     T*                  __restrict__     combined             // [N, hidden]
 ) {

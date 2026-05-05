@@ -2152,4 +2152,3 @@ fn expand_scalar_gate_bf16(
     .context("h2d expanded gate")?;
     Ok(())
 }
-

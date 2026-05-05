@@ -881,3 +881,10 @@ The "Baseline" column is the comparison point — the dense / no-feature
 run on the same hardware, model, and prompt. The "Source" column names
 the bench script or test that produced (or will produce) the
 measurement.
+
+<!-- AUTOGEN BELOW: bench-perf-matrix -->
+| Model           |  INT4 | Spec075 |
+| --------------- | ----: | ----: |
+| qwen3.6-35b-a3b | 4635.9 | 3591.0 |
+
+<!-- AUTOGEN END: bench-perf-matrix -->
