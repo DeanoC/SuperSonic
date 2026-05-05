@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "_doc": "Curated set of ~20 prompts. The first BF16 run for each (model) populates the reference; INT4/FP8 runs are diffed against the BF16 reference. Reference is stored at oracle/bench/golden_references/{model}.json (created on first BF16 run).",
+  "prompts": [
+    {"id": "fox_one_line", "prompt": "The quick brown fox jumps over", "max_new_tokens": 32},
+    {"id": "code_python_hello", "prompt": "def hello():\n    ", "max_new_tokens": 32},
+    {"id": "code_rust_main", "prompt": "fn main() {\n    println!(", "max_new_tokens": 16},
+    {"id": "story_open", "prompt": "Once upon a time, in a land far away,", "max_new_tokens": 64},
+    {"id": "math_arith", "prompt": "What is 47 + 35? The answer is", "max_new_tokens": 8},
+    {"id": "qa_capital", "prompt": "Q: What is the capital of France?\nA:", "max_new_tokens": 8},
+    {"id": "list_completion", "prompt": "Three primary colors are red, blue, and", "max_new_tokens": 4},
+    {"id": "translate_en_de", "prompt": "English: Good morning.\nGerman:", "max_new_tokens": 8},
+    {"id": "wiki_factual", "prompt": "The largest planet in our solar system is", "max_new_tokens": 4},
+    {"id": "code_complete_for", "prompt": "for i in range(10):\n    print(", "max_new_tokens": 16},
+    {"id": "json_emit", "prompt": "{\"name\": \"Alice\", \"age\":", "max_new_tokens": 4},
+    {"id": "longer_paragraph", "prompt": "The sun set slowly over the mountains, casting long shadows across", "max_new_tokens": 64},
+    {"id": "instruction_summarize", "prompt": "Summarize: The cat sat on the mat. The mat was red.\nSummary:", "max_new_tokens": 24},
+    {"id": "list_count", "prompt": "Count to five: 1, 2, 3,", "max_new_tokens": 8},
+    {"id": "syllogism", "prompt": "All birds can fly. A penguin is a bird. Can a penguin fly?", "max_new_tokens": 16},
+    {"id": "code_recursive", "prompt": "def fact(n):\n    if n <= 1:\n        return 1\n    return", "max_new_tokens": 16},
+    {"id": "bullet_list", "prompt": "Three benefits of exercise:\n-", "max_new_tokens": 48},
+    {"id": "completion_sentence", "prompt": "The reason the sky appears blue is", "max_new_tokens": 32},
+    {"id": "punctuation", "prompt": "Hello, world! How are you", "max_new_tokens": 8},
+    {"id": "long_repeat_check", "prompt": "Tell me a short story about a robot.", "max_new_tokens": 96}
+  ]
+}

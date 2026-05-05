@@ -1,0 +1,5 @@
+# Pinned hipfire version. Bump deliberately; changing this is a benchmark methodology change.
+# Format: one line, the exact `hipfire --version` output (or commit shorthand if hipfire emits one).
+# As of 2026-05-05, replace this placeholder with the actual installed version
+# captured via `hipfire --version` on the dev machine.
+hipfire-PLACEHOLDER-CAPTURE-VIA-hipfire-version
