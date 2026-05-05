@@ -1,4 +1,5 @@
 pub(crate) mod bake;
+pub(crate) mod batched_prefill;
 pub(crate) mod chain;
 pub(crate) mod decode_loop;
 pub(crate) mod dry_run;

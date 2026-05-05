@@ -49,7 +49,7 @@ use crate::registry::RegistryEntry;
 /// position (during prefill of kept tokens) or the absolute
 /// generation position (after prefill ends) while the cache slot
 /// is the compact `loop_state_position`.
-fn current_position(
+pub(crate) fn current_position(
     step: usize,
     loop_state_position: i32,
     keep_mask: Option<&Vec<bool>>,
@@ -391,22 +391,58 @@ fn decode_text(
     );
 
     // Batched-Q prefill opt-in. Read once. When set the new chunked
-    // path will (eventually) replace the per-token persistent decode
-    // loop for prefill — see docs/superpowers/plans/2026-05-05-qwen36-moe-batched-prefill-phase1.md.
-    // Currently a no-op stub (M1 wires only the env detection); from
-    // M6 onward this routes prefill through the new batched kernels.
+    // host orchestrator drives the prefill range
+    // `[0, effective_prompt_len - 1)` instead of the engine's main
+    // per-step loop — see
+    // docs/superpowers/plans/2026-05-05-qwen36-moe-batched-prefill-phase1.md.
+    // M6.1 SKELETON: the orchestrator still calls the existing
+    // per-token persistent megakernel inside each chunk; M6.3+ swaps
+    // those inner per-token launches for true batched kernels.
     // Treat unset / empty / "0" as off; anything else as on.
-    let _batched_prefill_requested = std::env::var("SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL")
+    let batched_prefill_requested = std::env::var("SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL")
         .map(|v| !v.is_empty() && v != "0")
         .unwrap_or(false);
-    if _batched_prefill_requested {
+
+    let mut start_step = 0usize;
+    if batched_prefill_requested && effective_prompt_len > 1 {
+        let timings = crate::qwen36_moe_cli::batched_prefill::run_batched_prefill_stub(
+            ordinal,
+            &geom,
+            &store,
+            weight_prefix,
+            &mut layers,
+            persistent_scratch.as_mut(),
+            _moe_expert_residency.as_mut(),
+            &mut moe_runtime,
+            &mut moe_routes,
+            &mut loop_state,
+            &prompt_ids,
+            keep_mask.as_ref(),
+            &kept_positions,
+            effective_prompt_len,
+            emit_stage_timings,
+        )?;
         eprintln!(
-            "[qwen36-moe batched-prefill] requested via env (stub mode \
-             — per-token persistent path still active until M6)"
+            "[qwen36-moe batched-prefill] chunks={} tokens={} embed_ms={:.1} chain_ms={:.1}",
+            timings.chunks,
+            timings.tokens,
+            timings.embed_total.as_secs_f64() * 1000.0,
+            timings.chain_total.as_secs_f64() * 1000.0,
         );
+        prefill_steps += timings.tokens;
+        prefill_embed_elapsed += timings.embed_total;
+        prefill_chain_elapsed += timings.chain_total;
+        // After the orchestrator processes prefill steps
+        // [0, effective_prompt_len - 1), the engine's main loop must
+        // resume at the FIRST generation step (where logits are
+        // computed). At that point `loop_state.position ==
+        // effective_prompt_len - 1` (incremented once per processed
+        // token) and `loop_state.current_token` is the LAST prompt
+        // token (the one to fold into logits in the gen step).
+        start_step = effective_prompt_len - 1;
     }
 
-    for step in 0..loop_state.total_steps {
+    for step in start_step..loop_state.total_steps {
         // When speculative decode is on, each iteration can commit
         // multiple tokens (up to K+1), so the standard `total_steps =
         // prompt_len + max_new - 1` count over-shoots. Break here once
