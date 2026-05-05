@@ -60,8 +60,8 @@ In dense MTP, `base_rope == base_cache == loop_state.position` and every `Positi
 - `specprefill_qwen36_moe_cosine_parity::cosine_qwen36_moe_keep_100_near_identity` continues to hit `cossim = 1.000000` (regression check — the SpecPrefill-only path with `MTP off`).
 - `specprefill_qwen36_moe_cosine_parity::cosine_qwen36_moe_keep_050_topic_alignment` continues to pass with the same topic-alignment bar.
 - `specprefill_qwen36_moe_mtp_cosine_parity` (new): two cells:
-  - `keep=1.00 near-identity` against dense+MTP baseline. Bar: cossim ≥ 0.99, argmax match, top-5 overlap = 5. Test stderr line `[mtp+specprefill parity mtp+cosine keep=1.00 near-identity] cossim=...` carries the actual measurement.
-  - `keep=0.50 topic-alignment` against dense+MTP baseline. Bar: cossim ≥ 0.65, top-5 overlap ≥ 3.
+  - `keep=1.00 near-identity` against dense+MTP baseline. Bar: cossim ≥ 0.99, argmax match, top-5 overlap = 5. **Measured: cossim=1.000000, dense_argmax=combined_argmax=421, top-5 overlap=5/5.** Bit-exact equivalence as expected — when every position is kept, `kept_positions[step] == step` for all steps so `base.rope == base.cache` and the path collapses to dense+MTP.
+  - `keep=0.50 topic-alignment` against dense+MTP baseline. Bar: cossim ≥ 0.65, top-5 overlap ≥ 3. **Measured: cossim=0.931045, dense_argmax=combined_argmax=421, top-5 overlap=3/5.** Argmax matches; cossim sits near the SpecPrefill-only test's same-cell value (0.931045 — this short prompt with `--max-new-tokens 1` only exercises the verify path's bonus-token logits, which MTP doesn't perturb relative to plain decode).
 
 The keep=1.00 cell is the strongest correctness probe: when every prompt position is kept, `kept_positions[step] == step` for all steps, so `base.rope == base.cache` and the SpecPrefill+MTP run is *definitionally* equivalent to dense+MTP on the input side. Any divergence is a plumbing bug. Ditto for the chain-step path through the SpecPrefill-only parity test that PR #211 already validated at `cossim = 1.0`.
 
