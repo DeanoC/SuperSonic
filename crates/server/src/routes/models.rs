@@ -171,6 +171,8 @@ pub async fn metrics(State(state): State<Arc<ServerState>>) -> impl IntoResponse
          supersonic_prefix_cache_evictions {}\n\
          # TYPE supersonic_prefix_cache_disk_writes counter\n\
          supersonic_prefix_cache_disk_writes {}\n\
+         # TYPE supersonic_prefix_cache_disk_reads counter\n\
+         supersonic_prefix_cache_disk_reads {}\n\
          # TYPE supersonic_prefix_cache_restore_failures counter\n\
          supersonic_prefix_cache_restore_failures {}\n\
          # TYPE supersonic_prefix_cache_admission_skips counter\n\
@@ -188,6 +190,7 @@ pub async fn metrics(State(state): State<Arc<ServerState>>) -> impl IntoResponse
         cache.cached_tokens,
         cache.evictions,
         cache.disk_writes,
+        cache.disk_reads,
         cache.restore_failures,
         cache.admission_skips,
     );

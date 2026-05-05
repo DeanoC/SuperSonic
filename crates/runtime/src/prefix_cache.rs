@@ -6,7 +6,7 @@ use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::session::SessionSnapshot;
@@ -64,6 +64,7 @@ pub struct PrefixCache {
     cached_tokens: AtomicU64,
     evictions: AtomicU64,
     disk_writes: AtomicU64,
+    disk_reads: AtomicU64,
     restore_failures: AtomicU64,
     admission_skips: AtomicU64,
 }
@@ -103,18 +104,20 @@ pub struct PrefixCacheStats {
     pub cached_tokens: u64,
     pub evictions: u64,
     pub disk_writes: u64,
+    pub disk_reads: u64,
     pub restore_failures: u64,
     pub admission_skips: u64,
 }
 
-#[derive(Serialize)]
-struct DiskEntry<'a> {
+#[derive(Serialize, Deserialize)]
+struct DiskEntry {
     format_version: u32,
-    namespace_hash: &'a str,
-    token_hash: &'a str,
+    namespace_hash: String,
+    token_hash: String,
     token_count: usize,
     expires_at_secs: u64,
-    retention: &'static str,
+    retention: String,
+    snapshot_file: Option<String>,
 }
 
 impl PrefixCache {
@@ -132,6 +135,7 @@ impl PrefixCache {
             cached_tokens: AtomicU64::new(0),
             evictions: AtomicU64::new(0),
             disk_writes: AtomicU64::new(0),
+            disk_reads: AtomicU64::new(0),
             restore_failures: AtomicU64::new(0),
             admission_skips: AtomicU64::new(0),
         }
@@ -230,6 +234,17 @@ impl PrefixCache {
             );
             return Ok(());
         }
+        let disk_bytes = if req.retention == CacheRetention::TwentyFourHours {
+            match snapshot.to_disk_bytes() {
+                Ok(bytes) => Some(bytes),
+                Err(e) => {
+                    tracing::debug!("prefix cache disk snapshot skipped: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let entry = PrefixCacheEntry {
             namespace: namespace.clone(),
             token_ids: token_ids.to_vec(),
@@ -253,9 +268,90 @@ impl PrefixCache {
         drop(inner);
 
         if req.retention == CacheRetention::TwentyFourHours {
-            self.write_disk_metadata(&namespace, &token_hash, token_ids.len(), expires_at_secs)?;
+            self.write_disk_entry(
+                &namespace,
+                &token_hash,
+                token_ids.len(),
+                expires_at_secs,
+                disk_bytes.as_deref(),
+            )?;
         }
         Ok(())
+    }
+
+    pub fn lookup_disk_bytes(
+        &self,
+        req: &CacheRequest,
+        prompt_ids: &[u32],
+    ) -> Option<PrefixCacheDiskHit> {
+        if !self.cfg.enabled
+            || req.retention != CacheRetention::TwentyFourHours
+            || self.cfg.dir.as_os_str().is_empty()
+        {
+            return None;
+        }
+        let namespace = namespace(req);
+        let now = epoch_secs();
+        let mut best: Option<DiskEntry> = None;
+        let entries = fs::read_dir(&self.cfg.dir).ok()?;
+        for dirent in entries.flatten() {
+            let path = dirent.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            let short_namespace = namespace.get(..16).unwrap_or(&namespace);
+            if !name.starts_with(short_namespace) {
+                continue;
+            }
+            let Some(entry): Option<DiskEntry> = fs::read(&path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            else {
+                continue;
+            };
+            if entry.expires_at_secs <= now {
+                remove_disk_entry(&path, &entry);
+                continue;
+            }
+            if entry.format_version != FORMAT_VERSION
+                || entry.namespace_hash != namespace
+                || entry.token_count > prompt_ids.len()
+                || entry.snapshot_file.is_none()
+            {
+                continue;
+            }
+            let prefix_hash = token_hash(&prompt_ids[..entry.token_count]);
+            if prefix_hash != entry.token_hash {
+                continue;
+            }
+            if best
+                .as_ref()
+                .is_none_or(|current| entry.token_count > current.token_count)
+            {
+                best = Some(entry);
+            }
+        }
+        let entry = best?;
+        let snapshot_file = entry.snapshot_file.as_ref()?;
+        let snapshot_path = self.cfg.dir.join(snapshot_file);
+        let disk_len = fs::metadata(&snapshot_path)
+            .ok()
+            .and_then(|m| usize::try_from(m.len()).ok())
+            .unwrap_or(0);
+        if !self.can_admit(entry.token_count, disk_len) {
+            self.admission_skips.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        let bytes = fs::read(snapshot_path).ok()?;
+        self.disk_reads.fetch_add(1, Ordering::Relaxed);
+        self.hits.fetch_add(1, Ordering::Relaxed);
+        self.cached_tokens
+            .fetch_add(entry.token_count as u64, Ordering::Relaxed);
+        Some(PrefixCacheDiskHit {
+            cached_tokens: entry.token_count,
+            bytes,
+        })
     }
 
     pub fn record_restore_failure(&self) {
@@ -285,6 +381,7 @@ impl PrefixCache {
             cached_tokens: self.cached_tokens.load(Ordering::Relaxed),
             evictions: self.evictions.load(Ordering::Relaxed),
             disk_writes: self.disk_writes.load(Ordering::Relaxed),
+            disk_reads: self.disk_reads.load(Ordering::Relaxed),
             restore_failures: self.restore_failures.load(Ordering::Relaxed),
             admission_skips: self.admission_skips.load(Ordering::Relaxed),
         }
@@ -322,29 +419,47 @@ impl PrefixCache {
         }
     }
 
-    fn write_disk_metadata(
+    fn write_disk_entry(
         &self,
         namespace: &str,
         token_hash: &str,
         token_count: usize,
         expires_at_secs: u64,
+        snapshot_bytes: Option<&[u8]>,
     ) -> Result<()> {
         fs::create_dir_all(&self.cfg.dir)
             .with_context(|| format!("create prefix cache dir {}", self.cfg.dir.display()))?;
         let path = disk_metadata_path(&self.cfg.dir, namespace, token_hash);
+        let snapshot_file = if let Some(bytes) = snapshot_bytes {
+            let snapshot_path = disk_snapshot_path(&self.cfg.dir, namespace, token_hash);
+            fs::write(&snapshot_path, bytes)
+                .with_context(|| format!("write {}", snapshot_path.display()))?;
+            snapshot_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(ToOwned::to_owned)
+        } else {
+            None
+        };
         let entry = DiskEntry {
             format_version: FORMAT_VERSION,
-            namespace_hash: namespace,
-            token_hash,
+            namespace_hash: namespace.to_string(),
+            token_hash: token_hash.to_string(),
             token_count,
             expires_at_secs,
-            retention: "24h",
+            retention: "24h".to_string(),
+            snapshot_file,
         };
         let bytes = serde_json::to_vec_pretty(&entry)?;
         fs::write(&path, bytes).with_context(|| format!("write {}", path.display()))?;
         self.disk_writes.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
+}
+
+pub struct PrefixCacheDiskHit {
+    pub cached_tokens: usize,
+    pub bytes: Vec<u8>,
 }
 
 fn namespace(req: &CacheRequest) -> String {
@@ -368,6 +483,27 @@ fn token_hash(token_ids: &[u32]) -> String {
 fn disk_metadata_path(dir: &std::path::Path, namespace: &str, token_hash: &str) -> PathBuf {
     let short_namespace = namespace.get(..16).unwrap_or(namespace);
     dir.join(format!("{short_namespace}-{token_hash}.json"))
+}
+
+fn disk_snapshot_path(dir: &std::path::Path, namespace: &str, token_hash: &str) -> PathBuf {
+    let short_namespace = namespace.get(..16).unwrap_or(namespace);
+    dir.join(format!("{short_namespace}-{token_hash}.qwen-prefix"))
+}
+
+fn remove_disk_entry(metadata_path: &std::path::Path, entry: &DiskEntry) {
+    if let Some(snapshot_file) = entry.snapshot_file.as_ref() {
+        let snapshot_path = metadata_path.with_file_name(snapshot_file);
+        if let Err(e) = fs::remove_file(&snapshot_path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::debug!(path = %snapshot_path.display(), "remove expired prefix snapshot failed: {e}");
+            }
+        }
+    }
+    if let Err(e) = fs::remove_file(metadata_path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::debug!(path = %metadata_path.display(), "remove expired prefix metadata failed: {e}");
+        }
+    }
 }
 
 fn touch_lru(lru: &mut VecDeque<String>, key: &str) {
@@ -468,5 +604,34 @@ mod tests {
             disk_ttl_secs: 86_400,
         });
         assert!(!disabled.can_admit(10, 10));
+    }
+
+    #[test]
+    fn remove_disk_entry_unlinks_metadata_and_snapshot() {
+        let dir = std::env::temp_dir().join(format!(
+            "supersonic-prefix-cache-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let metadata = dir.join("entry.json");
+        let snapshot = dir.join("entry.qwen-prefix");
+        fs::write(&metadata, b"{}").unwrap();
+        fs::write(&snapshot, b"snapshot").unwrap();
+        let entry = DiskEntry {
+            format_version: FORMAT_VERSION,
+            namespace_hash: "namespace".to_string(),
+            token_hash: "token".to_string(),
+            token_count: 1,
+            expires_at_secs: 0,
+            retention: "24h".to_string(),
+            snapshot_file: Some("entry.qwen-prefix".to_string()),
+        };
+
+        remove_disk_entry(&metadata, &entry);
+
+        assert!(!metadata.exists());
+        assert!(!snapshot.exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

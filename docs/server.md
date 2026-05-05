@@ -135,12 +135,13 @@ resident bytes, byte budget, and admission skips.
 `prompt_cache_retention` accepts:
 
 - `in_memory` (default): resident snapshot with a short idle TTL.
-- `24h`: resident snapshot plus disk metadata under the prefix-cache directory.
+- `24h`: resident snapshot plus prompt-free disk metadata. Qwen snapshots are
+  also persisted and can be lazily restored after a server restart.
 - `none`: bypass cache lookup and capture for the request.
 
 The disk files intentionally avoid prompt text and message JSON. They contain
-only hashes, counts, retention, and expiry metadata; resident model-state
-snapshots are what provide the live speedup.
+hashes, counts, retention, expiry metadata, logits, and model-state tensor
+bytes keyed by token hashes. Gemma disk snapshots are not persisted yet.
 
 ## Smoke Tests
 
@@ -205,6 +206,17 @@ Set `SUPERSONIC_PROMPT_CACHE_RETENTION=24h` to exercise disk metadata writes.
 It checks both an exact repeat and an extended same-prefix request, matching
 the common agent pattern where later turns replay prior transcript text and
 append new user/tool content.
+
+To verify Qwen disk restore, run the smoke once with `24h`, restart the server
+with the same `--prefix-cache-dir`, then run:
+
+```bash
+SUPERSONIC_BASE_URL=http://127.0.0.1:8080 \
+SUPERSONIC_API_KEY=secret \
+SUPERSONIC_PROMPT_CACHE_RETENTION=24h \
+SUPERSONIC_PREFIX_CACHE_SMOKE_PHASE=restart-probe \
+node /path/to/SuperSonic/scripts/prefix_cache_smoke.mjs
+```
 
 For short local prompts, start the server with `--prefix-cache-min-tokens 1`
 or set `SUPERSONIC_PREFIX_CACHE_MIN_TOKENS=1`; production defaults avoid

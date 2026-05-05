@@ -3,6 +3,7 @@ use std::ffi::c_void;
 use gpu_hal::{
     copy_h2d, sync, GpuBuffer, GpuError, HostBuffer, ScalarType, VirtualBacking, VirtualBuffer,
 };
+use serde::{Deserialize, Serialize};
 
 use crate::config::TextConfig;
 use crate::weights::LayerKind;
@@ -112,6 +113,33 @@ struct VirtualKvLogicalBackup {
 struct VirtualKvFullBackup {
     k: Vec<u8>,
     v: Option<Vec<u8>>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ModelStateDiskSnapshot {
+    pub layers: Vec<LayerStateDiskSnapshot>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct LayerStateDiskSnapshot {
+    kind: String,
+    kv_cache_k: Option<BufferDiskSnapshot>,
+    kv_cache_v: Option<BufferDiskSnapshot>,
+    kv_filled: usize,
+    kv_scale_k: Option<BufferDiskSnapshot>,
+    kv_scale_v: Option<BufferDiskSnapshot>,
+    kv_shadow_k: Option<BufferDiskSnapshot>,
+    kv_shadow_v: Option<BufferDiskSnapshot>,
+    kv_shadow_start: usize,
+    conv_state: Option<BufferDiskSnapshot>,
+    recurrent_state: Option<BufferDiskSnapshot>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct BufferDiskSnapshot {
+    dtype: String,
+    shape: Vec<usize>,
+    bytes: Vec<u8>,
 }
 
 impl LayerState {
@@ -999,6 +1027,80 @@ fn restore_virtual_kv_image_mapped(
 }
 
 impl LayerState {
+    pub fn to_disk_snapshot(&self) -> Result<LayerStateDiskSnapshot, GpuError> {
+        if self.has_virtual_kv_cache()
+            || self.certified_kv_host_k.is_some()
+            || self.certified_kv_host_v.is_some()
+            || self.certified_kv_key_i8.is_some()
+            || self.certified_kv_key_scale.is_some()
+            || self.certified_kv_key_zero.is_some()
+            || self.certified_kv_value_i4.is_some()
+            || self.certified_kv_value_scale.is_some()
+            || self.certified_kv_value_zero.is_some()
+            || self.certified_kv_value_error.is_some()
+            || self.certified_kv_value_norm.is_some()
+            || self.certified_kv_tail_k.is_some()
+            || self.certified_kv_tail_v.is_some()
+            || self.certified_kv_promoted_key_cache.is_some()
+            || self.certified_kv_promoted_key_cache_tags_gpu.is_some()
+            || self.certified_kv_promoted_key_cache_lru_gpu.is_some()
+            || self.certified_kv_promoted_value_cache.is_some()
+            || self.certified_kv_ranking_prefix_k.is_some()
+            || self.certified_kv_ranking_prefix_v.is_some()
+        {
+            return Err(GpuError::Unsupported(
+                "Qwen disk prefix snapshots only support standard KV/linear state".into(),
+            ));
+        }
+        Ok(LayerStateDiskSnapshot {
+            kind: match self.kind {
+                LayerKind::Linear => "linear".to_string(),
+                LayerKind::Full => "full".to_string(),
+            },
+            kv_cache_k: buffer_to_disk(&self.kv_cache_k)?,
+            kv_cache_v: buffer_to_disk(&self.kv_cache_v)?,
+            kv_filled: self.kv_filled,
+            kv_scale_k: buffer_to_disk(&self.kv_scale_k)?,
+            kv_scale_v: buffer_to_disk(&self.kv_scale_v)?,
+            kv_shadow_k: buffer_to_disk(&self.kv_shadow_k)?,
+            kv_shadow_v: buffer_to_disk(&self.kv_shadow_v)?,
+            kv_shadow_start: self.kv_shadow_start,
+            conv_state: buffer_to_disk(&self.conv_state)?,
+            recurrent_state: buffer_to_disk(&self.recurrent_state)?,
+        })
+    }
+
+    fn from_disk_snapshot(
+        snapshot: LayerStateDiskSnapshot,
+        config: &TextConfig,
+        ordinal: usize,
+    ) -> Result<Self, GpuError> {
+        let expected_kind = match snapshot.kind.as_str() {
+            "linear" => LayerKind::Linear,
+            "full" => LayerKind::Full,
+            other => {
+                return Err(GpuError::InvalidArg(format!(
+                    "unknown Qwen disk layer kind {other}"
+                )))
+            }
+        };
+        let mut layer = match expected_kind {
+            LayerKind::Linear => Self::new_linear(ordinal, config)?,
+            LayerKind::Full => Self::new_full(ordinal),
+        };
+        layer.kv_cache_k = buffer_from_disk(snapshot.kv_cache_k, ordinal)?;
+        layer.kv_cache_v = buffer_from_disk(snapshot.kv_cache_v, ordinal)?;
+        layer.kv_filled = snapshot.kv_filled;
+        layer.kv_scale_k = buffer_from_disk(snapshot.kv_scale_k, ordinal)?;
+        layer.kv_scale_v = buffer_from_disk(snapshot.kv_scale_v, ordinal)?;
+        layer.kv_shadow_k = buffer_from_disk(snapshot.kv_shadow_k, ordinal)?;
+        layer.kv_shadow_v = buffer_from_disk(snapshot.kv_shadow_v, ordinal)?;
+        layer.kv_shadow_start = snapshot.kv_shadow_start;
+        layer.conv_state = buffer_from_disk(snapshot.conv_state, ordinal)?;
+        layer.recurrent_state = buffer_from_disk(snapshot.recurrent_state, ordinal)?;
+        Ok(layer)
+    }
+
     pub fn resident_gpu_bytes(&self) -> usize {
         let mut total = 0usize;
         let mut add = |buf: &Option<GpuBuffer>| {
@@ -1131,6 +1233,47 @@ impl LayerState {
             conv_state: clone_opt(&self.conv_state)?,
             recurrent_state: clone_opt(&self.recurrent_state)?,
         })
+    }
+}
+
+fn buffer_to_disk(buf: &Option<GpuBuffer>) -> Result<Option<BufferDiskSnapshot>, GpuError> {
+    let Some(buf) = buf else {
+        return Ok(None);
+    };
+    Ok(Some(BufferDiskSnapshot {
+        dtype: dtype_name(buf.dtype()).to_string(),
+        shape: buf.shape().to_vec(),
+        bytes: buf.to_host_bytes()?,
+    }))
+}
+
+fn buffer_from_disk(
+    snapshot: Option<BufferDiskSnapshot>,
+    ordinal: usize,
+) -> Result<Option<GpuBuffer>, GpuError> {
+    let Some(snapshot) = snapshot else {
+        return Ok(None);
+    };
+    let dtype = ScalarType::from_name(&snapshot.dtype).ok_or_else(|| {
+        GpuError::InvalidArg(format!("unknown Qwen disk buffer dtype {}", snapshot.dtype))
+    })?;
+    Ok(Some(GpuBuffer::from_host_bytes(
+        ordinal,
+        dtype,
+        &snapshot.shape,
+        &snapshot.bytes,
+    )?))
+}
+
+fn dtype_name(dtype: ScalarType) -> &'static str {
+    match dtype {
+        ScalarType::F16 => "f16",
+        ScalarType::BF16 => "bf16",
+        ScalarType::F32 => "f32",
+        ScalarType::U8 => "u8",
+        ScalarType::U32 => "u32",
+        ScalarType::I64 => "i64",
+        ScalarType::F8E4M3 => "f8_e4m3",
     }
 }
 
@@ -1277,6 +1420,50 @@ impl ModelState {
             .iter()
             .map(LayerState::resident_gpu_bytes)
             .fold(0usize, usize::saturating_add)
+    }
+
+    pub fn to_disk_snapshot(&self) -> Result<ModelStateDiskSnapshot, GpuError> {
+        Ok(ModelStateDiskSnapshot {
+            layers: self
+                .layers
+                .iter()
+                .map(LayerState::to_disk_snapshot)
+                .collect::<Result<Vec<_>, _>>()?,
+        })
+    }
+
+    pub fn from_disk_snapshot(
+        snapshot: ModelStateDiskSnapshot,
+        config: &TextConfig,
+        ordinal: usize,
+    ) -> Result<Self, GpuError> {
+        if snapshot.layers.len() != config.num_hidden_layers {
+            return Err(GpuError::InvalidArg(format!(
+                "Qwen disk snapshot layer count {} != config {}",
+                snapshot.layers.len(),
+                config.num_hidden_layers
+            )));
+        }
+        let mut layers = Vec::with_capacity(snapshot.layers.len());
+        for (idx, layer_snapshot) in snapshot.layers.into_iter().enumerate() {
+            let expected = if config.is_full_attention(idx) {
+                "full"
+            } else {
+                "linear"
+            };
+            if layer_snapshot.kind != expected {
+                return Err(GpuError::InvalidArg(format!(
+                    "Qwen disk snapshot layer {idx} kind {} != expected {expected}",
+                    layer_snapshot.kind
+                )));
+            }
+            layers.push(LayerState::from_disk_snapshot(
+                layer_snapshot,
+                config,
+                ordinal,
+            )?);
+        }
+        Ok(Self { layers })
     }
 
     /// Capture `(conv_state, recurrent_state)` for every linear-attention

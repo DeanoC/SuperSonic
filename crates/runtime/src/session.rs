@@ -23,6 +23,15 @@ pub enum SessionSnapshot {
 }
 
 impl SessionSnapshot {
+    pub fn to_disk_bytes(&self) -> Result<Vec<u8>> {
+        match self {
+            Self::Qwen(s) => s.to_disk_bytes(),
+            Self::Gemma4Bf16(_) | Self::Gemma4Int4(_) => Err(anyhow!(
+                "disk prefix snapshots are currently implemented for Qwen only"
+            )),
+        }
+    }
+
     pub fn resident_bytes(&self) -> usize {
         match self {
             Self::Qwen(s) => s.resident_bytes(),
@@ -116,6 +125,15 @@ impl InferenceSession {
             (Self::Gemma4Int4(e), SessionSnapshot::Gemma4Int4(s)) => e.restore_prefix(&s),
             _ => Err(anyhow!(
                 "prefix cache snapshot does not match loaded model family"
+            )),
+        }
+    }
+
+    pub fn load_disk_prefix(&self, bytes: &[u8]) -> Result<SessionSnapshot> {
+        match self {
+            Self::Qwen(e) => Ok(SessionSnapshot::Qwen(e.load_prefix_snapshot_bytes(bytes)?)),
+            Self::Gemma4Bf16(_) | Self::Gemma4Int4(_) => Err(anyhow!(
+                "disk prefix snapshots are currently implemented for Qwen only"
             )),
         }
     }
