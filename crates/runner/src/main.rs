@@ -130,6 +130,23 @@ fn main() -> Result<()> {
     validate_dflash_flags(&cli, &model_variant)?;
     validate_specprefill_flags(&cli, &model_variant, backend)?;
 
+    // Teacher-forced is currently implemented for Llama 3.1 and Qwen3.5.
+    // Bail early for unsupported families so the user gets a clear message.
+    if cli.teacher_forced {
+        match model_variant.family() {
+            ModelFamily::Llama31 | ModelFamily::Qwen35 => {} // supported; handled inside engine
+            ModelFamily::Gemma4 => {
+                anyhow::bail!("Gemma 4 teacher-forced not yet implemented (Task 13)")
+            }
+            ModelFamily::Phi4 => {
+                anyhow::bail!("Phi-4 teacher-forced not yet implemented (Task 14)")
+            }
+            ModelFamily::Qwen36Moe => {
+                anyhow::bail!("Qwen3.6-MoE teacher-forced out of Phase 1 scope")
+            }
+        }
+    }
+
     match model_variant.family() {
         ModelFamily::Gemma4 => run_gemma4(&cli, &model_variant, entry, ordinal, gpu.total_vram),
         ModelFamily::Phi4 => {

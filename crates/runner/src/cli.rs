@@ -125,8 +125,8 @@ pub(crate) struct Cli {
     pub(crate) emit_generated_json: bool,
 
     /// Score the prompt with teacher forcing instead of generating new tokens.
-    /// Currently wired for the Llama 3.1 CUDA path as the PG-19/perplexity QA
-    /// surface.
+    /// Supported for Llama 3.1 (CUDA) and Qwen3.5 (HIP/CUDA/Metal).
+    /// Other model families bail with a "not yet implemented" message.
     #[arg(long)]
     pub(crate) teacher_forced: bool,
 
