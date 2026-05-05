@@ -107,13 +107,13 @@ pub struct MatrixConfig {
 pub fn run_matrix(cfg: &MatrixConfig, rd: &RunDir) -> Result<()> {
     rd.create()?;
 
-    let meta = MetaJson {
+    let mut meta = MetaJson {
         schema_version: SCHEMA_VERSION,
         run_id: rd.root().file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string(),
         timestamp_utc: Utc::now().to_rfc3339(),
         git_sha: cfg.git_sha.clone(),
         hostname: hostname_or_unknown(),
-        arch: format!("{:?}", cfg.arch).to_lowercase(),
+        arch: cfg.arch.as_str().to_string(),
         rocminfo: capture_cmd("rocminfo"),
         rocm_smi_u: capture_cmd_args("rocm-smi", &["-u"]),
         gpu_temp_c_pre: read_gpu_temp(),
@@ -142,21 +142,8 @@ pub fn run_matrix(cfg: &MatrixConfig, rd: &RunDir) -> Result<()> {
         }
     }
 
-    let mut meta_post = MetaJson {
-        schema_version: SCHEMA_VERSION,
-        run_id: rd.root().file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string(),
-        timestamp_utc: meta.timestamp_utc.clone(),
-        git_sha: meta.git_sha.clone(),
-        hostname: meta.hostname.clone(),
-        arch: meta.arch.clone(),
-        rocminfo: meta.rocminfo.clone(),
-        rocm_smi_u: meta.rocm_smi_u.clone(),
-        gpu_temp_c_pre: meta.gpu_temp_c_pre,
-        gpu_temp_c_post: read_gpu_temp(),
-        runner_version: meta.runner_version.clone(),
-    };
-    meta_post.gpu_temp_c_post = read_gpu_temp();
-    rd.write_meta(&meta_post)?;
+    meta.gpu_temp_c_post = read_gpu_temp();
+    rd.write_meta(&meta)?;
     Ok(())
 }
 
