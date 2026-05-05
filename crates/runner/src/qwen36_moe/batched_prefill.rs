@@ -67,38 +67,37 @@ use crate::qwen36_moe_types::{
     AttnLayerBuffers, FullAttnInt4Sidecars, FullAttnKvCache, LayerBuffers, MultiLayerGeom,
 };
 
-/// Three compile-time chunk-size variants the orchestrator dispatches
-/// among at runtime based on remaining prompt tokens. The kernel templates
-/// (M3 attention, M9 router permute, M10 grouped expert GEMM, M11 unpermute
-/// combine) all take `n_tokens` as a runtime arg and work for any size in
-/// [1, MAX]; the rationale for picking from a small set of fixed sizes:
+/// Chunk-size policy.
 ///
-///   - **64**: small for the last partial chunk and for very-short prompts.
-///     Avg tokens-per-expert = 64×8/256 = 2 — INT4 WMMA tiles 12% utilized;
-///     useful only when the chunk would otherwise be smaller.
-///   - **256**: medium. Avg tokens/expert = 8 — half-utilized 16×16 WMMA.
-///     Sweet spot for prompts in the 256–1023 range.
-///   - **1024**: large. Avg tokens/expert = 32 — fully-utilized 16×16 WMMA
-///     tiles. Best for the bulk of long prompts (>=1024 remaining).
+/// **WMMA-100% threshold**: the M10 grouped MoE GEMM's per-expert WMMA tile
+/// width is 16 rows. With `top_k=8` and `num_experts=256` the avg
+/// tokens-per-expert hits that threshold at chunk_size = `16 * 256 / 8 = 512`.
+/// Larger chunks don't gain WMMA utilization, only marginal K-tile-share in
+/// attention (diminishing returns past ~256 because GEMM bandwidth dominates).
 ///
-/// Scratch buffers (`FullAttnBatchScratch`) are sized for `MAX` and the
-/// per-chunk code uses only the prefix needed.
-pub(crate) const PREFILL_CHUNK_SIZE_SMALL: usize = 64;
-pub(crate) const PREFILL_CHUNK_SIZE_MEDIUM: usize = 256;
-pub(crate) const PREFILL_CHUNK_SIZE_LARGE: usize = 1024;
-pub(crate) const PREFILL_CHUNK_SIZE_MAX: usize = PREFILL_CHUNK_SIZE_LARGE;
+/// **Policy** (`pick_chunk_size`):
+/// 1. Use the WMMA-100% size (`512`) for the bulk of long prompts.
+/// 2. For the trailing partial chunk where `remaining < 512`, use exactly
+///    `remaining` in one call — splitting into multiple smaller chunks just
+///    adds launch overhead with no perf benefit.
+/// 3. For very-short prompts (prompt_len ≤ 512), use one chunk = `prompt_len`.
+/// 4. `LARGE = 1024` is reserved as the scratch-allocation ceiling so the
+///    kernels can grow in the future without re-tuning the buffer size; the
+///    runtime dispatch never picks larger than `WMMA_FULL` today.
+pub(crate) const PREFILL_CHUNK_SIZE_WMMA_FULL: usize = 512;
+pub(crate) const PREFILL_CHUNK_SIZE_MAX: usize = 1024;
 
-/// Pick the largest of {SMALL, MEDIUM, LARGE} that fits `remaining`. The
-/// last partial chunk uses the smallest variant that still covers it.
+/// Pick the chunk size for this iteration based on the remaining prefill
+/// tokens. See policy comment on `PREFILL_CHUNK_SIZE_WMMA_FULL` above.
 fn pick_chunk_size(remaining: usize) -> usize {
-    if remaining >= PREFILL_CHUNK_SIZE_LARGE {
-        PREFILL_CHUNK_SIZE_LARGE
-    } else if remaining >= PREFILL_CHUNK_SIZE_MEDIUM {
-        PREFILL_CHUNK_SIZE_MEDIUM
+    if remaining >= PREFILL_CHUNK_SIZE_WMMA_FULL {
+        PREFILL_CHUNK_SIZE_WMMA_FULL
     } else {
-        // remaining < 256: just process whatever's left in one shot. Cap
-        // by SMALL so the loop's per-call sizing stays bounded above.
-        remaining.min(PREFILL_CHUNK_SIZE_SMALL)
+        // Trailing partial OR short-prompt single chunk: process whatever's
+        // left in one call. Sub-WMMA-threshold but a single launch wins
+        // over multiple sub-256 chunks (each of which would also miss the
+        // WMMA threshold).
+        remaining
     }
 }
 
