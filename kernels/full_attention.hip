@@ -471,7 +471,10 @@ __global__ void supersonic_qwen35_full_attention_prefill_tiled_kernel(
                 for (int d = lane; d < head_dim; d += warpSize) {
                     partial += supersonic_qwen35_to_float(q_row[d]) * supersonic_qwen35_to_float(k_row[d]);
                 }
-                float score = supersonic_qwen35_wave_sum(partial) * scale;
+                // wave_sum is a __shfl_down butterfly that leaves the sum
+                // only in lane 0; broadcast it so every lane sees the same
+                // score (each lane runs its own per-output-dim recurrence).
+                float score = __shfl(supersonic_qwen35_wave_sum(partial), 0) * scale;
 
                 const float m_old = m_i;
                 const float m_new = score > m_old ? score : m_old;
