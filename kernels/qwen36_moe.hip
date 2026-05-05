@@ -68,6 +68,11 @@
 // dispatch from the persistent megakernel.
 #include "qwen36_moe_persistent/batched_prefill_grouped_expert.cuh"
 
+// Stage B (M11): unpermute + weighted combine kernel. Inverts M9's
+// permutation (host-built inverse table) and accumulates `top_k`
+// weighted expert outputs per token into a `[N, hidden]` BF16 tensor.
+#include "qwen36_moe_persistent/batched_prefill_unpermute_combine.cuh"
+
 namespace qwen36_moe {
 
 // -- Layer descriptor (mirror of Rust Qwen36MoeDecodeLayerDesc) ----------

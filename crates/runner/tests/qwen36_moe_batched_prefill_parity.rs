@@ -99,6 +99,11 @@ fn batched_prefill_matches_per_token() {
         &[
             ("SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL", "1"),
             ("SUPERSONIC_QWEN36_MOE_BATCHED_ATTN", "1"),
+            // M11: enable the grouped MoE FFN path (router permute + grouped
+            // expert GEMM + unpermute combine). When unset the orchestrator
+            // also defaults to ON; setting it explicitly here documents the
+            // expected configuration.
+            ("SUPERSONIC_QWEN36_MOE_GROUPED_FFN", "1"),
         ],
     )
     .expect("batched");
