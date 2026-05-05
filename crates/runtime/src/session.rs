@@ -23,6 +23,14 @@ pub enum SessionSnapshot {
 }
 
 impl SessionSnapshot {
+    pub fn resident_bytes(&self) -> usize {
+        match self {
+            Self::Qwen(s) => s.resident_bytes(),
+            Self::Gemma4Bf16(s) => s.resident_bytes(),
+            Self::Gemma4Int4(s) => s.resident_bytes(),
+        }
+    }
+
     pub fn try_clone(&self) -> Result<Self> {
         match self {
             Self::Qwen(s) => Ok(Self::Qwen(s.try_clone()?)),
@@ -90,6 +98,14 @@ impl InferenceSession {
             Self::Qwen(e) => Ok(SessionSnapshot::Qwen(e.snapshot_prefix(logits)?)),
             Self::Gemma4Bf16(e) => Ok(SessionSnapshot::Gemma4Bf16(e.snapshot_prefix(logits)?)),
             Self::Gemma4Int4(e) => Ok(SessionSnapshot::Gemma4Int4(e.snapshot_prefix(logits)?)),
+        }
+    }
+
+    pub fn prefix_snapshot_bytes(&self, logits_len: usize) -> usize {
+        match self {
+            Self::Qwen(e) => e.prefix_snapshot_bytes(logits_len),
+            Self::Gemma4Bf16(e) => e.prefix_snapshot_bytes(logits_len),
+            Self::Gemma4Int4(e) => e.prefix_snapshot_bytes(logits_len),
         }
     }
 

@@ -157,6 +157,10 @@ pub async fn metrics(State(state): State<Arc<ServerState>>) -> impl IntoResponse
          supersonic_max_context {}\n\
          # TYPE supersonic_prefix_cache_entries gauge\n\
          supersonic_prefix_cache_entries {}\n\
+         # TYPE supersonic_prefix_cache_resident_bytes gauge\n\
+         supersonic_prefix_cache_resident_bytes {}\n\
+         # TYPE supersonic_prefix_cache_max_bytes gauge\n\
+         supersonic_prefix_cache_max_bytes {}\n\
          # TYPE supersonic_prefix_cache_hits counter\n\
          supersonic_prefix_cache_hits {}\n\
          # TYPE supersonic_prefix_cache_misses counter\n\
@@ -168,19 +172,24 @@ pub async fn metrics(State(state): State<Arc<ServerState>>) -> impl IntoResponse
          # TYPE supersonic_prefix_cache_disk_writes counter\n\
          supersonic_prefix_cache_disk_writes {}\n\
          # TYPE supersonic_prefix_cache_restore_failures counter\n\
-         supersonic_prefix_cache_restore_failures {}\n",
+         supersonic_prefix_cache_restore_failures {}\n\
+         # TYPE supersonic_prefix_cache_admission_skips counter\n\
+         supersonic_prefix_cache_admission_skips {}\n",
         queue.active,
         queue.queued,
         queue.max_queue,
         queue.queue_timeout_ms,
         state.max_context,
         cache.entries,
+        cache.resident_bytes,
+        cache.max_bytes,
         cache.hits,
         cache.misses,
         cache.cached_tokens,
         cache.evictions,
         cache.disk_writes,
         cache.restore_failures,
+        cache.admission_skips,
     );
     ([(CONTENT_TYPE, "text/plain; version=0.0.4")], body)
 }

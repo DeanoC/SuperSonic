@@ -51,6 +51,7 @@ pub struct PrefixCacheConfig {
     pub dir: PathBuf,
     pub min_tokens: usize,
     pub max_entries: usize,
+    pub max_bytes: usize,
     pub memory_ttl_secs: u64,
     pub disk_ttl_secs: u64,
 }
@@ -64,18 +65,21 @@ pub struct PrefixCache {
     evictions: AtomicU64,
     disk_writes: AtomicU64,
     restore_failures: AtomicU64,
+    admission_skips: AtomicU64,
 }
 
 #[derive(Default)]
 struct PrefixCacheInner {
     entries: HashMap<String, PrefixCacheEntry>,
     lru: VecDeque<String>,
+    resident_bytes: usize,
 }
 
 pub struct PrefixCacheEntry {
     namespace: String,
     token_ids: Vec<u32>,
     snapshot: SessionSnapshot,
+    resident_bytes: usize,
     expires_at_secs: u64,
     last_used_secs: u64,
 }
@@ -91,6 +95,8 @@ pub struct PrefixCacheStats {
     pub dir: String,
     pub min_tokens: usize,
     pub max_entries: usize,
+    pub max_bytes: usize,
+    pub resident_bytes: usize,
     pub entries: usize,
     pub hits: u64,
     pub misses: u64,
@@ -98,6 +104,7 @@ pub struct PrefixCacheStats {
     pub evictions: u64,
     pub disk_writes: u64,
     pub restore_failures: u64,
+    pub admission_skips: u64,
 }
 
 #[derive(Serialize)]
@@ -126,11 +133,22 @@ impl PrefixCache {
             evictions: AtomicU64::new(0),
             disk_writes: AtomicU64::new(0),
             restore_failures: AtomicU64::new(0),
+            admission_skips: AtomicU64::new(0),
         }
     }
 
     pub fn config(&self) -> &PrefixCacheConfig {
         &self.cfg
+    }
+
+    pub fn can_admit(&self, token_count: usize, resident_bytes: usize) -> bool {
+        if !self.cfg.enabled || token_count < self.cfg.min_tokens {
+            return false;
+        }
+        if self.cfg.max_entries == 0 {
+            return false;
+        }
+        self.cfg.max_bytes == 0 || resident_bytes <= self.cfg.max_bytes
     }
 
     pub fn lookup(&self, req: &CacheRequest, prompt_ids: &[u32]) -> Option<PrefixCacheHit> {
@@ -200,10 +218,23 @@ impl PrefixCache {
         let token_hash = token_hash(token_ids);
         let key = format!("{namespace}:{token_hash}");
         let expires_at_secs = now.saturating_add(req.retention.ttl(&self.cfg).as_secs());
+        let resident_bytes = snapshot.resident_bytes();
+        if !self.can_admit(token_ids.len(), resident_bytes) {
+            self.admission_skips.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(
+                token_count = token_ids.len(),
+                resident_bytes,
+                max_bytes = self.cfg.max_bytes,
+                max_entries = self.cfg.max_entries,
+                "prefix cache snapshot skipped by admission policy"
+            );
+            return Ok(());
+        }
         let entry = PrefixCacheEntry {
             namespace: namespace.clone(),
             token_ids: token_ids.to_vec(),
             snapshot,
+            resident_bytes,
             expires_at_secs,
             last_used_secs: now,
         };
@@ -212,18 +243,13 @@ impl PrefixCache {
             .entries
             .lock()
             .map_err(|_| anyhow::anyhow!("prefix cache lock poisoned"))?;
-        inner.entries.insert(key.clone(), entry);
+        if let Some(old) = inner.entries.insert(key.clone(), entry) {
+            inner.resident_bytes = inner.resident_bytes.saturating_sub(old.resident_bytes);
+        }
+        inner.resident_bytes = inner.resident_bytes.saturating_add(resident_bytes);
         touch_lru(&mut inner.lru, &key);
         self.prune_locked(&mut inner, now);
-        while inner.entries.len() > self.cfg.max_entries {
-            if let Some(old) = inner.lru.pop_front() {
-                if inner.entries.remove(&old).is_some() {
-                    self.evictions.fetch_add(1, Ordering::Relaxed);
-                }
-            } else {
-                break;
-            }
-        }
+        self.enforce_capacity_locked(&mut inner);
         drop(inner);
 
         if req.retention == CacheRetention::TwentyFourHours {
@@ -236,13 +262,23 @@ impl PrefixCache {
         self.restore_failures.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn record_admission_skip(&self) {
+        self.admission_skips.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn stats(&self) -> PrefixCacheStats {
-        let entries = self.entries.lock().map(|e| e.entries.len()).unwrap_or(0);
+        let (entries, resident_bytes) = self
+            .entries
+            .lock()
+            .map(|e| (e.entries.len(), e.resident_bytes))
+            .unwrap_or((0, 0));
         PrefixCacheStats {
             enabled: self.cfg.enabled,
             dir: self.cfg.dir.display().to_string(),
             min_tokens: self.cfg.min_tokens,
             max_entries: self.cfg.max_entries,
+            max_bytes: self.cfg.max_bytes,
+            resident_bytes,
             entries,
             hits: self.hits.load(Ordering::Relaxed),
             misses: self.misses.load(Ordering::Relaxed),
@@ -250,6 +286,7 @@ impl PrefixCache {
             evictions: self.evictions.load(Ordering::Relaxed),
             disk_writes: self.disk_writes.load(Ordering::Relaxed),
             restore_failures: self.restore_failures.load(Ordering::Relaxed),
+            admission_skips: self.admission_skips.load(Ordering::Relaxed),
         }
     }
 
@@ -261,10 +298,27 @@ impl PrefixCache {
             }
         }
         for key in expired {
-            if inner.entries.remove(&key).is_some() {
-                self.evictions.fetch_add(1, Ordering::Relaxed);
-            }
+            self.remove_locked(inner, &key);
             inner.lru.retain(|k| k != &key);
+        }
+    }
+
+    fn enforce_capacity_locked(&self, inner: &mut PrefixCacheInner) {
+        while inner.entries.len() > self.cfg.max_entries
+            || (self.cfg.max_bytes > 0 && inner.resident_bytes > self.cfg.max_bytes)
+        {
+            if let Some(old) = inner.lru.pop_front() {
+                self.remove_locked(inner, &old);
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn remove_locked(&self, inner: &mut PrefixCacheInner, key: &str) {
+        if let Some(old) = inner.entries.remove(key) {
+            inner.resident_bytes = inner.resident_bytes.saturating_sub(old.resident_bytes);
+            self.evictions.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -387,5 +441,32 @@ mod tests {
         assert_ne!(a, b);
         assert_eq!(a.file_name().unwrap(), "1111222233334444-abcd.json");
         assert_eq!(b.file_name().unwrap(), "9999888877776666-abcd.json");
+    }
+
+    #[test]
+    fn admission_policy_checks_entry_and_byte_budget() {
+        let cache = PrefixCache::new(PrefixCacheConfig {
+            enabled: true,
+            dir: PathBuf::from("/tmp/cache"),
+            min_tokens: 4,
+            max_entries: 1,
+            max_bytes: 1024,
+            memory_ttl_secs: 600,
+            disk_ttl_secs: 86_400,
+        });
+        assert!(!cache.can_admit(3, 512));
+        assert!(cache.can_admit(4, 1024));
+        assert!(!cache.can_admit(4, 1025));
+
+        let disabled = PrefixCache::new(PrefixCacheConfig {
+            enabled: true,
+            dir: PathBuf::from("/tmp/cache"),
+            min_tokens: 1,
+            max_entries: 0,
+            max_bytes: 0,
+            memory_ttl_secs: 600,
+            disk_ttl_secs: 86_400,
+        });
+        assert!(!disabled.can_admit(10, 10));
     }
 }

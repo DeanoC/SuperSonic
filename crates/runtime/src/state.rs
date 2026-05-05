@@ -87,6 +87,7 @@ pub struct LoaderConfig {
     pub prefix_cache_dir: Option<PathBuf>,
     pub prefix_cache_min_tokens: usize,
     pub prefix_cache_max_entries: usize,
+    pub prefix_cache_max_bytes: Option<usize>,
     pub prefix_cache_memory_ttl_secs: u64,
     pub prefix_cache_disk_ttl_secs: u64,
 }
@@ -215,10 +216,20 @@ pub fn build(cfg: LoaderConfig) -> Result<ServerState> {
             dir: cache_dir,
             min_tokens: cfg.prefix_cache_min_tokens,
             max_entries: cfg.prefix_cache_max_entries,
+            max_bytes: cfg
+                .prefix_cache_max_bytes
+                .unwrap_or_else(|| default_prefix_cache_max_bytes(total_vram)),
             memory_ttl_secs: cfg.prefix_cache_memory_ttl_secs,
             disk_ttl_secs: cfg.prefix_cache_disk_ttl_secs,
         })),
     })
+}
+
+fn default_prefix_cache_max_bytes(total_vram: u64) -> usize {
+    const MIN_BUDGET: u64 = 64 * 1024 * 1024;
+    const MAX_BUDGET: u64 = 2 * 1024 * 1024 * 1024;
+    let budget = (total_vram / 20).clamp(MIN_BUDGET, MAX_BUDGET);
+    budget.min(usize::MAX as u64) as usize
 }
 
 fn validate_flag_exclusions(cfg: &LoaderConfig) -> Result<()> {
@@ -305,6 +316,7 @@ mod tests {
             prefix_cache_dir: None,
             prefix_cache_min_tokens: 128,
             prefix_cache_max_entries: 1,
+            prefix_cache_max_bytes: None,
             prefix_cache_memory_ttl_secs: 600,
             prefix_cache_disk_ttl_secs: 86_400,
         }

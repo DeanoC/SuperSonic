@@ -72,6 +72,7 @@ fn load_test_config() -> Option<LoaderConfig> {
             .and_then(|s| s.parse().ok())
             .unwrap_or(32),
         prefix_cache_max_entries: 1,
+        prefix_cache_max_bytes: None,
         prefix_cache_memory_ttl_secs: 600,
         prefix_cache_disk_ttl_secs: 86_400,
     })
