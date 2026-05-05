@@ -1,7 +1,14 @@
 """Math sanity for perplexity aggregation. No GPU."""
 import math
+from pathlib import Path
+from unittest.mock import patch
 
-from oracle.bench.perplexity import aggregate_ppl_from_chunks
+import pytest
+
+from oracle.bench.perplexity import (
+    PerplexityChunkError, PerplexityRequest,
+    aggregate_ppl_from_chunks, score_perplexity,
+)
 
 
 def test_aggregate_ppl_from_single_chunk():
@@ -28,3 +35,25 @@ def test_aggregate_ppl_empty_chunks_raises():
     import pytest
     with pytest.raises(ValueError):
         aggregate_ppl_from_chunks([])
+
+
+def test_score_perplexity_raises_on_missing_teacher_forced_json():
+    req = PerplexityRequest(
+        binary=Path("/bin/false"),
+        model="qwen3.5-0.8b",
+        model_dir=Path("/x"),
+        quant="bf16",
+        dataset="wikitext2",
+        contexts=64,
+        num_chunks=2,
+    )
+    # Stub _load_chunks so we don't hit HF; stub the runner so its output is
+    # missing the [teacher_forced_json] line. The chunk error must propagate.
+    with patch("oracle.bench.perplexity._load_chunks",
+               return_value=["chunk a", "chunk b"]), \
+         patch("oracle.bench.perplexity._run_supersonic_teacher_forced",
+               return_value="[gpu] backend=HIP\n[result] ms_per_step=8\n"):
+        with pytest.raises(PerplexityChunkError) as ei:
+            score_perplexity(req)
+        assert "missing [teacher_forced_json]" in str(ei.value)
+        assert "chunk 0" in str(ei.value)

@@ -16,6 +16,12 @@ from pathlib import Path
 _TF_JSON = re.compile(r"^\[teacher_forced_json\] (.+)$", re.MULTILINE)
 
 
+class PerplexityChunkError(RuntimeError):
+    """Raised when a teacher-forced chunk invocation fails to produce a
+    parseable [teacher_forced_json] line. Surfacing this as a hard error
+    prevents partial sweeps from quietly publishing biased numbers."""
+
+
 def aggregate_ppl_from_chunks(chunks: list[dict]) -> dict:
     if not chunks:
         raise ValueError("no chunks to aggregate")
@@ -44,11 +50,20 @@ def score_perplexity(req: PerplexityRequest) -> dict:
     """
     chunks_per_run = _load_chunks(req.dataset, req.contexts, req.num_chunks)
     chunk_results = []
-    for prompt in chunks_per_run:
+    for chunk_idx, prompt in enumerate(chunks_per_run):
         out = _run_supersonic_teacher_forced(req, prompt)
         m = _TF_JSON.search(out)
         if not m:
-            continue
+            # A missing [teacher_forced_json] line means the runner crashed,
+            # the kernel OOMed, or the model variant doesn't support
+            # --teacher-forced. Failing loudly is the right move: silently
+            # averaging fewer chunks than requested would publish biased
+            # numbers. Surface the failure with an output tail for triage.
+            tail = out[-2000:] if out else "<no output>"
+            raise PerplexityChunkError(
+                f"missing [teacher_forced_json] in chunk {chunk_idx} "
+                f"({req.model}/{req.quant}/{req.dataset}); output tail:\n{tail}"
+            )
         d = json.loads(m.group(1))
         chunk_results.append({"nll": d["total_nll"], "tokens": d["scored_tokens"]})
     agg = aggregate_ppl_from_chunks(chunk_results)

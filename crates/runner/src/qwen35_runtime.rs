@@ -332,7 +332,7 @@ pub(crate) fn run_qwen35_teacher_forced(
     println!(
         "[teacher_forced_json] {}",
         serde_json::to_string(&serde_json::json!({
-            "backend": "hip",
+            "backend": backend_label(engine.backend()),
             "model": model_variant.to_string(),
             "mode": "dense",
             "teacher_forced_scoring": if use_gpu_prefill_scoring { "gpu_prefill_target_nll" } else { "decode_step_logits" },
@@ -352,4 +352,17 @@ pub(crate) fn run_qwen35_teacher_forced(
         }))?
     );
     Ok(())
+}
+
+/// Map a `gpu_hal::Backend` to the lowercase label embedded in the
+/// `[teacher_forced_json]` payload. Downstream tooling keys per-backend
+/// aggregations off this string, so it MUST match the actual runtime backend
+/// rather than the (Llama-original) hardcoded "hip" literal that the early
+/// drafts of run_qwen35_teacher_forced inherited.
+fn backend_label(backend: gpu_hal::Backend) -> &'static str {
+    match backend {
+        gpu_hal::Backend::Hip => "hip",
+        gpu_hal::Backend::Cuda => "cuda",
+        gpu_hal::Backend::Metal => "metal",
+    }
 }

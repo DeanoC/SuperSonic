@@ -1408,7 +1408,7 @@ fn run_phi4_teacher_forced_inner(
     println!(
         "[teacher_forced_json] {}",
         serde_json::to_string(&serde_json::json!({
-            "backend": "hip",
+            "backend": phi4_backend_label(hidden_io.backend()),
             "model": model_variant.to_string(),
             "mode": "dense",
             "teacher_forced_scoring": "decode_step_logits",
@@ -1666,4 +1666,15 @@ fn build_int4_descs(weights: &Phi4Weights) -> Vec<phi4_ffi::Phi4INT4ScaleDesc> {
         });
     }
     descs
+}
+
+/// See `qwen35_runtime::backend_label` — emit the actual backend in
+/// `[teacher_forced_json]` so cross-backend perplexity aggregations
+/// don't mislabel non-HIP runs.
+fn phi4_backend_label(backend: Backend) -> &'static str {
+    match backend {
+        Backend::Hip => "hip",
+        Backend::Cuda => "cuda",
+        Backend::Metal => "metal",
+    }
 }

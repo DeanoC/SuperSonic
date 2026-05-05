@@ -171,7 +171,13 @@ pub(crate) fn run_gemma4(
 
     // Teacher-forced scoring: do not proceed to normal prefill+decode.
     if cli.teacher_forced {
-        return run_gemma4_teacher_forced(cli, model_variant, &mut engine, &prompt_ids);
+        return run_gemma4_teacher_forced(
+            cli,
+            model_variant,
+            entry.backend,
+            &mut engine,
+            &prompt_ids,
+        );
     }
 
     let oracle_output = if cli.validate {
@@ -623,6 +629,7 @@ fn gemma4_target_nll(logits: &[f32], target_token: u32) -> Result<f64> {
 pub(crate) fn run_gemma4_teacher_forced(
     cli: &Cli,
     model_variant: &ModelVariant,
+    backend: Backend,
     engine: &mut Gemma4Runtime,
     prompt_ids: &[u32],
 ) -> Result<()> {
@@ -681,7 +688,7 @@ pub(crate) fn run_gemma4_teacher_forced(
     println!(
         "[teacher_forced_json] {}",
         serde_json::to_string(&serde_json::json!({
-            "backend": "hip",
+            "backend": backend_label(backend),
             "model": model_variant.to_string(),
             "mode": "dense",
             "teacher_forced_scoring": "decode_step_logits",
@@ -701,4 +708,14 @@ pub(crate) fn run_gemma4_teacher_forced(
         }))?
     );
     Ok(())
+}
+
+/// See `qwen35_runtime::backend_label` — emit the actual backend in
+/// `[teacher_forced_json]` rather than a stale literal.
+fn backend_label(backend: Backend) -> &'static str {
+    match backend {
+        Backend::Hip => "hip",
+        Backend::Cuda => "cuda",
+        Backend::Metal => "metal",
+    }
 }
