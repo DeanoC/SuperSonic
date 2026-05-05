@@ -53,6 +53,13 @@
 // fits Qwen 3.6 MoE's hd=256 inside the 48 KiB LDS safety cap.
 #include "qwen36_moe_persistent/batched_prefill_attn_full.cuh"
 
+// Stage B (M9): single-block counting-sort permutation that groups
+// per-token top-K assignments by target expert, producing the
+// (expert_offsets, permuted_token_idx, permuted_kpos, permuted_weight)
+// arrays that M10's grouped MoE GEMM dispatches one INT4 GEMM per
+// expert against.
+#include "qwen36_moe_persistent/batched_prefill_router_permute.cuh"
+
 namespace qwen36_moe {
 
 // -- Layer descriptor (mirror of Rust Qwen36MoeDecodeLayerDesc) ----------

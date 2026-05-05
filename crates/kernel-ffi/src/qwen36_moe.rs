@@ -689,6 +689,42 @@ extern "C" {
         value: *const c_void,
         out: *mut c_void,
     ) -> c_int;
+
+    /// Stage B (M9) router permutation kernel. Groups per-token top-K expert
+    /// assignments by target expert (counting-sort, single block).
+    ///
+    /// Inputs (GPU buffers):
+    /// - `topk_idx`     : `[n_tokens, top_k]` i32 — per-token expert ids in
+    ///                     `[0, num_experts)`.
+    /// - `topk_weight`  : `[n_tokens, top_k]` BF16 — routing weights.
+    ///
+    /// Outputs (caller-allocated GPU buffers):
+    /// - `expert_offsets`     : `[num_experts + 1]` i32 — prefix sum.
+    /// - `permuted_token_idx` : `[n_tokens * top_k]` i32 — sorted token ids.
+    /// - `permuted_kpos`      : `[n_tokens * top_k]` i32 — top-K slot ids.
+    /// - `permuted_weight`    : `[n_tokens * top_k]` BF16 — routing weights.
+    ///
+    /// Within an expert's segment the order is unstable (atomicAdd cursor);
+    /// callers comparing against a CPU reference must compare per-segment as
+    /// a multiset.
+    ///
+    /// Status codes (non-zero = failure):
+    ///   140 invalid args (n_tokens/top_k/num_experts <= 0)
+    ///   141 num_experts > 256       142 top_k > 16
+    ///   143 n_tokens * top_k > 16384
+    ///   254 launch error            255 sync error
+    pub fn qwen36_moe_hip_batched_prefill_router_permute_launch(
+        device_ordinal: usize,
+        n_tokens: c_int,
+        top_k: c_int,
+        num_experts: c_int,
+        topk_idx: *const c_void,
+        topk_weight: *const c_void,
+        expert_offsets: *mut c_void,
+        permuted_token_idx: *mut c_void,
+        permuted_kpos: *mut c_void,
+        permuted_weight: *mut c_void,
+    ) -> c_int;
 }
 
 /// Safe wrapper over the stub launch. The engine pre-allocates `sync_buf`
@@ -2059,6 +2095,91 @@ pub fn batched_prefill_attn_full_launch(
         return Err(GpuError::backend(
             backend,
             format!("qwen36_moe batched_prefill_attn_full_launch failed with status {status}"),
+        ));
+    }
+    Ok(())
+}
+
+/// Stage B (M9) router permutation safe wrapper.
+///
+/// Counting-sort that groups the chunk's top-K expert assignments by target
+/// expert. Output buffers must be pre-allocated by the caller:
+/// - `expert_offsets`     : i32 `[num_experts + 1]`
+/// - `permuted_token_idx` : i32 `[n_tokens * top_k]`
+/// - `permuted_kpos`      : i32 `[n_tokens * top_k]`
+/// - `permuted_weight`    : BF16 `[n_tokens * top_k]`
+///
+/// Within an expert's segment, order is unstable (the kernel uses
+/// atomicAdd as the in-segment cursor). Tests must compare per-expert as
+/// a multiset of (token_idx, kpos, weight) triples — the downstream
+/// grouped GEMM is permutation-invariant inside a segment.
+#[allow(clippy::too_many_arguments)]
+pub fn batched_prefill_router_permute_launch(
+    ordinal: usize,
+    n_tokens: usize,
+    top_k: usize,
+    num_experts: usize,
+    topk_idx: &GpuBuffer,
+    topk_weight: &GpuBuffer,
+    expert_offsets: &mut GpuBuffer,
+    permuted_token_idx: &mut GpuBuffer,
+    permuted_kpos: &mut GpuBuffer,
+    permuted_weight: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    let backend = topk_idx.backend();
+    if backend != Backend::Hip && backend != Backend::Cuda {
+        return Err(GpuError::backend(
+            backend,
+            "qwen36_moe::batched_prefill_router_permute_launch requires HIP or CUDA backend"
+                .to_string(),
+        ));
+    }
+    let status: c_int = match backend {
+        Backend::Hip | Backend::Cuda => {
+            #[cfg(any(supersonic_backend_hip, supersonic_backend_cuda))]
+            unsafe {
+                qwen36_moe_hip_batched_prefill_router_permute_launch(
+                    ordinal,
+                    n_tokens as c_int,
+                    top_k as c_int,
+                    num_experts as c_int,
+                    topk_idx.as_ptr(),
+                    topk_weight.as_ptr(),
+                    expert_offsets.as_mut_ptr(),
+                    permuted_token_idx.as_mut_ptr(),
+                    permuted_kpos.as_mut_ptr(),
+                    permuted_weight.as_mut_ptr(),
+                )
+            }
+            #[cfg(not(any(supersonic_backend_hip, supersonic_backend_cuda)))]
+            {
+                let _ = (
+                    ordinal,
+                    n_tokens,
+                    top_k,
+                    num_experts,
+                    topk_idx,
+                    topk_weight,
+                    expert_offsets,
+                    permuted_token_idx,
+                    permuted_kpos,
+                    permuted_weight,
+                );
+                return Err(GpuError::backend(
+                    backend,
+                    "qwen36_moe::batched_prefill_router_permute_launch: backend not compiled"
+                        .to_string(),
+                ));
+            }
+        }
+        _ => unreachable!(),
+    };
+    if status != 0 {
+        return Err(GpuError::backend(
+            backend,
+            format!(
+                "qwen36_moe batched_prefill_router_permute_launch failed with status {status}"
+            ),
         ));
     }
     Ok(())

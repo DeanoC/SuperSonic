@@ -1380,3 +1380,62 @@ extern "C" int qwen36_moe_hip_batched_prefill_attn_full_launch(
     if (sync_err != hipSuccess) return 255;
     return 0;
 }
+
+// =============================================================================
+// Stage B (M9): router permutation kernel launcher.
+//
+// Groups per-token top-K expert assignments by target expert via a
+// single-block counting sort. Inputs are GPU-resident `topk_idx` (i32)
+// and `topk_weight` (BF16); outputs are `expert_offsets` (i32),
+// `permuted_token_idx` (i32), `permuted_kpos` (i32), and
+// `permuted_weight` (BF16). All output buffers must be pre-allocated by
+// the caller — the kernel writes them in place.
+//
+// Status codes:
+//   140 invalid args (n_tokens / top_k / num_experts <= 0)
+//   141 num_experts > 256                  (LDS pinned at MAX_EXPERTS=256)
+//   142 top_k > 16                         (sanity bound)
+//   143 n_tokens * top_k > 16384           (would exceed reasonable scratch)
+//   254 launch error                       255 sync error
+// =============================================================================
+
+extern "C" int qwen36_moe_hip_batched_prefill_router_permute_launch(
+    size_t      device_ordinal,
+    int         n_tokens,
+    int         top_k,
+    int         num_experts,
+    const void* topk_idx,
+    const void* topk_weight,
+    void*       expert_offsets,
+    void*       permuted_token_idx,
+    void*       permuted_kpos,
+    void*       permuted_weight
+) {
+    if (n_tokens <= 0 || top_k <= 0 || num_experts <= 0) return 140;
+    if (num_experts > 256) return 141;
+    if (top_k > 16) return 142;
+    if (static_cast<int64_t>(n_tokens) * static_cast<int64_t>(top_k) > 16384) return 143;
+
+    ScopedHipDevice scoped(static_cast<int>(device_ordinal));
+
+    constexpr int BLOCK = 256;
+    dim3 grid(1u, 1u, 1u);
+    dim3 block(static_cast<unsigned int>(BLOCK), 1u, 1u);
+
+    hipLaunchKernelGGL(
+        (qwen36_moe::qwen36_moe_batched_prefill_router_permute_kernel<256>),
+        grid, block, 0, 0,
+        n_tokens, top_k, num_experts,
+        static_cast<const int*>(topk_idx),
+        static_cast<const __hip_bfloat16*>(topk_weight),
+        static_cast<int*>(expert_offsets),
+        static_cast<int*>(permuted_token_idx),
+        static_cast<int*>(permuted_kpos),
+        static_cast<__hip_bfloat16*>(permuted_weight));
+
+    hipError_t launch_err = hipGetLastError();
+    hipError_t sync_err   = hipDeviceSynchronize();
+    if (launch_err != hipSuccess) return 254;
+    if (sync_err != hipSuccess) return 255;
+    return 0;
+}
