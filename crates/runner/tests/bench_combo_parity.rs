@@ -29,8 +29,10 @@ fn bench_combo_table_mentions_every_runner_supported_pair() {
         ("qwen3.5-4b", "fp8r"), ("qwen3.5-4b", "kv-fp8"),
         ("qwen3.5-9b", "bf16"), ("qwen3.5-9b", "int4"),
         ("qwen3.5-9b", "fp8r"), ("qwen3.5-9b", "kv-fp8"),
-        ("gemma4-e2b", "bf16"), ("gemma4-e2b", "int4"), ("gemma4-e2b", "kv-fp8"),
-        ("gemma4-e4b", "bf16"), ("gemma4-e4b", "int4"), ("gemma4-e4b", "kv-fp8"),
+        ("gemma4-e2b", "bf16"), ("gemma4-e2b", "int4"),
+        ("gemma4-e2b", "fp8r"), ("gemma4-e2b", "kv-fp8"),
+        ("gemma4-e4b", "bf16"), ("gemma4-e4b", "int4"),
+        ("gemma4-e4b", "fp8r"), ("gemma4-e4b", "kv-fp8"),
         ("phi4-mini", "bf16"), ("phi4-mini", "int4"),
         ("phi4-mini", "fp8r"), ("phi4-mini", "kv-fp8"),
         ("qwen3.6-35b-a3b", "int4"), ("qwen3.6-35b-a3b", "kv-fp8"),
@@ -40,6 +42,8 @@ fn bench_combo_table_mentions_every_runner_supported_pair() {
         let needle = format!("model: \"{model}\", quant: \"{quant}\"");
         assert!(bench_text.contains(&needle),
                 "bench/src/matrix.rs is missing combo: {model}/{quant}\n\
-                 If runner support changed, add or remove the row to match.");
+                 If runner support changed: add the row to crates/bench/src/matrix.rs::SUPPORTED_COMBOS, \
+                 and if support was REMOVED upstream also remove the corresponding entry from \
+                 the expected_pairs list in this file.");
     }
 }

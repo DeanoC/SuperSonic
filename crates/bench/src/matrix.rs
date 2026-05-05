@@ -55,19 +55,25 @@ pub static SUPPORTED_COMBOS: &[ComboDescriptor] = &[
     ComboDescriptor { model: "qwen3.5-9b", quant: "int4", arch: BenchArch::Gfx1100, min_vram_gib: 6.7 },
     ComboDescriptor { model: "qwen3.5-9b", quant: "fp8r", arch: BenchArch::Gfx1100, min_vram_gib: 10.8 },
     ComboDescriptor { model: "qwen3.5-9b", quant: "kv-fp8", arch: BenchArch::Gfx1100, min_vram_gib: 18.0 },
-    // Gemma 4 — no fp8r per feature-compatibility.md
+    // Gemma 4 — fp8r and kv-fp8 are wired into the single-batch persistent
+    // decode kernel only (require --batch-size=1, cannot combine with --int4).
+    // See docs/supported-matrix.md footnote 2.
     ComboDescriptor { model: "gemma4-e2b", quant: "bf16", arch: BenchArch::Gfx1100, min_vram_gib: 11.0 },
     ComboDescriptor { model: "gemma4-e2b", quant: "int4", arch: BenchArch::Gfx1100, min_vram_gib: 4.1 },
+    ComboDescriptor { model: "gemma4-e2b", quant: "fp8r", arch: BenchArch::Gfx1100, min_vram_gib: 6.6 },
     ComboDescriptor { model: "gemma4-e2b", quant: "kv-fp8", arch: BenchArch::Gfx1100, min_vram_gib: 11.0 },
     ComboDescriptor { model: "gemma4-e4b", quant: "bf16", arch: BenchArch::Gfx1100, min_vram_gib: 10.0 },
     ComboDescriptor { model: "gemma4-e4b", quant: "int4", arch: BenchArch::Gfx1100, min_vram_gib: 3.7 },
+    ComboDescriptor { model: "gemma4-e4b", quant: "fp8r", arch: BenchArch::Gfx1100, min_vram_gib: 6.0 },
     ComboDescriptor { model: "gemma4-e4b", quant: "kv-fp8", arch: BenchArch::Gfx1100, min_vram_gib: 10.0 },
     // Phi-4-mini — full quad
     ComboDescriptor { model: "phi4-mini", quant: "bf16", arch: BenchArch::Gfx1100, min_vram_gib: 8.0 },
     ComboDescriptor { model: "phi4-mini", quant: "int4", arch: BenchArch::Gfx1100, min_vram_gib: 3.0 },
     ComboDescriptor { model: "phi4-mini", quant: "fp8r", arch: BenchArch::Gfx1100, min_vram_gib: 4.8 },
     ComboDescriptor { model: "phi4-mini", quant: "kv-fp8", arch: BenchArch::Gfx1100, min_vram_gib: 8.0 },
-    // Qwen3.6-MoE — INT4 + KV-FP8 only on gfx1100 (24 GiB cap)
+    // Qwen3.6-MoE — INT4 + KV-FP8 only on gfx1100 (24 GiB cap).
+    // KV-FP8 lane requires --int4 simultaneously (only quant lane shipped).
+    // See docs/feature-compatibility.md footnote 4.
     ComboDescriptor { model: "qwen3.6-35b-a3b", quant: "int4", arch: BenchArch::Gfx1100, min_vram_gib: 21.0 },
     ComboDescriptor { model: "qwen3.6-35b-a3b", quant: "kv-fp8", arch: BenchArch::Gfx1100, min_vram_gib: 21.0 },
 ];
