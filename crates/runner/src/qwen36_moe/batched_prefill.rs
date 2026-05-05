@@ -286,7 +286,8 @@ pub(crate) fn run_batched_prefill_stub(
     // Refuse the batched path on any non-dense or FP8-KV configuration —
     // those carry unique invariants not yet supported here. Fall back to
     // the per-token path for the entire prefill in that case.
-    let supports_batched = supports_batched_path(layers, keep_mask);
+    let supports_batched =
+        supports_batched_path(layers, keep_mask, moe_expert_residency.is_some());
     if !supports_batched {
         return run_pertoken_chunked(
             ordinal,
@@ -386,11 +387,32 @@ pub(crate) fn run_batched_prefill_stub(
     Ok(timings)
 }
 
-/// Whether the layer stack supports the batched attn path.
-/// Currently disqualifies FP8 KV (kv_scale_k Some) and SpecPrefill mode
-/// (keep_mask Some). Both are deferrable to follow-ups.
-fn supports_batched_path(layers: &[LayerBuffers], keep_mask: Option<&Vec<bool>>) -> bool {
+/// Whether the layer stack supports the batched attn + grouped FFN path.
+///
+/// Refuses (falls through to per-token):
+/// - **SpecPrefill / sparse-prefill mode** (`keep_mask.is_some()`) — the
+///   batched path doesn't honor the per-token kept-position mapping.
+/// - **FP8 KV cache** (`kv_scale_k.is_some()` on any layer) — the batched
+///   KV cache write path is BF16-only; FP8 sidecar quantize-on-write isn't
+///   wired here.
+/// - **FP8-runtime weights** (`int4.group_size < 0` on any layer) — the
+///   negative-group-size sentinel signals FP8 weight sidecars (see
+///   `kernels/qwen36_moe_persistent/ffn_phase.cuh:109`); the new grouped
+///   FFN GEMM only handles INT4 with positive group_size.
+/// - **Sparse-VMM MoE residency** (caller-provided `moe_expert_residency`
+///   is `Some`) — sparse mode only RESERVES expert weight tensors upfront;
+///   per-step `handle_moe_expert_prefetch` must run via `run_chain_step`
+///   before FFN compute to page in any non-resident routed experts. The
+///   batched FFN bypasses that hook, so it would read non-resident memory.
+fn supports_batched_path(
+    layers: &[LayerBuffers],
+    keep_mask: Option<&Vec<bool>>,
+    moe_expert_residency_active: bool,
+) -> bool {
     if keep_mask.is_some() {
+        return false;
+    }
+    if moe_expert_residency_active {
         return false;
     }
     for l in layers {
@@ -399,6 +421,13 @@ fn supports_batched_path(layers: &[LayerBuffers], keep_mask: Option<&Vec<bool>>)
         } = &l.attn
         {
             if c.kv_scale_k.is_some() || c.kv_scale_v.is_some() {
+                return false;
+            }
+        }
+        if let Some(int4) = &l.ffn.int4 {
+            // Negative group_size = FP8 weight sidecar mode (see
+            // kernels/qwen36_moe_persistent/ffn_phase.cuh:109).
+            if int4.group_size < 0 {
                 return false;
             }
         }
