@@ -53,5 +53,9 @@ fn run_one_combo_records_error_on_missing_binary() {
     let policy = RunPolicy { measurement_runs: 1, cooldown_seconds: 0 };
     let cell = run_one_combo(&invocation, &policy).unwrap();
     use supersonic_bench::runs::PerfStatus;
-    matches!(cell.status, PerfStatus::Error { .. });
+    assert!(
+        matches!(cell.status, PerfStatus::Error { .. }),
+        "expected Error status on missing binary, got {:?}",
+        cell.status
+    );
 }
