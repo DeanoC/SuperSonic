@@ -5,6 +5,13 @@
 //! `crates/runner/tests/bench_combo_parity.rs` enforces this — if you change
 //! the runner registry, you MUST update this table or the test fails.
 
+use crate::perf::{run_one_combo, ComboInvocation, RunPolicy};
+use crate::runs::{MetaJson, RunDir, SCHEMA_VERSION};
+use anyhow::Result;
+use chrono::Utc;
+use std::path::PathBuf;
+use std::process::Command;
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum BenchArch { Gfx1100, Gfx1150, Sm86, AppleM4 }
 
@@ -80,4 +87,108 @@ pub static SUPPORTED_COMBOS: &[ComboDescriptor] = &[
 
 pub fn combos_for_arch(arch: BenchArch) -> Vec<&'static ComboDescriptor> {
     SUPPORTED_COMBOS.iter().filter(|c| c.arch == arch).collect()
+}
+
+pub struct MatrixConfig {
+    pub arch: BenchArch,
+    pub models: Vec<String>,
+    pub quants: Vec<String>,
+    pub binary: PathBuf,
+    pub model_dir_resolver: Box<dyn Fn(&str) -> PathBuf>,
+    pub prompt: String,
+    pub max_new_tokens: u32,
+    pub warmup_tokens: u32,
+    pub measurement_runs: u32,
+    pub cooldown_seconds: u32,
+    pub git_sha: String,
+    pub runner_version: String,
+}
+
+pub fn run_matrix(cfg: &MatrixConfig, rd: &RunDir) -> Result<()> {
+    rd.create()?;
+
+    let meta = MetaJson {
+        schema_version: SCHEMA_VERSION,
+        run_id: rd.root().file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string(),
+        timestamp_utc: Utc::now().to_rfc3339(),
+        git_sha: cfg.git_sha.clone(),
+        hostname: hostname_or_unknown(),
+        arch: format!("{:?}", cfg.arch).to_lowercase(),
+        rocminfo: capture_cmd("rocminfo"),
+        rocm_smi_u: capture_cmd_args("rocm-smi", &["-u"]),
+        gpu_temp_c_pre: read_gpu_temp(),
+        gpu_temp_c_post: None,
+        runner_version: cfg.runner_version.clone(),
+    };
+    rd.write_meta(&meta)?;
+
+    for model in &cfg.models {
+        for quant in &cfg.quants {
+            let invocation = ComboInvocation {
+                binary: cfg.binary.clone(),
+                model: model.clone(),
+                model_dir: (cfg.model_dir_resolver)(model),
+                quant: quant.clone(),
+                prompt: cfg.prompt.clone(),
+                max_new_tokens: cfg.max_new_tokens,
+                warmup_tokens: cfg.warmup_tokens,
+            };
+            let policy = RunPolicy {
+                measurement_runs: cfg.measurement_runs,
+                cooldown_seconds: cfg.cooldown_seconds,
+            };
+            let cell = run_one_combo(&invocation, &policy)?;
+            rd.write_perf(&cell)?;
+        }
+    }
+
+    let mut meta_post = MetaJson {
+        schema_version: SCHEMA_VERSION,
+        run_id: rd.root().file_name().and_then(|n| n.to_str()).unwrap_or("unknown").to_string(),
+        timestamp_utc: meta.timestamp_utc.clone(),
+        git_sha: meta.git_sha.clone(),
+        hostname: meta.hostname.clone(),
+        arch: meta.arch.clone(),
+        rocminfo: meta.rocminfo.clone(),
+        rocm_smi_u: meta.rocm_smi_u.clone(),
+        gpu_temp_c_pre: meta.gpu_temp_c_pre,
+        gpu_temp_c_post: read_gpu_temp(),
+        runner_version: meta.runner_version.clone(),
+    };
+    meta_post.gpu_temp_c_post = read_gpu_temp();
+    rd.write_meta(&meta_post)?;
+    Ok(())
+}
+
+fn hostname_or_unknown() -> String {
+    capture_cmd("hostname").trim().to_string()
+}
+
+fn capture_cmd(name: &str) -> String {
+    capture_cmd_args(name, &[])
+}
+
+fn capture_cmd_args(name: &str, args: &[&str]) -> String {
+    Command::new(name)
+        .args(args)
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_else(|_| String::new())
+}
+
+fn read_gpu_temp() -> Option<f64> {
+    let out = capture_cmd_args("rocm-smi", &["-t", "--json"]);
+    // Best-effort: parse `"Temperature (Sensor edge) (C)": "XX.X"` or similar.
+    // If parse fails, return None — the field is optional.
+    serde_json::from_str::<serde_json::Value>(&out)
+        .ok()
+        .and_then(|v| {
+            v.as_object()?
+                .values()
+                .next()?
+                .as_object()?
+                .iter()
+                .find(|(k, _)| k.contains("Temperature"))
+                .and_then(|(_, v)| v.as_str()?.parse().ok())
+        })
 }

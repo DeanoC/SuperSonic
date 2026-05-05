@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::io;
 
 pub const SCHEMA_VERSION: u32 = 1;
 
@@ -64,4 +65,40 @@ impl RunDir {
     pub fn external_path(&self, engine: &str, model: &str, quant: &str) -> PathBuf {
         self.root.join("external").join(engine).join(format!("{model}_{quant}.json"))
     }
+
+    /// Create the directory tree (root, perf/, quality/, external/).
+    pub fn create(&self) -> io::Result<()> {
+        std::fs::create_dir_all(self.root.join("perf"))?;
+        std::fs::create_dir_all(self.root.join("quality"))?;
+        std::fs::create_dir_all(self.root.join("external"))?;
+        Ok(())
+    }
+
+    pub fn write_meta(&self, meta: &MetaJson) -> io::Result<()> {
+        let s = serde_json::to_string_pretty(meta)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        std::fs::write(self.meta_path(), s)
+    }
+
+    pub fn write_perf(&self, cell: &PerfCellJson) -> io::Result<()> {
+        let path = self.perf_path(&cell.model, &cell.quant);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let s = serde_json::to_string_pretty(cell)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        std::fs::write(path, s)
+    }
+}
+
+/// Compute a unique run-dir path under `parent`, dated today, with `-N` suffix on collision.
+pub fn allocate_run_dir(parent: &Path, git_sha: &str, today: &str) -> PathBuf {
+    let base = format!("{today}-{git_sha}");
+    let mut candidate = parent.join(&base);
+    let mut n = 2;
+    while candidate.exists() {
+        candidate = parent.join(format!("{base}-{n}"));
+        n += 1;
+    }
+    candidate
 }
