@@ -1283,3 +1283,100 @@ extern "C" int qwen36_moe_hip_persistent_decode_launch(
     if (sync_err != hipSuccess) return 255;
     return 0;
 }
+
+// =============================================================================
+// Stage A (M3): batched-Q full-attention prefill kernel launcher.
+//
+// Standalone attention kernel — pre-projection (Q/K/V matmul + RoPE) and
+// KV cache write are caller responsibilities (see batched_prefill_kv_write
+// in M5/M6). Output is the pre-o_proj attention result `[B, H, q_len, D]`
+// in F32. dtype: 2 = bf16 (only path supported initially since qwen3.6-moe
+// runs INT4 weights → BF16 activations).
+//
+// Wave64 portability: the kernel hardcodes block.x = 32 and assumes
+// warpSize == 32 in stride math. Refuse the launch when the device's
+// warpSize differs (return code 137; mirrors full_attention_bridge.cpp's
+// launch_tiled guard from PR #219).
+// =============================================================================
+
+extern "C" int qwen36_moe_hip_batched_prefill_attn_full_launch(
+    int           dtype,
+    size_t        device_ordinal,
+    int           batch_size,
+    int           q_heads,
+    int           kv_heads,
+    int           q_len,
+    int           kv_len,
+    int           head_dim,
+    float         scale,
+    int           seqlen_offset,
+    const void*   query,
+    const void*   key,
+    const void*   value,
+    void*         out
+) {
+    if (dtype != 2) return 130;
+    if (q_heads <= 0 || kv_heads <= 0) return 131;
+    if (q_heads % kv_heads != 0) return 132;
+    if (head_dim <= 0 || head_dim > 8 * 32) return 133;
+    if (q_len <= 0 || kv_len <= 0) return 134;
+    if (seqlen_offset < 0 || seqlen_offset + q_len > kv_len) return 135;
+    if (batch_size <= 0) return 136;
+
+    ScopedHipDevice scoped(static_cast<int>(device_ordinal));
+
+    hipDeviceProp_t props;
+    if (hipGetDeviceProperties(&props, static_cast<int>(device_ordinal)) != hipSuccess) {
+        return 250;
+    }
+    if (props.warpSize != 32) {
+        // Fall through to the per-token path on wave64; this kernel
+        // assumes warpSize == 32 in stride math.
+        return 137;
+    }
+
+    constexpr int BM = 4;
+
+    // BK chosen so 2 * BK * head_dim * sizeof(bf16) stays under 48 KiB.
+    // qwen3.6-moe runs hd=256 → BK=32 (32 KiB). Keep the dispatch open
+    // for smaller head_dim values to support hypothetical future shapes.
+    int bk;
+    if      (head_dim <=  64) bk = 128;
+    else if (head_dim <= 128) bk = 64;
+    else                      bk = 32;
+
+    const size_t lds_bytes =
+        static_cast<size_t>(2) * static_cast<size_t>(bk) *
+        static_cast<size_t>(head_dim) * sizeof(__hip_bfloat16);
+    if (lds_bytes > 48 * 1024) return 138;
+
+    const int num_kv_groups = q_heads / kv_heads;
+    const int grid_x = (q_len + BM - 1) / BM;
+    dim3 grid(static_cast<unsigned int>(grid_x),
+              static_cast<unsigned int>(q_heads),
+              static_cast<unsigned int>(batch_size));
+    dim3 block(32u, static_cast<unsigned int>(BM), 1u);
+
+    auto launch = [&](auto bk_val) {
+        constexpr int BK_C = decltype(bk_val)::value;
+        hipLaunchKernelGGL(
+            (qwen36_moe::qwen36_moe_batched_prefill_attn_full_kernel<__hip_bfloat16, BM, BK_C>),
+            grid, block, lds_bytes, 0,
+            batch_size, q_heads, kv_heads, q_len, kv_len, head_dim,
+            num_kv_groups, scale, seqlen_offset,
+            static_cast<const __hip_bfloat16*>(query),
+            static_cast<const __hip_bfloat16*>(key),
+            static_cast<const __hip_bfloat16*>(value),
+            static_cast<float*>(out));
+    };
+
+    if      (bk == 128) launch(std::integral_constant<int, 128>{});
+    else if (bk ==  64) launch(std::integral_constant<int,  64>{});
+    else                launch(std::integral_constant<int,  32>{});
+
+    hipError_t launch_err = hipGetLastError();
+    hipError_t sync_err   = hipDeviceSynchronize();
+    if (launch_err != hipSuccess) return 254;
+    if (sync_err != hipSuccess) return 255;
+    return 0;
+}

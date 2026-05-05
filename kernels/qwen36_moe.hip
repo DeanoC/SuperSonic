@@ -47,6 +47,12 @@
 // `qwen36_moe_persistent/ffn_phase.cuh`.
 #include "qwen36_moe_persistent/ffn_phase.cuh"
 
+// Stage A (M3): standalone batched-Q full-attention prefill kernel,
+// modeled on the Qwen 3.5 K-tiled prefill kernel (PR #219). Templated;
+// the bridge instantiates the (T=hip_bfloat16, BM=4, BK=32) flavor that
+// fits Qwen 3.6 MoE's hd=256 inside the 48 KiB LDS safety cap.
+#include "qwen36_moe_persistent/batched_prefill_attn_full.cuh"
+
 namespace qwen36_moe {
 
 // -- Layer descriptor (mirror of Rust Qwen36MoeDecodeLayerDesc) ----------

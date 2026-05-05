@@ -651,6 +651,44 @@ extern "C" {
         h_norm_out: *mut c_void,
         fused_out: *mut c_void,
     ) -> c_int;
+
+    /// Stage A (M3) batched-Q full-attention prefill kernel. Standalone
+    /// attention math: Q/K/V are pre-projected and pre-RoPE'd by the
+    /// caller, the K/V cache is pre-written. Output is pre-o_proj
+    /// `[batch, q_heads, q_len, head_dim]` in F32.
+    ///
+    /// Shapes (BF16 unless noted):
+    /// - `query`: `[batch, q_heads, q_len, head_dim]`
+    /// - `key`:   `[batch, kv_heads, kv_len, head_dim]`
+    /// - `value`: `[batch, kv_heads, kv_len, head_dim]`
+    /// - `out` (F32): `[batch, q_heads, q_len, head_dim]`
+    ///
+    /// `seqlen_offset = past_len`; query at chunk position `qr` attends to
+    /// cache positions `[0, past_len + qr]` (causal, inclusive). `kv_len`
+    /// is the total cache length the kernel may read (typically
+    /// `past_len + q_len`).
+    ///
+    /// Status codes (non-zero = failure):
+    ///   130 dtype != bf16    131 invalid heads        132 q_heads % kv_heads
+    ///   133 head_dim out of range  134 q_len/kv_len   135 seqlen_offset / overflow
+    ///   136 batch_size       137 wave64 (unsupported) 138 LDS overflow
+    ///   254 launch error     255 sync error
+    pub fn qwen36_moe_hip_batched_prefill_attn_full_launch(
+        dtype: c_int,
+        device_ordinal: usize,
+        batch_size: c_int,
+        q_heads: c_int,
+        kv_heads: c_int,
+        q_len: c_int,
+        kv_len: c_int,
+        head_dim: c_int,
+        scale: f32,
+        seqlen_offset: c_int,
+        query: *const c_void,
+        key: *const c_void,
+        value: *const c_void,
+        out: *mut c_void,
+    ) -> c_int;
 }
 
 /// Safe wrapper over the stub launch. The engine pre-allocates `sync_buf`
@@ -1945,6 +1983,82 @@ pub fn mtp_pre_fusion_launch(
         return Err(GpuError::backend(
             backend,
             format!("qwen36_moe mtp_pre_fusion_launch failed with status {status}"),
+        ));
+    }
+    Ok(())
+}
+
+/// Stage A (M3) batched-Q full-attention prefill safe wrapper.
+///
+/// Runs FlashAttention-style attention with K-tile share across `q_len`
+/// queries against a pre-written K/V cache. The caller is responsible for
+/// pre-projecting Q/K/V (INT4 weights → BF16 acts), applying RoPE, and
+/// writing the chunk's new K/V values into the cache slots `[past_len,
+/// past_len + q_len)` BEFORE calling this. Output is the pre-o_proj
+/// attention result `[batch, q_heads, q_len, head_dim]` in F32.
+///
+/// `seqlen_offset` = `past_len`. Causal mask: query at chunk position `qr`
+/// attends to cache positions `[0, past_len + qr]` (inclusive).
+#[allow(clippy::too_many_arguments)]
+pub fn batched_prefill_attn_full_launch(
+    ordinal: usize,
+    batch_size: usize,
+    q_heads: usize,
+    kv_heads: usize,
+    q_len: usize,
+    kv_len: usize,
+    head_dim: usize,
+    scale: f32,
+    seqlen_offset: usize,
+    query: &GpuBuffer,
+    key: &GpuBuffer,
+    value: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    let backend = query.backend();
+    if backend != Backend::Hip && backend != Backend::Cuda {
+        return Err(GpuError::backend(
+            backend,
+            "qwen36_moe::batched_prefill_attn_full_launch requires HIP or CUDA backend".to_string(),
+        ));
+    }
+    let status: c_int = match backend {
+        Backend::Hip | Backend::Cuda => {
+            #[cfg(any(supersonic_backend_hip, supersonic_backend_cuda))]
+            unsafe {
+                qwen36_moe_hip_batched_prefill_attn_full_launch(
+                    2, // bf16
+                    ordinal,
+                    batch_size as c_int,
+                    q_heads as c_int,
+                    kv_heads as c_int,
+                    q_len as c_int,
+                    kv_len as c_int,
+                    head_dim as c_int,
+                    scale,
+                    seqlen_offset as c_int,
+                    query.as_ptr(),
+                    key.as_ptr(),
+                    value.as_ptr(),
+                    out.as_mut_ptr(),
+                )
+            }
+            #[cfg(not(any(supersonic_backend_hip, supersonic_backend_cuda)))]
+            {
+                let _ = (ordinal, batch_size, q_heads, kv_heads, q_len, kv_len,
+                    head_dim, scale, seqlen_offset, query, key, value, out);
+                return Err(GpuError::backend(
+                    backend,
+                    "qwen36_moe::batched_prefill_attn_full_launch: backend not compiled".to_string(),
+                ));
+            }
+        }
+        _ => unreachable!(),
+    };
+    if status != 0 {
+        return Err(GpuError::backend(
+            backend,
+            format!("qwen36_moe batched_prefill_attn_full_launch failed with status {status}"),
         ));
     }
     Ok(())
