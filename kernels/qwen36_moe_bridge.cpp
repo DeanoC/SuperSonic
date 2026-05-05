@@ -1283,3 +1283,359 @@ extern "C" int qwen36_moe_hip_persistent_decode_launch(
     if (sync_err != hipSuccess) return 255;
     return 0;
 }
+
+// =============================================================================
+// Stage A (M3): batched-Q full-attention prefill kernel launcher.
+//
+// Standalone attention kernel — pre-projection (Q/K/V matmul + RoPE) and
+// KV cache write are caller responsibilities (see batched_prefill_kv_write
+// in M5/M6). Output is the pre-o_proj attention result `[B, H, q_len, D]`
+// in F32. dtype: 2 = bf16 (only path supported initially since qwen3.6-moe
+// runs INT4 weights → BF16 activations).
+//
+// Wave64 portability: the kernel hardcodes block.x = 32 and assumes
+// warpSize == 32 in stride math. Refuse the launch when the device's
+// warpSize differs (return code 137; mirrors full_attention_bridge.cpp's
+// launch_tiled guard from PR #219).
+// =============================================================================
+
+extern "C" int qwen36_moe_hip_batched_prefill_attn_full_launch(
+    int           dtype,
+    size_t        device_ordinal,
+    int           batch_size,
+    int           q_heads,
+    int           kv_heads,
+    int           q_len,
+    int           kv_len,
+    int           head_dim,
+    float         scale,
+    int           seqlen_offset,
+    const void*   query,
+    const void*   key,
+    const void*   value,
+    void*         out
+) {
+    if (dtype != 2) return 130;
+    if (q_heads <= 0 || kv_heads <= 0) return 131;
+    if (q_heads % kv_heads != 0) return 132;
+    if (head_dim <= 0 || head_dim > 8 * 32) return 133;
+    if (q_len <= 0 || kv_len <= 0) return 134;
+    if (seqlen_offset < 0 || seqlen_offset + q_len > kv_len) return 135;
+    if (batch_size <= 0) return 136;
+
+    ScopedHipDevice scoped(static_cast<int>(device_ordinal));
+
+    hipDeviceProp_t props;
+    if (hipGetDeviceProperties(&props, static_cast<int>(device_ordinal)) != hipSuccess) {
+        return 250;
+    }
+    if (props.warpSize != 32) {
+        // Fall through to the per-token path on wave64; this kernel
+        // assumes warpSize == 32 in stride math.
+        return 137;
+    }
+
+    constexpr int BM = 4;
+
+    // BK chosen so 2 * BK * head_dim * sizeof(bf16) stays under 48 KiB.
+    // qwen3.6-moe runs hd=256 → BK=32 (32 KiB). Keep the dispatch open
+    // for smaller head_dim values to support hypothetical future shapes.
+    int bk;
+    if      (head_dim <=  64) bk = 128;
+    else if (head_dim <= 128) bk = 64;
+    else                      bk = 32;
+
+    const size_t lds_bytes =
+        static_cast<size_t>(2) * static_cast<size_t>(bk) *
+        static_cast<size_t>(head_dim) * sizeof(__hip_bfloat16);
+    if (lds_bytes > 48 * 1024) return 138;
+
+    const int num_kv_groups = q_heads / kv_heads;
+    const int grid_x = (q_len + BM - 1) / BM;
+    dim3 grid(static_cast<unsigned int>(grid_x),
+              static_cast<unsigned int>(q_heads),
+              static_cast<unsigned int>(batch_size));
+    dim3 block(32u, static_cast<unsigned int>(BM), 1u);
+
+    auto launch = [&](auto bk_val) {
+        constexpr int BK_C = decltype(bk_val)::value;
+        hipLaunchKernelGGL(
+            (qwen36_moe::qwen36_moe_batched_prefill_attn_full_kernel<__hip_bfloat16, BM, BK_C>),
+            grid, block, lds_bytes, 0,
+            batch_size, q_heads, kv_heads, q_len, kv_len, head_dim,
+            num_kv_groups, scale, seqlen_offset,
+            static_cast<const __hip_bfloat16*>(query),
+            static_cast<const __hip_bfloat16*>(key),
+            static_cast<const __hip_bfloat16*>(value),
+            static_cast<float*>(out));
+    };
+
+    if      (bk == 128) launch(std::integral_constant<int, 128>{});
+    else if (bk ==  64) launch(std::integral_constant<int,  64>{});
+    else                launch(std::integral_constant<int,  32>{});
+
+    hipError_t launch_err = hipGetLastError();
+    hipError_t sync_err   = hipDeviceSynchronize();
+    if (launch_err != hipSuccess) return 254;
+    if (sync_err != hipSuccess) return 255;
+    return 0;
+}
+
+// =============================================================================
+// Stage B (M9): router permutation kernel launcher.
+//
+// Groups per-token top-K expert assignments by target expert via a
+// single-block counting sort. Inputs are GPU-resident `topk_idx` (i32)
+// and `topk_weight` (BF16); outputs are `expert_offsets` (i32),
+// `permuted_token_idx` (i32), `permuted_kpos` (i32), and
+// `permuted_weight` (BF16). All output buffers must be pre-allocated by
+// the caller — the kernel writes them in place.
+//
+// Status codes:
+//   140 invalid args (n_tokens / top_k / num_experts <= 0)
+//   141 num_experts > 256                  (LDS pinned at MAX_EXPERTS=256)
+//   142 top_k > 16                         (sanity bound)
+//   143 n_tokens * top_k > 16384           (would exceed reasonable scratch)
+//   254 launch error                       255 sync error
+// =============================================================================
+
+extern "C" int qwen36_moe_hip_batched_prefill_router_permute_launch(
+    size_t      device_ordinal,
+    int         n_tokens,
+    int         top_k,
+    int         num_experts,
+    const void* topk_idx,
+    const void* topk_weight,
+    void*       expert_offsets,
+    void*       permuted_token_idx,
+    void*       permuted_kpos,
+    void*       permuted_weight
+) {
+    if (n_tokens <= 0 || top_k <= 0 || num_experts <= 0) return 140;
+    if (num_experts > 256) return 141;
+    if (top_k > 16) return 142;
+    if (static_cast<int64_t>(n_tokens) * static_cast<int64_t>(top_k) > 16384) return 143;
+
+    ScopedHipDevice scoped(static_cast<int>(device_ordinal));
+
+    constexpr int BLOCK = 256;
+    dim3 grid(1u, 1u, 1u);
+    dim3 block(static_cast<unsigned int>(BLOCK), 1u, 1u);
+
+    hipLaunchKernelGGL(
+        (qwen36_moe::qwen36_moe_batched_prefill_router_permute_kernel<256>),
+        grid, block, 0, 0,
+        n_tokens, top_k, num_experts,
+        static_cast<const int*>(topk_idx),
+        static_cast<const __hip_bfloat16*>(topk_weight),
+        static_cast<int*>(expert_offsets),
+        static_cast<int*>(permuted_token_idx),
+        static_cast<int*>(permuted_kpos),
+        static_cast<__hip_bfloat16*>(permuted_weight));
+
+    hipError_t launch_err = hipGetLastError();
+    hipError_t sync_err   = hipDeviceSynchronize();
+    if (launch_err != hipSuccess) return 254;
+    if (sync_err != hipSuccess) return 255;
+    return 0;
+}
+
+// =============================================================================
+// Stage B (M10): grouped-expert INT4 GEMM launcher.
+//
+// One launch processes ALL `num_experts` experts via persistent-block
+// work-stealing on the expert id. For each claimed expert the block walks
+// the segment of permuted rows produced by the M9 router permutation
+// kernel, gathering x from `x_norm[permuted_token_idx[row]]` and writing
+// down(silu(gate(x)) * up(x)) into `expert_out[row * hidden]`.
+//
+// Block geometry:
+//   blocks  = props.multiProcessorCount  (one block per CU, like the
+//                                          existing 4b INT4 path)
+//   threads = 256                         (matches FFN block_size)
+//
+// LDS budget (F32 elements, per the kernel header comment):
+//   hidden + 2*I + I  →  14 KiB at hidden=2048, I=512 (8K + 4K + 2K)
+//
+// Status codes:
+//   150 invalid args (zero/negative dims)
+//   151 num_experts > 256
+//   152 hidden / moe_intermediate not divisible by group_size
+//   153 group_size != 128
+//   154 top_k * n_tokens > 16384
+//   155 dtype != bf16 (only path supported initially)
+//   156 LDS overflow (>48 KiB)
+//   254 launch error
+//   255 sync error
+// =============================================================================
+
+extern "C" int qwen36_moe_hip_batched_prefill_grouped_expert_launch(
+    int           dtype,
+    size_t        device_ordinal,
+    int           n_tokens,
+    int           top_k,
+    int           num_experts,
+    int           hidden,
+    int           moe_intermediate,
+    int           group_size,
+    const void*   x_norm,
+    const void*   expert_offsets,
+    const void*   permuted_token_idx,
+    const void*   experts_gate_up_w,
+    const void*   experts_gate_up_scale,
+    const void*   experts_gate_up_zero,
+    const void*   experts_down_w,
+    const void*   experts_down_scale,
+    const void*   experts_down_zero,
+    void*         expert_out,
+    void*         counters
+) {
+    if (n_tokens <= 0 || top_k <= 0 || num_experts <= 0) return 150;
+    if (hidden <= 0 || moe_intermediate <= 0) return 150;
+    if (num_experts > 256) return 151;
+    if (group_size <= 0) return 153;
+    if (group_size != 128) return 153;
+    if ((hidden % group_size) != 0) return 152;
+    if ((moe_intermediate % group_size) != 0) return 152;
+    if (static_cast<int64_t>(n_tokens) * static_cast<int64_t>(top_k) > 16384) return 154;
+    if (dtype != 2) return 155;
+
+    // Reduction dims must be multiples of 16 for both the WMMA path
+    // (`wmma_int4_matvec_partial_16rows` strides K by 16) and the scalar
+    // 8-wide dq8 path (strides cols by 8). group_size=128 already enforces
+    // 16-divisibility for both `hidden` and `moe_intermediate`, so this is
+    // belt-and-braces.
+    if ((hidden % 16) != 0 || (moe_intermediate % 16) != 0) return 152;
+
+    ScopedHipDevice scoped(static_cast<int>(device_ordinal));
+
+    hipDeviceProp_t props;
+    if (hipGetDeviceProperties(&props, static_cast<int>(device_ordinal)) != hipSuccess) {
+        return 250;
+    }
+
+    constexpr int BLOCK = 256;
+    const int num_blocks = props.multiProcessorCount > 0
+        ? props.multiProcessorCount
+        : 32;
+
+    // LDS sizing — see kernel header for layout. F32 elements:
+    //   x_lds [hidden] + gu_lds [2*I] + silu_mul_lds [I]
+    const size_t lds_bytes =
+        (static_cast<size_t>(hidden) +
+         static_cast<size_t>(2 * moe_intermediate) +
+         static_cast<size_t>(moe_intermediate)) * sizeof(float);
+    if (lds_bytes > 48 * 1024) return 156;
+
+    dim3 grid(static_cast<unsigned int>(num_blocks), 1u, 1u);
+    dim3 block(static_cast<unsigned int>(BLOCK), 1u, 1u);
+
+    const bool wmma = device_supports_wmma_bf16(static_cast<int>(device_ordinal));
+
+    if (wmma) {
+        hipLaunchKernelGGL(
+            (qwen36_moe::qwen36_moe_batched_prefill_grouped_expert_kernel<hip_bfloat16, true>),
+            grid, block, lds_bytes, 0,
+            n_tokens, top_k, num_experts, hidden, moe_intermediate, group_size,
+            static_cast<const hip_bfloat16*>(x_norm),
+            static_cast<const int*>(expert_offsets),
+            static_cast<const int*>(permuted_token_idx),
+            static_cast<const uint8_t*>(experts_gate_up_w),
+            static_cast<const hip_bfloat16*>(experts_gate_up_scale),
+            static_cast<const hip_bfloat16*>(experts_gate_up_zero),
+            static_cast<const uint8_t*>(experts_down_w),
+            static_cast<const hip_bfloat16*>(experts_down_scale),
+            static_cast<const hip_bfloat16*>(experts_down_zero),
+            static_cast<hip_bfloat16*>(expert_out),
+            static_cast<unsigned int*>(counters));
+    } else {
+        hipLaunchKernelGGL(
+            (qwen36_moe::qwen36_moe_batched_prefill_grouped_expert_kernel<hip_bfloat16, false>),
+            grid, block, lds_bytes, 0,
+            n_tokens, top_k, num_experts, hidden, moe_intermediate, group_size,
+            static_cast<const hip_bfloat16*>(x_norm),
+            static_cast<const int*>(expert_offsets),
+            static_cast<const int*>(permuted_token_idx),
+            static_cast<const uint8_t*>(experts_gate_up_w),
+            static_cast<const hip_bfloat16*>(experts_gate_up_scale),
+            static_cast<const hip_bfloat16*>(experts_gate_up_zero),
+            static_cast<const uint8_t*>(experts_down_w),
+            static_cast<const hip_bfloat16*>(experts_down_scale),
+            static_cast<const hip_bfloat16*>(experts_down_zero),
+            static_cast<hip_bfloat16*>(expert_out),
+            static_cast<unsigned int*>(counters));
+    }
+
+    hipError_t launch_err = hipGetLastError();
+    hipError_t sync_err   = hipDeviceSynchronize();
+    if (launch_err != hipSuccess) return 254;
+    if (sync_err != hipSuccess) return 255;
+    return 0;
+}
+
+// =============================================================================
+// Stage B (M11): unpermute + weighted combine launcher.
+//
+// Builds the per-token weighted sum across `top_k` permuted expert outputs.
+// Caller pre-computes `permuted_inverse[N * top_k]` (the inverse of M9's
+// scatter, i.e. `permuted_inverse[token * top_k + kpos] = dst`) host-side
+// and uploads it before launch — keeps M9 untouched and turns the unpermute
+// itself into a simple gather + dot product.
+//
+// Block geometry:
+//   blocks  = (ceil(hidden / 256), n_tokens, 1)
+//   threads = 256
+//
+// Status codes:
+//   160 invalid args (zero/negative dims)
+//   161 top_k > 16
+//   162 dtype != bf16
+//   163 hidden too large (no shared scratch needed; this is a paranoia cap)
+//   164 reserved
+//   254 launch error
+//   255 sync error
+// =============================================================================
+
+extern "C" int qwen36_moe_hip_batched_prefill_unpermute_combine_launch(
+    int           dtype,
+    size_t        device_ordinal,
+    int           n_tokens,
+    int           top_k,
+    int           hidden,
+    const void*   permuted_inverse,
+    const void*   permuted_weight,
+    const void*   expert_out,
+    void*         combined
+) {
+    if (n_tokens <= 0 || top_k <= 0 || hidden <= 0) return 160;
+    if (top_k > 16) return 161;
+    if (dtype != 2) return 162;  // BF16 only.
+    // hidden bound — sanity cap. The kernel itself has no per-block LDS
+    // requirement so the only effective limit is grid.x = ceil(hidden/256)
+    // which is huge before it matters; we cap at 65536 to keep error paths
+    // simple.
+    if (hidden > 65536) return 163;
+
+    ScopedHipDevice scoped(static_cast<int>(device_ordinal));
+
+    constexpr int BLOCK = 256;
+    const unsigned int grid_x =
+        static_cast<unsigned int>((hidden + BLOCK - 1) / BLOCK);
+    dim3 grid(grid_x, static_cast<unsigned int>(n_tokens), 1u);
+    dim3 block(static_cast<unsigned int>(BLOCK), 1u, 1u);
+
+    hipLaunchKernelGGL(
+        (qwen36_moe::qwen36_moe_batched_prefill_unpermute_combine_kernel<hip_bfloat16, BLOCK>),
+        grid, block, 0, 0,
+        n_tokens, top_k, hidden,
+        static_cast<const int*>(permuted_inverse),
+        static_cast<const __hip_bfloat16*>(permuted_weight),
+        static_cast<const hip_bfloat16*>(expert_out),
+        static_cast<hip_bfloat16*>(combined));
+
+    hipError_t launch_err = hipGetLastError();
+    hipError_t sync_err   = hipDeviceSynchronize();
+    if (launch_err != hipSuccess) return 254;
+    if (sync_err != hipSuccess) return 255;
+    return 0;
+}

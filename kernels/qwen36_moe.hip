@@ -47,6 +47,32 @@
 // `qwen36_moe_persistent/ffn_phase.cuh`.
 #include "qwen36_moe_persistent/ffn_phase.cuh"
 
+// Stage A (M3): standalone batched-Q full-attention prefill kernel,
+// modeled on the Qwen 3.5 K-tiled prefill kernel (PR #219). Templated;
+// the bridge instantiates the (T=hip_bfloat16, BM=4, BK=32) flavor that
+// fits Qwen 3.6 MoE's hd=256 inside the 48 KiB LDS safety cap.
+#include "qwen36_moe_persistent/batched_prefill_attn_full.cuh"
+
+// Stage B (M9): single-block counting-sort permutation that groups
+// per-token top-K assignments by target expert, producing the
+// (expert_offsets, permuted_token_idx, permuted_kpos, permuted_weight)
+// arrays that M10's grouped MoE GEMM dispatches one INT4 GEMM per
+// expert against.
+#include "qwen36_moe_persistent/batched_prefill_router_permute.cuh"
+
+// Stage B (M10): grouped-expert INT4 GEMM kernel. One launch processes
+// all `num_experts` experts via persistent-block work-stealing on the
+// expert id. Reuses int4_dq8_matvec_partial / wmma_int4_matvec_partial_16rows
+// from helpers.cuh — math is identical to ffn_phase.cuh's Phase G + I,
+// restructured around an outer per-expert loop instead of per-top-k
+// dispatch from the persistent megakernel.
+#include "qwen36_moe_persistent/batched_prefill_grouped_expert.cuh"
+
+// Stage B (M11): unpermute + weighted combine kernel. Inverts M9's
+// permutation (host-built inverse table) and accumulates `top_k`
+// weighted expert outputs per token into a `[N, hidden]` BF16 tensor.
+#include "qwen36_moe_persistent/batched_prefill_unpermute_combine.cuh"
+
 namespace qwen36_moe {
 
 // -- Layer descriptor (mirror of Rust Qwen36MoeDecodeLayerDesc) ----------
