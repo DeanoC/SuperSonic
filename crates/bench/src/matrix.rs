@@ -6,7 +6,7 @@
 //! the runner registry, you MUST update this table or the test fails.
 
 use crate::perf::{run_one_combo, ComboInvocation, RunPolicy};
-use crate::runs::{MetaJson, RunDir, SCHEMA_VERSION};
+use crate::runs::{MetaJson, PerfCellJson, PerfStatus, RunDir, SCHEMA_VERSION};
 use anyhow::Result;
 use chrono::Utc;
 use std::path::PathBuf;
@@ -89,6 +89,14 @@ pub fn combos_for_arch(arch: BenchArch) -> Vec<&'static ComboDescriptor> {
     SUPPORTED_COMBOS.iter().filter(|c| c.arch == arch).collect()
 }
 
+/// True iff `(model, quant, arch)` appears in `SUPPORTED_COMBOS`. Used by
+/// `run_matrix` to skip unsupported pairs from the user's CLI cross-product.
+pub fn is_supported_combo(model: &str, quant: &str, arch: &BenchArch) -> bool {
+    SUPPORTED_COMBOS
+        .iter()
+        .any(|c| c.model == model && c.quant == quant && c.arch == *arch)
+}
+
 pub struct MatrixConfig {
     pub arch: BenchArch,
     pub models: Vec<String>,
@@ -124,6 +132,32 @@ pub fn run_matrix(cfg: &MatrixConfig, rd: &RunDir) -> Result<()> {
 
     for model in &cfg.models {
         for quant in &cfg.quants {
+            // Skip (model, quant, arch) triples that are not in the registry.
+            // bench-perf's --models / --quants flags are independent sets, so
+            // their Cartesian product can include unsupported pairs (e.g.
+            // qwen3.6-35b-a3b + bf16). Record a Skipped cell rather than
+            // letting the runner produce a useless Error cell.
+            if !is_supported_combo(model, quant, &cfg.arch) {
+                let cell = PerfCellJson {
+                    schema_version: SCHEMA_VERSION,
+                    model: model.clone(),
+                    quant: quant.clone(),
+                    prompt: cfg.prompt.clone(),
+                    max_new_tokens: cfg.max_new_tokens,
+                    status: PerfStatus::Skipped {
+                        reason: format!(
+                            "unsupported combo for {}: ({}, {}) not in SUPPORTED_COMBOS",
+                            cfg.arch.as_str(),
+                            model,
+                            quant
+                        ),
+                    },
+                    gpu_temp_c_end: None,
+                };
+                rd.write_perf(&cell)?;
+                continue;
+            }
+
             let invocation = ComboInvocation {
                 binary: cfg.binary.clone(),
                 model: model.clone(),

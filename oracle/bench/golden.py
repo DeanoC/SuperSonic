@@ -95,16 +95,35 @@ def run_golden(req: GoldenRequest) -> dict:
             "extras": {**agg, "per_prompt": per_prompt}}
 
 
+class GoldenGenerationError(RuntimeError):
+    """Raised when the supersonic subprocess fails or produces no text. We
+    refuse to silently bootstrap an empty BF16 reference — that would let
+    every later INT4/FP8 chrF score against garbage."""
+
+
 def _generate(req: GoldenRequest, prompt: dict) -> str:
     cmd = [str(req.binary), "--model", req.model, "--model-dir", str(req.model_dir),
            "--prompt", prompt["prompt"], "--max-new-tokens", str(prompt["max_new_tokens"])]
     cmd.extend({"bf16": [], "int4": ["--int4"], "fp8r": ["--fp8-runtime"],
                 "kv-fp8": ["--kv-fp8"], "int8": ["--int8"]}[req.quant])
     res = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if res.returncode != 0:
+        raise GoldenGenerationError(
+            f"supersonic exited with code {res.returncode} for prompt "
+            f"{prompt['id']!r} ({req.model}/{req.quant}); stderr tail:\n"
+            + (res.stderr or "")[-2000:]
+        )
     # Supersonic prints the prompt+generation as plain stdout lines, with
     # status lines like `[gpu] ...`, `[tokens] ...`, `[result] ...` mixed in.
     # Filter to the lines that don't start with a `[bracket]` tag — what
     # remains is the actual model output.
     lines = (res.stdout or "").splitlines()
     text_lines = [l for l in lines if not l.lstrip().startswith("[")]
-    return "\n".join(text_lines).strip()
+    text = "\n".join(text_lines).strip()
+    if not text:
+        raise GoldenGenerationError(
+            f"supersonic produced no generation text for prompt {prompt['id']!r} "
+            f"({req.model}/{req.quant}); stdout had only bracket-tagged status lines.\n"
+            f"stdout tail:\n{(res.stdout or '')[-2000:]}\nstderr tail:\n{(res.stderr or '')[-2000:]}"
+        )
+    return text

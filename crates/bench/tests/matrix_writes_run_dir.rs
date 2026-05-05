@@ -26,3 +26,40 @@ fn matrix_writes_meta_and_at_least_one_perf_cell() {
     let meta_text = std::fs::read_to_string(rd.meta_path()).unwrap();
     assert!(meta_text.contains("\"arch\": \"gfx1100\""));
 }
+
+#[test]
+fn matrix_skips_unsupported_combo_with_skipped_status() {
+    // qwen3.6-35b-a3b only supports int4 and kv-fp8 on gfx1100; bf16 is not
+    // a registered combo. run_matrix should write a Skipped cell rather than
+    // running the binary and producing an Error cell.
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = MatrixConfig {
+        arch: BenchArch::Gfx1100,
+        models: vec!["qwen3.6-35b-a3b".into()],
+        quants: vec!["bf16".into()],
+        // /bin/false would produce an Error cell if the supported-combo guard
+        // weren't there; the test asserts the guard runs first.
+        binary: PathBuf::from("/bin/false"),
+        model_dir_resolver: Box::new(|_| PathBuf::from("/nonexistent")),
+        prompt: "x".into(),
+        max_new_tokens: 1,
+        warmup_tokens: 1,
+        measurement_runs: 1,
+        cooldown_seconds: 0,
+        git_sha: "test".into(),
+        runner_version: "test 0.0.0".into(),
+    };
+    let rd = RunDir::new(tmp.path().join("run-skip"));
+    run_matrix(&cfg, &rd).unwrap();
+    let cell_path = rd.perf_path("qwen3.6-35b-a3b", "bf16");
+    assert!(cell_path.exists(), "expected skipped perf cell to be written");
+    let cell_text = std::fs::read_to_string(&cell_path).unwrap();
+    assert!(
+        cell_text.contains("\"status\": \"skipped\""),
+        "expected skipped status, got: {cell_text}"
+    );
+    assert!(
+        cell_text.contains("not in SUPPORTED_COMBOS"),
+        "expected reason to mention SUPPORTED_COMBOS, got: {cell_text}"
+    );
+}
