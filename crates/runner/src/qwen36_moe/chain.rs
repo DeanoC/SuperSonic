@@ -8,11 +8,11 @@ use crate::qwen36_moe_decode::{
     run_chained_decode_fast_with_expert_prefetch,
     run_chained_decode_fast_with_expert_prefetch_and_cache_pos,
 };
-use crate::qwen36_moe_persistent_decode::{LmHeadFold, PersistentScratch, CACHE_POS_INHERIT};
+use crate::qwen36_moe_persistent_decode::{LmHeadFold, PersistentScratch};
 use crate::qwen36_moe_residency::MoeExpertResidencyManager;
 use crate::qwen36_moe_telemetry::{MoeRouteRuntime, MoeSparseTelemetrySnapshot};
 use crate::qwen36_moe_types::{
-    DecodeOutputs, ExpertPrefetchPhase, ExpertRoute, LayerBuffers, MultiLayerGeom,
+    DecodeOutputs, ExpertPrefetchPhase, ExpertRoute, LayerBuffers, MultiLayerGeom, PositionPair,
 };
 
 pub(crate) struct Qwen36ChainStep<'a> {
@@ -25,18 +25,12 @@ pub(crate) struct Qwen36ChainStep<'a> {
     pub(crate) moe_runtime: &'a mut MoeRuntimeConfig,
     pub(crate) moe_routes: &'a mut MoeRouteRuntime,
     pub(crate) initial_hidden: &'a [u8],
-    pub(crate) position: i32,
-    /// Optional KV-cache slot override. When `None`, the kernel uses
-    /// `position` for both RoPE rotation and the KV slot (the dense
-    /// decode case, bit-equal to before this field existed). When
-    /// `Some(slot)`, the kernel uses `position` for RoPE rotation and
-    /// `slot` for the KV slot — this is the SpecPrefill sparse-prefill
-    /// case where kept tokens land in compact KV slots but rotate at
-    /// their original prompt positions. Both the persistent and chained
-    /// decode paths support the split: when `persistent_scratch` is
-    /// available we pass the slot straight through; otherwise we route
-    /// through the `run_chained_decode_fast_with_cache_pos` siblings.
-    pub(crate) cache_pos: Option<i32>,
+    /// `(rope, cache)` for this step. Dense decode uses
+    /// `PositionPair::dense(loop_state.position)`; SpecPrefill uses
+    /// `PositionPair::split(rope_pos, loop_state.position)`. The
+    /// chained-fallback branch only uses the cache_pos sibling fns
+    /// when `!position.is_dense()`.
+    pub(crate) position: PositionPair,
     pub(crate) step: usize,
     pub(crate) is_gen_step: bool,
     pub(crate) emit_stage_timings: bool,
@@ -58,13 +52,17 @@ pub(crate) fn run_chain_step(mut args: Qwen36ChainStep<'_>) -> Result<Qwen36Chai
         .should_track_routes(args.moe_runtime.prefetch_mode);
     let mut next_moe_topk_by_layer = args.moe_routes.next_topk_buffer(track_moe_routes);
 
+    let rope = args.position.rope;
+    let cache = args.position.cache;
+
     let mut lm_head_folded = false;
     let outputs = if let Some(scratch) = args.persistent_scratch.as_deref_mut() {
-        // Persistent decode covers both dense (cache_pos = None) and
-        // SpecPrefill sparse-prefill (cache_pos = Some(slot)) since
-        // the kernel decouples RoPE position from the KV slot.
-        // CACHE_POS_INHERIT (-1) sentinel ⇒ inherit from `position`.
-        let cache_pos_arg = args.cache_pos.unwrap_or(CACHE_POS_INHERIT);
+        // Persistent kernel takes (rope, cache) directly. The
+        // megakernel's full-attn phase consumes cache_pos via
+        // `eff_cache_pos = (cache_pos >= 0) ? cache_pos : position`,
+        // so passing `cache` works for both dense and SpecPrefill
+        // cases (when rope == cache the kernel produces bit-identical
+        // output to the pre-PR-#211 hard-coded -1 path).
         if let Some(manager) = args.moe_expert_residency.as_deref_mut() {
             drop(args.fold);
             let mut prefetch = |phase: ExpertPrefetchPhase,
@@ -90,30 +88,24 @@ pub(crate) fn run_chain_step(mut args: Qwen36ChainStep<'_>) -> Result<Qwen36Chai
                 .run_sparse_with_expert_prefetch(
                     args.ordinal,
                     args.initial_hidden,
-                    args.position,
-                    cache_pos_arg,
+                    rope,
+                    cache,
                     &mut prefetch,
                 )
                 .with_context(|| {
                     format!(
-                        "segmented persistent sparse decode (step {}, position {}, cache_pos {})",
-                        args.step, args.position, cache_pos_arg
+                        "segmented persistent sparse decode (step {}, rope {}, cache {})",
+                        args.step, rope, cache
                     )
                 })?
         } else {
             lm_head_folded = args.fold.is_some();
             scratch
-                .run(
-                    args.ordinal,
-                    args.initial_hidden,
-                    args.position,
-                    cache_pos_arg,
-                    args.fold,
-                )
+                .run(args.ordinal, args.initial_hidden, rope, cache, args.fold)
                 .with_context(|| {
                     format!(
-                        "persistent decode (step {}, position {}, cache_pos {})",
-                        args.step, args.position, cache_pos_arg
+                        "persistent decode (step {}, rope {}, cache {})",
+                        args.step, rope, cache
                     )
                 })?
         }
@@ -121,10 +113,10 @@ pub(crate) fn run_chain_step(mut args: Qwen36ChainStep<'_>) -> Result<Qwen36Chai
         // Chained fallback for when the persistent megakernel isn't
         // available (engine started without --persistent-decode, or
         // a dispatch path that the persistent kernel doesn't yet
-        // support). The chained driver has parallel cache_pos siblings
-        // so the SpecPrefill / MTP slot split keeps working here too.
+        // support). Chained has parallel cache_pos siblings; we
+        // pick them only when the pair actually diverges.
         drop(args.fold);
-        if let Some(cache_pos) = args.cache_pos {
+        if !args.position.is_dense() {
             if let Some(manager) = args.moe_expert_residency.as_deref_mut() {
                 let mut prefetch = |phase: ExpertPrefetchPhase,
                                     layer_idx: usize,
@@ -150,8 +142,8 @@ pub(crate) fn run_chain_step(mut args: Qwen36ChainStep<'_>) -> Result<Qwen36Chai
                     args.geom,
                     args.layers,
                     args.initial_hidden,
-                    args.position,
-                    cache_pos,
+                    rope,
+                    cache,
                     args.emit_stage_timings,
                     &mut prefetch,
                 )
@@ -161,15 +153,15 @@ pub(crate) fn run_chain_step(mut args: Qwen36ChainStep<'_>) -> Result<Qwen36Chai
                     args.geom,
                     args.layers,
                     args.initial_hidden,
-                    args.position,
-                    cache_pos,
+                    rope,
+                    cache,
                     args.emit_stage_timings,
                 )
             }
             .with_context(|| {
                 format!(
-                    "chained sparse-prefill decode (step {}, position {}, cache_pos {})",
-                    args.step, args.position, cache_pos
+                    "chained sparse-prefill decode (step {}, rope {}, cache {})",
+                    args.step, rope, cache
                 )
             })?
         } else if let Some(manager) = args.moe_expert_residency.as_deref_mut() {
@@ -197,31 +189,21 @@ pub(crate) fn run_chain_step(mut args: Qwen36ChainStep<'_>) -> Result<Qwen36Chai
                 args.geom,
                 args.layers,
                 args.initial_hidden,
-                args.position,
+                rope,
                 args.emit_stage_timings,
                 &mut prefetch,
             )
-            .with_context(|| {
-                format!(
-                    "chained decode (step {}, position {})",
-                    args.step, args.position
-                )
-            })?
+            .with_context(|| format!("chained decode (step {}, rope {})", args.step, rope))?
         } else {
             run_chained_decode_fast(
                 args.ordinal,
                 args.geom,
                 args.layers,
                 args.initial_hidden,
-                args.position,
+                rope,
                 args.emit_stage_timings,
             )
-            .with_context(|| {
-                format!(
-                    "chained decode (step {}, position {})",
-                    args.step, args.position
-                )
-            })?
+            .with_context(|| format!("chained decode (step {}, rope {})", args.step, rope))?
         }
     };
 
@@ -233,7 +215,7 @@ pub(crate) fn run_chain_step(mut args: Qwen36ChainStep<'_>) -> Result<Qwen36Chai
         args.moe_expert_residency.as_deref(),
     ) {
         let after = MoeSparseTelemetrySnapshot::capture(manager);
-        telemetry.record_step(args.step, args.position, args.is_gen_step, before, after);
+        telemetry.record_step(args.step, rope, args.is_gen_step, before, after);
     }
 
     Ok(Qwen36ChainStepOutput {

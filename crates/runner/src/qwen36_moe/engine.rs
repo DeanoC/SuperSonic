@@ -40,7 +40,36 @@ use crate::qwen36_moe_cli::vmm::{
 use crate::qwen36_moe_cli::vmm_config::{prepare_moe_runtime_config, should_use_qwen36_kv_vmm};
 use crate::qwen36_moe_logits::XorshiftRng;
 use crate::qwen36_moe_telemetry::{print_and_write_moe_residency_summary, MoeRouteRuntime};
+use crate::qwen36_moe_types::PositionPair;
 use crate::registry::RegistryEntry;
+
+/// Compute the `(rope, cache)` PositionPair for one step of the
+/// decode loop. In dense mode the rope and cache agree; in
+/// SpecPrefill mode the rope tracks the absolute prompt-token
+/// position (during prefill of kept tokens) or the absolute
+/// generation position (after prefill ends) while the cache slot
+/// is the compact `loop_state_position`.
+fn current_position(
+    step: usize,
+    loop_state_position: i32,
+    keep_mask: Option<&Vec<bool>>,
+    kept_positions: &[usize],
+    effective_prompt_len: usize,
+    full_prompt_len: usize,
+) -> PositionPair {
+    match keep_mask {
+        None => PositionPair::dense(loop_state_position),
+        Some(_) => {
+            let rope = if step < effective_prompt_len {
+                kept_positions[step] as i32
+            } else {
+                let gen_off = step - effective_prompt_len;
+                (full_prompt_len + gen_off) as i32
+            };
+            PositionPair::split(rope, loop_state_position)
+        }
+    }
+}
 
 pub fn run(cli: &crate::Cli, entry: &RegistryEntry, total_vram: u64) -> Result<()> {
     run_inner(cli, entry, total_vram, None)
@@ -163,13 +192,10 @@ fn decode_text(
     validate_speculative_sampling(speculative_decode, sampling)?;
 
     if keep_mask.is_some() && speculative_decode {
-        anyhow::bail!(
-            "SpecPrefill (sparse prefill via --specprefill-draft-dir) cannot be \
-             combined with --speculative-decode (MTP self-speculative). MTP uses \
-             the persistent decode kernel, which takes only `position` (no \
-             `cache_pos` decoupling), so it would write at wrong KV slots when \
-             the prompt has been pruned. R1 follow-up: plumb cache_pos through \
-             MTP too."
+        eprintln!(
+            "[specprefill+mtp] composed run: rope on absolute prompt timeline, \
+             cache on compact KV slot. See \
+             docs/research/2026-05-04-qwen36-mtp-specprefill-audit.md."
         );
     }
 
@@ -380,24 +406,17 @@ fn decode_text(
         if is_gen_step && generation_wall_start.is_none() {
             generation_wall_start = Some(std::time::Instant::now());
         }
-        // Per-step (rope_pos, cache_pos) for the chain step. In dense
-        // mode they equal `loop_state.position`. In sparse mode rope_pos
-        // is the original prompt position of the kept token (during
-        // prefill) or `prompt_ids.len() + gen_offset` (during gen);
-        // cache_pos is always `loop_state.position` (the compact slot
-        // index that advances by 1 per processed step).
-        let (rope_pos, chain_cache_pos): (i32, Option<i32>) = match &keep_mask {
-            None => (loop_state.position, None),
-            Some(_) => {
-                let rp = if step < effective_prompt_len {
-                    kept_positions[step] as i32
-                } else {
-                    let gen_off = step - effective_prompt_len;
-                    (prompt_ids.len() + gen_off) as i32
-                };
-                (rp, Some(loop_state.position))
-            }
-        };
+        // Per-step (rope, cache) pair. Dense mode: rope == cache.
+        // SpecPrefill mode: rope on absolute prompt timeline, cache
+        // on compact slot count. See `current_position` above.
+        let position = current_position(
+            step,
+            loop_state.position,
+            keep_mask.as_ref(),
+            &kept_positions,
+            effective_prompt_len,
+            prompt_ids.len(),
+        );
         // Embed lookup for the current token.
         let t0 = std::time::Instant::now();
         let initial_hidden = lookup_embed_row(
@@ -455,8 +474,7 @@ fn decode_text(
             moe_runtime: &mut moe_runtime,
             moe_routes: &mut moe_routes,
             initial_hidden: &initial_hidden,
-            position: rope_pos,
-            cache_pos: chain_cache_pos,
+            position,
             step,
             is_gen_step,
             emit_stage_timings,
@@ -541,6 +559,7 @@ fn decode_text(
                 counter: &mut counter_buf,
                 linear_attn_snapshot: linear_attn_snapshot.as_mut(),
                 loop_state: &loop_state,
+                base_position: position,
                 h_base_in: &h_base,
                 first_token: next_token,
                 stage_timings: &mut stage_timings,

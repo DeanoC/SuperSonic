@@ -44,6 +44,45 @@ pub struct MultiLayerGeom {
     pub top_k: i32,
 }
 
+/// Per-step position pair. Decouples the absolute RoPE rotation
+/// timeline from the KV cache slot index. They differ in
+/// SpecPrefill mode where kept tokens land in compact slots while
+/// still rotating at their original prompt positions; MTP-style
+/// decoupling uses the same shape (RoPE = base + k, cache slot = k).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PositionPair {
+    /// Absolute RoPE position (always-advancing timeline). Equals
+    /// `kept_positions[step]` during SpecPrefill prefill, and
+    /// `prompt_ids.len() + gen_offset` during generation.
+    pub rope: i32,
+    /// KV cache slot index. Equals `rope` in dense decode; equals
+    /// the compact slot count (`loop_state.position`) in
+    /// SpecPrefill mode.
+    pub cache: i32,
+}
+
+impl PositionPair {
+    /// Dense-decode shortcut: rope and cache slot agree.
+    #[inline]
+    pub const fn dense(p: i32) -> Self {
+        Self { rope: p, cache: p }
+    }
+
+    /// Decoupled SpecPrefill / MTP-style pair.
+    #[inline]
+    pub const fn split(rope: i32, cache: i32) -> Self {
+        Self { rope, cache }
+    }
+
+    /// `true` when rope and cache agree — i.e. the dense case.
+    /// Useful for the chained-fallback branch in chain.rs that only
+    /// needs the cache_pos sibling fns when the two diverge.
+    #[inline]
+    pub const fn is_dense(self) -> bool {
+        self.rope == self.cache
+    }
+}
+
 /// Per-layer attention weight buffers. The two variants are mutually
 /// exclusive: a layer is full xor linear. Selection happens at populate time
 /// via [`is_full_attn_layer`]. When [`AttnLayerBuffers::Full::int4`] /

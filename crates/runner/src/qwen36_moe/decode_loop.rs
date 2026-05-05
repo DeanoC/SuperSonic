@@ -2,6 +2,7 @@ use std::io::Write as _;
 
 use crate::qwen36_moe_cli::output::print_decoded_token;
 use crate::qwen36_moe_speculative::SpeculativeStepResult;
+use crate::qwen36_moe_types::PositionPair;
 
 pub struct Qwen36DecodeLoopState {
     pub generated_ids: Vec<u32>,
@@ -39,17 +40,24 @@ impl Qwen36DecodeLoopState {
     pub fn speculative_replay_inputs(
         &self,
         first_token: u32,
+        base: PositionPair,
         result: &SpeculativeStepResult,
-    ) -> Vec<(i32, u32)> {
+    ) -> Vec<(PositionPair, u32)> {
+        // base = (rope, cache) of `first_token`. Subsequent
+        // accepted-draft tokens advance both timelines by 1 each, so
+        // step i lands at (rope+1+i, cache+1+i). In dense mode the
+        // pair stays a `dense(p)` shape; in SpecPrefill+MTP the rope
+        // and cache stay decoupled.
         let mut replay = Vec::with_capacity(result.n_accepted + 1);
-        replay.push((self.position, first_token));
+        replay.push((base, first_token));
         for (i, &tok) in result
             .emitted_tokens
             .iter()
             .take(result.n_accepted)
             .enumerate()
         {
-            replay.push((self.position + 1 + i as i32, tok));
+            let off = 1 + i as i32;
+            replay.push((PositionPair::split(base.rope + off, base.cache + off), tok));
         }
         replay
     }
@@ -57,11 +65,12 @@ impl Qwen36DecodeLoopState {
     pub fn partial_accept_replay_inputs(
         &self,
         first_token: u32,
+        base: PositionPair,
         result: &SpeculativeStepResult,
         draft_count: usize,
-    ) -> Option<Vec<(i32, u32)>> {
+    ) -> Option<Vec<(PositionPair, u32)>> {
         (result.n_accepted < draft_count)
-            .then(|| self.speculative_replay_inputs(first_token, result))
+            .then(|| self.speculative_replay_inputs(first_token, base, result))
     }
 
     pub fn record_last_logits(&mut self, logits: &[u8]) {

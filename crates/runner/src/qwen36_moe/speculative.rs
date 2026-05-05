@@ -249,7 +249,7 @@ use anyhow::{Context, Result};
 use gpu_hal::{GpuBuffer, ScalarType};
 
 use crate::qwen36_moe_mtp::{run_mtp_draft_chain, MtpChainScratch, MtpForwardScratch};
-use crate::qwen36_moe_types::{MtpLayerBuffers, MultiLayerGeom};
+use crate::qwen36_moe_types::{MtpLayerBuffers, MultiLayerGeom, PositionPair};
 
 /// Result of one speculative-decode step.
 #[derive(Debug, Clone)]
@@ -279,11 +279,15 @@ pub struct SpeculativeStepResult {
 /// - `first_token_id`: the token the base just sampled (= `T_{p+1}`
 ///   in the docstring above). Becomes MTP's `next_token_id` at
 ///   step 0 and the base verifier's first input.
-/// - `base_position`: absolute base position of `first_token_id` —
-///   the cache slot it WILL be written to when the verify loop
-///   feeds it. Per the engine convention, this equals
-///   `decode_text`'s `position` value AFTER the regular sample
-///   that produced `first_token_id`.
+/// - `base_rope`: absolute RoPE position of `first_token_id` (the
+///   timeline used for query/key rotation). In dense decode this
+///   equals the cache slot. In SpecPrefill mode it's the full
+///   prompt position, while the cache slot is the compact slot
+///   count.
+/// - `base_cache`: KV cache slot `first_token_id` WILL be written
+///   to when the verify loop feeds it. In dense mode equals
+///   `base_rope`; in SpecPrefill mode equals
+///   `loop_state.position` (the compact slot count).
 /// - `num_drafts` (K): how many MTP drafts to generate.
 ///
 /// ## `base_step` closure contract
@@ -331,12 +335,19 @@ pub fn run_speculative_decode_step<F>(
     lm_head_w_buf: &GpuBuffer,
     h_base_in: &[u8],
     first_token_id: u32,
-    base_position: i32,
+    // Absolute RoPE position of `first_token_id`. The MTP draft
+    // chain rotates at `base_rope + k` regardless of mode, since
+    // RoPE is on the absolute prompt timeline.
+    base_rope: i32,
+    // KV cache slot of `first_token_id`. Equals `base_rope` in
+    // dense mode; equals `loop_state.position` (compact count) in
+    // SpecPrefill mode.
+    base_cache: i32,
     num_drafts: usize,
     mut base_step: F,
 ) -> Result<SpeculativeStepResult>
 where
-    F: FnMut(i32, u32) -> Result<(u32, Vec<u8>)>,
+    F: FnMut(PositionPair, u32) -> Result<(u32, Vec<u8>)>,
 {
     let hidden = geom.hidden as usize;
     if h_base_in.len() != hidden * 2 {
@@ -352,14 +363,17 @@ where
         // we emit one token (the function is documented as always
         // returning a non-empty `emitted_tokens` so the caller's
         // `position += emitted.len()` advances). Run a single base
-        // step at `base_position` with `first_token_id` — exactly
-        // what plain greedy decode would do for this token. This
-        // keeps the speculative driver a safe drop-in even when a
-        // tunable disables speculation, avoiding the stalled-loop
-        // failure mode the `--speculative-decode --num-speculative
-        // -tokens=0` knob would otherwise hit.
-        let (predicted, fh) = base_step(base_position, first_token_id)
-            .context("speculative: K=0 fallback base step")?;
+        // step at `(base_rope, base_cache)` with `first_token_id`
+        // — exactly what plain greedy decode would do for this
+        // token. This keeps the speculative driver a safe drop-in
+        // even when a tunable disables speculation, avoiding the
+        // stalled-loop failure mode the `--speculative-decode
+        // --num-speculative-tokens=0` knob would otherwise hit.
+        let (predicted, fh) = base_step(
+            PositionPair::split(base_rope, base_cache),
+            first_token_id,
+        )
+        .context("speculative: K=0 fallback base step")?;
         return Ok(SpeculativeStepResult {
             emitted_tokens: vec![predicted],
             n_accepted: 0,
@@ -372,11 +386,15 @@ where
         .context("speculative: upload h_base")?;
 
     // --- 2. Generate K MTP drafts. ---
+    // The MTP draft chain rotates at the absolute RoPE timeline, so
+    // pass `base_rope` regardless of mode. The draft chain has its
+    // own per-chain KV cache (slot = k), independent of the base
+    // model's compact slot count.
     let drafts_records = run_mtp_draft_chain(
         ordinal,
         geom,
         mtp,
-        base_position,
+        base_rope,
         &h_base_buf,
         first_token_id,
         num_drafts,
@@ -391,26 +409,26 @@ where
     // --- 3. Sequential verify with early termination. ---
     //
     // Iter k (k in 0..K):
-    //   feed `input_k` at position `base_position + k`,
-    //   read `predicted_k` = base's prediction for `base_position + k + 1`,
-    //   compare to drafts[k].
+    //   feed `input_k` at PositionPair { rope: base_rope+k,
+    //   cache: base_cache+k }, read `predicted_k` = base's
+    //   prediction for `(base_rope+k+1, base_cache+k+1)`, compare
+    //   to drafts[k].
     //
-    // input_0 = first_token_id (= T_{base_position}, just sampled).
+    // input_0 = first_token_id (= T_{base_rope}, just sampled).
     // input_k (k > 0) = drafts[k-1] (the just-accepted token).
-    //
-    // First mismatch at k: emit drafts[..k] ++ [predicted_k]; n_accepted = k.
-    // No mismatch through k = K-1: emit drafts[..K] ++ [bonus]; n_accepted = K.
-    //   The bonus is computed by an extra base step at position
-    //   `base_position + K` with input = drafts[K-1] — the K+1-th
-    //   call to `base_step`.
 
     let mut emitted: Vec<u32> = Vec::with_capacity(num_drafts + 1);
     let mut input = first_token_id;
 
     for k in 0..num_drafts {
-        let pos = base_position + (k as i32);
-        let (predicted, fh) = base_step(pos, input)
-            .with_context(|| format!("speculative: base verify k={k} pos={pos}"))?;
+        let k_i32 = k as i32;
+        let pair = PositionPair::split(base_rope + k_i32, base_cache + k_i32);
+        let (predicted, fh) = base_step(pair, input).with_context(|| {
+            format!(
+                "speculative: base verify k={k} rope={} cache={}",
+                pair.rope, pair.cache
+            )
+        })?;
         if predicted == drafts[k] {
             // Accept drafts[k]. Carry forward as next iter's input.
             emitted.push(drafts[k]);
@@ -426,11 +444,16 @@ where
         }
     }
 
-    // All K drafts accepted. Bonus base step at position p+K with
-    // input = drafts[K-1] (= last accepted token).
-    let pos = base_position + (num_drafts as i32);
-    let (bonus, fh) =
-        base_step(pos, input).with_context(|| format!("speculative: bonus base step pos={pos}"))?;
+    // All K drafts accepted. Bonus base step at (rope+K, cache+K)
+    // with input = drafts[K-1] (= last accepted token).
+    let k_i32 = num_drafts as i32;
+    let pair = PositionPair::split(base_rope + k_i32, base_cache + k_i32);
+    let (bonus, fh) = base_step(pair, input).with_context(|| {
+        format!(
+            "speculative: bonus base step rope={} cache={}",
+            pair.rope, pair.cache
+        )
+    })?;
     emitted.push(bonus);
     Ok(SpeculativeStepResult {
         emitted_tokens: emitted,
@@ -469,14 +492,16 @@ where
 /// the only difference is the closure shape:
 ///
 /// ```ignore
-/// F: FnOnce(&[(i32, u32)]) -> Result<Vec<(u32, Vec<u8>)>>
+/// F: FnOnce(&[(PositionPair, u32)]) -> Result<Vec<(u32, Vec<u8>)>>
 /// ```
 ///
-/// The closure receives K+1 `(position, input_token)` pairs:
-///   - `[0]`: `(base_position, first_token_id)` — the just-sampled
-///     token's verify slot, predicting `drafts[0]`.
-///   - `[i]` for `i in 1..=K`: `(base_position+i, drafts[i-1])` —
-///     each accepted draft's slot, predicting the next position.
+/// The closure receives K+1 `(PositionPair, input_token)` pairs:
+///   - `[0]`: `(PositionPair { rope: base_rope, cache: base_cache },
+///     first_token_id)` — the just-sampled token's verify slot,
+///     predicting `drafts[0]`.
+///   - `[i]` for `i in 1..=K`: `(PositionPair { rope: base_rope+i,
+///     cache: base_cache+i }, drafts[i-1])` — each accepted draft's
+///     slot, predicting the next position.
 ///
 /// And returns K+1 `(predicted_next_token, final_hidden_bytes)` tuples
 /// in the same order. The driver applies [`accept_prefix_greedy`]
@@ -497,12 +522,15 @@ pub fn run_speculative_decode_step_batched<F>(
     lm_head_w_buf: &GpuBuffer,
     h_base_in: &[u8],
     first_token_id: u32,
-    base_position: i32,
+    // Absolute RoPE position of `first_token_id`. See
+    // `run_speculative_decode_step` for the (rope, cache) split.
+    base_rope: i32,
+    base_cache: i32,
     num_drafts: usize,
     base_step_batched: F,
 ) -> Result<SpeculativeStepResult>
 where
-    F: FnOnce(&[(i32, u32)]) -> Result<Vec<(u32, Vec<u8>)>>,
+    F: FnOnce(&[(PositionPair, u32)]) -> Result<Vec<(u32, Vec<u8>)>>,
 {
     let hidden = geom.hidden as usize;
     if h_base_in.len() != hidden * 2 {
@@ -517,8 +545,11 @@ where
         // K=0 degenerate: single base step. Same fallback as the
         // per-step driver — preserves the "always emit ≥1 token"
         // contract for engine forward progress.
-        let outputs = base_step_batched(&[(base_position, first_token_id)])
-            .context("speculative_batched: K=0 fallback base step")?;
+        let outputs = base_step_batched(&[(
+            PositionPair::split(base_rope, base_cache),
+            first_token_id,
+        )])
+        .context("speculative_batched: K=0 fallback base step")?;
         if outputs.len() != 1 {
             anyhow::bail!(
                 "speculative_batched: K=0 closure returned {} outputs, \
@@ -539,11 +570,12 @@ where
         .context("speculative_batched: upload h_base")?;
 
     // --- 2. Generate K MTP drafts. ---
+    // MTP draft RoPE rotates at base_rope + k regardless of mode.
     let drafts_records = run_mtp_draft_chain(
         ordinal,
         geom,
         mtp,
-        base_position,
+        base_rope,
         &h_base_buf,
         first_token_id,
         num_drafts,
@@ -555,11 +587,15 @@ where
     .context("speculative_batched: MTP draft chain")?;
     let drafts: Vec<u32> = drafts_records.iter().map(|r| r.draft_token_id).collect();
 
-    // --- 3. Build K+1 verify (position, input) pairs. ---
-    let mut verify_inputs: Vec<(i32, u32)> = Vec::with_capacity(num_drafts + 1);
-    verify_inputs.push((base_position, first_token_id));
+    // --- 3. Build K+1 verify (PositionPair, input) pairs. ---
+    let mut verify_inputs: Vec<(PositionPair, u32)> = Vec::with_capacity(num_drafts + 1);
+    verify_inputs.push((PositionPair::split(base_rope, base_cache), first_token_id));
     for k in 0..num_drafts {
-        verify_inputs.push((base_position + (k as i32) + 1, drafts[k]));
+        let k_i32 = k as i32;
+        verify_inputs.push((
+            PositionPair::split(base_rope + k_i32 + 1, base_cache + k_i32 + 1),
+            drafts[k],
+        ));
     }
 
     // --- 4. Run the batched closure once. ---

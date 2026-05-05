@@ -44,7 +44,7 @@ use runner::qwen36_moe_mtp::{
 use runner::qwen36_moe_speculative::{
     run_speculative_decode_step, run_speculative_decode_step_batched, SpeculativeStepResult,
 };
-use runner::qwen36_moe_types::{FullAttnKvCache, MtpLayerBuffers, MultiLayerGeom};
+use runner::qwen36_moe_types::{FullAttnKvCache, MtpLayerBuffers, MultiLayerGeom, PositionPair};
 use safetensors::SafeTensors;
 use serde_json::Value;
 
@@ -756,7 +756,7 @@ fn qwen36_moe_speculative_driver_orchestration() {
     let mut step_idx = 0usize;
     let want_drafts_p1 = want_drafts.clone();
     let synth_fh_p1 = synth_fh.clone();
-    let base_step_p1 = move |_pos: i32, _input: u32| -> anyhow::Result<(u32, Vec<u8>)> {
+    let base_step_p1 = move |_pos: PositionPair, _input: u32| -> anyhow::Result<(u32, Vec<u8>)> {
         let predicted = if step_idx < want_drafts_p1.len() {
             want_drafts_p1[step_idx]
         } else {
@@ -776,7 +776,8 @@ fn qwen36_moe_speculative_driver_orchestration() {
         &lm_head_w,
         &h_base_bytes,
         base_next_token_id,
-        base_seq_len,
+        base_seq_len, // base_rope
+        base_seq_len, // base_cache (== base_rope in dense MTP)
         k,
         base_step_p1,
     )
@@ -796,7 +797,7 @@ fn qwen36_moe_speculative_driver_orchestration() {
         let mut step_idx = 0usize;
         let first_match = want_drafts[0];
         let synth_fh_p2 = synth_fh.clone();
-        let base_step_p2 = move |_pos: i32, _input: u32| -> anyhow::Result<(u32, Vec<u8>)> {
+        let base_step_p2 = move |_pos: PositionPair, _input: u32| -> anyhow::Result<(u32, Vec<u8>)> {
             let predicted = if step_idx == 0 { first_match } else { bad_pred };
             step_idx += 1;
             Ok((predicted, synth_fh_p2.clone()))
@@ -812,7 +813,8 @@ fn qwen36_moe_speculative_driver_orchestration() {
             &lm_head_w,
             &h_base_bytes,
             base_next_token_id,
-            base_seq_len,
+            base_seq_len, // base_rope
+            base_seq_len, // base_cache (== base_rope in dense MTP)
             k,
             base_step_p2,
         )
@@ -830,7 +832,7 @@ fn qwen36_moe_speculative_driver_orchestration() {
     // ---- Pass 3: zero-accept (immediate reject) ----
     let bad_pred: u32 = 67890;
     let synth_fh_p3 = synth_fh.clone();
-    let base_step_p3 = move |_pos: i32, _input: u32| -> anyhow::Result<(u32, Vec<u8>)> {
+    let base_step_p3 = move |_pos: PositionPair, _input: u32| -> anyhow::Result<(u32, Vec<u8>)> {
         Ok((bad_pred, synth_fh_p3.clone()))
     };
     eprintln!("[spec] pass 3 (reject at k=0)");
@@ -844,7 +846,8 @@ fn qwen36_moe_speculative_driver_orchestration() {
         &lm_head_w,
         &h_base_bytes,
         base_next_token_id,
-        base_seq_len,
+        base_seq_len, // base_rope
+        base_seq_len, // base_cache (== base_rope in dense MTP)
         k,
         base_step_p3,
     )
@@ -870,7 +873,7 @@ fn qwen36_moe_speculative_driver_orchestration() {
     let k0_pred: u32 = 4242;
     let synth_fh_p4 = synth_fh.clone();
     let mut p4_calls = 0usize;
-    let base_step_p4 = move |_pos: i32, _input: u32| -> anyhow::Result<(u32, Vec<u8>)> {
+    let base_step_p4 = move |_pos: PositionPair, _input: u32| -> anyhow::Result<(u32, Vec<u8>)> {
         p4_calls += 1;
         assert_eq!(p4_calls, 1, "K=0 must run exactly one base step");
         Ok((k0_pred, synth_fh_p4.clone()))
@@ -886,7 +889,8 @@ fn qwen36_moe_speculative_driver_orchestration() {
         &lm_head_w,
         &h_base_bytes,
         base_next_token_id,
-        base_seq_len,
+        base_seq_len, // base_rope
+        base_seq_len, // base_cache (== base_rope in dense MTP)
         /* num_drafts */ 0,
         base_step_p4,
     )
@@ -970,7 +974,7 @@ fn qwen36_moe_speculative_driver_orchestration_batched() {
     let bonus_token: u32 = 999;
     let want_drafts_p1 = want_drafts.clone();
     let synth_fh_p1 = synth_fh.clone();
-    let base_step_batched_p1 = move |inputs: &[(i32, u32)]| -> anyhow::Result<Vec<(u32, Vec<u8>)>> {
+    let base_step_batched_p1 = move |inputs: &[(PositionPair, u32)]| -> anyhow::Result<Vec<(u32, Vec<u8>)>> {
         assert_eq!(inputs.len(), k + 1, "expected K+1 inputs");
         // Predictions: drafts[0..K] match, then bonus for K-th.
         let mut out: Vec<(u32, Vec<u8>)> = Vec::with_capacity(k + 1);
@@ -990,7 +994,8 @@ fn qwen36_moe_speculative_driver_orchestration_batched() {
         &lm_head_w,
         &h_base_bytes,
         base_next_token_id,
-        base_seq_len,
+        base_seq_len, // base_rope
+        base_seq_len, // base_cache (== base_rope in dense MTP)
         k,
         base_step_batched_p1,
     )
@@ -1010,7 +1015,7 @@ fn qwen36_moe_speculative_driver_orchestration_batched() {
         let first_match = want_drafts[0];
         let synth_fh_p2 = synth_fh.clone();
         let base_step_batched_p2 =
-            move |inputs: &[(i32, u32)]| -> anyhow::Result<Vec<(u32, Vec<u8>)>> {
+            move |inputs: &[(PositionPair, u32)]| -> anyhow::Result<Vec<(u32, Vec<u8>)>> {
                 assert_eq!(inputs.len(), k + 1);
                 let mut out: Vec<(u32, Vec<u8>)> = Vec::with_capacity(k + 1);
                 // Index 0 matches drafts[0]
@@ -1034,7 +1039,8 @@ fn qwen36_moe_speculative_driver_orchestration_batched() {
             &lm_head_w,
             &h_base_bytes,
             base_next_token_id,
-            base_seq_len,
+            base_seq_len, // base_rope
+            base_seq_len, // base_cache (== base_rope in dense MTP)
             k,
             base_step_batched_p2,
         )
@@ -1054,7 +1060,7 @@ fn qwen36_moe_speculative_driver_orchestration_batched() {
     // ---- Pass 3: zero-accept (immediate reject at k=0) ----
     let bad_pred: u32 = 67890;
     let synth_fh_p3 = synth_fh.clone();
-    let base_step_batched_p3 = move |inputs: &[(i32, u32)]| -> anyhow::Result<Vec<(u32, Vec<u8>)>> {
+    let base_step_batched_p3 = move |inputs: &[(PositionPair, u32)]| -> anyhow::Result<Vec<(u32, Vec<u8>)>> {
         assert_eq!(inputs.len(), k + 1);
         let mut out: Vec<(u32, Vec<u8>)> = Vec::with_capacity(k + 1);
         out.push((bad_pred, synth_fh_p3.clone())); // immediate reject
@@ -1073,7 +1079,8 @@ fn qwen36_moe_speculative_driver_orchestration_batched() {
         &lm_head_w,
         &h_base_bytes,
         base_next_token_id,
-        base_seq_len,
+        base_seq_len, // base_rope
+        base_seq_len, // base_cache (== base_rope in dense MTP)
         k,
         base_step_batched_p3,
     )
@@ -1088,7 +1095,7 @@ fn qwen36_moe_speculative_driver_orchestration_batched() {
     // ---- Pass 4: K=0 fallback ----
     let k0_pred: u32 = 4242;
     let synth_fh_p4 = synth_fh.clone();
-    let base_step_batched_p4 = move |inputs: &[(i32, u32)]| -> anyhow::Result<Vec<(u32, Vec<u8>)>> {
+    let base_step_batched_p4 = move |inputs: &[(PositionPair, u32)]| -> anyhow::Result<Vec<(u32, Vec<u8>)>> {
         assert_eq!(inputs.len(), 1, "K=0 fallback runs exactly one base step");
         Ok(vec![(k0_pred, synth_fh_p4.clone())])
     };
@@ -1102,7 +1109,8 @@ fn qwen36_moe_speculative_driver_orchestration_batched() {
         &lm_head_w,
         &h_base_bytes,
         base_next_token_id,
-        base_seq_len,
+        base_seq_len, // base_rope
+        base_seq_len, // base_cache (== base_rope in dense MTP)
         /* K */ 0,
         base_step_batched_p4,
     )
@@ -1171,7 +1179,7 @@ fn qwen36_moe_speculative_driver_batched_reject_at_last_index() {
     // Post-fix: n_accepted=0 != K → no bonus, emitted=[bad_pred].
     let bad_pred_k1: u32 = 7777;
     let synth_fh_k1 = synth_fh.clone();
-    let base_step_k1 = move |inputs: &[(i32, u32)]| -> anyhow::Result<Vec<(u32, Vec<u8>)>> {
+    let base_step_k1 = move |inputs: &[(PositionPair, u32)]| -> anyhow::Result<Vec<(u32, Vec<u8>)>> {
         assert_eq!(inputs.len(), 2, "K=1 → K+1=2 verify inputs");
         // K+1 = 2 predictions: index 0 mismatches drafts[0],
         // index 1 (bonus) is filler — must NOT appear in emitted.
@@ -1190,7 +1198,8 @@ fn qwen36_moe_speculative_driver_batched_reject_at_last_index() {
         &lm_head_w,
         &h_base_bytes,
         base_next_token_id,
-        base_seq_len,
+        base_seq_len, // base_rope
+        base_seq_len, // base_cache (== base_rope in dense MTP)
         /* K */ 1,
         base_step_k1,
     )
@@ -1221,7 +1230,7 @@ fn qwen36_moe_speculative_driver_batched_reject_at_last_index() {
     let first_match = oracle_drafts[0];
     let bad_pred_k2: u32 = 8888;
     let synth_fh_k2 = synth_fh.clone();
-    let base_step_k2 = move |inputs: &[(i32, u32)]| -> anyhow::Result<Vec<(u32, Vec<u8>)>> {
+    let base_step_k2 = move |inputs: &[(PositionPair, u32)]| -> anyhow::Result<Vec<(u32, Vec<u8>)>> {
         assert_eq!(inputs.len(), 3, "K=2 → K+1=3 verify inputs");
         Ok(vec![
             (first_match, synth_fh_k2.clone()), // accepts drafts[0]
@@ -1239,7 +1248,8 @@ fn qwen36_moe_speculative_driver_batched_reject_at_last_index() {
         &lm_head_w,
         &h_base_bytes,
         base_next_token_id,
-        base_seq_len,
+        base_seq_len, // base_rope
+        base_seq_len, // base_cache (== base_rope in dense MTP)
         /* K */ 2,
         base_step_k2,
     )
