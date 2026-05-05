@@ -293,34 +293,25 @@ __global__ void supersonic_qwen35_full_attention_prefill_kernel(
             local_dims[local_count++] = d;
         }
 
+        // Online single-pass softmax (FlashAttention recurrence).
+        //
+        //   m_i = running max of scores
+        //   l_i = running denom (sum of exp(score - m_i))
+        //   acc = running output accumulator (in registers, per lane)
+        //
+        // On each new k_pos we form score = Q · K[k_pos] * scale, take
+        // m_new = max(m_i, score), rescale (acc, l_i) by alpha = exp(m_i - m_new),
+        // add the new contribution exp(score - m_new) * V[k_pos], and update m_i.
+        // Final out = acc / l_i.
+
         __shared__ float shared_max;
-        __shared__ float shared_denom;
+        __shared__ float shared_alpha;
         __shared__ float shared_weight;
+        __shared__ float shared_denom;
         __shared__ float shared_inv_denom;
 
         if (lane == 0) {
             shared_max = -INFINITY;
-        }
-        __syncthreads();
-
-        for (int k_pos = 0; k_pos < causal_limit; ++k_pos) {
-            const T* k_row = k_head_ptr + k_pos * head_dim;
-
-            float partial = 0.0f;
-            for (int d = lane; d < head_dim; d += warpSize) {
-                partial += supersonic_qwen35_to_float(q_row[d]) * supersonic_qwen35_to_float(k_row[d]);
-            }
-            float score = supersonic_qwen35_wave_sum(partial) * scale;
-
-            if (lane == 0) {
-                if (score > shared_max) {
-                    shared_max = score;
-                }
-            }
-            __syncthreads();
-        }
-
-        if (lane == 0) {
             shared_denom = 0.0f;
         }
         __syncthreads();
@@ -336,13 +327,23 @@ __global__ void supersonic_qwen35_full_attention_prefill_kernel(
             float score = supersonic_qwen35_wave_sum(partial) * scale;
 
             if (lane == 0) {
-                shared_weight = expf(score - shared_max);
-                shared_denom += shared_weight;
+                float m_old = shared_max;
+                float m_new = score > m_old ? score : m_old;
+                // alpha == 0 on the very first iteration (m_old = -inf): we
+                // explicitly zero the accumulators rather than evaluating
+                // expf(-inf - finite) which can produce NaN on some HW.
+                float alpha = (m_old == -INFINITY) ? 0.0f : expf(m_old - m_new);
+                shared_alpha = alpha;
+                shared_weight = expf(score - m_new);
+                shared_denom = shared_denom * alpha + shared_weight;
+                shared_max = m_new;
             }
             __syncthreads();
 
+            const float alpha = shared_alpha;
+            const float weight = shared_weight;
             for (int i = 0; i < local_count; ++i) {
-                local_acc[i] += shared_weight * supersonic_qwen35_to_float(v_row[local_dims[i]]);
+                local_acc[i] = local_acc[i] * alpha + weight * supersonic_qwen35_to_float(v_row[local_dims[i]]);
             }
             __syncthreads();
         }
@@ -351,8 +352,9 @@ __global__ void supersonic_qwen35_full_attention_prefill_kernel(
             shared_inv_denom = shared_denom > 0.0f ? 1.0f / shared_denom : 0.0f;
         }
         __syncthreads();
+        const float inv_denom = shared_inv_denom;
         for (int i = 0; i < local_count; ++i) {
-            out_row[local_dims[i]] = local_acc[i] * shared_inv_denom;
+            out_row[local_dims[i]] = local_acc[i] * inv_denom;
         }
         __syncthreads();
     }
