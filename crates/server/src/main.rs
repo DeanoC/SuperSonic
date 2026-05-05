@@ -127,6 +127,11 @@ struct Cli {
     )]
     prefix_cache_max_entries: usize,
 
+    /// Maximum resident prefix snapshot bytes. Defaults to an automatic
+    /// conservative VRAM budget; set to 0 to disable the byte cap.
+    #[arg(long, env = "SUPERSONIC_PREFIX_CACHE_MAX_BYTES")]
+    prefix_cache_max_bytes: Option<usize>,
+
     /// In-memory prefix cache TTL in seconds.
     #[arg(
         long,
@@ -174,6 +179,7 @@ fn main() -> Result<()> {
         prefix_cache_dir: cli.prefix_cache_dir,
         prefix_cache_min_tokens: cli.prefix_cache_min_tokens,
         prefix_cache_max_entries: cli.prefix_cache_max_entries,
+        prefix_cache_max_bytes: cli.prefix_cache_max_bytes,
         prefix_cache_memory_ttl_secs: cli.prefix_cache_memory_ttl_secs,
         prefix_cache_disk_ttl_secs: cli.prefix_cache_disk_ttl_secs,
     };

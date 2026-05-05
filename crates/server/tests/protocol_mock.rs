@@ -64,6 +64,7 @@ fn test_state_with_scheduler(
             dir: std::env::temp_dir().join("supersonic-test-prefix-cache"),
             min_tokens: 1,
             max_entries: 1,
+            max_bytes: 64 * 1024 * 1024,
             memory_ttl_secs: 600,
             disk_ttl_secs: 86_400,
         })),
@@ -441,6 +442,7 @@ async fn mock_auth_cors_and_model_mismatch() {
         .expect("capabilities json");
     assert_eq!(capabilities["prefix_cache"]["enabled"], true);
     assert_eq!(capabilities["prefix_cache"]["min_tokens"], 1);
+    assert_eq!(capabilities["prefix_cache"]["max_bytes"], 64 * 1024 * 1024);
 
     let missing_model = h
         .client
@@ -465,6 +467,8 @@ async fn mock_auth_cors_and_model_mismatch() {
     assert!(metrics.contains("supersonic_queued_requests"));
     assert!(metrics.contains("supersonic_prefix_cache_hits"));
     assert!(metrics.contains("supersonic_prefix_cache_cached_tokens"));
+    assert!(metrics.contains("supersonic_prefix_cache_resident_bytes"));
+    assert!(metrics.contains("supersonic_prefix_cache_admission_skips"));
 
     let cors = h
         .client

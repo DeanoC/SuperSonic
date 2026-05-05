@@ -42,6 +42,9 @@ Optional deployment flags:
     caching. The default is `128`.
   - `--prefix-cache-max-entries N` caps resident prefix snapshots. Snapshots
     clone model state on GPU; the conservative default is `1`.
+  - `--prefix-cache-max-bytes N` caps resident prefix snapshot bytes. The
+    default is an automatic conservative VRAM budget; set `0` to disable the
+    byte cap.
   - `--prefix-cache-memory-ttl-secs N` controls `in_memory` retention. The
     default is `600`.
   - `--prefix-cache-disk-ttl-secs N` controls `24h` metadata retention. The
@@ -123,6 +126,11 @@ uncached suffix, and reports the reused prompt tokens as
 `usage.prompt_tokens_details.cached_tokens`. The cache is scoped by model, API
 key, user/thread metadata, and `prompt_cache_key` to avoid accidental cross-user
 reuse.
+
+Resident snapshots are admitted only when they fit both the entry-count cap and
+the byte budget. This avoids cloning large model states into cache on GPUs that
+do not have enough spare VRAM. `/v1/capabilities` and `/metrics` expose current
+resident bytes, byte budget, and admission skips.
 
 `prompt_cache_retention` accepts:
 

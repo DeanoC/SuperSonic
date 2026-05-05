@@ -999,6 +999,40 @@ fn restore_virtual_kv_image_mapped(
 }
 
 impl LayerState {
+    pub fn resident_gpu_bytes(&self) -> usize {
+        let mut total = 0usize;
+        let mut add = |buf: &Option<GpuBuffer>| {
+            if let Some(buf) = buf {
+                total = total.saturating_add(buf.len_bytes());
+            }
+        };
+        add(&self.kv_cache_k);
+        add(&self.kv_cache_v);
+        add(&self.kv_scale_k);
+        add(&self.kv_scale_v);
+        add(&self.kv_shadow_k);
+        add(&self.kv_shadow_v);
+        add(&self.certified_kv_key_i8);
+        add(&self.certified_kv_key_scale);
+        add(&self.certified_kv_key_zero);
+        add(&self.certified_kv_value_i4);
+        add(&self.certified_kv_value_scale);
+        add(&self.certified_kv_value_zero);
+        add(&self.certified_kv_value_error);
+        add(&self.certified_kv_value_norm);
+        add(&self.certified_kv_tail_k);
+        add(&self.certified_kv_tail_v);
+        add(&self.certified_kv_promoted_key_cache);
+        add(&self.certified_kv_promoted_key_cache_tags_gpu);
+        add(&self.certified_kv_promoted_key_cache_lru_gpu);
+        add(&self.certified_kv_promoted_value_cache);
+        add(&self.certified_kv_ranking_prefix_k);
+        add(&self.certified_kv_ranking_prefix_v);
+        add(&self.conv_state);
+        add(&self.recurrent_state);
+        total
+    }
+
     /// Deep-copy all GPU buffers to create an independent clone.
     pub fn clone_gpu(&self) -> Result<Self, GpuError> {
         let clone_opt = |opt: &Option<GpuBuffer>| -> Result<Option<GpuBuffer>, GpuError> {
@@ -1236,6 +1270,13 @@ impl ModelState {
             layers.push(ls.clone_gpu()?);
         }
         Ok(Self { layers })
+    }
+
+    pub fn resident_gpu_bytes(&self) -> usize {
+        self.layers
+            .iter()
+            .map(LayerState::resident_gpu_bytes)
+            .fold(0usize, usize::saturating_add)
     }
 
     /// Capture `(conv_state, recurrent_state)` for every linear-attention

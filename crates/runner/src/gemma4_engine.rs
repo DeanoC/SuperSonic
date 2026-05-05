@@ -604,6 +604,12 @@ pub struct Gemma4EngineSnapshot {
 }
 
 impl Gemma4EngineSnapshot {
+    pub fn resident_bytes(&self) -> usize {
+        buffers_bytes(&self.k_caches)
+            .saturating_add(buffers_bytes(&self.v_caches))
+            .saturating_add(self.logits.len().saturating_mul(std::mem::size_of::<f32>()))
+    }
+
     pub fn try_clone(&self) -> Result<Self> {
         Ok(Self {
             k_caches: clone_buffers(&self.k_caches, "Gemma 4 K snapshot")?,
@@ -611,6 +617,13 @@ impl Gemma4EngineSnapshot {
             logits: self.logits.clone(),
         })
     }
+}
+
+fn buffers_bytes(buffers: &[GpuBuffer]) -> usize {
+    buffers
+        .iter()
+        .map(GpuBuffer::len_bytes)
+        .fold(0usize, usize::saturating_add)
 }
 
 fn clone_buffers(buffers: &[GpuBuffer], label: &str) -> Result<Vec<GpuBuffer>> {
@@ -1198,6 +1211,12 @@ impl Gemma4Engine {
             v_caches: clone_buffers(&self.v_caches[0], "Gemma 4 V prefix")?,
             logits,
         })
+    }
+
+    pub fn prefix_snapshot_bytes(&self, logits_len: usize) -> usize {
+        buffers_bytes(&self.k_caches[0])
+            .saturating_add(buffers_bytes(&self.v_caches[0]))
+            .saturating_add(logits_len.saturating_mul(std::mem::size_of::<f32>()))
     }
 
     pub fn restore_prefix(&mut self, snapshot: &Gemma4EngineSnapshot) -> Result<Vec<f32>> {

@@ -869,6 +869,12 @@ pub struct DecodeEngineSnapshot {
 }
 
 impl DecodeEngineSnapshot {
+    pub fn resident_bytes(&self) -> usize {
+        self.state
+            .resident_gpu_bytes()
+            .saturating_add(self.logits.len().saturating_mul(std::mem::size_of::<f32>()))
+    }
+
     pub fn try_clone(&self) -> Result<Self> {
         Ok(Self {
             state: self
@@ -10397,6 +10403,12 @@ impl DecodeEngine {
                 .map_err(|e| anyhow::anyhow!("snapshot Qwen prefix state: {e}"))?,
             logits,
         })
+    }
+
+    pub fn prefix_snapshot_bytes(&self, logits_len: usize) -> usize {
+        self.state
+            .resident_gpu_bytes()
+            .saturating_add(logits_len.saturating_mul(std::mem::size_of::<f32>()))
     }
 
     pub fn restore_prefix(&mut self, snapshot: &DecodeEngineSnapshot) -> Result<Vec<f32>> {

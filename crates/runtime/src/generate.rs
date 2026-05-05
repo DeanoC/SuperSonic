@@ -343,14 +343,7 @@ fn run(
     };
 
     if let Some(cache_req) = cache.as_ref() {
-        match guard.snapshot_prefix(prefill_logits.clone()) {
-            Ok(snapshot) => {
-                if let Err(e) = state.prefix_cache.insert(cache_req, &prompt_ids, snapshot) {
-                    tracing::warn!("prefix cache insert failed: {e}");
-                }
-            }
-            Err(e) => tracing::debug!("prefix cache snapshot skipped: {e}"),
-        }
+        snapshot_prefix_if_admitted(&guard, &state, cache_req, &prompt_ids, &prefill_logits);
     }
 
     let mut rng = rng_from_seed(params.seed);
@@ -429,17 +422,13 @@ fn run(
 
     if state_token_ids.len() > prompt_ids.len() {
         if let Some(cache_req) = cache.as_ref() {
-            match guard.snapshot_prefix(current_logits.clone()) {
-                Ok(snapshot) => {
-                    if let Err(e) = state
-                        .prefix_cache
-                        .insert(cache_req, &state_token_ids, snapshot)
-                    {
-                        tracing::warn!("prefix cache generated-prefix insert failed: {e}");
-                    }
-                }
-                Err(e) => tracing::debug!("generated prefix cache snapshot skipped: {e}"),
-            }
+            snapshot_prefix_if_admitted(
+                &guard,
+                &state,
+                cache_req,
+                &state_token_ids,
+                &current_logits,
+            );
         }
     }
 
@@ -467,21 +456,33 @@ fn prefill_with_cache_anchor(
     }
 
     let mut logits = guard.prefill(&prompt_ids[..anchor_len])?;
-    match guard.snapshot_prefix(logits.clone()) {
-        Ok(snapshot) => {
-            if let Err(e) = state
-                .prefix_cache
-                .insert(cache_req, &prompt_ids[..anchor_len], snapshot)
-            {
-                tracing::warn!("prefix cache anchor insert failed: {e}");
-            }
-        }
-        Err(e) => tracing::debug!("prefix cache anchor snapshot skipped: {e}"),
-    }
+    snapshot_prefix_if_admitted(guard, state, cache_req, &prompt_ids[..anchor_len], &logits);
     for (idx, token) in prompt_ids.iter().copied().enumerate().skip(anchor_len) {
         logits = guard.decode_step(token, idx)?;
     }
     Ok(logits)
+}
+
+fn snapshot_prefix_if_admitted(
+    guard: &InferenceSession,
+    state: &ServerState,
+    cache_req: &CacheRequest,
+    token_ids: &[u32],
+    logits: &[f32],
+) {
+    let estimate = guard.prefix_snapshot_bytes(logits.len());
+    if !state.prefix_cache.can_admit(token_ids.len(), estimate) {
+        state.prefix_cache.record_admission_skip();
+        return;
+    }
+    match guard.snapshot_prefix(logits.to_vec()) {
+        Ok(snapshot) => {
+            if let Err(e) = state.prefix_cache.insert(cache_req, token_ids, snapshot) {
+                tracing::warn!("prefix cache insert failed: {e}");
+            }
+        }
+        Err(e) => tracing::debug!("prefix cache snapshot skipped: {e}"),
+    }
 }
 
 fn detokenize(tokenizer: &Tokenizer, ids: &[u32]) -> String {
