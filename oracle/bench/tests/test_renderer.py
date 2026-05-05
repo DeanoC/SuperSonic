@@ -50,3 +50,23 @@ def test_hipfire_table_matches_golden():
         engine="hipfire",
     )
     assert rendered.strip() == GOLDEN_HIPFIRE.strip()
+
+
+def test_diff_flags_regressions_above_threshold():
+    from oracle.bench.render.diff import diff_runs
+    fixtures = Path(__file__).parent / "fixtures"
+    rows = diff_runs(fixtures / "run_baseline", fixtures / "run_minimal", threshold_pct=5.0)
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["model"] == "qwen3.5-0.8b"
+    assert r["quant"] == "bf16"
+    assert r["before"] == 7.5
+    assert r["after"] == 8.0
+    assert abs(r["delta_pct"] - 6.666) < 0.1
+
+
+def test_diff_below_threshold_is_omitted():
+    from oracle.bench.render.diff import diff_runs
+    fixtures = Path(__file__).parent / "fixtures"
+    rows = diff_runs(fixtures / "run_baseline", fixtures / "run_minimal", threshold_pct=10.0)
+    assert rows == []

@@ -14,6 +14,11 @@ def main():
     render.add_argument("--out", required=True, type=Path,
                         help="Repo root containing docs/quality.md and docs/performance.md")
 
+    diff = sub.add_parser("diff")
+    diff.add_argument("--run-a", required=True, type=Path)
+    diff.add_argument("--run-b", required=True, type=Path)
+    diff.add_argument("--threshold-pct", type=float, default=5.0)
+
     args = ap.parse_args()
     if args.cmd == "markdown":
         perf_md = render_perf_table(args.run / "perf")
@@ -36,6 +41,11 @@ def main():
             updated = replace_autogen_zone(perf_doc.read_text(), "hipfire-comparison", hipfire_md)
             perf_doc.write_text(updated)
             print(f"updated hipfire-comparison zone in {perf_doc}")
+
+    if args.cmd == "diff":
+        from .diff import diff_runs, render_diff_table
+        rows = diff_runs(args.run_a, args.run_b, threshold_pct=args.threshold_pct)
+        print(render_diff_table(rows))
 
 
 if __name__ == "__main__":
