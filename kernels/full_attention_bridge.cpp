@@ -121,6 +121,51 @@ int full_attention_prefill_device(
 }
 
 template <typename T>
+int full_attention_prefill_tiled_device(
+    int device_ordinal,
+    int batch_size,
+    int q_heads,
+    int kv_heads,
+    int q_len,
+    int kv_len,
+    int head_dim,
+    int num_kv_groups,
+    float scale,
+    int seqlen_offset,
+    const void* query,
+    const void* key,
+    const void* value,
+    void* out
+) {
+    constexpr int BM = 4;
+    constexpr int BK = 64;
+    if (head_dim > 8 * 32) return 132;       // ACC_MAX=8 × warpSize=32 cap
+    if (q_len <= 0) return 0;
+
+    ScopedHipDevice scoped(device_ordinal);
+
+    const int grid_x = (q_len + BM - 1) / BM;
+    dim3 grid(grid_x, q_heads, batch_size);
+    dim3 block(32, BM, 1);   // warpSize × BM warps
+    const size_t lds_bytes = (size_t)2 * BK * head_dim * sizeof(T);
+    if (lds_bytes > 48 * 1024) return 133;   // safety cap
+
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(supersonic_qwen35_full_attention_prefill_tiled_kernel<T, BM, BK>),
+        grid, block, lds_bytes, 0,
+        batch_size, q_heads, kv_heads, q_len, kv_len, head_dim,
+        num_kv_groups, scale, seqlen_offset,
+        static_cast<const T*>(query),
+        static_cast<const T*>(key),
+        static_cast<const T*>(value),
+        static_cast<float*>(out));
+
+    if (hipGetLastError() != hipSuccess) return 134;
+    if (hipDeviceSynchronize() != hipSuccess) return 135;
+    return 0;
+}
+
+template <typename T>
 int linear_prefill_conv_pack_device(
     int device_ordinal,
     int batch_size,
@@ -1900,6 +1945,31 @@ extern "C" int supersonic_qwen35_hip_full_attention_prefill(
     const void* key,
     const void* value,
     void* out) {
+
+    static const bool use_tiled = []{
+        const char* e = std::getenv("SUPERSONIC_PREFILL_ATTN_TILED");
+        return e && e[0] != '\0' && e[0] != '0';
+    }();
+
+    if (use_tiled && dtype == 2) {  // BF16 only for the tiled path; non-BF16 falls through
+        int rc = full_attention_prefill_tiled_device<hip_bfloat16>(
+            static_cast<int>(device_ordinal),
+            static_cast<int>(batch_size),
+            static_cast<int>(q_heads),
+            static_cast<int>(kv_heads),
+            static_cast<int>(q_len),
+            static_cast<int>(kv_len),
+            static_cast<int>(head_dim),
+            static_cast<int>(num_kv_groups),
+            scale,
+            static_cast<int>(seqlen_offset),
+            query, key, value, out);
+        if (rc == 0) return 0;
+        // On any tiled error (LDS overflow, kernel launch fail, dispatch shape unsupported),
+        // fall through to the existing non-tiled path. This matches the spirit of an A/B
+        // gate: a misconfiguration shouldn't break inference.
+    }
+
     switch (dtype) {
     case 0:
         return full_attention_prefill_device<half>(
