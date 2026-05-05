@@ -21,6 +21,13 @@ accumulation). 6-token prompt, 16-token generation, single sequence,
 from the runner's `[result] ms_per_step=N` / `ms_per_tok=N` line after
 one warm-up run; reproduce with `tests/gfx1100/bench_matrix.sh`.
 
+<!-- AUTOGEN BELOW: bench-perf-matrix -->
+| Model           |  BF16 |
+| --------------- | ----: |
+| qwen3.5-0.8b    |   8.0 |
+
+<!-- AUTOGEN END: bench-perf-matrix -->
+
 | Model           | BF16  | INT4  | FP8r  | KV-FP8 |
 |-----------------|------:|------:|------:|-------:|
 | qwen3.5-0.8b    |   8   |  10   |  10   |   85¹  |
@@ -46,6 +53,9 @@ self-consistent. KV-FP8 on Qwen is currently a memory feature
   for the MoE family. INT4-GPTQ is the only viable lane on gfx1100 for
   this model. The dedicated [Qwen3.6-MoE on gfx1100](#qwen36-moe-on-gfx1100)
   section below has the per-stage breakdown.
+
+<!-- AUTOGEN BELOW: hipfire-comparison -->
+<!-- AUTOGEN END: hipfire-comparison -->
 
 ### Translated to tokens/sec
 

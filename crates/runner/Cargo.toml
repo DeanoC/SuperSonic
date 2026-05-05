@@ -72,6 +72,10 @@ required-features = ["bughunt"]
 name = "llama31_certified_kv_microbench"
 path = "src/bin/llama31_certified_kv_microbench.rs"
 
+[[bin]]
+name = "bench_prefill_attn"
+path = "src/bin/bench_prefill_attn.rs"
+
 [dependencies]
 supersonic-core = { path = "../core" }
 gpu-hal = { path = "../gpu-hal" }

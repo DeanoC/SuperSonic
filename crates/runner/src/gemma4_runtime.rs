@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{anyhow, bail, Result};
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -70,6 +70,15 @@ impl Gemma4Runtime {
         match self {
             Self::Bf16(e) => e.replicate_seq0_kv(),
             Self::Int4(e) => e.replicate_seq0_kv(),
+        }
+    }
+
+    /// Run one decode step on sequence 0 with the given token and position.
+    /// Returns the full logit vector for sequence 0.
+    pub(crate) fn decode_step(&mut self, input_token: u32, pos: usize) -> anyhow::Result<Vec<f32>> {
+        match self {
+            Self::Bf16(e) => e.decode_step(input_token, pos),
+            Self::Int4(e) => e.decode_step(input_token, pos),
         }
     }
 
@@ -160,6 +169,17 @@ pub(crate) fn run_gemma4(
         bootstrap_downloaded,
     )?;
     eprintln!("[weights] loaded in {:.0}ms", t0.elapsed().as_millis());
+
+    // Teacher-forced scoring: do not proceed to normal prefill+decode.
+    if cli.teacher_forced {
+        return run_gemma4_teacher_forced(
+            cli,
+            model_variant,
+            entry.backend,
+            &mut engine,
+            &prompt_ids,
+        );
+    }
 
     let oracle_output = if cli.validate {
         let oracle_script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -584,4 +604,128 @@ pub(crate) fn check_gemma4_vram(
         );
     }
     Ok(())
+}
+
+/// Compute the negative log-likelihood of `target_token` under the distribution
+/// implied by `logits` (numerically stable log-softmax).
+fn gemma4_target_nll(logits: &[f32], target_token: u32) -> Result<f64> {
+    let target_idx = target_token as usize;
+    let target_logit = logits.get(target_idx).ok_or_else(|| {
+        anyhow!(
+            "target token {target_token} outside logits len {}",
+            logits.len()
+        )
+    })?;
+    let max_logit = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+    let sum_exp = logits
+        .iter()
+        .map(|&x| ((x as f64) - max_logit).exp())
+        .sum::<f64>();
+    Ok(max_logit + sum_exp.ln() - *target_logit as f64)
+}
+
+/// Score `prompt_ids` with teacher forcing: run GPU prefill over the first
+/// token, then decode step-by-step while feeding the *true* next token rather
+/// than the model's argmax.  Emits a human-readable `[teacher_forced]` line
+/// to stderr and a machine-parseable `[teacher_forced_json]` line to stdout
+/// with the same fields as the Qwen3.5 scorer.
+///
+/// Note: Gemma 4 does not currently have a `prefill_native_with_target_nll`
+/// path (that method is specific to the Qwen3.5 `DecodeEngine`).  This
+/// implementation therefore uses the decode-step-by-step path exclusively
+/// (equivalent to Qwen3.5's `--teacher-forced-decode-step` branch).
+/// All tokens from position 1 onward are scored, giving the same NLL/PPL
+/// semantics; only `teacher_forced_scoring` is different in the JSON.
+pub(crate) fn run_gemma4_teacher_forced(
+    cli: &Cli,
+    model_variant: &ModelVariant,
+    backend: Backend,
+    engine: &mut Gemma4Runtime,
+    prompt_ids: &[u32],
+) -> Result<()> {
+    if prompt_ids.len() < 2 {
+        bail!("--teacher-forced requires at least 2 prompt tokens");
+    }
+    if cli.validate || cli.gpu_validate {
+        bail!("--teacher-forced does not currently support --validate or --gpu-validate");
+    }
+
+    let score_start = Instant::now();
+    let prefill_start = Instant::now();
+
+    // Gemma 4 uses the decode-step-by-step path: prefill on a single token,
+    // then step through the remaining tokens scoring each from its logits.
+    let mut logits = engine.prefill(&prompt_ids[..1])?;
+    let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
+
+    let mut total_nll = 0.0f64;
+    let mut scored_tokens = 0usize;
+    let mut decode_steps = 0usize;
+
+    for target_idx in 1..prompt_ids.len() {
+        total_nll += gemma4_target_nll(&logits, prompt_ids[target_idx])?;
+        scored_tokens += 1;
+        if target_idx + 1 < prompt_ids.len() {
+            let input_token = prompt_ids[target_idx];
+            let pos = target_idx;
+            logits = engine.decode_step(input_token, pos)?;
+            decode_steps += 1;
+        }
+    }
+
+    if scored_tokens == 0 {
+        bail!("--teacher-forced scored zero tokens");
+    }
+
+    let total_ms = score_start.elapsed().as_secs_f64() * 1000.0;
+    let avg_nll = total_nll / scored_tokens as f64;
+    let perplexity = avg_nll.exp();
+    let bits_per_token = avg_nll / std::f64::consts::LN_2;
+    let ms_per_token = total_ms / scored_tokens as f64;
+    eprintln!(
+        "[teacher_forced] tokens={} scored_tokens={} decode_steps={} nll={:.6} avg_nll={:.6} ppl={:.6} bpt={:.6} prefill_ms={:.1} total_ms={:.1} ms_per_token={:.2}",
+        prompt_ids.len(),
+        scored_tokens,
+        decode_steps,
+        total_nll,
+        avg_nll,
+        perplexity,
+        bits_per_token,
+        prefill_ms,
+        total_ms,
+        ms_per_token,
+    );
+    println!(
+        "[teacher_forced_json] {}",
+        serde_json::to_string(&serde_json::json!({
+            "backend": backend_label(backend),
+            "model": model_variant.to_string(),
+            "mode": "dense",
+            "teacher_forced_scoring": "decode_step_logits",
+            "prompt_tokens": prompt_ids.len(),
+            "scored_tokens": scored_tokens,
+            "skipped_boundary_tokens": 0,
+            "dense_prefix_len": 0,
+            "decode_steps": decode_steps,
+            "certified_decode_steps": 0,
+            "total_nll": total_nll,
+            "avg_nll": avg_nll,
+            "perplexity": perplexity,
+            "bits_per_token": bits_per_token,
+            "prefill_ms": prefill_ms,
+            "total_ms": total_ms,
+            "ms_per_token": ms_per_token,
+        }))?
+    );
+    Ok(())
+}
+
+/// See `qwen35_runtime::backend_label` — emit the actual backend in
+/// `[teacher_forced_json]` rather than a stale literal.
+fn backend_label(backend: Backend) -> &'static str {
+    match backend {
+        Backend::Hip => "hip",
+        Backend::Cuda => "cuda",
+        Backend::Metal => "metal",
+    }
 }

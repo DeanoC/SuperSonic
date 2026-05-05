@@ -293,34 +293,25 @@ __global__ void supersonic_qwen35_full_attention_prefill_kernel(
             local_dims[local_count++] = d;
         }
 
+        // Online single-pass softmax (FlashAttention recurrence).
+        //
+        //   m_i = running max of scores
+        //   l_i = running denom (sum of exp(score - m_i))
+        //   acc = running output accumulator (in registers, per lane)
+        //
+        // On each new k_pos we form score = Q · K[k_pos] * scale, take
+        // m_new = max(m_i, score), rescale (acc, l_i) by alpha = exp(m_i - m_new),
+        // add the new contribution exp(score - m_new) * V[k_pos], and update m_i.
+        // Final out = acc / l_i.
+
         __shared__ float shared_max;
-        __shared__ float shared_denom;
+        __shared__ float shared_alpha;
         __shared__ float shared_weight;
+        __shared__ float shared_denom;
         __shared__ float shared_inv_denom;
 
         if (lane == 0) {
             shared_max = -INFINITY;
-        }
-        __syncthreads();
-
-        for (int k_pos = 0; k_pos < causal_limit; ++k_pos) {
-            const T* k_row = k_head_ptr + k_pos * head_dim;
-
-            float partial = 0.0f;
-            for (int d = lane; d < head_dim; d += warpSize) {
-                partial += supersonic_qwen35_to_float(q_row[d]) * supersonic_qwen35_to_float(k_row[d]);
-            }
-            float score = supersonic_qwen35_wave_sum(partial) * scale;
-
-            if (lane == 0) {
-                if (score > shared_max) {
-                    shared_max = score;
-                }
-            }
-            __syncthreads();
-        }
-
-        if (lane == 0) {
             shared_denom = 0.0f;
         }
         __syncthreads();
@@ -336,13 +327,23 @@ __global__ void supersonic_qwen35_full_attention_prefill_kernel(
             float score = supersonic_qwen35_wave_sum(partial) * scale;
 
             if (lane == 0) {
-                shared_weight = expf(score - shared_max);
-                shared_denom += shared_weight;
+                float m_old = shared_max;
+                float m_new = score > m_old ? score : m_old;
+                // alpha == 0 on the very first iteration (m_old = -inf): we
+                // explicitly zero the accumulators rather than evaluating
+                // expf(-inf - finite) which can produce NaN on some HW.
+                float alpha = (m_old == -INFINITY) ? 0.0f : expf(m_old - m_new);
+                shared_alpha = alpha;
+                shared_weight = expf(score - m_new);
+                shared_denom = shared_denom * alpha + shared_weight;
+                shared_max = m_new;
             }
             __syncthreads();
 
+            const float alpha = shared_alpha;
+            const float weight = shared_weight;
             for (int i = 0; i < local_count; ++i) {
-                local_acc[i] += shared_weight * supersonic_qwen35_to_float(v_row[local_dims[i]]);
+                local_acc[i] = local_acc[i] * alpha + weight * supersonic_qwen35_to_float(v_row[local_dims[i]]);
             }
             __syncthreads();
         }
@@ -351,10 +352,150 @@ __global__ void supersonic_qwen35_full_attention_prefill_kernel(
             shared_inv_denom = shared_denom > 0.0f ? 1.0f / shared_denom : 0.0f;
         }
         __syncthreads();
+        const float inv_denom = shared_inv_denom;
         for (int i = 0; i < local_count; ++i) {
-            out_row[local_dims[i]] = local_acc[i] * shared_inv_denom;
+            out_row[local_dims[i]] = local_acc[i] * inv_denom;
         }
         __syncthreads();
+    }
+}
+
+// Stage 3: K-tiled FlashAttention-style prefill attention.
+//
+// Grid:  (ceil(q_len / BM), q_heads, batch)
+// Block: (warpSize, BM)   — BM warps × warpSize lanes
+//
+// Each warp owns one query row qr = block_qr_base + warp_y and walks the
+// K dimension in tiles of BK rows. K and V tiles are loaded into LDS
+// once per tile and shared across all BM warps in the block, dropping
+// global K/V bandwidth by ~BM× vs the single-warp kernel.
+//
+// Per-warp register state:
+//   m_i           (float, running max of softmax scores)
+//   l_i           (float, running denom)
+//   acc[ACC_MAX]  (float per lane, output-side accumulators; up to ACC_MAX
+//                  elements per lane covering ceil(head_dim / warpSize) dims)
+template <typename T, int BM, int BK>
+__global__ void supersonic_qwen35_full_attention_prefill_tiled_kernel(
+    int batch_size,
+    int q_heads,
+    int kv_heads,
+    int q_len,
+    int kv_len,
+    int head_dim,
+    int num_kv_groups,
+    float scale,
+    int seqlen_offset,
+    const T* query,
+    const T* key,
+    const T* value,
+    float* out
+) {
+    constexpr int ACC_MAX = 8;   // head_dim <= 8 * warpSize asserted in launcher
+
+    const int qr_base = blockIdx.x * BM;
+    const int qh      = blockIdx.y;
+    const int batch   = blockIdx.z;
+    const int kv_h    = qh / num_kv_groups;
+    const int warp_y  = threadIdx.y;        // 0..BM-1
+    const int lane    = threadIdx.x;        // 0..warpSize-1
+    const int qr      = qr_base + warp_y;
+    if (lane >= warpSize) return;
+    if (batch >= batch_size || qh >= q_heads) return;
+
+    extern __shared__ unsigned char smem_raw[];
+    T* k_tile = reinterpret_cast<T*>(smem_raw);
+    T* v_tile = k_tile + BK * head_dim;
+
+    const bool active = (qr < q_len);
+    const int causal_limit = active ? min(kv_len, seqlen_offset + qr + 1) : 0;
+
+    const T* q_row = active ? (query + (((batch * q_heads + qh) * q_len + qr) * head_dim)) : nullptr;
+    const T* k_head_ptr = key   + ((batch * kv_heads + kv_h) * kv_len * head_dim);
+    const T* v_head_ptr = value + ((batch * kv_heads + kv_h) * kv_len * head_dim);
+    float*   out_row = active ? (out + (((batch * q_heads + qh) * q_len + qr) * head_dim)) : nullptr;
+
+    // Per-lane output accumulators (in registers). Each lane owns the dims
+    // d = lane, lane + warpSize, lane + 2*warpSize, ... (up to ACC_MAX of them).
+    float acc[ACC_MAX];
+    int   acc_dim[ACC_MAX];
+    int   acc_count = 0;
+    #pragma unroll
+    for (int i = 0; i < ACC_MAX; ++i) acc[i] = 0.0f;
+    for (int d = lane; d < head_dim && acc_count < ACC_MAX; d += warpSize) {
+        acc_dim[acc_count++] = d;
+    }
+
+    float m_i = -INFINITY;
+    float l_i = 0.0f;
+
+    // Iterate K tiles. Even inactive warps must participate in cooperative
+    // loads and __syncthreads() — they just won't write output.
+    const int causal_for_block = active ? causal_limit : 0;
+    // For the cooperative load we need an upper bound on K positions any
+    // warp in this block will need. Different warps can have different
+    // causal_limit values (qr varies). Use the maximum across the block.
+    __shared__ int block_max_kpos;
+    if (threadIdx.x == 0 && threadIdx.y == 0) block_max_kpos = 0;
+    __syncthreads();
+    if (lane == 0) atomicMax(&block_max_kpos, causal_for_block);
+    __syncthreads();
+    const int outer_limit = block_max_kpos;
+
+    for (int tile_base = 0; tile_base < outer_limit; tile_base += BK) {
+        const int tile_len = min(BK, outer_limit - tile_base);
+
+        // Cooperative load: BM warps × warpSize lanes pull tile_len * head_dim
+        // T values into LDS. Stride by total threads = BM * warpSize.
+        const int load_total = tile_len * head_dim;
+        const int total_threads = BM * warpSize;
+        const int linear_tid = warp_y * warpSize + lane;
+        for (int i = linear_tid; i < load_total; i += total_threads) {
+            const int row = i / head_dim;
+            const int col = i - row * head_dim;
+            const int gk_pos = tile_base + row;
+            const size_t off = (size_t)gk_pos * head_dim + (size_t)col;
+            k_tile[i] = k_head_ptr[off];
+            v_tile[i] = v_head_ptr[off];
+        }
+        __syncthreads();
+
+        // Walk this tile, applying the online softmax recurrence per query row.
+        if (active) {
+            const int j_max = min(tile_len, causal_limit - tile_base);
+            for (int j = 0; j < j_max; ++j) {
+                const T* k_row = k_tile + j * head_dim;
+                const T* v_row = v_tile + j * head_dim;
+
+                float partial = 0.0f;
+                for (int d = lane; d < head_dim; d += warpSize) {
+                    partial += supersonic_qwen35_to_float(q_row[d]) * supersonic_qwen35_to_float(k_row[d]);
+                }
+                // wave_sum is a __shfl_down butterfly that leaves the sum
+                // only in lane 0; broadcast it so every lane sees the same
+                // score (each lane runs its own per-output-dim recurrence).
+                float score = __shfl(supersonic_qwen35_wave_sum(partial), 0) * scale;
+
+                const float m_old = m_i;
+                const float m_new = score > m_old ? score : m_old;
+                const float alpha = (m_old == -INFINITY) ? 0.0f : expf(m_old - m_new);
+                const float weight = expf(score - m_new);
+                l_i = l_i * alpha + weight;
+                m_i = m_new;
+
+                for (int i = 0; i < acc_count; ++i) {
+                    acc[i] = acc[i] * alpha + weight * supersonic_qwen35_to_float(v_row[acc_dim[i]]);
+                }
+            }
+        }
+        __syncthreads();   // before next tile reuses k_tile/v_tile
+    }
+
+    if (active) {
+        const float inv = (l_i > 0.0f) ? (1.0f / l_i) : 0.0f;
+        for (int i = 0; i < acc_count; ++i) {
+            out_row[acc_dim[i]] = acc[i] * inv;
+        }
     }
 }
 

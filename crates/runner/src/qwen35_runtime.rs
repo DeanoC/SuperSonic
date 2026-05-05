@@ -1,6 +1,9 @@
-use anyhow::Result;
+use std::time::Instant;
+
+use anyhow::{anyhow, bail, Result};
 
 use crate::bakes::ensure_hf_metadata_present;
+use crate::decode_engine::DecodeEngine;
 use crate::qwen35_alt_runtime::run_qwen35_alt_runtime_if_requested;
 use crate::qwen35_decode_loop::{run_qwen35_decode_loop, Qwen35DecodeLoop};
 use crate::qwen35_decode_modes::{report_qwen35_decode_modes, resolve_qwen35_decode_modes};
@@ -99,6 +102,11 @@ pub(crate) fn run_qwen35(
         q4km_like,
         context_tokens,
     )?;
+
+    // Teacher-forced scoring: do not proceed to normal prefill+decode.
+    if cli.teacher_forced {
+        return run_qwen35_teacher_forced(cli, model_variant, &mut engine, &prompt_ids);
+    }
 
     let oracle_context = resolve_qwen35_oracle_context(cli, backend, ordinal, model_variant);
     let Qwen35Prefill {
@@ -201,4 +209,160 @@ pub(crate) fn run_qwen35(
     })?;
 
     Ok(())
+}
+
+/// Compute the negative log-likelihood of `target_token` under the distribution
+/// implied by `logits` (numerically stable log-softmax).
+fn qwen35_target_nll(logits: &[f32], target_token: u32) -> Result<f64> {
+    let target_idx = target_token as usize;
+    let target_logit = logits.get(target_idx).ok_or_else(|| {
+        anyhow!(
+            "target token {target_token} outside logits len {}",
+            logits.len()
+        )
+    })?;
+    let max_logit = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+    let sum_exp = logits
+        .iter()
+        .map(|&x| ((x as f64) - max_logit).exp())
+        .sum::<f64>();
+    Ok(max_logit + sum_exp.ln() - *target_logit as f64)
+}
+
+/// Score `prompt_ids` with teacher forcing: run GPU prefill over the full
+/// sequence, then decode step-by-step while feeding the *true* next token
+/// rather than the model's argmax.  Emits a human-readable `[teacher_forced]`
+/// line to stderr and a machine-parseable `[teacher_forced_json]` line to
+/// stdout with the same fields as the Llama 3.1 reference scorer.
+pub(crate) fn run_qwen35_teacher_forced(
+    cli: &Cli,
+    model_variant: &ModelVariant,
+    engine: &mut DecodeEngine,
+    prompt_ids: &[u32],
+) -> Result<()> {
+    if prompt_ids.len() < 2 {
+        bail!("--teacher-forced requires at least 2 prompt tokens");
+    }
+    if cli.validate || cli.gpu_validate {
+        bail!("--teacher-forced does not currently support --validate or --gpu-validate");
+    }
+    if cli.trace_prefill_layers
+        || cli.trace_oracle_prefill_layer.is_some()
+        || cli.certified_kv_trace_layer.is_some()
+        || cli.certified_kv_trace_all
+        || cli.certified_kv_shadow_validate
+    {
+        bail!("--teacher-forced does not support trace/debug validation flags yet");
+    }
+
+    let score_start = Instant::now();
+    let prefill_start = Instant::now();
+
+    // Use GPU prefill scoring (full-prompt prefill with per-token NLL) unless
+    // the caller explicitly requested the legacy decode-step-by-step path,
+    // OR the backend is non-CUDA — `cuda_target_nll_bf16` is a CUDA-only kernel
+    // (no HIP/Metal port) so HIP/Metal fall back to the decode-step scorer.
+    let cuda_only_scorer_available = engine.backend() == gpu_hal::Backend::Cuda;
+    let use_gpu_prefill_scoring =
+        !cli.teacher_forced_decode_step && cuda_only_scorer_available;
+
+    let mut total_nll = 0.0f64;
+    let mut scored_tokens = 0usize;
+    let decode_loop_start;
+    let mut logits;
+
+    if use_gpu_prefill_scoring {
+        // Prefill the full prompt and score every position except position 0
+        // (there is no "previous token" to predict position 0 from).
+        let targets = &prompt_ids[1..];
+        let prefill = engine.prefill_native_with_target_nll(prompt_ids, 0, targets)?;
+        let scored = prefill
+            .target_nll
+            .as_ref()
+            .ok_or_else(|| anyhow!("scored prefill did not return target NLL"))?;
+        total_nll += scored.total_nll;
+        scored_tokens += scored.scored_tokens;
+        logits = prefill.logits;
+        decode_loop_start = prompt_ids.len();
+    } else {
+        // Legacy path: prefill on a single token, then decode step by step
+        // scoring each position from its logits.
+        logits = engine.prefill_native(&prompt_ids[..1])?;
+        decode_loop_start = 1;
+    }
+    let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
+
+    let mut decode_steps = 0usize;
+
+    // decode_loop_start is either prompt_ids.len() (gpu prefill path, nothing
+    // left to decode) or 1 (legacy path, must step through remaining tokens).
+    for target_idx in decode_loop_start..prompt_ids.len() {
+        total_nll += qwen35_target_nll(&logits, prompt_ids[target_idx])?;
+        scored_tokens += 1;
+        if target_idx + 1 < prompt_ids.len() {
+            let input_token = prompt_ids[target_idx];
+            let pos = target_idx;
+            logits = engine.decode_step(input_token, pos)?;
+            decode_steps += 1;
+        }
+    }
+
+    if scored_tokens == 0 {
+        bail!("--teacher-forced scored zero tokens");
+    }
+
+    let total_ms = score_start.elapsed().as_secs_f64() * 1000.0;
+    let avg_nll = total_nll / scored_tokens as f64;
+    let perplexity = avg_nll.exp();
+    let bits_per_token = avg_nll / std::f64::consts::LN_2;
+    let ms_per_token = total_ms / scored_tokens as f64;
+    eprintln!(
+        "[teacher_forced] tokens={} scored_tokens={} decode_steps={} nll={:.6} avg_nll={:.6} ppl={:.6} bpt={:.6} prefill_ms={:.1} total_ms={:.1} ms_per_token={:.2}",
+        prompt_ids.len(),
+        scored_tokens,
+        decode_steps,
+        total_nll,
+        avg_nll,
+        perplexity,
+        bits_per_token,
+        prefill_ms,
+        total_ms,
+        ms_per_token,
+    );
+    println!(
+        "[teacher_forced_json] {}",
+        serde_json::to_string(&serde_json::json!({
+            "backend": backend_label(engine.backend()),
+            "model": model_variant.to_string(),
+            "mode": "dense",
+            "teacher_forced_scoring": if use_gpu_prefill_scoring { "gpu_prefill_target_nll" } else { "decode_step_logits" },
+            "prompt_tokens": prompt_ids.len(),
+            "scored_tokens": scored_tokens,
+            "skipped_boundary_tokens": 0,
+            "dense_prefix_len": 0,
+            "decode_steps": decode_steps,
+            "certified_decode_steps": 0,
+            "total_nll": total_nll,
+            "avg_nll": avg_nll,
+            "perplexity": perplexity,
+            "bits_per_token": bits_per_token,
+            "prefill_ms": prefill_ms,
+            "total_ms": total_ms,
+            "ms_per_token": ms_per_token,
+        }))?
+    );
+    Ok(())
+}
+
+/// Map a `gpu_hal::Backend` to the lowercase label embedded in the
+/// `[teacher_forced_json]` payload. Downstream tooling keys per-backend
+/// aggregations off this string, so it MUST match the actual runtime backend
+/// rather than the (Llama-original) hardcoded "hip" literal that the early
+/// drafts of run_qwen35_teacher_forced inherited.
+fn backend_label(backend: gpu_hal::Backend) -> &'static str {
+    match backend {
+        gpu_hal::Backend::Hip => "hip",
+        gpu_hal::Backend::Cuda => "cuda",
+        gpu_hal::Backend::Metal => "metal",
+    }
 }
