@@ -5,9 +5,10 @@
 
 use anyhow::{anyhow, bail, Result};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokenizers::Tokenizer;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 
 use supersonic_core::registry::{self, Backend, GpuArch, ModelFamily, ModelVariant};
 
@@ -15,21 +16,49 @@ use crate::backend_resolver::resolve_backend;
 use crate::bakes::ensure_hf_metadata_present;
 use crate::builders::{build_gemma4, build_qwen};
 use crate::chat_template::ChatTemplate;
+use crate::generate::MockGeneration;
 use crate::session::InferenceSession;
 use supersonic_core::capabilities::{capabilities_for_variant, ModelCapabilities};
+
+static NEXT_SERVER_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Per-process state shared across every HTTP request. Everything here is
 /// built once at startup.
 pub struct ServerState {
+    pub server_instance_id: u64,
     pub model_id: String,
     pub model_family: ModelFamily,
     pub tokenizer: Arc<Tokenizer>,
     pub chat_template: Option<Arc<ChatTemplate>>,
-    pub session: Arc<Mutex<InferenceSession>>,
+    pub session: Option<Arc<Mutex<InferenceSession>>>,
+    pub mock_generation: Option<MockGeneration>,
     pub eos_ids: Vec<u32>,
     pub max_context: usize,
     pub api_key: Option<String>,
+    pub cors_allow_origin: Option<String>,
+    pub response_store_max_entries: usize,
+    pub scheduler: Arc<GenerationScheduler>,
     pub capabilities: ModelCapabilities,
+}
+
+pub struct GenerationScheduler {
+    pub permits: Arc<Semaphore>,
+    pub active: AtomicUsize,
+    pub queued: AtomicUsize,
+    pub max_queue: usize,
+    pub queue_timeout_ms: u64,
+}
+
+impl GenerationScheduler {
+    pub fn new(max_queue: usize, queue_timeout_ms: u64) -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(1)),
+            active: AtomicUsize::new(0),
+            queued: AtomicUsize::new(0),
+            max_queue,
+            queue_timeout_ms,
+        }
+    }
 }
 
 /// Arguments captured from the CLI and forwarded into the loader.
@@ -45,6 +74,10 @@ pub struct LoaderConfig {
     pub fp8_runtime: bool,
     pub kv_fp8: bool,
     pub api_key: Option<String>,
+    pub cors_allow_origin: Option<String>,
+    pub response_store_max_entries: usize,
+    pub max_queued_requests: usize,
+    pub queue_timeout_ms: u64,
     /// Disable automatic bake download from the GitHub release. Air-gapped
     /// or reproducibility-focused deploys should set this.
     pub no_download: bool,
@@ -147,14 +180,22 @@ pub fn build(cfg: LoaderConfig) -> Result<ServerState> {
     );
 
     Ok(ServerState {
+        server_instance_id: NEXT_SERVER_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
         model_id: variant.to_string(),
         model_family: variant.family(),
         tokenizer: Arc::new(tokenizer),
         chat_template,
-        session: Arc::new(Mutex::new(session)),
+        session: Some(Arc::new(Mutex::new(session))),
+        mock_generation: None,
         eos_ids,
         max_context,
         api_key: cfg.api_key,
+        cors_allow_origin: cfg.cors_allow_origin,
+        response_store_max_entries: cfg.response_store_max_entries,
+        scheduler: Arc::new(GenerationScheduler::new(
+            cfg.max_queued_requests,
+            cfg.queue_timeout_ms,
+        )),
         capabilities,
     })
 }
@@ -234,6 +275,10 @@ mod tests {
             fp8_runtime: false,
             kv_fp8: false,
             api_key: None,
+            cors_allow_origin: None,
+            response_store_max_entries: 1024,
+            max_queued_requests: 32,
+            queue_timeout_ms: 30_000,
             no_download: true,
         }
     }

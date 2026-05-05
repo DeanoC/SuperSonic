@@ -4,11 +4,14 @@
 //! unbounded channel so the HTTP layer can either collect them into one
 //! response or stream them as SSE.
 
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use tokenizers::Tokenizer;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio::sync::{OwnedSemaphorePermit, TryAcquireError};
 
 use crate::sampling::{rng_from_seed, sample};
 use crate::session::InferenceSession;
@@ -51,6 +54,31 @@ pub enum GenEvent {
     Error(String),
 }
 
+#[derive(Debug, Clone)]
+pub struct SchedulerSnapshot {
+    pub active: usize,
+    pub queued: usize,
+    pub max_queue: usize,
+    pub queue_timeout_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct MockGeneration {
+    pub chunks: Vec<String>,
+    pub finish: FinishReason,
+    pub delay_ms: u64,
+}
+
+impl MockGeneration {
+    pub fn text(text: impl Into<String>) -> Self {
+        Self {
+            chunks: vec![text.into()],
+            finish: FinishReason::Stop,
+            delay_ms: 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum FinishReason {
     Stop,
@@ -81,8 +109,18 @@ pub fn prepare(
         .encode(prompt_text, add_special_tokens)
         .map_err(|e| anyhow!("tokenize: {e}"))?;
     let prompt_ids: Vec<u32> = encoding.get_ids().to_vec();
+    prepare_ids(state, prompt_ids, max_tokens)
+}
+
+/// Bounds-check pre-tokenized prompt IDs. This is used by compatibility
+/// routes that accept OpenAI-style token-array prompts.
+pub fn prepare_ids(
+    state: &ServerState,
+    prompt_ids: Vec<u32>,
+    max_tokens: usize,
+) -> Result<Vec<u32>> {
     if prompt_ids.is_empty() {
-        return Err(anyhow!("empty prompt after tokenization"));
+        return Err(anyhow!("empty prompt"));
     }
     // `saturating_add` so a pathological `max_tokens` near `usize::MAX` is
     // rejected here rather than overflowing and bypassing the bound.
@@ -106,14 +144,136 @@ pub fn spawn(
     state: Arc<ServerState>,
     prompt_ids: Vec<u32>,
     params: GenParams,
-) -> UnboundedReceiver<GenEvent> {
+) -> Result<UnboundedReceiver<GenEvent>> {
     let (tx, rx) = mpsc::unbounded_channel();
-    tokio::task::spawn_blocking(move || {
-        if let Err(e) = run(state, prompt_ids, params, tx.clone()) {
+
+    let scheduler = state.scheduler.clone();
+    match scheduler.permits.clone().try_acquire_owned() {
+        Ok(permit) => {
+            tokio::spawn(run_with_permit(
+                scheduler, state, prompt_ids, params, tx, permit,
+            ));
+            return Ok(rx);
+        }
+        Err(TryAcquireError::Closed) => {
+            return Err(anyhow!("generation scheduler closed"));
+        }
+        Err(TryAcquireError::NoPermits) => {}
+    }
+
+    let queued = scheduler.queued.fetch_add(1, Ordering::SeqCst) + 1;
+    if queued > scheduler.max_queue {
+        scheduler.queued.fetch_sub(1, Ordering::SeqCst);
+        return Err(anyhow!(
+            "generation queue full (queued={}, max_queue={})",
+            queued - 1,
+            scheduler.max_queue
+        ));
+    }
+
+    tokio::spawn(async move {
+        let acquire = scheduler.permits.clone().acquire_owned();
+        let timeout = tokio::time::sleep(Duration::from_millis(scheduler.queue_timeout_ms));
+        tokio::pin!(timeout);
+        let permit = tokio::select! {
+            permit = acquire => match permit {
+                Ok(permit) => permit,
+                Err(_) => {
+                    scheduler.queued.fetch_sub(1, Ordering::SeqCst);
+                    let _ = tx.send(GenEvent::Error("generation scheduler closed".to_string()));
+                    return;
+                }
+            },
+            _ = &mut timeout => {
+                scheduler.queued.fetch_sub(1, Ordering::SeqCst);
+                let _ = tx.send(GenEvent::Error("generation queue timeout".to_string()));
+                return;
+            },
+            _ = tx.closed() => {
+                scheduler.queued.fetch_sub(1, Ordering::SeqCst);
+                return;
+            }
+        };
+        scheduler.queued.fetch_sub(1, Ordering::SeqCst);
+        run_with_permit(scheduler, state, prompt_ids, params, tx, permit).await;
+    });
+    Ok(rx)
+}
+
+async fn run_with_permit(
+    scheduler: Arc<crate::state::GenerationScheduler>,
+    state: Arc<ServerState>,
+    prompt_ids: Vec<u32>,
+    params: GenParams,
+    tx: UnboundedSender<GenEvent>,
+    permit: OwnedSemaphorePermit,
+) {
+    if tx.is_closed() {
+        drop(permit);
+        return;
+    }
+    scheduler.active.fetch_add(1, Ordering::SeqCst);
+
+    if let Some(mock) = state.mock_generation.clone() {
+        run_mock(mock, &prompt_ids, &params, &tx).await;
+        scheduler.active.fetch_sub(1, Ordering::SeqCst);
+        drop(permit);
+        return;
+    }
+
+    let scheduler_done = scheduler.clone();
+    let join = tokio::task::spawn_blocking(move || {
+        let result = run(state, prompt_ids, params, tx.clone());
+        if let Err(e) = result {
             let _ = tx.send(GenEvent::Error(e.to_string()));
         }
+    })
+    .await;
+    if let Err(e) = join {
+        tracing::error!("generation worker join error: {e}");
+    }
+    scheduler_done.active.fetch_sub(1, Ordering::SeqCst);
+    drop(permit);
+}
+
+pub fn scheduler_snapshot(state: &ServerState) -> SchedulerSnapshot {
+    SchedulerSnapshot {
+        active: state.scheduler.active.load(Ordering::SeqCst),
+        queued: state.scheduler.queued.load(Ordering::SeqCst),
+        max_queue: state.scheduler.max_queue,
+        queue_timeout_ms: state.scheduler.queue_timeout_ms,
+    }
+}
+
+async fn run_mock(
+    mock: MockGeneration,
+    prompt_ids: &[u32],
+    params: &GenParams,
+    tx: &UnboundedSender<GenEvent>,
+) {
+    for chunk in &mock.chunks {
+        if tx.is_closed() || tx.send(GenEvent::Token(chunk.clone())).is_err() {
+            return;
+        }
+        if mock.delay_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(mock.delay_ms)).await;
+        }
+        tokio::task::yield_now().await;
+    }
+    let completion_tokens = mock.chunks.iter().filter(|s| !s.is_empty()).count() as u32;
+    let _ = tx.send(GenEvent::Done {
+        reason: if params.max_tokens == 0 {
+            FinishReason::Length
+        } else {
+            mock.finish
+        },
+        prompt_tokens: prompt_ids.len() as u32,
+        completion_tokens: if params.max_tokens == 0 {
+            0
+        } else {
+            completion_tokens
+        },
     });
-    rx
 }
 
 fn run(
@@ -136,7 +296,11 @@ fn run(
         return Ok(());
     }
 
-    let mut guard = state.session.blocking_lock();
+    let session = state
+        .session
+        .as_ref()
+        .ok_or_else(|| anyhow!("no inference session configured"))?;
+    let mut guard = session.blocking_lock();
     guard.reset()?;
     let prefill_logits = guard.prefill(&prompt_ids)?;
 

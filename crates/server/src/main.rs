@@ -71,6 +71,30 @@ struct Cli {
     #[arg(long, env = "SUPERSONIC_API_KEY")]
     api_key: Option<String>,
 
+    /// Optional CORS allow-origin value for browser clients, e.g.
+    /// `http://localhost:3000` or `*`. Also read from
+    /// `SUPERSONIC_CORS_ALLOW_ORIGIN`.
+    #[arg(long, env = "SUPERSONIC_CORS_ALLOW_ORIGIN")]
+    cors_allow_origin: Option<String>,
+
+    /// Maximum number of `/v1/responses` objects retained in memory.
+    #[arg(
+        long,
+        env = "SUPERSONIC_RESPONSE_STORE_MAX_ENTRIES",
+        default_value_t = 1024
+    )]
+    response_store_max_entries: usize,
+
+    /// Maximum number of requests allowed to wait for the single GPU
+    /// generation slot before new requests receive 429.
+    #[arg(long, env = "SUPERSONIC_MAX_QUEUED_REQUESTS", default_value_t = 32)]
+    max_queued_requests: usize,
+
+    /// Maximum time a request may wait in the generation queue before it
+    /// fails. Also read from `SUPERSONIC_QUEUE_TIMEOUT_MS`.
+    #[arg(long, env = "SUPERSONIC_QUEUE_TIMEOUT_MS", default_value_t = 30_000)]
+    queue_timeout_ms: u64,
+
     /// Disable automatic download of pre-baked weights from the GitHub
     /// `bakes-v{FORMAT_VERSION}` release. With this set, a missing INT4 bake
     /// produces a hard error instead of a fetch.
@@ -99,6 +123,10 @@ fn main() -> Result<()> {
         fp8_runtime: cli.fp8_runtime,
         kv_fp8: cli.kv_fp8,
         api_key: cli.api_key,
+        cors_allow_origin: cli.cors_allow_origin,
+        response_store_max_entries: cli.response_store_max_entries,
+        max_queued_requests: cli.max_queued_requests,
+        queue_timeout_ms: cli.queue_timeout_ms,
         no_download: cli.no_download,
     };
 

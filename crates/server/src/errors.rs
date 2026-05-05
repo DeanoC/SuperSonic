@@ -52,6 +52,30 @@ impl ApiError {
         }
     }
 
+    pub fn too_many_requests(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            body: ApiErrorBody {
+                message: msg.into(),
+                type_: "rate_limit_error".into(),
+                param: None,
+                code: None,
+            },
+        }
+    }
+
+    pub fn unavailable(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            body: ApiErrorBody {
+                message: msg.into(),
+                type_: "server_error".into(),
+                param: None,
+                code: None,
+            },
+        }
+    }
+
     pub fn internal(msg: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,

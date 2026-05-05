@@ -6,6 +6,7 @@ use serde::Serialize;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::generate::{FinishReason, GenEvent};
+use crate::schemas::Usage;
 
 pub type SseEvent = Result<Event, Infallible>;
 
@@ -22,7 +23,7 @@ where
     T: Serialize + 'static,
     D: Serialize + 'static,
     FT: FnMut(String) -> T + 'static,
-    FD: FnMut(FinishReason) -> D + 'static,
+    FD: FnMut(FinishReason, Option<Usage>) -> D + 'static,
 {
     async_stream::stream! {
         while let Some(ev) = rx.recv().await {
@@ -30,8 +31,12 @@ where
                 GenEvent::Token(text) => {
                     yield Ok::<_, Infallible>(json_event(&token_chunk(text)));
                 }
-                GenEvent::Done { reason, .. } => {
-                    yield Ok(json_event(&done_chunk(reason)));
+                GenEvent::Done { reason, prompt_tokens, completion_tokens } => {
+                    yield Ok(json_event(&done_chunk(reason, Some(Usage {
+                        prompt_tokens,
+                        completion_tokens,
+                        total_tokens: prompt_tokens + completion_tokens,
+                    }))));
                     yield Ok(Event::default().data("[DONE]"));
                     return;
                 }

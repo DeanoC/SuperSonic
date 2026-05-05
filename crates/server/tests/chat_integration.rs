@@ -60,6 +60,10 @@ fn load_test_config() -> Option<LoaderConfig> {
         fp8_runtime: fp8,
         kv_fp8,
         api_key: None,
+        cors_allow_origin: None,
+        response_store_max_entries: 1024,
+        max_queued_requests: 32,
+        queue_timeout_ms: 30_000,
         no_download: std::env::var("SUPERSONIC_TEST_NO_DOWNLOAD").is_ok(),
     })
 }

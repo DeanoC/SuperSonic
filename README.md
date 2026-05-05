@@ -40,6 +40,8 @@ to disable network fetches.
   (model, arch, quant) and runtime-feature impact.
 - **[Build and run](docs/build-and-run.md)** — per-backend build commands
   and the validated `supersonic` invocation set.
+- **[OpenAI-compatible server](docs/server.md)** — `supersonic-serve`
+  endpoints and harness compatibility notes.
 - **[Producing release bakes](docs/bake-distribution.md)** — how to
   produce, sign, and publish bakes for a new model variant.
 - **[Testing](docs/testing.md)** — E2E test runner, prerequisites, and
