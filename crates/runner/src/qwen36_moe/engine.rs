@@ -390,6 +390,22 @@ fn decode_text(
         moe_runtime.transition_min_observations,
     );
 
+    // Batched-Q prefill opt-in. Read once. When set the new chunked
+    // path will (eventually) replace the per-token persistent decode
+    // loop for prefill — see docs/superpowers/plans/2026-05-05-qwen36-moe-batched-prefill-phase1.md.
+    // Currently a no-op stub (M1 wires only the env detection); from
+    // M6 onward this routes prefill through the new batched kernels.
+    // Treat unset / empty / "0" as off; anything else as on.
+    let _batched_prefill_requested = std::env::var("SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL")
+        .map(|v| !v.is_empty() && v != "0")
+        .unwrap_or(false);
+    if _batched_prefill_requested {
+        eprintln!(
+            "[qwen36-moe batched-prefill] requested via env (stub mode \
+             — per-token persistent path still active until M6)"
+        );
+    }
+
     for step in 0..loop_state.total_steps {
         // When speculative decode is on, each iteration can commit
         // multiple tokens (up to K+1), so the standard `total_steps =
