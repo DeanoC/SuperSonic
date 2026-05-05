@@ -312,6 +312,7 @@ def build_run_env(
     env.pop("SUPERSONIC_MOE_ISLAND_PREFETCH", None)
     env.pop("SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS", None)
     env.pop("SUPERSONIC_VMM_MOE_ISLANDS", None)
+    env.pop("SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL", None)
     if args.force_moe_vmm or mode.sparse_cap is not None:
         env["SUPERSONIC_VMM_MOE_ISLANDS"] = "1"
     if mode.sparse_cap is not None:
@@ -321,6 +322,8 @@ def build_run_env(
             env["SUPERSONIC_MOE_ISLAND_PREFETCH"] = mode.prefetch_mode
         if mode.prefetch_ranks:
             env["SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS"] = mode.prefetch_ranks
+    if args.batched_prefill:
+        env["SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL"] = "1"
     return env
 
 
@@ -641,6 +644,13 @@ def main() -> int:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="set SUPERSONIC_VMM_MOE_ISLANDS=1 for non-sparse modes too",
+    )
+    parser.add_argument(
+        "--batched-prefill",
+        action="store_true",
+        help="set SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL=1 to engage the "
+             "batched-Q prefill path (no-op until M6; see plans/2026-05-05-"
+             "qwen36-moe-batched-prefill-phase1.md)",
     )
     parser.add_argument("--out-json", type=Path, default=Path("target/qwen36_longctx.json"))
     parser.add_argument("--out-md", type=Path, default=Path("target/qwen36_longctx.md"))
