@@ -259,8 +259,12 @@ pub(crate) fn run_qwen35_teacher_forced(
     let prefill_start = Instant::now();
 
     // Use GPU prefill scoring (full-prompt prefill with per-token NLL) unless
-    // the caller explicitly requested the legacy decode-step-by-step path.
-    let use_gpu_prefill_scoring = !cli.teacher_forced_decode_step;
+    // the caller explicitly requested the legacy decode-step-by-step path,
+    // OR the backend is non-CUDA — `cuda_target_nll_bf16` is a CUDA-only kernel
+    // (no HIP/Metal port) so HIP/Metal fall back to the decode-step scorer.
+    let cuda_only_scorer_available = engine.backend() == gpu_hal::Backend::Cuda;
+    let use_gpu_prefill_scoring =
+        !cli.teacher_forced_decode_step && cuda_only_scorer_available;
 
     let mut total_nll = 0.0f64;
     let mut scored_tokens = 0usize;
