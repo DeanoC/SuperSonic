@@ -2,7 +2,7 @@
 import argparse
 from pathlib import Path
 
-from .markdown import render_perf_table, replace_autogen_zone
+from .markdown import render_perf_table, render_quality_table, replace_autogen_zone
 
 
 def main():
@@ -22,6 +22,13 @@ def main():
             updated = replace_autogen_zone(perf_doc.read_text(), "bench-perf-matrix", perf_md)
             perf_doc.write_text(updated)
             print(f"updated {perf_doc}")
+
+        quality_md = render_quality_table(args.run / "quality")
+        quality_doc_path = args.out / "docs" / "quality.md"
+        quality_doc = quality_doc_path.read_text() if quality_doc_path.exists() else "# Model Quality\n\nMeasured (model, quant) quality for shipping models.\n"
+        updated = replace_autogen_zone(quality_doc, "bench-quality-table", quality_md)
+        quality_doc_path.write_text(updated)
+        print(f"updated {quality_doc_path}")
 
 
 if __name__ == "__main__":

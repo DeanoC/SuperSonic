@@ -47,6 +47,34 @@ def render_perf_table(perf_dir: Path) -> str:
     return "\n".join(rows) + "\n"
 
 
+def render_quality_table(quality_dir: Path) -> str:
+    cells = []
+    for f in sorted(quality_dir.glob("*.json")):
+        cells.append(json.loads(f.read_text()))
+    if not cells:
+        return ""
+
+    by_model_quant: dict[tuple[str, str], dict[str, dict]] = {}
+    for c in cells:
+        by_model_quant.setdefault((c["model"], c["quant"]), {})[c["eval"]] = c
+
+    evals = sorted({c["eval"] for c in cells})
+    headers = ["Model", "Quant"] + evals
+    rows = ["| " + " | ".join(headers) + " |",
+            "|" + "|".join("---" for _ in headers) + "|"]
+    for (model, quant) in sorted(by_model_quant):
+        row_evals = by_model_quant[(model, quant)]
+        cols = [model, quant]
+        for ev in evals:
+            cell = row_evals.get(ev)
+            if cell is None:
+                cols.append("—")
+            else:
+                cols.append(f"{cell['value']:.3f}")
+        rows.append("| " + " | ".join(cols) + " |")
+    return "\n".join(rows) + "\n"
+
+
 _AUTOGEN_BEGIN = "<!-- AUTOGEN BELOW: {key} -->"
 _AUTOGEN_END = "<!-- AUTOGEN END: {key} -->"
 
