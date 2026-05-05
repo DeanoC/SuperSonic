@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/bench",
     "crates/core",
     "crates/gemma4",
     "crates/gpu-hal",
