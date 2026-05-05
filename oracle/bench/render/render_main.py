@@ -2,7 +2,7 @@
 import argparse
 from pathlib import Path
 
-from .markdown import render_perf_table, render_quality_table, replace_autogen_zone
+from .markdown import render_perf_table, render_quality_table, render_external_comparison_table, replace_autogen_zone
 
 
 def main():
@@ -29,6 +29,13 @@ def main():
         updated = replace_autogen_zone(quality_doc, "bench-quality-table", quality_md)
         quality_doc_path.write_text(updated)
         print(f"updated {quality_doc_path}")
+
+        ext_dir = args.run / "external" / "hipfire"
+        if ext_dir.exists() and perf_doc.exists():
+            hipfire_md = render_external_comparison_table(args.run / "perf", ext_dir, "hipfire")
+            updated = replace_autogen_zone(perf_doc.read_text(), "hipfire-comparison", hipfire_md)
+            perf_doc.write_text(updated)
+            print(f"updated hipfire-comparison zone in {perf_doc}")
 
 
 if __name__ == "__main__":

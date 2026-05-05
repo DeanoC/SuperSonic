@@ -37,3 +37,16 @@ def test_autogen_zone_inserted_when_absent():
     out = replace_autogen_zone(original, "hipfire-comparison", "NEW")
     assert "<!-- AUTOGEN BELOW: hipfire-comparison -->" in out
     assert "NEW" in out
+
+
+GOLDEN_HIPFIRE = (Path(__file__).parent / "fixtures" / "golden_hipfire_fragment.md").read_text()
+
+
+def test_hipfire_table_matches_golden():
+    from oracle.bench.render.markdown import render_external_comparison_table
+    rendered = render_external_comparison_table(
+        FIXTURE_DIR / "perf",
+        FIXTURE_DIR / "external" / "hipfire",
+        engine="hipfire",
+    )
+    assert rendered.strip() == GOLDEN_HIPFIRE.strip()

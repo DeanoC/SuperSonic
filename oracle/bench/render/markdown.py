@@ -47,6 +47,32 @@ def render_perf_table(perf_dir: Path) -> str:
     return "\n".join(rows) + "\n"
 
 
+def render_external_comparison_table(perf_dir: Path, external_dir: Path, engine: str) -> str:
+    perf_cells = {}
+    for f in perf_dir.glob("*.json"):
+        d = json.loads(f.read_text())
+        perf_cells[(d["model"], d["quant"])] = d
+    ext_cells = {}
+    for f in external_dir.glob("*.json"):
+        d = json.loads(f.read_text())
+        ext_cells[(d["model"], d["quant"])] = d
+    keys = sorted(set(perf_cells) & set(ext_cells))
+    if not keys:
+        return ""
+
+    header = f"| Model           | Quant | SuperSonic ms/step | {engine} ms/step | Δ vs {engine} |"
+    sep    =  "|-----------------|-------|-------------------:|----------------:|-------------:|"
+    rows = [header, sep]
+    for (model, quant) in keys:
+        p, e = perf_cells[(model, quant)], ext_cells[(model, quant)]
+        if p["status"] != "ok" or e["status"] != "ok":
+            continue
+        ss_ms, ext_ms = p["ms_per_step"], e["ms_per_step"]
+        delta = (ss_ms - ext_ms) / ext_ms * 100 if ext_ms > 0 else 0
+        rows.append(f"| {model.ljust(15)} | {quant.ljust(5)} | {ss_ms:>18.1f} | {ext_ms:>15.1f} | {delta:+11.1f}% |")
+    return "\n".join(rows) + "\n"
+
+
 def render_quality_table(quality_dir: Path) -> str:
     cells = []
     for f in sorted(quality_dir.glob("*.json")):
