@@ -130,8 +130,7 @@ fn invoke_supersonic(
         .arg("--prompt")
         .arg(&invocation.prompt)
         .arg("--max-new-tokens")
-        .arg(max_new.to_string())
-        .arg("--emit-stage-timings");
+        .arg(max_new.to_string());
     apply_quant_flag(
         &mut cmd,
         &invocation.quant,
