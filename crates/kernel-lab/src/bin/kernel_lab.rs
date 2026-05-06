@@ -312,6 +312,7 @@ fn run_ref(
     std::fs::create_dir_all(worktree_root)?;
     let label = sanitize_ref(git_ref);
     let dir = worktree_root.join(label);
+    run_checked("git", &["worktree", "prune"])?;
     if dir.exists() {
         run_checked(
             "git",

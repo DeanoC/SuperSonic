@@ -93,6 +93,11 @@ The workflow compares the checked-out candidate worktree against the PR base
 commit using `compare-ref`, writes markdown to the GitHub step summary, and
 uploads the run JSON/markdown artifacts.
 
+Before building, the workflow waits for the ROCm device to report at most 5%
+GPU use and at most 20% VRAM allocation for three consecutive 30-second
+samples. If the device stays busy for one hour, the job fails with a clear
+timeout rather than running a noisy contended benchmark.
+
 ## Baselines
 
 Reviewed baseline summaries live under
