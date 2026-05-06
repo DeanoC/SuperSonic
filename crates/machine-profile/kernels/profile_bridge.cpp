@@ -118,6 +118,37 @@ extern "C" double mp_hbm_bandwidth_copy(int device, uint64_t bytes)
 extern "C" __global__ void mp_wmma_peak_f16_kernel(uint64_t iters, float *sink);
 extern "C" __global__ void mp_wmma_peak_bf16_kernel(uint64_t iters, float *sink);
 extern "C" __global__ void mp_wmma_peak_i8_kernel(uint64_t iters, int *sink);
+extern "C" __global__ void mp_wmma_probe_kernel(int *flags_out);
+
+// Runtime probe: writes 1 into flags_out[k] for each dtype the device's
+// arch slice has a real wmma intrinsic for, 0 otherwise. Returns 0 on
+// success, non-zero on hip error. flags_out_3 must point to int[3]
+// (f16, bf16, i8).
+extern "C" int mp_wmma_probe(int device, int *flags_out_3)
+{
+    hipSetDevice(device);
+    int *d_flags = nullptr;
+    if (hipMalloc(&d_flags, sizeof(int) * 3) != hipSuccess) {
+        flags_out_3[0] = 0; flags_out_3[1] = 0; flags_out_3[2] = 0;
+        return -1;
+    }
+    int sentinels[3] = { -1, -1, -1 };
+    hipMemcpy(d_flags, sentinels, sizeof(sentinels), hipMemcpyHostToDevice);
+    hipLaunchKernelGGL(mp_wmma_probe_kernel, dim3(1), dim3(1), 0, 0, d_flags);
+    if (hipDeviceSynchronize() != hipSuccess) {
+        hipFree(d_flags);
+        flags_out_3[0] = 0; flags_out_3[1] = 0; flags_out_3[2] = 0;
+        return -2;
+    }
+    hipMemcpy(flags_out_3, d_flags, sizeof(int) * 3, hipMemcpyDeviceToHost);
+    hipFree(d_flags);
+    // If kernel didn't run (no compatible arch slice), sentinels stay -1.
+    // Treat as unsupported across the board.
+    for (int i = 0; i < 3; ++i) {
+        if (flags_out_3[i] < 0) flags_out_3[i] = 0;
+    }
+    return 0;
+}
 
 extern "C" double mp_wmma_peak_f16(int device, uint32_t cu_count, uint64_t iters)
 {

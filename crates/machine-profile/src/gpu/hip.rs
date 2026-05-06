@@ -90,18 +90,29 @@ fn profile_one(device_index: u32, info: &HipDeviceInfo) -> GpuProfile {
     let write = unsafe { mp_hbm_bandwidth_write(device_index as i32, 1u64 << 28) };
     let copy = unsafe { mp_hbm_bandwidth_copy(device_index as i32, 1u64 << 28) };
 
-    // WMMA microkernels only have real intrinsics for RDNA3. On other
-    // architectures the fallback kernel body is empty, so the host
-    // wrapper would compute fake TFLOPS from launch overhead — leave
-    // the MMA fields as None instead of reporting a meaningless number.
-    let (f16, bf16, i8_tops) = if wmma_supported(&info.arch_name) {
-        (
-            Some(unsafe { mp_wmma_peak_f16(device_index as i32, cu_count, 100_000) }),
-            Some(unsafe { mp_wmma_peak_bf16(device_index as i32, cu_count, 100_000) }),
-            Some(unsafe { mp_wmma_peak_i8(device_index as i32, cu_count, 100_000) }),
-        )
+    // WMMA microkernels only have real intrinsics for some archs. Probe the
+    // device — the kernel itself uses __has_builtin per dtype, so future
+    // arches that ship the builtin are auto-detected without code changes.
+    // On unsupported (or unprobeable) archs we leave MMA fields as None
+    // rather than reporting fake numbers from launch-overhead-only runs.
+    let mut wmma_flags = [0i32; 3];
+    let probe_status =
+        unsafe { mp_wmma_probe(device_index as i32, wmma_flags.as_mut_ptr()) };
+    let probe_ok = probe_status == 0;
+    let f16 = if probe_ok && wmma_flags[0] == 1 {
+        Some(unsafe { mp_wmma_peak_f16(device_index as i32, cu_count, 100_000) })
     } else {
-        (None, None, None)
+        None
+    };
+    let bf16 = if probe_ok && wmma_flags[1] == 1 {
+        Some(unsafe { mp_wmma_peak_bf16(device_index as i32, cu_count, 100_000) })
+    } else {
+        None
+    };
+    let i8_tops = if probe_ok && wmma_flags[2] == 1 {
+        Some(unsafe { mp_wmma_peak_i8(device_index as i32, cu_count, 100_000) })
+    } else {
+        None
     };
 
     let mut h2d = vec![MpTransferSample { bytes: 0, gb_s: 0.0 }; 16];
@@ -187,9 +198,3 @@ fn guess_cu_count(arch: &str) -> u32 {
     }
 }
 
-/// Whether `wmma_peak.hip` has real `__builtin_amdgcn_wmma_*` intrinsics
-/// for this architecture. Must stay in sync with the `#if` guard in
-/// `kernels/wmma_peak.hip`.
-fn wmma_supported(arch: &str) -> bool {
-    matches!(arch, "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150")
-}

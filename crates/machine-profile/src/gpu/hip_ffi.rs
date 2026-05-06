@@ -17,6 +17,10 @@ extern "C" {
     pub fn mp_wmma_peak_f16(device: i32, cu_count: u32, iters: u64) -> f64;
     pub fn mp_wmma_peak_bf16(device: i32, cu_count: u32, iters: u64) -> f64;
     pub fn mp_wmma_peak_i8(device: i32, cu_count: u32, iters: u64) -> f64;
+
+    /// Probe the device's per-dtype WMMA support. Writes 0/1 flags into
+    /// `flags_out_3[0..3]` (f16, bf16, i8). Returns 0 on success.
+    pub fn mp_wmma_probe(device: i32, flags_out_3: *mut i32) -> i32;
 }
 
 #[cfg(supersonic_backend_hip)]
