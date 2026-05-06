@@ -7,6 +7,7 @@ extern "C" {
         total_vram_bytes_out: *mut u64,
         warp_size_out: *mut u32,
         clock_rate_khz_out: *mut u32,
+        pci_device_id_out: *mut u32,
     ) -> i32;
 
     pub fn mp_lds_bandwidth_run(device: i32, cu_count: u32, iters: u64) -> f64;

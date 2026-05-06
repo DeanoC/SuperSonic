@@ -94,6 +94,47 @@ pub fn measure() -> Profile {
     }
 }
 
+/// Compute the fingerprint without running any microkernels.
+///
+/// This is a small, fast subset of `measure()` — CPU `/proc/cpuinfo` parsing,
+/// GPU enumeration via `hipGetDeviceProperties`, ISA detection. Suitable for
+/// runtime cache invalidation checks where you only need to know if the
+/// machine is the same as the cached profile.
+pub fn fingerprint_only() -> (String, schema::FingerprintComponents) {
+    use schema::*;
+
+    let cpu_id = cpu::detect_cpu_id();
+    let mut gpu_descriptors = Vec::new();
+    #[cfg(supersonic_backend_hip)]
+    {
+        // Enumerate HIP devices for fingerprint inputs only — no kernel launches.
+        if let Ok(infos) = gpu::hip::enumerate_for_fingerprint() {
+            for info in infos {
+                gpu_descriptors.push(format!(
+                    "HIP:{}:0x{:04x}",
+                    info.arch_name,
+                    info.pci_device_id
+                ));
+            }
+        }
+    }
+    let driver = std::env::var("KFD_DRIVER_VERSION").unwrap_or_else(|_| "unknown".into());
+
+    let components = FingerprintComponents {
+        cpu: format!(
+            "{} stepping={} microcode={}",
+            cpu_id.model,
+            cpu_id.stepping,
+            cpu_id.microcode.as_deref().unwrap_or("?")
+        ),
+        gpus: gpu_descriptors,
+        driver,
+        isa: cpu_id.isa,
+    };
+    let fp = fingerprint::compute(&components);
+    (fp, components)
+}
+
 fn apply_catalog(gpus: &mut [schema::GpuProfile], cpu: &schema::CpuProfile) {
     for g in gpus.iter_mut() {
         if let Some(peaks) = catalog::lookup_gpu(&g.arch_name, g.pci_id.as_deref()) {
@@ -129,4 +170,27 @@ fn read_uname_release() -> String {
     std::fs::read_to_string("/proc/sys/kernel/osrelease")
         .map(|s| format!("linux {}", s.trim()))
         .unwrap_or_else(|_| "unknown".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verify that `fingerprint_only()` produces the same fingerprint hash as
+    /// `measure()`. This ensures the fast path is bit-exact with the full path
+    /// so cache invalidation decisions are consistent.
+    ///
+    /// This test calls `measure()` which runs GPU microkernels; mark it
+    /// `#[ignore]` so it only runs on hardware CI where a GPU is present.
+    #[test]
+    #[ignore]
+    fn fingerprint_only_matches_measure() {
+        let (fp_fast, _components) = fingerprint_only();
+        let profile = measure();
+        assert_eq!(
+            fp_fast, profile.fingerprint,
+            "fingerprint_only() hash '{}' != measure() hash '{}'",
+            fp_fast, profile.fingerprint
+        );
+    }
 }

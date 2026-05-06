@@ -274,7 +274,8 @@ extern "C" int mp_query_device_info(int device,
                                     char *arch_name_out, uint32_t arch_name_len,
                                     uint64_t *total_vram_bytes_out,
                                     uint32_t *warp_size_out,
-                                    uint32_t *clock_rate_khz_out)
+                                    uint32_t *clock_rate_khz_out,
+                                    uint32_t *pci_device_id_out)
 {
     hipSetDevice(device);
     hipDeviceProp_t props;
@@ -285,6 +286,12 @@ extern "C" int mp_query_device_info(int device,
     *total_vram_bytes_out = (uint64_t)props.totalGlobalMem;
     *warp_size_out = (uint32_t)props.warpSize;
     *clock_rate_khz_out = (uint32_t)props.clockRate;
+    // hipDeviceAttributePciChipId returns the GPU manufacturer (hardware) device ID,
+    // e.g. 0x744c for RX 7900 XTX (gfx1100/Navi 31). This is distinct from
+    // props.pciDeviceID which is the PCIe slot number (0-31), not the product ID.
+    int chip_id = 0;
+    hipDeviceGetAttribute(&chip_id, hipDeviceAttributePciChipId, device);
+    *pci_device_id_out = (uint32_t)chip_id;
     return 0;
 }
 

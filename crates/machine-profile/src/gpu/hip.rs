@@ -25,18 +25,20 @@ impl GpuProfiler for HipProfiler {
     }
 }
 
-struct HipDeviceInfo {
-    arch_name: String,
-    total_vram_bytes: u64,
-    warp_size: u32,
-    clock_rate_khz: u32,
+pub(crate) struct HipDeviceInfo {
+    pub arch_name: String,
+    pub total_vram_bytes: u64,
+    pub warp_size: u32,
+    pub clock_rate_khz: u32,
+    pub pci_device_id: u32,
 }
 
-fn query_device_info_hip(device: i32) -> Result<HipDeviceInfo, String> {
+pub(crate) fn query_device_info_hip(device: i32) -> Result<HipDeviceInfo, String> {
     let mut arch_buf = [0u8; 64];
     let mut total_vram: u64 = 0;
     let mut warp_size: u32 = 0;
     let mut clock_khz: u32 = 0;
+    let mut pci_device_id: u32 = 0;
     let status = unsafe {
         mp_query_device_info(
             device,
@@ -45,6 +47,7 @@ fn query_device_info_hip(device: i32) -> Result<HipDeviceInfo, String> {
             &mut total_vram,
             &mut warp_size,
             &mut clock_khz,
+            &mut pci_device_id,
         )
     };
     if status != 0 {
@@ -57,7 +60,26 @@ fn query_device_info_hip(device: i32) -> Result<HipDeviceInfo, String> {
         total_vram_bytes: total_vram,
         warp_size,
         clock_rate_khz: clock_khz,
+        pci_device_id,
     })
+}
+
+/// Enumerate HIP devices and return device info for fingerprint-only purposes.
+/// Does not launch any kernels — safe to call at startup without a full profile.
+pub(crate) fn enumerate_for_fingerprint() -> Result<Vec<HipDeviceInfo>, super::GpuProfileError> {
+    if !gpu_hal::is_backend_compiled(gpu_hal::Backend::Hip) {
+        return Err(super::GpuProfileError::NotImplemented("HIP not compiled"));
+    }
+    gpu_hal::set_backend(gpu_hal::Backend::Hip);
+    let mut out = Vec::new();
+    for device_index in 0..1u32 {
+        gpu_hal::set_device(device_index as usize)
+            .map_err(|e| super::GpuProfileError::Hip(e.to_string()))?;
+        let info = query_device_info_hip(device_index as i32)
+            .map_err(|e| super::GpuProfileError::Hip(e))?;
+        out.push(info);
+    }
+    Ok(out)
 }
 
 fn profile_one(device_index: u32, info: &HipDeviceInfo) -> GpuProfile {
@@ -87,7 +109,7 @@ fn profile_one(device_index: u32, info: &HipDeviceInfo) -> GpuProfile {
         backend: "HIP".into(),
         device_index,
         arch_name: info.arch_name.clone(),
-        pci_id: None,
+        pci_id: Some(format!("0x{:04x}", info.pci_device_id)),
         uuid: None,
         memory_arch: format!("{:?}", gpu_hal::current_memory_architecture()),
         total_vram_bytes: info.total_vram_bytes,
