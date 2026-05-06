@@ -1,0 +1,26 @@
+[package]
+name = "machine-profile"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[lib]
+name = "machine_profile"
+path = "src/lib.rs"
+
+[[bin]]
+name = "machine-profile"
+path = "src/bin/machine_profile.rs"
+
+[dependencies]
+anyhow = "1"
+blake3 = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+gpu-hal = { path = "../gpu-hal" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
