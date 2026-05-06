@@ -32,6 +32,21 @@ def test_autogen_zone_replaces_only_the_zone():
     assert "<!-- AUTOGEN END: hipfire-comparison -->" in out
 
 
+def test_autogen_zone_replaces_only_first_matching_zone():
+    original = (
+        "<!-- AUTOGEN BELOW: repeated -->\n"
+        "OLD FIRST\n"
+        "<!-- AUTOGEN END: repeated -->\n"
+        "<!-- AUTOGEN BELOW: repeated -->\n"
+        "OLD SECOND\n"
+        "<!-- AUTOGEN END: repeated -->\n"
+    )
+    out = replace_autogen_zone(original, "repeated", "NEW FIRST")
+    assert "NEW FIRST" in out
+    assert "OLD FIRST" not in out
+    assert "OLD SECOND" in out
+
+
 def test_autogen_zone_inserted_when_absent():
     original = "# Empty doc\n"
     out = replace_autogen_zone(original, "hipfire-comparison", "NEW")

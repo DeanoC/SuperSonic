@@ -129,7 +129,7 @@ def replace_autogen_zone(doc: str, key: str, new_content: str) -> str:
     if begin in doc and end in doc:
         pattern = re.compile(re.escape(begin) + r".*?" + re.escape(end), re.DOTALL)
         replacement = f"{begin}\n{new_content}\n{end}"
-        return pattern.sub(replacement, doc)
+        return pattern.sub(replacement, doc, count=1)
     # Append a new zone at the end.
     if not doc.endswith("\n"):
         doc += "\n"

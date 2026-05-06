@@ -101,7 +101,10 @@ python3 -m oracle.bench.specprefill_quality \
     --enforce-thresholds \
     "${quality_args[@]}"
 
-python3 -m oracle.bench.render.render_main markdown --run "$RUN_DIR" --out .
+python3 -m oracle.bench.render.render_main markdown \
+    --run "$RUN_DIR" \
+    --out . \
+    --perf-zone-key bench-perf-matrix-sm86
 
 echo "run_dir=$RUN_DIR"
 
