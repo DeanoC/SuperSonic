@@ -1,4 +1,4 @@
-use supersonic_bench::matrix::{combos_for_arch, BenchArch};
+use supersonic_bench::matrix::{combos_for_arch, is_supported_combo, BenchArch};
 
 #[test]
 fn gfx1100_includes_shipping_models() {
@@ -34,4 +34,33 @@ fn sm86_includes_qwen36_specprefill_lanes() {
     assert!(model_quants.contains(&("qwen3.6-35b-a3b", "int4-spec025")));
     assert!(model_quants.contains(&("qwen3.6-35b-a3b", "int4-spec050")));
     assert!(model_quants.contains(&("qwen3.6-35b-a3b", "int4-spec075")));
+}
+
+#[test]
+fn sm86_accepts_ad_hoc_qwen36_specprefill_lanes() {
+    assert!(is_supported_combo(
+        "qwen3.6-35b-a3b",
+        "int4-spec070",
+        &BenchArch::Sm86
+    ));
+    assert!(is_supported_combo(
+        "qwen3.6-35b-a3b",
+        "int4-spec100",
+        &BenchArch::Sm86
+    ));
+    assert!(!is_supported_combo(
+        "qwen3.6-35b-a3b",
+        "int4-spec004",
+        &BenchArch::Sm86
+    ));
+    assert!(!is_supported_combo(
+        "qwen3.6-35b-a3b",
+        "int4-spec070",
+        &BenchArch::Gfx1100
+    ));
+    assert!(!is_supported_combo(
+        "qwen3.5-9b",
+        "int4-spec070",
+        &BenchArch::Sm86
+    ));
 }

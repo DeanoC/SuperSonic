@@ -278,12 +278,30 @@ pub fn combos_for_arch(arch: BenchArch) -> Vec<&'static ComboDescriptor> {
     SUPPORTED_COMBOS.iter().filter(|c| c.arch == arch).collect()
 }
 
-/// True iff `(model, quant, arch)` appears in `SUPPORTED_COMBOS`. Used by
-/// `run_matrix` to skip unsupported pairs from the user's CLI cross-product.
+/// True iff `(model, quant, arch)` can be run by `bench-perf`. Most entries
+/// must appear in `SUPPORTED_COMBOS`; sm86 Qwen3.6 also accepts ad hoc
+/// `int4-specNNN` lanes so local sweeps can try intermediate keep ratios
+/// without adding every exploratory value to the shipping matrix.
 pub fn is_supported_combo(model: &str, quant: &str, arch: &BenchArch) -> bool {
+    if model == "qwen3.6-35b-a3b"
+        && *arch == BenchArch::Sm86
+        && parse_specprefill_quant(quant).is_some()
+    {
+        return true;
+    }
+
     SUPPORTED_COMBOS
         .iter()
         .any(|c| c.model == model && c.quant == quant && c.arch == *arch)
+}
+
+fn parse_specprefill_quant(quant: &str) -> Option<u32> {
+    let suffix = quant.strip_prefix("int4-spec")?;
+    if suffix.len() != 3 || !suffix.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let keep_percent = suffix.parse::<u32>().ok()?;
+    (5..=100).contains(&keep_percent).then_some(keep_percent)
 }
 
 pub struct MatrixConfig {

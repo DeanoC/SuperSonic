@@ -68,3 +68,38 @@ fn matrix_skips_unsupported_combo_with_skipped_status() {
         "expected reason to mention SUPPORTED_COMBOS, got: {cell_text}"
     );
 }
+
+#[test]
+fn matrix_runs_ad_hoc_sm86_specprefill_lane() {
+    // `int4-spec070` is intentionally not in SUPPORTED_COMBOS because it is an
+    // exploratory keep-ratio lane, but sm86 Qwen3.6 sweeps should still run it
+    // when requested explicitly.
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = MatrixConfig {
+        arch: BenchArch::Sm86,
+        models: vec!["qwen3.6-35b-a3b".into()],
+        quants: vec!["int4-spec070".into()],
+        binary: PathBuf::from("/bin/echo"),
+        model_dir_resolver: Box::new(|_| PathBuf::from("/nonexistent")),
+        specprefill_draft_dir_resolver: Box::new(|_| Some(PathBuf::from("/draft"))),
+        prompt: "x".into(),
+        max_new_tokens: 1,
+        warmup_tokens: 1,
+        measurement_runs: 1,
+        cooldown_seconds: 0,
+        git_sha: "test".into(),
+        runner_version: "test 0.0.0".into(),
+    };
+    let rd = RunDir::new(tmp.path().join("run-ad-hoc-spec"));
+    run_matrix(&cfg, &rd).unwrap();
+    let cell_text =
+        std::fs::read_to_string(rd.perf_path("qwen3.6-35b-a3b", "int4-spec070")).unwrap();
+    assert!(
+        cell_text.contains("\"status\": \"error\""),
+        "expected the binary to be invoked and fail metric extraction, got: {cell_text}"
+    );
+    assert!(
+        !cell_text.contains("\"status\": \"skipped\""),
+        "ad hoc sm86 spec lane should not be filtered out: {cell_text}"
+    );
+}
