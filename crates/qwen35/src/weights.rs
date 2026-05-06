@@ -37,6 +37,9 @@ fn ensure_f32_on_gpu(buf: GpuBuffer, ordinal: usize) -> Result<GpuBuffer, model_
 }
 
 pub const LOWBIT_NATIVE_INT4: i32 = 4;
+pub const LOWBIT_HIGGS4: i32 = 20;
+pub const LOWBIT_QUIP_E8: i32 = 21;
+pub const LOWBIT_QTIP_TRELLIS2: i32 = 22;
 pub const LOWBIT_GGML_Q4_K: i32 = 12;
 pub const LOWBIT_GGML_Q5_K: i32 = 13;
 pub const LOWBIT_GGML_Q6_K: i32 = 14;
@@ -83,6 +86,8 @@ pub struct Qwen35Weights {
     pub lm_head_int4_scale: Option<GpuBuffer>,
     /// INT4 GPTQ zero tile, parallel to `lm_head_int4_scale`. BF16.
     pub lm_head_int4_zero: Option<GpuBuffer>,
+    /// Optional AWQ input-channel inverse scale sidecar. BF16 `[hidden]`.
+    pub lm_head_awq_inv_scale: Option<GpuBuffer>,
     pub norm_weight: GpuBuffer,
     pub layers: Vec<LayerWeights>,
     /// True if weights are FP8 with runtime dequant (native FP8 bake).
@@ -126,10 +131,13 @@ pub struct LayerWeights {
     // INT4 scale/zero for common weights (None when not INT4)
     pub gate_proj_int4_scale: Option<GpuBuffer>,
     pub gate_proj_int4_zero: Option<GpuBuffer>,
+    pub gate_proj_awq_inv_scale: Option<GpuBuffer>,
     pub up_proj_int4_scale: Option<GpuBuffer>,
     pub up_proj_int4_zero: Option<GpuBuffer>,
+    pub up_proj_awq_inv_scale: Option<GpuBuffer>,
     pub down_proj_int4_scale: Option<GpuBuffer>,
     pub down_proj_int4_zero: Option<GpuBuffer>,
+    pub down_proj_awq_inv_scale: Option<GpuBuffer>,
     // Linear attention only
     pub linear: Option<LinearWeights>,
     // Full attention only
@@ -161,10 +169,13 @@ pub struct LinearWeights {
     // INT4 scale/zero (None when not INT4)
     pub qkv_proj_int4_scale: Option<GpuBuffer>,
     pub qkv_proj_int4_zero: Option<GpuBuffer>,
+    pub qkv_proj_awq_inv_scale: Option<GpuBuffer>,
     pub z_proj_int4_scale: Option<GpuBuffer>,
     pub z_proj_int4_zero: Option<GpuBuffer>,
+    pub z_proj_awq_inv_scale: Option<GpuBuffer>,
     pub out_proj_int4_scale: Option<GpuBuffer>,
     pub out_proj_int4_zero: Option<GpuBuffer>,
+    pub out_proj_awq_inv_scale: Option<GpuBuffer>,
 }
 
 pub struct FullWeights {
@@ -187,12 +198,16 @@ pub struct FullWeights {
     // INT4 scale/zero (None when not INT4)
     pub q_proj_int4_scale: Option<GpuBuffer>,
     pub q_proj_int4_zero: Option<GpuBuffer>,
+    pub q_proj_awq_inv_scale: Option<GpuBuffer>,
     pub k_proj_int4_scale: Option<GpuBuffer>,
     pub k_proj_int4_zero: Option<GpuBuffer>,
+    pub k_proj_awq_inv_scale: Option<GpuBuffer>,
     pub v_proj_int4_scale: Option<GpuBuffer>,
     pub v_proj_int4_zero: Option<GpuBuffer>,
+    pub v_proj_awq_inv_scale: Option<GpuBuffer>,
     pub o_proj_int4_scale: Option<GpuBuffer>,
     pub o_proj_int4_zero: Option<GpuBuffer>,
+    pub o_proj_awq_inv_scale: Option<GpuBuffer>,
 }
 
 impl Qwen35Weights {
@@ -250,12 +265,16 @@ impl Qwen35Weights {
                     o_proj_int8_scale: None,
                     q_proj_int4_scale: None,
                     q_proj_int4_zero: None,
+                    q_proj_awq_inv_scale: None,
                     k_proj_int4_scale: None,
                     k_proj_int4_zero: None,
+                    k_proj_awq_inv_scale: None,
                     v_proj_int4_scale: None,
                     v_proj_int4_zero: None,
+                    v_proj_awq_inv_scale: None,
                     o_proj_int4_scale: None,
                     o_proj_int4_zero: None,
+                    o_proj_awq_inv_scale: None,
                 };
                 (None, Some(full))
             } else {
@@ -309,10 +328,13 @@ impl Qwen35Weights {
                     out_proj_int8_scale: None,
                     qkv_proj_int4_scale: None,
                     qkv_proj_int4_zero: None,
+                    qkv_proj_awq_inv_scale: None,
                     z_proj_int4_scale: None,
                     z_proj_int4_zero: None,
+                    z_proj_awq_inv_scale: None,
                     out_proj_int4_scale: None,
                     out_proj_int4_zero: None,
+                    out_proj_awq_inv_scale: None,
                 };
                 (Some(linear), None)
             };
@@ -336,10 +358,13 @@ impl Qwen35Weights {
                 down_proj_int8_scale: None,
                 gate_proj_int4_scale: None,
                 gate_proj_int4_zero: None,
+                gate_proj_awq_inv_scale: None,
                 up_proj_int4_scale: None,
                 up_proj_int4_zero: None,
+                up_proj_awq_inv_scale: None,
                 down_proj_int4_scale: None,
                 down_proj_int4_zero: None,
+                down_proj_awq_inv_scale: None,
                 linear,
                 full,
             });
@@ -353,6 +378,7 @@ impl Qwen35Weights {
             lm_head_scale: None,
             lm_head_int4_scale: None,
             lm_head_int4_zero: None,
+            lm_head_awq_inv_scale: None,
             norm_weight,
             layers,
             is_fp8: false,
@@ -401,6 +427,14 @@ impl Qwen35Weights {
                     Ok((None, None))
                 }
             };
+        let load_awq_inv_scale = |name: &str| -> Result<Option<GpuBuffer>, model_store::Error> {
+            let scale_name = format!("{name}_awq_inv_scale");
+            if store.contains(&scale_name) {
+                Ok(Some(store.load_to_gpu(&scale_name, ordinal)?))
+            } else {
+                Ok(None)
+            }
+        };
         let is_ggml_lowbit = |name: &str| -> bool {
             matches!(
                 store.layout(name),
@@ -419,6 +453,7 @@ impl Qwen35Weights {
         };
         let lm_head_scale = load_scale(lm_head_name)?;
         let (lm_head_int4_scale, lm_head_int4_zero) = load_int4(lm_head_name)?;
+        let lm_head_awq_inv_scale = load_awq_inv_scale(lm_head_name)?;
 
         let norm_weight = store.load_to_gpu(&format!("{prefix}.norm.weight"), ordinal)?;
 
@@ -449,6 +484,9 @@ impl Qwen35Weights {
             let (gate_proj_int4_scale, gate_proj_int4_zero) = load_int4(&gate_name)?;
             let (up_proj_int4_scale, up_proj_int4_zero) = load_int4(&up_name)?;
             let (down_proj_int4_scale, down_proj_int4_zero) = load_int4(&down_name)?;
+            let gate_proj_awq_inv_scale = load_awq_inv_scale(&gate_name)?;
+            let up_proj_awq_inv_scale = load_awq_inv_scale(&up_name)?;
+            let down_proj_awq_inv_scale = load_awq_inv_scale(&down_name)?;
 
             // Detect FP8 and compute block_size from first scale tensor encountered
             if !is_fp8 {
@@ -495,6 +533,10 @@ impl Qwen35Weights {
                 let (k_i4s, k_i4z) = load_int4(&k_name)?;
                 let (v_i4s, v_i4z) = load_int4(&v_name)?;
                 let (o_i4s, o_i4z) = load_int4(&o_name)?;
+                let q_awq_inv = load_awq_inv_scale(&q_name)?;
+                let k_awq_inv = load_awq_inv_scale(&k_name)?;
+                let v_awq_inv = load_awq_inv_scale(&v_name)?;
+                let o_awq_inv = load_awq_inv_scale(&o_name)?;
                 let full = FullWeights {
                     q_proj_w: store.load_to_gpu(&q_name, ordinal)?,
                     k_proj_w: store.load_to_gpu(&k_name, ordinal)?,
@@ -512,12 +554,16 @@ impl Qwen35Weights {
                     o_proj_int8_scale: None,
                     q_proj_int4_scale: q_i4s,
                     q_proj_int4_zero: q_i4z,
+                    q_proj_awq_inv_scale: q_awq_inv,
                     k_proj_int4_scale: k_i4s,
                     k_proj_int4_zero: k_i4z,
+                    k_proj_awq_inv_scale: k_awq_inv,
                     v_proj_int4_scale: v_i4s,
                     v_proj_int4_zero: v_i4z,
+                    v_proj_awq_inv_scale: v_awq_inv,
                     o_proj_int4_scale: o_i4s,
                     o_proj_int4_zero: o_i4z,
+                    o_proj_awq_inv_scale: o_awq_inv,
                 };
                 (None, Some(full))
             } else {
@@ -530,6 +576,9 @@ impl Qwen35Weights {
                 let (qkv_i4s, qkv_i4z) = load_int4(&qkv_name)?;
                 let (z_i4s, z_i4z) = load_int4(&z_name)?;
                 let (out_i4s, out_i4z) = load_int4(&out_name)?;
+                let qkv_awq_inv = load_awq_inv_scale(&qkv_name)?;
+                let z_awq_inv = load_awq_inv_scale(&z_name)?;
+                let out_awq_inv = load_awq_inv_scale(&out_name)?;
                 let linear = LinearWeights {
                     qkv_proj_w: store.load_to_gpu(&qkv_name, ordinal)?,
                     z_proj_w: store.load_to_gpu(&z_name, ordinal)?,
@@ -555,10 +604,13 @@ impl Qwen35Weights {
                     out_proj_int8_scale: None,
                     qkv_proj_int4_scale: qkv_i4s,
                     qkv_proj_int4_zero: qkv_i4z,
+                    qkv_proj_awq_inv_scale: qkv_awq_inv,
                     z_proj_int4_scale: z_i4s,
                     z_proj_int4_zero: z_i4z,
+                    z_proj_awq_inv_scale: z_awq_inv,
                     out_proj_int4_scale: out_i4s,
                     out_proj_int4_zero: out_i4z,
+                    out_proj_awq_inv_scale: out_awq_inv,
                 };
                 (Some(linear), None)
             };
@@ -582,10 +634,13 @@ impl Qwen35Weights {
                 down_proj_int8_scale: None,
                 gate_proj_int4_scale,
                 gate_proj_int4_zero,
+                gate_proj_awq_inv_scale,
                 up_proj_int4_scale,
                 up_proj_int4_zero,
+                up_proj_awq_inv_scale,
                 down_proj_int4_scale,
                 down_proj_int4_zero,
+                down_proj_awq_inv_scale,
                 linear,
                 full,
             });
@@ -599,6 +654,7 @@ impl Qwen35Weights {
             lm_head_scale,
             lm_head_int4_scale,
             lm_head_int4_zero,
+            lm_head_awq_inv_scale,
             norm_weight,
             layers,
             is_fp8,

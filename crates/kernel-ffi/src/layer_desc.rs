@@ -142,33 +142,44 @@ impl Default for KVCacheFp8Desc {
 /// Parallel struct to DecodeLayerDesc — one per layer.
 /// Passed as a separate kernel argument (same pattern as FP8ScaleDesc).
 /// Type code 4 means native packed INT4 with scale/zero sidecars. Type codes
-/// 12/13/14 mean verbatim GGML Q4_K/Q5_K/Q6_K blocks.
+/// 12/13/14 mean verbatim GGML Q4_K/Q5_K/Q6_K blocks. Type codes 20/21/22
+/// are reserved for HIGGS4, QuIP# E8, and QTIP trellis runtime profiles.
 #[repr(C)]
 #[derive(Debug, Clone)]
 pub struct INT4ScaleDesc {
     // Common MLP weights
     pub gate_proj_scale: *const c_void,
     pub gate_proj_zero: *const c_void,
+    pub gate_proj_awq_inv_scale: *const c_void,
     pub up_proj_scale: *const c_void,
     pub up_proj_zero: *const c_void,
+    pub up_proj_awq_inv_scale: *const c_void,
     pub down_proj_scale: *const c_void,
     pub down_proj_zero: *const c_void,
+    pub down_proj_awq_inv_scale: *const c_void,
     // Linear attention weights
     pub qkv_proj_scale: *const c_void,
     pub qkv_proj_zero: *const c_void,
+    pub qkv_proj_awq_inv_scale: *const c_void,
     pub z_proj_scale: *const c_void,
     pub z_proj_zero: *const c_void,
+    pub z_proj_awq_inv_scale: *const c_void,
     pub linear_out_proj_scale: *const c_void,
     pub linear_out_proj_zero: *const c_void,
+    pub linear_out_proj_awq_inv_scale: *const c_void,
     // Full attention weights
     pub q_proj_scale: *const c_void,
     pub q_proj_zero: *const c_void,
+    pub q_proj_awq_inv_scale: *const c_void,
     pub k_proj_scale: *const c_void,
     pub k_proj_zero: *const c_void,
+    pub k_proj_awq_inv_scale: *const c_void,
     pub v_proj_scale: *const c_void,
     pub v_proj_zero: *const c_void,
+    pub v_proj_awq_inv_scale: *const c_void,
     pub o_proj_scale: *const c_void,
     pub o_proj_zero: *const c_void,
+    pub o_proj_awq_inv_scale: *const c_void,
     // Group size for INT4 quantization (typically 128)
     pub group_size: c_int,
     pub gate_proj_type: c_int,

@@ -916,6 +916,7 @@ fn process_full_attn_layer_batched(
         q_proj_w,
         &int4.q_proj_scale,
         &int4.q_proj_zero,
+        None,
         group_size,
         qtype,
         &mut scratch.qg_raw,
@@ -931,6 +932,7 @@ fn process_full_attn_layer_batched(
         k_proj_w,
         &int4.k_proj_scale,
         &int4.k_proj_zero,
+        None,
         group_size,
         qtype,
         &mut scratch.k,
@@ -946,6 +948,7 @@ fn process_full_attn_layer_batched(
         v_proj_w,
         &int4.v_proj_scale,
         &int4.v_proj_zero,
+        None,
         group_size,
         qtype,
         &mut scratch.v,
@@ -1169,6 +1172,7 @@ fn process_full_attn_layer_batched(
         o_proj_w,
         &int4.o_proj_scale,
         &int4.o_proj_zero,
+        None,
         group_size,
         qtype,
         &mut scratch.o,
@@ -1946,6 +1950,7 @@ fn process_ffn_batched_grouped(
         &ffn.shared_gate_proj_w,
         &int4.shared_gate_proj_scale,
         &int4.shared_gate_proj_zero,
+        None,
         group_size,
         qtype,
         &mut scratch.shared_gate,
@@ -1962,6 +1967,7 @@ fn process_ffn_batched_grouped(
         &ffn.shared_up_proj_w,
         &int4.shared_up_proj_scale,
         &int4.shared_up_proj_zero,
+        None,
         group_size,
         qtype,
         &mut scratch.shared_up,
@@ -1989,6 +1995,7 @@ fn process_ffn_batched_grouped(
         &ffn.shared_down_proj_w,
         &int4.shared_down_proj_scale,
         &int4.shared_down_proj_zero,
+        None,
         group_size,
         qtype,
         &mut scratch.shared_down,
@@ -2152,4 +2159,3 @@ fn expand_scalar_gate_bf16(
     .context("h2d expanded gate")?;
     Ok(())
 }
-

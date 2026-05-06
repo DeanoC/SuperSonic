@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::str::FromStr;
 
 pub const FORMAT_VERSION: u32 = 2;
 pub const CONVERTER_VERSION: u32 = 1;
@@ -31,12 +32,115 @@ pub enum LayoutTag {
     /// INT4 quantized weight. Packed as 2 nibbles per byte.
     /// Companion _int4_scale and _int4_zero tensors stored separately.
     Int4Quantized,
+    /// HIGGS 4-bit grid-coded weights. Runtime-backed profile, not compatible
+    /// with native INT4 scale/zero sidecars.
+    HiggsGridQuantized,
+    /// QuIP# E8P codebook blocks.
+    QuipE8Quantized,
+    /// QTIP trellis-coded blocks.
+    QtipTrellisQuantized,
     /// Verbatim GGML K-block quantized tensors from GGUF. Shape is
     /// `[rows, row_bytes]`, dtype is `u8`, and logical input columns are
     /// supplied by the model descriptor at runtime.
     GgmlQ4K,
     GgmlQ5K,
     GgmlQ6K,
+}
+
+/// User-facing weight quantization profile. These names are stable CLI,
+/// manifest, bake-directory, and release-asset identifiers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum QuantProfile {
+    Bf16,
+    Fp8Native,
+    Int4Gptq,
+    Int4Awq,
+    Int4Autoround,
+    Int4Hqq,
+    Higgs4,
+    QuipE8,
+    QtipTrellis2,
+    Q4Km,
+    Q4KmGptq,
+}
+
+impl QuantProfile {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Bf16 => "bf16",
+            Self::Fp8Native => "fp8-native",
+            Self::Int4Gptq => "int4-gptq",
+            Self::Int4Awq => "int4-awq",
+            Self::Int4Autoround => "int4-autoround",
+            Self::Int4Hqq => "int4-hqq",
+            Self::Higgs4 => "higgs4",
+            Self::QuipE8 => "quip-e8",
+            Self::QtipTrellis2 => "qtip-trellis2",
+            Self::Q4Km => "q4km",
+            Self::Q4KmGptq => "q4km-gptq",
+        }
+    }
+
+    pub fn is_native_int4_runtime(self) -> bool {
+        matches!(
+            self,
+            Self::Int4Gptq | Self::Int4Awq | Self::Int4Autoround | Self::Int4Hqq | Self::Q4KmGptq
+        )
+    }
+
+    pub fn is_runtime_backed_lowbit(self) -> bool {
+        matches!(self, Self::Higgs4 | Self::QuipE8 | Self::QtipTrellis2)
+    }
+}
+
+impl std::fmt::Display for QuantProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for QuantProfile {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "bf16" => Ok(Self::Bf16),
+            "fp8-native" | "fp8" => Ok(Self::Fp8Native),
+            "int4-gptq" | "gptq" => Ok(Self::Int4Gptq),
+            "int4-awq" | "awq" => Ok(Self::Int4Awq),
+            "int4-autoround" | "autoround" | "signround" | "int4-signround" => {
+                Ok(Self::Int4Autoround)
+            }
+            "int4-hqq" | "hqq" => Ok(Self::Int4Hqq),
+            "higgs4" | "higgs-4" => Ok(Self::Higgs4),
+            "quip-e8" | "quipe8" => Ok(Self::QuipE8),
+            "qtip-trellis2" | "qtip" => Ok(Self::QtipTrellis2),
+            "q4km" => Ok(Self::Q4Km),
+            "q4km-gptq" => Ok(Self::Q4KmGptq),
+            other => Err(format!(
+                "unknown quant profile {other:?}; expected one of: bf16, fp8-native, int4-gptq, int4-awq, int4-autoround, int4-hqq, higgs4, quip-e8, qtip-trellis2"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QuantMethodMeta {
+    pub profile: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calibration_corpus: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calibration_samples: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calibration_seqlen: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calibration_seed: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_dtype: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub producer_version: Option<String>,
 }
 
 /// Metadata for a single tensor in the baked package.
@@ -65,5 +169,36 @@ pub struct Manifest {
     pub source_format: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_quant: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quant_method: Option<QuantMethodMeta>,
     pub tensors: Vec<TensorMeta>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quant_profile_parse_aliases_and_canonical_names() {
+        assert_eq!(
+            "int4-gptq".parse::<QuantProfile>().unwrap(),
+            QuantProfile::Int4Gptq
+        );
+        assert_eq!(
+            "awq".parse::<QuantProfile>().unwrap(),
+            QuantProfile::Int4Awq
+        );
+        assert_eq!(
+            "int4-signround".parse::<QuantProfile>().unwrap(),
+            QuantProfile::Int4Autoround
+        );
+        assert_eq!(QuantProfile::QuipE8.as_str(), "quip-e8");
+    }
+
+    #[test]
+    fn quant_profile_runtime_classes() {
+        assert!(QuantProfile::Int4Hqq.is_native_int4_runtime());
+        assert!(QuantProfile::Higgs4.is_runtime_backed_lowbit());
+        assert!(!QuantProfile::Bf16.is_native_int4_runtime());
+    }
 }

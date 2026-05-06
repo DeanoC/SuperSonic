@@ -17,7 +17,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::manifest::{CONVERTER_VERSION, FORMAT_VERSION};
+use crate::manifest::{QuantProfile, CONVERTER_VERSION, FORMAT_VERSION};
 use crate::{bake_dir, bake_dir_fp8, bake_dir_int4, bake_dir_q4km, bake_dir_q4km_gptq, version_ok};
 
 /// Default GitHub repo that hosts release assets.
@@ -45,6 +45,18 @@ pub enum BakeVariant {
     Fp8Native,
     /// INT4 GPTQ quantized weights.
     Int4Gptq,
+    /// INT4 AWQ quantized weights in native INT4 runtime layout.
+    Int4Awq,
+    /// INT4 AutoRound/SignRound quantized weights in native INT4 runtime layout.
+    Int4Autoround,
+    /// INT4 HQQ quantized weights in native INT4 runtime layout.
+    Int4Hqq,
+    /// HIGGS 4-bit grid quantized weights.
+    Higgs4,
+    /// QuIP# E8P codebook weights.
+    QuipE8,
+    /// QTIP trellis-coded weights.
+    QtipTrellis2,
     /// GGUF Q4_K_M-compatible raw GGML K-block weights.
     Q4Km,
     /// Q4KM-sourced GPTQ/native INT4 weights.
@@ -57,6 +69,12 @@ impl BakeVariant {
             Self::Bf16 => "bf16",
             Self::Fp8Native => "fp8-native",
             Self::Int4Gptq => "int4-gptq",
+            Self::Int4Awq => "int4-awq",
+            Self::Int4Autoround => "int4-autoround",
+            Self::Int4Hqq => "int4-hqq",
+            Self::Higgs4 => "higgs4",
+            Self::QuipE8 => "quip-e8",
+            Self::QtipTrellis2 => "qtip-trellis2",
             Self::Q4Km => "q4km",
             Self::Q4KmGptq => "q4km-gptq",
         }
@@ -68,8 +86,34 @@ impl BakeVariant {
             Self::Bf16 => bake_dir(model_dir),
             Self::Fp8Native => bake_dir_fp8(model_dir),
             Self::Int4Gptq => bake_dir_int4(model_dir),
+            Self::Int4Awq => crate::bake_dir_for_quant_profile(model_dir, QuantProfile::Int4Awq),
+            Self::Int4Autoround => {
+                crate::bake_dir_for_quant_profile(model_dir, QuantProfile::Int4Autoround)
+            }
+            Self::Int4Hqq => crate::bake_dir_for_quant_profile(model_dir, QuantProfile::Int4Hqq),
+            Self::Higgs4 => crate::bake_dir_for_quant_profile(model_dir, QuantProfile::Higgs4),
+            Self::QuipE8 => crate::bake_dir_for_quant_profile(model_dir, QuantProfile::QuipE8),
+            Self::QtipTrellis2 => {
+                crate::bake_dir_for_quant_profile(model_dir, QuantProfile::QtipTrellis2)
+            }
             Self::Q4Km => bake_dir_q4km(model_dir),
             Self::Q4KmGptq => bake_dir_q4km_gptq(model_dir),
+        }
+    }
+
+    pub fn quant_profile(self) -> QuantProfile {
+        match self {
+            Self::Bf16 => QuantProfile::Bf16,
+            Self::Fp8Native => QuantProfile::Fp8Native,
+            Self::Int4Gptq => QuantProfile::Int4Gptq,
+            Self::Int4Awq => QuantProfile::Int4Awq,
+            Self::Int4Autoround => QuantProfile::Int4Autoround,
+            Self::Int4Hqq => QuantProfile::Int4Hqq,
+            Self::Higgs4 => QuantProfile::Higgs4,
+            Self::QuipE8 => QuantProfile::QuipE8,
+            Self::QtipTrellis2 => QuantProfile::QtipTrellis2,
+            Self::Q4Km => QuantProfile::Q4Km,
+            Self::Q4KmGptq => QuantProfile::Q4KmGptq,
         }
     }
 }
@@ -101,10 +145,34 @@ pub fn variant_from_flags(
     }
 }
 
+pub fn variant_from_quant_profile(profile: QuantProfile) -> BakeVariant {
+    match profile {
+        QuantProfile::Bf16 => BakeVariant::Bf16,
+        QuantProfile::Fp8Native => BakeVariant::Fp8Native,
+        QuantProfile::Int4Gptq => BakeVariant::Int4Gptq,
+        QuantProfile::Int4Awq => BakeVariant::Int4Awq,
+        QuantProfile::Int4Autoround => BakeVariant::Int4Autoround,
+        QuantProfile::Int4Hqq => BakeVariant::Int4Hqq,
+        QuantProfile::Higgs4 => BakeVariant::Higgs4,
+        QuantProfile::QuipE8 => BakeVariant::QuipE8,
+        QuantProfile::QtipTrellis2 => BakeVariant::QtipTrellis2,
+        QuantProfile::Q4Km => BakeVariant::Q4Km,
+        QuantProfile::Q4KmGptq => BakeVariant::Q4KmGptq,
+    }
+}
+
 pub fn version_ok_for_variant(variant: BakeVariant, bake_dir: &Path) -> bool {
     match variant {
         BakeVariant::Q4Km => crate::version_ok_q4km(bake_dir),
         BakeVariant::Q4KmGptq => crate::version_ok_q4km_gptq(bake_dir),
+        BakeVariant::Int4Awq
+        | BakeVariant::Int4Autoround
+        | BakeVariant::Int4Hqq
+        | BakeVariant::Higgs4
+        | BakeVariant::QuipE8
+        | BakeVariant::QtipTrellis2 => {
+            crate::version_ok_for_quant_profile(bake_dir, variant.quant_profile())
+        }
         _ => crate::version_ok(bake_dir),
     }
 }

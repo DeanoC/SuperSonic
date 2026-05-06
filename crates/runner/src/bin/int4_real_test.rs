@@ -89,6 +89,7 @@ fn main() -> Result<()> {
         &rhs_gpu,
         &scale_gpu,
         &zero_gpu,
+        None,
         meta.group_size,
         qwen35::weights::LOWBIT_NATIVE_INT4,
         &mut out_gpu,

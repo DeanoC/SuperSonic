@@ -164,6 +164,12 @@ pub(crate) struct Cli {
     #[arg(long)]
     pub(crate) oracle_prefill: bool,
 
+    /// Unified weight quantization profile. Canonical values: bf16,
+    /// fp8-native, int4-gptq, int4-awq, int4-autoround, int4-hqq, higgs4,
+    /// quip-e8, qtip-trellis2. Legacy flags remain accepted as aliases.
+    #[arg(long)]
+    pub(crate) weight_quant: Option<String>,
+
     /// Keep FP8 weights in native format on GPU for runtime dequantization.
     /// Halves weight VRAM (~8.8→4.8 GiB for 4B). Requires FP8 model weights.
     #[arg(long)]
@@ -516,4 +522,3 @@ pub(crate) struct Cli {
     #[arg(long, default_value = "cosine")]
     pub(crate) specprefill_algorithm: String,
 }
-

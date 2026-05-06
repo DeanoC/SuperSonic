@@ -286,26 +286,36 @@ struct Qwen35INT4ScaleDesc {
     // Common MLP weights
     const void* gate_proj_scale;
     const void* gate_proj_zero;
+    const void* gate_proj_awq_inv_scale;
     const void* up_proj_scale;
     const void* up_proj_zero;
+    const void* up_proj_awq_inv_scale;
     const void* down_proj_scale;
     const void* down_proj_zero;
+    const void* down_proj_awq_inv_scale;
     // Linear attention weights
     const void* qkv_proj_scale;
     const void* qkv_proj_zero;
+    const void* qkv_proj_awq_inv_scale;
     const void* z_proj_scale;
     const void* z_proj_zero;
+    const void* z_proj_awq_inv_scale;
     const void* linear_out_proj_scale;
     const void* linear_out_proj_zero;
+    const void* linear_out_proj_awq_inv_scale;
     // Full attention weights
     const void* q_proj_scale;
     const void* q_proj_zero;
+    const void* q_proj_awq_inv_scale;
     const void* k_proj_scale;
     const void* k_proj_zero;
+    const void* k_proj_awq_inv_scale;
     const void* v_proj_scale;
     const void* v_proj_zero;
+    const void* v_proj_awq_inv_scale;
     const void* o_proj_scale;
     const void* o_proj_zero;
+    const void* o_proj_awq_inv_scale;
     // Group size for INT4 quantization (typically 128)
     int group_size;
     int gate_proj_type;
@@ -402,6 +412,25 @@ __device__ inline float int4_dequant_scalar(
     // Round through BF16 so reconstruction matches Python's bf16-stored Q_dq.
     return bf16_round_rne_f32_finite(
         static_cast<float>(nibble) * s - static_cast<float>(zeros[si]) * s);
+}
+
+__device__ inline float awq_inv_scale_at(const void* awq_inv_scale, int col) {
+    if (awq_inv_scale == nullptr) return 1.0f;
+    const hip_bfloat16* inv = static_cast<const hip_bfloat16*>(awq_inv_scale);
+    return static_cast<float>(inv[col]);
+}
+
+__device__ inline void apply_awq_inv_scale_8(float w[8], const void* awq_inv_scale, int col) {
+    if (awq_inv_scale == nullptr) return;
+    const hip_bfloat16* inv = static_cast<const hip_bfloat16*>(awq_inv_scale);
+    w[0] *= static_cast<float>(inv[col + 0]);
+    w[1] *= static_cast<float>(inv[col + 1]);
+    w[2] *= static_cast<float>(inv[col + 2]);
+    w[3] *= static_cast<float>(inv[col + 3]);
+    w[4] *= static_cast<float>(inv[col + 4]);
+    w[5] *= static_cast<float>(inv[col + 5]);
+    w[6] *= static_cast<float>(inv[col + 6]);
+    w[7] *= static_cast<float>(inv[col + 7]);
 }
 
 template <typename T>
@@ -3223,6 +3252,7 @@ __global__ void supersonic_qwen35_matmul_int4_dequant_kernel(
     const uint8_t* __restrict__ rhs,       // [batch, n, k/2] packed INT4
     const T* __restrict__ scale,           // [n/group_size, k/group_size] BF16
     const T* __restrict__ zero,            // [n/group_size, k/group_size] BF16
+    const T* __restrict__ awq_inv_scale,   // optional [k] BF16, nullptr for GPTQ/HQQ
     int group_size,
     T* __restrict__ out                    // [batch, m, n] BF16
 ) {
@@ -3281,7 +3311,11 @@ __global__ void supersonic_qwen35_matmul_int4_dequant_kernel(
                 float z = supersonic_qwen35_to_float(zero[si]);
                 // Round through BF16 so prefill matches the decode megakernel's
                 // dequant path and the Python GPTQ reference (`bf16(q*s - zf*s)`).
-                s_rhs[rr][rc] = bf16_round_rne_f32_finite(static_cast<float>(nibble) * s - z * s);
+                float w = bf16_round_rne_f32_finite(static_cast<float>(nibble) * s - z * s);
+                if (awq_inv_scale != nullptr) {
+                    w *= supersonic_qwen35_to_float(awq_inv_scale[global_k]);
+                }
+                s_rhs[rr][rc] = w;
             } else {
                 s_rhs[rr][rc] = 0.0f;
             }
@@ -3328,6 +3362,7 @@ __global__ void supersonic_qwen35_matmul_int4_dequant_wmma_small_m_kernel(
     const uint8_t* __restrict__ rhs_int4,
     const hip_bfloat16* __restrict__ scale,
     const hip_bfloat16* __restrict__ zero,
+    const hip_bfloat16* __restrict__ awq_inv_scale,
     int group_size,
     hip_bfloat16* __restrict__ out
 ) {
@@ -3383,6 +3418,10 @@ __global__ void supersonic_qwen35_matmul_int4_dequant_wmma_small_m_kernel(
                 int n1 = (packed >> 4) & 0xF;
                 float v0 = bf16_round_rne_f32_finite(static_cast<float>(n0) * s - zs);
                 float v1 = bf16_round_rne_f32_finite(static_cast<float>(n1) * s - zs);
+                if (awq_inv_scale != nullptr) {
+                    v0 *= static_cast<float>(awq_inv_scale[kk + 2 * i]);
+                    v1 *= static_cast<float>(awq_inv_scale[kk + 2 * i + 1]);
+                }
                 uint32_t b0, b1;
                 __builtin_memcpy(&b0, &v0, 4);
                 __builtin_memcpy(&b1, &v1, 4);
@@ -3419,6 +3458,9 @@ __global__ void supersonic_qwen35_matmul_int4_dequant_wmma_small_m_kernel(
                     uint8_t packed = rhs_row_u8[kc >> 1];
                     int nib = (kc & 1) ? ((packed >> 4) & 0xF) : (packed & 0xF);
                     float v = bf16_round_rne_f32_finite(static_cast<float>(nib) * s - zs);
+                    if (awq_inv_scale != nullptr) {
+                        v *= static_cast<float>(awq_inv_scale[kc]);
+                    }
                     uint32_t bits;
                     __builtin_memcpy(&bits, &v, 4);
                     b[i] = static_cast<short>(bits >> 16);
@@ -3483,6 +3525,7 @@ void supersonic_qwen35_matmul_int4_dequant_wmma_kernel(
     const uint8_t* __restrict__ rhs_int4,    // [batch, n, k/2]
     const hip_bfloat16* __restrict__ scale,  // [n/group, k/group]
     const hip_bfloat16* __restrict__ zero,   // [n/group, k/group]
+    const hip_bfloat16* __restrict__ awq_inv_scale, // optional [k]
     int group_size,
     hip_bfloat16* __restrict__ out           // [batch, m, n]
 ) {
@@ -3575,6 +3618,10 @@ void supersonic_qwen35_matmul_int4_dequant_wmma_kernel(
                 int n1 = (packed >> 4) & 0xF;
                 float v0 = bf16_round_rne_f32_finite(static_cast<float>(n0) * s - zs);
                 float v1 = bf16_round_rne_f32_finite(static_cast<float>(n1) * s - zs);
+                if (awq_inv_scale != nullptr) {
+                    v0 *= static_cast<float>(awq_inv_scale[kk0 + col_lo]);
+                    v1 *= static_cast<float>(awq_inv_scale[kk0 + col_hi]);
+                }
                 uint32_t b0, b1;
                 __builtin_memcpy(&b0, &v0, 4);
                 __builtin_memcpy(&b1, &v1, 4);
@@ -3664,6 +3711,9 @@ void supersonic_qwen35_matmul_int4_dequant_wmma_kernel(
                     if (col_lo < k_rem) {
                         int n0 = packed & 0xF;
                         float v0 = bf16_round_rne_f32_finite(static_cast<float>(n0) * s - zs);
+                        if (awq_inv_scale != nullptr) {
+                            v0 *= static_cast<float>(awq_inv_scale[k_main + col_lo]);
+                        }
                         uint32_t b0;
                         __builtin_memcpy(&b0, &v0, 4);
                         out_lo = static_cast<uint16_t>(b0 >> 16);
@@ -3671,6 +3721,9 @@ void supersonic_qwen35_matmul_int4_dequant_wmma_kernel(
                     if (col_hi < k_rem) {
                         int n1 = (packed >> 4) & 0xF;
                         float v1 = bf16_round_rne_f32_finite(static_cast<float>(n1) * s - zs);
+                        if (awq_inv_scale != nullptr) {
+                            v1 *= static_cast<float>(awq_inv_scale[k_main + col_hi]);
+                        }
                         uint32_t b1;
                         __builtin_memcpy(&b1, &v1, 4);
                         out_hi = static_cast<uint16_t>(b1 >> 16);
@@ -3730,7 +3783,7 @@ void supersonic_qwen35_matmul_int4_dequant_wmma_kernel(
     store_sub(acc11, 16, 16);
 #else
     (void)batch_elems; (void)m; (void)n; (void)k;
-    (void)lhs; (void)rhs_int4; (void)scale; (void)zero; (void)group_size; (void)out;
+    (void)lhs; (void)rhs_int4; (void)scale; (void)zero; (void)awq_inv_scale; (void)group_size; (void)out;
 #endif
 }
 
@@ -4999,22 +5052,23 @@ __global__ void supersonic_qwen35_persistent_decode_kernel(
                     const void* w_scale = nullptr;
                     const void* w_i4_scale = nullptr;
                     const void* w_i4_zero = nullptr;
+                    const void* w_i4_awq_inv_scale = nullptr;
                     int row;
                     if (sr < static_cast<unsigned int>(L.q_out_dim)) {
                         w_raw = L.q_proj_w;
                         row = sr;
                         if (fp8_scales) w_scale = fp8_scales[layer].q_proj_scale;
-                        if (int4_scales) { w_i4_scale = int4_scales[layer].q_proj_scale; w_i4_zero = int4_scales[layer].q_proj_zero; }
+                        if (int4_scales) { w_i4_scale = int4_scales[layer].q_proj_scale; w_i4_zero = int4_scales[layer].q_proj_zero; w_i4_awq_inv_scale = int4_scales[layer].q_proj_awq_inv_scale; }
                     } else if (sr < static_cast<unsigned int>(L.q_out_dim + L.k_out_dim)) {
                         w_raw = L.k_proj_w;
                         row = sr - L.q_out_dim;
                         if (fp8_scales) w_scale = fp8_scales[layer].k_proj_scale;
-                        if (int4_scales) { w_i4_scale = int4_scales[layer].k_proj_scale; w_i4_zero = int4_scales[layer].k_proj_zero; }
+                        if (int4_scales) { w_i4_scale = int4_scales[layer].k_proj_scale; w_i4_zero = int4_scales[layer].k_proj_zero; w_i4_awq_inv_scale = int4_scales[layer].k_proj_awq_inv_scale; }
                     } else {
                         w_raw = L.v_proj_w;
                         row = sr - L.q_out_dim - L.k_out_dim;
                         if (fp8_scales) w_scale = fp8_scales[layer].v_proj_scale;
-                        if (int4_scales) { w_i4_scale = int4_scales[layer].v_proj_scale; w_i4_zero = int4_scales[layer].v_proj_zero; }
+                        if (int4_scales) { w_i4_scale = int4_scales[layer].v_proj_scale; w_i4_zero = int4_scales[layer].v_proj_zero; w_i4_awq_inv_scale = int4_scales[layer].v_proj_awq_inv_scale; }
                     }
 
                     float p[MAX_BATCH_SIZE];
@@ -5033,6 +5087,7 @@ __global__ void supersonic_qwen35_persistent_decode_kernel(
                             uint32_t packed = *reinterpret_cast<const uint32_t*>(&i4_row[c / 2]);
                             float w[8];
                             int4_dequant_8(packed, scales_p, zeros_p, scale_row, c, scale_cols, gsz, w);
+                            apply_awq_inv_scale_8(w, w_i4_awq_inv_scale, c);
                             for (int b = 0; b < B; b++) {
                                 const float* inp = lds_input + b * hidden_dim + c;
                                 p[b] += w[0]*inp[0] + w[1]*inp[1] + w[2]*inp[2] + w[3]*inp[3]
@@ -5040,7 +5095,8 @@ __global__ void supersonic_qwen35_persistent_decode_kernel(
                             }
                         }
                         for (int c = vd8 + lane_p; c < hidden_dim; c += warpSize) {
-                            float w = int4_dequant_scalar(w_raw, w_i4_scale, w_i4_zero, row, c, hidden_dim, gsz);
+                            float w = int4_dequant_scalar(w_raw, w_i4_scale, w_i4_zero, row, c, hidden_dim, gsz) *
+                                      awq_inv_scale_at(w_i4_awq_inv_scale, c);
                             for (int b = 0; b < B; b++)
                                 p[b] += w * lds_input[b * hidden_dim + c];
                         }
@@ -5498,6 +5554,7 @@ __global__ void supersonic_qwen35_persistent_decode_kernel(
                         float p = 0.0f;
                         if (int4_scales != nullptr && int4_scales[layer].o_proj_scale != nullptr) {
                             const int gsz = int4_scales[layer].group_size;
+                            const void* o_awq_inv = int4_scales[layer].o_proj_awq_inv_scale;
                             if (kv_fp8 != nullptr) {
                                 if (lane_o == 0) {
                                     for (int c = 0; c < attn_size; ++c) {
@@ -5508,7 +5565,7 @@ __global__ void supersonic_qwen35_persistent_decode_kernel(
                                             sr,
                                             c,
                                             attn_size,
-                                            gsz) * lds_input[c];
+                                            gsz) * awq_inv_scale_at(o_awq_inv, c) * lds_input[c];
                                     }
                                 }
                             } else {
@@ -5523,11 +5580,13 @@ __global__ void supersonic_qwen35_persistent_decode_kernel(
                                     uint32_t pk = *reinterpret_cast<const uint32_t*>(&i4_row[c / 2]);
                                     float w[8];
                                     int4_dequant_8(pk, sc, zr, sr_g, c, sc_cols, gsz, w);
+                                    apply_awq_inv_scale_8(w, o_awq_inv, c);
                                     p += w[0]*lds_input[c] + w[1]*lds_input[c+1] + w[2]*lds_input[c+2] + w[3]*lds_input[c+3]
                                        + w[4]*lds_input[c+4] + w[5]*lds_input[c+5] + w[6]*lds_input[c+6] + w[7]*lds_input[c+7];
                                 }
                                 for (int c = as8 + lane_o; c < attn_size; c += warpSize)
-                                    p += int4_dequant_scalar(L.o_proj_w, int4_scales[layer].o_proj_scale, int4_scales[layer].o_proj_zero, sr, c, attn_size, gsz) * lds_input[c];
+                                    p += int4_dequant_scalar(L.o_proj_w, int4_scales[layer].o_proj_scale, int4_scales[layer].o_proj_zero, sr, c, attn_size, gsz) *
+                                         awq_inv_scale_at(o_awq_inv, c) * lds_input[c];
                             }
                         } else if (fp8_scales != nullptr && fp8_scales[layer].o_proj_scale != nullptr) {
                             if (kv_fp8 != nullptr) {
@@ -5615,18 +5674,21 @@ __global__ void supersonic_qwen35_persistent_decode_kernel(
                     const void* w_scale = nullptr;      // FP8 scale (may coexist)
                     const void* w_i4_scale = nullptr;
                     const void* w_i4_zero = nullptr;
+                    const void* w_i4_awq_inv_scale = nullptr;
                     int row;
                     if (sr < static_cast<unsigned int>(L.qkv_out_dim)) {
                         w_raw = L.qkv_proj_w;
                         row = sr;
                         w_i4_scale = int4_scales[layer].qkv_proj_scale;
                         w_i4_zero = int4_scales[layer].qkv_proj_zero;
+                        w_i4_awq_inv_scale = int4_scales[layer].qkv_proj_awq_inv_scale;
                         if (fp8_scales) w_scale = fp8_scales[layer].qkv_proj_scale;
                     } else if (sr < static_cast<unsigned int>(L.qkv_out_dim + L.z_out_dim)) {
                         w_raw = L.z_proj_w;
                         row = sr - L.qkv_out_dim;
                         w_i4_scale = int4_scales[layer].z_proj_scale;
                         w_i4_zero = int4_scales[layer].z_proj_zero;
+                        w_i4_awq_inv_scale = int4_scales[layer].z_proj_awq_inv_scale;
                         if (fp8_scales) w_scale = fp8_scales[layer].z_proj_scale;
                     } else if (sr < static_cast<unsigned int>(L.qkv_out_dim + L.z_out_dim + nv_heads)) {
                         w_raw = L.b_proj_w;
@@ -5655,6 +5717,7 @@ __global__ void supersonic_qwen35_persistent_decode_kernel(
                             uint32_t pk = *reinterpret_cast<const uint32_t*>(&i4_row[c / 2]);
                             float w[8];
                             int4_dequant_8(pk, sc, zr, sr_g, c, sc_cols, gsz, w);
+                            apply_awq_inv_scale_8(w, w_i4_awq_inv_scale, c);
                             for (int b = 0; b < B; b++) {
                                 const float* inp = lds_input + b * hidden_dim + c;
                                 p[b] += w[0]*inp[0] + w[1]*inp[1] + w[2]*inp[2] + w[3]*inp[3]
@@ -5662,7 +5725,8 @@ __global__ void supersonic_qwen35_persistent_decode_kernel(
                             }
                         }
                         for (int c = vd8 + tid; c < hidden_dim; c += bs) {
-                            float w = int4_dequant_scalar(w_raw, w_i4_scale, w_i4_zero, row, c, hidden_dim, gsz);
+                            float w = int4_dequant_scalar(w_raw, w_i4_scale, w_i4_zero, row, c, hidden_dim, gsz) *
+                                      awq_inv_scale_at(w_i4_awq_inv_scale, c);
                             for (int b = 0; b < B; b++)
                                 p[b] += w * lds_input[b * hidden_dim + c];
                         }
@@ -5715,17 +5779,18 @@ __global__ void supersonic_qwen35_persistent_decode_kernel(
                     const void* w_scale = nullptr;
                     const void* w_i4_scale = nullptr;
                     const void* w_i4_zero = nullptr;
+                    const void* w_i4_awq_inv_scale = nullptr;
                     int row;
                     if (sr < static_cast<unsigned int>(L.qkv_out_dim)) {
                         w_raw = L.qkv_proj_w;
                         row = sr;
                         if (fp8_scales) w_scale = fp8_scales[layer].qkv_proj_scale;
-                        if (int4_scales) { w_i4_scale = int4_scales[layer].qkv_proj_scale; w_i4_zero = int4_scales[layer].qkv_proj_zero; }
+                        if (int4_scales) { w_i4_scale = int4_scales[layer].qkv_proj_scale; w_i4_zero = int4_scales[layer].qkv_proj_zero; w_i4_awq_inv_scale = int4_scales[layer].qkv_proj_awq_inv_scale; }
                     } else if (sr < static_cast<unsigned int>(L.qkv_out_dim + L.z_out_dim)) {
                         w_raw = L.z_proj_w;
                         row = sr - L.qkv_out_dim;
                         if (fp8_scales) w_scale = fp8_scales[layer].z_proj_scale;
-                        if (int4_scales) { w_i4_scale = int4_scales[layer].z_proj_scale; w_i4_zero = int4_scales[layer].z_proj_zero; }
+                        if (int4_scales) { w_i4_scale = int4_scales[layer].z_proj_scale; w_i4_zero = int4_scales[layer].z_proj_zero; w_i4_awq_inv_scale = int4_scales[layer].z_proj_awq_inv_scale; }
                     } else if (sr < static_cast<unsigned int>(L.qkv_out_dim + L.z_out_dim + nv_heads)) {
                         w_raw = L.b_proj_w;
                         row = sr - L.qkv_out_dim - L.z_out_dim;
@@ -5753,6 +5818,7 @@ __global__ void supersonic_qwen35_persistent_decode_kernel(
                             uint32_t pk = *reinterpret_cast<const uint32_t*>(&i4_row[c / 2]);
                             float w[8];
                             int4_dequant_8(pk, sc, zr, sr_g, c, sc_cols, gsz, w);
+                            apply_awq_inv_scale_8(w, w_i4_awq_inv_scale, c);
                             for (int b = 0; b < B; b++) {
                                 const float* inp = lds_input + b * hidden_dim + c;
                                 p[b] += w[0]*inp[0] + w[1]*inp[1] + w[2]*inp[2] + w[3]*inp[3]
@@ -5760,7 +5826,8 @@ __global__ void supersonic_qwen35_persistent_decode_kernel(
                             }
                         }
                         for (int c = vd8 + lane_p; c < hidden_dim; c += warpSize) {
-                            float w = int4_dequant_scalar(w_raw, w_i4_scale, w_i4_zero, row, c, hidden_dim, gsz);
+                            float w = int4_dequant_scalar(w_raw, w_i4_scale, w_i4_zero, row, c, hidden_dim, gsz) *
+                                      awq_inv_scale_at(w_i4_awq_inv_scale, c);
                             for (int b = 0; b < B; b++)
                                 p[b] += w * lds_input[b * hidden_dim + c];
                         }
@@ -6084,6 +6151,7 @@ __global__ void supersonic_qwen35_persistent_decode_kernel(
 
                         float p = 0.0f;
                         const int gsz = int4_scales[layer].group_size;
+                        const void* out_awq_inv = int4_scales[layer].linear_out_proj_awq_inv_scale;
                         const int byte_cols = vd / 2;
                         const uint8_t* i4_row = static_cast<const uint8_t*>(L.linear_out_proj_w) + static_cast<size_t>(sr) * byte_cols;
                         const hip_bfloat16* sc = static_cast<const hip_bfloat16*>(int4_scales[layer].linear_out_proj_scale);
@@ -6095,11 +6163,13 @@ __global__ void supersonic_qwen35_persistent_decode_kernel(
                             uint32_t pk = *reinterpret_cast<const uint32_t*>(&i4_row[c / 2]);
                             float w[8];
                             int4_dequant_8(pk, sc, zr, sr_g, c, sc_cols, gsz, w);
+                            apply_awq_inv_scale_8(w, out_awq_inv, c);
                             p += w[0]*lds_input[c] + w[1]*lds_input[c+1] + w[2]*lds_input[c+2] + w[3]*lds_input[c+3]
                                + w[4]*lds_input[c+4] + w[5]*lds_input[c+5] + w[6]*lds_input[c+6] + w[7]*lds_input[c+7];
                         }
                         for (int c = vd8 + tid; c < vd; c += bs)
-                            p += int4_dequant_scalar(L.linear_out_proj_w, int4_scales[layer].linear_out_proj_scale, int4_scales[layer].linear_out_proj_zero, sr, c, vd, gsz) * lds_input[c];
+                            p += int4_dequant_scalar(L.linear_out_proj_w, int4_scales[layer].linear_out_proj_scale, int4_scales[layer].linear_out_proj_zero, sr, c, vd, gsz) *
+                                 awq_inv_scale_at(out_awq_inv, c) * lds_input[c];
 
                         lds[tid] = p;
                         __syncthreads();
@@ -6125,6 +6195,7 @@ __global__ void supersonic_qwen35_persistent_decode_kernel(
                         float p = 0.0f;
                         if (out_int4) {
                             const int gsz = int4_scales[layer].group_size;
+                            const void* out_awq_inv = int4_scales[layer].linear_out_proj_awq_inv_scale;
                             const int byte_cols = vd / 2;
                             const uint8_t* i4_row = static_cast<const uint8_t*>(L.linear_out_proj_w) + static_cast<size_t>(sr) * byte_cols;
                             const hip_bfloat16* sc = static_cast<const hip_bfloat16*>(int4_scales[layer].linear_out_proj_scale);
@@ -6136,11 +6207,13 @@ __global__ void supersonic_qwen35_persistent_decode_kernel(
                                 uint32_t pk = *reinterpret_cast<const uint32_t*>(&i4_row[c / 2]);
                                 float w[8];
                                 int4_dequant_8(pk, sc, zr, sr_g, c, sc_cols, gsz, w);
+                                apply_awq_inv_scale_8(w, out_awq_inv, c);
                                 p += w[0]*lds_input[c] + w[1]*lds_input[c+1] + w[2]*lds_input[c+2] + w[3]*lds_input[c+3]
                                    + w[4]*lds_input[c+4] + w[5]*lds_input[c+5] + w[6]*lds_input[c+6] + w[7]*lds_input[c+7];
                             }
                             for (int c = vd8 + lane_o; c < vd; c += warpSize)
-                                p += int4_dequant_scalar(L.linear_out_proj_w, int4_scales[layer].linear_out_proj_scale, int4_scales[layer].linear_out_proj_zero, sr, c, vd, gsz) * lds_input[c];
+                                p += int4_dequant_scalar(L.linear_out_proj_w, int4_scales[layer].linear_out_proj_scale, int4_scales[layer].linear_out_proj_zero, sr, c, vd, gsz) *
+                                     awq_inv_scale_at(out_awq_inv, c) * lds_input[c];
                         } else if (fp8_scales != nullptr && fp8_scales[layer].linear_out_proj_scale != nullptr) {
                             for (int c = lane_o; c < vd; c += warpSize)
                                 p += fp8_dequant_weight_lut(L.linear_out_proj_w, fp8_scales[layer].linear_out_proj_scale, sr, c, vd, fp8_scales[layer].block_size, fp8_lut) * lds_input[c];
@@ -6271,6 +6344,8 @@ __global__ void supersonic_qwen35_persistent_decode_kernel(
                     const hip_bfloat16* g_zr = static_cast<const hip_bfloat16*>(int4_scales[layer].gate_proj_zero);
                     const hip_bfloat16* u_sc = static_cast<const hip_bfloat16*>(int4_scales[layer].up_proj_scale);
                     const hip_bfloat16* u_zr = static_cast<const hip_bfloat16*>(int4_scales[layer].up_proj_zero);
+                    const void* g_awq_inv = int4_scales[layer].gate_proj_awq_inv_scale;
+                    const void* u_awq_inv = int4_scales[layer].up_proj_awq_inv_scale;
                     const int g_sr = my_row / gsz;
                     const int sc_cols = (hidden_dim + gsz - 1) / gsz;
                     const int vd8 = hidden_dim & ~7;
@@ -6280,6 +6355,8 @@ __global__ void supersonic_qwen35_persistent_decode_kernel(
                         float gw[8], uw[8];
                         int4_dequant_8(gpk, g_sc, g_zr, g_sr, c, sc_cols, gsz, gw);
                         int4_dequant_8(upk, u_sc, u_zr, g_sr, c, sc_cols, gsz, uw);
+                        apply_awq_inv_scale_8(gw, g_awq_inv, c);
+                        apply_awq_inv_scale_8(uw, u_awq_inv, c);
                         for (int b = 0; b < B; b++) {
                             const float* inp = lds_input + b * hidden_dim + c;
                             gp[b] += gw[0]*inp[0] + gw[1]*inp[1] + gw[2]*inp[2] + gw[3]*inp[3]
@@ -6289,8 +6366,10 @@ __global__ void supersonic_qwen35_persistent_decode_kernel(
                         }
                     }
                     for (int c = vd8 + tid; c < hidden_dim; c += bs) {
-                        float gw = int4_dequant_scalar(L.gate_proj_w, int4_scales[layer].gate_proj_scale, int4_scales[layer].gate_proj_zero, my_row, c, hidden_dim, gsz);
-                        float uw = int4_dequant_scalar(L.up_proj_w, int4_scales[layer].up_proj_scale, int4_scales[layer].up_proj_zero, my_row, c, hidden_dim, gsz);
+                        float gw = int4_dequant_scalar(L.gate_proj_w, int4_scales[layer].gate_proj_scale, int4_scales[layer].gate_proj_zero, my_row, c, hidden_dim, gsz) *
+                                   awq_inv_scale_at(g_awq_inv, c);
+                        float uw = int4_dequant_scalar(L.up_proj_w, int4_scales[layer].up_proj_scale, int4_scales[layer].up_proj_zero, my_row, c, hidden_dim, gsz) *
+                                   awq_inv_scale_at(u_awq_inv, c);
                         for (int b = 0; b < B; b++) {
                             float inp = lds_input[b * hidden_dim + c];
                             gp[b] += gw * inp;
@@ -6342,6 +6421,8 @@ __global__ void supersonic_qwen35_persistent_decode_kernel(
                         const hip_bfloat16* g_zr = static_cast<const hip_bfloat16*>(int4_scales[layer].gate_proj_zero);
                         const hip_bfloat16* u_sc = static_cast<const hip_bfloat16*>(int4_scales[layer].up_proj_scale);
                         const hip_bfloat16* u_zr = static_cast<const hip_bfloat16*>(int4_scales[layer].up_proj_zero);
+                        const void* g_awq_inv = int4_scales[layer].gate_proj_awq_inv_scale;
+                        const void* u_awq_inv = int4_scales[layer].up_proj_awq_inv_scale;
                         const int g_sr = my_row / gsz;
                         const int sc_cols = (hidden_dim + gsz - 1) / gsz;
                         const int vd8 = hidden_dim & ~7;
@@ -6351,6 +6432,8 @@ __global__ void supersonic_qwen35_persistent_decode_kernel(
                             float gw[8], uw[8];
                             int4_dequant_8(gpk, g_sc, g_zr, g_sr, c, sc_cols, gsz, gw);
                             int4_dequant_8(upk, u_sc, u_zr, g_sr, c, sc_cols, gsz, uw);
+                            apply_awq_inv_scale_8(gw, g_awq_inv, c);
+                            apply_awq_inv_scale_8(uw, u_awq_inv, c);
                             for (int b = 0; b < B; b++) {
                                 const float* inp = lds_input + b * hidden_dim + c;
                                 gp[b] += gw[0]*inp[0] + gw[1]*inp[1] + gw[2]*inp[2] + gw[3]*inp[3]
@@ -6360,8 +6443,10 @@ __global__ void supersonic_qwen35_persistent_decode_kernel(
                             }
                         }
                         for (int c = vd8 + lane_p; c < hidden_dim; c += warpSize) {
-                            float gw = int4_dequant_scalar(L.gate_proj_w, int4_scales[layer].gate_proj_scale, int4_scales[layer].gate_proj_zero, my_row, c, hidden_dim, gsz);
-                            float uw = int4_dequant_scalar(L.up_proj_w, int4_scales[layer].up_proj_scale, int4_scales[layer].up_proj_zero, my_row, c, hidden_dim, gsz);
+                            float gw = int4_dequant_scalar(L.gate_proj_w, int4_scales[layer].gate_proj_scale, int4_scales[layer].gate_proj_zero, my_row, c, hidden_dim, gsz) *
+                                       awq_inv_scale_at(g_awq_inv, c);
+                            float uw = int4_dequant_scalar(L.up_proj_w, int4_scales[layer].up_proj_scale, int4_scales[layer].up_proj_zero, my_row, c, hidden_dim, gsz) *
+                                       awq_inv_scale_at(u_awq_inv, c);
                             for (int b = 0; b < B; b++) {
                                 float inp = lds_input[b * hidden_dim + c];
                                 gp[b] += gw * inp;
@@ -6487,6 +6572,7 @@ __global__ void supersonic_qwen35_persistent_decode_kernel(
 
                         float p = 0.0f;
                         const int gsz = int4_scales[layer].group_size;
+                        const void* d_awq_inv = int4_scales[layer].down_proj_awq_inv_scale;
                         const int byte_cols = L.intermediate_size / 2;
                         const uint8_t* i4_row = static_cast<const uint8_t*>(L.down_proj_w) + static_cast<size_t>(my_row) * byte_cols;
                         const hip_bfloat16* d_sc = static_cast<const hip_bfloat16*>(int4_scales[layer].down_proj_scale);
@@ -6498,11 +6584,13 @@ __global__ void supersonic_qwen35_persistent_decode_kernel(
                             uint32_t pk = *reinterpret_cast<const uint32_t*>(&i4_row[c / 2]);
                             float w[8];
                             int4_dequant_8(pk, d_sc, d_zr, sr_g, c, sc_cols, gsz, w);
+                            apply_awq_inv_scale_8(w, d_awq_inv, c);
                             p += w[0]*lds_input[c] + w[1]*lds_input[c+1] + w[2]*lds_input[c+2] + w[3]*lds_input[c+3]
                                + w[4]*lds_input[c+4] + w[5]*lds_input[c+5] + w[6]*lds_input[c+6] + w[7]*lds_input[c+7];
                         }
                         for (int c = is8 + tid; c < L.intermediate_size; c += bs)
-                            p += int4_dequant_scalar(L.down_proj_w, int4_scales[layer].down_proj_scale, int4_scales[layer].down_proj_zero, my_row, c, L.intermediate_size, gsz) * lds_input[c];
+                            p += int4_dequant_scalar(L.down_proj_w, int4_scales[layer].down_proj_scale, int4_scales[layer].down_proj_zero, my_row, c, L.intermediate_size, gsz) *
+                                 awq_inv_scale_at(d_awq_inv, c) * lds_input[c];
 
                         lds[tid] = p;
                         __syncthreads();
@@ -6529,6 +6617,7 @@ __global__ void supersonic_qwen35_persistent_decode_kernel(
                         float p = 0.0f;
                         if (down_int4) {
                             const int gsz = int4_scales[layer].group_size;
+                            const void* d_awq_inv = int4_scales[layer].down_proj_awq_inv_scale;
                             const int byte_cols = L.intermediate_size / 2;
                             const uint8_t* i4_row = static_cast<const uint8_t*>(L.down_proj_w) + static_cast<size_t>(my_row) * byte_cols;
                             const hip_bfloat16* d_sc = static_cast<const hip_bfloat16*>(int4_scales[layer].down_proj_scale);
@@ -6540,11 +6629,13 @@ __global__ void supersonic_qwen35_persistent_decode_kernel(
                                 uint32_t pk = *reinterpret_cast<const uint32_t*>(&i4_row[c / 2]);
                                 float w[8];
                                 int4_dequant_8(pk, d_sc, d_zr, sr_g, c, sc_cols, gsz, w);
+                                apply_awq_inv_scale_8(w, d_awq_inv, c);
                                 p += w[0]*lds_input[c] + w[1]*lds_input[c+1] + w[2]*lds_input[c+2] + w[3]*lds_input[c+3]
                                    + w[4]*lds_input[c+4] + w[5]*lds_input[c+5] + w[6]*lds_input[c+6] + w[7]*lds_input[c+7];
                             }
                             for (int c = is8 + lane_d; c < L.intermediate_size; c += warpSize)
-                                p += int4_dequant_scalar(L.down_proj_w, int4_scales[layer].down_proj_scale, int4_scales[layer].down_proj_zero, my_row, c, L.intermediate_size, gsz) * lds_input[c];
+                                p += int4_dequant_scalar(L.down_proj_w, int4_scales[layer].down_proj_scale, int4_scales[layer].down_proj_zero, my_row, c, L.intermediate_size, gsz) *
+                                     awq_inv_scale_at(d_awq_inv, c) * lds_input[c];
                         } else if (down_fp8) {
                             const uint8_t* d_fp8 = static_cast<const uint8_t*>(L.down_proj_w) + static_cast<size_t>(my_row) * L.intermediate_size;
                             const hip_bfloat16* d_scales = static_cast<const hip_bfloat16*>(fp8_scales[layer].down_proj_scale);

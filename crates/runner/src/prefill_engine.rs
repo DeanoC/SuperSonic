@@ -341,6 +341,7 @@ fn matmul_proj(
     out: &mut GpuBuffer,
     int4_scale: Option<&GpuBuffer>,
     int4_zero: Option<&GpuBuffer>,
+    int4_awq_inv_scale: Option<&GpuBuffer>,
     int4_group_size: usize,
 ) -> Result<()> {
     let qtype = qwen35::weights::infer_lowbit_type(weight, k, int4_scale.is_some());
@@ -357,6 +358,7 @@ fn matmul_proj(
             weight,
             sc,
             zr,
+            int4_awq_inv_scale,
             int4_group_size,
             qtype,
             out,
@@ -552,6 +554,7 @@ pub fn compute_logits_for_range(
             &*weights.lm_head,
             scale,
             zero,
+            weights.lm_head_awq_inv_scale.as_ref(),
             weights.int4_group_size,
             qwen35::weights::LOWBIT_NATIVE_INT4,
             &mut logits_buf,
@@ -2309,6 +2312,7 @@ pub fn metal_v2_decode_step_greedy(
             &*weights.lm_head,
             scale,
             zero,
+            weights.lm_head_awq_inv_scale.as_ref(),
             weights.int4_group_size,
             qwen35::weights::LOWBIT_NATIVE_INT4,
             &mut logits_buf,
@@ -2427,6 +2431,7 @@ fn prefill_full_attention_layer(
         &mut q_full,
         fw.q_proj_int4_scale.as_ref(),
         fw.q_proj_int4_zero.as_ref(),
+        fw.q_proj_awq_inv_scale.as_ref(),
         weights.int4_group_size,
     )?;
 
@@ -2473,6 +2478,7 @@ fn prefill_full_attention_layer(
         &mut scratch.proj_buf2,
         fw.k_proj_int4_scale.as_ref(),
         fw.k_proj_int4_zero.as_ref(),
+        fw.k_proj_awq_inv_scale.as_ref(),
         weights.int4_group_size,
     )?;
 
@@ -2608,6 +2614,7 @@ fn prefill_full_attention_layer(
         &mut v_buf,
         fw.v_proj_int4_scale.as_ref(),
         fw.v_proj_int4_zero.as_ref(),
+        fw.v_proj_awq_inv_scale.as_ref(),
         weights.int4_group_size,
     )?;
 
@@ -2828,6 +2835,7 @@ fn prefill_full_attention_layer(
         &mut scratch.proj_buf2,
         fw.o_proj_int4_scale.as_ref(),
         fw.o_proj_int4_zero.as_ref(),
+        fw.o_proj_awq_inv_scale.as_ref(),
         weights.int4_group_size,
     )?;
 
@@ -2888,6 +2896,7 @@ fn prefill_linear_attention_layer(
         &mut scratch.proj_buf,
         lw.qkv_proj_int4_scale.as_ref(),
         lw.qkv_proj_int4_zero.as_ref(),
+        lw.qkv_proj_awq_inv_scale.as_ref(),
         weights.int4_group_size,
     )?;
     if trace_linear_debug {
@@ -3000,6 +3009,7 @@ fn prefill_linear_attention_layer(
         &mut scratch.proj_buf2,
         lw.z_proj_int4_scale.as_ref(),
         lw.z_proj_int4_zero.as_ref(),
+        lw.z_proj_awq_inv_scale.as_ref(),
         weights.int4_group_size,
     )?;
     if trace_linear_debug {
@@ -3032,6 +3042,7 @@ fn prefill_linear_attention_layer(
         &mut b_buf,
         None,
         None,
+        None,
         0,
     )?;
 
@@ -3050,6 +3061,7 @@ fn prefill_linear_attention_layer(
         lw.a_proj_int8_scale.as_ref(),
         weights.fp8_block_size,
         &mut a_buf,
+        None,
         None,
         None,
         0,
@@ -3743,6 +3755,7 @@ fn prefill_linear_attention_layer(
         &mut scratch.proj_buf2,
         lw.out_proj_int4_scale.as_ref(),
         lw.out_proj_int4_zero.as_ref(),
+        lw.out_proj_awq_inv_scale.as_ref(),
         weights.int4_group_size,
     )?;
     if trace_linear_debug {
@@ -3815,6 +3828,7 @@ fn prefill_mlp_layer(
             &mut scratch.proj_buf,
             lw.gate_proj_int4_scale.as_ref(),
             lw.gate_proj_int4_zero.as_ref(),
+            lw.gate_proj_awq_inv_scale.as_ref(),
             weights.int4_group_size,
         )?;
     }
@@ -3849,6 +3863,7 @@ fn prefill_mlp_layer(
             &mut scratch.proj_buf2,
             lw.up_proj_int4_scale.as_ref(),
             lw.up_proj_int4_zero.as_ref(),
+            lw.up_proj_awq_inv_scale.as_ref(),
             weights.int4_group_size,
         )?;
     }
@@ -3896,6 +3911,7 @@ fn prefill_mlp_layer(
             &mut scratch.proj_buf,
             lw.down_proj_int4_scale.as_ref(),
             lw.down_proj_int4_zero.as_ref(),
+            lw.down_proj_awq_inv_scale.as_ref(),
             weights.int4_group_size,
         )?;
     }

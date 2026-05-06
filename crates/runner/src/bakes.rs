@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::Result;
+use model_store::manifest::QuantProfile;
 
 use crate::registry::ModelVariant;
 use crate::Cli;
@@ -91,8 +92,45 @@ pub(crate) fn try_download_bake(
 
 /// Pick the variant the CLI flags imply, using the same priority order as
 /// the rest of the runner.
-pub(crate) fn cli_variant(cli: &Cli) -> model_store::fetch::BakeVariant {
-    model_store::fetch::variant_from_flags(cli.q4km_gptq, cli.q4km, cli.int4, cli.fp8_runtime)
+pub(crate) fn effective_quant_profile(cli: &Cli) -> Result<QuantProfile> {
+    let mut selected: Option<QuantProfile> = None;
+    let mut set = |profile: QuantProfile, source: &str| -> Result<()> {
+        if let Some(prev) = selected {
+            if prev != profile {
+                anyhow::bail!(
+                    "{source} selects {profile}, but another quant flag already selected {prev}"
+                );
+            }
+        } else {
+            selected = Some(profile);
+        }
+        Ok(())
+    };
+    if let Some(raw) = cli.weight_quant.as_deref() {
+        let profile = raw
+            .parse::<QuantProfile>()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        set(profile, "--weight-quant")?;
+    }
+    if cli.int4 {
+        set(QuantProfile::Int4Gptq, "--int4")?;
+    }
+    if cli.fp8_runtime {
+        set(QuantProfile::Fp8Native, "--fp8-runtime")?;
+    }
+    if cli.q4km {
+        set(QuantProfile::Q4Km, "--q4km")?;
+    }
+    if cli.q4km_gptq {
+        set(QuantProfile::Q4KmGptq, "--q4km-gptq")?;
+    }
+    Ok(selected.unwrap_or(QuantProfile::Bf16))
+}
+
+pub(crate) fn cli_variant(cli: &Cli) -> Result<model_store::fetch::BakeVariant> {
+    Ok(model_store::fetch::variant_from_quant_profile(
+        effective_quant_profile(cli)?,
+    ))
 }
 
 pub(crate) fn variant_version_ok(
@@ -100,6 +138,27 @@ pub(crate) fn variant_version_ok(
     bake_dir: &Path,
 ) -> bool {
     model_store::fetch::version_ok_for_variant(variant, bake_dir)
+}
+
+fn quant_bake_method_note(profile: QuantProfile) -> &'static str {
+    match profile {
+        QuantProfile::Int4Hqq => "INT4-HQQ baking is data-free and runs in Python.",
+        QuantProfile::Int4Gptq => "INT4-GPTQ baking requires a calibration pass in Python.",
+        QuantProfile::Int4Awq => {
+            "INT4-AWQ baking requires activation statistics and runs in Python."
+        }
+        QuantProfile::Int4Autoround => {
+            "INT4-AutoRound baking requires activation samples and a Python rounding-optimization pass."
+        }
+        _ => "This quant profile requires an external Python bake.",
+    }
+}
+
+fn upload_bake_args(profile: QuantProfile) -> String {
+    match profile {
+        QuantProfile::Int4Gptq => "--int4".to_string(),
+        other => format!("--weight-quant {other}"),
+    }
 }
 
 pub(crate) fn should_fetch_bake(
@@ -134,13 +193,8 @@ pub(crate) fn load_qwen35_weights(
         .map_err(|e| anyhow::anyhow!("load weights: {e}"));
     }
 
-    let variant = if cli.int4 {
-        model_store::fetch::BakeVariant::Int4Gptq
-    } else if cli.fp8_runtime {
-        model_store::fetch::BakeVariant::Fp8Native
-    } else {
-        cli_variant(cli)
-    };
+    let profile = effective_quant_profile(cli)?;
+    let variant = model_store::fetch::variant_from_quant_profile(profile);
     let mut bake_dir = variant.bake_dir(&cli.model_dir);
     let _lock = model_store::BakeLock::acquire(&cli.model_dir)
         .map_err(|e| anyhow::anyhow!("acquire bake lock: {e}"))?;
@@ -172,9 +226,12 @@ pub(crate) fn load_qwen35_weights(
                     } else {
                         anyhow::bail!(
                             "no {variant} bake at {} and --no-download set.\n\
-                             Run on a bigger machine:\n  python oracle/bake_int4.py --model-dir {}",
+                             {}\n\
+                             Run on a bigger machine:\n  python oracle/bake_int4.py --model-dir {} --profile {}",
                             bake_dir.display(),
+                            quant_bake_method_note(profile),
                             cli.model_dir.display(),
+                            profile,
                         );
                     }
                 }
@@ -191,11 +248,14 @@ pub(crate) fn load_qwen35_weights(
                 } else {
                     anyhow::bail!(
                         "could not obtain {variant} bake: {e}\n\n\
-                         INT4 baking requires a GPTQ calibration pass in Python. \
-                         Run on a bigger machine:\n  python oracle/bake_int4.py --model-dir {}\n\
-                         then `python oracle/upload_bake.py --model {} --int4 --model-dir {}` to publish.",
+                         {} \
+                         Run on a bigger machine:\n  python oracle/bake_int4.py --model-dir {} --profile {}\n\
+                         then `python oracle/upload_bake.py --model {} {} --model-dir {}` to publish.",
+                        quant_bake_method_note(profile),
                         cli.model_dir.display(),
+                        profile,
                         cli.model,
+                        upload_bake_args(profile),
                         cli.model_dir.display(),
                     );
                 }
@@ -329,7 +389,7 @@ pub(crate) fn ensure_hf_metadata_present(cli: &Cli, model_variant: &ModelVariant
     if cli.model_dir.join("config.json").exists() {
         return Ok(false);
     }
-    let variant = cli_variant(cli);
+    let variant = cli_variant(cli)?;
     let bake_dir = variant.bake_dir(&cli.model_dir);
     let _lock = model_store::BakeLock::acquire(&cli.model_dir)
         .map_err(|e| anyhow::anyhow!("acquire bake lock: {e}"))?;
@@ -349,7 +409,22 @@ pub(crate) fn ensure_hf_metadata_present(cli: &Cli, model_variant: &ModelVariant
 
 #[cfg(test)]
 mod tests {
-    use super::{should_fetch_bake, should_fetch_exact_bake};
+    use clap::Parser;
+    use model_store::manifest::QuantProfile;
+
+    use super::{effective_quant_profile, should_fetch_bake, should_fetch_exact_bake};
+    use crate::Cli;
+
+    fn cli(extra: &[&str]) -> Cli {
+        let mut args = vec![
+            "supersonic",
+            "--model-dir",
+            "/tmp/model",
+            "--dry-run",
+        ];
+        args.extend_from_slice(extra);
+        Cli::parse_from(args)
+    }
 
     #[test]
     fn bootstrap_download_satisfies_forced_bake_download() {
@@ -369,5 +444,29 @@ mod tests {
     #[test]
     fn forced_exact_bake_fetch_ignores_metadata_bootstrap() {
         assert!(should_fetch_exact_bake(true, true));
+    }
+
+    #[test]
+    fn weight_quant_selects_canonical_profile() {
+        assert_eq!(
+            effective_quant_profile(&cli(&["--weight-quant", "hqq"])).unwrap(),
+            QuantProfile::Int4Hqq
+        );
+    }
+
+    #[test]
+    fn legacy_int4_alias_matches_gptq_profile() {
+        assert_eq!(
+            effective_quant_profile(&cli(&["--int4"])).unwrap(),
+            QuantProfile::Int4Gptq
+        );
+    }
+
+    #[test]
+    fn conflicting_quant_flags_are_rejected() {
+        let err = effective_quant_profile(&cli(&["--weight-quant", "int4-awq", "--int4"]))
+            .expect_err("conflicting quant flags should fail")
+            .to_string();
+        assert!(err.contains("--int4 selects int4-gptq"));
     }
 }

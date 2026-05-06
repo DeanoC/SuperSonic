@@ -6,7 +6,7 @@ pub mod transforms;
 
 use std::path::{Path, PathBuf};
 
-use manifest::{Manifest, CONVERTER_VERSION, FORMAT_VERSION};
+use manifest::{Manifest, QuantProfile, CONVERTER_VERSION, FORMAT_VERSION};
 
 pub use baker::{bake_phi4, bake_qwen35};
 pub use store::BakedStore;
@@ -54,9 +54,20 @@ pub fn version_ok_fp8(bake_dir: &Path) -> bool {
 /// Uses a separate directory so BF16/FP8/INT4 baked packages coexist. The
 /// "-gptq" suffix invalidates older naive min/max bakes automatically.
 pub fn bake_dir_int4(model_dir: &Path) -> PathBuf {
-    model_dir
-        .join(".supersonic")
-        .join(format!("v{FORMAT_VERSION}-int4-gptq"))
+    bake_dir_for_quant_profile(model_dir, QuantProfile::Int4Gptq)
+}
+
+/// Return the bake directory for any named weight quantization profile.
+pub fn bake_dir_for_quant_profile(model_dir: &Path, profile: QuantProfile) -> PathBuf {
+    match profile {
+        QuantProfile::Bf16 => bake_dir(model_dir),
+        QuantProfile::Fp8Native => bake_dir_fp8(model_dir),
+        QuantProfile::Q4Km => bake_dir_q4km(model_dir),
+        QuantProfile::Q4KmGptq => bake_dir_q4km_gptq(model_dir),
+        other => model_dir
+            .join(".supersonic")
+            .join(format!("v{FORMAT_VERSION}-{}", other.as_str())),
+    }
 }
 
 /// Return the bake directory for GGUF Q4_K_M-compatible raw GGML K-block weights.
@@ -157,4 +168,27 @@ fn version_ok_with_quant_profile(bake_dir: &Path, quant_profile: &str) -> bool {
         && m.converter_version == CONVERTER_VERSION
         && m.quant_profile.as_deref() == Some(quant_profile)
         && weights_bin_path(bake_dir).exists()
+}
+
+/// Check if a valid baked package exists and declares the expected modern
+/// quant profile. BF16 accepts legacy manifests that omitted `quant_profile`.
+pub fn version_ok_for_quant_profile(bake_dir: &Path, expected: QuantProfile) -> bool {
+    let mp = manifest_path(bake_dir);
+    let Ok(text) = std::fs::read_to_string(&mp) else {
+        return false;
+    };
+    let Ok(m) = serde_json::from_str::<Manifest>(&text) else {
+        return false;
+    };
+    if m.format_version != FORMAT_VERSION
+        || m.converter_version != CONVERTER_VERSION
+        || !weights_bin_path(bake_dir).exists()
+    {
+        return false;
+    }
+    match (expected, m.quant_profile.as_deref()) {
+        (QuantProfile::Bf16, None | Some("bf16")) => true,
+        (_, Some(got)) => got == expected.as_str(),
+        _ => false,
+    }
 }

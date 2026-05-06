@@ -859,6 +859,7 @@ unsafe extern "C" {
         rhs_int4: *const c_void,
         scale: *const c_void,
         zero: *const c_void,
+        awq_inv_scale: *const c_void,
         group_size: c_int,
         quant_type: c_int,
         out: *mut c_void,
@@ -2308,6 +2309,7 @@ pub fn matmul_rhs_transposed_int4(
     rhs_int4: &GpuBuffer,
     scale: &GpuBuffer,
     zero: &GpuBuffer,
+    awq_inv_scale: Option<&GpuBuffer>,
     group_size: usize,
     quant_type: i32,
     out: &mut GpuBuffer,
@@ -2379,6 +2381,9 @@ pub fn matmul_rhs_transposed_int4(
             rhs_int4.as_ptr(),
             scale.as_ptr(),
             zero.as_ptr(),
+            awq_inv_scale
+                .map(|buf| buf.as_ptr())
+                .unwrap_or(std::ptr::null()),
             group_size as c_int,
             quant_type as c_int,
             out.as_mut_ptr(),

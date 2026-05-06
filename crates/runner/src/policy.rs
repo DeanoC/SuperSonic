@@ -1,11 +1,15 @@
 use anyhow::Result;
+use model_store::manifest::QuantProfile;
 
 use crate::certified_kv;
 use crate::registry::{Backend, GpuArch, ModelFamily, ModelVariant};
 use crate::Cli;
 
 pub(crate) fn q4km_like(cli: &Cli) -> bool {
-    cli.q4km || cli.q4km_gptq
+    matches!(
+        crate::bakes::effective_quant_profile(cli),
+        Ok(QuantProfile::Q4Km | QuantProfile::Q4KmGptq)
+    )
 }
 
 pub(crate) fn validate_global_flags(
@@ -14,13 +18,12 @@ pub(crate) fn validate_global_flags(
     backend: Backend,
 ) -> Result<()> {
     let q4km_like = q4km_like(cli);
+    let profile = crate::bakes::effective_quant_profile(cli)?;
     if cli.q4km && cli.q4km_gptq {
         anyhow::bail!("--q4km is mutually exclusive with --q4km-gptq");
     }
-    if q4km_like && (cli.int4 || cli.int8 || cli.fp8_runtime) {
-        anyhow::bail!(
-            "--q4km/--q4km-gptq are mutually exclusive with --int4, --int8, and --fp8-runtime"
-        );
+    if q4km_like && cli.int8 {
+        anyhow::bail!("--q4km/--q4km-gptq are mutually exclusive with --int8");
     }
     if q4km_like
         && !matches!(
@@ -33,14 +36,32 @@ pub(crate) fn validate_global_flags(
     if q4km_like && backend != Backend::Cuda {
         anyhow::bail!("--q4km/--q4km-gptq are currently supported only on CUDA");
     }
-    if cli.gguf_file.is_some() && !cli.q4km {
+    if cli.gguf_file.is_some() && profile != QuantProfile::Q4Km {
         anyhow::bail!("--gguf-file requires --q4km");
     }
     if cli.no_bake && q4km_like {
         anyhow::bail!("--q4km/--q4km-gptq require a baked package; omit --no-bake");
     }
-    if cli.int8 && (cli.int4 || cli.fp8_runtime) {
-        anyhow::bail!("--int8 is mutually exclusive with --int4 and --fp8-runtime");
+    if cli.int8 && profile != QuantProfile::Bf16 {
+        anyhow::bail!(
+            "--int8 is mutually exclusive with --weight-quant and legacy weight quant flags"
+        );
+    }
+    if profile.is_runtime_backed_lowbit() {
+        anyhow::bail!(
+            "--weight-quant {profile} has manifest and package naming support, but Qwen HIP runtime kernels/loaders for this profile are not implemented yet"
+        );
+    }
+    if matches!(
+        profile,
+        QuantProfile::Int4Awq | QuantProfile::Int4Autoround | QuantProfile::Int4Hqq
+    ) && !matches!(
+        model_variant.family(),
+        ModelFamily::Qwen35 | ModelFamily::Qwen36Moe
+    ) {
+        anyhow::bail!(
+            "--weight-quant {profile} is Qwen-first; Gemma 4 and Phi 4 ports are follow-up work"
+        );
     }
     if cli.int8 && model_variant.family() != ModelFamily::Llama31 {
         anyhow::bail!("--int8 is currently supported only for llama3.1-8b on CUDA");

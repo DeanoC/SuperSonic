@@ -30,6 +30,7 @@ fn synthetic_store(expert_count: usize, expert_bytes: usize) -> tempfile::TempDi
         quant_profile: None,
         source_format: None,
         source_quant: None,
+        quant_method: None,
         tensors: vec![TensorMeta {
             name: "model.layers.0.mlp.experts.gate_up_proj".to_string(),
             shape: vec![total_bytes],
