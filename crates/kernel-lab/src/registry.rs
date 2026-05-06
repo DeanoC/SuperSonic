@@ -18,6 +18,27 @@ const TASKS: &[TaskDef] = &[
         run: tasks::qwen35_full_attention_prefill,
     },
     TaskDef {
+        id: "qwen35.int4_matvec",
+        family: "qwen3.5",
+        tags: &["qwen35", "int4", "awq", "quant"],
+        required: false,
+        run: tasks::qwen35_int4_matvec,
+    },
+    TaskDef {
+        id: "qwen35.int4_awq_dense_matvec",
+        family: "qwen3.5",
+        tags: &["qwen35", "int4", "awq", "quant"],
+        required: false,
+        run: tasks::qwen35_int4_awq_dense_matvec,
+    },
+    TaskDef {
+        id: "qwen35.int4_awq_sparse_outlier_matvec",
+        family: "qwen3.5",
+        tags: &["qwen35", "int4", "awq", "quant"],
+        required: false,
+        run: tasks::qwen35_int4_awq_sparse_outlier_matvec,
+    },
+    TaskDef {
         id: "qwen36.batched_prefill_attn_full",
         family: "qwen3.6-moe",
         tags: &["qwen36", "attention", "prefill", "required"],

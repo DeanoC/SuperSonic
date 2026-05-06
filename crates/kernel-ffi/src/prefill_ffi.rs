@@ -1009,6 +1009,19 @@ unsafe extern "C" {
         out: *mut c_void,
     ) -> c_int;
 
+    fn supersonic_qwen35_4b_hip_int4_sparse_outlier_add(
+        dtype: c_int,
+        device_ordinal: usize,
+        rows: c_int,
+        n: c_int,
+        k: c_int,
+        sub_cols: c_int,
+        lhs: *const c_void,
+        outlier_cols: *const c_void,
+        outlier_delta: *const c_void,
+        out: *mut c_void,
+    ) -> c_int;
+
     // BF16 → FP8 KV cache quantization
     fn supersonic_qwen35_4b_hip_quantize_kv_to_fp8(
         dtype: c_int,
@@ -2636,6 +2649,47 @@ pub fn int8_outlier_add(
             Ok(())
         })
     }
+}
+
+pub fn int4_sparse_outlier_add(
+    ordinal: usize,
+    rows: usize,
+    n: usize,
+    k: usize,
+    sub_cols: usize,
+    lhs: &GpuBuffer,
+    outlier_cols: &GpuBuffer,
+    outlier_delta: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if gpu_hal::current_backend() != Backend::Hip && gpu_hal::current_backend() != Backend::Cuda {
+        return Err(ffi_error(
+            "int4_sparse_outlier_add requires the HIP or CUDA backend".to_string(),
+        ));
+    }
+
+    ffi_profile_time_result("qwen.int4_sparse_outlier_add", ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_4b_hip_int4_sparse_outlier_add(
+                ScalarType::BF16.kernel_dtype_code(),
+                ordinal,
+                rows as c_int,
+                n as c_int,
+                k as c_int,
+                sub_cols as c_int,
+                lhs.as_ptr(),
+                outlier_cols.as_ptr(),
+                outlier_delta.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!(
+                "int4_sparse_outlier_add failed: {status}"
+            )));
+        }
+        Ok(())
+    })
 }
 
 // ---- Multi-row RMSNorm (for prefill — n_rows > 1) ----

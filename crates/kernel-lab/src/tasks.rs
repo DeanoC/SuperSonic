@@ -36,6 +36,16 @@ struct ExpertShape {
     seed: u64,
 }
 
+#[derive(Clone, Copy)]
+struct Int4MatvecShape {
+    m: usize,
+    n: usize,
+    k: usize,
+    group_size: usize,
+    sparse_cols: usize,
+    seed: u64,
+}
+
 struct TimedSamples {
     source: &'static str,
     us: Vec<f64>,
@@ -111,6 +121,39 @@ pub fn qwen36_batched_prefill_attn_full(cfg: &KernelLabConfig) -> Result<TaskRes
         shapes
             .iter()
             .map(|&shape| run_qwen36_attn_case(cfg, shape))
+            .collect(),
+    )
+}
+
+pub fn qwen35_int4_matvec(cfg: &KernelLabConfig) -> Result<TaskResult> {
+    let task = crate::find_task("qwen35.int4_matvec").unwrap();
+    task_result(
+        task,
+        int4_matvec_shapes()
+            .iter()
+            .map(|&shape| run_int4_matvec_case(cfg, shape, Int4Sidecar::None))
+            .collect(),
+    )
+}
+
+pub fn qwen35_int4_awq_dense_matvec(cfg: &KernelLabConfig) -> Result<TaskResult> {
+    let task = crate::find_task("qwen35.int4_awq_dense_matvec").unwrap();
+    task_result(
+        task,
+        int4_matvec_shapes()
+            .iter()
+            .map(|&shape| run_int4_matvec_case(cfg, shape, Int4Sidecar::DenseAwq))
+            .collect(),
+    )
+}
+
+pub fn qwen35_int4_awq_sparse_outlier_matvec(cfg: &KernelLabConfig) -> Result<TaskResult> {
+    let task = crate::find_task("qwen35.int4_awq_sparse_outlier_matvec").unwrap();
+    task_result(
+        task,
+        int4_matvec_shapes()
+            .iter()
+            .map(|&shape| run_int4_matvec_case(cfg, shape, Int4Sidecar::SparseOutlier))
             .collect(),
     )
 }
@@ -303,6 +346,237 @@ fn ensure_hip(cfg: &KernelLabConfig) -> Result<()> {
         return Err(anyhow!("HIP backend is not compiled"));
     }
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum Int4Sidecar {
+    None,
+    DenseAwq,
+    SparseOutlier,
+}
+
+fn int4_matvec_shapes() -> [Int4MatvecShape; 2] {
+    [
+        Int4MatvecShape {
+            m: 1,
+            n: 512,
+            k: 512,
+            group_size: GROUP_SIZE,
+            sparse_cols: 32,
+            seed: 0xA35A,
+        },
+        Int4MatvecShape {
+            m: 1,
+            n: 2048,
+            k: 2048,
+            group_size: GROUP_SIZE,
+            sparse_cols: 64,
+            seed: 0xA35B,
+        },
+    ]
+}
+
+fn run_int4_matvec_case(
+    cfg: &KernelLabConfig,
+    shape: Int4MatvecShape,
+    sidecar: Int4Sidecar,
+) -> Result<CaseResult> {
+    ensure_hip(cfg)?;
+    let batch = 1;
+    let rows = batch * shape.m;
+    let (lhs_host, lhs_f32) = make_bf16(rows * shape.k, shape.seed);
+    let (rhs_int4, scales, zeros) =
+        make_int4_slab(shape.n, shape.k, shape.group_size, shape.seed + 0x1000);
+    let awq_host = match sidecar {
+        Int4Sidecar::DenseAwq => Some(make_awq_inv_scale(shape.k, shape.seed + 0x2000)),
+        _ => None,
+    };
+    let outlier_cols = make_outlier_cols(shape.k, shape.sparse_cols, shape.seed + 0x3000);
+    let outlier_delta = make_sparse_delta(shape.n, shape.sparse_cols, shape.seed + 0x4000);
+
+    let lhs = upload_bf16(cfg.device, &lhs_host, &[batch, shape.m, shape.k])?;
+    let rhs = upload_u8(cfg.device, &rhs_int4, &[batch, shape.n, shape.k / 2])?;
+    let scale = upload_bf16(
+        cfg.device,
+        &scales,
+        &[shape.n / shape.group_size, shape.k / shape.group_size],
+    )?;
+    let zero = upload_bf16(
+        cfg.device,
+        &zeros,
+        &[shape.n / shape.group_size, shape.k / shape.group_size],
+    )?;
+    let awq = awq_host
+        .as_ref()
+        .map(|host| upload_bf16(cfg.device, host, &[shape.k]))
+        .transpose()?;
+    let cols_buf = upload_u32(cfg.device, &outlier_cols, &[shape.sparse_cols])?;
+    let delta_buf = upload_bf16(cfg.device, &outlier_delta, &[shape.n, shape.sparse_cols])?;
+    let mut out = GpuBuffer::zeros(cfg.device, ScalarType::BF16, &[batch, shape.m, shape.n])?;
+
+    prefill_ffi::matmul_rhs_transposed_int4(
+        cfg.device,
+        batch,
+        shape.m,
+        shape.n,
+        shape.k,
+        &lhs,
+        &rhs,
+        &scale,
+        &zero,
+        awq.as_ref(),
+        shape.group_size,
+        4,
+        &mut out,
+    )?;
+    if matches!(sidecar, Int4Sidecar::SparseOutlier) {
+        launch_int4_sparse_outlier_add(
+            cfg.device,
+            rows,
+            shape.n,
+            shape.k,
+            shape.sparse_cols,
+            &lhs,
+            &cols_buf,
+            &delta_buf,
+            &mut out,
+        )?;
+    }
+    gpu_hal::sync(cfg.device)?;
+    let got = download_bf16(&out)?;
+    let mut want = cpu_int4_matmul(
+        rows,
+        shape.n,
+        shape.k,
+        shape.group_size,
+        &lhs_f32,
+        &rhs_int4,
+        &scales,
+        &zeros,
+        awq_host.as_deref(),
+    );
+    if matches!(sidecar, Int4Sidecar::SparseOutlier) {
+        cpu_sparse_outlier_add(
+            rows,
+            shape.n,
+            shape.k,
+            shape.sparse_cols,
+            &lhs_f32,
+            &outlier_cols,
+            &outlier_delta,
+            &mut want,
+        );
+    }
+    let (max_abs, max_rel) = max_abs_rel_bf16(&got, &want, 1e-3);
+
+    let samples = match sidecar {
+        Int4Sidecar::SparseOutlier => measure_us(cfg, || {
+            prefill_ffi::matmul_rhs_transposed_int4(
+                cfg.device,
+                batch,
+                shape.m,
+                shape.n,
+                shape.k,
+                &lhs,
+                &rhs,
+                &scale,
+                &zero,
+                None,
+                shape.group_size,
+                4,
+                &mut out,
+            )?;
+            launch_int4_sparse_outlier_add(
+                cfg.device,
+                rows,
+                shape.n,
+                shape.k,
+                shape.sparse_cols,
+                &lhs,
+                &cols_buf,
+                &delta_buf,
+                &mut out,
+            )
+        })?,
+        _ => measure_us(cfg, || {
+            prefill_ffi::matmul_rhs_transposed_int4(
+                cfg.device,
+                batch,
+                shape.m,
+                shape.n,
+                shape.k,
+                &lhs,
+                &rhs,
+                &scale,
+                &zero,
+                awq.as_ref(),
+                shape.group_size,
+                4,
+                &mut out,
+            )
+        })?,
+    };
+
+    let name = match sidecar {
+        Int4Sidecar::None => "int4_matvec",
+        Int4Sidecar::DenseAwq => "int4_awq_dense_matvec",
+        Int4Sidecar::SparseOutlier => "int4_awq_sparse_outlier_matvec",
+    };
+    Ok(case_result(
+        name,
+        int4_shape_map(shape),
+        max_rel < 1e-2,
+        Some(max_abs),
+        Some(max_rel),
+        None,
+        None,
+        cfg,
+        &samples,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(kernel_lab_has_int4_sparse_outlier_add)]
+fn launch_int4_sparse_outlier_add(
+    ordinal: usize,
+    rows: usize,
+    n: usize,
+    k: usize,
+    sub_cols: usize,
+    lhs: &GpuBuffer,
+    outlier_cols: &GpuBuffer,
+    outlier_delta: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), gpu_hal::GpuError> {
+    prefill_ffi::int4_sparse_outlier_add(
+        ordinal,
+        rows,
+        n,
+        k,
+        sub_cols,
+        lhs,
+        outlier_cols,
+        outlier_delta,
+        out,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(not(kernel_lab_has_int4_sparse_outlier_add))]
+fn launch_int4_sparse_outlier_add(
+    _ordinal: usize,
+    _rows: usize,
+    _n: usize,
+    _k: usize,
+    _sub_cols: usize,
+    _lhs: &GpuBuffer,
+    _outlier_cols: &GpuBuffer,
+    _outlier_delta: &GpuBuffer,
+    _out: &mut GpuBuffer,
+) -> Result<(), gpu_hal::GpuError> {
+    Err(gpu_hal::GpuError::InvalidArg(
+        "kernel-ffi does not expose int4_sparse_outlier_add".to_string(),
+    ))
 }
 
 fn run_qwen35_attn_case(cfg: &KernelLabConfig, shape: AttnShape) -> Result<CaseResult> {
@@ -884,6 +1158,19 @@ fn upload_i32(ordinal: usize, host: &[i32], shape: &[usize]) -> Result<GpuBuffer
     Ok(buf)
 }
 
+fn upload_u32(ordinal: usize, host: &[u32], shape: &[usize]) -> Result<GpuBuffer> {
+    assert_eq!(host.len(), shape.iter().product::<usize>());
+    let mut buf = GpuBuffer::zeros(ordinal, ScalarType::U32, shape)?;
+    let bytes = unsafe { std::slice::from_raw_parts(host.as_ptr() as *const u8, host.len() * 4) };
+    gpu_hal::copy_h2d(
+        ordinal,
+        buf.as_mut_ptr(),
+        bytes.as_ptr() as *const _,
+        bytes.len(),
+    )?;
+    Ok(buf)
+}
+
 fn upload_u8(ordinal: usize, host: &[u8], shape: &[usize]) -> Result<GpuBuffer> {
     Ok(GpuBuffer::from_host_bytes(
         ordinal,
@@ -1148,6 +1435,10 @@ fn bf16_round_rne_f32(x: f32) -> f32 {
     f32::from_bits((bits.wrapping_add(rounding_bias)) & 0xFFFF_0000)
 }
 
+fn bf16_trunc_f32(x: f32) -> f32 {
+    f32::from_bits(x.to_bits() & 0xFFFF_0000)
+}
+
 fn int4_dequant_scalar(nibble: u32, scale: half::bf16, zero: half::bf16) -> f32 {
     bf16_round_rne_f32((nibble as f32) * scale.to_f32() - zero.to_f32() * scale.to_f32())
 }
@@ -1178,6 +1469,40 @@ fn make_int4_slab(
         zeros[i] = half::bf16::from_f32((raw % 16) as f32);
     }
     (packed, scales, zeros)
+}
+
+fn make_awq_inv_scale(k: usize, seed: u64) -> Vec<half::bf16> {
+    let mut state = seed;
+    (0..k)
+        .map(|_| {
+            let (next, raw) = lcg(state);
+            state = next;
+            half::bf16::from_f32(0.75 + ((raw % 1000) as f32 / 1000.0) * 0.5)
+        })
+        .collect()
+}
+
+fn make_outlier_cols(k: usize, sub_cols: usize, seed: u64) -> Vec<u32> {
+    let mut state = seed;
+    let mut cols = std::collections::BTreeSet::new();
+    while cols.len() < sub_cols {
+        let (next, raw) = lcg(state);
+        state = next;
+        cols.insert((raw as usize % k) as u32);
+    }
+    cols.into_iter().collect()
+}
+
+fn make_sparse_delta(n: usize, sub_cols: usize, seed: u64) -> Vec<half::bf16> {
+    let mut state = seed;
+    let mut out = Vec::with_capacity(n * sub_cols);
+    for _ in 0..n * sub_cols {
+        let (next, raw) = lcg(state);
+        state = next;
+        let centered = (raw % 2001) as f32 / 1000.0 - 1.0;
+        out.push(half::bf16::from_f32(centered * 0.01));
+    }
+    out
 }
 
 type ExpertWeights = (
@@ -1250,6 +1575,71 @@ fn int4_matvec_row(
         col += 8;
     }
     acc
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cpu_int4_matmul(
+    rows: usize,
+    n: usize,
+    k: usize,
+    gs: usize,
+    lhs: &[f32],
+    packed: &[u8],
+    scales: &[half::bf16],
+    zeros: &[half::bf16],
+    awq_inv_scale: Option<&[half::bf16]>,
+) -> Vec<half::bf16> {
+    let byte_cols = k / 2;
+    let scale_cols = k / gs;
+    let mut out = vec![half::bf16::ZERO; rows * n];
+    for row in 0..rows {
+        let x = &lhs[row * k..(row + 1) * k];
+        for out_col in 0..n {
+            let scale_row = out_col / gs;
+            let row_byte_off = out_col * byte_cols;
+            let mut acc = 0.0f32;
+            for c in 0..k {
+                let byte = packed[row_byte_off + c / 2];
+                let nibble = if c % 2 == 0 { byte & 0xF } else { byte >> 4 };
+                let g = c / gs;
+                let mut w = int4_dequant_scalar(
+                    nibble as u32,
+                    scales[scale_row * scale_cols + g],
+                    zeros[scale_row * scale_cols + g],
+                );
+                if let Some(inv) = awq_inv_scale {
+                    w = bf16_trunc_f32(w * inv[c].to_f32());
+                }
+                acc += x[c] * w;
+            }
+            out[row * n + out_col] = half::bf16::from_f32(bf16_round_rne_f32(acc));
+        }
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cpu_sparse_outlier_add(
+    rows: usize,
+    n: usize,
+    k: usize,
+    sub_cols: usize,
+    lhs: &[f32],
+    outlier_cols: &[u32],
+    outlier_delta: &[half::bf16],
+    out: &mut [half::bf16],
+) {
+    for row in 0..rows {
+        for out_col in 0..n {
+            let mut acc = out[row * n + out_col].to_f32();
+            for j in 0..sub_cols {
+                let k_col = outlier_cols[j] as usize;
+                debug_assert!(k_col < k);
+                acc += lhs[row * k + k_col] * outlier_delta[out_col * sub_cols + j].to_f32();
+            }
+            out[row * n + out_col] = half::bf16::from_f32(bf16_round_rne_f32(acc));
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1364,6 +1754,16 @@ fn attn_shape_map(shape: AttnShape) -> BTreeMap<String, usize> {
     ])
 }
 
+fn int4_shape_map(shape: Int4MatvecShape) -> BTreeMap<String, usize> {
+    BTreeMap::from([
+        ("m".into(), shape.m),
+        ("n".into(), shape.n),
+        ("k".into(), shape.k),
+        ("group_size".into(), shape.group_size),
+        ("sparse_cols".into(), shape.sparse_cols),
+    ])
+}
+
 fn router_shape_map(shape: RouterShape) -> BTreeMap<String, usize> {
     BTreeMap::from([
         ("n_tokens".into(), shape.n_tokens),
@@ -1380,4 +1780,92 @@ fn expert_shape_map(shape: ExpertShape) -> BTreeMap<String, usize> {
         ("hidden".into(), shape.hidden),
         ("moe_intermediate".into(), shape.moe_intermediate),
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cpu_int4_matmul_matches_manual_reference() {
+        let shape = Int4MatvecShape {
+            m: 1,
+            n: 128,
+            k: 128,
+            group_size: 128,
+            sparse_cols: 8,
+            seed: 0x51,
+        };
+        let (_lhs_bf16, lhs) = make_bf16(shape.m * shape.k, shape.seed);
+        let (packed, scales, zeros) =
+            make_int4_slab(shape.n, shape.k, shape.group_size, shape.seed + 1);
+        let got = cpu_int4_matmul(
+            shape.m,
+            shape.n,
+            shape.k,
+            shape.group_size,
+            &lhs,
+            &packed,
+            &scales,
+            &zeros,
+            None,
+        );
+        let want0 = half::bf16::from_f32(bf16_round_rne_f32(int4_matvec_row(
+            &packed,
+            &scales,
+            &zeros,
+            shape.k,
+            shape.group_size,
+            0,
+            &lhs,
+        )));
+        assert_eq!(got[0], want0);
+    }
+
+    #[test]
+    fn cpu_dense_awq_changes_reference_by_inverse_scale() {
+        let k = 128;
+        let n = 128;
+        let (_lhs_bf16, lhs) = make_bf16(k, 0x61);
+        let (packed, scales, zeros) = make_int4_slab(n, k, GROUP_SIZE, 0x62);
+        let awq = vec![half::bf16::from_f32(0.5); k];
+        let base = cpu_int4_matmul(1, n, k, GROUP_SIZE, &lhs, &packed, &scales, &zeros, None);
+        let dense = cpu_int4_matmul(
+            1,
+            n,
+            k,
+            GROUP_SIZE,
+            &lhs,
+            &packed,
+            &scales,
+            &zeros,
+            Some(&awq),
+        );
+        assert!(base
+            .iter()
+            .zip(dense.iter())
+            .any(|(lhs, rhs)| lhs.to_bits() != rhs.to_bits()));
+    }
+
+    #[test]
+    fn cpu_sparse_outlier_add_matches_manual_reference() {
+        let rows = 1;
+        let n = 4;
+        let k = 8;
+        let sub_cols = 3;
+        let lhs: Vec<f32> = (0..k).map(|i| i as f32 * 0.25).collect();
+        let cols = vec![1, 4, 6];
+        let delta: Vec<_> = (0..n * sub_cols)
+            .map(|i| half::bf16::from_f32((i as f32 - 3.0) * 0.125))
+            .collect();
+        let mut got = vec![half::bf16::ZERO; rows * n];
+        cpu_sparse_outlier_add(rows, n, k, sub_cols, &lhs, &cols, &delta, &mut got);
+        for out_col in 0..n {
+            let mut want = 0.0f32;
+            for j in 0..sub_cols {
+                want += lhs[cols[j] as usize] * delta[out_col * sub_cols + j].to_f32();
+            }
+            assert_eq!(got[out_col], half::bf16::from_f32(bf16_round_rne_f32(want)));
+        }
+    }
 }

@@ -3788,6 +3788,37 @@ void supersonic_qwen35_matmul_int4_dequant_wmma_kernel(
 }
 
 template <typename T>
+__global__ void supersonic_qwen35_int4_sparse_outlier_add_kernel(
+    int rows,
+    int n,
+    int k,
+    int sub_cols,
+    const T* __restrict__ lhs,
+    const uint32_t* __restrict__ outlier_cols,
+    const T* __restrict__ outlier_delta,
+    T* __restrict__ out
+) {
+    const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t total = static_cast<size_t>(rows) * static_cast<size_t>(n);
+    if (idx >= total) {
+        return;
+    }
+
+    const int row = static_cast<int>(idx / static_cast<size_t>(n));
+    const int out_col = static_cast<int>(idx % static_cast<size_t>(n));
+    float acc = 0.0f;
+    for (int j = 0; j < sub_cols; ++j) {
+        const int k_col = static_cast<int>(outlier_cols[j]);
+        const float x = supersonic_qwen35_to_float(lhs[row * k + k_col]);
+        const float delta = supersonic_qwen35_to_float(outlier_delta[out_col * sub_cols + j]);
+        acc += x * delta;
+    }
+
+    const float base = supersonic_qwen35_to_float(out[idx]);
+    out[idx] = supersonic_qwen35_from_float<T>(base + acc);
+}
+
+template <typename T>
 __global__ void supersonic_qwen35_delta_full_scan_pack_kernel(
     int batch_heads,
     int num_chunks,
