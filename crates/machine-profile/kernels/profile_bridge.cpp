@@ -122,11 +122,13 @@ extern "C" __global__ void mp_wmma_peak_i8_kernel(uint64_t iters, int *sink);
 extern "C" double mp_wmma_peak_f16(int device, uint32_t cu_count, uint64_t iters)
 {
     hipSetDevice(device);
-    float *sink = nullptr;
-    hipMalloc(&sink, sizeof(float) * cu_count);
-    hipMemset(sink, 0, sizeof(float) * cu_count);
     int threads = 32; // wave32 on RDNA
     uint32_t blocks = cu_count * 2;
+    // Fallback (non-RDNA3) kernels write sink[blockIdx.x] unconditionally, so
+    // size the sink for every launched block, not just per-CU.
+    float *sink = nullptr;
+    hipMalloc(&sink, sizeof(float) * blocks);
+    hipMemset(sink, 0, sizeof(float) * blocks);
 
     // warmup
     hipLaunchKernelGGL(mp_wmma_peak_f16_kernel, dim3(blocks), dim3(threads), 0, 0,
@@ -154,11 +156,12 @@ extern "C" double mp_wmma_peak_f16(int device, uint32_t cu_count, uint64_t iters
 extern "C" double mp_wmma_peak_bf16(int device, uint32_t cu_count, uint64_t iters)
 {
     hipSetDevice(device);
-    float *sink = nullptr;
-    hipMalloc(&sink, sizeof(float) * cu_count);
-    hipMemset(sink, 0, sizeof(float) * cu_count);
     int threads = 32; // wave32 on RDNA
     uint32_t blocks = cu_count * 2;
+    // Sink sized for every launched block; fallback kernels write unconditionally.
+    float *sink = nullptr;
+    hipMalloc(&sink, sizeof(float) * blocks);
+    hipMemset(sink, 0, sizeof(float) * blocks);
 
     // warmup
     hipLaunchKernelGGL(mp_wmma_peak_bf16_kernel, dim3(blocks), dim3(threads), 0, 0,
@@ -185,11 +188,12 @@ extern "C" double mp_wmma_peak_bf16(int device, uint32_t cu_count, uint64_t iter
 extern "C" double mp_wmma_peak_i8(int device, uint32_t cu_count, uint64_t iters)
 {
     hipSetDevice(device);
-    int *sink = nullptr;
-    hipMalloc(&sink, sizeof(int) * cu_count);
-    hipMemset(sink, 0, sizeof(int) * cu_count);
     int threads = 32;
     uint32_t blocks = cu_count * 2;
+    // Sink sized for every launched block; fallback kernels write unconditionally.
+    int *sink = nullptr;
+    hipMalloc(&sink, sizeof(int) * blocks);
+    hipMemset(sink, 0, sizeof(int) * blocks);
 
     hipLaunchKernelGGL(mp_wmma_peak_i8_kernel, dim3(blocks), dim3(threads), 0, 0, iters / 4, sink);
     hipDeviceSynchronize();
