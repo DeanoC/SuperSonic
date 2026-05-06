@@ -283,9 +283,10 @@ pub(crate) fn run_batched_prefill_stub(
         return Ok(timings);
     }
 
-    // Refuse the batched path on any non-dense or FP8-KV configuration —
-    // those carry unique invariants not yet supported here. Fall back to
-    // the per-token path for the entire prefill in that case.
+    // Refuse the batched path on FP8-KV / FP8-runtime / sparse-residency
+    // configurations. SpecPrefill sparse prompts are supported by staging
+    // only kept tokens and applying RoPE through an indirect position-id
+    // buffer, so they can use the same compact KV timeline as dense chunks.
     let supports_batched =
         supports_batched_path(layers, keep_mask, moe_expert_residency.is_some());
     if !supports_batched {
@@ -308,9 +309,8 @@ pub(crate) fn run_batched_prefill_stub(
         );
     }
 
-    // Build RoPE tables once. Size by the largest plausible position
-    // (`effective_prompt_len + max_new_tokens` worth of slots; here we
-    // bound by the cache's `kv_max_t` to be safe).
+    // Build RoPE tables once. Dense chunks only need compact KV slots;
+    // sparse SpecPrefill chunks need the original prompt positions too.
     let max_kv_t = layers
         .iter()
         .filter_map(|l| match &l.attn {
@@ -321,7 +321,8 @@ pub(crate) fn run_batched_prefill_stub(
         })
         .max()
         .unwrap_or(1);
-    let max_pos = max_kv_t.max(effective_prompt_len);
+    let full_prompt_len = prompt_ids.len();
+    let max_pos = max_kv_t.max(full_prompt_len).max(effective_prompt_len);
     let rotary = RotaryTables::build(
         ordinal,
         max_pos,
@@ -337,8 +338,6 @@ pub(crate) fn run_batched_prefill_stub(
     let scratch_n = PREFILL_CHUNK_SIZE_MAX.min(prefill_count.max(1));
     let mut scratch = FullAttnBatchScratch::alloc(ordinal, geom, scratch_n, max_kv_t)
         .context("alloc full-attn batched scratch (max chunk)")?;
-
-    let full_prompt_len = prompt_ids.len();
 
     // Persistent kernel & MoE residency are mutated per-token via the
     // FFN/linear-attn fallbacks; pull them through the orchestrator.
@@ -390,8 +389,6 @@ pub(crate) fn run_batched_prefill_stub(
 /// Whether the layer stack supports the batched attn + grouped FFN path.
 ///
 /// Refuses (falls through to per-token):
-/// - **SpecPrefill / sparse-prefill mode** (`keep_mask.is_some()`) — the
-///   batched path doesn't honor the per-token kept-position mapping.
 /// - **FP8 KV cache** (`kv_scale_k.is_some()` on any layer) — the batched
 ///   KV cache write path is BF16-only; FP8 sidecar quantize-on-write isn't
 ///   wired here.
@@ -409,9 +406,7 @@ fn supports_batched_path(
     keep_mask: Option<&Vec<bool>>,
     moe_expert_residency_active: bool,
 ) -> bool {
-    if keep_mask.is_some() {
-        return false;
-    }
+    let _ = keep_mask;
     if moe_expert_residency_active {
         return false;
     }
@@ -539,7 +534,7 @@ fn process_chunk_batched(
 
     // Batched-attn enabled path: stage chunk on GPU and drive per-layer.
     let _ = (persistent_scratch, moe_expert_residency, moe_runtime, moe_routes);
-    let _ = (emit_stage_timings, full_prompt_len, keep_mask);
+    let _ = (emit_stage_timings, full_prompt_len);
 
     // 1. Stage the N chunk tokens onto the GPU.
     let hidden = geom.hidden as usize;
@@ -560,6 +555,21 @@ fn process_chunk_batched(
     )?;
     let t_embed = t0.elapsed();
     timings.embed_total += t_embed;
+    let pos_ids = if keep_mask.is_some() {
+        let mut pos_ids_host = Vec::with_capacity(n);
+        for slot in 0..n {
+            pos_ids_host.push(kept_positions[chunk_start + slot] as u32);
+        }
+        let pos_bytes = unsafe {
+            std::slice::from_raw_parts(pos_ids_host.as_ptr() as *const u8, pos_ids_host.len() * 4)
+        };
+        Some(
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::U32, &[n], pos_bytes)
+                .context("upload sparse prefill pos_ids")?,
+        )
+    } else {
+        None
+    };
 
     // M13: grouped MoE FFN is the DEFAULT once we're on the batched-attn
     // path. Set SUPERSONIC_QWEN36_MOE_GROUPED_FFN=0 to fall back to per-token
@@ -639,6 +649,7 @@ fn process_chunk_batched(
                 int4,
                 kv_cache,
                 rotary,
+                pos_ids.as_ref(),
                 scratch,
             )
             .with_context(|| format!("batched full-attn layer {layer_idx}"))?;
@@ -878,6 +889,7 @@ fn process_full_attn_layer_batched(
     int4: &FullAttnInt4Sidecars,
     kv_cache: &mut FullAttnKvCache,
     rotary: &RotaryTables,
+    pos_ids: Option<&GpuBuffer>,
     scratch: &mut FullAttnBatchScratch,
 ) -> Result<()> {
     let hidden = geom.hidden as usize;
@@ -1006,33 +1018,64 @@ fn process_full_attn_layer_batched(
     )
     .map_err(|e| anyhow!("rms_norm_rows k: {e}"))?;
 
-    // 5. RoPE on q and k. positions [past_len, past_len + n).
-    prefill_ffi::apply_rope_prefill(
-        ordinal,
-        ScalarType::BF16,
-        n,
-        h,
-        hd,
-        rotary_dim,
-        &rotary.cos,
-        &rotary.sin,
-        past_len,
-        &mut q_after,
-    )
-    .map_err(|e| anyhow!("rope q: {e}"))?;
-    prefill_ffi::apply_rope_prefill(
-        ordinal,
-        ScalarType::BF16,
-        n,
-        hkv,
-        hd,
-        rotary_dim,
-        &rotary.cos,
-        &rotary.sin,
-        past_len,
-        &mut k_after,
-    )
-    .map_err(|e| anyhow!("rope k: {e}"))?;
+    // 5. RoPE on q and k. Dense uses compact positions
+    // [past_len, past_len + n). Sparse SpecPrefill uses the original
+    // prompt positions for rotation while still writing compact cache slots.
+    if let Some(pos_ids) = pos_ids {
+        prefill_ffi::apply_rope_prefill_indirect(
+            ordinal,
+            ScalarType::BF16,
+            n,
+            h,
+            hd,
+            rotary_dim,
+            &rotary.cos,
+            &rotary.sin,
+            pos_ids,
+            &mut q_after,
+        )
+        .map_err(|e| anyhow!("rope q indirect: {e}"))?;
+        prefill_ffi::apply_rope_prefill_indirect(
+            ordinal,
+            ScalarType::BF16,
+            n,
+            hkv,
+            hd,
+            rotary_dim,
+            &rotary.cos,
+            &rotary.sin,
+            pos_ids,
+            &mut k_after,
+        )
+        .map_err(|e| anyhow!("rope k indirect: {e}"))?;
+    } else {
+        prefill_ffi::apply_rope_prefill(
+            ordinal,
+            ScalarType::BF16,
+            n,
+            h,
+            hd,
+            rotary_dim,
+            &rotary.cos,
+            &rotary.sin,
+            past_len,
+            &mut q_after,
+        )
+        .map_err(|e| anyhow!("rope q: {e}"))?;
+        prefill_ffi::apply_rope_prefill(
+            ordinal,
+            ScalarType::BF16,
+            n,
+            hkv,
+            hd,
+            rotary_dim,
+            &rotary.cos,
+            &rotary.sin,
+            past_len,
+            &mut k_after,
+        )
+        .map_err(|e| anyhow!("rope k: {e}"))?;
+    }
 
     // 6. KV cache write — append k_after, v to slots [past_len, past_len+n).
     //    Cache layout: [t, Hkv, hd] BF16. Source: k_after [n, Hkv, hd]

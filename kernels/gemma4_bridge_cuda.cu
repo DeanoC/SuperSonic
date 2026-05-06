@@ -5,6 +5,7 @@
 
 #include <cstdlib>
 #include <cstdio>
+#include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <mutex>
 #include <stdint.h>
@@ -20,6 +21,39 @@ struct ScopedCudaDevice {
     }
     ~ScopedCudaDevice() { if (changed && previous >= 0) cudaSetDevice(previous); }
 };
+
+struct CublasHandleCache {
+    int device = -1;
+    cublasHandle_t handle = nullptr;
+
+    ~CublasHandleCache() {
+        if (handle != nullptr) {
+            cublasDestroy(handle);
+        }
+    }
+
+    cublasHandle_t get(int target_device) {
+        if (handle != nullptr && device == target_device) {
+            return handle;
+        }
+        if (handle != nullptr) {
+            cublasDestroy(handle);
+            handle = nullptr;
+        }
+        if (cublasCreate(&handle) != CUBLAS_STATUS_SUCCESS) {
+            return nullptr;
+        }
+        device = target_device;
+        return handle;
+    }
+};
+
+thread_local CublasHandleCache g_cublas_handle_cache;
+
+bool sync_each_kernel_enabled() {
+    const char* value = std::getenv("SUPERSONIC_SYNC_EACH_KERNEL");
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
 
 const char* const G4_PROFILE_LABELS[G4_PROFILE_PHASES] = {
     "A0_load_hidden",
@@ -139,7 +173,7 @@ int rms_norm_device(int device_ordinal, int n_cols, float eps,
         static_cast<const T*>(weight),
         static_cast<T*>(out));
     if (cudaGetLastError() != cudaSuccess) return 401;
-    if (cudaDeviceSynchronize() != cudaSuccess) return 402;
+    if (sync_each_kernel_enabled() && cudaDeviceSynchronize() != cudaSuccess) return 402;
     return 0;
 }
 
@@ -164,7 +198,7 @@ int matvec_device(int device_ordinal, int in_dim, int out_dim,
         static_cast<T*>(out),
         row_counter);
     if (cudaGetLastError() != cudaSuccess) return 412;
-    if (cudaDeviceSynchronize() != cudaSuccess) return 413;
+    if (sync_each_kernel_enabled() && cudaDeviceSynchronize() != cudaSuccess) return 413;
     return 0;
 }
 
@@ -182,7 +216,7 @@ int gelu_tanh_gate_mul_device(int device_ordinal, size_t n,
         static_cast<const T*>(up),
         static_cast<T*>(out));
     if (cudaGetLastError() != cudaSuccess) return 421;
-    if (cudaDeviceSynchronize() != cudaSuccess) return 422;
+    if (sync_each_kernel_enabled() && cudaDeviceSynchronize() != cudaSuccess) return 422;
     return 0;
 }
 
@@ -203,7 +237,7 @@ int rope_decode_device(int device_ordinal,
         static_cast<const T*>(sin_table),
         static_cast<T*>(x));
     if (cudaGetLastError() != cudaSuccess) return 431;
-    if (cudaDeviceSynchronize() != cudaSuccess) return 432;
+    if (sync_each_kernel_enabled() && cudaDeviceSynchronize() != cudaSuccess) return 432;
     return 0;
 }
 
@@ -225,7 +259,7 @@ int kv_append_device(int device_ordinal,
         static_cast<T*>(k_cache),
         static_cast<T*>(v_cache));
     if (cudaGetLastError() != cudaSuccess) return 441;
-    if (cudaDeviceSynchronize() != cudaSuccess) return 442;
+    if (sync_each_kernel_enabled() && cudaDeviceSynchronize() != cudaSuccess) return 442;
     return 0;
 }
 
@@ -277,7 +311,7 @@ int swa_attn_decode_device(int device_ordinal,
         if (cudaGetLastError() != cudaSuccess) return 453;
     }
 
-    if (cudaDeviceSynchronize() != cudaSuccess) return 454;
+    if (sync_each_kernel_enabled() && cudaDeviceSynchronize() != cudaSuccess) return 454;
     return 0;
 }
 
@@ -300,25 +334,56 @@ int rms_norm_rows_device(int device_ordinal, int n_rows, int n_cols, float eps,
         static_cast<const T*>(weight),
         static_cast<T*>(out));
     if (cudaGetLastError() != cudaSuccess) return 461;
-    if (cudaDeviceSynchronize() != cudaSuccess) return 462;
+    if (sync_each_kernel_enabled() && cudaDeviceSynchronize() != cudaSuccess) return 462;
     return 0;
 }
 
-// Does this device support RDNA3 WMMA intrinsics? See
-// kernels/full_attention_bridge_4b.cpp for the analogous helper on the Qwen
-// side — the helper is duplicated here (not shared) to keep Gemma 4 in its
-// own compilation unit (gemma4.hip codegen has historically been sensitive
-// to cross-contamination with the Qwen bridge). `std::call_once` protects
-// against data races from concurrent `supersonic-serve` request threads;
-// `SUPERSONIC_GEMMA4_DISABLE_WMMA=1` forces the scalar path for A/B compare.
+// CUDA prefill uses cublas Tensor Core GEMM for BF16 batched matvec when the
+// shape has enough rows to fill tiles. `SUPERSONIC_GEMMA4_DISABLE_WMMA=1` and
+// `SUPERSONIC_CUDA_PREFILL_FORCE_SCALAR=1` force the scalar path for A/B.
 static bool g4_device_supports_wmma_bf16(int device_ordinal) {
-    (void)device_ordinal;
-    return false;
+    if (std::getenv("SUPERSONIC_GEMMA4_DISABLE_WMMA") != nullptr ||
+        std::getenv("SUPERSONIC_CUDA_PREFILL_FORCE_SCALAR") != nullptr) {
+        return false;
+    }
+    cudaDeviceProp props;
+    if (cudaGetDeviceProperties(&props, device_ordinal) != cudaSuccess) {
+        return false;
+    }
+    return props.major >= 8;
 }
 
 static int matvec_batched_wmma_bf16_device(int device_ordinal, int seq_len, int in_dim, int out_dim, const void* x, const void* W, void* out) {
-    (void)device_ordinal; (void)seq_len; (void)in_dim; (void)out_dim; (void)x; (void)W; (void)out;
-    return 474;
+    ScopedCudaDevice scoped(device_ordinal);
+    cublasHandle_t handle = g_cublas_handle_cache.get(device_ordinal);
+    if (handle == nullptr) return 474;
+    if (cublasSetStream(handle, 0) != CUBLAS_STATUS_SUCCESS) return 475;
+
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    const cublasStatus_t status = cublasGemmEx(
+        handle,
+        CUBLAS_OP_T,
+        CUBLAS_OP_N,
+        out_dim,
+        seq_len,
+        in_dim,
+        &alpha,
+        W,
+        CUDA_R_16BF,
+        in_dim,
+        x,
+        CUDA_R_16BF,
+        in_dim,
+        &beta,
+        out,
+        CUDA_R_16BF,
+        out_dim,
+        CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    if (status != CUBLAS_STATUS_SUCCESS) return 476;
+    if (sync_each_kernel_enabled() && cudaDeviceSynchronize() != cudaSuccess) return 477;
+    return 0;
 }
 
 template <typename T>
@@ -342,7 +407,7 @@ int matvec_batched_device(int device_ordinal,
         static_cast<T*>(out),
         counter);
     if (cudaGetLastError() != cudaSuccess) return 472;
-    if (cudaDeviceSynchronize() != cudaSuccess) return 473;
+    if (sync_each_kernel_enabled() && cudaDeviceSynchronize() != cudaSuccess) return 473;
     return 0;
 }
 
@@ -370,7 +435,7 @@ int matvec_int4_device(int device_ordinal, int in_dim, int out_dim, int gsz,
         static_cast<T*>(out),
         row_counter);
     if (cudaGetLastError() != cudaSuccess) return 482;
-    if (cudaDeviceSynchronize() != cudaSuccess) return 483;
+    if (sync_each_kernel_enabled() && cudaDeviceSynchronize() != cudaSuccess) return 483;
     return 0;
 }
 
@@ -410,7 +475,7 @@ int rope_prefill_device(int device_ordinal,
         static_cast<const T*>(sin_table),
         static_cast<T*>(x));
     if (cudaGetLastError() != cudaSuccess) return 481;
-    if (cudaDeviceSynchronize() != cudaSuccess) return 482;
+    if (sync_each_kernel_enabled() && cudaDeviceSynchronize() != cudaSuccess) return 482;
     return 0;
 }
 
@@ -432,7 +497,7 @@ int kv_append_prefill_device(int device_ordinal,
         static_cast<T*>(k_cache),
         static_cast<T*>(v_cache));
     if (cudaGetLastError() != cudaSuccess) return 491;
-    if (cudaDeviceSynchronize() != cudaSuccess) return 492;
+    if (sync_each_kernel_enabled() && cudaDeviceSynchronize() != cudaSuccess) return 492;
     return 0;
 }
 
@@ -480,7 +545,7 @@ int attn_prefill_device(int device_ordinal,
         if (cudaGetLastError() != cudaSuccess) return 503;
     }
 
-    if (cudaDeviceSynchronize() != cudaSuccess) return 504;
+    if (sync_each_kernel_enabled() && cudaDeviceSynchronize() != cudaSuccess) return 504;
     return 0;
 }
 
@@ -497,7 +562,7 @@ int add_residual_device(int device_ordinal, size_t n,
         static_cast<const T*>(b),
         static_cast<T*>(out));
     if (cudaGetLastError() != cudaSuccess) return 511;
-    if (cudaDeviceSynchronize() != cudaSuccess) return 512;
+    if (sync_each_kernel_enabled() && cudaDeviceSynchronize() != cudaSuccess) return 512;
     return 0;
 }
 
@@ -514,7 +579,7 @@ int add_scaled_residual_device(int device_ordinal, size_t n, float scalar,
         static_cast<const T*>(b),
         static_cast<T*>(out));
     if (cudaGetLastError() != cudaSuccess) return 521;
-    if (cudaDeviceSynchronize() != cudaSuccess) return 522;
+    if (sync_each_kernel_enabled() && cudaDeviceSynchronize() != cudaSuccess) return 522;
     return 0;
 }
 
@@ -527,7 +592,7 @@ int scalar_mul_inplace_device(int device_ordinal, size_t n, float scalar, void* 
     g4_scalar_mul_inplace_kernel<T><<<dim3(grid), dim3(block), 0, 0>>>(
         n, scalar, static_cast<T*>(x));
     if (cudaGetLastError() != cudaSuccess) return 541;
-    if (cudaDeviceSynchronize() != cudaSuccess) return 542;
+    if (sync_each_kernel_enabled() && cudaDeviceSynchronize() != cudaSuccess) return 542;
     return 0;
 }
 
@@ -587,7 +652,7 @@ int fused_attn_block_device(int device_ordinal,
         static_cast<float*>(workspace),
         matvec_counter, barrier_counter, barrier_flag);
     if (cudaGetLastError() != cudaSuccess) return 604;
-    if (cudaDeviceSynchronize() != cudaSuccess) return 605;
+    if (sync_each_kernel_enabled() && cudaDeviceSynchronize() != cudaSuccess) return 605;
     return 0;
 }
 
@@ -660,7 +725,7 @@ int fused_attn_block_int4_device(int device_ordinal,
         static_cast<float*>(workspace),
         matvec_counter, barrier_counter, barrier_flag);
     if (cudaGetLastError() != cudaSuccess) return 624;
-    if (cudaDeviceSynchronize() != cudaSuccess) return 625;
+    if (sync_each_kernel_enabled() && cudaDeviceSynchronize() != cudaSuccess) return 625;
     return 0;
 }
 
@@ -709,7 +774,7 @@ int fused_mlp_ple_device(int device_ordinal,
         static_cast<float*>(workspace),
         matvec_counter, barrier_counter, barrier_flag);
     if (cudaGetLastError() != cudaSuccess) return 614;
-    if (cudaDeviceSynchronize() != cudaSuccess) return 615;
+    if (sync_each_kernel_enabled() && cudaDeviceSynchronize() != cudaSuccess) return 615;
     return 0;
 }
 
@@ -781,7 +846,7 @@ int fused_mlp_ple_int4_device(int device_ordinal,
         static_cast<float*>(workspace),
         matvec_counter, barrier_counter, barrier_flag);
     if (cudaGetLastError() != cudaSuccess) return 634;
-    if (cudaDeviceSynchronize() != cudaSuccess) return 635;
+    if (sync_each_kernel_enabled() && cudaDeviceSynchronize() != cudaSuccess) return 635;
     return 0;
 }
 
@@ -825,7 +890,7 @@ int persistent_decode_device(int device_ordinal,
         static_cast<float*>(workspace),
         matvec_counter, barrier_counter, barrier_flag, profile_cycles);
     if (cudaGetLastError() != cudaSuccess) return 704;
-    if (cudaDeviceSynchronize() != cudaSuccess) return 705;
+    if (sync_each_kernel_enabled() && cudaDeviceSynchronize() != cudaSuccess) return 705;
     g4_cuda_profile.collect(profile_cycles);
     return 0;
 }
@@ -884,7 +949,7 @@ int persistent_decode_fused_input_device(
         matvec_counter, barrier_counter, barrier_flag,
         nullptr, nullptr, nullptr, profile_cycles);
     if (cudaGetLastError() != cudaSuccess) return 724;
-    if (cudaDeviceSynchronize() != cudaSuccess) return 725;
+    if (sync_each_kernel_enabled() && cudaDeviceSynchronize() != cudaSuccess) return 725;
     g4_cuda_profile.collect(profile_cycles);
     return 0;
 }
@@ -981,7 +1046,7 @@ int persistent_decode_fused_input_argmax_device(
         out_token,
         profile_cycles);
     if (cudaGetLastError() != cudaSuccess) return 748;
-    if (cudaDeviceSynchronize() != cudaSuccess) return 745;
+    if (sync_each_kernel_enabled() && cudaDeviceSynchronize() != cudaSuccess) return 745;
     g4_cuda_profile.collect(profile_cycles);
     return 0;
 }
@@ -1018,7 +1083,7 @@ int final_norm_lm_head_argmax_device(int device_ordinal,
         static_cast<float*>(workspace),
         out_token, barrier_counter, barrier_flag);
     if (cudaGetLastError() != cudaSuccess) return 734;
-    if (cudaDeviceSynchronize() != cudaSuccess) return 735;
+    if (sync_each_kernel_enabled() && cudaDeviceSynchronize() != cudaSuccess) return 735;
     return 0;
 }
 
@@ -1057,7 +1122,7 @@ int persistent_decode_batch_device(int device_ordinal,
         static_cast<float*>(workspace),
         matvec_counter, barrier_counter, barrier_flag);
     if (cudaGetLastError() != cudaSuccess) return 724;
-    if (cudaDeviceSynchronize() != cudaSuccess) return 725;
+    if (sync_each_kernel_enabled() && cudaDeviceSynchronize() != cudaSuccess) return 725;
     return 0;
 }
 
@@ -1098,7 +1163,7 @@ int persistent_decode_batch_int4_device(int device_ordinal,
         static_cast<float*>(workspace),
         matvec_counter, barrier_counter, barrier_flag);
     if (cudaGetLastError() != cudaSuccess) return 734;
-    if (cudaDeviceSynchronize() != cudaSuccess) return 735;
+    if (sync_each_kernel_enabled() && cudaDeviceSynchronize() != cudaSuccess) return 735;
     return 0;
 }
 
@@ -1135,7 +1200,7 @@ int persistent_decode_int4_device(int device_ordinal,
         static_cast<float*>(workspace),
         matvec_counter, barrier_counter, barrier_flag);
     if (cudaGetLastError() != cudaSuccess) return 714;
-    if (cudaDeviceSynchronize() != cudaSuccess) return 715;
+    if (sync_each_kernel_enabled() && cudaDeviceSynchronize() != cudaSuccess) return 715;
     return 0;
 }
 
@@ -1153,7 +1218,7 @@ int gather_layer_slice_device(int device_ordinal,
         static_cast<const T*>(src),
         static_cast<T*>(out));
     if (cudaGetLastError() != cudaSuccess) return 551;
-    if (cudaDeviceSynchronize() != cudaSuccess) return 552;
+    if (sync_each_kernel_enabled() && cudaDeviceSynchronize() != cudaSuccess) return 552;
     return 0;
 }
 
@@ -1173,7 +1238,7 @@ int embed_gather_scaled_device(int device_ordinal, int seq_len, int hidden_size,
         static_cast<const T*>(table),
         static_cast<T*>(out));
     if (cudaGetLastError() != cudaSuccess) return 531;
-    if (cudaDeviceSynchronize() != cudaSuccess) return 532;
+    if (sync_each_kernel_enabled() && cudaDeviceSynchronize() != cudaSuccess) return 532;
     return 0;
 }
 

@@ -30,10 +30,16 @@ struct Cli {
     /// Model dir override: KEY=PATH, repeatable. KEY is e.g. "qwen3.5-0.8b".
     #[arg(long = "model-dir", value_parser = parse_kv)]
     model_dirs: Vec<(String, PathBuf)>,
+    /// SpecPrefill draft dir override: KEY=PATH, repeatable. KEY is the target
+    /// model, e.g. "qwen3.6-35b-a3b=/models/Qwen3.5-0.8B".
+    #[arg(long = "specprefill-draft-dir", value_parser = parse_kv)]
+    specprefill_draft_dirs: Vec<(String, PathBuf)>,
 }
 
 fn parse_kv(s: &str) -> Result<(String, PathBuf), String> {
-    let (k, v) = s.split_once('=').ok_or_else(|| "expected KEY=PATH".to_string())?;
+    let (k, v) = s
+        .split_once('=')
+        .ok_or_else(|| "expected KEY=PATH".to_string())?;
     Ok((k.to_string(), PathBuf::from(v)))
 }
 
@@ -52,8 +58,15 @@ fn main() -> Result<()> {
 
     let dir_map: std::collections::HashMap<_, _> = cli.model_dirs.into_iter().collect();
     let resolver: Box<dyn Fn(&str) -> PathBuf> = Box::new(move |m: &str| {
-        dir_map.get(m).cloned().unwrap_or_else(|| PathBuf::from(format!("/mnt/data/models/{m}")))
+        dir_map
+            .get(m)
+            .cloned()
+            .unwrap_or_else(|| PathBuf::from(format!("/mnt/data/models/{m}")))
     });
+    let draft_dir_map: std::collections::HashMap<_, _> =
+        cli.specprefill_draft_dirs.into_iter().collect();
+    let draft_resolver: Box<dyn Fn(&str) -> Option<PathBuf>> =
+        Box::new(move |m: &str| draft_dir_map.get(m).cloned());
 
     let binary_clone = cli.binary.clone();
     let runner_version = capture_runner_version(&cli.binary);
@@ -63,6 +76,7 @@ fn main() -> Result<()> {
         quants,
         binary: binary_clone,
         model_dir_resolver: resolver,
+        specprefill_draft_dir_resolver: draft_resolver,
         prompt: cli.prompt,
         max_new_tokens: cli.max_new_tokens,
         warmup_tokens: cli.warmup_tokens,

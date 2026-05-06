@@ -55,7 +55,7 @@ __global__ void qwen36_moe_batched_prefill_unpermute_combine_kernel(
     int                                  top_k,
     int                                  hidden,
     const int*          __restrict__     permuted_inverse,    // [N * top_k]
-    const __hip_bfloat16* __restrict__   permuted_weight,     // [N * top_k]
+    const hip_bfloat16* __restrict__   permuted_weight,     // [N * top_k]
     const T*            __restrict__     expert_out,          // [N * top_k, hidden]
     T*                  __restrict__     combined             // [N, hidden]
 ) {
@@ -69,7 +69,7 @@ __global__ void qwen36_moe_batched_prefill_unpermute_combine_kernel(
     const int inv_base = token * top_k;
     for (int kpos = 0; kpos < top_k; ++kpos) {
         const int dst = permuted_inverse[inv_base + kpos];
-        const float w = __bfloat162float(permuted_weight[dst]);
+        const float w = static_cast<float>(permuted_weight[dst]);
         const float v = static_cast<float>(expert_out[
             static_cast<size_t>(dst) * hidden + col]);
         acc += w * v;

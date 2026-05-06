@@ -63,11 +63,11 @@ __global__ void qwen36_moe_batched_prefill_router_permute_kernel(
     int  top_k,
     int  num_experts,
     const int* __restrict__         topk_idx,
-    const __hip_bfloat16* __restrict__ topk_weight,
+    const hip_bfloat16* __restrict__ topk_weight,
     int* __restrict__               expert_offsets,
     int* __restrict__               permuted_token_idx,
     int* __restrict__               permuted_kpos,
-    __hip_bfloat16* __restrict__    permuted_weight
+    hip_bfloat16* __restrict__    permuted_weight
 ) {
     __shared__ int counts[MAX_EXPERTS];
 

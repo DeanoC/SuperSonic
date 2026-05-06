@@ -53,8 +53,8 @@ template <typename T>
 __device__ __forceinline__ float to_float(T x);
 
 template <>
-__device__ __forceinline__ float to_float<__hip_bfloat16>(__hip_bfloat16 x) {
-    return __bfloat162float(x);
+__device__ __forceinline__ float to_float<hip_bfloat16>(hip_bfloat16 x) {
+    return static_cast<float>(x);
 }
 
 // Grid:  (ceil(q_len / BM), q_heads, batch)

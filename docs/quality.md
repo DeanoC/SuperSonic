@@ -1,6 +1,8 @@
 # Model Quality
 
-Measured quality for SuperSonic's shipping (model, quant) combos on `gfx1100`.
+Measured quality for SuperSonic's shipping (model, quant) combos and targeted
+feature gates. Some rows are broad model/quant evals on `gfx1100`; targeted
+rows such as `specprefill_logits` are backend-specific regression gates.
 
 This doc has two parts:
 - A hand-written narrative section (this prose, above the AUTOGEN sentinel).
@@ -16,13 +18,20 @@ Quality numbers come from two evals per cell:
 - **Perplexity** (PG-19 + WikiText-2 teacher-forced, default 4 chunks × 2048 tokens).
 - **Golden-prompt diff** (~20 curated prompts; INT4/FP8 generations are scored
   against the model's BF16 reference using exact-match and chrF).
+- **SpecPrefill logits** (Qwen3.6 CUDA): dense INT4 next-token logits are the
+  reference; SpecPrefill lanes report argmax-match rate, with cosine and top-5
+  overlap stored in the JSON extras. The default sm86 gate enforces the
+  conservative `int4-spec075` lane; set `INCLUDE_BALANCED=1` on
+  `tests/sm86/bench_specprefill_quality.sh` to also measure the faster
+  `int4-spec050` lane.
 
 The heavy lane (NIAH, RULER, lm-evaluation-harness) lives separately and is
 opt-in via `python -m oracle.bench.heavy.heavy_main`.
 
 <!-- AUTOGEN BELOW: bench-quality-table -->
-| Model | Quant | golden | perplexity_pg19 | perplexity_wikitext2 |
-|---|---|---|---|---|
-| qwen3.5-0.8b | bf16 | 1.000 | 18.912 | 21.906 |
+| Model | Quant | specprefill_logits |
+|---|---|---|
+| qwen3.6-35b-a3b | int4-spec050 | 0.714 |
+| qwen3.6-35b-a3b | int4-spec075 | 1.000 |
 
 <!-- AUTOGEN END: bench-quality-table -->

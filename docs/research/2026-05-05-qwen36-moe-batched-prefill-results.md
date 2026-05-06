@@ -1,8 +1,8 @@
 # Qwen 3.6 MoE Batched-Q Prefill — Design and Results
 
-**Date:** 2026-05-05  
-**Branch:** `worktree-qwen36-moe-batched-prefill`  
-**Plan:** `docs/superpowers/plans/2026-05-05-qwen36-moe-batched-prefill-phase1.md`  
+**Date:** 2026-05-05
+**Branch:** `worktree-qwen36-moe-batched-prefill`
+**Plan:** `docs/superpowers/plans/2026-05-05-qwen36-moe-batched-prefill-phase1.md`
 **Hardware:** AMD Radeon RX 7900 XTX (gfx1100), 24 GiB
 
 ## Problem

@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
 use std::io;
+use std::path::{Path, PathBuf};
 
 pub const SCHEMA_VERSION: u32 = 1;
 
@@ -53,17 +53,28 @@ pub struct RunDir {
 }
 
 impl RunDir {
-    pub fn new(root: PathBuf) -> Self { Self { root } }
-    pub fn root(&self) -> &Path { &self.root }
-    pub fn meta_path(&self) -> PathBuf { self.root.join("meta.json") }
+    pub fn new(root: PathBuf) -> Self {
+        Self { root }
+    }
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+    pub fn meta_path(&self) -> PathBuf {
+        self.root.join("meta.json")
+    }
     pub fn perf_path(&self, model: &str, quant: &str) -> PathBuf {
         self.root.join("perf").join(format!("{model}_{quant}.json"))
     }
     pub fn quality_path(&self, model: &str, quant: &str, eval: &str) -> PathBuf {
-        self.root.join("quality").join(format!("{model}_{quant}_{eval}.json"))
+        self.root
+            .join("quality")
+            .join(format!("{model}_{quant}_{eval}.json"))
     }
     pub fn external_path(&self, engine: &str, model: &str, quant: &str) -> PathBuf {
-        self.root.join("external").join(engine).join(format!("{model}_{quant}.json"))
+        self.root
+            .join("external")
+            .join(engine)
+            .join(format!("{model}_{quant}.json"))
     }
 
     /// Create the directory tree (root, perf/, quality/, external/).

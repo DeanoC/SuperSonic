@@ -64,6 +64,14 @@ pub(crate) struct Cli {
     #[arg(long)]
     pub(crate) emit_stage_timings: bool,
 
+    /// Emit a HAL-level allocation/copy/memset profile for the native prefill.
+    #[arg(long)]
+    pub(crate) profile_prefill: bool,
+
+    /// Write the native prefill profile as JSON to this path.
+    #[arg(long)]
+    pub(crate) profile_prefill_json: Option<PathBuf>,
+
     /// Enable Qwen3.6-MoE self-speculative decode.
     ///
     /// When set, the engine loads the multi-token-prediction (MTP) head
@@ -460,14 +468,18 @@ pub(crate) struct Cli {
     /// Path to the SpecPrefill (arXiv 2502.02789) draft model directory
     /// (e.g. `/mnt/data/models/Qwen3.5-0.8B`). Presence of this flag
     /// enables sparse target prefill via the speculator's importance
-    /// signal. Currently only supported for `--model qwen3.5-9b`.
+    /// signal. Supported for `--model qwen3.5-9b`; CUDA/HIP cosine
+    /// cross-family mode is also supported for `--model qwen3.6-35b-a3b`
+    /// with a Qwen3.5-0.8B drafter.
     #[arg(long)]
     pub(crate) specprefill_draft_dir: Option<PathBuf>,
 
     /// SpecPrefill keep ratio per chunk: fraction of tokens kept by the
     /// chunked top-K selection. Phase A2 measurements pin 0.50 as the
     /// quality-stable default on Qwen3.5-9B (cossim ≥ 0.927, argmax
-    /// match). Range: [0.05, 1.0]. Default applied in run_specprefill: 0.50.
+    /// match). CUDA Qwen3.6 cross-family SpecPrefill defaults to 0.75
+    /// because the broader logits gate shows 0.50 is a balanced/perf lane
+    /// with occasional argmax drift. Range: [0.05, 1.0].
     #[arg(long)]
     pub(crate) specprefill_keep_ratio: Option<f32>,
 

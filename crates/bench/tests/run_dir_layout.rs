@@ -1,5 +1,5 @@
-use supersonic_bench::runs::{MetaJson, PerfCellJson, PerfStatus, RunDir};
 use std::path::PathBuf;
+use supersonic_bench::runs::{MetaJson, PerfCellJson, PerfStatus, RunDir};
 
 #[test]
 fn meta_json_round_trip() {
@@ -31,13 +31,21 @@ fn perf_cell_json_status_variants() {
         quant: "bf16".into(),
         prompt: "The quick brown fox jumps over".into(),
         max_new_tokens: 16,
-        status: PerfStatus::Ok { ms_per_step: 8.0, ms_per_tok: 8.0, samples: vec![8.1, 8.0, 7.9] },
+        status: PerfStatus::Ok {
+            ms_per_step: 8.0,
+            ms_per_tok: 8.0,
+            samples: vec![8.1, 8.0, 7.9],
+        },
         gpu_temp_c_end: Some(60.0),
     };
     let s = serde_json::to_string(&ok).unwrap();
     let back: PerfCellJson = serde_json::from_str(&s).unwrap();
     match back.status {
-        PerfStatus::Ok { ms_per_step, samples, .. } => {
+        PerfStatus::Ok {
+            ms_per_step,
+            samples,
+            ..
+        } => {
             assert_eq!(ms_per_step, 8.0);
             assert_eq!(samples.len(), 3);
         }
@@ -45,7 +53,9 @@ fn perf_cell_json_status_variants() {
     }
 
     let skipped = PerfCellJson {
-        status: PerfStatus::Skipped { reason: "OOM at preflight".into() },
+        status: PerfStatus::Skipped {
+            reason: "OOM at preflight".into(),
+        },
         ..ok.clone()
     };
     let s = serde_json::to_string(&skipped).unwrap();
@@ -55,7 +65,10 @@ fn perf_cell_json_status_variants() {
 #[test]
 fn run_dir_paths() {
     let rd = RunDir::new(PathBuf::from("/tmp/bench-runs/2026-05-05-abc1234"));
-    assert_eq!(rd.meta_path(), PathBuf::from("/tmp/bench-runs/2026-05-05-abc1234/meta.json"));
+    assert_eq!(
+        rd.meta_path(),
+        PathBuf::from("/tmp/bench-runs/2026-05-05-abc1234/meta.json")
+    );
     assert_eq!(
         rd.perf_path("qwen3.5-0.8b", "bf16"),
         PathBuf::from("/tmp/bench-runs/2026-05-05-abc1234/perf/qwen3.5-0.8b_bf16.json"),

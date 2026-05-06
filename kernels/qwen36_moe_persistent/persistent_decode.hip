@@ -142,6 +142,10 @@ __global__ void qwen36_moe_persistent_decode_kernel(
     // on the decoupled-slot path so kept tokens land in compact KV
     // slots while still rotating at their original prompt positions.
     int                                  cache_pos,
+    const T* __restrict__                embed_w,                // [vocab, hidden] BF16, nullable
+    int                                  token_id,               // >=0 => load embed_w[token_id]
+    const unsigned int* __restrict__     token_ids,              // [prefill_len], nullable
+    int                                  prefill_len,            // >1 => dense prompt prefix loop
     T*    __restrict__                   hidden_ping,            // [hidden] BF16
     T*    __restrict__                   hidden_pong,            // [hidden] BF16
     float* __restrict__                  workspace,              // shared scratch
@@ -163,6 +167,24 @@ __global__ void qwen36_moe_persistent_decode_kernel(
     // `out_buf` is where it writes. Each phase swap is local to this fn.
     T* in_buf  = hidden_ping;
     T* out_buf = hidden_pong;
+
+    const int run_tokens = (token_ids != nullptr && prefill_len > 0) ? prefill_len : 1;
+    for (int token_step = 0; token_step < run_tokens; ++token_step) {
+    const int step_token_id = (token_ids != nullptr)
+        ? static_cast<int>(token_ids[token_step])
+        : token_id;
+    const int step_position = position + token_step;
+    const int step_cache_pos = (cache_pos >= 0) ? (cache_pos + token_step) : cache_pos;
+
+    if (embed_w != nullptr && step_token_id >= 0) {
+        const T* row = embed_w + static_cast<size_t>(step_token_id) * hidden;
+        for (int col = blockIdx.x * blockDim.x + threadIdx.x;
+             col < hidden;
+             col += blockDim.x * gridDim.x) {
+            hidden_ping[col] = row[col];
+        }
+        grid_barrier(barrier_counter, barrier_flag, num_blocks);
+    }
 
     if (mode == PERSISTENT_MODE_FFN_ONLY) {
         const DecodeLayerDesc& d = layers[start_layer];
@@ -216,7 +238,7 @@ __global__ void qwen36_moe_persistent_decode_kernel(
                 /*stage*/ 5,
                 hidden, num_heads, num_kv_heads, head_dim,
                 rotary_dim, rope_theta, rms_norm_eps,
-                position, cache_pos,
+                step_position, step_cache_pos,
                 in_buf,
                 static_cast<const T*>(d.input_norm_w),
                 static_cast<const T*>(d.q_proj_w),
@@ -344,6 +366,7 @@ __global__ void qwen36_moe_persistent_decode_kernel(
     // Each iteration does TWO swaps that cancel, so after every layer
     // `in_buf == hidden_ping`. The host downloads `hidden_ping` as the
     // final hidden regardless of `num_layers` parity.
+    }
 
     // Phase 3f: folded final RMSnorm + lm_head GEMV. Skipped when any
     // of the three buffers is null (the engine sets them all null on

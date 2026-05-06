@@ -6,8 +6,26 @@ from typing import Iterable
 
 from .schema import validate_perf_cell
 
-QUANT_COL_ORDER = ["bf16", "int4", "fp8r", "kv-fp8", "int8"]
-QUANT_LABELS = {"bf16": "BF16", "int4": "INT4", "fp8r": "FP8r", "kv-fp8": "KV-FP8", "int8": "INT8"}
+QUANT_COL_ORDER = [
+    "bf16",
+    "int4",
+    "int4-spec025",
+    "int4-spec050",
+    "int4-spec075",
+    "fp8r",
+    "kv-fp8",
+    "int8",
+]
+QUANT_LABELS = {
+    "bf16": "BF16",
+    "int4": "INT4",
+    "int4-spec025": "Spec025",
+    "int4-spec050": "Spec050",
+    "int4-spec075": "Spec075",
+    "fp8r": "FP8r",
+    "kv-fp8": "KV-FP8",
+    "int8": "INT8",
+}
 
 
 def render_perf_table(perf_dir: Path) -> str:
@@ -111,7 +129,7 @@ def replace_autogen_zone(doc: str, key: str, new_content: str) -> str:
     if begin in doc and end in doc:
         pattern = re.compile(re.escape(begin) + r".*?" + re.escape(end), re.DOTALL)
         replacement = f"{begin}\n{new_content}\n{end}"
-        return pattern.sub(replacement, doc)
+        return pattern.sub(replacement, doc, count=1)
     # Append a new zone at the end.
     if not doc.endswith("\n"):
         doc += "\n"

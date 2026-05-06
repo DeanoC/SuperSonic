@@ -5,6 +5,7 @@ use std::time::Instant;
 use crate::decode_engine::DecodeEngine;
 use crate::model_files::model_dir_has_raw_safetensors;
 use crate::prefill_engine::PrefillResult;
+use crate::profiling::PrefillProfileScope;
 use crate::qwen35_validation::{qwen35_oracle_script_path, Qwen35NativePrefillTrace};
 use crate::tensor_bytes::bf16_bytes_to_f32 as decode_bf16_le;
 use crate::{oracle, Cli};
@@ -134,6 +135,14 @@ pub(crate) fn run_qwen35_prefill(
     allow_host_lm_head_rescore: bool,
 ) -> Result<Qwen35Prefill> {
     let prefill_start = Instant::now();
+    let profile = PrefillProfileScope::new(
+        cli.profile_prefill,
+        cli.profile_prefill_json.as_deref(),
+        "qwen3.5",
+        &cli.model,
+        &cli.backend,
+        prompt_ids.len(),
+    );
     if cli.oracle_prefill {
         let oracle_script = qwen35_oracle_script_path();
         let output = oracle::run_oracle(
@@ -158,6 +167,7 @@ pub(crate) fn run_qwen35_prefill(
             "[prefill] oracle prefill done in {:.0}ms",
             prefill_start.elapsed().as_millis()
         );
+        profile.finish()?;
         return Ok(Qwen35Prefill {
             logits: output.prefill_logits,
             native_trace: None,
@@ -178,6 +188,7 @@ pub(crate) fn run_qwen35_prefill(
         "[prefill] native GPU prefill done in {:.0}ms",
         prefill_start.elapsed().as_millis()
     );
+    profile.finish()?;
 
     Ok(Qwen35Prefill {
         logits: prefill_result.logits,
