@@ -10,6 +10,12 @@ on a candidate checkout, then compare the two run directories.
 ```bash
 cargo run --release -p supersonic-kernel-lab --bin kernel-lab -- list
 
+cargo run --release -p supersonic-kernel-lab --bin kernel-lab -- list --json
+
+cargo run --release -p supersonic-kernel-lab --bin kernel-lab -- list --tags
+
+cargo run --release -p supersonic-kernel-lab --bin kernel-lab -- describe tag:prefill
+
 cargo run --release -p supersonic-kernel-lab --bin kernel-lab -- run \
   --tasks all \
   --backend hip \
@@ -39,11 +45,17 @@ cargo run --release -p supersonic-kernel-lab --bin kernel-lab -- baseline \
   --name required
 ```
 
-The harness writes `meta.json`, one `tasks/*.json` file per task, and a
-`summary.json` under `target/kernel-lab-runs/<date>-<git-sha>/`.
+The harness writes `meta.json`, `task_manifest.json`, one `tasks/*.json` file
+per task, `summary.json`, and `summary.md` under
+`target/kernel-lab-runs/<date>-<git-sha>/`.
 Per-case timings use HIP events when available and record
 `timing_source: "hip_event"` in JSON; unsupported timing backends fall back to
 synchronized wall-clock timing.
+
+The Rust task registry is the source of truth for task metadata. `list --json`
+prints serializable task snapshots, `list --tags` summarizes tag membership, and
+`describe <task-id|tag:tag> [--json]` shows the description, backend support,
+tags, required/optional status, and correctness contract.
 
 `--tasks` accepts `all` for the required suite, `everything` for every registry
 entry, comma-separated task ids, or comma-separated `tag:<name>` selectors. Tag
@@ -71,6 +83,10 @@ harness lands on `main`.
 Scoring is conservative: a task is valid only if every correctness case passes.
 `diff` reports per-task speedup, `fast_p`, geometric mean speedup, and fails on
 correctness regressions or median latency regressions above `--max-regression`.
+Diff JSON and markdown include machine-readable status/reason fields for each
+required task, including missing candidate tasks, incorrect candidate tasks, and
+latency regressions. The top-level diff status/reason also classifies geomean
+speedup failures.
 Exit code `2` means correctness failed, `3` means latency regression, and `4`
 means the run was correct but missed `--min-speedup`. `--github-summary`
 appends the markdown diff to `$GITHUB_STEP_SUMMARY` for Actions jobs.

@@ -19,6 +19,10 @@ cargo run --release -p supersonic-kernel-lab --bin kernel-lab -- baseline \
 The JSON file is the canonical artifact used by `kernel-lab diff`. The markdown
 sidecar is for review and should be regenerated from the same run.
 
+Run directories also contain `task_manifest.json` and `summary.md`. Those files
+are derived from the Rust task registry and the run summary; they are review
+artifacts, not separate sources of truth for baseline membership.
+
 CI compares pull-request candidates against both the PR base ref and the checked-in
 `gfx1100/required.summary.json` baseline. Manual `kernel-lab` workflow runs expose
 presets:

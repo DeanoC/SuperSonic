@@ -5,8 +5,11 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, ExitStatus};
 use supersonic_kernel_lab::run::{
-    diff_exit_code, diff_runs, load_summary, render_diff_markdown, render_markdown, resolve_tasks,
-    run_tasks, KernelLabConfig,
+    diff_exit_code, diff_runs_with_min_speedup, load_summary, render_diff_markdown,
+    render_markdown, resolve_tasks, run_tasks, KernelLabConfig,
+};
+use supersonic_kernel_lab::{
+    all_tag_metadata, all_task_metadata, describe_task_selector, TaskMetadata,
 };
 
 #[derive(Parser, Debug)]
@@ -19,7 +22,17 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    List,
+    List {
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        tags: bool,
+    },
+    Describe {
+        selector: String,
+        #[arg(long)]
+        json: bool,
+    },
     Run {
         #[arg(long, default_value = "all")]
         tasks: String,
@@ -101,15 +114,19 @@ enum Command {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::List => {
-            for task in supersonic_kernel_lab::all_tasks() {
-                println!(
-                    "{}\tfamily={}\trequired={}\ttags={}",
-                    task.id,
-                    task.family,
-                    task.required,
-                    task.tags.join(",")
-                );
+        Command::List { json, tags } => {
+            if tags {
+                print_tags(json)?;
+            } else {
+                print_tasks(json)?;
+            }
+        }
+        Command::Describe { selector, json } => {
+            let tasks = describe_task_selector(&selector)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&tasks)?);
+            } else {
+                print_task_descriptions(&tasks);
             }
         }
         Command::Run {
@@ -156,7 +173,8 @@ fn main() -> Result<()> {
         } => {
             let baseline = load_summary(&baseline)?;
             let candidate = load_summary(&candidate)?;
-            let diff = diff_runs(&baseline, &candidate, max_regression);
+            let diff =
+                diff_runs_with_min_speedup(&baseline, &candidate, max_regression, min_speedup);
             println!("{}", serde_json::to_string_pretty(&diff)?);
             write_diff_markdown(&diff, min_speedup, markdown_out, github_summary)?;
             let code = diff_exit_code(&diff, min_speedup);
@@ -215,7 +233,12 @@ fn main() -> Result<()> {
             if let Some(path) = candidate_summary_copy {
                 copy_summary_json(&candidate, &path)?;
             }
-            let diff = diff_runs(&baseline_summary, &candidate_summary, max_regression);
+            let diff = diff_runs_with_min_speedup(
+                &baseline_summary,
+                &candidate_summary,
+                max_regression,
+                min_speedup,
+            );
             println!("{}", serde_json::to_string_pretty(&diff)?);
             write_diff_markdown(&diff, min_speedup, markdown_out, github_summary)?;
             let code = diff_exit_code(&diff, min_speedup);
@@ -232,13 +255,69 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+fn print_tasks(json: bool) -> Result<()> {
+    let tasks = all_task_metadata();
+    if json {
+        println!("{}", serde_json::to_string_pretty(&tasks)?);
+    } else {
+        for task in tasks {
+            println!(
+                "{}\tfamily={}\trequired={}\tbackends={}\ttags={}",
+                task.id,
+                task.family,
+                task.required,
+                task.backend_support.join(","),
+                task.tags.join(",")
+            );
+        }
+    }
+    Ok(())
+}
+
+fn print_tags(json: bool) -> Result<()> {
+    let tags = all_tag_metadata();
+    if json {
+        println!("{}", serde_json::to_string_pretty(&tags)?);
+    } else {
+        for tag in tags {
+            println!(
+                "{}\ttasks={}\trequired={}",
+                tag.tag, tag.task_count, tag.required_task_count
+            );
+        }
+    }
+    Ok(())
+}
+
+fn print_task_descriptions(tasks: &[TaskMetadata]) {
+    for (idx, task) in tasks.iter().enumerate() {
+        if idx > 0 {
+            println!();
+        }
+        println!("{}", format_task_description(task));
+    }
+}
+
+fn format_task_description(task: &TaskMetadata) -> String {
+    format!(
+        "{}\n  family: {}\n  suite: {}\n  backends: {}\n  tags: {}\n  description: {}\n  correctness: {}",
+        task.id,
+        task.family,
+        if task.required { "required" } else { "optional" },
+        task.backend_support.join(","),
+        task.tags.join(","),
+        task.description,
+        task.correctness
+    )
+}
+
 fn copy_summary_json(run_dir: &Path, dst: &Path) -> Result<()> {
     let src = run_dir.join("summary.json");
     if let Some(parent) = dst.parent() {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::copy(&src, dst)?;
-    println!("[kernel-lab] copied candidate summary to {}", dst.display());
+    eprintln!("[kernel-lab] copied candidate summary to {}", dst.display());
     Ok(())
 }
 
@@ -271,7 +350,7 @@ fn write_diff_markdown(
     let markdown = render_diff_markdown(diff, min_speedup);
     if let Some(path) = markdown_out {
         std::fs::write(&path, &markdown)?;
-        println!("[kernel-lab] wrote {}", path.display());
+        eprintln!("[kernel-lab] wrote {}", path.display());
     }
     if github_summary {
         let path = std::env::var_os("GITHUB_STEP_SUMMARY")
@@ -611,6 +690,30 @@ mod tests {
         copy_summary_json(&run_dir, &out).unwrap();
 
         assert_eq!(std::fs::read_to_string(out).unwrap(), "{\"ok\":true}\n");
+    }
+
+    #[test]
+    fn list_json_helpers_expose_task_and_tag_metadata() {
+        let tasks = all_task_metadata();
+        let tasks_json = serde_json::to_string(&tasks).unwrap();
+        assert!(tasks_json.contains("qwen35.full_attention_prefill"));
+        assert!(tasks_json.contains("backend_support"));
+        assert!(tasks_json.contains("correctness"));
+
+        let tags = all_tag_metadata();
+        let tags_json = serde_json::to_string(&tags).unwrap();
+        assert!(tags_json.contains("\"tag\":\"required\""));
+        assert!(tags_json.contains("required_task_count"));
+    }
+
+    #[test]
+    fn describe_helper_formats_task_metadata() {
+        let tasks = describe_task_selector("qwen35.full_attention_prefill").unwrap();
+        let text = format_task_description(&tasks[0]);
+        assert!(text.contains("suite: required"));
+        assert!(text.contains("backends: hip"));
+        assert!(text.contains("description:"));
+        assert!(text.contains("correctness:"));
     }
 
     fn test_summary(

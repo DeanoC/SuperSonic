@@ -1,4 +1,4 @@
-use crate::registry::{all_tasks, TaskDef};
+use crate::registry::{all_tasks, task_metadata, TaskDef, TaskMetadata};
 use anyhow::{anyhow, Context, Result};
 use gpu_hal::Backend;
 use serde::{Deserialize, Serialize};
@@ -52,7 +52,13 @@ pub struct TaskResult {
     pub schema_version: u32,
     pub task_id: String,
     pub family: String,
+    #[serde(default)]
+    pub description: String,
     pub tags: Vec<String>,
+    #[serde(default)]
+    pub backend_support: Vec<String>,
+    #[serde(default)]
+    pub correctness: String,
     pub required: bool,
     pub correct: bool,
     pub cases: Vec<CaseResult>,
@@ -78,6 +84,10 @@ pub struct DiffTask {
     pub candidate_median_us: f64,
     pub speedup: f64,
     pub regression: bool,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,6 +95,10 @@ pub struct DiffReport {
     pub correct: bool,
     pub fast_p: f64,
     pub geomean_speedup: f64,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub reason: String,
     pub worst_regression: Option<DiffTask>,
     pub tasks: Vec<DiffTask>,
 }
@@ -188,6 +202,10 @@ pub fn run_tasks(cfg: &KernelLabConfig, tasks: &[TaskDef]) -> Result<(PathBuf, R
         run_dir.join("meta.json"),
         serde_json::to_string_pretty(&meta)?,
     )?;
+    std::fs::write(
+        run_dir.join("task_manifest.json"),
+        serde_json::to_string_pretty(&task_manifest(tasks))?,
+    )?;
 
     let mut results = Vec::new();
     for task in tasks {
@@ -195,12 +213,20 @@ pub fn run_tasks(cfg: &KernelLabConfig, tasks: &[TaskDef]) -> Result<(PathBuf, R
             schema_version: SCHEMA_VERSION,
             task_id: task.id.to_string(),
             family: task.family.to_string(),
+            description: task.description.to_string(),
             tags: task.tags.iter().map(|s| s.to_string()).collect(),
+            backend_support: task
+                .backend_support
+                .iter()
+                .map(|backend| backend.to_string())
+                .collect(),
+            correctness: task.correctness.to_string(),
             required: task.required,
             correct: false,
             cases: Vec::new(),
             error: Some(err.to_string()),
         });
+        apply_task_metadata(task, &mut result);
         result.correct = result.error.is_none() && result.cases.iter().all(|case| case.correct);
         std::fs::write(
             run_dir
@@ -227,6 +253,7 @@ pub fn run_tasks(cfg: &KernelLabConfig, tasks: &[TaskDef]) -> Result<(PathBuf, R
         run_dir.join("summary.json"),
         serde_json::to_string_pretty(&summary)?,
     )?;
+    std::fs::write(run_dir.join("summary.md"), render_markdown(&summary))?;
     append_history(&cfg.run_root.join("history.jsonl"), &summary)?;
     Ok((run_dir, summary))
 }
@@ -243,6 +270,15 @@ pub fn load_summary(path: &Path) -> Result<RunSummary> {
 }
 
 pub fn diff_runs(baseline: &RunSummary, candidate: &RunSummary, max_regression: f64) -> DiffReport {
+    diff_runs_with_min_speedup(baseline, candidate, max_regression, 1.0)
+}
+
+pub fn diff_runs_with_min_speedup(
+    baseline: &RunSummary,
+    candidate: &RunSummary,
+    max_regression: f64,
+    min_speedup: f64,
+) -> DiffReport {
     let mut candidate_by_id = BTreeMap::new();
     for task in &candidate.tasks {
         candidate_by_id.insert(task.task_id.as_str(), task);
@@ -259,6 +295,8 @@ pub fn diff_runs(baseline: &RunSummary, candidate: &RunSummary, max_regression: 
                 candidate_median_us: 0.0,
                 speedup: 0.0,
                 regression: true,
+                status: "correctness_failure".into(),
+                reason: "candidate task is missing".into(),
             });
             continue;
         };
@@ -270,7 +308,28 @@ pub fn diff_runs(baseline: &RunSummary, candidate: &RunSummary, max_regression: 
             0.0
         };
         let correct = base_task.correct && cand_task.correct;
-        let regression = !correct || cand_med > base_med * (1.0 + max_regression);
+        let latency_regression = cand_med > base_med * (1.0 + max_regression);
+        let regression = !correct || latency_regression;
+        let (status, reason) = if !correct {
+            (
+                "correctness_failure",
+                if !cand_task.correct {
+                    "candidate task is incorrect"
+                } else {
+                    "baseline task is incorrect"
+                },
+            )
+        } else if latency_regression {
+            (
+                "latency_regression",
+                "candidate latency exceeds max_regression",
+            )
+        } else {
+            (
+                "ok",
+                "candidate task is correct and within latency threshold",
+            )
+        };
         tasks.push(DiffTask {
             task_id: base_task.task_id.clone(),
             correct,
@@ -278,6 +337,8 @@ pub fn diff_runs(baseline: &RunSummary, candidate: &RunSummary, max_regression: 
             candidate_median_us: cand_med,
             speedup,
             regression,
+            status: status.into(),
+            reason: reason.into(),
         });
     }
 
@@ -304,10 +365,28 @@ pub fn diff_runs(baseline: &RunSummary, candidate: &RunSummary, max_regression: 
         .min_by(|a, b| a.speedup.total_cmp(&b.speedup))
         .cloned();
 
+    let task_checks_passed = worst_regression.is_none();
+    let correct = task_checks_passed;
+    let (status, reason) = if !task_checks_passed {
+        (
+            "failed",
+            "one or more required tasks failed correctness or latency checks",
+        )
+    } else if geomean_speedup < min_speedup {
+        ("speedup_failure", "geomean speedup is below min_speedup")
+    } else {
+        (
+            "ok",
+            "all required tasks are correct and within latency threshold",
+        )
+    };
+
     DiffReport {
-        correct: worst_regression.is_none(),
+        correct,
         fast_p,
         geomean_speedup,
+        status: status.to_string(),
+        reason: reason.to_string(),
         worst_regression,
         tasks,
     }
@@ -343,20 +422,45 @@ pub fn render_markdown(summary: &RunSummary) -> String {
         summary.passed_required_tasks,
         summary.required_task_count
     ));
-    s.push_str("| task | correct | timing | median us |\n| --- | --- | --- | ---: |\n");
+    s.push_str("| task | case | suite | tags | shape | correctness | max_abs | max_rel | exact | min_cos | median us | min us | p95 us |\n");
+    s.push_str(
+        "| --- | --- | --- | --- | --- | --- | ---: | ---: | --- | ---: | ---: | ---: | ---: |\n",
+    );
     for task in &summary.tasks {
-        let timing_source = task
-            .cases
-            .first()
-            .map(|case| case.timing_source.as_str())
-            .unwrap_or("unknown");
-        s.push_str(&format!(
-            "| `{}` | {} | `{}` | {:.3} |\n",
-            task.task_id,
-            if task.correct { "yes" } else { "no" },
-            timing_source,
-            task_median(task)
-        ));
+        let suite = if task.required {
+            "required"
+        } else {
+            "optional"
+        };
+        let tags = task.tags.join(",");
+        if task.cases.is_empty() {
+            s.push_str(&format!(
+                "| `{}` | error | {} | `{}` |  | {} |  |  |  |  |  |  |  |\n",
+                task.task_id,
+                suite,
+                tags,
+                task.error.as_deref().unwrap_or("no cases")
+            ));
+            continue;
+        }
+        for case in &task.cases {
+            s.push_str(&format!(
+                "| `{}` | `{}` | {} | `{}` | `{}` | {} | {} | {} | {} | {} | {:.3} | {:.3} | {:.3} |\n",
+                task.task_id,
+                case.name,
+                suite,
+                tags,
+                compact_shape(&case.shape),
+                if case.correct { "pass" } else { "fail" },
+                fmt_opt_f32(case.max_abs),
+                fmt_opt_f32(case.max_rel),
+                fmt_opt_bool(case.exact),
+                fmt_opt_f32(case.min_cos),
+                case.median_us,
+                case.min_us,
+                case.p95_us
+            ));
+        }
     }
     s
 }
@@ -364,16 +468,29 @@ pub fn render_markdown(summary: &RunSummary) -> String {
 pub fn render_diff_markdown(diff: &DiffReport, min_speedup: f64) -> String {
     let mut s = String::new();
     s.push_str("# SuperSonic Kernel Lab Diff\n\n");
+    let speedup_status = if diff.geomean_speedup < min_speedup {
+        "failed"
+    } else {
+        "ok"
+    };
     s.push_str(&format!(
-        "- correct: `{}`\n- fast_p: `{:.3}`\n- geomean speedup: `{:.3}`\n- min speedup: `{:.3}`\n\n",
-        diff.correct, diff.fast_p, diff.geomean_speedup, min_speedup
+        "- correct: `{}`\n- status: `{}`\n- reason: {}\n- fast_p: `{:.3}`\n- geomean speedup: `{:.3}` ({})\n- min speedup: `{:.3}`\n\n",
+        diff.correct,
+        diff.status,
+        diff.reason,
+        diff.fast_p,
+        diff.geomean_speedup,
+        speedup_status,
+        min_speedup
     ));
-    s.push_str("| task | correct | baseline us | candidate us | speedup | regression |\n");
-    s.push_str("| --- | --- | ---: | ---: | ---: | --- |\n");
+    s.push_str("| task | status | reason | correct | baseline us | candidate us | speedup | regression |\n");
+    s.push_str("| --- | --- | --- | --- | ---: | ---: | ---: | --- |\n");
     for task in &diff.tasks {
         s.push_str(&format!(
-            "| `{}` | {} | {:.3} | {:.3} | {:.3} | {} |\n",
+            "| `{}` | `{}` | {} | {} | {:.3} | {:.3} | {:.3} | {} |\n",
             task.task_id,
+            task.status,
+            task.reason,
             if task.correct { "yes" } else { "no" },
             task.baseline_median_us,
             task.candidate_median_us,
@@ -382,6 +499,10 @@ pub fn render_diff_markdown(diff: &DiffReport, min_speedup: f64) -> String {
         ));
     }
     s
+}
+
+pub fn task_manifest(tasks: &[TaskDef]) -> Vec<TaskMetadata> {
+    tasks.iter().map(task_metadata).collect()
 }
 
 pub fn task_median(task: &TaskResult) -> f64 {
@@ -440,6 +561,39 @@ fn append_history(path: &Path, summary: &RunSummary) -> Result<()> {
     Ok(())
 }
 
+fn apply_task_metadata(task: &TaskDef, result: &mut TaskResult) {
+    result.family = task.family.to_string();
+    result.description = task.description.to_string();
+    result.tags = task.tags.iter().map(|tag| tag.to_string()).collect();
+    result.backend_support = task
+        .backend_support
+        .iter()
+        .map(|backend| backend.to_string())
+        .collect();
+    result.correctness = task.correctness.to_string();
+    result.required = task.required;
+}
+
+fn compact_shape(shape: &BTreeMap<String, usize>) -> String {
+    shape
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn fmt_opt_f32(value: Option<f32>) -> String {
+    value
+        .map(|value| format!("{value:.6}"))
+        .unwrap_or_else(|| String::from(""))
+}
+
+fn fmt_opt_bool(value: Option<bool>) -> String {
+    value
+        .map(|value| if value { "true" } else { "false" }.to_string())
+        .unwrap_or_else(|| String::from(""))
+}
+
 fn median(samples: &mut [f64]) -> f64 {
     if samples.is_empty() {
         return 0.0;
@@ -485,16 +639,19 @@ mod tests {
             schema_version: SCHEMA_VERSION,
             task_id: id.into(),
             family: "test".into(),
-            tags: Vec::new(),
+            description: "test task".into(),
+            tags: vec!["required".into()],
+            backend_support: vec!["hip".into()],
+            correctness: "test correctness".into(),
             required: true,
             correct,
             cases: vec![CaseResult {
                 name: "case".into(),
-                shape: BTreeMap::new(),
+                shape: BTreeMap::from([("m".into(), 1), ("n".into(), 2)]),
                 correct,
-                max_abs: None,
-                max_rel: None,
-                min_cos: None,
+                max_abs: Some(0.001),
+                max_rel: Some(0.002),
+                min_cos: Some(0.999),
                 exact: Some(correct),
                 warmup: 0,
                 iters: 1,
@@ -569,6 +726,8 @@ mod tests {
         assert_eq!(diff.tasks.len(), 2);
         assert_eq!(diff.tasks[1].task_id, "b");
         assert!(diff.tasks[1].regression);
+        assert_eq!(diff.tasks[1].status, "correctness_failure");
+        assert_eq!(diff.tasks[1].reason, "candidate task is missing");
         assert_eq!(diff.tasks[1].candidate_median_us, 0.0);
     }
 
@@ -586,6 +745,17 @@ mod tests {
 
         let flat = summary(vec![task("a", true, 100.0)]);
         assert_eq!(diff_exit_code(&diff_runs(&base, &flat, 0.03), 1.02), 4);
+    }
+
+    #[test]
+    fn diff_report_classifies_geomean_speedup_failure_with_threshold() {
+        let base = summary(vec![task("a", true, 100.0)]);
+        let flat = summary(vec![task("a", true, 100.0)]);
+        let diff = diff_runs_with_min_speedup(&base, &flat, 0.03, 1.02);
+        assert!(diff.correct);
+        assert_eq!(diff.status, "speedup_failure");
+        assert_eq!(diff.reason, "geomean speedup is below min_speedup");
+        assert_eq!(diff_exit_code(&diff, 1.02), 4);
     }
 
     #[test]
@@ -608,18 +778,57 @@ mod tests {
         assert!(md.contains("# SuperSonic Kernel Lab"));
         assert!(md.contains("arch `gfx1100`"));
         assert!(md.contains("`qwen35.full_attention_prefill`"));
-        assert!(md.contains("`wall_sync`"));
+        assert!(md.contains("required"));
+        assert!(md.contains("`m=1 n=2`"));
+        assert!(md.contains("0.001000"));
         assert!(md.contains("123.457"));
     }
 
     #[test]
-    fn render_diff_markdown_includes_task_rows() {
+    fn render_diff_markdown_includes_task_rows_and_reasons() {
         let base = summary(vec![task("a", true, 100.0)]);
         let cand = summary(vec![task("a", true, 80.0)]);
         let md = render_diff_markdown(&diff_runs(&base, &cand, 0.03), 1.02);
         assert!(md.contains("# SuperSonic Kernel Lab Diff"));
         assert!(md.contains("`a`"));
+        assert!(md.contains("candidate task is correct"));
         assert!(md.contains("1.250"));
+    }
+
+    #[test]
+    fn load_summary_accepts_old_v1_without_added_task_metadata() {
+        let json = r#"{
+          "schema_version": 1,
+          "meta": {
+            "schema_version": 1,
+            "run_id": "old",
+            "timestamp_utc": "2026-05-06T00:00:00Z",
+            "git_sha": "abc123",
+            "git_dirty": false,
+            "backend": "hip",
+            "device": 0,
+            "arch": "gfx1100",
+            "rocm_smi": ""
+          },
+          "task_count": 1,
+          "passed_tasks": 1,
+          "required_task_count": 1,
+          "passed_required_tasks": 1,
+          "tasks": [{
+            "schema_version": 1,
+            "task_id": "old.task",
+            "family": "test",
+            "tags": ["required"],
+            "required": true,
+            "correct": true,
+            "cases": [],
+            "error": null
+          }]
+        }"#;
+        let summary: RunSummary = serde_json::from_str(json).unwrap();
+        assert_eq!(summary.tasks[0].description, "");
+        assert!(summary.tasks[0].backend_support.is_empty());
+        assert_eq!(summary.tasks[0].correctness, "");
     }
 
     #[test]

@@ -327,7 +327,14 @@ fn task_result(task: &TaskDef, cases: Result<Vec<CaseResult>>) -> Result<TaskRes
         schema_version: SCHEMA_VERSION,
         task_id: task.id.to_string(),
         family: task.family.to_string(),
+        description: task.description.to_string(),
         tags: task.tags.iter().map(|s| s.to_string()).collect(),
+        backend_support: task
+            .backend_support
+            .iter()
+            .map(|backend| backend.to_string())
+            .collect(),
+        correctness: task.correctness.to_string(),
         required: task.required,
         correct,
         cases,
