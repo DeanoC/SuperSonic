@@ -155,7 +155,7 @@
       "FMA"
     ]
   },
-  "captured_at": "2026-05-06T10:40:02.555369278+00:00",
+  "captured_at": "2026-05-06T10:53:48.578802514+00:00",
   "warnings": [
     {
       "component": "cpu.dram",
@@ -357,28 +357,28 @@
         "size_bytes": 49152,
         "line_bytes": 64,
         "ways": 12,
-        "measured_lat_ns": 5.0031182,
-        "measured_bw_gb_s": 3.0142927777202844
+        "measured_lat_ns": 5.6438814,
+        "measured_bw_gb_s": 3.130713099972531
       },
       "l2": {
         "size_bytes": 3145728,
         "line_bytes": 64,
         "ways": 12,
-        "measured_lat_ns": 5.2856632,
-        "measured_bw_gb_s": 2.926538157104193
+        "measured_lat_ns": 5.2231382,
+        "measured_bw_gb_s": 3.0900051643696314
       },
       "l3": {
         "size_bytes": 37748736,
         "line_bytes": 64,
         "ways": 12,
-        "measured_lat_ns": 17.8540436,
-        "measured_bw_gb_s": 2.921522949004681
+        "measured_lat_ns": 15.2682843,
+        "measured_bw_gb_s": 2.958213299238163
       }
     },
     "vector_peak": {
       "fp32": {
-        "measured_per_unit": 2.822212590972897,
-        "measured_aggregate": 67.73310218334953,
+        "measured_per_unit": 2.964141784855241,
+        "measured_aggregate": 71.13940283652579,
         "theoretical_aggregate": null,
         "ratio": null
       },
@@ -406,29 +406,29 @@
       "cu_count": 48,
       "wave_size": 32,
       "lds_per_cu_bytes": 65536,
-      "lds_bw_per_cu_gb_s": 215.29986208929486,
-      "lds_bw_aggregate_gb_s": 10334.393380286154,
+      "lds_bw_per_cu_gb_s": 217.1652710952653,
+      "lds_bw_aggregate_gb_s": 10423.933012572734,
       "vram_bw": {
-        "read_gb_s": 786.8996058693081,
-        "write_gb_s": 865.471060039444,
-        "copy_gb_s": 783.4393229923662,
+        "read_gb_s": 807.7014450951406,
+        "write_gb_s": 866.2631394664021,
+        "copy_gb_s": 788.2357435606431,
         "theoretical_peak_gb_s": 800.0,
-        "ratio_read": 0.9836245073366351
+        "ratio_read": 1.0096268063689258
       },
       "mma_peak": {
         "f16": {
-          "measured_tflops": 71.47031094681768,
+          "measured_tflops": 71.48301774768213,
           "theoretical_tflops": 122.8,
-          "ratio": 0.5820057894691993
+          "ratio": 0.5821092650462714
         },
         "bf16": {
-          "measured_tflops": 70.43418075412379,
+          "measured_tflops": 70.69574039538021,
           "theoretical_tflops": 122.8,
-          "ratio": 0.5735682471834185
+          "ratio": 0.575698211688764
         },
         "fp8_e4m3": null,
         "i8": {
-          "measured_tflops": 70.59031350733413,
+          "measured_tflops": 70.58031639588346,
           "theoretical_tflops": null,
           "ratio": null
         }
@@ -438,64 +438,64 @@
         "h2d_gb_s_by_size": [
           {
             "bytes": 4096,
-            "gb_s": 0.16231424608678421
+            "gb_s": 0.15836167577853627
           },
           {
             "bytes": 65536,
-            "gb_s": 4.850330617314218
+            "gb_s": 4.816798083526458
           },
           {
             "bytes": 1048576,
-            "gb_s": 20.94125987947416
+            "gb_s": 20.92651491386337
           },
           {
             "bytes": 4194304,
-            "gb_s": 25.254121880389548
+            "gb_s": 25.28106933462874
           },
           {
             "bytes": 16777216,
-            "gb_s": 26.74824694578157
+            "gb_s": 26.733627616691216
           },
           {
             "bytes": 67108864,
-            "gb_s": 26.97955764395045
+            "gb_s": 26.982033585581355
           },
           {
             "bytes": 268435456,
-            "gb_s": 27.00793479672724
+            "gb_s": 27.014313204130765
           }
         ],
         "d2h_gb_s_by_size": [
           {
             "bytes": 4096,
-            "gb_s": 0.16140917778259414
+            "gb_s": 0.15701062653555295
           },
           {
             "bytes": 65536,
-            "gb_s": 5.178140300888146
+            "gb_s": 5.082107528340935
           },
           {
             "bytes": 1048576,
-            "gb_s": 22.11364848095017
+            "gb_s": 22.122571206480167
           },
           {
             "bytes": 4194304,
-            "gb_s": 26.71067069754798
+            "gb_s": 26.733909835763534
           },
           {
             "bytes": 16777216,
-            "gb_s": 28.181667538041278
+            "gb_s": 28.181123157078304
           },
           {
             "bytes": 67108864,
-            "gb_s": 28.504484828251304
+            "gb_s": 28.503513252329913
           },
           {
             "bytes": 268435456,
-            "gb_s": 28.489806263066274
+            "gb_s": 28.563912943500192
           }
         ],
-        "duplex_gb_s": 50.6494463684436
+        "duplex_gb_s": 50.733699888188916
       },
       "clock_rate_khz_measured": 2482000
     }

@@ -31,6 +31,9 @@ pub(crate) struct HipDeviceInfo {
     pub warp_size: u32,
     pub clock_rate_khz: u32,
     pub pci_device_id: u32,
+    pub cu_count: u32,
+    pub lds_per_cu_bytes: u64,
+    pub integrated: bool,
 }
 
 pub(crate) fn query_device_info_hip(device: i32) -> Result<HipDeviceInfo, String> {
@@ -39,6 +42,9 @@ pub(crate) fn query_device_info_hip(device: i32) -> Result<HipDeviceInfo, String
     let mut warp_size: u32 = 0;
     let mut clock_khz: u32 = 0;
     let mut pci_device_id: u32 = 0;
+    let mut cu_count: u32 = 0;
+    let mut lds_per_cu: u64 = 0;
+    let mut integrated: i32 = 0;
     let status = unsafe {
         mp_query_device_info(
             device,
@@ -48,6 +54,9 @@ pub(crate) fn query_device_info_hip(device: i32) -> Result<HipDeviceInfo, String
             &mut warp_size,
             &mut clock_khz,
             &mut pci_device_id,
+            &mut cu_count,
+            &mut lds_per_cu,
+            &mut integrated,
         )
     };
     if status != 0 {
@@ -61,6 +70,9 @@ pub(crate) fn query_device_info_hip(device: i32) -> Result<HipDeviceInfo, String
         warp_size,
         clock_rate_khz: clock_khz,
         pci_device_id,
+        cu_count,
+        lds_per_cu_bytes: lds_per_cu,
+        integrated: integrated != 0,
     })
 }
 
@@ -83,7 +95,7 @@ pub(crate) fn enumerate_for_fingerprint() -> Result<Vec<HipDeviceInfo>, super::G
 }
 
 fn profile_one(device_index: u32, info: &HipDeviceInfo) -> GpuProfile {
-    let cu_count = guess_cu_count(&info.arch_name);
+    let cu_count = info.cu_count.max(1);
     let lds_aggregate =
         unsafe { mp_lds_bandwidth_run(device_index as i32, cu_count, 1_000_000) };
     let read = unsafe { mp_hbm_bandwidth_read(device_index as i32, 1u64 << 28) };
@@ -133,11 +145,11 @@ fn profile_one(device_index: u32, info: &HipDeviceInfo) -> GpuProfile {
         arch_name: info.arch_name.clone(),
         pci_id: Some(format!("0x{:04x}", info.pci_device_id)),
         uuid: None,
-        memory_arch: format!("{:?}", gpu_hal::current_memory_architecture()),
+        memory_arch: if info.integrated { "Unified" } else { "Discrete" }.into(),
         total_vram_bytes: info.total_vram_bytes,
         cu_count,
         wave_size: info.warp_size,
-        lds_per_cu_bytes: 65536,
+        lds_per_cu_bytes: info.lds_per_cu_bytes,
         lds_bw_per_cu_gb_s: Some(lds_aggregate / cu_count as f64),
         lds_bw_aggregate_gb_s: Some(lds_aggregate),
         vram_bw: VramBandwidth {
@@ -184,17 +196,6 @@ fn profile_one(device_index: u32, info: &HipDeviceInfo) -> GpuProfile {
             duplex_gb_s: Some(duplex),
         },
         clock_rate_khz_measured: Some(info.clock_rate_khz),
-    }
-}
-
-fn guess_cu_count(arch: &str) -> u32 {
-    match arch {
-        "gfx1100" => 48,
-        "gfx1101" => 32,
-        "gfx1102" => 16,
-        "gfx1150" => 16,
-        "gfx90a" => 104,
-        _ => 32,
     }
 }
 

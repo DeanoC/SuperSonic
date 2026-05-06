@@ -310,7 +310,10 @@ extern "C" int mp_query_device_info(int device,
                                     uint64_t *total_vram_bytes_out,
                                     uint32_t *warp_size_out,
                                     uint32_t *clock_rate_khz_out,
-                                    uint32_t *pci_device_id_out)
+                                    uint32_t *pci_device_id_out,
+                                    uint32_t *cu_count_out,
+                                    uint64_t *lds_per_cu_bytes_out,
+                                    int32_t  *integrated_out)
 {
     hipSetDevice(device);
     hipDeviceProp_t props;
@@ -327,6 +330,16 @@ extern "C" int mp_query_device_info(int device,
     int chip_id = 0;
     hipDeviceGetAttribute(&chip_id, hipDeviceAttributePciChipId, device);
     *pci_device_id_out = (uint32_t)chip_id;
+    // multiProcessorCount is the CU count on AMD (= SM count on NVIDIA).
+    *cu_count_out = (uint32_t)props.multiProcessorCount;
+    // On AMD/HIP, sharedMemPerBlock is the LDS allocation a single block can
+    // request, which equals the per-CU LDS budget (e.g. 64 KiB on RDNA3).
+    // sharedMemPerMultiprocessor on AMD has been observed to report aggregate
+    // LDS across all CUs rather than per-CU, so we don't use it.
+    *lds_per_cu_bytes_out = (uint64_t)props.sharedMemPerBlock;
+    // integrated == 1 for APUs / iGPUs (unified host+device memory),
+    // 0 for discrete GPUs.
+    *integrated_out = (int32_t)props.integrated;
     return 0;
 }
 
