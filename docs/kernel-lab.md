@@ -28,6 +28,11 @@ cargo run --release -p supersonic-kernel-lab --bin kernel-lab -- run \
   --backend hip \
   --device 0
 
+cargo run --release -p supersonic-kernel-lab --bin kernel-lab -- run \
+  --tasks tag:functional \
+  --backend hip \
+  --device 0
+
 cargo run --release -p supersonic-kernel-lab --bin kernel-lab -- diff \
   --baseline target/kernel-lab-runs/BASELINE \
   --candidate target/kernel-lab-runs/CANDIDATE \
@@ -60,7 +65,13 @@ tags, required/optional status, and correctness contract.
 `--tasks` accepts `all` for the required suite, `everything` for every registry
 entry, comma-separated task ids, or comma-separated `tag:<name>` selectors. Tag
 expansion is de-duplicated in registry order. The required task set stays fast;
-larger optional shapes are behind `--tasks tag:stress`.
+larger optional shapes are behind `--tasks tag:stress`, and primitive
+correctness checks are behind `--tasks tag:functional`.
+
+The `tag:functional` suite is a non-gating correctness corpus for compact
+primitive-level checks such as BF16 RMSNorm, BF16 RoPE, and INT4 dequant matvec.
+These tasks are intended to catch wrong-answer regressions before expanding
+performance coverage or promoting any subset into `all`.
 
 V1 required tasks cover the current high-leverage Qwen kernel surface:
 
