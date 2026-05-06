@@ -89,9 +89,20 @@ fn profile_one(device_index: u32, info: &HipDeviceInfo) -> GpuProfile {
     let read = unsafe { mp_hbm_bandwidth_read(device_index as i32, 1u64 << 28) };
     let write = unsafe { mp_hbm_bandwidth_write(device_index as i32, 1u64 << 28) };
     let copy = unsafe { mp_hbm_bandwidth_copy(device_index as i32, 1u64 << 28) };
-    let f16 = unsafe { mp_wmma_peak_f16(device_index as i32, cu_count, 100_000) };
-    let bf16 = unsafe { mp_wmma_peak_bf16(device_index as i32, cu_count, 100_000) };
-    let i8_tops = unsafe { mp_wmma_peak_i8(device_index as i32, cu_count, 100_000) };
+
+    // WMMA microkernels only have real intrinsics for RDNA3. On other
+    // architectures the fallback kernel body is empty, so the host
+    // wrapper would compute fake TFLOPS from launch overhead — leave
+    // the MMA fields as None instead of reporting a meaningless number.
+    let (f16, bf16, i8_tops) = if wmma_supported(&info.arch_name) {
+        (
+            Some(unsafe { mp_wmma_peak_f16(device_index as i32, cu_count, 100_000) }),
+            Some(unsafe { mp_wmma_peak_bf16(device_index as i32, cu_count, 100_000) }),
+            Some(unsafe { mp_wmma_peak_i8(device_index as i32, cu_count, 100_000) }),
+        )
+    } else {
+        (None, None, None)
+    };
 
     let mut h2d = vec![MpTransferSample { bytes: 0, gb_s: 0.0 }; 16];
     let n_h2d =
@@ -126,19 +137,19 @@ fn profile_one(device_index: u32, info: &HipDeviceInfo) -> GpuProfile {
             ratio_read: None,
         },
         mma_peak: MmaPeak {
-            f16: Some(MmaMeasurement {
-                measured_tflops: f16,
+            f16: f16.map(|measured_tflops| MmaMeasurement {
+                measured_tflops,
                 theoretical_tflops: None,
                 ratio: None,
             }),
-            bf16: Some(MmaMeasurement {
-                measured_tflops: bf16,
+            bf16: bf16.map(|measured_tflops| MmaMeasurement {
+                measured_tflops,
                 theoretical_tflops: None,
                 ratio: None,
             }),
             fp8_e4m3: None,
-            i8: Some(MmaMeasurement {
-                measured_tflops: i8_tops,
+            i8: i8_tops.map(|measured_tflops| MmaMeasurement {
+                measured_tflops,
                 theoretical_tflops: None,
                 ratio: None,
             }),
@@ -174,4 +185,11 @@ fn guess_cu_count(arch: &str) -> u32 {
         "gfx90a" => 104,
         _ => 32,
     }
+}
+
+/// Whether `wmma_peak.hip` has real `__builtin_amdgcn_wmma_*` intrinsics
+/// for this architecture. Must stay in sync with the `#if` guard in
+/// `kernels/wmma_peak.hip`.
+fn wmma_supported(arch: &str) -> bool {
+    matches!(arch, "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150")
 }
