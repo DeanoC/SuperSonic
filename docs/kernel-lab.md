@@ -94,6 +94,9 @@ harness lands on `main`.
 Scoring is conservative: a task is valid only if every correctness case passes.
 `diff` reports per-task speedup, `fast_p`, geometric mean speedup, and fails on
 correctness regressions or median latency regressions above `--max-regression`.
+`--latency-floor-us` can make latency regressions non-blocking for very small
+tasks whose baseline median is below the floor; correctness failures still fail
+regardless of latency.
 Diff JSON and markdown include machine-readable status/reason fields for each
 required task, including missing candidate tasks, incorrect candidate tasks, and
 latency regressions. The top-level diff status/reason also classifies geomean
@@ -106,10 +109,10 @@ appends the markdown diff to `$GITHUB_STEP_SUMMARY` for Actions jobs.
 
 `.github/workflows/kernel-lab.yml` runs on PRs that touch kernel-lab, kernel FFI,
 GPU HAL, Cargo metadata, or HIP kernel sources. It targets a self-hosted ROCm
-runner labelled `self-hosted`, `linux`, and `rocm`. The default PR suite is the
-cheap `qwen36.router_permute` task with relaxed smoke thresholds; use
-`workflow_dispatch` to run broader selectors such as `all`, `tag:prefill`, or
-`everything` with custom iteration counts.
+runner labelled `self-hosted`, `linux`, and `rocm`. The default PR suite is
+`all` with short warmup/iteration counts; use `workflow_dispatch` to run broader
+selectors such as `everything`, `tag:functional`, or `tag:stress` with custom
+iteration counts.
 
 Because the job executes candidate code on a persistent self-hosted GPU host,
 the PR trigger is restricted to same-repository branches. Fork PRs must be run
@@ -120,9 +123,11 @@ The workflow compares the checked-out candidate worktree against the PR base
 commit using `compare-ref`, writes markdown to the GitHub step summary, and
 uploads the run JSON/markdown artifacts.
 
-Before building, the workflow waits for the ROCm device to report at most 5%
+Before building, the workflow waits for the ROCm device to report at most 10%
 GPU use and at most 20% VRAM allocation for three consecutive 30-second
 samples. If the device stays busy for one hour, the job fails with a clear
+error. The default PR preset also uses a `75us` latency floor so tiny required
+tasks remain correctness-gated without failing on incidental GPU timing noise.
 timeout rather than running a noisy contended benchmark.
 
 ## Baselines

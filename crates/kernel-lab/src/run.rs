@@ -85,6 +85,10 @@ pub struct DiffTask {
     pub speedup: f64,
     pub regression: bool,
     #[serde(default)]
+    pub latency_floor_us: f64,
+    #[serde(default)]
+    pub latency_gate_active: bool,
+    #[serde(default)]
     pub status: String,
     #[serde(default)]
     pub reason: String,
@@ -95,6 +99,8 @@ pub struct DiffReport {
     pub correct: bool,
     pub fast_p: f64,
     pub geomean_speedup: f64,
+    #[serde(default)]
+    pub speedup_task_count: usize,
     #[serde(default)]
     pub status: String,
     #[serde(default)]
@@ -279,6 +285,16 @@ pub fn diff_runs_with_min_speedup(
     max_regression: f64,
     min_speedup: f64,
 ) -> DiffReport {
+    diff_runs_with_policy(baseline, candidate, max_regression, min_speedup, 0.0)
+}
+
+pub fn diff_runs_with_policy(
+    baseline: &RunSummary,
+    candidate: &RunSummary,
+    max_regression: f64,
+    min_speedup: f64,
+    latency_floor_us: f64,
+) -> DiffReport {
     let mut candidate_by_id = BTreeMap::new();
     for task in &candidate.tasks {
         candidate_by_id.insert(task.task_id.as_str(), task);
@@ -295,6 +311,8 @@ pub fn diff_runs_with_min_speedup(
                 candidate_median_us: 0.0,
                 speedup: 0.0,
                 regression: true,
+                latency_floor_us,
+                latency_gate_active: true,
                 status: "correctness_failure".into(),
                 reason: "candidate task is missing".into(),
             });
@@ -308,7 +326,9 @@ pub fn diff_runs_with_min_speedup(
             0.0
         };
         let correct = base_task.correct && cand_task.correct;
-        let latency_regression = cand_med > base_med * (1.0 + max_regression);
+        let raw_latency_regression = cand_med > base_med * (1.0 + max_regression);
+        let latency_gate_active = base_med >= latency_floor_us;
+        let latency_regression = raw_latency_regression && latency_gate_active;
         let regression = !correct || latency_regression;
         let (status, reason) = if !correct {
             (
@@ -324,6 +344,11 @@ pub fn diff_runs_with_min_speedup(
                 "latency_regression",
                 "candidate latency exceeds max_regression",
             )
+        } else if raw_latency_regression {
+            (
+                "latency_floor",
+                "candidate latency exceeds max_regression but baseline latency is below latency_floor_us",
+            )
         } else {
             (
                 "ok",
@@ -337,26 +362,34 @@ pub fn diff_runs_with_min_speedup(
             candidate_median_us: cand_med,
             speedup,
             regression,
+            latency_floor_us,
+            latency_gate_active,
             status: status.into(),
             reason: reason.into(),
         });
     }
 
-    let valid: Vec<_> = tasks.iter().filter(|task| task.correct).collect();
-    let fast_count = valid.iter().filter(|task| task.speedup > 1.0).count();
+    let speedup_gated: Vec<_> = tasks
+        .iter()
+        .filter(|task| task.correct && task.status != "latency_floor")
+        .collect();
+    let fast_count = speedup_gated
+        .iter()
+        .filter(|task| task.speedup > 1.0)
+        .count();
     let fast_p = if tasks.is_empty() {
         0.0
     } else {
         fast_count as f64 / tasks.len() as f64
     };
-    let geomean_speedup = if valid.is_empty() {
-        0.0
+    let geomean_speedup = if speedup_gated.is_empty() {
+        1.0
     } else {
-        (valid
+        (speedup_gated
             .iter()
             .map(|task| task.speedup.max(1e-9).ln())
             .sum::<f64>()
-            / valid.len() as f64)
+            / speedup_gated.len() as f64)
             .exp()
     };
     let worst_regression = tasks
@@ -372,7 +405,7 @@ pub fn diff_runs_with_min_speedup(
             "failed",
             "one or more required tasks failed correctness or latency checks",
         )
-    } else if geomean_speedup < min_speedup {
+    } else if !speedup_gated.is_empty() && geomean_speedup < min_speedup {
         ("speedup_failure", "geomean speedup is below min_speedup")
     } else {
         (
@@ -385,6 +418,7 @@ pub fn diff_runs_with_min_speedup(
         correct,
         fast_p,
         geomean_speedup,
+        speedup_task_count: speedup_gated.len(),
         status: status.to_string(),
         reason: reason.to_string(),
         worst_regression,
@@ -397,7 +431,7 @@ pub fn diff_exit_code(diff: &DiffReport, min_speedup: f64) -> i32 {
         2
     } else if diff.tasks.iter().any(|task| task.regression) {
         3
-    } else if diff.geomean_speedup < min_speedup {
+    } else if diff.speedup_task_count > 0 && diff.geomean_speedup < min_speedup {
         4
     } else {
         0
@@ -468,19 +502,20 @@ pub fn render_markdown(summary: &RunSummary) -> String {
 pub fn render_diff_markdown(diff: &DiffReport, min_speedup: f64) -> String {
     let mut s = String::new();
     s.push_str("# SuperSonic Kernel Lab Diff\n\n");
-    let speedup_status = if diff.geomean_speedup < min_speedup {
+    let speedup_status = if diff.speedup_task_count > 0 && diff.geomean_speedup < min_speedup {
         "failed"
     } else {
         "ok"
     };
     s.push_str(&format!(
-        "- correct: `{}`\n- status: `{}`\n- reason: {}\n- fast_p: `{:.3}`\n- geomean speedup: `{:.3}` ({})\n- min speedup: `{:.3}`\n\n",
+        "- correct: `{}`\n- status: `{}`\n- reason: {}\n- fast_p: `{:.3}`\n- geomean speedup: `{:.3}` ({})\n- speedup-gated tasks: `{}`\n- min speedup: `{:.3}`\n\n",
         diff.correct,
         diff.status,
         diff.reason,
         diff.fast_p,
         diff.geomean_speedup,
         speedup_status,
+        diff.speedup_task_count,
         min_speedup
     ));
     s.push_str("| task | status | reason | correct | baseline us | candidate us | speedup | regression |\n");
@@ -694,6 +729,35 @@ mod tests {
         let diff = diff_runs(&base, &cand, 0.03);
         assert!(!diff.correct);
         assert!(diff.tasks[0].regression);
+        assert!(diff.tasks[0].latency_gate_active);
+        assert_eq!(diff.tasks[0].status, "latency_regression");
+    }
+
+    #[test]
+    fn diff_latency_floor_ignores_tiny_task_timing_noise() {
+        let base = summary(vec![task("a", true, 37.0)]);
+        let cand = summary(vec![task("a", true, 43.0)]);
+        let diff = diff_runs_with_policy(&base, &cand, 0.10, 1.02, 75.0);
+        assert!(diff.correct);
+        assert!(!diff.tasks[0].regression);
+        assert!(!diff.tasks[0].latency_gate_active);
+        assert_eq!(diff.tasks[0].latency_floor_us, 75.0);
+        assert_eq!(diff.tasks[0].status, "latency_floor");
+        assert_eq!(diff.geomean_speedup, 1.0);
+        assert_eq!(diff.speedup_task_count, 0);
+        assert_eq!(diff.status, "ok");
+        assert_eq!(diff_exit_code(&diff, 1.02), 0);
+    }
+
+    #[test]
+    fn diff_latency_floor_still_gates_larger_tasks() {
+        let base = summary(vec![task("a", true, 100.0)]);
+        let cand = summary(vec![task("a", true, 112.0)]);
+        let diff = diff_runs_with_policy(&base, &cand, 0.10, 0.0, 75.0);
+        assert!(!diff.correct);
+        assert!(diff.tasks[0].regression);
+        assert!(diff.tasks[0].latency_gate_active);
+        assert_eq!(diff.tasks[0].status, "latency_regression");
     }
 
     #[test]
@@ -703,6 +767,7 @@ mod tests {
         let diff = diff_runs(&base, &cand, 0.03);
         assert!(diff.correct);
         assert_eq!(diff.fast_p, 1.0);
+        assert_eq!(diff.speedup_task_count, 2);
         assert!(diff.geomean_speedup > 1.24 && diff.geomean_speedup < 1.26);
         assert!(diff.worst_regression.is_none());
     }
@@ -753,6 +818,7 @@ mod tests {
         let flat = summary(vec![task("a", true, 100.0)]);
         let diff = diff_runs_with_min_speedup(&base, &flat, 0.03, 1.02);
         assert!(diff.correct);
+        assert_eq!(diff.speedup_task_count, 1);
         assert_eq!(diff.status, "speedup_failure");
         assert_eq!(diff.reason, "geomean speedup is below min_speedup");
         assert_eq!(diff_exit_code(&diff, 1.02), 4);

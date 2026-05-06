@@ -42,6 +42,10 @@ on:
         description: "minimum geomean speedup"
         required: true
         default: "0.0"
+      latency_floor_us:
+        description: "ignore latency regressions for tasks below this baseline median"
+        required: false
+        default: ""
       checked_baseline:
         description: "compare candidate against checked-in gfx1100 baseline"
         required: true
@@ -69,6 +73,7 @@ jobs:
       KERNEL_LAB_ITERS_INPUT: ${{ github.event.inputs.iters || '' }}
       KERNEL_LAB_MAX_REGRESSION: ${{ github.event.inputs.max_regression || '0.10' }}
       KERNEL_LAB_MIN_SPEEDUP: ${{ github.event.inputs.min_speedup || '0.0' }}
+      KERNEL_LAB_LATENCY_FLOOR_US_INPUT: ${{ github.event.inputs.latency_floor_us || '' }}
       KERNEL_LAB_CHECKED_BASELINE_INPUT: ${{ github.event.inputs.checked_baseline || 'auto' }}
       KERNEL_LAB_RUN_ROOT: target/kernel-lab-runs
       KERNEL_LAB_WORKTREE_ROOT: target/kernel-lab-worktrees
@@ -89,6 +94,7 @@ jobs:
               tasks="${KERNEL_LAB_TASKS_INPUT:-all}"
               warmup="${KERNEL_LAB_WARMUP_INPUT:-2}"
               iters="${KERNEL_LAB_ITERS_INPUT:-5}"
+              latency_floor_us="${KERNEL_LAB_LATENCY_FLOOR_US_INPUT:-75}"
               checked_baseline_default=1
               checked_baseline_blocking_default=0
               ;;
@@ -96,6 +102,7 @@ jobs:
               tasks="${KERNEL_LAB_TASKS_INPUT:-all}"
               warmup="${KERNEL_LAB_WARMUP_INPUT:-5}"
               iters="${KERNEL_LAB_ITERS_INPUT:-20}"
+              latency_floor_us="${KERNEL_LAB_LATENCY_FLOOR_US_INPUT:-0}"
               checked_baseline_default=1
               checked_baseline_blocking_default=1
               ;;
@@ -103,6 +110,7 @@ jobs:
               tasks="${KERNEL_LAB_TASKS_INPUT:-everything}"
               warmup="${KERNEL_LAB_WARMUP_INPUT:-5}"
               iters="${KERNEL_LAB_ITERS_INPUT:-20}"
+              latency_floor_us="${KERNEL_LAB_LATENCY_FLOOR_US_INPUT:-0}"
               checked_baseline_default=1
               checked_baseline_blocking_default=1
               ;;
@@ -110,6 +118,7 @@ jobs:
               tasks="${KERNEL_LAB_TASKS_INPUT:-tag:stress}"
               warmup="${KERNEL_LAB_WARMUP_INPUT:-5}"
               iters="${KERNEL_LAB_ITERS_INPUT:-20}"
+              latency_floor_us="${KERNEL_LAB_LATENCY_FLOOR_US_INPUT:-0}"
               checked_baseline_default=0
               checked_baseline_blocking_default=0
               ;;
@@ -146,6 +155,7 @@ jobs:
             echo "KERNEL_LAB_TASKS=$tasks"
             echo "KERNEL_LAB_WARMUP=$warmup"
             echo "KERNEL_LAB_ITERS=$iters"
+            echo "KERNEL_LAB_LATENCY_FLOOR_US=$latency_floor_us"
             echo "KERNEL_LAB_COMPARE_CHECKED_BASELINE=$checked_baseline"
             echo "KERNEL_LAB_CHECKED_BASELINE_BLOCKING=$checked_baseline_blocking"
           } >> "$GITHUB_ENV"
@@ -157,6 +167,7 @@ jobs:
             echo "- tasks: \`$tasks\`"
             echo "- warmup: \`$warmup\`"
             echo "- iters: \`$iters\`"
+            echo "- latency floor: \`${latency_floor_us}us\`"
             echo "- checked baseline: \`$checked_baseline\`"
             echo "- checked baseline blocking: \`$checked_baseline_blocking\`"
             if [ -n "$KERNEL_LAB_TASKS_INPUT" ] && [ "$KERNEL_LAB_CHECKED_BASELINE_INPUT" = "auto" ]; then
@@ -240,6 +251,7 @@ jobs:
             --worktree-root "$KERNEL_LAB_WORKTREE_ROOT" \
             --max-regression "$KERNEL_LAB_MAX_REGRESSION" \
             --min-speedup "$KERNEL_LAB_MIN_SPEEDUP" \
+            --latency-floor-us "$KERNEL_LAB_LATENCY_FLOOR_US" \
             --markdown-out "$KERNEL_LAB_RUN_ROOT/diff.md" \
             --candidate-summary-copy "$KERNEL_LAB_CANDIDATE_SUMMARY" \
             --github-summary
@@ -257,6 +269,7 @@ jobs:
             --candidate "$KERNEL_LAB_CANDIDATE_SUMMARY" \
             --max-regression "$KERNEL_LAB_MAX_REGRESSION" \
             --min-speedup "$KERNEL_LAB_MIN_SPEEDUP" \
+            --latency-floor-us "$KERNEL_LAB_LATENCY_FLOOR_US" \
             --markdown-out "$KERNEL_LAB_RUN_ROOT/checked-baseline-diff.md" \
             --github-summary
           status=$?
