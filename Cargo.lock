@@ -2108,6 +2108,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "supersonic-kernel-lab"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "gpu-hal",
+ "half",
+ "kernel-ffi",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "supersonic-runtime"
 version = "0.1.0"
 dependencies = [

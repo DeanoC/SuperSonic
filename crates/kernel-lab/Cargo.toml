@@ -1,0 +1,25 @@
+[package]
+name = "supersonic-kernel-lab"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "supersonic_kernel_lab"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kernel-lab"
+path = "src/bin/kernel_lab.rs"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+gpu-hal = { path = "../gpu-hal" }
+half = "2"
+kernel-ffi = { path = "../kernel-ffi" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
