@@ -100,6 +100,8 @@ pub struct DiffReport {
     pub fast_p: f64,
     pub geomean_speedup: f64,
     #[serde(default)]
+    pub speedup_task_count: usize,
+    #[serde(default)]
     pub status: String,
     #[serde(default)]
     pub reason: String,
@@ -367,21 +369,27 @@ pub fn diff_runs_with_policy(
         });
     }
 
-    let valid: Vec<_> = tasks.iter().filter(|task| task.correct).collect();
-    let fast_count = valid.iter().filter(|task| task.speedup > 1.0).count();
+    let speedup_gated: Vec<_> = tasks
+        .iter()
+        .filter(|task| task.correct && task.status != "latency_floor")
+        .collect();
+    let fast_count = speedup_gated
+        .iter()
+        .filter(|task| task.speedup > 1.0)
+        .count();
     let fast_p = if tasks.is_empty() {
         0.0
     } else {
         fast_count as f64 / tasks.len() as f64
     };
-    let geomean_speedup = if valid.is_empty() {
-        0.0
+    let geomean_speedup = if speedup_gated.is_empty() {
+        1.0
     } else {
-        (valid
+        (speedup_gated
             .iter()
             .map(|task| task.speedup.max(1e-9).ln())
             .sum::<f64>()
-            / valid.len() as f64)
+            / speedup_gated.len() as f64)
             .exp()
     };
     let worst_regression = tasks
@@ -397,7 +405,7 @@ pub fn diff_runs_with_policy(
             "failed",
             "one or more required tasks failed correctness or latency checks",
         )
-    } else if geomean_speedup < min_speedup {
+    } else if !speedup_gated.is_empty() && geomean_speedup < min_speedup {
         ("speedup_failure", "geomean speedup is below min_speedup")
     } else {
         (
@@ -410,6 +418,7 @@ pub fn diff_runs_with_policy(
         correct,
         fast_p,
         geomean_speedup,
+        speedup_task_count: speedup_gated.len(),
         status: status.to_string(),
         reason: reason.to_string(),
         worst_regression,
@@ -422,7 +431,7 @@ pub fn diff_exit_code(diff: &DiffReport, min_speedup: f64) -> i32 {
         2
     } else if diff.tasks.iter().any(|task| task.regression) {
         3
-    } else if diff.geomean_speedup < min_speedup {
+    } else if diff.speedup_task_count > 0 && diff.geomean_speedup < min_speedup {
         4
     } else {
         0
@@ -493,19 +502,20 @@ pub fn render_markdown(summary: &RunSummary) -> String {
 pub fn render_diff_markdown(diff: &DiffReport, min_speedup: f64) -> String {
     let mut s = String::new();
     s.push_str("# SuperSonic Kernel Lab Diff\n\n");
-    let speedup_status = if diff.geomean_speedup < min_speedup {
+    let speedup_status = if diff.speedup_task_count > 0 && diff.geomean_speedup < min_speedup {
         "failed"
     } else {
         "ok"
     };
     s.push_str(&format!(
-        "- correct: `{}`\n- status: `{}`\n- reason: {}\n- fast_p: `{:.3}`\n- geomean speedup: `{:.3}` ({})\n- min speedup: `{:.3}`\n\n",
+        "- correct: `{}`\n- status: `{}`\n- reason: {}\n- fast_p: `{:.3}`\n- geomean speedup: `{:.3}` ({})\n- speedup-gated tasks: `{}`\n- min speedup: `{:.3}`\n\n",
         diff.correct,
         diff.status,
         diff.reason,
         diff.fast_p,
         diff.geomean_speedup,
         speedup_status,
+        diff.speedup_task_count,
         min_speedup
     ));
     s.push_str("| task | status | reason | correct | baseline us | candidate us | speedup | regression |\n");
@@ -727,13 +737,16 @@ mod tests {
     fn diff_latency_floor_ignores_tiny_task_timing_noise() {
         let base = summary(vec![task("a", true, 37.0)]);
         let cand = summary(vec![task("a", true, 43.0)]);
-        let diff = diff_runs_with_policy(&base, &cand, 0.10, 0.0, 75.0);
+        let diff = diff_runs_with_policy(&base, &cand, 0.10, 1.02, 75.0);
         assert!(diff.correct);
         assert!(!diff.tasks[0].regression);
         assert!(!diff.tasks[0].latency_gate_active);
         assert_eq!(diff.tasks[0].latency_floor_us, 75.0);
         assert_eq!(diff.tasks[0].status, "latency_floor");
-        assert_eq!(diff_exit_code(&diff, 0.0), 0);
+        assert_eq!(diff.geomean_speedup, 1.0);
+        assert_eq!(diff.speedup_task_count, 0);
+        assert_eq!(diff.status, "ok");
+        assert_eq!(diff_exit_code(&diff, 1.02), 0);
     }
 
     #[test]
@@ -754,6 +767,7 @@ mod tests {
         let diff = diff_runs(&base, &cand, 0.03);
         assert!(diff.correct);
         assert_eq!(diff.fast_p, 1.0);
+        assert_eq!(diff.speedup_task_count, 2);
         assert!(diff.geomean_speedup > 1.24 && diff.geomean_speedup < 1.26);
         assert!(diff.worst_regression.is_none());
     }
@@ -804,6 +818,7 @@ mod tests {
         let flat = summary(vec![task("a", true, 100.0)]);
         let diff = diff_runs_with_min_speedup(&base, &flat, 0.03, 1.02);
         assert!(diff.correct);
+        assert_eq!(diff.speedup_task_count, 1);
         assert_eq!(diff.status, "speedup_failure");
         assert_eq!(diff.reason, "geomean speedup is below min_speedup");
         assert_eq!(diff_exit_code(&diff, 1.02), 4);
