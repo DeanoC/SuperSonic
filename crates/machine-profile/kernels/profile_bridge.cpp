@@ -1,6 +1,7 @@
 #include <hip/hip_runtime.h>
 #include <stdint.h>
 #include <chrono>
+#include <cstring>
 
 extern "C" __global__ void mp_lds_bandwidth_kernel(uint64_t iters, uint64_t *bytes_out);
 
@@ -202,4 +203,95 @@ extern "C" double mp_wmma_peak_i8(int device, uint32_t cu_count, uint64_t iters)
     double secs = std::chrono::duration<double>(t1 - t0).count();
     double total_ops = 256.0 * (double)iters * (double)threads * (double)blocks * (double)reps;
     return total_ops / secs / 1e12;
+}
+
+struct MpTransferSample { uint64_t bytes; double gb_s; };
+
+extern "C" int mp_pcie_h2d(int device, MpTransferSample *out, int max_samples)
+{
+    hipSetDevice(device);
+    const uint64_t sizes[] = { 4096ULL, 65536ULL, 1ULL<<20, 1ULL<<22, 1ULL<<24, 1ULL<<26, 1ULL<<28 };
+    int n = sizeof(sizes) / sizeof(sizes[0]);
+    if (n > max_samples) n = max_samples;
+
+    void *d_buf = nullptr;
+    hipMalloc(&d_buf, sizes[n - 1]);
+    void *h_buf = nullptr;
+    hipHostMalloc(&h_buf, sizes[n - 1]);
+    memset(h_buf, 0, sizes[n - 1]);
+
+    for (int i = 0; i < n; ++i) {
+        // warmup
+        hipMemcpy(d_buf, h_buf, sizes[i], hipMemcpyHostToDevice);
+        hipDeviceSynchronize();
+        auto t0 = std::chrono::high_resolution_clock::now();
+        int reps = sizes[i] >= (1ULL<<24) ? 4 : 32;
+        for (int r = 0; r < reps; ++r)
+            hipMemcpy(d_buf, h_buf, sizes[i], hipMemcpyHostToDevice);
+        hipDeviceSynchronize();
+        auto t1 = std::chrono::high_resolution_clock::now();
+        double secs = std::chrono::duration<double>(t1 - t0).count();
+        out[i].bytes = sizes[i];
+        out[i].gb_s = (double)(sizes[i] * reps) / secs / 1e9;
+    }
+    hipHostFree(h_buf);
+    hipFree(d_buf);
+    return n;
+}
+
+extern "C" int mp_pcie_d2h(int device, MpTransferSample *out, int max_samples)
+{
+    hipSetDevice(device);
+    const uint64_t sizes[] = { 4096ULL, 65536ULL, 1ULL<<20, 1ULL<<22, 1ULL<<24, 1ULL<<26, 1ULL<<28 };
+    int n = sizeof(sizes) / sizeof(sizes[0]);
+    if (n > max_samples) n = max_samples;
+
+    void *d_buf = nullptr;
+    hipMalloc(&d_buf, sizes[n - 1]);
+    hipMemset(d_buf, 0, sizes[n - 1]);
+    void *h_buf = nullptr;
+    hipHostMalloc(&h_buf, sizes[n - 1]);
+
+    for (int i = 0; i < n; ++i) {
+        hipMemcpy(h_buf, d_buf, sizes[i], hipMemcpyDeviceToHost);
+        hipDeviceSynchronize();
+        auto t0 = std::chrono::high_resolution_clock::now();
+        int reps = sizes[i] >= (1ULL<<24) ? 4 : 32;
+        for (int r = 0; r < reps; ++r)
+            hipMemcpy(h_buf, d_buf, sizes[i], hipMemcpyDeviceToHost);
+        hipDeviceSynchronize();
+        auto t1 = std::chrono::high_resolution_clock::now();
+        double secs = std::chrono::duration<double>(t1 - t0).count();
+        out[i].bytes = sizes[i];
+        out[i].gb_s = (double)(sizes[i] * reps) / secs / 1e9;
+    }
+    hipHostFree(h_buf);
+    hipFree(d_buf);
+    return n;
+}
+
+extern "C" double mp_pcie_duplex(int device, uint64_t bytes)
+{
+    hipSetDevice(device);
+    void *d_buf = nullptr; void *h_buf = nullptr;
+    hipMalloc(&d_buf, bytes);
+    hipHostMalloc(&h_buf, bytes);
+    hipStream_t s_h2d, s_d2h;
+    hipStreamCreate(&s_h2d);
+    hipStreamCreate(&s_d2h);
+    hipMemcpyAsync(d_buf, h_buf, bytes, hipMemcpyHostToDevice, s_h2d);
+    hipMemcpyAsync(h_buf, d_buf, bytes, hipMemcpyDeviceToHost, s_d2h);
+    hipStreamSynchronize(s_h2d); hipStreamSynchronize(s_d2h);
+    auto t0 = std::chrono::high_resolution_clock::now();
+    int reps = 4;
+    for (int r = 0; r < reps; ++r) {
+        hipMemcpyAsync(d_buf, h_buf, bytes, hipMemcpyHostToDevice, s_h2d);
+        hipMemcpyAsync(h_buf, d_buf, bytes, hipMemcpyDeviceToHost, s_d2h);
+    }
+    hipStreamSynchronize(s_h2d); hipStreamSynchronize(s_d2h);
+    auto t1 = std::chrono::high_resolution_clock::now();
+    double secs = std::chrono::duration<double>(t1 - t0).count();
+    hipStreamDestroy(s_h2d); hipStreamDestroy(s_d2h);
+    hipFree(d_buf); hipHostFree(h_buf);
+    return (double)(2 * bytes * reps) / secs / 1e9;
 }
