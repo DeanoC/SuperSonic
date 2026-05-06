@@ -50,6 +50,16 @@ enum Command {
         #[arg(long)]
         github_summary: bool,
     },
+    Baseline {
+        #[arg(long)]
+        run: PathBuf,
+        #[arg(long, default_value = "crates/kernel-lab/baselines")]
+        out_root: PathBuf,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        no_markdown: bool,
+    },
     CompareRef {
         #[arg(long, default_value = "main")]
         baseline_ref: String,
@@ -152,6 +162,16 @@ fn main() -> Result<()> {
                 std::process::exit(code);
             }
         }
+        Command::Baseline {
+            run,
+            out_root,
+            name,
+            no_markdown,
+        } => {
+            let summary = load_summary(&run)?;
+            let path = write_baseline_artifact(&summary, &out_root, name.as_deref(), !no_markdown)?;
+            println!("[kernel-lab] wrote baseline {}", path.display());
+        }
         Command::CompareRef {
             baseline_ref,
             candidate_ref,
@@ -204,6 +224,26 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn write_baseline_artifact(
+    summary: &supersonic_kernel_lab::run::RunSummary,
+    out_root: &Path,
+    name: Option<&str>,
+    write_markdown: bool,
+) -> Result<PathBuf> {
+    let arch = sanitize_label(&summary.meta.arch);
+    let stem = name.map(sanitize_label).unwrap_or_else(|| {
+        sanitize_label(&format!("{}-{}", summary.meta.backend, summary.meta.run_id))
+    });
+    let out_dir = out_root.join(arch);
+    std::fs::create_dir_all(&out_dir)?;
+    let summary_path = out_dir.join(format!("{stem}.summary.json"));
+    std::fs::write(&summary_path, serde_json::to_string_pretty(summary)?)?;
+    if write_markdown {
+        std::fs::write(out_dir.join(format!("{stem}.md")), render_markdown(summary))?;
+    }
+    Ok(summary_path)
 }
 
 fn write_diff_markdown(
@@ -272,6 +312,7 @@ fn run_ref(
     std::fs::create_dir_all(worktree_root)?;
     let label = sanitize_ref(git_ref);
     let dir = worktree_root.join(label);
+    run_checked("git", &["worktree", "prune"])?;
     if dir.exists() {
         run_checked(
             "git",
@@ -428,7 +469,11 @@ fn run_checked(cmd: &str, args: &[&str]) -> Result<()> {
 }
 
 fn sanitize_ref(git_ref: &str) -> String {
-    git_ref
+    sanitize_label(git_ref)
+}
+
+fn sanitize_label(label: &str) -> String {
+    label
         .chars()
         .map(|ch| {
             if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
@@ -522,6 +567,21 @@ mod tests {
         std::fs::write(new.join("summary.json"), "{}").unwrap();
 
         assert_eq!(newest_run_dir_excluding(&run_root, &before).unwrap(), new);
+    }
+
+    #[test]
+    fn write_baseline_artifact_groups_by_arch_and_sanitizes_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let summary = test_summary(1, 1, 1, 1);
+        let path = write_baseline_artifact(&summary, tmp.path(), Some("required/gfx+smoke"), true)
+            .unwrap();
+
+        assert_eq!(
+            path.strip_prefix(tmp.path()).unwrap(),
+            Path::new("gfx1100").join("required-gfx-smoke.summary.json")
+        );
+        assert!(path.exists());
+        assert!(path.with_file_name("required-gfx-smoke.md").exists());
     }
 
     fn test_summary(
