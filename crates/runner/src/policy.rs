@@ -52,9 +52,20 @@ pub(crate) fn validate_global_flags(
             "--weight-quant {profile} has manifest and package naming support, but Qwen HIP runtime kernels/loaders for this profile are not implemented yet"
         );
     }
-    if profile == QuantProfile::Int4Awq && model_variant.family() == ModelFamily::Qwen36Moe {
+    if matches!(
+        (profile, model_variant.family()),
+        (
+            QuantProfile::Int4Awq | QuantProfile::Int4Autoround | QuantProfile::Int4Hqq,
+            ModelFamily::Qwen36Moe
+        )
+    ) {
         anyhow::bail!(
-            "--weight-quant int4-awq is currently supported only for Qwen3.5; Qwen3.6-MoE does not load/pass AWQ sidecars yet"
+            "--weight-quant {profile} is currently supported only for Qwen3.5; Qwen3.6-MoE bake selection/runtime support is not wired for this profile yet"
+        );
+    }
+    if profile == QuantProfile::Int4Awq && backend == Backend::Cuda {
+        anyhow::bail!(
+            "--weight-quant int4-awq is currently supported only on HIP; CUDA INT4 kernels do not apply AWQ sidecars yet"
         );
     }
     if matches!(
@@ -106,25 +117,39 @@ mod tests {
     }
 
     #[test]
-    fn rejects_awq_for_qwen36_until_sidecars_are_wired() {
-        let err = validate_global_flags(
-            &cli(&["--weight-quant", "int4-awq"]),
-            &ModelVariant::Qwen3_6_35B_A3B,
-            Backend::Hip,
-        )
-        .expect_err("Qwen3.6 AWQ should fail until sidecars are wired")
-        .to_string();
-        assert!(err.contains("Qwen3.6-MoE does not load/pass AWQ sidecars"));
+    fn rejects_new_native_int4_profiles_for_qwen36_until_selection_is_wired() {
+        for profile in ["int4-awq", "int4-autoround", "int4-hqq"] {
+            let err = validate_global_flags(
+                &cli(&["--weight-quant", profile]),
+                &ModelVariant::Qwen3_6_35B_A3B,
+                Backend::Hip,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("Qwen3.6-MoE bake selection/runtime support is not wired"));
+        }
     }
 
     #[test]
-    fn allows_hqq_for_qwen36_native_int4_layout() {
+    fn rejects_awq_on_cuda_until_sidecars_are_applied() {
+        let err = validate_global_flags(
+            &cli(&["--weight-quant", "int4-awq"]),
+            &ModelVariant::Qwen3_5_4B,
+            Backend::Cuda,
+        )
+        .expect_err("CUDA AWQ should fail until sidecars are applied")
+        .to_string();
+        assert!(err.contains("CUDA INT4 kernels do not apply AWQ sidecars"));
+    }
+
+    #[test]
+    fn allows_gptq_for_qwen36_native_int4_layout() {
         validate_global_flags(
-            &cli(&["--weight-quant", "int4-hqq"]),
+            &cli(&["--weight-quant", "int4-gptq"]),
             &ModelVariant::Qwen3_6_35B_A3B,
             Backend::Hip,
         )
-        .expect("HQQ emits the native INT4 layout and does not require AWQ sidecars");
+        .expect("GPTQ remains the wired Qwen3.6 native INT4 path");
     }
 }
 
