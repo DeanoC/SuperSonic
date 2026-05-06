@@ -1,5 +1,6 @@
 //! Machine profiling — measure CPU + GPU hardware capabilities.
 
+pub mod catalog;
 pub mod fingerprint;
 pub mod schema;
 
