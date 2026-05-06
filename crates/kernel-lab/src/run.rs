@@ -154,7 +154,7 @@ pub fn run_tasks(cfg: &KernelLabConfig, tasks: &[TaskDef]) -> Result<(PathBuf, R
     gpu_hal::set_device(cfg.device).context("set GPU device")?;
 
     let git_sha = capture(["rev-parse", "--short", "HEAD"]).unwrap_or_else(|| "unknown".into());
-    let git_dirty = !capture(["status", "--porcelain"])
+    let git_dirty = !capture(["status", "--porcelain", "--untracked-files=no"])
         .unwrap_or_default()
         .is_empty();
     let date = chrono::Utc::now().format("%Y-%m-%d").to_string();
