@@ -33,6 +33,10 @@ cargo run --release -p supersonic-kernel-lab --bin kernel-lab -- compare-ref \
   --tasks all \
   --backend hip \
   --device 0
+
+cargo run --release -p supersonic-kernel-lab --bin kernel-lab -- baseline \
+  --run target/kernel-lab-runs/CANDIDATE \
+  --name required
 ```
 
 The harness writes `meta.json`, one `tasks/*.json` file per task, and a
@@ -70,3 +74,34 @@ correctness regressions or median latency regressions above `--max-regression`.
 Exit code `2` means correctness failed, `3` means latency regression, and `4`
 means the run was correct but missed `--min-speedup`. `--github-summary`
 appends the markdown diff to `$GITHUB_STEP_SUMMARY` for Actions jobs.
+
+## CI
+
+`.github/workflows/kernel-lab.yml` runs on PRs that touch kernel-lab, kernel FFI,
+GPU HAL, Cargo metadata, or HIP kernel sources. It targets a self-hosted ROCm
+runner labelled `self-hosted`, `linux`, and `rocm`. The default PR suite is the
+cheap `qwen36.router_permute` task with relaxed smoke thresholds; use
+`workflow_dispatch` to run broader selectors such as `all`, `tag:prefill`, or
+`everything` with custom iteration counts.
+
+The workflow compares the checked-out candidate worktree against the PR base
+commit using `compare-ref`, writes markdown to the GitHub step summary, and
+uploads the run JSON/markdown artifacts.
+
+## Baselines
+
+Reviewed baseline summaries live under
+`crates/kernel-lab/baselines/<arch>/<name>.summary.json`. Generate one from a
+run directory with:
+
+```bash
+cargo run --release -p supersonic-kernel-lab --bin kernel-lab -- baseline \
+  --run target/kernel-lab-runs/2026-05-06-abcdef0 \
+  --name required
+```
+
+The command groups artifacts by the run's detected architecture, writes the
+canonical JSON summary, and also writes a markdown sidecar unless
+`--no-markdown` is passed. These checked-in summaries are intended for stable
+release or lab-machine comparisons; PR gating should still prefer `compare-ref`
+when a suitable ROCm runner is available.

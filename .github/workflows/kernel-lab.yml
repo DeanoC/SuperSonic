@@ -1,0 +1,96 @@
+name: kernel-lab
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/kernel-lab.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "crates/gpu-hal/**"
+      - "crates/kernel-ffi/**"
+      - "crates/kernel-lab/**"
+      - "kernels/**"
+  workflow_dispatch:
+    inputs:
+      tasks:
+        description: "kernel-lab task selector"
+        required: true
+        default: "qwen36.router_permute"
+      warmup:
+        description: "warmup iterations"
+        required: true
+        default: "2"
+      iters:
+        description: "timed iterations"
+        required: true
+        default: "5"
+      max_regression:
+        description: "allowed median latency regression"
+        required: true
+        default: "0.10"
+      min_speedup:
+        description: "minimum geomean speedup"
+        required: true
+        default: "0.0"
+
+concurrency:
+  group: kernel-lab-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compare-ref:
+    name: compare-ref (${{ github.event.inputs.tasks || 'qwen36.router_permute' }})
+    runs-on: [self-hosted, linux, rocm]
+    timeout-minutes: 45
+    env:
+      KERNEL_LAB_TASKS: ${{ github.event.inputs.tasks || 'qwen36.router_permute' }}
+      KERNEL_LAB_WARMUP: ${{ github.event.inputs.warmup || '2' }}
+      KERNEL_LAB_ITERS: ${{ github.event.inputs.iters || '5' }}
+      KERNEL_LAB_MAX_REGRESSION: ${{ github.event.inputs.max_regression || '0.10' }}
+      KERNEL_LAB_MIN_SPEEDUP: ${{ github.event.inputs.min_speedup || '0.0' }}
+      KERNEL_LAB_RUN_ROOT: target/kernel-lab-runs
+      KERNEL_LAB_WORKTREE_ROOT: target/kernel-lab-worktrees
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Show GPU state
+        run: rocm-smi --showuse --showmemuse --showtemp
+
+      - name: Build kernel-lab
+        run: cargo build --release -p supersonic-kernel-lab --bin kernel-lab
+
+      - name: Unit tests
+        run: |
+          cargo test -p supersonic-kernel-lab --lib
+          cargo test -p supersonic-kernel-lab --bin kernel-lab
+
+      - name: Compare candidate against base ref
+        run: |
+          BASE_REF="${{ github.event.pull_request.base.sha || 'origin/main' }}"
+          ./target/release/kernel-lab compare-ref \
+            --baseline-ref "$BASE_REF" \
+            --candidate-ref worktree \
+            --tasks "$KERNEL_LAB_TASKS" \
+            --backend hip \
+            --device 0 \
+            --warmup "$KERNEL_LAB_WARMUP" \
+            --iters "$KERNEL_LAB_ITERS" \
+            --run-root "$KERNEL_LAB_RUN_ROOT" \
+            --worktree-root "$KERNEL_LAB_WORKTREE_ROOT" \
+            --max-regression "$KERNEL_LAB_MAX_REGRESSION" \
+            --min-speedup "$KERNEL_LAB_MIN_SPEEDUP" \
+            --markdown-out "$KERNEL_LAB_RUN_ROOT/diff.md" \
+            --github-summary
+
+      - name: Upload kernel-lab artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-lab-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            target/kernel-lab-runs/**/*.json
+            target/kernel-lab-runs/**/*.md
+            target/kernel-lab-runs/history.jsonl
+          if-no-files-found: ignore
