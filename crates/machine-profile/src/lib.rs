@@ -3,6 +3,7 @@
 pub mod catalog;
 pub mod cpu;
 pub mod fingerprint;
+pub mod gpu;
 pub mod schema;
 pub mod store;
 
