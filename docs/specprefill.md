@@ -150,11 +150,14 @@ uses dense INT4 next-token logits as reference:
 
 The runtime default for CUDA Qwen3.6 cross-family mode is therefore
 `keep_ratio=0.75`; pass `--specprefill-keep-ratio 0.50` explicitly when
-you want the faster balanced lane.
+you want the faster balanced lane. `bench-perf` also accepts explicit sm86
+Qwen3.6 exploratory lanes such as `int4-spec070`; see the May-06 sweep below
+for why `0.70` was measured but not promoted.
 
 ## Reference docs
 
 - Feasibility memo: [research/2026-05-03-specprefill-feasibility.md](research/2026-05-03-specprefill-feasibility.md).
 - Phase A measurements (4B target): [research/2026-05-03-specprefill-phase-a-results.md](research/2026-05-03-specprefill-phase-a-results.md).
 - Phase A2 measurements (9B target): [research/2026-05-03-specprefill-phase-a2-cross-target.md](research/2026-05-03-specprefill-phase-a2-cross-target.md).
+- CUDA Qwen3.6 keep-ratio sweep: [research/2026-05-06-qwen36-specprefill-keep-ratio-sweep.md](research/2026-05-06-qwen36-specprefill-keep-ratio-sweep.md).
 - Original paper: [papers/SpecPrefill_arXiv_2502.02789.pdf](papers/SpecPrefill_arXiv_2502.02789.pdf).
