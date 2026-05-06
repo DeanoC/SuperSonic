@@ -270,6 +270,24 @@ extern "C" int mp_pcie_d2h(int device, MpTransferSample *out, int max_samples)
     return n;
 }
 
+extern "C" int mp_query_device_info(int device,
+                                    char *arch_name_out, uint32_t arch_name_len,
+                                    uint64_t *total_vram_bytes_out,
+                                    uint32_t *warp_size_out,
+                                    uint32_t *clock_rate_khz_out)
+{
+    hipSetDevice(device);
+    hipDeviceProp_t props;
+    int status = hipGetDeviceProperties(&props, device);
+    if (status != 0) return status;
+    strncpy(arch_name_out, props.gcnArchName, arch_name_len - 1);
+    arch_name_out[arch_name_len - 1] = '\0';
+    *total_vram_bytes_out = (uint64_t)props.totalGlobalMem;
+    *warp_size_out = (uint32_t)props.warpSize;
+    *clock_rate_khz_out = (uint32_t)props.clockRate;
+    return 0;
+}
+
 extern "C" double mp_pcie_duplex(int device, uint64_t bytes)
 {
     hipSetDevice(device);
