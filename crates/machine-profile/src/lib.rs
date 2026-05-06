@@ -3,6 +3,7 @@
 pub mod catalog;
 pub mod fingerprint;
 pub mod schema;
+pub mod store;
 
 pub use schema::Profile;
 
