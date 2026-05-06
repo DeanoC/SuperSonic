@@ -5,8 +5,8 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, ExitStatus};
 use supersonic_kernel_lab::run::{
-    diff_exit_code, diff_runs_with_min_speedup, load_summary, render_diff_markdown,
-    render_markdown, resolve_tasks, run_tasks, KernelLabConfig,
+    diff_exit_code, diff_runs_with_policy, load_summary, render_diff_markdown, render_markdown,
+    resolve_tasks, run_tasks, KernelLabConfig,
 };
 use supersonic_kernel_lab::{
     all_tag_metadata, all_task_metadata, describe_task_selector, TaskMetadata,
@@ -58,6 +58,8 @@ enum Command {
         max_regression: f64,
         #[arg(long, default_value_t = 1.02)]
         min_speedup: f64,
+        #[arg(long, default_value_t = 0.0)]
+        latency_floor_us: f64,
         #[arg(long)]
         markdown_out: Option<PathBuf>,
         #[arg(long)]
@@ -96,6 +98,8 @@ enum Command {
         max_regression: f64,
         #[arg(long, default_value_t = 1.02)]
         min_speedup: f64,
+        #[arg(long, default_value_t = 0.0)]
+        latency_floor_us: f64,
         #[arg(long)]
         markdown_out: Option<PathBuf>,
         #[arg(long)]
@@ -168,13 +172,19 @@ fn main() -> Result<()> {
             candidate,
             max_regression,
             min_speedup,
+            latency_floor_us,
             markdown_out,
             github_summary,
         } => {
             let baseline = load_summary(&baseline)?;
             let candidate = load_summary(&candidate)?;
-            let diff =
-                diff_runs_with_min_speedup(&baseline, &candidate, max_regression, min_speedup);
+            let diff = diff_runs_with_policy(
+                &baseline,
+                &candidate,
+                max_regression,
+                min_speedup,
+                latency_floor_us,
+            );
             println!("{}", serde_json::to_string_pretty(&diff)?);
             write_diff_markdown(&diff, min_speedup, markdown_out, github_summary)?;
             let code = diff_exit_code(&diff, min_speedup);
@@ -204,6 +214,7 @@ fn main() -> Result<()> {
             worktree_root,
             max_regression,
             min_speedup,
+            latency_floor_us,
             markdown_out,
             github_summary,
             candidate_summary_copy,
@@ -233,11 +244,12 @@ fn main() -> Result<()> {
             if let Some(path) = candidate_summary_copy {
                 copy_summary_json(&candidate, &path)?;
             }
-            let diff = diff_runs_with_min_speedup(
+            let diff = diff_runs_with_policy(
                 &baseline_summary,
                 &candidate_summary,
                 max_regression,
                 min_speedup,
+                latency_floor_us,
             );
             println!("{}", serde_json::to_string_pretty(&diff)?);
             write_diff_markdown(&diff, min_speedup, markdown_out, github_summary)?;

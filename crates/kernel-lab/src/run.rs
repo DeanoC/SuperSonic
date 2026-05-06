@@ -85,6 +85,10 @@ pub struct DiffTask {
     pub speedup: f64,
     pub regression: bool,
     #[serde(default)]
+    pub latency_floor_us: f64,
+    #[serde(default)]
+    pub latency_gate_active: bool,
+    #[serde(default)]
     pub status: String,
     #[serde(default)]
     pub reason: String,
@@ -279,6 +283,16 @@ pub fn diff_runs_with_min_speedup(
     max_regression: f64,
     min_speedup: f64,
 ) -> DiffReport {
+    diff_runs_with_policy(baseline, candidate, max_regression, min_speedup, 0.0)
+}
+
+pub fn diff_runs_with_policy(
+    baseline: &RunSummary,
+    candidate: &RunSummary,
+    max_regression: f64,
+    min_speedup: f64,
+    latency_floor_us: f64,
+) -> DiffReport {
     let mut candidate_by_id = BTreeMap::new();
     for task in &candidate.tasks {
         candidate_by_id.insert(task.task_id.as_str(), task);
@@ -295,6 +309,8 @@ pub fn diff_runs_with_min_speedup(
                 candidate_median_us: 0.0,
                 speedup: 0.0,
                 regression: true,
+                latency_floor_us,
+                latency_gate_active: true,
                 status: "correctness_failure".into(),
                 reason: "candidate task is missing".into(),
             });
@@ -308,7 +324,9 @@ pub fn diff_runs_with_min_speedup(
             0.0
         };
         let correct = base_task.correct && cand_task.correct;
-        let latency_regression = cand_med > base_med * (1.0 + max_regression);
+        let raw_latency_regression = cand_med > base_med * (1.0 + max_regression);
+        let latency_gate_active = base_med >= latency_floor_us;
+        let latency_regression = raw_latency_regression && latency_gate_active;
         let regression = !correct || latency_regression;
         let (status, reason) = if !correct {
             (
@@ -324,6 +342,11 @@ pub fn diff_runs_with_min_speedup(
                 "latency_regression",
                 "candidate latency exceeds max_regression",
             )
+        } else if raw_latency_regression {
+            (
+                "latency_floor",
+                "candidate latency exceeds max_regression but baseline latency is below latency_floor_us",
+            )
         } else {
             (
                 "ok",
@@ -337,6 +360,8 @@ pub fn diff_runs_with_min_speedup(
             candidate_median_us: cand_med,
             speedup,
             regression,
+            latency_floor_us,
+            latency_gate_active,
             status: status.into(),
             reason: reason.into(),
         });
@@ -694,6 +719,32 @@ mod tests {
         let diff = diff_runs(&base, &cand, 0.03);
         assert!(!diff.correct);
         assert!(diff.tasks[0].regression);
+        assert!(diff.tasks[0].latency_gate_active);
+        assert_eq!(diff.tasks[0].status, "latency_regression");
+    }
+
+    #[test]
+    fn diff_latency_floor_ignores_tiny_task_timing_noise() {
+        let base = summary(vec![task("a", true, 37.0)]);
+        let cand = summary(vec![task("a", true, 43.0)]);
+        let diff = diff_runs_with_policy(&base, &cand, 0.10, 0.0, 75.0);
+        assert!(diff.correct);
+        assert!(!diff.tasks[0].regression);
+        assert!(!diff.tasks[0].latency_gate_active);
+        assert_eq!(diff.tasks[0].latency_floor_us, 75.0);
+        assert_eq!(diff.tasks[0].status, "latency_floor");
+        assert_eq!(diff_exit_code(&diff, 0.0), 0);
+    }
+
+    #[test]
+    fn diff_latency_floor_still_gates_larger_tasks() {
+        let base = summary(vec![task("a", true, 100.0)]);
+        let cand = summary(vec![task("a", true, 112.0)]);
+        let diff = diff_runs_with_policy(&base, &cand, 0.10, 0.0, 75.0);
+        assert!(!diff.correct);
+        assert!(diff.tasks[0].regression);
+        assert!(diff.tasks[0].latency_gate_active);
+        assert_eq!(diff.tasks[0].status, "latency_regression");
     }
 
     #[test]
