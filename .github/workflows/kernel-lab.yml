@@ -40,6 +40,7 @@ concurrency:
 jobs:
   compare-ref:
     name: compare-ref (${{ github.event.inputs.tasks || 'qwen36.router_permute' }})
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, linux, rocm]
     timeout-minutes: 45
     env:

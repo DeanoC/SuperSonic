@@ -84,6 +84,11 @@ cheap `qwen36.router_permute` task with relaxed smoke thresholds; use
 `workflow_dispatch` to run broader selectors such as `all`, `tag:prefill`, or
 `everything` with custom iteration counts.
 
+Because the job executes candidate code on a persistent self-hosted GPU host,
+the PR trigger is restricted to same-repository branches. Fork PRs must be run
+through a trusted manual `workflow_dispatch` after review, or on disposable
+isolated runners.
+
 The workflow compares the checked-out candidate worktree against the PR base
 commit using `compare-ref`, writes markdown to the GitHub step summary, and
 uploads the run JSON/markdown artifacts.
