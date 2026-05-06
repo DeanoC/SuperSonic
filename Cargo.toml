@@ -6,6 +6,7 @@ members = [
     "crates/gpu-hal",
     "crates/kernel-ffi",
     "crates/kernel-lab",
+    "crates/machine-profile",
     "crates/model-store",
     "crates/phi4",
     "crates/qwen35",
