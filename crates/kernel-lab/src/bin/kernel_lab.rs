@@ -1,8 +1,9 @@
 use anyhow::{anyhow, Result};
 use clap::{Parser, Subcommand};
 use gpu_hal::Backend;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::process::Command as ProcessCommand;
+use std::process::{Command as ProcessCommand, ExitStatus};
 use supersonic_kernel_lab::run::{
     diff_exit_code, diff_runs, load_summary, render_diff_markdown, render_markdown, resolve_tasks,
     run_tasks, KernelLabConfig,
@@ -129,7 +130,7 @@ fn main() -> Result<()> {
                     summary.required_task_count
                 );
             }
-            if summary.passed_required_tasks != summary.required_task_count {
+            if run_has_failed_tasks(&summary) {
                 std::process::exit(1);
             }
         }
@@ -240,6 +241,7 @@ fn run_ref(
     worktree_root: &PathBuf,
 ) -> Result<PathBuf> {
     if git_ref == "worktree" {
+        let before = existing_run_dirs(run_root);
         let status = ProcessCommand::new("cargo")
             .args([
                 "run",
@@ -264,10 +266,7 @@ fn run_ref(
                 run_root.to_string_lossy().as_ref(),
             ])
             .status()?;
-        if !status.success() {
-            return Err(anyhow!("candidate worktree run failed"));
-        }
-        return newest_run_dir(run_root);
+        return child_run_dir_after(status, run_root, &before, "candidate worktree");
     }
 
     std::fs::create_dir_all(worktree_root)?;
@@ -296,6 +295,7 @@ fn run_ref(
     )?;
     overlay_harness_crate(&dir)?;
     let absolute_run_root = std::env::current_dir()?.join(run_root);
+    let before = existing_run_dirs(&absolute_run_root);
     let status = ProcessCommand::new("cargo")
         .current_dir(&dir)
         .args([
@@ -321,10 +321,16 @@ fn run_ref(
             absolute_run_root.to_string_lossy().as_ref(),
         ])
         .status()?;
-    if !status.success() {
-        return Err(anyhow!("baseline ref {git_ref} run failed"));
-    }
-    newest_run_dir(&absolute_run_root)
+    child_run_dir_after(
+        status,
+        &absolute_run_root,
+        &before,
+        &format!("ref {git_ref}"),
+    )
+}
+
+fn run_has_failed_tasks(summary: &supersonic_kernel_lab::run::RunSummary) -> bool {
+    summary.passed_tasks != summary.task_count
 }
 
 fn overlay_harness_crate(worktree: &Path) -> Result<()> {
@@ -370,10 +376,37 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
-fn newest_run_dir(run_root: &PathBuf) -> Result<PathBuf> {
+fn child_run_dir_after(
+    status: ExitStatus,
+    run_root: &PathBuf,
+    before: &BTreeSet<PathBuf>,
+    label: &str,
+) -> Result<PathBuf> {
+    match newest_run_dir_excluding(run_root, before) {
+        Ok(path) => Ok(path),
+        Err(err) if status.success() => Err(err),
+        Err(_) => Err(anyhow!("{label} run failed before writing summary.json")),
+    }
+}
+
+fn existing_run_dirs(run_root: &PathBuf) -> BTreeSet<PathBuf> {
+    std::fs::read_dir(run_root)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.join("summary.json").exists())
+        .collect()
+}
+
+fn newest_run_dir_excluding(run_root: &PathBuf, before: &BTreeSet<PathBuf>) -> Result<PathBuf> {
     let mut entries: Vec<_> = std::fs::read_dir(run_root)?
         .filter_map(Result::ok)
-        .filter(|entry| entry.path().join("summary.json").exists())
+        .filter(|entry| {
+            let path = entry.path();
+            path.join("summary.json").exists() && !before.contains(&path)
+        })
         .filter_map(|entry| {
             let modified = entry.metadata().ok()?.modified().ok()?;
             Some((modified, entry.path()))
@@ -383,7 +416,7 @@ fn newest_run_dir(run_root: &PathBuf) -> Result<PathBuf> {
     entries
         .pop()
         .map(|(_, path)| path)
-        .ok_or_else(|| anyhow!("no kernel-lab run found under {}", run_root.display()))
+        .ok_or_else(|| anyhow!("no new kernel-lab run found under {}", run_root.display()))
 }
 
 fn run_checked(cmd: &str, args: &[&str]) -> Result<()> {
@@ -410,6 +443,7 @@ fn sanitize_ref(git_ref: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use supersonic_kernel_lab::run::{MetaJson, RunSummary, SCHEMA_VERSION};
 
     #[test]
     fn sanitize_ref_keeps_path_safe_characters_only() {
@@ -455,5 +489,65 @@ mod tests {
         overlay_harness_crate_from(&source, &worktree).unwrap();
         let cargo_toml = std::fs::read_to_string(worktree.join("Cargo.toml")).unwrap();
         assert_eq!(cargo_toml.matches("\"crates/kernel-lab\"").count(), 1);
+    }
+
+    #[test]
+    fn run_has_failed_tasks_checks_all_selected_tasks() {
+        let mut summary = test_summary(0, 0, 0, 0);
+        assert!(!run_has_failed_tasks(&summary));
+
+        summary = test_summary(1, 0, 0, 0);
+        assert!(run_has_failed_tasks(&summary));
+
+        summary = test_summary(2, 1, 1, 1);
+        assert!(run_has_failed_tasks(&summary));
+
+        summary = test_summary(2, 2, 1, 1);
+        assert!(!run_has_failed_tasks(&summary));
+    }
+
+    #[test]
+    fn newest_run_dir_excluding_returns_only_new_summaries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run_root = tmp.path().to_path_buf();
+        let old = run_root.join("old");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("summary.json"), "{}").unwrap();
+
+        let before = existing_run_dirs(&run_root);
+        assert!(newest_run_dir_excluding(&run_root, &before).is_err());
+
+        let new = run_root.join("new");
+        std::fs::create_dir_all(&new).unwrap();
+        std::fs::write(new.join("summary.json"), "{}").unwrap();
+
+        assert_eq!(newest_run_dir_excluding(&run_root, &before).unwrap(), new);
+    }
+
+    fn test_summary(
+        task_count: usize,
+        passed_tasks: usize,
+        required_task_count: usize,
+        passed_required_tasks: usize,
+    ) -> RunSummary {
+        RunSummary {
+            schema_version: SCHEMA_VERSION,
+            meta: MetaJson {
+                schema_version: SCHEMA_VERSION,
+                run_id: "test".into(),
+                timestamp_utc: "2026-05-06T00:00:00Z".into(),
+                git_sha: "test".into(),
+                git_dirty: false,
+                backend: "hip".into(),
+                device: 0,
+                arch: "gfx1100".into(),
+                rocm_smi: String::new(),
+            },
+            task_count,
+            passed_tasks,
+            required_task_count,
+            passed_required_tasks,
+            tasks: Vec::new(),
+        }
     }
 }
