@@ -34,6 +34,20 @@ extern "C" __global__ void mp_wmma_peak_bf16_kernel(uint64_t iters, float *sink)
     if (threadIdx.x == 0 && c[0] < -1e30f) sink[blockIdx.x] = c[0];
 }
 
+typedef int8_t  mp_i8x16 __attribute__((ext_vector_type(16)));
+typedef int32_t mp_i32x8 __attribute__((ext_vector_type(8)));
+
+extern "C" __global__ void mp_wmma_peak_i8_kernel(uint64_t iters, int *sink)
+{
+    mp_i8x16 a = {};
+    mp_i8x16 b = {};
+    mp_i32x8 c = {};
+    for (uint64_t i = 0; i < iters; ++i) {
+        c = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a, true, b, c, false);
+    }
+    if (threadIdx.x == 0 && c[0] < -2000000000) sink[blockIdx.x] = c[0];
+}
+
 #else
 
 extern "C" __global__ void mp_wmma_peak_f16_kernel(uint64_t iters, float *sink)
@@ -44,6 +58,10 @@ extern "C" __global__ void mp_wmma_peak_bf16_kernel(uint64_t iters, float *sink)
 {
     // TODO: bf16 wmma not supported on this arch
     if (threadIdx.x == 0) sink[blockIdx.x] = 0.0f;
+}
+extern "C" __global__ void mp_wmma_peak_i8_kernel(uint64_t iters, int *sink)
+{
+    if (threadIdx.x == 0) sink[blockIdx.x] = 0;
 }
 
 #endif

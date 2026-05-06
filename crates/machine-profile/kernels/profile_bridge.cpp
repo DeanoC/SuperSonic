@@ -116,6 +116,7 @@ extern "C" double mp_hbm_bandwidth_copy(int device, uint64_t bytes)
 
 extern "C" __global__ void mp_wmma_peak_f16_kernel(uint64_t iters, float *sink);
 extern "C" __global__ void mp_wmma_peak_bf16_kernel(uint64_t iters, float *sink);
+extern "C" __global__ void mp_wmma_peak_i8_kernel(uint64_t iters, int *sink);
 
 extern "C" double mp_wmma_peak_f16(int device, uint32_t cu_count, uint64_t iters)
 {
@@ -178,4 +179,27 @@ extern "C" double mp_wmma_peak_bf16(int device, uint32_t cu_count, uint64_t iter
         * (double)blocks
         * (double)reps;
     return total_flops / secs / 1e12; // TFLOPS
+}
+
+extern "C" double mp_wmma_peak_i8(int device, uint32_t cu_count, uint64_t iters)
+{
+    hipSetDevice(device);
+    int *sink = nullptr;
+    hipMalloc(&sink, sizeof(int) * cu_count);
+    hipMemset(sink, 0, sizeof(int) * cu_count);
+    int threads = 32;
+    uint32_t blocks = cu_count * 2;
+
+    hipLaunchKernelGGL(mp_wmma_peak_i8_kernel, dim3(blocks), dim3(threads), 0, 0, iters / 4, sink);
+    hipDeviceSynchronize();
+    auto t0 = std::chrono::high_resolution_clock::now();
+    int reps = 5;
+    for (int i = 0; i < reps; ++i)
+        hipLaunchKernelGGL(mp_wmma_peak_i8_kernel, dim3(blocks), dim3(threads), 0, 0, iters, sink);
+    hipDeviceSynchronize();
+    auto t1 = std::chrono::high_resolution_clock::now();
+    hipFree(sink);
+    double secs = std::chrono::duration<double>(t1 - t0).count();
+    double total_ops = 256.0 * (double)iters * (double)threads * (double)blocks * (double)reps;
+    return total_ops / secs / 1e12;
 }
