@@ -87,6 +87,8 @@ enum Command {
         markdown_out: Option<PathBuf>,
         #[arg(long)]
         github_summary: bool,
+        #[arg(long)]
+        candidate_summary_copy: Option<PathBuf>,
     },
     Render {
         #[arg(long)]
@@ -186,6 +188,7 @@ fn main() -> Result<()> {
             min_speedup,
             markdown_out,
             github_summary,
+            candidate_summary_copy,
         } => {
             let baseline = run_ref(
                 &baseline_ref,
@@ -209,6 +212,9 @@ fn main() -> Result<()> {
             )?;
             let baseline_summary = load_summary(&baseline)?;
             let candidate_summary = load_summary(&candidate)?;
+            if let Some(path) = candidate_summary_copy {
+                copy_summary_json(&candidate, &path)?;
+            }
             let diff = diff_runs(&baseline_summary, &candidate_summary, max_regression);
             println!("{}", serde_json::to_string_pretty(&diff)?);
             write_diff_markdown(&diff, min_speedup, markdown_out, github_summary)?;
@@ -223,6 +229,16 @@ fn main() -> Result<()> {
             println!("[kernel-lab] wrote {}", out.display());
         }
     }
+    Ok(())
+}
+
+fn copy_summary_json(run_dir: &Path, dst: &Path) -> Result<()> {
+    let src = run_dir.join("summary.json");
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::copy(&src, dst)?;
+    println!("[kernel-lab] copied candidate summary to {}", dst.display());
     Ok(())
 }
 
@@ -582,6 +598,19 @@ mod tests {
         );
         assert!(path.exists());
         assert!(path.with_file_name("required-gfx-smoke.md").exists());
+    }
+
+    #[test]
+    fn copy_summary_json_creates_parent_and_copies_summary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let run_dir = tmp.path().join("run");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        std::fs::write(run_dir.join("summary.json"), "{\"ok\":true}\n").unwrap();
+
+        let out = tmp.path().join("copies/candidate.summary.json");
+        copy_summary_json(&run_dir, &out).unwrap();
+
+        assert_eq!(std::fs::read_to_string(out).unwrap(), "{\"ok\":true}\n");
     }
 
     fn test_summary(

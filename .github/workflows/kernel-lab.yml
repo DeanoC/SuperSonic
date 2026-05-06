@@ -12,18 +12,28 @@ on:
       - "kernels/**"
   workflow_dispatch:
     inputs:
+      preset:
+        description: "kernel-lab preset"
+        required: true
+        type: choice
+        default: "pr"
+        options:
+          - pr
+          - required
+          - everything
+          - stress
       tasks:
-        description: "kernel-lab task selector"
-        required: true
-        default: "qwen36.router_permute"
+        description: "optional task selector override"
+        required: false
+        default: ""
       warmup:
-        description: "warmup iterations"
-        required: true
-        default: "2"
+        description: "optional warmup iteration override"
+        required: false
+        default: ""
       iters:
-        description: "timed iterations"
-        required: true
-        default: "5"
+        description: "optional timed iteration override"
+        required: false
+        default: ""
       max_regression:
         description: "allowed median latency regression"
         required: true
@@ -32,6 +42,15 @@ on:
         description: "minimum geomean speedup"
         required: true
         default: "0.0"
+      checked_baseline:
+        description: "compare candidate against checked-in gfx1100 baseline"
+        required: true
+        type: choice
+        default: "auto"
+        options:
+          - auto
+          - true
+          - false
 
 concurrency:
   group: kernel-lab-${{ github.workflow }}-${{ github.ref }}
@@ -39,18 +58,22 @@ concurrency:
 
 jobs:
   compare-ref:
-    name: compare-ref (${{ github.event.inputs.tasks || 'qwen36.router_permute' }})
+    name: compare-ref (${{ github.event.inputs.preset || 'pr' }})
     if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, linux, rocm]
+    runs-on: [self-hosted, linux, rocm, gfx1100]
     timeout-minutes: 45
     env:
-      KERNEL_LAB_TASKS: ${{ github.event.inputs.tasks || 'qwen36.router_permute' }}
-      KERNEL_LAB_WARMUP: ${{ github.event.inputs.warmup || '2' }}
-      KERNEL_LAB_ITERS: ${{ github.event.inputs.iters || '5' }}
+      KERNEL_LAB_PRESET: ${{ github.event.inputs.preset || 'pr' }}
+      KERNEL_LAB_TASKS_INPUT: ${{ github.event.inputs.tasks || '' }}
+      KERNEL_LAB_WARMUP_INPUT: ${{ github.event.inputs.warmup || '' }}
+      KERNEL_LAB_ITERS_INPUT: ${{ github.event.inputs.iters || '' }}
       KERNEL_LAB_MAX_REGRESSION: ${{ github.event.inputs.max_regression || '0.10' }}
       KERNEL_LAB_MIN_SPEEDUP: ${{ github.event.inputs.min_speedup || '0.0' }}
+      KERNEL_LAB_CHECKED_BASELINE_INPUT: ${{ github.event.inputs.checked_baseline || 'auto' }}
       KERNEL_LAB_RUN_ROOT: target/kernel-lab-runs
       KERNEL_LAB_WORKTREE_ROOT: target/kernel-lab-worktrees
+      KERNEL_LAB_CANDIDATE_SUMMARY: target/kernel-lab-runs/candidate.summary.json
+      KERNEL_LAB_CHECKED_BASELINE: crates/kernel-lab/baselines/gfx1100/required.summary.json
     steps:
       - uses: actions/checkout@v4
         with:
@@ -58,6 +81,88 @@ jobs:
 
       - name: Show GPU state
         run: rocm-smi --showuse --showmemuse --showtemp
+
+      - name: Resolve preset
+        run: |
+          case "$KERNEL_LAB_PRESET" in
+            pr)
+              tasks="${KERNEL_LAB_TASKS_INPUT:-all}"
+              warmup="${KERNEL_LAB_WARMUP_INPUT:-2}"
+              iters="${KERNEL_LAB_ITERS_INPUT:-5}"
+              checked_baseline_default=1
+              checked_baseline_blocking_default=0
+              ;;
+            required)
+              tasks="${KERNEL_LAB_TASKS_INPUT:-all}"
+              warmup="${KERNEL_LAB_WARMUP_INPUT:-5}"
+              iters="${KERNEL_LAB_ITERS_INPUT:-20}"
+              checked_baseline_default=1
+              checked_baseline_blocking_default=1
+              ;;
+            everything)
+              tasks="${KERNEL_LAB_TASKS_INPUT:-everything}"
+              warmup="${KERNEL_LAB_WARMUP_INPUT:-5}"
+              iters="${KERNEL_LAB_ITERS_INPUT:-20}"
+              checked_baseline_default=1
+              checked_baseline_blocking_default=1
+              ;;
+            stress)
+              tasks="${KERNEL_LAB_TASKS_INPUT:-tag:stress}"
+              warmup="${KERNEL_LAB_WARMUP_INPUT:-5}"
+              iters="${KERNEL_LAB_ITERS_INPUT:-20}"
+              checked_baseline_default=0
+              checked_baseline_blocking_default=0
+              ;;
+            *)
+              echo "unknown kernel-lab preset: $KERNEL_LAB_PRESET" >&2
+              exit 1
+              ;;
+          esac
+
+          checked_baseline="$checked_baseline_default"
+          checked_baseline_blocking="$checked_baseline_blocking_default"
+          case "$KERNEL_LAB_CHECKED_BASELINE_INPUT" in
+            auto)
+              if [ -n "$KERNEL_LAB_TASKS_INPUT" ]; then
+                checked_baseline=0
+                checked_baseline_blocking=0
+              fi
+              ;;
+            true)
+              checked_baseline=1
+              checked_baseline_blocking=1
+              ;;
+            false)
+              checked_baseline=0
+              checked_baseline_blocking=0
+              ;;
+            *)
+              echo "unknown checked_baseline value: $KERNEL_LAB_CHECKED_BASELINE_INPUT" >&2
+              exit 1
+              ;;
+          esac
+
+          {
+            echo "KERNEL_LAB_TASKS=$tasks"
+            echo "KERNEL_LAB_WARMUP=$warmup"
+            echo "KERNEL_LAB_ITERS=$iters"
+            echo "KERNEL_LAB_COMPARE_CHECKED_BASELINE=$checked_baseline"
+            echo "KERNEL_LAB_CHECKED_BASELINE_BLOCKING=$checked_baseline_blocking"
+          } >> "$GITHUB_ENV"
+
+          {
+            echo "### kernel-lab preset"
+            echo ""
+            echo "- preset: \`$KERNEL_LAB_PRESET\`"
+            echo "- tasks: \`$tasks\`"
+            echo "- warmup: \`$warmup\`"
+            echo "- iters: \`$iters\`"
+            echo "- checked baseline: \`$checked_baseline\`"
+            echo "- checked baseline blocking: \`$checked_baseline_blocking\`"
+            if [ -n "$KERNEL_LAB_TASKS_INPUT" ] && [ "$KERNEL_LAB_CHECKED_BASELINE_INPUT" = "auto" ]; then
+              echo "- checked baseline auto disabled because tasks were overridden"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Wait for GPU idle
         run: |
@@ -136,7 +241,38 @@ jobs:
             --max-regression "$KERNEL_LAB_MAX_REGRESSION" \
             --min-speedup "$KERNEL_LAB_MIN_SPEEDUP" \
             --markdown-out "$KERNEL_LAB_RUN_ROOT/diff.md" \
+            --candidate-summary-copy "$KERNEL_LAB_CANDIDATE_SUMMARY" \
             --github-summary
+
+      - name: Compare candidate against checked-in gfx1100 baseline
+        if: env.KERNEL_LAB_COMPARE_CHECKED_BASELINE == '1'
+        run: |
+          if [ ! -f "$KERNEL_LAB_CHECKED_BASELINE" ]; then
+            echo "missing checked-in baseline: $KERNEL_LAB_CHECKED_BASELINE" >&2
+            exit 1
+          fi
+          set +e
+          ./target/release/kernel-lab diff \
+            --baseline "$KERNEL_LAB_CHECKED_BASELINE" \
+            --candidate "$KERNEL_LAB_CANDIDATE_SUMMARY" \
+            --max-regression "$KERNEL_LAB_MAX_REGRESSION" \
+            --min-speedup "$KERNEL_LAB_MIN_SPEEDUP" \
+            --markdown-out "$KERNEL_LAB_RUN_ROOT/checked-baseline-diff.md" \
+            --github-summary
+          status=$?
+          set -e
+          if [ "$status" -ne 0 ]; then
+            {
+              echo "### checked baseline status"
+              echo ""
+              echo "- result: \`failed\`"
+              echo "- exit code: \`$status\`"
+              echo "- blocking: \`$KERNEL_LAB_CHECKED_BASELINE_BLOCKING\`"
+            } >> "$GITHUB_STEP_SUMMARY"
+            if [ "$KERNEL_LAB_CHECKED_BASELINE_BLOCKING" = "1" ]; then
+              exit "$status"
+            fi
+          fi
 
       - name: Upload kernel-lab artifacts
         if: always()
