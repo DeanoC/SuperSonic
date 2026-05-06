@@ -73,15 +73,15 @@ jobs:
             rocm-smi --showuse --showmemuse --showtemp | tee /tmp/kernel-lab-rocm-smi.txt
             gpu_use="$(
               awk -F': ' '/GPU use \(%\)/ {
-                gsub(/[^0-9.]/, "", $2);
-                print int($2);
+                gsub(/[^0-9.]/, "", $NF);
+                print int($NF);
                 exit;
               }' /tmp/kernel-lab-rocm-smi.txt
             )"
             vram_use="$(
               awk -F': ' '/GPU Memory Allocated \(VRAM%\)/ {
-                gsub(/[^0-9.]/, "", $2);
-                print int($2);
+                gsub(/[^0-9.]/, "", $NF);
+                print int($NF);
                 exit;
               }' /tmp/kernel-lab-rocm-smi.txt
             )"
