@@ -3965,6 +3965,65 @@ extern "C" int supersonic_qwen35_4b_hip_matmul_int4_dequant(
     }
 }
 
+template <typename T>
+int int4_sparse_outlier_add_device(
+    int device_ordinal,
+    int rows,
+    int n,
+    int k,
+    int sub_cols,
+    const void* lhs,
+    const void* outlier_cols,
+    const void* outlier_delta,
+    void* out
+) {
+    ScopedHipDevice scoped(device_ordinal);
+    constexpr int block = 256;
+    const size_t total = static_cast<size_t>(rows) * static_cast<size_t>(n);
+    const unsigned int grid = static_cast<unsigned int>((total + block - 1) / block);
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(supersonic_qwen35_int4_sparse_outlier_add_kernel<T>),
+        dim3(grid),
+        dim3(block),
+        0,
+        0,
+        rows,
+        n,
+        k,
+        sub_cols,
+        static_cast<const T*>(lhs),
+        static_cast<const uint32_t*>(outlier_cols),
+        static_cast<const T*>(outlier_delta),
+        static_cast<T*>(out));
+    hipError_t launch_err = hipGetLastError();
+    hipError_t sync_err = hipDeviceSynchronize();
+    if (launch_err != hipSuccess) return 294;
+    if (sync_err != hipSuccess) return 295;
+    return 0;
+}
+
+extern "C" int supersonic_qwen35_4b_hip_int4_sparse_outlier_add(
+    int dtype,
+    size_t device_ordinal,
+    int rows,
+    int n,
+    int k,
+    int sub_cols,
+    const void* lhs,
+    const void* outlier_cols,
+    const void* outlier_delta,
+    void* out
+) {
+    switch (dtype) {
+    case 2:
+        return int4_sparse_outlier_add_device<hip_bfloat16>(
+            static_cast<int>(device_ordinal), rows, n, k, sub_cols,
+            lhs, outlier_cols, outlier_delta, out);
+    default:
+        return 296;
+    }
+}
+
 extern "C" int supersonic_qwen35_4b_hip_cast(
     int input_dtype,
     int output_dtype,

@@ -659,6 +659,21 @@ mod tests {
     }
 
     #[test]
+    fn resolve_tasks_accepts_awq_tag() {
+        let tasks = resolve_tasks("tag:awq").unwrap();
+        let ids: Vec<_> = tasks.iter().map(|task| task.id).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "qwen35.int4_matvec",
+                "qwen35.int4_awq_dense_matvec",
+                "qwen35.int4_awq_sparse_outlier_matvec"
+            ]
+        );
+        assert!(tasks.iter().all(|task| !task.required));
+    }
+
+    #[test]
     fn resolve_tasks_rejects_unknown_tag() {
         let err = resolve_tasks("tag:not-a-real-tag").unwrap_err();
         assert!(err.to_string().contains("unknown task tag"));
