@@ -290,6 +290,9 @@ pub fn bake_qwen35(
             | LayoutTag::Fp8Native
             | LayoutTag::Int8Quantized
             | LayoutTag::Int4Quantized
+            | LayoutTag::HiggsGridQuantized
+            | LayoutTag::QuipE8Quantized
+            | LayoutTag::QtipTrellisQuantized
             | LayoutTag::GgmlQ4K
             | LayoutTag::GgmlQ5K
             | LayoutTag::GgmlQ6K => {
@@ -331,6 +334,7 @@ pub fn bake_qwen35(
         quant_profile: None,
         source_format: None,
         source_quant: None,
+        quant_method: None,
         tensors: entries,
     };
     let manifest_json = serde_json::to_string_pretty(&manifest)?;
@@ -495,6 +499,7 @@ pub fn bake_phi4(
         quant_profile: None,
         source_format: None,
         source_quant: None,
+        quant_method: None,
         tensors: entries,
     };
     let manifest_json = serde_json::to_string_pretty(&manifest)?;

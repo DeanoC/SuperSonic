@@ -1,0 +1,286 @@
+name: kernel-lab
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/kernel-lab.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "crates/gpu-hal/**"
+      - "crates/kernel-ffi/**"
+      - "crates/kernel-lab/**"
+      - "kernels/**"
+  workflow_dispatch:
+    inputs:
+      preset:
+        description: "kernel-lab preset"
+        required: true
+        type: choice
+        default: "pr"
+        options:
+          - pr
+          - required
+          - everything
+          - stress
+      tasks:
+        description: "optional task selector override"
+        required: false
+        default: ""
+      warmup:
+        description: "optional warmup iteration override"
+        required: false
+        default: ""
+      iters:
+        description: "optional timed iteration override"
+        required: false
+        default: ""
+      max_regression:
+        description: "allowed median latency regression"
+        required: true
+        default: "0.10"
+      min_speedup:
+        description: "minimum geomean speedup"
+        required: true
+        default: "0.0"
+      checked_baseline:
+        description: "compare candidate against checked-in gfx1100 baseline"
+        required: true
+        type: choice
+        default: "auto"
+        options:
+          - auto
+          - true
+          - false
+
+concurrency:
+  group: kernel-lab-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compare-ref:
+    name: compare-ref (${{ github.event.inputs.preset || 'pr' }})
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, linux, rocm, gfx1100]
+    timeout-minutes: 45
+    env:
+      KERNEL_LAB_PRESET: ${{ github.event.inputs.preset || 'pr' }}
+      KERNEL_LAB_TASKS_INPUT: ${{ github.event.inputs.tasks || '' }}
+      KERNEL_LAB_WARMUP_INPUT: ${{ github.event.inputs.warmup || '' }}
+      KERNEL_LAB_ITERS_INPUT: ${{ github.event.inputs.iters || '' }}
+      KERNEL_LAB_MAX_REGRESSION: ${{ github.event.inputs.max_regression || '0.10' }}
+      KERNEL_LAB_MIN_SPEEDUP: ${{ github.event.inputs.min_speedup || '0.0' }}
+      KERNEL_LAB_CHECKED_BASELINE_INPUT: ${{ github.event.inputs.checked_baseline || 'auto' }}
+      KERNEL_LAB_RUN_ROOT: target/kernel-lab-runs
+      KERNEL_LAB_WORKTREE_ROOT: target/kernel-lab-worktrees
+      KERNEL_LAB_CANDIDATE_SUMMARY: target/kernel-lab-runs/candidate.summary.json
+      KERNEL_LAB_CHECKED_BASELINE: crates/kernel-lab/baselines/gfx1100/required.summary.json
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Show GPU state
+        run: rocm-smi --showuse --showmemuse --showtemp
+
+      - name: Resolve preset
+        run: |
+          case "$KERNEL_LAB_PRESET" in
+            pr)
+              tasks="${KERNEL_LAB_TASKS_INPUT:-all}"
+              warmup="${KERNEL_LAB_WARMUP_INPUT:-2}"
+              iters="${KERNEL_LAB_ITERS_INPUT:-5}"
+              checked_baseline_default=1
+              checked_baseline_blocking_default=0
+              ;;
+            required)
+              tasks="${KERNEL_LAB_TASKS_INPUT:-all}"
+              warmup="${KERNEL_LAB_WARMUP_INPUT:-5}"
+              iters="${KERNEL_LAB_ITERS_INPUT:-20}"
+              checked_baseline_default=1
+              checked_baseline_blocking_default=1
+              ;;
+            everything)
+              tasks="${KERNEL_LAB_TASKS_INPUT:-everything}"
+              warmup="${KERNEL_LAB_WARMUP_INPUT:-5}"
+              iters="${KERNEL_LAB_ITERS_INPUT:-20}"
+              checked_baseline_default=1
+              checked_baseline_blocking_default=1
+              ;;
+            stress)
+              tasks="${KERNEL_LAB_TASKS_INPUT:-tag:stress}"
+              warmup="${KERNEL_LAB_WARMUP_INPUT:-5}"
+              iters="${KERNEL_LAB_ITERS_INPUT:-20}"
+              checked_baseline_default=0
+              checked_baseline_blocking_default=0
+              ;;
+            *)
+              echo "unknown kernel-lab preset: $KERNEL_LAB_PRESET" >&2
+              exit 1
+              ;;
+          esac
+
+          checked_baseline="$checked_baseline_default"
+          checked_baseline_blocking="$checked_baseline_blocking_default"
+          case "$KERNEL_LAB_CHECKED_BASELINE_INPUT" in
+            auto)
+              if [ -n "$KERNEL_LAB_TASKS_INPUT" ]; then
+                checked_baseline=0
+                checked_baseline_blocking=0
+              fi
+              ;;
+            true)
+              checked_baseline=1
+              checked_baseline_blocking=1
+              ;;
+            false)
+              checked_baseline=0
+              checked_baseline_blocking=0
+              ;;
+            *)
+              echo "unknown checked_baseline value: $KERNEL_LAB_CHECKED_BASELINE_INPUT" >&2
+              exit 1
+              ;;
+          esac
+
+          {
+            echo "KERNEL_LAB_TASKS=$tasks"
+            echo "KERNEL_LAB_WARMUP=$warmup"
+            echo "KERNEL_LAB_ITERS=$iters"
+            echo "KERNEL_LAB_COMPARE_CHECKED_BASELINE=$checked_baseline"
+            echo "KERNEL_LAB_CHECKED_BASELINE_BLOCKING=$checked_baseline_blocking"
+          } >> "$GITHUB_ENV"
+
+          {
+            echo "### kernel-lab preset"
+            echo ""
+            echo "- preset: \`$KERNEL_LAB_PRESET\`"
+            echo "- tasks: \`$tasks\`"
+            echo "- warmup: \`$warmup\`"
+            echo "- iters: \`$iters\`"
+            echo "- checked baseline: \`$checked_baseline\`"
+            echo "- checked baseline blocking: \`$checked_baseline_blocking\`"
+            if [ -n "$KERNEL_LAB_TASKS_INPUT" ] && [ "$KERNEL_LAB_CHECKED_BASELINE_INPUT" = "auto" ]; then
+              echo "- checked baseline auto disabled because tasks were overridden"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Wait for GPU idle
+        run: |
+          max_wait_seconds=3600
+          interval_seconds=30
+          required_idle_samples=3
+          max_gpu_use_percent=5
+          max_vram_use_percent=20
+          idle_samples=0
+          elapsed=0
+
+          while true; do
+            rocm-smi --showuse --showmemuse --showtemp | tee /tmp/kernel-lab-rocm-smi.txt
+            gpu_use="$(
+              awk -F': ' '/GPU use \(%\)/ {
+                gsub(/[^0-9.]/, "", $NF);
+                print int($NF);
+                exit;
+              }' /tmp/kernel-lab-rocm-smi.txt
+            )"
+            vram_use="$(
+              awk -F': ' '/GPU Memory Allocated \(VRAM%\)/ {
+                gsub(/[^0-9.]/, "", $NF);
+                print int($NF);
+                exit;
+              }' /tmp/kernel-lab-rocm-smi.txt
+            )"
+
+            if [ -z "$gpu_use" ] || [ -z "$vram_use" ]; then
+              echo "failed to parse rocm-smi utilization output" >&2
+              exit 1
+            fi
+
+            if [ "$gpu_use" -le "$max_gpu_use_percent" ] && [ "$vram_use" -le "$max_vram_use_percent" ]; then
+              idle_samples=$((idle_samples + 1))
+              echo "GPU idle sample ${idle_samples}/${required_idle_samples}: gpu=${gpu_use}% vram=${vram_use}%"
+            else
+              idle_samples=0
+              echo "GPU busy: gpu=${gpu_use}% vram=${vram_use}%; waiting ${interval_seconds}s"
+            fi
+
+            if [ "$idle_samples" -ge "$required_idle_samples" ]; then
+              echo "GPU has been idle for ${required_idle_samples} consecutive samples"
+              break
+            fi
+            if [ "$elapsed" -ge "$max_wait_seconds" ]; then
+              echo "timed out waiting for GPU idle after ${max_wait_seconds}s" >&2
+              exit 1
+            fi
+
+            sleep "$interval_seconds"
+            elapsed=$((elapsed + interval_seconds))
+          done
+
+      - name: Build kernel-lab
+        run: cargo build --release -p supersonic-kernel-lab --bin kernel-lab
+
+      - name: Unit tests
+        run: |
+          cargo test -p supersonic-kernel-lab --lib
+          cargo test -p supersonic-kernel-lab --bin kernel-lab
+
+      - name: Compare candidate against base ref
+        run: |
+          BASE_REF="${{ github.event.pull_request.base.sha || 'origin/main' }}"
+          ./target/release/kernel-lab compare-ref \
+            --baseline-ref "$BASE_REF" \
+            --candidate-ref worktree \
+            --tasks "$KERNEL_LAB_TASKS" \
+            --backend hip \
+            --device 0 \
+            --warmup "$KERNEL_LAB_WARMUP" \
+            --iters "$KERNEL_LAB_ITERS" \
+            --run-root "$KERNEL_LAB_RUN_ROOT" \
+            --worktree-root "$KERNEL_LAB_WORKTREE_ROOT" \
+            --max-regression "$KERNEL_LAB_MAX_REGRESSION" \
+            --min-speedup "$KERNEL_LAB_MIN_SPEEDUP" \
+            --markdown-out "$KERNEL_LAB_RUN_ROOT/diff.md" \
+            --candidate-summary-copy "$KERNEL_LAB_CANDIDATE_SUMMARY" \
+            --github-summary
+
+      - name: Compare candidate against checked-in gfx1100 baseline
+        if: env.KERNEL_LAB_COMPARE_CHECKED_BASELINE == '1'
+        run: |
+          if [ ! -f "$KERNEL_LAB_CHECKED_BASELINE" ]; then
+            echo "missing checked-in baseline: $KERNEL_LAB_CHECKED_BASELINE" >&2
+            exit 1
+          fi
+          set +e
+          ./target/release/kernel-lab diff \
+            --baseline "$KERNEL_LAB_CHECKED_BASELINE" \
+            --candidate "$KERNEL_LAB_CANDIDATE_SUMMARY" \
+            --max-regression "$KERNEL_LAB_MAX_REGRESSION" \
+            --min-speedup "$KERNEL_LAB_MIN_SPEEDUP" \
+            --markdown-out "$KERNEL_LAB_RUN_ROOT/checked-baseline-diff.md" \
+            --github-summary
+          status=$?
+          set -e
+          if [ "$status" -ne 0 ]; then
+            {
+              echo "### checked baseline status"
+              echo ""
+              echo "- result: \`failed\`"
+              echo "- exit code: \`$status\`"
+              echo "- blocking: \`$KERNEL_LAB_CHECKED_BASELINE_BLOCKING\`"
+            } >> "$GITHUB_STEP_SUMMARY"
+            if [ "$KERNEL_LAB_CHECKED_BASELINE_BLOCKING" = "1" ]; then
+              exit "$status"
+            fi
+          fi
+
+      - name: Upload kernel-lab artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-lab-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            target/kernel-lab-runs/**/*.json
+            target/kernel-lab-runs/**/*.md
+            target/kernel-lab-runs/history.jsonl
+          if-no-files-found: ignore

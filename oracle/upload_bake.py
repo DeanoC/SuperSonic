@@ -65,6 +65,12 @@ VARIANT_DIR_SUFFIX = {
     "bf16": "",
     "fp8-native": "-fp8",
     "int4-gptq": "-int4-gptq",
+    "int4-awq": "-int4-awq",
+    "int4-autoround": "-int4-autoround",
+    "int4-hqq": "-int4-hqq",
+    "higgs4": "-higgs4",
+    "quip-e8": "-quip-e8",
+    "qtip-trellis2": "-qtip-trellis2",
     "q4km": "-q4km",
     "q4km-gptq": "-q4km-gptq",
 }
@@ -125,9 +131,21 @@ def validate_bake(bake_dir: Path, variant: str) -> dict:
     # the Fp8Native bake must contain Fp8Native layouts. This catches the case
     # where a user points --int4 at a BF16 bake directory.
     layouts = {t.get("layout") for t in manifest.get("tensors", [])}
-    lowbit_layouts = {"Int4Quantized", "GgmlQ4K", "GgmlQ5K", "GgmlQ6K"}
-    if variant in ("int4-gptq", "q4km", "q4km-gptq") and not (layouts & lowbit_layouts):
+    lowbit_layouts = {
+        "Int4Quantized",
+        "HiggsGridQuantized",
+        "QuipE8Quantized",
+        "QtipTrellisQuantized",
+        "GgmlQ4K",
+        "GgmlQ5K",
+        "GgmlQ6K",
+    }
+    if variant in VARIANT_DIR_SUFFIX and variant not in ("bf16", "fp8-native") and not (layouts & lowbit_layouts):
         sys.exit(f"error: {bake_dir} has no Int4Quantized tensors — wrong variant?")
+    if variant.startswith("int4-") and manifest.get("quant_profile") not in (None, variant):
+        sys.exit(f"error: {bake_dir} has quant_profile={manifest.get('quant_profile')}, expected {variant}")
+    if variant in ("higgs4", "quip-e8", "qtip-trellis2") and manifest.get("quant_profile") != variant:
+        sys.exit(f"error: {bake_dir} is missing quant_profile={variant}")
     if variant == "q4km" and manifest.get("quant_profile") != "q4km-ggml-v1":
         sys.exit(f"error: {bake_dir} is missing quant_profile=q4km-ggml-v1")
     if variant == "q4km-gptq" and manifest.get("quant_profile") != "q4km-gptq-v1":
@@ -373,6 +391,15 @@ def main() -> None:
     variant_group.add_argument("--bf16", action="store_true")
     variant_group.add_argument("--fp8-native", action="store_true", dest="fp8_native")
     variant_group.add_argument("--int4", action="store_true", help="INT4 GPTQ bake")
+    variant_group.add_argument("--weight-quant", choices=[
+        "int4-gptq",
+        "int4-awq",
+        "int4-autoround",
+        "int4-hqq",
+        "higgs4",
+        "quip-e8",
+        "qtip-trellis2",
+    ], help="Modern named quant profile bake")
     variant_group.add_argument("--q4km", action="store_true", help="GGUF q4km raw GGML K-block bake")
     variant_group.add_argument("--q4km-gptq", action="store_true", dest="q4km_gptq",
                                help="Q4KM-sourced GPTQ/native INT4 bake")
@@ -390,6 +417,8 @@ def main() -> None:
         variant = "q4km"
     elif args.q4km_gptq:
         variant = "q4km-gptq"
+    elif args.weight_quant:
+        variant = args.weight_quant
     else:
         variant = "int4-gptq"
 

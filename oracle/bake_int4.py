@@ -42,6 +42,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from oracle.quant_bake.calibration import load_or_build_wikitext2_calibration
+from oracle.quant_bake.profiles import NATIVE_INT4_PROFILES, parse_profile
+
 
 def _malloc_trim() -> None:
     """Return free()'d host pages to the OS — glibc's allocator otherwise
@@ -456,6 +460,267 @@ def _minmax_int4_search_2d(
     return best_sc, best_zf
 
 
+@torch.no_grad()
+def hqq_lsq_quantize_torch(
+    W: torch.Tensor,
+    group_size: int,
+    iters: int = 4,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Data-free HQQ-style alternating LSQ quantizer for native INT4 layout.
+
+    This is intentionally runtime-compatible with GPTQ/AWQ native INT4:
+    packed-u8 weights plus BF16 scale/zero sidecars. It starts from the same
+    per-tile scale search used by fused expert min/max, then alternates q
+    assignment with an affine least-squares fit `w ~= scale*q + bias`.
+    """
+    if W.dim() != 2:
+        raise ValueError(f"HQQ dense quant expects 2D, got {tuple(W.shape)}")
+    W = W.to(torch.float32)
+    out_f, in_f = W.shape
+    gs = group_size
+    if in_f % gs != 0 or out_f % gs != 0:
+        raise ValueError(
+            f"shape {tuple(W.shape)} must be divisible by group_size={gs}"
+        )
+    scale_rows = out_f // gs
+    scale_cols = in_f // gs
+    tiles = W.reshape(scale_rows, gs, scale_cols, gs)
+    sc, zf = _minmax_int4_search_2d(tiles)
+
+    for _ in range(max(1, iters)):
+        sc_b = sc.unsqueeze(1).unsqueeze(3)
+        zf_b = zf.unsqueeze(1).unsqueeze(3)
+        q = torch.clamp(torch.round(tiles / sc_b + zf_b), 0.0, 15.0)
+        q_mean = q.mean(dim=(1, 3), keepdim=True)
+        w_mean = tiles.mean(dim=(1, 3), keepdim=True)
+        q_centered = q - q_mean
+        w_centered = tiles - w_mean
+        denom = (q_centered * q_centered).sum(dim=(1, 3)).clamp_min(1.0e-12)
+        sc_new = (q_centered * w_centered).sum(dim=(1, 3)) / denom
+        bias_new = w_mean.squeeze(3).squeeze(1) - sc_new * q_mean.squeeze(3).squeeze(1)
+        valid = torch.isfinite(sc_new) & (sc_new > 1.0e-8)
+        sc = torch.where(valid, sc_new, sc).to(torch.bfloat16).to(torch.float32)
+        zf_candidate = -bias_new / sc.clamp_min(1.0e-8)
+        zf = torch.where(valid, zf_candidate, zf).to(torch.bfloat16).to(torch.float32)
+
+    sc_b = sc.unsqueeze(1).unsqueeze(3)
+    zf_b = zf.unsqueeze(1).unsqueeze(3)
+    q_final = torch.clamp(torch.round(tiles / sc_b + zf_b), 0.0, 15.0)
+    nibbles = q_final.reshape(out_f, in_f).to(torch.uint8)
+    Q_dq = (q_final * sc_b - zf_b * sc_b).reshape(out_f, in_f).to(torch.bfloat16).to(torch.float32)
+    return Q_dq, nibbles, sc, zf
+
+
+@torch.no_grad()
+def awq_quantize_torch(
+    W: torch.Tensor,
+    act_importance: torch.Tensor,
+    group_size: int,
+    shrink_grid: tuple[float, ...] = (1.0, 0.95, 0.90, 0.85, 0.80, 0.75, 0.70),
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """AWQ-style activation-weighted native INT4 quantization.
+
+    SuperSonic's current INT4 runtime cannot consume separate activation
+    rescale tensors, so this keeps the packed-u8 + BF16 scale/zero layout and
+    uses AWQ's core signal: calibration activations identify important input
+    channels, and per-tile ranges are selected by weighted reconstruction MSE.
+    """
+    if W.dim() != 2:
+        raise ValueError(f"AWQ dense quant expects 2D, got {tuple(W.shape)}")
+    W = W.to(torch.float32)
+    out_f, in_f = W.shape
+    gs = group_size
+    if in_f % gs != 0 or out_f % gs != 0:
+        raise ValueError(
+            f"shape {tuple(W.shape)} must be divisible by group_size={gs}"
+        )
+    if act_importance.numel() != in_f:
+        raise ValueError(
+            f"activation importance has {act_importance.numel()} entries, "
+            f"expected {in_f}"
+        )
+
+    scale_rows = out_f // gs
+    scale_cols = in_f // gs
+    tiles = W.reshape(scale_rows, gs, scale_cols, gs)
+    imp = act_importance.to(device=W.device, dtype=torch.float32).clamp_min(1.0e-8)
+    imp = imp / imp.mean().clamp_min(1.0e-8)
+    imp_tiles = imp.reshape(scale_cols, gs).unsqueeze(0).unsqueeze(1)
+
+    tmax_orig = tiles.amax(dim=(1, 3))
+    tmin_orig = tiles.amin(dim=(1, 3))
+
+    def derive(tmin_v: torch.Tensor, tmax_v: torch.Tensor):
+        rng_v = tmax_v - tmin_v
+        sc_v = torch.where(rng_v > 0, rng_v / 15.0, torch.ones_like(rng_v))
+        zf_v = torch.where(rng_v > 0, -tmin_v / sc_v, torch.zeros_like(rng_v))
+        return (
+            sc_v.to(torch.bfloat16).to(torch.float32),
+            zf_v.to(torch.bfloat16).to(torch.float32),
+        )
+
+    def weighted_mse(sc_v: torch.Tensor, zf_v: torch.Tensor) -> torch.Tensor:
+        sc_b = sc_v.unsqueeze(1).unsqueeze(3)
+        zf_b = zf_v.unsqueeze(1).unsqueeze(3)
+        q = torch.clamp(torch.round(tiles / sc_b + zf_b), 0.0, 15.0)
+        recon = (q * sc_b - zf_b * sc_b).to(torch.bfloat16).to(torch.float32)
+        return (((tiles - recon) ** 2) * imp_tiles).mean(dim=(1, 3))
+
+    best_sc, best_zf = derive(tmin_orig, tmax_orig)
+    best_mse = weighted_mse(best_sc, best_zf)
+    for p in shrink_grid:
+        if p == 1.0:
+            continue
+        sc_p, zf_p = derive(p * tmin_orig, p * tmax_orig)
+        mse_p = weighted_mse(sc_p, zf_p)
+        better = mse_p < best_mse
+        best_sc = torch.where(better, sc_p, best_sc)
+        best_zf = torch.where(better, zf_p, best_zf)
+        best_mse = torch.where(better, mse_p, best_mse)
+
+    sc_full = best_sc.repeat_interleave(gs, dim=0).repeat_interleave(gs, dim=1)
+    zf_full = best_zf.repeat_interleave(gs, dim=0).repeat_interleave(gs, dim=1)
+    q_final = torch.clamp(torch.round(W / sc_full + zf_full), 0.0, 15.0)
+    nibbles = q_final.to(torch.uint8)
+    Q_dq = (q_final * sc_full - zf_full * sc_full).to(torch.bfloat16).to(torch.float32)
+    return Q_dq, nibbles, best_sc, best_zf
+
+
+def awq_channel_scale_torch(
+    act_importance: torch.Tensor,
+    W: torch.Tensor | None = None,
+    alpha: float = 0.5,
+    mode: str = "activation",
+    clamp_min: float = 1.0 / 16.0,
+    clamp_max: float = 16.0,
+) -> torch.Tensor:
+    """AWQ per-input-channel scale.
+
+    Runtime applies `x * inv_scale` while reading a weight quantized as
+    `W * scale`, preserving the dense linear result but giving important input
+    channels more quantization range.
+    """
+    imp = act_importance.to(dtype=torch.float32).clamp_min(1.0e-8)
+    imp = imp / imp.mean().clamp_min(1.0e-8)
+    if mode == "activation":
+        scale = imp.pow(alpha)
+    elif mode == "inverse-activation":
+        scale = imp.pow(-alpha)
+    elif mode == "activation-weight":
+        if W is None:
+            raise ValueError("AWQ scale mode 'activation-weight' requires W")
+        w_imp = W.detach().to(dtype=torch.float32).abs().mean(dim=0).clamp_min(1.0e-8)
+        w_imp = w_imp / w_imp.mean().clamp_min(1.0e-8)
+        scale = imp.pow(alpha) / w_imp.pow(max(0.0, 1.0 - alpha))
+    else:
+        raise ValueError(
+            f"unknown AWQ scale mode {mode!r}; expected activation, "
+            "inverse-activation, or activation-weight"
+        )
+    scale = scale / torch.log(scale).mean().exp().clamp_min(1.0e-8)
+    return scale.clamp(clamp_min, clamp_max)
+
+
+@torch.no_grad()
+def awq_quantize_with_sidecar_torch(
+    W: torch.Tensor,
+    act_importance: torch.Tensor,
+    group_size: int,
+    scale_alpha: float = 0.5,
+    scale_mode: str = "activation",
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if act_importance.numel() != W.shape[1]:
+        raise ValueError(
+            f"activation importance has {act_importance.numel()} entries, "
+            f"expected {W.shape[1]}"
+        )
+    awq_scale = awq_channel_scale_torch(
+        act_importance,
+        W=W,
+        alpha=scale_alpha,
+        mode=scale_mode,
+    ).to(
+        device=W.device, dtype=torch.float32
+    )
+    inv_scale = (1.0 / awq_scale).to(torch.bfloat16).to(torch.float32)
+    q_dq_scaled, nibbles, scale_t, zero_t = awq_quantize_torch(
+        W * awq_scale.reshape(1, -1),
+        act_importance,
+        group_size,
+    )
+    q_dq_effective = (q_dq_scaled * inv_scale.reshape(1, -1)).to(torch.bfloat16).to(torch.float32)
+    return q_dq_effective, nibbles, scale_t, zero_t, inv_scale
+
+
+def autoround_quantize_torch(
+    W: torch.Tensor,
+    act_samples: torch.Tensor,
+    group_size: int,
+    *,
+    steps: int = 20,
+    lr: float = 0.03,
+    row_chunk: int = 512,
+    max_optim_elements: int = 16_000_000,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, bool]:
+    """AutoRound/SignRound-style learned rounding for native INT4.
+
+    Scale/zero sidecars are initialized with the AWQ weighted range search,
+    then rounding decisions are optimized against calibration outputs using a
+    sigmoid relaxation. To keep producer memory bounded, output rows are
+    optimized in chunks and very large tensors can fall back to AWQ ranges.
+    """
+    if W.dim() != 2:
+        raise ValueError(f"AutoRound dense quant expects 2D, got {tuple(W.shape)}")
+    W = W.to(torch.float32)
+    X = act_samples.to(device=W.device, dtype=torch.float32)
+    if X.dim() != 2 or X.shape[1] != W.shape[1]:
+        raise ValueError(
+            f"activation samples shape {tuple(X.shape)} incompatible with weight {tuple(W.shape)}"
+        )
+    act_importance = X.abs().mean(dim=0)
+    _awq_dq, _awq_q, scale_t, zero_t = awq_quantize_torch(W, act_importance, group_size)
+    if steps <= 0 or X.shape[0] == 0 or W.numel() > max_optim_elements:
+        return _awq_dq, _awq_q, scale_t, zero_t, False
+
+    out_f, in_f = W.shape
+    gs = group_size
+    row_gr = torch.arange(out_f, device=W.device) // gs
+    col_gc = torch.arange(in_f, device=W.device) // gs
+    sc_full_all = scale_t[row_gr][:, col_gc]
+    zf_full_all = zero_t[row_gr][:, col_gc]
+    q_out = torch.empty((out_f, in_f), dtype=torch.uint8, device=W.device)
+    dq_out = torch.empty_like(W)
+
+    for r0 in range(0, out_f, row_chunk):
+        r1 = min(r0 + row_chunk, out_f)
+        Wc = W[r0:r1]
+        sc = sc_full_all[r0:r1]
+        zf = zf_full_all[r0:r1]
+        q_float = torch.clamp(Wc / sc + zf, 0.0, 15.0)
+        q_base = torch.floor(q_float).clamp(0.0, 14.0)
+        frac = (q_float - q_base).clamp(1.0e-4, 1.0 - 1.0e-4)
+        alpha = torch.logit(frac).detach().clone().requires_grad_(True)
+        target = X @ Wc.T
+        opt = torch.optim.Adam([alpha], lr=lr)
+        with torch.enable_grad():
+            for _ in range(steps):
+                opt.zero_grad(set_to_none=True)
+                q_soft = q_base + torch.sigmoid(alpha)
+                recon = (q_soft * sc - zf * sc).to(torch.float32)
+                pred = X @ recon.T
+                loss = torch.mean((pred - target) ** 2)
+                loss.backward()
+                opt.step()
+        q_final = (q_base + (torch.sigmoid(alpha.detach()) >= 0.5).to(torch.float32))
+        q_final = q_final.clamp(0.0, 15.0)
+        recon_final = (q_final * sc - zf * sc).to(torch.bfloat16).to(torch.float32)
+        q_out[r0:r1] = q_final.to(torch.uint8)
+        dq_out[r0:r1] = recon_final
+        del Wc, sc, zf, q_float, q_base, frac, alpha, target, opt, q_final, recon_final
+
+    return dq_out, q_out, scale_t, zero_t, True
+
+
 # ---------------------------------------------------------------------------
 # Fused MoE expert quantization (no GPTQ — min/max group-quant per expert).
 #
@@ -587,6 +852,43 @@ def fused_expert_minmax_int4_packed(
     return packed_out, scale_out, zero_out
 
 
+@torch.no_grad()
+def fused_expert_hqq_int4_packed(
+    W: torch.Tensor,
+    group_size: int,
+    work_device: torch.device | None = None,
+    iters: int = 4,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Packed fused-expert HQQ-style quantization for native INT4 runtime."""
+    if W.dim() != 3:
+        raise ValueError(f"fused expert tensor must be 3D, got shape {tuple(W.shape)}")
+    E, out_f, in_f = W.shape
+    gs = group_size
+    if in_f % gs != 0 or in_f % 2 != 0:
+        raise ValueError(
+            f"in_features {in_f} must be divisible by group_size={gs} and even"
+        )
+    if out_f % gs != 0:
+        raise ValueError(f"out_features {out_f} must be divisible by group_size={gs}")
+    scale_rows = out_f // gs
+    scale_cols = in_f // gs
+    packed_out = torch.empty((E, out_f, in_f // 2), dtype=torch.uint8)
+    scale_out = torch.empty((E, scale_rows, scale_cols), dtype=torch.float32)
+    zero_out = torch.empty((E, scale_rows, scale_cols), dtype=torch.float32)
+    dev = work_device if work_device is not None else W.device
+
+    for e in range(E):
+        slab = W[e].to(device=dev, dtype=torch.float32)
+        _Q_dq, q, sc, zf = hqq_lsq_quantize_torch(slab, group_size=group_size, iters=iters)
+        packed = (q[:, 0::2] | (q[:, 1::2] << 4)).contiguous().cpu()
+        packed_out[e] = packed
+        scale_out[e] = sc.cpu()
+        zero_out[e] = zf.cpu()
+        del slab, _Q_dq, q, sc, zf, packed
+
+    return packed_out, scale_out, zero_out
+
+
 # ---------------------------------------------------------------------------
 # Activation capture
 # ---------------------------------------------------------------------------
@@ -613,6 +915,64 @@ class HessianHook:
             new_N = self.N + n
             self.H = self.H * (self.N / new_N) + xx / new_N
             self.N = new_N
+
+    def close(self) -> None:
+        self._handle.remove()
+
+
+class ActivationImportanceHook:
+    """Accumulate mean absolute input activation per input channel."""
+
+    def __init__(self, linear: nn.Linear):
+        self.sum_abs: torch.Tensor | None = None
+        self.N: int = 0
+        self._handle = linear.register_forward_pre_hook(self._pre)
+
+    def _pre(self, module: nn.Module, inputs: tuple[torch.Tensor, ...]) -> None:
+        x = inputs[0]
+        if x.dim() > 2:
+            x = x.reshape(-1, x.shape[-1])
+        x = x.detach().to(torch.float32).abs()
+        n = x.shape[0]
+        cur = x.sum(dim=0)
+        if self.sum_abs is None:
+            self.sum_abs = cur
+        else:
+            self.sum_abs += cur
+        self.N += n
+
+    def mean_abs(self) -> torch.Tensor | None:
+        if self.sum_abs is None or self.N == 0:
+            return None
+        return self.sum_abs / float(self.N)
+
+    def close(self) -> None:
+        self._handle.remove()
+
+
+class ActivationSampleHook:
+    """Collect a bounded CPU sample of linear inputs for rounding optimization."""
+
+    def __init__(self, linear: nn.Linear, max_rows: int):
+        self.max_rows = max_rows
+        self.rows: list[torch.Tensor] = []
+        self.N: int = 0
+        self._handle = linear.register_forward_pre_hook(self._pre)
+
+    def _pre(self, module: nn.Module, inputs: tuple[torch.Tensor, ...]) -> None:
+        x = inputs[0]
+        if x.dim() > 2:
+            x = x.reshape(-1, x.shape[-1])
+        self.N += x.shape[0]
+        have = sum(t.shape[0] for t in self.rows)
+        take = max(0, min(self.max_rows - have, x.shape[0]))
+        if take:
+            self.rows.append(x[:take].detach().to(device="cpu", dtype=torch.float32))
+
+    def samples(self) -> torch.Tensor | None:
+        if not self.rows:
+            return None
+        return torch.cat(self.rows, dim=0)
 
     def close(self) -> None:
         self._handle.remove()
@@ -750,6 +1110,7 @@ def _stream_quantized_tensor(
     nibbles: torch.Tensor,           # [out, in] u8 (unpacked) or [E, out, in/2] u8 (already packed)
     scale_t: torch.Tensor,           # f32, BF16-rounded
     zero_t: torch.Tensor,            # f32, BF16-rounded
+    awq_inv_scale: torch.Tensor | None = None,
 ) -> None:
     """Pack (if needed) and stream a quantized tensor + sidecars to `writer`.
     Mirrors the per-tensor block from the old in-RAM `tensors_out`-building
@@ -772,6 +1133,11 @@ def _stream_quantized_tensor(
         f"{raw_name}_int4_zero", bf16_to_bytes(zero_t),
         list(zero_t.shape), "bf16", LAYOUT_RAW,
     )
+    if awq_inv_scale is not None:
+        writer.write_tensor(
+            f"{raw_name}_awq_inv_scale", bf16_to_bytes(awq_inv_scale),
+            list(awq_inv_scale.shape), "bf16", LAYOUT_RAW,
+        )
 
 
 def _selfcheck_dense(
@@ -780,6 +1146,7 @@ def _selfcheck_dense(
     zero_t: torch.Tensor,
     live: torch.Tensor,
     group_size: int,
+    awq_inv_scale: torch.Tensor | None = None,
 ) -> tuple[bool, float]:
     """Reconstruct a dense GPTQ tensor from (nibbles, scale, zero) and
     compare against the live `mod.weight.data`. Returns (matched, linf).
@@ -791,6 +1158,9 @@ def _selfcheck_dense(
     sc_full = scale_t[row_gr][:, col_gc]
     zf_full = zero_t[row_gr][:, col_gc]
     recon = nibbles.float() * sc_full - zf_full * sc_full
+    recon = recon.to(torch.bfloat16).to(torch.float32)
+    if awq_inv_scale is not None:
+        recon = recon * awq_inv_scale.reshape(1, -1).to(recon.device, dtype=recon.dtype)
     recon = recon.to(torch.bfloat16).to(torch.float32)
     matched = torch.equal(recon, live)
     linf = (recon - live).abs().max().item() if not matched else 0.0
@@ -1134,6 +1504,590 @@ def quantize_model(
             # malloc_trim, glibc keeps them in its arena cache and we drift
             # ~10 GiB upward over the 80-tensor pass.
             _release_host_memory()
+
+    return stats
+
+
+def quantize_model_awq(
+    model: nn.Module,
+    calib_ids: torch.Tensor,
+    device: torch.device,
+    group_size: int,
+    scale_alpha: float,
+    scale_mode: str,
+    writer: "StreamingPackageWriter",
+    hf_to_raw: dict[str, str],
+    safetensors_loader: Callable[[str], torch.Tensor | None] | None = None,
+) -> dict[str, Any]:
+    """Sequential AWQ-style native INT4 bake.
+
+    Each target linear collects mean absolute input activations from the
+    calibration windows. The quantizer then selects runtime-native scale/zero
+    sidecars by activation-weighted reconstruction error and writes the
+    dequantized weight back before advancing to the next layer.
+    """
+    model.eval()
+    inner = model.model
+    if hasattr(inner, "layers"):
+        text_root = inner
+    elif hasattr(inner, "language_model") and hasattr(inner.language_model, "layers"):
+        text_root = inner.language_model
+    else:
+        raise SystemExit(
+            "could not locate transformer layers under model.model[.language_model]"
+        )
+    layers = text_root.layers
+    num_layers = len(layers)
+
+    module_to_name: dict[int, str] = {}
+    for name, mod in model.named_modules():
+        if isinstance(mod, nn.Linear):
+            module_to_name[id(mod)] = name + ".weight"
+
+    log(f"[awq] capturing layer-0 inputs from {calib_ids.shape[0]} samples...")
+    hidden_cpu, layer_kwargs = capture_layer0_inputs(model, layers, calib_ids, device)
+    layer_kwargs_dev = move_kwargs_to(layer_kwargs, device)
+
+    stats: dict[str, Any] = {
+        "quantized_names": set(),
+        "dense_total": 0,
+        "dense_mismatch": 0,
+        "dense_worst": ("", 0.0),
+        "fused_total": 0,
+        "fused_worst": ("", 0.0),
+        "nibble_range_ok": True,
+    }
+    nsamples = len(hidden_cpu)
+
+    for layer_idx in range(num_layers):
+        layer = layers[layer_idx]
+        targets: list[tuple[str, nn.Linear]] = []
+        for mod in layer.modules():
+            if isinstance(mod, nn.Linear):
+                name = module_to_name[id(mod)]
+                if is_int4_target(name):
+                    targets.append((name, mod))
+
+        log(f"[awq] layer {layer_idx + 1}/{num_layers}: "
+            f"{len(targets)} targets, collecting activation stats over {nsamples} samples")
+
+        hooks = {name: ActivationImportanceHook(mod) for name, mod in targets}
+        with torch.no_grad():
+            for s in range(nsamples):
+                hs = hidden_cpu[s].to(device)
+                out = layer(hs, **layer_kwargs_dev)
+                if isinstance(out, tuple):
+                    out = out[0]
+                del hs, out
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
+        for name, mod in targets:
+            hook = hooks[name]
+            act = hook.mean_abs()
+            hook.close()
+            if act is None:
+                log(f"[awq]   {name}: WARNING no activations captured, skipping")
+                continue
+            t0 = time.perf_counter()
+            raw = _materialize_param(mod.weight, name, safetensors_loader)
+            W = raw.to(device=device, dtype=torch.float32)
+            Q_dq, nibbles, scale_t, zero_t, awq_inv = awq_quantize_with_sidecar_torch(
+                W,
+                act.to(device=device),
+                group_size,
+                scale_alpha=scale_alpha,
+                scale_mode=scale_mode,
+            )
+            elapsed = time.perf_counter() - t0
+            wrote = _writeback_param(mod, Q_dq)
+
+            raw_name = hf_to_raw.get(name)
+            if raw_name is None:
+                log(f"[awq]   {name}: WARN no safetensors raw name; skipping write")
+            else:
+                nibbles_cpu = nibbles.cpu()
+                scale_cpu = scale_t.cpu()
+                zero_cpu = zero_t.cpu()
+                awq_inv_cpu = awq_inv.cpu()
+                _stream_quantized_tensor(
+                    writer, raw_name, nibbles_cpu, scale_cpu, zero_cpu, awq_inv_cpu
+                )
+                stats["quantized_names"].add(name)
+                if wrote:
+                    stats["dense_total"] += 1
+                    live = mod.weight.data.to(torch.float32).cpu()
+                    matched, linf = _selfcheck_dense(
+                        nibbles_cpu, scale_cpu, zero_cpu, live, group_size, awq_inv_cpu,
+                    )
+                    if not matched:
+                        stats["dense_mismatch"] += 1
+                        if linf > stats["dense_worst"][1]:
+                            stats["dense_worst"] = (name, linf)
+                    del live
+                del nibbles_cpu, scale_cpu, zero_cpu, awq_inv_cpu
+
+            log(f"[awq]   {name}: shape={tuple(W.shape)} "
+                f"act_N={hook.N} took {elapsed:.1f}s"
+                + ("" if wrote else " [meta param: re-run will use BF16]"))
+            del raw, W, Q_dq, nibbles, scale_t, zero_t, awq_inv, act
+
+        with torch.no_grad():
+            for s in range(nsamples):
+                hs = hidden_cpu[s].to(device)
+                out = layer(hs, **layer_kwargs_dev)
+                if isinstance(out, tuple):
+                    out = out[0]
+                hidden_cpu[s] = out.detach().cpu()
+                del hs, out
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+        _release_host_memory()
+
+    final_norm = getattr(text_root, "norm", None)
+    lm_head = getattr(model, "lm_head", None)
+    if (
+        isinstance(lm_head, nn.Linear)
+        and final_norm is not None
+        and is_int4_target("lm_head.weight")
+    ):
+        log(f"[awq] lm_head: collecting activation stats over {nsamples} samples")
+        act_sum: torch.Tensor | None = None
+        act_N = 0
+        with torch.no_grad():
+            for s in range(nsamples):
+                hs = hidden_cpu[s].to(device)
+                normed = final_norm(hs)
+                x = normed.reshape(-1, normed.shape[-1]).to(torch.float32).abs()
+                cur = x.sum(dim=0)
+                act_sum = cur if act_sum is None else act_sum + cur
+                act_N += x.shape[0]
+                del hs, normed, x, cur
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+        if act_sum is None or act_N == 0:
+            log("[awq]   lm_head: WARNING no activations captured, skipping")
+        else:
+            t0 = time.perf_counter()
+            raw = _materialize_param(lm_head.weight, "lm_head.weight", safetensors_loader)
+            W = raw.to(device="cpu", dtype=torch.float32)
+            act = (act_sum / float(act_N)).to(device="cpu")
+            Q_dq, nibbles, scale_t, zero_t, awq_inv = awq_quantize_with_sidecar_torch(
+                W,
+                act,
+                group_size,
+                scale_alpha=scale_alpha,
+                scale_mode=scale_mode,
+            )
+            elapsed = time.perf_counter() - t0
+            wrote = lm_head.weight.device.type != "meta"
+            if wrote:
+                copy_weight_in_row_chunks(lm_head.weight.data, Q_dq)
+            raw_name = hf_to_raw.get("lm_head.weight", "lm_head.weight")
+            nibbles_cpu = nibbles.cpu()
+            scale_cpu = scale_t.cpu()
+            zero_cpu = zero_t.cpu()
+            awq_inv_cpu = awq_inv.cpu()
+            _stream_quantized_tensor(
+                writer, raw_name, nibbles_cpu, scale_cpu, zero_cpu, awq_inv_cpu
+            )
+            stats["quantized_names"].add("lm_head.weight")
+            if wrote:
+                stats["dense_total"] += 1
+                live = lm_head.weight.data.to(torch.float32).cpu()
+                matched, linf = _selfcheck_dense(
+                    nibbles_cpu, scale_cpu, zero_cpu, live, group_size, awq_inv_cpu,
+                )
+                if not matched:
+                    stats["dense_mismatch"] += 1
+                    if linf > stats["dense_worst"][1]:
+                        stats["dense_worst"] = ("lm_head.weight", linf)
+                del live
+            log(f"[awq]   lm_head: shape={tuple(W.shape)} "
+                f"act_N={act_N} took {elapsed:.1f}s"
+                + ("" if wrote else " [meta param: write-back skipped]"))
+            del raw, W, act, Q_dq, nibbles, scale_t, zero_t, awq_inv
+            del nibbles_cpu, scale_cpu, zero_cpu, awq_inv_cpu
+            _release_host_memory()
+
+    fused_param_names = sorted(
+        n for n, _ in model.named_parameters() if is_fused_expert_target(n)
+    )
+    if fused_param_names:
+        log(f"[awq] fused MoE experts: quantizing {len(fused_param_names)} "
+            f"3D tensors with min/max native INT4 fallback")
+        named_params = dict(model.named_parameters())
+        for name in fused_param_names:
+            t0 = time.perf_counter()
+            param = named_params[name]
+            raw = _materialize_param(param, name, safetensors_loader)
+            W = raw.to(device="cpu", dtype=torch.bfloat16)
+            packed, scale_t, zero_t = fused_expert_minmax_int4_packed(
+                W, group_size=group_size, work_device=device,
+            )
+            elapsed = time.perf_counter() - t0
+            raw_name = hf_to_raw.get(name, name)
+            _stream_quantized_tensor(writer, raw_name, packed, scale_t, zero_t)
+            stats["quantized_names"].add(name)
+            stats["fused_total"] += 1
+            range_ok, linf = _selfcheck_fused(packed, scale_t, zero_t, W, group_size)
+            if not range_ok:
+                stats["nibble_range_ok"] = False
+            if linf > stats["fused_worst"][1]:
+                stats["fused_worst"] = (name, linf)
+            log(f"[awq]   {name}: shape={tuple(W.shape)} -> "
+                f"packed={tuple(packed.shape)} took {elapsed:.1f}s")
+            del raw, W, packed, scale_t, zero_t
+            _release_host_memory()
+
+    return stats
+
+
+def quantize_model_autoround(
+    model: nn.Module,
+    calib_ids: torch.Tensor,
+    device: torch.device,
+    group_size: int,
+    writer: "StreamingPackageWriter",
+    hf_to_raw: dict[str, str],
+    safetensors_loader: Callable[[str], torch.Tensor | None] | None = None,
+    steps: int = 20,
+    lr: float = 0.03,
+    max_rows: int = 4096,
+    row_chunk: int = 512,
+    max_optim_elements: int = 16_000_000,
+) -> dict[str, Any]:
+    """Sequential AutoRound/SignRound-style native INT4 bake."""
+    model.eval()
+    inner = model.model
+    if hasattr(inner, "layers"):
+        text_root = inner
+    elif hasattr(inner, "language_model") and hasattr(inner.language_model, "layers"):
+        text_root = inner.language_model
+    else:
+        raise SystemExit(
+            "could not locate transformer layers under model.model[.language_model]"
+        )
+    layers = text_root.layers
+    num_layers = len(layers)
+
+    module_to_name: dict[int, str] = {}
+    for name, mod in model.named_modules():
+        if isinstance(mod, nn.Linear):
+            module_to_name[id(mod)] = name + ".weight"
+
+    log(f"[autoround] capturing layer-0 inputs from {calib_ids.shape[0]} samples...")
+    hidden_cpu, layer_kwargs = capture_layer0_inputs(model, layers, calib_ids, device)
+    layer_kwargs_dev = move_kwargs_to(layer_kwargs, device)
+
+    stats: dict[str, Any] = {
+        "quantized_names": set(),
+        "dense_total": 0,
+        "dense_mismatch": 0,
+        "dense_worst": ("", 0.0),
+        "fused_total": 0,
+        "fused_worst": ("", 0.0),
+        "nibble_range_ok": True,
+        "optimized_total": 0,
+        "fallback_total": 0,
+    }
+    nsamples = len(hidden_cpu)
+
+    for layer_idx in range(num_layers):
+        layer = layers[layer_idx]
+        targets: list[tuple[str, nn.Linear]] = []
+        for mod in layer.modules():
+            if isinstance(mod, nn.Linear):
+                name = module_to_name[id(mod)]
+                if is_int4_target(name):
+                    targets.append((name, mod))
+
+        log(f"[autoround] layer {layer_idx + 1}/{num_layers}: "
+            f"{len(targets)} targets, collecting up to {max_rows} activation rows")
+
+        hooks = {name: ActivationSampleHook(mod, max_rows=max_rows) for name, mod in targets}
+        with torch.no_grad():
+            for s in range(nsamples):
+                hs = hidden_cpu[s].to(device)
+                out = layer(hs, **layer_kwargs_dev)
+                if isinstance(out, tuple):
+                    out = out[0]
+                del hs, out
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
+        for name, mod in targets:
+            hook = hooks[name]
+            samples = hook.samples()
+            hook.close()
+            if samples is None:
+                log(f"[autoround]   {name}: WARNING no activations captured, skipping")
+                continue
+            t0 = time.perf_counter()
+            raw = _materialize_param(mod.weight, name, safetensors_loader)
+            W = raw.to(device=device, dtype=torch.float32)
+            Q_dq, nibbles, scale_t, zero_t, optimized = autoround_quantize_torch(
+                W,
+                samples.to(device=device),
+                group_size,
+                steps=steps,
+                lr=lr,
+                row_chunk=row_chunk,
+                max_optim_elements=max_optim_elements,
+            )
+            elapsed = time.perf_counter() - t0
+            wrote = _writeback_param(mod, Q_dq)
+
+            raw_name = hf_to_raw.get(name)
+            if raw_name is None:
+                log(f"[autoround]   {name}: WARN no safetensors raw name; skipping write")
+            else:
+                nibbles_cpu = nibbles.cpu()
+                scale_cpu = scale_t.cpu()
+                zero_cpu = zero_t.cpu()
+                _stream_quantized_tensor(writer, raw_name, nibbles_cpu, scale_cpu, zero_cpu)
+                stats["quantized_names"].add(name)
+                stats["optimized_total" if optimized else "fallback_total"] += 1
+                if wrote:
+                    stats["dense_total"] += 1
+                    live = mod.weight.data.to(torch.float32).cpu()
+                    matched, linf = _selfcheck_dense(
+                        nibbles_cpu, scale_cpu, zero_cpu, live, group_size,
+                    )
+                    if not matched:
+                        stats["dense_mismatch"] += 1
+                        if linf > stats["dense_worst"][1]:
+                            stats["dense_worst"] = (name, linf)
+                    del live
+                del nibbles_cpu, scale_cpu, zero_cpu
+
+            log(f"[autoround]   {name}: shape={tuple(W.shape)} "
+                f"act_N={hook.N} rows={samples.shape[0]} "
+                f"{'optimized' if optimized else 'awq-fallback'} took {elapsed:.1f}s"
+                + ("" if wrote else " [meta param: re-run will use BF16]"))
+            del raw, W, Q_dq, nibbles, scale_t, zero_t, samples
+
+        with torch.no_grad():
+            for s in range(nsamples):
+                hs = hidden_cpu[s].to(device)
+                out = layer(hs, **layer_kwargs_dev)
+                if isinstance(out, tuple):
+                    out = out[0]
+                hidden_cpu[s] = out.detach().cpu()
+                del hs, out
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+        _release_host_memory()
+
+    final_norm = getattr(text_root, "norm", None)
+    lm_head = getattr(model, "lm_head", None)
+    if (
+        isinstance(lm_head, nn.Linear)
+        and final_norm is not None
+        and is_int4_target("lm_head.weight")
+    ):
+        log(f"[autoround] lm_head: collecting up to {max_rows} activation rows")
+        rows: list[torch.Tensor] = []
+        act_N = 0
+        with torch.no_grad():
+            for s in range(nsamples):
+                hs = hidden_cpu[s].to(device)
+                normed = final_norm(hs)
+                x = normed.reshape(-1, normed.shape[-1]).to(torch.float32)
+                act_N += x.shape[0]
+                have = sum(t.shape[0] for t in rows)
+                take = max(0, min(max_rows - have, x.shape[0]))
+                if take:
+                    rows.append(x[:take].detach().cpu())
+                del hs, normed, x
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+        if not rows:
+            log("[autoround]   lm_head: WARNING no activations captured, skipping")
+        else:
+            t0 = time.perf_counter()
+            raw = _materialize_param(lm_head.weight, "lm_head.weight", safetensors_loader)
+            W = raw.to(device="cpu", dtype=torch.float32)
+            samples = torch.cat(rows, dim=0)
+            Q_dq, nibbles, scale_t, zero_t, optimized = autoround_quantize_torch(
+                W,
+                samples,
+                group_size,
+                steps=steps,
+                lr=lr,
+                row_chunk=row_chunk,
+                max_optim_elements=max_optim_elements,
+            )
+            elapsed = time.perf_counter() - t0
+            wrote = lm_head.weight.device.type != "meta"
+            if wrote:
+                copy_weight_in_row_chunks(lm_head.weight.data, Q_dq)
+            raw_name = hf_to_raw.get("lm_head.weight", "lm_head.weight")
+            nibbles_cpu = nibbles.cpu()
+            scale_cpu = scale_t.cpu()
+            zero_cpu = zero_t.cpu()
+            _stream_quantized_tensor(writer, raw_name, nibbles_cpu, scale_cpu, zero_cpu)
+            stats["quantized_names"].add("lm_head.weight")
+            stats["optimized_total" if optimized else "fallback_total"] += 1
+            if wrote:
+                stats["dense_total"] += 1
+                live = lm_head.weight.data.to(torch.float32).cpu()
+                matched, linf = _selfcheck_dense(
+                    nibbles_cpu, scale_cpu, zero_cpu, live, group_size,
+                )
+                if not matched:
+                    stats["dense_mismatch"] += 1
+                    if linf > stats["dense_worst"][1]:
+                        stats["dense_worst"] = ("lm_head.weight", linf)
+                del live
+            log(f"[autoround]   lm_head: shape={tuple(W.shape)} "
+                f"act_N={act_N} rows={samples.shape[0]} "
+                f"{'optimized' if optimized else 'awq-fallback'} took {elapsed:.1f}s"
+                + ("" if wrote else " [meta param: write-back skipped]"))
+            del raw, W, samples, Q_dq, nibbles, scale_t, zero_t
+            del nibbles_cpu, scale_cpu, zero_cpu, rows
+            _release_host_memory()
+
+    fused_param_names = sorted(
+        n for n, _ in model.named_parameters() if is_fused_expert_target(n)
+    )
+    if fused_param_names:
+        log(f"[autoround] fused MoE experts: quantizing {len(fused_param_names)} "
+            f"3D tensors with min/max native INT4 fallback")
+        named_params = dict(model.named_parameters())
+        for name in fused_param_names:
+            t0 = time.perf_counter()
+            param = named_params[name]
+            raw = _materialize_param(param, name, safetensors_loader)
+            W = raw.to(device="cpu", dtype=torch.bfloat16)
+            packed, scale_t, zero_t = fused_expert_minmax_int4_packed(
+                W, group_size=group_size, work_device=device,
+            )
+            elapsed = time.perf_counter() - t0
+            raw_name = hf_to_raw.get(name, name)
+            _stream_quantized_tensor(writer, raw_name, packed, scale_t, zero_t)
+            stats["quantized_names"].add(name)
+            stats["fused_total"] += 1
+            range_ok, linf = _selfcheck_fused(packed, scale_t, zero_t, W, group_size)
+            if not range_ok:
+                stats["nibble_range_ok"] = False
+            if linf > stats["fused_worst"][1]:
+                stats["fused_worst"] = (name, linf)
+            log(f"[autoround]   {name}: shape={tuple(W.shape)} -> "
+                f"packed={tuple(packed.shape)} took {elapsed:.1f}s")
+            del raw, W, packed, scale_t, zero_t
+            _release_host_memory()
+
+    log(f"[autoround] optimized={stats['optimized_total']} "
+        f"awq_fallback={stats['fallback_total']}")
+    return stats
+
+
+def quantize_model_hqq(
+    model: nn.Module,
+    device: torch.device,
+    group_size: int,
+    writer: "StreamingPackageWriter",
+    hf_to_raw: dict[str, str],
+    named_lookup: dict[str, torch.Tensor],
+    safetensors_loader: Callable[[str], torch.Tensor | None] | None = None,
+    iters: int = 4,
+) -> dict[str, Any]:
+    """Data-free HQQ-style native INT4 bake.
+
+    Unlike GPTQ, this does not capture Hessians or propagate quantized
+    activations layer-by-layer. It walks runtime-visible target weights,
+    quantizes each independently, streams the native INT4 triplet, and writes
+    dequantized weights back to live 2D parameters when possible so sample/PPL
+    checks exercise the same approximation.
+    """
+    model.eval()
+    stats: dict[str, Any] = {
+        "quantized_names": set(),
+        "dense_total": 0,
+        "dense_mismatch": 0,
+        "dense_worst": ("", 0.0),
+        "fused_total": 0,
+        "fused_worst": ("", 0.0),
+        "nibble_range_ok": True,
+    }
+    targets = sorted(
+        hf_name
+        for hf_name, raw_name in hf_to_raw.items()
+        if is_int4_target(hf_name)
+        and (
+            raw_name.endswith(".weight")
+            or is_fused_expert_target(raw_name)
+            or raw_name == "lm_head.weight"
+        )
+    )
+    if "lm_head.weight" not in targets and hasattr(model, "lm_head"):
+        targets.append("lm_head.weight")
+        hf_to_raw.setdefault("lm_head.weight", "lm_head.weight")
+        named_lookup.setdefault("lm_head.weight", model.lm_head.weight)
+    log(f"[hqq] quantizing {len(targets)} native INT4 target tensor(s)")
+
+    for name in targets:
+        raw_name = hf_to_raw.get(name, name)
+        param_ref = named_lookup.get(name)
+        if param_ref is None:
+            log(f"[hqq]   {name}: WARNING no live parameter; skipping")
+            continue
+        t0 = time.perf_counter()
+        raw = _materialize_param(param_ref, name, safetensors_loader)
+        if raw.dim() == 3 and is_fused_expert_target(name):
+            W = raw.to(device="cpu", dtype=torch.bfloat16)
+            packed, scale_t, zero_t = fused_expert_hqq_int4_packed(
+                W, group_size=group_size, work_device=device, iters=iters,
+            )
+            _stream_quantized_tensor(writer, raw_name, packed, scale_t, zero_t)
+            stats["quantized_names"].add(name)
+            stats["fused_total"] += 1
+            range_ok, linf = _selfcheck_fused(packed, scale_t, zero_t, W, group_size)
+            if not range_ok:
+                stats["nibble_range_ok"] = False
+            if linf > stats["fused_worst"][1]:
+                stats["fused_worst"] = (name, linf)
+            del W, packed, scale_t, zero_t
+        elif raw.dim() == 2:
+            W = raw.to(device=device, dtype=torch.float32)
+            Q_dq, nibbles, scale_t, zero_t = hqq_lsq_quantize_torch(
+                W, group_size=group_size, iters=iters,
+            )
+            wrote = False
+            if param_ref.device.type != "meta":
+                if param_ref.dim() == 2 and param_ref.shape == Q_dq.shape:
+                    if param_ref.device.type == "cpu":
+                        copy_weight_in_row_chunks(param_ref.data, Q_dq.cpu())
+                    else:
+                        param_ref.data.copy_(Q_dq.to(device=param_ref.device, dtype=param_ref.dtype))
+                    wrote = True
+            nibbles_cpu = nibbles.cpu()
+            scale_cpu = scale_t.cpu()
+            zero_cpu = zero_t.cpu()
+            _stream_quantized_tensor(writer, raw_name, nibbles_cpu, scale_cpu, zero_cpu)
+            stats["quantized_names"].add(name)
+            stats["dense_total"] += 1
+            matched, linf = _selfcheck_dense(
+                nibbles_cpu,
+                scale_cpu,
+                zero_cpu,
+                Q_dq.cpu(),
+                group_size,
+            )
+            if not matched:
+                stats["dense_mismatch"] += 1
+                if linf > stats["dense_worst"][1]:
+                    stats["dense_worst"] = (name, linf)
+            del W, Q_dq, nibbles, scale_t, zero_t, nibbles_cpu, scale_cpu, zero_cpu
+        else:
+            log(f"[hqq]   {name}: WARNING unsupported shape {tuple(raw.shape)}; skipping")
+            del raw
+            continue
+        elapsed = time.perf_counter() - t0
+        log(f"[hqq]   {name}: raw={raw_name} shape={tuple(raw.shape)} took {elapsed:.1f}s")
+        del raw
+        _release_host_memory()
 
     return stats
 
@@ -1525,9 +2479,18 @@ class StreamingPackageWriter:
     `write_package`; only the producer side becomes streaming.
     """
 
-    def __init__(self, out_dir: Path, model_family: str = "qwen35"):
+    def __init__(
+        self,
+        out_dir: Path,
+        model_family: str = "qwen35",
+        *,
+        quant_profile: str = "int4-gptq",
+        quant_method: dict[str, Any] | None = None,
+    ):
         self.out_dir = out_dir
         self.model_family = model_family
+        self.quant_profile = quant_profile
+        self.quant_method = quant_method
         out_dir.mkdir(parents=True, exist_ok=True)
         self.weights_path = out_dir / "weights.bin"
         self._fh = open(self.weights_path, "wb")
@@ -1578,8 +2541,13 @@ class StreamingPackageWriter:
             "format_version": FORMAT_VERSION,
             "converter_version": CONVERTER_VERSION,
             "model_family": self.model_family,
+            "quant_profile": self.quant_profile,
+            "source_format": "safetensors",
+            "source_quant": self.quant_profile,
             "tensors": sorted_entries,
         }
+        if self.quant_method is not None:
+            manifest["quant_method"] = self.quant_method
         with open(self.out_dir / "manifest.json", "w") as f:
             json.dump(manifest, f, indent=2)
         log(f"[bake-int4] wrote {self._cursor / (1024 * 1024):.1f} MiB to {self.weights_path}")
@@ -1613,7 +2581,7 @@ def write_package(
 # Driver
 # ---------------------------------------------------------------------------
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="GPTQ INT4 calibration bake for SuperSonic")
+    p = argparse.ArgumentParser(description="Native INT4 quantization bake for SuperSonic")
     p.add_argument("--model-dir", required=True, type=Path,
                    help="Path to the HuggingFace model directory")
     p.add_argument("--num-samples", type=int, default=128,
@@ -1634,6 +2602,34 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--out-dir", default=None, type=Path,
                    help="Override output directory (default: "
                         "{model-dir}/.supersonic/v{FORMAT_VERSION}-int4-gptq)")
+    p.add_argument("--profile", "--weight-quant", default="int4-gptq",
+                   help="Quantization profile to write. Implemented runtime-compatible "
+                        "profiles: int4-gptq, int4-awq, int4-autoround, int4-hqq.")
+    p.add_argument("--hqq-iters", type=int, default=4,
+                   help="Alternating least-squares iterations for --profile int4-hqq "
+                        "(default 4)")
+    p.add_argument("--autoround-steps", type=int, default=20,
+                   help="Rounding optimization steps for --profile int4-autoround "
+                        "(default 20)")
+    p.add_argument("--autoround-lr", type=float, default=0.03,
+                   help="Rounding optimizer learning rate for --profile int4-autoround "
+                        "(default 0.03)")
+    p.add_argument("--autoround-max-rows", type=int, default=4096,
+                   help="Maximum activation rows kept per linear for int4-autoround "
+                        "(default 4096)")
+    p.add_argument("--autoround-row-chunk", type=int, default=512,
+                   help="Output rows optimized at once for int4-autoround "
+                        "(default 512)")
+    p.add_argument("--autoround-max-elements", type=int, default=16_000_000,
+                   help="Tensors larger than this fall back to AWQ rounding for "
+                        "int4-autoround unless raised (default 16000000)")
+    p.add_argument("--awq-scale-alpha", type=float, default=0.5,
+                   help="AWQ sidecar scale exponent for --profile int4-awq "
+                        "(default 0.5)")
+    p.add_argument("--awq-scale-mode", default="activation",
+                   choices=["activation", "inverse-activation", "activation-weight"],
+                   help="AWQ sidecar scale formula for --profile int4-awq "
+                        "(default activation)")
     # Streaming offload — needed when BF16 weights don't fit a single GPU
     # (35B-A3B is ~67 GiB, never fits 24 GiB VRAM). Same pattern as
     # oracle/q4km_stream_gptq_bake.py: pass through to from_pretrained and
@@ -1656,6 +2652,29 @@ def main() -> None:
     model_dir: Path = args.model_dir
     if not model_dir.exists():
         raise SystemExit(f"model dir does not exist: {model_dir}")
+    profile = parse_profile(args.profile)
+    if profile.name not in NATIVE_INT4_PROFILES:
+        raise SystemExit(
+            f"{profile.name} uses layout {profile.layout}; its Qwen runtime baker/loader "
+            "is reserved but not implemented in bake_int4.py yet"
+        )
+    if profile.name not in ("int4-gptq", "int4-awq", "int4-autoround", "int4-hqq"):
+        raise SystemExit(
+            f"{profile.name} package naming and manifest metadata are supported, but "
+            "the quantization method is not implemented in bake_int4.py yet"
+        )
+    if args.hqq_iters < 1:
+        raise SystemExit("--hqq-iters must be >= 1")
+    if args.autoround_steps < 0:
+        raise SystemExit("--autoround-steps must be >= 0")
+    if args.autoround_max_rows < 1:
+        raise SystemExit("--autoround-max-rows must be >= 1")
+    if args.autoround_row_chunk < 1:
+        raise SystemExit("--autoround-row-chunk must be >= 1")
+    if args.autoround_max_elements < 1:
+        raise SystemExit("--autoround-max-elements must be >= 1")
+    if args.awq_scale_alpha < 0.0:
+        raise SystemExit("--awq-scale-alpha must be >= 0")
 
     # Device
     if args.device:
@@ -1796,25 +2815,18 @@ def main() -> None:
             return None
         return load_raw_tensor(model_dir, raw_name)
 
-    # --- Load calibration data ---
-    log("[bake-int4] loading WikiText-2 train split via `datasets`...")
-    from datasets import load_dataset
-    train = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
-    text = "\n\n".join(r["text"] for r in train if r["text"].strip())
-    enc = tokenizer(text, return_tensors="pt")
-    ids = enc.input_ids[0]
-    log(f"[bake-int4] tokenized train: {ids.numel()} tokens")
-    if ids.numel() < args.seqlen * 2:
-        raise SystemExit(
-            f"not enough calibration tokens ({ids.numel()}) for "
-            f"seqlen={args.seqlen}"
+    calib: torch.Tensor | None = None
+    if profile.name in ("int4-gptq", "int4-awq", "int4-autoround"):
+        windows = load_or_build_wikitext2_calibration(
+            tokenizer=tokenizer,
+            cache_dir=model_dir / ".supersonic" / "calib",
+            num_samples=args.num_samples,
+            seqlen=args.seqlen,
+            seed=args.seed,
+            log=log,
         )
-
-    torch.manual_seed(args.seed)
-    max_start = ids.numel() - args.seqlen - 1
-    starts = torch.randint(0, max_start, (args.num_samples,))
-    calib = torch.stack([ids[s:s + args.seqlen] for s in starts])
-    log(f"[bake-int4] calibration batch: {tuple(calib.shape)}")
+        calib = torch.tensor(windows, dtype=torch.long)
+        log(f"[bake-int4] calibration batch: {tuple(calib.shape)}")
 
     # --- Open the streaming writer up front so quantized tensors flow to
     # disk as soon as they're produced. The producer side never holds more
@@ -1822,25 +2834,107 @@ def main() -> None:
     # that's ~1 GiB peak (largest fused expert slab) instead of the ~17 GiB
     # the in-RAM `tensors_out` list reached before this refactor.
     out_dir = args.out_dir or (
-        model_dir / ".supersonic" / f"v{FORMAT_VERSION}-int4-gptq"
+        model_dir / ".supersonic" / f"v{FORMAT_VERSION}-{profile.name}"
     )
     # Context-manager form: on a partial run (exception propagating out),
     # `__exit__` closes the file handle but skips manifest emission so a
     # downstream bake-consumer can't accidentally read a half-written package
     # as if it were complete.
-    with StreamingPackageWriter(out_dir, model_family=model_family) as writer:
-        # --- GPTQ ---
+    quant_method: dict[str, Any] = {
+        "profile": profile.name,
+        "parameters": {"group_size": args.group_size},
+        "source_dtype": "bf16/f32",
+        "producer_version": f"oracle/bake_int4.py fmt{FORMAT_VERSION} cvt{CONVERTER_VERSION}",
+    }
+    if profile.name == "int4-gptq":
+        quant_method["parameters"]["damp"] = args.damp
+        quant_method["calibration_corpus"] = "wikitext-2-raw-v1/train"
+        quant_method["calibration_samples"] = args.num_samples
+        quant_method["calibration_seqlen"] = args.seqlen
+        quant_method["calibration_seed"] = args.seed
+    elif profile.name == "int4-awq":
+        quant_method["parameters"]["scale_search"] = "activation_weighted_shrink_grid"
+        quant_method["parameters"]["awq_sidecar"] = "per_input_channel_inv_scale_bf16"
+        quant_method["parameters"]["awq_scale_alpha"] = args.awq_scale_alpha
+        quant_method["parameters"]["awq_scale_mode"] = args.awq_scale_mode
+        quant_method["calibration_corpus"] = "wikitext-2-raw-v1/train"
+        quant_method["calibration_samples"] = args.num_samples
+        quant_method["calibration_seqlen"] = args.seqlen
+        quant_method["calibration_seed"] = args.seed
+    elif profile.name == "int4-autoround":
+        quant_method["parameters"]["scale_init"] = "awq_activation_weighted_shrink_grid"
+        quant_method["parameters"]["steps"] = args.autoround_steps
+        quant_method["parameters"]["lr"] = args.autoround_lr
+        quant_method["parameters"]["max_rows"] = args.autoround_max_rows
+        quant_method["parameters"]["row_chunk"] = args.autoround_row_chunk
+        quant_method["parameters"]["max_optim_elements"] = args.autoround_max_elements
+        quant_method["calibration_corpus"] = "wikitext-2-raw-v1/train"
+        quant_method["calibration_samples"] = args.num_samples
+        quant_method["calibration_seqlen"] = args.seqlen
+        quant_method["calibration_seed"] = args.seed
+    elif profile.name == "int4-hqq":
+        quant_method["parameters"]["iters"] = args.hqq_iters
+    with StreamingPackageWriter(
+        out_dir,
+        model_family=model_family,
+        quant_profile=profile.name,
+        quant_method=quant_method,
+    ) as writer:
         t0 = time.perf_counter()
-        stats = quantize_model(
-            model, calib, device,
-            group_size=args.group_size,
-            damp=args.damp,
-            writer=writer,
-            hf_to_raw=hf_to_raw,
-            safetensors_loader=safetensors_loader,
-        )
-        gptq_elapsed = time.perf_counter() - t0
-        log(f"[bake-int4] GPTQ done in {gptq_elapsed / 60.0:.1f} min "
+        if profile.name == "int4-gptq":
+            assert calib is not None
+            stats = quantize_model(
+                model, calib, device,
+                group_size=args.group_size,
+                damp=args.damp,
+                writer=writer,
+                hf_to_raw=hf_to_raw,
+                safetensors_loader=safetensors_loader,
+            )
+        elif profile.name == "int4-awq":
+            assert calib is not None
+            stats = quantize_model_awq(
+                model,
+                calib,
+                device,
+                group_size=args.group_size,
+                scale_alpha=args.awq_scale_alpha,
+                scale_mode=args.awq_scale_mode,
+                writer=writer,
+                hf_to_raw=hf_to_raw,
+                safetensors_loader=safetensors_loader,
+            )
+        elif profile.name == "int4-autoround":
+            assert calib is not None
+            stats = quantize_model_autoround(
+                model,
+                calib,
+                device,
+                group_size=args.group_size,
+                writer=writer,
+                hf_to_raw=hf_to_raw,
+                safetensors_loader=safetensors_loader,
+                steps=args.autoround_steps,
+                lr=args.autoround_lr,
+                max_rows=args.autoround_max_rows,
+                row_chunk=args.autoround_row_chunk,
+                max_optim_elements=args.autoround_max_elements,
+            )
+        elif profile.name == "int4-hqq":
+            stats = quantize_model_hqq(
+                model,
+                device,
+                group_size=args.group_size,
+                writer=writer,
+                hf_to_raw=hf_to_raw,
+                named_lookup=named_lookup,
+                safetensors_loader=safetensors_loader,
+                iters=args.hqq_iters,
+            )
+        else:
+            raise AssertionError(f"unhandled profile {profile.name}")
+        quant_elapsed = time.perf_counter() - t0
+        log(f"[bake-int4] {profile.name} done in {quant_elapsed / 60.0:.1f} min "
             f"({len(stats['quantized_names'])} tensors quantized + streamed)")
 
         # --- Sample generation sanity check (quantized weights live in the model) ---

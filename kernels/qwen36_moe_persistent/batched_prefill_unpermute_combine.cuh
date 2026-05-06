@@ -69,7 +69,7 @@ __global__ void qwen36_moe_batched_prefill_unpermute_combine_kernel(
     const int inv_base = token * top_k;
     for (int kpos = 0; kpos < top_k; ++kpos) {
         const int dst = permuted_inverse[inv_base + kpos];
-        const float w = __bfloat162float(permuted_weight[dst]);
+        const float w = static_cast<float>(permuted_weight[dst]);
         const float v = static_cast<float>(expert_out[
             static_cast<size_t>(dst) * hidden + col]);
         acc += w * v;

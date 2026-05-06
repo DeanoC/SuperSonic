@@ -298,26 +298,36 @@ struct Qwen35INT4ScaleDesc {
     // Common MLP weights
     const void* gate_proj_scale;
     const void* gate_proj_zero;
+    const void* gate_proj_awq_inv_scale;
     const void* up_proj_scale;
     const void* up_proj_zero;
+    const void* up_proj_awq_inv_scale;
     const void* down_proj_scale;
     const void* down_proj_zero;
+    const void* down_proj_awq_inv_scale;
     // Linear attention weights
     const void* qkv_proj_scale;
     const void* qkv_proj_zero;
+    const void* qkv_proj_awq_inv_scale;
     const void* z_proj_scale;
     const void* z_proj_zero;
+    const void* z_proj_awq_inv_scale;
     const void* linear_out_proj_scale;
     const void* linear_out_proj_zero;
+    const void* linear_out_proj_awq_inv_scale;
     // Full attention weights
     const void* q_proj_scale;
     const void* q_proj_zero;
+    const void* q_proj_awq_inv_scale;
     const void* k_proj_scale;
     const void* k_proj_zero;
+    const void* k_proj_awq_inv_scale;
     const void* v_proj_scale;
     const void* v_proj_zero;
+    const void* v_proj_awq_inv_scale;
     const void* o_proj_scale;
     const void* o_proj_zero;
+    const void* o_proj_awq_inv_scale;
     // Group size for INT4 quantization (typically 128)
     int group_size;
     int gate_proj_type;
@@ -3119,6 +3129,37 @@ __global__ void supersonic_qwen35_int8_outlier_add_kernel(
         const float w = supersonic_qwen35_to_float(
             supersonic_qwen35_from_float<T>(q * row_scale * inv_127));
         acc += lhs * w;
+    }
+
+    const float base = supersonic_qwen35_to_float(out[idx]);
+    out[idx] = supersonic_qwen35_from_float<T>(base + acc);
+}
+
+template <typename T>
+__global__ void supersonic_qwen35_int4_sparse_outlier_add_kernel(
+    int rows,
+    int n,
+    int k,
+    int sub_cols,
+    const T* __restrict__ lhs,
+    const uint32_t* __restrict__ outlier_cols,
+    const T* __restrict__ outlier_delta,
+    T* __restrict__ out
+) {
+    const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t total = static_cast<size_t>(rows) * static_cast<size_t>(n);
+    if (idx >= total) {
+        return;
+    }
+
+    const int row = static_cast<int>(idx / static_cast<size_t>(n));
+    const int out_col = static_cast<int>(idx % static_cast<size_t>(n));
+    float acc = 0.0f;
+    for (int j = 0; j < sub_cols; ++j) {
+        const int k_col = static_cast<int>(outlier_cols[j]);
+        const float x = supersonic_qwen35_to_float(lhs[row * k + k_col]);
+        const float delta = supersonic_qwen35_to_float(outlier_delta[out_col * sub_cols + j]);
+        acc += x * delta;
     }
 
     const float base = supersonic_qwen35_to_float(out[idx]);
