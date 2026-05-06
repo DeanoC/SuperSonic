@@ -52,6 +52,11 @@ pub(crate) fn validate_global_flags(
             "--weight-quant {profile} has manifest and package naming support, but Qwen HIP runtime kernels/loaders for this profile are not implemented yet"
         );
     }
+    if profile == QuantProfile::Int4Awq && model_variant.family() == ModelFamily::Qwen36Moe {
+        anyhow::bail!(
+            "--weight-quant int4-awq is currently supported only for Qwen3.5; Qwen3.6-MoE does not load/pass AWQ sidecars yet"
+        );
+    }
     if matches!(
         profile,
         QuantProfile::Int4Awq | QuantProfile::Int4Autoround | QuantProfile::Int4Hqq
@@ -84,6 +89,43 @@ pub(crate) fn validate_global_flags(
         anyhow::bail!("--certified-kv-shadow-validate requires --certified-kv");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::validate_global_flags;
+    use crate::registry::{Backend, ModelVariant};
+    use crate::Cli;
+
+    fn cli(extra: &[&str]) -> Cli {
+        let mut args = vec!["supersonic", "--model-dir", "/tmp/model", "--dry-run"];
+        args.extend_from_slice(extra);
+        Cli::parse_from(args)
+    }
+
+    #[test]
+    fn rejects_awq_for_qwen36_until_sidecars_are_wired() {
+        let err = validate_global_flags(
+            &cli(&["--weight-quant", "int4-awq"]),
+            &ModelVariant::Qwen3_6_35B_A3B,
+            Backend::Hip,
+        )
+        .expect_err("Qwen3.6 AWQ should fail until sidecars are wired")
+        .to_string();
+        assert!(err.contains("Qwen3.6-MoE does not load/pass AWQ sidecars"));
+    }
+
+    #[test]
+    fn allows_hqq_for_qwen36_native_int4_layout() {
+        validate_global_flags(
+            &cli(&["--weight-quant", "int4-hqq"]),
+            &ModelVariant::Qwen3_6_35B_A3B,
+            Backend::Hip,
+        )
+        .expect("HQQ emits the native INT4 layout and does not require AWQ sidecars");
+    }
 }
 
 pub(crate) fn validate_dflash_flags(cli: &Cli, model_variant: &ModelVariant) -> Result<()> {

@@ -298,26 +298,36 @@ struct Qwen35INT4ScaleDesc {
     // Common MLP weights
     const void* gate_proj_scale;
     const void* gate_proj_zero;
+    const void* gate_proj_awq_inv_scale;
     const void* up_proj_scale;
     const void* up_proj_zero;
+    const void* up_proj_awq_inv_scale;
     const void* down_proj_scale;
     const void* down_proj_zero;
+    const void* down_proj_awq_inv_scale;
     // Linear attention weights
     const void* qkv_proj_scale;
     const void* qkv_proj_zero;
+    const void* qkv_proj_awq_inv_scale;
     const void* z_proj_scale;
     const void* z_proj_zero;
+    const void* z_proj_awq_inv_scale;
     const void* linear_out_proj_scale;
     const void* linear_out_proj_zero;
+    const void* linear_out_proj_awq_inv_scale;
     // Full attention weights
     const void* q_proj_scale;
     const void* q_proj_zero;
+    const void* q_proj_awq_inv_scale;
     const void* k_proj_scale;
     const void* k_proj_zero;
+    const void* k_proj_awq_inv_scale;
     const void* v_proj_scale;
     const void* v_proj_zero;
+    const void* v_proj_awq_inv_scale;
     const void* o_proj_scale;
     const void* o_proj_zero;
+    const void* o_proj_awq_inv_scale;
     // Group size for INT4 quantization (typically 128)
     int group_size;
     int gate_proj_type;
