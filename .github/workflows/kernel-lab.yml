@@ -169,7 +169,7 @@ jobs:
           max_wait_seconds=3600
           interval_seconds=30
           required_idle_samples=3
-          max_gpu_use_percent=5
+          max_gpu_use_percent=10
           max_vram_use_percent=20
           idle_samples=0
           elapsed=0
