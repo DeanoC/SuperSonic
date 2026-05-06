@@ -259,6 +259,35 @@ pub fn functional_int4_dequant_matvec(cfg: &KernelLabConfig) -> Result<TaskResul
     )
 }
 
+pub fn functional_qwen36_moe_route_expert_combine(cfg: &KernelLabConfig) -> Result<TaskResult> {
+    let task = crate::find_task("functional.qwen36_moe_route_expert_combine").unwrap();
+    let shapes = [
+        ExpertShape {
+            n_tokens: 3,
+            top_k: 2,
+            num_experts: 4,
+            hidden: 128,
+            moe_intermediate: 128,
+            seed: 0xF301,
+        },
+        ExpertShape {
+            n_tokens: 5,
+            top_k: 2,
+            num_experts: 8,
+            hidden: 128,
+            moe_intermediate: 128,
+            seed: 0xF302,
+        },
+    ];
+    task_result(
+        task,
+        shapes
+            .iter()
+            .map(|&shape| run_qwen36_moe_pipeline_case(cfg, shape))
+            .collect(),
+    )
+}
+
 pub fn qwen36_batched_prefill_attn_full_stress(cfg: &KernelLabConfig) -> Result<TaskResult> {
     let task = crate::find_task("qwen36.batched_prefill_attn_full.stress").unwrap();
     let shapes = [
@@ -1246,6 +1275,243 @@ fn run_unpermute_case(cfg: &KernelLabConfig, shape: ExpertShape) -> Result<CaseR
     ))
 }
 
+fn run_qwen36_moe_pipeline_case(cfg: &KernelLabConfig, shape: ExpertShape) -> Result<CaseResult> {
+    ensure_hip(cfg)?;
+    let total = shape.n_tokens * shape.top_k;
+    let x_host = make_x_norm(shape.n_tokens, shape.hidden, shape.seed);
+    let topk_idx_host = make_topk_idx(
+        shape.n_tokens,
+        shape.top_k,
+        shape.num_experts,
+        shape.seed + 0x101,
+    );
+    let topk_w_host = make_topk_weight(shape.n_tokens, shape.top_k, shape.seed + 0x55);
+    let (want_offsets, want_token, want_kpos, want_weight) = cpu_router_reference(
+        shape.n_tokens,
+        shape.top_k,
+        shape.num_experts,
+        &topk_idx_host,
+        &topk_w_host,
+    );
+    let (gu_w, gu_s, gu_z, dp_w, dp_s, dp_z) = make_expert_weights(shape);
+    let want_expert = cpu_grouped_expert(
+        shape,
+        &x_host,
+        &want_token,
+        &want_offsets,
+        &gu_w,
+        &gu_s,
+        &gu_z,
+        &dp_w,
+        &dp_s,
+        &dp_z,
+    );
+    let want_inverse = inverse_permutation(shape.n_tokens, shape.top_k, &want_token, &want_kpos);
+    let want = cpu_unpermute_combine(
+        shape.n_tokens,
+        shape.top_k,
+        shape.hidden,
+        &want_inverse,
+        &want_weight,
+        &want_expert,
+    );
+
+    let x = upload_bf16(cfg.device, &x_host, &[shape.n_tokens, shape.hidden])?;
+    let topk_idx = upload_i32(cfg.device, &topk_idx_host, &[shape.n_tokens, shape.top_k])?;
+    let topk_weight = upload_bf16(cfg.device, &topk_w_host, &[shape.n_tokens, shape.top_k])?;
+    let mut offsets = GpuBuffer::zeros(cfg.device, ScalarType::U32, &[shape.num_experts + 1])?;
+    let mut perm_token = GpuBuffer::zeros(cfg.device, ScalarType::U32, &[total])?;
+    let mut perm_kpos = GpuBuffer::zeros(cfg.device, ScalarType::U32, &[total])?;
+    let mut perm_weight = GpuBuffer::zeros(cfg.device, ScalarType::BF16, &[total])?;
+    let two_i = 2 * shape.moe_intermediate;
+    let gu_w_buf = upload_u8(
+        cfg.device,
+        &gu_w,
+        &[shape.num_experts, two_i, shape.hidden / 2],
+    )?;
+    let gu_s_buf = upload_bf16(
+        cfg.device,
+        &gu_s,
+        &[
+            shape.num_experts,
+            two_i / GROUP_SIZE,
+            shape.hidden / GROUP_SIZE,
+        ],
+    )?;
+    let gu_z_buf = upload_bf16(
+        cfg.device,
+        &gu_z,
+        &[
+            shape.num_experts,
+            two_i / GROUP_SIZE,
+            shape.hidden / GROUP_SIZE,
+        ],
+    )?;
+    let dp_w_buf = upload_u8(
+        cfg.device,
+        &dp_w,
+        &[shape.num_experts, shape.hidden, shape.moe_intermediate / 2],
+    )?;
+    let dp_s_buf = upload_bf16(
+        cfg.device,
+        &dp_s,
+        &[
+            shape.num_experts,
+            shape.hidden / GROUP_SIZE,
+            shape.moe_intermediate / GROUP_SIZE,
+        ],
+    )?;
+    let dp_z_buf = upload_bf16(
+        cfg.device,
+        &dp_z,
+        &[
+            shape.num_experts,
+            shape.hidden / GROUP_SIZE,
+            shape.moe_intermediate / GROUP_SIZE,
+        ],
+    )?;
+    let mut expert_out = GpuBuffer::zeros(cfg.device, ScalarType::BF16, &[total, shape.hidden])?;
+    let mut counters = GpuBuffer::zeros(cfg.device, ScalarType::U32, &[1])?;
+    let mut combined = GpuBuffer::zeros(
+        cfg.device,
+        ScalarType::BF16,
+        &[shape.n_tokens, shape.hidden],
+    )?;
+
+    qwen36_moe::batched_prefill_router_permute_launch(
+        cfg.device,
+        shape.n_tokens,
+        shape.top_k,
+        shape.num_experts,
+        &topk_idx,
+        &topk_weight,
+        &mut offsets,
+        &mut perm_token,
+        &mut perm_kpos,
+        &mut perm_weight,
+    )?;
+    gpu_hal::sync(cfg.device)?;
+    let got_offsets = download_i32(&offsets)?;
+    let got_token = download_i32(&perm_token)?;
+    let got_kpos = download_i32(&perm_kpos)?;
+    let got_weight = download_bf16(&perm_weight)?;
+    let router_ok = router_exact(
+        RouterShape {
+            n_tokens: shape.n_tokens,
+            top_k: shape.top_k,
+            num_experts: shape.num_experts,
+            seed: shape.seed,
+        },
+        &got_offsets,
+        &got_token,
+        &got_kpos,
+        &got_weight,
+        &want_offsets,
+        &want_token,
+        &want_kpos,
+        &want_weight,
+    );
+    let inverse = inverse_permutation(shape.n_tokens, shape.top_k, &got_token, &got_kpos);
+    let inverse_buf = upload_i32(cfg.device, &inverse, &[total])?;
+
+    qwen36_moe::batched_prefill_grouped_expert_launch(
+        cfg.device,
+        shape.n_tokens,
+        shape.top_k,
+        shape.num_experts,
+        shape.hidden,
+        shape.moe_intermediate,
+        GROUP_SIZE,
+        &x,
+        &offsets,
+        &perm_token,
+        &gu_w_buf,
+        &gu_s_buf,
+        &gu_z_buf,
+        &dp_w_buf,
+        &dp_s_buf,
+        &dp_z_buf,
+        &mut expert_out,
+        &mut counters,
+    )?;
+    qwen36_moe::batched_prefill_unpermute_combine_launch(
+        cfg.device,
+        shape.n_tokens,
+        shape.top_k,
+        shape.hidden,
+        &inverse_buf,
+        &perm_weight,
+        &expert_out,
+        &mut combined,
+    )?;
+    gpu_hal::sync(cfg.device)?;
+    let got = download_bf16(&combined)?;
+    let (max_abs, max_rel) = max_abs_rel_bf16(&got, &want, 1e-3);
+    let (_, min_cos) = vector_abs_norm_and_min_cos(&got, &want, shape.hidden);
+
+    let samples = measure_us(cfg, || {
+        qwen36_moe::batched_prefill_router_permute_launch(
+            cfg.device,
+            shape.n_tokens,
+            shape.top_k,
+            shape.num_experts,
+            &topk_idx,
+            &topk_weight,
+            &mut offsets,
+            &mut perm_token,
+            &mut perm_kpos,
+            &mut perm_weight,
+        )?;
+        gpu_hal::memset_zeros(
+            cfg.device,
+            counters.as_mut_ptr(),
+            counters.elem_count() * std::mem::size_of::<u32>(),
+        )?;
+        qwen36_moe::batched_prefill_grouped_expert_launch(
+            cfg.device,
+            shape.n_tokens,
+            shape.top_k,
+            shape.num_experts,
+            shape.hidden,
+            shape.moe_intermediate,
+            GROUP_SIZE,
+            &x,
+            &offsets,
+            &perm_token,
+            &gu_w_buf,
+            &gu_s_buf,
+            &gu_z_buf,
+            &dp_w_buf,
+            &dp_s_buf,
+            &dp_z_buf,
+            &mut expert_out,
+            &mut counters,
+        )?;
+        qwen36_moe::batched_prefill_unpermute_combine_launch(
+            cfg.device,
+            shape.n_tokens,
+            shape.top_k,
+            shape.hidden,
+            &inverse_buf,
+            &perm_weight,
+            &expert_out,
+            &mut combined,
+        )
+    })?;
+
+    Ok(case_result(
+        "qwen36_moe_route_expert_combine",
+        expert_shape_map(shape),
+        router_ok && max_abs < 2e-2 && max_rel < 5e-2 && min_cos >= 0.999,
+        Some(max_abs),
+        Some(max_rel),
+        Some(min_cos),
+        Some(router_ok),
+        cfg,
+        &samples,
+    ))
+}
+
 fn measure_us<F>(cfg: &KernelLabConfig, mut f: F) -> Result<TimedSamples>
 where
     F: FnMut() -> Result<(), gpu_hal::GpuError>,
@@ -2052,6 +2318,20 @@ fn cpu_unpermute_combine(
         }
     }
     out
+}
+
+fn inverse_permutation(
+    n_tokens: usize,
+    top_k: usize,
+    perm_token: &[i32],
+    perm_kpos: &[i32],
+) -> Vec<i32> {
+    let total = n_tokens * top_k;
+    let mut inverse = vec![0i32; total];
+    for row in 0..total {
+        inverse[perm_token[row] as usize * top_k + perm_kpos[row] as usize] = row as i32;
+    }
+    inverse
 }
 
 fn attn_shape_map(shape: AttnShape) -> BTreeMap<String, usize> {

@@ -105,6 +105,16 @@ const TASKS: &[TaskDef] = &[
         run: tasks::functional_int4_dequant_matvec,
     },
     TaskDef {
+        id: "functional.qwen36_moe_route_expert_combine",
+        family: "functional",
+        description: "Compact Qwen3.6 MoE route -> grouped INT4 expert -> unpermute/combine conformance pipeline.",
+        tags: &["functional", "correctness", "compound", "qwen36", "moe"],
+        backend_support: HIP_BACKEND,
+        correctness: "Checks exact router layout and compares the final combined HIP token output against the Rust CPU MoE pipeline reference.",
+        required: false,
+        run: tasks::functional_qwen36_moe_route_expert_combine,
+    },
+    TaskDef {
         id: "qwen36.batched_prefill_attn_full",
         family: "qwen3.6-moe",
         description: "Qwen3.6 MoE batched full-attention prefill over representative decode-prefill shapes.",
@@ -322,7 +332,7 @@ mod tests {
     }
 
     #[test]
-    fn functional_tasks_are_optional_correctness_primitives() {
+    fn functional_tasks_are_optional_correctness_checks() {
         let tagged = describe_task_selector("tag:functional").unwrap();
         let ids: Vec<_> = tagged.iter().map(|task| task.id.as_str()).collect();
         assert_eq!(
@@ -331,12 +341,15 @@ mod tests {
                 "functional.rmsnorm_bf16",
                 "functional.rope_bf16",
                 "functional.int4_dequant_matvec",
+                "functional.qwen36_moe_route_expert_combine",
             ]
         );
         assert!(tagged.iter().all(|task| !task.required));
         assert!(tagged
             .iter()
-            .all(|task| task.tags.iter().any(|tag| tag == "correctness")
-                && task.tags.iter().any(|tag| tag == "primitive")));
+            .all(|task| task.tags.iter().any(|tag| tag == "correctness")));
+        assert!(tagged
+            .iter()
+            .any(|task| task.tags.iter().any(|tag| tag == "compound")));
     }
 }

@@ -69,7 +69,8 @@ larger optional shapes are behind `--tasks tag:stress`, and primitive
 correctness checks are behind `--tasks tag:functional`.
 
 The `tag:functional` suite is a non-gating correctness corpus for compact
-primitive-level checks such as BF16 RMSNorm, BF16 RoPE, and INT4 dequant matvec.
+primitive-level and compound checks such as BF16 RMSNorm, BF16 RoPE, INT4
+dequant matvec, and a Qwen3.6 MoE route -> grouped-expert -> combine pipeline.
 These tasks are intended to catch wrong-answer regressions before expanding
 performance coverage or promoting any subset into `all`.
 
