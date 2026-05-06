@@ -75,6 +75,36 @@ const TASKS: &[TaskDef] = &[
         run: tasks::qwen35_int4_awq_sparse_outlier_matvec,
     },
     TaskDef {
+        id: "functional.rmsnorm_bf16",
+        family: "functional",
+        description: "BF16 RMSNorm conformance cases over compact row shapes and deterministic edge-ish values.",
+        tags: &["functional", "correctness", "primitive", "rmsnorm"],
+        backend_support: HIP_BACKEND,
+        correctness: "Compares HIP BF16 RMSNorm output against the Rust CPU RMSNorm reference with BF16-rounded outputs.",
+        required: false,
+        run: tasks::functional_rmsnorm_bf16,
+    },
+    TaskDef {
+        id: "functional.rope_bf16",
+        family: "functional",
+        description: "BF16 RoPE conformance cases with nonzero position offsets and partial rotary dimensions.",
+        tags: &["functional", "correctness", "primitive", "rope"],
+        backend_support: HIP_BACKEND,
+        correctness: "Compares in-place HIP RoPE output against the Rust CPU RoPE reference using the same BF16 cosine and sine tables.",
+        required: false,
+        run: tasks::functional_rope_bf16,
+    },
+    TaskDef {
+        id: "functional.int4_dequant_matvec",
+        family: "functional",
+        description: "Compact INT4 dequant matvec conformance cases for packed weights and BF16 scale/zero tables.",
+        tags: &["functional", "correctness", "primitive", "int4", "quant"],
+        backend_support: HIP_BACKEND,
+        correctness: "Compares HIP BF16 INT4 matvec output against the Rust CPU packed-nibble dequant reference.",
+        required: false,
+        run: tasks::functional_int4_dequant_matvec,
+    },
+    TaskDef {
         id: "qwen36.batched_prefill_attn_full",
         family: "qwen3.6-moe",
         description: "Qwen3.6 MoE batched full-attention prefill over representative decode-prefill shapes.",
@@ -289,5 +319,24 @@ mod tests {
         let tagged = describe_task_selector("tag:stress").unwrap();
         assert_eq!(tagged.len(), 3);
         assert!(tagged.iter().all(|task| !task.required));
+    }
+
+    #[test]
+    fn functional_tasks_are_optional_correctness_primitives() {
+        let tagged = describe_task_selector("tag:functional").unwrap();
+        let ids: Vec<_> = tagged.iter().map(|task| task.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "functional.rmsnorm_bf16",
+                "functional.rope_bf16",
+                "functional.int4_dequant_matvec",
+            ]
+        );
+        assert!(tagged.iter().all(|task| !task.required));
+        assert!(tagged
+            .iter()
+            .all(|task| task.tags.iter().any(|tag| tag == "correctness")
+                && task.tags.iter().any(|tag| tag == "primitive")));
     }
 }

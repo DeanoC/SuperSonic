@@ -894,4 +894,19 @@ mod tests {
         assert_eq!(tasks.len(), 3);
         assert!(tasks.iter().all(|task| !task.required));
     }
+
+    #[test]
+    fn resolve_tasks_accepts_functional_tag_without_required_tasks() {
+        let tasks = resolve_tasks("tag:functional").unwrap();
+        let ids: Vec<_> = tasks.iter().map(|task| task.id).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "functional.rmsnorm_bf16",
+                "functional.rope_bf16",
+                "functional.int4_dequant_matvec"
+            ]
+        );
+        assert!(tasks.iter().all(|task| !task.required));
+    }
 }

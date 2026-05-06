@@ -46,6 +46,24 @@ struct Int4MatvecShape {
     seed: u64,
 }
 
+#[derive(Clone, Copy)]
+struct RmsNormShape {
+    n_rows: usize,
+    n_cols: usize,
+    eps: f32,
+    seed: u64,
+}
+
+#[derive(Clone, Copy)]
+struct RopeShape {
+    seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    pos_offset: usize,
+    seed: u64,
+}
+
 struct TimedSamples {
     source: &'static str,
     us: Vec<f64>,
@@ -154,6 +172,89 @@ pub fn qwen35_int4_awq_sparse_outlier_matvec(cfg: &KernelLabConfig) -> Result<Ta
         int4_matvec_shapes()
             .iter()
             .map(|&shape| run_int4_matvec_case(cfg, shape, Int4Sidecar::SparseOutlier))
+            .collect(),
+    )
+}
+
+pub fn functional_rmsnorm_bf16(cfg: &KernelLabConfig) -> Result<TaskResult> {
+    let task = crate::find_task("functional.rmsnorm_bf16").unwrap();
+    let shapes = [
+        RmsNormShape {
+            n_rows: 1,
+            n_cols: 64,
+            eps: 1e-6,
+            seed: 0xF001,
+        },
+        RmsNormShape {
+            n_rows: 3,
+            n_cols: 256,
+            eps: 1e-5,
+            seed: 0xF002,
+        },
+    ];
+    task_result(
+        task,
+        shapes
+            .iter()
+            .map(|&shape| run_rmsnorm_bf16_case(cfg, shape))
+            .collect(),
+    )
+}
+
+pub fn functional_rope_bf16(cfg: &KernelLabConfig) -> Result<TaskResult> {
+    let task = crate::find_task("functional.rope_bf16").unwrap();
+    let shapes = [
+        RopeShape {
+            seq_len: 4,
+            num_heads: 2,
+            head_dim: 16,
+            rotary_dim: 16,
+            pos_offset: 0,
+            seed: 0xF101,
+        },
+        RopeShape {
+            seq_len: 5,
+            num_heads: 3,
+            head_dim: 32,
+            rotary_dim: 24,
+            pos_offset: 7,
+            seed: 0xF102,
+        },
+    ];
+    task_result(
+        task,
+        shapes
+            .iter()
+            .map(|&shape| run_rope_bf16_case(cfg, shape))
+            .collect(),
+    )
+}
+
+pub fn functional_int4_dequant_matvec(cfg: &KernelLabConfig) -> Result<TaskResult> {
+    let task = crate::find_task("functional.int4_dequant_matvec").unwrap();
+    let shapes = [
+        Int4MatvecShape {
+            m: 1,
+            n: 128,
+            k: 128,
+            group_size: GROUP_SIZE,
+            sparse_cols: 8,
+            seed: 0xF201,
+        },
+        Int4MatvecShape {
+            m: 2,
+            n: 256,
+            k: 256,
+            group_size: GROUP_SIZE,
+            sparse_cols: 8,
+            seed: 0xF202,
+        },
+    ];
+    task_result(
+        task,
+        shapes
+            .iter()
+            .map(|&shape| run_int4_matvec_case(cfg, shape, Int4Sidecar::None))
             .collect(),
     )
 }
@@ -381,6 +482,128 @@ fn int4_matvec_shapes() -> [Int4MatvecShape; 2] {
             seed: 0xA35B,
         },
     ]
+}
+
+fn run_rmsnorm_bf16_case(cfg: &KernelLabConfig, shape: RmsNormShape) -> Result<CaseResult> {
+    ensure_hip(cfg)?;
+    let total = shape.n_rows * shape.n_cols;
+    let (input_host, _) = make_bf16(total, shape.seed);
+    let weight_host = make_rms_weight(shape.n_cols, shape.seed + 0x100);
+    let input = upload_bf16(cfg.device, &input_host, &[shape.n_rows, shape.n_cols])?;
+    let weight = upload_bf16(cfg.device, &weight_host, &[shape.n_cols])?;
+    let mut out = GpuBuffer::zeros(cfg.device, ScalarType::BF16, &[shape.n_rows, shape.n_cols])?;
+
+    prefill_ffi::rms_norm_rows_plain(
+        cfg.device,
+        ScalarType::BF16,
+        shape.n_rows,
+        shape.n_cols,
+        shape.eps,
+        &input,
+        &weight,
+        &mut out,
+    )?;
+    gpu_hal::sync(cfg.device)?;
+    let got = download_bf16(&out)?;
+    let want = cpu_rms_norm_plain_bf16(
+        shape.n_rows,
+        shape.n_cols,
+        shape.eps,
+        &input_host,
+        &weight_host,
+    );
+    let (max_abs, max_rel) = max_abs_rel_bf16(&got, &want, 1e-3);
+    let samples = measure_us(cfg, || {
+        prefill_ffi::rms_norm_rows_plain(
+            cfg.device,
+            ScalarType::BF16,
+            shape.n_rows,
+            shape.n_cols,
+            shape.eps,
+            &input,
+            &weight,
+            &mut out,
+        )
+    })?;
+    Ok(case_result(
+        "rmsnorm_bf16",
+        rmsnorm_shape_map(shape),
+        max_abs < 2e-2 && max_rel < 2e-2,
+        Some(max_abs),
+        Some(max_rel),
+        None,
+        None,
+        cfg,
+        &samples,
+    ))
+}
+
+fn run_rope_bf16_case(cfg: &KernelLabConfig, shape: RopeShape) -> Result<CaseResult> {
+    ensure_hip(cfg)?;
+    let total = shape.seq_len * shape.num_heads * shape.head_dim;
+    let (data_host, _) = make_bf16(total, shape.seed);
+    let (cos_host, sin_host) = make_rope_tables(
+        shape.pos_offset + shape.seq_len,
+        shape.rotary_dim / 2,
+        shape.seed + 0x100,
+    );
+    let cos = upload_bf16(
+        cfg.device,
+        &cos_host,
+        &[shape.pos_offset + shape.seq_len, shape.rotary_dim / 2],
+    )?;
+    let sin = upload_bf16(
+        cfg.device,
+        &sin_host,
+        &[shape.pos_offset + shape.seq_len, shape.rotary_dim / 2],
+    )?;
+    let mut data = upload_bf16(
+        cfg.device,
+        &data_host,
+        &[shape.seq_len, shape.num_heads, shape.head_dim],
+    )?;
+
+    prefill_ffi::apply_rope_prefill(
+        cfg.device,
+        ScalarType::BF16,
+        shape.seq_len,
+        shape.num_heads,
+        shape.head_dim,
+        shape.rotary_dim,
+        &cos,
+        &sin,
+        shape.pos_offset,
+        &mut data,
+    )?;
+    gpu_hal::sync(cfg.device)?;
+    let got = download_bf16(&data)?;
+    let want = cpu_apply_rope_bf16(shape, &data_host, &cos_host, &sin_host);
+    let (max_abs, max_rel) = max_abs_rel_bf16(&got, &want, 1e-3);
+    let samples = measure_us(cfg, || {
+        prefill_ffi::apply_rope_prefill(
+            cfg.device,
+            ScalarType::BF16,
+            shape.seq_len,
+            shape.num_heads,
+            shape.head_dim,
+            shape.rotary_dim,
+            &cos,
+            &sin,
+            shape.pos_offset,
+            &mut data,
+        )
+    })?;
+    Ok(case_result(
+        "rope_bf16",
+        rope_shape_map(shape),
+        max_abs < 2e-2 && max_rel < 2e-2,
+        Some(max_abs),
+        Some(max_rel),
+        None,
+        None,
+        cfg,
+        &samples,
+    ))
 }
 
 fn run_int4_matvec_case(
@@ -1240,6 +1463,86 @@ fn make_bf16(n: usize, seed: u64) -> (Vec<half::bf16>, Vec<f32>) {
     (bf, f32_round)
 }
 
+fn make_rms_weight(n_cols: usize, seed: u64) -> Vec<half::bf16> {
+    let mut state = seed;
+    (0..n_cols)
+        .map(|col| {
+            let (next, raw) = lcg(state);
+            state = next;
+            let base = 0.75 + ((raw % 2000) as f32 / 2000.0) * 0.5;
+            let edge = if col % 29 == 0 { 0.125 } else { 1.0 };
+            half::bf16::from_f32(base * edge)
+        })
+        .collect()
+}
+
+fn make_rope_tables(
+    n_positions: usize,
+    half_rot: usize,
+    seed: u64,
+) -> (Vec<half::bf16>, Vec<half::bf16>) {
+    let seed_phase = (seed % 997) as f32 * 0.0001;
+    let mut cos = Vec::with_capacity(n_positions * half_rot);
+    let mut sin = Vec::with_capacity(n_positions * half_rot);
+    for pos in 0..n_positions {
+        for i in 0..half_rot {
+            let theta = seed_phase + pos as f32 * 0.013 + i as f32 * 0.007;
+            cos.push(half::bf16::from_f32(theta.cos()));
+            sin.push(half::bf16::from_f32(theta.sin()));
+        }
+    }
+    (cos, sin)
+}
+
+fn cpu_rms_norm_plain_bf16(
+    n_rows: usize,
+    n_cols: usize,
+    eps: f32,
+    input: &[half::bf16],
+    weight: &[half::bf16],
+) -> Vec<half::bf16> {
+    let mut out = vec![half::bf16::ZERO; n_rows * n_cols];
+    for row in 0..n_rows {
+        let base = row * n_cols;
+        let mut mean_sq = 0.0f32;
+        for col in 0..n_cols {
+            let value = input[base + col].to_f32();
+            mean_sq += value * value;
+        }
+        let inv_rms = 1.0 / ((mean_sq / n_cols as f32) + eps).sqrt();
+        for col in 0..n_cols {
+            let value = input[base + col].to_f32() * inv_rms * weight[col].to_f32();
+            out[base + col] = half::bf16::from_f32(value);
+        }
+    }
+    out
+}
+
+fn cpu_apply_rope_bf16(
+    shape: RopeShape,
+    data: &[half::bf16],
+    cos: &[half::bf16],
+    sin: &[half::bf16],
+) -> Vec<half::bf16> {
+    let mut out = data.to_vec();
+    let half_rot = shape.rotary_dim / 2;
+    for pos in 0..shape.seq_len {
+        let table_base = (shape.pos_offset + pos) * half_rot;
+        for head in 0..shape.num_heads {
+            let base = (pos * shape.num_heads + head) * shape.head_dim;
+            for i in 0..half_rot {
+                let c = cos[table_base + i].to_f32();
+                let s = sin[table_base + i].to_f32();
+                let x0 = data[base + i].to_f32();
+                let x1 = data[base + i + half_rot].to_f32();
+                out[base + i] = half::bf16::from_f32(x0 * c - x1 * s);
+                out[base + i + half_rot] = half::bf16::from_f32(x1 * c + x0 * s);
+            }
+        }
+    }
+    out
+}
+
 fn cpu_attention_fp32(
     batch: usize,
     q_heads: usize,
@@ -1771,6 +2074,27 @@ fn int4_shape_map(shape: Int4MatvecShape) -> BTreeMap<String, usize> {
     ])
 }
 
+fn rmsnorm_shape_map(shape: RmsNormShape) -> BTreeMap<String, usize> {
+    BTreeMap::from([
+        ("n_rows".into(), shape.n_rows),
+        ("n_cols".into(), shape.n_cols),
+        (
+            "eps_scaled_1e9".into(),
+            (shape.eps * 1_000_000_000.0) as usize,
+        ),
+    ])
+}
+
+fn rope_shape_map(shape: RopeShape) -> BTreeMap<String, usize> {
+    BTreeMap::from([
+        ("seq_len".into(), shape.seq_len),
+        ("num_heads".into(), shape.num_heads),
+        ("head_dim".into(), shape.head_dim),
+        ("rotary_dim".into(), shape.rotary_dim),
+        ("pos_offset".into(), shape.pos_offset),
+    ])
+}
+
 fn router_shape_map(shape: RouterShape) -> BTreeMap<String, usize> {
     BTreeMap::from([
         ("n_tokens".into(), shape.n_tokens),
@@ -1874,5 +2198,48 @@ mod tests {
             }
             assert_eq!(got[out_col], half::bf16::from_f32(bf16_round_rne_f32(want)));
         }
+    }
+
+    #[test]
+    fn cpu_rms_norm_plain_matches_manual_reference() {
+        let input = vec![half::bf16::from_f32(3.0), half::bf16::from_f32(4.0)];
+        let weight = vec![half::bf16::from_f32(1.5), half::bf16::from_f32(0.5)];
+        let got = cpu_rms_norm_plain_bf16(1, 2, 0.0, &input, &weight);
+        let inv_rms = 1.0f32 / ((25.0f32 / 2.0).sqrt());
+        let want = [
+            half::bf16::from_f32(3.0 * inv_rms * 1.5),
+            half::bf16::from_f32(4.0 * inv_rms * 0.5),
+        ];
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn cpu_rope_bf16_rotates_first_half_against_second_half() {
+        let shape = RopeShape {
+            seq_len: 1,
+            num_heads: 1,
+            head_dim: 4,
+            rotary_dim: 4,
+            pos_offset: 0,
+            seed: 0,
+        };
+        let data = vec![
+            half::bf16::from_f32(1.0),
+            half::bf16::from_f32(2.0),
+            half::bf16::from_f32(3.0),
+            half::bf16::from_f32(4.0),
+        ];
+        let cos = vec![half::bf16::from_f32(0.0), half::bf16::from_f32(1.0)];
+        let sin = vec![half::bf16::from_f32(1.0), half::bf16::from_f32(0.0)];
+        let got = cpu_apply_rope_bf16(shape, &data, &cos, &sin);
+        assert_eq!(
+            got,
+            vec![
+                half::bf16::from_f32(-3.0),
+                half::bf16::from_f32(2.0),
+                half::bf16::from_f32(1.0),
+                half::bf16::from_f32(4.0),
+            ]
+        );
     }
 }
