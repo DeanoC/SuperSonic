@@ -460,6 +460,7 @@ fn matmul_proj(
     out: &mut GpuBuffer,
     int4_scale: Option<&GpuBuffer>,
     int4_zero: Option<&GpuBuffer>,
+    int4_awq_inv_scale: Option<&GpuBuffer>,
     int4_group_size: usize,
 ) -> Result<()> {
     let qtype = qwen35::weights::infer_lowbit_type(weight, k, int4_scale.is_some());
@@ -476,6 +477,7 @@ fn matmul_proj(
             weight,
             sc,
             zr,
+            int4_awq_inv_scale,
             int4_group_size,
             qtype,
             out,
@@ -2564,6 +2566,7 @@ impl DecodeEngine {
             &mut q_full,
             fw.q_proj_int4_scale.as_ref(),
             fw.q_proj_int4_zero.as_ref(),
+            fw.q_proj_awq_inv_scale.as_ref(),
             self.weights.int4_group_size,
         )?;
         if has_attn_gate {
@@ -2602,6 +2605,7 @@ impl DecodeEngine {
             &mut k_buf,
             fw.k_proj_int4_scale.as_ref(),
             fw.k_proj_int4_zero.as_ref(),
+            fw.k_proj_awq_inv_scale.as_ref(),
             self.weights.int4_group_size,
         )?;
         matmul_proj(
@@ -2618,6 +2622,7 @@ impl DecodeEngine {
             &mut v_buf,
             fw.v_proj_int4_scale.as_ref(),
             fw.v_proj_int4_zero.as_ref(),
+            fw.v_proj_awq_inv_scale.as_ref(),
             self.weights.int4_group_size,
         )?;
 
@@ -2819,6 +2824,7 @@ impl DecodeEngine {
             &mut q_full,
             fw.q_proj_int4_scale.as_ref(),
             fw.q_proj_int4_zero.as_ref(),
+            fw.q_proj_awq_inv_scale.as_ref(),
             self.weights.int4_group_size,
         )?;
         if has_attn_gate {
@@ -2856,6 +2862,7 @@ impl DecodeEngine {
             &mut k_buf,
             fw.k_proj_int4_scale.as_ref(),
             fw.k_proj_int4_zero.as_ref(),
+            fw.k_proj_awq_inv_scale.as_ref(),
             self.weights.int4_group_size,
         )?;
         matmul_proj(
@@ -2872,6 +2879,7 @@ impl DecodeEngine {
             &mut v_buf,
             fw.v_proj_int4_scale.as_ref(),
             fw.v_proj_int4_zero.as_ref(),
+            fw.v_proj_awq_inv_scale.as_ref(),
             self.weights.int4_group_size,
         )?;
         maybe_attn_rms_norm_rows(
@@ -3396,6 +3404,7 @@ impl DecodeEngine {
             &mut proj_out,
             fw.o_proj_int4_scale.as_ref(),
             fw.o_proj_int4_zero.as_ref(),
+            fw.o_proj_awq_inv_scale.as_ref(),
             self.weights.int4_group_size,
         )?;
         residual_add(self.ordinal, hidden_dim, &mut hidden_out, &proj_out)?;
@@ -3985,6 +3994,7 @@ impl DecodeEngine {
                 &*self.weights.lm_head,
                 scale,
                 zero,
+                self.weights.lm_head_awq_inv_scale.as_ref(),
                 self.weights.int4_group_size,
                 qwen35::weights::LOWBIT_NATIVE_INT4,
                 &mut self.logits_buf,
@@ -4719,6 +4729,7 @@ impl DecodeEngine {
                         q_full,
                         fw.q_proj_int4_scale.as_ref(),
                         fw.q_proj_int4_zero.as_ref(),
+                        fw.q_proj_awq_inv_scale.as_ref(),
                         self.weights.int4_group_size,
                     )?;
                 }
@@ -4737,6 +4748,7 @@ impl DecodeEngine {
                     q_full,
                     fw.q_proj_int4_scale.as_ref(),
                     fw.q_proj_int4_zero.as_ref(),
+                    fw.q_proj_awq_inv_scale.as_ref(),
                     self.weights.int4_group_size,
                 )?;
             }
@@ -4806,6 +4818,7 @@ impl DecodeEngine {
                         k_buf,
                         fw.k_proj_int4_scale.as_ref(),
                         fw.k_proj_int4_zero.as_ref(),
+                        fw.k_proj_awq_inv_scale.as_ref(),
                         self.weights.int4_group_size,
                     )?;
                 }
@@ -4824,6 +4837,7 @@ impl DecodeEngine {
                     k_buf,
                     fw.k_proj_int4_scale.as_ref(),
                     fw.k_proj_int4_zero.as_ref(),
+                    fw.k_proj_awq_inv_scale.as_ref(),
                     self.weights.int4_group_size,
                 )?;
             }
@@ -4871,6 +4885,7 @@ impl DecodeEngine {
                         v_buf,
                         fw.v_proj_int4_scale.as_ref(),
                         fw.v_proj_int4_zero.as_ref(),
+                        fw.v_proj_awq_inv_scale.as_ref(),
                         self.weights.int4_group_size,
                     )?;
                 }
@@ -4889,6 +4904,7 @@ impl DecodeEngine {
                     v_buf,
                     fw.v_proj_int4_scale.as_ref(),
                     fw.v_proj_int4_zero.as_ref(),
+                    fw.v_proj_awq_inv_scale.as_ref(),
                     self.weights.int4_group_size,
                 )?;
             }
@@ -9059,6 +9075,7 @@ impl DecodeEngine {
                     proj_out,
                     fw.o_proj_int4_scale.as_ref(),
                     fw.o_proj_int4_zero.as_ref(),
+                    fw.o_proj_awq_inv_scale.as_ref(),
                     self.weights.int4_group_size,
                 )?;
             }
@@ -9160,6 +9177,7 @@ impl DecodeEngine {
             &mut qkv,
             lw.qkv_proj_int4_scale.as_ref(),
             lw.qkv_proj_int4_zero.as_ref(),
+            lw.qkv_proj_awq_inv_scale.as_ref(),
             self.weights.int4_group_size,
         )?;
         let qkv_trace = if trace_output {
@@ -9184,6 +9202,7 @@ impl DecodeEngine {
             &mut z,
             lw.z_proj_int4_scale.as_ref(),
             lw.z_proj_int4_zero.as_ref(),
+            lw.z_proj_awq_inv_scale.as_ref(),
             self.weights.int4_group_size,
         )?;
         let z_trace = if trace_output {
@@ -9208,6 +9227,7 @@ impl DecodeEngine {
             &mut a,
             None,
             None,
+            None,
             self.weights.int4_group_size,
         )?;
         matmul_proj(
@@ -9222,6 +9242,7 @@ impl DecodeEngine {
             lw.b_proj_int8_scale.as_ref(),
             self.weights.fp8_block_size,
             &mut b,
+            None,
             None,
             None,
             self.weights.int4_group_size,
@@ -9584,6 +9605,7 @@ impl DecodeEngine {
             &mut proj_out,
             lw.out_proj_int4_scale.as_ref(),
             lw.out_proj_int4_zero.as_ref(),
+            lw.out_proj_awq_inv_scale.as_ref(),
             self.weights.int4_group_size,
         )?;
         let proj_trace = if trace_output {
@@ -9715,6 +9737,7 @@ impl DecodeEngine {
                     &mut scratch.gate,
                     lw.gate_proj_int4_scale.as_ref(),
                     lw.gate_proj_int4_zero.as_ref(),
+                    lw.gate_proj_awq_inv_scale.as_ref(),
                     self.weights.int4_group_size,
                 )?;
             }
@@ -9758,6 +9781,7 @@ impl DecodeEngine {
                     &mut scratch.up,
                     lw.up_proj_int4_scale.as_ref(),
                     lw.up_proj_int4_zero.as_ref(),
+                    lw.up_proj_awq_inv_scale.as_ref(),
                     self.weights.int4_group_size,
                 )?;
             }
@@ -9813,6 +9837,7 @@ impl DecodeEngine {
                 &mut scratch.down,
                 lw.down_proj_int4_scale.as_ref(),
                 lw.down_proj_int4_zero.as_ref(),
+                lw.down_proj_awq_inv_scale.as_ref(),
                 self.weights.int4_group_size,
             )?;
         }
@@ -11326,6 +11351,7 @@ impl DecodeEngine {
                 &*self.weights.lm_head,
                 scale,
                 zero,
+                self.weights.lm_head_awq_inv_scale.as_ref(),
                 self.weights.int4_group_size,
                 qwen35::weights::LOWBIT_NATIVE_INT4,
                 &mut self.logits_buf,
@@ -11640,6 +11666,7 @@ impl DecodeEngine {
                 &*self.weights.lm_head,
                 scale,
                 zero,
+                self.weights.lm_head_awq_inv_scale.as_ref(),
                 self.weights.int4_group_size,
                 qwen35::weights::LOWBIT_NATIVE_INT4,
                 &mut cache.logits_buf,
@@ -12148,6 +12175,7 @@ impl DecodeEngine {
                 &*self.weights.lm_head,
                 scale,
                 zero,
+                self.weights.lm_head_awq_inv_scale.as_ref(),
                 self.weights.int4_group_size,
                 qwen35::weights::LOWBIT_NATIVE_INT4,
                 &mut self.logits_buf,

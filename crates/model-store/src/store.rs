@@ -450,6 +450,7 @@ mod tests {
             quant_profile: None,
             source_format: None,
             source_quant: None,
+            quant_method: None,
             tensors: vec![
                 TensorMeta {
                     name: "lm_head.weight".to_string(),
@@ -532,6 +533,7 @@ mod tests {
             quant_profile: None,
             source_format: None,
             source_quant: None,
+            quant_method: None,
             tensors: vec![TensorMeta {
                 name: "bad.weight".to_string(),
                 shape: vec![2],

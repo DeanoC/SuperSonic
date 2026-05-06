@@ -3823,6 +3823,7 @@ int matmul_int4_dequant_device(
     const void* rhs_int4,
     const void* scale,
     const void* zero,
+    const void* awq_inv_scale,
     int group_size,
     void* out
 ) {
@@ -3841,6 +3842,7 @@ int matmul_int4_dequant_device(
         static_cast<const uint8_t*>(rhs_int4),
         static_cast<const T*>(scale),
         static_cast<const T*>(zero),
+        static_cast<const T*>(awq_inv_scale),
         group_size,
         static_cast<T*>(out));
     hipError_t launch_err = hipGetLastError();
@@ -3858,6 +3860,7 @@ static int matmul_int4_dequant_wmma_bf16_device(
     const void* rhs_int4,
     const void* scale,
     const void* zero,
+    const void* awq_inv_scale,
     int group_size,
     void* out
 ) {
@@ -3885,6 +3888,7 @@ static int matmul_int4_dequant_wmma_bf16_device(
             static_cast<const uint8_t*>(rhs_int4),
             static_cast<const hip_bfloat16*>(scale),
             static_cast<const hip_bfloat16*>(zero),
+            static_cast<const hip_bfloat16*>(awq_inv_scale),
             group_size,
             static_cast<hip_bfloat16*>(out));
         hipError_t launch_err = hipGetLastError();
@@ -3909,6 +3913,7 @@ static int matmul_int4_dequant_wmma_bf16_device(
         static_cast<const uint8_t*>(rhs_int4),
         static_cast<const hip_bfloat16*>(scale),
         static_cast<const hip_bfloat16*>(zero),
+        static_cast<const hip_bfloat16*>(awq_inv_scale),
         group_size,
         static_cast<hip_bfloat16*>(out));
     hipError_t launch_err = hipGetLastError();
@@ -3927,6 +3932,7 @@ extern "C" int supersonic_qwen35_4b_hip_matmul_int4_dequant(
     const void* rhs_int4,
     const void* scale,
     const void* zero,
+    const void* awq_inv_scale,
     int group_size,
     int quant_type,
     void* out) {
@@ -3948,11 +3954,11 @@ extern "C" int supersonic_qwen35_4b_hip_matmul_int4_dequant(
             device_supports_wmma_bf16(static_cast<int>(device_ordinal))) {
             return matmul_int4_dequant_wmma_bf16_device(
                 static_cast<int>(device_ordinal), batch_elems, m, n, k,
-                lhs, rhs_int4, scale, zero, group_size, out);
+                lhs, rhs_int4, scale, zero, awq_inv_scale, group_size, out);
         }
         return matmul_int4_dequant_device<hip_bfloat16>(
             static_cast<int>(device_ordinal), batch_elems, m, n, k,
-            lhs, rhs_int4, scale, zero, group_size, out);
+            lhs, rhs_int4, scale, zero, awq_inv_scale, group_size, out);
     }
     default:
         return 272;

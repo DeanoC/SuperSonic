@@ -3794,9 +3794,11 @@ extern "C" int supersonic_qwen35_4b_hip_matmul_int4_dequant(
     const void* rhs_int4,
     const void* scale,
     const void* zero,
+    const void* awq_inv_scale,
     int group_size,
     int quant_type,
     void* out) {
+    (void)awq_inv_scale;
     switch (dtype) {
     case 2:
         return matmul_int4_dequant_device<hip_bfloat16>(

@@ -20,10 +20,7 @@ pub(crate) fn check_qwen35_vram(
     );
     let effective_fixed = effective_fixed_vram(
         vram.fixed_bytes,
-        cli.q4km,
-        cli.q4km_gptq,
-        cli.int4,
-        cli.fp8_runtime,
+        crate::bakes::effective_quant_profile(cli)?,
     );
     let kv_bytes = kv_estimate.total_bytes;
     let estimated_vram = ((effective_fixed + kv_bytes) as f64 * vram.overhead_factor) as u64;
@@ -120,35 +117,32 @@ fn qwen35_kv_cache_vram_estimate(
     }
 }
 
-fn effective_fixed_vram(
-    fixed_bytes: u64,
-    q4km: bool,
-    q4km_gptq: bool,
-    int4: bool,
-    fp8_runtime: bool,
-) -> u64 {
-    if q4km {
-        (fixed_bytes as f64 * 0.30) as u64
-    } else if q4km_gptq || int4 {
-        // INT4: weights ~= fixed * 0.9, scratch ~= fixed * 0.1
-        // INT4 weights = weights / 4 + ~5% scale/zero overhead
-        // total ~= fixed * 0.9 * 0.3 + fixed * 0.1 = fixed * 0.37
-        (fixed_bytes as f64 * 0.37) as u64
-    } else if fp8_runtime {
-        // FP8: weights / 2 plus scale/scratch overhead.
-        (fixed_bytes as f64 * 0.55) as u64
-    } else {
-        fixed_bytes
+fn effective_fixed_vram(fixed_bytes: u64, profile: model_store::manifest::QuantProfile) -> u64 {
+    use model_store::manifest::QuantProfile;
+    match profile {
+        QuantProfile::Q4Km => (fixed_bytes as f64 * 0.30) as u64,
+        profile if profile.is_native_int4_runtime() => {
+            // INT4: weights ~= fixed * 0.9, scratch ~= fixed * 0.1.
+            // INT4 weights = weights / 4 + ~5% scale/zero overhead.
+            (fixed_bytes as f64 * 0.37) as u64
+        }
+        QuantProfile::Fp8Native => (fixed_bytes as f64 * 0.55) as u64,
+        QuantProfile::Higgs4 | QuantProfile::QuipE8 | QuantProfile::QtipTrellis2 => {
+            (fixed_bytes as f64 * 0.32) as u64
+        }
+        _ => fixed_bytes,
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use model_store::manifest::QuantProfile;
+
     use super::{effective_fixed_vram, qwen35_kv_cache_vram_estimate};
 
     #[test]
     fn q4km_gptq_uses_int4_vram_estimate() {
-        assert_eq!(effective_fixed_vram(100, false, true, false, false), 37);
+        assert_eq!(effective_fixed_vram(100, QuantProfile::Q4KmGptq), 37);
     }
 
     #[test]

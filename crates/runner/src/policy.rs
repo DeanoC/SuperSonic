@@ -1,11 +1,15 @@
 use anyhow::Result;
+use model_store::manifest::QuantProfile;
 
 use crate::certified_kv;
 use crate::registry::{Backend, GpuArch, ModelFamily, ModelVariant};
 use crate::Cli;
 
 pub(crate) fn q4km_like(cli: &Cli) -> bool {
-    cli.q4km || cli.q4km_gptq
+    matches!(
+        crate::bakes::effective_quant_profile(cli),
+        Ok(QuantProfile::Q4Km | QuantProfile::Q4KmGptq)
+    )
 }
 
 pub(crate) fn validate_global_flags(
@@ -14,13 +18,12 @@ pub(crate) fn validate_global_flags(
     backend: Backend,
 ) -> Result<()> {
     let q4km_like = q4km_like(cli);
+    let profile = crate::bakes::effective_quant_profile(cli)?;
     if cli.q4km && cli.q4km_gptq {
         anyhow::bail!("--q4km is mutually exclusive with --q4km-gptq");
     }
-    if q4km_like && (cli.int4 || cli.int8 || cli.fp8_runtime) {
-        anyhow::bail!(
-            "--q4km/--q4km-gptq are mutually exclusive with --int4, --int8, and --fp8-runtime"
-        );
+    if q4km_like && cli.int8 {
+        anyhow::bail!("--q4km/--q4km-gptq are mutually exclusive with --int8");
     }
     if q4km_like
         && !matches!(
@@ -33,14 +36,48 @@ pub(crate) fn validate_global_flags(
     if q4km_like && backend != Backend::Cuda {
         anyhow::bail!("--q4km/--q4km-gptq are currently supported only on CUDA");
     }
-    if cli.gguf_file.is_some() && !cli.q4km {
+    if cli.gguf_file.is_some() && profile != QuantProfile::Q4Km {
         anyhow::bail!("--gguf-file requires --q4km");
     }
     if cli.no_bake && q4km_like {
         anyhow::bail!("--q4km/--q4km-gptq require a baked package; omit --no-bake");
     }
-    if cli.int8 && (cli.int4 || cli.fp8_runtime) {
-        anyhow::bail!("--int8 is mutually exclusive with --int4 and --fp8-runtime");
+    if cli.int8 && profile != QuantProfile::Bf16 {
+        anyhow::bail!(
+            "--int8 is mutually exclusive with --weight-quant and legacy weight quant flags"
+        );
+    }
+    if profile.is_runtime_backed_lowbit() {
+        anyhow::bail!(
+            "--weight-quant {profile} has manifest and package naming support, but Qwen HIP runtime kernels/loaders for this profile are not implemented yet"
+        );
+    }
+    if matches!(
+        (profile, model_variant.family()),
+        (
+            QuantProfile::Int4Awq | QuantProfile::Int4Autoround | QuantProfile::Int4Hqq,
+            ModelFamily::Qwen36Moe
+        )
+    ) {
+        anyhow::bail!(
+            "--weight-quant {profile} is currently supported only for Qwen3.5; Qwen3.6-MoE bake selection/runtime support is not wired for this profile yet"
+        );
+    }
+    if profile == QuantProfile::Int4Awq && backend == Backend::Cuda {
+        anyhow::bail!(
+            "--weight-quant int4-awq is currently supported only on HIP; CUDA INT4 kernels do not apply AWQ sidecars yet"
+        );
+    }
+    if matches!(
+        profile,
+        QuantProfile::Int4Awq | QuantProfile::Int4Autoround | QuantProfile::Int4Hqq
+    ) && !matches!(
+        model_variant.family(),
+        ModelFamily::Qwen35 | ModelFamily::Qwen36Moe
+    ) {
+        anyhow::bail!(
+            "--weight-quant {profile} is Qwen-first; Gemma 4 and Phi 4 ports are follow-up work"
+        );
     }
     if cli.int8 && model_variant.family() != ModelFamily::Llama31 {
         anyhow::bail!("--int8 is currently supported only for llama3.1-8b on CUDA");
@@ -63,6 +100,57 @@ pub(crate) fn validate_global_flags(
         anyhow::bail!("--certified-kv-shadow-validate requires --certified-kv");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::validate_global_flags;
+    use crate::registry::{Backend, ModelVariant};
+    use crate::Cli;
+
+    fn cli(extra: &[&str]) -> Cli {
+        let mut args = vec!["supersonic", "--model-dir", "/tmp/model", "--dry-run"];
+        args.extend_from_slice(extra);
+        Cli::parse_from(args)
+    }
+
+    #[test]
+    fn rejects_new_native_int4_profiles_for_qwen36_until_selection_is_wired() {
+        for profile in ["int4-awq", "int4-autoround", "int4-hqq"] {
+            let err = validate_global_flags(
+                &cli(&["--weight-quant", profile]),
+                &ModelVariant::Qwen3_6_35B_A3B,
+                Backend::Hip,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("Qwen3.6-MoE bake selection/runtime support is not wired"));
+        }
+    }
+
+    #[test]
+    fn rejects_awq_on_cuda_until_sidecars_are_applied() {
+        let err = validate_global_flags(
+            &cli(&["--weight-quant", "int4-awq"]),
+            &ModelVariant::Qwen3_5_4B,
+            Backend::Cuda,
+        )
+        .expect_err("CUDA AWQ should fail until sidecars are applied")
+        .to_string();
+        assert!(err.contains("CUDA INT4 kernels do not apply AWQ sidecars"));
+    }
+
+    #[test]
+    fn allows_gptq_for_qwen36_native_int4_layout() {
+        validate_global_flags(
+            &cli(&["--weight-quant", "int4-gptq"]),
+            &ModelVariant::Qwen3_6_35B_A3B,
+            Backend::Hip,
+        )
+        .expect("GPTQ remains the wired Qwen3.6 native INT4 path");
+    }
 }
 
 pub(crate) fn validate_dflash_flags(cli: &Cli, model_variant: &ModelVariant) -> Result<()> {

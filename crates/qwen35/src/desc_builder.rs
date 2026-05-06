@@ -186,10 +186,13 @@ pub fn build_int4_scale_descs(weights: &Qwen35Weights) -> Option<Vec<INT4ScaleDe
         // Common MLP scales/zeros
         d.gate_proj_scale = ptr(&lw.gate_proj_int4_scale);
         d.gate_proj_zero = ptr(&lw.gate_proj_int4_zero);
+        d.gate_proj_awq_inv_scale = ptr(&lw.gate_proj_awq_inv_scale);
         d.up_proj_scale = ptr(&lw.up_proj_int4_scale);
         d.up_proj_zero = ptr(&lw.up_proj_int4_zero);
+        d.up_proj_awq_inv_scale = ptr(&lw.up_proj_awq_inv_scale);
         d.down_proj_scale = ptr(&lw.down_proj_int4_scale);
         d.down_proj_zero = ptr(&lw.down_proj_int4_zero);
+        d.down_proj_awq_inv_scale = ptr(&lw.down_proj_awq_inv_scale);
         d.gate_proj_type = infer_lowbit_type(
             &lw.gate_proj_w,
             weights.config.hidden_size,
@@ -211,10 +214,13 @@ pub fn build_int4_scale_descs(weights: &Qwen35Weights) -> Option<Vec<INT4ScaleDe
                 let lin = lw.linear.as_ref().unwrap();
                 d.qkv_proj_scale = ptr(&lin.qkv_proj_int4_scale);
                 d.qkv_proj_zero = ptr(&lin.qkv_proj_int4_zero);
+                d.qkv_proj_awq_inv_scale = ptr(&lin.qkv_proj_awq_inv_scale);
                 d.z_proj_scale = ptr(&lin.z_proj_int4_scale);
                 d.z_proj_zero = ptr(&lin.z_proj_int4_zero);
+                d.z_proj_awq_inv_scale = ptr(&lin.z_proj_awq_inv_scale);
                 d.linear_out_proj_scale = ptr(&lin.out_proj_int4_scale);
                 d.linear_out_proj_zero = ptr(&lin.out_proj_int4_zero);
+                d.linear_out_proj_awq_inv_scale = ptr(&lin.out_proj_awq_inv_scale);
                 d.qkv_proj_type = infer_lowbit_type(
                     &lin.qkv_proj_w,
                     weights.config.hidden_size,
@@ -235,12 +241,16 @@ pub fn build_int4_scale_descs(weights: &Qwen35Weights) -> Option<Vec<INT4ScaleDe
                 let fa = lw.full.as_ref().unwrap();
                 d.q_proj_scale = ptr(&fa.q_proj_int4_scale);
                 d.q_proj_zero = ptr(&fa.q_proj_int4_zero);
+                d.q_proj_awq_inv_scale = ptr(&fa.q_proj_awq_inv_scale);
                 d.k_proj_scale = ptr(&fa.k_proj_int4_scale);
                 d.k_proj_zero = ptr(&fa.k_proj_int4_zero);
+                d.k_proj_awq_inv_scale = ptr(&fa.k_proj_awq_inv_scale);
                 d.v_proj_scale = ptr(&fa.v_proj_int4_scale);
                 d.v_proj_zero = ptr(&fa.v_proj_int4_zero);
+                d.v_proj_awq_inv_scale = ptr(&fa.v_proj_awq_inv_scale);
                 d.o_proj_scale = ptr(&fa.o_proj_int4_scale);
                 d.o_proj_zero = ptr(&fa.o_proj_int4_zero);
+                d.o_proj_awq_inv_scale = ptr(&fa.o_proj_awq_inv_scale);
                 d.q_proj_type = infer_lowbit_type(
                     &fa.q_proj_w,
                     weights.config.hidden_size,
