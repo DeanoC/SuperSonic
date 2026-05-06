@@ -37,6 +37,7 @@ fn main() {
 
     let sources = [
         ("lds_bandwidth.hip", "lds_bandwidth.o"),
+        ("hbm_bandwidth.hip", "hbm_bandwidth.o"),
         ("profile_bridge.cpp", "profile_bridge.o"),
     ];
     let mut objects = Vec::new();

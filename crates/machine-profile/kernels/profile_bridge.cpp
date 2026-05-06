@@ -32,3 +32,84 @@ extern "C" double mp_lds_bandwidth_run(int device, uint32_t cu_count, uint64_t i
     double secs = std::chrono::duration<double>(t1 - t0).count();
     return (double)total / secs / 1e9; // GB/s aggregate
 }
+
+extern "C" __global__ void mp_hbm_read_kernel(const float4 *src, uint64_t n4, float *sink);
+extern "C" __global__ void mp_hbm_write_kernel(float4 *dst, uint64_t n4, float seed);
+extern "C" __global__ void mp_hbm_copy_kernel(const float4 *src, float4 *dst, uint64_t n4);
+
+extern "C" double mp_hbm_bandwidth_read(int device, uint64_t bytes)
+{
+    hipSetDevice(device);
+    uint64_t n4 = bytes / 16;
+    float4 *src = nullptr; float *sink = nullptr;
+    hipMalloc(&src, n4 * sizeof(float4));
+    hipMalloc(&sink, sizeof(float));
+    hipMemset(src, 0, n4 * sizeof(float4));
+    int threads = 256;
+    uint64_t blocks = (n4 + threads - 1) / threads;
+
+    for (int w = 0; w < 3; ++w) {
+        hipLaunchKernelGGL(mp_hbm_read_kernel, dim3(blocks), dim3(threads), 0, 0, src, n4, sink);
+    }
+    hipDeviceSynchronize();
+    auto t0 = std::chrono::high_resolution_clock::now();
+    int reps = 10;
+    for (int i = 0; i < reps; ++i)
+        hipLaunchKernelGGL(mp_hbm_read_kernel, dim3(blocks), dim3(threads), 0, 0, src, n4, sink);
+    hipDeviceSynchronize();
+    auto t1 = std::chrono::high_resolution_clock::now();
+    double secs = std::chrono::duration<double>(t1 - t0).count();
+
+    hipFree(src); hipFree(sink);
+    return (double)(bytes * reps) / secs / 1e9;
+}
+
+extern "C" double mp_hbm_bandwidth_write(int device, uint64_t bytes)
+{
+    hipSetDevice(device);
+    uint64_t n4 = bytes / 16;
+    float4 *dst = nullptr;
+    hipMalloc(&dst, n4 * sizeof(float4));
+    int threads = 256;
+    uint64_t blocks = (n4 + threads - 1) / threads;
+
+    for (int w = 0; w < 3; ++w)
+        hipLaunchKernelGGL(mp_hbm_write_kernel, dim3(blocks), dim3(threads), 0, 0, dst, n4, 1.0f);
+    hipDeviceSynchronize();
+    auto t0 = std::chrono::high_resolution_clock::now();
+    int reps = 10;
+    for (int i = 0; i < reps; ++i)
+        hipLaunchKernelGGL(mp_hbm_write_kernel, dim3(blocks), dim3(threads), 0, 0, dst, n4, 1.0f);
+    hipDeviceSynchronize();
+    auto t1 = std::chrono::high_resolution_clock::now();
+    double secs = std::chrono::duration<double>(t1 - t0).count();
+
+    hipFree(dst);
+    return (double)(bytes * reps) / secs / 1e9;
+}
+
+extern "C" double mp_hbm_bandwidth_copy(int device, uint64_t bytes)
+{
+    hipSetDevice(device);
+    uint64_t n4 = bytes / 16;
+    float4 *src = nullptr, *dst = nullptr;
+    hipMalloc(&src, n4 * sizeof(float4));
+    hipMalloc(&dst, n4 * sizeof(float4));
+    hipMemset(src, 0, n4 * sizeof(float4));
+    int threads = 256;
+    uint64_t blocks = (n4 + threads - 1) / threads;
+
+    for (int w = 0; w < 3; ++w)
+        hipLaunchKernelGGL(mp_hbm_copy_kernel, dim3(blocks), dim3(threads), 0, 0, src, dst, n4);
+    hipDeviceSynchronize();
+    auto t0 = std::chrono::high_resolution_clock::now();
+    int reps = 10;
+    for (int i = 0; i < reps; ++i)
+        hipLaunchKernelGGL(mp_hbm_copy_kernel, dim3(blocks), dim3(threads), 0, 0, src, dst, n4);
+    hipDeviceSynchronize();
+    auto t1 = std::chrono::high_resolution_clock::now();
+    double secs = std::chrono::duration<double>(t1 - t0).count();
+
+    hipFree(src); hipFree(dst);
+    return (double)(2 * bytes * reps) / secs / 1e9;
+}
