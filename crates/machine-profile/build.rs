@@ -21,20 +21,36 @@ fn have_hipcc() -> bool {
         .status().map(|s| s.success()).unwrap_or(false)
 }
 
+fn have_nvcc() -> bool {
+    Command::new("sh").arg("-lc").arg("command -v nvcc >/dev/null 2>&1")
+        .status().map(|s| s.success()).unwrap_or(false)
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=HIP_ARCH");
     println!("cargo:rerun-if-env-changed=SUPERSONIC_BACKENDS");
     println!("cargo:rustc-check-cfg=cfg(supersonic_backend_hip)");
 
-    // Mirror kernel-ffi's SUPERSONIC_BACKENDS gating: explicit non-HIP
-    // selection (e.g. `cuda` or `metal`) must skip the HIP path even when
-    // `hipcc` is in PATH, otherwise CUDA-only builds can fail to link
-    // amdhip64 or get the wrong profiler enabled.
+    // Mirror kernel-ffi's SUPERSONIC_BACKENDS gating exactly:
+    // - explicit non-HIP selection (e.g. `cuda` or `metal`) must skip the
+    //   HIP path even when `hipcc` is in PATH;
+    // - in `auto` mode on dual-toolchain hosts (both nvcc and hipcc present)
+    //   kernel-ffi and gpu-hal prefer CUDA, so we must NOT compile HIP here
+    //   either, otherwise the rest of the workspace would build CUDA while
+    //   this crate links amdhip64.
     let requested = env::var("SUPERSONIC_BACKENDS").unwrap_or_else(|_| "auto".to_string());
     let normalized = requested.trim().to_ascii_lowercase();
-    let want_hip =
-        normalized == "auto" || normalized.split(',').any(|p| p.trim() == "hip");
+    let explicit_hip = normalized.split(',').any(|p| p.trim() == "hip");
+    let auto = normalized == "auto";
+    let want_hip = if explicit_hip {
+        true
+    } else if auto {
+        // Auto mode: defer to CUDA when both toolchains are present.
+        !have_nvcc()
+    } else {
+        false
+    };
     if !want_hip {
         return;
     }

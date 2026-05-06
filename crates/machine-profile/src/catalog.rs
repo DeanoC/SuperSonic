@@ -83,8 +83,11 @@ const CPUS: &[CpuEntry] = &[
 ];
 
 pub fn lookup_gpu(arch: &str, pci_id: Option<&str>) -> Option<GpuPeaks> {
+    // HIP/ROCm reports CDNA target IDs as e.g. "gfx90a:sramecc+:xnack-".
+    // Strip the feature suffix so "gfx90a" in the catalog still matches.
+    let base_arch = arch.split(':').next().unwrap_or(arch);
     GPUS.iter()
-        .find(|e| e.arch == arch && (e.pci_id.is_none() || e.pci_id == pci_id))
+        .find(|e| e.arch == base_arch && (e.pci_id.is_none() || e.pci_id == pci_id))
         .map(|e| e.peaks)
 }
 
@@ -106,6 +109,15 @@ mod tests {
     #[test]
     fn unknown_gpu_returns_none() {
         assert!(lookup_gpu("gfx99999", None).is_none());
+    }
+
+    #[test]
+    fn cdna_target_id_with_feature_suffix_matches_base_arch() {
+        // ROCm reports CDNA targets like "gfx90a:sramecc+:xnack-".
+        // The catalog entry is keyed by "gfx90a" alone.
+        let peaks = lookup_gpu("gfx90a:sramecc+:xnack-", None)
+            .expect("should match base arch after stripping feature suffix");
+        assert!((peaks.theoretical_hbm_gb_s - 1638.0).abs() < 1e-3);
     }
 
     #[test]
