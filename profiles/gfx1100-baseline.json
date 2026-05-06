@@ -1,13 +1,13 @@
 {
   "schema_version": 1,
   "profile_version": "machine-profile/0.1.0",
-  "fingerprint": "blake3:15f4031b9a7304e596148e58772c1629679394ffc648d6bc6c7062a4bd7fac22",
+  "fingerprint": "blake3:04cf567da3bb122f3aa8807b88d832c1450cb2dc5eb936343500768fc3d21ea7",
   "fingerprint_components": {
     "cpu": "Intel(R) Core(TM) Ultra 7 270K Plus stepping=2 microcode=0x11b",
     "gpus": [
       "HIP:gfx1100:0x744c"
     ],
-    "driver": "unknown",
+    "driver": "rocm 7.1.52 linux 6.19.14-300.fc44.x86_64",
     "isa": [
       "fpu",
       "vme",
@@ -155,7 +155,7 @@
       "FMA"
     ]
   },
-  "captured_at": "2026-05-06T10:53:48.578802514+00:00",
+  "captured_at": "2026-05-06T11:11:38.698257985+00:00",
   "warnings": [
     {
       "component": "cpu.dram",
@@ -357,28 +357,28 @@
         "size_bytes": 49152,
         "line_bytes": 64,
         "ways": 12,
-        "measured_lat_ns": 5.6438814,
-        "measured_bw_gb_s": 3.130713099972531
+        "measured_lat_ns": 4.9891176,
+        "measured_bw_gb_s": 2.925746939139946
       },
       "l2": {
         "size_bytes": 3145728,
         "line_bytes": 64,
         "ways": 12,
-        "measured_lat_ns": 5.2231382,
-        "measured_bw_gb_s": 3.0900051643696314
+        "measured_lat_ns": 5.2329664,
+        "measured_bw_gb_s": 2.8647001947226585
       },
       "l3": {
         "size_bytes": 37748736,
         "line_bytes": 64,
         "ways": 12,
-        "measured_lat_ns": 15.2682843,
-        "measured_bw_gb_s": 2.958213299238163
+        "measured_lat_ns": 14.9703452,
+        "measured_bw_gb_s": 2.7911566044204497
       }
     },
     "vector_peak": {
       "fp32": {
-        "measured_per_unit": 2.964141784855241,
-        "measured_aggregate": 71.13940283652579,
+        "measured_per_unit": 3.0090239724549726,
+        "measured_aggregate": 72.21657533891934,
         "theoretical_aggregate": null,
         "ratio": null
       },
@@ -406,29 +406,29 @@
       "cu_count": 48,
       "wave_size": 32,
       "lds_per_cu_bytes": 65536,
-      "lds_bw_per_cu_gb_s": 217.1652710952653,
-      "lds_bw_aggregate_gb_s": 10423.933012572734,
+      "lds_bw_per_cu_gb_s": 211.52263348983738,
+      "lds_bw_aggregate_gb_s": 10153.086407512194,
       "vram_bw": {
-        "read_gb_s": 807.7014450951406,
-        "write_gb_s": 866.2631394664021,
-        "copy_gb_s": 788.2357435606431,
+        "read_gb_s": 782.0919244524405,
+        "write_gb_s": 814.3496393095688,
+        "copy_gb_s": 776.4434792568878,
         "theoretical_peak_gb_s": 800.0,
-        "ratio_read": 1.0096268063689258
+        "ratio_read": 0.9776149055655506
       },
       "mma_peak": {
         "f16": {
-          "measured_tflops": 71.48301774768213,
+          "measured_tflops": 71.4348130262585,
           "theoretical_tflops": 122.8,
-          "ratio": 0.5821092650462714
+          "ratio": 0.5817167184548737
         },
         "bf16": {
-          "measured_tflops": 70.69574039538021,
+          "measured_tflops": 70.34220124206536,
           "theoretical_tflops": 122.8,
-          "ratio": 0.575698211688764
+          "ratio": 0.5728192283555811
         },
         "fp8_e4m3": null,
         "i8": {
-          "measured_tflops": 70.58031639588346,
+          "measured_tflops": 71.09929465932582,
           "theoretical_tflops": null,
           "ratio": null
         }
@@ -438,64 +438,64 @@
         "h2d_gb_s_by_size": [
           {
             "bytes": 4096,
-            "gb_s": 0.15836167577853627
+            "gb_s": 0.15817057350589797
           },
           {
             "bytes": 65536,
-            "gb_s": 4.816798083526458
+            "gb_s": 4.782918668907809
           },
           {
             "bytes": 1048576,
-            "gb_s": 20.92651491386337
+            "gb_s": 20.964365910133168
           },
           {
             "bytes": 4194304,
-            "gb_s": 25.28106933462874
+            "gb_s": 25.140606400492405
           },
           {
             "bytes": 16777216,
-            "gb_s": 26.733627616691216
+            "gb_s": 26.68916479515888
           },
           {
             "bytes": 67108864,
-            "gb_s": 26.982033585581355
+            "gb_s": 26.958271917800584
           },
           {
             "bytes": 268435456,
-            "gb_s": 27.014313204130765
+            "gb_s": 26.97890212432048
           }
         ],
         "d2h_gb_s_by_size": [
           {
             "bytes": 4096,
-            "gb_s": 0.15701062653555295
+            "gb_s": 0.15710227613237285
           },
           {
             "bytes": 65536,
-            "gb_s": 5.082107528340935
+            "gb_s": 5.155190214452168
           },
           {
             "bytes": 1048576,
-            "gb_s": 22.122571206480167
+            "gb_s": 22.306271522210256
           },
           {
             "bytes": 4194304,
-            "gb_s": 26.733909835763534
+            "gb_s": 26.663269899555125
           },
           {
             "bytes": 16777216,
-            "gb_s": 28.181123157078304
+            "gb_s": 28.14205372954571
           },
           {
             "bytes": 67108864,
-            "gb_s": 28.503513252329913
+            "gb_s": 28.490172135813093
           },
           {
             "bytes": 268435456,
-            "gb_s": 28.563912943500192
+            "gb_s": 28.564717661520508
           }
         ],
-        "duplex_gb_s": 50.733699888188916
+        "duplex_gb_s": 50.49651676019782
       },
       "clock_rate_khz_measured": 2482000
     }
@@ -503,6 +503,6 @@
   "system": {
     "ram_bytes": 67061014528,
     "os": "redacted",
-    "kernel_driver": "unknown"
+    "kernel_driver": "rocm 7.1.52 linux 6.19.14-300.fc44.x86_64"
   }
 }

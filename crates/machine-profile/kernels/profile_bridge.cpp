@@ -343,6 +343,21 @@ extern "C" int mp_query_device_info(int device,
     return 0;
 }
 
+// Returns the HIP runtime version (e.g. 60020322 for ROCm 6.2.2 build 322)
+// in version_out. Stable input for fingerprinting that changes when ROCm
+// userspace updates. Returns 0 on success.
+extern "C" int mp_hip_runtime_version(uint32_t *version_out)
+{
+    int v = 0;
+    int status = hipRuntimeGetVersion(&v);
+    if (status != 0) {
+        *version_out = 0;
+        return status;
+    }
+    *version_out = (uint32_t)v;
+    return 0;
+}
+
 extern "C" double mp_pcie_duplex(int device, uint64_t bytes)
 {
     hipSetDevice(device);

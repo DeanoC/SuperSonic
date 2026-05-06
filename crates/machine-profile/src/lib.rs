@@ -62,7 +62,7 @@ pub fn measure() -> Profile {
     let mut gpus = gpu::run_all();
     apply_catalog(&mut gpus, &cpu_profile);
 
-    let driver = std::env::var("KFD_DRIVER_VERSION").unwrap_or_else(|_| "unknown".into());
+    let driver = detect_driver();
     let fp_components = FingerprintComponents {
         cpu: format!("{} stepping={} microcode={}",
             cpu_profile.model,
@@ -118,7 +118,7 @@ pub fn fingerprint_only() -> (String, schema::FingerprintComponents) {
             }
         }
     }
-    let driver = std::env::var("KFD_DRIVER_VERSION").unwrap_or_else(|_| "unknown".into());
+    let driver = detect_driver();
 
     let components = FingerprintComponents {
         cpu: format!(
@@ -170,6 +170,33 @@ fn read_uname_release() -> String {
     std::fs::read_to_string("/proc/sys/kernel/osrelease")
         .map(|s| format!("linux {}", s.trim()))
         .unwrap_or_else(|_| "unknown".into())
+}
+
+/// Detect a stable driver-version string for fingerprinting.
+///
+/// Combines the kernel release (changes on amdgpu module updates) with the
+/// HIP runtime version (changes on ROCm userspace updates). On non-HIP
+/// builds or when HIP is unavailable, falls back to kernel release alone.
+/// `KFD_DRIVER_VERSION` is honoured as an explicit override for users who
+/// want to pin a specific value.
+fn detect_driver() -> String {
+    if let Ok(env) = std::env::var("KFD_DRIVER_VERSION") {
+        return env;
+    }
+    let kernel = read_uname_release();
+    #[cfg(supersonic_backend_hip)]
+    {
+        let mut version: u32 = 0;
+        let status = unsafe { gpu::hip_ffi::mp_hip_runtime_version(&mut version) };
+        if status == 0 && version != 0 {
+            // 60020322 → "rocm 6.2.2"
+            let major = version / 10_000_000;
+            let minor = (version / 100_000) % 100;
+            let patch = (version / 1_000) % 100;
+            return format!("rocm {major}.{minor}.{patch} {kernel}");
+        }
+    }
+    kernel
 }
 
 #[cfg(test)]

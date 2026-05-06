@@ -13,7 +13,13 @@ pub fn measure(num_p_cores: u32) -> VectorPeak {
 }
 
 fn measure_fp32(num_p_cores: u32) -> MeasuredVsTheoretical {
-    let per_core_gflops = if cfg!(target_arch = "x86_64") && std::is_x86_feature_detected!("avx2") {
+    // peak_fp32_avx2 is compiled with target_feature = "avx2,fma" and uses
+    // _mm256_fmadd_ps. AVX2 does not imply FMA on x86_64 — early Haswell-era
+    // and a few low-power lines have one without the other, so gate on both.
+    let per_core_gflops = if cfg!(target_arch = "x86_64")
+        && std::is_x86_feature_detected!("avx2")
+        && std::is_x86_feature_detected!("fma")
+    {
         unsafe { peak_fp32_avx2() }
     } else {
         peak_fp32_scalar()

@@ -24,6 +24,10 @@ extern "C" {
     /// Probe the device's per-dtype WMMA support. Writes 0/1 flags into
     /// `flags_out_3[0..3]` (f16, bf16, i8). Returns 0 on success.
     pub fn mp_wmma_probe(device: i32, flags_out_3: *mut i32) -> i32;
+
+    /// HIP runtime version (e.g. 60020322 for ROCm 6.2.2). Used as a stable
+    /// fingerprint input that changes when ROCm userspace updates.
+    pub fn mp_hip_runtime_version(version_out: *mut u32) -> i32;
 }
 
 #[cfg(supersonic_backend_hip)]

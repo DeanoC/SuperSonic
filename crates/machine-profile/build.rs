@@ -24,7 +24,20 @@ fn have_hipcc() -> bool {
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=HIP_ARCH");
+    println!("cargo:rerun-if-env-changed=SUPERSONIC_BACKENDS");
     println!("cargo:rustc-check-cfg=cfg(supersonic_backend_hip)");
+
+    // Mirror kernel-ffi's SUPERSONIC_BACKENDS gating: explicit non-HIP
+    // selection (e.g. `cuda` or `metal`) must skip the HIP path even when
+    // `hipcc` is in PATH, otherwise CUDA-only builds can fail to link
+    // amdhip64 or get the wrong profiler enabled.
+    let requested = env::var("SUPERSONIC_BACKENDS").unwrap_or_else(|_| "auto".to_string());
+    let normalized = requested.trim().to_ascii_lowercase();
+    let want_hip =
+        normalized == "auto" || normalized.split(',').any(|p| p.trim() == "hip");
+    if !want_hip {
+        return;
+    }
 
     if !have_hipcc() {
         println!("cargo:warning=hipcc not found; machine-profile GPU kernels disabled");
