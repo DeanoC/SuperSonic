@@ -9,6 +9,12 @@ This doc tracks **correctness**. For measured speedups see
 For the model × quant × arch baseline see
 [supported-matrix.md](supported-matrix.md).
 
+CUDA `sm90` currently follows the `sm86` CUDA feature surface: H100-class
+devices compile native SM90 CUDA kernels but reuse the validated `sm86`
+registry geometry and feature gates. Dedicated H100 validation is tracked in
+[supported-matrix.md § CUDA on sm90](supported-matrix.md#cuda-on-sm90) and
+[performance.md § CUDA — sm90](performance.md#cuda--sm90-nvidia-h100-80gb-hbm3).
+
 ## How to read
 
 - **✅** = validated end-to-end (parity test or oracle agreement).
@@ -48,6 +54,9 @@ stable CLI surface).
 
 Support:
 
+The `sm86` CUDA column also applies to `sm90` unless a per-arch note says
+otherwise; the current H100 path is an inherited CUDA compatibility lane.
+
 | Model            | gfx1100 | gfx1150 | gfx942 | sm86  | apple-m4 |
 |------------------|:-------:|:-------:|:------:|:-----:|:--------:|
 | qwen3.5-0.8b     |    ✅   |   ✅    |  ✅¹  |  ✅   |    —     |
@@ -81,6 +90,9 @@ Flags: `--virtual-kv` (default ON for Qwen3.6-MoE on HIP per
 [lowlevel-memory.md](lowlevel-memory.md)).
 
 Support:
+
+The CUDA `sm86` column also applies to `sm90` for VMM: no VMM surface is
+registered for CUDA dense/Qwen3.6-MoE today.
 
 | Model            | gfx1100 | gfx1150 | gfx942 | sm86  |
 |------------------|:-------:|:-------:|:------:|:-----:|
@@ -116,6 +128,8 @@ full prompt-length sweep.
 
 Support:
 
+The CUDA `sm86` rejection also applies to `sm90`.
+
 | Target × Draft                 | gfx1100 | gfx1150 | gfx942 | sm86 |
 |--------------------------------|:-------:|:-------:|:------:|:----:|
 | qwen3.5-9b BF16 + qwen3.5-0.8b |    ✅   |   TBM   |  TBM   |  ❌¹ |
@@ -136,6 +150,8 @@ See [dflash.md](dflash.md) for the design and the M3/M4 milestones.
 
 Support:
 
+The CUDA `sm86` rejection also applies to `sm90`.
+
 | Target          | gfx1100 | gfx1150 | gfx942 | sm86 |
 |-----------------|:-------:|:-------:|:------:|:----:|
 | qwen3.5-9b INT4 |    ✅   |   ✅    |  TBM   |  ❌  |
@@ -155,6 +171,9 @@ Flags: governed by `--qwen36-moe-prefetch-policy <name>` and a few
 
 Support:
 
+The CUDA `sm86` column also applies to `sm90`: no CUDA MoE prefetch lane is
+registered today.
+
 | Model            | gfx1100 | gfx1150 | gfx942 | sm86 |
 |------------------|:-------:|:-------:|:------:|:----:|
 | qwen3.6-35b-a3b  |    ✅   |    —    |   —    |   —  |
@@ -170,6 +189,9 @@ Flags: `--certified-kv`, `--certified-kv-shadow-validate`. Requires
 [certified-kv-audit-map.md](certified-kv-audit-map.md).
 
 Support:
+
+The CUDA `sm86` column also applies to `sm90`; H100 inherits the same
+certified-KV feature gates pending dedicated quality/performance runs.
 
 | Model        | gfx1100 | gfx1150 | gfx942 | sm86 |
 |--------------|:-------:|:-------:|:------:|:----:|

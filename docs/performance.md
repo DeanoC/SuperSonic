@@ -700,6 +700,74 @@ CUDA `sm86` tracks detailed kernel-level optimization history for both the
 `0.8B` and `4B` hero lanes in
 [qwen35-sm86-optimization.md](qwen35-sm86-optimization.md).
 
+## CUDA — `sm90` (NVIDIA H100 80GB HBM3)
+
+Measurements recorded 2026-05-07 on an NVIDIA H100 80GB HBM3, driver
+580.126.09, CUDA toolkit 13.0 (`nvcc` 13.0.88). The H100 path compiles native
+SM90 CUDA objects but currently reuses the CUDA `sm86` registry geometry and
+kernel families. Treat these as a compatibility baseline, not a
+Hopper-optimized result.
+
+Before measuring, a resident vLLM `Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8`
+server using ~74 GiB of VRAM was stopped. The benchmark model directories were
+empty before the run; SuperSonic downloaded the `bakes-v2` BF16 release
+artifacts and bundled HF metadata on first use:
+
+- `/home/deano/models/Qwen3.5-0.8B-sm90`
+- `/home/deano/models/Qwen3.5-4B-sm90`
+
+Smoke checks:
+
+| Model         | Prompt tokens | Generated | Prefill | Decode | Result |
+|---------------|--------------:|----------:|--------:|-------:|--------|
+| qwen3.5-0.8b  |             6 |         4 |   39 ms |  64 ms | pass |
+| qwen3.5-4b    |             6 |         4 |  103 ms | 127 ms | pass |
+
+Warmed benchmark settings:
+
+```bash
+PATH=/home/deano/.cargo/bin:$PATH \
+SUPERSONIC_BACKENDS=cuda TARGET_PROMPT_TOKENS=224 MAX_NEW_TOKENS=32 \
+WARMUP_RUNS=3 TIMED_RUNS=5 COMPARE_LEGACY=0 \
+  ./tests/sm86/bench_qwen08.sh /home/deano/models/Qwen3.5-0.8B-sm90
+
+PATH=/home/deano/.cargo/bin:$PATH \
+SUPERSONIC_BACKENDS=cuda TARGET_PROMPT_TOKENS=224 MAX_NEW_TOKENS=32 \
+WARMUP_RUNS=3 TIMED_RUNS=5 \
+  ./tests/sm86/bench_qwen4b_single.sh /home/deano/models/Qwen3.5-4B-sm90
+
+PATH=/home/deano/.cargo/bin:$PATH \
+SUPERSONIC_BACKENDS=cuda TARGET_PROMPT_TOKENS=224 MAX_NEW_TOKENS=32 \
+WARMUP_RUNS=3 TIMED_RUNS=5 BATCH_SIZE=2 \
+  ./tests/sm86/bench_qwen4b_batch.sh /home/deano/models/Qwen3.5-4B-sm90
+```
+
+The prompt calibrator selected `prompt_repeat=32`, producing 416 prompt
+tokens. The table reports the mean over 5 timed runs after 3 warmup runs.
+
+| Model                       | Path                    | Prefill     | Decode      | Decode mean |
+|-----------------------------|-------------------------|------------:|------------:|------------:|
+| qwen3.5-0.8b                | fast-greedy BF16        | 1362.1 tok/s | 32.2 tok/s  | 994.8 ms / 32 tok |
+| qwen3.5-4b `--batch-size 1` | `--force-kernel-decode` | 784.9 tok/s  | 26.4 tok/s  | 1210.2 ms / 32 tok |
+| qwen3.5-4b `--batch-size 2` | batched BF16            | 785.8 tok/s  | 11.3 tok/s¹ | 5675.2 ms / 64 aggregate tok |
+
+¹ Aggregate tokens/second across `--batch-size 2`.
+
+The quick combined harness also passed:
+
+```bash
+PATH=/home/deano/.cargo/bin:$PATH \
+SUPERSONIC_BACKENDS=cuda RUNS=3 MAX_NEW_TOKENS=16 PROMPT_REPEAT=16 \
+BATCH_SIZE_4B=2 \
+  ./tests/sm86/bench.sh \
+  /home/deano/models/Qwen3.5-0.8B-sm90 \
+  /home/deano/models/Qwen3.5-4B-sm90
+```
+
+That quick pass produced 224 prompt tokens and 16 generated tokens. The first
+0.8B prefill included a cold-start outlier (`4551 ms`, then `189/186 ms`), so
+the warmed table above is the preferred H100 baseline.
+
 ## Metal — `apple-m4` (Apple M4)
 
 The current Metal numbers are still prototype-grade and are scoped narrowly to

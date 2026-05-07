@@ -347,7 +347,9 @@ fn compile_cuda(kernel_dir: &Path, out_dir: &Path) {
             .arg("-o")
             .arg(&obj_path);
         for arch in &archs {
-            cmd.arg(format!("-gencode=arch=compute_{arch},code=sm_{arch}"));
+            cmd.arg(format!(
+                "-gencode=arch=compute_{arch},code=[sm_{arch},compute_{arch}]"
+            ));
         }
         run(&mut cmd, context);
         objects.push(obj_path);
