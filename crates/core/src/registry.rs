@@ -113,6 +113,7 @@ pub enum GpuArch {
     Gfx1150,
     Gfx942,
     Sm86,
+    Sm90,
     AppleM4,
     Unknown(String),
 }
@@ -128,6 +129,7 @@ impl GpuArch {
             },
             Backend::Cuda => match name.trim() {
                 "sm86" => Self::Sm86,
+                "sm90" => Self::Sm90,
                 other => Self::Unknown(other.to_owned()),
             },
             Backend::Metal => match name.trim() {
@@ -145,6 +147,7 @@ impl fmt::Display for GpuArch {
             Self::Gfx1150 => write!(f, "gfx1150"),
             Self::Gfx942 => write!(f, "gfx942"),
             Self::Sm86 => write!(f, "sm86"),
+            Self::Sm90 => write!(f, "sm90"),
             Self::AppleM4 => write!(f, "apple-m4"),
             Self::Unknown(s) => write!(f, "{s}"),
         }
@@ -169,7 +172,9 @@ pub struct ArchProfile {
 impl ArchProfile {
     pub fn for_arch(arch: &GpuArch) -> Self {
         let memory = match arch {
-            GpuArch::Gfx1100 | GpuArch::Gfx942 | GpuArch::Sm86 => MemoryArchitecture::Discrete,
+            GpuArch::Gfx1100 | GpuArch::Gfx942 | GpuArch::Sm86 | GpuArch::Sm90 => {
+                MemoryArchitecture::Discrete
+            }
             GpuArch::Gfx1150 | GpuArch::AppleM4 => MemoryArchitecture::Unified,
             GpuArch::Unknown(_) => MemoryArchitecture::Discrete,
         };
@@ -865,9 +870,24 @@ pub fn lookup(
     backend: &Backend,
     arch: &GpuArch,
 ) -> Option<&'static RegistryEntry> {
-    REGISTRY
+    let direct = REGISTRY
         .iter()
-        .find(|e| e.model == *model && e.backend == *backend && e.arch == *arch)
+        .find(|e| e.model == *model && e.backend == *backend && e.arch == *arch);
+    if direct.is_some() {
+        return direct;
+    }
+
+    // H100-class CUDA devices report `sm90`. The current CUDA kernels are
+    // architecture-neutral enough to reuse the validated CUDA registry
+    // geometry. Builds on an H100 emit native SM90 cubins; builds on older
+    // CUDA hosts embed PTX alongside their native cubins for forward JIT.
+    if *backend == Backend::Cuda && *arch == GpuArch::Sm90 {
+        return REGISTRY
+            .iter()
+            .find(|e| e.model == *model && e.backend == *backend && e.arch == GpuArch::Sm86);
+    }
+
+    None
 }
 
 pub fn supported_models_list() -> Vec<&'static str> {
@@ -892,11 +912,17 @@ pub fn supported_models_list() -> Vec<&'static str> {
 }
 
 pub fn supported_archs_for(model: &ModelVariant, backend: &Backend) -> Vec<String> {
-    REGISTRY
+    let mut archs: Vec<String> = REGISTRY
         .iter()
         .filter(|e| e.model == *model && e.backend == *backend)
         .map(|e| e.arch.to_string())
-        .collect()
+        .collect();
+    if *backend == Backend::Cuda && archs.iter().any(|arch| arch == "sm86") {
+        archs.push("sm90".to_string());
+    }
+    archs.sort();
+    archs.dedup();
+    archs
 }
 
 #[cfg(test)]
@@ -907,6 +933,33 @@ mod tests {
     fn cuda_sm86_qwen_registry_includes_2b_and_9b() {
         assert!(lookup(&ModelVariant::Qwen3_5_2B, &Backend::Cuda, &GpuArch::Sm86,).is_some());
         assert!(lookup(&ModelVariant::Qwen3_5_9B, &Backend::Cuda, &GpuArch::Sm86,).is_some());
+    }
+
+    #[test]
+    fn cuda_sm90_reuses_cuda_registry_entries() {
+        assert_eq!(
+            GpuArch::from_backend_name(&Backend::Cuda, "sm90"),
+            GpuArch::Sm90
+        );
+        let profile = ArchProfile::for_arch(&GpuArch::Sm90);
+        assert_eq!(profile.memory, MemoryArchitecture::Discrete);
+        assert_eq!(profile.buffer_policy, BufferPolicy::all_default());
+        for model in [
+            ModelVariant::Qwen3_5_0_8B,
+            ModelVariant::Qwen3_5_2B,
+            ModelVariant::Qwen3_5_4B,
+            ModelVariant::Qwen3_5_9B,
+            ModelVariant::Qwen3_6_27B,
+            ModelVariant::Qwen3_6_35B_A3B,
+            ModelVariant::Gemma4_E2B,
+            ModelVariant::Phi4_Mini,
+            ModelVariant::Llama3_1_8B,
+        ] {
+            assert!(lookup(&model, &Backend::Cuda, &GpuArch::Sm90).is_some());
+            assert!(supported_archs_for(&model, &Backend::Cuda)
+                .iter()
+                .any(|arch| arch == "sm90"));
+        }
     }
 
     #[test]

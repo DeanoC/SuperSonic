@@ -6,12 +6,13 @@ which GPU architecture. The cells below track *correctness* — see
 and [docs/feature-compatibility.md](feature-compatibility.md) for the
 runtime-feature compatibility grid.
 
-Five backend surfaces are validated or in bring-up today:
+Six backend surfaces are validated or in bring-up today:
 
 - **HIP / `gfx1100`** — AMD Radeon RX 7900 XTX (RDNA 3, 24 GiB)
 - **HIP / `gfx1150`** — AMD Radeon 890M iGPU (RDNA 3.5)
 - **HIP / `gfx942`** — AMD Instinct MI300X-class (CDNA 3, wave64 bring-up)
 - **CUDA / `sm86`** — NVIDIA RTX 3090-class (Ampere)
+- **CUDA / `sm90`** — NVIDIA H100 80GB HBM3 (Hopper)
 - **Metal / `apple-m4`** — Apple M4, BF16 Qwen3.5 0.8B (CLI + `supersonic-serve`)
 
 ### HIP on `gfx1100`
@@ -171,6 +172,31 @@ kernel path by default; replayed-prefill decode is legacy debugging behavior
 behind `--force-replay-decode`. CUDA `--kv-fp8` single-sequence decode still
 uses replayed GPU prefill for correctness.
 
+### CUDA on `sm90`
+
+`sm90` currently reuses the CUDA `sm86` registry geometry and kernel families,
+while `kernel-ffi/build.rs` compiles the CUDA sources as native SM90 cubins
+from the detected H100 compute capability. This is a compatibility bring-up
+lane, not a Hopper-specific retune.
+
+| Model            | BF16 | INT4 | FP8 runtime | FP8 KV |
+|------------------|:----:|:----:|:-----------:|:------:|
+| qwen3.5-0.8b     |  ✅¹ |  ✅² |      ✅²    |   ✅²  |
+| qwen3.5-2b       |  ✅² |  ✅² |      ✅²    |   ✅²  |
+| qwen3.5-4b       |  ✅¹ |  ✅² |      ✅²    |   ✅²  |
+| qwen3.5-9b       |  ✅² |  ✅² |      ✅²    |   ✅²  |
+| gemma4-e2b       |  ✅² |  —   |      —      |    —   |
+| phi4-mini        |  ✅² |  ✅² |      ✅²    |   ⏳²  |
+| llama3.1-8b      |  ✅² |  —   |      —      |   ✅²  |
+
+¹ Smoke-tested and benchmarked on an NVIDIA H100 80GB HBM3 on 2026-05-07 with
+  CUDA 13.0 / driver 580.126.09, using the `bakes-v2` BF16 release artifacts.
+  See [docs/performance.md](performance.md#cuda--sm90-nvidia-h100-80gb-hbm3).
+² Registered on `sm90` by reusing the validated CUDA `sm86` entry for this
+  model/lane. Dedicated H100 parity coverage is pending; if you need strict
+  certification for one of these inherited lanes, run the matching `tests/sm86`
+  validation script on the H100 and record the result here.
+
 ### Metal on `apple-m4`
 
 | Model            | BF16 | INT4 | FP8 runtime | FP8 KV |
@@ -190,4 +216,3 @@ Metal v2 is a single supported surface:
   validation against a baked INT4 model is pending hardware time
 - `--fp8-runtime`, `--kv-fp8`, `--batch-size > 1`, `--force-kernel-decode`,
   and `--force-component-decode` are all rejected at startup
-
