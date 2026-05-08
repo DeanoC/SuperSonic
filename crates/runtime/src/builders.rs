@@ -19,6 +19,7 @@ pub(crate) fn build_qwen(
 ) -> Result<(InferenceSession, Vec<u32>)> {
     let mut params = match &entry.params {
         FamilyParams::Qwen35(p) => *p,
+        FamilyParams::Qwen3Moe(_) => unreachable!("caller filtered to Qwen3.5"),
         FamilyParams::Qwen36Moe(_) => unreachable!("caller filtered to Qwen3.5"),
         FamilyParams::Gemma4(_) => unreachable!("caller filtered to Qwen"),
         FamilyParams::Phi4(_) => unreachable!("caller filtered to Qwen"),
@@ -96,6 +97,7 @@ pub(crate) fn build_gemma4(
     let params = match &entry.params {
         FamilyParams::Gemma4(p) => p,
         FamilyParams::Qwen35(_) => unreachable!("caller filtered to Gemma 4"),
+        FamilyParams::Qwen3Moe(_) => unreachable!("caller filtered to Gemma 4"),
         FamilyParams::Qwen36Moe(_) => unreachable!("caller filtered to Gemma 4"),
         FamilyParams::Phi4(_) => unreachable!("caller filtered to Gemma 4"),
         FamilyParams::Llama31(_) => unreachable!("caller filtered to Gemma 4"),

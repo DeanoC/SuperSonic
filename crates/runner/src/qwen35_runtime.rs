@@ -42,6 +42,7 @@ pub(crate) fn run_qwen35(
 
     let params = match &entry.params {
         FamilyParams::Qwen35(p) => p,
+        FamilyParams::Qwen3Moe(_) => unreachable!("qwen3-moe handled above"),
         FamilyParams::Qwen36Moe(_) => unreachable!("qwen3.6-moe handled above"),
         FamilyParams::Gemma4(_) => unreachable!("gemma4 handled above"),
         FamilyParams::Phi4(_) => unreachable!("phi4 handled above"),

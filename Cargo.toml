@@ -11,6 +11,7 @@ members = [
     "crates/phi4",
     "crates/qwen35",
     "crates/qwen35_dflash",
+    "crates/qwen3_moe",
     "crates/qwen36_moe",
     "crates/runtime",
     "crates/runner",

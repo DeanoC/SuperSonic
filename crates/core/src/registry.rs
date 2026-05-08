@@ -6,6 +6,7 @@ pub use gpu_hal::{AllocStrategy, Backend, BufferPolicy, MemoryArchitecture};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelFamily {
+    Qwen3Moe,
     Qwen35,
     Qwen36Moe,
     Gemma4,
@@ -16,6 +17,7 @@ pub enum ModelFamily {
 impl fmt::Display for ModelFamily {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Qwen3Moe => write!(f, "qwen3-moe"),
             Self::Qwen35 => write!(f, "qwen3.5"),
             Self::Qwen36Moe => write!(f, "qwen3.6-moe"),
             Self::Gemma4 => write!(f, "gemma4"),
@@ -31,6 +33,7 @@ pub enum ModelVariant {
     Qwen3_5_2B,
     Qwen3_5_4B,
     Qwen3_5_9B,
+    Qwen3_30B_A3B,
     Qwen3_6_27B,
     Qwen3_6_35B_A3B,
     Gemma4_E2B,
@@ -46,6 +49,9 @@ impl ModelVariant {
             "qwen3.5-2b" | "qwen35-2b" | "2b" => Some(Self::Qwen3_5_2B),
             "qwen3.5-4b" | "qwen35-4b" | "4b" => Some(Self::Qwen3_5_4B),
             "qwen3.5-9b" | "qwen35-9b" | "9b" => Some(Self::Qwen3_5_9B),
+            "qwen3-30b-a3b" | "qwen3-30b-a3b-int4" | "qwen3moe-30b-a3b" => {
+                Some(Self::Qwen3_30B_A3B)
+            }
             "qwen3.6-27b" | "qwen36-27b" | "qwen3.6-27b-fp8" | "qwen36-27b-fp8" => {
                 Some(Self::Qwen3_6_27B)
             }
@@ -66,6 +72,7 @@ impl ModelVariant {
             Self::Qwen3_5_2B => "Qwen/Qwen3.5-2B",
             Self::Qwen3_5_4B => "Qwen/Qwen3.5-4B",
             Self::Qwen3_5_9B => "Qwen/Qwen3.5-9B",
+            Self::Qwen3_30B_A3B => "Qwen/Qwen3-30B-A3B",
             Self::Qwen3_6_27B => "Qwen/Qwen3.6-27B-FP8",
             Self::Qwen3_6_35B_A3B => "Qwen/Qwen3.6-35B-A3B-FP8",
             Self::Gemma4_E2B => "google/gemma-4-E2B",
@@ -82,6 +89,7 @@ impl ModelVariant {
             | Self::Qwen3_5_4B
             | Self::Qwen3_5_9B
             | Self::Qwen3_6_27B => ModelFamily::Qwen35,
+            Self::Qwen3_30B_A3B => ModelFamily::Qwen3Moe,
             Self::Qwen3_6_35B_A3B => ModelFamily::Qwen36Moe,
             Self::Gemma4_E2B | Self::Gemma4_E4B => ModelFamily::Gemma4,
             Self::Phi4_Mini => ModelFamily::Phi4,
@@ -97,6 +105,7 @@ impl fmt::Display for ModelVariant {
             Self::Qwen3_5_2B => write!(f, "qwen3.5-2b"),
             Self::Qwen3_5_4B => write!(f, "qwen3.5-4b"),
             Self::Qwen3_5_9B => write!(f, "qwen3.5-9b"),
+            Self::Qwen3_30B_A3B => write!(f, "qwen3-30b-a3b"),
             Self::Qwen3_6_27B => write!(f, "qwen3.6-27b"),
             Self::Qwen3_6_35B_A3B => write!(f, "qwen3.6-35b-a3b"),
             Self::Gemma4_E2B => write!(f, "gemma4-e2b"),
@@ -277,7 +286,24 @@ pub struct Qwen36MoeKernelParams {
     pub shared_expert_intermediate_size: u32,
 }
 
+#[derive(Clone, Copy)]
+pub struct Qwen3MoeKernelParams {
+    pub weight_prefix: &'static str,
+    pub kv_chunk_size: usize,
+    pub hidden_size: u32,
+    pub vocab_size: u32,
+    pub num_layers: u32,
+    pub num_attention_heads: u32,
+    pub num_kv_heads: u32,
+    pub head_dim: u32,
+    pub num_experts: u32,
+    pub top_k: u32,
+    pub moe_intermediate_size: u32,
+    pub scratch_floats: usize,
+}
+
 pub enum FamilyParams {
+    Qwen3Moe(Qwen3MoeKernelParams),
     Qwen35(Qwen35KernelParams),
     Qwen36Moe(Qwen36MoeKernelParams),
     Gemma4(Gemma4KernelParams),
@@ -785,6 +811,32 @@ static REGISTRY: &[RegistryEntry] = &[
             kv_chunk_size: 256,
         }),
     },
+    // Qwen3-30B-A3B BF16 checkpoint is ~56.9 GiB, so the gfx1100 v1 lane is
+    // INT4-GPTQ only. The runtime policy rejects BF16 until a large-VRAM
+    // profile and kernel path are added.
+    RegistryEntry {
+        model: ModelVariant::Qwen3_30B_A3B,
+        backend: Backend::Hip,
+        arch: GpuArch::Gfx1100,
+        vram: VramBudget {
+            fixed_bytes: 19 * GIB,
+            overhead_factor: 1.1,
+        },
+        params: FamilyParams::Qwen3Moe(Qwen3MoeKernelParams {
+            weight_prefix: "model",
+            kv_chunk_size: 256,
+            hidden_size: 2048,
+            vocab_size: 151_936,
+            num_layers: 48,
+            num_attention_heads: 32,
+            num_kv_heads: 4,
+            head_dim: 128,
+            num_experts: 128,
+            top_k: 8,
+            moe_intermediate_size: 768,
+            scratch_floats: 16_384,
+        }),
+    },
     // Qwen3.6-35B-A3B INT4 GPTQ on AMD gfx1100. Primary AMD v1 target.
     // BF16 won't fit 24 GiB; this entry assumes the INT4 bake. PR 3
     // wires it for the dry-run path; PR 6 lands the kernel.
@@ -878,6 +930,7 @@ pub fn supported_models_list() -> Vec<&'static str> {
             ModelVariant::Qwen3_5_2B => "qwen3.5-2b",
             ModelVariant::Qwen3_5_4B => "qwen3.5-4b",
             ModelVariant::Qwen3_5_9B => "qwen3.5-9b",
+            ModelVariant::Qwen3_30B_A3B => "qwen3-30b-a3b",
             ModelVariant::Qwen3_6_27B => "qwen3.6-27b",
             ModelVariant::Qwen3_6_35B_A3B => "qwen3.6-35b-a3b",
             ModelVariant::Gemma4_E2B => "gemma4-e2b",
@@ -931,6 +984,7 @@ mod tests {
             ModelVariant::Qwen3_5_2B,
             ModelVariant::Qwen3_5_4B,
             ModelVariant::Qwen3_5_9B,
+            ModelVariant::Qwen3_30B_A3B,
             ModelVariant::Gemma4_E2B,
             ModelVariant::Gemma4_E4B,
             ModelVariant::Phi4_Mini,
@@ -999,6 +1053,37 @@ mod tests {
         assert_eq!(ModelVariant::Qwen3_6_35B_A3B.to_string(), "qwen3.6-35b-a3b");
         assert!(supported_models_list().contains(&"qwen3.6-27b"));
         assert!(supported_models_list().contains(&"qwen3.6-35b-a3b"));
+    }
+
+    #[test]
+    fn qwen3_moe_aliases_and_registry_are_public() {
+        assert_eq!(
+            ModelVariant::from_cli_str("qwen3-30b-a3b-int4"),
+            Some(ModelVariant::Qwen3_30B_A3B)
+        );
+        assert_eq!(ModelVariant::Qwen3_30B_A3B.family(), ModelFamily::Qwen3Moe);
+        assert_eq!(
+            ModelVariant::Qwen3_30B_A3B.hf_model_id(),
+            "Qwen/Qwen3-30B-A3B"
+        );
+        assert!(supported_models_list().contains(&"qwen3-30b-a3b"));
+
+        let entry = lookup(
+            &ModelVariant::Qwen3_30B_A3B,
+            &Backend::Hip,
+            &GpuArch::Gfx1100,
+        )
+        .expect("qwen3-30b-a3b HIP gfx1100 registry entry");
+        match entry.params {
+            FamilyParams::Qwen3Moe(p) => {
+                assert_eq!(p.weight_prefix, "model");
+                assert_eq!(p.num_layers, 48);
+                assert_eq!(p.num_experts, 128);
+                assert_eq!(p.top_k, 8);
+                assert_eq!(p.moe_intermediate_size, 768);
+            }
+            _ => panic!("qwen3-30b-a3b must use Qwen3Moe family params"),
+        }
     }
 
     #[test]

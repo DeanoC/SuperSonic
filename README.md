@@ -48,6 +48,8 @@ to disable network fetches.
   per-feature parity tests.
 - **[DFlash speculative decode](docs/dflash.md)** — Qwen3.5-9B INT4
   speculative decode design and milestones.
+- **[Qwen3-30B-A3B HIP bring-up](docs/qwen3-30b-a3b-hip.md)** —
+  separate Qwen3 MoE scaffolding and INT4 bake contract for HIP.
 - **[SpecPrefill](docs/specprefill.md)** — long-prompt TTFT optimization
   via speculator-driven sparse prefill.
 - **[Certified KV (Llama 3.1)](docs/certified-kv-audit-map.md)** — KV

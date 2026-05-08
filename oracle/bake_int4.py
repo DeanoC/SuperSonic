@@ -112,9 +112,17 @@ FUSED_EXPERT_SUFFIXES = (
     ".mlp.experts.down_proj",
 )
 
+UNFUSED_EXPERT_RE = re.compile(
+    r"^(.+\.mlp\.experts)\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$"
+)
+
 
 def is_fused_expert_target(name: str) -> bool:
     return any(name.endswith(s) for s in FUSED_EXPERT_SUFFIXES)
+
+
+def is_unfused_expert_target(name: str) -> bool:
+    return UNFUSED_EXPERT_RE.match(name) is not None
 
 
 def is_int4_target(name: str) -> bool:
@@ -410,6 +418,45 @@ def pack_nibbles(nibbles: torch.Tensor) -> torch.Tensor:
     leading = nibbles.shape[:-1]
     r = nibbles.reshape(*leading, cols // 2, 2).to(torch.uint8)
     return (r[..., 0] | (r[..., 1] << 4)).contiguous()
+
+
+@torch.no_grad()
+def minmax_int4_2d_packed(
+    W: torch.Tensor,
+    group_size: int,
+    work_device: torch.device | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Calibration-free INT4 group quantization for one 2D matrix.
+
+    This writes the same runtime layout as GPTQ (packed u8 weight plus BF16
+    scale/zero sidecars), but chooses scales from the raw weight ranges. It is
+    used only by the Qwen3 raw-safetensors producer path for hosts that cannot
+    fit the full HF model plus calibration activations.
+    """
+    if W.dim() != 2:
+        raise ValueError(f"dense tensor must be 2D, got shape {tuple(W.shape)}")
+    out_f, in_f = W.shape
+    gs = group_size
+    if in_f % gs != 0 or in_f % 2 != 0:
+        raise ValueError(
+            f"in_features {in_f} must be divisible by group_size={gs} and even"
+        )
+    if out_f % gs != 0:
+        raise ValueError(f"out_features {out_f} must be divisible by group_size={gs}")
+    scale_rows = out_f // gs
+    scale_cols = in_f // gs
+    dev = work_device if work_device is not None else W.device
+    slab = W.to(device=dev, dtype=torch.float32)
+    tiles = slab.reshape(scale_rows, gs, scale_cols, gs)
+    sc, zf = _minmax_int4_search_2d(tiles)
+    sc_full = sc.repeat_interleave(gs, dim=0).repeat_interleave(gs, dim=1)
+    zf_full = zf.repeat_interleave(gs, dim=0).repeat_interleave(gs, dim=1)
+    q = torch.clamp(torch.round(slab / sc_full + zf_full), 0.0, 15.0).to(torch.uint8)
+    packed = (q[:, 0::2] | (q[:, 1::2] << 4)).contiguous().cpu()
+    scale = sc.cpu()
+    zero = zf.cpu()
+    del slab, tiles, sc_full, zf_full, q
+    return packed, scale, zero
 
 
 @torch.no_grad()
@@ -1211,6 +1258,9 @@ def quantize_model(
     writer: "StreamingPackageWriter",
     hf_to_raw: dict[str, str],
     safetensors_loader: Callable[[str], torch.Tensor | None] | None = None,
+    model_dir: Path | None = None,
+    raw_keys: set[str] | None = None,
+    model_family: str = "qwen35",
 ) -> dict[str, Any]:
     """
     Run sequential GPTQ, **streaming** each quantized tensor to `writer` as
@@ -1277,6 +1327,8 @@ def quantize_model(
         for mod in layer.modules():
             if isinstance(mod, nn.Linear):
                 name = module_to_name[id(mod)]
+                if model_family == "qwen3-moe" and is_unfused_expert_target(name):
+                    continue
                 if is_int4_target(name):
                     targets.append((name, mod))
 
@@ -1462,7 +1514,7 @@ def quantize_model(
     # a time on `device`, pack nibbles immediately to halve RAM use vs the
     # unpacked layout, then free the BF16 source. Writing path detects packed
     # 3D shapes via `dim() == 3` (dense GPTQ stays 2D + unpacked).
-    fused_param_names = sorted(
+    fused_param_names = [] if model_family == "qwen3-moe" else sorted(
         n for n, _ in model.named_parameters() if is_fused_expert_target(n)
     )
     if fused_param_names:
@@ -1504,6 +1556,56 @@ def quantize_model(
             # malloc_trim, glibc keeps them in its arena cache and we drift
             # ~10 GiB upward over the 80-tensor pass.
             _release_host_memory()
+
+    # Qwen3-30B-A3B ships the experts as individual HF Linear weights:
+    #   mlp.experts.{E}.gate_proj.weight / up_proj.weight / down_proj.weight
+    # The HIP runtime consumes the same fused slab contract as Qwen3.6-MoE:
+    #   mlp.experts.gate_up_proj [E, 2*moe, hidden]
+    #   mlp.experts.down_proj    [E, hidden, moe]
+    # Synthesize those fused tensors directly from safetensors so the dense
+    # GPTQ loop above does not spend hours calibrating thousands of tiny expert
+    # modules that the runtime will never load by name.
+    if model_family == "qwen3-moe":
+        if model_dir is None or raw_keys is None:
+            raise SystemExit("qwen3-moe bake requires model_dir and raw_keys")
+        raw_bases = sorted({
+            m.group(1)
+            for k in raw_keys
+            if (m := UNFUSED_EXPERT_RE.match(k)) is not None
+        })
+        if raw_bases:
+            log(f"[gptq] Qwen3 unfused MoE experts: fusing+quantizing "
+                f"{len(raw_bases) * 2} runtime tensors (min/max group-quant)")
+            loader = RawTensorLoader(model_dir)
+            for raw_base in raw_bases:
+                for kind in ("gate_up_proj", "down_proj"):
+                    raw_name = f"{raw_base}.{kind}"
+                    if writer.has(raw_name):
+                        continue
+                    t0 = time.perf_counter()
+                    W = load_fused_expert_bf16(
+                        model_dir, raw_keys, raw_base, kind, loader,
+                    )
+                    packed, scale_t, zero_t = fused_expert_minmax_int4_packed(
+                        W, group_size=group_size, work_device=device,
+                    )
+                    elapsed = time.perf_counter() - t0
+                    log(f"[gptq]   {raw_name}: shape={tuple(W.shape)} -> "
+                        f"packed={tuple(packed.shape)} took {elapsed:.1f}s")
+                    _stream_quantized_tensor(writer, raw_name, packed, scale_t, zero_t)
+                    stats["quantized_names"].add(raw_name)
+                    stats["fused_total"] += 1
+                    range_ok, linf = _selfcheck_fused(
+                        packed, scale_t, zero_t, W, group_size,
+                    )
+                    if not range_ok:
+                        stats["nibble_range_ok"] = False
+                    if linf > stats["fused_worst"][1]:
+                        stats["fused_worst"] = (raw_name, linf)
+                    del W, packed, scale_t, zero_t
+                    if device.type == "cuda":
+                        torch.cuda.empty_cache()
+                    _release_host_memory()
 
     return stats
 
@@ -2465,6 +2567,185 @@ def _build_name_map(hf_keys: list[str], raw_keys: set[str]) -> dict[str, str]:
     return out
 
 
+def infer_weight_prefix(raw_keys: set[str]) -> str:
+    for k in raw_keys:
+        if k.endswith(".embed_tokens.weight"):
+            return k[: -len(".embed_tokens.weight")]
+    for k in sorted(raw_keys):
+        if ".layers.0." in k:
+            return k.split(".layers.")[0]
+    raise SystemExit("could not infer weight prefix from safetensors keys")
+
+
+def infer_qwen_model_family(model_dir: Path, raw_keys: set[str]) -> tuple[str, Any]:
+    from transformers import AutoConfig
+
+    config = AutoConfig.from_pretrained(str(model_dir), trust_remote_code=True)
+    text_cfg = getattr(config, "text_config", config)
+    model_type = getattr(text_cfg, "model_type", getattr(config, "model_type", ""))
+    architectures = list(getattr(config, "architectures", None) or [])
+    if model_type == "qwen3_moe" or "Qwen3MoeForCausalLM" in architectures:
+        return "qwen3-moe", text_cfg
+    if any(is_fused_expert_target(k) for k in raw_keys):
+        return "qwen36-moe", text_cfg
+    return "qwen35", text_cfg
+
+
+def qwen3_raw_minmax_bake(
+    *,
+    model_dir: Path,
+    raw_keys: set[str],
+    out_dir: Path,
+    device: torch.device,
+    group_size: int,
+    quant_profile: str,
+) -> None:
+    """Qwen3-MoE OOM-safe producer that never instantiates the HF model.
+
+    Dense projections, lm_head, and synthesized fused experts are quantized
+    with per-tile min/max search directly from safetensors. Non-quantized
+    runtime tensors are streamed raw from safetensors.
+    """
+    model_family, text_cfg = infer_qwen_model_family(model_dir, raw_keys)
+    if model_family != "qwen3-moe":
+        raise SystemExit("--qwen3-raw-minmax is only valid for Qwen3-MoE checkpoints")
+    weight_prefix = infer_weight_prefix(raw_keys)
+    num_layers = int(text_cfg.num_hidden_layers)
+    layer_types = ["full_attention"] * num_layers
+    quant_method: dict[str, Any] = {
+        "profile": quant_profile,
+        "parameters": {
+            "group_size": group_size,
+            "dense_method": "raw_minmax_shrink_grid",
+            "expert_method": "raw_minmax_shrink_grid",
+        },
+        "source_dtype": "bf16/f32",
+        "producer_version": f"oracle/bake_int4.py fmt{FORMAT_VERSION} cvt{CONVERTER_VERSION}",
+        "calibration_corpus": None,
+        "calibration_samples": 0,
+        "calibration_seqlen": 0,
+        "note": "Qwen3 OOM-safe raw-safetensors producer; not Hessian GPTQ.",
+    }
+    log(f"[bake-int4] qwen3 raw-minmax path: prefix={weight_prefix!r} "
+        f"layers={num_layers}")
+    dense_names = sorted(
+        k for k in raw_keys
+        if is_int4_target(k) and not is_unfused_expert_target(k)
+    )
+    fused_bases = sorted({
+        m.group(1)
+        for k in raw_keys
+        if (m := UNFUSED_EXPERT_RE.match(k)) is not None
+    })
+    stats = {
+        "dense_total": 0,
+        "dense_worst": ("", 0.0),
+        "fused_total": 0,
+        "fused_worst": ("", 0.0),
+        "nibble_range_ok": True,
+    }
+    with StreamingPackageWriter(
+        out_dir,
+        model_family=model_family,
+        quant_profile=quant_profile,
+        quant_method=quant_method,
+    ) as writer:
+        log(f"[bake-int4] raw-minmax dense tensors: {len(dense_names)}")
+        for raw_name in dense_names:
+            t0 = time.perf_counter()
+            W = load_raw_tensor(model_dir, raw_name)
+            if W is None:
+                raise RuntimeError(f"missing raw tensor {raw_name}")
+            packed, scale_t, zero_t = minmax_int4_2d_packed(
+                W, group_size=group_size, work_device=device,
+            )
+            elapsed = time.perf_counter() - t0
+            writer.write_tensor(
+                raw_name, packed.numpy().tobytes(),
+                list(packed.shape), "u8", LAYOUT_INT4,
+            )
+            writer.write_tensor(
+                f"{raw_name}_int4_scale", bf16_to_bytes(scale_t),
+                list(scale_t.shape), "bf16", LAYOUT_RAW,
+            )
+            writer.write_tensor(
+                f"{raw_name}_int4_zero", bf16_to_bytes(zero_t),
+                list(zero_t.shape), "bf16", LAYOUT_RAW,
+            )
+            stats["dense_total"] += 1
+            log(f"[bake-int4]   {raw_name}: shape={tuple(W.shape)} "
+                f"-> packed={tuple(packed.shape)} took {elapsed:.1f}s")
+            del W, packed, scale_t, zero_t
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+            _release_host_memory()
+
+        log(f"[bake-int4] raw-minmax fused Qwen3 experts: {len(fused_bases) * 2}")
+        loader = RawTensorLoader(model_dir)
+        for raw_base in fused_bases:
+            for kind in ("gate_up_proj", "down_proj"):
+                raw_name = f"{raw_base}.{kind}"
+                t0 = time.perf_counter()
+                W = load_fused_expert_bf16(model_dir, raw_keys, raw_base, kind, loader)
+                packed, scale_t, zero_t = fused_expert_minmax_int4_packed(
+                    W, group_size=group_size, work_device=device,
+                )
+                elapsed = time.perf_counter() - t0
+                writer.write_tensor(
+                    raw_name, packed.numpy().tobytes(),
+                    list(packed.shape), "u8", LAYOUT_INT4,
+                )
+                writer.write_tensor(
+                    f"{raw_name}_int4_scale", bf16_to_bytes(scale_t),
+                    list(scale_t.shape), "bf16", LAYOUT_RAW,
+                )
+                writer.write_tensor(
+                    f"{raw_name}_int4_zero", bf16_to_bytes(zero_t),
+                    list(zero_t.shape), "bf16", LAYOUT_RAW,
+                )
+                range_ok, linf = _selfcheck_fused(
+                    packed, scale_t, zero_t, W, group_size,
+                )
+                if not range_ok:
+                    stats["nibble_range_ok"] = False
+                if linf > stats["fused_worst"][1]:
+                    stats["fused_worst"] = (raw_name, linf)
+                stats["fused_total"] += 1
+                log(f"[bake-int4]   {raw_name}: shape={tuple(W.shape)} "
+                    f"-> packed={tuple(packed.shape)} took {elapsed:.1f}s")
+                del W, packed, scale_t, zero_t
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
+                _release_host_memory()
+
+        log("[bake-int4] streaming raw non-quantized Qwen3 tensors...")
+        eligible = [
+            k for k in raw_keys
+            if not k.endswith("_scale_inv")
+            and not is_unfused_expert_target(k)
+            and (k.startswith(f"{weight_prefix}.") or k == "lm_head.weight")
+        ]
+        for raw_name in sorted(eligible):
+            if writer.has(raw_name):
+                continue
+            t = load_raw_tensor(model_dir, raw_name)
+            if t is None:
+                continue
+            shape = list(t.shape)
+            dtype_str = torch_dtype_to_str(t.dtype)
+            layout = classify_tensor(raw_name, shape, weight_prefix, layer_types)
+            b, final_shape, final_dtype = apply_layout(t, shape, layout, dtype_str)
+            writer.write_tensor(raw_name, b, final_shape, final_dtype, layout)
+            del t, b
+            _release_host_memory()
+        log(f"[self-check] raw-minmax dense INT4: {stats['dense_total']} tensors")
+        log(f"[self-check] raw-minmax fused MoE INT4: {stats['fused_total']} tensors, "
+            f"nibble_range_ok={stats['nibble_range_ok']}, "
+            f"worst-Linf-vs-bf16={stats['fused_worst'][0]} "
+            f"({stats['fused_worst'][1]:.2e})")
+    log(f"[bake-int4] done. Output: {out_dir}")
+
+
 class StreamingPackageWriter:
     """Streaming sink for the bake's `weights.bin` + `manifest.json`.
 
@@ -2644,6 +2925,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--offload-folder", default=None, type=Path,
                    help="Disk-offload folder for params that don't fit GPU+CPU "
                         "(needed for ~3 GiB shortfall on 35B-A3B with 24+50 GiB).")
+    p.add_argument("--qwen3-raw-minmax", action="store_true",
+                   help="Qwen3-MoE only: produce the runtime INT4 package directly "
+                        "from safetensors with min/max scale search, without loading "
+                        "the HF model or calibration activations. OOM-safe but not "
+                        "Hessian-calibrated GPTQ quality.")
     return p.parse_args()
 
 
@@ -2686,12 +2972,28 @@ def main() -> None:
         log("[bake-int4] WARNING: running GPTQ on CPU will be very slow for a 4B "
             "model. Use a CUDA/ROCm GPU if available.")
 
+    raw_keys = _load_raw_tensor_names(model_dir)
+    out_dir = args.out_dir or (
+        model_dir / ".supersonic" / f"v{FORMAT_VERSION}-{profile.name}"
+    )
+    if args.qwen3_raw_minmax:
+        if profile.name != "int4-gptq":
+            raise SystemExit("--qwen3-raw-minmax currently writes the int4-gptq runtime package")
+        qwen3_raw_minmax_bake(
+            model_dir=model_dir,
+            raw_keys=raw_keys,
+            out_dir=out_dir,
+            device=device,
+            group_size=args.group_size,
+            quant_profile=profile.name,
+        )
+        return
+
     # --- Load model + tokenizer ---
     from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
     log(f"[bake-int4] loading tokenizer from {model_dir}")
     tokenizer = AutoTokenizer.from_pretrained(str(model_dir), trust_remote_code=True)
     log(f"[bake-int4] loading model (bf16) from {model_dir}")
-    raw_keys = _load_raw_tensor_names(model_dir)
 
     load_kwargs: dict[str, Any] = {
         "torch_dtype": torch.bfloat16,
@@ -2740,25 +3042,10 @@ def main() -> None:
     # Anchor the prefix on ".embed_tokens.weight" — some checkpoints also
     # include an "mtp.layers.*" multi-token-prediction module, so matching
     # on ".layers.0." alone picks the wrong one.
-    weight_prefix = None
-    for k in raw_keys:
-        if k.endswith(".embed_tokens.weight"):
-            weight_prefix = k[: -len(".embed_tokens.weight")]
-            break
-    if weight_prefix is None:
-        # Fallback: first key with ".layers.0." — sorted so it's stable.
-        for k in sorted(raw_keys):
-            if ".layers.0." in k:
-                weight_prefix = k.split(".layers.")[0]
-                break
-    if weight_prefix is None:
-        raise SystemExit("could not infer weight prefix from safetensors keys")
+    weight_prefix = infer_weight_prefix(raw_keys)
     log(f"[bake-int4] canonical weight prefix (from safetensors): {weight_prefix!r}")
-    model_family = (
-        "qwen36-moe"
-        if any(".mlp.experts." in k for k in raw_keys)
-        else "qwen35"
-    )
+    config = model.config
+    model_family, text_cfg = infer_qwen_model_family(model_dir, raw_keys)
     log(f"[bake-int4] model_family={model_family!r}")
 
     # Avoid `model.state_dict()` here — under `device_map="auto"` it gathers
@@ -2778,8 +3065,6 @@ def main() -> None:
         log(f"[bake-int4] {len(missing_in_raw)} state-dict tensors have no "
             f"safetensors counterpart (e.g. tied weights) — skipping them.")
 
-    config = model.config
-    text_cfg = getattr(config, "text_config", config)
     num_layers = int(text_cfg.num_hidden_layers)
     layer_types = list(getattr(text_cfg, "layer_types", None) or [])
     if not layer_types:
@@ -2833,9 +3118,6 @@ def main() -> None:
     # than one (nibbles, scale, zero) triple in RAM at a time; on 35B-A3B
     # that's ~1 GiB peak (largest fused expert slab) instead of the ~17 GiB
     # the in-RAM `tensors_out` list reached before this refactor.
-    out_dir = args.out_dir or (
-        model_dir / ".supersonic" / f"v{FORMAT_VERSION}-{profile.name}"
-    )
     # Context-manager form: on a partial run (exception propagating out),
     # `__exit__` closes the file handle but skips manifest emission so a
     # downstream bake-consumer can't accidentally read a half-written package
@@ -2890,6 +3172,9 @@ def main() -> None:
                 writer=writer,
                 hf_to_raw=hf_to_raw,
                 safetensors_loader=safetensors_loader,
+                model_dir=model_dir,
+                raw_keys=raw_keys,
+                model_family=model_family,
             )
         elif profile.name == "int4-awq":
             assert calib is not None
@@ -2984,6 +3269,10 @@ def main() -> None:
             hf_name for hf_name in sd_keys
             if hf_name in hf_to_raw
             and not hf_to_raw[hf_name].endswith("_scale_inv")
+            and not (
+                model_family == "qwen3-moe"
+                and is_unfused_expert_target(hf_to_raw[hf_name])
+            )
             and (
                 hf_to_raw[hf_name].startswith(f"{weight_prefix}.")
                 or hf_to_raw[hf_name] == "lm_head.weight"
