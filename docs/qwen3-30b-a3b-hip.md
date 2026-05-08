@@ -21,9 +21,10 @@ The first PR wires the model as an explicit HIP-only INT4 bring-up target:
 The current code supports config validation, checkpoint tensor enumeration,
 INT4 baked tensor contract validation, baked manifest indexing, GPU upload of
 the INT4 weights, descriptor pointer construction, scratch allocation, full
-single-token decode math, and lm-head sampling. The HIP kernel is a
-correctness-first layer kernel, not the optimized persistent megakernel that
-the older Qwen3.5/Gemma paths use.
+single-token decode math, direct INT4 lm-head sampling, and a Qwen3-owned
+persistent decode chain. The persistent path is separate from the Qwen3.6-MoE
+runtime and is the default runtime path; pass `--no-persistent-decode` to run
+the chained per-layer A/B path.
 
 ## Model Geometry
 
@@ -65,8 +66,41 @@ cargo run --release --bin supersonic -- \
   --dry-run
 ```
 
-Non-dry-run execution is supported for one-token-at-a-time decode. It is slow
-by design in this bring-up branch because each layer launches independently.
+Non-dry-run execution is supported for one-token-at-a-time decode. Decode runs
+through the Qwen3 persistent chain by default. The chained per-layer path
+remains available for A/B testing:
+
+```bash
+cargo run --release --bin supersonic -- \
+  --model qwen3-30b-a3b \
+  --model-dir /path/to/Qwen3-30B-A3B \
+  --prompt "Hello" \
+  --max-new-tokens 1 \
+  --context-size 8 \
+  --int4 \
+  --no-persistent-decode
+```
+
+Use `--emit-stage-timings` to print per-token averages for embedding upload,
+decode, lm-head, and sampling.
+
+## Decode Optimization Notes
+
+The optimized HIP path in this PR makes three targeted changes:
+
+- the layer decode kernel now uses 1024 threads per cooperative block, which
+  improves the scalar row-dot path substantially on gfx1100-class hardware
+- the default runner path uploads the per-step descriptor table once and runs
+  all 48 layers through `qwen3_moe_persistent_decode_kernel`
+- the lm-head projection reads the INT4 baked `lm_head.weight` directly instead
+  of expanding it to a roughly 593 MiB BF16 GPU buffer at startup
+
+On the local gfx1100 24 GiB smoke setup with `/mnt/data/models/Qwen3-30B-A3B`,
+the synced one-token smoke improved from roughly 5.2 s/token in the initial
+256-thread bring-up path to roughly 2.46 s/token with the 1024-thread decode
+path. Persistent-vs-chained timings are currently very close because the
+single-token work is compute dominated; the persistent path is still useful as
+the Qwen3-owned launch surface for future multi-block/grid-barrier work.
 
 ## INT4 Bake Contract
 
@@ -141,7 +175,8 @@ cargo run --release --bin supersonic -- \
   --prompt "Hello" \
   --max-new-tokens 1 \
   --context-size 8 \
-  --int4
+  --int4 \
+  --emit-stage-timings
 
 cargo run --release --bin supersonic -- \
   --model qwen3-30b-a3b \

@@ -17,7 +17,7 @@ use qwen3_moe::weights::{
     CheckpointAccount, CheckpointDtype, TensorSpec,
 };
 
-use crate::qwen36_moe_logits::{dequant_int4_to_bf16_bytes, sample_bf16_logits, XorshiftRng};
+use crate::qwen36_moe_logits::{sample_bf16_logits, XorshiftRng};
 use crate::registry::{FamilyParams, RegistryEntry};
 use crate::Cli;
 
@@ -168,24 +168,30 @@ fn decode_text(
     }
     let scale_ptrs = weights.int4_scale_ptrs();
     let int4_descs = build_int4_scale_descs(&scale_ptrs, DEFAULT_INT4_GROUP_SIZE);
+    let desc_bytes_len =
+        text.num_hidden_layers * std::mem::size_of::<q3ffi::Qwen3MoeDecodeLayerDesc>();
+    let mut persistent_descs_dev = GpuBuffer::zeros(ordinal, ScalarType::U8, &[desc_bytes_len])
+        .context("alloc Qwen3 persistent layer descriptors")?;
+    let persistent_int4_descs_dev = {
+        let int4_bytes = struct_slice_as_bytes(&int4_descs);
+        GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[int4_bytes.len()], int4_bytes)
+            .context("upload Qwen3 persistent INT4 descriptors")?
+    };
 
     let mut hidden_a = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[text.hidden_size])
         .context("alloc Qwen3 hidden_a")?;
     let mut hidden_b = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[text.hidden_size])
         .context("alloc Qwen3 hidden_b")?;
+    let mut hidden_c = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[text.hidden_size])
+        .context("alloc Qwen3 hidden_c")?;
     let workspace_floats = qwen3_workspace_floats(text);
     let mut workspace = GpuBuffer::zeros(ordinal, ScalarType::F32, &[workspace_floats])
         .context("alloc Qwen3 layer workspace")?;
 
-    let lm_head_bf16 = load_lm_head_bf16(&store, text, weight_prefix)
-        .context("load/dequant Qwen3 lm_head BF16")?;
-    let lm_head = GpuBuffer::from_host_bytes(
-        ordinal,
-        ScalarType::BF16,
-        &[text.vocab_size, text.hidden_size],
-        &lm_head_bf16,
-    )
-    .context("upload Qwen3 lm_head BF16")?;
+    let lm_head = weights
+        .lm_head
+        .as_ref()
+        .ok_or_else(|| anyhow!("Qwen3-MoE INT4 bake is missing lm_head.weight"))?;
     let mut logits =
         GpuBuffer::zeros(ordinal, ScalarType::BF16, &[text.vocab_size]).context("alloc logits")?;
     let mut lm_counter =
@@ -199,8 +205,20 @@ fn decode_text(
     let mut generated = Vec::with_capacity(max_new);
     let mut last_logits = Vec::new();
     let start = std::time::Instant::now();
+    let mut embed_elapsed = std::time::Duration::ZERO;
+    let mut decode_elapsed = std::time::Duration::ZERO;
+    let mut lm_head_elapsed = std::time::Duration::ZERO;
+    let mut sample_elapsed = std::time::Duration::ZERO;
+    let mut gen_steps = 0usize;
+    let use_persistent = !cli.no_persistent_decode;
+    if use_persistent {
+        eprintln!(
+            "[qwen3-moe] persistent decode enabled; pass --no-persistent-decode for chained A/B"
+        );
+    }
 
     for step in 0..total_steps {
+        let t_embed = std::time::Instant::now();
         let row = lookup_embed_row(&store, weight_prefix, current as usize, text.hidden_size)
             .with_context(|| format!("lookup Qwen3 embedding row for token {current}"))?;
         gpu_hal::copy_h2d(
@@ -210,38 +228,69 @@ fn decode_text(
             row.len(),
         )
         .context("h2d Qwen3 token embedding")?;
+        embed_elapsed += t_embed.elapsed();
 
         let descs = build_layer_descs(text, &layer_ptrs, step, context)
             .context("build Qwen3 layer descriptors")?;
-        let mut front_a = true;
-        for (layer_idx, (desc, int4)) in descs.iter().zip(int4_descs.iter()).enumerate() {
-            let (input, output) = if front_a {
-                (&hidden_a, &mut hidden_b)
-            } else {
-                (&hidden_b, &mut hidden_a)
-            };
-            q3ffi::decode_layer_launch(
+        let t_decode = std::time::Instant::now();
+        let final_in_b = if use_persistent {
+            let desc_bytes = struct_slice_as_bytes(&descs);
+            gpu_hal::copy_h2d(
+                ordinal,
+                persistent_descs_dev.as_mut_ptr(),
+                desc_bytes.as_ptr() as *const _,
+                desc_bytes.len(),
+            )
+            .context("upload Qwen3 persistent layer descriptors")?;
+            q3ffi::persistent_decode_launch(
                 ordinal,
                 ScalarType::BF16,
-                desc,
-                int4,
+                &persistent_descs_dev,
+                &persistent_int4_descs_dev,
+                descs.len(),
                 text.hidden_size as i32,
                 step as i32,
-                input,
-                output,
+                &hidden_a,
+                &mut hidden_b,
+                &mut hidden_c,
                 &mut workspace,
             )
-            .with_context(|| format!("Qwen3 decode layer {layer_idx}"))?;
-            front_a = !front_a;
-        }
+            .context("Qwen3 persistent decode")?;
+            true
+        } else {
+            let mut front_a = true;
+            for (layer_idx, (desc, int4)) in descs.iter().zip(int4_descs.iter()).enumerate() {
+                let (input, output) = if front_a {
+                    (&hidden_a, &mut hidden_b)
+                } else {
+                    (&hidden_b, &mut hidden_a)
+                };
+                q3ffi::decode_layer_launch(
+                    ordinal,
+                    ScalarType::BF16,
+                    desc,
+                    int4,
+                    text.hidden_size as i32,
+                    step as i32,
+                    input,
+                    output,
+                    &mut workspace,
+                )
+                .with_context(|| format!("Qwen3 decode layer {layer_idx}"))?;
+                front_a = !front_a;
+            }
+            !front_a
+        };
+        decode_elapsed += t_decode.elapsed();
 
-        let final_hidden = if front_a { &hidden_a } else { &hidden_b };
+        let final_hidden = if final_in_b { &hidden_b } else { &hidden_a };
         if step + 1 < prompt.prompt_ids.len() {
             current = prompt.prompt_ids[step + 1];
             continue;
         }
 
-        q3ffi::lm_head_launch(
+        let t_lm_head = std::time::Instant::now();
+        q3ffi::lm_head_int4_launch(
             ordinal,
             ScalarType::BF16,
             text.hidden_size as i32,
@@ -249,12 +298,17 @@ fn decode_text(
             text.rms_norm_eps as f32,
             final_hidden,
             &weights.final_norm,
-            &lm_head,
+            &lm_head.weight,
+            &lm_head.scale,
+            &lm_head.zero,
+            DEFAULT_INT4_GROUP_SIZE as i32,
             &mut logits,
             &mut lm_counter,
         )
-        .context("Qwen3 lm_head")?;
+        .context("Qwen3 INT4 lm_head")?;
         last_logits = logits.to_host_bytes().context("d2h Qwen3 logits")?;
+        lm_head_elapsed += t_lm_head.elapsed();
+        let t_sample = std::time::Instant::now();
         let next = sample_bf16_logits(
             &last_logits,
             cli.temperature,
@@ -262,6 +316,8 @@ fn decode_text(
             cli.top_p,
             &mut rng,
         );
+        sample_elapsed += t_sample.elapsed();
+        gen_steps += 1;
         generated.push(next);
         print_token(prompt.tokenizer.as_ref(), next);
         std::io::stdout().flush().ok();
@@ -291,7 +347,23 @@ fn decode_text(
         elapsed,
         generated.len() as f64 / elapsed.max(1e-9)
     );
+    if cli.emit_stage_timings && gen_steps > 0 {
+        let n = gen_steps as f64;
+        eprintln!(
+            "[qwen3-moe stage-timings] gen_steps={} path={} embed_ms_avg={:.3} decode_ms_avg={:.3} lm_head_ms_avg={:.3} sample_ms_avg={:.3}",
+            gen_steps,
+            if use_persistent { "persistent" } else { "chained" },
+            embed_elapsed.as_secs_f64() * 1000.0 / n,
+            decode_elapsed.as_secs_f64() * 1000.0 / n,
+            lm_head_elapsed.as_secs_f64() * 1000.0 / n,
+            sample_elapsed.as_secs_f64() * 1000.0 / n,
+        );
+    }
     Ok(())
+}
+
+fn struct_slice_as_bytes<T>(slice: &[T]) -> &[u8] {
+    unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const u8, std::mem::size_of_val(slice)) }
 }
 
 fn ensure_int4_bake(cli: &Cli, entry: &RegistryEntry) -> Result<()> {
@@ -407,52 +479,6 @@ fn lookup_embed_row(
         );
     }
     Ok(bytes[start..end].to_vec())
-}
-
-fn load_lm_head_bf16(
-    store: &BakedStore,
-    text: &qwen3_moe::config::TextConfig,
-    weight_prefix: &str,
-) -> Result<Vec<u8>> {
-    let (name, packed) = if text.tie_word_embeddings {
-        let name = format!("{weight_prefix}.embed_tokens.weight");
-        let bytes = store
-            .raw_bytes(&name)
-            .ok_or_else(|| anyhow!("missing tied lm_head tensor {name}"))?
-            .to_vec();
-        (name, bytes)
-    } else {
-        let name = "lm_head.weight".to_string();
-        let bytes = store
-            .raw_bytes(&name)
-            .ok_or_else(|| anyhow!("missing lm_head.weight in bake"))?
-            .to_vec();
-        (name, bytes)
-    };
-    let scale_name = format!("{name}_int4_scale");
-    if !store.contains(&scale_name) {
-        return Ok(packed);
-    }
-    let zero_name = format!("{name}_int4_zero");
-    let scale = store
-        .raw_bytes(&scale_name)
-        .ok_or_else(|| anyhow!("missing {scale_name} in bake"))?;
-    let zero = store
-        .raw_bytes(&zero_name)
-        .ok_or_else(|| anyhow!("missing {zero_name} in bake"))?;
-    println!(
-        "  dequantizing Qwen3 lm_head INT4 ({:.1} MiB -> {:.1} MiB BF16)",
-        packed.len() as f64 / (1024.0 * 1024.0),
-        (text.vocab_size * text.hidden_size * 2) as f64 / (1024.0 * 1024.0)
-    );
-    Ok(dequant_int4_to_bf16_bytes(
-        &packed,
-        scale,
-        zero,
-        text.vocab_size,
-        text.hidden_size,
-        DEFAULT_INT4_GROUP_SIZE,
-    ))
 }
 
 fn qwen3_workspace_floats(text: &qwen3_moe::config::TextConfig) -> usize {

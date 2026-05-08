@@ -2,9 +2,9 @@
 //
 // This file is intentionally separate from Qwen3.6-MoE. Qwen3-30B-A3B is a
 // pure full-attention MoE model with different tensor geometry and no hybrid
-// linear-attention/shared-expert path. The decode kernel below is the first
-// correctness-oriented HIP path: one cooperative block runs one layer, with
-// INT4 dequant for attention and expert weights and BF16 KV cache.
+// linear-attention/shared-expert path. The decode path uses a Qwen3-owned
+// cooperative block implementation with INT4 dequant for attention/expert
+// weights, BF16 KV cache, and an optional single-launch persistent layer chain.
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_bfloat16.h>
@@ -237,17 +237,15 @@ __device__ void rms_norm_vec(
     __syncthreads();
 }
 
-__global__ void qwen3_moe_decode_layer_kernel(
+__device__ void qwen3_moe_decode_layer_device(
     const DecodeLayerDesc layer,
     const Int4ScaleDesc int4,
     int hidden,
     int position,
     const hip_bfloat16* __restrict__ input_hidden,
     hip_bfloat16* __restrict__ output_hidden,
-    float* __restrict__ workspace) {
-    extern __shared__ float lds[];
-    float* scratch = lds;
-
+    float* __restrict__ workspace,
+    float* __restrict__ scratch) {
     const int tid = threadIdx.x;
     const int hd = layer.head_dim;
     const int h = layer.num_heads;
@@ -511,6 +509,57 @@ __global__ void qwen3_moe_decode_layer_kernel(
     }
 }
 
+__global__ void qwen3_moe_decode_layer_kernel(
+    const DecodeLayerDesc layer,
+    const Int4ScaleDesc int4,
+    int hidden,
+    int position,
+    const hip_bfloat16* __restrict__ input_hidden,
+    hip_bfloat16* __restrict__ output_hidden,
+    float* __restrict__ workspace) {
+    extern __shared__ float lds[];
+    qwen3_moe_decode_layer_device(
+        layer, int4, hidden, position, input_hidden, output_hidden, workspace, lds);
+}
+
+__global__ void qwen3_moe_persistent_decode_kernel(
+    int num_layers,
+    const DecodeLayerDesc* __restrict__ layers,
+    const Int4ScaleDesc* __restrict__ int4_descs,
+    int hidden,
+    int position,
+    const hip_bfloat16* __restrict__ input_hidden,
+    hip_bfloat16* __restrict__ hidden_ping,
+    hip_bfloat16* __restrict__ hidden_pong,
+    float* __restrict__ workspace) {
+    extern __shared__ float lds[];
+    if (blockIdx.x != 0) return;
+    if (num_layers <= 0) return;
+
+    const hip_bfloat16* in = input_hidden;
+    hip_bfloat16* out = hidden_ping;
+    for (int layer_idx = 0; layer_idx < num_layers; ++layer_idx) {
+        qwen3_moe_decode_layer_device(
+            layers[layer_idx],
+            int4_descs[layer_idx],
+            hidden,
+            position,
+            in,
+            out,
+            workspace,
+            lds);
+        __syncthreads();
+        in = out;
+        out = (out == hidden_ping) ? hidden_pong : hidden_ping;
+    }
+
+    if (in != hidden_ping) {
+        for (int i = threadIdx.x; i < hidden; i += blockDim.x) {
+            hidden_ping[i] = in[i];
+        }
+    }
+}
+
 __global__ void qwen3_moe_lm_head_kernel(
     int hidden,
     int vocab,
@@ -552,6 +601,62 @@ __global__ void qwen3_moe_lm_head_kernel(
                 static_cast<float>(final_hidden[i]) * inv *
                 static_cast<float>(final_norm_w[i]));
             partial += static_cast<float>(lm_head_w[base + i]) * x;
+        }
+        lds[tid] = partial;
+        __syncthreads();
+        for (int s = bs / 2; s > 0; s >>= 1) {
+            if (tid < s) lds[tid] += lds[tid + s];
+            __syncthreads();
+        }
+        if (tid == 0) logits[row] = static_cast<hip_bfloat16>(bf16_round_rne_f32(lds[0]));
+        __syncthreads();
+    }
+}
+
+__global__ void qwen3_moe_lm_head_int4_kernel(
+    int hidden,
+    int vocab,
+    float rms_norm_eps,
+    const hip_bfloat16* __restrict__ final_hidden,
+    const hip_bfloat16* __restrict__ final_norm_w,
+    const uint8_t* __restrict__ lm_head_w,
+    const hip_bfloat16* __restrict__ lm_head_scale,
+    const hip_bfloat16* __restrict__ lm_head_zero,
+    int group_size,
+    hip_bfloat16* __restrict__ logits,
+    unsigned int* __restrict__ counter) {
+    extern __shared__ float lds[];
+    const int tid = threadIdx.x;
+    const int bs = blockDim.x;
+
+    float partial_sq = 0.0f;
+    for (int i = tid; i < hidden; i += bs) {
+        const float v = static_cast<float>(final_hidden[i]);
+        partial_sq += v * v;
+    }
+    lds[tid] = partial_sq;
+    __syncthreads();
+    for (int s = bs / 2; s > 0; s >>= 1) {
+        if (tid < s) lds[tid] += lds[tid + s];
+        __syncthreads();
+    }
+    const float inv = rsqrtf(lds[0] / static_cast<float>(hidden) + rms_norm_eps);
+    __syncthreads();
+
+    for (;;) {
+        __shared__ unsigned int row_s;
+        if (tid == 0) row_s = atomicAdd(counter, 1u);
+        __syncthreads();
+        const int row = static_cast<int>(row_s);
+        if (row >= vocab) return;
+
+        float partial = 0.0f;
+        for (int i = tid; i < hidden; i += bs) {
+            const float x = bf16_round_rne_f32(
+                static_cast<float>(final_hidden[i]) * inv *
+                static_cast<float>(final_norm_w[i]));
+            partial += int4_value(lm_head_w, lm_head_scale, lm_head_zero,
+                                  row, i, hidden, group_size) * x;
         }
         lds[tid] = partial;
         __syncthreads();

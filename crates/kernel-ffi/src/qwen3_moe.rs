@@ -115,6 +115,36 @@ extern "C" {
         logits: *mut c_void,
         counter: *mut c_uint,
     ) -> c_int;
+
+    pub fn qwen3_moe_hip_persistent_decode_launch(
+        dtype: c_int,
+        device_ordinal: usize,
+        num_layers: c_int,
+        layers: *const Qwen3MoeDecodeLayerDesc,
+        int4_descs: *const Qwen3MoeInt4ScaleDesc,
+        hidden: c_int,
+        position: c_int,
+        input_hidden: *const c_void,
+        hidden_ping: *mut c_void,
+        hidden_pong: *mut c_void,
+        workspace: *mut f32,
+    ) -> c_int;
+
+    pub fn qwen3_moe_hip_lm_head_int4_launch(
+        dtype: c_int,
+        device_ordinal: usize,
+        hidden: c_int,
+        vocab: c_int,
+        rms_norm_eps: f32,
+        final_hidden: *const c_void,
+        final_norm_w: *const c_void,
+        lm_head_w: *const c_void,
+        lm_head_scale: *const c_void,
+        lm_head_zero: *const c_void,
+        group_size: c_int,
+        logits: *mut c_void,
+        counter: *mut c_uint,
+    ) -> c_int;
 }
 
 pub fn stub_launch(
@@ -292,6 +322,152 @@ pub fn lm_head_launch(
         return Err(GpuError::backend(
             backend,
             format!("qwen3_moe lm_head launch failed with status {status}"),
+        ));
+    }
+    Ok(())
+}
+
+pub fn persistent_decode_launch(
+    ordinal: usize,
+    dtype: ScalarType,
+    layer_descs_device: &GpuBuffer,
+    int4_descs_device: &GpuBuffer,
+    num_layers: usize,
+    hidden: i32,
+    position: i32,
+    input_hidden: &GpuBuffer,
+    hidden_ping: &mut GpuBuffer,
+    hidden_pong: &mut GpuBuffer,
+    workspace: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if dtype != ScalarType::BF16 {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen3_moe::persistent_decode_launch: only BF16 is wired, got {dtype:?}"
+        )));
+    }
+    let backend = input_hidden.backend();
+    let status: c_int = match backend {
+        Backend::Hip => {
+            #[cfg(supersonic_backend_hip)]
+            unsafe {
+                qwen3_moe_hip_persistent_decode_launch(
+                    dtype.kernel_dtype_code(),
+                    ordinal,
+                    num_layers as c_int,
+                    layer_descs_device.as_ptr() as *const Qwen3MoeDecodeLayerDesc,
+                    int4_descs_device.as_ptr() as *const Qwen3MoeInt4ScaleDesc,
+                    hidden,
+                    position,
+                    input_hidden.as_ptr(),
+                    hidden_ping.as_mut_ptr(),
+                    hidden_pong.as_mut_ptr(),
+                    workspace.as_mut_ptr() as *mut f32,
+                )
+            }
+            #[cfg(not(supersonic_backend_hip))]
+            {
+                let _ = (
+                    ordinal,
+                    layer_descs_device,
+                    int4_descs_device,
+                    num_layers,
+                    hidden,
+                    position,
+                    hidden_ping,
+                    hidden_pong,
+                    workspace,
+                );
+                return Err(GpuError::InvalidArg(
+                    "qwen3_moe::persistent_decode_launch: HIP backend not compiled".into(),
+                ));
+            }
+        }
+        Backend::Cuda | Backend::Metal => {
+            return Err(GpuError::InvalidArg(
+                "qwen3_moe::persistent_decode_launch: Qwen3-MoE is HIP-only".into(),
+            ));
+        }
+    };
+    if status != 0 {
+        return Err(GpuError::backend(
+            backend,
+            format!("qwen3_moe persistent decode launch failed with status {status}"),
+        ));
+    }
+    Ok(())
+}
+
+pub fn lm_head_int4_launch(
+    ordinal: usize,
+    dtype: ScalarType,
+    hidden: i32,
+    vocab: i32,
+    rms_norm_eps: f32,
+    final_hidden: &GpuBuffer,
+    final_norm_w: &GpuBuffer,
+    lm_head_w: &GpuBuffer,
+    lm_head_scale: &GpuBuffer,
+    lm_head_zero: &GpuBuffer,
+    group_size: i32,
+    logits: &mut GpuBuffer,
+    counter: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if dtype != ScalarType::BF16 {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen3_moe::lm_head_int4_launch: only BF16 activations are wired, got {dtype:?}"
+        )));
+    }
+    let backend = final_hidden.backend();
+    let status: c_int = match backend {
+        Backend::Hip => {
+            #[cfg(supersonic_backend_hip)]
+            unsafe {
+                qwen3_moe_hip_lm_head_int4_launch(
+                    dtype.kernel_dtype_code(),
+                    ordinal,
+                    hidden,
+                    vocab,
+                    rms_norm_eps,
+                    final_hidden.as_ptr(),
+                    final_norm_w.as_ptr(),
+                    lm_head_w.as_ptr(),
+                    lm_head_scale.as_ptr(),
+                    lm_head_zero.as_ptr(),
+                    group_size,
+                    logits.as_mut_ptr(),
+                    counter.as_mut_ptr() as *mut c_uint,
+                )
+            }
+            #[cfg(not(supersonic_backend_hip))]
+            {
+                let _ = (
+                    ordinal,
+                    hidden,
+                    vocab,
+                    rms_norm_eps,
+                    final_norm_w,
+                    lm_head_w,
+                    lm_head_scale,
+                    lm_head_zero,
+                    group_size,
+                    logits,
+                    counter,
+                );
+                return Err(GpuError::InvalidArg(
+                    "qwen3_moe::lm_head_int4_launch: HIP backend not compiled".into(),
+                ));
+            }
+        }
+        Backend::Cuda | Backend::Metal => {
+            return Err(GpuError::InvalidArg(
+                "qwen3_moe::lm_head_int4_launch: Qwen3-MoE is HIP-only".into(),
+            ));
+        }
+    };
+    if status != 0 {
+        return Err(GpuError::backend(
+            backend,
+            format!("qwen3_moe INT4 lm_head launch failed with status {status}"),
         ));
     }
     Ok(())
