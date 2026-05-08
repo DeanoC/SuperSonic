@@ -171,6 +171,24 @@ __device__ float int4_value_3d(
     return bf16_round_rne_f32(static_cast<float>(nibble) * s - z * s);
 }
 
+__device__ __forceinline__ void int4_dequant_8(
+    uint32_t packed,
+    const hip_bfloat16* __restrict__ scale,
+    const hip_bfloat16* __restrict__ zero,
+    int scale_idx,
+    float out[8]) {
+    const float s = static_cast<float>(scale[scale_idx]);
+    const float zs = static_cast<float>(zero[scale_idx]) * s;
+    out[0] = bf16_round_rne_f32(static_cast<float>((packed >>  0) & 0xF) * s - zs);
+    out[1] = bf16_round_rne_f32(static_cast<float>((packed >>  4) & 0xF) * s - zs);
+    out[2] = bf16_round_rne_f32(static_cast<float>((packed >>  8) & 0xF) * s - zs);
+    out[3] = bf16_round_rne_f32(static_cast<float>((packed >> 12) & 0xF) * s - zs);
+    out[4] = bf16_round_rne_f32(static_cast<float>((packed >> 16) & 0xF) * s - zs);
+    out[5] = bf16_round_rne_f32(static_cast<float>((packed >> 20) & 0xF) * s - zs);
+    out[6] = bf16_round_rne_f32(static_cast<float>((packed >> 24) & 0xF) * s - zs);
+    out[7] = bf16_round_rne_f32(static_cast<float>((packed >> 28) & 0xF) * s - zs);
+}
+
 __device__ float dense_or_int4_dot(
     const void* weight,
     const void* scale,
@@ -185,7 +203,24 @@ __device__ float dense_or_int4_dot(
         const uint8_t* w = static_cast<const uint8_t*>(weight);
         const hip_bfloat16* s = static_cast<const hip_bfloat16*>(scale);
         const hip_bfloat16* z = static_cast<const hip_bfloat16*>(zero);
-        for (int c = threadIdx.x; c < cols; c += blockDim.x) {
+        const int byte_cols = (cols + 1) / 2;
+        const int scale_cols = (cols + group_size - 1) / group_size;
+        const int scale_row = row / group_size;
+        int c = threadIdx.x * 8;
+        for (; c + 7 < cols; c += blockDim.x * 8) {
+            uint32_t packed;
+            __builtin_memcpy(
+                &packed,
+                w + static_cast<size_t>(row) * byte_cols + c / 2,
+                sizeof(packed));
+            float vals[8];
+            int4_dequant_8(packed, s, z, scale_row * scale_cols + c / group_size, vals);
+            partial += vals[0] * x[c + 0] + vals[1] * x[c + 1] +
+                       vals[2] * x[c + 2] + vals[3] * x[c + 3] +
+                       vals[4] * x[c + 4] + vals[5] * x[c + 5] +
+                       vals[6] * x[c + 6] + vals[7] * x[c + 7];
+        }
+        for (; c < cols; ++c) {
             partial += int4_value(w, s, z, row, c, cols, group_size) * x[c];
         }
     } else {
@@ -213,7 +248,25 @@ __device__ float expert_int4_dot(
     const hip_bfloat16* s = static_cast<const hip_bfloat16*>(scale);
     const hip_bfloat16* z = static_cast<const hip_bfloat16*>(zero);
     float partial = 0.0f;
-    for (int c = threadIdx.x; c < cols; c += blockDim.x) {
+    const int byte_cols = (cols + 1) / 2;
+    const int scale_rows = (rows + group_size - 1) / group_size;
+    const int scale_cols = (cols + group_size - 1) / group_size;
+    const size_t packed_base =
+        (static_cast<size_t>(expert) * rows + row) * byte_cols;
+    const int scale_base =
+        (expert * scale_rows + row / group_size) * scale_cols;
+    int c = threadIdx.x * 8;
+    for (; c + 7 < cols; c += blockDim.x * 8) {
+        uint32_t packed;
+        __builtin_memcpy(&packed, w + packed_base + c / 2, sizeof(packed));
+        float vals[8];
+        int4_dequant_8(packed, s, z, scale_base + c / group_size, vals);
+        partial += vals[0] * x[c + 0] + vals[1] * x[c + 1] +
+                   vals[2] * x[c + 2] + vals[3] * x[c + 3] +
+                   vals[4] * x[c + 4] + vals[5] * x[c + 5] +
+                   vals[6] * x[c + 6] + vals[7] * x[c + 7];
+    }
+    for (; c < cols; ++c) {
         partial += int4_value_3d(w, s, z, expert, row, c, rows, cols, group_size) * x[c];
     }
     return block_sum(partial, scratch);
@@ -651,7 +704,29 @@ __global__ void qwen3_moe_lm_head_int4_kernel(
         if (row >= vocab) return;
 
         float partial = 0.0f;
-        for (int i = tid; i < hidden; i += bs) {
+        const int byte_cols = (hidden + 1) / 2;
+        const int scale_cols = (hidden + group_size - 1) / group_size;
+        const int scale_row = row / group_size;
+        int i = tid * 8;
+        for (; i + 7 < hidden; i += bs * 8) {
+            uint32_t packed;
+            __builtin_memcpy(
+                &packed,
+                lm_head_w + static_cast<size_t>(row) * byte_cols + i / 2,
+                sizeof(packed));
+            float vals[8];
+            int4_dequant_8(
+                packed, lm_head_scale, lm_head_zero,
+                scale_row * scale_cols + i / group_size, vals);
+            #pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const float x = bf16_round_rne_f32(
+                    static_cast<float>(final_hidden[i + j]) * inv *
+                    static_cast<float>(final_norm_w[i + j]));
+                partial += vals[j] * x;
+            }
+        }
+        for (; i < hidden; ++i) {
             const float x = bf16_round_rne_f32(
                 static_cast<float>(final_hidden[i]) * inv *
                 static_cast<float>(final_norm_w[i]));
