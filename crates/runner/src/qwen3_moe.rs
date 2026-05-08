@@ -184,9 +184,11 @@ fn decode_text(
         .context("alloc Qwen3 hidden_b")?;
     let mut hidden_c = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[text.hidden_size])
         .context("alloc Qwen3 hidden_c")?;
-    let workspace_floats = qwen3_workspace_floats(text);
+    let workspace_floats = qwen3_workspace_floats(text, context);
     let mut workspace = GpuBuffer::zeros(ordinal, ScalarType::F32, &[workspace_floats])
         .context("alloc Qwen3 layer workspace")?;
+    let mut persistent_sync = GpuBuffer::zeros(ordinal, ScalarType::U8, &[96])
+        .context("alloc Qwen3 persistent sync buffer")?;
 
     let lm_head = weights
         .lm_head
@@ -254,6 +256,7 @@ fn decode_text(
                 &mut hidden_b,
                 &mut hidden_c,
                 &mut workspace,
+                &mut persistent_sync,
             )
             .context("Qwen3 persistent decode")?;
             true
@@ -481,13 +484,15 @@ fn lookup_embed_row(
     Ok(bytes[start..end].to_vec())
 }
 
-fn qwen3_workspace_floats(text: &qwen3_moe::config::TextConfig) -> usize {
+fn qwen3_workspace_floats(text: &qwen3_moe::config::TextConfig, context: usize) -> usize {
     let hidden = text.hidden_size;
     let q_dim = text.num_attention_heads * text.head_dim;
     let kv_dim = text.num_key_value_heads * text.head_dim;
     let experts = text.num_experts;
     let top_k = text.top_k();
     let i = text.moe_intermediate_size;
+    let scores = text.num_attention_heads * context;
+    let partials = 128;
     hidden
         + q_dim
         + kv_dim
@@ -502,6 +507,8 @@ fn qwen3_workspace_floats(text: &qwen3_moe::config::TextConfig) -> usize {
         + i
         + hidden
         + hidden
+        + scores
+        + partials
 }
 
 fn inspect_checkpoint(cli: &Cli, text: &qwen3_moe::config::TextConfig, prefix: &str) -> Result<()> {

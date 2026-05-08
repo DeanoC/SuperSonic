@@ -60,6 +60,8 @@ struct Int4ScaleDesc {
     int         group_size;
 };
 
+constexpr int Q3_MAX_GRID_BLOCKS = 128;
+
 __global__ void qwen3_moe_descriptor_walk_stub(
     int                              num_layers,
     const DecodeLayerDesc* __restrict__ layers,
@@ -575,6 +577,215 @@ __global__ void qwen3_moe_decode_layer_kernel(
         layer, int4, hidden, position, input_hidden, output_hidden, workspace, lds);
 }
 
+__device__ inline void q3_grid_barrier(
+    unsigned int* barrier_counter,
+    unsigned int* barrier_flag,
+    int num_blocks) {
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const unsigned int phase = __atomic_load_n(barrier_flag, __ATOMIC_RELAXED);
+        __threadfence();
+        const unsigned int old = atomicAdd(barrier_counter, 1u);
+        if (old == static_cast<unsigned int>(num_blocks) - 1u) {
+            __atomic_store_n(barrier_counter, 0u, __ATOMIC_RELAXED);
+            __atomic_store_n(barrier_flag, phase + 1u, __ATOMIC_RELEASE);
+        } else {
+            while (__atomic_load_n(barrier_flag, __ATOMIC_ACQUIRE) == phase) {}
+        }
+    }
+    __syncthreads();
+}
+
+__device__ inline void q3_grid_barrier_reset_counter(
+    unsigned int* barrier_counter,
+    unsigned int* barrier_flag,
+    int num_blocks,
+    unsigned int* work_counter) {
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const unsigned int phase = __atomic_load_n(barrier_flag, __ATOMIC_RELAXED);
+        __threadfence();
+        const unsigned int old = atomicAdd(barrier_counter, 1u);
+        if (old == static_cast<unsigned int>(num_blocks) - 1u) {
+            __atomic_store_n(work_counter, 0u, __ATOMIC_RELAXED);
+            __atomic_store_n(barrier_counter, 0u, __ATOMIC_RELAXED);
+            __atomic_store_n(barrier_flag, phase + 1u, __ATOMIC_RELEASE);
+        } else {
+            while (__atomic_load_n(barrier_flag, __ATOMIC_ACQUIRE) == phase) {}
+        }
+    }
+    __syncthreads();
+}
+
+__device__ void q3_grid_rms_norm(
+    const float* in,
+    const void* weight,
+    float eps,
+    float* out,
+    int n,
+    float* partials,
+    float* scratch,
+    unsigned int* barrier_counter,
+    unsigned int* barrier_flag,
+    int nb) {
+    const int tid = threadIdx.x;
+    const int bs = blockDim.x;
+    float partial = 0.0f;
+    for (int i = blockIdx.x * bs + tid; i < n; i += nb * bs) {
+        const float v = in[i];
+        partial += v * v;
+    }
+    const float block = block_sum(partial, scratch);
+    if (tid == 0) partials[blockIdx.x] = block;
+    q3_grid_barrier(barrier_counter, barrier_flag, nb);
+
+    if (blockIdx.x == 0) {
+        float total = 0.0f;
+        for (int i = tid; i < nb; i += bs) total += partials[i];
+        total = block_sum(total, scratch);
+        if (tid == 0) partials[0] = rsqrtf(total / static_cast<float>(n) + eps);
+    }
+    q3_grid_barrier(barrier_counter, barrier_flag, nb);
+
+    const float inv = partials[0];
+    for (int i = blockIdx.x * bs + tid; i < n; i += nb * bs) {
+        out[i] = bf16_round_rne_f32(in[i] * inv * load_bf16(weight, i));
+    }
+}
+
+__device__ void q3_block_head_rms_norm_rope(
+    float* vec,
+    const void* weight,
+    int heads,
+    int head_dim,
+    float eps,
+    int position,
+    float rope_theta,
+    float* scratch) {
+    const int head = blockIdx.x;
+    if (head >= heads) return;
+    const int tid = threadIdx.x;
+    float* row = vec + head * head_dim;
+    float partial = 0.0f;
+    for (int i = tid; i < head_dim; i += blockDim.x) {
+        const float v = row[i];
+        partial += v * v;
+    }
+    const float sum = block_sum(partial, scratch);
+    const float inv = rsqrtf(sum / static_cast<float>(head_dim) + eps);
+    for (int i = tid; i < head_dim; i += blockDim.x) {
+        row[i] = bf16_round_rne_f32(row[i] * inv * load_bf16(weight, i));
+    }
+    __syncthreads();
+
+    const int half = head_dim / 2;
+    const float theta_log = logf(rope_theta);
+    for (int i = tid; i < half; i += blockDim.x) {
+        const float a = row[i];
+        const float b = row[half + i];
+        const float freq = static_cast<float>(position) *
+            expf(-(static_cast<float>(i) / static_cast<float>(half)) * theta_log);
+        const float c = bf16_round_rne_f32(cosf(freq));
+        const float s = bf16_round_rne_f32(sinf(freq));
+        row[i] = bf16_round_rne_f32(
+            bf16_round_rne_f32(a * c) - bf16_round_rne_f32(b * s));
+        row[half + i] = bf16_round_rne_f32(
+            bf16_round_rne_f32(b * c) + bf16_round_rne_f32(a * s));
+    }
+}
+
+__device__ void q3_qkv_rows(
+    const DecodeLayerDesc& layer,
+    const Int4ScaleDesc& int4,
+    const float* hnorm,
+    float* q,
+    float* k,
+    float* v,
+    int hidden,
+    int q_dim,
+    int kv_dim,
+    float* scratch,
+    unsigned int* work_counter) {
+    while (true) {
+        __shared__ unsigned int row_s;
+        if (threadIdx.x == 0) row_s = atomicAdd(work_counter, 1u);
+        __syncthreads();
+        const int row = static_cast<int>(row_s);
+        if (row >= q_dim + 2 * kv_dim) return;
+        if (row < q_dim) {
+            const float sum = dense_or_int4_dot(
+                layer.q_proj_w, int4.q_proj_scale, int4.q_proj_zero,
+                row, hnorm, hidden, int4.group_size, scratch);
+            if (threadIdx.x == 0) q[row] = bf16_round_rne_f32(sum);
+        } else if (row < q_dim + kv_dim) {
+            const int r = row - q_dim;
+            const float sum = dense_or_int4_dot(
+                layer.k_proj_w, int4.k_proj_scale, int4.k_proj_zero,
+                r, hnorm, hidden, int4.group_size, scratch);
+            if (threadIdx.x == 0) k[r] = bf16_round_rne_f32(sum);
+        } else {
+            const int r = row - q_dim - kv_dim;
+            const float sum = dense_or_int4_dot(
+                layer.v_proj_w, int4.v_proj_scale, int4.v_proj_zero,
+                r, hnorm, hidden, int4.group_size, scratch);
+            if (threadIdx.x == 0) v[r] = bf16_round_rne_f32(sum);
+        }
+        __syncthreads();
+    }
+}
+
+__device__ void q3_dense_rows(
+    const void* weight,
+    const void* scale,
+    const void* zero,
+    const float* x,
+    float* out,
+    int rows,
+    int cols,
+    int group_size,
+    float* scratch,
+    unsigned int* work_counter,
+    bool round_output) {
+    while (true) {
+        __shared__ unsigned int row_s;
+        if (threadIdx.x == 0) row_s = atomicAdd(work_counter, 1u);
+        __syncthreads();
+        const int row = static_cast<int>(row_s);
+        if (row >= rows) return;
+        const float sum = dense_or_int4_dot(
+            weight, scale, zero, row, x, cols, group_size, scratch);
+        if (threadIdx.x == 0) {
+            out[row] = round_output ? bf16_round_rne_f32(sum) : sum;
+        }
+        __syncthreads();
+    }
+}
+
+__device__ void q3_expert_rows(
+    const void* weight,
+    const void* scale,
+    const void* zero,
+    int expert,
+    const float* x,
+    float* out,
+    int rows,
+    int cols,
+    int group_size,
+    float* scratch,
+    unsigned int* work_counter) {
+    while (true) {
+        __shared__ unsigned int row_s;
+        if (threadIdx.x == 0) row_s = atomicAdd(work_counter, 1u);
+        __syncthreads();
+        const int row = static_cast<int>(row_s);
+        if (row >= rows) return;
+        const float sum = expert_int4_dot(
+            weight, scale, zero, expert, row, x, rows, cols, group_size, scratch);
+        if (threadIdx.x == 0) out[row] = bf16_round_rne_f32(sum);
+        __syncthreads();
+    }
+}
+
 __global__ void qwen3_moe_persistent_decode_kernel(
     int num_layers,
     const DecodeLayerDesc* __restrict__ layers,
@@ -584,30 +795,280 @@ __global__ void qwen3_moe_persistent_decode_kernel(
     const hip_bfloat16* __restrict__ input_hidden,
     hip_bfloat16* __restrict__ hidden_ping,
     hip_bfloat16* __restrict__ hidden_pong,
-    float* __restrict__ workspace) {
+    float* __restrict__ workspace,
+    unsigned int* __restrict__ sync) __attribute__((launch_bounds(256, 1))) {
     extern __shared__ float lds[];
-    if (blockIdx.x != 0) return;
     if (num_layers <= 0) return;
+    const int tid = threadIdx.x;
+    const int bs = blockDim.x;
+    const int nb = gridDim.x;
+    unsigned int* work_counter = sync + 0;
+    unsigned int* barrier_counter = sync + 1;
+    unsigned int* barrier_flag = sync + 2;
 
     const hip_bfloat16* in = input_hidden;
     hip_bfloat16* out = hidden_ping;
     for (int layer_idx = 0; layer_idx < num_layers; ++layer_idx) {
-        qwen3_moe_decode_layer_device(
-            layers[layer_idx],
-            int4_descs[layer_idx],
-            hidden,
-            position,
-            in,
-            out,
-            workspace,
-            lds);
-        __syncthreads();
+        const DecodeLayerDesc layer = layers[layer_idx];
+        const Int4ScaleDesc int4 = int4_descs[layer_idx];
+        const int hd = layer.head_dim;
+        const int h = layer.num_heads;
+        const int hkv = layer.num_kv_heads;
+        const int q_dim = h * hd;
+        const int kv_dim = hkv * hd;
+        const int group_size = int4.group_size;
+        const int top_k = layer.top_k;
+        const int experts = layer.num_experts;
+        const int moe_i = layer.moe_intermediate_size;
+        const int kv_slot = layer.kv_len;
+        const int kv_len = (layer.kv_cache_k != nullptr && layer.kv_cache_v != nullptr)
+            ? (kv_slot + 1)
+            : 1;
+
+        const int OFF_X = 0;
+        const int OFF_Q = OFF_X + hidden;
+        const int OFF_K = OFF_Q + q_dim;
+        const int OFF_V = OFF_K + kv_dim;
+        const int OFF_ATTN = OFF_V + kv_dim;
+        const int OFF_HN = OFF_ATTN + q_dim;
+        const int OFF_ROUTER = OFF_HN + hidden;
+        const int OFF_PROBS = OFF_ROUTER + experts;
+        const int OFF_TOPK_VAL = OFF_PROBS + experts;
+        const int OFF_TOPK_IDX = OFF_TOPK_VAL + top_k;
+        const int OFF_GU = OFF_TOPK_IDX + top_k;
+        const int OFF_MID = OFF_GU + 2 * moe_i;
+        const int OFF_EXPERT_OUT = OFF_MID + moe_i;
+        const int OFF_MOE_OUT = OFF_EXPERT_OUT + hidden;
+        const int OFF_SCORES = OFF_MOE_OUT + hidden;
+        const int OFF_PARTIALS = OFF_SCORES + h * layer.kv_max_t;
+
+        float* x = workspace + OFF_X;
+        float* q = workspace + OFF_Q;
+        float* k = workspace + OFF_K;
+        float* v = workspace + OFF_V;
+        float* attn = workspace + OFF_ATTN;
+        float* hnorm = workspace + OFF_HN;
+        float* router = workspace + OFF_ROUTER;
+        float* probs = workspace + OFF_PROBS;
+        float* topk_val = workspace + OFF_TOPK_VAL;
+        float* topk_idx = workspace + OFF_TOPK_IDX;
+        float* gu = workspace + OFF_GU;
+        float* mid = workspace + OFF_MID;
+        float* expert_out = workspace + OFF_EXPERT_OUT;
+        float* moe_out = workspace + OFF_MOE_OUT;
+        float* scores = workspace + OFF_SCORES;
+        float* partials = workspace + OFF_PARTIALS;
+
+        for (int i = blockIdx.x * bs + tid; i < hidden; i += nb * bs) {
+            x[i] = static_cast<float>(in[i]);
+        }
+        q3_grid_barrier(barrier_counter, barrier_flag, nb);
+
+        q3_grid_rms_norm(
+            x, layer.input_norm_w, layer.input_norm_eps, hnorm, hidden,
+            partials, lds, barrier_counter, barrier_flag, nb);
+        q3_grid_barrier_reset_counter(
+            barrier_counter, barrier_flag, nb, work_counter);
+
+        q3_qkv_rows(layer, int4, hnorm, q, k, v, hidden, q_dim, kv_dim, lds, work_counter);
+        q3_grid_barrier(barrier_counter, barrier_flag, nb);
+
+        q3_block_head_rms_norm_rope(
+            q, layer.q_norm_w, h, hd, layer.input_norm_eps,
+            position, layer.rope_theta, lds);
+        q3_grid_barrier(barrier_counter, barrier_flag, nb);
+
+        q3_block_head_rms_norm_rope(
+            k, layer.k_norm_w, hkv, hd, layer.input_norm_eps,
+            position, layer.rope_theta, lds);
+        q3_grid_barrier(barrier_counter, barrier_flag, nb);
+
+        hip_bfloat16* cache_k = static_cast<hip_bfloat16*>(layer.kv_cache_k);
+        hip_bfloat16* cache_v = static_cast<hip_bfloat16*>(layer.kv_cache_v);
+        if (cache_k != nullptr && cache_v != nullptr && kv_slot < layer.kv_max_t) {
+            const int base = kv_slot * kv_dim;
+            for (int i = blockIdx.x * bs + tid; i < kv_dim; i += nb * bs) {
+                cache_k[base + i] = static_cast<hip_bfloat16>(k[i]);
+                cache_v[base + i] = static_cast<hip_bfloat16>(v[i]);
+            }
+        }
+        q3_grid_barrier(barrier_counter, barrier_flag, nb);
+
+        const float attn_scale = rsqrtf(static_cast<float>(hd));
+        const int rep = h / hkv;
+        q3_grid_barrier_reset_counter(
+            barrier_counter, barrier_flag, nb, work_counter);
+        while (true) {
+            __shared__ unsigned int item_s;
+            if (tid == 0) item_s = atomicAdd(work_counter, 1u);
+            __syncthreads();
+            const int item = static_cast<int>(item_s);
+            if (item >= h * kv_len) break;
+            const int t = item % kv_len;
+            const int head = item / kv_len;
+            const int kv_head = head / rep;
+            float partial = 0.0f;
+            for (int d = tid; d < hd; d += bs) {
+                const float kval = (cache_k != nullptr)
+                    ? static_cast<float>(cache_k[t * kv_dim + kv_head * hd + d])
+                    : k[kv_head * hd + d];
+                partial += q[head * hd + d] * kval;
+            }
+            const float score = block_sum(partial, lds) * attn_scale;
+            if (tid == 0) scores[head * layer.kv_max_t + t] = score;
+            __syncthreads();
+        }
+        q3_grid_barrier(barrier_counter, barrier_flag, nb);
+
+        if (blockIdx.x < static_cast<unsigned int>(h)) {
+            const int head = blockIdx.x;
+            float* row = scores + head * layer.kv_max_t;
+            float local_max = -INFINITY;
+            for (int t = tid; t < kv_len; t += bs) local_max = fmaxf(local_max, row[t]);
+            lds[tid] = local_max;
+            __syncthreads();
+            for (int s = bs / 2; s > 0; s >>= 1) {
+                if (tid < s) lds[tid] = fmaxf(lds[tid], lds[tid + s]);
+                __syncthreads();
+            }
+            const float maxv = lds[0];
+            __syncthreads();
+            float local_sum = 0.0f;
+            for (int t = tid; t < kv_len; t += bs) {
+                const float e = expf(row[t] - maxv);
+                row[t] = e;
+                local_sum += e;
+            }
+            const float sum = block_sum(local_sum, lds);
+            const float inv = 1.0f / sum;
+            for (int t = tid; t < kv_len; t += bs) row[t] = bf16_round_rne_f32(row[t] * inv);
+        }
+        q3_grid_barrier(barrier_counter, barrier_flag, nb);
+
+        for (int item = blockIdx.x * bs + tid; item < q_dim; item += nb * bs) {
+            const int d = item % hd;
+            const int head = item / hd;
+            const int kv_head = head / rep;
+            const float* row = scores + head * layer.kv_max_t;
+            float acc = 0.0f;
+            for (int t = 0; t < kv_len; ++t) {
+                const float vv = (cache_v != nullptr)
+                    ? static_cast<float>(cache_v[t * kv_dim + kv_head * hd + d])
+                    : v[kv_head * hd + d];
+                acc += row[t] * vv;
+            }
+            attn[item] = bf16_round_rne_f32(acc);
+        }
+        q3_grid_barrier(barrier_counter, barrier_flag, nb);
+
+        q3_grid_barrier_reset_counter(
+            barrier_counter, barrier_flag, nb, work_counter);
+        q3_dense_rows(
+            layer.o_proj_w, int4.o_proj_scale, int4.o_proj_zero,
+            attn, hnorm, hidden, q_dim, group_size, lds, work_counter, true);
+        q3_grid_barrier(barrier_counter, barrier_flag, nb);
+
+        for (int i = blockIdx.x * bs + tid; i < hidden; i += nb * bs) {
+            x[i] = bf16_round_rne_f32(x[i] + hnorm[i]);
+        }
+        q3_grid_barrier(barrier_counter, barrier_flag, nb);
+
+        q3_grid_rms_norm(
+            x, layer.post_attn_norm_w, layer.post_attn_norm_eps, hnorm, hidden,
+            partials, lds, barrier_counter, barrier_flag, nb);
+        q3_grid_barrier_reset_counter(
+            barrier_counter, barrier_flag, nb, work_counter);
+
+        q3_dense_rows(
+            layer.router_w, nullptr, nullptr, hnorm, router, experts, hidden,
+            group_size, lds, work_counter, true);
+        q3_grid_barrier(barrier_counter, barrier_flag, nb);
+
+        if (blockIdx.x == 0) {
+            if (tid == 0) {
+                float maxv = -INFINITY;
+                for (int e = 0; e < experts; ++e) maxv = fmaxf(maxv, router[e]);
+                float denom = 0.0f;
+                for (int e = 0; e < experts; ++e) {
+                    probs[e] = expf(router[e] - maxv);
+                    denom += probs[e];
+                }
+                for (int e = 0; e < experts; ++e) {
+                    probs[e] = bf16_round_rne_f32(probs[e] / denom);
+                }
+                for (int kpos = 0; kpos < top_k; ++kpos) {
+                    int best_i = 0;
+                    float best_v = -INFINITY;
+                    for (int e = 0; e < experts; ++e) {
+                        if (probs[e] > best_v) {
+                            best_v = probs[e];
+                            best_i = e;
+                        }
+                    }
+                    topk_idx[kpos] = static_cast<float>(best_i);
+                    topk_val[kpos] = best_v;
+                    probs[best_i] = -INFINITY;
+                }
+                if (layer.norm_topk_prob) {
+                    float sum = 0.0f;
+                    for (int kpos = 0; kpos < top_k; ++kpos) sum += topk_val[kpos];
+                    const float inv = 1.0f / sum;
+                    for (int kpos = 0; kpos < top_k; ++kpos) {
+                        topk_val[kpos] = bf16_round_rne_f32(topk_val[kpos] * inv);
+                    }
+                }
+            }
+        }
+        q3_grid_barrier(barrier_counter, barrier_flag, nb);
+
+        for (int i = blockIdx.x * bs + tid; i < hidden; i += nb * bs) moe_out[i] = 0.0f;
+        q3_grid_barrier(barrier_counter, barrier_flag, nb);
+
+        for (int kpos = 0; kpos < top_k; ++kpos) {
+            const int expert = static_cast<int>(topk_idx[kpos]);
+            q3_grid_barrier_reset_counter(
+                barrier_counter, barrier_flag, nb, work_counter);
+            q3_expert_rows(
+                layer.experts_gate_up_w,
+                int4.experts_gate_up_scale,
+                int4.experts_gate_up_zero,
+                expert, hnorm, gu, 2 * moe_i, hidden, group_size, lds, work_counter);
+            q3_grid_barrier(barrier_counter, barrier_flag, nb);
+
+            for (int i = blockIdx.x * bs + tid; i < moe_i; i += nb * bs) {
+                const float g = gu[i];
+                const float u = gu[moe_i + i];
+                mid[i] = bf16_round_rne_f32((g / (1.0f + expf(-g))) * u);
+            }
+            q3_grid_barrier(barrier_counter, barrier_flag, nb);
+
+            q3_grid_barrier_reset_counter(
+                barrier_counter, barrier_flag, nb, work_counter);
+            q3_expert_rows(
+                layer.experts_down_w,
+                int4.experts_down_scale,
+                int4.experts_down_zero,
+                expert, mid, expert_out, hidden, moe_i, group_size, lds, work_counter);
+            q3_grid_barrier(barrier_counter, barrier_flag, nb);
+
+            for (int i = blockIdx.x * bs + tid; i < hidden; i += nb * bs) {
+                moe_out[i] += topk_val[kpos] * expert_out[i];
+            }
+            q3_grid_barrier(barrier_counter, barrier_flag, nb);
+        }
+
+        for (int i = blockIdx.x * bs + tid; i < hidden; i += nb * bs) {
+            out[i] = static_cast<hip_bfloat16>(
+                bf16_round_rne_f32(x[i] + bf16_round_rne_f32(moe_out[i])));
+        }
+        q3_grid_barrier(barrier_counter, barrier_flag, nb);
+
         in = out;
         out = (out == hidden_ping) ? hidden_pong : hidden_ping;
     }
 
     if (in != hidden_ping) {
-        for (int i = threadIdx.x; i < hidden; i += blockDim.x) {
+        for (int i = blockIdx.x * bs + tid; i < hidden; i += nb * bs) {
             hidden_ping[i] = in[i];
         }
     }

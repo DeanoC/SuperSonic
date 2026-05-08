@@ -86,7 +86,9 @@ decode, lm-head, and sampling.
 
 ## Decode Optimization Notes
 
-The optimized HIP path in this PR makes three targeted changes:
+The optimized HIP path now has two decode generations.
+
+The first optimized persistent path made three targeted changes:
 
 - the layer decode kernel now uses 1024 threads per cooperative block, which
   improves the scalar row-dot path substantially on gfx1100-class hardware
@@ -101,6 +103,27 @@ the synced one-token smoke improved from roughly 5.2 s/token in the initial
 path. Persistent-vs-chained timings are currently very close because the
 single-token work is compute dominated; the persistent path is still useful as
 the Qwen3-owned launch surface for future multi-block/grid-barrier work.
+
+The multi-block persistent path keeps the Qwen3 implementation separate from
+Qwen3.6 and uses a Qwen3-local grid barrier plus a work-stealing counter. It
+launches one resident grid for all 48 layers and parallelizes the bulk decode
+phases across blocks: RMSNorm reductions, Q/K/V projections, q/k norm and
+RoPE, KV append, attention score/softmax/value aggregation, O projection,
+router projection, selected expert gate/up/down matvecs, and residual writes.
+The chained per-layer path remains available with `--no-persistent-decode` for
+A/B correctness checks.
+
+On the same local gfx1100 setup, synced one-token context-8 timings are:
+
+- persistent multi-block: `decode_ms_avg=55.8`, `lm_head_ms_avg=3.9`
+- chained single-block fallback: `decode_ms_avg=1905.1`, `lm_head_ms_avg=4.1`
+
+A ROCTracer HIP trace for the persistent smoke reported
+`qwen3_moe_persistent_decode_kernel` at about `55.15 ms` and
+`qwen3_moe_lm_head_int4_kernel` at about `3.82 ms`. Persistent-vs-chained
+logits for the same prompt were bit-identical in the local smoke
+(`cos=1.0`, `max_abs=0.0`, same argmax and 5/5 top-5 overlap). A context-128
+8-token smoke averaged `decode_ms_avg=125.2` and generated successfully.
 
 ## INT4 Bake Contract
 
