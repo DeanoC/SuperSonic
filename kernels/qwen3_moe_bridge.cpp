@@ -132,7 +132,8 @@ extern "C" int qwen3_moe_hip_persistent_decode_launch(
     void*                                    hidden_ping,
     void*                                    hidden_pong,
     float*                                   workspace,
-    unsigned int*                            sync) {
+    unsigned int*                            sync,
+    uint64_t*                                profile) {
     if (dtype != 2) return 110; // BF16 activations only.
     if (num_layers <= 0 || num_layers > 1024) return 100;
     if (layers == nullptr || int4_descs == nullptr || input_hidden == nullptr ||
@@ -158,6 +159,14 @@ extern "C" int qwen3_moe_hip_persistent_decode_launch(
     if (hipMemsetAsync(sync, 0, 96) != hipSuccess) {
         return 200;
     }
+    if (profile != nullptr) {
+        const size_t profile_bytes =
+            static_cast<size_t>(num_layers) * qwen3_moe::Q3_PROFILE_PHASES *
+            sizeof(uint64_t);
+        if (hipMemsetAsync(profile, 0, profile_bytes) != hipSuccess) {
+            return 200;
+        }
+    }
 
     const int block_threads = 256;
     const size_t shmem = block_threads * sizeof(float);
@@ -174,7 +183,8 @@ extern "C" int qwen3_moe_hip_persistent_decode_launch(
                        static_cast<hip_bfloat16*>(hidden_ping),
                        static_cast<hip_bfloat16*>(hidden_pong),
                        workspace,
-                       sync);
+                       sync,
+                       profile);
     hipError_t launch_err = hipGetLastError();
     hipError_t sync_err =
         sync_each_kernel_enabled() ? hipDeviceSynchronize() : hipSuccess;

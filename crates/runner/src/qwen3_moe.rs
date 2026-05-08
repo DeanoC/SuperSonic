@@ -21,6 +21,30 @@ use crate::qwen36_moe_logits::{sample_bf16_logits, XorshiftRng};
 use crate::registry::{FamilyParams, RegistryEntry};
 use crate::Cli;
 
+const QWEN3_PROFILE_PHASES: usize = 20;
+const QWEN3_PROFILE_PHASE_NAMES: [&str; QWEN3_PROFILE_PHASES] = [
+    "input_load",
+    "input_norm",
+    "qkv",
+    "q_norm_rope",
+    "k_norm_rope",
+    "kv_store",
+    "attn_scores",
+    "softmax",
+    "attn_values",
+    "o_proj",
+    "attn_residual",
+    "post_norm",
+    "router",
+    "topk",
+    "moe_zero",
+    "expert_gate_up",
+    "expert_act",
+    "expert_down",
+    "expert_accum",
+    "output",
+];
+
 pub(crate) fn run(cli: &Cli, entry: &RegistryEntry, total_vram: u64) -> Result<()> {
     validate_policy(cli, entry)?;
 
@@ -189,6 +213,19 @@ fn decode_text(
         .context("alloc Qwen3 layer workspace")?;
     let mut persistent_sync = GpuBuffer::zeros(ordinal, ScalarType::U8, &[96])
         .context("alloc Qwen3 persistent sync buffer")?;
+    let profile_decode_phases = std::env::var_os("SUPERSONIC_QWEN3_PROFILE_PHASES").is_some();
+    let mut decode_profile = if profile_decode_phases {
+        Some(
+            GpuBuffer::zeros(
+                ordinal,
+                ScalarType::U8,
+                &[text.num_hidden_layers * QWEN3_PROFILE_PHASES * std::mem::size_of::<u64>()],
+            )
+            .context("alloc Qwen3 decode phase profile buffer")?,
+        )
+    } else {
+        None
+    };
 
     let lm_head = weights
         .lm_head
@@ -257,8 +294,15 @@ fn decode_text(
                 &mut hidden_c,
                 &mut workspace,
                 &mut persistent_sync,
+                decode_profile.as_mut(),
             )
             .context("Qwen3 persistent decode")?;
+            if step + 1 >= prompt.prompt_ids.len() {
+                if let Some(profile) = decode_profile.as_ref() {
+                    print_decode_phase_profile(step, text.num_hidden_layers, profile)
+                        .context("print Qwen3 decode phase profile")?;
+                }
+            }
             true
         } else {
             let mut front_a = true;
@@ -503,12 +547,73 @@ fn qwen3_workspace_floats(text: &qwen3_moe::config::TextConfig, context: usize) 
         + experts
         + top_k
         + top_k
-        + 2 * i
-        + i
-        + hidden
+        + top_k * 2 * i
+        + top_k * i
+        + top_k * hidden
         + hidden
         + scores
         + partials
+}
+
+fn print_decode_phase_profile(step: usize, num_layers: usize, profile: &GpuBuffer) -> Result<()> {
+    let bytes = profile.to_host_bytes().context("d2h Qwen3 decode phase profile")?;
+    let mut phase_totals = [0u64; QWEN3_PROFILE_PHASES];
+    let mut layer_totals = vec![0u64; num_layers];
+    for (idx, chunk) in bytes.chunks_exact(std::mem::size_of::<u64>()).enumerate() {
+        let mut arr = [0u8; 8];
+        arr.copy_from_slice(chunk);
+        let cycles = u64::from_ne_bytes(arr);
+        let layer = idx / QWEN3_PROFILE_PHASES;
+        let phase = idx % QWEN3_PROFILE_PHASES;
+        if layer < num_layers {
+            phase_totals[phase] = phase_totals[phase].saturating_add(cycles);
+            layer_totals[layer] = layer_totals[layer].saturating_add(cycles);
+        }
+    }
+    let total: u64 = phase_totals.iter().copied().sum();
+    if total == 0 {
+        eprintln!("[qwen3-moe phase-profile] step={step} no samples");
+        return Ok(());
+    }
+
+    let mut phases: Vec<_> = QWEN3_PROFILE_PHASE_NAMES
+        .iter()
+        .zip(phase_totals.iter())
+        .filter(|(_, cycles)| **cycles > 0)
+        .map(|(name, cycles)| (*name, *cycles))
+        .collect();
+    phases.sort_by_key(|(_, cycles)| std::cmp::Reverse(*cycles));
+    eprintln!("[qwen3-moe phase-profile] step={step} total_cycles={total}");
+    for (name, cycles) in phases.iter().take(12) {
+        eprintln!(
+            "[qwen3-moe phase-profile]   {:>16}: {:>14} cycles {:>6.2}%",
+            name,
+            cycles,
+            (*cycles as f64) * 100.0 / (total as f64)
+        );
+    }
+
+    let mut layers: Vec<_> = layer_totals
+        .iter()
+        .enumerate()
+        .filter(|(_, cycles)| **cycles > 0)
+        .map(|(layer, cycles)| (layer, *cycles))
+        .collect();
+    layers.sort_by_key(|(_, cycles)| std::cmp::Reverse(*cycles));
+    let top_layers = layers
+        .iter()
+        .take(6)
+        .map(|(layer, cycles)| {
+            format!(
+                "{}:{:.2}%",
+                layer,
+                (*cycles as f64) * 100.0 / (total as f64)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    eprintln!("[qwen3-moe phase-profile]   top_layers: {top_layers}");
+    Ok(())
 }
 
 fn inspect_checkpoint(cli: &Cli, text: &qwen3_moe::config::TextConfig, prefix: &str) -> Result<()> {

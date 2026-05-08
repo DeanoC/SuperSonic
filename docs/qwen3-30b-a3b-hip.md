@@ -118,7 +118,30 @@ On the same local gfx1100 setup, synced one-token context-8 timings are:
 - persistent multi-block: `decode_ms_avg=55.8`, `lm_head_ms_avg=3.9`
 - chained single-block fallback: `decode_ms_avg=1905.1`, `lm_head_ms_avg=4.1`
 
-A ROCTracer HIP trace for the persistent smoke reported
+The next optimization pass added Qwen3-local phase profiling
+(`SUPERSONIC_QWEN3_PROFILE_PHASES=1`) and replaced the selected-expert MoE
+matvec work with wave-per-row scheduling. The same wave-per-row strategy is
+also used for the Q/K/V and O projections. This is still GEMV-shaped rather
+than a WMMA tile, but it lets each 256-thread block process multiple rows
+concurrently and removes the worst one-block-per-row underutilization.
+
+On the same local gfx1100 setup, the optimized wave-row persistent path
+measured:
+
+- context-8 one-token: `decode_ms_avg=26.4`, `lm_head_ms_avg=3.9`
+- context-128 8-token smoke: `decode_ms_avg=53.6`, `lm_head_ms_avg=3.7`
+- context-217 phase-profiled token: `decode_ms_avg=6169.0` over the full
+  token-by-token prompt run, with the final token phase mix dominated by
+  `expert_gate_up` 22.1%, `attn_scores` 18.9%, `expert_down` 12.9%,
+  `attn_values` 10.8%, `qkv` 9.6%, and `o_proj` 8.2%
+
+The expert wave-row path was bit-identical to the chained fallback in the
+context-8 logit smoke. After also moving Q/K/V and O projection reductions to
+wave reductions, the context-8 logit comparison remained stable at the sampled
+surface (`cos=0.999979205`, `max_abs=0.125`, same argmax and 10/10 top-10
+overlap), but is no longer bit-identical because the reduction order changed.
+
+A ROCTracer HIP trace for the earlier multi-block persistent smoke reported
 `qwen3_moe_persistent_decode_kernel` at about `55.15 ms` and
 `qwen3_moe_lm_head_int4_kernel` at about `3.82 ms`. Persistent-vs-chained
 logits for the same prompt were bit-identical in the local smoke
