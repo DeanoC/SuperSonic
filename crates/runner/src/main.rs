@@ -62,6 +62,7 @@ mod qwen36_moe_state;
 mod qwen36_moe_telemetry;
 #[path = "qwen36_moe/types.rs"]
 mod qwen36_moe_types;
+mod qwen3_moe;
 mod registry;
 mod specprefill;
 mod specprefill_engine;
@@ -134,7 +135,13 @@ fn main() -> Result<()> {
     // Bail early for unsupported families so the user gets a clear message.
     if cli.teacher_forced {
         match model_variant.family() {
-            ModelFamily::Llama31 | ModelFamily::Qwen35 | ModelFamily::Gemma4 | ModelFamily::Phi4 => {} // supported; handled inside engine
+            ModelFamily::Llama31
+            | ModelFamily::Qwen35
+            | ModelFamily::Gemma4
+            | ModelFamily::Phi4 => {} // supported; handled inside engine
+            ModelFamily::Qwen3Moe => {
+                anyhow::bail!("Qwen3-MoE teacher-forced decode is out of v1 scope")
+            }
             ModelFamily::Qwen36Moe => {
                 anyhow::bail!("Qwen3.6-MoE teacher-forced out of Phase 1 scope")
             }
@@ -149,6 +156,7 @@ fn main() -> Result<()> {
         ModelFamily::Llama31 => {
             llama31_engine::run_llama31(&cli, &model_variant, entry, ordinal, gpu.total_vram)
         }
+        ModelFamily::Qwen3Moe => qwen3_moe::run(&cli, entry, gpu.total_vram),
         ModelFamily::Qwen36Moe => {
             // Route Qwen3.6-MoE through the SpecPrefill orchestrator when the
             // drafter flag is set, so the cross-family R1 path

@@ -28,13 +28,21 @@ pub(crate) fn validate_global_flags(
     if q4km_like
         && !matches!(
             model_variant.family(),
-            ModelFamily::Qwen35 | ModelFamily::Qwen36Moe
+            ModelFamily::Qwen35 | ModelFamily::Qwen3Moe | ModelFamily::Qwen36Moe
         )
     {
         anyhow::bail!("--q4km/--q4km-gptq are currently supported only for Qwen models");
     }
     if q4km_like && backend != Backend::Cuda {
         anyhow::bail!("--q4km/--q4km-gptq are currently supported only on CUDA");
+    }
+    if matches!(model_variant.family(), ModelFamily::Qwen3Moe) {
+        if !cli.int4 || profile != QuantProfile::Int4Gptq {
+            anyhow::bail!("qwen3-30b-a3b v1 requires --int4 / int4-gptq");
+        }
+        if backend != Backend::Hip {
+            anyhow::bail!("qwen3-30b-a3b v1 is supported only on HIP");
+        }
     }
     if cli.gguf_file.is_some() && profile != QuantProfile::Q4Km {
         anyhow::bail!("--gguf-file requires --q4km");
@@ -56,11 +64,11 @@ pub(crate) fn validate_global_flags(
         (profile, model_variant.family()),
         (
             QuantProfile::Int4Awq | QuantProfile::Int4Autoround | QuantProfile::Int4Hqq,
-            ModelFamily::Qwen36Moe
+            ModelFamily::Qwen3Moe | ModelFamily::Qwen36Moe
         )
     ) {
         anyhow::bail!(
-            "--weight-quant {profile} is currently supported only for Qwen3.5; Qwen3.6-MoE bake selection/runtime support is not wired for this profile yet"
+            "--weight-quant {profile} is currently supported only for Qwen3.5; Qwen3/Qwen3.6-MoE bake selection/runtime support is not wired for this profile yet"
         );
     }
     if profile == QuantProfile::Int4Awq && backend == Backend::Cuda {
@@ -73,7 +81,7 @@ pub(crate) fn validate_global_flags(
         QuantProfile::Int4Awq | QuantProfile::Int4Autoround | QuantProfile::Int4Hqq
     ) && !matches!(
         model_variant.family(),
-        ModelFamily::Qwen35 | ModelFamily::Qwen36Moe
+        ModelFamily::Qwen35 | ModelFamily::Qwen3Moe | ModelFamily::Qwen36Moe
     ) {
         anyhow::bail!(
             "--weight-quant {profile} is Qwen-first; Gemma 4 and Phi 4 ports are follow-up work"

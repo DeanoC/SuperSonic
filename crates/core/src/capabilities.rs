@@ -35,6 +35,9 @@ pub fn capabilities_for_variant(
     let family = variant.family();
     let serve_status = match family {
         ModelFamily::Qwen35 | ModelFamily::Gemma4 => ServeStatus::Ready,
+        ModelFamily::Qwen3Moe => {
+            ServeStatus::CliOnly("Qwen3 MoE runtime is still wired through the CLI flow")
+        }
         ModelFamily::Qwen36Moe => {
             ServeStatus::CliOnly("Qwen3.6 MoE runtime is still wired through the CLI flow")
         }
@@ -65,6 +68,10 @@ mod tests {
         let cases = [
             (ModelVariant::Qwen3_5_0_8B, ServeStatus::Ready),
             (ModelVariant::Gemma4_E2B, ServeStatus::Ready),
+            (
+                ModelVariant::Qwen3_30B_A3B,
+                ServeStatus::CliOnly("Qwen3 MoE runtime is still wired through the CLI flow"),
+            ),
             (
                 ModelVariant::Qwen3_6_35B_A3B,
                 ServeStatus::CliOnly("Qwen3.6 MoE runtime is still wired through the CLI flow"),

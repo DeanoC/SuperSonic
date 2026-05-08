@@ -8,6 +8,7 @@ pub mod phi4;
 pub mod prefill_ffi;
 mod qwen35;
 pub mod qwen36_moe;
+pub mod qwen3_moe;
 
 pub use layer_desc::{
     BatchSeqDesc, DecodeLayerDesc, FP8ScaleDesc, INT4ScaleDesc, KVCacheFp8Desc, MAX_BATCH_SIZE,

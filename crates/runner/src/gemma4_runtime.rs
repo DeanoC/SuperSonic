@@ -139,6 +139,7 @@ pub(crate) fn run_gemma4(
     let params = match &entry.params {
         FamilyParams::Gemma4(p) => p,
         FamilyParams::Qwen35(_) => unreachable!("dispatch filtered to Gemma4"),
+        FamilyParams::Qwen3Moe(_) => unreachable!("dispatch filtered to Gemma4"),
         FamilyParams::Qwen36Moe(_) => unreachable!("dispatch filtered to Gemma4"),
         FamilyParams::Phi4(_) => unreachable!("dispatch filtered to Gemma4"),
         FamilyParams::Llama31(_) => unreachable!("dispatch filtered to Gemma4"),

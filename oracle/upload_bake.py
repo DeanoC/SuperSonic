@@ -7,6 +7,7 @@ upserts a single `bakes-index.json` asset, and uploads everything via `gh`.
 
 Typical use on a big-box producer:
     python oracle/upload_bake.py --model qwen3.5-4b --int4 --model-dir /path/to/Qwen3.5-4B
+    python oracle/upload_bake.py --model qwen3-30b-a3b --int4 --model-dir /path/to/Qwen3-30B-A3B
     python oracle/upload_bake.py --model gemma4-e4b --int4 --model-dir /path/to/gemma-4-E4B
 
 Dry-run leaves the tarball in /tmp/ and prints the `gh` commands without
@@ -57,6 +58,7 @@ OPTIONAL_HF_FILES = [
 KNOWN_MODELS = {
     "qwen3.5-0.8b", "qwen3.5-2b", "qwen3.5-4b", "qwen3.5-9b",
     "qwen3.6-27b", "qwen3.6-35b-a3b",
+    "qwen3-30b-a3b",
     "gemma4-e2b", "gemma4-e4b",
     "phi4-mini",
 }
@@ -82,6 +84,7 @@ FAMILY_FOR = {
     "qwen3.5-9b": "qwen35",
     "qwen3.6-27b": "qwen35",
     "qwen3.6-35b-a3b": "qwen36-moe",
+    "qwen3-30b-a3b": "qwen3-moe",
     "gemma4-e2b": "gemma4",
     "gemma4-e4b": "gemma4",
     "phi4-mini": "phi4",

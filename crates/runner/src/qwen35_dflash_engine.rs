@@ -71,7 +71,8 @@ pub fn run_qwen35_dflash(
 
     let params = match &entry.params {
         FamilyParams::Qwen35(p) => *p,
-        FamilyParams::Qwen36Moe(_)
+        FamilyParams::Qwen3Moe(_)
+        | FamilyParams::Qwen36Moe(_)
         | FamilyParams::Gemma4(_)
         | FamilyParams::Phi4(_)
         | FamilyParams::Llama31(_) => {

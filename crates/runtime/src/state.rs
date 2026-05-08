@@ -171,6 +171,7 @@ pub fn build(cfg: LoaderConfig) -> Result<ServerState> {
     let max_context = cfg.max_context.max(8);
     let (session, eos_ids) = match variant.family() {
         ModelFamily::Qwen35 => build_qwen(&cfg, entry, max_context)?,
+        ModelFamily::Qwen3Moe => bail!("qwen3-30b-a3b MoE runtime is not implemented yet"),
         ModelFamily::Qwen36Moe => bail!("qwen3.6-35b-a3b MoE runtime is not implemented yet"),
         ModelFamily::Gemma4 => build_gemma4(&cfg, entry, max_context)?,
         ModelFamily::Phi4 => {
@@ -252,7 +253,7 @@ fn validate_runtime_policy(
     if q4km_like
         && !matches!(
             variant.family(),
-            ModelFamily::Qwen35 | ModelFamily::Qwen36Moe
+            ModelFamily::Qwen35 | ModelFamily::Qwen3Moe | ModelFamily::Qwen36Moe
         )
     {
         bail!("--q4km/--q4km-gptq are currently supported only for Qwen models");
@@ -278,6 +279,9 @@ fn validate_runtime_policy(
 
     match variant.family() {
         ModelFamily::Qwen35 | ModelFamily::Gemma4 => Ok(()),
+        ModelFamily::Qwen3Moe => {
+            bail!("qwen3-30b-a3b MoE runtime is not implemented yet")
+        }
         ModelFamily::Qwen36Moe => {
             bail!("qwen3.6-35b-a3b MoE runtime is not implemented yet")
         }

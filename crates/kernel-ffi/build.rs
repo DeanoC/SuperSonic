@@ -234,6 +234,11 @@ fn compile_hip(kernel_dir: &Path, out_dir: &Path) {
             "qwen36_moe_hip.o",
             "building Qwen3.6-MoE HIP bridge",
         ),
+        (
+            "qwen3_moe_bridge.cpp",
+            "qwen3_moe_hip.o",
+            "building Qwen3-MoE HIP bridge",
+        ),
     ];
     let archs = detect_hip_archs();
     if archs.is_empty() {
@@ -429,6 +434,8 @@ fn main() {
         "qwen36_moe_cuda_prelude.cuh",
         "qwen36_moe_bridge.cpp",
         "qwen36_moe_bridge_cuda.cu",
+        "qwen3_moe.hip",
+        "qwen3_moe_bridge.cpp",
         "qwen36_moe_persistent/helpers.cuh",
         "qwen36_moe_persistent/full_attn_phase.cuh",
         "qwen36_moe_persistent/linear_attn_phase.cuh",
