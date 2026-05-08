@@ -970,7 +970,8 @@ mod tests {
             vec![
                 "functional.rmsnorm_bf16",
                 "functional.rope_bf16",
-                "functional.int4_dequant_matvec"
+                "functional.int4_dequant_matvec",
+                "functional.qwen36_moe_route_expert_combine"
             ]
         );
         assert!(tasks.iter().all(|task| !task.required));
