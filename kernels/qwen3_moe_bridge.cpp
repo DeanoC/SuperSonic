@@ -131,21 +131,38 @@ extern "C" int qwen3_moe_hip_persistent_decode_launch(
     const void*                              input_hidden,
     void*                                    hidden_ping,
     void*                                    hidden_pong,
-    float*                                   workspace) {
+    float*                                   workspace,
+    unsigned int*                            sync) {
     if (dtype != 2) return 110; // BF16 activations only.
     if (num_layers <= 0 || num_layers > 1024) return 100;
     if (layers == nullptr || int4_descs == nullptr || input_hidden == nullptr ||
-        hidden_ping == nullptr || hidden_pong == nullptr || workspace == nullptr) {
+        hidden_ping == nullptr || hidden_pong == nullptr || workspace == nullptr ||
+        sync == nullptr) {
         return 101;
     }
     if (hidden <= 0 || position < 0) return 102;
 
     ScopedHipDevice scoped(static_cast<int>(device_ordinal));
 
-    const int block_threads = 1024;
+    hipDeviceProp_t props;
+    if (hipGetDeviceProperties(&props, static_cast<int>(device_ordinal)) !=
+        hipSuccess) {
+        return 250;
+    }
+    int num_blocks = props.multiProcessorCount > 0 ? props.multiProcessorCount : 16;
+    if (num_blocks > qwen3_moe::Q3_MAX_GRID_BLOCKS) {
+        num_blocks = qwen3_moe::Q3_MAX_GRID_BLOCKS;
+    }
+    if (num_blocks <= 0) return 250;
+
+    if (hipMemsetAsync(sync, 0, 96) != hipSuccess) {
+        return 200;
+    }
+
+    const int block_threads = 256;
     const size_t shmem = block_threads * sizeof(float);
     hipLaunchKernelGGL(qwen3_moe::qwen3_moe_persistent_decode_kernel,
-                       dim3(1),
+                       dim3(static_cast<unsigned int>(num_blocks)),
                        dim3(block_threads),
                        shmem, 0,
                        num_layers,
@@ -156,7 +173,8 @@ extern "C" int qwen3_moe_hip_persistent_decode_launch(
                        static_cast<const hip_bfloat16*>(input_hidden),
                        static_cast<hip_bfloat16*>(hidden_ping),
                        static_cast<hip_bfloat16*>(hidden_pong),
-                       workspace);
+                       workspace,
+                       sync);
     hipError_t launch_err = hipGetLastError();
     hipError_t sync_err =
         sync_each_kernel_enabled() ? hipDeviceSynchronize() : hipSuccess;

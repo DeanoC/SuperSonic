@@ -128,6 +128,7 @@ extern "C" {
         hidden_ping: *mut c_void,
         hidden_pong: *mut c_void,
         workspace: *mut f32,
+        sync: *mut c_uint,
     ) -> c_int;
 
     pub fn qwen3_moe_hip_lm_head_int4_launch(
@@ -339,6 +340,7 @@ pub fn persistent_decode_launch(
     hidden_ping: &mut GpuBuffer,
     hidden_pong: &mut GpuBuffer,
     workspace: &mut GpuBuffer,
+    sync_buf: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
     if dtype != ScalarType::BF16 {
         return Err(GpuError::InvalidArg(format!(
@@ -362,6 +364,7 @@ pub fn persistent_decode_launch(
                     hidden_ping.as_mut_ptr(),
                     hidden_pong.as_mut_ptr(),
                     workspace.as_mut_ptr() as *mut f32,
+                    sync_buf.as_mut_ptr() as *mut c_uint,
                 )
             }
             #[cfg(not(supersonic_backend_hip))]
@@ -376,6 +379,7 @@ pub fn persistent_decode_launch(
                     hidden_ping,
                     hidden_pong,
                     workspace,
+                    sync_buf,
                 );
                 return Err(GpuError::InvalidArg(
                     "qwen3_moe::persistent_decode_launch: HIP backend not compiled".into(),
