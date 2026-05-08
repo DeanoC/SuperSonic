@@ -62,6 +62,7 @@ struct Int4ScaleDesc {
 
 constexpr int Q3_MAX_GRID_BLOCKS = 128;
 constexpr int Q3_PROFILE_PHASES = 20;
+constexpr int Q3_ATTN_SCORE_GROUP_T = 128;
 
 enum Q3ProfilePhase {
     Q3_PROF_INPUT_LOAD = 0,
@@ -157,6 +158,17 @@ __device__ __forceinline__ float q3_wave_sum(float v) {
         v += __shfl_down(v, offset);
     }
     return v;
+}
+
+__device__ float q3_group128_sum(float v, float* scratch, int group, int lane) {
+    const int base = group * Q3_ATTN_SCORE_GROUP_T;
+    scratch[base + lane] = v;
+    __syncthreads();
+    for (int s = Q3_ATTN_SCORE_GROUP_T / 2; s > 0; s >>= 1) {
+        if (lane < s) scratch[base + lane] += scratch[base + lane + s];
+        __syncthreads();
+    }
+    return scratch[base];
 }
 
 __device__ float int4_value(
@@ -1119,25 +1131,56 @@ __global__ void qwen3_moe_persistent_decode_kernel(
         const int rep = h / hkv;
         q3_grid_barrier_reset_counter(
             barrier_counter, barrier_flag, nb, work_counter);
-        while (true) {
-            __shared__ unsigned int item_s;
-            if (tid == 0) item_s = atomicAdd(work_counter, 1u);
-            __syncthreads();
-            const int item = static_cast<int>(item_s);
-            if (item >= h * kv_len) break;
-            const int t = item % kv_len;
-            const int head = item / kv_len;
-            const int kv_head = head / rep;
-            float partial = 0.0f;
-            for (int d = tid; d < hd; d += bs) {
-                const float kval = (cache_k != nullptr)
-                    ? static_cast<float>(cache_k[t * kv_dim + kv_head * hd + d])
-                    : k[kv_head * hd + d];
-                partial += q[head * hd + d] * kval;
+        if (hd <= Q3_ATTN_SCORE_GROUP_T && bs >= Q3_ATTN_SCORE_GROUP_T * 2) {
+            const int score_groups = bs / Q3_ATTN_SCORE_GROUP_T;
+            const int group = tid / Q3_ATTN_SCORE_GROUP_T;
+            const int lane = tid - group * Q3_ATTN_SCORE_GROUP_T;
+            while (true) {
+                __shared__ unsigned int base_s;
+                if (tid == 0) {
+                    base_s = atomicAdd(work_counter, static_cast<unsigned int>(score_groups));
+                }
+                __syncthreads();
+                if (static_cast<int>(base_s) >= h * kv_len) break;
+                const int item = static_cast<int>(base_s) + group;
+                const bool active = item < h * kv_len;
+                const int t = active ? (item % kv_len) : 0;
+                const int head = active ? (item / kv_len) : 0;
+                const int kv_head = head / rep;
+                float partial = 0.0f;
+                if (active) {
+                    for (int d = lane; d < hd; d += Q3_ATTN_SCORE_GROUP_T) {
+                        const float kval = (cache_k != nullptr)
+                            ? static_cast<float>(cache_k[t * kv_dim + kv_head * hd + d])
+                            : k[kv_head * hd + d];
+                        partial += q[head * hd + d] * kval;
+                    }
+                }
+                const float score = q3_group128_sum(partial, lds, group, lane) * attn_scale;
+                if (active && lane == 0) scores[head * layer.kv_max_t + t] = score;
+                __syncthreads();
             }
-            const float score = block_sum(partial, lds) * attn_scale;
-            if (tid == 0) scores[head * layer.kv_max_t + t] = score;
-            __syncthreads();
+        } else {
+            while (true) {
+                __shared__ unsigned int item_s;
+                if (tid == 0) item_s = atomicAdd(work_counter, 1u);
+                __syncthreads();
+                const int item = static_cast<int>(item_s);
+                if (item >= h * kv_len) break;
+                const int t = item % kv_len;
+                const int head = item / kv_len;
+                const int kv_head = head / rep;
+                float partial = 0.0f;
+                for (int d = tid; d < hd; d += bs) {
+                    const float kval = (cache_k != nullptr)
+                        ? static_cast<float>(cache_k[t * kv_dim + kv_head * hd + d])
+                        : k[kv_head * hd + d];
+                    partial += q[head * hd + d] * kval;
+                }
+                const float score = block_sum(partial, lds) * attn_scale;
+                if (tid == 0) scores[head * layer.kv_max_t + t] = score;
+                __syncthreads();
+            }
         }
         q3_grid_barrier(barrier_counter, barrier_flag, nb);
         q3_profile_next(profile, layer_idx, Q3_PROF_ATTN_SCORES, &phase_start);
