@@ -62,7 +62,7 @@ struct Int4ScaleDesc {
 
 constexpr int Q3_MAX_GRID_BLOCKS = 128;
 constexpr int Q3_PROFILE_PHASES = 20;
-constexpr int Q3_ATTN_SCORE_GROUP_T = 128;
+constexpr int Q3_ATTN_SCORE_GROUP_T = 64;
 
 enum Q3ProfilePhase {
     Q3_PROF_INPUT_LOAD = 0,
@@ -160,8 +160,23 @@ __device__ __forceinline__ float q3_wave_sum(float v) {
     return v;
 }
 
-__device__ float q3_group128_sum(float v, float* scratch, int group, int lane) {
+__device__ float q3_attn_score_group_sum(float v, float* scratch, int group, int lane) {
     const int base = group * Q3_ATTN_SCORE_GROUP_T;
+    if (Q3_ATTN_SCORE_GROUP_T == 64 && warpSize == 32) {
+        scratch[base + lane] = v;
+        __syncthreads();
+        float paired = 0.0f;
+        if (lane < 32) {
+            paired = scratch[base + lane] + scratch[base + lane + 32];
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                paired += __shfl_down(paired, offset);
+            }
+            if (lane == 0) scratch[base] = paired;
+        }
+        __syncthreads();
+        return scratch[base];
+    }
+
     scratch[base + lane] = v;
     __syncthreads();
     for (int s = Q3_ATTN_SCORE_GROUP_T / 2; s > 0; s >>= 1) {
@@ -187,6 +202,88 @@ __device__ float int4_value(
     const float s = static_cast<float>(scale[scale_idx]);
     const float z = static_cast<float>(zero[scale_idx]);
     return bf16_round_rne_f32(static_cast<float>(nibble) * s - z * s);
+}
+
+__device__ void q3_router_topk_select_block(
+    const float* router,
+    float* probs,
+    float* topk_val,
+    float* topk_idx,
+    int experts,
+    int top_k,
+    int norm_topk_prob) {
+    const int tid = threadIdx.x;
+    const int bs = blockDim.x;
+
+    if (norm_topk_prob) {
+        if (tid == 0) {
+            for (int e = 0; e < experts; ++e) probs[e] = router[e];
+            for (int kpos = 0; kpos < top_k; ++kpos) {
+                int best_i = 0;
+                float best_v = -INFINITY;
+                for (int e = 0; e < experts; ++e) {
+                    if (probs[e] > best_v) {
+                        best_v = probs[e];
+                        best_i = e;
+                    }
+                }
+                topk_idx[kpos] = static_cast<float>(best_i);
+                topk_val[kpos] = best_v;
+                probs[best_i] = -INFINITY;
+            }
+        }
+        __syncthreads();
+
+        const float maxv = topk_val[0];
+        for (int e = tid; e < experts; e += bs) {
+            probs[e] = expf(router[e] - maxv);
+        }
+        __syncthreads();
+
+        if (tid == 0) {
+            float denom = 0.0f;
+            for (int e = 0; e < experts; ++e) denom += probs[e];
+            for (int kpos = 0; kpos < top_k; ++kpos) {
+                const int expert = static_cast<int>(topk_idx[kpos]);
+                topk_val[kpos] = bf16_round_rne_f32(probs[expert] / denom);
+            }
+            float sum = 0.0f;
+            for (int kpos = 0; kpos < top_k; ++kpos) sum += topk_val[kpos];
+            const float inv = 1.0f / sum;
+            for (int kpos = 0; kpos < top_k; ++kpos) {
+                topk_val[kpos] = bf16_round_rne_f32(topk_val[kpos] * inv);
+            }
+        }
+        __syncthreads();
+        return;
+    }
+
+    if (tid == 0) {
+        float maxv = -INFINITY;
+        for (int e = 0; e < experts; ++e) maxv = fmaxf(maxv, router[e]);
+        float denom = 0.0f;
+        for (int e = 0; e < experts; ++e) {
+            probs[e] = expf(router[e] - maxv);
+            denom += probs[e];
+        }
+        for (int e = 0; e < experts; ++e) {
+            probs[e] = bf16_round_rne_f32(probs[e] / denom);
+        }
+        for (int kpos = 0; kpos < top_k; ++kpos) {
+            int best_i = 0;
+            float best_v = -INFINITY;
+            for (int e = 0; e < experts; ++e) {
+                if (probs[e] > best_v) {
+                    best_v = probs[e];
+                    best_i = e;
+                }
+            }
+            topk_idx[kpos] = static_cast<float>(best_i);
+            topk_val[kpos] = best_v;
+            probs[best_i] = -INFINITY;
+        }
+    }
+    __syncthreads();
 }
 
 __device__ float int4_value_3d(
@@ -536,35 +633,9 @@ __device__ void qwen3_moe_decode_layer_device(
         if (tid == 0) router[e] = bf16_round_rne_f32(sum);
         __syncthreads();
     }
-    if (tid == 0) {
-        float maxv = -INFINITY;
-        for (int e = 0; e < experts; ++e) maxv = fmaxf(maxv, router[e]);
-        float denom = 0.0f;
-        for (int e = 0; e < experts; ++e) {
-            probs[e] = expf(router[e] - maxv);
-            denom += probs[e];
-        }
-        for (int e = 0; e < experts; ++e) probs[e] = bf16_round_rne_f32(probs[e] / denom);
-        for (int kpos = 0; kpos < top_k; ++kpos) {
-            int best_i = 0;
-            float best_v = -INFINITY;
-            for (int e = 0; e < experts; ++e) {
-                if (probs[e] > best_v) {
-                    best_v = probs[e];
-                    best_i = e;
-                }
-            }
-            topk_idx[kpos] = static_cast<float>(best_i);
-            topk_val[kpos] = best_v;
-            probs[best_i] = -INFINITY;
-        }
-        if (layer.norm_topk_prob) {
-            float sum = 0.0f;
-            for (int kpos = 0; kpos < top_k; ++kpos) sum += topk_val[kpos];
-            const float inv = 1.0f / sum;
-            for (int kpos = 0; kpos < top_k; ++kpos) topk_val[kpos] = bf16_round_rne_f32(topk_val[kpos] * inv);
-        }
-    }
+    q3_router_topk_select_block(
+        router, probs, topk_val, topk_idx, experts, top_k,
+        layer.norm_topk_prob);
     __syncthreads();
 
     for (int i = tid; i < hidden; i += blockDim.x) moe_out[i] = 0.0f;
@@ -941,6 +1012,111 @@ __device__ void q3_dense_wave_rows(
     }
 }
 
+__device__ void q3_dense_pair_wave_rows(
+    const void* weight,
+    const void* scale,
+    const void* zero,
+    const float* x,
+    float* out,
+    int rows,
+    int cols,
+    int group_size,
+    unsigned int* work_counter,
+    bool round_output) {
+    const int lane = threadIdx.x % warpSize;
+    const int wave = threadIdx.x / warpSize;
+    const int waves_per_block = blockDim.x / warpSize;
+    const int row_pairs = (rows + 1) / 2;
+    const uint8_t* w = static_cast<const uint8_t*>(weight);
+    const hip_bfloat16* s = static_cast<const hip_bfloat16*>(scale);
+    const hip_bfloat16* z = static_cast<const hip_bfloat16*>(zero);
+    const int byte_cols = (cols + 1) / 2;
+    const int scale_cols = (cols + group_size - 1) / group_size;
+
+    while (true) {
+        __shared__ unsigned int base_s;
+        if (threadIdx.x == 0) {
+            base_s = atomicAdd(work_counter, static_cast<unsigned int>(waves_per_block));
+        }
+        __syncthreads();
+        if (static_cast<int>(base_s) >= row_pairs) return;
+
+        const int item = static_cast<int>(base_s) + wave;
+        if (item < row_pairs) {
+            const int row0 = item * 2;
+            const int row1 = row0 + 1;
+            const bool has_row1 = row1 < rows;
+            float partial0 = 0.0f;
+            float partial1 = 0.0f;
+
+            if (scale != nullptr) {
+                const size_t packed_base0 = static_cast<size_t>(row0) * byte_cols;
+                const size_t packed_base1 = static_cast<size_t>(row1) * byte_cols;
+                const int scale_base0 = (row0 / group_size) * scale_cols;
+                const int scale_base1 = (row1 / group_size) * scale_cols;
+
+                int c = lane * 8;
+                for (; c + 7 < cols; c += warpSize * 8) {
+                    uint32_t packed0;
+                    uint32_t packed1 = 0;
+                    __builtin_memcpy(&packed0, w + packed_base0 + c / 2, sizeof(packed0));
+                    if (has_row1) {
+                        __builtin_memcpy(&packed1, w + packed_base1 + c / 2, sizeof(packed1));
+                    }
+                    float vals0[8];
+                    float vals1[8];
+                    int4_dequant_8(packed0, s, z, scale_base0 + c / group_size, vals0);
+                    if (has_row1) {
+                        int4_dequant_8(packed1, s, z, scale_base1 + c / group_size, vals1);
+                    }
+                    const float x0 = x[c + 0];
+                    const float x1 = x[c + 1];
+                    const float x2 = x[c + 2];
+                    const float x3 = x[c + 3];
+                    const float x4 = x[c + 4];
+                    const float x5 = x[c + 5];
+                    const float x6 = x[c + 6];
+                    const float x7 = x[c + 7];
+                    partial0 += vals0[0] * x0 + vals0[1] * x1 +
+                                vals0[2] * x2 + vals0[3] * x3 +
+                                vals0[4] * x4 + vals0[5] * x5 +
+                                vals0[6] * x6 + vals0[7] * x7;
+                    if (has_row1) {
+                        partial1 += vals1[0] * x0 + vals1[1] * x1 +
+                                    vals1[2] * x2 + vals1[3] * x3 +
+                                    vals1[4] * x4 + vals1[5] * x5 +
+                                    vals1[6] * x6 + vals1[7] * x7;
+                    }
+                }
+                for (; c < cols; ++c) {
+                    const float xv = x[c];
+                    partial0 += int4_value(w, s, z, row0, c, cols, group_size) * xv;
+                    if (has_row1) {
+                        partial1 += int4_value(w, s, z, row1, c, cols, group_size) * xv;
+                    }
+                }
+            } else {
+                const hip_bfloat16* wf = static_cast<const hip_bfloat16*>(weight);
+                const size_t base0 = static_cast<size_t>(row0) * cols;
+                const size_t base1 = static_cast<size_t>(row1) * cols;
+                for (int c = lane; c < cols; c += warpSize) {
+                    const float xv = x[c];
+                    partial0 += static_cast<float>(wf[base0 + c]) * xv;
+                    if (has_row1) partial1 += static_cast<float>(wf[base1 + c]) * xv;
+                }
+            }
+
+            const float sum0 = q3_wave_sum(partial0);
+            const float sum1 = q3_wave_sum(partial1);
+            if (lane == 0) {
+                out[row0] = round_output ? bf16_round_rne_f32(sum0) : sum0;
+                if (has_row1) out[row1] = round_output ? bf16_round_rne_f32(sum1) : sum1;
+            }
+        }
+        __syncthreads();
+    }
+}
+
 __device__ void q3_expert_batch_wave_rows(
     const void* weight,
     const void* scale,
@@ -1003,6 +1179,271 @@ __device__ void q3_expert_batch_wave_rows(
             }
             const float sum = q3_wave_sum(partial);
             if (lane == 0) out[kpos * rows + row] = bf16_round_rne_f32(sum);
+        }
+        __syncthreads();
+    }
+}
+
+__device__ void q3_expert_gate_up_pair_wave_rows(
+    const void* weight,
+    const void* scale,
+    const void* zero,
+    const float* topk_idx,
+    int top_k,
+    const float* x,
+    float* out,
+    int moe_i,
+    int cols,
+    int group_size,
+    unsigned int* work_counter) {
+    const int lane = threadIdx.x % warpSize;
+    const int wave = threadIdx.x / warpSize;
+    const int waves_per_block = blockDim.x / warpSize;
+    const int total = top_k * moe_i;
+    const int rows = 2 * moe_i;
+    const uint8_t* w = static_cast<const uint8_t*>(weight);
+    const hip_bfloat16* s = static_cast<const hip_bfloat16*>(scale);
+    const hip_bfloat16* z = static_cast<const hip_bfloat16*>(zero);
+    const int byte_cols = (cols + 1) / 2;
+    const int scale_rows = (rows + group_size - 1) / group_size;
+    const int scale_cols = (cols + group_size - 1) / group_size;
+
+    while (true) {
+        __shared__ unsigned int base_s;
+        if (threadIdx.x == 0) {
+            base_s = atomicAdd(work_counter, static_cast<unsigned int>(waves_per_block));
+        }
+        __syncthreads();
+        if (static_cast<int>(base_s) >= total) return;
+
+        const int item = static_cast<int>(base_s) + wave;
+        if (item < total) {
+            const int kpos = item / moe_i;
+            const int row = item - kpos * moe_i;
+            const int expert = static_cast<int>(topk_idx[kpos]);
+            const int gate_row = row;
+            const int up_row = moe_i + row;
+            const size_t expert_base = static_cast<size_t>(expert) * rows;
+            const size_t gate_packed_base = (expert_base + gate_row) * byte_cols;
+            const size_t up_packed_base = (expert_base + up_row) * byte_cols;
+            const int gate_scale_base =
+                (expert * scale_rows + gate_row / group_size) * scale_cols;
+            const int up_scale_base =
+                (expert * scale_rows + up_row / group_size) * scale_cols;
+
+            float gate_partial = 0.0f;
+            float up_partial = 0.0f;
+            if (cols == 2048 && group_size == 128) {
+                for (int c = lane * 8; c < 2048; c += warpSize * 8) {
+                    uint32_t gate_packed;
+                    uint32_t up_packed;
+                    __builtin_memcpy(
+                        &gate_packed, w + gate_packed_base + c / 2, sizeof(gate_packed));
+                    __builtin_memcpy(
+                        &up_packed, w + up_packed_base + c / 2, sizeof(up_packed));
+                    float gate_vals[8];
+                    float up_vals[8];
+                    const int scale_off = c >> 7;
+                    int4_dequant_8(gate_packed, s, z, gate_scale_base + scale_off, gate_vals);
+                    int4_dequant_8(up_packed, s, z, up_scale_base + scale_off, up_vals);
+                    const float x0 = x[c + 0];
+                    const float x1 = x[c + 1];
+                    const float x2 = x[c + 2];
+                    const float x3 = x[c + 3];
+                    const float x4 = x[c + 4];
+                    const float x5 = x[c + 5];
+                    const float x6 = x[c + 6];
+                    const float x7 = x[c + 7];
+                    gate_partial += gate_vals[0] * x0 + gate_vals[1] * x1 +
+                                    gate_vals[2] * x2 + gate_vals[3] * x3 +
+                                    gate_vals[4] * x4 + gate_vals[5] * x5 +
+                                    gate_vals[6] * x6 + gate_vals[7] * x7;
+                    up_partial += up_vals[0] * x0 + up_vals[1] * x1 +
+                                  up_vals[2] * x2 + up_vals[3] * x3 +
+                                  up_vals[4] * x4 + up_vals[5] * x5 +
+                                  up_vals[6] * x6 + up_vals[7] * x7;
+                }
+            } else {
+                int c = lane * 8;
+                for (; c + 7 < cols; c += warpSize * 8) {
+                    uint32_t gate_packed;
+                    uint32_t up_packed;
+                    __builtin_memcpy(
+                        &gate_packed, w + gate_packed_base + c / 2, sizeof(gate_packed));
+                    __builtin_memcpy(
+                        &up_packed, w + up_packed_base + c / 2, sizeof(up_packed));
+                    float gate_vals[8];
+                    float up_vals[8];
+                    int4_dequant_8(
+                        gate_packed, s, z, gate_scale_base + c / group_size, gate_vals);
+                    int4_dequant_8(
+                        up_packed, s, z, up_scale_base + c / group_size, up_vals);
+                    const float x0 = x[c + 0];
+                    const float x1 = x[c + 1];
+                    const float x2 = x[c + 2];
+                    const float x3 = x[c + 3];
+                    const float x4 = x[c + 4];
+                    const float x5 = x[c + 5];
+                    const float x6 = x[c + 6];
+                    const float x7 = x[c + 7];
+                    gate_partial += gate_vals[0] * x0 + gate_vals[1] * x1 +
+                                    gate_vals[2] * x2 + gate_vals[3] * x3 +
+                                    gate_vals[4] * x4 + gate_vals[5] * x5 +
+                                    gate_vals[6] * x6 + gate_vals[7] * x7;
+                    up_partial += up_vals[0] * x0 + up_vals[1] * x1 +
+                                  up_vals[2] * x2 + up_vals[3] * x3 +
+                                  up_vals[4] * x4 + up_vals[5] * x5 +
+                                  up_vals[6] * x6 + up_vals[7] * x7;
+                }
+                for (; c < cols; ++c) {
+                    const float xv = x[c];
+                    gate_partial +=
+                        int4_value_3d(w, s, z, expert, gate_row, c, rows, cols, group_size) * xv;
+                    up_partial +=
+                        int4_value_3d(w, s, z, expert, up_row, c, rows, cols, group_size) * xv;
+                }
+            }
+            const float gate_sum = q3_wave_sum(gate_partial);
+            const float up_sum = q3_wave_sum(up_partial);
+            if (lane == 0) {
+                float* out_k = out + kpos * rows;
+                out_k[gate_row] = bf16_round_rne_f32(gate_sum);
+                out_k[up_row] = bf16_round_rne_f32(up_sum);
+            }
+        }
+        __syncthreads();
+    }
+}
+
+__device__ void q3_expert_down_pair_wave_rows(
+    const void* weight,
+    const void* scale,
+    const void* zero,
+    const float* topk_idx,
+    int top_k,
+    const float* x,
+    float* out,
+    int rows,
+    int cols,
+    int group_size,
+    unsigned int* work_counter) {
+    const int lane = threadIdx.x % warpSize;
+    const int wave = threadIdx.x / warpSize;
+    const int waves_per_block = blockDim.x / warpSize;
+    const int row_pairs = (rows + 1) / 2;
+    const int total = top_k * row_pairs;
+    const uint8_t* w = static_cast<const uint8_t*>(weight);
+    const hip_bfloat16* s = static_cast<const hip_bfloat16*>(scale);
+    const hip_bfloat16* z = static_cast<const hip_bfloat16*>(zero);
+    const int byte_cols = (cols + 1) / 2;
+    const int scale_rows = (rows + group_size - 1) / group_size;
+    const int scale_cols = (cols + group_size - 1) / group_size;
+
+    while (true) {
+        __shared__ unsigned int base_s;
+        if (threadIdx.x == 0) {
+            base_s = atomicAdd(work_counter, static_cast<unsigned int>(waves_per_block));
+        }
+        __syncthreads();
+        if (static_cast<int>(base_s) >= total) return;
+
+        const int item = static_cast<int>(base_s) + wave;
+        if (item < total) {
+            const int kpos = item / row_pairs;
+            const int row0 = (item - kpos * row_pairs) * 2;
+            const int row1 = row0 + 1;
+            const bool has_row1 = row1 < rows;
+            const int expert = static_cast<int>(topk_idx[kpos]);
+            const float* x_row = x + kpos * cols;
+            const size_t expert_base = static_cast<size_t>(expert) * rows;
+            const size_t packed_base0 = (expert_base + row0) * byte_cols;
+            const size_t packed_base1 = (expert_base + row1) * byte_cols;
+            const int scale_base0 =
+                (expert * scale_rows + row0 / group_size) * scale_cols;
+            const int scale_base1 =
+                (expert * scale_rows + row1 / group_size) * scale_cols;
+
+            float partial0 = 0.0f;
+            float partial1 = 0.0f;
+            if (rows == 2048 && cols == 768 && group_size == 128) {
+                for (int c = lane * 8; c < 768; c += warpSize * 8) {
+                    uint32_t packed0;
+                    uint32_t packed1;
+                    __builtin_memcpy(&packed0, w + packed_base0 + c / 2, sizeof(packed0));
+                    __builtin_memcpy(&packed1, w + packed_base1 + c / 2, sizeof(packed1));
+                    float vals0[8];
+                    float vals1[8];
+                    const int scale_off = c >> 7;
+                    int4_dequant_8(packed0, s, z, scale_base0 + scale_off, vals0);
+                    int4_dequant_8(packed1, s, z, scale_base1 + scale_off, vals1);
+                    const float x0 = x_row[c + 0];
+                    const float x1 = x_row[c + 1];
+                    const float x2 = x_row[c + 2];
+                    const float x3 = x_row[c + 3];
+                    const float x4 = x_row[c + 4];
+                    const float x5 = x_row[c + 5];
+                    const float x6 = x_row[c + 6];
+                    const float x7 = x_row[c + 7];
+                    partial0 += vals0[0] * x0 + vals0[1] * x1 +
+                                vals0[2] * x2 + vals0[3] * x3 +
+                                vals0[4] * x4 + vals0[5] * x5 +
+                                vals0[6] * x6 + vals0[7] * x7;
+                    partial1 += vals1[0] * x0 + vals1[1] * x1 +
+                                vals1[2] * x2 + vals1[3] * x3 +
+                                vals1[4] * x4 + vals1[5] * x5 +
+                                vals1[6] * x6 + vals1[7] * x7;
+                }
+            } else {
+                int c = lane * 8;
+                for (; c + 7 < cols; c += warpSize * 8) {
+                    uint32_t packed0;
+                    uint32_t packed1 = 0;
+                    __builtin_memcpy(&packed0, w + packed_base0 + c / 2, sizeof(packed0));
+                    if (has_row1) {
+                        __builtin_memcpy(&packed1, w + packed_base1 + c / 2, sizeof(packed1));
+                    }
+                    float vals0[8];
+                    float vals1[8];
+                    int4_dequant_8(packed0, s, z, scale_base0 + c / group_size, vals0);
+                    if (has_row1) {
+                        int4_dequant_8(packed1, s, z, scale_base1 + c / group_size, vals1);
+                    }
+                    const float x0 = x_row[c + 0];
+                    const float x1 = x_row[c + 1];
+                    const float x2 = x_row[c + 2];
+                    const float x3 = x_row[c + 3];
+                    const float x4 = x_row[c + 4];
+                    const float x5 = x_row[c + 5];
+                    const float x6 = x_row[c + 6];
+                    const float x7 = x_row[c + 7];
+                    partial0 += vals0[0] * x0 + vals0[1] * x1 +
+                                vals0[2] * x2 + vals0[3] * x3 +
+                                vals0[4] * x4 + vals0[5] * x5 +
+                                vals0[6] * x6 + vals0[7] * x7;
+                    if (has_row1) {
+                        partial1 += vals1[0] * x0 + vals1[1] * x1 +
+                                    vals1[2] * x2 + vals1[3] * x3 +
+                                    vals1[4] * x4 + vals1[5] * x5 +
+                                    vals1[6] * x6 + vals1[7] * x7;
+                    }
+                }
+                for (; c < cols; ++c) {
+                    const float xv = x_row[c];
+                    partial0 +=
+                        int4_value_3d(w, s, z, expert, row0, c, rows, cols, group_size) * xv;
+                    if (has_row1) {
+                        partial1 +=
+                            int4_value_3d(w, s, z, expert, row1, c, rows, cols, group_size) * xv;
+                    }
+                }
+            }
+            const float sum0 = q3_wave_sum(partial0);
+            const float sum1 = q3_wave_sum(partial1);
+            if (lane == 0) {
+                float* out_k = out + kpos * rows;
+                out_k[row0] = bf16_round_rne_f32(sum0);
+                if (has_row1) out_k[row1] = bf16_round_rne_f32(sum1);
+            }
         }
         __syncthreads();
     }
@@ -1099,7 +1540,19 @@ __global__ void qwen3_moe_persistent_decode_kernel(
             barrier_counter, barrier_flag, nb, work_counter);
         q3_profile_next(profile, layer_idx, Q3_PROF_INPUT_NORM, &phase_start);
 
-        q3_qkv_wave_rows(layer, int4, hnorm, q, k, v, hidden, q_dim, kv_dim, work_counter);
+        q3_dense_pair_wave_rows(
+            layer.q_proj_w, int4.q_proj_scale, int4.q_proj_zero,
+            hnorm, q, q_dim, hidden, group_size, work_counter, true);
+        q3_grid_barrier_reset_counter(
+            barrier_counter, barrier_flag, nb, work_counter);
+        q3_dense_pair_wave_rows(
+            layer.k_proj_w, int4.k_proj_scale, int4.k_proj_zero,
+            hnorm, k, kv_dim, hidden, group_size, work_counter, true);
+        q3_grid_barrier_reset_counter(
+            barrier_counter, barrier_flag, nb, work_counter);
+        q3_dense_pair_wave_rows(
+            layer.v_proj_w, int4.v_proj_scale, int4.v_proj_zero,
+            hnorm, v, kv_dim, hidden, group_size, work_counter, true);
         q3_grid_barrier(barrier_counter, barrier_flag, nb);
         q3_profile_next(profile, layer_idx, Q3_PROF_QKV, &phase_start);
 
@@ -1131,7 +1584,7 @@ __global__ void qwen3_moe_persistent_decode_kernel(
         const int rep = h / hkv;
         q3_grid_barrier_reset_counter(
             barrier_counter, barrier_flag, nb, work_counter);
-        if (hd <= Q3_ATTN_SCORE_GROUP_T && bs >= Q3_ATTN_SCORE_GROUP_T * 2) {
+        if (hd <= Q3_ATTN_SCORE_GROUP_T * 2 && bs >= Q3_ATTN_SCORE_GROUP_T * 2) {
             const int score_groups = bs / Q3_ATTN_SCORE_GROUP_T;
             const int group = tid / Q3_ATTN_SCORE_GROUP_T;
             const int lane = tid - group * Q3_ATTN_SCORE_GROUP_T;
@@ -1149,14 +1602,20 @@ __global__ void qwen3_moe_persistent_decode_kernel(
                 const int kv_head = head / rep;
                 float partial = 0.0f;
                 if (active) {
-                    for (int d = lane; d < hd; d += Q3_ATTN_SCORE_GROUP_T) {
-                        const float kval = (cache_k != nullptr)
-                            ? static_cast<float>(cache_k[t * kv_dim + kv_head * hd + d])
-                            : k[kv_head * hd + d];
-                        partial += q[head * hd + d] * kval;
+                    const int k_head_base = kv_head * hd;
+                    if (cache_k != nullptr) {
+                        const hip_bfloat16* k_row = cache_k + t * kv_dim + k_head_base;
+                        for (int d = lane; d < hd; d += Q3_ATTN_SCORE_GROUP_T) {
+                            partial += q[head * hd + d] * static_cast<float>(k_row[d]);
+                        }
+                    } else {
+                        const float* k_row = k + k_head_base;
+                        for (int d = lane; d < hd; d += Q3_ATTN_SCORE_GROUP_T) {
+                            partial += q[head * hd + d] * k_row[d];
+                        }
                     }
                 }
-                const float score = q3_group128_sum(partial, lds, group, lane) * attn_scale;
+                const float score = q3_attn_score_group_sum(partial, lds, group, lane) * attn_scale;
                 if (active && lane == 0) scores[head * layer.kv_max_t + t] = score;
                 __syncthreads();
             }
@@ -1217,11 +1676,24 @@ __global__ void qwen3_moe_persistent_decode_kernel(
             const int kv_head = head / rep;
             const float* row = scores + head * layer.kv_max_t;
             float acc = 0.0f;
-            for (int t = 0; t < kv_len; ++t) {
-                const float vv = (cache_v != nullptr)
-                    ? static_cast<float>(cache_v[t * kv_dim + kv_head * hd + d])
-                    : v[kv_head * hd + d];
-                acc += row[t] * vv;
+            const int v_head_offset = kv_head * hd + d;
+            if (cache_v != nullptr) {
+                const hip_bfloat16* v_col = cache_v + v_head_offset;
+                int t = 0;
+                for (; t + 3 < kv_len; t += 4) {
+                    acc += row[t] * static_cast<float>(v_col[0]);
+                    acc += row[t + 1] * static_cast<float>(v_col[kv_dim]);
+                    acc += row[t + 2] * static_cast<float>(v_col[kv_dim * 2]);
+                    acc += row[t + 3] * static_cast<float>(v_col[kv_dim * 3]);
+                    v_col += kv_dim * 4;
+                }
+                for (; t < kv_len; ++t) {
+                    acc += row[t] * static_cast<float>(*v_col);
+                    v_col += kv_dim;
+                }
+            } else {
+                const float vv = v[v_head_offset];
+                for (int t = 0; t < kv_len; ++t) acc += row[t] * vv;
             }
             attn[item] = bf16_round_rne_f32(acc);
         }
@@ -1230,7 +1702,7 @@ __global__ void qwen3_moe_persistent_decode_kernel(
 
         q3_grid_barrier_reset_counter(
             barrier_counter, barrier_flag, nb, work_counter);
-        q3_dense_wave_rows(
+        q3_dense_pair_wave_rows(
             layer.o_proj_w, int4.o_proj_scale, int4.o_proj_zero,
             attn, hnorm, hidden, q_dim, group_size, work_counter, true);
         q3_grid_barrier(barrier_counter, barrier_flag, nb);
@@ -1256,39 +1728,9 @@ __global__ void qwen3_moe_persistent_decode_kernel(
         q3_profile_next(profile, layer_idx, Q3_PROF_ROUTER, &phase_start);
 
         if (blockIdx.x == 0) {
-            if (tid == 0) {
-                float maxv = -INFINITY;
-                for (int e = 0; e < experts; ++e) maxv = fmaxf(maxv, router[e]);
-                float denom = 0.0f;
-                for (int e = 0; e < experts; ++e) {
-                    probs[e] = expf(router[e] - maxv);
-                    denom += probs[e];
-                }
-                for (int e = 0; e < experts; ++e) {
-                    probs[e] = bf16_round_rne_f32(probs[e] / denom);
-                }
-                for (int kpos = 0; kpos < top_k; ++kpos) {
-                    int best_i = 0;
-                    float best_v = -INFINITY;
-                    for (int e = 0; e < experts; ++e) {
-                        if (probs[e] > best_v) {
-                            best_v = probs[e];
-                            best_i = e;
-                        }
-                    }
-                    topk_idx[kpos] = static_cast<float>(best_i);
-                    topk_val[kpos] = best_v;
-                    probs[best_i] = -INFINITY;
-                }
-                if (layer.norm_topk_prob) {
-                    float sum = 0.0f;
-                    for (int kpos = 0; kpos < top_k; ++kpos) sum += topk_val[kpos];
-                    const float inv = 1.0f / sum;
-                    for (int kpos = 0; kpos < top_k; ++kpos) {
-                        topk_val[kpos] = bf16_round_rne_f32(topk_val[kpos] * inv);
-                    }
-                }
-            }
+            q3_router_topk_select_block(
+                router, probs, topk_val, topk_idx, experts, top_k,
+                layer.norm_topk_prob);
         }
         q3_grid_barrier(barrier_counter, barrier_flag, nb);
         q3_profile_next(profile, layer_idx, Q3_PROF_TOPK, &phase_start);
@@ -1299,11 +1741,11 @@ __global__ void qwen3_moe_persistent_decode_kernel(
 
         q3_grid_barrier_reset_counter(
             barrier_counter, barrier_flag, nb, work_counter);
-        q3_expert_batch_wave_rows(
+        q3_expert_gate_up_pair_wave_rows(
             layer.experts_gate_up_w,
             int4.experts_gate_up_scale,
             int4.experts_gate_up_zero,
-            topk_idx, top_k, hnorm, false, gu, 2 * moe_i, hidden,
+            topk_idx, top_k, hnorm, gu, moe_i, hidden,
             group_size, work_counter);
         q3_grid_barrier(barrier_counter, barrier_flag, nb);
         q3_profile_next(profile, layer_idx, Q3_PROF_EXPERT_GATE_UP, &phase_start);
@@ -1321,11 +1763,11 @@ __global__ void qwen3_moe_persistent_decode_kernel(
 
         q3_grid_barrier_reset_counter(
             barrier_counter, barrier_flag, nb, work_counter);
-        q3_expert_batch_wave_rows(
+        q3_expert_down_pair_wave_rows(
             layer.experts_down_w,
             int4.experts_down_scale,
             int4.experts_down_zero,
-            topk_idx, top_k, mid, true, expert_out, hidden, moe_i,
+            topk_idx, top_k, mid, expert_out, hidden, moe_i,
             group_size, work_counter);
         q3_grid_barrier(barrier_counter, barrier_flag, nb);
         q3_profile_next(profile, layer_idx, Q3_PROF_EXPERT_DOWN, &phase_start);
