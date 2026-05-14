@@ -425,6 +425,18 @@ pub(crate) fn validate_gemma4_startup(
         if cli.batch_size != 1 {
             anyhow::bail!("Gemma 4 CUDA v1 supports only --batch-size=1");
         }
+    } else if backend == Backend::Metal {
+        if cli.fp8_runtime {
+            anyhow::bail!(
+                "Gemma 4 Metal currently supports BF16 and INT4 only; --fp8-runtime is not wired"
+            );
+        }
+        if cli.kv_fp8 {
+            anyhow::bail!("Gemma 4 Metal currently supports BF16 KV only; --kv-fp8 is not wired");
+        }
+        if cli.batch_size != 1 {
+            anyhow::bail!("Gemma 4 Metal currently supports only --batch-size=1");
+        }
     }
 
     if cli.fp8_runtime && cli.int4 {

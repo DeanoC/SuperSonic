@@ -2422,6 +2422,22 @@ pub fn matmul_rhs_transposed_fp8(
     block_size: usize,
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    if out.backend() == Backend::Metal {
+        let _ = ordinal;
+        return metal_profile_host_time("matmul_rhs_transposed_fp8", || {
+            metal_host::matmul_rhs_transposed_fp8(
+                batch_elems,
+                m,
+                n,
+                k,
+                lhs,
+                rhs_fp8,
+                scale,
+                block_size,
+                out,
+            )
+        });
+    }
     ffi_profile_time_result("qwen.matmul_rhs_transposed_fp8", ordinal, || {
         let status = unsafe {
             supersonic_qwen35_4b_hip_matmul_fp8_dequant(

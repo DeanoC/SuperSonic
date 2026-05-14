@@ -40,6 +40,9 @@ fn metal_qwen_smoke_runs_end_to_end() {
         "--max-new-tokens",
         "1",
     ]);
+    if let Some(allow_untested_gpu) = std::env::var_os("SUPERSONIC_TEST_ALLOW_UNTESTED_GPU") {
+        cmd.arg("--allow-untested-gpu").arg(allow_untested_gpu);
+    }
 
     if repo_root.join(".venv/bin/python3").exists() {
         cmd.args(["--validate", "--oracle-device", "cpu"]);

@@ -57,6 +57,10 @@ struct Cli {
 
     #[arg(long)]
     profile_layers: bool,
+
+    /// Run on an arch without a registry entry by reusing another arch's kernel.
+    #[arg(long)]
+    allow_untested_gpu: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -94,6 +98,7 @@ fn main() -> Result<()> {
         bench_warmup: cli.warmup,
         bench_decode_tokens: cli.decode_tokens,
         bench_profile_ops: cli.profile_ops,
+        allow_untested_gpu: cli.allow_untested_gpu,
     })?;
 
     let exit_code = report.exit_code();

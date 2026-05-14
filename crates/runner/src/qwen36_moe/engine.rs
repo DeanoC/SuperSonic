@@ -25,7 +25,7 @@ use crate::qwen36_moe_cli::output::{
     print_sampling_summary,
 };
 use crate::qwen36_moe_cli::policy::{
-    resolve_context_size, validate_cuda_v1_flags, validate_decode_backend,
+    resolve_context_size, validate_cuda_v1_flags, validate_decode_backend, validate_metal_v1_flags,
     validate_persistent_kv_fp8_flags,
 };
 use crate::qwen36_moe_cli::prompt::{
@@ -105,6 +105,7 @@ fn run_inner(
     let (context_size, context_size_source) = resolve_context_size(cli);
     validate_persistent_kv_fp8_flags(cli)?;
     validate_cuda_v1_flags(cli, entry)?;
+    validate_metal_v1_flags(cli, entry)?;
 
     let report = run_qwen36_moe_dry_run(
         &cli.model_dir,
@@ -148,7 +149,7 @@ fn run_inner(
         // `--persistent-decode` flag is a hidden no-op (kept for harness
         // back-compat); `--no-persistent-decode` is the documented
         // opt-out for A/B comparison or bisecting megakernel regressions.
-        !cli.no_persistent_decode,
+        entry.backend != Backend::Metal && !cli.no_persistent_decode,
         cli.kv_fp8,
         cli.dump_last_logits,
         cli.profile_prefill,

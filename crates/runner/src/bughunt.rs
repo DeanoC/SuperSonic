@@ -17,20 +17,18 @@ mod profile;
 mod report;
 mod runtime;
 mod util;
-pub use args::*;
-use args::validate_args;
-use manifest::{load_prompt_manifest, select_prompts};
-use output::{print_report_summary, write_report_json};
-use profile::{
-    collect_profiles, reset_profiles, snapshot_profiles, ProfileGuard, ProfileReports,
-};
-pub use report::*;
-use runtime::QwenBughuntRuntime;
 use adapter::{
     compute_qwen_logits_from_hidden_row, run_native_prefill,
     run_native_prefill_greedy_token_with_state, run_native_prefill_with_trace,
     run_tail_replay_with_trace, run_trace_oracle,
 };
+use args::validate_args;
+pub use args::*;
+use manifest::{load_prompt_manifest, select_prompts};
+use output::{print_report_summary, write_report_json};
+use profile::{collect_profiles, reset_profiles, snapshot_profiles, ProfileGuard, ProfileReports};
+pub use report::*;
+use runtime::QwenBughuntRuntime;
 use util::{
     bench_stats, decode_bf16_le, encode_bf16_le, extract_causal_conv_window_bsd, flatten_bsh,
     flatten_token_bsd, max_abs_delta_details, mean_abs_delta, mean_square, mean_square_delta,
@@ -50,6 +48,7 @@ pub fn run(args: BughuntArgs) -> Result<BughuntReport> {
         args.backend,
         args.ordinal,
         &args.oracle_device,
+        args.allow_untested_gpu.as_deref(),
     )?;
     let metadata = runtime.metadata(args.mode);
     let report = match args.mode {

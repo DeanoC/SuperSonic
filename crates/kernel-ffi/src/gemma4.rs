@@ -11,6 +11,71 @@
 use std::ffi::{c_int, c_uint, c_void};
 
 use gpu_hal::{Backend, GpuBuffer, GpuError, ScalarType};
+use half::bf16;
+
+fn gemma4_metal_error(msg: impl Into<String>) -> GpuError {
+    GpuError::backend(Backend::Metal, msg.into())
+}
+
+fn gelu_pytorch_tanh(x: f32) -> f32 {
+    let inner = (2.0f32 / std::f32::consts::PI).sqrt() * (x + 0.044_715 * x * x * x);
+    0.5 * x * (1.0 + inner.tanh())
+}
+
+fn gelu_tanh_gate_mul_metal_host(
+    ordinal: usize,
+    dtype: ScalarType,
+    output: &mut GpuBuffer,
+    gate: &GpuBuffer,
+    up: &GpuBuffer,
+    n: usize,
+) -> Result<(), GpuError> {
+    let gate_bytes = gate.to_host_bytes()?;
+    let up_bytes = up.to_host_bytes()?;
+    let out_bytes = match dtype {
+        ScalarType::BF16 => {
+            let mut out = Vec::with_capacity(n * 2);
+            for (g, u) in gate_bytes
+                .chunks_exact(2)
+                .zip(up_bytes.chunks_exact(2))
+                .take(n)
+            {
+                let g = bf16::from_bits(u16::from_le_bytes([g[0], g[1]])).to_f32();
+                let u = bf16::from_bits(u16::from_le_bytes([u[0], u[1]])).to_f32();
+                out.extend_from_slice(
+                    &bf16::from_f32(gelu_pytorch_tanh(g) * u)
+                        .to_bits()
+                        .to_le_bytes(),
+                );
+            }
+            out
+        }
+        ScalarType::F32 => {
+            let mut out = Vec::with_capacity(n * 4);
+            for (g, u) in gate_bytes
+                .chunks_exact(4)
+                .zip(up_bytes.chunks_exact(4))
+                .take(n)
+            {
+                let g = f32::from_le_bytes([g[0], g[1], g[2], g[3]]);
+                let u = f32::from_le_bytes([u[0], u[1], u[2], u[3]]);
+                out.extend_from_slice(&(gelu_pytorch_tanh(g) * u).to_le_bytes());
+            }
+            out
+        }
+        other => {
+            return Err(GpuError::InvalidArg(format!(
+                "gemma4 GELU-tanh Metal fallback does not support dtype {other:?}"
+            )));
+        }
+    };
+    gpu_hal::copy_h2d(
+        ordinal,
+        output.as_mut_ptr(),
+        out_bytes.as_ptr() as *const c_void,
+        out_bytes.len(),
+    )
+}
 
 #[cfg(any(supersonic_backend_hip, supersonic_backend_cuda))]
 unsafe extern "C" {
@@ -693,6 +758,16 @@ pub fn rms_norm(
     eps: f32,
     n_cols: usize,
 ) -> Result<(), GpuError> {
+    if output.backend() == Backend::Metal {
+        return match weight {
+            Some(weight) => crate::prefill_ffi::rms_norm_rows_plain(
+                ordinal, dtype, 1, n_cols, eps, input, weight, output,
+            ),
+            None => Err(gemma4_metal_error(
+                "gemma4 rms_norm Metal fallback requires a weight buffer",
+            )),
+        };
+    }
     let weight_ptr = weight.map(|b| b.as_ptr()).unwrap_or(std::ptr::null());
     let status = unsafe {
         supersonic_gemma4_hip_rms_norm(
@@ -733,6 +808,9 @@ pub fn rms_norm_per_row(
     num_rows: usize,
     n_cols: usize,
 ) -> Result<(), GpuError> {
+    if output.backend() == Backend::Metal {
+        return rms_norm_rows(ordinal, dtype, output, input, weight, eps, num_rows, n_cols);
+    }
     let weight_ptr = weight.map(|b| b.as_ptr()).unwrap_or(std::ptr::null());
     let row_bytes = n_cols * dtype.size_in_bytes();
     let in_base = input.as_ptr() as *const u8;
@@ -775,6 +853,12 @@ pub fn matvec(
     out_dim: usize,
     counter_buf: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    if output.backend() == Backend::Metal {
+        let _ = counter_buf;
+        return crate::prefill_ffi::matmul_rhs_transposed(
+            ordinal, dtype, 1, 1, out_dim, in_dim, input, weight, output,
+        );
+    }
     let status = unsafe {
         supersonic_gemma4_hip_matvec(
             dtype.kernel_dtype_code(),
@@ -814,6 +898,18 @@ pub fn matvec_int4(
     group_size: usize,
     counter_buf: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    if output.backend() == Backend::Metal {
+        let _ = counter_buf;
+        if dtype != ScalarType::BF16 {
+            return Err(gemma4_metal_error(format!(
+                "gemma4 matvec_int4 Metal fallback supports BF16 only, got {dtype:?}"
+            )));
+        }
+        return crate::prefill_ffi::matmul_rhs_transposed_int4(
+            ordinal, 1, 1, out_dim, in_dim, input, w_packed, w_scale, w_zero, None, group_size, 4,
+            output,
+        );
+    }
     let status = unsafe {
         supersonic_gemma4_hip_matvec_int4(
             dtype.kernel_dtype_code(),
@@ -854,6 +950,18 @@ pub fn matvec_batched_int4(
     group_size: usize,
     counter_buf: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    if output.backend() == Backend::Metal {
+        let _ = counter_buf;
+        if dtype != ScalarType::BF16 {
+            return Err(gemma4_metal_error(format!(
+                "gemma4 matvec_batched_int4 Metal fallback supports BF16 only, got {dtype:?}"
+            )));
+        }
+        return crate::prefill_ffi::matmul_rhs_transposed_int4(
+            ordinal, 1, seq_len, out_dim, in_dim, input, w_packed, w_scale, w_zero, None,
+            group_size, 4, output,
+        );
+    }
     let status = unsafe {
         supersonic_gemma4_hip_matvec_batched_int4(
             dtype.kernel_dtype_code(),
@@ -889,6 +997,9 @@ pub fn gelu_tanh_gate_mul(
     up: &GpuBuffer,
     n: usize,
 ) -> Result<(), GpuError> {
+    if output.backend() == Backend::Metal {
+        return gelu_tanh_gate_mul_metal_host(ordinal, dtype, output, gate, up, n);
+    }
     let status = unsafe {
         supersonic_gemma4_hip_gelu_tanh_gate_mul(
             dtype.kernel_dtype_code(),
@@ -923,6 +1034,11 @@ pub fn rope_decode(
     rotary_dim: usize,
     position: usize,
 ) -> Result<(), GpuError> {
+    if x.backend() == Backend::Metal {
+        return crate::prefill_ffi::apply_rope_prefill(
+            ordinal, dtype, 1, num_heads, head_dim, rotary_dim, cos_table, sin_table, position, x,
+        );
+    }
     let status = unsafe {
         supersonic_gemma4_hip_rope_decode(
             dtype.kernel_dtype_code(),
@@ -972,6 +1088,35 @@ pub fn swa_attn_decode(
     sliding_window: i32,
     scale: f32,
 ) -> Result<(), GpuError> {
+    if out.backend() == Backend::Metal {
+        if sliding_window > 0 && kv_len > sliding_window as usize {
+            return Err(gemma4_metal_error(format!(
+                "gemma4 Metal decode attention needs a sliding-window cache slice for kv_len={kv_len}, window={sliding_window}"
+            )));
+        }
+        let _ = scores_scratch;
+        return crate::prefill_ffi::metal_full_attention_decode_bf16_f32(
+            num_q_heads,
+            num_kv_heads,
+            kv_len,
+            max_t,
+            head_dim,
+            scale,
+            q,
+            k_cache,
+            v_cache,
+            out,
+        )
+        .and_then(|_| {
+            if out.dtype() == ScalarType::F32 {
+                Ok(())
+            } else {
+                Err(gemma4_metal_error(
+                    "gemma4 Metal decode attention fallback currently writes F32 output",
+                ))
+            }
+        });
+    }
     let status = unsafe {
         supersonic_gemma4_hip_swa_attn_decode(
             dtype.kernel_dtype_code(),
@@ -1015,6 +1160,27 @@ pub fn kv_append(
     pos: usize,
     max_t: usize,
 ) -> Result<(), GpuError> {
+    if k_cache.backend() == Backend::Metal {
+        let elem_bytes = dtype.size_in_bytes();
+        let row_bytes = head_dim * elem_bytes;
+        for h in 0..num_kv_heads {
+            let src_off = h * row_bytes;
+            let dst_off = ((h * max_t + pos) * head_dim) * elem_bytes;
+            gpu_hal::copy_d2d(
+                ordinal,
+                k_cache.offset_ptr(dst_off) as *mut c_void,
+                k_in.offset_ptr(src_off),
+                row_bytes,
+            )?;
+            gpu_hal::copy_d2d(
+                ordinal,
+                v_cache.offset_ptr(dst_off) as *mut c_void,
+                v_in.offset_ptr(src_off),
+                row_bytes,
+            )?;
+        }
+        return Ok(());
+    }
     let status = unsafe {
         supersonic_gemma4_hip_kv_append(
             dtype.kernel_dtype_code(),
@@ -1061,6 +1227,24 @@ pub fn rms_norm_rows(
     n_rows: usize,
     n_cols: usize,
 ) -> Result<(), GpuError> {
+    if output.backend() == Backend::Metal {
+        return match weight {
+            Some(weight) => crate::prefill_ffi::rms_norm_rows_plain(
+                ordinal, dtype, n_rows, n_cols, eps, input, weight, output,
+            ),
+            None => {
+                let ones = vec![bf16::from_f32(1.0).to_bits().to_le_bytes(); n_cols]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>();
+                let weight =
+                    GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[n_cols], &ones)?;
+                crate::prefill_ffi::rms_norm_rows_plain(
+                    ordinal, dtype, n_rows, n_cols, eps, input, &weight, output,
+                )
+            }
+        };
+    }
     let weight_ptr = weight.map(|b| b.as_ptr()).unwrap_or(std::ptr::null());
     let status = unsafe {
         supersonic_gemma4_hip_rms_norm_rows(
@@ -1096,6 +1280,12 @@ pub fn matvec_batched(
     out_dim: usize,
     counter_buf: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    if output.backend() == Backend::Metal {
+        let _ = counter_buf;
+        return crate::prefill_ffi::matmul_rhs_transposed(
+            ordinal, dtype, 1, seq_len, out_dim, in_dim, input, weight, output,
+        );
+    }
     let status = unsafe {
         supersonic_gemma4_hip_matvec_batched(
             dtype.kernel_dtype_code(),
@@ -1134,6 +1324,12 @@ pub fn rope_prefill(
     rotary_dim: usize,
     pos_base: usize,
 ) -> Result<(), GpuError> {
+    if x.backend() == Backend::Metal {
+        return crate::prefill_ffi::apply_rope_prefill(
+            ordinal, dtype, seq_len, num_heads, head_dim, rotary_dim, cos_table, sin_table,
+            pos_base, x,
+        );
+    }
     let status = unsafe {
         supersonic_gemma4_hip_rope_prefill(
             dtype.kernel_dtype_code(),
@@ -1173,6 +1369,29 @@ pub fn kv_append_prefill(
     pos_base: usize,
     max_t: usize,
 ) -> Result<(), GpuError> {
+    if k_cache.backend() == Backend::Metal {
+        let elem_bytes = dtype.size_in_bytes();
+        let row_bytes = head_dim * elem_bytes;
+        for t in 0..seq_len {
+            for h in 0..num_kv_heads {
+                let src_off = ((t * num_kv_heads + h) * head_dim) * elem_bytes;
+                let dst_off = ((h * max_t + pos_base + t) * head_dim) * elem_bytes;
+                gpu_hal::copy_d2d(
+                    ordinal,
+                    k_cache.offset_ptr(dst_off) as *mut c_void,
+                    k_in.offset_ptr(src_off),
+                    row_bytes,
+                )?;
+                gpu_hal::copy_d2d(
+                    ordinal,
+                    v_cache.offset_ptr(dst_off) as *mut c_void,
+                    v_in.offset_ptr(src_off),
+                    row_bytes,
+                )?;
+            }
+        }
+        return Ok(());
+    }
     let status = unsafe {
         supersonic_gemma4_hip_kv_append_prefill(
             dtype.kernel_dtype_code(),
@@ -1222,6 +1441,40 @@ pub fn attn_prefill(
     sliding_window: i32,
     scale: f32,
 ) -> Result<(), GpuError> {
+    if out.backend() == Backend::Metal {
+        let _ = scores_scratch;
+        let kv_len = pos_base + seq_len;
+        if sliding_window > 0 && kv_len > sliding_window as usize {
+            return Err(gemma4_metal_error(format!(
+                "gemma4 Metal prefill attention needs a sliding-window cache slice for kv_len={kv_len}, window={sliding_window}"
+            )));
+        }
+        let mut out_f32 = GpuBuffer::zeros(ordinal, ScalarType::F32, out.shape()).map_err(|e| {
+            gemma4_metal_error(format!("gemma4 Metal attention fallback alloc: {e}"))
+        })?;
+        crate::prefill_ffi::metal_full_attention_prefill_strided_bf16_f32(
+            num_q_heads,
+            num_kv_heads,
+            seq_len,
+            kv_len,
+            max_t,
+            head_dim,
+            scale,
+            pos_base,
+            q,
+            k_cache,
+            v_cache,
+            &mut out_f32,
+        )?;
+        return crate::prefill_ffi::cast(
+            ordinal,
+            ScalarType::F32,
+            dtype,
+            out.elem_count(),
+            &out_f32,
+            out,
+        );
+    }
     let status = unsafe {
         supersonic_gemma4_hip_attn_prefill(
             dtype.kernel_dtype_code(),
@@ -1259,6 +1512,9 @@ pub fn add_residual(
     b: &GpuBuffer,
     n: usize,
 ) -> Result<(), GpuError> {
+    if output.backend() == Backend::Metal {
+        return crate::prefill_ffi::element_add(ordinal, dtype, n, a, b, output);
+    }
     let status = unsafe {
         supersonic_gemma4_hip_add_residual(
             dtype.kernel_dtype_code(),
@@ -1289,6 +1545,13 @@ pub fn add_scaled_residual(
     scalar: f32,
     n: usize,
 ) -> Result<(), GpuError> {
+    if output.backend() == Backend::Metal {
+        let mut tmp = GpuBuffer::zeros(ordinal, dtype, output.shape()).map_err(|e| {
+            gemma4_metal_error(format!("gemma4 Metal add_scaled_residual alloc: {e}"))
+        })?;
+        crate::prefill_ffi::element_add(ordinal, dtype, n, a, b, &mut tmp)?;
+        return crate::prefill_ffi::mul_scalar(ordinal, dtype, n, scalar, &tmp, output);
+    }
     let status = unsafe {
         supersonic_gemma4_hip_add_scaled_residual(
             dtype.kernel_dtype_code(),
@@ -1320,6 +1583,14 @@ pub fn scalar_mul_inplace(
     scalar: f32,
     n: usize,
 ) -> Result<(), GpuError> {
+    if x.backend() == Backend::Metal {
+        let mut tmp = GpuBuffer::zeros(ordinal, dtype, x.shape()).map_err(|e| {
+            gemma4_metal_error(format!("gemma4 Metal scalar_mul_inplace alloc: {e}"))
+        })?;
+        crate::prefill_ffi::mul_scalar(ordinal, dtype, n, scalar, x, &mut tmp)?;
+        gpu_hal::copy_d2d(ordinal, x.as_mut_ptr(), tmp.as_ptr(), x.len_bytes())?;
+        return Ok(());
+    }
     let status = unsafe {
         supersonic_gemma4_hip_scalar_mul_inplace(
             dtype.kernel_dtype_code(),
@@ -1750,6 +2021,21 @@ pub fn gather_layer_slice(
     ple_hidden: usize,
     layer_idx: usize,
 ) -> Result<(), GpuError> {
+    if output.backend() == Backend::Metal {
+        let elem_bytes = dtype.size_in_bytes();
+        let row_bytes = ple_hidden * elem_bytes;
+        for s in 0..seq_len {
+            let src_off = ((s * num_layers + layer_idx) * ple_hidden) * elem_bytes;
+            let dst_off = s * row_bytes;
+            gpu_hal::copy_d2d(
+                ordinal,
+                output.offset_ptr(dst_off) as *mut c_void,
+                src.offset_ptr(src_off),
+                row_bytes,
+            )?;
+        }
+        return Ok(());
+    }
     let status = unsafe {
         supersonic_gemma4_hip_gather_layer_slice(
             dtype.kernel_dtype_code(),
@@ -1787,6 +2073,19 @@ pub fn embed_gather_scaled(
     vocab_size: usize,
     scale: f32,
 ) -> Result<(), GpuError> {
+    if output.backend() == Backend::Metal {
+        crate::prefill_ffi::embedding_lookup(
+            ordinal,
+            dtype,
+            seq_len,
+            vocab_size,
+            hidden_size,
+            table,
+            token_ids,
+            output,
+        )?;
+        return scalar_mul_inplace(ordinal, dtype, output, scale, seq_len * hidden_size);
+    }
     let status = unsafe {
         supersonic_gemma4_hip_embed_gather_scaled(
             dtype.kernel_dtype_code(),
@@ -2675,4 +2974,154 @@ pub fn persistent_decode_batch_int4(
         ));
     }
     Ok(())
+}
+
+#[cfg(all(test, target_os = "macos", supersonic_backend_metal))]
+mod metal_tests {
+    use super::*;
+    use gpu_hal::{set_backend, Backend};
+
+    fn bf16_bytes(values: &[f32]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|v| bf16::from_f32(*v).to_bits().to_le_bytes())
+            .collect()
+    }
+
+    fn read_bf16(buffer: &GpuBuffer) -> Vec<f32> {
+        let bytes = buffer.to_host_bytes().expect("download BF16 test buffer");
+        bytes
+            .chunks_exact(2)
+            .map(|chunk| bf16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])).to_f32())
+            .collect()
+    }
+
+    fn upload(shape: &[usize], values: &[f32]) -> GpuBuffer {
+        GpuBuffer::from_host_bytes(0, ScalarType::BF16, shape, &bf16_bytes(values))
+            .expect("upload BF16 test tensor")
+    }
+
+    #[test]
+    fn metal_gemma4_component_wrappers_run() {
+        set_backend(Backend::Metal);
+        let mut out = GpuBuffer::zeros(0, ScalarType::BF16, &[2]).expect("alloc out");
+        let input = upload(&[2], &[3.0, 4.0]);
+        let weight = upload(&[2], &[0.5, -0.5]);
+        rms_norm(0, ScalarType::BF16, &mut out, &input, Some(&weight), 0.0, 2)
+            .expect("gemma4 rms_norm Metal fallback");
+        let norm = read_bf16(&out);
+        let inv_rms = 1.0f32 / ((25.0f32 / 2.0).sqrt());
+        assert!((norm[0] - 3.0 * inv_rms * 0.5).abs() <= 0.02);
+        assert!((norm[1] - 4.0 * inv_rms * -0.5).abs() <= 0.02);
+
+        let lhs = upload(&[1, 3], &[1.0, 2.0, 3.0]);
+        let rhs = upload(&[2, 3], &[1.0, 0.0, -1.0, 0.5, 0.5, 0.5]);
+        let mut mat = GpuBuffer::zeros(0, ScalarType::BF16, &[1, 2]).expect("alloc mat");
+        let mut counter = GpuBuffer::zeros(0, ScalarType::U32, &[1]).expect("alloc counter");
+        matvec_batched(
+            0,
+            ScalarType::BF16,
+            &mut mat,
+            &lhs,
+            &rhs,
+            1,
+            3,
+            2,
+            &mut counter,
+        )
+        .expect("gemma4 matvec_batched Metal fallback");
+        let mat = read_bf16(&mat);
+        assert!((mat[0] - -2.0).abs() <= 0.02);
+        assert!((mat[1] - 3.0).abs() <= 0.02);
+
+        let nibbles: [[u8; 4]; 4] = [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12], [13, 14, 15, 0]];
+        let mut rhs_bytes = Vec::with_capacity(8);
+        for row in &nibbles {
+            rhs_bytes.push(row[0] | (row[1] << 4));
+            rhs_bytes.push(row[2] | (row[3] << 4));
+        }
+        let rhs_int4 = GpuBuffer::from_host_bytes(0, ScalarType::U8, &[1, 4, 2], &rhs_bytes)
+            .expect("upload INT4 rhs");
+        let scale_vals = [0.5, 0.25, 0.125, 1.0];
+        let zero_vals = [2.0, 1.0, 4.0, 0.5];
+        let scale = upload(&[2, 2], &scale_vals);
+        let zero = upload(&[2, 2], &zero_vals);
+        let int4_lhs = upload(&[4], &[1.0, 0.5, -1.0, 2.0]);
+        let mut int4_out =
+            GpuBuffer::zeros(0, ScalarType::BF16, &[4]).expect("alloc INT4 matvec out");
+        matvec_int4(
+            0,
+            ScalarType::BF16,
+            &mut int4_out,
+            &int4_lhs,
+            &rhs_int4,
+            &scale,
+            &zero,
+            4,
+            4,
+            2,
+            &mut counter,
+        )
+        .expect("gemma4 matvec_int4 Metal fallback");
+        let int4_actual = read_bf16(&int4_out);
+        let bf16_round = |x: f32| -> f32 { bf16::from_f32(x).to_f32() };
+        let int4_lhs_vals = [1.0, 0.5, -1.0, 2.0];
+        for col in 0..4usize {
+            let scale_row = col / 2;
+            let mut expected = 0.0f32;
+            for kk in 0..4usize {
+                let si = scale_row * 2 + (kk / 2);
+                let w = bf16_round(
+                    nibbles[col][kk] as f32 * scale_vals[si] - zero_vals[si] * scale_vals[si],
+                );
+                expected += int4_lhs_vals[kk] * w;
+            }
+            assert!(
+                (int4_actual[col] - expected).abs() <= 0.05,
+                "INT4 matvec fallback col {col}: got {}, want {expected}",
+                int4_actual[col]
+            );
+        }
+
+        let gate = upload(&[3], &[-1.0, 0.0, 1.0]);
+        let up = upload(&[3], &[2.0, 2.0, 2.0]);
+        let mut gelu = GpuBuffer::zeros(0, ScalarType::BF16, &[3]).expect("alloc gelu");
+        gelu_tanh_gate_mul(0, ScalarType::BF16, &mut gelu, &gate, &up, 3)
+            .expect("gemma4 gelu_tanh_gate_mul Metal fallback");
+        let gelu = read_bf16(&gelu);
+        for (got, (g, u)) in gelu.iter().zip([(-1.0, 2.0), (0.0, 2.0), (1.0, 2.0)]) {
+            let want = gelu_pytorch_tanh(g) * u;
+            assert!(
+                (got - want).abs() <= 0.02,
+                "gelu fallback mismatch: got {got}, want {want}"
+            );
+        }
+
+        let tokens = GpuBuffer::from_host_bytes(
+            0,
+            ScalarType::U32,
+            &[2],
+            &[1u32.to_le_bytes(), 0u32.to_le_bytes()].concat(),
+        )
+        .expect("upload token ids");
+        let table = upload(&[2, 2], &[1.0, 2.0, 3.0, 4.0]);
+        let mut embed = GpuBuffer::zeros(0, ScalarType::BF16, &[2, 2]).expect("alloc embed");
+        embed_gather_scaled(
+            0,
+            ScalarType::BF16,
+            &mut embed,
+            &tokens,
+            &table,
+            2,
+            2,
+            2,
+            0.5,
+        )
+        .expect("gemma4 embed_gather_scaled Metal fallback");
+        let embed = read_bf16(&embed);
+        let expected = [1.5, 2.0, 0.5, 1.0];
+        for (got, want) in embed.iter().zip(expected) {
+            assert!((got - want).abs() <= 0.02);
+        }
+    }
 }

@@ -30,12 +30,33 @@ pub fn validate_persistent_kv_fp8_flags(cli: &crate::Cli) -> Result<()> {
 }
 
 pub fn validate_decode_backend(entry: &RegistryEntry) -> Result<()> {
-    if !matches!(entry.backend, Backend::Hip | Backend::Cuda) {
+    if !matches!(entry.backend, Backend::Hip | Backend::Cuda | Backend::Metal) {
         anyhow::bail!(
-            "qwen3.6-35b-a3b decode kernels are wired for HIP and CUDA sm86; \
-             registry-selected backend was {:?}. Re-run with --backend hip/cuda, \
+            "qwen3.6-35b-a3b decode kernels are wired for HIP, CUDA sm86, and \
+             the Metal chained fallback path; registry-selected backend was {:?}. \
+             Re-run with --backend hip/cuda/metal, \
              or use --dry-run for analytic accounting.",
             entry.backend,
+        );
+    }
+    Ok(())
+}
+
+pub fn validate_metal_v1_flags(cli: &crate::Cli, entry: &RegistryEntry) -> Result<()> {
+    if entry.backend != Backend::Metal {
+        return Ok(());
+    }
+    if cli.fp8_runtime {
+        anyhow::bail!(
+            "Qwen3.6-35B-A3B Metal v1 supports INT4 chained decode only; --fp8-runtime is not wired."
+        );
+    }
+    if cli.kv_fp8 {
+        anyhow::bail!("Qwen3.6-35B-A3B Metal v1 keeps BF16 KV cache; --kv-fp8 is not wired.");
+    }
+    if cli.speculative_decode || cli.batched_spec_verify {
+        anyhow::bail!(
+            "Qwen3.6-35B-A3B Metal v1 does not wire the MTP/speculative decode path yet."
         );
     }
     Ok(())

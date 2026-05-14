@@ -97,6 +97,7 @@ pub struct BughuntArgs {
     pub bench_warmup: usize,
     pub bench_decode_tokens: usize,
     pub bench_profile_ops: bool,
+    pub allow_untested_gpu: Option<String>,
 }
 
 pub(crate) fn validate_args(args: &BughuntArgs) -> Result<()> {

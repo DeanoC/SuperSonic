@@ -18,7 +18,7 @@ fi
 
 cd "$repo_root"
 
-cargo build -p runner --bin qwen35_bughunt
+cargo build -p runner --bin qwen35_bughunt --features bughunt
 
 cmd=(
   "$repo_root/target/debug/qwen35_bughunt"
@@ -32,6 +32,10 @@ cmd=(
 
 if [[ -n "${QWEN35_BUGHUNT_PROMPT:-}" ]]; then
   cmd+=(--prompt "$QWEN35_BUGHUNT_PROMPT")
+fi
+
+if [[ -n "${QWEN35_BUGHUNT_ALLOW_UNTESTED_GPU:-}" ]]; then
+  cmd+=(--allow-untested-gpu "$QWEN35_BUGHUNT_ALLOW_UNTESTED_GPU")
 fi
 
 if [[ -d "$repo_root/.venv/bin" ]]; then

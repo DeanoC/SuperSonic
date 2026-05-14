@@ -40,8 +40,8 @@ pub(crate) fn validate_global_flags(
         if !cli.int4 || profile != QuantProfile::Int4Gptq {
             anyhow::bail!("qwen3-30b-a3b v1 requires --int4 / int4-gptq");
         }
-        if backend != Backend::Hip {
-            anyhow::bail!("qwen3-30b-a3b v1 is supported only on HIP");
+        if !matches!(backend, Backend::Hip | Backend::Metal) {
+            anyhow::bail!("qwen3-30b-a3b v1 is supported only on HIP and Metal");
         }
     }
     if cli.gguf_file.is_some() && profile != QuantProfile::Q4Km {

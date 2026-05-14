@@ -1039,11 +1039,7 @@ pub fn metal_lm_head_argmax_bf16_into(
     {
         crate::prefill_ffi::metal_profile_time("lm_head_argmax", "native", || {
             crate::metal_native::lm_head_argmax_bf16(
-                hidden,
-                weight,
-                &mut out_index,
-                hidden_dim,
-                vocab_size,
+                hidden, weight, out_index, hidden_dim, vocab_size,
             )
         })
     }
@@ -1107,9 +1103,9 @@ pub fn metal_lm_head_argmax_bf16_with_partials_into(
             crate::metal_native::lm_head_argmax_bf16_with_partials(
                 hidden,
                 weight,
-                &mut out_index,
-                Some(&mut partial_values),
-                Some(&mut partial_indices),
+                out_index,
+                Some(partial_values),
+                Some(partial_indices),
                 hidden_dim,
                 vocab_size,
             )
@@ -1154,7 +1150,7 @@ pub fn metal_argmax_bf16_into(
     #[cfg(all(target_os = "macos", supersonic_backend_metal))]
     {
         crate::prefill_ffi::metal_profile_time("argmax_bf16", "native", || {
-            crate::metal_native::argmax_bf16(logits, &mut out_index, n)
+            crate::metal_native::argmax_bf16(logits, out_index, n)
         })
     }
     #[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
@@ -1255,6 +1251,12 @@ pub fn standalone_matvec_4b(
         )));
     }
     let backend = output.backend();
+    if backend == Backend::Metal {
+        let _ = counter_buf;
+        return crate::prefill_ffi::matmul_rhs_transposed(
+            ordinal, dtype, 1, 1, out_dim, in_dim, input, weight, output,
+        );
+    }
     gpu_hal::memset_zeros(ordinal, counter_buf.as_mut_ptr(), 4)?;
     let status = match backend {
         Backend::Hip => {
@@ -1295,11 +1297,7 @@ pub fn standalone_matvec_4b(
                 return Err(GpuError::InvalidArg("CUDA backend not compiled".into()));
             }
         }
-        Backend::Metal => {
-            return Err(GpuError::InvalidArg(
-                "standalone_matvec_4b is not supported on Metal v1".into(),
-            ))
-        }
+        Backend::Metal => unreachable!("handled above"),
     };
     if status != 0 {
         return Err(backend_error(
@@ -1389,6 +1387,11 @@ pub fn rms_norm_4b_multirow(
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
     let backend = out.backend();
+    if backend == Backend::Metal {
+        return crate::prefill_ffi::rms_norm_rows(
+            ordinal, dtype, n_rows, hidden_dim, eps, input, weight, out,
+        );
+    }
     let status = match backend {
         Backend::Hip => {
             #[cfg(supersonic_backend_hip)]
@@ -1459,6 +1462,19 @@ pub fn matmul_rhs_transposed_4b(
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
     let backend = out.backend();
+    if backend == Backend::Metal {
+        return crate::prefill_ffi::matmul_rhs_transposed(
+            ordinal,
+            dtype,
+            batch_elems,
+            m,
+            n,
+            k,
+            lhs,
+            rhs,
+            out,
+        );
+    }
     let status = match backend {
         Backend::Hip => {
             #[cfg(supersonic_backend_hip)]
@@ -1500,11 +1516,7 @@ pub fn matmul_rhs_transposed_4b(
                 return Err(GpuError::InvalidArg("CUDA backend not compiled".into()));
             }
         }
-        Backend::Metal => {
-            return Err(GpuError::InvalidArg(
-                "matmul_rhs_transposed_4b is not supported on Metal v1".into(),
-            ))
-        }
+        Backend::Metal => unreachable!("handled above"),
     };
     if status != 0 {
         return Err(backend_error(
@@ -1634,6 +1646,50 @@ mod tests {
         let actual = read_bf16(&output);
         let inv_rms = 1.0f32 / ((25.0f32 / 2.0).sqrt());
         let expected = vec![3.0 * inv_rms * 1.5, 4.0 * inv_rms * 0.5];
+        for (idx, (got, want)) in actual.iter().zip(expected.iter()).enumerate() {
+            let delta = (got - want).abs();
+            assert!(
+                delta <= 0.02,
+                "idx {idx}: expected {want}, got {got}, delta {delta}"
+            );
+        }
+    }
+
+    #[test]
+    fn metal_standalone_matvec_4b_uses_generic_matmul_path() {
+        set_backend(Backend::Metal);
+        let ordinal = 0usize;
+        let input = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[3],
+            &bf16_bytes(&[1.0, 2.0, 3.0]),
+        )
+        .expect("upload input");
+        let weight = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[2, 3],
+            &bf16_bytes(&[1.0, 0.0, -1.0, 0.5, 0.5, 0.5]),
+        )
+        .expect("upload weight");
+        let mut output = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[2]).expect("alloc output");
+        let mut counter = GpuBuffer::zeros(ordinal, ScalarType::U32, &[1]).expect("alloc counter");
+
+        standalone_matvec_4b(
+            ordinal,
+            ScalarType::BF16,
+            &mut output,
+            &input,
+            &weight,
+            3,
+            2,
+            &mut counter,
+        )
+        .expect("run standalone_matvec_4b");
+
+        let actual = read_bf16(&output);
+        let expected = [-2.0, 3.0];
         for (idx, (got, want)) in actual.iter().zip(expected.iter()).enumerate() {
             let delta = (got - want).abs();
             assert!(

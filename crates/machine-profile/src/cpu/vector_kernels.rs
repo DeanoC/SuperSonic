@@ -16,20 +16,27 @@ fn measure_fp32(num_p_cores: u32) -> MeasuredVsTheoretical {
     // peak_fp32_avx2 is compiled with target_feature = "avx2,fma" and uses
     // _mm256_fmadd_ps. AVX2 does not imply FMA on x86_64 — early Haswell-era
     // and a few low-power lines have one without the other, so gate on both.
-    let per_core_gflops = if cfg!(target_arch = "x86_64")
-        && std::is_x86_feature_detected!("avx2")
-        && std::is_x86_feature_detected!("fma")
-    {
-        unsafe { peak_fp32_avx2() }
-    } else {
-        peak_fp32_scalar()
-    };
+    let per_core_gflops = measure_fp32_impl();
     MeasuredVsTheoretical {
         measured_per_unit: Some(per_core_gflops),
         measured_aggregate: per_core_gflops * num_p_cores as f64,
         theoretical_aggregate: None,
         ratio: None,
     }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn measure_fp32_impl() -> f64 {
+    if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+        unsafe { peak_fp32_avx2() }
+    } else {
+        peak_fp32_scalar()
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn measure_fp32_impl() -> f64 {
+    peak_fp32_scalar()
 }
 
 // NOTE: On stable Rust 1.95.0, `_mm512_castsi512_bf16` and `_mm512_dpbf16_ps`
@@ -39,15 +46,27 @@ fn measure_fp32(num_p_cores: u32) -> MeasuredVsTheoretical {
 // this toolchain — catalog consumers should treat it as a lower bound until the
 // AVX-512 BF16 intrinsics land on stable.
 fn measure_bf16(num_p_cores: u32) -> Option<MeasuredVsTheoretical> {
-    if !cfg!(target_arch = "x86_64") { return None; }
-    if !std::is_x86_feature_detected!("avx512bf16") { return None; }
-    let per_core_gflops = unsafe { peak_bf16_avx512() };
-    Some(MeasuredVsTheoretical {
-        measured_per_unit: Some(per_core_gflops),
-        measured_aggregate: per_core_gflops * num_p_cores as f64,
-        theoretical_aggregate: None,
-        ratio: None,
-    })
+    measure_bf16_impl(num_p_cores)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn measure_bf16_impl(num_p_cores: u32) -> Option<MeasuredVsTheoretical> {
+    if std::is_x86_feature_detected!("avx512bf16") {
+        let per_core_gflops = unsafe { peak_bf16_avx512() };
+        Some(MeasuredVsTheoretical {
+            measured_per_unit: Some(per_core_gflops),
+            measured_aggregate: per_core_gflops * num_p_cores as f64,
+            theoretical_aggregate: None,
+            ratio: None,
+        })
+    } else {
+        None
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn measure_bf16_impl(_num_p_cores: u32) -> Option<MeasuredVsTheoretical> {
+    None
 }
 
 fn peak_fp32_scalar() -> f64 {
@@ -83,7 +102,9 @@ unsafe fn peak_fp32_avx2() -> f64 {
         }
     }
     let mut acc = a[0];
-    for k in 1..8 { acc = _mm256_add_ps(acc, a[k]); }
+    for k in 1..8 {
+        acc = _mm256_add_ps(acc, a[k]);
+    }
     let mut tmp = [0f32; 8];
     _mm256_storeu_ps(tmp.as_mut_ptr(), acc);
     black_box(tmp);
@@ -91,7 +112,9 @@ unsafe fn peak_fp32_avx2() -> f64 {
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-unsafe fn peak_fp32_avx2() -> f64 { peak_fp32_scalar() }
+unsafe fn peak_fp32_avx2() -> f64 {
+    peak_fp32_scalar()
+}
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512bf16")]
@@ -105,7 +128,9 @@ unsafe fn peak_bf16_avx512() -> f64 {
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-unsafe fn peak_bf16_avx512() -> f64 { 0.0 }
+unsafe fn peak_bf16_avx512() -> f64 {
+    0.0
+}
 
 #[cfg(test)]
 mod tests {

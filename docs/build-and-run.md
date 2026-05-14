@@ -258,13 +258,24 @@ Detailed CUDA `sm86` history for both the `0.8B` and `4B` hero lanes lives in
 
 ## Metal
 
-Metal support is currently a Qwen3.5 0.8B Apple-silicon lane validated on Apple M4.
+Metal support is currently a Qwen3.5 Apple-silicon lane validated on Apple M4
+and Apple M5 Max.
 The core decode path is now O(N) incremental decode — no replay overhead.
 
-Validated Metal scope:
+Supported Metal scope:
 
 - `qwen3.5-0.8b`, `qwen3.5-2b`
+- `qwen3.5-4b`, `qwen3.5-9b` on Apple M5 Max
+- `qwen3-30b-a3b` INT4 on Apple M5 Max is wired through a correctness-first
+  chained Metal fallback; a local full-model smoke is still pending
+- `qwen3.6-35b-a3b` INT4 on Apple M5 Max is wired through the chained Metal
+  decode route; a local full-model smoke is still pending
+- `gemma4-e2b`, `gemma4-e4b` BF16 and INT4 on Apple M5 Max are wired through a
+  component Metal decode path; a local model smoke is still pending
+- `phi4-mini` BF16, INT4, and FP8-runtime on Apple M5 Max are wired through a
+  component Metal decode path; a local model smoke is still pending
 - Apple M4 / `apple-m4`
+- Apple M5 Max / `apple-m5-max`
 - BF16 prefill parity against the Python CPU oracle
 - CLI and `supersonic-serve` HTTP server
 - native Metal greedy prefill
@@ -273,15 +284,29 @@ Validated Metal scope:
 
 Metal currently rejects or defers:
 
-- models other than `qwen3.5-0.8b` and `qwen3.5-2b`
-- `--fp8-runtime`
+- `--fp8-runtime` outside the Phi4 component path
 - `--kv-fp8`
 - batched decode
 - persistent megakernel decode (all ops fused into one dispatch)
+- `qwen3-30b-a3b` INT4 on Apple M5 Max has a correctness-first chained Metal
+  fallback for decode-layer attention, MoE routing, expert matmul, KV updates,
+  and the final INT4 lm-head. The persistent Qwen3-MoE megakernel remains
+  HIP-only, and a local full-model smoke is still pending.
+- `qwen3.6-35b-a3b` INT4 on Apple M5 Max uses the host-orchestrated chained
+  decode route with Metal fallbacks for BF16 full-attention, linear-attention,
+  and FFN stages, plus INT4 sidecars for projection and expert matvecs.
+  FP8-runtime, KV-FP8, speculative decode, persistent decode, and the local
+  full-model smoke are still pending.
+- `phi4-mini` INT4 and FP8-runtime are build-checked through the component
+  Metal route; KV-FP8 and local model smokes are still pending
+- `gemma4-e2b` and `gemma4-e4b` INT4 are build-checked through the component
+  Metal route, but still need a local INT4 bake/model smoke
 
 Native Metal kernels used in the hot path:
 
 - matmul RHS-transposed (BF16 + INT4 GPTQ dequant)
+- FP8 runtime-dequant matmul has a correctness-first Metal host fallback for
+  Phi4 component decode
 - full-attention prefill core
 - lm-head argmax
 - RMSNorm rows
@@ -293,13 +318,17 @@ Native Metal kernels used in the hot path:
 - QKV split
 - Q-gate split
 
-Current Apple M4 checkpoint on this machine:
+Current Apple M4 / Apple M5 Max checkpoint:
 
 - `qwen35_bughunt --mode gate`: PASS for `hello_world`, `forest_prompt`, and `code_prompt`
 - `supersonic --backend metal --model qwen3.5-0.8b --prompt "Hello, world" --max-new-tokens 8`:
   - prefill about `112 ms`
   - incremental decode about `34 ms/token` (constant across context lengths)
 - `--gpu-validate` on 16-token sequence: `gpu_oracle_max_delta=0.0000` every step
+- Apple M5 Max validation also covers `qwen3.5-0.8b --validate --oracle-device cpu`
+  and the checked-in bughunt gate.
+- Apple M5 Max validation also covers one-token `qwen3.5-4b` and `qwen3.5-9b`
+  `--validate --oracle-device cpu` smokes through Metal v2 incremental decode.
 
 The next optimization target is a persistent Metal megakernel — collapsing the
 per-token command-buffer round-trips into a single dispatch, equivalent to the
