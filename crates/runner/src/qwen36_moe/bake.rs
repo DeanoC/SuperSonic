@@ -95,3 +95,37 @@ pub(crate) fn select_decode_bake(
         weight_mode,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_model_dir(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "supersonic-qwen36-bake-{name}-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).expect("create temp model dir");
+        dir
+    }
+
+    #[test]
+    fn select_decode_bake_rejects_bf16_when_int4_required() {
+        let model_dir = temp_model_dir("int4-required");
+        fs::create_dir_all(model_store::bake_dir(&model_dir)).expect("create bf16 bake dir");
+
+        let err = match select_decode_bake(&model_dir, false, true) {
+            Ok(_) => panic!("int4 requirement must not fall back to bf16"),
+            Err(err) => err.to_string(),
+        };
+
+        assert!(err.contains("--int4 requested but no INT4-GPTQ bake exists"));
+        let _ = fs::remove_dir_all(model_dir);
+    }
+}

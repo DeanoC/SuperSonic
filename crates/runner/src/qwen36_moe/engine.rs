@@ -132,6 +132,7 @@ fn run_inner(
         top_p: cli.top_p,
         seed: cli.sampling_seed,
     };
+    let requires_int4_bake = cli.int4 || matches!(entry.backend, Backend::Cuda | Backend::Metal);
     decode_text(
         &cli.model_dir,
         &report,
@@ -141,7 +142,7 @@ fn run_inner(
         cli.emit_stage_timings,
         cli.speculative_decode,
         cli.fp8_runtime,
-        cli.int4,
+        requires_int4_bake,
         cli.batched_spec_verify,
         entry.backend,
         cli.device,
@@ -221,12 +222,20 @@ fn decode_text(
 
     let bake_open_start = std::time::Instant::now();
     let bake = select_decode_bake(model_dir, fp8_runtime, int4_runtime)?;
-    if backend == Backend::Cuda && !bake.weight_mode.is_int4() {
-        anyhow::bail!(
-            "Qwen3.6-35B-A3B CUDA v1 requires an INT4/q4km bake; selected {} from {}",
-            bake.weight_mode.display_name(),
-            bake.bake_dir.display(),
-        );
+    if !bake.weight_mode.is_int4() {
+        match backend {
+            Backend::Cuda => anyhow::bail!(
+                "Qwen3.6-35B-A3B CUDA v1 requires an INT4/q4km bake; selected {} from {}",
+                bake.weight_mode.display_name(),
+                bake.bake_dir.display(),
+            ),
+            Backend::Metal => anyhow::bail!(
+                "Qwen3.6-35B-A3B Metal v1 requires an INT4-GPTQ bake; selected {} from {}",
+                bake.weight_mode.display_name(),
+                bake.bake_dir.display(),
+            ),
+            _ => {}
+        }
     }
     println!(
         "  loading from bake: {} ({})",
