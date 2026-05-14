@@ -188,7 +188,7 @@ on CUDA devices with `SUPERSONIC_VMM_KV=1`:
   expert VA reservation after the run. With persistent decode left at its
   default, the run reports segmented persistent sparse decode.
 - Qwen3.6-MoE sparse-vs-dense VMM e2e gate:
-  `SUPERSONIC_BACKENDS=hip SUPERSONIC_TEST_QWEN36_MOE_MODEL_DIR=/mnt/data/models/Qwen3.6-35B-A3B cargo test --release -p runner --test qwen36_moe_sparse_vmm_smoke -- --ignored --nocapture`
+  `SUPERSONIC_BACKENDS=hip SUPERSONIC_TEST_MODEL_DIR=/mnt/data/models/Qwen3.6-35B-A3B cargo test --release -p runner --test qwen36_moe_sparse_vmm_smoke -- --ignored --nocapture`
   compares dense virtual expert slabs with sparse router-prefetched slabs over
   multiple generated tokens and validates the telemetry JSON cap/peak fields.
   The default test cap is 256 experts; override with

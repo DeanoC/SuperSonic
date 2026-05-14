@@ -1382,11 +1382,17 @@ mod tests {
             &Backend::Metal,
             &GpuArch::AppleM5Max,
         );
+        let qwen36_moe_m5 = lookup(
+            &ModelVariant::Qwen3_6_35B_A3B,
+            &Backend::Metal,
+            &GpuArch::AppleM5Max,
+        );
         assert!(e08b_m5.is_some());
         assert!(e2b_m5.is_some());
         assert!(e4b_m5.is_some());
         assert!(e9b_m5.is_some());
         assert!(qwen3_moe_m5.is_some());
+        assert!(qwen36_moe_m5.is_some());
         assert!(phi4_m5.is_some());
         assert!(gemma_e2b_m5.is_some());
         assert!(gemma_e4b_m5.is_some());
@@ -1412,6 +1418,11 @@ mod tests {
         );
         assert!(
             supported_archs_for(&ModelVariant::Qwen3_30B_A3B, &Backend::Metal)
+                .iter()
+                .any(|arch| arch == "apple-m5-max")
+        );
+        assert!(
+            supported_archs_for(&ModelVariant::Qwen3_6_35B_A3B, &Backend::Metal)
                 .iter()
                 .any(|arch| arch == "apple-m5-max")
         );

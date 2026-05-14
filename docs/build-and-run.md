@@ -258,8 +258,9 @@ Detailed CUDA `sm86` history for both the `0.8B` and `4B` hero lanes lives in
 
 ## Metal
 
-Metal support is currently a Qwen3.5 Apple-silicon lane validated on Apple M4
-and Apple M5 Max.
+Metal support is currently an Apple-silicon lane validated on Apple M4 and
+Apple M5 Max, with Qwen3.5 BF16 coverage and a supported Qwen3.6-35B-A3B INT4
+Apple M5 Max path.
 The core decode path is now O(N) incremental decode — no replay overhead.
 
 Supported Metal scope:
@@ -268,8 +269,8 @@ Supported Metal scope:
 - `qwen3.5-4b`, `qwen3.5-9b` on Apple M5 Max
 - `qwen3-30b-a3b` INT4 on Apple M5 Max is wired through a correctness-first
   chained Metal fallback; a local full-model smoke is still pending
-- `qwen3.6-35b-a3b` INT4 on Apple M5 Max is wired through the chained Metal
-  decode route; a local full-model smoke is still pending
+- `qwen3.6-35b-a3b` INT4 on Apple M5 Max is supported through the
+  correctness-first chained Metal decode route
 - `gemma4-e2b`, `gemma4-e4b` BF16 and INT4 on Apple M5 Max are wired through a
   component Metal decode path; a local model smoke is still pending
 - `phi4-mini` BF16, INT4, and FP8-runtime on Apple M5 Max are wired through a
@@ -294,9 +295,11 @@ Metal currently rejects or defers:
   HIP-only, and a local full-model smoke is still pending.
 - `qwen3.6-35b-a3b` INT4 on Apple M5 Max uses the host-orchestrated chained
   decode route with Metal fallbacks for BF16 full-attention, linear-attention,
-  and FFN stages, plus INT4 sidecars for projection and expert matvecs.
-  FP8-runtime, KV-FP8, speculative decode, persistent decode, and the local
-  full-model smoke are still pending.
+  and FFN stages, plus INT4 sidecars for projection and expert matvecs. The
+  one-token local smoke is:
+  `cargo run --release --bin supersonic -- --backend metal --model qwen3.6-35b-a3b --model-dir /path/to/Qwen3.6-35B-A3B --int4 --prompt "Hello" --max-new-tokens 1 --emit-stage-timings`.
+  FP8-runtime, KV-FP8, speculative decode, and persistent decode remain
+  unsupported on this Metal path.
 - `phi4-mini` INT4 and FP8-runtime are build-checked through the component
   Metal route; KV-FP8 and local model smokes are still pending
 - `gemma4-e2b` and `gemma4-e4b` INT4 are build-checked through the component
