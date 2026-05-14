@@ -153,9 +153,14 @@ pub(crate) fn validate_qwen35_startup(
     } else if backend == Backend::Metal {
         if !matches!(
             model_variant,
-            ModelVariant::Qwen3_5_0_8B | ModelVariant::Qwen3_5_2B
+            ModelVariant::Qwen3_5_0_8B
+                | ModelVariant::Qwen3_5_2B
+                | ModelVariant::Qwen3_5_4B
+                | ModelVariant::Qwen3_5_9B
         ) {
-            anyhow::bail!("Metal only supports --model qwen3.5-0.8b or qwen3.5-2b");
+            anyhow::bail!(
+                "Metal only supports --model qwen3.5-0.8b, qwen3.5-2b, qwen3.5-4b, or qwen3.5-9b"
+            );
         }
         if q4km_like {
             anyhow::bail!("Metal does not support --q4km/--q4km-gptq on Qwen3.5 yet");

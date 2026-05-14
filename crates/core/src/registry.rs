@@ -124,6 +124,7 @@ pub enum GpuArch {
     Sm86,
     Sm90,
     AppleM4,
+    AppleM5Max,
     Unknown(String),
 }
 
@@ -143,6 +144,7 @@ impl GpuArch {
             },
             Backend::Metal => match name.trim() {
                 "apple-m4" => Self::AppleM4,
+                "apple-m5-max" => Self::AppleM5Max,
                 other => Self::Unknown(other.to_owned()),
             },
         }
@@ -158,6 +160,7 @@ impl fmt::Display for GpuArch {
             Self::Sm86 => write!(f, "sm86"),
             Self::Sm90 => write!(f, "sm90"),
             Self::AppleM4 => write!(f, "apple-m4"),
+            Self::AppleM5Max => write!(f, "apple-m5-max"),
             Self::Unknown(s) => write!(f, "{s}"),
         }
     }
@@ -184,7 +187,9 @@ impl ArchProfile {
             GpuArch::Gfx1100 | GpuArch::Gfx942 | GpuArch::Sm86 | GpuArch::Sm90 => {
                 MemoryArchitecture::Discrete
             }
-            GpuArch::Gfx1150 | GpuArch::AppleM4 => MemoryArchitecture::Unified,
+            GpuArch::Gfx1150 | GpuArch::AppleM4 | GpuArch::AppleM5Max => {
+                MemoryArchitecture::Unified
+            }
             GpuArch::Unknown(_) => MemoryArchitecture::Discrete,
         };
         // Per-arch (BufferKind → AllocStrategy) table. `Persistent` always
@@ -607,6 +612,70 @@ static REGISTRY: &[RegistryEntry] = &[
         }),
     },
     RegistryEntry {
+        model: ModelVariant::Qwen3_5_0_8B,
+        backend: Backend::Metal,
+        arch: GpuArch::AppleM5Max,
+        vram: VramBudget {
+            fixed_bytes: 4 * GIB,
+            overhead_factor: 1.1,
+        },
+        params: FamilyParams::Qwen35(Qwen35KernelParams {
+            proj_buf_floats: 8224,
+            attn_scratch_floats: 16384,
+            weight_prefix: "model.language_model",
+            kv_chunk_size: 256,
+            use_4b_kernel: false,
+        }),
+    },
+    RegistryEntry {
+        model: ModelVariant::Qwen3_5_2B,
+        backend: Backend::Metal,
+        arch: GpuArch::AppleM5Max,
+        vram: VramBudget {
+            fixed_bytes: 5 * GIB,
+            overhead_factor: 1.1,
+        },
+        params: FamilyParams::Qwen35(Qwen35KernelParams {
+            proj_buf_floats: 8224,
+            attn_scratch_floats: 16384,
+            weight_prefix: "model.language_model",
+            kv_chunk_size: 256,
+            use_4b_kernel: false,
+        }),
+    },
+    RegistryEntry {
+        model: ModelVariant::Qwen3_5_4B,
+        backend: Backend::Metal,
+        arch: GpuArch::AppleM5Max,
+        vram: VramBudget {
+            fixed_bytes: 10 * GIB,
+            overhead_factor: 1.1,
+        },
+        params: FamilyParams::Qwen35(Qwen35KernelParams {
+            proj_buf_floats: 12352,
+            attn_scratch_floats: 16384,
+            weight_prefix: "model.language_model",
+            kv_chunk_size: 256,
+            use_4b_kernel: false,
+        }),
+    },
+    RegistryEntry {
+        model: ModelVariant::Qwen3_5_9B,
+        backend: Backend::Metal,
+        arch: GpuArch::AppleM5Max,
+        vram: VramBudget {
+            fixed_bytes: 18 * GIB,
+            overhead_factor: 1.1,
+        },
+        params: FamilyParams::Qwen35(Qwen35KernelParams {
+            proj_buf_floats: 12352,
+            attn_scratch_floats: 16384,
+            weight_prefix: "model.language_model",
+            kv_chunk_size: 256,
+            use_4b_kernel: false,
+        }),
+    },
+    RegistryEntry {
         model: ModelVariant::Qwen3_5_4B,
         backend: Backend::Cuda,
         arch: GpuArch::Sm86,
@@ -748,6 +817,32 @@ static REGISTRY: &[RegistryEntry] = &[
             kv_chunk_size: 256,
         }),
     },
+    RegistryEntry {
+        model: ModelVariant::Gemma4_E2B,
+        backend: Backend::Metal,
+        arch: GpuArch::AppleM5Max,
+        vram: VramBudget {
+            fixed_bytes: 11 * GIB,
+            overhead_factor: 1.1,
+        },
+        params: FamilyParams::Gemma4(Gemma4KernelParams {
+            weight_prefix: "model.language_model",
+            kv_chunk_size: 256,
+        }),
+    },
+    RegistryEntry {
+        model: ModelVariant::Gemma4_E4B,
+        backend: Backend::Metal,
+        arch: GpuArch::AppleM5Max,
+        vram: VramBudget {
+            fixed_bytes: 10 * GIB,
+            overhead_factor: 1.1,
+        },
+        params: FamilyParams::Gemma4(Gemma4KernelParams {
+            weight_prefix: "model.language_model",
+            kv_chunk_size: 256,
+        }),
+    },
     // Phi-4-mini: 3.8B dense, full-attention all 32 layers, LongRoPE.
     // BF16 weights ≈ 7.6 GiB; KV cache at 4K ctx ≈ 520 MiB (32 layers × 2 × 8 kv_heads × 128 head_dim × 2 B).
     // Fits gfx1150 with headroom. Weight prefix is bare `model` (Phi stores tensors as `model.*`).
@@ -804,6 +899,19 @@ static REGISTRY: &[RegistryEntry] = &[
         }),
     },
     RegistryEntry {
+        model: ModelVariant::Phi4_Mini,
+        backend: Backend::Metal,
+        arch: GpuArch::AppleM5Max,
+        vram: VramBudget {
+            fixed_bytes: 8 * GIB,
+            overhead_factor: 1.1,
+        },
+        params: FamilyParams::Phi4(Phi4KernelParams {
+            weight_prefix: "model",
+            kv_chunk_size: 256,
+        }),
+    },
+    RegistryEntry {
         model: ModelVariant::Llama3_1_8B,
         backend: Backend::Cuda,
         arch: GpuArch::Sm86,
@@ -842,6 +950,29 @@ static REGISTRY: &[RegistryEntry] = &[
             scratch_floats: 16_384,
         }),
     },
+    RegistryEntry {
+        model: ModelVariant::Qwen3_30B_A3B,
+        backend: Backend::Metal,
+        arch: GpuArch::AppleM5Max,
+        vram: VramBudget {
+            fixed_bytes: 19 * GIB,
+            overhead_factor: 1.1,
+        },
+        params: FamilyParams::Qwen3Moe(Qwen3MoeKernelParams {
+            weight_prefix: "model",
+            kv_chunk_size: 256,
+            hidden_size: 2048,
+            vocab_size: 151_936,
+            num_layers: 48,
+            num_attention_heads: 32,
+            num_kv_heads: 4,
+            head_dim: 128,
+            num_experts: 128,
+            top_k: 8,
+            moe_intermediate_size: 768,
+            scratch_floats: 16_384,
+        }),
+    },
     // Qwen3.6-35B-A3B INT4 GPTQ on AMD gfx1100. Primary AMD v1 target.
     // BF16 won't fit 24 GiB; this entry assumes the INT4 bake. PR 3
     // wires it for the dry-run path; PR 6 lands the kernel.
@@ -851,6 +982,26 @@ static REGISTRY: &[RegistryEntry] = &[
         arch: GpuArch::Gfx1100,
         vram: VramBudget {
             fixed_bytes: 19 * GIB,
+            overhead_factor: 1.1,
+        },
+        params: FamilyParams::Qwen36Moe(Qwen36MoeKernelParams {
+            weight_prefix: "model.language_model",
+            kv_chunk_size: 256,
+            proj_buf_floats: 16_480,
+            attn_scratch_floats: 24_576,
+            moe_scratch_floats: 4_096,
+            num_experts: 256,
+            top_k: 8,
+            moe_intermediate_size: 512,
+            shared_expert_intermediate_size: 512,
+        }),
+    },
+    RegistryEntry {
+        model: ModelVariant::Qwen3_6_35B_A3B,
+        backend: Backend::Metal,
+        arch: GpuArch::AppleM5Max,
+        vram: VramBudget {
+            fixed_bytes: 20 * GIB,
             overhead_factor: 1.1,
         },
         params: FamilyParams::Qwen36Moe(Qwen36MoeKernelParams {
@@ -1145,6 +1296,7 @@ mod tests {
             (Backend::Hip, GpuArch::Gfx1100),
             (Backend::Hip, GpuArch::Gfx942),
             (Backend::Cuda, GpuArch::Sm86),
+            (Backend::Metal, GpuArch::AppleM5Max),
         ] {
             let entry = lookup(&ModelVariant::Qwen3_6_35B_A3B, &backend, &arch)
                 .unwrap_or_else(|| panic!("qwen3.6-35b-a3b {backend} {arch} entry"));
@@ -1170,7 +1322,14 @@ mod tests {
     }
 
     #[test]
-    fn metal_apple_m4_registry_includes_08b_and_2b() {
+    fn metal_apple_silicon_registry_includes_supported_qwen35_models() {
+        assert_eq!(
+            GpuArch::from_backend_name(&Backend::Metal, "apple-m5-max"),
+            GpuArch::AppleM5Max
+        );
+        let profile = ArchProfile::for_arch(&GpuArch::AppleM5Max);
+        assert_eq!(profile.memory, MemoryArchitecture::Unified);
+        assert_eq!(profile.buffer_policy, BufferPolicy::all_default());
         let e08b = lookup(
             &ModelVariant::Qwen3_5_0_8B,
             &Backend::Metal,
@@ -1183,6 +1342,79 @@ mod tests {
         );
         assert!(e08b.is_some());
         assert!(e2b.is_some());
+        let phi4_m5 = lookup(
+            &ModelVariant::Phi4_Mini,
+            &Backend::Metal,
+            &GpuArch::AppleM5Max,
+        );
+        let gemma_e2b_m5 = lookup(
+            &ModelVariant::Gemma4_E2B,
+            &Backend::Metal,
+            &GpuArch::AppleM5Max,
+        );
+        let gemma_e4b_m5 = lookup(
+            &ModelVariant::Gemma4_E4B,
+            &Backend::Metal,
+            &GpuArch::AppleM5Max,
+        );
+        let e08b_m5 = lookup(
+            &ModelVariant::Qwen3_5_0_8B,
+            &Backend::Metal,
+            &GpuArch::AppleM5Max,
+        );
+        let e2b_m5 = lookup(
+            &ModelVariant::Qwen3_5_2B,
+            &Backend::Metal,
+            &GpuArch::AppleM5Max,
+        );
+        let e4b_m5 = lookup(
+            &ModelVariant::Qwen3_5_4B,
+            &Backend::Metal,
+            &GpuArch::AppleM5Max,
+        );
+        let e9b_m5 = lookup(
+            &ModelVariant::Qwen3_5_9B,
+            &Backend::Metal,
+            &GpuArch::AppleM5Max,
+        );
+        let qwen3_moe_m5 = lookup(
+            &ModelVariant::Qwen3_30B_A3B,
+            &Backend::Metal,
+            &GpuArch::AppleM5Max,
+        );
+        assert!(e08b_m5.is_some());
+        assert!(e2b_m5.is_some());
+        assert!(e4b_m5.is_some());
+        assert!(e9b_m5.is_some());
+        assert!(qwen3_moe_m5.is_some());
+        assert!(phi4_m5.is_some());
+        assert!(gemma_e2b_m5.is_some());
+        assert!(gemma_e4b_m5.is_some());
+        assert!(
+            supported_archs_for(&ModelVariant::Qwen3_5_0_8B, &Backend::Metal)
+                .iter()
+                .any(|arch| arch == "apple-m5-max")
+        );
+        assert!(
+            supported_archs_for(&ModelVariant::Phi4_Mini, &Backend::Metal)
+                .iter()
+                .any(|arch| arch == "apple-m5-max")
+        );
+        assert!(
+            supported_archs_for(&ModelVariant::Gemma4_E2B, &Backend::Metal)
+                .iter()
+                .any(|arch| arch == "apple-m5-max")
+        );
+        assert!(
+            supported_archs_for(&ModelVariant::Qwen3_5_4B, &Backend::Metal)
+                .iter()
+                .any(|arch| arch == "apple-m5-max")
+        );
+        assert!(
+            supported_archs_for(&ModelVariant::Qwen3_30B_A3B, &Backend::Metal)
+                .iter()
+                .any(|arch| arch == "apple-m5-max")
+        );
         let p08b = match &e08b.unwrap().params {
             FamilyParams::Qwen35(p) => p,
             _ => panic!("wrong family"),
@@ -1191,7 +1423,22 @@ mod tests {
             FamilyParams::Qwen35(p) => p,
             _ => panic!("wrong family"),
         };
+        let p08b_m5 = match &e08b_m5.unwrap().params {
+            FamilyParams::Qwen35(p) => p,
+            _ => panic!("wrong family"),
+        };
+        let p4b_m5 = match &e4b_m5.unwrap().params {
+            FamilyParams::Qwen35(p) => p,
+            _ => panic!("wrong family"),
+        };
+        let p9b_m5 = match &e9b_m5.unwrap().params {
+            FamilyParams::Qwen35(p) => p,
+            _ => panic!("wrong family"),
+        };
         assert!(!p08b.use_4b_kernel);
         assert!(!p2b.use_4b_kernel);
+        assert!(!p08b_m5.use_4b_kernel);
+        assert!(!p4b_m5.use_4b_kernel);
+        assert!(!p9b_m5.use_4b_kernel);
     }
 }

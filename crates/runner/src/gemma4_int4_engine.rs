@@ -19,10 +19,10 @@
 use std::ffi::{c_int, c_void};
 use std::path::{Path, PathBuf};
 
-use ::gemma4::config::{AttnKind, Config, TextConfig};
-use ::gemma4::weight_spec as g4_spec;
 use anyhow::{anyhow, bail, Context, Result};
-use gpu_hal::{GpuBuffer, ScalarType};
+use gemma4::config::{AttnKind, Config, TextConfig};
+use gemma4::weight_spec as g4_spec;
+use gpu_hal::{Backend, GpuBuffer, ScalarType};
 use half::bf16;
 use kernel_ffi::gemma4 as g4;
 use kernel_ffi::gemma4::{Gemma4BatchSeqDesc, Gemma4DecodeLayerDesc, Gemma4Int4ScaleDesc};
@@ -356,6 +356,29 @@ fn copy_kv_slots_range(
         let dst_ptr = unsafe { (dst.as_mut_ptr() as *mut u8).add(byte_off) as *mut c_void };
         gpu_hal::copy_d2d(device, dst_ptr, src_ptr, bytes)
             .map_err(|e| anyhow!("copy_kv_slots_range: {e}"))?;
+    }
+    Ok(())
+}
+
+fn copy_kv_slots_range_to_compact(
+    device: usize,
+    src: &GpuBuffer,
+    dst: &mut GpuBuffer,
+    num_kv_heads: usize,
+    src_max_t: usize,
+    head_dim: usize,
+    t_start: usize,
+    count: usize,
+) -> Result<()> {
+    let row_bytes = head_dim * 2;
+    for h in 0..num_kv_heads {
+        let src_byte_off = ((h * src_max_t) + t_start) * row_bytes;
+        let dst_byte_off = h * count * row_bytes;
+        let bytes = count * row_bytes;
+        let src_ptr = src.offset_ptr(src_byte_off);
+        let dst_ptr = unsafe { (dst.as_mut_ptr() as *mut u8).add(dst_byte_off) as *mut c_void };
+        gpu_hal::copy_d2d(device, dst_ptr, src_ptr, bytes)
+            .map_err(|e| anyhow!("copy_kv_slots_range_to_compact: {e}"))?;
     }
     Ok(())
 }
@@ -1766,6 +1789,9 @@ impl Gemma4Int4Engine {
     /// (small matmul + norm over the token's row) and the lm-head epilogue
     /// runs after. Returns softcapped logits.
     pub fn decode_step(&mut self, input_token_id: u32, pos: usize) -> Result<Vec<f32>> {
+        if gpu_hal::current_backend() == Backend::Metal {
+            return self.decode_step_primitive(input_token_id, pos);
+        }
         if pos >= self.max_t {
             bail!("decode_step: pos {pos} >= max_t {}", self.max_t);
         }
@@ -2485,22 +2511,94 @@ impl Gemma4Int4Engine {
             let kv_len = pos + 1;
             let mut attn_out = GpuBuffer::zeros(device, dtype, &[num_q_heads, head_dim])?;
             let mut scores = GpuBuffer::zeros(device, ScalarType::F32, &[num_q_heads, max_t])?;
-            g4::swa_attn_decode(
-                device,
-                dtype,
-                &q_normed,
-                &self.k_caches[layer_idx],
-                &self.v_caches[layer_idx],
-                &mut scores,
-                &mut attn_out,
-                num_q_heads,
-                num_kv_heads,
-                head_dim,
-                kv_len,
-                max_t,
-                sliding_window,
-                1.0,
-            )?;
+            if gpu_hal::current_backend() == Backend::Metal {
+                let sliding_window_usize = sliding_window.max(0) as usize;
+                if sliding_window_usize > 0 && kv_len > sliding_window_usize {
+                    let window_start = kv_len - sliding_window_usize;
+                    let mut k_window = GpuBuffer::zeros(
+                        device,
+                        dtype,
+                        &[num_kv_heads, sliding_window_usize, head_dim],
+                    )?;
+                    let mut v_window = GpuBuffer::zeros(
+                        device,
+                        dtype,
+                        &[num_kv_heads, sliding_window_usize, head_dim],
+                    )?;
+                    copy_kv_slots_range_to_compact(
+                        device,
+                        &self.k_caches[layer_idx],
+                        &mut k_window,
+                        num_kv_heads,
+                        max_t,
+                        head_dim,
+                        window_start,
+                        sliding_window_usize,
+                    )?;
+                    copy_kv_slots_range_to_compact(
+                        device,
+                        &self.v_caches[layer_idx],
+                        &mut v_window,
+                        num_kv_heads,
+                        max_t,
+                        head_dim,
+                        window_start,
+                        sliding_window_usize,
+                    )?;
+                    g4::attn_prefill(
+                        device,
+                        dtype,
+                        &q_normed,
+                        &k_window,
+                        &v_window,
+                        &mut scores,
+                        &mut attn_out,
+                        1,
+                        num_q_heads,
+                        num_kv_heads,
+                        head_dim,
+                        sliding_window_usize - 1,
+                        sliding_window_usize,
+                        0,
+                        1.0,
+                    )?;
+                } else {
+                    g4::attn_prefill(
+                        device,
+                        dtype,
+                        &q_normed,
+                        &self.k_caches[layer_idx],
+                        &self.v_caches[layer_idx],
+                        &mut scores,
+                        &mut attn_out,
+                        1,
+                        num_q_heads,
+                        num_kv_heads,
+                        head_dim,
+                        pos,
+                        max_t,
+                        sliding_window,
+                        1.0,
+                    )?;
+                }
+            } else {
+                g4::swa_attn_decode(
+                    device,
+                    dtype,
+                    &q_normed,
+                    &self.k_caches[layer_idx],
+                    &self.v_caches[layer_idx],
+                    &mut scores,
+                    &mut attn_out,
+                    num_q_heads,
+                    num_kv_heads,
+                    head_dim,
+                    kv_len,
+                    max_t,
+                    sliding_window,
+                    1.0,
+                )?;
+            }
 
             let attn_flat = {
                 let bytes = attn_out.to_host_bytes()?;

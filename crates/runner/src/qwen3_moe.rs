@@ -116,8 +116,8 @@ pub(crate) fn run(cli: &Cli, entry: &RegistryEntry, total_vram: u64) -> Result<(
 }
 
 fn validate_policy(cli: &Cli, entry: &RegistryEntry) -> Result<()> {
-    if entry.backend != Backend::Hip {
-        anyhow::bail!("Qwen3-30B-A3B v1 is HIP-only");
+    if !matches!(entry.backend, Backend::Hip | Backend::Metal) {
+        anyhow::bail!("Qwen3-30B-A3B v1 is supported only on HIP and Metal");
     }
     if !cli.int4 {
         anyhow::bail!("Qwen3-30B-A3B v1 requires --int4; BF16 weights do not fit gfx1100 24 GB");
@@ -249,10 +249,14 @@ fn decode_text(
     let mut lm_head_elapsed = std::time::Duration::ZERO;
     let mut sample_elapsed = std::time::Duration::ZERO;
     let mut gen_steps = 0usize;
-    let use_persistent = !cli.no_persistent_decode;
+    let use_persistent = entry.backend != Backend::Metal && !cli.no_persistent_decode;
     if use_persistent {
         eprintln!(
             "[qwen3-moe] persistent decode enabled; pass --no-persistent-decode for chained A/B"
+        );
+    } else if entry.backend == Backend::Metal {
+        eprintln!(
+            "[qwen3-moe] Metal decode uses chained layer fallbacks; persistent decode is HIP-only"
         );
     }
 
@@ -556,7 +560,9 @@ fn qwen3_workspace_floats(text: &qwen3_moe::config::TextConfig, context: usize) 
 }
 
 fn print_decode_phase_profile(step: usize, num_layers: usize, profile: &GpuBuffer) -> Result<()> {
-    let bytes = profile.to_host_bytes().context("d2h Qwen3 decode phase profile")?;
+    let bytes = profile
+        .to_host_bytes()
+        .context("d2h Qwen3 decode phase profile")?;
     let mut phase_totals = [0u64; QWEN3_PROFILE_PHASES];
     let mut layer_totals = vec![0u64; num_layers];
     for (idx, chunk) in bytes.chunks_exact(std::mem::size_of::<u64>()).enumerate() {

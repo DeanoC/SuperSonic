@@ -12,16 +12,67 @@ use std::time::Instant;
 
 use anyhow::{anyhow, bail, Result};
 use gpu_hal::{Backend, GpuBuffer, ScalarType};
-use kernel_ffi::phi4 as phi4_ffi;
+use kernel_ffi::{phi4 as phi4_ffi, prefill_ffi};
 
+use crate::model_files::model_dir_has_raw_safetensors;
 use crate::oracle::OracleOutput;
 use crate::registry::{FamilyParams, ModelVariant, RegistryEntry};
 use crate::{oracle as oracle_mod, should_fetch_exact_bake, try_download_bake, validate};
-use crate::model_files::model_dir_has_raw_safetensors;
 use phi4::config::{load_config, Phi4Config};
 use phi4::rope::Phi4LongRope;
 use phi4::state::Phi4ModelState;
 use phi4::weights::Phi4Weights;
+
+struct Phi4MetalDecodeScratch {
+    input_normed: GpuBuffer,
+    q: GpuBuffer,
+    k: GpuBuffer,
+    v: GpuBuffer,
+    attn_out_f32: GpuBuffer,
+    attn_out_bf16: GpuBuffer,
+    attn_proj: GpuBuffer,
+    post_attn_normed: GpuBuffer,
+    gate: GpuBuffer,
+    up: GpuBuffer,
+    swiglu: GpuBuffer,
+    mlp_out: GpuBuffer,
+}
+
+impl Phi4MetalDecodeScratch {
+    fn new(config: &Phi4Config, ordinal: usize) -> Result<Self> {
+        let hidden = config.hidden_size;
+        let head_dim = config.head_dim();
+        let q_dim = config.num_attention_heads * head_dim;
+        let kv_dim = config.num_key_value_heads * head_dim;
+        let intermediate = config.intermediate_size;
+        Ok(Self {
+            input_normed: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, hidden])
+                .map_err(|e| anyhow!("alloc Phi-4 Metal input_normed: {e}"))?,
+            q: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, q_dim])
+                .map_err(|e| anyhow!("alloc Phi-4 Metal q: {e}"))?,
+            k: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, kv_dim])
+                .map_err(|e| anyhow!("alloc Phi-4 Metal k: {e}"))?,
+            v: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, kv_dim])
+                .map_err(|e| anyhow!("alloc Phi-4 Metal v: {e}"))?,
+            attn_out_f32: GpuBuffer::zeros(ordinal, ScalarType::F32, &[q_dim])
+                .map_err(|e| anyhow!("alloc Phi-4 Metal attn_out_f32: {e}"))?,
+            attn_out_bf16: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, q_dim])
+                .map_err(|e| anyhow!("alloc Phi-4 Metal attn_out_bf16: {e}"))?,
+            attn_proj: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, hidden])
+                .map_err(|e| anyhow!("alloc Phi-4 Metal attn_proj: {e}"))?,
+            post_attn_normed: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, hidden])
+                .map_err(|e| anyhow!("alloc Phi-4 Metal post_attn_normed: {e}"))?,
+            gate: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, intermediate])
+                .map_err(|e| anyhow!("alloc Phi-4 Metal gate: {e}"))?,
+            up: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, intermediate])
+                .map_err(|e| anyhow!("alloc Phi-4 Metal up: {e}"))?,
+            swiglu: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, intermediate])
+                .map_err(|e| anyhow!("alloc Phi-4 Metal swiglu: {e}"))?,
+            mlp_out: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, hidden])
+                .map_err(|e| anyhow!("alloc Phi-4 Metal mlp_out: {e}"))?,
+        })
+    }
+}
 
 fn resolve_phi4_oracle_model_id(
     explicit_model_id: Option<&str>,
@@ -80,6 +131,12 @@ pub fn run_phi4(
     }
     if cli.batch_size != 1 {
         bail!("Phi-4 engine is single-sequence at launch (--batch-size must be 1)");
+    }
+    if entry.backend == Backend::Metal && cli.kv_fp8 {
+        bail!("Phi-4 Metal currently supports BF16 KV cache only; --kv-fp8 is not wired");
+    }
+    if entry.backend == Backend::Metal && cli.teacher_forced {
+        bail!("Phi-4 Metal teacher-forced scoring is not wired yet");
     }
     if cli.oracle_prefill || cli.gpu_validate {
         bail!("Phi-4 engine has no --oracle-prefill / --gpu-validate path yet");
@@ -453,6 +510,11 @@ pub fn run_phi4(
         .map_err(|e| anyhow!("alloc lm_argmax_idxs: {e}"))?;
     let mut lm_argmax_out = GpuBuffer::zeros(ordinal, ScalarType::U32, &[1])
         .map_err(|e| anyhow!("alloc lm_argmax_out: {e}"))?;
+    let mut metal_scratch = if entry.backend == Backend::Metal {
+        Some(Phi4MetalDecodeScratch::new(&config, ordinal)?)
+    } else {
+        None
+    };
 
     let mut hidden_io = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, hidden_size])
         .map_err(|e| anyhow!("alloc hidden_io: {e}"))?;
@@ -664,35 +726,53 @@ pub fn run_phi4(
         // 5. Pick LongRoPE table for this position (short vs long).
         let (cos_table, sin_table) = rope.tables_for_kv_len(pos);
 
-        // 6. Launch persistent decode megakernel.
-        phi4_ffi::persistent_decode(
-            ordinal,
-            ScalarType::BF16,
-            launch_layers,
-            hidden_size,
-            intermediate_size,
-            pos,
-            &desc_device,
-            &mut hidden_io,
-            &mut workspace,
-            &mut sync_buf,
-            cos_table,
-            sin_table,
-            proj_buf_floats,
-            attn_scratch_floats,
-            fp8_scale_device.as_ref(),
-            kv_fp8_desc_device.as_ref(),
-            1,
-            None,
-            int4_scale_device.as_ref(),
-            if debug_dump_layer_trace.is_some() && step == prompt_ids.len() - 1 {
-                layer_trace_buf.as_mut()
-            } else {
-                None
-            },
-            PHI4_TRACE_COMPONENTS,
-        )
-        .map_err(|e| anyhow!("phi4 persistent_decode at step {step}: {e}"))?;
+        // 6. Run the decoder stack. HIP/CUDA use the persistent megakernel;
+        // Metal uses a BF16 component path built from the existing Metal
+        // primitives until a Phi-specific Metal persistent kernel lands.
+        if let Some(scratch) = metal_scratch.as_mut() {
+            phi4_decode_step_metal_bf16(
+                &config,
+                &weights,
+                &mut state,
+                &rope,
+                ordinal,
+                launch_layers,
+                hidden_size,
+                &mut hidden_io,
+                pos,
+                scratch,
+            )
+            .map_err(|e| anyhow!("phi4 Metal component decode at step {step}: {e}"))?;
+        } else {
+            phi4_ffi::persistent_decode(
+                ordinal,
+                ScalarType::BF16,
+                launch_layers,
+                hidden_size,
+                intermediate_size,
+                pos,
+                &desc_device,
+                &mut hidden_io,
+                &mut workspace,
+                &mut sync_buf,
+                cos_table,
+                sin_table,
+                proj_buf_floats,
+                attn_scratch_floats,
+                fp8_scale_device.as_ref(),
+                kv_fp8_desc_device.as_ref(),
+                1,
+                None,
+                int4_scale_device.as_ref(),
+                if debug_dump_layer_trace.is_some() && step == prompt_ids.len() - 1 {
+                    layer_trace_buf.as_mut()
+                } else {
+                    None
+                },
+                PHI4_TRACE_COMPONENTS,
+            )
+            .map_err(|e| anyhow!("phi4 persistent_decode at step {step}: {e}"))?;
+        }
 
         if let (Some(ref path), Some(trace_buf)) =
             (&debug_dump_layer_trace, layer_trace_buf.as_ref())
@@ -1084,6 +1164,332 @@ pub fn run_phi4(
     }
 
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn phi4_decode_step_metal_bf16(
+    config: &Phi4Config,
+    weights: &Phi4Weights,
+    state: &mut Phi4ModelState,
+    rope: &Phi4LongRope,
+    ordinal: usize,
+    launch_layers: usize,
+    hidden_size: usize,
+    hidden_io: &mut GpuBuffer,
+    pos: usize,
+    scratch: &mut Phi4MetalDecodeScratch,
+) -> Result<()> {
+    let head_dim = config.head_dim();
+    let num_heads = config.num_attention_heads;
+    let num_kv_heads = config.num_key_value_heads;
+    let q_dim = num_heads * head_dim;
+    let kv_dim = num_kv_heads * head_dim;
+    let intermediate = config.intermediate_size;
+    let rms_eps = config.rms_norm_eps as f32;
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+    let (cos_table, sin_table) = rope.tables_for_kv_len(pos);
+
+    for layer_idx in 0..launch_layers {
+        let lw = &weights.layers[layer_idx];
+        let ls = &mut state.layers[layer_idx];
+        let kv_cap = ls.kv_capacity();
+        let cache_k = ls
+            .kv_cache_k
+            .as_mut()
+            .ok_or_else(|| anyhow!("Phi-4 Metal layer {layer_idx}: missing K cache"))?;
+        let cache_v = ls
+            .kv_cache_v
+            .as_mut()
+            .ok_or_else(|| anyhow!("Phi-4 Metal layer {layer_idx}: missing V cache"))?;
+
+        prefill_ffi::rms_norm_rows_plain(
+            ordinal,
+            ScalarType::BF16,
+            1,
+            hidden_size,
+            rms_eps,
+            hidden_io,
+            &lw.input_norm_w,
+            &mut scratch.input_normed,
+        )
+        .map_err(|e| anyhow!("layer {layer_idx} input RMSNorm: {e}"))?;
+
+        phi4_metal_matmul_projection(
+            ordinal,
+            weights,
+            q_dim,
+            hidden_size,
+            &scratch.input_normed,
+            &lw.q_proj_w,
+            lw.q_proj_int4_scale.as_ref(),
+            lw.q_proj_int4_zero.as_ref(),
+            lw.q_proj_fp8_scale.as_ref(),
+            &mut scratch.q,
+        )
+        .map_err(|e| anyhow!("layer {layer_idx} q_proj: {e}"))?;
+        phi4_metal_matmul_projection(
+            ordinal,
+            weights,
+            kv_dim,
+            hidden_size,
+            &scratch.input_normed,
+            &lw.k_proj_w,
+            lw.k_proj_int4_scale.as_ref(),
+            lw.k_proj_int4_zero.as_ref(),
+            lw.k_proj_fp8_scale.as_ref(),
+            &mut scratch.k,
+        )
+        .map_err(|e| anyhow!("layer {layer_idx} k_proj: {e}"))?;
+        phi4_metal_matmul_projection(
+            ordinal,
+            weights,
+            kv_dim,
+            hidden_size,
+            &scratch.input_normed,
+            &lw.v_proj_w,
+            lw.v_proj_int4_scale.as_ref(),
+            lw.v_proj_int4_zero.as_ref(),
+            lw.v_proj_fp8_scale.as_ref(),
+            &mut scratch.v,
+        )
+        .map_err(|e| anyhow!("layer {layer_idx} v_proj: {e}"))?;
+
+        prefill_ffi::apply_rope_prefill(
+            ordinal,
+            ScalarType::BF16,
+            1,
+            num_heads,
+            head_dim,
+            config.rotary_dim(),
+            cos_table,
+            sin_table,
+            pos,
+            &mut scratch.q,
+        )
+        .map_err(|e| anyhow!("layer {layer_idx} q RoPE: {e}"))?;
+        prefill_ffi::apply_rope_prefill(
+            ordinal,
+            ScalarType::BF16,
+            1,
+            num_kv_heads,
+            head_dim,
+            config.rotary_dim(),
+            cos_table,
+            sin_table,
+            pos,
+            &mut scratch.k,
+        )
+        .map_err(|e| anyhow!("layer {layer_idx} k RoPE: {e}"))?;
+
+        let elem_bytes = ScalarType::BF16.size_in_bytes();
+        let head_bytes = head_dim * elem_bytes;
+        for h in 0..num_kv_heads {
+            let src_off = h * head_bytes;
+            let dst_off = ((h * kv_cap + pos) * head_dim) * elem_bytes;
+            gpu_hal::copy_d2d(
+                ordinal,
+                cache_k.offset_ptr(dst_off) as *mut c_void,
+                scratch.k.offset_ptr(src_off),
+                head_bytes,
+            )
+            .map_err(|e| anyhow!("layer {layer_idx} append K head {h}: {e}"))?;
+            gpu_hal::copy_d2d(
+                ordinal,
+                cache_v.offset_ptr(dst_off) as *mut c_void,
+                scratch.v.offset_ptr(src_off),
+                head_bytes,
+            )
+            .map_err(|e| anyhow!("layer {layer_idx} append V head {h}: {e}"))?;
+        }
+
+        prefill_ffi::metal_full_attention_decode_bf16_f32(
+            num_heads,
+            num_kv_heads,
+            pos + 1,
+            kv_cap,
+            head_dim,
+            scale,
+            &scratch.q,
+            &*cache_k,
+            &*cache_v,
+            &mut scratch.attn_out_f32,
+        )
+        .map_err(|e| anyhow!("layer {layer_idx} full attention: {e}"))?;
+        prefill_ffi::cast(
+            ordinal,
+            ScalarType::F32,
+            ScalarType::BF16,
+            q_dim,
+            &scratch.attn_out_f32,
+            &mut scratch.attn_out_bf16,
+        )
+        .map_err(|e| anyhow!("layer {layer_idx} attention cast: {e}"))?;
+        phi4_metal_matmul_projection(
+            ordinal,
+            weights,
+            hidden_size,
+            q_dim,
+            &scratch.attn_out_bf16,
+            &lw.o_proj_w,
+            lw.o_proj_int4_scale.as_ref(),
+            lw.o_proj_int4_zero.as_ref(),
+            lw.o_proj_fp8_scale.as_ref(),
+            &mut scratch.attn_proj,
+        )
+        .map_err(|e| anyhow!("layer {layer_idx} o_proj: {e}"))?;
+        prefill_ffi::element_add(
+            ordinal,
+            ScalarType::BF16,
+            hidden_size,
+            hidden_io,
+            &scratch.attn_proj,
+            &mut scratch.mlp_out,
+        )
+        .map_err(|e| anyhow!("layer {layer_idx} attention residual: {e}"))?;
+        gpu_hal::copy_d2d(
+            ordinal,
+            hidden_io.as_mut_ptr(),
+            scratch.mlp_out.as_ptr(),
+            hidden_io.len_bytes(),
+        )
+        .map_err(|e| anyhow!("layer {layer_idx} attention residual copy: {e}"))?;
+
+        prefill_ffi::rms_norm_rows_plain(
+            ordinal,
+            ScalarType::BF16,
+            1,
+            hidden_size,
+            rms_eps,
+            hidden_io,
+            &lw.post_attn_norm_w,
+            &mut scratch.post_attn_normed,
+        )
+        .map_err(|e| anyhow!("layer {layer_idx} post-attn RMSNorm: {e}"))?;
+        phi4_metal_matmul_projection(
+            ordinal,
+            weights,
+            intermediate,
+            hidden_size,
+            &scratch.post_attn_normed,
+            &lw.gate_proj_w,
+            lw.gate_proj_int4_scale.as_ref(),
+            lw.gate_proj_int4_zero.as_ref(),
+            lw.gate_proj_fp8_scale.as_ref(),
+            &mut scratch.gate,
+        )
+        .map_err(|e| anyhow!("layer {layer_idx} gate_proj: {e}"))?;
+        phi4_metal_matmul_projection(
+            ordinal,
+            weights,
+            intermediate,
+            hidden_size,
+            &scratch.post_attn_normed,
+            &lw.up_proj_w,
+            lw.up_proj_int4_scale.as_ref(),
+            lw.up_proj_int4_zero.as_ref(),
+            lw.up_proj_fp8_scale.as_ref(),
+            &mut scratch.up,
+        )
+        .map_err(|e| anyhow!("layer {layer_idx} up_proj: {e}"))?;
+        prefill_ffi::swiglu_mul(
+            ordinal,
+            ScalarType::BF16,
+            intermediate,
+            &scratch.gate,
+            &scratch.up,
+            &mut scratch.swiglu,
+        )
+        .map_err(|e| anyhow!("layer {layer_idx} swiglu: {e}"))?;
+        phi4_metal_matmul_projection(
+            ordinal,
+            weights,
+            hidden_size,
+            intermediate,
+            &scratch.swiglu,
+            &lw.down_proj_w,
+            lw.down_proj_int4_scale.as_ref(),
+            lw.down_proj_int4_zero.as_ref(),
+            lw.down_proj_fp8_scale.as_ref(),
+            &mut scratch.mlp_out,
+        )
+        .map_err(|e| anyhow!("layer {layer_idx} down_proj: {e}"))?;
+        prefill_ffi::element_add(
+            ordinal,
+            ScalarType::BF16,
+            hidden_size,
+            hidden_io,
+            &scratch.mlp_out,
+            &mut scratch.attn_proj,
+        )
+        .map_err(|e| anyhow!("layer {layer_idx} MLP residual: {e}"))?;
+        gpu_hal::copy_d2d(
+            ordinal,
+            hidden_io.as_mut_ptr(),
+            scratch.attn_proj.as_ptr(),
+            hidden_io.len_bytes(),
+        )
+        .map_err(|e| anyhow!("layer {layer_idx} MLP residual copy: {e}"))?;
+    }
+    Ok(())
+}
+
+fn phi4_metal_matmul_projection(
+    ordinal: usize,
+    weights: &Phi4Weights,
+    out_dim: usize,
+    in_dim: usize,
+    input: &GpuBuffer,
+    weight: &GpuBuffer,
+    int4_scale: Option<&GpuBuffer>,
+    int4_zero: Option<&GpuBuffer>,
+    fp8_scale: Option<&GpuBuffer>,
+    output: &mut GpuBuffer,
+) -> Result<()> {
+    if weights.is_int4 {
+        let scale = int4_scale.ok_or_else(|| anyhow!("missing INT4 scale tensor"))?;
+        let zero = int4_zero.ok_or_else(|| anyhow!("missing INT4 zero tensor"))?;
+        Ok(prefill_ffi::matmul_rhs_transposed_int4(
+            ordinal,
+            1,
+            1,
+            out_dim,
+            in_dim,
+            input,
+            weight,
+            scale,
+            zero,
+            None,
+            weights.int4_group_size,
+            4,
+            output,
+        )?)
+    } else if weights.is_fp8 {
+        let scale = fp8_scale.ok_or_else(|| anyhow!("missing FP8 scale tensor"))?;
+        Ok(prefill_ffi::matmul_rhs_transposed_fp8(
+            ordinal,
+            1,
+            1,
+            out_dim,
+            in_dim,
+            input,
+            weight,
+            scale,
+            weights.fp8_block_size,
+            output,
+        )?)
+    } else {
+        Ok(prefill_ffi::matmul_rhs_transposed(
+            ordinal,
+            ScalarType::BF16,
+            1,
+            1,
+            out_dim,
+            in_dim,
+            input,
+            weight,
+            output,
+        )?)
+    }
 }
 
 /// Compute the negative log-likelihood of `target_token` under the distribution
@@ -1515,6 +1921,301 @@ mod oracle_tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod metal_component_tests {
+    use std::sync::Arc;
+
+    use gpu_hal::{set_backend, Backend};
+    use half::bf16;
+    use phi4::config::Phi4Config;
+    use phi4::state::Phi4ModelState;
+    use phi4::weights::{Phi4LayerWeights, Phi4Weights};
+
+    use super::*;
+
+    fn bf16_bytes(values: &[f32]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| bf16::from_f32(*value).to_bits().to_le_bytes())
+            .collect()
+    }
+
+    fn read_bf16(buffer: &GpuBuffer) -> Vec<f32> {
+        let bytes = buffer.to_host_bytes().expect("download bf16 buffer");
+        bytes
+            .chunks_exact(2)
+            .map(|chunk| bf16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])).to_f32())
+            .collect()
+    }
+
+    fn upload(ordinal: usize, shape: &[usize], values: &[f32]) -> GpuBuffer {
+        GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, shape, &bf16_bytes(values))
+            .expect("upload bf16 test tensor")
+    }
+
+    fn fp8_e4m3_byte(value: f32) -> u8 {
+        if value == 0.0 {
+            0x00
+        } else if value == 1.0 {
+            0x38
+        } else {
+            panic!("test FP8 helper only encodes exact 0.0 and 1.0, got {value}");
+        }
+    }
+
+    fn upload_fp8(ordinal: usize, shape: &[usize], values: &[f32]) -> GpuBuffer {
+        let bytes = values
+            .iter()
+            .map(|value| fp8_e4m3_byte(*value))
+            .collect::<Vec<_>>();
+        GpuBuffer::from_host_bytes(ordinal, ScalarType::F8E4M3, shape, &bytes)
+            .expect("upload fp8 test tensor")
+    }
+
+    fn upload_fp8_scale(ordinal: usize) -> GpuBuffer {
+        GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::BF16,
+            &[1, 1],
+            &bf16::from_f32(1.0).to_bits().to_le_bytes(),
+        )
+        .expect("upload fp8 scale")
+    }
+
+    fn identity(size: usize) -> Vec<f32> {
+        let mut values = vec![0.0; size * size];
+        for i in 0..size {
+            values[i * size + i] = 1.0;
+        }
+        values
+    }
+
+    #[test]
+    fn phi4_metal_component_decode_smoke_appends_kv_and_updates_hidden() {
+        set_backend(Backend::Metal);
+        let ordinal = 0usize;
+        let config = Phi4Config {
+            vocab_size: 8,
+            hidden_size: 4,
+            intermediate_size: 4,
+            num_hidden_layers: 1,
+            num_attention_heads: 1,
+            num_key_value_heads: 1,
+            max_position_embeddings: 8,
+            original_max_position_embeddings: 8,
+            rope_theta: 10000.0,
+            partial_rotary_factor: 0.5,
+            rms_norm_eps: 1e-5,
+            tie_word_embeddings: true,
+            rope_scaling: None,
+            eos_token_id: None,
+            bos_token_id: None,
+        };
+        let hidden = config.hidden_size;
+        let intermediate = config.intermediate_size;
+        let ident = identity(hidden);
+        let ones = vec![1.0; hidden];
+        let zeros = vec![0.0; hidden * hidden];
+        let layer = Phi4LayerWeights {
+            input_norm_w: upload(ordinal, &[hidden], &ones),
+            post_attn_norm_w: upload(ordinal, &[hidden], &ones),
+            q_proj_w: upload(ordinal, &[hidden, hidden], &ident),
+            k_proj_w: upload(ordinal, &[hidden, hidden], &ident),
+            v_proj_w: upload(ordinal, &[hidden, hidden], &ident),
+            o_proj_w: upload(ordinal, &[hidden, hidden], &ident),
+            gate_proj_w: upload(ordinal, &[intermediate, hidden], &zeros),
+            up_proj_w: upload(ordinal, &[intermediate, hidden], &zeros),
+            down_proj_w: upload(ordinal, &[hidden, intermediate], &zeros),
+            q_proj_int4_scale: None,
+            q_proj_int4_zero: None,
+            k_proj_int4_scale: None,
+            k_proj_int4_zero: None,
+            v_proj_int4_scale: None,
+            v_proj_int4_zero: None,
+            o_proj_int4_scale: None,
+            o_proj_int4_zero: None,
+            gate_proj_int4_scale: None,
+            gate_proj_int4_zero: None,
+            up_proj_int4_scale: None,
+            up_proj_int4_zero: None,
+            down_proj_int4_scale: None,
+            down_proj_int4_zero: None,
+            q_proj_fp8_scale: None,
+            k_proj_fp8_scale: None,
+            v_proj_fp8_scale: None,
+            o_proj_fp8_scale: None,
+            gate_proj_fp8_scale: None,
+            up_proj_fp8_scale: None,
+            down_proj_fp8_scale: None,
+        };
+        let dummy = Arc::new(upload(
+            ordinal,
+            &[config.vocab_size, hidden],
+            &vec![0.0; 8 * hidden],
+        ));
+        let weights = Phi4Weights {
+            config: config.clone(),
+            embed_tokens: dummy.clone(),
+            lm_head: dummy,
+            norm_weight: upload(ordinal, &[hidden], &ones),
+            layers: vec![layer],
+            is_int4: false,
+            int4_group_size: 0,
+            is_fp8: false,
+            fp8_block_size: 0,
+        };
+        let rope = Phi4LongRope::build(&config, ordinal).expect("build tiny Phi-4 rope");
+        let mut state = Phi4ModelState::new(&config);
+        state.layers[0]
+            .ensure_kv_capacity(0, ordinal, &config, 4, false)
+            .expect("alloc tiny KV");
+        let mut hidden_io = upload(ordinal, &[1, hidden], &[1.0, 0.5, -0.25, 0.125]);
+        let before = read_bf16(&hidden_io);
+        let mut scratch = Phi4MetalDecodeScratch::new(&config, ordinal).expect("alloc scratch");
+
+        phi4_decode_step_metal_bf16(
+            &config,
+            &weights,
+            &mut state,
+            &rope,
+            ordinal,
+            1,
+            hidden,
+            &mut hidden_io,
+            0,
+            &mut scratch,
+        )
+        .expect("run Phi-4 Metal component decode");
+
+        let after = read_bf16(&hidden_io);
+        assert!(after.iter().all(|v| v.is_finite()));
+        assert!(
+            after
+                .iter()
+                .zip(before.iter())
+                .any(|(a, b)| (a - b).abs() > 0.01),
+            "component decode should update hidden state: before={before:?} after={after:?}"
+        );
+        let cache_k = state.layers[0]
+            .kv_cache_k
+            .as_ref()
+            .expect("K cache after decode");
+        let cache = read_bf16(cache_k);
+        assert!(
+            cache.iter().take(hidden).any(|v| v.abs() > 0.01),
+            "component decode should append non-zero K cache, cache={cache:?}"
+        );
+    }
+
+    #[test]
+    fn phi4_metal_component_decode_accepts_fp8_projection_weights() {
+        set_backend(Backend::Metal);
+        let ordinal = 0usize;
+        let config = Phi4Config {
+            vocab_size: 8,
+            hidden_size: 4,
+            intermediate_size: 4,
+            num_hidden_layers: 1,
+            num_attention_heads: 1,
+            num_key_value_heads: 1,
+            max_position_embeddings: 8,
+            original_max_position_embeddings: 8,
+            rope_theta: 10000.0,
+            partial_rotary_factor: 0.5,
+            rms_norm_eps: 1e-5,
+            tie_word_embeddings: true,
+            rope_scaling: None,
+            eos_token_id: None,
+            bos_token_id: None,
+        };
+        let hidden = config.hidden_size;
+        let intermediate = config.intermediate_size;
+        let ident = identity(hidden);
+        let ones = vec![1.0; hidden];
+        let zeros = vec![0.0; hidden * hidden];
+        let layer = Phi4LayerWeights {
+            input_norm_w: upload(ordinal, &[hidden], &ones),
+            post_attn_norm_w: upload(ordinal, &[hidden], &ones),
+            q_proj_w: upload_fp8(ordinal, &[hidden, hidden], &ident),
+            k_proj_w: upload_fp8(ordinal, &[hidden, hidden], &ident),
+            v_proj_w: upload_fp8(ordinal, &[hidden, hidden], &ident),
+            o_proj_w: upload_fp8(ordinal, &[hidden, hidden], &ident),
+            gate_proj_w: upload_fp8(ordinal, &[intermediate, hidden], &zeros),
+            up_proj_w: upload_fp8(ordinal, &[intermediate, hidden], &zeros),
+            down_proj_w: upload_fp8(ordinal, &[hidden, intermediate], &zeros),
+            q_proj_int4_scale: None,
+            q_proj_int4_zero: None,
+            k_proj_int4_scale: None,
+            k_proj_int4_zero: None,
+            v_proj_int4_scale: None,
+            v_proj_int4_zero: None,
+            o_proj_int4_scale: None,
+            o_proj_int4_zero: None,
+            gate_proj_int4_scale: None,
+            gate_proj_int4_zero: None,
+            up_proj_int4_scale: None,
+            up_proj_int4_zero: None,
+            down_proj_int4_scale: None,
+            down_proj_int4_zero: None,
+            q_proj_fp8_scale: Some(upload_fp8_scale(ordinal)),
+            k_proj_fp8_scale: Some(upload_fp8_scale(ordinal)),
+            v_proj_fp8_scale: Some(upload_fp8_scale(ordinal)),
+            o_proj_fp8_scale: Some(upload_fp8_scale(ordinal)),
+            gate_proj_fp8_scale: Some(upload_fp8_scale(ordinal)),
+            up_proj_fp8_scale: Some(upload_fp8_scale(ordinal)),
+            down_proj_fp8_scale: Some(upload_fp8_scale(ordinal)),
+        };
+        let dummy = Arc::new(upload(
+            ordinal,
+            &[config.vocab_size, hidden],
+            &vec![0.0; 8 * hidden],
+        ));
+        let weights = Phi4Weights {
+            config: config.clone(),
+            embed_tokens: dummy.clone(),
+            lm_head: dummy,
+            norm_weight: upload(ordinal, &[hidden], &ones),
+            layers: vec![layer],
+            is_int4: false,
+            int4_group_size: 0,
+            is_fp8: true,
+            fp8_block_size: 128,
+        };
+        let rope = Phi4LongRope::build(&config, ordinal).expect("build tiny Phi-4 rope");
+        let mut state = Phi4ModelState::new(&config);
+        state.layers[0]
+            .ensure_kv_capacity(0, ordinal, &config, 4, false)
+            .expect("alloc tiny KV");
+        let mut hidden_io = upload(ordinal, &[1, hidden], &[1.0, 0.5, -0.25, 0.125]);
+        let before = read_bf16(&hidden_io);
+        let mut scratch = Phi4MetalDecodeScratch::new(&config, ordinal).expect("alloc scratch");
+
+        phi4_decode_step_metal_bf16(
+            &config,
+            &weights,
+            &mut state,
+            &rope,
+            ordinal,
+            1,
+            hidden,
+            &mut hidden_io,
+            0,
+            &mut scratch,
+        )
+        .expect("run Phi-4 Metal FP8 component decode");
+
+        let after = read_bf16(&hidden_io);
+        assert!(after.iter().all(|v| v.is_finite()));
+        assert!(
+            after
+                .iter()
+                .zip(before.iter())
+                .any(|(a, b)| (a - b).abs() > 0.01),
+            "FP8 component decode should update hidden state: before={before:?} after={after:?}"
+        );
     }
 }
 

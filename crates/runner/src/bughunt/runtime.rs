@@ -39,14 +39,19 @@ impl QwenBughuntRuntime {
         backend_choice: BackendArg,
         ordinal: usize,
         oracle_device_spec: &str,
+        allow_untested_gpu: Option<&str>,
     ) -> Result<Self> {
         let backend = backend_runtime::resolve_backend(backend_choice.into(), ordinal)?;
         gpu_hal::set_backend(backend);
 
         let gpu = backend_runtime::query_gpu_info(backend, ordinal)?;
         let model_variant = ModelVariant::Qwen3_5_0_8B;
-        let entry =
-            backend_runtime::lookup_registry_entry(&model_variant, backend, &gpu.gpu_arch, None)?;
+        let entry = backend_runtime::lookup_registry_entry(
+            &model_variant,
+            backend,
+            &gpu.gpu_arch,
+            allow_untested_gpu,
+        )?;
         let params = match entry.params {
             FamilyParams::Qwen35(params) => params,
             _ => bail!("bughunt harness only supports Qwen3.5"),

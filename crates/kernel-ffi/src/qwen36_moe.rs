@@ -1290,9 +1290,11 @@ pub fn attn_step_launch(
             params.stage
         )));
     }
-    // All five stages are wired through PR 4b2 step 5.
-
     let backend = output.backend();
+    if backend == Backend::Metal {
+        return attn_step_stage1_5_metal_host(params, weights, int4, output, workspace);
+    }
+
     let counters = sync_buf.as_mut_ptr() as *mut c_uint;
     // Layout: 16 u32 work-stealing counter slots at +0..+63 (the FFN
     // concurrent-experts dispatch uses 2*K_top of these; attn/linear/stub
@@ -1353,9 +1355,7 @@ pub fn attn_step_launch(
             }
         }
         Backend::Metal => {
-            return Err(GpuError::InvalidArg(
-                "qwen36_moe::attn_step_launch: Metal backend not yet wired".into(),
-            ));
+            unreachable!("Metal attn_step handled above");
         }
     };
     if status != 0 {
@@ -1364,6 +1364,389 @@ pub fn attn_step_launch(
             format!("qwen36_moe attn_step launch failed with status {status}"),
         ));
     }
+    Ok(())
+}
+
+fn attn_step_stage1_5_metal_host(
+    params: Qwen36MoeAttnStepParams,
+    weights: &Qwen36MoeAttnStepWeights,
+    int4: &Qwen36MoeAttnStepInt4,
+    output: &mut GpuBuffer,
+    workspace: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if output.dtype() != ScalarType::BF16 || workspace.dtype() != ScalarType::F32 {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::attn_step_launch: Metal stage1-5 expects BF16/F32 \
+             output buffers, got {:?}/{:?}",
+            output.dtype(),
+            workspace.dtype(),
+        )));
+    }
+    if int4.group_size < 0 {
+        return Err(GpuError::InvalidArg(
+            "qwen36_moe::attn_step_launch: Metal stage1-5 does not yet support FP8 sidecars".into(),
+        ));
+    }
+    if weights.input_hidden.is_null()
+        || weights.input_norm_w.is_null()
+        || weights.q_proj_w.is_null()
+        || weights.q_norm_w.is_null()
+    {
+        return Err(GpuError::InvalidArg(
+            "qwen36_moe::attn_step_launch: Metal stage1 requires input_hidden, \
+             input_norm_w, q_proj_w, and q_norm_w"
+                .into(),
+        ));
+    }
+    if params.stage >= 2
+        && (weights.k_proj_w.is_null() || weights.v_proj_w.is_null() || weights.k_norm_w.is_null())
+    {
+        return Err(GpuError::InvalidArg(
+            "qwen36_moe::attn_step_launch: Metal stage2 requires k_proj_w, \
+             v_proj_w, and k_norm_w"
+                .into(),
+        ));
+    }
+    if params.stage >= 3 && (params.rotary_dim < 0 || params.rotary_dim > params.head_dim) {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::attn_step_launch: Metal stage{} invalid rotary_dim {} for head_dim {}",
+            params.stage, params.rotary_dim, params.head_dim
+        )));
+    }
+    if params.stage >= 4 {
+        let cache_k_set = !weights.kv_cache_k.is_null();
+        let cache_v_set = !weights.kv_cache_v.is_null();
+        if cache_k_set != cache_v_set {
+            return Err(GpuError::InvalidArg(
+                "qwen36_moe::attn_step_launch: Metal stage4 requires paired KV cache pointers"
+                    .into(),
+            ));
+        }
+        if cache_k_set {
+            let eff_cache_pos = if params.cache_pos >= 0 {
+                params.cache_pos
+            } else {
+                params.position
+            };
+            if eff_cache_pos < 0 || weights.kv_max_t <= eff_cache_pos {
+                return Err(GpuError::InvalidArg(format!(
+                    "qwen36_moe::attn_step_launch: Metal stage{} invalid cache_pos {} for kv_max_t {}",
+                    params.stage, eff_cache_pos, weights.kv_max_t
+                )));
+            }
+        }
+    }
+    if params.stage >= 5 && weights.o_proj_w.is_null() {
+        return Err(GpuError::InvalidArg(
+            "qwen36_moe::attn_step_launch: Metal stage5 requires o_proj_w".into(),
+        ));
+    }
+
+    let hidden = params.hidden as usize;
+    let num_heads = params.num_heads as usize;
+    let num_kv_heads = params.num_kv_heads as usize;
+    let head_dim = params.head_dim as usize;
+    if hidden == 0 || num_heads == 0 || num_kv_heads == 0 || head_dim == 0 {
+        return Err(GpuError::InvalidArg(
+            "qwen36_moe::attn_step_launch: Metal stage1-5 requires non-zero geometry".into(),
+        ));
+    }
+    if params.stage >= 4 && num_heads % num_kv_heads != 0 {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::attn_step_launch: Metal stage{} requires num_heads divisible by num_kv_heads",
+            params.stage
+        )));
+    }
+
+    let q_out_dim = 2 * num_heads * head_dim;
+    let q_normed_dim = num_heads * head_dim;
+    let kv_dim = num_kv_heads * head_dim;
+    let off_q_raw = 0usize;
+    let off_k_raw = q_out_dim;
+    let off_v_raw = off_k_raw + kv_dim;
+    let off_q_normed = off_v_raw + kv_dim;
+    let off_k_normed = off_q_normed + q_normed_dim;
+    let off_q_rot = off_k_normed + kv_dim;
+    let off_k_rot = off_q_rot + q_normed_dim;
+    let off_attn = 4 * num_heads * head_dim + 4 * num_kv_heads * head_dim;
+    let off_gated = off_attn + q_normed_dim;
+    let off_o_out = off_gated + q_normed_dim;
+    let cache_k_set = !weights.kv_cache_k.is_null();
+    let eff_cache_pos = if params.cache_pos >= 0 {
+        params.cache_pos as usize
+    } else {
+        params.position.max(0) as usize
+    };
+    let kv_len = if cache_k_set { eff_cache_pos + 1 } else { 1 };
+    let output_len = if params.stage == 2 {
+        kv_dim
+    } else if params.stage == 3 {
+        q_normed_dim + kv_dim
+    } else if params.stage == 5 {
+        hidden
+    } else {
+        q_normed_dim
+    };
+    let workspace_len = if params.stage >= 5 {
+        off_o_out + hidden
+    } else if params.stage >= 4 {
+        off_attn + q_normed_dim
+    } else if params.stage >= 3 {
+        off_k_rot + kv_dim
+    } else if params.stage >= 2 {
+        off_k_normed + kv_dim
+    } else {
+        off_q_normed + q_normed_dim
+    };
+    let workspace_elems = workspace.shape().iter().product::<usize>();
+    let output_elems = output.shape().iter().product::<usize>();
+    if workspace_elems < workspace_len {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::attn_step_launch: Metal stage{} workspace too small: need {}, got {}",
+            params.stage, workspace_len, workspace_elems
+        )));
+    }
+    if output_elems < output_len {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::attn_step_launch: Metal stage{} output too small: need {}, got {}",
+            params.stage, output_len, output_elems
+        )));
+    }
+
+    let input = unsafe { std::slice::from_raw_parts(weights.input_hidden as *const u16, hidden) };
+    let input_norm_w =
+        unsafe { std::slice::from_raw_parts(weights.input_norm_w as *const u16, hidden) };
+    let q_norm_w = unsafe { std::slice::from_raw_parts(weights.q_norm_w as *const u16, head_dim) };
+    let output =
+        unsafe { std::slice::from_raw_parts_mut(output.as_mut_ptr() as *mut u16, output_len) };
+    let workspace = unsafe {
+        std::slice::from_raw_parts_mut(workspace.as_mut_ptr() as *mut f32, workspace_len)
+    };
+
+    let mut mean_sq = 0.0f32;
+    for &bits in input {
+        let v = bf16_bits_to_f32(bits);
+        mean_sq += v * v;
+    }
+    let inv_rms = 1.0f32 / (mean_sq / hidden as f32 + params.rms_norm_eps).sqrt();
+    let mut x_norm = vec![0.0f32; hidden];
+    for col in 0..hidden {
+        let v = bf16_bits_to_f32(input[col]);
+        let w = bf16_bits_to_f32(input_norm_w[col]);
+        x_norm[col] = bf16_round_f32(v * inv_rms * (1.0 + w));
+    }
+
+    for row in 0..q_out_dim {
+        let acc = qwen36_dense_or_int4_dot_2d(
+            weights.q_proj_w,
+            int4.q_proj_scale,
+            int4.q_proj_zero,
+            row,
+            hidden,
+            int4.group_size,
+            &x_norm,
+        )?;
+        workspace[off_q_raw + row] = bf16_round_f32(acc);
+    }
+
+    for head in 0..num_heads {
+        let q_in_base = head * 2 * head_dim;
+        let q_out_base = head * head_dim;
+        let mut mean_sq = 0.0f32;
+        for i in 0..head_dim {
+            let v = workspace[off_q_raw + q_in_base + i];
+            mean_sq += v * v;
+        }
+        let inv_head = 1.0f32 / (mean_sq / head_dim as f32 + params.rms_norm_eps).sqrt();
+        for i in 0..head_dim {
+            let v = workspace[off_q_raw + q_in_base + i];
+            let w = bf16_bits_to_f32(q_norm_w[i]);
+            let normed = bf16_round_f32(v * inv_head * (1.0 + w));
+            workspace[off_q_normed + q_out_base + i] = normed;
+            if params.stage == 1 {
+                output[q_out_base + i] = f32_to_bf16_bits(normed);
+            }
+        }
+    }
+
+    if params.stage == 1 {
+        return Ok(());
+    }
+
+    let k_norm_w = unsafe { std::slice::from_raw_parts(weights.k_norm_w as *const u16, head_dim) };
+
+    for row in 0..kv_dim {
+        let k_acc = qwen36_dense_or_int4_dot_2d(
+            weights.k_proj_w,
+            int4.k_proj_scale,
+            int4.k_proj_zero,
+            row,
+            hidden,
+            int4.group_size,
+            &x_norm,
+        )?;
+        let v_acc = qwen36_dense_or_int4_dot_2d(
+            weights.v_proj_w,
+            int4.v_proj_scale,
+            int4.v_proj_zero,
+            row,
+            hidden,
+            int4.group_size,
+            &x_norm,
+        )?;
+        workspace[off_k_raw + row] = bf16_round_f32(k_acc);
+        workspace[off_v_raw + row] = bf16_round_f32(v_acc);
+    }
+
+    for head in 0..num_kv_heads {
+        let base = head * head_dim;
+        let mut mean_sq = 0.0f32;
+        for i in 0..head_dim {
+            let v = workspace[off_k_raw + base + i];
+            mean_sq += v * v;
+        }
+        let inv_head = 1.0f32 / (mean_sq / head_dim as f32 + params.rms_norm_eps).sqrt();
+        for i in 0..head_dim {
+            let v = workspace[off_k_raw + base + i];
+            let w = bf16_bits_to_f32(k_norm_w[i]);
+            let normed = bf16_round_f32(v * inv_head * (1.0 + w));
+            workspace[off_k_normed + base + i] = normed;
+            if params.stage == 2 {
+                output[base + i] = f32_to_bf16_bits(normed);
+            }
+        }
+    }
+
+    if params.stage == 2 {
+        return Ok(());
+    }
+
+    let rotary_dim = params.rotary_dim as usize;
+    let half_rotary = rotary_dim / 2;
+    let theta_log = params.rope_theta.ln();
+    for head_idx in 0..(num_heads + num_kv_heads) {
+        let is_k = head_idx >= num_heads;
+        let head = if is_k { head_idx - num_heads } else { head_idx };
+        let src_off = if is_k { off_k_normed } else { off_q_normed };
+        let dst_off = if is_k { off_k_rot } else { off_q_rot };
+        let pub_off = head_idx * head_dim;
+        for i in 0..half_rotary {
+            let a = workspace[src_off + head * head_dim + i];
+            let b = workspace[src_off + head * head_dim + half_rotary + i];
+            let exponent = (i as f32 / half_rotary as f32) * theta_log;
+            let freq = params.position as f32 * (-exponent).exp();
+            let c = bf16_round_f32(freq.cos());
+            let s = bf16_round_f32(freq.sin());
+            let rot_a = bf16_round_f32(bf16_round_f32(a * c) - bf16_round_f32(b * s));
+            let rot_b = bf16_round_f32(bf16_round_f32(b * c) + bf16_round_f32(a * s));
+            workspace[dst_off + head * head_dim + i] = rot_a;
+            workspace[dst_off + head * head_dim + half_rotary + i] = rot_b;
+            if params.stage == 3 {
+                output[pub_off + i] = f32_to_bf16_bits(rot_a);
+                output[pub_off + half_rotary + i] = f32_to_bf16_bits(rot_b);
+            }
+        }
+        for i in rotary_dim..head_dim {
+            let x = workspace[src_off + head * head_dim + i];
+            workspace[dst_off + head * head_dim + i] = x;
+            if params.stage == 3 {
+                output[pub_off + i] = f32_to_bf16_bits(x);
+            }
+        }
+    }
+
+    if params.stage == 3 {
+        return Ok(());
+    }
+
+    let rep = num_heads / num_kv_heads;
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+    if cache_k_set {
+        let cache_elems = weights.kv_max_t as usize * kv_dim;
+        let cache_k =
+            unsafe { std::slice::from_raw_parts_mut(weights.kv_cache_k as *mut u16, cache_elems) };
+        let cache_v =
+            unsafe { std::slice::from_raw_parts_mut(weights.kv_cache_v as *mut u16, cache_elems) };
+        let slot_base = eff_cache_pos * kv_dim;
+        for idx in 0..kv_dim {
+            cache_k[slot_base + idx] = f32_to_bf16_bits(workspace[off_k_rot + idx]);
+            cache_v[slot_base + idx] = f32_to_bf16_bits(workspace[off_v_raw + idx]);
+        }
+        for hq in 0..num_heads {
+            let h_kv = hq / rep;
+            let mut scores = vec![0.0f32; kv_len];
+            let mut max_score = f32::NEG_INFINITY;
+            for t in 0..kv_len {
+                let mut dot = 0.0f32;
+                let kv_base = t * kv_dim + h_kv * head_dim;
+                for i in 0..head_dim {
+                    dot += workspace[off_q_rot + hq * head_dim + i]
+                        * bf16_bits_to_f32(cache_k[kv_base + i]);
+                }
+                let score = dot * scale;
+                scores[t] = score;
+                max_score = max_score.max(score);
+            }
+            let mut denom = 0.0f32;
+            for score in scores.iter_mut() {
+                *score = (*score - max_score).exp();
+                denom += *score;
+            }
+            for i in 0..head_dim {
+                let mut acc = 0.0f32;
+                for t in 0..kv_len {
+                    let kv_base = t * kv_dim + h_kv * head_dim;
+                    acc += (scores[t] / denom) * bf16_bits_to_f32(cache_v[kv_base + i]);
+                }
+                workspace[off_attn + hq * head_dim + i] = acc;
+                if params.stage == 4 {
+                    output[hq * head_dim + i] = f32_to_bf16_bits(acc);
+                }
+            }
+        }
+    } else {
+        for hq in 0..num_heads {
+            let h_kv = hq / rep;
+            for i in 0..head_dim {
+                let v = workspace[off_v_raw + h_kv * head_dim + i];
+                workspace[off_attn + hq * head_dim + i] = v;
+                if params.stage == 4 {
+                    output[hq * head_dim + i] = f32_to_bf16_bits(v);
+                }
+            }
+        }
+    }
+
+    if params.stage == 4 {
+        return Ok(());
+    }
+
+    for head in 0..num_heads {
+        for i in 0..head_dim {
+            let out_gate = workspace[off_q_raw + head * 2 * head_dim + head_dim + i];
+            let attn_v = workspace[off_attn + head * head_dim + i];
+            let sig = 1.0f32 / (1.0f32 + (-out_gate).exp());
+            let gated = bf16_round_f32(bf16_round_f32(sig) * attn_v);
+            workspace[off_gated + head * head_dim + i] = gated;
+        }
+    }
+
+    for row in 0..hidden {
+        let acc = qwen36_dense_or_int4_dot_2d(
+            weights.o_proj_w,
+            int4.o_proj_scale,
+            int4.o_proj_zero,
+            row,
+            q_normed_dim,
+            int4.group_size,
+            &workspace[off_gated..off_gated + q_normed_dim],
+        )?;
+        let o_out = bf16_round_f32(acc);
+        let result = bf16_round_f32(bf16_bits_to_f32(input[row]) + o_out);
+        workspace[off_o_out + row] = result;
+        output[row] = f32_to_bf16_bits(result);
+    }
+
     Ok(())
 }
 
@@ -1468,6 +1851,15 @@ pub fn linear_step_launch(
     // All five stages are wired through PR 4b3 step 6.
 
     let backend = output.backend();
+    if backend == Backend::Metal {
+        if params.stage <= 5 {
+            return linear_step_stage1_5_metal_host(params, weights, int4, output, workspace);
+        }
+        return Err(GpuError::InvalidArg(
+            "qwen36_moe::linear_step_launch: Metal backend is wired for stages 1-5 only".into(),
+        ));
+    }
+
     let counters = sync_buf.as_mut_ptr() as *mut c_uint;
     // Layout: 16 u32 work-stealing counter slots at +0..+63 (the FFN
     // concurrent-experts dispatch uses 2*K_top of these; attn/linear/stub
@@ -1527,9 +1919,7 @@ pub fn linear_step_launch(
             }
         }
         Backend::Metal => {
-            return Err(GpuError::InvalidArg(
-                "qwen36_moe::linear_step_launch: Metal backend not yet wired".into(),
-            ));
+            unreachable!("Metal linear_step handled above");
         }
     };
     if status != 0 {
@@ -1538,6 +1928,408 @@ pub fn linear_step_launch(
             format!("qwen36_moe linear_step launch failed with status {status}"),
         ));
     }
+    Ok(())
+}
+
+fn linear_step_stage1_5_metal_host(
+    params: Qwen36MoeLinearStepParams,
+    weights: &Qwen36MoeLinearStepWeights,
+    int4: &Qwen36MoeLinearStepInt4,
+    output: &mut GpuBuffer,
+    workspace: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if output.dtype() != ScalarType::BF16 || workspace.dtype() != ScalarType::F32 {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::linear_step_launch: Metal stage1-5 expects BF16/F32 \
+             output buffers, got {:?}/{:?}",
+            output.dtype(),
+            workspace.dtype(),
+        )));
+    }
+    if int4.group_size < 0 {
+        return Err(GpuError::InvalidArg(
+            "qwen36_moe::linear_step_launch: Metal stage1-5 does not yet support FP8 sidecars"
+                .into(),
+        ));
+    }
+    if weights.input_hidden.is_null()
+        || weights.input_norm_w.is_null()
+        || weights.in_proj_qkv_w.is_null()
+        || weights.in_proj_z_w.is_null()
+        || weights.in_proj_a_w.is_null()
+        || weights.in_proj_b_w.is_null()
+    {
+        return Err(GpuError::InvalidArg(
+            "qwen36_moe::linear_step_launch: Metal stage1-5 requires input_hidden, \
+             input_norm_w, in_proj_qkv_w, in_proj_z_w, in_proj_a_w, and in_proj_b_w"
+                .into(),
+        ));
+    }
+
+    let hidden = params.hidden as usize;
+    let num_k_heads = params.num_k_heads as usize;
+    let num_v_heads = params.num_v_heads as usize;
+    let head_k_dim = params.head_k_dim as usize;
+    let head_v_dim = params.head_v_dim as usize;
+
+    if params.stage >= 2
+        && (weights.conv1d_w.is_null()
+            || weights.conv_state.is_null()
+            || params.conv_kernel_dim < 1)
+    {
+        return Err(GpuError::InvalidArg(
+            "qwen36_moe::linear_step_launch: Metal stage2 requires conv1d_w, \
+             conv_state, and conv_kernel_dim >= 1"
+                .into(),
+        ));
+    }
+    if params.stage >= 3 && num_v_heads % num_k_heads != 0 {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::linear_step_launch: Metal stage{} requires num_v_heads \
+             divisible by num_k_heads, got {num_v_heads}/{num_k_heads}",
+            params.stage
+        )));
+    }
+    if params.stage == 4
+        && (weights.dt_bias.is_null()
+            || weights.a_log.is_null()
+            || weights.recurrent_state.is_null())
+    {
+        return Err(GpuError::InvalidArg(
+            "qwen36_moe::linear_step_launch: Metal stage4 requires dt_bias, \
+             a_log, and recurrent_state"
+                .into(),
+        ));
+    }
+    if params.stage == 5
+        && (weights.dt_bias.is_null()
+            || weights.a_log.is_null()
+            || weights.norm_w.is_null()
+            || weights.out_proj_w.is_null()
+            || weights.recurrent_state.is_null())
+    {
+        return Err(GpuError::InvalidArg(
+            "qwen36_moe::linear_step_launch: Metal stage5 requires dt_bias, \
+             a_log, norm_w, out_proj_w, and recurrent_state"
+                .into(),
+        ));
+    }
+
+    let key_dim = num_k_heads * head_k_dim;
+    let val_dim = num_v_heads * head_v_dim;
+    let qkv_dim = 2 * key_dim + val_dim;
+    let total_rows = qkv_dim + val_dim + 2 * num_v_heads;
+    let off_qkv_raw = 0usize;
+    let off_z_raw = qkv_dim;
+    let off_a_raw = qkv_dim + val_dim;
+    let off_b_raw = qkv_dim + val_dim + num_v_heads;
+    let off_q_normed = total_rows;
+    let off_k_normed = off_q_normed + key_dim;
+    let off_q_rep = off_k_normed + key_dim;
+    let off_k_rep = off_q_rep + num_v_heads * head_k_dim;
+    let stage3_workspace_len = off_k_rep + num_v_heads * head_k_dim;
+    let off_beta = stage3_workspace_len;
+    let off_g = off_beta + num_v_heads;
+    let off_rec_out = off_g + num_v_heads;
+    let stage4_workspace_len = off_rec_out + val_dim;
+    let workspace_len = if params.stage >= 3 {
+        if params.stage >= 4 {
+            stage4_workspace_len
+        } else {
+            stage3_workspace_len
+        }
+    } else {
+        total_rows
+    };
+    let output_len = if params.stage >= 5 {
+        hidden
+    } else if params.stage >= 4 {
+        val_dim
+    } else if params.stage >= 3 {
+        2 * num_v_heads * head_k_dim + val_dim
+    } else {
+        qkv_dim
+    };
+    if workspace.len_bytes() / std::mem::size_of::<f32>() < workspace_len {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::linear_step_launch: Metal stage{} workspace too small: \
+             need {workspace_len} f32 entries, got {}",
+            params.stage,
+            workspace.len_bytes() / std::mem::size_of::<f32>(),
+        )));
+    }
+    if output.len_bytes() / std::mem::size_of::<u16>() < output_len {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::linear_step_launch: Metal stage{} output too small: \
+             need {output_len} BF16 entries, got {}",
+            params.stage,
+            output.len_bytes() / std::mem::size_of::<u16>(),
+        )));
+    }
+
+    let input = unsafe { std::slice::from_raw_parts(weights.input_hidden as *const u16, hidden) };
+    let input_norm_w =
+        unsafe { std::slice::from_raw_parts(weights.input_norm_w as *const u16, hidden) };
+    let in_proj_a_w = unsafe {
+        std::slice::from_raw_parts(weights.in_proj_a_w as *const u16, num_v_heads * hidden)
+    };
+    let in_proj_b_w = unsafe {
+        std::slice::from_raw_parts(weights.in_proj_b_w as *const u16, num_v_heads * hidden)
+    };
+    let output =
+        unsafe { std::slice::from_raw_parts_mut(output.as_mut_ptr() as *mut u16, output_len) };
+    let workspace = unsafe {
+        std::slice::from_raw_parts_mut(workspace.as_mut_ptr() as *mut f32, workspace_len)
+    };
+
+    let mut mean_sq = 0.0f32;
+    for &bits in input {
+        let v = bf16_bits_to_f32(bits);
+        mean_sq += v * v;
+    }
+    let inv_rms = 1.0f32 / (mean_sq / hidden as f32 + params.rms_norm_eps).sqrt();
+    let mut x_norm = vec![0.0f32; hidden];
+    for col in 0..hidden {
+        let v = bf16_bits_to_f32(input[col]);
+        let w = bf16_bits_to_f32(input_norm_w[col]);
+        x_norm[col] = bf16_round_f32(v * inv_rms * (1.0 + w));
+    }
+
+    for row in 0..qkv_dim {
+        let acc = qwen36_dense_or_int4_dot_2d(
+            weights.in_proj_qkv_w,
+            int4.in_proj_qkv_scale,
+            int4.in_proj_qkv_zero,
+            row,
+            hidden,
+            int4.group_size,
+            &x_norm,
+        )?;
+        let rounded = bf16_round_f32(acc);
+        workspace[off_qkv_raw + row] = rounded;
+        if params.stage == 1 {
+            output[row] = f32_to_bf16_bits(rounded);
+        }
+    }
+    for row in 0..val_dim {
+        let acc = qwen36_dense_or_int4_dot_2d(
+            weights.in_proj_z_w,
+            int4.in_proj_z_scale,
+            int4.in_proj_z_zero,
+            row,
+            hidden,
+            int4.group_size,
+            &x_norm,
+        )?;
+        workspace[off_z_raw + row] = bf16_round_f32(acc);
+    }
+    for row in 0..num_v_heads {
+        let mut acc_a = 0.0f32;
+        let mut acc_b = 0.0f32;
+        let row_base = row * hidden;
+        for col in 0..hidden {
+            let x = x_norm[col];
+            acc_a += bf16_bits_to_f32(in_proj_a_w[row_base + col]) * x;
+            acc_b += bf16_bits_to_f32(in_proj_b_w[row_base + col]) * x;
+        }
+        workspace[off_a_raw + row] = bf16_round_f32(acc_a);
+        workspace[off_b_raw + row] = bf16_round_f32(acc_b);
+    }
+
+    if params.stage == 1 {
+        return Ok(());
+    }
+
+    let kernel = params.conv_kernel_dim as usize;
+    let kstate = kernel - 1;
+    let conv1d_w =
+        unsafe { std::slice::from_raw_parts(weights.conv1d_w as *const u16, qkv_dim * kernel) };
+    let conv1d_bias = if weights.conv1d_bias.is_null() {
+        None
+    } else {
+        Some(unsafe { std::slice::from_raw_parts(weights.conv1d_bias as *const u16, qkv_dim) })
+    };
+    let conv_state =
+        unsafe { std::slice::from_raw_parts_mut(weights.conv_state as *mut u16, qkv_dim * kstate) };
+
+    for ch in 0..qkv_dim {
+        let new_qkv = workspace[off_qkv_raw + ch];
+        let mut acc = 0.0f32;
+        for t in 0..kstate {
+            let state = bf16_bits_to_f32(conv_state[ch * kstate + t]);
+            acc += state * bf16_bits_to_f32(conv1d_w[ch * kernel + t]);
+        }
+        acc += new_qkv * bf16_bits_to_f32(conv1d_w[ch * kernel + kstate]);
+        if let Some(bias) = conv1d_bias {
+            acc += bf16_bits_to_f32(bias[ch]);
+        }
+        let conv_out = bf16_round_f32(acc);
+        let silu = bf16_round_f32(conv_out * (1.0 / (1.0 + (-conv_out).exp())));
+        workspace[off_qkv_raw + ch] = silu;
+        if params.stage == 2 {
+            output[ch] = f32_to_bf16_bits(silu);
+        }
+
+        if kstate > 0 {
+            for t in 0..kstate.saturating_sub(1) {
+                conv_state[ch * kstate + t] = conv_state[ch * kstate + t + 1];
+            }
+            conv_state[ch * kstate + (kstate - 1)] = f32_to_bf16_bits(new_qkv);
+        }
+    }
+
+    if params.stage == 2 {
+        return Ok(());
+    }
+
+    for head in 0..num_k_heads {
+        let q_src = off_qkv_raw + head * head_k_dim;
+        let k_src = off_qkv_raw + key_dim + head * head_k_dim;
+        let q_dst = off_q_normed + head * head_k_dim;
+        let k_dst = off_k_normed + head * head_k_dim;
+
+        let mut q_ss = 0.0f32;
+        let mut k_ss = 0.0f32;
+        for i in 0..head_k_dim {
+            let q = workspace[q_src + i];
+            let k = workspace[k_src + i];
+            q_ss += q * q;
+            k_ss += k * k;
+        }
+        let q_denom = bf16_round_f32(bf16_round_f32(q_ss.sqrt()).max(1e-6));
+        let k_denom = bf16_round_f32(bf16_round_f32(k_ss.sqrt()).max(1e-6));
+        for i in 0..head_k_dim {
+            workspace[q_dst + i] = bf16_round_f32(workspace[q_src + i] / q_denom);
+            workspace[k_dst + i] = bf16_round_f32(workspace[k_src + i] / k_denom);
+        }
+    }
+
+    let rep = num_v_heads / num_k_heads;
+    let q_scale = 1.0f32 / (head_k_dim as f32).sqrt();
+    for vhead in 0..num_v_heads {
+        let src_kh = vhead / rep;
+        let q_src = off_q_normed + src_kh * head_k_dim;
+        let k_src = off_k_normed + src_kh * head_k_dim;
+        let q_dst = off_q_rep + vhead * head_k_dim;
+        let k_dst = off_k_rep + vhead * head_k_dim;
+        for i in 0..head_k_dim {
+            let qs = bf16_round_f32(workspace[q_src + i] * q_scale);
+            let kn = workspace[k_src + i];
+            workspace[q_dst + i] = qs;
+            workspace[k_dst + i] = kn;
+            if params.stage == 3 {
+                output[vhead * head_k_dim + i] = f32_to_bf16_bits(qs);
+                output[num_v_heads * head_k_dim + vhead * head_k_dim + i] = f32_to_bf16_bits(kn);
+            }
+        }
+        let v_src = off_qkv_raw + 2 * key_dim + vhead * head_v_dim;
+        let v_out = 2 * num_v_heads * head_k_dim + vhead * head_v_dim;
+        if params.stage == 3 {
+            for i in 0..head_v_dim {
+                output[v_out + i] = f32_to_bf16_bits(workspace[v_src + i]);
+            }
+        }
+    }
+
+    if params.stage == 3 {
+        return Ok(());
+    }
+
+    let dt_bias = unsafe { std::slice::from_raw_parts(weights.dt_bias as *const u16, num_v_heads) };
+    let a_log = unsafe { std::slice::from_raw_parts(weights.a_log as *const u16, num_v_heads) };
+    let recurrent_state = unsafe {
+        std::slice::from_raw_parts_mut(
+            weights.recurrent_state,
+            num_v_heads * head_k_dim * head_v_dim,
+        )
+    };
+    for head in 0..num_v_heads {
+        let a_v = workspace[off_a_raw + head];
+        let b_v = workspace[off_b_raw + head];
+        let dt_b = bf16_bits_to_f32(dt_bias[head]);
+        let a_log_v = bf16_bits_to_f32(a_log[head]);
+        let softplus = (1.0 + (a_v + dt_b).exp()).ln();
+        workspace[off_beta + head] = 1.0 / (1.0 + (-b_v).exp());
+        workspace[off_g + head] = -softplus * a_log_v.exp();
+    }
+
+    for head in 0..num_v_heads {
+        let beta = workspace[off_beta + head];
+        let gstep = workspace[off_g + head].exp();
+        let state_off = head * head_k_dim * head_v_dim;
+        let kv_off = off_k_rep + head * head_k_dim;
+        let qv_off = off_q_rep + head * head_k_dim;
+        let v_off = off_qkv_raw + 2 * key_dim + head * head_v_dim;
+        for e in 0..head_k_dim * head_v_dim {
+            recurrent_state[state_off + e] *= gstep;
+        }
+        let mut kv_mem = vec![0.0f32; head_v_dim];
+        for j in 0..head_v_dim {
+            let mut acc = 0.0f32;
+            for i in 0..head_k_dim {
+                acc += recurrent_state[state_off + i * head_v_dim + j] * workspace[kv_off + i];
+            }
+            kv_mem[j] = acc;
+        }
+        let mut delta = vec![0.0f32; head_v_dim];
+        for j in 0..head_v_dim {
+            delta[j] = (workspace[v_off + j] - kv_mem[j]) * beta;
+        }
+        for i in 0..head_k_dim {
+            for j in 0..head_v_dim {
+                recurrent_state[state_off + i * head_v_dim + j] += workspace[kv_off + i] * delta[j];
+            }
+        }
+        for j in 0..head_v_dim {
+            let mut acc = 0.0f32;
+            for i in 0..head_k_dim {
+                acc += recurrent_state[state_off + i * head_v_dim + j] * workspace[qv_off + i];
+            }
+            let rec = bf16_round_f32(acc);
+            workspace[off_rec_out + head * head_v_dim + j] = rec;
+            output[head * head_v_dim + j] = f32_to_bf16_bits(rec);
+        }
+    }
+
+    if params.stage == 4 {
+        return Ok(());
+    }
+
+    let norm_w = unsafe { std::slice::from_raw_parts(weights.norm_w as *const u16, head_v_dim) };
+    for head in 0..num_v_heads {
+        let rec_off = off_rec_out + head * head_v_dim;
+        let z_off = off_z_raw + head * head_v_dim;
+        let mut mean_sq = 0.0f32;
+        for j in 0..head_v_dim {
+            let v = workspace[rec_off + j];
+            mean_sq += v * v;
+        }
+        let inv = 1.0f32 / (mean_sq / head_v_dim as f32 + params.rms_norm_eps).sqrt();
+        for j in 0..head_v_dim {
+            let rec = workspace[rec_off + j];
+            let nw = bf16_bits_to_f32(norm_w[j]);
+            let on = bf16_round_f32(rec * inv * nw);
+            let z = workspace[z_off + j];
+            let z_silu = bf16_round_f32(z * (1.0 / (1.0 + (-z).exp())));
+            workspace[rec_off + j] = bf16_round_f32(on * z_silu);
+        }
+    }
+
+    for row in 0..hidden {
+        let acc = qwen36_dense_or_int4_dot_2d(
+            weights.out_proj_w,
+            int4.out_proj_scale,
+            int4.out_proj_zero,
+            row,
+            val_dim,
+            int4.group_size,
+            &workspace[off_rec_out..off_rec_out + val_dim],
+        )?;
+        let o_out = bf16_round_f32(acc);
+        let residual = bf16_round_f32(bf16_bits_to_f32(input[row]) + o_out);
+        output[row] = f32_to_bf16_bits(residual);
+    }
+
     Ok(())
 }
 
@@ -1671,10 +2463,11 @@ pub fn ffn_step_launch(
             params.top_k,
         )));
     }
-    // Only stage 1 is wired through PR 4b4 step 2; stage 2..=5 will land in
-    // follow-up commits to this PR.
-
     let backend = output.backend();
+    if backend == Backend::Metal {
+        return ffn_step_stage1_5_metal_host(params, weights, int4, output, output_idx, workspace);
+    }
+
     let counters = sync_buf.as_mut_ptr() as *mut c_uint;
     // Layout: 16 u32 work-stealing counter slots at +0..+63 (the FFN
     // concurrent-experts dispatch uses 2*K_top of these; attn/linear/stub
@@ -1733,9 +2526,7 @@ pub fn ffn_step_launch(
             }
         }
         Backend::Metal => {
-            return Err(GpuError::InvalidArg(
-                "qwen36_moe::ffn_step_launch: Metal backend not yet wired".into(),
-            ));
+            unreachable!("Metal ffn_step handled above");
         }
     };
     if status != 0 {
@@ -1744,6 +2535,342 @@ pub fn ffn_step_launch(
             format!("qwen36_moe ffn_step launch failed with status {status}"),
         ));
     }
+    Ok(())
+}
+
+fn ffn_step_stage1_5_metal_host(
+    params: Qwen36MoeFfnStepParams,
+    weights: &Qwen36MoeFfnStepWeights,
+    int4: &Qwen36MoeFfnStepInt4,
+    output: &mut GpuBuffer,
+    output_idx: &mut GpuBuffer,
+    workspace: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if output.dtype() != ScalarType::BF16
+        || output_idx.dtype() != ScalarType::U32
+        || workspace.dtype() != ScalarType::F32
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::ffn_step_launch: Metal stage1-5 expects BF16/U32/F32 \
+             output buffers, got {:?}/{:?}/{:?}",
+            output.dtype(),
+            output_idx.dtype(),
+            workspace.dtype(),
+        )));
+    }
+    if int4.group_size < 0 {
+        return Err(GpuError::InvalidArg(
+            "qwen36_moe::ffn_step_launch: Metal stage1-5 does not yet support FP8 sidecars".into(),
+        ));
+    }
+    if weights.input_hidden.is_null()
+        || weights.post_attn_norm_w.is_null()
+        || weights.gate_w.is_null()
+    {
+        return Err(GpuError::InvalidArg(
+            "qwen36_moe::ffn_step_launch: Metal stage1 requires input_hidden, \
+             post_attn_norm_w, and gate_w"
+                .into(),
+        ));
+    }
+    if params.stage >= 2
+        && (weights.shared_gate_proj_w.is_null()
+            || weights.shared_up_proj_w.is_null()
+            || weights.shared_down_proj_w.is_null()
+            || weights.shared_expert_gate_w.is_null())
+    {
+        return Err(GpuError::InvalidArg(
+            "qwen36_moe::ffn_step_launch: Metal stage2 requires shared expert weights".into(),
+        ));
+    }
+    if params.stage >= 3 && (weights.gate_up_proj_w.is_null() || weights.down_proj_w.is_null()) {
+        return Err(GpuError::InvalidArg(
+            "qwen36_moe::ffn_step_launch: Metal stage3 requires gate_up_proj_w and down_proj_w"
+                .into(),
+        ));
+    }
+
+    let hidden = params.hidden as usize;
+    let num_experts = params.num_experts as usize;
+    let moe_intermediate = params.moe_intermediate as usize;
+    let shared_intermediate = params.shared_intermediate as usize;
+    let top_k = params.top_k as usize;
+    if hidden == 0
+        || num_experts == 0
+        || moe_intermediate == 0
+        || shared_intermediate == 0
+        || top_k == 0
+    {
+        return Err(GpuError::InvalidArg(
+            "qwen36_moe::ffn_step_launch: Metal stage1-5 requires non-zero geometry".into(),
+        ));
+    }
+
+    let off_h_norm = 0usize;
+    let off_router_logits = hidden;
+    let off_router_probs = hidden + num_experts;
+    let off_topk_val = hidden + 2 * num_experts;
+    let off_topk_idx = hidden + 2 * num_experts + top_k;
+    let off_sg_scalar = hidden + 2 * num_experts + 2 * top_k;
+    let off_sgp = off_sg_scalar + 1;
+    let off_sup = off_sgp + shared_intermediate;
+    let off_shared_mid = off_sup + shared_intermediate;
+    let off_shared_out = off_shared_mid + shared_intermediate;
+    let off_expert_gu = off_shared_out + hidden;
+    let off_expert_mid = off_expert_gu + top_k * 2 * moe_intermediate;
+    let off_expert_stack = off_expert_mid + top_k * moe_intermediate;
+    let off_moe_out = off_expert_stack + top_k * hidden;
+    let workspace_len = if params.stage >= 4 {
+        off_moe_out + hidden
+    } else if params.stage >= 3 {
+        off_expert_stack + top_k * hidden
+    } else if params.stage >= 2 {
+        off_shared_out + hidden
+    } else {
+        off_sg_scalar
+    };
+    let output_len = if params.stage == 1 { top_k } else { hidden };
+    if workspace.len_bytes() / std::mem::size_of::<f32>() < workspace_len {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::ffn_step_launch: Metal stage{} workspace too small: need {}, got {}",
+            params.stage,
+            workspace_len,
+            workspace.len_bytes() / std::mem::size_of::<f32>()
+        )));
+    }
+    if output.len_bytes() / std::mem::size_of::<u16>() < output_len {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::ffn_step_launch: Metal stage{} output too small: need {}, got {}",
+            params.stage,
+            output_len,
+            output.len_bytes() / std::mem::size_of::<u16>()
+        )));
+    }
+    if output_idx.len_bytes() / std::mem::size_of::<i32>() < top_k {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::ffn_step_launch: Metal output_idx too small: need {}, got {}",
+            top_k,
+            output_idx.len_bytes() / std::mem::size_of::<i32>()
+        )));
+    }
+
+    let input = unsafe { std::slice::from_raw_parts(weights.input_hidden as *const u16, hidden) };
+    let norm_w =
+        unsafe { std::slice::from_raw_parts(weights.post_attn_norm_w as *const u16, hidden) };
+    let gate_w =
+        unsafe { std::slice::from_raw_parts(weights.gate_w as *const u16, num_experts * hidden) };
+    let output =
+        unsafe { std::slice::from_raw_parts_mut(output.as_mut_ptr() as *mut u16, output_len) };
+    let output_idx =
+        unsafe { std::slice::from_raw_parts_mut(output_idx.as_mut_ptr() as *mut i32, top_k) };
+    let workspace = unsafe {
+        std::slice::from_raw_parts_mut(workspace.as_mut_ptr() as *mut f32, workspace_len)
+    };
+
+    let mut mean_sq = 0.0f32;
+    for &bits in input {
+        let v = bf16_bits_to_f32(bits);
+        mean_sq += v * v;
+    }
+    let inv_rms = 1.0f32 / (mean_sq / hidden as f32 + params.rms_norm_eps).sqrt();
+    for col in 0..hidden {
+        let v = bf16_bits_to_f32(input[col]);
+        let w = bf16_bits_to_f32(norm_w[col]);
+        workspace[off_h_norm + col] = bf16_round_f32(v * inv_rms * (1.0 + w));
+    }
+
+    for expert in 0..num_experts {
+        let mut acc = 0.0f32;
+        let row = expert * hidden;
+        for col in 0..hidden {
+            acc += bf16_bits_to_f32(gate_w[row + col]) * workspace[off_h_norm + col];
+        }
+        workspace[off_router_logits + expert] = bf16_round_f32(acc);
+    }
+
+    let row_max = workspace[off_router_logits..off_router_logits + num_experts]
+        .iter()
+        .copied()
+        .fold(f32::NEG_INFINITY, f32::max);
+    let mut row_sum = 0.0f32;
+    for expert in 0..num_experts {
+        let e = (workspace[off_router_logits + expert] - row_max).exp();
+        workspace[off_router_probs + expert] = e;
+        row_sum += e;
+    }
+    let inv_sum = 1.0f32 / row_sum;
+    for expert in 0..num_experts {
+        workspace[off_router_probs + expert] =
+            bf16_round_f32(workspace[off_router_probs + expert] * inv_sum);
+    }
+
+    for kk in 0..top_k {
+        let mut best_idx = -1i32;
+        let mut best_val = f32::NEG_INFINITY;
+        for expert in 0..num_experts {
+            let v = workspace[off_router_probs + expert];
+            if v > best_val || (v == best_val && best_idx >= 0 && (expert as i32) < best_idx) {
+                best_val = v;
+                best_idx = expert as i32;
+            }
+        }
+        workspace[off_topk_idx + kk] = f32::from_bits(best_idx as u32);
+        workspace[off_topk_val + kk] = best_val;
+        if best_idx >= 0 {
+            workspace[off_router_probs + best_idx as usize] = f32::NEG_INFINITY;
+        }
+    }
+
+    let sum_k: f32 = (0..top_k).map(|kk| workspace[off_topk_val + kk]).sum();
+    let inv_k = 1.0f32 / sum_k;
+    for kk in 0..top_k {
+        let w = bf16_round_f32(workspace[off_topk_val + kk] * inv_k);
+        workspace[off_topk_val + kk] = w;
+        output[kk] = f32_to_bf16_bits(w);
+        output_idx[kk] = f32::to_bits(workspace[off_topk_idx + kk]) as i32;
+    }
+
+    if params.stage == 1 {
+        return Ok(());
+    }
+
+    let shared_expert_gate_w =
+        unsafe { std::slice::from_raw_parts(weights.shared_expert_gate_w as *const u16, hidden) };
+
+    for row in 0..shared_intermediate {
+        let gate_acc = qwen36_dense_or_int4_dot_2d(
+            weights.shared_gate_proj_w,
+            int4.shared_gate_proj_scale,
+            int4.shared_gate_proj_zero,
+            row,
+            hidden,
+            int4.group_size,
+            &workspace[off_h_norm..off_h_norm + hidden],
+        )?;
+        let up_acc = qwen36_dense_or_int4_dot_2d(
+            weights.shared_up_proj_w,
+            int4.shared_up_proj_scale,
+            int4.shared_up_proj_zero,
+            row,
+            hidden,
+            int4.group_size,
+            &workspace[off_h_norm..off_h_norm + hidden],
+        )?;
+        workspace[off_sgp + row] = gate_acc;
+        workspace[off_sup + row] = up_acc;
+    }
+    let mut sg_acc = 0.0f32;
+    for col in 0..hidden {
+        sg_acc += bf16_bits_to_f32(shared_expert_gate_w[col]) * workspace[off_h_norm + col];
+    }
+    workspace[off_sg_scalar] = 1.0f32 / (1.0f32 + (-sg_acc).exp());
+
+    for i in 0..shared_intermediate {
+        let gp = workspace[off_sgp + i];
+        let up = workspace[off_sup + i];
+        let silu = gp * (1.0f32 / (1.0f32 + (-gp).exp()));
+        workspace[off_shared_mid + i] = silu * up;
+    }
+
+    let sg_scalar = workspace[off_sg_scalar];
+    for row in 0..hidden {
+        let acc = qwen36_dense_or_int4_dot_2d(
+            weights.shared_down_proj_w,
+            int4.shared_down_proj_scale,
+            int4.shared_down_proj_zero,
+            row,
+            shared_intermediate,
+            int4.group_size,
+            &workspace[off_shared_mid..off_shared_mid + shared_intermediate],
+        )?;
+        let val = bf16_round_f32(sg_scalar * acc);
+        workspace[off_shared_out + row] = val;
+        if params.stage == 2 {
+            output[row] = f32_to_bf16_bits(val);
+        }
+    }
+
+    if params.stage == 2 {
+        return Ok(());
+    }
+
+    let active_groups = if params.stage == 3 { 1 } else { top_k };
+    for group in 0..active_groups {
+        let expert = f32::to_bits(workspace[off_topk_idx + group]) as i32 as usize;
+        let gu_base = off_expert_gu + group * 2 * moe_intermediate;
+        for row in 0..(2 * moe_intermediate) {
+            let acc = qwen36_expert_dense_or_int4_dot(
+                weights.gate_up_proj_w,
+                int4.gate_up_proj_scale,
+                int4.gate_up_proj_zero,
+                expert,
+                row,
+                2 * moe_intermediate,
+                hidden,
+                int4.group_size,
+                &workspace[off_h_norm..off_h_norm + hidden],
+            )?;
+            workspace[gu_base + row] = acc;
+        }
+
+        let mid_base = off_expert_mid + group * moe_intermediate;
+        for i in 0..moe_intermediate {
+            let gp = workspace[gu_base + i];
+            let up = workspace[gu_base + moe_intermediate + i];
+            let silu = gp * (1.0f32 / (1.0f32 + (-gp).exp()));
+            workspace[mid_base + i] = silu * up;
+        }
+
+        let stack_base = off_expert_stack + group * hidden;
+        for row in 0..hidden {
+            let acc = qwen36_expert_dense_or_int4_dot(
+                weights.down_proj_w,
+                int4.down_proj_scale,
+                int4.down_proj_zero,
+                expert,
+                row,
+                hidden,
+                moe_intermediate,
+                int4.group_size,
+                &workspace[mid_base..mid_base + moe_intermediate],
+            )?;
+            workspace[stack_base + row] = acc;
+            if params.stage == 3 && group == 0 {
+                output[row] = f32_to_bf16_bits(bf16_round_f32(acc));
+            }
+        }
+    }
+
+    if params.stage == 3 {
+        return Ok(());
+    }
+
+    for row in 0..hidden {
+        let mut acc = 0.0f32;
+        for group in 0..top_k {
+            acc += workspace[off_topk_val + group]
+                * workspace[off_expert_stack + group * hidden + row];
+        }
+        let val = bf16_round_f32(acc);
+        workspace[off_moe_out + row] = val;
+        if params.stage == 4 {
+            output[row] = f32_to_bf16_bits(val);
+        }
+    }
+
+    if params.stage == 4 {
+        return Ok(());
+    }
+
+    for row in 0..hidden {
+        let val = bf16_round_f32(
+            bf16_bits_to_f32(input[row])
+                + workspace[off_moe_out + row]
+                + workspace[off_shared_out + row],
+        );
+        output[row] = f32_to_bf16_bits(val);
+    }
+
     Ok(())
 }
 
@@ -1793,6 +2920,19 @@ pub fn int4_dequant_smoke_launch(
     }
 
     let backend = packed_buf.backend();
+    if backend == Backend::Metal {
+        return int4_dequant_smoke_launch_metal_host(
+            packed_buf,
+            scale_buf,
+            zero_buf,
+            out_rows,
+            in_cols,
+            gsz,
+            dq_8_out,
+            dq_scalar_out,
+        );
+    }
+
     let status: c_int = match backend {
         Backend::Hip | Backend::Cuda => {
             #[cfg(any(supersonic_backend_hip, supersonic_backend_cuda))]
@@ -1816,11 +2956,7 @@ pub fn int4_dequant_smoke_launch(
                 ));
             }
         }
-        Backend::Metal => {
-            return Err(GpuError::InvalidArg(
-                "qwen36_moe::int4_dequant_smoke_launch: Metal backend not yet wired".into(),
-            ));
-        }
+        Backend::Metal => unreachable!("Metal int4_dequant_smoke handled above"),
     };
     if status != 0 {
         return Err(GpuError::backend(
@@ -1829,6 +2965,219 @@ pub fn int4_dequant_smoke_launch(
         ));
     }
     Ok(())
+}
+
+fn int4_dequant_smoke_launch_metal_host(
+    packed_buf: &GpuBuffer,
+    scale_buf: &GpuBuffer,
+    zero_buf: &GpuBuffer,
+    out_rows: i32,
+    in_cols: i32,
+    gsz: i32,
+    dq_8_out: &mut GpuBuffer,
+    dq_scalar_out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if packed_buf.dtype() != ScalarType::U8
+        || scale_buf.dtype() != ScalarType::BF16
+        || zero_buf.dtype() != ScalarType::BF16
+        || dq_8_out.dtype() != ScalarType::F32
+        || dq_scalar_out.dtype() != ScalarType::F32
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::int4_dequant_smoke_launch: Metal fallback expects \
+             U8/BF16/BF16/F32/F32 buffers, got {:?}/{:?}/{:?}/{:?}/{:?}",
+            packed_buf.dtype(),
+            scale_buf.dtype(),
+            zero_buf.dtype(),
+            dq_8_out.dtype(),
+            dq_scalar_out.dtype(),
+        )));
+    }
+
+    let out_rows = out_rows as usize;
+    let in_cols = in_cols as usize;
+    let gsz = gsz as usize;
+    let total = out_rows * in_cols;
+    let byte_cols = in_cols / 2;
+    let scale_cols = in_cols / gsz;
+    let packed = unsafe {
+        std::slice::from_raw_parts(packed_buf.as_ptr() as *const u8, out_rows * byte_cols)
+    };
+    let scale = unsafe {
+        std::slice::from_raw_parts(
+            scale_buf.as_ptr() as *const u16,
+            (out_rows / gsz) * scale_cols,
+        )
+    };
+    let zero = unsafe {
+        std::slice::from_raw_parts(
+            zero_buf.as_ptr() as *const u16,
+            (out_rows / gsz) * scale_cols,
+        )
+    };
+    let dq_8 = unsafe { std::slice::from_raw_parts_mut(dq_8_out.as_mut_ptr() as *mut f32, total) };
+    let dq_scalar =
+        unsafe { std::slice::from_raw_parts_mut(dq_scalar_out.as_mut_ptr() as *mut f32, total) };
+
+    for row in 0..out_rows {
+        for col in 0..in_cols {
+            let scale_idx = (row / gsz) * scale_cols + col / gsz;
+            let s = f32::from_bits((scale[scale_idx] as u32) << 16);
+            let z = f32::from_bits((zero[scale_idx] as u32) << 16);
+            let byte = packed[row * byte_cols + col / 2];
+            let q = if col & 1 == 0 {
+                byte & 0x0F
+            } else {
+                (byte >> 4) & 0x0F
+            };
+            let v = bf16_round_f32(q as f32 * s - z * s);
+            let idx = row * in_cols + col;
+            dq_8[idx] = v;
+            dq_scalar[idx] = v;
+        }
+    }
+    Ok(())
+}
+
+fn bf16_round_f32(x: f32) -> f32 {
+    let bits = x.to_bits();
+    let rounding_bias = 0x7FFFu32 + ((bits >> 16) & 1);
+    let r = bits.wrapping_add(rounding_bias);
+    f32::from_bits(r & 0xFFFF_0000)
+}
+
+fn f32_to_bf16_bits(x: f32) -> u16 {
+    (bf16_round_f32(x).to_bits() >> 16) as u16
+}
+
+fn bf16_bits_to_f32(bits: u16) -> f32 {
+    f32::from_bits((bits as u32) << 16)
+}
+
+fn qwen36_int4_value_2d(
+    packed: &[u8],
+    scale: &[u16],
+    zero: &[u16],
+    row: usize,
+    col: usize,
+    cols: usize,
+    group_size: usize,
+) -> f32 {
+    let byte_cols = cols.div_ceil(2);
+    let byte = packed[row * byte_cols + col / 2];
+    let nibble = if col & 1 == 0 {
+        byte & 0x0f
+    } else {
+        (byte >> 4) & 0x0f
+    };
+    let scale_cols = cols.div_ceil(group_size);
+    let scale_idx = (row / group_size) * scale_cols + col / group_size;
+    let s = bf16_bits_to_f32(scale[scale_idx]);
+    let z = bf16_bits_to_f32(zero[scale_idx]);
+    bf16_round_f32(nibble as f32 * s - z * s)
+}
+
+fn qwen36_dense_or_int4_dot_2d(
+    weight: *const c_void,
+    scale: *const c_void,
+    zero: *const c_void,
+    row: usize,
+    cols: usize,
+    group_size: i32,
+    x: &[f32],
+) -> Result<f32, GpuError> {
+    if weight.is_null() {
+        return Err(GpuError::InvalidArg(
+            "qwen36_moe: Metal fallback received a null weight pointer".into(),
+        ));
+    }
+    if scale.is_null() && zero.is_null() {
+        let w = unsafe { std::slice::from_raw_parts(weight as *const u16, (row + 1) * cols) };
+        let row_base = row * cols;
+        let mut acc = 0.0f32;
+        for col in 0..cols {
+            acc += bf16_bits_to_f32(w[row_base + col]) * x[col];
+        }
+        return Ok(acc);
+    }
+    if scale.is_null() || zero.is_null() || group_size <= 0 {
+        return Err(GpuError::InvalidArg(
+            "qwen36_moe: Metal INT4 fallback requires paired scale/zero pointers and positive group_size"
+                .into(),
+        ));
+    }
+    let group_size = group_size as usize;
+    let packed_len = (row + 1) * cols.div_ceil(2);
+    let scale_len = (row / group_size + 1) * cols.div_ceil(group_size);
+    let packed = unsafe { std::slice::from_raw_parts(weight as *const u8, packed_len) };
+    let scale = unsafe { std::slice::from_raw_parts(scale as *const u16, scale_len) };
+    let zero = unsafe { std::slice::from_raw_parts(zero as *const u16, scale_len) };
+    let mut acc = 0.0f32;
+    for col in 0..cols {
+        acc += qwen36_int4_value_2d(packed, scale, zero, row, col, cols, group_size) * x[col];
+    }
+    Ok(acc)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen36_expert_dense_or_int4_dot(
+    weight: *const c_void,
+    scale: *const c_void,
+    zero: *const c_void,
+    expert: usize,
+    row: usize,
+    rows: usize,
+    cols: usize,
+    group_size: i32,
+    x: &[f32],
+) -> Result<f32, GpuError> {
+    if weight.is_null() {
+        return Err(GpuError::InvalidArg(
+            "qwen36_moe: Metal expert fallback received a null weight pointer".into(),
+        ));
+    }
+    if scale.is_null() && zero.is_null() {
+        let len = (expert * rows + row + 1) * cols;
+        let w = unsafe { std::slice::from_raw_parts(weight as *const u16, len) };
+        let row_base = (expert * rows + row) * cols;
+        let mut acc = 0.0f32;
+        for col in 0..cols {
+            acc += bf16_bits_to_f32(w[row_base + col]) * x[col];
+        }
+        return Ok(acc);
+    }
+    if scale.is_null() || zero.is_null() || group_size <= 0 {
+        return Err(GpuError::InvalidArg(
+            "qwen36_moe: Metal expert INT4 fallback requires paired scale/zero pointers and positive group_size"
+                .into(),
+        ));
+    }
+    let group_size = group_size as usize;
+    let byte_cols = cols.div_ceil(2);
+    let scale_rows = rows.div_ceil(group_size);
+    let scale_cols = cols.div_ceil(group_size);
+    let packed_len = (expert * rows + row + 1) * byte_cols;
+    let scale_len = (expert * scale_rows + row / group_size + 1) * scale_cols;
+    let packed = unsafe { std::slice::from_raw_parts(weight as *const u8, packed_len) };
+    let scale = unsafe { std::slice::from_raw_parts(scale as *const u16, scale_len) };
+    let zero = unsafe { std::slice::from_raw_parts(zero as *const u16, scale_len) };
+    let packed_base = (expert * rows + row) * byte_cols;
+    let scale_base = (expert * scale_rows + row / group_size) * scale_cols;
+    let mut acc = 0.0f32;
+    for col in 0..cols {
+        let byte = packed[packed_base + col / 2];
+        let nibble = if col & 1 == 0 {
+            byte & 0x0f
+        } else {
+            (byte >> 4) & 0x0f
+        };
+        let scale_idx = scale_base + col / group_size;
+        let s = bf16_bits_to_f32(scale[scale_idx]);
+        let z = bf16_bits_to_f32(zero[scale_idx]);
+        let w = bf16_round_f32(nibble as f32 * s - z * s);
+        acc += w * x[col];
+    }
+    Ok(acc)
 }
 
 /// Safe wrapper for the GPU final RMSNorm + lm_head GEMV.
@@ -1865,6 +3214,21 @@ pub fn lm_head_launch(
              got hidden={hidden} vocab={vocab}"
         )));
     }
+    let backend = lm_head_w_buf.backend();
+    if backend == Backend::Metal {
+        let _ = counter_buf;
+        return lm_head_launch_metal_bf16(
+            ordinal,
+            hidden,
+            vocab,
+            rms_norm_eps,
+            final_hidden_buf,
+            final_norm_w_buf,
+            lm_head_w_buf,
+            logits_buf,
+            x_normed_out_buf,
+        );
+    }
     let block_size: i32 = 256;
     if hidden % block_size != 0 {
         return Err(GpuError::InvalidArg(format!(
@@ -1874,7 +3238,6 @@ pub fn lm_head_launch(
         )));
     }
 
-    let backend = lm_head_w_buf.backend();
     let x_normed_ptr = x_normed_out_buf
         .map(|b| b.as_mut_ptr())
         .unwrap_or(std::ptr::null_mut());
@@ -1904,9 +3267,7 @@ pub fn lm_head_launch(
             }
         }
         Backend::Metal => {
-            return Err(GpuError::InvalidArg(
-                "qwen36_moe::lm_head_launch: Metal backend not yet wired".into(),
-            ));
+            unreachable!("Metal handled above");
         }
     };
     if status != 0 {
@@ -1964,6 +3325,21 @@ pub fn lm_head_batched_launch(
             "qwen36_moe::lm_head_batched_launch: m must be ≥ 1, got {m}"
         )));
     }
+    let backend = lm_head_w_buf.backend();
+    if backend == Backend::Metal {
+        return lm_head_batched_launch_metal_bf16(
+            ordinal,
+            m,
+            hidden,
+            vocab,
+            rms_norm_eps,
+            final_hidden_buf,
+            final_norm_w_buf,
+            lm_head_w_buf,
+            logits_buf,
+            x_normed_out_buf,
+        );
+    }
     // M is bounded by min(16, LDS budget / row size). At hidden=2048 the
     // LDS per row is 4 KiB; with 128 B reduction scratch and a 64 KiB cap
     // the effective ceiling is 15 (not the API's 16). Compute the
@@ -1990,7 +3366,6 @@ pub fn lm_head_batched_launch(
         )));
     }
 
-    let backend = lm_head_w_buf.backend();
     let x_normed_ptr = x_normed_out_buf
         .map(|b| b.as_mut_ptr())
         .unwrap_or(std::ptr::null_mut());
@@ -2020,9 +3395,7 @@ pub fn lm_head_batched_launch(
             }
         }
         Backend::Metal => {
-            return Err(GpuError::InvalidArg(
-                "qwen36_moe::lm_head_batched_launch: Metal backend not yet wired".into(),
-            ));
+            unreachable!("Metal handled above");
         }
     };
     if status == 138 {
@@ -2042,6 +3415,96 @@ pub fn lm_head_batched_launch(
         ));
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lm_head_launch_metal_bf16(
+    ordinal: usize,
+    hidden: i32,
+    vocab: i32,
+    rms_norm_eps: f32,
+    final_hidden_buf: &GpuBuffer,
+    final_norm_w_buf: &GpuBuffer,
+    lm_head_w_buf: &GpuBuffer,
+    logits_buf: &mut GpuBuffer,
+    x_normed_out_buf: Option<&mut GpuBuffer>,
+) -> Result<(), GpuError> {
+    let hidden = hidden as usize;
+    let vocab = vocab as usize;
+    let mut owned_normed;
+    let normed = if let Some(buf) = x_normed_out_buf {
+        buf
+    } else {
+        owned_normed = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, hidden])?;
+        &mut owned_normed
+    };
+    crate::prefill_ffi::rms_norm_rows(
+        ordinal,
+        ScalarType::BF16,
+        1,
+        hidden,
+        rms_norm_eps,
+        final_hidden_buf,
+        final_norm_w_buf,
+        normed,
+    )?;
+    crate::prefill_ffi::matmul_rhs_transposed(
+        ordinal,
+        ScalarType::BF16,
+        1,
+        1,
+        vocab,
+        hidden,
+        normed,
+        lm_head_w_buf,
+        logits_buf,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lm_head_batched_launch_metal_bf16(
+    ordinal: usize,
+    m: i32,
+    hidden: i32,
+    vocab: i32,
+    rms_norm_eps: f32,
+    final_hidden_buf: &GpuBuffer,
+    final_norm_w_buf: &GpuBuffer,
+    lm_head_w_buf: &GpuBuffer,
+    logits_buf: &mut GpuBuffer,
+    x_normed_out_buf: Option<&mut GpuBuffer>,
+) -> Result<(), GpuError> {
+    let m = m as usize;
+    let hidden = hidden as usize;
+    let vocab = vocab as usize;
+    let mut owned_normed;
+    let normed = if let Some(buf) = x_normed_out_buf {
+        buf
+    } else {
+        owned_normed = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[m, hidden])?;
+        &mut owned_normed
+    };
+    crate::prefill_ffi::rms_norm_rows(
+        ordinal,
+        ScalarType::BF16,
+        m,
+        hidden,
+        rms_norm_eps,
+        final_hidden_buf,
+        final_norm_w_buf,
+        normed,
+    )?;
+    crate::prefill_ffi::matmul_rhs_transposed(
+        ordinal,
+        ScalarType::BF16,
+        1,
+        m,
+        vocab,
+        hidden,
+        normed,
+        lm_head_w_buf,
+        logits_buf,
+    )
 }
 
 /// Safe wrapper for the GPU MTP pre-fusion kernel (Phase 6.2c.1).
@@ -2086,6 +3549,24 @@ pub fn mtp_pre_fusion_launch(
             "qwen36_moe::mtp_pre_fusion_launch: positive hidden required, got {hidden}"
         )));
     }
+
+    let backend = fc_w_buf.backend();
+    if backend == Backend::Metal {
+        return mtp_pre_fusion_launch_metal_bf16(
+            ordinal,
+            hidden,
+            rms_norm_eps,
+            e_in_buf,
+            h_base_buf,
+            pre_fc_norm_embedding_w_buf,
+            pre_fc_norm_hidden_w_buf,
+            fc_w_buf,
+            e_norm_out_buf,
+            h_norm_out_buf,
+            fused_out_buf,
+        );
+    }
+
     let block_size: i32 = 256;
     if hidden % block_size != 0 {
         return Err(GpuError::InvalidArg(format!(
@@ -2095,7 +3576,6 @@ pub fn mtp_pre_fusion_launch(
         )));
     }
 
-    let backend = fc_w_buf.backend();
     let status: c_int = match backend {
         Backend::Hip | Backend::Cuda => {
             #[cfg(any(supersonic_backend_hip, supersonic_backend_cuda))]
@@ -2122,11 +3602,7 @@ pub fn mtp_pre_fusion_launch(
                 ));
             }
         }
-        Backend::Metal => {
-            return Err(GpuError::InvalidArg(
-                "qwen36_moe::mtp_pre_fusion_launch: Metal backend not yet wired".into(),
-            ));
-        }
+        Backend::Metal => unreachable!("Metal mtp_pre_fusion handled above"),
     };
     if status != 0 {
         return Err(GpuError::backend(
@@ -2135,6 +3611,70 @@ pub fn mtp_pre_fusion_launch(
         ));
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mtp_pre_fusion_launch_metal_bf16(
+    ordinal: usize,
+    hidden: i32,
+    rms_norm_eps: f32,
+    e_in_buf: &GpuBuffer,
+    h_base_buf: &GpuBuffer,
+    pre_fc_norm_embedding_w_buf: &GpuBuffer,
+    pre_fc_norm_hidden_w_buf: &GpuBuffer,
+    fc_w_buf: &GpuBuffer,
+    e_norm_out_buf: &mut GpuBuffer,
+    h_norm_out_buf: &mut GpuBuffer,
+    fused_out_buf: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    let hidden = hidden as usize;
+    crate::prefill_ffi::rms_norm_rows(
+        ordinal,
+        ScalarType::BF16,
+        1,
+        hidden,
+        rms_norm_eps,
+        e_in_buf,
+        pre_fc_norm_embedding_w_buf,
+        e_norm_out_buf,
+    )?;
+    crate::prefill_ffi::rms_norm_rows(
+        ordinal,
+        ScalarType::BF16,
+        1,
+        hidden,
+        rms_norm_eps,
+        h_base_buf,
+        pre_fc_norm_hidden_w_buf,
+        h_norm_out_buf,
+    )?;
+
+    let mut concat = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, 2 * hidden])?;
+    let half_bytes = hidden * ScalarType::BF16.size_in_bytes();
+    gpu_hal::copy_d2d(
+        ordinal,
+        concat.as_mut_ptr(),
+        e_norm_out_buf.as_ptr(),
+        half_bytes,
+    )?;
+    gpu_hal::copy_d2d(
+        ordinal,
+        concat.offset_ptr(half_bytes) as *mut c_void,
+        h_norm_out_buf.as_ptr(),
+        half_bytes,
+    )?;
+
+    crate::prefill_ffi::matmul_rhs_transposed(
+        ordinal,
+        ScalarType::BF16,
+        1,
+        1,
+        hidden,
+        2 * hidden,
+        &concat,
+        fc_w_buf,
+        fused_out_buf,
+    )
 }
 
 /// Stage A (M3) batched-Q full-attention prefill safe wrapper.
@@ -2194,11 +3734,25 @@ pub fn batched_prefill_attn_full_launch(
             }
             #[cfg(not(any(supersonic_backend_hip, supersonic_backend_cuda)))]
             {
-                let _ = (ordinal, batch_size, q_heads, kv_heads, q_len, kv_len,
-                    head_dim, scale, seqlen_offset, query, key, value, out);
+                let _ = (
+                    ordinal,
+                    batch_size,
+                    q_heads,
+                    kv_heads,
+                    q_len,
+                    kv_len,
+                    head_dim,
+                    scale,
+                    seqlen_offset,
+                    query,
+                    key,
+                    value,
+                    out,
+                );
                 return Err(GpuError::backend(
                     backend,
-                    "qwen36_moe::batched_prefill_attn_full_launch: backend not compiled".to_string(),
+                    "qwen36_moe::batched_prefill_attn_full_launch: backend not compiled"
+                        .to_string(),
                 ));
             }
         }
@@ -2290,9 +3844,7 @@ pub fn batched_prefill_router_permute_launch(
     if status != 0 {
         return Err(GpuError::backend(
             backend,
-            format!(
-                "qwen36_moe batched_prefill_router_permute_launch failed with status {status}"
-            ),
+            format!("qwen36_moe batched_prefill_router_permute_launch failed with status {status}"),
         ));
     }
     Ok(())
@@ -2409,12 +3961,18 @@ pub fn batched_prefill_grouped_expert_launch(
     if status != 0 {
         return Err(GpuError::backend(
             backend,
-            format!(
-                "qwen36_moe batched_prefill_grouped_expert_launch failed with status {status}"
-            ),
+            format!("qwen36_moe batched_prefill_grouped_expert_launch failed with status {status}"),
         ));
     }
-    let _ = (ordinal, n_tokens, top_k, num_experts, hidden, moe_intermediate, group_size);
+    let _ = (
+        ordinal,
+        n_tokens,
+        top_k,
+        num_experts,
+        hidden,
+        moe_intermediate,
+        group_size,
+    );
     Ok(())
 }
 
@@ -2654,6 +4212,2407 @@ mod tests {
         assert!(d.kv_cache_k.is_null());
         assert!(d.linear_recurrent_state.is_null());
         assert!(d.experts_gate_up_w.is_null());
+    }
+
+    #[cfg(all(target_os = "macos", supersonic_backend_metal))]
+    fn bf16_bytes(values: &[f32]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| half::bf16::from_f32(*value).to_bits().to_le_bytes())
+            .collect()
+    }
+
+    #[cfg(all(target_os = "macos", supersonic_backend_metal))]
+    fn read_bf16(buffer: &GpuBuffer) -> Vec<f32> {
+        let bytes = buffer.to_host_bytes().expect("download bf16");
+        bytes
+            .chunks_exact(2)
+            .map(|chunk| half::bf16::from_bits(u16::from_le_bytes([chunk[0], chunk[1]])).to_f32())
+            .collect()
+    }
+
+    #[cfg(all(target_os = "macos", supersonic_backend_metal))]
+    fn upload_bf16(ordinal: usize, shape: &[usize], values: &[f32]) -> GpuBuffer {
+        GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, shape, &bf16_bytes(values))
+            .expect("upload bf16")
+    }
+
+    #[cfg(all(target_os = "macos", supersonic_backend_metal))]
+    fn upload_int4_rows(
+        ordinal: usize,
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+        nibbles: &[Vec<u8>],
+        scale_value: f32,
+    ) -> (GpuBuffer, GpuBuffer, GpuBuffer) {
+        let mut packed = Vec::with_capacity(rows * cols.div_ceil(2));
+        for row in nibbles {
+            for pair in row.chunks(2) {
+                let lo = pair[0] & 0x0f;
+                let hi = pair.get(1).copied().unwrap_or(0) & 0x0f;
+                packed.push(lo | (hi << 4));
+            }
+        }
+        let weights =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[rows, cols.div_ceil(2)], &packed)
+                .expect("upload qwen36 int4 rows");
+        let sidecar_len = rows.div_ceil(group_size) * cols.div_ceil(group_size);
+        let scale = upload_bf16(ordinal, &[sidecar_len], &vec![scale_value; sidecar_len]);
+        let zero = upload_bf16(ordinal, &[sidecar_len], &vec![0.0; sidecar_len]);
+        (weights, scale, zero)
+    }
+
+    #[cfg(all(target_os = "macos", supersonic_backend_metal))]
+    fn f32_bytes(values: &[f32]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect()
+    }
+
+    #[cfg(all(target_os = "macos", supersonic_backend_metal))]
+    fn upload_f32(ordinal: usize, shape: &[usize], values: &[f32]) -> GpuBuffer {
+        GpuBuffer::from_host_bytes(ordinal, ScalarType::F32, shape, &f32_bytes(values))
+            .expect("upload f32")
+    }
+
+    #[cfg(all(target_os = "macos", supersonic_backend_metal))]
+    fn read_f32(buffer: &GpuBuffer) -> Vec<f32> {
+        let bytes = buffer.to_host_bytes().expect("download f32");
+        bytes
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect()
+    }
+
+    #[cfg(all(target_os = "macos", supersonic_backend_metal))]
+    fn qwen36_lm_head_reference(
+        hidden_rows: &[f32],
+        norm_w: &[f32],
+        lm_head: &[f32],
+        rows: usize,
+        hidden: usize,
+        vocab: usize,
+        eps: f32,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let mut normed = vec![0.0f32; rows * hidden];
+        let mut logits = vec![0.0f32; rows * vocab];
+        for row in 0..rows {
+            let hidden_base = row * hidden;
+            let mean_sq = hidden_rows[hidden_base..hidden_base + hidden]
+                .iter()
+                .map(|v| v * v)
+                .sum::<f32>()
+                / hidden as f32;
+            let inv = 1.0 / (mean_sq + eps).sqrt();
+            for col in 0..hidden {
+                normed[hidden_base + col] = half::bf16::from_f32(
+                    hidden_rows[hidden_base + col] * inv * (1.0 + norm_w[col]),
+                )
+                .to_f32();
+            }
+            for tok in 0..vocab {
+                let mut acc = 0.0f32;
+                for col in 0..hidden {
+                    acc += normed[hidden_base + col] * lm_head[tok * hidden + col];
+                }
+                logits[row * vocab + tok] = half::bf16::from_f32(acc).to_f32();
+            }
+        }
+        (normed, logits)
+    }
+
+    #[cfg(all(target_os = "macos", supersonic_backend_metal))]
+    fn bf16_round(value: f32) -> f32 {
+        half::bf16::from_f32(value).to_f32()
+    }
+
+    #[cfg(all(target_os = "macos", supersonic_backend_metal))]
+    fn qwen36_mtp_pre_fusion_reference(
+        e_in: &[f32],
+        h_base: &[f32],
+        e_norm_w: &[f32],
+        h_norm_w: &[f32],
+        fc_w: &[f32],
+        hidden: usize,
+        eps: f32,
+    ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        fn norm(input: &[f32], weight: &[f32], hidden: usize, eps: f32) -> Vec<f32> {
+            let input_bf16: Vec<f32> = input.iter().copied().map(bf16_round).collect();
+            let weight_bf16: Vec<f32> = weight.iter().copied().map(bf16_round).collect();
+            let mean_sq = input_bf16.iter().map(|v| v * v).sum::<f32>() / hidden as f32;
+            let inv = 1.0 / (mean_sq + eps).sqrt();
+            (0..hidden)
+                .map(|idx| bf16_round(input_bf16[idx] * inv * (1.0 + weight_bf16[idx])))
+                .collect()
+        }
+
+        let e_norm = norm(e_in, e_norm_w, hidden, eps);
+        let h_norm = norm(h_base, h_norm_w, hidden, eps);
+        let mut cat = Vec::with_capacity(2 * hidden);
+        cat.extend_from_slice(&e_norm);
+        cat.extend_from_slice(&h_norm);
+        let fc_w_bf16: Vec<f32> = fc_w.iter().copied().map(bf16_round).collect();
+        let mut fused = vec![0.0f32; hidden];
+        for row in 0..hidden {
+            let mut acc = 0.0f32;
+            for col in 0..(2 * hidden) {
+                acc += cat[col] * fc_w_bf16[row * 2 * hidden + col];
+            }
+            fused[row] = bf16_round(acc);
+        }
+        (e_norm, h_norm, fused)
+    }
+
+    #[cfg(all(target_os = "macos", supersonic_backend_metal))]
+    fn qwen36_ffn_stage1_reference(
+        input_hidden: &[f32],
+        norm_w: &[f32],
+        gate_w: &[f32],
+        hidden: usize,
+        num_experts: usize,
+        top_k: usize,
+        eps: f32,
+    ) -> (Vec<f32>, Vec<i32>) {
+        let input_bf16: Vec<f32> = input_hidden.iter().copied().map(bf16_round).collect();
+        let norm_w_bf16: Vec<f32> = norm_w.iter().copied().map(bf16_round).collect();
+        let gate_w_bf16: Vec<f32> = gate_w.iter().copied().map(bf16_round).collect();
+        let mean_sq = input_bf16.iter().map(|v| v * v).sum::<f32>() / hidden as f32;
+        let inv = 1.0 / (mean_sq + eps).sqrt();
+        let h_norm: Vec<f32> = (0..hidden)
+            .map(|idx| bf16_round(input_bf16[idx] * inv * (1.0 + norm_w_bf16[idx])))
+            .collect();
+        let mut logits = vec![0.0f32; num_experts];
+        for expert in 0..num_experts {
+            let mut acc = 0.0f32;
+            for col in 0..hidden {
+                acc += gate_w_bf16[expert * hidden + col] * h_norm[col];
+            }
+            logits[expert] = bf16_round(acc);
+        }
+        let row_max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let exps: Vec<f32> = logits.iter().map(|v| (v - row_max).exp()).collect();
+        let sum = exps.iter().sum::<f32>();
+        let mut probs: Vec<f32> = exps.iter().map(|v| bf16_round(v / sum)).collect();
+        let mut idx = vec![0i32; top_k];
+        let mut weights = vec![0.0f32; top_k];
+        for k in 0..top_k {
+            let mut best_idx = -1i32;
+            let mut best_val = f32::NEG_INFINITY;
+            for (expert, &value) in probs.iter().enumerate() {
+                if value > best_val
+                    || (value == best_val && best_idx >= 0 && (expert as i32) < best_idx)
+                {
+                    best_val = value;
+                    best_idx = expert as i32;
+                }
+            }
+            idx[k] = best_idx;
+            weights[k] = best_val;
+            probs[best_idx as usize] = f32::NEG_INFINITY;
+        }
+        let sum_k = weights.iter().sum::<f32>();
+        for weight in weights.iter_mut() {
+            *weight = bf16_round(*weight / sum_k);
+        }
+        (weights, idx)
+    }
+
+    #[cfg(all(target_os = "macos", supersonic_backend_metal))]
+    fn qwen36_ffn_stage1_5_reference(
+        stage: usize,
+        input_hidden: &[f32],
+        norm_w: &[f32],
+        gate_w: &[f32],
+        gate_up_proj_w: &[f32],
+        down_proj_w: &[f32],
+        shared_gate_proj_w: &[f32],
+        shared_up_proj_w: &[f32],
+        shared_down_proj_w: &[f32],
+        shared_expert_gate_w: &[f32],
+        hidden: usize,
+        num_experts: usize,
+        moe_intermediate: usize,
+        shared_intermediate: usize,
+        top_k: usize,
+        eps: f32,
+    ) -> (Vec<f32>, Vec<i32>) {
+        let input_bf16: Vec<f32> = input_hidden.iter().copied().map(bf16_round).collect();
+        let norm_w_bf16: Vec<f32> = norm_w.iter().copied().map(bf16_round).collect();
+        let gate_w_bf16: Vec<f32> = gate_w.iter().copied().map(bf16_round).collect();
+        let gu_w_bf16: Vec<f32> = gate_up_proj_w.iter().copied().map(bf16_round).collect();
+        let down_w_bf16: Vec<f32> = down_proj_w.iter().copied().map(bf16_round).collect();
+        let sgp_w_bf16: Vec<f32> = shared_gate_proj_w.iter().copied().map(bf16_round).collect();
+        let sup_w_bf16: Vec<f32> = shared_up_proj_w.iter().copied().map(bf16_round).collect();
+        let sd_w_bf16: Vec<f32> = shared_down_proj_w.iter().copied().map(bf16_round).collect();
+        let seg_w_bf16: Vec<f32> = shared_expert_gate_w
+            .iter()
+            .copied()
+            .map(bf16_round)
+            .collect();
+
+        let mean_sq = input_bf16.iter().map(|v| v * v).sum::<f32>() / hidden as f32;
+        let inv = 1.0 / (mean_sq + eps).sqrt();
+        let h_norm: Vec<f32> = (0..hidden)
+            .map(|idx| bf16_round(input_bf16[idx] * inv * (1.0 + norm_w_bf16[idx])))
+            .collect();
+
+        let mut logits = vec![0.0f32; num_experts];
+        for expert in 0..num_experts {
+            let mut acc = 0.0f32;
+            for col in 0..hidden {
+                acc += gate_w_bf16[expert * hidden + col] * h_norm[col];
+            }
+            logits[expert] = bf16_round(acc);
+        }
+        let row_max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let exps: Vec<f32> = logits.iter().map(|v| (v - row_max).exp()).collect();
+        let sum = exps.iter().sum::<f32>();
+        let mut probs: Vec<f32> = exps.iter().map(|v| bf16_round(v / sum)).collect();
+        let mut idx = vec![0i32; top_k];
+        let mut topk_w = vec![0.0f32; top_k];
+        for k in 0..top_k {
+            let mut best_idx = -1i32;
+            let mut best_val = f32::NEG_INFINITY;
+            for (expert, &value) in probs.iter().enumerate() {
+                if value > best_val
+                    || (value == best_val && best_idx >= 0 && (expert as i32) < best_idx)
+                {
+                    best_val = value;
+                    best_idx = expert as i32;
+                }
+            }
+            idx[k] = best_idx;
+            topk_w[k] = best_val;
+            probs[best_idx as usize] = f32::NEG_INFINITY;
+        }
+        let sum_k = topk_w.iter().sum::<f32>();
+        for weight in topk_w.iter_mut() {
+            *weight = bf16_round(*weight / sum_k);
+        }
+        if stage == 1 {
+            return (topk_w, idx);
+        }
+
+        let mut sgp = vec![0.0f32; shared_intermediate];
+        let mut sup = vec![0.0f32; shared_intermediate];
+        for row in 0..shared_intermediate {
+            for col in 0..hidden {
+                sgp[row] += sgp_w_bf16[row * hidden + col] * h_norm[col];
+                sup[row] += sup_w_bf16[row * hidden + col] * h_norm[col];
+            }
+        }
+        let mut sg_scalar = 0.0f32;
+        for col in 0..hidden {
+            sg_scalar += seg_w_bf16[col] * h_norm[col];
+        }
+        sg_scalar = 1.0 / (1.0 + (-sg_scalar).exp());
+        let mut shared_mid = vec![0.0f32; shared_intermediate];
+        for i in 0..shared_intermediate {
+            shared_mid[i] = sgp[i] * (1.0 / (1.0 + (-sgp[i]).exp())) * sup[i];
+        }
+        let mut shared_out = vec![0.0f32; hidden];
+        for row in 0..hidden {
+            let mut acc = 0.0f32;
+            for col in 0..shared_intermediate {
+                acc += sd_w_bf16[row * shared_intermediate + col] * shared_mid[col];
+            }
+            shared_out[row] = bf16_round(sg_scalar * acc);
+        }
+        if stage == 2 {
+            return (shared_out, idx);
+        }
+
+        let active = if stage == 3 { 1 } else { top_k };
+        let mut expert_stack = vec![0.0f32; top_k * hidden];
+        for group in 0..active {
+            let expert = idx[group] as usize;
+            let mut gu = vec![0.0f32; 2 * moe_intermediate];
+            let gu_base = expert * 2 * moe_intermediate * hidden;
+            for row in 0..2 * moe_intermediate {
+                for col in 0..hidden {
+                    gu[row] += gu_w_bf16[gu_base + row * hidden + col] * h_norm[col];
+                }
+            }
+            let mut mid = vec![0.0f32; moe_intermediate];
+            for i in 0..moe_intermediate {
+                mid[i] = gu[i] * (1.0 / (1.0 + (-gu[i]).exp())) * gu[moe_intermediate + i];
+            }
+            let down_base = expert * hidden * moe_intermediate;
+            for row in 0..hidden {
+                let mut acc = 0.0f32;
+                for col in 0..moe_intermediate {
+                    acc += down_w_bf16[down_base + row * moe_intermediate + col] * mid[col];
+                }
+                expert_stack[group * hidden + row] = acc;
+            }
+        }
+        if stage == 3 {
+            return (
+                expert_stack[..hidden]
+                    .iter()
+                    .copied()
+                    .map(bf16_round)
+                    .collect(),
+                idx,
+            );
+        }
+
+        let mut moe_out = vec![0.0f32; hidden];
+        for row in 0..hidden {
+            let mut acc = 0.0f32;
+            for group in 0..top_k {
+                acc += topk_w[group] * expert_stack[group * hidden + row];
+            }
+            moe_out[row] = bf16_round(acc);
+        }
+        if stage == 4 {
+            return (moe_out, idx);
+        }
+
+        let mut out = vec![0.0f32; hidden];
+        for row in 0..hidden {
+            out[row] = bf16_round(input_bf16[row] + moe_out[row] + shared_out[row]);
+        }
+        (out, idx)
+    }
+
+    #[cfg(all(target_os = "macos", supersonic_backend_metal))]
+    fn qwen36_attn_stage1_reference(
+        input_hidden: &[f32],
+        input_norm_w: &[f32],
+        q_proj_w: &[f32],
+        q_norm_w: &[f32],
+        hidden: usize,
+        num_heads: usize,
+        head_dim: usize,
+        eps: f32,
+    ) -> Vec<f32> {
+        let input_bf16: Vec<f32> = input_hidden.iter().copied().map(bf16_round).collect();
+        let norm_w_bf16: Vec<f32> = input_norm_w.iter().copied().map(bf16_round).collect();
+        let q_proj_w_bf16: Vec<f32> = q_proj_w.iter().copied().map(bf16_round).collect();
+        let q_norm_w_bf16: Vec<f32> = q_norm_w.iter().copied().map(bf16_round).collect();
+        let mean_sq = input_bf16.iter().map(|v| v * v).sum::<f32>() / hidden as f32;
+        let inv = 1.0 / (mean_sq + eps).sqrt();
+        let x_norm: Vec<f32> = (0..hidden)
+            .map(|idx| bf16_round(input_bf16[idx] * inv * (1.0 + norm_w_bf16[idx])))
+            .collect();
+        let q_out_dim = 2 * num_heads * head_dim;
+        let mut q_raw = vec![0.0f32; q_out_dim];
+        for row in 0..q_out_dim {
+            let mut acc = 0.0f32;
+            for col in 0..hidden {
+                acc += q_proj_w_bf16[row * hidden + col] * x_norm[col];
+            }
+            q_raw[row] = bf16_round(acc);
+        }
+        let mut q_normed = vec![0.0f32; num_heads * head_dim];
+        for head in 0..num_heads {
+            let q_in_base = head * 2 * head_dim;
+            let q_out_base = head * head_dim;
+            let mean_sq = (0..head_dim)
+                .map(|i| q_raw[q_in_base + i].powi(2))
+                .sum::<f32>()
+                / head_dim as f32;
+            let inv = 1.0 / (mean_sq + eps).sqrt();
+            for i in 0..head_dim {
+                q_normed[q_out_base + i] =
+                    bf16_round(q_raw[q_in_base + i] * inv * (1.0 + q_norm_w_bf16[i]));
+            }
+        }
+        q_normed
+    }
+
+    #[cfg(all(target_os = "macos", supersonic_backend_metal))]
+    fn qwen36_attn_stage1_5_reference(
+        stage: usize,
+        input_hidden: &[f32],
+        input_norm_w: &[f32],
+        q_proj_w: &[f32],
+        k_proj_w: &[f32],
+        v_proj_w: &[f32],
+        q_norm_w: &[f32],
+        k_norm_w: &[f32],
+        o_proj_w: &[f32],
+        hidden: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        rotary_dim: usize,
+        rope_theta: f32,
+        position: i32,
+        eps: f32,
+    ) -> Vec<f32> {
+        let input_bf16: Vec<f32> = input_hidden.iter().copied().map(bf16_round).collect();
+        let norm_w_bf16: Vec<f32> = input_norm_w.iter().copied().map(bf16_round).collect();
+        let q_proj_w_bf16: Vec<f32> = q_proj_w.iter().copied().map(bf16_round).collect();
+        let k_proj_w_bf16: Vec<f32> = k_proj_w.iter().copied().map(bf16_round).collect();
+        let v_proj_w_bf16: Vec<f32> = v_proj_w.iter().copied().map(bf16_round).collect();
+        let q_norm_w_bf16: Vec<f32> = q_norm_w.iter().copied().map(bf16_round).collect();
+        let k_norm_w_bf16: Vec<f32> = k_norm_w.iter().copied().map(bf16_round).collect();
+        let o_proj_w_bf16: Vec<f32> = o_proj_w.iter().copied().map(bf16_round).collect();
+
+        let mean_sq = input_bf16.iter().map(|v| v * v).sum::<f32>() / hidden as f32;
+        let inv = 1.0 / (mean_sq + eps).sqrt();
+        let x_norm: Vec<f32> = (0..hidden)
+            .map(|idx| bf16_round(input_bf16[idx] * inv * (1.0 + norm_w_bf16[idx])))
+            .collect();
+
+        let q_out_dim = 2 * num_heads * head_dim;
+        let kv_dim = num_kv_heads * head_dim;
+        let mut q_raw = vec![0.0f32; q_out_dim];
+        for row in 0..q_out_dim {
+            let mut acc = 0.0f32;
+            for col in 0..hidden {
+                acc += q_proj_w_bf16[row * hidden + col] * x_norm[col];
+            }
+            q_raw[row] = bf16_round(acc);
+        }
+        let mut q_normed = vec![0.0f32; num_heads * head_dim];
+        for head in 0..num_heads {
+            let q_in_base = head * 2 * head_dim;
+            let q_out_base = head * head_dim;
+            let mean_sq = (0..head_dim)
+                .map(|i| q_raw[q_in_base + i].powi(2))
+                .sum::<f32>()
+                / head_dim as f32;
+            let inv = 1.0 / (mean_sq + eps).sqrt();
+            for i in 0..head_dim {
+                q_normed[q_out_base + i] =
+                    bf16_round(q_raw[q_in_base + i] * inv * (1.0 + q_norm_w_bf16[i]));
+            }
+        }
+        if stage == 1 {
+            return q_normed;
+        }
+
+        let mut k_raw = vec![0.0f32; kv_dim];
+        let mut v_raw = vec![0.0f32; kv_dim];
+        for row in 0..kv_dim {
+            let mut k_acc = 0.0f32;
+            let mut v_acc = 0.0f32;
+            for col in 0..hidden {
+                k_acc += k_proj_w_bf16[row * hidden + col] * x_norm[col];
+                v_acc += v_proj_w_bf16[row * hidden + col] * x_norm[col];
+            }
+            k_raw[row] = bf16_round(k_acc);
+            v_raw[row] = bf16_round(v_acc);
+        }
+        let mut k_normed = vec![0.0f32; kv_dim];
+        for head in 0..num_kv_heads {
+            let base = head * head_dim;
+            let mean_sq =
+                (0..head_dim).map(|i| k_raw[base + i].powi(2)).sum::<f32>() / head_dim as f32;
+            let inv = 1.0 / (mean_sq + eps).sqrt();
+            for i in 0..head_dim {
+                k_normed[base + i] = bf16_round(k_raw[base + i] * inv * (1.0 + k_norm_w_bf16[i]));
+            }
+        }
+        if stage == 2 {
+            return k_normed;
+        }
+
+        fn rope(
+            input: &[f32],
+            num_heads: usize,
+            head_dim: usize,
+            rotary_dim: usize,
+            rope_theta: f32,
+            position: i32,
+        ) -> Vec<f32> {
+            let mut out = input.to_vec();
+            let half = rotary_dim / 2;
+            let theta_log = rope_theta.ln();
+            for head in 0..num_heads {
+                let base = head * head_dim;
+                for i in 0..half {
+                    let a = input[base + i];
+                    let b = input[base + half + i];
+                    let freq = position as f32 * (-((i as f32 / half as f32) * theta_log)).exp();
+                    let c = bf16_round(freq.cos());
+                    let s = bf16_round(freq.sin());
+                    out[base + i] = bf16_round(bf16_round(a * c) - bf16_round(b * s));
+                    out[base + half + i] = bf16_round(bf16_round(b * c) + bf16_round(a * s));
+                }
+            }
+            out
+        }
+
+        let q_rot = rope(
+            &q_normed, num_heads, head_dim, rotary_dim, rope_theta, position,
+        );
+        let k_rot = rope(
+            &k_normed,
+            num_kv_heads,
+            head_dim,
+            rotary_dim,
+            rope_theta,
+            position,
+        );
+        if stage == 3 {
+            let mut out = q_rot;
+            out.extend_from_slice(&k_rot);
+            return out;
+        }
+
+        let rep = num_heads / num_kv_heads;
+        let mut attn = vec![0.0f32; num_heads * head_dim];
+        for hq in 0..num_heads {
+            let h_kv = hq / rep;
+            for i in 0..head_dim {
+                attn[hq * head_dim + i] = v_raw[h_kv * head_dim + i];
+            }
+        }
+        if stage == 4 {
+            return attn;
+        }
+
+        let mut gated = vec![0.0f32; num_heads * head_dim];
+        for h in 0..num_heads {
+            for i in 0..head_dim {
+                let out_gate = q_raw[h * 2 * head_dim + head_dim + i];
+                let sig = bf16_round(1.0 / (1.0 + (-out_gate).exp()));
+                gated[h * head_dim + i] = bf16_round(sig * attn[h * head_dim + i]);
+            }
+        }
+        let qd = num_heads * head_dim;
+        let mut out = vec![0.0f32; hidden];
+        for row in 0..hidden {
+            let mut acc = 0.0f32;
+            for col in 0..qd {
+                acc += o_proj_w_bf16[row * qd + col] * gated[col];
+            }
+            out[row] = bf16_round(input_bf16[row] + bf16_round(acc));
+        }
+        out
+    }
+
+    #[cfg(all(target_os = "macos", supersonic_backend_metal))]
+    fn qwen36_linear_stage1_reference(
+        input_hidden: &[f32],
+        input_norm_w: &[f32],
+        in_proj_qkv_w: &[f32],
+        hidden: usize,
+        qkv_dim: usize,
+        eps: f32,
+    ) -> Vec<f32> {
+        let input_bf16: Vec<f32> = input_hidden.iter().copied().map(bf16_round).collect();
+        let norm_w_bf16: Vec<f32> = input_norm_w.iter().copied().map(bf16_round).collect();
+        let qkv_w_bf16: Vec<f32> = in_proj_qkv_w.iter().copied().map(bf16_round).collect();
+        let mean_sq = input_bf16.iter().map(|v| v * v).sum::<f32>() / hidden as f32;
+        let inv = 1.0 / (mean_sq + eps).sqrt();
+        let x_norm: Vec<f32> = (0..hidden)
+            .map(|idx| bf16_round(input_bf16[idx] * inv * (1.0 + norm_w_bf16[idx])))
+            .collect();
+        let mut qkv_raw = vec![0.0f32; qkv_dim];
+        for row in 0..qkv_dim {
+            let mut acc = 0.0f32;
+            for col in 0..hidden {
+                acc += qkv_w_bf16[row * hidden + col] * x_norm[col];
+            }
+            qkv_raw[row] = bf16_round(acc);
+        }
+        qkv_raw
+    }
+
+    #[cfg(all(target_os = "macos", supersonic_backend_metal))]
+    fn qwen36_linear_stage2_reference(
+        qkv_raw: &[f32],
+        conv_state: &[f32],
+        conv1d_w: &[f32],
+        conv1d_bias: Option<&[f32]>,
+        qkv_dim: usize,
+        kernel: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let qkv_bf16: Vec<f32> = qkv_raw.iter().copied().map(bf16_round).collect();
+        let state_bf16: Vec<f32> = conv_state.iter().copied().map(bf16_round).collect();
+        let weight_bf16: Vec<f32> = conv1d_w.iter().copied().map(bf16_round).collect();
+        let bias_bf16 = conv1d_bias.map(|b| b.iter().copied().map(bf16_round).collect::<Vec<_>>());
+        let kstate = kernel - 1;
+        let mut silu_out = vec![0.0f32; qkv_dim];
+        let mut next_state = state_bf16.clone();
+        for ch in 0..qkv_dim {
+            let mut acc = 0.0f32;
+            for t in 0..kstate {
+                acc += state_bf16[ch * kstate + t] * weight_bf16[ch * kernel + t];
+            }
+            acc += qkv_bf16[ch] * weight_bf16[ch * kernel + kstate];
+            if let Some(bias) = bias_bf16.as_ref() {
+                acc += bias[ch];
+            }
+            let conv_out = bf16_round(acc);
+            silu_out[ch] = bf16_round(conv_out * (1.0 / (1.0 + (-conv_out).exp())));
+            for t in 0..kstate.saturating_sub(1) {
+                next_state[ch * kstate + t] = state_bf16[ch * kstate + t + 1];
+            }
+            if kstate > 0 {
+                next_state[ch * kstate + (kstate - 1)] = qkv_bf16[ch];
+            }
+        }
+        (silu_out, next_state)
+    }
+
+    #[cfg(all(target_os = "macos", supersonic_backend_metal))]
+    fn qwen36_linear_stage3_reference(
+        silu_out: &[f32],
+        num_k_heads: usize,
+        num_v_heads: usize,
+        head_k_dim: usize,
+        head_v_dim: usize,
+    ) -> Vec<f32> {
+        let key_dim = num_k_heads * head_k_dim;
+        let val_dim = num_v_heads * head_v_dim;
+        let mut q_normed = vec![0.0f32; key_dim];
+        let mut k_normed = vec![0.0f32; key_dim];
+        for head in 0..num_k_heads {
+            let q_base = head * head_k_dim;
+            let k_base = key_dim + head * head_k_dim;
+            let q_ss = (0..head_k_dim)
+                .map(|i| silu_out[q_base + i] * silu_out[q_base + i])
+                .sum::<f32>();
+            let k_ss = (0..head_k_dim)
+                .map(|i| silu_out[k_base + i] * silu_out[k_base + i])
+                .sum::<f32>();
+            let q_denom = bf16_round(bf16_round(q_ss.sqrt()).max(1e-6));
+            let k_denom = bf16_round(bf16_round(k_ss.sqrt()).max(1e-6));
+            for i in 0..head_k_dim {
+                q_normed[q_base + i] = bf16_round(silu_out[q_base + i] / q_denom);
+                k_normed[head * head_k_dim + i] = bf16_round(silu_out[k_base + i] / k_denom);
+            }
+        }
+
+        let mut out = vec![0.0f32; 2 * num_v_heads * head_k_dim + val_dim];
+        let rep = num_v_heads / num_k_heads;
+        let q_scale = 1.0f32 / (head_k_dim as f32).sqrt();
+        for vhead in 0..num_v_heads {
+            let src_kh = vhead / rep;
+            for i in 0..head_k_dim {
+                out[vhead * head_k_dim + i] =
+                    bf16_round(q_normed[src_kh * head_k_dim + i] * q_scale);
+                out[num_v_heads * head_k_dim + vhead * head_k_dim + i] =
+                    k_normed[src_kh * head_k_dim + i];
+            }
+            let v_src = 2 * key_dim + vhead * head_v_dim;
+            let v_dst = 2 * num_v_heads * head_k_dim + vhead * head_v_dim;
+            for i in 0..head_v_dim {
+                out[v_dst + i] = silu_out[v_src + i];
+            }
+        }
+        out
+    }
+
+    #[cfg(all(target_os = "macos", supersonic_backend_metal))]
+    fn qwen36_linear_stage4_reference(
+        stage3_out: &[f32],
+        a_raw: &[f32],
+        b_raw: &[f32],
+        dt_bias: &[f32],
+        a_log: &[f32],
+        recurrent_state: &[f32],
+        num_v_heads: usize,
+        head_k_dim: usize,
+        head_v_dim: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let val_dim = num_v_heads * head_v_dim;
+        let q_scaled = &stage3_out[..num_v_heads * head_k_dim];
+        let k_rep = &stage3_out[num_v_heads * head_k_dim..2 * num_v_heads * head_k_dim];
+        let v_heads =
+            &stage3_out[2 * num_v_heads * head_k_dim..2 * num_v_heads * head_k_dim + val_dim];
+        let a_bf16: Vec<f32> = a_raw.iter().copied().map(bf16_round).collect();
+        let b_bf16: Vec<f32> = b_raw.iter().copied().map(bf16_round).collect();
+        let dt_bf16: Vec<f32> = dt_bias.iter().copied().map(bf16_round).collect();
+        let alog_bf16: Vec<f32> = a_log.iter().copied().map(bf16_round).collect();
+        let mut state = recurrent_state.to_vec();
+        let mut rec_out = vec![0.0f32; val_dim];
+
+        for head in 0..num_v_heads {
+            let beta = 1.0 / (1.0 + (-b_bf16[head]).exp());
+            let softplus = (1.0 + (a_bf16[head] + dt_bf16[head]).exp()).ln();
+            let gstep = (-softplus * alog_bf16[head].exp()).exp();
+            let state_off = head * head_k_dim * head_v_dim;
+            let q_off = head * head_k_dim;
+            let v_off = head * head_v_dim;
+
+            for e in 0..head_k_dim * head_v_dim {
+                state[state_off + e] *= gstep;
+            }
+            let mut kv_mem = vec![0.0f32; head_v_dim];
+            for j in 0..head_v_dim {
+                for i in 0..head_k_dim {
+                    kv_mem[j] += state[state_off + i * head_v_dim + j] * k_rep[q_off + i];
+                }
+            }
+            let mut delta = vec![0.0f32; head_v_dim];
+            for j in 0..head_v_dim {
+                delta[j] = (v_heads[v_off + j] - kv_mem[j]) * beta;
+            }
+            for i in 0..head_k_dim {
+                for j in 0..head_v_dim {
+                    state[state_off + i * head_v_dim + j] += k_rep[q_off + i] * delta[j];
+                }
+            }
+            for j in 0..head_v_dim {
+                let mut acc = 0.0f32;
+                for i in 0..head_k_dim {
+                    acc += state[state_off + i * head_v_dim + j] * q_scaled[q_off + i];
+                }
+                rec_out[v_off + j] = bf16_round(acc);
+            }
+        }
+
+        (rec_out, state)
+    }
+
+    #[cfg(all(target_os = "macos", supersonic_backend_metal))]
+    fn qwen36_linear_stage5_reference(
+        input_hidden: &[f32],
+        rec_out: &[f32],
+        z_raw: &[f32],
+        norm_w: &[f32],
+        out_proj_w: &[f32],
+        hidden: usize,
+        num_v_heads: usize,
+        head_v_dim: usize,
+        eps: f32,
+    ) -> Vec<f32> {
+        let val_dim = num_v_heads * head_v_dim;
+        let rec_bf16: Vec<f32> = rec_out.iter().copied().map(bf16_round).collect();
+        let z_bf16: Vec<f32> = z_raw.iter().copied().map(bf16_round).collect();
+        let norm_w_bf16: Vec<f32> = norm_w.iter().copied().map(bf16_round).collect();
+        let out_w_bf16: Vec<f32> = out_proj_w.iter().copied().map(bf16_round).collect();
+        let input_bf16: Vec<f32> = input_hidden.iter().copied().map(bf16_round).collect();
+        let mut gated = vec![0.0f32; val_dim];
+        for head in 0..num_v_heads {
+            let rec_off = head * head_v_dim;
+            let mean_sq = (0..head_v_dim)
+                .map(|j| rec_bf16[rec_off + j] * rec_bf16[rec_off + j])
+                .sum::<f32>()
+                / head_v_dim as f32;
+            let inv = 1.0 / (mean_sq + eps).sqrt();
+            for j in 0..head_v_dim {
+                let on = bf16_round(rec_bf16[rec_off + j] * inv * norm_w_bf16[j]);
+                let z = z_bf16[rec_off + j];
+                let z_silu = bf16_round(z * (1.0 / (1.0 + (-z).exp())));
+                gated[rec_off + j] = bf16_round(on * z_silu);
+            }
+        }
+        let mut out = vec![0.0f32; hidden];
+        for row in 0..hidden {
+            let mut acc = 0.0f32;
+            for col in 0..val_dim {
+                acc += out_w_bf16[row * val_dim + col] * gated[col];
+            }
+            out[row] = bf16_round(input_bf16[row] + bf16_round(acc));
+        }
+        out
+    }
+
+    #[cfg(all(target_os = "macos", supersonic_backend_metal))]
+    #[test]
+    fn metal_lm_head_fallback_runs_and_captures_normed() {
+        use gpu_hal::{set_backend, Backend};
+
+        set_backend(Backend::Metal);
+        let ordinal = 0usize;
+        let hidden = 4usize;
+        let vocab = 4usize;
+        let eps = 0.0f32;
+        let hidden_vals = [1.0, 0.5, -1.0, 2.0];
+        let norm_vals = [0.0, 0.25, -0.5, 1.0];
+        let lm_vals = [
+            1.0, 0.0, 0.0, 0.0, //
+            0.0, 1.0, 0.0, 0.0, //
+            0.0, 0.0, 1.0, 0.0, //
+            0.0, 0.0, 0.0, 1.0, //
+        ];
+        let hidden_buf = upload_bf16(ordinal, &[hidden], &hidden_vals);
+        let norm_buf = upload_bf16(ordinal, &[hidden], &norm_vals);
+        let lm_buf = upload_bf16(ordinal, &[vocab, hidden], &lm_vals);
+        let mut logits = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[vocab])
+            .expect("alloc qwen36 metal logits");
+        let mut normed = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[hidden])
+            .expect("alloc qwen36 metal normed");
+        let mut counter = GpuBuffer::zeros(ordinal, ScalarType::U32, &[1]).expect("alloc counter");
+
+        lm_head_launch(
+            ordinal,
+            hidden as i32,
+            vocab as i32,
+            eps,
+            &hidden_buf,
+            &norm_buf,
+            &lm_buf,
+            &mut logits,
+            Some(&mut normed),
+            &mut counter,
+        )
+        .expect("run Qwen3.6-MoE Metal lm_head fallback");
+
+        let (expected_normed, expected_logits) =
+            qwen36_lm_head_reference(&hidden_vals, &norm_vals, &lm_vals, 1, hidden, vocab, eps);
+        for (idx, (a, e)) in read_bf16(&normed)
+            .iter()
+            .zip(expected_normed.iter())
+            .enumerate()
+        {
+            assert!(
+                (a - e).abs() <= 0.01,
+                "normed idx {idx}: expected {e}, got {a}"
+            );
+        }
+        for (idx, (a, e)) in read_bf16(&logits)
+            .iter()
+            .zip(expected_logits.iter())
+            .enumerate()
+        {
+            assert!(
+                (a - e).abs() <= 0.01,
+                "logit idx {idx}: expected {e}, got {a}"
+            );
+        }
+    }
+
+    #[cfg(all(target_os = "macos", supersonic_backend_metal))]
+    #[test]
+    fn metal_lm_head_batched_fallback_matches_rows() {
+        use gpu_hal::{set_backend, Backend};
+
+        set_backend(Backend::Metal);
+        let ordinal = 0usize;
+        let rows = 2usize;
+        let hidden = 4usize;
+        let vocab = 3usize;
+        let eps = 1e-5f32;
+        let hidden_vals = [1.0, 0.5, -1.0, 2.0, -0.25, 0.75, 1.5, -2.0];
+        let norm_vals = [0.0, 0.25, -0.5, 1.0];
+        let lm_vals = [
+            1.0, 0.0, 0.0, 0.0, //
+            0.0, 1.0, 0.0, 0.0, //
+            0.25, -0.5, 0.75, 1.0, //
+        ];
+        let hidden_buf = upload_bf16(ordinal, &[rows, hidden], &hidden_vals);
+        let norm_buf = upload_bf16(ordinal, &[hidden], &norm_vals);
+        let lm_buf = upload_bf16(ordinal, &[vocab, hidden], &lm_vals);
+        let mut logits = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[rows, vocab])
+            .expect("alloc qwen36 metal batched logits");
+        let mut normed = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[rows, hidden])
+            .expect("alloc qwen36 metal batched normed");
+
+        lm_head_batched_launch(
+            ordinal,
+            rows as i32,
+            hidden as i32,
+            vocab as i32,
+            eps,
+            &hidden_buf,
+            &norm_buf,
+            &lm_buf,
+            &mut logits,
+            Some(&mut normed),
+        )
+        .expect("run Qwen3.6-MoE Metal batched lm_head fallback");
+
+        let (expected_normed, expected_logits) =
+            qwen36_lm_head_reference(&hidden_vals, &norm_vals, &lm_vals, rows, hidden, vocab, eps);
+        for (idx, (a, e)) in read_bf16(&normed)
+            .iter()
+            .zip(expected_normed.iter())
+            .enumerate()
+        {
+            assert!(
+                (a - e).abs() <= 0.01,
+                "normed idx {idx}: expected {e}, got {a}"
+            );
+        }
+        for (idx, (a, e)) in read_bf16(&logits)
+            .iter()
+            .zip(expected_logits.iter())
+            .enumerate()
+        {
+            assert!(
+                (a - e).abs() <= 0.02,
+                "logit idx {idx}: expected {e}, got {a}"
+            );
+        }
+    }
+
+    #[cfg(all(target_os = "macos", supersonic_backend_metal))]
+    #[test]
+    fn metal_mtp_pre_fusion_fallback_matches_reference() {
+        use gpu_hal::{set_backend, Backend};
+
+        set_backend(Backend::Metal);
+        let ordinal = 0usize;
+        let hidden = 4usize;
+        let eps = 1e-5f32;
+        let e_in_vals = [1.0, 0.5, -1.0, 2.0];
+        let h_base_vals = [-0.25, 0.75, 1.5, -2.0];
+        let e_norm_w_vals = [0.0, 0.25, -0.5, 1.0];
+        let h_norm_w_vals = [0.5, -0.25, 0.0, 0.75];
+        let fc_w_vals = [
+            1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, //
+            0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, //
+            0.25, -0.5, 0.0, 0.0, 0.0, 0.0, 0.75, 1.0, //
+            0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, //
+        ];
+        let e_in = upload_bf16(ordinal, &[hidden], &e_in_vals);
+        let h_base = upload_bf16(ordinal, &[hidden], &h_base_vals);
+        let e_norm_w = upload_bf16(ordinal, &[hidden], &e_norm_w_vals);
+        let h_norm_w = upload_bf16(ordinal, &[hidden], &h_norm_w_vals);
+        let fc_w = upload_bf16(ordinal, &[hidden, 2 * hidden], &fc_w_vals);
+        let mut e_norm = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[hidden])
+            .expect("alloc qwen36 metal mtp e_norm");
+        let mut h_norm = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[hidden])
+            .expect("alloc qwen36 metal mtp h_norm");
+        let mut fused = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[hidden])
+            .expect("alloc qwen36 metal mtp fused");
+
+        mtp_pre_fusion_launch(
+            ordinal,
+            hidden as i32,
+            eps,
+            &e_in,
+            &h_base,
+            &e_norm_w,
+            &h_norm_w,
+            &fc_w,
+            &mut e_norm,
+            &mut h_norm,
+            &mut fused,
+        )
+        .expect("run Qwen3.6-MoE Metal MTP pre-fusion fallback");
+
+        let (expected_e_norm, expected_h_norm, expected_fused) = qwen36_mtp_pre_fusion_reference(
+            &e_in_vals,
+            &h_base_vals,
+            &e_norm_w_vals,
+            &h_norm_w_vals,
+            &fc_w_vals,
+            hidden,
+            eps,
+        );
+        for (idx, (a, e)) in read_bf16(&e_norm)
+            .iter()
+            .zip(expected_e_norm.iter())
+            .enumerate()
+        {
+            assert!(
+                (a - e).abs() <= 0.01,
+                "e_norm idx {idx}: expected {e}, got {a}"
+            );
+        }
+        for (idx, (a, e)) in read_bf16(&h_norm)
+            .iter()
+            .zip(expected_h_norm.iter())
+            .enumerate()
+        {
+            assert!(
+                (a - e).abs() <= 0.01,
+                "h_norm idx {idx}: expected {e}, got {a}"
+            );
+        }
+        for (idx, (a, e)) in read_bf16(&fused)
+            .iter()
+            .zip(expected_fused.iter())
+            .enumerate()
+        {
+            assert!(
+                (a - e).abs() <= 0.02,
+                "fused idx {idx}: expected {e}, got {a}"
+            );
+        }
+    }
+
+    #[cfg(all(target_os = "macos", supersonic_backend_metal))]
+    #[test]
+    fn metal_ffn_stage1_fallback_matches_reference() {
+        use gpu_hal::{set_backend, Backend};
+
+        set_backend(Backend::Metal);
+        let ordinal = 0usize;
+        let hidden = 4usize;
+        let num_experts = 4usize;
+        let top_k = 2usize;
+        let eps = 1e-5f32;
+        let input_vals = [1.0, 0.5, -1.0, 2.0];
+        let norm_vals = [0.0, 0.25, -0.5, 1.0];
+        let gate_vals = [
+            1.0, 0.0, 0.0, 0.0, //
+            0.0, 1.0, 0.0, 0.0, //
+            0.25, -0.5, 0.75, 1.0, //
+            -0.5, 0.25, 0.5, -0.25, //
+        ];
+        let input_hidden = upload_bf16(ordinal, &[hidden], &input_vals);
+        let norm_w = upload_bf16(ordinal, &[hidden], &norm_vals);
+        let gate_w = upload_bf16(ordinal, &[num_experts, hidden], &gate_vals);
+        let mut output = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[hidden])
+            .expect("alloc qwen36 metal ffn output");
+        let mut output_idx = GpuBuffer::zeros(ordinal, ScalarType::U32, &[top_k])
+            .expect("alloc qwen36 metal ffn output_idx");
+        let workspace_len = hidden + 2 * num_experts + 2 * top_k;
+        let mut workspace = GpuBuffer::zeros(ordinal, ScalarType::F32, &[workspace_len])
+            .expect("alloc qwen36 metal ffn workspace");
+        let mut sync_buf =
+            GpuBuffer::zeros(ordinal, ScalarType::U8, &[96]).expect("alloc sync buf");
+
+        let params = Qwen36MoeFfnStepParams {
+            stage: 1,
+            hidden: hidden as i32,
+            num_experts: num_experts as i32,
+            moe_intermediate: 4,
+            shared_intermediate: 4,
+            top_k: top_k as i32,
+            rms_norm_eps: eps,
+        };
+        let weights = Qwen36MoeFfnStepWeights {
+            input_hidden: input_hidden.as_ptr(),
+            post_attn_norm_w: norm_w.as_ptr(),
+            gate_w: gate_w.as_ptr(),
+            gate_up_proj_w: std::ptr::null(),
+            down_proj_w: std::ptr::null(),
+            shared_gate_proj_w: std::ptr::null(),
+            shared_up_proj_w: std::ptr::null(),
+            shared_down_proj_w: std::ptr::null(),
+            shared_expert_gate_w: std::ptr::null(),
+        };
+
+        ffn_step_launch(
+            ordinal,
+            ScalarType::BF16,
+            params,
+            &weights,
+            &Qwen36MoeFfnStepInt4::disabled(),
+            &mut output,
+            &mut output_idx,
+            &mut workspace,
+            &mut sync_buf,
+        )
+        .expect("run Qwen3.6-MoE Metal FFN stage1 fallback");
+
+        let (expected_weights, expected_idx) = qwen36_ffn_stage1_reference(
+            &input_vals,
+            &norm_vals,
+            &gate_vals,
+            hidden,
+            num_experts,
+            top_k,
+            eps,
+        );
+        let got_idx_bytes = output_idx.to_host_bytes().expect("download output_idx");
+        let got_idx: Vec<i32> = got_idx_bytes
+            .chunks_exact(4)
+            .map(|chunk| i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect();
+        assert_eq!(got_idx, expected_idx);
+        for (idx, (a, e)) in read_bf16(&output)[..top_k]
+            .iter()
+            .zip(expected_weights.iter())
+            .enumerate()
+        {
+            assert!(
+                (a - e).abs() <= 0.01,
+                "topk weight idx {idx}: expected {e}, got {a}"
+            );
+        }
+    }
+
+    #[cfg(all(target_os = "macos", supersonic_backend_metal))]
+    #[test]
+    fn metal_ffn_stage2_5_fallbacks_match_reference() {
+        use gpu_hal::{set_backend, Backend};
+
+        set_backend(Backend::Metal);
+        let ordinal = 0usize;
+        let hidden = 4usize;
+        let num_experts = 4usize;
+        let moe_intermediate = 3usize;
+        let shared_intermediate = 3usize;
+        let top_k = 2usize;
+        let eps = 1e-5f32;
+        let input_vals = [1.0, 0.5, -1.0, 2.0];
+        let norm_vals = [0.0, 0.25, -0.5, 1.0];
+        let gate_vals = [
+            1.0, 0.0, 0.0, 0.0, //
+            0.0, 1.0, 0.0, 0.0, //
+            0.25, -0.5, 0.75, 1.0, //
+            -0.5, 0.25, 0.5, -0.25, //
+        ];
+        let shared_gate_vals = [
+            0.25, -0.5, 0.75, 0.125, //
+            -0.25, 0.5, -0.75, 1.0, //
+            0.5, 0.25, -0.25, 0.75, //
+        ];
+        let shared_up_vals = [
+            -0.5, 0.25, 1.0, -0.25, //
+            0.75, -0.75, 0.5, 0.125, //
+            0.25, 0.5, -0.5, 1.0, //
+        ];
+        let shared_down_vals = [
+            0.5, -0.25, 0.75, //
+            -0.5, 0.25, 1.0, //
+            0.125, -0.75, 0.5, //
+            0.75, 0.5, -0.25, //
+        ];
+        let shared_gate_scalar_vals = [0.25, -0.5, 0.75, 1.0];
+        let mut gate_up_vals = vec![0.0f32; num_experts * 2 * moe_intermediate * hidden];
+        for (idx, v) in gate_up_vals.iter_mut().enumerate() {
+            *v = ((idx % 11) as f32 - 5.0) * 0.125;
+        }
+        let mut down_vals = vec![0.0f32; num_experts * hidden * moe_intermediate];
+        for (idx, v) in down_vals.iter_mut().enumerate() {
+            *v = ((idx % 13) as f32 - 6.0) * 0.1;
+        }
+
+        let input_hidden = upload_bf16(ordinal, &[hidden], &input_vals);
+        let norm_w = upload_bf16(ordinal, &[hidden], &norm_vals);
+        let gate_w = upload_bf16(ordinal, &[num_experts, hidden], &gate_vals);
+        let gate_up_proj_w = upload_bf16(
+            ordinal,
+            &[num_experts, 2 * moe_intermediate, hidden],
+            &gate_up_vals,
+        );
+        let down_proj_w = upload_bf16(
+            ordinal,
+            &[num_experts, hidden, moe_intermediate],
+            &down_vals,
+        );
+        let shared_gate_proj_w =
+            upload_bf16(ordinal, &[shared_intermediate, hidden], &shared_gate_vals);
+        let shared_up_proj_w =
+            upload_bf16(ordinal, &[shared_intermediate, hidden], &shared_up_vals);
+        let shared_down_proj_w =
+            upload_bf16(ordinal, &[hidden, shared_intermediate], &shared_down_vals);
+        let shared_expert_gate_w = upload_bf16(ordinal, &[1, hidden], &shared_gate_scalar_vals);
+
+        let weights = Qwen36MoeFfnStepWeights {
+            input_hidden: input_hidden.as_ptr(),
+            post_attn_norm_w: norm_w.as_ptr(),
+            gate_w: gate_w.as_ptr(),
+            gate_up_proj_w: gate_up_proj_w.as_ptr(),
+            down_proj_w: down_proj_w.as_ptr(),
+            shared_gate_proj_w: shared_gate_proj_w.as_ptr(),
+            shared_up_proj_w: shared_up_proj_w.as_ptr(),
+            shared_down_proj_w: shared_down_proj_w.as_ptr(),
+            shared_expert_gate_w: shared_expert_gate_w.as_ptr(),
+        };
+
+        for stage in 2..=5 {
+            let mut output = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[hidden])
+                .expect("alloc qwen36 metal ffn output");
+            let mut output_idx = GpuBuffer::zeros(ordinal, ScalarType::U32, &[top_k])
+                .expect("alloc qwen36 metal ffn output_idx");
+            let workspace_len = 3 * hidden
+                + 2 * num_experts
+                + 2 * top_k
+                + 1
+                + 3 * shared_intermediate
+                + top_k * 3 * moe_intermediate
+                + top_k * hidden;
+            let mut workspace = GpuBuffer::zeros(ordinal, ScalarType::F32, &[workspace_len])
+                .expect("alloc qwen36 metal ffn workspace");
+            let mut sync_buf =
+                GpuBuffer::zeros(ordinal, ScalarType::U8, &[96]).expect("alloc sync buf");
+
+            let params = Qwen36MoeFfnStepParams {
+                stage,
+                hidden: hidden as i32,
+                num_experts: num_experts as i32,
+                moe_intermediate: moe_intermediate as i32,
+                shared_intermediate: shared_intermediate as i32,
+                top_k: top_k as i32,
+                rms_norm_eps: eps,
+            };
+            ffn_step_launch(
+                ordinal,
+                ScalarType::BF16,
+                params,
+                &weights,
+                &Qwen36MoeFfnStepInt4::disabled(),
+                &mut output,
+                &mut output_idx,
+                &mut workspace,
+                &mut sync_buf,
+            )
+            .expect("run Qwen3.6-MoE Metal FFN fallback");
+
+            let (expected, expected_idx) = qwen36_ffn_stage1_5_reference(
+                stage as usize,
+                &input_vals,
+                &norm_vals,
+                &gate_vals,
+                &gate_up_vals,
+                &down_vals,
+                &shared_gate_vals,
+                &shared_up_vals,
+                &shared_down_vals,
+                &shared_gate_scalar_vals,
+                hidden,
+                num_experts,
+                moe_intermediate,
+                shared_intermediate,
+                top_k,
+                eps,
+            );
+            let got_idx_bytes = output_idx.to_host_bytes().expect("download output_idx");
+            let got_idx: Vec<i32> = got_idx_bytes
+                .chunks_exact(4)
+                .map(|chunk| i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                .collect();
+            assert_eq!(got_idx, expected_idx, "stage {stage} topk idx mismatch");
+            for (idx, (a, e)) in read_bf16(&output).iter().zip(expected.iter()).enumerate() {
+                assert!(
+                    (a - e).abs() <= 0.02,
+                    "stage {stage} output idx {idx}: expected {e}, got {a}"
+                );
+            }
+        }
+    }
+
+    #[cfg(all(target_os = "macos", supersonic_backend_metal))]
+    #[test]
+    fn metal_attn_stage1_fallback_matches_reference() {
+        use gpu_hal::{set_backend, Backend};
+
+        set_backend(Backend::Metal);
+        let ordinal = 0usize;
+        let hidden = 4usize;
+        let num_heads = 2usize;
+        let num_kv_heads = 1usize;
+        let head_dim = 2usize;
+        let eps = 1e-5f32;
+        let input_vals = [1.0, 0.5, -1.0, 2.0];
+        let norm_vals = [0.0, 0.25, -0.5, 1.0];
+        let q_norm_vals = [0.0, 0.5];
+        let q_proj_vals = [
+            1.0, 0.0, 0.0, 0.0, //
+            0.0, 1.0, 0.0, 0.0, //
+            0.25, -0.5, 0.75, 1.0, //
+            -0.5, 0.25, 0.5, -0.25, //
+            0.0, 0.0, 1.0, 0.0, //
+            0.0, 0.0, 0.0, 1.0, //
+            0.5, 0.5, -0.25, 0.25, //
+            -0.25, 0.75, 0.25, -0.5, //
+        ];
+        let input_hidden = upload_bf16(ordinal, &[hidden], &input_vals);
+        let input_norm_w = upload_bf16(ordinal, &[hidden], &norm_vals);
+        let q_proj_w = upload_bf16(ordinal, &[2 * num_heads * head_dim, hidden], &q_proj_vals);
+        let q_norm_w = upload_bf16(ordinal, &[head_dim], &q_norm_vals);
+        let mut output = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[num_heads * head_dim])
+            .expect("alloc qwen36 metal attn output");
+        let workspace_len =
+            2 * num_heads * head_dim + 2 * num_kv_heads * head_dim + num_heads * head_dim;
+        let mut workspace = GpuBuffer::zeros(ordinal, ScalarType::F32, &[workspace_len])
+            .expect("alloc qwen36 metal attn workspace");
+        let mut sync_buf =
+            GpuBuffer::zeros(ordinal, ScalarType::U8, &[96]).expect("alloc sync buf");
+
+        let params = Qwen36MoeAttnStepParams {
+            stage: 1,
+            hidden: hidden as i32,
+            num_heads: num_heads as i32,
+            num_kv_heads: num_kv_heads as i32,
+            head_dim: head_dim as i32,
+            rotary_dim: head_dim as i32,
+            rope_theta: 1_000_000.0,
+            rms_norm_eps: eps,
+            position: 0,
+            cache_pos: Qwen36MoeAttnStepParams::CACHE_POS_INHERIT,
+        };
+        let weights = Qwen36MoeAttnStepWeights {
+            input_hidden: input_hidden.as_ptr(),
+            input_norm_w: input_norm_w.as_ptr(),
+            q_proj_w: q_proj_w.as_ptr(),
+            k_proj_w: std::ptr::null(),
+            v_proj_w: std::ptr::null(),
+            q_norm_w: q_norm_w.as_ptr(),
+            k_norm_w: std::ptr::null(),
+            o_proj_w: std::ptr::null(),
+            kv_cache_k: std::ptr::null_mut(),
+            kv_cache_v: std::ptr::null_mut(),
+            kv_max_t: 0,
+        };
+
+        attn_step_launch(
+            ordinal,
+            ScalarType::BF16,
+            params,
+            &weights,
+            &Qwen36MoeAttnStepInt4::disabled(),
+            &mut output,
+            &mut workspace,
+            &mut sync_buf,
+        )
+        .expect("run Qwen3.6-MoE Metal attention stage1 fallback");
+
+        let expected = qwen36_attn_stage1_reference(
+            &input_vals,
+            &norm_vals,
+            &q_proj_vals,
+            &q_norm_vals,
+            hidden,
+            num_heads,
+            head_dim,
+            eps,
+        );
+        for (idx, (a, e)) in read_bf16(&output).iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (a - e).abs() <= 0.01,
+                "q_normed idx {idx}: expected {e}, got {a}"
+            );
+        }
+    }
+
+    #[cfg(all(target_os = "macos", supersonic_backend_metal))]
+    #[test]
+    fn metal_attn_stage1_int4_sidecar_matches_reference() {
+        use gpu_hal::{set_backend, Backend};
+
+        set_backend(Backend::Metal);
+        let ordinal = 0usize;
+        let hidden = 4usize;
+        let num_heads = 2usize;
+        let num_kv_heads = 1usize;
+        let head_dim = 2usize;
+        let group_size = 2usize;
+        let eps = 1e-5f32;
+        let input_vals = [1.0, 0.5, -1.0, 2.0];
+        let norm_vals = [0.0, 0.25, -0.5, 1.0];
+        let q_norm_vals = [0.0, 0.5];
+        let nibbles = vec![
+            vec![4, 0, 0, 0],
+            vec![0, 4, 0, 0],
+            vec![1, 2, 0, 0],
+            vec![0, 0, 2, 1],
+            vec![0, 0, 4, 0],
+            vec![0, 0, 0, 4],
+            vec![2, 0, 1, 0],
+            vec![0, 1, 0, 2],
+        ];
+        let q_proj_vals = nibbles
+            .iter()
+            .flat_map(|row| row.iter().map(|v| *v as f32 * 0.25))
+            .collect::<Vec<_>>();
+
+        let input_hidden = upload_bf16(ordinal, &[hidden], &input_vals);
+        let input_norm_w = upload_bf16(ordinal, &[hidden], &norm_vals);
+        let (q_proj_w, q_proj_scale, q_proj_zero) = upload_int4_rows(
+            ordinal,
+            2 * num_heads * head_dim,
+            hidden,
+            group_size,
+            &nibbles,
+            0.25,
+        );
+        let q_norm_w = upload_bf16(ordinal, &[head_dim], &q_norm_vals);
+        let mut output = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[num_heads * head_dim])
+            .expect("alloc qwen36 metal attn int4 output");
+        let workspace_len =
+            2 * num_heads * head_dim + 2 * num_kv_heads * head_dim + num_heads * head_dim;
+        let mut workspace = GpuBuffer::zeros(ordinal, ScalarType::F32, &[workspace_len])
+            .expect("alloc qwen36 metal attn int4 workspace");
+        let mut sync_buf =
+            GpuBuffer::zeros(ordinal, ScalarType::U8, &[96]).expect("alloc sync buf");
+
+        let params = Qwen36MoeAttnStepParams {
+            stage: 1,
+            hidden: hidden as i32,
+            num_heads: num_heads as i32,
+            num_kv_heads: num_kv_heads as i32,
+            head_dim: head_dim as i32,
+            rotary_dim: head_dim as i32,
+            rope_theta: 1_000_000.0,
+            rms_norm_eps: eps,
+            position: 0,
+            cache_pos: Qwen36MoeAttnStepParams::CACHE_POS_INHERIT,
+        };
+        let weights = Qwen36MoeAttnStepWeights {
+            input_hidden: input_hidden.as_ptr(),
+            input_norm_w: input_norm_w.as_ptr(),
+            q_proj_w: q_proj_w.as_ptr(),
+            k_proj_w: std::ptr::null(),
+            v_proj_w: std::ptr::null(),
+            q_norm_w: q_norm_w.as_ptr(),
+            k_norm_w: std::ptr::null(),
+            o_proj_w: std::ptr::null(),
+            kv_cache_k: std::ptr::null_mut(),
+            kv_cache_v: std::ptr::null_mut(),
+            kv_max_t: 0,
+        };
+        let int4 = Qwen36MoeAttnStepInt4 {
+            q_proj_scale: q_proj_scale.as_ptr(),
+            q_proj_zero: q_proj_zero.as_ptr(),
+            k_proj_scale: std::ptr::null(),
+            k_proj_zero: std::ptr::null(),
+            v_proj_scale: std::ptr::null(),
+            v_proj_zero: std::ptr::null(),
+            o_proj_scale: std::ptr::null(),
+            o_proj_zero: std::ptr::null(),
+            group_size: group_size as i32,
+        };
+
+        attn_step_launch(
+            ordinal,
+            ScalarType::BF16,
+            params,
+            &weights,
+            &int4,
+            &mut output,
+            &mut workspace,
+            &mut sync_buf,
+        )
+        .expect("run Qwen3.6-MoE Metal attention stage1 INT4 fallback");
+
+        let expected = qwen36_attn_stage1_reference(
+            &input_vals,
+            &norm_vals,
+            &q_proj_vals,
+            &q_norm_vals,
+            hidden,
+            num_heads,
+            head_dim,
+            eps,
+        );
+        for (idx, (a, e)) in read_bf16(&output).iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (a - e).abs() <= 0.01,
+                "int4 q_normed idx {idx}: expected {e}, got {a}"
+            );
+        }
+    }
+
+    #[cfg(all(target_os = "macos", supersonic_backend_metal))]
+    #[test]
+    fn metal_attn_stage2_5_fallbacks_match_reference() {
+        use gpu_hal::{set_backend, Backend};
+
+        set_backend(Backend::Metal);
+        let ordinal = 0usize;
+        let hidden = 4usize;
+        let num_heads = 2usize;
+        let num_kv_heads = 1usize;
+        let head_dim = 2usize;
+        let eps = 1e-5f32;
+        let input_vals = [1.0, 0.5, -1.0, 2.0];
+        let norm_vals = [0.0, 0.25, -0.5, 1.0];
+        let q_norm_vals = [0.0, 0.5];
+        let k_norm_vals = [0.25, -0.25];
+        let q_proj_vals = [
+            1.0, 0.0, 0.0, 0.0, //
+            0.0, 1.0, 0.0, 0.0, //
+            0.25, -0.5, 0.75, 1.0, //
+            -0.5, 0.25, 0.5, -0.25, //
+            0.0, 0.0, 1.0, 0.0, //
+            0.0, 0.0, 0.0, 1.0, //
+            0.5, 0.5, -0.25, 0.25, //
+            -0.25, 0.75, 0.25, -0.5, //
+        ];
+        let k_proj_vals = [
+            0.5, -0.25, 1.0, 0.25, //
+            -0.75, 0.5, 0.25, -0.5, //
+        ];
+        let v_proj_vals = [
+            0.25, 0.75, -0.5, 0.5, //
+            -0.5, 0.25, 0.75, 1.0, //
+        ];
+        let o_proj_vals = [
+            0.25, -0.5, 0.75, 1.0, //
+            -0.25, 0.5, -0.75, 0.125, //
+            0.5, 0.25, 0.25, -0.5, //
+            -1.0, 0.75, 0.5, 0.25, //
+        ];
+        let input_hidden = upload_bf16(ordinal, &[hidden], &input_vals);
+        let input_norm_w = upload_bf16(ordinal, &[hidden], &norm_vals);
+        let q_proj_w = upload_bf16(ordinal, &[2 * num_heads * head_dim, hidden], &q_proj_vals);
+        let k_proj_w = upload_bf16(ordinal, &[num_kv_heads * head_dim, hidden], &k_proj_vals);
+        let v_proj_w = upload_bf16(ordinal, &[num_kv_heads * head_dim, hidden], &v_proj_vals);
+        let q_norm_w = upload_bf16(ordinal, &[head_dim], &q_norm_vals);
+        let k_norm_w = upload_bf16(ordinal, &[head_dim], &k_norm_vals);
+        let o_proj_w = upload_bf16(ordinal, &[hidden, num_heads * head_dim], &o_proj_vals);
+
+        let weights = Qwen36MoeAttnStepWeights {
+            input_hidden: input_hidden.as_ptr(),
+            input_norm_w: input_norm_w.as_ptr(),
+            q_proj_w: q_proj_w.as_ptr(),
+            k_proj_w: k_proj_w.as_ptr(),
+            v_proj_w: v_proj_w.as_ptr(),
+            q_norm_w: q_norm_w.as_ptr(),
+            k_norm_w: k_norm_w.as_ptr(),
+            o_proj_w: o_proj_w.as_ptr(),
+            kv_cache_k: std::ptr::null_mut(),
+            kv_cache_v: std::ptr::null_mut(),
+            kv_max_t: 0,
+        };
+
+        for stage in 2..=5 {
+            let mut output = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[6])
+                .expect("alloc qwen36 metal attn output");
+            let mut workspace = GpuBuffer::zeros(ordinal, ScalarType::F32, &[36])
+                .expect("alloc qwen36 metal attn workspace");
+            let mut sync_buf =
+                GpuBuffer::zeros(ordinal, ScalarType::U8, &[96]).expect("alloc sync buf");
+            let params = Qwen36MoeAttnStepParams {
+                stage,
+                hidden: hidden as i32,
+                num_heads: num_heads as i32,
+                num_kv_heads: num_kv_heads as i32,
+                head_dim: head_dim as i32,
+                rotary_dim: head_dim as i32,
+                rope_theta: 1_000_000.0,
+                rms_norm_eps: eps,
+                position: 3,
+                cache_pos: Qwen36MoeAttnStepParams::CACHE_POS_INHERIT,
+            };
+
+            attn_step_launch(
+                ordinal,
+                ScalarType::BF16,
+                params,
+                &weights,
+                &Qwen36MoeAttnStepInt4::disabled(),
+                &mut output,
+                &mut workspace,
+                &mut sync_buf,
+            )
+            .expect("run Qwen3.6-MoE Metal attention fallback");
+
+            let expected = qwen36_attn_stage1_5_reference(
+                stage as usize,
+                &input_vals,
+                &norm_vals,
+                &q_proj_vals,
+                &k_proj_vals,
+                &v_proj_vals,
+                &q_norm_vals,
+                &k_norm_vals,
+                &o_proj_vals,
+                hidden,
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                head_dim,
+                1_000_000.0,
+                3,
+                eps,
+            );
+            let got = read_bf16(&output);
+            for (idx, (a, e)) in got.iter().zip(expected.iter()).enumerate() {
+                assert!(
+                    (a - e).abs() <= 0.02,
+                    "stage {stage} idx {idx}: expected {e}, got {a}"
+                );
+            }
+        }
+    }
+
+    #[cfg(all(target_os = "macos", supersonic_backend_metal))]
+    #[test]
+    fn metal_linear_stage1_fallback_matches_reference() {
+        use gpu_hal::{set_backend, Backend};
+
+        set_backend(Backend::Metal);
+        let ordinal = 0usize;
+        let hidden = 4usize;
+        let num_k_heads = 1usize;
+        let num_v_heads = 2usize;
+        let head_k_dim = 2usize;
+        let head_v_dim = 1usize;
+        let key_dim = num_k_heads * head_k_dim;
+        let val_dim = num_v_heads * head_v_dim;
+        let qkv_dim = 2 * key_dim + val_dim;
+        let eps = 1e-5f32;
+        let input_vals = [1.0, 0.5, -1.0, 2.0];
+        let norm_vals = [0.0, 0.25, -0.5, 1.0];
+        let qkv_vals = [
+            1.0, 0.0, 0.0, 0.0, //
+            0.0, 1.0, 0.0, 0.0, //
+            0.25, -0.5, 0.75, 1.0, //
+            -0.5, 0.25, 0.5, -0.25, //
+            0.0, 0.0, 1.0, 0.0, //
+            0.0, 0.0, 0.0, 1.0, //
+        ];
+        let z_vals = [
+            0.5, 0.0, -0.5, 1.0, //
+            -0.25, 0.75, 0.25, -0.5, //
+        ];
+        let a_vals = [
+            1.0, -0.5, 0.0, 0.25, //
+            0.0, 0.25, 0.5, -1.0, //
+        ];
+        let b_vals = [
+            -0.5, 0.5, 1.0, 0.0, //
+            0.25, 0.0, -0.25, 0.75, //
+        ];
+        let input_hidden = upload_bf16(ordinal, &[hidden], &input_vals);
+        let input_norm_w = upload_bf16(ordinal, &[hidden], &norm_vals);
+        let in_proj_qkv_w = upload_bf16(ordinal, &[qkv_dim, hidden], &qkv_vals);
+        let in_proj_z_w = upload_bf16(ordinal, &[val_dim, hidden], &z_vals);
+        let in_proj_a_w = upload_bf16(ordinal, &[num_v_heads, hidden], &a_vals);
+        let in_proj_b_w = upload_bf16(ordinal, &[num_v_heads, hidden], &b_vals);
+        let mut output = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[qkv_dim])
+            .expect("alloc qwen36 metal linear output");
+        let workspace_len = qkv_dim + val_dim + 2 * num_v_heads;
+        let mut workspace = GpuBuffer::zeros(ordinal, ScalarType::F32, &[workspace_len])
+            .expect("alloc qwen36 metal linear workspace");
+        let mut sync_buf =
+            GpuBuffer::zeros(ordinal, ScalarType::U8, &[96]).expect("alloc sync buf");
+
+        let params = Qwen36MoeLinearStepParams {
+            stage: 1,
+            hidden: hidden as i32,
+            num_k_heads: num_k_heads as i32,
+            num_v_heads: num_v_heads as i32,
+            head_k_dim: head_k_dim as i32,
+            head_v_dim: head_v_dim as i32,
+            conv_kernel_dim: 4,
+            rms_norm_eps: eps,
+        };
+        let weights = Qwen36MoeLinearStepWeights {
+            input_hidden: input_hidden.as_ptr(),
+            input_norm_w: input_norm_w.as_ptr(),
+            in_proj_qkv_w: in_proj_qkv_w.as_ptr(),
+            in_proj_z_w: in_proj_z_w.as_ptr(),
+            in_proj_a_w: in_proj_a_w.as_ptr(),
+            in_proj_b_w: in_proj_b_w.as_ptr(),
+            conv1d_w: std::ptr::null(),
+            conv1d_bias: std::ptr::null(),
+            dt_bias: std::ptr::null(),
+            a_log: std::ptr::null(),
+            norm_w: std::ptr::null(),
+            out_proj_w: std::ptr::null(),
+            conv_state: std::ptr::null_mut(),
+            recurrent_state: std::ptr::null_mut(),
+        };
+
+        linear_step_launch(
+            ordinal,
+            ScalarType::BF16,
+            params,
+            &weights,
+            &Qwen36MoeLinearStepInt4::disabled(),
+            &mut output,
+            &mut workspace,
+            &mut sync_buf,
+        )
+        .expect("run Qwen3.6-MoE Metal linear stage1 fallback");
+
+        let expected = qwen36_linear_stage1_reference(
+            &input_vals,
+            &norm_vals,
+            &qkv_vals,
+            hidden,
+            qkv_dim,
+            eps,
+        );
+        for (idx, (a, e)) in read_bf16(&output).iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (a - e).abs() <= 0.01,
+                "qkv_raw idx {idx}: expected {e}, got {a}"
+            );
+        }
+    }
+
+    #[cfg(all(target_os = "macos", supersonic_backend_metal))]
+    #[test]
+    fn metal_linear_stage2_fallback_matches_reference_and_updates_state() {
+        use gpu_hal::{set_backend, Backend};
+
+        set_backend(Backend::Metal);
+        let ordinal = 0usize;
+        let hidden = 4usize;
+        let num_k_heads = 1usize;
+        let num_v_heads = 2usize;
+        let head_k_dim = 2usize;
+        let head_v_dim = 1usize;
+        let key_dim = num_k_heads * head_k_dim;
+        let val_dim = num_v_heads * head_v_dim;
+        let qkv_dim = 2 * key_dim + val_dim;
+        let kernel = 3usize;
+        let kstate = kernel - 1;
+        let eps = 1e-5f32;
+        let input_vals = [1.0, 0.5, -1.0, 2.0];
+        let norm_vals = [0.0, 0.25, -0.5, 1.0];
+        let qkv_vals = [
+            1.0, 0.0, 0.0, 0.0, //
+            0.0, 1.0, 0.0, 0.0, //
+            0.25, -0.5, 0.75, 1.0, //
+            -0.5, 0.25, 0.5, -0.25, //
+            0.0, 0.0, 1.0, 0.0, //
+            0.0, 0.0, 0.0, 1.0, //
+        ];
+        let z_vals = [
+            0.5, 0.0, -0.5, 1.0, //
+            -0.25, 0.75, 0.25, -0.5, //
+        ];
+        let a_vals = [
+            1.0, -0.5, 0.0, 0.25, //
+            0.0, 0.25, 0.5, -1.0, //
+        ];
+        let b_vals = [
+            -0.5, 0.5, 1.0, 0.0, //
+            0.25, 0.0, -0.25, 0.75, //
+        ];
+        let conv_w_vals = [
+            0.5, -0.25, 1.0, //
+            0.25, 0.5, -0.5, //
+            -0.5, 1.0, 0.25, //
+            1.0, 0.0, -0.25, //
+            0.75, -0.5, 0.5, //
+            -0.25, 0.25, 1.0, //
+        ];
+        let conv_bias_vals = [0.0, 0.25, -0.25, 0.5, -0.5, 0.125];
+        let conv_state_vals = [
+            0.25, -0.5, //
+            0.0, 0.5, //
+            -0.25, 0.75, //
+            1.0, -1.0, //
+            0.125, -0.375, //
+            -0.75, 0.25, //
+        ];
+        let input_hidden = upload_bf16(ordinal, &[hidden], &input_vals);
+        let input_norm_w = upload_bf16(ordinal, &[hidden], &norm_vals);
+        let in_proj_qkv_w = upload_bf16(ordinal, &[qkv_dim, hidden], &qkv_vals);
+        let in_proj_z_w = upload_bf16(ordinal, &[val_dim, hidden], &z_vals);
+        let in_proj_a_w = upload_bf16(ordinal, &[num_v_heads, hidden], &a_vals);
+        let in_proj_b_w = upload_bf16(ordinal, &[num_v_heads, hidden], &b_vals);
+        let conv1d_w = upload_bf16(ordinal, &[qkv_dim, kernel], &conv_w_vals);
+        let conv1d_bias = upload_bf16(ordinal, &[qkv_dim], &conv_bias_vals);
+        let mut conv_state = upload_bf16(ordinal, &[qkv_dim, kstate], &conv_state_vals);
+        let mut output = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[qkv_dim])
+            .expect("alloc qwen36 metal linear stage2 output");
+        let workspace_len = qkv_dim + val_dim + 2 * num_v_heads;
+        let mut workspace = GpuBuffer::zeros(ordinal, ScalarType::F32, &[workspace_len])
+            .expect("alloc qwen36 metal linear stage2 workspace");
+        let mut sync_buf =
+            GpuBuffer::zeros(ordinal, ScalarType::U8, &[96]).expect("alloc sync buf");
+
+        let params = Qwen36MoeLinearStepParams {
+            stage: 2,
+            hidden: hidden as i32,
+            num_k_heads: num_k_heads as i32,
+            num_v_heads: num_v_heads as i32,
+            head_k_dim: head_k_dim as i32,
+            head_v_dim: head_v_dim as i32,
+            conv_kernel_dim: kernel as i32,
+            rms_norm_eps: eps,
+        };
+        let weights = Qwen36MoeLinearStepWeights {
+            input_hidden: input_hidden.as_ptr(),
+            input_norm_w: input_norm_w.as_ptr(),
+            in_proj_qkv_w: in_proj_qkv_w.as_ptr(),
+            in_proj_z_w: in_proj_z_w.as_ptr(),
+            in_proj_a_w: in_proj_a_w.as_ptr(),
+            in_proj_b_w: in_proj_b_w.as_ptr(),
+            conv1d_w: conv1d_w.as_ptr(),
+            conv1d_bias: conv1d_bias.as_ptr(),
+            dt_bias: std::ptr::null(),
+            a_log: std::ptr::null(),
+            norm_w: std::ptr::null(),
+            out_proj_w: std::ptr::null(),
+            conv_state: conv_state.as_mut_ptr(),
+            recurrent_state: std::ptr::null_mut(),
+        };
+
+        linear_step_launch(
+            ordinal,
+            ScalarType::BF16,
+            params,
+            &weights,
+            &Qwen36MoeLinearStepInt4::disabled(),
+            &mut output,
+            &mut workspace,
+            &mut sync_buf,
+        )
+        .expect("run Qwen3.6-MoE Metal linear stage2 fallback");
+
+        let qkv_raw = qwen36_linear_stage1_reference(
+            &input_vals,
+            &norm_vals,
+            &qkv_vals,
+            hidden,
+            qkv_dim,
+            eps,
+        );
+        let (expected_silu, expected_state) = qwen36_linear_stage2_reference(
+            &qkv_raw,
+            &conv_state_vals,
+            &conv_w_vals,
+            Some(&conv_bias_vals),
+            qkv_dim,
+            kernel,
+        );
+        for (idx, (a, e)) in read_bf16(&output)
+            .iter()
+            .zip(expected_silu.iter())
+            .enumerate()
+        {
+            assert!(
+                (a - e).abs() <= 0.01,
+                "silu_out idx {idx}: expected {e}, got {a}"
+            );
+        }
+        for (idx, (a, e)) in read_bf16(&conv_state)
+            .iter()
+            .zip(expected_state.iter())
+            .enumerate()
+        {
+            assert!(
+                (a - e).abs() <= 0.01,
+                "conv_state idx {idx}: expected {e}, got {a}"
+            );
+        }
+    }
+
+    #[cfg(all(target_os = "macos", supersonic_backend_metal))]
+    #[test]
+    fn metal_linear_stage3_fallback_matches_reference() {
+        use gpu_hal::{set_backend, Backend};
+
+        set_backend(Backend::Metal);
+        let ordinal = 0usize;
+        let hidden = 4usize;
+        let num_k_heads = 1usize;
+        let num_v_heads = 2usize;
+        let head_k_dim = 2usize;
+        let head_v_dim = 1usize;
+        let key_dim = num_k_heads * head_k_dim;
+        let val_dim = num_v_heads * head_v_dim;
+        let qkv_dim = 2 * key_dim + val_dim;
+        let kernel = 3usize;
+        let kstate = kernel - 1;
+        let eps = 1e-5f32;
+        let input_vals = [1.0, 0.5, -1.0, 2.0];
+        let norm_vals = [0.0, 0.25, -0.5, 1.0];
+        let qkv_vals = [
+            1.0, 0.0, 0.0, 0.0, //
+            0.0, 1.0, 0.0, 0.0, //
+            0.25, -0.5, 0.75, 1.0, //
+            -0.5, 0.25, 0.5, -0.25, //
+            0.0, 0.0, 1.0, 0.0, //
+            0.0, 0.0, 0.0, 1.0, //
+        ];
+        let z_vals = [
+            0.5, 0.0, -0.5, 1.0, //
+            -0.25, 0.75, 0.25, -0.5, //
+        ];
+        let a_vals = [
+            1.0, -0.5, 0.0, 0.25, //
+            0.0, 0.25, 0.5, -1.0, //
+        ];
+        let b_vals = [
+            -0.5, 0.5, 1.0, 0.0, //
+            0.25, 0.0, -0.25, 0.75, //
+        ];
+        let conv_w_vals = [
+            0.5, -0.25, 1.0, //
+            0.25, 0.5, -0.5, //
+            -0.5, 1.0, 0.25, //
+            1.0, 0.0, -0.25, //
+            0.75, -0.5, 0.5, //
+            -0.25, 0.25, 1.0, //
+        ];
+        let conv_state_vals = [
+            0.25, -0.5, //
+            0.0, 0.5, //
+            -0.25, 0.75, //
+            1.0, -1.0, //
+            0.125, -0.375, //
+            -0.75, 0.25, //
+        ];
+        let input_hidden = upload_bf16(ordinal, &[hidden], &input_vals);
+        let input_norm_w = upload_bf16(ordinal, &[hidden], &norm_vals);
+        let in_proj_qkv_w = upload_bf16(ordinal, &[qkv_dim, hidden], &qkv_vals);
+        let in_proj_z_w = upload_bf16(ordinal, &[val_dim, hidden], &z_vals);
+        let in_proj_a_w = upload_bf16(ordinal, &[num_v_heads, hidden], &a_vals);
+        let in_proj_b_w = upload_bf16(ordinal, &[num_v_heads, hidden], &b_vals);
+        let conv1d_w = upload_bf16(ordinal, &[qkv_dim, kernel], &conv_w_vals);
+        let mut conv_state = upload_bf16(ordinal, &[qkv_dim, kstate], &conv_state_vals);
+        let output_len = 2 * num_v_heads * head_k_dim + val_dim;
+        let mut output = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[output_len])
+            .expect("alloc qwen36 metal linear stage3 output");
+        let stage3_workspace_len =
+            qkv_dim + val_dim + 2 * num_v_heads + 2 * key_dim + 2 * num_v_heads * head_k_dim;
+        let mut workspace = GpuBuffer::zeros(ordinal, ScalarType::F32, &[stage3_workspace_len])
+            .expect("alloc qwen36 metal linear stage3 workspace");
+        let mut sync_buf =
+            GpuBuffer::zeros(ordinal, ScalarType::U8, &[96]).expect("alloc sync buf");
+
+        let params = Qwen36MoeLinearStepParams {
+            stage: 3,
+            hidden: hidden as i32,
+            num_k_heads: num_k_heads as i32,
+            num_v_heads: num_v_heads as i32,
+            head_k_dim: head_k_dim as i32,
+            head_v_dim: head_v_dim as i32,
+            conv_kernel_dim: kernel as i32,
+            rms_norm_eps: eps,
+        };
+        let weights = Qwen36MoeLinearStepWeights {
+            input_hidden: input_hidden.as_ptr(),
+            input_norm_w: input_norm_w.as_ptr(),
+            in_proj_qkv_w: in_proj_qkv_w.as_ptr(),
+            in_proj_z_w: in_proj_z_w.as_ptr(),
+            in_proj_a_w: in_proj_a_w.as_ptr(),
+            in_proj_b_w: in_proj_b_w.as_ptr(),
+            conv1d_w: conv1d_w.as_ptr(),
+            conv1d_bias: std::ptr::null(),
+            dt_bias: std::ptr::null(),
+            a_log: std::ptr::null(),
+            norm_w: std::ptr::null(),
+            out_proj_w: std::ptr::null(),
+            conv_state: conv_state.as_mut_ptr(),
+            recurrent_state: std::ptr::null_mut(),
+        };
+
+        linear_step_launch(
+            ordinal,
+            ScalarType::BF16,
+            params,
+            &weights,
+            &Qwen36MoeLinearStepInt4::disabled(),
+            &mut output,
+            &mut workspace,
+            &mut sync_buf,
+        )
+        .expect("run Qwen3.6-MoE Metal linear stage3 fallback");
+
+        let qkv_raw = qwen36_linear_stage1_reference(
+            &input_vals,
+            &norm_vals,
+            &qkv_vals,
+            hidden,
+            qkv_dim,
+            eps,
+        );
+        let (silu_out, _) = qwen36_linear_stage2_reference(
+            &qkv_raw,
+            &conv_state_vals,
+            &conv_w_vals,
+            None,
+            qkv_dim,
+            kernel,
+        );
+        let expected = qwen36_linear_stage3_reference(
+            &silu_out,
+            num_k_heads,
+            num_v_heads,
+            head_k_dim,
+            head_v_dim,
+        );
+        for (idx, (a, e)) in read_bf16(&output).iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (a - e).abs() <= 0.01,
+                "stage3 output idx {idx}: expected {e}, got {a}"
+            );
+        }
+    }
+
+    #[cfg(all(target_os = "macos", supersonic_backend_metal))]
+    #[test]
+    fn metal_linear_stage4_fallback_matches_reference_and_updates_recurrent_state() {
+        use gpu_hal::{set_backend, Backend};
+
+        set_backend(Backend::Metal);
+        let ordinal = 0usize;
+        let hidden = 4usize;
+        let num_k_heads = 1usize;
+        let num_v_heads = 2usize;
+        let head_k_dim = 2usize;
+        let head_v_dim = 1usize;
+        let key_dim = num_k_heads * head_k_dim;
+        let val_dim = num_v_heads * head_v_dim;
+        let qkv_dim = 2 * key_dim + val_dim;
+        let kernel = 3usize;
+        let kstate = kernel - 1;
+        let eps = 1e-5f32;
+        let input_vals = [1.0, 0.5, -1.0, 2.0];
+        let norm_vals = [0.0, 0.25, -0.5, 1.0];
+        let qkv_vals = [
+            1.0, 0.0, 0.0, 0.0, //
+            0.0, 1.0, 0.0, 0.0, //
+            0.25, -0.5, 0.75, 1.0, //
+            -0.5, 0.25, 0.5, -0.25, //
+            0.0, 0.0, 1.0, 0.0, //
+            0.0, 0.0, 0.0, 1.0, //
+        ];
+        let z_vals = [
+            0.5, 0.0, -0.5, 1.0, //
+            -0.25, 0.75, 0.25, -0.5, //
+        ];
+        let a_vals = [
+            1.0, -0.5, 0.0, 0.25, //
+            0.0, 0.25, 0.5, -1.0, //
+        ];
+        let b_vals = [
+            -0.5, 0.5, 1.0, 0.0, //
+            0.25, 0.0, -0.25, 0.75, //
+        ];
+        let conv_w_vals = [
+            0.5, -0.25, 1.0, //
+            0.25, 0.5, -0.5, //
+            -0.5, 1.0, 0.25, //
+            1.0, 0.0, -0.25, //
+            0.75, -0.5, 0.5, //
+            -0.25, 0.25, 1.0, //
+        ];
+        let conv_state_vals = [
+            0.25, -0.5, //
+            0.0, 0.5, //
+            -0.25, 0.75, //
+            1.0, -1.0, //
+            0.125, -0.375, //
+            -0.75, 0.25, //
+        ];
+        let dt_bias_vals = [0.125, -0.25];
+        let a_log_vals = [-0.5, 0.25];
+        let recurrent_vals = [0.25, -0.5, 0.75, -1.0];
+
+        let input_hidden = upload_bf16(ordinal, &[hidden], &input_vals);
+        let input_norm_w = upload_bf16(ordinal, &[hidden], &norm_vals);
+        let in_proj_qkv_w = upload_bf16(ordinal, &[qkv_dim, hidden], &qkv_vals);
+        let in_proj_z_w = upload_bf16(ordinal, &[val_dim, hidden], &z_vals);
+        let in_proj_a_w = upload_bf16(ordinal, &[num_v_heads, hidden], &a_vals);
+        let in_proj_b_w = upload_bf16(ordinal, &[num_v_heads, hidden], &b_vals);
+        let conv1d_w = upload_bf16(ordinal, &[qkv_dim, kernel], &conv_w_vals);
+        let mut conv_state = upload_bf16(ordinal, &[qkv_dim, kstate], &conv_state_vals);
+        let dt_bias = upload_bf16(ordinal, &[num_v_heads], &dt_bias_vals);
+        let a_log = upload_bf16(ordinal, &[num_v_heads], &a_log_vals);
+        let mut recurrent_state = upload_f32(
+            ordinal,
+            &[num_v_heads, head_k_dim, head_v_dim],
+            &recurrent_vals,
+        );
+        let mut output = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[val_dim])
+            .expect("alloc qwen36 metal linear stage4 output");
+        let stage4_workspace_len = qkv_dim
+            + val_dim
+            + 2 * num_v_heads
+            + 2 * key_dim
+            + 2 * num_v_heads * head_k_dim
+            + 2 * num_v_heads
+            + val_dim;
+        let mut workspace = GpuBuffer::zeros(ordinal, ScalarType::F32, &[stage4_workspace_len])
+            .expect("alloc qwen36 metal linear stage4 workspace");
+        let mut sync_buf =
+            GpuBuffer::zeros(ordinal, ScalarType::U8, &[96]).expect("alloc sync buf");
+
+        let params = Qwen36MoeLinearStepParams {
+            stage: 4,
+            hidden: hidden as i32,
+            num_k_heads: num_k_heads as i32,
+            num_v_heads: num_v_heads as i32,
+            head_k_dim: head_k_dim as i32,
+            head_v_dim: head_v_dim as i32,
+            conv_kernel_dim: kernel as i32,
+            rms_norm_eps: eps,
+        };
+        let weights = Qwen36MoeLinearStepWeights {
+            input_hidden: input_hidden.as_ptr(),
+            input_norm_w: input_norm_w.as_ptr(),
+            in_proj_qkv_w: in_proj_qkv_w.as_ptr(),
+            in_proj_z_w: in_proj_z_w.as_ptr(),
+            in_proj_a_w: in_proj_a_w.as_ptr(),
+            in_proj_b_w: in_proj_b_w.as_ptr(),
+            conv1d_w: conv1d_w.as_ptr(),
+            conv1d_bias: std::ptr::null(),
+            dt_bias: dt_bias.as_ptr(),
+            a_log: a_log.as_ptr(),
+            norm_w: std::ptr::null(),
+            out_proj_w: std::ptr::null(),
+            conv_state: conv_state.as_mut_ptr(),
+            recurrent_state: recurrent_state.as_mut_ptr() as *mut f32,
+        };
+
+        linear_step_launch(
+            ordinal,
+            ScalarType::BF16,
+            params,
+            &weights,
+            &Qwen36MoeLinearStepInt4::disabled(),
+            &mut output,
+            &mut workspace,
+            &mut sync_buf,
+        )
+        .expect("run Qwen3.6-MoE Metal linear stage4 fallback");
+
+        let qkv_raw = qwen36_linear_stage1_reference(
+            &input_vals,
+            &norm_vals,
+            &qkv_vals,
+            hidden,
+            qkv_dim,
+            eps,
+        );
+        let a_raw = qwen36_linear_stage1_reference(
+            &input_vals,
+            &norm_vals,
+            &a_vals,
+            hidden,
+            num_v_heads,
+            eps,
+        );
+        let b_raw = qwen36_linear_stage1_reference(
+            &input_vals,
+            &norm_vals,
+            &b_vals,
+            hidden,
+            num_v_heads,
+            eps,
+        );
+        let (silu_out, _) = qwen36_linear_stage2_reference(
+            &qkv_raw,
+            &conv_state_vals,
+            &conv_w_vals,
+            None,
+            qkv_dim,
+            kernel,
+        );
+        let stage3_out = qwen36_linear_stage3_reference(
+            &silu_out,
+            num_k_heads,
+            num_v_heads,
+            head_k_dim,
+            head_v_dim,
+        );
+        let (expected_rec, expected_state) = qwen36_linear_stage4_reference(
+            &stage3_out,
+            &a_raw,
+            &b_raw,
+            &dt_bias_vals,
+            &a_log_vals,
+            &recurrent_vals,
+            num_v_heads,
+            head_k_dim,
+            head_v_dim,
+        );
+        for (idx, (a, e)) in read_bf16(&output)
+            .iter()
+            .zip(expected_rec.iter())
+            .enumerate()
+        {
+            assert!(
+                (a - e).abs() <= 0.01,
+                "stage4 output idx {idx}: expected {e}, got {a}"
+            );
+        }
+        for (idx, (a, e)) in read_f32(&recurrent_state)
+            .iter()
+            .zip(expected_state.iter())
+            .enumerate()
+        {
+            assert!(
+                (a - e).abs() <= 0.0005,
+                "recurrent_state idx {idx}: expected {e}, got {a}"
+            );
+        }
+    }
+
+    #[cfg(all(target_os = "macos", supersonic_backend_metal))]
+    #[test]
+    fn metal_linear_stage5_fallback_matches_reference() {
+        use gpu_hal::{set_backend, Backend};
+
+        set_backend(Backend::Metal);
+        let ordinal = 0usize;
+        let hidden = 4usize;
+        let num_k_heads = 1usize;
+        let num_v_heads = 2usize;
+        let head_k_dim = 2usize;
+        let head_v_dim = 1usize;
+        let key_dim = num_k_heads * head_k_dim;
+        let val_dim = num_v_heads * head_v_dim;
+        let qkv_dim = 2 * key_dim + val_dim;
+        let kernel = 3usize;
+        let kstate = kernel - 1;
+        let eps = 1e-5f32;
+        let input_vals = [1.0, 0.5, -1.0, 2.0];
+        let norm_vals = [0.0, 0.25, -0.5, 1.0];
+        let qkv_vals = [
+            1.0, 0.0, 0.0, 0.0, //
+            0.0, 1.0, 0.0, 0.0, //
+            0.25, -0.5, 0.75, 1.0, //
+            -0.5, 0.25, 0.5, -0.25, //
+            0.0, 0.0, 1.0, 0.0, //
+            0.0, 0.0, 0.0, 1.0, //
+        ];
+        let z_vals = [
+            0.5, 0.0, -0.5, 1.0, //
+            -0.25, 0.75, 0.25, -0.5, //
+        ];
+        let a_vals = [
+            1.0, -0.5, 0.0, 0.25, //
+            0.0, 0.25, 0.5, -1.0, //
+        ];
+        let b_vals = [
+            -0.5, 0.5, 1.0, 0.0, //
+            0.25, 0.0, -0.25, 0.75, //
+        ];
+        let conv_w_vals = [
+            0.5, -0.25, 1.0, //
+            0.25, 0.5, -0.5, //
+            -0.5, 1.0, 0.25, //
+            1.0, 0.0, -0.25, //
+            0.75, -0.5, 0.5, //
+            -0.25, 0.25, 1.0, //
+        ];
+        let conv_state_vals = [
+            0.25, -0.5, //
+            0.0, 0.5, //
+            -0.25, 0.75, //
+            1.0, -1.0, //
+            0.125, -0.375, //
+            -0.75, 0.25, //
+        ];
+        let dt_bias_vals = [0.125, -0.25];
+        let a_log_vals = [-0.5, 0.25];
+        let recurrent_vals = [0.25, -0.5, 0.75, -1.0];
+        let out_norm_vals = [1.25];
+        let out_proj_vals = [
+            1.0, 0.0, //
+            0.0, 1.0, //
+            0.5, -0.25, //
+            -0.75, 0.25, //
+        ];
+
+        let input_hidden = upload_bf16(ordinal, &[hidden], &input_vals);
+        let input_norm_w = upload_bf16(ordinal, &[hidden], &norm_vals);
+        let in_proj_qkv_w = upload_bf16(ordinal, &[qkv_dim, hidden], &qkv_vals);
+        let in_proj_z_w = upload_bf16(ordinal, &[val_dim, hidden], &z_vals);
+        let in_proj_a_w = upload_bf16(ordinal, &[num_v_heads, hidden], &a_vals);
+        let in_proj_b_w = upload_bf16(ordinal, &[num_v_heads, hidden], &b_vals);
+        let conv1d_w = upload_bf16(ordinal, &[qkv_dim, kernel], &conv_w_vals);
+        let mut conv_state = upload_bf16(ordinal, &[qkv_dim, kstate], &conv_state_vals);
+        let dt_bias = upload_bf16(ordinal, &[num_v_heads], &dt_bias_vals);
+        let a_log = upload_bf16(ordinal, &[num_v_heads], &a_log_vals);
+        let norm_w = upload_bf16(ordinal, &[head_v_dim], &out_norm_vals);
+        let out_proj_w = upload_bf16(ordinal, &[hidden, val_dim], &out_proj_vals);
+        let mut recurrent_state = upload_f32(
+            ordinal,
+            &[num_v_heads, head_k_dim, head_v_dim],
+            &recurrent_vals,
+        );
+        let mut output = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[hidden])
+            .expect("alloc qwen36 metal linear stage5 output");
+        let stage4_workspace_len = qkv_dim
+            + val_dim
+            + 2 * num_v_heads
+            + 2 * key_dim
+            + 2 * num_v_heads * head_k_dim
+            + 2 * num_v_heads
+            + val_dim;
+        let mut workspace = GpuBuffer::zeros(ordinal, ScalarType::F32, &[stage4_workspace_len])
+            .expect("alloc qwen36 metal linear stage5 workspace");
+        let mut sync_buf =
+            GpuBuffer::zeros(ordinal, ScalarType::U8, &[96]).expect("alloc sync buf");
+
+        let params = Qwen36MoeLinearStepParams {
+            stage: 5,
+            hidden: hidden as i32,
+            num_k_heads: num_k_heads as i32,
+            num_v_heads: num_v_heads as i32,
+            head_k_dim: head_k_dim as i32,
+            head_v_dim: head_v_dim as i32,
+            conv_kernel_dim: kernel as i32,
+            rms_norm_eps: eps,
+        };
+        let weights = Qwen36MoeLinearStepWeights {
+            input_hidden: input_hidden.as_ptr(),
+            input_norm_w: input_norm_w.as_ptr(),
+            in_proj_qkv_w: in_proj_qkv_w.as_ptr(),
+            in_proj_z_w: in_proj_z_w.as_ptr(),
+            in_proj_a_w: in_proj_a_w.as_ptr(),
+            in_proj_b_w: in_proj_b_w.as_ptr(),
+            conv1d_w: conv1d_w.as_ptr(),
+            conv1d_bias: std::ptr::null(),
+            dt_bias: dt_bias.as_ptr(),
+            a_log: a_log.as_ptr(),
+            norm_w: norm_w.as_ptr(),
+            out_proj_w: out_proj_w.as_ptr(),
+            conv_state: conv_state.as_mut_ptr(),
+            recurrent_state: recurrent_state.as_mut_ptr() as *mut f32,
+        };
+
+        linear_step_launch(
+            ordinal,
+            ScalarType::BF16,
+            params,
+            &weights,
+            &Qwen36MoeLinearStepInt4::disabled(),
+            &mut output,
+            &mut workspace,
+            &mut sync_buf,
+        )
+        .expect("run Qwen3.6-MoE Metal linear stage5 fallback");
+
+        let qkv_raw = qwen36_linear_stage1_reference(
+            &input_vals,
+            &norm_vals,
+            &qkv_vals,
+            hidden,
+            qkv_dim,
+            eps,
+        );
+        let z_raw =
+            qwen36_linear_stage1_reference(&input_vals, &norm_vals, &z_vals, hidden, val_dim, eps);
+        let a_raw = qwen36_linear_stage1_reference(
+            &input_vals,
+            &norm_vals,
+            &a_vals,
+            hidden,
+            num_v_heads,
+            eps,
+        );
+        let b_raw = qwen36_linear_stage1_reference(
+            &input_vals,
+            &norm_vals,
+            &b_vals,
+            hidden,
+            num_v_heads,
+            eps,
+        );
+        let (silu_out, _) = qwen36_linear_stage2_reference(
+            &qkv_raw,
+            &conv_state_vals,
+            &conv_w_vals,
+            None,
+            qkv_dim,
+            kernel,
+        );
+        let stage3_out = qwen36_linear_stage3_reference(
+            &silu_out,
+            num_k_heads,
+            num_v_heads,
+            head_k_dim,
+            head_v_dim,
+        );
+        let (rec_out, _) = qwen36_linear_stage4_reference(
+            &stage3_out,
+            &a_raw,
+            &b_raw,
+            &dt_bias_vals,
+            &a_log_vals,
+            &recurrent_vals,
+            num_v_heads,
+            head_k_dim,
+            head_v_dim,
+        );
+        let expected = qwen36_linear_stage5_reference(
+            &input_vals,
+            &rec_out,
+            &z_raw,
+            &out_norm_vals,
+            &out_proj_vals,
+            hidden,
+            num_v_heads,
+            head_v_dim,
+            eps,
+        );
+        for (idx, (a, e)) in read_bf16(&output).iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (a - e).abs() <= 0.01,
+                "stage5 output idx {idx}: expected {e}, got {a}"
+            );
+        }
     }
 
     /// HIP smoke test: launch the stub kernel against a synthetic 40-layer
@@ -7021,7 +10980,11 @@ mod tests {
     /// BF16 round-to-nearest-even of an F32 value, returning the 16-bit
     /// big-end-of-F32 representation. Same math as the kernel's
     /// `bf16_round_rne_f32`.
-    #[cfg(any(supersonic_backend_hip, supersonic_backend_cuda))]
+    #[cfg(any(
+        supersonic_backend_hip,
+        supersonic_backend_cuda,
+        supersonic_backend_metal
+    ))]
     fn bf16_round_bits(x: f32) -> u16 {
         let bits = x.to_bits();
         let rounding_bias = 0x7FFFu32 + ((bits >> 16) & 1);
@@ -7030,7 +10993,11 @@ mod tests {
     }
 
     /// Reverse: F32 from a BF16 bit pattern.
-    #[cfg(any(supersonic_backend_hip, supersonic_backend_cuda))]
+    #[cfg(any(
+        supersonic_backend_hip,
+        supersonic_backend_cuda,
+        supersonic_backend_metal
+    ))]
     fn f32_from_bf16(b: u16) -> f32 {
         f32::from_bits((b as u32) << 16)
     }
@@ -7039,7 +11006,11 @@ mod tests {
     /// of `minmax_int4_packed_and_recon` in the FFN oracle. Returns
     /// `(packed [out, in/2] u8, scale [out/gs, in/gs] u16-as-BF16,
     /// zero [out/gs, in/gs] u16-as-BF16)`.
-    #[cfg(any(supersonic_backend_hip, supersonic_backend_cuda))]
+    #[cfg(any(
+        supersonic_backend_hip,
+        supersonic_backend_cuda,
+        supersonic_backend_metal
+    ))]
     fn host_minmax_int4(
         w: &[f32],
         out_rows: usize,
@@ -7099,7 +11070,11 @@ mod tests {
 
     /// Reference reconstruction: `bf16(q*s - z*s)` per element. Returns
     /// F32 values whose lower 16 bits are zero (i.e. exactly BF16-precision).
-    #[cfg(any(supersonic_backend_hip, supersonic_backend_cuda))]
+    #[cfg(any(
+        supersonic_backend_hip,
+        supersonic_backend_cuda,
+        supersonic_backend_metal
+    ))]
     fn host_dequant_recon(
         packed: &[u8],
         scale: &[u16],
@@ -7129,7 +11104,11 @@ mod tests {
     }
 
     /// Encode a slice of BF16 16-bit values to LE bytes for `from_host_bytes`.
-    #[cfg(any(supersonic_backend_hip, supersonic_backend_cuda))]
+    #[cfg(any(
+        supersonic_backend_hip,
+        supersonic_backend_cuda,
+        supersonic_backend_metal
+    ))]
     fn bf16_bits_to_bytes(bits: &[u16]) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(bits.len() * 2);
         for b in bits {
@@ -7141,10 +11120,16 @@ mod tests {
     /// Drives one (out_rows, in_cols, gsz) configuration through the smoke
     /// kernel and asserts both helper outputs match the host reference
     /// exactly.
-    #[cfg(any(supersonic_backend_hip, supersonic_backend_cuda))]
+    #[cfg(any(
+        supersonic_backend_hip,
+        supersonic_backend_cuda,
+        supersonic_backend_metal
+    ))]
     fn run_int4_dequant_smoke(out_rows: usize, in_cols: usize, gsz: usize, label: &str) {
         use gpu_hal::{is_backend_compiled, set_backend, Backend, GpuBuffer, ScalarType};
-        let backend = if is_backend_compiled(Backend::Cuda) {
+        let backend = if is_backend_compiled(Backend::Metal) {
+            Backend::Metal
+        } else if is_backend_compiled(Backend::Cuda) {
             Backend::Cuda
         } else {
             Backend::Hip
@@ -7234,7 +11219,11 @@ mod tests {
         }
     }
 
-    #[cfg(any(supersonic_backend_hip, supersonic_backend_cuda))]
+    #[cfg(any(
+        supersonic_backend_hip,
+        supersonic_backend_cuda,
+        supersonic_backend_metal
+    ))]
     #[test]
     fn qwen36_moe_int4_dequant_smoke_fast_path() {
         // gsz=8, in_cols=16 → every 8-col span lies in one group, so
@@ -7242,7 +11231,11 @@ mod tests {
         run_int4_dequant_smoke(8, 16, 8, "fast (gsz=8)");
     }
 
-    #[cfg(any(supersonic_backend_hip, supersonic_backend_cuda))]
+    #[cfg(any(
+        supersonic_backend_hip,
+        supersonic_backend_cuda,
+        supersonic_backend_metal
+    ))]
     #[test]
     fn qwen36_moe_int4_dequant_smoke_slow_path() {
         // gsz=4, in_cols=16 → 8-col spans starting at col=0 cross from

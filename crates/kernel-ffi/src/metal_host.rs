@@ -48,6 +48,22 @@ fn f32_to_bf16_bits(value: f32) -> u16 {
 }
 
 #[inline(always)]
+fn fp8_e4m3_to_f32(byte: u8) -> f32 {
+    let sign = if byte & 0x80 != 0 { -1.0 } else { 1.0 };
+    let exp = (byte >> 3) & 0x0f;
+    let mant = byte & 0x07;
+    if exp == 0 {
+        if mant == 0 {
+            sign * 0.0
+        } else {
+            sign * (mant as f32 / 8.0) * 2.0f32.powi(1 - 7)
+        }
+    } else {
+        sign * (1.0 + mant as f32 / 8.0) * 2.0f32.powi(exp as i32 - 7)
+    }
+}
+
+#[inline(always)]
 fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
@@ -269,6 +285,78 @@ pub(crate) fn matmul_rhs_transposed(
                 "matmul_rhs_transposed",
                 format!("unsupported dtype {other:?}"),
             ))
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn matmul_rhs_transposed_fp8(
+    batch_elems: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    lhs: &GpuBuffer,
+    rhs_fp8: &GpuBuffer,
+    scale: &GpuBuffer,
+    block_size: usize,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if lhs.dtype() != ScalarType::BF16 || out.dtype() != ScalarType::BF16 {
+        return Err(unsupported(
+            "matmul_rhs_transposed_fp8",
+            format!(
+                "expected BF16 lhs/out buffers, got {:?}/{:?}",
+                lhs.dtype(),
+                out.dtype()
+            ),
+        ));
+    }
+    if rhs_fp8.dtype() != ScalarType::F8E4M3 && rhs_fp8.dtype() != ScalarType::U8 {
+        return Err(unsupported(
+            "matmul_rhs_transposed_fp8",
+            format!("expected F8E4M3/U8 rhs, got {:?}", rhs_fp8.dtype()),
+        ));
+    }
+    if scale.dtype() != ScalarType::BF16 {
+        return Err(unsupported(
+            "matmul_rhs_transposed_fp8",
+            format!("expected BF16 scale, got {:?}", scale.dtype()),
+        ));
+    }
+    if block_size == 0 {
+        return Err(unsupported(
+            "matmul_rhs_transposed_fp8",
+            "block_size must be non-zero",
+        ));
+    }
+
+    let lhs = unsafe { bf16_slice(lhs.as_ptr(), batch_elems * m * k) };
+    let rhs = unsafe { std::slice::from_raw_parts(rhs_fp8.as_ptr() as *const u8, n * k) };
+    let row_blocks = n.div_ceil(block_size);
+    let col_blocks = k.div_ceil(block_size);
+    let scale = unsafe { bf16_slice(scale.as_ptr(), row_blocks * col_blocks) };
+    let out = unsafe { bf16_slice_mut(out.as_mut_ptr(), batch_elems * m * n) };
+
+    for batch in 0..batch_elems {
+        let lhs_batch_base = batch * m * k;
+        let out_batch_base = batch * m * n;
+        for row in 0..m {
+            let lhs_row_base = lhs_batch_base + row * k;
+            let out_row_base = out_batch_base + row * n;
+            for out_col in 0..n {
+                let rhs_row_base = out_col * k;
+                let scale_row = out_col / block_size;
+                let mut acc = 0.0f32;
+                for kk in 0..k {
+                    let scale_col = kk / block_size;
+                    let scale_idx = scale_row * col_blocks + scale_col;
+                    let weight_f32 =
+                        fp8_e4m3_to_f32(rhs[rhs_row_base + kk]) * bf16_to_f32(scale[scale_idx]);
+                    let weight = bf16_to_f32(f32_to_bf16_bits(weight_f32));
+                    acc += bf16_to_f32(lhs[lhs_row_base + kk]) * weight;
+                }
+                out[out_row_base + out_col] = f32_to_bf16_bits(acc);
+            }
         }
     }
     Ok(())
