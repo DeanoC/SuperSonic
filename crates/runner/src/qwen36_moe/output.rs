@@ -117,4 +117,9 @@ pub(crate) fn print_generation_summary(
     if !generated_ids.is_empty() {
         println!("  Generated ids: {generated_ids:?}");
     }
+    println!(
+        "[result] prompt_tokens={} generated_tokens={}",
+        prompt_len,
+        generated_ids.len()
+    );
 }

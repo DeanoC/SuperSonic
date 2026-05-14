@@ -7,6 +7,7 @@ use std::process::Command;
 fn model_dir() -> Option<String> {
     std::env::var("SUPERSONIC_TEST_QWEN36_MOE_MODEL_DIR")
         .or_else(|_| std::env::var("SUPERSONIC_QWEN36_MTP_MODEL_DIR"))
+        .or_else(|_| std::env::var("SUPERSONIC_TEST_MODEL_DIR"))
         .ok()
 }
 
@@ -96,7 +97,7 @@ fn qwen36_moe_sparse_vmm_matches_dense_virtual_slabs() {
 
     let Some(model_dir) = model_dir() else {
         eprintln!(
-            "skipping: SUPERSONIC_TEST_QWEN36_MOE_MODEL_DIR/SUPERSONIC_QWEN36_MTP_MODEL_DIR not set"
+            "skipping: SUPERSONIC_TEST_QWEN36_MOE_MODEL_DIR/SUPERSONIC_QWEN36_MTP_MODEL_DIR/SUPERSONIC_TEST_MODEL_DIR not set"
         );
         return;
     };

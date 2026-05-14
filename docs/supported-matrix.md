@@ -207,7 +207,7 @@ lane, not a Hopper-specific retune.
 | qwen3.5-4b       |  ✅¹ |  —   |      —      |    —   |
 | qwen3.5-9b       |  ✅¹ |  —   |      —      |    —   |
 | qwen3-30b-a3b    |  —   | ⏳²  |      —      |    —   |
-| qwen3.6-35b-a3b  |  —   | ⏳²  |      —      |    —   |
+| qwen3.6-35b-a3b  |  —   |  ✅¹ |      —      |    —   |
 | gemma4-e2b       |  ⏳² | ⏳²  |      —      |    —   |
 | gemma4-e4b       |  ⏳² | ⏳²  |      —      |    —   |
 | phi4-mini        |  ⏳² | ⏳²  |     ⏳²     |    —   |
@@ -225,13 +225,14 @@ Metal v2 is a single supported surface:
   routing, expert matmul, KV updates, and the final INT4 lm-head. The
   persistent Qwen3-MoE megakernel remains HIP-only; a local full-model smoke is
   still pending.
-- `qwen3.6-35b-a3b` INT4 has an Apple M5 Max registry row and uses the
+- `qwen3.6-35b-a3b` INT4 is supported on Apple M5 Max through the
   host-orchestrated chained decode route with Metal fallbacks for BF16
   full-attention stages 1-5, linear-attention stages 1-5, FFN stages 1-5,
   the final lm-head helpers, MTP pre-fusion helper, and INT4 sidecars for the
-  projection/expert matvecs. Persistent decode, FP8-runtime, KV-FP8, and
-  speculative decode remain HIP/CUDA-only; a local full-model smoke is still
-  pending.
+  projection/expert matvecs. The validation smoke is:
+  `SUPERSONIC_TEST_MODEL_DIR=/path/to/Qwen3.6-35B-A3B cargo test --release -p runner --test qwen36_moe_metal_smoke -- --ignored --nocapture`.
+  Persistent decode, FP8-runtime, KV-FP8, and speculative decode remain
+  unsupported on this Metal path.
 - `phi4-mini` has an Apple M5 Max registry row and uses a component Metal decode
   path assembled from existing RMSNorm, GEMV, INT4 runtime-dequant matvec,
   FP8 runtime-dequant host fallback matvec, RoPE, attention, SwiGLU, and
@@ -247,8 +248,8 @@ Metal v2 is a single supported surface:
 - decode is implemented as **incremental per-token decode**: each generated token runs
   a single length-1 forward pass (O(N) per step). Conv and recurrent state are carried
   across tokens in persistent GPU buffers; KV cache grows with the sequence
-- INT4 GPTQ kernel is wired in (bit-exact CPU reference unit test passes); end-to-end
-  validation against a baked INT4 model is pending hardware time
+- INT4 GPTQ kernel coverage includes the supported `qwen3.6-35b-a3b` Apple M5
+  Max smoke; other large INT4 Metal rows remain pending local model validation
 - `--fp8-runtime`, `--kv-fp8`, `--batch-size > 1`, `--force-kernel-decode`,
   and `--force-component-decode` are all rejected at startup
 
@@ -257,5 +258,6 @@ Metal v2 is a single supported surface:
   validation is pending a local model checkout.
 
 Metal is not yet at mode-level HIP parity: persistent megakernel decode,
-Qwen3.6 FP8-runtime, Qwen3.6 KV-FP8, speculative decode, and the local
-full-model smokes for the large Apple M5 Max rows remain pending.
+Qwen3.6 FP8-runtime, Qwen3.6 KV-FP8, speculative decode, and the remaining
+large Apple M5 Max model smokes outside the supported Qwen3.6 INT4 lane remain
+pending.

@@ -50,6 +50,7 @@ pub(crate) fn ensure_qwen36_bake(cli: &crate::Cli, entry: &RegistryEntry) -> Res
 pub(crate) fn select_decode_bake(
     model_dir: &Path,
     fp8_runtime: bool,
+    int4_runtime: bool,
 ) -> Result<DecodeBakeSelection> {
     // INT4 remains the default small-VRAM path; explicit --fp8-runtime
     // selects the native FP8 bake.
@@ -68,6 +69,14 @@ pub(crate) fn select_decode_bake(
         (fp8_dir, Qwen36WeightMode::Fp8)
     } else if int4_dir.exists() {
         (int4_dir, Qwen36WeightMode::Int4)
+    } else if int4_runtime {
+        return Err(anyhow!(
+            "--int4 requested but no INT4-GPTQ bake exists at {}. \
+             Create one with `python3 oracle/bake_int4.py --model-dir {}` \
+             or allow the release bake download.",
+            int4_dir.display(),
+            model_dir.display()
+        ));
     } else if bf16_dir.exists() {
         (bf16_dir, Qwen36WeightMode::Bf16)
     } else {

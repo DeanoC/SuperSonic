@@ -100,12 +100,11 @@ fn run_inner(
     total_vram: u64,
     keep_mask: Option<Vec<bool>>,
 ) -> Result<()> {
-    ensure_qwen36_bake(cli, entry)?;
-
     let (context_size, context_size_source) = resolve_context_size(cli);
     validate_persistent_kv_fp8_flags(cli)?;
     validate_cuda_v1_flags(cli, entry)?;
     validate_metal_v1_flags(cli, entry)?;
+    ensure_qwen36_bake(cli, entry)?;
 
     let report = run_qwen36_moe_dry_run(
         &cli.model_dir,
@@ -142,6 +141,7 @@ fn run_inner(
         cli.emit_stage_timings,
         cli.speculative_decode,
         cli.fp8_runtime,
+        cli.int4,
         cli.batched_spec_verify,
         entry.backend,
         cli.device,
@@ -186,6 +186,7 @@ fn decode_text(
     emit_stage_timings: bool,
     speculative_decode: bool,
     fp8_runtime: bool,
+    int4_runtime: bool,
     batched_spec_verify: bool,
     backend: Backend,
     ordinal: usize,
@@ -219,7 +220,7 @@ fn decode_text(
     print_prompt_summary(prompt, &prompt_ids);
 
     let bake_open_start = std::time::Instant::now();
-    let bake = select_decode_bake(model_dir, fp8_runtime)?;
+    let bake = select_decode_bake(model_dir, fp8_runtime, int4_runtime)?;
     if backend == Backend::Cuda && !bake.weight_mode.is_int4() {
         anyhow::bail!(
             "Qwen3.6-35B-A3B CUDA v1 requires an INT4/q4km bake; selected {} from {}",

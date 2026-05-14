@@ -106,6 +106,15 @@ mod tests {
         .expect("qwen3.6-35b-a3b CUDA sm86 registry entry")
     }
 
+    fn metal_entry() -> &'static RegistryEntry {
+        lookup(
+            &ModelVariant::Qwen3_6_35B_A3B,
+            &Backend::Metal,
+            &GpuArch::AppleM5Max,
+        )
+        .expect("qwen3.6-35b-a3b Metal apple-m5-max registry entry")
+    }
+
     fn cli(extra: &[&str]) -> crate::Cli {
         let mut args = vec![
             "supersonic",
@@ -122,6 +131,12 @@ mod tests {
     fn cuda_v1_error(extra: &[&str]) -> String {
         validate_cuda_v1_flags(&cli(extra), cuda_entry())
             .expect_err("CUDA v1 policy should reject this flag set")
+            .to_string()
+    }
+
+    fn metal_v1_error(extra: &[&str]) -> String {
+        validate_metal_v1_flags(&cli(extra), metal_entry())
+            .expect_err("Metal v1 policy should reject this flag set")
             .to_string()
     }
 
@@ -153,5 +168,18 @@ mod tests {
         std::env::remove_var("SUPERSONIC_VMM_KV");
 
         assert!(err.contains("SUPERSONIC_VMM_KV=1"));
+    }
+
+    #[test]
+    fn metal_v1_accepts_default_int4_path() {
+        validate_metal_v1_flags(&cli(&["--int4"]), metal_entry()).expect("Metal INT4 v1 flags");
+    }
+
+    #[test]
+    fn metal_v1_rejects_unsupported_weight_kv_and_speculative_modes() {
+        assert!(metal_v1_error(&["--fp8-runtime"]).contains("--fp8-runtime"));
+        assert!(metal_v1_error(&["--kv-fp8"]).contains("--kv-fp8"));
+        assert!(metal_v1_error(&["--speculative-decode"]).contains("speculative"));
+        assert!(metal_v1_error(&["--batched-spec-verify"]).contains("speculative"));
     }
 }

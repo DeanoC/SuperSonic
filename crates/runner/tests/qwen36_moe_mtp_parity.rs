@@ -12,7 +12,8 @@
 //! the oracle JSON (the existing `prefusion_weights` block is already
 //! 16 MiB). The test loads `mtp.*` tensors from the INT4 bake's raw BF16
 //! MTP pass-through tensors at the path given by
-//! `SUPERSONIC_QWEN36_MTP_MODEL_DIR`, matching the runtime path.
+//! `SUPERSONIC_QWEN36_MTP_MODEL_DIR` or `SUPERSONIC_TEST_MODEL_DIR`,
+//! matching the runtime path.
 //!
 //! Skipped silently when either env var isn't set so CI / non-HIP
 //! machines stay green. To run locally:
@@ -23,7 +24,7 @@
 //!     --num-speculative-tokens 1 --seed 42 \
 //!     --out /tmp/qwen36_mtp.json
 //! SUPERSONIC_QWEN36_MTP_ORACLE_JSON=/tmp/qwen36_mtp.json \
-//!   SUPERSONIC_QWEN36_MTP_MODEL_DIR=/path/to/Qwen3.6-35B-A3B \
+//!   SUPERSONIC_TEST_MODEL_DIR=/path/to/Qwen3.6-35B-A3B \
 //!   cargo test --release -p runner --test qwen36_moe_mtp_parity \
 //!     -- --nocapture
 //! ```
@@ -47,6 +48,13 @@ use runner::qwen36_moe_speculative::{
 use runner::qwen36_moe_types::{FullAttnKvCache, MtpLayerBuffers, MultiLayerGeom, PositionPair};
 use safetensors::SafeTensors;
 use serde_json::Value;
+
+fn qwen36_model_dir() -> Option<String> {
+    std::env::var("SUPERSONIC_QWEN36_MTP_MODEL_DIR")
+        .or_else(|_| std::env::var("SUPERSONIC_TEST_QWEN36_MOE_MODEL_DIR"))
+        .or_else(|_| std::env::var("SUPERSONIC_TEST_MODEL_DIR"))
+        .ok()
+}
 
 fn b64(input: &str) -> Vec<u8> {
     base64::engine::general_purpose::STANDARD
@@ -247,9 +255,9 @@ fn qwen36_moe_mtp_layer_forward_matches_oracle() {
         );
         return;
     };
-    let Ok(model_dir) = std::env::var("SUPERSONIC_QWEN36_MTP_MODEL_DIR") else {
+    let Some(model_dir) = qwen36_model_dir() else {
         eprintln!(
-            "skip: SUPERSONIC_QWEN36_MTP_MODEL_DIR not set. Point this at the \
+            "skip: SUPERSONIC_QWEN36_MTP_MODEL_DIR/SUPERSONIC_TEST_MODEL_DIR not set. Point this at the \
              same model_dir the oracle used (the test loads `mtp.*` tensors \
              directly from safetensors — they're too big to round-trip through \
              the oracle JSON)."
@@ -407,8 +415,8 @@ fn qwen36_moe_mtp_draft_step_matches_oracle() {
         eprintln!("skip: SUPERSONIC_QWEN36_MTP_ORACLE_JSON not set");
         return;
     };
-    let Ok(model_dir) = std::env::var("SUPERSONIC_QWEN36_MTP_MODEL_DIR") else {
-        eprintln!("skip: SUPERSONIC_QWEN36_MTP_MODEL_DIR not set");
+    let Some(model_dir) = qwen36_model_dir() else {
+        eprintln!("skip: SUPERSONIC_QWEN36_MTP_MODEL_DIR/SUPERSONIC_TEST_MODEL_DIR not set");
         return;
     };
     let model_dir = PathBuf::from(model_dir);
@@ -531,8 +539,8 @@ fn qwen36_moe_mtp_draft_chain_matches_oracle() {
         eprintln!("skip: SUPERSONIC_QWEN36_MTP_ORACLE_JSON not set");
         return;
     };
-    let Ok(model_dir) = std::env::var("SUPERSONIC_QWEN36_MTP_MODEL_DIR") else {
-        eprintln!("skip: SUPERSONIC_QWEN36_MTP_MODEL_DIR not set");
+    let Some(model_dir) = qwen36_model_dir() else {
+        eprintln!("skip: SUPERSONIC_QWEN36_MTP_MODEL_DIR/SUPERSONIC_TEST_MODEL_DIR not set");
         return;
     };
     let model_dir = PathBuf::from(model_dir);
@@ -707,8 +715,8 @@ fn qwen36_moe_speculative_driver_orchestration() {
         eprintln!("skip: SUPERSONIC_QWEN36_MTP_ORACLE_JSON not set");
         return;
     };
-    let Ok(model_dir) = std::env::var("SUPERSONIC_QWEN36_MTP_MODEL_DIR") else {
-        eprintln!("skip: SUPERSONIC_QWEN36_MTP_MODEL_DIR not set");
+    let Some(model_dir) = qwen36_model_dir() else {
+        eprintln!("skip: SUPERSONIC_QWEN36_MTP_MODEL_DIR/SUPERSONIC_TEST_MODEL_DIR not set");
         return;
     };
     let model_dir = PathBuf::from(model_dir);
@@ -797,11 +805,12 @@ fn qwen36_moe_speculative_driver_orchestration() {
         let mut step_idx = 0usize;
         let first_match = want_drafts[0];
         let synth_fh_p2 = synth_fh.clone();
-        let base_step_p2 = move |_pos: PositionPair, _input: u32| -> anyhow::Result<(u32, Vec<u8>)> {
-            let predicted = if step_idx == 0 { first_match } else { bad_pred };
-            step_idx += 1;
-            Ok((predicted, synth_fh_p2.clone()))
-        };
+        let base_step_p2 =
+            move |_pos: PositionPair, _input: u32| -> anyhow::Result<(u32, Vec<u8>)> {
+                let predicted = if step_idx == 0 { first_match } else { bad_pred };
+                step_idx += 1;
+                Ok((predicted, synth_fh_p2.clone()))
+            };
         eprintln!("[spec] pass 2 (reject at k=1)");
         let r2 = run_speculative_decode_step(
             ordinal,
@@ -930,8 +939,8 @@ fn qwen36_moe_speculative_driver_orchestration_batched() {
         eprintln!("skip: SUPERSONIC_QWEN36_MTP_ORACLE_JSON not set");
         return;
     };
-    let Ok(model_dir) = std::env::var("SUPERSONIC_QWEN36_MTP_MODEL_DIR") else {
-        eprintln!("skip: SUPERSONIC_QWEN36_MTP_MODEL_DIR not set");
+    let Some(model_dir) = qwen36_model_dir() else {
+        eprintln!("skip: SUPERSONIC_QWEN36_MTP_MODEL_DIR/SUPERSONIC_TEST_MODEL_DIR not set");
         return;
     };
     let model_dir = PathBuf::from(model_dir);
@@ -974,16 +983,17 @@ fn qwen36_moe_speculative_driver_orchestration_batched() {
     let bonus_token: u32 = 999;
     let want_drafts_p1 = want_drafts.clone();
     let synth_fh_p1 = synth_fh.clone();
-    let base_step_batched_p1 = move |inputs: &[(PositionPair, u32)]| -> anyhow::Result<Vec<(u32, Vec<u8>)>> {
-        assert_eq!(inputs.len(), k + 1, "expected K+1 inputs");
-        // Predictions: drafts[0..K] match, then bonus for K-th.
-        let mut out: Vec<(u32, Vec<u8>)> = Vec::with_capacity(k + 1);
-        for i in 0..k {
-            out.push((want_drafts_p1[i], synth_fh_p1.clone()));
-        }
-        out.push((bonus_token, synth_fh_p1.clone()));
-        Ok(out)
-    };
+    let base_step_batched_p1 =
+        move |inputs: &[(PositionPair, u32)]| -> anyhow::Result<Vec<(u32, Vec<u8>)>> {
+            assert_eq!(inputs.len(), k + 1, "expected K+1 inputs");
+            // Predictions: drafts[0..K] match, then bonus for K-th.
+            let mut out: Vec<(u32, Vec<u8>)> = Vec::with_capacity(k + 1);
+            for i in 0..k {
+                out.push((want_drafts_p1[i], synth_fh_p1.clone()));
+            }
+            out.push((bonus_token, synth_fh_p1.clone()));
+            Ok(out)
+        };
     let r1 = run_speculative_decode_step_batched(
         ordinal,
         &geom,
@@ -1060,15 +1070,16 @@ fn qwen36_moe_speculative_driver_orchestration_batched() {
     // ---- Pass 3: zero-accept (immediate reject at k=0) ----
     let bad_pred: u32 = 67890;
     let synth_fh_p3 = synth_fh.clone();
-    let base_step_batched_p3 = move |inputs: &[(PositionPair, u32)]| -> anyhow::Result<Vec<(u32, Vec<u8>)>> {
-        assert_eq!(inputs.len(), k + 1);
-        let mut out: Vec<(u32, Vec<u8>)> = Vec::with_capacity(k + 1);
-        out.push((bad_pred, synth_fh_p3.clone())); // immediate reject
-        for _ in 1..(k + 1) {
-            out.push((0u32, synth_fh_p3.clone()));
-        }
-        Ok(out)
-    };
+    let base_step_batched_p3 =
+        move |inputs: &[(PositionPair, u32)]| -> anyhow::Result<Vec<(u32, Vec<u8>)>> {
+            assert_eq!(inputs.len(), k + 1);
+            let mut out: Vec<(u32, Vec<u8>)> = Vec::with_capacity(k + 1);
+            out.push((bad_pred, synth_fh_p3.clone())); // immediate reject
+            for _ in 1..(k + 1) {
+                out.push((0u32, synth_fh_p3.clone()));
+            }
+            Ok(out)
+        };
     let r3 = run_speculative_decode_step_batched(
         ordinal,
         &geom,
@@ -1095,10 +1106,11 @@ fn qwen36_moe_speculative_driver_orchestration_batched() {
     // ---- Pass 4: K=0 fallback ----
     let k0_pred: u32 = 4242;
     let synth_fh_p4 = synth_fh.clone();
-    let base_step_batched_p4 = move |inputs: &[(PositionPair, u32)]| -> anyhow::Result<Vec<(u32, Vec<u8>)>> {
-        assert_eq!(inputs.len(), 1, "K=0 fallback runs exactly one base step");
-        Ok(vec![(k0_pred, synth_fh_p4.clone())])
-    };
+    let base_step_batched_p4 =
+        move |inputs: &[(PositionPair, u32)]| -> anyhow::Result<Vec<(u32, Vec<u8>)>> {
+            assert_eq!(inputs.len(), 1, "K=0 fallback runs exactly one base step");
+            Ok(vec![(k0_pred, synth_fh_p4.clone())])
+        };
     let r4 = run_speculative_decode_step_batched(
         ordinal,
         &geom,
@@ -1144,8 +1156,8 @@ fn qwen36_moe_speculative_driver_batched_reject_at_last_index() {
         eprintln!("skip: SUPERSONIC_QWEN36_MTP_ORACLE_JSON not set");
         return;
     };
-    let Ok(model_dir) = std::env::var("SUPERSONIC_QWEN36_MTP_MODEL_DIR") else {
-        eprintln!("skip: SUPERSONIC_QWEN36_MTP_MODEL_DIR not set");
+    let Some(model_dir) = qwen36_model_dir() else {
+        eprintln!("skip: SUPERSONIC_QWEN36_MTP_MODEL_DIR/SUPERSONIC_TEST_MODEL_DIR not set");
         return;
     };
     let model_dir = PathBuf::from(model_dir);
@@ -1179,15 +1191,16 @@ fn qwen36_moe_speculative_driver_batched_reject_at_last_index() {
     // Post-fix: n_accepted=0 != K → no bonus, emitted=[bad_pred].
     let bad_pred_k1: u32 = 7777;
     let synth_fh_k1 = synth_fh.clone();
-    let base_step_k1 = move |inputs: &[(PositionPair, u32)]| -> anyhow::Result<Vec<(u32, Vec<u8>)>> {
-        assert_eq!(inputs.len(), 2, "K=1 → K+1=2 verify inputs");
-        // K+1 = 2 predictions: index 0 mismatches drafts[0],
-        // index 1 (bonus) is filler — must NOT appear in emitted.
-        Ok(vec![
-            (bad_pred_k1, synth_fh_k1.clone()),
-            (99999, synth_fh_k1.clone()),
-        ])
-    };
+    let base_step_k1 =
+        move |inputs: &[(PositionPair, u32)]| -> anyhow::Result<Vec<(u32, Vec<u8>)>> {
+            assert_eq!(inputs.len(), 2, "K=1 → K+1=2 verify inputs");
+            // K+1 = 2 predictions: index 0 mismatches drafts[0],
+            // index 1 (bonus) is filler — must NOT appear in emitted.
+            Ok(vec![
+                (bad_pred_k1, synth_fh_k1.clone()),
+                (99999, synth_fh_k1.clone()),
+            ])
+        };
     let r_k1 = run_speculative_decode_step_batched(
         ordinal,
         &geom,
@@ -1230,14 +1243,15 @@ fn qwen36_moe_speculative_driver_batched_reject_at_last_index() {
     let first_match = oracle_drafts[0];
     let bad_pred_k2: u32 = 8888;
     let synth_fh_k2 = synth_fh.clone();
-    let base_step_k2 = move |inputs: &[(PositionPair, u32)]| -> anyhow::Result<Vec<(u32, Vec<u8>)>> {
-        assert_eq!(inputs.len(), 3, "K=2 → K+1=3 verify inputs");
-        Ok(vec![
-            (first_match, synth_fh_k2.clone()), // accepts drafts[0]
-            (bad_pred_k2, synth_fh_k2.clone()), // rejects drafts[1]
-            (99999, synth_fh_k2.clone()),       // bonus filler
-        ])
-    };
+    let base_step_k2 =
+        move |inputs: &[(PositionPair, u32)]| -> anyhow::Result<Vec<(u32, Vec<u8>)>> {
+            assert_eq!(inputs.len(), 3, "K=2 → K+1=3 verify inputs");
+            Ok(vec![
+                (first_match, synth_fh_k2.clone()), // accepts drafts[0]
+                (bad_pred_k2, synth_fh_k2.clone()), // rejects drafts[1]
+                (99999, synth_fh_k2.clone()),       // bonus filler
+            ])
+        };
     let r_k2 = run_speculative_decode_step_batched(
         ordinal,
         &geom,

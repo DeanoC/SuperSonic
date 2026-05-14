@@ -2287,7 +2287,9 @@ fn linear_step_stage1_5_metal_host(
             }
             let rec = bf16_round_f32(acc);
             workspace[off_rec_out + head * head_v_dim + j] = rec;
-            output[head * head_v_dim + j] = f32_to_bf16_bits(rec);
+            if params.stage == 4 {
+                output[head * head_v_dim + j] = f32_to_bf16_bits(rec);
+            }
         }
     }
 
