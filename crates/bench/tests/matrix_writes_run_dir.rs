@@ -10,7 +10,7 @@ fn matrix_writes_meta_and_at_least_one_perf_cell() {
         models: vec!["qwen3.5-0.8b".into()],
         quants: vec!["bf16".into()],
         binary: PathBuf::from("/bin/echo"), // will produce no [result], so cells will be Error
-        model_dir_resolver: Box::new(|_| PathBuf::from("/nonexistent")),
+        model_dir_resolver: Box::new(|_| Ok(PathBuf::from("/nonexistent"))),
         specprefill_draft_dir_resolver: Box::new(|_| None),
         prompt: "x".into(),
         max_new_tokens: 1,
@@ -41,7 +41,7 @@ fn matrix_skips_unsupported_combo_with_skipped_status() {
         // /bin/false would produce an Error cell if the supported-combo guard
         // weren't there; the test asserts the guard runs first.
         binary: PathBuf::from("/bin/false"),
-        model_dir_resolver: Box::new(|_| PathBuf::from("/nonexistent")),
+        model_dir_resolver: Box::new(|_| Ok(PathBuf::from("/nonexistent"))),
         specprefill_draft_dir_resolver: Box::new(|_| None),
         prompt: "x".into(),
         max_new_tokens: 1,
@@ -80,7 +80,7 @@ fn matrix_runs_ad_hoc_sm86_specprefill_lane() {
         models: vec!["qwen3.6-35b-a3b".into()],
         quants: vec!["int4-spec070".into()],
         binary: PathBuf::from("/bin/echo"),
-        model_dir_resolver: Box::new(|_| PathBuf::from("/nonexistent")),
+        model_dir_resolver: Box::new(|_| Ok(PathBuf::from("/nonexistent"))),
         specprefill_draft_dir_resolver: Box::new(|_| Some(PathBuf::from("/draft"))),
         prompt: "x".into(),
         max_new_tokens: 1,

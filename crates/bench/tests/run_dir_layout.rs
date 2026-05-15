@@ -4,7 +4,7 @@ use supersonic_bench::runs::{MetaJson, PerfCellJson, PerfStatus, RunDir};
 #[test]
 fn meta_json_round_trip() {
     let meta = MetaJson {
-        schema_version: 1,
+        schema_version: 2,
         run_id: "2026-05-05-abc1234".to_string(),
         timestamp_utc: "2026-05-05T12:00:00Z".to_string(),
         git_sha: "abc1234".to_string(),
@@ -26,9 +26,11 @@ fn meta_json_round_trip() {
 #[test]
 fn perf_cell_json_status_variants() {
     let ok = PerfCellJson {
-        schema_version: 1,
+        schema_version: 2,
         model: "qwen3.5-0.8b".into(),
         quant: "bf16".into(),
+        arch: "gfx1100".into(),
+        backend: "hip".into(),
         prompt: "The quick brown fox jumps over".into(),
         max_new_tokens: 16,
         status: PerfStatus::Ok {
@@ -36,6 +38,9 @@ fn perf_cell_json_status_variants() {
             ms_per_tok: 8.0,
             samples: vec![8.1, 8.0, 7.9],
         },
+        stage_timings: None,
+        chain_breakdown: None,
+        lifecycle_timings: None,
         gpu_temp_c_end: Some(60.0),
     };
     let s = serde_json::to_string(&ok).unwrap();

@@ -23,6 +23,7 @@ fn run_one_combo_takes_median_of_three() {
     let invocation = ComboInvocation {
         binary: bin,
         backend: None,
+        arch: "gfx1100".into(),
         model: "qwen3.5-0.8b".into(),
         model_dir: PathBuf::from("/nonexistent"),
         quant: "bf16".into(),
@@ -55,6 +56,7 @@ fn run_one_combo_records_error_on_missing_binary() {
     let invocation = ComboInvocation {
         binary: PathBuf::from("/nonexistent/supersonic"),
         backend: None,
+        arch: "gfx1100".into(),
         model: "qwen3.5-0.8b".into(),
         model_dir: PathBuf::from("/nonexistent"),
         quant: "bf16".into(),

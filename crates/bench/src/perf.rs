@@ -1,6 +1,7 @@
 use crate::runs::{PerfCellJson, PerfStatus, SCHEMA_VERSION};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
@@ -9,6 +10,19 @@ use std::time::Duration;
 pub struct ExtractedMetrics {
     pub ms_per_step: f64,
     pub ms_per_tok: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AttributionTimings {
+    pub stage_timings: Option<BTreeMap<String, f64>>,
+    pub chain_breakdown: Option<BTreeMap<String, f64>>,
+    pub lifecycle_timings: Option<BTreeMap<String, f64>>,
+}
+
+#[derive(Debug, Clone)]
+struct ExtractedRun {
+    metrics: ExtractedMetrics,
+    attribution: AttributionTimings,
 }
 
 /// Parse the last `[result] ms_per_step=N ...` line from the combined
@@ -66,6 +80,26 @@ pub fn extract_metrics(output: &str) -> Option<ExtractedMetrics> {
     None
 }
 
+pub fn extract_attribution_timings(output: &str) -> AttributionTimings {
+    AttributionTimings {
+        stage_timings: output
+            .lines()
+            .rev()
+            .find(|l| l.starts_with("[qwen36-moe stage-timings]"))
+            .map(parse_numeric_fields),
+        chain_breakdown: output
+            .lines()
+            .rev()
+            .find(|l| l.starts_with("[qwen36-moe chain-breakdown]"))
+            .map(parse_numeric_fields),
+        lifecycle_timings: output
+            .lines()
+            .rev()
+            .find(|l| l.starts_with("[qwen36-moe lifecycle-timings]"))
+            .map(parse_numeric_fields),
+    }
+}
+
 fn parse_field(line: &str, key: &str) -> Option<f64> {
     // Assumes runner emits space-delimited key=value pairs (no trailing punctuation).
     let needle = format!("{key}=");
@@ -75,10 +109,25 @@ fn parse_field(line: &str, key: &str) -> Option<f64> {
     rest[..end].parse().ok()
 }
 
+fn parse_numeric_fields(line: &str) -> BTreeMap<String, f64> {
+    line.split_whitespace()
+        .filter_map(|part| {
+            let part = part.trim_matches(|c| c == '(' || c == ')');
+            let (key, raw) = part.split_once('=')?;
+            let value = raw
+                .trim_end_matches(|c: char| c == ',' || c == ')')
+                .parse::<f64>()
+                .ok()?;
+            Some((key.to_string(), value))
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone)]
 pub struct ComboInvocation {
     pub binary: PathBuf,
     pub backend: Option<String>,
+    pub arch: String,
     pub model: String,
     pub model_dir: PathBuf,
     pub quant: String,
@@ -100,39 +149,56 @@ pub fn run_one_combo(invocation: &ComboInvocation, policy: &RunPolicy) -> Result
     }
 
     // Warmup pass — discard.
-    let _ = invoke_supersonic(invocation, invocation.warmup_tokens);
+    let _ = invoke_supersonic(invocation, invocation.warmup_tokens, false);
 
     let mut samples = Vec::new();
     let mut last_err: Option<String> = None;
     for _ in 0..policy.measurement_runs {
-        match invoke_supersonic(invocation, invocation.max_new_tokens) {
-            Ok(m) => samples.push(m.ms_per_step),
+        match invoke_supersonic(invocation, invocation.max_new_tokens, false) {
+            Ok(run) => samples.push(run.metrics.ms_per_step),
             Err(e) => last_err = Some(e),
         }
     }
 
-    let status = if samples.is_empty() {
-        PerfStatus::Error {
-            stderr_tail: last_err.unwrap_or_else(|| "no samples".into()),
-        }
+    let (status, attribution) = if samples.is_empty() {
+        (
+            PerfStatus::Error {
+                stderr_tail: last_err.unwrap_or_else(|| "no samples".into()),
+            },
+            AttributionTimings::default(),
+        )
     } else {
         let mut sorted = samples.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let median = sorted[sorted.len() / 2];
-        PerfStatus::Ok {
-            ms_per_step: median,
-            ms_per_tok: median,
-            samples,
-        }
+        let attribution = invoke_supersonic(invocation, invocation.max_new_tokens, true)
+            .map(|run| run.attribution)
+            .unwrap_or_default();
+        (
+            PerfStatus::Ok {
+                ms_per_step: median,
+                ms_per_tok: median,
+                samples,
+            },
+            attribution,
+        )
     };
 
     Ok(PerfCellJson {
         schema_version: SCHEMA_VERSION,
         model: invocation.model.clone(),
         quant: invocation.quant.clone(),
+        arch: invocation.arch.clone(),
+        backend: invocation
+            .backend
+            .clone()
+            .unwrap_or_else(|| "auto".to_string()),
         prompt: invocation.prompt.clone(),
         max_new_tokens: invocation.max_new_tokens,
         status,
+        stage_timings: attribution.stage_timings,
+        chain_breakdown: attribution.chain_breakdown,
+        lifecycle_timings: attribution.lifecycle_timings,
         gpu_temp_c_end: None,
     })
 }
@@ -140,10 +206,15 @@ pub fn run_one_combo(invocation: &ComboInvocation, policy: &RunPolicy) -> Result
 fn invoke_supersonic(
     invocation: &ComboInvocation,
     max_new: u32,
-) -> std::result::Result<ExtractedMetrics, String> {
+    emit_stage_timings: bool,
+) -> std::result::Result<ExtractedRun, String> {
     let mut cmd = Command::new(&invocation.binary);
     if let Some(backend) = &invocation.backend {
         cmd.arg("--backend").arg(backend);
+    }
+    if invocation.arch == "apple-m5-max" && invocation.model == "qwen3.6-35b-a3b" {
+        cmd.env("SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL", "0")
+            .env("SUPERSONIC_QWEN36_DENSE_PREFILL_TOKEN_LOOP", "1");
     }
     cmd.arg("--model")
         .arg(&invocation.model)
@@ -153,6 +224,9 @@ fn invoke_supersonic(
         .arg(&invocation.prompt)
         .arg("--max-new-tokens")
         .arg(max_new.to_string());
+    if emit_stage_timings {
+        cmd.arg("--emit-stage-timings");
+    }
     apply_quant_flag(
         &mut cmd,
         &invocation.quant,
@@ -162,7 +236,7 @@ fn invoke_supersonic(
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     let combined = format!("{stdout}\n{stderr}");
-    extract_metrics(&combined).ok_or_else(|| {
+    let metrics = extract_metrics(&combined).ok_or_else(|| {
         let tail: String = combined
             .lines()
             .rev()
@@ -173,6 +247,10 @@ fn invoke_supersonic(
             .collect::<Vec<_>>()
             .join("\n");
         format!("no recognized metric line; tail:\n{tail}")
+    })?;
+    Ok(ExtractedRun {
+        metrics,
+        attribution: extract_attribution_timings(&combined),
     })
 }
 

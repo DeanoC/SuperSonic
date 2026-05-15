@@ -1,5 +1,6 @@
 """CLI: python -m oracle.bench.render.render_main"""
 import argparse
+import json
 from pathlib import Path
 
 from .markdown import render_perf_table, render_quality_table, render_external_comparison_table, replace_autogen_zone
@@ -24,9 +25,15 @@ def main():
     args = ap.parse_args()
     if args.cmd == "markdown":
         perf_md = render_perf_table(args.run / "perf")
+        perf_zone_key = args.perf_zone_key
+        meta_path = args.run / "meta.json"
+        if perf_zone_key == "bench-perf-matrix" and meta_path.exists():
+            arch = json.loads(meta_path.read_text()).get("arch")
+            if arch == "apple-m5-max":
+                perf_zone_key = "apple-m5-max-metal"
         perf_doc = (args.out / "docs" / "performance.md")
         if perf_doc.exists():
-            updated = replace_autogen_zone(perf_doc.read_text(), args.perf_zone_key, perf_md)
+            updated = replace_autogen_zone(perf_doc.read_text(), perf_zone_key, perf_md)
             perf_doc.write_text(updated)
             print(f"updated {perf_doc}")
 

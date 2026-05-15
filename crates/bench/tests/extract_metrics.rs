@@ -1,5 +1,5 @@
 #[allow(unused_imports)]
-use supersonic_bench::perf::{extract_metrics, ExtractedMetrics};
+use supersonic_bench::perf::{extract_attribution_timings, extract_metrics, ExtractedMetrics};
 
 const MODERN: &str = include_str!("fixtures/runner_output_modern.txt");
 const PHI4: &str = include_str!("fixtures/runner_output_phi4.txt");
@@ -63,4 +63,27 @@ fn extracts_qwen36_batched_prefill_lines_when_result_line_is_absent() {
 ";
     let m = extract_metrics(s).unwrap();
     assert!((m.ms_per_step - 3514.6).abs() < 1e-6);
+}
+
+#[test]
+fn extracts_qwen36_attribution_timing_maps() {
+    let s = "\
+[result] prompt_tokens=6 generated_tokens=16
+[qwen36-moe stage-timings] gen_steps=16 embed_ms_avg=0.123 chain_ms_avg=25.456 lm_head_ms_avg=2.000 sample_ms_avg=0.010 detok_ms_avg=0.001 total_ms_avg=27.590 (chain_total_ms=407.3 lm_head_total_ms=32.0)
+[qwen36-moe chain-breakdown] gen_steps=16 full_attn_ms_avg=8.000 linear_attn_ms_avg=4.000 ffn_ms_avg=13.456 (full_attn_total_ms=128.0 linear_attn_total_ms=64.0 ffn_total_ms=215.3)
+[qwen36-moe lifecycle-timings] prompt_setup_ms=1.000 bake_open_ms=2.000 layer_load_ms=3.000 session_ms=4.000 prefill_steps=1 prefill_embed_ms=5.000 prefill_chain_ms=6.000 prefill_total_ms=11.000 generation_wall_ms=441.0 total_wall_ms=452.0
+";
+    let timings = extract_attribution_timings(s);
+    assert_eq!(
+        timings.stage_timings.unwrap().get("chain_ms_avg"),
+        Some(&25.456)
+    );
+    assert_eq!(
+        timings.chain_breakdown.unwrap().get("ffn_total_ms"),
+        Some(&215.3)
+    );
+    assert_eq!(
+        timings.lifecycle_timings.unwrap().get("prefill_total_ms"),
+        Some(&11.0)
+    );
 }

@@ -49,6 +49,27 @@ def test_perf_cell_error_status():
     validate_perf_cell(cell)
 
 
+def test_perf_cell_v2_attribution_status():
+    cell = {
+        "schema_version": 2,
+        "model": "qwen3.6-35b-a3b",
+        "quant": "int4",
+        "arch": "apple-m5-max",
+        "backend": "metal",
+        "prompt": "x",
+        "max_new_tokens": 16,
+        "status": "ok",
+        "ms_per_step": 27.5,
+        "ms_per_tok": 27.5,
+        "samples": [27.4, 27.5, 27.6],
+        "stage_timings": {"chain_ms_avg": 25.0},
+        "chain_breakdown": {"ffn_ms_avg": 12.0},
+        "lifecycle_timings": {"prefill_total_ms": 1000.0},
+        "gpu_temp_c_end": None,
+    }
+    validate_perf_cell(cell)
+
+
 def test_perf_cell_invalid_status_rejected():
     cell = {
         "schema_version": 1,

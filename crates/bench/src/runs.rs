@@ -1,8 +1,9 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetaJson {
@@ -40,10 +41,18 @@ pub struct PerfCellJson {
     pub schema_version: u32,
     pub model: String,
     pub quant: String,
+    pub arch: String,
+    pub backend: String,
     pub prompt: String,
     pub max_new_tokens: u32,
     #[serde(flatten)]
     pub status: PerfStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stage_timings: Option<BTreeMap<String, f64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chain_breakdown: Option<BTreeMap<String, f64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lifecycle_timings: Option<BTreeMap<String, f64>>,
     pub gpu_temp_c_end: Option<f64>,
 }
 
