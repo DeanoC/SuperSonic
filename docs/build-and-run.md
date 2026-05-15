@@ -259,22 +259,22 @@ Detailed CUDA `sm86` history for both the `0.8B` and `4B` hero lanes lives in
 ## Metal
 
 Metal support is currently an Apple-silicon lane validated on Apple M4 and
-Apple M5 Max, with Qwen3.5 BF16 coverage and a supported Qwen3.6-35B-A3B INT4
-Apple M5 Max path.
+Apple M5 Max, with Qwen3.5 BF16 coverage, Qwen3.6-35B-A3B INT4 coverage, and
+large Apple M5 Max component/chained-path coverage.
 The core decode path is now O(N) incremental decode — no replay overhead.
 
 Supported Metal scope:
 
 - `qwen3.5-0.8b`, `qwen3.5-2b`
 - `qwen3.5-4b`, `qwen3.5-9b` on Apple M5 Max
-- `qwen3-30b-a3b` INT4 on Apple M5 Max is wired through a correctness-first
-  chained Metal fallback; a local full-model smoke is still pending
+- `qwen3-30b-a3b` INT4 on Apple M5 Max is supported through a correctness-first
+  chained Metal fallback
 - `qwen3.6-35b-a3b` INT4 on Apple M5 Max is supported through the
   correctness-first chained Metal decode route
-- `gemma4-e2b`, `gemma4-e4b` BF16 and INT4 on Apple M5 Max are wired through a
-  component Metal decode path; a local model smoke is still pending
-- `phi4-mini` BF16, INT4, and FP8-runtime on Apple M5 Max are wired through a
-  component Metal decode path; a local model smoke is still pending
+- `gemma4-e2b`, `gemma4-e4b` BF16 and INT4 on Apple M5 Max are supported
+  through a component Metal decode path
+- `phi4-mini` BF16, INT4, and FP8-runtime on Apple M5 Max are supported through
+  a component Metal decode path
 - Apple M4 / `apple-m4`
 - Apple M5 Max / `apple-m5-max`
 - BF16 prefill parity against the Python CPU oracle
@@ -292,7 +292,7 @@ Metal currently rejects or defers:
 - `qwen3-30b-a3b` INT4 on Apple M5 Max has a correctness-first chained Metal
   fallback for decode-layer attention, MoE routing, expert matmul, KV updates,
   and the final INT4 lm-head. The persistent Qwen3-MoE megakernel remains
-  HIP-only, and a local full-model smoke is still pending.
+  HIP-only.
 - `qwen3.6-35b-a3b` INT4 on Apple M5 Max uses the host-orchestrated chained
   decode route with Metal fallbacks for BF16 full-attention, linear-attention,
   and FFN stages, plus INT4 sidecars for projection and expert matvecs. The
@@ -300,10 +300,10 @@ Metal currently rejects or defers:
   `cargo run --release --bin supersonic -- --backend metal --model qwen3.6-35b-a3b --model-dir /path/to/Qwen3.6-35B-A3B --int4 --prompt "Hello" --max-new-tokens 1 --emit-stage-timings`.
   FP8-runtime, KV-FP8, speculative decode, and persistent decode remain
   unsupported on this Metal path.
-- `phi4-mini` INT4 and FP8-runtime are build-checked through the component
-  Metal route; KV-FP8 and local model smokes are still pending
-- `gemma4-e2b` and `gemma4-e4b` INT4 are build-checked through the component
-  Metal route, but still need a local INT4 bake/model smoke
+- `phi4-mini` INT4 and FP8-runtime use the component Metal route; KV-FP8 is
+  still unsupported
+- `gemma4-e2b` and `gemma4-e4b` INT4 use the component Metal route with
+  release-hosted INT4 GPTQ bakes
 
 Native Metal kernels used in the hot path:
 
@@ -332,10 +332,41 @@ Current Apple M4 / Apple M5 Max checkpoint:
   and the checked-in bughunt gate.
 - Apple M5 Max validation also covers one-token `qwen3.5-4b` and `qwen3.5-9b`
   `--validate --oracle-device cpu` smokes through Metal v2 incremental decode.
+- Apple M5 Max validation also covers one-token large-model smokes for
+  `qwen3-30b-a3b` INT4, `gemma4-e2b` BF16/INT4, `gemma4-e4b` BF16/INT4, and
+  `phi4-mini` BF16/INT4/FP8-runtime.
 
 The next optimization target is a persistent Metal megakernel — collapsing the
 per-token command-buffer round-trips into a single dispatch, equivalent to the
 HIP persistent decode path.
+
+### Large model setup
+
+The large Apple M5 Max Metal smoke suite uses one canonical model root:
+
+```bash
+export SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models"
+mkdir -p "$SUPERSONIC_TEST_MODEL_ROOT"
+
+hf download Qwen/Qwen3-30B-A3B --local-dir "$SUPERSONIC_TEST_MODEL_ROOT/qwen3-30b-a3b"
+hf download google/gemma-4-E2B --local-dir "$SUPERSONIC_TEST_MODEL_ROOT/gemma4-e2b"
+hf download google/gemma-4-E4B --local-dir "$SUPERSONIC_TEST_MODEL_ROOT/gemma4-e4b"
+hf download microsoft/Phi-4-mini-instruct --local-dir "$SUPERSONIC_TEST_MODEL_ROOT/phi4-mini"
+```
+
+Quantized lanes use release-hosted bakes and install them under each model's
+`.supersonic/` directory on first run:
+
+- `v2-int4-gptq` for `qwen3-30b-a3b`, `gemma4-e2b`, `gemma4-e4b`, and
+  `phi4-mini --int4`
+- `v2-fp8` for `phi4-mini --fp8-runtime`
+
+The ignored large-model gate is:
+
+```bash
+SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" \
+  cargo test --release -p runner --test metal_large_model_smoke -- --ignored --nocapture
+```
 
 ### Metal validation
 
