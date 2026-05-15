@@ -206,11 +206,11 @@ lane, not a Hopper-specific retune.
 | qwen3.5-2b       |  ✅  |  —   |      —      |    —   |
 | qwen3.5-4b       |  ✅¹ |  —   |      —      |    —   |
 | qwen3.5-9b       |  ✅¹ |  —   |      —      |    —   |
-| qwen3-30b-a3b    |  —   | ⏳²  |      —      |    —   |
+| qwen3-30b-a3b    |  —   |  ✅¹ |      —      |    —   |
 | qwen3.6-35b-a3b  |  —   |  ✅¹ |      —      |    —   |
-| gemma4-e2b       |  ⏳² | ⏳²  |      —      |    —   |
-| gemma4-e4b       |  ⏳² | ⏳²  |      —      |    —   |
-| phi4-mini        |  ⏳² | ⏳²  |     ⏳²     |    —   |
+| gemma4-e2b       |  ✅¹ |  ✅¹ |      —      |    —   |
+| gemma4-e4b       |  ✅¹ |  ✅¹ |      —      |    —   |
+| phi4-mini        |  ✅¹ |  ✅¹ |     ✅¹     |    —   |
 
 Metal v2 is a single supported surface:
 
@@ -223,8 +223,7 @@ Metal v2 is a single supported surface:
 - `qwen3-30b-a3b` INT4 has an Apple M5 Max registry row and uses a
   correctness-first chained Metal fallback for decode-layer attention, MoE
   routing, expert matmul, KV updates, and the final INT4 lm-head. The
-  persistent Qwen3-MoE megakernel remains HIP-only; a local full-model smoke is
-  still pending.
+  persistent Qwen3-MoE megakernel remains HIP-only.
 - `qwen3.6-35b-a3b` INT4 is supported on Apple M5 Max through the
   host-orchestrated chained decode route with Metal fallbacks for BF16
   full-attention stages 1-5, linear-attention stages 1-5, FFN stages 1-5,
@@ -236,28 +235,32 @@ Metal v2 is a single supported surface:
 - `phi4-mini` has an Apple M5 Max registry row and uses a component Metal decode
   path assembled from existing RMSNorm, GEMV, INT4 runtime-dequant matvec,
   FP8 runtime-dequant host fallback matvec, RoPE, attention, SwiGLU, and
-  residual kernels. A local model smoke is still pending.
+  residual kernels.
 - `gemma4-e2b` and `gemma4-e4b` have Apple M5 Max registry rows. BF16 uses a
   runner-level Metal component path for RMSNorm, BF16 matvec, RoPE, attention,
   residual, MLP, PLE, K/V append, and sliding-window cache slicing. INT4 uses
   the same component decode route with Metal INT4 matvec fallbacks.
-  A local model smoke is still pending.
 - Apple M4 remains limited to the smaller Metal validation lane.
 - both the `supersonic` CLI and `supersonic-serve` HTTP server work; `/v1/completions`
   and `/v1/chat/completions` (streaming and non-streaming) are exercised end-to-end
 - decode is implemented as **incremental per-token decode**: each generated token runs
   a single length-1 forward pass (O(N) per step). Conv and recurrent state are carried
   across tokens in persistent GPU buffers; KV cache grows with the sequence
-- INT4 GPTQ kernel coverage includes the supported `qwen3.6-35b-a3b` Apple M5
-  Max smoke; other large INT4 Metal rows remain pending local model validation
+- INT4 GPTQ kernel coverage includes the supported `qwen3.6-35b-a3b`,
+  `qwen3-30b-a3b`, `gemma4-e2b`, `gemma4-e4b`, and `phi4-mini` Apple M5 Max
+  smokes.
 - `--fp8-runtime`, `--kv-fp8`, `--batch-size > 1`, `--force-kernel-decode`,
   and `--force-component-decode` are all rejected at startup
 
 ¹ Apple M5 Max only.
-² Apple M5 Max component path is wired and build-checked; end-to-end
-  validation is pending a local model checkout.
 
 Metal is not yet at mode-level HIP parity: persistent megakernel decode,
-Qwen3.6 FP8-runtime, Qwen3.6 KV-FP8, speculative decode, and the remaining
-large Apple M5 Max model smokes outside the supported Qwen3.6 INT4 lane remain
-pending.
+Qwen3.6 FP8-runtime, Qwen3.6 KV-FP8, speculative decode, Metal VMM, and
+batching remain unsupported.
+
+The Apple M5 Max large-model smoke is:
+
+```bash
+SUPERSONIC_TEST_MODEL_ROOT=/path/to/supersonic-metal-models \
+  cargo test --release -p runner --test metal_large_model_smoke -- --ignored --nocapture
+```

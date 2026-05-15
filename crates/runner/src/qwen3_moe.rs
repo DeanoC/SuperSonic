@@ -398,6 +398,17 @@ fn decode_text(
         elapsed,
         generated.len() as f64 / elapsed.max(1e-9)
     );
+    let decode_ms = decode_elapsed.as_secs_f64() * 1000.0;
+    let ms_per_step = if generated.is_empty() {
+        0.0
+    } else {
+        decode_ms / generated.len() as f64
+    };
+    eprintln!(
+        "[result] prompt_tokens={} generated_tokens={} decode_ms={decode_ms:.0} ms_per_step={ms_per_step:.1}",
+        prompt.prompt_ids.len(),
+        generated.len(),
+    );
     if cli.emit_stage_timings && gen_steps > 0 {
         let n = gen_steps as f64;
         eprintln!(
