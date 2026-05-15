@@ -97,13 +97,12 @@ fn metal_large_model_smokes_run_end_to_end() {
 
 #[cfg(target_os = "macos")]
 fn run_case(case: SmokeCase) {
-    let Some(model_dir) = support::resolve_model_dir(case.model_dir) else {
-        eprintln!(
-            "skipping {}: set SUPERSONIC_TEST_MODEL_ROOT with {} or {}",
+    let model_dir = support::resolve_model_dir(case.model_dir).unwrap_or_else(|| {
+        panic!(
+            "missing model for {}: set SUPERSONIC_TEST_MODEL_ROOT with {} or set {}",
             case.name, case.model_dir.canonical_subdir, case.model_dir.override_env
-        );
-        return;
-    };
+        )
+    });
 
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_supersonic"));
     cmd.env("PATH", support::path_with_repo_venv()).args([
