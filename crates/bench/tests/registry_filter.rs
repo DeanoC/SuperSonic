@@ -18,11 +18,21 @@ fn gfx1100_includes_shipping_models() {
 
 #[test]
 fn min_vram_set_for_every_combo() {
-    for arch in [BenchArch::Gfx1100, BenchArch::Sm86] {
+    for arch in [BenchArch::Gfx1100, BenchArch::Sm86, BenchArch::AppleM5Max] {
         for c in combos_for_arch(arch) {
             assert!(c.min_vram_gib > 0.0, "combo {c:?} has zero min_vram_gib");
         }
     }
+}
+
+#[test]
+fn apple_m5_max_includes_qwen36_int4_metal_lane() {
+    let combos = combos_for_arch(BenchArch::AppleM5Max);
+    let model_quants: Vec<(&str, &str)> = combos.iter().map(|c| (c.model, c.quant)).collect();
+
+    assert_eq!(BenchArch::AppleM5Max.backend(), Some("metal"));
+    assert!(model_quants.contains(&("qwen3.6-35b-a3b", "int4")));
+    assert!(!model_quants.contains(&("qwen3.6-35b-a3b", "kv-fp8")));
 }
 
 #[test]

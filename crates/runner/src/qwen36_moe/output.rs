@@ -96,6 +96,7 @@ pub(crate) fn print_generation_summary(
     generated_ids: &[u32],
     prompt_len: usize,
     eos_id: Option<u32>,
+    decode_ms: Option<f64>,
 ) {
     println!();
     println!();
@@ -117,9 +118,24 @@ pub(crate) fn print_generation_summary(
     if !generated_ids.is_empty() {
         println!("  Generated ids: {generated_ids:?}");
     }
-    println!(
-        "[result] prompt_tokens={} generated_tokens={}",
-        prompt_len,
-        generated_ids.len()
-    );
+    if let Some(decode_ms) = decode_ms {
+        let ms_per_step = if generated_ids.is_empty() {
+            0.0
+        } else {
+            decode_ms / generated_ids.len() as f64
+        };
+        println!(
+            "[result] prompt_tokens={} generated_tokens={} decode_ms={:.0} ms_per_step={:.1}",
+            prompt_len,
+            generated_ids.len(),
+            decode_ms,
+            ms_per_step,
+        );
+    } else {
+        println!(
+            "[result] prompt_tokens={} generated_tokens={}",
+            prompt_len,
+            generated_ids.len()
+        );
+    }
 }

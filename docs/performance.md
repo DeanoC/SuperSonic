@@ -817,6 +817,42 @@ What still dominates:
   wait, which implies the next real win should come from deeper decode fusion
   or fewer queued decode sub-operations rather than more host-side cleanup
 
+## Metal — `apple-m5-max` (Apple M5 Max)
+
+Apple M5 Max Metal is the main Apple-silicon target for Qwen3.6 bring-up. The
+current benchmark lane is deliberately narrow: `qwen3.6-35b-a3b` with INT4
+weights on the chained Metal decode path. This section is a performance harness
+checkpoint, not a claim that the HIP feature set has been ported to Metal.
+
+Reproduce the run with:
+
+```bash
+SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" cargo run --release -p supersonic-bench --bin bench-perf -- --arch apple-m5-max --models qwen3.6-35b-a3b --quants int4
+```
+
+The harness records a warmup plus median-of-3 headline run at
+`--max-new-tokens 16`, then performs one additional `--emit-stage-timings`
+attribution run. For this Metal lane it also forces the dense prefill token loop
+(`SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL=0` and
+`SUPERSONIC_QWEN36_DENSE_PREFILL_TOKEN_LOOP=1`) because the default Qwen3.6
+batched prefill router-permute path is HIP/CUDA-only. The attribution maps are
+stored in the same perf JSON as `stage_timings`, `chain_breakdown`, and
+`lifecycle_timings` without feeding back into the headline median.
+
+<!-- AUTOGEN BELOW: apple-m5-max-metal -->
+| Model           |  INT4 |
+| --------------- | ----: |
+| qwen3.6-35b-a3b | 2354.1 |
+
+<!-- AUTOGEN END: apple-m5-max-metal -->
+
+Unsupported Metal constraints remain explicit for this target: persistent
+decode, KV-FP8, speculative decode, batching, and Metal VMM are not benchmarked
+or claimed here yet. The first baseline from this section should drive the next
+runtime optimization target; the expected first candidate is Qwen3.6 INT4
+persistent Metal decode because the current path is still chained per-token
+dispatch.
+
 ## How to reproduce
 
 ```bash

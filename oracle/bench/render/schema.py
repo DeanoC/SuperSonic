@@ -11,7 +11,7 @@ META_SCHEMA = {
         "arch", "rocminfo", "rocm_smi_u", "runner_version",
     ],
     "properties": {
-        "schema_version": {"type": "integer", "const": 1},
+        "schema_version": {"type": "integer", "enum": [1, 2]},
         "run_id": {"type": "string"},
         "timestamp_utc": {"type": "string"},
         "git_sha": {"type": "string"},
@@ -26,19 +26,42 @@ META_SCHEMA = {
 }
 
 _PERF_BASE = {
-    "schema_version": {"type": "integer", "const": 1},
+    "schema_version": {"type": "integer", "enum": [1, 2]},
     "model": {"type": "string"},
     "quant": {"type": "string"},
+    "arch": {"type": "string"},
+    "backend": {"type": "string"},
     "prompt": {"type": "string"},
     "max_new_tokens": {"type": "integer", "minimum": 1},
+    "stage_timings": {
+        "type": "object",
+        "additionalProperties": {"type": "number"},
+    },
+    "chain_breakdown": {
+        "type": "object",
+        "additionalProperties": {"type": "number"},
+    },
+    "lifecycle_timings": {
+        "type": "object",
+        "additionalProperties": {"type": "number"},
+    },
     "gpu_temp_c_end": {"type": ["number", "null"]},
 }
+_PERF_REQUIRED = [
+    "schema_version", "model", "quant", "prompt", "max_new_tokens", "gpu_temp_c_end",
+]
 
 PERF_CELL_SCHEMA = {
     "type": "object",
+    "allOf": [
+        {
+            "if": {"properties": {"schema_version": {"const": 2}}},
+            "then": {"required": ["arch", "backend"]},
+        }
+    ],
     "oneOf": [
         {
-            "required": list(_PERF_BASE) + ["status", "ms_per_step", "ms_per_tok", "samples"],
+            "required": _PERF_REQUIRED + ["status", "ms_per_step", "ms_per_tok", "samples"],
             "properties": {**_PERF_BASE,
                            "status": {"const": "ok"},
                            "ms_per_step": {"type": "number"},
@@ -46,13 +69,13 @@ PERF_CELL_SCHEMA = {
                            "samples": {"type": "array", "items": {"type": "number"}}},
         },
         {
-            "required": list(_PERF_BASE) + ["status", "reason"],
+            "required": _PERF_REQUIRED + ["status", "reason"],
             "properties": {**_PERF_BASE,
                            "status": {"const": "skipped"},
                            "reason": {"type": "string"}},
         },
         {
-            "required": list(_PERF_BASE) + ["status", "stderr_tail"],
+            "required": _PERF_REQUIRED + ["status", "stderr_tail"],
             "properties": {**_PERF_BASE,
                            "status": {"const": "error"},
                            "stderr_tail": {"type": "string"}},

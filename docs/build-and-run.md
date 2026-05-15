@@ -346,20 +346,33 @@ The large Apple M5 Max Metal smoke suite uses one canonical model root:
 
 ```bash
 export SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models"
+export HF_HOME="$HOME/.cache/huggingface"
+export HUGGINGFACE_HUB_CACHE="$HF_HOME/hub"
 mkdir -p "$SUPERSONIC_TEST_MODEL_ROOT"
 
 hf download Qwen/Qwen3-30B-A3B --local-dir "$SUPERSONIC_TEST_MODEL_ROOT/qwen3-30b-a3b"
 hf download google/gemma-4-E2B --local-dir "$SUPERSONIC_TEST_MODEL_ROOT/gemma4-e2b"
 hf download google/gemma-4-E4B --local-dir "$SUPERSONIC_TEST_MODEL_ROOT/gemma4-e4b"
 hf download microsoft/Phi-4-mini-instruct --local-dir "$SUPERSONIC_TEST_MODEL_ROOT/phi4-mini"
+
+# Qwen3.6 is large enough that this machine keeps the HF snapshot as the
+# source of truth and exposes a stable SuperSonic alias. Replace `<snapshot>`
+# with the hash under `$HUGGINGFACE_HUB_CACHE/models--Qwen--Qwen3.6-35B-A3B-FP8/snapshots/`.
+hf download Qwen/Qwen3.6-35B-A3B-FP8
+ln -sfn "$HUGGINGFACE_HUB_CACHE/models--Qwen--Qwen3.6-35B-A3B-FP8/snapshots/<snapshot>" \
+  "$SUPERSONIC_TEST_MODEL_ROOT/qwen3.6-35b-a3b"
 ```
 
 Quantized lanes use release-hosted bakes and install them under each model's
 `.supersonic/` directory on first run:
 
+- `v2-int4-gptq` for `qwen3.6-35b-a3b`
 - `v2-int4-gptq` for `qwen3-30b-a3b`, `gemma4-e2b`, `gemma4-e4b`, and
   `phi4-mini --int4`
 - `v2-fp8` for `phi4-mini --fp8-runtime`
+
+On this development machine, the same convention is sourced from
+`~/.config/supersonic/env.zsh` by `~/.zshenv`.
 
 The ignored large-model gate is:
 

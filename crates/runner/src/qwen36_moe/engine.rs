@@ -719,7 +719,15 @@ fn decode_text(
     }
 
     print_last_logits_if_requested(dump_last_logits, &loop_state.last_logits_bytes);
-    print_generation_summary(&loop_state.generated_ids, prompt_ids.len(), eos_id);
+    let generation_wall_ms = generation_wall_start
+        .as_ref()
+        .map(|start| start.elapsed().as_secs_f64() * 1000.0);
+    print_generation_summary(
+        &loop_state.generated_ids,
+        prompt_ids.len(),
+        eos_id,
+        generation_wall_ms,
+    );
     if let Some(manager) = _moe_expert_residency.as_ref() {
         print_and_write_moe_residency_summary(
             manager,
@@ -733,10 +741,6 @@ fn decode_text(
     if emit_stage_timings {
         let to_ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
         let prefill_total_ms = to_ms(prefill_embed_elapsed + prefill_chain_elapsed);
-        let generation_wall_ms = generation_wall_start
-            .as_ref()
-            .map(|start| to_ms(start.elapsed()))
-            .unwrap_or(0.0);
         eprintln!(
             "[qwen36-moe lifecycle-timings] prompt_setup_ms={:.3} \
              bake_open_ms={:.3} layer_load_ms={:.3} session_ms={:.3} \
@@ -750,7 +754,7 @@ fn decode_text(
             to_ms(prefill_embed_elapsed),
             to_ms(prefill_chain_elapsed),
             prefill_total_ms,
-            generation_wall_ms,
+            generation_wall_ms.unwrap_or(0.0),
             to_ms(decode_wall_start.elapsed()),
         );
     }

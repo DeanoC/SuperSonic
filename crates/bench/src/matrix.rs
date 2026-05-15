@@ -18,6 +18,7 @@ pub enum BenchArch {
     Gfx1150,
     Sm86,
     AppleM4,
+    AppleM5Max,
 }
 
 impl BenchArch {
@@ -27,6 +28,7 @@ impl BenchArch {
             "gfx1150" => Self::Gfx1150,
             "sm86" => Self::Sm86,
             "apple-m4" => Self::AppleM4,
+            "apple-m5-max" => Self::AppleM5Max,
             _ => return None,
         })
     }
@@ -36,6 +38,7 @@ impl BenchArch {
             Self::Gfx1150 => "gfx1150",
             Self::Sm86 => "sm86",
             Self::AppleM4 => "apple-m4",
+            Self::AppleM5Max => "apple-m5-max",
         }
     }
 
@@ -43,7 +46,7 @@ impl BenchArch {
         match self {
             Self::Gfx1100 | Self::Gfx1150 => Some("hip"),
             Self::Sm86 => Some("cuda"),
-            Self::AppleM4 => None,
+            Self::AppleM4 | Self::AppleM5Max => Some("metal"),
         }
     }
 }
@@ -246,6 +249,15 @@ pub static SUPPORTED_COMBOS: &[ComboDescriptor] = &[
         arch: BenchArch::Gfx1100,
         min_vram_gib: 21.0,
     },
+    // Apple M5 Max Metal v1: Qwen3.6 INT4 chained decode only. This is the
+    // main-target harness lane; persistent decode, KV-FP8, speculative decode,
+    // batching, and Metal VMM stay explicitly out of scope for this row.
+    ComboDescriptor {
+        model: "qwen3.6-35b-a3b",
+        quant: "int4",
+        arch: BenchArch::AppleM5Max,
+        min_vram_gib: 21.0,
+    },
     // CUDA sm86 Qwen3.6-MoE prefill lanes. `int4-specNNN` is INT4 plus
     // Qwen3.5-0.8B cross-family SpecPrefill cosine keep ratio NNN/100.
     ComboDescriptor {
@@ -309,7 +321,7 @@ pub struct MatrixConfig {
     pub models: Vec<String>,
     pub quants: Vec<String>,
     pub binary: PathBuf,
-    pub model_dir_resolver: Box<dyn Fn(&str) -> PathBuf>,
+    pub model_dir_resolver: Box<dyn Fn(&str) -> Result<PathBuf>>,
     pub specprefill_draft_dir_resolver: Box<dyn Fn(&str) -> Option<PathBuf>>,
     pub prompt: String,
     pub max_new_tokens: u32,
@@ -355,6 +367,8 @@ pub fn run_matrix(cfg: &MatrixConfig, rd: &RunDir) -> Result<()> {
                     schema_version: SCHEMA_VERSION,
                     model: model.clone(),
                     quant: quant.clone(),
+                    arch: cfg.arch.as_str().to_string(),
+                    backend: cfg.arch.backend().unwrap_or("auto").to_string(),
                     prompt: cfg.prompt.clone(),
                     max_new_tokens: cfg.max_new_tokens,
                     status: PerfStatus::Skipped {
@@ -365,6 +379,9 @@ pub fn run_matrix(cfg: &MatrixConfig, rd: &RunDir) -> Result<()> {
                             quant
                         ),
                     },
+                    stage_timings: None,
+                    chain_breakdown: None,
+                    lifecycle_timings: None,
                     gpu_temp_c_end: None,
                 };
                 rd.write_perf(&cell)?;
@@ -374,8 +391,9 @@ pub fn run_matrix(cfg: &MatrixConfig, rd: &RunDir) -> Result<()> {
             let invocation = ComboInvocation {
                 binary: cfg.binary.clone(),
                 backend: cfg.arch.backend().map(str::to_string),
+                arch: cfg.arch.as_str().to_string(),
                 model: model.clone(),
-                model_dir: (cfg.model_dir_resolver)(model),
+                model_dir: (cfg.model_dir_resolver)(model)?,
                 quant: quant.clone(),
                 specprefill_draft_dir: (cfg.specprefill_draft_dir_resolver)(model),
                 prompt: cfg.prompt.clone(),

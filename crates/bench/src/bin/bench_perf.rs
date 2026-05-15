@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Result};
 use clap::Parser;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use supersonic_bench::matrix::{run_matrix, BenchArch, MatrixConfig};
 use supersonic_bench::runs::{allocate_run_dir, RunDir};
@@ -27,9 +28,10 @@ struct Cli {
     binary: PathBuf,
     #[arg(long, default_value = "./target/bench-runs")]
     run_root: PathBuf,
-    /// Model dir override: KEY=PATH, repeatable. KEY is e.g. "qwen3.5-0.8b".
-    #[arg(long = "model-dir", value_parser = parse_kv)]
-    model_dirs: Vec<(String, PathBuf)>,
+    /// Model dir override. Use KEY=PATH for a specific model, or PATH when a
+    /// single model is selected.
+    #[arg(long = "model-dir", value_parser = parse_model_dir)]
+    model_dirs: Vec<ModelDirArg>,
     /// SpecPrefill draft dir override: KEY=PATH, repeatable. KEY is the target
     /// model, e.g. "qwen3.6-35b-a3b=/models/Qwen3.5-0.8B".
     #[arg(long = "specprefill-draft-dir", value_parser = parse_kv)]
@@ -41,6 +43,20 @@ fn parse_kv(s: &str) -> Result<(String, PathBuf), String> {
         .split_once('=')
         .ok_or_else(|| "expected KEY=PATH".to_string())?;
     Ok((k.to_string(), PathBuf::from(v)))
+}
+
+#[derive(Debug, Clone)]
+enum ModelDirArg {
+    Exact(String, PathBuf),
+    Bare(PathBuf),
+}
+
+fn parse_model_dir(s: &str) -> Result<ModelDirArg, String> {
+    if let Some((k, v)) = s.split_once('=') {
+        Ok(ModelDirArg::Exact(k.to_string(), PathBuf::from(v)))
+    } else {
+        Ok(ModelDirArg::Bare(PathBuf::from(s)))
+    }
 }
 
 fn main() -> Result<()> {
@@ -56,15 +72,29 @@ fn main() -> Result<()> {
     let run_path = allocate_run_dir(&cli.run_root, &git_sha, &today);
     let rd = RunDir::new(run_path.clone());
 
-    let dir_map: std::collections::HashMap<_, _> = cli.model_dirs.into_iter().collect();
-    let resolver: Box<dyn Fn(&str) -> PathBuf> = Box::new(move |m: &str| {
-        dir_map
+    let selected_models = models.clone();
+    let model_root = std::env::var_os("SUPERSONIC_TEST_MODEL_ROOT").map(PathBuf::from);
+    let (dir_map, bare_model_dir) = normalize_model_dirs(cli.model_dirs, &selected_models)?;
+    let resolver: Box<dyn Fn(&str) -> Result<PathBuf>> = Box::new(move |m: &str| {
+        let candidate = dir_map
             .get(m)
             .cloned()
-            .unwrap_or_else(|| PathBuf::from(format!("/mnt/data/models/{m}")))
+            .or_else(|| bare_model_dir.clone())
+            .or_else(|| model_root.as_ref().map(|root| root.join(m)));
+        let Some(path) = candidate else {
+            return Err(anyhow!(
+                "missing model dir for {m}; pass --model-dir {m}=PATH or set SUPERSONIC_TEST_MODEL_ROOT"
+            ));
+        };
+        if !path.exists() {
+            return Err(anyhow!(
+                "model dir for {m} does not exist: {}; pass --model-dir {m}=PATH or set SUPERSONIC_TEST_MODEL_ROOT",
+                path.display()
+            ));
+        }
+        Ok(path)
     });
-    let draft_dir_map: std::collections::HashMap<_, _> =
-        cli.specprefill_draft_dirs.into_iter().collect();
+    let draft_dir_map: HashMap<_, _> = cli.specprefill_draft_dirs.into_iter().collect();
     let draft_resolver: Box<dyn Fn(&str) -> Option<PathBuf>> =
         Box::new(move |m: &str| draft_dir_map.get(m).cloned());
 
@@ -88,6 +118,30 @@ fn main() -> Result<()> {
     run_matrix(&cfg, &rd)?;
     println!("[bench-perf] wrote {}", run_path.display());
     Ok(())
+}
+
+fn normalize_model_dirs(
+    args: Vec<ModelDirArg>,
+    selected_models: &[String],
+) -> Result<(HashMap<String, PathBuf>, Option<PathBuf>)> {
+    let mut exact = HashMap::new();
+    let mut bare = None;
+    for arg in args {
+        match arg {
+            ModelDirArg::Exact(model, path) => {
+                exact.insert(model, path);
+            }
+            ModelDirArg::Bare(path) => {
+                if selected_models.len() != 1 {
+                    return Err(anyhow!(
+                        "--model-dir PATH is only valid when exactly one model is selected; use --model-dir KEY=PATH for matrix runs"
+                    ));
+                }
+                bare = Some(path);
+            }
+        }
+    }
+    Ok((exact, bare))
 }
 
 fn filter_csv<'a>(spec: &str, available: impl IntoIterator<Item = &'a str>) -> Vec<String> {
