@@ -76,16 +76,20 @@ fn main() -> Result<()> {
     let model_root = std::env::var_os("SUPERSONIC_TEST_MODEL_ROOT").map(PathBuf::from);
     let (dir_map, bare_model_dir) = normalize_model_dirs(cli.model_dirs, &selected_models)?;
     let resolver: Box<dyn Fn(&str) -> Result<PathBuf>> = Box::new(move |m: &str| {
-        let candidate = dir_map
-            .get(m)
-            .cloned()
-            .or_else(|| bare_model_dir.clone())
-            .or_else(|| model_root.as_ref().map(|root| root.join(m)));
-        let Some(path) = candidate else {
-            return Err(anyhow!(
-                "missing model dir for {m}; pass --model-dir {m}=PATH or set SUPERSONIC_TEST_MODEL_ROOT"
-            ));
+        let candidate = dir_map.get(m).cloned().or_else(|| bare_model_dir.clone());
+        if let Some(path) = candidate {
+            if !path.exists() {
+                return Err(anyhow!(
+                    "model dir for {m} does not exist: {}; pass --model-dir {m}=PATH or set SUPERSONIC_TEST_MODEL_ROOT",
+                    path.display()
+                ));
+            }
+            return Ok(path);
+        }
+        let Some(root) = model_root.as_ref() else {
+            return Ok(PathBuf::from(format!("/mnt/data/models/{m}")));
         };
+        let path = root.join(m);
         if !path.exists() {
             return Err(anyhow!(
                 "model dir for {m} does not exist: {}; pass --model-dir {m}=PATH or set SUPERSONIC_TEST_MODEL_ROOT",
