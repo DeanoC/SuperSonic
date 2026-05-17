@@ -15,10 +15,9 @@ impl GpuProfiler for HipProfiler {
         // gpu-hal currently exposes a single device. If multi-device support
         // lands, iterate here.
         for device_index in 0..1u32 {
-            set_device(device_index as usize)
-                .map_err(|e| GpuProfileError::Hip(e.to_string()))?;
-            let info = query_device_info_hip(device_index as i32)
-                .map_err(|e| GpuProfileError::Hip(e))?;
+            set_device(device_index as usize).map_err(|e| GpuProfileError::Hip(e.to_string()))?;
+            let info =
+                query_device_info_hip(device_index as i32).map_err(|e| GpuProfileError::Hip(e))?;
             out.push(profile_one(device_index, &info));
         }
         Ok(out)
@@ -62,7 +61,10 @@ pub(crate) fn query_device_info_hip(device: i32) -> Result<HipDeviceInfo, String
     if status != 0 {
         return Err(format!("mp_query_device_info returned {status}"));
     }
-    let nul = arch_buf.iter().position(|&b| b == 0).unwrap_or(arch_buf.len());
+    let nul = arch_buf
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(arch_buf.len());
     let arch_name = String::from_utf8_lossy(&arch_buf[..nul]).to_string();
     Ok(HipDeviceInfo {
         arch_name,
@@ -96,8 +98,7 @@ pub(crate) fn enumerate_for_fingerprint() -> Result<Vec<HipDeviceInfo>, super::G
 
 fn profile_one(device_index: u32, info: &HipDeviceInfo) -> GpuProfile {
     let cu_count = info.cu_count.max(1);
-    let lds_aggregate =
-        unsafe { mp_lds_bandwidth_run(device_index as i32, cu_count, 1_000_000) };
+    let lds_aggregate = unsafe { mp_lds_bandwidth_run(device_index as i32, cu_count, 1_000_000) };
     let read = unsafe { mp_hbm_bandwidth_read(device_index as i32, 1u64 << 28) };
     let write = unsafe { mp_hbm_bandwidth_write(device_index as i32, 1u64 << 28) };
     let copy = unsafe { mp_hbm_bandwidth_copy(device_index as i32, 1u64 << 28) };
@@ -108,8 +109,7 @@ fn profile_one(device_index: u32, info: &HipDeviceInfo) -> GpuProfile {
     // On unsupported (or unprobeable) archs we leave MMA fields as None
     // rather than reporting fake numbers from launch-overhead-only runs.
     let mut wmma_flags = [0i32; 3];
-    let probe_status =
-        unsafe { mp_wmma_probe(device_index as i32, wmma_flags.as_mut_ptr()) };
+    let probe_status = unsafe { mp_wmma_probe(device_index as i32, wmma_flags.as_mut_ptr()) };
     let probe_ok = probe_status == 0;
     let f16 = if probe_ok && wmma_flags[0] == 1 {
         Some(unsafe { mp_wmma_peak_f16(device_index as i32, cu_count, 100_000) })
@@ -127,14 +127,24 @@ fn profile_one(device_index: u32, info: &HipDeviceInfo) -> GpuProfile {
         None
     };
 
-    let mut h2d = vec![MpTransferSample { bytes: 0, gb_s: 0.0 }; 16];
-    let n_h2d =
-        unsafe { mp_pcie_h2d(device_index as i32, h2d.as_mut_ptr(), h2d.len() as i32) };
+    let mut h2d = vec![
+        MpTransferSample {
+            bytes: 0,
+            gb_s: 0.0
+        };
+        16
+    ];
+    let n_h2d = unsafe { mp_pcie_h2d(device_index as i32, h2d.as_mut_ptr(), h2d.len() as i32) };
     h2d.truncate(n_h2d.max(0) as usize);
 
-    let mut d2h = vec![MpTransferSample { bytes: 0, gb_s: 0.0 }; 16];
-    let n_d2h =
-        unsafe { mp_pcie_d2h(device_index as i32, d2h.as_mut_ptr(), d2h.len() as i32) };
+    let mut d2h = vec![
+        MpTransferSample {
+            bytes: 0,
+            gb_s: 0.0
+        };
+        16
+    ];
+    let n_d2h = unsafe { mp_pcie_d2h(device_index as i32, d2h.as_mut_ptr(), d2h.len() as i32) };
     d2h.truncate(n_d2h.max(0) as usize);
 
     let duplex = unsafe { mp_pcie_duplex(device_index as i32, 1u64 << 27) };
@@ -145,7 +155,12 @@ fn profile_one(device_index: u32, info: &HipDeviceInfo) -> GpuProfile {
         arch_name: info.arch_name.clone(),
         pci_id: Some(format!("0x{:04x}", info.pci_device_id)),
         uuid: None,
-        memory_arch: if info.integrated { "Unified" } else { "Discrete" }.into(),
+        memory_arch: if info.integrated {
+            "Unified"
+        } else {
+            "Discrete"
+        }
+        .into(),
         total_vram_bytes: info.total_vram_bytes,
         cu_count,
         wave_size: info.warp_size,
@@ -196,6 +211,7 @@ fn profile_one(device_index: u32, info: &HipDeviceInfo) -> GpuProfile {
             duplex_gb_s: Some(duplex),
         },
         clock_rate_khz_measured: Some(info.clock_rate_khz),
+        metal: None,
+        microkernels: Vec::new(),
     }
 }
-

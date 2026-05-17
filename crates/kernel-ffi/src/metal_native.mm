@@ -1,5 +1,8 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#if SUPERSONIC_HAVE_MTL4_MPP
+#import <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -548,6 +551,161 @@ void configure_precise_math(MTLCompileOptions* options) {
 #pragma clang diagnostic pop
     }
 }
+
+#if SUPERSONIC_HAVE_MTL4_MPP
+id<MTLComputePipelineState> mpp_mtl4_pipeline_from_source(
+    NSString* source,
+    NSString* name,
+    NSUInteger threads_per_threadgroup
+) {
+    NSError* error = nil;
+    MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+    options.languageVersion = MTLLanguageVersion4_0;
+    id<MTLLibrary> library = [metal_device() newLibraryWithSource:source options:options error:&error];
+    if (library == nil || error != nil) {
+        if (NSProcessInfo.processInfo.environment[@"SUPERSONIC_METAL_PROFILE_DEBUG"] != nil) {
+            NSLog(@"SuperSonic MPP pilot Metal4 compile failed for %@: %@", name, error);
+        }
+        return nil;
+    }
+
+    MTL4LibraryFunctionDescriptor* function_desc = [[MTL4LibraryFunctionDescriptor alloc] init];
+    function_desc.name = name;
+    function_desc.library = library;
+
+    MTL4ComputePipelineDescriptor* pipeline_desc = [[MTL4ComputePipelineDescriptor alloc] init];
+    pipeline_desc.computeFunctionDescriptor = function_desc;
+    pipeline_desc.maxTotalThreadsPerThreadgroup = threads_per_threadgroup;
+    pipeline_desc.requiredThreadsPerThreadgroup = MTLSizeMake(threads_per_threadgroup, 1, 1);
+
+    MTL4CompilerDescriptor* compiler_desc = [[MTL4CompilerDescriptor alloc] init];
+    id<MTL4Compiler> compiler = [metal_device() newCompilerWithDescriptor:compiler_desc error:&error];
+    if (compiler == nil || error != nil) {
+        if (NSProcessInfo.processInfo.environment[@"SUPERSONIC_METAL_PROFILE_DEBUG"] != nil) {
+            NSLog(@"SuperSonic MPP pilot Metal4 compiler failed for %@: %@", name, error);
+        }
+        return nil;
+    }
+
+    id<MTLComputePipelineState> pipeline =
+        [compiler newComputePipelineStateWithDescriptor:pipeline_desc compilerTaskOptions:nil error:&error];
+    if (pipeline == nil && NSProcessInfo.processInfo.environment[@"SUPERSONIC_METAL_PROFILE_DEBUG"] != nil) {
+        NSLog(@"SuperSonic MPP pilot Metal4 pipeline failed for %@: %@", name, error);
+    }
+    return pipeline;
+}
+
+MTLTensorDescriptor* mpp_tensor_descriptor(NSUInteger dim0, NSUInteger dim1, MTLTensorDataType data_type) {
+    NSInteger dims[2] = {
+        static_cast<NSInteger>(dim0),
+        static_cast<NSInteger>(dim1),
+    };
+    NSInteger strides[2] = {
+        1,
+        static_cast<NSInteger>(dim0),
+    };
+    MTLTensorDescriptor* desc = [[MTLTensorDescriptor alloc] init];
+    desc.dimensions = [[MTLTensorExtents alloc] initWithRank:2 values:dims];
+    desc.strides = [[MTLTensorExtents alloc] initWithRank:2 values:strides];
+    desc.dataType = data_type;
+    desc.usage = MTLTensorUsageCompute | MTLTensorUsageMachineLearning;
+    desc.storageMode = MTLStorageModeShared;
+    return desc;
+}
+
+MTLTensorDescriptor* mpp_device_tensor_descriptor(NSUInteger dim0, NSUInteger dim1, MTLTensorDataType data_type) {
+    MTLTensorDescriptor* desc = mpp_tensor_descriptor(dim0, dim1, data_type);
+    desc.strides = nil;
+    return desc;
+}
+
+id<MTLTensor> mpp_tensor_from_device(id<MTLDevice> device, MTLTensorDescriptor* desc) {
+    NSError* error = nil;
+    id<MTLTensor> tensor = [device newTensorWithDescriptor:desc error:&error];
+    if (tensor == nil && NSProcessInfo.processInfo.environment[@"SUPERSONIC_METAL_PROFILE_DEBUG"] != nil) {
+        NSLog(@"SuperSonic MPP pilot tensor creation failed: %@", error);
+    }
+    return tensor;
+}
+
+void mpp_tensor_replace_all_f16(id<MTLTensor> tensor, const uint16_t* values, NSUInteger dim0, NSUInteger dim1) {
+    NSInteger origin_values[2] = {0, 0};
+    NSInteger dim_values[2] = {
+        static_cast<NSInteger>(dim0),
+        static_cast<NSInteger>(dim1),
+    };
+    NSInteger stride_values[2] = {
+        1,
+        static_cast<NSInteger>(dim0),
+    };
+    MTLTensorExtents* origin = [[MTLTensorExtents alloc] initWithRank:2 values:origin_values];
+    MTLTensorExtents* dims = [[MTLTensorExtents alloc] initWithRank:2 values:dim_values];
+    MTLTensorExtents* strides = [[MTLTensorExtents alloc] initWithRank:2 values:stride_values];
+    [tensor replaceSliceOrigin:origin sliceDimensions:dims withBytes:values strides:strides];
+}
+
+float mpp_tensor_first_f32(id<MTLTensor> tensor) {
+    NSInteger origin_values[2] = {0, 0};
+    NSInteger dim_values[2] = {1, 1};
+    NSInteger stride_values[2] = {1, 1};
+    MTLTensorExtents* origin = [[MTLTensorExtents alloc] initWithRank:2 values:origin_values];
+    MTLTensorExtents* dims = [[MTLTensorExtents alloc] initWithRank:2 values:dim_values];
+    MTLTensorExtents* strides = [[MTLTensorExtents alloc] initWithRank:2 values:stride_values];
+    float value = 0.0f;
+    [tensor getBytes:&value strides:strides fromSliceOrigin:origin sliceDimensions:dims];
+    return value;
+}
+
+id<MTL4ArgumentTable> mpp_mtl4_argument_table(id<MTLDevice> device, NSUInteger buffer_bind_count) {
+    MTL4ArgumentTableDescriptor* desc = [[MTL4ArgumentTableDescriptor alloc] init];
+    desc.maxBufferBindCount = buffer_bind_count;
+    desc.initializeBindings = YES;
+    NSError* error = nil;
+    id<MTL4ArgumentTable> table = [device newArgumentTableWithDescriptor:desc error:&error];
+    if (table == nil && NSProcessInfo.processInfo.environment[@"SUPERSONIC_METAL_PROFILE_DEBUG"] != nil) {
+        NSLog(@"SuperSonic MPP pilot argument table failed: %@", error);
+    }
+    return table;
+}
+
+bool mpp_wait_for_mtl4_queue(id<MTL4CommandQueue> queue, id<MTLSharedEvent> event, uint64_t value) {
+    [queue signalEvent:event value:value];
+    return [event waitUntilSignaledValue:value timeoutMS:30000];
+}
+
+bool mpp_encode_gemm_mtl4(
+    id<MTLDevice> device,
+    id<MTL4CommandQueue> queue,
+    id<MTLComputePipelineState> pipeline,
+    id<MTL4ArgumentTable> args,
+    uint32_t tg_x,
+    uint32_t tg_y,
+    NSUInteger threads_per_threadgroup,
+    id<MTLSharedEvent> event,
+    uint64_t signal_value
+) {
+    id<MTL4CommandAllocator> allocator = [device newCommandAllocator];
+    id<MTL4CommandBuffer> command_buffer = [device newCommandBuffer];
+    if (allocator == nil || command_buffer == nil) {
+        return false;
+    }
+    [command_buffer beginCommandBufferWithAllocator:allocator];
+    id<MTL4ComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+    if (encoder == nil) {
+        [command_buffer endCommandBuffer];
+        return false;
+    }
+    [encoder setComputePipelineState:pipeline];
+    [encoder setArgumentTable:args];
+    [encoder dispatchThreadgroups:MTLSizeMake(tg_x, tg_y, 1)
+            threadsPerThreadgroup:MTLSizeMake(threads_per_threadgroup, 1, 1)];
+    [encoder endEncoding];
+    [command_buffer endCommandBuffer];
+    id<MTL4CommandBuffer> buffers[1] = { command_buffer };
+    [queue commit:buffers count:1];
+    return mpp_wait_for_mtl4_queue(queue, event, signal_value);
+}
+#endif  // SUPERSONIC_HAVE_MTL4_MPP
 
 id<MTLComputePipelineState> matmul_pipeline_bf16(NSError** error_out) {
     static std::mutex mutex;
@@ -9714,6 +9872,133 @@ extern "C" int supersonic_metal_matmul_rhs_transposed_f32(
             [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
         }, 315, 316, 317, 318);
     }
+}
+
+extern "C" double supersonic_metal_mpp_tile_gemm_f16_tflops(uint32_t size, uint32_t iterations) {
+#if SUPERSONIC_HAVE_MTL4_MPP
+    @autoreleasepool {
+        id<MTLDevice> device = metal_device();
+        if (device == nil || size == 0 || iterations == 0 || (size % 64u) != 0u) {
+            return 0.0;
+        }
+        id<MTL4CommandQueue> queue = [device newMTL4CommandQueue];
+        if (queue == nil) {
+            return 0.0;
+        }
+
+        NSString* source =
+             @"#include <metal_stdlib>\n"
+             "#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>\n"
+             "using namespace metal;\n"
+             "using namespace mpp::tensor_ops;\n"
+             "kernel void supersonic_mpp_gemm_tile(tensor<device half, dextents<int32_t, 2>> A [[buffer(0)]],\n"
+             "                                      tensor<device half, dextents<int32_t, 2>> B [[buffer(1)]],\n"
+             "                                      tensor<device float, dextents<int32_t, 2>> C [[buffer(2)]]) {\n"
+             "  constexpr auto desc = matmul2d_descriptor(64, 32, 64, false, false, false);\n"
+             "  matmul2d<desc, execution_simdgroups<4>> op;\n"
+             "  auto tA = A.slice(0, 0);\n"
+             "  auto tB = B.slice(0, 0);\n"
+             "  auto tC = C.slice(0, 0);\n"
+             "  op.run(tA, tB, tC);\n"
+             "}\n";
+        id<MTLComputePipelineState> pipeline =
+            mpp_mtl4_pipeline_from_source(source, @"supersonic_mpp_gemm_tile", 128);
+        if (pipeline == nil) {
+            return 0.0;
+        }
+
+        const NSUInteger a_count = 64u * 64u;
+        const NSUInteger b_count = 32u * 64u;
+        id<MTLBuffer> a_buf = [device newBufferWithLength:a_count * sizeof(uint16_t)
+                                                   options:MTLResourceStorageModeShared];
+        id<MTLBuffer> b_buf = [device newBufferWithLength:b_count * sizeof(uint16_t)
+                                                   options:MTLResourceStorageModeShared];
+        if (a_buf == nil || b_buf == nil) {
+            return 0.0;
+        }
+        auto* a = static_cast<uint16_t*>(a_buf.contents);
+        auto* b = static_cast<uint16_t*>(b_buf.contents);
+        for (NSUInteger i = 0; i < a_count; ++i) {
+            a[i] = static_cast<uint16_t>(0x3c00u + (i & 1u));
+        }
+        for (NSUInteger i = 0; i < b_count; ++i) {
+            b[i] = static_cast<uint16_t>(0x3800u + (i & 1u));
+        }
+
+        id<MTLTensor> a_tensor = mpp_tensor_from_device(
+            device,
+            mpp_device_tensor_descriptor(64, 64, MTLTensorDataTypeFloat16)
+        );
+        id<MTLTensor> b_tensor = mpp_tensor_from_device(
+            device,
+            mpp_device_tensor_descriptor(32, 64, MTLTensorDataTypeFloat16)
+        );
+        id<MTLTensor> c_tensor = mpp_tensor_from_device(
+            device,
+            mpp_device_tensor_descriptor(32, 64, MTLTensorDataTypeFloat32)
+        );
+        if (a_tensor == nil || b_tensor == nil || c_tensor == nil) {
+            return 0.0;
+        }
+        mpp_tensor_replace_all_f16(a_tensor, a, 64, 64);
+        mpp_tensor_replace_all_f16(b_tensor, b, 32, 64);
+
+        id<MTL4ArgumentTable> args = mpp_mtl4_argument_table(device, 3);
+        id<MTLSharedEvent> event = [device newSharedEvent];
+        if (args == nil || event == nil) {
+            return 0.0;
+        }
+        [args setResource:a_tensor.gpuResourceID atBufferIndex:0];
+        [args setResource:b_tensor.gpuResourceID atBufferIndex:1];
+        [args setResource:c_tensor.gpuResourceID atBufferIndex:2];
+
+        const uint32_t tile_m = size / 64u;
+        const uint32_t tile_n = size / 32u;
+        const uint32_t tile_k = size / 64u;
+        const uint32_t tg_x = tile_n;
+        const uint32_t tg_y = tile_m * tile_k;
+        const NSUInteger threads_per_threadgroup = pipeline.threadExecutionWidth * 4u;
+
+        if (!mpp_encode_gemm_mtl4(
+                device, queue, pipeline, args, tg_x, tg_y, threads_per_threadgroup, event, 1)) {
+            return 0.0;
+        }
+
+        auto start = std::chrono::steady_clock::now();
+        for (uint32_t i = 0; i < iterations; ++i) {
+            const uint64_t signal_value = static_cast<uint64_t>(i) + 2u;
+            if (!mpp_encode_gemm_mtl4(
+                    device, queue, pipeline, args, tg_x, tg_y, threads_per_threadgroup, event, signal_value)) {
+                return 0.0;
+            }
+        }
+
+        const double seconds =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        if (seconds <= 0.0 || !std::isfinite(seconds)) {
+            return 0.0;
+        }
+        volatile float guard = mpp_tensor_first_f32(c_tensor);
+        if (guard == 0.0f || !std::isfinite(static_cast<double>(guard))) {
+            return 0.0;
+        }
+        (void)guard;
+
+        const double flops = static_cast<double>(iterations)
+            * 2.0
+            * static_cast<double>(tile_m)
+            * static_cast<double>(tile_n)
+            * static_cast<double>(tile_k)
+            * 64.0
+            * 32.0
+            * 64.0;
+        return flops / seconds / 1.0e12;
+    }
+#else
+    (void)size;
+    (void)iterations;
+    return 0.0;
+#endif
 }
 
 extern "C" int supersonic_metal_qwen_linear_projections_bf16(

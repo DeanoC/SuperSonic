@@ -386,15 +386,48 @@ fn compile_metal_stubs(manifest_dir: &Path) {
         .file(manifest_dir.join("src/metal_link_stubs.cc"))
         .flag_if_supported("-std=c++17")
         .compile("kernel_ffi_metal_stubs");
-    cc::Build::new()
+    let have_mtl4_mpp = have_mtl4_mpp_sdk();
+    let mut metal = cc::Build::new();
+    metal
         .cpp(true)
         .file(manifest_dir.join("src/metal_native.mm"))
         .flag_if_supported("-std=c++17")
-        .flag("-fobjc-arc")
-        .compile("kernel_ffi_metal_native");
+        .flag("-fobjc-arc");
+    if have_mtl4_mpp {
+        metal.define("SUPERSONIC_HAVE_MTL4_MPP", "1");
+    } else {
+        println!(
+            "cargo:warning=Metal 4 MPP tensor headers not found; M5 MPP attribution pilot disabled"
+        );
+    }
+    metal.compile("kernel_ffi_metal_native");
     println!("cargo:rustc-link-lib=framework=Foundation");
     println!("cargo:rustc-link-lib=framework=Metal");
+    if have_mtl4_mpp {
+        println!("cargo:rustc-link-lib=framework=MetalPerformancePrimitives");
+    }
     println!("cargo:rustc-cfg=supersonic_backend_metal");
+}
+
+fn have_mtl4_mpp_sdk() -> bool {
+    let Ok(output) = Command::new("xcrun")
+        .args(["--sdk", "macosx", "--show-sdk-path"])
+        .output()
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let sdk = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim().to_string());
+    sdk.join("System/Library/Frameworks/Metal.framework/Headers/MTL4CommandQueue.h")
+        .is_file()
+        && sdk
+            .join("System/Library/Frameworks/Metal.framework/Headers/MTLTensor.h")
+            .is_file()
+        && sdk
+            .join("System/Library/Frameworks/MetalPerformancePrimitives.framework/Headers/MetalPerformancePrimitives.h")
+            .is_file()
 }
 
 fn main() {

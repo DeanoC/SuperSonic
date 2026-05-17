@@ -248,6 +248,15 @@ impl Default for Qwen36MoeBatchSeqDesc {
     }
 }
 
+/// Attribution-only MPP pilot used by the Apple M5 Metal bench harness.
+///
+/// This measures repeated exact `64x32x64` MPP tensor tiles as an equivalent
+/// square GEMM throughput number. It does not consume Qwen3.6 model weights
+/// and must not be interpreted as a decode-path replacement.
+pub fn metal_mpp_tile_gemm_f16_tflops(size: u32, iterations: u32) -> Result<f64, GpuError> {
+    crate::metal_native::mpp_tile_gemm_f16_tflops(size, iterations)
+}
+
 #[cfg(any(supersonic_backend_hip, supersonic_backend_cuda))]
 extern "C" {
     /// Stub launch entry. Walks the descriptor array, validates field

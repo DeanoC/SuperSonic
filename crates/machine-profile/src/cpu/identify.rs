@@ -14,8 +14,54 @@ pub fn detect_cpu_id() -> CpuId {
     if let Ok(text) = fs::read_to_string("/proc/cpuinfo") {
         parse_proc_cpuinfo(&text, &mut id);
     }
+    #[cfg(target_os = "macos")]
+    fill_macos_cpu_id(&mut id);
     fill_isa_from_runtime(&mut id);
     id
+}
+
+#[cfg(target_os = "macos")]
+fn fill_macos_cpu_id(id: &mut CpuId) {
+    if id.model.is_empty() {
+        id.model = sysctl_string("machdep.cpu.brand_string")
+            .or_else(|| sysctl_string("machdep.cpu.brand"))
+            .or_else(|| system_profiler_field("chip_type"))
+            .unwrap_or_else(|| "Apple Silicon".into());
+    }
+    if id.vendor.is_empty() {
+        id.vendor = "Apple".into();
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn sysctl_string(name: &str) -> Option<String> {
+    let output = std::process::Command::new("/usr/sbin/sysctl")
+        .args(["-n", name])
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+#[cfg(target_os = "macos")]
+fn system_profiler_field(field: &str) -> Option<String> {
+    let output = std::process::Command::new("/usr/sbin/system_profiler")
+        .args(["SPHardwareDataType", "-json"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let root: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    root.get("SPHardwareDataType")?
+        .as_array()?
+        .first()?
+        .get(field)?
+        .as_str()
+        .map(str::to_string)
 }
 
 fn parse_proc_cpuinfo(text: &str, id: &mut CpuId) {
@@ -50,19 +96,35 @@ fn fill_isa_from_runtime(id: &mut CpuId) {
             id.isa.push(s.to_string());
         }
     };
-    if std::is_x86_feature_detected!("avx2") { add("AVX2"); }
-    if std::is_x86_feature_detected!("avx512f") { add("AVX-512F"); }
-    if std::is_x86_feature_detected!("avx512bf16") { add("AVX-512BF16"); }
-    if std::is_x86_feature_detected!("avxvnni") { add("AVX-VNNI"); }
+    if std::is_x86_feature_detected!("avx2") {
+        add("AVX2");
+    }
+    if std::is_x86_feature_detected!("avx512f") {
+        add("AVX-512F");
+    }
+    if std::is_x86_feature_detected!("avx512bf16") {
+        add("AVX-512BF16");
+    }
+    if std::is_x86_feature_detected!("avxvnni") {
+        add("AVX-VNNI");
+    }
     #[cfg(feature = "x86_amx_intrinsics")]
-    if std::is_x86_feature_detected!("amx-bf16") { add("AMX-BF16"); }
-    if std::is_x86_feature_detected!("fma") { add("FMA"); }
+    if std::is_x86_feature_detected!("amx-bf16") {
+        add("AMX-BF16");
+    }
+    if std::is_x86_feature_detected!("fma") {
+        add("FMA");
+    }
 }
 
 #[cfg(target_arch = "aarch64")]
 fn fill_isa_from_runtime(id: &mut CpuId) {
-    if std::arch::is_aarch64_feature_detected!("neon") { id.isa.push("NEON".into()); }
-    if std::arch::is_aarch64_feature_detected!("sve") { id.isa.push("SVE".into()); }
+    if std::arch::is_aarch64_feature_detected!("neon") {
+        id.isa.push("NEON".into());
+    }
+    if std::arch::is_aarch64_feature_detected!("sve") {
+        id.isa.push("SVE".into());
+    }
 }
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]

@@ -382,6 +382,7 @@ pub fn run_matrix(cfg: &MatrixConfig, rd: &RunDir) -> Result<()> {
                     stage_timings: None,
                     chain_breakdown: None,
                     lifecycle_timings: None,
+                    mpp_pilot: None,
                     gpu_temp_c_end: None,
                 };
                 rd.write_perf(&cell)?;
