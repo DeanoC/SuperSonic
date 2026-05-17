@@ -41,6 +41,7 @@ fn perf_cell_json_status_variants() {
         stage_timings: None,
         chain_breakdown: None,
         lifecycle_timings: None,
+        mpp_pilot: None,
         gpu_temp_c_end: Some(60.0),
     };
     let s = serde_json::to_string(&ok).unwrap();

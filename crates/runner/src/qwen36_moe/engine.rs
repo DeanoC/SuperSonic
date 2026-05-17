@@ -758,6 +758,31 @@ fn decode_text(
             to_ms(decode_wall_start.elapsed()),
         );
     }
+    emit_mpp_pilot_if_requested(emit_stage_timings);
 
     Ok(())
+}
+
+fn emit_mpp_pilot_if_requested(emit_stage_timings: bool) {
+    if !emit_stage_timings || std::env::var_os("SUPERSONIC_METAL_QWEN36_MPP_PILOT").is_none() {
+        return;
+    }
+    let size = std::env::var("SUPERSONIC_METAL_QWEN36_MPP_PILOT_SIZE")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(2048);
+    let iterations = std::env::var("SUPERSONIC_METAL_QWEN36_MPP_PILOT_ITERS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(5);
+    match kernel_ffi::qwen36_moe::metal_mpp_tile_gemm_f16_tflops(size, iterations) {
+        Ok(tflops) => eprintln!(
+            "[qwen36-moe mpp-pilot] status=ok size={} iterations={} tile_m=64 tile_n=32 tile_k=64 tflops={:.3}",
+            size, iterations, tflops
+        ),
+        Err(err) => eprintln!(
+            "[qwen36-moe mpp-pilot] status=error size={} iterations={} tflops=0.000 error={}",
+            size, iterations, err
+        ),
+    }
 }

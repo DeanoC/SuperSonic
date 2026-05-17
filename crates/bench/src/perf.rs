@@ -17,6 +17,7 @@ pub struct AttributionTimings {
     pub stage_timings: Option<BTreeMap<String, f64>>,
     pub chain_breakdown: Option<BTreeMap<String, f64>>,
     pub lifecycle_timings: Option<BTreeMap<String, f64>>,
+    pub mpp_pilot: Option<BTreeMap<String, f64>>,
 }
 
 #[derive(Debug, Clone)]
@@ -96,6 +97,11 @@ pub fn extract_attribution_timings(output: &str) -> AttributionTimings {
             .lines()
             .rev()
             .find(|l| l.starts_with("[qwen36-moe lifecycle-timings]"))
+            .map(parse_numeric_fields),
+        mpp_pilot: output
+            .lines()
+            .rev()
+            .find(|l| l.starts_with("[qwen36-moe mpp-pilot]"))
             .map(parse_numeric_fields),
     }
 }
@@ -199,6 +205,7 @@ pub fn run_one_combo(invocation: &ComboInvocation, policy: &RunPolicy) -> Result
         stage_timings: attribution.stage_timings,
         chain_breakdown: attribution.chain_breakdown,
         lifecycle_timings: attribution.lifecycle_timings,
+        mpp_pilot: attribution.mpp_pilot,
         gpu_temp_c_end: None,
     })
 }
@@ -215,6 +222,9 @@ fn invoke_supersonic(
     if invocation.arch == "apple-m5-max" && invocation.model == "qwen3.6-35b-a3b" {
         cmd.env("SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL", "0")
             .env("SUPERSONIC_QWEN36_DENSE_PREFILL_TOKEN_LOOP", "1");
+        if emit_stage_timings {
+            cmd.env("SUPERSONIC_METAL_QWEN36_MPP_PILOT", "1");
+        }
     }
     cmd.arg("--model")
         .arg(&invocation.model)

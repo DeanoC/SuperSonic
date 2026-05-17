@@ -830,28 +830,67 @@ Reproduce the run with:
 SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" cargo run --release -p supersonic-bench --bin bench-perf -- --arch apple-m5-max --models qwen3.6-35b-a3b --quants int4
 ```
 
+Capture the native Metal hardware profile before starting runtime optimization:
+
+```bash
+SUPERSONIC_BACKENDS=metal cargo run -p machine-profile --bin machine-profile -- show --raw
+```
+
+The Metal profile records the Apple GPU device name, Metal capability metadata,
+unified-memory bandwidth, threadgroup-memory bandwidth, F16
+`simdgroup_multiply_accumulate` throughput rows split by accumulator dtype, a
+small sweep over simdgroups-per-threadgroup/threadgroups-per-core/accumulator
+count, an MPS FP16 GEMM roofline row, and Qwen3.6-shaped INT4 GEMV
+microkernels. On the current M5 Max machine the profiler identifies the GPU as
+`apple-m5-max` with 40 GPU cores from `system_profiler`; published profiles must
+remain sanitized and must not include serial numbers, hardware UUIDs, display
+serials, or provisioning identifiers. Treat the MPS row as the vendor-library
+hardware ceiling and the explicit simdgroup rows as SuperSonic kernel-design
+probes. The profile also includes a public-MSL tiled simdgroup GEMM row at
+`2048^3`, a same-size MPS row, and guarded MPP + Metal Tensor matmul rows. The
+MPP rows are the only rows intended to represent the supported M5 Neural
+Accelerator path; they remain `null` unless the runtime can compile the MPP
+shader, bind `MTLTensor` arguments through Metal 4 argument tables, complete the
+dispatch, and read back a nonzero tensor result. The support probe is a single
+full `64x64 * 64x32 -> 64x32` MPP tile; the large MPP rows are equivalent-GEMM
+throughput measurements built from repeated exact `64x32x64` MPP tiles and are
+independently guarded by their own output readback. They are not yet a claim
+that one whole square `MTLTensor` matmul invocation is working. The raw profile
+also records `mpp_tensor_matmul_probe_status`, `mpp_tensor_write_probe_value`,
+and `mpp_tensor_matmul_probe_value` so a failed MPP row distinguishes tensor
+binding from the MPP operation itself. If the isolated MMA sweep stays flat and
+the public tiled GEMM remains far below same-size MPS, the next
+optimization step is MPP/Metal-Tensor or MLX interop for large dense phases, not
+another single occupancy tweak.
+
 The harness records a warmup plus median-of-3 headline run at
 `--max-new-tokens 16`, then performs one additional `--emit-stage-timings`
 attribution run. For this Metal lane it also forces the dense prefill token loop
 (`SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL=0` and
 `SUPERSONIC_QWEN36_DENSE_PREFILL_TOKEN_LOOP=1`) because the default Qwen3.6
-batched prefill router-permute path is HIP/CUDA-only. The attribution maps are
-stored in the same perf JSON as `stage_timings`, `chain_breakdown`, and
-`lifecycle_timings` without feeding back into the headline median.
+batched prefill router-permute path is HIP/CUDA-only. The attribution run also
+enables `SUPERSONIC_METAL_QWEN36_MPP_PILOT=1`, which emits a separate
+`[qwen36-moe mpp-pilot]` row for repeated exact `64x32x64` MPP tiles. This is a
+runtime-adjacent MPP pilot measurement, not a model matmul replacement. The
+attribution maps are stored in the same perf JSON as `stage_timings`,
+`chain_breakdown`, `lifecycle_timings`, and `mpp_pilot` without feeding back
+into the headline median.
 
 <!-- AUTOGEN BELOW: apple-m5-max-metal -->
 | Model           |  INT4 |
 | --------------- | ----: |
-| qwen3.6-35b-a3b | 2354.1 |
+| qwen3.6-35b-a3b | 2374.6 |
 
 <!-- AUTOGEN END: apple-m5-max-metal -->
 
 Unsupported Metal constraints remain explicit for this target: persistent
 decode, KV-FP8, speculative decode, batching, and Metal VMM are not benchmarked
-or claimed here yet. The first baseline from this section should drive the next
-runtime optimization target; the expected first candidate is Qwen3.6 INT4
-persistent Metal decode because the current path is still chained per-token
-dispatch.
+or claimed here yet. The benchmark baseline plus the native Metal profile should
+drive the next runtime optimization target. Because the Qwen3.6 hero lane uses
+GPTQ-packed INT4 weights and the public MPP tile currently consumes FP16
+`MTLTensor` inputs, the next runtime PR should either prove an INT4-compatible
+MPP packing/dequant bridge or keep MPP as an attribution-only pilot while the
+native Metal path targets fused FFN/MoE dispatch overhead.
 
 ## How to reproduce
 

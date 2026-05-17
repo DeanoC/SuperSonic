@@ -30,7 +30,7 @@ pub fn measure() -> Profile {
     let cpu_id = cpu::detect_cpu_id();
     let topology = cpu::topology::detect();
     let cache = cpu::cache::detect();
-    let vector_peak = cpu::vector_kernels::measure(topology.cores_p);
+    let vector_peak = cpu::vector_kernels::measure(topology.cores_p.max(1));
 
     // Skip DRAM in startup-mode measurement (allocates ~768 MiB); the CLI
     // can opt in via a future flag. For now we record `null` and warn.
@@ -64,22 +64,21 @@ pub fn measure() -> Profile {
 
     let driver = detect_driver();
     let fp_components = FingerprintComponents {
-        cpu: format!("{} stepping={} microcode={}",
+        cpu: format!(
+            "{} stepping={} microcode={}",
             cpu_profile.model,
             cpu_profile.stepping,
-            cpu_profile.microcode.as_deref().unwrap_or("?")),
-        gpus: gpus.iter()
-            .map(|g| format!("{}:{}:{}", g.backend, g.arch_name,
-                             g.pci_id.as_deref().unwrap_or("?")))
-            .collect(),
+            cpu_profile.microcode.as_deref().unwrap_or("?")
+        ),
+        gpus: gpus.iter().map(gpu_fingerprint_descriptor).collect(),
         driver: driver.clone(),
         isa: cpu_profile.isa.clone(),
     };
     let fp = fingerprint::compute(&fp_components);
 
     Profile {
-        schema_version: 1,
-        profile_version: "machine-profile/0.1.0".into(),
+        schema_version: 2,
+        profile_version: "machine-profile/0.2.0".into(),
         fingerprint: fp,
         fingerprint_components: fp_components,
         captured_at: Utc::now().to_rfc3339(),
@@ -92,6 +91,18 @@ pub fn measure() -> Profile {
             kernel_driver: Some(driver),
         },
     }
+}
+
+fn gpu_fingerprint_descriptor(g: &schema::GpuProfile) -> String {
+    if g.backend == "Metal" {
+        return format!("Metal:{}:{}", g.arch_name, g.cu_count);
+    }
+    format!(
+        "{}:{}:{}",
+        g.backend,
+        g.arch_name,
+        g.pci_id.as_deref().unwrap_or("?")
+    )
 }
 
 /// Compute the fingerprint without running any microkernels.
@@ -112,9 +123,16 @@ pub fn fingerprint_only() -> (String, schema::FingerprintComponents) {
             for info in infos {
                 gpu_descriptors.push(format!(
                     "HIP:{}:0x{:04x}",
-                    info.arch_name,
-                    info.pci_device_id
+                    info.arch_name, info.pci_device_id
                 ));
+            }
+        }
+    }
+    #[cfg(supersonic_backend_metal)]
+    {
+        if let Ok(infos) = gpu::metal::enumerate_for_fingerprint() {
+            for info in infos {
+                gpu_descriptors.push(format!("Metal:{}:{}", info.arch_name, info.core_count));
             }
         }
     }
@@ -156,6 +174,12 @@ fn apply_catalog(gpus: &mut [schema::GpuProfile], cpu: &schema::CpuProfile) {
 }
 
 fn read_total_ram() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(v) = sysctl_string("hw.memsize").and_then(|s| s.parse().ok()) {
+            return Some(v);
+        }
+    }
     let s = std::fs::read_to_string("/proc/meminfo").ok()?;
     for line in s.lines() {
         if let Some(rest) = line.strip_prefix("MemTotal:") {
@@ -167,9 +191,31 @@ fn read_total_ram() -> Option<u64> {
 }
 
 fn read_uname_release() -> String {
-    std::fs::read_to_string("/proc/sys/kernel/osrelease")
-        .map(|s| format!("linux {}", s.trim()))
-        .unwrap_or_else(|_| "unknown".into())
+    #[cfg(target_os = "macos")]
+    {
+        let product = sysctl_string("kern.osproductversion")
+            .or_else(|| sysctl_string("kern.osrelease"))
+            .unwrap_or_else(|| "unknown".into());
+        format!("macos {product}")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        std::fs::read_to_string("/proc/sys/kernel/osrelease")
+            .map(|s| format!("linux {}", s.trim()))
+            .unwrap_or_else(|_| "unknown".into())
+    }
+}
+
+fn sysctl_string(name: &str) -> Option<String> {
+    let output = std::process::Command::new("/usr/sbin/sysctl")
+        .args(["-n", name])
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// Detect a stable driver-version string for fingerprinting.

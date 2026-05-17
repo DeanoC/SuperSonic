@@ -72,6 +72,7 @@ fn extracts_qwen36_attribution_timing_maps() {
 [qwen36-moe stage-timings] gen_steps=16 embed_ms_avg=0.123 chain_ms_avg=25.456 lm_head_ms_avg=2.000 sample_ms_avg=0.010 detok_ms_avg=0.001 total_ms_avg=27.590 (chain_total_ms=407.3 lm_head_total_ms=32.0)
 [qwen36-moe chain-breakdown] gen_steps=16 full_attn_ms_avg=8.000 linear_attn_ms_avg=4.000 ffn_ms_avg=13.456 (full_attn_total_ms=128.0 linear_attn_total_ms=64.0 ffn_total_ms=215.3)
 [qwen36-moe lifecycle-timings] prompt_setup_ms=1.000 bake_open_ms=2.000 layer_load_ms=3.000 session_ms=4.000 prefill_steps=1 prefill_embed_ms=5.000 prefill_chain_ms=6.000 prefill_total_ms=11.000 generation_wall_ms=441.0 total_wall_ms=452.0
+[qwen36-moe mpp-pilot] status=ok size=2048 iterations=5 tile_m=64 tile_n=32 tile_k=64 tflops=13.250
 ";
     let timings = extract_attribution_timings(s);
     assert_eq!(
@@ -86,4 +87,5 @@ fn extracts_qwen36_attribution_timing_maps() {
         timings.lifecycle_timings.unwrap().get("prefill_total_ms"),
         Some(&11.0)
     );
+    assert_eq!(timings.mpp_pilot.unwrap().get("tflops"), Some(&13.25));
 }

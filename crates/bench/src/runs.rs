@@ -53,6 +53,8 @@ pub struct PerfCellJson {
     pub chain_breakdown: Option<BTreeMap<String, f64>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lifecycle_timings: Option<BTreeMap<String, f64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mpp_pilot: Option<BTreeMap<String, f64>>,
     pub gpu_temp_c_end: Option<f64>,
 }
 

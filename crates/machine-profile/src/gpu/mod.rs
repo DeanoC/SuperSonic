@@ -14,6 +14,8 @@ pub enum GpuProfileError {
     NotImplemented(&'static str),
     #[error("hip error: {0}")]
     Hip(String),
+    #[error("metal error: {0}")]
+    Metal(String),
 }
 
 pub trait GpuProfiler {
@@ -27,6 +29,13 @@ pub fn run_all() -> Vec<GpuProfile> {
         match hip::HipProfiler.profile() {
             Ok(p) => out.extend(p),
             Err(e) => eprintln!("HIP profiler failed: {e}"),
+        }
+    }
+    #[cfg(supersonic_backend_metal)]
+    {
+        match metal::MetalProfiler.profile() {
+            Ok(p) => out.extend(p),
+            Err(e) => eprintln!("Metal profiler failed: {e}"),
         }
     }
     out

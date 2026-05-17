@@ -102,6 +102,7 @@ unsafe extern "C" {
         rhs_ptr: *const c_void,
         out_ptr: *mut c_void,
     ) -> c_int;
+    fn supersonic_metal_mpp_tile_gemm_f16_tflops(size: u32, iterations: u32) -> f64;
     fn supersonic_metal_qwen_linear_projections_bf16(
         hidden_dim: usize,
         qkv_dim: usize,
@@ -1253,6 +1254,23 @@ pub(crate) fn matmul_rhs_transposed_f32(
         ));
     }
     Ok(())
+}
+
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+pub(crate) fn mpp_tile_gemm_f16_tflops(size: u32, iterations: u32) -> Result<f64, GpuError> {
+    if size == 0 || iterations == 0 || size % 64 != 0 {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native MPP tile GEMM requires non-zero size divisible by 64 and iterations > 0, got size={size} iterations={iterations}"
+        )));
+    }
+    let tflops = unsafe { supersonic_metal_mpp_tile_gemm_f16_tflops(size, iterations) };
+    if tflops.is_finite() && tflops > 0.0 {
+        Ok(tflops)
+    } else {
+        Err(GpuError::InvalidArg(
+            "metal native MPP tile GEMM pilot returned no measurement".into(),
+        ))
+    }
 }
 
 #[cfg(all(target_os = "macos", supersonic_backend_metal))]
@@ -3785,6 +3803,14 @@ pub(crate) fn matmul_rhs_transposed_f32(
 }
 
 #[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+pub(crate) fn mpp_tile_gemm_f16_tflops(_size: u32, _iterations: u32) -> Result<f64, GpuError> {
+    Err(GpuError::backend(
+        Backend::Metal,
+        "metal native MPP tile GEMM pilot is not compiled".into(),
+    ))
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn qwen_linear_projections_bf16(
     _hidden_dim: usize,
@@ -4397,6 +4423,17 @@ mod tests {
             .chunks_exact(4)
             .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
             .collect()
+    }
+
+    #[test]
+    #[ignore = "MPP/Metal Tensor availability depends on Xcode 26.1+ and M5 hardware"]
+    fn metal_mpp_tile_gemm_f16_pilot_smoke() {
+        set_backend(Backend::Metal);
+        let tflops = mpp_tile_gemm_f16_tflops(2048, 2).expect("run MPP tile GEMM pilot");
+        assert!(
+            tflops.is_finite() && tflops > 0.0,
+            "invalid MPP pilot TFLOPS: {tflops}"
+        );
     }
 
     #[test]
