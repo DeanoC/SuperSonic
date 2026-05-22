@@ -949,6 +949,19 @@ correct but not yet default: profile rows show `qwen36_ffn_int4_stage5` at
 the expected token `[11]` but measured `ffn_ms_avg=1206.240`. Reduce that
 command-buffer wait before promoting native FFN into the normal lane.
 
+Follow-up linear profiling keeps the normal lane unchanged and adds subphase
+rows under `SUPERSONIC_METAL_PROFILE=1`. A one-token profile smoke generated
+the expected token `[11]` and reported the linear host subphases as:
+`qwen36_linear_int4_in_proj_qkv` 100.577 ms total,
+`qwen36_linear_int4_out_proj` 43.777 ms,
+`qwen36_linear_int4_in_proj_z` 42.956 ms, and
+`qwen36_linear_recurrent_update` 25.168 ms across 30 linear layers. The
+experimental native projection split is available only with
+`SUPERSONIC_METAL_ENABLE_QWEN36_LINEAR_INT4_STAGE5=1`; the first smoke was
+correct but slower because three separate GEMV dispatches increased wait time.
+The next implementation target should therefore be a fused linear-attention
+stage-5 path, not standalone projection launches.
+
 Unsupported Metal constraints remain explicit for this target: persistent
 decode, KV-FP8, speculative decode, batching, and Metal VMM are not benchmarked
 or claimed here yet. Because the Qwen3.6 hero lane uses GPTQ-packed INT4

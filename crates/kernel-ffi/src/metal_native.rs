@@ -1258,6 +1258,47 @@ pub(crate) fn matmul_rhs_transposed_int4_bf16_gemv_m1_tiled(
 
 #[cfg(all(target_os = "macos", supersonic_backend_metal))]
 #[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn matmul_rhs_transposed_int4_bf16_gemv_m1_tiled_raw(
+    n: usize,
+    k: usize,
+    group_size: usize,
+    lhs: *const c_void,
+    rhs_int4: *const c_void,
+    scale: *const c_void,
+    zero: *const c_void,
+    out: *mut c_void,
+) -> Result<(), GpuError> {
+    if n == 0
+        || k == 0
+        || group_size == 0
+        || lhs.is_null()
+        || rhs_int4.is_null()
+        || scale.is_null()
+        || zero.is_null()
+        || out.is_null()
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native matmul_rhs_transposed_int4_bf16_gemv_m1_tiled_raw invalid shape: n={n} k={k} group_size={group_size}"
+        )));
+    }
+    let status = unsafe {
+        supersonic_metal_matmul_rhs_transposed_int4_bf16_gemv_m1_tiled(
+            n, k, group_size, lhs, rhs_int4, scale, zero, out,
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!(
+                "metal native matmul_rhs_transposed_int4_bf16_gemv_m1_tiled_raw failed with status {status}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn qwen36_ffn_int4_stage5(
     hidden: usize,
     num_experts: usize,
@@ -3911,6 +3952,24 @@ pub(crate) fn matmul_rhs_transposed_int4_bf16_gemv_m1_tiled(
     Err(GpuError::backend(
         Backend::Metal,
         "metal native matmul_rhs_transposed_int4_bf16_gemv_m1_tiled is not compiled".into(),
+    ))
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn matmul_rhs_transposed_int4_bf16_gemv_m1_tiled_raw(
+    _n: usize,
+    _k: usize,
+    _group_size: usize,
+    _lhs: *const c_void,
+    _rhs_int4: *const c_void,
+    _scale: *const c_void,
+    _zero: *const c_void,
+    _out: *mut c_void,
+) -> Result<(), GpuError> {
+    Err(GpuError::backend(
+        Backend::Metal,
+        "metal native matmul_rhs_transposed_int4_bf16_gemv_m1_tiled_raw is not compiled".into(),
     ))
 }
 

@@ -1532,18 +1532,22 @@ fn attn_step_stage1_5_metal_host(
         std::slice::from_raw_parts_mut(workspace.as_mut_ptr() as *mut f32, workspace_len)
     };
 
-    let mut mean_sq = 0.0f32;
-    for &bits in input {
-        let v = bf16_bits_to_f32(bits);
-        mean_sq += v * v;
-    }
-    let inv_rms = 1.0f32 / (mean_sq / hidden as f32 + params.rms_norm_eps).sqrt();
-    let mut x_norm = vec![0.0f32; hidden];
-    for col in 0..hidden {
-        let v = bf16_bits_to_f32(input[col]);
-        let w = bf16_bits_to_f32(input_norm_w[col]);
-        x_norm[col] = bf16_round_f32(v * inv_rms * (1.0 + w));
-    }
+    let x_norm =
+        crate::prefill_ffi::metal_profile_time("qwen36_full_attn_input_norm", "host", || {
+            let mut mean_sq = 0.0f32;
+            for &bits in input {
+                let v = bf16_bits_to_f32(bits);
+                mean_sq += v * v;
+            }
+            let inv_rms = 1.0f32 / (mean_sq / hidden as f32 + params.rms_norm_eps).sqrt();
+            let mut x_norm = vec![0.0f32; hidden];
+            for col in 0..hidden {
+                let v = bf16_bits_to_f32(input[col]);
+                let w = bf16_bits_to_f32(input_norm_w[col]);
+                x_norm[col] = bf16_round_f32(v * inv_rms * (1.0 + w));
+            }
+            x_norm
+        });
 
     qwen36_validate_dense_or_int4_sidecars(
         int4.q_proj_scale,
@@ -1881,6 +1885,37 @@ impl Qwen36MoeLinearStepInt4 {
     }
 }
 
+fn qwen36_linear_int4_stage5_metal_native_supported(
+    params: Qwen36MoeLinearStepParams,
+    weights: &Qwen36MoeLinearStepWeights,
+    int4: &Qwen36MoeLinearStepInt4,
+    output_capacity: usize,
+    qkv_dim: usize,
+    val_dim: usize,
+) -> bool {
+    std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_LINEAR_INT4_STAGE5").is_some()
+        && params.stage == 5
+        && params.hidden == 2048
+        && params.num_k_heads == 16
+        && params.num_v_heads == 32
+        && params.head_k_dim == 128
+        && params.head_v_dim == 128
+        && params.conv_kernel_dim == 4
+        && int4.group_size == 128
+        && output_capacity >= qkv_dim + val_dim
+        && !crate::metal_native::disabled_by_env()
+        && !weights.input_hidden.is_null()
+        && !weights.in_proj_qkv_w.is_null()
+        && !weights.in_proj_z_w.is_null()
+        && !weights.out_proj_w.is_null()
+        && !int4.in_proj_qkv_scale.is_null()
+        && !int4.in_proj_qkv_zero.is_null()
+        && !int4.in_proj_z_scale.is_null()
+        && !int4.in_proj_z_zero.is_null()
+        && !int4.out_proj_scale.is_null()
+        && !int4.out_proj_zero.is_null()
+}
+
 /// Safe wrapper for the PR 4b3 staged linear-attention parity launcher.
 /// Same workspace / sync_buf layout as [`attn_step_launch`]: 96-byte zero
 /// scratch (only counters[0] used here), F32 workspace sized for the
@@ -2116,12 +2151,12 @@ fn linear_step_stage1_5_metal_host(
             workspace.len_bytes() / std::mem::size_of::<f32>(),
         )));
     }
-    if output.len_bytes() / std::mem::size_of::<u16>() < output_len {
+    let output_capacity = output.len_bytes() / std::mem::size_of::<u16>();
+    if output_capacity < output_len {
         return Err(GpuError::InvalidArg(format!(
             "qwen36_moe::linear_step_launch: Metal stage{} output too small: \
              need {output_len} BF16 entries, got {}",
-            params.stage,
-            output.len_bytes() / std::mem::size_of::<u16>(),
+            params.stage, output_capacity,
         )));
     }
 
@@ -2135,23 +2170,26 @@ fn linear_step_stage1_5_metal_host(
         std::slice::from_raw_parts(weights.in_proj_b_w as *const u16, num_v_heads * hidden)
     };
     let output =
-        unsafe { std::slice::from_raw_parts_mut(output.as_mut_ptr() as *mut u16, output_len) };
+        unsafe { std::slice::from_raw_parts_mut(output.as_mut_ptr() as *mut u16, output_capacity) };
     let workspace = unsafe {
         std::slice::from_raw_parts_mut(workspace.as_mut_ptr() as *mut f32, workspace_len)
     };
 
-    let mut mean_sq = 0.0f32;
-    for &bits in input {
-        let v = bf16_bits_to_f32(bits);
-        mean_sq += v * v;
-    }
-    let inv_rms = 1.0f32 / (mean_sq / hidden as f32 + params.rms_norm_eps).sqrt();
-    let mut x_norm = vec![0.0f32; hidden];
-    for col in 0..hidden {
-        let v = bf16_bits_to_f32(input[col]);
-        let w = bf16_bits_to_f32(input_norm_w[col]);
-        x_norm[col] = bf16_round_f32(v * inv_rms * (1.0 + w));
-    }
+    let x_norm = crate::prefill_ffi::metal_profile_time("qwen36_linear_input_norm", "host", || {
+        let mut mean_sq = 0.0f32;
+        for &bits in input {
+            let v = bf16_bits_to_f32(bits);
+            mean_sq += v * v;
+        }
+        let inv_rms = 1.0f32 / (mean_sq / hidden as f32 + params.rms_norm_eps).sqrt();
+        let mut x_norm = vec![0.0f32; hidden];
+        for col in 0..hidden {
+            let v = bf16_bits_to_f32(input[col]);
+            let w = bf16_bits_to_f32(input_norm_w[col]);
+            x_norm[col] = bf16_round_f32(v * inv_rms * (1.0 + w));
+        }
+        x_norm
+    });
 
     qwen36_validate_dense_or_int4_sidecars(
         int4.in_proj_qkv_scale,
@@ -2174,55 +2212,114 @@ fn linear_step_stage1_5_metal_host(
         )?;
     }
 
-    {
-        let qkv_w = weights.in_proj_qkv_w as usize;
-        let qkv_scale = int4.in_proj_qkv_scale as usize;
-        let qkv_zero = int4.in_proj_qkv_zero as usize;
-        let group_size = int4.group_size.max(0) as usize;
-        let qkv = &mut workspace[off_qkv_raw..off_qkv_raw + qkv_dim];
-        qwen36_parallel_chunks_mut(qkv, 64, |start, chunk| {
-            for (local, out) in chunk.iter_mut().enumerate() {
-                let row = start + local;
-                let acc = qwen36_dense_or_int4_dot_2d_unchecked(
-                    qkv_w, qkv_scale, qkv_zero, row, hidden, group_size, &x_norm,
-                );
-                *out = bf16_round_f32(acc);
-            }
-        });
-        if params.stage == 1 {
-            for row in 0..qkv_dim {
-                output[row] = f32_to_bf16_bits(workspace[off_qkv_raw + row]);
-            }
-        }
-    }
-    {
-        let z_w = weights.in_proj_z_w as usize;
-        let z_scale = int4.in_proj_z_scale as usize;
-        let z_zero = int4.in_proj_z_zero as usize;
-        let group_size = int4.group_size.max(0) as usize;
-        let z = &mut workspace[off_z_raw..off_z_raw + val_dim];
-        qwen36_parallel_chunks_mut(z, 64, |start, chunk| {
-            for (local, out) in chunk.iter_mut().enumerate() {
-                let row = start + local;
-                let acc = qwen36_dense_or_int4_dot_2d_unchecked(
-                    z_w, z_scale, z_zero, row, hidden, group_size, &x_norm,
-                );
-                *out = bf16_round_f32(acc);
-            }
-        });
-    }
-    for row in 0..num_v_heads {
-        let mut acc_a = 0.0f32;
-        let mut acc_b = 0.0f32;
-        let row_base = row * hidden;
+    let linear_native = qwen36_linear_int4_stage5_metal_native_supported(
+        params,
+        weights,
+        int4,
+        output_capacity,
+        qkv_dim,
+        val_dim,
+    );
+
+    if linear_native {
+        let lhs_bf16 = workspace.as_mut_ptr() as *mut u16;
         for col in 0..hidden {
-            let x = x_norm[col];
-            acc_a += bf16_bits_to_f32(in_proj_a_w[row_base + col]) * x;
-            acc_b += bf16_bits_to_f32(in_proj_b_w[row_base + col]) * x;
+            unsafe {
+                *lhs_bf16.add(col) = f32_to_bf16_bits(x_norm[col]);
+            }
         }
-        workspace[off_a_raw + row] = bf16_round_f32(acc_a);
-        workspace[off_b_raw + row] = bf16_round_f32(acc_b);
+        crate::prefill_ffi::metal_profile_time(
+            "qwen36_linear_int4_in_proj_qkv",
+            "native",
+            || unsafe {
+                crate::metal_native::matmul_rhs_transposed_int4_bf16_gemv_m1_tiled_raw(
+                    qkv_dim,
+                    hidden,
+                    int4.group_size as usize,
+                    lhs_bf16 as *const c_void,
+                    weights.in_proj_qkv_w,
+                    int4.in_proj_qkv_scale,
+                    int4.in_proj_qkv_zero,
+                    output.as_mut_ptr() as *mut c_void,
+                )
+            },
+        )?;
+        crate::prefill_ffi::metal_profile_time(
+            "qwen36_linear_int4_in_proj_z",
+            "native",
+            || unsafe {
+                crate::metal_native::matmul_rhs_transposed_int4_bf16_gemv_m1_tiled_raw(
+                    val_dim,
+                    hidden,
+                    int4.group_size as usize,
+                    lhs_bf16 as *const c_void,
+                    weights.in_proj_z_w,
+                    int4.in_proj_z_scale,
+                    int4.in_proj_z_zero,
+                    output.as_mut_ptr().add(off_z_raw) as *mut c_void,
+                )
+            },
+        )?;
+        for row in 0..qkv_dim {
+            workspace[off_qkv_raw + row] = bf16_bits_to_f32(output[off_qkv_raw + row]);
+        }
+        for row in 0..val_dim {
+            workspace[off_z_raw + row] = bf16_bits_to_f32(output[off_z_raw + row]);
+        }
+    } else {
+        crate::prefill_ffi::metal_profile_time("qwen36_linear_int4_in_proj_qkv", "host", || {
+            let qkv_w = weights.in_proj_qkv_w as usize;
+            let qkv_scale = int4.in_proj_qkv_scale as usize;
+            let qkv_zero = int4.in_proj_qkv_zero as usize;
+            let group_size = int4.group_size.max(0) as usize;
+            let qkv = &mut workspace[off_qkv_raw..off_qkv_raw + qkv_dim];
+            qwen36_parallel_chunks_mut(qkv, 64, |start, chunk| {
+                for (local, out) in chunk.iter_mut().enumerate() {
+                    let row = start + local;
+                    let acc = qwen36_dense_or_int4_dot_2d_unchecked(
+                        qkv_w, qkv_scale, qkv_zero, row, hidden, group_size, &x_norm,
+                    );
+                    *out = bf16_round_f32(acc);
+                }
+            });
+            if params.stage == 1 {
+                for row in 0..qkv_dim {
+                    output[row] = f32_to_bf16_bits(workspace[off_qkv_raw + row]);
+                }
+            }
+        });
+
+        crate::prefill_ffi::metal_profile_time("qwen36_linear_int4_in_proj_z", "host", || {
+            let z_w = weights.in_proj_z_w as usize;
+            let z_scale = int4.in_proj_z_scale as usize;
+            let z_zero = int4.in_proj_z_zero as usize;
+            let group_size = int4.group_size.max(0) as usize;
+            let z = &mut workspace[off_z_raw..off_z_raw + val_dim];
+            qwen36_parallel_chunks_mut(z, 64, |start, chunk| {
+                for (local, out) in chunk.iter_mut().enumerate() {
+                    let row = start + local;
+                    let acc = qwen36_dense_or_int4_dot_2d_unchecked(
+                        z_w, z_scale, z_zero, row, hidden, group_size, &x_norm,
+                    );
+                    *out = bf16_round_f32(acc);
+                }
+            });
+        });
     }
+    crate::prefill_ffi::metal_profile_time("qwen36_linear_in_proj_ab", "host", || {
+        for row in 0..num_v_heads {
+            let mut acc_a = 0.0f32;
+            let mut acc_b = 0.0f32;
+            let row_base = row * hidden;
+            for col in 0..hidden {
+                let x = x_norm[col];
+                acc_a += bf16_bits_to_f32(in_proj_a_w[row_base + col]) * x;
+                acc_b += bf16_bits_to_f32(in_proj_b_w[row_base + col]) * x;
+            }
+            workspace[off_a_raw + row] = bf16_round_f32(acc_a);
+            workspace[off_b_raw + row] = bf16_round_f32(acc_b);
+        }
+    });
 
     if params.stage == 1 {
         return Ok(());
@@ -2240,187 +2337,229 @@ fn linear_step_stage1_5_metal_host(
     let conv_state =
         unsafe { std::slice::from_raw_parts_mut(weights.conv_state as *mut u16, qkv_dim * kstate) };
 
-    for ch in 0..qkv_dim {
-        let new_qkv = workspace[off_qkv_raw + ch];
-        let mut acc = 0.0f32;
-        for t in 0..kstate {
-            let state = bf16_bits_to_f32(conv_state[ch * kstate + t]);
-            acc += state * bf16_bits_to_f32(conv1d_w[ch * kernel + t]);
-        }
-        acc += new_qkv * bf16_bits_to_f32(conv1d_w[ch * kernel + kstate]);
-        if let Some(bias) = conv1d_bias {
-            acc += bf16_bits_to_f32(bias[ch]);
-        }
-        let conv_out = bf16_round_f32(acc);
-        let silu = bf16_round_f32(conv_out * (1.0 / (1.0 + (-conv_out).exp())));
-        workspace[off_qkv_raw + ch] = silu;
-        if params.stage == 2 {
-            output[ch] = f32_to_bf16_bits(silu);
-        }
-
-        if kstate > 0 {
-            for t in 0..kstate.saturating_sub(1) {
-                conv_state[ch * kstate + t] = conv_state[ch * kstate + t + 1];
+    crate::prefill_ffi::metal_profile_time("qwen36_linear_conv_silu_state", "host", || {
+        for ch in 0..qkv_dim {
+            let new_qkv = workspace[off_qkv_raw + ch];
+            let mut acc = 0.0f32;
+            for t in 0..kstate {
+                let state = bf16_bits_to_f32(conv_state[ch * kstate + t]);
+                acc += state * bf16_bits_to_f32(conv1d_w[ch * kernel + t]);
             }
-            conv_state[ch * kstate + (kstate - 1)] = f32_to_bf16_bits(new_qkv);
+            acc += new_qkv * bf16_bits_to_f32(conv1d_w[ch * kernel + kstate]);
+            if let Some(bias) = conv1d_bias {
+                acc += bf16_bits_to_f32(bias[ch]);
+            }
+            let conv_out = bf16_round_f32(acc);
+            let silu = bf16_round_f32(conv_out * (1.0 / (1.0 + (-conv_out).exp())));
+            workspace[off_qkv_raw + ch] = silu;
+            if params.stage == 2 {
+                output[ch] = f32_to_bf16_bits(silu);
+            }
+
+            if kstate > 0 {
+                for t in 0..kstate.saturating_sub(1) {
+                    conv_state[ch * kstate + t] = conv_state[ch * kstate + t + 1];
+                }
+                conv_state[ch * kstate + (kstate - 1)] = f32_to_bf16_bits(new_qkv);
+            }
         }
-    }
+    });
 
     if params.stage == 2 {
         return Ok(());
     }
 
-    for head in 0..num_k_heads {
-        let q_src = off_qkv_raw + head * head_k_dim;
-        let k_src = off_qkv_raw + key_dim + head * head_k_dim;
-        let q_dst = off_q_normed + head * head_k_dim;
-        let k_dst = off_k_normed + head * head_k_dim;
+    crate::prefill_ffi::metal_profile_time("qwen36_linear_qk_norm_repeat", "host", || {
+        for head in 0..num_k_heads {
+            let q_src = off_qkv_raw + head * head_k_dim;
+            let k_src = off_qkv_raw + key_dim + head * head_k_dim;
+            let q_dst = off_q_normed + head * head_k_dim;
+            let k_dst = off_k_normed + head * head_k_dim;
 
-        let mut q_ss = 0.0f32;
-        let mut k_ss = 0.0f32;
-        for i in 0..head_k_dim {
-            let q = workspace[q_src + i];
-            let k = workspace[k_src + i];
-            q_ss += q * q;
-            k_ss += k * k;
+            let mut q_ss = 0.0f32;
+            let mut k_ss = 0.0f32;
+            for i in 0..head_k_dim {
+                let q = workspace[q_src + i];
+                let k = workspace[k_src + i];
+                q_ss += q * q;
+                k_ss += k * k;
+            }
+            let q_denom = bf16_round_f32(bf16_round_f32(q_ss.sqrt()).max(1e-6));
+            let k_denom = bf16_round_f32(bf16_round_f32(k_ss.sqrt()).max(1e-6));
+            for i in 0..head_k_dim {
+                workspace[q_dst + i] = bf16_round_f32(workspace[q_src + i] / q_denom);
+                workspace[k_dst + i] = bf16_round_f32(workspace[k_src + i] / k_denom);
+            }
         }
-        let q_denom = bf16_round_f32(bf16_round_f32(q_ss.sqrt()).max(1e-6));
-        let k_denom = bf16_round_f32(bf16_round_f32(k_ss.sqrt()).max(1e-6));
-        for i in 0..head_k_dim {
-            workspace[q_dst + i] = bf16_round_f32(workspace[q_src + i] / q_denom);
-            workspace[k_dst + i] = bf16_round_f32(workspace[k_src + i] / k_denom);
-        }
-    }
 
-    let rep = num_v_heads / num_k_heads;
-    let q_scale = 1.0f32 / (head_k_dim as f32).sqrt();
-    for vhead in 0..num_v_heads {
-        let src_kh = vhead / rep;
-        let q_src = off_q_normed + src_kh * head_k_dim;
-        let k_src = off_k_normed + src_kh * head_k_dim;
-        let q_dst = off_q_rep + vhead * head_k_dim;
-        let k_dst = off_k_rep + vhead * head_k_dim;
-        for i in 0..head_k_dim {
-            let qs = bf16_round_f32(workspace[q_src + i] * q_scale);
-            let kn = workspace[k_src + i];
-            workspace[q_dst + i] = qs;
-            workspace[k_dst + i] = kn;
+        let rep = num_v_heads / num_k_heads;
+        let q_scale = 1.0f32 / (head_k_dim as f32).sqrt();
+        for vhead in 0..num_v_heads {
+            let src_kh = vhead / rep;
+            let q_src = off_q_normed + src_kh * head_k_dim;
+            let k_src = off_k_normed + src_kh * head_k_dim;
+            let q_dst = off_q_rep + vhead * head_k_dim;
+            let k_dst = off_k_rep + vhead * head_k_dim;
+            for i in 0..head_k_dim {
+                let qs = bf16_round_f32(workspace[q_src + i] * q_scale);
+                let kn = workspace[k_src + i];
+                workspace[q_dst + i] = qs;
+                workspace[k_dst + i] = kn;
+                if params.stage == 3 {
+                    output[vhead * head_k_dim + i] = f32_to_bf16_bits(qs);
+                    output[num_v_heads * head_k_dim + vhead * head_k_dim + i] =
+                        f32_to_bf16_bits(kn);
+                }
+            }
+            let v_src = off_qkv_raw + 2 * key_dim + vhead * head_v_dim;
+            let v_out = 2 * num_v_heads * head_k_dim + vhead * head_v_dim;
             if params.stage == 3 {
-                output[vhead * head_k_dim + i] = f32_to_bf16_bits(qs);
-                output[num_v_heads * head_k_dim + vhead * head_k_dim + i] = f32_to_bf16_bits(kn);
+                for i in 0..head_v_dim {
+                    output[v_out + i] = f32_to_bf16_bits(workspace[v_src + i]);
+                }
             }
         }
-        let v_src = off_qkv_raw + 2 * key_dim + vhead * head_v_dim;
-        let v_out = 2 * num_v_heads * head_k_dim + vhead * head_v_dim;
-        if params.stage == 3 {
-            for i in 0..head_v_dim {
-                output[v_out + i] = f32_to_bf16_bits(workspace[v_src + i]);
-            }
-        }
-    }
+    });
 
     if params.stage == 3 {
         return Ok(());
     }
 
-    let dt_bias = unsafe { std::slice::from_raw_parts(weights.dt_bias as *const u16, num_v_heads) };
-    let a_log = unsafe { std::slice::from_raw_parts(weights.a_log as *const u16, num_v_heads) };
-    let recurrent_state = unsafe {
-        std::slice::from_raw_parts_mut(
-            weights.recurrent_state,
-            num_v_heads * head_k_dim * head_v_dim,
-        )
-    };
-    for head in 0..num_v_heads {
-        let a_v = workspace[off_a_raw + head];
-        let b_v = workspace[off_b_raw + head];
-        let dt_b = bf16_bits_to_f32(dt_bias[head]);
-        let a_log_v = bf16_bits_to_f32(a_log[head]);
-        let softplus = (1.0 + (a_v + dt_b).exp()).ln();
-        workspace[off_beta + head] = 1.0 / (1.0 + (-b_v).exp());
-        workspace[off_g + head] = -softplus * a_log_v.exp();
-    }
+    crate::prefill_ffi::metal_profile_time("qwen36_linear_recurrent_update", "host", || {
+        let dt_bias =
+            unsafe { std::slice::from_raw_parts(weights.dt_bias as *const u16, num_v_heads) };
+        let a_log = unsafe { std::slice::from_raw_parts(weights.a_log as *const u16, num_v_heads) };
+        let recurrent_state = unsafe {
+            std::slice::from_raw_parts_mut(
+                weights.recurrent_state,
+                num_v_heads * head_k_dim * head_v_dim,
+            )
+        };
+        for head in 0..num_v_heads {
+            let a_v = workspace[off_a_raw + head];
+            let b_v = workspace[off_b_raw + head];
+            let dt_b = bf16_bits_to_f32(dt_bias[head]);
+            let a_log_v = bf16_bits_to_f32(a_log[head]);
+            let softplus = (1.0 + (a_v + dt_b).exp()).ln();
+            workspace[off_beta + head] = 1.0 / (1.0 + (-b_v).exp());
+            workspace[off_g + head] = -softplus * a_log_v.exp();
+        }
 
-    for head in 0..num_v_heads {
-        let beta = workspace[off_beta + head];
-        let gstep = workspace[off_g + head].exp();
-        let state_off = head * head_k_dim * head_v_dim;
-        let kv_off = off_k_rep + head * head_k_dim;
-        let qv_off = off_q_rep + head * head_k_dim;
-        let v_off = off_qkv_raw + 2 * key_dim + head * head_v_dim;
-        for e in 0..head_k_dim * head_v_dim {
-            recurrent_state[state_off + e] *= gstep;
-        }
-        let mut kv_mem = vec![0.0f32; head_v_dim];
-        for j in 0..head_v_dim {
-            let mut acc = 0.0f32;
-            for i in 0..head_k_dim {
-                acc += recurrent_state[state_off + i * head_v_dim + j] * workspace[kv_off + i];
+        for head in 0..num_v_heads {
+            let beta = workspace[off_beta + head];
+            let gstep = workspace[off_g + head].exp();
+            let state_off = head * head_k_dim * head_v_dim;
+            let kv_off = off_k_rep + head * head_k_dim;
+            let qv_off = off_q_rep + head * head_k_dim;
+            let v_off = off_qkv_raw + 2 * key_dim + head * head_v_dim;
+            for e in 0..head_k_dim * head_v_dim {
+                recurrent_state[state_off + e] *= gstep;
             }
-            kv_mem[j] = acc;
-        }
-        let mut delta = vec![0.0f32; head_v_dim];
-        for j in 0..head_v_dim {
-            delta[j] = (workspace[v_off + j] - kv_mem[j]) * beta;
-        }
-        for i in 0..head_k_dim {
+            let mut kv_mem = vec![0.0f32; head_v_dim];
             for j in 0..head_v_dim {
-                recurrent_state[state_off + i * head_v_dim + j] += workspace[kv_off + i] * delta[j];
+                let mut acc = 0.0f32;
+                for i in 0..head_k_dim {
+                    acc += recurrent_state[state_off + i * head_v_dim + j] * workspace[kv_off + i];
+                }
+                kv_mem[j] = acc;
             }
-        }
-        for j in 0..head_v_dim {
-            let mut acc = 0.0f32;
+            let mut delta = vec![0.0f32; head_v_dim];
+            for j in 0..head_v_dim {
+                delta[j] = (workspace[v_off + j] - kv_mem[j]) * beta;
+            }
             for i in 0..head_k_dim {
-                acc += recurrent_state[state_off + i * head_v_dim + j] * workspace[qv_off + i];
+                for j in 0..head_v_dim {
+                    recurrent_state[state_off + i * head_v_dim + j] +=
+                        workspace[kv_off + i] * delta[j];
+                }
             }
-            let rec = bf16_round_f32(acc);
-            workspace[off_rec_out + head * head_v_dim + j] = rec;
-            if params.stage == 4 {
-                output[head * head_v_dim + j] = f32_to_bf16_bits(rec);
+            for j in 0..head_v_dim {
+                let mut acc = 0.0f32;
+                for i in 0..head_k_dim {
+                    acc += recurrent_state[state_off + i * head_v_dim + j] * workspace[qv_off + i];
+                }
+                let rec = bf16_round_f32(acc);
+                workspace[off_rec_out + head * head_v_dim + j] = rec;
+                if params.stage == 4 {
+                    output[head * head_v_dim + j] = f32_to_bf16_bits(rec);
+                }
             }
         }
-    }
+    });
 
     if params.stage == 4 {
         return Ok(());
     }
 
-    let norm_w = unsafe { std::slice::from_raw_parts(weights.norm_w as *const u16, head_v_dim) };
-    for head in 0..num_v_heads {
-        let rec_off = off_rec_out + head * head_v_dim;
-        let z_off = off_z_raw + head * head_v_dim;
-        let mut mean_sq = 0.0f32;
-        for j in 0..head_v_dim {
-            let v = workspace[rec_off + j];
-            mean_sq += v * v;
-        }
-        let inv = 1.0f32 / (mean_sq / head_v_dim as f32 + params.rms_norm_eps).sqrt();
-        for j in 0..head_v_dim {
-            let rec = workspace[rec_off + j];
-            let nw = bf16_bits_to_f32(norm_w[j]);
-            let on = bf16_round_f32(rec * inv * nw);
-            let z = workspace[z_off + j];
-            let z_silu = bf16_round_f32(z * (1.0 / (1.0 + (-z).exp())));
-            workspace[rec_off + j] = bf16_round_f32(on * z_silu);
-        }
-    }
-
-    let rec_out = workspace[off_rec_out..off_rec_out + val_dim].to_vec();
-    {
-        let out_w = weights.out_proj_w as usize;
-        let out_scale = int4.out_proj_scale as usize;
-        let out_zero = int4.out_proj_zero as usize;
-        let group_size = int4.group_size.max(0) as usize;
-        qwen36_parallel_chunks_mut(output, 64, |start, chunk| {
-            for (local, out) in chunk.iter_mut().enumerate() {
-                let row = start + local;
-                let acc = qwen36_dense_or_int4_dot_2d_unchecked(
-                    out_w, out_scale, out_zero, row, val_dim, group_size, &rec_out,
-                );
-                let o_out = bf16_round_f32(acc);
-                let residual = bf16_round_f32(bf16_bits_to_f32(input[row]) + o_out);
-                *out = f32_to_bf16_bits(residual);
+    crate::prefill_ffi::metal_profile_time("qwen36_linear_output_gate_norm", "host", || {
+        let norm_w =
+            unsafe { std::slice::from_raw_parts(weights.norm_w as *const u16, head_v_dim) };
+        for head in 0..num_v_heads {
+            let rec_off = off_rec_out + head * head_v_dim;
+            let z_off = off_z_raw + head * head_v_dim;
+            let mut mean_sq = 0.0f32;
+            for j in 0..head_v_dim {
+                let v = workspace[rec_off + j];
+                mean_sq += v * v;
             }
+            let inv = 1.0f32 / (mean_sq / head_v_dim as f32 + params.rms_norm_eps).sqrt();
+            for j in 0..head_v_dim {
+                let rec = workspace[rec_off + j];
+                let nw = bf16_bits_to_f32(norm_w[j]);
+                let on = bf16_round_f32(rec * inv * nw);
+                let z = workspace[z_off + j];
+                let z_silu = bf16_round_f32(z * (1.0 / (1.0 + (-z).exp())));
+                workspace[rec_off + j] = bf16_round_f32(on * z_silu);
+            }
+        }
+    });
+
+    if linear_native {
+        let rec_bf16 = workspace.as_mut_ptr() as *mut u16;
+        for col in 0..val_dim {
+            unsafe {
+                *rec_bf16.add(col) = f32_to_bf16_bits(workspace[off_rec_out + col]);
+            }
+        }
+        crate::prefill_ffi::metal_profile_time(
+            "qwen36_linear_int4_out_proj",
+            "native",
+            || unsafe {
+                crate::metal_native::matmul_rhs_transposed_int4_bf16_gemv_m1_tiled_raw(
+                    hidden,
+                    val_dim,
+                    int4.group_size as usize,
+                    rec_bf16 as *const c_void,
+                    weights.out_proj_w,
+                    int4.out_proj_scale,
+                    int4.out_proj_zero,
+                    output.as_mut_ptr() as *mut c_void,
+                )
+            },
+        )?;
+        for row in 0..hidden {
+            let o_out = bf16_bits_to_f32(output[row]);
+            let residual = bf16_round_f32(bf16_bits_to_f32(input[row]) + o_out);
+            output[row] = f32_to_bf16_bits(residual);
+        }
+    } else {
+        crate::prefill_ffi::metal_profile_time("qwen36_linear_int4_out_proj", "host", || {
+            let rec_out = &workspace[off_rec_out..off_rec_out + val_dim];
+            let out_w = weights.out_proj_w as usize;
+            let out_scale = int4.out_proj_scale as usize;
+            let out_zero = int4.out_proj_zero as usize;
+            let group_size = int4.group_size.max(0) as usize;
+            qwen36_parallel_chunks_mut(&mut output[..hidden], 64, |start, chunk| {
+                for (local, out) in chunk.iter_mut().enumerate() {
+                    let row = start + local;
+                    let acc = qwen36_dense_or_int4_dot_2d_unchecked(
+                        out_w, out_scale, out_zero, row, val_dim, group_size, rec_out,
+                    );
+                    let o_out = bf16_round_f32(acc);
+                    let residual = bf16_round_f32(bf16_bits_to_f32(input[row]) + o_out);
+                    *out = f32_to_bf16_bits(residual);
+                }
+            });
         });
     }
 
