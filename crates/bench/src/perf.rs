@@ -1,4 +1,4 @@
-use crate::runs::{PerfCellJson, PerfStatus, SCHEMA_VERSION};
+use crate::runs::{PerfCellJson, PerfStatus, ProfileEntryJson, ProfileJson, SCHEMA_VERSION};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -18,6 +18,8 @@ pub struct AttributionTimings {
     pub chain_breakdown: Option<BTreeMap<String, f64>>,
     pub lifecycle_timings: Option<BTreeMap<String, f64>>,
     pub mpp_pilot: Option<BTreeMap<String, f64>>,
+    pub metal_profile: Option<ProfileJson>,
+    pub hal_profile: Option<ProfileJson>,
 }
 
 #[derive(Debug, Clone)]
@@ -103,6 +105,8 @@ pub fn extract_attribution_timings(output: &str) -> AttributionTimings {
             .rev()
             .find(|l| l.starts_with("[qwen36-moe mpp-pilot]"))
             .map(parse_numeric_fields),
+        metal_profile: extract_profile(output, "[metal-profile]", "[metal-profile-op]", true),
+        hal_profile: extract_profile(output, "[hal-profile]", "[hal-profile-op]", false),
     }
 }
 
@@ -125,6 +129,55 @@ fn parse_numeric_fields(line: &str) -> BTreeMap<String, f64> {
                 .parse::<f64>()
                 .ok()?;
             Some((key.to_string(), value))
+        })
+        .collect()
+}
+
+fn extract_profile(
+    output: &str,
+    summary_prefix: &str,
+    entry_prefix: &str,
+    has_path: bool,
+) -> Option<ProfileJson> {
+    let summary_line = output
+        .lines()
+        .rev()
+        .find(|line| line.starts_with(summary_prefix))?;
+    let summary = parse_numeric_fields(summary_line);
+    let entries = output
+        .lines()
+        .filter(|line| line.starts_with(entry_prefix))
+        .filter_map(|line| parse_profile_entry(line, has_path))
+        .collect();
+    Some(ProfileJson { summary, entries })
+}
+
+fn parse_profile_entry(line: &str, has_path: bool) -> Option<ProfileEntryJson> {
+    let fields = parse_string_fields(line);
+    Some(ProfileEntryJson {
+        op: fields.get("op")?.to_string(),
+        path: if has_path {
+            fields.get("path").map(|value| value.to_string())
+        } else {
+            None
+        },
+        calls: fields.get("calls")?.parse().ok()?,
+        mean_ms: fields.get("mean_ms")?.parse().ok()?,
+        total_ms: fields.get("total_ms")?.parse().ok()?,
+        max_ms: fields.get("max_ms")?.parse().ok()?,
+        total_bytes: fields
+            .get("total_bytes")
+            .and_then(|value| value.parse().ok()),
+    })
+}
+
+fn parse_string_fields(line: &str) -> BTreeMap<String, String> {
+    line.split_whitespace()
+        .filter_map(|part| {
+            let part = part.trim_matches(|c| c == '(' || c == ')');
+            let (key, raw) = part.split_once('=')?;
+            let value = raw.trim_end_matches(|c: char| c == ',' || c == ')');
+            Some((key.to_string(), value.to_string()))
         })
         .collect()
 }
@@ -206,6 +259,8 @@ pub fn run_one_combo(invocation: &ComboInvocation, policy: &RunPolicy) -> Result
         chain_breakdown: attribution.chain_breakdown,
         lifecycle_timings: attribution.lifecycle_timings,
         mpp_pilot: attribution.mpp_pilot,
+        metal_profile: attribution.metal_profile,
+        hal_profile: attribution.hal_profile,
         gpu_temp_c_end: None,
     })
 }
@@ -223,7 +278,8 @@ fn invoke_supersonic(
         cmd.env("SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL", "0")
             .env("SUPERSONIC_QWEN36_DENSE_PREFILL_TOKEN_LOOP", "1");
         if emit_stage_timings {
-            cmd.env("SUPERSONIC_METAL_QWEN36_MPP_PILOT", "1");
+            cmd.env("SUPERSONIC_METAL_QWEN36_MPP_PILOT", "1")
+                .env("SUPERSONIC_METAL_PROFILE", "1");
         }
     }
     cmd.arg("--model")

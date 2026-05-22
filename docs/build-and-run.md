@@ -295,7 +295,11 @@ Metal currently rejects or defers:
   HIP-only.
 - `qwen3.6-35b-a3b` INT4 on Apple M5 Max uses the host-orchestrated chained
   decode route with Metal fallbacks for BF16 full-attention, linear-attention,
-  and FFN stages, plus INT4 sidecars for projection and expert matvecs. The
+  and FFN stages, plus INT4 sidecars for projection and expert matvecs. Stage-5
+  FFN projection work also has a narrowly gated native Metal INT4 attribution
+  path enabled by `SUPERSONIC_METAL_PROFILE=1` or
+  `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5=1`; the default lane keeps the
+  measured faster host fallback until the combined native path beats it. The
   one-token local smoke is:
   `cargo run --release --bin supersonic -- --backend metal --model qwen3.6-35b-a3b --model-dir /path/to/Qwen3.6-35B-A3B --int4 --prompt "Hello" --max-new-tokens 1 --emit-stage-timings`.
   FP8-runtime, KV-FP8, speculative decode, and persistent decode remain
@@ -313,6 +317,8 @@ Native Metal kernels used in the hot path:
 - full-attention prefill core
 - lm-head argmax
 - RMSNorm rows
+- Qwen3.6 stage-5 FFN INT4 projection kernels for profiling / opt-in
+  attribution
 - linear prefill conv pack
 - element add
 - cast
@@ -336,9 +342,12 @@ Current Apple M4 / Apple M5 Max checkpoint:
   `qwen3-30b-a3b` INT4, `gemma4-e2b` BF16/INT4, `gemma4-e4b` BF16/INT4, and
   `phi4-mini` BF16/INT4/FP8-runtime.
 
-The next optimization target is a persistent Metal megakernel — collapsing the
-per-token command-buffer round-trips into a single dispatch, equivalent to the
-HIP persistent decode path.
+The current Qwen3.6 optimization target is measured from the Apple M5 Max
+bench/profile loop rather than guessed up front. As of the latest local
+checkpoint, FFN fallback tightening brought the headline decode gate below
+330 ms/token; linear-attention is now the largest per-token attribution bucket,
+while the native FFN profile path still shows command-buffer wait as the thing
+to fix before making it default.
 
 ### Large model setup
 
@@ -393,18 +402,25 @@ SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" \
 
 SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" \
   python3 tests/metal/bench_qwen36_longctx.py --preset smoke
+
+SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" \
+  python3 tests/metal/bench_qwen36_longctx.py --preset smoke --metal-profile
 ```
 
 Use the long-context harness with `--preset comparison` before choosing the
 next Metal runtime optimization target. The report records generated-token
 sanity, NIAH hit/miss, stage timings, chain breakdown, and lifecycle timings
-for the supported INT4 chained-decode lane. The 512-token smoke is intentionally
-slow on the current chained Metal prefill path; treat the comparison preset as a
-long-running sweep rather than a per-commit unit gate.
-The current 512-token M5 Max smoke points at FFN as the measured next runtime
-target after host fallback row parallelism cut prefill from roughly 1001 seconds
-to roughly 160 seconds across FFN, linear-attention, and full-attention
-projection passes.
+for the supported INT4 chained-decode lane. With `--metal-profile`, it also sets
+`SUPERSONIC_METAL_PROFILE=1` and records parsed `metal_profile` and
+`hal_profile` summaries from the machine-readable profile lines. The 512-token
+smoke is intentionally slow on the current chained Metal prefill path; treat the
+comparison preset as a long-running sweep rather than a per-commit unit gate.
+The current M5 Max perf gate points at linear-attention as the next measured
+multi-token per-token bucket after FFN fallback tightening. The 512-token
+`--metal-profile` smoke currently reports roughly 269 ms/token, 71.7 s prefill,
+and a clear NIAH miss row; its one-token row is lm-head/tail dominated, while
+the Metal profile totals still point at FFN command-buffer wait. The native FFN
+opt-in path stays attribution-only until that command-buffer wait is reduced.
 
 ### Metal validation
 

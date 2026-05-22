@@ -102,6 +102,77 @@ def build_metal_env(base_env: dict[str, str]) -> dict[str, str]:
     return env
 
 
+def parse_key_values(line: str) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for part in line.split():
+        if "=" not in part:
+            continue
+        key, raw = part.split("=", 1)
+        values[key] = raw.rstrip(",)")
+    return values
+
+
+def parse_profile(output: str, summary_prefix: str, op_prefix: str) -> dict[str, Any] | None:
+    summary_lines = [line for line in output.splitlines() if line.startswith(summary_prefix)]
+    if not summary_lines:
+        return None
+    summary = {
+        key: float(value)
+        for key, value in parse_key_values(summary_lines[-1]).items()
+        if key not in {"op", "path"}
+    }
+    entries: list[dict[str, Any]] = []
+    for line in output.splitlines():
+        if not line.startswith(op_prefix):
+            continue
+        fields = parse_key_values(line)
+        entry: dict[str, Any] = {
+            "op": fields.get("op"),
+            "calls": int(fields.get("calls", "0")),
+            "mean_ms": float(fields.get("mean_ms", "0")),
+            "total_ms": float(fields.get("total_ms", "0")),
+            "max_ms": float(fields.get("max_ms", "0")),
+        }
+        if "path" in fields:
+            entry["path"] = fields["path"]
+        if "total_bytes" in fields:
+            entry["total_bytes"] = int(fields["total_bytes"])
+        entries.append(entry)
+    return {"summary": summary, "entries": entries}
+
+
+def append_profile_markdown(md: str, rows: list[dict[str, Any]]) -> str:
+    profiled = [row for row in rows if row.get("metal_profile") or row.get("hal_profile")]
+    if not profiled:
+        return md
+    lines = [
+        "",
+        "### Metal/HAL profile",
+        "",
+        "| Context | Metal total ms | Top Metal op | Top Metal ms | HAL total ms |",
+        "|---:|---:|:---|---:|---:|",
+    ]
+    for row in profiled:
+        metal = row.get("metal_profile") or {}
+        hal = row.get("hal_profile") or {}
+        entries = metal.get("entries") or []
+        top = max(entries, key=lambda item: item.get("total_ms") or 0.0) if entries else {}
+        metal_total = (metal.get("summary") or {}).get("total_ms")
+        hal_total = (hal.get("summary") or {}).get("total_ms")
+        lines.append(
+            "| {ctx} | {metal_total} | {op} | {op_total} | {hal_total} |".format(
+                ctx=row.get("context_tokens_requested"),
+                metal_total=f"{metal_total:.3f}" if metal_total is not None else "",
+                op=top.get("op") or "",
+                op_total=(
+                    f"{top.get('total_ms'):.3f}" if top.get("total_ms") is not None else ""
+                ),
+                hal_total=f"{hal_total:.3f}" if hal_total is not None else "",
+            )
+        )
+    return md.rstrip() + "\n" + "\n".join(lines) + "\n"
+
+
 def run_one(
     args: argparse.Namespace,
     context_tokens: int,
@@ -110,6 +181,8 @@ def run_one(
     warmup: bool,
 ) -> dict[str, Any]:
     env = build_metal_env(os.environ)
+    if args.metal_profile and not warmup:
+        env["SUPERSONIC_METAL_PROFILE"] = "1"
     cmd = [
         str(args.binary),
         "--backend",
@@ -173,6 +246,8 @@ def run_one(
             "stage": BASE.parse_stage_timings(output),
             "chain_breakdown": BASE.parse_chain_breakdown(output),
             "lifecycle": BASE.parse_lifecycle_timings(output),
+            "metal_profile": parse_profile(output, "[metal-profile]", "[metal-profile-op]"),
+            "hal_profile": parse_profile(output, "[hal-profile]", "[hal-profile-op]"),
             "result": BASE.parse_result(output),
             "vmm_residency": BASE.dense_vmm_residency(output),
             "stdout_tail": stdout[-1600:],
@@ -199,6 +274,8 @@ def run_one(
         "stage": BASE.parse_stage_timings(output),
         "chain_breakdown": BASE.parse_chain_breakdown(output),
         "lifecycle": BASE.parse_lifecycle_timings(output),
+        "metal_profile": parse_profile(output, "[metal-profile]", "[metal-profile-op]"),
+        "hal_profile": parse_profile(output, "[hal-profile]", "[hal-profile-op]"),
         "result": BASE.parse_result(output),
         "vmm_residency": BASE.dense_vmm_residency(output),
         "stdout_tail": proc.stdout[-1600:],
@@ -242,6 +319,11 @@ def main() -> int:
         "--out-md",
         type=Path,
         default=Path("target/qwen36_metal_longctx.md"),
+    )
+    parser.add_argument(
+        "--metal-profile",
+        action="store_true",
+        help="enable SUPERSONIC_METAL_PROFILE for measured runs and include profile summaries",
     )
     args = apply_preset_defaults(parser.parse_args())
     args.model_dir = resolve_model_dir(args.model_dir, os.environ)
@@ -288,7 +370,7 @@ def main() -> int:
             )
 
     summary = BASE.summarize(rows)
-    md = BASE.markdown(rows, summary)
+    md = append_profile_markdown(BASE.markdown(rows, summary), rows)
     payload = {
         "schema": SCHEMA,
         "model": MODEL,
@@ -298,6 +380,7 @@ def main() -> int:
         "contexts": contexts,
         "modes": ["int4"],
         "max_new_tokens": args.max_new_tokens,
+        "metal_profile": args.metal_profile,
         "seed": args.seed,
         "summary": summary,
         "recommendation": BASE.recommendation(summary),

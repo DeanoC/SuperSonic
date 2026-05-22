@@ -27,7 +27,7 @@
 use std::ptr;
 
 use anyhow::{anyhow, Context, Result};
-use gpu_hal::{copy_d2h, memset_zeros, GpuBuffer, GpuError, ScalarType};
+use gpu_hal::{copy_d2h, memset_zeros, Backend, GpuBuffer, GpuError, ScalarType};
 use kernel_ffi::qwen36_moe::{
     attn_step_launch, ffn_step_launch, linear_step_launch, Qwen36MoeAttnStepInt4,
     Qwen36MoeAttnStepParams, Qwen36MoeAttnStepWeights, Qwen36MoeFfnStepInt4,
@@ -120,6 +120,14 @@ pub(crate) fn ffn_output_elems(geom: &MultiLayerGeom) -> usize {
 ///   (padding to 96 bytes for alignment headroom)
 pub(crate) fn reset_sync_buf(ordinal: usize, sync_buf: &mut GpuBuffer) -> Result<(), GpuError> {
     memset_zeros(ordinal, sync_buf.as_mut_ptr(), 96)
+}
+
+fn sync_metal_queue_for_host_read(buffer: &GpuBuffer, label: &str) -> Result<()> {
+    if buffer.backend() == Backend::Metal {
+        kernel_ffi::prefill_ffi::sync_metal_queue()
+            .map_err(|e| anyhow!("{label} Metal queue sync: {e}"))?;
+    }
+    Ok(())
 }
 
 /// Copy `[hidden]` BF16 elements out of a GPU buffer into a freshly
@@ -841,13 +849,14 @@ fn run_chained_decode_impl_with_cache_pos(
                 .context("reset sync_buf (ffn after prefetch)")?;
         }
         let t_k = std::time::Instant::now();
+        let ffn_stage5_output = output_buf;
         ffn_step_launch(
             ordinal,
             ScalarType::BF16,
             params_stage5,
             &ffn_weights,
             &ffn_int4_ptrs,
-            &mut ffn_output,
+            ffn_stage5_output,
             &mut ffn_output_idx,
             &mut ffn_workspace,
             &mut sync_buf,
@@ -858,18 +867,11 @@ fn run_chained_decode_impl_with_cache_pos(
         }
         t_ffn += t_k.elapsed();
 
-        // Same D2D + swap as the attn step.
-        gpu_hal::copy_d2d(
-            ordinal,
-            output_buf.as_mut_ptr(),
-            ffn_output.as_ptr(),
-            hidden * 2,
-        )
-        .context("d2d ffn_output -> residual")?;
         front = 1 - front;
 
         if capture {
-            let ffn_out_bytes = download_hidden_bf16(ordinal, output_buf, hidden)
+            sync_metal_queue_for_host_read(ffn_stage5_output, "download per-layer ffn output")?;
+            let ffn_out_bytes = download_hidden_bf16(ordinal, ffn_stage5_output, hidden)
                 .context("download per-layer ffn output")?;
             if trace_norms {
                 let v = bf16_bytes_to_f32(&ffn_out_bytes);
@@ -885,6 +887,7 @@ fn run_chained_decode_impl_with_cache_pos(
     }
 
     let final_buf = if front == 0 { &hidden_a } else { &hidden_b };
+    sync_metal_queue_for_host_read(final_buf, "download final hidden")?;
     let final_hidden_bytes =
         download_hidden_bf16(ordinal, final_buf, hidden).context("download final hidden")?;
 

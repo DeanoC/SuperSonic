@@ -15,6 +15,7 @@ unsafe extern "C" {
     fn supersonic_metal_batch_set_label(label: *const c_char) -> c_int;
     fn supersonic_metal_batch_end() -> c_int;
     fn supersonic_metal_batch_is_active() -> c_int;
+    fn supersonic_metal_queue_sync() -> c_int;
     fn supersonic_metal_copy_d2d(
         src_ptr: *const c_void,
         dst_ptr: *mut c_void,
@@ -92,6 +93,34 @@ unsafe extern "C" {
         scale_ptr: *const c_void,
         zero_ptr: *const c_void,
         out_ptr: *mut c_void,
+    ) -> c_int;
+    fn supersonic_metal_qwen36_ffn_int4_stage5(
+        hidden: usize,
+        num_experts: usize,
+        moe_intermediate: usize,
+        shared_intermediate: usize,
+        top_k: usize,
+        group_size: usize,
+        input_hidden_ptr: *const c_void,
+        shared_expert_gate_ptr: *const c_void,
+        shared_gate_proj_ptr: *const c_void,
+        shared_gate_scale_ptr: *const c_void,
+        shared_gate_zero_ptr: *const c_void,
+        shared_up_proj_ptr: *const c_void,
+        shared_up_scale_ptr: *const c_void,
+        shared_up_zero_ptr: *const c_void,
+        shared_down_proj_ptr: *const c_void,
+        shared_down_scale_ptr: *const c_void,
+        shared_down_zero_ptr: *const c_void,
+        gate_up_proj_ptr: *const c_void,
+        gate_up_scale_ptr: *const c_void,
+        gate_up_zero_ptr: *const c_void,
+        down_proj_ptr: *const c_void,
+        down_scale_ptr: *const c_void,
+        down_zero_ptr: *const c_void,
+        workspace_ptr: *mut c_void,
+        output_ptr: *mut c_void,
+        wait_for_completion: c_int,
     ) -> c_int;
     fn supersonic_metal_matmul_rhs_transposed_f32(
         batch_elems: usize,
@@ -673,6 +702,18 @@ pub(crate) fn flush_batch() -> Result<(), GpuError> {
 }
 
 #[cfg(all(target_os = "macos", supersonic_backend_metal))]
+pub(crate) fn queue_sync() -> Result<(), GpuError> {
+    let status = unsafe { supersonic_metal_queue_sync() };
+    if status != 0 {
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!("metal native queue sync failed with status {status}"),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
 pub(crate) fn batch_is_active() -> bool {
     unsafe { supersonic_metal_batch_is_active() != 0 }
 }
@@ -1210,6 +1251,88 @@ pub(crate) fn matmul_rhs_transposed_int4_bf16_gemv_m1_tiled(
             format!(
             "metal native matmul_rhs_transposed_int4_bf16_gemv_m1_tiled failed with status {status}"
         ),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn qwen36_ffn_int4_stage5(
+    hidden: usize,
+    num_experts: usize,
+    moe_intermediate: usize,
+    shared_intermediate: usize,
+    top_k: usize,
+    group_size: usize,
+    input_hidden: *const c_void,
+    shared_expert_gate: *const c_void,
+    shared_gate_proj: *const c_void,
+    shared_gate_scale: *const c_void,
+    shared_gate_zero: *const c_void,
+    shared_up_proj: *const c_void,
+    shared_up_scale: *const c_void,
+    shared_up_zero: *const c_void,
+    shared_down_proj: *const c_void,
+    shared_down_scale: *const c_void,
+    shared_down_zero: *const c_void,
+    gate_up_proj: *const c_void,
+    gate_up_scale: *const c_void,
+    gate_up_zero: *const c_void,
+    down_proj: *const c_void,
+    down_scale: *const c_void,
+    down_zero: *const c_void,
+    workspace: *mut c_void,
+    output: *mut c_void,
+    wait_for_completion: bool,
+) -> Result<(), GpuError> {
+    if hidden == 0
+        || num_experts == 0
+        || moe_intermediate == 0
+        || shared_intermediate == 0
+        || top_k == 0
+        || group_size == 0
+        || workspace.is_null()
+        || output.is_null()
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native qwen36_ffn_int4_stage5 invalid shape: hidden={hidden} num_experts={num_experts} moe_intermediate={moe_intermediate} shared_intermediate={shared_intermediate} top_k={top_k} group_size={group_size}"
+        )));
+    }
+    let status = unsafe {
+        supersonic_metal_qwen36_ffn_int4_stage5(
+            hidden,
+            num_experts,
+            moe_intermediate,
+            shared_intermediate,
+            top_k,
+            group_size,
+            input_hidden,
+            shared_expert_gate,
+            shared_gate_proj,
+            shared_gate_scale,
+            shared_gate_zero,
+            shared_up_proj,
+            shared_up_scale,
+            shared_up_zero,
+            shared_down_proj,
+            shared_down_scale,
+            shared_down_zero,
+            gate_up_proj,
+            gate_up_scale,
+            gate_up_zero,
+            down_proj,
+            down_scale,
+            down_zero,
+            workspace,
+            output,
+            i32::from(wait_for_completion),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!("metal native qwen36_ffn_int4_stage5 failed with status {status}"),
         ));
     }
     Ok(())
@@ -3491,6 +3614,11 @@ pub(crate) fn flush_batch() -> Result<(), GpuError> {
 }
 
 #[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+pub(crate) fn queue_sync() -> Result<(), GpuError> {
+    Ok(())
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
 pub(crate) fn batch_is_active() -> bool {
     false
 }
@@ -3783,6 +3911,42 @@ pub(crate) fn matmul_rhs_transposed_int4_bf16_gemv_m1_tiled(
     Err(GpuError::backend(
         Backend::Metal,
         "metal native matmul_rhs_transposed_int4_bf16_gemv_m1_tiled is not compiled".into(),
+    ))
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn qwen36_ffn_int4_stage5(
+    _hidden: usize,
+    _num_experts: usize,
+    _moe_intermediate: usize,
+    _shared_intermediate: usize,
+    _top_k: usize,
+    _group_size: usize,
+    _input_hidden: *const c_void,
+    _shared_expert_gate: *const c_void,
+    _shared_gate_proj: *const c_void,
+    _shared_gate_scale: *const c_void,
+    _shared_gate_zero: *const c_void,
+    _shared_up_proj: *const c_void,
+    _shared_up_scale: *const c_void,
+    _shared_up_zero: *const c_void,
+    _shared_down_proj: *const c_void,
+    _shared_down_scale: *const c_void,
+    _shared_down_zero: *const c_void,
+    _gate_up_proj: *const c_void,
+    _gate_up_scale: *const c_void,
+    _gate_up_zero: *const c_void,
+    _down_proj: *const c_void,
+    _down_scale: *const c_void,
+    _down_zero: *const c_void,
+    _workspace: *mut c_void,
+    _output: *mut c_void,
+    _wait_for_completion: bool,
+) -> Result<(), GpuError> {
+    Err(GpuError::backend(
+        Backend::Metal,
+        "metal native qwen36_ffn_int4_stage5 is not compiled".into(),
     ))
 }
 

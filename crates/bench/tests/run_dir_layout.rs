@@ -42,6 +42,8 @@ fn perf_cell_json_status_variants() {
         chain_breakdown: None,
         lifecycle_timings: None,
         mpp_pilot: None,
+        metal_profile: None,
+        hal_profile: None,
         gpu_temp_c_end: Some(60.0),
     };
     let s = serde_json::to_string(&ok).unwrap();

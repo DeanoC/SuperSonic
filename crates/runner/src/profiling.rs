@@ -33,6 +33,10 @@ impl Drop for MetalProfileScope {
             metal.total_calls, metal.total_ms, metal.native_ms, metal.host_ms
         );
         eprintln!(
+            "[metal-profile] calls={} total_ms={:.3} native_ms={:.3} host_ms={:.3}",
+            metal.total_calls, metal.total_ms, metal.native_ms, metal.host_ms
+        );
+        eprintln!(
             "{:<48} {:>10} {:>10} {:>12} {:>12}",
             "op (path)", "calls", "mean_ms", "total_ms", "max_ms"
         );
@@ -50,11 +54,32 @@ impl Drop for MetalProfileScope {
                 entry.total_ms,
                 entry.max_ms
             );
+            eprintln!(
+                "[metal-profile-op] op={} path={} calls={} mean_ms={:.4} total_ms={:.3} max_ms={:.3}",
+                entry.op,
+                entry.path,
+                entry.calls,
+                mean_ms,
+                entry.total_ms,
+                entry.max_ms,
+            );
         }
         eprintln!();
         eprintln!("=== HAL op profile (gpu_hal level) ===");
         eprintln!(
             "calls={} total_ms={:.3} alloc_calls={} alloc_bytes={} h2d={} d2h={} d2d={} memset={} sync_calls={}",
+            hal.total_calls,
+            hal.total_ms,
+            hal.alloc_calls,
+            hal.alloc_bytes,
+            hal.h2d_bytes,
+            hal.d2h_bytes,
+            hal.d2d_bytes,
+            hal.memset_bytes,
+            hal.sync_calls,
+        );
+        eprintln!(
+            "[hal-profile] calls={} total_ms={:.3} alloc_calls={} alloc_bytes={} h2d={} d2h={} d2d={} memset={} sync_calls={}",
             hal.total_calls,
             hal.total_ms,
             hal.alloc_calls,
@@ -78,6 +103,15 @@ impl Drop for MetalProfileScope {
             eprintln!(
                 "{:<32} {:>10} {:>10.4} {:>12.3} {:>12.3} {:>14}",
                 entry.op, entry.calls, mean_ms, entry.total_ms, entry.max_ms, entry.total_bytes
+            );
+            eprintln!(
+                "[hal-profile-op] op={} calls={} mean_ms={:.4} total_ms={:.3} max_ms={:.3} total_bytes={}",
+                entry.op,
+                entry.calls,
+                mean_ms,
+                entry.total_ms,
+                entry.max_ms,
+                entry.total_bytes,
             );
         }
         kernel_ffi::prefill_ffi::metal_profile_set_enabled(false);

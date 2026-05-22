@@ -79,6 +79,36 @@ class Qwen36MetalLongContextBenchTests(unittest.TestCase):
         self.assertNotIn("SUPERSONIC_MOE_ISLAND_CAP_EXPERTS", env)
         self.assertNotIn("SUPERSONIC_MOE_ISLAND_TELEMETRY_JSON", env)
 
+    def test_parse_profile_extracts_summary_and_entries(self):
+        output = """
+[metal-profile] calls=2 total_ms=12.000 native_ms=10.000 host_ms=2.000
+[metal-profile-op] op=qwen36_ffn_int4_stage5 path=native calls=1 mean_ms=10.0000 total_ms=10.000 max_ms=10.000
+"""
+        profile = bench_qwen36_metal_longctx.parse_profile(
+            output, "[metal-profile]", "[metal-profile-op]"
+        )
+        self.assertIsNotNone(profile)
+        self.assertEqual(profile["summary"]["native_ms"], 10.0)
+        self.assertEqual(profile["entries"][0]["op"], "qwen36_ffn_int4_stage5")
+        self.assertEqual(profile["entries"][0]["path"], "native")
+
+    def test_append_profile_markdown_adds_profile_table(self):
+        md = bench_qwen36_metal_longctx.append_profile_markdown(
+            "# report\n",
+            [
+                {
+                    "context_tokens_requested": 512,
+                    "metal_profile": {
+                        "summary": {"total_ms": 12.0},
+                        "entries": [{"op": "qwen36_ffn_int4_stage5", "total_ms": 10.0}],
+                    },
+                    "hal_profile": {"summary": {"total_ms": 1.0}, "entries": []},
+                }
+            ],
+        )
+        self.assertIn("Metal/HAL profile", md)
+        self.assertIn("qwen36_ffn_int4_stage5", md)
+
 
 if __name__ == "__main__":
     unittest.main()

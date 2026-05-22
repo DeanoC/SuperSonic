@@ -292,6 +292,10 @@ pub fn flush_metal_batch() -> Result<(), GpuError> {
     metal_native::flush_batch()
 }
 
+pub fn sync_metal_queue() -> Result<(), GpuError> {
+    metal_native::queue_sync()
+}
+
 /// True when a Metal batch is currently open (i.e. ops will be accumulated
 /// into the shared command buffer rather than committing one-by-one).
 /// Always false on non-Metal builds.

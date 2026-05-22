@@ -2503,6 +2503,40 @@ impl Qwen36MoeFfnStepInt4 {
     }
 }
 
+fn qwen36_ffn_int4_stage5_metal_native_supported(
+    params: Qwen36MoeFfnStepParams,
+    weights: &Qwen36MoeFfnStepWeights,
+    int4: &Qwen36MoeFfnStepInt4,
+) -> bool {
+    (std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5").is_some()
+        || std::env::var_os("SUPERSONIC_METAL_PROFILE").is_some())
+        && params.stage == 5
+        && params.hidden == 2048
+        && params.num_experts == 256
+        && params.moe_intermediate == 512
+        && params.shared_intermediate == 512
+        && params.top_k == 8
+        && int4.group_size == 128
+        && !crate::metal_native::disabled_by_env()
+        && !weights.input_hidden.is_null()
+        && !weights.shared_expert_gate_w.is_null()
+        && !weights.shared_gate_proj_w.is_null()
+        && !weights.shared_up_proj_w.is_null()
+        && !weights.shared_down_proj_w.is_null()
+        && !weights.gate_up_proj_w.is_null()
+        && !weights.down_proj_w.is_null()
+        && !int4.shared_gate_proj_scale.is_null()
+        && !int4.shared_gate_proj_zero.is_null()
+        && !int4.shared_up_proj_scale.is_null()
+        && !int4.shared_up_proj_zero.is_null()
+        && !int4.shared_down_proj_scale.is_null()
+        && !int4.shared_down_proj_zero.is_null()
+        && !int4.gate_up_proj_scale.is_null()
+        && !int4.gate_up_proj_zero.is_null()
+        && !int4.down_proj_scale.is_null()
+        && !int4.down_proj_zero.is_null()
+}
+
 /// Safe wrapper for the PR 4b4 staged MoE FFN parity launcher.
 ///
 /// `output` must be a BF16 buffer with at least `max(top_k, hidden)` elements
@@ -2860,6 +2894,43 @@ fn ffn_step_stage1_5_metal_host(
         int4.group_size,
         "down_proj",
     )?;
+
+    if qwen36_ffn_int4_stage5_metal_native_supported(params, weights, int4) {
+        return crate::prefill_ffi::metal_profile_time(
+            "qwen36_ffn_int4_stage5",
+            "native",
+            || unsafe {
+                crate::metal_native::qwen36_ffn_int4_stage5(
+                    hidden,
+                    num_experts,
+                    moe_intermediate,
+                    shared_intermediate,
+                    top_k,
+                    int4.group_size as usize,
+                    weights.input_hidden,
+                    weights.shared_expert_gate_w,
+                    weights.shared_gate_proj_w,
+                    int4.shared_gate_proj_scale,
+                    int4.shared_gate_proj_zero,
+                    weights.shared_up_proj_w,
+                    int4.shared_up_proj_scale,
+                    int4.shared_up_proj_zero,
+                    weights.shared_down_proj_w,
+                    int4.shared_down_proj_scale,
+                    int4.shared_down_proj_zero,
+                    weights.gate_up_proj_w,
+                    int4.gate_up_proj_scale,
+                    int4.gate_up_proj_zero,
+                    weights.down_proj_w,
+                    int4.down_proj_scale,
+                    int4.down_proj_zero,
+                    workspace.as_mut_ptr() as *mut c_void,
+                    output.as_mut_ptr() as *mut c_void,
+                    true,
+                )
+            },
+        );
+    }
 
     let h_norm = workspace[off_h_norm..off_h_norm + hidden].to_vec();
     {
@@ -3324,18 +3395,28 @@ fn qwen36_dense_or_int4_dot_2d_unchecked(
     let scale_cols = cols.div_ceil(group_size);
     let packed_base = row * byte_cols;
     let scale_base = (row / group_size) * scale_cols;
-    for col in 0..cols {
-        let byte = unsafe { *packed.add(packed_base + col / 2) };
-        let nibble = if col & 1 == 0 {
-            byte & 0x0f
-        } else {
-            (byte >> 4) & 0x0f
-        };
-        let scale_idx = scale_base + col / group_size;
+    for scale_col in 0..scale_cols {
+        let group_start = scale_col * group_size;
+        let group_end = cols.min(group_start + group_size);
+        let scale_idx = scale_base + scale_col;
         let s = bf16_bits_to_f32(unsafe { *scale.add(scale_idx) });
         let z = bf16_bits_to_f32(unsafe { *zero.add(scale_idx) });
-        let w = bf16_round_f32(nibble as f32 * s - z * s);
-        acc += w * x[col];
+        let zs = z * s;
+        let mut col = group_start;
+        let mut byte_idx = packed_base + group_start / 2;
+        while col + 1 < group_end {
+            let byte = unsafe { *packed.add(byte_idx) };
+            let w0 = bf16_round_f32((byte & 0x0f) as f32 * s - zs);
+            let w1 = bf16_round_f32(((byte >> 4) & 0x0f) as f32 * s - zs);
+            acc += w0 * x[col] + w1 * x[col + 1];
+            col += 2;
+            byte_idx += 1;
+        }
+        if col < group_end {
+            let byte = unsafe { *packed.add(byte_idx) };
+            let w = bf16_round_f32((byte & 0x0f) as f32 * s - zs);
+            acc += w * x[col];
+        }
     }
     acc
 }
@@ -3369,18 +3450,28 @@ fn qwen36_expert_dense_or_int4_dot_unchecked(
     let scale_cols = cols.div_ceil(group_size);
     let packed_base = (expert * rows + row) * byte_cols;
     let scale_base = (expert * scale_rows + row / group_size) * scale_cols;
-    for col in 0..cols {
-        let byte = unsafe { *packed.add(packed_base + col / 2) };
-        let nibble = if col & 1 == 0 {
-            byte & 0x0f
-        } else {
-            (byte >> 4) & 0x0f
-        };
-        let scale_idx = scale_base + col / group_size;
+    for scale_col in 0..scale_cols {
+        let group_start = scale_col * group_size;
+        let group_end = cols.min(group_start + group_size);
+        let scale_idx = scale_base + scale_col;
         let s = bf16_bits_to_f32(unsafe { *scale.add(scale_idx) });
         let z = bf16_bits_to_f32(unsafe { *zero.add(scale_idx) });
-        let w = bf16_round_f32(nibble as f32 * s - z * s);
-        acc += w * x[col];
+        let zs = z * s;
+        let mut col = group_start;
+        let mut byte_idx = packed_base + group_start / 2;
+        while col + 1 < group_end {
+            let byte = unsafe { *packed.add(byte_idx) };
+            let w0 = bf16_round_f32((byte & 0x0f) as f32 * s - zs);
+            let w1 = bf16_round_f32(((byte >> 4) & 0x0f) as f32 * s - zs);
+            acc += w0 * x[col] + w1 * x[col + 1];
+            col += 2;
+            byte_idx += 1;
+        }
+        if col < group_end {
+            let byte = unsafe { *packed.add(byte_idx) };
+            let w = bf16_round_f32((byte & 0x0f) as f32 * s - zs);
+            acc += w * x[col];
+        }
     }
     acc
 }
