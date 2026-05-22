@@ -89,6 +89,34 @@ struct Qwen36FfnInt4Params {
     uint32_t off_moe_out;
 };
 
+struct Qwen36LinearInt4Params {
+    uint32_t hidden;
+    uint32_t num_k_heads;
+    uint32_t num_v_heads;
+    uint32_t head_k_dim;
+    uint32_t head_v_dim;
+    uint32_t conv_kernel_dim;
+    uint32_t group_size;
+    uint32_t key_dim;
+    uint32_t val_dim;
+    uint32_t qkv_dim;
+    uint32_t kstate;
+    uint32_t has_conv1d_bias;
+    uint32_t off_qkv_raw;
+    uint32_t off_z_raw;
+    uint32_t off_a_raw;
+    uint32_t off_b_raw;
+    uint32_t off_q_normed;
+    uint32_t off_k_normed;
+    uint32_t off_q_rep;
+    uint32_t off_k_rep;
+    uint32_t off_beta;
+    uint32_t off_g;
+    uint32_t off_rec_out;
+    float rms_norm_eps;
+    float q_scale;
+};
+
 struct QwenFullProjectionParams {
     uint32_t hidden_dim;
     uint32_t q_proj_dim;
@@ -1998,6 +2026,454 @@ kernel void supersonic_qwen_mlp_down_residual_bf16(
         *error_out = build_error;
     }
     return pipeline;
+}
+
+struct Qwen36LinearInt4Pipelines {
+    __strong id<MTLComputePipelineState> input_norm = nil;
+    __strong id<MTLComputePipelineState> projections = nil;
+    __strong id<MTLComputePipelineState> conv_silu_state = nil;
+    __strong id<MTLComputePipelineState> qk_norm_repeat = nil;
+    __strong id<MTLComputePipelineState> recurrent_update = nil;
+    __strong id<MTLComputePipelineState> output_gate_norm = nil;
+    __strong id<MTLComputePipelineState> out_proj_finalize = nil;
+};
+
+Qwen36LinearInt4Pipelines qwen36_linear_int4_pipelines(NSError** error_out) {
+    static std::mutex mutex;
+    static bool attempted = false;
+    static Qwen36LinearInt4Pipelines pipelines;
+    static __strong NSError* build_error = nil;
+
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!attempted) {
+        attempted = true;
+        @autoreleasepool {
+            id<MTLDevice> device = metal_device();
+            if (device == nil) {
+                build_error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                                   code:1100
+                                               userInfo:@{NSLocalizedDescriptionKey : @"No Metal device"}];
+            } else {
+                static const char* kSource = R"QWEN36LINEAR(
+#include <metal_stdlib>
+using namespace metal;
+
+struct Qwen36LinearInt4Params {
+    uint hidden;
+    uint num_k_heads;
+    uint num_v_heads;
+    uint head_k_dim;
+    uint head_v_dim;
+    uint conv_kernel_dim;
+    uint group_size;
+    uint key_dim;
+    uint val_dim;
+    uint qkv_dim;
+    uint kstate;
+    uint has_conv1d_bias;
+    uint off_qkv_raw;
+    uint off_z_raw;
+    uint off_a_raw;
+    uint off_b_raw;
+    uint off_q_normed;
+    uint off_k_normed;
+    uint off_q_rep;
+    uint off_k_rep;
+    uint off_beta;
+    uint off_g;
+    uint off_rec_out;
+    float rms_norm_eps;
+    float q_scale;
+};
+
+inline float bf16_round_rne_finite(float x) {
+    uint bits = as_type<uint>(x);
+    uint rounding_bias = 0x7FFFu + ((bits >> 16) & 1u);
+    bits += rounding_bias;
+    bits &= 0xFFFF0000u;
+    return as_type<float>(bits);
+}
+
+inline float silu(float x) {
+    return x * (1.0f / (1.0f + exp(-x)));
+}
+
+inline float int4_weight_2d(
+    device const uchar* packed,
+    device const bfloat* scale,
+    device const bfloat* zero,
+    uint row,
+    uint col,
+    uint cols,
+    uint group_size
+) {
+    uint byte_cols = (cols + 1u) / 2u;
+    uint scale_cols = (cols + group_size - 1u) / group_size;
+    uint packed_byte = uint(packed[row * byte_cols + (col >> 1u)]);
+    uint nibble = (col & 1u) != 0u ? ((packed_byte >> 4u) & 0xFu) : (packed_byte & 0xFu);
+    uint scale_idx = (row / group_size) * scale_cols + (col / group_size);
+    float s = float(scale[scale_idx]);
+    float z = float(zero[scale_idx]);
+    return bf16_round_rne_finite(float(nibble) * s - z * s);
+}
+
+kernel void supersonic_qwen36_linear_input_norm(
+    device const bfloat* input_hidden [[buffer(0)]],
+    device const bfloat* input_norm_w [[buffer(1)]],
+    device bfloat* output [[buffer(2)]],
+    constant Qwen36LinearInt4Params& params [[buffer(3)]],
+    threadgroup float* partials [[threadgroup(0)]],
+    uint thread_id [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_id [[simdgroup_index_in_threadgroup]]
+) {
+    float partial = 0.0f;
+    for (uint col = thread_id; col < params.hidden; col += 1024u) {
+        float v = float(input_hidden[col]);
+        partial += v * v;
+    }
+    float simd_partial = simd_sum(partial);
+    if (simd_lane == 0) {
+        partials[simd_id] = simd_partial;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float total = 0.0f;
+    if (simd_id == 0) {
+        float x = simd_lane < 32u ? partials[simd_lane] : 0.0f;
+        float sum = simd_sum(x);
+        if (simd_lane == 0) {
+            partials[0] = sum;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    total = partials[0];
+    float inv_rms = 1.0f / sqrt(total / float(params.hidden) + params.rms_norm_eps);
+    for (uint col = thread_id; col < params.hidden; col += 1024u) {
+        float v = float(input_hidden[col]);
+        float w = float(input_norm_w[col]);
+        output[col] = bfloat(bf16_round_rne_finite(v * inv_rms * (1.0f + w)));
+    }
+}
+
+kernel void supersonic_qwen36_linear_projections(
+    device const bfloat* x_norm [[buffer(0)]],
+    device const uchar* in_proj_qkv [[buffer(1)]],
+    device const bfloat* in_proj_qkv_scale [[buffer(2)]],
+    device const bfloat* in_proj_qkv_zero [[buffer(3)]],
+    device const uchar* in_proj_z [[buffer(4)]],
+    device const bfloat* in_proj_z_scale [[buffer(5)]],
+    device const bfloat* in_proj_z_zero [[buffer(6)]],
+    device const bfloat* in_proj_a [[buffer(7)]],
+    device const bfloat* in_proj_b [[buffer(8)]],
+    device float* workspace [[buffer(9)]],
+    constant Qwen36LinearInt4Params& params [[buffer(10)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_position_in_threadgroup]]
+) {
+    uint ab_base = params.qkv_dim + params.val_dim;
+    uint total_rows = ab_base + 2u * params.num_v_heads;
+    if (row >= total_rows) {
+        return;
+    }
+    float partial = 0.0f;
+    if (row < params.qkv_dim) {
+        for (uint col = lane; col < params.hidden; col += 32u) {
+            partial += int4_weight_2d(
+                in_proj_qkv, in_proj_qkv_scale, in_proj_qkv_zero,
+                row, col, params.hidden, params.group_size
+            ) * float(x_norm[col]);
+        }
+        float acc = simd_sum(partial);
+        if (lane == 0) {
+            workspace[params.off_qkv_raw + row] = bf16_round_rne_finite(acc);
+        }
+    } else if (row < ab_base) {
+        uint z_row = row - params.qkv_dim;
+        for (uint col = lane; col < params.hidden; col += 32u) {
+            partial += int4_weight_2d(
+                in_proj_z, in_proj_z_scale, in_proj_z_zero,
+                z_row, col, params.hidden, params.group_size
+            ) * float(x_norm[col]);
+        }
+        float acc = simd_sum(partial);
+        if (lane == 0) {
+            workspace[params.off_z_raw + z_row] = bf16_round_rne_finite(acc);
+        }
+    } else {
+        uint ab_row = row - ab_base;
+        bool is_b = ab_row >= params.num_v_heads;
+        uint head = is_b ? ab_row - params.num_v_heads : ab_row;
+        for (uint col = lane; col < params.hidden; col += 32u) {
+            uint idx = head * params.hidden + col;
+            float w = is_b ? float(in_proj_b[idx]) : float(in_proj_a[idx]);
+            partial += w * float(x_norm[col]);
+        }
+        float acc = simd_sum(partial);
+        if (lane == 0) {
+            uint out_off = is_b ? params.off_b_raw + head : params.off_a_raw + head;
+            workspace[out_off] = bf16_round_rne_finite(acc);
+        }
+    }
+}
+
+kernel void supersonic_qwen36_linear_conv_silu_state(
+    device float* workspace [[buffer(0)]],
+    device const bfloat* conv1d_w [[buffer(1)]],
+    device const bfloat* conv1d_bias [[buffer(2)]],
+    device bfloat* conv_state [[buffer(3)]],
+    constant Qwen36LinearInt4Params& params [[buffer(4)]],
+    uint ch [[thread_position_in_grid]]
+) {
+    if (ch >= params.qkv_dim) {
+        return;
+    }
+    float new_qkv = workspace[params.off_qkv_raw + ch];
+    float acc = 0.0f;
+    for (uint t = 0; t < params.kstate; ++t) {
+        acc += float(conv_state[ch * params.kstate + t]) *
+               float(conv1d_w[ch * params.conv_kernel_dim + t]);
+    }
+    acc += new_qkv * float(conv1d_w[ch * params.conv_kernel_dim + params.kstate]);
+    if (params.has_conv1d_bias != 0u) {
+        acc += float(conv1d_bias[ch]);
+    }
+    float conv_out = bf16_round_rne_finite(acc);
+    workspace[params.off_qkv_raw + ch] = bf16_round_rne_finite(silu(conv_out));
+
+    if (params.kstate > 0u) {
+        for (uint t = 0; t + 1u < params.kstate; ++t) {
+            conv_state[ch * params.kstate + t] = conv_state[ch * params.kstate + t + 1u];
+        }
+        conv_state[ch * params.kstate + (params.kstate - 1u)] = bfloat(new_qkv);
+    }
+}
+
+kernel void supersonic_qwen36_linear_qk_norm_repeat(
+    device float* workspace [[buffer(0)]],
+    constant Qwen36LinearInt4Params& params [[buffer(1)]],
+    uint head [[threadgroup_position_in_grid]],
+    uint lane [[thread_position_in_threadgroup]]
+) {
+    if (head >= params.num_k_heads) {
+        return;
+    }
+    uint q_src = params.off_qkv_raw + head * params.head_k_dim;
+    uint k_src = params.off_qkv_raw + params.key_dim + head * params.head_k_dim;
+    float q_partial = 0.0f;
+    float k_partial = 0.0f;
+    for (uint i = lane; i < params.head_k_dim; i += 32u) {
+        float q = workspace[q_src + i];
+        float k = workspace[k_src + i];
+        q_partial += q * q;
+        k_partial += k * k;
+    }
+    float q_ss = simd_sum(q_partial);
+    float k_ss = simd_sum(k_partial);
+    float q_denom = bf16_round_rne_finite(max(bf16_round_rne_finite(sqrt(q_ss)), 1.0e-6f));
+    float k_denom = bf16_round_rne_finite(max(bf16_round_rne_finite(sqrt(k_ss)), 1.0e-6f));
+    uint repeat = params.num_v_heads / params.num_k_heads;
+    for (uint i = lane; i < params.head_k_dim; i += 32u) {
+        float qn = bf16_round_rne_finite(workspace[q_src + i] / q_denom);
+        float kn = bf16_round_rne_finite(workspace[k_src + i] / k_denom);
+        float qs = bf16_round_rne_finite(qn * params.q_scale);
+        for (uint r = 0; r < repeat; ++r) {
+            uint vhead = head * repeat + r;
+            workspace[params.off_q_rep + vhead * params.head_k_dim + i] = qs;
+            workspace[params.off_k_rep + vhead * params.head_k_dim + i] = kn;
+        }
+    }
+}
+
+kernel void supersonic_qwen36_linear_recurrent_update(
+    device float* workspace [[buffer(0)]],
+    device const bfloat* dt_bias [[buffer(1)]],
+    device const bfloat* a_log [[buffer(2)]],
+    device float* recurrent_state [[buffer(3)]],
+    constant Qwen36LinearInt4Params& params [[buffer(4)]],
+    uint3 tg [[threadgroup_position_in_grid]],
+    uint3 tid [[thread_position_in_threadgroup]]
+) {
+    uint lane = tid.x;
+    uint j = tg.x;
+    uint head = tg.y;
+    if (head >= params.num_v_heads || j >= params.head_v_dim) {
+        return;
+    }
+    float a_v = workspace[params.off_a_raw + head];
+    float b_v = workspace[params.off_b_raw + head];
+    float softplus = log(1.0f + exp(a_v + float(dt_bias[head])));
+    float beta = 1.0f / (1.0f + exp(-b_v));
+    float gstep = exp(-softplus * exp(float(a_log[head])));
+    if (j == 0 && lane == 0) {
+        workspace[params.off_beta + head] = beta;
+        workspace[params.off_g + head] = -softplus * exp(float(a_log[head]));
+    }
+
+    uint state_base = head * params.head_k_dim * params.head_v_dim;
+    uint k_base = params.off_k_rep + head * params.head_k_dim;
+    uint q_base = params.off_q_rep + head * params.head_k_dim;
+    uint v_base = params.off_qkv_raw + 2u * params.key_dim + head * params.head_v_dim;
+    float kv_partial = 0.0f;
+    for (uint i = lane; i < params.head_k_dim; i += 32u) {
+        uint state_idx = state_base + i * params.head_v_dim + j;
+        recurrent_state[state_idx] *= gstep;
+        kv_partial += recurrent_state[state_idx] * workspace[k_base + i];
+    }
+    float kv_mem = simd_sum(kv_partial);
+    float delta = (workspace[v_base + j] - kv_mem) * beta;
+    float rec_partial = 0.0f;
+    for (uint i = lane; i < params.head_k_dim; i += 32u) {
+        uint state_idx = state_base + i * params.head_v_dim + j;
+        float updated = recurrent_state[state_idx] + workspace[k_base + i] * delta;
+        recurrent_state[state_idx] = updated;
+        rec_partial += updated * workspace[q_base + i];
+    }
+    float rec = simd_sum(rec_partial);
+    if (lane == 0) {
+        workspace[params.off_rec_out + head * params.head_v_dim + j] =
+            bf16_round_rne_finite(rec);
+    }
+}
+
+kernel void supersonic_qwen36_linear_output_gate_norm(
+    device float* workspace [[buffer(0)]],
+    device const bfloat* norm_w [[buffer(1)]],
+    constant Qwen36LinearInt4Params& params [[buffer(2)]],
+    uint head [[threadgroup_position_in_grid]],
+    uint lane [[thread_position_in_threadgroup]]
+) {
+    if (head >= params.num_v_heads) {
+        return;
+    }
+    uint rec_base = params.off_rec_out + head * params.head_v_dim;
+    uint z_base = params.off_z_raw + head * params.head_v_dim;
+    float partial = 0.0f;
+    for (uint j = lane; j < params.head_v_dim; j += 32u) {
+        float v = workspace[rec_base + j];
+        partial += v * v;
+    }
+    float mean_sq = simd_sum(partial);
+    float inv = 1.0f / sqrt(mean_sq / float(params.head_v_dim) + params.rms_norm_eps);
+    for (uint j = lane; j < params.head_v_dim; j += 32u) {
+        float rec = workspace[rec_base + j];
+        float on = bf16_round_rne_finite(rec * inv * float(norm_w[j]));
+        float z = workspace[z_base + j];
+        float z_silu = bf16_round_rne_finite(silu(z));
+        workspace[rec_base + j] = bf16_round_rne_finite(on * z_silu);
+    }
+}
+
+kernel void supersonic_qwen36_linear_out_proj_finalize(
+    device const bfloat* input_hidden [[buffer(0)]],
+    device const uchar* out_proj [[buffer(1)]],
+    device const bfloat* out_proj_scale [[buffer(2)]],
+    device const bfloat* out_proj_zero [[buffer(3)]],
+    device float* workspace [[buffer(4)]],
+    device bfloat* output [[buffer(5)]],
+    constant Qwen36LinearInt4Params& params [[buffer(6)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_position_in_threadgroup]]
+) {
+    if (row >= params.hidden) {
+        return;
+    }
+    float partial = 0.0f;
+    for (uint col = lane; col < params.val_dim; col += 32u) {
+        float w = int4_weight_2d(
+            out_proj, out_proj_scale, out_proj_zero,
+            row, col, params.val_dim, params.group_size
+        );
+        partial += w * workspace[params.off_rec_out + col];
+    }
+    float acc = simd_sum(partial);
+    if (lane == 0) {
+        float o_out = bf16_round_rne_finite(acc);
+        float residual = bf16_round_rne_finite(float(input_hidden[row]) + o_out);
+        output[row] = bfloat(residual);
+    }
+}
+)QWEN36LINEAR";
+
+                NSString* source = [NSString stringWithUTF8String:kSource];
+                MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+                configure_precise_math(options);
+                NSError* library_error = nil;
+                id<MTLLibrary> library = [device newLibraryWithSource:source
+                                                              options:options
+                                                                error:&library_error];
+                if (library == nil || library_error != nil) {
+                    build_error = library_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                       code:1101
+                                                                   userInfo:@{
+                                                                       NSLocalizedDescriptionKey :
+                                                                           @"Failed to compile qwen36 linear int4 library"
+                                                                   }];
+                } else {
+                    NSArray<NSString*>* names = @[
+                        @"supersonic_qwen36_linear_input_norm",
+                        @"supersonic_qwen36_linear_projections",
+                        @"supersonic_qwen36_linear_conv_silu_state",
+                        @"supersonic_qwen36_linear_qk_norm_repeat",
+                        @"supersonic_qwen36_linear_recurrent_update",
+                        @"supersonic_qwen36_linear_output_gate_norm",
+                        @"supersonic_qwen36_linear_out_proj_finalize",
+                    ];
+                    for (NSString* name in names) {
+                        id<MTLFunction> function = [library newFunctionWithName:name];
+                        if (function == nil) {
+                            build_error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                                               code:1102
+                                                           userInfo:@{
+                                                               NSLocalizedDescriptionKey :
+                                                                   [NSString stringWithFormat:@"Failed to load %@", name]
+                                                           }];
+                            break;
+                        }
+                        NSError* pipeline_error = nil;
+                        id<MTLComputePipelineState> pipeline =
+                            [device newComputePipelineStateWithFunction:function error:&pipeline_error];
+                        if (pipeline == nil || pipeline_error != nil) {
+                            build_error = pipeline_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                                 code:1103
+                                                                             userInfo:@{
+                                                                                 NSLocalizedDescriptionKey :
+                                                                                     [NSString stringWithFormat:@"Failed to create %@", name]
+                                                                             }];
+                            break;
+                        }
+                        if ([name isEqualToString:@"supersonic_qwen36_linear_input_norm"]) {
+                            pipelines.input_norm = pipeline;
+                        } else if ([name isEqualToString:@"supersonic_qwen36_linear_projections"]) {
+                            pipelines.projections = pipeline;
+                        } else if ([name isEqualToString:@"supersonic_qwen36_linear_conv_silu_state"]) {
+                            pipelines.conv_silu_state = pipeline;
+                        } else if ([name isEqualToString:@"supersonic_qwen36_linear_qk_norm_repeat"]) {
+                            pipelines.qk_norm_repeat = pipeline;
+                        } else if ([name isEqualToString:@"supersonic_qwen36_linear_recurrent_update"]) {
+                            pipelines.recurrent_update = pipeline;
+                        } else if ([name isEqualToString:@"supersonic_qwen36_linear_output_gate_norm"]) {
+                            pipelines.output_gate_norm = pipeline;
+                        } else if ([name isEqualToString:@"supersonic_qwen36_linear_out_proj_finalize"]) {
+                            pipelines.out_proj_finalize = pipeline;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if ((pipelines.input_norm == nil || pipelines.projections == nil ||
+         pipelines.conv_silu_state == nil || pipelines.qk_norm_repeat == nil ||
+         pipelines.recurrent_update == nil || pipelines.output_gate_norm == nil ||
+         pipelines.out_proj_finalize == nil) &&
+        error_out != nullptr) {
+        *error_out = build_error;
+    }
+    if (build_error != nil && NSProcessInfo.processInfo.environment[@"SUPERSONIC_METAL_PROFILE"] != nil) {
+        NSLog(@"SuperSonic Qwen3.6 linear INT4 Metal pipeline error: %@", build_error);
+    }
+    return pipelines;
 }
 
 struct Qwen36FfnInt4Pipelines {
@@ -9768,6 +10244,330 @@ extern "C" int supersonic_metal_matmul_rhs_transposed_int4_bf16(
             MTLSize threads_per_grid = MTLSizeMake(n, m, batch_elems);
             [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
         }, 419, 420, 421, 422);
+    }
+}
+
+extern "C" int supersonic_metal_qwen36_linear_int4_stage5(
+    size_t hidden,
+    size_t num_k_heads,
+    size_t num_v_heads,
+    size_t head_k_dim,
+    size_t head_v_dim,
+    size_t conv_kernel_dim,
+    size_t group_size,
+    float rms_norm_eps,
+    const void* input_hidden_ptr,
+    const void* input_norm_w_ptr,
+    const void* in_proj_qkv_ptr,
+    const void* in_proj_qkv_scale_ptr,
+    const void* in_proj_qkv_zero_ptr,
+    const void* in_proj_z_ptr,
+    const void* in_proj_z_scale_ptr,
+    const void* in_proj_z_zero_ptr,
+    const void* in_proj_a_ptr,
+    const void* in_proj_b_ptr,
+    const void* conv1d_w_ptr,
+    const void* conv1d_bias_ptr,
+    const void* dt_bias_ptr,
+    const void* a_log_ptr,
+    const void* norm_w_ptr,
+    const void* out_proj_ptr,
+    const void* out_proj_scale_ptr,
+    const void* out_proj_zero_ptr,
+    void* conv_state_ptr,
+    void* recurrent_state_ptr,
+    void* workspace_ptr,
+    void* output_ptr,
+    int wait_for_completion
+) {
+    @autoreleasepool {
+        if (hidden == 0 || num_k_heads == 0 || num_v_heads == 0 ||
+            head_k_dim == 0 || head_v_dim == 0 || conv_kernel_dim == 0 ||
+            group_size == 0 || input_hidden_ptr == nullptr ||
+            input_norm_w_ptr == nullptr || in_proj_qkv_ptr == nullptr ||
+            in_proj_qkv_scale_ptr == nullptr || in_proj_qkv_zero_ptr == nullptr ||
+            in_proj_z_ptr == nullptr || in_proj_z_scale_ptr == nullptr ||
+            in_proj_z_zero_ptr == nullptr || in_proj_a_ptr == nullptr ||
+            in_proj_b_ptr == nullptr || conv1d_w_ptr == nullptr ||
+            dt_bias_ptr == nullptr || a_log_ptr == nullptr ||
+            norm_w_ptr == nullptr || out_proj_ptr == nullptr ||
+            out_proj_scale_ptr == nullptr || out_proj_zero_ptr == nullptr ||
+            conv_state_ptr == nullptr || recurrent_state_ptr == nullptr ||
+            workspace_ptr == nullptr || output_ptr == nullptr) {
+            return 1120;
+        }
+        if (hidden > UINT32_MAX || num_k_heads > UINT32_MAX ||
+            num_v_heads > UINT32_MAX || head_k_dim > UINT32_MAX ||
+            head_v_dim > UINT32_MAX || conv_kernel_dim > UINT32_MAX ||
+            group_size > UINT32_MAX) {
+            return 1121;
+        }
+        if (num_v_heads % num_k_heads != 0 || conv_kernel_dim < 1 ||
+            hidden % 2 != 0 || head_k_dim % 2 != 0 || head_v_dim % 2 != 0) {
+            return 1122;
+        }
+        if (num_k_heads > SIZE_MAX / head_k_dim ||
+            num_v_heads > SIZE_MAX / head_v_dim) {
+            return 1123;
+        }
+        size_t key_dim = num_k_heads * head_k_dim;
+        size_t val_dim = num_v_heads * head_v_dim;
+        if (key_dim > (SIZE_MAX - val_dim) / 2) {
+            return 1124;
+        }
+        size_t qkv_dim = 2 * key_dim + val_dim;
+        size_t total_projection_rows = qkv_dim + val_dim + 2 * num_v_heads;
+        if (key_dim > UINT32_MAX || val_dim > UINT32_MAX ||
+            qkv_dim > UINT32_MAX || total_projection_rows > UINT32_MAX) {
+            return 1125;
+        }
+
+        NSError* pipeline_error = nil;
+        Qwen36LinearInt4Pipelines pipelines = qwen36_linear_int4_pipelines(&pipeline_error);
+        if (pipelines.input_norm == nil || pipelines.projections == nil ||
+            pipelines.conv_silu_state == nil || pipelines.qk_norm_repeat == nil ||
+            pipelines.recurrent_update == nil || pipelines.output_gate_norm == nil ||
+            pipelines.out_proj_finalize == nil) {
+            return 1126;
+        }
+
+        id<MTLBuffer> input_hidden = nil;
+        id<MTLBuffer> input_norm_w = nil;
+        id<MTLBuffer> in_proj_qkv = nil;
+        id<MTLBuffer> in_proj_qkv_scale = nil;
+        id<MTLBuffer> in_proj_qkv_zero = nil;
+        id<MTLBuffer> in_proj_z = nil;
+        id<MTLBuffer> in_proj_z_scale = nil;
+        id<MTLBuffer> in_proj_z_zero = nil;
+        id<MTLBuffer> in_proj_a = nil;
+        id<MTLBuffer> in_proj_b = nil;
+        id<MTLBuffer> conv1d_w = nil;
+        id<MTLBuffer> conv1d_bias = nil;
+        id<MTLBuffer> dt_bias = nil;
+        id<MTLBuffer> a_log = nil;
+        id<MTLBuffer> norm_w = nil;
+        id<MTLBuffer> out_proj = nil;
+        id<MTLBuffer> out_proj_scale = nil;
+        id<MTLBuffer> out_proj_zero = nil;
+        id<MTLBuffer> conv_state = nil;
+        id<MTLBuffer> recurrent_state = nil;
+        id<MTLBuffer> workspace = nil;
+        id<MTLBuffer> output = nil;
+        size_t input_hidden_offset = 0;
+        size_t input_norm_w_offset = 0;
+        size_t in_proj_qkv_offset = 0;
+        size_t in_proj_qkv_scale_offset = 0;
+        size_t in_proj_qkv_zero_offset = 0;
+        size_t in_proj_z_offset = 0;
+        size_t in_proj_z_scale_offset = 0;
+        size_t in_proj_z_zero_offset = 0;
+        size_t in_proj_a_offset = 0;
+        size_t in_proj_b_offset = 0;
+        size_t conv1d_w_offset = 0;
+        size_t conv1d_bias_offset = 0;
+        size_t dt_bias_offset = 0;
+        size_t a_log_offset = 0;
+        size_t norm_w_offset = 0;
+        size_t out_proj_offset = 0;
+        size_t out_proj_scale_offset = 0;
+        size_t out_proj_zero_offset = 0;
+        size_t conv_state_offset = 0;
+        size_t recurrent_state_offset = 0;
+        size_t workspace_offset = 0;
+        size_t output_offset = 0;
+
+        auto lookup_required = [](const void* ptr, id<MTLBuffer>* buffer, size_t* offset, int code) -> int {
+            return lookup_buffer(ptr, buffer, offset) == 0 ? 0 : code;
+        };
+        int status = 0;
+        if ((status = lookup_required(input_hidden_ptr, &input_hidden, &input_hidden_offset, 1127)) != 0) return status;
+        if ((status = lookup_required(input_norm_w_ptr, &input_norm_w, &input_norm_w_offset, 1128)) != 0) return status;
+        if ((status = lookup_required(in_proj_qkv_ptr, &in_proj_qkv, &in_proj_qkv_offset, 1129)) != 0) return status;
+        if ((status = lookup_required(in_proj_qkv_scale_ptr, &in_proj_qkv_scale, &in_proj_qkv_scale_offset, 1130)) != 0) return status;
+        if ((status = lookup_required(in_proj_qkv_zero_ptr, &in_proj_qkv_zero, &in_proj_qkv_zero_offset, 1131)) != 0) return status;
+        if ((status = lookup_required(in_proj_z_ptr, &in_proj_z, &in_proj_z_offset, 1132)) != 0) return status;
+        if ((status = lookup_required(in_proj_z_scale_ptr, &in_proj_z_scale, &in_proj_z_scale_offset, 1133)) != 0) return status;
+        if ((status = lookup_required(in_proj_z_zero_ptr, &in_proj_z_zero, &in_proj_z_zero_offset, 1134)) != 0) return status;
+        if ((status = lookup_required(in_proj_a_ptr, &in_proj_a, &in_proj_a_offset, 1135)) != 0) return status;
+        if ((status = lookup_required(in_proj_b_ptr, &in_proj_b, &in_proj_b_offset, 1136)) != 0) return status;
+        if ((status = lookup_required(conv1d_w_ptr, &conv1d_w, &conv1d_w_offset, 1137)) != 0) return status;
+        if (conv1d_bias_ptr != nullptr) {
+            if ((status = lookup_required(conv1d_bias_ptr, &conv1d_bias, &conv1d_bias_offset, 1138)) != 0) return status;
+        } else {
+            conv1d_bias = conv1d_w;
+            conv1d_bias_offset = conv1d_w_offset;
+        }
+        if ((status = lookup_required(dt_bias_ptr, &dt_bias, &dt_bias_offset, 1139)) != 0) return status;
+        if ((status = lookup_required(a_log_ptr, &a_log, &a_log_offset, 1140)) != 0) return status;
+        if ((status = lookup_required(norm_w_ptr, &norm_w, &norm_w_offset, 1141)) != 0) return status;
+        if ((status = lookup_required(out_proj_ptr, &out_proj, &out_proj_offset, 1142)) != 0) return status;
+        if ((status = lookup_required(out_proj_scale_ptr, &out_proj_scale, &out_proj_scale_offset, 1143)) != 0) return status;
+        if ((status = lookup_required(out_proj_zero_ptr, &out_proj_zero, &out_proj_zero_offset, 1144)) != 0) return status;
+        if ((status = lookup_required(conv_state_ptr, &conv_state, &conv_state_offset, 1145)) != 0) return status;
+        if ((status = lookup_required(recurrent_state_ptr, &recurrent_state, &recurrent_state_offset, 1146)) != 0) return status;
+        if ((status = lookup_required(workspace_ptr, &workspace, &workspace_offset, 1147)) != 0) return status;
+        if ((status = lookup_required(output_ptr, &output, &output_offset, 1148)) != 0) return status;
+
+        uint32_t off_qkv_raw = 0u;
+        uint32_t off_z_raw = static_cast<uint32_t>(qkv_dim);
+        uint32_t off_a_raw = static_cast<uint32_t>(qkv_dim + val_dim);
+        uint32_t off_b_raw = static_cast<uint32_t>(qkv_dim + val_dim + num_v_heads);
+        uint32_t off_q_normed = static_cast<uint32_t>(qkv_dim + val_dim + 2 * num_v_heads);
+        uint32_t off_k_normed = off_q_normed + static_cast<uint32_t>(key_dim);
+        uint32_t off_q_rep = off_k_normed + static_cast<uint32_t>(key_dim);
+        uint32_t off_k_rep = off_q_rep + static_cast<uint32_t>(num_v_heads * head_k_dim);
+        uint32_t off_beta = off_k_rep + static_cast<uint32_t>(num_v_heads * head_k_dim);
+        uint32_t off_g = off_beta + static_cast<uint32_t>(num_v_heads);
+        uint32_t off_rec_out = off_g + static_cast<uint32_t>(num_v_heads);
+
+        Qwen36LinearInt4Params params = {
+            static_cast<uint32_t>(hidden),
+            static_cast<uint32_t>(num_k_heads),
+            static_cast<uint32_t>(num_v_heads),
+            static_cast<uint32_t>(head_k_dim),
+            static_cast<uint32_t>(head_v_dim),
+            static_cast<uint32_t>(conv_kernel_dim),
+            static_cast<uint32_t>(group_size),
+            static_cast<uint32_t>(key_dim),
+            static_cast<uint32_t>(val_dim),
+            static_cast<uint32_t>(qkv_dim),
+            static_cast<uint32_t>(conv_kernel_dim - 1),
+            conv1d_bias_ptr != nullptr ? 1u : 0u,
+            off_qkv_raw,
+            off_z_raw,
+            off_a_raw,
+            off_b_raw,
+            off_q_normed,
+            off_k_normed,
+            off_q_rep,
+            off_k_rep,
+            off_beta,
+            off_g,
+            off_rec_out,
+            rms_norm_eps,
+            1.0f / sqrtf(static_cast<float>(head_k_dim)),
+        };
+
+        auto encode_input_norm = [&](id<MTLComputeCommandEncoder> encoder) {
+            [encoder setComputePipelineState:pipelines.input_norm];
+            [encoder setBuffer:input_hidden offset:input_hidden_offset atIndex:0];
+            [encoder setBuffer:input_norm_w offset:input_norm_w_offset atIndex:1];
+            [encoder setBuffer:output offset:output_offset atIndex:2];
+            [encoder setBytes:&params length:sizeof(params) atIndex:3];
+            [encoder setThreadgroupMemoryLength:32 * sizeof(float) atIndex:0];
+            [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
+        };
+        auto encode_projections = [&](id<MTLComputeCommandEncoder> encoder) {
+            [encoder setComputePipelineState:pipelines.projections];
+            [encoder setBuffer:output offset:output_offset atIndex:0];
+            [encoder setBuffer:in_proj_qkv offset:in_proj_qkv_offset atIndex:1];
+            [encoder setBuffer:in_proj_qkv_scale offset:in_proj_qkv_scale_offset atIndex:2];
+            [encoder setBuffer:in_proj_qkv_zero offset:in_proj_qkv_zero_offset atIndex:3];
+            [encoder setBuffer:in_proj_z offset:in_proj_z_offset atIndex:4];
+            [encoder setBuffer:in_proj_z_scale offset:in_proj_z_scale_offset atIndex:5];
+            [encoder setBuffer:in_proj_z_zero offset:in_proj_z_zero_offset atIndex:6];
+            [encoder setBuffer:in_proj_a offset:in_proj_a_offset atIndex:7];
+            [encoder setBuffer:in_proj_b offset:in_proj_b_offset atIndex:8];
+            [encoder setBuffer:workspace offset:workspace_offset atIndex:9];
+            [encoder setBytes:&params length:sizeof(params) atIndex:10];
+            [encoder dispatchThreadgroups:MTLSizeMake(total_projection_rows, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        };
+        auto encode_conv = [&](id<MTLComputeCommandEncoder> encoder) {
+            [encoder setComputePipelineState:pipelines.conv_silu_state];
+            [encoder setBuffer:workspace offset:workspace_offset atIndex:0];
+            [encoder setBuffer:conv1d_w offset:conv1d_w_offset atIndex:1];
+            [encoder setBuffer:conv1d_bias offset:conv1d_bias_offset atIndex:2];
+            [encoder setBuffer:conv_state offset:conv_state_offset atIndex:3];
+            [encoder setBytes:&params length:sizeof(params) atIndex:4];
+            NSUInteger tg_width =
+                std::min<NSUInteger>(256, std::max<NSUInteger>(1, pipelines.conv_silu_state.maxTotalThreadsPerThreadgroup));
+            [encoder dispatchThreads:MTLSizeMake(qkv_dim, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(tg_width, 1, 1)];
+        };
+        auto encode_qk_norm_repeat = [&](id<MTLComputeCommandEncoder> encoder) {
+            [encoder setComputePipelineState:pipelines.qk_norm_repeat];
+            [encoder setBuffer:workspace offset:workspace_offset atIndex:0];
+            [encoder setBytes:&params length:sizeof(params) atIndex:1];
+            [encoder dispatchThreadgroups:MTLSizeMake(num_k_heads, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        };
+        auto encode_recurrent = [&](id<MTLComputeCommandEncoder> encoder) {
+            [encoder setComputePipelineState:pipelines.recurrent_update];
+            [encoder setBuffer:workspace offset:workspace_offset atIndex:0];
+            [encoder setBuffer:dt_bias offset:dt_bias_offset atIndex:1];
+            [encoder setBuffer:a_log offset:a_log_offset atIndex:2];
+            [encoder setBuffer:recurrent_state offset:recurrent_state_offset atIndex:3];
+            [encoder setBytes:&params length:sizeof(params) atIndex:4];
+            [encoder dispatchThreadgroups:MTLSizeMake(head_v_dim, num_v_heads, 1)
+                    threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        };
+        auto encode_output_gate_norm = [&](id<MTLComputeCommandEncoder> encoder) {
+            [encoder setComputePipelineState:pipelines.output_gate_norm];
+            [encoder setBuffer:workspace offset:workspace_offset atIndex:0];
+            [encoder setBuffer:norm_w offset:norm_w_offset atIndex:1];
+            [encoder setBytes:&params length:sizeof(params) atIndex:2];
+            [encoder dispatchThreadgroups:MTLSizeMake(num_v_heads, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        };
+        auto encode_out_proj_finalize = [&](id<MTLComputeCommandEncoder> encoder) {
+            [encoder setComputePipelineState:pipelines.out_proj_finalize];
+            [encoder setBuffer:input_hidden offset:input_hidden_offset atIndex:0];
+            [encoder setBuffer:out_proj offset:out_proj_offset atIndex:1];
+            [encoder setBuffer:out_proj_scale offset:out_proj_scale_offset atIndex:2];
+            [encoder setBuffer:out_proj_zero offset:out_proj_zero_offset atIndex:3];
+            [encoder setBuffer:workspace offset:workspace_offset atIndex:4];
+            [encoder setBuffer:output offset:output_offset atIndex:5];
+            [encoder setBytes:&params length:sizeof(params) atIndex:6];
+            [encoder dispatchThreadgroups:MTLSizeMake(hidden, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        };
+
+        bool split_profile = NSProcessInfo.processInfo.environment[@"SUPERSONIC_METAL_PROFILE"] != nil;
+        if (split_profile) {
+            if ((status = encode_or_submit_labeled(encode_input_norm, "qwen36_linear_int4_input_norm", 1149, 1150, 1151, 1152)) != 0) return status;
+            if ((status = encode_or_submit_labeled(encode_projections, "qwen36_linear_int4_projections", 1153, 1154, 1155, 1156)) != 0) return status;
+            if ((status = encode_or_submit_labeled(encode_conv, "qwen36_linear_int4_conv_silu_state", 1157, 1158, 1159, 1160)) != 0) return status;
+            if ((status = encode_or_submit_labeled(encode_qk_norm_repeat, "qwen36_linear_int4_qk_norm_repeat", 1161, 1162, 1163, 1164)) != 0) return status;
+            if ((status = encode_or_submit_labeled(encode_recurrent, "qwen36_linear_int4_recurrent_update", 1165, 1166, 1167, 1168)) != 0) return status;
+            if ((status = encode_or_submit_labeled(encode_output_gate_norm, "qwen36_linear_int4_output_gate_norm", 1169, 1170, 1171, 1172)) != 0) return status;
+            return encode_or_submit_labeled(encode_out_proj_finalize, "qwen36_linear_int4_out_proj_finalize", 1173, 1174, 1175, 1176);
+        }
+
+        auto encode_stage = [&](id<MTLComputeCommandEncoder> encoder) {
+            encode_input_norm(encoder);
+            [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            encode_projections(encoder);
+            [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            encode_conv(encoder);
+            [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            encode_qk_norm_repeat(encoder);
+            [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            encode_recurrent(encoder);
+            [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            encode_output_gate_norm(encoder);
+            [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            encode_out_proj_finalize(encoder);
+        };
+        if (wait_for_completion != 0) {
+            return encode_or_submit_labeled(
+                encode_stage,
+                "qwen36_linear_int4_stage5",
+                1177,
+                1178,
+                1179,
+                1180
+            );
+        }
+        return encode_or_submit_labeled_async(
+            encode_stage,
+            "qwen36_linear_int4_stage5",
+            1177,
+            1178,
+            1179,
+            1180
+        );
     }
 }
 

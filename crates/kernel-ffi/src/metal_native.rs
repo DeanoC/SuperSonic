@@ -122,6 +122,39 @@ unsafe extern "C" {
         output_ptr: *mut c_void,
         wait_for_completion: c_int,
     ) -> c_int;
+    fn supersonic_metal_qwen36_linear_int4_stage5(
+        hidden: usize,
+        num_k_heads: usize,
+        num_v_heads: usize,
+        head_k_dim: usize,
+        head_v_dim: usize,
+        conv_kernel_dim: usize,
+        group_size: usize,
+        rms_norm_eps: f32,
+        input_hidden_ptr: *const c_void,
+        input_norm_w_ptr: *const c_void,
+        in_proj_qkv_ptr: *const c_void,
+        in_proj_qkv_scale_ptr: *const c_void,
+        in_proj_qkv_zero_ptr: *const c_void,
+        in_proj_z_ptr: *const c_void,
+        in_proj_z_scale_ptr: *const c_void,
+        in_proj_z_zero_ptr: *const c_void,
+        in_proj_a_ptr: *const c_void,
+        in_proj_b_ptr: *const c_void,
+        conv1d_w_ptr: *const c_void,
+        conv1d_bias_ptr: *const c_void,
+        dt_bias_ptr: *const c_void,
+        a_log_ptr: *const c_void,
+        norm_w_ptr: *const c_void,
+        out_proj_ptr: *const c_void,
+        out_proj_scale_ptr: *const c_void,
+        out_proj_zero_ptr: *const c_void,
+        conv_state_ptr: *mut c_void,
+        recurrent_state_ptr: *mut c_void,
+        workspace_ptr: *mut c_void,
+        output_ptr: *mut c_void,
+        wait_for_completion: c_int,
+    ) -> c_int;
     fn supersonic_metal_matmul_rhs_transposed_f32(
         batch_elems: usize,
         m: usize,
@@ -1292,6 +1325,118 @@ pub(crate) unsafe fn matmul_rhs_transposed_int4_bf16_gemv_m1_tiled_raw(
             format!(
                 "metal native matmul_rhs_transposed_int4_bf16_gemv_m1_tiled_raw failed with status {status}"
             ),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn qwen36_linear_int4_stage5(
+    hidden: usize,
+    num_k_heads: usize,
+    num_v_heads: usize,
+    head_k_dim: usize,
+    head_v_dim: usize,
+    conv_kernel_dim: usize,
+    group_size: usize,
+    rms_norm_eps: f32,
+    input_hidden: *const c_void,
+    input_norm_w: *const c_void,
+    in_proj_qkv: *const c_void,
+    in_proj_qkv_scale: *const c_void,
+    in_proj_qkv_zero: *const c_void,
+    in_proj_z: *const c_void,
+    in_proj_z_scale: *const c_void,
+    in_proj_z_zero: *const c_void,
+    in_proj_a: *const c_void,
+    in_proj_b: *const c_void,
+    conv1d_w: *const c_void,
+    conv1d_bias: *const c_void,
+    dt_bias: *const c_void,
+    a_log: *const c_void,
+    norm_w: *const c_void,
+    out_proj: *const c_void,
+    out_proj_scale: *const c_void,
+    out_proj_zero: *const c_void,
+    conv_state: *mut c_void,
+    recurrent_state: *mut c_void,
+    workspace: *mut c_void,
+    output: *mut c_void,
+    wait_for_completion: bool,
+) -> Result<(), GpuError> {
+    if hidden == 0
+        || num_k_heads == 0
+        || num_v_heads == 0
+        || head_k_dim == 0
+        || head_v_dim == 0
+        || conv_kernel_dim == 0
+        || group_size == 0
+        || input_hidden.is_null()
+        || input_norm_w.is_null()
+        || in_proj_qkv.is_null()
+        || in_proj_qkv_scale.is_null()
+        || in_proj_qkv_zero.is_null()
+        || in_proj_z.is_null()
+        || in_proj_z_scale.is_null()
+        || in_proj_z_zero.is_null()
+        || in_proj_a.is_null()
+        || in_proj_b.is_null()
+        || conv1d_w.is_null()
+        || dt_bias.is_null()
+        || a_log.is_null()
+        || norm_w.is_null()
+        || out_proj.is_null()
+        || out_proj_scale.is_null()
+        || out_proj_zero.is_null()
+        || conv_state.is_null()
+        || recurrent_state.is_null()
+        || workspace.is_null()
+        || output.is_null()
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native qwen36_linear_int4_stage5 invalid shape: hidden={hidden} num_k_heads={num_k_heads} num_v_heads={num_v_heads} head_k_dim={head_k_dim} head_v_dim={head_v_dim} conv_kernel_dim={conv_kernel_dim} group_size={group_size}"
+        )));
+    }
+    let status = unsafe {
+        supersonic_metal_qwen36_linear_int4_stage5(
+            hidden,
+            num_k_heads,
+            num_v_heads,
+            head_k_dim,
+            head_v_dim,
+            conv_kernel_dim,
+            group_size,
+            rms_norm_eps,
+            input_hidden,
+            input_norm_w,
+            in_proj_qkv,
+            in_proj_qkv_scale,
+            in_proj_qkv_zero,
+            in_proj_z,
+            in_proj_z_scale,
+            in_proj_z_zero,
+            in_proj_a,
+            in_proj_b,
+            conv1d_w,
+            conv1d_bias,
+            dt_bias,
+            a_log,
+            norm_w,
+            out_proj,
+            out_proj_scale,
+            out_proj_zero,
+            conv_state,
+            recurrent_state,
+            workspace,
+            output,
+            i32::from(wait_for_completion),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!("metal native qwen36_linear_int4_stage5 failed with status {status}"),
         ));
     }
     Ok(())
@@ -3970,6 +4115,47 @@ pub(crate) unsafe fn matmul_rhs_transposed_int4_bf16_gemv_m1_tiled_raw(
     Err(GpuError::backend(
         Backend::Metal,
         "metal native matmul_rhs_transposed_int4_bf16_gemv_m1_tiled_raw is not compiled".into(),
+    ))
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn qwen36_linear_int4_stage5(
+    _hidden: usize,
+    _num_k_heads: usize,
+    _num_v_heads: usize,
+    _head_k_dim: usize,
+    _head_v_dim: usize,
+    _conv_kernel_dim: usize,
+    _group_size: usize,
+    _rms_norm_eps: f32,
+    _input_hidden: *const c_void,
+    _input_norm_w: *const c_void,
+    _in_proj_qkv: *const c_void,
+    _in_proj_qkv_scale: *const c_void,
+    _in_proj_qkv_zero: *const c_void,
+    _in_proj_z: *const c_void,
+    _in_proj_z_scale: *const c_void,
+    _in_proj_z_zero: *const c_void,
+    _in_proj_a: *const c_void,
+    _in_proj_b: *const c_void,
+    _conv1d_w: *const c_void,
+    _conv1d_bias: *const c_void,
+    _dt_bias: *const c_void,
+    _a_log: *const c_void,
+    _norm_w: *const c_void,
+    _out_proj: *const c_void,
+    _out_proj_scale: *const c_void,
+    _out_proj_zero: *const c_void,
+    _conv_state: *mut c_void,
+    _recurrent_state: *mut c_void,
+    _workspace: *mut c_void,
+    _output: *mut c_void,
+    _wait_for_completion: bool,
+) -> Result<(), GpuError> {
+    Err(GpuError::backend(
+        Backend::Metal,
+        "metal native qwen36_linear_int4_stage5 is not compiled".into(),
     ))
 }
 

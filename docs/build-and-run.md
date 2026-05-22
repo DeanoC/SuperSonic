@@ -294,12 +294,14 @@ Metal currently rejects or defers:
   and the final INT4 lm-head. The persistent Qwen3-MoE megakernel remains
   HIP-only.
 - `qwen3.6-35b-a3b` INT4 on Apple M5 Max uses the host-orchestrated chained
-  decode route with Metal fallbacks for BF16 full-attention, linear-attention,
-  and FFN stages, plus INT4 sidecars for projection and expert matvecs. Stage-5
-  FFN projection work also has a narrowly gated native Metal INT4 attribution
-  path enabled by `SUPERSONIC_METAL_PROFILE=1` or
-  `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5=1`; the default lane keeps the
-  measured faster host fallback until the combined native path beats it. The
+  decode route with Metal fallbacks for BF16 full-attention and FFN stages,
+  plus INT4 sidecars for projection and expert matvecs. Stage-5
+  linear-attention projection/recurrent work uses a fused native Metal INT4
+  path by default; set `SUPERSONIC_METAL_DISABLE_QWEN36_LINEAR_INT4_STAGE5=1`
+  to force the host fallback. Stage-5 FFN projection work also has a narrowly
+  gated native Metal INT4 attribution path enabled by `SUPERSONIC_METAL_PROFILE=1`
+  or `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5=1`; reducing FFN
+  command-buffer wait is the next measured optimization target. The
   one-token local smoke is:
   `cargo run --release --bin supersonic -- --backend metal --model qwen3.6-35b-a3b --model-dir /path/to/Qwen3.6-35B-A3B --int4 --prompt "Hello" --max-new-tokens 1 --emit-stage-timings`.
   FP8-runtime, KV-FP8, speculative decode, and persistent decode remain
@@ -317,6 +319,7 @@ Native Metal kernels used in the hot path:
 - full-attention prefill core
 - lm-head argmax
 - RMSNorm rows
+- Qwen3.6 stage-5 linear-attention INT4 fused projection/recurrent path
 - Qwen3.6 stage-5 FFN INT4 projection kernels for profiling / opt-in
   attribution
 - linear prefill conv pack

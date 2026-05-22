@@ -823,9 +823,10 @@ Apple M5 Max Metal is the main Apple-silicon target for Qwen3.6 bring-up. The
 current benchmark lane is deliberately narrow: `qwen3.6-35b-a3b` with INT4
 weights on the chained Metal decode path. This section is a performance harness
 checkpoint, not a claim that the HIP feature set has been ported to Metal.
-The latest checkpoint keeps the production lane on the measured faster
-host-orchestrated fallback while adding an opt-in native Metal FFN attribution
-path for stage-5 INT4 projection work.
+The latest checkpoint promotes the fused Qwen3.6 stage-5 linear-attention INT4
+Metal path into the default lane, with `SUPERSONIC_METAL_DISABLE_QWEN36_LINEAR_INT4_STAGE5=1`
+kept as the host fallback escape hatch. Native FFN projection work remains
+profile/opt-in while command-buffer wait is reduced.
 
 Reproduce the run with:
 
@@ -920,47 +921,41 @@ median.
 <!-- AUTOGEN BELOW: apple-m5-max-metal -->
 | Model           |  INT4 |
 | --------------- | ----: |
-| qwen3.6-35b-a3b | 274.6 |
+| qwen3.6-35b-a3b | 235.4 |
 
 <!-- AUTOGEN END: apple-m5-max-metal -->
 
 Latest local attribution run
-(`target/bench-runs/2026-05-22-2ecff62/perf/qwen3.6-35b-a3b_int4.json`):
+(`target/bench-runs/2026-05-22-d97ee50/perf/qwen3.6-35b-a3b_int4.json`):
 
 | Metric | Value |
 |---|---:|
-| Headline median | 274.6 ms/token |
-| Stage total | 167.637 ms/token |
-| Chain | 162.062 ms/token |
-| LM head | 5.143 ms/token |
-| FFN | 70.195 ms/token |
-| Linear attention | 75.660 ms/token |
-| Full attention | 16.028 ms/token |
-| Prefill total | 2278.376 ms |
-| MPP pilot | 16.423 TFLOP/s |
+| Headline median | 235.4 ms/token |
+| Stage total | 132.533 ms/token |
+| Chain | 119.646 ms/token |
+| LM head | 11.779 ms/token |
+| FFN | 55.391 ms/token |
+| Linear attention | 44.303 ms/token |
+| Full attention | 19.669 ms/token |
+| Prefill total | 2938.147 ms |
+| MPP pilot | 14.316 TFLOP/s |
 
-The profile top ops name two different next steps. The per-stage attribution
-bucket is now linear-attention (`75.660 ms/token`) narrowly ahead of FFN
-(`70.195 ms/token`), so the next default-lane runtime work should target the
-linear-attention projection/recurrent path. The native FFN attribution path is
-correct but not yet default: profile rows show `qwen36_ffn_int4_stage5` at
-2619.047 ms total across the attribution run and `command_buffer_wait` at
-2611.339 ms total, while an opt-in one-token combined native FFN smoke generated
-the expected token `[11]` but measured `ffn_ms_avg=1206.240`. Reduce that
-command-buffer wait before promoting native FFN into the normal lane.
+The fused linear-attention path is now the measured default win. A warmed
+one-token smoke generated the expected token `[11]` and measured
+`linear_attn_ms_avg=102.403`; the same smoke with
+`SUPERSONIC_METAL_DISABLE_QWEN36_LINEAR_INT4_STAGE5=1` measured
+`linear_attn_ms_avg=153.915`. The bench attribution run reports
+`qwen36_linear_int4_stage5` as 1071.416 ms total across 630 profiled calls;
+the largest linear sub-dispatch is `qwen36_linear_int4_projections`
+at 116.715 ms GPU time.
 
-Follow-up linear profiling keeps the normal lane unchanged and adds subphase
-rows under `SUPERSONIC_METAL_PROFILE=1`. A one-token profile smoke generated
-the expected token `[11]` and reported the linear host subphases as:
-`qwen36_linear_int4_in_proj_qkv` 100.577 ms total,
-`qwen36_linear_int4_out_proj` 43.777 ms,
-`qwen36_linear_int4_in_proj_z` 42.956 ms, and
-`qwen36_linear_recurrent_update` 25.168 ms across 30 linear layers. The
-experimental native projection split is available only with
-`SUPERSONIC_METAL_ENABLE_QWEN36_LINEAR_INT4_STAGE5=1`; the first smoke was
-correct but slower because three separate GEMV dispatches increased wait time.
-The next implementation target should therefore be a fused linear-attention
-stage-5 path, not standalone projection launches.
+The next measured bottleneck is FFN plus command-buffer wait. Per-stage
+attribution now has FFN (`55.391 ms/token`) ahead of linear attention
+(`44.303 ms/token`), and the Metal profile top ops are
+`command_buffer_wait` at 4188.511 ms total, `qwen36_ffn_int4_stage5`
+at 3098.222 ms total, and `qwen36_linear_int4_stage5` at 1071.416 ms total.
+The next default-lane optimization should therefore reduce FFN native wait or
+merge FFN sub-dispatches before tackling another linear-attention tweak.
 
 Unsupported Metal constraints remain explicit for this target: persistent
 decode, KV-FP8, speculative decode, batching, and Metal VMM are not benchmarked

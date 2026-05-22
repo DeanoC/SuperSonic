@@ -1890,10 +1890,8 @@ fn qwen36_linear_int4_stage5_metal_native_supported(
     weights: &Qwen36MoeLinearStepWeights,
     int4: &Qwen36MoeLinearStepInt4,
     output_capacity: usize,
-    qkv_dim: usize,
-    val_dim: usize,
 ) -> bool {
-    std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_LINEAR_INT4_STAGE5").is_some()
+    std::env::var_os("SUPERSONIC_METAL_DISABLE_QWEN36_LINEAR_INT4_STAGE5").is_none()
         && params.stage == 5
         && params.hidden == 2048
         && params.num_k_heads == 16
@@ -1902,12 +1900,21 @@ fn qwen36_linear_int4_stage5_metal_native_supported(
         && params.head_v_dim == 128
         && params.conv_kernel_dim == 4
         && int4.group_size == 128
-        && output_capacity >= qkv_dim + val_dim
+        && output_capacity >= params.hidden as usize
         && !crate::metal_native::disabled_by_env()
         && !weights.input_hidden.is_null()
+        && !weights.input_norm_w.is_null()
         && !weights.in_proj_qkv_w.is_null()
         && !weights.in_proj_z_w.is_null()
+        && !weights.in_proj_a_w.is_null()
+        && !weights.in_proj_b_w.is_null()
+        && !weights.conv1d_w.is_null()
+        && !weights.dt_bias.is_null()
+        && !weights.a_log.is_null()
+        && !weights.norm_w.is_null()
         && !weights.out_proj_w.is_null()
+        && !weights.conv_state.is_null()
+        && !weights.recurrent_state.is_null()
         && !int4.in_proj_qkv_scale.is_null()
         && !int4.in_proj_qkv_zero.is_null()
         && !int4.in_proj_z_scale.is_null()
@@ -1989,7 +1996,7 @@ pub fn linear_step_launch(
                     weights.norm_w,
                     weights.out_proj_w,
                     weights.conv_state,
-                    weights.recurrent_state,
+                    weights.recurrent_state as *mut c_void,
                     int4.group_size as c_int,
                     int4.in_proj_qkv_scale,
                     int4.in_proj_qkv_zero,
@@ -2160,6 +2167,69 @@ fn linear_step_stage1_5_metal_host(
         )));
     }
 
+    qwen36_validate_dense_or_int4_sidecars(
+        int4.in_proj_qkv_scale,
+        int4.in_proj_qkv_zero,
+        int4.group_size,
+        "in_proj_qkv",
+    )?;
+    qwen36_validate_dense_or_int4_sidecars(
+        int4.in_proj_z_scale,
+        int4.in_proj_z_zero,
+        int4.group_size,
+        "in_proj_z",
+    )?;
+    if params.stage >= 5 {
+        qwen36_validate_dense_or_int4_sidecars(
+            int4.out_proj_scale,
+            int4.out_proj_zero,
+            int4.group_size,
+            "out_proj",
+        )?;
+    }
+
+    if qwen36_linear_int4_stage5_metal_native_supported(params, weights, int4, output_capacity) {
+        return crate::prefill_ffi::metal_profile_time(
+            "qwen36_linear_int4_stage5",
+            "native",
+            || unsafe {
+                crate::metal_native::qwen36_linear_int4_stage5(
+                    hidden,
+                    num_k_heads,
+                    num_v_heads,
+                    head_k_dim,
+                    head_v_dim,
+                    params.conv_kernel_dim as usize,
+                    int4.group_size as usize,
+                    params.rms_norm_eps,
+                    weights.input_hidden,
+                    weights.input_norm_w,
+                    weights.in_proj_qkv_w,
+                    int4.in_proj_qkv_scale,
+                    int4.in_proj_qkv_zero,
+                    weights.in_proj_z_w,
+                    int4.in_proj_z_scale,
+                    int4.in_proj_z_zero,
+                    weights.in_proj_a_w,
+                    weights.in_proj_b_w,
+                    weights.conv1d_w,
+                    weights.conv1d_bias,
+                    weights.dt_bias,
+                    weights.a_log,
+                    weights.norm_w,
+                    weights.out_proj_w,
+                    int4.out_proj_scale,
+                    int4.out_proj_zero,
+                    weights.conv_state,
+                    weights.recurrent_state as *mut c_void,
+                    workspace.as_mut_ptr() as *mut c_void,
+                    output.as_mut_ptr() as *mut c_void,
+                    true,
+                )
+            },
+        );
+    }
+
     let input = unsafe { std::slice::from_raw_parts(weights.input_hidden as *const u16, hidden) };
     let input_norm_w =
         unsafe { std::slice::from_raw_parts(weights.input_norm_w as *const u16, hidden) };
@@ -2191,121 +2261,44 @@ fn linear_step_stage1_5_metal_host(
         x_norm
     });
 
-    qwen36_validate_dense_or_int4_sidecars(
-        int4.in_proj_qkv_scale,
-        int4.in_proj_qkv_zero,
-        int4.group_size,
-        "in_proj_qkv",
-    )?;
-    qwen36_validate_dense_or_int4_sidecars(
-        int4.in_proj_z_scale,
-        int4.in_proj_z_zero,
-        int4.group_size,
-        "in_proj_z",
-    )?;
-    if params.stage >= 5 {
-        qwen36_validate_dense_or_int4_sidecars(
-            int4.out_proj_scale,
-            int4.out_proj_zero,
-            int4.group_size,
-            "out_proj",
-        )?;
-    }
-
-    let linear_native = qwen36_linear_int4_stage5_metal_native_supported(
-        params,
-        weights,
-        int4,
-        output_capacity,
-        qkv_dim,
-        val_dim,
-    );
-
-    if linear_native {
-        let lhs_bf16 = workspace.as_mut_ptr() as *mut u16;
-        for col in 0..hidden {
-            unsafe {
-                *lhs_bf16.add(col) = f32_to_bf16_bits(x_norm[col]);
-            }
-        }
-        crate::prefill_ffi::metal_profile_time(
-            "qwen36_linear_int4_in_proj_qkv",
-            "native",
-            || unsafe {
-                crate::metal_native::matmul_rhs_transposed_int4_bf16_gemv_m1_tiled_raw(
-                    qkv_dim,
-                    hidden,
-                    int4.group_size as usize,
-                    lhs_bf16 as *const c_void,
-                    weights.in_proj_qkv_w,
-                    int4.in_proj_qkv_scale,
-                    int4.in_proj_qkv_zero,
-                    output.as_mut_ptr() as *mut c_void,
-                )
-            },
-        )?;
-        crate::prefill_ffi::metal_profile_time(
-            "qwen36_linear_int4_in_proj_z",
-            "native",
-            || unsafe {
-                crate::metal_native::matmul_rhs_transposed_int4_bf16_gemv_m1_tiled_raw(
-                    val_dim,
-                    hidden,
-                    int4.group_size as usize,
-                    lhs_bf16 as *const c_void,
-                    weights.in_proj_z_w,
-                    int4.in_proj_z_scale,
-                    int4.in_proj_z_zero,
-                    output.as_mut_ptr().add(off_z_raw) as *mut c_void,
-                )
-            },
-        )?;
-        for row in 0..qkv_dim {
-            workspace[off_qkv_raw + row] = bf16_bits_to_f32(output[off_qkv_raw + row]);
-        }
-        for row in 0..val_dim {
-            workspace[off_z_raw + row] = bf16_bits_to_f32(output[off_z_raw + row]);
-        }
-    } else {
-        crate::prefill_ffi::metal_profile_time("qwen36_linear_int4_in_proj_qkv", "host", || {
-            let qkv_w = weights.in_proj_qkv_w as usize;
-            let qkv_scale = int4.in_proj_qkv_scale as usize;
-            let qkv_zero = int4.in_proj_qkv_zero as usize;
-            let group_size = int4.group_size.max(0) as usize;
-            let qkv = &mut workspace[off_qkv_raw..off_qkv_raw + qkv_dim];
-            qwen36_parallel_chunks_mut(qkv, 64, |start, chunk| {
-                for (local, out) in chunk.iter_mut().enumerate() {
-                    let row = start + local;
-                    let acc = qwen36_dense_or_int4_dot_2d_unchecked(
-                        qkv_w, qkv_scale, qkv_zero, row, hidden, group_size, &x_norm,
-                    );
-                    *out = bf16_round_f32(acc);
-                }
-            });
-            if params.stage == 1 {
-                for row in 0..qkv_dim {
-                    output[row] = f32_to_bf16_bits(workspace[off_qkv_raw + row]);
-                }
+    crate::prefill_ffi::metal_profile_time("qwen36_linear_int4_in_proj_qkv", "host", || {
+        let qkv_w = weights.in_proj_qkv_w as usize;
+        let qkv_scale = int4.in_proj_qkv_scale as usize;
+        let qkv_zero = int4.in_proj_qkv_zero as usize;
+        let group_size = int4.group_size.max(0) as usize;
+        let qkv = &mut workspace[off_qkv_raw..off_qkv_raw + qkv_dim];
+        qwen36_parallel_chunks_mut(qkv, 64, |start, chunk| {
+            for (local, out) in chunk.iter_mut().enumerate() {
+                let row = start + local;
+                let acc = qwen36_dense_or_int4_dot_2d_unchecked(
+                    qkv_w, qkv_scale, qkv_zero, row, hidden, group_size, &x_norm,
+                );
+                *out = bf16_round_f32(acc);
             }
         });
+        if params.stage == 1 {
+            for row in 0..qkv_dim {
+                output[row] = f32_to_bf16_bits(workspace[off_qkv_raw + row]);
+            }
+        }
+    });
 
-        crate::prefill_ffi::metal_profile_time("qwen36_linear_int4_in_proj_z", "host", || {
-            let z_w = weights.in_proj_z_w as usize;
-            let z_scale = int4.in_proj_z_scale as usize;
-            let z_zero = int4.in_proj_z_zero as usize;
-            let group_size = int4.group_size.max(0) as usize;
-            let z = &mut workspace[off_z_raw..off_z_raw + val_dim];
-            qwen36_parallel_chunks_mut(z, 64, |start, chunk| {
-                for (local, out) in chunk.iter_mut().enumerate() {
-                    let row = start + local;
-                    let acc = qwen36_dense_or_int4_dot_2d_unchecked(
-                        z_w, z_scale, z_zero, row, hidden, group_size, &x_norm,
-                    );
-                    *out = bf16_round_f32(acc);
-                }
-            });
+    crate::prefill_ffi::metal_profile_time("qwen36_linear_int4_in_proj_z", "host", || {
+        let z_w = weights.in_proj_z_w as usize;
+        let z_scale = int4.in_proj_z_scale as usize;
+        let z_zero = int4.in_proj_z_zero as usize;
+        let group_size = int4.group_size.max(0) as usize;
+        let z = &mut workspace[off_z_raw..off_z_raw + val_dim];
+        qwen36_parallel_chunks_mut(z, 64, |start, chunk| {
+            for (local, out) in chunk.iter_mut().enumerate() {
+                let row = start + local;
+                let acc = qwen36_dense_or_int4_dot_2d_unchecked(
+                    z_w, z_scale, z_zero, row, hidden, group_size, &x_norm,
+                );
+                *out = bf16_round_f32(acc);
+            }
         });
-    }
+    });
     crate::prefill_ffi::metal_profile_time("qwen36_linear_in_proj_ab", "host", || {
         for row in 0..num_v_heads {
             let mut acc_a = 0.0f32;
@@ -2514,54 +2507,24 @@ fn linear_step_stage1_5_metal_host(
         }
     });
 
-    if linear_native {
-        let rec_bf16 = workspace.as_mut_ptr() as *mut u16;
-        for col in 0..val_dim {
-            unsafe {
-                *rec_bf16.add(col) = f32_to_bf16_bits(workspace[off_rec_out + col]);
+    crate::prefill_ffi::metal_profile_time("qwen36_linear_int4_out_proj", "host", || {
+        let rec_out = &workspace[off_rec_out..off_rec_out + val_dim];
+        let out_w = weights.out_proj_w as usize;
+        let out_scale = int4.out_proj_scale as usize;
+        let out_zero = int4.out_proj_zero as usize;
+        let group_size = int4.group_size.max(0) as usize;
+        qwen36_parallel_chunks_mut(&mut output[..hidden], 64, |start, chunk| {
+            for (local, out) in chunk.iter_mut().enumerate() {
+                let row = start + local;
+                let acc = qwen36_dense_or_int4_dot_2d_unchecked(
+                    out_w, out_scale, out_zero, row, val_dim, group_size, rec_out,
+                );
+                let o_out = bf16_round_f32(acc);
+                let residual = bf16_round_f32(bf16_bits_to_f32(input[row]) + o_out);
+                *out = f32_to_bf16_bits(residual);
             }
-        }
-        crate::prefill_ffi::metal_profile_time(
-            "qwen36_linear_int4_out_proj",
-            "native",
-            || unsafe {
-                crate::metal_native::matmul_rhs_transposed_int4_bf16_gemv_m1_tiled_raw(
-                    hidden,
-                    val_dim,
-                    int4.group_size as usize,
-                    rec_bf16 as *const c_void,
-                    weights.out_proj_w,
-                    int4.out_proj_scale,
-                    int4.out_proj_zero,
-                    output.as_mut_ptr() as *mut c_void,
-                )
-            },
-        )?;
-        for row in 0..hidden {
-            let o_out = bf16_bits_to_f32(output[row]);
-            let residual = bf16_round_f32(bf16_bits_to_f32(input[row]) + o_out);
-            output[row] = f32_to_bf16_bits(residual);
-        }
-    } else {
-        crate::prefill_ffi::metal_profile_time("qwen36_linear_int4_out_proj", "host", || {
-            let rec_out = &workspace[off_rec_out..off_rec_out + val_dim];
-            let out_w = weights.out_proj_w as usize;
-            let out_scale = int4.out_proj_scale as usize;
-            let out_zero = int4.out_proj_zero as usize;
-            let group_size = int4.group_size.max(0) as usize;
-            qwen36_parallel_chunks_mut(&mut output[..hidden], 64, |start, chunk| {
-                for (local, out) in chunk.iter_mut().enumerate() {
-                    let row = start + local;
-                    let acc = qwen36_dense_or_int4_dot_2d_unchecked(
-                        out_w, out_scale, out_zero, row, val_dim, group_size, rec_out,
-                    );
-                    let o_out = bf16_round_f32(acc);
-                    let residual = bf16_round_f32(bf16_bits_to_f32(input[row]) + o_out);
-                    *out = f32_to_bf16_bits(residual);
-                }
-            });
         });
-    }
+    });
 
     Ok(())
 }
