@@ -324,7 +324,7 @@ def build_run_env(
             env["SUPERSONIC_MOE_ISLAND_PREFETCH"] = mode.prefetch_mode
         if mode.prefetch_ranks:
             env["SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS"] = mode.prefetch_ranks
-    if args.no_batched_prefill:
+    if getattr(args, "no_batched_prefill", False):
         # M13: batched prefill is the default; this flag disables all three
         # stages of the batched path for A/B comparison against the legacy
         # per-token persistent decode prefill loop.
@@ -500,7 +500,10 @@ def summarize(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if not context_rows:
             summaries.append({"context_tokens_requested": context, "status": "no-successful-runs"})
             continue
-        baseline = next((row for row in context_rows if row["mode"] == "int4-vmm"), None)
+        baseline = next(
+            (row for row in context_rows if row["mode"] in {"int4-vmm", "int4"}),
+            None,
+        )
         best = min(context_rows, key=lambda row: row_ms_per_tok(row) or float("inf"))
         baseline_ms = row_ms_per_tok(baseline) if baseline else None
         best_ms = row_ms_per_tok(best)
@@ -582,7 +585,7 @@ def markdown(rows: list[dict[str, Any]], summary: list[dict[str, Any]] | None = 
     )
     baseline_ids_by_context: dict[int, list[int]] = {}
     for row in rows:
-        if row["mode"] == "int4-vmm":
+        if row["mode"] in {"int4-vmm", "int4"} and row.get("returncode") == 0:
             baseline_ids_by_context[row["context_tokens_requested"]] = row.get("generated_ids") or []
     for row in rows:
         residency = row.get("vmm_residency") or {}

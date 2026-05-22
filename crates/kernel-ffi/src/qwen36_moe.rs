@@ -1545,17 +1545,50 @@ fn attn_step_stage1_5_metal_host(
         x_norm[col] = bf16_round_f32(v * inv_rms * (1.0 + w));
     }
 
-    for row in 0..q_out_dim {
-        let acc = qwen36_dense_or_int4_dot_2d(
-            weights.q_proj_w,
-            int4.q_proj_scale,
-            int4.q_proj_zero,
-            row,
-            hidden,
+    qwen36_validate_dense_or_int4_sidecars(
+        int4.q_proj_scale,
+        int4.q_proj_zero,
+        int4.group_size,
+        "q_proj",
+    )?;
+    if params.stage >= 2 {
+        qwen36_validate_dense_or_int4_sidecars(
+            int4.k_proj_scale,
+            int4.k_proj_zero,
             int4.group_size,
-            &x_norm,
+            "k_proj",
         )?;
-        workspace[off_q_raw + row] = bf16_round_f32(acc);
+        qwen36_validate_dense_or_int4_sidecars(
+            int4.v_proj_scale,
+            int4.v_proj_zero,
+            int4.group_size,
+            "v_proj",
+        )?;
+    }
+    if params.stage >= 5 {
+        qwen36_validate_dense_or_int4_sidecars(
+            int4.o_proj_scale,
+            int4.o_proj_zero,
+            int4.group_size,
+            "o_proj",
+        )?;
+    }
+
+    {
+        let q_w = weights.q_proj_w as usize;
+        let q_scale = int4.q_proj_scale as usize;
+        let q_zero = int4.q_proj_zero as usize;
+        let group_size = int4.group_size.max(0) as usize;
+        let q_raw = &mut workspace[off_q_raw..off_q_raw + q_out_dim];
+        qwen36_parallel_chunks_mut(q_raw, 64, |start, chunk| {
+            for (local, out) in chunk.iter_mut().enumerate() {
+                let row = start + local;
+                let acc = qwen36_dense_or_int4_dot_2d_unchecked(
+                    q_w, q_scale, q_zero, row, hidden, group_size, &x_norm,
+                );
+                *out = bf16_round_f32(acc);
+            }
+        });
     }
 
     for head in 0..num_heads {
@@ -1584,27 +1617,30 @@ fn attn_step_stage1_5_metal_host(
 
     let k_norm_w = unsafe { std::slice::from_raw_parts(weights.k_norm_w as *const u16, head_dim) };
 
-    for row in 0..kv_dim {
-        let k_acc = qwen36_dense_or_int4_dot_2d(
-            weights.k_proj_w,
-            int4.k_proj_scale,
-            int4.k_proj_zero,
-            row,
-            hidden,
-            int4.group_size,
-            &x_norm,
-        )?;
-        let v_acc = qwen36_dense_or_int4_dot_2d(
-            weights.v_proj_w,
-            int4.v_proj_scale,
-            int4.v_proj_zero,
-            row,
-            hidden,
-            int4.group_size,
-            &x_norm,
-        )?;
-        workspace[off_k_raw + row] = bf16_round_f32(k_acc);
-        workspace[off_v_raw + row] = bf16_round_f32(v_acc);
+    {
+        let (_, after_k) = workspace.split_at_mut(off_k_raw);
+        let (k_raw, after_v) = after_k.split_at_mut(kv_dim);
+        let (v_raw, _) = after_v.split_at_mut(kv_dim);
+        let k_w = weights.k_proj_w as usize;
+        let k_scale = int4.k_proj_scale as usize;
+        let k_zero = int4.k_proj_zero as usize;
+        let v_w = weights.v_proj_w as usize;
+        let v_scale = int4.v_proj_scale as usize;
+        let v_zero = int4.v_proj_zero as usize;
+        let group_size = int4.group_size.max(0) as usize;
+        qwen36_parallel_chunks2_mut(k_raw, v_raw, 64, |start, k_chunk, v_chunk| {
+            for (local, (k_out, v_out)) in k_chunk.iter_mut().zip(v_chunk.iter_mut()).enumerate() {
+                let row = start + local;
+                let k_acc = qwen36_dense_or_int4_dot_2d_unchecked(
+                    k_w, k_scale, k_zero, row, hidden, group_size, &x_norm,
+                );
+                let v_acc = qwen36_dense_or_int4_dot_2d_unchecked(
+                    v_w, v_scale, v_zero, row, hidden, group_size, &x_norm,
+                );
+                *k_out = bf16_round_f32(k_acc);
+                *v_out = bf16_round_f32(v_acc);
+            }
+        });
     }
 
     for head in 0..num_kv_heads {
@@ -1740,20 +1776,33 @@ fn attn_step_stage1_5_metal_host(
         }
     }
 
-    for row in 0..hidden {
-        let acc = qwen36_dense_or_int4_dot_2d(
-            weights.o_proj_w,
-            int4.o_proj_scale,
-            int4.o_proj_zero,
-            row,
-            q_normed_dim,
-            int4.group_size,
-            &workspace[off_gated..off_gated + q_normed_dim],
-        )?;
-        let o_out = bf16_round_f32(acc);
-        let result = bf16_round_f32(bf16_bits_to_f32(input[row]) + o_out);
-        workspace[off_o_out + row] = result;
-        output[row] = f32_to_bf16_bits(result);
+    let gated = workspace[off_gated..off_gated + q_normed_dim].to_vec();
+    {
+        let o_w = weights.o_proj_w as usize;
+        let o_scale = int4.o_proj_scale as usize;
+        let o_zero = int4.o_proj_zero as usize;
+        let group_size = int4.group_size.max(0) as usize;
+        let o_out = &mut workspace[off_o_out..off_o_out + hidden];
+        qwen36_parallel_chunks2_mut(o_out, output, 64, |start, out_chunk, pub_chunk| {
+            for (local, (out, pub_out)) in
+                out_chunk.iter_mut().zip(pub_chunk.iter_mut()).enumerate()
+            {
+                let row = start + local;
+                let acc = qwen36_dense_or_int4_dot_2d_unchecked(
+                    o_w,
+                    o_scale,
+                    o_zero,
+                    row,
+                    q_normed_dim,
+                    group_size,
+                    &gated,
+                );
+                let proj = bf16_round_f32(acc);
+                let result = bf16_round_f32(bf16_bits_to_f32(input[row]) + proj);
+                *out = result;
+                *pub_out = f32_to_bf16_bits(result);
+            }
+        });
     }
 
     Ok(())
@@ -2104,33 +2153,63 @@ fn linear_step_stage1_5_metal_host(
         x_norm[col] = bf16_round_f32(v * inv_rms * (1.0 + w));
     }
 
-    for row in 0..qkv_dim {
-        let acc = qwen36_dense_or_int4_dot_2d(
-            weights.in_proj_qkv_w,
-            int4.in_proj_qkv_scale,
-            int4.in_proj_qkv_zero,
-            row,
-            hidden,
+    qwen36_validate_dense_or_int4_sidecars(
+        int4.in_proj_qkv_scale,
+        int4.in_proj_qkv_zero,
+        int4.group_size,
+        "in_proj_qkv",
+    )?;
+    qwen36_validate_dense_or_int4_sidecars(
+        int4.in_proj_z_scale,
+        int4.in_proj_z_zero,
+        int4.group_size,
+        "in_proj_z",
+    )?;
+    if params.stage >= 5 {
+        qwen36_validate_dense_or_int4_sidecars(
+            int4.out_proj_scale,
+            int4.out_proj_zero,
             int4.group_size,
-            &x_norm,
+            "out_proj",
         )?;
-        let rounded = bf16_round_f32(acc);
-        workspace[off_qkv_raw + row] = rounded;
+    }
+
+    {
+        let qkv_w = weights.in_proj_qkv_w as usize;
+        let qkv_scale = int4.in_proj_qkv_scale as usize;
+        let qkv_zero = int4.in_proj_qkv_zero as usize;
+        let group_size = int4.group_size.max(0) as usize;
+        let qkv = &mut workspace[off_qkv_raw..off_qkv_raw + qkv_dim];
+        qwen36_parallel_chunks_mut(qkv, 64, |start, chunk| {
+            for (local, out) in chunk.iter_mut().enumerate() {
+                let row = start + local;
+                let acc = qwen36_dense_or_int4_dot_2d_unchecked(
+                    qkv_w, qkv_scale, qkv_zero, row, hidden, group_size, &x_norm,
+                );
+                *out = bf16_round_f32(acc);
+            }
+        });
         if params.stage == 1 {
-            output[row] = f32_to_bf16_bits(rounded);
+            for row in 0..qkv_dim {
+                output[row] = f32_to_bf16_bits(workspace[off_qkv_raw + row]);
+            }
         }
     }
-    for row in 0..val_dim {
-        let acc = qwen36_dense_or_int4_dot_2d(
-            weights.in_proj_z_w,
-            int4.in_proj_z_scale,
-            int4.in_proj_z_zero,
-            row,
-            hidden,
-            int4.group_size,
-            &x_norm,
-        )?;
-        workspace[off_z_raw + row] = bf16_round_f32(acc);
+    {
+        let z_w = weights.in_proj_z_w as usize;
+        let z_scale = int4.in_proj_z_scale as usize;
+        let z_zero = int4.in_proj_z_zero as usize;
+        let group_size = int4.group_size.max(0) as usize;
+        let z = &mut workspace[off_z_raw..off_z_raw + val_dim];
+        qwen36_parallel_chunks_mut(z, 64, |start, chunk| {
+            for (local, out) in chunk.iter_mut().enumerate() {
+                let row = start + local;
+                let acc = qwen36_dense_or_int4_dot_2d_unchecked(
+                    z_w, z_scale, z_zero, row, hidden, group_size, &x_norm,
+                );
+                *out = bf16_round_f32(acc);
+            }
+        });
     }
     for row in 0..num_v_heads {
         let mut acc_a = 0.0f32;
@@ -2326,19 +2405,23 @@ fn linear_step_stage1_5_metal_host(
         }
     }
 
-    for row in 0..hidden {
-        let acc = qwen36_dense_or_int4_dot_2d(
-            weights.out_proj_w,
-            int4.out_proj_scale,
-            int4.out_proj_zero,
-            row,
-            val_dim,
-            int4.group_size,
-            &workspace[off_rec_out..off_rec_out + val_dim],
-        )?;
-        let o_out = bf16_round_f32(acc);
-        let residual = bf16_round_f32(bf16_bits_to_f32(input[row]) + o_out);
-        output[row] = f32_to_bf16_bits(residual);
+    let rec_out = workspace[off_rec_out..off_rec_out + val_dim].to_vec();
+    {
+        let out_w = weights.out_proj_w as usize;
+        let out_scale = int4.out_proj_scale as usize;
+        let out_zero = int4.out_proj_zero as usize;
+        let group_size = int4.group_size.max(0) as usize;
+        qwen36_parallel_chunks_mut(output, 64, |start, chunk| {
+            for (local, out) in chunk.iter_mut().enumerate() {
+                let row = start + local;
+                let acc = qwen36_dense_or_int4_dot_2d_unchecked(
+                    out_w, out_scale, out_zero, row, val_dim, group_size, &rec_out,
+                );
+                let o_out = bf16_round_f32(acc);
+                let residual = bf16_round_f32(bf16_bits_to_f32(input[row]) + o_out);
+                *out = f32_to_bf16_bits(residual);
+            }
+        });
     }
 
     Ok(())
@@ -2747,32 +2830,78 @@ fn ffn_step_stage1_5_metal_host(
 
     let shared_expert_gate_w =
         unsafe { std::slice::from_raw_parts(weights.shared_expert_gate_w as *const u16, hidden) };
+    qwen36_validate_dense_or_int4_sidecars(
+        int4.shared_gate_proj_scale,
+        int4.shared_gate_proj_zero,
+        int4.group_size,
+        "shared_gate_proj",
+    )?;
+    qwen36_validate_dense_or_int4_sidecars(
+        int4.shared_up_proj_scale,
+        int4.shared_up_proj_zero,
+        int4.group_size,
+        "shared_up_proj",
+    )?;
+    qwen36_validate_dense_or_int4_sidecars(
+        int4.shared_down_proj_scale,
+        int4.shared_down_proj_zero,
+        int4.group_size,
+        "shared_down_proj",
+    )?;
+    qwen36_validate_dense_or_int4_sidecars(
+        int4.gate_up_proj_scale,
+        int4.gate_up_proj_zero,
+        int4.group_size,
+        "gate_up_proj",
+    )?;
+    qwen36_validate_dense_or_int4_sidecars(
+        int4.down_proj_scale,
+        int4.down_proj_zero,
+        int4.group_size,
+        "down_proj",
+    )?;
 
-    for row in 0..shared_intermediate {
-        let gate_acc = qwen36_dense_or_int4_dot_2d(
-            weights.shared_gate_proj_w,
-            int4.shared_gate_proj_scale,
-            int4.shared_gate_proj_zero,
-            row,
-            hidden,
-            int4.group_size,
-            &workspace[off_h_norm..off_h_norm + hidden],
-        )?;
-        let up_acc = qwen36_dense_or_int4_dot_2d(
-            weights.shared_up_proj_w,
-            int4.shared_up_proj_scale,
-            int4.shared_up_proj_zero,
-            row,
-            hidden,
-            int4.group_size,
-            &workspace[off_h_norm..off_h_norm + hidden],
-        )?;
-        workspace[off_sgp + row] = gate_acc;
-        workspace[off_sup + row] = up_acc;
+    let h_norm = workspace[off_h_norm..off_h_norm + hidden].to_vec();
+    {
+        let (_, after_sgp) = workspace.split_at_mut(off_sgp);
+        let (sgp, after_sup) = after_sgp.split_at_mut(shared_intermediate);
+        let (sup, _) = after_sup.split_at_mut(shared_intermediate);
+        let shared_gate_w = weights.shared_gate_proj_w as usize;
+        let shared_gate_scale = int4.shared_gate_proj_scale as usize;
+        let shared_gate_zero = int4.shared_gate_proj_zero as usize;
+        let shared_up_w = weights.shared_up_proj_w as usize;
+        let shared_up_scale = int4.shared_up_proj_scale as usize;
+        let shared_up_zero = int4.shared_up_proj_zero as usize;
+        let group_size = int4.group_size.max(0) as usize;
+        qwen36_parallel_chunks2_mut(sgp, sup, 64, |start, gate_chunk, up_chunk| {
+            for (local, (gate_out, up_out)) in
+                gate_chunk.iter_mut().zip(up_chunk.iter_mut()).enumerate()
+            {
+                let row = start + local;
+                *gate_out = qwen36_dense_or_int4_dot_2d_unchecked(
+                    shared_gate_w,
+                    shared_gate_scale,
+                    shared_gate_zero,
+                    row,
+                    hidden,
+                    group_size,
+                    &h_norm,
+                );
+                *up_out = qwen36_dense_or_int4_dot_2d_unchecked(
+                    shared_up_w,
+                    shared_up_scale,
+                    shared_up_zero,
+                    row,
+                    hidden,
+                    group_size,
+                    &h_norm,
+                );
+            }
+        });
     }
     let mut sg_acc = 0.0f32;
     for col in 0..hidden {
-        sg_acc += bf16_bits_to_f32(shared_expert_gate_w[col]) * workspace[off_h_norm + col];
+        sg_acc += bf16_bits_to_f32(shared_expert_gate_w[col]) * h_norm[col];
     }
     workspace[off_sg_scalar] = 1.0f32 / (1.0f32 + (-sg_acc).exp());
 
@@ -2784,20 +2913,32 @@ fn ffn_step_stage1_5_metal_host(
     }
 
     let sg_scalar = workspace[off_sg_scalar];
-    for row in 0..hidden {
-        let acc = qwen36_dense_or_int4_dot_2d(
-            weights.shared_down_proj_w,
-            int4.shared_down_proj_scale,
-            int4.shared_down_proj_zero,
-            row,
-            shared_intermediate,
-            int4.group_size,
-            &workspace[off_shared_mid..off_shared_mid + shared_intermediate],
-        )?;
-        let val = bf16_round_f32(sg_scalar * acc);
-        workspace[off_shared_out + row] = val;
+    let shared_mid = workspace[off_shared_mid..off_shared_mid + shared_intermediate].to_vec();
+    {
+        let shared_down_w = weights.shared_down_proj_w as usize;
+        let shared_down_scale = int4.shared_down_proj_scale as usize;
+        let shared_down_zero = int4.shared_down_proj_zero as usize;
+        let group_size = int4.group_size.max(0) as usize;
+        let shared_out = &mut workspace[off_shared_out..off_shared_out + hidden];
+        qwen36_parallel_chunks_mut(shared_out, 64, |start, chunk| {
+            for (local, out) in chunk.iter_mut().enumerate() {
+                let row = start + local;
+                let acc = qwen36_dense_or_int4_dot_2d_unchecked(
+                    shared_down_w,
+                    shared_down_scale,
+                    shared_down_zero,
+                    row,
+                    shared_intermediate,
+                    group_size,
+                    &shared_mid,
+                );
+                *out = bf16_round_f32(sg_scalar * acc);
+            }
+        });
         if params.stage == 2 {
-            output[row] = f32_to_bf16_bits(val);
+            for row in 0..hidden {
+                output[row] = f32_to_bf16_bits(workspace[off_shared_out + row]);
+            }
         }
     }
 
@@ -2809,19 +2950,28 @@ fn ffn_step_stage1_5_metal_host(
     for group in 0..active_groups {
         let expert = f32::to_bits(workspace[off_topk_idx + group]) as i32 as usize;
         let gu_base = off_expert_gu + group * 2 * moe_intermediate;
-        for row in 0..(2 * moe_intermediate) {
-            let acc = qwen36_expert_dense_or_int4_dot(
-                weights.gate_up_proj_w,
-                int4.gate_up_proj_scale,
-                int4.gate_up_proj_zero,
-                expert,
-                row,
-                2 * moe_intermediate,
-                hidden,
-                int4.group_size,
-                &workspace[off_h_norm..off_h_norm + hidden],
-            )?;
-            workspace[gu_base + row] = acc;
+        {
+            let gate_up_w = weights.gate_up_proj_w as usize;
+            let gate_up_scale = int4.gate_up_proj_scale as usize;
+            let gate_up_zero = int4.gate_up_proj_zero as usize;
+            let group_size = int4.group_size.max(0) as usize;
+            let gu = &mut workspace[gu_base..gu_base + 2 * moe_intermediate];
+            qwen36_parallel_chunks_mut(gu, 64, |start, chunk| {
+                for (local, out) in chunk.iter_mut().enumerate() {
+                    let row = start + local;
+                    *out = qwen36_expert_dense_or_int4_dot_unchecked(
+                        gate_up_w,
+                        gate_up_scale,
+                        gate_up_zero,
+                        expert,
+                        row,
+                        2 * moe_intermediate,
+                        hidden,
+                        group_size,
+                        &h_norm,
+                    );
+                }
+            });
         }
 
         let mid_base = off_expert_mid + group * moe_intermediate;
@@ -2833,21 +2983,33 @@ fn ffn_step_stage1_5_metal_host(
         }
 
         let stack_base = off_expert_stack + group * hidden;
-        for row in 0..hidden {
-            let acc = qwen36_expert_dense_or_int4_dot(
-                weights.down_proj_w,
-                int4.down_proj_scale,
-                int4.down_proj_zero,
-                expert,
-                row,
-                hidden,
-                moe_intermediate,
-                int4.group_size,
-                &workspace[mid_base..mid_base + moe_intermediate],
-            )?;
-            workspace[stack_base + row] = acc;
+        let expert_mid = workspace[mid_base..mid_base + moe_intermediate].to_vec();
+        {
+            let down_w = weights.down_proj_w as usize;
+            let down_scale = int4.down_proj_scale as usize;
+            let down_zero = int4.down_proj_zero as usize;
+            let group_size = int4.group_size.max(0) as usize;
+            let stack = &mut workspace[stack_base..stack_base + hidden];
+            qwen36_parallel_chunks_mut(stack, 64, |start, chunk| {
+                for (local, out) in chunk.iter_mut().enumerate() {
+                    let row = start + local;
+                    *out = qwen36_expert_dense_or_int4_dot_unchecked(
+                        down_w,
+                        down_scale,
+                        down_zero,
+                        expert,
+                        row,
+                        hidden,
+                        moe_intermediate,
+                        group_size,
+                        &expert_mid,
+                    );
+                }
+            });
             if params.stage == 3 && group == 0 {
-                output[row] = f32_to_bf16_bits(bf16_round_f32(acc));
+                for row in 0..hidden {
+                    output[row] = f32_to_bf16_bits(bf16_round_f32(workspace[stack_base + row]));
+                }
             }
         }
     }
@@ -3065,130 +3227,162 @@ fn bf16_bits_to_f32(bits: u16) -> f32 {
     f32::from_bits((bits as u32) << 16)
 }
 
-fn qwen36_int4_value_2d(
-    packed: &[u8],
-    scale: &[u16],
-    zero: &[u16],
+fn qwen36_host_parallelism(len: usize, min_rows_per_worker: usize) -> usize {
+    if len < min_rows_per_worker.saturating_mul(2) {
+        return 1;
+    }
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    workers.min(len.div_ceil(min_rows_per_worker)).max(1)
+}
+
+fn qwen36_parallel_chunks_mut<T, F>(slice: &mut [T], min_rows_per_worker: usize, f: F)
+where
+    T: Send,
+    F: Fn(usize, &mut [T]) + Sync,
+{
+    let workers = qwen36_host_parallelism(slice.len(), min_rows_per_worker);
+    if workers <= 1 {
+        f(0, slice);
+        return;
+    }
+    let chunk = slice.len().div_ceil(workers);
+    let f = &f;
+    std::thread::scope(|scope| {
+        for (chunk_idx, chunk_slice) in slice.chunks_mut(chunk).enumerate() {
+            let start = chunk_idx * chunk;
+            scope.spawn(move || f(start, chunk_slice));
+        }
+    });
+}
+
+fn qwen36_parallel_chunks2_mut<T, U, F>(a: &mut [T], b: &mut [U], min_rows_per_worker: usize, f: F)
+where
+    T: Send,
+    U: Send,
+    F: Fn(usize, &mut [T], &mut [U]) + Sync,
+{
+    debug_assert_eq!(a.len(), b.len());
+    let workers = qwen36_host_parallelism(a.len(), min_rows_per_worker);
+    if workers <= 1 {
+        f(0, a, b);
+        return;
+    }
+    let chunk = a.len().div_ceil(workers);
+    let f = &f;
+    std::thread::scope(|scope| {
+        for (chunk_idx, (a_chunk, b_chunk)) in
+            a.chunks_mut(chunk).zip(b.chunks_mut(chunk)).enumerate()
+        {
+            let start = chunk_idx * chunk;
+            scope.spawn(move || f(start, a_chunk, b_chunk));
+        }
+    });
+}
+
+fn qwen36_validate_dense_or_int4_sidecars(
+    scale: *const c_void,
+    zero: *const c_void,
+    group_size: i32,
+    label: &str,
+) -> Result<(), GpuError> {
+    if scale.is_null() && zero.is_null() {
+        return Ok(());
+    }
+    if scale.is_null() || zero.is_null() || group_size <= 0 {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe: Metal INT4 fallback requires paired scale/zero pointers \
+             and positive group_size for {label}"
+        )));
+    }
+    Ok(())
+}
+
+fn qwen36_dense_or_int4_dot_2d_unchecked(
+    weight: usize,
+    scale: usize,
+    zero: usize,
     row: usize,
-    col: usize,
     cols: usize,
     group_size: usize,
+    x: &[f32],
 ) -> f32 {
-    let byte_cols = cols.div_ceil(2);
-    let byte = packed[row * byte_cols + col / 2];
-    let nibble = if col & 1 == 0 {
-        byte & 0x0f
-    } else {
-        (byte >> 4) & 0x0f
-    };
-    let scale_cols = cols.div_ceil(group_size);
-    let scale_idx = (row / group_size) * scale_cols + col / group_size;
-    let s = bf16_bits_to_f32(scale[scale_idx]);
-    let z = bf16_bits_to_f32(zero[scale_idx]);
-    bf16_round_f32(nibble as f32 * s - z * s)
-}
-
-fn qwen36_dense_or_int4_dot_2d(
-    weight: *const c_void,
-    scale: *const c_void,
-    zero: *const c_void,
-    row: usize,
-    cols: usize,
-    group_size: i32,
-    x: &[f32],
-) -> Result<f32, GpuError> {
-    if weight.is_null() {
-        return Err(GpuError::InvalidArg(
-            "qwen36_moe: Metal fallback received a null weight pointer".into(),
-        ));
-    }
-    if scale.is_null() && zero.is_null() {
-        let w = unsafe { std::slice::from_raw_parts(weight as *const u16, (row + 1) * cols) };
+    let mut acc = 0.0f32;
+    if scale == 0 && zero == 0 {
+        let w = weight as *const u16;
         let row_base = row * cols;
-        let mut acc = 0.0f32;
         for col in 0..cols {
-            acc += bf16_bits_to_f32(w[row_base + col]) * x[col];
+            acc += bf16_bits_to_f32(unsafe { *w.add(row_base + col) }) * x[col];
         }
-        return Ok(acc);
+        return acc;
     }
-    if scale.is_null() || zero.is_null() || group_size <= 0 {
-        return Err(GpuError::InvalidArg(
-            "qwen36_moe: Metal INT4 fallback requires paired scale/zero pointers and positive group_size"
-                .into(),
-        ));
-    }
-    let group_size = group_size as usize;
-    let packed_len = (row + 1) * cols.div_ceil(2);
-    let scale_len = (row / group_size + 1) * cols.div_ceil(group_size);
-    let packed = unsafe { std::slice::from_raw_parts(weight as *const u8, packed_len) };
-    let scale = unsafe { std::slice::from_raw_parts(scale as *const u16, scale_len) };
-    let zero = unsafe { std::slice::from_raw_parts(zero as *const u16, scale_len) };
-    let mut acc = 0.0f32;
-    for col in 0..cols {
-        acc += qwen36_int4_value_2d(packed, scale, zero, row, col, cols, group_size) * x[col];
-    }
-    Ok(acc)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn qwen36_expert_dense_or_int4_dot(
-    weight: *const c_void,
-    scale: *const c_void,
-    zero: *const c_void,
-    expert: usize,
-    row: usize,
-    rows: usize,
-    cols: usize,
-    group_size: i32,
-    x: &[f32],
-) -> Result<f32, GpuError> {
-    if weight.is_null() {
-        return Err(GpuError::InvalidArg(
-            "qwen36_moe: Metal expert fallback received a null weight pointer".into(),
-        ));
-    }
-    if scale.is_null() && zero.is_null() {
-        let len = (expert * rows + row + 1) * cols;
-        let w = unsafe { std::slice::from_raw_parts(weight as *const u16, len) };
-        let row_base = (expert * rows + row) * cols;
-        let mut acc = 0.0f32;
-        for col in 0..cols {
-            acc += bf16_bits_to_f32(w[row_base + col]) * x[col];
-        }
-        return Ok(acc);
-    }
-    if scale.is_null() || zero.is_null() || group_size <= 0 {
-        return Err(GpuError::InvalidArg(
-            "qwen36_moe: Metal expert INT4 fallback requires paired scale/zero pointers and positive group_size"
-                .into(),
-        ));
-    }
-    let group_size = group_size as usize;
+    let packed = weight as *const u8;
+    let scale = scale as *const u16;
+    let zero = zero as *const u16;
     let byte_cols = cols.div_ceil(2);
-    let scale_rows = rows.div_ceil(group_size);
     let scale_cols = cols.div_ceil(group_size);
-    let packed_len = (expert * rows + row + 1) * byte_cols;
-    let scale_len = (expert * scale_rows + row / group_size + 1) * scale_cols;
-    let packed = unsafe { std::slice::from_raw_parts(weight as *const u8, packed_len) };
-    let scale = unsafe { std::slice::from_raw_parts(scale as *const u16, scale_len) };
-    let zero = unsafe { std::slice::from_raw_parts(zero as *const u16, scale_len) };
-    let packed_base = (expert * rows + row) * byte_cols;
-    let scale_base = (expert * scale_rows + row / group_size) * scale_cols;
-    let mut acc = 0.0f32;
+    let packed_base = row * byte_cols;
+    let scale_base = (row / group_size) * scale_cols;
     for col in 0..cols {
-        let byte = packed[packed_base + col / 2];
+        let byte = unsafe { *packed.add(packed_base + col / 2) };
         let nibble = if col & 1 == 0 {
             byte & 0x0f
         } else {
             (byte >> 4) & 0x0f
         };
         let scale_idx = scale_base + col / group_size;
-        let s = bf16_bits_to_f32(scale[scale_idx]);
-        let z = bf16_bits_to_f32(zero[scale_idx]);
+        let s = bf16_bits_to_f32(unsafe { *scale.add(scale_idx) });
+        let z = bf16_bits_to_f32(unsafe { *zero.add(scale_idx) });
         let w = bf16_round_f32(nibble as f32 * s - z * s);
         acc += w * x[col];
     }
-    Ok(acc)
+    acc
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen36_expert_dense_or_int4_dot_unchecked(
+    weight: usize,
+    scale: usize,
+    zero: usize,
+    expert: usize,
+    row: usize,
+    rows: usize,
+    cols: usize,
+    group_size: usize,
+    x: &[f32],
+) -> f32 {
+    let mut acc = 0.0f32;
+    if scale == 0 && zero == 0 {
+        let w = weight as *const u16;
+        let row_base = (expert * rows + row) * cols;
+        for col in 0..cols {
+            acc += bf16_bits_to_f32(unsafe { *w.add(row_base + col) }) * x[col];
+        }
+        return acc;
+    }
+    let packed = weight as *const u8;
+    let scale = scale as *const u16;
+    let zero = zero as *const u16;
+    let byte_cols = cols.div_ceil(2);
+    let scale_rows = rows.div_ceil(group_size);
+    let scale_cols = cols.div_ceil(group_size);
+    let packed_base = (expert * rows + row) * byte_cols;
+    let scale_base = (expert * scale_rows + row / group_size) * scale_cols;
+    for col in 0..cols {
+        let byte = unsafe { *packed.add(packed_base + col / 2) };
+        let nibble = if col & 1 == 0 {
+            byte & 0x0f
+        } else {
+            (byte >> 4) & 0x0f
+        };
+        let scale_idx = scale_base + col / group_size;
+        let s = bf16_bits_to_f32(unsafe { *scale.add(scale_idx) });
+        let z = bf16_bits_to_f32(unsafe { *zero.add(scale_idx) });
+        let w = bf16_round_f32(nibble as f32 * s - z * s);
+        acc += w * x[col];
+    }
+    acc
 }
 
 /// Safe wrapper for the GPU final RMSNorm + lm_head GEMV.

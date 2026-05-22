@@ -830,6 +830,36 @@ Reproduce the run with:
 SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" cargo run --release -p supersonic-bench --bin bench-perf -- --arch apple-m5-max --models qwen3.6-35b-a3b --quants int4
 ```
 
+The local-main-target workflow for this machine is:
+
+1. quick smoke: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" cargo test --release -p runner --test qwen36_moe_metal_smoke -- --ignored --nocapture`
+2. headline decode gate: the `bench-perf --arch apple-m5-max --models qwen3.6-35b-a3b --quants int4` command above
+3. long-context smoke: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/bench_qwen36_longctx.py --preset smoke`
+4. long-context comparison: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/bench_qwen36_longctx.py --preset comparison`
+
+The Metal long-context harness writes `target/qwen36_metal_longctx.json` and
+`target/qwen36_metal_longctx.md`. It uses deterministic NIAH-style prompts and
+the supported `int4` Metal lane only, then reports generated-token sanity,
+NIAH hit/miss, `stage_timings`, `chain_breakdown`, and `lifecycle_timings`.
+The 512-token smoke is a real prefill run and is slow on the current chained
+Metal path; use `--preset comparison` as a long-running sweep before selecting
+the next runtime optimization target.
+
+Current 512-token smoke checkpoint on this M5 Max after host fallback
+row-parallelization passes through FFN, linear-attention, and full-attention
+projections:
+
+| Context | total ms/tok | tok/s | prefill s | full-attn ms | linear-attn ms | FFN ms | likely bottleneck |
+|---:|---:|---:|---:|---:|---:|---:|:---|
+| 512 | 531.15 | 1.88 | 159.87 | 51.62 | 130.73 | 234.09 | FFN |
+
+The original 512-token smoke measured roughly 2598.56 ms/token with
+prefill_total_ms=1001228.792 and FFN as the top per-token stage. The first
+row-parallel FFN pass cut prefill to roughly 553 seconds and moved the measured
+bottleneck to linear-attention; follow-up linear-attention and full-attention
+projection passes cut prefill to roughly 160 seconds. The measured next runtime
+optimization target is back to the routed expert FFN path.
+
 Capture the native Metal hardware profile before starting runtime optimization:
 
 ```bash
@@ -879,18 +909,19 @@ into the headline median.
 <!-- AUTOGEN BELOW: apple-m5-max-metal -->
 | Model           |  INT4 |
 | --------------- | ----: |
-| qwen3.6-35b-a3b | 2374.6 |
+| qwen3.6-35b-a3b | 387.2 |
 
 <!-- AUTOGEN END: apple-m5-max-metal -->
 
 Unsupported Metal constraints remain explicit for this target: persistent
 decode, KV-FP8, speculative decode, batching, and Metal VMM are not benchmarked
-or claimed here yet. The benchmark baseline plus the native Metal profile should
-drive the next runtime optimization target. Because the Qwen3.6 hero lane uses
+or claimed here yet. The benchmark baseline, long-context harness, and native
+Metal profile must name the measured bottleneck before any runtime optimization
+PR starts. Because the Qwen3.6 hero lane uses
 GPTQ-packed INT4 weights and the public MPP tile currently consumes FP16
 `MTLTensor` inputs, the next runtime PR should either prove an INT4-compatible
 MPP packing/dequant bridge or keep MPP as an attribution-only pilot while the
-native Metal path targets fused FFN/MoE dispatch overhead.
+native Metal path targets the measured routed expert FFN fallback bottleneck.
 
 ## How to reproduce
 

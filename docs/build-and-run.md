@@ -381,6 +381,31 @@ SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" \
   cargo test --release -p runner --test metal_large_model_smoke -- --ignored --nocapture
 ```
 
+The Qwen3.6 Apple M5 Max main-target loop is:
+
+```bash
+SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" \
+  cargo test --release -p runner --test qwen36_moe_metal_smoke -- --ignored --nocapture
+
+SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" \
+  cargo run --release -p supersonic-bench --bin bench-perf -- \
+  --arch apple-m5-max --models qwen3.6-35b-a3b --quants int4
+
+SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" \
+  python3 tests/metal/bench_qwen36_longctx.py --preset smoke
+```
+
+Use the long-context harness with `--preset comparison` before choosing the
+next Metal runtime optimization target. The report records generated-token
+sanity, NIAH hit/miss, stage timings, chain breakdown, and lifecycle timings
+for the supported INT4 chained-decode lane. The 512-token smoke is intentionally
+slow on the current chained Metal prefill path; treat the comparison preset as a
+long-running sweep rather than a per-commit unit gate.
+The current 512-token M5 Max smoke points at FFN as the measured next runtime
+target after host fallback row parallelism cut prefill from roughly 1001 seconds
+to roughly 160 seconds across FFN, linear-attention, and full-attention
+projection passes.
+
 ### Metal validation
 
 The canonical Apple silicon gate is:
