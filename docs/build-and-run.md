@@ -312,7 +312,11 @@ Metal currently rejects or defers:
   `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_TILED_STAGE5=1`; it also remains
   diagnostic-only because the current real decode profile is dominated by
   command-buffer wait and large bake-buffer residency rather than the GPU
-  arithmetic row. A packed active-expert variant,
+  arithmetic row. A direct-gather follow-up,
+  `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_DIRECT_GATHER_STAGE5=1`, keeps
+  original expert IDs and uses a wider tiled down/finalize kernel, but it is
+  still diagnostic-only because the measured FFN time remains above the default
+  host-orchestrated lane. A packed active-expert variant,
   `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_PACKED_STAGE5=1`, copies only the
   routed top-k expert slabs into compact scratch buffers before running the
   same combined shader. It is also diagnostic-only: it proves the giant-buffer

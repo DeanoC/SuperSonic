@@ -1073,10 +1073,23 @@ but it measured `777.3 ms/token`, `ffn_ms_avg=641.772`, and
 The command-buffer GPU attribution for the fused pack+expert shader was only
 `64.400 ms`, while `command_buffer_wait` was `2678.881 ms`; moving slab
 materialization from CPU to GPU therefore did not solve the residency/wait
-problem. The useful next FFN direction is to stop rebuilding packed expert slabs
-entirely, either by teaching the fused INT4 kernel to gather original expert IDs
-efficiently or by building a static per-layer hot table with an explicit miss
-fallback.
+problem.
+
+The direct-gather follow-up is opt-in behind
+`SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_DIRECT_GATHER_STAGE5=1`. It keeps
+the original top-k expert IDs, reads the baked expert buffers directly, and uses
+a 256-thread tiled down/finalize kernel so the down projection has the same
+wide reduction shape as gate/up. It also preserved `[11, 353, 599, 264]`, but
+the unprofiled four-token smoke measured `308.8 ms/token` with
+`ffn_ms_avg=249.990`; the profiled run measured `756.8 ms/token`,
+`ffn_ms_avg=616.225`, and
+`qwen36_ffn_int4_expert_direct_gather_stage5=2318.450 ms` across 160 layer
+calls, while the command-buffer GPU attribution for the direct gather command
+was only `55.965 ms`. That confirms the direct original-buffer gather is still
+wait/residency dominated on this model. The useful next FFN direction is an
+explicit resident representation that avoids per-token active-slab rebuilds and
+avoids random giant-buffer gathers, most likely the MPS/MPP bridge or a static
+per-layer hot table with a narrow miss fallback.
 
 The first MPS bridge step is now an attribution probe, not a decode path. With
 `SUPERSONIC_METAL_QWEN36_MPS_EXPERT_PILOT=1`, the runner appends a

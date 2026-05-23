@@ -3090,6 +3090,28 @@ fn qwen36_ffn_expert_packed_stage5_metal_native_supported(
         && !int4.down_proj_zero.is_null()
 }
 
+fn qwen36_ffn_expert_direct_gather_stage5_metal_native_supported(
+    params: Qwen36MoeFfnStepParams,
+    weights: &Qwen36MoeFfnStepWeights,
+    int4: &Qwen36MoeFfnStepInt4,
+) -> bool {
+    std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_DIRECT_GATHER_STAGE5").is_some()
+        && params.stage == 5
+        && params.hidden == 2048
+        && params.num_experts == 256
+        && params.moe_intermediate == 512
+        && params.top_k == 8
+        && int4.group_size == 128
+        && !crate::metal_native::disabled_by_env()
+        && !weights.input_hidden.is_null()
+        && !weights.gate_up_proj_w.is_null()
+        && !weights.down_proj_w.is_null()
+        && !int4.gate_up_proj_scale.is_null()
+        && !int4.gate_up_proj_zero.is_null()
+        && !int4.down_proj_scale.is_null()
+        && !int4.down_proj_zero.is_null()
+}
+
 fn qwen36_ffn_expert_gpu_pack_stage5_metal_native_supported(
     params: Qwen36MoeFfnStepParams,
     weights: &Qwen36MoeFfnStepWeights,
@@ -5243,6 +5265,37 @@ fn ffn_step_stage1_5_metal_host(
                     output_ptr,
                     off_topk_val,
                     off_shared_out,
+                    off_moe_out,
+                    true,
+                )
+            },
+        )?;
+        return Ok(());
+    }
+    if qwen36_ffn_expert_direct_gather_stage5_metal_native_supported(params, weights, int4) {
+        crate::prefill_ffi::metal_profile_time(
+            "qwen36_ffn_int4_expert_direct_gather_stage5",
+            "native",
+            || unsafe {
+                crate::metal_native::qwen36_ffn_expert_direct_gather_stage5(
+                    hidden,
+                    moe_intermediate,
+                    active_groups,
+                    int4.group_size as usize,
+                    workspace_ptr,
+                    weights.input_hidden,
+                    weights.gate_up_proj_w,
+                    int4.gate_up_proj_scale,
+                    int4.gate_up_proj_zero,
+                    weights.down_proj_w,
+                    int4.down_proj_scale,
+                    int4.down_proj_zero,
+                    output_ptr,
+                    off_h_norm,
+                    off_topk_val,
+                    off_topk_idx,
+                    off_shared_out,
+                    off_expert_mid,
                     off_moe_out,
                     true,
                 )
