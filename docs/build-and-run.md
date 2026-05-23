@@ -454,6 +454,9 @@ SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" \
   python3 tests/metal/bench_qwen36_longctx.py --preset smoke \
   --batched-prefill-feasibility
 
+SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" \
+  python3 tests/metal/audit_qwen36_mtp.py --require-complete-bake
+
 cargo build --release -p runner --bin qwen36_ffn_expert_microbench
 target/release/qwen36_ffn_expert_microbench --iters 20 --warmup 3
 ```
@@ -469,6 +472,14 @@ path but records grouped-MoE router/permutation occupancy from actual route
 choices via `[qwen36-batched-prefill-feasibility]`. The 512-token smoke is
 intentionally slow on the current chained Metal prefill path; treat the
 comparison preset as a long-running sweep rather than a per-commit unit gate.
+The MTP audit writes `target/qwen36_mtp_audit.json` and
+`target/qwen36_mtp_audit.md`. It checks the local safetensors index for the
+split source MTP tensors, checks the INT4 bake manifest for the 19 folded
+runtime tensors consumed by `mtp_loader.rs`, and can fail closed with
+`--require-complete-bake`. The current local Qwen3.6 FP8 snapshot reports
+1,560 `mtp.*` source tensors and the INT4 bake reports all 19 runtime MTP
+tensors, but speculative decode remains unsupported on the Metal policy path
+until the MTP parity and acceptance harness is wired.
 The current M5 Max perf gate points at linear-attention as the next measured
 multi-token per-token bucket after FFN fallback tightening. The 512-token
 `--metal-profile` smoke currently reports roughly 269 ms/token, 71.7 s prefill,

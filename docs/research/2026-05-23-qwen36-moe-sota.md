@@ -339,6 +339,12 @@ under the same smoke:
 4. **Qwen3.6 MTP tensor audit**
    Parse local safetensors/bakes for MTP heads and write down the loader delta
    before implementing speculative decode.
+   Initial implementation landed as `tests/metal/audit_qwen36_mtp.py`. The
+   local M5 Max cache reports the FP8 source snapshot as complete with 1,560
+   `mtp.*` tensors, and the INT4 bake manifest as complete with the 19 folded
+   runtime tensors consumed by `mtp_loader.rs`. The loader delta is therefore
+   "model files ready, Metal speculative decode still policy-blocked until a
+   parity/acceptance harness is wired."
 
 ## Sources
 

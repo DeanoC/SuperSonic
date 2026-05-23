@@ -859,8 +859,9 @@ The local-main-target workflow for this machine is:
 3. long-context smoke: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/bench_qwen36_longctx.py --preset smoke`
 4. profile smoke: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/bench_qwen36_longctx.py --preset smoke --metal-profile`
 5. batched-prefill MoE feasibility: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/bench_qwen36_longctx.py --preset smoke --batched-prefill-feasibility`
-6. routed-expert FFN microbench: `target/release/qwen36_ffn_expert_microbench --iters 20 --warmup 3`
-7. long-context comparison: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/bench_qwen36_longctx.py --preset comparison`
+6. MTP tensor audit: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/audit_qwen36_mtp.py --require-complete-bake`
+7. routed-expert FFN microbench: `target/release/qwen36_ffn_expert_microbench --iters 20 --warmup 3`
+8. long-context comparison: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/bench_qwen36_longctx.py --preset comparison`
 
 The Metal long-context harness writes `target/qwen36_metal_longctx.json` and
 `target/qwen36_metal_longctx.md`. It uses deterministic NIAH-style prompts and
@@ -877,6 +878,13 @@ coverage.
 The 512-token smoke is a real prefill run and is slow on the current chained
 Metal path; use `--preset comparison` as a long-running sweep before selecting
 the next runtime optimization target.
+`tests/metal/audit_qwen36_mtp.py` is the speculative-decode readiness audit. It
+checks the source snapshot for the split MTP expert tensors and the INT4 bake
+for the 19 folded `mtp.*` tensors loaded by the runtime. On this local M5 Max
+cache, the audit reports `source=complete` with 1,560 `mtp.*` tensors and
+`bake=complete` with all 19 runtime MTP tensors, so the model files are ready
+for the next MTP parity harness. Metal speculative decode is still unsupported
+until that harness exists and measures acceptance separately from FFN latency.
 
 Current 512-token `--metal-profile` smoke checkpoint on this M5 Max after the
 FFN fallback tightening and profile parser work:
