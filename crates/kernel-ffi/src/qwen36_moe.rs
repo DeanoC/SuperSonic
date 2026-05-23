@@ -20,7 +20,7 @@
 use std::ffi::{c_int, c_void};
 use std::os::raw::c_uint;
 
-use gpu_hal::{Backend, GpuBuffer, GpuError, ScalarType};
+use gpu_hal::{Backend, BufferKind, GpuBuffer, GpuError, ScalarType};
 
 use crate::layer_desc::MAX_BATCH_SIZE;
 
@@ -2678,6 +2678,199 @@ fn qwen36_ffn_expert_tiled_stage5_metal_native_supported(
         && !int4.down_proj_zero.is_null()
 }
 
+fn qwen36_ffn_expert_packed_stage5_metal_native_supported(
+    params: Qwen36MoeFfnStepParams,
+    weights: &Qwen36MoeFfnStepWeights,
+    int4: &Qwen36MoeFfnStepInt4,
+) -> bool {
+    std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_PACKED_STAGE5").is_some()
+        && params.stage == 5
+        && params.hidden == 2048
+        && params.num_experts == 256
+        && params.moe_intermediate == 512
+        && params.top_k == 8
+        && int4.group_size == 128
+        && !crate::metal_native::disabled_by_env()
+        && !weights.input_hidden.is_null()
+        && !weights.gate_up_proj_w.is_null()
+        && !weights.down_proj_w.is_null()
+        && !int4.gate_up_proj_scale.is_null()
+        && !int4.gate_up_proj_zero.is_null()
+        && !int4.down_proj_scale.is_null()
+        && !int4.down_proj_zero.is_null()
+}
+
+struct Qwen36PackedExpertBuffers {
+    gate_up_proj: GpuBuffer,
+    gate_up_scale: GpuBuffer,
+    gate_up_zero: GpuBuffer,
+    down_proj: GpuBuffer,
+    down_scale: GpuBuffer,
+    down_zero: GpuBuffer,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen36_pack_active_experts_for_metal(
+    ordinal: usize,
+    hidden: usize,
+    moe_intermediate: usize,
+    active_experts: &[usize],
+    group_size: usize,
+    num_experts: usize,
+    gate_up_proj_ptr: *const c_void,
+    gate_up_scale_ptr: *const c_void,
+    gate_up_zero_ptr: *const c_void,
+    down_proj_ptr: *const c_void,
+    down_scale_ptr: *const c_void,
+    down_zero_ptr: *const c_void,
+) -> Result<Qwen36PackedExpertBuffers, GpuError> {
+    if active_experts.is_empty() {
+        return Err(GpuError::InvalidArg(
+            "qwen36_pack_active_experts_for_metal: active_experts must not be empty".into(),
+        ));
+    }
+    if group_size == 0
+        || hidden == 0
+        || moe_intermediate == 0
+        || hidden % 2 != 0
+        || moe_intermediate % 2 != 0
+        || hidden % group_size != 0
+        || moe_intermediate % group_size != 0
+        || (2 * moe_intermediate) % group_size != 0
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_pack_active_experts_for_metal: unsupported geometry hidden={hidden} moe_intermediate={moe_intermediate} group_size={group_size}"
+        )));
+    }
+    if gate_up_proj_ptr.is_null()
+        || gate_up_scale_ptr.is_null()
+        || gate_up_zero_ptr.is_null()
+        || down_proj_ptr.is_null()
+        || down_scale_ptr.is_null()
+        || down_zero_ptr.is_null()
+    {
+        return Err(GpuError::InvalidArg(
+            "qwen36_pack_active_experts_for_metal: null expert tensor pointer".into(),
+        ));
+    }
+    for &expert in active_experts {
+        if expert >= num_experts {
+            return Err(GpuError::InvalidArg(format!(
+                "qwen36_pack_active_experts_for_metal: expert index {expert} >= num_experts {num_experts}"
+            )));
+        }
+    }
+
+    let groups = active_experts.len();
+    let gate_up_rows = 2 * moe_intermediate;
+    let gate_up_byte_cols = hidden / 2;
+    let gate_up_bytes_per_expert = gate_up_rows * gate_up_byte_cols;
+    let gate_up_sidecar_rows = gate_up_rows / group_size;
+    let gate_up_sidecar_cols = hidden / group_size;
+    let gate_up_sidecar_elems_per_expert = gate_up_sidecar_rows * gate_up_sidecar_cols;
+
+    let down_rows = hidden;
+    let down_byte_cols = moe_intermediate / 2;
+    let down_bytes_per_expert = down_rows * down_byte_cols;
+    let down_sidecar_rows = hidden / group_size;
+    let down_sidecar_cols = moe_intermediate / group_size;
+    let down_sidecar_elems_per_expert = down_sidecar_rows * down_sidecar_cols;
+
+    let mut gate_up_proj = GpuBuffer::alloc_with_kind(
+        ordinal,
+        ScalarType::U8,
+        &[groups, gate_up_rows, gate_up_byte_cols],
+        BufferKind::Scratch,
+    )?;
+    let mut gate_up_scale = GpuBuffer::alloc_with_kind(
+        ordinal,
+        ScalarType::BF16,
+        &[groups, gate_up_sidecar_rows, gate_up_sidecar_cols],
+        BufferKind::Scratch,
+    )?;
+    let mut gate_up_zero = GpuBuffer::alloc_with_kind(
+        ordinal,
+        ScalarType::BF16,
+        &[groups, gate_up_sidecar_rows, gate_up_sidecar_cols],
+        BufferKind::Scratch,
+    )?;
+    let mut down_proj = GpuBuffer::alloc_with_kind(
+        ordinal,
+        ScalarType::U8,
+        &[groups, down_rows, down_byte_cols],
+        BufferKind::Scratch,
+    )?;
+    let mut down_scale = GpuBuffer::alloc_with_kind(
+        ordinal,
+        ScalarType::BF16,
+        &[groups, down_sidecar_rows, down_sidecar_cols],
+        BufferKind::Scratch,
+    )?;
+    let mut down_zero = GpuBuffer::alloc_with_kind(
+        ordinal,
+        ScalarType::BF16,
+        &[groups, down_sidecar_rows, down_sidecar_cols],
+        BufferKind::Scratch,
+    )?;
+
+    let gate_up_src = gate_up_proj_ptr as *const u8;
+    let gate_up_scale_src = gate_up_scale_ptr as *const u16;
+    let gate_up_zero_src = gate_up_zero_ptr as *const u16;
+    let down_src = down_proj_ptr as *const u8;
+    let down_scale_src = down_scale_ptr as *const u16;
+    let down_zero_src = down_zero_ptr as *const u16;
+    let gate_up_dst = gate_up_proj.as_mut_ptr() as *mut u8;
+    let gate_up_scale_dst = gate_up_scale.as_mut_ptr() as *mut u16;
+    let gate_up_zero_dst = gate_up_zero.as_mut_ptr() as *mut u16;
+    let down_dst = down_proj.as_mut_ptr() as *mut u8;
+    let down_scale_dst = down_scale.as_mut_ptr() as *mut u16;
+    let down_zero_dst = down_zero.as_mut_ptr() as *mut u16;
+
+    for (group, &expert) in active_experts.iter().enumerate() {
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                gate_up_src.add(expert * gate_up_bytes_per_expert),
+                gate_up_dst.add(group * gate_up_bytes_per_expert),
+                gate_up_bytes_per_expert,
+            );
+            std::ptr::copy_nonoverlapping(
+                gate_up_scale_src.add(expert * gate_up_sidecar_elems_per_expert),
+                gate_up_scale_dst.add(group * gate_up_sidecar_elems_per_expert),
+                gate_up_sidecar_elems_per_expert,
+            );
+            std::ptr::copy_nonoverlapping(
+                gate_up_zero_src.add(expert * gate_up_sidecar_elems_per_expert),
+                gate_up_zero_dst.add(group * gate_up_sidecar_elems_per_expert),
+                gate_up_sidecar_elems_per_expert,
+            );
+            std::ptr::copy_nonoverlapping(
+                down_src.add(expert * down_bytes_per_expert),
+                down_dst.add(group * down_bytes_per_expert),
+                down_bytes_per_expert,
+            );
+            std::ptr::copy_nonoverlapping(
+                down_scale_src.add(expert * down_sidecar_elems_per_expert),
+                down_scale_dst.add(group * down_sidecar_elems_per_expert),
+                down_sidecar_elems_per_expert,
+            );
+            std::ptr::copy_nonoverlapping(
+                down_zero_src.add(expert * down_sidecar_elems_per_expert),
+                down_zero_dst.add(group * down_sidecar_elems_per_expert),
+                down_sidecar_elems_per_expert,
+            );
+        }
+    }
+
+    Ok(Qwen36PackedExpertBuffers {
+        gate_up_proj,
+        gate_up_scale,
+        gate_up_zero,
+        down_proj,
+        down_scale,
+        down_zero,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn ffn_expert_gate_up_tiled_metal_launch(
     hidden: usize,
@@ -3056,6 +3249,7 @@ fn ffn_step_stage1_5_metal_host(
         unsafe { std::slice::from_raw_parts(weights.gate_w as *const u16, num_experts * hidden) };
     let workspace_ptr = workspace.as_mut_ptr();
     let output_ptr = output.as_mut_ptr();
+    let output_ordinal = output.device_ordinal();
     let output =
         unsafe { std::slice::from_raw_parts_mut(output.as_mut_ptr() as *mut u16, output_len) };
     let output_idx =
@@ -3291,6 +3485,63 @@ fn ffn_step_stage1_5_metal_host(
     }
 
     let active_groups = if params.stage == 3 { 1 } else { top_k };
+    let active_experts: Vec<usize> = (0..active_groups)
+        .map(|group| f32::to_bits(workspace[off_topk_idx + group]) as i32 as usize)
+        .collect();
+    if qwen36_ffn_expert_packed_stage5_metal_native_supported(params, weights, int4) {
+        let packed = crate::prefill_ffi::metal_profile_time(
+            "qwen36_ffn_int4_expert_pack_stage5",
+            "host",
+            || {
+                qwen36_pack_active_experts_for_metal(
+                    output_ordinal,
+                    hidden,
+                    moe_intermediate,
+                    &active_experts,
+                    int4.group_size as usize,
+                    num_experts,
+                    weights.gate_up_proj_w,
+                    int4.gate_up_proj_scale,
+                    int4.gate_up_proj_zero,
+                    weights.down_proj_w,
+                    int4.down_proj_scale,
+                    int4.down_proj_zero,
+                )
+            },
+        )?;
+        for group in 0..active_groups {
+            workspace[off_topk_idx + group] = f32::from_bits(group as u32);
+        }
+        crate::prefill_ffi::metal_profile_time(
+            "qwen36_ffn_int4_expert_packed_stage5",
+            "native",
+            || unsafe {
+                crate::metal_native::qwen36_ffn_expert_gate_up_down_finalize_tiled(
+                    hidden,
+                    moe_intermediate,
+                    active_groups,
+                    int4.group_size as usize,
+                    workspace_ptr,
+                    weights.input_hidden,
+                    packed.gate_up_proj.as_ptr(),
+                    packed.gate_up_scale.as_ptr(),
+                    packed.gate_up_zero.as_ptr(),
+                    packed.down_proj.as_ptr(),
+                    packed.down_scale.as_ptr(),
+                    packed.down_zero.as_ptr(),
+                    output_ptr,
+                    off_h_norm,
+                    off_topk_val,
+                    off_topk_idx,
+                    off_shared_out,
+                    off_expert_mid,
+                    off_moe_out,
+                    true,
+                )
+            },
+        )?;
+        return Ok(());
+    }
     if qwen36_ffn_expert_tiled_stage5_metal_native_supported(params, weights, int4) {
         crate::prefill_ffi::metal_profile_time(
             "qwen36_ffn_int4_expert_gate_up_down_finalize_tiled",
@@ -3323,9 +3574,6 @@ fn ffn_step_stage1_5_metal_host(
         return Ok(());
     }
 
-    let active_experts: Vec<usize> = (0..active_groups)
-        .map(|group| f32::to_bits(workspace[off_topk_idx + group]) as i32 as usize)
-        .collect();
     if qwen36_ffn_expert_gate_up_tiled_metal_native_supported(params, weights, int4) {
         crate::prefill_ffi::metal_profile_time(
             "qwen36_ffn_int4_expert_gate_up_tiled",

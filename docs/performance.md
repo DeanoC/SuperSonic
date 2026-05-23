@@ -840,7 +840,11 @@ down/finalize path is available behind
 `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_TILED_STAGE5=1`; it keeps the
 `expert_mid` workspace device-side, but remains diagnostic-only because the
 real model profile points at command-buffer wait and bake-buffer residency
-rather than raw shader arithmetic.
+rather than raw shader arithmetic. The packed active-expert variant behind
+`SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_PACKED_STAGE5=1` copies only routed
+top-k expert slabs into compact scratch buffers before launching the same
+combined shader. It is a residency attribution experiment, not a default
+runtime path.
 
 Reproduce the run with:
 
@@ -997,10 +1001,22 @@ across 40 layers, but only 19.760 ms total GPU time for
 `command_buffer_wait` accounts for 1561.827 ms total in the same run. The
 combined microbench proves the arithmetic path is cheap on synthetic resident
 buffers; the real decode path is now pointing at command-buffer waits plus
-large GPTQ bake-buffer residency/page movement. The next runtime optimization
-should therefore attack buffer residency, expert-weight packing/prefetch, or an
-MPS/MPP-backed expert matvec bridge before any routed-expert FFN path is made
-default.
+large GPTQ bake-buffer residency/page movement.
+
+The packed active-expert path is the first residency experiment on the real
+model. With `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_PACKED_STAGE5=1`, the
+unprofiled one-token smoke still generates `[11]` and improves the pathological
+combined path to `337.4 ms/token` with `ffn_ms_avg=177.706`. The profiled run
+measures `376.1 ms/token`, `ffn_ms_avg=184.798`, `100.287 ms` total in
+`qwen36_ffn_int4_expert_pack_stage5`, `43.556 ms` total in
+`qwen36_ffn_int4_expert_packed_stage5`, and `21.075 ms` total GPU time for the
+combined shader. `command_buffer_wait` drops from the pathological
+`1561.827 ms` to `182.291 ms`, so packing confirms that the giant expert
+buffers caused most of the previous wall time. It is still slower than the
+default FFN lane because the per-token CPU pack copies active expert slabs from
+every layer. The next runtime optimization should therefore focus on persistent
+hot-expert packing, prefetch/residency reuse across tokens, or an MPS/MPP-backed
+expert matvec bridge before any routed-expert FFN path is made default.
 
 Unsupported Metal constraints remain explicit for this target: persistent
 decode, KV-FP8, speculative decode, batching, and Metal VMM are not benchmarked

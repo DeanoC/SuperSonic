@@ -312,7 +312,12 @@ Metal currently rejects or defers:
   `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_TILED_STAGE5=1`; it also remains
   diagnostic-only because the current real decode profile is dominated by
   command-buffer wait and large bake-buffer residency rather than the GPU
-  arithmetic row. The one-token local smoke is:
+  arithmetic row. A packed active-expert variant,
+  `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_PACKED_STAGE5=1`, copies only the
+  routed top-k expert slabs into compact scratch buffers before running the
+  same combined shader. It is also diagnostic-only: it proves the giant-buffer
+  residency fault is real, but the CPU packing cost is still too high for the
+  default lane. The one-token local smoke is:
   `cargo run --release --bin supersonic -- --backend metal --model qwen3.6-35b-a3b --model-dir /path/to/Qwen3.6-35B-A3B --int4 --prompt "Hello" --max-new-tokens 1 --emit-stage-timings`.
   FP8-runtime, KV-FP8, speculative decode, and persistent decode remain
   unsupported on this Metal path.
@@ -336,6 +341,8 @@ Native Metal kernels used in the hot path:
   microbenching and explicit opt-in attribution
 - Qwen3.6 routed-expert gate/up + down/finalize tiled INT4 kernel for focused
   FFN microbenching and explicit opt-in attribution
+- Qwen3.6 packed active-expert routed FFN experiment for explicit
+  residency-attribution runs
 - linear prefill conv pack
 - element add
 - cast
@@ -447,11 +454,15 @@ stage-5 INT4 geometry. Wired into real decode with
 still generates `[11]`, but it regresses badly: the profiled one-token smoke
 measured `ffn_ms_avg=1458.677`, with only `19.760 ms` total GPU time for
 `command_buffer_gpu:qwen36_ffn_int4_expert_gate_up_down_finalize_tiled` across
-40 layers and `1561.827 ms` in `command_buffer_wait`. The next FFN target is
-therefore not more arithmetic in this shader; it is command-buffer wait and
-real bake-buffer residency/page movement, or a packing/prefetch strategy that
-keeps the expert data resident before promoting a default routed-expert GPU
-path.
+40 layers and `1561.827 ms` in `command_buffer_wait`. The packed active-expert
+variant still generates `[11]` and cuts the unprofiled one-token result to
+roughly `337 ms/token`, but profile attribution shows `100.287 ms` in
+`qwen36_ffn_int4_expert_pack_stage5`, `43.556 ms` in
+`qwen36_ffn_int4_expert_packed_stage5`, and `182.291 ms` in
+`command_buffer_wait`. The next FFN target is therefore not more arithmetic in
+this shader; it is persistent hot-expert packing, prefetch/residency reuse, or
+an MPS/MPP-backed expert matvec bridge that avoids copying active expert slabs
+every token.
 
 ### Metal validation
 
