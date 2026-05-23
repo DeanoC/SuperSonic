@@ -109,6 +109,9 @@ struct Qwen36PackedExpertCacheProfileAccumulator {
     copied_bytes: u64,
     active_groups_total: u64,
     max_active_groups: usize,
+    slot_hits: u64,
+    slot_misses: u64,
+    evictions: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -121,6 +124,9 @@ pub struct Qwen36PackedExpertCacheProfileSnapshot {
     pub active_groups_total: u64,
     pub max_active_groups: usize,
     pub entries: usize,
+    pub slot_hits: u64,
+    pub slot_misses: u64,
+    pub evictions: u64,
 }
 
 impl Qwen36PackedExpertCacheProfileSnapshot {
@@ -146,6 +152,15 @@ impl Qwen36PackedExpertCacheProfileSnapshot {
             0.0
         } else {
             self.copied_bytes as f64 / copy_ops as f64
+        }
+    }
+
+    pub fn slot_hit_rate(&self) -> f64 {
+        let total = self.slot_hits + self.slot_misses;
+        if total == 0 {
+            0.0
+        } else {
+            self.slot_hits as f64 / total as f64
         }
     }
 }
@@ -183,7 +198,11 @@ pub fn qwen36_packed_expert_cache_profile_snapshot() -> Qwen36PackedExpertCacheP
     let entries = QWEN36_PACKED_EXPERT_CACHE
         .get()
         .and_then(|cache| cache.lock().ok().map(|cache| cache.len()))
-        .unwrap_or(0);
+        .unwrap_or(0)
+        + QWEN36_PACKED_EXPERT_HOTSET_CACHE
+            .get()
+            .and_then(|cache| cache.lock().ok().map(|cache| cache.len()))
+            .unwrap_or(0);
     let Some(profile) = QWEN36_PACKED_EXPERT_CACHE_PROFILE.get() else {
         return Qwen36PackedExpertCacheProfileSnapshot {
             entries,
@@ -202,6 +221,9 @@ pub fn qwen36_packed_expert_cache_profile_snapshot() -> Qwen36PackedExpertCacheP
         active_groups_total: profile.active_groups_total,
         max_active_groups: profile.max_active_groups,
         entries,
+        slot_hits: profile.slot_hits,
+        slot_misses: profile.slot_misses,
+        evictions: profile.evictions,
     }
 }
 
@@ -221,6 +243,9 @@ fn qwen36_packed_expert_cache_profile_record(
     allocation: bool,
     active_groups: usize,
     copied_bytes: usize,
+    slot_hits: usize,
+    slot_misses: usize,
+    evictions: usize,
 ) {
     if !qwen36_packed_expert_cache_profile_enabled() {
         return;
@@ -243,6 +268,9 @@ fn qwen36_packed_expert_cache_profile_record(
         profile.allocations += 1;
     }
     profile.copied_bytes += copied_bytes as u64;
+    profile.slot_hits += slot_hits as u64;
+    profile.slot_misses += slot_misses as u64;
+    profile.evictions += evictions as u64;
 }
 
 fn qwen36_route_profile_layers() -> usize {
@@ -3121,8 +3149,18 @@ struct Qwen36PackedExpertCacheEntry {
     buffers: Qwen36PackedExpertBuffers,
 }
 
+struct Qwen36PackedExpertHotsetCacheEntry {
+    slot_experts: Vec<Option<usize>>,
+    slot_last_used: Vec<u64>,
+    next_stamp: u64,
+    buffers: Qwen36PackedExpertBuffers,
+}
+
 static QWEN36_PACKED_EXPERT_CACHE: OnceLock<
     Mutex<HashMap<Qwen36PackedExpertCacheKey, Qwen36PackedExpertCacheEntry>>,
+> = OnceLock::new();
+static QWEN36_PACKED_EXPERT_HOTSET_CACHE: OnceLock<
+    Mutex<HashMap<Qwen36PackedExpertCacheKey, Qwen36PackedExpertHotsetCacheEntry>>,
 > = OnceLock::new();
 
 #[allow(clippy::too_many_arguments)]
@@ -3270,6 +3308,122 @@ fn qwen36_packed_expert_copy_bytes(
             + down_bytes_per_expert
             + 2 * gate_up_sidecar_elems_per_expert * bf16_bytes
             + 2 * down_sidecar_elems_per_expert * bf16_bytes)
+}
+
+fn qwen36_packed_expert_hotset_capacity(top_k: usize) -> Option<usize> {
+    if std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_PACK_HOTSET").is_none() {
+        return None;
+    }
+    let capacity = std::env::var("SUPERSONIC_METAL_QWEN36_FFN_EXPERT_HOTSET_CAPACITY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(16);
+    Some(capacity.clamp(top_k, 256))
+}
+
+fn qwen36_hotset_choose_slot(
+    slot_experts: &[Option<usize>],
+    slot_last_used: &[u64],
+    protected_slots: &[bool],
+    expert: usize,
+) -> (usize, bool, bool) {
+    if let Some(slot) = slot_experts
+        .iter()
+        .position(|&slot_expert| slot_expert == Some(expert))
+    {
+        return (slot, true, false);
+    }
+    if let Some(slot) = slot_experts
+        .iter()
+        .enumerate()
+        .find_map(|(slot, expert)| (expert.is_none() && !protected_slots[slot]).then_some(slot))
+    {
+        return (slot, false, false);
+    }
+    let (slot, _) = slot_last_used
+        .iter()
+        .enumerate()
+        .filter(|(slot, _)| !protected_slots[*slot])
+        .min_by_key(|(_, stamp)| *stamp)
+        .expect("qwen36 hotset capacity must leave at least one unprotected slot");
+    (slot, false, true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen36_fill_packed_expert_slot_for_metal(
+    hidden: usize,
+    moe_intermediate: usize,
+    expert: usize,
+    slot: usize,
+    group_size: usize,
+    gate_up_proj_ptr: *const c_void,
+    gate_up_scale_ptr: *const c_void,
+    gate_up_zero_ptr: *const c_void,
+    down_proj_ptr: *const c_void,
+    down_scale_ptr: *const c_void,
+    down_zero_ptr: *const c_void,
+    buffers: &mut Qwen36PackedExpertBuffers,
+) {
+    let gate_up_rows = 2 * moe_intermediate;
+    let gate_up_byte_cols = hidden / 2;
+    let gate_up_bytes_per_expert = gate_up_rows * gate_up_byte_cols;
+    let gate_up_sidecar_rows = gate_up_rows / group_size;
+    let gate_up_sidecar_cols = hidden / group_size;
+    let gate_up_sidecar_elems_per_expert = gate_up_sidecar_rows * gate_up_sidecar_cols;
+
+    let down_rows = hidden;
+    let down_byte_cols = moe_intermediate / 2;
+    let down_bytes_per_expert = down_rows * down_byte_cols;
+    let down_sidecar_rows = hidden / group_size;
+    let down_sidecar_cols = moe_intermediate / group_size;
+    let down_sidecar_elems_per_expert = down_sidecar_rows * down_sidecar_cols;
+
+    let gate_up_src = gate_up_proj_ptr as *const u8;
+    let gate_up_scale_src = gate_up_scale_ptr as *const u16;
+    let gate_up_zero_src = gate_up_zero_ptr as *const u16;
+    let down_src = down_proj_ptr as *const u8;
+    let down_scale_src = down_scale_ptr as *const u16;
+    let down_zero_src = down_zero_ptr as *const u16;
+    let gate_up_dst = buffers.gate_up_proj.as_mut_ptr() as *mut u8;
+    let gate_up_scale_dst = buffers.gate_up_scale.as_mut_ptr() as *mut u16;
+    let gate_up_zero_dst = buffers.gate_up_zero.as_mut_ptr() as *mut u16;
+    let down_dst = buffers.down_proj.as_mut_ptr() as *mut u8;
+    let down_scale_dst = buffers.down_scale.as_mut_ptr() as *mut u16;
+    let down_zero_dst = buffers.down_zero.as_mut_ptr() as *mut u16;
+
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            gate_up_src.add(expert * gate_up_bytes_per_expert),
+            gate_up_dst.add(slot * gate_up_bytes_per_expert),
+            gate_up_bytes_per_expert,
+        );
+        std::ptr::copy_nonoverlapping(
+            gate_up_scale_src.add(expert * gate_up_sidecar_elems_per_expert),
+            gate_up_scale_dst.add(slot * gate_up_sidecar_elems_per_expert),
+            gate_up_sidecar_elems_per_expert,
+        );
+        std::ptr::copy_nonoverlapping(
+            gate_up_zero_src.add(expert * gate_up_sidecar_elems_per_expert),
+            gate_up_zero_dst.add(slot * gate_up_sidecar_elems_per_expert),
+            gate_up_sidecar_elems_per_expert,
+        );
+        std::ptr::copy_nonoverlapping(
+            down_src.add(expert * down_bytes_per_expert),
+            down_dst.add(slot * down_bytes_per_expert),
+            down_bytes_per_expert,
+        );
+        std::ptr::copy_nonoverlapping(
+            down_scale_src.add(expert * down_sidecar_elems_per_expert),
+            down_scale_dst.add(slot * down_sidecar_elems_per_expert),
+            down_sidecar_elems_per_expert,
+        );
+        std::ptr::copy_nonoverlapping(
+            down_zero_src.add(expert * down_sidecar_elems_per_expert),
+            down_zero_dst.add(slot * down_sidecar_elems_per_expert),
+            down_sidecar_elems_per_expert,
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3484,6 +3638,9 @@ where
                         false,
                         active_experts.len(),
                         copy_bytes,
+                        0,
+                        active_experts.len(),
+                        0,
                     );
                 } else {
                     qwen36_packed_expert_cache_profile_record(
@@ -3491,6 +3648,9 @@ where
                         false,
                         false,
                         active_experts.len(),
+                        0,
+                        active_experts.len(),
+                        0,
                         0,
                     );
                 }
@@ -3529,6 +3689,9 @@ where
                 true,
                 active_experts.len(),
                 copy_bytes,
+                0,
+                active_experts.len(),
+                0,
             );
             Ok(())
         },
@@ -3537,6 +3700,160 @@ where
         GpuError::backend(
             Backend::Metal,
             "qwen36 packed expert cache entry missing after fill".into(),
+        )
+    })?;
+    f(&entry.buffers)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen36_with_hotset_packed_experts_for_metal<T, F>(
+    ordinal: usize,
+    hidden: usize,
+    moe_intermediate: usize,
+    active_experts: &[usize],
+    group_size: usize,
+    num_experts: usize,
+    capacity: usize,
+    workspace: &mut [f32],
+    off_topk_idx: usize,
+    gate_up_proj_ptr: *const c_void,
+    gate_up_scale_ptr: *const c_void,
+    gate_up_zero_ptr: *const c_void,
+    down_proj_ptr: *const c_void,
+    down_scale_ptr: *const c_void,
+    down_zero_ptr: *const c_void,
+    f: F,
+) -> Result<T, GpuError>
+where
+    F: FnOnce(&Qwen36PackedExpertBuffers) -> Result<T, GpuError>,
+{
+    qwen36_validate_active_expert_pack(
+        hidden,
+        moe_intermediate,
+        active_experts,
+        group_size,
+        num_experts,
+        gate_up_proj_ptr,
+        gate_up_scale_ptr,
+        gate_up_zero_ptr,
+        down_proj_ptr,
+        down_scale_ptr,
+        down_zero_ptr,
+    )?;
+    if capacity < active_experts.len() {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36 hotset packed expert cache capacity {capacity} < active groups {}",
+            active_experts.len()
+        )));
+    }
+    if off_topk_idx + active_experts.len() > workspace.len() {
+        return Err(GpuError::InvalidArg(
+            "qwen36 hotset packed expert cache topk workspace out of bounds".into(),
+        ));
+    }
+
+    let key = Qwen36PackedExpertCacheKey {
+        gate_up_proj_ptr: gate_up_proj_ptr as usize,
+        gate_up_scale_ptr: gate_up_scale_ptr as usize,
+        gate_up_zero_ptr: gate_up_zero_ptr as usize,
+        down_proj_ptr: down_proj_ptr as usize,
+        down_scale_ptr: down_scale_ptr as usize,
+        down_zero_ptr: down_zero_ptr as usize,
+        hidden,
+        moe_intermediate,
+        group_size,
+        active_groups: capacity,
+    };
+    let cache = QWEN36_PACKED_EXPERT_HOTSET_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache.lock().map_err(|_| {
+        GpuError::backend(
+            Backend::Metal,
+            "qwen36 packed expert hotset cache mutex poisoned".into(),
+        )
+    })?;
+    crate::prefill_ffi::metal_profile_time(
+        "qwen36_ffn_int4_expert_pack_hotset_stage5",
+        "host",
+        || -> Result<(), GpuError> {
+            let mut allocation = false;
+            if let std::collections::hash_map::Entry::Vacant(vacant) = cache.entry(key) {
+                let buffers = qwen36_alloc_packed_experts_for_metal(
+                    ordinal,
+                    hidden,
+                    moe_intermediate,
+                    capacity,
+                    group_size,
+                )?;
+                vacant.insert(Qwen36PackedExpertHotsetCacheEntry {
+                    slot_experts: vec![None; capacity],
+                    slot_last_used: vec![0; capacity],
+                    next_stamp: 1,
+                    buffers,
+                });
+                allocation = true;
+            }
+            let entry = cache.get_mut(&key).ok_or_else(|| {
+                GpuError::backend(
+                    Backend::Metal,
+                    "qwen36 packed expert hotset cache entry missing after allocation".into(),
+                )
+            })?;
+            let bytes_per_expert =
+                qwen36_packed_expert_copy_bytes(hidden, moe_intermediate, 1, group_size);
+            let mut protected_slots = vec![false; capacity];
+            let mut slot_hits = 0usize;
+            let mut slot_misses = 0usize;
+            let mut evictions = 0usize;
+            for (group, &expert) in active_experts.iter().enumerate() {
+                let (slot, hit, eviction) = qwen36_hotset_choose_slot(
+                    &entry.slot_experts,
+                    &entry.slot_last_used,
+                    &protected_slots,
+                    expert,
+                );
+                if hit {
+                    slot_hits += 1;
+                } else {
+                    slot_misses += 1;
+                    evictions += usize::from(eviction);
+                    qwen36_fill_packed_expert_slot_for_metal(
+                        hidden,
+                        moe_intermediate,
+                        expert,
+                        slot,
+                        group_size,
+                        gate_up_proj_ptr,
+                        gate_up_scale_ptr,
+                        gate_up_zero_ptr,
+                        down_proj_ptr,
+                        down_scale_ptr,
+                        down_zero_ptr,
+                        &mut entry.buffers,
+                    );
+                    entry.slot_experts[slot] = Some(expert);
+                }
+                entry.slot_last_used[slot] = entry.next_stamp;
+                entry.next_stamp = entry.next_stamp.wrapping_add(1).max(1);
+                protected_slots[slot] = true;
+                workspace[off_topk_idx + group] = f32::from_bits(slot as u32);
+            }
+            qwen36_packed_expert_cache_profile_record(
+                slot_misses == 0,
+                slot_misses > 0,
+                allocation,
+                active_experts.len(),
+                slot_misses * bytes_per_expert,
+                slot_hits,
+                slot_misses,
+                evictions,
+            );
+            Ok(())
+        },
+    )?;
+    let entry = cache.get(&key).ok_or_else(|| {
+        GpuError::backend(
+            Backend::Metal,
+            "qwen36 packed expert hotset cache entry missing after fill".into(),
         )
     })?;
     f(&entry.buffers)
@@ -4821,6 +5138,56 @@ fn ffn_step_stage1_5_metal_host(
         return Ok(());
     }
     if qwen36_ffn_expert_packed_stage5_metal_native_supported(params, weights, int4) {
+        if let Some(hotset_capacity) = qwen36_packed_expert_hotset_capacity(active_groups) {
+            qwen36_with_hotset_packed_experts_for_metal(
+                output_ordinal,
+                hidden,
+                moe_intermediate,
+                &active_experts,
+                int4.group_size as usize,
+                num_experts,
+                hotset_capacity,
+                workspace,
+                off_topk_idx,
+                weights.gate_up_proj_w,
+                int4.gate_up_proj_scale,
+                int4.gate_up_proj_zero,
+                weights.down_proj_w,
+                int4.down_proj_scale,
+                int4.down_proj_zero,
+                |packed| {
+                    crate::prefill_ffi::metal_profile_time(
+                        "qwen36_ffn_int4_expert_packed_hotset_stage5",
+                        "native",
+                        || unsafe {
+                            crate::metal_native::qwen36_ffn_expert_gate_up_down_finalize_tiled(
+                                hidden,
+                                moe_intermediate,
+                                active_groups,
+                                int4.group_size as usize,
+                                workspace_ptr,
+                                weights.input_hidden,
+                                packed.gate_up_proj.as_ptr(),
+                                packed.gate_up_scale.as_ptr(),
+                                packed.gate_up_zero.as_ptr(),
+                                packed.down_proj.as_ptr(),
+                                packed.down_scale.as_ptr(),
+                                packed.down_zero.as_ptr(),
+                                output_ptr,
+                                off_h_norm,
+                                off_topk_val,
+                                off_topk_idx,
+                                off_shared_out,
+                                off_expert_mid,
+                                off_moe_out,
+                                true,
+                            )
+                        },
+                    )
+                },
+            )?;
+            return Ok(());
+        }
         for group in 0..active_groups {
             workspace[off_topk_idx + group] = f32::from_bits(group as u32);
         }
@@ -6522,6 +6889,27 @@ mod tests {
     fn qwen36_packed_expert_copy_bytes_matches_stage5_geometry() {
         let bytes = qwen36_packed_expert_copy_bytes(2048, 512, 8, 128);
         assert_eq!(bytes, 12_589_056);
+    }
+
+    #[test]
+    fn qwen36_hotset_slot_selection_reuses_hits_and_protects_current_call() {
+        let slots = vec![Some(7), Some(9), None, Some(11)];
+        let last_used = vec![10, 1, 0, 3];
+        let protected = vec![false; 4];
+        assert_eq!(
+            qwen36_hotset_choose_slot(&slots, &last_used, &protected, 9),
+            (1, true, false)
+        );
+        assert_eq!(
+            qwen36_hotset_choose_slot(&slots, &last_used, &protected, 13),
+            (2, false, false)
+        );
+
+        let protected = vec![false, true, true, false];
+        assert_eq!(
+            qwen36_hotset_choose_slot(&slots, &last_used, &protected, 13),
+            (3, false, true)
+        );
     }
 
     fn test_int4_blob(num_experts: usize, rows: usize, cols: usize) -> Vec<u8> {

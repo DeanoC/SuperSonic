@@ -1034,9 +1034,9 @@ That rules out a simple per-layer scratch-slab cache as the next promotion
 target. The next FFN work should either keep packed experts resident without
 recopying on route churn, or move the expert matvecs to a Metal Performance
 Shaders / MPP bridge that avoids the CPU slab-pack step entirely.
-Profile runs now also emit `[qwen36-pack-cache]` when the packed cache is
+Profile runs now also emit `[qwen36-pack-cache]` when a packed reuse probe is
 exercised. A four-token Apple M5 Max profile with the packed expert path and
-pack cache enabled generated `[11, 353, 599, 264]` and measured
+exact-route pack cache enabled generated `[11, 353, 599, 264]` and measured
 `279.5 ms/token`, `ffn_ms_avg=162.420`, and
 `qwen36_ffn_int4_expert_pack_stage5=384.124 ms` across 160 layer calls. The
 cache profile reported `calls=160`, `entries=40`, `exact_hits=0`,
@@ -1046,6 +1046,23 @@ is saving allocation churn but not slab-copy churn: every post-allocation layer
 call saw a different active-expert set. The next packed-path experiment needs a
 larger resident hot set or a different addressing scheme; an exact-route
 per-layer cache is not worth promoting.
+
+The resident hot-set follow-up is opt-in behind
+`SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_PACK_HOTSET=1`; capacity defaults to
+16 and can be set with
+`SUPERSONIC_METAL_QWEN36_FFN_EXPERT_HOTSET_CAPACITY`. It reuses the same packed
+kernel but maps each top-k expert to a resident slot, so only slot misses are
+recopied. The 16-slot Apple M5 Max profile preserved `[11, 353, 599, 264]` and
+cut copied bytes to `1356470784`, with `slot_hits=418`, `slot_misses=862`,
+`slot_hit_rate=0.326562`, and `evictions=222`, but measured `298.0 ms/token`
+and `ffn_ms_avg=161.142`. A 32-slot run avoided evictions and improved host pack
+time to `337.429 ms`, but copied bytes barely changed (`1345455360`) and wall
+time worsened to `304.2 ms/token`, with
+`qwen36_ffn_int4_expert_packed_hotset_stage5=185.272 ms`. That rules out a
+straight LRU hotset as the next promotion path. The useful next FFN direction is
+to stop rebuilding packed expert slabs entirely, either by teaching the fused
+INT4 kernel to gather original expert IDs efficiently or by building a static
+per-layer hot table with an explicit miss fallback.
 
 The first MPS bridge step is now an attribution probe, not a decode path. With
 `SUPERSONIC_METAL_QWEN36_MPS_EXPERT_PILOT=1`, the runner appends a

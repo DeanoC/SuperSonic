@@ -114,7 +114,7 @@ impl Drop for MetalProfileScope {
             eprintln!();
             eprintln!("=== Qwen3.6 packed expert cache profile ===");
             eprintln!(
-                "calls={} entries={} exact_hits={} route_refills={} allocations={} copied_bytes={} exact_hit_rate={:.2}% avg_groups={:.2} max_groups={} avg_copy_bytes={:.0}",
+                "calls={} entries={} exact_hits={} route_refills={} allocations={} copied_bytes={} exact_hit_rate={:.2}% slot_hit_rate={:.2}% slot_hits={} slot_misses={} evictions={} avg_groups={:.2} max_groups={} avg_copy_bytes={:.0}",
                 pack_cache.calls,
                 pack_cache.entries,
                 pack_cache.exact_hits,
@@ -122,12 +122,16 @@ impl Drop for MetalProfileScope {
                 pack_cache.allocations,
                 pack_cache.copied_bytes,
                 pack_cache.exact_hit_rate() * 100.0,
+                pack_cache.slot_hit_rate() * 100.0,
+                pack_cache.slot_hits,
+                pack_cache.slot_misses,
+                pack_cache.evictions,
                 pack_cache.avg_active_groups(),
                 pack_cache.max_active_groups,
                 pack_cache.avg_copied_bytes(),
             );
             eprintln!(
-                "[qwen36-pack-cache] calls={} entries={} exact_hits={} route_refills={} allocations={} copied_bytes={} exact_hit_rate={:.6} avg_active_groups={:.6} max_active_groups={} avg_copy_bytes={:.3}",
+                "[qwen36-pack-cache] calls={} entries={} exact_hits={} route_refills={} allocations={} copied_bytes={} exact_hit_rate={:.6} slot_hits={} slot_misses={} slot_hit_rate={:.6} evictions={} avg_active_groups={:.6} max_active_groups={} avg_copy_bytes={:.3}",
                 pack_cache.calls,
                 pack_cache.entries,
                 pack_cache.exact_hits,
@@ -135,6 +139,10 @@ impl Drop for MetalProfileScope {
                 pack_cache.allocations,
                 pack_cache.copied_bytes,
                 pack_cache.exact_hit_rate(),
+                pack_cache.slot_hits,
+                pack_cache.slot_misses,
+                pack_cache.slot_hit_rate(),
+                pack_cache.evictions,
                 pack_cache.avg_active_groups(),
                 pack_cache.max_active_groups,
                 pack_cache.avg_copied_bytes(),

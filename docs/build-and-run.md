@@ -317,7 +317,14 @@ Metal currently rejects or defers:
   routed top-k expert slabs into compact scratch buffers before running the
   same combined shader. It is also diagnostic-only: it proves the giant-buffer
   residency fault is real, but the CPU packing cost is still too high for the
-  default lane. The one-token local smoke is:
+  default lane. Two reuse probes are available for attribution only:
+  `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_PACK_CACHE=1` caches exact
+  per-layer active sets, while
+  `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_PACK_HOTSET=1` keeps an LRU
+  resident slot pool sized by
+  `SUPERSONIC_METAL_QWEN36_FFN_EXPERT_HOTSET_CAPACITY` (default 16). Neither is
+  promoted because measured route churn still leaves too much slab copy and
+  residency overhead. The one-token local smoke is:
   `cargo run --release --bin supersonic -- --backend metal --model qwen3.6-35b-a3b --model-dir /path/to/Qwen3.6-35B-A3B --int4 --prompt "Hello" --max-new-tokens 1 --emit-stage-timings`.
   FP8-runtime, KV-FP8, speculative decode, and persistent decode remain
   unsupported on this Metal path.
@@ -463,6 +470,15 @@ roughly `337 ms/token`, but profile attribution shows `100.287 ms` in
 `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_PACK_CACHE=1`, but the measured
 result was not promotable: it reduced HAL alloc/free churn while regressing the
 profiled control from `217.6 ms/token` to `234.7 ms/token` on the same prompt.
+The hotset probe,
+`SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_PACK_HOTSET=1`, is also
+diagnostic-only. A four-token M5 Max profile generated the expected
+`[11, 353, 599, 264]` with 16 resident slots and cut copied bytes from
+`2014248960` to `1356470784`, but it measured `298.0 ms/token`; 32 resident
+slots cut copied bytes only slightly further to `1345455360` and measured
+`304.2 ms/token`. That points away from LRU slab caching and toward either a
+different fused INT4 addressing scheme or eliminating the per-token packed slab
+path.
 `SUPERSONIC_METAL_QWEN36_MPS_EXPERT_PILOT=1` adds a resident-FP16
 Metal Performance Shaders attribution row for the active-expert GEMV shapes. A
 one-token M5 Max smoke generated `[11]` and reported `gate_up_ms=3.260`,
