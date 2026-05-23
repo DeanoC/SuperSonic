@@ -394,6 +394,18 @@ under the same smoke:
    target is routed expert compute/residency rather than more launch-only
    full-attention reshuffling.
 
+   The seventh slice tests two small routed-FFN orchestration ideas and leaves
+   both disabled by default. A fused Metal residual-add kernel preserves the two
+   BF16 rounding points from `chunk_hidden += combined; chunk_hidden +=
+   shared_out`, but measured 11.03s prefill versus a 10.65s disabled-path
+   control. A native Metal router softmax/top-k kernel avoids the router logits
+   D2H readback and top-k H2D writes; standalone dispatch measured 11.51s
+   prefill, and batching it with routed expert direct still measured 11.63s,
+   while the host-top-k control measured 11.05s. The diagnostics remain
+   available behind `SUPERSONIC_QWEN36_MOE_METAL_FUSED_FFN_RESIDUAL=1` and
+   `SUPERSONIC_QWEN36_MOE_METAL_ROUTER_TOPK=1`, but the default lane stays on
+   the measured faster host-top-k and two-add residual path.
+
 3. **Static top-N resident MPS table probe**
    Use route profiles to choose top-N experts per layer, materialize FP16 MPS
    RHS once, fall back on misses, and measure real prompts.

@@ -957,6 +957,17 @@ prefill, and native Q/gate splitting via
 probes disabled, the default path measured 10.73s prefill and generated the
 same `[271]` sanity row. The measured next bottleneck remains routed expert
 compute/residency, not these full-attention layout probes.
+
+Two routed-FFN micro-orchestration probes are also measured negative and remain
+opt-in only. `SUPERSONIC_QWEN36_MOE_METAL_FUSED_FFN_RESIDUAL=1` fuses
+`chunk_hidden += combined` and `chunk_hidden += shared_out` into one Metal
+kernel while preserving the two BF16 rounding points, but measured 11.03s
+prefill versus a 10.65s disabled-path control. `SUPERSONIC_QWEN36_MOE_METAL_ROUTER_TOPK=1`
+is the matching router probe: it runs router softmax/top-k on Metal and batches
+it with routed expert direct in normal runs. It preserves the `[271]` sanity
+row, but measured 11.63s prefill versus an 11.05s host-top-k control. The
+default lane keeps both off. The next FFN work should target routed expert
+compute/residency, not standalone router top-k or residual-add reshuffling.
 `tests/metal/audit_qwen36_mtp.py` is the speculative-decode readiness audit. It
 checks the source snapshot for the split MTP expert tensors and the INT4 bake
 for the 19 folded `mtp.*` tensors loaded by the runtime. On this local M5 Max

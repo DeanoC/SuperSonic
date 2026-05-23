@@ -128,6 +128,12 @@ struct Qwen36BatchedFfnExpertParams {
     uint32_t group_size;
 };
 
+struct Qwen36RouterTopkParams {
+    uint32_t n_tokens;
+    uint32_t num_experts;
+    uint32_t top_k;
+};
+
 struct Qwen36LinearInt4Params {
     uint32_t hidden;
     uint32_t num_k_heads;
@@ -2523,6 +2529,7 @@ kernel void supersonic_qwen36_linear_out_proj_finalize(
 }
 
 struct Qwen36FfnInt4Pipelines {
+    __strong id<MTLComputePipelineState> router_topk = nil;
     __strong id<MTLComputePipelineState> shared_gate_up = nil;
     __strong id<MTLComputePipelineState> shared_scalar = nil;
     __strong id<MTLComputePipelineState> shared_down = nil;
@@ -2604,6 +2611,12 @@ struct Qwen36BatchedFfnExpertParams {
     uint group_size;
 };
 
+struct Qwen36RouterTopkParams {
+    uint n_tokens;
+    uint num_experts;
+    uint top_k;
+};
+
 inline float bf16_round_rne_finite(float x) {
     uint bits = as_type<uint>(x);
     uint rounding_bias = 0x7FFFu + ((bits >> 16) & 1u);
@@ -2657,6 +2670,75 @@ inline float int4_weight_expert(
     float s = float(scale[scale_idx]);
     float z = float(zero[scale_idx]);
     return bf16_round_rne_finite(float(nibble) * s - z * s);
+}
+
+kernel void supersonic_qwen36_router_softmax_topk_bf16(
+    device const bfloat* logits [[buffer(0)]],
+    device uint* topk_idx [[buffer(1)]],
+    device bfloat* topk_weight [[buffer(2)]],
+    constant Qwen36RouterTopkParams& params [[buffer(3)]],
+    threadgroup float* scratch [[threadgroup(0)]],
+    uint token [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]
+) {
+    if (token >= params.n_tokens || params.num_experts > 256u || params.top_k > 16u) {
+        return;
+    }
+
+    float v = -INFINITY;
+    if (tid < params.num_experts) {
+        v = float(logits[token * params.num_experts + tid]);
+    }
+    scratch[tid] = v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            scratch[tid] = max(scratch[tid], scratch[tid + stride]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float row_max = scratch[0];
+
+    float e = (tid < params.num_experts) ? exp(v - row_max) : 0.0f;
+    scratch[tid] = e;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            scratch[tid] += scratch[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inv_sum = 1.0f / scratch[0];
+
+    scratch[tid] = (tid < params.num_experts) ? bf16_round_rne_finite(e * inv_sum) : -INFINITY;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0u) {
+        float sum_k = 0.0f;
+        for (uint k = 0u; k < params.top_k; ++k) {
+            float best_val = -INFINITY;
+            uint best_idx = 0u;
+            for (uint expert = 0u; expert < params.num_experts; ++expert) {
+                float prob = scratch[expert];
+                if (prob > best_val || (prob == best_val && expert < best_idx)) {
+                    best_val = prob;
+                    best_idx = expert;
+                }
+            }
+            scratch[256u + k] = best_val;
+            topk_idx[token * params.top_k + k] = best_idx;
+            sum_k += best_val;
+            scratch[best_idx] = -INFINITY;
+        }
+
+        float inv_k = 1.0f / sum_k;
+        for (uint k = 0u; k < params.top_k; ++k) {
+            topk_weight[token * params.top_k + k] =
+                bfloat(bf16_round_rne_finite(scratch[256u + k] * inv_k));
+        }
+    }
 }
 
 kernel void supersonic_qwen36_ffn_shared_gate_up(
@@ -3261,6 +3343,7 @@ kernel void supersonic_qwen36_ffn_mps_transcode_down_lut(
                                                                    }];
                 } else {
                     NSArray<NSString*>* names = @[
+                        @"supersonic_qwen36_router_softmax_topk_bf16",
                         @"supersonic_qwen36_ffn_shared_gate_up",
                         @"supersonic_qwen36_ffn_shared_scalar",
                         @"supersonic_qwen36_ffn_shared_down",
@@ -3303,7 +3386,9 @@ kernel void supersonic_qwen36_ffn_mps_transcode_down_lut(
                                                                              }];
                             break;
                         }
-                        if ([name isEqualToString:@"supersonic_qwen36_ffn_shared_gate_up"]) {
+                        if ([name isEqualToString:@"supersonic_qwen36_router_softmax_topk_bf16"]) {
+                            pipelines.router_topk = pipeline;
+                        } else if ([name isEqualToString:@"supersonic_qwen36_ffn_shared_gate_up"]) {
                             pipelines.shared_gate_up = pipeline;
                         } else if ([name isEqualToString:@"supersonic_qwen36_ffn_shared_scalar"]) {
                             pipelines.shared_scalar = pipeline;
@@ -3344,7 +3429,7 @@ kernel void supersonic_qwen36_ffn_mps_transcode_down_lut(
         }
     }
 
-    bool ok = pipelines.shared_gate_up != nil && pipelines.shared_scalar != nil &&
+    bool ok = pipelines.router_topk != nil && pipelines.shared_gate_up != nil && pipelines.shared_scalar != nil &&
         pipelines.shared_down != nil && pipelines.expert_gate_up != nil &&
         pipelines.expert_down_finalize != nil && pipelines.expert_down_finalize_tiled != nil &&
         pipelines.batched_expert_gate_up_tiled != nil &&
@@ -5754,6 +5839,92 @@ kernel void supersonic_element_add_f32(
                                                                              userInfo:@{
                                                                                  NSLocalizedDescriptionKey :
                                                                                      @"Failed to create element-add pipeline"
+                                                                             }];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (pipeline == nil && error_out != nullptr) {
+        *error_out = build_error;
+    }
+    return pipeline;
+}
+
+id<MTLComputePipelineState> qwen36_ffn_residual_add_pipeline_bf16(NSError** error_out) {
+    static std::mutex mutex;
+    static bool attempted = false;
+    static __strong id<MTLComputePipelineState> pipeline = nil;
+    static __strong NSError* build_error = nil;
+
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!attempted) {
+        attempted = true;
+        @autoreleasepool {
+            id<MTLDevice> device = metal_device();
+            if (device == nil) {
+                build_error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                                   code:771
+                                               userInfo:@{NSLocalizedDescriptionKey : @"No Metal device"}];
+            } else {
+                static const char* kSource = R"Q36FFNRES(
+#include <metal_stdlib>
+using namespace metal;
+
+struct Qwen36FfnResidualAddParams {
+    uint total_elems;
+};
+
+kernel void supersonic_qwen36_ffn_residual_add_bf16(
+    device bfloat* residual [[buffer(0)]],
+    device const bfloat* combined [[buffer(1)]],
+    device const bfloat* shared [[buffer(2)]],
+    constant Qwen36FfnResidualAddParams& params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.total_elems) {
+        return;
+    }
+    bfloat with_routed = bfloat(float(residual[gid]) + float(combined[gid]));
+    residual[gid] = bfloat(float(with_routed) + float(shared[gid]));
+}
+)Q36FFNRES";
+                NSString* source = [NSString stringWithUTF8String:kSource];
+                MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+                configure_precise_math(options);
+                NSError* library_error = nil;
+                id<MTLLibrary> library = [device newLibraryWithSource:source
+                                                              options:options
+                                                                error:&library_error];
+                if (library == nil || library_error != nil) {
+                    build_error = library_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                       code:772
+                                                                   userInfo:@{
+                                                                       NSLocalizedDescriptionKey :
+                                                                           @"Failed to compile Qwen3.6 FFN residual-add library"
+                                                                   }];
+                } else {
+                    id<MTLFunction> function =
+                        [library newFunctionWithName:@"supersonic_qwen36_ffn_residual_add_bf16"];
+                    if (function == nil) {
+                        build_error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                                           code:773
+                                                       userInfo:@{
+                                                           NSLocalizedDescriptionKey :
+                                                               @"Failed to load Qwen3.6 FFN residual-add function"
+                                                       }];
+                    } else {
+                        NSError* pipeline_error = nil;
+                        pipeline = [device newComputePipelineStateWithFunction:function
+                                                                         error:&pipeline_error];
+                        if (pipeline == nil || pipeline_error != nil) {
+                            build_error = pipeline_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                                 code:774
+                                                                             userInfo:@{
+                                                                                 NSLocalizedDescriptionKey :
+                                                                                     @"Failed to create Qwen3.6 FFN residual-add pipeline"
                                                                              }];
                         }
                     }
@@ -8323,6 +8494,61 @@ extern "C" int supersonic_metal_element_add_f32(
         out_ptr,
         @"supersonic_element_add_f32"
     );
+}
+
+extern "C" int supersonic_metal_qwen36_ffn_residual_add_bf16(
+    size_t total_elems,
+    void* residual_ptr,
+    const void* combined_ptr,
+    const void* shared_ptr
+) {
+    @autoreleasepool {
+        if (total_elems == 0) {
+            return 0;
+        }
+        if (total_elems > UINT32_MAX || residual_ptr == nullptr ||
+            combined_ptr == nullptr || shared_ptr == nullptr) {
+            return 781;
+        }
+
+        NSError* pipeline_error = nil;
+        id<MTLComputePipelineState> pipeline = qwen36_ffn_residual_add_pipeline_bf16(&pipeline_error);
+        if (pipeline == nil) {
+            return 782;
+        }
+
+        id<MTLBuffer> residual = nil;
+        id<MTLBuffer> combined = nil;
+        id<MTLBuffer> shared = nil;
+        size_t residual_offset = 0;
+        size_t combined_offset = 0;
+        size_t shared_offset = 0;
+        if (lookup_buffer(residual_ptr, &residual, &residual_offset) != 0) {
+            return 783;
+        }
+        if (lookup_buffer(combined_ptr, &combined, &combined_offset) != 0) {
+            return 784;
+        }
+        if (lookup_buffer(shared_ptr, &shared, &shared_offset) != 0) {
+            return 785;
+        }
+
+        ElementwiseParams params = {static_cast<uint32_t>(total_elems)};
+
+        return encode_or_submit([&](id<MTLComputeCommandEncoder> encoder) {
+            [encoder setComputePipelineState:pipeline];
+            [encoder setBuffer:residual offset:residual_offset atIndex:0];
+            [encoder setBuffer:combined offset:combined_offset atIndex:1];
+            [encoder setBuffer:shared offset:shared_offset atIndex:2];
+            [encoder setBytes:&params length:sizeof(params) atIndex:3];
+
+            NSUInteger tg_width =
+                std::min<NSUInteger>(256, std::max<NSUInteger>(1, pipeline.maxTotalThreadsPerThreadgroup));
+            MTLSize threads_per_group = MTLSizeMake(tg_width, 1, 1);
+            MTLSize threads_per_grid = MTLSizeMake(total_elems, 1, 1);
+            [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
+        }, 786, 787, 788, 789);
+    }
 }
 
 static int supersonic_metal_sigmoid_mul_impl(
@@ -11964,6 +12190,71 @@ extern "C" int supersonic_metal_qwen36_batched_ffn_grouped_expert_direct(
             1284,
             1285,
             1286);
+    }
+}
+
+extern "C" int supersonic_metal_qwen36_router_softmax_topk_bf16(
+    size_t n_tokens,
+    size_t num_experts,
+    size_t top_k,
+    const void* logits_ptr,
+    void* topk_idx_ptr,
+    void* topk_weight_ptr
+) {
+    @autoreleasepool {
+        if (n_tokens == 0 || num_experts == 0 || top_k == 0 || logits_ptr == nullptr ||
+            topk_idx_ptr == nullptr || topk_weight_ptr == nullptr) {
+            return 1290;
+        }
+        if (n_tokens > UINT32_MAX || num_experts > 256 || top_k > 16) {
+            return 1291;
+        }
+
+        NSError* pipeline_error = nil;
+        Qwen36FfnInt4Pipelines pipelines = qwen36_ffn_int4_pipelines(&pipeline_error);
+        if (pipelines.router_topk == nil) {
+            return 1292;
+        }
+
+        id<MTLBuffer> logits = nil;
+        id<MTLBuffer> topk_idx = nil;
+        id<MTLBuffer> topk_weight = nil;
+        size_t logits_offset = 0;
+        size_t topk_idx_offset = 0;
+        size_t topk_weight_offset = 0;
+        if (lookup_buffer(logits_ptr, &logits, &logits_offset) != 0) {
+            return 1293;
+        }
+        if (lookup_buffer(topk_idx_ptr, &topk_idx, &topk_idx_offset) != 0) {
+            return 1294;
+        }
+        if (lookup_buffer(topk_weight_ptr, &topk_weight, &topk_weight_offset) != 0) {
+            return 1295;
+        }
+
+        Qwen36RouterTopkParams params = {
+            static_cast<uint32_t>(n_tokens),
+            static_cast<uint32_t>(num_experts),
+            static_cast<uint32_t>(top_k),
+        };
+
+        return encode_or_submit_labeled(
+            [&](id<MTLComputeCommandEncoder> encoder) {
+                [encoder setComputePipelineState:pipelines.router_topk];
+                [encoder setBuffer:logits offset:logits_offset atIndex:0];
+                [encoder setBuffer:topk_idx offset:topk_idx_offset atIndex:1];
+                [encoder setBuffer:topk_weight offset:topk_weight_offset atIndex:2];
+                [encoder setBytes:&params length:sizeof(params) atIndex:3];
+                [encoder setThreadgroupMemoryLength:(256 + 16) * sizeof(float) atIndex:0];
+                [encoder dispatchThreadgroups:MTLSizeMake(n_tokens, 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            },
+            "qwen36_batched_prefill_router_softmax_topk",
+            1296,
+            1297,
+            1298,
+            1299
+        );
     }
 }
 

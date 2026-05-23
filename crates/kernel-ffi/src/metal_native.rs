@@ -227,6 +227,14 @@ unsafe extern "C" {
         combined_ptr: *mut c_void,
         wait_for_completion: c_int,
     ) -> c_int;
+    fn supersonic_metal_qwen36_router_softmax_topk_bf16(
+        n_tokens: usize,
+        num_experts: usize,
+        top_k: usize,
+        logits_ptr: *const c_void,
+        topk_idx_ptr: *mut c_void,
+        topk_weight_ptr: *mut c_void,
+    ) -> c_int;
     fn supersonic_metal_qwen36_ffn_expert_mps_bridge_f16(
         hidden: usize,
         moe_intermediate: usize,
@@ -580,6 +588,12 @@ unsafe extern "C" {
         lhs_ptr: *const c_void,
         rhs_ptr: *const c_void,
         out_ptr: *mut c_void,
+    ) -> c_int;
+    fn supersonic_metal_qwen36_ffn_residual_add_bf16(
+        total_elems: usize,
+        residual_ptr: *mut c_void,
+        combined_ptr: *const c_void,
+        shared_ptr: *const c_void,
     ) -> c_int;
     fn supersonic_metal_sigmoid_mul_bf16(
         total_elems: usize,
@@ -2134,6 +2148,61 @@ pub(crate) unsafe fn qwen36_batched_prefill_grouped_expert_direct(
 }
 
 #[cfg(all(target_os = "macos", supersonic_backend_metal))]
+pub(crate) fn qwen36_router_softmax_topk_bf16(
+    n_tokens: usize,
+    num_experts: usize,
+    top_k: usize,
+    logits: &GpuBuffer,
+    topk_idx: &mut GpuBuffer,
+    topk_weight: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if n_tokens == 0 || num_experts == 0 || top_k == 0 || num_experts > 256 || top_k > 16 {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native qwen36_router_softmax_topk_bf16 invalid shape: n_tokens={n_tokens} num_experts={num_experts} top_k={top_k}"
+        )));
+    }
+    if logits.dtype() != ScalarType::BF16
+        || topk_idx.dtype() != ScalarType::U32
+        || topk_weight.dtype() != ScalarType::BF16
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native qwen36_router_softmax_topk_bf16 dtype mismatch: logits={:?} topk_idx={:?} topk_weight={:?}",
+            logits.dtype(),
+            topk_idx.dtype(),
+            topk_weight.dtype()
+        )));
+    }
+    if logits.elem_count() < n_tokens * num_experts
+        || topk_idx.elem_count() < n_tokens * top_k
+        || topk_weight.elem_count() < n_tokens * top_k
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native qwen36_router_softmax_topk_bf16 buffer too small: logits={} topk_idx={} topk_weight={}",
+            logits.elem_count(),
+            topk_idx.elem_count(),
+            topk_weight.elem_count()
+        )));
+    }
+    let status = unsafe {
+        supersonic_metal_qwen36_router_softmax_topk_bf16(
+            n_tokens,
+            num_experts,
+            top_k,
+            logits.as_ptr(),
+            topk_idx.as_mut_ptr(),
+            topk_weight.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!("metal native qwen36_router_softmax_topk_bf16 failed with status {status}"),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn qwen36_ffn_int4_stage5(
     hidden: usize,
@@ -3332,6 +3401,47 @@ pub(crate) fn element_add(
         return Err(GpuError::backend(
             Backend::Metal,
             format!("metal native element_add failed with status {status}"),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+pub(crate) fn qwen36_ffn_residual_add_bf16(
+    total_elems: usize,
+    residual: &mut GpuBuffer,
+    combined: &GpuBuffer,
+    shared: &GpuBuffer,
+) -> Result<(), GpuError> {
+    if total_elems > u32::MAX as usize {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native qwen36_ffn_residual_add_bf16 supports at most {} elements, got {total_elems}",
+            u32::MAX
+        )));
+    }
+    if residual.dtype() != ScalarType::BF16
+        || combined.dtype() != ScalarType::BF16
+        || shared.dtype() != ScalarType::BF16
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native qwen36_ffn_residual_add_bf16 expects BF16 buffers, got {:?}/{:?}/{:?}",
+            residual.dtype(),
+            combined.dtype(),
+            shared.dtype()
+        )));
+    }
+    let status = unsafe {
+        supersonic_metal_qwen36_ffn_residual_add_bf16(
+            total_elems,
+            residual.as_mut_ptr(),
+            combined.as_ptr(),
+            shared.as_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!("metal native qwen36_ffn_residual_add_bf16 failed with status {status}"),
         ));
     }
     Ok(())
@@ -5174,6 +5284,21 @@ pub(crate) unsafe fn qwen36_batched_prefill_grouped_expert_direct(
 }
 
 #[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+pub(crate) fn qwen36_router_softmax_topk_bf16(
+    _n_tokens: usize,
+    _num_experts: usize,
+    _top_k: usize,
+    _logits: &GpuBuffer,
+    _topk_idx: &mut GpuBuffer,
+    _topk_weight: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    Err(GpuError::backend(
+        Backend::Metal,
+        "metal native qwen36_router_softmax_topk_bf16 is not compiled".into(),
+    ))
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn qwen36_ffn_expert_mps_bridge_f16(
     _hidden: usize,
@@ -5669,6 +5794,19 @@ pub(crate) fn element_add(
     Err(GpuError::backend(
         Backend::Metal,
         "metal native element_add is not compiled".into(),
+    ))
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+pub(crate) fn qwen36_ffn_residual_add_bf16(
+    _total_elems: usize,
+    _residual: &mut GpuBuffer,
+    _combined: &GpuBuffer,
+    _shared: &GpuBuffer,
+) -> Result<(), GpuError> {
+    Err(GpuError::backend(
+        Backend::Metal,
+        "metal native qwen36_ffn_residual_add_bf16 is not compiled".into(),
     ))
 }
 

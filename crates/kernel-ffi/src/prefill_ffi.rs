@@ -2984,6 +2984,51 @@ pub fn element_add_inplace(
     Ok(())
 }
 
+pub fn qwen36_router_softmax_topk_bf16(
+    n_tokens: usize,
+    num_experts: usize,
+    top_k: usize,
+    logits: &GpuBuffer,
+    topk_idx: &mut GpuBuffer,
+    topk_weight: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if logits.backend() != Backend::Metal {
+        return Err(GpuError::InvalidArg(
+            "qwen36_router_softmax_topk_bf16 requires Metal logits".into(),
+        ));
+    }
+    metal_profile_time(
+        "qwen36_batched_prefill_router_softmax_topk",
+        "native",
+        || {
+            metal_native::qwen36_router_softmax_topk_bf16(
+                n_tokens,
+                num_experts,
+                top_k,
+                logits,
+                topk_idx,
+                topk_weight,
+            )
+        },
+    )
+}
+
+pub fn qwen36_ffn_residual_add_bf16(
+    total_elems: usize,
+    residual: &mut GpuBuffer,
+    combined: &GpuBuffer,
+    shared: &GpuBuffer,
+) -> Result<(), GpuError> {
+    if residual.backend() != Backend::Metal {
+        return Err(GpuError::InvalidArg(
+            "qwen36_ffn_residual_add_bf16 requires a Metal residual buffer".into(),
+        ));
+    }
+    metal_profile_time("qwen36_batched_prefill_ffn_residual_add", "native", || {
+        metal_native::qwen36_ffn_residual_add_bf16(total_elems, residual, combined, shared)
+    })
+}
+
 // ---- Cast between dtypes ----
 
 /// Cast all elements from one dtype to another on GPU.

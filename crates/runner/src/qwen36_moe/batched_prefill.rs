@@ -1896,85 +1896,121 @@ fn process_ffn_batched_grouped(
     //    num_experts=256 this is 64*256*2 = 32 KiB D2H + 64*8*4 + 64*8*2 =
     //    ~2 KiB H2D per layer per chunk — negligible vs the matmul cost.
     //    (TODO: GPU softmax/top-K fusion as a future M12+ perf opportunity.)
-    let mut logits_bytes = vec![0u8; n * num_experts * 2];
-    copy_d2h(
-        ordinal,
-        logits_bytes.as_mut_ptr() as *mut c_void,
-        scratch.router_logits_bf16.as_ptr(),
-        logits_bytes.len(),
-    )
-    .context("d2h router_logits_bf16")?;
-    let mut topk_idx_host = vec![0i32; n * top_k];
-    let mut topk_weight_host = vec![0u16; n * top_k];
-    for token in 0..n {
-        let row_bf16 = unsafe {
-            std::slice::from_raw_parts(
-                (logits_bytes.as_ptr() as *const u16).add(token * num_experts),
-                num_experts,
-            )
-        };
-        // Widen BF16 → F32 to match the per-token kernel's Phase C, which
-        // reads workspace[OFF_ROUTER_LOGITS] as F32 (the value was stored
-        // via `bf16_round_rne_f32` in Phase B).
-        let row: Vec<f32> = row_bf16.iter().map(|&b| bf16_bits_to_f32(b)).collect();
-        // Match per-token kernel (`ffn_phase.cuh` Phase C): softmax with
-        // BF16-rounded probs, then top-K with low-index tie-breaking, then
-        // renormalise top-K to sum to 1 (BF16-rounded again).
-        let row_max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let exps: Vec<f32> = row.iter().map(|&v| (v - row_max).exp()).collect();
-        let row_sum: f32 = exps.iter().copied().sum();
-        let inv_sum = 1.0f32 / row_sum;
-        // BF16-round each prob to match the per-token kernel.
-        let mut probs: Vec<f32> = exps
-            .iter()
-            .map(|&e| bf16_round_rne_f32(e * inv_sum))
-            .collect();
+    let explicit_route_profile = std::env::var_os("SUPERSONIC_QWEN36_ROUTE_PROFILE").is_some()
+        || std::env::var_os("SUPERSONIC_QWEN36_ROUTE_PROFILE_DUMP_CALLS").is_some()
+        || std::env::var_os("SUPERSONIC_QWEN36_ROUTE_PROFILE_DUMP_TOPN_LAYERS").is_some()
+        || std::env::var_os("SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL_FEASIBILITY").is_some()
+        || std::env::var_os("SUPERSONIC_QWEN36_EXPERT_RESIDENCY_PROFILE").is_some()
+        || std::env::var_os("SUPERSONIC_QWEN36_PACK_CACHE_PROFILE").is_some();
+    let use_metal_router_topk = scratch.router_logits_bf16.backend() == Backend::Metal
+        && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
+        && !explicit_route_profile
+        && std::env::var_os("SUPERSONIC_METAL_PROFILE").is_none()
+        && std::env::var_os("SUPERSONIC_METAL_DISABLE_BATCH").is_none()
+        && std::env::var("SUPERSONIC_QWEN36_MOE_METAL_ROUTER_TOPK")
+            .map(|v| v != "0")
+            .unwrap_or(false);
+    let metal_router_expert_batch = if use_metal_router_topk {
+        let guard = prefill_ffi::MetalBatchGuard::begin()
+            .map_err(|e| anyhow!("begin Metal router/expert FFN batch: {e}"))?;
+        prefill_ffi::set_metal_batch_label("qwen36_batched_prefill_router_expert_direct")
+            .map_err(|e| anyhow!("label Metal router/expert FFN batch: {e}"))?;
+        Some(guard)
+    } else {
+        None
+    };
+    if use_metal_router_topk {
+        prefill_ffi::qwen36_router_softmax_topk_bf16(
+            n,
+            num_experts,
+            top_k,
+            &scratch.router_logits_bf16,
+            &mut scratch.topk_idx,
+            &mut scratch.topk_weight,
+        )
+        .map_err(|e| anyhow!("Metal router softmax top-k: {e}"))?;
+    } else {
+        let mut logits_bytes = vec![0u8; n * num_experts * 2];
+        copy_d2h(
+            ordinal,
+            logits_bytes.as_mut_ptr() as *mut c_void,
+            scratch.router_logits_bf16.as_ptr(),
+            logits_bytes.len(),
+        )
+        .context("d2h router_logits_bf16")?;
+        let mut topk_idx_host = vec![0i32; n * top_k];
+        let mut topk_weight_host = vec![0u16; n * top_k];
+        for token in 0..n {
+            let row_bf16 = unsafe {
+                std::slice::from_raw_parts(
+                    (logits_bytes.as_ptr() as *const u16).add(token * num_experts),
+                    num_experts,
+                )
+            };
+            // Widen BF16 → F32 to match the per-token kernel's Phase C, which
+            // reads workspace[OFF_ROUTER_LOGITS] as F32 (the value was stored
+            // via `bf16_round_rne_f32` in Phase B).
+            let row: Vec<f32> = row_bf16.iter().map(|&b| bf16_bits_to_f32(b)).collect();
+            // Match per-token kernel (`ffn_phase.cuh` Phase C): softmax with
+            // BF16-rounded probs, then top-K with low-index tie-breaking, then
+            // renormalise top-K to sum to 1 (BF16-rounded again).
+            let row_max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let exps: Vec<f32> = row.iter().map(|&v| (v - row_max).exp()).collect();
+            let row_sum: f32 = exps.iter().copied().sum();
+            let inv_sum = 1.0f32 / row_sum;
+            // BF16-round each prob to match the per-token kernel.
+            let mut probs: Vec<f32> = exps
+                .iter()
+                .map(|&e| bf16_round_rne_f32(e * inv_sum))
+                .collect();
 
-        // Top-K with low-index tie-break (mark with -inf as we go).
-        for k in 0..top_k {
-            let mut best_idx = -1i32;
-            let mut best_val = f32::NEG_INFINITY;
-            for (i, &v) in probs.iter().enumerate() {
-                if v > best_val || (v == best_val && best_idx >= 0 && (i as i32) < best_idx) {
-                    best_val = v;
-                    best_idx = i as i32;
+            // Top-K with low-index tie-break (mark with -inf as we go).
+            for k in 0..top_k {
+                let mut best_idx = -1i32;
+                let mut best_val = f32::NEG_INFINITY;
+                for (i, &v) in probs.iter().enumerate() {
+                    if v > best_val || (v == best_val && best_idx >= 0 && (i as i32) < best_idx) {
+                        best_val = v;
+                        best_idx = i as i32;
+                    }
+                }
+                topk_idx_host[token * top_k + k] = best_idx;
+                topk_weight_host[token * top_k + k] = f32_to_bf16_bits(best_val);
+                // Mask the winner so the next iteration picks the next highest.
+                if best_idx >= 0 {
+                    probs[best_idx as usize] = f32::NEG_INFINITY;
                 }
             }
-            topk_idx_host[token * top_k + k] = best_idx;
-            topk_weight_host[token * top_k + k] = f32_to_bf16_bits(best_val);
-            // Mask the winner so the next iteration picks the next highest.
-            if best_idx >= 0 {
-                probs[best_idx as usize] = f32::NEG_INFINITY;
+            // Renormalise the top-K weights.
+            let sum_k: f32 = (0..top_k)
+                .map(|k| bf16_bits_to_f32(topk_weight_host[token * top_k + k]))
+                .sum();
+            let inv_k = 1.0f32 / sum_k;
+            for k in 0..top_k {
+                let w = bf16_bits_to_f32(topk_weight_host[token * top_k + k]);
+                topk_weight_host[token * top_k + k] =
+                    f32_to_bf16_bits(bf16_round_rne_f32(w * inv_k));
             }
+            let active_experts: Vec<usize> = (0..top_k)
+                .map(|k| topk_idx_host[token * top_k + k].max(0) as usize)
+                .collect();
+            kernel_ffi::qwen36_moe::qwen36_route_profile_record_active_experts(&active_experts);
         }
-        // Renormalise the top-K weights.
-        let sum_k: f32 = (0..top_k)
-            .map(|k| bf16_bits_to_f32(topk_weight_host[token * top_k + k]))
-            .sum();
-        let inv_k = 1.0f32 / sum_k;
-        for k in 0..top_k {
-            let w = bf16_bits_to_f32(topk_weight_host[token * top_k + k]);
-            topk_weight_host[token * top_k + k] = f32_to_bf16_bits(bf16_round_rne_f32(w * inv_k));
-        }
-        let active_experts: Vec<usize> = (0..top_k)
-            .map(|k| topk_idx_host[token * top_k + k].max(0) as usize)
-            .collect();
-        kernel_ffi::qwen36_moe::qwen36_route_profile_record_active_experts(&active_experts);
+        copy_h2d(
+            ordinal,
+            scratch.topk_idx.as_mut_ptr(),
+            topk_idx_host.as_ptr() as *const c_void,
+            topk_idx_host.len() * 4,
+        )
+        .context("h2d topk_idx")?;
+        copy_h2d(
+            ordinal,
+            scratch.topk_weight.as_mut_ptr(),
+            topk_weight_host.as_ptr() as *const c_void,
+            topk_weight_host.len() * 2,
+        )
+        .context("h2d topk_weight")?;
     }
-    copy_h2d(
-        ordinal,
-        scratch.topk_idx.as_mut_ptr(),
-        topk_idx_host.as_ptr() as *const c_void,
-        topk_idx_host.len() * 4,
-    )
-    .context("h2d topk_idx")?;
-    copy_h2d(
-        ordinal,
-        scratch.topk_weight.as_mut_ptr(),
-        topk_weight_host.as_ptr() as *const c_void,
-        topk_weight_host.len() * 2,
-    )
-    .context("h2d topk_weight")?;
 
     if scratch.h_norm.backend() == Backend::Metal {
         // Metal v1 prototype: keep the same host router/top-k contract but
@@ -2114,6 +2150,11 @@ fn process_ffn_batched_grouped(
         )
         .map_err(|e| anyhow!("M11 unpermute combine: {e}"))?;
     }
+    if let Some(batch) = metal_router_expert_batch {
+        batch
+            .finish()
+            .map_err(|e| anyhow!("finish Metal router/expert FFN batch: {e}"))?;
+    }
 
     // 7. Shared expert (batched primitives).
     //
@@ -2235,22 +2276,40 @@ fn process_ffn_batched_grouped(
     }
 
     // 8. Residual add: chunk_hidden += combined; chunk_hidden += shared_out.
-    prefill_ffi::element_add_inplace(
-        ordinal,
-        ScalarType::BF16,
-        n * hidden,
-        chunk_hidden,
-        &scratch.combined,
-    )
-    .map_err(|e| anyhow!("residual add (combined): {e}"))?;
-    prefill_ffi::element_add_inplace(
-        ordinal,
-        ScalarType::BF16,
-        n * hidden,
-        chunk_hidden,
-        &scratch.shared_out,
-    )
-    .map_err(|e| anyhow!("residual add (shared_out): {e}"))?;
+    // Opt-in diagnostic only: the fused Metal residual-add path preserves the
+    // two BF16 rounding points, but the current M5 Max smoke was slower than
+    // the existing two-add sequence.
+    let use_metal_fused_residual = chunk_hidden.backend() == Backend::Metal
+        && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
+        && std::env::var("SUPERSONIC_QWEN36_MOE_METAL_FUSED_FFN_RESIDUAL")
+            .map(|v| v != "0")
+            .unwrap_or(false);
+    if use_metal_fused_residual {
+        prefill_ffi::qwen36_ffn_residual_add_bf16(
+            n * hidden,
+            chunk_hidden,
+            &scratch.combined,
+            &scratch.shared_out,
+        )
+        .map_err(|e| anyhow!("fused residual add (combined + shared_out): {e}"))?;
+    } else {
+        prefill_ffi::element_add_inplace(
+            ordinal,
+            ScalarType::BF16,
+            n * hidden,
+            chunk_hidden,
+            &scratch.combined,
+        )
+        .map_err(|e| anyhow!("residual add (combined): {e}"))?;
+        prefill_ffi::element_add_inplace(
+            ordinal,
+            ScalarType::BF16,
+            n * hidden,
+            chunk_hidden,
+            &scratch.shared_out,
+        )
+        .map_err(|e| anyhow!("residual add (shared_out): {e}"))?;
+    }
 
     // Touch unused fields to keep the compiler happy on cfg(feature) gates.
     let _ = (geom, scratch.num_experts, scratch.top_k);
