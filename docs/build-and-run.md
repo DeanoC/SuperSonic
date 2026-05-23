@@ -459,10 +459,13 @@ variant still generates `[11]` and cuts the unprofiled one-token result to
 roughly `337 ms/token`, but profile attribution shows `100.287 ms` in
 `qwen36_ffn_int4_expert_pack_stage5`, `43.556 ms` in
 `qwen36_ffn_int4_expert_packed_stage5`, and `182.291 ms` in
-`command_buffer_wait`. The next FFN target is therefore not more arithmetic in
-this shader; it is persistent hot-expert packing, prefetch/residency reuse, or
-an MPS/MPP-backed expert matvec bridge that avoids copying active expert slabs
-every token.
+`command_buffer_wait`. A short four-token cache probe is available with
+`SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_PACK_CACHE=1`, but the measured
+result was not promotable: it reduced HAL alloc/free churn while regressing the
+profiled control from `217.6 ms/token` to `234.7 ms/token` on the same prompt.
+The next FFN target is therefore not more arithmetic in this shader; it is a
+route-aware residency plan, prefetch/reuse that avoids per-token pack copies, or
+an MPS/MPP-backed expert matvec bridge.
 
 ### Metal validation
 

@@ -1018,6 +1018,19 @@ every layer. The next runtime optimization should therefore focus on persistent
 hot-expert packing, prefetch/residency reuse across tokens, or an MPS/MPP-backed
 expert matvec bridge before any routed-expert FFN path is made default.
 
+A follow-up reuse-cache probe is intentionally opt-in behind
+`SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_PACK_CACHE=1` while the packed expert
+path is enabled. On a four-token profiled smoke, the cache preserved the same
+tokens `[11, 353, 599, 264]` and reduced HAL alloc/free churn from 2431/2431
+calls to 1711/1471 calls, but it did not improve latency: the cached run
+measured `234.7 ms/token`, `ffn_ms_avg=128.730`, and `280.597 ms` total in
+`qwen36_ffn_int4_expert_pack_stage5`; the no-cache control measured
+`217.6 ms/token`, `ffn_ms_avg=126.803`, and `248.724 ms` in the same pack bucket.
+That rules out a simple per-layer scratch-slab cache as the next promotion
+target. The next FFN work should either keep packed experts resident without
+recopying on route churn, or move the expert matvecs to a Metal Performance
+Shaders / MPP bridge that avoids the CPU slab-pack step entirely.
+
 Unsupported Metal constraints remain explicit for this target: persistent
 decode, KV-FP8, speculative decode, batching, and Metal VMM are not benchmarked
 or claimed here yet. Because the Qwen3.6 hero lane uses GPTQ-packed INT4
