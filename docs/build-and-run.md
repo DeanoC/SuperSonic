@@ -303,11 +303,16 @@ Metal currently rejects or defers:
   experts; `SUPERSONIC_METAL_PROFILE=1` profiles that default lane rather than
   switching implementations. The experimental native FFN path remains explicit
   opt-in via `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5=1`; routed expert
-  gate/up and down matvecs are the next measured optimization target. A
-  gate/up-only tiled routed-expert kernel can be tested with
+  gate/up and down matvecs are the next measured optimization target. The
+  tiled routed-expert gate/up kernel can be tested with
   `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_GATE_UP_TILED=1`, but it is
-  diagnostic-only until expert down/finalize can consume the intermediate on
-  GPU. The one-token local smoke is:
+  diagnostic-only because expert down/finalize still has to read the
+  intermediate through the host path. A combined routed expert gate/up +
+  down/finalize experiment keeps `expert_mid` device-side behind
+  `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_TILED_STAGE5=1`; it also remains
+  diagnostic-only because the current real decode profile is dominated by
+  command-buffer wait and large bake-buffer residency rather than the GPU
+  arithmetic row. The one-token local smoke is:
   `cargo run --release --bin supersonic -- --backend metal --model qwen3.6-35b-a3b --model-dir /path/to/Qwen3.6-35B-A3B --int4 --prompt "Hello" --max-new-tokens 1 --emit-stage-timings`.
   FP8-runtime, KV-FP8, speculative decode, and persistent decode remain
   unsupported on this Metal path.
@@ -329,6 +334,8 @@ Native Metal kernels used in the hot path:
   experiments
 - Qwen3.6 routed-expert gate/up tiled INT4 kernel for focused FFN
   microbenching and explicit opt-in attribution
+- Qwen3.6 routed-expert gate/up + down/finalize tiled INT4 kernel for focused
+  FFN microbenching and explicit opt-in attribution
 - linear prefill conv pack
 - element add
 - cast
@@ -433,11 +440,18 @@ multi-token per-token bucket after FFN fallback tightening. The 512-token
 `--metal-profile` smoke currently reports roughly 269 ms/token, 71.7 s prefill,
 and a clear NIAH miss row; its one-token row is lm-head/tail dominated, while
 the Metal profile totals still point at FFN command-buffer wait. The routed
-expert gate/up microbench reports `mean_ms=0.5962` with zero mismatches on the
-exact Qwen3.6 stage-5 INT4 geometry, but the decode opt-in path regresses
-because each layer synchronizes before host expert-down. The next FFN target is
-therefore a full routed-expert GPU path that keeps `expert_mid` device-side
-through expert down, top-k combine, shared add, and residual.
+expert microbench reports `mean_ms=0.4490` for gate/up and `mean_ms=0.3332`
+for combined gate/up + down/finalize with zero mismatches on the exact Qwen3.6
+stage-5 INT4 geometry. Wired into real decode with
+`SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_TILED_STAGE5=1`, the combined path
+still generates `[11]`, but it regresses badly: the profiled one-token smoke
+measured `ffn_ms_avg=1458.677`, with only `19.760 ms` total GPU time for
+`command_buffer_gpu:qwen36_ffn_int4_expert_gate_up_down_finalize_tiled` across
+40 layers and `1561.827 ms` in `command_buffer_wait`. The next FFN target is
+therefore not more arithmetic in this shader; it is command-buffer wait and
+real bake-buffer residency/page movement, or a packing/prefetch strategy that
+keeps the expert data resident before promoting a default routed-expert GPU
+path.
 
 ### Metal validation
 

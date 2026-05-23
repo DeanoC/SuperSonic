@@ -10740,6 +10740,151 @@ extern "C" int supersonic_metal_qwen36_ffn_expert_gate_up_tiled(
     }
 }
 
+extern "C" int supersonic_metal_qwen36_ffn_expert_gate_up_down_finalize_tiled(
+    size_t hidden,
+    size_t moe_intermediate,
+    size_t top_k,
+    size_t group_size,
+    void* workspace_ptr,
+    const void* input_hidden_ptr,
+    const void* gate_up_proj_ptr,
+    const void* gate_up_scale_ptr,
+    const void* gate_up_zero_ptr,
+    const void* down_proj_ptr,
+    const void* down_scale_ptr,
+    const void* down_zero_ptr,
+    void* output_ptr,
+    size_t off_h_norm,
+    size_t off_topk_val,
+    size_t off_topk_idx,
+    size_t off_shared_out,
+    size_t off_expert_mid,
+    size_t off_moe_out,
+    int wait_for_completion
+) {
+    @autoreleasepool {
+        if (hidden == 0 || moe_intermediate == 0 || top_k == 0 || group_size == 0 ||
+            workspace_ptr == nullptr || input_hidden_ptr == nullptr ||
+            gate_up_proj_ptr == nullptr || gate_up_scale_ptr == nullptr ||
+            gate_up_zero_ptr == nullptr || down_proj_ptr == nullptr ||
+            down_scale_ptr == nullptr || down_zero_ptr == nullptr || output_ptr == nullptr) {
+            return 1193;
+        }
+        if (hidden > UINT32_MAX || moe_intermediate > UINT32_MAX ||
+            top_k > UINT32_MAX || group_size > UINT32_MAX ||
+            off_h_norm > UINT32_MAX || off_topk_val > UINT32_MAX ||
+            off_topk_idx > UINT32_MAX || off_shared_out > UINT32_MAX ||
+            off_expert_mid > UINT32_MAX || off_moe_out > UINT32_MAX) {
+            return 1194;
+        }
+        if ((hidden % 2) != 0 || (moe_intermediate % 2) != 0) {
+            return 1195;
+        }
+
+        NSError* pipeline_error = nil;
+        Qwen36FfnInt4Pipelines pipelines = qwen36_ffn_int4_pipelines(&pipeline_error);
+        if (pipelines.expert_gate_up_tiled == nil || pipelines.expert_down_finalize == nil) {
+            return 1196;
+        }
+
+        id<MTLBuffer> workspace = nil;
+        id<MTLBuffer> input_hidden = nil;
+        id<MTLBuffer> gate_up_proj = nil;
+        id<MTLBuffer> gate_up_scale = nil;
+        id<MTLBuffer> gate_up_zero = nil;
+        id<MTLBuffer> down_proj = nil;
+        id<MTLBuffer> down_scale = nil;
+        id<MTLBuffer> down_zero = nil;
+        id<MTLBuffer> output = nil;
+        size_t workspace_offset = 0;
+        size_t input_hidden_offset = 0;
+        size_t gate_up_proj_offset = 0;
+        size_t gate_up_scale_offset = 0;
+        size_t gate_up_zero_offset = 0;
+        size_t down_proj_offset = 0;
+        size_t down_scale_offset = 0;
+        size_t down_zero_offset = 0;
+        size_t output_offset = 0;
+        if (lookup_buffer(workspace_ptr, &workspace, &workspace_offset) != 0) return 1197;
+        if (lookup_buffer(input_hidden_ptr, &input_hidden, &input_hidden_offset) != 0) return 1198;
+        if (lookup_buffer(gate_up_proj_ptr, &gate_up_proj, &gate_up_proj_offset) != 0) return 1199;
+        if (lookup_buffer(gate_up_scale_ptr, &gate_up_scale, &gate_up_scale_offset) != 0) return 1200;
+        if (lookup_buffer(gate_up_zero_ptr, &gate_up_zero, &gate_up_zero_offset) != 0) return 1201;
+        if (lookup_buffer(down_proj_ptr, &down_proj, &down_proj_offset) != 0) return 1202;
+        if (lookup_buffer(down_scale_ptr, &down_scale, &down_scale_offset) != 0) return 1203;
+        if (lookup_buffer(down_zero_ptr, &down_zero, &down_zero_offset) != 0) return 1204;
+        if (lookup_buffer(output_ptr, &output, &output_offset) != 0) return 1205;
+
+        Qwen36FfnExpertGateUpTiledParams gate_params = {
+            static_cast<uint32_t>(hidden),
+            static_cast<uint32_t>(moe_intermediate),
+            static_cast<uint32_t>(top_k),
+            static_cast<uint32_t>(group_size),
+            static_cast<uint32_t>(off_h_norm),
+            static_cast<uint32_t>(off_topk_idx),
+            static_cast<uint32_t>(off_expert_mid),
+        };
+        Qwen36FfnInt4Params down_params = {
+            static_cast<uint32_t>(hidden),
+            0u,
+            static_cast<uint32_t>(moe_intermediate),
+            0u,
+            static_cast<uint32_t>(top_k),
+            static_cast<uint32_t>(group_size),
+            static_cast<uint32_t>(off_h_norm),
+            static_cast<uint32_t>(off_topk_val),
+            static_cast<uint32_t>(off_topk_idx),
+            0u,
+            0u,
+            static_cast<uint32_t>(off_shared_out),
+            static_cast<uint32_t>(off_expert_mid),
+            static_cast<uint32_t>(off_moe_out),
+        };
+
+        auto encode = [&](id<MTLComputeCommandEncoder> encoder) {
+            [encoder setComputePipelineState:pipelines.expert_gate_up_tiled];
+            [encoder setBuffer:workspace offset:workspace_offset atIndex:0];
+            [encoder setBuffer:gate_up_proj offset:gate_up_proj_offset atIndex:1];
+            [encoder setBuffer:gate_up_scale offset:gate_up_scale_offset atIndex:2];
+            [encoder setBuffer:gate_up_zero offset:gate_up_zero_offset atIndex:3];
+            [encoder setBytes:&gate_params length:sizeof(gate_params) atIndex:4];
+            [encoder setThreadgroupMemoryLength:16 * sizeof(float) atIndex:0];
+            [encoder dispatchThreadgroups:MTLSizeMake(moe_intermediate, top_k, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+            [encoder setComputePipelineState:pipelines.expert_down_finalize];
+            [encoder setBuffer:workspace offset:workspace_offset atIndex:0];
+            [encoder setBuffer:input_hidden offset:input_hidden_offset atIndex:1];
+            [encoder setBuffer:down_proj offset:down_proj_offset atIndex:2];
+            [encoder setBuffer:down_scale offset:down_scale_offset atIndex:3];
+            [encoder setBuffer:down_zero offset:down_zero_offset atIndex:4];
+            [encoder setBuffer:output offset:output_offset atIndex:5];
+            [encoder setBytes:&down_params length:sizeof(down_params) atIndex:6];
+            [encoder dispatchThreadgroups:MTLSizeMake(hidden, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        };
+        if (wait_for_completion != 0) {
+            return encode_or_submit_labeled(
+                encode,
+                "qwen36_ffn_int4_expert_gate_up_down_finalize_tiled",
+                1206,
+                1207,
+                1208,
+                1209
+            );
+        }
+        return encode_or_submit_labeled_async(
+            encode,
+            "qwen36_ffn_int4_expert_gate_up_down_finalize_tiled",
+            1206,
+            1207,
+            1208,
+            1209
+        );
+    }
+}
+
 extern "C" int supersonic_metal_qwen36_ffn_int4_stage5(
     size_t hidden,
     size_t num_experts,

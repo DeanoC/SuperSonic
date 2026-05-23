@@ -835,7 +835,12 @@ gate/up-only tiled routed-expert kernel is also available as a diagnostic
 microbench and explicit decode experiment via
 `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_GATE_UP_TILED=1`, but it is not
 promoted because the real decode path must still synchronize back to host for
-expert down/finalize.
+expert down/finalize. The follow-up combined routed-expert gate/up +
+down/finalize path is available behind
+`SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_TILED_STAGE5=1`; it keeps the
+`expert_mid` workspace device-side, but remains diagnostic-only because the
+real model profile points at command-buffer wait and bake-buffer residency
+rather than raw shader arithmetic.
 
 Reproduce the run with:
 
@@ -960,17 +965,19 @@ with `qwen36_ffn_host_expert_gate_up` at 56.839 ms total and
 escape hatch also generated `[11]`, but remains too slow to promote
 (`ffn_ms_avg=640.553` in the same one-token smoke shape).
 
-The focused routed-expert gate/up microbench exercises the exact Qwen3.6 stage-5
-INT4 shape (`hidden=2048`, `num_experts=256`, `moe_intermediate=512`,
-`top_k=8`, `group_size=128`) without the rest of decode:
+The focused routed-expert microbench exercises the exact Qwen3.6 stage-5 INT4
+shape (`hidden=2048`, `num_experts=256`, `moe_intermediate=512`, `top_k=8`,
+`group_size=128`) without the rest of decode:
 
 ```bash
 cargo build --release -p runner --bin qwen36_ffn_expert_microbench
 target/release/qwen36_ffn_expert_microbench --iters 20 --warmup 3
 ```
 
-On this M5 Max it reports `mean_ms=0.5962`, `max_abs=0.000015`, and
-`mismatches=0`. Wired into decode with
+On this M5 Max it reports `mean_ms=0.4490`, `max_abs=0.000015`, and
+`mismatches=0` for gate/up, plus `mean_ms=0.3332`, `max_abs=0.000000`, and
+`mismatches=0` for the combined gate/up + down/finalize path. Wired into decode
+with
 `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_GATE_UP_TILED=1`, the same kernel
 still generates `[11]`, and the Metal profile shows only 8.418 ms total GPU
 time for `command_buffer_gpu:qwen36_ffn_int4_expert_gate_up_tiled` across
@@ -979,16 +986,21 @@ time for `command_buffer_gpu:qwen36_ffn_int4_expert_gate_up_tiled` across
 layer must wait before the host expert-down path reads `expert_mid`. That makes
 the gate/up-only decode experiment a diagnostic step, not the default path.
 
-The next measured bottleneck is still routed-expert FFN, but the target is now
-more precise: keep `expert_mid` on GPU and fuse/chain expert-down plus top-k
-finalize/residual before making gate/up native. The top default one-token
-profile rows are `qwen36_linear_int4_stage5`, `command_buffer_wait`,
-`qwen36_ffn_host_expert_gate_up`, and `qwen36_ffn_host_expert_down`; the
-gate/up-only experiment proves the raw Metal kernel is cheap while the current
-CPU/GPU handoff dominates. The next runtime optimization should therefore be a
-single routed-expert FFN GPU path that includes gate/up, SiLU, down, top-k
-combine, shared add, and residual, or an MPS/MPP-backed expert matvec bridge
-that avoids per-layer host synchronization.
+The combined opt-in path with
+`SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_TILED_STAGE5=1` also generates
+`[11]`, but it is not promotable. An unprofiled one-token smoke measured
+`ffn_ms_avg=1276.670`; the profiled one-token smoke measured
+`ffn_ms_avg=1458.677`, with
+`qwen36_ffn_int4_expert_gate_up_down_finalize_tiled` at 1414.646 ms wall time
+across 40 layers, but only 19.760 ms total GPU time for
+`command_buffer_gpu:qwen36_ffn_int4_expert_gate_up_down_finalize_tiled`.
+`command_buffer_wait` accounts for 1561.827 ms total in the same run. The
+combined microbench proves the arithmetic path is cheap on synthetic resident
+buffers; the real decode path is now pointing at command-buffer waits plus
+large GPTQ bake-buffer residency/page movement. The next runtime optimization
+should therefore attack buffer residency, expert-weight packing/prefetch, or an
+MPS/MPP-backed expert matvec bridge before any routed-expert FFN path is made
+default.
 
 Unsupported Metal constraints remain explicit for this target: persistent
 decode, KV-FP8, speculative decode, batching, and Metal VMM are not benchmarked

@@ -1,8 +1,8 @@
 //! Focused Qwen3.6 MoE routed-expert FFN INT4 microbench.
 //!
-//! This exercises only the stage-5 routed expert gate/up projection shape:
-//! top-k experts, rows `[2 * moe_intermediate, hidden]`, GPTQ INT4 sidecars,
-//! and the same workspace offsets used by the decode fallback.
+//! This exercises the stage-5 routed expert projection shape: top-k expert
+//! gate/up, routed down/finalize, GPTQ INT4 sidecars, and the same workspace
+//! conventions used by the decode fallback.
 
 use anyhow::{anyhow, bail, Result};
 use clap::Parser;
@@ -116,12 +116,13 @@ fn dequant(
     zeros: &[f32],
     expert: usize,
     row: usize,
+    rows: usize,
     col: usize,
+    cols: usize,
 ) -> f32 {
-    let rows = 2 * MOE_INTERMEDIATE;
-    let byte_cols = HIDDEN / 2;
+    let byte_cols = cols / 2;
     let scale_rows = rows.div_ceil(GROUP_SIZE);
-    let scale_cols = HIDDEN.div_ceil(GROUP_SIZE);
+    let scale_cols = cols.div_ceil(GROUP_SIZE);
     let byte = packed[(expert * rows + row) * byte_cols + col / 2];
     let nibble = if col & 1 == 0 {
         byte & 0x0f
@@ -141,6 +142,7 @@ fn reference(
     h_norm: &[f32],
     experts: &[usize],
 ) -> Vec<f32> {
+    let rows = 2 * MOE_INTERMEDIATE;
     let mut out = vec![0.0f32; experts.len() * MOE_INTERMEDIATE];
     for (group, &expert) in experts.iter().enumerate() {
         for row in 0..MOE_INTERMEDIATE {
@@ -148,12 +150,56 @@ fn reference(
             let mut up = 0.0f32;
             for col in 0..HIDDEN {
                 let x = h_norm[col];
-                gate += dequant(packed, scales, zeros, expert, row, col) * x;
-                up += dequant(packed, scales, zeros, expert, MOE_INTERMEDIATE + row, col) * x;
+                gate += dequant(packed, scales, zeros, expert, row, rows, col, HIDDEN) * x;
+                up += dequant(
+                    packed,
+                    scales,
+                    zeros,
+                    expert,
+                    MOE_INTERMEDIATE + row,
+                    rows,
+                    col,
+                    HIDDEN,
+                ) * x;
             }
             let silu = gate * (1.0f32 / (1.0f32 + (-gate).exp()));
             out[group * MOE_INTERMEDIATE + row] = silu * up;
         }
+    }
+    out
+}
+
+fn reference_final(
+    down_packed: &[u8],
+    down_scales: &[f32],
+    down_zeros: &[f32],
+    expert_mid: &[f32],
+    input_hidden: &[f32],
+    shared_out: &[f32],
+    topk_val: &[f32],
+    experts: &[usize],
+) -> Vec<f32> {
+    let mut out = vec![0.0f32; HIDDEN];
+    for row in 0..HIDDEN {
+        let mut moe_acc = 0.0f32;
+        for (group, &expert) in experts.iter().enumerate() {
+            let mut down = 0.0f32;
+            for col in 0..MOE_INTERMEDIATE {
+                down += dequant(
+                    down_packed,
+                    down_scales,
+                    down_zeros,
+                    expert,
+                    row,
+                    HIDDEN,
+                    col,
+                    MOE_INTERMEDIATE,
+                ) * expert_mid[group * MOE_INTERMEDIATE + col];
+            }
+            moe_acc += topk_val[group] * down;
+        }
+        let moe = bf16_round(moe_acc);
+        out[row] = bf16_round(input_hidden[row] + moe + shared_out[row]);
     }
     out
 }
@@ -168,23 +214,52 @@ fn main() -> Result<()> {
     let rows = 2 * MOE_INTERMEDIATE;
     let active_experts = [3usize, 17, 42, 87, 119, 140, 188, 251];
     let off_h_norm = 0usize;
-    let off_topk_idx = off_h_norm + HIDDEN;
-    let off_expert_mid = off_topk_idx + TOP_K;
-    let workspace_len = off_expert_mid + TOP_K * MOE_INTERMEDIATE;
+    let off_topk_val = off_h_norm + HIDDEN;
+    let off_topk_idx = off_topk_val + TOP_K;
+    let off_shared_out = off_topk_idx + TOP_K;
+    let off_expert_mid = off_shared_out + HIDDEN;
+    let off_moe_out = off_expert_mid + TOP_K * MOE_INTERMEDIATE;
+    let workspace_len = off_moe_out + HIDDEN;
 
     eprintln!(
         "[qwen36-ffn-expert-microbench] building synthetic exact geometry: experts={NUM_EXPERTS} rows={rows} hidden={HIDDEN}"
     );
     let packed = build_packed(rows, HIDDEN);
     let (scales, zeros) = build_sidecars(rows, HIDDEN);
+    let down_packed = build_packed(HIDDEN, MOE_INTERMEDIATE);
+    let (down_scales, down_zeros) = build_sidecars(HIDDEN, MOE_INTERMEDIATE);
     let h_norm: Vec<f32> = (0..HIDDEN).map(activation_at).collect();
     let expected = reference(&packed, &scales, &zeros, &h_norm, &active_experts);
+    let input_hidden: Vec<f32> = (0..HIDDEN)
+        .map(|i| bf16_round(((i as f32) * 0.017).cos() * 0.2))
+        .collect();
+    let shared_out: Vec<f32> = (0..HIDDEN)
+        .map(|i| bf16_round(((i as f32) * 0.019).sin() * 0.15))
+        .collect();
+    let topk_val_raw: Vec<f32> = (0..TOP_K).map(|i| 1.0 / (i as f32 + 2.0)).collect();
+    let topk_sum: f32 = topk_val_raw.iter().sum();
+    let topk_val: Vec<f32> = topk_val_raw
+        .iter()
+        .map(|&v| bf16_round(v / topk_sum))
+        .collect();
+    let expected_final = reference_final(
+        &down_packed,
+        &down_scales,
+        &down_zeros,
+        &expected,
+        &input_hidden,
+        &shared_out,
+        &topk_val,
+        &active_experts,
+    );
 
     let mut workspace_host = vec![0.0f32; workspace_len];
     workspace_host[off_h_norm..off_h_norm + HIDDEN].copy_from_slice(&h_norm);
+    workspace_host[off_topk_val..off_topk_val + TOP_K].copy_from_slice(&topk_val);
     for (i, &expert) in active_experts.iter().enumerate() {
         workspace_host[off_topk_idx + i] = f32::from_bits(expert as u32);
     }
+    workspace_host[off_shared_out..off_shared_out + HIDDEN].copy_from_slice(&shared_out);
 
     let mut workspace = GpuBuffer::from_host_bytes(
         0,
@@ -206,6 +281,35 @@ fn main() -> Result<()> {
         &[NUM_EXPERTS, rows / GROUP_SIZE, HIDDEN / GROUP_SIZE],
         &bf16_bytes(&zeros),
     )?;
+    let down = GpuBuffer::from_host_bytes(
+        0,
+        ScalarType::U8,
+        &[NUM_EXPERTS, HIDDEN, MOE_INTERMEDIATE / 2],
+        &down_packed,
+    )?;
+    let down_scale = GpuBuffer::from_host_bytes(
+        0,
+        ScalarType::BF16,
+        &[
+            NUM_EXPERTS,
+            HIDDEN / GROUP_SIZE,
+            MOE_INTERMEDIATE / GROUP_SIZE,
+        ],
+        &bf16_bytes(&down_scales),
+    )?;
+    let down_zero = GpuBuffer::from_host_bytes(
+        0,
+        ScalarType::BF16,
+        &[
+            NUM_EXPERTS,
+            HIDDEN / GROUP_SIZE,
+            MOE_INTERMEDIATE / GROUP_SIZE,
+        ],
+        &bf16_bytes(&down_zeros),
+    )?;
+    let input_hidden_buf =
+        GpuBuffer::from_host_bytes(0, ScalarType::BF16, &[HIDDEN], &bf16_bytes(&input_hidden))?;
+    let mut output = GpuBuffer::zeros(0, ScalarType::BF16, &[HIDDEN])?;
 
     for _ in 0..args.warmup {
         qwen36_moe::ffn_expert_gate_up_tiled_metal_launch(
@@ -270,6 +374,91 @@ fn main() -> Result<()> {
     );
     if mismatches > 0 {
         return Err(anyhow!("tiled expert gate/up mismatches: {mismatches}"));
+    }
+
+    for _ in 0..args.warmup {
+        qwen36_moe::ffn_expert_tiled_stage5_metal_launch(
+            HIDDEN,
+            MOE_INTERMEDIATE,
+            TOP_K,
+            GROUP_SIZE,
+            &mut workspace,
+            &input_hidden_buf,
+            &gate_up,
+            &gate_up_scale,
+            &gate_up_zero,
+            &down,
+            &down_scale,
+            &down_zero,
+            &mut output,
+            off_h_norm,
+            off_topk_val,
+            off_topk_idx,
+            off_shared_out,
+            off_expert_mid,
+            off_moe_out,
+        )?;
+    }
+
+    let start = Instant::now();
+    for _ in 0..args.iters {
+        qwen36_moe::ffn_expert_tiled_stage5_metal_launch(
+            HIDDEN,
+            MOE_INTERMEDIATE,
+            TOP_K,
+            GROUP_SIZE,
+            &mut workspace,
+            &input_hidden_buf,
+            &gate_up,
+            &gate_up_scale,
+            &gate_up_zero,
+            &down,
+            &down_scale,
+            &down_zero,
+            &mut output,
+            off_h_norm,
+            off_topk_val,
+            off_topk_idx,
+            off_shared_out,
+            off_expert_mid,
+            off_moe_out,
+        )?;
+    }
+    let full_mean_ms = start.elapsed().as_secs_f64() * 1000.0 / args.iters.max(1) as f64;
+    let got_final: Vec<f32> = output
+        .to_host_bytes()?
+        .chunks_exact(2)
+        .map(|c| bf16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
+        .collect();
+    let mut full_max_abs = 0.0f32;
+    let mut full_max_rel = 0.0f32;
+    let mut full_worst = 0usize;
+    let mut full_mismatches = 0usize;
+    for i in 0..got_final.len() {
+        let d = (got_final[i] - expected_final[i]).abs();
+        let rel = d / expected_final[i].abs().max(1.0);
+        if d > full_max_abs {
+            full_max_abs = d;
+            full_max_rel = rel;
+            full_worst = i;
+        }
+        let tol = expected_final[i].abs().max(1.0) * 0.08 + 0.05;
+        if d > tol {
+            full_mismatches += 1;
+        }
+    }
+    println!(
+        "[qwen36-ffn-expert-tiled-stage5] mean_ms={full_mean_ms:.4} iters={} warmup={} max_abs={full_max_abs:.6} max_rel={full_max_rel:.6} worst={} got={:.6} expected={:.6} mismatches={full_mismatches}",
+        args.iters,
+        args.warmup,
+        full_worst,
+        got_final[full_worst],
+        expected_final[full_worst],
+    );
+    if full_mismatches > 0 {
+        return Err(anyhow!(
+            "tiled expert stage5 finalize mismatches: {full_mismatches}"
+        ));
     }
     Ok(())
 }
