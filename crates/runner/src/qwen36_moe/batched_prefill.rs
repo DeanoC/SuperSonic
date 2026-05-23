@@ -704,6 +704,7 @@ fn process_chunk_batched(
             process_ffn_pertoken(
                 ordinal,
                 geom,
+                layer_idx,
                 n,
                 &mut chunk_hidden,
                 &layer.ffn,
@@ -1567,6 +1568,7 @@ fn process_full_attn_layer_pertoken(
 fn process_ffn_pertoken(
     ordinal: usize,
     geom: &MultiLayerGeom,
+    layer_idx: usize,
     n: usize,
     chunk_hidden: &mut GpuBuffer,
     ffn: &crate::qwen36_moe_types::FfnLayerBuffers,
@@ -1579,6 +1581,7 @@ fn process_ffn_pertoken(
     let row_bytes = hidden * 2;
     let params = Qwen36MoeFfnStepParams {
         stage: 5,
+        layer_idx: layer_idx as i32,
         hidden: geom.hidden,
         num_experts: geom.num_experts,
         moe_intermediate: geom.moe_intermediate,

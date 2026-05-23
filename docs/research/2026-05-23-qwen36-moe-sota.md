@@ -413,12 +413,19 @@ under the same smoke:
    experiment concrete: `[qwen36-route-topn-layer]` exposes per-layer expert
    IDs/counts for static tables, `[qwen36-route-call]` exposes real active
    expert sets, and `tests/metal/probe_qwen36_static_topn.py` turns calibration
-   and evaluation prompt runs into coverage, fallback-call, worst-layer, and
-   resident FP16 MPS RHS size rows. The first slice is still a hit-rate/sizing
-   probe; the runtime path does not yet consume a static MPS table.
+   and evaluation prompt runs into coverage, fallback-call, worst-layer,
+   resident native INT4 size, resident FP16 MPS RHS size, and `static_tables`
+   rows. The first runtime slice consumes those tables as an opt-in native
+   INT4 packed static top-N path; the larger static MPS/MPP table remains a
+   follow-up.
    The first local smoke is a negative result for small capacities: top-N 16
    costs 3.75 GiB of FP16 RHS storage but covered only 35.8% of assignments and
    fully served 4/880 layer calls on a coding-shaped evaluation prompt.
+   A regenerated v2 capacity-64 table improved evaluation assignment coverage
+   to 69.858%, but the first one-token runtime smoke still hit only 9/40 layers
+   exactly and measured 507 ms/token with 369.071 ms in FFN. Treat the native
+   static table as validated plumbing for warm-reuse/hybrid-fallback experiments,
+   not as a promoted path.
 
 4. **Qwen3.6 MTP tensor audit**
    Parse local safetensors/bakes for MTP heads and write down the loader delta

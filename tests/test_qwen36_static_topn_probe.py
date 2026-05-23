@@ -62,6 +62,18 @@ class Qwen36StaticTopNProbeTests(unittest.TestCase):
         self.assertEqual(estimate["bytes_per_expert"], 6_291_456)
         self.assertAlmostEqual(estimate["total_gib"], 3.75)
 
+    def test_resident_native_int4_size_includes_sidecars(self):
+        estimate = probe_qwen36_static_topn.estimate_resident_native_int4_bytes(
+            layers=40,
+            capacity=64,
+            hidden=2048,
+            moe_intermediate=512,
+            group_size=128,
+        )
+
+        self.assertEqual(estimate["bytes_per_expert"], 1_573_632)
+        self.assertAlmostEqual(estimate["total_gib"], 3.7518310546875)
+
     def test_build_report_summarizes_capacity_rows(self):
         report = probe_qwen36_static_topn.build_report(
             CALIBRATION_OUTPUT,
@@ -76,13 +88,16 @@ class Qwen36StaticTopNProbeTests(unittest.TestCase):
         self.assertEqual(report["calibration"]["topn_layer_rows"], 4)
         self.assertEqual(report["evaluation"]["route_calls"], 3)
         self.assertEqual(report["rows"][0]["capacity"], 2)
+        self.assertEqual(report["static_tables"]["2"]["layers"][0]["experts"], [1, 2])
+        self.assertEqual(report["static_tables"]["4"]["layers"][1]["experts"], [4, 6, 3, 7])
         self.assertGreater(
             report["rows"][1]["evaluation_static_topn"]["coverage"],
             report["rows"][0]["evaluation_static_topn"]["coverage"],
         )
         md = probe_qwen36_static_topn.render_markdown(report)
         self.assertIn("Static Top-N MPS Probe", md)
-        self.assertIn("Resident RHS GiB", md)
+        self.assertIn("Native INT4 GiB", md)
+        self.assertIn("MPS RHS GiB", md)
 
 
 if __name__ == "__main__":

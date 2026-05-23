@@ -29,7 +29,7 @@ use crate::layer_desc::MAX_BATCH_SIZE;
 
 const QWEN36_ROUTE_PROFILE_DEFAULT_LAYERS: usize = 40;
 const QWEN36_ROUTE_PROFILE_DEFAULT_MAX_CALLS: usize = 16_384;
-const QWEN36_ROUTE_PROFILE_CACHE_CAPS: [usize; 4] = [2, 4, 8, 16];
+const QWEN36_ROUTE_PROFILE_DEFAULT_CAPS: [usize; 6] = [2, 4, 8, 16, 32, 64];
 const QWEN36_BATCHED_PREFILL_PLAN_CHUNKS: [usize; 5] = [64, 128, 256, 512, 1024];
 
 static QWEN36_ROUTE_PROFILE: OnceLock<Mutex<Qwen36RouteProfileAccumulator>> = OnceLock::new();
@@ -244,6 +244,7 @@ pub enum Qwen36ExpertResidencyMissPolicy {
     ExactRoute,
     LruHotset,
     GpuPack,
+    StaticTopN,
 }
 
 impl Qwen36ExpertResidencyMissPolicy {
@@ -252,6 +253,7 @@ impl Qwen36ExpertResidencyMissPolicy {
             Self::ExactRoute => "exact_route",
             Self::LruHotset => "lru_hotset",
             Self::GpuPack => "gpu_pack",
+            Self::StaticTopN => "static_topn",
         }
     }
 }
@@ -566,6 +568,10 @@ pub fn qwen36_expert_residency_profile_snapshot() -> Qwen36ExpertResidencyProfil
         + QWEN36_PACKED_EXPERT_HOTSET_CACHE
             .get()
             .and_then(|cache| cache.lock().ok().map(|cache| cache.len()))
+            .unwrap_or(0)
+        + QWEN36_PACKED_EXPERT_STATIC_TOPN_CACHE
+            .get()
+            .and_then(|cache| cache.lock().ok().map(|cache| cache.len()))
             .unwrap_or(0);
     let Some(profile) = QWEN36_EXPERT_RESIDENCY_PROFILE.get() else {
         return Qwen36ExpertResidencyProfileSnapshot {
@@ -757,6 +763,31 @@ fn qwen36_hotset_expert_residency_profile_record(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn qwen36_static_topn_expert_residency_profile_record(
+    capacity: usize,
+    exact_hit: bool,
+    route_refill: bool,
+    allocation: bool,
+    active_groups: usize,
+    copied_bytes: usize,
+    slot_hits: usize,
+    slot_misses: usize,
+    evictions: usize,
+) {
+    qwen36_expert_residency_profile_record(
+        Qwen36ExpertResidencyProfileKey::new(Qwen36ExpertResidencyMissPolicy::StaticTopN, capacity),
+        exact_hit,
+        route_refill,
+        allocation,
+        active_groups,
+        copied_bytes,
+        slot_hits,
+        slot_misses,
+        evictions,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
 fn qwen36_gpu_pack_expert_residency_profile_record(
     exact_hit: bool,
     route_refill: bool,
@@ -789,6 +820,23 @@ fn qwen36_route_profile_layers() -> usize {
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|&value| value > 0)
         .unwrap_or(QWEN36_ROUTE_PROFILE_DEFAULT_LAYERS)
+}
+
+fn qwen36_route_profile_capacities() -> Vec<usize> {
+    let mut capacities = std::env::var("SUPERSONIC_QWEN36_ROUTE_PROFILE_CAPACITIES")
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .filter_map(|part| part.trim().parse::<usize>().ok())
+                .filter(|&capacity| capacity > 0)
+                .collect::<Vec<_>>()
+        })
+        .filter(|capacities| !capacities.is_empty())
+        .unwrap_or_else(|| QWEN36_ROUTE_PROFILE_DEFAULT_CAPS.to_vec());
+    capacities.sort_unstable();
+    capacities.dedup();
+    capacities
 }
 
 fn qwen36_route_profile_max_calls() -> usize {
@@ -856,7 +904,7 @@ fn qwen36_route_profile_simulate(
     }
     snapshot.unique_layer_experts = unique_layer_experts.len();
 
-    for &capacity in &QWEN36_ROUTE_PROFILE_CACHE_CAPS {
+    for capacity in qwen36_route_profile_capacities() {
         let mut caches: Vec<Vec<u16>> = (0..layers).map(|_| Vec::new()).collect();
         let mut sim = Qwen36RouteCacheSim {
             capacity,
@@ -3586,6 +3634,7 @@ fn linear_step_stage1_5_metal_host(
 #[derive(Debug, Clone, Copy)]
 pub struct Qwen36MoeFfnStepParams {
     pub stage: i32,
+    pub layer_idx: i32,
     pub hidden: i32,
     pub num_experts: i32,
     pub moe_intermediate: i32,
@@ -3848,12 +3897,186 @@ struct Qwen36PackedExpertHotsetCacheEntry {
     buffers: Qwen36PackedExpertBuffers,
 }
 
+struct Qwen36PackedExpertStaticTopNCacheEntry {
+    resident_experts: Vec<usize>,
+    buffers: Qwen36PackedExpertBuffers,
+}
+
+#[derive(Debug, Clone, Default)]
+struct Qwen36StaticTopNTable {
+    layers_by_capacity: HashMap<usize, Vec<Vec<usize>>>,
+}
+
+impl Qwen36StaticTopNTable {
+    fn capacity_exists(&self, capacity: usize) -> bool {
+        self.layers_by_capacity.contains_key(&capacity)
+    }
+
+    fn largest_capacity(&self) -> Option<usize> {
+        self.layers_by_capacity.keys().copied().max()
+    }
+
+    fn layer_experts(&self, capacity: usize, layer_idx: usize) -> Option<&[usize]> {
+        self.layers_by_capacity
+            .get(&capacity)
+            .and_then(|layers| layers.get(layer_idx))
+            .map(Vec::as_slice)
+            .filter(|experts| !experts.is_empty())
+    }
+}
+
 static QWEN36_PACKED_EXPERT_CACHE: OnceLock<
     Mutex<HashMap<Qwen36PackedExpertCacheKey, Qwen36PackedExpertCacheEntry>>,
 > = OnceLock::new();
 static QWEN36_PACKED_EXPERT_HOTSET_CACHE: OnceLock<
     Mutex<HashMap<Qwen36PackedExpertCacheKey, Qwen36PackedExpertHotsetCacheEntry>>,
 > = OnceLock::new();
+static QWEN36_PACKED_EXPERT_STATIC_TOPN_CACHE: OnceLock<
+    Mutex<HashMap<Qwen36PackedExpertCacheKey, Qwen36PackedExpertStaticTopNCacheEntry>>,
+> = OnceLock::new();
+static QWEN36_STATIC_TOPN_TABLE: OnceLock<Result<Qwen36StaticTopNTable, String>> = OnceLock::new();
+
+fn qwen36_parse_static_topn_experts(
+    value: &serde_json::Value,
+    path: &str,
+) -> Result<Vec<usize>, String> {
+    let experts = value
+        .as_array()
+        .ok_or_else(|| format!("{path}: experts must be an array"))?;
+    let mut parsed = Vec::with_capacity(experts.len());
+    for (idx, expert) in experts.iter().enumerate() {
+        let expert = expert
+            .as_u64()
+            .ok_or_else(|| format!("{path}[{idx}]: expert must be an integer"))?;
+        parsed.push(
+            usize::try_from(expert)
+                .map_err(|_| format!("{path}[{idx}]: expert {expert} does not fit in usize"))?,
+        );
+    }
+    Ok(parsed)
+}
+
+fn qwen36_parse_static_topn_layer_rows(
+    capacity: usize,
+    value: &serde_json::Value,
+) -> Result<Vec<Vec<usize>>, String> {
+    let mut layers: Vec<Vec<usize>> = Vec::new();
+    if let Some(rows) = value.get("layers").and_then(|value| value.as_array()) {
+        for (row_idx, row) in rows.iter().enumerate() {
+            let layer_idx = row
+                .get("layer")
+                .and_then(|value| value.as_u64())
+                .ok_or_else(|| {
+                    format!("static_tables.{capacity}.layers[{row_idx}]: missing integer layer")
+                })?;
+            let layer_idx = usize::try_from(layer_idx).map_err(|_| {
+                format!("static_tables.{capacity}.layers[{row_idx}]: layer does not fit in usize")
+            })?;
+            let experts = row.get("experts").ok_or_else(|| {
+                format!("static_tables.{capacity}.layers[{row_idx}]: missing experts")
+            })?;
+            if layers.len() <= layer_idx {
+                layers.resize_with(layer_idx + 1, Vec::new);
+            }
+            layers[layer_idx] = qwen36_parse_static_topn_experts(
+                experts,
+                &format!("static_tables.{capacity}.layers[{row_idx}].experts"),
+            )?;
+        }
+        return Ok(layers);
+    }
+
+    let object = value
+        .as_object()
+        .ok_or_else(|| format!("static_tables.{capacity}: expected object"))?;
+    for (layer_key, layer_value) in object {
+        let layer_idx = layer_key.parse::<usize>().map_err(|err| {
+            format!("static_tables.{capacity}.{layer_key}: invalid layer key: {err}")
+        })?;
+        let experts_value = layer_value.get("experts").unwrap_or(layer_value);
+        if layers.len() <= layer_idx {
+            layers.resize_with(layer_idx + 1, Vec::new);
+        }
+        layers[layer_idx] = qwen36_parse_static_topn_experts(
+            experts_value,
+            &format!("static_tables.{capacity}.{layer_key}.experts"),
+        )?;
+    }
+    Ok(layers)
+}
+
+fn qwen36_parse_static_topn_table_json(raw: &str) -> Result<Qwen36StaticTopNTable, String> {
+    let root: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|err| format!("failed to parse static top-N JSON: {err}"))?;
+    let tables = root
+        .get("static_tables")
+        .ok_or_else(|| "static top-N JSON missing static_tables".to_string())?
+        .as_object()
+        .ok_or_else(|| "static_tables must be an object".to_string())?;
+    let mut layers_by_capacity = HashMap::new();
+    for (capacity_key, value) in tables {
+        let capacity = capacity_key.parse::<usize>().map_err(|err| {
+            format!("static_tables capacity key {capacity_key:?} is invalid: {err}")
+        })?;
+        if capacity == 0 {
+            return Err("static_tables capacity must be > 0".into());
+        }
+        let layers = qwen36_parse_static_topn_layer_rows(capacity, value)?;
+        if !layers.is_empty() {
+            layers_by_capacity.insert(capacity, layers);
+        }
+    }
+    if layers_by_capacity.is_empty() {
+        return Err("static_tables did not contain any layer tables".into());
+    }
+    Ok(Qwen36StaticTopNTable { layers_by_capacity })
+}
+
+fn qwen36_static_topn_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_STATIC_TOPN").is_some()
+}
+
+fn qwen36_static_topn_table_from_env() -> Result<Option<&'static Qwen36StaticTopNTable>, GpuError> {
+    if !qwen36_static_topn_enabled() {
+        return Ok(None);
+    }
+    let table = QWEN36_STATIC_TOPN_TABLE.get_or_init(|| {
+        let path = std::env::var("SUPERSONIC_METAL_QWEN36_FFN_EXPERT_STATIC_TOPN_FILE")
+            .map_err(|_| {
+                "SUPERSONIC_METAL_QWEN36_FFN_EXPERT_STATIC_TOPN_FILE is required when static top-N is enabled"
+                    .to_string()
+            })?;
+        let raw = std::fs::read_to_string(&path)
+            .map_err(|err| format!("failed to read static top-N file {path}: {err}"))?;
+        qwen36_parse_static_topn_table_json(&raw)
+    });
+    match table {
+        Ok(table) => Ok(Some(table)),
+        Err(err) => Err(GpuError::backend(
+            Backend::Metal,
+            format!("qwen36 static top-N table load failed: {err}"),
+        )),
+    }
+}
+
+fn qwen36_static_topn_requested_capacity() -> Result<Option<usize>, GpuError> {
+    match std::env::var("SUPERSONIC_METAL_QWEN36_FFN_EXPERT_STATIC_TOPN_CAPACITY") {
+        Ok(value) => value
+            .parse::<usize>()
+            .ok()
+            .filter(|&capacity| capacity > 0)
+            .map(Some)
+            .ok_or_else(|| {
+                GpuError::InvalidArg(format!(
+                    "invalid SUPERSONIC_METAL_QWEN36_FFN_EXPERT_STATIC_TOPN_CAPACITY={value:?}"
+                ))
+            }),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(err) => Err(GpuError::InvalidArg(format!(
+            "invalid static top-N capacity env: {err}"
+        ))),
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 fn qwen36_validate_active_expert_pack(
@@ -4244,6 +4467,203 @@ fn qwen36_pack_active_experts_for_metal(
         &mut buffers,
     );
     Ok(buffers)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen36_with_static_topn_packed_experts_for_metal<T, F>(
+    ordinal: usize,
+    layer_idx: i32,
+    hidden: usize,
+    moe_intermediate: usize,
+    active_experts: &[usize],
+    group_size: usize,
+    num_experts: usize,
+    workspace: &mut [f32],
+    off_topk_idx: usize,
+    gate_up_proj_ptr: *const c_void,
+    gate_up_scale_ptr: *const c_void,
+    gate_up_zero_ptr: *const c_void,
+    down_proj_ptr: *const c_void,
+    down_scale_ptr: *const c_void,
+    down_zero_ptr: *const c_void,
+    f: F,
+) -> Result<Option<T>, GpuError>
+where
+    F: FnOnce(&Qwen36PackedExpertBuffers) -> Result<T, GpuError>,
+{
+    let Some(table) = qwen36_static_topn_table_from_env()? else {
+        return Ok(None);
+    };
+    if layer_idx < 0 {
+        return Ok(None);
+    }
+    qwen36_validate_active_expert_pack(
+        hidden,
+        moe_intermediate,
+        active_experts,
+        group_size,
+        num_experts,
+        gate_up_proj_ptr,
+        gate_up_scale_ptr,
+        gate_up_zero_ptr,
+        down_proj_ptr,
+        down_scale_ptr,
+        down_zero_ptr,
+    )?;
+    if off_topk_idx + active_experts.len() > workspace.len() {
+        return Err(GpuError::InvalidArg(
+            "qwen36 static top-N packed expert cache topk workspace out of bounds".into(),
+        ));
+    }
+
+    let requested_capacity = qwen36_static_topn_requested_capacity()?;
+    let capacity = if let Some(capacity) = requested_capacity {
+        if !table.capacity_exists(capacity) {
+            return Err(GpuError::InvalidArg(format!(
+                "static top-N table does not contain requested capacity {capacity}"
+            )));
+        }
+        capacity
+    } else {
+        table.largest_capacity().ok_or_else(|| {
+            GpuError::InvalidArg("static top-N table does not contain any capacity".into())
+        })?
+    };
+    let Some(resident_experts) = table.layer_experts(capacity, layer_idx as usize) else {
+        return Ok(None);
+    };
+    let resident_capacity = resident_experts.len();
+    let mut expert_to_slot = vec![None; num_experts];
+    for (slot, &expert) in resident_experts.iter().enumerate() {
+        if expert >= num_experts {
+            return Err(GpuError::InvalidArg(format!(
+                "static top-N table layer {layer_idx} capacity {capacity} has expert {expert} >= num_experts {num_experts}"
+            )));
+        }
+        if expert_to_slot[expert].replace(slot).is_some() {
+            return Err(GpuError::InvalidArg(format!(
+                "static top-N table layer {layer_idx} capacity {capacity} contains duplicate expert {expert}"
+            )));
+        }
+    }
+
+    let mut active_slots = Vec::with_capacity(active_experts.len());
+    let mut slot_hits = 0usize;
+    let mut slot_misses = 0usize;
+    for &expert in active_experts {
+        if let Some(slot) = expert_to_slot[expert] {
+            slot_hits += 1;
+            active_slots.push(slot);
+        } else {
+            slot_misses += 1;
+        }
+    }
+    if slot_misses > 0 {
+        qwen36_static_topn_expert_residency_profile_record(
+            resident_capacity,
+            false,
+            false,
+            false,
+            active_experts.len(),
+            0,
+            slot_hits,
+            slot_misses,
+            0,
+        );
+        return Ok(None);
+    }
+
+    let key = Qwen36PackedExpertCacheKey {
+        gate_up_proj_ptr: gate_up_proj_ptr as usize,
+        gate_up_scale_ptr: gate_up_scale_ptr as usize,
+        gate_up_zero_ptr: gate_up_zero_ptr as usize,
+        down_proj_ptr: down_proj_ptr as usize,
+        down_scale_ptr: down_scale_ptr as usize,
+        down_zero_ptr: down_zero_ptr as usize,
+        hidden,
+        moe_intermediate,
+        group_size,
+        active_groups: resident_capacity,
+    };
+    let cache = QWEN36_PACKED_EXPERT_STATIC_TOPN_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache.lock().map_err(|_| {
+        GpuError::backend(
+            Backend::Metal,
+            "qwen36 packed expert static top-N cache mutex poisoned".into(),
+        )
+    })?;
+    let mut allocation = false;
+    let copied_bytes =
+        qwen36_packed_expert_copy_bytes(hidden, moe_intermediate, resident_capacity, group_size);
+    crate::prefill_ffi::metal_profile_time(
+        "qwen36_ffn_int4_expert_static_topn_pack_stage5",
+        "host",
+        || -> Result<(), GpuError> {
+            match cache.entry(key) {
+                std::collections::hash_map::Entry::Occupied(entry) => {
+                    if entry.get().resident_experts.as_slice() != resident_experts {
+                        return Err(GpuError::backend(
+                            Backend::Metal,
+                            "qwen36 static top-N cache key collision with different resident experts"
+                                .into(),
+                        ));
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(vacant) => {
+                    let mut buffers = qwen36_alloc_packed_experts_for_metal(
+                        ordinal,
+                        hidden,
+                        moe_intermediate,
+                        resident_capacity,
+                        group_size,
+                    )?;
+                    for (slot, &expert) in resident_experts.iter().enumerate() {
+                        qwen36_fill_packed_expert_slot_for_metal(
+                            hidden,
+                            moe_intermediate,
+                            expert,
+                            slot,
+                            group_size,
+                            gate_up_proj_ptr,
+                            gate_up_scale_ptr,
+                            gate_up_zero_ptr,
+                            down_proj_ptr,
+                            down_scale_ptr,
+                            down_zero_ptr,
+                            &mut buffers,
+                        );
+                    }
+                    vacant.insert(Qwen36PackedExpertStaticTopNCacheEntry {
+                        resident_experts: resident_experts.to_vec(),
+                        buffers,
+                    });
+                    allocation = true;
+                }
+            }
+            Ok(())
+        },
+    )?;
+    for (group, &slot) in active_slots.iter().enumerate() {
+        workspace[off_topk_idx + group] = f32::from_bits(slot as u32);
+    }
+    qwen36_static_topn_expert_residency_profile_record(
+        resident_capacity,
+        true,
+        false,
+        allocation,
+        active_experts.len(),
+        usize::from(allocation) * copied_bytes,
+        slot_hits,
+        0,
+        0,
+    );
+    let entry = cache.get(&key).ok_or_else(|| {
+        GpuError::backend(
+            Backend::Metal,
+            "qwen36 packed expert static top-N cache entry missing after fill".into(),
+        )
+    })?;
+    Ok(Some(f(&entry.buffers)?))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6017,6 +6437,55 @@ fn ffn_step_stage1_5_metal_host(
                     )
                 },
             )?;
+            return Ok(());
+        }
+        if let Some(()) = qwen36_with_static_topn_packed_experts_for_metal(
+            output_ordinal,
+            params.layer_idx,
+            hidden,
+            moe_intermediate,
+            &active_experts,
+            int4.group_size as usize,
+            num_experts,
+            workspace,
+            off_topk_idx,
+            weights.gate_up_proj_w,
+            int4.gate_up_proj_scale,
+            int4.gate_up_proj_zero,
+            weights.down_proj_w,
+            int4.down_proj_scale,
+            int4.down_proj_zero,
+            |packed| {
+                crate::prefill_ffi::metal_profile_time(
+                    "qwen36_ffn_int4_expert_packed_static_topn_stage5",
+                    "native",
+                    || unsafe {
+                        crate::metal_native::qwen36_ffn_expert_gate_up_down_finalize_tiled(
+                            hidden,
+                            moe_intermediate,
+                            active_groups,
+                            int4.group_size as usize,
+                            workspace_ptr,
+                            weights.input_hidden,
+                            packed.gate_up_proj.as_ptr(),
+                            packed.gate_up_scale.as_ptr(),
+                            packed.gate_up_zero.as_ptr(),
+                            packed.down_proj.as_ptr(),
+                            packed.down_scale.as_ptr(),
+                            packed.down_zero.as_ptr(),
+                            output_ptr,
+                            off_h_norm,
+                            off_topk_val,
+                            off_topk_idx,
+                            off_shared_out,
+                            off_expert_mid,
+                            off_moe_out,
+                            true,
+                        )
+                    },
+                )
+            },
+        )? {
             return Ok(());
         }
         if let Some(hotset_capacity) = qwen36_packed_expert_hotset_capacity(active_groups) {
@@ -7897,6 +8366,33 @@ mod tests {
     }
 
     #[test]
+    fn qwen36_static_topn_table_parser_reads_probe_export() {
+        let raw = r#"{
+            "schema": "qwen36-static-topn-mps-probe-v2",
+            "static_tables": {
+                "4": {
+                    "layers": [
+                        {"layer": 0, "experts": [7, 1], "counts": [3, 2]},
+                        {"layer": 2, "experts": [5, 4], "counts": [9, 1]}
+                    ]
+                },
+                "8": {
+                    "1": [3, 2, 1]
+                }
+            }
+        }"#;
+        let table = qwen36_parse_static_topn_table_json(raw).expect("parse static top-N table");
+
+        assert!(table.capacity_exists(4));
+        assert!(table.capacity_exists(8));
+        assert_eq!(table.largest_capacity(), Some(8));
+        assert_eq!(table.layer_experts(4, 0), Some([7, 1].as_slice()));
+        assert_eq!(table.layer_experts(4, 1), None);
+        assert_eq!(table.layer_experts(4, 2), Some([5, 4].as_slice()));
+        assert_eq!(table.layer_experts(8, 1), Some([3, 2, 1].as_slice()));
+    }
+
+    #[test]
     fn qwen36_route_profile_simulates_layer_locality() {
         let records = vec![
             vec![1, 2],
@@ -9198,6 +9694,7 @@ mod tests {
 
         let params = Qwen36MoeFfnStepParams {
             stage: 1,
+            layer_idx: 0,
             hidden: hidden as i32,
             num_experts: num_experts as i32,
             moe_intermediate: 4,
@@ -9356,6 +9853,7 @@ mod tests {
 
             let params = Qwen36MoeFfnStepParams {
                 stage,
+                layer_idx: 0,
                 hidden: hidden as i32,
                 num_experts: num_experts as i32,
                 moe_intermediate: moe_intermediate as i32,
@@ -13438,6 +13936,7 @@ mod tests {
 
         let params = Qwen36MoeFfnStepParams {
             stage: 1,
+            layer_idx: 0,
             hidden: geom.hidden,
             num_experts: geom.num_experts,
             moe_intermediate: geom.moe_intermediate,
@@ -13606,6 +14105,7 @@ mod tests {
 
         let params = Qwen36MoeFfnStepParams {
             stage: 2,
+            layer_idx: 0,
             hidden: geom.hidden,
             num_experts: geom.num_experts,
             moe_intermediate: geom.moe_intermediate,
@@ -13784,6 +14284,7 @@ mod tests {
 
         let params = Qwen36MoeFfnStepParams {
             stage: 3,
+            layer_idx: 0,
             hidden: geom.hidden,
             num_experts: geom.num_experts,
             moe_intermediate: geom.moe_intermediate,
@@ -13951,6 +14452,7 @@ mod tests {
 
         let params = Qwen36MoeFfnStepParams {
             stage: 4,
+            layer_idx: 0,
             hidden: geom.hidden,
             num_experts: geom.num_experts,
             moe_intermediate: geom.moe_intermediate,
@@ -14118,6 +14620,7 @@ mod tests {
 
         let params = Qwen36MoeFfnStepParams {
             stage: 5,
+            layer_idx: 0,
             hidden: geom.hidden,
             num_experts: geom.num_experts,
             moe_intermediate: geom.moe_intermediate,
@@ -14369,6 +14872,7 @@ mod tests {
 
         let params = Qwen36MoeFfnStepParams {
             stage: 2,
+            layer_idx: 0,
             hidden: geom.hidden,
             num_experts: geom.num_experts,
             moe_intermediate: geom.moe_intermediate,
@@ -14610,6 +15114,7 @@ mod tests {
 
         let params = Qwen36MoeFfnStepParams {
             stage: 3,
+            layer_idx: 0,
             hidden: geom.hidden,
             num_experts: geom.num_experts,
             moe_intermediate: geom.moe_intermediate,
@@ -14842,6 +15347,7 @@ mod tests {
 
         let params = Qwen36MoeFfnStepParams {
             stage: 5,
+            layer_idx: 0,
             hidden: geom.hidden,
             num_experts: geom.num_experts,
             moe_intermediate: geom.moe_intermediate,

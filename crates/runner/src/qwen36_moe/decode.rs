@@ -757,6 +757,7 @@ fn run_chained_decode_impl_with_cache_pos(
         let ffn = &layer.ffn;
         let params_stage5 = Qwen36MoeFfnStepParams {
             stage: 5,
+            layer_idx: layer_idx as i32,
             hidden: geom.hidden,
             num_experts: geom.num_experts,
             moe_intermediate: geom.moe_intermediate,

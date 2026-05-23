@@ -1007,11 +1007,23 @@ probe. The runner now has gated machine-readable route dumps:
 `SUPERSONIC_QWEN36_ROUTE_PROFILE_DUMP_CALLS=1` emits `[qwen36-route-call]`
 rows for real active expert sets. The probe uses those rows to build static
 top-N sets from a calibration prompt, evaluate them against a separate
-coding-shaped prompt, and size the resident FP16 MPS RHS table. For Qwen3.6
-geometry, each resident expert costs roughly 6 MiB of FP16 RHS data
-(gate/up plus down), so capacities 2/4/8/16 across 40 layers imply about
-0.47/0.94/1.88/3.75 GiB before h_norm/output scratch or miss fallback. This is
-a measurement harness, not a promoted FFN implementation.
+coding-shaped prompt, export a `static_tables` JSON object for runtime probes,
+and size both native INT4 resident tables and resident FP16 MPS RHS tables. For
+Qwen3.6 geometry, each resident expert costs roughly 1.50 MiB as native INT4
+packed weights plus GPTQ sidecars, or 6 MiB of FP16 MPS RHS data (gate/up plus
+down). Capacities 2/4/8/16 across 40 layers imply about
+0.12/0.23/0.47/0.94 GiB for native INT4 residency and
+0.47/0.94/1.88/3.75 GiB for FP16 RHS residency before h_norm/output scratch or
+miss fallback.
+The packed native INT4 static-table runtime probe is opt-in on top of the
+packed stage-5 path:
+`SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_PACKED_STAGE5=1`,
+`SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_STATIC_TOPN=1`,
+`SUPERSONIC_METAL_QWEN36_FFN_EXPERT_STATIC_TOPN_FILE=target/qwen36_static_topn_mps_probe.json`,
+and optionally
+`SUPERSONIC_METAL_QWEN36_FFN_EXPERT_STATIC_TOPN_CAPACITY=<N>`. It uses a
+per-layer resident native INT4 table on full hits and falls back to the
+existing packed/hotset path when any active expert is missing.
 The first local two-prompt smoke used a profiling/agentic calibration prompt
 and a coding-shaped evaluation prompt at context 256. It collected 160
 calibration top-N rows and 880 evaluation route calls. Assignment coverage on
@@ -1213,6 +1225,26 @@ time worsened to `304.2 ms/token`, with
 `qwen36_ffn_int4_expert_packed_hotset_stage5=185.272 ms`. That rules out a
 straight LRU hotset as the next promotion path.
 
+The static top-N resident follow-up is opt-in behind
+`SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_STATIC_TOPN=1` while the packed
+expert path is enabled. It loads `static_tables` from
+`SUPERSONIC_METAL_QWEN36_FFN_EXPERT_STATIC_TOPN_FILE`, chooses the largest
+exported capacity unless
+`SUPERSONIC_METAL_QWEN36_FFN_EXPERT_STATIC_TOPN_CAPACITY` is set, and fills a
+per-layer native INT4 resident table once. Full-hit calls remap top-k experts
+to resident slots and run `qwen36_ffn_int4_expert_packed_static_topn_stage5`;
+misses record `miss_policy=static_topn` in the expert-residency profile and
+fall through to the existing packed/hotset/default path.
+The first Apple M5 Max one-token smoke used the regenerated v2 probe table.
+The probe's capacity-64 row covered 69.858% of evaluation assignments, and the
+runtime smoke preserved generation parity with `[11]`. It is not a latency win
+on the cold first token: `decode_ms=507`, `ffn_ms_avg=369.071`, and the
+residency profile reported `exact_hits=9/40`, `slot_hit_rate=0.731250`, and
+`copied_bytes=879660288` for static-table allocations. That validates the
+runtime wiring and miss fallback, but leaves promotion blocked on warm
+multi-token reuse and/or a cheaper hybrid fallback for the 31/40 non-full-hit
+layer calls.
+
 The GPU-side active-slab pack probe is opt-in behind
 `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_GPU_PACK_STAGE5=1` on top of the
 packed expert path. It allocates compact per-layer scratch once, copies the
@@ -1240,8 +1272,9 @@ calls, while the command-buffer GPU attribution for the direct gather command
 was only `55.965 ms`. That confirms the direct original-buffer gather is still
 wait/residency dominated on this model. The useful next FFN direction is an
 explicit resident representation that avoids per-token active-slab rebuilds and
-avoids random giant-buffer gathers, most likely the MPS/MPP bridge or a static
-per-layer hot table with a narrow miss fallback.
+avoids random giant-buffer gathers. The native INT4 static top-N probe now
+covers the narrow static-table branch; MPS/MPP remains the next heavier
+resident-matvec option if static full-hit rates are not high enough.
 
 The first MPS bridge step is now an attribution probe, not a decode path. With
 `SUPERSONIC_METAL_QWEN36_MPS_EXPERT_PILOT=1`, the runner appends a
@@ -1294,10 +1327,11 @@ FP16 MPS slab rebuild/consumption. The next FFN experiment should either keep
 active FP16 experts resident across route reuse, or return to a fully fused
 routed-expert INT4 path that avoids MPSMatrix RHS rebuilds entirely. Profile
 runs now emit Qwen3.6 route-locality lines to decide between those paths:
-`[qwen36-route-profile]` reports adjacent-token same-layer reuse, while
+`[qwen36-route-profile]` reports adjacent-token same-layer reuse. By default,
 `[qwen36-route-cache-sim]` simulates per-layer LRU resident-slab budgets of
-2/4/8/16 experts and `[qwen36-route-topn]` reports oracle top-N coverage for
-the same budgets. A 4-token Apple M5 Max profile generated `[11, 353, 599,
+2/4/8/16/32/64 experts, and `[qwen36-route-topn]` reports oracle top-N coverage
+for the same budgets; override with
+`SUPERSONIC_QWEN36_ROUTE_PROFILE_CAPACITIES`. A 4-token Apple M5 Max profile generated `[11, 353, 599,
 264]` and measured `adjacent_hit_rate=0.400000`; the per-layer LRU hit rates
 were 0.5%/2.5%/23.0%/32.7% for capacities 2/4/8/16, while oracle top-N
 coverage was 19.2%/34.4%/57.6%/83.2%. That is enough to reject a tiny LRU

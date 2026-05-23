@@ -263,6 +263,7 @@ pub fn run_mtp_layer_step(
     reset_sync_buf(ordinal, &mut scratch.sync_buf).context("reset sync_buf (mtp ffn)")?;
     let ffn_params = Qwen36MoeFfnStepParams {
         stage: 5,
+        layer_idx: -1,
         hidden: geom.hidden,
         num_experts: geom.num_experts,
         moe_intermediate: geom.moe_intermediate,

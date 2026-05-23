@@ -4,8 +4,7 @@
 This harness turns the route-profile dump into the first static resident-table
 experiment: collect per-layer top-N experts from a calibration prompt, replay a
 separate evaluation prompt with raw route calls, then report hit/fallback rates
-and the FP16 MPS RHS table size that a no-rebuild resident implementation would
-need.
+plus native INT4 and FP16 MPS resident-table sizes.
 """
 
 from __future__ import annotations
@@ -21,8 +20,8 @@ from typing import Any
 
 
 MODEL = "qwen3.6-35b-a3b"
-SCHEMA = "qwen36-static-topn-mps-probe-v1"
-DEFAULT_CAPACITIES = "2,4,8,16"
+SCHEMA = "qwen36-static-topn-mps-probe-v2"
+DEFAULT_CAPACITIES = "2,4,8,16,32,64"
 DEFAULT_LAYERS = 40
 DEFAULT_HIDDEN = 2048
 DEFAULT_MOE_INTERMEDIATE = 512
@@ -113,6 +112,38 @@ def build_static_tables(
     return tables
 
 
+def export_static_tables(
+    topn_rows: list[dict[str, Any]],
+    capacities: list[int],
+    layers: int,
+) -> dict[str, dict[str, Any]]:
+    exported: dict[str, dict[str, Any]] = {}
+    for capacity in capacities:
+        layer_rows = []
+        rows = sorted(
+            (row for row in topn_rows if int(row["capacity"]) == capacity),
+            key=lambda row: int(row["layer"]),
+        )
+        for row in rows:
+            layer = int(row["layer"])
+            if not 0 <= layer < layers:
+                continue
+            experts = [int(expert) for expert in row["experts"][:capacity]]
+            counts = [int(count) for count in row["counts"][: len(experts)]]
+            layer_rows.append(
+                {
+                    "layer": layer,
+                    "experts": experts,
+                    "counts": counts,
+                    "covered": int(row.get("covered", 0)),
+                    "total": int(row.get("total", 0)),
+                    "coverage": float(row.get("coverage", 0.0)),
+                }
+            )
+        exported[str(capacity)] = {"layers": layer_rows}
+    return exported
+
+
 def evaluate_static_table(
     calls: list[dict[str, Any]],
     table: dict[int, set[int]],
@@ -168,6 +199,41 @@ def evaluate_static_table(
         "full_hit_call_rate": full_hit_calls / len(calls) if calls else 0.0,
         "missing_layers": sorted(missing_layers),
         "worst_layer": worst_layer,
+    }
+
+
+def ceil_div(lhs: int, rhs: int) -> int:
+    return (lhs + rhs - 1) // rhs
+
+
+def estimate_resident_native_int4_bytes(
+    layers: int,
+    capacity: int,
+    hidden: int = DEFAULT_HIDDEN,
+    moe_intermediate: int = DEFAULT_MOE_INTERMEDIATE,
+    group_size: int = DEFAULT_GROUP_SIZE,
+) -> dict[str, Any]:
+    gate_up_rows = 2 * moe_intermediate
+    gate_up_weight_bytes_per_expert = gate_up_rows * ceil_div(hidden, 2)
+    gate_up_sidecar_elems = ceil_div(gate_up_rows, group_size) * ceil_div(hidden, group_size)
+    down_weight_bytes_per_expert = hidden * ceil_div(moe_intermediate, 2)
+    down_sidecar_elems = ceil_div(hidden, group_size) * ceil_div(moe_intermediate, group_size)
+    bytes_per_expert = (
+        gate_up_weight_bytes_per_expert
+        + down_weight_bytes_per_expert
+        + 2 * gate_up_sidecar_elems * 2
+        + 2 * down_sidecar_elems * 2
+    )
+    total = layers * capacity * bytes_per_expert
+    return {
+        "layers": layers,
+        "capacity": capacity,
+        "group_size": group_size,
+        "bytes_per_expert": bytes_per_expert,
+        "gate_up_weight_bytes_per_expert": gate_up_weight_bytes_per_expert,
+        "down_weight_bytes_per_expert": down_weight_bytes_per_expert,
+        "total_bytes": total,
+        "total_gib": total / (1024.0**3),
     }
 
 
@@ -230,6 +296,12 @@ def build_report(
                 "capacity": capacity,
                 "calibration_oracle_topn": calibration_summary.get(capacity, {}),
                 "evaluation_static_topn": evaluation,
+                "resident_native_int4": estimate_resident_native_int4_bytes(
+                    layers,
+                    capacity,
+                    hidden,
+                    moe_intermediate,
+                ),
                 "resident_mps_rhs": estimate_resident_mps_rhs_bytes(
                     layers,
                     capacity,
@@ -256,6 +328,7 @@ def build_report(
             "route_calls": len(route_calls),
             "assignments": sum(len(call["experts"]) for call in route_calls),
         },
+        "static_tables": export_static_tables(topn_rows, capacities, layers),
         "rows": rows,
     }
 
@@ -264,12 +337,13 @@ def render_markdown(report: dict[str, Any]) -> str:
     lines = [
         "# Qwen3.6 Static Top-N MPS Probe",
         "",
-        "| Capacity | Calib coverage | Eval coverage | Full-hit calls | Fallback calls | Worst layer | Resident RHS GiB |",
-        "|---:|---:|---:|---:|---:|:---|---:|",
+        "| Capacity | Calib coverage | Eval coverage | Full-hit calls | Fallback calls | Worst layer | Native INT4 GiB | MPS RHS GiB |",
+        "|---:|---:|---:|---:|---:|:---|---:|---:|",
     ]
     for row in report["rows"]:
         calib = row["calibration_oracle_topn"]
         eval_static = row["evaluation_static_topn"]
+        native = row["resident_native_int4"]
         rhs = row["resident_mps_rhs"]
         worst_layer = eval_static.get("worst_layer")
         worst = (
@@ -278,20 +352,21 @@ def render_markdown(report: dict[str, Any]) -> str:
             else ""
         )
         lines.append(
-            "| {cap} | {calib:.1%} | {eval_cov:.1%} | {full:.1%} | {fallback} | {worst} | {gib:.2f} |".format(
+            "| {cap} | {calib:.1%} | {eval_cov:.1%} | {full:.1%} | {fallback} | {worst} | {native_gib:.2f} | {gib:.2f} |".format(
                 cap=row["capacity"],
                 calib=calib.get("coverage", 0.0),
                 eval_cov=eval_static.get("coverage", 0.0),
                 full=eval_static.get("full_hit_call_rate", 0.0),
                 fallback=eval_static.get("fallback_calls", 0),
                 worst=worst,
+                native_gib=native.get("total_gib", 0.0),
                 gib=rhs.get("total_gib", 0.0),
             )
         )
     lines.extend(
         [
             "",
-            "The resident RHS estimate includes FP16 gate/up and down matrices only; it excludes h_norm/output scratch and miss fallback cost.",
+            "The native INT4 estimate is the resident-table footprint used by the opt-in packed Metal path. The resident RHS estimate includes FP16 gate/up and down matrices only; it excludes h_norm/output scratch and miss fallback cost.",
         ]
     )
     return "\n".join(lines).rstrip() + "\n"

@@ -328,7 +328,14 @@ Metal currently rejects or defers:
   resident slot pool sized by
   `SUPERSONIC_METAL_QWEN36_FFN_EXPERT_HOTSET_CAPACITY` (default 16). Neither is
   promoted because measured route churn still leaves too much slab copy and
-  residency overhead. A GPU-side active-slab pack probe can be stacked on the
+  residency overhead. A static native INT4 top-N probe can also be stacked on
+  the packed path with
+  `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_STATIC_TOPN=1` and
+  `SUPERSONIC_METAL_QWEN36_FFN_EXPERT_STATIC_TOPN_FILE=target/qwen36_static_topn_mps_probe.json`;
+  set `SUPERSONIC_METAL_QWEN36_FFN_EXPERT_STATIC_TOPN_CAPACITY` to choose one
+  exported capacity, otherwise the largest table is used. Full hits run from
+  resident slots and misses fall through to the existing packed/hotset path. A
+  GPU-side active-slab pack probe can be stacked on the
   packed path with
   `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_GPU_PACK_STAGE5=1`. It keeps the
   CPU out of the per-token copy loop and remaps top-k expert IDs inside the
@@ -652,8 +659,10 @@ per-token FP16 MPS slab rebuild/consumption, so the next target is either
 resident reused slabs or a fully fused routed-expert INT4 path. Metal profile
 runs also emit Qwen3.6 route-locality lines:
 `[qwen36-route-profile]`, `[qwen36-route-cache-sim]`, and
-`[qwen36-route-topn]`. Use those to check whether a small per-layer resident
-expert cache has enough route reuse before implementing it.
+`[qwen36-route-topn]`. The route profiler defaults to capacities
+2/4/8/16/32/64 and accepts `SUPERSONIC_QWEN36_ROUTE_PROFILE_CAPACITIES` for
+custom resident-table budgets. Use those rows to choose a static table before
+enabling the opt-in native INT4 top-N runtime probe.
 
 ### Metal validation
 
