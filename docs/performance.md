@@ -859,13 +859,14 @@ The local-main-target workflow for this machine is:
 3. long-context smoke: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/bench_qwen36_longctx.py --preset smoke`
 4. profile smoke: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/bench_qwen36_longctx.py --preset smoke --metal-profile`
 5. batched-prefill MoE feasibility: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/bench_qwen36_longctx.py --preset smoke --batched-prefill-feasibility`
-6. MTP tensor audit: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/audit_qwen36_mtp.py --require-complete-bake`
-7. MTP acceptance/policy probe: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/probe_qwen36_mtp_acceptance.py`
-8. MTP Metal K=1 experiment: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/probe_qwen36_mtp_acceptance.py --metal-experiment`
-9. MTP Metal prompt-suite sweep: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/sweep_qwen36_mtp_acceptance.py --prompt-set smoke --metal-experiment`
-10. static top-N resident-table probe: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/probe_qwen36_static_topn.py`
-11. routed-expert FFN microbench: `target/release/qwen36_ffn_expert_microbench --iters 20 --warmup 3`
-12. long-context comparison: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/bench_qwen36_longctx.py --preset comparison`
+6. batched-prefill Metal prototype: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/bench_qwen36_longctx.py --preset smoke --batched-prefill-prototype`
+7. MTP tensor audit: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/audit_qwen36_mtp.py --require-complete-bake`
+8. MTP acceptance/policy probe: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/probe_qwen36_mtp_acceptance.py`
+9. MTP Metal K=1 experiment: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/probe_qwen36_mtp_acceptance.py --metal-experiment`
+10. MTP Metal prompt-suite sweep: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/sweep_qwen36_mtp_acceptance.py --prompt-set smoke --metal-experiment`
+11. static top-N resident-table probe: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/probe_qwen36_static_topn.py`
+12. routed-expert FFN microbench: `target/release/qwen36_ffn_expert_microbench --iters 20 --warmup 3`
+13. long-context comparison: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/bench_qwen36_longctx.py --preset comparison`
 
 The Metal long-context harness writes `target/qwen36_metal_longctx.json` and
 `target/qwen36_metal_longctx.md`. It uses deterministic NIAH-style prompts and
@@ -880,8 +881,15 @@ metadata a future Metal prefill kernel would consume: profiled tokens, chunks,
 expert segments, average rows per touched expert, and WMMA16 assignment
 coverage. It also emits `[qwen36-batched-prefill-plan]` rows for candidate
 64/128/256/512/1024-token chunks, recording scalar tail assignments, WMMA16
-padded assignments, and padding overhead. The long-context JSON schema is now
-`qwen36-moe-metal-longctx-bench-v3` and includes those rows under
+padded assignments, and padding overhead. With `--batched-prefill-prototype`,
+the harness sets
+`SUPERSONIC_QWEN36_MOE_METAL_BATCHED_PREFILL_PROTOTYPE=1` and runs the
+experimental Metal batched-prefill path: Metal batched full-attention plus a
+direct routed-expert INT4 gate/up and down/combine kernel pair, with
+router/top-k and shared-expert work still on the existing host/primitive path.
+The long-context JSON schema is now `qwen36-moe-metal-longctx-bench-v4` and
+records `batched_prefill_prototype` at top level plus
+`metal_batched_prefill_prototype` per row; feasibility rows remain under
 `batched_prefill_plans`; set
 `SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL_PLAN_CHUNKS=...` to override the planner
 chunk list without adding a SuperSonic CLI flag.
@@ -893,6 +901,22 @@ one chunk with 82.7% WMMA16 assignment coverage, 23,048 scalar-tail assignments,
 and 54.6% WMMA16 padding overhead. Chunk 64 fell to 37.3% WMMA16 coverage and
 228.0% padding overhead, so the first Metal grouped-compute prototype should
 start at the moderate/full-prompt chunk end, not tiny chunks.
+The first opt-in prototype smoke on this machine used the 512-token preset and
+generated the same `[271]` one-token sanity row. In normal mode it measured
+22.15s prefill, 268.55 ms/token decode, and no NIAH hit because only one token
+was requested. The profiled variant measured 34.20s prefill and 253.74
+ms/token decode; profile overhead is expected because
+`SUPERSONIC_METAL_PROFILE=1` splits the routed-expert phases. The profile rows
+showed `qwen36_batched_prefill_grouped_expert_direct` at 5.024s native wall
+across 40 layers, GPU timestamps of 1.903s for
+`command_buffer_gpu:qwen36_batched_prefill_grouped_expert_gate_up` and 2.045s
+for `command_buffer_gpu:qwen36_batched_prefill_grouped_expert_down_combine`,
+while `command_buffer_wait` was still the top Metal row at 33.184s and HAL
+`copy_h2d` accounted for 4.335s. On Apple UMA this is buffer
+materialization/copy bookkeeping rather than PCIe upload. That makes the next
+measured target prefill orchestration, UMA `copy_h2d` volume, and
+linear-attention command-buffer volume, not more per-token MPS slab
+materialization.
 `tests/metal/audit_qwen36_mtp.py` is the speculative-decode readiness audit. It
 checks the source snapshot for the split MTP expert tensors and the INT4 bake
 for the 19 folded `mtp.*` tensors loaded by the runtime. On this local M5 Max

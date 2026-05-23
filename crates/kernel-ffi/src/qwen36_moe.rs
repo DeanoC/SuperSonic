@@ -633,6 +633,12 @@ pub fn qwen36_batched_prefill_feasibility_profile_enabled() -> bool {
         || std::env::var_os("SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL_FEASIBILITY").is_some()
 }
 
+pub fn qwen36_route_profile_record_active_experts(active_experts: &[usize]) {
+    if qwen36_route_profile_enabled() {
+        qwen36_route_profile_record(active_experts);
+    }
+}
+
 fn qwen36_batched_prefill_plan_chunk_sizes(current_chunk_size: usize) -> Vec<usize> {
     let mut sizes: Vec<usize> =
         if let Ok(raw) = std::env::var("SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL_PLAN_CHUNKS") {
@@ -7159,6 +7165,30 @@ pub fn batched_prefill_attn_full_launch(
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
     let backend = query.backend();
+    if backend == Backend::Metal {
+        if batch_size != 1 {
+            return Err(GpuError::backend(
+                backend,
+                format!(
+                    "qwen36_moe::batched_prefill_attn_full_launch Metal path supports batch_size=1, got {batch_size}"
+                ),
+            ));
+        }
+        return crate::prefill_ffi::metal_full_attention_prefill_strided_bf16_f32(
+            q_heads,
+            kv_heads,
+            q_len,
+            kv_len,
+            kv_len,
+            head_dim,
+            scale,
+            seqlen_offset,
+            query,
+            key,
+            value,
+            out,
+        );
+    }
     if backend != Backend::Hip && backend != Backend::Cuda {
         return Err(GpuError::backend(
             backend,
@@ -7219,6 +7249,147 @@ pub fn batched_prefill_attn_full_launch(
         ));
     }
     Ok(())
+}
+
+/// Metal v1 direct routed-expert prefill prototype.
+///
+/// This bypasses the HIP M9/M10/M11 router-permute path and consumes the
+/// already materialized top-k tables directly:
+/// - `x_norm`: BF16 `[n_tokens, hidden]`
+/// - `topk_idx`: U32 `[n_tokens, top_k]`
+/// - `topk_weight`: BF16 `[n_tokens, top_k]`
+/// - `expert_mid`: F32 `[n_tokens * top_k, moe_intermediate]`
+/// - `combined`: BF16 `[n_tokens, hidden]`
+///
+/// SAFETY: raw weight pointers must refer to live Metal buffers on `ordinal`.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn batched_prefill_grouped_expert_direct_metal_launch_raw(
+    ordinal: usize,
+    n_tokens: usize,
+    top_k: usize,
+    hidden: usize,
+    moe_intermediate: usize,
+    group_size: usize,
+    x_norm: &GpuBuffer,
+    topk_idx: &GpuBuffer,
+    topk_weight: &GpuBuffer,
+    gate_up_proj: *const c_void,
+    gate_up_scale: *const c_void,
+    gate_up_zero: *const c_void,
+    down_proj: *const c_void,
+    down_scale: *const c_void,
+    down_zero: *const c_void,
+    expert_mid: &mut GpuBuffer,
+    combined: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    let backend = x_norm.backend();
+    if backend != Backend::Metal {
+        return Err(GpuError::backend(
+            backend,
+            "qwen36_moe::batched_prefill_grouped_expert_direct_metal_launch_raw requires Metal backend"
+                .to_string(),
+        ));
+    }
+    if topk_idx.backend() != Backend::Metal
+        || topk_weight.backend() != Backend::Metal
+        || expert_mid.backend() != Backend::Metal
+        || combined.backend() != Backend::Metal
+    {
+        return Err(GpuError::InvalidArg(
+            "qwen36_moe::batched_prefill_grouped_expert_direct_metal_launch_raw requires all buffers on Metal"
+                .into(),
+        ));
+    }
+    if x_norm.dtype() != ScalarType::BF16
+        || topk_idx.dtype() != ScalarType::U32
+        || topk_weight.dtype() != ScalarType::BF16
+        || expert_mid.dtype() != ScalarType::F32
+        || combined.dtype() != ScalarType::BF16
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::batched_prefill_grouped_expert_direct_metal_launch_raw dtype mismatch: x_norm={:?} topk_idx={:?} topk_weight={:?} expert_mid={:?} combined={:?}",
+            x_norm.dtype(),
+            topk_idx.dtype(),
+            topk_weight.dtype(),
+            expert_mid.dtype(),
+            combined.dtype(),
+        )));
+    }
+    if n_tokens == 0
+        || top_k == 0
+        || hidden == 0
+        || moe_intermediate == 0
+        || group_size == 0
+        || gate_up_proj.is_null()
+        || gate_up_scale.is_null()
+        || gate_up_zero.is_null()
+        || down_proj.is_null()
+        || down_scale.is_null()
+        || down_zero.is_null()
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::batched_prefill_grouped_expert_direct_metal_launch_raw invalid shape: n_tokens={n_tokens} top_k={top_k} hidden={hidden} moe_intermediate={moe_intermediate} group_size={group_size}"
+        )));
+    }
+    let expected_routes = n_tokens.checked_mul(top_k).ok_or_else(|| {
+        GpuError::InvalidArg(
+            "qwen36_moe::batched_prefill_grouped_expert_direct_metal_launch_raw top-k size overflow"
+                .into(),
+        )
+    })?;
+    let expected_mid = expected_routes.checked_mul(moe_intermediate).ok_or_else(|| {
+        GpuError::InvalidArg(
+            "qwen36_moe::batched_prefill_grouped_expert_direct_metal_launch_raw expert_mid size overflow"
+                .into(),
+        )
+    })?;
+    let expected_combined = n_tokens.checked_mul(hidden).ok_or_else(|| {
+        GpuError::InvalidArg(
+            "qwen36_moe::batched_prefill_grouped_expert_direct_metal_launch_raw combined size overflow"
+                .into(),
+        )
+    })?;
+    if x_norm.elem_count() < expected_combined
+        || topk_idx.elem_count() < expected_routes
+        || topk_weight.elem_count() < expected_routes
+        || expert_mid.elem_count() < expected_mid
+        || combined.elem_count() < expected_combined
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::batched_prefill_grouped_expert_direct_metal_launch_raw buffer too small: x_norm={} topk_idx={} topk_weight={} expert_mid={} combined={}",
+            x_norm.elem_count(),
+            topk_idx.elem_count(),
+            topk_weight.elem_count(),
+            expert_mid.elem_count(),
+            combined.elem_count(),
+        )));
+    }
+    let _ = ordinal;
+    crate::prefill_ffi::metal_profile_time(
+        "qwen36_batched_prefill_grouped_expert_direct",
+        "native",
+        || unsafe {
+            crate::metal_native::qwen36_batched_prefill_grouped_expert_direct(
+                n_tokens,
+                top_k,
+                hidden,
+                moe_intermediate,
+                group_size,
+                x_norm.as_ptr(),
+                topk_idx.as_ptr(),
+                topk_weight.as_ptr(),
+                gate_up_proj,
+                gate_up_scale,
+                gate_up_zero,
+                down_proj,
+                down_scale,
+                down_zero,
+                expert_mid.as_mut_ptr(),
+                combined.as_mut_ptr(),
+                true,
+            )
+        },
+    )
 }
 
 /// Stage B (M9) router permutation safe wrapper.

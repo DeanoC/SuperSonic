@@ -337,13 +337,27 @@ under the same smoke:
    chunk sizes. These rows keep the path `metadata_only=1`, but make the next
    grouped-compute PR concrete by exposing scalar-tail assignments, WMMA16
    padded assignments, and padding overhead for 64/128/256/512/1024-token
-   chunks, with an env override for local what-if sweeps. No Metal grouped expert
-   compute is promoted yet. The first v3 512-token Metal smoke profiled 417
-   prefill tokens and showed 512/1024-token chunks tied at 82.7% WMMA16
-   assignment coverage and 54.6% padding overhead, while chunk 64 fell to 37.3%
-   coverage and 228.0% padding overhead. That makes moderate/full-prompt chunks
-   the starting point for the first correctness-first Metal grouped expert
-   compute prototype.
+   chunks, with an env override for local what-if sweeps. The first v3
+   512-token Metal smoke profiled 417 prefill tokens and showed 512/1024-token
+   chunks tied at 82.7% WMMA16 assignment coverage and 54.6% padding overhead,
+   while chunk 64 fell to 37.3% coverage and 228.0% padding overhead.
+
+   The third slice adds an opt-in Metal grouped-compute prototype behind
+   `SUPERSONIC_QWEN36_MOE_METAL_BATCHED_PREFILL_PROTOTYPE=1` and
+   `tests/metal/bench_qwen36_longctx.py --batched-prefill-prototype`. It routes
+   batched full-attention through the existing Metal prefill primitive and
+   replaces the HIP M9/M10/M11 grouped expert sequence with a direct INT4 Metal
+   routed-expert gate/up and down/combine kernel pair. This is still
+   experimental, not policy-promoted: router/top-k and shared-expert work remain
+   on the existing host/primitive path. The first normal 512-token smoke
+   generated the same `[271]` sanity row and measured 22.15s prefill; the
+   profiled run measured 34.20s prefill and showed 1.903s GPU time in
+   gate/up, 2.045s in down/combine, 33.184s in command-buffer wait, and 4.335s
+   in HAL `copy_h2d`. On Apple UMA this is buffer materialization/copy
+   bookkeeping rather than PCIe upload. That shifts the next optimization
+   question from "can the grouped MoE shape execute on Metal?" to "how do we
+   cut prefill orchestration, UMA `copy_h2d` volume, and linear-attention
+   command-buffer volume?"
 
 3. **Static top-N resident MPS table probe**
    Use route profiles to choose top-N experts per layer, materialize FP16 MPS

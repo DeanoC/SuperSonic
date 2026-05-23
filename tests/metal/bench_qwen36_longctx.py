@@ -23,7 +23,7 @@ from typing import Any
 
 
 MODEL = "qwen3.6-35b-a3b"
-SCHEMA = "qwen36-moe-metal-longctx-bench-v3"
+SCHEMA = "qwen36-moe-metal-longctx-bench-v4"
 
 PRESETS: dict[str, dict[str, Any]] = {
     "smoke": {
@@ -100,6 +100,14 @@ def build_metal_env(base_env: dict[str, str]) -> dict[str, str]:
     env["SUPERSONIC_QWEN36_MOE_GROUPED_FFN"] = "0"
     env["SUPERSONIC_QWEN36_DENSE_PREFILL_TOKEN_LOOP"] = "1"
     return env
+
+
+def enable_metal_batched_prefill_prototype(env: dict[str, str]) -> None:
+    env["SUPERSONIC_QWEN36_MOE_METAL_BATCHED_PREFILL_PROTOTYPE"] = "1"
+    env["SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL"] = "1"
+    env["SUPERSONIC_QWEN36_MOE_BATCHED_ATTN"] = "1"
+    env["SUPERSONIC_QWEN36_MOE_GROUPED_FFN"] = "1"
+    env.pop("SUPERSONIC_QWEN36_DENSE_PREFILL_TOKEN_LOOP", None)
 
 
 def parse_key_values(line: str) -> dict[str, str]:
@@ -288,6 +296,8 @@ def run_one(
     warmup: bool,
 ) -> dict[str, Any]:
     env = build_metal_env(os.environ)
+    if args.batched_prefill_prototype:
+        enable_metal_batched_prefill_prototype(env)
     if args.batched_prefill_feasibility and not warmup:
         env["SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL_FEASIBILITY"] = "1"
         env["SUPERSONIC_QWEN36_ROUTE_PROFILE_MAX_CALLS"] = str(
@@ -346,6 +356,7 @@ def run_one(
         return {
             "context_tokens_requested": context_tokens,
             "mode": "int4",
+            "metal_batched_prefill_prototype": bool(args.batched_prefill_prototype),
             "returncode": -1,
             "timeout_seconds": args.timeout,
             "wall_seconds": elapsed,
@@ -375,6 +386,7 @@ def run_one(
     row: dict[str, Any] = {
         "context_tokens_requested": context_tokens,
         "mode": "int4",
+        "metal_batched_prefill_prototype": bool(args.batched_prefill_prototype),
         "returncode": proc.returncode,
         "wall_seconds": elapsed,
         "command": cmd,
@@ -449,6 +461,14 @@ def main() -> int:
             "router/permutation occupancy metadata for prefill"
         ),
     )
+    parser.add_argument(
+        "--batched-prefill-prototype",
+        action="store_true",
+        help=(
+            "run the experimental Metal batched-prefill path with direct "
+            "batched routed-expert compute"
+        ),
+    )
     args = apply_preset_defaults(parser.parse_args())
     args.model_dir = resolve_model_dir(args.model_dir, os.environ)
 
@@ -508,6 +528,7 @@ def main() -> int:
         "max_new_tokens": args.max_new_tokens,
         "metal_profile": args.metal_profile,
         "batched_prefill_feasibility": args.batched_prefill_feasibility,
+        "batched_prefill_prototype": args.batched_prefill_prototype,
         "seed": args.seed,
         "summary": summary,
         "recommendation": BASE.recommendation(summary),

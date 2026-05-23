@@ -455,6 +455,10 @@ SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" \
   --batched-prefill-feasibility
 
 SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" \
+  python3 tests/metal/bench_qwen36_longctx.py --preset smoke \
+  --batched-prefill-prototype
+
+SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" \
   python3 tests/metal/audit_qwen36_mtp.py --require-complete-bake
 
 SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" \
@@ -494,6 +498,15 @@ On the first 512-token smoke, the 512/1024-token plans tied because the prompt
 had 417 profiled prefill tokens: 82.7% WMMA16 assignment coverage, 23,048
 scalar-tail assignments, and 54.6% WMMA16 padding overhead. Smaller chunks
 increased scalar tails sharply.
+With `--batched-prefill-prototype`, the harness flips the explicit
+`SUPERSONIC_QWEN36_MOE_METAL_BATCHED_PREFILL_PROTOTYPE=1` opt-in and runs the
+experimental Metal batched-prefill route. This path uses Metal batched
+full-attention and a direct routed-expert INT4 kernel pair for grouped MoE
+prefill while keeping router/top-k and shared-expert work on the existing host
+or primitive path. It is not the supported default lane yet. The first local
+512-token normal smoke generated the same `[271]` one-token sanity row and
+reduced prefill to 22.15s; the profiled smoke measured 34.20s because it splits
+the routed-expert gate/up and down/combine phases for attribution.
 The MTP audit writes `target/qwen36_mtp_audit.json` and
 `target/qwen36_mtp_audit.md`. It checks the local safetensors index for the
 split source MTP tensors, checks the INT4 bake manifest for the 19 folded

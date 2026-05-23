@@ -79,6 +79,19 @@ class Qwen36MetalLongContextBenchTests(unittest.TestCase):
         self.assertNotIn("SUPERSONIC_MOE_ISLAND_CAP_EXPERTS", env)
         self.assertNotIn("SUPERSONIC_MOE_ISLAND_TELEMETRY_JSON", env)
 
+    def test_enable_metal_batched_prefill_prototype_flips_opt_in_knobs(self):
+        env = bench_qwen36_metal_longctx.build_metal_env(
+            {"PATH": os.environ.get("PATH", "")}
+        )
+        bench_qwen36_metal_longctx.enable_metal_batched_prefill_prototype(env)
+        self.assertEqual(
+            env["SUPERSONIC_QWEN36_MOE_METAL_BATCHED_PREFILL_PROTOTYPE"], "1"
+        )
+        self.assertEqual(env["SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL"], "1")
+        self.assertEqual(env["SUPERSONIC_QWEN36_MOE_BATCHED_ATTN"], "1")
+        self.assertEqual(env["SUPERSONIC_QWEN36_MOE_GROUPED_FFN"], "1")
+        self.assertNotIn("SUPERSONIC_QWEN36_DENSE_PREFILL_TOKEN_LOOP", env)
+
     def test_parse_profile_extracts_summary_and_entries(self):
         output = """
 [metal-profile] calls=2 total_ms=12.000 native_ms=10.000 host_ms=2.000
