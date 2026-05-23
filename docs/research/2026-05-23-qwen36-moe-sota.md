@@ -369,6 +369,18 @@ under the same smoke:
    time across 40 layers, so the next target remains orchestration plus the
    measured linear-attention, full-attention, and routed-expert direct rows.
 
+   The fifth slice trims linear-attention orchestration without changing the
+   linear kernel math. The Metal stage-5 native finalizer can now write its
+   residual output to a separate chunk row while reusing the existing output
+   scratch for normalized hidden state. The batched-prefill prototype opens one
+   Metal command-buffer batch per linear-attention layer in normal runs,
+   encodes each token sequentially with barriers, and avoids the per-token CPU
+   D2D row copy. A 512-token control with
+   `SUPERSONIC_QWEN36_MOE_METAL_LINEAR_PREFILL_DIRECT=0` measured 13.30s
+   prefill; the direct-row batch measured 10.89s prefill and preserved the
+   `[271]` sanity row. `SUPERSONIC_METAL_PROFILE=1` keeps the waited path so
+   phase attribution remains comparable.
+
 3. **Static top-N resident MPS table probe**
    Use route profiles to choose top-N experts per layer, materialize FP16 MPS
    RHS once, fall back on misses, and measure real prompts.

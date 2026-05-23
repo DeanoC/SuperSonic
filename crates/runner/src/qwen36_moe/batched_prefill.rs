@@ -45,10 +45,10 @@ use kernel_ffi::prefill_ffi;
 use kernel_ffi::qwen36_moe::{
     attn_step_launch, batched_prefill_attn_full_launch, batched_prefill_grouped_expert_launch_raw,
     batched_prefill_router_permute_launch, batched_prefill_unpermute_combine_launch,
-    ffn_step_launch, linear_step_launch, Qwen36MoeAttnStepInt4, Qwen36MoeAttnStepParams,
-    Qwen36MoeAttnStepWeights, Qwen36MoeFfnStepInt4, Qwen36MoeFfnStepParams,
-    Qwen36MoeFfnStepWeights, Qwen36MoeLinearStepInt4, Qwen36MoeLinearStepParams,
-    Qwen36MoeLinearStepWeights,
+    ffn_step_launch, linear_step_launch, linear_step_stage5_metal_native_into,
+    Qwen36MoeAttnStepInt4, Qwen36MoeAttnStepParams, Qwen36MoeAttnStepWeights, Qwen36MoeFfnStepInt4,
+    Qwen36MoeFfnStepParams, Qwen36MoeFfnStepWeights, Qwen36MoeLinearStepInt4,
+    Qwen36MoeLinearStepParams, Qwen36MoeLinearStepWeights,
 };
 use model_store::BakedStore;
 
@@ -1304,8 +1304,23 @@ fn process_linear_attn_layer_pertoken(
         }
         None => Qwen36MoeLinearStepInt4::disabled(),
     };
+    let use_metal_direct_rows = chunk_hidden.backend() == Backend::Metal
+        && int4_ptrs.group_size == 128
+        && std::env::var_os("SUPERSONIC_METAL_PROFILE").is_none()
+        && std::env::var_os("SUPERSONIC_METAL_DISABLE_BATCH").is_none()
+        && std::env::var("SUPERSONIC_QWEN36_MOE_METAL_LINEAR_PREFILL_DIRECT")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+    let _metal_batch = if use_metal_direct_rows {
+        let guard = prefill_ffi::MetalBatchGuard::begin()
+            .map_err(|e| anyhow!("begin Metal linear direct-row batch: {e}"))?;
+        prefill_ffi::set_metal_batch_label("qwen36_linear_prefill_direct_rows")
+            .map_err(|e| anyhow!("label Metal linear direct-row batch: {e}"))?;
+        Some(guard)
+    } else {
+        None
+    };
     for t in 0..n {
-        reset_sync_buf(ordinal, sync_buf).context("reset sync_buf (linear-attn pertoken)")?;
         let token_byte_off = t * row_bytes;
         let input_ptr = chunk_hidden.offset_ptr(token_byte_off);
         let weights = Qwen36MoeLinearStepWeights {
@@ -1327,22 +1342,48 @@ fn process_linear_attn_layer_pertoken(
             conv_state: conv_state.as_mut_ptr(),
             recurrent_state: recurrent_state.as_mut_ptr() as *mut f32,
         };
-        linear_step_launch(
-            ordinal,
-            ScalarType::BF16,
-            params,
-            &weights,
-            &int4_ptrs,
-            attn_output,
-            attn_workspace,
-            sync_buf,
-        )
-        .with_context(|| format!("linear_step_launch (pertoken t={t})"))?;
-        // Copy attn_output[..hidden] back into chunk_hidden[t]
-        let dst =
-            unsafe { (chunk_hidden.as_mut_ptr() as *mut u8).add(token_byte_off) as *mut c_void };
-        gpu_hal::copy_d2d(ordinal, dst, attn_output.as_ptr(), row_bytes)
-            .context("d2d linear-attn output -> chunk row")?;
+        if use_metal_direct_rows {
+            let dst = unsafe {
+                (chunk_hidden.as_mut_ptr() as *mut u8).add(token_byte_off) as *mut c_void
+            };
+            unsafe {
+                linear_step_stage5_metal_native_into(
+                    params,
+                    &weights,
+                    &int4_ptrs,
+                    attn_output,
+                    attn_workspace,
+                    dst,
+                    hidden,
+                    false,
+                )
+            }
+            .with_context(|| format!("linear_step_stage5_metal_native_into (pertoken t={t})"))?;
+        } else {
+            reset_sync_buf(ordinal, sync_buf).context("reset sync_buf (linear-attn pertoken)")?;
+            linear_step_launch(
+                ordinal,
+                ScalarType::BF16,
+                params,
+                &weights,
+                &int4_ptrs,
+                attn_output,
+                attn_workspace,
+                sync_buf,
+            )
+            .with_context(|| format!("linear_step_launch (pertoken t={t})"))?;
+            // Copy attn_output[..hidden] back into chunk_hidden[t]
+            let dst = unsafe {
+                (chunk_hidden.as_mut_ptr() as *mut u8).add(token_byte_off) as *mut c_void
+            };
+            gpu_hal::copy_d2d(ordinal, dst, attn_output.as_ptr(), row_bytes)
+                .context("d2d linear-attn output -> chunk row")?;
+        }
+    }
+    if let Some(batch) = _metal_batch {
+        batch
+            .finish()
+            .map_err(|e| anyhow!("finish Metal linear direct-row batch: {e}"))?;
     }
     Ok(())
 }

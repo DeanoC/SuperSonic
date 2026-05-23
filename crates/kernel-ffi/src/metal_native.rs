@@ -295,6 +295,7 @@ unsafe extern "C" {
         recurrent_state_ptr: *mut c_void,
         workspace_ptr: *mut c_void,
         output_ptr: *mut c_void,
+        final_output_ptr: *mut c_void,
         wait_for_completion: c_int,
     ) -> c_int;
     fn supersonic_metal_matmul_rhs_transposed_f32(
@@ -1522,6 +1523,7 @@ pub(crate) unsafe fn qwen36_linear_int4_stage5(
     recurrent_state: *mut c_void,
     workspace: *mut c_void,
     output: *mut c_void,
+    final_output: *mut c_void,
     wait_for_completion: bool,
 ) -> Result<(), GpuError> {
     if hidden == 0
@@ -1552,6 +1554,7 @@ pub(crate) unsafe fn qwen36_linear_int4_stage5(
         || recurrent_state.is_null()
         || workspace.is_null()
         || output.is_null()
+        || final_output.is_null()
     {
         return Err(GpuError::InvalidArg(format!(
             "metal native qwen36_linear_int4_stage5 invalid shape: hidden={hidden} num_k_heads={num_k_heads} num_v_heads={num_v_heads} head_k_dim={head_k_dim} head_v_dim={head_v_dim} conv_kernel_dim={conv_kernel_dim} group_size={group_size}"
@@ -1589,6 +1592,7 @@ pub(crate) unsafe fn qwen36_linear_int4_stage5(
             recurrent_state,
             workspace,
             output,
+            final_output,
             i32::from(wait_for_completion),
         )
     };
@@ -4935,6 +4939,7 @@ pub(crate) unsafe fn qwen36_linear_int4_stage5(
     _recurrent_state: *mut c_void,
     _workspace: *mut c_void,
     _output: *mut c_void,
+    _final_output: *mut c_void,
     _wait_for_completion: bool,
 ) -> Result<(), GpuError> {
     Err(GpuError::backend(

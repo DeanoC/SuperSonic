@@ -2947,7 +2947,9 @@ pub fn linear_step_launch(
     let backend = output.backend();
     if backend == Backend::Metal {
         if params.stage <= 5 {
-            return linear_step_stage1_5_metal_host(params, weights, int4, output, workspace);
+            return linear_step_stage1_5_metal_host(
+                params, weights, int4, output, workspace, None, true,
+            );
         }
         return Err(GpuError::InvalidArg(
             "qwen36_moe::linear_step_launch: Metal backend is wired for stages 1-5 only".into(),
@@ -3025,12 +3027,52 @@ pub fn linear_step_launch(
     Ok(())
 }
 
+/// Metal-only stage-5 launcher that uses `output` as the temporary
+/// normalized-hidden buffer, but writes the final residual result to
+/// `final_output`. This lets batched prefill keep each row in place without a
+/// CPU-side shared-memory D2D copy after every linear-attention token.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn linear_step_stage5_metal_native_into(
+    params: Qwen36MoeLinearStepParams,
+    weights: &Qwen36MoeLinearStepWeights,
+    int4: &Qwen36MoeLinearStepInt4,
+    output: &mut GpuBuffer,
+    workspace: &mut GpuBuffer,
+    final_output: *mut c_void,
+    final_output_capacity: usize,
+    wait_for_completion: bool,
+) -> Result<(), GpuError> {
+    if output.backend() != Backend::Metal {
+        return Err(GpuError::backend(
+            output.backend(),
+            "qwen36_moe::linear_step_stage5_metal_native_into requires Metal output".into(),
+        ));
+    }
+    if params.stage != 5 {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::linear_step_stage5_metal_native_into requires stage=5, got {}",
+            params.stage
+        )));
+    }
+    linear_step_stage1_5_metal_host(
+        params,
+        weights,
+        int4,
+        output,
+        workspace,
+        Some((final_output, final_output_capacity)),
+        wait_for_completion,
+    )
+}
+
 fn linear_step_stage1_5_metal_host(
     params: Qwen36MoeLinearStepParams,
     weights: &Qwen36MoeLinearStepWeights,
     int4: &Qwen36MoeLinearStepInt4,
     output: &mut GpuBuffer,
     workspace: &mut GpuBuffer,
+    final_output_override: Option<(*mut c_void, usize)>,
+    wait_for_completion: bool,
 ) -> Result<(), GpuError> {
     if output.dtype() != ScalarType::BF16 || workspace.dtype() != ScalarType::F32 {
         return Err(GpuError::InvalidArg(format!(
@@ -3160,6 +3202,14 @@ fn linear_step_stage1_5_metal_host(
             params.stage, output_capacity,
         )));
     }
+    let (final_output_ptr, final_output_capacity) =
+        final_output_override.unwrap_or_else(|| (output.as_mut_ptr(), output_capacity));
+    if params.stage == 5 && (final_output_ptr.is_null() || final_output_capacity < hidden) {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::linear_step_launch: Metal stage5 final output too small: \
+             need {hidden} BF16 entries, got {final_output_capacity}"
+        )));
+    }
 
     qwen36_validate_dense_or_int4_sidecars(
         int4.in_proj_qkv_scale,
@@ -3218,10 +3268,17 @@ fn linear_step_stage1_5_metal_host(
                     weights.recurrent_state as *mut c_void,
                     workspace.as_mut_ptr() as *mut c_void,
                     output.as_mut_ptr() as *mut c_void,
-                    true,
+                    final_output_ptr,
+                    wait_for_completion,
                 )
             },
         );
+    }
+    if final_output_override.is_some() {
+        return Err(GpuError::InvalidArg(
+            "qwen36_moe::linear_step_launch: Metal direct final output requires native stage5 INT4 support"
+                .into(),
+        ));
     }
 
     let input = unsafe { std::slice::from_raw_parts(weights.input_hidden as *const u16, hidden) };

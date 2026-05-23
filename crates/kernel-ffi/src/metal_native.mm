@@ -2417,6 +2417,7 @@ kernel void supersonic_qwen36_linear_out_proj_finalize(
     device float* workspace [[buffer(4)]],
     device bfloat* output [[buffer(5)]],
     constant Qwen36LinearInt4Params& params [[buffer(6)]],
+    device bfloat* final_output [[buffer(7)]],
     uint row [[threadgroup_position_in_grid]],
     uint lane [[thread_position_in_threadgroup]]
 ) {
@@ -2435,7 +2436,7 @@ kernel void supersonic_qwen36_linear_out_proj_finalize(
     if (lane == 0) {
         float o_out = bf16_round_rne_finite(acc);
         float residual = bf16_round_rne_finite(float(input_hidden[row]) + o_out);
-        output[row] = bfloat(residual);
+        final_output[row] = bfloat(residual);
     }
 }
 )QWEN36LINEAR";
@@ -10994,6 +10995,7 @@ extern "C" int supersonic_metal_qwen36_linear_int4_stage5(
     void* recurrent_state_ptr,
     void* workspace_ptr,
     void* output_ptr,
+    void* final_output_ptr,
     int wait_for_completion
 ) {
     @autoreleasepool {
@@ -11009,7 +11011,8 @@ extern "C" int supersonic_metal_qwen36_linear_int4_stage5(
             norm_w_ptr == nullptr || out_proj_ptr == nullptr ||
             out_proj_scale_ptr == nullptr || out_proj_zero_ptr == nullptr ||
             conv_state_ptr == nullptr || recurrent_state_ptr == nullptr ||
-            workspace_ptr == nullptr || output_ptr == nullptr) {
+            workspace_ptr == nullptr || output_ptr == nullptr ||
+            final_output_ptr == nullptr) {
             return 1120;
         }
         if (hidden > UINT32_MAX || num_k_heads > UINT32_MAX ||
@@ -11069,6 +11072,7 @@ extern "C" int supersonic_metal_qwen36_linear_int4_stage5(
         id<MTLBuffer> recurrent_state = nil;
         id<MTLBuffer> workspace = nil;
         id<MTLBuffer> output = nil;
+        id<MTLBuffer> final_output = nil;
         size_t input_hidden_offset = 0;
         size_t input_norm_w_offset = 0;
         size_t in_proj_qkv_offset = 0;
@@ -11091,6 +11095,7 @@ extern "C" int supersonic_metal_qwen36_linear_int4_stage5(
         size_t recurrent_state_offset = 0;
         size_t workspace_offset = 0;
         size_t output_offset = 0;
+        size_t final_output_offset = 0;
 
         auto lookup_required = [](const void* ptr, id<MTLBuffer>* buffer, size_t* offset, int code) -> int {
             return lookup_buffer(ptr, buffer, offset) == 0 ? 0 : code;
@@ -11123,6 +11128,7 @@ extern "C" int supersonic_metal_qwen36_linear_int4_stage5(
         if ((status = lookup_required(recurrent_state_ptr, &recurrent_state, &recurrent_state_offset, 1146)) != 0) return status;
         if ((status = lookup_required(workspace_ptr, &workspace, &workspace_offset, 1147)) != 0) return status;
         if ((status = lookup_required(output_ptr, &output, &output_offset, 1148)) != 0) return status;
+        if ((status = lookup_required(final_output_ptr, &final_output, &final_output_offset, 1181)) != 0) return status;
 
         uint32_t off_qkv_raw = 0u;
         uint32_t off_z_raw = static_cast<uint32_t>(qkv_dim);
@@ -11236,6 +11242,7 @@ extern "C" int supersonic_metal_qwen36_linear_int4_stage5(
             [encoder setBuffer:workspace offset:workspace_offset atIndex:4];
             [encoder setBuffer:output offset:output_offset atIndex:5];
             [encoder setBytes:&params length:sizeof(params) atIndex:6];
+            [encoder setBuffer:final_output offset:final_output_offset atIndex:7];
             [encoder dispatchThreadgroups:MTLSizeMake(hidden, 1, 1)
                     threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
         };

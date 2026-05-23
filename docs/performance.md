@@ -931,6 +931,20 @@ traffic from the prior prototype profile. The remaining top rows are
 materializing the baked model buffers. That makes the next measured target
 prefill orchestration, linear-attention command-buffer volume, full-attention
 prefill, and routed-expert direct work, not per-token MPS slab materialization.
+
+The next orchestration slice targets `qwen36_linear_int4_stage5`, which had
+12,540 waited calls in the profiled 512-token run. The normal Metal prototype
+now keeps the native stage-5 temporary output separate from the final residual
+destination, opens one Metal batch per linear-attention layer, and writes final
+rows directly into `chunk_hidden`; this removes the per-token CPU D2D row copy
+and collapses the waited linear submits for normal runs. Attribution runs keep
+the old waited path when `SUPERSONIC_METAL_PROFILE=1` so the per-phase profile
+rows stay comparable. On the 512-token smoke, the direct-off control
+(`SUPERSONIC_QWEN36_MOE_METAL_LINEAR_PREFILL_DIRECT=0`) measured 13.30s
+prefill and 191.99 ms/token with `[271]`; the direct-row batch measured 10.89s
+prefill and 179.14 ms/token with the same generated ID. The next measured
+targets remain full-attention prefill and routed-expert direct compute, while a
+proper batched linear-attention kernel would be the larger follow-up.
 `tests/metal/audit_qwen36_mtp.py` is the speculative-decode readiness audit. It
 checks the source snapshot for the split MTP expert tensors and the INT4 bake
 for the 19 folded `mtp.*` tensors loaded by the runtime. On this local M5 Max

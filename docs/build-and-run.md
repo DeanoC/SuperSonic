@@ -513,7 +513,14 @@ prefill and 172.54 ms/token with the same `[271]` sanity row. The profiled row
 shows `sigmoid_mul_row_scalar` at 11.859 ms native wall and 0.725 ms GPU time
 across 40 layers, so the next measured pressure remains command-buffer
 orchestration, linear-attention volume, full-attention prefill, and routed
-expert direct work.
+expert direct work. A follow-up linear-attention orchestration slice keeps the
+native stage-5 output scratch separate from the final row destination, batches
+each linear layer's per-token Metal launches into one command buffer, and
+writes the final residual directly into the chunk row. With
+`SUPERSONIC_QWEN36_MOE_METAL_LINEAR_PREFILL_DIRECT=0` as the control, the
+512-token smoke measured 13.30s prefill; with the direct-row batch enabled it
+measured 10.89s prefill and the same `[271]` sanity row. Profile runs keep the
+waited per-token path so phase attribution remains readable.
 The MTP audit writes `target/qwen36_mtp_audit.json` and
 `target/qwen36_mtp_audit.md`. It checks the local safetensors index for the
 split source MTP tensors, checks the INT4 bake manifest for the 19 folded
