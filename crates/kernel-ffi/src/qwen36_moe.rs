@@ -55,6 +55,8 @@ pub struct Qwen36RouteProfileSnapshot {
     pub adjacent_total: u64,
     pub cache_sims: Vec<Qwen36RouteCacheSim>,
     pub topn_sims: Vec<Qwen36RouteTopNSim>,
+    pub topn_layers: Vec<Qwen36RouteTopNLayer>,
+    pub route_calls: Vec<Qwen36RouteCall>,
 }
 
 impl Qwen36RouteProfileSnapshot {
@@ -100,6 +102,33 @@ impl Qwen36RouteTopNSim {
             self.covered as f64 / self.total as f64
         }
     }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Qwen36RouteTopNLayer {
+    pub capacity: usize,
+    pub layer: usize,
+    pub experts: Vec<u16>,
+    pub counts: Vec<u64>,
+    pub covered: u64,
+    pub total: u64,
+}
+
+impl Qwen36RouteTopNLayer {
+    pub fn coverage(&self) -> f64 {
+        if self.total == 0 {
+            0.0
+        } else {
+            self.covered as f64 / self.total as f64
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Qwen36RouteCall {
+    pub call_idx: usize,
+    pub layer: usize,
+    pub experts: Vec<u16>,
 }
 
 #[derive(Debug, Clone)]
@@ -546,6 +575,8 @@ pub fn qwen36_expert_residency_profile_snapshot() -> Qwen36ExpertResidencyProfil
 fn qwen36_route_profile_enabled() -> bool {
     crate::prefill_ffi::metal_profile_enabled()
         || std::env::var_os("SUPERSONIC_QWEN36_ROUTE_PROFILE").is_some()
+        || std::env::var_os("SUPERSONIC_QWEN36_ROUTE_PROFILE_DUMP_CALLS").is_some()
+        || std::env::var_os("SUPERSONIC_QWEN36_ROUTE_PROFILE_DUMP_TOPN_LAYERS").is_some()
         || std::env::var_os("SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL_FEASIBILITY").is_some()
 }
 
@@ -735,6 +766,11 @@ fn qwen36_route_profile_simulate(
     let mut per_layer_freq: Vec<HashMap<u16, u64>> = (0..layers).map(|_| HashMap::new()).collect();
     for (call_idx, experts) in records.iter().enumerate() {
         let layer = call_idx % layers;
+        snapshot.route_calls.push(Qwen36RouteCall {
+            call_idx,
+            layer,
+            experts: experts.clone(),
+        });
         snapshot.assignments += experts.len() as u64;
         for &expert in experts {
             unique_layer_experts.insert((layer, expert), ());
@@ -782,10 +818,28 @@ fn qwen36_route_profile_simulate(
             total: snapshot.assignments,
             ..Qwen36RouteTopNSim::default()
         };
-        for freq in &per_layer_freq {
-            let mut counts: Vec<u64> = freq.values().copied().collect();
-            counts.sort_unstable_by(|lhs, rhs| rhs.cmp(lhs));
-            topn.covered += counts.iter().take(capacity).sum::<u64>();
+        for (layer, freq) in per_layer_freq.iter().enumerate() {
+            let mut counts: Vec<(u16, u64)> = freq
+                .iter()
+                .map(|(&expert, &count)| (expert, count))
+                .collect();
+            counts.sort_unstable_by(|(lhs_expert, lhs_count), (rhs_expert, rhs_count)| {
+                rhs_count
+                    .cmp(lhs_count)
+                    .then_with(|| lhs_expert.cmp(rhs_expert))
+            });
+            let selected: Vec<(u16, u64)> = counts.into_iter().take(capacity).collect();
+            let covered = selected.iter().map(|(_, count)| *count).sum::<u64>();
+            let total = freq.values().copied().sum::<u64>();
+            topn.covered += covered;
+            snapshot.topn_layers.push(Qwen36RouteTopNLayer {
+                capacity,
+                layer,
+                experts: selected.iter().map(|(expert, _)| *expert).collect(),
+                counts: selected.iter().map(|(_, count)| *count).collect(),
+                covered,
+                total,
+            });
         }
         snapshot.topn_sims.push(topn);
     }
@@ -7565,6 +7619,9 @@ mod tests {
         assert_eq!(snapshot.unique_layer_experts, 7);
         assert_eq!(snapshot.adjacent_hits, 4);
         assert_eq!(snapshot.adjacent_total, 8);
+        assert_eq!(snapshot.route_calls.len(), 6);
+        assert_eq!(snapshot.route_calls[3].layer, 1);
+        assert_eq!(snapshot.route_calls[3].experts, vec![6, 4]);
 
         let cap2 = snapshot
             .cache_sims
@@ -7581,6 +7638,16 @@ mod tests {
             .expect("cap2 top-n sim");
         assert_eq!(top2.covered, 9);
         assert_eq!(top2.total, 12);
+
+        let layer0_top2 = snapshot
+            .topn_layers
+            .iter()
+            .find(|row| row.capacity == 2 && row.layer == 0)
+            .expect("layer0 cap2 top-n row");
+        assert_eq!(layer0_top2.experts, vec![1, 2]);
+        assert_eq!(layer0_top2.counts, vec![3, 2]);
+        assert_eq!(layer0_top2.covered, 5);
+        assert_eq!(layer0_top2.total, 6);
     }
 
     #[test]

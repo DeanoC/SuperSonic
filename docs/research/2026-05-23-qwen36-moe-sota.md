@@ -335,6 +335,16 @@ under the same smoke:
 3. **Static top-N resident MPS table probe**
    Use route profiles to choose top-N experts per layer, materialize FP16 MPS
    RHS once, fall back on misses, and measure real prompts.
+   Initial instrumentation landed the route data needed to make this
+   experiment concrete: `[qwen36-route-topn-layer]` exposes per-layer expert
+   IDs/counts for static tables, `[qwen36-route-call]` exposes real active
+   expert sets, and `tests/metal/probe_qwen36_static_topn.py` turns calibration
+   and evaluation prompt runs into coverage, fallback-call, worst-layer, and
+   resident FP16 MPS RHS size rows. The first slice is still a hit-rate/sizing
+   probe; the runtime path does not yet consume a static MPS table.
+   The first local smoke is a negative result for small capacities: top-N 16
+   costs 3.75 GiB of FP16 RHS storage but covered only 35.8% of assignments and
+   fully served 4/880 layer calls on a coding-shaped evaluation prompt.
 
 4. **Qwen3.6 MTP tensor audit**
    Parse local safetensors/bakes for MTP heads and write down the loader delta

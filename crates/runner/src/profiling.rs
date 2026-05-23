@@ -12,6 +12,8 @@ impl MetalProfileScope {
         let metal_active = std::env::var_os("SUPERSONIC_METAL_PROFILE").is_some();
         let qwen_active = metal_active
             || std::env::var_os("SUPERSONIC_QWEN36_ROUTE_PROFILE").is_some()
+            || std::env::var_os("SUPERSONIC_QWEN36_ROUTE_PROFILE_DUMP_CALLS").is_some()
+            || std::env::var_os("SUPERSONIC_QWEN36_ROUTE_PROFILE_DUMP_TOPN_LAYERS").is_some()
             || std::env::var_os("SUPERSONIC_QWEN36_EXPERT_RESIDENCY_PROFILE").is_some()
             || std::env::var_os("SUPERSONIC_QWEN36_PACK_CACHE_PROFILE").is_some()
             || std::env::var_os("SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL_FEASIBILITY").is_some();
@@ -121,6 +123,46 @@ impl Drop for MetalProfileScope {
                     sim.total,
                     sim.coverage(),
                 );
+                }
+                if std::env::var_os("SUPERSONIC_QWEN36_ROUTE_PROFILE_DUMP_TOPN_LAYERS").is_some() {
+                    for row in &route.topn_layers {
+                        let experts = row
+                            .experts
+                            .iter()
+                            .map(|expert| expert.to_string())
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        let counts = row
+                            .counts
+                            .iter()
+                            .map(|count| count.to_string())
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        eprintln!(
+                            "[qwen36-route-topn-layer] scope=per_layer_oracle_topn capacity={} layer={} experts={} counts={} covered={} total={} coverage={:.6}",
+                            row.capacity,
+                            row.layer,
+                            experts,
+                            counts,
+                            row.covered,
+                            row.total,
+                            row.coverage(),
+                        );
+                    }
+                }
+                if std::env::var_os("SUPERSONIC_QWEN36_ROUTE_PROFILE_DUMP_CALLS").is_some() {
+                    for call in &route.route_calls {
+                        let experts = call
+                            .experts
+                            .iter()
+                            .map(|expert| expert.to_string())
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        eprintln!(
+                            "[qwen36-route-call] call_idx={} layer={} experts={}",
+                            call.call_idx, call.layer, experts
+                        );
+                    }
                 }
             }
             let expert_residency =

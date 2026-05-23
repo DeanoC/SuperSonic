@@ -860,8 +860,9 @@ The local-main-target workflow for this machine is:
 4. profile smoke: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/bench_qwen36_longctx.py --preset smoke --metal-profile`
 5. batched-prefill MoE feasibility: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/bench_qwen36_longctx.py --preset smoke --batched-prefill-feasibility`
 6. MTP tensor audit: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/audit_qwen36_mtp.py --require-complete-bake`
-7. routed-expert FFN microbench: `target/release/qwen36_ffn_expert_microbench --iters 20 --warmup 3`
-8. long-context comparison: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/bench_qwen36_longctx.py --preset comparison`
+7. static top-N resident-table probe: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/probe_qwen36_static_topn.py`
+8. routed-expert FFN microbench: `target/release/qwen36_ffn_expert_microbench --iters 20 --warmup 3`
+9. long-context comparison: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/bench_qwen36_longctx.py --preset comparison`
 
 The Metal long-context harness writes `target/qwen36_metal_longctx.json` and
 `target/qwen36_metal_longctx.md`. It uses deterministic NIAH-style prompts and
@@ -885,6 +886,26 @@ cache, the audit reports `source=complete` with 1,560 `mtp.*` tensors and
 `bake=complete` with all 19 runtime MTP tensors, so the model files are ready
 for the next MTP parity harness. Metal speculative decode is still unsupported
 until that harness exists and measures acceptance separately from FFN latency.
+`tests/metal/probe_qwen36_static_topn.py` is the first static resident-table
+probe. The runner now has gated machine-readable route dumps:
+`SUPERSONIC_QWEN36_ROUTE_PROFILE_DUMP_TOPN_LAYERS=1` emits
+`[qwen36-route-topn-layer]` rows with per-layer expert IDs and counts, while
+`SUPERSONIC_QWEN36_ROUTE_PROFILE_DUMP_CALLS=1` emits `[qwen36-route-call]`
+rows for real active expert sets. The probe uses those rows to build static
+top-N sets from a calibration prompt, evaluate them against a separate
+coding-shaped prompt, and size the resident FP16 MPS RHS table. For Qwen3.6
+geometry, each resident expert costs roughly 6 MiB of FP16 RHS data
+(gate/up plus down), so capacities 2/4/8/16 across 40 layers imply about
+0.47/0.94/1.88/3.75 GiB before h_norm/output scratch or miss fallback. This is
+a measurement harness, not a promoted FFN implementation.
+The first local two-prompt smoke used a profiling/agentic calibration prompt
+and a coding-shaped evaluation prompt at context 256. It collected 160
+calibration top-N rows and 880 evaluation route calls. Assignment coverage on
+the evaluation prompt was 9.1%/14.9%/23.1%/35.8% for capacities 2/4/8/16, and
+capacity 16 fully covered only 0.5% of layer calls, leaving 876/880 calls on the
+miss fallback. The result is a useful negative gate: a small static resident MPS
+table is unlikely to beat the default path unless the fallback is very cheap or
+the table is prompt/domain-specialized.
 
 Current 512-token `--metal-profile` smoke checkpoint on this M5 Max after the
 FFN fallback tightening and profile parser work:

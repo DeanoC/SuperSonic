@@ -457,6 +457,9 @@ SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" \
 SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" \
   python3 tests/metal/audit_qwen36_mtp.py --require-complete-bake
 
+SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" \
+  python3 tests/metal/probe_qwen36_static_topn.py
+
 cargo build --release -p runner --bin qwen36_ffn_expert_microbench
 target/release/qwen36_ffn_expert_microbench --iters 20 --warmup 3
 ```
@@ -480,6 +483,18 @@ runtime tensors consumed by `mtp_loader.rs`, and can fail closed with
 1,560 `mtp.*` source tensors and the INT4 bake reports all 19 runtime MTP
 tensors, but speculative decode remains unsupported on the Metal policy path
 until the MTP parity and acceptance harness is wired.
+The static top-N probe writes `target/qwen36_static_topn_mps_probe.json` and
+`target/qwen36_static_topn_mps_probe.md`. It uses the route profiler's gated
+`[qwen36-route-topn-layer]` and `[qwen36-route-call]` rows to choose per-layer
+oracle top-N experts from a calibration prompt, replay a separate
+coding-shaped evaluation prompt, and report assignment coverage, full-hit call
+rate, miss fallback calls, worst layer, and the FP16 MPS RHS footprint for each
+resident capacity. This is a resident-table sizing and hit-rate probe only; it
+does not yet replace FFN execution with a static MPS table.
+On the first two-prompt local smoke, capacity 16 covered only 35.8% of
+evaluation assignments with 876/880 FFN calls still requiring fallback, while
+requiring 3.75 GiB of resident FP16 RHS storage. That argues against a tiny
+static table as the next default path.
 The current M5 Max perf gate points at linear-attention as the next measured
 multi-token per-token bucket after FFN fallback tightening. The 512-token
 `--metal-profile` smoke currently reports roughly 269 ms/token, 71.7 s prefill,
