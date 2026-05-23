@@ -3167,12 +3167,14 @@ fn push_f16_bits(bytes: &mut Vec<u8>, bits: u16) {
     bytes.extend_from_slice(&bits.to_le_bytes());
 }
 
+#[cfg(test)]
 fn alloc_f16_byte_vec(elements: usize) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(elements * 2);
     bytes.resize(elements * 2, 0);
     bytes
 }
 
+#[cfg(test)]
 fn write_f16_byte(bytes: &mut [u8], index: usize, bits: u16) {
     let offset = index * 2;
     bytes[offset..offset + 2].copy_from_slice(&bits.to_le_bytes());
@@ -3287,6 +3289,77 @@ fn qwen36_int4_f16_lut(scale_bits: u16, zero_bits: u16) -> [u16; 16] {
     std::array::from_fn(|idx| f32_to_f16_bits(bf16_round_f32(idx as f32 * s - zs)))
 }
 
+#[inline(always)]
+fn qwen36_int4_f16_pair_lut(scale_bits: u16, zero_bits: u16) -> [u32; 256] {
+    let nibble_lut = qwen36_int4_f16_lut(scale_bits, zero_bits);
+    std::array::from_fn(|byte| {
+        let lo = nibble_lut[byte & 0x0f] as u32;
+        let hi = (nibble_lut[(byte >> 4) & 0x0f] as u32) << 16;
+        lo | hi
+    })
+}
+
+#[inline(always)]
+fn write_f16_unaligned(bytes: &mut [u8], index: usize, bits: u16) {
+    unsafe {
+        std::ptr::write_unaligned(bytes.as_mut_ptr().add(index * 2).cast::<u16>(), bits);
+    }
+}
+
+#[inline(always)]
+fn write_f16_pair_unaligned(bytes: &mut [u8], index: usize, bits: u32) {
+    unsafe {
+        std::ptr::write_unaligned(bytes.as_mut_ptr().add(index * 2).cast::<u32>(), bits);
+    }
+}
+
+#[inline(always)]
+fn read_f16_unaligned(bytes: &[u8], index: usize) -> u16 {
+    unsafe { std::ptr::read_unaligned(bytes.as_ptr().add(index * 2).cast::<u16>()) }
+}
+
+fn qwen36_gpu_buffer_as_mut_bytes(buffer: &mut GpuBuffer) -> &mut [u8] {
+    unsafe { std::slice::from_raw_parts_mut(buffer.as_mut_ptr().cast::<u8>(), buffer.len_bytes()) }
+}
+
+#[repr(align(16))]
+struct Qwen36F16Chunk16([u16; 16]);
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn qwen36_store_f16_chunk16_stream(dst: *mut u8, values: &Qwen36F16Chunk16) {
+    std::arch::asm!(
+        "ldr q0, [{src}]",
+        "ldr q1, [{src}, #16]",
+        "stnp q0, q1, [{dst}]",
+        src = in(reg) values.0.as_ptr(),
+        dst = in(reg) dst,
+        out("v0") _,
+        out("v1") _,
+        options(nostack, preserves_flags)
+    );
+}
+
+#[inline(always)]
+fn qwen36_write_f16_chunk16(
+    bytes: &mut [u8],
+    index: usize,
+    values: &Qwen36F16Chunk16,
+    stream: bool,
+) {
+    let dst = unsafe { bytes.as_mut_ptr().add(index * 2) };
+    #[cfg(target_arch = "aarch64")]
+    if stream {
+        unsafe {
+            qwen36_store_f16_chunk16_stream(dst, values);
+        }
+        return;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(values.0.as_ptr().cast::<u8>(), dst, 32);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn qwen36_pack_transposed_int4_f16_lut(
     src: *const u8,
@@ -3299,36 +3372,72 @@ fn qwen36_pack_transposed_int4_f16_lut(
     dst: &mut [u8],
     dst_group_base: usize,
     dst_col_stride: usize,
+    stream_stores: bool,
 ) {
     let byte_cols = cols.div_ceil(2);
     let scale_rows = rows.div_ceil(group_size);
     let scale_cols = cols.div_ceil(group_size);
-    for scale_col in 0..scale_cols {
-        let col_start = scale_col * group_size;
-        let col_end = (col_start + group_size).min(cols);
-        for col in (col_start..col_end).step_by(2) {
-            let col1 = col + 1;
-            for row_group in 0..scale_rows {
-                let row_start = row_group * group_size;
-                let row_end = (row_start + group_size).min(rows);
-                let scale_idx = (expert * scale_rows + row_group) * scale_cols + scale_col;
-                let lut =
-                    unsafe { qwen36_int4_f16_lut(*scale.add(scale_idx), *zero.add(scale_idx)) };
-                for row in row_start..row_end {
-                    let packed_base = (expert * rows + row) * byte_cols;
-                    let byte = unsafe { *src.add(packed_base + col / 2) };
-                    write_f16_byte(
-                        dst,
-                        dst_group_base + col * dst_col_stride + row,
-                        lut[(byte & 0x0f) as usize],
-                    );
-                    if col1 < col_end {
-                        write_f16_byte(
-                            dst,
-                            dst_group_base + col1 * dst_col_stride + row,
-                            lut[((byte >> 4) & 0x0f) as usize],
+    let mut tile = vec![0u8; group_size * group_size * 2];
+
+    for row_group in 0..scale_rows {
+        let row_start = row_group * group_size;
+        let row_end = (row_start + group_size).min(rows);
+        let tile_rows = row_end - row_start;
+        for scale_col in 0..scale_cols {
+            let col_start = scale_col * group_size;
+            let col_end = (col_start + group_size).min(cols);
+            let tile_cols = col_end - col_start;
+            let tile_byte_cols = tile_cols.div_ceil(2);
+            let scale_idx = (expert * scale_rows + row_group) * scale_cols + scale_col;
+            let pair_lut =
+                unsafe { qwen36_int4_f16_pair_lut(*scale.add(scale_idx), *zero.add(scale_idx)) };
+
+            for (tile_row, row) in (row_start..row_end).enumerate() {
+                let tile_row_base = tile_row * tile_cols;
+                let packed_base = (expert * rows + row) * byte_cols;
+                let mut byte_offset = 0usize;
+                while byte_offset < tile_byte_cols {
+                    let byte = unsafe { *src.add(packed_base + col_start / 2 + byte_offset) };
+                    let col0 = 2 * byte_offset;
+                    let col1 = col0 + 1;
+                    if col1 < tile_cols {
+                        write_f16_pair_unaligned(
+                            &mut tile,
+                            tile_row_base + col0,
+                            pair_lut[byte as usize],
+                        );
+                    } else {
+                        write_f16_unaligned(
+                            &mut tile,
+                            tile_row_base + col0,
+                            pair_lut[byte as usize] as u16,
                         );
                     }
+                    byte_offset += 1;
+                }
+            }
+
+            for tile_col in 0..tile_cols {
+                let dst_base = dst_group_base + (col_start + tile_col) * dst_col_stride + row_start;
+                let mut tile_row = 0usize;
+                if stream_stores {
+                    let mut chunk = Qwen36F16Chunk16([0; 16]);
+                    while tile_row + 16 <= tile_rows {
+                        for idx in 0..16 {
+                            chunk.0[idx] =
+                                read_f16_unaligned(&tile, (tile_row + idx) * tile_cols + tile_col);
+                        }
+                        qwen36_write_f16_chunk16(dst, dst_base + tile_row, &chunk, true);
+                        tile_row += 16;
+                    }
+                }
+                while tile_row < tile_rows {
+                    write_f16_unaligned(
+                        dst,
+                        dst_base + tile_row,
+                        read_f16_unaligned(&tile, tile_row * tile_cols + tile_col),
+                    );
+                    tile_row += 1;
                 }
             }
         }
@@ -3336,6 +3445,7 @@ fn qwen36_pack_transposed_int4_f16_lut(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn qwen36_pack_mps_expert_bridge_bytes_lut(
     hidden: usize,
     moe_intermediate: usize,
@@ -3381,6 +3491,7 @@ fn qwen36_pack_mps_expert_bridge_bytes_lut(
             &mut gate_up_rhs_bytes,
             group * hidden * gate_up_rows,
             gate_up_rows,
+            false,
         );
         qwen36_pack_transposed_int4_f16_lut(
             down_w,
@@ -3393,9 +3504,79 @@ fn qwen36_pack_mps_expert_bridge_bytes_lut(
             &mut down_rhs_bytes,
             group * moe_intermediate * hidden,
             hidden,
+            false,
         );
     }
     (h_norm_bytes, gate_up_rhs_bytes, down_rhs_bytes)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen36_fill_mps_expert_bridge_buffers_lut(
+    hidden: usize,
+    moe_intermediate: usize,
+    active_experts: &[usize],
+    h_norm: &[f32],
+    group_size: usize,
+    gate_up_proj_ptr: *const c_void,
+    gate_up_scale_ptr: *const c_void,
+    gate_up_zero_ptr: *const c_void,
+    down_proj_ptr: *const c_void,
+    down_scale_ptr: *const c_void,
+    down_zero_ptr: *const c_void,
+    bridge: &mut Qwen36MpsExpertBridgeBuffers,
+    stream_stores: bool,
+) {
+    let active_groups = active_experts.len();
+    let gate_up_rows = 2 * moe_intermediate;
+
+    {
+        let h_norm_bytes = qwen36_gpu_buffer_as_mut_bytes(&mut bridge.h_norm);
+        for group in 0..active_groups {
+            let dst_base = group * hidden;
+            for (col, &x) in h_norm.iter().enumerate() {
+                write_f16_unaligned(h_norm_bytes, dst_base + col, f32_to_f16_bits(x));
+            }
+        }
+    }
+
+    let gate_up_w = gate_up_proj_ptr as *const u8;
+    let gate_up_scale = gate_up_scale_ptr as *const u16;
+    let gate_up_zero = gate_up_zero_ptr as *const u16;
+    let down_w = down_proj_ptr as *const u8;
+    let down_scale = down_scale_ptr as *const u16;
+    let down_zero = down_zero_ptr as *const u16;
+
+    for (group, &expert) in active_experts.iter().enumerate() {
+        qwen36_pack_transposed_int4_f16_lut(
+            gate_up_w,
+            gate_up_scale,
+            gate_up_zero,
+            expert,
+            gate_up_rows,
+            hidden,
+            group_size,
+            qwen36_gpu_buffer_as_mut_bytes(&mut bridge.gate_up_rhs),
+            group * hidden * gate_up_rows,
+            gate_up_rows,
+            stream_stores,
+        );
+        qwen36_pack_transposed_int4_f16_lut(
+            down_w,
+            down_scale,
+            down_zero,
+            expert,
+            hidden,
+            moe_intermediate,
+            group_size,
+            qwen36_gpu_buffer_as_mut_bytes(&mut bridge.down_rhs),
+            group * moe_intermediate * hidden,
+            hidden,
+            stream_stores,
+        );
+    }
+    if stream_stores {
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3416,8 +3597,14 @@ fn qwen36_build_mps_expert_bridge_buffers(
 ) -> Result<Qwen36MpsExpertBridgeBuffers, GpuError> {
     let active_groups = active_experts.len();
     let gate_up_rows = 2 * moe_intermediate;
-    let (h_norm_bytes, gate_up_rhs_bytes, down_rhs_bytes) = if use_lut_pack {
-        qwen36_pack_mps_expert_bridge_bytes_lut(
+    if use_lut_pack {
+        let mut bridge = qwen36_alloc_mps_expert_bridge_buffers(
+            ordinal,
+            hidden,
+            moe_intermediate,
+            active_groups,
+        )?;
+        qwen36_fill_mps_expert_bridge_buffers_lut(
             hidden,
             moe_intermediate,
             active_experts,
@@ -3429,8 +3616,12 @@ fn qwen36_build_mps_expert_bridge_buffers(
             down_proj_ptr,
             down_scale_ptr,
             down_zero_ptr,
-        )
-    } else {
+            &mut bridge,
+            std::env::var_os("SUPERSONIC_METAL_QWEN36_MPS_BRIDGE_CPU_TRANSCODE_STREAM").is_some(),
+        );
+        return Ok(bridge);
+    }
+    let (h_norm_bytes, gate_up_rhs_bytes, down_rhs_bytes) =
         qwen36_pack_mps_expert_bridge_bytes_scalar(
             hidden,
             moe_intermediate,
@@ -3443,8 +3634,7 @@ fn qwen36_build_mps_expert_bridge_buffers(
             down_proj_ptr,
             down_scale_ptr,
             down_zero_ptr,
-        )
-    };
+        );
 
     let h_norm = GpuBuffer::from_host_bytes(
         ordinal,

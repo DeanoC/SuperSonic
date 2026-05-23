@@ -489,13 +489,22 @@ layers while the Metal command-buffer GPU timestamp for the transcode work was
 only `66.239 ms`. That points away from more per-token MPS slab materialization
 and toward either a fully fused routed-expert INT4 path or persistent resident
 expert buffers that avoid rebuilding/consuming large FP16 MPS matrices every
-token. The CPU fallback also has an opt-in LUT pack experiment via
-`SUPERSONIC_METAL_QWEN36_MPS_BRIDGE_CPU_TRANSCODE_LUT=1`: the pure CPU
-microbench improves scalar packing from `1271.431 ms` to `512.129 ms` for the
-50.4 MB active slab, but the real profiled bridge regressed to
-`3787.1 ms/token` with
-`qwen36_ffn_int4_expert_mps_bridge_pack_f16_lut=3371.748 ms` across 40 layers,
-so it remains an attribution experiment only.
+token. The CPU fallback also has an opt-in tiled packed-byte LUT pack experiment
+via `SUPERSONIC_METAL_QWEN36_MPS_BRIDGE_CPU_TRANSCODE_LUT=1`: the release
+microbench improves scalar packing from `44.725 ms` to `16.602 ms` for the
+50.4 MB active slab by mapping each packed INT4 byte to a pair of FP16 values
+and transposing through cache-sized tiles. With the LUT path enabled, the bridge
+materializes directly into the Metal shared buffers instead of first building
+large intermediate CPU slabs and copying them into `MTLBuffer` storage. An
+additional opt-in one-way store mode,
+`SUPERSONIC_METAL_QWEN36_MPS_BRIDGE_CPU_TRANSCODE_STREAM=1`, uses paired
+non-temporal ARM stores for the transposed FP16 flush. It still generated
+`[11]`, but it is not promotable: the stream-store smoke measured
+`868.1 ms/token` unprofiled, and the profiled run measured `907.5 ms/token`
+with `qwen36_ffn_int4_expert_mps_bridge_pack_f16_lut=556.425 ms` across 40
+layers. On Apple UMA this is not PCIe upload cost; the remaining blocker is
+per-token FP16 MPS slab rebuild/consumption, so the next target is either
+resident reused slabs or a fully fused routed-expert INT4 path.
 
 ### Metal validation
 
