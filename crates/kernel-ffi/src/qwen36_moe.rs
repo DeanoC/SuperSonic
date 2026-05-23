@@ -259,6 +259,38 @@ pub fn metal_mpp_tile_gemm_f16_tflops(size: u32, iterations: u32) -> Result<f64,
     crate::metal_native::mpp_tile_gemm_f16_tflops(size, iterations)
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct MetalMpsExpertF16Probe {
+    pub gate_up_ms: f64,
+    pub down_ms: f64,
+    pub gate_up_tflops: f64,
+    pub down_tflops: f64,
+}
+
+/// Attribution-only MPS probe for Qwen3.6 active-expert GEMV shapes.
+///
+/// This is a resident-FP16 vendor-library upper-bound probe. It does not use the
+/// GPTQ INT4 expert buffers directly and does not change the decode path.
+pub fn metal_mps_expert_f16_probe(
+    hidden: usize,
+    moe_intermediate: usize,
+    top_k: usize,
+    iterations: u32,
+) -> Result<MetalMpsExpertF16Probe, GpuError> {
+    let probe = crate::metal_native::qwen36_mps_expert_f16_probe(
+        hidden,
+        moe_intermediate,
+        top_k,
+        iterations,
+    )?;
+    Ok(MetalMpsExpertF16Probe {
+        gate_up_ms: probe.gate_up_ms,
+        down_ms: probe.down_ms,
+        gate_up_tflops: probe.gate_up_tflops,
+        down_tflops: probe.down_tflops,
+    })
+}
+
 #[cfg(any(supersonic_backend_hip, supersonic_backend_cuda))]
 extern "C" {
     /// Stub launch entry. Walks the descriptor array, validates field

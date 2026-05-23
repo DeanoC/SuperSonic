@@ -759,6 +759,7 @@ fn decode_text(
         );
     }
     emit_mpp_pilot_if_requested(emit_stage_timings);
+    emit_mps_expert_pilot_if_requested(emit_stage_timings);
 
     Ok(())
 }
@@ -783,6 +784,51 @@ fn emit_mpp_pilot_if_requested(emit_stage_timings: bool) {
         Err(err) => eprintln!(
             "[qwen36-moe mpp-pilot] status=error size={} iterations={} tflops=0.000 error={}",
             size, iterations, err
+        ),
+    }
+}
+
+fn emit_mps_expert_pilot_if_requested(emit_stage_timings: bool) {
+    if !emit_stage_timings || std::env::var_os("SUPERSONIC_METAL_QWEN36_MPS_EXPERT_PILOT").is_none()
+    {
+        return;
+    }
+    let hidden = std::env::var("SUPERSONIC_METAL_QWEN36_MPS_EXPERT_HIDDEN")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(2048);
+    let moe_intermediate = std::env::var("SUPERSONIC_METAL_QWEN36_MPS_EXPERT_MOE_INTERMEDIATE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(512);
+    let top_k = std::env::var("SUPERSONIC_METAL_QWEN36_MPS_EXPERT_TOP_K")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(8);
+    let iterations = std::env::var("SUPERSONIC_METAL_QWEN36_MPS_EXPERT_ITERS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(100);
+    match kernel_ffi::qwen36_moe::metal_mps_expert_f16_probe(
+        hidden,
+        moe_intermediate,
+        top_k,
+        iterations,
+    ) {
+        Ok(probe) => eprintln!(
+            "[qwen36-moe mps-expert-pilot] status=ok hidden={} moe_intermediate={} top_k={} iterations={} gate_up_ms={:.3} down_ms={:.3} gate_up_tflops={:.3} down_tflops={:.3}",
+            hidden,
+            moe_intermediate,
+            top_k,
+            iterations,
+            probe.gate_up_ms,
+            probe.down_ms,
+            probe.gate_up_tflops,
+            probe.down_tflops,
+        ),
+        Err(err) => eprintln!(
+            "[qwen36-moe mps-expert-pilot] status=error hidden={} moe_intermediate={} top_k={} iterations={} gate_up_ms=0.000 down_ms=0.000 gate_up_tflops=0.000 down_tflops=0.000 error={}",
+            hidden, moe_intermediate, top_k, iterations, err
         ),
     }
 }

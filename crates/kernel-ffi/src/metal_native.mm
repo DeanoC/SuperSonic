@@ -1,5 +1,6 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#import <MetalPerformanceShaders/MetalPerformanceShaders.h>
 #if SUPERSONIC_HAVE_MTL4_MPP
 #import <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 #endif
@@ -50,6 +51,19 @@ inline void record_command_buffer_gpu_profile(id<MTLCommandBuffer> command_buffe
         std::string labeled_op = "command_buffer_gpu:" + label;
         record_profile_elapsed(labeled_op.c_str(), "runtime", gpu_elapsed_ms);
     }
+}
+
+double wait_command_buffer_ms(id<MTLCommandBuffer> command_buffer, MetalClock::time_point start) {
+    [command_buffer commit];
+    [command_buffer waitUntilCompleted];
+    if (command_buffer.status != MTLCommandBufferStatusCompleted) {
+        return 0.0;
+    }
+    const double gpu_elapsed_ms = (command_buffer.GPUEndTime - command_buffer.GPUStartTime) * 1000.0;
+    if (std::isfinite(gpu_elapsed_ms) && gpu_elapsed_ms > 0.0) {
+        return gpu_elapsed_ms;
+    }
+    return std::chrono::duration<double, std::milli>(MetalClock::now() - start).count();
 }
 
 struct MatmulParams {
@@ -11137,6 +11151,161 @@ extern "C" int supersonic_metal_qwen36_ffn_int4_stage5(
             1005,
             1006
         );
+    }
+}
+
+extern "C" int supersonic_metal_qwen36_mps_expert_f16_probe(
+    size_t hidden,
+    size_t moe_intermediate,
+    size_t top_k,
+    uint32_t iterations,
+    double* gate_up_ms_out,
+    double* down_ms_out,
+    double* gate_up_tflops_out,
+    double* down_tflops_out
+) {
+    @autoreleasepool {
+        if (hidden == 0 || moe_intermediate == 0 || top_k == 0 || iterations == 0 ||
+            gate_up_ms_out == nullptr || down_ms_out == nullptr ||
+            gate_up_tflops_out == nullptr || down_tflops_out == nullptr) {
+            return 1210;
+        }
+        if (hidden > UINT32_MAX || moe_intermediate > UINT32_MAX || top_k > UINT32_MAX) {
+            return 1211;
+        }
+        id<MTLDevice> device = metal_device();
+        id<MTLCommandQueue> queue = metal_queue();
+        if (device == nil || queue == nil) {
+            return 1212;
+        }
+
+        const NSUInteger m = static_cast<NSUInteger>(top_k);
+        const NSUInteger hidden_cols = static_cast<NSUInteger>(hidden);
+        const NSUInteger gate_up_cols = static_cast<NSUInteger>(2 * moe_intermediate);
+        const NSUInteger down_k = static_cast<NSUInteger>(moe_intermediate);
+        const NSUInteger down_cols = static_cast<NSUInteger>(hidden);
+
+        auto make_buffer = [&](NSUInteger elements) -> id<MTLBuffer> {
+            return [device newBufferWithLength:elements * sizeof(uint16_t)
+                                      options:MTLResourceStorageModeShared];
+        };
+        id<MTLBuffer> gate_lhs_buf = make_buffer(m * hidden_cols);
+        id<MTLBuffer> gate_rhs_buf = make_buffer(hidden_cols * gate_up_cols);
+        id<MTLBuffer> gate_out_buf = make_buffer(m * gate_up_cols);
+        id<MTLBuffer> down_lhs_buf = make_buffer(m * down_k);
+        id<MTLBuffer> down_rhs_buf = make_buffer(down_k * down_cols);
+        id<MTLBuffer> down_out_buf = make_buffer(m * down_cols);
+        if (gate_lhs_buf == nil || gate_rhs_buf == nil || gate_out_buf == nil ||
+            down_lhs_buf == nil || down_rhs_buf == nil || down_out_buf == nil) {
+            return 1213;
+        }
+
+        auto fill_half = [](id<MTLBuffer> buffer, NSUInteger elements, uint16_t base) {
+            auto* ptr = static_cast<uint16_t*>(buffer.contents);
+            for (NSUInteger i = 0; i < elements; ++i) {
+                ptr[i] = static_cast<uint16_t>(base + (i & 1u));
+            }
+        };
+        fill_half(gate_lhs_buf, m * hidden_cols, 0x3c00u);
+        fill_half(gate_rhs_buf, hidden_cols * gate_up_cols, 0x3800u);
+        memset(gate_out_buf.contents, 0, m * gate_up_cols * sizeof(uint16_t));
+        fill_half(down_lhs_buf, m * down_k, 0x3c00u);
+        fill_half(down_rhs_buf, down_k * down_cols, 0x3800u);
+        memset(down_out_buf.contents, 0, m * down_cols * sizeof(uint16_t));
+
+        auto matrix = [](id<MTLBuffer> buffer, NSUInteger rows, NSUInteger cols) -> MPSMatrix* {
+            MPSMatrixDescriptor* desc =
+                [MPSMatrixDescriptor matrixDescriptorWithRows:rows
+                                                      columns:cols
+                                                     rowBytes:cols * sizeof(uint16_t)
+                                                     dataType:MPSDataTypeFloat16];
+            return [[MPSMatrix alloc] initWithBuffer:buffer descriptor:desc];
+        };
+
+        MPSMatrix* gate_lhs = matrix(gate_lhs_buf, m, hidden_cols);
+        MPSMatrix* gate_rhs = matrix(gate_rhs_buf, hidden_cols, gate_up_cols);
+        MPSMatrix* gate_out = matrix(gate_out_buf, m, gate_up_cols);
+        MPSMatrix* down_lhs = matrix(down_lhs_buf, m, down_k);
+        MPSMatrix* down_rhs = matrix(down_rhs_buf, down_k, down_cols);
+        MPSMatrix* down_out = matrix(down_out_buf, m, down_cols);
+        MPSMatrixMultiplication* gate_gemm =
+            [[MPSMatrixMultiplication alloc] initWithDevice:device
+                                              transposeLeft:false
+                                             transposeRight:false
+                                                resultRows:m
+                                             resultColumns:gate_up_cols
+                                           interiorColumns:hidden_cols
+                                                    alpha:1.0
+                                                     beta:0.0];
+        MPSMatrixMultiplication* down_gemm =
+            [[MPSMatrixMultiplication alloc] initWithDevice:device
+                                              transposeLeft:false
+                                             transposeRight:false
+                                                resultRows:m
+                                             resultColumns:down_cols
+                                           interiorColumns:down_k
+                                                    alpha:1.0
+                                                     beta:0.0];
+        if (gate_lhs == nil || gate_rhs == nil || gate_out == nil ||
+            down_lhs == nil || down_rhs == nil || down_out == nil ||
+            gate_gemm == nil || down_gemm == nil) {
+            return 1214;
+        }
+
+        auto run_mps = [&](MPSMatrixMultiplication* gemm,
+                           MPSMatrix* lhs,
+                           MPSMatrix* rhs,
+                           MPSMatrix* out,
+                           const char* op) -> double {
+            id<MTLCommandBuffer> warm = [queue commandBuffer];
+            if (warm == nil) {
+                return 0.0;
+            }
+            [gemm encodeToCommandBuffer:warm leftMatrix:lhs rightMatrix:rhs resultMatrix:out];
+            [warm commit];
+            [warm waitUntilCompleted];
+            if (warm.status != MTLCommandBufferStatusCompleted) {
+                return 0.0;
+            }
+
+            id<MTLCommandBuffer> command_buffer = [queue commandBuffer];
+            if (command_buffer == nil) {
+                return 0.0;
+            }
+            for (uint32_t i = 0; i < iterations; ++i) {
+                [gemm encodeToCommandBuffer:command_buffer leftMatrix:lhs rightMatrix:rhs resultMatrix:out];
+            }
+            auto start = MetalClock::now();
+            const double elapsed_ms = wait_command_buffer_ms(command_buffer, start);
+            record_profile_elapsed(op, "native", elapsed_ms);
+            return elapsed_ms;
+        };
+
+        const double gate_up_ms =
+            run_mps(gate_gemm, gate_lhs, gate_rhs, gate_out, "qwen36_mps_expert_gate_up_f16_probe");
+        const double down_ms =
+            run_mps(down_gemm, down_lhs, down_rhs, down_out, "qwen36_mps_expert_down_f16_probe");
+        if (gate_up_ms <= 0.0 || down_ms <= 0.0 ||
+            !std::isfinite(gate_up_ms) || !std::isfinite(down_ms)) {
+            return 1215;
+        }
+
+        volatile uint16_t guard =
+            static_cast<uint16_t*>(gate_out_buf.contents)[0] ^
+            static_cast<uint16_t*>(down_out_buf.contents)[0];
+        (void)guard;
+
+        const double gate_up_flops = static_cast<double>(iterations) * 2.0 *
+            static_cast<double>(top_k) * static_cast<double>(2 * moe_intermediate) *
+            static_cast<double>(hidden);
+        const double down_flops = static_cast<double>(iterations) * 2.0 *
+            static_cast<double>(top_k) * static_cast<double>(hidden) *
+            static_cast<double>(moe_intermediate);
+        *gate_up_ms_out = gate_up_ms;
+        *down_ms_out = down_ms;
+        *gate_up_tflops_out = gate_up_flops / (gate_up_ms / 1000.0) / 1.0e12;
+        *down_tflops_out = down_flops / (down_ms / 1000.0) / 1.0e12;
+        return 0;
     }
 }
 

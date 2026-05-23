@@ -42,6 +42,7 @@ fn perf_cell_json_status_variants() {
         chain_breakdown: None,
         lifecycle_timings: None,
         mpp_pilot: None,
+        mps_expert_pilot: None,
         metal_profile: None,
         hal_profile: None,
         gpu_temp_c_end: Some(60.0),

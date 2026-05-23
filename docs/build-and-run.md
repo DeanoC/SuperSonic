@@ -463,9 +463,18 @@ roughly `337 ms/token`, but profile attribution shows `100.287 ms` in
 `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_PACK_CACHE=1`, but the measured
 result was not promotable: it reduced HAL alloc/free churn while regressing the
 profiled control from `217.6 ms/token` to `234.7 ms/token` on the same prompt.
-The next FFN target is therefore not more arithmetic in this shader; it is a
-route-aware residency plan, prefetch/reuse that avoids per-token pack copies, or
-an MPS/MPP-backed expert matvec bridge.
+`SUPERSONIC_METAL_QWEN36_MPS_EXPERT_PILOT=1` adds a resident-FP16
+Metal Performance Shaders attribution row for the active-expert GEMV shapes. A
+one-token M5 Max smoke generated `[11]` and reported `gate_up_ms=3.260`,
+`down_ms=2.975`, `gate_up_tflops=1.029`, and `down_tflops=0.564` for 100
+repeated expert-shape MPS GEMMs, while the default INT4 host expert work in the
+same profiled run was `73.851 ms` gate/up and `42.274 ms` down across 40 layers.
+The full `bench-perf` attribution lane writes this as `mps_expert_pilot` in
+schema-v4 JSON; the latest M5 Max run measured `150.6 ms/token` median with
+`ffn_ms_avg=96.761`, `linear_attn_ms_avg=54.181`, and a resident-MPS pilot of
+`gate_up_ms=0.619`, `down_ms=0.433`.
+The next FFN target is therefore an MPS-backed INT4-to-FP16 expert bridge or a
+route-aware residency plan that avoids per-token CPU slab packing.
 
 ### Metal validation
 

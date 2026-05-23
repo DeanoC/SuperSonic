@@ -18,6 +18,7 @@ pub struct AttributionTimings {
     pub chain_breakdown: Option<BTreeMap<String, f64>>,
     pub lifecycle_timings: Option<BTreeMap<String, f64>>,
     pub mpp_pilot: Option<BTreeMap<String, f64>>,
+    pub mps_expert_pilot: Option<BTreeMap<String, f64>>,
     pub metal_profile: Option<ProfileJson>,
     pub hal_profile: Option<ProfileJson>,
 }
@@ -104,6 +105,11 @@ pub fn extract_attribution_timings(output: &str) -> AttributionTimings {
             .lines()
             .rev()
             .find(|l| l.starts_with("[qwen36-moe mpp-pilot]"))
+            .map(parse_numeric_fields),
+        mps_expert_pilot: output
+            .lines()
+            .rev()
+            .find(|l| l.starts_with("[qwen36-moe mps-expert-pilot]"))
             .map(parse_numeric_fields),
         metal_profile: extract_profile(output, "[metal-profile]", "[metal-profile-op]", true),
         hal_profile: extract_profile(output, "[hal-profile]", "[hal-profile-op]", false),
@@ -259,6 +265,7 @@ pub fn run_one_combo(invocation: &ComboInvocation, policy: &RunPolicy) -> Result
         chain_breakdown: attribution.chain_breakdown,
         lifecycle_timings: attribution.lifecycle_timings,
         mpp_pilot: attribution.mpp_pilot,
+        mps_expert_pilot: attribution.mps_expert_pilot,
         metal_profile: attribution.metal_profile,
         hal_profile: attribution.hal_profile,
         gpu_temp_c_end: None,
@@ -279,6 +286,7 @@ fn invoke_supersonic(
             .env("SUPERSONIC_QWEN36_DENSE_PREFILL_TOKEN_LOOP", "1");
         if emit_stage_timings {
             cmd.env("SUPERSONIC_METAL_QWEN36_MPP_PILOT", "1")
+                .env("SUPERSONIC_METAL_QWEN36_MPS_EXPERT_PILOT", "1")
                 .env("SUPERSONIC_METAL_PROFILE", "1");
         }
     }

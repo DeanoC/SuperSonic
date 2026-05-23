@@ -73,6 +73,7 @@ fn extracts_qwen36_attribution_timing_maps() {
 [qwen36-moe chain-breakdown] gen_steps=16 full_attn_ms_avg=8.000 linear_attn_ms_avg=4.000 ffn_ms_avg=13.456 (full_attn_total_ms=128.0 linear_attn_total_ms=64.0 ffn_total_ms=215.3)
 [qwen36-moe lifecycle-timings] prompt_setup_ms=1.000 bake_open_ms=2.000 layer_load_ms=3.000 session_ms=4.000 prefill_steps=1 prefill_embed_ms=5.000 prefill_chain_ms=6.000 prefill_total_ms=11.000 generation_wall_ms=441.0 total_wall_ms=452.0
 [qwen36-moe mpp-pilot] status=ok size=2048 iterations=5 tile_m=64 tile_n=32 tile_k=64 tflops=13.250
+[qwen36-moe mps-expert-pilot] status=ok hidden=2048 moe_intermediate=512 top_k=8 iterations=100 gate_up_ms=2.500 down_ms=1.250 gate_up_tflops=1.342 down_tflops=0.671
 [metal-profile] calls=3 total_ms=50.000 native_ms=45.000 host_ms=5.000
 [metal-profile-op] op=qwen36_ffn_int4_stage5 path=native calls=2 mean_ms=20.0000 total_ms=40.000 max_ms=21.000
 [hal-profile] calls=4 total_ms=1.000 alloc_calls=0 alloc_bytes=0 h2d=0 d2h=0 d2d=4096 memset=0 sync_calls=1
@@ -92,6 +93,10 @@ fn extracts_qwen36_attribution_timing_maps() {
         Some(&11.0)
     );
     assert_eq!(timings.mpp_pilot.unwrap().get("tflops"), Some(&13.25));
+    assert_eq!(
+        timings.mps_expert_pilot.unwrap().get("gate_up_tflops"),
+        Some(&1.342)
+    );
     let metal = timings.metal_profile.unwrap();
     assert_eq!(metal.summary.get("native_ms"), Some(&45.0));
     assert_eq!(metal.entries[0].op, "qwen36_ffn_int4_stage5");

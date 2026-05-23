@@ -201,6 +201,16 @@ unsafe extern "C" {
         out_ptr: *mut c_void,
     ) -> c_int;
     fn supersonic_metal_mpp_tile_gemm_f16_tflops(size: u32, iterations: u32) -> f64;
+    fn supersonic_metal_qwen36_mps_expert_f16_probe(
+        hidden: usize,
+        moe_intermediate: usize,
+        top_k: usize,
+        iterations: u32,
+        gate_up_ms_out: *mut f64,
+        down_ms_out: *mut f64,
+        gate_up_tflops_out: *mut f64,
+        down_tflops_out: *mut f64,
+    ) -> c_int;
     fn supersonic_metal_qwen_linear_projections_bf16(
         hidden_dim: usize,
         qkv_dim: usize,
@@ -1747,6 +1757,68 @@ pub(crate) fn mpp_tile_gemm_f16_tflops(size: u32, iterations: u32) -> Result<f64
             "metal native MPP tile GEMM pilot returned no measurement".into(),
         ))
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Qwen36MpsExpertF16Probe {
+    pub gate_up_ms: f64,
+    pub down_ms: f64,
+    pub gate_up_tflops: f64,
+    pub down_tflops: f64,
+}
+
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+pub(crate) fn qwen36_mps_expert_f16_probe(
+    hidden: usize,
+    moe_intermediate: usize,
+    top_k: usize,
+    iterations: u32,
+) -> Result<Qwen36MpsExpertF16Probe, GpuError> {
+    if hidden == 0 || moe_intermediate == 0 || top_k == 0 || iterations == 0 {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native Qwen3.6 MPS expert probe requires non-zero dims/iterations, got hidden={hidden} moe_intermediate={moe_intermediate} top_k={top_k} iterations={iterations}"
+        )));
+    }
+    let mut gate_up_ms = 0.0f64;
+    let mut down_ms = 0.0f64;
+    let mut gate_up_tflops = 0.0f64;
+    let mut down_tflops = 0.0f64;
+    let status = unsafe {
+        supersonic_metal_qwen36_mps_expert_f16_probe(
+            hidden,
+            moe_intermediate,
+            top_k,
+            iterations,
+            &mut gate_up_ms,
+            &mut down_ms,
+            &mut gate_up_tflops,
+            &mut down_tflops,
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!("metal native Qwen3.6 MPS expert probe failed with status {status}"),
+        ));
+    }
+    if !gate_up_ms.is_finite()
+        || !down_ms.is_finite()
+        || !gate_up_tflops.is_finite()
+        || !down_tflops.is_finite()
+        || gate_up_ms <= 0.0
+        || down_ms <= 0.0
+    {
+        return Err(GpuError::backend(
+            Backend::Metal,
+            "metal native Qwen3.6 MPS expert probe returned invalid measurement".into(),
+        ));
+    }
+    Ok(Qwen36MpsExpertF16Probe {
+        gate_up_ms,
+        down_ms,
+        gate_up_tflops,
+        down_tflops,
+    })
 }
 
 #[cfg(all(target_os = "macos", supersonic_backend_metal))]
@@ -4435,6 +4507,19 @@ pub(crate) fn mpp_tile_gemm_f16_tflops(_size: u32, _iterations: u32) -> Result<f
     Err(GpuError::backend(
         Backend::Metal,
         "metal native MPP tile GEMM pilot is not compiled".into(),
+    ))
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+pub(crate) fn qwen36_mps_expert_f16_probe(
+    _hidden: usize,
+    _moe_intermediate: usize,
+    _top_k: usize,
+    _iterations: u32,
+) -> Result<Qwen36MpsExpertF16Probe, GpuError> {
+    Err(GpuError::backend(
+        Backend::Metal,
+        "metal native Qwen3.6 MPS expert probe is not compiled".into(),
     ))
 }
 

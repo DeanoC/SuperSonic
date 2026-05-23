@@ -929,41 +929,45 @@ attribution run. For this Metal lane it also forces the dense prefill token loop
 batched prefill router-permute path is HIP/CUDA-only. The attribution run also
 enables `SUPERSONIC_METAL_QWEN36_MPP_PILOT=1`, which emits a separate
 `[qwen36-moe mpp-pilot]` row for repeated exact `64x32x64` MPP tiles. It also
-enables `SUPERSONIC_METAL_PROFILE=1` for the attribution run so the profile JSON
-includes `metal_profile` and `hal_profile` objects with parseable per-op rows.
-This is a runtime-adjacent MPP pilot measurement, not a model matmul
-replacement. The attribution maps are stored in the same schema-v3 perf JSON as
+enables `SUPERSONIC_METAL_QWEN36_MPS_EXPERT_PILOT=1`, which emits a resident
+FP16 Metal Performance Shaders row for Qwen3.6 active-expert GEMV shapes. It
+also enables `SUPERSONIC_METAL_PROFILE=1` for the attribution run so the profile
+JSON includes `metal_profile` and `hal_profile` objects with parseable per-op
+rows. These are runtime-adjacent MPP/MPS pilot measurements, not model matmul
+replacements. The attribution maps are stored in the same schema-v4 perf JSON as
 `stage_timings`, `chain_breakdown`, `lifecycle_timings`, `mpp_pilot`,
-`metal_profile`, and `hal_profile` without feeding back into the headline
-median.
+`mps_expert_pilot`, `metal_profile`, and `hal_profile` without feeding back into
+the headline median.
 
 <!-- AUTOGEN BELOW: apple-m5-max-metal -->
 | Model           |  INT4 |
 | --------------- | ----: |
-| qwen3.6-35b-a3b | 144.2 |
+| qwen3.6-35b-a3b | 150.6 |
 
 <!-- AUTOGEN END: apple-m5-max-metal -->
 
 Latest local attribution run
-(`target/bench-runs/2026-05-23-04d8f14/perf/qwen3.6-35b-a3b_int4.json`):
+(`target/bench-runs/2026-05-23-796ea84/perf/qwen3.6-35b-a3b_int4.json`):
 
 | Metric | Value |
 |---|---:|
-| Headline median | 144.2 ms/token |
-| Stage total | 169.963 ms/token |
-| Chain | 165.603 ms/token |
-| LM head | 4.115 ms/token |
-| FFN | 93.152 ms/token |
-| Linear attention | 55.530 ms/token |
-| Full attention | 16.737 ms/token |
-| Prefill total | 908.013 ms |
-| MPP pilot | 17.019 TFLOP/s |
+| Headline median | 150.6 ms/token |
+| Stage total | 173.014 ms/token |
+| Chain | 167.612 ms/token |
+| LM head | 4.342 ms/token |
+| FFN | 96.761 ms/token |
+| Linear attention | 54.181 ms/token |
+| Full attention | 16.470 ms/token |
+| Prefill total | 1070.741 ms |
+| MPP pilot | 15.230 TFLOP/s |
+| MPS expert pilot gate/up | 0.619 ms, 5.423 TFLOP/s |
+| MPS expert pilot down | 0.433 ms, 3.878 TFLOP/s |
 
-The headline median is the unprofiled median-of-3 run (`144.2`, `141.3`,
-`147.2` ms/token). The stage table comes from the extra profile attribution run
-and carries profiling overhead, but now follows the same default FFN path as
-the headline samples. A default one-token smoke generated the expected token
-`[11]`; the latest local cold one-token profile measured `ffn_ms_avg=128.573`,
+The headline median is the unprofiled median-of-3 run (`149.2`, `150.6`,
+`153.5` ms/token). The stage table comes from the extra profile attribution run
+and carries profiling overhead, but follows the same default FFN path as the
+headline samples. A default one-token smoke generated the expected token `[11]`;
+the latest local cold one-token profile measured `ffn_ms_avg=128.573`,
 with `qwen36_ffn_host_expert_gate_up` at 56.839 ms total and
 `qwen36_ffn_host_expert_down` at 36.181 ms total. The explicit full native FFN
 escape hatch also generated `[11]`, but remains too slow to promote
@@ -1030,6 +1034,23 @@ That rules out a simple per-layer scratch-slab cache as the next promotion
 target. The next FFN work should either keep packed experts resident without
 recopying on route churn, or move the expert matvecs to a Metal Performance
 Shaders / MPP bridge that avoids the CPU slab-pack step entirely.
+
+The first MPS bridge step is now an attribution probe, not a decode path. With
+`SUPERSONIC_METAL_QWEN36_MPS_EXPERT_PILOT=1`, the runner appends a
+`[qwen36-moe mps-expert-pilot]` row and bench perf JSON schema v4 records it as
+`mps_expert_pilot`. This probe uses resident FP16 MPSMatrix inputs shaped like
+the active-expert gate/up and down GEMVs; it does not consume the GPTQ INT4
+expert tensors. On a one-token M5 Max smoke, the model still generated `[11]`
+and the probe measured `gate_up_ms=3.260`, `down_ms=2.975`,
+`gate_up_tflops=1.029`, and `down_tflops=0.564` for 100 repeated GEMMs. In the
+full `bench-perf` attribution run, the same resident-shape pilot measured
+`gate_up_ms=0.619` and `down_ms=0.433`; the default INT4 host expert path
+reported `qwen36_ffn_host_expert_gate_up=963.798 ms` and
+`qwen36_ffn_host_expert_down=508.565 ms` across the profiled prefill+decode
+calls. That makes the next runtime experiment concrete: build an
+INT4-to-FP16 active-expert bridge for MPS, then compare its conversion/packing
+cost against the existing CPU slab pack and host matvec totals before replacing
+any default FFN path.
 
 Unsupported Metal constraints remain explicit for this target: persistent
 decode, KV-FP8, speculative decode, batching, and Metal VMM are not benchmarked
