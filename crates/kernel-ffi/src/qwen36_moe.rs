@@ -23,6 +23,7 @@ use std::os::raw::c_uint;
 use std::sync::{Mutex, OnceLock};
 
 use gpu_hal::{Backend, BufferKind, GpuBuffer, GpuError, ScalarType};
+use half::f16;
 
 use crate::layer_desc::MAX_BATCH_SIZE;
 
@@ -2734,6 +2735,28 @@ fn qwen36_ffn_expert_packed_stage5_metal_native_supported(
         && !int4.down_proj_zero.is_null()
 }
 
+fn qwen36_ffn_expert_mps_bridge_stage5_supported(
+    params: Qwen36MoeFfnStepParams,
+    weights: &Qwen36MoeFfnStepWeights,
+    int4: &Qwen36MoeFfnStepInt4,
+) -> bool {
+    std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_MPS_BRIDGE").is_some()
+        && params.stage == 5
+        && params.hidden == 2048
+        && params.num_experts == 256
+        && params.moe_intermediate == 512
+        && params.top_k == 8
+        && int4.group_size == 128
+        && !crate::metal_native::disabled_by_env()
+        && !weights.input_hidden.is_null()
+        && !weights.gate_up_proj_w.is_null()
+        && !weights.down_proj_w.is_null()
+        && !int4.gate_up_proj_scale.is_null()
+        && !int4.gate_up_proj_zero.is_null()
+        && !int4.down_proj_scale.is_null()
+        && !int4.down_proj_zero.is_null()
+}
+
 struct Qwen36PackedExpertBuffers {
     gate_up_proj: GpuBuffer,
     gate_up_scale: GpuBuffer,
@@ -2741,6 +2764,15 @@ struct Qwen36PackedExpertBuffers {
     down_proj: GpuBuffer,
     down_scale: GpuBuffer,
     down_zero: GpuBuffer,
+}
+
+struct Qwen36MpsExpertBridgeBuffers {
+    h_norm: GpuBuffer,
+    gate_up_rhs: GpuBuffer,
+    gate_up_out: GpuBuffer,
+    down_lhs: GpuBuffer,
+    down_rhs: GpuBuffer,
+    down_out: GpuBuffer,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -3125,6 +3157,147 @@ where
         )
     })?;
     f(&entry.buffers)
+}
+
+fn f32_to_f16_bits(x: f32) -> u16 {
+    f16::from_f32(x).to_bits()
+}
+
+fn push_f16_bits(bytes: &mut Vec<u8>, bits: u16) {
+    bytes.extend_from_slice(&bits.to_le_bytes());
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen36_expert_int4_weight_unchecked(
+    weight: usize,
+    scale: usize,
+    zero: usize,
+    expert: usize,
+    row: usize,
+    rows: usize,
+    col: usize,
+    cols: usize,
+    group_size: usize,
+) -> f32 {
+    let packed = weight as *const u8;
+    let scale = scale as *const u16;
+    let zero = zero as *const u16;
+    let byte_cols = cols.div_ceil(2);
+    let scale_rows = rows.div_ceil(group_size);
+    let scale_cols = cols.div_ceil(group_size);
+    let packed_base = (expert * rows + row) * byte_cols;
+    let scale_base = (expert * scale_rows + row / group_size) * scale_cols;
+    let byte = unsafe { *packed.add(packed_base + col / 2) };
+    let nibble = if col & 1 == 0 {
+        byte & 0x0f
+    } else {
+        (byte >> 4) & 0x0f
+    };
+    let scale_idx = scale_base + col / group_size;
+    let s = bf16_bits_to_f32(unsafe { *scale.add(scale_idx) });
+    let z = bf16_bits_to_f32(unsafe { *zero.add(scale_idx) });
+    bf16_round_f32(nibble as f32 * s - z * s)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen36_build_mps_expert_bridge_buffers(
+    ordinal: usize,
+    hidden: usize,
+    moe_intermediate: usize,
+    active_experts: &[usize],
+    h_norm: &[f32],
+    group_size: usize,
+    gate_up_proj_ptr: *const c_void,
+    gate_up_scale_ptr: *const c_void,
+    gate_up_zero_ptr: *const c_void,
+    down_proj_ptr: *const c_void,
+    down_scale_ptr: *const c_void,
+    down_zero_ptr: *const c_void,
+) -> Result<Qwen36MpsExpertBridgeBuffers, GpuError> {
+    let active_groups = active_experts.len();
+    let gate_up_rows = 2 * moe_intermediate;
+    let mut h_norm_bytes = Vec::with_capacity(active_groups * hidden * 2);
+    let mut gate_up_rhs_bytes = Vec::with_capacity(active_groups * hidden * gate_up_rows * 2);
+    let mut down_rhs_bytes = Vec::with_capacity(active_groups * moe_intermediate * hidden * 2);
+
+    for _ in 0..active_groups {
+        for &x in h_norm {
+            push_f16_bits(&mut h_norm_bytes, f32_to_f16_bits(x));
+        }
+    }
+
+    let gate_up_w = gate_up_proj_ptr as usize;
+    let gate_up_scale = gate_up_scale_ptr as usize;
+    let gate_up_zero = gate_up_zero_ptr as usize;
+    let down_w = down_proj_ptr as usize;
+    let down_scale = down_scale_ptr as usize;
+    let down_zero = down_zero_ptr as usize;
+
+    for &expert in active_experts {
+        for col in 0..hidden {
+            for row in 0..gate_up_rows {
+                let w = qwen36_expert_int4_weight_unchecked(
+                    gate_up_w,
+                    gate_up_scale,
+                    gate_up_zero,
+                    expert,
+                    row,
+                    gate_up_rows,
+                    col,
+                    hidden,
+                    group_size,
+                );
+                push_f16_bits(&mut gate_up_rhs_bytes, f32_to_f16_bits(w));
+            }
+        }
+        for col in 0..moe_intermediate {
+            for row in 0..hidden {
+                let w = qwen36_expert_int4_weight_unchecked(
+                    down_w,
+                    down_scale,
+                    down_zero,
+                    expert,
+                    row,
+                    hidden,
+                    col,
+                    moe_intermediate,
+                    group_size,
+                );
+                push_f16_bits(&mut down_rhs_bytes, f32_to_f16_bits(w));
+            }
+        }
+    }
+
+    let h_norm = GpuBuffer::from_host_bytes(
+        ordinal,
+        ScalarType::F16,
+        &[active_groups, hidden],
+        &h_norm_bytes,
+    )?;
+    let gate_up_rhs = GpuBuffer::from_host_bytes(
+        ordinal,
+        ScalarType::F16,
+        &[active_groups, hidden, gate_up_rows],
+        &gate_up_rhs_bytes,
+    )?;
+    let gate_up_out = GpuBuffer::zeros(ordinal, ScalarType::F16, &[active_groups, gate_up_rows])?;
+    let down_lhs = GpuBuffer::zeros(ordinal, ScalarType::F16, &[active_groups, moe_intermediate])?;
+    let down_rhs = GpuBuffer::from_host_bytes(
+        ordinal,
+        ScalarType::F16,
+        &[active_groups, moe_intermediate, hidden],
+        &down_rhs_bytes,
+    )?;
+    let down_out = GpuBuffer::zeros(ordinal, ScalarType::F16, &[active_groups, hidden])?;
+
+    Ok(Qwen36MpsExpertBridgeBuffers {
+        h_norm,
+        gate_up_rhs,
+        gate_up_out,
+        down_lhs,
+        down_rhs,
+        down_out,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3744,6 +3917,53 @@ fn ffn_step_stage1_5_metal_host(
     let active_experts: Vec<usize> = (0..active_groups)
         .map(|group| f32::to_bits(workspace[off_topk_idx + group]) as i32 as usize)
         .collect();
+    if qwen36_ffn_expert_mps_bridge_stage5_supported(params, weights, int4) {
+        let mut bridge = crate::prefill_ffi::metal_profile_time(
+            "qwen36_ffn_int4_expert_mps_bridge_pack_f16",
+            "host",
+            || {
+                qwen36_build_mps_expert_bridge_buffers(
+                    output_ordinal,
+                    hidden,
+                    moe_intermediate,
+                    &active_experts,
+                    &h_norm,
+                    int4.group_size as usize,
+                    weights.gate_up_proj_w,
+                    int4.gate_up_proj_scale,
+                    int4.gate_up_proj_zero,
+                    weights.down_proj_w,
+                    int4.down_proj_scale,
+                    int4.down_proj_zero,
+                )
+            },
+        )?;
+        crate::prefill_ffi::metal_profile_time(
+            "qwen36_ffn_int4_expert_mps_bridge_f16",
+            "native",
+            || unsafe {
+                crate::metal_native::qwen36_ffn_expert_mps_bridge_f16(
+                    hidden,
+                    moe_intermediate,
+                    active_groups,
+                    workspace_ptr,
+                    weights.input_hidden,
+                    bridge.h_norm.as_ptr(),
+                    bridge.gate_up_rhs.as_ptr(),
+                    bridge.gate_up_out.as_mut_ptr(),
+                    bridge.down_lhs.as_mut_ptr(),
+                    bridge.down_rhs.as_ptr(),
+                    bridge.down_out.as_mut_ptr(),
+                    output_ptr,
+                    off_topk_val,
+                    off_shared_out,
+                    off_moe_out,
+                    true,
+                )
+            },
+        )?;
+        return Ok(());
+    }
     if qwen36_ffn_expert_packed_stage5_metal_native_supported(params, weights, int4) {
         for group in 0..active_groups {
             workspace[off_topk_idx + group] = f32::from_bits(group as u32);

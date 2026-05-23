@@ -2507,6 +2507,8 @@ struct Qwen36FfnInt4Pipelines {
     __strong id<MTLComputePipelineState> expert_gate_up = nil;
     __strong id<MTLComputePipelineState> expert_gate_up_tiled = nil;
     __strong id<MTLComputePipelineState> expert_down_finalize = nil;
+    __strong id<MTLComputePipelineState> expert_mps_silu = nil;
+    __strong id<MTLComputePipelineState> expert_mps_finalize = nil;
 };
 
 Qwen36FfnInt4Pipelines qwen36_ffn_int4_pipelines(NSError** error_out) {
@@ -2818,6 +2820,47 @@ kernel void supersonic_qwen36_ffn_expert_down_finalize(
         output[row] = bfloat(final);
     }
 }
+
+kernel void supersonic_qwen36_ffn_mps_expert_silu(
+    device const half* gate_up_out [[buffer(0)]],
+    device half* down_lhs [[buffer(1)]],
+    constant Qwen36FfnInt4Params& params [[buffer(2)]],
+    uint3 gid [[thread_position_in_grid]]
+) {
+    uint row = gid.x;
+    uint group = gid.y;
+    if (row >= params.moe_intermediate || group >= params.top_k) {
+        return;
+    }
+    uint base = group * 2u * params.moe_intermediate;
+    float gate = float(gate_up_out[base + row]);
+    float up = float(gate_up_out[base + params.moe_intermediate + row]);
+    down_lhs[group * params.moe_intermediate + row] = half(silu(gate) * up);
+}
+
+kernel void supersonic_qwen36_ffn_mps_expert_finalize(
+    device float* workspace [[buffer(0)]],
+    device const bfloat* input_hidden [[buffer(1)]],
+    device const half* down_out [[buffer(2)]],
+    device bfloat* output [[buffer(3)]],
+    constant Qwen36FfnInt4Params& params [[buffer(4)]],
+    uint row [[thread_position_in_grid]]
+) {
+    if (row >= params.hidden) {
+        return;
+    }
+    float moe_acc = 0.0f;
+    for (uint group = 0; group < params.top_k; ++group) {
+        moe_acc += workspace[params.off_topk_val + group] *
+            float(down_out[group * params.hidden + row]);
+    }
+    float moe = bf16_round_rne_finite(moe_acc);
+    workspace[params.off_moe_out + row] = moe;
+    float final = bf16_round_rne_finite(
+        float(input_hidden[row]) + moe + workspace[params.off_shared_out + row]
+    );
+    output[row] = bfloat(final);
+}
 )QWEN36FFN";
 
                 NSString* source = [NSString stringWithUTF8String:kSource];
@@ -2842,6 +2885,8 @@ kernel void supersonic_qwen36_ffn_expert_down_finalize(
                         @"supersonic_qwen36_ffn_expert_gate_up",
                         @"supersonic_qwen36_ffn_expert_gate_up_tiled",
                         @"supersonic_qwen36_ffn_expert_down_finalize",
+                        @"supersonic_qwen36_ffn_mps_expert_silu",
+                        @"supersonic_qwen36_ffn_mps_expert_finalize",
                     ];
                     for (NSString* name in names) {
                         id<MTLFunction> function = [library newFunctionWithName:name];
@@ -2879,6 +2924,10 @@ kernel void supersonic_qwen36_ffn_expert_down_finalize(
                             pipelines.expert_gate_up_tiled = pipeline;
                         } else if ([name isEqualToString:@"supersonic_qwen36_ffn_expert_down_finalize"]) {
                             pipelines.expert_down_finalize = pipeline;
+                        } else if ([name isEqualToString:@"supersonic_qwen36_ffn_mps_expert_silu"]) {
+                            pipelines.expert_mps_silu = pipeline;
+                        } else if ([name isEqualToString:@"supersonic_qwen36_ffn_mps_expert_finalize"]) {
+                            pipelines.expert_mps_finalize = pipeline;
                         }
                     }
                 }
@@ -2888,7 +2937,8 @@ kernel void supersonic_qwen36_ffn_expert_down_finalize(
 
     bool ok = pipelines.shared_gate_up != nil && pipelines.shared_scalar != nil &&
         pipelines.shared_down != nil && pipelines.expert_gate_up != nil &&
-        pipelines.expert_down_finalize != nil;
+        pipelines.expert_down_finalize != nil && pipelines.expert_mps_silu != nil &&
+        pipelines.expert_mps_finalize != nil;
     if (!ok && build_error != nil &&
         NSProcessInfo.processInfo.environment[@"SUPERSONIC_METAL_PROFILE_DEBUG"] != nil) {
         NSLog(@"SuperSonic Qwen3.6 FFN INT4 Metal pipeline error: %@", build_error);
@@ -11151,6 +11201,203 @@ extern "C" int supersonic_metal_qwen36_ffn_int4_stage5(
             1005,
             1006
         );
+    }
+}
+
+extern "C" int supersonic_metal_qwen36_ffn_expert_mps_bridge_f16(
+    size_t hidden,
+    size_t moe_intermediate,
+    size_t top_k,
+    void* workspace_ptr,
+    const void* input_hidden_ptr,
+    const void* h_norm_f16_ptr,
+    const void* gate_up_rhs_f16_ptr,
+    void* gate_up_out_f16_ptr,
+    void* down_lhs_f16_ptr,
+    const void* down_rhs_f16_ptr,
+    void* down_out_f16_ptr,
+    void* output_ptr,
+    size_t off_topk_val,
+    size_t off_shared_out,
+    size_t off_moe_out,
+    int wait_for_completion
+) {
+    @autoreleasepool {
+        if (hidden == 0 || moe_intermediate == 0 || top_k == 0 ||
+            workspace_ptr == nullptr || input_hidden_ptr == nullptr ||
+            h_norm_f16_ptr == nullptr || gate_up_rhs_f16_ptr == nullptr ||
+            gate_up_out_f16_ptr == nullptr || down_lhs_f16_ptr == nullptr ||
+            down_rhs_f16_ptr == nullptr || down_out_f16_ptr == nullptr ||
+            output_ptr == nullptr) {
+            return 1220;
+        }
+        if (hidden > UINT32_MAX || moe_intermediate > UINT32_MAX || top_k > UINT32_MAX ||
+            off_topk_val > UINT32_MAX || off_shared_out > UINT32_MAX ||
+            off_moe_out > UINT32_MAX) {
+            return 1221;
+        }
+
+        id<MTLDevice> device = metal_device();
+        id<MTLCommandQueue> queue = metal_queue();
+        if (device == nil || queue == nil) {
+            return 1222;
+        }
+        NSError* pipeline_error = nil;
+        Qwen36FfnInt4Pipelines pipelines = qwen36_ffn_int4_pipelines(&pipeline_error);
+        if (pipelines.expert_mps_silu == nil || pipelines.expert_mps_finalize == nil) {
+            return 1223;
+        }
+
+        id<MTLBuffer> workspace = nil;
+        id<MTLBuffer> input_hidden = nil;
+        id<MTLBuffer> h_norm = nil;
+        id<MTLBuffer> gate_up_rhs = nil;
+        id<MTLBuffer> gate_up_out = nil;
+        id<MTLBuffer> down_lhs = nil;
+        id<MTLBuffer> down_rhs = nil;
+        id<MTLBuffer> down_out = nil;
+        id<MTLBuffer> output = nil;
+        size_t workspace_offset = 0;
+        size_t input_hidden_offset = 0;
+        size_t h_norm_offset = 0;
+        size_t gate_up_rhs_offset = 0;
+        size_t gate_up_out_offset = 0;
+        size_t down_lhs_offset = 0;
+        size_t down_rhs_offset = 0;
+        size_t down_out_offset = 0;
+        size_t output_offset = 0;
+        if (lookup_buffer(workspace_ptr, &workspace, &workspace_offset) != 0) return 1224;
+        if (lookup_buffer(input_hidden_ptr, &input_hidden, &input_hidden_offset) != 0) return 1225;
+        if (lookup_buffer(h_norm_f16_ptr, &h_norm, &h_norm_offset) != 0) return 1226;
+        if (lookup_buffer(gate_up_rhs_f16_ptr, &gate_up_rhs, &gate_up_rhs_offset) != 0) return 1227;
+        if (lookup_buffer(gate_up_out_f16_ptr, &gate_up_out, &gate_up_out_offset) != 0) return 1228;
+        if (lookup_buffer(down_lhs_f16_ptr, &down_lhs, &down_lhs_offset) != 0) return 1229;
+        if (lookup_buffer(down_rhs_f16_ptr, &down_rhs, &down_rhs_offset) != 0) return 1230;
+        if (lookup_buffer(down_out_f16_ptr, &down_out, &down_out_offset) != 0) return 1231;
+        if (lookup_buffer(output_ptr, &output, &output_offset) != 0) return 1232;
+
+        const NSUInteger h = static_cast<NSUInteger>(hidden);
+        const NSUInteger i = static_cast<NSUInteger>(moe_intermediate);
+        const NSUInteger k = static_cast<NSUInteger>(top_k);
+        const NSUInteger gate_up_cols = 2 * i;
+        const NSUInteger f16_size = sizeof(uint16_t);
+
+        auto matrix_at = [](id<MTLBuffer> buffer,
+                            NSUInteger offset,
+                            NSUInteger rows,
+                            NSUInteger cols) -> MPSMatrix* {
+            MPSMatrixDescriptor* desc =
+                [MPSMatrixDescriptor matrixDescriptorWithRows:rows
+                                                      columns:cols
+                                                     rowBytes:cols * sizeof(uint16_t)
+                                                     dataType:MPSDataTypeFloat16];
+            return [[MPSMatrix alloc] initWithBuffer:buffer offset:offset descriptor:desc];
+        };
+
+        MPSMatrixMultiplication* gate_gemm =
+            [[MPSMatrixMultiplication alloc] initWithDevice:device
+                                              transposeLeft:false
+                                             transposeRight:false
+                                                resultRows:1
+                                             resultColumns:gate_up_cols
+                                           interiorColumns:h
+                                                    alpha:1.0
+                                                     beta:0.0];
+        MPSMatrixMultiplication* down_gemm =
+            [[MPSMatrixMultiplication alloc] initWithDevice:device
+                                              transposeLeft:false
+                                             transposeRight:false
+                                                resultRows:1
+                                             resultColumns:h
+                                           interiorColumns:i
+                                                    alpha:1.0
+                                                     beta:0.0];
+        if (gate_gemm == nil || down_gemm == nil) {
+            return 1233;
+        }
+
+        Qwen36FfnInt4Params params = {
+            static_cast<uint32_t>(hidden),
+            0u,
+            static_cast<uint32_t>(moe_intermediate),
+            0u,
+            static_cast<uint32_t>(top_k),
+            0u,
+            0u,
+            static_cast<uint32_t>(off_topk_val),
+            0u,
+            0u,
+            0u,
+            static_cast<uint32_t>(off_shared_out),
+            0u,
+            static_cast<uint32_t>(off_moe_out),
+        };
+
+        id<MTLCommandBuffer> command_buffer = [queue commandBuffer];
+        if (command_buffer == nil) {
+            return 1234;
+        }
+        for (NSUInteger group = 0; group < k; ++group) {
+            MPSMatrix* lhs = matrix_at(h_norm, h_norm_offset + group * h * f16_size, 1, h);
+            MPSMatrix* rhs =
+                matrix_at(gate_up_rhs, gate_up_rhs_offset + group * h * gate_up_cols * f16_size, h, gate_up_cols);
+            MPSMatrix* out =
+                matrix_at(gate_up_out, gate_up_out_offset + group * gate_up_cols * f16_size, 1, gate_up_cols);
+            if (lhs == nil || rhs == nil || out == nil) {
+                return 1235;
+            }
+            [gate_gemm encodeToCommandBuffer:command_buffer leftMatrix:lhs rightMatrix:rhs resultMatrix:out];
+        }
+
+        id<MTLComputeCommandEncoder> silu_encoder = [command_buffer computeCommandEncoder];
+        if (silu_encoder == nil) {
+            return 1236;
+        }
+        [silu_encoder setComputePipelineState:pipelines.expert_mps_silu];
+        [silu_encoder setBuffer:gate_up_out offset:gate_up_out_offset atIndex:0];
+        [silu_encoder setBuffer:down_lhs offset:down_lhs_offset atIndex:1];
+        [silu_encoder setBytes:&params length:sizeof(params) atIndex:2];
+        [silu_encoder dispatchThreads:MTLSizeMake(i, k, 1)
+                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [silu_encoder endEncoding];
+
+        for (NSUInteger group = 0; group < k; ++group) {
+            MPSMatrix* lhs = matrix_at(down_lhs, down_lhs_offset + group * i * f16_size, 1, i);
+            MPSMatrix* rhs =
+                matrix_at(down_rhs, down_rhs_offset + group * i * h * f16_size, i, h);
+            MPSMatrix* out =
+                matrix_at(down_out, down_out_offset + group * h * f16_size, 1, h);
+            if (lhs == nil || rhs == nil || out == nil) {
+                return 1237;
+            }
+            [down_gemm encodeToCommandBuffer:command_buffer leftMatrix:lhs rightMatrix:rhs resultMatrix:out];
+        }
+
+        id<MTLComputeCommandEncoder> finalize_encoder = [command_buffer computeCommandEncoder];
+        if (finalize_encoder == nil) {
+            return 1238;
+        }
+        [finalize_encoder setComputePipelineState:pipelines.expert_mps_finalize];
+        [finalize_encoder setBuffer:workspace offset:workspace_offset atIndex:0];
+        [finalize_encoder setBuffer:input_hidden offset:input_hidden_offset atIndex:1];
+        [finalize_encoder setBuffer:down_out offset:down_out_offset atIndex:2];
+        [finalize_encoder setBuffer:output offset:output_offset atIndex:3];
+        [finalize_encoder setBytes:&params length:sizeof(params) atIndex:4];
+        [finalize_encoder dispatchThreads:MTLSizeMake(h, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [finalize_encoder endEncoding];
+
+        auto start = MetalClock::now();
+        if (wait_for_completion != 0) {
+            const double elapsed_ms = wait_command_buffer_ms(command_buffer, start);
+            if (elapsed_ms <= 0.0 || !std::isfinite(elapsed_ms)) {
+                return 1239;
+            }
+            record_command_buffer_gpu_profile(command_buffer, "qwen36_ffn_int4_expert_mps_bridge_f16");
+            return 0;
+        }
+        [command_buffer commit];
+        return 0;
     }
 }
 

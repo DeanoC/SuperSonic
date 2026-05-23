@@ -473,8 +473,14 @@ The full `bench-perf` attribution lane writes this as `mps_expert_pilot` in
 schema-v4 JSON; the latest M5 Max run measured `150.6 ms/token` median with
 `ffn_ms_avg=96.761`, `linear_attn_ms_avg=54.181`, and a resident-MPS pilot of
 `gate_up_ms=0.619`, `down_ms=0.433`.
-The next FFN target is therefore an MPS-backed INT4-to-FP16 expert bridge or a
-route-aware residency plan that avoids per-token CPU slab packing.
+`SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_MPS_BRIDGE=1` enables the first
+real bridge experiment: active GPTQ experts are transposed/dequantized to FP16
+MPS buffers, MPS runs gate/up and down, and a small Metal finalizer writes the
+decode output. It still generated `[11]`, but it is not promotable yet: a warm
+one-token profile measured `1707.3 ms/token`, with `1365.389 ms` in CPU
+INT4-to-FP16 packing and only `34.032 ms` in bridge command-buffer GPU time.
+The next FFN target is therefore persistent active-expert FP16 residency or a
+GPU-side INT4-to-FP16 transcode that avoids per-token CPU slab packing.
 
 ### Metal validation
 

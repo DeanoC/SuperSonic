@@ -1047,10 +1047,20 @@ full `bench-perf` attribution run, the same resident-shape pilot measured
 `gate_up_ms=0.619` and `down_ms=0.433`; the default INT4 host expert path
 reported `qwen36_ffn_host_expert_gate_up=963.798 ms` and
 `qwen36_ffn_host_expert_down=508.565 ms` across the profiled prefill+decode
-calls. That makes the next runtime experiment concrete: build an
-INT4-to-FP16 active-expert bridge for MPS, then compare its conversion/packing
-cost against the existing CPU slab pack and host matvec totals before replacing
-any default FFN path.
+calls.
+
+The first real MPS bridge is opt-in behind
+`SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_MPS_BRIDGE=1`. It uses the real
+active GPTQ experts, transposes/dequantizes those slabs to FP16 MPS layout on
+the CPU, runs MPSMatrix gate/up and down, applies SiLU and residual/shared
+finalization on Metal, and writes the decode output. A warm one-token M5 Max
+smoke still generated `[11]`, but measured `1707.3 ms/token` with
+`ffn_ms_avg=1502.344`. Profile attribution named the blocker:
+`qwen36_ffn_int4_expert_mps_bridge_pack_f16=1365.389 ms` across 40 layers,
+while `command_buffer_gpu:qwen36_ffn_int4_expert_mps_bridge_f16=34.032 ms`.
+That rules out per-token CPU INT4-to-FP16 slab conversion. The next FFN
+experiment should keep active FP16 experts resident across route reuse, or move
+the INT4-to-FP16 transcode onto the GPU before MPS consumes the matrices.
 
 Unsupported Metal constraints remain explicit for this target: persistent
 decode, KV-FP8, speculative decode, batching, and Metal VMM are not benchmarked
