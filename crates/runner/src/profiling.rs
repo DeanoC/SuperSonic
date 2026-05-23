@@ -15,6 +15,7 @@ impl MetalProfileScope {
             kernel_ffi::prefill_ffi::metal_profile_reset();
             gpu_hal::hal_profile_reset();
             kernel_ffi::qwen36_moe::qwen36_route_profile_reset();
+            kernel_ffi::qwen36_moe::qwen36_packed_expert_cache_profile_reset();
         }
         Self { active }
     }
@@ -107,6 +108,37 @@ impl Drop for MetalProfileScope {
                     sim.coverage(),
                 );
             }
+        }
+        let pack_cache = kernel_ffi::qwen36_moe::qwen36_packed_expert_cache_profile_snapshot();
+        if pack_cache.calls > 0 || pack_cache.entries > 0 {
+            eprintln!();
+            eprintln!("=== Qwen3.6 packed expert cache profile ===");
+            eprintln!(
+                "calls={} entries={} exact_hits={} route_refills={} allocations={} copied_bytes={} exact_hit_rate={:.2}% avg_groups={:.2} max_groups={} avg_copy_bytes={:.0}",
+                pack_cache.calls,
+                pack_cache.entries,
+                pack_cache.exact_hits,
+                pack_cache.route_refills,
+                pack_cache.allocations,
+                pack_cache.copied_bytes,
+                pack_cache.exact_hit_rate() * 100.0,
+                pack_cache.avg_active_groups(),
+                pack_cache.max_active_groups,
+                pack_cache.avg_copied_bytes(),
+            );
+            eprintln!(
+                "[qwen36-pack-cache] calls={} entries={} exact_hits={} route_refills={} allocations={} copied_bytes={} exact_hit_rate={:.6} avg_active_groups={:.6} max_active_groups={} avg_copy_bytes={:.3}",
+                pack_cache.calls,
+                pack_cache.entries,
+                pack_cache.exact_hits,
+                pack_cache.route_refills,
+                pack_cache.allocations,
+                pack_cache.copied_bytes,
+                pack_cache.exact_hit_rate(),
+                pack_cache.avg_active_groups(),
+                pack_cache.max_active_groups,
+                pack_cache.avg_copied_bytes(),
+            );
         }
         eprintln!();
         eprintln!("=== HAL op profile (gpu_hal level) ===");

@@ -32,6 +32,9 @@ const QWEN36_ROUTE_PROFILE_DEFAULT_MAX_CALLS: usize = 16_384;
 const QWEN36_ROUTE_PROFILE_CACHE_CAPS: [usize; 4] = [2, 4, 8, 16];
 
 static QWEN36_ROUTE_PROFILE: OnceLock<Mutex<Qwen36RouteProfileAccumulator>> = OnceLock::new();
+static QWEN36_PACKED_EXPERT_CACHE_PROFILE: OnceLock<
+    Mutex<Qwen36PackedExpertCacheProfileAccumulator>,
+> = OnceLock::new();
 
 #[derive(Debug, Clone, Default)]
 struct Qwen36RouteProfileAccumulator {
@@ -97,6 +100,56 @@ impl Qwen36RouteTopNSim {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+struct Qwen36PackedExpertCacheProfileAccumulator {
+    calls: u64,
+    exact_hits: u64,
+    route_refills: u64,
+    allocations: u64,
+    copied_bytes: u64,
+    active_groups_total: u64,
+    max_active_groups: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Qwen36PackedExpertCacheProfileSnapshot {
+    pub calls: u64,
+    pub exact_hits: u64,
+    pub route_refills: u64,
+    pub allocations: u64,
+    pub copied_bytes: u64,
+    pub active_groups_total: u64,
+    pub max_active_groups: usize,
+    pub entries: usize,
+}
+
+impl Qwen36PackedExpertCacheProfileSnapshot {
+    pub fn exact_hit_rate(&self) -> f64 {
+        if self.calls == 0 {
+            0.0
+        } else {
+            self.exact_hits as f64 / self.calls as f64
+        }
+    }
+
+    pub fn avg_active_groups(&self) -> f64 {
+        if self.calls == 0 {
+            0.0
+        } else {
+            self.active_groups_total as f64 / self.calls as f64
+        }
+    }
+
+    pub fn avg_copied_bytes(&self) -> f64 {
+        let copy_ops = self.route_refills + self.allocations;
+        if copy_ops == 0 {
+            0.0
+        } else {
+            self.copied_bytes as f64 / copy_ops as f64
+        }
+    }
+}
+
 pub fn qwen36_route_profile_reset() {
     if let Some(profile) = QWEN36_ROUTE_PROFILE.get() {
         let mut profile = profile.lock().expect("qwen36 route profile mutex poisoned");
@@ -117,9 +170,79 @@ pub fn qwen36_route_profile_snapshot() -> Qwen36RouteProfileSnapshot {
     )
 }
 
+pub fn qwen36_packed_expert_cache_profile_reset() {
+    if let Some(profile) = QWEN36_PACKED_EXPERT_CACHE_PROFILE.get() {
+        *profile
+            .lock()
+            .expect("qwen36 packed expert cache profile mutex poisoned") =
+            Qwen36PackedExpertCacheProfileAccumulator::default();
+    }
+}
+
+pub fn qwen36_packed_expert_cache_profile_snapshot() -> Qwen36PackedExpertCacheProfileSnapshot {
+    let entries = QWEN36_PACKED_EXPERT_CACHE
+        .get()
+        .and_then(|cache| cache.lock().ok().map(|cache| cache.len()))
+        .unwrap_or(0);
+    let Some(profile) = QWEN36_PACKED_EXPERT_CACHE_PROFILE.get() else {
+        return Qwen36PackedExpertCacheProfileSnapshot {
+            entries,
+            ..Qwen36PackedExpertCacheProfileSnapshot::default()
+        };
+    };
+    let profile = profile
+        .lock()
+        .expect("qwen36 packed expert cache profile mutex poisoned");
+    Qwen36PackedExpertCacheProfileSnapshot {
+        calls: profile.calls,
+        exact_hits: profile.exact_hits,
+        route_refills: profile.route_refills,
+        allocations: profile.allocations,
+        copied_bytes: profile.copied_bytes,
+        active_groups_total: profile.active_groups_total,
+        max_active_groups: profile.max_active_groups,
+        entries,
+    }
+}
+
 fn qwen36_route_profile_enabled() -> bool {
     crate::prefill_ffi::metal_profile_enabled()
         || std::env::var_os("SUPERSONIC_QWEN36_ROUTE_PROFILE").is_some()
+}
+
+fn qwen36_packed_expert_cache_profile_enabled() -> bool {
+    crate::prefill_ffi::metal_profile_enabled()
+        || std::env::var_os("SUPERSONIC_QWEN36_PACK_CACHE_PROFILE").is_some()
+}
+
+fn qwen36_packed_expert_cache_profile_record(
+    exact_hit: bool,
+    route_refill: bool,
+    allocation: bool,
+    active_groups: usize,
+    copied_bytes: usize,
+) {
+    if !qwen36_packed_expert_cache_profile_enabled() {
+        return;
+    }
+    let profile = QWEN36_PACKED_EXPERT_CACHE_PROFILE
+        .get_or_init(|| Mutex::new(Qwen36PackedExpertCacheProfileAccumulator::default()));
+    let mut profile = profile
+        .lock()
+        .expect("qwen36 packed expert cache profile mutex poisoned");
+    profile.calls += 1;
+    profile.active_groups_total += active_groups as u64;
+    profile.max_active_groups = profile.max_active_groups.max(active_groups);
+    if exact_hit {
+        profile.exact_hits += 1;
+    }
+    if route_refill {
+        profile.route_refills += 1;
+    }
+    if allocation {
+        profile.allocations += 1;
+    }
+    profile.copied_bytes += copied_bytes as u64;
 }
 
 fn qwen36_route_profile_layers() -> usize {
@@ -3121,6 +3244,34 @@ fn qwen36_alloc_packed_experts_for_metal(
     })
 }
 
+fn qwen36_packed_expert_copy_bytes(
+    hidden: usize,
+    moe_intermediate: usize,
+    active_groups: usize,
+    group_size: usize,
+) -> usize {
+    let gate_up_rows = 2 * moe_intermediate;
+    let gate_up_byte_cols = hidden / 2;
+    let gate_up_bytes_per_expert = gate_up_rows * gate_up_byte_cols;
+    let gate_up_sidecar_rows = gate_up_rows / group_size;
+    let gate_up_sidecar_cols = hidden / group_size;
+    let gate_up_sidecar_elems_per_expert = gate_up_sidecar_rows * gate_up_sidecar_cols;
+
+    let down_rows = hidden;
+    let down_byte_cols = moe_intermediate / 2;
+    let down_bytes_per_expert = down_rows * down_byte_cols;
+    let down_sidecar_rows = hidden / group_size;
+    let down_sidecar_cols = moe_intermediate / group_size;
+    let down_sidecar_elems_per_expert = down_sidecar_rows * down_sidecar_cols;
+
+    let bf16_bytes = std::mem::size_of::<u16>();
+    active_groups
+        * (gate_up_bytes_per_expert
+            + down_bytes_per_expert
+            + 2 * gate_up_sidecar_elems_per_expert * bf16_bytes
+            + 2 * down_sidecar_elems_per_expert * bf16_bytes)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn qwen36_fill_packed_experts_for_metal(
     hidden: usize,
@@ -3304,6 +3455,12 @@ where
         "qwen36_ffn_int4_expert_pack_stage5",
         "host",
         || -> Result<(), GpuError> {
+            let copy_bytes = qwen36_packed_expert_copy_bytes(
+                hidden,
+                moe_intermediate,
+                active_experts.len(),
+                group_size,
+            );
             if let Some(entry) = cache.get_mut(&key) {
                 if entry.active_experts != active_experts {
                     qwen36_fill_packed_experts_for_metal(
@@ -3321,6 +3478,21 @@ where
                     );
                     entry.active_experts.clear();
                     entry.active_experts.extend_from_slice(active_experts);
+                    qwen36_packed_expert_cache_profile_record(
+                        false,
+                        true,
+                        false,
+                        active_experts.len(),
+                        copy_bytes,
+                    );
+                } else {
+                    qwen36_packed_expert_cache_profile_record(
+                        true,
+                        false,
+                        false,
+                        active_experts.len(),
+                        0,
+                    );
                 }
                 return Ok(());
             }
@@ -3350,6 +3522,13 @@ where
                     active_experts: active_experts.to_vec(),
                     buffers,
                 },
+            );
+            qwen36_packed_expert_cache_profile_record(
+                false,
+                false,
+                true,
+                active_experts.len(),
+                copy_bytes,
             );
             Ok(())
         },
@@ -6337,6 +6516,12 @@ mod tests {
             .expect("cap2 top-n sim");
         assert_eq!(top2.covered, 9);
         assert_eq!(top2.total, 12);
+    }
+
+    #[test]
+    fn qwen36_packed_expert_copy_bytes_matches_stage5_geometry() {
+        let bytes = qwen36_packed_expert_copy_bytes(2048, 512, 8, 128);
+        assert_eq!(bytes, 12_589_056);
     }
 
     fn test_int4_blob(num_experts: usize, rows: usize, cols: usize) -> Vec<u8> {

@@ -1034,10 +1034,22 @@ That rules out a simple per-layer scratch-slab cache as the next promotion
 target. The next FFN work should either keep packed experts resident without
 recopying on route churn, or move the expert matvecs to a Metal Performance
 Shaders / MPP bridge that avoids the CPU slab-pack step entirely.
+Profile runs now also emit `[qwen36-pack-cache]` when the packed cache is
+exercised. A four-token Apple M5 Max profile with the packed expert path and
+pack cache enabled generated `[11, 353, 599, 264]` and measured
+`279.5 ms/token`, `ffn_ms_avg=162.420`, and
+`qwen36_ffn_int4_expert_pack_stage5=384.124 ms` across 160 layer calls. The
+cache profile reported `calls=160`, `entries=40`, `exact_hits=0`,
+`route_refills=120`, `allocations=40`, and `copied_bytes=2014248960`, with
+`avg_copy_bytes=12589056` per refill/allocation. That confirms the scratch cache
+is saving allocation churn but not slab-copy churn: every post-allocation layer
+call saw a different active-expert set. The next packed-path experiment needs a
+larger resident hot set or a different addressing scheme; an exact-route
+per-layer cache is not worth promoting.
 
 The first MPS bridge step is now an attribution probe, not a decode path. With
 `SUPERSONIC_METAL_QWEN36_MPS_EXPERT_PILOT=1`, the runner appends a
-`[qwen36-moe mps-expert-pilot]` row and bench perf JSON schema v4 records it as
+`[qwen36-moe mps-expert-pilot]` row and bench perf JSON schema v5 records it as
 `mps_expert_pilot`. This probe uses resident FP16 MPSMatrix inputs shaped like
 the active-expert gate/up and down GEMVs; it does not consume the GPTQ INT4
 expert tensors. On a one-token M5 Max smoke, the model still generated `[11]`

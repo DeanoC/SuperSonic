@@ -384,6 +384,7 @@ pub fn run_matrix(cfg: &MatrixConfig, rd: &RunDir) -> Result<()> {
                     lifecycle_timings: None,
                     mpp_pilot: None,
                     mps_expert_pilot: None,
+                    qwen36_pack_cache: None,
                     metal_profile: None,
                     hal_profile: None,
                     gpu_temp_c_end: None,
