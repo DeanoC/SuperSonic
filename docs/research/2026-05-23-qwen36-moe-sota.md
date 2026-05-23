@@ -381,6 +381,19 @@ under the same smoke:
    `[271]` sanity row. `SUPERSONIC_METAL_PROFILE=1` keeps the waited path so
    phase attribution remains comparable.
 
+   The sixth slice tests the obvious full-attention layout shortcuts and keeps
+   only the neutral scratch reuse on by default. Full-attention prefill now
+   reuses Q/K-after-norm and KV-prefix scratch buffers across layers instead
+   of allocating them inside every full-attention layer call. Two Metal layout
+   probes remain env-gated negative results: a time-major KV attention kernel
+   (`SUPERSONIC_QWEN36_MOE_METAL_FULL_ATTN_TMAJOR=1`) measured 11.09s prefill,
+   and a single-kernel Q/gate split
+   (`SUPERSONIC_QWEN36_MOE_METAL_SPLIT_QGATE=1`) measured 11.00s prefill.
+   The default path with both probes off measured 10.73s prefill and preserved
+   the `[271]` sanity row, so neither layout probe is promoted. The next useful
+   target is routed expert compute/residency rather than more launch-only
+   full-attention reshuffling.
+
 3. **Static top-N resident MPS table probe**
    Use route profiles to choose top-N experts per layer, materialize FP16 MPS
    RHS once, fall back on misses, and measure real prompts.

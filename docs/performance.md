@@ -945,6 +945,18 @@ prefill and 191.99 ms/token with `[271]`; the direct-row batch measured 10.89s
 prefill and 179.14 ms/token with the same generated ID. The next measured
 targets remain full-attention prefill and routed-expert direct compute, while a
 proper batched linear-attention kernel would be the larger follow-up.
+
+The full-attention follow-up keeps only allocation reuse on by default. The
+batched prefill path now reuses Q-after-norm, K-after-norm, and KV-prefix
+scratch buffers instead of allocating them inside every full-attention layer.
+Two apparent layout fixes were measured but left opt-in because they did not
+beat the default path on the 512-token Metal smoke: direct time-major KV
+attention via `SUPERSONIC_QWEN36_MOE_METAL_FULL_ATTN_TMAJOR=1` measured 11.09s
+prefill, and native Q/gate splitting via
+`SUPERSONIC_QWEN36_MOE_METAL_SPLIT_QGATE=1` measured 11.00s prefill. With both
+probes disabled, the default path measured 10.73s prefill and generated the
+same `[271]` sanity row. The measured next bottleneck remains routed expert
+compute/residency, not these full-attention layout probes.
 `tests/metal/audit_qwen36_mtp.py` is the speculative-decode readiness audit. It
 checks the source snapshot for the split MTP expert tensors and the INT4 bake
 for the 19 folded `mtp.*` tensors loaded by the runtime. On this local M5 Max

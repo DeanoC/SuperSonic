@@ -4133,6 +4133,133 @@ kernel void supersonic_full_attention_prefill_bf16_f32(
     return pipeline;
 }
 
+id<MTLComputePipelineState> full_attention_tmajor_pipeline_bf16_f32(NSError** error_out) {
+    static std::mutex mutex;
+    static bool attempted = false;
+    static __strong id<MTLComputePipelineState> pipeline = nil;
+    static __strong NSError* build_error = nil;
+
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!attempted) {
+        attempted = true;
+        @autoreleasepool {
+            id<MTLDevice> device = metal_device();
+            if (device == nil) {
+                build_error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                                   code:11
+                                               userInfo:@{NSLocalizedDescriptionKey : @"No Metal device"}];
+            } else {
+                static const char* kSource = R"FATTNTMAJOR(
+#include <metal_stdlib>
+using namespace metal;
+
+struct FullAttentionParams {
+    uint q_heads;
+    uint kv_heads;
+    uint q_len;
+    uint kv_len;
+    uint kv_stride;
+    uint head_dim;
+    uint seqlen_offset;
+    float scale;
+};
+
+kernel void supersonic_full_attention_prefill_tmajor_bf16_f32(
+    device const bfloat* query [[buffer(0)]],
+    device const bfloat* key [[buffer(1)]],
+    device const bfloat* value [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    constant FullAttentionParams& params [[buffer(4)]],
+    uint3 gid [[thread_position_in_grid]]
+) {
+    uint d = gid.x;
+    uint q_head = gid.y;
+    uint q_pos = gid.z;
+    if (q_head >= params.q_heads || q_pos >= params.q_len || d >= params.head_dim) {
+        return;
+    }
+
+    uint num_kv_groups = params.q_heads / params.kv_heads;
+    uint kv_head = q_head / num_kv_groups;
+    uint max_attend = min(params.seqlen_offset + q_pos + 1, params.kv_len);
+    uint query_base = (q_pos * params.q_heads + q_head) * params.head_dim;
+
+    float max_score = -INFINITY;
+    for (uint kv_pos = 0; kv_pos < max_attend; ++kv_pos) {
+        uint key_base = (kv_pos * params.kv_heads + kv_head) * params.head_dim;
+        float dot = 0.0f;
+        for (uint kk = 0; kk < params.head_dim; ++kk) {
+            dot += float(query[query_base + kk]) * float(key[key_base + kk]);
+        }
+        float score = dot * params.scale;
+        max_score = max(max_score, score);
+    }
+
+    float denom = 0.0f;
+    float numer = 0.0f;
+    for (uint kv_pos = 0; kv_pos < max_attend; ++kv_pos) {
+        uint key_base = (kv_pos * params.kv_heads + kv_head) * params.head_dim;
+        float dot = 0.0f;
+        for (uint kk = 0; kk < params.head_dim; ++kk) {
+            dot += float(query[query_base + kk]) * float(key[key_base + kk]);
+        }
+        float weight = exp((dot * params.scale) - max_score);
+        denom += weight;
+        uint value_base = (kv_pos * params.kv_heads + kv_head) * params.head_dim;
+        numer += weight * float(value[value_base + d]);
+    }
+
+    out[(q_pos * params.q_heads + q_head) * params.head_dim + d] = numer / denom;
+}
+)FATTNTMAJOR";
+                NSString* source = [NSString stringWithUTF8String:kSource];
+                MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+                configure_precise_math(options);
+                NSError* library_error = nil;
+                id<MTLLibrary> library = [device newLibraryWithSource:source
+                                                              options:options
+                                                                error:&library_error];
+                if (library == nil || library_error != nil) {
+                    build_error = library_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                       code:212
+                                                                   userInfo:@{
+                                                                       NSLocalizedDescriptionKey :
+                                                                           @"Failed to compile time-major full-attention library"
+                                                                   }];
+                } else {
+                    id<MTLFunction> function =
+                        [library newFunctionWithName:@"supersonic_full_attention_prefill_tmajor_bf16_f32"];
+                    if (function == nil) {
+                        build_error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                                           code:213
+                                                       userInfo:@{
+                                                           NSLocalizedDescriptionKey :
+                                                               @"Failed to load time-major full-attention function"
+                                                       }];
+                    } else {
+                        NSError* pipeline_error = nil;
+                        pipeline = [device newComputePipelineStateWithFunction:function
+                                                                         error:&pipeline_error];
+                        if (pipeline == nil || pipeline_error != nil) {
+                            build_error = pipeline_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                                 code:214
+                                                                             userInfo:@{
+                                                                                 NSLocalizedDescriptionKey :
+                                                                                     @"Failed to create time-major full-attention pipeline"
+                                                                             }];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (pipeline == nil && error_out != nullptr) {
+        *error_out = build_error;
+    }
+    return pipeline;
+}
+
 id<MTLComputePipelineState> full_attention_decode_pipeline_bf16_f32(NSError** error_out) {
     static std::mutex mutex;
     static bool attempted = false;
@@ -13903,6 +14030,80 @@ extern "C" int supersonic_metal_full_attention_prefill_bf16_f32(
             MTLSize threads_per_grid = MTLSizeMake(head_dim, q_len, q_heads);
             [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
         }, 27, 28, 29, 30);
+    }
+}
+
+extern "C" int supersonic_metal_full_attention_prefill_tmajor_bf16_f32(
+    size_t q_heads,
+    size_t kv_heads,
+    size_t q_len,
+    size_t kv_len,
+    size_t head_dim,
+    float scale,
+    size_t seqlen_offset,
+    const void* query_ptr,
+    const void* key_ptr,
+    const void* value_ptr,
+    void* out_ptr
+) {
+    @autoreleasepool {
+        if (q_heads == 0 || kv_heads == 0 || q_len == 0 || kv_len == 0 || head_dim == 0 ||
+            query_ptr == nullptr || key_ptr == nullptr || value_ptr == nullptr || out_ptr == nullptr ||
+            (q_heads % kv_heads) != 0) {
+            return 211;
+        }
+
+        NSError* pipeline_error = nil;
+        id<MTLComputePipelineState> pipeline = full_attention_tmajor_pipeline_bf16_f32(&pipeline_error);
+        if (pipeline == nil) {
+            return 212;
+        }
+
+        id<MTLBuffer> query = nil;
+        id<MTLBuffer> key = nil;
+        id<MTLBuffer> value = nil;
+        id<MTLBuffer> out = nil;
+        size_t query_offset = 0;
+        size_t key_offset = 0;
+        size_t value_offset = 0;
+        size_t out_offset = 0;
+        if (lookup_buffer(query_ptr, &query, &query_offset) != 0) {
+            return 213;
+        }
+        if (lookup_buffer(key_ptr, &key, &key_offset) != 0) {
+            return 214;
+        }
+        if (lookup_buffer(value_ptr, &value, &value_offset) != 0) {
+            return 215;
+        }
+        if (lookup_buffer(out_ptr, &out, &out_offset) != 0) {
+            return 216;
+        }
+
+        FullAttentionParams params = {
+            static_cast<uint32_t>(q_heads),
+            static_cast<uint32_t>(kv_heads),
+            static_cast<uint32_t>(q_len),
+            static_cast<uint32_t>(kv_len),
+            static_cast<uint32_t>(kv_len),
+            static_cast<uint32_t>(head_dim),
+            static_cast<uint32_t>(seqlen_offset),
+            scale,
+        };
+
+        return encode_or_submit([&](id<MTLComputeCommandEncoder> encoder) {
+            [encoder setComputePipelineState:pipeline];
+            [encoder setBuffer:query offset:query_offset atIndex:0];
+            [encoder setBuffer:key offset:key_offset atIndex:1];
+            [encoder setBuffer:value offset:value_offset atIndex:2];
+            [encoder setBuffer:out offset:out_offset atIndex:3];
+            [encoder setBytes:&params length:sizeof(params) atIndex:4];
+
+            NSUInteger tg_width = std::min<NSUInteger>(16, std::max<NSUInteger>(1, head_dim));
+            MTLSize threads_per_group = MTLSizeMake(tg_width, 1, 1);
+            MTLSize threads_per_grid = MTLSizeMake(head_dim, q_heads, q_len);
+            [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
+        }, 217, 218, 219, 220);
     }
 }
 

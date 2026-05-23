@@ -154,14 +154,24 @@ struct FullAttnBatchScratch {
     qg_raw: GpuBuffer,
     /// `[N, H, hd]` BF16. q values extracted from qg_raw.
     q: GpuBuffer,
+    /// `[N, H, hd]` BF16. q after per-head RMSNorm and RoPE.
+    q_after: GpuBuffer,
     /// `[N, H, hd]` BF16. gate values extracted from qg_raw.
     gate: GpuBuffer,
     /// `[N, Hkv*hd]` BF16. k_proj output (also q_norm input view as `[N*Hkv, hd]`).
     k: GpuBuffer,
+    /// `[N, Hkv, hd]` BF16. k after per-head RMSNorm and RoPE.
+    k_after: GpuBuffer,
     /// `[N, Hkv*hd]` BF16. v_proj output.
     v: GpuBuffer,
     /// `[H, N, hd]` BF16. q transposed for M3 input.
     q_thsd: GpuBuffer,
+    /// `[kv_max_t, Hkv, hd]` BF16. Temporary time-major K prefix for the
+    /// legacy Metal full-attention layout path.
+    kv_prefix_k: GpuBuffer,
+    /// `[kv_max_t, Hkv, hd]` BF16. Temporary time-major V prefix for the
+    /// legacy Metal full-attention layout path.
+    kv_prefix_v: GpuBuffer,
     /// `[Hkv, kv_max_t, hd]` BF16. K cache transposed for M3 input.
     /// (Allocated but currently unused — the live path mallocs a per-call
     /// `[hkv, kv_len, hd]` since `kv_len` varies per chunk; this slot is
@@ -202,12 +212,20 @@ impl FullAttnBatchScratch {
         let qg_raw =
             GpuBuffer::zeros(ordinal, ScalarType::BF16, &[n, q_dim]).context("alloc qg_raw")?;
         let q = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[n, h, hd]).context("alloc q")?;
+        let q_after = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[n, h, hd])
+            .context("alloc q_after_norm")?;
         let gate =
             GpuBuffer::zeros(ordinal, ScalarType::BF16, &[n, h, hd]).context("alloc gate")?;
         let k = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[n, kv_dim]).context("alloc k")?;
+        let k_after = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[n, hkv, hd])
+            .context("alloc k_after_norm")?;
         let v = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[n, kv_dim]).context("alloc v")?;
         let q_thsd =
             GpuBuffer::zeros(ordinal, ScalarType::BF16, &[h, n, hd]).context("alloc q_thsd")?;
+        let kv_prefix_k = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[kv_max_t.max(1), hkv, hd])
+            .context("alloc kv_prefix_k")?;
+        let kv_prefix_v = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[kv_max_t.max(1), hkv, hd])
+            .context("alloc kv_prefix_v")?;
         let k_thsd = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[hkv, kv_max_t.max(1), hd])
             .context("alloc k_thsd")?;
         let v_thsd = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[hkv, kv_max_t.max(1), hd])
@@ -227,10 +245,14 @@ impl FullAttnBatchScratch {
             x_norm,
             qg_raw,
             q,
+            q_after,
             gate,
             k,
+            k_after,
             v,
             q_thsd,
+            kv_prefix_k,
+            kv_prefix_v,
             k_thsd,
             v_thsd,
             attn_out_f32,
@@ -966,29 +988,41 @@ fn process_full_attn_layer_batched(
 
     // 3. Split q+gate. qg_raw layout per row: [h0_q[hd], h0_gate[hd],
     //    h1_q[hd], h1_gate[hd], ...] — interleaved per-head halves.
-    //    Extract into contiguous q[N,H,hd] and gate[N,H,hd] via per-head
-    //    d2d copies. (No batched primitive for this strided copy yet.)
-    let row_bytes = hd * 2;
-    for nn in 0..n {
-        for hh in 0..h {
-            let qg_row_off = (nn * q_dim + hh * 2 * hd) * 2;
-            let q_off = (nn * h * hd + hh * hd) * 2;
-            let gate_off = q_off; // same layout in `gate`
-                                  // q half
-            let src_q = scratch.qg_raw.offset_ptr(qg_row_off);
-            let dst_q = unsafe { (scratch.q.as_mut_ptr() as *mut u8).add(q_off) as *mut c_void };
-            gpu_hal::copy_d2d(ordinal, dst_q, src_q, row_bytes).context("split q")?;
-            // gate half
-            let src_g = scratch.qg_raw.offset_ptr(qg_row_off + hd * 2);
-            let dst_g =
-                unsafe { (scratch.gate.as_mut_ptr() as *mut u8).add(gate_off) as *mut c_void };
-            gpu_hal::copy_d2d(ordinal, dst_g, src_g, row_bytes).context("split gate")?;
+    let use_metal_split_qgate = chunk_hidden.backend() == Backend::Metal
+        && std::env::var("SUPERSONIC_QWEN36_MOE_METAL_SPLIT_QGATE")
+            .map(|v| v != "0")
+            .unwrap_or(false);
+    if use_metal_split_qgate {
+        prefill_ffi::split_qgate(
+            ordinal,
+            ScalarType::BF16,
+            n,
+            h,
+            hd,
+            &scratch.qg_raw,
+            &mut scratch.q,
+            &mut scratch.gate,
+        )
+        .map_err(|e| anyhow!("split qgate: {e}"))?;
+    } else {
+        let row_bytes = hd * 2;
+        for nn in 0..n {
+            for hh in 0..h {
+                let qg_row_off = (nn * q_dim + hh * 2 * hd) * 2;
+                let q_off = (nn * h * hd + hh * hd) * 2;
+                let src_q = scratch.qg_raw.offset_ptr(qg_row_off);
+                let dst_q =
+                    unsafe { (scratch.q.as_mut_ptr() as *mut u8).add(q_off) as *mut c_void };
+                gpu_hal::copy_d2d(ordinal, dst_q, src_q, row_bytes).context("split q")?;
+                let src_g = scratch.qg_raw.offset_ptr(qg_row_off + hd * 2);
+                let dst_g =
+                    unsafe { (scratch.gate.as_mut_ptr() as *mut u8).add(q_off) as *mut c_void };
+                gpu_hal::copy_d2d(ordinal, dst_g, src_g, row_bytes).context("split gate")?;
+            }
         }
     }
 
     // 4. Per-head q_norm + k_norm (RMSnorm on rows of head_dim).
-    let mut q_after =
-        GpuBuffer::zeros(ordinal, ScalarType::BF16, &[n * h, hd]).context("alloc q_after_norm")?;
     prefill_ffi::rms_norm_rows(
         ordinal,
         ScalarType::BF16,
@@ -997,11 +1031,9 @@ fn process_full_attn_layer_batched(
         geom.rms_norm_eps,
         &scratch.q,
         q_norm_w,
-        &mut q_after,
+        &mut scratch.q_after,
     )
     .map_err(|e| anyhow!("rms_norm_rows q: {e}"))?;
-    let mut k_after = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[n * hkv, hd])
-        .context("alloc k_after_norm")?;
     prefill_ffi::rms_norm_rows(
         ordinal,
         ScalarType::BF16,
@@ -1010,7 +1042,7 @@ fn process_full_attn_layer_batched(
         geom.rms_norm_eps,
         &scratch.k,
         k_norm_w,
-        &mut k_after,
+        &mut scratch.k_after,
     )
     .map_err(|e| anyhow!("rms_norm_rows k: {e}"))?;
 
@@ -1028,7 +1060,7 @@ fn process_full_attn_layer_batched(
             &rotary.cos,
             &rotary.sin,
             pos_ids,
-            &mut q_after,
+            &mut scratch.q_after,
         )
         .map_err(|e| anyhow!("rope q indirect: {e}"))?;
         prefill_ffi::apply_rope_prefill_indirect(
@@ -1041,7 +1073,7 @@ fn process_full_attn_layer_batched(
             &rotary.cos,
             &rotary.sin,
             pos_ids,
-            &mut k_after,
+            &mut scratch.k_after,
         )
         .map_err(|e| anyhow!("rope k indirect: {e}"))?;
     } else {
@@ -1055,7 +1087,7 @@ fn process_full_attn_layer_batched(
             &rotary.cos,
             &rotary.sin,
             past_len,
-            &mut q_after,
+            &mut scratch.q_after,
         )
         .map_err(|e| anyhow!("rope q: {e}"))?;
         prefill_ffi::apply_rope_prefill(
@@ -1068,7 +1100,7 @@ fn process_full_attn_layer_batched(
             &rotary.cos,
             &rotary.sin,
             past_len,
-            &mut k_after,
+            &mut scratch.k_after,
         )
         .map_err(|e| anyhow!("rope k: {e}"))?;
     }
@@ -1084,99 +1116,123 @@ fn process_full_attn_layer_batched(
     unsafe {
         let dst_k = (cache_k_ptr as *mut u8).add(cache_byte_off) as *mut c_void;
         let dst_v = (cache_v_ptr as *mut u8).add(cache_byte_off) as *mut c_void;
-        gpu_hal::copy_d2d(ordinal, dst_k, k_after.as_ptr(), copy_bytes)
+        gpu_hal::copy_d2d(ordinal, dst_k, scratch.k_after.as_ptr(), copy_bytes)
             .context("kv cache K write")?;
         gpu_hal::copy_d2d(ordinal, dst_v, scratch.v.as_ptr(), copy_bytes)
             .context("kv cache V write")?;
     }
 
-    // 7. Transpose q [n, h, hd] -> [h, n, hd] for M3 input.
-    prefill_ffi::transpose_shd_hsd(
-        ordinal,
-        ScalarType::BF16,
-        n,
-        h,
-        hd,
-        &q_after,
-        &mut scratch.q_thsd,
-    )
-    .map_err(|e| anyhow!("transpose q s,h,d -> h,s,d: {e}"))?;
-
-    //    Transpose KV cache prefix [past_len + n, hkv, hd] -> [hkv, past_len + n, hd].
     let kv_len = past_len + n;
-    // We need to wrap the cache as a GpuBuffer view to call transpose. Do
-    // a direct D2D into a re-shaped temporary. The transpose primitive
-    // takes a `&GpuBuffer` so we materialize a temp view by allocating
-    // and copying — wasteful but correct. (If profiling shows this as a
-    // hotspot, add a raw-pointer transpose variant.)
-    let mut kv_prefix_k = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[kv_len, hkv, hd])
-        .context("alloc kv_prefix_k")?;
-    let mut kv_prefix_v = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[kv_len, hkv, hd])
-        .context("alloc kv_prefix_v")?;
-    let kv_bytes = kv_len * row_kv_bytes;
-    gpu_hal::copy_d2d(ordinal, kv_prefix_k.as_mut_ptr(), cache_k_ptr, kv_bytes)
+    let use_metal_tmajor_full_attn = chunk_hidden.backend() == Backend::Metal
+        && std::env::var("SUPERSONIC_QWEN36_MOE_METAL_FULL_ATTN_TMAJOR")
+            .map(|v| v != "0")
+            .unwrap_or(false);
+
+    if use_metal_tmajor_full_attn {
+        // 7. Metal-only fast layout path. The native kernel reads the
+        // persistent time-major KV cache `[T,Hkv,D]` directly and writes
+        // `[N,H,D]` F32 output, avoiding the old prefix copy plus K/V/Q/output
+        // transpose chain for every full-attention layer.
+        unsafe {
+            prefill_ffi::metal_full_attention_prefill_tmajor_bf16_f32(
+                h,
+                hkv,
+                n,
+                kv_len,
+                hd,
+                scale,
+                past_len,
+                &scratch.q_after,
+                cache_k_ptr as *const c_void,
+                cache_v_ptr as *const c_void,
+                &mut scratch.attn_out_nhd_f32,
+            )
+        }
+        .map_err(|e| anyhow!("metal full_attention_prefill_tmajor: {e}"))?;
+    } else {
+        // 7. Legacy layout path: transpose q [n, h, hd] -> [h, n, hd] and
+        // materialize a compact head-major KV prefix for M3 input.
+        prefill_ffi::transpose_shd_hsd(
+            ordinal,
+            ScalarType::BF16,
+            n,
+            h,
+            hd,
+            &scratch.q_after,
+            &mut scratch.q_thsd,
+        )
+        .map_err(|e| anyhow!("transpose q s,h,d -> h,s,d: {e}"))?;
+
+        let kv_bytes = kv_len * row_kv_bytes;
+        gpu_hal::copy_d2d(
+            ordinal,
+            scratch.kv_prefix_k.as_mut_ptr(),
+            cache_k_ptr,
+            kv_bytes,
+        )
         .context("kv prefix copy K")?;
-    gpu_hal::copy_d2d(ordinal, kv_prefix_v.as_mut_ptr(), cache_v_ptr, kv_bytes)
+        gpu_hal::copy_d2d(
+            ordinal,
+            scratch.kv_prefix_v.as_mut_ptr(),
+            cache_v_ptr,
+            kv_bytes,
+        )
         .context("kv prefix copy V")?;
-    let mut k_thsd_prefix = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[hkv, kv_len, hd])
-        .context("alloc k_thsd_prefix")?;
-    let mut v_thsd_prefix = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[hkv, kv_len, hd])
-        .context("alloc v_thsd_prefix")?;
-    prefill_ffi::transpose_shd_hsd(
-        ordinal,
-        ScalarType::BF16,
-        kv_len,
-        hkv,
-        hd,
-        &kv_prefix_k,
-        &mut k_thsd_prefix,
-    )
-    .map_err(|e| anyhow!("transpose K: {e}"))?;
-    prefill_ffi::transpose_shd_hsd(
-        ordinal,
-        ScalarType::BF16,
-        kv_len,
-        hkv,
-        hd,
-        &kv_prefix_v,
-        &mut v_thsd_prefix,
-    )
-    .map_err(|e| anyhow!("transpose V: {e}"))?;
-    let _ = kv_max_t; // unused after transpose
+        prefill_ffi::transpose_shd_hsd(
+            ordinal,
+            ScalarType::BF16,
+            kv_len,
+            hkv,
+            hd,
+            &scratch.kv_prefix_k,
+            &mut scratch.k_thsd,
+        )
+        .map_err(|e| anyhow!("transpose K: {e}"))?;
+        prefill_ffi::transpose_shd_hsd(
+            ordinal,
+            ScalarType::BF16,
+            kv_len,
+            hkv,
+            hd,
+            &scratch.kv_prefix_v,
+            &mut scratch.v_thsd,
+        )
+        .map_err(|e| anyhow!("transpose V: {e}"))?;
+        let _ = kv_max_t;
 
-    // 8. M3 batched-Q full-attention.
-    batched_prefill_attn_full_launch(
-        ordinal,
-        1, // batch
-        h,
-        hkv,
-        n, // q_len
-        kv_len,
-        hd,
-        scale,
-        past_len, // seqlen_offset
-        &scratch.q_thsd,
-        &k_thsd_prefix,
-        &v_thsd_prefix,
-        &mut scratch.attn_out_f32,
-    )
-    .map_err(|e| anyhow!("batched_prefill_attn_full_launch: {e}"))?;
+        batched_prefill_attn_full_launch(
+            ordinal,
+            1, // batch
+            h,
+            hkv,
+            n, // q_len
+            kv_len,
+            hd,
+            scale,
+            past_len, // seqlen_offset
+            &scratch.q_thsd,
+            &scratch.k_thsd,
+            &scratch.v_thsd,
+            &mut scratch.attn_out_f32,
+        )
+        .map_err(|e| anyhow!("batched_prefill_attn_full_launch: {e}"))?;
 
-    // 9. Transpose attn_out F32 [h, n, hd] -> [n, h, hd]. Do it via
-    //    transpose_shd_hsd with s=h, h=n: it transposes [s, h, d] to
-    //    [h, s, d], so passing s=h, h=n yields the desired [n, h, hd].
-    prefill_ffi::transpose_shd_hsd(
-        ordinal,
-        ScalarType::F32,
-        h, // s
-        n, // h
-        hd,
-        &scratch.attn_out_f32,
-        &mut scratch.attn_out_nhd_f32,
-    )
-    .map_err(|e| anyhow!("transpose attn_out h,n,d -> n,h,d: {e}"))?;
+        // 8. Transpose attn_out F32 [h, n, hd] -> [n, h, hd]. Do it via
+        //    transpose_shd_hsd with s=h, h=n: it transposes [s, h, d] to
+        //    [h, s, d], so passing s=h, h=n yields the desired [n, h, hd].
+        prefill_ffi::transpose_shd_hsd(
+            ordinal,
+            ScalarType::F32,
+            h, // s
+            n, // h
+            hd,
+            &scratch.attn_out_f32,
+            &mut scratch.attn_out_nhd_f32,
+        )
+        .map_err(|e| anyhow!("transpose attn_out h,n,d -> n,h,d: {e}"))?;
+    }
 
-    // 10. Cast F32 -> BF16.
+    // 9. Cast F32 -> BF16.
     prefill_ffi::cast(
         ordinal,
         ScalarType::F32,

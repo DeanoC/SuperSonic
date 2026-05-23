@@ -1510,6 +1510,42 @@ pub fn metal_full_attention_prefill_strided_bf16_f32(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub unsafe fn metal_full_attention_prefill_tmajor_bf16_f32(
+    q_heads: usize,
+    kv_heads: usize,
+    q_len: usize,
+    kv_len: usize,
+    head_dim: usize,
+    scale: f32,
+    seqlen_offset: usize,
+    query: &GpuBuffer,
+    key_ptr: *const c_void,
+    value_ptr: *const c_void,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if out.backend() != Backend::Metal {
+        return Err(GpuError::InvalidArg(
+            "metal_full_attention_prefill_tmajor_bf16_f32 requires a Metal output buffer".into(),
+        ));
+    }
+    metal_profile_time("full_attention_prefill_tmajor", "native", || unsafe {
+        metal_native::full_attention_prefill_tmajor_bf16_f32(
+            q_heads,
+            kv_heads,
+            q_len,
+            kv_len,
+            head_dim,
+            scale,
+            seqlen_offset,
+            query,
+            key_ptr,
+            value_ptr,
+            out,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn metal_full_attention_decode_bf16_f32(
     q_heads: usize,
     kv_heads: usize,

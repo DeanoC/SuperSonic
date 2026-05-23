@@ -521,6 +521,16 @@ writes the final residual directly into the chunk row. With
 512-token smoke measured 13.30s prefill; with the direct-row batch enabled it
 measured 10.89s prefill and the same `[271]` sanity row. Profile runs keep the
 waited per-token path so phase attribution remains readable.
+The next full-attention pass keeps reusable prefill scratch on by default and
+leaves two measured layout shortcuts behind opt-in env gates. Reusing
+Q/K-after-norm and KV-prefix buffers avoids per-layer allocation churn. The
+time-major KV attention probe
+(`SUPERSONIC_QWEN36_MOE_METAL_FULL_ATTN_TMAJOR=1`) measured 11.09s prefill,
+and the native Q/gate split probe
+(`SUPERSONIC_QWEN36_MOE_METAL_SPLIT_QGATE=1`) measured 11.00s prefill, so both
+remain off by default. The default 512-token smoke with the probes off measured
+10.73s prefill and preserved `[271]`; the next target remains routed expert
+compute/residency.
 The MTP audit writes `target/qwen36_mtp_audit.json` and
 `target/qwen36_mtp_audit.md`. It checks the local safetensors index for the
 split source MTP tensors, checks the INT4 bake manifest for the 19 folded
