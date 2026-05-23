@@ -489,7 +489,13 @@ layers while the Metal command-buffer GPU timestamp for the transcode work was
 only `66.239 ms`. That points away from more per-token MPS slab materialization
 and toward either a fully fused routed-expert INT4 path or persistent resident
 expert buffers that avoid rebuilding/consuming large FP16 MPS matrices every
-token.
+token. The CPU fallback also has an opt-in LUT pack experiment via
+`SUPERSONIC_METAL_QWEN36_MPS_BRIDGE_CPU_TRANSCODE_LUT=1`: the pure CPU
+microbench improves scalar packing from `1271.431 ms` to `512.129 ms` for the
+50.4 MB active slab, but the real profiled bridge regressed to
+`3787.1 ms/token` with
+`qwen36_ffn_int4_expert_mps_bridge_pack_f16_lut=3371.748 ms` across 40 layers,
+so it remains an attribution experiment only.
 
 ### Metal validation
 

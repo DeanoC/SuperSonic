@@ -1067,9 +1067,17 @@ slightly to `1683.6 ms/token`, with `ffn_ms_avg=1473.939` and generated token
 `qwen36_ffn_int4_expert_mps_transcode_int4_f16=1404.914 ms` wall time, and
 `command_buffer_gpu:qwen36_ffn_int4_expert_mps_transcode_int4_f16=66.239 ms`
 across 40 layers. That rules out per-token FP16 MPS slab materialization as the
-mainline route. The next FFN experiment should either keep active FP16 experts
-resident across route reuse, or return to a fully fused routed-expert INT4 path
-that avoids MPSMatrix RHS rebuilds entirely.
+mainline route. A CPU LUT pack is available for investigation with
+`SUPERSONIC_METAL_QWEN36_MPS_BRIDGE_CPU_TRANSCODE_LUT=1`. Its pure CPU
+microbench improves the 50.4 MB active-slab pack from `1271.431 ms` to
+`512.129 ms`, but the real profiled bridge generated `[11]` while regressing to
+`3787.1 ms/token`, `ffn_ms_avg=3529.819`, and
+`qwen36_ffn_int4_expert_mps_bridge_pack_f16_lut=3371.748 ms` across 40 layers.
+That keeps the scalar CPU pack as the fallback control and rules out CPU-side
+MPS slab materialization as the next optimization target. The next FFN
+experiment should either keep active FP16 experts resident across route reuse,
+or return to a fully fused routed-expert INT4 path that avoids MPSMatrix RHS
+rebuilds entirely.
 
 Unsupported Metal constraints remain explicit for this target: persistent
 decode, KV-FP8, speculative decode, batching, and Metal VMM are not benchmarked

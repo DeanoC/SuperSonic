@@ -3167,6 +3167,17 @@ fn push_f16_bits(bytes: &mut Vec<u8>, bits: u16) {
     bytes.extend_from_slice(&bits.to_le_bytes());
 }
 
+fn alloc_f16_byte_vec(elements: usize) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(elements * 2);
+    bytes.resize(elements * 2, 0);
+    bytes
+}
+
+fn write_f16_byte(bytes: &mut [u8], index: usize, bits: u16) {
+    let offset = index * 2;
+    bytes[offset..offset + 2].copy_from_slice(&bits.to_le_bytes());
+}
+
 #[allow(clippy::too_many_arguments)]
 fn qwen36_expert_int4_weight_unchecked(
     weight: usize,
@@ -3200,8 +3211,7 @@ fn qwen36_expert_int4_weight_unchecked(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn qwen36_build_mps_expert_bridge_buffers(
-    ordinal: usize,
+fn qwen36_pack_mps_expert_bridge_bytes_scalar(
     hidden: usize,
     moe_intermediate: usize,
     active_experts: &[usize],
@@ -3213,7 +3223,7 @@ fn qwen36_build_mps_expert_bridge_buffers(
     down_proj_ptr: *const c_void,
     down_scale_ptr: *const c_void,
     down_zero_ptr: *const c_void,
-) -> Result<Qwen36MpsExpertBridgeBuffers, GpuError> {
+) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     let active_groups = active_experts.len();
     let gate_up_rows = 2 * moe_intermediate;
     let mut h_norm_bytes = Vec::with_capacity(active_groups * hidden * 2);
@@ -3267,6 +3277,174 @@ fn qwen36_build_mps_expert_bridge_buffers(
             }
         }
     }
+    (h_norm_bytes, gate_up_rhs_bytes, down_rhs_bytes)
+}
+
+fn qwen36_int4_f16_lut(scale_bits: u16, zero_bits: u16) -> [u16; 16] {
+    let s = bf16_bits_to_f32(scale_bits);
+    let z = bf16_bits_to_f32(zero_bits);
+    let zs = z * s;
+    std::array::from_fn(|idx| f32_to_f16_bits(bf16_round_f32(idx as f32 * s - zs)))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen36_pack_transposed_int4_f16_lut(
+    src: *const u8,
+    scale: *const u16,
+    zero: *const u16,
+    expert: usize,
+    rows: usize,
+    cols: usize,
+    group_size: usize,
+    dst: &mut [u8],
+    dst_group_base: usize,
+    dst_col_stride: usize,
+) {
+    let byte_cols = cols.div_ceil(2);
+    let scale_rows = rows.div_ceil(group_size);
+    let scale_cols = cols.div_ceil(group_size);
+    for scale_col in 0..scale_cols {
+        let col_start = scale_col * group_size;
+        let col_end = (col_start + group_size).min(cols);
+        for col in (col_start..col_end).step_by(2) {
+            let col1 = col + 1;
+            for row_group in 0..scale_rows {
+                let row_start = row_group * group_size;
+                let row_end = (row_start + group_size).min(rows);
+                let scale_idx = (expert * scale_rows + row_group) * scale_cols + scale_col;
+                let lut =
+                    unsafe { qwen36_int4_f16_lut(*scale.add(scale_idx), *zero.add(scale_idx)) };
+                for row in row_start..row_end {
+                    let packed_base = (expert * rows + row) * byte_cols;
+                    let byte = unsafe { *src.add(packed_base + col / 2) };
+                    write_f16_byte(
+                        dst,
+                        dst_group_base + col * dst_col_stride + row,
+                        lut[(byte & 0x0f) as usize],
+                    );
+                    if col1 < col_end {
+                        write_f16_byte(
+                            dst,
+                            dst_group_base + col1 * dst_col_stride + row,
+                            lut[((byte >> 4) & 0x0f) as usize],
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen36_pack_mps_expert_bridge_bytes_lut(
+    hidden: usize,
+    moe_intermediate: usize,
+    active_experts: &[usize],
+    h_norm: &[f32],
+    group_size: usize,
+    gate_up_proj_ptr: *const c_void,
+    gate_up_scale_ptr: *const c_void,
+    gate_up_zero_ptr: *const c_void,
+    down_proj_ptr: *const c_void,
+    down_scale_ptr: *const c_void,
+    down_zero_ptr: *const c_void,
+) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let active_groups = active_experts.len();
+    let gate_up_rows = 2 * moe_intermediate;
+    let mut h_norm_bytes = alloc_f16_byte_vec(active_groups * hidden);
+    let mut gate_up_rhs_bytes = alloc_f16_byte_vec(active_groups * hidden * gate_up_rows);
+    let mut down_rhs_bytes = alloc_f16_byte_vec(active_groups * moe_intermediate * hidden);
+
+    for group in 0..active_groups {
+        let dst_base = group * hidden;
+        for (col, &x) in h_norm.iter().enumerate() {
+            write_f16_byte(&mut h_norm_bytes, dst_base + col, f32_to_f16_bits(x));
+        }
+    }
+
+    let gate_up_w = gate_up_proj_ptr as *const u8;
+    let gate_up_scale = gate_up_scale_ptr as *const u16;
+    let gate_up_zero = gate_up_zero_ptr as *const u16;
+    let down_w = down_proj_ptr as *const u8;
+    let down_scale = down_scale_ptr as *const u16;
+    let down_zero = down_zero_ptr as *const u16;
+
+    for (group, &expert) in active_experts.iter().enumerate() {
+        qwen36_pack_transposed_int4_f16_lut(
+            gate_up_w,
+            gate_up_scale,
+            gate_up_zero,
+            expert,
+            gate_up_rows,
+            hidden,
+            group_size,
+            &mut gate_up_rhs_bytes,
+            group * hidden * gate_up_rows,
+            gate_up_rows,
+        );
+        qwen36_pack_transposed_int4_f16_lut(
+            down_w,
+            down_scale,
+            down_zero,
+            expert,
+            hidden,
+            moe_intermediate,
+            group_size,
+            &mut down_rhs_bytes,
+            group * moe_intermediate * hidden,
+            hidden,
+        );
+    }
+    (h_norm_bytes, gate_up_rhs_bytes, down_rhs_bytes)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen36_build_mps_expert_bridge_buffers(
+    ordinal: usize,
+    hidden: usize,
+    moe_intermediate: usize,
+    active_experts: &[usize],
+    h_norm: &[f32],
+    group_size: usize,
+    gate_up_proj_ptr: *const c_void,
+    gate_up_scale_ptr: *const c_void,
+    gate_up_zero_ptr: *const c_void,
+    down_proj_ptr: *const c_void,
+    down_scale_ptr: *const c_void,
+    down_zero_ptr: *const c_void,
+    use_lut_pack: bool,
+) -> Result<Qwen36MpsExpertBridgeBuffers, GpuError> {
+    let active_groups = active_experts.len();
+    let gate_up_rows = 2 * moe_intermediate;
+    let (h_norm_bytes, gate_up_rhs_bytes, down_rhs_bytes) = if use_lut_pack {
+        qwen36_pack_mps_expert_bridge_bytes_lut(
+            hidden,
+            moe_intermediate,
+            active_experts,
+            h_norm,
+            group_size,
+            gate_up_proj_ptr,
+            gate_up_scale_ptr,
+            gate_up_zero_ptr,
+            down_proj_ptr,
+            down_scale_ptr,
+            down_zero_ptr,
+        )
+    } else {
+        qwen36_pack_mps_expert_bridge_bytes_scalar(
+            hidden,
+            moe_intermediate,
+            active_experts,
+            h_norm,
+            group_size,
+            gate_up_proj_ptr,
+            gate_up_scale_ptr,
+            gate_up_zero_ptr,
+            down_proj_ptr,
+            down_scale_ptr,
+            down_zero_ptr,
+        )
+    };
 
     let h_norm = GpuBuffer::from_host_bytes(
         ordinal,
@@ -3975,26 +4153,30 @@ fn ffn_step_stage1_5_metal_host(
         let cpu_transcode =
             std::env::var_os("SUPERSONIC_METAL_QWEN36_MPS_BRIDGE_CPU_TRANSCODE").is_some();
         let mut bridge = if cpu_transcode {
-            crate::prefill_ffi::metal_profile_time(
-                "qwen36_ffn_int4_expert_mps_bridge_pack_f16",
-                "host",
-                || {
-                    qwen36_build_mps_expert_bridge_buffers(
-                        output_ordinal,
-                        hidden,
-                        moe_intermediate,
-                        &active_experts,
-                        &h_norm,
-                        int4.group_size as usize,
-                        weights.gate_up_proj_w,
-                        int4.gate_up_proj_scale,
-                        int4.gate_up_proj_zero,
-                        weights.down_proj_w,
-                        int4.down_proj_scale,
-                        int4.down_proj_zero,
-                    )
-                },
-            )?
+            let use_lut_pack =
+                std::env::var_os("SUPERSONIC_METAL_QWEN36_MPS_BRIDGE_CPU_TRANSCODE_LUT").is_some();
+            let pack_op = if use_lut_pack {
+                "qwen36_ffn_int4_expert_mps_bridge_pack_f16_lut"
+            } else {
+                "qwen36_ffn_int4_expert_mps_bridge_pack_f16"
+            };
+            crate::prefill_ffi::metal_profile_time(pack_op, "host", || {
+                qwen36_build_mps_expert_bridge_buffers(
+                    output_ordinal,
+                    hidden,
+                    moe_intermediate,
+                    &active_experts,
+                    &h_norm,
+                    int4.group_size as usize,
+                    weights.gate_up_proj_w,
+                    int4.gate_up_proj_scale,
+                    int4.gate_up_proj_zero,
+                    weights.down_proj_w,
+                    int4.down_proj_scale,
+                    int4.down_proj_zero,
+                    use_lut_pack,
+                )
+            })?
         } else {
             let mut bridge = crate::prefill_ffi::metal_profile_time(
                 "qwen36_ffn_int4_expert_mps_bridge_alloc_f16",
@@ -5723,6 +5905,153 @@ mod tests {
         assert!(d.kv_cache_k.is_null());
         assert!(d.linear_recurrent_state.is_null());
         assert!(d.experts_gate_up_w.is_null());
+    }
+
+    fn test_int4_blob(num_experts: usize, rows: usize, cols: usize) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(num_experts * rows * cols.div_ceil(2));
+        for expert in 0..num_experts {
+            for row in 0..rows {
+                for col in (0..cols).step_by(2) {
+                    let lo = ((expert * 3 + row * 5 + col) & 0x0f) as u8;
+                    let hi = ((expert * 7 + row * 11 + col + 1) & 0x0f) as u8;
+                    bytes.push(lo | (hi << 4));
+                }
+            }
+        }
+        bytes
+    }
+
+    fn test_bf16_sidecar(
+        num_experts: usize,
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+        base: f32,
+    ) -> Vec<u16> {
+        let scale_rows = rows.div_ceil(group_size);
+        let scale_cols = cols.div_ceil(group_size);
+        let mut values = Vec::with_capacity(num_experts * scale_rows * scale_cols);
+        for expert in 0..num_experts {
+            for row_group in 0..scale_rows {
+                for col_group in 0..scale_cols {
+                    let value = base + 0.03125 * expert as f32 + 0.0078125 * row_group as f32
+                        - 0.00390625 * col_group as f32;
+                    values.push(half::bf16::from_f32(value).to_bits());
+                }
+            }
+        }
+        values
+    }
+
+    #[test]
+    fn qwen36_mps_bridge_lut_pack_matches_scalar_pack() {
+        let hidden = 8;
+        let moe_intermediate = 4;
+        let gate_up_rows = 2 * moe_intermediate;
+        let group_size = 4;
+        let num_experts = 3;
+        let active_experts = [2usize, 0usize];
+        let h_norm = [0.25, -1.0, 2.0, 0.5, -0.125, 1.5, -2.5, 3.0];
+
+        let gate_up = test_int4_blob(num_experts, gate_up_rows, hidden);
+        let gate_up_scale = test_bf16_sidecar(num_experts, gate_up_rows, hidden, group_size, 0.125);
+        let gate_up_zero = test_bf16_sidecar(num_experts, gate_up_rows, hidden, group_size, 0.5);
+        let down = test_int4_blob(num_experts, hidden, moe_intermediate);
+        let down_scale =
+            test_bf16_sidecar(num_experts, hidden, moe_intermediate, group_size, 0.0625);
+        let down_zero = test_bf16_sidecar(num_experts, hidden, moe_intermediate, group_size, 0.25);
+
+        let scalar = qwen36_pack_mps_expert_bridge_bytes_scalar(
+            hidden,
+            moe_intermediate,
+            &active_experts,
+            &h_norm,
+            group_size,
+            gate_up.as_ptr().cast(),
+            gate_up_scale.as_ptr().cast(),
+            gate_up_zero.as_ptr().cast(),
+            down.as_ptr().cast(),
+            down_scale.as_ptr().cast(),
+            down_zero.as_ptr().cast(),
+        );
+        let lut = qwen36_pack_mps_expert_bridge_bytes_lut(
+            hidden,
+            moe_intermediate,
+            &active_experts,
+            &h_norm,
+            group_size,
+            gate_up.as_ptr().cast(),
+            gate_up_scale.as_ptr().cast(),
+            gate_up_zero.as_ptr().cast(),
+            down.as_ptr().cast(),
+            down_scale.as_ptr().cast(),
+            down_zero.as_ptr().cast(),
+        );
+
+        assert_eq!(lut.0, scalar.0, "h_norm pack mismatch");
+        assert_eq!(lut.1, scalar.1, "gate/up RHS pack mismatch");
+        assert_eq!(lut.2, scalar.2, "down RHS pack mismatch");
+    }
+
+    #[test]
+    #[ignore = "microbench for the Qwen3.6 MPS bridge CPU transcode experiment"]
+    fn qwen36_mps_bridge_cpu_pack_lut_microbench() {
+        let hidden = 2048;
+        let moe_intermediate = 512;
+        let gate_up_rows = 2 * moe_intermediate;
+        let group_size = 128;
+        let num_experts = 8;
+        let active_experts: Vec<usize> = (0..8).collect();
+        let h_norm: Vec<f32> = (0..hidden)
+            .map(|idx| ((idx as i32 % 17) as f32 - 8.0) * 0.03125)
+            .collect();
+        let gate_up = test_int4_blob(num_experts, gate_up_rows, hidden);
+        let gate_up_scale =
+            test_bf16_sidecar(num_experts, gate_up_rows, hidden, group_size, 0.03125);
+        let gate_up_zero = test_bf16_sidecar(num_experts, gate_up_rows, hidden, group_size, 7.0);
+        let down = test_int4_blob(num_experts, hidden, moe_intermediate);
+        let down_scale =
+            test_bf16_sidecar(num_experts, hidden, moe_intermediate, group_size, 0.03125);
+        let down_zero = test_bf16_sidecar(num_experts, hidden, moe_intermediate, group_size, 7.0);
+
+        let scalar_start = std::time::Instant::now();
+        let scalar = qwen36_pack_mps_expert_bridge_bytes_scalar(
+            hidden,
+            moe_intermediate,
+            &active_experts,
+            &h_norm,
+            group_size,
+            gate_up.as_ptr().cast(),
+            gate_up_scale.as_ptr().cast(),
+            gate_up_zero.as_ptr().cast(),
+            down.as_ptr().cast(),
+            down_scale.as_ptr().cast(),
+            down_zero.as_ptr().cast(),
+        );
+        let scalar_ms = scalar_start.elapsed().as_secs_f64() * 1000.0;
+
+        let lut_start = std::time::Instant::now();
+        let lut = qwen36_pack_mps_expert_bridge_bytes_lut(
+            hidden,
+            moe_intermediate,
+            &active_experts,
+            &h_norm,
+            group_size,
+            gate_up.as_ptr().cast(),
+            gate_up_scale.as_ptr().cast(),
+            gate_up_zero.as_ptr().cast(),
+            down.as_ptr().cast(),
+            down_scale.as_ptr().cast(),
+            down_zero.as_ptr().cast(),
+        );
+        let lut_ms = lut_start.elapsed().as_secs_f64() * 1000.0;
+
+        assert_eq!(lut, scalar);
+        eprintln!(
+            "qwen36_mps_bridge_cpu_pack_lut_microbench scalar_ms={scalar_ms:.3} lut_ms={lut_ms:.3} speedup={:.2}x bytes={}",
+            scalar_ms / lut_ms.max(f64::MIN_POSITIVE),
+            lut.0.len() + lut.1.len() + lut.2.len()
+        );
     }
 
     #[cfg(all(target_os = "macos", supersonic_backend_metal))]
