@@ -3300,6 +3300,60 @@ fn qwen36_build_mps_expert_bridge_buffers(
     })
 }
 
+fn qwen36_alloc_mps_expert_bridge_buffers(
+    ordinal: usize,
+    hidden: usize,
+    moe_intermediate: usize,
+    active_groups: usize,
+) -> Result<Qwen36MpsExpertBridgeBuffers, GpuError> {
+    let gate_up_rows = 2 * moe_intermediate;
+    let h_norm = GpuBuffer::alloc_with_kind(
+        ordinal,
+        ScalarType::F16,
+        &[active_groups, hidden],
+        BufferKind::Scratch,
+    )?;
+    let gate_up_rhs = GpuBuffer::alloc_with_kind(
+        ordinal,
+        ScalarType::F16,
+        &[active_groups, hidden, gate_up_rows],
+        BufferKind::Scratch,
+    )?;
+    let gate_up_out = GpuBuffer::alloc_with_kind(
+        ordinal,
+        ScalarType::F16,
+        &[active_groups, gate_up_rows],
+        BufferKind::Scratch,
+    )?;
+    let down_lhs = GpuBuffer::alloc_with_kind(
+        ordinal,
+        ScalarType::F16,
+        &[active_groups, moe_intermediate],
+        BufferKind::Scratch,
+    )?;
+    let down_rhs = GpuBuffer::alloc_with_kind(
+        ordinal,
+        ScalarType::F16,
+        &[active_groups, moe_intermediate, hidden],
+        BufferKind::Scratch,
+    )?;
+    let down_out = GpuBuffer::alloc_with_kind(
+        ordinal,
+        ScalarType::F16,
+        &[active_groups, hidden],
+        BufferKind::Scratch,
+    )?;
+
+    Ok(Qwen36MpsExpertBridgeBuffers {
+        h_norm,
+        gate_up_rhs,
+        gate_up_out,
+        down_lhs,
+        down_rhs,
+        down_out,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn ffn_expert_gate_up_tiled_metal_launch(
     hidden: usize,
@@ -3918,26 +3972,70 @@ fn ffn_step_stage1_5_metal_host(
         .map(|group| f32::to_bits(workspace[off_topk_idx + group]) as i32 as usize)
         .collect();
     if qwen36_ffn_expert_mps_bridge_stage5_supported(params, weights, int4) {
-        let mut bridge = crate::prefill_ffi::metal_profile_time(
-            "qwen36_ffn_int4_expert_mps_bridge_pack_f16",
-            "host",
-            || {
-                qwen36_build_mps_expert_bridge_buffers(
-                    output_ordinal,
-                    hidden,
-                    moe_intermediate,
-                    &active_experts,
-                    &h_norm,
-                    int4.group_size as usize,
-                    weights.gate_up_proj_w,
-                    int4.gate_up_proj_scale,
-                    int4.gate_up_proj_zero,
-                    weights.down_proj_w,
-                    int4.down_proj_scale,
-                    int4.down_proj_zero,
-                )
-            },
-        )?;
+        let cpu_transcode =
+            std::env::var_os("SUPERSONIC_METAL_QWEN36_MPS_BRIDGE_CPU_TRANSCODE").is_some();
+        let mut bridge = if cpu_transcode {
+            crate::prefill_ffi::metal_profile_time(
+                "qwen36_ffn_int4_expert_mps_bridge_pack_f16",
+                "host",
+                || {
+                    qwen36_build_mps_expert_bridge_buffers(
+                        output_ordinal,
+                        hidden,
+                        moe_intermediate,
+                        &active_experts,
+                        &h_norm,
+                        int4.group_size as usize,
+                        weights.gate_up_proj_w,
+                        int4.gate_up_proj_scale,
+                        int4.gate_up_proj_zero,
+                        weights.down_proj_w,
+                        int4.down_proj_scale,
+                        int4.down_proj_zero,
+                    )
+                },
+            )?
+        } else {
+            let mut bridge = crate::prefill_ffi::metal_profile_time(
+                "qwen36_ffn_int4_expert_mps_bridge_alloc_f16",
+                "host",
+                || {
+                    qwen36_alloc_mps_expert_bridge_buffers(
+                        output_ordinal,
+                        hidden,
+                        moe_intermediate,
+                        active_groups,
+                    )
+                },
+            )?;
+            let profile_transcode = std::env::var_os("SUPERSONIC_METAL_PROFILE").is_some();
+            crate::prefill_ffi::metal_profile_time(
+                "qwen36_ffn_int4_expert_mps_transcode_int4_f16",
+                "native",
+                || unsafe {
+                    crate::metal_native::qwen36_ffn_expert_mps_transcode_int4_f16(
+                        hidden,
+                        moe_intermediate,
+                        active_groups,
+                        int4.group_size as usize,
+                        workspace_ptr,
+                        weights.gate_up_proj_w,
+                        int4.gate_up_proj_scale,
+                        int4.gate_up_proj_zero,
+                        weights.down_proj_w,
+                        int4.down_proj_scale,
+                        int4.down_proj_zero,
+                        bridge.h_norm.as_mut_ptr(),
+                        bridge.gate_up_rhs.as_mut_ptr(),
+                        bridge.down_rhs.as_mut_ptr(),
+                        off_h_norm,
+                        off_topk_idx,
+                        profile_transcode,
+                    )
+                },
+            )?;
+            bridge
+        };
         crate::prefill_ffi::metal_profile_time(
             "qwen36_ffn_int4_expert_mps_bridge_f16",
             "native",

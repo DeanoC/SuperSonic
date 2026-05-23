@@ -176,6 +176,25 @@ unsafe extern "C" {
         off_moe_out: usize,
         wait_for_completion: c_int,
     ) -> c_int;
+    fn supersonic_metal_qwen36_ffn_expert_mps_transcode_int4_f16(
+        hidden: usize,
+        moe_intermediate: usize,
+        top_k: usize,
+        group_size: usize,
+        workspace_ptr: *mut c_void,
+        gate_up_proj_ptr: *const c_void,
+        gate_up_scale_ptr: *const c_void,
+        gate_up_zero_ptr: *const c_void,
+        down_proj_ptr: *const c_void,
+        down_scale_ptr: *const c_void,
+        down_zero_ptr: *const c_void,
+        h_norm_f16_ptr: *mut c_void,
+        gate_up_rhs_f16_ptr: *mut c_void,
+        down_rhs_f16_ptr: *mut c_void,
+        off_h_norm: usize,
+        off_topk_idx: usize,
+        wait_for_completion: c_int,
+    ) -> c_int;
     fn supersonic_metal_qwen36_linear_int4_stage5(
         hidden: usize,
         num_k_heads: usize,
@@ -1698,6 +1717,78 @@ pub(crate) unsafe fn qwen36_ffn_expert_mps_bridge_f16(
         return Err(GpuError::backend(
             Backend::Metal,
             format!("metal native qwen36_ffn_expert_mps_bridge_f16 failed with status {status}"),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn qwen36_ffn_expert_mps_transcode_int4_f16(
+    hidden: usize,
+    moe_intermediate: usize,
+    top_k: usize,
+    group_size: usize,
+    workspace: *mut c_void,
+    gate_up_proj: *const c_void,
+    gate_up_scale: *const c_void,
+    gate_up_zero: *const c_void,
+    down_proj: *const c_void,
+    down_scale: *const c_void,
+    down_zero: *const c_void,
+    h_norm_f16: *mut c_void,
+    gate_up_rhs_f16: *mut c_void,
+    down_rhs_f16: *mut c_void,
+    off_h_norm: usize,
+    off_topk_idx: usize,
+    wait_for_completion: bool,
+) -> Result<(), GpuError> {
+    if hidden == 0
+        || moe_intermediate == 0
+        || top_k == 0
+        || group_size == 0
+        || workspace.is_null()
+        || gate_up_proj.is_null()
+        || gate_up_scale.is_null()
+        || gate_up_zero.is_null()
+        || down_proj.is_null()
+        || down_scale.is_null()
+        || down_zero.is_null()
+        || h_norm_f16.is_null()
+        || gate_up_rhs_f16.is_null()
+        || down_rhs_f16.is_null()
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native qwen36_ffn_expert_mps_transcode_int4_f16 invalid shape: hidden={hidden} moe_intermediate={moe_intermediate} top_k={top_k} group_size={group_size}"
+        )));
+    }
+    let status = unsafe {
+        supersonic_metal_qwen36_ffn_expert_mps_transcode_int4_f16(
+            hidden,
+            moe_intermediate,
+            top_k,
+            group_size,
+            workspace,
+            gate_up_proj,
+            gate_up_scale,
+            gate_up_zero,
+            down_proj,
+            down_scale,
+            down_zero,
+            h_norm_f16,
+            gate_up_rhs_f16,
+            down_rhs_f16,
+            off_h_norm,
+            off_topk_idx,
+            i32::from(wait_for_completion),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!(
+                "metal native qwen36_ffn_expert_mps_transcode_int4_f16 failed with status {status}"
+            ),
         ));
     }
     Ok(())
@@ -4557,6 +4648,33 @@ pub(crate) unsafe fn qwen36_ffn_expert_mps_bridge_f16(
     Err(GpuError::backend(
         Backend::Metal,
         "metal native qwen36_ffn_expert_mps_bridge_f16 is not compiled".into(),
+    ))
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn qwen36_ffn_expert_mps_transcode_int4_f16(
+    _hidden: usize,
+    _moe_intermediate: usize,
+    _top_k: usize,
+    _group_size: usize,
+    _workspace: *mut c_void,
+    _gate_up_proj: *const c_void,
+    _gate_up_scale: *const c_void,
+    _gate_up_zero: *const c_void,
+    _down_proj: *const c_void,
+    _down_scale: *const c_void,
+    _down_zero: *const c_void,
+    _h_norm_f16: *mut c_void,
+    _gate_up_rhs_f16: *mut c_void,
+    _down_rhs_f16: *mut c_void,
+    _off_h_norm: usize,
+    _off_topk_idx: usize,
+    _wait_for_completion: bool,
+) -> Result<(), GpuError> {
+    Err(GpuError::backend(
+        Backend::Metal,
+        "metal native qwen36_ffn_expert_mps_transcode_int4_f16 is not compiled".into(),
     ))
 }
 

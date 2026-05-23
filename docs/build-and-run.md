@@ -479,8 +479,17 @@ MPS buffers, MPS runs gate/up and down, and a small Metal finalizer writes the
 decode output. It still generated `[11]`, but it is not promotable yet: a warm
 one-token profile measured `1707.3 ms/token`, with `1365.389 ms` in CPU
 INT4-to-FP16 packing and only `34.032 ms` in bridge command-buffer GPU time.
-The next FFN target is therefore persistent active-expert FP16 residency or a
-GPU-side INT4-to-FP16 transcode that avoids per-token CPU slab packing.
+The follow-up GPU-side transcode uses a 16-entry threadgroup LUT per GPTQ
+scale/zero group and keeps the CPU path available with
+`SUPERSONIC_METAL_QWEN36_MPS_BRIDGE_CPU_TRANSCODE=1`. It is correct and the
+normal async smoke improved slightly to `1683.6 ms/token`, but it is still not
+promotable: the profiled GPU-transcode run measured `1766.4 ms/token` with
+`qwen36_ffn_int4_expert_mps_transcode_int4_f16=1404.914 ms` wall time across 40
+layers while the Metal command-buffer GPU timestamp for the transcode work was
+only `66.239 ms`. That points away from more per-token MPS slab materialization
+and toward either a fully fused routed-expert INT4 path or persistent resident
+expert buffers that avoid rebuilding/consuming large FP16 MPS matrices every
+token.
 
 ### Metal validation
 

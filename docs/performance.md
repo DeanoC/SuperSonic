@@ -1052,15 +1052,24 @@ calls.
 The first real MPS bridge is opt-in behind
 `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_MPS_BRIDGE=1`. It uses the real
 active GPTQ experts, transposes/dequantizes those slabs to FP16 MPS layout on
-the CPU, runs MPSMatrix gate/up and down, applies SiLU and residual/shared
-finalization on Metal, and writes the decode output. A warm one-token M5 Max
-smoke still generated `[11]`, but measured `1707.3 ms/token` with
-`ffn_ms_avg=1502.344`. Profile attribution named the blocker:
+the CPU by default only when
+`SUPERSONIC_METAL_QWEN36_MPS_BRIDGE_CPU_TRANSCODE=1`; otherwise it uses a
+GPU-side INT4-to-FP16 transcode with a 16-entry threadgroup LUT per GPTQ
+scale/zero group before MPSMatrix gate/up and down consume the FP16 slabs. The
+original CPU-pack profile generated `[11]`, but measured `1707.3 ms/token` with
+`ffn_ms_avg=1502.344`. Profile attribution named the first blocker:
 `qwen36_ffn_int4_expert_mps_bridge_pack_f16=1365.389 ms` across 40 layers,
 while `command_buffer_gpu:qwen36_ffn_int4_expert_mps_bridge_f16=34.032 ms`.
-That rules out per-token CPU INT4-to-FP16 slab conversion. The next FFN
-experiment should keep active FP16 experts resident across route reuse, or move
-the INT4-to-FP16 transcode onto the GPU before MPS consumes the matrices.
+The GPU LUT transcode path is correct and the normal async smoke improved
+slightly to `1683.6 ms/token`, with `ffn_ms_avg=1473.939` and generated token
+`[11]`. It is still not promotable: the profiled GPU-transcode run measured
+`1766.4 ms/token`, `ffn_ms_avg=1538.500`,
+`qwen36_ffn_int4_expert_mps_transcode_int4_f16=1404.914 ms` wall time, and
+`command_buffer_gpu:qwen36_ffn_int4_expert_mps_transcode_int4_f16=66.239 ms`
+across 40 layers. That rules out per-token FP16 MPS slab materialization as the
+mainline route. The next FFN experiment should either keep active FP16 experts
+resident across route reuse, or return to a fully fused routed-expert INT4 path
+that avoids MPSMatrix RHS rebuilds entirely.
 
 Unsupported Metal constraints remain explicit for this target: persistent
 decode, KV-FP8, speculative decode, batching, and Metal VMM are not benchmarked
