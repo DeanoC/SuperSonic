@@ -2610,8 +2610,7 @@ fn qwen36_ffn_int4_stage5_metal_native_supported(
     weights: &Qwen36MoeFfnStepWeights,
     int4: &Qwen36MoeFfnStepInt4,
 ) -> bool {
-    (std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5").is_some()
-        || std::env::var_os("SUPERSONIC_METAL_PROFILE").is_some())
+    std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5").is_some()
         && params.stage == 5
         && params.hidden == 2048
         && params.num_experts == 256
@@ -2897,68 +2896,70 @@ fn ffn_step_stage1_5_metal_host(
         std::slice::from_raw_parts_mut(workspace.as_mut_ptr() as *mut f32, workspace_len)
     };
 
-    let mut mean_sq = 0.0f32;
-    for &bits in input {
-        let v = bf16_bits_to_f32(bits);
-        mean_sq += v * v;
-    }
-    let inv_rms = 1.0f32 / (mean_sq / hidden as f32 + params.rms_norm_eps).sqrt();
-    for col in 0..hidden {
-        let v = bf16_bits_to_f32(input[col]);
-        let w = bf16_bits_to_f32(norm_w[col]);
-        workspace[off_h_norm + col] = bf16_round_f32(v * inv_rms * (1.0 + w));
-    }
-
-    for expert in 0..num_experts {
-        let mut acc = 0.0f32;
-        let row = expert * hidden;
-        for col in 0..hidden {
-            acc += bf16_bits_to_f32(gate_w[row + col]) * workspace[off_h_norm + col];
+    crate::prefill_ffi::metal_profile_time("qwen36_ffn_host_router_topk", "host", || {
+        let mut mean_sq = 0.0f32;
+        for &bits in input {
+            let v = bf16_bits_to_f32(bits);
+            mean_sq += v * v;
         }
-        workspace[off_router_logits + expert] = bf16_round_f32(acc);
-    }
+        let inv_rms = 1.0f32 / (mean_sq / hidden as f32 + params.rms_norm_eps).sqrt();
+        for col in 0..hidden {
+            let v = bf16_bits_to_f32(input[col]);
+            let w = bf16_bits_to_f32(norm_w[col]);
+            workspace[off_h_norm + col] = bf16_round_f32(v * inv_rms * (1.0 + w));
+        }
 
-    let row_max = workspace[off_router_logits..off_router_logits + num_experts]
-        .iter()
-        .copied()
-        .fold(f32::NEG_INFINITY, f32::max);
-    let mut row_sum = 0.0f32;
-    for expert in 0..num_experts {
-        let e = (workspace[off_router_logits + expert] - row_max).exp();
-        workspace[off_router_probs + expert] = e;
-        row_sum += e;
-    }
-    let inv_sum = 1.0f32 / row_sum;
-    for expert in 0..num_experts {
-        workspace[off_router_probs + expert] =
-            bf16_round_f32(workspace[off_router_probs + expert] * inv_sum);
-    }
-
-    for kk in 0..top_k {
-        let mut best_idx = -1i32;
-        let mut best_val = f32::NEG_INFINITY;
         for expert in 0..num_experts {
-            let v = workspace[off_router_probs + expert];
-            if v > best_val || (v == best_val && best_idx >= 0 && (expert as i32) < best_idx) {
-                best_val = v;
-                best_idx = expert as i32;
+            let mut acc = 0.0f32;
+            let row = expert * hidden;
+            for col in 0..hidden {
+                acc += bf16_bits_to_f32(gate_w[row + col]) * workspace[off_h_norm + col];
+            }
+            workspace[off_router_logits + expert] = bf16_round_f32(acc);
+        }
+
+        let row_max = workspace[off_router_logits..off_router_logits + num_experts]
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, f32::max);
+        let mut row_sum = 0.0f32;
+        for expert in 0..num_experts {
+            let e = (workspace[off_router_logits + expert] - row_max).exp();
+            workspace[off_router_probs + expert] = e;
+            row_sum += e;
+        }
+        let inv_sum = 1.0f32 / row_sum;
+        for expert in 0..num_experts {
+            workspace[off_router_probs + expert] =
+                bf16_round_f32(workspace[off_router_probs + expert] * inv_sum);
+        }
+
+        for kk in 0..top_k {
+            let mut best_idx = -1i32;
+            let mut best_val = f32::NEG_INFINITY;
+            for expert in 0..num_experts {
+                let v = workspace[off_router_probs + expert];
+                if v > best_val || (v == best_val && best_idx >= 0 && (expert as i32) < best_idx) {
+                    best_val = v;
+                    best_idx = expert as i32;
+                }
+            }
+            workspace[off_topk_idx + kk] = f32::from_bits(best_idx as u32);
+            workspace[off_topk_val + kk] = best_val;
+            if best_idx >= 0 {
+                workspace[off_router_probs + best_idx as usize] = f32::NEG_INFINITY;
             }
         }
-        workspace[off_topk_idx + kk] = f32::from_bits(best_idx as u32);
-        workspace[off_topk_val + kk] = best_val;
-        if best_idx >= 0 {
-            workspace[off_router_probs + best_idx as usize] = f32::NEG_INFINITY;
-        }
-    }
 
-    let sum_k: f32 = (0..top_k).map(|kk| workspace[off_topk_val + kk]).sum();
-    let inv_k = 1.0f32 / sum_k;
-    for kk in 0..top_k {
-        let w = bf16_round_f32(workspace[off_topk_val + kk] * inv_k);
-        workspace[off_topk_val + kk] = w;
-        output[kk] = f32_to_bf16_bits(w);
-        output_idx[kk] = f32::to_bits(workspace[off_topk_idx + kk]) as i32;
-    }
+        let sum_k: f32 = (0..top_k).map(|kk| workspace[off_topk_val + kk]).sum();
+        let inv_k = 1.0f32 / sum_k;
+        for kk in 0..top_k {
+            let w = bf16_round_f32(workspace[off_topk_val + kk] * inv_k);
+            workspace[off_topk_val + kk] = w;
+            output[kk] = f32_to_bf16_bits(w);
+            output_idx[kk] = f32::to_bits(workspace[off_topk_idx + kk]) as i32;
+        }
+    });
 
     if params.stage == 1 {
         return Ok(());
@@ -3035,7 +3036,7 @@ fn ffn_step_stage1_5_metal_host(
     }
 
     let h_norm = workspace[off_h_norm..off_h_norm + hidden].to_vec();
-    {
+    crate::prefill_ffi::metal_profile_time("qwen36_ffn_host_shared_gate_up", "host", || {
         let (_, after_sgp) = workspace.split_at_mut(off_sgp);
         let (sgp, after_sup) = after_sgp.split_at_mut(shared_intermediate);
         let (sup, _) = after_sup.split_at_mut(shared_intermediate);
@@ -3071,23 +3072,25 @@ fn ffn_step_stage1_5_metal_host(
                 );
             }
         });
-    }
-    let mut sg_acc = 0.0f32;
-    for col in 0..hidden {
-        sg_acc += bf16_bits_to_f32(shared_expert_gate_w[col]) * h_norm[col];
-    }
-    workspace[off_sg_scalar] = 1.0f32 / (1.0f32 + (-sg_acc).exp());
+    });
+    crate::prefill_ffi::metal_profile_time("qwen36_ffn_host_shared_scalar_silu", "host", || {
+        let mut sg_acc = 0.0f32;
+        for col in 0..hidden {
+            sg_acc += bf16_bits_to_f32(shared_expert_gate_w[col]) * h_norm[col];
+        }
+        workspace[off_sg_scalar] = 1.0f32 / (1.0f32 + (-sg_acc).exp());
 
-    for i in 0..shared_intermediate {
-        let gp = workspace[off_sgp + i];
-        let up = workspace[off_sup + i];
-        let silu = gp * (1.0f32 / (1.0f32 + (-gp).exp()));
-        workspace[off_shared_mid + i] = silu * up;
-    }
+        for i in 0..shared_intermediate {
+            let gp = workspace[off_sgp + i];
+            let up = workspace[off_sup + i];
+            let silu = gp * (1.0f32 / (1.0f32 + (-gp).exp()));
+            workspace[off_shared_mid + i] = silu * up;
+        }
+    });
 
     let sg_scalar = workspace[off_sg_scalar];
     let shared_mid = workspace[off_shared_mid..off_shared_mid + shared_intermediate].to_vec();
-    {
+    crate::prefill_ffi::metal_profile_time("qwen36_ffn_host_shared_down", "host", || {
         let shared_down_w = weights.shared_down_proj_w as usize;
         let shared_down_scale = int4.shared_down_proj_scale as usize;
         let shared_down_zero = int4.shared_down_proj_zero as usize;
@@ -3110,112 +3113,126 @@ fn ffn_step_stage1_5_metal_host(
         });
         if params.stage == 2 {
             for row in 0..hidden {
-                output[row] = f32_to_bf16_bits(workspace[off_shared_out + row]);
+                output[row] = f32_to_bf16_bits(shared_out[row]);
             }
         }
-    }
+    });
 
     if params.stage == 2 {
         return Ok(());
     }
 
     let active_groups = if params.stage == 3 { 1 } else { top_k };
-    for group in 0..active_groups {
-        let expert = f32::to_bits(workspace[off_topk_idx + group]) as i32 as usize;
-        let gu_base = off_expert_gu + group * 2 * moe_intermediate;
-        {
-            let gate_up_w = weights.gate_up_proj_w as usize;
-            let gate_up_scale = int4.gate_up_proj_scale as usize;
-            let gate_up_zero = int4.gate_up_proj_zero as usize;
-            let group_size = int4.group_size.max(0) as usize;
-            let gu = &mut workspace[gu_base..gu_base + 2 * moe_intermediate];
-            qwen36_parallel_chunks_mut(gu, 64, |start, chunk| {
-                for (local, out) in chunk.iter_mut().enumerate() {
-                    let row = start + local;
-                    *out = qwen36_expert_dense_or_int4_dot_unchecked(
-                        gate_up_w,
-                        gate_up_scale,
-                        gate_up_zero,
-                        expert,
-                        row,
-                        2 * moe_intermediate,
-                        hidden,
-                        group_size,
-                        &h_norm,
-                    );
-                }
-            });
-        }
+    let active_experts: Vec<usize> = (0..active_groups)
+        .map(|group| f32::to_bits(workspace[off_topk_idx + group]) as i32 as usize)
+        .collect();
+    crate::prefill_ffi::metal_profile_time("qwen36_ffn_host_expert_gate_up", "host", || {
+        let gate_up_w = weights.gate_up_proj_w as usize;
+        let gate_up_scale = int4.gate_up_proj_scale as usize;
+        let gate_up_zero = int4.gate_up_proj_zero as usize;
+        let group_size = int4.group_size.max(0) as usize;
+        let rows_per_group = 2 * moe_intermediate;
+        let gu = &mut workspace[off_expert_gu..off_expert_gu + active_groups * rows_per_group];
+        qwen36_parallel_chunks_mut(gu, 64, |start, chunk| {
+            for (local, out) in chunk.iter_mut().enumerate() {
+                let flat_row = start + local;
+                let group = flat_row / rows_per_group;
+                let row = flat_row - group * rows_per_group;
+                *out = qwen36_expert_dense_or_int4_dot_unchecked(
+                    gate_up_w,
+                    gate_up_scale,
+                    gate_up_zero,
+                    active_experts[group],
+                    row,
+                    rows_per_group,
+                    hidden,
+                    group_size,
+                    &h_norm,
+                );
+            }
+        });
+    });
 
-        let mid_base = off_expert_mid + group * moe_intermediate;
-        for i in 0..moe_intermediate {
-            let gp = workspace[gu_base + i];
-            let up = workspace[gu_base + moe_intermediate + i];
-            let silu = gp * (1.0f32 / (1.0f32 + (-gp).exp()));
-            workspace[mid_base + i] = silu * up;
-        }
-
-        let stack_base = off_expert_stack + group * hidden;
-        let expert_mid = workspace[mid_base..mid_base + moe_intermediate].to_vec();
-        {
-            let down_w = weights.down_proj_w as usize;
-            let down_scale = int4.down_proj_scale as usize;
-            let down_zero = int4.down_proj_zero as usize;
-            let group_size = int4.group_size.max(0) as usize;
-            let stack = &mut workspace[stack_base..stack_base + hidden];
-            qwen36_parallel_chunks_mut(stack, 64, |start, chunk| {
-                for (local, out) in chunk.iter_mut().enumerate() {
-                    let row = start + local;
-                    *out = qwen36_expert_dense_or_int4_dot_unchecked(
-                        down_w,
-                        down_scale,
-                        down_zero,
-                        expert,
-                        row,
-                        hidden,
-                        moe_intermediate,
-                        group_size,
-                        &expert_mid,
-                    );
-                }
-            });
-            if params.stage == 3 && group == 0 {
-                for row in 0..hidden {
-                    output[row] = f32_to_bf16_bits(bf16_round_f32(workspace[stack_base + row]));
-                }
+    crate::prefill_ffi::metal_profile_time("qwen36_ffn_host_expert_silu", "host", || {
+        for group in 0..active_groups {
+            let gu_base = off_expert_gu + group * 2 * moe_intermediate;
+            let mid_base = off_expert_mid + group * moe_intermediate;
+            for i in 0..moe_intermediate {
+                let gp = workspace[gu_base + i];
+                let up = workspace[gu_base + moe_intermediate + i];
+                let silu = gp * (1.0f32 / (1.0f32 + (-gp).exp()));
+                workspace[mid_base + i] = silu * up;
             }
         }
-    }
+    });
+
+    let expert_mid =
+        workspace[off_expert_mid..off_expert_mid + active_groups * moe_intermediate].to_vec();
+    crate::prefill_ffi::metal_profile_time("qwen36_ffn_host_expert_down", "host", || {
+        let down_w = weights.down_proj_w as usize;
+        let down_scale = int4.down_proj_scale as usize;
+        let down_zero = int4.down_proj_zero as usize;
+        let group_size = int4.group_size.max(0) as usize;
+        let stack = &mut workspace[off_expert_stack..off_expert_stack + active_groups * hidden];
+        qwen36_parallel_chunks_mut(stack, 64, |start, chunk| {
+            for (local, out) in chunk.iter_mut().enumerate() {
+                let flat_row = start + local;
+                let group = flat_row / hidden;
+                let row = flat_row - group * hidden;
+                let mid = &expert_mid[group * moe_intermediate..(group + 1) * moe_intermediate];
+                *out = qwen36_expert_dense_or_int4_dot_unchecked(
+                    down_w,
+                    down_scale,
+                    down_zero,
+                    active_experts[group],
+                    row,
+                    hidden,
+                    moe_intermediate,
+                    group_size,
+                    mid,
+                );
+            }
+        });
+        if params.stage == 3 {
+            for row in 0..hidden {
+                output[row] = f32_to_bf16_bits(bf16_round_f32(stack[row]));
+            }
+        }
+    });
 
     if params.stage == 3 {
         return Ok(());
     }
 
-    for row in 0..hidden {
-        let mut acc = 0.0f32;
-        for group in 0..top_k {
-            acc += workspace[off_topk_val + group]
-                * workspace[off_expert_stack + group * hidden + row];
+    crate::prefill_ffi::metal_profile_time("qwen36_ffn_host_finalize", "host", || {
+        for row in 0..hidden {
+            let mut acc = 0.0f32;
+            for group in 0..top_k {
+                acc += workspace[off_topk_val + group]
+                    * workspace[off_expert_stack + group * hidden + row];
+            }
+            let val = bf16_round_f32(acc);
+            workspace[off_moe_out + row] = val;
+            if params.stage == 4 {
+                output[row] = f32_to_bf16_bits(val);
+            }
         }
-        let val = bf16_round_f32(acc);
-        workspace[off_moe_out + row] = val;
-        if params.stage == 4 {
-            output[row] = f32_to_bf16_bits(val);
-        }
-    }
+    });
 
     if params.stage == 4 {
         return Ok(());
     }
 
-    for row in 0..hidden {
-        let val = bf16_round_f32(
-            bf16_bits_to_f32(input[row])
-                + workspace[off_moe_out + row]
-                + workspace[off_shared_out + row],
-        );
-        output[row] = f32_to_bf16_bits(val);
-    }
+    crate::prefill_ffi::metal_profile_time("qwen36_ffn_host_residual", "host", || {
+        for row in 0..hidden {
+            let val = bf16_round_f32(
+                bf16_bits_to_f32(input[row])
+                    + workspace[off_moe_out + row]
+                    + workspace[off_shared_out + row],
+            );
+            output[row] = f32_to_bf16_bits(val);
+        }
+    });
 
     Ok(())
 }

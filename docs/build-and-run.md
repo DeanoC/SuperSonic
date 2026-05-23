@@ -298,10 +298,12 @@ Metal currently rejects or defers:
   plus INT4 sidecars for projection and expert matvecs. Stage-5
   linear-attention projection/recurrent work uses a fused native Metal INT4
   path by default; set `SUPERSONIC_METAL_DISABLE_QWEN36_LINEAR_INT4_STAGE5=1`
-  to force the host fallback. Stage-5 FFN projection work also has a narrowly
-  gated native Metal INT4 attribution path enabled by `SUPERSONIC_METAL_PROFILE=1`
-  or `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5=1`; reducing FFN
-  command-buffer wait is the next measured optimization target. The
+  to force the host fallback. Stage-5 FFN work stays on the host fallback by
+  default, with routed expert gate/up and down rows batched across top-k
+  experts; `SUPERSONIC_METAL_PROFILE=1` profiles that default lane rather than
+  switching implementations. The experimental native FFN path remains explicit
+  opt-in via `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5=1`; routed expert
+  gate/up and down matvecs are the next measured optimization target. The
   one-token local smoke is:
   `cargo run --release --bin supersonic -- --backend metal --model qwen3.6-35b-a3b --model-dir /path/to/Qwen3.6-35B-A3B --int4 --prompt "Hello" --max-new-tokens 1 --emit-stage-timings`.
   FP8-runtime, KV-FP8, speculative decode, and persistent decode remain
@@ -320,8 +322,8 @@ Native Metal kernels used in the hot path:
 - lm-head argmax
 - RMSNorm rows
 - Qwen3.6 stage-5 linear-attention INT4 fused projection/recurrent path
-- Qwen3.6 stage-5 FFN INT4 projection kernels for profiling / opt-in
-  attribution
+- Qwen3.6 stage-5 FFN INT4 projection kernels for explicit opt-in
+  experiments
 - linear prefill conv pack
 - element add
 - cast

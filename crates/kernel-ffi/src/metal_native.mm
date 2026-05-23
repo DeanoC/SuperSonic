@@ -10796,9 +10796,13 @@ extern "C" int supersonic_metal_qwen36_ffn_int4_stage5(
 
         auto encode_stage = [&](id<MTLComputeCommandEncoder> encoder) {
             encode_shared_gate_up(encoder);
+            [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
             encode_shared_scalar(encoder);
+            [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
             encode_shared_down(encoder);
+            [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
             encode_expert_gate_up(encoder);
+            [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
             encode_expert_down_finalize(encoder);
         };
         if (wait_for_completion != 0) {

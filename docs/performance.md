@@ -825,8 +825,12 @@ weights on the chained Metal decode path. This section is a performance harness
 checkpoint, not a claim that the HIP feature set has been ported to Metal.
 The latest checkpoint promotes the fused Qwen3.6 stage-5 linear-attention INT4
 Metal path into the default lane, with `SUPERSONIC_METAL_DISABLE_QWEN36_LINEAR_INT4_STAGE5=1`
-kept as the host fallback escape hatch. Native FFN projection work remains
-profile/opt-in while command-buffer wait is reduced.
+kept as the host fallback escape hatch. The default FFN lane remains the
+host-orchestrated INT4 fallback, but routed expert gate/up and down work is now
+batched across top-k experts to reduce per-layer thread orchestration. Native
+FFN projection work remains explicit opt-in with
+`SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5=1`; profile runs no longer
+switch the FFN implementation underneath the headline lane.
 
 Reproduce the run with:
 
@@ -921,41 +925,42 @@ median.
 <!-- AUTOGEN BELOW: apple-m5-max-metal -->
 | Model           |  INT4 |
 | --------------- | ----: |
-| qwen3.6-35b-a3b | 235.4 |
+| qwen3.6-35b-a3b | 144.2 |
 
 <!-- AUTOGEN END: apple-m5-max-metal -->
 
 Latest local attribution run
-(`target/bench-runs/2026-05-22-d97ee50/perf/qwen3.6-35b-a3b_int4.json`):
+(`target/bench-runs/2026-05-23-04d8f14/perf/qwen3.6-35b-a3b_int4.json`):
 
 | Metric | Value |
 |---|---:|
-| Headline median | 235.4 ms/token |
-| Stage total | 132.533 ms/token |
-| Chain | 119.646 ms/token |
-| LM head | 11.779 ms/token |
-| FFN | 55.391 ms/token |
-| Linear attention | 44.303 ms/token |
-| Full attention | 19.669 ms/token |
-| Prefill total | 2938.147 ms |
-| MPP pilot | 14.316 TFLOP/s |
+| Headline median | 144.2 ms/token |
+| Stage total | 169.963 ms/token |
+| Chain | 165.603 ms/token |
+| LM head | 4.115 ms/token |
+| FFN | 93.152 ms/token |
+| Linear attention | 55.530 ms/token |
+| Full attention | 16.737 ms/token |
+| Prefill total | 908.013 ms |
+| MPP pilot | 17.019 TFLOP/s |
 
-The fused linear-attention path is now the measured default win. A warmed
-one-token smoke generated the expected token `[11]` and measured
-`linear_attn_ms_avg=102.403`; the same smoke with
-`SUPERSONIC_METAL_DISABLE_QWEN36_LINEAR_INT4_STAGE5=1` measured
-`linear_attn_ms_avg=153.915`. The bench attribution run reports
-`qwen36_linear_int4_stage5` as 1071.416 ms total across 630 profiled calls;
-the largest linear sub-dispatch is `qwen36_linear_int4_projections`
-at 116.715 ms GPU time.
+The headline median is the unprofiled median-of-3 run (`144.2`, `141.3`,
+`147.2` ms/token). The stage table comes from the extra profile attribution run
+and carries profiling overhead, but now follows the same default FFN path as
+the headline samples. A default one-token smoke generated the expected token
+`[11]` and measured `ffn_ms_avg=183.144`. The explicit native FFN escape hatch
+also generated `[11]`; adding command-buffer barriers reduced that opt-in path
+from roughly 1501 ms to `ffn_ms_avg=635.555`, but it remains too slow to
+promote.
 
-The next measured bottleneck is FFN plus command-buffer wait. Per-stage
-attribution now has FFN (`55.391 ms/token`) ahead of linear attention
-(`44.303 ms/token`), and the Metal profile top ops are
-`command_buffer_wait` at 4188.511 ms total, `qwen36_ffn_int4_stage5`
-at 3098.222 ms total, and `qwen36_linear_int4_stage5` at 1071.416 ms total.
-The next default-lane optimization should therefore reduce FFN native wait or
-merge FFN sub-dispatches before tackling another linear-attention tweak.
+The next measured bottleneck is routed-expert FFN math on the host fallback,
+with Metal command-buffer wait still visible behind the linear path. The top
+profile rows are `qwen36_linear_int4_stage5` at 1203.601 ms total,
+`command_buffer_wait` at 1193.995 ms, `qwen36_ffn_host_expert_gate_up`
+at 864.719 ms, and `qwen36_ffn_host_expert_down` at 458.261 ms across the
+attribution run. The next runtime optimization should therefore target a real
+tiled/batched FFN expert kernel or an MPS/MPP-backed expert matvec bridge,
+rather than promoting the current row-per-output native FFN kernels.
 
 Unsupported Metal constraints remain explicit for this target: persistent
 decode, KV-FP8, speculative decode, batching, and Metal VMM are not benchmarked
