@@ -244,6 +244,12 @@ struct ElementwiseParams {
     uint32_t total_elems;
 };
 
+struct RowScalarSigmoidParams {
+    uint32_t rows;
+    uint32_t cols;
+    uint32_t total_elems;
+};
+
 struct MulScalarParams {
     uint32_t total_elems;
     float scalar;
@@ -5743,6 +5749,99 @@ kernel void supersonic_sigmoid_mul_f32(
     return pipeline;
 }
 
+id<MTLComputePipelineState> sigmoid_mul_row_scalar_pipeline_bf16(NSError** error_out) {
+    static std::mutex mutex;
+    static bool attempted = false;
+    static __strong id<MTLComputePipelineState> pipeline = nil;
+    static __strong NSError* build_error = nil;
+
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!attempted) {
+        attempted = true;
+        @autoreleasepool {
+            id<MTLDevice> device = metal_device();
+            if (device == nil) {
+                build_error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                                   code:1841
+                                               userInfo:@{NSLocalizedDescriptionKey : @"No Metal device"}];
+            } else {
+                static const char* kSource = R"SIGMROWS(
+#include <metal_stdlib>
+using namespace metal;
+
+struct RowScalarSigmoidParams {
+    uint rows;
+    uint cols;
+    uint total_elems;
+};
+
+kernel void supersonic_sigmoid_mul_row_scalar_bf16(
+    device const bfloat* data [[buffer(0)]],
+    device const bfloat* row_gate [[buffer(1)]],
+    device bfloat* out [[buffer(2)]],
+    constant RowScalarSigmoidParams& params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.total_elems) {
+        return;
+    }
+    uint row = gid / params.cols;
+    if (row >= params.rows) {
+        return;
+    }
+    float sig = 1.0f / (1.0f + exp(-float(row_gate[row])));
+    out[gid] = bfloat(float(data[gid]) * sig);
+}
+)SIGMROWS";
+
+                NSString* source = [NSString stringWithUTF8String:kSource];
+                MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+                configure_precise_math(options);
+                NSError* library_error = nil;
+                id<MTLLibrary> library = [device newLibraryWithSource:source
+                                                              options:options
+                                                                error:&library_error];
+                if (library == nil || library_error != nil) {
+                    build_error = library_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                       code:1842
+                                                                   userInfo:@{
+                                                                       NSLocalizedDescriptionKey :
+                                                                           @"Failed to compile row-scalar sigmoid-mul library"
+                                                                   }];
+                } else {
+                    id<MTLFunction> function =
+                        [library newFunctionWithName:@"supersonic_sigmoid_mul_row_scalar_bf16"];
+                    if (function == nil) {
+                        build_error = [NSError errorWithDomain:@"SuperSonicMetal"
+                                                           code:1843
+                                                       userInfo:@{
+                                                           NSLocalizedDescriptionKey :
+                                                               @"Failed to load row-scalar sigmoid-mul function"
+                                                       }];
+                    } else {
+                        NSError* pipeline_error = nil;
+                        pipeline = [device newComputePipelineStateWithFunction:function
+                                                                         error:&pipeline_error];
+                        if (pipeline == nil || pipeline_error != nil) {
+                            build_error = pipeline_error ?: [NSError errorWithDomain:@"SuperSonicMetal"
+                                                                                 code:1844
+                                                                             userInfo:@{
+                                                                                 NSLocalizedDescriptionKey :
+                                                                                     @"Failed to create row-scalar sigmoid-mul pipeline"
+                                                                             }];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (pipeline == nil && error_out != nullptr) {
+        *error_out = build_error;
+    }
+    return pipeline;
+}
+
 id<MTLComputePipelineState> full_attention_gate_pipeline(NSError** error_out) {
     static std::mutex mutex;
     static bool attempted = false;
@@ -8181,6 +8280,73 @@ extern "C" int supersonic_metal_sigmoid_mul_f32(
         out_ptr,
         @"supersonic_sigmoid_mul_f32"
     );
+}
+
+extern "C" int supersonic_metal_sigmoid_mul_row_scalar_bf16(
+    size_t rows,
+    size_t cols,
+    const void* data_ptr,
+    const void* row_gate_ptr,
+    void* out_ptr
+) {
+    @autoreleasepool {
+        if (rows == 0 || cols == 0) {
+            return 0;
+        }
+        if (rows > UINT32_MAX || cols > UINT32_MAX ||
+            data_ptr == nullptr || row_gate_ptr == nullptr || out_ptr == nullptr) {
+            return 1845;
+        }
+        const size_t total_elems = rows * cols;
+        if (cols != 0 && total_elems / cols != rows) {
+            return 1846;
+        }
+        if (total_elems > UINT32_MAX) {
+            return 1847;
+        }
+
+        NSError* pipeline_error = nil;
+        id<MTLComputePipelineState> pipeline = sigmoid_mul_row_scalar_pipeline_bf16(&pipeline_error);
+        if (pipeline == nil) {
+            return 1848;
+        }
+
+        id<MTLBuffer> data = nil;
+        id<MTLBuffer> row_gate = nil;
+        id<MTLBuffer> out = nil;
+        size_t data_offset = 0;
+        size_t row_gate_offset = 0;
+        size_t out_offset = 0;
+        if (lookup_buffer(data_ptr, &data, &data_offset) != 0) {
+            return 1849;
+        }
+        if (lookup_buffer(row_gate_ptr, &row_gate, &row_gate_offset) != 0) {
+            return 1850;
+        }
+        if (lookup_buffer(out_ptr, &out, &out_offset) != 0) {
+            return 1851;
+        }
+
+        RowScalarSigmoidParams params = {
+            static_cast<uint32_t>(rows),
+            static_cast<uint32_t>(cols),
+            static_cast<uint32_t>(total_elems),
+        };
+
+        return encode_or_submit_labeled([&](id<MTLComputeCommandEncoder> encoder) {
+            [encoder setComputePipelineState:pipeline];
+            [encoder setBuffer:data offset:data_offset atIndex:0];
+            [encoder setBuffer:row_gate offset:row_gate_offset atIndex:1];
+            [encoder setBuffer:out offset:out_offset atIndex:2];
+            [encoder setBytes:&params length:sizeof(params) atIndex:3];
+
+            NSUInteger tg_width =
+                std::min<NSUInteger>(256, std::max<NSUInteger>(1, pipeline.maxTotalThreadsPerThreadgroup));
+            MTLSize threads_per_group = MTLSizeMake(tg_width, 1, 1);
+            MTLSize threads_per_grid = MTLSizeMake(total_elems, 1, 1);
+            [encoder dispatchThreads:threads_per_grid threadsPerThreadgroup:threads_per_group];
+        }, "sigmoid_mul_row_scalar", 1852, 1853, 1854, 1855);
+    }
 }
 
 extern "C" int supersonic_metal_full_attention_gate_bf16(

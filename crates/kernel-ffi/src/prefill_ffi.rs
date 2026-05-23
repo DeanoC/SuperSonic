@@ -3551,6 +3551,35 @@ pub fn sigmoid_mul(
     })
 }
 
+/// BF16 row-wise scalar gate: `out[row, col] = data[row, col] * sigmoid(row_gate[row])`.
+pub fn sigmoid_mul_row_scalar_bf16(
+    ordinal: usize,
+    rows: usize,
+    cols: usize,
+    data: &GpuBuffer,
+    row_gate: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if out.backend() != Backend::Metal {
+        return Err(GpuError::backend(
+            out.backend(),
+            "sigmoid_mul_row_scalar_bf16 is currently implemented only for Metal".into(),
+        ));
+    }
+    let _ = ordinal;
+    if !metal_native::disabled_by_env() {
+        let result = metal_profile_time("sigmoid_mul_row_scalar", "native", || {
+            metal_native::sigmoid_mul_row_scalar_bf16(rows, cols, data, row_gate, out)
+        });
+        if result.is_ok() {
+            return result;
+        }
+    }
+    metal_profile_host_time("sigmoid_mul_row_scalar", || {
+        metal_host::sigmoid_mul_row_scalar_bf16(rows, cols, data, row_gate, out)
+    })
+}
+
 // ---- Compute beta/g for delta recurrent ----
 
 /// Compute beta = sigmoid(B) and g = -softplus(A + dt_bias) * a_log_exp.

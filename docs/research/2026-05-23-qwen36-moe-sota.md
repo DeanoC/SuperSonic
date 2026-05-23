@@ -359,6 +359,16 @@ under the same smoke:
    cut prefill orchestration, UMA `copy_h2d` volume, and linear-attention
    command-buffer volume?"
 
+   The fourth slice removes the shared-expert scalar-gate host broadcast from
+   that prototype. A native Metal BF16 row-scalar sigmoid multiply consumes the
+   `[N, 1]` shared gate directly and writes the `[N, hidden]` shared output,
+   avoiding the D2H scalar read, expanded-gate H2D write, and per-layer temp
+   allocation. The follow-up 512-token normal smoke measured 12.47s prefill and
+   172.54 ms/token with the same `[271]` sanity row. The profiled
+   `sigmoid_mul_row_scalar` row measured 11.859 ms native wall and 0.725 ms GPU
+   time across 40 layers, so the next target remains orchestration plus the
+   measured linear-attention, full-attention, and routed-expert direct rows.
+
 3. **Static top-N resident MPS table probe**
    Use route profiles to choose top-N experts per layer, materialize FP16 MPS
    RHS once, fall back on misses, and measure real prompts.

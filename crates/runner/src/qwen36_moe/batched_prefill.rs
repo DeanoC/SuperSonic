@@ -1619,6 +1619,8 @@ struct GroupedFfnScratch {
     shared_gate_scalar: GpuBuffer,
     /// `[N, hidden]` BF16 — shared expert output after sigmoid gating.
     shared_out: GpuBuffer,
+    /// `[N, hidden]` BF16 — fallback temp for shared expert scalar gating.
+    shared_out_final: GpuBuffer,
 }
 
 impl GroupedFfnScratch {
@@ -1672,6 +1674,8 @@ impl GroupedFfnScratch {
             .context("alloc grouped_ffn shared_gate_scalar")?;
         let shared_out = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[n, hidden])
             .context("alloc grouped_ffn shared_out")?;
+        let shared_out_final = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[n, hidden])
+            .context("alloc grouped_ffn shared_out_final")?;
 
         Ok(Self {
             n,
@@ -1696,6 +1700,7 @@ impl GroupedFfnScratch {
             shared_down,
             shared_gate_scalar,
             shared_out,
+            shared_out_final,
         })
     }
 }
@@ -2093,58 +2098,44 @@ fn process_ffn_batched_grouped(
     )
     .map_err(|e| anyhow!("matmul shared_expert_gate: {e}"))?;
     //    7f. shared_out = sigmoid(shared_gate_scalar) * shared_down.
-    //         The scalar gate is broadcast across the hidden dim per token.
-    //         `sigmoid_mul(data, gate)` computes `data * sigmoid(gate)` over
-    //         matching shapes — but our gate is [N, 1] and data is [N, hidden].
-    //         We expand the gate to [N, hidden] on the host (cheap) and call
-    //         sigmoid_mul over the full N*hidden span.
-    expand_scalar_gate_bf16(
-        ordinal,
-        n,
-        hidden,
-        &scratch.shared_gate_scalar,
-        &mut scratch.shared_out, // reuse shared_out as the temp expanded gate
-    )?;
-    // Now shared_out holds the broadcast gate; we want out = down * sigmoid(gate).
-    // sigmoid_mul writes into the OUT slot from data + gate. Use a temporary
-    // alias: data=shared_down, gate=shared_out (expanded gate), out=shared_out
-    // — sigmoid_mul reads gate and data, then writes out. Aliasing out=gate is
-    // safe as long as the kernel reads gate before writing out per-element
-    // (it does). To be defensive, allocate a tiny temp. The cleanest path is
-    // to use a separate output: we'll reuse `shared_silu_mul` shape doesn't
-    // match (it's [N, shared_intermediate]) — so we need [N, hidden]. The
-    // simplest defensive fix is a local temporary. Allocation per layer is
-    // wasteful; instead we sequence: compute shared_out_temp into a separate
-    // buffer. But to keep the scratch struct stable, use a `combined`-shaped
-    // temp. Actually, sigmoid_mul on HIP reads both inputs into registers
-    // before writing the output (kernel `pfx_sigmoid_mul` uses `out[i] =
-    // data[i] * sigmoid(gate[i])` per thread — single load each), so
-    // out aliasing gate is safe. Verified in
-    // `kernels/qwen35_prefill/sigmoid_mul.hip` style kernels.
-    //
-    // Be conservative: allocate a transient buffer instead of relying on
-    // alias-safety semantics that may shift between backends. Cost is one
-    // alloc per layer per chunk = 40 * num_chunks; tiny.
-    let mut shared_out_final = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[n, hidden])
-        .context("alloc shared_out_final temp")?;
-    prefill_ffi::sigmoid_mul(
-        ordinal,
-        ScalarType::BF16,
-        n * hidden,
-        &scratch.shared_down,
-        &scratch.shared_out, // expanded gate
-        &mut shared_out_final,
-    )
-    .map_err(|e| anyhow!("sigmoid_mul shared: {e}"))?;
-    // Copy final result back into `scratch.shared_out` so downstream
-    // residual-add reads the right buffer.
-    gpu_hal::copy_d2d(
-        ordinal,
-        scratch.shared_out.as_mut_ptr(),
-        shared_out_final.as_ptr(),
-        n * hidden * 2,
-    )
-    .context("d2d shared_out_final -> shared_out")?;
+    //         Metal uses a row-scalar kernel so the `[N, 1]` gate never
+    //         round-trips through host memory as an expanded `[N, hidden]`
+    //         buffer. HIP/CUDA keep the older explicit expansion path for now.
+    if scratch.shared_down.backend() == Backend::Metal {
+        prefill_ffi::sigmoid_mul_row_scalar_bf16(
+            ordinal,
+            n,
+            hidden,
+            &scratch.shared_down,
+            &scratch.shared_gate_scalar,
+            &mut scratch.shared_out,
+        )
+        .map_err(|e| anyhow!("sigmoid_mul_row_scalar shared: {e}"))?;
+    } else {
+        expand_scalar_gate_bf16(
+            ordinal,
+            n,
+            hidden,
+            &scratch.shared_gate_scalar,
+            &mut scratch.shared_out, // reuse shared_out as the temp expanded gate
+        )?;
+        prefill_ffi::sigmoid_mul(
+            ordinal,
+            ScalarType::BF16,
+            n * hidden,
+            &scratch.shared_down,
+            &scratch.shared_out,
+            &mut scratch.shared_out_final,
+        )
+        .map_err(|e| anyhow!("sigmoid_mul shared: {e}"))?;
+        gpu_hal::copy_d2d(
+            ordinal,
+            scratch.shared_out.as_mut_ptr(),
+            scratch.shared_out_final.as_ptr(),
+            n * hidden * 2,
+        )
+        .context("d2d shared_out_final -> shared_out")?;
+    }
 
     // 8. Residual add: chunk_hidden += combined; chunk_hidden += shared_out.
     prefill_ffi::element_add_inplace(

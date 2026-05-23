@@ -579,6 +579,13 @@ unsafe extern "C" {
         gate_ptr: *const c_void,
         out_ptr: *mut c_void,
     ) -> c_int;
+    fn supersonic_metal_sigmoid_mul_row_scalar_bf16(
+        rows: usize,
+        cols: usize,
+        data_ptr: *const c_void,
+        row_gate_ptr: *const c_void,
+        out_ptr: *mut c_void,
+    ) -> c_int;
     fn supersonic_metal_swiglu_mul_bf16(
         total_elems: usize,
         gate_ptr: *const c_void,
@@ -3300,6 +3307,54 @@ pub(crate) fn sigmoid_mul(
 }
 
 #[cfg(all(target_os = "macos", supersonic_backend_metal))]
+pub(crate) fn sigmoid_mul_row_scalar_bf16(
+    rows: usize,
+    cols: usize,
+    data: &GpuBuffer,
+    row_gate: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    let total_elems = rows.checked_mul(cols).ok_or_else(|| {
+        GpuError::InvalidArg(format!(
+            "metal native sigmoid_mul_row_scalar_bf16 size overflow: rows={rows} cols={cols}"
+        ))
+    })?;
+    if total_elems > u32::MAX as usize {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native sigmoid_mul_row_scalar_bf16 supports at most {} elements, got {total_elems}",
+            u32::MAX
+        )));
+    }
+    if data.dtype() != ScalarType::BF16
+        || row_gate.dtype() != ScalarType::BF16
+        || out.dtype() != ScalarType::BF16
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native sigmoid_mul_row_scalar_bf16 expects BF16 buffers, got {:?}/{:?}/{:?}",
+            data.dtype(),
+            row_gate.dtype(),
+            out.dtype()
+        )));
+    }
+    let status = unsafe {
+        supersonic_metal_sigmoid_mul_row_scalar_bf16(
+            rows,
+            cols,
+            data.as_ptr(),
+            row_gate.as_ptr(),
+            out.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!("metal native sigmoid_mul_row_scalar_bf16 failed with status {status}"),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
 pub(crate) fn full_attention_gate_bf16(
     total_elems: usize,
     attn_f32: &GpuBuffer,
@@ -5523,6 +5578,20 @@ pub(crate) fn sigmoid_mul(
     Err(GpuError::backend(
         Backend::Metal,
         "metal native sigmoid_mul is not compiled".into(),
+    ))
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+pub(crate) fn sigmoid_mul_row_scalar_bf16(
+    _rows: usize,
+    _cols: usize,
+    _data: &GpuBuffer,
+    _row_gate: &GpuBuffer,
+    _out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    Err(GpuError::backend(
+        Backend::Metal,
+        "metal native sigmoid_mul_row_scalar_bf16 is not compiled".into(),
     ))
 }
 

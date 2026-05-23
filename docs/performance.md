@@ -913,10 +913,24 @@ across 40 layers, GPU timestamps of 1.903s for
 for `command_buffer_gpu:qwen36_batched_prefill_grouped_expert_down_combine`,
 while `command_buffer_wait` was still the top Metal row at 33.184s and HAL
 `copy_h2d` accounted for 4.335s. On Apple UMA this is buffer
-materialization/copy bookkeeping rather than PCIe upload. That makes the next
-measured target prefill orchestration, UMA `copy_h2d` volume, and
-linear-attention command-buffer volume, not more per-token MPS slab
-materialization.
+materialization/copy bookkeeping rather than PCIe upload.
+
+The next measured slice removes the shared-expert scalar-gate host broadcast in
+the Metal batched-prefill prototype. A native BF16 row-scalar sigmoid multiply
+keeps the `[N, 1]` gate on Metal and writes the `[N, hidden]` shared output
+directly. The follow-up 512-token normal prototype smoke measured 12.47s
+prefill and 172.54 ms/token with the same `[271]` generated-token sanity row.
+The profiled run still carries heavy attribution overhead, but the new
+`sigmoid_mul_row_scalar` row itself is small: 40 calls, 11.859 ms native wall,
+and 0.725 ms GPU timestamp total. It also removes 40 D2H scalar-gate reads, 40
+expanded-gate H2D writes, 40 transient temp allocations, and about 68 MB of D2D
+traffic from the prior prototype profile. The remaining top rows are
+`command_buffer_wait`, `qwen36_linear_int4_stage5`,
+`qwen36_batched_prefill_grouped_expert_direct`, and
+`full_attention_prefill_strided`; HAL `copy_h2d` is still dominated by
+materializing the baked model buffers. That makes the next measured target
+prefill orchestration, linear-attention command-buffer volume, full-attention
+prefill, and routed-expert direct work, not per-token MPS slab materialization.
 `tests/metal/audit_qwen36_mtp.py` is the speculative-decode readiness audit. It
 checks the source snapshot for the split MTP expert tensors and the INT4 bake
 for the 19 folded `mtp.*` tensors loaded by the runtime. On this local M5 Max

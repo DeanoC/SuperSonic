@@ -938,6 +938,33 @@ pub(crate) fn sigmoid_mul(
     Ok(())
 }
 
+pub(crate) fn sigmoid_mul_row_scalar_bf16(
+    rows: usize,
+    cols: usize,
+    data: &GpuBuffer,
+    row_gate: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    let total_elems = rows.checked_mul(cols).ok_or_else(|| {
+        unsupported(
+            "sigmoid_mul_row_scalar_bf16",
+            format!("size overflow: rows={rows} cols={cols}"),
+        )
+    })?;
+    let data = unsafe { bf16_slice(data.as_ptr(), total_elems) };
+    let row_gate = unsafe { bf16_slice(row_gate.as_ptr(), rows) };
+    let out = unsafe { bf16_slice_mut(out.as_mut_ptr(), total_elems) };
+    for row in 0..rows {
+        let sig = sigmoid(bf16_to_f32(row_gate[row]));
+        let row_off = row * cols;
+        for col in 0..cols {
+            let idx = row_off + col;
+            out[idx] = f32_to_bf16_bits(bf16_to_f32(data[idx]) * sig);
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn compute_beta_g(
     dtype: ScalarType,
     seq_len: usize,
@@ -1768,6 +1795,28 @@ mod tests {
                 "idx {idx}: expected {e}, got {a}, delta {delta} > tol {tol}"
             );
         }
+    }
+
+    #[test]
+    fn metal_host_sigmoid_mul_row_scalar_bf16_matches_reference() {
+        use_metal_backend();
+        let ordinal = 0usize;
+        let data_vals = [1.0f32, -2.0, 0.5, 10.0, 3.0, -4.0];
+        let gate_vals = [0.0f32, 2.0];
+        let data =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[2, 3], &bf16_bytes(&data_vals))
+                .expect("upload data");
+        let gates =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[2, 1], &bf16_bytes(&gate_vals))
+                .expect("upload gates");
+        let mut out = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[2, 3]).expect("alloc out");
+        sigmoid_mul_row_scalar_bf16(2, 3, &data, &gates, &mut out).expect("row scalar sigmoid");
+        let expected: Vec<f32> = data_vals
+            .chunks_exact(3)
+            .zip(gate_vals)
+            .flat_map(|(row, gate)| row.iter().map(move |v| v * sigmoid(gate)))
+            .collect();
+        assert_close(&read_bf16(&out), &expected, 0.02);
     }
 
     #[test]

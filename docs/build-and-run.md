@@ -506,7 +506,14 @@ prefill while keeping router/top-k and shared-expert work on the existing host
 or primitive path. It is not the supported default lane yet. The first local
 512-token normal smoke generated the same `[271]` one-token sanity row and
 reduced prefill to 22.15s; the profiled smoke measured 34.20s because it splits
-the routed-expert gate/up and down/combine phases for attribution.
+the routed-expert gate/up and down/combine phases for attribution. A follow-up
+Metal row-scalar sigmoid kernel now avoids expanding the shared-expert scalar
+gate through host memory; the 512-token normal prototype smoke measured 12.47s
+prefill and 172.54 ms/token with the same `[271]` sanity row. The profiled row
+shows `sigmoid_mul_row_scalar` at 11.859 ms native wall and 0.725 ms GPU time
+across 40 layers, so the next measured pressure remains command-buffer
+orchestration, linear-attention volume, full-attention prefill, and routed
+expert direct work.
 The MTP audit writes `target/qwen36_mtp_audit.json` and
 `target/qwen36_mtp_audit.md`. It checks the local safetensors index for the
 split source MTP tensors, checks the INT4 bake manifest for the 19 folded
