@@ -89,6 +89,16 @@ struct Qwen36FfnInt4Params {
     uint32_t off_moe_out;
 };
 
+struct Qwen36FfnExpertGateUpTiledParams {
+    uint hidden;
+    uint moe_intermediate;
+    uint top_k;
+    uint group_size;
+    uint off_h_norm;
+    uint off_topk_idx;
+    uint off_expert_mid;
+};
+
 struct Qwen36LinearInt4Params {
     uint32_t hidden;
     uint32_t num_k_heads;
@@ -2481,6 +2491,7 @@ struct Qwen36FfnInt4Pipelines {
     __strong id<MTLComputePipelineState> shared_scalar = nil;
     __strong id<MTLComputePipelineState> shared_down = nil;
     __strong id<MTLComputePipelineState> expert_gate_up = nil;
+    __strong id<MTLComputePipelineState> expert_gate_up_tiled = nil;
     __strong id<MTLComputePipelineState> expert_down_finalize = nil;
 };
 
@@ -2519,6 +2530,16 @@ struct Qwen36FfnInt4Params {
     uint off_shared_out;
     uint off_expert_mid;
     uint off_moe_out;
+};
+
+struct Qwen36FfnExpertGateUpTiledParams {
+    uint hidden;
+    uint moe_intermediate;
+    uint top_k;
+    uint group_size;
+    uint off_h_norm;
+    uint off_topk_idx;
+    uint off_expert_mid;
 };
 
 inline float bf16_round_rne_finite(float x) {
@@ -2692,6 +2713,60 @@ kernel void supersonic_qwen36_ffn_expert_gate_up(
     }
 }
 
+kernel void supersonic_qwen36_ffn_expert_gate_up_tiled(
+    device float* workspace [[buffer(0)]],
+    device const uchar* gate_up_proj [[buffer(1)]],
+    device const bfloat* gate_up_scale [[buffer(2)]],
+    device const bfloat* gate_up_zero [[buffer(3)]],
+    constant Qwen36FfnExpertGateUpTiledParams& params [[buffer(4)]],
+    threadgroup float* partials [[threadgroup(0)]],
+    uint3 tg [[threadgroup_position_in_grid]],
+    uint thread_id [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd_id [[simdgroup_index_in_threadgroup]]
+) {
+    uint row = tg.x;
+    uint group = tg.y;
+    if (row >= params.moe_intermediate || group >= params.top_k) {
+        return;
+    }
+    uint expert = as_type<uint>(workspace[params.off_topk_idx + group]);
+    uint rows = 2u * params.moe_intermediate;
+    float gate_partial = 0.0f;
+    float up_partial = 0.0f;
+    for (uint col = thread_id; col < params.hidden; col += 256u) {
+        float x = workspace[params.off_h_norm + col];
+        gate_partial += int4_weight_expert(
+            gate_up_proj, gate_up_scale, gate_up_zero,
+            expert, row, rows, col, params.hidden, params.group_size
+        ) * x;
+        up_partial += int4_weight_expert(
+            gate_up_proj, gate_up_scale, gate_up_zero,
+            expert, params.moe_intermediate + row, rows,
+            col, params.hidden, params.group_size
+        ) * x;
+    }
+
+    float gate_simd = simd_sum(gate_partial);
+    float up_simd = simd_sum(up_partial);
+    if (lane == 0u) {
+        partials[simd_id] = gate_simd;
+        partials[8u + simd_id] = up_simd;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_id == 0u) {
+        float gate_in = lane < 8u ? partials[lane] : 0.0f;
+        float up_in = lane < 8u ? partials[8u + lane] : 0.0f;
+        float gate = simd_sum(gate_in);
+        float up = simd_sum(up_in);
+        if (lane == 0u) {
+            workspace[params.off_expert_mid + group * params.moe_intermediate + row] =
+                silu(gate) * up;
+        }
+    }
+}
+
 kernel void supersonic_qwen36_ffn_expert_down_finalize(
     device float* workspace [[buffer(0)]],
     device const bfloat* input_hidden [[buffer(1)]],
@@ -2751,6 +2826,7 @@ kernel void supersonic_qwen36_ffn_expert_down_finalize(
                         @"supersonic_qwen36_ffn_shared_scalar",
                         @"supersonic_qwen36_ffn_shared_down",
                         @"supersonic_qwen36_ffn_expert_gate_up",
+                        @"supersonic_qwen36_ffn_expert_gate_up_tiled",
                         @"supersonic_qwen36_ffn_expert_down_finalize",
                     ];
                     for (NSString* name in names) {
@@ -2785,6 +2861,8 @@ kernel void supersonic_qwen36_ffn_expert_down_finalize(
                             pipelines.shared_down = pipeline;
                         } else if ([name isEqualToString:@"supersonic_qwen36_ffn_expert_gate_up"]) {
                             pipelines.expert_gate_up = pipeline;
+                        } else if ([name isEqualToString:@"supersonic_qwen36_ffn_expert_gate_up_tiled"]) {
+                            pipelines.expert_gate_up_tiled = pipeline;
                         } else if ([name isEqualToString:@"supersonic_qwen36_ffn_expert_down_finalize"]) {
                             pipelines.expert_down_finalize = pipeline;
                         }
@@ -10567,6 +10645,97 @@ extern "C" int supersonic_metal_qwen36_linear_int4_stage5(
             1178,
             1179,
             1180
+        );
+    }
+}
+
+extern "C" int supersonic_metal_qwen36_ffn_expert_gate_up_tiled(
+    size_t hidden,
+    size_t moe_intermediate,
+    size_t top_k,
+    size_t group_size,
+    void* workspace_ptr,
+    const void* gate_up_proj_ptr,
+    const void* gate_up_scale_ptr,
+    const void* gate_up_zero_ptr,
+    size_t off_h_norm,
+    size_t off_topk_idx,
+    size_t off_expert_mid,
+    int wait_for_completion
+) {
+    @autoreleasepool {
+        if (hidden == 0 || moe_intermediate == 0 || top_k == 0 || group_size == 0 ||
+            workspace_ptr == nullptr || gate_up_proj_ptr == nullptr ||
+            gate_up_scale_ptr == nullptr || gate_up_zero_ptr == nullptr) {
+            return 1181;
+        }
+        if (hidden > UINT32_MAX || moe_intermediate > UINT32_MAX ||
+            top_k > UINT32_MAX || group_size > UINT32_MAX ||
+            off_h_norm > UINT32_MAX || off_topk_idx > UINT32_MAX ||
+            off_expert_mid > UINT32_MAX) {
+            return 1182;
+        }
+        if ((hidden % 2) != 0 || (moe_intermediate % 2) != 0) {
+            return 1183;
+        }
+
+        NSError* pipeline_error = nil;
+        Qwen36FfnInt4Pipelines pipelines = qwen36_ffn_int4_pipelines(&pipeline_error);
+        if (pipelines.expert_gate_up_tiled == nil) {
+            return 1184;
+        }
+
+        id<MTLBuffer> workspace = nil;
+        id<MTLBuffer> gate_up_proj = nil;
+        id<MTLBuffer> gate_up_scale = nil;
+        id<MTLBuffer> gate_up_zero = nil;
+        size_t workspace_offset = 0;
+        size_t gate_up_proj_offset = 0;
+        size_t gate_up_scale_offset = 0;
+        size_t gate_up_zero_offset = 0;
+        if (lookup_buffer(workspace_ptr, &workspace, &workspace_offset) != 0) return 1185;
+        if (lookup_buffer(gate_up_proj_ptr, &gate_up_proj, &gate_up_proj_offset) != 0) return 1186;
+        if (lookup_buffer(gate_up_scale_ptr, &gate_up_scale, &gate_up_scale_offset) != 0) return 1187;
+        if (lookup_buffer(gate_up_zero_ptr, &gate_up_zero, &gate_up_zero_offset) != 0) return 1188;
+
+        Qwen36FfnExpertGateUpTiledParams params = {
+            static_cast<uint32_t>(hidden),
+            static_cast<uint32_t>(moe_intermediate),
+            static_cast<uint32_t>(top_k),
+            static_cast<uint32_t>(group_size),
+            static_cast<uint32_t>(off_h_norm),
+            static_cast<uint32_t>(off_topk_idx),
+            static_cast<uint32_t>(off_expert_mid),
+        };
+
+        auto encode = [&](id<MTLComputeCommandEncoder> encoder) {
+            [encoder setComputePipelineState:pipelines.expert_gate_up_tiled];
+            [encoder setBuffer:workspace offset:workspace_offset atIndex:0];
+            [encoder setBuffer:gate_up_proj offset:gate_up_proj_offset atIndex:1];
+            [encoder setBuffer:gate_up_scale offset:gate_up_scale_offset atIndex:2];
+            [encoder setBuffer:gate_up_zero offset:gate_up_zero_offset atIndex:3];
+            [encoder setBytes:&params length:sizeof(params) atIndex:4];
+            [encoder setThreadgroupMemoryLength:16 * sizeof(float) atIndex:0];
+            [encoder dispatchThreadgroups:MTLSizeMake(moe_intermediate, top_k, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        };
+        if (wait_for_completion != 0) {
+            return encode_or_submit_labeled(
+                encode,
+                "qwen36_ffn_int4_expert_gate_up_tiled",
+                1189,
+                1190,
+                1191,
+                1192
+            );
+        }
+        return encode_or_submit_labeled_async(
+            encode,
+            "qwen36_ffn_int4_expert_gate_up_tiled",
+            1189,
+            1190,
+            1191,
+            1192
         );
     }
 }

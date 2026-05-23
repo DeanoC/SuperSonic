@@ -76,6 +76,10 @@ path = "src/bin/llama31_certified_kv_microbench.rs"
 name = "bench_prefill_attn"
 path = "src/bin/bench_prefill_attn.rs"
 
+[[bin]]
+name = "qwen36_ffn_expert_microbench"
+path = "src/bin/qwen36_ffn_expert_microbench.rs"
+
 [dependencies]
 machine-profile = { path = "../machine-profile" }
 supersonic-core = { path = "../core" }

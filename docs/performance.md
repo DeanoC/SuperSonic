@@ -830,7 +830,12 @@ host-orchestrated INT4 fallback, but routed expert gate/up and down work is now
 batched across top-k experts to reduce per-layer thread orchestration. Native
 FFN projection work remains explicit opt-in with
 `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5=1`; profile runs no longer
-switch the FFN implementation underneath the headline lane.
+switch the FFN implementation underneath the headline lane. A newer
+gate/up-only tiled routed-expert kernel is also available as a diagnostic
+microbench and explicit decode experiment via
+`SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_GATE_UP_TILED=1`, but it is not
+promoted because the real decode path must still synchronize back to host for
+expert down/finalize.
 
 Reproduce the run with:
 
@@ -844,7 +849,8 @@ The local-main-target workflow for this machine is:
 2. headline decode gate: the `bench-perf --arch apple-m5-max --models qwen3.6-35b-a3b --quants int4` command above
 3. long-context smoke: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/bench_qwen36_longctx.py --preset smoke`
 4. profile smoke: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/bench_qwen36_longctx.py --preset smoke --metal-profile`
-5. long-context comparison: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/bench_qwen36_longctx.py --preset comparison`
+5. routed-expert FFN microbench: `target/release/qwen36_ffn_expert_microbench --iters 20 --warmup 3`
+6. long-context comparison: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/bench_qwen36_longctx.py --preset comparison`
 
 The Metal long-context harness writes `target/qwen36_metal_longctx.json` and
 `target/qwen36_metal_longctx.md`. It uses deterministic NIAH-style prompts and
@@ -948,19 +954,41 @@ The headline median is the unprofiled median-of-3 run (`144.2`, `141.3`,
 `147.2` ms/token). The stage table comes from the extra profile attribution run
 and carries profiling overhead, but now follows the same default FFN path as
 the headline samples. A default one-token smoke generated the expected token
-`[11]` and measured `ffn_ms_avg=183.144`. The explicit native FFN escape hatch
-also generated `[11]`; adding command-buffer barriers reduced that opt-in path
-from roughly 1501 ms to `ffn_ms_avg=635.555`, but it remains too slow to
-promote.
+`[11]`; the latest local cold one-token profile measured `ffn_ms_avg=128.573`,
+with `qwen36_ffn_host_expert_gate_up` at 56.839 ms total and
+`qwen36_ffn_host_expert_down` at 36.181 ms total. The explicit full native FFN
+escape hatch also generated `[11]`, but remains too slow to promote
+(`ffn_ms_avg=640.553` in the same one-token smoke shape).
 
-The next measured bottleneck is routed-expert FFN math on the host fallback,
-with Metal command-buffer wait still visible behind the linear path. The top
-profile rows are `qwen36_linear_int4_stage5` at 1203.601 ms total,
-`command_buffer_wait` at 1193.995 ms, `qwen36_ffn_host_expert_gate_up`
-at 864.719 ms, and `qwen36_ffn_host_expert_down` at 458.261 ms across the
-attribution run. The next runtime optimization should therefore target a real
-tiled/batched FFN expert kernel or an MPS/MPP-backed expert matvec bridge,
-rather than promoting the current row-per-output native FFN kernels.
+The focused routed-expert gate/up microbench exercises the exact Qwen3.6 stage-5
+INT4 shape (`hidden=2048`, `num_experts=256`, `moe_intermediate=512`,
+`top_k=8`, `group_size=128`) without the rest of decode:
+
+```bash
+cargo build --release -p runner --bin qwen36_ffn_expert_microbench
+target/release/qwen36_ffn_expert_microbench --iters 20 --warmup 3
+```
+
+On this M5 Max it reports `mean_ms=0.5962`, `max_abs=0.000015`, and
+`mismatches=0`. Wired into decode with
+`SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_GATE_UP_TILED=1`, the same kernel
+still generates `[11]`, and the Metal profile shows only 8.418 ms total GPU
+time for `command_buffer_gpu:qwen36_ffn_int4_expert_gate_up_tiled` across
+40 layers. The wall-time op row is much worse, however:
+`qwen36_ffn_int4_expert_gate_up_tiled` records 277.396 ms total because each
+layer must wait before the host expert-down path reads `expert_mid`. That makes
+the gate/up-only decode experiment a diagnostic step, not the default path.
+
+The next measured bottleneck is still routed-expert FFN, but the target is now
+more precise: keep `expert_mid` on GPU and fuse/chain expert-down plus top-k
+finalize/residual before making gate/up native. The top default one-token
+profile rows are `qwen36_linear_int4_stage5`, `command_buffer_wait`,
+`qwen36_ffn_host_expert_gate_up`, and `qwen36_ffn_host_expert_down`; the
+gate/up-only experiment proves the raw Metal kernel is cheap while the current
+CPU/GPU handoff dominates. The next runtime optimization should therefore be a
+single routed-expert FFN GPU path that includes gate/up, SiLU, down, top-k
+combine, shared add, and residual, or an MPS/MPP-backed expert matvec bridge
+that avoids per-layer host synchronization.
 
 Unsupported Metal constraints remain explicit for this target: persistent
 decode, KV-FP8, speculative decode, batching, and Metal VMM are not benchmarked

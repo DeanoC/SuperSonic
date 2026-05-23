@@ -122,6 +122,20 @@ unsafe extern "C" {
         output_ptr: *mut c_void,
         wait_for_completion: c_int,
     ) -> c_int;
+    fn supersonic_metal_qwen36_ffn_expert_gate_up_tiled(
+        hidden: usize,
+        moe_intermediate: usize,
+        top_k: usize,
+        group_size: usize,
+        workspace_ptr: *mut c_void,
+        gate_up_proj_ptr: *const c_void,
+        gate_up_scale_ptr: *const c_void,
+        gate_up_zero_ptr: *const c_void,
+        off_h_norm: usize,
+        off_topk_idx: usize,
+        off_expert_mid: usize,
+        wait_for_completion: c_int,
+    ) -> c_int;
     fn supersonic_metal_qwen36_linear_int4_stage5(
         hidden: usize,
         num_k_heads: usize,
@@ -1437,6 +1451,60 @@ pub(crate) unsafe fn qwen36_linear_int4_stage5(
         return Err(GpuError::backend(
             Backend::Metal,
             format!("metal native qwen36_linear_int4_stage5 failed with status {status}"),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn qwen36_ffn_expert_gate_up_tiled(
+    hidden: usize,
+    moe_intermediate: usize,
+    top_k: usize,
+    group_size: usize,
+    workspace: *mut c_void,
+    gate_up_proj: *const c_void,
+    gate_up_scale: *const c_void,
+    gate_up_zero: *const c_void,
+    off_h_norm: usize,
+    off_topk_idx: usize,
+    off_expert_mid: usize,
+    wait_for_completion: bool,
+) -> Result<(), GpuError> {
+    if hidden == 0
+        || moe_intermediate == 0
+        || top_k == 0
+        || group_size == 0
+        || workspace.is_null()
+        || gate_up_proj.is_null()
+        || gate_up_scale.is_null()
+        || gate_up_zero.is_null()
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native qwen36_ffn_expert_gate_up_tiled invalid shape: hidden={hidden} moe_intermediate={moe_intermediate} top_k={top_k} group_size={group_size}"
+        )));
+    }
+    let status = unsafe {
+        supersonic_metal_qwen36_ffn_expert_gate_up_tiled(
+            hidden,
+            moe_intermediate,
+            top_k,
+            group_size,
+            workspace,
+            gate_up_proj,
+            gate_up_scale,
+            gate_up_zero,
+            off_h_norm,
+            off_topk_idx,
+            off_expert_mid,
+            i32::from(wait_for_completion),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!("metal native qwen36_ffn_expert_gate_up_tiled failed with status {status}"),
         ));
     }
     Ok(())
@@ -4156,6 +4224,28 @@ pub(crate) unsafe fn qwen36_linear_int4_stage5(
     Err(GpuError::backend(
         Backend::Metal,
         "metal native qwen36_linear_int4_stage5 is not compiled".into(),
+    ))
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn qwen36_ffn_expert_gate_up_tiled(
+    _hidden: usize,
+    _moe_intermediate: usize,
+    _top_k: usize,
+    _group_size: usize,
+    _workspace: *mut c_void,
+    _gate_up_proj: *const c_void,
+    _gate_up_scale: *const c_void,
+    _gate_up_zero: *const c_void,
+    _off_h_norm: usize,
+    _off_topk_idx: usize,
+    _off_expert_mid: usize,
+    _wait_for_completion: bool,
+) -> Result<(), GpuError> {
+    Err(GpuError::backend(
+        Backend::Metal,
+        "metal native qwen36_ffn_expert_gate_up_tiled is not compiled".into(),
     ))
 }
 

@@ -303,8 +303,11 @@ Metal currently rejects or defers:
   experts; `SUPERSONIC_METAL_PROFILE=1` profiles that default lane rather than
   switching implementations. The experimental native FFN path remains explicit
   opt-in via `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5=1`; routed expert
-  gate/up and down matvecs are the next measured optimization target. The
-  one-token local smoke is:
+  gate/up and down matvecs are the next measured optimization target. A
+  gate/up-only tiled routed-expert kernel can be tested with
+  `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_GATE_UP_TILED=1`, but it is
+  diagnostic-only until expert down/finalize can consume the intermediate on
+  GPU. The one-token local smoke is:
   `cargo run --release --bin supersonic -- --backend metal --model qwen3.6-35b-a3b --model-dir /path/to/Qwen3.6-35B-A3B --int4 --prompt "Hello" --max-new-tokens 1 --emit-stage-timings`.
   FP8-runtime, KV-FP8, speculative decode, and persistent decode remain
   unsupported on this Metal path.
@@ -324,6 +327,8 @@ Native Metal kernels used in the hot path:
 - Qwen3.6 stage-5 linear-attention INT4 fused projection/recurrent path
 - Qwen3.6 stage-5 FFN INT4 projection kernels for explicit opt-in
   experiments
+- Qwen3.6 routed-expert gate/up tiled INT4 kernel for focused FFN
+  microbenching and explicit opt-in attribution
 - linear prefill conv pack
 - element add
 - cast
@@ -410,6 +415,9 @@ SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" \
 
 SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" \
   python3 tests/metal/bench_qwen36_longctx.py --preset smoke --metal-profile
+
+cargo build --release -p runner --bin qwen36_ffn_expert_microbench
+target/release/qwen36_ffn_expert_microbench --iters 20 --warmup 3
 ```
 
 Use the long-context harness with `--preset comparison` before choosing the
@@ -424,8 +432,12 @@ The current M5 Max perf gate points at linear-attention as the next measured
 multi-token per-token bucket after FFN fallback tightening. The 512-token
 `--metal-profile` smoke currently reports roughly 269 ms/token, 71.7 s prefill,
 and a clear NIAH miss row; its one-token row is lm-head/tail dominated, while
-the Metal profile totals still point at FFN command-buffer wait. The native FFN
-opt-in path stays attribution-only until that command-buffer wait is reduced.
+the Metal profile totals still point at FFN command-buffer wait. The routed
+expert gate/up microbench reports `mean_ms=0.5962` with zero mismatches on the
+exact Qwen3.6 stage-5 INT4 geometry, but the decode opt-in path regresses
+because each layer synchronizes before host expert-down. The next FFN target is
+therefore a full routed-expert GPU path that keeps `expert_mid` device-side
+through expert down, top-k combine, shared add, and residual.
 
 ### Metal validation
 
