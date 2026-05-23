@@ -324,7 +324,13 @@ Metal currently rejects or defers:
   resident slot pool sized by
   `SUPERSONIC_METAL_QWEN36_FFN_EXPERT_HOTSET_CAPACITY` (default 16). Neither is
   promoted because measured route churn still leaves too much slab copy and
-  residency overhead. The one-token local smoke is:
+  residency overhead. A GPU-side active-slab pack probe can be stacked on the
+  packed path with
+  `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_GPU_PACK_STAGE5=1`. It keeps the
+  CPU out of the per-token copy loop and remaps top-k expert IDs inside the
+  same Metal command buffer, but remains diagnostic-only because the measured
+  wall time is worse than the CPU pack path on this machine. The one-token
+  local smoke is:
   `cargo run --release --bin supersonic -- --backend metal --model qwen3.6-35b-a3b --model-dir /path/to/Qwen3.6-35B-A3B --int4 --prompt "Hello" --max-new-tokens 1 --emit-stage-timings`.
   FP8-runtime, KV-FP8, speculative decode, and persistent decode remain
   unsupported on this Metal path.
@@ -476,8 +482,13 @@ diagnostic-only. A four-token M5 Max profile generated the expected
 `[11, 353, 599, 264]` with 16 resident slots and cut copied bytes from
 `2014248960` to `1356470784`, but it measured `298.0 ms/token`; 32 resident
 slots cut copied bytes only slightly further to `1345455360` and measured
-`304.2 ms/token`. That points away from LRU slab caching and toward either a
-different fused INT4 addressing scheme or eliminating the per-token packed slab
+`304.2 ms/token`. The GPU-side active-slab pack probe,
+`SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_GPU_PACK_STAGE5=1`, also preserves
+the expected four-token output but measured `777.3 ms/token` with
+`ffn_ms_avg=641.772`; it removes CPU slab copying but moves the same per-token
+active slab materialization into Metal command-buffer waits. These probes point
+away from slab rebuilding, whether CPU or GPU driven, and toward a different
+fused INT4 addressing scheme or eliminating the per-token packed slab
 path.
 `SUPERSONIC_METAL_QWEN36_MPS_EXPERT_PILOT=1` adds a resident-FP16
 Metal Performance Shaders attribution row for the active-expert GEMV shapes. A

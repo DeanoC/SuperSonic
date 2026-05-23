@@ -1059,10 +1059,24 @@ and `ffn_ms_avg=161.142`. A 32-slot run avoided evictions and improved host pack
 time to `337.429 ms`, but copied bytes barely changed (`1345455360`) and wall
 time worsened to `304.2 ms/token`, with
 `qwen36_ffn_int4_expert_packed_hotset_stage5=185.272 ms`. That rules out a
-straight LRU hotset as the next promotion path. The useful next FFN direction is
-to stop rebuilding packed expert slabs entirely, either by teaching the fused
-INT4 kernel to gather original expert IDs efficiently or by building a static
-per-layer hot table with an explicit miss fallback.
+straight LRU hotset as the next promotion path.
+
+The GPU-side active-slab pack probe is opt-in behind
+`SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_GPU_PACK_STAGE5=1` on top of the
+packed expert path. It allocates compact per-layer scratch once, copies the
+current top-k expert slabs from the original baked Metal buffers in the FFN
+command buffer, remaps `topk_idx` to compact group IDs, then runs the existing
+packed gate/up and down/finalize shader. The four-token Apple M5 Max smoke
+preserved `[11, 353, 599, 264]`, so the remap and packed shader parity are good,
+but it measured `777.3 ms/token`, `ffn_ms_avg=641.772`, and
+`qwen36_ffn_int4_expert_gpu_pack_stage5=2417.156 ms` across 160 layer calls.
+The command-buffer GPU attribution for the fused pack+expert shader was only
+`64.400 ms`, while `command_buffer_wait` was `2678.881 ms`; moving slab
+materialization from CPU to GPU therefore did not solve the residency/wait
+problem. The useful next FFN direction is to stop rebuilding packed expert slabs
+entirely, either by teaching the fused INT4 kernel to gather original expert IDs
+efficiently or by building a static per-layer hot table with an explicit miss
+fallback.
 
 The first MPS bridge step is now an attribution probe, not a decode path. With
 `SUPERSONIC_METAL_QWEN36_MPS_EXPERT_PILOT=1`, the runner appends a

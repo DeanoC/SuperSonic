@@ -3090,6 +3090,15 @@ fn qwen36_ffn_expert_packed_stage5_metal_native_supported(
         && !int4.down_proj_zero.is_null()
 }
 
+fn qwen36_ffn_expert_gpu_pack_stage5_metal_native_supported(
+    params: Qwen36MoeFfnStepParams,
+    weights: &Qwen36MoeFfnStepWeights,
+    int4: &Qwen36MoeFfnStepInt4,
+) -> bool {
+    std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_GPU_PACK_STAGE5").is_some()
+        && qwen36_ffn_expert_packed_stage5_metal_native_supported(params, weights, int4)
+}
+
 fn qwen36_ffn_expert_mps_bridge_stage5_supported(
     params: Qwen36MoeFfnStepParams,
     weights: &Qwen36MoeFfnStepWeights,
@@ -3700,6 +3709,110 @@ where
         GpuError::backend(
             Backend::Metal,
             "qwen36 packed expert cache entry missing after fill".into(),
+        )
+    })?;
+    f(&entry.buffers)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen36_with_gpu_pack_buffers_for_metal<T, F>(
+    ordinal: usize,
+    hidden: usize,
+    moe_intermediate: usize,
+    active_experts: &[usize],
+    group_size: usize,
+    num_experts: usize,
+    gate_up_proj_ptr: *const c_void,
+    gate_up_scale_ptr: *const c_void,
+    gate_up_zero_ptr: *const c_void,
+    down_proj_ptr: *const c_void,
+    down_scale_ptr: *const c_void,
+    down_zero_ptr: *const c_void,
+    f: F,
+) -> Result<T, GpuError>
+where
+    F: FnOnce(&Qwen36PackedExpertBuffers) -> Result<T, GpuError>,
+{
+    qwen36_validate_active_expert_pack(
+        hidden,
+        moe_intermediate,
+        active_experts,
+        group_size,
+        num_experts,
+        gate_up_proj_ptr,
+        gate_up_scale_ptr,
+        gate_up_zero_ptr,
+        down_proj_ptr,
+        down_scale_ptr,
+        down_zero_ptr,
+    )?;
+    let key = Qwen36PackedExpertCacheKey {
+        gate_up_proj_ptr: gate_up_proj_ptr as usize,
+        gate_up_scale_ptr: gate_up_scale_ptr as usize,
+        gate_up_zero_ptr: gate_up_zero_ptr as usize,
+        down_proj_ptr: down_proj_ptr as usize,
+        down_scale_ptr: down_scale_ptr as usize,
+        down_zero_ptr: down_zero_ptr as usize,
+        hidden,
+        moe_intermediate,
+        group_size,
+        active_groups: active_experts.len(),
+    };
+    let cache = QWEN36_PACKED_EXPERT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache.lock().map_err(|_| {
+        GpuError::backend(
+            Backend::Metal,
+            "qwen36 GPU packed expert cache mutex poisoned".into(),
+        )
+    })?;
+    crate::prefill_ffi::metal_profile_time(
+        "qwen36_ffn_int4_expert_gpu_pack_alloc_stage5",
+        "host",
+        || -> Result<(), GpuError> {
+            if cache.contains_key(&key) {
+                qwen36_packed_expert_cache_profile_record(
+                    false,
+                    true,
+                    false,
+                    active_experts.len(),
+                    0,
+                    0,
+                    active_experts.len(),
+                    0,
+                );
+                return Ok(());
+            }
+            let buffers = qwen36_alloc_packed_experts_for_metal(
+                ordinal,
+                hidden,
+                moe_intermediate,
+                active_experts.len(),
+                group_size,
+            )?;
+            cache.insert(
+                key,
+                Qwen36PackedExpertCacheEntry {
+                    active_experts: Vec::new(),
+                    buffers,
+                },
+            );
+            qwen36_packed_expert_cache_profile_record(
+                false,
+                false,
+                true,
+                active_experts.len(),
+                0,
+                0,
+                active_experts.len(),
+                0,
+            );
+            Ok(())
+        },
+    )?;
+    let entry = cache.get(&key).ok_or_else(|| {
+        GpuError::backend(
+            Backend::Metal,
+            "qwen36 GPU packed expert cache entry missing after allocation".into(),
         )
     })?;
     f(&entry.buffers)
@@ -5138,6 +5251,59 @@ fn ffn_step_stage1_5_metal_host(
         return Ok(());
     }
     if qwen36_ffn_expert_packed_stage5_metal_native_supported(params, weights, int4) {
+        if qwen36_ffn_expert_gpu_pack_stage5_metal_native_supported(params, weights, int4) {
+            qwen36_with_gpu_pack_buffers_for_metal(
+                output_ordinal,
+                hidden,
+                moe_intermediate,
+                &active_experts,
+                int4.group_size as usize,
+                num_experts,
+                weights.gate_up_proj_w,
+                int4.gate_up_proj_scale,
+                int4.gate_up_proj_zero,
+                weights.down_proj_w,
+                int4.down_proj_scale,
+                int4.down_proj_zero,
+                |packed| {
+                    crate::prefill_ffi::metal_profile_time(
+                        "qwen36_ffn_int4_expert_gpu_pack_stage5",
+                        "native",
+                        || unsafe {
+                            crate::metal_native::qwen36_ffn_expert_gpu_pack_gate_up_down_finalize_tiled(
+                                hidden,
+                                moe_intermediate,
+                                active_groups,
+                                int4.group_size as usize,
+                                workspace_ptr,
+                                weights.input_hidden,
+                                weights.gate_up_proj_w,
+                                int4.gate_up_proj_scale,
+                                int4.gate_up_proj_zero,
+                                weights.down_proj_w,
+                                int4.down_proj_scale,
+                                int4.down_proj_zero,
+                                packed.gate_up_proj.as_ptr() as *mut c_void,
+                                packed.gate_up_scale.as_ptr() as *mut c_void,
+                                packed.gate_up_zero.as_ptr() as *mut c_void,
+                                packed.down_proj.as_ptr() as *mut c_void,
+                                packed.down_scale.as_ptr() as *mut c_void,
+                                packed.down_zero.as_ptr() as *mut c_void,
+                                output_ptr,
+                                off_h_norm,
+                                off_topk_val,
+                                off_topk_idx,
+                                off_shared_out,
+                                off_expert_mid,
+                                off_moe_out,
+                                true,
+                            )
+                        },
+                    )
+                },
+            )?;
+            return Ok(());
+        }
         if let Some(hotset_capacity) = qwen36_packed_expert_hotset_capacity(active_groups) {
             qwen36_with_hotset_packed_experts_for_metal(
                 output_ordinal,

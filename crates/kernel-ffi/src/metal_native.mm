@@ -113,6 +113,13 @@ struct Qwen36FfnExpertGateUpTiledParams {
     uint off_expert_mid;
 };
 
+struct Qwen36FfnExpertPackParams {
+    uint32_t rows;
+    uint32_t cols;
+    uint32_t top_k;
+    uint32_t off_topk_idx;
+};
+
 struct Qwen36LinearInt4Params {
     uint32_t hidden;
     uint32_t num_k_heads;
@@ -2507,6 +2514,9 @@ struct Qwen36FfnInt4Pipelines {
     __strong id<MTLComputePipelineState> expert_gate_up = nil;
     __strong id<MTLComputePipelineState> expert_gate_up_tiled = nil;
     __strong id<MTLComputePipelineState> expert_down_finalize = nil;
+    __strong id<MTLComputePipelineState> expert_pack_u8 = nil;
+    __strong id<MTLComputePipelineState> expert_pack_bf16_pair = nil;
+    __strong id<MTLComputePipelineState> expert_pack_remap_topk = nil;
     __strong id<MTLComputePipelineState> expert_mps_silu = nil;
     __strong id<MTLComputePipelineState> expert_mps_finalize = nil;
     __strong id<MTLComputePipelineState> expert_mps_transcode_hnorm = nil;
@@ -2559,6 +2569,13 @@ struct Qwen36FfnExpertGateUpTiledParams {
     uint off_h_norm;
     uint off_topk_idx;
     uint off_expert_mid;
+};
+
+struct Qwen36FfnExpertPackParams {
+    uint rows;
+    uint cols;
+    uint top_k;
+    uint off_topk_idx;
 };
 
 inline float bf16_round_rne_finite(float x) {
@@ -2824,6 +2841,62 @@ kernel void supersonic_qwen36_ffn_expert_down_finalize(
     }
 }
 
+kernel void supersonic_qwen36_ffn_pack_active_u8(
+    device const float* workspace [[buffer(0)]],
+    device const uchar* src [[buffer(1)]],
+    device uchar* dst [[buffer(2)]],
+    constant Qwen36FfnExpertPackParams& params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint elems_per_group = params.rows * params.cols;
+    uint total = params.top_k * elems_per_group;
+    if (gid >= total || elems_per_group == 0u) {
+        return;
+    }
+    uint group = gid / elems_per_group;
+    uint rem = gid - group * elems_per_group;
+    uint row = rem / params.cols;
+    uint col = rem - row * params.cols;
+    uint expert = as_type<uint>(workspace[params.off_topk_idx + group]);
+    dst[(group * params.rows + row) * params.cols + col] =
+        src[(expert * params.rows + row) * params.cols + col];
+}
+
+kernel void supersonic_qwen36_ffn_pack_active_bf16_pair(
+    device const float* workspace [[buffer(0)]],
+    device const bfloat* scale_src [[buffer(1)]],
+    device const bfloat* zero_src [[buffer(2)]],
+    device bfloat* scale_dst [[buffer(3)]],
+    device bfloat* zero_dst [[buffer(4)]],
+    constant Qwen36FfnExpertPackParams& params [[buffer(5)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    uint elems_per_group = params.rows * params.cols;
+    uint total = params.top_k * elems_per_group;
+    if (gid >= total || elems_per_group == 0u) {
+        return;
+    }
+    uint group = gid / elems_per_group;
+    uint rem = gid - group * elems_per_group;
+    uint row = rem / params.cols;
+    uint col = rem - row * params.cols;
+    uint expert = as_type<uint>(workspace[params.off_topk_idx + group]);
+    uint dst_idx = (group * params.rows + row) * params.cols + col;
+    uint src_idx = (expert * params.rows + row) * params.cols + col;
+    scale_dst[dst_idx] = scale_src[src_idx];
+    zero_dst[dst_idx] = zero_src[src_idx];
+}
+
+kernel void supersonic_qwen36_ffn_pack_active_remap_topk(
+    device float* workspace [[buffer(0)]],
+    constant Qwen36FfnExpertPackParams& params [[buffer(1)]],
+    uint group [[thread_position_in_grid]]
+) {
+    if (group < params.top_k) {
+        workspace[params.off_topk_idx + group] = as_type<float>(group);
+    }
+}
+
 kernel void supersonic_qwen36_ffn_mps_expert_silu(
     device const half* gate_up_out [[buffer(0)]],
     device half* down_lhs [[buffer(1)]],
@@ -2999,6 +3072,9 @@ kernel void supersonic_qwen36_ffn_mps_transcode_down_lut(
                         @"supersonic_qwen36_ffn_expert_gate_up",
                         @"supersonic_qwen36_ffn_expert_gate_up_tiled",
                         @"supersonic_qwen36_ffn_expert_down_finalize",
+                        @"supersonic_qwen36_ffn_pack_active_u8",
+                        @"supersonic_qwen36_ffn_pack_active_bf16_pair",
+                        @"supersonic_qwen36_ffn_pack_active_remap_topk",
                         @"supersonic_qwen36_ffn_mps_expert_silu",
                         @"supersonic_qwen36_ffn_mps_expert_finalize",
                         @"supersonic_qwen36_ffn_mps_transcode_hnorm",
@@ -3041,6 +3117,12 @@ kernel void supersonic_qwen36_ffn_mps_transcode_down_lut(
                             pipelines.expert_gate_up_tiled = pipeline;
                         } else if ([name isEqualToString:@"supersonic_qwen36_ffn_expert_down_finalize"]) {
                             pipelines.expert_down_finalize = pipeline;
+                        } else if ([name isEqualToString:@"supersonic_qwen36_ffn_pack_active_u8"]) {
+                            pipelines.expert_pack_u8 = pipeline;
+                        } else if ([name isEqualToString:@"supersonic_qwen36_ffn_pack_active_bf16_pair"]) {
+                            pipelines.expert_pack_bf16_pair = pipeline;
+                        } else if ([name isEqualToString:@"supersonic_qwen36_ffn_pack_active_remap_topk"]) {
+                            pipelines.expert_pack_remap_topk = pipeline;
                         } else if ([name isEqualToString:@"supersonic_qwen36_ffn_mps_expert_silu"]) {
                             pipelines.expert_mps_silu = pipeline;
                         } else if ([name isEqualToString:@"supersonic_qwen36_ffn_mps_expert_finalize"]) {
@@ -3060,7 +3142,9 @@ kernel void supersonic_qwen36_ffn_mps_transcode_down_lut(
 
     bool ok = pipelines.shared_gate_up != nil && pipelines.shared_scalar != nil &&
         pipelines.shared_down != nil && pipelines.expert_gate_up != nil &&
-        pipelines.expert_down_finalize != nil && pipelines.expert_mps_silu != nil &&
+        pipelines.expert_down_finalize != nil && pipelines.expert_pack_u8 != nil &&
+        pipelines.expert_pack_bf16_pair != nil && pipelines.expert_pack_remap_topk != nil &&
+        pipelines.expert_mps_silu != nil &&
         pipelines.expert_mps_finalize != nil && pipelines.expert_mps_transcode_hnorm != nil &&
         pipelines.expert_mps_transcode_gate_up != nil && pipelines.expert_mps_transcode_down != nil;
     if (!ok && build_error != nil &&
@@ -11069,6 +11153,267 @@ extern "C" int supersonic_metal_qwen36_ffn_expert_gate_up_down_finalize_tiled(
             1207,
             1208,
             1209
+        );
+    }
+}
+
+extern "C" int supersonic_metal_qwen36_ffn_expert_gpu_pack_gate_up_down_finalize_tiled(
+    size_t hidden,
+    size_t moe_intermediate,
+    size_t top_k,
+    size_t group_size,
+    void* workspace_ptr,
+    const void* input_hidden_ptr,
+    const void* gate_up_proj_src_ptr,
+    const void* gate_up_scale_src_ptr,
+    const void* gate_up_zero_src_ptr,
+    const void* down_proj_src_ptr,
+    const void* down_scale_src_ptr,
+    const void* down_zero_src_ptr,
+    void* gate_up_proj_dst_ptr,
+    void* gate_up_scale_dst_ptr,
+    void* gate_up_zero_dst_ptr,
+    void* down_proj_dst_ptr,
+    void* down_scale_dst_ptr,
+    void* down_zero_dst_ptr,
+    void* output_ptr,
+    size_t off_h_norm,
+    size_t off_topk_val,
+    size_t off_topk_idx,
+    size_t off_shared_out,
+    size_t off_expert_mid,
+    size_t off_moe_out,
+    int wait_for_completion
+) {
+    @autoreleasepool {
+        if (hidden == 0 || moe_intermediate == 0 || top_k == 0 || group_size == 0 ||
+            workspace_ptr == nullptr || input_hidden_ptr == nullptr ||
+            gate_up_proj_src_ptr == nullptr || gate_up_scale_src_ptr == nullptr ||
+            gate_up_zero_src_ptr == nullptr || down_proj_src_ptr == nullptr ||
+            down_scale_src_ptr == nullptr || down_zero_src_ptr == nullptr ||
+            gate_up_proj_dst_ptr == nullptr || gate_up_scale_dst_ptr == nullptr ||
+            gate_up_zero_dst_ptr == nullptr || down_proj_dst_ptr == nullptr ||
+            down_scale_dst_ptr == nullptr || down_zero_dst_ptr == nullptr || output_ptr == nullptr) {
+            return 1230;
+        }
+        if (hidden > UINT32_MAX || moe_intermediate > UINT32_MAX ||
+            top_k > UINT32_MAX || group_size > UINT32_MAX ||
+            off_h_norm > UINT32_MAX || off_topk_val > UINT32_MAX ||
+            off_topk_idx > UINT32_MAX || off_shared_out > UINT32_MAX ||
+            off_expert_mid > UINT32_MAX || off_moe_out > UINT32_MAX) {
+            return 1231;
+        }
+        if ((hidden % 2) != 0 || (moe_intermediate % 2) != 0 ||
+            (hidden % group_size) != 0 || (moe_intermediate % group_size) != 0 ||
+            ((2 * moe_intermediate) % group_size) != 0) {
+            return 1232;
+        }
+
+        NSError* pipeline_error = nil;
+        Qwen36FfnInt4Pipelines pipelines = qwen36_ffn_int4_pipelines(&pipeline_error);
+        if (pipelines.expert_pack_u8 == nil || pipelines.expert_pack_bf16_pair == nil ||
+            pipelines.expert_pack_remap_topk == nil || pipelines.expert_gate_up_tiled == nil ||
+            pipelines.expert_down_finalize == nil) {
+            return 1233;
+        }
+
+        id<MTLBuffer> workspace = nil;
+        id<MTLBuffer> input_hidden = nil;
+        id<MTLBuffer> gate_up_proj_src = nil;
+        id<MTLBuffer> gate_up_scale_src = nil;
+        id<MTLBuffer> gate_up_zero_src = nil;
+        id<MTLBuffer> down_proj_src = nil;
+        id<MTLBuffer> down_scale_src = nil;
+        id<MTLBuffer> down_zero_src = nil;
+        id<MTLBuffer> gate_up_proj_dst = nil;
+        id<MTLBuffer> gate_up_scale_dst = nil;
+        id<MTLBuffer> gate_up_zero_dst = nil;
+        id<MTLBuffer> down_proj_dst = nil;
+        id<MTLBuffer> down_scale_dst = nil;
+        id<MTLBuffer> down_zero_dst = nil;
+        id<MTLBuffer> output = nil;
+        size_t workspace_offset = 0;
+        size_t input_hidden_offset = 0;
+        size_t gate_up_proj_src_offset = 0;
+        size_t gate_up_scale_src_offset = 0;
+        size_t gate_up_zero_src_offset = 0;
+        size_t down_proj_src_offset = 0;
+        size_t down_scale_src_offset = 0;
+        size_t down_zero_src_offset = 0;
+        size_t gate_up_proj_dst_offset = 0;
+        size_t gate_up_scale_dst_offset = 0;
+        size_t gate_up_zero_dst_offset = 0;
+        size_t down_proj_dst_offset = 0;
+        size_t down_scale_dst_offset = 0;
+        size_t down_zero_dst_offset = 0;
+        size_t output_offset = 0;
+        if (lookup_buffer(workspace_ptr, &workspace, &workspace_offset) != 0) return 1234;
+        if (lookup_buffer(input_hidden_ptr, &input_hidden, &input_hidden_offset) != 0) return 1235;
+        if (lookup_buffer(gate_up_proj_src_ptr, &gate_up_proj_src, &gate_up_proj_src_offset) != 0) return 1236;
+        if (lookup_buffer(gate_up_scale_src_ptr, &gate_up_scale_src, &gate_up_scale_src_offset) != 0) return 1237;
+        if (lookup_buffer(gate_up_zero_src_ptr, &gate_up_zero_src, &gate_up_zero_src_offset) != 0) return 1238;
+        if (lookup_buffer(down_proj_src_ptr, &down_proj_src, &down_proj_src_offset) != 0) return 1239;
+        if (lookup_buffer(down_scale_src_ptr, &down_scale_src, &down_scale_src_offset) != 0) return 1240;
+        if (lookup_buffer(down_zero_src_ptr, &down_zero_src, &down_zero_src_offset) != 0) return 1241;
+        if (lookup_buffer(gate_up_proj_dst_ptr, &gate_up_proj_dst, &gate_up_proj_dst_offset) != 0) return 1242;
+        if (lookup_buffer(gate_up_scale_dst_ptr, &gate_up_scale_dst, &gate_up_scale_dst_offset) != 0) return 1243;
+        if (lookup_buffer(gate_up_zero_dst_ptr, &gate_up_zero_dst, &gate_up_zero_dst_offset) != 0) return 1244;
+        if (lookup_buffer(down_proj_dst_ptr, &down_proj_dst, &down_proj_dst_offset) != 0) return 1245;
+        if (lookup_buffer(down_scale_dst_ptr, &down_scale_dst, &down_scale_dst_offset) != 0) return 1246;
+        if (lookup_buffer(down_zero_dst_ptr, &down_zero_dst, &down_zero_dst_offset) != 0) return 1247;
+        if (lookup_buffer(output_ptr, &output, &output_offset) != 0) return 1248;
+
+        Qwen36FfnExpertPackParams gate_up_u8_params = {
+            static_cast<uint32_t>(2 * moe_intermediate),
+            static_cast<uint32_t>(hidden / 2),
+            static_cast<uint32_t>(top_k),
+            static_cast<uint32_t>(off_topk_idx),
+        };
+        Qwen36FfnExpertPackParams gate_up_sidecar_params = {
+            static_cast<uint32_t>((2 * moe_intermediate) / group_size),
+            static_cast<uint32_t>(hidden / group_size),
+            static_cast<uint32_t>(top_k),
+            static_cast<uint32_t>(off_topk_idx),
+        };
+        Qwen36FfnExpertPackParams down_u8_params = {
+            static_cast<uint32_t>(hidden),
+            static_cast<uint32_t>(moe_intermediate / 2),
+            static_cast<uint32_t>(top_k),
+            static_cast<uint32_t>(off_topk_idx),
+        };
+        Qwen36FfnExpertPackParams down_sidecar_params = {
+            static_cast<uint32_t>(hidden / group_size),
+            static_cast<uint32_t>(moe_intermediate / group_size),
+            static_cast<uint32_t>(top_k),
+            static_cast<uint32_t>(off_topk_idx),
+        };
+        Qwen36FfnExpertGateUpTiledParams gate_params = {
+            static_cast<uint32_t>(hidden),
+            static_cast<uint32_t>(moe_intermediate),
+            static_cast<uint32_t>(top_k),
+            static_cast<uint32_t>(group_size),
+            static_cast<uint32_t>(off_h_norm),
+            static_cast<uint32_t>(off_topk_idx),
+            static_cast<uint32_t>(off_expert_mid),
+        };
+        Qwen36FfnInt4Params down_params = {
+            static_cast<uint32_t>(hidden),
+            0u,
+            static_cast<uint32_t>(moe_intermediate),
+            0u,
+            static_cast<uint32_t>(top_k),
+            static_cast<uint32_t>(group_size),
+            static_cast<uint32_t>(off_h_norm),
+            static_cast<uint32_t>(off_topk_val),
+            static_cast<uint32_t>(off_topk_idx),
+            0u,
+            0u,
+            static_cast<uint32_t>(off_shared_out),
+            static_cast<uint32_t>(off_expert_mid),
+            static_cast<uint32_t>(off_moe_out),
+        };
+
+        auto encode = [&](id<MTLComputeCommandEncoder> encoder) {
+            MTLSize threads = MTLSizeMake(256, 1, 1);
+            auto encode_pack_u8 = [&](id<MTLBuffer> src, size_t src_offset,
+                                      id<MTLBuffer> dst, size_t dst_offset,
+                                      Qwen36FfnExpertPackParams& params) {
+                size_t total = static_cast<size_t>(params.rows) * params.cols * params.top_k;
+                [encoder setComputePipelineState:pipelines.expert_pack_u8];
+                [encoder setBuffer:workspace offset:workspace_offset atIndex:0];
+                [encoder setBuffer:src offset:src_offset atIndex:1];
+                [encoder setBuffer:dst offset:dst_offset atIndex:2];
+                [encoder setBytes:&params length:sizeof(params) atIndex:3];
+                [encoder dispatchThreads:MTLSizeMake(total, 1, 1) threadsPerThreadgroup:threads];
+            };
+            auto encode_pack_bf16_pair = [&](id<MTLBuffer> scale_src, size_t scale_src_offset,
+                                             id<MTLBuffer> zero_src, size_t zero_src_offset,
+                                             id<MTLBuffer> scale_dst, size_t scale_dst_offset,
+                                             id<MTLBuffer> zero_dst, size_t zero_dst_offset,
+                                             Qwen36FfnExpertPackParams& params) {
+                size_t total = static_cast<size_t>(params.rows) * params.cols * params.top_k;
+                [encoder setComputePipelineState:pipelines.expert_pack_bf16_pair];
+                [encoder setBuffer:workspace offset:workspace_offset atIndex:0];
+                [encoder setBuffer:scale_src offset:scale_src_offset atIndex:1];
+                [encoder setBuffer:zero_src offset:zero_src_offset atIndex:2];
+                [encoder setBuffer:scale_dst offset:scale_dst_offset atIndex:3];
+                [encoder setBuffer:zero_dst offset:zero_dst_offset atIndex:4];
+                [encoder setBytes:&params length:sizeof(params) atIndex:5];
+                [encoder dispatchThreads:MTLSizeMake(total, 1, 1) threadsPerThreadgroup:threads];
+            };
+
+            encode_pack_u8(
+                gate_up_proj_src, gate_up_proj_src_offset,
+                gate_up_proj_dst, gate_up_proj_dst_offset,
+                gate_up_u8_params
+            );
+            encode_pack_bf16_pair(
+                gate_up_scale_src, gate_up_scale_src_offset,
+                gate_up_zero_src, gate_up_zero_src_offset,
+                gate_up_scale_dst, gate_up_scale_dst_offset,
+                gate_up_zero_dst, gate_up_zero_dst_offset,
+                gate_up_sidecar_params
+            );
+            encode_pack_u8(
+                down_proj_src, down_proj_src_offset,
+                down_proj_dst, down_proj_dst_offset,
+                down_u8_params
+            );
+            encode_pack_bf16_pair(
+                down_scale_src, down_scale_src_offset,
+                down_zero_src, down_zero_src_offset,
+                down_scale_dst, down_scale_dst_offset,
+                down_zero_dst, down_zero_dst_offset,
+                down_sidecar_params
+            );
+            [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+            [encoder setComputePipelineState:pipelines.expert_pack_remap_topk];
+            [encoder setBuffer:workspace offset:workspace_offset atIndex:0];
+            [encoder setBytes:&down_sidecar_params length:sizeof(down_sidecar_params) atIndex:1];
+            [encoder dispatchThreads:MTLSizeMake(top_k, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+            [encoder setComputePipelineState:pipelines.expert_gate_up_tiled];
+            [encoder setBuffer:workspace offset:workspace_offset atIndex:0];
+            [encoder setBuffer:gate_up_proj_dst offset:gate_up_proj_dst_offset atIndex:1];
+            [encoder setBuffer:gate_up_scale_dst offset:gate_up_scale_dst_offset atIndex:2];
+            [encoder setBuffer:gate_up_zero_dst offset:gate_up_zero_dst_offset atIndex:3];
+            [encoder setBytes:&gate_params length:sizeof(gate_params) atIndex:4];
+            [encoder setThreadgroupMemoryLength:16 * sizeof(float) atIndex:0];
+            [encoder dispatchThreadgroups:MTLSizeMake(moe_intermediate, top_k, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+            [encoder setComputePipelineState:pipelines.expert_down_finalize];
+            [encoder setBuffer:workspace offset:workspace_offset atIndex:0];
+            [encoder setBuffer:input_hidden offset:input_hidden_offset atIndex:1];
+            [encoder setBuffer:down_proj_dst offset:down_proj_dst_offset atIndex:2];
+            [encoder setBuffer:down_scale_dst offset:down_scale_dst_offset atIndex:3];
+            [encoder setBuffer:down_zero_dst offset:down_zero_dst_offset atIndex:4];
+            [encoder setBuffer:output offset:output_offset atIndex:5];
+            [encoder setBytes:&down_params length:sizeof(down_params) atIndex:6];
+            [encoder dispatchThreadgroups:MTLSizeMake(hidden, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        };
+        if (wait_for_completion != 0) {
+            return encode_or_submit_labeled(
+                encode,
+                "qwen36_ffn_int4_expert_gpu_pack_gate_up_down_finalize_tiled",
+                1249,
+                1250,
+                1251,
+                1252
+            );
+        }
+        return encode_or_submit_labeled_async(
+            encode,
+            "qwen36_ffn_int4_expert_gpu_pack_gate_up_down_finalize_tiled",
+            1249,
+            1250,
+            1251,
+            1252
         );
     }
 }

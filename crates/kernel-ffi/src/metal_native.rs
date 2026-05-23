@@ -158,6 +158,34 @@ unsafe extern "C" {
         off_moe_out: usize,
         wait_for_completion: c_int,
     ) -> c_int;
+    fn supersonic_metal_qwen36_ffn_expert_gpu_pack_gate_up_down_finalize_tiled(
+        hidden: usize,
+        moe_intermediate: usize,
+        top_k: usize,
+        group_size: usize,
+        workspace_ptr: *mut c_void,
+        input_hidden_ptr: *const c_void,
+        gate_up_proj_src_ptr: *const c_void,
+        gate_up_scale_src_ptr: *const c_void,
+        gate_up_zero_src_ptr: *const c_void,
+        down_proj_src_ptr: *const c_void,
+        down_scale_src_ptr: *const c_void,
+        down_zero_src_ptr: *const c_void,
+        gate_up_proj_dst_ptr: *mut c_void,
+        gate_up_scale_dst_ptr: *mut c_void,
+        gate_up_zero_dst_ptr: *mut c_void,
+        down_proj_dst_ptr: *mut c_void,
+        down_scale_dst_ptr: *mut c_void,
+        down_zero_dst_ptr: *mut c_void,
+        output_ptr: *mut c_void,
+        off_h_norm: usize,
+        off_topk_val: usize,
+        off_topk_idx: usize,
+        off_shared_out: usize,
+        off_expert_mid: usize,
+        off_moe_out: usize,
+        wait_for_completion: c_int,
+    ) -> c_int;
     fn supersonic_metal_qwen36_ffn_expert_mps_bridge_f16(
         hidden: usize,
         moe_intermediate: usize,
@@ -1788,6 +1816,101 @@ pub(crate) unsafe fn qwen36_ffn_expert_mps_transcode_int4_f16(
             Backend::Metal,
             format!(
                 "metal native qwen36_ffn_expert_mps_transcode_int4_f16 failed with status {status}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn qwen36_ffn_expert_gpu_pack_gate_up_down_finalize_tiled(
+    hidden: usize,
+    moe_intermediate: usize,
+    top_k: usize,
+    group_size: usize,
+    workspace: *mut c_void,
+    input_hidden: *const c_void,
+    gate_up_proj_src: *const c_void,
+    gate_up_scale_src: *const c_void,
+    gate_up_zero_src: *const c_void,
+    down_proj_src: *const c_void,
+    down_scale_src: *const c_void,
+    down_zero_src: *const c_void,
+    gate_up_proj_dst: *mut c_void,
+    gate_up_scale_dst: *mut c_void,
+    gate_up_zero_dst: *mut c_void,
+    down_proj_dst: *mut c_void,
+    down_scale_dst: *mut c_void,
+    down_zero_dst: *mut c_void,
+    output: *mut c_void,
+    off_h_norm: usize,
+    off_topk_val: usize,
+    off_topk_idx: usize,
+    off_shared_out: usize,
+    off_expert_mid: usize,
+    off_moe_out: usize,
+    wait_for_completion: bool,
+) -> Result<(), GpuError> {
+    if hidden == 0
+        || moe_intermediate == 0
+        || top_k == 0
+        || group_size == 0
+        || workspace.is_null()
+        || input_hidden.is_null()
+        || gate_up_proj_src.is_null()
+        || gate_up_scale_src.is_null()
+        || gate_up_zero_src.is_null()
+        || down_proj_src.is_null()
+        || down_scale_src.is_null()
+        || down_zero_src.is_null()
+        || gate_up_proj_dst.is_null()
+        || gate_up_scale_dst.is_null()
+        || gate_up_zero_dst.is_null()
+        || down_proj_dst.is_null()
+        || down_scale_dst.is_null()
+        || down_zero_dst.is_null()
+        || output.is_null()
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native qwen36_ffn_expert_gpu_pack_gate_up_down_finalize_tiled invalid shape: hidden={hidden} moe_intermediate={moe_intermediate} top_k={top_k} group_size={group_size}"
+        )));
+    }
+    let status = unsafe {
+        supersonic_metal_qwen36_ffn_expert_gpu_pack_gate_up_down_finalize_tiled(
+            hidden,
+            moe_intermediate,
+            top_k,
+            group_size,
+            workspace,
+            input_hidden,
+            gate_up_proj_src,
+            gate_up_scale_src,
+            gate_up_zero_src,
+            down_proj_src,
+            down_scale_src,
+            down_zero_src,
+            gate_up_proj_dst,
+            gate_up_scale_dst,
+            gate_up_zero_dst,
+            down_proj_dst,
+            down_scale_dst,
+            down_zero_dst,
+            output,
+            off_h_norm,
+            off_topk_val,
+            off_topk_idx,
+            off_shared_out,
+            off_expert_mid,
+            off_moe_out,
+            i32::from(wait_for_completion),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!(
+                "metal native qwen36_ffn_expert_gpu_pack_gate_up_down_finalize_tiled failed with status {status}"
             ),
         ));
     }
@@ -4622,6 +4745,43 @@ pub(crate) unsafe fn qwen36_ffn_expert_gate_up_down_finalize_tiled(
     Err(GpuError::backend(
         Backend::Metal,
         "metal native qwen36_ffn_expert_gate_up_down_finalize_tiled is not compiled".into(),
+    ))
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn qwen36_ffn_expert_gpu_pack_gate_up_down_finalize_tiled(
+    _hidden: usize,
+    _moe_intermediate: usize,
+    _top_k: usize,
+    _group_size: usize,
+    _workspace: *mut c_void,
+    _input_hidden: *const c_void,
+    _gate_up_proj_src: *const c_void,
+    _gate_up_scale_src: *const c_void,
+    _gate_up_zero_src: *const c_void,
+    _down_proj_src: *const c_void,
+    _down_scale_src: *const c_void,
+    _down_zero_src: *const c_void,
+    _gate_up_proj_dst: *mut c_void,
+    _gate_up_scale_dst: *mut c_void,
+    _gate_up_zero_dst: *mut c_void,
+    _down_proj_dst: *mut c_void,
+    _down_scale_dst: *mut c_void,
+    _down_zero_dst: *mut c_void,
+    _output: *mut c_void,
+    _off_h_norm: usize,
+    _off_topk_val: usize,
+    _off_topk_idx: usize,
+    _off_shared_out: usize,
+    _off_expert_mid: usize,
+    _off_moe_out: usize,
+    _wait_for_completion: bool,
+) -> Result<(), GpuError> {
+    Err(GpuError::backend(
+        Backend::Metal,
+        "metal native qwen36_ffn_expert_gpu_pack_gate_up_down_finalize_tiled is not compiled"
+            .into(),
     ))
 }
 
