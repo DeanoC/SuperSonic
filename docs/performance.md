@@ -1084,7 +1084,19 @@ not promotable: unprofiled decode measured `868.1 ms/token`,
 On Apple UMA this is not PCIe upload cost; the remaining blocker is per-token
 FP16 MPS slab rebuild/consumption. The next FFN experiment should either keep
 active FP16 experts resident across route reuse, or return to a fully fused
-routed-expert INT4 path that avoids MPSMatrix RHS rebuilds entirely.
+routed-expert INT4 path that avoids MPSMatrix RHS rebuilds entirely. Profile
+runs now emit Qwen3.6 route-locality lines to decide between those paths:
+`[qwen36-route-profile]` reports adjacent-token same-layer reuse, while
+`[qwen36-route-cache-sim]` simulates per-layer LRU resident-slab budgets of
+2/4/8/16 experts and `[qwen36-route-topn]` reports oracle top-N coverage for
+the same budgets. A 4-token Apple M5 Max profile generated `[11, 353, 599,
+264]` and measured `adjacent_hit_rate=0.400000`; the per-layer LRU hit rates
+were 0.5%/2.5%/23.0%/32.7% for capacities 2/4/8/16, while oracle top-N
+coverage was 19.2%/34.4%/57.6%/83.2%. That is enough to reject a tiny LRU
+resident cache as the next immediate optimization, but it leaves a larger
+hot-set cache or fused routed INT4 path as the next measured fork.
+`SUPERSONIC_QWEN36_ROUTE_PROFILE_LAYERS` defaults to `40` for
+Qwen3.6-35B-A3B and can be overridden for smaller parity runs.
 
 Unsupported Metal constraints remain explicit for this target: persistent
 decode, KV-FP8, speculative decode, batching, and Metal VMM are not benchmarked

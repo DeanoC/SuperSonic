@@ -504,7 +504,11 @@ non-temporal ARM stores for the transposed FP16 flush. It still generated
 with `qwen36_ffn_int4_expert_mps_bridge_pack_f16_lut=556.425 ms` across 40
 layers. On Apple UMA this is not PCIe upload cost; the remaining blocker is
 per-token FP16 MPS slab rebuild/consumption, so the next target is either
-resident reused slabs or a fully fused routed-expert INT4 path.
+resident reused slabs or a fully fused routed-expert INT4 path. Metal profile
+runs also emit Qwen3.6 route-locality lines:
+`[qwen36-route-profile]`, `[qwen36-route-cache-sim]`, and
+`[qwen36-route-topn]`. Use those to check whether a small per-layer resident
+expert cache has enough route reuse before implementing it.
 
 ### Metal validation
 

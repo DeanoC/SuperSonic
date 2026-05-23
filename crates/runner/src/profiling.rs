@@ -14,6 +14,7 @@ impl MetalProfileScope {
             gpu_hal::hal_profile_set_enabled(true);
             kernel_ffi::prefill_ffi::metal_profile_reset();
             gpu_hal::hal_profile_reset();
+            kernel_ffi::qwen36_moe::qwen36_route_profile_reset();
         }
         Self { active }
     }
@@ -63,6 +64,49 @@ impl Drop for MetalProfileScope {
                 entry.total_ms,
                 entry.max_ms,
             );
+        }
+        let route = kernel_ffi::qwen36_moe::qwen36_route_profile_snapshot();
+        if route.calls > 0 {
+            eprintln!();
+            eprintln!("=== Qwen3.6 route locality profile ===");
+            eprintln!(
+                "calls={} layers={} assignments={} unique_layer_experts={} adjacent_hit_rate={:.2}% dropped_calls={}",
+                route.calls,
+                route.layers,
+                route.assignments,
+                route.unique_layer_experts,
+                route.adjacent_hit_rate() * 100.0,
+                route.dropped_calls,
+            );
+            eprintln!(
+                "[qwen36-route-profile] calls={} layers={} assignments={} unique_layer_experts={} adjacent_hits={} adjacent_total={} adjacent_hit_rate={:.6} dropped_calls={}",
+                route.calls,
+                route.layers,
+                route.assignments,
+                route.unique_layer_experts,
+                route.adjacent_hits,
+                route.adjacent_total,
+                route.adjacent_hit_rate(),
+                route.dropped_calls,
+            );
+            for sim in &route.cache_sims {
+                eprintln!(
+                    "[qwen36-route-cache-sim] scope=per_layer_lru capacity={} hits={} misses={} hit_rate={:.6}",
+                    sim.capacity,
+                    sim.hits,
+                    sim.misses,
+                    sim.hit_rate(),
+                );
+            }
+            for sim in &route.topn_sims {
+                eprintln!(
+                    "[qwen36-route-topn] scope=per_layer_oracle_topn capacity={} covered={} total={} coverage={:.6}",
+                    sim.capacity,
+                    sim.covered,
+                    sim.total,
+                    sim.coverage(),
+                );
+            }
         }
         eprintln!();
         eprintln!("=== HAL op profile (gpu_hal level) ===");

@@ -27,6 +27,210 @@ use half::f16;
 
 use crate::layer_desc::MAX_BATCH_SIZE;
 
+const QWEN36_ROUTE_PROFILE_DEFAULT_LAYERS: usize = 40;
+const QWEN36_ROUTE_PROFILE_DEFAULT_MAX_CALLS: usize = 16_384;
+const QWEN36_ROUTE_PROFILE_CACHE_CAPS: [usize; 4] = [2, 4, 8, 16];
+
+static QWEN36_ROUTE_PROFILE: OnceLock<Mutex<Qwen36RouteProfileAccumulator>> = OnceLock::new();
+
+#[derive(Debug, Clone, Default)]
+struct Qwen36RouteProfileAccumulator {
+    records: Vec<Vec<u16>>,
+    dropped_calls: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Qwen36RouteProfileSnapshot {
+    pub calls: u64,
+    pub dropped_calls: u64,
+    pub layers: usize,
+    pub assignments: u64,
+    pub unique_layer_experts: usize,
+    pub adjacent_hits: u64,
+    pub adjacent_total: u64,
+    pub cache_sims: Vec<Qwen36RouteCacheSim>,
+    pub topn_sims: Vec<Qwen36RouteTopNSim>,
+}
+
+impl Qwen36RouteProfileSnapshot {
+    pub fn adjacent_hit_rate(&self) -> f64 {
+        if self.adjacent_total == 0 {
+            0.0
+        } else {
+            self.adjacent_hits as f64 / self.adjacent_total as f64
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Qwen36RouteCacheSim {
+    pub capacity: usize,
+    pub hits: u64,
+    pub misses: u64,
+}
+
+impl Qwen36RouteCacheSim {
+    pub fn hit_rate(&self) -> f64 {
+        let total = self.hits + self.misses;
+        if total == 0 {
+            0.0
+        } else {
+            self.hits as f64 / total as f64
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Qwen36RouteTopNSim {
+    pub capacity: usize,
+    pub covered: u64,
+    pub total: u64,
+}
+
+impl Qwen36RouteTopNSim {
+    pub fn coverage(&self) -> f64 {
+        if self.total == 0 {
+            0.0
+        } else {
+            self.covered as f64 / self.total as f64
+        }
+    }
+}
+
+pub fn qwen36_route_profile_reset() {
+    if let Some(profile) = QWEN36_ROUTE_PROFILE.get() {
+        let mut profile = profile.lock().expect("qwen36 route profile mutex poisoned");
+        profile.records.clear();
+        profile.dropped_calls = 0;
+    }
+}
+
+pub fn qwen36_route_profile_snapshot() -> Qwen36RouteProfileSnapshot {
+    let Some(profile) = QWEN36_ROUTE_PROFILE.get() else {
+        return Qwen36RouteProfileSnapshot::default();
+    };
+    let profile = profile.lock().expect("qwen36 route profile mutex poisoned");
+    qwen36_route_profile_simulate(
+        &profile.records,
+        profile.dropped_calls,
+        qwen36_route_profile_layers(),
+    )
+}
+
+fn qwen36_route_profile_enabled() -> bool {
+    crate::prefill_ffi::metal_profile_enabled()
+        || std::env::var_os("SUPERSONIC_QWEN36_ROUTE_PROFILE").is_some()
+}
+
+fn qwen36_route_profile_layers() -> usize {
+    std::env::var("SUPERSONIC_QWEN36_ROUTE_PROFILE_LAYERS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(QWEN36_ROUTE_PROFILE_DEFAULT_LAYERS)
+}
+
+fn qwen36_route_profile_max_calls() -> usize {
+    std::env::var("SUPERSONIC_QWEN36_ROUTE_PROFILE_MAX_CALLS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(QWEN36_ROUTE_PROFILE_DEFAULT_MAX_CALLS)
+}
+
+fn qwen36_route_profile_record(active_experts: &[usize]) {
+    let profile =
+        QWEN36_ROUTE_PROFILE.get_or_init(|| Mutex::new(Qwen36RouteProfileAccumulator::default()));
+    let mut profile = profile.lock().expect("qwen36 route profile mutex poisoned");
+    if profile.records.len() >= qwen36_route_profile_max_calls() {
+        profile.dropped_calls += 1;
+        return;
+    }
+    profile.records.push(
+        active_experts
+            .iter()
+            .map(|&expert| expert.min(u16::MAX as usize) as u16)
+            .collect(),
+    );
+}
+
+fn qwen36_route_profile_simulate(
+    records: &[Vec<u16>],
+    dropped_calls: u64,
+    layers: usize,
+) -> Qwen36RouteProfileSnapshot {
+    let mut snapshot = Qwen36RouteProfileSnapshot {
+        calls: records.len() as u64,
+        dropped_calls,
+        layers,
+        ..Qwen36RouteProfileSnapshot::default()
+    };
+    if records.is_empty() || layers == 0 {
+        return snapshot;
+    }
+
+    let mut unique_layer_experts = HashMap::<(usize, u16), ()>::new();
+    let mut per_layer_freq: Vec<HashMap<u16, u64>> = (0..layers).map(|_| HashMap::new()).collect();
+    for (call_idx, experts) in records.iter().enumerate() {
+        let layer = call_idx % layers;
+        snapshot.assignments += experts.len() as u64;
+        for &expert in experts {
+            unique_layer_experts.insert((layer, expert), ());
+            *per_layer_freq[layer].entry(expert).or_insert(0) += 1;
+        }
+        if call_idx >= layers {
+            let prev = &records[call_idx - layers];
+            for &expert in experts {
+                snapshot.adjacent_total += 1;
+                if prev.contains(&expert) {
+                    snapshot.adjacent_hits += 1;
+                }
+            }
+        }
+    }
+    snapshot.unique_layer_experts = unique_layer_experts.len();
+
+    for &capacity in &QWEN36_ROUTE_PROFILE_CACHE_CAPS {
+        let mut caches: Vec<Vec<u16>> = (0..layers).map(|_| Vec::new()).collect();
+        let mut sim = Qwen36RouteCacheSim {
+            capacity,
+            ..Qwen36RouteCacheSim::default()
+        };
+        for (call_idx, experts) in records.iter().enumerate() {
+            let layer = call_idx % layers;
+            let cache = &mut caches[layer];
+            for &expert in experts {
+                if let Some(pos) = cache.iter().position(|&cached| cached == expert) {
+                    sim.hits += 1;
+                    let expert = cache.remove(pos);
+                    cache.push(expert);
+                } else {
+                    sim.misses += 1;
+                    if cache.len() >= capacity {
+                        cache.remove(0);
+                    }
+                    cache.push(expert);
+                }
+            }
+        }
+        snapshot.cache_sims.push(sim);
+
+        let mut topn = Qwen36RouteTopNSim {
+            capacity,
+            total: snapshot.assignments,
+            ..Qwen36RouteTopNSim::default()
+        };
+        for freq in &per_layer_freq {
+            let mut counts: Vec<u64> = freq.values().copied().collect();
+            counts.sort_unstable_by(|lhs, rhs| rhs.cmp(lhs));
+            topn.covered += counts.iter().take(capacity).sum::<u64>();
+        }
+        snapshot.topn_sims.push(topn);
+    }
+
+    snapshot
+}
+
 /// Per-layer descriptor for the Qwen3.6-MoE megakernel. Field order and
 /// natural x86_64 alignment must match the C++ struct in
 /// `kernels/qwen36_moe.hip` exactly. The repr-C layout is fixed at PR 4
@@ -4339,6 +4543,9 @@ fn ffn_step_stage1_5_metal_host(
     let active_experts: Vec<usize> = (0..active_groups)
         .map(|group| f32::to_bits(workspace[off_topk_idx + group]) as i32 as usize)
         .collect();
+    if qwen36_route_profile_enabled() {
+        qwen36_route_profile_record(&active_experts);
+    }
     if qwen36_ffn_expert_mps_bridge_stage5_supported(params, weights, int4) {
         let cpu_transcode =
             std::env::var_os("SUPERSONIC_METAL_QWEN36_MPS_BRIDGE_CPU_TRANSCODE").is_some();
@@ -6095,6 +6302,41 @@ mod tests {
         assert!(d.kv_cache_k.is_null());
         assert!(d.linear_recurrent_state.is_null());
         assert!(d.experts_gate_up_w.is_null());
+    }
+
+    #[test]
+    fn qwen36_route_profile_simulates_layer_locality() {
+        let records = vec![
+            vec![1, 2],
+            vec![3, 4],
+            vec![1, 5],
+            vec![6, 4],
+            vec![1, 2],
+            vec![6, 7],
+        ];
+        let snapshot = qwen36_route_profile_simulate(&records, 0, 2);
+
+        assert_eq!(snapshot.calls, 6);
+        assert_eq!(snapshot.assignments, 12);
+        assert_eq!(snapshot.unique_layer_experts, 7);
+        assert_eq!(snapshot.adjacent_hits, 4);
+        assert_eq!(snapshot.adjacent_total, 8);
+
+        let cap2 = snapshot
+            .cache_sims
+            .iter()
+            .find(|sim| sim.capacity == 2)
+            .expect("cap2 cache sim");
+        assert_eq!(cap2.hits, 4);
+        assert_eq!(cap2.misses, 8);
+
+        let top2 = snapshot
+            .topn_sims
+            .iter()
+            .find(|sim| sim.capacity == 2)
+            .expect("cap2 top-n sim");
+        assert_eq!(top2.covered, 9);
+        assert_eq!(top2.total, 12);
     }
 
     fn test_int4_blob(num_experts: usize, rows: usize, cols: usize) -> Vec<u8> {
