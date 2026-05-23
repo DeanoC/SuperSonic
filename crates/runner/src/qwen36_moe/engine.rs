@@ -374,6 +374,15 @@ fn decode_text(
             prompt_ids.len(),
         );
     }
+    if kernel_ffi::qwen36_moe::qwen36_batched_prefill_feasibility_profile_enabled() {
+        kernel_ffi::qwen36_moe::qwen36_batched_prefill_feasibility_profile_configure(
+            layers.len(),
+            geom.top_k as usize,
+            geom.num_experts as usize,
+            crate::qwen36_moe_cli::batched_prefill::PREFILL_CHUNK_SIZE_WMMA_FULL,
+            effective_prompt_len.saturating_sub(1),
+        );
+    }
     let backend_label = format!("{backend:?}");
     let mut prefill_profile = Some(PrefillProfileScope::new(
         profile_prefill,

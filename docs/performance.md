@@ -858,15 +858,22 @@ The local-main-target workflow for this machine is:
 2. headline decode gate: the `bench-perf --arch apple-m5-max --models qwen3.6-35b-a3b --quants int4` command above
 3. long-context smoke: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/bench_qwen36_longctx.py --preset smoke`
 4. profile smoke: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/bench_qwen36_longctx.py --preset smoke --metal-profile`
-5. routed-expert FFN microbench: `target/release/qwen36_ffn_expert_microbench --iters 20 --warmup 3`
-6. long-context comparison: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/bench_qwen36_longctx.py --preset comparison`
+5. batched-prefill MoE feasibility: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/bench_qwen36_longctx.py --preset smoke --batched-prefill-feasibility`
+6. routed-expert FFN microbench: `target/release/qwen36_ffn_expert_microbench --iters 20 --warmup 3`
+7. long-context comparison: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/bench_qwen36_longctx.py --preset comparison`
 
 The Metal long-context harness writes `target/qwen36_metal_longctx.json` and
 `target/qwen36_metal_longctx.md`. It uses deterministic NIAH-style prompts and
 the supported `int4` Metal lane only, then reports generated-token sanity,
 NIAH hit/miss, `stage_timings`, `chain_breakdown`, and `lifecycle_timings`.
 When `--metal-profile` is set, the harness also records parsed `metal_profile`
-and `hal_profile` summaries from the machine-readable profile lines.
+and `hal_profile` summaries from the machine-readable profile lines. When
+`--batched-prefill-feasibility` is set, the harness still forces the known-good
+Metal per-token prefill path, but it enables route capture and records
+`batched_prefill_feasibility` rows that summarize the grouped-MoE permutation
+metadata a future Metal prefill kernel would consume: profiled tokens, chunks,
+expert segments, average rows per touched expert, and WMMA16 assignment
+coverage.
 The 512-token smoke is a real prefill run and is slow on the current chained
 Metal path; use `--preset comparison` as a long-running sweep before selecting
 the next runtime optimization target.

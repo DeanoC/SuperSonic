@@ -323,6 +323,14 @@ under the same smoke:
    Implement only router permutation metadata and a no-op/reference combine
    first, then add grouped expert compute. This should target long-context
    prefill, not decode.
+   Initial implementation landed a Metal-safe metadata lane: the long-context
+   harness can run with `--batched-prefill-feasibility`, keeping the supported
+   per-token Metal prefill execution while emitting
+   `[qwen36-batched-prefill-feasibility]` rows derived from actual router
+   choices. The row reports chunk count, permutation entries, touched expert
+   segments, average rows per segment, max segment size, and WMMA16 coverage.
+   It is intentionally `metadata_only=1`; no Metal grouped expert compute is
+   promoted yet.
 
 3. **Static top-N resident MPS table probe**
    Use route profiles to choose top-N experts per layer, materialize FP16 MPS

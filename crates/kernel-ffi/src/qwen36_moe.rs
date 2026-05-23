@@ -34,6 +34,9 @@ const QWEN36_ROUTE_PROFILE_CACHE_CAPS: [usize; 4] = [2, 4, 8, 16];
 static QWEN36_ROUTE_PROFILE: OnceLock<Mutex<Qwen36RouteProfileAccumulator>> = OnceLock::new();
 static QWEN36_EXPERT_RESIDENCY_PROFILE: OnceLock<Mutex<Qwen36ExpertResidencyProfileAccumulator>> =
     OnceLock::new();
+static QWEN36_BATCHED_PREFILL_FEASIBILITY_PROFILE: OnceLock<
+    Mutex<Qwen36BatchedPrefillFeasibilityConfig>,
+> = OnceLock::new();
 
 #[derive(Debug, Clone, Default)]
 struct Qwen36RouteProfileAccumulator {
@@ -95,6 +98,74 @@ impl Qwen36RouteTopNSim {
             0.0
         } else {
             self.covered as f64 / self.total as f64
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Qwen36BatchedPrefillFeasibilityConfig {
+    layers: usize,
+    top_k: usize,
+    num_experts: usize,
+    chunk_size: usize,
+    prefill_tokens: usize,
+}
+
+impl Default for Qwen36BatchedPrefillFeasibilityConfig {
+    fn default() -> Self {
+        Self {
+            layers: QWEN36_ROUTE_PROFILE_DEFAULT_LAYERS,
+            top_k: 8,
+            num_experts: 256,
+            chunk_size: 512,
+            prefill_tokens: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Qwen36BatchedPrefillFeasibilityProfileSnapshot {
+    pub calls: u64,
+    pub dropped_calls: u64,
+    pub layers: usize,
+    pub top_k: usize,
+    pub num_experts: usize,
+    pub chunk_size: usize,
+    pub prefill_tokens: usize,
+    pub profiled_tokens: usize,
+    pub chunks: usize,
+    pub assignments: u64,
+    pub permutation_entries: u64,
+    pub expert_segments: u64,
+    pub wmma16_segments: u64,
+    pub wmma16_covered_assignments: u64,
+    pub max_rows_per_segment: u64,
+    pub max_unique_experts_per_layer_chunk: usize,
+}
+
+impl Qwen36BatchedPrefillFeasibilityProfileSnapshot {
+    pub fn avg_unique_experts_per_layer_chunk(&self) -> f64 {
+        let denom = self.chunks.saturating_mul(self.layers);
+        if denom == 0 {
+            0.0
+        } else {
+            self.expert_segments as f64 / denom as f64
+        }
+    }
+
+    pub fn avg_rows_per_segment(&self) -> f64 {
+        if self.expert_segments == 0 {
+            0.0
+        } else {
+            self.assignments as f64 / self.expert_segments as f64
+        }
+    }
+
+    pub fn wmma16_assignment_coverage(&self) -> f64 {
+        if self.assignments == 0 {
+            0.0
+        } else {
+            self.wmma16_covered_assignments as f64 / self.assignments as f64
         }
     }
 }
@@ -327,6 +398,15 @@ pub fn qwen36_route_profile_reset() {
     }
 }
 
+pub fn qwen36_batched_prefill_feasibility_profile_reset() {
+    if let Some(profile) = QWEN36_BATCHED_PREFILL_FEASIBILITY_PROFILE.get() {
+        let mut profile = profile
+            .lock()
+            .expect("qwen36 batched prefill feasibility profile mutex poisoned");
+        *profile = Qwen36BatchedPrefillFeasibilityConfig::default();
+    }
+}
+
 pub fn qwen36_route_profile_snapshot() -> Qwen36RouteProfileSnapshot {
     let Some(profile) = QWEN36_ROUTE_PROFILE.get() else {
         return Qwen36RouteProfileSnapshot::default();
@@ -336,6 +416,51 @@ pub fn qwen36_route_profile_snapshot() -> Qwen36RouteProfileSnapshot {
         &profile.records,
         profile.dropped_calls,
         qwen36_route_profile_layers(),
+    )
+}
+
+pub fn qwen36_batched_prefill_feasibility_profile_configure(
+    layers: usize,
+    top_k: usize,
+    num_experts: usize,
+    chunk_size: usize,
+    prefill_tokens: usize,
+) {
+    let profile = QWEN36_BATCHED_PREFILL_FEASIBILITY_PROFILE
+        .get_or_init(|| Mutex::new(Qwen36BatchedPrefillFeasibilityConfig::default()));
+    let mut profile = profile
+        .lock()
+        .expect("qwen36 batched prefill feasibility profile mutex poisoned");
+    *profile = Qwen36BatchedPrefillFeasibilityConfig {
+        layers: layers.max(1),
+        top_k: top_k.max(1),
+        num_experts: num_experts.max(1),
+        chunk_size: chunk_size.max(1),
+        prefill_tokens,
+    };
+}
+
+pub fn qwen36_batched_prefill_feasibility_profile_snapshot(
+) -> Qwen36BatchedPrefillFeasibilityProfileSnapshot {
+    let Some(route_profile) = QWEN36_ROUTE_PROFILE.get() else {
+        return Qwen36BatchedPrefillFeasibilityProfileSnapshot::default();
+    };
+    let route_profile = route_profile
+        .lock()
+        .expect("qwen36 route profile mutex poisoned");
+    let config = QWEN36_BATCHED_PREFILL_FEASIBILITY_PROFILE
+        .get()
+        .map(|profile| {
+            profile
+                .lock()
+                .expect("qwen36 batched prefill feasibility profile mutex poisoned")
+                .clone()
+        })
+        .unwrap_or_default();
+    qwen36_batched_prefill_feasibility_profile_simulate(
+        &route_profile.records,
+        route_profile.dropped_calls,
+        &config,
     )
 }
 
@@ -421,6 +546,12 @@ pub fn qwen36_expert_residency_profile_snapshot() -> Qwen36ExpertResidencyProfil
 fn qwen36_route_profile_enabled() -> bool {
     crate::prefill_ffi::metal_profile_enabled()
         || std::env::var_os("SUPERSONIC_QWEN36_ROUTE_PROFILE").is_some()
+        || std::env::var_os("SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL_FEASIBILITY").is_some()
+}
+
+pub fn qwen36_batched_prefill_feasibility_profile_enabled() -> bool {
+    crate::prefill_ffi::metal_profile_enabled()
+        || std::env::var_os("SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL_FEASIBILITY").is_some()
 }
 
 fn qwen36_expert_residency_profile_enabled() -> bool {
@@ -659,6 +790,73 @@ fn qwen36_route_profile_simulate(
         snapshot.topn_sims.push(topn);
     }
 
+    snapshot
+}
+
+fn qwen36_batched_prefill_feasibility_profile_simulate(
+    records: &[Vec<u16>],
+    dropped_calls: u64,
+    config: &Qwen36BatchedPrefillFeasibilityConfig,
+) -> Qwen36BatchedPrefillFeasibilityProfileSnapshot {
+    let layers = config.layers.max(1);
+    let top_k = config.top_k.max(1);
+    let chunk_size = config.chunk_size.max(1);
+    let available_tokens = records.len() / layers;
+    let requested_tokens = if config.prefill_tokens == 0 {
+        available_tokens
+    } else {
+        config.prefill_tokens
+    };
+    let profiled_tokens = requested_tokens.min(available_tokens);
+    let chunks = if profiled_tokens == 0 {
+        0
+    } else {
+        profiled_tokens.div_ceil(chunk_size)
+    };
+    let mut snapshot = Qwen36BatchedPrefillFeasibilityProfileSnapshot {
+        calls: records.len() as u64,
+        dropped_calls,
+        layers,
+        top_k,
+        num_experts: config.num_experts.max(1),
+        chunk_size,
+        prefill_tokens: config.prefill_tokens,
+        profiled_tokens,
+        chunks,
+        ..Qwen36BatchedPrefillFeasibilityProfileSnapshot::default()
+    };
+    if profiled_tokens == 0 {
+        return snapshot;
+    }
+
+    for chunk_start in (0..profiled_tokens).step_by(chunk_size) {
+        let chunk_end = (chunk_start + chunk_size).min(profiled_tokens);
+        for layer in 0..layers {
+            let mut counts = HashMap::<u16, u64>::new();
+            for token in chunk_start..chunk_end {
+                let call_idx = token * layers + layer;
+                let Some(experts) = records.get(call_idx) else {
+                    continue;
+                };
+                for &expert in experts.iter().take(top_k) {
+                    *counts.entry(expert).or_insert(0) += 1;
+                    snapshot.assignments += 1;
+                }
+            }
+            snapshot.expert_segments += counts.len() as u64;
+            snapshot.max_unique_experts_per_layer_chunk = snapshot
+                .max_unique_experts_per_layer_chunk
+                .max(counts.len());
+            for rows in counts.values().copied() {
+                snapshot.max_rows_per_segment = snapshot.max_rows_per_segment.max(rows);
+                if rows >= 16 {
+                    snapshot.wmma16_segments += 1;
+                    snapshot.wmma16_covered_assignments += rows;
+                }
+            }
+        }
+    }
+    snapshot.permutation_entries = snapshot.assignments;
     snapshot
 }
 
@@ -7383,6 +7581,38 @@ mod tests {
             .expect("cap2 top-n sim");
         assert_eq!(top2.covered, 9);
         assert_eq!(top2.total, 12);
+    }
+
+    #[test]
+    fn qwen36_batched_prefill_feasibility_groups_routes_by_chunk_and_layer() {
+        let records = vec![
+            vec![1, 2],
+            vec![5, 6],
+            vec![1, 3],
+            vec![5, 7],
+            vec![1, 4],
+            vec![8, 9],
+        ];
+        let config = Qwen36BatchedPrefillFeasibilityConfig {
+            layers: 2,
+            top_k: 2,
+            num_experts: 10,
+            chunk_size: 2,
+            prefill_tokens: 3,
+        };
+        let snapshot = qwen36_batched_prefill_feasibility_profile_simulate(&records, 0, &config);
+
+        assert_eq!(snapshot.calls, 6);
+        assert_eq!(snapshot.profiled_tokens, 3);
+        assert_eq!(snapshot.chunks, 2);
+        assert_eq!(snapshot.assignments, 12);
+        assert_eq!(snapshot.permutation_entries, 12);
+        assert_eq!(snapshot.expert_segments, 10);
+        assert_eq!(snapshot.max_unique_experts_per_layer_chunk, 3);
+        assert_eq!(snapshot.max_rows_per_segment, 2);
+        assert_eq!(snapshot.avg_unique_experts_per_layer_chunk(), 2.5);
+        assert!((snapshot.avg_rows_per_segment() - 1.2).abs() < 1e-6);
+        assert_eq!(snapshot.wmma16_assignment_coverage(), 0.0);
     }
 
     #[test]

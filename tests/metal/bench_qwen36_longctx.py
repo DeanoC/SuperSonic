@@ -23,7 +23,7 @@ from typing import Any
 
 
 MODEL = "qwen3.6-35b-a3b"
-SCHEMA = "qwen36-moe-metal-longctx-bench-v1"
+SCHEMA = "qwen36-moe-metal-longctx-bench-v2"
 
 PRESETS: dict[str, dict[str, Any]] = {
     "smoke": {
@@ -141,6 +141,62 @@ def parse_profile(output: str, summary_prefix: str, op_prefix: str) -> dict[str,
     return {"summary": summary, "entries": entries}
 
 
+def parse_batched_prefill_feasibility(output: str) -> dict[str, Any] | None:
+    lines = [
+        line
+        for line in output.splitlines()
+        if line.startswith("[qwen36-batched-prefill-feasibility]")
+    ]
+    if not lines:
+        return None
+    parsed: dict[str, Any] = {}
+    for key, value in parse_key_values(lines[-1]).items():
+        try:
+            if any(ch in value for ch in ".eE"):
+                parsed[key] = float(value)
+            else:
+                parsed[key] = int(value)
+        except ValueError:
+            parsed[key] = value
+    return parsed
+
+
+def append_batched_prefill_feasibility_markdown(md: str, rows: list[dict[str, Any]]) -> str:
+    profiled = [row for row in rows if row.get("batched_prefill_feasibility")]
+    if not profiled:
+        return md
+    lines = [
+        "",
+        "### Batched-Prefill MoE Feasibility",
+        "",
+        "| Context | Profiled tokens | Chunks | Avg unique experts | Avg rows/segment | WMMA16 coverage | Dropped calls |",
+        "|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for row in profiled:
+        profile = row.get("batched_prefill_feasibility") or {}
+        coverage = profile.get("wmma16_assignment_coverage")
+        lines.append(
+            "| {ctx} | {tokens} | {chunks} | {unique} | {rows} | {coverage} | {dropped} |".format(
+                ctx=row.get("context_tokens_requested"),
+                tokens=profile.get("profiled_tokens", ""),
+                chunks=profile.get("chunks", ""),
+                unique=(
+                    f"{profile.get('avg_unique_experts_per_layer_chunk'):.2f}"
+                    if profile.get("avg_unique_experts_per_layer_chunk") is not None
+                    else ""
+                ),
+                rows=(
+                    f"{profile.get('avg_rows_per_segment'):.2f}"
+                    if profile.get("avg_rows_per_segment") is not None
+                    else ""
+                ),
+                coverage=f"{coverage * 100.0:.1f}%" if coverage is not None else "",
+                dropped=profile.get("dropped_calls", ""),
+            )
+        )
+    return md.rstrip() + "\n" + "\n".join(lines) + "\n"
+
+
 def append_profile_markdown(md: str, rows: list[dict[str, Any]]) -> str:
     profiled = [row for row in rows if row.get("metal_profile") or row.get("hal_profile")]
     if not profiled:
@@ -181,6 +237,11 @@ def run_one(
     warmup: bool,
 ) -> dict[str, Any]:
     env = build_metal_env(os.environ)
+    if args.batched_prefill_feasibility and not warmup:
+        env["SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL_FEASIBILITY"] = "1"
+        env["SUPERSONIC_QWEN36_ROUTE_PROFILE_MAX_CALLS"] = str(
+            max(65536, (context_tokens + args.max_new_tokens + 8) * 40)
+        )
     if args.metal_profile and not warmup:
         env["SUPERSONIC_METAL_PROFILE"] = "1"
     cmd = [
@@ -246,6 +307,7 @@ def run_one(
             "stage": BASE.parse_stage_timings(output),
             "chain_breakdown": BASE.parse_chain_breakdown(output),
             "lifecycle": BASE.parse_lifecycle_timings(output),
+            "batched_prefill_feasibility": parse_batched_prefill_feasibility(output),
             "metal_profile": parse_profile(output, "[metal-profile]", "[metal-profile-op]"),
             "hal_profile": parse_profile(output, "[hal-profile]", "[hal-profile-op]"),
             "result": BASE.parse_result(output),
@@ -274,6 +336,7 @@ def run_one(
         "stage": BASE.parse_stage_timings(output),
         "chain_breakdown": BASE.parse_chain_breakdown(output),
         "lifecycle": BASE.parse_lifecycle_timings(output),
+        "batched_prefill_feasibility": parse_batched_prefill_feasibility(output),
         "metal_profile": parse_profile(output, "[metal-profile]", "[metal-profile-op]"),
         "hal_profile": parse_profile(output, "[hal-profile]", "[hal-profile-op]"),
         "result": BASE.parse_result(output),
@@ -325,6 +388,14 @@ def main() -> int:
         action="store_true",
         help="enable SUPERSONIC_METAL_PROFILE for measured runs and include profile summaries",
     )
+    parser.add_argument(
+        "--batched-prefill-feasibility",
+        action="store_true",
+        help=(
+            "keep the supported Metal per-token path but emit grouped-MoE "
+            "router/permutation occupancy metadata for prefill"
+        ),
+    )
     args = apply_preset_defaults(parser.parse_args())
     args.model_dir = resolve_model_dir(args.model_dir, os.environ)
 
@@ -370,7 +441,8 @@ def main() -> int:
             )
 
     summary = BASE.summarize(rows)
-    md = append_profile_markdown(BASE.markdown(rows, summary), rows)
+    md = append_batched_prefill_feasibility_markdown(BASE.markdown(rows, summary), rows)
+    md = append_profile_markdown(md, rows)
     payload = {
         "schema": SCHEMA,
         "model": MODEL,
@@ -381,6 +453,7 @@ def main() -> int:
         "modes": ["int4"],
         "max_new_tokens": args.max_new_tokens,
         "metal_profile": args.metal_profile,
+        "batched_prefill_feasibility": args.batched_prefill_feasibility,
         "seed": args.seed,
         "summary": summary,
         "recommendation": BASE.recommendation(summary),

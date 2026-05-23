@@ -450,6 +450,10 @@ SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" \
 SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" \
   python3 tests/metal/bench_qwen36_longctx.py --preset smoke --metal-profile
 
+SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" \
+  python3 tests/metal/bench_qwen36_longctx.py --preset smoke \
+  --batched-prefill-feasibility
+
 cargo build --release -p runner --bin qwen36_ffn_expert_microbench
 target/release/qwen36_ffn_expert_microbench --iters 20 --warmup 3
 ```
@@ -459,8 +463,11 @@ next Metal runtime optimization target. The report records generated-token
 sanity, NIAH hit/miss, stage timings, chain breakdown, and lifecycle timings
 for the supported INT4 chained-decode lane. With `--metal-profile`, it also sets
 `SUPERSONIC_METAL_PROFILE=1` and records parsed `metal_profile` and
-`hal_profile` summaries from the machine-readable profile lines. The 512-token
-smoke is intentionally slow on the current chained Metal prefill path; treat the
+`hal_profile` summaries from the machine-readable profile lines. With
+`--batched-prefill-feasibility`, it keeps the supported Metal per-token prefill
+path but records grouped-MoE router/permutation occupancy from actual route
+choices via `[qwen36-batched-prefill-feasibility]`. The 512-token smoke is
+intentionally slow on the current chained Metal prefill path; treat the
 comparison preset as a long-running sweep rather than a per-commit unit gate.
 The current M5 Max perf gate points at linear-attention as the next measured
 multi-token per-token bucket after FFN fallback tightening. The 512-token
