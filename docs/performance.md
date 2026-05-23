@@ -862,9 +862,10 @@ The local-main-target workflow for this machine is:
 6. MTP tensor audit: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/audit_qwen36_mtp.py --require-complete-bake`
 7. MTP acceptance/policy probe: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/probe_qwen36_mtp_acceptance.py`
 8. MTP Metal K=1 experiment: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/probe_qwen36_mtp_acceptance.py --metal-experiment`
-9. static top-N resident-table probe: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/probe_qwen36_static_topn.py`
-10. routed-expert FFN microbench: `target/release/qwen36_ffn_expert_microbench --iters 20 --warmup 3`
-11. long-context comparison: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/bench_qwen36_longctx.py --preset comparison`
+9. MTP Metal prompt-suite sweep: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/sweep_qwen36_mtp_acceptance.py --prompt-set smoke --metal-experiment`
+10. static top-N resident-table probe: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/probe_qwen36_static_topn.py`
+11. routed-expert FFN microbench: `target/release/qwen36_ffn_expert_microbench --iters 20 --warmup 3`
+12. long-context comparison: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/bench_qwen36_longctx.py --preset comparison`
 
 The Metal long-context harness writes `target/qwen36_metal_longctx.json` and
 `target/qwen36_metal_longctx.md`. It uses deterministic NIAH-style prompts and
@@ -904,7 +905,15 @@ local K=1 smoke completed in 24.3s with `drafted_tokens=2`,
 `accepted_tokens=1`, `acceptance_rate=0.5`, and
 `target_steps_per_emitted=1.0`; this proves the Metal path can run and measure
 acceptance, but it is not a throughput win by itself because every emitted token
-still required one target-model step.
+still required one target-model step. `tests/metal/sweep_qwen36_mtp_acceptance.py`
+extends that one-prompt result across a smoke or comparison prompt suite and
+writes aggregate `drafted_tokens`, `accepted_tokens`, `acceptance_rate`, and
+`target_steps_per_emitted` rows to
+`target/qwen36_mtp_acceptance_sweep.{json,md}`. The first smoke sweep completed
+both rows in 34.7s: the profiling prompt accepted 0/2 drafts, the coding prompt
+accepted 1/2 drafts, aggregate acceptance was 25.0%, and aggregate
+`target_steps_per_emitted` remained 1.0. This keeps K=1 as an instrumentation
+path, not a supported-speed path.
 `tests/metal/probe_qwen36_static_topn.py` is the first static resident-table
 probe. The runner now has gated machine-readable route dumps:
 `SUPERSONIC_QWEN36_ROUTE_PROFILE_DUMP_TOPN_LAYERS=1` emits

@@ -376,6 +376,18 @@ under the same smoke:
    `acceptance_rate=0.5`, and `target_steps_per_emitted=1.0` in 24.3s, so the
    current value is correctness/telemetry proof rather than throughput.
 
+7. **Qwen3.6 MTP prompt-suite acceptance sweep**
+   Promote the single-prompt K=1 experiment into a small smoke/comparison suite
+   before changing Metal policy again. `tests/metal/sweep_qwen36_mtp_acceptance.py`
+   runs the same env-gated path across profiling, coding, reasoning, and summary
+   prompts, aggregates accepted/drafted tokens and target steps per emitted
+   token, and records policy-blocked rows when the experiment gate is absent.
+   The first Metal smoke sweep measured 2/2 prompts in 34.7s with aggregate
+   `accepted_tokens=1`, `drafted_tokens=4`, `acceptance_rate=0.25`, and
+   `target_steps_per_emitted=1.0`; the profiling prompt accepted 0/2 drafts and
+   the coding prompt accepted 1/2. K=1 therefore remains an instrumentation path,
+   not a policy-promotion candidate.
+
 ## Sources
 
 - [Qwen/Qwen3.6-35B-A3B model card](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)

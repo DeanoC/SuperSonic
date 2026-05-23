@@ -464,6 +464,10 @@ SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" \
   python3 tests/metal/probe_qwen36_mtp_acceptance.py --metal-experiment
 
 SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" \
+  python3 tests/metal/sweep_qwen36_mtp_acceptance.py --prompt-set smoke \
+  --metal-experiment
+
+SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" \
   python3 tests/metal/probe_qwen36_static_topn.py
 
 cargo build --release -p runner --bin qwen36_ffn_expert_microbench
@@ -503,7 +507,14 @@ supported per-token prefill lane; `--batched-spec-verify` remains blocked.
 The first local K=1 smoke completed in 24.3s and recorded
 `drafted_tokens=2`, `accepted_tokens=1`, `acceptance_rate=0.5`, and
 `target_steps_per_emitted=1.0`, so it is a correctness/acceptance foothold, not
-a throughput win by itself.
+a throughput win by itself. The sweep harness writes
+`target/qwen36_mtp_acceptance_sweep.json` and
+`target/qwen36_mtp_acceptance_sweep.md`, then aggregates measured rows across a
+small prompt suite so K=1 promotion is based on prompt breadth rather than a
+single acceptance sample. The first two-prompt Metal smoke measured both rows:
+profiling accepted 0/2 drafts, coding accepted 1/2 drafts, aggregate acceptance
+was 25.0%, and aggregate `target_steps_per_emitted` stayed 1.0. That keeps the
+path useful for telemetry, but not ready for Metal policy promotion.
 The static top-N probe writes `target/qwen36_static_topn_mps_probe.json` and
 `target/qwen36_static_topn_mps_probe.md`. It uses the route profiler's gated
 `[qwen36-route-topn-layer]` and `[qwen36-route-call]` rows to choose per-layer
