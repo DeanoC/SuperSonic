@@ -860,9 +860,10 @@ The local-main-target workflow for this machine is:
 4. profile smoke: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/bench_qwen36_longctx.py --preset smoke --metal-profile`
 5. batched-prefill MoE feasibility: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/bench_qwen36_longctx.py --preset smoke --batched-prefill-feasibility`
 6. MTP tensor audit: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/audit_qwen36_mtp.py --require-complete-bake`
-7. static top-N resident-table probe: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/probe_qwen36_static_topn.py`
-8. routed-expert FFN microbench: `target/release/qwen36_ffn_expert_microbench --iters 20 --warmup 3`
-9. long-context comparison: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/bench_qwen36_longctx.py --preset comparison`
+7. MTP acceptance/policy probe: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/probe_qwen36_mtp_acceptance.py`
+8. static top-N resident-table probe: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/probe_qwen36_static_topn.py`
+9. routed-expert FFN microbench: `target/release/qwen36_ffn_expert_microbench --iters 20 --warmup 3`
+10. long-context comparison: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/bench_qwen36_longctx.py --preset comparison`
 
 The Metal long-context harness writes `target/qwen36_metal_longctx.json` and
 `target/qwen36_metal_longctx.md`. It uses deterministic NIAH-style prompts and
@@ -884,8 +885,16 @@ checks the source snapshot for the split MTP expert tensors and the INT4 bake
 for the 19 folded `mtp.*` tensors loaded by the runtime. On this local M5 Max
 cache, the audit reports `source=complete` with 1,560 `mtp.*` tensors and
 `bake=complete` with all 19 runtime MTP tensors, so the model files are ready
-for the next MTP parity harness. Metal speculative decode is still unsupported
-until that harness exists and measures acceptance separately from FFN latency.
+for the MTP acceptance gate. The runner now emits a machine-readable
+`[qwen36-mtp-acceptance]` row when
+`SUPERSONIC_QWEN36_MTP_ACCEPTANCE_PROFILE=1` or `--emit-stage-timings` is used
+with speculative decode. The row records drafted tokens, accepted tokens,
+acceptance rate, emitted tokens, base verify steps, batched replay steps, and
+target steps per emitted token. `tests/metal/probe_qwen36_mtp_acceptance.py`
+captures that telemetry on enabled backends and records the expected
+`policy_blocked` result on Metal today. Metal speculative decode remains
+unsupported until that probe reports real one-draft and multi-draft acceptance
+without mixing the result into FFN latency.
 `tests/metal/probe_qwen36_static_topn.py` is the first static resident-table
 probe. The runner now has gated machine-readable route dumps:
 `SUPERSONIC_QWEN36_ROUTE_PROFILE_DUMP_TOPN_LAYERS=1` emits

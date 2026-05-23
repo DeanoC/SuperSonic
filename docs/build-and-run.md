@@ -458,6 +458,9 @@ SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" \
   python3 tests/metal/audit_qwen36_mtp.py --require-complete-bake
 
 SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" \
+  python3 tests/metal/probe_qwen36_mtp_acceptance.py
+
+SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" \
   python3 tests/metal/probe_qwen36_static_topn.py
 
 cargo build --release -p runner --bin qwen36_ffn_expert_microbench
@@ -482,7 +485,14 @@ runtime tensors consumed by `mtp_loader.rs`, and can fail closed with
 `--require-complete-bake`. The current local Qwen3.6 FP8 snapshot reports
 1,560 `mtp.*` source tensors and the INT4 bake reports all 19 runtime MTP
 tensors, but speculative decode remains unsupported on the Metal policy path
-until the MTP parity and acceptance harness is wired.
+until the MTP path is explicitly enabled. The acceptance probe writes
+`target/qwen36_mtp_acceptance_probe.json` and
+`target/qwen36_mtp_acceptance_probe.md`. Today on Metal it records the expected
+`policy_blocked` row; when run on a backend with speculative decode enabled it
+parses `[qwen36-mtp-acceptance]` telemetry with drafted tokens, accepted
+tokens, emitted tokens, base verify steps, replay steps, and target
+steps/emitted so one-draft and multi-draft acceptance can be measured apart
+from FFN latency.
 The static top-N probe writes `target/qwen36_static_topn_mps_probe.json` and
 `target/qwen36_static_topn_mps_probe.md`. It uses the route profiler's gated
 `[qwen36-route-topn-layer]` and `[qwen36-route-call]` rows to choose per-layer

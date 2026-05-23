@@ -294,7 +294,7 @@ pub(crate) fn run_speculative_extension(
         refresh_linear_attn_state(args.ordinal, args.layers, snapshot)
             .context("refresh linear-attn snapshot before batched verify")?;
 
-        let result = run_speculative_decode_step_batched(
+        let mut result = run_speculative_decode_step_batched(
             args.ordinal,
             args.geom,
             args.mtp,
@@ -331,6 +331,7 @@ pub(crate) fn run_speculative_extension(
             &result,
             dynamic_k,
         ) {
+            result.replay_steps = replay.len();
             restore_and_replay_accepted_prefix(Qwen36SpecReplayAccepted {
                 ordinal: args.ordinal,
                 geom: args.geom,

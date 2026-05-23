@@ -40,6 +40,7 @@ use crate::qwen36_moe_cli::vmm::{
 };
 use crate::qwen36_moe_cli::vmm_config::{prepare_moe_runtime_config, should_use_qwen36_kv_vmm};
 use crate::qwen36_moe_logits::XorshiftRng;
+use crate::qwen36_moe_speculative::SpeculativeStepResult;
 use crate::qwen36_moe_telemetry::{print_and_write_moe_residency_summary, MoeRouteRuntime};
 use crate::qwen36_moe_types::PositionPair;
 use crate::registry::RegistryEntry;
@@ -69,6 +70,95 @@ pub(crate) fn current_position(
             };
             PositionPair::split(rope, loop_state_position)
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Qwen36MtpAcceptanceStats {
+    mode: &'static str,
+    steps: usize,
+    drafted_tokens: usize,
+    accepted_tokens: usize,
+    emitted_tokens: usize,
+    base_steps: usize,
+    replay_steps: usize,
+    full_accept_steps: usize,
+    zero_accept_steps: usize,
+    max_accept: usize,
+}
+
+impl Qwen36MtpAcceptanceStats {
+    fn new(batched_spec_verify: bool) -> Self {
+        Self {
+            mode: if batched_spec_verify {
+                "batched"
+            } else {
+                "sequential"
+            },
+            steps: 0,
+            drafted_tokens: 0,
+            accepted_tokens: 0,
+            emitted_tokens: 0,
+            base_steps: 0,
+            replay_steps: 0,
+            full_accept_steps: 0,
+            zero_accept_steps: 0,
+            max_accept: 0,
+        }
+    }
+
+    fn record(&mut self, result: &SpeculativeStepResult) {
+        self.steps += 1;
+        self.drafted_tokens += result.n_drafted;
+        self.accepted_tokens += result.n_accepted;
+        self.emitted_tokens += result.emitted_tokens.len();
+        self.base_steps += result.base_steps;
+        self.replay_steps += result.replay_steps;
+        self.max_accept = self.max_accept.max(result.n_accepted);
+        if result.n_drafted > 0 && result.n_accepted == result.n_drafted {
+            self.full_accept_steps += 1;
+        }
+        if result.n_accepted == 0 {
+            self.zero_accept_steps += 1;
+        }
+    }
+
+    fn print_if_requested(&self, enabled: bool) {
+        if !enabled || self.steps == 0 {
+            return;
+        }
+        let acceptance_rate = if self.drafted_tokens > 0 {
+            self.accepted_tokens as f64 / self.drafted_tokens as f64
+        } else {
+            0.0
+        };
+        let emitted_per_step = self.emitted_tokens as f64 / self.steps as f64;
+        let target_steps = self.base_steps + self.replay_steps;
+        let target_steps_per_emitted = if self.emitted_tokens > 0 {
+            target_steps as f64 / self.emitted_tokens as f64
+        } else {
+            0.0
+        };
+        eprintln!(
+            "[qwen36-mtp-acceptance] mode={} steps={} drafted_tokens={} \
+             accepted_tokens={} acceptance_rate={:.6} emitted_tokens={} \
+             emitted_per_step={:.6} base_steps={} replay_steps={} \
+             target_steps_per_emitted={:.6} full_accept_steps={} \
+             zero_accept_steps={} max_accept={}",
+            self.mode,
+            self.steps,
+            self.drafted_tokens,
+            self.accepted_tokens,
+            acceptance_rate,
+            self.emitted_tokens,
+            emitted_per_step,
+            self.base_steps,
+            self.replay_steps,
+            target_steps_per_emitted,
+            self.full_accept_steps,
+            self.zero_accept_steps,
+            self.max_accept,
+        );
     }
 }
 
@@ -414,6 +504,10 @@ fn decode_text(
     // is a real GPU+sync measurement. CPU-side stages (embed lookup, lm_head
     // GEMV, sampling, detokenize) are pure host work.
     let mut stage_timings = Qwen36StageTimingTotals::default();
+    let mtp_acceptance_profile =
+        std::env::var_os("SUPERSONIC_QWEN36_MTP_ACCEPTANCE_PROFILE").is_some();
+    let mut mtp_acceptance_stats =
+        speculative_decode.then(|| Qwen36MtpAcceptanceStats::new(batched_spec_verify));
     let mut prefill_steps = 0usize;
     let mut prefill_embed_elapsed = std::time::Duration::ZERO;
     let mut prefill_chain_elapsed = std::time::Duration::ZERO;
@@ -717,6 +811,9 @@ fn decode_text(
                 emit_stage_timings,
             })?;
 
+            if let Some(stats) = mtp_acceptance_stats.as_mut() {
+                stats.record(&result);
+            }
             if loop_state.append_speculative_emissions(&result, tokenizer.as_ref(), eos_id) {
                 break;
             }
@@ -766,6 +863,9 @@ fn decode_text(
             generation_wall_ms.unwrap_or(0.0),
             to_ms(decode_wall_start.elapsed()),
         );
+    }
+    if let Some(stats) = mtp_acceptance_stats.as_ref() {
+        stats.print_if_requested(mtp_acceptance_profile || emit_stage_timings);
     }
     emit_mpp_pilot_if_requested(emit_stage_timings);
     emit_mps_expert_pilot_if_requested(emit_stage_timings);

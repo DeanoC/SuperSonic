@@ -294,7 +294,9 @@ SuperSonic:
 - Start with a model-file audit: confirm which MTP tensors exist in the local
   bake and whether the current INT4 bake preserves them.
 - Build a tiny MTP loader/parity harness before touching the decode loop.
-- Measure one-token and multi-token acceptance separately from FFN latency.
+- Measure one-token and multi-token acceptance separately from FFN latency with
+  `SUPERSONIC_QWEN36_MTP_ACCEPTANCE_PROFILE=1` and
+  `tests/metal/probe_qwen36_mtp_acceptance.py`.
 - Keep SpecPrefill separate; it is a long-prompt prefill optimization, not a
   decode replacement.
 
@@ -353,8 +355,15 @@ under the same smoke:
    local M5 Max cache reports the FP8 source snapshot as complete with 1,560
    `mtp.*` tensors, and the INT4 bake manifest as complete with the 19 folded
    runtime tensors consumed by `mtp_loader.rs`. The loader delta is therefore
-   "model files ready, Metal speculative decode still policy-blocked until a
-   parity/acceptance harness is wired."
+   "model files ready, Metal speculative decode still policy-blocked until the
+   runtime path is enabled."
+
+5. **Qwen3.6 MTP acceptance probe**
+   Add machine-readable `[qwen36-mtp-acceptance]` telemetry to the runner and
+   a harness that records either real acceptance or the current Metal policy
+   block. The telemetry separates drafted tokens, accepted tokens, base verify
+   chains, batched replay chains, and target steps per emitted token, so MTP can
+   be judged independently of FFN kernel latency.
 
 ## Sources
 
