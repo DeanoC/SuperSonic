@@ -20,6 +20,8 @@ pub struct AttributionTimings {
     pub mpp_pilot: Option<BTreeMap<String, f64>>,
     pub mps_expert_pilot: Option<BTreeMap<String, f64>>,
     pub qwen36_pack_cache: Option<BTreeMap<String, f64>>,
+    pub qwen36_expert_residency: Option<BTreeMap<String, f64>>,
+    pub qwen36_expert_residency_policies: Option<Vec<BTreeMap<String, f64>>>,
     pub metal_profile: Option<ProfileJson>,
     pub hal_profile: Option<ProfileJson>,
 }
@@ -117,6 +119,19 @@ pub fn extract_attribution_timings(output: &str) -> AttributionTimings {
             .rev()
             .find(|l| l.starts_with("[qwen36-pack-cache]"))
             .map(parse_numeric_fields),
+        qwen36_expert_residency: output
+            .lines()
+            .rev()
+            .find(|l| l.starts_with("[qwen36-expert-residency]"))
+            .map(parse_numeric_fields),
+        qwen36_expert_residency_policies: {
+            let policies: Vec<_> = output
+                .lines()
+                .filter(|l| l.starts_with("[qwen36-expert-residency-policy]"))
+                .map(parse_numeric_fields)
+                .collect();
+            (!policies.is_empty()).then_some(policies)
+        },
         metal_profile: extract_profile(output, "[metal-profile]", "[metal-profile-op]", true),
         hal_profile: extract_profile(output, "[hal-profile]", "[hal-profile-op]", false),
     }
@@ -273,6 +288,8 @@ pub fn run_one_combo(invocation: &ComboInvocation, policy: &RunPolicy) -> Result
         mpp_pilot: attribution.mpp_pilot,
         mps_expert_pilot: attribution.mps_expert_pilot,
         qwen36_pack_cache: attribution.qwen36_pack_cache,
+        qwen36_expert_residency: attribution.qwen36_expert_residency,
+        qwen36_expert_residency_policies: attribution.qwen36_expert_residency_policies,
         metal_profile: attribution.metal_profile,
         hal_profile: attribution.hal_profile,
         gpu_temp_c_end: None,

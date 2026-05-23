@@ -32,9 +32,8 @@ const QWEN36_ROUTE_PROFILE_DEFAULT_MAX_CALLS: usize = 16_384;
 const QWEN36_ROUTE_PROFILE_CACHE_CAPS: [usize; 4] = [2, 4, 8, 16];
 
 static QWEN36_ROUTE_PROFILE: OnceLock<Mutex<Qwen36RouteProfileAccumulator>> = OnceLock::new();
-static QWEN36_PACKED_EXPERT_CACHE_PROFILE: OnceLock<
-    Mutex<Qwen36PackedExpertCacheProfileAccumulator>,
-> = OnceLock::new();
+static QWEN36_EXPERT_RESIDENCY_PROFILE: OnceLock<Mutex<Qwen36ExpertResidencyProfileAccumulator>> =
+    OnceLock::new();
 
 #[derive(Debug, Clone, Default)]
 struct Qwen36RouteProfileAccumulator {
@@ -100,8 +99,70 @@ impl Qwen36RouteTopNSim {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Qwen36ExpertResidentFormat {
+    NativeInt4,
+}
+
+impl Qwen36ExpertResidentFormat {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NativeInt4 => "native_int4",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Qwen36ExpertResidencyScope {
+    PerLayer,
+}
+
+impl Qwen36ExpertResidencyScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PerLayer => "per_layer",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Qwen36ExpertResidencyMissPolicy {
+    ExactRoute,
+    LruHotset,
+    GpuPack,
+}
+
+impl Qwen36ExpertResidencyMissPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ExactRoute => "exact_route",
+            Self::LruHotset => "lru_hotset",
+            Self::GpuPack => "gpu_pack",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Qwen36ExpertResidencyProfileKey {
+    pub resident_format: Qwen36ExpertResidentFormat,
+    pub scope: Qwen36ExpertResidencyScope,
+    pub miss_policy: Qwen36ExpertResidencyMissPolicy,
+    pub capacity: usize,
+}
+
+impl Qwen36ExpertResidencyProfileKey {
+    fn new(miss_policy: Qwen36ExpertResidencyMissPolicy, capacity: usize) -> Self {
+        Self {
+            resident_format: Qwen36ExpertResidentFormat::NativeInt4,
+            scope: Qwen36ExpertResidencyScope::PerLayer,
+            miss_policy,
+            capacity,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
-struct Qwen36PackedExpertCacheProfileAccumulator {
+struct Qwen36ExpertResidencyCounters {
     calls: u64,
     exact_hits: u64,
     route_refills: u64,
@@ -115,7 +176,17 @@ struct Qwen36PackedExpertCacheProfileAccumulator {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct Qwen36PackedExpertCacheProfileSnapshot {
+struct Qwen36ExpertResidencyProfileAccumulator {
+    totals: Qwen36ExpertResidencyCounters,
+    policies: HashMap<Qwen36ExpertResidencyProfileKey, Qwen36ExpertResidencyCounters>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Qwen36ExpertResidencyPolicySnapshot {
+    pub resident_format: &'static str,
+    pub scope: &'static str,
+    pub miss_policy: &'static str,
+    pub capacity: usize,
     pub calls: u64,
     pub exact_hits: u64,
     pub route_refills: u64,
@@ -123,13 +194,12 @@ pub struct Qwen36PackedExpertCacheProfileSnapshot {
     pub copied_bytes: u64,
     pub active_groups_total: u64,
     pub max_active_groups: usize,
-    pub entries: usize,
     pub slot_hits: u64,
     pub slot_misses: u64,
     pub evictions: u64,
 }
 
-impl Qwen36PackedExpertCacheProfileSnapshot {
+impl Qwen36ExpertResidencyPolicySnapshot {
     pub fn exact_hit_rate(&self) -> f64 {
         if self.calls == 0 {
             0.0
@@ -165,6 +235,90 @@ impl Qwen36PackedExpertCacheProfileSnapshot {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct Qwen36ExpertResidencyProfileSnapshot {
+    pub calls: u64,
+    pub exact_hits: u64,
+    pub route_refills: u64,
+    pub allocations: u64,
+    pub copied_bytes: u64,
+    pub active_groups_total: u64,
+    pub max_active_groups: usize,
+    pub entries: usize,
+    pub slot_hits: u64,
+    pub slot_misses: u64,
+    pub evictions: u64,
+    pub policies: Vec<Qwen36ExpertResidencyPolicySnapshot>,
+}
+
+impl Qwen36ExpertResidencyProfileSnapshot {
+    pub fn exact_hit_rate(&self) -> f64 {
+        if self.calls == 0 {
+            0.0
+        } else {
+            self.exact_hits as f64 / self.calls as f64
+        }
+    }
+
+    pub fn avg_active_groups(&self) -> f64 {
+        if self.calls == 0 {
+            0.0
+        } else {
+            self.active_groups_total as f64 / self.calls as f64
+        }
+    }
+
+    pub fn avg_copied_bytes(&self) -> f64 {
+        let copy_ops = self.route_refills + self.allocations;
+        if copy_ops == 0 {
+            0.0
+        } else {
+            self.copied_bytes as f64 / copy_ops as f64
+        }
+    }
+
+    pub fn slot_hit_rate(&self) -> f64 {
+        let total = self.slot_hits + self.slot_misses;
+        if total == 0 {
+            0.0
+        } else {
+            self.slot_hits as f64 / total as f64
+        }
+    }
+}
+
+pub type Qwen36PackedExpertCacheProfileSnapshot = Qwen36ExpertResidencyProfileSnapshot;
+
+#[allow(clippy::too_many_arguments)]
+fn qwen36_expert_residency_counters_record(
+    counters: &mut Qwen36ExpertResidencyCounters,
+    exact_hit: bool,
+    route_refill: bool,
+    allocation: bool,
+    active_groups: usize,
+    copied_bytes: usize,
+    slot_hits: usize,
+    slot_misses: usize,
+    evictions: usize,
+) {
+    counters.calls += 1;
+    counters.active_groups_total += active_groups as u64;
+    counters.max_active_groups = counters.max_active_groups.max(active_groups);
+    if exact_hit {
+        counters.exact_hits += 1;
+    }
+    if route_refill {
+        counters.route_refills += 1;
+    }
+    if allocation {
+        counters.allocations += 1;
+    }
+    counters.copied_bytes += copied_bytes as u64;
+    counters.slot_hits += slot_hits as u64;
+    counters.slot_misses += slot_misses as u64;
+    counters.evictions += evictions as u64;
+}
+
 pub fn qwen36_route_profile_reset() {
     if let Some(profile) = QWEN36_ROUTE_PROFILE.get() {
         let mut profile = profile.lock().expect("qwen36 route profile mutex poisoned");
@@ -186,15 +340,23 @@ pub fn qwen36_route_profile_snapshot() -> Qwen36RouteProfileSnapshot {
 }
 
 pub fn qwen36_packed_expert_cache_profile_reset() {
-    if let Some(profile) = QWEN36_PACKED_EXPERT_CACHE_PROFILE.get() {
+    qwen36_expert_residency_profile_reset();
+}
+
+pub fn qwen36_expert_residency_profile_reset() {
+    if let Some(profile) = QWEN36_EXPERT_RESIDENCY_PROFILE.get() {
         *profile
             .lock()
-            .expect("qwen36 packed expert cache profile mutex poisoned") =
-            Qwen36PackedExpertCacheProfileAccumulator::default();
+            .expect("qwen36 expert residency profile mutex poisoned") =
+            Qwen36ExpertResidencyProfileAccumulator::default();
     }
 }
 
 pub fn qwen36_packed_expert_cache_profile_snapshot() -> Qwen36PackedExpertCacheProfileSnapshot {
+    qwen36_expert_residency_profile_snapshot()
+}
+
+pub fn qwen36_expert_residency_profile_snapshot() -> Qwen36ExpertResidencyProfileSnapshot {
     let entries = QWEN36_PACKED_EXPERT_CACHE
         .get()
         .and_then(|cache| cache.lock().ok().map(|cache| cache.len()))
@@ -203,27 +365,56 @@ pub fn qwen36_packed_expert_cache_profile_snapshot() -> Qwen36PackedExpertCacheP
             .get()
             .and_then(|cache| cache.lock().ok().map(|cache| cache.len()))
             .unwrap_or(0);
-    let Some(profile) = QWEN36_PACKED_EXPERT_CACHE_PROFILE.get() else {
-        return Qwen36PackedExpertCacheProfileSnapshot {
+    let Some(profile) = QWEN36_EXPERT_RESIDENCY_PROFILE.get() else {
+        return Qwen36ExpertResidencyProfileSnapshot {
             entries,
-            ..Qwen36PackedExpertCacheProfileSnapshot::default()
+            ..Qwen36ExpertResidencyProfileSnapshot::default()
         };
     };
     let profile = profile
         .lock()
-        .expect("qwen36 packed expert cache profile mutex poisoned");
-    Qwen36PackedExpertCacheProfileSnapshot {
-        calls: profile.calls,
-        exact_hits: profile.exact_hits,
-        route_refills: profile.route_refills,
-        allocations: profile.allocations,
-        copied_bytes: profile.copied_bytes,
-        active_groups_total: profile.active_groups_total,
-        max_active_groups: profile.max_active_groups,
+        .expect("qwen36 expert residency profile mutex poisoned");
+    let mut policies: Vec<_> = profile
+        .policies
+        .iter()
+        .map(|(key, counters)| Qwen36ExpertResidencyPolicySnapshot {
+            resident_format: key.resident_format.as_str(),
+            scope: key.scope.as_str(),
+            miss_policy: key.miss_policy.as_str(),
+            capacity: key.capacity,
+            calls: counters.calls,
+            exact_hits: counters.exact_hits,
+            route_refills: counters.route_refills,
+            allocations: counters.allocations,
+            copied_bytes: counters.copied_bytes,
+            active_groups_total: counters.active_groups_total,
+            max_active_groups: counters.max_active_groups,
+            slot_hits: counters.slot_hits,
+            slot_misses: counters.slot_misses,
+            evictions: counters.evictions,
+        })
+        .collect();
+    policies.sort_by_key(|policy| {
+        (
+            policy.resident_format,
+            policy.scope,
+            policy.miss_policy,
+            policy.capacity,
+        )
+    });
+    Qwen36ExpertResidencyProfileSnapshot {
+        calls: profile.totals.calls,
+        exact_hits: profile.totals.exact_hits,
+        route_refills: profile.totals.route_refills,
+        allocations: profile.totals.allocations,
+        copied_bytes: profile.totals.copied_bytes,
+        active_groups_total: profile.totals.active_groups_total,
+        max_active_groups: profile.totals.max_active_groups,
         entries,
-        slot_hits: profile.slot_hits,
-        slot_misses: profile.slot_misses,
-        evictions: profile.evictions,
+        slot_hits: profile.totals.slot_hits,
+        slot_misses: profile.totals.slot_misses,
+        evictions: profile.totals.evictions,
+        policies,
     }
 }
 
@@ -232,11 +423,58 @@ fn qwen36_route_profile_enabled() -> bool {
         || std::env::var_os("SUPERSONIC_QWEN36_ROUTE_PROFILE").is_some()
 }
 
-fn qwen36_packed_expert_cache_profile_enabled() -> bool {
+fn qwen36_expert_residency_profile_enabled() -> bool {
     crate::prefill_ffi::metal_profile_enabled()
+        || std::env::var_os("SUPERSONIC_QWEN36_EXPERT_RESIDENCY_PROFILE").is_some()
         || std::env::var_os("SUPERSONIC_QWEN36_PACK_CACHE_PROFILE").is_some()
 }
 
+#[allow(clippy::too_many_arguments)]
+fn qwen36_expert_residency_profile_record(
+    key: Qwen36ExpertResidencyProfileKey,
+    exact_hit: bool,
+    route_refill: bool,
+    allocation: bool,
+    active_groups: usize,
+    copied_bytes: usize,
+    slot_hits: usize,
+    slot_misses: usize,
+    evictions: usize,
+) {
+    if !qwen36_expert_residency_profile_enabled() {
+        return;
+    }
+    let profile = QWEN36_EXPERT_RESIDENCY_PROFILE
+        .get_or_init(|| Mutex::new(Qwen36ExpertResidencyProfileAccumulator::default()));
+    let mut profile = profile
+        .lock()
+        .expect("qwen36 expert residency profile mutex poisoned");
+    qwen36_expert_residency_counters_record(
+        &mut profile.totals,
+        exact_hit,
+        route_refill,
+        allocation,
+        active_groups,
+        copied_bytes,
+        slot_hits,
+        slot_misses,
+        evictions,
+    );
+    let policy = profile.policies.entry(key).or_default();
+    qwen36_expert_residency_counters_record(
+        policy,
+        exact_hit,
+        route_refill,
+        allocation,
+        active_groups,
+        copied_bytes,
+        slot_hits,
+        slot_misses,
+        evictions,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
 fn qwen36_packed_expert_cache_profile_record(
     exact_hit: bool,
     route_refill: bool,
@@ -247,30 +485,72 @@ fn qwen36_packed_expert_cache_profile_record(
     slot_misses: usize,
     evictions: usize,
 ) {
-    if !qwen36_packed_expert_cache_profile_enabled() {
-        return;
-    }
-    let profile = QWEN36_PACKED_EXPERT_CACHE_PROFILE
-        .get_or_init(|| Mutex::new(Qwen36PackedExpertCacheProfileAccumulator::default()));
-    let mut profile = profile
-        .lock()
-        .expect("qwen36 packed expert cache profile mutex poisoned");
-    profile.calls += 1;
-    profile.active_groups_total += active_groups as u64;
-    profile.max_active_groups = profile.max_active_groups.max(active_groups);
-    if exact_hit {
-        profile.exact_hits += 1;
-    }
-    if route_refill {
-        profile.route_refills += 1;
-    }
-    if allocation {
-        profile.allocations += 1;
-    }
-    profile.copied_bytes += copied_bytes as u64;
-    profile.slot_hits += slot_hits as u64;
-    profile.slot_misses += slot_misses as u64;
-    profile.evictions += evictions as u64;
+    qwen36_expert_residency_profile_record(
+        Qwen36ExpertResidencyProfileKey::new(
+            Qwen36ExpertResidencyMissPolicy::ExactRoute,
+            active_groups,
+        ),
+        exact_hit,
+        route_refill,
+        allocation,
+        active_groups,
+        copied_bytes,
+        slot_hits,
+        slot_misses,
+        evictions,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen36_hotset_expert_residency_profile_record(
+    capacity: usize,
+    exact_hit: bool,
+    route_refill: bool,
+    allocation: bool,
+    active_groups: usize,
+    copied_bytes: usize,
+    slot_hits: usize,
+    slot_misses: usize,
+    evictions: usize,
+) {
+    qwen36_expert_residency_profile_record(
+        Qwen36ExpertResidencyProfileKey::new(Qwen36ExpertResidencyMissPolicy::LruHotset, capacity),
+        exact_hit,
+        route_refill,
+        allocation,
+        active_groups,
+        copied_bytes,
+        slot_hits,
+        slot_misses,
+        evictions,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen36_gpu_pack_expert_residency_profile_record(
+    exact_hit: bool,
+    route_refill: bool,
+    allocation: bool,
+    active_groups: usize,
+    copied_bytes: usize,
+    slot_hits: usize,
+    slot_misses: usize,
+    evictions: usize,
+) {
+    qwen36_expert_residency_profile_record(
+        Qwen36ExpertResidencyProfileKey::new(
+            Qwen36ExpertResidencyMissPolicy::GpuPack,
+            active_groups,
+        ),
+        exact_hit,
+        route_refill,
+        allocation,
+        active_groups,
+        copied_bytes,
+        slot_hits,
+        slot_misses,
+        evictions,
+    );
 }
 
 fn qwen36_route_profile_layers() -> usize {
@@ -3792,7 +4072,7 @@ where
         "host",
         || -> Result<(), GpuError> {
             if cache.contains_key(&key) {
-                qwen36_packed_expert_cache_profile_record(
+                qwen36_gpu_pack_expert_residency_profile_record(
                     false,
                     true,
                     false,
@@ -3818,7 +4098,7 @@ where
                     buffers,
                 },
             );
-            qwen36_packed_expert_cache_profile_record(
+            qwen36_gpu_pack_expert_residency_profile_record(
                 false,
                 false,
                 true,
@@ -3972,7 +4252,8 @@ where
                 protected_slots[slot] = true;
                 workspace[off_topk_idx + group] = f32::from_bits(slot as u32);
             }
-            qwen36_packed_expert_cache_profile_record(
+            qwen36_hotset_expert_residency_profile_record(
+                capacity,
                 slot_misses == 0,
                 slot_misses > 0,
                 allocation,

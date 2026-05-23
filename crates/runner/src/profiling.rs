@@ -15,7 +15,7 @@ impl MetalProfileScope {
             kernel_ffi::prefill_ffi::metal_profile_reset();
             gpu_hal::hal_profile_reset();
             kernel_ffi::qwen36_moe::qwen36_route_profile_reset();
-            kernel_ffi::qwen36_moe::qwen36_packed_expert_cache_profile_reset();
+            kernel_ffi::qwen36_moe::qwen36_expert_residency_profile_reset();
         }
         Self { active }
     }
@@ -109,44 +109,83 @@ impl Drop for MetalProfileScope {
                 );
             }
         }
-        let pack_cache = kernel_ffi::qwen36_moe::qwen36_packed_expert_cache_profile_snapshot();
-        if pack_cache.calls > 0 || pack_cache.entries > 0 {
+        let expert_residency = kernel_ffi::qwen36_moe::qwen36_expert_residency_profile_snapshot();
+        if expert_residency.calls > 0 || expert_residency.entries > 0 {
             eprintln!();
-            eprintln!("=== Qwen3.6 packed expert cache profile ===");
+            eprintln!("=== Qwen3.6 expert residency profile ===");
             eprintln!(
                 "calls={} entries={} exact_hits={} route_refills={} allocations={} copied_bytes={} exact_hit_rate={:.2}% slot_hit_rate={:.2}% slot_hits={} slot_misses={} evictions={} avg_groups={:.2} max_groups={} avg_copy_bytes={:.0}",
-                pack_cache.calls,
-                pack_cache.entries,
-                pack_cache.exact_hits,
-                pack_cache.route_refills,
-                pack_cache.allocations,
-                pack_cache.copied_bytes,
-                pack_cache.exact_hit_rate() * 100.0,
-                pack_cache.slot_hit_rate() * 100.0,
-                pack_cache.slot_hits,
-                pack_cache.slot_misses,
-                pack_cache.evictions,
-                pack_cache.avg_active_groups(),
-                pack_cache.max_active_groups,
-                pack_cache.avg_copied_bytes(),
+                expert_residency.calls,
+                expert_residency.entries,
+                expert_residency.exact_hits,
+                expert_residency.route_refills,
+                expert_residency.allocations,
+                expert_residency.copied_bytes,
+                expert_residency.exact_hit_rate() * 100.0,
+                expert_residency.slot_hit_rate() * 100.0,
+                expert_residency.slot_hits,
+                expert_residency.slot_misses,
+                expert_residency.evictions,
+                expert_residency.avg_active_groups(),
+                expert_residency.max_active_groups,
+                expert_residency.avg_copied_bytes(),
+            );
+            eprintln!(
+                "[qwen36-expert-residency] calls={} entries={} exact_hits={} route_refills={} allocations={} copied_bytes={} exact_hit_rate={:.6} slot_hits={} slot_misses={} slot_hit_rate={:.6} evictions={} avg_active_groups={:.6} max_active_groups={} avg_copy_bytes={:.3}",
+                expert_residency.calls,
+                expert_residency.entries,
+                expert_residency.exact_hits,
+                expert_residency.route_refills,
+                expert_residency.allocations,
+                expert_residency.copied_bytes,
+                expert_residency.exact_hit_rate(),
+                expert_residency.slot_hits,
+                expert_residency.slot_misses,
+                expert_residency.slot_hit_rate(),
+                expert_residency.evictions,
+                expert_residency.avg_active_groups(),
+                expert_residency.max_active_groups,
+                expert_residency.avg_copied_bytes(),
             );
             eprintln!(
                 "[qwen36-pack-cache] calls={} entries={} exact_hits={} route_refills={} allocations={} copied_bytes={} exact_hit_rate={:.6} slot_hits={} slot_misses={} slot_hit_rate={:.6} evictions={} avg_active_groups={:.6} max_active_groups={} avg_copy_bytes={:.3}",
-                pack_cache.calls,
-                pack_cache.entries,
-                pack_cache.exact_hits,
-                pack_cache.route_refills,
-                pack_cache.allocations,
-                pack_cache.copied_bytes,
-                pack_cache.exact_hit_rate(),
-                pack_cache.slot_hits,
-                pack_cache.slot_misses,
-                pack_cache.slot_hit_rate(),
-                pack_cache.evictions,
-                pack_cache.avg_active_groups(),
-                pack_cache.max_active_groups,
-                pack_cache.avg_copied_bytes(),
+                expert_residency.calls,
+                expert_residency.entries,
+                expert_residency.exact_hits,
+                expert_residency.route_refills,
+                expert_residency.allocations,
+                expert_residency.copied_bytes,
+                expert_residency.exact_hit_rate(),
+                expert_residency.slot_hits,
+                expert_residency.slot_misses,
+                expert_residency.slot_hit_rate(),
+                expert_residency.evictions,
+                expert_residency.avg_active_groups(),
+                expert_residency.max_active_groups,
+                expert_residency.avg_copied_bytes(),
             );
+            for policy in &expert_residency.policies {
+                eprintln!(
+                    "[qwen36-expert-residency-policy] resident_format={} scope={} miss_policy={} capacity={} calls={} exact_hits={} route_refills={} allocations={} copied_bytes={} exact_hit_rate={:.6} slot_hits={} slot_misses={} slot_hit_rate={:.6} evictions={} avg_active_groups={:.6} max_active_groups={} avg_copy_bytes={:.3}",
+                    policy.resident_format,
+                    policy.scope,
+                    policy.miss_policy,
+                    policy.capacity,
+                    policy.calls,
+                    policy.exact_hits,
+                    policy.route_refills,
+                    policy.allocations,
+                    policy.copied_bytes,
+                    policy.exact_hit_rate(),
+                    policy.slot_hits,
+                    policy.slot_misses,
+                    policy.slot_hit_rate(),
+                    policy.evictions,
+                    policy.avg_active_groups(),
+                    policy.max_active_groups,
+                    policy.avg_copied_bytes(),
+                );
+            }
         }
         eprintln!();
         eprintln!("=== HAL op profile (gpu_hal level) ===");

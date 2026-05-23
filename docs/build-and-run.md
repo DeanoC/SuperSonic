@@ -333,7 +333,10 @@ Metal currently rejects or defers:
   `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_GPU_PACK_STAGE5=1`. It keeps the
   CPU out of the per-token copy loop and remaps top-k expert IDs inside the
   same Metal command buffer, but remains diagnostic-only because the measured
-  wall time is worse than the CPU pack path on this machine. The one-token
+  wall time is worse than the CPU pack path on this machine. Profile runs emit
+  `[qwen36-expert-residency]` and `[qwen36-expert-residency-policy]`; set
+  `SUPERSONIC_QWEN36_EXPERT_RESIDENCY_PROFILE=1` to collect the same residency
+  counters without enabling the full Metal/HAL profile tables. The one-token
   local smoke is:
   `cargo run --release --bin supersonic -- --backend metal --model qwen3.6-35b-a3b --model-dir /path/to/Qwen3.6-35B-A3B --int4 --prompt "Hello" --max-new-tokens 1 --emit-stage-timings`.
   FP8-runtime, KV-FP8, speculative decode, and persistent decode remain
@@ -501,7 +504,7 @@ one-token M5 Max smoke generated `[11]` and reported `gate_up_ms=3.260`,
 repeated expert-shape MPS GEMMs, while the default INT4 host expert work in the
 same profiled run was `73.851 ms` gate/up and `42.274 ms` down across 40 layers.
 The full `bench-perf` attribution lane writes this as `mps_expert_pilot` in
-schema-v4 JSON; the latest M5 Max run measured `150.6 ms/token` median with
+schema-v6 JSON; the latest M5 Max run measured `150.6 ms/token` median with
 `ffn_ms_avg=96.761`, `linear_attn_ms_avg=54.181`, and a resident-MPS pilot of
 `gate_up_ms=0.619`, `down_ms=0.433`.
 `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_MPS_BRIDGE=1` enables the first

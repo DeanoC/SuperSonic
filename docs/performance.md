@@ -934,7 +934,7 @@ FP16 Metal Performance Shaders row for Qwen3.6 active-expert GEMV shapes. It
 also enables `SUPERSONIC_METAL_PROFILE=1` for the attribution run so the profile
 JSON includes `metal_profile` and `hal_profile` objects with parseable per-op
 rows. These are runtime-adjacent MPP/MPS pilot measurements, not model matmul
-replacements. The attribution maps are stored in the same schema-v4 perf JSON as
+replacements. The attribution maps are stored in the same schema-v6 perf JSON as
 `stage_timings`, `chain_breakdown`, `lifecycle_timings`, `mpp_pilot`,
 `mps_expert_pilot`, `metal_profile`, and `hal_profile` without feeding back into
 the headline median.
@@ -1034,9 +1034,11 @@ That rules out a simple per-layer scratch-slab cache as the next promotion
 target. The next FFN work should either keep packed experts resident without
 recopying on route churn, or move the expert matvecs to a Metal Performance
 Shaders / MPP bridge that avoids the CPU slab-pack step entirely.
-Profile runs now also emit `[qwen36-pack-cache]` when a packed reuse probe is
-exercised. A four-token Apple M5 Max profile with the packed expert path and
-exact-route pack cache enabled generated `[11, 353, 599, 264]` and measured
+Profile runs now emit `[qwen36-expert-residency]` plus one
+`[qwen36-expert-residency-policy]` row per resident expert policy. The legacy
+`[qwen36-pack-cache]` line is still emitted for older parsers. A four-token
+Apple M5 Max profile with the packed expert path and exact-route pack cache
+enabled generated `[11, 353, 599, 264]` and measured
 `279.5 ms/token`, `ffn_ms_avg=162.420`, and
 `qwen36_ffn_int4_expert_pack_stage5=384.124 ms` across 160 layer calls. The
 cache profile reported `calls=160`, `entries=40`, `exact_hits=0`,
@@ -1093,7 +1095,7 @@ per-layer hot table with a narrow miss fallback.
 
 The first MPS bridge step is now an attribution probe, not a decode path. With
 `SUPERSONIC_METAL_QWEN36_MPS_EXPERT_PILOT=1`, the runner appends a
-`[qwen36-moe mps-expert-pilot]` row and bench perf JSON schema v5 records it as
+`[qwen36-moe mps-expert-pilot]` row and bench perf JSON schema v6 records it as
 `mps_expert_pilot`. This probe uses resident FP16 MPSMatrix inputs shaped like
 the active-expert gate/up and down GEMVs; it does not consume the GPTQ INT4
 expert tensors. On a one-token M5 Max smoke, the model still generated `[11]`

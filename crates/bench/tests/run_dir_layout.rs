@@ -44,6 +44,8 @@ fn perf_cell_json_status_variants() {
         mpp_pilot: None,
         mps_expert_pilot: None,
         qwen36_pack_cache: None,
+        qwen36_expert_residency: None,
+        qwen36_expert_residency_policies: None,
         metal_profile: None,
         hal_profile: None,
         gpu_temp_c_end: Some(60.0),
