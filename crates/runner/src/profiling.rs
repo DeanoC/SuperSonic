@@ -262,7 +262,7 @@ impl Drop for MetalProfileScope {
                     batched_prefill.dropped_calls,
                 );
                 eprintln!(
-                    "[qwen36-batched-prefill-feasibility] calls={} dropped_calls={} layers={} top_k={} num_experts={} chunk_size={} prefill_tokens={} profiled_tokens={} chunks={} assignments={} permutation_entries={} expert_segments={} avg_unique_experts_per_layer_chunk={:.6} avg_rows_per_segment={:.6} max_rows_per_segment={} max_unique_experts_per_layer_chunk={} wmma16_segments={} wmma16_covered_assignments={} wmma16_assignment_coverage={:.6} metadata_only=1",
+                    "[qwen36-batched-prefill-feasibility] calls={} dropped_calls={} layers={} top_k={} num_experts={} chunk_size={} prefill_tokens={} profiled_tokens={} chunks={} assignments={} permutation_entries={} expert_segments={} avg_unique_experts_per_layer_chunk={:.6} avg_rows_per_segment={:.6} max_rows_per_segment={} max_unique_experts_per_layer_chunk={} wmma16_segments={} wmma16_covered_assignments={} wmma16_assignment_coverage={:.6} scalar_tail_segments={} scalar_tail_assignments={} wmma16_padded_assignments={} wmma16_padding_overhead={:.6} metadata_only=1",
                     batched_prefill.calls,
                     batched_prefill.dropped_calls,
                     batched_prefill.layers,
@@ -282,7 +282,41 @@ impl Drop for MetalProfileScope {
                     batched_prefill.wmma16_segments,
                     batched_prefill.wmma16_covered_assignments,
                     batched_prefill.wmma16_assignment_coverage(),
+                    batched_prefill.scalar_tail_segments,
+                    batched_prefill.scalar_tail_assignments,
+                    batched_prefill.wmma16_padded_assignments,
+                    batched_prefill.wmma16_padding_overhead(),
                 );
+                for plan in
+                    kernel_ffi::qwen36_moe::qwen36_batched_prefill_feasibility_plan_snapshots()
+                {
+                    eprintln!(
+                        "[qwen36-batched-prefill-plan] calls={} dropped_calls={} layers={} top_k={} num_experts={} chunk_size={} prefill_tokens={} profiled_tokens={} chunks={} assignments={} permutation_entries={} expert_segments={} avg_unique_experts_per_layer_chunk={:.6} avg_rows_per_segment={:.6} max_rows_per_segment={} max_unique_experts_per_layer_chunk={} wmma16_segments={} wmma16_covered_assignments={} wmma16_assignment_coverage={:.6} scalar_tail_segments={} scalar_tail_assignments={} wmma16_padded_assignments={} wmma16_padding_overhead={:.6} metadata_only=1",
+                        plan.calls,
+                        plan.dropped_calls,
+                        plan.layers,
+                        plan.top_k,
+                        plan.num_experts,
+                        plan.chunk_size,
+                        plan.prefill_tokens,
+                        plan.profiled_tokens,
+                        plan.chunks,
+                        plan.assignments,
+                        plan.permutation_entries,
+                        plan.expert_segments,
+                        plan.avg_unique_experts_per_layer_chunk(),
+                        plan.avg_rows_per_segment(),
+                        plan.max_rows_per_segment,
+                        plan.max_unique_experts_per_layer_chunk,
+                        plan.wmma16_segments,
+                        plan.wmma16_covered_assignments,
+                        plan.wmma16_assignment_coverage(),
+                        plan.scalar_tail_segments,
+                        plan.scalar_tail_assignments,
+                        plan.wmma16_padded_assignments,
+                        plan.wmma16_padding_overhead(),
+                    );
+                }
             }
         }
         if self.metal_active {

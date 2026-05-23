@@ -30,6 +30,7 @@ use crate::layer_desc::MAX_BATCH_SIZE;
 const QWEN36_ROUTE_PROFILE_DEFAULT_LAYERS: usize = 40;
 const QWEN36_ROUTE_PROFILE_DEFAULT_MAX_CALLS: usize = 16_384;
 const QWEN36_ROUTE_PROFILE_CACHE_CAPS: [usize; 4] = [2, 4, 8, 16];
+const QWEN36_BATCHED_PREFILL_PLAN_CHUNKS: [usize; 5] = [64, 128, 256, 512, 1024];
 
 static QWEN36_ROUTE_PROFILE: OnceLock<Mutex<Qwen36RouteProfileAccumulator>> = OnceLock::new();
 static QWEN36_EXPERT_RESIDENCY_PROFILE: OnceLock<Mutex<Qwen36ExpertResidencyProfileAccumulator>> =
@@ -168,6 +169,9 @@ pub struct Qwen36BatchedPrefillFeasibilityProfileSnapshot {
     pub expert_segments: u64,
     pub wmma16_segments: u64,
     pub wmma16_covered_assignments: u64,
+    pub wmma16_padded_assignments: u64,
+    pub scalar_tail_segments: u64,
+    pub scalar_tail_assignments: u64,
     pub max_rows_per_segment: u64,
     pub max_unique_experts_per_layer_chunk: usize,
 }
@@ -195,6 +199,16 @@ impl Qwen36BatchedPrefillFeasibilityProfileSnapshot {
             0.0
         } else {
             self.wmma16_covered_assignments as f64 / self.assignments as f64
+        }
+    }
+
+    pub fn wmma16_padding_overhead(&self) -> f64 {
+        if self.assignments == 0 {
+            0.0
+        } else {
+            self.wmma16_padded_assignments
+                .saturating_sub(self.assignments) as f64
+                / self.assignments as f64
         }
     }
 }
@@ -493,6 +507,40 @@ pub fn qwen36_batched_prefill_feasibility_profile_snapshot(
     )
 }
 
+pub fn qwen36_batched_prefill_feasibility_plan_snapshots(
+) -> Vec<Qwen36BatchedPrefillFeasibilityProfileSnapshot> {
+    let Some(route_profile) = QWEN36_ROUTE_PROFILE.get() else {
+        return Vec::new();
+    };
+    let route_profile = route_profile
+        .lock()
+        .expect("qwen36 route profile mutex poisoned");
+    let config = QWEN36_BATCHED_PREFILL_FEASIBILITY_PROFILE
+        .get()
+        .map(|profile| {
+            profile
+                .lock()
+                .expect("qwen36 batched prefill feasibility profile mutex poisoned")
+                .clone()
+        })
+        .unwrap_or_default();
+    let mut chunk_sizes = qwen36_batched_prefill_plan_chunk_sizes(config.chunk_size);
+    chunk_sizes.sort_unstable();
+    chunk_sizes.dedup();
+    chunk_sizes
+        .into_iter()
+        .map(|chunk_size| {
+            let mut plan_config = config.clone();
+            plan_config.chunk_size = chunk_size.max(1);
+            qwen36_batched_prefill_feasibility_profile_simulate(
+                &route_profile.records,
+                route_profile.dropped_calls,
+                &plan_config,
+            )
+        })
+        .collect()
+}
+
 pub fn qwen36_packed_expert_cache_profile_reset() {
     qwen36_expert_residency_profile_reset();
 }
@@ -583,6 +631,20 @@ fn qwen36_route_profile_enabled() -> bool {
 pub fn qwen36_batched_prefill_feasibility_profile_enabled() -> bool {
     crate::prefill_ffi::metal_profile_enabled()
         || std::env::var_os("SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL_FEASIBILITY").is_some()
+}
+
+fn qwen36_batched_prefill_plan_chunk_sizes(current_chunk_size: usize) -> Vec<usize> {
+    let mut sizes: Vec<usize> =
+        if let Ok(raw) = std::env::var("SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL_PLAN_CHUNKS") {
+            raw.split(',')
+                .filter_map(|part| part.trim().parse::<usize>().ok())
+                .filter(|&chunk| chunk > 0)
+                .collect()
+        } else {
+            QWEN36_BATCHED_PREFILL_PLAN_CHUNKS.to_vec()
+        };
+    sizes.push(current_chunk_size.max(1));
+    sizes
 }
 
 fn qwen36_expert_residency_profile_enabled() -> bool {
@@ -903,9 +965,13 @@ fn qwen36_batched_prefill_feasibility_profile_simulate(
                 .max(counts.len());
             for rows in counts.values().copied() {
                 snapshot.max_rows_per_segment = snapshot.max_rows_per_segment.max(rows);
+                snapshot.wmma16_padded_assignments += rows.div_ceil(16) * 16;
                 if rows >= 16 {
                     snapshot.wmma16_segments += 1;
                     snapshot.wmma16_covered_assignments += rows;
+                } else {
+                    snapshot.scalar_tail_segments += 1;
+                    snapshot.scalar_tail_assignments += rows;
                 }
             }
         }
@@ -7677,9 +7743,13 @@ mod tests {
         assert_eq!(snapshot.expert_segments, 10);
         assert_eq!(snapshot.max_unique_experts_per_layer_chunk, 3);
         assert_eq!(snapshot.max_rows_per_segment, 2);
+        assert_eq!(snapshot.scalar_tail_segments, 10);
+        assert_eq!(snapshot.scalar_tail_assignments, 12);
+        assert_eq!(snapshot.wmma16_padded_assignments, 160);
         assert_eq!(snapshot.avg_unique_experts_per_layer_chunk(), 2.5);
         assert!((snapshot.avg_rows_per_segment() - 1.2).abs() < 1e-6);
         assert_eq!(snapshot.wmma16_assignment_coverage(), 0.0);
+        assert!((snapshot.wmma16_padding_overhead() - (148.0 / 12.0)).abs() < 1e-6);
     }
 
     #[test]

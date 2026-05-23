@@ -878,10 +878,21 @@ Metal per-token prefill path, but it enables route capture and records
 `batched_prefill_feasibility` rows that summarize the grouped-MoE permutation
 metadata a future Metal prefill kernel would consume: profiled tokens, chunks,
 expert segments, average rows per touched expert, and WMMA16 assignment
-coverage.
+coverage. It also emits `[qwen36-batched-prefill-plan]` rows for candidate
+64/128/256/512/1024-token chunks, recording scalar tail assignments, WMMA16
+padded assignments, and padding overhead. The long-context JSON schema is now
+`qwen36-moe-metal-longctx-bench-v3` and includes those rows under
+`batched_prefill_plans`; set
+`SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL_PLAN_CHUNKS=...` to override the planner
+chunk list without adding a SuperSonic CLI flag.
 The 512-token smoke is a real prefill run and is slow on the current chained
 Metal path; use `--preset comparison` as a long-running sweep before selecting
-the next runtime optimization target.
+the next runtime optimization target. The first v3 feasibility smoke on this
+machine profiled 417 prefill tokens and showed the 512/1024-token plans tied at
+one chunk with 82.7% WMMA16 assignment coverage, 23,048 scalar-tail assignments,
+and 54.6% WMMA16 padding overhead. Chunk 64 fell to 37.3% WMMA16 coverage and
+228.0% padding overhead, so the first Metal grouped-compute prototype should
+start at the moderate/full-prompt chunk end, not tiny chunks.
 `tests/metal/audit_qwen36_mtp.py` is the speculative-decode readiness audit. It
 checks the source snapshot for the split MTP expert tensors and the INT4 bake
 for the 19 folded `mtp.*` tensors loaded by the runtime. On this local M5 Max

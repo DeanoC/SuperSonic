@@ -482,9 +482,18 @@ for the supported INT4 chained-decode lane. With `--metal-profile`, it also sets
 `hal_profile` summaries from the machine-readable profile lines. With
 `--batched-prefill-feasibility`, it keeps the supported Metal per-token prefill
 path but records grouped-MoE router/permutation occupancy from actual route
-choices via `[qwen36-batched-prefill-feasibility]`. The 512-token smoke is
+choices via `[qwen36-batched-prefill-feasibility]` plus
+`[qwen36-batched-prefill-plan]` candidate chunk rows. The plan rows compare
+64/128/256/512/1024-token chunks by grouped-expert segment count, scalar tails,
+WMMA16 assignment coverage, and padded-row overhead; set
+`SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL_PLAN_CHUNKS=...` to override the
+candidate list for a local experiment. The 512-token smoke is
 intentionally slow on the current chained Metal prefill path; treat the
 comparison preset as a long-running sweep rather than a per-commit unit gate.
+On the first 512-token smoke, the 512/1024-token plans tied because the prompt
+had 417 profiled prefill tokens: 82.7% WMMA16 assignment coverage, 23,048
+scalar-tail assignments, and 54.6% WMMA16 padding overhead. Smaller chunks
+increased scalar tails sharply.
 The MTP audit writes `target/qwen36_mtp_audit.json` and
 `target/qwen36_mtp_audit.md`. It checks the local safetensors index for the
 split source MTP tensors, checks the INT4 bake manifest for the 19 folded

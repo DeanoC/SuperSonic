@@ -23,7 +23,7 @@ from typing import Any
 
 
 MODEL = "qwen3.6-35b-a3b"
-SCHEMA = "qwen36-moe-metal-longctx-bench-v2"
+SCHEMA = "qwen36-moe-metal-longctx-bench-v3"
 
 PRESETS: dict[str, dict[str, Any]] = {
     "smoke": {
@@ -161,6 +161,24 @@ def parse_batched_prefill_feasibility(output: str) -> dict[str, Any] | None:
     return parsed
 
 
+def parse_batched_prefill_plans(output: str) -> list[dict[str, Any]]:
+    plans: list[dict[str, Any]] = []
+    for line in output.splitlines():
+        if not line.startswith("[qwen36-batched-prefill-plan]"):
+            continue
+        parsed: dict[str, Any] = {}
+        for key, value in parse_key_values(line).items():
+            try:
+                if any(ch in value for ch in ".eE"):
+                    parsed[key] = float(value)
+                else:
+                    parsed[key] = int(value)
+            except ValueError:
+                parsed[key] = value
+        plans.append(parsed)
+    return plans
+
+
 def append_batched_prefill_feasibility_markdown(md: str, rows: list[dict[str, Any]]) -> str:
     profiled = [row for row in rows if row.get("batched_prefill_feasibility")]
     if not profiled:
@@ -194,6 +212,39 @@ def append_batched_prefill_feasibility_markdown(md: str, rows: list[dict[str, An
                 dropped=profile.get("dropped_calls", ""),
             )
         )
+    return md.rstrip() + "\n" + "\n".join(lines) + "\n"
+
+
+def append_batched_prefill_plan_markdown(md: str, rows: list[dict[str, Any]]) -> str:
+    profiled = [row for row in rows if row.get("batched_prefill_plans")]
+    if not profiled:
+        return md
+    lines = [
+        "",
+        "### Batched-Prefill MoE Chunk Plan",
+        "",
+        "| Context | Chunk | Chunks | Avg rows/segment | WMMA16 coverage | Scalar tail assignments | WMMA16 padding overhead |",
+        "|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for row in profiled:
+        for plan in row.get("batched_prefill_plans") or []:
+            coverage = plan.get("wmma16_assignment_coverage")
+            overhead = plan.get("wmma16_padding_overhead")
+            lines.append(
+                "| {ctx} | {chunk} | {chunks} | {rows} | {coverage} | {tail} | {overhead} |".format(
+                    ctx=row.get("context_tokens_requested"),
+                    chunk=plan.get("chunk_size", ""),
+                    chunks=plan.get("chunks", ""),
+                    rows=(
+                        f"{plan.get('avg_rows_per_segment'):.2f}"
+                        if plan.get("avg_rows_per_segment") is not None
+                        else ""
+                    ),
+                    coverage=f"{coverage * 100.0:.1f}%" if coverage is not None else "",
+                    tail=plan.get("scalar_tail_assignments", ""),
+                    overhead=f"{overhead * 100.0:.1f}%" if overhead is not None else "",
+                )
+            )
     return md.rstrip() + "\n" + "\n".join(lines) + "\n"
 
 
@@ -308,6 +359,7 @@ def run_one(
             "chain_breakdown": BASE.parse_chain_breakdown(output),
             "lifecycle": BASE.parse_lifecycle_timings(output),
             "batched_prefill_feasibility": parse_batched_prefill_feasibility(output),
+            "batched_prefill_plans": parse_batched_prefill_plans(output),
             "metal_profile": parse_profile(output, "[metal-profile]", "[metal-profile-op]"),
             "hal_profile": parse_profile(output, "[hal-profile]", "[hal-profile-op]"),
             "result": BASE.parse_result(output),
@@ -337,6 +389,7 @@ def run_one(
         "chain_breakdown": BASE.parse_chain_breakdown(output),
         "lifecycle": BASE.parse_lifecycle_timings(output),
         "batched_prefill_feasibility": parse_batched_prefill_feasibility(output),
+        "batched_prefill_plans": parse_batched_prefill_plans(output),
         "metal_profile": parse_profile(output, "[metal-profile]", "[metal-profile-op]"),
         "hal_profile": parse_profile(output, "[hal-profile]", "[hal-profile-op]"),
         "result": BASE.parse_result(output),
@@ -442,6 +495,7 @@ def main() -> int:
 
     summary = BASE.summarize(rows)
     md = append_batched_prefill_feasibility_markdown(BASE.markdown(rows, summary), rows)
+    md = append_batched_prefill_plan_markdown(md, rows)
     md = append_profile_markdown(md, rows)
     payload = {
         "schema": SCHEMA,

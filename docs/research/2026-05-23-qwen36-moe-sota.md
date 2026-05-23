@@ -333,8 +333,17 @@ under the same smoke:
    `[qwen36-batched-prefill-feasibility]` rows derived from actual router
    choices. The row reports chunk count, permutation entries, touched expert
    segments, average rows per segment, max segment size, and WMMA16 coverage.
-   It is intentionally `metadata_only=1`; no Metal grouped expert compute is
-   promoted yet.
+   The second slice adds `[qwen36-batched-prefill-plan]` rows for candidate
+   chunk sizes. These rows keep the path `metadata_only=1`, but make the next
+   grouped-compute PR concrete by exposing scalar-tail assignments, WMMA16
+   padded assignments, and padding overhead for 64/128/256/512/1024-token
+   chunks, with an env override for local what-if sweeps. No Metal grouped expert
+   compute is promoted yet. The first v3 512-token Metal smoke profiled 417
+   prefill tokens and showed 512/1024-token chunks tied at 82.7% WMMA16
+   assignment coverage and 54.6% padding overhead, while chunk 64 fell to 37.3%
+   coverage and 228.0% padding overhead. That makes moderate/full-prompt chunks
+   the starting point for the first correctness-first Metal grouped expert
+   compute prototype.
 
 3. **Static top-N resident MPS table probe**
    Use route profiles to choose top-N experts per layer, materialize FP16 MPS

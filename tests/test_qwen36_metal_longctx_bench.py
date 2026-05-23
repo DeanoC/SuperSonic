@@ -94,14 +94,27 @@ class Qwen36MetalLongContextBenchTests(unittest.TestCase):
 
     def test_parse_batched_prefill_feasibility(self):
         output = """
-[qwen36-batched-prefill-feasibility] calls=20440 dropped_calls=0 layers=40 top_k=8 num_experts=256 chunk_size=512 prefill_tokens=511 profiled_tokens=511 chunks=1 assignments=163520 permutation_entries=163520 expert_segments=4127 avg_unique_experts_per_layer_chunk=103.175000 avg_rows_per_segment=39.619578 max_rows_per_segment=90 max_unique_experts_per_layer_chunk=118 wmma16_segments=3880 wmma16_covered_assignments=158000 wmma16_assignment_coverage=0.966243 metadata_only=1
+[qwen36-batched-prefill-feasibility] calls=20440 dropped_calls=0 layers=40 top_k=8 num_experts=256 chunk_size=512 prefill_tokens=511 profiled_tokens=511 chunks=1 assignments=163520 permutation_entries=163520 expert_segments=4127 avg_unique_experts_per_layer_chunk=103.175000 avg_rows_per_segment=39.619578 max_rows_per_segment=90 max_unique_experts_per_layer_chunk=118 wmma16_segments=3880 wmma16_covered_assignments=158000 wmma16_assignment_coverage=0.966243 scalar_tail_segments=247 scalar_tail_assignments=5520 wmma16_padded_assignments=190000 wmma16_padding_overhead=0.161322 metadata_only=1
 """
         profile = bench_qwen36_metal_longctx.parse_batched_prefill_feasibility(output)
         self.assertIsNotNone(profile)
         self.assertEqual(profile["profiled_tokens"], 511)
         self.assertEqual(profile["chunk_size"], 512)
         self.assertAlmostEqual(profile["avg_rows_per_segment"], 39.619578)
+        self.assertEqual(profile["scalar_tail_assignments"], 5520)
+        self.assertAlmostEqual(profile["wmma16_padding_overhead"], 0.161322)
         self.assertEqual(profile["metadata_only"], 1)
+
+    def test_parse_batched_prefill_plans(self):
+        output = """
+[qwen36-batched-prefill-plan] calls=20440 dropped_calls=0 layers=40 top_k=8 num_experts=256 chunk_size=128 prefill_tokens=511 profiled_tokens=511 chunks=4 assignments=163520 permutation_entries=163520 expert_segments=13312 avg_unique_experts_per_layer_chunk=83.200000 avg_rows_per_segment=12.283654 max_rows_per_segment=34 max_unique_experts_per_layer_chunk=98 wmma16_segments=3000 wmma16_covered_assignments=72000 wmma16_assignment_coverage=0.440313 scalar_tail_segments=10312 scalar_tail_assignments=91520 wmma16_padded_assignments=250000 wmma16_padding_overhead=0.528867 metadata_only=1
+[qwen36-batched-prefill-plan] calls=20440 dropped_calls=0 layers=40 top_k=8 num_experts=256 chunk_size=512 prefill_tokens=511 profiled_tokens=511 chunks=1 assignments=163520 permutation_entries=163520 expert_segments=4127 avg_unique_experts_per_layer_chunk=103.175000 avg_rows_per_segment=39.619578 max_rows_per_segment=90 max_unique_experts_per_layer_chunk=118 wmma16_segments=3880 wmma16_covered_assignments=158000 wmma16_assignment_coverage=0.966243 scalar_tail_segments=247 scalar_tail_assignments=5520 wmma16_padded_assignments=190000 wmma16_padding_overhead=0.161322 metadata_only=1
+"""
+        plans = bench_qwen36_metal_longctx.parse_batched_prefill_plans(output)
+        self.assertEqual(len(plans), 2)
+        self.assertEqual(plans[0]["chunk_size"], 128)
+        self.assertEqual(plans[1]["chunks"], 1)
+        self.assertAlmostEqual(plans[1]["wmma16_assignment_coverage"], 0.966243)
 
     def test_append_batched_prefill_feasibility_markdown_adds_table(self):
         md = bench_qwen36_metal_longctx.append_batched_prefill_feasibility_markdown(
@@ -122,6 +135,28 @@ class Qwen36MetalLongContextBenchTests(unittest.TestCase):
         )
         self.assertIn("Batched-Prefill MoE Feasibility", md)
         self.assertIn("96.6%", md)
+
+    def test_append_batched_prefill_plan_markdown_adds_table(self):
+        md = bench_qwen36_metal_longctx.append_batched_prefill_plan_markdown(
+            "# report\n",
+            [
+                {
+                    "context_tokens_requested": 512,
+                    "batched_prefill_plans": [
+                        {
+                            "chunk_size": 512,
+                            "chunks": 1,
+                            "avg_rows_per_segment": 39.619578,
+                            "wmma16_assignment_coverage": 0.966243,
+                            "scalar_tail_assignments": 5520,
+                            "wmma16_padding_overhead": 0.161322,
+                        }
+                    ],
+                }
+            ],
+        )
+        self.assertIn("Batched-Prefill MoE Chunk Plan", md)
+        self.assertIn("16.1%", md)
 
     def test_append_profile_markdown_adds_profile_table(self):
         md = bench_qwen36_metal_longctx.append_profile_markdown(
