@@ -461,6 +461,9 @@ SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" \
   python3 tests/metal/probe_qwen36_mtp_acceptance.py
 
 SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" \
+  python3 tests/metal/probe_qwen36_mtp_acceptance.py --metal-experiment
+
+SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" \
   python3 tests/metal/probe_qwen36_static_topn.py
 
 cargo build --release -p runner --bin qwen36_ffn_expert_microbench
@@ -492,7 +495,15 @@ until the MTP path is explicitly enabled. The acceptance probe writes
 parses `[qwen36-mtp-acceptance]` telemetry with drafted tokens, accepted
 tokens, emitted tokens, base verify steps, replay steps, and target
 steps/emitted so one-draft and multi-draft acceptance can be measured apart
-from FFN latency.
+from FFN latency. `--metal-experiment` sets
+`SUPERSONIC_QWEN36_METAL_MTP_EXPERIMENT=1`, enabling the experimental Metal
+sequential K=1 path only. The probe also sets
+`SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL=0` on Metal so it stays on the
+supported per-token prefill lane; `--batched-spec-verify` remains blocked.
+The first local K=1 smoke completed in 24.3s and recorded
+`drafted_tokens=2`, `accepted_tokens=1`, `acceptance_rate=0.5`, and
+`target_steps_per_emitted=1.0`, so it is a correctness/acceptance foothold, not
+a throughput win by itself.
 The static top-N probe writes `target/qwen36_static_topn_mps_probe.json` and
 `target/qwen36_static_topn_mps_probe.md`. It uses the route profiler's gated
 `[qwen36-route-topn-layer]` and `[qwen36-route-call]` rows to choose per-layer

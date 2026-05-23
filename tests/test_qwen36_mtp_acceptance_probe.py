@@ -40,6 +40,7 @@ class Qwen36MtpAcceptanceProbeTests(unittest.TestCase):
             1.25,
             "hip",
             batched_spec_verify=True,
+            env_overrides={},
         )
 
         self.assertEqual(report["schema"], probe_qwen36_mtp_acceptance.SCHEMA)
@@ -56,6 +57,7 @@ class Qwen36MtpAcceptanceProbeTests(unittest.TestCase):
             0.02,
             "metal",
             batched_spec_verify=False,
+            env_overrides={},
         )
 
         self.assertEqual(report["status"], "policy_blocked")
@@ -72,9 +74,27 @@ class Qwen36MtpAcceptanceProbeTests(unittest.TestCase):
             0.1,
             "hip",
             batched_spec_verify=False,
+            env_overrides={},
         )
 
         self.assertEqual(report["status"], "missing_acceptance")
+
+    def test_build_env_overrides_can_enable_metal_experiment(self):
+        args = type(
+            "Args",
+            (),
+            {
+                "backend": "metal",
+                "metal_experiment": True,
+            },
+        )()
+
+        env = probe_qwen36_mtp_acceptance.build_env_overrides(args)
+
+        self.assertEqual(env["SUPERSONIC_BACKENDS"], "metal")
+        self.assertEqual(env["SUPERSONIC_QWEN36_MTP_ACCEPTANCE_PROFILE"], "1")
+        self.assertEqual(env["SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL"], "0")
+        self.assertEqual(env["SUPERSONIC_QWEN36_METAL_MTP_EXPERIMENT"], "1")
 
 
 if __name__ == "__main__":

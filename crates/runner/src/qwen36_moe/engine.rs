@@ -25,7 +25,8 @@ use crate::qwen36_moe_cli::output::{
     print_sampling_summary,
 };
 use crate::qwen36_moe_cli::policy::{
-    resolve_context_size, validate_cuda_v1_flags, validate_decode_backend, validate_metal_v1_flags,
+    max_speculative_tokens_for_backend, metal_mtp_experiment_enabled, resolve_context_size,
+    validate_cuda_v1_flags, validate_decode_backend, validate_metal_v1_flags,
     validate_persistent_kv_fp8_flags,
 };
 use crate::qwen36_moe_cli::prompt::{
@@ -392,6 +393,13 @@ fn decode_text(
     let virtual_kv_stats = virtual_kv_stats_for_layers(&layers);
     print_virtual_kv_stats_if_active(virtual_kv_stats, kv_fp8, backend, ordinal);
     let session_start = std::time::Instant::now();
+    let max_speculative_tokens = max_speculative_tokens_for_backend(backend);
+    if speculative_decode && backend == Backend::Metal && metal_mtp_experiment_enabled() {
+        eprintln!(
+            "[qwen36-mtp-metal-experiment] enabled=1 max_drafts={} verify=sequential status=experimental",
+            max_speculative_tokens
+        );
+    }
     let session = prepare_decode_session(
         &store,
         ordinal,
@@ -402,6 +410,7 @@ fn decode_text(
         speculative_decode,
         batched_spec_verify,
         persistent_decode,
+        max_speculative_tokens,
         &mut layers,
     )?;
     let session_elapsed = session_start.elapsed();
@@ -809,6 +818,7 @@ fn decode_text(
                 first_token: next_token,
                 stage_timings: &mut stage_timings,
                 emit_stage_timings,
+                max_drafts: max_speculative_tokens,
             })?;
 
             if let Some(stats) = mtp_acceptance_stats.as_mut() {

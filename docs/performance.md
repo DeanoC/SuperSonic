@@ -861,9 +861,10 @@ The local-main-target workflow for this machine is:
 5. batched-prefill MoE feasibility: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/bench_qwen36_longctx.py --preset smoke --batched-prefill-feasibility`
 6. MTP tensor audit: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/audit_qwen36_mtp.py --require-complete-bake`
 7. MTP acceptance/policy probe: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/probe_qwen36_mtp_acceptance.py`
-8. static top-N resident-table probe: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/probe_qwen36_static_topn.py`
-9. routed-expert FFN microbench: `target/release/qwen36_ffn_expert_microbench --iters 20 --warmup 3`
-10. long-context comparison: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/bench_qwen36_longctx.py --preset comparison`
+8. MTP Metal K=1 experiment: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/probe_qwen36_mtp_acceptance.py --metal-experiment`
+9. static top-N resident-table probe: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/probe_qwen36_static_topn.py`
+10. routed-expert FFN microbench: `target/release/qwen36_ffn_expert_microbench --iters 20 --warmup 3`
+11. long-context comparison: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/bench_qwen36_longctx.py --preset comparison`
 
 The Metal long-context harness writes `target/qwen36_metal_longctx.json` and
 `target/qwen36_metal_longctx.md`. It uses deterministic NIAH-style prompts and
@@ -893,8 +894,17 @@ acceptance rate, emitted tokens, base verify steps, batched replay steps, and
 target steps per emitted token. `tests/metal/probe_qwen36_mtp_acceptance.py`
 captures that telemetry on enabled backends and records the expected
 `policy_blocked` result on Metal today. Metal speculative decode remains
-unsupported until that probe reports real one-draft and multi-draft acceptance
-without mixing the result into FFN latency.
+unsupported by default. For measurement only, `--metal-experiment` sets
+`SUPERSONIC_QWEN36_METAL_MTP_EXPERIMENT=1` and runs the sequential K=1 Metal
+path. The probe forces `SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL=0` on Metal so
+the experiment does not accidentally enter the HIP/CUDA-only grouped prefill
+launcher. Batched verify and K>1 promotion remain blocked until that row
+reports real acceptance without mixing the result into FFN latency. The first
+local K=1 smoke completed in 24.3s with `drafted_tokens=2`,
+`accepted_tokens=1`, `acceptance_rate=0.5`, and
+`target_steps_per_emitted=1.0`; this proves the Metal path can run and measure
+acceptance, but it is not a throughput win by itself because every emitted token
+still required one target-model step.
 `tests/metal/probe_qwen36_static_topn.py` is the first static resident-table
 probe. The runner now has gated machine-readable route dumps:
 `SUPERSONIC_QWEN36_ROUTE_PROFILE_DUMP_TOPN_LAYERS=1` emits

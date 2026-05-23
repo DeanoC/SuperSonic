@@ -4,6 +4,23 @@ use gpu_hal::Backend;
 use crate::qwen36_moe_cli::dry_run::ContextSizeSource;
 use crate::registry::RegistryEntry;
 
+pub(crate) const QWEN36_NUM_SPECULATIVE_TOKENS: usize = 3;
+pub(crate) const QWEN36_METAL_MTP_EXPERIMENT_ENV: &str = "SUPERSONIC_QWEN36_METAL_MTP_EXPERIMENT";
+
+pub(crate) fn metal_mtp_experiment_enabled() -> bool {
+    std::env::var(QWEN36_METAL_MTP_EXPERIMENT_ENV)
+        .map(|value| value != "0")
+        .unwrap_or(false)
+}
+
+pub(crate) fn max_speculative_tokens_for_backend(backend: Backend) -> usize {
+    if backend == Backend::Metal && metal_mtp_experiment_enabled() {
+        1
+    } else {
+        QWEN36_NUM_SPECULATIVE_TOKENS
+    }
+}
+
 pub fn resolve_context_size(cli: &crate::Cli) -> (usize, ContextSizeSource) {
     let max_new = cli.max_new_tokens.max(1);
     if let Some(ctx) = cli.context_size {
@@ -54,7 +71,13 @@ pub fn validate_metal_v1_flags(cli: &crate::Cli, entry: &RegistryEntry) -> Resul
     if cli.kv_fp8 {
         anyhow::bail!("Qwen3.6-35B-A3B Metal v1 keeps BF16 KV cache; --kv-fp8 is not wired.");
     }
-    if cli.speculative_decode || cli.batched_spec_verify {
+    if cli.batched_spec_verify {
+        anyhow::bail!(
+            "Qwen3.6-35B-A3B Metal MTP experiment is sequential K=1 only; \
+             --batched-spec-verify is not wired."
+        );
+    }
+    if cli.speculative_decode && !metal_mtp_experiment_enabled() {
         anyhow::bail!(
             "Qwen3.6-35B-A3B Metal v1 does not wire the MTP/speculative decode path yet."
         );
@@ -135,6 +158,8 @@ mod tests {
     }
 
     fn metal_v1_error(extra: &[&str]) -> String {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        std::env::remove_var(QWEN36_METAL_MTP_EXPERIMENT_ENV);
         validate_metal_v1_flags(&cli(extra), metal_entry())
             .expect_err("Metal v1 policy should reject this flag set")
             .to_string()
@@ -172,6 +197,9 @@ mod tests {
 
     #[test]
     fn metal_v1_accepts_default_int4_path() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        std::env::remove_var(QWEN36_METAL_MTP_EXPERIMENT_ENV);
+
         validate_metal_v1_flags(&cli(&["--int4"]), metal_entry()).expect("Metal INT4 v1 flags");
     }
 
@@ -180,6 +208,25 @@ mod tests {
         assert!(metal_v1_error(&["--fp8-runtime"]).contains("--fp8-runtime"));
         assert!(metal_v1_error(&["--kv-fp8"]).contains("--kv-fp8"));
         assert!(metal_v1_error(&["--speculative-decode"]).contains("speculative"));
-        assert!(metal_v1_error(&["--batched-spec-verify"]).contains("speculative"));
+        assert!(metal_v1_error(&["--batched-spec-verify"]).contains("batched"));
+    }
+
+    #[test]
+    fn metal_v1_allows_env_gated_k1_speculative_experiment() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        std::env::set_var(QWEN36_METAL_MTP_EXPERIMENT_ENV, "1");
+
+        validate_metal_v1_flags(&cli(&["--int4", "--speculative-decode"]), metal_entry())
+            .expect("env-gated Metal MTP experiment");
+        assert_eq!(max_speculative_tokens_for_backend(Backend::Metal), 1);
+        assert!(validate_metal_v1_flags(
+            &cli(&["--int4", "--speculative-decode", "--batched-spec-verify"]),
+            metal_entry(),
+        )
+        .expect_err("batched Metal MTP remains blocked")
+        .to_string()
+        .contains("batched"));
+
+        std::env::remove_var(QWEN36_METAL_MTP_EXPERIMENT_ENV);
     }
 }

@@ -297,6 +297,8 @@ SuperSonic:
 - Measure one-token and multi-token acceptance separately from FFN latency with
   `SUPERSONIC_QWEN36_MTP_ACCEPTANCE_PROFILE=1` and
   `tests/metal/probe_qwen36_mtp_acceptance.py`.
+- Keep Metal enablement env-gated while it is experimental:
+  `SUPERSONIC_QWEN36_METAL_MTP_EXPERIMENT=1` allows sequential K=1 only.
 - Keep SpecPrefill separate; it is a long-prompt prefill optimization, not a
   decode replacement.
 
@@ -364,6 +366,15 @@ under the same smoke:
    block. The telemetry separates drafted tokens, accepted tokens, base verify
    chains, batched replay chains, and target steps per emitted token, so MTP can
    be judged independently of FFN kernel latency.
+
+6. **Qwen3.6 Metal K=1 MTP experiment**
+   Keep the supported Metal lane blocked by default, but add an explicit
+   `SUPERSONIC_QWEN36_METAL_MTP_EXPERIMENT=1` escape hatch for sequential K=1
+   acceptance runs. This is a measurement path only: batched verify and K>1 are
+   still out of policy until K=1 proves useful and correct on local prompts.
+   The first local Metal run measured `drafted_tokens=2`, `accepted_tokens=1`,
+   `acceptance_rate=0.5`, and `target_steps_per_emitted=1.0` in 24.3s, so the
+   current value is correctness/telemetry proof rather than throughput.
 
 ## Sources
 

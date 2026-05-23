@@ -22,6 +22,9 @@ from typing import Any
 MODEL = "qwen3.6-35b-a3b"
 SCHEMA = "qwen36-moe-mtp-acceptance-probe-v1"
 POLICY_BLOCKED_NEEDLE = "does not wire the MTP/speculative decode path yet"
+METAL_EXPERIMENT_ENV = "SUPERSONIC_QWEN36_METAL_MTP_EXPERIMENT"
+ACCEPTANCE_PROFILE_ENV = "SUPERSONIC_QWEN36_MTP_ACCEPTANCE_PROFILE"
+BATCHED_PREFILL_ENV = "SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL"
 DEFAULT_PROMPT = (
     "Explain how a local inference runtime should measure native MTP "
     "acceptance separately from base-model FFN latency."
@@ -90,6 +93,7 @@ def build_report(
     wall_seconds: float,
     backend: str,
     batched_spec_verify: bool,
+    env_overrides: dict[str, str],
 ) -> dict[str, Any]:
     acceptance = parse_mtp_acceptance(output)
     status = classify_run(returncode, output, acceptance)
@@ -102,6 +106,7 @@ def build_report(
         "returncode": returncode,
         "wall_seconds": wall_seconds,
         "command": command,
+        "env_overrides": env_overrides,
         "acceptance": acceptance,
         "policy_blocked": status == "policy_blocked",
     }
@@ -163,8 +168,7 @@ def resolve_model_dir(raw_model_dir: Path | None, env: dict[str, str]) -> Path:
 
 def run_supersonic(args: argparse.Namespace) -> tuple[str, float, int, list[str]]:
     env = os.environ.copy()
-    env["SUPERSONIC_BACKENDS"] = args.backend
-    env["SUPERSONIC_QWEN36_MTP_ACCEPTANCE_PROFILE"] = "1"
+    env.update(build_env_overrides(args))
 
     cmd = [
         str(args.binary),
@@ -230,11 +234,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--max-new-tokens",
         type=int,
         default=5,
-        help="5 allows the first MTP extension to draft K=3 after the base token.",
+        help="5 allows the first extension to draft after the base token; Metal experiment forces K=1.",
     )
     parser.add_argument("--seed", type=int, default=20260523)
     parser.add_argument("--timeout", type=int, default=900)
     parser.add_argument("--batched-spec-verify", action="store_true")
+    parser.add_argument(
+        "--metal-experiment",
+        action="store_true",
+        help=f"set {METAL_EXPERIMENT_ENV}=1 to run the env-gated Metal K=1 path",
+    )
     parser.add_argument(
         "--log",
         type=Path,
@@ -259,9 +268,22 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def build_env_overrides(args: argparse.Namespace) -> dict[str, str]:
+    overrides = {
+        "SUPERSONIC_BACKENDS": args.backend,
+        ACCEPTANCE_PROFILE_ENV: "1",
+    }
+    if args.backend == "metal":
+        overrides[BATCHED_PREFILL_ENV] = "0"
+    if args.metal_experiment:
+        overrides[METAL_EXPERIMENT_ENV] = "1"
+    return overrides
+
+
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
     args.model_dir = resolve_model_dir(args.model_dir, os.environ)
+    env_overrides = build_env_overrides(args)
 
     if args.log:
         output = args.log.read_text()
@@ -278,6 +300,7 @@ def main(argv: list[str]) -> int:
         wall_seconds,
         args.backend,
         args.batched_spec_verify,
+        env_overrides,
     )
     args.out_json.parent.mkdir(parents=True, exist_ok=True)
     args.out_json.write_text(json.dumps(report, indent=2) + "\n")
