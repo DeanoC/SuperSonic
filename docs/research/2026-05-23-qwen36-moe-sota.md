@@ -1117,6 +1117,36 @@ under the same smoke:
    `qwen36_ffn_int4_router_topk_stage5` before revisiting shared/expert matvec
    tiling.
 
+33. **Qwen3.6 router-stage SIMD pilot**
+   The router-stage optimization pilot is now wired behind
+   `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_STAGE5_SIMD=1`. It keeps the
+   existing serial RMSNorm order for parity, then splits router logits into a
+   SIMD-per-expert dispatch before a second top-k-from-logits dispatch. The
+   fused-routed INT4 sweep is schema v9 and adds
+   `full-stage5-router-simd`, `full-stage5-router-simd-batch-phases`, and
+   `full-stage5-router-simd-batch-ffn-phases` modes. The subphase parser now
+   treats Metal GPU labels as exact labels, because
+   `qwen36_ffn_int4_router_topk_stage5` is a prefix of the SIMD label
+   `qwen36_ffn_int4_router_topk_stage5_simd`.
+
+   This is not promoted. The full comparison smoke preserved IDs for the
+   coarse SIMD batch row, but the FFN-subphase SIMD attribution row diverged:
+   default and non-SIMD rows generated `[11, 271, 40, 599]`, while
+   `full-stage5-router-simd-batch-ffn-phases` generated
+   `[11, 353, 599, 264]`. In the same run, coarse SIMD also regressed the
+   coarse FFN GPU bucket: non-SIMD
+   `decode_batch_ffn_gpu_ms=393.556` versus SIMD `449.659`.
+
+   The arithmetic signal is still interesting. In the FFN-subphase comparison,
+   the SIMD router label reduced from `123.239 ms` to `99.278 ms`, and total
+   labeled FFN GPU time moved from `230.097 ms` to `199.200 ms`; an isolated
+   repeat of `default,full-stage5-router-simd-batch-ffn-phases` preserved
+   generated IDs and measured router `113.686 ms` inside `228.659 ms` total
+   FFN-subphase GPU time. Because the mixed comparison found an ID mismatch,
+   the next router PR should add a router-logit/top-k parity tap for the SIMD
+   path and chase deterministic route equality before using this path as a
+   performance candidate.
+
 ## Sources
 
 - [Qwen/Qwen3.6-35B-A3B model card](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)

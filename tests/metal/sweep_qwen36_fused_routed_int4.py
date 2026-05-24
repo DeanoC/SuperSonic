@@ -15,13 +15,15 @@ from typing import Any
 
 
 MODEL = "qwen3.6-35b-a3b"
-SCHEMA = "qwen36-fused-routed-int4-sweep-v8"
+SCHEMA = "qwen36-fused-routed-int4-sweep-v9"
 DEFAULT_MAX_FUSED_WALL_GPU_RATIO = 4.0
 DEFAULT_MAX_WAIT_GPU_RATIO = 4.0
 BATCH_FAST_PROFILE_MODES = {
     "full-stage5-router-batch",
     "full-stage5-router-batch-phases",
     "full-stage5-router-batch-ffn-phases",
+    "full-stage5-router-simd-batch-phases",
+    "full-stage5-router-simd-batch-ffn-phases",
 }
 
 PROMPT_SETS: dict[str, list[tuple[str, str]]] = {
@@ -57,6 +59,10 @@ MODE_ALIASES: dict[str, str] = {
     "router-stage5": "full-stage5-router",
     "full-router": "full-stage5-router",
     "full-stage5-router": "full-stage5-router",
+    "router-simd": "full-stage5-router-simd",
+    "router-stage5-simd": "full-stage5-router-simd",
+    "full-router-simd": "full-stage5-router-simd",
+    "full-stage5-router-simd": "full-stage5-router-simd",
     "router-batch": "full-stage5-router-batch",
     "batch-router": "full-stage5-router-batch",
     "full-router-batch": "full-stage5-router-batch",
@@ -69,6 +75,14 @@ MODE_ALIASES: dict[str, str] = {
     "batch-router-ffn-phases": "full-stage5-router-batch-ffn-phases",
     "full-router-batch-ffn-phases": "full-stage5-router-batch-ffn-phases",
     "full-stage5-router-batch-ffn-phases": "full-stage5-router-batch-ffn-phases",
+    "router-simd-batch-phases": "full-stage5-router-simd-batch-phases",
+    "batch-router-simd-phases": "full-stage5-router-simd-batch-phases",
+    "full-router-simd-batch-phases": "full-stage5-router-simd-batch-phases",
+    "full-stage5-router-simd-batch-phases": "full-stage5-router-simd-batch-phases",
+    "router-simd-batch-ffn-phases": "full-stage5-router-simd-batch-ffn-phases",
+    "batch-router-simd-ffn-phases": "full-stage5-router-simd-batch-ffn-phases",
+    "full-router-simd-batch-ffn-phases": "full-stage5-router-simd-batch-ffn-phases",
+    "full-stage5-router-simd-batch-ffn-phases": "full-stage5-router-simd-batch-ffn-phases",
     "router-defer": "router-defer-wait",
     "router-defer-wait": "router-defer-wait",
     "defer-router-wait": "router-defer-wait",
@@ -82,9 +96,12 @@ FUSED_OP_NEEDLES = {
     "gpu-pack": "qwen36_ffn_int4_expert_gpu_pack_stage5",
     "full-stage5": "qwen36_ffn_int4_stage5",
     "full-stage5-router": "qwen36_ffn_int4_stage5_with_router",
+    "full-stage5-router-simd": "qwen36_ffn_int4_stage5_with_router",
     "full-stage5-router-batch": "qwen36_ffn_int4_stage5_with_router",
     "full-stage5-router-batch-phases": "qwen36_ffn_int4_stage5_with_router",
     "full-stage5-router-batch-ffn-phases": "qwen36_ffn_int4",
+    "full-stage5-router-simd-batch-phases": "qwen36_ffn_int4_stage5_with_router",
+    "full-stage5-router-simd-batch-ffn-phases": "qwen36_ffn_int4",
     "router-defer-wait": "qwen36_ffn_int4_stage5_with_router",
 }
 
@@ -104,6 +121,16 @@ FUSED_GPU_OP_PREFIXES = {
     "full-stage5-router": (
         "command_buffer_gpu:qwen36_ffn_int4_stage5_with_router",
         "command_buffer_gpu:qwen36_ffn_int4_router_topk_stage5",
+        "command_buffer_gpu:qwen36_ffn_int4_router_topk_stage5_simd",
+        "command_buffer_gpu:qwen36_ffn_int4_shared_gate_up",
+        "command_buffer_gpu:qwen36_ffn_int4_shared_gate_scalar",
+        "command_buffer_gpu:qwen36_ffn_int4_shared_down",
+        "command_buffer_gpu:qwen36_ffn_int4_expert_gate_up_tiled_stage5",
+        "command_buffer_gpu:qwen36_ffn_int4_expert_down_finalize",
+    ),
+    "full-stage5-router-simd": (
+        "command_buffer_gpu:qwen36_ffn_int4_stage5_with_router",
+        "command_buffer_gpu:qwen36_ffn_int4_router_topk_stage5_simd",
         "command_buffer_gpu:qwen36_ffn_int4_shared_gate_up",
         "command_buffer_gpu:qwen36_ffn_int4_shared_gate_scalar",
         "command_buffer_gpu:qwen36_ffn_int4_shared_down",
@@ -130,8 +157,26 @@ FUSED_GPU_OP_PREFIXES = {
         "command_buffer_gpu:qwen36_ffn_int4_expert_gate_up_tiled_stage5",
         "command_buffer_gpu:qwen36_ffn_int4_expert_down_finalize",
     ),
+    "full-stage5-router-simd-batch-phases": (
+        "command_buffer_gpu:qwen36_decode_batch_ffn",
+        "command_buffer_gpu:qwen36_ffn_int4_stage5_with_router",
+        "command_buffer_gpu:qwen36_ffn_int4_router_topk_stage5_simd",
+        "command_buffer_gpu:qwen36_ffn_int4_shared_gate_up",
+        "command_buffer_gpu:qwen36_ffn_int4_shared_gate_scalar",
+        "command_buffer_gpu:qwen36_ffn_int4_shared_down",
+        "command_buffer_gpu:qwen36_ffn_int4_expert_gate_up_tiled_stage5",
+        "command_buffer_gpu:qwen36_ffn_int4_expert_down_finalize",
+    ),
     "full-stage5-router-batch-ffn-phases": (
         "command_buffer_gpu:qwen36_ffn_int4_router_topk_stage5",
+        "command_buffer_gpu:qwen36_ffn_int4_shared_gate_up",
+        "command_buffer_gpu:qwen36_ffn_int4_shared_gate_scalar",
+        "command_buffer_gpu:qwen36_ffn_int4_shared_down",
+        "command_buffer_gpu:qwen36_ffn_int4_expert_gate_up_tiled_stage5",
+        "command_buffer_gpu:qwen36_ffn_int4_expert_down_finalize",
+    ),
+    "full-stage5-router-simd-batch-ffn-phases": (
+        "command_buffer_gpu:qwen36_ffn_int4_router_topk_stage5_simd",
         "command_buffer_gpu:qwen36_ffn_int4_shared_gate_up",
         "command_buffer_gpu:qwen36_ffn_int4_shared_gate_scalar",
         "command_buffer_gpu:qwen36_ffn_int4_shared_down",
@@ -150,12 +195,23 @@ FUSED_GPU_OP_PREFIXES = {
 }
 
 BATCH_FFN_PHASE_GPU_FIELDS = {
-    "decode_batch_ffn_router_topk_gpu_ms": "command_buffer_gpu:qwen36_ffn_int4_router_topk_stage5",
-    "decode_batch_ffn_shared_gate_up_gpu_ms": "command_buffer_gpu:qwen36_ffn_int4_shared_gate_up",
-    "decode_batch_ffn_shared_scalar_gpu_ms": "command_buffer_gpu:qwen36_ffn_int4_shared_gate_scalar",
-    "decode_batch_ffn_shared_down_gpu_ms": "command_buffer_gpu:qwen36_ffn_int4_shared_down",
-    "decode_batch_ffn_expert_gate_up_gpu_ms": "command_buffer_gpu:qwen36_ffn_int4_expert_gate_up_tiled_stage5",
-    "decode_batch_ffn_expert_down_gpu_ms": "command_buffer_gpu:qwen36_ffn_int4_expert_down_finalize",
+    "decode_batch_ffn_router_topk_gpu_ms": (
+        "command_buffer_gpu:qwen36_ffn_int4_router_topk_stage5",
+        "command_buffer_gpu:qwen36_ffn_int4_router_topk_stage5_simd",
+    ),
+    "decode_batch_ffn_shared_gate_up_gpu_ms": (
+        "command_buffer_gpu:qwen36_ffn_int4_shared_gate_up",
+    ),
+    "decode_batch_ffn_shared_scalar_gpu_ms": (
+        "command_buffer_gpu:qwen36_ffn_int4_shared_gate_scalar",
+    ),
+    "decode_batch_ffn_shared_down_gpu_ms": ("command_buffer_gpu:qwen36_ffn_int4_shared_down",),
+    "decode_batch_ffn_expert_gate_up_gpu_ms": (
+        "command_buffer_gpu:qwen36_ffn_int4_expert_gate_up_tiled_stage5",
+    ),
+    "decode_batch_ffn_expert_down_gpu_ms": (
+        "command_buffer_gpu:qwen36_ffn_int4_expert_down_finalize",
+    ),
 }
 
 
@@ -315,6 +371,9 @@ def build_env_overrides(args: argparse.Namespace, mode: str) -> dict[str, str]:
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5"] = "1"
     elif mode == "full-stage5-router":
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"] = "1"
+    elif mode == "full-stage5-router-simd":
+        overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"] = "1"
+        overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_STAGE5_SIMD"] = "1"
     elif mode == "full-stage5-router-batch":
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"] = "1"
         overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH"] = "1"
@@ -324,6 +383,17 @@ def build_env_overrides(args: argparse.Namespace, mode: str) -> dict[str, str]:
         overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH_PROFILE_PHASES"] = "1"
     elif mode == "full-stage5-router-batch-ffn-phases":
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"] = "1"
+        overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH"] = "1"
+        overrides["SUPERSONIC_METAL_PROFILE_QWEN36_FFN_PHASES"] = "1"
+        overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH_PROFILE_FFN_PHASES"] = "1"
+    elif mode == "full-stage5-router-simd-batch-phases":
+        overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"] = "1"
+        overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_STAGE5_SIMD"] = "1"
+        overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH"] = "1"
+        overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH_PROFILE_PHASES"] = "1"
+    elif mode == "full-stage5-router-simd-batch-ffn-phases":
+        overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"] = "1"
+        overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_STAGE5_SIMD"] = "1"
         overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH"] = "1"
         overrides["SUPERSONIC_METAL_PROFILE_QWEN36_FFN_PHASES"] = "1"
         overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH_PROFILE_FFN_PHASES"] = "1"
@@ -487,8 +557,19 @@ def decode_batch_phase_gpu_ms(row: dict[str, Any], phase: str) -> float | None:
 
 
 def batch_ffn_subphase_gpu_ms(row: dict[str, Any], field: str) -> float | None:
-    needle = BATCH_FFN_PHASE_GPU_FIELDS[field]
-    return profile_op_total(row.get("metal_profile"), needle)
+    total = 0.0
+    matched = False
+    profile = row.get("metal_profile")
+    if not profile:
+        return None
+    needles = {needle.lower() for needle in BATCH_FFN_PHASE_GPU_FIELDS[field]}
+    for entry in profile.get("entries") or []:
+        op = str(entry.get("op") or "").lower()
+        if op not in needles:
+            continue
+        matched = True
+        total += float(entry.get("total_ms") or 0.0)
+    return total if matched else None
 
 
 def batch_ffn_subphase_total_gpu_ms(row: dict[str, Any]) -> float | None:

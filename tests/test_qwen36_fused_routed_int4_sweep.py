@@ -89,7 +89,7 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
 
         self.assertEqual(
             script.parse_modes(
-                "baseline,direct,direct-defer,defer-direct-wait,gpu-pack,gpack,stage5,native-stage5,router,router-batch,batch-router,router-batch-phases,batch-router-phases,router-batch-ffn-phases,batch-router-ffn-phases,router-defer"
+                "baseline,direct,direct-defer,defer-direct-wait,gpu-pack,gpack,stage5,native-stage5,router,router-simd,router-batch,batch-router,router-batch-phases,batch-router-phases,router-batch-ffn-phases,batch-router-ffn-phases,router-simd-batch-phases,router-simd-batch-ffn-phases,router-defer"
             ),
             [
                 "default",
@@ -98,9 +98,12 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
                 "gpu-pack",
                 "full-stage5",
                 "full-stage5-router",
+                "full-stage5-router-simd",
                 "full-stage5-router-batch",
                 "full-stage5-router-batch-phases",
                 "full-stage5-router-batch-ffn-phases",
+                "full-stage5-router-simd-batch-phases",
+                "full-stage5-router-simd-batch-ffn-phases",
                 "router-defer-wait",
             ],
         )
@@ -114,6 +117,7 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
         gpu_pack = script.build_env_overrides(args, "gpu-pack")
         full_stage5 = script.build_env_overrides(args, "full-stage5")
         full_stage5_router = script.build_env_overrides(args, "full-stage5-router")
+        full_stage5_router_simd = script.build_env_overrides(args, "full-stage5-router-simd")
         full_stage5_router_batch = script.build_env_overrides(args, "full-stage5-router-batch")
         full_stage5_router_batch_phases = script.build_env_overrides(
             args,
@@ -122,6 +126,14 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
         full_stage5_router_batch_ffn_phases = script.build_env_overrides(
             args,
             "full-stage5-router-batch-ffn-phases",
+        )
+        full_stage5_router_simd_batch_phases = script.build_env_overrides(
+            args,
+            "full-stage5-router-simd-batch-phases",
+        )
+        full_stage5_router_simd_batch_ffn_phases = script.build_env_overrides(
+            args,
+            "full-stage5-router-simd-batch-ffn-phases",
         )
         router_defer = script.build_env_overrides(args, "router-defer-wait")
         default = script.build_env_overrides(args, "default")
@@ -158,6 +170,14 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
         )
         self.assertEqual(
             full_stage5_router["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"],
+            "1",
+        )
+        self.assertEqual(
+            full_stage5_router_simd["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"],
+            "1",
+        )
+        self.assertEqual(
+            full_stage5_router_simd["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_STAGE5_SIMD"],
             "1",
         )
         self.assertEqual(
@@ -202,6 +222,30 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
         )
         self.assertEqual(
             full_stage5_router_batch_ffn_phases[
+                "SUPERSONIC_METAL_QWEN36_DECODE_BATCH_PROFILE_FFN_PHASES"
+            ],
+            "1",
+        )
+        self.assertEqual(
+            full_stage5_router_simd_batch_phases[
+                "SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_STAGE5_SIMD"
+            ],
+            "1",
+        )
+        self.assertEqual(
+            full_stage5_router_simd_batch_phases[
+                "SUPERSONIC_METAL_QWEN36_DECODE_BATCH_PROFILE_PHASES"
+            ],
+            "1",
+        )
+        self.assertEqual(
+            full_stage5_router_simd_batch_ffn_phases[
+                "SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_STAGE5_SIMD"
+            ],
+            "1",
+        )
+        self.assertEqual(
+            full_stage5_router_simd_batch_ffn_phases[
                 "SUPERSONIC_METAL_QWEN36_DECODE_BATCH_PROFILE_FFN_PHASES"
             ],
             "1",
@@ -253,11 +297,23 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
             "Hello",
             "full-stage5-router-batch-ffn-phases",
         )
+        simd_batch_phases = script.build_command(
+            args,
+            "Hello",
+            "full-stage5-router-simd-batch-phases",
+        )
+        simd_batch_ffn_phases = script.build_command(
+            args,
+            "Hello",
+            "full-stage5-router-simd-batch-ffn-phases",
+        )
 
         self.assertIn("--emit-stage-timings", normal)
         self.assertNotIn("--emit-stage-timings", batch)
         self.assertNotIn("--emit-stage-timings", batch_phases)
         self.assertNotIn("--emit-stage-timings", batch_ffn_phases)
+        self.assertNotIn("--emit-stage-timings", simd_batch_phases)
+        self.assertNotIn("--emit-stage-timings", simd_batch_ffn_phases)
         self.assertIn("--emit-generated-json", batch)
 
     def test_promotion_gate_passes_only_real_improvements(self):
@@ -530,6 +586,41 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
         self.assertEqual(candidate["decode_batch_ffn_gpu_ms"], 166.0)
         self.assertEqual(candidate["fused_gpu_ms"], 166.0)
         self.assertAlmostEqual(candidate["wait_gpu_ratio"], 60.0 / 166.0)
+
+    def test_decode_batch_ffn_subphase_profile_accepts_simd_router_label(self):
+        script = sweep_qwen36_fused_routed_int4
+        candidate = row("full-stage5-router-simd-batch-ffn-phases", wait=30.0)
+        candidate["metal_profile"]["entries"].extend(
+            [
+                {
+                    "op": "command_buffer_gpu:qwen36_ffn_int4_router_topk_stage5_simd",
+                    "path": "runtime",
+                    "calls": 2,
+                    "mean_ms": 2.5,
+                    "total_ms": 5.0,
+                    "max_ms": 3.0,
+                },
+                {
+                    "op": "command_buffer_gpu:qwen36_ffn_int4_expert_down_finalize",
+                    "path": "runtime",
+                    "calls": 2,
+                    "mean_ms": 7.5,
+                    "total_ms": 15.0,
+                    "max_ms": 8.0,
+                },
+            ]
+        )
+
+        script.annotate_ffn_profile_fields(
+            [candidate],
+            max_wall_gpu_ratio=4.0,
+            max_wait_gpu_ratio=4.0,
+        )
+
+        self.assertEqual(candidate["decode_batch_ffn_router_topk_gpu_ms"], 5.0)
+        self.assertEqual(candidate["decode_batch_ffn_expert_down_gpu_ms"], 15.0)
+        self.assertEqual(candidate["decode_batch_ffn_gpu_ms"], 20.0)
+        self.assertEqual(candidate["fused_gpu_ms"], 20.0)
 
     def test_router_parity_tap_rows_are_parsed_and_rendered(self):
         script = sweep_qwen36_fused_routed_int4
