@@ -15,11 +15,14 @@ from typing import Any
 
 
 MODEL = "qwen3.6-35b-a3b"
-SCHEMA = "qwen36-fused-routed-int4-sweep-v11"
+SCHEMA = "qwen36-fused-routed-int4-sweep-v12"
 DEFAULT_MAX_FUSED_WALL_GPU_RATIO = 4.0
 DEFAULT_MAX_WAIT_GPU_RATIO = 4.0
+COARSE_BATCH_SERIAL_MODE = "full-stage5-router-batch"
+COARSE_BATCH_SIMD_MODE = "full-stage5-router-simd-batch"
 BATCH_FAST_PROFILE_MODES = {
     "full-stage5-router-batch",
+    "full-stage5-router-simd-batch",
     "full-stage5-router-batch-phases",
     "full-stage5-router-batch-ffn-phases",
     "full-stage5-router-simd-batch-phases",
@@ -67,6 +70,10 @@ MODE_ALIASES: dict[str, str] = {
     "batch-router": "full-stage5-router-batch",
     "full-router-batch": "full-stage5-router-batch",
     "full-stage5-router-batch": "full-stage5-router-batch",
+    "router-simd-batch": "full-stage5-router-simd-batch",
+    "batch-router-simd": "full-stage5-router-simd-batch",
+    "full-router-simd-batch": "full-stage5-router-simd-batch",
+    "full-stage5-router-simd-batch": "full-stage5-router-simd-batch",
     "router-batch-phases": "full-stage5-router-batch-phases",
     "batch-router-phases": "full-stage5-router-batch-phases",
     "full-router-batch-phases": "full-stage5-router-batch-phases",
@@ -98,6 +105,7 @@ FUSED_OP_NEEDLES = {
     "full-stage5-router": "qwen36_ffn_int4_stage5_with_router",
     "full-stage5-router-simd": "qwen36_ffn_int4_stage5_with_router",
     "full-stage5-router-batch": "qwen36_ffn_int4_stage5_with_router",
+    "full-stage5-router-simd-batch": "qwen36_ffn_int4_stage5_with_router",
     "full-stage5-router-batch-phases": "qwen36_ffn_int4_stage5_with_router",
     "full-stage5-router-batch-ffn-phases": "qwen36_ffn_int4",
     "full-stage5-router-simd-batch-phases": "qwen36_ffn_int4_stage5_with_router",
@@ -141,6 +149,16 @@ FUSED_GPU_OP_PREFIXES = {
         "command_buffer_gpu:qwen36_decode_batch",
         "command_buffer_gpu:qwen36_ffn_int4_stage5_with_router",
         "command_buffer_gpu:qwen36_ffn_int4_router_topk_stage5",
+        "command_buffer_gpu:qwen36_ffn_int4_shared_gate_up",
+        "command_buffer_gpu:qwen36_ffn_int4_shared_gate_scalar",
+        "command_buffer_gpu:qwen36_ffn_int4_shared_down",
+        "command_buffer_gpu:qwen36_ffn_int4_expert_gate_up_tiled_stage5",
+        "command_buffer_gpu:qwen36_ffn_int4_expert_down_finalize",
+    ),
+    "full-stage5-router-simd-batch": (
+        "command_buffer_gpu:qwen36_decode_batch",
+        "command_buffer_gpu:qwen36_ffn_int4_stage5_with_router",
+        "command_buffer_gpu:qwen36_ffn_int4_router_topk_stage5_simd",
         "command_buffer_gpu:qwen36_ffn_int4_shared_gate_up",
         "command_buffer_gpu:qwen36_ffn_int4_shared_gate_scalar",
         "command_buffer_gpu:qwen36_ffn_int4_shared_down",
@@ -553,6 +571,10 @@ def build_env_overrides(args: argparse.Namespace, mode: str) -> dict[str, str]:
     elif mode == "full-stage5-router-batch":
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"] = "1"
         overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH"] = "1"
+    elif mode == "full-stage5-router-simd-batch":
+        overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"] = "1"
+        overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_STAGE5_SIMD"] = "1"
+        overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH"] = "1"
     elif mode == "full-stage5-router-batch-phases":
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"] = "1"
         overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH"] = "1"
@@ -683,6 +705,14 @@ def profile_op_total_where(profile: dict[str, Any] | None, predicate: Any) -> fl
     return total if matched else None
 
 
+def profile_op_total_exact(profile: dict[str, Any] | None, op_name: str) -> float | None:
+    op_name = op_name.lower()
+    return profile_op_total_where(
+        profile,
+        lambda entry: str(entry.get("op") or "").lower() == op_name,
+    )
+
+
 def command_buffer_wait_ms(row: dict[str, Any]) -> float | None:
     return profile_op_total(row.get("metal_profile"), "command_buffer_wait")
 
@@ -729,6 +759,13 @@ def decode_batch_phase_gpu_ms(row: dict[str, Any], phase: str) -> float | None:
     return profile_op_total(
         row.get("metal_profile"),
         f"command_buffer_gpu:qwen36_decode_batch_{phase}",
+    )
+
+
+def decode_batch_gpu_ms(row: dict[str, Any]) -> float | None:
+    return profile_op_total_exact(
+        row.get("metal_profile"),
+        "command_buffer_gpu:qwen36_decode_batch",
     )
 
 
@@ -798,6 +835,7 @@ def annotate_ffn_profile_fields(
         row["fused_op_ms"] = fused_op_ms(row)
         row["fused_wall_ms"] = fused_wall_ms(row)
         row["fused_gpu_ms"] = fused_gpu_ms(row)
+        row["decode_batch_gpu_ms"] = decode_batch_gpu_ms(row)
         row["decode_batch_linear_gpu_ms"] = decode_batch_phase_gpu_ms(row, "linear_attn")
         row["decode_batch_ffn_gpu_ms"] = decode_batch_phase_gpu_ms(row, "ffn")
         for field in BATCH_FFN_PHASE_GPU_FIELDS:
@@ -1195,6 +1233,156 @@ def build_ffn_residency_gap(
     }
 
 
+def build_decode_batch_coarse_comparison(
+    rows: list[dict[str, Any]],
+    modes: list[str],
+) -> dict[str, Any]:
+    prompt_ids: list[str] = []
+    for row in rows:
+        prompt_id = str(row.get("prompt_id", ""))
+        if prompt_id and prompt_id not in prompt_ids:
+            prompt_ids.append(prompt_id)
+    rows_by_key = {
+        (str(row.get("prompt_id", "")), row.get("mode")): row
+        for row in rows
+    }
+    comparisons: list[dict[str, Any]] = []
+    missing_modes = [
+        mode
+        for mode in (COARSE_BATCH_SERIAL_MODE, COARSE_BATCH_SIMD_MODE)
+        if mode not in modes
+    ]
+    for prompt_id in prompt_ids:
+        baseline = rows_by_key.get((prompt_id, "default"))
+        serial = rows_by_key.get((prompt_id, COARSE_BATCH_SERIAL_MODE))
+        simd = rows_by_key.get((prompt_id, COARSE_BATCH_SIMD_MODE))
+        if serial is None or simd is None:
+            comparisons.append(
+                {
+                    "prompt_id": prompt_id,
+                    "status": "missing_mode",
+                    "missing_modes": [
+                        mode
+                        for mode, row in (
+                            (COARSE_BATCH_SERIAL_MODE, serial),
+                            (COARSE_BATCH_SIMD_MODE, simd),
+                        )
+                        if row is None
+                    ],
+                }
+            )
+            continue
+        serial_decode = row_number(serial, "result", "decode_ms")
+        simd_decode = row_number(simd, "result", "decode_ms")
+        serial_gpu = serial.get("decode_batch_gpu_ms")
+        simd_gpu = simd.get("decode_batch_gpu_ms")
+        serial_wait = serial.get("command_buffer_wait_ms")
+        simd_wait = simd.get("command_buffer_wait_ms")
+        generated_ids_match_default = (
+            None
+            if baseline is None
+            else (simd.get("generated_ids") or []) == (baseline.get("generated_ids") or [])
+        )
+        generated_ids_match_serial = (simd.get("generated_ids") or []) == (
+            serial.get("generated_ids") or []
+        )
+        decode_ratio = safe_ratio(simd_decode, serial_decode)
+        gpu_ratio = safe_ratio(simd_gpu, serial_gpu)
+        wait_ratio = safe_ratio(simd_wait, serial_wait)
+        wait_gpu_ratio = safe_ratio(simd_wait, simd_gpu)
+        decode_gpu_ratio = safe_ratio(simd_decode, simd_gpu)
+        if simd.get("status") != "ok" or serial.get("status") != "ok":
+            blocker = "missing_ok_row"
+        elif generated_ids_match_default is False or not generated_ids_match_serial:
+            blocker = "correctness"
+        elif wait_gpu_ratio is not None and wait_gpu_ratio > DEFAULT_MAX_WAIT_GPU_RATIO:
+            blocker = "batch_wait_or_submit_overhead"
+        elif decode_gpu_ratio is not None and decode_gpu_ratio > DEFAULT_MAX_FUSED_WALL_GPU_RATIO:
+            blocker = "batch_wall_overhead"
+        elif gpu_ratio is not None and gpu_ratio >= 0.999:
+            blocker = "router_gpu_not_improved"
+        else:
+            blocker = "gpu_work_or_profile_needed"
+        comparisons.append(
+            {
+                "prompt_id": prompt_id,
+                "status": "ok",
+                "generated_ids_match_default": generated_ids_match_default,
+                "generated_ids_match_serial": generated_ids_match_serial,
+                "serial_decode_ms": serial_decode,
+                "simd_decode_ms": simd_decode,
+                "decode_ratio": decode_ratio,
+                "serial_decode_batch_gpu_ms": serial_gpu,
+                "simd_decode_batch_gpu_ms": simd_gpu,
+                "decode_batch_gpu_ratio": gpu_ratio,
+                "serial_command_buffer_wait_ms": serial_wait,
+                "simd_command_buffer_wait_ms": simd_wait,
+                "command_buffer_wait_ratio": wait_ratio,
+                "simd_wait_gpu_ratio": wait_gpu_ratio,
+                "simd_decode_gpu_ratio": decode_gpu_ratio,
+                "blocker": blocker,
+            }
+        )
+
+    usable = [
+        item
+        for item in comparisons
+        if item.get("status") == "ok"
+    ]
+    blockers = sorted({str(item.get("blocker")) for item in usable})
+    mismatches = [
+        item
+        for item in usable
+        if item.get("generated_ids_match_default") is False
+        or item.get("generated_ids_match_serial") is False
+    ]
+    improved_decode = [
+        item
+        for item in usable
+        if item.get("decode_ratio") is not None and float(item["decode_ratio"]) < 1.0
+    ]
+    improved_gpu = [
+        item
+        for item in usable
+        if item.get("decode_batch_gpu_ratio") is not None
+        and float(item["decode_batch_gpu_ratio"]) < 1.0
+    ]
+    if missing_modes:
+        recommendation = "run_decode_batch_coarse_simd_sweep"
+        reason = "serial and SIMD coarse decode-batch rows are both required"
+    elif mismatches:
+        recommendation = "fix_decode_batch_simd_correctness"
+        reason = "SIMD coarse batch row does not match the default or serial generated IDs"
+    elif usable and len(improved_decode) == len(usable) and len(improved_gpu) == len(usable):
+        if any(
+            item.get("blocker") in {"batch_wait_or_submit_overhead", "batch_wall_overhead"}
+            for item in usable
+        ):
+            recommendation = "target_decode_batch_wait_or_wall_overhead"
+            reason = "SIMD improves the coarse batch GPU label, but wall/wait ratios dominate"
+        else:
+            recommendation = "keep_simd_router_enabled_then_target_remaining_gpu_work"
+            reason = "SIMD improves coarse batch decode and GPU labels without a wall/wait blocker"
+    elif usable:
+        recommendation = "keep_simd_router_as_attribution_only"
+        reason = "SIMD coarse batch did not improve both decode wall time and batch GPU time"
+    else:
+        recommendation = "run_decode_batch_coarse_simd_sweep"
+        reason = "no usable coarse decode-batch comparison rows were found"
+    return {
+        "serial_mode": COARSE_BATCH_SERIAL_MODE,
+        "simd_mode": COARSE_BATCH_SIMD_MODE,
+        "available": not missing_modes and bool(usable),
+        "missing_modes": missing_modes,
+        "comparison_count": len(usable),
+        "mismatch_count": len(mismatches),
+        "blockers": blockers,
+        "recommendation": recommendation,
+        "reason": reason,
+        "comparisons": comparisons,
+    }
+
+
 def summarize_with_gate(
     rows: list[dict[str, Any]],
     modes: list[str],
@@ -1222,6 +1410,7 @@ def summarize_with_gate(
         max_fused_wall_gpu_ratio,
         max_wait_gpu_ratio,
     )
+    summary["decode_batch_coarse"] = build_decode_batch_coarse_comparison(rows, modes)
     return summary
 
 
@@ -1293,6 +1482,7 @@ def render_markdown(report: dict[str, Any]) -> str:
     ffn_gap = summary.get("ffn_residency_gap") or {}
     router_parity = summary.get("router_parity") or {}
     route_snapshot = summary.get("decode_batch_route_snapshot") or {}
+    decode_batch_coarse = summary.get("decode_batch_coarse") or {}
     lines = [
         "# Qwen3.6 Fused Routed INT4 Sweep",
         "",
@@ -1309,13 +1499,14 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- promotion_gate_passed: `{promotion_gate.get('passed', False)}`",
         f"- promotion_gate_passed_modes: `{','.join(promotion_gate.get('passed_modes') or []) or '-'}`",
         f"- ffn_gap_recommendation: `{ffn_gap.get('recommendation') or '-'}`",
+        f"- decode_batch_coarse_recommendation: `{decode_batch_coarse.get('recommendation') or '-'}`",
         f"- router_parity_tap_count: `{router_parity.get('tap_count', 0)}`",
         f"- router_parity_mismatches: `{router_parity.get('mismatch_count', 0)}`",
         f"- decode_batch_route_snapshot_count: `{route_snapshot.get('snapshot_count', 0)}`",
         f"- decode_batch_route_snapshot_mismatches: `{route_snapshot.get('mismatch_count', 0)}`",
         "",
-        "| Prompt | Mode | Status | IDs | Decode ms | FFN ms avg | Fused wall ms | Fused GPU ms | Batch lin GPU ms | Batch FFN GPU ms | Wall/GPU | Wait/GPU | FFN class | Top Metal op | Top Metal ms | HAL ms | Wall s |",
-        "|:---|:---|:---|:---|---:|---:|---:|---:|---:|---:|---:|---:|:---|:---|---:|---:|---:|",
+        "| Prompt | Mode | Status | IDs | Decode ms | FFN ms avg | Fused wall ms | Fused GPU ms | Batch GPU ms | Batch lin GPU ms | Batch FFN GPU ms | Wall/GPU | Wait/GPU | FFN class | Top Metal op | Top Metal ms | HAL ms | Wall s |",
+        "|:---|:---|:---|:---|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---|:---|---:|---:|---:|",
     ]
     for row in report["rows"]:
         result = row.get("result") or {}
@@ -1323,7 +1514,7 @@ def render_markdown(report: dict[str, Any]) -> str:
         top_metal = top_profile_op(row.get("metal_profile"))
         hal_summary = (row.get("hal_profile") or {}).get("summary") or {}
         lines.append(
-            "| {prompt} | {mode} | {status} | {ids} | {decode} | {ffn} | {fused_wall} | {fused_gpu} | {batch_linear} | {batch_ffn} | {wall_gpu} | {wait_gpu} | {ffn_class} | {top_op} | {top_ms} | {hal_ms} | {wall} |".format(
+            "| {prompt} | {mode} | {status} | {ids} | {decode} | {ffn} | {fused_wall} | {fused_gpu} | {batch_gpu} | {batch_linear} | {batch_ffn} | {wall_gpu} | {wait_gpu} | {ffn_class} | {top_op} | {top_ms} | {hal_ms} | {wall} |".format(
                 prompt=row.get("prompt_id", ""),
                 mode=row.get("mode", ""),
                 status=row.get("status", ""),
@@ -1332,6 +1523,7 @@ def render_markdown(report: dict[str, Any]) -> str:
                 ffn=render_float(chain.get("ffn_ms_avg")),
                 fused_wall=render_float(row.get("fused_wall_ms")),
                 fused_gpu=render_float(row.get("fused_gpu_ms")),
+                batch_gpu=render_float(row.get("decode_batch_gpu_ms")),
                 batch_linear=render_float(row.get("decode_batch_linear_gpu_ms")),
                 batch_ffn=render_float(row.get("decode_batch_ffn_gpu_ms")),
                 wall_gpu=render_float(row.get("fused_wall_gpu_ratio"), 2),
@@ -1343,6 +1535,45 @@ def render_markdown(report: dict[str, Any]) -> str:
                 wall=render_float(row.get("wall_seconds"), 1),
             )
         )
+    coarse_comparisons = [
+        item
+        for item in (decode_batch_coarse.get("comparisons") or [])
+        if item.get("status") == "ok"
+    ]
+    if coarse_comparisons:
+        lines.extend(
+            [
+                "",
+                "## Decode Batch Coarse SIMD",
+                "",
+                f"- recommendation: `{decode_batch_coarse.get('recommendation') or '-'}`",
+                f"- reason: {decode_batch_coarse.get('reason') or '-'}",
+                "",
+                "| Prompt | IDs match default | IDs match serial | Serial decode ms | SIMD decode ms | Decode ratio | Serial batch GPU ms | SIMD batch GPU ms | GPU ratio | Serial wait ms | SIMD wait ms | Wait ratio | SIMD wait/GPU | Blocker |",
+                "|:---|:---:|:---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---|",
+            ]
+        )
+        for comparison in coarse_comparisons:
+            ids_default = comparison.get("generated_ids_match_default")
+            ids_serial = comparison.get("generated_ids_match_serial")
+            lines.append(
+                "| {prompt} | {ids_default} | {ids_serial} | {serial_decode} | {simd_decode} | {decode_ratio} | {serial_gpu} | {simd_gpu} | {gpu_ratio} | {serial_wait} | {simd_wait} | {wait_ratio} | {wait_gpu} | {blocker} |".format(
+                    prompt=comparison.get("prompt_id", ""),
+                    ids_default="-" if ids_default is None else str(bool(ids_default)).lower(),
+                    ids_serial="-" if ids_serial is None else str(bool(ids_serial)).lower(),
+                    serial_decode=render_float(comparison.get("serial_decode_ms")),
+                    simd_decode=render_float(comparison.get("simd_decode_ms")),
+                    decode_ratio=render_float(comparison.get("decode_ratio"), 3),
+                    serial_gpu=render_float(comparison.get("serial_decode_batch_gpu_ms")),
+                    simd_gpu=render_float(comparison.get("simd_decode_batch_gpu_ms")),
+                    gpu_ratio=render_float(comparison.get("decode_batch_gpu_ratio"), 3),
+                    serial_wait=render_float(comparison.get("serial_command_buffer_wait_ms")),
+                    simd_wait=render_float(comparison.get("simd_command_buffer_wait_ms")),
+                    wait_ratio=render_float(comparison.get("command_buffer_wait_ratio"), 3),
+                    wait_gpu=render_float(comparison.get("simd_wait_gpu_ratio"), 3),
+                    blocker=comparison.get("blocker") or "-",
+                )
+            )
     if any(
         row.get(field) is not None
         for row in report["rows"]

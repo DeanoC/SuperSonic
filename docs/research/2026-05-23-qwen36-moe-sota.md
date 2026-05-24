@@ -1229,6 +1229,43 @@ under the same smoke:
    flushes, and decide whether the remaining blocker is batch/wait overhead or
    the still-large router/shared scalar GPU work.
 
+36. **Qwen3.6 coarse decode-batch SIMD lane**
+   The fused-routed sweep is now schema v12 and adds the missing phase-free
+   SIMD batch mode, `full-stage5-router-simd-batch`, plus a
+   `decode_batch_coarse` summary. The mode sets the same stage-5 router and
+   decode-batch guards as `full-stage5-router-batch`, adds
+   `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_STAGE5_SIMD=1`, and keeps
+   `--emit-stage-timings` off so the measurement is one coarse
+   `qwen36_decode_batch` profile lane rather than the per-FFN subphase
+   attribution path. The summary compares the serial and SIMD coarse rows by
+   generated IDs, decode wall time, exact `command_buffer_gpu:qwen36_decode_batch`
+   time, command-buffer wait, and wait/GPU ratios.
+
+   The Metal smoke used
+   `--modes default,full-stage5-router-batch,full-stage5-router-simd-batch
+   --metal-profile` with no route snapshot and no FFN phase flushing. It
+   preserved generated IDs across all rows: `[11, 271, 40, 599]`. Default
+   remained much faster at `849.0 ms` decode with `ffn_ms_avg=114.380`, so the
+   decode-batch lane is still not a promotion candidate. Inside the coarse
+   batch lane, SIMD helped but only modestly: serial batch measured
+   `1482.0 ms` decode, `1263.000 ms` batch GPU, and `1360.363 ms`
+   command-buffer wait; SIMD batch measured `1447.0 ms` decode,
+   `1220.971 ms` batch GPU, and `1328.013 ms` command-buffer wait. That is a
+   2.4% decode improvement, 3.3% batch-GPU reduction, and 2.4% wait reduction
+   versus the serial coarse batch row.
+
+   The blocker classification is now sharper: the subphase flushes were not
+   hiding a SIMD correctness problem, and the phase-free coarse batch row does
+   benefit from SIMD. However, the large `qwen36_decode_batch` GPU blob still
+   dominates and command-buffer wait tracks it closely (`wait/GPU ~= 1.10`),
+   rather than exploding into the earlier per-phase wall/GPU gap. The next
+   implementation should keep the SIMD router enabled for batch probes, but
+   keep the batch path gated. The next optimization target is the internal
+   work inside the coarse `qwen36_decode_batch` blob, starting with a
+   non-flushing attribution split or a narrower fused FFN arithmetic reduction;
+   batch mode should not be promoted over the current default chained decode
+   path until its headline decode time beats default.
+
 ## Sources
 
 - [Qwen/Qwen3.6-35B-A3B model card](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)
