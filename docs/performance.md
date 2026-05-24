@@ -1187,7 +1187,12 @@ previous schema-v8 run (`162.6 ms/token`, `linear_attn_ms_avg=31.335`), this
 measured `145.5 ms/token` and `linear_attn_ms_avg=28.690`; split-profile GPU
 rows show `qwen36_linear_int4_projections` dropping from `175.821 ms` to
 `70.896 ms` total and `qwen36_linear_int4_out_proj_finalize` from `58.545 ms`
-to `28.171 ms` total. A default one-token smoke generated the expected token
+to `28.171 ms` total. Follow-up beta/g recurrent-update hoist probes were
+measured and rejected: moving beta/g into the q/k repeat dispatch was headline
+flat (`145.1 ms/token`) and regressed split recurrent/qk rows, while a
+lane-0 threadgroup variant was also headline flat (`145.6 ms/token`) with a
+slower split recurrent row. Keep the paired-nibble kernel as the default
+linear-attention state. A default one-token smoke generated the expected token
 `[11]`;
 the latest local cold one-token profile measured `ffn_ms_avg=128.573`,
 with `qwen36_ffn_host_expert_gate_up` at 56.839 ms total and

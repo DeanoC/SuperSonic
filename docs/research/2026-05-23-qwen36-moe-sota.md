@@ -650,6 +650,23 @@ under the same smoke:
    make the next actionable target the largest non-exhausted bucket selected by
    the v2 selector.
 
+16. **Qwen3.6 linear recurrent beta/g hoist rejection**
+   The next tiny linear-kernel idea was measured and rejected instead of
+   promoted. A q/k-repeat precompute variant moved beta/g into the existing
+   q/k repeat dispatch, but the 2026-05-24 `bench-perf` lane stayed headline
+   flat (`145.1 ms/token` versus `145.5`) and did not improve normal
+   `linear_attn_ms_avg` (`28.608` versus `28.690`); split-profile rows also
+   moved the wrong way for recurrent/qk attribution
+   (`qwen36_linear_int4_recurrent_update` `33.313 -> 48.187 ms` total and
+   `qwen36_linear_int4_qk_norm_repeat` `3.611 -> 13.292 ms` total). A
+   lane-0 threadgroup variant also stayed headline flat (`145.6 ms/token`) and
+   kept the split recurrent row slower (`50.699 ms` total). A SIMD-broadcast
+   smoke preserved `[11]`, but its one-token chain timing regressed, so it was
+   not run as a promotion candidate. Keep the paired-nibble stage-5 linear
+   kernel as the current default; the next useful work should be a larger
+   orchestration/kernel change with a clearer normal-run win, not another
+   beta/g hoist.
+
 ## Sources
 
 - [Qwen/Qwen3.6-35B-A3B model card](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)
