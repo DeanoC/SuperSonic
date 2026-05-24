@@ -479,6 +479,8 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
             router_parity_tap_max_calls=3,
             shared_parity_tap=True,
             shared_parity_tap_max_calls=5,
+            routed_parity_tap=True,
+            routed_parity_tap_max_calls=7,
         )
         tap_router = script.build_env_overrides(tap_args, "full-stage5-router")
         self.assertEqual(
@@ -506,6 +508,16 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
                 "SUPERSONIC_METAL_QWEN36_DECODE_BATCH_SHARED_STAGE5_PARITY_TAP_MAX_CALLS"
             ],
             "5",
+        )
+        self.assertEqual(
+            tap_router["SUPERSONIC_METAL_QWEN36_DECODE_BATCH_ROUTED_STAGE5_PARITY_TAP"],
+            "1",
+        )
+        self.assertEqual(
+            tap_router[
+                "SUPERSONIC_METAL_QWEN36_DECODE_BATCH_ROUTED_STAGE5_PARITY_TAP_MAX_CALLS"
+            ],
+            "7",
         )
         snapshot_args = Namespace(
             metal_profile=False,
@@ -1199,6 +1211,79 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
         self.assertEqual(
             report["summary"]["decode_batch_shared_parity"]["paths"],
             ["all_tiled"],
+        )
+
+    def test_decode_batch_routed_parity_tap_rows_are_parsed_and_rendered(self):
+        script = sweep_qwen36_fused_routed_int4
+        output = (
+            "[qwen36-decode-batch-routed-parity] call=0 position=64 cache_pos=64 "
+            "layer=5 router_path=simd phase_profile=1 topk_idx_match=1 "
+            "workspace_idx_match=1 output_idx_match=1 topk_first_mismatch=-1 "
+            "workspace_first_idx_mismatch=-1 output_first_idx_mismatch=-1 "
+            "topk_weight_max_abs=1.25000000e-02 topk_weight_argmax=0 "
+            "expert_mid_max_abs=5.00000000e-01 expert_mid_argmax=23 "
+            "host_expert_mid_at_argmax=1.50000000e+00 "
+            "metal_expert_mid_at_argmax=1.00000000e+00 "
+            "moe_out_max_abs=2.50000000e-01 moe_out_argmax=33 "
+            "host_moe_out_at_argmax=1.25000000e+00 "
+            "metal_moe_out_at_argmax=1.00000000e+00 "
+            "final_out_max_abs=1.25000000e-01 final_out_argmax=44 "
+            "host_final_out_at_argmax=2.00000000e+00 "
+            "metal_final_out_at_argmax=1.87500000e+00 "
+            "host_idx=1,2 workspace_idx=1,2 output_idx=1,2 "
+            "host_w=0.60000002,0.39999998 metal_w=0.61250001,0.38750000\n"
+        )
+
+        taps = script.parse_decode_batch_routed_parity_taps(output)
+
+        self.assertEqual(len(taps), 1)
+        self.assertEqual(taps[0]["position"], 64)
+        self.assertEqual(taps[0]["router_path"], "simd")
+        self.assertEqual(taps[0]["topk_idx_match"], 1)
+        self.assertAlmostEqual(taps[0]["moe_out_max_abs"], 0.25)
+        self.assertAlmostEqual(taps[0]["final_out_max_abs"], 0.125)
+
+        args = Namespace(
+            max_new_tokens=2,
+            context_size=64,
+            metal_profile=False,
+            metal_profile_phases=False,
+            router_parity_tap=False,
+            router_parity_tap_max_calls=40,
+            shared_parity_tap=False,
+            shared_parity_tap_max_calls=40,
+            routed_parity_tap=True,
+            routed_parity_tap_max_calls=3,
+            decode_batch_route_snapshot=False,
+            promotion_max_headline_ratio=0.999,
+            promotion_max_ffn_ratio=0.999,
+            promotion_max_component_regression_ratio=1.10,
+            promotion_max_command_buffer_wait_ratio=1.05,
+            promotion_max_fused_wall_gpu_ratio=4.0,
+            promotion_max_wait_gpu_ratio=4.0,
+            promotion_require_profile=False,
+        )
+        candidate = row("full-stage5-router-simd-batch-shared-tiled")
+        candidate["decode_batch_routed_parity_taps"] = taps
+        report = script.build_report(
+            [row("default"), candidate],
+            args,
+            ["default", "full-stage5-router-simd-batch-shared-tiled"],
+            "smoke",
+        )
+        md = script.render_markdown(report)
+
+        self.assertIn("routed_parity_tap: `True`", md)
+        self.assertIn("decode_batch_routed_parity_tap_count: `1`", md)
+        self.assertIn("decode_batch_routed_parity_max_moe_out_abs: `0.25000000`", md)
+        self.assertIn("## Decode-Batch Routed Expert Parity Tap", md)
+        self.assertIn(
+            "| hello | full-stage5-router-simd-batch-shared-tiled | simd | true | 0 | 64 | 5 | true |",
+            md,
+        )
+        self.assertEqual(
+            report["summary"]["decode_batch_routed_parity"]["paths"],
+            ["simd"],
         )
 
     def test_downstream_parity_taps_are_compared_and_rendered(self):

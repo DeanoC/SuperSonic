@@ -3963,6 +3963,13 @@ struct Qwen36FfnSharedReference {
     shared_scalar: f32,
 }
 
+#[derive(Debug, Clone)]
+struct Qwen36FfnRoutedReference {
+    expert_mid: Vec<f32>,
+    moe_out: Vec<f32>,
+    final_out: Vec<f32>,
+}
+
 fn qwen36_compute_ffn_router_reference(
     input: &[u16],
     norm_w: &[u16],
@@ -4118,6 +4125,89 @@ fn qwen36_compute_ffn_shared_reference(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn qwen36_compute_ffn_routed_reference(
+    input: &[u16],
+    h_norm: &[f32],
+    shared_out: &[f32],
+    topk_idx: &[u32],
+    topk_weight: &[f32],
+    gate_up_w: usize,
+    gate_up_scale: usize,
+    gate_up_zero: usize,
+    down_w: usize,
+    down_scale: usize,
+    down_zero: usize,
+    hidden: usize,
+    moe_intermediate: usize,
+    top_k: usize,
+    group_size: usize,
+) -> Qwen36FfnRoutedReference {
+    let rows_per_group = 2 * moe_intermediate;
+    let mut expert_mid = vec![0.0f32; top_k * moe_intermediate];
+    for group in 0..top_k {
+        let expert = topk_idx[group] as usize;
+        let mid_base = group * moe_intermediate;
+        for row in 0..moe_intermediate {
+            let gate = qwen36_expert_dense_or_int4_dot_unchecked(
+                gate_up_w,
+                gate_up_scale,
+                gate_up_zero,
+                expert,
+                row,
+                rows_per_group,
+                hidden,
+                group_size,
+                h_norm,
+            );
+            let up = qwen36_expert_dense_or_int4_dot_unchecked(
+                gate_up_w,
+                gate_up_scale,
+                gate_up_zero,
+                expert,
+                moe_intermediate + row,
+                rows_per_group,
+                hidden,
+                group_size,
+                h_norm,
+            );
+            let silu = gate * (1.0f32 / (1.0f32 + (-gate).exp()));
+            expert_mid[mid_base + row] = silu * up;
+        }
+    }
+
+    let mut moe_out = vec![0.0f32; hidden];
+    let mut final_out = vec![0.0f32; hidden];
+    for row in 0..hidden {
+        let mut acc = 0.0f32;
+        for group in 0..top_k {
+            let expert = topk_idx[group] as usize;
+            let mid = &expert_mid[group * moe_intermediate..(group + 1) * moe_intermediate];
+            let down = qwen36_expert_dense_or_int4_dot_unchecked(
+                down_w,
+                down_scale,
+                down_zero,
+                expert,
+                row,
+                hidden,
+                moe_intermediate,
+                group_size,
+                mid,
+            );
+            acc += topk_weight[group] * down;
+        }
+        let moe = bf16_round_f32(acc);
+        moe_out[row] = moe;
+        final_out[row] = bf16_round_f32(bf16_bits_to_f32(input[row]) + moe + shared_out[row]);
+    }
+
+    Qwen36FfnRoutedReference {
+        expert_mid,
+        moe_out,
+        final_out,
+    }
+}
+
 fn qwen36_bytes_to_f32_vec(bytes: &[u8]) -> Vec<f32> {
     bytes
         .chunks_exact(4)
@@ -4130,6 +4220,10 @@ fn qwen36_bytes_to_u32_vec(bytes: &[u8]) -> Vec<u32> {
         .chunks_exact(4)
         .map(|chunk| u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
         .collect()
+}
+
+fn qwen36_bf16_slice_to_f32_vec(values: &[u16]) -> Vec<f32> {
+    values.iter().map(|&bits| bf16_bits_to_f32(bits)).collect()
 }
 
 fn qwen36_max_abs_delta(expected: &[f32], got: &[f32]) -> (f32, usize) {
@@ -4494,6 +4588,228 @@ pub fn emit_decode_batch_shared_stage5_parity_tap_from_host(
         shared_out_argmax,
         host_shared_out_at_argmax,
         metal_shared_out_at_argmax,
+    );
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn emit_decode_batch_routed_stage5_parity_tap_from_host(
+    call: usize,
+    position: i32,
+    cache_pos: i32,
+    layer_idx: i32,
+    router_path: &str,
+    phase_profile: bool,
+    input: &[u16],
+    workspace: &[f32],
+    output: &[u16],
+    output_idx: &[u32],
+    params: Qwen36MoeFfnStepParams,
+    weights: &Qwen36MoeFfnStepWeights,
+    int4: &Qwen36MoeFfnStepInt4,
+) -> Result<(), GpuError> {
+    if params.stage != 5 {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::emit_decode_batch_routed_stage5_parity_tap_from_host requires stage 5, got {}",
+            params.stage
+        )));
+    }
+    if int4.group_size < 0 {
+        return Err(GpuError::InvalidArg(
+            "qwen36_moe::emit_decode_batch_routed_stage5_parity_tap_from_host does not support FP8 sidecars"
+                .into(),
+        ));
+    }
+    if !qwen36_ffn_int4_stage5_router_metal_native_supported(params, weights, int4) {
+        return Err(GpuError::InvalidArg(
+            "qwen36_moe::emit_decode_batch_routed_stage5_parity_tap_from_host requires the Qwen3.6 Metal INT4 router stage-5 path"
+                .into(),
+        ));
+    }
+
+    let hidden = params.hidden as usize;
+    let num_experts = params.num_experts as usize;
+    let moe_intermediate = params.moe_intermediate as usize;
+    let shared_intermediate = params.shared_intermediate as usize;
+    let top_k = params.top_k as usize;
+    let off_router_logits = hidden;
+    let off_router_probs = hidden + num_experts;
+    let off_topk_val = off_router_probs + num_experts;
+    let off_topk_idx = off_topk_val + top_k;
+    let off_sg_scalar = off_topk_idx + top_k;
+    let off_sgp = off_sg_scalar + 1;
+    let off_sup = off_sgp + shared_intermediate;
+    let off_shared_mid = off_sup + shared_intermediate;
+    let off_shared_out = off_shared_mid + shared_intermediate;
+    let off_expert_gu = off_shared_out + hidden;
+    let off_expert_mid = off_expert_gu + top_k * 2 * moe_intermediate;
+    let off_expert_stack = off_expert_mid + top_k * moe_intermediate;
+    let off_moe_out = off_expert_stack + top_k * hidden;
+    let workspace_needed = off_moe_out + hidden;
+
+    if input.len() < hidden {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::emit_decode_batch_routed_stage5_parity_tap_from_host input too small: need {hidden}, got {}",
+            input.len()
+        )));
+    }
+    if output.len() < hidden {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::emit_decode_batch_routed_stage5_parity_tap_from_host output too small: need {hidden}, got {}",
+            output.len()
+        )));
+    }
+    if output_idx.len() < top_k {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::emit_decode_batch_routed_stage5_parity_tap_from_host output_idx too small: need {top_k}, got {}",
+            output_idx.len()
+        )));
+    }
+    if workspace.len() < workspace_needed {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::emit_decode_batch_routed_stage5_parity_tap_from_host workspace too small: need {workspace_needed}, got {}",
+            workspace.len()
+        )));
+    }
+
+    let norm_w =
+        unsafe { std::slice::from_raw_parts(weights.post_attn_norm_w as *const u16, hidden) };
+    let gate_w =
+        unsafe { std::slice::from_raw_parts(weights.gate_w as *const u16, num_experts * hidden) };
+    let router_reference = qwen36_compute_ffn_router_reference(
+        &input[..hidden],
+        norm_w,
+        gate_w,
+        hidden,
+        num_experts,
+        top_k,
+        params.rms_norm_eps,
+    );
+
+    let shared_expert_gate_w =
+        unsafe { std::slice::from_raw_parts(weights.shared_expert_gate_w as *const u16, hidden) };
+    let shared_reference = qwen36_compute_ffn_shared_reference(
+        &router_reference.h_norm,
+        shared_expert_gate_w,
+        weights.shared_gate_proj_w as usize,
+        int4.shared_gate_proj_scale as usize,
+        int4.shared_gate_proj_zero as usize,
+        weights.shared_up_proj_w as usize,
+        int4.shared_up_proj_scale as usize,
+        int4.shared_up_proj_zero as usize,
+        weights.shared_down_proj_w as usize,
+        int4.shared_down_proj_scale as usize,
+        int4.shared_down_proj_zero as usize,
+        hidden,
+        shared_intermediate,
+        int4.group_size.max(0) as usize,
+    );
+    let routed_reference = qwen36_compute_ffn_routed_reference(
+        &input[..hidden],
+        &router_reference.h_norm,
+        &shared_reference.shared_out,
+        &router_reference.topk_idx,
+        &router_reference.topk_weight,
+        weights.gate_up_proj_w as usize,
+        int4.gate_up_proj_scale as usize,
+        int4.gate_up_proj_zero as usize,
+        weights.down_proj_w as usize,
+        int4.down_proj_scale as usize,
+        int4.down_proj_zero as usize,
+        hidden,
+        moe_intermediate,
+        top_k,
+        int4.group_size.max(0) as usize,
+    );
+
+    let topk_weight = &workspace[off_topk_val..off_topk_val + top_k];
+    let workspace_topk_idx: Vec<u32> = workspace[off_topk_idx..off_topk_idx + top_k]
+        .iter()
+        .map(|value| value.to_bits())
+        .collect();
+    let output_topk_idx = &output_idx[..top_k];
+    let expert_mid = &workspace[off_expert_mid..off_expert_mid + top_k * moe_intermediate];
+    let moe_out = &workspace[off_moe_out..off_moe_out + hidden];
+    let final_out = qwen36_bf16_slice_to_f32_vec(&output[..hidden]);
+
+    let (topk_weight_max_abs, topk_weight_argmax) =
+        qwen36_max_abs_delta(&router_reference.topk_weight, topk_weight);
+    let workspace_idx_match = router_reference.topk_idx == workspace_topk_idx;
+    let output_idx_match = router_reference.topk_idx.as_slice() == output_topk_idx;
+    let topk_idx_match = workspace_idx_match && output_idx_match;
+    let workspace_first_idx_mismatch =
+        qwen36_first_u32_mismatch(&router_reference.topk_idx, &workspace_topk_idx);
+    let output_first_idx_mismatch =
+        qwen36_first_u32_mismatch(&router_reference.topk_idx, output_topk_idx);
+    let topk_first_mismatch = match (workspace_first_idx_mismatch, output_first_idx_mismatch) {
+        (-1, -1) => -1,
+        (-1, output) => output,
+        (workspace, -1) => workspace,
+        (workspace, output) => workspace.min(output),
+    };
+
+    let (expert_mid_max_abs, expert_mid_argmax) =
+        qwen36_max_abs_delta(&routed_reference.expert_mid, expert_mid);
+    let (moe_out_max_abs, moe_out_argmax) =
+        qwen36_max_abs_delta(&routed_reference.moe_out, moe_out);
+    let (final_out_max_abs, final_out_argmax) =
+        qwen36_max_abs_delta(&routed_reference.final_out, &final_out);
+    let host_expert_mid_at_argmax = routed_reference
+        .expert_mid
+        .get(expert_mid_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let metal_expert_mid_at_argmax = expert_mid
+        .get(expert_mid_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let host_moe_out_at_argmax = routed_reference
+        .moe_out
+        .get(moe_out_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let metal_moe_out_at_argmax = moe_out.get(moe_out_argmax).copied().unwrap_or(f32::NAN);
+    let host_final_out_at_argmax = routed_reference
+        .final_out
+        .get(final_out_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let metal_final_out_at_argmax = final_out.get(final_out_argmax).copied().unwrap_or(f32::NAN);
+
+    eprintln!(
+        "[qwen36-decode-batch-routed-parity] call={} position={} cache_pos={} layer={} router_path={} phase_profile={} topk_idx_match={} workspace_idx_match={} output_idx_match={} topk_first_mismatch={} workspace_first_idx_mismatch={} output_first_idx_mismatch={} topk_weight_max_abs={:.8e} topk_weight_argmax={} expert_mid_max_abs={:.8e} expert_mid_argmax={} host_expert_mid_at_argmax={:.8e} metal_expert_mid_at_argmax={:.8e} moe_out_max_abs={:.8e} moe_out_argmax={} host_moe_out_at_argmax={:.8e} metal_moe_out_at_argmax={:.8e} final_out_max_abs={:.8e} final_out_argmax={} host_final_out_at_argmax={:.8e} metal_final_out_at_argmax={:.8e} host_idx={} workspace_idx={} output_idx={} host_w={} metal_w={}",
+        call,
+        position,
+        cache_pos,
+        layer_idx,
+        router_path,
+        phase_profile as u8,
+        topk_idx_match as u8,
+        workspace_idx_match as u8,
+        output_idx_match as u8,
+        topk_first_mismatch,
+        workspace_first_idx_mismatch,
+        output_first_idx_mismatch,
+        topk_weight_max_abs,
+        topk_weight_argmax,
+        expert_mid_max_abs,
+        expert_mid_argmax,
+        host_expert_mid_at_argmax,
+        metal_expert_mid_at_argmax,
+        moe_out_max_abs,
+        moe_out_argmax,
+        host_moe_out_at_argmax,
+        metal_moe_out_at_argmax,
+        final_out_max_abs,
+        final_out_argmax,
+        host_final_out_at_argmax,
+        metal_final_out_at_argmax,
+        qwen36_join_u32(&router_reference.topk_idx),
+        qwen36_join_u32(&workspace_topk_idx),
+        qwen36_join_u32(output_topk_idx),
+        qwen36_join_f32(&router_reference.topk_weight),
+        qwen36_join_f32(topk_weight),
     );
 
     Ok(())

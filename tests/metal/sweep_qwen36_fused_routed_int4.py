@@ -15,7 +15,7 @@ from typing import Any
 
 
 MODEL = "qwen3.6-35b-a3b"
-SCHEMA = "qwen36-fused-routed-int4-sweep-v18"
+SCHEMA = "qwen36-fused-routed-int4-sweep-v19"
 DEFAULT_MAX_FUSED_WALL_GPU_RATIO = 4.0
 DEFAULT_MAX_WAIT_GPU_RATIO = 4.0
 COARSE_BATCH_SERIAL_MODE = "full-stage5-router-batch"
@@ -455,6 +455,19 @@ def parse_decode_batch_shared_parity_taps(output: str) -> list[dict[str, Any]]:
     return rows
 
 
+def parse_decode_batch_routed_parity_taps(output: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for line in output.splitlines():
+        if not line.startswith("[qwen36-decode-batch-routed-parity]"):
+            continue
+        fields = {
+            key: parse_number(value)
+            for key, value in parse_key_values(line).items()
+        }
+        rows.append(fields)
+    return rows
+
+
 def parse_final_hidden_taps(output: str) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for line in output.splitlines():
@@ -588,6 +601,54 @@ def summarize_shared_parity_taps(
                 "shared_scalar_abs": tap.get("shared_scalar_abs"),
                 "shared_out_max_abs": tap.get("shared_out_max_abs"),
                 "shared_out_argmax": tap.get("shared_out_argmax"),
+            }
+            for tap in ranked[:20]
+        ],
+    }
+
+
+def summarize_routed_parity_taps(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    taps = [
+        tap
+        for row in rows
+        for tap in (row.get("decode_batch_routed_parity_taps") or [])
+    ]
+    paths = sorted({str(tap.get("router_path") or "-") for tap in taps})
+    mismatches = [tap for tap in taps if not bool(tap.get("topk_idx_match"))]
+
+    def max_field(name: str) -> float:
+        return max((float(tap.get(name) or 0.0) for tap in taps), default=0.0)
+
+    ranked = sorted(
+        taps,
+        key=lambda tap: max(
+            float(tap.get("expert_mid_max_abs") or 0.0),
+            float(tap.get("moe_out_max_abs") or 0.0),
+            float(tap.get("final_out_max_abs") or 0.0),
+            float(tap.get("topk_weight_max_abs") or 0.0),
+        ),
+        reverse=True,
+    )
+    return {
+        "tap_count": len(taps),
+        "mismatch_count": len(mismatches),
+        "paths": paths,
+        "max_topk_weight_abs": max_field("topk_weight_max_abs"),
+        "max_expert_mid_abs": max_field("expert_mid_max_abs"),
+        "max_moe_out_abs": max_field("moe_out_max_abs"),
+        "max_final_out_abs": max_field("final_out_max_abs"),
+        "worst_examples": [
+            {
+                "path": tap.get("router_path") or "-",
+                "layer": tap.get("layer"),
+                "topk_idx_match": tap.get("topk_idx_match"),
+                "topk_weight_max_abs": tap.get("topk_weight_max_abs"),
+                "expert_mid_max_abs": tap.get("expert_mid_max_abs"),
+                "expert_mid_argmax": tap.get("expert_mid_argmax"),
+                "moe_out_max_abs": tap.get("moe_out_max_abs"),
+                "moe_out_argmax": tap.get("moe_out_argmax"),
+                "final_out_max_abs": tap.get("final_out_max_abs"),
+                "final_out_argmax": tap.get("final_out_argmax"),
             }
             for tap in ranked[:20]
         ],
@@ -947,6 +1008,13 @@ def build_env_overrides(args: argparse.Namespace, mode: str) -> dict[str, str]:
             )
             overrides[
                 "SUPERSONIC_METAL_QWEN36_DECODE_BATCH_SHARED_STAGE5_PARITY_TAP_MAX_CALLS"
+            ] = str(max_calls)
+    if getattr(args, "routed_parity_tap", False):
+        overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH_ROUTED_STAGE5_PARITY_TAP"] = "1"
+        max_calls = getattr(args, "routed_parity_tap_max_calls", None)
+        if max_calls:
+            overrides[
+                "SUPERSONIC_METAL_QWEN36_DECODE_BATCH_ROUTED_STAGE5_PARITY_TAP_MAX_CALLS"
             ] = str(max_calls)
     if getattr(args, "decode_batch_route_snapshot", False):
         overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH_ROUTE_SNAPSHOT"] = "1"
@@ -1349,6 +1417,7 @@ def run_row(args: argparse.Namespace, prompt_id: str, prompt: str, mode: str) ->
             "router_parity_taps": parse_router_parity_taps(output),
             "shared_parity_taps": parse_shared_parity_taps(output),
             "decode_batch_shared_parity_taps": parse_decode_batch_shared_parity_taps(output),
+            "decode_batch_routed_parity_taps": parse_decode_batch_routed_parity_taps(output),
             "final_hidden_taps": parse_final_hidden_taps(output),
             "logits_taps": parse_logits_taps(output),
             "layer_output_taps": parse_layer_output_taps(output),
@@ -1379,6 +1448,7 @@ def run_row(args: argparse.Namespace, prompt_id: str, prompt: str, mode: str) ->
             "router_parity_taps": parse_router_parity_taps(output),
             "shared_parity_taps": parse_shared_parity_taps(output),
             "decode_batch_shared_parity_taps": parse_decode_batch_shared_parity_taps(output),
+            "decode_batch_routed_parity_taps": parse_decode_batch_routed_parity_taps(output),
             "final_hidden_taps": parse_final_hidden_taps(output),
             "logits_taps": parse_logits_taps(output),
             "layer_output_taps": parse_layer_output_taps(output),
@@ -2000,6 +2070,7 @@ def build_report(
         rows,
         "decode_batch_shared_parity_taps",
     )
+    summary["decode_batch_routed_parity"] = summarize_routed_parity_taps(rows)
     summary["final_hidden_tap"] = summarize_final_hidden_taps(rows)
     summary["logits_tap"] = summarize_logits_taps(rows)
     summary["layer_output_tap"] = summarize_layer_output_taps(rows)
@@ -2022,6 +2093,8 @@ def build_report(
         "router_parity_tap_max_calls": getattr(args, "router_parity_tap_max_calls", None),
         "shared_parity_tap": getattr(args, "shared_parity_tap", False),
         "shared_parity_tap_max_calls": getattr(args, "shared_parity_tap_max_calls", None),
+        "routed_parity_tap": getattr(args, "routed_parity_tap", False),
+        "routed_parity_tap_max_calls": getattr(args, "routed_parity_tap_max_calls", None),
         "decode_batch_route_snapshot": getattr(args, "decode_batch_route_snapshot", False),
         "promotion_thresholds": {
             "max_headline_ratio": args.promotion_max_headline_ratio,
@@ -2053,6 +2126,7 @@ def render_markdown(report: dict[str, Any]) -> str:
     router_parity = summary.get("router_parity") or {}
     shared_parity = summary.get("shared_parity") or {}
     decode_batch_shared_parity = summary.get("decode_batch_shared_parity") or {}
+    decode_batch_routed_parity = summary.get("decode_batch_routed_parity") or {}
     final_hidden_tap = summary.get("final_hidden_tap") or {}
     logits_tap = summary.get("logits_tap") or {}
     layer_output_tap = summary.get("layer_output_tap") or {}
@@ -2073,6 +2147,7 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- layer_output_tap: `{report.get('layer_output_tap', False)}`",
         f"- router_parity_tap: `{report.get('router_parity_tap', False)}`",
         f"- shared_parity_tap: `{report.get('shared_parity_tap', False)}`",
+        f"- routed_parity_tap: `{report.get('routed_parity_tap', False)}`",
         f"- decode_batch_route_snapshot: `{report.get('decode_batch_route_snapshot', False)}`",
         f"- generated_ids_match: `{summary['generated_ids_match']}`",
         f"- promotion_gate_passed: `{promotion_gate.get('passed', False)}`",
@@ -2086,6 +2161,9 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- shared_parity_max_out_abs: `{render_float(shared_parity.get('max_shared_out_abs'), 8)}`",
         f"- decode_batch_shared_parity_tap_count: `{decode_batch_shared_parity.get('tap_count', 0)}`",
         f"- decode_batch_shared_parity_max_out_abs: `{render_float(decode_batch_shared_parity.get('max_shared_out_abs'), 8)}`",
+        f"- decode_batch_routed_parity_tap_count: `{decode_batch_routed_parity.get('tap_count', 0)}`",
+        f"- decode_batch_routed_parity_max_moe_out_abs: `{render_float(decode_batch_routed_parity.get('max_moe_out_abs'), 8)}`",
+        f"- decode_batch_routed_parity_max_final_out_abs: `{render_float(decode_batch_routed_parity.get('max_final_out_abs'), 8)}`",
         f"- final_hidden_tap_count: `{final_hidden_tap.get('tap_count', 0)}`",
         f"- final_hidden_checksum_mismatches: `{final_hidden_tap.get('checksum_mismatch_count', 0)}`",
         f"- logits_tap_count: `{logits_tap.get('tap_count', 0)}`",
@@ -2448,6 +2526,56 @@ def render_markdown(report: dict[str, Any]) -> str:
                     metal_out=render_float(tap.get("metal_shared_out_at_argmax"), 8),
                 )
             )
+    decode_batch_routed_tap_rows: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for row in report["rows"]:
+        for tap in row.get("decode_batch_routed_parity_taps") or []:
+            decode_batch_routed_tap_rows.append((row, tap))
+    if decode_batch_routed_tap_rows:
+        ranked_routed = sorted(
+            decode_batch_routed_tap_rows,
+            key=lambda pair: max(
+                float(pair[1].get("expert_mid_max_abs") or 0.0),
+                float(pair[1].get("moe_out_max_abs") or 0.0),
+                float(pair[1].get("final_out_max_abs") or 0.0),
+                float(pair[1].get("topk_weight_max_abs") or 0.0),
+            ),
+            reverse=True,
+        )
+        lines.extend(
+            [
+                "",
+                "## Decode-Batch Routed Expert Parity Tap",
+                "",
+                "| Prompt | Mode | Router | Phase profile | Call | Position | Layer | TopK match | TopK weight max | Expert mid max | Expert mid idx | Host mid | Metal mid | MoE out max | MoE out idx | Host MoE | Metal MoE | Final out max | Final out idx | Host final | Metal final |",
+                "|:---|:---|:---|:---|---:|---:|---:|:---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+            ]
+        )
+        for row, tap in ranked_routed[:40]:
+            lines.append(
+                "| {prompt} | {mode} | {router} | {phase} | {call} | {position} | {layer} | {match} | {weight} | {mid} | {mid_idx} | {host_mid} | {metal_mid} | {moe} | {moe_idx} | {host_moe} | {metal_moe} | {final} | {final_idx} | {host_final} | {metal_final} |".format(
+                    prompt=row.get("prompt_id", ""),
+                    mode=row.get("mode", ""),
+                    router=tap.get("router_path", "-"),
+                    phase=str(bool(tap.get("phase_profile"))).lower(),
+                    call=tap.get("call", "-"),
+                    position=tap.get("position", "-"),
+                    layer=tap.get("layer", "-"),
+                    match=str(bool(tap.get("topk_idx_match"))).lower(),
+                    weight=render_float(tap.get("topk_weight_max_abs"), 8),
+                    mid=render_float(tap.get("expert_mid_max_abs"), 8),
+                    mid_idx=tap.get("expert_mid_argmax", "-"),
+                    host_mid=render_float(tap.get("host_expert_mid_at_argmax"), 8),
+                    metal_mid=render_float(tap.get("metal_expert_mid_at_argmax"), 8),
+                    moe=render_float(tap.get("moe_out_max_abs"), 8),
+                    moe_idx=tap.get("moe_out_argmax", "-"),
+                    host_moe=render_float(tap.get("host_moe_out_at_argmax"), 8),
+                    metal_moe=render_float(tap.get("metal_moe_out_at_argmax"), 8),
+                    final=render_float(tap.get("final_out_max_abs"), 8),
+                    final_idx=tap.get("final_out_argmax", "-"),
+                    host_final=render_float(tap.get("host_final_out_at_argmax"), 8),
+                    metal_final=render_float(tap.get("metal_final_out_at_argmax"), 8),
+                )
+            )
     final_hidden_comparisons = (summary.get("final_hidden_tap") or {}).get("comparisons") or []
     if final_hidden_comparisons:
         lines.extend(
@@ -2571,6 +2699,17 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         type=int,
         default=40,
         help="maximum shared-expert parity tap rows emitted by the runtime",
+    )
+    parser.add_argument(
+        "--routed-parity-tap",
+        action="store_true",
+        help="emit and parse Qwen3.6 decode-batch routed-expert parity rows",
+    )
+    parser.add_argument(
+        "--routed-parity-tap-max-calls",
+        type=int,
+        default=40,
+        help="maximum decode-batch routed-expert parity tap rows emitted by the runtime",
     )
     parser.add_argument(
         "--decode-batch-route-snapshot",

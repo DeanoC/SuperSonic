@@ -1504,6 +1504,46 @@ under the same smoke:
    already different, disable or parity-tap the batched expert gate/up and
    down/combine kernels before attempting another performance promotion.
 
+43. **Qwen3.6 decode-batch routed parity tap**
+   The fused-routed sweep is now schema `v19` and adds `--routed-parity-tap`,
+   which sets
+   `SUPERSONIC_METAL_QWEN36_DECODE_BATCH_ROUTED_STAGE5_PARITY_TAP=1`. The
+   decode-batch runtime reuses the batch-native FFN snapshots from section 40
+   and, when the routed tap is enabled, also snapshots the stage-5 FFN output
+   row plus `output_idx`. After the batch flush it emits
+   `[qwen36-decode-batch-routed-parity]` rows comparing the exact Metal
+   workspace against a host reference for top-k indices/weights, routed
+   `expert_mid`, combined `moe_out`, and final residual output.
+
+   The four-token Metal run used
+   `--modes default,full-stage5-router-simd-batch-shared-tiled
+   --max-new-tokens 4 --metal-profile --shared-parity-tap
+   --shared-parity-tap-max-calls 160 --downstream-parity-tap
+   --layer-output-tap --routed-parity-tap
+   --routed-parity-tap-max-calls 160`. It again reproduced the generated-ID
+   failure: default generated `[11,271,40,599]`, while the decode-batch
+   shared-tiled row generated `[11,353,599,264]`. The first layer-output
+   mismatch stayed at position `0`, layer `0`, phase `ffn`; final-hidden
+   checksums diverged from `gen_index=0`, and logits top-1 diverged at
+   `gen_index=1`.
+
+   The new routed tap captured `160` rows and found no top-k index mismatch.
+   Routed arithmetic was tight: `max_topk_weight_abs=9.77e-4`,
+   `max_expert_mid_abs=1.39e-4`, `max_moe_out_abs=4.88e-4`, and
+   `max_final_out_abs=9.77e-4`. The shared tap in the same run also stayed in
+   the same BF16-scale band (`max_shared_out_abs=2.44e-4`). This rules out a
+   gross routed-expert indexing or down/combine bug as the source of the layer
+   `0` FFN checksum mismatch.
+
+   The remaining correctness gap looks like deterministic BF16-scale output
+   drift that checksum-level taps classify as a mismatch and that later
+   generation steps amplify into token divergence. Before any more FFN
+   performance promotion work, the next diagnostic should add a numeric
+   default-versus-decode-batch layer-output delta tap for the first
+   mismatching FFN row, then decide whether the policy can accept a small
+   tolerance or whether the native path must be made bit-exact with the
+   default chained FFN rounding order.
+
 ## Sources
 
 - [Qwen/Qwen3.6-35B-A3B model card](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)
