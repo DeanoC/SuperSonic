@@ -15,7 +15,7 @@ from typing import Any
 
 
 MODEL = "qwen3.6-35b-a3b"
-SCHEMA = "qwen36-fused-routed-int4-sweep-v16"
+SCHEMA = "qwen36-fused-routed-int4-sweep-v17"
 DEFAULT_MAX_FUSED_WALL_GPU_RATIO = 4.0
 DEFAULT_MAX_WAIT_GPU_RATIO = 4.0
 COARSE_BATCH_SERIAL_MODE = "full-stage5-router-batch"
@@ -455,6 +455,32 @@ def parse_decode_batch_shared_parity_taps(output: str) -> list[dict[str, Any]]:
     return rows
 
 
+def parse_final_hidden_taps(output: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for line in output.splitlines():
+        if not line.startswith("[qwen36-final-hidden-tap]"):
+            continue
+        fields = {
+            key: parse_number(value)
+            for key, value in parse_key_values(line).items()
+        }
+        rows.append(fields)
+    return rows
+
+
+def parse_logits_taps(output: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for line in output.splitlines():
+        if not line.startswith("[qwen36-logits-tap]"):
+            continue
+        fields = {
+            key: parse_number(value)
+            for key, value in parse_key_values(line).items()
+        }
+        rows.append(fields)
+    return rows
+
+
 def parse_decode_batch_route_snapshots(output: str) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for line in output.splitlines():
@@ -552,6 +578,89 @@ def summarize_shared_parity_taps(
             }
             for tap in ranked[:20]
         ],
+    }
+
+
+def iter_downstream_taps(
+    rows: list[dict[str, Any]],
+    field: str,
+) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    return [
+        (row, tap)
+        for row in rows
+        for tap in (row.get(field) or [])
+    ]
+
+
+def downstream_tap_comparisons(
+    rows: list[dict[str, Any]],
+    field: str,
+) -> list[dict[str, Any]]:
+    baselines: dict[tuple[str, int], dict[str, Any]] = {}
+    for row, tap in iter_downstream_taps(rows, field):
+        if row.get("mode") != "default":
+            continue
+        key = (str(row.get("prompt_id", "")), int(tap.get("gen_index", 0)))
+        baselines[key] = tap
+
+    comparisons: list[dict[str, Any]] = []
+    for row, tap in iter_downstream_taps(rows, field):
+        if row.get("mode") == "default":
+            continue
+        key = (str(row.get("prompt_id", "")), int(tap.get("gen_index", 0)))
+        baseline = baselines.get(key)
+        comparison: dict[str, Any] = {
+            "prompt_id": key[0],
+            "mode": row.get("mode"),
+            "gen_index": key[1],
+            "path": tap.get("path", "-"),
+            "checksum": tap.get("checksum"),
+            "baseline_checksum": None if baseline is None else baseline.get("checksum"),
+            "checksum_match": None if baseline is None else tap.get("checksum") == baseline.get("checksum"),
+            "status": "missing_baseline" if baseline is None else "ok",
+        }
+        if field == "logits_taps":
+            comparison["top1_idx"] = tap.get("top1_idx")
+            comparison["baseline_top1_idx"] = None if baseline is None else baseline.get("top1_idx")
+            comparison["top1_match"] = (
+                None if baseline is None else tap.get("top1_idx") == baseline.get("top1_idx")
+            )
+        comparisons.append(comparison)
+    return comparisons
+
+
+def summarize_final_hidden_taps(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    taps = [tap for _, tap in iter_downstream_taps(rows, "final_hidden_taps")]
+    comparisons = downstream_tap_comparisons(rows, "final_hidden_taps")
+    mismatches = [item for item in comparisons if item.get("checksum_match") is False]
+    return {
+        "tap_count": len(taps),
+        "paths": sorted({str(tap.get("path") or "-") for tap in taps}),
+        "comparison_count": len(comparisons),
+        "checksum_mismatch_count": len(mismatches),
+        "first_mismatch": mismatches[0] if mismatches else None,
+        "comparisons": comparisons,
+    }
+
+
+def summarize_logits_taps(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    taps = [tap for _, tap in iter_downstream_taps(rows, "logits_taps")]
+    comparisons = downstream_tap_comparisons(rows, "logits_taps")
+    checksum_mismatches = [
+        item for item in comparisons if item.get("checksum_match") is False
+    ]
+    top1_mismatches = [
+        item for item in comparisons if item.get("top1_match") is False
+    ]
+    return {
+        "tap_count": len(taps),
+        "paths": sorted({str(tap.get("path") or "-") for tap in taps}),
+        "comparison_count": len(comparisons),
+        "checksum_mismatch_count": len(checksum_mismatches),
+        "top1_mismatch_count": len(top1_mismatches),
+        "first_checksum_mismatch": checksum_mismatches[0] if checksum_mismatches else None,
+        "first_top1_mismatch": top1_mismatches[0] if top1_mismatches else None,
+        "comparisons": comparisons,
     }
 
 
@@ -735,6 +844,8 @@ def build_env_overrides(args: argparse.Namespace, mode: str) -> dict[str, str]:
         overrides["SUPERSONIC_METAL_PROFILE"] = "1"
     if getattr(args, "metal_profile_phases", False):
         overrides["SUPERSONIC_METAL_PROFILE_QWEN36_FFN_PHASES"] = "1"
+    if getattr(args, "downstream_parity_tap", False):
+        overrides["SUPERSONIC_QWEN36_DOWNSTREAM_PARITY_TAP"] = "1"
     if getattr(args, "router_parity_tap", False):
         overrides["SUPERSONIC_METAL_QWEN36_FFN_ROUTER_STAGE5_PARITY_TAP"] = "1"
         max_calls = getattr(args, "router_parity_tap_max_calls", None)
@@ -1154,6 +1265,8 @@ def run_row(args: argparse.Namespace, prompt_id: str, prompt: str, mode: str) ->
             "router_parity_taps": parse_router_parity_taps(output),
             "shared_parity_taps": parse_shared_parity_taps(output),
             "decode_batch_shared_parity_taps": parse_decode_batch_shared_parity_taps(output),
+            "final_hidden_taps": parse_final_hidden_taps(output),
+            "logits_taps": parse_logits_taps(output),
             "decode_batch_route_snapshots": parse_decode_batch_route_snapshots(output),
             "output_tail": output_tail(output),
         }
@@ -1181,6 +1294,8 @@ def run_row(args: argparse.Namespace, prompt_id: str, prompt: str, mode: str) ->
             "router_parity_taps": parse_router_parity_taps(output),
             "shared_parity_taps": parse_shared_parity_taps(output),
             "decode_batch_shared_parity_taps": parse_decode_batch_shared_parity_taps(output),
+            "final_hidden_taps": parse_final_hidden_taps(output),
+            "logits_taps": parse_logits_taps(output),
             "decode_batch_route_snapshots": parse_decode_batch_route_snapshots(output),
             "fused_op_ms": None,
             "output_tail": output_tail(output),
@@ -1799,6 +1914,8 @@ def build_report(
         rows,
         "decode_batch_shared_parity_taps",
     )
+    summary["final_hidden_tap"] = summarize_final_hidden_taps(rows)
+    summary["logits_tap"] = summarize_logits_taps(rows)
     summary["decode_batch_route_snapshot"] = summarize_decode_batch_route_snapshots(rows)
     return {
         "schema": SCHEMA,
@@ -1812,6 +1929,7 @@ def build_report(
         "fast_profile_modes": [mode for mode in modes if not mode_emits_stage_timings(mode)],
         "metal_profile": args.metal_profile,
         "metal_profile_phases": getattr(args, "metal_profile_phases", False),
+        "downstream_parity_tap": getattr(args, "downstream_parity_tap", False),
         "router_parity_tap": getattr(args, "router_parity_tap", False),
         "router_parity_tap_max_calls": getattr(args, "router_parity_tap_max_calls", None),
         "shared_parity_tap": getattr(args, "shared_parity_tap", False),
@@ -1847,6 +1965,8 @@ def render_markdown(report: dict[str, Any]) -> str:
     router_parity = summary.get("router_parity") or {}
     shared_parity = summary.get("shared_parity") or {}
     decode_batch_shared_parity = summary.get("decode_batch_shared_parity") or {}
+    final_hidden_tap = summary.get("final_hidden_tap") or {}
+    logits_tap = summary.get("logits_tap") or {}
     route_snapshot = summary.get("decode_batch_route_snapshot") or {}
     decode_batch_coarse = summary.get("decode_batch_coarse") or {}
     deferred_phase = summary.get("decode_batch_deferred_phase") or {}
@@ -1860,6 +1980,7 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- fast_profile_modes: `{','.join(report.get('fast_profile_modes') or []) or '-'}`",
         f"- metal_profile: `{report['metal_profile']}`",
         f"- metal_profile_phases: `{report.get('metal_profile_phases', False)}`",
+        f"- downstream_parity_tap: `{report.get('downstream_parity_tap', False)}`",
         f"- router_parity_tap: `{report.get('router_parity_tap', False)}`",
         f"- shared_parity_tap: `{report.get('shared_parity_tap', False)}`",
         f"- decode_batch_route_snapshot: `{report.get('decode_batch_route_snapshot', False)}`",
@@ -1875,6 +1996,10 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- shared_parity_max_out_abs: `{render_float(shared_parity.get('max_shared_out_abs'), 8)}`",
         f"- decode_batch_shared_parity_tap_count: `{decode_batch_shared_parity.get('tap_count', 0)}`",
         f"- decode_batch_shared_parity_max_out_abs: `{render_float(decode_batch_shared_parity.get('max_shared_out_abs'), 8)}`",
+        f"- final_hidden_tap_count: `{final_hidden_tap.get('tap_count', 0)}`",
+        f"- final_hidden_checksum_mismatches: `{final_hidden_tap.get('checksum_mismatch_count', 0)}`",
+        f"- logits_tap_count: `{logits_tap.get('tap_count', 0)}`",
+        f"- logits_top1_mismatches: `{logits_tap.get('top1_mismatch_count', 0)}`",
         f"- decode_batch_route_snapshot_count: `{route_snapshot.get('snapshot_count', 0)}`",
         f"- decode_batch_route_snapshot_mismatches: `{route_snapshot.get('mismatch_count', 0)}`",
         "",
@@ -2231,6 +2356,53 @@ def render_markdown(report: dict[str, Any]) -> str:
                     metal_out=render_float(tap.get("metal_shared_out_at_argmax"), 8),
                 )
             )
+    final_hidden_comparisons = (summary.get("final_hidden_tap") or {}).get("comparisons") or []
+    if final_hidden_comparisons:
+        lines.extend(
+            [
+                "",
+                "## Final Hidden Tap",
+                "",
+                "| Prompt | Mode | Path | Gen | Checksum match | Baseline checksum | Candidate checksum |",
+                "|:---|:---|:---|---:|:---:|:---|:---|",
+            ]
+        )
+        for item in final_hidden_comparisons[:40]:
+            lines.append(
+                "| {prompt} | {mode} | {path} | {gen} | {match} | {base} | {checksum} |".format(
+                    prompt=item.get("prompt_id", ""),
+                    mode=item.get("mode", ""),
+                    path=item.get("path", "-"),
+                    gen=item.get("gen_index", "-"),
+                    match=str(item.get("checksum_match")).lower(),
+                    base=item.get("baseline_checksum") or "-",
+                    checksum=item.get("checksum") or "-",
+                )
+            )
+    logits_comparisons = (summary.get("logits_tap") or {}).get("comparisons") or []
+    if logits_comparisons:
+        lines.extend(
+            [
+                "",
+                "## Logits Tap",
+                "",
+                "| Prompt | Mode | Path | Gen | Checksum match | Top1 match | Baseline top1 | Candidate top1 |",
+                "|:---|:---|:---|---:|:---:|:---:|---:|---:|",
+            ]
+        )
+        for item in logits_comparisons[:40]:
+            lines.append(
+                "| {prompt} | {mode} | {path} | {gen} | {checksum_match} | {top1_match} | {base_top1} | {top1} |".format(
+                    prompt=item.get("prompt_id", ""),
+                    mode=item.get("mode", ""),
+                    path=item.get("path", "-"),
+                    gen=item.get("gen_index", "-"),
+                    checksum_match=str(item.get("checksum_match")).lower(),
+                    top1_match=str(item.get("top1_match")).lower(),
+                    base_top1=item.get("baseline_top1_idx", "-"),
+                    top1=item.get("top1_idx", "-"),
+                )
+            )
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -2250,6 +2422,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--metal-profile-phases",
         action="store_true",
         help="split Qwen3.6 FFN Metal profile runs into per-phase command buffers",
+    )
+    parser.add_argument(
+        "--downstream-parity-tap",
+        action="store_true",
+        help="emit final-hidden and lm-head logits signatures for default-vs-decode-batch comparison",
     )
     parser.add_argument(
         "--router-parity-tap",

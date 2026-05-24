@@ -1418,6 +1418,51 @@ under the same smoke:
    the divergence appears before FFN finalize, in residual accumulation, or at
    lm-head/sampling.
 
+41. **Qwen3.6 downstream hidden/logits parity tap**
+   The fused-routed sweep is now schema `v17` and adds
+   `--downstream-parity-tap`, which sets
+   `SUPERSONIC_QWEN36_DOWNSTREAM_PARITY_TAP=1`. The runner emits
+   `[qwen36-final-hidden-tap]` after final hidden materialization and
+   `[qwen36-logits-tap]` after lm-head logits are available. Both records carry
+   `step`, `gen_index`, `position`, `path`, `lm_head_folded`, element count, and
+   a stable checksum; the final-hidden row also reports norm/max/head values,
+   while the logits row reports top-1 and top-5. The sweep compares candidate
+   taps against the default row per prompt and generation index, then renders
+   JSON/Markdown summaries for checksum and logits top-1 drift.
+
+   The four-token Metal run used
+   `--modes default,full-stage5-router-simd-batch-shared-tiled
+   --max-new-tokens 4 --metal-profile --shared-parity-tap
+   --shared-parity-tap-max-calls 160 --downstream-parity-tap`. It reproduced
+   the known generated-ID divergence: default generated `[11,271,40,599]`,
+   while the decode-batch shared-tiled row generated `[11,353,599,264]`.
+   The batch-native shared parity tap stayed tight over `160` rows
+   (`max_shared_out_abs=2.44e-4`), so this run again does not implicate shared
+   expert arithmetic as the primary drift source.
+
+   The new downstream tap moved the failure boundary. Final-hidden checksums
+   mismatched for all four generated tokens, starting immediately at
+   `gen_index=0` (`d30ef3d258b59586` default versus `ec6f0d09ab0f9b73`
+   decode-batch). Logits checksums also mismatched from `gen_index=0`, but
+   top-1 still matched for the first sample (`11` versus `11`); top-1 diverged
+   at `gen_index=1` (`271` default versus `353` decode-batch) and stayed
+   divergent for the remaining samples (`40` versus `599`, then `599` versus
+   `264`). The profiled row remains a correctness probe, not a promotion
+   candidate: default measured `1059.0 ms` decode, while the decode-batch
+   shared-tiled row measured `1945.0 ms` decode with
+   `qwen36_decode_batch=1417.532 ms` and `command_buffer_wait=1506.119 ms`.
+
+   This rules out lm-head/sampling as the first place to look. The logits
+   decision changes only after the hidden vector has already diverged, and the
+   first-token top-1 match shows that checksum drift can be masked by the
+   margin. The next correctness probe should bisect the final-hidden producer:
+   capture per-token layer-output signatures around decode-batch finalize,
+   residual add, and final RMSNorm for the default chained path versus
+   `qwen36_decode_batch`. If layer outputs are clean until the last layer, focus
+   on final RMSNorm/residual materialization; if they diverge earlier, bisect
+   within the decode-batch FFN finalize and residual accumulation for the first
+   mismatching layer.
+
 ## Sources
 
 - [Qwen/Qwen3.6-35B-A3B model card](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)

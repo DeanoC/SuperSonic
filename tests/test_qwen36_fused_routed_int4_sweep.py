@@ -446,6 +446,17 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
         phase_default = script.build_env_overrides(phase_args, "default")
         self.assertEqual(phase_default["SUPERSONIC_METAL_PROFILE_QWEN36_FFN_PHASES"], "1")
 
+        downstream_args = Namespace(
+            metal_profile=False,
+            metal_profile_phases=False,
+            downstream_parity_tap=True,
+        )
+        downstream_default = script.build_env_overrides(downstream_args, "default")
+        self.assertEqual(
+            downstream_default["SUPERSONIC_QWEN36_DOWNSTREAM_PARITY_TAP"],
+            "1",
+        )
+
         tap_args = Namespace(
             metal_profile=False,
             metal_profile_phases=False,
@@ -1174,6 +1185,75 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
             report["summary"]["decode_batch_shared_parity"]["paths"],
             ["all_tiled"],
         )
+
+    def test_downstream_parity_taps_are_compared_and_rendered(self):
+        script = sweep_qwen36_fused_routed_int4
+        output = "\n".join(
+            [
+                "[qwen36-final-hidden-tap] step=0 gen_index=0 position=1 path=chained "
+                "lm_head_folded=0 elems=2048 checksum=aaaabbbbccccdddd "
+                "l2=1.25000000e+01 max_abs=2.50000000e+00 max_abs_idx=17 "
+                "head8=0001,0002",
+                "[qwen36-logits-tap] step=0 gen_index=0 position=1 path=chained "
+                "lm_head_folded=0 elems=151936 checksum=1111222233334444 "
+                "top1_idx=11 top1_val=3.50000000e+00 top5=11:3.5,7:2.0",
+            ]
+        )
+        candidate_output = "\n".join(
+            [
+                "[qwen36-final-hidden-tap] step=0 gen_index=0 position=1 path=decode_batch "
+                "lm_head_folded=0 elems=2048 checksum=ffffbbbbccccdddd "
+                "l2=1.26000000e+01 max_abs=2.60000000e+00 max_abs_idx=19 "
+                "head8=0001,0003",
+                "[qwen36-logits-tap] step=0 gen_index=0 position=1 path=decode_batch "
+                "lm_head_folded=0 elems=151936 checksum=9999222233334444 "
+                "top1_idx=353 top1_val=3.75000000e+00 top5=353:3.75,11:3.5",
+            ]
+        )
+
+        default = row("default")
+        default["final_hidden_taps"] = script.parse_final_hidden_taps(output)
+        default["logits_taps"] = script.parse_logits_taps(output)
+        candidate = row("full-stage5-router-simd-batch-shared-tiled")
+        candidate["final_hidden_taps"] = script.parse_final_hidden_taps(candidate_output)
+        candidate["logits_taps"] = script.parse_logits_taps(candidate_output)
+
+        args = Namespace(
+            max_new_tokens=1,
+            context_size=64,
+            metal_profile=False,
+            metal_profile_phases=False,
+            downstream_parity_tap=True,
+            router_parity_tap=False,
+            router_parity_tap_max_calls=40,
+            shared_parity_tap=False,
+            shared_parity_tap_max_calls=40,
+            decode_batch_route_snapshot=False,
+            promotion_max_headline_ratio=0.999,
+            promotion_max_ffn_ratio=0.999,
+            promotion_max_component_regression_ratio=1.10,
+            promotion_max_command_buffer_wait_ratio=1.05,
+            promotion_max_fused_wall_gpu_ratio=4.0,
+            promotion_max_wait_gpu_ratio=4.0,
+            promotion_require_profile=False,
+        )
+        report = script.build_report(
+            [default, candidate],
+            args,
+            ["default", "full-stage5-router-simd-batch-shared-tiled"],
+            "smoke",
+        )
+        md = script.render_markdown(report)
+
+        self.assertIn("downstream_parity_tap: `True`", md)
+        self.assertIn("final_hidden_checksum_mismatches: `1`", md)
+        self.assertIn("logits_top1_mismatches: `1`", md)
+        self.assertIn("## Final Hidden Tap", md)
+        self.assertIn("## Logits Tap", md)
+        self.assertFalse(
+            report["summary"]["final_hidden_tap"]["comparisons"][0]["checksum_match"]
+        )
+        self.assertFalse(report["summary"]["logits_tap"]["comparisons"][0]["top1_match"])
 
     def test_router_parity_tap_selection_keeps_each_path(self):
         script = sweep_qwen36_fused_routed_int4
