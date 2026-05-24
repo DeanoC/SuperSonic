@@ -15,10 +15,10 @@ from typing import Any
 
 
 MODEL = "qwen3.6-35b-a3b"
-SCHEMA = "qwen36-fused-routed-int4-sweep-v6"
+SCHEMA = "qwen36-fused-routed-int4-sweep-v7"
 DEFAULT_MAX_FUSED_WALL_GPU_RATIO = 4.0
 DEFAULT_MAX_WAIT_GPU_RATIO = 4.0
-BATCH_FAST_PROFILE_MODES = {"full-stage5-router-batch"}
+BATCH_FAST_PROFILE_MODES = {"full-stage5-router-batch", "full-stage5-router-batch-phases"}
 
 PROMPT_SETS: dict[str, list[tuple[str, str]]] = {
     "smoke": [("hello", "Hello")],
@@ -57,6 +57,10 @@ MODE_ALIASES: dict[str, str] = {
     "batch-router": "full-stage5-router-batch",
     "full-router-batch": "full-stage5-router-batch",
     "full-stage5-router-batch": "full-stage5-router-batch",
+    "router-batch-phases": "full-stage5-router-batch-phases",
+    "batch-router-phases": "full-stage5-router-batch-phases",
+    "full-router-batch-phases": "full-stage5-router-batch-phases",
+    "full-stage5-router-batch-phases": "full-stage5-router-batch-phases",
     "router-defer": "router-defer-wait",
     "router-defer-wait": "router-defer-wait",
     "defer-router-wait": "router-defer-wait",
@@ -71,6 +75,7 @@ FUSED_OP_NEEDLES = {
     "full-stage5": "qwen36_ffn_int4_stage5",
     "full-stage5-router": "qwen36_ffn_int4_stage5_with_router",
     "full-stage5-router-batch": "qwen36_ffn_int4_stage5_with_router",
+    "full-stage5-router-batch-phases": "qwen36_ffn_int4_stage5_with_router",
     "router-defer-wait": "qwen36_ffn_int4_stage5_with_router",
 }
 
@@ -98,6 +103,16 @@ FUSED_GPU_OP_PREFIXES = {
     ),
     "full-stage5-router-batch": (
         "command_buffer_gpu:qwen36_decode_batch",
+        "command_buffer_gpu:qwen36_ffn_int4_stage5_with_router",
+        "command_buffer_gpu:qwen36_ffn_int4_router_topk_stage5",
+        "command_buffer_gpu:qwen36_ffn_int4_shared_gate_up",
+        "command_buffer_gpu:qwen36_ffn_int4_shared_gate_scalar",
+        "command_buffer_gpu:qwen36_ffn_int4_shared_down",
+        "command_buffer_gpu:qwen36_ffn_int4_expert_gate_up_tiled_stage5",
+        "command_buffer_gpu:qwen36_ffn_int4_expert_down_finalize",
+    ),
+    "full-stage5-router-batch-phases": (
+        "command_buffer_gpu:qwen36_decode_batch_ffn",
         "command_buffer_gpu:qwen36_ffn_int4_stage5_with_router",
         "command_buffer_gpu:qwen36_ffn_int4_router_topk_stage5",
         "command_buffer_gpu:qwen36_ffn_int4_shared_gate_up",
@@ -277,6 +292,10 @@ def build_env_overrides(args: argparse.Namespace, mode: str) -> dict[str, str]:
     elif mode == "full-stage5-router-batch":
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"] = "1"
         overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH"] = "1"
+    elif mode == "full-stage5-router-batch-phases":
+        overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"] = "1"
+        overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH"] = "1"
+        overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH_PROFILE_PHASES"] = "1"
     elif mode == "router-defer-wait":
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"] = "1"
         overrides["SUPERSONIC_METAL_QWEN36_DEFER_FFN_ROUTER_STAGE5_WAIT"] = "1"
@@ -429,6 +448,13 @@ def fused_gpu_ms(row: dict[str, Any]) -> float | None:
     return profile_op_total_where(row.get("metal_profile"), matches)
 
 
+def decode_batch_phase_gpu_ms(row: dict[str, Any], phase: str) -> float | None:
+    return profile_op_total(
+        row.get("metal_profile"),
+        f"command_buffer_gpu:qwen36_decode_batch_{phase}",
+    )
+
+
 def safe_ratio(numerator: float | None, denominator: float | None) -> float | None:
     if numerator is None or denominator is None or denominator == 0:
         return None
@@ -467,6 +493,8 @@ def annotate_ffn_profile_fields(
         row["fused_op_ms"] = fused_op_ms(row)
         row["fused_wall_ms"] = fused_wall_ms(row)
         row["fused_gpu_ms"] = fused_gpu_ms(row)
+        row["decode_batch_linear_gpu_ms"] = decode_batch_phase_gpu_ms(row, "linear_attn")
+        row["decode_batch_ffn_gpu_ms"] = decode_batch_phase_gpu_ms(row, "ffn")
         row["fused_wall_gpu_ratio"] = safe_ratio(row["fused_wall_ms"], row["fused_gpu_ms"])
         row["wait_gpu_ratio"] = safe_ratio(row["command_buffer_wait_ms"], row["fused_gpu_ms"])
         row["ffn_attribution_class"] = classify_ffn_attribution(
@@ -964,8 +992,8 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- promotion_gate_passed_modes: `{','.join(promotion_gate.get('passed_modes') or []) or '-'}`",
         f"- ffn_gap_recommendation: `{ffn_gap.get('recommendation') or '-'}`",
         "",
-        "| Prompt | Mode | Status | IDs | Decode ms | FFN ms avg | Fused wall ms | Fused GPU ms | Wall/GPU | Wait/GPU | FFN class | Top Metal op | Top Metal ms | HAL ms | Wall s |",
-        "|:---|:---|:---|:---|---:|---:|---:|---:|---:|---:|:---|:---|---:|---:|---:|",
+        "| Prompt | Mode | Status | IDs | Decode ms | FFN ms avg | Fused wall ms | Fused GPU ms | Batch lin GPU ms | Batch FFN GPU ms | Wall/GPU | Wait/GPU | FFN class | Top Metal op | Top Metal ms | HAL ms | Wall s |",
+        "|:---|:---|:---|:---|---:|---:|---:|---:|---:|---:|---:|---:|:---|:---|---:|---:|---:|",
     ]
     for row in report["rows"]:
         result = row.get("result") or {}
@@ -973,7 +1001,7 @@ def render_markdown(report: dict[str, Any]) -> str:
         top_metal = top_profile_op(row.get("metal_profile"))
         hal_summary = (row.get("hal_profile") or {}).get("summary") or {}
         lines.append(
-            "| {prompt} | {mode} | {status} | {ids} | {decode} | {ffn} | {fused_wall} | {fused_gpu} | {wall_gpu} | {wait_gpu} | {ffn_class} | {top_op} | {top_ms} | {hal_ms} | {wall} |".format(
+            "| {prompt} | {mode} | {status} | {ids} | {decode} | {ffn} | {fused_wall} | {fused_gpu} | {batch_linear} | {batch_ffn} | {wall_gpu} | {wait_gpu} | {ffn_class} | {top_op} | {top_ms} | {hal_ms} | {wall} |".format(
                 prompt=row.get("prompt_id", ""),
                 mode=row.get("mode", ""),
                 status=row.get("status", ""),
@@ -982,6 +1010,8 @@ def render_markdown(report: dict[str, Any]) -> str:
                 ffn=render_float(chain.get("ffn_ms_avg")),
                 fused_wall=render_float(row.get("fused_wall_ms")),
                 fused_gpu=render_float(row.get("fused_gpu_ms")),
+                batch_linear=render_float(row.get("decode_batch_linear_gpu_ms")),
+                batch_ffn=render_float(row.get("decode_batch_ffn_gpu_ms")),
                 wall_gpu=render_float(row.get("fused_wall_gpu_ratio"), 2),
                 wait_gpu=render_float(row.get("wait_gpu_ratio"), 2),
                 ffn_class=row.get("ffn_attribution_class") or "-",

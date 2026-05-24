@@ -1052,6 +1052,38 @@ under the same smoke:
    batched FFN router/shared/expert kernels, and the linear stage-5 kernels
    that now coexist inside the large decode-batch command buffers.
 
+31. **Qwen3.6 decode-batch phase attribution**
+   The decode-batch probe now has a phase-attribution mode,
+   `full-stage5-router-batch-phases`, guarded by
+   `SUPERSONIC_METAL_QWEN36_DECODE_BATCH_PROFILE_PHASES=1` in addition to the
+   stage-5 router and decode-batch envs. This keeps the no-stage-timing fast
+   profile lane, but flushes the open Metal batch after each native
+   linear-attention stage and each native router-FFN stage with stable labels:
+   `command_buffer_gpu:qwen36_decode_batch_linear_attn` and
+   `command_buffer_gpu:qwen36_decode_batch_ffn`. The sweep JSON/Markdown now
+   records `decode_batch_linear_gpu_ms` and `decode_batch_ffn_gpu_ms` so the
+   coarse `qwen36_decode_batch` GPU blob can be split without enabling
+   per-dispatch `--emit-stage-timings`.
+
+   The same patch also makes the batch guard flush before any full-attention
+   host read, including the opt-in `attn_step_stage5_metal_host_into` direct
+   handoff path. That path is a direct residual handoff, not a fully native
+   full-attention kernel; it still computes the full-attention staged fallback
+   on the host and therefore must not read Metal-backed hidden while earlier
+   batched GPU work is pending.
+
+   The first phase-attribution smoke preserved default generated IDs
+   `[11, 271, 40, 599]`. The coarse batch row measured `482.1 ms/token` with
+   `command_buffer_gpu:qwen36_decode_batch=1632.789 ms`. The phase row measured
+   `472.5 ms/token`, and split that batched GPU time into
+   `decode_batch_ffn_gpu_ms=507.387` versus
+   `decode_batch_linear_gpu_ms=30.590`. Splitting increased command-buffer
+   waits to `288` calls and `1759.923 ms`, as expected for attribution mode,
+   but it proved the next arithmetic target is the FFN side of the batched
+   pipeline rather than linear stage-5. The next kernel PR should now focus on
+   reducing `qwen36_decode_batch_ffn` GPU time, with the phase mode kept as the
+   proof harness for each FFN sub-kernel change.
+
 ## Sources
 
 - [Qwen/Qwen3.6-35B-A3B model card](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)

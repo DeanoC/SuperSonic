@@ -153,6 +153,10 @@ fn qwen36_metal_decode_batch_enabled(
         && std::env::var_os("SUPERSONIC_METAL_QWEN36_FFN_ROUTER_STAGE5_PARITY_TAP").is_none()
 }
 
+fn qwen36_metal_decode_batch_profile_phases_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_QWEN36_DECODE_BATCH_PROFILE_PHASES").is_some()
+}
+
 fn flush_active_metal_decode_batch(label: &str) -> Result<bool> {
     if !kernel_ffi::prefill_ffi::metal_batch_is_active() {
         return Ok(false);
@@ -162,6 +166,19 @@ fn flush_active_metal_decode_batch(label: &str) -> Result<bool> {
     kernel_ffi::prefill_ffi::flush_metal_batch()
         .map_err(|e| anyhow!("{label} Metal batch flush: {e}"))?;
     Ok(true)
+}
+
+fn flush_metal_decode_batch_profile_phase(label: &str, profile_label: &str) -> Result<()> {
+    if !qwen36_metal_decode_batch_profile_phases_enabled()
+        || !kernel_ffi::prefill_ffi::metal_batch_is_active()
+    {
+        return Ok(());
+    }
+    kernel_ffi::prefill_ffi::set_metal_batch_label(profile_label)
+        .map_err(|e| anyhow!("{label} Metal batch label: {e}"))?;
+    kernel_ffi::prefill_ffi::flush_metal_batch()
+        .map_err(|e| anyhow!("{label} Metal batch flush: {e}"))?;
+    Ok(())
 }
 
 fn sync_metal_queue_for_host_boundary(backend: Backend, label: &str) -> Result<()> {
@@ -771,10 +788,10 @@ fn run_chained_decode_impl_with_cache_pos(
                 let t_k = std::time::Instant::now();
                 let use_metal_direct = output_buf.backend() == Backend::Metal
                     && metal_full_attn_decode_direct_enabled(&int4_ptrs);
-                if metal_decode_batch_active && !use_metal_direct {
+                if metal_decode_batch_active {
                     sync_metal_queue_for_host_boundary(
                         input_backend,
-                        "sync before full-attn host fallback",
+                        "sync before full-attn host read",
                     )?;
                 }
                 if use_metal_direct {
@@ -928,6 +945,12 @@ fn run_chained_decode_impl_with_cache_pos(
                 if options.accurate_stage_timings {
                     gpu_hal::sync(ordinal)
                         .context("sync_after_linear_step (accurate_stage_timings)")?;
+                }
+                if use_metal_direct {
+                    flush_metal_decode_batch_profile_phase(
+                        "profile flush after linear-attn",
+                        "qwen36_decode_batch_linear_attn",
+                    )?;
                 }
                 t_linear_attn += t_k.elapsed();
             }
@@ -1107,6 +1130,12 @@ fn run_chained_decode_impl_with_cache_pos(
         metal_queue_dirty = defer_layer_ffn_router || defer_layer_ffn_direct_gather;
         if options.accurate_stage_timings {
             gpu_hal::sync(ordinal).context("sync_after_ffn_step (accurate_stage_timings)")?;
+        }
+        if ffn_uses_router_native {
+            flush_metal_decode_batch_profile_phase(
+                "profile flush after ffn",
+                "qwen36_decode_batch_ffn",
+            )?;
         }
         t_ffn += t_k.elapsed();
 
