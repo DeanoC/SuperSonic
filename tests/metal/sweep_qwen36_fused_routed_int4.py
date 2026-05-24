@@ -39,6 +39,9 @@ MODE_ALIASES: dict[str, str] = {
     "packed": "packed",
     "direct": "direct-gather",
     "direct-gather": "direct-gather",
+    "direct-defer": "direct-defer-wait",
+    "direct-defer-wait": "direct-defer-wait",
+    "defer-direct-wait": "direct-defer-wait",
     "gpu-pack": "gpu-pack",
     "gpack": "gpu-pack",
     "full": "full-stage5",
@@ -53,11 +56,12 @@ MODE_ALIASES: dict[str, str] = {
     "router-defer-wait": "router-defer-wait",
     "defer-router-wait": "router-defer-wait",
 }
-DEFAULT_MODES = "default,direct-gather,gpu-pack,full-stage5,full-stage5-router,router-defer-wait"
+DEFAULT_MODES = "default,direct-gather,direct-defer-wait,gpu-pack,full-stage5,full-stage5-router,router-defer-wait"
 
 FUSED_OP_NEEDLES = {
     "packed": "qwen36_ffn_int4_expert_packed_stage5",
     "direct-gather": "qwen36_ffn_int4_expert_direct_gather_stage5",
+    "direct-defer-wait": "qwen36_ffn_int4_expert_direct_gather_stage5",
     "gpu-pack": "qwen36_ffn_int4_expert_gpu_pack_stage5",
     "full-stage5": "qwen36_ffn_int4_stage5",
     "full-stage5-router": "qwen36_ffn_int4_stage5_with_router",
@@ -67,6 +71,7 @@ FUSED_OP_NEEDLES = {
 FUSED_GPU_OP_PREFIXES = {
     "packed": ("command_buffer_gpu:qwen36_ffn_int4_expert_packed_stage5",),
     "direct-gather": ("command_buffer_gpu:qwen36_ffn_int4_expert_direct_gather_stage5",),
+    "direct-defer-wait": ("command_buffer_gpu:qwen36_ffn_int4_expert_direct_gather_stage5",),
     "gpu-pack": ("command_buffer_gpu:qwen36_ffn_int4_expert_gpu_pack",),
     "full-stage5": ("command_buffer_gpu:qwen36_ffn_int4_stage5",),
     "full-stage5-router": ("command_buffer_gpu:qwen36_ffn_int4_stage5_with_router",),
@@ -200,6 +205,9 @@ def build_env_overrides(args: argparse.Namespace, mode: str) -> dict[str, str]:
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_PACKED_STAGE5"] = "1"
     elif mode == "direct-gather":
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_DIRECT_GATHER_STAGE5"] = "1"
+    elif mode == "direct-defer-wait":
+        overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_DIRECT_GATHER_STAGE5"] = "1"
+        overrides["SUPERSONIC_METAL_QWEN36_DEFER_FFN_DIRECT_GATHER_STAGE5_WAIT"] = "1"
     elif mode == "gpu-pack":
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_PACKED_STAGE5"] = "1"
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_GPU_PACK_STAGE5"] = "1"

@@ -29,7 +29,9 @@ use std::ptr;
 use anyhow::{anyhow, Context, Result};
 use gpu_hal::{copy_d2h, memset_zeros, Backend, GpuBuffer, GpuError, ScalarType};
 use kernel_ffi::qwen36_moe::{
-    attn_step_launch, attn_step_stage5_metal_host_into, ffn_stage5_router_defer_wait_enabled,
+    attn_step_launch, attn_step_stage5_metal_host_into,
+    ffn_expert_direct_gather_defer_wait_enabled,
+    ffn_expert_direct_gather_stage5_metal_native_supported, ffn_stage5_router_defer_wait_enabled,
     ffn_stage5_router_metal_native_supported, ffn_step_launch, linear_step_launch,
     linear_step_stage5_metal_native_into, Qwen36MoeAttnStepInt4, Qwen36MoeAttnStepParams,
     Qwen36MoeAttnStepWeights, Qwen36MoeFfnStepInt4, Qwen36MoeFfnStepParams,
@@ -953,6 +955,15 @@ fn run_chained_decode_impl_with_cache_pos(
             }
             None => Qwen36MoeFfnStepInt4::disabled(),
         };
+        let defer_layer_ffn_direct_gather = output_buf.backend() == Backend::Metal
+            && !capture
+            && expert_prefetch.is_none()
+            && ffn_expert_direct_gather_defer_wait_enabled()
+            && ffn_expert_direct_gather_stage5_metal_native_supported(
+                params_stage5,
+                &ffn_weights,
+                &ffn_int4_ptrs,
+            );
         if let Some(prefetch) = expert_prefetch.as_mut() {
             prefetch(ExpertPrefetchPhase::Lookahead, layer_idx, &[]).with_context(|| {
                 format!("lookahead prefetch routed experts (layer {layer_idx})")
@@ -1001,7 +1012,7 @@ fn run_chained_decode_impl_with_cache_pos(
             &mut sync_buf,
         )
         .with_context(|| format!("ffn_step_launch (layer {layer_idx})"))?;
-        metal_queue_dirty = defer_layer_ffn_router;
+        metal_queue_dirty = defer_layer_ffn_router || defer_layer_ffn_direct_gather;
         if options.accurate_stage_timings {
             gpu_hal::sync(ordinal).context("sync_after_ffn_step (accurate_stage_timings)")?;
         }

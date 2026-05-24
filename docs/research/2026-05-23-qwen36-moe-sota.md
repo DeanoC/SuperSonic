@@ -918,6 +918,35 @@ under the same smoke:
    around the parity-preserving raw expert path, or fix the shared/router
    portions of `full-stage5*` before trying to promote those larger kernels.
 
+27. **Qwen3.6 direct-gather FFN deferred-wait probe**
+   The fused-routed INT4 sweep now includes `direct-defer-wait`, guarded by
+   `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_DIRECT_GATHER_STAGE5=1` plus
+   `SUPERSONIC_METAL_QWEN36_DEFER_FFN_DIRECT_GATHER_STAGE5_WAIT=1`. Unlike
+   the router-deferred probe, this mode keeps the linear-attention wait in
+   place because the host router/shared FFN setup still needs the attention
+   output. It only skips the final direct-gather command-buffer wait and lets
+   the runner synchronize before the next host full-attention read or final
+   hidden download.
+   The refreshed seven-mode smoke kept `direct-defer-wait` parity-clean:
+   default, `direct-gather`, `direct-defer-wait`, and `gpu-pack` all generated
+   `[11, 271, 40, 599]`; `full-stage5`, `full-stage5-router`, and
+   `router-defer-wait` still generated `[11, 353, 599, 264]`. The result is a
+   useful negative attribution point rather than a promotion candidate.
+   `direct-defer-wait` collapsed the measured direct-gather fused wall from
+   `692.446 ms` to `3.908 ms` while keeping comparable GPU time
+   (`33.621 ms`), and the FFN bucket fell to `34.389 ms/token` versus the
+   default `140.484`. But the wait moved into the surrounding chain:
+   headline decode regressed to `384.9 ms/token` from default `245.1`,
+   `linear_attn_ms_avg` rose to `243.713`, `command_buffer_wait` rose to
+   `1294.473 ms`, and `wait/GPU` worsened to `38.50`. The SOTA selector still
+   chooses FFN as the dominant default-lane bucket (`120.243 ms` median) and
+   keeps `sub_action=prototype_ffn_residency_or_submit_wait_path`, but pure
+   wait deferral is now ruled out for both the full-router and parity-clean
+   direct-gather paths. The next attempt should reduce the actual number or
+   granularity of waited Metal command buffers, or fix the larger
+   `full-stage5*` parity issue so shared/router/expert work can be encoded as
+   a single larger GPU pipeline.
+
 ## Sources
 
 - [Qwen/Qwen3.6-35B-A3B model card](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)

@@ -89,11 +89,12 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
 
         self.assertEqual(
             script.parse_modes(
-                "baseline,direct,gpu-pack,gpack,stage5,native-stage5,router,router-defer"
+                "baseline,direct,direct-defer,defer-direct-wait,gpu-pack,gpack,stage5,native-stage5,router,router-defer"
             ),
             [
                 "default",
                 "direct-gather",
+                "direct-defer-wait",
                 "gpu-pack",
                 "full-stage5",
                 "full-stage5-router",
@@ -106,6 +107,7 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
         args = Namespace(metal_profile=True, metal_profile_phases=False)
 
         direct = script.build_env_overrides(args, "direct-gather")
+        direct_defer = script.build_env_overrides(args, "direct-defer-wait")
         gpu_pack = script.build_env_overrides(args, "gpu-pack")
         full_stage5 = script.build_env_overrides(args, "full-stage5")
         full_stage5_router = script.build_env_overrides(args, "full-stage5-router")
@@ -121,6 +123,14 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
         self.assertNotIn(
             "SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_DIRECT_GATHER_STAGE5",
             default,
+        )
+        self.assertEqual(
+            direct_defer["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_DIRECT_GATHER_STAGE5"],
+            "1",
+        )
+        self.assertEqual(
+            direct_defer["SUPERSONIC_METAL_QWEN36_DEFER_FFN_DIRECT_GATHER_STAGE5_WAIT"],
+            "1",
         )
         self.assertEqual(
             gpu_pack["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_PACKED_STAGE5"],
