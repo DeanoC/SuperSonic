@@ -4414,6 +4414,33 @@ fn qwen36_emit_ffn_shared_stage5_parity_tap(
     let (shared_out_max_abs, shared_out_argmax) =
         qwen36_max_abs_delta(&reference.shared_out, shared_out);
     let shared_scalar_abs = (reference.shared_scalar - shared_scalar).abs();
+    let host_shared_gate_at_mid_argmax = reference
+        .shared_gate
+        .get(shared_mid_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let metal_shared_gate_at_mid_argmax = shared_gate
+        .get(shared_mid_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let host_shared_up_at_mid_argmax = reference
+        .shared_up
+        .get(shared_mid_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let metal_shared_up_at_mid_argmax = shared_up
+        .get(shared_mid_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let host_shared_mid_at_argmax = reference
+        .shared_mid
+        .get(shared_mid_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let metal_shared_mid_at_argmax = shared_mid
+        .get(shared_mid_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
     let host_shared_out_at_argmax = reference
         .shared_out
         .get(shared_out_argmax)
@@ -4425,7 +4452,7 @@ fn qwen36_emit_ffn_shared_stage5_parity_tap(
         .unwrap_or(f32::NAN);
 
     eprintln!(
-        "[qwen36-ffn-shared-parity] call={} layer={} shared_path={} shared_gate_max_abs={:.8e} shared_gate_argmax={} shared_up_max_abs={:.8e} shared_up_argmax={} shared_mid_max_abs={:.8e} shared_mid_argmax={} shared_scalar_abs={:.8e} host_shared_scalar={:.8e} metal_shared_scalar={:.8e} shared_out_max_abs={:.8e} shared_out_argmax={} host_shared_out_at_argmax={:.8e} metal_shared_out_at_argmax={:.8e}",
+        "[qwen36-ffn-shared-parity] call={} layer={} shared_path={} shared_gate_max_abs={:.8e} shared_gate_argmax={} shared_up_max_abs={:.8e} shared_up_argmax={} shared_mid_max_abs={:.8e} shared_mid_argmax={} host_shared_gate_at_mid_argmax={:.8e} metal_shared_gate_at_mid_argmax={:.8e} host_shared_up_at_mid_argmax={:.8e} metal_shared_up_at_mid_argmax={:.8e} host_shared_mid_at_argmax={:.8e} metal_shared_mid_at_argmax={:.8e} shared_scalar_abs={:.8e} host_shared_scalar={:.8e} metal_shared_scalar={:.8e} shared_out_max_abs={:.8e} shared_out_argmax={} host_shared_out_at_argmax={:.8e} metal_shared_out_at_argmax={:.8e}",
         call,
         layer_idx,
         qwen36_ffn_shared_stage5_path_label(),
@@ -4435,6 +4462,12 @@ fn qwen36_emit_ffn_shared_stage5_parity_tap(
         shared_up_argmax,
         shared_mid_max_abs,
         shared_mid_argmax,
+        host_shared_gate_at_mid_argmax,
+        metal_shared_gate_at_mid_argmax,
+        host_shared_up_at_mid_argmax,
+        metal_shared_up_at_mid_argmax,
+        host_shared_mid_at_argmax,
+        metal_shared_mid_at_argmax,
         shared_scalar_abs,
         reference.shared_scalar,
         shared_scalar,
@@ -4556,6 +4589,33 @@ pub fn emit_decode_batch_shared_stage5_parity_tap_from_host(
     let (shared_out_max_abs, shared_out_argmax) =
         qwen36_max_abs_delta(&shared_reference.shared_out, shared_out);
     let shared_scalar_abs = (shared_reference.shared_scalar - shared_scalar).abs();
+    let host_shared_gate_at_mid_argmax = shared_reference
+        .shared_gate
+        .get(shared_mid_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let metal_shared_gate_at_mid_argmax = shared_gate
+        .get(shared_mid_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let host_shared_up_at_mid_argmax = shared_reference
+        .shared_up
+        .get(shared_mid_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let metal_shared_up_at_mid_argmax = shared_up
+        .get(shared_mid_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let host_shared_mid_at_argmax = shared_reference
+        .shared_mid
+        .get(shared_mid_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let metal_shared_mid_at_argmax = shared_mid
+        .get(shared_mid_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
     let host_shared_out_at_argmax = shared_reference
         .shared_out
         .get(shared_out_argmax)
@@ -4567,7 +4627,7 @@ pub fn emit_decode_batch_shared_stage5_parity_tap_from_host(
         .unwrap_or(f32::NAN);
 
     eprintln!(
-        "[qwen36-decode-batch-shared-parity] call={} position={} cache_pos={} layer={} router_path={} phase_profile={} shared_path={} shared_gate_max_abs={:.8e} shared_gate_argmax={} shared_up_max_abs={:.8e} shared_up_argmax={} shared_mid_max_abs={:.8e} shared_mid_argmax={} shared_scalar_abs={:.8e} host_shared_scalar={:.8e} metal_shared_scalar={:.8e} shared_out_max_abs={:.8e} shared_out_argmax={} host_shared_out_at_argmax={:.8e} metal_shared_out_at_argmax={:.8e}",
+        "[qwen36-decode-batch-shared-parity] call={} position={} cache_pos={} layer={} router_path={} phase_profile={} shared_path={} shared_gate_max_abs={:.8e} shared_gate_argmax={} shared_up_max_abs={:.8e} shared_up_argmax={} shared_mid_max_abs={:.8e} shared_mid_argmax={} host_shared_gate_at_mid_argmax={:.8e} metal_shared_gate_at_mid_argmax={:.8e} host_shared_up_at_mid_argmax={:.8e} metal_shared_up_at_mid_argmax={:.8e} host_shared_mid_at_argmax={:.8e} metal_shared_mid_at_argmax={:.8e} shared_scalar_abs={:.8e} host_shared_scalar={:.8e} metal_shared_scalar={:.8e} shared_out_max_abs={:.8e} shared_out_argmax={} host_shared_out_at_argmax={:.8e} metal_shared_out_at_argmax={:.8e}",
         call,
         position,
         cache_pos,
@@ -4581,6 +4641,12 @@ pub fn emit_decode_batch_shared_stage5_parity_tap_from_host(
         shared_up_argmax,
         shared_mid_max_abs,
         shared_mid_argmax,
+        host_shared_gate_at_mid_argmax,
+        metal_shared_gate_at_mid_argmax,
+        host_shared_up_at_mid_argmax,
+        metal_shared_up_at_mid_argmax,
+        host_shared_mid_at_argmax,
+        metal_shared_mid_at_argmax,
         shared_scalar_abs,
         shared_reference.shared_scalar,
         shared_scalar,

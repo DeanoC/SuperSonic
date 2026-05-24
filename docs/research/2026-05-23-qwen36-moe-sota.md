@@ -1674,6 +1674,38 @@ under the same smoke:
    documented eval/tolerance promotion policy rather than silently relaxing the
    checksum gate.
 
+47. **Qwen3.6 shared-mid drift tap**
+   A precise-exp probe was tried in both Qwen3.6 Metal SiLU helpers and did not
+   move the measured layer-7 FFN mismatch. The probe was reverted rather than
+   keeping slower math on the hot path: the first mismatch stayed at position
+   `0`, layer `7`, phase `ffn`, index `1621`, with the same one-BF16-step
+   final hidden delta and the same shared-out residual attribution.
+
+   The fused-routed sweep is now schema `v23` and extends both
+   `[qwen36-ffn-shared-parity]` and
+   `[qwen36-decode-batch-shared-parity]` with host/Metal values at the
+   `shared_mid_argmax`: gate, up, and mid. The Markdown shared parity rows now
+   surface those values, and the residual attribution row reports the derived
+   gate-at-mid, up-at-mid, and mid deltas.
+
+   The refreshed Metal run used the same two-token layer-7 attribution command
+   and wrote
+   `/private/tmp/qwen36_shared_mid_tap_layer7_delta_2tok.{json,md}`. Generated
+   IDs still matched (`[11,271]`) and promotion remained blocked by the layer
+   checksum. For the first residual delta, `shared_out_argmax=1621` still
+   matched the layer-output delta index, with host shared-out `0.0123901367`
+   versus Metal `0.0123291016` (`shared_out_delta_at_argmax=-6.10351e-5`).
+   The new mid tap shows `shared_mid_argmax=13`: gate and up matched exactly at
+   that index, while mid differed only by `-6.0e-8` (`0.336338878` versus
+   `0.336338818`).
+
+   That rules out `exp` precision as the primary fix for the observed layer-7
+   row. The next useful correctness probe should target the shared-down
+   accumulation and final shared-out BF16 materialization for output index
+   `1621`, because a tiny shared-mid drift is being amplified or rounded into
+   the shared-out residual boundary rather than showing as a large gate/up/mid
+   mismatch.
+
 ## Sources
 
 - [Qwen/Qwen3.6-35B-A3B model card](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)

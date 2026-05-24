@@ -1142,6 +1142,12 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
             "shared_gate_max_abs=1.25000000e-01 shared_gate_argmax=17 "
             "shared_up_max_abs=6.25000000e-02 shared_up_argmax=19 "
             "shared_mid_max_abs=5.00000000e-01 shared_mid_argmax=23 "
+            "host_shared_gate_at_mid_argmax=1.00000000e+00 "
+            "metal_shared_gate_at_mid_argmax=1.12500000e+00 "
+            "host_shared_up_at_mid_argmax=2.00000000e+00 "
+            "metal_shared_up_at_mid_argmax=1.75000000e+00 "
+            "host_shared_mid_at_argmax=1.50000000e+00 "
+            "metal_shared_mid_at_argmax=1.00000000e+00 "
             "shared_scalar_abs=3.12500000e-02 "
             "host_shared_scalar=5.00000000e-01 metal_shared_scalar=5.31250000e-01 "
             "shared_out_max_abs=2.50000000e-01 shared_out_argmax=33 "
@@ -1155,6 +1161,8 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
         self.assertEqual(taps[0]["layer"], 5)
         self.assertEqual(taps[0]["shared_path"], "gate_up_tiled")
         self.assertAlmostEqual(taps[0]["shared_mid_max_abs"], 0.5)
+        self.assertAlmostEqual(taps[0]["host_shared_mid_at_argmax"], 1.5)
+        self.assertAlmostEqual(taps[0]["metal_shared_mid_at_argmax"], 1.0)
         self.assertEqual(taps[0]["shared_out_argmax"], 33)
 
         args = Namespace(
@@ -1202,6 +1210,12 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
             "shared_gate_max_abs=1.25000000e-01 shared_gate_argmax=17 "
             "shared_up_max_abs=6.25000000e-02 shared_up_argmax=19 "
             "shared_mid_max_abs=5.00000000e-01 shared_mid_argmax=23 "
+            "host_shared_gate_at_mid_argmax=1.00000000e+00 "
+            "metal_shared_gate_at_mid_argmax=1.12500000e+00 "
+            "host_shared_up_at_mid_argmax=2.00000000e+00 "
+            "metal_shared_up_at_mid_argmax=1.75000000e+00 "
+            "host_shared_mid_at_argmax=1.50000000e+00 "
+            "metal_shared_mid_at_argmax=1.00000000e+00 "
             "shared_scalar_abs=3.12500000e-02 "
             "host_shared_scalar=5.00000000e-01 metal_shared_scalar=5.31250000e-01 "
             "shared_out_max_abs=2.50000000e-01 shared_out_argmax=33 "
@@ -1216,6 +1230,8 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
         self.assertEqual(taps[0]["router_path"], "simd")
         self.assertEqual(taps[0]["phase_profile"], 1)
         self.assertAlmostEqual(taps[0]["shared_out_max_abs"], 0.25)
+        self.assertAlmostEqual(taps[0]["host_shared_gate_at_mid_argmax"], 1.0)
+        self.assertAlmostEqual(taps[0]["metal_shared_up_at_mid_argmax"], 1.75)
 
         args = Namespace(
             max_new_tokens=2,
@@ -1560,6 +1576,13 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
             {
                 "position": 0,
                 "layer": 7,
+                "shared_mid_argmax": 23,
+                "host_shared_gate_at_mid_argmax": 1.0,
+                "metal_shared_gate_at_mid_argmax": 1.125,
+                "host_shared_up_at_mid_argmax": 2.0,
+                "metal_shared_up_at_mid_argmax": 1.75,
+                "host_shared_mid_at_argmax": 1.5,
+                "metal_shared_mid_at_argmax": 1.0,
                 "shared_out_argmax": 1,
                 "shared_out_max_abs": 0.0000610351562,
                 "host_shared_out_at_argmax": 0.0123901367,
@@ -1624,6 +1647,9 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
         self.assertTrue(first["final_out_argmax_matches_delta"])
         self.assertEqual(first["source"], "shared_out_residual_rounding_boundary")
         self.assertAlmostEqual(first["shared_out_delta_at_argmax"], -0.0000610351)
+        self.assertAlmostEqual(first["shared_gate_delta_at_mid_argmax"], 0.125)
+        self.assertAlmostEqual(first["shared_up_delta_at_mid_argmax"], -0.25)
+        self.assertAlmostEqual(first["shared_mid_delta_at_argmax"], -0.5)
         self.assertIn("ffn_residual_delta_first_source: `shared_out_residual_rounding_boundary`", md)
         self.assertIn("## FFN Residual Delta Attribution", md)
 
