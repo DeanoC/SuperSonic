@@ -568,7 +568,10 @@ a throughput win by itself. The sweep harness writes
 `target/qwen36_mtp_acceptance_sweep.json` and
 `target/qwen36_mtp_acceptance_sweep.md`, then aggregates measured rows across a
 small prompt suite so K=1 promotion is based on prompt breadth rather than a
-single acceptance sample. The first two-prompt Metal smoke measured both rows:
+single acceptance sample. It also reports a non-fatal `promotion_gate` summary
+using aggregate acceptance and target steps per emitted token; add
+`--metal-profile` to retain parsed Metal/HAL attribution rows for each prompt.
+The first two-prompt Metal smoke measured both rows:
 profiling accepted 0/2 drafts, coding accepted 1/2 drafts, aggregate acceptance
 was 25.0%, and aggregate `target_steps_per_emitted` stayed 1.0. That keeps the
 path useful for telemetry, but not ready for Metal policy promotion.

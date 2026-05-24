@@ -58,6 +58,31 @@ class Qwen36MtpAcceptanceSweepTests(unittest.TestCase):
         self.assertAlmostEqual(summary["acceptance_rate"], 4 / 6)
         self.assertEqual(summary["target_steps"], 9)
         self.assertAlmostEqual(summary["target_steps_per_emitted"], 9 / 8)
+        self.assertFalse(summary["promotion_gate"]["passed"])
+        self.assertIn("policy_blocked_rows", summary["promotion_gate"]["failures"])
+        self.assertIn(
+            "target_steps_per_emitted_above_threshold",
+            summary["promotion_gate"]["failures"],
+        )
+
+    def test_promotion_gate_can_pass_when_all_prompts_are_efficient(self):
+        rows = [
+            {
+                "status": "measured",
+                "wall_seconds": 10.0,
+                "acceptance": {
+                    "drafted_tokens": 4,
+                    "accepted_tokens": 3,
+                    "emitted_tokens": 8,
+                    "base_steps": 6,
+                    "replay_steps": 1,
+                },
+            }
+        ]
+
+        summary = sweep_qwen36_mtp_acceptance.build_summary(rows)
+
+        self.assertTrue(summary["promotion_gate"]["passed"])
 
     def test_render_markdown_includes_prompt_rows(self):
         rows = [
@@ -80,6 +105,11 @@ class Qwen36MtpAcceptanceSweepTests(unittest.TestCase):
                     "replay_steps": 0,
                     "target_steps_per_emitted": 1.0,
                 },
+                "metal_profile": {
+                    "summary": {"total_ms": 12.0},
+                    "entries": [{"op": "qwen36_mtp_verify", "total_ms": 10.0}],
+                },
+                "hal_profile": {"summary": {"total_ms": 3.0}, "entries": []},
             }
         ]
         report = sweep_qwen36_mtp_acceptance.build_report(
@@ -93,7 +123,11 @@ class Qwen36MtpAcceptanceSweepTests(unittest.TestCase):
         md = sweep_qwen36_mtp_acceptance.render_markdown(report)
 
         self.assertIn("Qwen3.6 MTP Acceptance Sweep", md)
-        self.assertIn("| coding | measured | 2 | 1 | 50.0% | 3 | 1.000 | 24.0 |", md)
+        self.assertIn("promotion_gate_passed", md)
+        self.assertIn(
+            "| coding | measured | 2 | 1 | 50.0% | 3 | 1.000 | qwen36_mtp_verify | 10.000 | 3.000 | 24.0 |",
+            md,
+        )
 
     def test_select_prompts_prefers_custom_prompts(self):
         args = type(

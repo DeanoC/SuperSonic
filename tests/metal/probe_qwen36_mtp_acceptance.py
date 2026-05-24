@@ -20,7 +20,7 @@ from typing import Any
 
 
 MODEL = "qwen3.6-35b-a3b"
-SCHEMA = "qwen36-moe-mtp-acceptance-probe-v1"
+SCHEMA = "qwen36-moe-mtp-acceptance-probe-v2"
 POLICY_BLOCKED_NEEDLE = "does not wire the MTP/speculative decode path yet"
 METAL_EXPERIMENT_ENV = "SUPERSONIC_QWEN36_METAL_MTP_EXPERIMENT"
 ACCEPTANCE_PROFILE_ENV = "SUPERSONIC_QWEN36_MTP_ACCEPTANCE_PROFILE"
@@ -56,6 +56,44 @@ def parse_key_values(line: str) -> dict[str, str]:
         key, raw = part.split("=", 1)
         values[key] = raw.rstrip(",)")
     return values
+
+
+def parse_number(raw: str) -> int | float | str:
+    try:
+        if any(ch in raw for ch in ".eE"):
+            return float(raw)
+        return int(raw)
+    except ValueError:
+        return raw
+
+
+def parse_profile(output: str, summary_prefix: str, op_prefix: str) -> dict[str, Any] | None:
+    summary_lines = [line for line in output.splitlines() if line.startswith(summary_prefix)]
+    if not summary_lines:
+        return None
+    summary = {
+        key: parse_number(value)
+        for key, value in parse_key_values(summary_lines[-1]).items()
+        if key not in {"op", "path"}
+    }
+    entries: list[dict[str, Any]] = []
+    for line in output.splitlines():
+        if not line.startswith(op_prefix):
+            continue
+        fields = parse_key_values(line)
+        entry: dict[str, Any] = {
+            "op": fields.get("op"),
+            "calls": int(fields.get("calls", "0")),
+            "mean_ms": float(fields.get("mean_ms", "0")),
+            "total_ms": float(fields.get("total_ms", "0")),
+            "max_ms": float(fields.get("max_ms", "0")),
+        }
+        if "path" in fields:
+            entry["path"] = fields["path"]
+        if "total_bytes" in fields:
+            entry["total_bytes"] = int(fields["total_bytes"])
+        entries.append(entry)
+    return {"summary": summary, "entries": entries}
 
 
 def parse_mtp_acceptance(output: str) -> dict[str, Any]:
@@ -109,14 +147,25 @@ def build_report(
         "env_overrides": env_overrides,
         "acceptance": acceptance,
         "policy_blocked": status == "policy_blocked",
+        "metal_profile": parse_profile(output, "[metal-profile]", "[metal-profile-op]"),
+        "hal_profile": parse_profile(output, "[hal-profile]", "[hal-profile-op]"),
     }
     if status != "measured":
         report["output_tail"] = output[-5000:]
     return report
 
 
+def top_profile_op(profile: dict[str, Any] | None) -> dict[str, Any]:
+    if not profile:
+        return {}
+    entries = profile.get("entries") or []
+    return max(entries, key=lambda item: item.get("total_ms") or 0.0) if entries else {}
+
+
 def render_markdown(report: dict[str, Any]) -> str:
     acceptance = report.get("acceptance") or {}
+    top_metal = top_profile_op(report.get("metal_profile"))
+    hal_total = ((report.get("hal_profile") or {}).get("summary") or {}).get("total_ms")
     lines = [
         "# Qwen3.6 MTP Acceptance Probe",
         "",
@@ -153,6 +202,23 @@ def render_markdown(report: dict[str, Any]) -> str:
         )
     else:
         lines.extend(["No acceptance row was captured.", ""])
+    if top_metal or hal_total is not None:
+        lines.extend(
+            [
+                "| Top Metal op | Top Metal ms | HAL ms |",
+                "|:---|---:|---:|",
+                "| {op} | {metal_ms} | {hal_ms} |".format(
+                    op=top_metal.get("op") or "-",
+                    metal_ms=(
+                        f"{top_metal.get('total_ms'):.3f}"
+                        if top_metal.get("total_ms") is not None
+                        else "-"
+                    ),
+                    hal_ms=f"{hal_total:.3f}" if hal_total is not None else "-",
+                ),
+                "",
+            ]
+        )
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -245,6 +311,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help=f"set {METAL_EXPERIMENT_ENV}=1 to run the env-gated Metal K=1 path",
     )
     parser.add_argument(
+        "--metal-profile",
+        action="store_true",
+        help="set SUPERSONIC_METAL_PROFILE=1 and retain parsed Metal/HAL profile rows",
+    )
+    parser.add_argument(
         "--log",
         type=Path,
         help="Parse an existing combined stdout/stderr log instead of running supersonic.",
@@ -277,6 +348,8 @@ def build_env_overrides(args: argparse.Namespace) -> dict[str, str]:
         overrides[BATCHED_PREFILL_ENV] = "0"
     if args.metal_experiment:
         overrides[METAL_EXPERIMENT_ENV] = "1"
+    if getattr(args, "metal_profile", False):
+        overrides["SUPERSONIC_METAL_PROFILE"] = "1"
     return overrides
 
 

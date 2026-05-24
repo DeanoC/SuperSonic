@@ -997,9 +997,12 @@ still required one target-model step. `tests/metal/sweep_qwen36_mtp_acceptance.p
 extends that one-prompt result across a smoke or comparison prompt suite and
 writes aggregate `drafted_tokens`, `accepted_tokens`, `acceptance_rate`, and
 `target_steps_per_emitted` rows to
-`target/qwen36_mtp_acceptance_sweep.{json,md}`. The first smoke sweep completed
-both rows in 34.7s: the profiling prompt accepted 0/2 drafts, the coding prompt
-accepted 1/2 drafts, aggregate acceptance was 25.0%, and aggregate
+`target/qwen36_mtp_acceptance_sweep.{json,md}`. The sweep now reports a
+machine-readable `promotion_gate` using aggregate acceptance and target-model
+steps per emitted token, and `--metal-profile` preserves parsed Metal/HAL
+attribution rows for each prompt. The first smoke sweep completed both rows in
+34.7s: the profiling prompt accepted 0/2 drafts, the coding prompt accepted
+1/2 drafts, aggregate acceptance was 25.0%, and aggregate
 `target_steps_per_emitted` remained 1.0. This keeps K=1 as an instrumentation
 path, not a supported-speed path.
 `tests/metal/probe_qwen36_static_topn.py` is the first static resident-table

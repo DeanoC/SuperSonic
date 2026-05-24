@@ -501,7 +501,9 @@ under the same smoke:
    before changing Metal policy again. `tests/metal/sweep_qwen36_mtp_acceptance.py`
    runs the same env-gated path across profiling, coding, reasoning, and summary
    prompts, aggregates accepted/drafted tokens and target steps per emitted
-   token, and records policy-blocked rows when the experiment gate is absent.
+   token, records policy-blocked rows when the experiment gate is absent, and
+   now emits a `promotion_gate` summary plus optional Metal/HAL profile rows
+   when `--metal-profile` is used.
    The first Metal smoke sweep measured 2/2 prompts in 34.7s with aggregate
    `accepted_tokens=1`, `drafted_tokens=4`, `acceptance_rate=0.25`, and
    `target_steps_per_emitted=1.0`; the profiling prompt accepted 0/2 drafts and
