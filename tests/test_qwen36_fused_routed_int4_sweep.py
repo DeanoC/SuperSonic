@@ -463,11 +463,31 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
             metal_profile_phases=False,
             downstream_parity_tap=False,
             layer_output_tap=True,
+            layer_output_delta_tap=True,
+            layer_output_delta_position=0,
+            layer_output_delta_layer=0,
+            layer_output_delta_phase="ffn",
         )
         layer_output_default = script.build_env_overrides(layer_output_args, "default")
         self.assertEqual(
             layer_output_default["SUPERSONIC_QWEN36_LAYER_OUTPUT_TAP"],
             "1",
+        )
+        self.assertEqual(
+            layer_output_default["SUPERSONIC_QWEN36_LAYER_OUTPUT_DELTA_TAP"],
+            "1",
+        )
+        self.assertEqual(
+            layer_output_default["SUPERSONIC_QWEN36_LAYER_OUTPUT_DELTA_TAP_POSITION"],
+            "0",
+        )
+        self.assertEqual(
+            layer_output_default["SUPERSONIC_QWEN36_LAYER_OUTPUT_DELTA_TAP_LAYER"],
+            "0",
+        )
+        self.assertEqual(
+            layer_output_default["SUPERSONIC_QWEN36_LAYER_OUTPUT_DELTA_TAP_PHASE"],
+            "ffn",
         )
 
         tap_args = Namespace(
@@ -1426,6 +1446,72 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
             report["summary"]["layer_output_tap"]["first_mismatch"]["phase"],
             "ffn",
         )
+
+    def test_layer_output_delta_taps_compute_numeric_delta(self):
+        script = sweep_qwen36_fused_routed_int4
+        output = (
+            "[qwen36-layer-output-delta-tap] call=0 position=0 cache_pos=0 "
+            "path=chained phase_profile=0 layer=0 phase=ffn elems=3 "
+            "checksum=aaaabbbbccccdddd bf16=3f80,4000,c000\n"
+        )
+        candidate_output = (
+            "[qwen36-layer-output-delta-tap] call=0 position=0 cache_pos=0 "
+            "path=decode_batch phase_profile=0 layer=0 phase=ffn elems=3 "
+            "checksum=ffffbbbbccccdddd bf16=3f80,4040,c000\n"
+        )
+
+        default = row("default")
+        default["layer_output_delta_taps"] = script.parse_layer_output_delta_taps(output)
+        candidate = row("full-stage5-router-simd-batch-shared-tiled")
+        candidate["layer_output_delta_taps"] = script.parse_layer_output_delta_taps(
+            candidate_output
+        )
+
+        args = Namespace(
+            max_new_tokens=1,
+            context_size=64,
+            metal_profile=False,
+            metal_profile_phases=False,
+            downstream_parity_tap=False,
+            layer_output_tap=False,
+            layer_output_delta_tap=True,
+            layer_output_delta_position=0,
+            layer_output_delta_layer=0,
+            layer_output_delta_phase="ffn",
+            router_parity_tap=False,
+            router_parity_tap_max_calls=40,
+            shared_parity_tap=False,
+            shared_parity_tap_max_calls=40,
+            routed_parity_tap=False,
+            routed_parity_tap_max_calls=40,
+            decode_batch_route_snapshot=False,
+            promotion_max_headline_ratio=0.999,
+            promotion_max_ffn_ratio=0.999,
+            promotion_max_component_regression_ratio=1.10,
+            promotion_max_command_buffer_wait_ratio=1.05,
+            promotion_max_fused_wall_gpu_ratio=4.0,
+            promotion_max_wait_gpu_ratio=4.0,
+            promotion_require_profile=False,
+        )
+        report = script.build_report(
+            [default, candidate],
+            args,
+            ["default", "full-stage5-router-simd-batch-shared-tiled"],
+            "smoke",
+        )
+        md = script.render_markdown(report)
+        summary = report["summary"]["layer_output_delta_tap"]
+        comparison = summary["comparisons"][0]
+
+        self.assertIn("layer_output_delta_tap: `True`", md)
+        self.assertIn("layer_output_delta_tap_count: `2`", md)
+        self.assertIn("layer_output_delta_max_abs: `1.00000000`", md)
+        self.assertIn("## Layer Output Delta Tap", md)
+        self.assertFalse(comparison["checksum_match"])
+        self.assertEqual(comparison["max_abs_delta_idx"], 1)
+        self.assertAlmostEqual(comparison["max_abs_delta"], 1.0)
+        self.assertEqual(comparison["max_ulp_delta"], 64)
+        self.assertEqual(comparison["differing_elems"], 1)
 
     def test_router_parity_tap_selection_keeps_each_path(self):
         script = sweep_qwen36_fused_routed_int4

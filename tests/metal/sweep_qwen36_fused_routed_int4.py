@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import re
+import struct
 import subprocess
 import sys
 import time
@@ -15,7 +16,7 @@ from typing import Any
 
 
 MODEL = "qwen3.6-35b-a3b"
-SCHEMA = "qwen36-fused-routed-int4-sweep-v19"
+SCHEMA = "qwen36-fused-routed-int4-sweep-v20"
 DEFAULT_MAX_FUSED_WALL_GPU_RATIO = 4.0
 DEFAULT_MAX_WAIT_GPU_RATIO = 4.0
 COARSE_BATCH_SERIAL_MODE = "full-stage5-router-batch"
@@ -507,6 +508,19 @@ def parse_layer_output_taps(output: str) -> list[dict[str, Any]]:
     return rows
 
 
+def parse_layer_output_delta_taps(output: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for line in output.splitlines():
+        if not line.startswith("[qwen36-layer-output-delta-tap]"):
+            continue
+        fields = {
+            key: parse_number(value)
+            for key, value in parse_key_values(line).items()
+        }
+        rows.append(fields)
+    return rows
+
+
 def parse_decode_batch_route_snapshots(output: str) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for line in output.splitlines():
@@ -807,6 +821,157 @@ def summarize_layer_output_taps(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def bf16_hex_to_bits(raw: Any) -> list[int]:
+    if raw is None:
+        return []
+    return [
+        int(part, 16)
+        for part in str(raw).split(",")
+        if part
+    ]
+
+
+def bf16_bits_to_f32(bits: int) -> float:
+    raw = (bits & 0xFFFF) << 16
+    return struct.unpack(">f", raw.to_bytes(4, "big"))[0]
+
+
+def bf16_order_key(bits: int) -> int:
+    bits &= 0xFFFF
+    if bits & 0x8000:
+        return (~bits) & 0xFFFF
+    return bits | 0x8000
+
+
+def compare_bf16_hex_values(expected_raw: Any, got_raw: Any) -> dict[str, Any]:
+    expected_bits = bf16_hex_to_bits(expected_raw)
+    got_bits = bf16_hex_to_bits(got_raw)
+    limit = min(len(expected_bits), len(got_bits))
+    max_abs_delta = 0.0
+    max_abs_idx = 0
+    max_ulp_delta = 0
+    max_ulp_idx = 0
+    differing_elems = abs(len(expected_bits) - len(got_bits))
+    for idx in range(limit):
+        a_bits = expected_bits[idx]
+        b_bits = got_bits[idx]
+        if a_bits != b_bits:
+            differing_elems += 1
+        delta = abs(bf16_bits_to_f32(a_bits) - bf16_bits_to_f32(b_bits))
+        if delta > max_abs_delta:
+            max_abs_delta = delta
+            max_abs_idx = idx
+        ulp_delta = abs(bf16_order_key(a_bits) - bf16_order_key(b_bits))
+        if ulp_delta > max_ulp_delta:
+            max_ulp_delta = ulp_delta
+            max_ulp_idx = idx
+    return {
+        "elems": limit,
+        "length_match": len(expected_bits) == len(got_bits),
+        "differing_elems": differing_elems,
+        "max_abs_delta": max_abs_delta,
+        "max_abs_delta_idx": max_abs_idx,
+        "max_ulp_delta": max_ulp_delta,
+        "max_ulp_delta_idx": max_ulp_idx,
+        "baseline_bf16_at_max_abs": (
+            f"{expected_bits[max_abs_idx]:04x}" if expected_bits and max_abs_idx < len(expected_bits) else None
+        ),
+        "candidate_bf16_at_max_abs": (
+            f"{got_bits[max_abs_idx]:04x}" if got_bits and max_abs_idx < len(got_bits) else None
+        ),
+        "baseline_value_at_max_abs": (
+            bf16_bits_to_f32(expected_bits[max_abs_idx])
+            if expected_bits and max_abs_idx < len(expected_bits)
+            else None
+        ),
+        "candidate_value_at_max_abs": (
+            bf16_bits_to_f32(got_bits[max_abs_idx])
+            if got_bits and max_abs_idx < len(got_bits)
+            else None
+        ),
+    }
+
+
+def iter_layer_output_delta_taps(
+    rows: list[dict[str, Any]],
+) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    return [
+        (row, tap)
+        for row in rows
+        for tap in (row.get("layer_output_delta_taps") or [])
+    ]
+
+
+def compare_layer_output_delta_taps(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    baselines: dict[tuple[str, int, int, str], dict[str, Any]] = {}
+    for row, tap in iter_layer_output_delta_taps(rows):
+        if row.get("mode") != "default":
+            continue
+        key = (
+            str(row.get("prompt_id", "")),
+            int(tap.get("position", 0)),
+            int(tap.get("layer", -1)),
+            str(tap.get("phase", "-")),
+        )
+        baselines[key] = tap
+
+    comparisons: list[dict[str, Any]] = []
+    for row, tap in iter_layer_output_delta_taps(rows):
+        if row.get("mode") == "default":
+            continue
+        key = (
+            str(row.get("prompt_id", "")),
+            int(tap.get("position", 0)),
+            int(tap.get("layer", -1)),
+            str(tap.get("phase", "-")),
+        )
+        baseline = baselines.get(key)
+        item = {
+            "prompt_id": key[0],
+            "mode": row.get("mode"),
+            "position": key[1],
+            "layer": key[2],
+            "phase": key[3],
+            "path": tap.get("path", "-"),
+            "checksum": tap.get("checksum"),
+            "baseline_checksum": None if baseline is None else baseline.get("checksum"),
+            "checksum_match": None
+            if baseline is None
+            else tap.get("checksum") == baseline.get("checksum"),
+            "status": "missing_baseline" if baseline is None else "ok",
+        }
+        if baseline is not None:
+            item.update(compare_bf16_hex_values(baseline.get("bf16"), tap.get("bf16")))
+        comparisons.append(item)
+    return comparisons
+
+
+def summarize_layer_output_delta_taps(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    taps = [tap for _, tap in iter_layer_output_delta_taps(rows)]
+    comparisons = compare_layer_output_delta_taps(rows)
+    mismatches = [item for item in comparisons if item.get("checksum_match") is False]
+    return {
+        "tap_count": len(taps),
+        "paths": sorted({str(tap.get("path") or "-") for tap in taps}),
+        "comparison_count": len(comparisons),
+        "checksum_mismatch_count": len(mismatches),
+        "max_abs_delta": max(
+            (float(item.get("max_abs_delta") or 0.0) for item in comparisons),
+            default=0.0,
+        ),
+        "max_ulp_delta": max(
+            (int(item.get("max_ulp_delta") or 0) for item in comparisons),
+            default=0,
+        ),
+        "max_differing_elems": max(
+            (int(item.get("differing_elems") or 0) for item in comparisons),
+            default=0,
+        ),
+        "first_mismatch": mismatches[0] if mismatches else None,
+        "comparisons": comparisons,
+    }
+
+
 def select_router_parity_tap_rows(
     tap_rows: list[tuple[dict[str, Any], dict[str, Any]]],
     limit: int = 40,
@@ -991,6 +1156,17 @@ def build_env_overrides(args: argparse.Namespace, mode: str) -> dict[str, str]:
         overrides["SUPERSONIC_QWEN36_DOWNSTREAM_PARITY_TAP"] = "1"
     if getattr(args, "layer_output_tap", False):
         overrides["SUPERSONIC_QWEN36_LAYER_OUTPUT_TAP"] = "1"
+    if getattr(args, "layer_output_delta_tap", False):
+        overrides["SUPERSONIC_QWEN36_LAYER_OUTPUT_DELTA_TAP"] = "1"
+        layer = getattr(args, "layer_output_delta_layer", None)
+        if layer is not None:
+            overrides["SUPERSONIC_QWEN36_LAYER_OUTPUT_DELTA_TAP_LAYER"] = str(layer)
+        position = getattr(args, "layer_output_delta_position", None)
+        if position is not None:
+            overrides["SUPERSONIC_QWEN36_LAYER_OUTPUT_DELTA_TAP_POSITION"] = str(position)
+        phase = getattr(args, "layer_output_delta_phase", None)
+        if phase:
+            overrides["SUPERSONIC_QWEN36_LAYER_OUTPUT_DELTA_TAP_PHASE"] = str(phase)
     if getattr(args, "router_parity_tap", False):
         overrides["SUPERSONIC_METAL_QWEN36_FFN_ROUTER_STAGE5_PARITY_TAP"] = "1"
         max_calls = getattr(args, "router_parity_tap_max_calls", None)
@@ -1421,6 +1597,7 @@ def run_row(args: argparse.Namespace, prompt_id: str, prompt: str, mode: str) ->
             "final_hidden_taps": parse_final_hidden_taps(output),
             "logits_taps": parse_logits_taps(output),
             "layer_output_taps": parse_layer_output_taps(output),
+            "layer_output_delta_taps": parse_layer_output_delta_taps(output),
             "decode_batch_route_snapshots": parse_decode_batch_route_snapshots(output),
             "output_tail": output_tail(output),
         }
@@ -1452,6 +1629,7 @@ def run_row(args: argparse.Namespace, prompt_id: str, prompt: str, mode: str) ->
             "final_hidden_taps": parse_final_hidden_taps(output),
             "logits_taps": parse_logits_taps(output),
             "layer_output_taps": parse_layer_output_taps(output),
+            "layer_output_delta_taps": parse_layer_output_delta_taps(output),
             "decode_batch_route_snapshots": parse_decode_batch_route_snapshots(output),
             "fused_op_ms": None,
             "output_tail": output_tail(output),
@@ -2074,6 +2252,7 @@ def build_report(
     summary["final_hidden_tap"] = summarize_final_hidden_taps(rows)
     summary["logits_tap"] = summarize_logits_taps(rows)
     summary["layer_output_tap"] = summarize_layer_output_taps(rows)
+    summary["layer_output_delta_tap"] = summarize_layer_output_delta_taps(rows)
     summary["decode_batch_route_snapshot"] = summarize_decode_batch_route_snapshots(rows)
     return {
         "schema": SCHEMA,
@@ -2089,6 +2268,10 @@ def build_report(
         "metal_profile_phases": getattr(args, "metal_profile_phases", False),
         "downstream_parity_tap": getattr(args, "downstream_parity_tap", False),
         "layer_output_tap": getattr(args, "layer_output_tap", False),
+        "layer_output_delta_tap": getattr(args, "layer_output_delta_tap", False),
+        "layer_output_delta_layer": getattr(args, "layer_output_delta_layer", None),
+        "layer_output_delta_position": getattr(args, "layer_output_delta_position", None),
+        "layer_output_delta_phase": getattr(args, "layer_output_delta_phase", None),
         "router_parity_tap": getattr(args, "router_parity_tap", False),
         "router_parity_tap_max_calls": getattr(args, "router_parity_tap_max_calls", None),
         "shared_parity_tap": getattr(args, "shared_parity_tap", False),
@@ -2130,6 +2313,7 @@ def render_markdown(report: dict[str, Any]) -> str:
     final_hidden_tap = summary.get("final_hidden_tap") or {}
     logits_tap = summary.get("logits_tap") or {}
     layer_output_tap = summary.get("layer_output_tap") or {}
+    layer_output_delta_tap = summary.get("layer_output_delta_tap") or {}
     route_snapshot = summary.get("decode_batch_route_snapshot") or {}
     decode_batch_coarse = summary.get("decode_batch_coarse") or {}
     deferred_phase = summary.get("decode_batch_deferred_phase") or {}
@@ -2145,6 +2329,7 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- metal_profile_phases: `{report.get('metal_profile_phases', False)}`",
         f"- downstream_parity_tap: `{report.get('downstream_parity_tap', False)}`",
         f"- layer_output_tap: `{report.get('layer_output_tap', False)}`",
+        f"- layer_output_delta_tap: `{report.get('layer_output_delta_tap', False)}`",
         f"- router_parity_tap: `{report.get('router_parity_tap', False)}`",
         f"- shared_parity_tap: `{report.get('shared_parity_tap', False)}`",
         f"- routed_parity_tap: `{report.get('routed_parity_tap', False)}`",
@@ -2170,6 +2355,9 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- logits_top1_mismatches: `{logits_tap.get('top1_mismatch_count', 0)}`",
         f"- layer_output_tap_count: `{layer_output_tap.get('tap_count', 0)}`",
         f"- layer_output_checksum_mismatches: `{layer_output_tap.get('checksum_mismatch_count', 0)}`",
+        f"- layer_output_delta_tap_count: `{layer_output_delta_tap.get('tap_count', 0)}`",
+        f"- layer_output_delta_max_abs: `{render_float(layer_output_delta_tap.get('max_abs_delta'), 8)}`",
+        f"- layer_output_delta_max_ulp: `{layer_output_delta_tap.get('max_ulp_delta', 0)}`",
         f"- decode_batch_route_snapshot_count: `{route_snapshot.get('snapshot_count', 0)}`",
         f"- decode_batch_route_snapshot_mismatches: `{route_snapshot.get('mismatch_count', 0)}`",
         "",
@@ -2648,6 +2836,38 @@ def render_markdown(report: dict[str, Any]) -> str:
                     checksum=item.get("checksum") or "-",
                 )
             )
+    layer_output_delta_comparisons = (
+        (summary.get("layer_output_delta_tap") or {}).get("comparisons") or []
+    )
+    if layer_output_delta_comparisons:
+        lines.extend(
+            [
+                "",
+                "## Layer Output Delta Tap",
+                "",
+                "| Prompt | Mode | Path | Position | Layer | Phase | Checksum match | Max abs delta | Max abs idx | Max ULP | ULP idx | Differing elems | Baseline | Candidate |",
+                "|:---|:---|:---|---:|---:|:---|:---:|---:|---:|---:|---:|---:|---:|---:|",
+            ]
+        )
+        for item in layer_output_delta_comparisons[:40]:
+            lines.append(
+                "| {prompt} | {mode} | {path} | {position} | {layer} | {phase} | {match} | {delta} | {delta_idx} | {ulp} | {ulp_idx} | {diffs} | {base} | {candidate} |".format(
+                    prompt=item.get("prompt_id", ""),
+                    mode=item.get("mode", ""),
+                    path=item.get("path", "-"),
+                    position=item.get("position", "-"),
+                    layer=item.get("layer", "-"),
+                    phase=item.get("phase", "-"),
+                    match=str(item.get("checksum_match")).lower(),
+                    delta=render_float(item.get("max_abs_delta"), 8),
+                    delta_idx=item.get("max_abs_delta_idx", "-"),
+                    ulp=item.get("max_ulp_delta", "-"),
+                    ulp_idx=item.get("max_ulp_delta_idx", "-"),
+                    diffs=item.get("differing_elems", "-"),
+                    base=render_float(item.get("baseline_value_at_max_abs"), 8),
+                    candidate=render_float(item.get("candidate_value_at_max_abs"), 8),
+                )
+            )
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -2677,6 +2897,29 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--layer-output-tap",
         action="store_true",
         help="emit post-attention and post-FFN layer-output signatures for default-vs-decode-batch comparison",
+    )
+    parser.add_argument(
+        "--layer-output-delta-tap",
+        action="store_true",
+        help="emit full BF16 layer-output rows for numeric default-vs-candidate delta comparison",
+    )
+    parser.add_argument(
+        "--layer-output-delta-position",
+        type=int,
+        default=0,
+        help="position filter for the layer-output delta tap",
+    )
+    parser.add_argument(
+        "--layer-output-delta-layer",
+        type=int,
+        default=0,
+        help="layer filter for the layer-output delta tap",
+    )
+    parser.add_argument(
+        "--layer-output-delta-phase",
+        choices=["attn", "ffn"],
+        default="ffn",
+        help="phase filter for the layer-output delta tap",
     )
     parser.add_argument(
         "--router-parity-tap",

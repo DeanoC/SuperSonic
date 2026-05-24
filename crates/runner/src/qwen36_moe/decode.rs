@@ -51,6 +51,7 @@ static QWEN36_DECODE_BATCH_ROUTE_SNAPSHOT_CALLS: AtomicUsize = AtomicUsize::new(
 static QWEN36_DECODE_BATCH_SHARED_PARITY_TAP_CALLS: AtomicUsize = AtomicUsize::new(0);
 static QWEN36_DECODE_BATCH_ROUTED_PARITY_TAP_CALLS: AtomicUsize = AtomicUsize::new(0);
 static QWEN36_LAYER_OUTPUT_TAP_CALLS: AtomicUsize = AtomicUsize::new(0);
+static QWEN36_LAYER_OUTPUT_DELTA_TAP_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 const LAYER_OUTPUT_TAP_PHASE_COUNT: usize = 2;
 const LAYER_OUTPUT_TAP_PHASES: [&str; 2] = ["attn", "ffn"];
@@ -227,6 +228,56 @@ fn qwen36_metal_decode_batch_routed_stage5_parity_tap_max_calls() -> usize {
 
 fn qwen36_layer_output_tap_enabled() -> bool {
     std::env::var_os("SUPERSONIC_QWEN36_LAYER_OUTPUT_TAP").is_some()
+        || qwen36_layer_output_delta_tap_enabled()
+}
+
+fn qwen36_layer_output_delta_tap_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_QWEN36_LAYER_OUTPUT_DELTA_TAP").is_some()
+}
+
+fn qwen36_layer_output_delta_tap_position() -> Option<i32> {
+    std::env::var("SUPERSONIC_QWEN36_LAYER_OUTPUT_DELTA_TAP_POSITION")
+        .ok()
+        .and_then(|raw| raw.parse::<i32>().ok())
+}
+
+fn qwen36_layer_output_delta_tap_layer() -> Option<usize> {
+    std::env::var("SUPERSONIC_QWEN36_LAYER_OUTPUT_DELTA_TAP_LAYER")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+}
+
+fn qwen36_layer_output_delta_tap_phase() -> Option<usize> {
+    let raw = std::env::var("SUPERSONIC_QWEN36_LAYER_OUTPUT_DELTA_TAP_PHASE").ok()?;
+    LAYER_OUTPUT_TAP_PHASES
+        .iter()
+        .position(|phase| phase.eq_ignore_ascii_case(raw.trim()))
+}
+
+fn qwen36_layer_output_delta_tap_matches(
+    position: i32,
+    layer_idx: usize,
+    phase_idx: usize,
+) -> bool {
+    if !qwen36_layer_output_delta_tap_enabled() {
+        return false;
+    }
+    if let Some(wanted) = qwen36_layer_output_delta_tap_position() {
+        if position != wanted {
+            return false;
+        }
+    }
+    if let Some(wanted) = qwen36_layer_output_delta_tap_layer() {
+        if layer_idx != wanted {
+            return false;
+        }
+    }
+    if let Some(wanted) = qwen36_layer_output_delta_tap_phase() {
+        if phase_idx != wanted {
+            return false;
+        }
+    }
+    true
 }
 
 fn qwen36_metal_router_stage5_simd_env_enabled() -> bool {
@@ -442,6 +493,14 @@ fn bf16_head_hex(bytes: &[u8], elems: usize) -> String {
         .join(",")
 }
 
+fn bf16_full_hex(bytes: &[u8]) -> String {
+    bytes
+        .chunks_exact(2)
+        .map(|chunk| format!("{:02x}{:02x}", chunk[1], chunk[0]))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn snapshot_layer_output(
     ordinal: usize,
     snapshots: &mut LayerOutputSnapshots,
@@ -525,6 +584,23 @@ fn emit_layer_output_taps(
                 max_abs_idx,
                 bf16_head_hex(row_bytes, 8),
             );
+            if qwen36_layer_output_delta_tap_matches(position, layer_idx, phase_idx) {
+                let delta_call =
+                    QWEN36_LAYER_OUTPUT_DELTA_TAP_CALLS.fetch_add(1, Ordering::Relaxed);
+                eprintln!(
+                    "[qwen36-layer-output-delta-tap] call={} position={} cache_pos={} path={} phase_profile={} layer={} phase={} elems={} checksum={:016x} bf16={}",
+                    delta_call,
+                    position,
+                    cache_pos,
+                    path,
+                    phase_profile as u8,
+                    layer_idx,
+                    LAYER_OUTPUT_TAP_PHASES[phase_idx],
+                    hidden_f32.len(),
+                    fnv1a64_bytes(row_bytes),
+                    bf16_full_hex(row_bytes),
+                );
+            }
         }
     }
     Ok(())

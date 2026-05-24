@@ -1544,6 +1544,56 @@ under the same smoke:
    tolerance or whether the native path must be made bit-exact with the
    default chained FFN rounding order.
 
+44. **Qwen3.6 layer-output numeric delta tap**
+   The fused-routed sweep is now schema `v20` and adds
+   `--layer-output-delta-tap`, which sets
+   `SUPERSONIC_QWEN36_LAYER_OUTPUT_DELTA_TAP=1`. The runtime reuses the
+   layer-output tap buffer and, for a filtered position/layer/phase only,
+   emits `[qwen36-layer-output-delta-tap]` rows with the full BF16 row as
+   comma-separated hex words. The sweep compares the default chained row
+   against the candidate decode-batch row and reports element count, checksum
+   agreement, max absolute delta, max BF16-ordered ULP delta, and the first
+   mismatching element details. The extra full-row payload is intentionally
+   filtered by `SUPERSONIC_QWEN36_LAYER_OUTPUT_DELTA_TAP_POSITION`,
+   `SUPERSONIC_QWEN36_LAYER_OUTPUT_DELTA_TAP_LAYER`, and
+   `SUPERSONIC_QWEN36_LAYER_OUTPUT_DELTA_TAP_PHASE` so attribution runs do not
+   dump every layer output.
+
+   The four-token Metal run used
+   `--modes default,full-stage5-router-simd-batch-shared-tiled
+   --max-new-tokens 4 --metal-profile --shared-parity-tap
+   --shared-parity-tap-max-calls 160 --downstream-parity-tap
+   --layer-output-tap --layer-output-delta-tap
+   --layer-output-delta-position 0 --layer-output-delta-layer 0
+   --layer-output-delta-phase ffn --routed-parity-tap
+   --routed-parity-tap-max-calls 160`. It reproduced the existing
+   generated-ID divergence: default generated `[11,271,40,599]`, while the
+   decode-batch shared-tiled row generated `[11,353,599,264]`. The first
+   checksum mismatch stayed at position `0`, layer `0`, phase `ffn`
+   (`f1872ddeb26a59b0` default versus `68a1cc5202bd41e4` decode-batch).
+
+   The numeric delta tap emitted the two filtered rows and one comparison. The
+   layer `0` FFN row has `2048` BF16 elements, only `2` differing elements,
+   `max_abs_delta=1.220703125e-4`, and `max_ulp_delta=1`. The largest
+   difference was at index `225`: default BF16 `3c93`
+   (`0.0179443359375`) versus decode-batch BF16 `3c92`
+   (`0.017822265625`). Shared and routed attribution stayed tight in the same
+   run: shared captured `160` rows with `max_shared_out_abs=2.44e-4`, and
+   routed captured `160` rows with no top-k mismatch plus
+   `max_topk_weight_abs=9.77e-4`, `max_expert_mid_abs=1.39e-4`,
+   `max_moe_out_abs=4.88e-4`, and `max_final_out_abs=9.77e-4`.
+
+   This turns the first-layer correctness issue from an indexing suspicion
+   into a deterministic materialization/rounding target. The batch-native FFN
+   path is numerically very close, but not bit-exact with the default chained
+   path, and the one-ULP BF16 drift is enough to amplify into generated-token
+   divergence by the second sampled token. Promotion should stay blocked until
+   stage-5 decode-batch FFN finalize/residual materialization matches the
+   default path bit-for-bit, or until the acceptance policy explicitly moves
+   from generated-ID parity to an eval/tolerance gate. For this lane, the next
+   correctness target is bit-exact rounding/materialization, not another
+   performance variant.
+
 ## Sources
 
 - [Qwen/Qwen3.6-35B-A3B model card](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)
