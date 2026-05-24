@@ -92,6 +92,35 @@ class Qwen36MetalLongContextBenchTests(unittest.TestCase):
         self.assertEqual(env["SUPERSONIC_QWEN36_MOE_GROUPED_FFN"], "1")
         self.assertNotIn("SUPERSONIC_QWEN36_DENSE_PREFILL_TOKEN_LOOP", env)
 
+    def test_apply_batched_prefill_variant_sets_named_env(self):
+        env = bench_qwen36_metal_longctx.build_metal_env(
+            {"PATH": os.environ.get("PATH", "")}
+        )
+        bench_qwen36_metal_longctx.enable_metal_batched_prefill_prototype(env)
+
+        overrides = bench_qwen36_metal_longctx.apply_batched_prefill_variant(
+            env, "router-topk"
+        )
+
+        self.assertEqual(
+            overrides,
+            {"SUPERSONIC_QWEN36_MOE_METAL_ROUTER_TOPK": "1"},
+        )
+        self.assertEqual(env["SUPERSONIC_QWEN36_MOE_METAL_ROUTER_TOPK"], "1")
+
+    def test_batched_prefill_variant_catalog_covers_measured_probes(self):
+        self.assertIn(
+            "linear-direct-off", bench_qwen36_metal_longctx.BATCHED_PREFILL_VARIANTS
+        )
+        self.assertIn(
+            "full-attn-tmajor", bench_qwen36_metal_longctx.BATCHED_PREFILL_VARIANTS
+        )
+        self.assertIn("split-qgate", bench_qwen36_metal_longctx.BATCHED_PREFILL_VARIANTS)
+        self.assertIn("router-topk", bench_qwen36_metal_longctx.BATCHED_PREFILL_VARIANTS)
+        self.assertIn(
+            "fused-residual", bench_qwen36_metal_longctx.BATCHED_PREFILL_VARIANTS
+        )
+
     def test_parse_profile_extracts_summary_and_entries(self):
         output = """
 [metal-profile] calls=2 total_ms=12.000 native_ms=10.000 host_ms=2.000

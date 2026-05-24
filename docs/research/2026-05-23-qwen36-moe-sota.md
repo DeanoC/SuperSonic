@@ -405,6 +405,11 @@ under the same smoke:
    available behind `SUPERSONIC_QWEN36_MOE_METAL_FUSED_FFN_RESIDUAL=1` and
    `SUPERSONIC_QWEN36_MOE_METAL_ROUTER_TOPK=1`, but the default lane stays on
    the measured faster host-top-k and two-add residual path.
+   The long-context harness now has a `--batched-prefill-variant` selector for
+   these measured env-gated probes (`linear-direct-off`, `full-attn-tmajor`,
+   `split-qgate`, `router-topk`, and `fused-residual`) and records the selected
+   variant plus env overrides in JSON rows. This keeps the negative/prototype
+   gates reproducible without promoting them into the SuperSonic CLI.
 
 3. **Static top-N resident MPS table probe**
    Use route profiles to choose top-N experts per layer, materialize FP16 MPS

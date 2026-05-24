@@ -514,7 +514,11 @@ With `--batched-prefill-prototype`, the harness flips the explicit
 experimental Metal batched-prefill route. This path uses Metal batched
 full-attention and a direct routed-expert INT4 kernel pair for grouped MoE
 prefill while keeping router/top-k and shared-expert work on the existing host
-or primitive path. It is not the supported default lane yet. The first local
+or primitive path. It is not the supported default lane yet.
+`--batched-prefill-variant` makes the env-gated prototype probes reproducible
+from the harness: `linear-direct-off`, `full-attn-tmajor`, `split-qgate`,
+`router-topk`, and `fused-residual`. The JSON rows record both the variant name
+and the exact env overrides used for the run. The first local
 512-token normal smoke generated the same `[271]` one-token sanity row and
 reduced prefill to 22.15s; the profiled smoke measured 34.20s because it splits
 the routed-expert gate/up and down/combine phases for attribution. A follow-up

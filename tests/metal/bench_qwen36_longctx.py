@@ -23,7 +23,7 @@ from typing import Any
 
 
 MODEL = "qwen3.6-35b-a3b"
-SCHEMA = "qwen36-moe-metal-longctx-bench-v4"
+SCHEMA = "qwen36-moe-metal-longctx-bench-v5"
 
 PRESETS: dict[str, dict[str, Any]] = {
     "smoke": {
@@ -44,6 +44,15 @@ PRESETS: dict[str, dict[str, Any]] = {
         "warmup": True,
         "timeout": 28800,
     },
+}
+
+BATCHED_PREFILL_VARIANTS: dict[str, dict[str, str]] = {
+    "default": {},
+    "linear-direct-off": {"SUPERSONIC_QWEN36_MOE_METAL_LINEAR_PREFILL_DIRECT": "0"},
+    "full-attn-tmajor": {"SUPERSONIC_QWEN36_MOE_METAL_FULL_ATTN_TMAJOR": "1"},
+    "split-qgate": {"SUPERSONIC_QWEN36_MOE_METAL_SPLIT_QGATE": "1"},
+    "router-topk": {"SUPERSONIC_QWEN36_MOE_METAL_ROUTER_TOPK": "1"},
+    "fused-residual": {"SUPERSONIC_QWEN36_MOE_METAL_FUSED_FFN_RESIDUAL": "1"},
 }
 
 
@@ -108,6 +117,12 @@ def enable_metal_batched_prefill_prototype(env: dict[str, str]) -> None:
     env["SUPERSONIC_QWEN36_MOE_BATCHED_ATTN"] = "1"
     env["SUPERSONIC_QWEN36_MOE_GROUPED_FFN"] = "1"
     env.pop("SUPERSONIC_QWEN36_DENSE_PREFILL_TOKEN_LOOP", None)
+
+
+def apply_batched_prefill_variant(env: dict[str, str], variant: str) -> dict[str, str]:
+    overrides = BATCHED_PREFILL_VARIANTS[variant]
+    env.update(overrides)
+    return overrides.copy()
 
 
 def parse_key_values(line: str) -> dict[str, str]:
@@ -296,8 +311,10 @@ def run_one(
     warmup: bool,
 ) -> dict[str, Any]:
     env = build_metal_env(os.environ)
+    variant_env_overrides: dict[str, str] = {}
     if args.batched_prefill_prototype:
         enable_metal_batched_prefill_prototype(env)
+        variant_env_overrides = apply_batched_prefill_variant(env, args.batched_prefill_variant)
     if args.batched_prefill_feasibility and not warmup:
         env["SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL_FEASIBILITY"] = "1"
         env["SUPERSONIC_QWEN36_ROUTE_PROFILE_MAX_CALLS"] = str(
@@ -357,6 +374,8 @@ def run_one(
             "context_tokens_requested": context_tokens,
             "mode": "int4",
             "metal_batched_prefill_prototype": bool(args.batched_prefill_prototype),
+            "batched_prefill_variant": args.batched_prefill_variant,
+            "batched_prefill_variant_env": variant_env_overrides,
             "returncode": -1,
             "timeout_seconds": args.timeout,
             "wall_seconds": elapsed,
@@ -387,6 +406,8 @@ def run_one(
         "context_tokens_requested": context_tokens,
         "mode": "int4",
         "metal_batched_prefill_prototype": bool(args.batched_prefill_prototype),
+        "batched_prefill_variant": args.batched_prefill_variant,
+        "batched_prefill_variant_env": variant_env_overrides,
         "returncode": proc.returncode,
         "wall_seconds": elapsed,
         "command": cmd,
@@ -469,8 +490,16 @@ def main() -> int:
             "batched routed-expert compute"
         ),
     )
+    parser.add_argument(
+        "--batched-prefill-variant",
+        choices=sorted(BATCHED_PREFILL_VARIANTS),
+        default="default",
+        help="named env-gated variant for --batched-prefill-prototype A/B runs",
+    )
     args = apply_preset_defaults(parser.parse_args())
     args.model_dir = resolve_model_dir(args.model_dir, os.environ)
+    if args.batched_prefill_variant != "default" and not args.batched_prefill_prototype:
+        parser.error("--batched-prefill-variant requires --batched-prefill-prototype")
 
     try:
         contexts = BASE.parse_int_list(args.contexts)
@@ -529,6 +558,7 @@ def main() -> int:
         "metal_profile": args.metal_profile,
         "batched_prefill_feasibility": args.batched_prefill_feasibility,
         "batched_prefill_prototype": args.batched_prefill_prototype,
+        "batched_prefill_variant": args.batched_prefill_variant,
         "seed": args.seed,
         "summary": summary,
         "recommendation": BASE.recommendation(summary),

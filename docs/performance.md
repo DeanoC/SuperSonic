@@ -889,10 +889,15 @@ the harness sets
 experimental Metal batched-prefill path: Metal batched full-attention plus a
 direct routed-expert INT4 gate/up and down/combine kernel pair, with
 router/top-k and shared-expert work still on the existing host/primitive path.
-The long-context JSON schema is now `qwen36-moe-metal-longctx-bench-v4` and
+`--batched-prefill-variant` names the measured env-gated prototype probes
+without requiring hand-built environment overrides: `linear-direct-off`,
+`full-attn-tmajor`, `split-qgate`, `router-topk`, and `fused-residual`.
+The harness records the selected variant and its env overrides per row so A/B
+comparison outputs are self-describing. The long-context JSON schema is now
+`qwen36-moe-metal-longctx-bench-v5` and
 records `batched_prefill_prototype` at top level plus
-`metal_batched_prefill_prototype` per row; feasibility rows remain under
-`batched_prefill_plans`; set
+`metal_batched_prefill_prototype` and `batched_prefill_variant` per row;
+feasibility rows remain under `batched_prefill_plans`; set
 `SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL_PLAN_CHUNKS=...` to override the planner
 chunk list without adding a SuperSonic CLI flag.
 The 512-token smoke is a real prefill run and is slow on the current chained
