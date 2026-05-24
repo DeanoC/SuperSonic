@@ -161,6 +161,10 @@ fn qwen36_metal_decode_batch_profile_phases_enabled() -> bool {
     std::env::var_os("SUPERSONIC_METAL_QWEN36_DECODE_BATCH_PROFILE_PHASES").is_some()
 }
 
+fn qwen36_metal_decode_batch_profile_phases_deferred_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_QWEN36_DECODE_BATCH_PROFILE_PHASES_DEFERRED").is_some()
+}
+
 fn qwen36_metal_decode_batch_ffn_profile_phases_enabled() -> bool {
     std::env::var_os("SUPERSONIC_METAL_QWEN36_DECODE_BATCH_PROFILE_FFN_PHASES").is_some()
 }
@@ -186,9 +190,15 @@ fn flush_active_metal_decode_batch(label: &str) -> Result<bool> {
 }
 
 fn flush_metal_decode_batch_profile_phase(label: &str, profile_label: &str) -> Result<()> {
-    if !qwen36_metal_decode_batch_profile_phases_enabled()
-        || !kernel_ffi::prefill_ffi::metal_batch_is_active()
-    {
+    if !kernel_ffi::prefill_ffi::metal_batch_is_active() {
+        return Ok(());
+    }
+    if qwen36_metal_decode_batch_profile_phases_deferred_enabled() {
+        kernel_ffi::prefill_ffi::commit_metal_batch_current(profile_label)
+            .map_err(|e| anyhow!("{label} Metal batch deferred commit: {e}"))?;
+        return Ok(());
+    }
+    if !qwen36_metal_decode_batch_profile_phases_enabled() {
         return Ok(());
     }
     kernel_ffi::prefill_ffi::set_metal_batch_label(profile_label)
@@ -307,7 +317,8 @@ fn emit_decode_batch_route_snapshot(
         "serial"
     };
     let phase_profile = qwen36_metal_decode_batch_ffn_profile_phases_enabled()
-        || qwen36_metal_decode_batch_profile_phases_enabled();
+        || qwen36_metal_decode_batch_profile_phases_enabled()
+        || qwen36_metal_decode_batch_profile_phases_deferred_enabled();
     let call = QWEN36_DECODE_BATCH_ROUTE_SNAPSHOT_CALLS.fetch_add(1, Ordering::Relaxed);
     eprintln!(
         "[qwen36-decode-batch-route-snapshot] call={} position={} cache_pos={} router_path={} phase_profile={} layers={} top_k={} captured_layers={} entries={} first_layer={} last_layer={} checksum={} routes={}",

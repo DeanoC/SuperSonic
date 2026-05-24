@@ -15,14 +15,18 @@ from typing import Any
 
 
 MODEL = "qwen3.6-35b-a3b"
-SCHEMA = "qwen36-fused-routed-int4-sweep-v12"
+SCHEMA = "qwen36-fused-routed-int4-sweep-v13"
 DEFAULT_MAX_FUSED_WALL_GPU_RATIO = 4.0
 DEFAULT_MAX_WAIT_GPU_RATIO = 4.0
 COARSE_BATCH_SERIAL_MODE = "full-stage5-router-batch"
 COARSE_BATCH_SIMD_MODE = "full-stage5-router-simd-batch"
+DEFERRED_BATCH_SERIAL_MODE = "full-stage5-router-batch-deferred-phases"
+DEFERRED_BATCH_SIMD_MODE = "full-stage5-router-simd-batch-deferred-phases"
 BATCH_FAST_PROFILE_MODES = {
     "full-stage5-router-batch",
     "full-stage5-router-simd-batch",
+    "full-stage5-router-batch-deferred-phases",
+    "full-stage5-router-simd-batch-deferred-phases",
     "full-stage5-router-batch-phases",
     "full-stage5-router-batch-ffn-phases",
     "full-stage5-router-simd-batch-phases",
@@ -74,6 +78,14 @@ MODE_ALIASES: dict[str, str] = {
     "batch-router-simd": "full-stage5-router-simd-batch",
     "full-router-simd-batch": "full-stage5-router-simd-batch",
     "full-stage5-router-simd-batch": "full-stage5-router-simd-batch",
+    "router-batch-deferred-phases": "full-stage5-router-batch-deferred-phases",
+    "batch-router-deferred-phases": "full-stage5-router-batch-deferred-phases",
+    "full-router-batch-deferred-phases": "full-stage5-router-batch-deferred-phases",
+    "full-stage5-router-batch-deferred-phases": "full-stage5-router-batch-deferred-phases",
+    "router-simd-batch-deferred-phases": "full-stage5-router-simd-batch-deferred-phases",
+    "batch-router-simd-deferred-phases": "full-stage5-router-simd-batch-deferred-phases",
+    "full-router-simd-batch-deferred-phases": "full-stage5-router-simd-batch-deferred-phases",
+    "full-stage5-router-simd-batch-deferred-phases": "full-stage5-router-simd-batch-deferred-phases",
     "router-batch-phases": "full-stage5-router-batch-phases",
     "batch-router-phases": "full-stage5-router-batch-phases",
     "full-router-batch-phases": "full-stage5-router-batch-phases",
@@ -106,6 +118,8 @@ FUSED_OP_NEEDLES = {
     "full-stage5-router-simd": "qwen36_ffn_int4_stage5_with_router",
     "full-stage5-router-batch": "qwen36_ffn_int4_stage5_with_router",
     "full-stage5-router-simd-batch": "qwen36_ffn_int4_stage5_with_router",
+    "full-stage5-router-batch-deferred-phases": "qwen36_ffn_int4_stage5_with_router",
+    "full-stage5-router-simd-batch-deferred-phases": "qwen36_ffn_int4_stage5_with_router",
     "full-stage5-router-batch-phases": "qwen36_ffn_int4_stage5_with_router",
     "full-stage5-router-batch-ffn-phases": "qwen36_ffn_int4",
     "full-stage5-router-simd-batch-phases": "qwen36_ffn_int4_stage5_with_router",
@@ -157,6 +171,26 @@ FUSED_GPU_OP_PREFIXES = {
     ),
     "full-stage5-router-simd-batch": (
         "command_buffer_gpu:qwen36_decode_batch",
+        "command_buffer_gpu:qwen36_ffn_int4_stage5_with_router",
+        "command_buffer_gpu:qwen36_ffn_int4_router_topk_stage5_simd",
+        "command_buffer_gpu:qwen36_ffn_int4_shared_gate_up",
+        "command_buffer_gpu:qwen36_ffn_int4_shared_gate_scalar",
+        "command_buffer_gpu:qwen36_ffn_int4_shared_down",
+        "command_buffer_gpu:qwen36_ffn_int4_expert_gate_up_tiled_stage5",
+        "command_buffer_gpu:qwen36_ffn_int4_expert_down_finalize",
+    ),
+    "full-stage5-router-batch-deferred-phases": (
+        "command_buffer_gpu:qwen36_decode_batch_ffn",
+        "command_buffer_gpu:qwen36_ffn_int4_stage5_with_router",
+        "command_buffer_gpu:qwen36_ffn_int4_router_topk_stage5",
+        "command_buffer_gpu:qwen36_ffn_int4_shared_gate_up",
+        "command_buffer_gpu:qwen36_ffn_int4_shared_gate_scalar",
+        "command_buffer_gpu:qwen36_ffn_int4_shared_down",
+        "command_buffer_gpu:qwen36_ffn_int4_expert_gate_up_tiled_stage5",
+        "command_buffer_gpu:qwen36_ffn_int4_expert_down_finalize",
+    ),
+    "full-stage5-router-simd-batch-deferred-phases": (
+        "command_buffer_gpu:qwen36_decode_batch_ffn",
         "command_buffer_gpu:qwen36_ffn_int4_stage5_with_router",
         "command_buffer_gpu:qwen36_ffn_int4_router_topk_stage5_simd",
         "command_buffer_gpu:qwen36_ffn_int4_shared_gate_up",
@@ -575,6 +609,15 @@ def build_env_overrides(args: argparse.Namespace, mode: str) -> dict[str, str]:
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"] = "1"
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_STAGE5_SIMD"] = "1"
         overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH"] = "1"
+    elif mode == "full-stage5-router-batch-deferred-phases":
+        overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"] = "1"
+        overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH"] = "1"
+        overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH_PROFILE_PHASES_DEFERRED"] = "1"
+    elif mode == "full-stage5-router-simd-batch-deferred-phases":
+        overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"] = "1"
+        overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_STAGE5_SIMD"] = "1"
+        overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH"] = "1"
+        overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH_PROFILE_PHASES_DEFERRED"] = "1"
     elif mode == "full-stage5-router-batch-phases":
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"] = "1"
         overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH"] = "1"
@@ -1383,6 +1426,112 @@ def build_decode_batch_coarse_comparison(
     }
 
 
+def build_decode_batch_deferred_phase_summary(
+    rows: list[dict[str, Any]],
+    modes: list[str],
+) -> dict[str, Any]:
+    prompt_ids: list[str] = []
+    for row in rows:
+        prompt_id = str(row.get("prompt_id", ""))
+        if prompt_id and prompt_id not in prompt_ids:
+            prompt_ids.append(prompt_id)
+    rows_by_key = {
+        (str(row.get("prompt_id", "")), row.get("mode")): row
+        for row in rows
+    }
+    rows_out: list[dict[str, Any]] = []
+    missing_modes = [
+        mode
+        for mode in (DEFERRED_BATCH_SERIAL_MODE, DEFERRED_BATCH_SIMD_MODE)
+        if mode not in modes
+    ]
+    for prompt_id in prompt_ids:
+        baseline = rows_by_key.get((prompt_id, "default"))
+        for mode in (DEFERRED_BATCH_SERIAL_MODE, DEFERRED_BATCH_SIMD_MODE):
+            row = rows_by_key.get((prompt_id, mode))
+            if row is None:
+                continue
+            linear_gpu = row.get("decode_batch_linear_gpu_ms")
+            ffn_gpu = row.get("decode_batch_ffn_gpu_ms")
+            total_gpu = None
+            if linear_gpu is not None or ffn_gpu is not None:
+                total_gpu = float(linear_gpu or 0.0) + float(ffn_gpu or 0.0)
+            ffn_share = safe_ratio(ffn_gpu, total_gpu)
+            wait_ms = row.get("command_buffer_wait_ms")
+            wait_gpu_ratio = safe_ratio(wait_ms, total_gpu)
+            generated_ids_match_default = (
+                None
+                if baseline is None
+                else (row.get("generated_ids") or []) == (baseline.get("generated_ids") or [])
+            )
+            if row.get("status") != "ok":
+                blocker = "missing_ok_row"
+            elif generated_ids_match_default is False:
+                blocker = "correctness"
+            elif total_gpu is None:
+                blocker = "missing_deferred_phase_profile"
+            elif ffn_share is not None and ffn_share >= 0.60:
+                blocker = "ffn_gpu_work"
+            elif linear_gpu is not None and ffn_gpu is not None and linear_gpu > ffn_gpu:
+                blocker = "linear_gpu_work"
+            elif wait_gpu_ratio is not None and wait_gpu_ratio > DEFAULT_MAX_WAIT_GPU_RATIO:
+                blocker = "wait_or_submit_overhead"
+            else:
+                blocker = "mixed_gpu_work"
+            rows_out.append(
+                {
+                    "prompt_id": prompt_id,
+                    "mode": mode,
+                    "router_path": "simd" if "simd" in mode else "serial",
+                    "status": row.get("status"),
+                    "generated_ids_match_default": generated_ids_match_default,
+                    "decode_ms": row_number(row, "result", "decode_ms"),
+                    "linear_gpu_ms": linear_gpu,
+                    "ffn_gpu_ms": ffn_gpu,
+                    "total_phase_gpu_ms": total_gpu,
+                    "ffn_share": ffn_share,
+                    "command_buffer_wait_ms": wait_ms,
+                    "wait_gpu_ratio": wait_gpu_ratio,
+                    "blocker": blocker,
+                }
+            )
+
+    usable = [row for row in rows_out if row.get("status") == "ok"]
+    blockers = sorted({str(row.get("blocker")) for row in usable})
+    if missing_modes:
+        recommendation = "run_decode_batch_deferred_phase_sweep"
+        reason = "serial and SIMD deferred phase rows are both required"
+    elif any(row.get("blocker") == "correctness" for row in usable):
+        recommendation = "fix_decode_batch_deferred_phase_correctness"
+        reason = "a deferred phase row does not match default generated IDs"
+    elif any(row.get("blocker") == "ffn_gpu_work" for row in usable):
+        recommendation = "target_batched_ffn_gpu_work"
+        reason = "deferred non-waiting phase labels show FFN dominates the coarse batch GPU work"
+    elif any(row.get("blocker") == "linear_gpu_work" for row in usable):
+        recommendation = "target_batched_linear_gpu_work"
+        reason = "deferred non-waiting phase labels show linear attention dominates the coarse batch GPU work"
+    elif any(row.get("blocker") == "wait_or_submit_overhead" for row in usable):
+        recommendation = "target_decode_batch_wait_or_submit_overhead"
+        reason = "deferred phase labels are small relative to command-buffer wait"
+    elif usable:
+        recommendation = "inspect_decode_batch_mixed_gpu_work"
+        reason = "deferred phase labels do not point at one dominant component"
+    else:
+        recommendation = "run_decode_batch_deferred_phase_sweep"
+        reason = "no usable deferred phase rows were found"
+    return {
+        "serial_mode": DEFERRED_BATCH_SERIAL_MODE,
+        "simd_mode": DEFERRED_BATCH_SIMD_MODE,
+        "available": not missing_modes and bool(usable),
+        "missing_modes": missing_modes,
+        "row_count": len(usable),
+        "blockers": blockers,
+        "recommendation": recommendation,
+        "reason": reason,
+        "rows": rows_out,
+    }
+
+
 def summarize_with_gate(
     rows: list[dict[str, Any]],
     modes: list[str],
@@ -1411,6 +1560,7 @@ def summarize_with_gate(
         max_wait_gpu_ratio,
     )
     summary["decode_batch_coarse"] = build_decode_batch_coarse_comparison(rows, modes)
+    summary["decode_batch_deferred_phase"] = build_decode_batch_deferred_phase_summary(rows, modes)
     return summary
 
 
@@ -1483,6 +1633,7 @@ def render_markdown(report: dict[str, Any]) -> str:
     router_parity = summary.get("router_parity") or {}
     route_snapshot = summary.get("decode_batch_route_snapshot") or {}
     decode_batch_coarse = summary.get("decode_batch_coarse") or {}
+    deferred_phase = summary.get("decode_batch_deferred_phase") or {}
     lines = [
         "# Qwen3.6 Fused Routed INT4 Sweep",
         "",
@@ -1500,6 +1651,7 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- promotion_gate_passed_modes: `{','.join(promotion_gate.get('passed_modes') or []) or '-'}`",
         f"- ffn_gap_recommendation: `{ffn_gap.get('recommendation') or '-'}`",
         f"- decode_batch_coarse_recommendation: `{decode_batch_coarse.get('recommendation') or '-'}`",
+        f"- decode_batch_deferred_phase_recommendation: `{deferred_phase.get('recommendation') or '-'}`",
         f"- router_parity_tap_count: `{router_parity.get('tap_count', 0)}`",
         f"- router_parity_mismatches: `{router_parity.get('mismatch_count', 0)}`",
         f"- decode_batch_route_snapshot_count: `{route_snapshot.get('snapshot_count', 0)}`",
@@ -1572,6 +1724,42 @@ def render_markdown(report: dict[str, Any]) -> str:
                     wait_ratio=render_float(comparison.get("command_buffer_wait_ratio"), 3),
                     wait_gpu=render_float(comparison.get("simd_wait_gpu_ratio"), 3),
                     blocker=comparison.get("blocker") or "-",
+                )
+            )
+    deferred_rows = [
+        item
+        for item in (deferred_phase.get("rows") or [])
+        if item.get("status") == "ok"
+    ]
+    if deferred_rows:
+        lines.extend(
+            [
+                "",
+                "## Decode Batch Deferred Phase",
+                "",
+                f"- recommendation: `{deferred_phase.get('recommendation') or '-'}`",
+                f"- reason: {deferred_phase.get('reason') or '-'}",
+                "",
+                "| Prompt | Mode | Path | IDs match default | Decode ms | Linear GPU ms | FFN GPU ms | Phase GPU ms | FFN share | Wait ms | Wait/GPU | Blocker |",
+                "|:---|:---|:---|:---:|---:|---:|---:|---:|---:|---:|---:|:---|",
+            ]
+        )
+        for item in deferred_rows:
+            ids_match = item.get("generated_ids_match_default")
+            lines.append(
+                "| {prompt} | {mode} | {path} | {ids} | {decode} | {linear} | {ffn} | {total} | {share} | {wait} | {wait_gpu} | {blocker} |".format(
+                    prompt=item.get("prompt_id", ""),
+                    mode=item.get("mode", ""),
+                    path=item.get("router_path", "-"),
+                    ids="-" if ids_match is None else str(bool(ids_match)).lower(),
+                    decode=render_float(item.get("decode_ms")),
+                    linear=render_float(item.get("linear_gpu_ms")),
+                    ffn=render_float(item.get("ffn_gpu_ms")),
+                    total=render_float(item.get("total_phase_gpu_ms")),
+                    share=render_float(item.get("ffn_share"), 3),
+                    wait=render_float(item.get("command_buffer_wait_ms")),
+                    wait_gpu=render_float(item.get("wait_gpu_ratio"), 3),
+                    blocker=item.get("blocker") or "-",
                 )
             )
     if any(

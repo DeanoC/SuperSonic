@@ -307,6 +307,10 @@ pub fn set_metal_batch_label(label: &str) -> Result<(), GpuError> {
     metal_native::set_batch_label(label)
 }
 
+pub fn commit_metal_batch_current(label: &str) -> Result<(), GpuError> {
+    metal_native::commit_batch_current(label)
+}
+
 pub fn metal_copy_d2d(src: *const c_void, dst: *mut c_void, bytes: usize) -> Result<(), GpuError> {
     metal_native::copy_d2d(src, dst, bytes)
 }

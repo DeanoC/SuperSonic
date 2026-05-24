@@ -1266,6 +1266,41 @@ under the same smoke:
    batch mode should not be promoted over the current default chained decode
    path until its headline decode time beats default.
 
+37. **Qwen3.6 deferred decode-batch phase attribution**
+   The decode-batch attribution lane now has non-waiting phase labels,
+   `full-stage5-router-batch-deferred-phases` and
+   `full-stage5-router-simd-batch-deferred-phases`, guarded by
+   `SUPERSONIC_METAL_QWEN36_DECODE_BATCH_PROFILE_PHASES_DEFERRED=1`.
+   Instead of flushing after a phase, the Metal batch helper closes and commits
+   the current command buffer with a stable label, starts a fresh command
+   buffer for later work, and waits for all pending buffers only at the next
+   host boundary or final batch close. This keeps Metal queue ordering intact
+   while letting the profile report `qwen36_decode_batch_linear_attn` and
+   `qwen36_decode_batch_ffn` without inserting a per-phase fence. The sweep is
+   schema v13 and summarizes these rows in
+   `decode_batch_deferred_phase`.
+
+   The four-token Metal smoke used
+   `--modes default,full-stage5-router-batch,full-stage5-router-simd-batch,full-stage5-router-batch-deferred-phases,full-stage5-router-simd-batch-deferred-phases
+   --metal-profile`. All rows generated the same IDs:
+   `[11, 271, 40, 599]`. The coarse batch comparison was noisy and did not
+   promote SIMD in this run: serial batch measured `1692.0 ms` decode and
+   `1424.394 ms` batch GPU, while SIMD batch measured `1805.0 ms` decode and
+   `1548.916 ms` batch GPU. That keeps the coarse batch lane gated.
+
+   The deferred phase labels still provide the needed bottleneck split. The
+   serial deferred row measured `linear=39.053 ms`, `ffn=615.180 ms`,
+   `phase_total=654.233 ms`, and `ffn_share=0.940`. The SIMD deferred row
+   measured `linear=26.962 ms`, `ffn=383.723 ms`,
+   `phase_total=410.685 ms`, and `ffn_share=0.934`. Command-buffer wait still
+   exceeded labeled GPU work (`wait/GPU=2.75` serial and `2.84` SIMD), so this
+   is an attribution lane rather than a promotion path. The important result is
+   that, once phase labels avoid per-phase waits, FFN still dominates the
+   labeled native batch work by a wide margin. The next implementation target
+   should be batched FFN arithmetic, starting with the routed expert and shared
+   expert work inside `qwen36_decode_batch_ffn`, not another linear-attention
+   split.
+
 ## Sources
 
 - [Qwen/Qwen3.6-35B-A3B model card](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)

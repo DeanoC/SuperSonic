@@ -386,8 +386,11 @@ id<MTLCommandQueue> metal_queue() {
 struct MetalBatchState {
     __strong id<MTLCommandBuffer> command_buffer = nil;
     __strong id<MTLComputeCommandEncoder> encoder = nil;
+    __strong NSMutableArray* pending_buffers = nil;
     bool has_work = false;
     std::string label;
+
+    MetalBatchState() : pending_buffers([[NSMutableArray alloc] init]) {}
 };
 
 thread_local int metal_batch_depth = 0;
@@ -414,6 +417,26 @@ int metal_batch_ensure_command_buffer() {
     return 0;
 }
 
+int metal_batch_wait_pending() {
+    if (metal_batch_state == nullptr || metal_batch_state->pending_buffers == nil ||
+        metal_batch_state->pending_buffers.count == 0) {
+        return 0;
+    }
+
+    auto wait_start = MetalClock::now();
+    for (id<MTLCommandBuffer> command_buffer in metal_batch_state->pending_buffers) {
+        [command_buffer waitUntilCompleted];
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) {
+            [metal_batch_state->pending_buffers removeAllObjects];
+            record_runtime_profile("command_buffer_wait", wait_start);
+            return 906;
+        }
+    }
+    record_runtime_profile("command_buffer_wait", wait_start);
+    [metal_batch_state->pending_buffers removeAllObjects];
+    return 0;
+}
+
 int metal_batch_ensure_compute_encoder() {
     int status = metal_batch_ensure_command_buffer();
     if (status != 0) {
@@ -434,7 +457,7 @@ int metal_batch_ensure_compute_encoder() {
 
 int metal_batch_close_encoder(bool restart) {
     if (metal_batch_state == nullptr || metal_batch_state->command_buffer == nil) {
-        return 0;
+        return metal_batch_wait_pending();
     }
 
     id<MTLCommandBuffer> command_buffer = metal_batch_state->command_buffer;
@@ -463,8 +486,54 @@ int metal_batch_close_encoder(bool restart) {
         }
         record_command_buffer_gpu_profile(command_buffer, label);
     }
+    int pending_status = metal_batch_wait_pending();
+    if (pending_status != 0) {
+        return pending_status;
+    }
 
     (void)restart;
+    return 0;
+}
+
+int metal_batch_commit_current_async(const char* label_override) {
+    if (metal_batch_depth <= 0 || metal_batch_state == nullptr) {
+        return 0;
+    }
+    if (metal_batch_state->command_buffer == nil) {
+        if (label_override != nullptr) {
+            metal_batch_state->label = label_override;
+        }
+        return 0;
+    }
+
+    id<MTLCommandBuffer> command_buffer = metal_batch_state->command_buffer;
+    id<MTLComputeCommandEncoder> encoder = metal_batch_state->encoder;
+    bool has_work = metal_batch_state->has_work;
+    std::string label = label_override == nullptr ? metal_batch_state->label : label_override;
+    metal_batch_state->encoder = nil;
+    metal_batch_state->command_buffer = nil;
+    metal_batch_state->has_work = false;
+    metal_batch_state->label.clear();
+
+    if (encoder != nil) {
+        auto end_encoding_start = MetalClock::now();
+        [encoder endEncoding];
+        record_runtime_profile("encoder_end", end_encoding_start);
+    }
+    if (!has_work) {
+        return 0;
+    }
+
+    std::string label_copy = label;
+    [command_buffer addCompletedHandler:^(id<MTLCommandBuffer> completed) {
+        if (completed.status == MTLCommandBufferStatusCompleted) {
+            record_command_buffer_gpu_profile(completed, label_copy);
+        }
+    }];
+    auto commit_start = MetalClock::now();
+    [command_buffer commit];
+    record_runtime_profile("command_buffer_commit", commit_start);
+    [metal_batch_state->pending_buffers addObject:command_buffer];
     return 0;
 }
 
@@ -8654,6 +8723,12 @@ extern "C" int supersonic_metal_batch_flush() {
 extern "C" int supersonic_metal_batch_set_label(const char* label) {
     @autoreleasepool {
         return metal_batch_set_label(label);
+    }
+}
+
+extern "C" int supersonic_metal_batch_commit_current(const char* label) {
+    @autoreleasepool {
+        return metal_batch_commit_current_async(label);
     }
 }
 

@@ -13,6 +13,7 @@ unsafe extern "C" {
     fn supersonic_metal_batch_begin() -> c_int;
     fn supersonic_metal_batch_flush() -> c_int;
     fn supersonic_metal_batch_set_label(label: *const c_char) -> c_int;
+    fn supersonic_metal_batch_commit_current(label: *const c_char) -> c_int;
     fn supersonic_metal_batch_end() -> c_int;
     fn supersonic_metal_batch_is_active() -> c_int;
     fn supersonic_metal_queue_sync() -> c_int;
@@ -1003,6 +1004,24 @@ pub(crate) fn set_batch_label(label: &str) -> Result<(), GpuError> {
         return Err(GpuError::backend(
             Backend::Metal,
             format!("metal native batch set label failed with status {status}"),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+pub(crate) fn commit_batch_current(label: &str) -> Result<(), GpuError> {
+    let label = CString::new(label).map_err(|_| {
+        GpuError::backend(
+            Backend::Metal,
+            "metal native batch commit label contains NUL byte".to_string(),
+        )
+    })?;
+    let status = unsafe { supersonic_metal_batch_commit_current(label.as_ptr()) };
+    if status != 0 {
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!("metal native batch commit current failed with status {status}"),
         ));
     }
     Ok(())
@@ -5004,6 +5023,11 @@ pub(crate) fn batch_is_active() -> bool {
 
 #[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
 pub(crate) fn set_batch_label(_label: &str) -> Result<(), GpuError> {
+    Ok(())
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+pub(crate) fn commit_batch_current(_label: &str) -> Result<(), GpuError> {
     Ok(())
 }
 
