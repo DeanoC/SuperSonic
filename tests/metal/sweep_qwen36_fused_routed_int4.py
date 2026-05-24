@@ -16,7 +16,7 @@ from typing import Any
 
 
 MODEL = "qwen3.6-35b-a3b"
-SCHEMA = "qwen36-fused-routed-int4-sweep-v30"
+SCHEMA = "qwen36-fused-routed-int4-sweep-v31"
 DEFAULT_MAX_FUSED_WALL_GPU_RATIO = 4.0
 DEFAULT_MAX_WAIT_GPU_RATIO = 4.0
 COARSE_BATCH_SERIAL_MODE = "full-stage5-router-batch"
@@ -1280,6 +1280,350 @@ def layer_output_delta_comparisons_by_key(
             str(item.get("phase", "-")),
         ): item
         for item in compare_layer_output_delta_taps(rows)
+    }
+
+
+def layer_output_tap_map(row: dict[str, Any]) -> dict[tuple[int, int, str], dict[str, Any]]:
+    return {
+        (
+            int(tap.get("position", 0)),
+            int(tap.get("layer", -1)),
+            str(tap.get("phase", "-")),
+        ): tap
+        for tap in (row.get("layer_output_taps") or [])
+    }
+
+
+def build_layer_output_tolerance_prompt_result(
+    baseline: dict[str, Any],
+    row: dict[str, Any],
+    delta_by_key: dict[tuple[str, str, int, int, str], dict[str, Any]],
+    *,
+    allow_layer_output_tolerance: bool,
+    layer_output_max_abs_delta: float,
+    layer_output_max_ulp_delta: int,
+    layer_output_max_differing_elems: int,
+) -> dict[str, Any]:
+    prompt_id = str(row.get("prompt_id", baseline.get("prompt_id", "")))
+    mode = str(row.get("mode", ""))
+    baseline_by_key = layer_output_tap_map(baseline)
+    candidate_by_key = layer_output_tap_map(row)
+    result: dict[str, Any] = {
+        "prompt_id": prompt_id,
+        "mode": mode,
+        "diagnostic_only": mode in DIAGNOSTIC_ONLY_MODES,
+        "status": "ok",
+        "compared_rows": 0,
+        "checksum_mismatches": 0,
+        "missing_candidate_rows": 0,
+        "missing_delta_evidence": 0,
+        "length_mismatches": 0,
+        "required_max_abs_delta": 0.0,
+        "required_max_ulp_delta": 0,
+        "required_max_differing_elems": 0,
+        "within_current_thresholds": True,
+        "requires_layer_output_tolerance": False,
+        "first_mismatch": None,
+    }
+    if not baseline_by_key and not candidate_by_key:
+        return result
+    if not baseline_by_key:
+        result["status"] = "missing_baseline_taps"
+        result["within_current_thresholds"] = False
+        result["first_mismatch"] = {"reason": "missing_baseline_taps"}
+        return result
+    if not candidate_by_key:
+        result["status"] = "missing_candidate_taps"
+        result["missing_candidate_rows"] = len(baseline_by_key)
+        result["within_current_thresholds"] = False
+        result["first_mismatch"] = {"reason": "missing_candidate_taps"}
+        return result
+
+    first_mismatch: dict[str, Any] | None = None
+    for key, baseline_tap in baseline_by_key.items():
+        candidate_tap = candidate_by_key.get(key)
+        base_mismatch = {
+            "position": key[0],
+            "layer": key[1],
+            "phase": key[2],
+            "baseline_checksum": baseline_tap.get("checksum"),
+            "candidate_checksum": None
+            if candidate_tap is None
+            else candidate_tap.get("checksum"),
+        }
+        if candidate_tap is None:
+            result["missing_candidate_rows"] += 1
+            if first_mismatch is None:
+                first_mismatch = {**base_mismatch, "reason": "missing_candidate"}
+            continue
+        result["compared_rows"] += 1
+        if candidate_tap.get("checksum") == baseline_tap.get("checksum"):
+            continue
+
+        result["checksum_mismatches"] += 1
+        mismatch = {**base_mismatch, "reason": "checksum_mismatch"}
+        delta = delta_by_key.get((prompt_id, mode, key[0], key[1], key[2]))
+        if delta is None or delta.get("status") != "ok":
+            result["missing_delta_evidence"] += 1
+            mismatch["reason"] = "missing_layer_output_delta"
+            if first_mismatch is None:
+                first_mismatch = mismatch
+            continue
+        if not bool(delta.get("length_match")):
+            result["length_mismatches"] += 1
+            mismatch["reason"] = "layer_output_delta_length_mismatch"
+            mismatch["elems"] = delta.get("elems")
+            if first_mismatch is None:
+                first_mismatch = mismatch
+            continue
+
+        max_abs_delta = float(delta.get("max_abs_delta") or 0.0)
+        max_ulp_delta = int(delta.get("max_ulp_delta") or 0)
+        differing_elems = int(delta.get("differing_elems") or 0)
+        result["required_max_abs_delta"] = max(
+            float(result["required_max_abs_delta"]),
+            max_abs_delta,
+        )
+        result["required_max_ulp_delta"] = max(
+            int(result["required_max_ulp_delta"]),
+            max_ulp_delta,
+        )
+        result["required_max_differing_elems"] = max(
+            int(result["required_max_differing_elems"]),
+            differing_elems,
+        )
+        mismatch.update(
+            {
+                "max_abs_delta": max_abs_delta,
+                "max_ulp_delta": max_ulp_delta,
+                "differing_elems": differing_elems,
+                "max_abs_delta_idx": delta.get("max_abs_delta_idx"),
+                "max_ulp_delta_idx": delta.get("max_ulp_delta_idx"),
+            }
+        )
+        if first_mismatch is None:
+            first_mismatch = mismatch
+
+    result["first_mismatch"] = first_mismatch
+    has_mismatch = (
+        int(result["checksum_mismatches"]) > 0
+        or int(result["missing_candidate_rows"]) > 0
+    )
+    result["requires_layer_output_tolerance"] = int(result["checksum_mismatches"]) > 0
+    result["within_current_thresholds"] = (
+        not has_mismatch
+        or (
+            allow_layer_output_tolerance
+            and int(result["missing_candidate_rows"]) == 0
+            and int(result["missing_delta_evidence"]) == 0
+            and int(result["length_mismatches"]) == 0
+            and float(result["required_max_abs_delta"]) <= layer_output_max_abs_delta
+            and int(result["required_max_ulp_delta"]) <= layer_output_max_ulp_delta
+            and int(result["required_max_differing_elems"])
+            <= layer_output_max_differing_elems
+        )
+    )
+    return result
+
+
+def build_layer_output_tolerance_policy(
+    rows: list[dict[str, Any]],
+    modes: list[str],
+    allow_layer_output_tolerance: bool = False,
+    layer_output_max_abs_delta: float = 0.0,
+    layer_output_max_ulp_delta: int = 0,
+    layer_output_max_differing_elems: int = 0,
+) -> dict[str, Any]:
+    prompt_ids: list[str] = []
+    for row in rows:
+        prompt_id = str(row.get("prompt_id", ""))
+        if prompt_id and prompt_id not in prompt_ids:
+            prompt_ids.append(prompt_id)
+    candidate_modes = [mode for mode in modes if mode != "default"]
+    rows_by_key = {
+        (str(row.get("prompt_id", "")), str(row.get("mode", ""))): row
+        for row in rows
+    }
+    delta_by_key = layer_output_delta_comparisons_by_key(rows)
+    prompt_results: list[dict[str, Any]] = []
+    for mode in candidate_modes:
+        for prompt_id in prompt_ids:
+            baseline = rows_by_key.get((prompt_id, "default"))
+            row = rows_by_key.get((prompt_id, mode))
+            if baseline is None or baseline.get("status") != "ok":
+                prompt_results.append(
+                    {
+                        "prompt_id": prompt_id,
+                        "mode": mode,
+                        "diagnostic_only": mode in DIAGNOSTIC_ONLY_MODES,
+                        "status": "missing_ok_default",
+                        "compared_rows": 0,
+                        "checksum_mismatches": 0,
+                        "missing_candidate_rows": 0,
+                        "missing_delta_evidence": 0,
+                        "length_mismatches": 0,
+                        "required_max_abs_delta": 0.0,
+                        "required_max_ulp_delta": 0,
+                        "required_max_differing_elems": 0,
+                        "within_current_thresholds": False,
+                        "requires_layer_output_tolerance": False,
+                        "first_mismatch": {"reason": "missing_ok_default"},
+                    }
+                )
+                continue
+            if row is None or row.get("status") != "ok":
+                prompt_results.append(
+                    {
+                        "prompt_id": prompt_id,
+                        "mode": mode,
+                        "diagnostic_only": mode in DIAGNOSTIC_ONLY_MODES,
+                        "status": "missing_ok_candidate",
+                        "compared_rows": 0,
+                        "checksum_mismatches": 0,
+                        "missing_candidate_rows": 0,
+                        "missing_delta_evidence": 0,
+                        "length_mismatches": 0,
+                        "required_max_abs_delta": 0.0,
+                        "required_max_ulp_delta": 0,
+                        "required_max_differing_elems": 0,
+                        "within_current_thresholds": False,
+                        "requires_layer_output_tolerance": False,
+                        "first_mismatch": {"reason": "missing_ok_candidate"},
+                    }
+                )
+                continue
+            prompt_results.append(
+                build_layer_output_tolerance_prompt_result(
+                    baseline,
+                    row,
+                    delta_by_key,
+                    allow_layer_output_tolerance=allow_layer_output_tolerance,
+                    layer_output_max_abs_delta=layer_output_max_abs_delta,
+                    layer_output_max_ulp_delta=layer_output_max_ulp_delta,
+                    layer_output_max_differing_elems=layer_output_max_differing_elems,
+                )
+            )
+
+    mode_results: list[dict[str, Any]] = []
+    for mode in candidate_modes:
+        items = [item for item in prompt_results if item.get("mode") == mode]
+        checksum_mismatches = sum(int(item.get("checksum_mismatches") or 0) for item in items)
+        missing_delta_evidence = sum(
+            int(item.get("missing_delta_evidence") or 0) for item in items
+        )
+        missing_candidate_rows = sum(
+            int(item.get("missing_candidate_rows") or 0) for item in items
+        )
+        length_mismatches = sum(int(item.get("length_mismatches") or 0) for item in items)
+        required_max_abs_delta = max(
+            (float(item.get("required_max_abs_delta") or 0.0) for item in items),
+            default=0.0,
+        )
+        required_max_ulp_delta = max(
+            (int(item.get("required_max_ulp_delta") or 0) for item in items),
+            default=0,
+        )
+        required_max_differing_elems = max(
+            (int(item.get("required_max_differing_elems") or 0) for item in items),
+            default=0,
+        )
+        mode_results.append(
+            {
+                "mode": mode,
+                "diagnostic_only": mode in DIAGNOSTIC_ONLY_MODES,
+                "prompt_count": len(items),
+                "checksum_mismatches": checksum_mismatches,
+                "missing_candidate_rows": missing_candidate_rows,
+                "missing_delta_evidence": missing_delta_evidence,
+                "length_mismatches": length_mismatches,
+                "required_max_abs_delta": required_max_abs_delta,
+                "required_max_ulp_delta": required_max_ulp_delta,
+                "required_max_differing_elems": required_max_differing_elems,
+                "within_current_thresholds": bool(items)
+                and all(bool(item.get("within_current_thresholds")) for item in items),
+                "requires_layer_output_tolerance": checksum_mismatches > 0,
+                "first_mismatch": next(
+                    (item.get("first_mismatch") for item in items if item.get("first_mismatch")),
+                    None,
+                ),
+            }
+        )
+
+    max_required_abs_delta = max(
+        (float(item.get("required_max_abs_delta") or 0.0) for item in mode_results),
+        default=0.0,
+    )
+    max_required_ulp_delta = max(
+        (int(item.get("required_max_ulp_delta") or 0) for item in mode_results),
+        default=0,
+    )
+    max_required_differing_elems = max(
+        (int(item.get("required_max_differing_elems") or 0) for item in mode_results),
+        default=0,
+    )
+    modes_with_gaps = [
+        str(item.get("mode"))
+        for item in mode_results
+        if int(item.get("missing_delta_evidence") or 0) > 0
+        or int(item.get("length_mismatches") or 0) > 0
+        or int(item.get("missing_candidate_rows") or 0) > 0
+    ]
+    modes_with_mismatches = [
+        str(item.get("mode"))
+        for item in mode_results
+        if int(item.get("checksum_mismatches") or 0) > 0
+    ]
+    modes_within_current_tolerance = [
+        str(item.get("mode"))
+        for item in mode_results
+        if int(item.get("checksum_mismatches") or 0) > 0
+        and bool(item.get("within_current_thresholds"))
+    ]
+    modes_requiring_tolerance = [
+        str(item.get("mode"))
+        for item in mode_results
+        if int(item.get("checksum_mismatches") or 0) > 0
+        and not bool(item.get("within_current_thresholds"))
+        and str(item.get("mode")) not in modes_with_gaps
+    ]
+
+    if not candidate_modes:
+        recommendation = "run_candidate_sweep"
+        reason = "no candidate modes were provided"
+    elif modes_with_gaps:
+        recommendation = "rerun_with_layer_output_delta_tap"
+        reason = "layer-output mismatches need complete delta-tap evidence before tolerance can be selected"
+    elif modes_requiring_tolerance:
+        recommendation = "choose_explicit_layer_output_tolerance_or_fix_kernel"
+        reason = "candidate layer-output mismatches have measured BF16 deltas outside the current tolerance policy"
+    elif modes_within_current_tolerance:
+        recommendation = "current_layer_output_tolerance_covers_mismatches"
+        reason = "the current explicit tolerance covers every measured layer-output mismatch"
+    elif not modes_with_mismatches:
+        recommendation = "no_layer_output_tolerance_needed"
+        reason = "no candidate layer-output checksum mismatches were observed"
+    else:
+        recommendation = "choose_explicit_layer_output_tolerance_or_fix_kernel"
+        reason = "candidate layer-output mismatch state was inconclusive"
+
+    return {
+        "allow_layer_output_tolerance": allow_layer_output_tolerance,
+        "thresholds": {
+            "max_abs_delta": layer_output_max_abs_delta,
+            "max_ulp_delta": layer_output_max_ulp_delta,
+            "max_differing_elems": layer_output_max_differing_elems,
+        },
+        "candidate_modes": candidate_modes,
+        "recommendation": recommendation,
+        "reason": reason,
+        "max_required_abs_delta": max_required_abs_delta,
+        "max_required_ulp_delta": max_required_ulp_delta,
+        "max_required_differing_elems": max_required_differing_elems,
+        "modes_requiring_tolerance": modes_requiring_tolerance,
+        "modes_within_current_tolerance": modes_within_current_tolerance,
+        "modes_missing_delta_evidence": modes_with_gaps,
+        "mode_results": mode_results,
+        "prompt_results": prompt_results,
     }
 
 
@@ -2990,6 +3334,14 @@ def summarize_with_gate(
         layer_output_max_ulp_delta,
         layer_output_max_differing_elems,
     )
+    summary["layer_output_tolerance_policy"] = build_layer_output_tolerance_policy(
+        rows,
+        modes,
+        allow_layer_output_tolerance,
+        layer_output_max_abs_delta,
+        layer_output_max_ulp_delta,
+        layer_output_max_differing_elems,
+    )
     summary["ffn_residency_gap"] = build_ffn_residency_gap(
         rows,
         modes,
@@ -3109,6 +3461,7 @@ def render_float(value: Any, precision: int = 3) -> str:
 def render_markdown(report: dict[str, Any]) -> str:
     summary = report["summary"]
     promotion_gate = summary.get("promotion_gate") or {}
+    layer_output_tolerance = summary.get("layer_output_tolerance_policy") or {}
     ffn_gap = summary.get("ffn_residency_gap") or {}
     router_parity = summary.get("router_parity") or {}
     shared_parity = summary.get("shared_parity") or {}
@@ -3142,6 +3495,13 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- promotion_layer_output_max_abs_delta: `{render_float((promotion_gate.get('thresholds') or {}).get('layer_output_max_abs_delta'), 8)}`",
         f"- promotion_layer_output_max_ulp_delta: `{(promotion_gate.get('thresholds') or {}).get('layer_output_max_ulp_delta', 0)}`",
         f"- promotion_layer_output_max_differing_elems: `{(promotion_gate.get('thresholds') or {}).get('layer_output_max_differing_elems', 0)}`",
+        f"- layer_output_tolerance_recommendation: `{layer_output_tolerance.get('recommendation') or '-'}`",
+        f"- layer_output_tolerance_max_required_abs_delta: `{render_float(layer_output_tolerance.get('max_required_abs_delta'), 8)}`",
+        f"- layer_output_tolerance_max_required_ulp_delta: `{layer_output_tolerance.get('max_required_ulp_delta', 0)}`",
+        f"- layer_output_tolerance_max_required_differing_elems: `{layer_output_tolerance.get('max_required_differing_elems', 0)}`",
+        f"- layer_output_tolerance_modes_requiring: `{','.join(layer_output_tolerance.get('modes_requiring_tolerance') or []) or '-'}`",
+        f"- layer_output_tolerance_modes_within_current: `{','.join(layer_output_tolerance.get('modes_within_current_tolerance') or []) or '-'}`",
+        f"- layer_output_tolerance_modes_missing_evidence: `{','.join(layer_output_tolerance.get('modes_missing_delta_evidence') or []) or '-'}`",
         f"- router_parity_tap: `{report.get('router_parity_tap', False)}`",
         f"- shared_parity_tap: `{report.get('shared_parity_tap', False)}`",
         f"- routed_parity_tap: `{report.get('routed_parity_tap', False)}`",
@@ -3848,6 +4208,45 @@ def render_markdown(report: dict[str, Any]) -> str:
                     match=str(item.get("checksum_match")).lower(),
                     base=item.get("baseline_checksum") or "-",
                     checksum=item.get("checksum") or "-",
+                )
+            )
+    layer_output_tolerance_rows = (
+        (summary.get("layer_output_tolerance_policy") or {}).get("prompt_results") or []
+    )
+    if layer_output_tolerance_rows:
+        lines.extend(
+            [
+                "",
+                "## Layer Output Tolerance Policy",
+                "",
+                "| Prompt | Mode | Diagnostic | Status | Mismatches | Missing evidence | Missing candidate | Required abs | Required ULP | Required elems | Within current | First mismatch |",
+                "|:---|:---|:---:|:---|---:|---:|---:|---:|---:|---:|:---:|:---|",
+            ]
+        )
+        for item in layer_output_tolerance_rows[:80]:
+            first = item.get("first_mismatch") or {}
+            if first:
+                first_label = "{layer}:{phase}:{reason}".format(
+                    layer=first.get("layer", "-"),
+                    phase=first.get("phase", "-"),
+                    reason=first.get("reason", "-"),
+                )
+            else:
+                first_label = "-"
+            lines.append(
+                "| {prompt} | {mode} | {diagnostic} | {status} | {mismatches} | {missing_delta} | {missing_candidate} | {required_abs} | {required_ulp} | {required_elems} | {within} | {first} |".format(
+                    prompt=item.get("prompt_id", ""),
+                    mode=item.get("mode", ""),
+                    diagnostic=str(item.get("diagnostic_only", False)).lower(),
+                    status=item.get("status", "-"),
+                    mismatches=item.get("checksum_mismatches", 0),
+                    missing_delta=item.get("missing_delta_evidence", 0),
+                    missing_candidate=item.get("missing_candidate_rows", 0),
+                    required_abs=render_float(item.get("required_max_abs_delta"), 8),
+                    required_ulp=item.get("required_max_ulp_delta", 0),
+                    required_elems=item.get("required_max_differing_elems", 0),
+                    within=str(item.get("within_current_thresholds", False)).lower(),
+                    first=first_label,
                 )
             )
     layer_output_delta_comparisons = (

@@ -816,6 +816,137 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
         self.assertEqual(prompt["layer_output_untolerated_checksum_mismatches"], 0)
         self.assertNotIn("prompt_hello:layer_output_checksum_mismatch", gate["candidates"][0]["failures"])
 
+    def test_layer_output_tolerance_policy_reports_required_thresholds(self):
+        script = sweep_qwen36_fused_routed_int4
+        baseline = row("default", ids=[11, 271])
+        candidate = row("direct-gather", ids=[11, 271], headline=90.0, ffn=40.0, wait=9.0)
+        baseline["layer_output_taps"] = [
+            {"position": 0, "layer": 7, "phase": "ffn", "checksum": "baseline"},
+        ]
+        candidate["layer_output_taps"] = [
+            {"position": 0, "layer": 7, "phase": "ffn", "checksum": "candidate"},
+        ]
+        baseline["layer_output_delta_taps"] = [
+            {
+                "position": 0,
+                "layer": 7,
+                "phase": "ffn",
+                "path": "chained",
+                "checksum": "baseline",
+                "bf16": "bdc1",
+            }
+        ]
+        candidate["layer_output_delta_taps"] = [
+            {
+                "position": 0,
+                "layer": 7,
+                "phase": "ffn",
+                "path": "decode_batch",
+                "checksum": "candidate",
+                "bf16": "bdc2",
+            }
+        ]
+
+        policy = script.build_layer_output_tolerance_policy(
+            [baseline, candidate],
+            ["default", "direct-gather"],
+        )
+
+        self.assertEqual(
+            policy["recommendation"],
+            "choose_explicit_layer_output_tolerance_or_fix_kernel",
+        )
+        self.assertEqual(policy["modes_requiring_tolerance"], ["direct-gather"])
+        self.assertEqual(policy["max_required_ulp_delta"], 1)
+        self.assertEqual(policy["max_required_differing_elems"], 1)
+        self.assertGreater(policy["max_required_abs_delta"], 0.0)
+        prompt = policy["prompt_results"][0]
+        self.assertEqual(prompt["first_mismatch"]["layer"], 7)
+        self.assertEqual(prompt["missing_delta_evidence"], 0)
+
+        covered = script.build_layer_output_tolerance_policy(
+            [baseline, candidate],
+            ["default", "direct-gather"],
+            allow_layer_output_tolerance=True,
+            layer_output_max_abs_delta=0.001,
+            layer_output_max_ulp_delta=1,
+            layer_output_max_differing_elems=1,
+        )
+
+        self.assertEqual(
+            covered["recommendation"],
+            "current_layer_output_tolerance_covers_mismatches",
+        )
+        self.assertEqual(covered["modes_within_current_tolerance"], ["direct-gather"])
+        self.assertEqual(covered["modes_requiring_tolerance"], [])
+
+    def test_render_markdown_includes_layer_output_tolerance_policy(self):
+        script = sweep_qwen36_fused_routed_int4
+        baseline = row("default", ids=[11, 271])
+        candidate = row("direct-gather", ids=[11, 271], headline=90.0, ffn=40.0, wait=9.0)
+        baseline["layer_output_taps"] = [
+            {"position": 0, "layer": 7, "phase": "ffn", "checksum": "baseline"},
+        ]
+        candidate["layer_output_taps"] = [
+            {"position": 0, "layer": 7, "phase": "ffn", "checksum": "candidate"},
+        ]
+        baseline["layer_output_delta_taps"] = [
+            {
+                "position": 0,
+                "layer": 7,
+                "phase": "ffn",
+                "path": "chained",
+                "checksum": "baseline",
+                "bf16": "bdc1",
+            }
+        ]
+        candidate["layer_output_delta_taps"] = [
+            {
+                "position": 0,
+                "layer": 7,
+                "phase": "ffn",
+                "path": "decode_batch",
+                "checksum": "candidate",
+                "bf16": "bdc2",
+            }
+        ]
+        args = Namespace(
+            max_new_tokens=2,
+            context_size=64,
+            metal_profile=True,
+            metal_profile_phases=False,
+            promotion_max_headline_ratio=0.999,
+            promotion_max_ffn_ratio=0.999,
+            promotion_max_component_regression_ratio=1.10,
+            promotion_max_command_buffer_wait_ratio=1.05,
+            promotion_max_fused_wall_gpu_ratio=4.0,
+            promotion_max_wait_gpu_ratio=4.0,
+            promotion_require_profile=True,
+            promotion_allow_layer_output_tolerance=True,
+            promotion_layer_output_max_abs_delta=0.001,
+            promotion_layer_output_max_ulp_delta=1,
+            promotion_layer_output_max_differing_elems=1,
+        )
+
+        report = script.build_report(
+            [baseline, candidate],
+            args,
+            ["default", "direct-gather"],
+            "smoke",
+        )
+        md = script.render_markdown(report)
+
+        self.assertEqual(
+            report["summary"]["layer_output_tolerance_policy"]["recommendation"],
+            "current_layer_output_tolerance_covers_mismatches",
+        )
+        self.assertIn(
+            "layer_output_tolerance_recommendation: `current_layer_output_tolerance_covers_mismatches`",
+            md,
+        )
+        self.assertIn("## Layer Output Tolerance Policy", md)
+        self.assertIn("| hello | direct-gather | false | ok | 1 | 0 | 0 |", md)
+
     def test_promotion_gate_rejects_host_correction_diagnostic_modes(self):
         script = sweep_qwen36_fused_routed_int4
         for mode in (

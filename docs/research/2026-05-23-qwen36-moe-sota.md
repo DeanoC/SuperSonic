@@ -1953,6 +1953,49 @@ under the same smoke:
    optimization should not start until the correctness policy for this routed
    gate/up BF16 boundary is decided.
 
+54. **Qwen3.6 layer-output tolerance policy**
+   The fused-routed sweep is now schema `v31`. The sweep now summarizes an
+   explicit `layer_output_tolerance_policy` beside the existing promotion gate.
+   For each candidate mode and prompt it records whether layer-output checksum
+   mismatches have complete delta-tap evidence, the minimum required BF16
+   absolute-delta / ordered-ULP / differing-element thresholds, whether the
+   current promotion tolerance covers those mismatches, and whether the mode is
+   diagnostic-only. The Markdown report also renders a dedicated Layer Output
+   Tolerance Policy table so tolerance decisions are visible in review logs.
+
+   The shortest Metal smoke wrote
+   `/private/tmp/qwen36_layer_tolerance_policy_v31_1tok.{json,md}` with
+   `--modes default,full-stage5-router-simd-batch,full-stage5-router-simd-batch-shared-host-corrected,full-stage5-router-simd-batch-shared-routed-host-corrected
+   --max-new-tokens 1 --context-size 64 --metal-profile --layer-output-tap
+   --layer-output-delta-tap --layer-output-delta-all --no-promotion-require-profile`.
+   Generated IDs still matched (`[11]`), and no candidate was promotable. The
+   policy recommendation was
+   `choose_explicit_layer_output_tolerance_or_fix_kernel`, with no missing
+   delta evidence. The non-diagnostic `full-stage5-router-simd-batch` row had
+   `65` layer-output checksum mismatches. Its first mismatch was still layer
+   `7` FFN with `max_abs_delta=0.00048828125`, `max_ulp_delta=1`, and one
+   differing BF16 element, but tolerating the whole downstream stream would
+   require `max_abs_delta=0.15625`, `max_ulp_delta=31081`, and `1991`
+   differing elements. The shared-only diagnostic row had `13` mismatches and
+   would still require `max_abs_delta=0.0625`, `max_ulp_delta=30737`, and
+   `1951` differing elements. The shared+routed diagnostic remained at zero
+   layer-output mismatches.
+
+   That makes the policy decision clear: the current routed SIMD batch path
+   should not be promoted under a broad layer-output tolerance. The local first
+   cliffs are BF16-scale (`0.00048828125` at layer `7`, then `0.0001220703125`
+   at layer `33` after shared correction), but the uncorrected downstream
+   hidden stream diverges too far for an acceptable promotion threshold. The
+   next correctness step is a kernel fix for the routed expert gate/up/SwiGLU
+   accumulation/materialization boundary, not a tolerance-only gate change.
+   The performance profile remains useful after that fix lands: the measured
+   v31 run still classifies the FFN path as submit/residency heavy for the
+   correction diagnostics, while the uncorrected batch row shows large GPU work
+   under profile (`command_buffer_wait=829.747 ms`,
+   `fused_gpu_ms=799.781 ms`). Runtime optimization should resume only after a
+   non-diagnostic row reaches layer-output parity or a much narrower,
+   locally-proven tolerance.
+
 ## Sources
 
 - [Qwen/Qwen3.6-35B-A3B model card](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)
