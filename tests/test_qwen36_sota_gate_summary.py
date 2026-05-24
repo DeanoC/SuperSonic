@@ -162,6 +162,14 @@ class Qwen36SotaGateSummaryTests(unittest.TestCase):
             "run_or_refresh_gate_reports",
         )
         self.assertEqual(report["rows"][0]["recommendation_action"], "run_harness")
+        self.assertIn(
+            "sweep_qwen36_batched_prefill_variants.py",
+            report["rows"][0]["refresh_command"],
+        )
+        self.assertIn(
+            "sweep_qwen36_fused_routed_int4.py",
+            report["rows"][2]["refresh_command"],
+        )
 
     def test_runtime_promotion_pass_wins_next_action(self):
         script = summarize_qwen36_sota_gates
@@ -321,6 +329,10 @@ class Qwen36SotaGateSummaryTests(unittest.TestCase):
         self.assertFalse(report["summary"]["all_inputs_ok"])
         self.assertEqual(report["summary"]["status_counts"], {"stale": 6})
         self.assertEqual(report["rows"][0]["recommendation_action"], "refresh_harness")
+        self.assertIn(
+            "sweep_qwen36_batched_prefill_variants.py",
+            report["rows"][0]["refresh_command"],
+        )
         self.assertIn("report age", report["rows"][0]["error"])
         self.assertIsNotNone(report["rows"][0]["mtime_utc"])
         self.assertGreater(report["rows"][0]["age_seconds"], 3600.0)
@@ -335,6 +347,8 @@ class Qwen36SotaGateSummaryTests(unittest.TestCase):
 
             self.assertIn("Qwen3.6 Metal SOTA Gate Summary", md)
             self.assertIn("| Batched-prefill variants | ok | false |", md)
+            self.assertIn("## Refresh Commands", md)
+            self.assertIn("sweep_qwen36_fused_routed_int4.py", md)
             self.assertIn("keep_default_lane_and_select_next_measured_bottleneck", md)
 
             missing = root / "missing.json"

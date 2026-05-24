@@ -1333,10 +1333,10 @@ individual sweeps. It reads the batched-prefill variant sweep, static top-N
 runtime sweep, fused routed INT4 runtime sweep, MPS resident-table probe, route
 residency sweep, and MTP acceptance sweep JSON reports, then writes
 `target/qwen36_sota_gate_summary.{json,md}` with input status, report age,
-passed/failed gate IDs, candidate failures, and the next action. Missing reports
-are preserved as rows by default; use `--require --max-age-hours 24` when a local
-validation run should fail closed on absent, malformed, schema-mismatched,
-stale, or missing-gate artifacts.
+passed/failed gate IDs, candidate failures, refresh commands, and the next
+action. Missing reports are preserved as rows by default; use
+`--require --max-age-hours 24` when a local validation run should fail closed on
+absent, malformed, schema-mismatched, stale, or missing-gate artifacts.
 
 The first partial-hit resident MPS runtime prototype is opt-in behind
 `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_MPS_STATIC_TOPN_PARTIAL=1` plus the

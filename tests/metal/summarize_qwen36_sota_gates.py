@@ -12,7 +12,8 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA = "qwen36-sota-gate-summary-v3"
+MODEL_ROOT_ENV = 'SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models"'
+SCHEMA = "qwen36-sota-gate-summary-v4"
 
 
 @dataclass(frozen=True)
@@ -23,6 +24,7 @@ class GateSpec:
     expected_schema: str
     gate_keys: tuple[str, ...]
     kind: str
+    refresh_command: str
 
 
 GATE_SPECS = (
@@ -33,6 +35,10 @@ GATE_SPECS = (
         expected_schema="qwen36-metal-batched-prefill-variant-sweep-v2",
         gate_keys=("promotion_gate",),
         kind="runtime_promotion",
+        refresh_command=(
+            f"{MODEL_ROOT_ENV} python3 tests/metal/sweep_qwen36_batched_prefill_variants.py "
+            "--metal-profile"
+        ),
     ),
     GateSpec(
         gate_id="static_topn_runtime",
@@ -41,6 +47,10 @@ GATE_SPECS = (
         expected_schema="qwen36-static-topn-runtime-sweep-v3",
         gate_keys=("promotion_gate",),
         kind="runtime_promotion",
+        refresh_command=(
+            f"{MODEL_ROOT_ENV} python3 tests/metal/sweep_qwen36_static_topn_runtime.py "
+            "--modes default,static,static-hotset,mps-static-partial --metal-profile"
+        ),
     ),
     GateSpec(
         gate_id="fused_routed_int4",
@@ -49,6 +59,10 @@ GATE_SPECS = (
         expected_schema="qwen36-fused-routed-int4-sweep-v1",
         gate_keys=("promotion_gate",),
         kind="runtime_promotion",
+        refresh_command=(
+            f"{MODEL_ROOT_ENV} python3 tests/metal/sweep_qwen36_fused_routed_int4.py "
+            "--prompt-set smoke --metal-profile"
+        ),
     ),
     GateSpec(
         gate_id="mps_resident_table",
@@ -57,6 +71,10 @@ GATE_SPECS = (
         expected_schema="qwen36-mps-resident-table-probe-v2",
         gate_keys=("viability_gate",),
         kind="viability",
+        refresh_command=(
+            f"{MODEL_ROOT_ENV} python3 tests/metal/probe_qwen36_mps_resident_table.py "
+            "--run-pilot --require-pilot"
+        ),
     ),
     GateSpec(
         gate_id="route_residency",
@@ -65,6 +83,10 @@ GATE_SPECS = (
         expected_schema="qwen36-route-residency-sweep-v1",
         gate_keys=("decision_gate",),
         kind="residency_decision",
+        refresh_command=(
+            f"{MODEL_ROOT_ENV} python3 tests/metal/sweep_qwen36_route_residency.py "
+            "--prompt-set smoke"
+        ),
     ),
     GateSpec(
         gate_id="mtp_acceptance",
@@ -73,6 +95,10 @@ GATE_SPECS = (
         expected_schema="qwen36-moe-mtp-acceptance-sweep-v2",
         gate_keys=("promotion_gate",),
         kind="runtime_promotion",
+        refresh_command=(
+            f"{MODEL_ROOT_ENV} python3 tests/metal/sweep_qwen36_mtp_acceptance.py "
+            "--prompt-set smoke --metal-experiment"
+        ),
     ),
 )
 
@@ -185,6 +211,7 @@ def build_gate_row(
         "label": spec.label,
         "kind": spec.kind,
         "path": str(path),
+        "refresh_command": spec.refresh_command,
         "mtime_utc": mtime_utc,
         "age_seconds": age_seconds,
         "max_age_seconds": max_age_seconds,
@@ -442,6 +469,17 @@ def render_markdown(report: dict[str, Any]) -> str:
                 age=fmt_age(row.get("age_seconds")),
             )
         )
+    lines.extend(
+        [
+            "",
+            "## Refresh Commands",
+            "",
+            "| Gate | Command |",
+            "|:---|:---|",
+        ]
+    )
+    for row in report["rows"]:
+        lines.append(f"| {row['label']} | `{row['refresh_command']}` |")
     lines.extend(
         [
             "",
