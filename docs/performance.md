@@ -1138,15 +1138,17 @@ also enables `SUPERSONIC_METAL_PROFILE=1` only for the profile attribution run
 so the profile JSON includes `metal_profile` and `hal_profile` objects with
 parseable per-op rows without replacing the unprofiled stage table. These are
 runtime-adjacent MPP/MPS pilot measurements, not model matmul replacements. The
-attribution maps are stored in the same schema-v8 perf JSON as
+attribution maps are stored in the same schema-v9 perf JSON as
 `stage_timings`, `chain_breakdown`, `lifecycle_timings`, `mpp_pilot`,
 `mps_expert_pilot`, `metal_profile`, and `hal_profile` without feeding back into
 the headline median. When the profile pass carries extra split-dispatch
 overhead, its timing maps are kept separately as `profile_stage_timings`,
-`profile_chain_breakdown`, and `profile_lifecycle_timings`. Schema v8 also
+`profile_chain_breakdown`, and `profile_lifecycle_timings`. Schema v9 also
 preserves typed Qwen3.6 expert-residency policy rows with `resident_format`,
 `scope`, `miss_policy`, `capacity`, and the numeric counters so perf artifacts
-retain the scheduler identity.
+retain the scheduler identity, and `meta.json` records git dirty paths plus a
+worktree diff hash so selector auto-discovery consumes only artifacts matching
+the current checkout unless a historical JSON is supplied explicitly.
 
 <!-- AUTOGEN BELOW: apple-m5-max-metal -->
 | Model           |  INT4 |
@@ -1175,7 +1177,7 @@ Latest local attribution run
 | MPS expert pilot down | 0.338 ms, 4.961 TFLOP/s |
 
 The headline median is the unprofiled median-of-3 run (`150.4`, `145.5`,
-`141.8` ms/token). Schema-v8 stores unprofiled stage timings in
+`141.8` ms/token). Current schema-v9 runs store unprofiled stage timings in
 `stage_timings` and preserves the split-profile timing maps under the
 `profile_*` fields; the profile pass still shows `qwen36_linear_int4_stage5`
 and `command_buffer_wait` as the top Metal rows, but the normal stage table no
@@ -1475,7 +1477,7 @@ both fused candidates failing headline, FFN, and command-buffer-wait gates.
 
 The first MPS bridge step is now an attribution probe, not a decode path. With
 `SUPERSONIC_METAL_QWEN36_MPS_EXPERT_PILOT=1`, the runner appends a
-`[qwen36-moe mps-expert-pilot]` row and bench perf JSON schema v8 records it as
+`[qwen36-moe mps-expert-pilot]` row and bench perf JSON schema v9 records it as
 `mps_expert_pilot`. This probe uses resident FP16 MPSMatrix inputs shaped like
 the active-expert gate/up and down GEMVs; it does not consume the GPTQ INT4
 expert tensors. On a one-token M5 Max smoke, the model still generated `[11]`

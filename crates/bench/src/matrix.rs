@@ -329,6 +329,9 @@ pub struct MatrixConfig {
     pub measurement_runs: u32,
     pub cooldown_seconds: u32,
     pub git_sha: String,
+    pub git_dirty: bool,
+    pub git_dirty_paths: Vec<String>,
+    pub git_diff_hash: Option<String>,
     pub runner_version: String,
 }
 
@@ -345,6 +348,9 @@ pub fn run_matrix(cfg: &MatrixConfig, rd: &RunDir) -> Result<()> {
             .to_string(),
         timestamp_utc: Utc::now().to_rfc3339(),
         git_sha: cfg.git_sha.clone(),
+        git_dirty: cfg.git_dirty,
+        git_dirty_paths: cfg.git_dirty_paths.clone(),
+        git_diff_hash: cfg.git_diff_hash.clone(),
         hostname: hostname_or_unknown(),
         arch: cfg.arch.as_str().to_string(),
         rocminfo: capture_cmd("rocminfo"),

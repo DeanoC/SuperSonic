@@ -18,6 +18,7 @@ SPEC.loader.exec_module(selector)
 
 
 def write_json(path: Path, payload: dict) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload) + "\n")
     return path
 
@@ -105,7 +106,7 @@ def prefill_report() -> dict:
 
 def bench_perf_report() -> dict:
     return {
-        "schema_version": 8,
+        "schema_version": 9,
         "model": selector.MODEL,
         "quant": "int4",
         "arch": "apple-m5-max",
@@ -153,6 +154,7 @@ class Qwen36NextBottleneckTests(unittest.TestCase):
             "prefill_json": root / "prefill.json",
             "bench_perf_json": None,
             "bench_run_root": root / "empty-bench-runs",
+            "repo_root": root / "not-a-git-repo",
             "out_json": root / "next.json",
             "out_md": root / "next.md",
         }
@@ -206,8 +208,8 @@ class Qwen36NextBottleneckTests(unittest.TestCase):
             md = selector.render_markdown(report)
 
         self.assertEqual(report["schema"], selector.SCHEMA)
-        self.assertEqual(report["input_reports"]["bench_perf"]["schema"], 8)
-        self.assertEqual(report["bench_perf"]["schema_version"], 8)
+        self.assertEqual(report["input_reports"]["bench_perf"]["schema"], 9)
+        self.assertEqual(report["bench_perf"]["schema_version"], 9)
         self.assertEqual(report["bench_perf"]["linear_attn_ms_avg"], 31.335)
         self.assertEqual(report["bench_perf"]["profile_linear_attn_ms_avg"], 53.165)
         buckets = {row["bucket"]: row for row in report["decode_bucket_ranking"]}
@@ -221,6 +223,76 @@ class Qwen36NextBottleneckTests(unittest.TestCase):
         self.assertEqual(report["top_metal_profile_ops"][0]["source"], "bench_perf")
         self.assertIn("## Bench Perf", md)
         self.assertIn("profile_linear_attn_ms_avg", md)
+
+    def test_auto_discovers_matching_bench_perf_fingerprint_before_newer_stale_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_root = root / "bench-runs"
+            matching = run_root / "2026-05-24-match" / "perf" / "qwen3.6-35b-a3b_int4.json"
+            stale = run_root / "2026-05-24-stale" / "perf" / "qwen3.6-35b-a3b_int4.json"
+            write_json(matching, bench_perf_report())
+            write_json(stale, {**bench_perf_report(), "ms_per_step": 999.0})
+            write_json(
+                matching.parent.parent / "meta.json",
+                {
+                    "schema_version": 9,
+                    "git_sha": "abc1234",
+                    "git_dirty": True,
+                    "git_dirty_paths": ["crates/kernel-ffi/src/metal_native.mm"],
+                    "git_diff_hash": "current",
+                },
+            )
+            write_json(
+                stale.parent.parent / "meta.json",
+                {
+                    "schema_version": 9,
+                    "git_sha": "abc1234",
+                    "git_dirty": True,
+                    "git_dirty_paths": ["crates/kernel-ffi/src/metal_native.mm"],
+                    "git_diff_hash": "old-experiment",
+                },
+            )
+
+            selected = selector.latest_bench_perf_json(
+                run_root,
+                {
+                    "git_sha": "abc1234",
+                    "git_dirty": True,
+                    "git_dirty_paths": ["crates/runner/src/main.rs"],
+                    "git_diff_hash": "current",
+                },
+            )
+
+        self.assertEqual(selected, matching)
+
+    def test_auto_discovery_skips_bench_perf_when_current_fingerprint_has_no_match(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_root = root / "bench-runs"
+            stale = run_root / "2026-05-24-stale" / "perf" / "qwen3.6-35b-a3b_int4.json"
+            write_json(stale, bench_perf_report())
+            write_json(
+                stale.parent.parent / "meta.json",
+                {
+                    "schema_version": 9,
+                    "git_sha": "abc1234",
+                    "git_dirty": True,
+                    "git_dirty_paths": ["crates/kernel-ffi/src/metal_native.mm"],
+                    "git_diff_hash": "old-experiment",
+                },
+            )
+
+            selected = selector.latest_bench_perf_json(
+                run_root,
+                {
+                    "git_sha": "abc1234",
+                    "git_dirty": True,
+                    "git_dirty_paths": ["crates/runner/src/main.rs"],
+                    "git_diff_hash": "current",
+                },
+            )
+
+        self.assertIsNone(selected)
 
     def test_defers_when_sota_summary_has_specific_next_action(self):
         with tempfile.TemporaryDirectory() as tmp:

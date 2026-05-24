@@ -4,14 +4,16 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import statistics
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
 
 
-SCHEMA = "qwen36-next-bottleneck-v2"
+SCHEMA = "qwen36-next-bottleneck-v3"
 MODEL = "qwen3.6-35b-a3b"
 BACKEND = "metal"
 FALLBACK_ACTION = "keep_default_lane_and_select_next_measured_bottleneck"
@@ -41,7 +43,111 @@ def load_report(path: Path) -> tuple[dict[str, Any] | None, str | None]:
     return loaded, None
 
 
-def latest_bench_perf_json(run_root: Path) -> Path | None:
+def run_cmd(args: list[str], cwd: Path | None = None) -> str | None:
+    try:
+        proc = subprocess.run(
+            args,
+            cwd=cwd,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        return None
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.decode("utf-8", errors="replace")
+
+
+def parse_git_dirty_paths(status: str) -> list[str]:
+    paths: list[str] = []
+    for line in status.splitlines():
+        if len(line) < 4:
+            continue
+        path = line[3:].strip()
+        if not path:
+            continue
+        if " -> " in path:
+            path = path.split(" -> ", 1)[1]
+        paths.append(path.strip('"'))
+    return paths
+
+
+def git_fingerprint(repo_root: Path) -> dict[str, Any] | None:
+    git_sha = run_cmd(["git", "rev-parse", "--short", "HEAD"], cwd=repo_root)
+    if git_sha is None:
+        return None
+    status = run_cmd(
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+        cwd=repo_root,
+    )
+    diff = run_cmd(["git", "diff", "--binary", "HEAD"], cwd=repo_root)
+    if status is None or diff is None:
+        return None
+    digest = hashlib.sha256()
+    digest.update(status.encode())
+    digest.update(b"\0")
+    digest.update(diff.encode())
+    dirty_paths = parse_git_dirty_paths(status)
+    return {
+        "git_sha": git_sha.strip(),
+        "git_dirty": bool(dirty_paths),
+        "git_dirty_paths": dirty_paths,
+        "git_diff_hash": digest.hexdigest(),
+    }
+
+
+def bench_perf_meta_path(perf_path: Path) -> Path:
+    return perf_path.parent.parent / "meta.json"
+
+
+def load_bench_perf_meta(perf_path: Path | None) -> dict[str, Any] | None:
+    if perf_path is None:
+        return None
+    meta_path = bench_perf_meta_path(perf_path)
+    if not meta_path.exists():
+        return None
+    try:
+        loaded = json.loads(meta_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    return loaded if isinstance(loaded, dict) else None
+
+
+def fingerprint_matches(meta: dict[str, Any] | None, current: dict[str, Any] | None) -> bool:
+    if not meta or not current:
+        return False
+    return (
+        meta.get("git_sha") == current.get("git_sha")
+        and meta.get("git_diff_hash") is not None
+        and meta.get("git_diff_hash") == current.get("git_diff_hash")
+    )
+
+
+def bench_perf_candidate_score(
+    path: Path,
+    current_fingerprint: dict[str, Any] | None,
+) -> tuple[int, float]:
+    meta = load_bench_perf_meta(path)
+    if fingerprint_matches(meta, current_fingerprint):
+        score = 3
+    elif (
+        meta
+        and current_fingerprint
+        and meta.get("git_sha") == current_fingerprint.get("git_sha")
+    ):
+        score = 2
+    elif meta:
+        score = 1
+    else:
+        score = 0
+    return (score, path.stat().st_mtime)
+
+
+def latest_bench_perf_json(
+    run_root: Path,
+    current_fingerprint: dict[str, Any] | None = None,
+) -> Path | None:
     candidates = [
         path
         for path in run_root.glob("*/perf/qwen3.6-35b-a3b_int4.json")
@@ -49,7 +155,16 @@ def latest_bench_perf_json(run_root: Path) -> Path | None:
     ]
     if not candidates:
         return None
-    return max(candidates, key=lambda path: path.stat().st_mtime)
+    if current_fingerprint is not None:
+        matching = [
+            path
+            for path in candidates
+            if fingerprint_matches(load_bench_perf_meta(path), current_fingerprint)
+        ]
+        if not matching:
+            return None
+        return max(matching, key=lambda path: path.stat().st_mtime)
+    return max(candidates, key=lambda path: bench_perf_candidate_score(path, current_fingerprint))
 
 
 def report_schema(report: dict[str, Any] | None) -> Any:
@@ -152,6 +267,8 @@ def bench_perf_runtime_report(report: dict[str, Any]) -> dict[str, Any] | None:
 def summarize_bench_perf(
     report: dict[str, Any] | None,
     path: Path | None,
+    meta: dict[str, Any] | None = None,
+    current_fingerprint: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     if not report or report.get("status") != "ok":
         return None
@@ -172,6 +289,10 @@ def summarize_bench_perf(
         "profile_linear_attn_ms_avg": profile_chain.get("linear_attn_ms_avg"),
         "profile_full_attn_ms_avg": profile_chain.get("full_attn_ms_avg"),
         "profile_lm_head_ms_avg": profile_stage.get("lm_head_ms_avg"),
+        "git_sha": (meta or {}).get("git_sha"),
+        "git_dirty": (meta or {}).get("git_dirty"),
+        "git_diff_hash": (meta or {}).get("git_diff_hash"),
+        "fingerprint_match": fingerprint_matches(meta, current_fingerprint),
     }
 
 
@@ -355,13 +476,16 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         elif report is not None:
             loaded[name] = report
 
+    current_fingerprint = git_fingerprint(getattr(args, "repo_root", Path(".")))
     bench_perf_path = getattr(args, "bench_perf_json", None)
     bench_perf_explicit = bench_perf_path is not None
     if bench_perf_path is None:
         bench_perf_path = latest_bench_perf_json(
-            getattr(args, "bench_run_root", Path("target/bench-runs"))
+            getattr(args, "bench_run_root", Path("target/bench-runs")),
+            current_fingerprint,
         )
     bench_perf_report = None
+    bench_perf_meta = None
     if bench_perf_path is None:
         input_reports["bench_perf"] = {
             "path": None,
@@ -371,11 +495,16 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         }
     else:
         report, error = load_report(bench_perf_path)
+        bench_perf_meta = load_bench_perf_meta(bench_perf_path)
         input_reports["bench_perf"] = {
             "path": str(bench_perf_path),
             "status": "ok" if error is None else "error",
             "error": error,
             "schema": report_schema(report),
+            "git_sha": (bench_perf_meta or {}).get("git_sha"),
+            "git_dirty": (bench_perf_meta or {}).get("git_dirty"),
+            "git_diff_hash": (bench_perf_meta or {}).get("git_diff_hash"),
+            "fingerprint_match": fingerprint_matches(bench_perf_meta, current_fingerprint),
         }
         if error is not None and bench_perf_explicit:
             errors.append(f"bench_perf: {error}")
@@ -407,7 +536,13 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         ),
         "recommendation": recommendation,
         "decode_bucket_ranking": bucket_rows,
-        "bench_perf": summarize_bench_perf(bench_perf_report, bench_perf_path),
+        "current_fingerprint": current_fingerprint,
+        "bench_perf": summarize_bench_perf(
+            bench_perf_report,
+            bench_perf_path,
+            bench_perf_meta,
+            current_fingerprint,
+        ),
         "prefill": summarize_prefill(loaded.get("batched_prefill_variants")),
         "top_metal_profile_ops": top_profile_entries(runtime_reports, "metal_profile"),
         "top_hal_profile_ops": top_profile_entries(runtime_reports, "hal_profile"),
@@ -480,6 +615,9 @@ def render_markdown(report: dict[str, Any]) -> str:
                 "",
                 f"- path: `{bench.get('path') or '-'}`",
                 f"- schema_version: `{bench.get('schema_version') or '-'}`",
+                f"- git_sha: `{bench.get('git_sha') or '-'}`",
+                f"- git_dirty: `{str(bench.get('git_dirty')).lower() if bench.get('git_dirty') is not None else '-'}`",
+                f"- fingerprint_match: `{str(bool(bench.get('fingerprint_match'))).lower()}`",
                 f"- ms_per_step: `{fmt_float(bench.get('ms_per_step'))}`",
                 f"- linear_attn_ms_avg: `{fmt_float(bench.get('linear_attn_ms_avg'))}`",
                 f"- profile_linear_attn_ms_avg: `{fmt_float(bench.get('profile_linear_attn_ms_avg'))}`",
@@ -548,6 +686,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         type=Path,
         default=Path("target/bench-runs"),
         help="run root used to auto-discover the latest bench-perf JSON",
+    )
+    parser.add_argument(
+        "--repo-root",
+        type=Path,
+        default=Path("."),
+        help="repo root used to fingerprint the current checkout for bench-perf auto-discovery",
     )
     parser.add_argument(
         "--out-json",

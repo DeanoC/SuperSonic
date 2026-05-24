@@ -197,7 +197,7 @@ fi
     };
 
     let cell = run_one_combo(&invocation, &policy).unwrap();
-    assert_eq!(cell.schema_version, 8);
+    assert_eq!(cell.schema_version, 9);
     assert_eq!(
         cell.stage_timings
             .as_ref()

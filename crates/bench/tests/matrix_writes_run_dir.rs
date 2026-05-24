@@ -18,6 +18,9 @@ fn matrix_writes_meta_and_at_least_one_perf_cell() {
         measurement_runs: 1,
         cooldown_seconds: 0,
         git_sha: "test".into(),
+        git_dirty: false,
+        git_dirty_paths: vec![],
+        git_diff_hash: Some("clean".into()),
         runner_version: "test 0.0.0".into(),
     };
     let rd = RunDir::new(tmp.path().join("run-1"));
@@ -49,6 +52,9 @@ fn matrix_skips_unsupported_combo_with_skipped_status() {
         measurement_runs: 1,
         cooldown_seconds: 0,
         git_sha: "test".into(),
+        git_dirty: false,
+        git_dirty_paths: vec![],
+        git_diff_hash: Some("clean".into()),
         runner_version: "test 0.0.0".into(),
     };
     let rd = RunDir::new(tmp.path().join("run-skip"));
@@ -88,6 +94,9 @@ fn matrix_runs_ad_hoc_sm86_specprefill_lane() {
         measurement_runs: 1,
         cooldown_seconds: 0,
         git_sha: "test".into(),
+        git_dirty: false,
+        git_dirty_paths: vec![],
+        git_diff_hash: Some("clean".into()),
         runner_version: "test 0.0.0".into(),
     };
     let rd = RunDir::new(tmp.path().join("run-ad-hoc-spec"));

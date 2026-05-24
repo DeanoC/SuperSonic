@@ -11,6 +11,9 @@ fn meta_json_round_trip() {
         run_id: "2026-05-05-abc1234".to_string(),
         timestamp_utc: "2026-05-05T12:00:00Z".to_string(),
         git_sha: "abc1234".to_string(),
+        git_dirty: true,
+        git_dirty_paths: vec!["crates/kernel-ffi/src/metal_native.mm".to_string()],
+        git_diff_hash: Some("hash123".to_string()),
         hostname: "test-host".to_string(),
         arch: "gfx1100".to_string(),
         rocminfo: "Agent 1: gfx1100".to_string(),
@@ -22,6 +25,12 @@ fn meta_json_round_trip() {
     let s = serde_json::to_string(&meta).unwrap();
     let parsed: MetaJson = serde_json::from_str(&s).unwrap();
     assert_eq!(parsed.run_id, "2026-05-05-abc1234");
+    assert!(parsed.git_dirty);
+    assert_eq!(
+        parsed.git_dirty_paths,
+        vec!["crates/kernel-ffi/src/metal_native.mm".to_string()]
+    );
+    assert_eq!(parsed.git_diff_hash.as_deref(), Some("hash123"));
     assert_eq!(parsed.gpu_temp_c_pre, Some(45.0));
     assert_eq!(parsed.gpu_temp_c_post, None);
 }
@@ -88,7 +97,7 @@ fn perf_cell_preserves_qwen36_expert_residency_policy_labels() {
     metrics.insert("copied_bytes".to_string(), 2014248960.0);
 
     let cell = PerfCellJson {
-        schema_version: 8,
+        schema_version: 9,
         model: "qwen3.6-35b-a3b".into(),
         quant: "int4".into(),
         arch: "apple-m5-max".into(),

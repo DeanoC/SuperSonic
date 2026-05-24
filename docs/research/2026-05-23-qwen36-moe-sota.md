@@ -601,13 +601,18 @@ under the same smoke:
    Close the loop when every SOTA runtime fork is negative. `tests/metal/select_qwen36_next_bottleneck.py`
    reads the refreshed SOTA gate summary plus the profiled default rows from
    the static top-N, fused routed INT4, LRU resident-cache, batched-prefill
-   sweeps, and the latest optional `bench-perf` schema-v8 Qwen3.6 INT4
+   sweeps, and the latest optional `bench-perf` schema-v9 Qwen3.6 INT4
    artifact under `target/bench-runs`. It ranks decode buckets, records the
    prefill best-vs-baseline row, preserves top Metal/HAL profile ops, and writes
-   `target/qwen36_next_bottleneck.{json,md}`. If FFN is still the dominant
-   bucket but the resident/static/fused/MPS/LRU FFN forks have all failed or
-   been superseded, the selector names the largest non-exhausted bucket instead
-   of looping back to an already-negative FFN residency path.
+   `target/qwen36_next_bottleneck.{json,md}`. The v3 selector also reads
+   adjacent `meta.json` worktree fingerprints and only auto-consumes bench
+   artifacts whose git SHA plus diff hash match the current checkout, so
+   rejected uncommitted experiments do not silently become the headline default.
+   Historical JSON can still be supplied explicitly with `--bench-perf-json`.
+   If FFN is still the dominant bucket but the resident/static/fused/MPS/LRU FFN
+   forks have all failed or been superseded, the selector names the largest
+   non-exhausted bucket instead of looping back to an already-negative FFN
+   residency path.
 
 13. **Qwen3.6 linear-attention decode direct-output handoff**
    Act on the selector's first recommendation with a small orchestration
@@ -624,16 +629,18 @@ under the same smoke:
 
 14. **Qwen3.6 bench attribution split**
    Keep the next-bottleneck selector honest by separating normal timing
-   attribution from split-dispatch Metal profiling. `bench-perf` schema v8
+   attribution from split-dispatch Metal profiling. `bench-perf` schema v9
    stores `stage_timings`, `chain_breakdown`, and `lifecycle_timings` from an
    unprofiled `--emit-stage-timings` run, then runs a separate
    `SUPERSONIC_METAL_PROFILE=1` attribution pass for `metal_profile` and
    `hal_profile`. The profiled timing maps remain available under
    `profile_stage_timings`, `profile_chain_breakdown`, and
    `profile_lifecycle_timings`, so command-buffer split overhead can be studied
-   without making it the headline stage attribution. The next-bottleneck
-   selector's v2 schema consumes this artifact when present, keeping the
-   current headline run in the same evidence bundle as the narrower sweep rows.
+   without making it the headline stage attribution. The same run directory's
+   `meta.json` now includes git dirty paths and a diff hash for selector
+   artifact hygiene. The next-bottleneck selector's v3 schema consumes this
+   artifact when present, keeping the current headline run in the same evidence
+   bundle as the narrower sweep rows.
 
 15. **Qwen3.6 linear INT4 paired-nibble projection loop**
    Act on the selector's linear-attention target inside the measured dominant

@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
-pub const SCHEMA_VERSION: u32 = 8;
+pub const SCHEMA_VERSION: u32 = 9;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetaJson {
@@ -11,6 +11,12 @@ pub struct MetaJson {
     pub run_id: String,
     pub timestamp_utc: String,
     pub git_sha: String,
+    #[serde(default)]
+    pub git_dirty: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub git_dirty_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_diff_hash: Option<String>,
     pub hostname: String,
     pub arch: String,
     pub rocminfo: String,
