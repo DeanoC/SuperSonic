@@ -1537,6 +1537,96 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
         self.assertEqual(comparison["max_ulp_delta"], 64)
         self.assertEqual(comparison["differing_elems"], 1)
 
+    def test_ffn_residual_delta_attribution_links_parity_rows(self):
+        script = sweep_qwen36_fused_routed_int4
+        output = (
+            "[qwen36-layer-output-delta-tap] call=0 position=0 cache_pos=0 "
+            "path=chained phase_profile=0 layer=7 phase=ffn elems=2 "
+            "checksum=aaaabbbbccccdddd bf16=3c00,bdc1\n"
+        )
+        candidate_output = (
+            "[qwen36-layer-output-delta-tap] call=0 position=0 cache_pos=0 "
+            "path=decode_batch phase_profile=0 layer=7 phase=ffn elems=2 "
+            "checksum=ffffbbbbccccdddd bf16=3c00,bdc2\n"
+        )
+
+        default = row("default")
+        default["layer_output_delta_taps"] = script.parse_layer_output_delta_taps(output)
+        candidate = row("full-stage5-router-simd-batch")
+        candidate["layer_output_delta_taps"] = script.parse_layer_output_delta_taps(
+            candidate_output
+        )
+        candidate["decode_batch_shared_parity_taps"] = [
+            {
+                "position": 0,
+                "layer": 7,
+                "shared_out_argmax": 1,
+                "shared_out_max_abs": 0.0000610351562,
+                "host_shared_out_at_argmax": 0.0123901367,
+                "metal_shared_out_at_argmax": 0.0123291016,
+            }
+        ]
+        candidate["decode_batch_routed_parity_taps"] = [
+            {
+                "position": 0,
+                "layer": 7,
+                "topk_idx_match": 1,
+                "moe_out_argmax": 10,
+                "moe_out_max_abs": 0.0000152587891,
+                "host_moe_out_at_argmax": -0.00253295898,
+                "metal_moe_out_at_argmax": -0.0025177002,
+                "final_out_argmax": 1,
+                "final_out_max_abs": 0.00048828125,
+                "host_final_out_at_argmax": -0.0942382812,
+                "metal_final_out_at_argmax": -0.0947265625,
+            }
+        ]
+
+        args = Namespace(
+            max_new_tokens=1,
+            context_size=64,
+            metal_profile=False,
+            metal_profile_phases=False,
+            downstream_parity_tap=False,
+            layer_output_tap=False,
+            layer_output_delta_tap=True,
+            layer_output_delta_position=0,
+            layer_output_delta_layer=7,
+            layer_output_delta_phase="ffn",
+            router_parity_tap=False,
+            router_parity_tap_max_calls=40,
+            shared_parity_tap=False,
+            shared_parity_tap_max_calls=40,
+            routed_parity_tap=True,
+            routed_parity_tap_max_calls=40,
+            decode_batch_route_snapshot=False,
+            promotion_max_headline_ratio=0.999,
+            promotion_max_ffn_ratio=0.999,
+            promotion_max_component_regression_ratio=1.10,
+            promotion_max_command_buffer_wait_ratio=1.05,
+            promotion_max_fused_wall_gpu_ratio=4.0,
+            promotion_max_wait_gpu_ratio=4.0,
+            promotion_require_profile=False,
+        )
+        report = script.build_report(
+            [default, candidate],
+            args,
+            ["default", "full-stage5-router-simd-batch"],
+            "smoke",
+        )
+        md = script.render_markdown(report)
+        summary = report["summary"]["ffn_residual_delta_attribution"]
+        first = summary["first"]
+
+        self.assertEqual(summary["item_count"], 1)
+        self.assertEqual(first["delta_idx"], 1)
+        self.assertTrue(first["shared_out_argmax_matches_delta"])
+        self.assertTrue(first["final_out_argmax_matches_delta"])
+        self.assertEqual(first["source"], "shared_out_residual_rounding_boundary")
+        self.assertAlmostEqual(first["shared_out_delta_at_argmax"], -0.0000610351)
+        self.assertIn("ffn_residual_delta_first_source: `shared_out_residual_rounding_boundary`", md)
+        self.assertIn("## FFN Residual Delta Attribution", md)
+
     def test_router_parity_tap_selection_keeps_each_path(self):
         script = sweep_qwen36_fused_routed_int4
         tap_rows = []

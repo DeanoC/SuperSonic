@@ -1633,6 +1633,47 @@ under the same smoke:
    stage-5 decode-batch hidden-stream parity under the layer-output tap, with
    performance promotion gated on those checksums before headline speed.
 
+46. **Qwen3.6 FFN residual delta attribution**
+   The fused-routed sweep is now schema `v22` and adds a derived
+   `ffn_residual_delta_attribution` summary. When
+   `--layer-output-delta-tap` is combined with decode-batch shared and routed
+   parity taps, the reporter now joins the first FFN row delta with the
+   matching shared/routed parity rows for the same prompt, position, and
+   layer. The JSON and Markdown rows name the delta index, shared-out argmax,
+   MoE-out argmax, final-out argmax, top-k parity, and a coarse source label
+   such as `shared_out_residual_rounding_boundary`.
+
+   The verification run used `--modes default,full-stage5-router-simd-batch
+   --max-new-tokens 2 --metal-profile --shared-parity-tap
+   --shared-parity-tap-max-calls 80 --routed-parity-tap
+   --routed-parity-tap-max-calls 80 --downstream-parity-tap
+   --layer-output-tap --layer-output-delta-tap
+   --layer-output-delta-position 0 --layer-output-delta-layer 7
+   --layer-output-delta-phase ffn`. Generated IDs still matched
+   (`[11,271]`), while promotion stayed blocked by the tapped hidden stream.
+   The first layer-output mismatch remained position `0`, layer `7`, phase
+   `ffn`, and the filtered numeric row had a single BF16 element different:
+   index `1621`, default `-0.09423828125`, decode-batch `-0.0947265625`,
+   `max_abs_delta=0.00048828125`, `max_ulp_delta=1`.
+
+   The new attribution row connected that same index to shared and final
+   residual parity: top-k indices and top-k weights matched exactly,
+   `shared_out_argmax=1621` with host `0.0123901367` versus Metal
+   `0.0123291016`, while `final_out_argmax=1621` reproduced the one-ULP final
+   hidden delta. The MoE max was elsewhere (`moe_out_argmax=1107`,
+   `max_moe_out_abs=1.52587891e-5`), so the current root-cause label is
+   `shared_out_residual_rounding_boundary`.
+
+   The next implementation target is therefore the native shared path's
+   materialization math, especially `silu(shared_gate) * shared_up` feeding
+   `shared_down`, and the final residual BF16 rounding boundary. Router SIMD
+   and top-k are not the blocker for this measured row. A bit-exact fix should
+   first try to make the host-order Metal shared path reproduce the chained
+   CPU/shared result at index `1621`; if that proves too expensive or
+   inherently cross-math-library sensitive, the alternative is an explicitly
+   documented eval/tolerance promotion policy rather than silently relaxing the
+   checksum gate.
+
 ## Sources
 
 - [Qwen/Qwen3.6-35B-A3B model card](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)

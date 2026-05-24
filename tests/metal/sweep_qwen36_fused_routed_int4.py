@@ -16,7 +16,7 @@ from typing import Any
 
 
 MODEL = "qwen3.6-35b-a3b"
-SCHEMA = "qwen36-fused-routed-int4-sweep-v21"
+SCHEMA = "qwen36-fused-routed-int4-sweep-v22"
 DEFAULT_MAX_FUSED_WALL_GPU_RATIO = 4.0
 DEFAULT_MAX_WAIT_GPU_RATIO = 4.0
 COARSE_BATCH_SERIAL_MODE = "full-stage5-router-batch"
@@ -969,6 +969,151 @@ def summarize_layer_output_delta_taps(rows: list[dict[str, Any]]) -> dict[str, A
         ),
         "first_mismatch": mismatches[0] if mismatches else None,
         "comparisons": comparisons,
+    }
+
+
+def matching_decode_batch_tap(
+    row: dict[str, Any],
+    field: str,
+    position: int,
+    layer: int,
+) -> dict[str, Any] | None:
+    for tap in row.get(field) or []:
+        if int(tap.get("position", -1)) == position and int(tap.get("layer", -1)) == layer:
+            return tap
+    return None
+
+
+def numeric_delta(a: Any, b: Any) -> float | None:
+    if a is None or b is None:
+        return None
+    return float(b) - float(a)
+
+
+def build_ffn_residual_delta_attribution(
+    rows: list[dict[str, Any]],
+    delta_summary: dict[str, Any],
+) -> dict[str, Any]:
+    rows_by_key = {
+        (str(row.get("prompt_id", "")), str(row.get("mode", ""))): row
+        for row in rows
+    }
+    items: list[dict[str, Any]] = []
+    for comparison in delta_summary.get("comparisons") or []:
+        if comparison.get("checksum_match") is not False:
+            continue
+        if str(comparison.get("phase", "")) != "ffn":
+            continue
+
+        prompt_id = str(comparison.get("prompt_id", ""))
+        mode = str(comparison.get("mode", ""))
+        position = int(comparison.get("position", -1))
+        layer = int(comparison.get("layer", -1))
+        delta_idx = int(comparison.get("max_abs_delta_idx", -1))
+        row = rows_by_key.get((prompt_id, mode), {})
+        shared = matching_decode_batch_tap(
+            row,
+            "decode_batch_shared_parity_taps",
+            position,
+            layer,
+        )
+        routed = matching_decode_batch_tap(
+            row,
+            "decode_batch_routed_parity_taps",
+            position,
+            layer,
+        )
+
+        shared_idx = None if shared is None else int(shared.get("shared_out_argmax", -1))
+        moe_idx = None if routed is None else int(routed.get("moe_out_argmax", -1))
+        final_idx = None if routed is None else int(routed.get("final_out_argmax", -1))
+        shared_matches = shared_idx == delta_idx
+        moe_matches = moe_idx == delta_idx
+        final_matches = final_idx == delta_idx
+        topk_match = None if routed is None else bool(routed.get("topk_idx_match"))
+
+        if final_matches and shared_matches and topk_match is not False:
+            source = "shared_out_residual_rounding_boundary"
+        elif final_matches and moe_matches and topk_match is not False:
+            source = "moe_out_residual_rounding_boundary"
+        elif final_matches and topk_match is not False:
+            source = "final_residual_rounding_boundary"
+        elif shared_matches:
+            source = "shared_out_delta"
+        elif moe_matches:
+            source = "moe_out_delta"
+        elif shared is not None or routed is not None:
+            source = "parity_delta_away_from_layer_max"
+        else:
+            source = "missing_decode_batch_parity_taps"
+
+        item = {
+            "prompt_id": prompt_id,
+            "mode": mode,
+            "position": position,
+            "layer": layer,
+            "phase": comparison.get("phase"),
+            "delta_idx": delta_idx,
+            "max_abs_delta": comparison.get("max_abs_delta"),
+            "max_ulp_delta": comparison.get("max_ulp_delta"),
+            "differing_elems": comparison.get("differing_elems"),
+            "baseline_value_at_delta": comparison.get("baseline_value_at_max_abs"),
+            "candidate_value_at_delta": comparison.get("candidate_value_at_max_abs"),
+            "source": source,
+            "topk_idx_match": topk_match,
+            "shared_out_argmax": shared_idx,
+            "shared_out_argmax_matches_delta": shared_matches,
+            "shared_out_max_abs": None if shared is None else shared.get("shared_out_max_abs"),
+            "host_shared_out_at_argmax": None
+            if shared is None
+            else shared.get("host_shared_out_at_argmax"),
+            "metal_shared_out_at_argmax": None
+            if shared is None
+            else shared.get("metal_shared_out_at_argmax"),
+            "shared_out_delta_at_argmax": None
+            if shared is None
+            else numeric_delta(
+                shared.get("host_shared_out_at_argmax"),
+                shared.get("metal_shared_out_at_argmax"),
+            ),
+            "moe_out_argmax": moe_idx,
+            "moe_out_argmax_matches_delta": moe_matches,
+            "moe_out_max_abs": None if routed is None else routed.get("moe_out_max_abs"),
+            "host_moe_out_at_argmax": None
+            if routed is None
+            else routed.get("host_moe_out_at_argmax"),
+            "metal_moe_out_at_argmax": None
+            if routed is None
+            else routed.get("metal_moe_out_at_argmax"),
+            "moe_out_delta_at_argmax": None
+            if routed is None
+            else numeric_delta(
+                routed.get("host_moe_out_at_argmax"),
+                routed.get("metal_moe_out_at_argmax"),
+            ),
+            "final_out_argmax": final_idx,
+            "final_out_argmax_matches_delta": final_matches,
+            "final_out_max_abs": None if routed is None else routed.get("final_out_max_abs"),
+            "host_final_out_at_argmax": None
+            if routed is None
+            else routed.get("host_final_out_at_argmax"),
+            "metal_final_out_at_argmax": None
+            if routed is None
+            else routed.get("metal_final_out_at_argmax"),
+            "final_out_delta_at_argmax": None
+            if routed is None
+            else numeric_delta(
+                routed.get("host_final_out_at_argmax"),
+                routed.get("metal_final_out_at_argmax"),
+            ),
+        }
+        items.append(item)
+
+    return {
+        "item_count": len(items),
+        "sources": sorted({str(item.get("source")) for item in items}),
+        "first": items[0] if items else None,
+        "items": items,
     }
 
 
@@ -2362,6 +2507,10 @@ def build_report(
     summary["logits_tap"] = summarize_logits_taps(rows)
     summary["layer_output_tap"] = summarize_layer_output_taps(rows)
     summary["layer_output_delta_tap"] = summarize_layer_output_delta_taps(rows)
+    summary["ffn_residual_delta_attribution"] = build_ffn_residual_delta_attribution(
+        rows,
+        summary["layer_output_delta_tap"],
+    )
     summary["decode_batch_route_snapshot"] = summarize_decode_batch_route_snapshots(rows)
     return {
         "schema": SCHEMA,
@@ -2423,6 +2572,7 @@ def render_markdown(report: dict[str, Any]) -> str:
     logits_tap = summary.get("logits_tap") or {}
     layer_output_tap = summary.get("layer_output_tap") or {}
     layer_output_delta_tap = summary.get("layer_output_delta_tap") or {}
+    ffn_residual_delta = summary.get("ffn_residual_delta_attribution") or {}
     route_snapshot = summary.get("decode_batch_route_snapshot") or {}
     decode_batch_coarse = summary.get("decode_batch_coarse") or {}
     deferred_phase = summary.get("decode_batch_deferred_phase") or {}
@@ -2467,6 +2617,8 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- layer_output_delta_tap_count: `{layer_output_delta_tap.get('tap_count', 0)}`",
         f"- layer_output_delta_max_abs: `{render_float(layer_output_delta_tap.get('max_abs_delta'), 8)}`",
         f"- layer_output_delta_max_ulp: `{layer_output_delta_tap.get('max_ulp_delta', 0)}`",
+        f"- ffn_residual_delta_items: `{ffn_residual_delta.get('item_count', 0)}`",
+        f"- ffn_residual_delta_first_source: `{(ffn_residual_delta.get('first') or {}).get('source') or '-'}`",
         f"- decode_batch_route_snapshot_count: `{route_snapshot.get('snapshot_count', 0)}`",
         f"- decode_batch_route_snapshot_mismatches: `{route_snapshot.get('mismatch_count', 0)}`",
         "",
@@ -2975,6 +3127,39 @@ def render_markdown(report: dict[str, Any]) -> str:
                     diffs=item.get("differing_elems", "-"),
                     base=render_float(item.get("baseline_value_at_max_abs"), 8),
                     candidate=render_float(item.get("candidate_value_at_max_abs"), 8),
+                )
+            )
+    ffn_residual_items = (
+        (summary.get("ffn_residual_delta_attribution") or {}).get("items") or []
+    )
+    if ffn_residual_items:
+        lines.extend(
+            [
+                "",
+                "## FFN Residual Delta Attribution",
+                "",
+                "| Prompt | Mode | Position | Layer | Delta idx | Max abs | Max ULP | Shared idx | Shared delta | MoE idx | MoE delta | Final idx | Final delta | TopK match | Source |",
+                "|:---|:---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|:---|",
+            ]
+        )
+        for item in ffn_residual_items[:40]:
+            lines.append(
+                "| {prompt} | {mode} | {position} | {layer} | {delta_idx} | {max_abs} | {max_ulp} | {shared_idx} | {shared_delta} | {moe_idx} | {moe_delta} | {final_idx} | {final_delta} | {topk} | {source} |".format(
+                    prompt=item.get("prompt_id", ""),
+                    mode=item.get("mode", ""),
+                    position=item.get("position", "-"),
+                    layer=item.get("layer", "-"),
+                    delta_idx=item.get("delta_idx", "-"),
+                    max_abs=render_float(item.get("max_abs_delta"), 8),
+                    max_ulp=item.get("max_ulp_delta", "-"),
+                    shared_idx=item.get("shared_out_argmax", "-"),
+                    shared_delta=render_float(item.get("shared_out_delta_at_argmax"), 8),
+                    moe_idx=item.get("moe_out_argmax", "-"),
+                    moe_delta=render_float(item.get("moe_out_delta_at_argmax"), 8),
+                    final_idx=item.get("final_out_argmax", "-"),
+                    final_delta=render_float(item.get("final_out_delta_at_argmax"), 8),
+                    topk=str(item.get("topk_idx_match")).lower(),
+                    source=item.get("source", "-"),
                 )
             )
     return "\n".join(lines).rstrip() + "\n"
