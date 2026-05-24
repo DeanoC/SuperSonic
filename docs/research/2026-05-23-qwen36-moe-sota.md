@@ -411,6 +411,15 @@ under the same smoke:
    variant plus env overrides in JSON rows. This keeps the negative/prototype
    gates reproducible without promoting them into the SuperSonic CLI.
 
+   The eighth slice adds `tests/metal/sweep_qwen36_batched_prefill_variants.py`
+   so those prototype gates can be compared as a small suite instead of
+   one-off manual runs. The sweep includes the supported `baseline` lane,
+   `prototype-default`, and selected named variants, uses the same
+   deterministic NIAH prompt per context, records generated-ID parity, and
+   writes JSON/Markdown rows with prefill ratios versus baseline plus optional
+   Metal/HAL profiles. This keeps the "do not promote unless it wins" rule
+   machine-readable for future prefill/orchestration changes.
+
 3. **Static top-N resident MPS table probe**
    Use route profiles to choose top-N experts per layer, materialize FP16 MPS
    RHS once, fall back on misses, and measure real prompts.
