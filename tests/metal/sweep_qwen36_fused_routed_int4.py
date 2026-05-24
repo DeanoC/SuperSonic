@@ -16,7 +16,7 @@ from typing import Any
 
 
 MODEL = "qwen3.6-35b-a3b"
-SCHEMA = "qwen36-fused-routed-int4-sweep-v23"
+SCHEMA = "qwen36-fused-routed-int4-sweep-v25"
 DEFAULT_MAX_FUSED_WALL_GPU_RATIO = 4.0
 DEFAULT_MAX_WAIT_GPU_RATIO = 4.0
 COARSE_BATCH_SERIAL_MODE = "full-stage5-router-batch"
@@ -630,6 +630,15 @@ def summarize_shared_parity_taps(
                 "shared_scalar_abs": tap.get("shared_scalar_abs"),
                 "shared_out_max_abs": tap.get("shared_out_max_abs"),
                 "shared_out_argmax": tap.get("shared_out_argmax"),
+                "host_shared_gated_at_out_argmax": tap.get(
+                    "host_shared_gated_at_out_argmax"
+                ),
+                "metal_mid_host_shared_gated_at_out_argmax": tap.get(
+                    "metal_mid_host_shared_gated_at_out_argmax"
+                ),
+                "metal_mid_host_shared_out_at_argmax": tap.get(
+                    "metal_mid_host_shared_out_at_argmax"
+                ),
             }
             for tap in ranked[:20]
         ],
@@ -1005,6 +1014,13 @@ def numeric_delta(a: Any, b: Any) -> float | None:
     return float(b) - float(a)
 
 
+def numeric_matches(a: Any, b: Any, eps: float = 1.0e-12) -> bool | None:
+    delta = numeric_delta(a, b)
+    if delta is None:
+        return None
+    return abs(delta) <= eps
+
+
 def build_ffn_residual_delta_attribution(
     rows: list[dict[str, Any]],
     delta_summary: dict[str, Any],
@@ -1046,9 +1062,26 @@ def build_ffn_residual_delta_attribution(
         moe_matches = moe_idx == delta_idx
         final_matches = final_idx == delta_idx
         topk_match = None if routed is None else bool(routed.get("topk_idx_match"))
+        metal_mid_host_out_matches_host = None
+        metal_mid_host_out_matches_metal = None
+        if shared is not None:
+            metal_mid_host_out_matches_host = numeric_matches(
+                shared.get("host_shared_out_at_argmax"),
+                shared.get("metal_mid_host_shared_out_at_argmax"),
+            )
+            metal_mid_host_out_matches_metal = numeric_matches(
+                shared.get("metal_shared_out_at_argmax"),
+                shared.get("metal_mid_host_shared_out_at_argmax"),
+            )
 
         if final_matches and shared_matches and topk_match is not False:
-            source = "shared_out_residual_rounding_boundary"
+            if (
+                metal_mid_host_out_matches_metal is True
+                and metal_mid_host_out_matches_host is False
+            ):
+                source = "shared_mid_to_shared_out_bf16_boundary"
+            else:
+                source = "shared_out_residual_rounding_boundary"
         elif final_matches and moe_matches and topk_match is not False:
             source = "moe_out_residual_rounding_boundary"
         elif final_matches and topk_match is not False:
@@ -1116,6 +1149,44 @@ def build_ffn_residual_delta_attribution(
                 shared.get("host_shared_mid_at_argmax"),
                 shared.get("metal_shared_mid_at_argmax"),
             ),
+            "host_shared_down_acc_at_out_argmax": None
+            if shared is None
+            else shared.get("host_shared_down_acc_at_out_argmax"),
+            "host_shared_gated_at_out_argmax": None
+            if shared is None
+            else shared.get("host_shared_gated_at_out_argmax"),
+            "host_shared_out_recomputed_at_argmax": None
+            if shared is None
+            else shared.get("host_shared_out_recomputed_at_argmax"),
+            "metal_mid_host_shared_down_acc_at_out_argmax": None
+            if shared is None
+            else shared.get("metal_mid_host_shared_down_acc_at_out_argmax"),
+            "metal_mid_host_shared_gated_at_out_argmax": None
+            if shared is None
+            else shared.get("metal_mid_host_shared_gated_at_out_argmax"),
+            "metal_mid_host_shared_out_at_argmax": None
+            if shared is None
+            else shared.get("metal_mid_host_shared_out_at_argmax"),
+            "metal_mid_host_shared_gated_delta_at_out_argmax": None
+            if shared is None
+            else numeric_delta(
+                shared.get("host_shared_gated_at_out_argmax"),
+                shared.get("metal_mid_host_shared_gated_at_out_argmax"),
+            ),
+            "metal_mid_host_shared_out_delta_vs_host": None
+            if shared is None
+            else numeric_delta(
+                shared.get("host_shared_out_at_argmax"),
+                shared.get("metal_mid_host_shared_out_at_argmax"),
+            ),
+            "metal_mid_host_shared_out_delta_vs_metal": None
+            if shared is None
+            else numeric_delta(
+                shared.get("metal_shared_out_at_argmax"),
+                shared.get("metal_mid_host_shared_out_at_argmax"),
+            ),
+            "metal_mid_host_shared_out_matches_host": metal_mid_host_out_matches_host,
+            "metal_mid_host_shared_out_matches_metal": metal_mid_host_out_matches_metal,
             "host_shared_out_at_argmax": None
             if shared is None
             else shared.get("host_shared_out_at_argmax"),
@@ -2965,13 +3036,13 @@ def render_markdown(report: dict[str, Any]) -> str:
                 "",
                 "## Shared Expert Parity Tap",
                 "",
-                "| Prompt | Mode | Path | Layer | Gate max | Gate idx | Up max | Up idx | Mid max | Mid idx | Host gate@mid | Metal gate@mid | Host up@mid | Metal up@mid | Host mid | Metal mid | Scalar max | Shared out max | Shared out idx | Host out | Metal out |",
-                "|:---|:---|:---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+                "| Prompt | Mode | Path | Layer | Gate max | Gate idx | Up max | Up idx | Mid max | Mid idx | Host gate@mid | Metal gate@mid | Host up@mid | Metal up@mid | Host mid | Metal mid | Scalar max | Shared out max | Shared out idx | Host out | Metal out | Host gated | Metal-mid gated | Metal-mid host out |",
+                "|:---|:---|:---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
             ]
         )
         for row, tap in select_shared_parity_tap_rows(shared_tap_rows, limit=40):
             lines.append(
-                "| {prompt} | {mode} | {path} | {layer} | {gate} | {gate_idx} | {up} | {up_idx} | {mid} | {mid_idx} | {host_gate_mid} | {metal_gate_mid} | {host_up_mid} | {metal_up_mid} | {host_mid} | {metal_mid} | {scalar} | {out} | {out_idx} | {host_out} | {metal_out} |".format(
+                "| {prompt} | {mode} | {path} | {layer} | {gate} | {gate_idx} | {up} | {up_idx} | {mid} | {mid_idx} | {host_gate_mid} | {metal_gate_mid} | {host_up_mid} | {metal_up_mid} | {host_mid} | {metal_mid} | {scalar} | {out} | {out_idx} | {host_out} | {metal_out} | {host_gated} | {metal_mid_gated} | {metal_mid_out} |".format(
                     prompt=row.get("prompt_id", ""),
                     mode=row.get("mode", ""),
                     path=tap.get("shared_path", "-"),
@@ -3001,6 +3072,15 @@ def render_markdown(report: dict[str, Any]) -> str:
                     out_idx=tap.get("shared_out_argmax", "-"),
                     host_out=render_float(tap.get("host_shared_out_at_argmax"), 8),
                     metal_out=render_float(tap.get("metal_shared_out_at_argmax"), 8),
+                    host_gated=render_float(
+                        tap.get("host_shared_gated_at_out_argmax"), 8
+                    ),
+                    metal_mid_gated=render_float(
+                        tap.get("metal_mid_host_shared_gated_at_out_argmax"), 8
+                    ),
+                    metal_mid_out=render_float(
+                        tap.get("metal_mid_host_shared_out_at_argmax"), 8
+                    ),
                 )
             )
     decode_batch_shared_tap_rows: list[tuple[dict[str, Any], dict[str, Any]]] = []
@@ -3013,8 +3093,8 @@ def render_markdown(report: dict[str, Any]) -> str:
                 "",
                 "## Decode-Batch Shared Expert Parity Tap",
                 "",
-                "| Prompt | Mode | Router | Phase profile | Path | Call | Position | Layer | Gate max | Up max | Mid max | Mid idx | Host gate@mid | Metal gate@mid | Host up@mid | Metal up@mid | Host mid | Metal mid | Scalar max | Shared out max | Shared out idx | Host out | Metal out |",
-                "|:---|:---|:---|:---|:---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+                "| Prompt | Mode | Router | Phase profile | Path | Call | Position | Layer | Gate max | Up max | Mid max | Mid idx | Host gate@mid | Metal gate@mid | Host up@mid | Metal up@mid | Host mid | Metal mid | Scalar max | Shared out max | Shared out idx | Host out | Metal out | Host gated | Metal-mid gated | Metal-mid host out |",
+                "|:---|:---|:---|:---|:---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
             ]
         )
         for row, tap in select_shared_parity_tap_rows(
@@ -3022,7 +3102,7 @@ def render_markdown(report: dict[str, Any]) -> str:
             limit=40,
         ):
             lines.append(
-                "| {prompt} | {mode} | {router} | {phase} | {path} | {call} | {position} | {layer} | {gate} | {up} | {mid} | {mid_idx} | {host_gate_mid} | {metal_gate_mid} | {host_up_mid} | {metal_up_mid} | {host_mid} | {metal_mid} | {scalar} | {out} | {out_idx} | {host_out} | {metal_out} |".format(
+                "| {prompt} | {mode} | {router} | {phase} | {path} | {call} | {position} | {layer} | {gate} | {up} | {mid} | {mid_idx} | {host_gate_mid} | {metal_gate_mid} | {host_up_mid} | {metal_up_mid} | {host_mid} | {metal_mid} | {scalar} | {out} | {out_idx} | {host_out} | {metal_out} | {host_gated} | {metal_mid_gated} | {metal_mid_out} |".format(
                     prompt=row.get("prompt_id", ""),
                     mode=row.get("mode", ""),
                     router=tap.get("router_path", "-"),
@@ -3054,6 +3134,15 @@ def render_markdown(report: dict[str, Any]) -> str:
                     out_idx=tap.get("shared_out_argmax", "-"),
                     host_out=render_float(tap.get("host_shared_out_at_argmax"), 8),
                     metal_out=render_float(tap.get("metal_shared_out_at_argmax"), 8),
+                    host_gated=render_float(
+                        tap.get("host_shared_gated_at_out_argmax"), 8
+                    ),
+                    metal_mid_gated=render_float(
+                        tap.get("metal_mid_host_shared_gated_at_out_argmax"), 8
+                    ),
+                    metal_mid_out=render_float(
+                        tap.get("metal_mid_host_shared_out_at_argmax"), 8
+                    ),
                 )
             )
     decode_batch_routed_tap_rows: list[tuple[dict[str, Any], dict[str, Any]]] = []
@@ -3219,13 +3308,13 @@ def render_markdown(report: dict[str, Any]) -> str:
                 "",
                 "## FFN Residual Delta Attribution",
                 "",
-                "| Prompt | Mode | Position | Layer | Delta idx | Max abs | Max ULP | Shared idx | Shared delta | Shared mid idx | Gate@mid delta | Up@mid delta | Mid delta | MoE idx | MoE delta | Final idx | Final delta | TopK match | Source |",
-                "|:---|:---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|:---|",
+                "| Prompt | Mode | Position | Layer | Delta idx | Max abs | Max ULP | Shared idx | Shared delta | Shared mid idx | Gate@mid delta | Up@mid delta | Mid delta | Metal-mid host out | Metal-mid vs Metal | MoE idx | MoE delta | Final idx | Final delta | TopK match | Source |",
+                "|:---|:---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|:---:|:---|",
             ]
         )
         for item in ffn_residual_items[:40]:
             lines.append(
-                "| {prompt} | {mode} | {position} | {layer} | {delta_idx} | {max_abs} | {max_ulp} | {shared_idx} | {shared_delta} | {shared_mid_idx} | {gate_mid_delta} | {up_mid_delta} | {mid_delta} | {moe_idx} | {moe_delta} | {final_idx} | {final_delta} | {topk} | {source} |".format(
+                "| {prompt} | {mode} | {position} | {layer} | {delta_idx} | {max_abs} | {max_ulp} | {shared_idx} | {shared_delta} | {shared_mid_idx} | {gate_mid_delta} | {up_mid_delta} | {mid_delta} | {metal_mid_out} | {metal_mid_vs_metal} | {moe_idx} | {moe_delta} | {final_idx} | {final_delta} | {topk} | {source} |".format(
                     prompt=item.get("prompt_id", ""),
                     mode=item.get("mode", ""),
                     position=item.get("position", "-"),
@@ -3243,6 +3332,12 @@ def render_markdown(report: dict[str, Any]) -> str:
                         item.get("shared_up_delta_at_mid_argmax"), 8
                     ),
                     mid_delta=render_float(item.get("shared_mid_delta_at_argmax"), 8),
+                    metal_mid_out=render_float(
+                        item.get("metal_mid_host_shared_out_at_argmax"), 8
+                    ),
+                    metal_mid_vs_metal=render_float(
+                        item.get("metal_mid_host_shared_out_delta_vs_metal"), 8
+                    ),
                     moe_idx=item.get("moe_out_argmax", "-"),
                     moe_delta=render_float(item.get("moe_out_delta_at_argmax"), 8),
                     final_idx=item.get("final_out_argmax", "-"),

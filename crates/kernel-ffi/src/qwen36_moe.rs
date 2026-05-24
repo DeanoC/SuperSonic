@@ -4126,6 +4126,30 @@ fn qwen36_compute_ffn_shared_reference(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn qwen36_shared_down_row_probe(
+    shared_down_w: usize,
+    shared_down_scale: usize,
+    shared_down_zero: usize,
+    row: usize,
+    shared_intermediate: usize,
+    group_size: usize,
+    shared_scalar: f32,
+    shared_mid: &[f32],
+) -> (f32, f32, f32) {
+    let acc = qwen36_dense_or_int4_dot_2d_unchecked(
+        shared_down_w,
+        shared_down_scale,
+        shared_down_zero,
+        row,
+        shared_intermediate,
+        group_size,
+        shared_mid,
+    );
+    let gated = shared_scalar * acc;
+    (acc, gated, bf16_round_f32(gated))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn qwen36_compute_ffn_routed_reference(
     input: &[u16],
     h_norm: &[f32],
@@ -4388,6 +4412,8 @@ fn qwen36_emit_ffn_shared_stage5_parity_tap(
     off_sup: usize,
     off_shared_mid: usize,
     off_shared_out: usize,
+    weights: &Qwen36MoeFfnStepWeights,
+    int4: &Qwen36MoeFfnStepInt4,
     reference: &Qwen36FfnSharedReference,
 ) -> Result<(), GpuError> {
     let call = QWEN36_FFN_SHARED_PARITY_TAP_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -4450,9 +4476,41 @@ fn qwen36_emit_ffn_shared_stage5_parity_tap(
         .get(shared_out_argmax)
         .copied()
         .unwrap_or(f32::NAN);
+    let shared_down_w = weights.shared_down_proj_w as usize;
+    let shared_down_scale = int4.shared_down_proj_scale as usize;
+    let shared_down_zero = int4.shared_down_proj_zero as usize;
+    let group_size = int4.group_size.max(0) as usize;
+    let (
+        host_shared_down_acc_at_out_argmax,
+        host_shared_gated_at_out_argmax,
+        host_shared_out_recomputed_at_argmax,
+    ) = qwen36_shared_down_row_probe(
+        shared_down_w,
+        shared_down_scale,
+        shared_down_zero,
+        shared_out_argmax,
+        shared_intermediate,
+        group_size,
+        reference.shared_scalar,
+        &reference.shared_mid,
+    );
+    let (
+        metal_mid_host_shared_down_acc_at_out_argmax,
+        metal_mid_host_shared_gated_at_out_argmax,
+        metal_mid_host_shared_out_at_argmax,
+    ) = qwen36_shared_down_row_probe(
+        shared_down_w,
+        shared_down_scale,
+        shared_down_zero,
+        shared_out_argmax,
+        shared_intermediate,
+        group_size,
+        shared_scalar,
+        shared_mid,
+    );
 
     eprintln!(
-        "[qwen36-ffn-shared-parity] call={} layer={} shared_path={} shared_gate_max_abs={:.8e} shared_gate_argmax={} shared_up_max_abs={:.8e} shared_up_argmax={} shared_mid_max_abs={:.8e} shared_mid_argmax={} host_shared_gate_at_mid_argmax={:.8e} metal_shared_gate_at_mid_argmax={:.8e} host_shared_up_at_mid_argmax={:.8e} metal_shared_up_at_mid_argmax={:.8e} host_shared_mid_at_argmax={:.8e} metal_shared_mid_at_argmax={:.8e} shared_scalar_abs={:.8e} host_shared_scalar={:.8e} metal_shared_scalar={:.8e} shared_out_max_abs={:.8e} shared_out_argmax={} host_shared_out_at_argmax={:.8e} metal_shared_out_at_argmax={:.8e}",
+        "[qwen36-ffn-shared-parity] call={} layer={} shared_path={} shared_gate_max_abs={:.8e} shared_gate_argmax={} shared_up_max_abs={:.8e} shared_up_argmax={} shared_mid_max_abs={:.8e} shared_mid_argmax={} host_shared_gate_at_mid_argmax={:.8e} metal_shared_gate_at_mid_argmax={:.8e} host_shared_up_at_mid_argmax={:.8e} metal_shared_up_at_mid_argmax={:.8e} host_shared_mid_at_argmax={:.8e} metal_shared_mid_at_argmax={:.8e} shared_scalar_abs={:.8e} host_shared_scalar={:.8e} metal_shared_scalar={:.8e} shared_out_max_abs={:.8e} shared_out_argmax={} host_shared_out_at_argmax={:.8e} metal_shared_out_at_argmax={:.8e} host_shared_down_acc_at_out_argmax={:.8e} host_shared_gated_at_out_argmax={:.8e} host_shared_out_recomputed_at_argmax={:.8e} metal_mid_host_shared_down_acc_at_out_argmax={:.8e} metal_mid_host_shared_gated_at_out_argmax={:.8e} metal_mid_host_shared_out_at_argmax={:.8e}",
         call,
         layer_idx,
         qwen36_ffn_shared_stage5_path_label(),
@@ -4475,6 +4533,12 @@ fn qwen36_emit_ffn_shared_stage5_parity_tap(
         shared_out_argmax,
         host_shared_out_at_argmax,
         metal_shared_out_at_argmax,
+        host_shared_down_acc_at_out_argmax,
+        host_shared_gated_at_out_argmax,
+        host_shared_out_recomputed_at_argmax,
+        metal_mid_host_shared_down_acc_at_out_argmax,
+        metal_mid_host_shared_gated_at_out_argmax,
+        metal_mid_host_shared_out_at_argmax,
     );
 
     Ok(())
@@ -4625,9 +4689,41 @@ pub fn emit_decode_batch_shared_stage5_parity_tap_from_host(
         .get(shared_out_argmax)
         .copied()
         .unwrap_or(f32::NAN);
+    let shared_down_w = weights.shared_down_proj_w as usize;
+    let shared_down_scale = int4.shared_down_proj_scale as usize;
+    let shared_down_zero = int4.shared_down_proj_zero as usize;
+    let group_size = int4.group_size.max(0) as usize;
+    let (
+        host_shared_down_acc_at_out_argmax,
+        host_shared_gated_at_out_argmax,
+        host_shared_out_recomputed_at_argmax,
+    ) = qwen36_shared_down_row_probe(
+        shared_down_w,
+        shared_down_scale,
+        shared_down_zero,
+        shared_out_argmax,
+        shared_intermediate,
+        group_size,
+        shared_reference.shared_scalar,
+        &shared_reference.shared_mid,
+    );
+    let (
+        metal_mid_host_shared_down_acc_at_out_argmax,
+        metal_mid_host_shared_gated_at_out_argmax,
+        metal_mid_host_shared_out_at_argmax,
+    ) = qwen36_shared_down_row_probe(
+        shared_down_w,
+        shared_down_scale,
+        shared_down_zero,
+        shared_out_argmax,
+        shared_intermediate,
+        group_size,
+        shared_scalar,
+        shared_mid,
+    );
 
     eprintln!(
-        "[qwen36-decode-batch-shared-parity] call={} position={} cache_pos={} layer={} router_path={} phase_profile={} shared_path={} shared_gate_max_abs={:.8e} shared_gate_argmax={} shared_up_max_abs={:.8e} shared_up_argmax={} shared_mid_max_abs={:.8e} shared_mid_argmax={} host_shared_gate_at_mid_argmax={:.8e} metal_shared_gate_at_mid_argmax={:.8e} host_shared_up_at_mid_argmax={:.8e} metal_shared_up_at_mid_argmax={:.8e} host_shared_mid_at_argmax={:.8e} metal_shared_mid_at_argmax={:.8e} shared_scalar_abs={:.8e} host_shared_scalar={:.8e} metal_shared_scalar={:.8e} shared_out_max_abs={:.8e} shared_out_argmax={} host_shared_out_at_argmax={:.8e} metal_shared_out_at_argmax={:.8e}",
+        "[qwen36-decode-batch-shared-parity] call={} position={} cache_pos={} layer={} router_path={} phase_profile={} shared_path={} shared_gate_max_abs={:.8e} shared_gate_argmax={} shared_up_max_abs={:.8e} shared_up_argmax={} shared_mid_max_abs={:.8e} shared_mid_argmax={} host_shared_gate_at_mid_argmax={:.8e} metal_shared_gate_at_mid_argmax={:.8e} host_shared_up_at_mid_argmax={:.8e} metal_shared_up_at_mid_argmax={:.8e} host_shared_mid_at_argmax={:.8e} metal_shared_mid_at_argmax={:.8e} shared_scalar_abs={:.8e} host_shared_scalar={:.8e} metal_shared_scalar={:.8e} shared_out_max_abs={:.8e} shared_out_argmax={} host_shared_out_at_argmax={:.8e} metal_shared_out_at_argmax={:.8e} host_shared_down_acc_at_out_argmax={:.8e} host_shared_gated_at_out_argmax={:.8e} host_shared_out_recomputed_at_argmax={:.8e} metal_mid_host_shared_down_acc_at_out_argmax={:.8e} metal_mid_host_shared_gated_at_out_argmax={:.8e} metal_mid_host_shared_out_at_argmax={:.8e}",
         call,
         position,
         cache_pos,
@@ -4654,6 +4750,12 @@ pub fn emit_decode_batch_shared_stage5_parity_tap_from_host(
         shared_out_argmax,
         host_shared_out_at_argmax,
         metal_shared_out_at_argmax,
+        host_shared_down_acc_at_out_argmax,
+        host_shared_gated_at_out_argmax,
+        host_shared_out_recomputed_at_argmax,
+        metal_mid_host_shared_down_acc_at_out_argmax,
+        metal_mid_host_shared_gated_at_out_argmax,
+        metal_mid_host_shared_out_at_argmax,
     );
 
     Ok(())
@@ -8233,6 +8335,8 @@ fn ffn_step_stage1_5_metal_host(
                     off_sup,
                     off_shared_mid,
                     off_shared_out,
+                    weights,
+                    int4,
                     reference,
                 )?;
             }

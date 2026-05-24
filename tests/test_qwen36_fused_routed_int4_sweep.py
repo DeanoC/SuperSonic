@@ -1152,7 +1152,13 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
             "host_shared_scalar=5.00000000e-01 metal_shared_scalar=5.31250000e-01 "
             "shared_out_max_abs=2.50000000e-01 shared_out_argmax=33 "
             "host_shared_out_at_argmax=1.25000000e+00 "
-            "metal_shared_out_at_argmax=1.00000000e+00\n"
+            "metal_shared_out_at_argmax=1.00000000e+00 "
+            "host_shared_down_acc_at_out_argmax=1.00000000e+01 "
+            "host_shared_gated_at_out_argmax=5.00000000e+00 "
+            "host_shared_out_recomputed_at_argmax=5.00000000e+00 "
+            "metal_mid_host_shared_down_acc_at_out_argmax=9.00000000e+00 "
+            "metal_mid_host_shared_gated_at_out_argmax=4.50000000e+00 "
+            "metal_mid_host_shared_out_at_argmax=4.50000000e+00\n"
         )
 
         taps = script.parse_shared_parity_taps(output)
@@ -1164,6 +1170,7 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
         self.assertAlmostEqual(taps[0]["host_shared_mid_at_argmax"], 1.5)
         self.assertAlmostEqual(taps[0]["metal_shared_mid_at_argmax"], 1.0)
         self.assertEqual(taps[0]["shared_out_argmax"], 33)
+        self.assertAlmostEqual(taps[0]["metal_mid_host_shared_out_at_argmax"], 4.5)
 
         args = Namespace(
             max_new_tokens=2,
@@ -1220,7 +1227,13 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
             "host_shared_scalar=5.00000000e-01 metal_shared_scalar=5.31250000e-01 "
             "shared_out_max_abs=2.50000000e-01 shared_out_argmax=33 "
             "host_shared_out_at_argmax=1.25000000e+00 "
-            "metal_shared_out_at_argmax=1.00000000e+00\n"
+            "metal_shared_out_at_argmax=1.00000000e+00 "
+            "host_shared_down_acc_at_out_argmax=1.00000000e+01 "
+            "host_shared_gated_at_out_argmax=5.00000000e+00 "
+            "host_shared_out_recomputed_at_argmax=5.00000000e+00 "
+            "metal_mid_host_shared_down_acc_at_out_argmax=9.00000000e+00 "
+            "metal_mid_host_shared_gated_at_out_argmax=4.50000000e+00 "
+            "metal_mid_host_shared_out_at_argmax=4.50000000e+00\n"
         )
 
         taps = script.parse_decode_batch_shared_parity_taps(output)
@@ -1232,6 +1245,7 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
         self.assertAlmostEqual(taps[0]["shared_out_max_abs"], 0.25)
         self.assertAlmostEqual(taps[0]["host_shared_gate_at_mid_argmax"], 1.0)
         self.assertAlmostEqual(taps[0]["metal_shared_up_at_mid_argmax"], 1.75)
+        self.assertAlmostEqual(taps[0]["host_shared_gated_at_out_argmax"], 5.0)
 
         args = Namespace(
             max_new_tokens=2,
@@ -1587,6 +1601,12 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
                 "shared_out_max_abs": 0.0000610351562,
                 "host_shared_out_at_argmax": 0.0123901367,
                 "metal_shared_out_at_argmax": 0.0123291016,
+                "host_shared_down_acc_at_out_argmax": 0.125,
+                "host_shared_gated_at_out_argmax": 0.0123901367,
+                "host_shared_out_recomputed_at_argmax": 0.0123901367,
+                "metal_mid_host_shared_down_acc_at_out_argmax": 0.125,
+                "metal_mid_host_shared_gated_at_out_argmax": 0.0123901367,
+                "metal_mid_host_shared_out_at_argmax": 0.0123291016,
             }
         ]
         candidate["decode_batch_routed_parity_taps"] = [
@@ -1645,12 +1665,16 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
         self.assertEqual(first["delta_idx"], 1)
         self.assertTrue(first["shared_out_argmax_matches_delta"])
         self.assertTrue(first["final_out_argmax_matches_delta"])
-        self.assertEqual(first["source"], "shared_out_residual_rounding_boundary")
+        self.assertEqual(first["source"], "shared_mid_to_shared_out_bf16_boundary")
         self.assertAlmostEqual(first["shared_out_delta_at_argmax"], -0.0000610351)
         self.assertAlmostEqual(first["shared_gate_delta_at_mid_argmax"], 0.125)
         self.assertAlmostEqual(first["shared_up_delta_at_mid_argmax"], -0.25)
         self.assertAlmostEqual(first["shared_mid_delta_at_argmax"], -0.5)
-        self.assertIn("ffn_residual_delta_first_source: `shared_out_residual_rounding_boundary`", md)
+        self.assertAlmostEqual(first["metal_mid_host_shared_out_delta_vs_host"], -0.0000610351)
+        self.assertAlmostEqual(first["metal_mid_host_shared_out_delta_vs_metal"], 0.0)
+        self.assertFalse(first["metal_mid_host_shared_out_matches_host"])
+        self.assertTrue(first["metal_mid_host_shared_out_matches_metal"])
+        self.assertIn("ffn_residual_delta_first_source: `shared_mid_to_shared_out_bf16_boundary`", md)
         self.assertIn("## FFN Residual Delta Attribution", md)
 
     def test_router_parity_tap_selection_keeps_each_path(self):

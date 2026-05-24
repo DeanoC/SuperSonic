@@ -1706,6 +1706,32 @@ under the same smoke:
    the shared-out residual boundary rather than showing as a large gate/up/mid
    mismatch.
 
+48. **Qwen3.6 shared-down recompute probe**
+   The fused-routed sweep is now schema `v25`. It extends the shared parity
+   rows again with a host recompute of the shared-down row at
+   `shared_out_argmax`, using the Metal-produced `shared_mid` and shared scalar
+   as inputs. The residual attribution now records whether that host recompute
+   matches the host shared-out or the Metal shared-out, and refines the source
+   to `shared_mid_to_shared_out_bf16_boundary` when the recompute lands on
+   Metal.
+
+   The refreshed Metal run wrote
+   `/private/tmp/qwen36_shared_down_probe_layer7_delta_2tok.{json,md}`. The
+   first FFN mismatch is unchanged at position `0`, layer `7`, index `1621`,
+   with one BF16 element differing. The recompute result is decisive:
+   `host_shared_gated_at_out_argmax=0.012359621`, while recomputing from the
+   Metal mid vector gives `0.0123596173`; that tiny `-3.7e-9` gated delta
+   rounds to the Metal shared-out `0.0123291016` rather than the host shared-out
+   `0.0123901367`.
+
+   The remaining correctness issue is therefore not a large shared-down
+   accumulation error. It is a BF16 cliff: exact-enough gate/up and a
+   `-6.0e-8` shared-mid difference are sufficient to flip the final shared-out
+   rounding bit at index `1621`. The next implementation choice should be
+   explicit: either make shared-mid bit-exact with the CPU reference before
+   shared-down, or promote this path under a documented tolerance/eval policy
+   instead of a checksum gate.
+
 ## Sources
 
 - [Qwen/Qwen3.6-35B-A3B model card](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)
