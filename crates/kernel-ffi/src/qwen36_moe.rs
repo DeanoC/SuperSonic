@@ -3845,6 +3845,41 @@ fn qwen36_ffn_int4_stage5_metal_native_supported(
         && !int4.down_proj_zero.is_null()
 }
 
+fn qwen36_ffn_int4_stage5_router_metal_native_supported(
+    params: Qwen36MoeFfnStepParams,
+    weights: &Qwen36MoeFfnStepWeights,
+    int4: &Qwen36MoeFfnStepInt4,
+) -> bool {
+    std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER").is_some()
+        && params.stage == 5
+        && params.hidden == 2048
+        && params.num_experts == 256
+        && params.moe_intermediate == 512
+        && params.shared_intermediate == 512
+        && params.top_k == 8
+        && int4.group_size == 128
+        && !crate::metal_native::disabled_by_env()
+        && !weights.input_hidden.is_null()
+        && !weights.post_attn_norm_w.is_null()
+        && !weights.gate_w.is_null()
+        && !weights.shared_expert_gate_w.is_null()
+        && !weights.shared_gate_proj_w.is_null()
+        && !weights.shared_up_proj_w.is_null()
+        && !weights.shared_down_proj_w.is_null()
+        && !weights.gate_up_proj_w.is_null()
+        && !weights.down_proj_w.is_null()
+        && !int4.shared_gate_proj_scale.is_null()
+        && !int4.shared_gate_proj_zero.is_null()
+        && !int4.shared_up_proj_scale.is_null()
+        && !int4.shared_up_proj_zero.is_null()
+        && !int4.shared_down_proj_scale.is_null()
+        && !int4.shared_down_proj_zero.is_null()
+        && !int4.gate_up_proj_scale.is_null()
+        && !int4.gate_up_proj_zero.is_null()
+        && !int4.down_proj_scale.is_null()
+        && !int4.down_proj_zero.is_null()
+}
+
 fn qwen36_ffn_expert_gate_up_tiled_metal_native_supported(
     params: Qwen36MoeFfnStepParams,
     weights: &Qwen36MoeFfnStepWeights,
@@ -7022,6 +7057,77 @@ fn ffn_step_stage1_5_metal_host(
             top_k,
             output_idx.len_bytes() / std::mem::size_of::<i32>()
         )));
+    }
+
+    if qwen36_ffn_int4_stage5_router_metal_native_supported(params, weights, int4) {
+        qwen36_validate_dense_or_int4_sidecars(
+            int4.shared_gate_proj_scale,
+            int4.shared_gate_proj_zero,
+            int4.group_size,
+            "shared_gate_proj",
+        )?;
+        qwen36_validate_dense_or_int4_sidecars(
+            int4.shared_up_proj_scale,
+            int4.shared_up_proj_zero,
+            int4.group_size,
+            "shared_up_proj",
+        )?;
+        qwen36_validate_dense_or_int4_sidecars(
+            int4.shared_down_proj_scale,
+            int4.shared_down_proj_zero,
+            int4.group_size,
+            "shared_down_proj",
+        )?;
+        qwen36_validate_dense_or_int4_sidecars(
+            int4.gate_up_proj_scale,
+            int4.gate_up_proj_zero,
+            int4.group_size,
+            "gate_up_proj",
+        )?;
+        qwen36_validate_dense_or_int4_sidecars(
+            int4.down_proj_scale,
+            int4.down_proj_zero,
+            int4.group_size,
+            "down_proj",
+        )?;
+        return crate::prefill_ffi::metal_profile_time(
+            "qwen36_ffn_int4_stage5_with_router",
+            "native",
+            || unsafe {
+                crate::metal_native::qwen36_ffn_int4_stage5_with_router(
+                    hidden,
+                    num_experts,
+                    moe_intermediate,
+                    shared_intermediate,
+                    top_k,
+                    int4.group_size as usize,
+                    params.rms_norm_eps,
+                    weights.input_hidden,
+                    weights.post_attn_norm_w,
+                    weights.gate_w,
+                    weights.shared_expert_gate_w,
+                    weights.shared_gate_proj_w,
+                    int4.shared_gate_proj_scale,
+                    int4.shared_gate_proj_zero,
+                    weights.shared_up_proj_w,
+                    int4.shared_up_proj_scale,
+                    int4.shared_up_proj_zero,
+                    weights.shared_down_proj_w,
+                    int4.shared_down_proj_scale,
+                    int4.shared_down_proj_zero,
+                    weights.gate_up_proj_w,
+                    int4.gate_up_proj_scale,
+                    int4.gate_up_proj_zero,
+                    weights.down_proj_w,
+                    int4.down_proj_scale,
+                    int4.down_proj_zero,
+                    workspace.as_mut_ptr() as *mut c_void,
+                    output_idx.as_mut_ptr() as *mut c_void,
+                    output.as_mut_ptr() as *mut c_void,
+                    true,
+                )
+            },
+        );
     }
 
     let input = unsafe { std::slice::from_raw_parts(weights.input_hidden as *const u16, hidden) };

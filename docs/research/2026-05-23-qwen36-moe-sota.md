@@ -796,16 +796,39 @@ under the same smoke:
    instead of the default `[11, 271, 40, 599]` and regressed to
    `578.8 ms/token` / `ffn_ms_avg=480.816`.
 
-21. **Qwen3.6 refreshed SOTA selector after FFN v2/v4 gates**
+21. **Qwen3.6 refreshed SOTA selector after FFN v3/v4 gates**
    With the static top-N runtime report refreshed to schema v4 and the
-   fused-routed INT4 report refreshed to schema v2, the SOTA summary loads all
+   fused-routed INT4 report refreshed to schema v3, the SOTA summary loads all
    ten gate reports cleanly. The latest selector still names
    `prototype_new_ffn_residency_or_compute_path` with `ffn_ms_avg` as both the
    target and dominant bucket: median default FFN is `111.557 ms`, versus
-   `67.456 ms` for linear attention, `19.716 ms` for full attention, and
+   `67.456 ms` for linear attention, `19.293 ms` for full attention, and
    `8.453 ms` for lm-head. Since all tracked narrow FFN/linear/full/lm-head
    gates are now exhausted, the next FFN change should be a larger native INT4
    kernel design, not another small env-gated fork of the current decode path.
+
+22. **Qwen3.6 stage-5 router-in-Metal FFN probe**
+   The fused-routed INT4 sweep v3 adds `full-stage5-router`, guarded by
+   `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER=1`, to test whether
+   moving RMSNorm, router logits, softmax/top-k, and routed/shared INT4 stage-5
+   projection work into the native Metal FFN path can remove the per-layer host
+   router wait. The new kernel is deliberately narrow: Metal only, stage 5
+   only, Qwen3.6 35B-A3B geometry (`hidden=2048`, `num_experts=256`,
+   `moe_intermediate=512`, `shared_intermediate=512`, `top_k=8`), INT4
+   `group_size=128`, complete sidecars, and the normal host fallback for all
+   other cases or when `SUPERSONIC_METAL_FORCE_HOST_NATIVE=1`.
+   The first one-token smoke compiled and generated the same ID as default
+   (`[11]`), proving the wiring and shader pipeline are viable. The four-token
+   sweep keeps the mode disabled: default generated `[11, 271, 40, 599]` at
+   `198.0 ms/token` with `ffn_ms_avg=106.242`, while
+   `full-stage5-router` generated `[11, 353, 599, 264]` at
+   `341.4 ms/token` with `ffn_ms_avg=257.605`. Its profile is still valuable:
+   the stable op `qwen36_ffn_int4_stage5_with_router` reports
+   `1030.004 ms` total, and command-buffer wait rises from `266.025 ms` to
+   `1238.229 ms`. The next FFN attempt should keep this gate as evidence, but
+   target a more substantial resident/fused INT4 compute design with fewer
+   waited sub-dispatches and better reduction/tiling behavior before promotion
+   is considered.
 
 ## Sources
 

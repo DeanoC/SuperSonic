@@ -122,6 +122,38 @@ unsafe extern "C" {
         output_ptr: *mut c_void,
         wait_for_completion: c_int,
     ) -> c_int;
+    fn supersonic_metal_qwen36_ffn_int4_stage5_with_router(
+        hidden: usize,
+        num_experts: usize,
+        moe_intermediate: usize,
+        shared_intermediate: usize,
+        top_k: usize,
+        group_size: usize,
+        rms_norm_eps: f32,
+        input_hidden_ptr: *const c_void,
+        post_attn_norm_ptr: *const c_void,
+        gate_ptr: *const c_void,
+        shared_expert_gate_ptr: *const c_void,
+        shared_gate_proj_ptr: *const c_void,
+        shared_gate_scale_ptr: *const c_void,
+        shared_gate_zero_ptr: *const c_void,
+        shared_up_proj_ptr: *const c_void,
+        shared_up_scale_ptr: *const c_void,
+        shared_up_zero_ptr: *const c_void,
+        shared_down_proj_ptr: *const c_void,
+        shared_down_scale_ptr: *const c_void,
+        shared_down_zero_ptr: *const c_void,
+        gate_up_proj_ptr: *const c_void,
+        gate_up_scale_ptr: *const c_void,
+        gate_up_zero_ptr: *const c_void,
+        down_proj_ptr: *const c_void,
+        down_scale_ptr: *const c_void,
+        down_zero_ptr: *const c_void,
+        workspace_ptr: *mut c_void,
+        output_idx_ptr: *mut c_void,
+        output_ptr: *mut c_void,
+        wait_for_completion: c_int,
+    ) -> c_int;
     fn supersonic_metal_qwen36_ffn_expert_gate_up_tiled(
         hidden: usize,
         moe_intermediate: usize,
@@ -2372,6 +2404,97 @@ pub(crate) unsafe fn qwen36_ffn_int4_stage5(
         return Err(GpuError::backend(
             Backend::Metal,
             format!("metal native qwen36_ffn_int4_stage5 failed with status {status}"),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn qwen36_ffn_int4_stage5_with_router(
+    hidden: usize,
+    num_experts: usize,
+    moe_intermediate: usize,
+    shared_intermediate: usize,
+    top_k: usize,
+    group_size: usize,
+    rms_norm_eps: f32,
+    input_hidden: *const c_void,
+    post_attn_norm: *const c_void,
+    gate: *const c_void,
+    shared_expert_gate: *const c_void,
+    shared_gate_proj: *const c_void,
+    shared_gate_scale: *const c_void,
+    shared_gate_zero: *const c_void,
+    shared_up_proj: *const c_void,
+    shared_up_scale: *const c_void,
+    shared_up_zero: *const c_void,
+    shared_down_proj: *const c_void,
+    shared_down_scale: *const c_void,
+    shared_down_zero: *const c_void,
+    gate_up_proj: *const c_void,
+    gate_up_scale: *const c_void,
+    gate_up_zero: *const c_void,
+    down_proj: *const c_void,
+    down_scale: *const c_void,
+    down_zero: *const c_void,
+    workspace: *mut c_void,
+    output_idx: *mut c_void,
+    output: *mut c_void,
+    wait_for_completion: bool,
+) -> Result<(), GpuError> {
+    if hidden == 0
+        || num_experts == 0
+        || moe_intermediate == 0
+        || shared_intermediate == 0
+        || top_k == 0
+        || group_size == 0
+        || workspace.is_null()
+        || output_idx.is_null()
+        || output.is_null()
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native qwen36_ffn_int4_stage5_with_router invalid shape: hidden={hidden} num_experts={num_experts} moe_intermediate={moe_intermediate} shared_intermediate={shared_intermediate} top_k={top_k} group_size={group_size}"
+        )));
+    }
+    let status = unsafe {
+        supersonic_metal_qwen36_ffn_int4_stage5_with_router(
+            hidden,
+            num_experts,
+            moe_intermediate,
+            shared_intermediate,
+            top_k,
+            group_size,
+            rms_norm_eps,
+            input_hidden,
+            post_attn_norm,
+            gate,
+            shared_expert_gate,
+            shared_gate_proj,
+            shared_gate_scale,
+            shared_gate_zero,
+            shared_up_proj,
+            shared_up_scale,
+            shared_up_zero,
+            shared_down_proj,
+            shared_down_scale,
+            shared_down_zero,
+            gate_up_proj,
+            gate_up_scale,
+            gate_up_zero,
+            down_proj,
+            down_scale,
+            down_zero,
+            workspace,
+            output_idx,
+            output,
+            i32::from(wait_for_completion),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!("metal native qwen36_ffn_int4_stage5_with_router failed with status {status}"),
         ));
     }
     Ok(())
@@ -5915,6 +6038,46 @@ pub(crate) fn element_add(
     Err(GpuError::backend(
         Backend::Metal,
         "metal native element_add is not compiled".into(),
+    ))
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn qwen36_ffn_int4_stage5_with_router(
+    _hidden: usize,
+    _num_experts: usize,
+    _moe_intermediate: usize,
+    _shared_intermediate: usize,
+    _top_k: usize,
+    _group_size: usize,
+    _rms_norm_eps: f32,
+    _input_hidden: *const c_void,
+    _post_attn_norm: *const c_void,
+    _gate: *const c_void,
+    _shared_expert_gate: *const c_void,
+    _shared_gate_proj: *const c_void,
+    _shared_gate_scale: *const c_void,
+    _shared_gate_zero: *const c_void,
+    _shared_up_proj: *const c_void,
+    _shared_up_scale: *const c_void,
+    _shared_up_zero: *const c_void,
+    _shared_down_proj: *const c_void,
+    _shared_down_scale: *const c_void,
+    _shared_down_zero: *const c_void,
+    _gate_up_proj: *const c_void,
+    _gate_up_scale: *const c_void,
+    _gate_up_zero: *const c_void,
+    _down_proj: *const c_void,
+    _down_scale: *const c_void,
+    _down_zero: *const c_void,
+    _workspace: *mut c_void,
+    _output_idx: *mut c_void,
+    _output: *mut c_void,
+    _wait_for_completion: bool,
+) -> Result<(), GpuError> {
+    Err(GpuError::backend(
+        Backend::Metal,
+        "metal native qwen36_ffn_int4_stage5_with_router is not compiled".into(),
     ))
 }
 
