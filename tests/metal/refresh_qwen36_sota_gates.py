@@ -285,6 +285,12 @@ def add_gate_path_args(parser: argparse.ArgumentParser) -> None:
         default=gate_summary.GATE_SPECS[8].default_path,
         help="full-attention decode variant sweep JSON",
     )
+    parser.add_argument(
+        "--lm-head-json",
+        type=Path,
+        default=gate_summary.GATE_SPECS[9].default_path,
+        help="lm-head tail variant sweep JSON",
+    )
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:

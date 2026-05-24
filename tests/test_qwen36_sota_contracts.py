@@ -55,6 +55,10 @@ full_sweep = load_script(
     "qwen36_sota_full_sweep",
     METAL_DIR / "sweep_qwen36_full_decode.py",
 )
+lm_head_tail_sweep = load_script(
+    "qwen36_sota_lm_head_tail_sweep",
+    METAL_DIR / "sweep_qwen36_lm_head_tail.py",
+)
 next_bottleneck = load_script(
     "qwen36_sota_next_bottleneck",
     METAL_DIR / "select_qwen36_next_bottleneck.py",
@@ -84,8 +88,9 @@ class Qwen36SotaContractTests(unittest.TestCase):
         self.assertEqual(lru_sweep.SCHEMA, "qwen36-lru-resident-cache-sweep-v1")
         self.assertEqual(linear_sweep.SCHEMA, "qwen36-linear-decode-sweep-v1")
         self.assertEqual(full_sweep.SCHEMA, "qwen36-full-decode-sweep-v1")
-        self.assertEqual(next_bottleneck.SCHEMA, "qwen36-next-bottleneck-v5")
-        self.assertEqual(sota_summary.SCHEMA, "qwen36-sota-gate-summary-v9")
+        self.assertEqual(lm_head_tail_sweep.SCHEMA, "qwen36-lm-head-tail-sweep-v1")
+        self.assertEqual(next_bottleneck.SCHEMA, "qwen36-next-bottleneck-v6")
+        self.assertEqual(sota_summary.SCHEMA, "qwen36-sota-gate-summary-v10")
         self.assertEqual(sota_refresh.SCHEMA, "qwen36-sota-gate-refresh-plan-v1")
 
     def test_sota_summary_tracks_current_gate_reports(self):
@@ -136,6 +141,14 @@ class Qwen36SotaContractTests(unittest.TestCase):
         self.assertIn(
             "sweep_qwen36_full_decode.py",
             specs["full_attention_variants"].refresh_command,
+        )
+        self.assertEqual(
+            specs["lm_head_tail_variants"].expected_schema,
+            lm_head_tail_sweep.SCHEMA,
+        )
+        self.assertIn(
+            "sweep_qwen36_lm_head_tail.py",
+            specs["lm_head_tail_variants"].refresh_command,
         )
         self.assertEqual(specs["mps_resident_table"].gate_keys, ("viability_gate",))
         self.assertEqual(specs["route_residency"].gate_keys, ("decision_gate",))
@@ -310,6 +323,56 @@ class Qwen36SotaContractTests(unittest.TestCase):
         gate = report["summary"]["promotion_gate"]
         self.assertTrue(gate["passed"])
         self.assertEqual(gate["passed_modes"], ["direct-off"])
+        self.assertIn("thresholds", gate)
+        self.assertIn("candidates", gate)
+
+    def test_lm_head_tail_sweep_exposes_promotion_gate(self):
+        rows = [
+            {
+                "status": "ok",
+                "prompt_id": "p",
+                "mode": "default",
+                "generated_ids": [1, 2],
+                "result": {"ms_per_step": 100.0},
+                "stage_timings": {"lm_head_ms_avg": 5.0, "sample_ms_avg": 0.2},
+                "chain_breakdown": {
+                    "ffn_ms_avg": 50.0,
+                    "full_attn_ms_avg": 10.0,
+                    "linear_attn_ms_avg": 20.0,
+                },
+                "metal_profile": {
+                    "entries": [{"op": "command_buffer_wait", "total_ms": 100.0}]
+                },
+            },
+            {
+                "status": "ok",
+                "prompt_id": "p",
+                "mode": "gpu-argmax",
+                "generated_ids": [1, 2],
+                "result": {"ms_per_step": 90.0},
+                "stage_timings": {"lm_head_ms_avg": 4.0, "sample_ms_avg": 0.01},
+                "chain_breakdown": {
+                    "ffn_ms_avg": 50.5,
+                    "full_attn_ms_avg": 10.5,
+                    "linear_attn_ms_avg": 20.5,
+                },
+                "metal_profile": {
+                    "entries": [{"op": "command_buffer_wait", "total_ms": 102.0}]
+                },
+            },
+        ]
+        args = lm_head_tail_sweep.parse_args([])
+
+        report = lm_head_tail_sweep.build_report(
+            rows,
+            args,
+            ["default", "gpu-argmax"],
+            "smoke",
+        )
+
+        gate = report["summary"]["promotion_gate"]
+        self.assertTrue(gate["passed"])
+        self.assertEqual(gate["passed_modes"], ["gpu-argmax"])
         self.assertIn("thresholds", gate)
         self.assertIn("candidates", gate)
 

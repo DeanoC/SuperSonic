@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA = "qwen36-next-bottleneck-v5"
+SCHEMA = "qwen36-next-bottleneck-v6"
 MODEL = "qwen3.6-35b-a3b"
 BACKEND = "metal"
 FALLBACK_ACTION = "keep_default_lane_and_select_next_measured_bottleneck"
@@ -25,6 +25,7 @@ FFN_GATE_IDS = {
 FFN_SUPERSEDED_IDS = {"mps_resident_table", "route_residency"}
 LINEAR_GATE_IDS = {"linear_decode_variants"}
 FULL_GATE_IDS = {"full_attention_variants"}
+LM_HEAD_GATE_IDS = {"lm_head_tail_variants"}
 BUCKET_ACTIONS = {
     "ffn_ms_avg": "prototype_new_ffn_residency_or_compute_path",
     "linear_attn_ms_avg": "prototype_linear_attention_orchestration",
@@ -412,6 +413,11 @@ def full_gate_family_exhausted(sota_summary: dict[str, Any]) -> bool:
     return FULL_GATE_IDS.issubset(failed)
 
 
+def lm_head_gate_family_exhausted(sota_summary: dict[str, Any]) -> bool:
+    failed = set(str(item) for item in sota_summary.get("failed_gate_ids") or [])
+    return LM_HEAD_GATE_IDS.issubset(failed)
+
+
 def choose_recommendation(
     sota_report: dict[str, Any] | None,
     bucket_rows: list[dict[str, Any]],
@@ -443,6 +449,18 @@ def choose_recommendation(
     ffn_exhausted = ffn_gate_family_exhausted(sota_summary)
     actionable = [row for row in bucket_rows if not row["exhausted"]]
     target = actionable[0] if actionable else dominant
+    if not actionable:
+        return {
+            "status": "selected",
+            "action": BUCKET_ACTIONS.get(target["bucket"], "inspect_measured_bucket"),
+            "target_bucket": target["bucket"],
+            "dominant_bucket": dominant["bucket"],
+            "reason": (
+                "all tracked narrow runtime gates are exhausted; revisit the "
+                "largest measured default-lane bucket with a larger kernel or "
+                "orchestration change"
+            ),
+        }
     if dominant["bucket"] == "ffn_ms_avg" and ffn_exhausted and actionable:
         return {
             "status": "selected",
@@ -472,6 +490,7 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         "lru_resident_cache": args.lru_json,
         "linear_decode_variants": args.linear_json,
         "full_attention_variants": args.full_json,
+        "lm_head_tail_variants": args.lm_head_json,
         "batched_prefill_variants": args.prefill_json,
     }
     loaded: dict[str, dict[str, Any]] = {}
@@ -533,6 +552,7 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
             "lru_resident_cache",
             "linear_decode_variants",
             "full_attention_variants",
+            "lm_head_tail_variants",
         )
         if name in loaded
     }
@@ -551,6 +571,8 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
             exhausted_buckets.add("linear_attn_ms_avg")
         if full_gate_family_exhausted(sota_summary):
             exhausted_buckets.add("full_attn_ms_avg")
+        if lm_head_gate_family_exhausted(sota_summary):
+            exhausted_buckets.add("lm_head_ms_avg")
     bucket_rows = summarize_buckets(samples, exhausted_buckets)
     recommendation = choose_recommendation(sota_report, bucket_rows, errors)
     return {
@@ -713,6 +735,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--full-json",
         type=Path,
         default=Path("target/qwen36_full_decode_sweep.json"),
+    )
+    parser.add_argument(
+        "--lm-head-json",
+        type=Path,
+        default=Path("target/qwen36_lm_head_tail_sweep.json"),
     )
     parser.add_argument(
         "--bench-perf-json",

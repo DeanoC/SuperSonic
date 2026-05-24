@@ -856,6 +856,16 @@ measured `144.7 ms/token` versus `145.2 ms/token` with
 `SUPERSONIC_METAL_DISABLE_QWEN36_LINEAR_DECODE_DIRECT=1`; HAL `copy_d2d` fell
 from 840 calls / 3.44 MiB to 210 calls / 0.86 MiB. That confirms the old copy
 handoff is avoidable but too small to explain current decode time.
+The lm-head tail now has the same measured-gate treatment:
+`SUPERSONIC_METAL_ENABLE_QWEN36_LM_HEAD_GPU_ARGMAX=1` keeps greedy top-1
+selection on Metal and reads back only the chosen token when full host logits
+are not needed. It remains opt-in until the lm-head tail sweep proves a
+headline and `lm_head_ms_avg` win with generated-ID parity. The first
+four-token smoke preserved IDs `[11, 271, 40, 599]` and lowered full-logit D2H
+from `0.067 ms` total to `0.004 ms`, but failed promotion because
+`lm_head_ms_avg` moved from `9.044` to `9.389 ms`; the measured next lm-head
+idea should fuse top-1 selection into the lm-head tail or change the dense
+matmul shape, not add a separate argmax dispatch.
 
 Reproduce the run with:
 
@@ -880,14 +890,15 @@ The local-main-target workflow for this machine is:
 13. static top-N warm runtime sweep: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/sweep_qwen36_static_topn_runtime.py --modes default,static,static-hotset,mps-static-partial --metal-profile`
 14. linear decode variant sweep: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/sweep_qwen36_linear_decode.py --prompt-set smoke --metal-profile`
 15. full-attention decode variant sweep: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/sweep_qwen36_full_decode.py --prompt-set smoke --metal-profile`
-16. MPS resident-table viability probe: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/probe_qwen36_mps_resident_table.py --run-pilot --require-pilot`
-17. route residency sweep: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/sweep_qwen36_route_residency.py --prompt-set smoke`
-18. LRU resident-cache sweep: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/sweep_qwen36_lru_resident_cache.py --capacities 32,64 --metal-profile`
-19. fused routed INT4 sweep: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/sweep_qwen36_fused_routed_int4.py --prompt-set smoke --metal-profile`
-20. SOTA gate refresh plan: `python3 tests/metal/refresh_qwen36_sota_gates.py --max-age-hours 24`
-21. SOTA gate summary: `python3 tests/metal/summarize_qwen36_sota_gates.py --require --max-age-hours 24`
-22. next bottleneck selector: `python3 tests/metal/select_qwen36_next_bottleneck.py --require-selected`
-23. routed-expert FFN microbench: `target/release/qwen36_ffn_expert_microbench --iters 20 --warmup 3`
+16. lm-head tail variant sweep: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/sweep_qwen36_lm_head_tail.py --prompt-set smoke --metal-profile`
+17. MPS resident-table viability probe: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/probe_qwen36_mps_resident_table.py --run-pilot --require-pilot`
+18. route residency sweep: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/sweep_qwen36_route_residency.py --prompt-set smoke`
+19. LRU resident-cache sweep: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/sweep_qwen36_lru_resident_cache.py --capacities 32,64 --metal-profile`
+20. fused routed INT4 sweep: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/sweep_qwen36_fused_routed_int4.py --prompt-set smoke --metal-profile`
+21. SOTA gate refresh plan: `python3 tests/metal/refresh_qwen36_sota_gates.py --max-age-hours 24`
+22. SOTA gate summary: `python3 tests/metal/summarize_qwen36_sota_gates.py --require --max-age-hours 24`
+23. next bottleneck selector: `python3 tests/metal/select_qwen36_next_bottleneck.py --require-selected`
+24. routed-expert FFN microbench: `target/release/qwen36_ffn_expert_microbench --iters 20 --warmup 3`
 24. long-context comparison: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/bench_qwen36_longctx.py --preset comparison`
 
 The Metal long-context harness writes `target/qwen36_metal_longctx.json` and

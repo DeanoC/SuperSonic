@@ -362,7 +362,8 @@ Native Metal kernels used in the hot path:
 - FP8 runtime-dequant matmul has a correctness-first Metal host fallback for
   Phi4 component decode
 - full-attention prefill core
-- lm-head argmax
+- lm-head argmax, including the Qwen3.6 greedy lm-head tail experiment gated by
+  `SUPERSONIC_METAL_ENABLE_QWEN36_LM_HEAD_GPU_ARGMAX=1`
 - RMSNorm rows
 - Qwen3.6 stage-5 linear-attention INT4 fused projection/recurrent path
 - Qwen3.6 stage-5 FFN INT4 projection kernels for explicit opt-in
@@ -490,6 +491,18 @@ SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" \
 SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" \
   python3 tests/metal/sweep_qwen36_static_topn_runtime.py \
   --modes default,static,static-hotset,mps-static-partial --metal-profile
+
+SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" \
+  python3 tests/metal/sweep_qwen36_linear_decode.py \
+  --prompt-set smoke --metal-profile
+
+SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" \
+  python3 tests/metal/sweep_qwen36_full_decode.py \
+  --prompt-set smoke --metal-profile
+
+SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" \
+  python3 tests/metal/sweep_qwen36_lm_head_tail.py \
+  --prompt-set smoke --metal-profile
 
 SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" \
   python3 tests/metal/probe_qwen36_mps_resident_table.py \
@@ -631,6 +644,15 @@ improve headline ms/token and `ffn_ms_avg`, keep full-attention,
 linear-attention, and lm-head inside the configured regression ratio, and carry
 command-buffer-wait profile evidence unless `--no-promotion-require-profile` is
 used.
+`tests/metal/sweep_qwen36_lm_head_tail.py` compares the default full-logit
+host-sampling tail against `gpu-argmax`, which enables
+`SUPERSONIC_METAL_ENABLE_QWEN36_LM_HEAD_GPU_ARGMAX=1`. The opt-in path is
+limited to greedy Metal runs that do not request host logits; it preserves
+full-logit readback for non-greedy sampling, `--dump-last-logits`, and
+`SUPERSONIC_QWEN36_DUMP_LOGITS`. Its v1 promotion gate requires generated IDs
+to match default, headline and `lm_head_ms_avg` to improve, the chain buckets
+to stay inside the regression ratio, and command-buffer-wait profile evidence
+when profiling is required.
 The MPS resident-table probe writes
 `target/qwen36_mps_resident_table_probe.json` and
 `target/qwen36_mps_resident_table_probe.md`. Its v2 `viability_gate` is an

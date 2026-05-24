@@ -717,10 +717,36 @@ under the same smoke:
    `target/qwen36_full_decode_sweep.{json,md}`. Its nonfatal gate only passes
    a candidate if it preserves IDs, has enough generated tokens, improves
    headline and `full_attn_ms_avg`, and keeps FFN/linear/lm-head plus wait
-   attribution within thresholds. The SOTA summary v9 tracks this report, and
-   the next-bottleneck selector v5 marks `full_attn_ms_avg` exhausted after the
+   attribution within thresholds. The SOTA summary v10 tracks this report, and
+   the next-bottleneck selector v6 marks `full_attn_ms_avg` exhausted after the
    full-attention gate fails so the workflow can move on to the lm-head tail or
    a larger measured kernel target.
+
+19. **Qwen3.6 lm-head tail gate**
+   The selector's lm-head recommendation now has a narrow runtime experiment
+   before larger tail-kernel work. `SUPERSONIC_METAL_ENABLE_QWEN36_LM_HEAD_GPU_ARGMAX=1`
+   keeps greedy top-1 selection on Metal after the existing RMSNorm + lm-head
+   matmul, then reads back only the selected `u32` token instead of the full
+   BF16 vocab logits. The gate is deliberately limited to Metal, greedy
+   sampling (`temperature <= 0` or `top_k == 1`), and non-debug runs where
+   `--dump-last-logits` / `SUPERSONIC_QWEN36_DUMP_LOGITS` do not require the
+   full logits buffer on the host. The default path still downloads logits and
+   samples on the CPU for parity, non-greedy sampling, and debugging.
+   `tests/metal/sweep_qwen36_lm_head_tail.py` compares default against
+   `gpu-argmax`, records generated-ID parity, stage and chain timings,
+   optional Metal/HAL profiles, `argmax_bf16`, `copy_d2h`, and
+   `command_buffer_wait`, and writes
+   `target/qwen36_lm_head_tail_sweep.{json,md}`. The SOTA summary v10 tracks
+   this report, and the next-bottleneck selector v6 marks `lm_head_ms_avg`
+   exhausted only after the lm-head tail gate fails; once all narrow runtime
+   gates are exhausted, it returns to the dominant measured bucket for a larger
+   kernel or orchestration change. The first four-token M5 Max smoke preserved
+   the default IDs `[11, 271, 40, 599]` and slightly improved headline
+   ms/token (`235.1 -> 233.7`), but failed promotion because `lm_head_ms_avg`
+   regressed (`9.044 -> 9.389`). The useful lesson is that full-logit D2H was
+   already tiny (`copy_d2h` `0.067 -> 0.004 ms` total), so a future lm-head
+   win needs a fused lm-head/top-1 tail or a larger dense-matmul change rather
+   than just replacing host argmax with a separate Metal argmax dispatch.
 
 ## Sources
 

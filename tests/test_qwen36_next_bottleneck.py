@@ -25,7 +25,7 @@ def write_json(path: Path, payload: dict) -> Path:
 
 def sota_summary(next_action: str = selector.FALLBACK_ACTION) -> dict:
     return {
-        "schema": "qwen36-sota-gate-summary-v9",
+        "schema": "qwen36-sota-gate-summary-v10",
         "summary": {
             "next_action": {"action": next_action},
             "failed_gate_ids": [
@@ -153,6 +153,7 @@ class Qwen36NextBottleneckTests(unittest.TestCase):
             "lru_json": root / "lru.json",
             "linear_json": root / "linear.json",
             "full_json": root / "full.json",
+            "lm_head_json": root / "lm_head.json",
             "prefill_json": root / "prefill.json",
             "bench_perf_json": None,
             "bench_run_root": root / "empty-bench-runs",
@@ -183,6 +184,10 @@ class Qwen36NextBottleneckTests(unittest.TestCase):
         write_json(
             paths["full_json"],
             runtime_report(default_row("full", 92.0, 56.0, 17.0, 5.1)),
+        )
+        write_json(
+            paths["lm_head_json"],
+            runtime_report(default_row("lm_head", 94.0, 57.0, 18.0, 4.9)),
         )
         write_json(paths["prefill_json"], prefill_report())
         return paths
@@ -223,7 +228,7 @@ class Qwen36NextBottleneckTests(unittest.TestCase):
         self.assertEqual(report["bench_perf"]["linear_attn_ms_avg"], 31.335)
         self.assertEqual(report["bench_perf"]["profile_linear_attn_ms_avg"], 53.165)
         buckets = {row["bucket"]: row for row in report["decode_bucket_ranking"]}
-        self.assertEqual(buckets["ffn_ms_avg"]["sample_count"], 6)
+        self.assertEqual(buckets["ffn_ms_avg"]["sample_count"], 7)
         self.assertTrue(
             any(
                 sample["source"] == "bench_perf" and sample["row"] == "bench_perf"
@@ -267,6 +272,28 @@ class Qwen36NextBottleneckTests(unittest.TestCase):
         self.assertEqual(rec["action"], "prototype_lm_head_tail_path")
         buckets = {row["bucket"]: row for row in report["decode_bucket_ranking"]}
         self.assertTrue(buckets["full_attn_ms_avg"]["exhausted"])
+
+    def test_returns_to_dominant_bucket_after_lm_head_gate_is_negative(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = self.write_default_inputs(Path(tmp))
+            summary = sota_summary()
+            summary["summary"]["failed_gate_ids"].extend(
+                [
+                    "linear_decode_variants",
+                    "full_attention_variants",
+                    "lm_head_tail_variants",
+                ]
+            )
+            write_json(paths["sota_json"], summary)
+            report = selector.build_report(self.args_for(paths))
+
+        rec = report["recommendation"]
+        self.assertEqual(rec["status"], "selected")
+        self.assertEqual(rec["dominant_bucket"], "ffn_ms_avg")
+        self.assertEqual(rec["target_bucket"], "ffn_ms_avg")
+        self.assertEqual(rec["action"], "prototype_new_ffn_residency_or_compute_path")
+        buckets = {row["bucket"]: row for row in report["decode_bucket_ranking"]}
+        self.assertTrue(buckets["lm_head_ms_avg"]["exhausted"])
 
     def test_auto_discovers_matching_bench_perf_fingerprint_before_newer_stale_run(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -369,6 +396,8 @@ class Qwen36NextBottleneckTests(unittest.TestCase):
                     str(paths["linear_json"]),
                     "--full-json",
                     str(paths["full_json"]),
+                    "--lm-head-json",
+                    str(paths["lm_head_json"]),
                     "--prefill-json",
                     str(paths["prefill_json"]),
                     "--bench-run-root",
