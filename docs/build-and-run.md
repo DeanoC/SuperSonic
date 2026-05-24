@@ -643,8 +643,9 @@ resident-expert branch can be chosen from prompt-shaped route evidence instead
 of one Hello run.
 `tests/metal/summarize_qwen36_sota_gates.py` is the cross-harness summary for
 the current roadmap gates. It reads the batched-prefill variant sweep, static
-top-N runtime sweep, MPS resident-table probe, route residency sweep, and MTP
-acceptance sweep JSON reports, then writes `target/qwen36_sota_gate_summary.json`
+top-N runtime sweep, fused routed INT4 runtime sweep, MPS resident-table probe,
+route residency sweep, and MTP acceptance sweep JSON reports, then writes
+`target/qwen36_sota_gate_summary.json`
 and `target/qwen36_sota_gate_summary.md`. Missing reports remain visible as rows
 by default; add `--require` to make a local validation run fail closed on
 missing, malformed, schema-mismatched, stale, or missing-gate artifacts. Use

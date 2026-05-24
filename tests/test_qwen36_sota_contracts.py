@@ -61,7 +61,7 @@ class Qwen36SotaContractTests(unittest.TestCase):
         self.assertEqual(mps_probe.SCHEMA, "qwen36-mps-resident-table-probe-v2")
         self.assertEqual(route_sweep.SCHEMA, "qwen36-route-residency-sweep-v1")
         self.assertEqual(mtp_sweep.SCHEMA, "qwen36-moe-mtp-acceptance-sweep-v2")
-        self.assertEqual(sota_summary.SCHEMA, "qwen36-sota-gate-summary-v2")
+        self.assertEqual(sota_summary.SCHEMA, "qwen36-sota-gate-summary-v3")
 
     def test_sota_summary_tracks_current_gate_reports(self):
         specs = {spec.gate_id: spec for spec in sota_summary.GATE_SPECS}

@@ -1329,8 +1329,8 @@ so the next residency fork can be selected from measured route evidence before
 more slab-cache or fused-INT4 work begins.
 `tests/metal/summarize_qwen36_sota_gates.py` is the aggregation step after the
 individual sweeps. It reads the batched-prefill variant sweep, static top-N
-runtime sweep, MPS resident-table probe, route residency sweep, and MTP
-acceptance sweep JSON reports, then writes
+runtime sweep, fused routed INT4 runtime sweep, MPS resident-table probe, route
+residency sweep, and MTP acceptance sweep JSON reports, then writes
 `target/qwen36_sota_gate_summary.{json,md}` with input status, report age,
 passed/failed gate IDs, candidate failures, and the next action. Missing reports
 are preserved as rows by default; use `--require --max-age-hours 24` when a local

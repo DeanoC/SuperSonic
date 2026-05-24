@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA = "qwen36-sota-gate-summary-v2"
+SCHEMA = "qwen36-sota-gate-summary-v3"
 
 
 @dataclass(frozen=True)

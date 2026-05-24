@@ -570,7 +570,7 @@ under the same smoke:
    variant sweep, static top-N runtime sweep, fused routed INT4 runtime sweep,
    MPS resident-table probe, route residency sweep, and MTP acceptance sweep
    reports, then writes
-   `target/qwen36_sota_gate_summary.{json,md}`. The v2 schema records input
+   `target/qwen36_sota_gate_summary.{json,md}`. The v3 schema records input
    health, report age, passed and failed gate IDs, candidate failures, and a
    single `next_action`. Missing reports are nonfatal rows by default; `--require`
    turns absent, malformed, schema-mismatched, or missing-gate artifacts into a
