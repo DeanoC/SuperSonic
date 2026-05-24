@@ -125,7 +125,7 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
 
         self.assertEqual(
             script.parse_modes(
-                "baseline,direct,direct-defer,defer-direct-wait,gpu-pack,gpack,stage5,native-stage5,router,router-simd,router-batch,batch-router,router-simd-batch,batch-router-simd,router-simd-batch-shared-tiled,batch-router-simd-shared-tiled,router-simd-batch-shared-gate-up-tiled,router-simd-batch-shared-scalar-simd,router-simd-batch-shared-down-tiled,router-simd-batch-shared-host-corrected,router-batch-deferred-phases,batch-router-deferred-phases,router-simd-batch-deferred-phases,batch-router-simd-deferred-phases,router-simd-batch-shared-tiled-deferred-phases,batch-router-simd-shared-tiled-deferred-phases,router-batch-phases,batch-router-phases,router-batch-ffn-phases,batch-router-ffn-phases,router-simd-batch-phases,router-simd-batch-ffn-phases,router-simd-batch-shared-tiled-ffn-phases,batch-router-simd-shared-tiled-ffn-phases,router-defer"
+                "baseline,direct,direct-defer,defer-direct-wait,gpu-pack,gpack,stage5,native-stage5,router,router-simd,router-batch,batch-router,router-simd-batch,batch-router-simd,router-simd-batch-shared-tiled,batch-router-simd-shared-tiled,router-simd-batch-shared-gate-up-tiled,router-simd-batch-shared-scalar-simd,router-simd-batch-shared-down-tiled,router-simd-batch-shared-host-corrected,router-simd-batch-shared-routed-host-corrected,router-batch-deferred-phases,batch-router-deferred-phases,router-simd-batch-deferred-phases,batch-router-simd-deferred-phases,router-simd-batch-shared-tiled-deferred-phases,batch-router-simd-shared-tiled-deferred-phases,router-batch-phases,batch-router-phases,router-batch-ffn-phases,batch-router-ffn-phases,router-simd-batch-phases,router-simd-batch-ffn-phases,router-simd-batch-shared-tiled-ffn-phases,batch-router-simd-shared-tiled-ffn-phases,router-defer"
             ),
             [
                 "default",
@@ -142,6 +142,7 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
                 "full-stage5-router-simd-batch-shared-scalar-simd",
                 "full-stage5-router-simd-batch-shared-down-tiled",
                 "full-stage5-router-simd-batch-shared-host-corrected",
+                "full-stage5-router-simd-batch-shared-routed-host-corrected",
                 "full-stage5-router-batch-deferred-phases",
                 "full-stage5-router-simd-batch-deferred-phases",
                 "full-stage5-router-simd-batch-shared-tiled-deferred-phases",
@@ -188,6 +189,10 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
         full_stage5_router_simd_batch_shared_host_corrected = script.build_env_overrides(
             args,
             "full-stage5-router-simd-batch-shared-host-corrected",
+        )
+        full_stage5_router_simd_batch_shared_routed_host_corrected = script.build_env_overrides(
+            args,
+            "full-stage5-router-simd-batch-shared-routed-host-corrected",
         )
         full_stage5_router_batch_deferred = script.build_env_overrides(
             args,
@@ -339,6 +344,30 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
         self.assertEqual(
             full_stage5_router_simd_batch_shared_host_corrected[
                 "SUPERSONIC_METAL_QWEN36_FFN_STAGE5_SHARED_HOST_CORRECTION"
+            ],
+            "1",
+        )
+        self.assertEqual(
+            full_stage5_router_simd_batch_shared_routed_host_corrected[
+                "SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_STAGE5_SIMD"
+            ],
+            "1",
+        )
+        self.assertEqual(
+            full_stage5_router_simd_batch_shared_routed_host_corrected[
+                "SUPERSONIC_METAL_QWEN36_DECODE_BATCH"
+            ],
+            "1",
+        )
+        self.assertEqual(
+            full_stage5_router_simd_batch_shared_routed_host_corrected[
+                "SUPERSONIC_METAL_QWEN36_FFN_STAGE5_SHARED_HOST_CORRECTION"
+            ],
+            "1",
+        )
+        self.assertEqual(
+            full_stage5_router_simd_batch_shared_routed_host_corrected[
+                "SUPERSONIC_METAL_QWEN36_FFN_STAGE5_ROUTED_HOST_CORRECTION"
             ],
             "1",
         )
@@ -652,6 +681,11 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
             "Hello",
             "full-stage5-router-simd-batch-shared-host-corrected",
         )
+        simd_batch_shared_routed_host_corrected = script.build_command(
+            args,
+            "Hello",
+            "full-stage5-router-simd-batch-shared-routed-host-corrected",
+        )
 
         self.assertIn("--emit-stage-timings", normal)
         self.assertNotIn("--emit-stage-timings", batch)
@@ -666,6 +700,7 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
         self.assertNotIn("--emit-stage-timings", simd_batch_ffn_phases)
         self.assertNotIn("--emit-stage-timings", simd_batch_shared_tiled_ffn_phases)
         self.assertNotIn("--emit-stage-timings", simd_batch_shared_host_corrected)
+        self.assertNotIn("--emit-stage-timings", simd_batch_shared_routed_host_corrected)
         self.assertIn("--emit-generated-json", batch)
 
     def test_promotion_gate_passes_only_real_improvements(self):
@@ -781,20 +816,23 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
         self.assertEqual(prompt["layer_output_untolerated_checksum_mismatches"], 0)
         self.assertNotIn("prompt_hello:layer_output_checksum_mismatch", gate["candidates"][0]["failures"])
 
-    def test_promotion_gate_rejects_shared_host_correction_diagnostic_mode(self):
+    def test_promotion_gate_rejects_host_correction_diagnostic_modes(self):
         script = sweep_qwen36_fused_routed_int4
-        mode = "full-stage5-router-simd-batch-shared-host-corrected"
-        candidate = row(mode, ids=[11, 271], headline=90.0, ffn=40.0, wait=9.0)
-        gate = script.build_promotion_gate(
-            [row("default", ids=[11, 271]), candidate],
-            ["default", mode],
-        )
+        for mode in (
+            "full-stage5-router-simd-batch-shared-host-corrected",
+            "full-stage5-router-simd-batch-shared-routed-host-corrected",
+        ):
+            candidate = row(mode, ids=[11, 271], headline=90.0, ffn=40.0, wait=9.0)
+            gate = script.build_promotion_gate(
+                [row("default", ids=[11, 271]), candidate],
+                ["default", mode],
+            )
 
-        self.assertFalse(gate["passed"])
-        self.assertIn(
-            "prompt_hello:diagnostic_mode_not_promotable",
-            gate["candidates"][0]["failures"],
-        )
+            self.assertFalse(gate["passed"])
+            self.assertIn(
+                "prompt_hello:diagnostic_mode_not_promotable",
+                gate["candidates"][0]["failures"],
+            )
 
     def test_render_markdown_includes_gate_rows(self):
         script = sweep_qwen36_fused_routed_int4
@@ -1453,6 +1491,71 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
         self.assertIn("## Shared Host Correction", md)
         self.assertIn(
             "| hello | full-stage5-router-simd-batch-shared-host-corrected | host_order | 7 |",
+            md,
+        )
+
+    def test_routed_host_correction_rows_are_parsed_and_rendered(self):
+        script = sweep_qwen36_fused_routed_int4
+        output = (
+            "[qwen36-ffn-routed-host-correction] layer=33 router_path=simd "
+            "hidden=2048 top_k=8 expert_mid_max_abs=1.52587891e-05 "
+            "expert_mid_argmax=17 host_expert_mid_at_argmax=1.00000000e+00 "
+            "metal_expert_mid_at_argmax=9.99984741e-01 "
+            "moe_out_max_abs=6.10351562e-05 moe_out_argmax=8 "
+            "host_moe_out_at_argmax=1.25732422e-02 "
+            "metal_moe_out_at_argmax=1.25122070e-02 "
+            "output_patch_max_abs=1.22070312e-04 output_patch_argmax=8 "
+            "host_final_out_at_argmax=1.26953125e-02 "
+            "metal_final_out_at_argmax=1.25732422e-02 "
+            "changed_output_elems=1 first_changed_output=8\n"
+        )
+
+        corrections = script.parse_routed_host_corrections(output)
+
+        self.assertEqual(len(corrections), 1)
+        self.assertEqual(corrections[0]["layer"], 33)
+        self.assertEqual(corrections[0]["router_path"], "simd")
+        self.assertEqual(corrections[0]["moe_out_argmax"], 8)
+        self.assertAlmostEqual(corrections[0]["output_patch_max_abs"], 0.000122070312)
+
+        args = Namespace(
+            max_new_tokens=1,
+            context_size=64,
+            metal_profile=False,
+            metal_profile_phases=False,
+            router_parity_tap=False,
+            router_parity_tap_max_calls=40,
+            shared_parity_tap=False,
+            shared_parity_tap_max_calls=3,
+            routed_parity_tap=False,
+            routed_parity_tap_max_calls=3,
+            decode_batch_route_snapshot=False,
+            promotion_max_headline_ratio=0.999,
+            promotion_max_ffn_ratio=0.999,
+            promotion_max_component_regression_ratio=1.10,
+            promotion_max_command_buffer_wait_ratio=1.05,
+            promotion_max_fused_wall_gpu_ratio=4.0,
+            promotion_max_wait_gpu_ratio=4.0,
+            promotion_require_profile=False,
+        )
+        mode = "full-stage5-router-simd-batch-shared-routed-host-corrected"
+        candidate = row(mode)
+        candidate["routed_host_corrections"] = corrections
+        report = script.build_report(
+            [row("default"), candidate],
+            args,
+            ["default", mode],
+            "smoke",
+        )
+        md = script.render_markdown(report)
+
+        self.assertEqual(report["summary"]["routed_host_correction"]["correction_count"], 1)
+        self.assertEqual(report["summary"]["routed_host_correction"]["changed_count"], 1)
+        self.assertIn("routed_host_correction_count: `1`", md)
+        self.assertIn("routed_host_correction_max_output_patch_abs: `0.00012207`", md)
+        self.assertIn("## Routed Host Correction", md)
+        self.assertIn(
+            "| hello | full-stage5-router-simd-batch-shared-routed-host-corrected | simd | 33 |",
             md,
         )
 

@@ -3912,6 +3912,11 @@ fn qwen36_ffn_stage5_shared_host_correction_enabled() -> bool {
         && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
 }
 
+fn qwen36_ffn_stage5_routed_host_correction_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_QWEN36_FFN_STAGE5_ROUTED_HOST_CORRECTION").is_some()
+        && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
+}
+
 fn qwen36_ffn_router_stage5_simd_env_enabled() -> bool {
     std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_STAGE5_SIMD").is_some()
         && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
@@ -4642,6 +4647,132 @@ fn qwen36_apply_ffn_shared_stage5_host_correction(
         metal_shared_out_at_argmax,
         output_patch_max_abs,
         output_patch_argmax,
+        changed_output_elems,
+        first_changed_output,
+    );
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen36_apply_ffn_routed_stage5_host_correction(
+    ordinal: usize,
+    layer_idx: i32,
+    hidden: usize,
+    moe_intermediate: usize,
+    top_k: usize,
+    off_expert_mid: usize,
+    off_moe_out: usize,
+    workspace: &mut GpuBuffer,
+    output: &mut GpuBuffer,
+    reference: &Qwen36FfnRoutedReference,
+) -> Result<(), GpuError> {
+    crate::prefill_ffi::flush_metal_batch()?;
+    gpu_hal::sync(ordinal)?;
+
+    let workspace_len = workspace.len_bytes() / std::mem::size_of::<f32>();
+    let expert_mid_len = top_k * moe_intermediate;
+    if workspace_len < off_expert_mid + expert_mid_len || workspace_len < off_moe_out + hidden {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::ffn_step_launch: routed host correction workspace too small: need {}, got {}",
+            (off_expert_mid + expert_mid_len).max(off_moe_out + hidden),
+            workspace_len
+        )));
+    }
+    if output.len_bytes() / std::mem::size_of::<u16>() < hidden {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::ffn_step_launch: routed host correction output too small: need {hidden}, got {}",
+            output.len_bytes() / std::mem::size_of::<u16>()
+        )));
+    }
+
+    let workspace = unsafe {
+        std::slice::from_raw_parts_mut(workspace.as_mut_ptr() as *mut f32, workspace_len)
+    };
+    let output = unsafe { std::slice::from_raw_parts_mut(output.as_mut_ptr() as *mut u16, hidden) };
+    let expert_mid = &workspace[off_expert_mid..off_expert_mid + expert_mid_len];
+    let (expert_mid_max_abs, expert_mid_argmax) =
+        qwen36_max_abs_delta(&reference.expert_mid, expert_mid);
+    let host_expert_mid_at_argmax = reference
+        .expert_mid
+        .get(expert_mid_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let metal_expert_mid_at_argmax = expert_mid
+        .get(expert_mid_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
+
+    let mut moe_out_max_abs = 0.0f32;
+    let mut moe_out_argmax = 0usize;
+    let mut host_moe_out_at_argmax = f32::NAN;
+    let mut metal_moe_out_at_argmax = f32::NAN;
+    let mut output_patch_max_abs = 0.0f32;
+    let mut output_patch_argmax = 0usize;
+    let mut host_final_out_at_argmax = f32::NAN;
+    let mut metal_final_out_at_argmax = f32::NAN;
+    let mut changed_output_elems = 0usize;
+    let mut first_changed_output = usize::MAX;
+
+    for row in 0..hidden {
+        let metal_moe = workspace[off_moe_out + row];
+        let host_moe = reference.moe_out[row];
+        let moe_abs = (host_moe - metal_moe).abs();
+        if row == 0 || moe_abs > moe_out_max_abs {
+            moe_out_max_abs = moe_abs;
+            moe_out_argmax = row;
+            host_moe_out_at_argmax = host_moe;
+            metal_moe_out_at_argmax = metal_moe;
+        }
+
+        let before = bf16_bits_to_f32(output[row]);
+        let host_final = reference.final_out[row];
+        let patch_abs = (host_final - before).abs();
+        if row == 0 || patch_abs > output_patch_max_abs {
+            output_patch_max_abs = patch_abs;
+            output_patch_argmax = row;
+            host_final_out_at_argmax = host_final;
+            metal_final_out_at_argmax = before;
+        }
+        workspace[off_moe_out + row] = host_moe;
+        let corrected_bits = f32_to_bf16_bits(host_final);
+        if corrected_bits != output[row] {
+            changed_output_elems += 1;
+            if first_changed_output == usize::MAX {
+                first_changed_output = row;
+            }
+        }
+        output[row] = corrected_bits;
+    }
+
+    let first_changed_output = if first_changed_output == usize::MAX {
+        -1isize
+    } else {
+        first_changed_output as isize
+    };
+    let router_path = if qwen36_ffn_router_stage5_simd_env_enabled() {
+        "simd"
+    } else {
+        "serial"
+    };
+    eprintln!(
+        "[qwen36-ffn-routed-host-correction] layer={} router_path={} hidden={} top_k={} expert_mid_max_abs={:.8e} expert_mid_argmax={} host_expert_mid_at_argmax={:.8e} metal_expert_mid_at_argmax={:.8e} moe_out_max_abs={:.8e} moe_out_argmax={} host_moe_out_at_argmax={:.8e} metal_moe_out_at_argmax={:.8e} output_patch_max_abs={:.8e} output_patch_argmax={} host_final_out_at_argmax={:.8e} metal_final_out_at_argmax={:.8e} changed_output_elems={} first_changed_output={}",
+        layer_idx,
+        router_path,
+        hidden,
+        top_k,
+        expert_mid_max_abs,
+        expert_mid_argmax,
+        host_expert_mid_at_argmax,
+        metal_expert_mid_at_argmax,
+        moe_out_max_abs,
+        moe_out_argmax,
+        host_moe_out_at_argmax,
+        metal_moe_out_at_argmax,
+        output_patch_max_abs,
+        output_patch_argmax,
+        host_final_out_at_argmax,
+        metal_final_out_at_argmax,
         changed_output_elems,
         first_changed_output,
     );
@@ -8317,11 +8448,16 @@ fn ffn_step_stage1_5_metal_host(
         let router_parity_tap = qwen36_ffn_router_stage5_parity_tap_enabled();
         let shared_parity_tap = qwen36_ffn_shared_stage5_parity_tap_enabled();
         let shared_host_correction = qwen36_ffn_stage5_shared_host_correction_enabled();
-        if shared_host_correction {
+        let routed_host_correction = qwen36_ffn_stage5_routed_host_correction_enabled();
+        if shared_host_correction || routed_host_correction {
             crate::prefill_ffi::flush_metal_batch()?;
             gpu_hal::sync(ordinal)?;
         }
-        let router_reference = if router_parity_tap || shared_parity_tap || shared_host_correction {
+        let router_reference = if router_parity_tap
+            || shared_parity_tap
+            || shared_host_correction
+            || routed_host_correction
+        {
             let input =
                 unsafe { std::slice::from_raw_parts(weights.input_hidden as *const u16, hidden) };
             let norm_w = unsafe {
@@ -8342,30 +8478,66 @@ fn ffn_step_stage1_5_metal_host(
         } else {
             None
         };
-        let shared_reference = if shared_parity_tap || shared_host_correction {
-            let shared_expert_gate_w = unsafe {
-                std::slice::from_raw_parts(weights.shared_expert_gate_w as *const u16, hidden)
+        let shared_reference =
+            if shared_parity_tap || shared_host_correction || routed_host_correction {
+                let shared_expert_gate_w = unsafe {
+                    std::slice::from_raw_parts(weights.shared_expert_gate_w as *const u16, hidden)
+                };
+                let reference = router_reference.as_ref().ok_or_else(|| {
+                    GpuError::InvalidArg(
+                        "qwen36_moe::ffn_step_launch: shared parity tap missing router reference"
+                            .into(),
+                    )
+                })?;
+                Some(qwen36_compute_ffn_shared_reference(
+                    &reference.h_norm,
+                    shared_expert_gate_w,
+                    weights.shared_gate_proj_w as usize,
+                    int4.shared_gate_proj_scale as usize,
+                    int4.shared_gate_proj_zero as usize,
+                    weights.shared_up_proj_w as usize,
+                    int4.shared_up_proj_scale as usize,
+                    int4.shared_up_proj_zero as usize,
+                    weights.shared_down_proj_w as usize,
+                    int4.shared_down_proj_scale as usize,
+                    int4.shared_down_proj_zero as usize,
+                    hidden,
+                    shared_intermediate,
+                    int4.group_size.max(0) as usize,
+                ))
+            } else {
+                None
             };
-            let reference = router_reference.as_ref().ok_or_else(|| {
+        let routed_reference = if routed_host_correction {
+            let input =
+                unsafe { std::slice::from_raw_parts(weights.input_hidden as *const u16, hidden) };
+            let router_reference = router_reference.as_ref().ok_or_else(|| {
                 GpuError::InvalidArg(
-                    "qwen36_moe::ffn_step_launch: shared parity tap missing router reference"
+                    "qwen36_moe::ffn_step_launch: routed host correction missing router reference"
                         .into(),
                 )
             })?;
-            Some(qwen36_compute_ffn_shared_reference(
-                &reference.h_norm,
-                shared_expert_gate_w,
-                weights.shared_gate_proj_w as usize,
-                int4.shared_gate_proj_scale as usize,
-                int4.shared_gate_proj_zero as usize,
-                weights.shared_up_proj_w as usize,
-                int4.shared_up_proj_scale as usize,
-                int4.shared_up_proj_zero as usize,
-                weights.shared_down_proj_w as usize,
-                int4.shared_down_proj_scale as usize,
-                int4.shared_down_proj_zero as usize,
+            let shared_reference = shared_reference.as_ref().ok_or_else(|| {
+                GpuError::InvalidArg(
+                    "qwen36_moe::ffn_step_launch: routed host correction missing shared reference"
+                        .into(),
+                )
+            })?;
+            Some(qwen36_compute_ffn_routed_reference(
+                input,
+                &router_reference.h_norm,
+                &shared_reference.shared_out,
+                &router_reference.topk_idx,
+                &router_reference.topk_weight,
+                weights.gate_up_proj_w as usize,
+                int4.gate_up_proj_scale as usize,
+                int4.gate_up_proj_zero as usize,
+                weights.down_proj_w as usize,
+                int4.down_proj_scale as usize,
+                int4.down_proj_zero as usize,
                 hidden,
-                shared_intermediate,
+                moe_intermediate,
+                top_k,
                 int4.group_size.max(0) as usize,
             ))
         } else {
@@ -8425,6 +8597,26 @@ fn ffn_step_stage1_5_metal_host(
                     off_shared_out,
                     off_moe_out,
                     weights,
+                    workspace,
+                    output,
+                    reference,
+                )?;
+            }
+            if routed_host_correction {
+                let reference = routed_reference.as_ref().ok_or_else(|| {
+                    GpuError::InvalidArg(
+                        "qwen36_moe::ffn_step_launch: routed host correction missing reference"
+                            .into(),
+                    )
+                })?;
+                qwen36_apply_ffn_routed_stage5_host_correction(
+                    ordinal,
+                    params.layer_idx,
+                    hidden,
+                    moe_intermediate,
+                    top_k,
+                    off_expert_mid,
+                    off_moe_out,
                     workspace,
                     output,
                     reference,

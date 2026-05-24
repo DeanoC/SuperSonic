@@ -16,7 +16,7 @@ from typing import Any
 
 
 MODEL = "qwen3.6-35b-a3b"
-SCHEMA = "qwen36-fused-routed-int4-sweep-v27"
+SCHEMA = "qwen36-fused-routed-int4-sweep-v28"
 DEFAULT_MAX_FUSED_WALL_GPU_RATIO = 4.0
 DEFAULT_MAX_WAIT_GPU_RATIO = 4.0
 COARSE_BATCH_SERIAL_MODE = "full-stage5-router-batch"
@@ -30,6 +30,9 @@ SHARED_GATE_UP_TILED_BATCH_SIMD_MODE = "full-stage5-router-simd-batch-shared-gat
 SHARED_SCALAR_SIMD_BATCH_SIMD_MODE = "full-stage5-router-simd-batch-shared-scalar-simd"
 SHARED_DOWN_TILED_BATCH_SIMD_MODE = "full-stage5-router-simd-batch-shared-down-tiled"
 SHARED_HOST_CORRECTED_BATCH_SIMD_MODE = "full-stage5-router-simd-batch-shared-host-corrected"
+SHARED_ROUTED_HOST_CORRECTED_BATCH_SIMD_MODE = (
+    "full-stage5-router-simd-batch-shared-routed-host-corrected"
+)
 SHARED_TILED_MODES = {
     SHARED_TILED_BATCH_SIMD_MODE,
     SHARED_TILED_DEFERRED_SIMD_MODE,
@@ -52,6 +55,7 @@ BATCH_FAST_PROFILE_MODES = {
     SHARED_SCALAR_SIMD_BATCH_SIMD_MODE,
     SHARED_DOWN_TILED_BATCH_SIMD_MODE,
     SHARED_HOST_CORRECTED_BATCH_SIMD_MODE,
+    SHARED_ROUTED_HOST_CORRECTED_BATCH_SIMD_MODE,
     "full-stage5-router-batch-phases",
     "full-stage5-router-batch-ffn-phases",
     "full-stage5-router-simd-batch-phases",
@@ -59,6 +63,7 @@ BATCH_FAST_PROFILE_MODES = {
 }
 DIAGNOSTIC_ONLY_MODES = {
     SHARED_HOST_CORRECTED_BATCH_SIMD_MODE,
+    SHARED_ROUTED_HOST_CORRECTED_BATCH_SIMD_MODE,
 }
 
 PROMPT_SETS: dict[str, list[tuple[str, str]]] = {
@@ -123,6 +128,10 @@ MODE_ALIASES: dict[str, str] = {
     "batch-router-simd-shared-host-corrected": SHARED_HOST_CORRECTED_BATCH_SIMD_MODE,
     "full-router-simd-batch-shared-host-corrected": SHARED_HOST_CORRECTED_BATCH_SIMD_MODE,
     SHARED_HOST_CORRECTED_BATCH_SIMD_MODE: SHARED_HOST_CORRECTED_BATCH_SIMD_MODE,
+    "router-simd-batch-shared-routed-host-corrected": SHARED_ROUTED_HOST_CORRECTED_BATCH_SIMD_MODE,
+    "batch-router-simd-shared-routed-host-corrected": SHARED_ROUTED_HOST_CORRECTED_BATCH_SIMD_MODE,
+    "full-router-simd-batch-shared-routed-host-corrected": SHARED_ROUTED_HOST_CORRECTED_BATCH_SIMD_MODE,
+    SHARED_ROUTED_HOST_CORRECTED_BATCH_SIMD_MODE: SHARED_ROUTED_HOST_CORRECTED_BATCH_SIMD_MODE,
     "router-batch-deferred-phases": "full-stage5-router-batch-deferred-phases",
     "batch-router-deferred-phases": "full-stage5-router-batch-deferred-phases",
     "full-router-batch-deferred-phases": "full-stage5-router-batch-deferred-phases",
@@ -180,6 +189,7 @@ FUSED_OP_NEEDLES = {
     SHARED_SCALAR_SIMD_BATCH_SIMD_MODE: "qwen36_ffn_int4_stage5_with_router",
     SHARED_DOWN_TILED_BATCH_SIMD_MODE: "qwen36_ffn_int4_stage5_with_router",
     SHARED_HOST_CORRECTED_BATCH_SIMD_MODE: "qwen36_ffn_int4_stage5_with_router",
+    SHARED_ROUTED_HOST_CORRECTED_BATCH_SIMD_MODE: "qwen36_ffn_int4_stage5_with_router",
     "full-stage5-router-batch-phases": "qwen36_ffn_int4_stage5_with_router",
     "full-stage5-router-batch-ffn-phases": "qwen36_ffn_int4",
     "full-stage5-router-simd-batch-phases": "qwen36_ffn_int4_stage5_with_router",
@@ -319,6 +329,9 @@ FUSED_GPU_OP_PREFIXES[SHARED_DOWN_TILED_BATCH_SIMD_MODE] = FUSED_GPU_OP_PREFIXES
     "full-stage5-router-simd-batch"
 ]
 FUSED_GPU_OP_PREFIXES[SHARED_HOST_CORRECTED_BATCH_SIMD_MODE] = FUSED_GPU_OP_PREFIXES[
+    "full-stage5-router-simd-batch"
+]
+FUSED_GPU_OP_PREFIXES[SHARED_ROUTED_HOST_CORRECTED_BATCH_SIMD_MODE] = FUSED_GPU_OP_PREFIXES[
     "full-stage5-router-simd-batch"
 ]
 FUSED_GPU_OP_PREFIXES[SHARED_TILED_DEFERRED_SIMD_MODE] = FUSED_GPU_OP_PREFIXES[
@@ -486,6 +499,19 @@ def parse_shared_host_corrections(output: str) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for line in output.splitlines():
         if not line.startswith("[qwen36-ffn-shared-host-correction]"):
+            continue
+        fields = {
+            key: parse_number(value)
+            for key, value in parse_key_values(line).items()
+        }
+        rows.append(fields)
+    return rows
+
+
+def parse_routed_host_corrections(output: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for line in output.splitlines():
+        if not line.startswith("[qwen36-ffn-routed-host-correction]"):
             continue
         fields = {
             key: parse_number(value)
@@ -717,6 +743,69 @@ def summarize_shared_host_corrections(rows: list[dict[str, Any]]) -> dict[str, A
                 "metal_shared_out_at_argmax": item.get("metal_shared_out_at_argmax"),
                 "output_patch_max_abs": item.get("output_patch_max_abs"),
                 "output_patch_argmax": item.get("output_patch_argmax"),
+                "changed_output_elems": item.get("changed_output_elems"),
+                "first_changed_output": item.get("first_changed_output"),
+            }
+            for item in ranked[:20]
+        ],
+    }
+
+
+def summarize_routed_host_corrections(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    corrections = [
+        correction
+        for row in rows
+        for correction in (row.get("routed_host_corrections") or [])
+    ]
+    paths = sorted({str(correction.get("router_path") or "-") for correction in corrections})
+    changed = [
+        correction
+        for correction in corrections
+        if int(correction.get("changed_output_elems") or 0) > 0
+    ]
+    ranked = sorted(
+        corrections,
+        key=lambda correction: max(
+            float(correction.get("moe_out_max_abs") or 0.0),
+            float(correction.get("output_patch_max_abs") or 0.0),
+            float(correction.get("expert_mid_max_abs") or 0.0),
+        ),
+        reverse=True,
+    )
+    return {
+        "correction_count": len(corrections),
+        "changed_count": len(changed),
+        "paths": paths,
+        "max_expert_mid_abs": max(
+            (float(item.get("expert_mid_max_abs") or 0.0) for item in corrections),
+            default=0.0,
+        ),
+        "max_moe_out_abs": max(
+            (float(item.get("moe_out_max_abs") or 0.0) for item in corrections),
+            default=0.0,
+        ),
+        "max_output_patch_abs": max(
+            (float(item.get("output_patch_max_abs") or 0.0) for item in corrections),
+            default=0.0,
+        ),
+        "max_changed_output_elems": max(
+            (int(item.get("changed_output_elems") or 0) for item in corrections),
+            default=0,
+        ),
+        "worst_examples": [
+            {
+                "layer": item.get("layer"),
+                "path": item.get("router_path") or "-",
+                "expert_mid_max_abs": item.get("expert_mid_max_abs"),
+                "expert_mid_argmax": item.get("expert_mid_argmax"),
+                "moe_out_max_abs": item.get("moe_out_max_abs"),
+                "moe_out_argmax": item.get("moe_out_argmax"),
+                "host_moe_out_at_argmax": item.get("host_moe_out_at_argmax"),
+                "metal_moe_out_at_argmax": item.get("metal_moe_out_at_argmax"),
+                "output_patch_max_abs": item.get("output_patch_max_abs"),
+                "output_patch_argmax": item.get("output_patch_argmax"),
+                "host_final_out_at_argmax": item.get("host_final_out_at_argmax"),
+                "metal_final_out_at_argmax": item.get("metal_final_out_at_argmax"),
                 "changed_output_elems": item.get("changed_output_elems"),
                 "first_changed_output": item.get("first_changed_output"),
             }
@@ -1607,6 +1696,12 @@ def build_env_overrides(args: argparse.Namespace, mode: str) -> dict[str, str]:
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_STAGE5_SIMD"] = "1"
         overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH"] = "1"
         overrides["SUPERSONIC_METAL_QWEN36_FFN_STAGE5_SHARED_HOST_CORRECTION"] = "1"
+    elif mode == SHARED_ROUTED_HOST_CORRECTED_BATCH_SIMD_MODE:
+        overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"] = "1"
+        overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_STAGE5_SIMD"] = "1"
+        overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH"] = "1"
+        overrides["SUPERSONIC_METAL_QWEN36_FFN_STAGE5_SHARED_HOST_CORRECTION"] = "1"
+        overrides["SUPERSONIC_METAL_QWEN36_FFN_STAGE5_ROUTED_HOST_CORRECTION"] = "1"
     elif mode == "full-stage5-router-batch-deferred-phases":
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"] = "1"
         overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH"] = "1"
@@ -1964,6 +2059,7 @@ def run_row(args: argparse.Namespace, prompt_id: str, prompt: str, mode: str) ->
             "decode_batch_shared_parity_taps": parse_decode_batch_shared_parity_taps(output),
             "decode_batch_routed_parity_taps": parse_decode_batch_routed_parity_taps(output),
             "shared_host_corrections": parse_shared_host_corrections(output),
+            "routed_host_corrections": parse_routed_host_corrections(output),
             "final_hidden_taps": parse_final_hidden_taps(output),
             "logits_taps": parse_logits_taps(output),
             "layer_output_taps": parse_layer_output_taps(output),
@@ -1997,6 +2093,7 @@ def run_row(args: argparse.Namespace, prompt_id: str, prompt: str, mode: str) ->
             "decode_batch_shared_parity_taps": parse_decode_batch_shared_parity_taps(output),
             "decode_batch_routed_parity_taps": parse_decode_batch_routed_parity_taps(output),
             "shared_host_corrections": parse_shared_host_corrections(output),
+            "routed_host_corrections": parse_routed_host_corrections(output),
             "final_hidden_taps": parse_final_hidden_taps(output),
             "logits_taps": parse_logits_taps(output),
             "layer_output_taps": parse_layer_output_taps(output),
@@ -2835,6 +2932,7 @@ def build_report(
     )
     summary["decode_batch_routed_parity"] = summarize_routed_parity_taps(rows)
     summary["shared_host_correction"] = summarize_shared_host_corrections(rows)
+    summary["routed_host_correction"] = summarize_routed_host_corrections(rows)
     summary["final_hidden_tap"] = summarize_final_hidden_taps(rows)
     summary["logits_tap"] = summarize_logits_taps(rows)
     summary["layer_output_tap"] = summarize_layer_output_taps(rows)
@@ -2914,6 +3012,7 @@ def render_markdown(report: dict[str, Any]) -> str:
     decode_batch_shared_parity = summary.get("decode_batch_shared_parity") or {}
     decode_batch_routed_parity = summary.get("decode_batch_routed_parity") or {}
     shared_host_correction = summary.get("shared_host_correction") or {}
+    routed_host_correction = summary.get("routed_host_correction") or {}
     final_hidden_tap = summary.get("final_hidden_tap") or {}
     logits_tap = summary.get("logits_tap") or {}
     layer_output_tap = summary.get("layer_output_tap") or {}
@@ -2962,6 +3061,10 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- shared_host_correction_count: `{shared_host_correction.get('correction_count', 0)}`",
         f"- shared_host_correction_changed_count: `{shared_host_correction.get('changed_count', 0)}`",
         f"- shared_host_correction_max_output_patch_abs: `{render_float(shared_host_correction.get('max_output_patch_abs'), 8)}`",
+        f"- routed_host_correction_count: `{routed_host_correction.get('correction_count', 0)}`",
+        f"- routed_host_correction_changed_count: `{routed_host_correction.get('changed_count', 0)}`",
+        f"- routed_host_correction_max_moe_out_abs: `{render_float(routed_host_correction.get('max_moe_out_abs'), 8)}`",
+        f"- routed_host_correction_max_output_patch_abs: `{render_float(routed_host_correction.get('max_output_patch_abs'), 8)}`",
         f"- final_hidden_tap_count: `{final_hidden_tap.get('tap_count', 0)}`",
         f"- final_hidden_checksum_mismatches: `{final_hidden_tap.get('checksum_mismatch_count', 0)}`",
         f"- logits_tap_count: `{logits_tap.get('tap_count', 0)}`",
@@ -3461,6 +3564,50 @@ def render_markdown(report: dict[str, Any]) -> str:
                     metal=render_float(correction.get("metal_shared_out_at_argmax"), 8),
                     patch=render_float(correction.get("output_patch_max_abs"), 8),
                     patch_idx=correction.get("output_patch_argmax", "-"),
+                    changed=correction.get("changed_output_elems", "-"),
+                    first=correction.get("first_changed_output", "-"),
+                )
+            )
+    routed_correction_rows: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for row in report["rows"]:
+        for correction in row.get("routed_host_corrections") or []:
+            routed_correction_rows.append((row, correction))
+    if routed_correction_rows:
+        ranked_routed_corrections = sorted(
+            routed_correction_rows,
+            key=lambda pair: max(
+                float(pair[1].get("moe_out_max_abs") or 0.0),
+                float(pair[1].get("output_patch_max_abs") or 0.0),
+                float(pair[1].get("expert_mid_max_abs") or 0.0),
+            ),
+            reverse=True,
+        )
+        lines.extend(
+            [
+                "",
+                "## Routed Host Correction",
+                "",
+                "| Prompt | Mode | Router | Layer | Expert mid max | Expert mid idx | MoE out max | MoE out idx | Host MoE | Metal MoE | Output patch max | Output patch idx | Host final | Metal final | Changed elems | First changed |",
+                "|:---|:---|:---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+            ]
+        )
+        for row, correction in ranked_routed_corrections[:40]:
+            lines.append(
+                "| {prompt} | {mode} | {path} | {layer} | {mid} | {mid_idx} | {moe} | {moe_idx} | {host_moe} | {metal_moe} | {patch} | {patch_idx} | {host_final} | {metal_final} | {changed} | {first} |".format(
+                    prompt=row.get("prompt_id", ""),
+                    mode=row.get("mode", ""),
+                    path=correction.get("router_path", "-"),
+                    layer=correction.get("layer", "-"),
+                    mid=render_float(correction.get("expert_mid_max_abs"), 8),
+                    mid_idx=correction.get("expert_mid_argmax", "-"),
+                    moe=render_float(correction.get("moe_out_max_abs"), 8),
+                    moe_idx=correction.get("moe_out_argmax", "-"),
+                    host_moe=render_float(correction.get("host_moe_out_at_argmax"), 8),
+                    metal_moe=render_float(correction.get("metal_moe_out_at_argmax"), 8),
+                    patch=render_float(correction.get("output_patch_max_abs"), 8),
+                    patch_idx=correction.get("output_patch_argmax", "-"),
+                    host_final=render_float(correction.get("host_final_out_at_argmax"), 8),
+                    metal_final=render_float(correction.get("metal_final_out_at_argmax"), 8),
                     changed=correction.get("changed_output_elems", "-"),
                     first=correction.get("first_changed_output", "-"),
                 )

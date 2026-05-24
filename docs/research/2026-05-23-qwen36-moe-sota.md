@@ -1826,6 +1826,51 @@ under the same smoke:
    can tell whether the remaining drift is routed expert math, MoE combine, or
    final residual ordering before changing the hot Metal kernels.
 
+51. **Qwen3.6 routed-output host-correction diagnostic**
+   The fused-routed sweep is now schema `v28`. It adds a second diagnostic-only
+   mode, `full-stage5-router-simd-batch-shared-routed-host-corrected`, which
+   enables both
+   `SUPERSONIC_METAL_QWEN36_FFN_STAGE5_SHARED_HOST_CORRECTION=1` and
+   `SUPERSONIC_METAL_QWEN36_FFN_STAGE5_ROUTED_HOST_CORRECTION=1`. The routed
+   correction computes the host routed reference from the same router/shared
+   reference path, compares Metal `expert_mid`, `moe_out`, and final output,
+   patches only the routed `moe_out` plus final BF16 output, and emits
+   `[qwen36-ffn-routed-host-correction]` rows. Like the shared correction, this
+   mode is explicitly diagnostic and cannot pass promotion.
+
+   The Metal smoke wrote
+   `/private/tmp/qwen36_routed_host_corrected_v28_1tok.{json,md}` with
+   `--modes default,full-stage5-router-simd-batch,full-stage5-router-simd-batch-shared-host-corrected,full-stage5-router-simd-batch-shared-routed-host-corrected
+   --max-new-tokens 1 --context-size 64 --metal-profile --layer-output-tap
+   --layer-output-delta-tap --layer-output-delta-all`. Generated IDs matched
+   across all four rows (`[11]`). The uncorrected row again had `65`
+   layer-output checksum mismatches starting at layer `7` FFN. Shared-only
+   correction again reduced that to `13` mismatches, first at layer `33` FFN
+   with `max_abs_delta=0.0001220703125`, `max_ulp_delta=2`, and one differing
+   element. Shared+routed correction reduced layer-output mismatches to `0`.
+
+   The routed correction emitted `40` rows and changed final output on exactly
+   one layer: layer `33`. There, `expert_mid_max_abs=4.76837158e-6` at expert
+   mid index `111`, while the routed `moe_out` BF16 boundary flipped by
+   `0.000122070312` at hidden index `8`
+   (`host_moe_out_at_argmax=-0.0219726562`, Metal
+   `-0.0220947266`). The final output patch was the same magnitude at the same
+   hidden index (`host_final_out_at_argmax=0.0126953125`, Metal
+   `0.0125732422`) and changed one BF16 element. That makes the remaining
+   post-shared-correction source a routed MoE output materialization cliff, not
+   final residual ordering.
+
+   The correction also demonstrates that the current decode-batch/router-SIMD
+   hidden-stream drift is a chain of two BF16 cliffs: shared output at layer `7`
+   and routed MoE output at layer `33`. The next hot-path correctness target is
+   therefore the routed expert down/combine materialization. Before touching the
+   optimized Metal path, the useful follow-up diagnostic is a row probe for
+   layer `33`, hidden index `8`, that recomputes the expert down/combine from
+   Metal-produced `expert_mid` and top-k weights. If that recompute lands on the
+   Metal `moe_out`, the fix has to make `expert_mid` bit-exact; if it lands on
+   the host `moe_out`, the fix is in the routed down/combine accumulation or
+   BF16 materialization.
+
 ## Sources
 
 - [Qwen/Qwen3.6-35B-A3B model card](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)
