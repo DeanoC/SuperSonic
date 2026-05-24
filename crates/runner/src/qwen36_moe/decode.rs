@@ -29,7 +29,8 @@ use std::ptr;
 use anyhow::{anyhow, Context, Result};
 use gpu_hal::{copy_d2h, memset_zeros, Backend, GpuBuffer, GpuError, ScalarType};
 use kernel_ffi::qwen36_moe::{
-    attn_step_launch, attn_step_stage5_metal_host_into, ffn_step_launch, linear_step_launch,
+    attn_step_launch, attn_step_stage5_metal_host_into, ffn_stage5_router_defer_wait_enabled,
+    ffn_stage5_router_metal_native_supported, ffn_step_launch, linear_step_launch,
     linear_step_stage5_metal_native_into, Qwen36MoeAttnStepInt4, Qwen36MoeAttnStepParams,
     Qwen36MoeAttnStepWeights, Qwen36MoeFfnStepInt4, Qwen36MoeFfnStepParams,
     Qwen36MoeFfnStepWeights, Qwen36MoeLinearStepInt4, Qwen36MoeLinearStepParams,
@@ -529,10 +530,16 @@ fn run_chained_decode_impl_with_cache_pos(
     // "input to next launch". Starts at 0 (initial_hidden was uploaded
     // into hidden_a). After each launch we swap.
     let mut front: usize = 0;
+    let mut metal_queue_dirty = false;
 
     for (layer_idx, layer) in layers.iter_mut().enumerate() {
         // ---- Attention ----
-        reset_sync_buf(ordinal, &mut sync_buf).context("reset sync_buf (attn)")?;
+        if metal_queue_dirty && matches!(layer.attn, AttnLayerBuffers::Full { .. }) {
+            sync_metal_queue_for_host_read(
+                if front == 0 { &hidden_a } else { &hidden_b },
+                "sync before full-attn host read",
+            )?;
+        }
         // Capture the *const input pointer + *mut output pointer based on
         // current `front`. Borrowing both `hidden_a` and `hidden_b`
         // mutably at the same time isn't possible; pointer arithmetic is.
@@ -541,7 +548,79 @@ fn run_chained_decode_impl_with_cache_pos(
         } else {
             (hidden_b.as_ptr(), &mut hidden_a)
         };
+        reset_sync_buf(ordinal, &mut sync_buf).context("reset sync_buf (attn)")?;
         let mut attn_output_published = false;
+        let defer_layer_ffn_router = {
+            let ffn = &layer.ffn;
+            let params = Qwen36MoeFfnStepParams {
+                stage: 5,
+                layer_idx: layer_idx as i32,
+                hidden: geom.hidden,
+                num_experts: geom.num_experts,
+                moe_intermediate: geom.moe_intermediate,
+                shared_intermediate: geom.shared_intermediate,
+                top_k: geom.top_k,
+                rms_norm_eps: geom.rms_norm_eps,
+            };
+            let weights = Qwen36MoeFfnStepWeights {
+                input_hidden: input_ptr,
+                post_attn_norm_w: ffn.post_attn_norm_w.as_ptr(),
+                gate_w: ffn.gate_w.as_ptr(),
+                gate_up_proj_w: ffn.gate_up_proj_w.as_ptr(),
+                down_proj_w: ffn.down_proj_w.as_ptr(),
+                shared_gate_proj_w: ffn.shared_gate_proj_w.as_ptr(),
+                shared_up_proj_w: ffn.shared_up_proj_w.as_ptr(),
+                shared_down_proj_w: ffn.shared_down_proj_w.as_ptr(),
+                shared_expert_gate_w: ffn.shared_expert_gate_w.as_ptr(),
+            };
+            let int4 = match &ffn.int4 {
+                Some(s) => {
+                    let fp8 = s.group_size < 0;
+                    Qwen36MoeFfnStepInt4 {
+                        group_size: s.group_size,
+                        gate_up_proj_scale: s.gate_up_proj_scale.as_ptr(),
+                        gate_up_proj_zero: if fp8 {
+                            ptr::null()
+                        } else {
+                            s.gate_up_proj_zero.as_ptr()
+                        },
+                        down_proj_scale: s.down_proj_scale.as_ptr(),
+                        down_proj_zero: if fp8 {
+                            ptr::null()
+                        } else {
+                            s.down_proj_zero.as_ptr()
+                        },
+                        shared_gate_proj_scale: s.shared_gate_proj_scale.as_ptr(),
+                        shared_gate_proj_zero: if fp8 {
+                            ptr::null()
+                        } else {
+                            s.shared_gate_proj_zero.as_ptr()
+                        },
+                        shared_up_proj_scale: s.shared_up_proj_scale.as_ptr(),
+                        shared_up_proj_zero: if fp8 {
+                            ptr::null()
+                        } else {
+                            s.shared_up_proj_zero.as_ptr()
+                        },
+                        shared_down_proj_scale: s.shared_down_proj_scale.as_ptr(),
+                        shared_down_proj_zero: if fp8 {
+                            ptr::null()
+                        } else {
+                            s.shared_down_proj_zero.as_ptr()
+                        },
+                    }
+                }
+                None => Qwen36MoeFfnStepInt4::disabled(),
+            };
+            output_buf.backend() == Backend::Metal
+                && !capture
+                && expert_prefetch.is_none()
+                && std::env::var_os("SUPERSONIC_METAL_DISABLE_QWEN36_LINEAR_DECODE_DIRECT")
+                    .is_none()
+                && std::env::var_os("SUPERSONIC_METAL_DISABLE_QWEN36_LINEAR_INT4_STAGE5").is_none()
+                && ffn_stage5_router_defer_wait_enabled()
+                && ffn_stage5_router_metal_native_supported(params, &weights, &int4)
+        };
 
         match &mut layer.attn {
             AttnLayerBuffers::Full {
@@ -731,6 +810,7 @@ fn run_chained_decode_impl_with_cache_pos(
                 if output_buf.backend() == Backend::Metal
                     && metal_linear_decode_direct_enabled(&int4_ptrs)
                 {
+                    let wait_for_completion = !defer_layer_ffn_router;
                     unsafe {
                         linear_step_stage5_metal_native_into(
                             params,
@@ -740,7 +820,7 @@ fn run_chained_decode_impl_with_cache_pos(
                             &mut attn_workspace,
                             output_buf.as_mut_ptr(),
                             hidden,
-                            true,
+                            wait_for_completion,
                         )
                     }
                     .with_context(|| {
@@ -921,6 +1001,7 @@ fn run_chained_decode_impl_with_cache_pos(
             &mut sync_buf,
         )
         .with_context(|| format!("ffn_step_launch (layer {layer_idx})"))?;
+        metal_queue_dirty = defer_layer_ffn_router;
         if options.accurate_stage_timings {
             gpu_hal::sync(ordinal).context("sync_after_ffn_step (accurate_stage_timings)")?;
         }

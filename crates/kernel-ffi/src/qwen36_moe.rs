@@ -3880,6 +3880,19 @@ fn qwen36_ffn_int4_stage5_router_metal_native_supported(
         && !int4.down_proj_zero.is_null()
 }
 
+pub fn ffn_stage5_router_metal_native_supported(
+    params: Qwen36MoeFfnStepParams,
+    weights: &Qwen36MoeFfnStepWeights,
+    int4: &Qwen36MoeFfnStepInt4,
+) -> bool {
+    qwen36_ffn_int4_stage5_router_metal_native_supported(params, weights, int4)
+}
+
+pub fn ffn_stage5_router_defer_wait_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_QWEN36_DEFER_FFN_ROUTER_STAGE5_WAIT").is_some()
+        && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
+}
+
 fn qwen36_ffn_expert_gate_up_tiled_metal_native_supported(
     params: Qwen36MoeFfnStepParams,
     weights: &Qwen36MoeFfnStepWeights,
@@ -7124,7 +7137,7 @@ fn ffn_step_stage1_5_metal_host(
                     workspace.as_mut_ptr() as *mut c_void,
                     output_idx.as_mut_ptr() as *mut c_void,
                     output.as_mut_ptr() as *mut c_void,
-                    true,
+                    !ffn_stage5_router_defer_wait_enabled(),
                 )
             },
         );

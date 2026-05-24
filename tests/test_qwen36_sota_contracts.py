@@ -115,6 +115,7 @@ class Qwen36SotaContractTests(unittest.TestCase):
         self.assertIn("sweep_qwen36_fused_routed_int4.py", specs["fused_routed_int4"].refresh_command)
         self.assertIn("full-stage5", specs["fused_routed_int4"].refresh_command)
         self.assertIn("full-stage5-router", specs["fused_routed_int4"].refresh_command)
+        self.assertIn("router-defer-wait", specs["fused_routed_int4"].refresh_command)
         self.assertEqual(
             specs["mps_resident_table"].expected_schema,
             mps_probe.SCHEMA,

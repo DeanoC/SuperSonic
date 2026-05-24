@@ -554,6 +554,14 @@ int encode_or_submit_labeled_maybe_wait(
     auto end_encoding_start = MetalClock::now();
     [encoder endEncoding];
     record_runtime_profile("encoder_end", end_encoding_start);
+    if (!wait_for_completion) {
+        std::string label_copy = label;
+        [command_buffer addCompletedHandler:^(id<MTLCommandBuffer> completed) {
+            if (completed.status == MTLCommandBufferStatusCompleted) {
+                record_command_buffer_gpu_profile(completed, label_copy);
+            }
+        }];
+    }
     auto commit_start = MetalClock::now();
     [command_buffer commit];
     record_runtime_profile("command_buffer_commit", commit_start);

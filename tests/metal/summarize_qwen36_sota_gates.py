@@ -61,7 +61,7 @@ GATE_SPECS = (
         kind="runtime_promotion",
         refresh_command=(
             f"{MODEL_ROOT_ENV} python3 tests/metal/sweep_qwen36_fused_routed_int4.py "
-            "--prompt-set smoke --modes default,direct-gather,gpu-pack,full-stage5,full-stage5-router --metal-profile"
+            "--prompt-set smoke --modes default,direct-gather,gpu-pack,full-stage5,full-stage5-router,router-defer-wait --metal-profile"
         ),
     ),
     GateSpec(

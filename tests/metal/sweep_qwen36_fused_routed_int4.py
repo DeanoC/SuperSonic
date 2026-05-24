@@ -49,8 +49,11 @@ MODE_ALIASES: dict[str, str] = {
     "router-stage5": "full-stage5-router",
     "full-router": "full-stage5-router",
     "full-stage5-router": "full-stage5-router",
+    "router-defer": "router-defer-wait",
+    "router-defer-wait": "router-defer-wait",
+    "defer-router-wait": "router-defer-wait",
 }
-DEFAULT_MODES = "default,direct-gather,gpu-pack,full-stage5,full-stage5-router"
+DEFAULT_MODES = "default,direct-gather,gpu-pack,full-stage5,full-stage5-router,router-defer-wait"
 
 FUSED_OP_NEEDLES = {
     "packed": "qwen36_ffn_int4_expert_packed_stage5",
@@ -58,6 +61,7 @@ FUSED_OP_NEEDLES = {
     "gpu-pack": "qwen36_ffn_int4_expert_gpu_pack_stage5",
     "full-stage5": "qwen36_ffn_int4_stage5",
     "full-stage5-router": "qwen36_ffn_int4_stage5_with_router",
+    "router-defer-wait": "qwen36_ffn_int4_stage5_with_router",
 }
 
 FUSED_GPU_OP_PREFIXES = {
@@ -66,6 +70,7 @@ FUSED_GPU_OP_PREFIXES = {
     "gpu-pack": ("command_buffer_gpu:qwen36_ffn_int4_expert_gpu_pack",),
     "full-stage5": ("command_buffer_gpu:qwen36_ffn_int4_stage5",),
     "full-stage5-router": ("command_buffer_gpu:qwen36_ffn_int4_stage5_with_router",),
+    "router-defer-wait": ("command_buffer_gpu:qwen36_ffn_int4_stage5_with_router",),
 }
 
 
@@ -202,6 +207,9 @@ def build_env_overrides(args: argparse.Namespace, mode: str) -> dict[str, str]:
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5"] = "1"
     elif mode == "full-stage5-router":
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"] = "1"
+    elif mode == "router-defer-wait":
+        overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"] = "1"
+        overrides["SUPERSONIC_METAL_QWEN36_DEFER_FFN_ROUTER_STAGE5_WAIT"] = "1"
     return overrides
 
 

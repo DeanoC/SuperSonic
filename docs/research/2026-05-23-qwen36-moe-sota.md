@@ -874,6 +874,28 @@ under the same smoke:
    wall overhead for the resident stage-5 path, with correctness fixed before
    any promotion attempt.
 
+25. **Qwen3.6 router FFN deferred-wait probe**
+   The fused-routed INT4 sweep now includes `router-defer-wait`, guarded by
+   `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER=1` plus
+   `SUPERSONIC_METAL_QWEN36_DEFER_FFN_ROUTER_STAGE5_WAIT=1`, to test whether
+   simply letting the stage-5 router FFN command buffers run asynchronously can
+   remove the dominant waited wall time. The native Metal profiling bridge also
+   records `command_buffer_gpu:*` rows from completion handlers for async
+   command buffers, so the deferred mode still has GPU timestamp attribution.
+   The first four-token M5 Max smoke is a useful negative result. It reduced
+   the measured FFN bucket from `full-stage5-router` `380.445 ms/token` to
+   `3.612 ms/token`, but decode regressed from `481.6` to
+   `559.7 ms/token` because the wait moved into the surrounding chain:
+   `linear_attn_ms_avg` rose to `396.640`, `command_buffer_wait` rose to
+   `2101.426 ms`, and `wait/GPU` stayed high at `21.79`. The deferred row also
+   generated `[11, 353, 599, 264]` instead of the default
+   `[11, 271, 40, 599]`, matching the existing router-FFN correctness gap.
+   This rules out pure wait deferral as a promotion path. The next FFN attempt
+   should either fix the router stage-5 arithmetic/parity gap first or reduce
+   the real command-buffer/fence granularity with a larger encoded pipeline,
+   rather than just shifting the same wait into linear attention or the next
+   host read.
+
 ## Sources
 
 - [Qwen/Qwen3.6-35B-A3B model card](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)
