@@ -641,6 +641,14 @@ and `target/qwen36_route_residency_sweep.md`. Its v1 `decision_gate` compares
 per-layer LRU hit rates against oracle static top-N coverage so the next
 resident-expert branch can be chosen from prompt-shaped route evidence instead
 of one Hello run.
+`tests/metal/sweep_qwen36_fused_routed_int4.py` compares the `default`,
+`direct-gather`, and `gpu-pack` routed-expert INT4 decode paths under the same
+prompt suite and writes `target/qwen36_fused_routed_int4_sweep.json` and
+`target/qwen36_fused_routed_int4_sweep.md`. Its v1 `promotion_gate` preserves
+the fused INT4 fork as a measured runtime decision: generated IDs must match
+default, headline decode and FFN time must improve, component timings must stay
+inside the regression ratio, and command-buffer-wait profile evidence is
+required unless explicitly disabled.
 `tests/metal/summarize_qwen36_sota_gates.py` is the cross-harness summary for
 the current roadmap gates. It reads the batched-prefill variant sweep, static
 top-N runtime sweep, fused routed INT4 runtime sweep, MPS resident-table probe,
