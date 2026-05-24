@@ -23,6 +23,7 @@ Generated 4 tokens (1 prompt + 4 new). EOS: no (max_new_tokens hit).
 [qwen36-expert-residency-policy] resident_format=native_int4 scope=per_layer miss_policy=static_topn capacity=64 calls=160 exact_hits=9 route_refills=0 allocations=9 copied_bytes=879660288 exact_hit_rate=0.056250 slot_hits=900 slot_misses=380 slot_hit_rate=0.703125 evictions=0 avg_active_groups=8.000000 max_active_groups=8 avg_copy_bytes=97740032.000
 [metal-profile] calls=2 total_ms=12.000 native_ms=10.000 host_ms=2.000
 [metal-profile-op] op=qwen36_ffn_int4_stage5 path=native calls=1 mean_ms=10.0000 total_ms=10.000 max_ms=10.000
+[metal-profile-op] op=command_buffer_wait path=host calls=1 mean_ms=2.0000 total_ms=2.000 max_ms=2.000
 [hal-profile] calls=1 total_ms=3.000 alloc_calls=0 alloc_bytes=0 h2d=0 d2h=0 d2d=0 memset=0 sync_calls=0
 [hal-profile-op] op=copy_h2d calls=1 mean_ms=3.0000 total_ms=3.000 max_ms=3.000 total_bytes=1024
 """
@@ -48,6 +49,7 @@ class Qwen36StaticTopNRuntimeSweepTests(unittest.TestCase):
         self.assertIsNotNone(metal)
         self.assertEqual(metal["summary"]["native_ms"], 10.0)
         self.assertEqual(metal["entries"][0]["op"], "qwen36_ffn_int4_stage5")
+        self.assertAlmostEqual(parse.command_buffer_wait_ms({"metal_profile": metal}), 2.0)
         hal = parse.parse_profile(SAMPLE_OUTPUT, "[hal-profile]", "[hal-profile-op]")
         self.assertIsNotNone(hal)
         self.assertEqual(hal["entries"][0]["total_bytes"], 1024)
@@ -98,9 +100,11 @@ class Qwen36StaticTopNRuntimeSweepTests(unittest.TestCase):
         report = script.build_report(rows, args, ["default", "static"], "smoke")
 
         self.assertFalse(report["summary"]["generated_ids_match"])
+        self.assertFalse(report["summary"]["promotion_gate"]["passed"])
         md = script.render_markdown(report)
         self.assertIn("Static Top-N Runtime Sweep", md)
         self.assertIn("generated_ids_match", md)
+        self.assertIn("promotion_gate_passed", md)
 
     def test_report_summary_compares_ids_within_each_prompt(self):
         script = sweep_qwen36_static_topn_runtime
@@ -118,6 +122,132 @@ class Qwen36StaticTopNRuntimeSweepTests(unittest.TestCase):
         self.assertEqual(
             report["summary"]["reference_generated_ids_by_prompt"],
             {"p1": [1, 2], "p2": [3, 4]},
+        )
+
+    def test_promotion_gate_can_pass_for_improved_profiled_mode(self):
+        script = sweep_qwen36_static_topn_runtime
+        rows = [
+            {
+                "status": "ok",
+                "prompt_id": "p",
+                "mode": "default",
+                "generated_ids": [1, 2],
+                "result": {"ms_per_step": 100.0},
+                "stage_timings": {"lm_head_ms_avg": 5.0},
+                "chain_breakdown": {
+                    "ffn_ms_avg": 50.0,
+                    "full_attn_ms_avg": 10.0,
+                    "linear_attn_ms_avg": 20.0,
+                },
+                "metal_profile": {
+                    "entries": [{"op": "command_buffer_wait", "total_ms": 100.0}]
+                },
+            },
+            {
+                "status": "ok",
+                "prompt_id": "p",
+                "mode": "static",
+                "generated_ids": [1, 2],
+                "result": {"ms_per_step": 90.0},
+                "stage_timings": {"lm_head_ms_avg": 5.1},
+                "chain_breakdown": {
+                    "ffn_ms_avg": 45.0,
+                    "full_attn_ms_avg": 10.5,
+                    "linear_attn_ms_avg": 21.0,
+                },
+                "metal_profile": {
+                    "entries": [{"op": "command_buffer_wait", "total_ms": 102.0}]
+                },
+            },
+        ]
+
+        summary = script.summarize_with_gate(rows, ["default", "static"])
+
+        self.assertTrue(summary["promotion_gate"]["passed"])
+        self.assertEqual(summary["promotion_gate"]["passed_modes"], ["static"])
+
+    def test_promotion_gate_requires_profile_by_default(self):
+        script = sweep_qwen36_static_topn_runtime
+        rows = [
+            {
+                "status": "ok",
+                "prompt_id": "p",
+                "mode": "default",
+                "generated_ids": [1, 2],
+                "result": {"ms_per_step": 100.0},
+                "stage_timings": {"lm_head_ms_avg": 5.0},
+                "chain_breakdown": {
+                    "ffn_ms_avg": 50.0,
+                    "full_attn_ms_avg": 10.0,
+                    "linear_attn_ms_avg": 20.0,
+                },
+            },
+            {
+                "status": "ok",
+                "prompt_id": "p",
+                "mode": "static",
+                "generated_ids": [1, 2],
+                "result": {"ms_per_step": 90.0},
+                "stage_timings": {"lm_head_ms_avg": 5.1},
+                "chain_breakdown": {
+                    "ffn_ms_avg": 45.0,
+                    "full_attn_ms_avg": 10.5,
+                    "linear_attn_ms_avg": 21.0,
+                },
+            },
+        ]
+
+        summary = script.summarize_with_gate(rows, ["default", "static"])
+
+        self.assertFalse(summary["promotion_gate"]["passed"])
+        self.assertIn(
+            "prompt_p:missing_command_buffer_wait_profile",
+            summary["promotion_gate"]["candidates"][0]["failures"],
+        )
+
+    def test_promotion_gate_rejects_attention_regression(self):
+        script = sweep_qwen36_static_topn_runtime
+        rows = [
+            {
+                "status": "ok",
+                "prompt_id": "p",
+                "mode": "default",
+                "generated_ids": [1, 2],
+                "result": {"ms_per_step": 100.0},
+                "stage_timings": {"lm_head_ms_avg": 5.0},
+                "chain_breakdown": {
+                    "ffn_ms_avg": 50.0,
+                    "full_attn_ms_avg": 10.0,
+                    "linear_attn_ms_avg": 20.0,
+                },
+                "metal_profile": {
+                    "entries": [{"op": "command_buffer_wait", "total_ms": 100.0}]
+                },
+            },
+            {
+                "status": "ok",
+                "prompt_id": "p",
+                "mode": "static",
+                "generated_ids": [1, 2],
+                "result": {"ms_per_step": 90.0},
+                "stage_timings": {"lm_head_ms_avg": 5.1},
+                "chain_breakdown": {
+                    "ffn_ms_avg": 45.0,
+                    "full_attn_ms_avg": 13.0,
+                    "linear_attn_ms_avg": 21.0,
+                },
+                "metal_profile": {
+                    "entries": [{"op": "command_buffer_wait", "total_ms": 102.0}]
+                },
+            },
+        ]
+
+        summary = script.summarize_with_gate(rows, ["default", "static"])
+
+        self.assertFalse(summary["promotion_gate"]["passed"])
+        self.assertIn(
+            "prompt_p:full_attn_ms_avg_regressed",
+            summary["promotion_gate"]["candidates"][0]["failures"],
         )
 
 

@@ -486,7 +486,7 @@ SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" \
 
 SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" \
   python3 tests/metal/sweep_qwen36_static_topn_runtime.py \
-  --modes default,static,static-hotset
+  --modes default,static,static-hotset --metal-profile
 
 cargo build --release -p runner --bin qwen36_ffn_expert_microbench
 target/release/qwen36_ffn_expert_microbench --iters 20 --warmup 3
@@ -613,7 +613,12 @@ static table as the next default path.
 prompt, stage timings, chain breakdown, lifecycle timings, and expert-residency
 policy rows for each mode. Add `--metal-profile` to keep parsed
 `metal_profile` / `hal_profile` objects in each row and render the top
-attribution rows in Markdown.
+attribution rows in Markdown. The v3 report includes a nonfatal
+`promotion_gate`: a resident mode must preserve generated IDs versus `default`,
+improve headline ms/token and `ffn_ms_avg`, keep full-attention,
+linear-attention, and lm-head inside the configured regression ratio, and carry
+command-buffer-wait profile evidence unless `--no-promotion-require-profile` is
+used.
 The current M5 Max perf gate points at linear-attention as the next measured
 multi-token per-token bucket after FFN fallback tightening. The 512-token
 `--metal-profile` smoke currently reports roughly 269 ms/token, 71.7 s prefill,

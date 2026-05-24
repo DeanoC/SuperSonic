@@ -866,7 +866,7 @@ The local-main-target workflow for this machine is:
 10. MTP Metal K=1 experiment: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/probe_qwen36_mtp_acceptance.py --metal-experiment`
 11. MTP Metal prompt-suite sweep: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/sweep_qwen36_mtp_acceptance.py --prompt-set smoke --metal-experiment`
 12. static top-N resident-table probe: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/probe_qwen36_static_topn.py`
-13. static top-N warm runtime sweep: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/sweep_qwen36_static_topn_runtime.py --modes default,static,static-hotset,mps-static-partial`
+13. static top-N warm runtime sweep: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/sweep_qwen36_static_topn_runtime.py --modes default,static,static-hotset,mps-static-partial --metal-profile`
 14. MPS resident-table viability probe: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/probe_qwen36_mps_resident_table.py --run-pilot --require-pilot`
 15. routed-expert FFN microbench: `target/release/qwen36_ffn_expert_microbench --iters 20 --warmup 3`
 16. long-context comparison: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/bench_qwen36_longctx.py --preset comparison`
@@ -1275,7 +1275,12 @@ timings, expert-residency totals, and per-policy rows in
 `target/qwen36_static_topn_runtime_sweep.{json,md}`. With `--metal-profile`
 it also preserves parsed `metal_profile` and `hal_profile` objects per row and
 renders the top Metal/HAL attribution in Markdown, which makes the comparison
-prompt set usable as a profiling gate rather than a Hello-only smoke.
+prompt set usable as a profiling gate rather than a Hello-only smoke. The v3
+schema adds a nonfatal `promotion_gate`: a resident mode must preserve
+generated IDs versus `default`, improve headline ms/token and `ffn_ms_avg`,
+keep full-attention, linear-attention, and lm-head inside the configured
+regression ratio, and include non-regressed `command_buffer_wait` profile
+evidence unless `--no-promotion-require-profile` is used.
 The first four-token smoke preserved `[11, 353, 599, 264]` across all three
 modes but ruled out promotion: default measured `decode_ms=702` and
 `ffn_ms_avg=98.761`, static measured `decode_ms=951`, `ffn_ms_avg=177.563`,

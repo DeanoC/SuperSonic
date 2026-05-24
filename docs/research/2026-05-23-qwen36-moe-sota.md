@@ -454,6 +454,11 @@ under the same smoke:
    allocation. The sweep schema now also preserves parsed Metal/HAL profiles
    when `--metal-profile` is used, so coding/profiling prompt sets can be used
    as attribution gates instead of relying on a single Hello run.
+   A follow-up v3 schema adds a nonfatal `promotion_gate` for resident FFN
+   modes: generated IDs must match `default`, headline ms/token and
+   `ffn_ms_avg` must improve, full-attention, linear-attention, and lm-head
+   must stay inside the configured regression threshold, and
+   `command_buffer_wait` profile evidence is required by default.
    The first four-token smoke preserved `[11, 353, 599, 264]` across default,
    static, and static+hotset, but default still won: `decode_ms=702` and
    `ffn_ms_avg=98.761` versus static at `decode_ms=951` / `ffn_ms_avg=177.563`

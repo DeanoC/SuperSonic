@@ -15,7 +15,7 @@ from typing import Any
 
 
 MODEL = "qwen3.6-35b-a3b"
-SCHEMA = "qwen36-static-topn-runtime-sweep-v2"
+SCHEMA = "qwen36-static-topn-runtime-sweep-v3"
 
 PROMPT_SETS: dict[str, list[tuple[str, str]]] = {
     "smoke": [
@@ -134,6 +134,61 @@ def parse_profile(output: str, summary_prefix: str, op_prefix: str) -> dict[str,
             entry["total_bytes"] = int(fields["total_bytes"])
         entries.append(entry)
     return {"summary": summary, "entries": entries}
+
+
+def row_number(row: dict[str, Any], section: str, key: str) -> float | None:
+    values = row.get(section) or {}
+    value = values.get(key)
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def headline_ms_per_token(row: dict[str, Any]) -> float | None:
+    return row_number(row, "result", "ms_per_step") or row_number(
+        row, "stage_timings", "total_ms_avg"
+    )
+
+
+def chain_ms(row: dict[str, Any], key: str) -> float | None:
+    return row_number(row, "chain_breakdown", key)
+
+
+def lm_head_ms(row: dict[str, Any]) -> float | None:
+    return row_number(row, "stage_timings", "lm_head_ms_avg")
+
+
+def profile_op_total(profile: dict[str, Any] | None, needle: str) -> float | None:
+    if not profile:
+        return None
+    total = 0.0
+    matched = False
+    for entry in profile.get("entries") or []:
+        op = str(entry.get("op") or "").lower()
+        if needle not in op:
+            continue
+        matched = True
+        total += float(entry.get("total_ms") or 0.0)
+    return total if matched else None
+
+
+def command_buffer_wait_ms(row: dict[str, Any]) -> float | None:
+    return profile_op_total(row.get("metal_profile"), "command_buffer_wait")
+
+
+def ratio(
+    row: dict[str, Any],
+    baseline: dict[str, Any],
+    getter: Any,
+) -> tuple[float | None, float | None, float | None]:
+    row_value = getter(row)
+    baseline_value = getter(baseline)
+    if baseline_value is None or baseline_value == 0 or row_value is None:
+        return row_value, baseline_value, None
+    return row_value, baseline_value, row_value / baseline_value
 
 
 def parse_generated_ids(output: str) -> list[int]:
@@ -354,6 +409,186 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def append_ratio_gate(
+    failures: list[str],
+    prompt_result: dict[str, Any],
+    name: str,
+    row: dict[str, Any],
+    baseline: dict[str, Any],
+    getter: Any,
+    max_ratio: float,
+    missing_failure: str,
+    regression_failure: str,
+) -> None:
+    row_value, baseline_value, metric_ratio = ratio(row, baseline, getter)
+    prompt_result[name] = row_value
+    prompt_result[f"baseline_{name}"] = baseline_value
+    prompt_result[f"{name}_ratio"] = metric_ratio
+    if metric_ratio is None:
+        failures.append(missing_failure)
+    elif metric_ratio > max_ratio:
+        failures.append(regression_failure)
+
+
+def build_promotion_gate(
+    rows: list[dict[str, Any]],
+    modes: list[str],
+    max_headline_ratio: float = 0.999,
+    max_ffn_ratio: float = 0.999,
+    max_component_regression_ratio: float = 1.10,
+    max_command_buffer_wait_ratio: float = 1.05,
+    require_profile: bool = True,
+) -> dict[str, Any]:
+    prompt_ids: list[str] = []
+    for row in rows:
+        prompt_id = str(row.get("prompt_id", ""))
+        if prompt_id and prompt_id not in prompt_ids:
+            prompt_ids.append(prompt_id)
+    rows_by_key = {
+        (str(row.get("prompt_id", "")), row.get("mode")): row
+        for row in rows
+    }
+    candidate_modes = [mode for mode in modes if mode != "default"]
+    candidates: list[dict[str, Any]] = []
+    for mode in candidate_modes:
+        failures: list[str] = []
+        prompt_results: list[dict[str, Any]] = []
+        for prompt_id in prompt_ids:
+            prompt_result: dict[str, Any] = {"prompt_id": prompt_id}
+            baseline = rows_by_key.get((prompt_id, "default"))
+            row = rows_by_key.get((prompt_id, mode))
+            if baseline is None or baseline.get("status") != "ok":
+                failures.append(f"prompt_{prompt_id}:missing_ok_default")
+                prompt_result["passed"] = False
+                prompt_result["failures"] = ["missing_ok_default"]
+                prompt_results.append(prompt_result)
+                continue
+            if row is None or row.get("status") != "ok":
+                failures.append(f"prompt_{prompt_id}:missing_ok_candidate")
+                prompt_result["passed"] = False
+                prompt_result["failures"] = ["missing_ok_candidate"]
+                prompt_results.append(prompt_result)
+                continue
+
+            prompt_failures: list[str] = []
+            if (row.get("generated_ids") or []) != (baseline.get("generated_ids") or []):
+                prompt_failures.append("generated_ids_mismatch")
+            append_ratio_gate(
+                prompt_failures,
+                prompt_result,
+                "headline_ms_per_token",
+                row,
+                baseline,
+                headline_ms_per_token,
+                max_headline_ratio,
+                "missing_headline_ms_per_token",
+                "headline_not_improved",
+            )
+            append_ratio_gate(
+                prompt_failures,
+                prompt_result,
+                "ffn_ms_avg",
+                row,
+                baseline,
+                lambda item: chain_ms(item, "ffn_ms_avg"),
+                max_ffn_ratio,
+                "missing_ffn_ms_avg",
+                "ffn_not_improved",
+            )
+            for component in ("full_attn_ms_avg", "linear_attn_ms_avg"):
+                append_ratio_gate(
+                    prompt_failures,
+                    prompt_result,
+                    component,
+                    row,
+                    baseline,
+                    lambda item, metric_name=component: chain_ms(item, metric_name),
+                    max_component_regression_ratio,
+                    f"missing_{component}",
+                    f"{component}_regressed",
+                )
+            append_ratio_gate(
+                prompt_failures,
+                prompt_result,
+                "lm_head_ms_avg",
+                row,
+                baseline,
+                lm_head_ms,
+                max_component_regression_ratio,
+                "missing_lm_head_ms_avg",
+                "lm_head_ms_avg_regressed",
+            )
+            if require_profile:
+                append_ratio_gate(
+                    prompt_failures,
+                    prompt_result,
+                    "command_buffer_wait_ms",
+                    row,
+                    baseline,
+                    command_buffer_wait_ms,
+                    max_command_buffer_wait_ratio,
+                    "missing_command_buffer_wait_profile",
+                    "command_buffer_wait_regressed",
+                )
+            else:
+                row_value, baseline_value, metric_ratio = ratio(
+                    row, baseline, command_buffer_wait_ms
+                )
+                prompt_result["command_buffer_wait_ms"] = row_value
+                prompt_result["baseline_command_buffer_wait_ms"] = baseline_value
+                prompt_result["command_buffer_wait_ms_ratio"] = metric_ratio
+
+            prompt_result["passed"] = not prompt_failures
+            prompt_result["failures"] = prompt_failures
+            failures.extend(f"prompt_{prompt_id}:{failure}" for failure in prompt_failures)
+            prompt_results.append(prompt_result)
+        candidates.append(
+            {
+                "mode": mode,
+                "passed": not failures,
+                "failures": failures,
+                "prompts": prompt_results,
+            }
+        )
+
+    passed_modes = [candidate["mode"] for candidate in candidates if candidate["passed"]]
+    return {
+        "passed": bool(passed_modes),
+        "passed_modes": passed_modes,
+        "candidate_count": len(candidates),
+        "thresholds": {
+            "max_headline_ratio": max_headline_ratio,
+            "max_ffn_ratio": max_ffn_ratio,
+            "max_component_regression_ratio": max_component_regression_ratio,
+            "max_command_buffer_wait_ratio": max_command_buffer_wait_ratio,
+            "require_profile": require_profile,
+        },
+        "candidates": candidates,
+    }
+
+
+def summarize_with_gate(
+    rows: list[dict[str, Any]],
+    modes: list[str],
+    max_headline_ratio: float = 0.999,
+    max_ffn_ratio: float = 0.999,
+    max_component_regression_ratio: float = 1.10,
+    max_command_buffer_wait_ratio: float = 1.05,
+    require_profile: bool = True,
+) -> dict[str, Any]:
+    summary = summarize(rows)
+    summary["promotion_gate"] = build_promotion_gate(
+        rows,
+        modes,
+        max_headline_ratio,
+        max_ffn_ratio,
+        max_component_regression_ratio,
+        max_command_buffer_wait_ratio,
+        require_profile,
+    )
+    return summary
+
+
 def build_report(
     rows: list[dict[str, Any]],
     args: argparse.Namespace,
@@ -370,7 +605,22 @@ def build_report(
         "static_table_json": str(args.static_table_json),
         "static_capacity": args.static_capacity,
         "hotset_capacity": args.hotset_capacity,
-        "summary": summarize(rows),
+        "promotion_thresholds": {
+            "max_headline_ratio": args.promotion_max_headline_ratio,
+            "max_ffn_ratio": args.promotion_max_ffn_ratio,
+            "max_component_regression_ratio": args.promotion_max_component_regression_ratio,
+            "max_command_buffer_wait_ratio": args.promotion_max_command_buffer_wait_ratio,
+            "require_profile": args.promotion_require_profile,
+        },
+        "summary": summarize_with_gate(
+            rows,
+            modes,
+            args.promotion_max_headline_ratio,
+            args.promotion_max_ffn_ratio,
+            args.promotion_max_component_regression_ratio,
+            args.promotion_max_command_buffer_wait_ratio,
+            args.promotion_require_profile,
+        ),
         "rows": rows,
     }
 
@@ -393,6 +643,7 @@ def top_profile_op(profile: dict[str, Any] | None) -> dict[str, Any]:
 
 def render_markdown(report: dict[str, Any]) -> str:
     summary = report["summary"]
+    promotion_gate = summary.get("promotion_gate") or {}
     lines = [
         "# Qwen3.6 Static Top-N Runtime Sweep",
         "",
@@ -400,6 +651,8 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- modes: `{','.join(report['modes'])}`",
         f"- max_new_tokens: `{report['max_new_tokens']}`",
         f"- generated_ids_match: `{summary['generated_ids_match']}`",
+        f"- promotion_gate_passed: `{promotion_gate.get('passed', False)}`",
+        f"- promotion_gate_passed_modes: `{','.join(promotion_gate.get('passed_modes') or []) or '-'}`",
         "",
         "| Prompt | Mode | Status | IDs | Decode ms | FFN ms avg | Exact hit rate | Slot hit rate | Copied GiB | Top Metal op | Top Metal ms | HAL ms | Wall s |",
         "|:---|:---|:---|:---|---:|---:|---:|---:|---:|:---|---:|---:|---:|",
@@ -434,6 +687,30 @@ def render_markdown(report: dict[str, Any]) -> str:
             "Rows are separate process runs. Static modes measure within-run warm reuse across generated tokens; the first token still pays resident-table allocation on full-hit layers.",
         ]
     )
+    candidates = promotion_gate.get("candidates") or []
+    if candidates:
+        lines.extend(
+            [
+                "",
+                "## Promotion Gate",
+                "",
+                "| Mode | Passed | Failures |",
+                "|:---|:---:|:---|",
+            ]
+        )
+        for candidate in candidates:
+            failures = candidate.get("failures") or []
+            lines.append(
+                "| {mode} | {passed} | {failures} |".format(
+                    mode=candidate.get("mode"),
+                    passed=str(candidate.get("passed", False)).lower(),
+                    failures=", ".join(str(item) for item in failures) or "-",
+                )
+            )
+        lines.append("")
+        lines.append(
+            "The gate is nonfatal for this script. A resident FFN mode passes only when generated IDs match the default mode for every prompt, headline ms/token and FFN time improve, full-attention/linear-attention/lm-head stay inside the configured regression threshold, and command-buffer-wait attribution is present and not regressed when profile evidence is required."
+        )
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -452,6 +729,36 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--static-capacity", type=int)
     parser.add_argument("--hotset-capacity", type=int, default=64)
     parser.add_argument("--metal-profile", action="store_true")
+    parser.add_argument(
+        "--promotion-max-headline-ratio",
+        type=float,
+        default=0.999,
+        help="maximum candidate/default headline ms/token ratio for promotion",
+    )
+    parser.add_argument(
+        "--promotion-max-ffn-ratio",
+        type=float,
+        default=0.999,
+        help="maximum candidate/default ffn_ms_avg ratio for promotion",
+    )
+    parser.add_argument(
+        "--promotion-max-component-regression-ratio",
+        type=float,
+        default=1.10,
+        help="maximum allowed ratio for full-attn, linear-attn, and lm-head buckets",
+    )
+    parser.add_argument(
+        "--promotion-max-command-buffer-wait-ratio",
+        type=float,
+        default=1.05,
+        help="maximum candidate/default command_buffer_wait profile ratio",
+    )
+    parser.add_argument(
+        "--promotion-require-profile",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="require command_buffer_wait profile evidence for promotion",
+    )
     parser.add_argument("--out-json", type=Path, default=Path("target/qwen36_static_topn_runtime_sweep.json"))
     parser.add_argument("--out-md", type=Path, default=Path("target/qwen36_static_topn_runtime_sweep.md"))
     return parser.parse_args(argv)
