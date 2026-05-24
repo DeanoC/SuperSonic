@@ -540,12 +540,23 @@ under the same smoke:
    the coding prompt accepted 1/2. K=1 therefore remains an instrumentation path,
    not a policy-promotion candidate.
 
-8. **Qwen3.6 SOTA gate summary**
+8. **Qwen3.6 route residency decision sweep**
+   Turn the route-locality telemetry into a prompt-suite decision before
+   another resident-expert runtime experiment. `tests/metal/sweep_qwen36_route_residency.py`
+   runs with `SUPERSONIC_QWEN36_ROUTE_PROFILE=1`, aggregates
+   `[qwen36-route-profile]`, `[qwen36-route-cache-sim]`, and
+   `[qwen36-route-topn]` rows across smoke or comparison prompts, and writes
+   `target/qwen36_route_residency_sweep.{json,md}`. The v1 `decision_gate`
+   compares per-layer LRU hit-rate with oracle static top-N coverage, then
+   recommends a larger LRU resident cache, static resident table, or fused
+   routed INT4 branch.
+
+9. **Qwen3.6 SOTA gate summary**
    Preserve negative results as one roadmap-level artifact instead of leaving
    the promotion/viability decisions scattered across individual JSON files.
    `tests/metal/summarize_qwen36_sota_gates.py` reads the batched-prefill
-   variant sweep, static top-N runtime sweep, MPS resident-table probe, and MTP
-   acceptance sweep reports, then writes
+   variant sweep, static top-N runtime sweep, MPS resident-table probe, route
+   residency sweep, and MTP acceptance sweep reports, then writes
    `target/qwen36_sota_gate_summary.{json,md}`. The v1 schema records input
    health, passed and failed gate IDs, candidate failures, and a single
    `next_action`. Missing reports are nonfatal rows by default; `--require`

@@ -492,6 +492,9 @@ SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" \
   python3 tests/metal/probe_qwen36_mps_resident_table.py \
   --run-pilot --require-pilot
 
+SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" \
+  python3 tests/metal/sweep_qwen36_route_residency.py --prompt-set smoke
+
 python3 tests/metal/summarize_qwen36_sota_gates.py --require
 
 cargo build --release -p runner --bin qwen36_ffn_expert_microbench
@@ -632,13 +635,19 @@ estimate gate, not a runtime promotion gate: full-hit-only and partial-hit
 candidates must fit the configured resident RHS budget and meet projected FFN
 speedup, coverage, and full-hit-rate thresholds. A passing partial-hit estimate
 still requires a runtime path that avoids per-token FP16 RHS rebuilds.
+`tests/metal/sweep_qwen36_route_residency.py` runs the existing route profiler
+across a small prompt suite and writes `target/qwen36_route_residency_sweep.json`
+and `target/qwen36_route_residency_sweep.md`. Its v1 `decision_gate` compares
+per-layer LRU hit rates against oracle static top-N coverage so the next
+resident-expert branch can be chosen from prompt-shaped route evidence instead
+of one Hello run.
 `tests/metal/summarize_qwen36_sota_gates.py` is the cross-harness summary for
 the current roadmap gates. It reads the batched-prefill variant sweep, static
-top-N runtime sweep, MPS resident-table probe, and MTP acceptance sweep JSON
-reports, then writes `target/qwen36_sota_gate_summary.json` and
-`target/qwen36_sota_gate_summary.md`. Missing reports remain visible as rows by
-default; add `--require` to make a local validation run fail closed on missing,
-malformed, stale-schema, or missing-gate artifacts.
+top-N runtime sweep, MPS resident-table probe, route residency sweep, and MTP
+acceptance sweep JSON reports, then writes `target/qwen36_sota_gate_summary.json`
+and `target/qwen36_sota_gate_summary.md`. Missing reports remain visible as rows
+by default; add `--require` to make a local validation run fail closed on
+missing, malformed, stale-schema, or missing-gate artifacts.
 The current M5 Max perf gate points at linear-attention as the next measured
 multi-token per-token bucket after FFN fallback tightening. The 512-token
 `--metal-profile` smoke currently reports roughly 269 ms/token, 71.7 s prefill,

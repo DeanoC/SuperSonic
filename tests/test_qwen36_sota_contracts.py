@@ -31,6 +31,10 @@ mps_probe = load_script(
     "qwen36_sota_mps_probe",
     METAL_DIR / "probe_qwen36_mps_resident_table.py",
 )
+route_sweep = load_script(
+    "qwen36_sota_route_sweep",
+    METAL_DIR / "sweep_qwen36_route_residency.py",
+)
 mtp_sweep = load_script(
     "qwen36_sota_mtp_sweep",
     METAL_DIR / "sweep_qwen36_mtp_acceptance.py",
@@ -50,6 +54,7 @@ class Qwen36SotaContractTests(unittest.TestCase):
         )
         self.assertEqual(static_sweep.SCHEMA, "qwen36-static-topn-runtime-sweep-v3")
         self.assertEqual(mps_probe.SCHEMA, "qwen36-mps-resident-table-probe-v2")
+        self.assertEqual(route_sweep.SCHEMA, "qwen36-route-residency-sweep-v1")
         self.assertEqual(mtp_sweep.SCHEMA, "qwen36-moe-mtp-acceptance-sweep-v2")
         self.assertEqual(sota_summary.SCHEMA, "qwen36-sota-gate-summary-v1")
 
@@ -69,10 +74,15 @@ class Qwen36SotaContractTests(unittest.TestCase):
             mps_probe.SCHEMA,
         )
         self.assertEqual(
+            specs["route_residency"].expected_schema,
+            route_sweep.SCHEMA,
+        )
+        self.assertEqual(
             specs["mtp_acceptance"].expected_schema,
             mtp_sweep.SCHEMA,
         )
         self.assertEqual(specs["mps_resident_table"].gate_keys, ("viability_gate",))
+        self.assertEqual(specs["route_residency"].gate_keys, ("decision_gate",))
 
     def test_batched_prefill_variants_cover_documented_negative_gates(self):
         expected = {

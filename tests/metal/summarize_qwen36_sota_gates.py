@@ -50,6 +50,14 @@ GATE_SPECS = (
         kind="viability",
     ),
     GateSpec(
+        gate_id="route_residency",
+        label="Route residency",
+        default_path=Path("target/qwen36_route_residency_sweep.json"),
+        expected_schema="qwen36-route-residency-sweep-v1",
+        gate_keys=("decision_gate",),
+        kind="residency_decision",
+    ),
+    GateSpec(
         gate_id="mtp_acceptance",
         label="MTP acceptance",
         default_path=Path("target/qwen36_mtp_acceptance_sweep.json"),
@@ -238,6 +246,20 @@ def choose_next_action(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "blocked_reason": None,
         }
 
+    decision_passes = [
+        row
+        for row in rows
+        if row.get("kind") == "residency_decision" and row.get("passed") is True
+    ]
+    if decision_passes:
+        first = decision_passes[0]
+        recommendation = first.get("recommendation") or "choose_residency_fork"
+        return {
+            "action": recommendation,
+            "reason": "a route-locality decision gate selected a residency fork",
+            "blocked_reason": None,
+        }
+
     return {
         "action": "keep_default_lane_and_select_next_measured_bottleneck",
         "reason": "all gate reports loaded, but no promotion or viability gate passed",
@@ -253,6 +275,8 @@ def recommendation_for_row(row: dict[str, Any]) -> str:
     if row.get("passed") is True:
         if row.get("kind") == "viability":
             return str(row.get("recommendation") or "prototype_viable_path")
+        if row.get("kind") == "residency_decision":
+            return str(row.get("recommendation") or "choose_residency_fork")
         candidates = row.get("passed_candidates") or []
         return "prepare_runtime_promotion" + (f":{candidates[0]}" if candidates else "")
     return "keep_disabled"
@@ -373,9 +397,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="MPS resident table probe JSON",
     )
     parser.add_argument(
-        "--mtp-json",
+        "--route-json",
         type=Path,
         default=GATE_SPECS[3].default_path,
+        help="route residency sweep JSON",
+    )
+    parser.add_argument(
+        "--mtp-json",
+        type=Path,
+        default=GATE_SPECS[4].default_path,
         help="MTP acceptance sweep JSON",
     )
     parser.add_argument(
@@ -406,6 +436,7 @@ def paths_from_args(args: argparse.Namespace) -> dict[str, Path]:
         "batched_prefill_variants": args.prefill_json,
         "static_topn_runtime": args.static_runtime_json,
         "mps_resident_table": args.mps_json,
+        "route_residency": args.route_json,
         "mtp_acceptance": args.mtp_json,
     }
 

@@ -37,6 +37,7 @@ class Qwen36SotaGateSummaryTests(unittest.TestCase):
             "batched_prefill_variants": root / "prefill.json",
             "static_topn_runtime": root / "static.json",
             "mps_resident_table": root / "mps.json",
+            "route_residency": root / "route.json",
             "mtp_acceptance": root / "mtp.json",
         }
 
@@ -46,6 +47,7 @@ class Qwen36SotaGateSummaryTests(unittest.TestCase):
         prefill_gate: dict | None = None,
         static_gate: dict | None = None,
         mps_gate: dict | None = None,
+        route_gate: dict | None = None,
         mtp_gate: dict | None = None,
     ) -> dict[str, Path]:
         script = summarize_qwen36_sota_gates
@@ -96,8 +98,27 @@ class Qwen36SotaGateSummaryTests(unittest.TestCase):
             },
         )
         write_report(
-            paths["mtp_acceptance"],
+            paths["route_residency"],
             script.GATE_SPECS[3].expected_schema,
+            "decision_gate",
+            route_gate
+            if route_gate is not None
+            else {
+                "passed": False,
+                "recommendation": "prefer_fused_routed_int4",
+                "candidates": [
+                    {
+                        "kind": "lru_hotset",
+                        "capacity": 16,
+                        "passed": False,
+                        "failures": ["lru_hit_rate_below_threshold"],
+                    }
+                ],
+            },
+        )
+        write_report(
+            paths["mtp_acceptance"],
+            script.GATE_SPECS[4].expected_schema,
             "promotion_gate",
             mtp_gate
             if mtp_gate is not None
@@ -114,7 +135,7 @@ class Qwen36SotaGateSummaryTests(unittest.TestCase):
             report = script.build_report(self.paths_in(Path(tmp)))
 
         self.assertEqual(report["schema"], script.SCHEMA)
-        self.assertEqual(report["summary"]["status_counts"], {"missing": 4})
+        self.assertEqual(report["summary"]["status_counts"], {"missing": 5})
         self.assertFalse(report["summary"]["all_inputs_ok"])
         self.assertEqual(
             report["summary"]["next_action"]["action"],
@@ -138,6 +159,17 @@ class Qwen36SotaGateSummaryTests(unittest.TestCase):
                     "candidates": [
                         {
                             "kind": "partial_hit_optimistic",
+                            "capacity": 64,
+                            "passed": True,
+                        }
+                    ],
+                },
+                route_gate={
+                    "passed": True,
+                    "recommendation": "prototype_larger_lru_resident_cache",
+                    "candidates": [
+                        {
+                            "kind": "lru_hotset",
                             "capacity": 64,
                             "passed": True,
                         }
@@ -184,6 +216,31 @@ class Qwen36SotaGateSummaryTests(unittest.TestCase):
         )
         self.assertEqual(report["rows"][2]["passed_candidates"], ["partial_hit_optimistic:64"])
 
+    def test_route_decision_pass_is_next_when_runtime_and_viability_fail(self):
+        script = summarize_qwen36_sota_gates
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = self.write_default_reports(
+                Path(tmp),
+                route_gate={
+                    "passed": True,
+                    "recommendation": "prototype_larger_lru_resident_cache",
+                    "candidates": [
+                        {
+                            "kind": "lru_hotset",
+                            "capacity": 64,
+                            "passed": True,
+                        }
+                    ],
+                },
+            )
+            report = script.build_report(paths)
+
+        self.assertEqual(
+            report["summary"]["next_action"]["action"],
+            "prototype_larger_lru_resident_cache",
+        )
+        self.assertEqual(report["rows"][3]["passed_candidates"], ["lru_hotset:64"])
+
     def test_malformed_schema_mismatch_and_missing_gate_are_reported(self):
         script = summarize_qwen36_sota_gates
         with tempfile.TemporaryDirectory() as tmp:
@@ -201,8 +258,14 @@ class Qwen36SotaGateSummaryTests(unittest.TestCase):
                 + "\n"
             )
             write_report(
-                paths["mtp_acceptance"],
+                paths["route_residency"],
                 script.GATE_SPECS[3].expected_schema,
+                "decision_gate",
+                {"passed": False, "recommendation": "prefer_fused_routed_int4"},
+            )
+            write_report(
+                paths["mtp_acceptance"],
+                script.GATE_SPECS[4].expected_schema,
                 "promotion_gate",
                 {"passed": False, "failures": ["acceptance_below_threshold"]},
             )
@@ -239,6 +302,8 @@ class Qwen36SotaGateSummaryTests(unittest.TestCase):
                     str(paths["static_topn_runtime"]),
                     "--mps-json",
                     str(paths["mps_resident_table"]),
+                    "--route-json",
+                    str(paths["route_residency"]),
                     "--mtp-json",
                     str(paths["mtp_acceptance"]),
                     "--out-json",

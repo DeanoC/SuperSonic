@@ -868,9 +868,10 @@ The local-main-target workflow for this machine is:
 12. static top-N resident-table probe: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/probe_qwen36_static_topn.py`
 13. static top-N warm runtime sweep: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/sweep_qwen36_static_topn_runtime.py --modes default,static,static-hotset,mps-static-partial --metal-profile`
 14. MPS resident-table viability probe: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/probe_qwen36_mps_resident_table.py --run-pilot --require-pilot`
-15. SOTA gate summary: `python3 tests/metal/summarize_qwen36_sota_gates.py --require`
-16. routed-expert FFN microbench: `target/release/qwen36_ffn_expert_microbench --iters 20 --warmup 3`
-17. long-context comparison: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/bench_qwen36_longctx.py --preset comparison`
+15. route residency sweep: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/sweep_qwen36_route_residency.py --prompt-set smoke`
+16. SOTA gate summary: `python3 tests/metal/summarize_qwen36_sota_gates.py --require`
+17. routed-expert FFN microbench: `target/release/qwen36_ffn_expert_microbench --iters 20 --warmup 3`
+18. long-context comparison: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/bench_qwen36_longctx.py --preset comparison`
 
 The Metal long-context harness writes `target/qwen36_metal_longctx.json` and
 `target/qwen36_metal_longctx.md`. It uses deterministic NIAH-style prompts and
@@ -1310,14 +1311,23 @@ deliberately optimistic partial-hit estimate is 87.58 ms/token. That keeps a
 dense resident MPS path interesting only if it can serve resident hits and miss
 fallbacks inside the same layer without rebuilding per-token FP16 slabs; a
 full-hit-only bridge is not enough.
+`tests/metal/sweep_qwen36_route_residency.py` is the prompt-suite version of
+the route-locality rows. It runs the default Metal lane with
+`SUPERSONIC_QWEN36_ROUTE_PROFILE=1`, aggregates `[qwen36-route-profile]`,
+`[qwen36-route-cache-sim]`, and `[qwen36-route-topn]` rows across prompts, and
+writes `target/qwen36_route_residency_sweep.{json,md}`. Its v1
+`decision_gate` compares LRU hot-set hit rate with oracle static top-N coverage
+so the next residency fork can be selected from measured route evidence before
+more slab-cache or fused-INT4 work begins.
 `tests/metal/summarize_qwen36_sota_gates.py` is the aggregation step after the
 individual sweeps. It reads the batched-prefill variant sweep, static top-N
-runtime sweep, MPS resident-table probe, and MTP acceptance sweep JSON reports,
-then writes `target/qwen36_sota_gate_summary.{json,md}` with input status,
-passed/failed gate IDs, candidate failures, and the next action. Missing
-reports are preserved as rows by default; use `--require` when a local
-validation run should fail closed on absent, malformed, stale-schema, or
-missing-gate artifacts.
+runtime sweep, MPS resident-table probe, route residency sweep, and MTP
+acceptance sweep JSON reports, then writes
+`target/qwen36_sota_gate_summary.{json,md}` with input status, passed/failed
+gate IDs, candidate failures, and the next action. Missing reports are
+preserved as rows by default; use `--require` when a local validation run
+should fail closed on absent, malformed, stale-schema, or missing-gate
+artifacts.
 
 The first partial-hit resident MPS runtime prototype is opt-in behind
 `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_MPS_STATIC_TOPN_PARTIAL=1` plus the
@@ -1441,6 +1451,12 @@ resident cache as the next immediate optimization, but it leaves a larger
 hot-set cache or fused routed INT4 path as the next measured fork.
 `SUPERSONIC_QWEN36_ROUTE_PROFILE_LAYERS` defaults to `40` for
 Qwen3.6-35B-A3B and can be overridden for smaller parity runs.
+`tests/metal/sweep_qwen36_route_residency.py` preserves those rows as a
+prompt-suite report with a nonfatal `decision_gate`: if LRU hit-rate clears the
+configured threshold, the next branch is a larger resident cache; if only
+oracle top-N coverage clears, the next branch is a static resident table; if
+neither clears, the report recommends a fused routed INT4 path over additional
+slab-residency experiments.
 
 Unsupported Metal constraints remain explicit for this target: persistent
 decode, KV-FP8, speculative decode, batching, and Metal VMM are not benchmarked
