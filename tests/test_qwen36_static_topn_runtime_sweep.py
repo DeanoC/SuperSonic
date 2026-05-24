@@ -45,8 +45,8 @@ class Qwen36StaticTopNRuntimeSweepTests(unittest.TestCase):
         parse_modes = sweep_qwen36_static_topn_runtime.parse_modes
 
         self.assertEqual(
-            parse_modes("baseline,packed,static-hotset,baseline"),
-            ["default", "packed", "static-hotset"],
+            parse_modes("baseline,packed,static-hotset,static-mps-partial,baseline"),
+            ["default", "packed", "static-hotset", "mps-static-partial"],
         )
         with self.assertRaises(ValueError):
             parse_modes("unknown")
@@ -67,6 +67,14 @@ class Qwen36StaticTopNRuntimeSweepTests(unittest.TestCase):
         self.assertEqual(env["SUPERSONIC_METAL_QWEN36_FFN_EXPERT_STATIC_TOPN_CAPACITY"], "64")
         self.assertEqual(env["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_PACK_HOTSET"], "1")
         self.assertEqual(env["SUPERSONIC_METAL_QWEN36_FFN_EXPERT_HOTSET_CAPACITY"], "32")
+
+        env = script.build_env_overrides(args, "mps-static-partial")
+        self.assertEqual(env["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_STATIC_TOPN"], "1")
+        self.assertEqual(
+            env["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_MPS_STATIC_TOPN_PARTIAL"],
+            "1",
+        )
+        self.assertNotIn("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_PACKED_STAGE5", env)
 
     def test_report_summary_detects_generation_mismatch(self):
         script = sweep_qwen36_static_topn_runtime

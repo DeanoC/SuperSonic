@@ -448,6 +448,24 @@ under the same smoke:
    bridge, and estimates 87.58 ms/token only under the optimistic partial-hit
    model. The next runtime implementation should therefore be a partial-hit
    resident table, not another full-hit-only static bridge.
+   The first partial-hit runtime prototype is now env-gated behind
+   `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_MPS_STATIC_TOPN_PARTIAL=1`.
+   It caches a per-layer FP16 MPS RHS table for the static top-N experts,
+   dispatches an indexed MPS bridge for resident-hit groups, and computes miss
+   groups on the existing host INT4 path before combining the contributions.
+   `tests/metal/sweep_qwen36_static_topn_runtime.py` includes the
+   `mps-static-partial` mode so this path can be judged against the same
+   generated-token parity and expert-residency rows as the native INT4 static
+   probes.
+   The first measurement is a useful rejection signal: a profiled one-token
+   smoke preserved `[11]`, but measured `decode_ms=6324`,
+   `ffn_ms_avg=6073.323`, `slot_hit_rate=0.731250`, and
+   `copied_bytes=15753805824`; the indexed MPS bridge was `365.052 ms` across
+   40 calls, while FP16 LUT packing alone took `5630.663 ms`. The warm
+   four-token sweep also preserved `[11, 353, 599, 264]`, but regressed from
+   `default` `decode_ms=702` / `ffn_ms_avg=94.930` to `mps-static-partial`
+   `decode_ms=7839` / `ffn_ms_avg=1845.066`. Do not promote this path without
+   eliminating FP16 RHS materialization/copy and the per-layer MPS/host split.
 
 4. **Qwen3.6 MTP tensor audit**
    Parse local safetensors/bakes for MTP heads and write down the loader delta

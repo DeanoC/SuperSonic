@@ -865,7 +865,7 @@ The local-main-target workflow for this machine is:
 9. MTP Metal K=1 experiment: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/probe_qwen36_mtp_acceptance.py --metal-experiment`
 10. MTP Metal prompt-suite sweep: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/sweep_qwen36_mtp_acceptance.py --prompt-set smoke --metal-experiment`
 11. static top-N resident-table probe: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/probe_qwen36_static_topn.py`
-12. static top-N warm runtime sweep: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/sweep_qwen36_static_topn_runtime.py --modes default,static,static-hotset`
+12. static top-N warm runtime sweep: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/sweep_qwen36_static_topn_runtime.py --modes default,static,static-hotset,mps-static-partial`
 13. MPS resident-table viability probe: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/probe_qwen36_mps_resident_table.py --run-pilot --require-pilot`
 14. routed-expert FFN microbench: `target/release/qwen36_ffn_expert_microbench --iters 20 --warmup 3`
 15. long-context comparison: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/bench_qwen36_longctx.py --preset comparison`
@@ -1276,6 +1276,34 @@ deliberately optimistic partial-hit estimate is 87.58 ms/token. That keeps a
 dense resident MPS path interesting only if it can serve resident hits and miss
 fallbacks inside the same layer without rebuilding per-token FP16 slabs; a
 full-hit-only bridge is not enough.
+
+The first partial-hit resident MPS runtime prototype is opt-in behind
+`SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_MPS_STATIC_TOPN_PARTIAL=1` plus the
+same static-table env used by native INT4 static top-N. It materializes a
+per-layer FP16 MPS RHS table once from the static top-N experts, remaps only the
+resident-hit routed groups to table slots, runs an indexed MPS bridge for those
+hits, then computes miss groups on the existing host INT4 path and combines
+both contributions before the residual write. Profile rows use
+`resident_format=fp16_mps`, `miss_policy=static_topn`, and stable op names
+`qwen36_ffn_int4_expert_mps_static_topn_pack_f16_lut`,
+`qwen36_ffn_int4_expert_mps_static_topn_partial_f16`, and
+`qwen36_ffn_host_expert_mps_static_topn_miss_*`. The warm sweep mode
+`mps-static-partial` compares this path against `default`, `static`, and
+`static-hotset` with the same generated-ID parity key. This is still a
+diagnostic path, not a promoted default.
+
+The first measured result is negative. A profiled one-token smoke preserved the
+generated id `[11]`, but reported `decode_ms=6324`, `ffn_ms_avg=6073.323`,
+`slot_hit_rate=0.731250`, and `copied_bytes=15753805824`. The native indexed
+MPS bridge itself was `365.052 ms` across 40 layer calls, while
+`qwen36_ffn_int4_expert_mps_static_topn_pack_f16_lut` took `5630.663 ms` on
+the host and HAL `copy_h2d` accounted for `4481.851 ms` / `17886298368` bytes.
+The warm four-token sweep preserved `[11, 353, 599, 264]`, but measured
+`default` at `decode_ms=702`, `ffn_ms_avg=94.930` versus
+`mps-static-partial` at `decode_ms=7839`, `ffn_ms_avg=1845.066`,
+`slot_hit_rate=0.507812`, and `copied_gib=14.672`. This confirms the prototype
+as a correctness/profiling harness only: the RHS materialization and
+MPS/host-split overhead swamp the resident-hit matmuls.
 
 The GPU-side active-slab pack probe is opt-in behind
 `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_GPU_PACK_STAGE5=1` on top of the

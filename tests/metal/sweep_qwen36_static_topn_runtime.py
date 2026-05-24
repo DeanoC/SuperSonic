@@ -43,8 +43,10 @@ MODE_ALIASES: dict[str, str] = {
     "hotset": "hotset",
     "static": "static",
     "static-hotset": "static-hotset",
+    "mps-static-partial": "mps-static-partial",
+    "static-mps-partial": "mps-static-partial",
 }
-DEFAULT_MODES = "default,static,static-hotset"
+DEFAULT_MODES = "default,static,static-hotset,mps-static-partial"
 
 
 def parse_key_values(line: str) -> dict[str, str]:
@@ -158,7 +160,7 @@ def build_env_overrides(args: argparse.Namespace, mode: str) -> dict[str, str]:
         overrides["SUPERSONIC_METAL_QWEN36_FFN_EXPERT_HOTSET_CAPACITY"] = str(
             args.hotset_capacity
         )
-    if mode in {"static", "static-hotset"}:
+    if mode in {"static", "static-hotset", "mps-static-partial"}:
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_STATIC_TOPN"] = "1"
         overrides["SUPERSONIC_METAL_QWEN36_FFN_EXPERT_STATIC_TOPN_FILE"] = str(
             args.static_table_json
@@ -167,6 +169,8 @@ def build_env_overrides(args: argparse.Namespace, mode: str) -> dict[str, str]:
             overrides["SUPERSONIC_METAL_QWEN36_FFN_EXPERT_STATIC_TOPN_CAPACITY"] = str(
                 args.static_capacity
             )
+    if mode == "mps-static-partial":
+        overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_MPS_STATIC_TOPN_PARTIAL"] = "1"
     return overrides
 
 
@@ -380,7 +384,10 @@ def main(argv: list[str]) -> int:
     args = parse_args(argv)
     args.model_dir = resolve_model_dir(args.model_dir, os.environ)
     modes = parse_modes(args.modes)
-    if any(mode in {"static", "static-hotset"} for mode in modes) and not args.static_table_json.exists():
+    if (
+        any(mode in {"static", "static-hotset", "mps-static-partial"} for mode in modes)
+        and not args.static_table_json.exists()
+    ):
         print(
             f"[qwen36-static-topn-runtime-sweep] error=missing_static_table_json path={args.static_table_json}",
             file=sys.stderr,
