@@ -625,9 +625,15 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
     def test_router_parity_tap_rows_are_parsed_and_rendered(self):
         script = sweep_qwen36_fused_routed_int4
         output = (
-            "[qwen36-ffn-router-parity] call=0 layer=5 topk_idx_match=0 "
-            "workspace_idx_match=0 output_idx_match=0 h_norm_max_abs=1.25000000e-01 "
+            "[qwen36-ffn-router-parity] call=0 layer=5 router_path=simd "
+            "topk_idx_match=0 workspace_idx_match=0 output_idx_match=0 "
+            "topk_first_mismatch=1 workspace_first_idx_mismatch=1 "
+            "output_first_idx_mismatch=1 h_norm_max_abs=1.25000000e-01 "
             "h_norm_argmax=17 logits_max_abs=2.50000000e-01 logits_argmax=33 "
+            "host_top_logit_idx=2 metal_top_logit_idx=4 "
+            "host_top_logit=1.25000000e+00 metal_top_logit=1.37500000e+00 "
+            "host_logit_at_metal_top=1.12500000e+00 "
+            "metal_logit_at_host_top=1.00000000e+00 "
             "topk_weight_max_abs=3.12500000e-02 topk_weight_argmax=2 "
             "host_idx=1,2,3 workspace_idx=1,4,3 output_idx=1,4,3 "
             "host_w=0.50000000,0.25000000,0.12500000 "
@@ -639,7 +645,10 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
         self.assertEqual(len(taps), 1)
         self.assertEqual(taps[0]["layer"], 5)
         self.assertEqual(taps[0]["topk_idx_match"], 0)
+        self.assertEqual(taps[0]["router_path"], "simd")
+        self.assertEqual(taps[0]["topk_first_mismatch"], 1)
         self.assertEqual(taps[0]["host_idx"], "1,2,3")
+        self.assertEqual(taps[0]["metal_top_logit_idx"], 4)
         self.assertAlmostEqual(taps[0]["logits_max_abs"], 0.25)
 
         args = Namespace(
@@ -663,8 +672,49 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
         md = script.render_markdown(report)
 
         self.assertIn("router_parity_tap: `True`", md)
+        self.assertIn("router_parity_tap_count: `1`", md)
+        self.assertIn("router_parity_mismatches: `1`", md)
         self.assertIn("## Router Parity Tap", md)
-        self.assertIn("| hello | full-stage5-router | 5 | false |", md)
+        self.assertIn("| hello | full-stage5-router | simd | 5 | false | 1 |", md)
+        self.assertEqual(report["summary"]["router_parity"]["paths"], ["simd"])
+
+    def test_router_parity_tap_selection_keeps_each_path(self):
+        script = sweep_qwen36_fused_routed_int4
+        tap_rows = []
+        serial_row = {"prompt_id": "hello", "mode": "full-stage5-router"}
+        simd_row = {"prompt_id": "hello", "mode": "full-stage5-router-simd"}
+        for layer in range(40):
+            tap_rows.append(
+                (
+                    serial_row,
+                    {
+                        "router_path": "serial",
+                        "layer": layer,
+                        "topk_idx_match": 1,
+                    },
+                )
+            )
+        for layer in range(40):
+            tap_rows.append(
+                (
+                    simd_row,
+                    {
+                        "router_path": "simd",
+                        "layer": layer,
+                        "topk_idx_match": 1,
+                    },
+                )
+            )
+
+        selected = script.select_router_parity_tap_rows(tap_rows, limit=40)
+
+        self.assertEqual(len(selected), 40)
+        paths = {tap["router_path"] for _, tap in selected}
+        self.assertEqual(paths, {"serial", "simd"})
+        serial_layers = {tap["layer"] for _, tap in selected if tap["router_path"] == "serial"}
+        simd_layers = {tap["layer"] for _, tap in selected if tap["router_path"] == "simd"}
+        self.assertIn(39, serial_layers)
+        self.assertIn(39, simd_layers)
 
 
 if __name__ == "__main__":

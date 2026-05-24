@@ -15,7 +15,7 @@ from typing import Any
 
 
 MODEL = "qwen3.6-35b-a3b"
-SCHEMA = "qwen36-fused-routed-int4-sweep-v9"
+SCHEMA = "qwen36-fused-routed-int4-sweep-v10"
 DEFAULT_MAX_FUSED_WALL_GPU_RATIO = 4.0
 DEFAULT_MAX_WAIT_GPU_RATIO = 4.0
 BATCH_FAST_PROFILE_MODES = {
@@ -307,6 +307,97 @@ def parse_router_parity_taps(output: str) -> list[dict[str, Any]]:
         }
         rows.append(fields)
     return rows
+
+
+def summarize_router_parity_taps(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    taps = [
+        tap
+        for row in rows
+        for tap in (row.get("router_parity_taps") or [])
+    ]
+    paths = sorted({str(tap.get("router_path") or "-") for tap in taps})
+    mismatches = [tap for tap in taps if not bool(tap.get("topk_idx_match"))]
+    return {
+        "tap_count": len(taps),
+        "mismatch_count": len(mismatches),
+        "paths": paths,
+        "max_h_norm_abs": max(
+            (float(tap.get("h_norm_max_abs") or 0.0) for tap in taps),
+            default=0.0,
+        ),
+        "max_logits_abs": max(
+            (float(tap.get("logits_max_abs") or 0.0) for tap in taps),
+            default=0.0,
+        ),
+        "max_topk_weight_abs": max(
+            (float(tap.get("topk_weight_max_abs") or 0.0) for tap in taps),
+            default=0.0,
+        ),
+        "mismatch_examples": [
+            {
+                "path": tap.get("router_path") or "-",
+                "layer": tap.get("layer"),
+                "first_mismatch": tap.get("topk_first_mismatch"),
+                "host_idx": tap.get("host_idx"),
+                "metal_idx": tap.get("workspace_idx", tap.get("output_idx")),
+                "host_top_logit_idx": tap.get("host_top_logit_idx"),
+                "metal_top_logit_idx": tap.get("metal_top_logit_idx"),
+            }
+            for tap in mismatches[:20]
+        ],
+    }
+
+
+def select_router_parity_tap_rows(
+    tap_rows: list[tuple[dict[str, Any], dict[str, Any]]],
+    limit: int = 40,
+) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    if len(tap_rows) <= limit:
+        return tap_rows
+
+    selected: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    selected_taps: set[int] = set()
+
+    def add(pair: tuple[dict[str, Any], dict[str, Any]]) -> None:
+        tap_id = id(pair[1])
+        if tap_id not in selected_taps and len(selected) < limit:
+            selected.append(pair)
+            selected_taps.add(tap_id)
+
+    for pair in tap_rows:
+        if not bool(pair[1].get("topk_idx_match")):
+            add(pair)
+
+    grouped: dict[tuple[str, str, str], list[tuple[dict[str, Any], dict[str, Any]]]] = {}
+    for pair in tap_rows:
+        row, tap = pair
+        key = (
+            str(row.get("prompt_id", "")),
+            str(row.get("mode", "")),
+            str(tap.get("router_path", "-")),
+        )
+        grouped.setdefault(key, []).append(pair)
+
+    remaining = max(0, limit - len(selected))
+    quota = max(1, remaining // max(1, len(grouped)))
+    for group in grouped.values():
+        if len(selected) >= limit:
+            break
+        if len(group) <= quota:
+            candidates = group
+        elif quota == 1:
+            candidates = [group[0]]
+        else:
+            candidates = group[: quota - 1] + [group[-1]]
+        for pair in candidates:
+            add(pair)
+
+    for pair in tap_rows:
+        if len(selected) >= limit:
+            break
+        add(pair)
+
+    return selected
 
 
 def parse_modes(raw: str) -> list[str]:
@@ -1058,6 +1149,18 @@ def build_report(
         args.promotion_max_fused_wall_gpu_ratio,
         args.promotion_max_wait_gpu_ratio,
     )
+    summary = summarize_with_gate(
+        rows,
+        modes,
+        args.promotion_max_headline_ratio,
+        args.promotion_max_ffn_ratio,
+        args.promotion_max_component_regression_ratio,
+        args.promotion_max_command_buffer_wait_ratio,
+        args.promotion_require_profile,
+        args.promotion_max_fused_wall_gpu_ratio,
+        args.promotion_max_wait_gpu_ratio,
+    )
+    summary["router_parity"] = summarize_router_parity_taps(rows)
     return {
         "schema": SCHEMA,
         "model": MODEL,
@@ -1081,17 +1184,7 @@ def build_report(
             "max_wait_gpu_ratio": args.promotion_max_wait_gpu_ratio,
             "require_profile": args.promotion_require_profile,
         },
-        "summary": summarize_with_gate(
-            rows,
-            modes,
-            args.promotion_max_headline_ratio,
-            args.promotion_max_ffn_ratio,
-            args.promotion_max_component_regression_ratio,
-            args.promotion_max_command_buffer_wait_ratio,
-            args.promotion_require_profile,
-            args.promotion_max_fused_wall_gpu_ratio,
-            args.promotion_max_wait_gpu_ratio,
-        ),
+        "summary": summary,
         "rows": rows,
     }
 
@@ -1109,6 +1202,7 @@ def render_markdown(report: dict[str, Any]) -> str:
     summary = report["summary"]
     promotion_gate = summary.get("promotion_gate") or {}
     ffn_gap = summary.get("ffn_residency_gap") or {}
+    router_parity = summary.get("router_parity") or {}
     lines = [
         "# Qwen3.6 Fused Routed INT4 Sweep",
         "",
@@ -1124,6 +1218,8 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- promotion_gate_passed: `{promotion_gate.get('passed', False)}`",
         f"- promotion_gate_passed_modes: `{','.join(promotion_gate.get('passed_modes') or []) or '-'}`",
         f"- ffn_gap_recommendation: `{ffn_gap.get('recommendation') or '-'}`",
+        f"- router_parity_tap_count: `{router_parity.get('tap_count', 0)}`",
+        f"- router_parity_mismatches: `{router_parity.get('mismatch_count', 0)}`",
         "",
         "| Prompt | Mode | Status | IDs | Decode ms | FFN ms avg | Fused wall ms | Fused GPU ms | Batch lin GPU ms | Batch FFN GPU ms | Wall/GPU | Wait/GPU | FFN class | Top Metal op | Top Metal ms | HAL ms | Wall s |",
         "|:---|:---|:---|:---|---:|---:|---:|---:|---:|---:|---:|---:|:---|:---|---:|---:|---:|",
@@ -1248,21 +1344,38 @@ def render_markdown(report: dict[str, Any]) -> str:
                 "",
                 "## Router Parity Tap",
                 "",
-                "| Prompt | Mode | Layer | Match | HNorm max | HNorm idx | Logit max | Logit idx | TopK weight max | Host idx | Metal idx |",
-                "|:---|:---|---:|:---:|---:|---:|---:|---:|---:|:---|:---|",
+                "| Prompt | Mode | Path | Layer | Match | First mismatch | HNorm max | HNorm idx | Logit max | Logit idx | Host top | Metal top | Host@Metal | Metal@Host | TopK weight max | Host idx | Metal idx |",
+                "|:---|:---|:---|---:|:---:|---:|---:|---:|---:|---:|:---|:---|---:|---:|---:|:---|:---|",
             ]
         )
-        for row, tap in tap_rows[:40]:
+        for row, tap in select_router_parity_tap_rows(tap_rows, limit=40):
+            host_top = "{idx}:{value}".format(
+                idx=tap.get("host_top_logit_idx", "-"),
+                value=render_float(tap.get("host_top_logit"), 8),
+            )
+            metal_top = "{idx}:{value}".format(
+                idx=tap.get("metal_top_logit_idx", "-"),
+                value=render_float(tap.get("metal_top_logit"), 8),
+            )
             lines.append(
-                "| {prompt} | {mode} | {layer} | {match} | {hnorm} | {hnorm_idx} | {logits} | {logits_idx} | {weight} | {host_idx} | {metal_idx} |".format(
+                "| {prompt} | {mode} | {path} | {layer} | {match} | {first_mismatch} | {hnorm} | {hnorm_idx} | {logits} | {logits_idx} | {host_top} | {metal_top} | {host_at_metal} | {metal_at_host} | {weight} | {host_idx} | {metal_idx} |".format(
                     prompt=row.get("prompt_id", ""),
                     mode=row.get("mode", ""),
+                    path=tap.get("router_path", "-"),
                     layer=tap.get("layer", "-"),
                     match=str(bool(tap.get("topk_idx_match"))).lower(),
+                    first_mismatch=tap.get(
+                        "topk_first_mismatch",
+                        tap.get("workspace_first_idx_mismatch", "-"),
+                    ),
                     hnorm=render_float(tap.get("h_norm_max_abs"), 8),
                     hnorm_idx=tap.get("h_norm_argmax", "-"),
                     logits=render_float(tap.get("logits_max_abs"), 8),
                     logits_idx=tap.get("logits_argmax", "-"),
+                    host_top=host_top,
+                    metal_top=metal_top,
+                    host_at_metal=render_float(tap.get("host_logit_at_metal_top"), 8),
+                    metal_at_host=render_float(tap.get("metal_logit_at_host_top"), 8),
                     weight=render_float(tap.get("topk_weight_max_abs"), 8),
                     host_idx=tap.get("host_idx", "-"),
                     metal_idx=tap.get("workspace_idx", tap.get("output_idx", "-")),

@@ -1147,6 +1147,49 @@ under the same smoke:
    path and chase deterministic route equality before using this path as a
    performance candidate.
 
+34. **Qwen3.6 SIMD router parity evidence**
+   The router parity tap now identifies the active router path and records the
+   data needed to debug route-rank drift: `router_path`,
+   `topk_first_mismatch`, workspace/output first-mismatch indices, host and
+   Metal top-logit indices, top-logit values, and cross-read logits at the
+   other path's top expert. The fused-routed sweep is schema v10 and summarizes
+   tap counts, mismatch counts, observed paths, max hidden/logit/top-k-weight
+   deltas, and mismatch examples in JSON. The Markdown renderer also samples
+   every prompt/mode/path group so the SIMD rows are visible when a full 40
+   layer tap is present.
+
+   The full one-token Metal smoke used
+   `--modes default,full-stage5-router,full-stage5-router-simd
+   --metal-profile --router-parity-tap --router-parity-tap-max-calls 80`.
+   It preserved generated IDs (`[11]`) across all modes and emitted 80 tap
+   rows: 40 serial-router rows and 40 SIMD-router rows covering layers 0
+   through 39. Both paths reported zero top-k mismatches, `topk_first_mismatch`
+   stayed `-1`, host and Metal top-logit indices matched on every tapped
+   layer, and the max deltas were all zero:
+   `max_h_norm_abs=0.0`, `max_logits_abs=0.0`, and
+   `max_topk_weight_abs=0.0`.
+
+   This was a correctness/profiling tap, not a promotion measurement. The tap
+   disables decode batching and adds per-layer synchronization/readback, so
+   visible wall times are dominated by residency/submit waits. In that run,
+   default measured `665.0 ms` decode with `ffn_ms_avg=239.519`.
+   `full-stage5-router` measured `1581.0 ms` decode,
+   `ffn_ms_avg=1397.756`, `fused_wall_ms=1377.424`,
+   `fused_gpu_ms=97.045`, and `command_buffer_wait=1506.416 ms`.
+   `full-stage5-router-simd` measured `1952.0 ms` decode,
+   `ffn_ms_avg=1740.241`, `fused_wall_ms=1713.524`,
+   `fused_gpu_ms=86.106`, and `command_buffer_wait=1866.179 ms`.
+
+   The earlier SIMD batch-FFN phase drift is therefore not explained by the
+   standalone SIMD router logit/top-k math. The next runtime step should move
+   back to the decode-batch attribution lane and add a batch-compatible route
+   checksum or route snapshot around
+   `full-stage5-router-simd-batch-ffn-phases`. If that confirms route equality
+   under batching, the measured bottleneck to attack is still the batched FFN
+   router/shared/expert GPU work; if it finds route drift only inside the batch
+   phase lane, fix that batch/profile interaction before promoting the SIMD
+   router as a performance candidate.
+
 ## Sources
 
 - [Qwen/Qwen3.6-35B-A3B model card](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)

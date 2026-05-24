@@ -3900,6 +3900,11 @@ fn qwen36_ffn_router_stage5_parity_tap_enabled() -> bool {
         && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
 }
 
+fn qwen36_ffn_router_stage5_simd_env_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_STAGE5_SIMD").is_some()
+        && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
+}
+
 fn qwen36_ffn_router_stage5_parity_tap_max_calls() -> usize {
     std::env::var("SUPERSONIC_METAL_QWEN36_FFN_ROUTER_STAGE5_PARITY_TAP_MAX_CALLS")
         .ok()
@@ -4021,6 +4026,31 @@ fn qwen36_max_abs_delta(expected: &[f32], got: &[f32]) -> (f32, usize) {
     (max_abs, max_idx)
 }
 
+fn qwen36_argmax_f32(values: &[f32]) -> (usize, f32) {
+    let mut best_idx = 0usize;
+    let mut best_value = f32::NEG_INFINITY;
+    for (idx, &value) in values.iter().enumerate() {
+        if value > best_value || (value == best_value && idx < best_idx) {
+            best_idx = idx;
+            best_value = value;
+        }
+    }
+    (best_idx, best_value)
+}
+
+fn qwen36_first_u32_mismatch(expected: &[u32], got: &[u32]) -> i32 {
+    let min_len = expected.len().min(got.len());
+    for idx in 0..min_len {
+        if expected[idx] != got[idx] {
+            return idx as i32;
+        }
+    }
+    if expected.len() != got.len() {
+        return min_len as i32;
+    }
+    -1
+}
+
 fn qwen36_join_u32(values: &[u32]) -> String {
     values
         .iter()
@@ -4078,18 +4108,50 @@ fn qwen36_emit_ffn_router_stage5_parity_tap(
     let workspace_idx_match = reference.topk_idx == workspace_topk_idx;
     let output_idx_match = reference.topk_idx.as_slice() == output_topk_idx;
     let topk_idx_match = workspace_idx_match && output_idx_match;
+    let workspace_first_idx_mismatch =
+        qwen36_first_u32_mismatch(&reference.topk_idx, &workspace_topk_idx);
+    let output_first_idx_mismatch = qwen36_first_u32_mismatch(&reference.topk_idx, output_topk_idx);
+    let topk_first_mismatch = match (workspace_first_idx_mismatch, output_first_idx_mismatch) {
+        (-1, -1) => -1,
+        (-1, output) => output,
+        (workspace, -1) => workspace,
+        (workspace, output) => workspace.min(output),
+    };
+    let (host_top_logit_idx, host_top_logit) = qwen36_argmax_f32(&reference.logits);
+    let (metal_top_logit_idx, metal_top_logit) = qwen36_argmax_f32(logits);
+    let host_logit_at_metal_top = reference
+        .logits
+        .get(metal_top_logit_idx)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let metal_logit_at_host_top = logits.get(host_top_logit_idx).copied().unwrap_or(f32::NAN);
+    let router_path = if qwen36_ffn_router_stage5_simd_env_enabled() {
+        "simd"
+    } else {
+        "serial"
+    };
 
     eprintln!(
-        "[qwen36-ffn-router-parity] call={} layer={} topk_idx_match={} workspace_idx_match={} output_idx_match={} h_norm_max_abs={:.8e} h_norm_argmax={} logits_max_abs={:.8e} logits_argmax={} topk_weight_max_abs={:.8e} topk_weight_argmax={} host_idx={} workspace_idx={} output_idx={} host_w={} metal_w={}",
+        "[qwen36-ffn-router-parity] call={} layer={} router_path={} topk_idx_match={} workspace_idx_match={} output_idx_match={} topk_first_mismatch={} workspace_first_idx_mismatch={} output_first_idx_mismatch={} h_norm_max_abs={:.8e} h_norm_argmax={} logits_max_abs={:.8e} logits_argmax={} host_top_logit_idx={} metal_top_logit_idx={} host_top_logit={:.8e} metal_top_logit={:.8e} host_logit_at_metal_top={:.8e} metal_logit_at_host_top={:.8e} topk_weight_max_abs={:.8e} topk_weight_argmax={} host_idx={} workspace_idx={} output_idx={} host_w={} metal_w={}",
         call,
         layer_idx,
+        router_path,
         topk_idx_match as u8,
         workspace_idx_match as u8,
         output_idx_match as u8,
+        topk_first_mismatch,
+        workspace_first_idx_mismatch,
+        output_first_idx_mismatch,
         h_norm_max_abs,
         h_norm_argmax,
         logits_max_abs,
         logits_argmax,
+        host_top_logit_idx,
+        metal_top_logit_idx,
+        host_top_logit,
+        metal_top_logit,
+        host_logit_at_metal_top,
+        metal_logit_at_host_top,
         topk_weight_max_abs,
         topk_weight_argmax,
         qwen36_join_u32(&reference.topk_idx),
