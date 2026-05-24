@@ -276,6 +276,55 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
             "prototype_ffn_residency_or_submit_wait_path",
         )
 
+    def test_phase_profile_sums_full_stage5_gpu_subdispatches(self):
+        script = sweep_qwen36_fused_routed_int4
+        candidate = row("full-stage5", wait=48.0)
+        candidate["metal_profile"]["entries"].extend(
+            [
+                {
+                    "op": "qwen36_ffn_int4_stage5",
+                    "path": "native",
+                    "calls": 1,
+                    "mean_ms": 96.0,
+                    "total_ms": 96.0,
+                    "max_ms": 96.0,
+                },
+                {
+                    "op": "command_buffer_gpu:qwen36_ffn_int4_shared_gate_up",
+                    "path": "runtime",
+                    "calls": 1,
+                    "mean_ms": 8.0,
+                    "total_ms": 8.0,
+                    "max_ms": 8.0,
+                },
+                {
+                    "op": "command_buffer_gpu:qwen36_ffn_int4_shared_down",
+                    "path": "runtime",
+                    "calls": 1,
+                    "mean_ms": 4.0,
+                    "total_ms": 4.0,
+                    "max_ms": 4.0,
+                },
+                {
+                    "op": "command_buffer_gpu:qwen36_ffn_int4_expert_gate_up_tiled_stage5",
+                    "path": "runtime",
+                    "calls": 1,
+                    "mean_ms": 12.0,
+                    "total_ms": 12.0,
+                    "max_ms": 12.0,
+                },
+            ]
+        )
+        rows = [row("default"), candidate]
+
+        script.annotate_ffn_profile_fields(rows, max_wall_gpu_ratio=4.0, max_wait_gpu_ratio=4.0)
+
+        self.assertEqual(candidate["fused_wall_ms"], 96.0)
+        self.assertEqual(candidate["fused_gpu_ms"], 24.0)
+        self.assertEqual(candidate["fused_wall_gpu_ratio"], 4.0)
+        self.assertEqual(candidate["wait_gpu_ratio"], 2.0)
+        self.assertEqual(candidate["ffn_attribution_class"], "gpu_arithmetic")
+
 
 if __name__ == "__main__":
     unittest.main()

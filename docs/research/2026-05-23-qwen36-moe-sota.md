@@ -947,6 +947,36 @@ under the same smoke:
    `full-stage5*` parity issue so shared/router/expert work can be encoded as
    a single larger GPU pipeline.
 
+28. **Qwen3.6 full-stage5 shared parity probe**
+   The no-router `full-stage5` path is now a parity-clean diagnostic by using
+   the tiled expert gate/up path plus host-order shared INT4 dot products and
+   the original non-tiled expert down/finalize. This is not a promoted
+   performance path: the shared kernels intentionally preserve host accumulation
+   order to isolate correctness before reintroducing faster reductions.
+   The refreshed seven-mode smoke shows the new boundary clearly. Default
+   generated `[11, 271, 40, 599]` at `203.3 ms/token` with
+   `ffn_ms_avg=107.419`. `direct-gather`, `direct-defer-wait`, `gpu-pack`, and
+   the repaired `full-stage5` all preserved those IDs, while
+   `full-stage5-router` and `router-defer-wait` still generated
+   `[11, 353, 599, 264]`. The router mismatch persisted even after switching
+   router down/finalize to the non-tiled finalize path, so the remaining
+   correctness gap is in the router/RMSNorm/top-k side of
+   `full-stage5-router`, not expert down finalize.
+   The promotion gate remains negative. The parity-clean `full-stage5` row
+   measured `401.5 ms/token`, `ffn_ms_avg=312.345`,
+   `fused_wall_ms=1202.172`, `fused_gpu_ms=89.615`,
+   `wall/GPU=13.41`, `command_buffer_wait=1426.349 ms`, and
+   `wait/GPU=15.92`. A separate phase-attribution smoke now sums phase GPU
+   rows correctly and kept `full-stage5` parity-clean, but still classified it
+   as residency/submit-wait bound: `fused_gpu_ms=101.339`,
+   `command_buffer_wait=1350.109 ms`, `wait/GPU=13.32`. The largest phase GPU
+   rows were shared gate/up (`33.717 ms`), shared scalar (`22.224 ms`), expert
+   gate/up (`19.618 ms`), expert down/finalize (`13.420 ms`), and shared down
+   (`12.360 ms`). The next FFN attempt should keep no-router `full-stage5` as
+   the correctness baseline, then either make the shared host-order math fast
+   enough without token drift or fix the router stage so the whole FFN can be
+   studied as one parity-clean larger pipeline.
+
 ## Sources
 
 - [Qwen/Qwen3.6-35B-A3B model card](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)

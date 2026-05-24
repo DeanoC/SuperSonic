@@ -73,9 +73,32 @@ FUSED_GPU_OP_PREFIXES = {
     "direct-gather": ("command_buffer_gpu:qwen36_ffn_int4_expert_direct_gather_stage5",),
     "direct-defer-wait": ("command_buffer_gpu:qwen36_ffn_int4_expert_direct_gather_stage5",),
     "gpu-pack": ("command_buffer_gpu:qwen36_ffn_int4_expert_gpu_pack",),
-    "full-stage5": ("command_buffer_gpu:qwen36_ffn_int4_stage5",),
-    "full-stage5-router": ("command_buffer_gpu:qwen36_ffn_int4_stage5_with_router",),
-    "router-defer-wait": ("command_buffer_gpu:qwen36_ffn_int4_stage5_with_router",),
+    "full-stage5": (
+        "command_buffer_gpu:qwen36_ffn_int4_stage5",
+        "command_buffer_gpu:qwen36_ffn_int4_shared_gate_up",
+        "command_buffer_gpu:qwen36_ffn_int4_shared_gate_scalar",
+        "command_buffer_gpu:qwen36_ffn_int4_shared_down",
+        "command_buffer_gpu:qwen36_ffn_int4_expert_gate_up_tiled_stage5",
+        "command_buffer_gpu:qwen36_ffn_int4_expert_down_finalize",
+    ),
+    "full-stage5-router": (
+        "command_buffer_gpu:qwen36_ffn_int4_stage5_with_router",
+        "command_buffer_gpu:qwen36_ffn_int4_router_topk_stage5",
+        "command_buffer_gpu:qwen36_ffn_int4_shared_gate_up",
+        "command_buffer_gpu:qwen36_ffn_int4_shared_gate_scalar",
+        "command_buffer_gpu:qwen36_ffn_int4_shared_down",
+        "command_buffer_gpu:qwen36_ffn_int4_expert_gate_up_tiled_stage5",
+        "command_buffer_gpu:qwen36_ffn_int4_expert_down_finalize",
+    ),
+    "router-defer-wait": (
+        "command_buffer_gpu:qwen36_ffn_int4_stage5_with_router",
+        "command_buffer_gpu:qwen36_ffn_int4_router_topk_stage5",
+        "command_buffer_gpu:qwen36_ffn_int4_shared_gate_up",
+        "command_buffer_gpu:qwen36_ffn_int4_shared_gate_scalar",
+        "command_buffer_gpu:qwen36_ffn_int4_shared_down",
+        "command_buffer_gpu:qwen36_ffn_int4_expert_gate_up_tiled_stage5",
+        "command_buffer_gpu:qwen36_ffn_int4_expert_down_finalize",
+    ),
 }
 
 
