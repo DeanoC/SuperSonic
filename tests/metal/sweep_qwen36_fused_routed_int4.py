@@ -15,7 +15,9 @@ from typing import Any
 
 
 MODEL = "qwen3.6-35b-a3b"
-SCHEMA = "qwen36-fused-routed-int4-sweep-v4"
+SCHEMA = "qwen36-fused-routed-int4-sweep-v5"
+DEFAULT_MAX_FUSED_WALL_GPU_RATIO = 4.0
+DEFAULT_MAX_WAIT_GPU_RATIO = 4.0
 
 PROMPT_SETS: dict[str, list[tuple[str, str]]] = {
     "smoke": [("hello", "Hello")],
@@ -56,6 +58,14 @@ FUSED_OP_NEEDLES = {
     "gpu-pack": "qwen36_ffn_int4_expert_gpu_pack_stage5",
     "full-stage5": "qwen36_ffn_int4_stage5",
     "full-stage5-router": "qwen36_ffn_int4_stage5_with_router",
+}
+
+FUSED_GPU_OP_PREFIXES = {
+    "packed": ("command_buffer_gpu:qwen36_ffn_int4_expert_packed_stage5",),
+    "direct-gather": ("command_buffer_gpu:qwen36_ffn_int4_expert_direct_gather_stage5",),
+    "gpu-pack": ("command_buffer_gpu:qwen36_ffn_int4_expert_gpu_pack",),
+    "full-stage5": ("command_buffer_gpu:qwen36_ffn_int4_stage5",),
+    "full-stage5-router": ("command_buffer_gpu:qwen36_ffn_int4_stage5_with_router",),
 }
 
 
@@ -280,6 +290,19 @@ def profile_op_total(profile: dict[str, Any] | None, needle: str) -> float | Non
     return total if matched else None
 
 
+def profile_op_total_where(profile: dict[str, Any] | None, predicate: Any) -> float | None:
+    if not profile:
+        return None
+    total = 0.0
+    matched = False
+    for entry in profile.get("entries") or []:
+        if not predicate(entry):
+            continue
+        matched = True
+        total += float(entry.get("total_ms") or 0.0)
+    return total if matched else None
+
+
 def command_buffer_wait_ms(row: dict[str, Any]) -> float | None:
     return profile_op_total(row.get("metal_profile"), "command_buffer_wait")
 
@@ -289,6 +312,84 @@ def fused_op_ms(row: dict[str, Any]) -> float | None:
     if needle is None:
         return None
     return profile_op_total(row.get("metal_profile"), needle)
+
+
+def fused_wall_ms(row: dict[str, Any]) -> float | None:
+    needle = FUSED_OP_NEEDLES.get(str(row.get("mode") or ""))
+    if needle is None:
+        return None
+    needle = needle.lower()
+
+    def matches(entry: dict[str, Any]) -> bool:
+        op = str(entry.get("op") or "").lower()
+        path = str(entry.get("path") or "").lower()
+        return needle in op and not op.startswith("command_buffer_gpu:") and path in {
+            "",
+            "native",
+        }
+
+    return profile_op_total_where(row.get("metal_profile"), matches)
+
+
+def fused_gpu_ms(row: dict[str, Any]) -> float | None:
+    prefixes = tuple(
+        prefix.lower() for prefix in FUSED_GPU_OP_PREFIXES.get(str(row.get("mode") or ""), ())
+    )
+    if not prefixes:
+        return None
+
+    def matches(entry: dict[str, Any]) -> bool:
+        op = str(entry.get("op") or "").lower()
+        return any(op.startswith(prefix) for prefix in prefixes)
+
+    return profile_op_total_where(row.get("metal_profile"), matches)
+
+
+def safe_ratio(numerator: float | None, denominator: float | None) -> float | None:
+    if numerator is None or denominator is None or denominator == 0:
+        return None
+    return numerator / denominator
+
+
+def classify_ffn_attribution(row: dict[str, Any], max_wall_gpu_ratio: float, max_wait_gpu_ratio: float) -> str:
+    if row.get("mode") == "default":
+        return "host_or_default"
+    if row.get("status") != "ok":
+        return "unavailable"
+    if not row.get("metal_profile"):
+        return "missing_profile"
+    gpu_ms = row.get("fused_gpu_ms")
+    if gpu_ms is None or gpu_ms == 0:
+        return "missing_gpu_profile"
+    wait_gpu_ratio = row.get("wait_gpu_ratio")
+    wall_gpu_ratio = row.get("fused_wall_gpu_ratio")
+    if (
+        wait_gpu_ratio is not None
+        and wait_gpu_ratio > max_wait_gpu_ratio
+        or wall_gpu_ratio is not None
+        and wall_gpu_ratio > max_wall_gpu_ratio
+    ):
+        return "residency_or_submit_wait"
+    return "gpu_arithmetic"
+
+
+def annotate_ffn_profile_fields(
+    rows: list[dict[str, Any]],
+    max_wall_gpu_ratio: float = DEFAULT_MAX_FUSED_WALL_GPU_RATIO,
+    max_wait_gpu_ratio: float = DEFAULT_MAX_WAIT_GPU_RATIO,
+) -> None:
+    for row in rows:
+        row["command_buffer_wait_ms"] = command_buffer_wait_ms(row)
+        row["fused_op_ms"] = fused_op_ms(row)
+        row["fused_wall_ms"] = fused_wall_ms(row)
+        row["fused_gpu_ms"] = fused_gpu_ms(row)
+        row["fused_wall_gpu_ratio"] = safe_ratio(row["fused_wall_ms"], row["fused_gpu_ms"])
+        row["wait_gpu_ratio"] = safe_ratio(row["command_buffer_wait_ms"], row["fused_gpu_ms"])
+        row["ffn_attribution_class"] = classify_ffn_attribution(
+            row,
+            max_wall_gpu_ratio,
+            max_wait_gpu_ratio,
+        )
 
 
 def ratio(
@@ -542,6 +643,11 @@ def build_promotion_gate(
                 prompt_result["baseline_command_buffer_wait_ms"] = baseline_value
                 prompt_result["command_buffer_wait_ms_ratio"] = metric_ratio
             prompt_result["fused_op_ms"] = row.get("fused_op_ms")
+            prompt_result["fused_wall_ms"] = row.get("fused_wall_ms")
+            prompt_result["fused_gpu_ms"] = row.get("fused_gpu_ms")
+            prompt_result["fused_wall_gpu_ratio"] = row.get("fused_wall_gpu_ratio")
+            prompt_result["wait_gpu_ratio"] = row.get("wait_gpu_ratio")
+            prompt_result["ffn_attribution_class"] = row.get("ffn_attribution_class")
             prompt_result["passed"] = not prompt_failures
             prompt_result["failures"] = prompt_failures
             failures.extend(f"prompt_{prompt_id}:{failure}" for failure in prompt_failures)
@@ -571,6 +677,96 @@ def build_promotion_gate(
     }
 
 
+def build_ffn_residency_gap(
+    rows: list[dict[str, Any]],
+    modes: list[str],
+    max_wall_gpu_ratio: float = DEFAULT_MAX_FUSED_WALL_GPU_RATIO,
+    max_wait_gpu_ratio: float = DEFAULT_MAX_WAIT_GPU_RATIO,
+) -> dict[str, Any]:
+    prompt_ids: list[str] = []
+    for row in rows:
+        prompt_id = str(row.get("prompt_id", ""))
+        if prompt_id and prompt_id not in prompt_ids:
+            prompt_ids.append(prompt_id)
+    rows_by_key = {
+        (str(row.get("prompt_id", "")), row.get("mode")): row
+        for row in rows
+    }
+    candidates: list[dict[str, Any]] = []
+    for mode in [mode for mode in modes if mode != "default"]:
+        prompt_results: list[dict[str, Any]] = []
+        classes: set[str] = set()
+        for prompt_id in prompt_ids:
+            row = rows_by_key.get((prompt_id, mode))
+            baseline = rows_by_key.get((prompt_id, "default"))
+            generated_ids_match_default = (
+                None
+                if row is None or baseline is None
+                else (row.get("generated_ids") or []) == (baseline.get("generated_ids") or [])
+            )
+            row_class = str((row or {}).get("ffn_attribution_class") or "missing_candidate")
+            classes.add(row_class)
+            prompt_results.append(
+                {
+                    "prompt_id": prompt_id,
+                    "status": (row or {}).get("status"),
+                    "generated_ids_match_default": generated_ids_match_default,
+                    "fused_op_ms": (row or {}).get("fused_op_ms"),
+                    "fused_wall_ms": (row or {}).get("fused_wall_ms"),
+                    "fused_gpu_ms": (row or {}).get("fused_gpu_ms"),
+                    "fused_wall_gpu_ratio": (row or {}).get("fused_wall_gpu_ratio"),
+                    "command_buffer_wait_ms": (row or {}).get("command_buffer_wait_ms"),
+                    "wait_gpu_ratio": (row or {}).get("wait_gpu_ratio"),
+                    "ffn_attribution_class": row_class,
+                }
+            )
+        candidates.append(
+            {
+                "mode": mode,
+                "classes": sorted(classes),
+                "prompts": prompt_results,
+            }
+        )
+    all_classes = {
+        cls
+        for candidate in candidates
+        for cls in candidate.get("classes", [])
+    }
+    residency_modes = [
+        candidate["mode"]
+        for candidate in candidates
+        if "residency_or_submit_wait" in candidate.get("classes", [])
+    ]
+    gpu_arithmetic_modes = [
+        candidate["mode"]
+        for candidate in candidates
+        if "gpu_arithmetic" in candidate.get("classes", [])
+    ]
+    if residency_modes:
+        recommendation = "prototype_ffn_residency_or_submit_wait_path"
+        reason = "candidate GPU timestamps are much smaller than native wall or command-buffer wait totals"
+    elif gpu_arithmetic_modes:
+        recommendation = "prototype_ffn_gpu_arithmetic_tiling_path"
+        reason = "candidate native wall time tracks GPU command time closely enough to focus on arithmetic"
+    elif all_classes & {"missing_profile", "missing_gpu_profile"}:
+        recommendation = "refresh_fused_ffn_sweep_with_metal_profile"
+        reason = "candidate rows are missing enough GPU attribution to classify the FFN gap"
+    else:
+        recommendation = "inspect_fused_ffn_candidate_gap"
+        reason = "candidate rows did not produce a dominant residency or GPU-arithmetic class"
+    return {
+        "thresholds": {
+            "max_fused_wall_gpu_ratio": max_wall_gpu_ratio,
+            "max_wait_gpu_ratio": max_wait_gpu_ratio,
+        },
+        "recommendation": recommendation,
+        "reason": reason,
+        "residency_or_submit_wait_modes": residency_modes,
+        "gpu_arithmetic_modes": gpu_arithmetic_modes,
+        "candidates": candidates,
+    }
+
+
 def summarize_with_gate(
     rows: list[dict[str, Any]],
     modes: list[str],
@@ -579,6 +775,8 @@ def summarize_with_gate(
     max_component_regression_ratio: float = 1.10,
     max_command_buffer_wait_ratio: float = 1.05,
     require_profile: bool = True,
+    max_fused_wall_gpu_ratio: float = DEFAULT_MAX_FUSED_WALL_GPU_RATIO,
+    max_wait_gpu_ratio: float = DEFAULT_MAX_WAIT_GPU_RATIO,
 ) -> dict[str, Any]:
     summary = summarize(rows)
     summary["promotion_gate"] = build_promotion_gate(
@@ -590,6 +788,12 @@ def summarize_with_gate(
         max_command_buffer_wait_ratio,
         require_profile,
     )
+    summary["ffn_residency_gap"] = build_ffn_residency_gap(
+        rows,
+        modes,
+        max_fused_wall_gpu_ratio,
+        max_wait_gpu_ratio,
+    )
     return summary
 
 
@@ -599,6 +803,11 @@ def build_report(
     modes: list[str],
     prompt_set: str,
 ) -> dict[str, Any]:
+    annotate_ffn_profile_fields(
+        rows,
+        args.promotion_max_fused_wall_gpu_ratio,
+        args.promotion_max_wait_gpu_ratio,
+    )
     return {
         "schema": SCHEMA,
         "model": MODEL,
@@ -614,6 +823,8 @@ def build_report(
             "max_ffn_ratio": args.promotion_max_ffn_ratio,
             "max_component_regression_ratio": args.promotion_max_component_regression_ratio,
             "max_command_buffer_wait_ratio": args.promotion_max_command_buffer_wait_ratio,
+            "max_fused_wall_gpu_ratio": args.promotion_max_fused_wall_gpu_ratio,
+            "max_wait_gpu_ratio": args.promotion_max_wait_gpu_ratio,
             "require_profile": args.promotion_require_profile,
         },
         "summary": summarize_with_gate(
@@ -624,6 +835,8 @@ def build_report(
             args.promotion_max_component_regression_ratio,
             args.promotion_max_command_buffer_wait_ratio,
             args.promotion_require_profile,
+            args.promotion_max_fused_wall_gpu_ratio,
+            args.promotion_max_wait_gpu_ratio,
         ),
         "rows": rows,
     }
@@ -641,6 +854,7 @@ def render_float(value: Any, precision: int = 3) -> str:
 def render_markdown(report: dict[str, Any]) -> str:
     summary = report["summary"]
     promotion_gate = summary.get("promotion_gate") or {}
+    ffn_gap = summary.get("ffn_residency_gap") or {}
     lines = [
         "# Qwen3.6 Fused Routed INT4 Sweep",
         "",
@@ -652,9 +866,10 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- generated_ids_match: `{summary['generated_ids_match']}`",
         f"- promotion_gate_passed: `{promotion_gate.get('passed', False)}`",
         f"- promotion_gate_passed_modes: `{','.join(promotion_gate.get('passed_modes') or []) or '-'}`",
+        f"- ffn_gap_recommendation: `{ffn_gap.get('recommendation') or '-'}`",
         "",
-        "| Prompt | Mode | Status | IDs | Decode ms | FFN ms avg | Fused op ms | Top Metal op | Top Metal ms | HAL ms | Wall s |",
-        "|:---|:---|:---|:---|---:|---:|---:|:---|---:|---:|---:|",
+        "| Prompt | Mode | Status | IDs | Decode ms | FFN ms avg | Fused wall ms | Fused GPU ms | Wall/GPU | Wait/GPU | FFN class | Top Metal op | Top Metal ms | HAL ms | Wall s |",
+        "|:---|:---|:---|:---|---:|---:|---:|---:|---:|---:|:---|:---|---:|---:|---:|",
     ]
     for row in report["rows"]:
         result = row.get("result") or {}
@@ -662,14 +877,18 @@ def render_markdown(report: dict[str, Any]) -> str:
         top_metal = top_profile_op(row.get("metal_profile"))
         hal_summary = (row.get("hal_profile") or {}).get("summary") or {}
         lines.append(
-            "| {prompt} | {mode} | {status} | {ids} | {decode} | {ffn} | {fused} | {top_op} | {top_ms} | {hal_ms} | {wall} |".format(
+            "| {prompt} | {mode} | {status} | {ids} | {decode} | {ffn} | {fused_wall} | {fused_gpu} | {wall_gpu} | {wait_gpu} | {ffn_class} | {top_op} | {top_ms} | {hal_ms} | {wall} |".format(
                 prompt=row.get("prompt_id", ""),
                 mode=row.get("mode", ""),
                 status=row.get("status", ""),
                 ids=",".join(str(item) for item in row.get("generated_ids", [])),
                 decode=render_float(result.get("decode_ms")),
                 ffn=render_float(chain.get("ffn_ms_avg")),
-                fused=render_float(row.get("fused_op_ms")),
+                fused_wall=render_float(row.get("fused_wall_ms")),
+                fused_gpu=render_float(row.get("fused_gpu_ms")),
+                wall_gpu=render_float(row.get("fused_wall_gpu_ratio"), 2),
+                wait_gpu=render_float(row.get("wait_gpu_ratio"), 2),
+                ffn_class=row.get("ffn_attribution_class") or "-",
                 top_op=top_metal.get("op") or "-",
                 top_ms=render_float(top_metal.get("total_ms")),
                 hal_ms=render_float(hal_summary.get("total_ms")),
@@ -700,6 +919,36 @@ def render_markdown(report: dict[str, Any]) -> str:
         lines.append(
             "The gate is nonfatal. A fused routed INT4 mode passes only when generated IDs match default, headline ms/token and FFN time improve, full-attention/linear-attention/lm-head stay inside the configured regression threshold, and command-buffer-wait attribution is present and not regressed when profile evidence is required."
         )
+    gap_candidates = ffn_gap.get("candidates") or []
+    if gap_candidates:
+        lines.extend(
+            [
+                "",
+                "## FFN Residency Gap",
+                "",
+                f"- recommendation: `{ffn_gap.get('recommendation') or '-'}`",
+                f"- reason: {ffn_gap.get('reason') or '-'}",
+                "",
+                "| Mode | Prompt | Class | IDs Match | Fused wall ms | Fused GPU ms | Wall/GPU | Wait ms | Wait/GPU |",
+                "|:---|:---|:---|:---:|---:|---:|---:|---:|---:|",
+            ]
+        )
+        for candidate in gap_candidates:
+            for prompt in candidate.get("prompts") or []:
+                ids_match = prompt.get("generated_ids_match_default")
+                lines.append(
+                    "| {mode} | {prompt} | {cls} | {ids} | {wall} | {gpu} | {wall_gpu} | {wait} | {wait_gpu} |".format(
+                        mode=candidate.get("mode"),
+                        prompt=prompt.get("prompt_id"),
+                        cls=prompt.get("ffn_attribution_class") or "-",
+                        ids="-" if ids_match is None else str(bool(ids_match)).lower(),
+                        wall=render_float(prompt.get("fused_wall_ms")),
+                        gpu=render_float(prompt.get("fused_gpu_ms")),
+                        wall_gpu=render_float(prompt.get("fused_wall_gpu_ratio"), 2),
+                        wait=render_float(prompt.get("command_buffer_wait_ms")),
+                        wait_gpu=render_float(prompt.get("wait_gpu_ratio"), 2),
+                    )
+                )
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -743,6 +992,18 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         type=float,
         default=1.05,
         help="maximum candidate/default command_buffer_wait profile ratio",
+    )
+    parser.add_argument(
+        "--promotion-max-fused-wall-gpu-ratio",
+        type=float,
+        default=DEFAULT_MAX_FUSED_WALL_GPU_RATIO,
+        help="maximum native fused FFN wall/GPU profile ratio before classifying the candidate as residency or submit wait bound",
+    )
+    parser.add_argument(
+        "--promotion-max-wait-gpu-ratio",
+        type=float,
+        default=DEFAULT_MAX_WAIT_GPU_RATIO,
+        help="maximum command_buffer_wait/GPU profile ratio before classifying the candidate as residency or submit wait bound",
     )
     parser.add_argument(
         "--promotion-require-profile",

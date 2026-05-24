@@ -26,6 +26,7 @@ def row(
     lm_head: float = 5.0,
     wait: float | None = 10.0,
     fused: float | None = None,
+    fused_gpu: float | None = None,
     status: str = "ok",
 ) -> dict:
     profile = None
@@ -43,10 +44,22 @@ def row(
             entries.append(
                 {
                     "op": "qwen36_ffn_int4_expert_direct_gather_stage5",
+                    "path": "native",
                     "calls": 1,
                     "mean_ms": fused,
                     "total_ms": fused,
                     "max_ms": fused,
+                }
+            )
+        if fused_gpu is not None:
+            entries.append(
+                {
+                    "op": "command_buffer_gpu:qwen36_ffn_int4_expert_direct_gather_stage5",
+                    "path": "runtime",
+                    "calls": 1,
+                    "mean_ms": fused_gpu,
+                    "total_ms": fused_gpu,
+                    "max_ms": fused_gpu,
                 }
             )
         profile = {"summary": {"calls": len(entries)}, "entries": entries}
@@ -178,12 +191,21 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
             promotion_max_ffn_ratio=0.999,
             promotion_max_component_regression_ratio=1.10,
             promotion_max_command_buffer_wait_ratio=1.05,
+            promotion_max_fused_wall_gpu_ratio=4.0,
+            promotion_max_wait_gpu_ratio=4.0,
             promotion_require_profile=True,
         )
         report = script.build_report(
             [
                 row("default"),
-                row("direct-gather", headline=90.0, ffn=40.0, wait=9.0, fused=12.0),
+                row(
+                    "direct-gather",
+                    headline=90.0,
+                    ffn=40.0,
+                    wait=9.0,
+                    fused=12.0,
+                    fused_gpu=3.0,
+                ),
             ],
             args,
             ["default", "direct-gather"],
@@ -195,6 +217,42 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
         self.assertIn("Qwen3.6 Fused Routed INT4 Sweep", md)
         self.assertIn("promotion_gate_passed: `True`", md)
         self.assertIn("| direct-gather | true | - |", md)
+        self.assertEqual(
+            report["summary"]["ffn_residency_gap"]["recommendation"],
+            "prototype_ffn_gpu_arithmetic_tiling_path",
+        )
+        self.assertIn("## FFN Residency Gap", md)
+
+    def test_ffn_residency_gap_classifies_wait_bound_candidates(self):
+        script = sweep_qwen36_fused_routed_int4
+        rows = [
+            row("default"),
+            row(
+                "direct-gather",
+                headline=90.0,
+                ffn=40.0,
+                wait=30.0,
+                fused=80.0,
+                fused_gpu=4.0,
+            ),
+        ]
+        script.annotate_ffn_profile_fields(rows, max_wall_gpu_ratio=4.0, max_wait_gpu_ratio=4.0)
+
+        gap = script.build_ffn_residency_gap(
+            rows,
+            ["default", "direct-gather"],
+            max_wall_gpu_ratio=4.0,
+            max_wait_gpu_ratio=4.0,
+        )
+
+        direct_prompt = gap["candidates"][0]["prompts"][0]
+        self.assertEqual(direct_prompt["fused_wall_ms"], 80.0)
+        self.assertEqual(direct_prompt["fused_gpu_ms"], 4.0)
+        self.assertEqual(direct_prompt["ffn_attribution_class"], "residency_or_submit_wait")
+        self.assertEqual(
+            gap["recommendation"],
+            "prototype_ffn_residency_or_submit_wait_path",
+        )
 
 
 if __name__ == "__main__":

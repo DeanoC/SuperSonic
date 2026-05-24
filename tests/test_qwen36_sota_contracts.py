@@ -81,7 +81,7 @@ class Qwen36SotaContractTests(unittest.TestCase):
             "qwen36-metal-batched-prefill-variant-sweep-v2",
         )
         self.assertEqual(static_sweep.SCHEMA, "qwen36-static-topn-runtime-sweep-v4")
-        self.assertEqual(fused_sweep.SCHEMA, "qwen36-fused-routed-int4-sweep-v4")
+        self.assertEqual(fused_sweep.SCHEMA, "qwen36-fused-routed-int4-sweep-v5")
         self.assertEqual(mps_probe.SCHEMA, "qwen36-mps-resident-table-probe-v2")
         self.assertEqual(route_sweep.SCHEMA, "qwen36-route-residency-sweep-v1")
         self.assertEqual(mtp_sweep.SCHEMA, "qwen36-moe-mtp-acceptance-sweep-v2")
@@ -89,7 +89,7 @@ class Qwen36SotaContractTests(unittest.TestCase):
         self.assertEqual(linear_sweep.SCHEMA, "qwen36-linear-decode-sweep-v1")
         self.assertEqual(full_sweep.SCHEMA, "qwen36-full-decode-sweep-v1")
         self.assertEqual(lm_head_tail_sweep.SCHEMA, "qwen36-lm-head-tail-sweep-v1")
-        self.assertEqual(next_bottleneck.SCHEMA, "qwen36-next-bottleneck-v6")
+        self.assertEqual(next_bottleneck.SCHEMA, "qwen36-next-bottleneck-v7")
         self.assertEqual(sota_summary.SCHEMA, "qwen36-sota-gate-summary-v10")
         self.assertEqual(sota_refresh.SCHEMA, "qwen36-sota-gate-refresh-plan-v1")
 

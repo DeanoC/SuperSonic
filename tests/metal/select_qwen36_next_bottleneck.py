@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA = "qwen36-next-bottleneck-v6"
+SCHEMA = "qwen36-next-bottleneck-v7"
 MODEL = "qwen3.6-35b-a3b"
 BACKEND = "metal"
 FALLBACK_ACTION = "keep_default_lane_and_select_next_measured_bottleneck"
@@ -355,6 +355,67 @@ def top_profile_entries(
     return entries[:limit]
 
 
+def summarize_ffn_candidate_gap(report: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not report:
+        return None
+    gap = (report.get("summary") or {}).get("ffn_residency_gap")
+    if not isinstance(gap, dict):
+        return None
+    candidates: list[dict[str, Any]] = []
+    for candidate in gap.get("candidates") or []:
+        if not isinstance(candidate, dict):
+            continue
+        prompts = [
+            prompt
+            for prompt in candidate.get("prompts") or []
+            if isinstance(prompt, dict)
+        ]
+        classes = sorted(
+            {
+                str(prompt.get("ffn_attribution_class"))
+                for prompt in prompts
+                if prompt.get("ffn_attribution_class")
+            }
+        )
+        candidate_summary = {
+            "mode": candidate.get("mode"),
+            "classes": classes or candidate.get("classes") or [],
+            "prompt_count": len(prompts),
+            "max_fused_wall_gpu_ratio": max(
+                [
+                    float(prompt["fused_wall_gpu_ratio"])
+                    for prompt in prompts
+                    if prompt.get("fused_wall_gpu_ratio") is not None
+                ]
+                or [0.0]
+            ),
+            "max_wait_gpu_ratio": max(
+                [
+                    float(prompt["wait_gpu_ratio"])
+                    for prompt in prompts
+                    if prompt.get("wait_gpu_ratio") is not None
+                ]
+                or [0.0]
+            ),
+            "generated_ids_match_default": all(
+                prompt.get("generated_ids_match_default") is True
+                for prompt in prompts
+                if prompt.get("generated_ids_match_default") is not None
+            )
+            if prompts
+            else None,
+        }
+        candidates.append(candidate_summary)
+    return {
+        "recommendation": gap.get("recommendation"),
+        "reason": gap.get("reason"),
+        "thresholds": gap.get("thresholds") or {},
+        "residency_or_submit_wait_modes": gap.get("residency_or_submit_wait_modes") or [],
+        "gpu_arithmetic_modes": gap.get("gpu_arithmetic_modes") or [],
+        "candidates": candidates,
+    }
+
+
 def summarize_prefill(report: dict[str, Any] | None) -> dict[str, Any] | None:
     if not report:
         return None
@@ -422,6 +483,7 @@ def choose_recommendation(
     sota_report: dict[str, Any] | None,
     bucket_rows: list[dict[str, Any]],
     errors: list[str],
+    ffn_candidate_gap: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if errors:
         return {
@@ -450,7 +512,7 @@ def choose_recommendation(
     actionable = [row for row in bucket_rows if not row["exhausted"]]
     target = actionable[0] if actionable else dominant
     if not actionable:
-        return {
+        recommendation = {
             "status": "selected",
             "action": BUCKET_ACTIONS.get(target["bucket"], "inspect_measured_bucket"),
             "target_bucket": target["bucket"],
@@ -461,6 +523,12 @@ def choose_recommendation(
                 "orchestration change"
             ),
         }
+        if target["bucket"] == "ffn_ms_avg" and ffn_candidate_gap:
+            sub_action = ffn_candidate_gap.get("recommendation")
+            if sub_action:
+                recommendation["sub_action"] = sub_action
+                recommendation["sub_reason"] = ffn_candidate_gap.get("reason")
+        return recommendation
     if dominant["bucket"] == "ffn_ms_avg" and ffn_exhausted and actionable:
         return {
             "status": "selected",
@@ -574,7 +642,13 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         if lm_head_gate_family_exhausted(sota_summary):
             exhausted_buckets.add("lm_head_ms_avg")
     bucket_rows = summarize_buckets(samples, exhausted_buckets)
-    recommendation = choose_recommendation(sota_report, bucket_rows, errors)
+    ffn_candidate_gap = summarize_ffn_candidate_gap(loaded.get("fused_routed_int4"))
+    recommendation = choose_recommendation(
+        sota_report,
+        bucket_rows,
+        errors,
+        ffn_candidate_gap,
+    )
     return {
         "schema": SCHEMA,
         "model": MODEL,
@@ -594,6 +668,7 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
             current_fingerprint,
         ),
         "prefill": summarize_prefill(loaded.get("batched_prefill_variants")),
+        "ffn_candidate_gap": ffn_candidate_gap,
         "top_metal_profile_ops": top_profile_entries(runtime_reports, "metal_profile"),
         "top_hal_profile_ops": top_profile_entries(runtime_reports, "hal_profile"),
     }
@@ -622,6 +697,7 @@ def render_markdown(report: dict[str, Any]) -> str:
         "",
         f"- status: `{rec['status']}`",
         f"- action: `{rec['action']}`",
+        f"- sub_action: `{rec.get('sub_action') or '-'}`",
         f"- target_bucket: `{rec.get('target_bucket') or '-'}`",
         f"- dominant_bucket: `{rec.get('dominant_bucket') or '-'}`",
         f"- sota_next_action: `{report.get('sota_next_action') or '-'}`",
@@ -656,6 +732,31 @@ def render_markdown(report: dict[str, Any]) -> str:
                 f"- promotion_gate_passed: `{str(bool(prefill.get('promotion_gate_passed'))).lower()}`",
             ]
         )
+    ffn_gap = report.get("ffn_candidate_gap") or {}
+    if ffn_gap:
+        lines.extend(
+            [
+                "",
+                "## FFN Candidate Gap",
+                "",
+                f"- recommendation: `{ffn_gap.get('recommendation') or '-'}`",
+                f"- reason: {ffn_gap.get('reason') or '-'}",
+                "",
+                "| Mode | Classes | Max Wall/GPU | Max Wait/GPU | IDs Match |",
+                "|:---|:---|---:|---:|:---:|",
+            ]
+        )
+        for candidate in ffn_gap.get("candidates") or []:
+            ids_match = candidate.get("generated_ids_match_default")
+            lines.append(
+                "| {mode} | {classes} | {wall_gpu} | {wait_gpu} | {ids} |".format(
+                    mode=candidate.get("mode") or "-",
+                    classes=fmt_list(candidate.get("classes")),
+                    wall_gpu=fmt_float(candidate.get("max_fused_wall_gpu_ratio")),
+                    wait_gpu=fmt_float(candidate.get("max_wait_gpu_ratio")),
+                    ids="-" if ids_match is None else str(bool(ids_match)).lower(),
+                )
+            )
     bench = report.get("bench_perf") or {}
     if bench:
         lines.extend(

@@ -48,6 +48,41 @@ def runtime_report(default_row: dict) -> dict:
     }
 
 
+def fused_report(default_row: dict) -> dict:
+    report = runtime_report(default_row)
+    report["summary"] = {
+        "ffn_residency_gap": {
+            "recommendation": "prototype_ffn_residency_or_submit_wait_path",
+            "reason": "candidate GPU timestamps are much smaller than native wall or command-buffer wait totals",
+            "thresholds": {
+                "max_fused_wall_gpu_ratio": 4.0,
+                "max_wait_gpu_ratio": 4.0,
+            },
+            "residency_or_submit_wait_modes": ["full-stage5"],
+            "gpu_arithmetic_modes": [],
+            "candidates": [
+                {
+                    "mode": "full-stage5",
+                    "classes": ["residency_or_submit_wait"],
+                    "prompts": [
+                        {
+                            "prompt_id": "hello",
+                            "generated_ids_match_default": True,
+                            "fused_wall_ms": 800.0,
+                            "fused_gpu_ms": 80.0,
+                            "fused_wall_gpu_ratio": 10.0,
+                            "command_buffer_wait_ms": 1000.0,
+                            "wait_gpu_ratio": 12.5,
+                            "ffn_attribution_class": "residency_or_submit_wait",
+                        }
+                    ],
+                }
+            ],
+        }
+    }
+    return report
+
+
 def default_row(
     report_name: str,
     ffn: float,
@@ -171,7 +206,7 @@ class Qwen36NextBottleneckTests(unittest.TestCase):
         )
         write_json(
             paths["fused_json"],
-            runtime_report(default_row("fused", 90.0, 65.0, 18.0, 6.0)),
+            fused_report(default_row("fused", 90.0, 65.0, 18.0, 6.0)),
         )
         write_json(
             paths["lru_json"],
@@ -292,8 +327,13 @@ class Qwen36NextBottleneckTests(unittest.TestCase):
         self.assertEqual(rec["dominant_bucket"], "ffn_ms_avg")
         self.assertEqual(rec["target_bucket"], "ffn_ms_avg")
         self.assertEqual(rec["action"], "prototype_new_ffn_residency_or_compute_path")
+        self.assertEqual(rec["sub_action"], "prototype_ffn_residency_or_submit_wait_path")
         buckets = {row["bucket"]: row for row in report["decode_bucket_ranking"]}
         self.assertTrue(buckets["lm_head_ms_avg"]["exhausted"])
+        self.assertEqual(
+            report["ffn_candidate_gap"]["recommendation"],
+            "prototype_ffn_residency_or_submit_wait_path",
+        )
 
     def test_auto_discovers_matching_bench_perf_fingerprint_before_newer_stale_run(self):
         with tempfile.TemporaryDirectory() as tmp:

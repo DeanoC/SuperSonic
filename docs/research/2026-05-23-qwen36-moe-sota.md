@@ -850,6 +850,30 @@ under the same smoke:
    enabled while still keeping per-phase GPU timestamps available for
    root-cause runs.
 
+24. **Qwen3.6 FFN residency/submit-wait gap selector**
+   The fused-routed INT4 sweep is now schema v5 and records separate native
+   FFN wall time, command-buffer GPU time, wall/GPU ratio, wait/GPU ratio, and
+   a stable `ffn_attribution_class` per candidate. The refreshed smoke sweep
+   keeps the promotion gate negative, but removes the ambiguity in the next
+   FFN target: every native candidate is classified as
+   `residency_or_submit_wait`. The default row generated `[11, 271, 40, 599]`
+   with `ffn_ms_avg=124.806`. The only candidate that preserved generated IDs
+   was `gpu-pack`, but it regressed to `ffn_ms_avg=569.327` with
+   `fused_wall_ms=2104.865`, `fused_gpu_ms=87.973`,
+   `wall/GPU=23.93`, and `wait/GPU=28.10`. The other candidates also landed
+   in the same gap class: `direct-gather` at `23.20` / `28.92`,
+   `full-stage5` at `25.93` / `30.88`, and `full-stage5-router` at
+   `18.44` / `21.28` for wall/GPU and wait/GPU respectively.
+   The next-bottleneck selector is now schema v7 and keeps the broad action as
+   `prototype_new_ffn_residency_or_compute_path`, but adds the measured
+   `sub_action=prototype_ffn_residency_or_submit_wait_path`. The latest
+   default-lane ranking remains FFN first (`118.882 ms` median), followed by
+   linear attention (`69.149 ms`), full attention (`19.903 ms`), and lm-head
+   (`8.453 ms`). So the next FFN implementation should not start as another
+   arithmetic-only kernel fork; it should reduce waited command-buffer/native
+   wall overhead for the resident stage-5 path, with correctness fixed before
+   any promotion attempt.
+
 ## Sources
 
 - [Qwen/Qwen3.6-35B-A3B model card](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)
