@@ -125,7 +125,7 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
 
         self.assertEqual(
             script.parse_modes(
-                "baseline,direct,direct-defer,defer-direct-wait,gpu-pack,gpack,stage5,native-stage5,router,router-simd,router-batch,batch-router,router-simd-batch,batch-router-simd,router-simd-batch-shared-tiled,batch-router-simd-shared-tiled,router-simd-batch-shared-gate-up-tiled,router-simd-batch-shared-scalar-simd,router-simd-batch-shared-down-tiled,router-simd-batch-shared-host-corrected,router-simd-batch-shared-routed-host-corrected,router-batch-deferred-phases,batch-router-deferred-phases,router-simd-batch-deferred-phases,batch-router-simd-deferred-phases,router-simd-batch-shared-tiled-deferred-phases,batch-router-simd-shared-tiled-deferred-phases,router-batch-phases,batch-router-phases,router-batch-ffn-phases,batch-router-ffn-phases,router-simd-batch-phases,router-simd-batch-ffn-phases,router-simd-batch-shared-tiled-ffn-phases,batch-router-simd-shared-tiled-ffn-phases,router-defer"
+                "baseline,direct,direct-defer,defer-direct-wait,gpu-pack,gpack,stage5,native-stage5,router,router-simd,router-batch,batch-router,router-simd-batch,batch-router-simd,router-simd-batch-shared-tiled,batch-router-simd-shared-tiled,router-simd-batch-shared-gate-up-tiled,router-simd-batch-shared-scalar-simd,router-simd-batch-shared-down-tiled,router-simd-batch-routed-gate-up-host-order,router-simd-batch-shared-host-corrected-routed-gate-up-host-order,router-simd-batch-shared-host-corrected,router-simd-batch-shared-routed-host-corrected,router-batch-deferred-phases,batch-router-deferred-phases,router-simd-batch-deferred-phases,batch-router-simd-deferred-phases,router-simd-batch-shared-tiled-deferred-phases,batch-router-simd-shared-tiled-deferred-phases,router-batch-phases,batch-router-phases,router-batch-ffn-phases,batch-router-ffn-phases,router-simd-batch-phases,router-simd-batch-ffn-phases,router-simd-batch-shared-tiled-ffn-phases,batch-router-simd-shared-tiled-ffn-phases,router-defer"
             ),
             [
                 "default",
@@ -141,6 +141,8 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
                 "full-stage5-router-simd-batch-shared-gate-up-tiled",
                 "full-stage5-router-simd-batch-shared-scalar-simd",
                 "full-stage5-router-simd-batch-shared-down-tiled",
+                "full-stage5-router-simd-batch-routed-gate-up-host-order",
+                "full-stage5-router-simd-batch-shared-host-corrected-routed-gate-up-host-order",
                 "full-stage5-router-simd-batch-shared-host-corrected",
                 "full-stage5-router-simd-batch-shared-routed-host-corrected",
                 "full-stage5-router-batch-deferred-phases",
@@ -185,6 +187,16 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
         full_stage5_router_simd_batch_shared_down_tiled = script.build_env_overrides(
             args,
             "full-stage5-router-simd-batch-shared-down-tiled",
+        )
+        full_stage5_router_simd_batch_routed_gate_up_host_order = script.build_env_overrides(
+            args,
+            "full-stage5-router-simd-batch-routed-gate-up-host-order",
+        )
+        full_stage5_router_simd_batch_shared_host_corrected_routed_gate_up_host_order = (
+            script.build_env_overrides(
+                args,
+                "full-stage5-router-simd-batch-shared-host-corrected-routed-gate-up-host-order",
+            )
         )
         full_stage5_router_simd_batch_shared_host_corrected = script.build_env_overrides(
             args,
@@ -326,6 +338,48 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
         self.assertEqual(
             full_stage5_router_simd_batch_shared_down_tiled[
                 "SUPERSONIC_METAL_ENABLE_QWEN36_FFN_SHARED_DOWN_TILED"
+            ],
+            "1",
+        )
+        self.assertEqual(
+            full_stage5_router_simd_batch_routed_gate_up_host_order[
+                "SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_STAGE5_SIMD"
+            ],
+            "1",
+        )
+        self.assertEqual(
+            full_stage5_router_simd_batch_routed_gate_up_host_order[
+                "SUPERSONIC_METAL_QWEN36_FFN_EXPERT_GATE_UP_HOST_ORDER_STAGE5"
+            ],
+            "1",
+        )
+        self.assertEqual(
+            full_stage5_router_simd_batch_routed_gate_up_host_order[
+                "SUPERSONIC_METAL_QWEN36_DECODE_BATCH"
+            ],
+            "1",
+        )
+        self.assertEqual(
+            full_stage5_router_simd_batch_shared_host_corrected_routed_gate_up_host_order[
+                "SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_STAGE5_SIMD"
+            ],
+            "1",
+        )
+        self.assertEqual(
+            full_stage5_router_simd_batch_shared_host_corrected_routed_gate_up_host_order[
+                "SUPERSONIC_METAL_QWEN36_FFN_STAGE5_SHARED_HOST_CORRECTION"
+            ],
+            "1",
+        )
+        self.assertEqual(
+            full_stage5_router_simd_batch_shared_host_corrected_routed_gate_up_host_order[
+                "SUPERSONIC_METAL_QWEN36_FFN_EXPERT_GATE_UP_HOST_ORDER_STAGE5"
+            ],
+            "1",
+        )
+        self.assertEqual(
+            full_stage5_router_simd_batch_shared_host_corrected_routed_gate_up_host_order[
+                "SUPERSONIC_METAL_QWEN36_DECODE_BATCH"
             ],
             "1",
         )

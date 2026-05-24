@@ -1996,6 +1996,55 @@ under the same smoke:
    non-diagnostic row reaches layer-output parity or a much narrower,
    locally-proven tolerance.
 
+55. **Qwen3.6 routed gate/up host-order Metal rejection**
+   The fused-routed sweep is now schema `v33`. It adds an env-gated routed
+   expert gate/up Metal probe,
+   `SUPERSONIC_METAL_QWEN36_FFN_EXPERT_GATE_UP_HOST_ORDER_STAGE5=1`, and two
+   sweep modes:
+   `full-stage5-router-simd-batch-routed-gate-up-host-order` and the diagnostic
+   `full-stage5-router-simd-batch-shared-host-corrected-routed-gate-up-host-order`.
+   The new Metal kernel uses one active thread per `(top_k, row)` item and
+   mirrors the Rust reference's packed-pair INT4 expression before writing
+   `expert_mid`. It keeps the normal tiled path as the default and labels phase
+   profiling as `qwen36_ffn_int4_expert_gate_up_host_order_stage5`.
+
+   A release rebuild was required before measuring this Objective-C++ change:
+   `cargo build --release -p runner --bin supersonic`. A one-mode phase smoke
+   wrote `/private/tmp/qwen36_routed_gate_up_host_order_v33_phase_1tok.{json,md}`
+   and confirmed the new profile label was live:
+   `command_buffer_gpu:qwen36_ffn_int4_expert_gate_up_host_order_stage5` had
+   `40` calls and `71.125 ms` total GPU time. Generated IDs still matched
+   (`[11]`).
+
+   The rebuilt five-mode smoke wrote
+   `/private/tmp/qwen36_routed_gate_up_host_order_v33_1tok.{json,md}` with
+   `--modes default,full-stage5-router-simd-batch,full-stage5-router-simd-batch-routed-gate-up-host-order,full-stage5-router-simd-batch-shared-host-corrected-routed-gate-up-host-order,full-stage5-router-simd-batch-shared-routed-host-corrected
+   --max-new-tokens 1 --context-size 64 --metal-profile --layer-output-tap
+   --layer-output-delta-tap --layer-output-delta-all --no-promotion-require-profile`.
+   All rows ran and generated IDs matched (`[11]`), but no row was promotable.
+   The normal SIMD batch row still had `65` layer-output mismatches, first at
+   layer `7` FFN with `max_abs_delta=0.00048828125`, `max_ulp_delta=1`, and one
+   differing BF16 element. The routed gate/up host-order row regressed the
+   layer-output policy summary to `67` mismatches, first at layer `6` FFN with
+   `max_abs_delta=0.000244140625`, `max_ulp_delta=1`, and one differing BF16
+   element; tolerating the whole downstream stream would require
+   `max_abs_delta=0.71875`, `max_ulp_delta=31348`, and `2028` differing
+   elements. Adding shared host correction did not rescue the host-order routed
+   gate/up path: the shared-corrected host-order diagnostic also had `67`
+   mismatches. The full shared+routed host-corrected diagnostic remained at zero
+   layer-output mismatches.
+
+   That rejects single-thread Metal host-order routed gate/up as a correctness
+   fix. The remaining problem is narrower than routed down/combine and top-k,
+   but it is not solved by replacing the tiled reduction with a scalar Metal dot
+   in the current kernel. The next correctness probe should add a non-patching
+   routed gate/up tap, or split the existing routed host-correction tap, so the
+   host-order Metal gate/up/SwiGLU values can be compared directly against the
+   host reference at the new layer `6` cliff and the older layer `33` cliff.
+   Until that probe names whether the source is Metal `h_norm`, dot expression
+   evaluation, SiLU/exp, or product materialization, the tiled FFN optimization
+   path should stay behind the layer-output parity gate.
+
 ## Sources
 
 - [Qwen/Qwen3.6-35B-A3B model card](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)

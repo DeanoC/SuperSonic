@@ -49,6 +49,11 @@ inline bool qwen36_ffn_routed_host_correction_probe_enabled() {
            std::getenv("SUPERSONIC_METAL_FORCE_HOST_NATIVE") == nullptr;
 }
 
+inline bool qwen36_ffn_expert_gate_up_host_order_enabled() {
+    return std::getenv("SUPERSONIC_METAL_QWEN36_FFN_EXPERT_GATE_UP_HOST_ORDER_STAGE5") != nullptr &&
+           std::getenv("SUPERSONIC_METAL_FORCE_HOST_NATIVE") == nullptr;
+}
+
 inline void record_command_buffer_gpu_profile(id<MTLCommandBuffer> command_buffer, const std::string& label) {
     if (command_buffer == nil) {
         return;
@@ -2703,6 +2708,7 @@ struct Qwen36FfnInt4Pipelines {
     __strong id<MTLComputePipelineState> shared_down_tiled = nil;
     __strong id<MTLComputePipelineState> expert_gate_up = nil;
     __strong id<MTLComputePipelineState> expert_gate_up_tiled = nil;
+    __strong id<MTLComputePipelineState> expert_gate_up_host_order = nil;
     __strong id<MTLComputePipelineState> expert_down_finalize = nil;
     __strong id<MTLComputePipelineState> expert_down_finalize_tiled = nil;
     __strong id<MTLComputePipelineState> batched_expert_gate_up_tiled = nil;
@@ -2883,6 +2889,49 @@ inline float int4_weight_expert(
     float s = float(scale[scale_idx]);
     float z = float(zero[scale_idx]);
     return bf16_round_rne_finite(float(nibble) * s - z * s);
+}
+
+inline float int4_dot_expert_host_order(
+    device const uchar* packed,
+    device const bfloat* scale,
+    device const bfloat* zero,
+    uint expert,
+    uint row,
+    uint rows,
+    uint cols,
+    uint group_size,
+    device const float* x
+) {
+    float acc = 0.0f;
+    uint byte_cols = (cols + 1u) / 2u;
+    uint scale_rows = (rows + group_size - 1u) / group_size;
+    uint scale_cols = (cols + group_size - 1u) / group_size;
+    uint packed_base = (expert * rows + row) * byte_cols;
+    uint scale_base = (expert * scale_rows + row / group_size) * scale_cols;
+    for (uint scale_col = 0u; scale_col < scale_cols; ++scale_col) {
+        uint group_start = scale_col * group_size;
+        uint group_end = min(cols, group_start + group_size);
+        uint scale_idx = scale_base + scale_col;
+        float s = float(scale[scale_idx]);
+        float z = float(zero[scale_idx]);
+        float zs = z * s;
+        uint col = group_start;
+        uint byte_idx = packed_base + group_start / 2u;
+        while (col + 1u < group_end) {
+            uint packed_byte = uint(packed[byte_idx]);
+            float w0 = bf16_round_rne_finite(float(packed_byte & 0xFu) * s - zs);
+            float w1 = bf16_round_rne_finite(float((packed_byte >> 4u) & 0xFu) * s - zs);
+            acc += w0 * x[col] + w1 * x[col + 1u];
+            col += 2u;
+            byte_idx += 1u;
+        }
+        if (col < group_end) {
+            uint packed_byte = uint(packed[byte_idx]);
+            float w = bf16_round_rne_finite(float(packed_byte & 0xFu) * s - zs);
+            acc += w * x[col];
+        }
+    }
+    return acc;
 }
 
 kernel void supersonic_qwen36_router_softmax_topk_bf16(
@@ -3455,6 +3504,41 @@ kernel void supersonic_qwen36_ffn_expert_gate_up_tiled(
     }
 }
 
+kernel void supersonic_qwen36_ffn_expert_gate_up_host_order(
+    device float* workspace [[buffer(0)]],
+    device const uchar* gate_up_proj [[buffer(1)]],
+    device const bfloat* gate_up_scale [[buffer(2)]],
+    device const bfloat* gate_up_zero [[buffer(3)]],
+    constant Qwen36FfnExpertGateUpTiledParams& params [[buffer(4)]],
+    uint3 tg [[threadgroup_position_in_grid]],
+    uint thread_id [[thread_index_in_threadgroup]]
+) {
+    uint row = tg.x;
+    uint group = tg.y;
+    if (thread_id != 0u || row >= params.moe_intermediate || group >= params.top_k) {
+        return;
+    }
+    uint expert = as_type<uint>(workspace[params.off_topk_idx + group]);
+    uint rows = 2u * params.moe_intermediate;
+    device const float* h_norm = workspace + params.off_h_norm;
+    float gate = int4_dot_expert_host_order(
+        gate_up_proj, gate_up_scale, gate_up_zero,
+        expert, row, rows, params.hidden, params.group_size, h_norm
+    );
+    float up = int4_dot_expert_host_order(
+        gate_up_proj, gate_up_scale, gate_up_zero,
+        expert, params.moe_intermediate + row, rows,
+        params.hidden, params.group_size, h_norm
+    );
+    if (params.off_expert_gu != QWEN36_FFN_NO_EXPERT_GU_TAP) {
+        uint gu_base = params.off_expert_gu + group * (2u * params.moe_intermediate);
+        workspace[gu_base + row] = gate;
+        workspace[gu_base + params.moe_intermediate + row] = up;
+    }
+    workspace[params.off_expert_mid + group * params.moe_intermediate + row] =
+        silu(gate) * up;
+}
+
 kernel void supersonic_qwen36_ffn_expert_down_finalize(
     device float* workspace [[buffer(0)]],
     device const bfloat* input_hidden [[buffer(1)]],
@@ -3900,6 +3984,7 @@ kernel void supersonic_qwen36_ffn_mps_transcode_down_lut(
                         @"supersonic_qwen36_ffn_shared_down_tiled",
                         @"supersonic_qwen36_ffn_expert_gate_up",
                         @"supersonic_qwen36_ffn_expert_gate_up_tiled",
+                        @"supersonic_qwen36_ffn_expert_gate_up_host_order",
                         @"supersonic_qwen36_ffn_expert_down_finalize",
                         @"supersonic_qwen36_ffn_expert_down_finalize_tiled",
                         @"supersonic_qwen36_batched_ffn_expert_gate_up_tiled",
@@ -3963,6 +4048,8 @@ kernel void supersonic_qwen36_ffn_mps_transcode_down_lut(
                             pipelines.expert_gate_up = pipeline;
                         } else if ([name isEqualToString:@"supersonic_qwen36_ffn_expert_gate_up_tiled"]) {
                             pipelines.expert_gate_up_tiled = pipeline;
+                        } else if ([name isEqualToString:@"supersonic_qwen36_ffn_expert_gate_up_host_order"]) {
+                            pipelines.expert_gate_up_host_order = pipeline;
                         } else if ([name isEqualToString:@"supersonic_qwen36_ffn_expert_down_finalize"]) {
                             pipelines.expert_down_finalize = pipeline;
                         } else if ([name isEqualToString:@"supersonic_qwen36_ffn_expert_down_finalize_tiled"]) {
@@ -4000,7 +4087,8 @@ kernel void supersonic_qwen36_ffn_mps_transcode_down_lut(
         pipelines.shared_gate_up != nil && pipelines.shared_gate_up_tiled != nil &&
         pipelines.shared_scalar != nil && pipelines.shared_scalar_simd != nil &&
         pipelines.shared_down != nil && pipelines.shared_down_tiled != nil &&
-        pipelines.expert_gate_up != nil &&
+        pipelines.expert_gate_up != nil && pipelines.expert_gate_up_tiled != nil &&
+        pipelines.expert_gate_up_host_order != nil &&
         pipelines.expert_down_finalize != nil && pipelines.expert_down_finalize_tiled != nil &&
         pipelines.batched_expert_gate_up_tiled != nil &&
         pipelines.batched_expert_down_combine_tiled != nil &&
@@ -13161,12 +13249,14 @@ extern "C" int supersonic_metal_qwen36_ffn_int4_stage5(
         bool shared_gate_up_tiled = qwen36_ffn_shared_gate_up_tiled_enabled();
         bool shared_scalar_simd = qwen36_ffn_shared_scalar_simd_enabled();
         bool shared_down_tiled = qwen36_ffn_shared_down_tiled_enabled();
+        bool expert_gate_up_host_order = qwen36_ffn_expert_gate_up_host_order_enabled();
         if (pipelines.shared_gate_up == nil || pipelines.shared_scalar == nil ||
             pipelines.shared_down == nil || pipelines.expert_gate_up_tiled == nil ||
             pipelines.expert_down_finalize == nil ||
             (shared_gate_up_tiled && pipelines.shared_gate_up_tiled == nil) ||
             (shared_scalar_simd && pipelines.shared_scalar_simd == nil) ||
-            (shared_down_tiled && pipelines.shared_down_tiled == nil)) {
+            (shared_down_tiled && pipelines.shared_down_tiled == nil) ||
+            (expert_gate_up_host_order && pipelines.expert_gate_up_host_order == nil)) {
             return 963;
         }
 
@@ -13319,15 +13409,17 @@ extern "C" int supersonic_metal_qwen36_ffn_int4_stage5(
                     threadsPerThreadgroup:MTLSizeMake(shared_down_tiled ? 256 : 32, 1, 1)];
         };
         auto encode_expert_gate_up = [&](id<MTLComputeCommandEncoder> encoder) {
-            [encoder setComputePipelineState:pipelines.expert_gate_up_tiled];
+            [encoder setComputePipelineState:expert_gate_up_host_order ? pipelines.expert_gate_up_host_order : pipelines.expert_gate_up_tiled];
             [encoder setBuffer:workspace offset:workspace_offset atIndex:0];
             [encoder setBuffer:gate_up_proj offset:gate_up_proj_offset atIndex:1];
             [encoder setBuffer:gate_up_scale offset:gate_up_scale_offset atIndex:2];
             [encoder setBuffer:gate_up_zero offset:gate_up_zero_offset atIndex:3];
             [encoder setBytes:&expert_gate_params length:sizeof(expert_gate_params) atIndex:4];
-            [encoder setThreadgroupMemoryLength:16 * sizeof(float) atIndex:0];
+            if (!expert_gate_up_host_order) {
+                [encoder setThreadgroupMemoryLength:16 * sizeof(float) atIndex:0];
+            }
             [encoder dispatchThreadgroups:MTLSizeMake(moe_intermediate, top_k, 1)
-                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                    threadsPerThreadgroup:MTLSizeMake(expert_gate_up_host_order ? 32 : 256, 1, 1)];
         };
         auto encode_expert_down_finalize = [&](id<MTLComputeCommandEncoder> encoder) {
             [encoder setComputePipelineState:pipelines.expert_down_finalize];
@@ -13363,7 +13455,10 @@ extern "C" int supersonic_metal_qwen36_ffn_int4_stage5(
             if ((status = submit_profile_phase(encode_shared_gate_up, "qwen36_ffn_int4_shared_gate_up", 983, 984, 985, 986)) != 0) return status;
             if ((status = submit_profile_phase(encode_shared_scalar, "qwen36_ffn_int4_shared_gate_scalar", 987, 988, 989, 990)) != 0) return status;
             if ((status = submit_profile_phase(encode_shared_down, "qwen36_ffn_int4_shared_down", 991, 992, 993, 994)) != 0) return status;
-            if ((status = submit_profile_phase(encode_expert_gate_up, "qwen36_ffn_int4_expert_gate_up_tiled_stage5", 995, 996, 997, 998)) != 0) return status;
+            const std::string expert_gate_label = expert_gate_up_host_order
+                ? "qwen36_ffn_int4_expert_gate_up_host_order_stage5"
+                : "qwen36_ffn_int4_expert_gate_up_tiled_stage5";
+            if ((status = submit_profile_phase(encode_expert_gate_up, expert_gate_label, 995, 996, 997, 998)) != 0) return status;
             return submit_profile_phase(
                 encode_expert_down_finalize,
                 "qwen36_ffn_int4_expert_down_finalize",
@@ -13472,6 +13567,7 @@ extern "C" int supersonic_metal_qwen36_ffn_int4_stage5_with_router(
         bool shared_gate_up_tiled = qwen36_ffn_shared_gate_up_tiled_enabled();
         bool shared_scalar_simd = qwen36_ffn_shared_scalar_simd_enabled();
         bool shared_down_tiled = qwen36_ffn_shared_down_tiled_enabled();
+        bool expert_gate_up_host_order = qwen36_ffn_expert_gate_up_host_order_enabled();
         if ((!router_simd && pipelines.router_stage5 == nil) ||
             (router_simd && (pipelines.router_norm_stage5 == nil ||
                              pipelines.router_logits_simd_stage5 == nil ||
@@ -13482,7 +13578,8 @@ extern "C" int supersonic_metal_qwen36_ffn_int4_stage5_with_router(
             pipelines.expert_down_finalize == nil ||
             (shared_gate_up_tiled && pipelines.shared_gate_up_tiled == nil) ||
             (shared_scalar_simd && pipelines.shared_scalar_simd == nil) ||
-            (shared_down_tiled && pipelines.shared_down_tiled == nil)) {
+            (shared_down_tiled && pipelines.shared_down_tiled == nil) ||
+            (expert_gate_up_host_order && pipelines.expert_gate_up_host_order == nil)) {
             return 1393;
         }
 
@@ -13685,15 +13782,17 @@ extern "C" int supersonic_metal_qwen36_ffn_int4_stage5_with_router(
                     threadsPerThreadgroup:MTLSizeMake(shared_down_tiled ? 256 : 32, 1, 1)];
         };
         auto encode_expert_gate_up = [&](id<MTLComputeCommandEncoder> encoder) {
-            [encoder setComputePipelineState:pipelines.expert_gate_up_tiled];
+            [encoder setComputePipelineState:expert_gate_up_host_order ? pipelines.expert_gate_up_host_order : pipelines.expert_gate_up_tiled];
             [encoder setBuffer:workspace offset:workspace_offset atIndex:0];
             [encoder setBuffer:gate_up_proj offset:gate_up_proj_offset atIndex:1];
             [encoder setBuffer:gate_up_scale offset:gate_up_scale_offset atIndex:2];
             [encoder setBuffer:gate_up_zero offset:gate_up_zero_offset atIndex:3];
             [encoder setBytes:&expert_gate_params length:sizeof(expert_gate_params) atIndex:4];
-            [encoder setThreadgroupMemoryLength:16 * sizeof(float) atIndex:0];
+            if (!expert_gate_up_host_order) {
+                [encoder setThreadgroupMemoryLength:16 * sizeof(float) atIndex:0];
+            }
             [encoder dispatchThreadgroups:MTLSizeMake(moe_intermediate, top_k, 1)
-                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                    threadsPerThreadgroup:MTLSizeMake(expert_gate_up_host_order ? 32 : 256, 1, 1)];
         };
         auto encode_expert_down_finalize = [&](id<MTLComputeCommandEncoder> encoder) {
             [encoder setComputePipelineState:pipelines.expert_down_finalize];
@@ -13733,7 +13832,10 @@ extern "C" int supersonic_metal_qwen36_ffn_int4_stage5_with_router(
             if ((status = submit_profile_phase(encode_shared_gate_up, "qwen36_ffn_int4_shared_gate_up", 1420, 1421, 1422, 1423)) != 0) return status;
             if ((status = submit_profile_phase(encode_shared_scalar, "qwen36_ffn_int4_shared_gate_scalar", 1424, 1425, 1426, 1427)) != 0) return status;
             if ((status = submit_profile_phase(encode_shared_down, "qwen36_ffn_int4_shared_down", 1428, 1429, 1430, 1431)) != 0) return status;
-            if ((status = submit_profile_phase(encode_expert_gate_up, "qwen36_ffn_int4_expert_gate_up_tiled_stage5", 1432, 1433, 1434, 1435)) != 0) return status;
+            const std::string expert_gate_label = expert_gate_up_host_order
+                ? "qwen36_ffn_int4_expert_gate_up_host_order_stage5"
+                : "qwen36_ffn_int4_expert_gate_up_tiled_stage5";
+            if ((status = submit_profile_phase(encode_expert_gate_up, expert_gate_label, 1432, 1433, 1434, 1435)) != 0) return status;
             return submit_profile_phase(
                 encode_expert_down_finalize,
                 "qwen36_ffn_int4_expert_down_finalize",
