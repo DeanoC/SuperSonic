@@ -16,7 +16,7 @@ from typing import Any
 
 
 MODEL = "qwen3.6-35b-a3b"
-SCHEMA = "qwen36-fused-routed-int4-sweep-v36"
+SCHEMA = "qwen36-fused-routed-int4-sweep-v37"
 DEFAULT_MAX_FUSED_WALL_GPU_RATIO = 4.0
 DEFAULT_MAX_WAIT_GPU_RATIO = 4.0
 COARSE_BATCH_SERIAL_MODE = "full-stage5-router-batch"
@@ -31,6 +31,9 @@ SHARED_GATE_UP_EXP2_BATCH_SIMD_MODE = "full-stage5-router-simd-batch-shared-gate
 SHARED_SCALAR_SIMD_BATCH_SIMD_MODE = "full-stage5-router-simd-batch-shared-scalar-simd"
 SHARED_DOWN_TILED_BATCH_SIMD_MODE = "full-stage5-router-simd-batch-shared-down-tiled"
 SHARED_HOST_CORRECTED_BATCH_SIMD_MODE = "full-stage5-router-simd-batch-shared-host-corrected"
+SHARED_MID_HOST_CORRECTED_BATCH_SIMD_MODE = (
+    "full-stage5-router-simd-batch-shared-mid-host-corrected"
+)
 SHARED_ROUTED_HOST_CORRECTED_BATCH_SIMD_MODE = (
     "full-stage5-router-simd-batch-shared-routed-host-corrected"
 )
@@ -82,6 +85,7 @@ BATCH_FAST_PROFILE_MODES = {
     ROUTED_GATE_UP_HOST_ORDER_BATCH_SIMD_MODE,
     SHARED_HOST_CORRECTED_ROUTED_GATE_UP_HOST_ORDER_BATCH_SIMD_MODE,
     SHARED_HOST_CORRECTED_BATCH_SIMD_MODE,
+    SHARED_MID_HOST_CORRECTED_BATCH_SIMD_MODE,
     SHARED_ROUTED_HOST_CORRECTED_BATCH_SIMD_MODE,
     "full-stage5-router-batch-phases",
     "full-stage5-router-batch-ffn-phases",
@@ -94,6 +98,7 @@ DIAGNOSTIC_ONLY_MODES = {
     ROUTED_FINALIZE_TAP_BATCH_SIMD_MODE,
     ROUTED_GATE_UP_HOST_ORDER_FINALIZE_TAP_BATCH_SIMD_MODE,
     SHARED_HOST_CORRECTED_BATCH_SIMD_MODE,
+    SHARED_MID_HOST_CORRECTED_BATCH_SIMD_MODE,
     SHARED_HOST_CORRECTED_ROUTED_GATE_UP_HOST_ORDER_BATCH_SIMD_MODE,
     SHARED_ROUTED_HOST_CORRECTED_BATCH_SIMD_MODE,
 }
@@ -194,6 +199,11 @@ MODE_ALIASES: dict[str, str] = {
     "batch-router-simd-shared-host-corrected": SHARED_HOST_CORRECTED_BATCH_SIMD_MODE,
     "full-router-simd-batch-shared-host-corrected": SHARED_HOST_CORRECTED_BATCH_SIMD_MODE,
     SHARED_HOST_CORRECTED_BATCH_SIMD_MODE: SHARED_HOST_CORRECTED_BATCH_SIMD_MODE,
+    "router-simd-batch-shared-mid-host-corrected": SHARED_MID_HOST_CORRECTED_BATCH_SIMD_MODE,
+    "batch-router-simd-shared-mid-host-corrected": SHARED_MID_HOST_CORRECTED_BATCH_SIMD_MODE,
+    "full-router-simd-batch-shared-mid-host-corrected": SHARED_MID_HOST_CORRECTED_BATCH_SIMD_MODE,
+    "shared-mid-host-corrected": SHARED_MID_HOST_CORRECTED_BATCH_SIMD_MODE,
+    SHARED_MID_HOST_CORRECTED_BATCH_SIMD_MODE: SHARED_MID_HOST_CORRECTED_BATCH_SIMD_MODE,
     "router-simd-batch-shared-routed-host-corrected": SHARED_ROUTED_HOST_CORRECTED_BATCH_SIMD_MODE,
     "batch-router-simd-shared-routed-host-corrected": SHARED_ROUTED_HOST_CORRECTED_BATCH_SIMD_MODE,
     "full-router-simd-batch-shared-routed-host-corrected": SHARED_ROUTED_HOST_CORRECTED_BATCH_SIMD_MODE,
@@ -262,6 +272,7 @@ FUSED_OP_NEEDLES = {
     ROUTED_GATE_UP_HOST_ORDER_BATCH_SIMD_MODE: "qwen36_ffn_int4_stage5_with_router",
     SHARED_HOST_CORRECTED_ROUTED_GATE_UP_HOST_ORDER_BATCH_SIMD_MODE: "qwen36_ffn_int4_stage5_with_router",
     SHARED_HOST_CORRECTED_BATCH_SIMD_MODE: "qwen36_ffn_int4_stage5_with_router",
+    SHARED_MID_HOST_CORRECTED_BATCH_SIMD_MODE: "qwen36_ffn_int4_stage5_with_router",
     SHARED_ROUTED_HOST_CORRECTED_BATCH_SIMD_MODE: "qwen36_ffn_int4_stage5_with_router",
     "full-stage5-router-batch-phases": "qwen36_ffn_int4_stage5_with_router",
     "full-stage5-router-batch-ffn-phases": "qwen36_ffn_int4",
@@ -428,6 +439,9 @@ FUSED_GPU_OP_PREFIXES[SHARED_HOST_CORRECTED_ROUTED_GATE_UP_HOST_ORDER_BATCH_SIMD
     "command_buffer_gpu:qwen36_ffn_int4_expert_gate_up_host_order_stage5",
 )
 FUSED_GPU_OP_PREFIXES[SHARED_HOST_CORRECTED_BATCH_SIMD_MODE] = FUSED_GPU_OP_PREFIXES[
+    "full-stage5-router-simd-batch"
+]
+FUSED_GPU_OP_PREFIXES[SHARED_MID_HOST_CORRECTED_BATCH_SIMD_MODE] = FUSED_GPU_OP_PREFIXES[
     "full-stage5-router-simd-batch"
 ]
 FUSED_GPU_OP_PREFIXES[SHARED_ROUTED_HOST_CORRECTED_BATCH_SIMD_MODE] = FUSED_GPU_OP_PREFIXES[
@@ -600,6 +614,19 @@ def parse_shared_host_corrections(output: str) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for line in output.splitlines():
         if not line.startswith("[qwen36-ffn-shared-host-correction]"):
+            continue
+        fields = {
+            key: parse_number(value)
+            for key, value in parse_key_values(line).items()
+        }
+        rows.append(fields)
+    return rows
+
+
+def parse_shared_mid_host_corrections(output: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for line in output.splitlines():
+        if not line.startswith("[qwen36-ffn-shared-mid-host-correction]"):
             continue
         fields = {
             key: parse_number(value)
@@ -870,6 +897,79 @@ def summarize_shared_host_corrections(rows: list[dict[str, Any]]) -> dict[str, A
                 "metal_shared_out_at_argmax": item.get("metal_shared_out_at_argmax"),
                 "output_patch_max_abs": item.get("output_patch_max_abs"),
                 "output_patch_argmax": item.get("output_patch_argmax"),
+                "changed_output_elems": item.get("changed_output_elems"),
+                "first_changed_output": item.get("first_changed_output"),
+            }
+            for item in ranked[:20]
+        ],
+    }
+
+
+def summarize_shared_mid_host_corrections(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    corrections = [
+        correction
+        for row in rows
+        for correction in (row.get("shared_mid_host_corrections") or [])
+    ]
+    paths = sorted({str(correction.get("shared_path") or "-") for correction in corrections})
+    changed = [
+        correction
+        for correction in corrections
+        if int(correction.get("changed_output_elems") or 0) > 0
+    ]
+    ranked = sorted(
+        corrections,
+        key=lambda correction: max(
+            float(correction.get("shared_mid_max_abs") or 0.0),
+            float(correction.get("shared_out_patch_max_abs") or 0.0),
+            float(correction.get("output_patch_max_abs") or 0.0),
+        ),
+        reverse=True,
+    )
+    return {
+        "correction_count": len(corrections),
+        "changed_count": len(changed),
+        "paths": paths,
+        "max_shared_mid_abs": max(
+            (float(item.get("shared_mid_max_abs") or 0.0) for item in corrections),
+            default=0.0,
+        ),
+        "max_shared_out_patch_abs": max(
+            (float(item.get("shared_out_patch_max_abs") or 0.0) for item in corrections),
+            default=0.0,
+        ),
+        "max_output_patch_abs": max(
+            (float(item.get("output_patch_max_abs") or 0.0) for item in corrections),
+            default=0.0,
+        ),
+        "max_changed_shared_mid_elems": max(
+            (int(item.get("changed_shared_mid_elems") or 0) for item in corrections),
+            default=0,
+        ),
+        "max_changed_shared_out_elems": max(
+            (int(item.get("changed_shared_out_elems") or 0) for item in corrections),
+            default=0,
+        ),
+        "max_changed_output_elems": max(
+            (int(item.get("changed_output_elems") or 0) for item in corrections),
+            default=0,
+        ),
+        "worst_examples": [
+            {
+                "layer": item.get("layer"),
+                "path": item.get("shared_path") or "-",
+                "shared_mid_max_abs": item.get("shared_mid_max_abs"),
+                "shared_mid_argmax": item.get("shared_mid_argmax"),
+                "host_shared_mid_at_argmax": item.get("host_shared_mid_at_argmax"),
+                "metal_shared_mid_at_argmax": item.get("metal_shared_mid_at_argmax"),
+                "shared_out_patch_max_abs": item.get("shared_out_patch_max_abs"),
+                "shared_out_patch_argmax": item.get("shared_out_patch_argmax"),
+                "host_shared_out_at_argmax": item.get("host_shared_out_at_argmax"),
+                "metal_shared_out_at_argmax": item.get("metal_shared_out_at_argmax"),
+                "output_patch_max_abs": item.get("output_patch_max_abs"),
+                "output_patch_argmax": item.get("output_patch_argmax"),
+                "changed_shared_mid_elems": item.get("changed_shared_mid_elems"),
+                "changed_shared_out_elems": item.get("changed_shared_out_elems"),
                 "changed_output_elems": item.get("changed_output_elems"),
                 "first_changed_output": item.get("first_changed_output"),
             }
@@ -2565,6 +2665,11 @@ def build_env_overrides(args: argparse.Namespace, mode: str) -> dict[str, str]:
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_STAGE5_SIMD"] = "1"
         overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH"] = "1"
         overrides["SUPERSONIC_METAL_QWEN36_FFN_STAGE5_SHARED_HOST_CORRECTION"] = "1"
+    elif mode == SHARED_MID_HOST_CORRECTED_BATCH_SIMD_MODE:
+        overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"] = "1"
+        overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_STAGE5_SIMD"] = "1"
+        overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH"] = "1"
+        overrides["SUPERSONIC_METAL_QWEN36_FFN_STAGE5_SHARED_MID_HOST_CORRECTION"] = "1"
     elif mode == SHARED_ROUTED_HOST_CORRECTED_BATCH_SIMD_MODE:
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"] = "1"
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_STAGE5_SIMD"] = "1"
@@ -2928,6 +3033,7 @@ def run_row(args: argparse.Namespace, prompt_id: str, prompt: str, mode: str) ->
             "decode_batch_shared_parity_taps": parse_decode_batch_shared_parity_taps(output),
             "decode_batch_routed_parity_taps": parse_decode_batch_routed_parity_taps(output),
             "shared_host_corrections": parse_shared_host_corrections(output),
+            "shared_mid_host_corrections": parse_shared_mid_host_corrections(output),
             "routed_host_corrections": parse_routed_host_corrections(output),
             "routed_gate_up_taps": parse_routed_gate_up_taps(output),
             "routed_finalize_taps": parse_routed_finalize_taps(output),
@@ -2964,6 +3070,7 @@ def run_row(args: argparse.Namespace, prompt_id: str, prompt: str, mode: str) ->
             "decode_batch_shared_parity_taps": parse_decode_batch_shared_parity_taps(output),
             "decode_batch_routed_parity_taps": parse_decode_batch_routed_parity_taps(output),
             "shared_host_corrections": parse_shared_host_corrections(output),
+            "shared_mid_host_corrections": parse_shared_mid_host_corrections(output),
             "routed_host_corrections": parse_routed_host_corrections(output),
             "routed_gate_up_taps": parse_routed_gate_up_taps(output),
             "routed_finalize_taps": parse_routed_finalize_taps(output),
@@ -3813,6 +3920,7 @@ def build_report(
     )
     summary["decode_batch_routed_parity"] = summarize_routed_parity_taps(rows)
     summary["shared_host_correction"] = summarize_shared_host_corrections(rows)
+    summary["shared_mid_host_correction"] = summarize_shared_mid_host_corrections(rows)
     summary["routed_host_correction"] = summarize_routed_host_corrections(rows)
     summary["routed_gate_up_tap"] = summarize_routed_gate_up_taps(rows)
     summary["routed_finalize_tap"] = summarize_routed_finalize_taps(rows)
@@ -3896,6 +4004,7 @@ def render_markdown(report: dict[str, Any]) -> str:
     decode_batch_shared_parity = summary.get("decode_batch_shared_parity") or {}
     decode_batch_routed_parity = summary.get("decode_batch_routed_parity") or {}
     shared_host_correction = summary.get("shared_host_correction") or {}
+    shared_mid_host_correction = summary.get("shared_mid_host_correction") or {}
     routed_host_correction = summary.get("routed_host_correction") or {}
     routed_gate_up_tap = summary.get("routed_gate_up_tap") or {}
     routed_finalize_tap = summary.get("routed_finalize_tap") or {}
@@ -3954,6 +4063,11 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- shared_host_correction_count: `{shared_host_correction.get('correction_count', 0)}`",
         f"- shared_host_correction_changed_count: `{shared_host_correction.get('changed_count', 0)}`",
         f"- shared_host_correction_max_output_patch_abs: `{render_float(shared_host_correction.get('max_output_patch_abs'), 8)}`",
+        f"- shared_mid_host_correction_count: `{shared_mid_host_correction.get('correction_count', 0)}`",
+        f"- shared_mid_host_correction_changed_count: `{shared_mid_host_correction.get('changed_count', 0)}`",
+        f"- shared_mid_host_correction_max_shared_mid_abs: `{render_float(shared_mid_host_correction.get('max_shared_mid_abs'), 8)}`",
+        f"- shared_mid_host_correction_max_shared_out_patch_abs: `{render_float(shared_mid_host_correction.get('max_shared_out_patch_abs'), 8)}`",
+        f"- shared_mid_host_correction_max_output_patch_abs: `{render_float(shared_mid_host_correction.get('max_output_patch_abs'), 8)}`",
         f"- routed_host_correction_count: `{routed_host_correction.get('correction_count', 0)}`",
         f"- routed_host_correction_changed_count: `{routed_host_correction.get('changed_count', 0)}`",
         f"- routed_host_correction_metal_mid_host_topk_matches_host_count: `{routed_host_correction.get('metal_mid_host_topk_matches_host_count', 0)}`",
@@ -4485,6 +4599,52 @@ def render_markdown(report: dict[str, Any]) -> str:
                     patch=render_float(correction.get("output_patch_max_abs"), 8),
                     patch_idx=correction.get("output_patch_argmax", "-"),
                     changed=correction.get("changed_output_elems", "-"),
+                    first=correction.get("first_changed_output", "-"),
+                )
+            )
+    mid_correction_rows: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for row in report["rows"]:
+        for correction in row.get("shared_mid_host_corrections") or []:
+            mid_correction_rows.append((row, correction))
+    if mid_correction_rows:
+        ranked_mid_corrections = sorted(
+            mid_correction_rows,
+            key=lambda pair: max(
+                float(pair[1].get("shared_mid_max_abs") or 0.0),
+                float(pair[1].get("shared_out_patch_max_abs") or 0.0),
+                float(pair[1].get("output_patch_max_abs") or 0.0),
+            ),
+            reverse=True,
+        )
+        lines.extend(
+            [
+                "",
+                "## Shared-Mid Host Correction",
+                "",
+                "| Prompt | Mode | Path | Layer | Shared mid max | Shared mid idx | Host mid | Metal mid | Shared out patch max | Shared out idx | Host out | Metal out | Output patch max | Output patch idx | Changed mid | Changed out | Changed output | First changed |",
+                "|:---|:---|:---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+            ]
+        )
+        for row, correction in ranked_mid_corrections[:40]:
+            lines.append(
+                "| {prompt} | {mode} | {path} | {layer} | {mid} | {mid_idx} | {host_mid} | {metal_mid} | {shared} | {shared_idx} | {host_out} | {metal_out} | {patch} | {patch_idx} | {changed_mid} | {changed_out} | {changed_output} | {first} |".format(
+                    prompt=row.get("prompt_id", ""),
+                    mode=row.get("mode", ""),
+                    path=correction.get("shared_path", "-"),
+                    layer=correction.get("layer", "-"),
+                    mid=render_float(correction.get("shared_mid_max_abs"), 8),
+                    mid_idx=correction.get("shared_mid_argmax", "-"),
+                    host_mid=render_float(correction.get("host_shared_mid_at_argmax"), 8),
+                    metal_mid=render_float(correction.get("metal_shared_mid_at_argmax"), 8),
+                    shared=render_float(correction.get("shared_out_patch_max_abs"), 8),
+                    shared_idx=correction.get("shared_out_patch_argmax", "-"),
+                    host_out=render_float(correction.get("host_shared_out_at_argmax"), 8),
+                    metal_out=render_float(correction.get("metal_shared_out_at_argmax"), 8),
+                    patch=render_float(correction.get("output_patch_max_abs"), 8),
+                    patch_idx=correction.get("output_patch_argmax", "-"),
+                    changed_mid=correction.get("changed_shared_mid_elems", "-"),
+                    changed_out=correction.get("changed_shared_out_elems", "-"),
+                    changed_output=correction.get("changed_output_elems", "-"),
                     first=correction.get("first_changed_output", "-"),
                 )
             )

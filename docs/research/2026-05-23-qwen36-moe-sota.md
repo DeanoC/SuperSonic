@@ -2227,6 +2227,54 @@ under the same smoke:
    contract or a targeted shared-mid correction probe; simply swapping Metal
    `exp` for Metal `exp2` is insufficient.
 
+60. **Qwen3.6 shared-mid host-correction probe**
+   The fused-routed sweep is now schema `v37`. It adds a diagnostic-only
+   shared-mid correction mode,
+   `full-stage5-router-simd-batch-shared-mid-host-corrected`, controlled by
+   `SUPERSONIC_METAL_QWEN36_FFN_STAGE5_SHARED_MID_HOST_CORRECTION=1`. After the
+   Metal stage-5 FFN path completes, the diagnostic flushes/synchronizes,
+   patches `workspace.shared_mid` from the host shared reference, recomputes
+   shared-down and the final residual output on the host, and emits
+   `[qwen36-ffn-shared-mid-host-correction]` rows. The mode is explicitly
+   non-promotable.
+
+   Local validation passed:
+   `PYTHONPYCACHEPREFIX=/private/tmp/supersonic-pycache python3 -m py_compile
+   tests/metal/sweep_qwen36_fused_routed_int4.py
+   tests/test_qwen36_fused_routed_int4_sweep.py`,
+   `PYTHONPYCACHEPREFIX=/private/tmp/supersonic-pycache python3 -m unittest
+   tests.test_qwen36_fused_routed_int4_sweep`,
+   `cargo test -p kernel-ffi qwen36_moe --lib`, `cargo fmt --check`,
+   `cargo build --release -p runner --bin supersonic`, and `git diff --check`.
+   The focused Metal run wrote
+   `/private/tmp/qwen36_shared_mid_host_correction_v37_1tok.{json,md}` with
+   `--modes default,full-stage5-router-simd-batch,full-stage5-router-simd-batch-shared-mid-host-corrected
+   --max-new-tokens 1 --context-size 64 --metal-profile --shared-parity-tap
+   --shared-parity-tap-max-calls 120 --routed-parity-tap
+   --routed-parity-tap-max-calls 120 --layer-output-tap
+   --layer-output-delta-tap --layer-output-delta-all
+   --no-promotion-require-profile`. All three rows ran, generated IDs matched
+   (`[11]`), and the promotion gate remained false.
+
+   The correction probe confirms the layer `7`, row `1621` diagnosis. It emitted
+   `40` correction rows and only one changed final output row. At layer `7`, the
+   host/Metal shared-mid values were `0.336338878` versus `0.336338818`; patching
+   that value changed shared output from `0.0123291016` to `0.0123901367` and
+   corrected the visible output by `0.00048828125` at row `1621`. Across the run,
+   the largest shared-mid delta was `4.76837158e-7`, the largest shared-output
+   patch was `6.10351562e-5`, and the largest final-output patch was
+   `0.00048828125`.
+
+   With the shared-mid patch active, the first remaining diagnostic mismatch
+   moves to routed MoE: layer `33`, row `8`, source
+   `moe_out_residual_rounding_boundary`, `max_abs_delta=0.0001220703125`,
+   `max_ulp_delta=2`, and one differing element. Shared output is exact there,
+   while MoE output differs (`host_moe=-0.0219726562`,
+   `metal_moe=-0.0220947266`) and the final output follows that MoE delta. The
+   next correctness target should therefore be a routed expert down/finalize
+   rounding probe/fix for the normal decode-batch path, not another shared
+   gate/up approximation experiment.
+
 ## Sources
 
 - [Qwen/Qwen3.6-35B-A3B model card](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)
