@@ -3907,6 +3907,11 @@ fn qwen36_ffn_shared_stage5_parity_tap_enabled() -> bool {
         && !crate::prefill_ffi::metal_batch_is_active()
 }
 
+fn qwen36_ffn_stage5_shared_host_correction_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_QWEN36_FFN_STAGE5_SHARED_HOST_CORRECTION").is_some()
+        && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
+}
+
 fn qwen36_ffn_router_stage5_simd_env_enabled() -> bool {
     std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_STAGE5_SIMD").is_some()
         && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
@@ -4539,6 +4544,106 @@ fn qwen36_emit_ffn_shared_stage5_parity_tap(
         metal_mid_host_shared_down_acc_at_out_argmax,
         metal_mid_host_shared_gated_at_out_argmax,
         metal_mid_host_shared_out_at_argmax,
+    );
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen36_apply_ffn_shared_stage5_host_correction(
+    ordinal: usize,
+    layer_idx: i32,
+    hidden: usize,
+    off_shared_out: usize,
+    off_moe_out: usize,
+    weights: &Qwen36MoeFfnStepWeights,
+    workspace: &mut GpuBuffer,
+    output: &mut GpuBuffer,
+    reference: &Qwen36FfnSharedReference,
+) -> Result<(), GpuError> {
+    crate::prefill_ffi::flush_metal_batch()?;
+    gpu_hal::sync(ordinal)?;
+
+    let workspace_len = workspace.len_bytes() / std::mem::size_of::<f32>();
+    if workspace_len < off_moe_out + hidden {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::ffn_step_launch: shared host correction workspace too small: need {}, got {}",
+            off_moe_out + hidden,
+            workspace_len
+        )));
+    }
+    if output.len_bytes() / std::mem::size_of::<u16>() < hidden {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::ffn_step_launch: shared host correction output too small: need {hidden}, got {}",
+            output.len_bytes() / std::mem::size_of::<u16>()
+        )));
+    }
+
+    let input = unsafe { std::slice::from_raw_parts(weights.input_hidden as *const u16, hidden) };
+    let workspace = unsafe {
+        std::slice::from_raw_parts_mut(workspace.as_mut_ptr() as *mut f32, workspace_len)
+    };
+    let output = unsafe { std::slice::from_raw_parts_mut(output.as_mut_ptr() as *mut u16, hidden) };
+
+    let mut shared_out_max_abs = 0.0f32;
+    let mut shared_out_argmax = 0usize;
+    let mut host_shared_out_at_argmax = f32::NAN;
+    let mut metal_shared_out_at_argmax = f32::NAN;
+    let mut output_patch_max_abs = 0.0f32;
+    let mut output_patch_argmax = 0usize;
+    let mut changed_output_elems = 0usize;
+    let mut first_changed_output = usize::MAX;
+
+    for row in 0..hidden {
+        let metal_shared = workspace[off_shared_out + row];
+        let host_shared = reference.shared_out[row];
+        let shared_abs = (host_shared - metal_shared).abs();
+        if row == 0 || shared_abs > shared_out_max_abs {
+            shared_out_max_abs = shared_abs;
+            shared_out_argmax = row;
+            host_shared_out_at_argmax = host_shared;
+            metal_shared_out_at_argmax = metal_shared;
+        }
+
+        let before = bf16_bits_to_f32(output[row]);
+        workspace[off_shared_out + row] = host_shared;
+        let corrected = bf16_round_f32(
+            bf16_bits_to_f32(input[row]) + workspace[off_moe_out + row] + host_shared,
+        );
+        let corrected_bits = f32_to_bf16_bits(corrected);
+        let after = bf16_bits_to_f32(corrected_bits);
+        let patch_abs = (after - before).abs();
+        if patch_abs > output_patch_max_abs {
+            output_patch_max_abs = patch_abs;
+            output_patch_argmax = row;
+        }
+        if corrected_bits != output[row] {
+            changed_output_elems += 1;
+            if first_changed_output == usize::MAX {
+                first_changed_output = row;
+            }
+        }
+        output[row] = corrected_bits;
+    }
+
+    let first_changed_output = if first_changed_output == usize::MAX {
+        -1isize
+    } else {
+        first_changed_output as isize
+    };
+    eprintln!(
+        "[qwen36-ffn-shared-host-correction] layer={} shared_path={} hidden={} shared_out_max_abs={:.8e} shared_out_argmax={} host_shared_out_at_argmax={:.8e} metal_shared_out_at_argmax={:.8e} output_patch_max_abs={:.8e} output_patch_argmax={} changed_output_elems={} first_changed_output={}",
+        layer_idx,
+        qwen36_ffn_shared_stage5_path_label(),
+        hidden,
+        shared_out_max_abs,
+        shared_out_argmax,
+        host_shared_out_at_argmax,
+        metal_shared_out_at_argmax,
+        output_patch_max_abs,
+        output_patch_argmax,
+        changed_output_elems,
+        first_changed_output,
     );
 
     Ok(())
@@ -8211,7 +8316,12 @@ fn ffn_step_stage1_5_metal_host(
         )?;
         let router_parity_tap = qwen36_ffn_router_stage5_parity_tap_enabled();
         let shared_parity_tap = qwen36_ffn_shared_stage5_parity_tap_enabled();
-        let router_reference = if router_parity_tap || shared_parity_tap {
+        let shared_host_correction = qwen36_ffn_stage5_shared_host_correction_enabled();
+        if shared_host_correction {
+            crate::prefill_ffi::flush_metal_batch()?;
+            gpu_hal::sync(ordinal)?;
+        }
+        let router_reference = if router_parity_tap || shared_parity_tap || shared_host_correction {
             let input =
                 unsafe { std::slice::from_raw_parts(weights.input_hidden as *const u16, hidden) };
             let norm_w = unsafe {
@@ -8232,7 +8342,7 @@ fn ffn_step_stage1_5_metal_host(
         } else {
             None
         };
-        let shared_reference = if shared_parity_tap {
+        let shared_reference = if shared_parity_tap || shared_host_correction {
             let shared_expert_gate_w = unsafe {
                 std::slice::from_raw_parts(weights.shared_expert_gate_w as *const u16, hidden)
             };
@@ -8301,6 +8411,25 @@ fn ffn_step_stage1_5_metal_host(
             },
         );
         if status.is_ok() {
+            if shared_host_correction {
+                let reference = shared_reference.as_ref().ok_or_else(|| {
+                    GpuError::InvalidArg(
+                        "qwen36_moe::ffn_step_launch: shared host correction missing reference"
+                            .into(),
+                    )
+                })?;
+                qwen36_apply_ffn_shared_stage5_host_correction(
+                    ordinal,
+                    params.layer_idx,
+                    hidden,
+                    off_shared_out,
+                    off_moe_out,
+                    weights,
+                    workspace,
+                    output,
+                    reference,
+                )?;
+            }
             if router_parity_tap {
                 let reference = router_reference.as_ref().ok_or_else(|| {
                     GpuError::InvalidArg(

@@ -1779,6 +1779,53 @@ under the same smoke:
    before layer `8`, or move to a separate eval/logit-level acceptance policy
    that is intentionally broader than hidden-stream parity.
 
+50. **Qwen3.6 shared-output host-correction diagnostic**
+   The fused-routed sweep is now schema `v27`. It adds a diagnostic-only mode,
+   `full-stage5-router-simd-batch-shared-host-corrected`, controlled by
+   `SUPERSONIC_METAL_QWEN36_FFN_STAGE5_SHARED_HOST_CORRECTION=1`. The mode
+   still runs the native decode-batch/router-SIMD FFN path, then flushes and
+   patches only the shared FFN output from the host reference before
+   recomputing the final residual BF16 row. It is explicitly rejected by the
+   promotion gate through `diagnostic_mode_not_promotable`, because the
+   per-layer flush/sync/readback cost is for attribution only.
+
+   The one-token Metal smoke wrote
+   `/private/tmp/qwen36_shared_host_corrected_v27_1tok.{json,md}` with
+   `--modes default,full-stage5-router-simd-batch,full-stage5-router-simd-batch-shared-host-corrected
+   --max-new-tokens 1 --context-size 64 --metal-profile --layer-output-tap
+   --layer-output-delta-tap --layer-output-delta-all`. Generated IDs matched
+   across all rows (`[11]`), but promotion stayed false. The uncorrected
+   decode-batch/router-SIMD row had `65` layer-output checksum mismatches, first
+   at layer `7` FFN with `max_abs_delta=0.00048828125`,
+   `max_ulp_delta=1`, and one differing element. With the shared-output host
+   correction enabled, mismatches dropped to `13`, and the first untolerated
+   row moved to layer `33` FFN with `max_abs_delta=0.0001220703125`,
+   `max_ulp_delta=2`, and one differing element.
+
+   The correction log emitted `40` per-layer rows. Only one layer changed the
+   final hidden output: layer `7`, where the patched shared output differed by
+   `6.10351562e-5` at index `1621` and changed one BF16 output element by
+   `0.00048828125`. This confirms that the layer-7 cliff is caused by shared
+   output materialization/residual rounding, not by router top-k selection.
+   It also proves that fixing that first cliff is not sufficient for full
+   hidden-stream parity: a later layer-33 FFN source remains.
+
+   The profile rows underline why this stays diagnostic. The normal
+   decode-batch/router-SIMD profile in this tap-heavy run reported
+   `command_buffer_gpu:qwen36_decode_batch` at `1211.089 ms` and
+   `command_buffer_wait` at `1264.159 ms`, while the host-corrected row split
+   work into `93` command-buffer waits with `120` HAL syncs. Its top GPU rows
+   were `command_buffer_gpu:qwen36_ffn_int4_stage5_with_router`
+   (`91.159 ms`) and
+   `command_buffer_gpu:qwen36_linear_int4_out_proj_finalize` (`87.653 ms`).
+   Those numbers are attribution overhead, not a performance candidate.
+
+   The next measured correctness target is the late layer-33 FFN mismatch under
+   shared correction. A good follow-up is a similarly narrow diagnostic that
+   patches the routed/MoE contribution or final residual at layer `33`, so we
+   can tell whether the remaining drift is routed expert math, MoE combine, or
+   final residual ordering before changing the hot Metal kernels.
+
 ## Sources
 
 - [Qwen/Qwen3.6-35B-A3B model card](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)
