@@ -2151,6 +2151,42 @@ under the same smoke:
    tap inside the Metal finalize kernel for the host-order path before trying to
    promote either optimization.
 
+58. **Qwen3.6 shared-mid boundary attribution**
+   The follow-up shared-path sweep wrote
+   `/private/tmp/qwen36_shared_path_parity_v35_1tok.{json,md}` with
+   `--modes default,full-stage5-router-simd-batch,full-stage5-router-simd-batch-shared-down-tiled,full-stage5-router-simd-batch-shared-tiled,full-stage5-router-simd-batch-shared-routed-host-corrected
+   --max-new-tokens 1 --context-size 64 --metal-profile --shared-parity-tap
+   --shared-parity-tap-max-calls 120 --routed-parity-tap
+   --routed-parity-tap-max-calls 120 --layer-output-tap
+   --layer-output-delta-tap --layer-output-delta-all
+   --no-promotion-require-profile`. All five rows ran and generated IDs matched
+   (`[11]`), but the promotion gate remained false.
+
+   The normal decode-batch path still first diverges at layer `7` FFN, row
+   `1621`, with a one-element `0.00048828125` residual delta. The shared
+   gate/up inputs at the relevant shared-mid row matched exactly, but shared-mid
+   differed by roughly one FP32 ulp
+   (`host_shared_mid=0.336338878`, `metal_shared_mid=0.336338818`). Feeding that
+   Metal shared-mid into the host shared-down recompute produced
+   `metal_mid_host_shared_out=0.0123291016`, exactly matching the Metal shared
+   output and differing from the host recompute
+   (`host_shared_out=0.0123901367`). The `shared-down-tiled` mode reproduced the
+   same first cliff, so the normal-path issue is not shared-down accumulation or
+   tiling; it is the SiLU/multiply shared-mid materialization landing on a BF16
+   rounding boundary.
+
+   Two rejected local probes confirmed that interpretation. A `precise::exp`
+   variant and a sign-stable negative-branch SiLU variant both rebuilt and ran
+   the one-token Metal smoke, but the focused sweep still reported the same
+   layer `7`, row `1621` `shared_mid_to_shared_out_bf16_boundary` source in
+   `/private/tmp/qwen36_shared_silu_precise_v36_1tok.{json,md}` and
+   `/private/tmp/qwen36_shared_silu_stable_v36_1tok.{json,md}`. Those runtime
+   changes are not retained. The next useful code change is either a targeted
+   Metal shared-mid implementation that intentionally matches the host libm/FMA
+   rounding contract, or a measured policy decision that permits this specific
+   one-ulp BF16 boundary while continuing to fail hard on larger or non-localized
+   drift.
+
 ## Sources
 
 - [Qwen/Qwen3.6-35B-A3B model card](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)
