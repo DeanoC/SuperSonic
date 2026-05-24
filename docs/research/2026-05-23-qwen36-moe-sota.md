@@ -420,6 +420,12 @@ under the same smoke:
    Metal/HAL profiles. This keeps the "do not promote unless it wins" rule
    machine-readable for future prefill/orchestration changes.
 
+   The ninth slice turns that rule into a nonfatal `promotion_gate` in the
+   variant sweep schema. A candidate must preserve generated IDs, improve
+   prefill, headline decode, and `ffn_ms_avg`, keep full-attention,
+   linear-attention, and lm-head inside the configured regression threshold,
+   and provide non-regressed `command_buffer_wait` profile evidence by default.
+
 3. **Static top-N resident MPS table probe**
    Use route profiles to choose top-N experts per layer, materialize FP16 MPS
    RHS once, fall back on misses, and measure real prompts.

@@ -860,7 +860,7 @@ The local-main-target workflow for this machine is:
 4. profile smoke: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/bench_qwen36_longctx.py --preset smoke --metal-profile`
 5. batched-prefill MoE feasibility: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/bench_qwen36_longctx.py --preset smoke --batched-prefill-feasibility`
 6. batched-prefill Metal prototype: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/bench_qwen36_longctx.py --preset smoke --batched-prefill-prototype`
-7. batched-prefill variant sweep: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/sweep_qwen36_batched_prefill_variants.py`
+7. batched-prefill variant sweep: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/sweep_qwen36_batched_prefill_variants.py --metal-profile`
 8. MTP tensor audit: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/audit_qwen36_mtp.py --require-complete-bake`
 9. MTP acceptance/policy probe: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/probe_qwen36_mtp_acceptance.py`
 10. MTP Metal K=1 experiment: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/probe_qwen36_mtp_acceptance.py --metal-experiment`
@@ -907,7 +907,12 @@ mode plus `prototype-default` and the named prototype variants against the same
 deterministic NIAH prompt per context, then writes
 `target/qwen36_metal_batched_prefill_variant_sweep.{json,md}` with generated ID
 parity, prefill ratios versus baseline, lifecycle/stage rows, optional
-Metal/HAL profiles, and the exact variant/env gate used by each row.
+Metal/HAL profiles, and the exact variant/env gate used by each row. Its v2
+schema adds a nonfatal `promotion_gate` summary: a candidate must preserve
+generated IDs, improve prefill, headline decode, and `ffn_ms_avg`, avoid more
+than the configured full-attention/linear-attention/lm-head regression ratio,
+and include non-regressed `command_buffer_wait` profile evidence unless
+`--no-promotion-require-profile` is used.
 The 512-token smoke is a real prefill run and is slow on the current chained
 Metal path; use `--preset comparison` as a long-running sweep before selecting
 the next runtime optimization target. The first v3 feasibility smoke on this

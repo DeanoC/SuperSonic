@@ -466,7 +466,7 @@ SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" \
   --batched-prefill-prototype
 
 SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" \
-  python3 tests/metal/sweep_qwen36_batched_prefill_variants.py
+  python3 tests/metal/sweep_qwen36_batched_prefill_variants.py --metal-profile
 
 SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" \
   python3 tests/metal/audit_qwen36_mtp.py --require-complete-bake
@@ -528,7 +528,11 @@ deterministic NIAH prompt per context. It writes
 `target/qwen36_metal_batched_prefill_variant_sweep.json` and
 `target/qwen36_metal_batched_prefill_variant_sweep.md`, preserving generated-ID
 parity, prefill ratios versus baseline, stage/lifecycle rows, and optional
-Metal/HAL attribution with `--metal-profile`. The first local
+Metal/HAL attribution with `--metal-profile`. The v2 report also includes a
+nonfatal `promotion_gate`: variants must preserve generated IDs, improve
+prefill, headline decode, and `ffn_ms_avg`, avoid material full-attention,
+linear-attention, or lm-head regressions, and carry command-buffer-wait profile
+evidence unless `--no-promotion-require-profile` is used. The first local
 512-token normal smoke generated the same `[271]` one-token sanity row and
 reduced prefill to 22.15s; the profiled smoke measured 34.20s because it splits
 the routed-expert gate/up and down/combine phases for attribution. A follow-up

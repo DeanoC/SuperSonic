@@ -55,6 +55,12 @@ class Qwen36BatchedPrefillVariantSweepTests(unittest.TestCase):
                 "generated_ids": [271],
                 "lifecycle": {"prefill_total_ms": 12000.0},
                 "stage": {"total_ms_avg": 100.0},
+                "chain_breakdown": {
+                    "ffn_ms_avg": 50.0,
+                    "full_attn_ms_avg": 10.0,
+                    "linear_attn_ms_avg": 20.0,
+                    "lm_head_ms_avg": 5.0,
+                },
             },
             {
                 "context_tokens_requested": 512,
@@ -63,10 +69,16 @@ class Qwen36BatchedPrefillVariantSweepTests(unittest.TestCase):
                 "generated_ids": [271],
                 "lifecycle": {"prefill_total_ms": 9000.0},
                 "stage": {"total_ms_avg": 90.0},
+                "chain_breakdown": {
+                    "ffn_ms_avg": 45.0,
+                    "full_attn_ms_avg": 10.5,
+                    "linear_attn_ms_avg": 21.0,
+                    "lm_head_ms_avg": 5.1,
+                },
             },
         ]
 
-        summary = script.summarize(rows)
+        summary = script.summarize(rows, require_profile=False)
 
         self.assertTrue(summary["generated_ids_match"])
         self.assertEqual(summary["best_prefill_by_context"]["512"]["mode"], "prototype-default")
@@ -74,6 +86,9 @@ class Qwen36BatchedPrefillVariantSweepTests(unittest.TestCase):
         self.assertEqual(comparison["mode"], "prototype-default")
         self.assertAlmostEqual(comparison["prefill_ratio"], 0.75)
         self.assertAlmostEqual(comparison["decode_total_ratio"], 0.9)
+        self.assertAlmostEqual(comparison["ffn_ms_avg_ratio"], 0.9)
+        self.assertTrue(summary["promotion_gate"]["passed"])
+        self.assertEqual(summary["promotion_gate"]["passed_modes"], ["prototype-default"])
 
     def test_summarize_reports_generated_id_mismatch(self):
         script = sweep_qwen36_batched_prefill_variants
@@ -91,11 +106,104 @@ class Qwen36BatchedPrefillVariantSweepTests(unittest.TestCase):
                     "status": "ok",
                     "generated_ids": [272],
                 },
-            ]
+            ],
+            require_profile=False,
         )
 
         self.assertFalse(summary["generated_ids_match"])
         self.assertEqual(summary["generated_id_mismatches"][0]["mode"], "router-topk")
+        self.assertIn(
+            "context_512:generated_ids_mismatch",
+            summary["promotion_gate"]["candidates"][0]["failures"],
+        )
+
+    def test_promotion_gate_requires_profile_by_default(self):
+        script = sweep_qwen36_batched_prefill_variants
+        summary = script.summarize(
+            [
+                {
+                    "context_tokens_requested": 512,
+                    "sweep_mode": "baseline",
+                    "status": "ok",
+                    "generated_ids": [271],
+                    "lifecycle": {"prefill_total_ms": 12000.0},
+                    "stage": {"total_ms_avg": 100.0},
+                    "chain_breakdown": {
+                        "ffn_ms_avg": 50.0,
+                        "full_attn_ms_avg": 10.0,
+                        "linear_attn_ms_avg": 20.0,
+                        "lm_head_ms_avg": 5.0,
+                    },
+                },
+                {
+                    "context_tokens_requested": 512,
+                    "sweep_mode": "router-topk",
+                    "status": "ok",
+                    "generated_ids": [271],
+                    "lifecycle": {"prefill_total_ms": 9000.0},
+                    "stage": {"total_ms_avg": 90.0},
+                    "chain_breakdown": {
+                        "ffn_ms_avg": 45.0,
+                        "full_attn_ms_avg": 10.5,
+                        "linear_attn_ms_avg": 21.0,
+                        "lm_head_ms_avg": 5.1,
+                    },
+                },
+            ]
+        )
+
+        self.assertFalse(summary["promotion_gate"]["passed"])
+        self.assertIn(
+            "context_512:missing_command_buffer_wait_profile",
+            summary["promotion_gate"]["candidates"][0]["failures"],
+        )
+
+    def test_promotion_gate_rejects_bucket_regression(self):
+        script = sweep_qwen36_batched_prefill_variants
+        summary = script.summarize(
+            [
+                {
+                    "context_tokens_requested": 512,
+                    "sweep_mode": "baseline",
+                    "status": "ok",
+                    "generated_ids": [271],
+                    "lifecycle": {"prefill_total_ms": 12000.0},
+                    "stage": {"total_ms_avg": 100.0},
+                    "chain_breakdown": {
+                        "ffn_ms_avg": 50.0,
+                        "full_attn_ms_avg": 10.0,
+                        "linear_attn_ms_avg": 20.0,
+                        "lm_head_ms_avg": 5.0,
+                    },
+                    "metal_profile": {
+                        "entries": [{"op": "command_buffer_wait", "total_ms": 100.0}]
+                    },
+                },
+                {
+                    "context_tokens_requested": 512,
+                    "sweep_mode": "router-topk",
+                    "status": "ok",
+                    "generated_ids": [271],
+                    "lifecycle": {"prefill_total_ms": 9000.0},
+                    "stage": {"total_ms_avg": 90.0},
+                    "chain_breakdown": {
+                        "ffn_ms_avg": 45.0,
+                        "full_attn_ms_avg": 13.0,
+                        "linear_attn_ms_avg": 21.0,
+                        "lm_head_ms_avg": 5.1,
+                    },
+                    "metal_profile": {
+                        "entries": [{"op": "command_buffer_wait", "total_ms": 102.0}]
+                    },
+                },
+            ]
+        )
+
+        self.assertFalse(summary["promotion_gate"]["passed"])
+        self.assertIn(
+            "context_512:full_attn_ms_avg_regressed",
+            summary["promotion_gate"]["candidates"][0]["failures"],
+        )
 
     def test_render_markdown_includes_profile_and_baseline_delta(self):
         script = sweep_qwen36_batched_prefill_variants
@@ -108,6 +216,15 @@ class Qwen36BatchedPrefillVariantSweepTests(unittest.TestCase):
                 "niah_contains_expected": True,
                 "lifecycle": {"prefill_total_ms": 12000.0},
                 "stage": {"total_ms_avg": 100.0},
+                "chain_breakdown": {
+                    "ffn_ms_avg": 50.0,
+                    "full_attn_ms_avg": 10.0,
+                    "linear_attn_ms_avg": 20.0,
+                    "lm_head_ms_avg": 5.0,
+                },
+                "metal_profile": {
+                    "entries": [{"op": "command_buffer_wait", "total_ms": 100.0}]
+                },
                 "wall_seconds": 13.0,
             },
             {
@@ -118,8 +235,17 @@ class Qwen36BatchedPrefillVariantSweepTests(unittest.TestCase):
                 "niah_contains_expected": True,
                 "lifecycle": {"prefill_total_ms": 15000.0},
                 "stage": {"total_ms_avg": 105.0},
+                "chain_breakdown": {
+                    "ffn_ms_avg": 55.0,
+                    "full_attn_ms_avg": 10.5,
+                    "linear_attn_ms_avg": 21.0,
+                    "lm_head_ms_avg": 5.1,
+                },
                 "metal_profile": {
-                    "entries": [{"op": "qwen36_router_topk", "total_ms": 12.5}]
+                    "entries": [
+                        {"op": "qwen36_router_topk", "total_ms": 150.0},
+                        {"op": "command_buffer_wait", "total_ms": 130.0},
+                    ]
                 },
                 "hal_profile": {"summary": {"total_ms": 4.0}},
                 "wall_seconds": 16.0,
@@ -132,6 +258,12 @@ class Qwen36BatchedPrefillVariantSweepTests(unittest.TestCase):
                 max_new_tokens=1,
                 metal_profile=True,
                 batched_prefill_feasibility=False,
+                promotion_max_prefill_ratio=0.999,
+                promotion_max_decode_ratio=0.999,
+                promotion_max_ffn_ratio=0.999,
+                promotion_max_component_regression_ratio=1.10,
+                promotion_max_command_buffer_wait_ratio=1.05,
+                promotion_require_profile=True,
                 seed=20260504,
             ),
             [512],
@@ -144,6 +276,8 @@ class Qwen36BatchedPrefillVariantSweepTests(unittest.TestCase):
         self.assertIn("router-topk", md)
         self.assertIn("1.250x", md)
         self.assertIn("qwen36_router_topk", md)
+        self.assertIn("promotion_gate_passed", md)
+        self.assertIn("prefill_not_improved", md)
 
 
 if __name__ == "__main__":
