@@ -102,6 +102,11 @@ class Qwen36MpsResidentTableProbeTests(unittest.TestCase):
 
         self.assertEqual(report["schema"], script.SCHEMA)
         self.assertEqual(report["summary"]["best_partial_capacity"], 4)
+        self.assertTrue(report["summary"]["viability_gate"]["passed"])
+        self.assertEqual(
+            report["summary"]["viability_gate"]["recommendation"],
+            "prototype_partial_hit_resident_mps",
+        )
         self.assertEqual(
             report["rows"][1]["recommendation"],
             "prototype_partial_hit_resident_mps",
@@ -109,6 +114,59 @@ class Qwen36MpsResidentTableProbeTests(unittest.TestCase):
         md = script.render_markdown(report)
         self.assertIn("MPS Resident Table Probe", md)
         self.assertIn("Partial-hit optimistic", md)
+        self.assertIn("viability_gate_passed", md)
+        self.assertIn("Viability Gate", md)
+
+    def test_viability_gate_rejects_large_or_low_coverage_candidates(self):
+        script = probe_qwen36_mps_resident_table
+        pilot = {"source": "manual", "status": "ok", "gate_up_ms": 1.0, "down_ms": 1.0}
+
+        report = script.build_report(
+            STATIC_REPORT,
+            pilot,
+            layers=2,
+            hidden=8,
+            moe_intermediate=4,
+            top_k=2,
+            baseline_ffn_ms=10.0,
+            baseline_source="unit test",
+            gate_max_rhs_gib=0.015,
+            gate_max_ratio=0.90,
+            gate_min_partial_coverage=0.50,
+            gate_min_full_hit_call_rate=0.50,
+        )
+
+        gate = report["summary"]["viability_gate"]
+        self.assertFalse(gate["passed"])
+        failures = {
+            failure
+            for candidate in gate["candidates"]
+            for failure in candidate["failures"]
+        }
+        self.assertIn("resident_rhs_too_large", failures)
+        self.assertIn("coverage_below_threshold", failures)
+
+    def test_viability_gate_requires_usable_pilot(self):
+        script = probe_qwen36_mps_resident_table
+
+        report = script.build_report(
+            STATIC_REPORT,
+            pilot=None,
+            layers=2,
+            hidden=8,
+            moe_intermediate=4,
+            top_k=2,
+            baseline_ffn_ms=10.0,
+            baseline_source="unit test",
+        )
+
+        gate = report["summary"]["viability_gate"]
+        self.assertFalse(gate["passed"])
+        self.assertEqual(gate["recommendation"], "measure_mps_pilot")
+        self.assertIn(
+            "missing_usable_mps_pilot",
+            gate["candidates"][0]["failures"],
+        )
 
     def test_pilot_env_sets_shape_controls(self):
         script = probe_qwen36_mps_resident_table

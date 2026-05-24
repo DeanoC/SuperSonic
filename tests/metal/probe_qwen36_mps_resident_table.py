@@ -21,7 +21,7 @@ from typing import Any
 
 
 MODEL = "qwen3.6-35b-a3b"
-SCHEMA = "qwen36-mps-resident-table-probe-v1"
+SCHEMA = "qwen36-mps-resident-table-probe-v2"
 PILOT_PREFIX = "[qwen36-moe mps-expert-pilot]"
 
 DEFAULT_LAYERS = 40
@@ -30,6 +30,10 @@ DEFAULT_MOE_INTERMEDIATE = 512
 DEFAULT_TOP_K = 8
 DEFAULT_BASELINE_FFN_MS = 98.761
 DEFAULT_BASELINE_SOURCE = "2026-05-23 static-topn warm default ffn_ms_avg"
+DEFAULT_GATE_MAX_RHS_GIB = 16.0
+DEFAULT_GATE_MAX_RATIO = 0.90
+DEFAULT_GATE_MIN_PARTIAL_COVERAGE = 0.50
+DEFAULT_GATE_MIN_FULL_HIT_CALL_RATE = 0.50
 
 
 def parse_key_values(line: str) -> dict[str, str]:
@@ -301,6 +305,140 @@ def choose_recommendation(evaluation: dict[str, Any], cost: dict[str, Any]) -> s
     return "raise_capacity_or_use_fused_int4"
 
 
+def append_gate_failure(
+    failures: list[str],
+    condition: bool,
+    failure: str,
+) -> None:
+    if not condition:
+        failures.append(failure)
+
+
+def build_candidate_gate(
+    row: dict[str, Any],
+    kind: str,
+    max_rhs_gib: float,
+    max_ratio: float,
+    min_partial_coverage: float,
+    min_full_hit_call_rate: float,
+) -> dict[str, Any]:
+    evaluation = row["evaluation_static_topn"]
+    rhs = row["resident_mps_rhs"]
+    cost = row["cost_model"]
+    failures: list[str] = []
+    status_ok = cost.get("status") == "ok"
+    rhs_gib = float(rhs.get("total_gib", 0.0))
+    coverage = float(evaluation.get("coverage", 0.0))
+    full_hit_rate = float(evaluation.get("full_hit_call_rate", 0.0))
+    append_gate_failure(failures, status_ok, "missing_usable_mps_pilot")
+    append_gate_failure(failures, rhs_gib <= max_rhs_gib, "resident_rhs_too_large")
+
+    if kind == "full_hit_only":
+        estimate = cost.get("full_hit_only_ms_per_token_est")
+        estimate_ratio = cost.get("full_hit_only_ratio")
+        append_gate_failure(
+            failures,
+            full_hit_rate >= min_full_hit_call_rate,
+            "full_hit_rate_below_threshold",
+        )
+    elif kind == "partial_hit_optimistic":
+        estimate = cost.get("partial_hit_optimistic_ms_per_token_est")
+        estimate_ratio = cost.get("partial_hit_optimistic_ratio")
+        append_gate_failure(
+            failures,
+            coverage >= min_partial_coverage,
+            "coverage_below_threshold",
+        )
+    else:
+        raise ValueError(f"unknown gate candidate kind {kind!r}")
+
+    append_gate_failure(failures, estimate_ratio is not None, "missing_estimate")
+    if estimate_ratio is not None:
+        append_gate_failure(
+            failures,
+            float(estimate_ratio) <= max_ratio,
+            "estimate_not_fast_enough",
+        )
+
+    return {
+        "kind": kind,
+        "capacity": row["capacity"],
+        "passed": not failures,
+        "failures": failures,
+        "estimated_ms_per_token": estimate,
+        "estimated_ratio": estimate_ratio,
+        "resident_mps_rhs_gib": rhs_gib,
+        "coverage": coverage,
+        "full_hit_call_rate": full_hit_rate,
+        "requires_no_per_token_rebuild": kind == "partial_hit_optimistic",
+    }
+
+
+def build_viability_gate(
+    rows: list[dict[str, Any]],
+    max_rhs_gib: float = DEFAULT_GATE_MAX_RHS_GIB,
+    max_ratio: float = DEFAULT_GATE_MAX_RATIO,
+    min_partial_coverage: float = DEFAULT_GATE_MIN_PARTIAL_COVERAGE,
+    min_full_hit_call_rate: float = DEFAULT_GATE_MIN_FULL_HIT_CALL_RATE,
+) -> dict[str, Any]:
+    candidates: list[dict[str, Any]] = []
+    for row in rows:
+        candidates.append(
+            build_candidate_gate(
+                row,
+                "full_hit_only",
+                max_rhs_gib,
+                max_ratio,
+                min_partial_coverage,
+                min_full_hit_call_rate,
+            )
+        )
+        candidates.append(
+            build_candidate_gate(
+                row,
+                "partial_hit_optimistic",
+                max_rhs_gib,
+                max_ratio,
+                min_partial_coverage,
+                min_full_hit_call_rate,
+            )
+        )
+    passed = [candidate for candidate in candidates if candidate["passed"]]
+    full_hit_passes = [
+        candidate for candidate in passed if candidate["kind"] == "full_hit_only"
+    ]
+    partial_passes = [
+        candidate for candidate in passed if candidate["kind"] == "partial_hit_optimistic"
+    ]
+    if full_hit_passes:
+        recommendation = "prototype_full_hit_resident_mps"
+    elif partial_passes:
+        recommendation = "prototype_partial_hit_resident_mps"
+    elif any(row["cost_model"].get("status") != "ok" for row in rows):
+        recommendation = "measure_mps_pilot"
+    else:
+        recommendation = "reject_resident_mps_for_now"
+    best = min(
+        passed,
+        key=lambda candidate: candidate.get("estimated_ratio")
+        if candidate.get("estimated_ratio") is not None
+        else float("inf"),
+        default=None,
+    )
+    return {
+        "passed": bool(passed),
+        "recommendation": recommendation,
+        "best_candidate": best,
+        "thresholds": {
+            "max_rhs_gib": max_rhs_gib,
+            "max_ratio": max_ratio,
+            "min_partial_coverage": min_partial_coverage,
+            "min_full_hit_call_rate": min_full_hit_call_rate,
+        },
+        "candidates": candidates,
+    }
+
+
 def build_report(
     static_report: dict[str, Any],
     pilot: dict[str, Any] | None,
@@ -310,6 +448,10 @@ def build_report(
     top_k: int,
     baseline_ffn_ms: float,
     baseline_source: str,
+    gate_max_rhs_gib: float = DEFAULT_GATE_MAX_RHS_GIB,
+    gate_max_ratio: float = DEFAULT_GATE_MAX_RATIO,
+    gate_min_partial_coverage: float = DEFAULT_GATE_MIN_PARTIAL_COVERAGE,
+    gate_min_full_hit_call_rate: float = DEFAULT_GATE_MIN_FULL_HIT_CALL_RATE,
 ) -> dict[str, Any]:
     rows: list[dict[str, Any]] = []
     for static_row in static_report.get("rows", []):
@@ -347,6 +489,13 @@ def build_report(
             ),
         )
 
+    viability_gate = build_viability_gate(
+        rows,
+        gate_max_rhs_gib,
+        gate_max_ratio,
+        gate_min_partial_coverage,
+        gate_min_full_hit_call_rate,
+    )
     return {
         "schema": SCHEMA,
         "model": MODEL,
@@ -358,6 +507,12 @@ def build_report(
         "baseline": {
             "ffn_ms_per_token": baseline_ffn_ms,
             "source": baseline_source,
+        },
+        "viability_thresholds": {
+            "max_rhs_gib": gate_max_rhs_gib,
+            "max_ratio": gate_max_ratio,
+            "min_partial_coverage": gate_min_partial_coverage,
+            "min_full_hit_call_rate": gate_min_full_hit_call_rate,
         },
         "pilot": pilot or {"source": "none", "status": "missing"},
         "rows": rows,
@@ -371,6 +526,7 @@ def build_report(
             )
             if best_partial
             else None,
+            "viability_gate": viability_gate,
         },
     }
 
@@ -394,8 +550,12 @@ def fmt_pct(value: Any) -> str:
 
 
 def render_markdown(report: dict[str, Any]) -> str:
+    viability_gate = (report.get("summary") or {}).get("viability_gate") or {}
     lines = [
         "# Qwen3.6 MPS Resident Table Probe",
+        "",
+        f"- viability_gate_passed: `{viability_gate.get('passed', False)}`",
+        f"- viability_gate_recommendation: `{viability_gate.get('recommendation', '-')}`",
         "",
         "| Capacity | Eval coverage | Full-hit calls | Fallback calls | MPS RHS GiB | All-resident MPS ms/tok | Full-hit-only est | Partial-hit optimistic est | Recommendation |",
         "|---:|---:|---:|---:|---:|---:|---:|---:|:---|",
@@ -423,6 +583,35 @@ def render_markdown(report: dict[str, Any]) -> str:
             "The all-resident column is the FP16 MPS pilot cost if every routed expert for every layer were resident. The full-hit-only estimate falls back to the default FFN lane whenever a layer has any miss. The partial-hit estimate is deliberately optimistic: it assumes resident assignments and miss assignments can be split without an extra per-token FP16 table rebuild.",
         ]
     )
+    candidates = viability_gate.get("candidates") or []
+    if candidates:
+        lines.extend(
+            [
+                "",
+                "## Viability Gate",
+                "",
+                "| Candidate | Capacity | Passed | Ratio | RHS GiB | Coverage | Full-hit rate | Failures |",
+                "|:---|---:|:---:|---:|---:|---:|---:|:---|",
+            ]
+        )
+        for candidate in candidates:
+            failures = candidate.get("failures") or []
+            lines.append(
+                "| {kind} | {capacity} | {passed} | {ratio} | {rhs} | {coverage} | {full_hit} | {failures} |".format(
+                    kind=candidate.get("kind"),
+                    capacity=candidate.get("capacity"),
+                    passed=str(candidate.get("passed", False)).lower(),
+                    ratio=fmt_pct(candidate.get("estimated_ratio")),
+                    rhs=fmt_ms(candidate.get("resident_mps_rhs_gib")),
+                    coverage=fmt_pct(candidate.get("coverage")),
+                    full_hit=fmt_pct(candidate.get("full_hit_call_rate")),
+                    failures=", ".join(str(item) for item in failures) or "-",
+                )
+            )
+        lines.append("")
+        lines.append(
+            "The gate is nonfatal and estimates implementation viability, not runtime promotion. A partial-hit candidate is only a reason to prototype if it can be implemented without rebuilding FP16 RHS data per token; the runtime sweep remains the authority for promotion."
+        )
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -449,6 +638,30 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K)
     parser.add_argument("--baseline-ffn-ms", type=float, default=DEFAULT_BASELINE_FFN_MS)
     parser.add_argument("--baseline-source", default=DEFAULT_BASELINE_SOURCE)
+    parser.add_argument(
+        "--gate-max-rhs-gib",
+        type=float,
+        default=DEFAULT_GATE_MAX_RHS_GIB,
+        help="maximum resident FP16 RHS footprint for an MPS table candidate",
+    )
+    parser.add_argument(
+        "--gate-max-ratio",
+        type=float,
+        default=DEFAULT_GATE_MAX_RATIO,
+        help="maximum estimate/default FFN ratio for viability",
+    )
+    parser.add_argument(
+        "--gate-min-partial-coverage",
+        type=float,
+        default=DEFAULT_GATE_MIN_PARTIAL_COVERAGE,
+        help="minimum assignment coverage for a partial-hit candidate",
+    )
+    parser.add_argument(
+        "--gate-min-full-hit-call-rate",
+        type=float,
+        default=DEFAULT_GATE_MIN_FULL_HIT_CALL_RATE,
+        help="minimum full-hit layer-call rate for a full-hit-only candidate",
+    )
     parser.add_argument("--prompt", default="Hello")
     parser.add_argument("--context-size", type=int, default=64)
     parser.add_argument("--max-new-tokens", type=int, default=1)
@@ -509,6 +722,10 @@ def main(argv: list[str]) -> int:
         args.top_k,
         args.baseline_ffn_ms,
         args.baseline_source,
+        args.gate_max_rhs_gib,
+        args.gate_max_ratio,
+        args.gate_min_partial_coverage,
+        args.gate_min_full_hit_call_rate,
     )
     report["run_meta"] = run_meta
 

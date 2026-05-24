@@ -619,6 +619,13 @@ improve headline ms/token and `ffn_ms_avg`, keep full-attention,
 linear-attention, and lm-head inside the configured regression ratio, and carry
 command-buffer-wait profile evidence unless `--no-promotion-require-profile` is
 used.
+The MPS resident-table probe writes
+`target/qwen36_mps_resident_table_probe.json` and
+`target/qwen36_mps_resident_table_probe.md`. Its v2 `viability_gate` is an
+estimate gate, not a runtime promotion gate: full-hit-only and partial-hit
+candidates must fit the configured resident RHS budget and meet projected FFN
+speedup, coverage, and full-hit-rate thresholds. A passing partial-hit estimate
+still requires a runtime path that avoids per-token FP16 RHS rebuilds.
 The current M5 Max perf gate points at linear-attention as the next measured
 multi-token per-token bucket after FFN fallback tightening. The 512-token
 `--metal-profile` smoke currently reports roughly 269 ms/token, 71.7 s prefill,

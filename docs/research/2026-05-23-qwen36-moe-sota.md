@@ -476,6 +476,11 @@ under the same smoke:
    bridge, and estimates 87.58 ms/token only under the optimistic partial-hit
    model. The next runtime implementation should therefore be a partial-hit
    resident table, not another full-hit-only static bridge.
+   A follow-up v2 schema adds a nonfatal `viability_gate` to this probe. It
+   evaluates full-hit-only and optimistic partial-hit candidates against
+   resident RHS footprint, projected FFN speedup, route coverage, and full-hit
+   thresholds, while keeping the runtime sweep as the authority for actual
+   promotion.
    The first partial-hit runtime prototype is now env-gated behind
    `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_MPS_STATIC_TOPN_PARTIAL=1`.
    It caches a per-layer FP16 MPS RHS table for the static top-N experts,

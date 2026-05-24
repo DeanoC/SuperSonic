@@ -1295,7 +1295,11 @@ prefill/orchestration buckets already shown to dominate long-context runs.
 explicit gate. It consumes `target/qwen36_static_topn_mps_probe.json`, optionally
 runs the existing `[qwen36-moe mps-expert-pilot]` row, and writes
 `target/qwen36_mps_resident_table_probe.{json,md}` with all-resident MPS,
-full-hit-only, and optimistic partial-hit estimates. The first direct
+full-hit-only, and optimistic partial-hit estimates. The v2 report adds a
+nonfatal `viability_gate` with resident-RHS size, projected speedup, assignment
+coverage, and full-hit-rate thresholds; a passing partial-hit row is a reason
+to prototype only if the runtime can avoid per-token FP16 RHS rebuilds, not a
+default-promotion signal. The first direct
 `--run-pilot` smoke measured `gate_up_ms=1.312` and `down_ms=0.757`, giving an
 all-resident FP16 MPS floor of 82.76 ms/token versus the 98.761 ms/token
 default FFN baseline. Capacity 64 costs 15.00 GiB of FP16 MPS RHS storage,
