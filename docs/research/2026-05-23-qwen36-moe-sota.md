@@ -1732,6 +1732,53 @@ under the same smoke:
    shared-down, or promote this path under a documented tolerance/eval policy
    instead of a checksum gate.
 
+49. **Qwen3.6 explicit layer-output tolerance gate**
+   The fused-routed sweep is now schema `v26`. It adds
+   `--layer-output-delta-all`, which leaves the runtime's layer-output delta
+   filters unset so every tapped position/layer/phase row emits the full BF16
+   payload for numeric comparison. It also adds an explicit opt-in promotion
+   policy:
+   `--promotion-allow-layer-output-tolerance`,
+   `--promotion-layer-output-max-abs-delta`,
+   `--promotion-layer-output-max-ulp-delta`, and
+   `--promotion-layer-output-max-differing-elems`. Strict checksum parity
+   remains the default. With tolerance enabled, a layer-output checksum
+   mismatch is waived only when a matching numeric delta row exists and proves
+   the mismatch is within all configured limits; missing or over-limit delta
+   evidence still fails the nonfatal promotion gate.
+
+   The validation run used `--modes default,full-stage5-router-simd-batch
+   --max-new-tokens 1 --metal-profile --layer-output-tap
+   --layer-output-delta-tap --layer-output-delta-all
+   --promotion-allow-layer-output-tolerance
+   --promotion-layer-output-max-abs-delta 0.0005
+   --promotion-layer-output-max-ulp-delta 1
+   --promotion-layer-output-max-differing-elems 1
+   --no-promotion-require-profile`, writing
+   `/private/tmp/qwen36_layer_output_tolerance_v26_1tok.{json,md}`. The run
+   emitted `160` delta rows and compared `80` candidate rows. Generated IDs
+   matched for the one sampled token, but the tolerance gate still rejected the
+   candidate: `65` layer-output checksums differed, only the first layer-7 FFN
+   row was within the one-ULP/one-element policy, and `64` rows exceeded or
+   propagated beyond that tolerance.
+
+   The first tolerated row is the known BF16 cliff at position `0`, layer `7`,
+   phase `ffn`, index `1621`: `differing_elems=1`,
+   `max_abs_delta=0.00048828125`, and `max_ulp_delta=1`. The first
+   untolerated row is immediately next, position `0`, layer `8`, phase `attn`:
+   `differing_elems=125`, `max_abs_delta=0.0009765625`, and
+   `max_ulp_delta=128`. Across the full one-token hidden stream,
+   `max_abs_delta` reached `0.15625`, `max_ulp_delta` reached `31081`, and
+   `max_differing_elems` reached `1991`.
+
+   This makes the promotion policy explicit without weakening the default
+   correctness gate. A hidden-row one-ULP tolerance can explain the first
+   rounding cliff, but it cannot promote the current decode-batch path once the
+   drift propagates through later layers. The next useful implementation choice
+   is now sharper: either make shared-mid/output materialization bit-exact
+   before layer `8`, or move to a separate eval/logit-level acceptance policy
+   that is intentionally broader than hidden-stream parity.
+
 ## Sources
 
 - [Qwen/Qwen3.6-35B-A3B model card](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)

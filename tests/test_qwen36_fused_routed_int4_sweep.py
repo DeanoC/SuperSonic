@@ -464,6 +464,7 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
             downstream_parity_tap=False,
             layer_output_tap=True,
             layer_output_delta_tap=True,
+            layer_output_delta_all=False,
             layer_output_delta_position=0,
             layer_output_delta_layer=0,
             layer_output_delta_phase="ffn",
@@ -489,6 +490,22 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
             layer_output_default["SUPERSONIC_QWEN36_LAYER_OUTPUT_DELTA_TAP_PHASE"],
             "ffn",
         )
+        layer_output_all_args = Namespace(
+            metal_profile=False,
+            metal_profile_phases=False,
+            downstream_parity_tap=False,
+            layer_output_tap=True,
+            layer_output_delta_tap=True,
+            layer_output_delta_all=True,
+            layer_output_delta_position=0,
+            layer_output_delta_layer=0,
+            layer_output_delta_phase="ffn",
+        )
+        layer_output_all = script.build_env_overrides(layer_output_all_args, "default")
+        self.assertEqual(layer_output_all["SUPERSONIC_QWEN36_LAYER_OUTPUT_DELTA_TAP"], "1")
+        self.assertNotIn("SUPERSONIC_QWEN36_LAYER_OUTPUT_DELTA_TAP_POSITION", layer_output_all)
+        self.assertNotIn("SUPERSONIC_QWEN36_LAYER_OUTPUT_DELTA_TAP_LAYER", layer_output_all)
+        self.assertNotIn("SUPERSONIC_QWEN36_LAYER_OUTPUT_DELTA_TAP_PHASE", layer_output_all)
 
         tap_args = Namespace(
             metal_profile=False,
@@ -686,6 +703,54 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
         self.assertEqual(prompt["layer_output_checksum_mismatches"], 1)
         self.assertEqual(prompt["layer_output_first_mismatch"]["layer"], 0)
         self.assertEqual(prompt["layer_output_first_mismatch"]["phase"], "ffn")
+
+    def test_promotion_gate_can_tolerate_proven_layer_output_delta(self):
+        script = sweep_qwen36_fused_routed_int4
+        baseline = row("default", ids=[11, 271])
+        candidate = row("direct-gather", ids=[11, 271], headline=90.0, ffn=40.0, wait=9.0)
+        baseline["layer_output_taps"] = [
+            {"position": 0, "layer": 7, "phase": "ffn", "checksum": "baseline"},
+        ]
+        candidate["layer_output_taps"] = [
+            {"position": 0, "layer": 7, "phase": "ffn", "checksum": "candidate"},
+        ]
+        baseline["layer_output_delta_taps"] = [
+            {
+                "position": 0,
+                "layer": 7,
+                "phase": "ffn",
+                "path": "chained",
+                "checksum": "baseline",
+                "bf16": "bdc1",
+            }
+        ]
+        candidate["layer_output_delta_taps"] = [
+            {
+                "position": 0,
+                "layer": 7,
+                "phase": "ffn",
+                "path": "decode_batch",
+                "checksum": "candidate",
+                "bf16": "bdc2",
+            }
+        ]
+
+        gate = script.build_promotion_gate(
+            [baseline, candidate],
+            ["default", "direct-gather"],
+            allow_layer_output_tolerance=True,
+            layer_output_max_abs_delta=0.001,
+            layer_output_max_ulp_delta=1,
+            layer_output_max_differing_elems=1,
+        )
+
+        self.assertTrue(gate["passed"])
+        self.assertEqual(gate["passed_modes"], ["direct-gather"])
+        prompt = gate["candidates"][0]["prompts"][0]
+        self.assertEqual(prompt["layer_output_checksum_mismatches"], 1)
+        self.assertEqual(prompt["layer_output_tolerated_checksum_mismatches"], 1)
+        self.assertEqual(prompt["layer_output_untolerated_checksum_mismatches"], 0)
+        self.assertNotIn("prompt_hello:layer_output_checksum_mismatch", gate["candidates"][0]["failures"])
 
     def test_render_markdown_includes_gate_rows(self):
         script = sweep_qwen36_fused_routed_int4

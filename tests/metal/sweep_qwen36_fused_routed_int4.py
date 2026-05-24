@@ -16,7 +16,7 @@ from typing import Any
 
 
 MODEL = "qwen3.6-35b-a3b"
-SCHEMA = "qwen36-fused-routed-int4-sweep-v25"
+SCHEMA = "qwen36-fused-routed-int4-sweep-v26"
 DEFAULT_MAX_FUSED_WALL_GPU_RATIO = 4.0
 DEFAULT_MAX_WAIT_GPU_RATIO = 4.0
 COARSE_BATCH_SERIAL_MODE = "full-stage5-router-batch"
@@ -996,6 +996,21 @@ def summarize_layer_output_delta_taps(rows: list[dict[str, Any]]) -> dict[str, A
     }
 
 
+def layer_output_delta_comparisons_by_key(
+    rows: list[dict[str, Any]],
+) -> dict[tuple[str, str, int, int, str], dict[str, Any]]:
+    return {
+        (
+            str(item.get("prompt_id", "")),
+            str(item.get("mode", "")),
+            int(item.get("position", 0)),
+            int(item.get("layer", -1)),
+            str(item.get("phase", "-")),
+        ): item
+        for item in compare_layer_output_delta_taps(rows)
+    }
+
+
 def matching_decode_batch_tap(
     row: dict[str, Any],
     field: str,
@@ -1426,15 +1441,16 @@ def build_env_overrides(args: argparse.Namespace, mode: str) -> dict[str, str]:
         overrides["SUPERSONIC_QWEN36_LAYER_OUTPUT_TAP"] = "1"
     if getattr(args, "layer_output_delta_tap", False):
         overrides["SUPERSONIC_QWEN36_LAYER_OUTPUT_DELTA_TAP"] = "1"
-        layer = getattr(args, "layer_output_delta_layer", None)
-        if layer is not None:
-            overrides["SUPERSONIC_QWEN36_LAYER_OUTPUT_DELTA_TAP_LAYER"] = str(layer)
-        position = getattr(args, "layer_output_delta_position", None)
-        if position is not None:
-            overrides["SUPERSONIC_QWEN36_LAYER_OUTPUT_DELTA_TAP_POSITION"] = str(position)
-        phase = getattr(args, "layer_output_delta_phase", None)
-        if phase:
-            overrides["SUPERSONIC_QWEN36_LAYER_OUTPUT_DELTA_TAP_PHASE"] = str(phase)
+        if not getattr(args, "layer_output_delta_all", False):
+            layer = getattr(args, "layer_output_delta_layer", None)
+            if layer is not None:
+                overrides["SUPERSONIC_QWEN36_LAYER_OUTPUT_DELTA_TAP_LAYER"] = str(layer)
+            position = getattr(args, "layer_output_delta_position", None)
+            if position is not None:
+                overrides["SUPERSONIC_QWEN36_LAYER_OUTPUT_DELTA_TAP_POSITION"] = str(position)
+            phase = getattr(args, "layer_output_delta_phase", None)
+            if phase:
+                overrides["SUPERSONIC_QWEN36_LAYER_OUTPUT_DELTA_TAP_PHASE"] = str(phase)
     if getattr(args, "router_parity_tap", False):
         overrides["SUPERSONIC_METAL_QWEN36_FFN_ROUTER_STAGE5_PARITY_TAP"] = "1"
         max_calls = getattr(args, "router_parity_tap_max_calls", None)
@@ -1971,6 +1987,12 @@ def append_ratio_gate(
 def layer_output_pair_status(
     baseline: dict[str, Any],
     row: dict[str, Any],
+    *,
+    delta_by_key: dict[tuple[str, str, int, int, str], dict[str, Any]] | None = None,
+    allow_tolerance: bool = False,
+    max_abs_delta: float = 0.0,
+    max_ulp_delta: int = 0,
+    max_differing_elems: int = 0,
 ) -> dict[str, Any] | None:
     baseline_taps = baseline.get("layer_output_taps") or []
     candidate_taps = row.get("layer_output_taps") or []
@@ -2014,8 +2036,12 @@ def layer_output_pair_status(
 
     compared_rows = 0
     checksum_mismatches = 0
+    tolerated_checksum_mismatches = 0
+    untolerated_checksum_mismatches = 0
     missing_candidate_rows = 0
     first_mismatch: dict[str, Any] | None = None
+    first_untolerated_mismatch: dict[str, Any] | None = None
+    tolerance_examples: list[dict[str, Any]] = []
     for key, baseline_tap in baseline_by_key.items():
         candidate_tap = candidate_by_key.get(key)
         if candidate_tap is None:
@@ -2033,23 +2059,71 @@ def layer_output_pair_status(
         compared_rows += 1
         if candidate_tap.get("checksum") != baseline_tap.get("checksum"):
             checksum_mismatches += 1
+            mismatch = {
+                "position": key[0],
+                "layer": key[1],
+                "phase": key[2],
+                "baseline_checksum": baseline_tap.get("checksum"),
+                "candidate_checksum": candidate_tap.get("checksum"),
+                "reason": "checksum_mismatch",
+            }
             if first_mismatch is None:
-                first_mismatch = {
-                    "position": key[0],
-                    "layer": key[1],
-                    "phase": key[2],
-                    "baseline_checksum": baseline_tap.get("checksum"),
-                    "candidate_checksum": candidate_tap.get("checksum"),
-                    "reason": "checksum_mismatch",
-                }
+                first_mismatch = dict(mismatch)
+            delta = None if delta_by_key is None else delta_by_key.get(
+                (
+                    str(baseline.get("prompt_id", "")),
+                    str(row.get("mode", "")),
+                    key[0],
+                    key[1],
+                    key[2],
+                )
+            )
+            delta_ok = (
+                allow_tolerance
+                and delta is not None
+                and delta.get("status") == "ok"
+                and bool(delta.get("length_match"))
+                and float(delta.get("max_abs_delta") or 0.0) <= max_abs_delta
+                and int(delta.get("max_ulp_delta") or 0) <= max_ulp_delta
+                and int(delta.get("differing_elems") or 0) <= max_differing_elems
+            )
+            if delta_ok:
+                tolerated_checksum_mismatches += 1
+                if len(tolerance_examples) < 20:
+                    tolerance_examples.append(
+                        {
+                            **mismatch,
+                            "max_abs_delta": delta.get("max_abs_delta"),
+                            "max_ulp_delta": delta.get("max_ulp_delta"),
+                            "differing_elems": delta.get("differing_elems"),
+                        }
+                    )
+            else:
+                untolerated_checksum_mismatches += 1
+                reason = "layer_output_tolerance_disabled"
+                if allow_tolerance:
+                    reason = "missing_layer_output_delta"
+                    if delta is not None:
+                        reason = "layer_output_tolerance_exceeded"
+                mismatch["reason"] = reason
+                if delta is not None:
+                    mismatch["max_abs_delta"] = delta.get("max_abs_delta")
+                    mismatch["max_ulp_delta"] = delta.get("max_ulp_delta")
+                    mismatch["differing_elems"] = delta.get("differing_elems")
+                if first_untolerated_mismatch is None:
+                    first_untolerated_mismatch = mismatch
 
     return {
         "available": True,
         "status": "ok",
         "compared_rows": compared_rows,
         "checksum_mismatches": checksum_mismatches,
+        "tolerated_checksum_mismatches": tolerated_checksum_mismatches,
+        "untolerated_checksum_mismatches": untolerated_checksum_mismatches,
         "missing_candidate_rows": missing_candidate_rows,
         "first_mismatch": first_mismatch,
+        "first_untolerated_mismatch": first_untolerated_mismatch,
+        "tolerance_examples": tolerance_examples,
     }
 
 
@@ -2061,6 +2135,10 @@ def build_promotion_gate(
     max_component_regression_ratio: float = 1.10,
     max_command_buffer_wait_ratio: float = 1.05,
     require_profile: bool = True,
+    allow_layer_output_tolerance: bool = False,
+    layer_output_max_abs_delta: float = 0.0,
+    layer_output_max_ulp_delta: int = 0,
+    layer_output_max_differing_elems: int = 0,
 ) -> dict[str, Any]:
     prompt_ids: list[str] = []
     for row in rows:
@@ -2072,6 +2150,7 @@ def build_promotion_gate(
         for row in rows
     }
     candidate_modes = [mode for mode in modes if mode != "default"]
+    delta_by_key = layer_output_delta_comparisons_by_key(rows)
     candidates: list[dict[str, Any]] = []
     for mode in candidate_modes:
         failures: list[str] = []
@@ -2096,7 +2175,15 @@ def build_promotion_gate(
             prompt_failures: list[str] = []
             if (row.get("generated_ids") or []) != (baseline.get("generated_ids") or []):
                 prompt_failures.append("generated_ids_mismatch")
-            layer_output_status = layer_output_pair_status(baseline, row)
+            layer_output_status = layer_output_pair_status(
+                baseline,
+                row,
+                delta_by_key=delta_by_key,
+                allow_tolerance=allow_layer_output_tolerance,
+                max_abs_delta=layer_output_max_abs_delta,
+                max_ulp_delta=layer_output_max_ulp_delta,
+                max_differing_elems=layer_output_max_differing_elems,
+            )
             if layer_output_status is not None:
                 prompt_result["layer_output_compared_rows"] = layer_output_status.get(
                     "compared_rows"
@@ -2104,11 +2191,23 @@ def build_promotion_gate(
                 prompt_result["layer_output_checksum_mismatches"] = layer_output_status.get(
                     "checksum_mismatches"
                 )
+                prompt_result["layer_output_tolerated_checksum_mismatches"] = (
+                    layer_output_status.get("tolerated_checksum_mismatches")
+                )
+                prompt_result["layer_output_untolerated_checksum_mismatches"] = (
+                    layer_output_status.get("untolerated_checksum_mismatches")
+                )
                 prompt_result["layer_output_missing_candidate_rows"] = layer_output_status.get(
                     "missing_candidate_rows"
                 )
                 prompt_result["layer_output_first_mismatch"] = layer_output_status.get(
                     "first_mismatch"
+                )
+                prompt_result["layer_output_first_untolerated_mismatch"] = (
+                    layer_output_status.get("first_untolerated_mismatch")
+                )
+                prompt_result["layer_output_tolerance_examples"] = (
+                    layer_output_status.get("tolerance_examples")
                 )
                 if layer_output_status.get("status") == "missing_baseline":
                     prompt_failures.append("missing_layer_output_baseline")
@@ -2116,7 +2215,11 @@ def build_promotion_gate(
                     prompt_failures.append("missing_layer_output_candidate")
                 else:
                     if int(layer_output_status.get("checksum_mismatches") or 0) > 0:
-                        prompt_failures.append("layer_output_checksum_mismatch")
+                        if allow_layer_output_tolerance:
+                            if int(layer_output_status.get("untolerated_checksum_mismatches") or 0) > 0:
+                                prompt_failures.append("layer_output_tolerance_exceeded")
+                        else:
+                            prompt_failures.append("layer_output_checksum_mismatch")
                     if int(layer_output_status.get("missing_candidate_rows") or 0) > 0:
                         prompt_failures.append("layer_output_missing_candidate_rows")
             append_ratio_gate(
@@ -2214,6 +2317,10 @@ def build_promotion_gate(
             "max_command_buffer_wait_ratio": max_command_buffer_wait_ratio,
             "require_profile": require_profile,
             "require_layer_output_parity_when_tapped": True,
+            "allow_layer_output_tolerance": allow_layer_output_tolerance,
+            "layer_output_max_abs_delta": layer_output_max_abs_delta,
+            "layer_output_max_ulp_delta": layer_output_max_ulp_delta,
+            "layer_output_max_differing_elems": layer_output_max_differing_elems,
         },
         "candidates": candidates,
     }
@@ -2575,6 +2682,10 @@ def summarize_with_gate(
     require_profile: bool = True,
     max_fused_wall_gpu_ratio: float = DEFAULT_MAX_FUSED_WALL_GPU_RATIO,
     max_wait_gpu_ratio: float = DEFAULT_MAX_WAIT_GPU_RATIO,
+    allow_layer_output_tolerance: bool = False,
+    layer_output_max_abs_delta: float = 0.0,
+    layer_output_max_ulp_delta: int = 0,
+    layer_output_max_differing_elems: int = 0,
 ) -> dict[str, Any]:
     summary = summarize(rows)
     summary["promotion_gate"] = build_promotion_gate(
@@ -2585,6 +2696,10 @@ def summarize_with_gate(
         max_component_regression_ratio,
         max_command_buffer_wait_ratio,
         require_profile,
+        allow_layer_output_tolerance,
+        layer_output_max_abs_delta,
+        layer_output_max_ulp_delta,
+        layer_output_max_differing_elems,
     )
     summary["ffn_residency_gap"] = build_ffn_residency_gap(
         rows,
@@ -2618,6 +2733,10 @@ def build_report(
         args.promotion_require_profile,
         args.promotion_max_fused_wall_gpu_ratio,
         args.promotion_max_wait_gpu_ratio,
+        getattr(args, "promotion_allow_layer_output_tolerance", False),
+        getattr(args, "promotion_layer_output_max_abs_delta", 0.0),
+        getattr(args, "promotion_layer_output_max_ulp_delta", 0),
+        getattr(args, "promotion_layer_output_max_differing_elems", 0),
     )
     summary["router_parity"] = summarize_router_parity_taps(rows)
     summary["shared_parity"] = summarize_shared_parity_taps(rows)
@@ -2650,6 +2769,7 @@ def build_report(
         "downstream_parity_tap": getattr(args, "downstream_parity_tap", False),
         "layer_output_tap": getattr(args, "layer_output_tap", False),
         "layer_output_delta_tap": getattr(args, "layer_output_delta_tap", False),
+        "layer_output_delta_all": getattr(args, "layer_output_delta_all", False),
         "layer_output_delta_layer": getattr(args, "layer_output_delta_layer", None),
         "layer_output_delta_position": getattr(args, "layer_output_delta_position", None),
         "layer_output_delta_phase": getattr(args, "layer_output_delta_phase", None),
@@ -2668,6 +2788,18 @@ def build_report(
             "max_fused_wall_gpu_ratio": args.promotion_max_fused_wall_gpu_ratio,
             "max_wait_gpu_ratio": args.promotion_max_wait_gpu_ratio,
             "require_profile": args.promotion_require_profile,
+            "allow_layer_output_tolerance": getattr(
+                args, "promotion_allow_layer_output_tolerance", False
+            ),
+            "layer_output_max_abs_delta": getattr(
+                args, "promotion_layer_output_max_abs_delta", 0.0
+            ),
+            "layer_output_max_ulp_delta": getattr(
+                args, "promotion_layer_output_max_ulp_delta", 0
+            ),
+            "layer_output_max_differing_elems": getattr(
+                args, "promotion_layer_output_max_differing_elems", 0
+            ),
         },
         "summary": summary,
         "rows": rows,
@@ -2712,6 +2844,11 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- downstream_parity_tap: `{report.get('downstream_parity_tap', False)}`",
         f"- layer_output_tap: `{report.get('layer_output_tap', False)}`",
         f"- layer_output_delta_tap: `{report.get('layer_output_delta_tap', False)}`",
+        f"- layer_output_delta_all: `{report.get('layer_output_delta_all', False)}`",
+        f"- promotion_allow_layer_output_tolerance: `{(promotion_gate.get('thresholds') or {}).get('allow_layer_output_tolerance', False)}`",
+        f"- promotion_layer_output_max_abs_delta: `{render_float((promotion_gate.get('thresholds') or {}).get('layer_output_max_abs_delta'), 8)}`",
+        f"- promotion_layer_output_max_ulp_delta: `{(promotion_gate.get('thresholds') or {}).get('layer_output_max_ulp_delta', 0)}`",
+        f"- promotion_layer_output_max_differing_elems: `{(promotion_gate.get('thresholds') or {}).get('layer_output_max_differing_elems', 0)}`",
         f"- router_parity_tap: `{report.get('router_parity_tap', False)}`",
         f"- shared_parity_tap: `{report.get('shared_parity_tap', False)}`",
         f"- routed_parity_tap: `{report.get('routed_parity_tap', False)}`",
@@ -2947,7 +3084,7 @@ def render_markdown(report: dict[str, Any]) -> str:
             )
         lines.append("")
         lines.append(
-            "The gate is nonfatal. A fused routed INT4 mode passes only when generated IDs match default, tapped layer outputs match default when the layer-output tap is enabled, headline ms/token and FFN time improve, full-attention/linear-attention/lm-head stay inside the configured regression threshold, and command-buffer-wait attribution is present and not regressed when profile evidence is required."
+            "The gate is nonfatal. A fused routed INT4 mode passes only when generated IDs match default, tapped layer outputs either match default or every mismatching row is proven within the explicit layer-output tolerance thresholds, headline ms/token and FFN time improve, full-attention/linear-attention/lm-head stay inside the configured regression threshold, and command-buffer-wait attribution is present and not regressed when profile evidence is required."
         )
     gap_candidates = ffn_gap.get("candidates") or []
     if gap_candidates:
@@ -3382,6 +3519,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="emit full BF16 layer-output rows for numeric default-vs-candidate delta comparison",
     )
     parser.add_argument(
+        "--layer-output-delta-all",
+        action="store_true",
+        help="emit numeric layer-output delta rows for every tapped position/layer/phase instead of one filtered row",
+    )
+    parser.add_argument(
         "--layer-output-delta-position",
         type=int,
         default=0,
@@ -3478,6 +3620,29 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="require command_buffer_wait profile evidence for promotion",
+    )
+    parser.add_argument(
+        "--promotion-allow-layer-output-tolerance",
+        action="store_true",
+        help="allow layer-output checksum mismatches only when delta rows prove they are within the explicit numeric thresholds",
+    )
+    parser.add_argument(
+        "--promotion-layer-output-max-abs-delta",
+        type=float,
+        default=0.0,
+        help="maximum per-row BF16 absolute delta allowed when layer-output tolerance is enabled",
+    )
+    parser.add_argument(
+        "--promotion-layer-output-max-ulp-delta",
+        type=int,
+        default=0,
+        help="maximum per-row BF16 ordered-ULP delta allowed when layer-output tolerance is enabled",
+    )
+    parser.add_argument(
+        "--promotion-layer-output-max-differing-elems",
+        type=int,
+        default=0,
+        help="maximum differing BF16 elements allowed per row when layer-output tolerance is enabled",
     )
     parser.add_argument(
         "--out-json",
