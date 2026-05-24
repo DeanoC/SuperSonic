@@ -873,8 +873,9 @@ The local-main-target workflow for this machine is:
 17. fused routed INT4 sweep: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/sweep_qwen36_fused_routed_int4.py --prompt-set smoke --metal-profile`
 18. SOTA gate refresh plan: `python3 tests/metal/refresh_qwen36_sota_gates.py --max-age-hours 24`
 19. SOTA gate summary: `python3 tests/metal/summarize_qwen36_sota_gates.py --require --max-age-hours 24`
-20. routed-expert FFN microbench: `target/release/qwen36_ffn_expert_microbench --iters 20 --warmup 3`
-21. long-context comparison: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/bench_qwen36_longctx.py --preset comparison`
+20. next bottleneck selector: `python3 tests/metal/select_qwen36_next_bottleneck.py --require-selected`
+21. routed-expert FFN microbench: `target/release/qwen36_ffn_expert_microbench --iters 20 --warmup 3`
+22. long-context comparison: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/bench_qwen36_longctx.py --preset comparison`
 
 The Metal long-context harness writes `target/qwen36_metal_longctx.json` and
 `target/qwen36_metal_longctx.md`. It uses deterministic NIAH-style prompts and
@@ -1349,6 +1350,13 @@ that summary: by default it writes
 malformed, schema-mismatched, or missing-gate rows selected; add `--run` to
 execute those trusted local refresh commands in order, or `--only <gate_id>` to
 force-refresh one gate even when its current report is already OK.
+`tests/metal/select_qwen36_next_bottleneck.py` is the follow-up when that
+summary lands on `keep_default_lane_and_select_next_measured_bottleneck`. It
+reads the refreshed gate summary plus the profiled default rows from the
+runtime sweeps, ranks decode buckets, marks FFN exhausted when the resident,
+static, fused, MPS, and LRU forks all have negative runtime evidence, and
+writes `target/qwen36_next_bottleneck.{json,md}` with the next bucket to
+prototype.
 
 The first partial-hit resident MPS runtime prototype is opt-in behind
 `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_MPS_STATIC_TOPN_PARTIAL=1` plus the

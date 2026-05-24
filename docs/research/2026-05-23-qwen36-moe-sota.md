@@ -597,6 +597,17 @@ under the same smoke:
    or missing SOTA gates can be selected in one dry-run artifact before the
    operator chooses `--run`.
 
+12. **Qwen3.6 next-bottleneck selector**
+   Close the loop when every SOTA runtime fork is negative. `tests/metal/select_qwen36_next_bottleneck.py`
+   reads the refreshed SOTA gate summary plus the profiled default rows from
+   the static top-N, fused routed INT4, LRU resident-cache, and batched-prefill
+   sweeps. It ranks decode buckets, records the prefill best-vs-baseline row,
+   preserves top Metal/HAL profile ops, and writes
+   `target/qwen36_next_bottleneck.{json,md}`. If FFN is still the dominant
+   bucket but the resident/static/fused/MPS/LRU FFN forks have all failed or
+   been superseded, the selector names the largest non-exhausted bucket instead
+   of looping back to an already-negative FFN residency path.
+
 ## Sources
 
 - [Qwen/Qwen3.6-35B-A3B model card](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)

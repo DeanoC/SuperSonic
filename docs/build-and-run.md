@@ -669,6 +669,12 @@ commands into a dry-run plan at
 `target/qwen36_sota_gate_refresh_plan.{json,md}`. It selects missing/stale/bad
 inputs by default, supports `--only <gate_id>` for a deliberate one-gate
 refresh, and executes the selected commands only when `--run` is provided.
+When the summary's `next_action` is
+`keep_default_lane_and_select_next_measured_bottleneck`, run
+`tests/metal/select_qwen36_next_bottleneck.py`. It writes
+`target/qwen36_next_bottleneck.{json,md}` by ranking the profiled default-lane
+decode buckets and skipping FFN as an action target once the resident/static/
+fused/MPS/LRU FFN forks are all measured negative.
 The current M5 Max perf gate points at linear-attention as the next measured
 multi-token per-token bucket after FFN fallback tightening. The 512-token
 `--metal-profile` smoke currently reports roughly 269 ms/token, 71.7 s prefill,

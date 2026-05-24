@@ -1,0 +1,466 @@
+#!/usr/bin/env python3
+"""Select the next Qwen3.6 Metal bottleneck after SOTA gates are exhausted."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import statistics
+import sys
+from pathlib import Path
+from typing import Any
+
+
+SCHEMA = "qwen36-next-bottleneck-v1"
+MODEL = "qwen3.6-35b-a3b"
+BACKEND = "metal"
+FALLBACK_ACTION = "keep_default_lane_and_select_next_measured_bottleneck"
+FFN_GATE_IDS = {
+    "static_topn_runtime",
+    "fused_routed_int4",
+    "lru_resident_cache",
+}
+FFN_SUPERSEDED_IDS = {"mps_resident_table", "route_residency"}
+BUCKET_ACTIONS = {
+    "ffn_ms_avg": "prototype_new_ffn_residency_or_compute_path",
+    "linear_attn_ms_avg": "prototype_linear_attention_orchestration",
+    "full_attn_ms_avg": "prototype_full_attention_orchestration",
+    "lm_head_ms_avg": "prototype_lm_head_tail_path",
+}
+
+
+def load_report(path: Path) -> tuple[dict[str, Any] | None, str | None]:
+    if not path.exists():
+        return None, f"missing report: {path}"
+    try:
+        loaded = json.loads(path.read_text())
+    except json.JSONDecodeError as exc:
+        return None, f"malformed json: {exc.msg} at line {exc.lineno} column {exc.colno}"
+    if not isinstance(loaded, dict):
+        return None, "malformed report: top-level JSON value must be an object"
+    return loaded, None
+
+
+def is_default_row(row: dict[str, Any]) -> bool:
+    mode = row.get("mode")
+    sweep_mode = row.get("sweep_mode")
+    return mode == "default" or sweep_mode == "baseline"
+
+
+def row_number(row: dict[str, Any], section: str, key: str) -> float | None:
+    values = row.get(section) or {}
+    if not isinstance(values, dict):
+        return None
+    value = values.get(key)
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def bucket_value(row: dict[str, Any], bucket: str) -> float | None:
+    if bucket == "lm_head_ms_avg":
+        return row_number(row, "stage_timings", bucket)
+    return row_number(row, "chain_breakdown", bucket)
+
+
+def row_label(row: dict[str, Any]) -> str:
+    if row.get("prompt_id") is not None:
+        return str(row["prompt_id"])
+    if row.get("context_tokens_requested") is not None:
+        return f"context_{row['context_tokens_requested']}"
+    return "row"
+
+
+def collect_bucket_samples(
+    reports: dict[str, dict[str, Any]],
+) -> dict[str, list[dict[str, Any]]]:
+    samples: dict[str, list[dict[str, Any]]] = {
+        "ffn_ms_avg": [],
+        "linear_attn_ms_avg": [],
+        "full_attn_ms_avg": [],
+        "lm_head_ms_avg": [],
+    }
+    for report_name, report in reports.items():
+        for row in report.get("rows") or []:
+            if not isinstance(row, dict):
+                continue
+            if row.get("status") != "ok" or not is_default_row(row):
+                continue
+            for bucket in samples:
+                value = bucket_value(row, bucket)
+                if value is None:
+                    continue
+                samples[bucket].append(
+                    {
+                        "source": report_name,
+                        "row": row_label(row),
+                        "mode": row.get("mode") or row.get("sweep_mode"),
+                        "value_ms": value,
+                    }
+                )
+    return samples
+
+
+def summarize_buckets(
+    samples: dict[str, list[dict[str, Any]]],
+    exhausted_buckets: set[str],
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for bucket, bucket_samples in samples.items():
+        if not bucket_samples:
+            continue
+        values = [float(sample["value_ms"]) for sample in bucket_samples]
+        rows.append(
+            {
+                "bucket": bucket,
+                "median_ms": statistics.median(values),
+                "mean_ms": sum(values) / len(values),
+                "max_ms": max(values),
+                "sample_count": len(values),
+                "exhausted": bucket in exhausted_buckets,
+                "samples": bucket_samples,
+            }
+        )
+    rows.sort(key=lambda item: item["median_ms"], reverse=True)
+    return rows
+
+
+def top_profile_entries(
+    reports: dict[str, dict[str, Any]],
+    profile_key: str,
+    limit: int = 8,
+) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    for report_name, report in reports.items():
+        for row in report.get("rows") or []:
+            if not isinstance(row, dict):
+                continue
+            if row.get("status") != "ok" or not is_default_row(row):
+                continue
+            profile = row.get(profile_key) or {}
+            for entry in profile.get("entries") or []:
+                if not isinstance(entry, dict):
+                    continue
+                entries.append(
+                    {
+                        "source": report_name,
+                        "row": row_label(row),
+                        "mode": row.get("mode") or row.get("sweep_mode"),
+                        "op": entry.get("op"),
+                        "path": entry.get("path"),
+                        "total_ms": float(entry.get("total_ms") or 0.0),
+                        "mean_ms": entry.get("mean_ms"),
+                        "calls": entry.get("calls"),
+                    }
+                )
+    entries.sort(key=lambda item: item["total_ms"], reverse=True)
+    return entries[:limit]
+
+
+def summarize_prefill(report: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not report:
+        return None
+    rows = [
+        row
+        for row in report.get("rows") or []
+        if isinstance(row, dict) and row.get("status") == "ok"
+    ]
+    if not rows:
+        return None
+    prefill_rows = []
+    for row in rows:
+        lifecycle = row.get("lifecycle") or {}
+        prefill_total_ms = lifecycle.get("prefill_total_ms")
+        if prefill_total_ms is None:
+            continue
+        prefill_rows.append(
+            {
+                "mode": row.get("sweep_mode") or row.get("mode"),
+                "context_tokens_requested": row.get("context_tokens_requested"),
+                "prefill_total_ms": float(prefill_total_ms),
+            }
+        )
+    if not prefill_rows:
+        return None
+    baseline = next((row for row in prefill_rows if row["mode"] == "baseline"), None)
+    best = min(prefill_rows, key=lambda row: row["prefill_total_ms"])
+    baseline_ms = baseline["prefill_total_ms"] if baseline else None
+    return {
+        "baseline_ms": baseline_ms,
+        "best_mode": best["mode"],
+        "best_ms": best["prefill_total_ms"],
+        "best_vs_baseline": (
+            None if not baseline_ms else best["prefill_total_ms"] / baseline_ms
+        ),
+        "promotion_gate_passed": bool(
+            ((report.get("summary") or {}).get("promotion_gate") or {}).get("passed", False)
+        ),
+        "rows": prefill_rows,
+    }
+
+
+def ffn_gate_family_exhausted(sota_summary: dict[str, Any]) -> bool:
+    failed = set(str(item) for item in sota_summary.get("failed_gate_ids") or [])
+    superseded = set(str(item) for item in sota_summary.get("superseded_gate_ids") or [])
+    return FFN_GATE_IDS.issubset(failed) and FFN_SUPERSEDED_IDS.issubset(superseded)
+
+
+def choose_recommendation(
+    sota_report: dict[str, Any] | None,
+    bucket_rows: list[dict[str, Any]],
+    errors: list[str],
+) -> dict[str, Any]:
+    if errors:
+        return {
+            "status": "input_failure",
+            "action": "refresh_or_repair_input_reports",
+            "reason": "one or more required selector inputs were missing or malformed",
+        }
+    assert sota_report is not None
+    sota_summary = sota_report.get("summary") or {}
+    next_action = (sota_summary.get("next_action") or {}).get("action")
+    if next_action != FALLBACK_ACTION:
+        return {
+            "status": "defer_to_sota_gate_summary",
+            "action": next_action,
+            "reason": "SOTA gate summary still points at a specific gate action",
+        }
+    if not bucket_rows:
+        return {
+            "status": "input_failure",
+            "action": "refresh_profiled_runtime_reports",
+            "reason": "no default runtime rows with chain bucket timings were available",
+        }
+
+    dominant = bucket_rows[0]
+    ffn_exhausted = ffn_gate_family_exhausted(sota_summary)
+    actionable = [row for row in bucket_rows if not row["exhausted"]]
+    target = actionable[0] if actionable else dominant
+    if dominant["bucket"] == "ffn_ms_avg" and ffn_exhausted and actionable:
+        return {
+            "status": "selected",
+            "action": BUCKET_ACTIONS[target["bucket"]],
+            "target_bucket": target["bucket"],
+            "dominant_bucket": dominant["bucket"],
+            "reason": (
+                "FFN remains the largest measured bucket, but current resident, "
+                "static, fused, MPS, and LRU FFN forks have negative runtime gates; "
+                "select the largest non-exhausted bucket next"
+            ),
+        }
+    return {
+        "status": "selected",
+        "action": BUCKET_ACTIONS.get(target["bucket"], "inspect_measured_bucket"),
+        "target_bucket": target["bucket"],
+        "dominant_bucket": dominant["bucket"],
+        "reason": "selected the largest measured default-lane bucket",
+    }
+
+
+def build_report(args: argparse.Namespace) -> dict[str, Any]:
+    input_specs = {
+        "sota_summary": args.sota_json,
+        "static_topn_runtime": args.static_runtime_json,
+        "fused_routed_int4": args.fused_json,
+        "lru_resident_cache": args.lru_json,
+        "batched_prefill_variants": args.prefill_json,
+    }
+    loaded: dict[str, dict[str, Any]] = {}
+    input_reports: dict[str, dict[str, Any]] = {}
+    errors: list[str] = []
+    for name, path in input_specs.items():
+        report, error = load_report(path)
+        input_reports[name] = {
+            "path": str(path),
+            "status": "ok" if error is None else "error",
+            "error": error,
+            "schema": report.get("schema") if report else None,
+        }
+        if error is not None:
+            errors.append(f"{name}: {error}")
+        elif report is not None:
+            loaded[name] = report
+
+    runtime_reports = {
+        name: loaded[name]
+        for name in ("static_topn_runtime", "fused_routed_int4", "lru_resident_cache")
+        if name in loaded
+    }
+    samples = collect_bucket_samples(runtime_reports)
+    sota_report = loaded.get("sota_summary")
+    exhausted_buckets = {"ffn_ms_avg"} if sota_report and ffn_gate_family_exhausted(sota_report.get("summary") or {}) else set()
+    bucket_rows = summarize_buckets(samples, exhausted_buckets)
+    recommendation = choose_recommendation(sota_report, bucket_rows, errors)
+    return {
+        "schema": SCHEMA,
+        "model": MODEL,
+        "backend": BACKEND,
+        "input_reports": input_reports,
+        "errors": errors,
+        "sota_next_action": (
+            (((sota_report or {}).get("summary") or {}).get("next_action") or {}).get("action")
+        ),
+        "recommendation": recommendation,
+        "decode_bucket_ranking": bucket_rows,
+        "prefill": summarize_prefill(loaded.get("batched_prefill_variants")),
+        "top_metal_profile_ops": top_profile_entries(runtime_reports, "metal_profile"),
+        "top_hal_profile_ops": top_profile_entries(runtime_reports, "hal_profile"),
+    }
+
+
+def fmt_float(value: Any, digits: int = 3) -> str:
+    if value is None:
+        return "-"
+    try:
+        return f"{float(value):.{digits}f}"
+    except (TypeError, ValueError):
+        return "-"
+
+
+def fmt_list(values: Any) -> str:
+    if not values:
+        return "-"
+    return ", ".join(str(value) for value in values)
+
+
+def render_markdown(report: dict[str, Any]) -> str:
+    rec = report["recommendation"]
+    prefill = report.get("prefill") or {}
+    lines = [
+        "# Qwen3.6 Metal Next Bottleneck",
+        "",
+        f"- status: `{rec['status']}`",
+        f"- action: `{rec['action']}`",
+        f"- target_bucket: `{rec.get('target_bucket') or '-'}`",
+        f"- dominant_bucket: `{rec.get('dominant_bucket') or '-'}`",
+        f"- sota_next_action: `{report.get('sota_next_action') or '-'}`",
+        f"- reason: {rec['reason']}",
+        "",
+        "## Decode Buckets",
+        "",
+        "| Bucket | Median ms | Mean ms | Max ms | Samples | Exhausted |",
+        "|:---|---:|---:|---:|---:|:---:|",
+    ]
+    for row in report["decode_bucket_ranking"]:
+        lines.append(
+            "| {bucket} | {median} | {mean} | {max_ms} | {samples} | {exhausted} |".format(
+                bucket=row["bucket"],
+                median=fmt_float(row.get("median_ms")),
+                mean=fmt_float(row.get("mean_ms")),
+                max_ms=fmt_float(row.get("max_ms")),
+                samples=row.get("sample_count"),
+                exhausted=str(bool(row.get("exhausted"))).lower(),
+            )
+        )
+    if prefill:
+        lines.extend(
+            [
+                "",
+                "## Prefill",
+                "",
+                f"- baseline_ms: `{fmt_float(prefill.get('baseline_ms'))}`",
+                f"- best_mode: `{prefill.get('best_mode') or '-'}`",
+                f"- best_ms: `{fmt_float(prefill.get('best_ms'))}`",
+                f"- best_vs_baseline: `{fmt_float(prefill.get('best_vs_baseline'))}`",
+                f"- promotion_gate_passed: `{str(bool(prefill.get('promotion_gate_passed'))).lower()}`",
+            ]
+        )
+    lines.extend(
+        [
+            "",
+            "## Top Metal Ops",
+            "",
+            "| Source | Row | Op | Path | Total ms | Calls |",
+            "|:---|:---|:---|:---|---:|---:|",
+        ]
+    )
+    for entry in report["top_metal_profile_ops"][:5]:
+        lines.append(
+            "| {source} | {row} | {op} | {path} | {total} | {calls} |".format(
+                source=entry.get("source"),
+                row=entry.get("row"),
+                op=entry.get("op") or "-",
+                path=entry.get("path") or "-",
+                total=fmt_float(entry.get("total_ms")),
+                calls=entry.get("calls") or "-",
+            )
+        )
+    if report.get("errors"):
+        lines.extend(["", "## Errors", "", fmt_list(report["errors"])])
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--sota-json",
+        type=Path,
+        default=Path("target/qwen36_sota_gate_summary.json"),
+    )
+    parser.add_argument(
+        "--static-runtime-json",
+        type=Path,
+        default=Path("target/qwen36_static_topn_runtime_sweep.json"),
+    )
+    parser.add_argument(
+        "--fused-json",
+        type=Path,
+        default=Path("target/qwen36_fused_routed_int4_sweep.json"),
+    )
+    parser.add_argument(
+        "--lru-json",
+        type=Path,
+        default=Path("target/qwen36_lru_resident_cache_sweep.json"),
+    )
+    parser.add_argument(
+        "--prefill-json",
+        type=Path,
+        default=Path("target/qwen36_metal_batched_prefill_variant_sweep.json"),
+    )
+    parser.add_argument(
+        "--out-json",
+        type=Path,
+        default=Path("target/qwen36_next_bottleneck.json"),
+    )
+    parser.add_argument(
+        "--out-md",
+        type=Path,
+        default=Path("target/qwen36_next_bottleneck.md"),
+    )
+    parser.add_argument(
+        "--require-selected",
+        action="store_true",
+        help="exit non-zero unless the selector reaches a concrete selected action",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str]) -> int:
+    args = parse_args(argv)
+    report = build_report(args)
+    args.out_json.parent.mkdir(parents=True, exist_ok=True)
+    args.out_json.write_text(json.dumps(report, indent=2) + "\n")
+    args.out_md.parent.mkdir(parents=True, exist_ok=True)
+    args.out_md.write_text(render_markdown(report))
+
+    rec = report["recommendation"]
+    print(
+        "[qwen36-next-bottleneck] status={} action={} target={} dominant={}".format(
+            rec["status"],
+            rec["action"],
+            rec.get("target_bucket") or "-",
+            rec.get("dominant_bucket") or "-",
+        )
+    )
+    print(f"[wrote] {args.out_json}")
+    print(f"[wrote] {args.out_md}")
+    if args.require_selected and rec["status"] != "selected":
+        return 1
+    return 0 if not report["errors"] else 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

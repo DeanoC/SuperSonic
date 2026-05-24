@@ -47,6 +47,10 @@ lru_sweep = load_script(
     "qwen36_sota_lru_sweep",
     METAL_DIR / "sweep_qwen36_lru_resident_cache.py",
 )
+next_bottleneck = load_script(
+    "qwen36_sota_next_bottleneck",
+    METAL_DIR / "select_qwen36_next_bottleneck.py",
+)
 sota_summary = load_script(
     "qwen36_sota_gate_summary",
     METAL_DIR / "summarize_qwen36_sota_gates.py",
@@ -70,6 +74,7 @@ class Qwen36SotaContractTests(unittest.TestCase):
         self.assertEqual(route_sweep.SCHEMA, "qwen36-route-residency-sweep-v1")
         self.assertEqual(mtp_sweep.SCHEMA, "qwen36-moe-mtp-acceptance-sweep-v2")
         self.assertEqual(lru_sweep.SCHEMA, "qwen36-lru-resident-cache-sweep-v1")
+        self.assertEqual(next_bottleneck.SCHEMA, "qwen36-next-bottleneck-v1")
         self.assertEqual(sota_summary.SCHEMA, "qwen36-sota-gate-summary-v7")
         self.assertEqual(sota_refresh.SCHEMA, "qwen36-sota-gate-refresh-plan-v1")
 
