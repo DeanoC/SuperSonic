@@ -570,13 +570,16 @@ under the same smoke:
    variant sweep, static top-N runtime sweep, fused routed INT4 runtime sweep,
    MPS resident-table probe, route residency sweep, and MTP acceptance sweep
    reports, then writes
-   `target/qwen36_sota_gate_summary.{json,md}`. The v4 schema records input
+   `target/qwen36_sota_gate_summary.{json,md}`. The v5 schema records input
    health, report age, passed and failed gate IDs, candidate failures, and a
-   single `next_action`, plus the refresh command for each gate. Missing
-   reports are nonfatal rows by default; `--require` turns absent, malformed,
-   schema-mismatched, or missing-gate artifacts into a failed validation run,
-   and `--max-age-hours` adds an mtime-based stale-report gate for local refresh
-   runs. `tests/metal/refresh_qwen36_sota_gates.py` consumes the same gate
+   single `next_action`, plus the refresh command for each gate. It also marks
+   passed estimate gates as superseded when a newer runtime gate has already
+   measured and rejected the corresponding candidate, so the next action cannot
+   loop back to an already-negative prototype. Missing reports are nonfatal rows
+   by default; `--require` turns absent, malformed, schema-mismatched, or
+   missing-gate artifacts into a failed validation run, and `--max-age-hours`
+   adds an mtime-based stale-report gate for local refresh runs.
+   `tests/metal/refresh_qwen36_sota_gates.py` consumes the same gate
    surface and writes `target/qwen36_sota_gate_refresh_plan.{json,md}` so stale
    or missing SOTA gates can be selected in one dry-run artifact before the
    operator chooses `--run`.

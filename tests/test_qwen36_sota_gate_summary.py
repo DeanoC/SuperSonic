@@ -269,6 +269,61 @@ class Qwen36SotaGateSummaryTests(unittest.TestCase):
         )
         self.assertEqual(report["rows"][4]["passed_candidates"], ["lru_hotset:64"])
 
+    def test_mps_viability_is_superseded_by_failed_runtime_candidate(self):
+        script = summarize_qwen36_sota_gates
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = self.write_default_reports(
+                Path(tmp),
+                static_gate={
+                    "passed": False,
+                    "candidates": [
+                        {
+                            "mode": "mps-static-partial",
+                            "passed": False,
+                            "failures": ["headline_not_improved"],
+                        }
+                    ],
+                },
+                mps_gate={
+                    "passed": True,
+                    "recommendation": "prototype_partial_hit_resident_mps",
+                    "candidates": [
+                        {
+                            "kind": "partial_hit_optimistic",
+                            "capacity": 64,
+                            "passed": True,
+                        }
+                    ],
+                },
+                route_gate={
+                    "passed": True,
+                    "recommendation": "prototype_larger_lru_resident_cache",
+                    "candidates": [
+                        {
+                            "kind": "lru_hotset",
+                            "capacity": 64,
+                            "passed": True,
+                        }
+                    ],
+                },
+            )
+            report = script.build_report(paths)
+
+        mps_row = report["rows"][3]
+        self.assertEqual(
+            mps_row["superseded_by"],
+            "static_topn_runtime:mps-static-partial",
+        )
+        self.assertEqual(
+            mps_row["recommendation_action"],
+            "keep_disabled_runtime_failed",
+        )
+        self.assertEqual(report["summary"]["superseded_gate_ids"], ["mps_resident_table"])
+        self.assertEqual(
+            report["summary"]["next_action"]["action"],
+            "prototype_larger_lru_resident_cache",
+        )
+
     def test_malformed_schema_mismatch_and_missing_gate_are_reported(self):
         script = summarize_qwen36_sota_gates
         with tempfile.TemporaryDirectory() as tmp:

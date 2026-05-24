@@ -1338,6 +1338,9 @@ passed/failed gate IDs, candidate failures, refresh commands, and the next
 action. Missing reports are preserved as rows by default; use
 `--require --max-age-hours 24` when a local validation run should fail closed on
 absent, malformed, schema-mismatched, stale, or missing-gate artifacts.
+The v5 summary also records `superseded_gates`; this prevents an older
+estimate-only pass from taking `next_action` after the corresponding runtime
+candidate has already been measured and rejected.
 `tests/metal/refresh_qwen36_sota_gates.py` is the operational companion for
 that summary: by default it writes
 `target/qwen36_sota_gate_refresh_plan.{json,md}` with only the missing, stale,

@@ -660,6 +660,9 @@ gate artifact. Add `--require` to make a local validation run fail closed on
 missing, malformed, schema-mismatched, stale, or missing-gate artifacts. Use
 `--max-age-hours N` when the summary must reject old target reports instead of
 quietly reusing yesterday's gate decisions.
+The v5 summary marks an estimate gate as superseded when a newer runtime sweep
+has already measured and rejected that candidate, keeping `next_action` pointed
+at untried implementation work.
 `tests/metal/refresh_qwen36_sota_gates.py` turns those row-level refresh
 commands into a dry-run plan at
 `target/qwen36_sota_gate_refresh_plan.{json,md}`. It selects missing/stale/bad

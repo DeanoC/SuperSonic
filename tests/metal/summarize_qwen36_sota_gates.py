@@ -13,7 +13,7 @@ from typing import Any
 
 
 MODEL_ROOT_ENV = 'SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models"'
-SCHEMA = "qwen36-sota-gate-summary-v4"
+SCHEMA = "qwen36-sota-gate-summary-v5"
 
 
 @dataclass(frozen=True)
@@ -221,6 +221,8 @@ def build_gate_row(
         "gate_key": None,
         "passed": None,
         "recommendation": None,
+        "superseded_by": None,
+        "superseded_reason": None,
         "passed_candidates": [],
         "failed_candidates": [],
         "failures": [],
@@ -304,6 +306,7 @@ def choose_next_action(rows: list[dict[str, Any]]) -> dict[str, Any]:
         row
         for row in rows
         if row.get("kind") == "viability" and row.get("passed") is True
+        and row.get("superseded_by") is None
     ]
     if viability_passes:
         first = viability_passes[0]
@@ -336,6 +339,8 @@ def choose_next_action(rows: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def recommendation_for_row(row: dict[str, Any]) -> str:
+    if row.get("superseded_by"):
+        return "keep_disabled_runtime_failed"
     if row.get("status") == "missing":
         return "run_harness"
     if row.get("status") == "stale":
@@ -360,6 +365,9 @@ def build_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
     passed_gate_rows = [
         row for row in rows if row.get("status") == "ok" and row.get("passed") is True
     ]
+    superseded_rows = [
+        row for row in rows if row.get("status") == "ok" and row.get("superseded_by")
+    ]
     next_action = choose_next_action(rows)
     return {
         "gate_count": len(rows),
@@ -375,10 +383,39 @@ def build_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
         ],
         "passed_gate_ids": [str(row["gate_id"]) for row in passed_gate_rows],
         "failed_gate_ids": [str(row["gate_id"]) for row in failed_gate_rows],
+        "superseded_gate_ids": [str(row["gate_id"]) for row in superseded_rows],
         "all_inputs_ok": not bad_rows,
         "all_loaded_gates_passed": not bad_rows and not failed_gate_rows,
         "next_action": next_action,
     }
+
+
+def failed_candidate_names(row: dict[str, Any]) -> set[str]:
+    candidates = row.get("failed_candidates") or []
+    if not isinstance(candidates, list):
+        return set()
+    return {
+        str(candidate.get("candidate"))
+        for candidate in candidates
+        if isinstance(candidate, dict) and candidate.get("candidate") is not None
+    }
+
+
+def apply_supersession(rows: list[dict[str, Any]]) -> None:
+    by_id = {str(row["gate_id"]): row for row in rows}
+    static_runtime = by_id.get("static_topn_runtime")
+    mps_estimate = by_id.get("mps_resident_table")
+    if static_runtime is None or mps_estimate is None:
+        return
+    if static_runtime.get("status") != "ok" or mps_estimate.get("status") != "ok":
+        return
+    if "mps-static-partial" not in failed_candidate_names(static_runtime):
+        return
+    mps_estimate["superseded_by"] = "static_topn_runtime:mps-static-partial"
+    mps_estimate["superseded_reason"] = (
+        "partial-hit resident MPS was already measured as a runtime candidate "
+        "and failed the static top-N promotion gate"
+    )
 
 
 def build_report(
@@ -396,6 +433,7 @@ def build_report(
         )
         for spec in GATE_SPECS
     ]
+    apply_supersession(rows)
     for row in rows:
         row["recommendation_action"] = recommendation_for_row(row)
     return {
@@ -447,23 +485,25 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- loaded_gates_passed: `{summary['all_loaded_gates_passed']}`",
         f"- passed_gates: `{fmt_list(summary['passed_gate_ids'])}`",
         f"- failed_gates: `{fmt_list(summary['failed_gate_ids'])}`",
+        f"- superseded_gates: `{fmt_list(summary['superseded_gate_ids'])}`",
         f"- next_action: `{next_action['action']}`",
         f"- blocked_reason: `{next_action.get('blocked_reason') or '-'}`",
         "",
-        "| Gate | Status | Passed | Candidates | Recommendation | Failures | Path | Age |",
-        "|:---|:---|:---:|:---|:---|:---|:---|---:|",
+        "| Gate | Status | Passed | Candidates | Recommendation | Superseded By | Failures | Path | Age |",
+        "|:---|:---|:---:|:---|:---|:---|:---|:---|---:|",
     ]
     for row in report["rows"]:
         failures = row.get("failures") or []
         if row.get("error"):
             failures = [row["error"], *failures]
         lines.append(
-            "| {label} | {status} | {passed} | {candidates} | {rec} | {failures} | `{path}` | {age} |".format(
+            "| {label} | {status} | {passed} | {candidates} | {rec} | {superseded} | {failures} | `{path}` | {age} |".format(
                 label=row["label"],
                 status=row["status"],
                 passed=fmt_bool(row.get("passed")),
                 candidates=fmt_list(row.get("passed_candidates")),
                 rec=row.get("recommendation_action") or "-",
+                superseded=row.get("superseded_by") or "-",
                 failures=fmt_list(failures),
                 path=row["path"],
                 age=fmt_age(row.get("age_seconds")),
