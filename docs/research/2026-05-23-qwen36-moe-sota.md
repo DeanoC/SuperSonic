@@ -1871,6 +1871,43 @@ under the same smoke:
    the host `moe_out`, the fix is in the routed down/combine accumulation or
    BF16 materialization.
 
+52. **Qwen3.6 routed down/combine row probe**
+   The fused-routed sweep is now schema `v29`. The routed host-correction row
+   now also recomputes the `moe_out_argmax` row three ways: host
+   `expert_mid` plus host top-k, Metal `expert_mid` plus host top-k, and Metal
+   `expert_mid` plus Metal top-k. The Markdown/JSON summary records whether
+   the Metal-mid recompute lands on the host or Metal `moe_out`, plus the
+   top-k index and weight deltas.
+
+   The shortest Metal smoke wrote
+   `/private/tmp/qwen36_routed_row_probe_v29_1tok.{json,md}` with
+   `--modes default,full-stage5-router-simd-batch-shared-routed-host-corrected
+   --max-new-tokens 1 --context-size 64 --metal-profile --layer-output-tap
+   --layer-output-delta-tap --layer-output-delta-all`. Generated IDs matched
+   (`[11]`), and the shared+routed diagnostic still produced zero layer-output
+   mismatches. The row is diagnostic-only and still fails promotion only for
+   `diagnostic_mode_not_promotable` plus the expected missing headline/stage
+   timing fields.
+
+   The layer `33`, hidden index `8` routed cliff is now localized one step
+   earlier. Top-k indices matched and `topk_weight_max_abs=0.0`. The host
+   down/combine recompute at the failing row was
+   `host_routed_moe_out_recomputed_at_argmax=-0.0219726562`, matching the host
+   `moe_out`. Recomputing with Metal `expert_mid` produced
+   `metal_mid_host_topk_moe_out_at_argmax=-0.0220947266`, matching the Metal
+   `moe_out`; using Metal top-k gave the same value. The accumulator values
+   straddle a BF16 boundary:
+   `host_routed_down_acc_at_moe_argmax=-0.0220336821` versus
+   `metal_mid_host_topk_down_acc_at_moe_argmax=-0.022033738`.
+
+   That rules out routed down/combine ordering and top-k weights as the direct
+   source for this measured row. The next correctness target is the routed
+   expert gate/up/SwiGLU materialization that creates `expert_mid` for layer
+   `33`, expert-mid index `111`. A useful next probe should log host and Metal
+   routed gate, up, SiLU, and mid values at that index, then decide whether the
+   fix is precise SiLU/multiply behavior, BF16/F32 staging, or an explicit
+   hidden-stream tolerance/eval policy.
+
 ## Sources
 
 - [Qwen/Qwen3.6-35B-A3B model card](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)

@@ -1498,12 +1498,21 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
         script = sweep_qwen36_fused_routed_int4
         output = (
             "[qwen36-ffn-routed-host-correction] layer=33 router_path=simd "
-            "hidden=2048 top_k=8 expert_mid_max_abs=1.52587891e-05 "
+            "hidden=2048 top_k=8 topk_idx_match=1 topk_weight_max_abs=0.00000000e+00 "
+            "topk_weight_argmax=0 host_topk_weight_at_argmax=5.00000000e-01 "
+            "metal_topk_weight_at_argmax=5.00000000e-01 "
+            "expert_mid_max_abs=1.52587891e-05 "
             "expert_mid_argmax=17 host_expert_mid_at_argmax=1.00000000e+00 "
             "metal_expert_mid_at_argmax=9.99984741e-01 "
             "moe_out_max_abs=6.10351562e-05 moe_out_argmax=8 "
             "host_moe_out_at_argmax=1.25732422e-02 "
             "metal_moe_out_at_argmax=1.25122070e-02 "
+            "host_routed_down_acc_at_moe_argmax=1.25740000e-02 "
+            "host_routed_moe_out_recomputed_at_argmax=1.25732422e-02 "
+            "metal_mid_host_topk_down_acc_at_moe_argmax=1.25120000e-02 "
+            "metal_mid_host_topk_moe_out_at_argmax=1.25122070e-02 "
+            "metal_mid_metal_topk_down_acc_at_moe_argmax=1.25120000e-02 "
+            "metal_mid_metal_topk_moe_out_at_argmax=1.25122070e-02 "
             "output_patch_max_abs=1.22070312e-04 output_patch_argmax=8 "
             "host_final_out_at_argmax=1.26953125e-02 "
             "metal_final_out_at_argmax=1.25732422e-02 "
@@ -1516,6 +1525,11 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
         self.assertEqual(corrections[0]["layer"], 33)
         self.assertEqual(corrections[0]["router_path"], "simd")
         self.assertEqual(corrections[0]["moe_out_argmax"], 8)
+        self.assertEqual(corrections[0]["topk_idx_match"], 1)
+        self.assertAlmostEqual(
+            corrections[0]["metal_mid_host_topk_moe_out_at_argmax"],
+            0.0125122070,
+        )
         self.assertAlmostEqual(corrections[0]["output_patch_max_abs"], 0.000122070312)
 
         args = Namespace(
@@ -1551,11 +1565,25 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
 
         self.assertEqual(report["summary"]["routed_host_correction"]["correction_count"], 1)
         self.assertEqual(report["summary"]["routed_host_correction"]["changed_count"], 1)
+        self.assertEqual(
+            report["summary"]["routed_host_correction"][
+                "metal_mid_host_topk_matches_metal_count"
+            ],
+            1,
+        )
+        self.assertEqual(
+            report["summary"]["routed_host_correction"]["max_topk_weight_abs"],
+            0.0,
+        )
         self.assertIn("routed_host_correction_count: `1`", md)
+        self.assertIn(
+            "routed_host_correction_metal_mid_host_topk_matches_metal_count: `1`",
+            md,
+        )
         self.assertIn("routed_host_correction_max_output_patch_abs: `0.00012207`", md)
         self.assertIn("## Routed Host Correction", md)
         self.assertIn(
-            "| hello | full-stage5-router-simd-batch-shared-routed-host-corrected | simd | 33 |",
+            "| hello | full-stage5-router-simd-batch-shared-routed-host-corrected | simd | 33 | true |",
             md,
         )
 

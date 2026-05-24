@@ -4242,6 +4242,40 @@ fn qwen36_compute_ffn_routed_reference(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn qwen36_routed_down_row_probe(
+    down_w: usize,
+    down_scale: usize,
+    down_zero: usize,
+    row: usize,
+    hidden: usize,
+    moe_intermediate: usize,
+    top_k: usize,
+    group_size: usize,
+    topk_idx: &[u32],
+    topk_weight: &[f32],
+    expert_mid: &[f32],
+) -> (f32, f32) {
+    let mut acc = 0.0f32;
+    for group in 0..top_k {
+        let expert = topk_idx[group] as usize;
+        let mid = &expert_mid[group * moe_intermediate..(group + 1) * moe_intermediate];
+        let down = qwen36_expert_dense_or_int4_dot_unchecked(
+            down_w,
+            down_scale,
+            down_zero,
+            expert,
+            row,
+            hidden,
+            moe_intermediate,
+            group_size,
+            mid,
+        );
+        acc += topk_weight[group] * down;
+    }
+    (acc, bf16_round_f32(acc))
+}
+
 fn qwen36_bytes_to_f32_vec(bytes: &[u8]) -> Vec<f32> {
     bytes
         .chunks_exact(4)
@@ -4661,11 +4695,16 @@ fn qwen36_apply_ffn_routed_stage5_host_correction(
     hidden: usize,
     moe_intermediate: usize,
     top_k: usize,
+    off_topk_val: usize,
+    off_topk_idx: usize,
     off_expert_mid: usize,
     off_moe_out: usize,
+    weights: &Qwen36MoeFfnStepWeights,
+    int4: &Qwen36MoeFfnStepInt4,
     workspace: &mut GpuBuffer,
     output: &mut GpuBuffer,
     reference: &Qwen36FfnRoutedReference,
+    router_reference: &Qwen36FfnRouterReference,
 ) -> Result<(), GpuError> {
     crate::prefill_ffi::flush_metal_batch()?;
     gpu_hal::sync(ordinal)?;
@@ -4690,15 +4729,32 @@ fn qwen36_apply_ffn_routed_stage5_host_correction(
         std::slice::from_raw_parts_mut(workspace.as_mut_ptr() as *mut f32, workspace_len)
     };
     let output = unsafe { std::slice::from_raw_parts_mut(output.as_mut_ptr() as *mut u16, hidden) };
-    let expert_mid = &workspace[off_expert_mid..off_expert_mid + expert_mid_len];
+    let metal_expert_mid = workspace[off_expert_mid..off_expert_mid + expert_mid_len].to_vec();
+    let metal_topk_weight = workspace[off_topk_val..off_topk_val + top_k].to_vec();
+    let metal_topk_idx: Vec<u32> = workspace[off_topk_idx..off_topk_idx + top_k]
+        .iter()
+        .map(|value| value.to_bits())
+        .collect();
     let (expert_mid_max_abs, expert_mid_argmax) =
-        qwen36_max_abs_delta(&reference.expert_mid, expert_mid);
+        qwen36_max_abs_delta(&reference.expert_mid, &metal_expert_mid);
+    let topk_idx_match = router_reference.topk_idx == metal_topk_idx;
+    let (topk_weight_max_abs, topk_weight_argmax) =
+        qwen36_max_abs_delta(&router_reference.topk_weight, &metal_topk_weight);
+    let host_topk_weight_at_argmax = router_reference
+        .topk_weight
+        .get(topk_weight_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let metal_topk_weight_at_argmax = metal_topk_weight
+        .get(topk_weight_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
     let host_expert_mid_at_argmax = reference
         .expert_mid
         .get(expert_mid_argmax)
         .copied()
         .unwrap_or(f32::NAN);
-    let metal_expert_mid_at_argmax = expert_mid
+    let metal_expert_mid_at_argmax = metal_expert_mid
         .get(expert_mid_argmax)
         .copied()
         .unwrap_or(f32::NAN);
@@ -4745,6 +4801,53 @@ fn qwen36_apply_ffn_routed_stage5_host_correction(
         output[row] = corrected_bits;
     }
 
+    let group_size = int4.group_size.max(0) as usize;
+    let down_w = weights.down_proj_w as usize;
+    let down_scale = int4.down_proj_scale as usize;
+    let down_zero = int4.down_proj_zero as usize;
+    let (host_routed_down_acc_at_moe_argmax, host_routed_moe_out_recomputed_at_argmax) =
+        qwen36_routed_down_row_probe(
+            down_w,
+            down_scale,
+            down_zero,
+            moe_out_argmax,
+            hidden,
+            moe_intermediate,
+            top_k,
+            group_size,
+            &router_reference.topk_idx,
+            &router_reference.topk_weight,
+            &reference.expert_mid,
+        );
+    let (metal_mid_host_topk_down_acc_at_moe_argmax, metal_mid_host_topk_moe_out_at_argmax) =
+        qwen36_routed_down_row_probe(
+            down_w,
+            down_scale,
+            down_zero,
+            moe_out_argmax,
+            hidden,
+            moe_intermediate,
+            top_k,
+            group_size,
+            &router_reference.topk_idx,
+            &router_reference.topk_weight,
+            &metal_expert_mid,
+        );
+    let (metal_mid_metal_topk_down_acc_at_moe_argmax, metal_mid_metal_topk_moe_out_at_argmax) =
+        qwen36_routed_down_row_probe(
+            down_w,
+            down_scale,
+            down_zero,
+            moe_out_argmax,
+            hidden,
+            moe_intermediate,
+            top_k,
+            group_size,
+            &metal_topk_idx,
+            &metal_topk_weight,
+            &metal_expert_mid,
+        );
+
     let first_changed_output = if first_changed_output == usize::MAX {
         -1isize
     } else {
@@ -4756,11 +4859,16 @@ fn qwen36_apply_ffn_routed_stage5_host_correction(
         "serial"
     };
     eprintln!(
-        "[qwen36-ffn-routed-host-correction] layer={} router_path={} hidden={} top_k={} expert_mid_max_abs={:.8e} expert_mid_argmax={} host_expert_mid_at_argmax={:.8e} metal_expert_mid_at_argmax={:.8e} moe_out_max_abs={:.8e} moe_out_argmax={} host_moe_out_at_argmax={:.8e} metal_moe_out_at_argmax={:.8e} output_patch_max_abs={:.8e} output_patch_argmax={} host_final_out_at_argmax={:.8e} metal_final_out_at_argmax={:.8e} changed_output_elems={} first_changed_output={}",
+        "[qwen36-ffn-routed-host-correction] layer={} router_path={} hidden={} top_k={} topk_idx_match={} topk_weight_max_abs={:.8e} topk_weight_argmax={} host_topk_weight_at_argmax={:.8e} metal_topk_weight_at_argmax={:.8e} expert_mid_max_abs={:.8e} expert_mid_argmax={} host_expert_mid_at_argmax={:.8e} metal_expert_mid_at_argmax={:.8e} moe_out_max_abs={:.8e} moe_out_argmax={} host_moe_out_at_argmax={:.8e} metal_moe_out_at_argmax={:.8e} host_routed_down_acc_at_moe_argmax={:.8e} host_routed_moe_out_recomputed_at_argmax={:.8e} metal_mid_host_topk_down_acc_at_moe_argmax={:.8e} metal_mid_host_topk_moe_out_at_argmax={:.8e} metal_mid_metal_topk_down_acc_at_moe_argmax={:.8e} metal_mid_metal_topk_moe_out_at_argmax={:.8e} output_patch_max_abs={:.8e} output_patch_argmax={} host_final_out_at_argmax={:.8e} metal_final_out_at_argmax={:.8e} changed_output_elems={} first_changed_output={}",
         layer_idx,
         router_path,
         hidden,
         top_k,
+        topk_idx_match as u8,
+        topk_weight_max_abs,
+        topk_weight_argmax,
+        host_topk_weight_at_argmax,
+        metal_topk_weight_at_argmax,
         expert_mid_max_abs,
         expert_mid_argmax,
         host_expert_mid_at_argmax,
@@ -4769,6 +4877,12 @@ fn qwen36_apply_ffn_routed_stage5_host_correction(
         moe_out_argmax,
         host_moe_out_at_argmax,
         metal_moe_out_at_argmax,
+        host_routed_down_acc_at_moe_argmax,
+        host_routed_moe_out_recomputed_at_argmax,
+        metal_mid_host_topk_down_acc_at_moe_argmax,
+        metal_mid_host_topk_moe_out_at_argmax,
+        metal_mid_metal_topk_down_acc_at_moe_argmax,
+        metal_mid_metal_topk_moe_out_at_argmax,
         output_patch_max_abs,
         output_patch_argmax,
         host_final_out_at_argmax,
@@ -8615,11 +8729,21 @@ fn ffn_step_stage1_5_metal_host(
                     hidden,
                     moe_intermediate,
                     top_k,
+                    off_topk_val,
+                    off_topk_idx,
                     off_expert_mid,
                     off_moe_out,
+                    weights,
+                    int4,
                     workspace,
                     output,
                     reference,
+                    router_reference.as_ref().ok_or_else(|| {
+                        GpuError::InvalidArg(
+                            "qwen36_moe::ffn_step_launch: routed host correction missing router reference"
+                                .into(),
+                        )
+                    })?,
                 )?;
             }
             if router_parity_tap {
