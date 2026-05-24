@@ -15,7 +15,7 @@ from typing import Any
 
 
 MODEL = "qwen3.6-35b-a3b"
-SCHEMA = "qwen36-static-topn-runtime-sweep-v1"
+SCHEMA = "qwen36-static-topn-runtime-sweep-v2"
 
 PROMPT_SETS: dict[str, list[tuple[str, str]]] = {
     "smoke": [
@@ -105,6 +105,35 @@ def parse_expert_residency_policies(output: str) -> list[dict[str, Any]]:
             {key: parse_number(value) for key, value in parse_key_values(line).items()}
         )
     return rows
+
+
+def parse_profile(output: str, summary_prefix: str, op_prefix: str) -> dict[str, Any] | None:
+    summary_lines = [line for line in output.splitlines() if line.startswith(summary_prefix)]
+    if not summary_lines:
+        return None
+    summary = {
+        key: parse_number(value)
+        for key, value in parse_key_values(summary_lines[-1]).items()
+        if key not in {"op", "path"}
+    }
+    entries: list[dict[str, Any]] = []
+    for line in output.splitlines():
+        if not line.startswith(op_prefix):
+            continue
+        fields = parse_key_values(line)
+        entry: dict[str, Any] = {
+            "op": fields.get("op"),
+            "calls": int(fields.get("calls", "0")),
+            "mean_ms": float(fields.get("mean_ms", "0")),
+            "total_ms": float(fields.get("total_ms", "0")),
+            "max_ms": float(fields.get("max_ms", "0")),
+        }
+        if "path" in fields:
+            entry["path"] = fields["path"]
+        if "total_bytes" in fields:
+            entry["total_bytes"] = int(fields["total_bytes"])
+        entries.append(entry)
+    return {"summary": summary, "entries": entries}
 
 
 def parse_generated_ids(output: str) -> list[int]:
@@ -206,6 +235,20 @@ def output_tail(output: str, limit: int = 5000) -> str:
     return output[-limit:]
 
 
+def timeout_output(exc: subprocess.TimeoutExpired) -> str:
+    stdout = (
+        exc.stdout.decode(errors="replace")
+        if isinstance(exc.stdout, bytes)
+        else (exc.stdout or "")
+    )
+    stderr = (
+        exc.stderr.decode(errors="replace")
+        if isinstance(exc.stderr, bytes)
+        else (exc.stderr or "")
+    )
+    return stdout + stderr
+
+
 def run_row(args: argparse.Namespace, prompt_id: str, prompt: str, mode: str) -> dict[str, Any]:
     env = os.environ.copy()
     env_overrides = build_env_overrides(args, mode)
@@ -239,11 +282,13 @@ def run_row(args: argparse.Namespace, prompt_id: str, prompt: str, mode: str) ->
             "lifecycle_timings": parse_lifecycle_timings(output),
             "expert_residency": parse_expert_residency(output),
             "expert_residency_policies": parse_expert_residency_policies(output),
+            "metal_profile": parse_profile(output, "[metal-profile]", "[metal-profile-op]"),
+            "hal_profile": parse_profile(output, "[hal-profile]", "[hal-profile-op]"),
             "output_tail": output_tail(output),
         }
         return row
     except subprocess.TimeoutExpired as exc:
-        output = (exc.stdout or "") + (exc.stderr or "")
+        output = timeout_output(exc)
         return {
             "prompt_id": prompt_id,
             "prompt": prompt,
@@ -260,22 +305,41 @@ def run_row(args: argparse.Namespace, prompt_id: str, prompt: str, mode: str) ->
             "lifecycle_timings": {},
             "expert_residency": None,
             "expert_residency_policies": [],
-            "output_tail": output_tail(str(output)),
+            "metal_profile": parse_profile(output, "[metal-profile]", "[metal-profile-op]"),
+            "hal_profile": parse_profile(output, "[hal-profile]", "[hal-profile-op]"),
+            "output_tail": output_tail(output),
         }
 
 
 def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
     ok_rows = [row for row in rows if row.get("status") == "ok"]
-    reference_ids = ok_rows[0].get("generated_ids", []) if ok_rows else []
-    mismatches = [
-        {
-            "prompt_id": row.get("prompt_id"),
-            "mode": row.get("mode"),
-            "generated_ids": row.get("generated_ids", []),
+    reference_by_prompt: dict[str, list[int]] = {}
+    prompt_summaries: dict[str, dict[str, Any]] = {}
+    mismatches: list[dict[str, Any]] = []
+    for row in ok_rows:
+        prompt_id = str(row.get("prompt_id", ""))
+        generated_ids = row.get("generated_ids", [])
+        if prompt_id not in reference_by_prompt:
+            reference_by_prompt[prompt_id] = generated_ids
+        elif generated_ids != reference_by_prompt[prompt_id]:
+            mismatches.append(
+                {
+                    "prompt_id": row.get("prompt_id"),
+                    "mode": row.get("mode"),
+                    "reference_generated_ids": reference_by_prompt[prompt_id],
+                    "generated_ids": generated_ids,
+                }
+            )
+    for prompt_id, reference_ids in reference_by_prompt.items():
+        prompt_rows = [row for row in ok_rows if str(row.get("prompt_id", "")) == prompt_id]
+        prompt_mismatches = [
+            row for row in prompt_rows if row.get("generated_ids", []) != reference_ids
+        ]
+        prompt_summaries[prompt_id] = {
+            "ok_rows": len(prompt_rows),
+            "reference_generated_ids": reference_ids,
+            "generated_ids_match": not prompt_mismatches,
         }
-        for row in ok_rows
-        if row.get("generated_ids", []) != reference_ids
-    ]
     return {
         "rows": len(rows),
         "ok_rows": len(ok_rows),
@@ -283,9 +347,10 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
             status: sum(1 for row in rows if row.get("status") == status)
             for status in sorted({str(row.get("status")) for row in rows})
         },
-        "reference_generated_ids": reference_ids,
+        "reference_generated_ids_by_prompt": reference_by_prompt,
         "generated_ids_match": not mismatches,
         "generated_id_mismatches": mismatches,
+        "prompt_summaries": prompt_summaries,
     }
 
 
@@ -319,6 +384,13 @@ def render_float(value: Any, precision: int = 3) -> str:
         return str(value)
 
 
+def top_profile_op(profile: dict[str, Any] | None) -> dict[str, Any]:
+    if not profile:
+        return {}
+    entries = profile.get("entries") or []
+    return max(entries, key=lambda item: item.get("total_ms") or 0.0) if entries else {}
+
+
 def render_markdown(report: dict[str, Any]) -> str:
     summary = report["summary"]
     lines = [
@@ -329,16 +401,18 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- max_new_tokens: `{report['max_new_tokens']}`",
         f"- generated_ids_match: `{summary['generated_ids_match']}`",
         "",
-        "| Prompt | Mode | Status | IDs | Decode ms | FFN ms avg | Exact hit rate | Slot hit rate | Copied GiB | Wall s |",
-        "|:---|:---|:---|:---|---:|---:|---:|---:|---:|---:|",
+        "| Prompt | Mode | Status | IDs | Decode ms | FFN ms avg | Exact hit rate | Slot hit rate | Copied GiB | Top Metal op | Top Metal ms | HAL ms | Wall s |",
+        "|:---|:---|:---|:---|---:|---:|---:|---:|---:|:---|---:|---:|---:|",
     ]
     for row in report["rows"]:
         residency = row.get("expert_residency") or {}
         result = row.get("result") or {}
         chain = row.get("chain_breakdown") or {}
+        top_metal = top_profile_op(row.get("metal_profile"))
+        hal_summary = (row.get("hal_profile") or {}).get("summary") or {}
         copied_gib = float(residency.get("copied_bytes", 0) or 0) / (1024.0**3)
         lines.append(
-            "| {prompt} | {mode} | {status} | {ids} | {decode} | {ffn} | {exact} | {slot} | {copied} | {wall} |".format(
+            "| {prompt} | {mode} | {status} | {ids} | {decode} | {ffn} | {exact} | {slot} | {copied} | {top_op} | {top_ms} | {hal_ms} | {wall} |".format(
                 prompt=row.get("prompt_id", ""),
                 mode=row.get("mode", ""),
                 status=row.get("status", ""),
@@ -348,6 +422,9 @@ def render_markdown(report: dict[str, Any]) -> str:
                 exact=render_float(residency.get("exact_hit_rate"), 6),
                 slot=render_float(residency.get("slot_hit_rate"), 6),
                 copied=render_float(copied_gib, 3),
+                top_op=top_metal.get("op") or "-",
+                top_ms=render_float(top_metal.get("total_ms")),
+                hal_ms=render_float(hal_summary.get("total_ms")),
                 wall=render_float(row.get("wall_seconds"), 1),
             )
         )

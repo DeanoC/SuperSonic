@@ -1249,9 +1249,12 @@ layer calls.
 `tests/metal/sweep_qwen36_static_topn_runtime.py` is the follow-up warm-token
 comparison harness for that question. It runs separate process rows for modes
 such as `default`, `static`, and `static-hotset`, keeps generated IDs as the
-parity key, and records stage timings, chain breakdown, lifecycle timings,
-expert-residency totals, and per-policy rows in
-`target/qwen36_static_topn_runtime_sweep.{json,md}`.
+per-prompt parity key, and records stage timings, chain breakdown, lifecycle
+timings, expert-residency totals, and per-policy rows in
+`target/qwen36_static_topn_runtime_sweep.{json,md}`. With `--metal-profile`
+it also preserves parsed `metal_profile` and `hal_profile` objects per row and
+renders the top Metal/HAL attribution in Markdown, which makes the comparison
+prompt set usable as a profiling gate rather than a Hello-only smoke.
 The first four-token smoke preserved `[11, 353, 599, 264]` across all three
 modes but ruled out promotion: default measured `decode_ms=702` and
 `ffn_ms_avg=98.761`, static measured `decode_ms=951`, `ffn_ms_avg=177.563`,

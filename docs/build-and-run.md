@@ -588,9 +588,11 @@ static table as the next default path.
 `static_tables` JSON and compares warm decode modes such as `default`,
 `static`, and `static-hotset`. It writes
 `target/qwen36_static_topn_runtime_sweep.json` and
-`target/qwen36_static_topn_runtime_sweep.md`, preserving generated IDs, stage
-timings, chain breakdown, lifecycle timings, and expert-residency policy rows
-for each mode.
+`target/qwen36_static_topn_runtime_sweep.md`, preserving generated IDs per
+prompt, stage timings, chain breakdown, lifecycle timings, and expert-residency
+policy rows for each mode. Add `--metal-profile` to keep parsed
+`metal_profile` / `hal_profile` objects in each row and render the top
+attribution rows in Markdown.
 The current M5 Max perf gate points at linear-attention as the next measured
 multi-token per-token bucket after FFN fallback tightening. The 512-token
 `--metal-profile` smoke currently reports roughly 269 ms/token, 71.7 s prefill,

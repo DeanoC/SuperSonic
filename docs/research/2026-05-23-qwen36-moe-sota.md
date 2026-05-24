@@ -429,8 +429,11 @@ under the same smoke:
    The next harness slice is
    `tests/metal/sweep_qwen36_static_topn_runtime.py`, which compares warm decode
    modes (`default`, `static`, `static-hotset`, etc.) against the same generated
-   IDs and records expert-residency policy rows so promotion decisions can be
-   made on multi-token reuse rather than a cold first-token allocation.
+   IDs per prompt and records expert-residency policy rows so promotion
+   decisions can be made on multi-token reuse rather than a cold first-token
+   allocation. The sweep schema now also preserves parsed Metal/HAL profiles
+   when `--metal-profile` is used, so coding/profiling prompt sets can be used
+   as attribution gates instead of relying on a single Hello run.
    The first four-token smoke preserved `[11, 353, 599, 264]` across default,
    static, and static+hotset, but default still won: `decode_ms=702` and
    `ffn_ms_avg=98.761` versus static at `decode_ms=951` / `ffn_ms_avg=177.563`

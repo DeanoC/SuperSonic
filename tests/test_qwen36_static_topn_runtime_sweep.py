@@ -21,6 +21,10 @@ Generated 4 tokens (1 prompt + 4 new). EOS: no (max_new_tokens hit).
 [qwen36-moe lifecycle-timings] prompt_setup_ms=10.000 bake_open_ms=1.000 layer_load_ms=100.000 session_ms=1000.000 prefill_steps=0 prefill_embed_ms=0.000 prefill_chain_ms=0.000 prefill_total_ms=0.000 generation_wall_ms=939.000 total_wall_ms=1111.000
 [qwen36-expert-residency] calls=160 entries=40 exact_hits=9 route_refills=0 allocations=9 copied_bytes=879660288 exact_hit_rate=0.056250 slot_hits=900 slot_misses=380 slot_hit_rate=0.703125 evictions=0 avg_active_groups=8.000000 max_active_groups=8 avg_copy_bytes=97740032.000
 [qwen36-expert-residency-policy] resident_format=native_int4 scope=per_layer miss_policy=static_topn capacity=64 calls=160 exact_hits=9 route_refills=0 allocations=9 copied_bytes=879660288 exact_hit_rate=0.056250 slot_hits=900 slot_misses=380 slot_hit_rate=0.703125 evictions=0 avg_active_groups=8.000000 max_active_groups=8 avg_copy_bytes=97740032.000
+[metal-profile] calls=2 total_ms=12.000 native_ms=10.000 host_ms=2.000
+[metal-profile-op] op=qwen36_ffn_int4_stage5 path=native calls=1 mean_ms=10.0000 total_ms=10.000 max_ms=10.000
+[hal-profile] calls=1 total_ms=3.000 alloc_calls=0 alloc_bytes=0 h2d=0 d2h=0 d2d=0 memset=0 sync_calls=0
+[hal-profile-op] op=copy_h2d calls=1 mean_ms=3.0000 total_ms=3.000 max_ms=3.000 total_bytes=1024
 """
 
 
@@ -40,6 +44,13 @@ class Qwen36StaticTopNRuntimeSweepTests(unittest.TestCase):
         policies = parse.parse_expert_residency_policies(SAMPLE_OUTPUT)
         self.assertEqual(policies[0]["miss_policy"], "static_topn")
         self.assertEqual(policies[0]["capacity"], 64)
+        metal = parse.parse_profile(SAMPLE_OUTPUT, "[metal-profile]", "[metal-profile-op]")
+        self.assertIsNotNone(metal)
+        self.assertEqual(metal["summary"]["native_ms"], 10.0)
+        self.assertEqual(metal["entries"][0]["op"], "qwen36_ffn_int4_stage5")
+        hal = parse.parse_profile(SAMPLE_OUTPUT, "[hal-profile]", "[hal-profile-op]")
+        self.assertIsNotNone(hal)
+        self.assertEqual(hal["entries"][0]["total_bytes"], 1024)
 
     def test_parse_modes_normalizes_aliases(self):
         parse_modes = sweep_qwen36_static_topn_runtime.parse_modes
@@ -90,6 +101,24 @@ class Qwen36StaticTopNRuntimeSweepTests(unittest.TestCase):
         md = script.render_markdown(report)
         self.assertIn("Static Top-N Runtime Sweep", md)
         self.assertIn("generated_ids_match", md)
+
+    def test_report_summary_compares_ids_within_each_prompt(self):
+        script = sweep_qwen36_static_topn_runtime
+        args = script.parse_args([])
+        rows = [
+            {"status": "ok", "prompt_id": "p1", "mode": "default", "generated_ids": [1, 2]},
+            {"status": "ok", "prompt_id": "p1", "mode": "static", "generated_ids": [1, 2]},
+            {"status": "ok", "prompt_id": "p2", "mode": "default", "generated_ids": [3, 4]},
+            {"status": "ok", "prompt_id": "p2", "mode": "static", "generated_ids": [3, 4]},
+        ]
+
+        report = script.build_report(rows, args, ["default", "static"], "comparison")
+
+        self.assertTrue(report["summary"]["generated_ids_match"])
+        self.assertEqual(
+            report["summary"]["reference_generated_ids_by_prompt"],
+            {"p1": [1, 2], "p2": [3, 4]},
+        )
 
 
 if __name__ == "__main__":
