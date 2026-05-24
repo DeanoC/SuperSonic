@@ -1301,6 +1301,40 @@ under the same smoke:
    expert work inside `qwen36_decode_batch_ffn`, not another linear-attention
    split.
 
+38. **Qwen3.6 shared-expert tiled SIMD rejection**
+   The first batched-FFN arithmetic probe targeted the scalar shared-expert
+   kernels because `shared_gate_up`, `shared_scalar`, and `shared_down` were
+   still mostly one-lane dot products while routed expert gate/up already used
+   256-thread reductions. The Metal path now has gated shared-expert probes:
+   `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_SHARED_GATE_UP_TILED`,
+   `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_SHARED_SCALAR_SIMD`,
+   `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_SHARED_DOWN_TILED`, plus the combined
+   `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_SHARED_TILED`. The fused-routed sweep is
+   schema v14 and exposes these through
+   `full-stage5-router-simd-batch-shared-gate-up-tiled`,
+   `full-stage5-router-simd-batch-shared-scalar-simd`,
+   `full-stage5-router-simd-batch-shared-down-tiled`, and
+   `full-stage5-router-simd-batch-shared-tiled`.
+
+   The combined FFN-subphase attribution row proved the arithmetic idea works
+   locally but is not correctness-clean: shared gate/up dropped to `4.227 ms`,
+   shared scalar to `1.234 ms`, and shared down to `5.626 ms`, but generated
+   IDs changed from `[11, 271, 40, 599]` to `[11, 353, 599, 264]`. The
+   component sweep isolated the drift: gate/up tiled and scalar SIMD each
+   produced `[11, 353, 599, 264]`; shared-down tiled preserved
+   `[11, 271, 40, 599]` but regressed coarse batch GPU from `1351.984 ms` to
+   `1948.279 ms`. The combined tiled row also drifted and measured
+   `1571.437 ms` batch GPU, worse than the SIMD batch baseline in that run.
+
+   This path should stay gated as a negative/probe result. The useful lesson is
+   that naive parallel reductions change enough shared-expert numerical order
+   to alter decode, and the one parity-clean shared component is slower at
+   coarse batch scope. The next FFN arithmetic step should not be a direct
+   tiled rewrite of shared reductions. Either build a route/output parity tap
+   for shared-expert reductions before changing accumulation order, or move to
+   a larger routed-expert arithmetic target where the existing tiled reductions
+   are already accepted and the profile still has significant GPU work.
+
 ## Sources
 
 - [Qwen/Qwen3.6-35B-A3B model card](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)

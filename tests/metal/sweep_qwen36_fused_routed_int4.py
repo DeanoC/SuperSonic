@@ -15,18 +15,40 @@ from typing import Any
 
 
 MODEL = "qwen3.6-35b-a3b"
-SCHEMA = "qwen36-fused-routed-int4-sweep-v13"
+SCHEMA = "qwen36-fused-routed-int4-sweep-v14"
 DEFAULT_MAX_FUSED_WALL_GPU_RATIO = 4.0
 DEFAULT_MAX_WAIT_GPU_RATIO = 4.0
 COARSE_BATCH_SERIAL_MODE = "full-stage5-router-batch"
 COARSE_BATCH_SIMD_MODE = "full-stage5-router-simd-batch"
 DEFERRED_BATCH_SERIAL_MODE = "full-stage5-router-batch-deferred-phases"
 DEFERRED_BATCH_SIMD_MODE = "full-stage5-router-simd-batch-deferred-phases"
+SHARED_TILED_BATCH_SIMD_MODE = "full-stage5-router-simd-batch-shared-tiled"
+SHARED_TILED_DEFERRED_SIMD_MODE = "full-stage5-router-simd-batch-shared-tiled-deferred-phases"
+SHARED_TILED_FFN_PHASE_SIMD_MODE = "full-stage5-router-simd-batch-shared-tiled-ffn-phases"
+SHARED_GATE_UP_TILED_BATCH_SIMD_MODE = "full-stage5-router-simd-batch-shared-gate-up-tiled"
+SHARED_SCALAR_SIMD_BATCH_SIMD_MODE = "full-stage5-router-simd-batch-shared-scalar-simd"
+SHARED_DOWN_TILED_BATCH_SIMD_MODE = "full-stage5-router-simd-batch-shared-down-tiled"
+SHARED_TILED_MODES = {
+    SHARED_TILED_BATCH_SIMD_MODE,
+    SHARED_TILED_DEFERRED_SIMD_MODE,
+    SHARED_TILED_FFN_PHASE_SIMD_MODE,
+}
+SHARED_COMPONENT_MODES = {
+    SHARED_GATE_UP_TILED_BATCH_SIMD_MODE,
+    SHARED_SCALAR_SIMD_BATCH_SIMD_MODE,
+    SHARED_DOWN_TILED_BATCH_SIMD_MODE,
+}
 BATCH_FAST_PROFILE_MODES = {
     "full-stage5-router-batch",
     "full-stage5-router-simd-batch",
     "full-stage5-router-batch-deferred-phases",
     "full-stage5-router-simd-batch-deferred-phases",
+    SHARED_TILED_BATCH_SIMD_MODE,
+    SHARED_TILED_DEFERRED_SIMD_MODE,
+    SHARED_TILED_FFN_PHASE_SIMD_MODE,
+    SHARED_GATE_UP_TILED_BATCH_SIMD_MODE,
+    SHARED_SCALAR_SIMD_BATCH_SIMD_MODE,
+    SHARED_DOWN_TILED_BATCH_SIMD_MODE,
     "full-stage5-router-batch-phases",
     "full-stage5-router-batch-ffn-phases",
     "full-stage5-router-simd-batch-phases",
@@ -78,6 +100,19 @@ MODE_ALIASES: dict[str, str] = {
     "batch-router-simd": "full-stage5-router-simd-batch",
     "full-router-simd-batch": "full-stage5-router-simd-batch",
     "full-stage5-router-simd-batch": "full-stage5-router-simd-batch",
+    "router-simd-batch-shared-tiled": SHARED_TILED_BATCH_SIMD_MODE,
+    "batch-router-simd-shared-tiled": SHARED_TILED_BATCH_SIMD_MODE,
+    "full-router-simd-batch-shared-tiled": SHARED_TILED_BATCH_SIMD_MODE,
+    SHARED_TILED_BATCH_SIMD_MODE: SHARED_TILED_BATCH_SIMD_MODE,
+    "router-simd-batch-shared-gate-up-tiled": SHARED_GATE_UP_TILED_BATCH_SIMD_MODE,
+    "batch-router-simd-shared-gate-up-tiled": SHARED_GATE_UP_TILED_BATCH_SIMD_MODE,
+    SHARED_GATE_UP_TILED_BATCH_SIMD_MODE: SHARED_GATE_UP_TILED_BATCH_SIMD_MODE,
+    "router-simd-batch-shared-scalar-simd": SHARED_SCALAR_SIMD_BATCH_SIMD_MODE,
+    "batch-router-simd-shared-scalar-simd": SHARED_SCALAR_SIMD_BATCH_SIMD_MODE,
+    SHARED_SCALAR_SIMD_BATCH_SIMD_MODE: SHARED_SCALAR_SIMD_BATCH_SIMD_MODE,
+    "router-simd-batch-shared-down-tiled": SHARED_DOWN_TILED_BATCH_SIMD_MODE,
+    "batch-router-simd-shared-down-tiled": SHARED_DOWN_TILED_BATCH_SIMD_MODE,
+    SHARED_DOWN_TILED_BATCH_SIMD_MODE: SHARED_DOWN_TILED_BATCH_SIMD_MODE,
     "router-batch-deferred-phases": "full-stage5-router-batch-deferred-phases",
     "batch-router-deferred-phases": "full-stage5-router-batch-deferred-phases",
     "full-router-batch-deferred-phases": "full-stage5-router-batch-deferred-phases",
@@ -86,6 +121,10 @@ MODE_ALIASES: dict[str, str] = {
     "batch-router-simd-deferred-phases": "full-stage5-router-simd-batch-deferred-phases",
     "full-router-simd-batch-deferred-phases": "full-stage5-router-simd-batch-deferred-phases",
     "full-stage5-router-simd-batch-deferred-phases": "full-stage5-router-simd-batch-deferred-phases",
+    "router-simd-batch-shared-tiled-deferred-phases": SHARED_TILED_DEFERRED_SIMD_MODE,
+    "batch-router-simd-shared-tiled-deferred-phases": SHARED_TILED_DEFERRED_SIMD_MODE,
+    "full-router-simd-batch-shared-tiled-deferred-phases": SHARED_TILED_DEFERRED_SIMD_MODE,
+    SHARED_TILED_DEFERRED_SIMD_MODE: SHARED_TILED_DEFERRED_SIMD_MODE,
     "router-batch-phases": "full-stage5-router-batch-phases",
     "batch-router-phases": "full-stage5-router-batch-phases",
     "full-router-batch-phases": "full-stage5-router-batch-phases",
@@ -102,6 +141,10 @@ MODE_ALIASES: dict[str, str] = {
     "batch-router-simd-ffn-phases": "full-stage5-router-simd-batch-ffn-phases",
     "full-router-simd-batch-ffn-phases": "full-stage5-router-simd-batch-ffn-phases",
     "full-stage5-router-simd-batch-ffn-phases": "full-stage5-router-simd-batch-ffn-phases",
+    "router-simd-batch-shared-tiled-ffn-phases": SHARED_TILED_FFN_PHASE_SIMD_MODE,
+    "batch-router-simd-shared-tiled-ffn-phases": SHARED_TILED_FFN_PHASE_SIMD_MODE,
+    "full-router-simd-batch-shared-tiled-ffn-phases": SHARED_TILED_FFN_PHASE_SIMD_MODE,
+    SHARED_TILED_FFN_PHASE_SIMD_MODE: SHARED_TILED_FFN_PHASE_SIMD_MODE,
     "router-defer": "router-defer-wait",
     "router-defer-wait": "router-defer-wait",
     "defer-router-wait": "router-defer-wait",
@@ -120,6 +163,12 @@ FUSED_OP_NEEDLES = {
     "full-stage5-router-simd-batch": "qwen36_ffn_int4_stage5_with_router",
     "full-stage5-router-batch-deferred-phases": "qwen36_ffn_int4_stage5_with_router",
     "full-stage5-router-simd-batch-deferred-phases": "qwen36_ffn_int4_stage5_with_router",
+    SHARED_TILED_BATCH_SIMD_MODE: "qwen36_ffn_int4_stage5_with_router",
+    SHARED_TILED_DEFERRED_SIMD_MODE: "qwen36_ffn_int4_stage5_with_router",
+    SHARED_TILED_FFN_PHASE_SIMD_MODE: "qwen36_ffn_int4",
+    SHARED_GATE_UP_TILED_BATCH_SIMD_MODE: "qwen36_ffn_int4_stage5_with_router",
+    SHARED_SCALAR_SIMD_BATCH_SIMD_MODE: "qwen36_ffn_int4_stage5_with_router",
+    SHARED_DOWN_TILED_BATCH_SIMD_MODE: "qwen36_ffn_int4_stage5_with_router",
     "full-stage5-router-batch-phases": "qwen36_ffn_int4_stage5_with_router",
     "full-stage5-router-batch-ffn-phases": "qwen36_ffn_int4",
     "full-stage5-router-simd-batch-phases": "qwen36_ffn_int4_stage5_with_router",
@@ -245,6 +294,25 @@ FUSED_GPU_OP_PREFIXES = {
         "command_buffer_gpu:qwen36_ffn_int4_expert_down_finalize",
     ),
 }
+
+FUSED_GPU_OP_PREFIXES[SHARED_TILED_BATCH_SIMD_MODE] = FUSED_GPU_OP_PREFIXES[
+    "full-stage5-router-simd-batch"
+]
+FUSED_GPU_OP_PREFIXES[SHARED_GATE_UP_TILED_BATCH_SIMD_MODE] = FUSED_GPU_OP_PREFIXES[
+    "full-stage5-router-simd-batch"
+]
+FUSED_GPU_OP_PREFIXES[SHARED_SCALAR_SIMD_BATCH_SIMD_MODE] = FUSED_GPU_OP_PREFIXES[
+    "full-stage5-router-simd-batch"
+]
+FUSED_GPU_OP_PREFIXES[SHARED_DOWN_TILED_BATCH_SIMD_MODE] = FUSED_GPU_OP_PREFIXES[
+    "full-stage5-router-simd-batch"
+]
+FUSED_GPU_OP_PREFIXES[SHARED_TILED_DEFERRED_SIMD_MODE] = FUSED_GPU_OP_PREFIXES[
+    "full-stage5-router-simd-batch-deferred-phases"
+]
+FUSED_GPU_OP_PREFIXES[SHARED_TILED_FFN_PHASE_SIMD_MODE] = FUSED_GPU_OP_PREFIXES[
+    "full-stage5-router-simd-batch-ffn-phases"
+]
 
 BATCH_FFN_PHASE_GPU_FIELDS = {
     "decode_batch_ffn_router_topk_gpu_ms": (
@@ -609,6 +677,26 @@ def build_env_overrides(args: argparse.Namespace, mode: str) -> dict[str, str]:
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"] = "1"
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_STAGE5_SIMD"] = "1"
         overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH"] = "1"
+    elif mode == SHARED_TILED_BATCH_SIMD_MODE:
+        overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"] = "1"
+        overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_STAGE5_SIMD"] = "1"
+        overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_SHARED_TILED"] = "1"
+        overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH"] = "1"
+    elif mode == SHARED_GATE_UP_TILED_BATCH_SIMD_MODE:
+        overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"] = "1"
+        overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_STAGE5_SIMD"] = "1"
+        overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_SHARED_GATE_UP_TILED"] = "1"
+        overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH"] = "1"
+    elif mode == SHARED_SCALAR_SIMD_BATCH_SIMD_MODE:
+        overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"] = "1"
+        overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_STAGE5_SIMD"] = "1"
+        overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_SHARED_SCALAR_SIMD"] = "1"
+        overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH"] = "1"
+    elif mode == SHARED_DOWN_TILED_BATCH_SIMD_MODE:
+        overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"] = "1"
+        overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_STAGE5_SIMD"] = "1"
+        overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_SHARED_DOWN_TILED"] = "1"
+        overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH"] = "1"
     elif mode == "full-stage5-router-batch-deferred-phases":
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"] = "1"
         overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH"] = "1"
@@ -616,6 +704,12 @@ def build_env_overrides(args: argparse.Namespace, mode: str) -> dict[str, str]:
     elif mode == "full-stage5-router-simd-batch-deferred-phases":
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"] = "1"
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_STAGE5_SIMD"] = "1"
+        overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH"] = "1"
+        overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH_PROFILE_PHASES_DEFERRED"] = "1"
+    elif mode == SHARED_TILED_DEFERRED_SIMD_MODE:
+        overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"] = "1"
+        overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_STAGE5_SIMD"] = "1"
+        overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_SHARED_TILED"] = "1"
         overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH"] = "1"
         overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH_PROFILE_PHASES_DEFERRED"] = "1"
     elif mode == "full-stage5-router-batch-phases":
@@ -635,6 +729,13 @@ def build_env_overrides(args: argparse.Namespace, mode: str) -> dict[str, str]:
     elif mode == "full-stage5-router-simd-batch-ffn-phases":
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"] = "1"
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_STAGE5_SIMD"] = "1"
+        overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH"] = "1"
+        overrides["SUPERSONIC_METAL_PROFILE_QWEN36_FFN_PHASES"] = "1"
+        overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH_PROFILE_FFN_PHASES"] = "1"
+    elif mode == SHARED_TILED_FFN_PHASE_SIMD_MODE:
+        overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"] = "1"
+        overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_STAGE5_SIMD"] = "1"
+        overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_SHARED_TILED"] = "1"
         overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH"] = "1"
         overrides["SUPERSONIC_METAL_PROFILE_QWEN36_FFN_PHASES"] = "1"
         overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH_PROFILE_FFN_PHASES"] = "1"

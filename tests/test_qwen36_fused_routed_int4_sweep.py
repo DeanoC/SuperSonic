@@ -125,7 +125,7 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
 
         self.assertEqual(
             script.parse_modes(
-                "baseline,direct,direct-defer,defer-direct-wait,gpu-pack,gpack,stage5,native-stage5,router,router-simd,router-batch,batch-router,router-simd-batch,batch-router-simd,router-batch-deferred-phases,batch-router-deferred-phases,router-simd-batch-deferred-phases,batch-router-simd-deferred-phases,router-batch-phases,batch-router-phases,router-batch-ffn-phases,batch-router-ffn-phases,router-simd-batch-phases,router-simd-batch-ffn-phases,router-defer"
+                "baseline,direct,direct-defer,defer-direct-wait,gpu-pack,gpack,stage5,native-stage5,router,router-simd,router-batch,batch-router,router-simd-batch,batch-router-simd,router-simd-batch-shared-tiled,batch-router-simd-shared-tiled,router-simd-batch-shared-gate-up-tiled,router-simd-batch-shared-scalar-simd,router-simd-batch-shared-down-tiled,router-batch-deferred-phases,batch-router-deferred-phases,router-simd-batch-deferred-phases,batch-router-simd-deferred-phases,router-simd-batch-shared-tiled-deferred-phases,batch-router-simd-shared-tiled-deferred-phases,router-batch-phases,batch-router-phases,router-batch-ffn-phases,batch-router-ffn-phases,router-simd-batch-phases,router-simd-batch-ffn-phases,router-simd-batch-shared-tiled-ffn-phases,batch-router-simd-shared-tiled-ffn-phases,router-defer"
             ),
             [
                 "default",
@@ -137,12 +137,18 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
                 "full-stage5-router-simd",
                 "full-stage5-router-batch",
                 "full-stage5-router-simd-batch",
+                "full-stage5-router-simd-batch-shared-tiled",
+                "full-stage5-router-simd-batch-shared-gate-up-tiled",
+                "full-stage5-router-simd-batch-shared-scalar-simd",
+                "full-stage5-router-simd-batch-shared-down-tiled",
                 "full-stage5-router-batch-deferred-phases",
                 "full-stage5-router-simd-batch-deferred-phases",
+                "full-stage5-router-simd-batch-shared-tiled-deferred-phases",
                 "full-stage5-router-batch-phases",
                 "full-stage5-router-batch-ffn-phases",
                 "full-stage5-router-simd-batch-phases",
                 "full-stage5-router-simd-batch-ffn-phases",
+                "full-stage5-router-simd-batch-shared-tiled-ffn-phases",
                 "router-defer-wait",
             ],
         )
@@ -162,6 +168,22 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
             args,
             "full-stage5-router-simd-batch",
         )
+        full_stage5_router_simd_batch_shared_tiled = script.build_env_overrides(
+            args,
+            "full-stage5-router-simd-batch-shared-tiled",
+        )
+        full_stage5_router_simd_batch_shared_gate_up_tiled = script.build_env_overrides(
+            args,
+            "full-stage5-router-simd-batch-shared-gate-up-tiled",
+        )
+        full_stage5_router_simd_batch_shared_scalar_simd = script.build_env_overrides(
+            args,
+            "full-stage5-router-simd-batch-shared-scalar-simd",
+        )
+        full_stage5_router_simd_batch_shared_down_tiled = script.build_env_overrides(
+            args,
+            "full-stage5-router-simd-batch-shared-down-tiled",
+        )
         full_stage5_router_batch_deferred = script.build_env_overrides(
             args,
             "full-stage5-router-batch-deferred-phases",
@@ -169,6 +191,10 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
         full_stage5_router_simd_batch_deferred = script.build_env_overrides(
             args,
             "full-stage5-router-simd-batch-deferred-phases",
+        )
+        full_stage5_router_simd_batch_shared_tiled_deferred = script.build_env_overrides(
+            args,
+            "full-stage5-router-simd-batch-shared-tiled-deferred-phases",
         )
         full_stage5_router_batch_phases = script.build_env_overrides(
             args,
@@ -185,6 +211,10 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
         full_stage5_router_simd_batch_ffn_phases = script.build_env_overrides(
             args,
             "full-stage5-router-simd-batch-ffn-phases",
+        )
+        full_stage5_router_simd_batch_shared_tiled_ffn_phases = script.build_env_overrides(
+            args,
+            "full-stage5-router-simd-batch-shared-tiled-ffn-phases",
         )
         router_defer = script.build_env_overrides(args, "router-defer-wait")
         default = script.build_env_overrides(args, "default")
@@ -256,6 +286,40 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
             "1",
         )
         self.assertEqual(
+            full_stage5_router_simd_batch_shared_tiled[
+                "SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_STAGE5_SIMD"
+            ],
+            "1",
+        )
+        self.assertEqual(
+            full_stage5_router_simd_batch_shared_tiled[
+                "SUPERSONIC_METAL_ENABLE_QWEN36_FFN_SHARED_TILED"
+            ],
+            "1",
+        )
+        self.assertEqual(
+            full_stage5_router_simd_batch_shared_tiled["SUPERSONIC_METAL_QWEN36_DECODE_BATCH"],
+            "1",
+        )
+        self.assertEqual(
+            full_stage5_router_simd_batch_shared_gate_up_tiled[
+                "SUPERSONIC_METAL_ENABLE_QWEN36_FFN_SHARED_GATE_UP_TILED"
+            ],
+            "1",
+        )
+        self.assertEqual(
+            full_stage5_router_simd_batch_shared_scalar_simd[
+                "SUPERSONIC_METAL_ENABLE_QWEN36_FFN_SHARED_SCALAR_SIMD"
+            ],
+            "1",
+        )
+        self.assertEqual(
+            full_stage5_router_simd_batch_shared_down_tiled[
+                "SUPERSONIC_METAL_ENABLE_QWEN36_FFN_SHARED_DOWN_TILED"
+            ],
+            "1",
+        )
+        self.assertEqual(
             full_stage5_router_batch_deferred[
                 "SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"
             ],
@@ -279,6 +343,18 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
         )
         self.assertEqual(
             full_stage5_router_simd_batch_deferred[
+                "SUPERSONIC_METAL_QWEN36_DECODE_BATCH_PROFILE_PHASES_DEFERRED"
+            ],
+            "1",
+        )
+        self.assertEqual(
+            full_stage5_router_simd_batch_shared_tiled_deferred[
+                "SUPERSONIC_METAL_ENABLE_QWEN36_FFN_SHARED_TILED"
+            ],
+            "1",
+        )
+        self.assertEqual(
+            full_stage5_router_simd_batch_shared_tiled_deferred[
                 "SUPERSONIC_METAL_QWEN36_DECODE_BATCH_PROFILE_PHASES_DEFERRED"
             ],
             "1",
@@ -346,6 +422,18 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
             "1",
         )
         self.assertEqual(
+            full_stage5_router_simd_batch_shared_tiled_ffn_phases[
+                "SUPERSONIC_METAL_ENABLE_QWEN36_FFN_SHARED_TILED"
+            ],
+            "1",
+        )
+        self.assertEqual(
+            full_stage5_router_simd_batch_shared_tiled_ffn_phases[
+                "SUPERSONIC_METAL_QWEN36_DECODE_BATCH_PROFILE_FFN_PHASES"
+            ],
+            "1",
+        )
+        self.assertEqual(
             router_defer["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"],
             "1",
         )
@@ -400,6 +488,11 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
         normal = script.build_command(args, "Hello", "full-stage5-router")
         batch = script.build_command(args, "Hello", "full-stage5-router-batch")
         simd_batch = script.build_command(args, "Hello", "full-stage5-router-simd-batch")
+        simd_batch_shared_tiled = script.build_command(
+            args,
+            "Hello",
+            "full-stage5-router-simd-batch-shared-tiled",
+        )
         deferred_batch = script.build_command(
             args,
             "Hello",
@@ -409,6 +502,11 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
             args,
             "Hello",
             "full-stage5-router-simd-batch-deferred-phases",
+        )
+        deferred_simd_batch_shared_tiled = script.build_command(
+            args,
+            "Hello",
+            "full-stage5-router-simd-batch-shared-tiled-deferred-phases",
         )
         batch_phases = script.build_command(args, "Hello", "full-stage5-router-batch-phases")
         batch_ffn_phases = script.build_command(
@@ -426,16 +524,24 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
             "Hello",
             "full-stage5-router-simd-batch-ffn-phases",
         )
+        simd_batch_shared_tiled_ffn_phases = script.build_command(
+            args,
+            "Hello",
+            "full-stage5-router-simd-batch-shared-tiled-ffn-phases",
+        )
 
         self.assertIn("--emit-stage-timings", normal)
         self.assertNotIn("--emit-stage-timings", batch)
         self.assertNotIn("--emit-stage-timings", simd_batch)
+        self.assertNotIn("--emit-stage-timings", simd_batch_shared_tiled)
         self.assertNotIn("--emit-stage-timings", deferred_batch)
         self.assertNotIn("--emit-stage-timings", deferred_simd_batch)
+        self.assertNotIn("--emit-stage-timings", deferred_simd_batch_shared_tiled)
         self.assertNotIn("--emit-stage-timings", batch_phases)
         self.assertNotIn("--emit-stage-timings", batch_ffn_phases)
         self.assertNotIn("--emit-stage-timings", simd_batch_phases)
         self.assertNotIn("--emit-stage-timings", simd_batch_ffn_phases)
+        self.assertNotIn("--emit-stage-timings", simd_batch_shared_tiled_ffn_phases)
         self.assertIn("--emit-generated-json", batch)
 
     def test_promotion_gate_passes_only_real_improvements(self):
