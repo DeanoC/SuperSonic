@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA = "qwen36-next-bottleneck-v3"
+SCHEMA = "qwen36-next-bottleneck-v4"
 MODEL = "qwen3.6-35b-a3b"
 BACKEND = "metal"
 FALLBACK_ACTION = "keep_default_lane_and_select_next_measured_bottleneck"
@@ -23,6 +23,7 @@ FFN_GATE_IDS = {
     "lru_resident_cache",
 }
 FFN_SUPERSEDED_IDS = {"mps_resident_table", "route_residency"}
+LINEAR_GATE_IDS = {"linear_decode_variants"}
 BUCKET_ACTIONS = {
     "ffn_ms_avg": "prototype_new_ffn_residency_or_compute_path",
     "linear_attn_ms_avg": "prototype_linear_attention_orchestration",
@@ -400,6 +401,11 @@ def ffn_gate_family_exhausted(sota_summary: dict[str, Any]) -> bool:
     return FFN_GATE_IDS.issubset(failed) and FFN_SUPERSEDED_IDS.issubset(superseded)
 
 
+def linear_gate_family_exhausted(sota_summary: dict[str, Any]) -> bool:
+    failed = set(str(item) for item in sota_summary.get("failed_gate_ids") or [])
+    return LINEAR_GATE_IDS.issubset(failed)
+
+
 def choose_recommendation(
     sota_report: dict[str, Any] | None,
     bucket_rows: list[dict[str, Any]],
@@ -458,6 +464,7 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         "static_topn_runtime": args.static_runtime_json,
         "fused_routed_int4": args.fused_json,
         "lru_resident_cache": args.lru_json,
+        "linear_decode_variants": args.linear_json,
         "batched_prefill_variants": args.prefill_json,
     }
     loaded: dict[str, dict[str, Any]] = {}
@@ -513,7 +520,12 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
 
     runtime_reports = {
         name: loaded[name]
-        for name in ("static_topn_runtime", "fused_routed_int4", "lru_resident_cache")
+        for name in (
+            "static_topn_runtime",
+            "fused_routed_int4",
+            "lru_resident_cache",
+            "linear_decode_variants",
+        )
         if name in loaded
     }
     if bench_perf_report is not None:
@@ -522,7 +534,13 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
             runtime_reports["bench_perf"] = normalized
     samples = collect_bucket_samples(runtime_reports)
     sota_report = loaded.get("sota_summary")
-    exhausted_buckets = {"ffn_ms_avg"} if sota_report and ffn_gate_family_exhausted(sota_report.get("summary") or {}) else set()
+    exhausted_buckets: set[str] = set()
+    if sota_report:
+        sota_summary = sota_report.get("summary") or {}
+        if ffn_gate_family_exhausted(sota_summary):
+            exhausted_buckets.add("ffn_ms_avg")
+        if linear_gate_family_exhausted(sota_summary):
+            exhausted_buckets.add("linear_attn_ms_avg")
     bucket_rows = summarize_buckets(samples, exhausted_buckets)
     recommendation = choose_recommendation(sota_report, bucket_rows, errors)
     return {
@@ -675,6 +693,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--prefill-json",
         type=Path,
         default=Path("target/qwen36_metal_batched_prefill_variant_sweep.json"),
+    )
+    parser.add_argument(
+        "--linear-json",
+        type=Path,
+        default=Path("target/qwen36_linear_decode_sweep.json"),
     )
     parser.add_argument(
         "--bench-perf-json",

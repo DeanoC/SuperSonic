@@ -604,7 +604,7 @@ under the same smoke:
    sweeps, and the latest optional `bench-perf` schema-v9 Qwen3.6 INT4
    artifact under `target/bench-runs`. It ranks decode buckets, records the
    prefill best-vs-baseline row, preserves top Metal/HAL profile ops, and writes
-   `target/qwen36_next_bottleneck.{json,md}`. The v3 selector also reads
+   `target/qwen36_next_bottleneck.{json,md}`. The v4 selector also reads
    adjacent `meta.json` worktree fingerprints and only auto-consumes bench
    artifacts whose git SHA plus diff hash match the current checkout, so
    rejected uncommitted experiments do not silently become the headline default.
@@ -638,7 +638,7 @@ under the same smoke:
    `profile_lifecycle_timings`, so command-buffer split overhead can be studied
    without making it the headline stage attribution. The same run directory's
    `meta.json` now includes git dirty paths and a diff hash for selector
-   artifact hygiene. The next-bottleneck selector's v3 schema consumes this
+   artifact hygiene. The next-bottleneck selector's v4 schema consumes this
    artifact when present, keeping the current headline run in the same evidence
    bundle as the narrower sweep rows.
 
@@ -655,7 +655,7 @@ under the same smoke:
    to `28.171 ms` total. The next measured bottleneck remains FFN host expert
    work by absolute time, but the current negative FFN residency gates still
    make the next actionable target the largest non-exhausted bucket selected by
-   the v2 selector.
+   the v4 selector.
 
 16. **Qwen3.6 linear recurrent beta/g hoist rejection**
    The next tiny linear-kernel idea was measured and rejected instead of
@@ -673,6 +673,30 @@ under the same smoke:
    kernel as the current default; the next useful work should be a larger
    orchestration/kernel change with a clearer normal-run win, not another
    beta/g hoist.
+
+17. **Qwen3.6 linear decode variant sweep**
+   The selector's linear-attention recommendation now has a repeatable gate
+   instead of another hand-run experiment. `tests/metal/sweep_qwen36_linear_decode.py`
+   compares the current default, the old residual handoff
+   (`direct-off` / `SUPERSONIC_METAL_DISABLE_QWEN36_LINEAR_DECODE_DIRECT=1`),
+   and the host linear fallback
+   (`host-linear` / `SUPERSONIC_METAL_DISABLE_QWEN36_LINEAR_INT4_STAGE5=1`)
+   under the same deterministic prompts. It records generated-ID parity,
+   `stage_timings`, `chain_breakdown`, lifecycle timings, optional Metal/HAL
+   profiles, `qwen36_linear_int4_stage5`, subdispatch totals, `copy_d2d`, and
+   `command_buffer_wait`. Its nonfatal promotion gate requires generated IDs
+   to match default, at least two generated tokens before a row can pass,
+   headline and `linear_attn_ms_avg` to improve, FFN/full-attention/lm-head to
+   stay inside the regression threshold, and non-regressed command-buffer wait
+   evidence when profiling is required. The SOTA gate summary now tracks this
+   report, and the next-bottleneck selector marks `linear_attn_ms_avg`
+   exhausted only after this gate has failed. That lets a measured negative
+   linear sweep move the next target to full attention instead of cycling
+   through smaller linear micro-tweaks. The first four-token Metal smoke
+   rejected both candidates: `direct-off` preserved the default IDs
+   `[11, 271, 40, 599]` but regressed headline decode (`860 ms` versus
+   `827 ms`) and full-attention attribution, while `host-linear` generated
+   `[11, 353, 599, 264]` and regressed headline, linear-attention, and lm-head.
 
 ## Sources
 

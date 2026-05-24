@@ -13,7 +13,7 @@ from typing import Any
 
 
 MODEL_ROOT_ENV = 'SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models"'
-SCHEMA = "qwen36-sota-gate-summary-v7"
+SCHEMA = "qwen36-sota-gate-summary-v8"
 
 
 @dataclass(frozen=True)
@@ -110,6 +110,18 @@ GATE_SPECS = (
         refresh_command=(
             f"{MODEL_ROOT_ENV} python3 tests/metal/sweep_qwen36_lru_resident_cache.py "
             "--capacities 32,64 --metal-profile"
+        ),
+    ),
+    GateSpec(
+        gate_id="linear_decode_variants",
+        label="Linear decode variants",
+        default_path=Path("target/qwen36_linear_decode_sweep.json"),
+        expected_schema="qwen36-linear-decode-sweep-v1",
+        gate_keys=("promotion_gate",),
+        kind="runtime_promotion",
+        refresh_command=(
+            f"{MODEL_ROOT_ENV} python3 tests/metal/sweep_qwen36_linear_decode.py "
+            "--prompt-set smoke --metal-profile"
         ),
     ),
 )
@@ -605,6 +617,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="LRU resident cache runtime sweep JSON",
     )
     parser.add_argument(
+        "--linear-json",
+        type=Path,
+        default=GATE_SPECS[7].default_path,
+        help="linear decode variant sweep JSON",
+    )
+    parser.add_argument(
         "--out-json",
         type=Path,
         default=Path("target/qwen36_sota_gate_summary.json"),
@@ -641,6 +659,7 @@ def paths_from_args(args: argparse.Namespace) -> dict[str, Path]:
         "route_residency": args.route_json,
         "mtp_acceptance": args.mtp_json,
         "lru_resident_cache": args.lru_json,
+        "linear_decode_variants": args.linear_json,
     }
 
 

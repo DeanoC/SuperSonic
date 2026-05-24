@@ -47,6 +47,10 @@ lru_sweep = load_script(
     "qwen36_sota_lru_sweep",
     METAL_DIR / "sweep_qwen36_lru_resident_cache.py",
 )
+linear_sweep = load_script(
+    "qwen36_sota_linear_sweep",
+    METAL_DIR / "sweep_qwen36_linear_decode.py",
+)
 next_bottleneck = load_script(
     "qwen36_sota_next_bottleneck",
     METAL_DIR / "select_qwen36_next_bottleneck.py",
@@ -74,8 +78,9 @@ class Qwen36SotaContractTests(unittest.TestCase):
         self.assertEqual(route_sweep.SCHEMA, "qwen36-route-residency-sweep-v1")
         self.assertEqual(mtp_sweep.SCHEMA, "qwen36-moe-mtp-acceptance-sweep-v2")
         self.assertEqual(lru_sweep.SCHEMA, "qwen36-lru-resident-cache-sweep-v1")
-        self.assertEqual(next_bottleneck.SCHEMA, "qwen36-next-bottleneck-v3")
-        self.assertEqual(sota_summary.SCHEMA, "qwen36-sota-gate-summary-v7")
+        self.assertEqual(linear_sweep.SCHEMA, "qwen36-linear-decode-sweep-v1")
+        self.assertEqual(next_bottleneck.SCHEMA, "qwen36-next-bottleneck-v4")
+        self.assertEqual(sota_summary.SCHEMA, "qwen36-sota-gate-summary-v8")
         self.assertEqual(sota_refresh.SCHEMA, "qwen36-sota-gate-refresh-plan-v1")
 
     def test_sota_summary_tracks_current_gate_reports(self):
@@ -111,6 +116,14 @@ class Qwen36SotaContractTests(unittest.TestCase):
             lru_sweep.SCHEMA,
         )
         self.assertIn("sweep_qwen36_lru_resident_cache.py", specs["lru_resident_cache"].refresh_command)
+        self.assertEqual(
+            specs["linear_decode_variants"].expected_schema,
+            linear_sweep.SCHEMA,
+        )
+        self.assertIn(
+            "sweep_qwen36_linear_decode.py",
+            specs["linear_decode_variants"].refresh_command,
+        )
         self.assertEqual(specs["mps_resident_table"].gate_keys, ("viability_gate",))
         self.assertEqual(specs["route_residency"].gate_keys, ("decision_gate",))
 
@@ -234,6 +247,56 @@ class Qwen36SotaContractTests(unittest.TestCase):
         gate = report["summary"]["promotion_gate"]
         self.assertTrue(gate["passed"])
         self.assertEqual(gate["passed_modes"], ["direct-gather"])
+        self.assertIn("thresholds", gate)
+        self.assertIn("candidates", gate)
+
+    def test_linear_decode_sweep_exposes_promotion_gate(self):
+        rows = [
+            {
+                "status": "ok",
+                "prompt_id": "p",
+                "mode": "default",
+                "generated_ids": [1, 2],
+                "result": {"ms_per_step": 100.0},
+                "stage_timings": {"lm_head_ms_avg": 5.0},
+                "chain_breakdown": {
+                    "ffn_ms_avg": 50.0,
+                    "full_attn_ms_avg": 10.0,
+                    "linear_attn_ms_avg": 20.0,
+                },
+                "metal_profile": {
+                    "entries": [{"op": "command_buffer_wait", "total_ms": 100.0}]
+                },
+            },
+            {
+                "status": "ok",
+                "prompt_id": "p",
+                "mode": "direct-off",
+                "generated_ids": [1, 2],
+                "result": {"ms_per_step": 90.0},
+                "stage_timings": {"lm_head_ms_avg": 5.1},
+                "chain_breakdown": {
+                    "ffn_ms_avg": 50.5,
+                    "full_attn_ms_avg": 10.5,
+                    "linear_attn_ms_avg": 15.0,
+                },
+                "metal_profile": {
+                    "entries": [{"op": "command_buffer_wait", "total_ms": 102.0}]
+                },
+            },
+        ]
+        args = linear_sweep.parse_args([])
+
+        report = linear_sweep.build_report(
+            rows,
+            args,
+            ["default", "direct-off"],
+            "smoke",
+        )
+
+        gate = report["summary"]["promotion_gate"]
+        self.assertTrue(gate["passed"])
+        self.assertEqual(gate["passed_modes"], ["direct-off"])
         self.assertIn("thresholds", gate)
         self.assertIn("candidates", gate)
 

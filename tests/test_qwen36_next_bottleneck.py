@@ -25,7 +25,7 @@ def write_json(path: Path, payload: dict) -> Path:
 
 def sota_summary(next_action: str = selector.FALLBACK_ACTION) -> dict:
     return {
-        "schema": "qwen36-sota-gate-summary-v7",
+        "schema": "qwen36-sota-gate-summary-v8",
         "summary": {
             "next_action": {"action": next_action},
             "failed_gate_ids": [
@@ -151,6 +151,7 @@ class Qwen36NextBottleneckTests(unittest.TestCase):
             "static_runtime_json": root / "static.json",
             "fused_json": root / "fused.json",
             "lru_json": root / "lru.json",
+            "linear_json": root / "linear.json",
             "prefill_json": root / "prefill.json",
             "bench_perf_json": None,
             "bench_run_root": root / "empty-bench-runs",
@@ -173,6 +174,10 @@ class Qwen36NextBottleneckTests(unittest.TestCase):
         write_json(
             paths["lru_json"],
             runtime_report(default_row("lru", 110.0, 70.0, 22.0, 7.0)),
+        )
+        write_json(
+            paths["linear_json"],
+            runtime_report(default_row("linear", 95.0, 55.0, 19.0, 5.5)),
         )
         write_json(paths["prefill_json"], prefill_report())
         return paths
@@ -198,7 +203,7 @@ class Qwen36NextBottleneckTests(unittest.TestCase):
         self.assertEqual(report["prefill"]["best_mode"], "prototype-default")
         self.assertIn("prototype_linear_attention_orchestration", md)
 
-    def test_includes_schema_v8_bench_perf_as_runtime_evidence(self):
+    def test_includes_schema_v9_bench_perf_as_runtime_evidence(self):
         with tempfile.TemporaryDirectory() as tmp:
             paths = self.write_default_inputs(Path(tmp))
             bench_path = Path(tmp) / "bench.json"
@@ -213,7 +218,7 @@ class Qwen36NextBottleneckTests(unittest.TestCase):
         self.assertEqual(report["bench_perf"]["linear_attn_ms_avg"], 31.335)
         self.assertEqual(report["bench_perf"]["profile_linear_attn_ms_avg"], 53.165)
         buckets = {row["bucket"]: row for row in report["decode_bucket_ranking"]}
-        self.assertEqual(buckets["ffn_ms_avg"]["sample_count"], 4)
+        self.assertEqual(buckets["ffn_ms_avg"]["sample_count"], 5)
         self.assertTrue(
             any(
                 sample["source"] == "bench_perf" and sample["row"] == "bench_perf"
@@ -223,6 +228,22 @@ class Qwen36NextBottleneckTests(unittest.TestCase):
         self.assertEqual(report["top_metal_profile_ops"][0]["source"], "bench_perf")
         self.assertIn("## Bench Perf", md)
         self.assertIn("profile_linear_attn_ms_avg", md)
+
+    def test_moves_to_full_attention_when_linear_gate_is_also_negative(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = self.write_default_inputs(Path(tmp))
+            summary = sota_summary()
+            summary["summary"]["failed_gate_ids"].append("linear_decode_variants")
+            write_json(paths["sota_json"], summary)
+            report = selector.build_report(self.args_for(paths))
+
+        rec = report["recommendation"]
+        self.assertEqual(rec["status"], "selected")
+        self.assertEqual(rec["dominant_bucket"], "ffn_ms_avg")
+        self.assertEqual(rec["target_bucket"], "full_attn_ms_avg")
+        self.assertEqual(rec["action"], "prototype_full_attention_orchestration")
+        buckets = {row["bucket"]: row for row in report["decode_bucket_ranking"]}
+        self.assertTrue(buckets["linear_attn_ms_avg"]["exhausted"])
 
     def test_auto_discovers_matching_bench_perf_fingerprint_before_newer_stale_run(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -321,6 +342,8 @@ class Qwen36NextBottleneckTests(unittest.TestCase):
                     str(paths["fused_json"]),
                     "--lru-json",
                     str(paths["lru_json"]),
+                    "--linear-json",
+                    str(paths["linear_json"]),
                     "--prefill-json",
                     str(paths["prefill_json"]),
                     "--bench-run-root",
