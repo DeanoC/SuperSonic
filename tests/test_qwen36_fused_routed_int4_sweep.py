@@ -1502,8 +1502,21 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
             "topk_weight_argmax=0 host_topk_weight_at_argmax=5.00000000e-01 "
             "metal_topk_weight_at_argmax=5.00000000e-01 "
             "expert_mid_max_abs=1.52587891e-05 "
-            "expert_mid_argmax=17 host_expert_mid_at_argmax=1.00000000e+00 "
+            "expert_mid_argmax=17 expert_mid_group=2 expert_mid_row=1 "
+            "host_expert_gate_at_mid_argmax=1.25000000e+00 "
+            "metal_expert_gate_at_mid_argmax=1.24998474e+00 "
+            "expert_gate_delta_at_mid_argmax=1.52587891e-05 "
+            "host_expert_up_at_mid_argmax=1.10000000e+00 "
+            "metal_expert_up_at_mid_argmax=1.09999084e+00 "
+            "expert_up_delta_at_mid_argmax=9.15527344e-06 "
+            "host_expert_silu_at_mid_argmax=9.71445143e-01 "
+            "metal_expert_silu_at_mid_argmax=9.71430421e-01 "
+            "expert_silu_delta_at_mid_argmax=1.47223473e-05 "
+            "host_expert_mid_at_argmax=1.00000000e+00 "
             "metal_expert_mid_at_argmax=9.99984741e-01 "
+            "host_expert_mid_recomputed_at_argmax=1.06858969e+00 "
+            "metal_expert_mid_recomputed_at_argmax=1.06856441e+00 "
+            "expert_mid_recompute_delta_at_argmax=2.52723694e-05 "
             "moe_out_max_abs=6.10351562e-05 moe_out_argmax=8 "
             "host_moe_out_at_argmax=1.25732422e-02 "
             "metal_moe_out_at_argmax=1.25122070e-02 "
@@ -1525,7 +1538,17 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
         self.assertEqual(corrections[0]["layer"], 33)
         self.assertEqual(corrections[0]["router_path"], "simd")
         self.assertEqual(corrections[0]["moe_out_argmax"], 8)
+        self.assertEqual(corrections[0]["expert_mid_group"], 2)
+        self.assertEqual(corrections[0]["expert_mid_row"], 1)
         self.assertEqual(corrections[0]["topk_idx_match"], 1)
+        self.assertAlmostEqual(
+            corrections[0]["expert_gate_delta_at_mid_argmax"],
+            0.0000152587891,
+        )
+        self.assertAlmostEqual(
+            corrections[0]["expert_mid_recompute_delta_at_argmax"],
+            0.0000252723694,
+        )
         self.assertAlmostEqual(
             corrections[0]["metal_mid_host_topk_moe_out_at_argmax"],
             0.0125122070,
@@ -1575,9 +1598,24 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
             report["summary"]["routed_host_correction"]["max_topk_weight_abs"],
             0.0,
         )
+        self.assertAlmostEqual(
+            report["summary"]["routed_host_correction"]["max_expert_gate_abs"],
+            0.0000152587891,
+        )
+        self.assertAlmostEqual(
+            report["summary"]["routed_host_correction"][
+                "max_expert_mid_recompute_abs"
+            ],
+            0.0000252723694,
+        )
         self.assertIn("routed_host_correction_count: `1`", md)
         self.assertIn(
             "routed_host_correction_metal_mid_host_topk_matches_metal_count: `1`",
+            md,
+        )
+        self.assertIn("routed_host_correction_max_expert_gate_abs: `0.00001526`", md)
+        self.assertIn(
+            "routed_host_correction_max_expert_mid_recompute_abs: `0.00002527`",
             md,
         )
         self.assertIn("routed_host_correction_max_output_patch_abs: `0.00012207`", md)
@@ -1586,6 +1624,7 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
             "| hello | full-stage5-router-simd-batch-shared-routed-host-corrected | simd | 33 | true |",
             md,
         )
+        self.assertIn("| 17 | 2 | 1 | 1.25000000 | 1.24998474 | 0.00001526 |", md)
 
     def test_decode_batch_routed_parity_tap_rows_are_parsed_and_rendered(self):
         script = sweep_qwen36_fused_routed_int4

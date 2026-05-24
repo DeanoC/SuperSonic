@@ -16,7 +16,7 @@ from typing import Any
 
 
 MODEL = "qwen3.6-35b-a3b"
-SCHEMA = "qwen36-fused-routed-int4-sweep-v29"
+SCHEMA = "qwen36-fused-routed-int4-sweep-v30"
 DEFAULT_MAX_FUSED_WALL_GPU_RATIO = 4.0
 DEFAULT_MAX_WAIT_GPU_RATIO = 4.0
 COARSE_BATCH_SERIAL_MODE = "full-stage5-router-batch"
@@ -810,6 +810,25 @@ def summarize_routed_host_corrections(rows: list[dict[str, Any]]) -> dict[str, A
             (float(item.get("expert_mid_max_abs") or 0.0) for item in corrections),
             default=0.0,
         ),
+        "max_expert_gate_abs": max(
+            (float(item.get("expert_gate_delta_at_mid_argmax") or 0.0) for item in corrections),
+            default=0.0,
+        ),
+        "max_expert_up_abs": max(
+            (float(item.get("expert_up_delta_at_mid_argmax") or 0.0) for item in corrections),
+            default=0.0,
+        ),
+        "max_expert_silu_abs": max(
+            (float(item.get("expert_silu_delta_at_mid_argmax") or 0.0) for item in corrections),
+            default=0.0,
+        ),
+        "max_expert_mid_recompute_abs": max(
+            (
+                float(item.get("expert_mid_recompute_delta_at_argmax") or 0.0)
+                for item in corrections
+            ),
+            default=0.0,
+        ),
         "max_topk_weight_abs": max(
             (float(item.get("topk_weight_max_abs") or 0.0) for item in corrections),
             default=0.0,
@@ -835,6 +854,44 @@ def summarize_routed_host_corrections(rows: list[dict[str, Any]]) -> dict[str, A
                 "topk_weight_argmax": item.get("topk_weight_argmax"),
                 "expert_mid_max_abs": item.get("expert_mid_max_abs"),
                 "expert_mid_argmax": item.get("expert_mid_argmax"),
+                "expert_mid_group": item.get("expert_mid_group"),
+                "expert_mid_row": item.get("expert_mid_row"),
+                "host_expert_gate_at_mid_argmax": item.get(
+                    "host_expert_gate_at_mid_argmax"
+                ),
+                "metal_expert_gate_at_mid_argmax": item.get(
+                    "metal_expert_gate_at_mid_argmax"
+                ),
+                "expert_gate_delta_at_mid_argmax": item.get(
+                    "expert_gate_delta_at_mid_argmax"
+                ),
+                "host_expert_up_at_mid_argmax": item.get(
+                    "host_expert_up_at_mid_argmax"
+                ),
+                "metal_expert_up_at_mid_argmax": item.get(
+                    "metal_expert_up_at_mid_argmax"
+                ),
+                "expert_up_delta_at_mid_argmax": item.get(
+                    "expert_up_delta_at_mid_argmax"
+                ),
+                "host_expert_silu_at_mid_argmax": item.get(
+                    "host_expert_silu_at_mid_argmax"
+                ),
+                "metal_expert_silu_at_mid_argmax": item.get(
+                    "metal_expert_silu_at_mid_argmax"
+                ),
+                "expert_silu_delta_at_mid_argmax": item.get(
+                    "expert_silu_delta_at_mid_argmax"
+                ),
+                "host_expert_mid_recomputed_at_argmax": item.get(
+                    "host_expert_mid_recomputed_at_argmax"
+                ),
+                "metal_expert_mid_recomputed_at_argmax": item.get(
+                    "metal_expert_mid_recomputed_at_argmax"
+                ),
+                "expert_mid_recompute_delta_at_argmax": item.get(
+                    "expert_mid_recompute_delta_at_argmax"
+                ),
                 "moe_out_max_abs": item.get("moe_out_max_abs"),
                 "moe_out_argmax": item.get("moe_out_argmax"),
                 "host_moe_out_at_argmax": item.get("host_moe_out_at_argmax"),
@@ -3113,6 +3170,10 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- routed_host_correction_metal_mid_host_topk_matches_metal_count: `{routed_host_correction.get('metal_mid_host_topk_matches_metal_count', 0)}`",
         f"- routed_host_correction_metal_mid_metal_topk_matches_metal_count: `{routed_host_correction.get('metal_mid_metal_topk_matches_metal_count', 0)}`",
         f"- routed_host_correction_max_topk_weight_abs: `{render_float(routed_host_correction.get('max_topk_weight_abs'), 8)}`",
+        f"- routed_host_correction_max_expert_gate_abs: `{render_float(routed_host_correction.get('max_expert_gate_abs'), 8)}`",
+        f"- routed_host_correction_max_expert_up_abs: `{render_float(routed_host_correction.get('max_expert_up_abs'), 8)}`",
+        f"- routed_host_correction_max_expert_silu_abs: `{render_float(routed_host_correction.get('max_expert_silu_abs'), 8)}`",
+        f"- routed_host_correction_max_expert_mid_recompute_abs: `{render_float(routed_host_correction.get('max_expert_mid_recompute_abs'), 8)}`",
         f"- routed_host_correction_max_moe_out_abs: `{render_float(routed_host_correction.get('max_moe_out_abs'), 8)}`",
         f"- routed_host_correction_max_output_patch_abs: `{render_float(routed_host_correction.get('max_output_patch_abs'), 8)}`",
         f"- final_hidden_tap_count: `{final_hidden_tap.get('tap_count', 0)}`",
@@ -3637,13 +3698,13 @@ def render_markdown(report: dict[str, Any]) -> str:
                 "",
                 "## Routed Host Correction",
                 "",
-                "| Prompt | Mode | Router | Layer | TopK match | TopK weight max | Expert mid max | Expert mid idx | MoE out max | MoE out idx | Host MoE | Metal MoE | Host recompute | Metal-mid host-topK | Metal-mid metal-topK | Output patch max | Output patch idx | Host final | Metal final | Changed elems | First changed |",
-                "|:---|:---|:---|---:|:---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+                "| Prompt | Mode | Router | Layer | TopK match | TopK weight max | Expert mid max | Expert mid idx | Group | Row | Host gate | Metal gate | Gate delta | Host up | Metal up | Up delta | Host SiLU | Metal SiLU | SiLU delta | Host mid | Metal mid | Host mid recompute | Metal mid recompute | Mid recompute delta | MoE out max | MoE out idx | Host MoE | Metal MoE | Host recompute | Metal-mid host-topK | Metal-mid metal-topK | Output patch max | Output patch idx | Host final | Metal final | Changed elems | First changed |",
+                "|:---|:---|:---|---:|:---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
             ]
         )
         for row, correction in ranked_routed_corrections[:40]:
             lines.append(
-                "| {prompt} | {mode} | {path} | {layer} | {topk_match} | {topk_weight} | {mid} | {mid_idx} | {moe} | {moe_idx} | {host_moe} | {metal_moe} | {host_recompute} | {metal_mid_host_topk} | {metal_mid_metal_topk} | {patch} | {patch_idx} | {host_final} | {metal_final} | {changed} | {first} |".format(
+                "| {prompt} | {mode} | {path} | {layer} | {topk_match} | {topk_weight} | {mid} | {mid_idx} | {mid_group} | {mid_row} | {host_gate} | {metal_gate} | {gate_delta} | {host_up} | {metal_up} | {up_delta} | {host_silu} | {metal_silu} | {silu_delta} | {host_mid} | {metal_mid} | {host_mid_recompute} | {metal_mid_recompute} | {mid_recompute_delta} | {moe} | {moe_idx} | {host_moe} | {metal_moe} | {host_recompute} | {metal_mid_host_topk} | {metal_mid_metal_topk} | {patch} | {patch_idx} | {host_final} | {metal_final} | {changed} | {first} |".format(
                     prompt=row.get("prompt_id", ""),
                     mode=row.get("mode", ""),
                     path=correction.get("router_path", "-"),
@@ -3652,6 +3713,50 @@ def render_markdown(report: dict[str, Any]) -> str:
                     topk_weight=render_float(correction.get("topk_weight_max_abs"), 8),
                     mid=render_float(correction.get("expert_mid_max_abs"), 8),
                     mid_idx=correction.get("expert_mid_argmax", "-"),
+                    mid_group=correction.get("expert_mid_group", "-"),
+                    mid_row=correction.get("expert_mid_row", "-"),
+                    host_gate=render_float(
+                        correction.get("host_expert_gate_at_mid_argmax"), 8
+                    ),
+                    metal_gate=render_float(
+                        correction.get("metal_expert_gate_at_mid_argmax"), 8
+                    ),
+                    gate_delta=render_float(
+                        correction.get("expert_gate_delta_at_mid_argmax"), 8
+                    ),
+                    host_up=render_float(
+                        correction.get("host_expert_up_at_mid_argmax"), 8
+                    ),
+                    metal_up=render_float(
+                        correction.get("metal_expert_up_at_mid_argmax"), 8
+                    ),
+                    up_delta=render_float(
+                        correction.get("expert_up_delta_at_mid_argmax"), 8
+                    ),
+                    host_silu=render_float(
+                        correction.get("host_expert_silu_at_mid_argmax"), 8
+                    ),
+                    metal_silu=render_float(
+                        correction.get("metal_expert_silu_at_mid_argmax"), 8
+                    ),
+                    silu_delta=render_float(
+                        correction.get("expert_silu_delta_at_mid_argmax"), 8
+                    ),
+                    host_mid=render_float(
+                        correction.get("host_expert_mid_at_argmax"), 8
+                    ),
+                    metal_mid=render_float(
+                        correction.get("metal_expert_mid_at_argmax"), 8
+                    ),
+                    host_mid_recompute=render_float(
+                        correction.get("host_expert_mid_recomputed_at_argmax"), 8
+                    ),
+                    metal_mid_recompute=render_float(
+                        correction.get("metal_expert_mid_recomputed_at_argmax"), 8
+                    ),
+                    mid_recompute_delta=render_float(
+                        correction.get("expert_mid_recompute_delta_at_argmax"), 8
+                    ),
                     moe=render_float(correction.get("moe_out_max_abs"), 8),
                     moe_idx=correction.get("moe_out_argmax", "-"),
                     host_moe=render_float(correction.get("host_moe_out_at_argmax"), 8),

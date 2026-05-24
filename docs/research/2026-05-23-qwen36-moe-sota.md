@@ -1908,6 +1908,51 @@ under the same smoke:
    fix is precise SiLU/multiply behavior, BF16/F32 staging, or an explicit
    hidden-stream tolerance/eval policy.
 
+53. **Qwen3.6 routed gate/up/SwiGLU probe**
+   The fused-routed sweep is now schema `v30`. The routed host-correction
+   diagnostic now has an env-gated Metal tap for routed expert gate/up: when
+   `SUPERSONIC_METAL_QWEN36_FFN_STAGE5_ROUTED_HOST_CORRECTION=1`, the tiled
+   expert gate/up shader writes the raw gate and up reductions into the
+   existing `off_expert_gu` workspace before materializing `expert_mid`. Normal
+   runs keep the sentinel offset and do not pay for the diagnostic writes. The
+   JSON/Markdown summary now records host and Metal gate, up, SiLU, and
+   recomputed mid values at the `expert_mid_argmax`.
+
+   The shortest Metal smoke wrote
+   `/private/tmp/qwen36_routed_gate_up_probe_v30_1tok.{json,md}` with
+   `--modes default,full-stage5-router-simd-batch-shared-routed-host-corrected
+   --max-new-tokens 1 --context-size 64 --metal-profile --layer-output-tap
+   --layer-output-delta-tap --layer-output-delta-all`. Generated IDs matched
+   (`[11]`), and the shared+routed diagnostic still produced zero layer-output
+   mismatches. The routed summary had `40` correction rows, `1` changed output
+   row, `topk_weight_max_abs=0.0`, `max_expert_gate_abs=5.7220459e-6`,
+   `max_expert_up_abs=3.33786011e-6`,
+   `max_expert_silu_abs=5.7220459e-6`, and
+   `max_expert_mid_recompute_abs=2.67028809e-5`.
+
+   The layer `33` cliff is now directly attributable to routed gate/up/SwiGLU
+   materialization. At expert-mid index `111` (`group=0`, `row=111`), host
+   gate/up/SwiGLU were `2.38652968`, `-2.25330496`, and `2.18557024`; Metal
+   wrote `2.38653088`, `-2.25330591`, and `2.18557143`. Those small deltas
+   exactly recreate the observed mid difference:
+   `host_expert_mid_recomputed_at_argmax=-4.92475605` versus
+   `metal_expert_mid_recomputed_at_argmax=-4.92476082`
+   (`expert_mid_recompute_delta_at_argmax=4.76837158e-6`). Feeding that Metal
+   mid into the already-probed down/combine path reproduces the Metal BF16 MoE
+   output (`-0.0220947266`) rather than the host BF16 output
+   (`-0.0219726562`) at hidden index `8`.
+
+   This rules out routed down/combine, top-k, and final residual ordering for
+   the remaining one-token correctness cliff. The next correctness target is
+   routed expert gate/up accumulation/materialization: either make the tiled
+   reduction land on the host-side value for boundary-sensitive rows, or promote
+   this path under an explicit layer-output tolerance policy that accepts the
+   measured BF16-scale drift. The performance profile from this diagnostic is
+   still submit/residency-heavy (`command_buffer_wait=743.468 ms` versus
+   `qwen36_ffn_int4_stage5_with_router` GPU `104.130 ms`), so the next runtime
+   optimization should not start until the correctness policy for this routed
+   gate/up BF16 boundary is decided.
+
 ## Sources
 
 - [Qwen/Qwen3.6-35B-A3B model card](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)

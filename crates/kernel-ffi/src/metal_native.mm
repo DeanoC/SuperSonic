@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <stdint.h>
@@ -27,6 +28,7 @@ extern "C" void supersonic_metal_profile_record(
 namespace {
 
 using MetalClock = std::chrono::steady_clock;
+static constexpr uint32_t QWEN36_FFN_NO_EXPERT_GU_TAP = 0xffffffffu;
 
 inline void record_runtime_profile(const char* op, MetalClock::time_point start) {
     supersonic_metal_profile_record(
@@ -40,6 +42,11 @@ inline void record_profile_elapsed(const char* op, const char* path, double elap
     if (std::isfinite(elapsed_ms) && elapsed_ms >= 0.0) {
         supersonic_metal_profile_record(op, path, elapsed_ms);
     }
+}
+
+inline bool qwen36_ffn_routed_host_correction_probe_enabled() {
+    return std::getenv("SUPERSONIC_METAL_QWEN36_FFN_STAGE5_ROUTED_HOST_CORRECTION") != nullptr &&
+           std::getenv("SUPERSONIC_METAL_FORCE_HOST_NATIVE") == nullptr;
 }
 
 inline void record_command_buffer_gpu_profile(id<MTLCommandBuffer> command_buffer, const std::string& label) {
@@ -114,6 +121,7 @@ struct Qwen36FfnExpertGateUpTiledParams {
     uint off_h_norm;
     uint off_topk_idx;
     uint off_expert_mid;
+    uint off_expert_gu;
 };
 
 struct Qwen36FfnExpertPackParams {
@@ -2729,6 +2737,8 @@ Qwen36FfnInt4Pipelines qwen36_ffn_int4_pipelines(NSError** error_out) {
 #include <metal_stdlib>
 using namespace metal;
 
+constant uint QWEN36_FFN_NO_EXPERT_GU_TAP = 0xffffffffu;
+
 struct Qwen36FfnInt4Params {
     uint hidden;
     uint num_experts;
@@ -2756,6 +2766,7 @@ struct Qwen36FfnExpertGateUpTiledParams {
     uint off_h_norm;
     uint off_topk_idx;
     uint off_expert_mid;
+    uint off_expert_gu;
 };
 
 struct Qwen36FfnExpertPackParams {
@@ -3433,6 +3444,11 @@ kernel void supersonic_qwen36_ffn_expert_gate_up_tiled(
         float gate = simd_sum(gate_in);
         float up = simd_sum(up_in);
         if (lane == 0u) {
+            if (params.off_expert_gu != QWEN36_FFN_NO_EXPERT_GU_TAP) {
+                uint gu_base = params.off_expert_gu + group * (2u * params.moe_intermediate);
+                workspace[gu_base + row] = gate;
+                workspace[gu_base + params.moe_intermediate + row] = up;
+            }
             workspace[params.off_expert_mid + group * params.moe_intermediate + row] =
                 silu(gate) * up;
         }
@@ -12264,6 +12280,7 @@ extern "C" int supersonic_metal_qwen36_ffn_expert_gate_up_tiled(
             static_cast<uint32_t>(off_h_norm),
             static_cast<uint32_t>(off_topk_idx),
             static_cast<uint32_t>(off_expert_mid),
+            QWEN36_FFN_NO_EXPERT_GU_TAP,
         };
 
         auto encode = [&](id<MTLComputeCommandEncoder> encoder) {
@@ -12381,6 +12398,7 @@ extern "C" int supersonic_metal_qwen36_ffn_expert_gate_up_down_finalize_tiled(
             static_cast<uint32_t>(off_h_norm),
             static_cast<uint32_t>(off_topk_idx),
             static_cast<uint32_t>(off_expert_mid),
+            QWEN36_FFN_NO_EXPERT_GU_TAP,
         };
         Qwen36FfnInt4Params down_params = {
             static_cast<uint32_t>(hidden),
@@ -12531,6 +12549,7 @@ extern "C" int supersonic_metal_qwen36_ffn_expert_direct_gather_stage5(
             static_cast<uint32_t>(off_h_norm),
             static_cast<uint32_t>(off_topk_idx),
             static_cast<uint32_t>(off_expert_mid),
+            QWEN36_FFN_NO_EXPERT_GU_TAP,
         };
         Qwen36FfnInt4Params down_params = {
             static_cast<uint32_t>(hidden),
@@ -12959,6 +12978,7 @@ extern "C" int supersonic_metal_qwen36_ffn_expert_gpu_pack_gate_up_down_finalize
             static_cast<uint32_t>(off_h_norm),
             static_cast<uint32_t>(off_topk_idx),
             static_cast<uint32_t>(off_expert_mid),
+            QWEN36_FFN_NO_EXPERT_GU_TAP,
         };
         Qwen36FfnInt4Params down_params = {
             static_cast<uint32_t>(hidden),
@@ -13244,6 +13264,9 @@ extern "C" int supersonic_metal_qwen36_ffn_int4_stage5(
             off_expert_mid,
             off_moe_out,
         };
+        uint32_t off_expert_gu_probe = qwen36_ffn_routed_host_correction_probe_enabled()
+            ? off_expert_gu
+            : QWEN36_FFN_NO_EXPERT_GU_TAP;
         Qwen36FfnExpertGateUpTiledParams expert_gate_params = {
             static_cast<uint32_t>(hidden),
             static_cast<uint32_t>(moe_intermediate),
@@ -13252,6 +13275,7 @@ extern "C" int supersonic_metal_qwen36_ffn_int4_stage5(
             off_h_norm,
             off_topk_idx,
             off_expert_mid,
+            off_expert_gu_probe,
         };
 
         auto encode_shared_gate_up = [&](id<MTLComputeCommandEncoder> encoder) {
@@ -13565,6 +13589,9 @@ extern "C" int supersonic_metal_qwen36_ffn_int4_stage5_with_router(
             off_expert_mid,
             off_moe_out,
         };
+        uint32_t off_expert_gu_probe = qwen36_ffn_routed_host_correction_probe_enabled()
+            ? off_expert_gu
+            : QWEN36_FFN_NO_EXPERT_GU_TAP;
         Qwen36FfnExpertGateUpTiledParams expert_gate_params = {
             static_cast<uint32_t>(hidden),
             static_cast<uint32_t>(moe_intermediate),
@@ -13573,6 +13600,7 @@ extern "C" int supersonic_metal_qwen36_ffn_int4_stage5_with_router(
             off_h_norm,
             off_topk_idx,
             off_expert_mid,
+            off_expert_gu_probe,
         };
         auto encode_router = [&](id<MTLComputeCommandEncoder> encoder) {
             if (router_simd) {

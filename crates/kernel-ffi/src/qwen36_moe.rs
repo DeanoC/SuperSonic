@@ -3975,6 +3975,9 @@ struct Qwen36FfnSharedReference {
 
 #[derive(Debug, Clone)]
 struct Qwen36FfnRoutedReference {
+    expert_gate: Vec<f32>,
+    expert_up: Vec<f32>,
+    expert_silu: Vec<f32>,
     expert_mid: Vec<f32>,
     moe_out: Vec<f32>,
     final_out: Vec<f32>,
@@ -4178,6 +4181,9 @@ fn qwen36_compute_ffn_routed_reference(
     group_size: usize,
 ) -> Qwen36FfnRoutedReference {
     let rows_per_group = 2 * moe_intermediate;
+    let mut expert_gate = vec![0.0f32; top_k * moe_intermediate];
+    let mut expert_up = vec![0.0f32; top_k * moe_intermediate];
+    let mut expert_silu = vec![0.0f32; top_k * moe_intermediate];
     let mut expert_mid = vec![0.0f32; top_k * moe_intermediate];
     for group in 0..top_k {
         let expert = topk_idx[group] as usize;
@@ -4206,6 +4212,9 @@ fn qwen36_compute_ffn_routed_reference(
                 h_norm,
             );
             let silu = gate * (1.0f32 / (1.0f32 + (-gate).exp()));
+            expert_gate[mid_base + row] = gate;
+            expert_up[mid_base + row] = up;
+            expert_silu[mid_base + row] = silu;
             expert_mid[mid_base + row] = silu * up;
         }
     }
@@ -4236,6 +4245,9 @@ fn qwen36_compute_ffn_routed_reference(
     }
 
     Qwen36FfnRoutedReference {
+        expert_gate,
+        expert_up,
+        expert_silu,
         expert_mid,
         moe_out,
         final_out,
@@ -4697,6 +4709,7 @@ fn qwen36_apply_ffn_routed_stage5_host_correction(
     top_k: usize,
     off_topk_val: usize,
     off_topk_idx: usize,
+    off_expert_gu: usize,
     off_expert_mid: usize,
     off_moe_out: usize,
     weights: &Qwen36MoeFfnStepWeights,
@@ -4711,10 +4724,16 @@ fn qwen36_apply_ffn_routed_stage5_host_correction(
 
     let workspace_len = workspace.len_bytes() / std::mem::size_of::<f32>();
     let expert_mid_len = top_k * moe_intermediate;
-    if workspace_len < off_expert_mid + expert_mid_len || workspace_len < off_moe_out + hidden {
+    let expert_gu_len = top_k * 2 * moe_intermediate;
+    if workspace_len < off_expert_gu + expert_gu_len
+        || workspace_len < off_expert_mid + expert_mid_len
+        || workspace_len < off_moe_out + hidden
+    {
         return Err(GpuError::InvalidArg(format!(
             "qwen36_moe::ffn_step_launch: routed host correction workspace too small: need {}, got {}",
-            (off_expert_mid + expert_mid_len).max(off_moe_out + hidden),
+            (off_expert_gu + expert_gu_len)
+                .max(off_expert_mid + expert_mid_len)
+                .max(off_moe_out + hidden),
             workspace_len
         )));
     }
@@ -4729,6 +4748,7 @@ fn qwen36_apply_ffn_routed_stage5_host_correction(
         std::slice::from_raw_parts_mut(workspace.as_mut_ptr() as *mut f32, workspace_len)
     };
     let output = unsafe { std::slice::from_raw_parts_mut(output.as_mut_ptr() as *mut u16, hidden) };
+    let metal_expert_gu = workspace[off_expert_gu..off_expert_gu + expert_gu_len].to_vec();
     let metal_expert_mid = workspace[off_expert_mid..off_expert_mid + expert_mid_len].to_vec();
     let metal_topk_weight = workspace[off_topk_val..off_topk_val + top_k].to_vec();
     let metal_topk_idx: Vec<u32> = workspace[off_topk_idx..off_topk_idx + top_k]
@@ -4758,6 +4778,46 @@ fn qwen36_apply_ffn_routed_stage5_host_correction(
         .get(expert_mid_argmax)
         .copied()
         .unwrap_or(f32::NAN);
+    let expert_mid_group = expert_mid_argmax / moe_intermediate;
+    let expert_mid_row = expert_mid_argmax % moe_intermediate;
+    let metal_gu_base = expert_mid_group * 2 * moe_intermediate;
+    let host_expert_gate_at_mid_argmax = reference
+        .expert_gate
+        .get(expert_mid_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let metal_expert_gate_at_mid_argmax = metal_expert_gu
+        .get(metal_gu_base + expert_mid_row)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let host_expert_up_at_mid_argmax = reference
+        .expert_up
+        .get(expert_mid_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let metal_expert_up_at_mid_argmax = metal_expert_gu
+        .get(metal_gu_base + moe_intermediate + expert_mid_row)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let host_expert_silu_at_mid_argmax = reference
+        .expert_silu
+        .get(expert_mid_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let metal_expert_silu_at_mid_argmax = metal_expert_gate_at_mid_argmax
+        * (1.0f32 / (1.0f32 + (-metal_expert_gate_at_mid_argmax).exp()));
+    let host_expert_mid_recomputed_at_argmax =
+        host_expert_silu_at_mid_argmax * host_expert_up_at_mid_argmax;
+    let metal_expert_mid_recomputed_at_argmax =
+        metal_expert_silu_at_mid_argmax * metal_expert_up_at_mid_argmax;
+    let expert_gate_delta_at_mid_argmax =
+        (host_expert_gate_at_mid_argmax - metal_expert_gate_at_mid_argmax).abs();
+    let expert_up_delta_at_mid_argmax =
+        (host_expert_up_at_mid_argmax - metal_expert_up_at_mid_argmax).abs();
+    let expert_silu_delta_at_mid_argmax =
+        (host_expert_silu_at_mid_argmax - metal_expert_silu_at_mid_argmax).abs();
+    let expert_mid_recompute_delta_at_argmax =
+        (host_expert_mid_recomputed_at_argmax - metal_expert_mid_recomputed_at_argmax).abs();
 
     let mut moe_out_max_abs = 0.0f32;
     let mut moe_out_argmax = 0usize;
@@ -4859,7 +4919,7 @@ fn qwen36_apply_ffn_routed_stage5_host_correction(
         "serial"
     };
     eprintln!(
-        "[qwen36-ffn-routed-host-correction] layer={} router_path={} hidden={} top_k={} topk_idx_match={} topk_weight_max_abs={:.8e} topk_weight_argmax={} host_topk_weight_at_argmax={:.8e} metal_topk_weight_at_argmax={:.8e} expert_mid_max_abs={:.8e} expert_mid_argmax={} host_expert_mid_at_argmax={:.8e} metal_expert_mid_at_argmax={:.8e} moe_out_max_abs={:.8e} moe_out_argmax={} host_moe_out_at_argmax={:.8e} metal_moe_out_at_argmax={:.8e} host_routed_down_acc_at_moe_argmax={:.8e} host_routed_moe_out_recomputed_at_argmax={:.8e} metal_mid_host_topk_down_acc_at_moe_argmax={:.8e} metal_mid_host_topk_moe_out_at_argmax={:.8e} metal_mid_metal_topk_down_acc_at_moe_argmax={:.8e} metal_mid_metal_topk_moe_out_at_argmax={:.8e} output_patch_max_abs={:.8e} output_patch_argmax={} host_final_out_at_argmax={:.8e} metal_final_out_at_argmax={:.8e} changed_output_elems={} first_changed_output={}",
+        "[qwen36-ffn-routed-host-correction] layer={} router_path={} hidden={} top_k={} topk_idx_match={} topk_weight_max_abs={:.8e} topk_weight_argmax={} host_topk_weight_at_argmax={:.8e} metal_topk_weight_at_argmax={:.8e} expert_mid_max_abs={:.8e} expert_mid_argmax={} expert_mid_group={} expert_mid_row={} host_expert_gate_at_mid_argmax={:.8e} metal_expert_gate_at_mid_argmax={:.8e} expert_gate_delta_at_mid_argmax={:.8e} host_expert_up_at_mid_argmax={:.8e} metal_expert_up_at_mid_argmax={:.8e} expert_up_delta_at_mid_argmax={:.8e} host_expert_silu_at_mid_argmax={:.8e} metal_expert_silu_at_mid_argmax={:.8e} expert_silu_delta_at_mid_argmax={:.8e} host_expert_mid_at_argmax={:.8e} metal_expert_mid_at_argmax={:.8e} host_expert_mid_recomputed_at_argmax={:.8e} metal_expert_mid_recomputed_at_argmax={:.8e} expert_mid_recompute_delta_at_argmax={:.8e} moe_out_max_abs={:.8e} moe_out_argmax={} host_moe_out_at_argmax={:.8e} metal_moe_out_at_argmax={:.8e} host_routed_down_acc_at_moe_argmax={:.8e} host_routed_moe_out_recomputed_at_argmax={:.8e} metal_mid_host_topk_down_acc_at_moe_argmax={:.8e} metal_mid_host_topk_moe_out_at_argmax={:.8e} metal_mid_metal_topk_down_acc_at_moe_argmax={:.8e} metal_mid_metal_topk_moe_out_at_argmax={:.8e} output_patch_max_abs={:.8e} output_patch_argmax={} host_final_out_at_argmax={:.8e} metal_final_out_at_argmax={:.8e} changed_output_elems={} first_changed_output={}",
         layer_idx,
         router_path,
         hidden,
@@ -4871,8 +4931,22 @@ fn qwen36_apply_ffn_routed_stage5_host_correction(
         metal_topk_weight_at_argmax,
         expert_mid_max_abs,
         expert_mid_argmax,
+        expert_mid_group,
+        expert_mid_row,
+        host_expert_gate_at_mid_argmax,
+        metal_expert_gate_at_mid_argmax,
+        expert_gate_delta_at_mid_argmax,
+        host_expert_up_at_mid_argmax,
+        metal_expert_up_at_mid_argmax,
+        expert_up_delta_at_mid_argmax,
+        host_expert_silu_at_mid_argmax,
+        metal_expert_silu_at_mid_argmax,
+        expert_silu_delta_at_mid_argmax,
         host_expert_mid_at_argmax,
         metal_expert_mid_at_argmax,
+        host_expert_mid_recomputed_at_argmax,
+        metal_expert_mid_recomputed_at_argmax,
+        expert_mid_recompute_delta_at_argmax,
         moe_out_max_abs,
         moe_out_argmax,
         host_moe_out_at_argmax,
@@ -8731,6 +8805,7 @@ fn ffn_step_stage1_5_metal_host(
                     top_k,
                     off_topk_val,
                     off_topk_idx,
+                    off_expert_gu,
                     off_expert_mid,
                     off_moe_out,
                     weights,
