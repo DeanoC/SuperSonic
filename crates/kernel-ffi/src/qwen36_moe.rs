@@ -6398,6 +6398,208 @@ pub fn ffn_expert_tiled_stage5_metal_launch(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn ffn_expert_direct_gather_stage5_metal_launch(
+    hidden: usize,
+    moe_intermediate: usize,
+    top_k: usize,
+    group_size: usize,
+    workspace: &mut GpuBuffer,
+    input_hidden: &GpuBuffer,
+    gate_up_proj: &GpuBuffer,
+    gate_up_scale: &GpuBuffer,
+    gate_up_zero: &GpuBuffer,
+    down_proj: &GpuBuffer,
+    down_scale: &GpuBuffer,
+    down_zero: &GpuBuffer,
+    output: &mut GpuBuffer,
+    off_h_norm: usize,
+    off_topk_val: usize,
+    off_topk_idx: usize,
+    off_shared_out: usize,
+    off_expert_mid: usize,
+    off_moe_out: usize,
+) -> Result<(), GpuError> {
+    if workspace.backend() != Backend::Metal
+        || input_hidden.backend() != Backend::Metal
+        || gate_up_proj.backend() != Backend::Metal
+        || gate_up_scale.backend() != Backend::Metal
+        || gate_up_zero.backend() != Backend::Metal
+        || down_proj.backend() != Backend::Metal
+        || down_scale.backend() != Backend::Metal
+        || down_zero.backend() != Backend::Metal
+        || output.backend() != Backend::Metal
+    {
+        return Err(GpuError::InvalidArg(
+            "qwen36_moe::ffn_expert_direct_gather_stage5_metal_launch requires all buffers on Metal"
+                .into(),
+        ));
+    }
+    if workspace.dtype() != ScalarType::F32
+        || input_hidden.dtype() != ScalarType::BF16
+        || gate_up_proj.dtype() != ScalarType::U8
+        || gate_up_scale.dtype() != ScalarType::BF16
+        || gate_up_zero.dtype() != ScalarType::BF16
+        || down_proj.dtype() != ScalarType::U8
+        || down_scale.dtype() != ScalarType::BF16
+        || down_zero.dtype() != ScalarType::BF16
+        || output.dtype() != ScalarType::BF16
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::ffn_expert_direct_gather_stage5_metal_launch expects F32/BF16/U8/BF16/BF16/U8/BF16/BF16/BF16, got {:?}/{:?}/{:?}/{:?}/{:?}/{:?}/{:?}/{:?}/{:?}",
+            workspace.dtype(),
+            input_hidden.dtype(),
+            gate_up_proj.dtype(),
+            gate_up_scale.dtype(),
+            gate_up_zero.dtype(),
+            down_proj.dtype(),
+            down_scale.dtype(),
+            down_zero.dtype(),
+            output.dtype()
+        )));
+    }
+    unsafe {
+        crate::metal_native::qwen36_ffn_expert_direct_gather_stage5(
+            hidden,
+            moe_intermediate,
+            top_k,
+            group_size,
+            workspace.as_mut_ptr(),
+            input_hidden.as_ptr(),
+            gate_up_proj.as_ptr(),
+            gate_up_scale.as_ptr(),
+            gate_up_zero.as_ptr(),
+            down_proj.as_ptr(),
+            down_scale.as_ptr(),
+            down_zero.as_ptr(),
+            output.as_mut_ptr(),
+            off_h_norm,
+            off_topk_val,
+            off_topk_idx,
+            off_shared_out,
+            off_expert_mid,
+            off_moe_out,
+            true,
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn ffn_expert_gpu_pack_stage5_metal_launch(
+    hidden: usize,
+    moe_intermediate: usize,
+    top_k: usize,
+    group_size: usize,
+    workspace: &mut GpuBuffer,
+    input_hidden: &GpuBuffer,
+    gate_up_proj_src: &GpuBuffer,
+    gate_up_scale_src: &GpuBuffer,
+    gate_up_zero_src: &GpuBuffer,
+    down_proj_src: &GpuBuffer,
+    down_scale_src: &GpuBuffer,
+    down_zero_src: &GpuBuffer,
+    gate_up_proj_dst: &mut GpuBuffer,
+    gate_up_scale_dst: &mut GpuBuffer,
+    gate_up_zero_dst: &mut GpuBuffer,
+    down_proj_dst: &mut GpuBuffer,
+    down_scale_dst: &mut GpuBuffer,
+    down_zero_dst: &mut GpuBuffer,
+    output: &mut GpuBuffer,
+    off_h_norm: usize,
+    off_topk_val: usize,
+    off_topk_idx: usize,
+    off_shared_out: usize,
+    off_expert_mid: usize,
+    off_moe_out: usize,
+) -> Result<(), GpuError> {
+    if workspace.backend() != Backend::Metal
+        || input_hidden.backend() != Backend::Metal
+        || gate_up_proj_src.backend() != Backend::Metal
+        || gate_up_scale_src.backend() != Backend::Metal
+        || gate_up_zero_src.backend() != Backend::Metal
+        || down_proj_src.backend() != Backend::Metal
+        || down_scale_src.backend() != Backend::Metal
+        || down_zero_src.backend() != Backend::Metal
+        || gate_up_proj_dst.backend() != Backend::Metal
+        || gate_up_scale_dst.backend() != Backend::Metal
+        || gate_up_zero_dst.backend() != Backend::Metal
+        || down_proj_dst.backend() != Backend::Metal
+        || down_scale_dst.backend() != Backend::Metal
+        || down_zero_dst.backend() != Backend::Metal
+        || output.backend() != Backend::Metal
+    {
+        return Err(GpuError::InvalidArg(
+            "qwen36_moe::ffn_expert_gpu_pack_stage5_metal_launch requires all buffers on Metal"
+                .into(),
+        ));
+    }
+    if workspace.dtype() != ScalarType::F32
+        || input_hidden.dtype() != ScalarType::BF16
+        || gate_up_proj_src.dtype() != ScalarType::U8
+        || gate_up_scale_src.dtype() != ScalarType::BF16
+        || gate_up_zero_src.dtype() != ScalarType::BF16
+        || down_proj_src.dtype() != ScalarType::U8
+        || down_scale_src.dtype() != ScalarType::BF16
+        || down_zero_src.dtype() != ScalarType::BF16
+        || gate_up_proj_dst.dtype() != ScalarType::U8
+        || gate_up_scale_dst.dtype() != ScalarType::BF16
+        || gate_up_zero_dst.dtype() != ScalarType::BF16
+        || down_proj_dst.dtype() != ScalarType::U8
+        || down_scale_dst.dtype() != ScalarType::BF16
+        || down_zero_dst.dtype() != ScalarType::BF16
+        || output.dtype() != ScalarType::BF16
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::ffn_expert_gpu_pack_stage5_metal_launch dtype mismatch: workspace={:?} input_hidden={:?} gate_up_src={:?}/{:?}/{:?} down_src={:?}/{:?}/{:?} gate_up_dst={:?}/{:?}/{:?} down_dst={:?}/{:?}/{:?} output={:?}",
+            workspace.dtype(),
+            input_hidden.dtype(),
+            gate_up_proj_src.dtype(),
+            gate_up_scale_src.dtype(),
+            gate_up_zero_src.dtype(),
+            down_proj_src.dtype(),
+            down_scale_src.dtype(),
+            down_zero_src.dtype(),
+            gate_up_proj_dst.dtype(),
+            gate_up_scale_dst.dtype(),
+            gate_up_zero_dst.dtype(),
+            down_proj_dst.dtype(),
+            down_scale_dst.dtype(),
+            down_zero_dst.dtype(),
+            output.dtype()
+        )));
+    }
+    unsafe {
+        crate::metal_native::qwen36_ffn_expert_gpu_pack_gate_up_down_finalize_tiled(
+            hidden,
+            moe_intermediate,
+            top_k,
+            group_size,
+            workspace.as_mut_ptr(),
+            input_hidden.as_ptr(),
+            gate_up_proj_src.as_ptr(),
+            gate_up_scale_src.as_ptr(),
+            gate_up_zero_src.as_ptr(),
+            down_proj_src.as_ptr(),
+            down_scale_src.as_ptr(),
+            down_zero_src.as_ptr(),
+            gate_up_proj_dst.as_mut_ptr(),
+            gate_up_scale_dst.as_mut_ptr(),
+            gate_up_zero_dst.as_mut_ptr(),
+            down_proj_dst.as_mut_ptr(),
+            down_scale_dst.as_mut_ptr(),
+            down_zero_dst.as_mut_ptr(),
+            output.as_mut_ptr(),
+            off_h_norm,
+            off_topk_val,
+            off_topk_idx,
+            off_shared_out,
+            off_expert_mid,
+            off_moe_out,
+            true,
+        )
+    }
+}
+
 /// Safe wrapper for the PR 4b4 staged MoE FFN parity launcher.
 ///
 /// `output` must be a BF16 buffer with at least `max(top_k, hidden)` elements

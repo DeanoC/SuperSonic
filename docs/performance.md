@@ -1171,10 +1171,16 @@ cargo build --release -p runner --bin qwen36_ffn_expert_microbench
 target/release/qwen36_ffn_expert_microbench --iters 20 --warmup 3
 ```
 
-On this M5 Max it reports `mean_ms=0.4490`, `max_abs=0.000015`, and
-`mismatches=0` for gate/up, plus `mean_ms=0.3332`, `max_abs=0.000000`, and
-`mismatches=0` for the combined gate/up + down/finalize path. Wired into decode
-with
+The binary reports gate/up-only, the original combined tiled stage-5 path, the
+direct-gather fused routed INT4 path, and the GPU-pack fused routed INT4 path.
+All four rows use the same synthetic Qwen3.6 stage-5 geometry and validate
+against the CPU oracle, so the GPU-pack row is the apples-to-apples microbench
+for the route-sweep fallback when static residency misses too often.
+
+On this M5 Max, the four-row Metal validation run reports `mean_ms=0.5351` for
+gate/up, `0.4984` for the original combined stage-5 path, `0.3369` for
+direct-gather fused stage-5, and `0.5331` for GPU-pack fused stage-5; every row
+has `mismatches=0`. Wired into decode with
 `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_GATE_UP_TILED=1`, the same kernel
 still generates `[11]`, and the Metal profile shows only 8.418 ms total GPU
 time for `command_buffer_gpu:qwen36_ffn_int4_expert_gate_up_tiled` across

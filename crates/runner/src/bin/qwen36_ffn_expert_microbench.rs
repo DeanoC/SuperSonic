@@ -6,10 +6,10 @@
 
 use anyhow::{anyhow, bail, Result};
 use clap::Parser;
-use gpu_hal::{Backend, GpuBuffer, ScalarType};
+use gpu_hal::{copy_h2d, Backend, GpuBuffer, ScalarType};
 use half::bf16;
 use kernel_ffi::qwen36_moe;
-use std::time::Instant;
+use std::{ffi::c_void, time::Instant};
 
 const HIDDEN: usize = 2048;
 const NUM_EXPERTS: usize = 256;
@@ -50,6 +50,34 @@ fn f32_from_bytes(bytes: &[u8]) -> Vec<f32> {
         .chunks_exact(4)
         .map(|c| f32::from_bits(u32::from_le_bytes([c[0], c[1], c[2], c[3]])))
         .collect()
+}
+
+fn bf16_from_bytes(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(2)
+        .map(|c| bf16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
+        .collect()
+}
+
+fn write_topk_indices(
+    workspace: &mut GpuBuffer,
+    off_topk_idx: usize,
+    experts: &[usize],
+) -> Result<()> {
+    let vals: Vec<f32> = experts
+        .iter()
+        .map(|&expert| f32::from_bits(expert as u32))
+        .collect();
+    let bytes = f32_bytes(&vals);
+    let byte_offset = off_topk_idx * std::mem::size_of::<f32>();
+    let dst = unsafe { (workspace.as_mut_ptr() as *mut u8).add(byte_offset) as *mut c_void };
+    copy_h2d(
+        workspace.device_ordinal(),
+        dst,
+        bytes.as_ptr() as *const c_void,
+        bytes.len(),
+    )?;
+    Ok(())
 }
 
 fn nibble_at(expert: usize, row: usize, col: usize) -> u8 {
@@ -204,6 +232,83 @@ fn reference_final(
     out
 }
 
+fn validate_expert_mid(
+    label: &str,
+    args: &Args,
+    mean_ms: f64,
+    got: &[f32],
+    expected: &[f32],
+) -> Result<()> {
+    let mut max_abs = 0.0f32;
+    let mut max_rel = 0.0f32;
+    let mut worst = 0usize;
+    let mut mismatches = 0usize;
+    for i in 0..got.len() {
+        let d = (got[i] - expected[i]).abs();
+        let rel = d / expected[i].abs().max(1.0);
+        if d > max_abs {
+            max_abs = d;
+            max_rel = rel;
+            worst = i;
+        }
+        let tol = expected[i].abs().max(1.0) * 0.04 + 0.02;
+        if d > tol {
+            mismatches += 1;
+        }
+    }
+    println!(
+        "[{label}] mean_ms={mean_ms:.4} iters={} warmup={} max_abs={max_abs:.6} max_rel={max_rel:.6} worst={} got={:.6} expected={:.6} mismatches={mismatches}",
+        args.iters,
+        args.warmup,
+        worst,
+        got[worst],
+        expected[worst],
+    );
+    if mismatches > 0 {
+        return Err(anyhow!("{label} mismatches: {mismatches}"));
+    }
+    Ok(())
+}
+
+fn validate_final_output(
+    label: &str,
+    args: &Args,
+    mean_ms: f64,
+    output: &GpuBuffer,
+    expected_final: &[f32],
+) -> Result<()> {
+    let got_final = bf16_from_bytes(&output.to_host_bytes()?);
+    let mut max_abs = 0.0f32;
+    let mut max_rel = 0.0f32;
+    let mut worst = 0usize;
+    let mut mismatches = 0usize;
+    for i in 0..got_final.len() {
+        let d = (got_final[i] - expected_final[i]).abs();
+        let rel = d / expected_final[i].abs().max(1.0);
+        if d > max_abs {
+            max_abs = d;
+            max_rel = rel;
+            worst = i;
+        }
+        let tol = expected_final[i].abs().max(1.0) * 0.08 + 0.05;
+        if d > tol {
+            mismatches += 1;
+        }
+    }
+    println!(
+        "[{label}] mean_ms={mean_ms:.4} iters={} warmup={} max_abs={max_abs:.6} max_rel={max_rel:.6} worst={} got={:.6} expected={:.6} mismatches={mismatches}",
+        args.iters,
+        args.warmup,
+        worst,
+        got_final[worst],
+        expected_final[worst],
+    );
+    if mismatches > 0 {
+        return Err(anyhow!("{label} mismatches: {mismatches}"));
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     if !gpu_hal::is_backend_compiled(Backend::Metal) {
@@ -267,6 +372,12 @@ fn main() -> Result<()> {
         &[workspace_len],
         &f32_bytes(&workspace_host),
     )?;
+    let mut workspace_gpu_pack = GpuBuffer::from_host_bytes(
+        0,
+        ScalarType::F32,
+        &[workspace_len],
+        &f32_bytes(&workspace_host),
+    )?;
     let gate_up =
         GpuBuffer::from_host_bytes(0, ScalarType::U8, &[NUM_EXPERTS, rows, HIDDEN / 2], &packed)?;
     let gate_up_scale = GpuBuffer::from_host_bytes(
@@ -310,6 +421,35 @@ fn main() -> Result<()> {
     let input_hidden_buf =
         GpuBuffer::from_host_bytes(0, ScalarType::BF16, &[HIDDEN], &bf16_bytes(&input_hidden))?;
     let mut output = GpuBuffer::zeros(0, ScalarType::BF16, &[HIDDEN])?;
+    let mut direct_output = GpuBuffer::zeros(0, ScalarType::BF16, &[HIDDEN])?;
+    let mut gpu_pack_output = GpuBuffer::zeros(0, ScalarType::BF16, &[HIDDEN])?;
+    let mut gate_up_gpu_pack =
+        GpuBuffer::zeros(0, ScalarType::U8, &[TOP_K, rows, HIDDEN / 2])?;
+    let mut gate_up_scale_gpu_pack = GpuBuffer::zeros(
+        0,
+        ScalarType::BF16,
+        &[TOP_K, rows / GROUP_SIZE, HIDDEN / GROUP_SIZE],
+    )?;
+    let mut gate_up_zero_gpu_pack = GpuBuffer::zeros(
+        0,
+        ScalarType::BF16,
+        &[TOP_K, rows / GROUP_SIZE, HIDDEN / GROUP_SIZE],
+    )?;
+    let mut down_gpu_pack = GpuBuffer::zeros(
+        0,
+        ScalarType::U8,
+        &[TOP_K, HIDDEN, MOE_INTERMEDIATE / 2],
+    )?;
+    let mut down_scale_gpu_pack = GpuBuffer::zeros(
+        0,
+        ScalarType::BF16,
+        &[TOP_K, HIDDEN / GROUP_SIZE, MOE_INTERMEDIATE / GROUP_SIZE],
+    )?;
+    let mut down_zero_gpu_pack = GpuBuffer::zeros(
+        0,
+        ScalarType::BF16,
+        &[TOP_K, HIDDEN / GROUP_SIZE, MOE_INTERMEDIATE / GROUP_SIZE],
+    )?;
 
     for _ in 0..args.warmup {
         qwen36_moe::ffn_expert_gate_up_tiled_metal_launch(
@@ -347,34 +487,13 @@ fn main() -> Result<()> {
 
     let got_all = f32_from_bytes(&workspace.to_host_bytes()?);
     let got = &got_all[off_expert_mid..off_expert_mid + TOP_K * MOE_INTERMEDIATE];
-    let mut max_abs = 0.0f32;
-    let mut max_rel = 0.0f32;
-    let mut worst = 0usize;
-    let mut mismatches = 0usize;
-    for i in 0..got.len() {
-        let d = (got[i] - expected[i]).abs();
-        let rel = d / expected[i].abs().max(1.0);
-        if d > max_abs {
-            max_abs = d;
-            max_rel = rel;
-            worst = i;
-        }
-        let tol = expected[i].abs().max(1.0) * 0.04 + 0.02;
-        if d > tol {
-            mismatches += 1;
-        }
-    }
-    println!(
-        "[qwen36-ffn-expert-gate-up-tiled] mean_ms={mean_ms:.4} iters={} warmup={} max_abs={max_abs:.6} max_rel={max_rel:.6} worst={} got={:.6} expected={:.6} mismatches={mismatches}",
-        args.iters,
-        args.warmup,
-        worst,
-        got[worst],
-        expected[worst],
-    );
-    if mismatches > 0 {
-        return Err(anyhow!("tiled expert gate/up mismatches: {mismatches}"));
-    }
+    validate_expert_mid(
+        "qwen36-ffn-expert-gate-up-tiled",
+        &args,
+        mean_ms,
+        got,
+        &expected,
+    )?;
 
     for _ in 0..args.warmup {
         qwen36_moe::ffn_expert_tiled_stage5_metal_launch(
@@ -425,40 +544,140 @@ fn main() -> Result<()> {
         )?;
     }
     let full_mean_ms = start.elapsed().as_secs_f64() * 1000.0 / args.iters.max(1) as f64;
-    let got_final: Vec<f32> = output
-        .to_host_bytes()?
-        .chunks_exact(2)
-        .map(|c| bf16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32())
-        .collect();
-    let mut full_max_abs = 0.0f32;
-    let mut full_max_rel = 0.0f32;
-    let mut full_worst = 0usize;
-    let mut full_mismatches = 0usize;
-    for i in 0..got_final.len() {
-        let d = (got_final[i] - expected_final[i]).abs();
-        let rel = d / expected_final[i].abs().max(1.0);
-        if d > full_max_abs {
-            full_max_abs = d;
-            full_max_rel = rel;
-            full_worst = i;
-        }
-        let tol = expected_final[i].abs().max(1.0) * 0.08 + 0.05;
-        if d > tol {
-            full_mismatches += 1;
-        }
+    validate_final_output(
+        "qwen36-ffn-expert-tiled-stage5",
+        &args,
+        full_mean_ms,
+        &output,
+        &expected_final,
+    )?;
+
+    for _ in 0..args.warmup {
+        qwen36_moe::ffn_expert_direct_gather_stage5_metal_launch(
+            HIDDEN,
+            MOE_INTERMEDIATE,
+            TOP_K,
+            GROUP_SIZE,
+            &mut workspace,
+            &input_hidden_buf,
+            &gate_up,
+            &gate_up_scale,
+            &gate_up_zero,
+            &down,
+            &down_scale,
+            &down_zero,
+            &mut direct_output,
+            off_h_norm,
+            off_topk_val,
+            off_topk_idx,
+            off_shared_out,
+            off_expert_mid,
+            off_moe_out,
+        )?;
     }
-    println!(
-        "[qwen36-ffn-expert-tiled-stage5] mean_ms={full_mean_ms:.4} iters={} warmup={} max_abs={full_max_abs:.6} max_rel={full_max_rel:.6} worst={} got={:.6} expected={:.6} mismatches={full_mismatches}",
-        args.iters,
-        args.warmup,
-        full_worst,
-        got_final[full_worst],
-        expected_final[full_worst],
-    );
-    if full_mismatches > 0 {
-        return Err(anyhow!(
-            "tiled expert stage5 finalize mismatches: {full_mismatches}"
-        ));
+
+    let start = Instant::now();
+    for _ in 0..args.iters {
+        qwen36_moe::ffn_expert_direct_gather_stage5_metal_launch(
+            HIDDEN,
+            MOE_INTERMEDIATE,
+            TOP_K,
+            GROUP_SIZE,
+            &mut workspace,
+            &input_hidden_buf,
+            &gate_up,
+            &gate_up_scale,
+            &gate_up_zero,
+            &down,
+            &down_scale,
+            &down_zero,
+            &mut direct_output,
+            off_h_norm,
+            off_topk_val,
+            off_topk_idx,
+            off_shared_out,
+            off_expert_mid,
+            off_moe_out,
+        )?;
     }
+    let direct_mean_ms = start.elapsed().as_secs_f64() * 1000.0 / args.iters.max(1) as f64;
+    validate_final_output(
+        "qwen36-ffn-expert-direct-gather-stage5",
+        &args,
+        direct_mean_ms,
+        &direct_output,
+        &expected_final,
+    )?;
+
+    for _ in 0..args.warmup {
+        write_topk_indices(&mut workspace_gpu_pack, off_topk_idx, &active_experts)?;
+        qwen36_moe::ffn_expert_gpu_pack_stage5_metal_launch(
+            HIDDEN,
+            MOE_INTERMEDIATE,
+            TOP_K,
+            GROUP_SIZE,
+            &mut workspace_gpu_pack,
+            &input_hidden_buf,
+            &gate_up,
+            &gate_up_scale,
+            &gate_up_zero,
+            &down,
+            &down_scale,
+            &down_zero,
+            &mut gate_up_gpu_pack,
+            &mut gate_up_scale_gpu_pack,
+            &mut gate_up_zero_gpu_pack,
+            &mut down_gpu_pack,
+            &mut down_scale_gpu_pack,
+            &mut down_zero_gpu_pack,
+            &mut gpu_pack_output,
+            off_h_norm,
+            off_topk_val,
+            off_topk_idx,
+            off_shared_out,
+            off_expert_mid,
+            off_moe_out,
+        )?;
+    }
+
+    let start = Instant::now();
+    for _ in 0..args.iters {
+        write_topk_indices(&mut workspace_gpu_pack, off_topk_idx, &active_experts)?;
+        qwen36_moe::ffn_expert_gpu_pack_stage5_metal_launch(
+            HIDDEN,
+            MOE_INTERMEDIATE,
+            TOP_K,
+            GROUP_SIZE,
+            &mut workspace_gpu_pack,
+            &input_hidden_buf,
+            &gate_up,
+            &gate_up_scale,
+            &gate_up_zero,
+            &down,
+            &down_scale,
+            &down_zero,
+            &mut gate_up_gpu_pack,
+            &mut gate_up_scale_gpu_pack,
+            &mut gate_up_zero_gpu_pack,
+            &mut down_gpu_pack,
+            &mut down_scale_gpu_pack,
+            &mut down_zero_gpu_pack,
+            &mut gpu_pack_output,
+            off_h_norm,
+            off_topk_val,
+            off_topk_idx,
+            off_shared_out,
+            off_expert_mid,
+            off_moe_out,
+        )?;
+    }
+    let gpu_pack_mean_ms = start.elapsed().as_secs_f64() * 1000.0 / args.iters.max(1) as f64;
+    validate_final_output(
+        "qwen36-ffn-expert-gpu-pack-stage5",
+        &args,
+        gpu_pack_mean_ms,
+        &gpu_pack_output,
+        &expected_final,
+    )?;
     Ok(())
 }
