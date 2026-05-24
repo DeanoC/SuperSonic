@@ -140,12 +140,56 @@ pub(crate) fn reset_sync_buf(ordinal: usize, sync_buf: &mut GpuBuffer) -> Result
     memset_zeros(ordinal, sync_buf.as_mut_ptr(), 96)
 }
 
-fn sync_metal_queue_for_host_read(buffer: &GpuBuffer, label: &str) -> Result<()> {
-    if buffer.backend() == Backend::Metal {
+fn qwen36_metal_decode_batch_enabled(
+    capture: bool,
+    accurate_stage_timings: bool,
+    has_expert_prefetch: bool,
+) -> bool {
+    std::env::var_os("SUPERSONIC_METAL_QWEN36_DECODE_BATCH").is_some()
+        && !capture
+        && !accurate_stage_timings
+        && !has_expert_prefetch
+        && std::env::var_os("SUPERSONIC_METAL_PROFILE_QWEN36_FFN_PHASES").is_none()
+        && std::env::var_os("SUPERSONIC_METAL_QWEN36_FFN_ROUTER_STAGE5_PARITY_TAP").is_none()
+}
+
+fn flush_active_metal_decode_batch(label: &str) -> Result<bool> {
+    if !kernel_ffi::prefill_ffi::metal_batch_is_active() {
+        return Ok(false);
+    }
+    kernel_ffi::prefill_ffi::set_metal_batch_label("qwen36_decode_batch")
+        .map_err(|e| anyhow!("{label} Metal batch label: {e}"))?;
+    kernel_ffi::prefill_ffi::flush_metal_batch()
+        .map_err(|e| anyhow!("{label} Metal batch flush: {e}"))?;
+    Ok(true)
+}
+
+fn sync_metal_queue_for_host_boundary(backend: Backend, label: &str) -> Result<()> {
+    if backend == Backend::Metal {
+        if flush_active_metal_decode_batch(label)? {
+            return Ok(());
+        }
         kernel_ffi::prefill_ffi::sync_metal_queue()
             .map_err(|e| anyhow!("{label} Metal queue sync: {e}"))?;
     }
     Ok(())
+}
+
+fn sync_metal_queue_for_host_read(buffer: &GpuBuffer, label: &str) -> Result<()> {
+    sync_metal_queue_for_host_boundary(buffer.backend(), label)
+}
+
+fn copy_d2d_decode(
+    ordinal: usize,
+    dst: *mut std::ffi::c_void,
+    src: *const std::ffi::c_void,
+    bytes: usize,
+) -> Result<(), GpuError> {
+    if kernel_ffi::prefill_ffi::metal_batch_is_active() {
+        kernel_ffi::prefill_ffi::metal_copy_d2d(src, dst, bytes)
+    } else {
+        gpu_hal::copy_d2d(ordinal, dst, src, bytes)
+    }
 }
 
 /// Copy `[hidden]` BF16 elements out of a GPU buffer into a freshly
@@ -528,6 +572,22 @@ fn run_chained_decode_impl_with_cache_pos(
         eprintln!("[trace] step pos={position} init_hidden L2={init_norm:.4}");
     }
 
+    let metal_decode_batch = if hidden_a.backend() == Backend::Metal
+        && qwen36_metal_decode_batch_enabled(
+            capture,
+            options.accurate_stage_timings,
+            expert_prefetch.is_some(),
+        ) {
+        let guard = kernel_ffi::prefill_ffi::MetalBatchGuard::begin()
+            .map_err(|e| anyhow!("qwen36 Metal decode batch begin: {e}"))?;
+        kernel_ffi::prefill_ffi::set_metal_batch_label("qwen36_decode_batch")
+            .map_err(|e| anyhow!("qwen36 Metal decode batch label: {e}"))?;
+        Some(guard)
+    } else {
+        None
+    };
+    let metal_decode_batch_active = metal_decode_batch.is_some();
+
     // `front` indexes which of (hidden_a, hidden_b) holds the current
     // "input to next launch". Starts at 0 (initial_hidden was uploaded
     // into hidden_a). After each launch we swap.
@@ -537,14 +597,24 @@ fn run_chained_decode_impl_with_cache_pos(
     for (layer_idx, layer) in layers.iter_mut().enumerate() {
         // ---- Attention ----
         if metal_queue_dirty && matches!(layer.attn, AttnLayerBuffers::Full { .. }) {
-            sync_metal_queue_for_host_read(
-                if front == 0 { &hidden_a } else { &hidden_b },
+            sync_metal_queue_for_host_boundary(
+                if front == 0 {
+                    hidden_a.backend()
+                } else {
+                    hidden_b.backend()
+                },
                 "sync before full-attn host read",
             )?;
+            metal_queue_dirty = false;
         }
         // Capture the *const input pointer + *mut output pointer based on
         // current `front`. Borrowing both `hidden_a` and `hidden_b`
         // mutably at the same time isn't possible; pointer arithmetic is.
+        let input_backend = if front == 0 {
+            hidden_a.backend()
+        } else {
+            hidden_b.backend()
+        };
         let (input_ptr, output_buf): (_, &mut GpuBuffer) = if front == 0 {
             (hidden_a.as_ptr(), &mut hidden_b)
         } else {
@@ -699,9 +769,15 @@ fn run_chained_decode_impl_with_cache_pos(
                     None => Qwen36MoeAttnStepInt4::disabled(),
                 };
                 let t_k = std::time::Instant::now();
-                if output_buf.backend() == Backend::Metal
-                    && metal_full_attn_decode_direct_enabled(&int4_ptrs)
-                {
+                let use_metal_direct = output_buf.backend() == Backend::Metal
+                    && metal_full_attn_decode_direct_enabled(&int4_ptrs);
+                if metal_decode_batch_active && !use_metal_direct {
+                    sync_metal_queue_for_host_boundary(
+                        input_backend,
+                        "sync before full-attn host fallback",
+                    )?;
+                }
+                if use_metal_direct {
                     unsafe {
                         attn_step_stage5_metal_host_into(
                             params,
@@ -809,9 +885,16 @@ fn run_chained_decode_impl_with_cache_pos(
                     None => Qwen36MoeLinearStepInt4::disabled(),
                 };
                 let t_k = std::time::Instant::now();
-                if output_buf.backend() == Backend::Metal
-                    && metal_linear_decode_direct_enabled(&int4_ptrs)
-                {
+                let use_metal_direct = output_buf.backend() == Backend::Metal
+                    && metal_linear_decode_direct_enabled(&int4_ptrs);
+                if (metal_queue_dirty || metal_decode_batch_active) && !use_metal_direct {
+                    sync_metal_queue_for_host_boundary(
+                        input_backend,
+                        "sync before linear-attn host fallback",
+                    )?;
+                    metal_queue_dirty = false;
+                }
+                if use_metal_direct {
                     let wait_for_completion = !defer_layer_ffn_router;
                     unsafe {
                         linear_step_stage5_metal_native_into(
@@ -854,7 +937,7 @@ fn run_chained_decode_impl_with_cache_pos(
             // attn_output[..hidden] now holds output_after_attn. Copy it into
             // the front buffer so the FFN reads it as input. Linear Metal INT4
             // can publish directly to this buffer and skips this D2D copy.
-            gpu_hal::copy_d2d(
+            copy_d2d_decode(
                 ordinal,
                 output_buf.as_mut_ptr(),
                 attn_output.as_ptr(),
@@ -964,6 +1047,15 @@ fn run_chained_decode_impl_with_cache_pos(
                 &ffn_weights,
                 &ffn_int4_ptrs,
             );
+        let ffn_uses_router_native = output_buf.backend() == Backend::Metal
+            && ffn_stage5_router_metal_native_supported(
+                params_stage5,
+                &ffn_weights,
+                &ffn_int4_ptrs,
+            );
+        if (metal_queue_dirty || metal_decode_batch_active) && !ffn_uses_router_native {
+            sync_metal_queue_for_host_boundary(input_backend, "sync before ffn host router")?;
+        }
         if let Some(prefetch) = expert_prefetch.as_mut() {
             prefetch(ExpertPrefetchPhase::Lookahead, layer_idx, &[]).with_context(|| {
                 format!("lookahead prefetch routed experts (layer {layer_idx})")
@@ -1041,6 +1133,11 @@ fn run_chained_decode_impl_with_cache_pos(
     sync_metal_queue_for_host_read(final_buf, "download final hidden")?;
     let final_hidden_bytes =
         download_hidden_bf16(ordinal, final_buf, hidden).context("download final hidden")?;
+    if let Some(batch) = metal_decode_batch {
+        batch
+            .finish()
+            .map_err(|e| anyhow!("qwen36 Metal decode batch finish: {e}"))?;
+    }
 
     Ok(DecodeOutputs {
         final_hidden_bytes,

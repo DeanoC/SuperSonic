@@ -15,9 +15,10 @@ from typing import Any
 
 
 MODEL = "qwen3.6-35b-a3b"
-SCHEMA = "qwen36-fused-routed-int4-sweep-v5"
+SCHEMA = "qwen36-fused-routed-int4-sweep-v6"
 DEFAULT_MAX_FUSED_WALL_GPU_RATIO = 4.0
 DEFAULT_MAX_WAIT_GPU_RATIO = 4.0
+BATCH_FAST_PROFILE_MODES = {"full-stage5-router-batch"}
 
 PROMPT_SETS: dict[str, list[tuple[str, str]]] = {
     "smoke": [("hello", "Hello")],
@@ -52,6 +53,10 @@ MODE_ALIASES: dict[str, str] = {
     "router-stage5": "full-stage5-router",
     "full-router": "full-stage5-router",
     "full-stage5-router": "full-stage5-router",
+    "router-batch": "full-stage5-router-batch",
+    "batch-router": "full-stage5-router-batch",
+    "full-router-batch": "full-stage5-router-batch",
+    "full-stage5-router-batch": "full-stage5-router-batch",
     "router-defer": "router-defer-wait",
     "router-defer-wait": "router-defer-wait",
     "defer-router-wait": "router-defer-wait",
@@ -65,6 +70,7 @@ FUSED_OP_NEEDLES = {
     "gpu-pack": "qwen36_ffn_int4_expert_gpu_pack_stage5",
     "full-stage5": "qwen36_ffn_int4_stage5",
     "full-stage5-router": "qwen36_ffn_int4_stage5_with_router",
+    "full-stage5-router-batch": "qwen36_ffn_int4_stage5_with_router",
     "router-defer-wait": "qwen36_ffn_int4_stage5_with_router",
 }
 
@@ -82,6 +88,16 @@ FUSED_GPU_OP_PREFIXES = {
         "command_buffer_gpu:qwen36_ffn_int4_expert_down_finalize",
     ),
     "full-stage5-router": (
+        "command_buffer_gpu:qwen36_ffn_int4_stage5_with_router",
+        "command_buffer_gpu:qwen36_ffn_int4_router_topk_stage5",
+        "command_buffer_gpu:qwen36_ffn_int4_shared_gate_up",
+        "command_buffer_gpu:qwen36_ffn_int4_shared_gate_scalar",
+        "command_buffer_gpu:qwen36_ffn_int4_shared_down",
+        "command_buffer_gpu:qwen36_ffn_int4_expert_gate_up_tiled_stage5",
+        "command_buffer_gpu:qwen36_ffn_int4_expert_down_finalize",
+    ),
+    "full-stage5-router-batch": (
+        "command_buffer_gpu:qwen36_decode_batch",
         "command_buffer_gpu:qwen36_ffn_int4_stage5_with_router",
         "command_buffer_gpu:qwen36_ffn_int4_router_topk_stage5",
         "command_buffer_gpu:qwen36_ffn_int4_shared_gate_up",
@@ -258,14 +274,21 @@ def build_env_overrides(args: argparse.Namespace, mode: str) -> dict[str, str]:
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5"] = "1"
     elif mode == "full-stage5-router":
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"] = "1"
+    elif mode == "full-stage5-router-batch":
+        overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"] = "1"
+        overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH"] = "1"
     elif mode == "router-defer-wait":
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"] = "1"
         overrides["SUPERSONIC_METAL_QWEN36_DEFER_FFN_ROUTER_STAGE5_WAIT"] = "1"
     return overrides
 
 
-def build_command(args: argparse.Namespace, prompt: str) -> list[str]:
-    return [
+def mode_emits_stage_timings(mode: str) -> bool:
+    return mode not in BATCH_FAST_PROFILE_MODES
+
+
+def build_command(args: argparse.Namespace, prompt: str, mode: str) -> list[str]:
+    command = [
         str(args.binary),
         "--backend",
         "metal",
@@ -287,9 +310,11 @@ def build_command(args: argparse.Namespace, prompt: str) -> list[str]:
         "--sampling-seed",
         str(args.seed),
         "--no-download",
-        "--emit-stage-timings",
         "--emit-generated-json",
     ]
+    if mode_emits_stage_timings(mode):
+        command.append("--emit-stage-timings")
+    return command
 
 
 def output_tail(output: str, limit: int = 5000) -> str:
@@ -474,7 +499,8 @@ def run_row(args: argparse.Namespace, prompt_id: str, prompt: str, mode: str) ->
     env = os.environ.copy()
     env_overrides = build_env_overrides(args, mode)
     env.update(env_overrides)
-    command = build_command(args, prompt)
+    stage_timings_enabled = mode_emits_stage_timings(mode)
+    command = build_command(args, prompt, mode)
     started = time.monotonic()
     try:
         proc = subprocess.run(
@@ -496,6 +522,7 @@ def run_row(args: argparse.Namespace, prompt_id: str, prompt: str, mode: str) ->
             "wall_seconds": wall_seconds,
             "env_overrides": env_overrides,
             "command": command,
+            "stage_timings_enabled": stage_timings_enabled,
             "generated_ids": parse_generated_ids(output),
             "result": parse_result(output),
             "stage_timings": parse_stage_timings(output),
@@ -519,6 +546,7 @@ def run_row(args: argparse.Namespace, prompt_id: str, prompt: str, mode: str) ->
             "wall_seconds": time.monotonic() - started,
             "env_overrides": env_overrides,
             "command": command,
+            "stage_timings_enabled": stage_timings_enabled,
             "generated_ids": [],
             "result": {},
             "stage_timings": {},
@@ -877,6 +905,8 @@ def build_report(
         "modes": modes,
         "max_new_tokens": args.max_new_tokens,
         "context_size": args.context_size,
+        "stage_timing_modes": [mode for mode in modes if mode_emits_stage_timings(mode)],
+        "fast_profile_modes": [mode for mode in modes if not mode_emits_stage_timings(mode)],
         "metal_profile": args.metal_profile,
         "metal_profile_phases": getattr(args, "metal_profile_phases", False),
         "router_parity_tap": getattr(args, "router_parity_tap", False),
@@ -924,6 +954,8 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- prompt_set: `{report['prompt_set']}`",
         f"- modes: `{','.join(report['modes'])}`",
         f"- max_new_tokens: `{report['max_new_tokens']}`",
+        f"- stage_timing_modes: `{','.join(report.get('stage_timing_modes') or []) or '-'}`",
+        f"- fast_profile_modes: `{','.join(report.get('fast_profile_modes') or []) or '-'}`",
         f"- metal_profile: `{report['metal_profile']}`",
         f"- metal_profile_phases: `{report.get('metal_profile_phases', False)}`",
         f"- router_parity_tap: `{report.get('router_parity_tap', False)}`",

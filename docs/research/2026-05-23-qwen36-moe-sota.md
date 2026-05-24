@@ -1020,6 +1020,38 @@ under the same smoke:
    It should target command-buffer granularity/residency and native-wall
    collapse, not another top-k or scalar wait-deferral fix.
 
+30. **Qwen3.6 decode-batch command-buffer probe**
+   The fused-routed sweep now includes `full-stage5-router-batch`, guarded by
+   `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER=1` plus
+   `SUPERSONIC_METAL_QWEN36_DECODE_BATCH=1`. The runner opens an experimental
+   Metal batch around Qwen3.6 chained decode only when per-layer capture,
+   accurate stage timings, router parity taps, phase profiling, and expert
+   prefetch are all off. Host fallback boundaries flush the batch before CPU
+   reads shared buffers, and D2D residual copies use a Metal blit when a batch
+   is active. The sweep reports this mode in a fast-profile lane without
+   `--emit-stage-timings`, because per-stage syncs intentionally defeat the
+   command-buffer batching experiment.
+
+   The smoke run kept generated-token parity with default:
+   `[11, 271, 40, 599]`. The batch guard did what it was meant to do at the
+   submission layer: the profiled `full-stage5-router-batch` row reduced Metal
+   profile calls from `7396` to `764`, command-buffer waits from `1012` to
+   `52`, and emitted `command_buffer_gpu:qwen36_decode_batch` with `44` batched
+   chunks. However, it is not a promotion path. Default measured
+   `219.7 ms/token`, non-batched `full-stage5-router` measured
+   `476.1 ms/token`, and the batch row measured `435.9 ms/token`. The batch
+   row moved the attribution from submit overhead into GPU work:
+   `command_buffer_gpu:qwen36_decode_batch=1492.302 ms`,
+   `command_buffer_wait=1628.769 ms`, `wait/GPU=1.09`, and the native wrapper
+   wall around `qwen36_ffn_int4_stage5_with_router` collapsed to
+   `9.250 ms` only because it now records enqueue time inside the open batch.
+
+   This rules out command-buffer count alone as the next fix. The next FFN
+   target should use the batch mode as an attribution tool, then optimize the
+   actual batched GPU work: full-attention host-boundary frequency, the
+   batched FFN router/shared/expert kernels, and the linear stage-5 kernels
+   that now coexist inside the large decode-batch command buffers.
+
 ## Sources
 
 - [Qwen/Qwen3.6-35B-A3B model card](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)

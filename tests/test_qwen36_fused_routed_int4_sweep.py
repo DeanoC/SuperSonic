@@ -89,7 +89,7 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
 
         self.assertEqual(
             script.parse_modes(
-                "baseline,direct,direct-defer,defer-direct-wait,gpu-pack,gpack,stage5,native-stage5,router,router-defer"
+                "baseline,direct,direct-defer,defer-direct-wait,gpu-pack,gpack,stage5,native-stage5,router,router-batch,batch-router,router-defer"
             ),
             [
                 "default",
@@ -98,6 +98,7 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
                 "gpu-pack",
                 "full-stage5",
                 "full-stage5-router",
+                "full-stage5-router-batch",
                 "router-defer-wait",
             ],
         )
@@ -111,6 +112,7 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
         gpu_pack = script.build_env_overrides(args, "gpu-pack")
         full_stage5 = script.build_env_overrides(args, "full-stage5")
         full_stage5_router = script.build_env_overrides(args, "full-stage5-router")
+        full_stage5_router_batch = script.build_env_overrides(args, "full-stage5-router-batch")
         router_defer = script.build_env_overrides(args, "router-defer-wait")
         default = script.build_env_overrides(args, "default")
 
@@ -149,6 +151,14 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
             "1",
         )
         self.assertEqual(
+            full_stage5_router_batch["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"],
+            "1",
+        )
+        self.assertEqual(
+            full_stage5_router_batch["SUPERSONIC_METAL_QWEN36_DECODE_BATCH"],
+            "1",
+        )
+        self.assertEqual(
             router_defer["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"],
             "1",
         )
@@ -176,6 +186,23 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
             tap_router["SUPERSONIC_METAL_QWEN36_FFN_ROUTER_STAGE5_PARITY_TAP_MAX_CALLS"],
             "3",
         )
+
+    def test_build_command_omits_stage_timing_for_batch_mode(self):
+        script = sweep_qwen36_fused_routed_int4
+        args = Namespace(
+            binary=Path("target/release/supersonic"),
+            model_dir=Path("/models/qwen3.6-35b-a3b"),
+            context_size=64,
+            max_new_tokens=4,
+            seed=7,
+        )
+
+        normal = script.build_command(args, "Hello", "full-stage5-router")
+        batch = script.build_command(args, "Hello", "full-stage5-router-batch")
+
+        self.assertIn("--emit-stage-timings", normal)
+        self.assertNotIn("--emit-stage-timings", batch)
+        self.assertIn("--emit-generated-json", batch)
 
     def test_promotion_gate_passes_only_real_improvements(self):
         script = sweep_qwen36_fused_routed_int4
