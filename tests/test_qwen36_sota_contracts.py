@@ -51,6 +51,10 @@ linear_sweep = load_script(
     "qwen36_sota_linear_sweep",
     METAL_DIR / "sweep_qwen36_linear_decode.py",
 )
+full_sweep = load_script(
+    "qwen36_sota_full_sweep",
+    METAL_DIR / "sweep_qwen36_full_decode.py",
+)
 next_bottleneck = load_script(
     "qwen36_sota_next_bottleneck",
     METAL_DIR / "select_qwen36_next_bottleneck.py",
@@ -79,8 +83,9 @@ class Qwen36SotaContractTests(unittest.TestCase):
         self.assertEqual(mtp_sweep.SCHEMA, "qwen36-moe-mtp-acceptance-sweep-v2")
         self.assertEqual(lru_sweep.SCHEMA, "qwen36-lru-resident-cache-sweep-v1")
         self.assertEqual(linear_sweep.SCHEMA, "qwen36-linear-decode-sweep-v1")
-        self.assertEqual(next_bottleneck.SCHEMA, "qwen36-next-bottleneck-v4")
-        self.assertEqual(sota_summary.SCHEMA, "qwen36-sota-gate-summary-v8")
+        self.assertEqual(full_sweep.SCHEMA, "qwen36-full-decode-sweep-v1")
+        self.assertEqual(next_bottleneck.SCHEMA, "qwen36-next-bottleneck-v5")
+        self.assertEqual(sota_summary.SCHEMA, "qwen36-sota-gate-summary-v9")
         self.assertEqual(sota_refresh.SCHEMA, "qwen36-sota-gate-refresh-plan-v1")
 
     def test_sota_summary_tracks_current_gate_reports(self):
@@ -123,6 +128,14 @@ class Qwen36SotaContractTests(unittest.TestCase):
         self.assertIn(
             "sweep_qwen36_linear_decode.py",
             specs["linear_decode_variants"].refresh_command,
+        )
+        self.assertEqual(
+            specs["full_attention_variants"].expected_schema,
+            full_sweep.SCHEMA,
+        )
+        self.assertIn(
+            "sweep_qwen36_full_decode.py",
+            specs["full_attention_variants"].refresh_command,
         )
         self.assertEqual(specs["mps_resident_table"].gate_keys, ("viability_gate",))
         self.assertEqual(specs["route_residency"].gate_keys, ("decision_gate",))

@@ -29,10 +29,11 @@ use std::ptr;
 use anyhow::{anyhow, Context, Result};
 use gpu_hal::{copy_d2h, memset_zeros, Backend, GpuBuffer, GpuError, ScalarType};
 use kernel_ffi::qwen36_moe::{
-    attn_step_launch, ffn_step_launch, linear_step_launch, linear_step_stage5_metal_native_into,
-    Qwen36MoeAttnStepInt4, Qwen36MoeAttnStepParams, Qwen36MoeAttnStepWeights, Qwen36MoeFfnStepInt4,
-    Qwen36MoeFfnStepParams, Qwen36MoeFfnStepWeights, Qwen36MoeLinearStepInt4,
-    Qwen36MoeLinearStepParams, Qwen36MoeLinearStepWeights,
+    attn_step_launch, attn_step_stage5_metal_host_into, ffn_step_launch, linear_step_launch,
+    linear_step_stage5_metal_native_into, Qwen36MoeAttnStepInt4, Qwen36MoeAttnStepParams,
+    Qwen36MoeAttnStepWeights, Qwen36MoeFfnStepInt4, Qwen36MoeFfnStepParams,
+    Qwen36MoeFfnStepWeights, Qwen36MoeLinearStepInt4, Qwen36MoeLinearStepParams,
+    Qwen36MoeLinearStepWeights,
 };
 
 use crate::qwen36_moe_logits::bf16_bytes_to_f32;
@@ -91,6 +92,13 @@ fn metal_linear_decode_direct_enabled(int4: &Qwen36MoeLinearStepInt4) -> bool {
         && std::env::var_os("SUPERSONIC_METAL_DISABLE_QWEN36_LINEAR_DECODE_DIRECT").is_none()
         && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
         && std::env::var_os("SUPERSONIC_METAL_DISABLE_QWEN36_LINEAR_INT4_STAGE5").is_none()
+}
+
+fn metal_full_attn_decode_direct_enabled(int4: &Qwen36MoeAttnStepInt4) -> bool {
+    int4.group_size == 128
+        && std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FULL_ATTN_DECODE_DIRECT").is_some()
+        && std::env::var_os("SUPERSONIC_METAL_DISABLE_QWEN36_FULL_ATTN_DECODE_DIRECT").is_none()
+        && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
 }
 
 /// FFN parity launcher workspace floats — copied from the per-block test
@@ -610,17 +618,37 @@ fn run_chained_decode_impl_with_cache_pos(
                     None => Qwen36MoeAttnStepInt4::disabled(),
                 };
                 let t_k = std::time::Instant::now();
-                attn_step_launch(
-                    ordinal,
-                    ScalarType::BF16,
-                    params,
-                    &weights,
-                    &int4_ptrs,
-                    &mut attn_output,
-                    &mut attn_workspace,
-                    &mut sync_buf,
-                )
-                .with_context(|| format!("attn_step_launch (layer {layer_idx}, full)"))?;
+                if output_buf.backend() == Backend::Metal
+                    && metal_full_attn_decode_direct_enabled(&int4_ptrs)
+                {
+                    unsafe {
+                        attn_step_stage5_metal_host_into(
+                            params,
+                            &weights,
+                            &int4_ptrs,
+                            &mut attn_output,
+                            &mut attn_workspace,
+                            output_buf.as_mut_ptr(),
+                            hidden,
+                        )
+                    }
+                    .with_context(|| {
+                        format!("attn_step_stage5_metal_host_into (layer {layer_idx})")
+                    })?;
+                    attn_output_published = true;
+                } else {
+                    attn_step_launch(
+                        ordinal,
+                        ScalarType::BF16,
+                        params,
+                        &weights,
+                        &int4_ptrs,
+                        &mut attn_output,
+                        &mut attn_workspace,
+                        &mut sync_buf,
+                    )
+                    .with_context(|| format!("attn_step_launch (layer {layer_idx}, full)"))?;
+                }
                 if options.accurate_stage_timings {
                     gpu_hal::sync(ordinal)
                         .context("sync_after_attn_step (accurate_stage_timings)")?;

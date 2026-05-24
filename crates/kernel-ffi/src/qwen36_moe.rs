@@ -2390,7 +2390,7 @@ pub fn attn_step_launch(
     }
     let backend = output.backend();
     if backend == Backend::Metal {
-        return attn_step_stage1_5_metal_host(params, weights, int4, output, workspace);
+        return attn_step_stage1_5_metal_host(params, weights, int4, output, workspace, None);
     }
 
     let counters = sync_buf.as_mut_ptr() as *mut c_uint;
@@ -2465,12 +2465,48 @@ pub fn attn_step_launch(
     Ok(())
 }
 
+/// Metal-only stage-5 launcher that uses `output` as the attention scratch
+/// publication buffer, but writes the final residual hidden state to
+/// `final_output`. This trims the decode-chain handoff copy after full-attn
+/// layers while preserving the host fallback implementation.
+pub unsafe fn attn_step_stage5_metal_host_into(
+    params: Qwen36MoeAttnStepParams,
+    weights: &Qwen36MoeAttnStepWeights,
+    int4: &Qwen36MoeAttnStepInt4,
+    output: &mut GpuBuffer,
+    workspace: &mut GpuBuffer,
+    final_output: *mut c_void,
+    final_output_capacity: usize,
+) -> Result<(), GpuError> {
+    if output.backend() != Backend::Metal {
+        return Err(GpuError::backend(
+            output.backend(),
+            "qwen36_moe::attn_step_stage5_metal_host_into requires Metal output".into(),
+        ));
+    }
+    if params.stage != 5 {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::attn_step_stage5_metal_host_into requires stage=5, got {}",
+            params.stage
+        )));
+    }
+    attn_step_stage1_5_metal_host(
+        params,
+        weights,
+        int4,
+        output,
+        workspace,
+        Some((final_output, final_output_capacity)),
+    )
+}
+
 fn attn_step_stage1_5_metal_host(
     params: Qwen36MoeAttnStepParams,
     weights: &Qwen36MoeAttnStepWeights,
     int4: &Qwen36MoeAttnStepInt4,
     output: &mut GpuBuffer,
     workspace: &mut GpuBuffer,
+    final_output_override: Option<(*mut c_void, usize)>,
 ) -> Result<(), GpuError> {
     if output.dtype() != ScalarType::BF16 || workspace.dtype() != ScalarType::F32 {
         return Err(GpuError::InvalidArg(format!(
@@ -2610,13 +2646,27 @@ fn attn_step_stage1_5_metal_host(
             params.stage, output_len, output_elems
         )));
     }
+    if final_output_override.is_some() && params.stage != 5 {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::attn_step_launch: Metal direct final output requires stage=5, got {}",
+            params.stage
+        )));
+    }
+    let output_ptr = output.as_mut_ptr();
+    if let Some((final_output_ptr, final_output_capacity)) = final_output_override {
+        if final_output_ptr.is_null() || final_output_capacity < hidden {
+            return Err(GpuError::InvalidArg(format!(
+                "qwen36_moe::attn_step_launch: Metal stage5 final output too small: need {}, got {}",
+                hidden, final_output_capacity
+            )));
+        }
+    }
 
     let input = unsafe { std::slice::from_raw_parts(weights.input_hidden as *const u16, hidden) };
     let input_norm_w =
         unsafe { std::slice::from_raw_parts(weights.input_norm_w as *const u16, hidden) };
     let q_norm_w = unsafe { std::slice::from_raw_parts(weights.q_norm_w as *const u16, head_dim) };
-    let output =
-        unsafe { std::slice::from_raw_parts_mut(output.as_mut_ptr() as *mut u16, output_len) };
+    let output = unsafe { std::slice::from_raw_parts_mut(output_ptr as *mut u16, output_len) };
     let workspace = unsafe {
         std::slice::from_raw_parts_mut(workspace.as_mut_ptr() as *mut f32, workspace_len)
     };
@@ -2876,7 +2926,7 @@ fn attn_step_stage1_5_metal_host(
         let o_zero = int4.o_proj_zero as usize;
         let group_size = int4.group_size.max(0) as usize;
         let o_out = &mut workspace[off_o_out..off_o_out + hidden];
-        qwen36_parallel_chunks2_mut(o_out, output, 64, |start, out_chunk, pub_chunk| {
+        let publish_o_proj = |start: usize, out_chunk: &mut [f32], pub_chunk: &mut [u16]| {
             for (local, (out, pub_out)) in
                 out_chunk.iter_mut().zip(pub_chunk.iter_mut()).enumerate()
             {
@@ -2895,7 +2945,17 @@ fn attn_step_stage1_5_metal_host(
                 *out = result;
                 *pub_out = f32_to_bf16_bits(result);
             }
-        });
+        };
+        match final_output_override {
+            Some((final_output_ptr, _)) if final_output_ptr != output_ptr => {
+                let final_output =
+                    unsafe { std::slice::from_raw_parts_mut(final_output_ptr as *mut u16, hidden) };
+                qwen36_parallel_chunks2_mut(o_out, final_output, 64, publish_o_proj);
+            }
+            _ => {
+                qwen36_parallel_chunks2_mut(o_out, output, 64, publish_o_proj);
+            }
+        }
     }
 
     Ok(())

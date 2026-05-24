@@ -581,9 +581,10 @@ under the same smoke:
    the promotion/viability decisions scattered across individual JSON files.
    `tests/metal/summarize_qwen36_sota_gates.py` reads the batched-prefill
    variant sweep, static top-N runtime sweep, fused routed INT4 runtime sweep,
-   MPS resident-table probe, route residency sweep, MTP acceptance sweep, and
-   LRU resident-cache sweep reports, then writes
-   `target/qwen36_sota_gate_summary.{json,md}`. The v7 schema records input
+   MPS resident-table probe, route residency sweep, MTP acceptance sweep, LRU
+   resident-cache sweep, linear decode sweep, and full-attention decode sweep
+   reports, then writes
+   `target/qwen36_sota_gate_summary.{json,md}`. The v9 schema records input
    health, report age, passed and failed gate IDs, candidate failures, and a
    single `next_action`, plus the refresh command for each gate. It also marks
    passed estimate or decision gates as superseded when a newer runtime gate has
@@ -601,10 +602,11 @@ under the same smoke:
    Close the loop when every SOTA runtime fork is negative. `tests/metal/select_qwen36_next_bottleneck.py`
    reads the refreshed SOTA gate summary plus the profiled default rows from
    the static top-N, fused routed INT4, LRU resident-cache, batched-prefill
-   sweeps, and the latest optional `bench-perf` schema-v9 Qwen3.6 INT4
+   linear/full-attention decode sweeps, and the latest optional `bench-perf`
+   schema-v9 Qwen3.6 INT4
    artifact under `target/bench-runs`. It ranks decode buckets, records the
    prefill best-vs-baseline row, preserves top Metal/HAL profile ops, and writes
-   `target/qwen36_next_bottleneck.{json,md}`. The v4 selector also reads
+   `target/qwen36_next_bottleneck.{json,md}`. The v5 selector also reads
    adjacent `meta.json` worktree fingerprints and only auto-consumes bench
    artifacts whose git SHA plus diff hash match the current checkout, so
    rejected uncommitted experiments do not silently become the headline default.
@@ -638,7 +640,7 @@ under the same smoke:
    `profile_lifecycle_timings`, so command-buffer split overhead can be studied
    without making it the headline stage attribution. The same run directory's
    `meta.json` now includes git dirty paths and a diff hash for selector
-   artifact hygiene. The next-bottleneck selector's v4 schema consumes this
+   artifact hygiene. The next-bottleneck selector's v5 schema consumes this
    artifact when present, keeping the current headline run in the same evidence
    bundle as the narrower sweep rows.
 
@@ -655,7 +657,7 @@ under the same smoke:
    to `28.171 ms` total. The next measured bottleneck remains FFN host expert
    work by absolute time, but the current negative FFN residency gates still
    make the next actionable target the largest non-exhausted bucket selected by
-   the v4 selector.
+   the v5 selector.
 
 16. **Qwen3.6 linear recurrent beta/g hoist rejection**
    The next tiny linear-kernel idea was measured and rejected instead of
@@ -697,6 +699,28 @@ under the same smoke:
    `[11, 271, 40, 599]` but regressed headline decode (`860 ms` versus
    `827 ms`) and full-attention attribution, while `host-linear` generated
    `[11, 353, 599, 264]` and regressed headline, linear-attention, and lm-head.
+
+18. **Qwen3.6 full-attention decode handoff gate**
+   The selector's full-attention recommendation now starts with the smallest
+   measurable orchestration change before attempting a real Metal attention
+   kernel. Metal INT4 full-attention stage 5 can write its final residual
+   directly into the decode ping-pong buffer through
+   `attn_step_stage5_metal_host_into`, skipping the old `attn_output` to
+   residual D2D copy for full-attention layers. Because the first measured
+   profile showed the direct handoff slower than the old path, it is opt-in
+   with `SUPERSONIC_METAL_ENABLE_QWEN36_FULL_ATTN_DECODE_DIRECT=1` instead of
+   the default.
+   `tests/metal/sweep_qwen36_full_decode.py` compares default against the
+   `direct` candidate, records generated-ID parity, timings, optional Metal/HAL
+   profiles, full-attention host profile totals, `copy_d2d`, and
+   `command_buffer_wait`, and writes
+   `target/qwen36_full_decode_sweep.{json,md}`. Its nonfatal gate only passes
+   a candidate if it preserves IDs, has enough generated tokens, improves
+   headline and `full_attn_ms_avg`, and keeps FFN/linear/lm-head plus wait
+   attribution within thresholds. The SOTA summary v9 tracks this report, and
+   the next-bottleneck selector v5 marks `full_attn_ms_avg` exhausted after the
+   full-attention gate fails so the workflow can move on to the lm-head tail or
+   a larger measured kernel target.
 
 ## Sources
 

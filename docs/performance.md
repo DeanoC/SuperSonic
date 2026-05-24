@@ -879,15 +879,16 @@ The local-main-target workflow for this machine is:
 12. static top-N resident-table probe: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/probe_qwen36_static_topn.py`
 13. static top-N warm runtime sweep: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/sweep_qwen36_static_topn_runtime.py --modes default,static,static-hotset,mps-static-partial --metal-profile`
 14. linear decode variant sweep: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/sweep_qwen36_linear_decode.py --prompt-set smoke --metal-profile`
-15. MPS resident-table viability probe: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/probe_qwen36_mps_resident_table.py --run-pilot --require-pilot`
-16. route residency sweep: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/sweep_qwen36_route_residency.py --prompt-set smoke`
-17. LRU resident-cache sweep: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/sweep_qwen36_lru_resident_cache.py --capacities 32,64 --metal-profile`
-18. fused routed INT4 sweep: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/sweep_qwen36_fused_routed_int4.py --prompt-set smoke --metal-profile`
-19. SOTA gate refresh plan: `python3 tests/metal/refresh_qwen36_sota_gates.py --max-age-hours 24`
-20. SOTA gate summary: `python3 tests/metal/summarize_qwen36_sota_gates.py --require --max-age-hours 24`
-21. next bottleneck selector: `python3 tests/metal/select_qwen36_next_bottleneck.py --require-selected`
-22. routed-expert FFN microbench: `target/release/qwen36_ffn_expert_microbench --iters 20 --warmup 3`
-23. long-context comparison: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/bench_qwen36_longctx.py --preset comparison`
+15. full-attention decode variant sweep: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/sweep_qwen36_full_decode.py --prompt-set smoke --metal-profile`
+16. MPS resident-table viability probe: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/probe_qwen36_mps_resident_table.py --run-pilot --require-pilot`
+17. route residency sweep: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/sweep_qwen36_route_residency.py --prompt-set smoke`
+18. LRU resident-cache sweep: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/sweep_qwen36_lru_resident_cache.py --capacities 32,64 --metal-profile`
+19. fused routed INT4 sweep: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/sweep_qwen36_fused_routed_int4.py --prompt-set smoke --metal-profile`
+20. SOTA gate refresh plan: `python3 tests/metal/refresh_qwen36_sota_gates.py --max-age-hours 24`
+21. SOTA gate summary: `python3 tests/metal/summarize_qwen36_sota_gates.py --require --max-age-hours 24`
+22. next bottleneck selector: `python3 tests/metal/select_qwen36_next_bottleneck.py --require-selected`
+23. routed-expert FFN microbench: `target/release/qwen36_ffn_expert_microbench --iters 20 --warmup 3`
+24. long-context comparison: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/bench_qwen36_longctx.py --preset comparison`
 
 The Metal long-context harness writes `target/qwen36_metal_longctx.json` and
 `target/qwen36_metal_longctx.md`. It uses deterministic NIAH-style prompts and
@@ -1371,14 +1372,14 @@ more slab-cache or fused-INT4 work begins.
 `tests/metal/summarize_qwen36_sota_gates.py` is the aggregation step after the
 individual sweeps. It reads the batched-prefill variant sweep, static top-N
 runtime sweep, fused routed INT4 runtime sweep, MPS resident-table probe, route
-residency sweep, MTP acceptance sweep, and LRU resident-cache sweep JSON
-reports, then writes
+residency sweep, MTP acceptance sweep, LRU resident-cache sweep, linear decode
+sweep, and full-attention decode sweep JSON reports, then writes
 `target/qwen36_sota_gate_summary.{json,md}` with input status, report age,
 passed/failed gate IDs, candidate failures, refresh commands, and the next
 action. Missing reports are preserved as rows by default; use
 `--require --max-age-hours 24` when a local validation run should fail closed on
 absent, malformed, schema-mismatched, stale, or missing-gate artifacts.
-The v7 summary also records `superseded_gates`; this prevents an older
+The v9 summary also records `superseded_gates`; this prevents an older
 estimate or decision pass from taking `next_action` after the corresponding
 runtime candidate has already been measured and rejected.
 `tests/metal/refresh_qwen36_sota_gates.py` is the operational companion for
@@ -1391,9 +1392,9 @@ force-refresh one gate even when its current report is already OK.
 summary lands on `keep_default_lane_and_select_next_measured_bottleneck`. It
 reads the refreshed gate summary plus the profiled default rows from the
 runtime sweeps, ranks decode buckets, marks FFN exhausted when the resident,
-static, fused, MPS, and LRU forks all have negative runtime evidence, and
-writes `target/qwen36_next_bottleneck.{json,md}` with the next bucket to
-prototype.
+static, fused, MPS, and LRU forks all have negative runtime evidence, marks
+linear and full attention exhausted after their variant gates fail, and writes
+`target/qwen36_next_bottleneck.{json,md}` with the next bucket to prototype.
 
 The first partial-hit resident MPS runtime prototype is opt-in behind
 `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_MPS_STATIC_TOPN_PARTIAL=1` plus the

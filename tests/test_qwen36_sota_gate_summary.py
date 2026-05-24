@@ -43,6 +43,7 @@ class Qwen36SotaGateSummaryTests(unittest.TestCase):
             "mtp_acceptance": root / "mtp.json",
             "lru_resident_cache": root / "lru.json",
             "linear_decode_variants": root / "linear.json",
+            "full_attention_variants": root / "full.json",
         }
 
     def write_default_reports(
@@ -56,6 +57,7 @@ class Qwen36SotaGateSummaryTests(unittest.TestCase):
         mtp_gate: dict | None = None,
         lru_gate: dict | None = None,
         linear_gate: dict | None = None,
+        full_gate: dict | None = None,
     ) -> dict[str, Path]:
         script = summarize_qwen36_sota_gates
         paths = self.paths_in(root)
@@ -185,6 +187,23 @@ class Qwen36SotaGateSummaryTests(unittest.TestCase):
                 ],
             },
         )
+        write_report(
+            paths["full_attention_variants"],
+            script.GATE_SPECS[8].expected_schema,
+            "promotion_gate",
+            full_gate
+            if full_gate is not None
+            else {
+                "passed": False,
+                "candidates": [
+                    {
+                        "mode": "direct-off",
+                        "passed": False,
+                        "failures": ["full_attn_not_improved"],
+                    }
+                ],
+            },
+        )
         return paths
 
     def test_missing_reports_are_rows_by_default(self):
@@ -193,7 +212,7 @@ class Qwen36SotaGateSummaryTests(unittest.TestCase):
             report = script.build_report(self.paths_in(Path(tmp)))
 
         self.assertEqual(report["schema"], script.SCHEMA)
-        self.assertEqual(report["summary"]["status_counts"], {"missing": 8})
+        self.assertEqual(report["summary"]["status_counts"], {"missing": 9})
         self.assertFalse(report["summary"]["all_inputs_ok"])
         self.assertEqual(
             report["summary"]["next_action"]["action"],
@@ -211,6 +230,10 @@ class Qwen36SotaGateSummaryTests(unittest.TestCase):
         self.assertIn(
             "sweep_qwen36_linear_decode.py",
             report["rows"][7]["refresh_command"],
+        )
+        self.assertIn(
+            "sweep_qwen36_full_decode.py",
+            report["rows"][8]["refresh_command"],
         )
 
     def test_runtime_promotion_pass_wins_next_action(self):
@@ -457,6 +480,12 @@ class Qwen36SotaGateSummaryTests(unittest.TestCase):
                 "promotion_gate",
                 {"passed": False, "failures": ["linear_attn_not_improved"]},
             )
+            write_report(
+                paths["full_attention_variants"],
+                script.GATE_SPECS[8].expected_schema,
+                "promotion_gate",
+                {"passed": False, "failures": ["full_attn_not_improved"]},
+            )
             report = script.build_report(paths)
 
         statuses = {row["gate_id"]: row["status"] for row in report["rows"]}
@@ -467,6 +496,7 @@ class Qwen36SotaGateSummaryTests(unittest.TestCase):
         self.assertEqual(statuses["mtp_acceptance"], "ok")
         self.assertEqual(statuses["lru_resident_cache"], "ok")
         self.assertEqual(statuses["linear_decode_variants"], "ok")
+        self.assertEqual(statuses["full_attention_variants"], "ok")
         self.assertEqual(report["summary"]["input_failure_count"], 3)
         self.assertIn("static_topn_runtime", report["summary"]["next_action"]["blocked_reason"])
 
@@ -483,7 +513,7 @@ class Qwen36SotaGateSummaryTests(unittest.TestCase):
         statuses = {row["gate_id"]: row["status"] for row in report["rows"]}
         self.assertEqual(set(statuses.values()), {"stale"})
         self.assertFalse(report["summary"]["all_inputs_ok"])
-        self.assertEqual(report["summary"]["status_counts"], {"stale": 8})
+        self.assertEqual(report["summary"]["status_counts"], {"stale": 9})
         self.assertEqual(report["rows"][0]["recommendation_action"], "refresh_harness")
         self.assertIn(
             "sweep_qwen36_batched_prefill_variants.py",
@@ -528,6 +558,8 @@ class Qwen36SotaGateSummaryTests(unittest.TestCase):
                     str(paths["lru_resident_cache"]),
                     "--linear-json",
                     str(paths["linear_decode_variants"]),
+                    "--full-json",
+                    str(paths["full_attention_variants"]),
                     "--out-json",
                     str(out_json),
                     "--out-md",

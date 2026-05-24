@@ -53,6 +53,7 @@ class Qwen36SotaGateRefreshTests(unittest.TestCase):
             "mtp_acceptance": root / "mtp.json",
             "lru_resident_cache": root / "lru.json",
             "linear_decode_variants": root / "linear.json",
+            "full_attention_variants": root / "full.json",
         }
 
     def write_default_reports(self, root: Path) -> dict[str, Path]:
@@ -105,6 +106,12 @@ class Qwen36SotaGateRefreshTests(unittest.TestCase):
             "promotion_gate",
             {"passed": False, "failures": ["linear_attn_not_improved"]},
         )
+        write_report(
+            paths["full_attention_variants"],
+            summary.GATE_SPECS[8].expected_schema,
+            "promotion_gate",
+            {"passed": False, "failures": ["full_attn_not_improved"]},
+        )
         return paths
 
     def test_missing_reports_are_selected_by_default(self):
@@ -116,8 +123,8 @@ class Qwen36SotaGateRefreshTests(unittest.TestCase):
 
         self.assertEqual(report["schema"], refresh.SCHEMA)
         self.assertTrue(report["summary"]["dry_run"])
-        self.assertEqual(report["summary"]["selected_count"], 8)
-        self.assertEqual(report["summary"]["run_status_counts"], {"planned": 8})
+        self.assertEqual(report["summary"]["selected_count"], 9)
+        self.assertEqual(report["summary"]["run_status_counts"], {"planned": 9})
         self.assertEqual(set(row["input_status"] for row in rows), {"missing"})
         self.assertIn("sweep_qwen36_batched_prefill_variants.py", md)
         self.assertIn("Add `--run`", md)
@@ -131,7 +138,7 @@ class Qwen36SotaGateRefreshTests(unittest.TestCase):
         self.assertEqual({row["run_status"] for row in default_rows}, {"skipped"})
 
         all_rows = refresh.build_plan_rows(pre_report["rows"], refresh_all=True)
-        self.assertEqual(sum(1 for row in all_rows if row["selected"]), 8)
+        self.assertEqual(sum(1 for row in all_rows if row["selected"]), 9)
         self.assertEqual({row["selection_reason"] for row in all_rows}, {"all"})
 
         only_rows = refresh.build_plan_rows(
@@ -178,6 +185,8 @@ class Qwen36SotaGateRefreshTests(unittest.TestCase):
                     str(paths["lru_resident_cache"]),
                     "--linear-json",
                     str(paths["linear_decode_variants"]),
+                    "--full-json",
+                    str(paths["full_attention_variants"]),
                     "--out-json",
                     str(out_json),
                     "--out-md",
@@ -190,7 +199,7 @@ class Qwen36SotaGateRefreshTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(report["schema"], refresh.SCHEMA)
         self.assertTrue(report["summary"]["dry_run"])
-        self.assertEqual(report["summary"]["selected_count"], 8)
+        self.assertEqual(report["summary"]["selected_count"], 9)
         self.assertTrue(md_exists)
 
 
