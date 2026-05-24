@@ -865,8 +865,9 @@ The local-main-target workflow for this machine is:
 9. MTP Metal K=1 experiment: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/probe_qwen36_mtp_acceptance.py --metal-experiment`
 10. MTP Metal prompt-suite sweep: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/sweep_qwen36_mtp_acceptance.py --prompt-set smoke --metal-experiment`
 11. static top-N resident-table probe: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/probe_qwen36_static_topn.py`
-12. routed-expert FFN microbench: `target/release/qwen36_ffn_expert_microbench --iters 20 --warmup 3`
-13. long-context comparison: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/bench_qwen36_longctx.py --preset comparison`
+12. static top-N warm runtime sweep: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/sweep_qwen36_static_topn_runtime.py --modes default,static,static-hotset`
+13. routed-expert FFN microbench: `target/release/qwen36_ffn_expert_microbench --iters 20 --warmup 3`
+14. long-context comparison: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/bench_qwen36_longctx.py --preset comparison`
 
 The Metal long-context harness writes `target/qwen36_metal_longctx.json` and
 `target/qwen36_metal_longctx.md`. It uses deterministic NIAH-style prompts and
@@ -1244,6 +1245,21 @@ residency profile reported `exact_hits=9/40`, `slot_hit_rate=0.731250`, and
 runtime wiring and miss fallback, but leaves promotion blocked on warm
 multi-token reuse and/or a cheaper hybrid fallback for the 31/40 non-full-hit
 layer calls.
+`tests/metal/sweep_qwen36_static_topn_runtime.py` is the follow-up warm-token
+comparison harness for that question. It runs separate process rows for modes
+such as `default`, `static`, and `static-hotset`, keeps generated IDs as the
+parity key, and records stage timings, chain breakdown, lifecycle timings,
+expert-residency totals, and per-policy rows in
+`target/qwen36_static_topn_runtime_sweep.{json,md}`.
+The first four-token smoke preserved `[11, 353, 599, 264]` across all three
+modes but ruled out promotion: default measured `decode_ms=702` and
+`ffn_ms_avg=98.761`, static measured `decode_ms=951`, `ffn_ms_avg=177.563`,
+`exact_hits=10/160`, `slot_hit_rate=0.508594`, and `copied_bytes=980372736`,
+and static+hotset measured `decode_ms=1450`, `ffn_ms_avg=262.215`, and
+`copied_bytes=2234557440`. The native static table is useful as a measured
+residency scaffold, but Qwen3.6 Metal should next target either a dense
+resident MPS/MPP table that can serve partial hits cheaply, or return to the
+prefill/orchestration buckets already shown to dominate long-context runs.
 
 The GPU-side active-slab pack probe is opt-in behind
 `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_GPU_PACK_STAGE5=1` on top of the

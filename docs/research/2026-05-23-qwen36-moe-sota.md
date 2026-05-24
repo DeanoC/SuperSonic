@@ -426,6 +426,17 @@ under the same smoke:
    exactly and measured 507 ms/token with 369.071 ms in FFN. Treat the native
    static table as validated plumbing for warm-reuse/hybrid-fallback experiments,
    not as a promoted path.
+   The next harness slice is
+   `tests/metal/sweep_qwen36_static_topn_runtime.py`, which compares warm decode
+   modes (`default`, `static`, `static-hotset`, etc.) against the same generated
+   IDs and records expert-residency policy rows so promotion decisions can be
+   made on multi-token reuse rather than a cold first-token allocation.
+   The first four-token smoke preserved `[11, 353, 599, 264]` across default,
+   static, and static+hotset, but default still won: `decode_ms=702` and
+   `ffn_ms_avg=98.761` versus static at `decode_ms=951` / `ffn_ms_avg=177.563`
+   and static+hotset at `decode_ms=1450` / `ffn_ms_avg=262.215`. Static top-N
+   therefore remains a negative gate and a profiling scaffold, not the next
+   runtime promotion.
 
 4. **Qwen3.6 MTP tensor audit**
    Parse local safetensors/bakes for MTP heads and write down the loader delta

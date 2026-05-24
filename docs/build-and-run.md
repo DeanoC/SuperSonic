@@ -481,6 +481,10 @@ SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" \
 SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" \
   python3 tests/metal/probe_qwen36_static_topn.py
 
+SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" \
+  python3 tests/metal/sweep_qwen36_static_topn_runtime.py \
+  --modes default,static,static-hotset
+
 cargo build --release -p runner --bin qwen36_ffn_expert_microbench
 target/release/qwen36_ffn_expert_microbench --iters 20 --warmup 3
 ```
@@ -580,6 +584,13 @@ On the first two-prompt local smoke, capacity 16 covered only 35.8% of
 evaluation assignments with 876/880 FFN calls still requiring fallback, while
 requiring 3.75 GiB of resident FP16 RHS storage. That argues against a tiny
 static table as the next default path.
+`tests/metal/sweep_qwen36_static_topn_runtime.py` consumes the generated
+`static_tables` JSON and compares warm decode modes such as `default`,
+`static`, and `static-hotset`. It writes
+`target/qwen36_static_topn_runtime_sweep.json` and
+`target/qwen36_static_topn_runtime_sweep.md`, preserving generated IDs, stage
+timings, chain breakdown, lifecycle timings, and expert-residency policy rows
+for each mode.
 The current M5 Max perf gate points at linear-attention as the next measured
 multi-token per-token bucket after FFN fallback tightening. The 512-token
 `--metal-profile` smoke currently reports roughly 269 ms/token, 71.7 s prefill,
