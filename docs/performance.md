@@ -825,10 +825,14 @@ weights on the chained Metal decode path. This section is a performance harness
 checkpoint, not a claim that the HIP feature set has been ported to Metal.
 The latest checkpoint promotes the fused Qwen3.6 stage-5 linear-attention INT4
 Metal path into the default lane, with `SUPERSONIC_METAL_DISABLE_QWEN36_LINEAR_INT4_STAGE5=1`
-kept as the host fallback escape hatch. The default FFN lane remains the
-host-orchestrated INT4 fallback, but routed expert gate/up and down work is now
-batched across top-k experts to reduce per-layer thread orchestration. Native
-FFN projection work remains explicit opt-in with
+kept as the host fallback escape hatch. Decode now lets that native stage-5
+linear path publish directly into the next residual buffer by default, avoiding
+the old `attn_output -> residual` D2D handoff; set
+`SUPERSONIC_METAL_DISABLE_QWEN36_LINEAR_DECODE_DIRECT=1` to retain the older
+handoff for bisection. The default FFN lane remains the host-orchestrated INT4
+fallback, but routed expert gate/up and down work is now batched across top-k
+experts to reduce per-layer thread orchestration. Native FFN projection work
+remains explicit opt-in with
 `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5=1`; profile runs no longer
 switch the FFN implementation underneath the headline lane. A newer
 gate/up-only tiled routed-expert kernel is also available as a diagnostic
@@ -845,6 +849,13 @@ rather than raw shader arithmetic. The packed active-expert variant behind
 top-k expert slabs into compact scratch buffers before launching the same
 combined shader. It is a residency attribution experiment, not a default
 runtime path.
+
+The direct-output handoff is an orchestration cleanup, not a new headline
+bottleneck fix. On the 2026-05-24 Apple M5 Max comparison, the default lane
+measured `144.7 ms/token` versus `145.2 ms/token` with
+`SUPERSONIC_METAL_DISABLE_QWEN36_LINEAR_DECODE_DIRECT=1`; HAL `copy_d2d` fell
+from 840 calls / 3.44 MiB to 210 calls / 0.86 MiB. That confirms the old copy
+handoff is avoidable but too small to explain current decode time.
 
 Reproduce the run with:
 

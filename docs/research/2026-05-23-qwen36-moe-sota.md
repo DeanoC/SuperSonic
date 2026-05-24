@@ -608,6 +608,19 @@ under the same smoke:
    been superseded, the selector names the largest non-exhausted bucket instead
    of looping back to an already-negative FFN residency path.
 
+13. **Qwen3.6 linear-attention decode direct-output handoff**
+   Act on the selector's first recommendation with a small orchestration
+   change before inventing a new linear-attention kernel. Decode now uses the
+   existing Metal stage-5 INT4 linear launcher with a final-output override, so
+   linear layers publish directly into the next residual buffer instead of
+   writing `attn_output` and then issuing a D2D copy. The old handoff remains
+   available for bisection with
+   `SUPERSONIC_METAL_DISABLE_QWEN36_LINEAR_DECODE_DIRECT=1`. A 2026-05-24
+   `bench-perf` comparison measured a flat headline (`144.7 ms/token` direct
+   versus `145.2 ms/token` disabled) while reducing HAL `copy_d2d` from 840
+   calls / 3.44 MiB to 210 calls / 0.86 MiB, so the measured next target remains
+   command-buffer/native linear work and FFN rather than the residual copy.
+
 ## Sources
 
 - [Qwen/Qwen3.6-35B-A3B model card](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)

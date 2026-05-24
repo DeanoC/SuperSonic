@@ -29,8 +29,8 @@ use std::ptr;
 use anyhow::{anyhow, Context, Result};
 use gpu_hal::{copy_d2h, memset_zeros, Backend, GpuBuffer, GpuError, ScalarType};
 use kernel_ffi::qwen36_moe::{
-    attn_step_launch, ffn_step_launch, linear_step_launch, Qwen36MoeAttnStepInt4,
-    Qwen36MoeAttnStepParams, Qwen36MoeAttnStepWeights, Qwen36MoeFfnStepInt4,
+    attn_step_launch, ffn_step_launch, linear_step_launch, linear_step_stage5_metal_native_into,
+    Qwen36MoeAttnStepInt4, Qwen36MoeAttnStepParams, Qwen36MoeAttnStepWeights, Qwen36MoeFfnStepInt4,
     Qwen36MoeFfnStepParams, Qwen36MoeFfnStepWeights, Qwen36MoeLinearStepInt4,
     Qwen36MoeLinearStepParams, Qwen36MoeLinearStepWeights,
 };
@@ -84,6 +84,13 @@ fn linear_attn_output_elems(geom: &MultiLayerGeom) -> usize {
     // Stage 5 publishes [hidden]; earlier stages publish wider intermediates.
     // The per-block linear test uses `2 * V*Kd + V*Vd` as the upper bound.
     2 * v * kd + v * vd
+}
+
+fn metal_linear_decode_direct_enabled(int4: &Qwen36MoeLinearStepInt4) -> bool {
+    int4.group_size == 128
+        && std::env::var_os("SUPERSONIC_METAL_DISABLE_QWEN36_LINEAR_DECODE_DIRECT").is_none()
+        && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
+        && std::env::var_os("SUPERSONIC_METAL_DISABLE_QWEN36_LINEAR_INT4_STAGE5").is_none()
 }
 
 /// FFN parity launcher workspace floats — copied from the per-block test
@@ -526,6 +533,7 @@ fn run_chained_decode_impl_with_cache_pos(
         } else {
             (hidden_b.as_ptr(), &mut hidden_a)
         };
+        let mut attn_output_published = false;
 
         match &mut layer.attn {
             AttnLayerBuffers::Full {
@@ -692,17 +700,38 @@ fn run_chained_decode_impl_with_cache_pos(
                     None => Qwen36MoeLinearStepInt4::disabled(),
                 };
                 let t_k = std::time::Instant::now();
-                linear_step_launch(
-                    ordinal,
-                    ScalarType::BF16,
-                    params,
-                    &weights,
-                    &int4_ptrs,
-                    &mut attn_output,
-                    &mut attn_workspace,
-                    &mut sync_buf,
-                )
-                .with_context(|| format!("linear_step_launch (layer {layer_idx})"))?;
+                if output_buf.backend() == Backend::Metal
+                    && metal_linear_decode_direct_enabled(&int4_ptrs)
+                {
+                    unsafe {
+                        linear_step_stage5_metal_native_into(
+                            params,
+                            &weights,
+                            &int4_ptrs,
+                            &mut attn_output,
+                            &mut attn_workspace,
+                            output_buf.as_mut_ptr(),
+                            hidden,
+                            true,
+                        )
+                    }
+                    .with_context(|| {
+                        format!("linear_step_stage5_metal_native_into (layer {layer_idx})")
+                    })?;
+                    attn_output_published = true;
+                } else {
+                    linear_step_launch(
+                        ordinal,
+                        ScalarType::BF16,
+                        params,
+                        &weights,
+                        &int4_ptrs,
+                        &mut attn_output,
+                        &mut attn_workspace,
+                        &mut sync_buf,
+                    )
+                    .with_context(|| format!("linear_step_launch (layer {layer_idx})"))?;
+                }
                 if options.accurate_stage_timings {
                     gpu_hal::sync(ordinal)
                         .context("sync_after_linear_step (accurate_stage_timings)")?;
@@ -711,17 +740,18 @@ fn run_chained_decode_impl_with_cache_pos(
             }
         }
 
-        // attn_output[..hidden] now holds output_after_attn. Copy it into
-        // the front buffer so the FFN reads it as input. We use a D2D
-        // copy through the kernel for simplicity rather than juggling a
-        // third hidden buffer.
-        gpu_hal::copy_d2d(
-            ordinal,
-            output_buf.as_mut_ptr(),
-            attn_output.as_ptr(),
-            hidden * 2,
-        )
-        .context("d2d attn_output -> residual")?;
+        if !attn_output_published {
+            // attn_output[..hidden] now holds output_after_attn. Copy it into
+            // the front buffer so the FFN reads it as input. Linear Metal INT4
+            // can publish directly to this buffer and skips this D2D copy.
+            gpu_hal::copy_d2d(
+                ordinal,
+                output_buf.as_mut_ptr(),
+                attn_output.as_ptr(),
+                hidden * 2,
+            )
+            .context("d2d attn_output -> residual")?;
+        }
 
         // Swap front: the just-published value is now the "current input".
         front = 1 - front;

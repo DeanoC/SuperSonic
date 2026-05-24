@@ -298,8 +298,11 @@ Metal currently rejects or defers:
   plus INT4 sidecars for projection and expert matvecs. Stage-5
   linear-attention projection/recurrent work uses a fused native Metal INT4
   path by default; set `SUPERSONIC_METAL_DISABLE_QWEN36_LINEAR_INT4_STAGE5=1`
-  to force the host fallback. Stage-5 FFN work stays on the host fallback by
-  default, with routed expert gate/up and down rows batched across top-k
+  to force the host fallback. Decode publishes that native linear output
+  directly into the next residual buffer by default; set
+  `SUPERSONIC_METAL_DISABLE_QWEN36_LINEAR_DECODE_DIRECT=1` to retain the older
+  D2D-copy handoff. Stage-5 FFN work stays on the host fallback by default,
+  with routed expert gate/up and down rows batched across top-k
   experts; `SUPERSONIC_METAL_PROFILE=1` profiles that default lane rather than
   switching implementations. The experimental native FFN path remains explicit
   opt-in via `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5=1`; routed expert
