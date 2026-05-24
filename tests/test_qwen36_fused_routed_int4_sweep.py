@@ -200,6 +200,16 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
                 "full-stage5-router-simd-batch-routed-gate-up-host-order-tap",
             )
         )
+        full_stage5_router_simd_batch_routed_finalize_tap = script.build_env_overrides(
+            args,
+            "full-stage5-router-simd-batch-routed-finalize-tap",
+        )
+        full_stage5_router_simd_batch_routed_gate_up_host_order_finalize_tap = (
+            script.build_env_overrides(
+                args,
+                "full-stage5-router-simd-batch-routed-gate-up-host-order-finalize-tap",
+            )
+        )
         full_stage5_router_simd_batch_routed_gate_up_host_order = script.build_env_overrides(
             args,
             "full-stage5-router-simd-batch-routed-gate-up-host-order",
@@ -383,6 +393,40 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
         )
         self.assertEqual(
             full_stage5_router_simd_batch_routed_gate_up_host_order_tap[
+                "SUPERSONIC_METAL_QWEN36_FFN_EXPERT_GATE_UP_HOST_ORDER_STAGE5"
+            ],
+            "1",
+        )
+        self.assertEqual(
+            full_stage5_router_simd_batch_routed_finalize_tap[
+                "SUPERSONIC_METAL_QWEN36_FFN_STAGE5_ROUTED_FINALIZE_TAP"
+            ],
+            "1",
+        )
+        self.assertEqual(
+            full_stage5_router_simd_batch_routed_finalize_tap[
+                "SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_STAGE5_SIMD"
+            ],
+            "1",
+        )
+        self.assertEqual(
+            full_stage5_router_simd_batch_routed_finalize_tap[
+                "SUPERSONIC_METAL_QWEN36_DECODE_BATCH"
+            ],
+            "1",
+        )
+        self.assertNotIn(
+            "SUPERSONIC_METAL_QWEN36_FFN_EXPERT_GATE_UP_HOST_ORDER_STAGE5",
+            full_stage5_router_simd_batch_routed_finalize_tap,
+        )
+        self.assertEqual(
+            full_stage5_router_simd_batch_routed_gate_up_host_order_finalize_tap[
+                "SUPERSONIC_METAL_QWEN36_FFN_STAGE5_ROUTED_FINALIZE_TAP"
+            ],
+            "1",
+        )
+        self.assertEqual(
+            full_stage5_router_simd_batch_routed_gate_up_host_order_finalize_tap[
                 "SUPERSONIC_METAL_QWEN36_FFN_EXPERT_GATE_UP_HOST_ORDER_STAGE5"
             ],
             "1",
@@ -1982,6 +2026,128 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
             md,
         )
         self.assertIn("| 17 | 2 | 1 | 1.25000000 | 1.24998474 | 0.00001526 |", md)
+
+    def test_routed_finalize_tap_rows_are_parsed_and_rendered(self):
+        script = sweep_qwen36_fused_routed_int4
+        output = (
+            "[qwen36-ffn-routed-finalize-tap] layer=6 router_path=simd "
+            "hidden=2048 top_k=8 topk_idx_match=1 "
+            "topk_weight_max_abs=0.00000000e+00 topk_weight_argmax=0 "
+            "shared_out_max_abs=3.05175781e-05 shared_out_argmax=2 "
+            "host_shared_out_at_argmax=1.00000000e-01 "
+            "metal_shared_out_at_argmax=9.99694824e-02 "
+            "moe_out_max_abs=6.10351562e-05 moe_out_argmax=8 "
+            "final_out_max_abs=1.22070312e-04 final_out_argmax=9 "
+            "moe_probe_row=8 moe_input=1.00000000e+00 "
+            "moe_host_moe=1.25732422e-02 moe_metal_moe=1.25122070e-02 "
+            "moe_host_shared=1.00000000e-01 moe_metal_shared=9.99694824e-02 "
+            "moe_host_final=1.10937500e+00 moe_metal_final=1.10937500e+00 "
+            "moe_final_host_host=1.10937500e+00 "
+            "moe_final_metal_moe_host_shared=1.10937500e+00 "
+            "moe_final_host_moe_metal_shared=1.10937500e+00 "
+            "moe_final_metal_moe_metal_shared=1.10937500e+00 "
+            "moe_host_down_acc=1.25740000e-02 "
+            "moe_host_moe_recomputed=1.25732422e-02 "
+            "moe_metal_mid_host_topk_down_acc=1.25120000e-02 "
+            "moe_metal_mid_host_topk_moe=1.25122070e-02 "
+            "moe_metal_mid_metal_topk_down_acc=1.25120000e-02 "
+            "moe_metal_mid_metal_topk_moe=1.25122070e-02 "
+            "moe_final_metal_mid_host_topk_host_shared=1.10937500e+00 "
+            "moe_final_metal_mid_host_topk_metal_shared=1.10937500e+00 "
+            "moe_final_metal_mid_metal_topk_host_shared=1.10937500e+00 "
+            "moe_final_metal_mid_metal_topk_metal_shared=1.10937500e+00 "
+            "moe_metal_moe_matches_metal_mid_host_topk=1 "
+            "moe_metal_moe_matches_metal_mid_metal_topk=1 "
+            "moe_host_final_matches_host_moe_host_shared=1 "
+            "moe_metal_final_matches_metal_moe_metal_shared=1 "
+            "final_probe_row=9 final_input=1.00000000e+00 "
+            "final_host_moe=2.00000000e-02 final_metal_moe=1.98974609e-02 "
+            "final_host_shared=1.00000000e-01 final_metal_shared=1.00000000e-01 "
+            "final_host_final=1.11718750e+00 final_metal_final=1.11718750e+00 "
+            "final_final_host_host=1.11718750e+00 "
+            "final_final_metal_moe_host_shared=1.11718750e+00 "
+            "final_final_host_moe_metal_shared=1.11718750e+00 "
+            "final_final_metal_moe_metal_shared=1.11718750e+00 "
+            "final_host_down_acc=2.00000000e-02 "
+            "final_host_moe_recomputed=2.00000000e-02 "
+            "final_metal_mid_host_topk_down_acc=1.98970000e-02 "
+            "final_metal_mid_host_topk_moe=1.98974609e-02 "
+            "final_metal_mid_metal_topk_down_acc=1.98970000e-02 "
+            "final_metal_mid_metal_topk_moe=1.98974609e-02 "
+            "final_final_metal_mid_host_topk_host_shared=1.11718750e+00 "
+            "final_final_metal_mid_host_topk_metal_shared=1.11718750e+00 "
+            "final_final_metal_mid_metal_topk_host_shared=1.11718750e+00 "
+            "final_final_metal_mid_metal_topk_metal_shared=1.11718750e+00 "
+            "final_metal_moe_matches_metal_mid_host_topk=1 "
+            "final_metal_moe_matches_metal_mid_metal_topk=1 "
+            "final_host_final_matches_host_moe_host_shared=1 "
+            "final_metal_final_matches_metal_moe_metal_shared=1\n"
+        )
+
+        taps = script.parse_routed_finalize_taps(output)
+
+        self.assertEqual(len(taps), 1)
+        self.assertEqual(taps[0]["layer"], 6)
+        self.assertEqual(taps[0]["router_path"], "simd")
+        self.assertEqual(taps[0]["moe_probe_row"], 8)
+        self.assertEqual(taps[0]["final_probe_row"], 9)
+        self.assertEqual(taps[0]["final_metal_final_matches_metal_moe_metal_shared"], 1)
+        self.assertAlmostEqual(taps[0]["shared_out_max_abs"], 0.0000305175781)
+        self.assertAlmostEqual(taps[0]["final_out_max_abs"], 0.000122070312)
+
+        args = Namespace(
+            max_new_tokens=1,
+            context_size=64,
+            metal_profile=False,
+            metal_profile_phases=False,
+            router_parity_tap=False,
+            router_parity_tap_max_calls=40,
+            shared_parity_tap=False,
+            shared_parity_tap_max_calls=3,
+            routed_parity_tap=False,
+            routed_parity_tap_max_calls=3,
+            decode_batch_route_snapshot=False,
+            promotion_max_headline_ratio=0.999,
+            promotion_max_ffn_ratio=0.999,
+            promotion_max_component_regression_ratio=1.10,
+            promotion_max_command_buffer_wait_ratio=1.05,
+            promotion_max_fused_wall_gpu_ratio=4.0,
+            promotion_max_wait_gpu_ratio=4.0,
+            promotion_require_profile=False,
+        )
+        mode = "full-stage5-router-simd-batch-routed-finalize-tap"
+        candidate = row(mode)
+        candidate["routed_finalize_taps"] = taps
+        report = script.build_report(
+            [row("default"), candidate],
+            args,
+            ["default", mode],
+            "smoke",
+        )
+        md = script.render_markdown(report)
+
+        self.assertEqual(report["summary"]["routed_finalize_tap"]["tap_count"], 1)
+        self.assertEqual(
+            report["summary"]["routed_finalize_tap"][
+                "final_metal_final_matches_metal_moe_metal_shared_count"
+            ],
+            1,
+        )
+        self.assertAlmostEqual(
+            report["summary"]["routed_finalize_tap"]["max_shared_out_abs"],
+            0.0000305175781,
+        )
+        self.assertIn("routed_finalize_tap_count: `1`", md)
+        self.assertIn(
+            "routed_finalize_tap_final_metal_final_matches_metal_moe_metal_shared_count: `1`",
+            md,
+        )
+        self.assertIn("routed_finalize_tap_max_final_out_abs: `0.00012207`", md)
+        self.assertIn("## Routed Finalize Tap", md)
+        self.assertIn(
+            "| hello | full-stage5-router-simd-batch-routed-finalize-tap | simd | 6 | true |",
+            md,
+        )
 
     def test_decode_batch_routed_parity_tap_rows_are_parsed_and_rendered(self):
         script = sweep_qwen36_fused_routed_int4

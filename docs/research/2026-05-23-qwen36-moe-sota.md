@@ -2099,6 +2099,58 @@ under the same smoke:
    the next probe at routed expert down/finalize or final residual/add
    ordering, ideally at both the MoE argmax and the final-output argmax.
 
+57. **Qwen3.6 routed finalize non-patching tap**
+   The fused-routed sweep is now schema `v35`. It adds a diagnostic-only routed
+   finalize tap behind
+   `SUPERSONIC_METAL_QWEN36_FFN_STAGE5_ROUTED_FINALIZE_TAP=1`, plus two modes:
+   `full-stage5-router-simd-batch-routed-finalize-tap` and
+   `full-stage5-router-simd-batch-routed-gate-up-host-order-finalize-tap`. The
+   Rust tap reads back top-k, shared output, routed expert mid, MoE output, and
+   final output, then emits `[qwen36-ffn-routed-finalize-tap]` with recomputed
+   routed down and final-add combinations at both the MoE argmax and final-output
+   argmax. It does not patch `workspace` or `output`.
+
+   Local validation passed:
+   `python3 -m py_compile tests/metal/sweep_qwen36_fused_routed_int4.py
+   tests/test_qwen36_fused_routed_int4_sweep.py`,
+   `python3 -m unittest tests.test_qwen36_fused_routed_int4_sweep`,
+   `cargo test -p kernel-ffi qwen36_moe --lib`, `cargo fmt --check`,
+   `git diff --check`, and `cargo build --release -p runner --bin supersonic`.
+   The v35 one-token Metal smoke wrote
+   `/private/tmp/qwen36_routed_finalize_tap_v35_1tok.{json,md}` with
+   `--modes default,full-stage5-router-simd-batch,full-stage5-router-simd-batch-routed-finalize-tap,full-stage5-router-simd-batch-routed-gate-up-host-order-finalize-tap,full-stage5-router-simd-batch-shared-routed-host-corrected
+   --max-new-tokens 1 --context-size 64 --metal-profile --layer-output-tap
+   --layer-output-delta-tap --layer-output-delta-all --no-promotion-require-profile`.
+   All five rows ran and generated IDs matched (`[11]`), but the promotion gate
+   remained false.
+
+   The combined finalize tap summary recorded `80` rows with exact top-k
+   weights, `max_shared_out_abs=0.0000610351562`,
+   `max_moe_out_abs=0.000244140625`, and
+   `max_final_out_abs=0.00048828125`. Every tapped final output matched the
+   recomputed Metal expression `bf16(input + metal_moe + metal_shared)`
+   (`80/80`), so the final residual/add ordering is not the primary suspect.
+   In the normal tiled path, the first visible cliff remains layer `7` FFN:
+   the final argmax row `1621` has matching MoE
+   (`host_moe=metal_moe=-0.0213623047`) but shared output differs
+   (`host_shared=0.0123901367`, `metal_shared=0.0123291016`), and the Metal
+   final exactly matches the Metal recomposition
+   (`host_final=-0.0942382812`, `metal_final=-0.0947265625`). That points the
+   normal tiled cliff at shared-down/shared-final materialization, not routed
+   gate/up or final add.
+
+   The host-order routed gate/up diagnostic still fails earlier at layer `6`
+   FFN. At row `1846`, shared output is identical
+   (`host_shared=metal_shared=0.0170898438`), recomputing routed down from the
+   Metal mid/top-k gives the host MoE (`0.00823974609`), but the kernel's Metal
+   MoE is `0.00817871094`; the final output then exactly matches
+   `bf16(input + metal_moe + metal_shared)`. That keeps the host-order-specific
+   cliff inside routed expert down/finalize math, while the default tiled path's
+   first visible cliff is now shared-side. The next corrective step should split
+   the shared-down tap/fix for the normal path and add a routed-down accumulator
+   tap inside the Metal finalize kernel for the host-order path before trying to
+   promote either optimization.
+
 ## Sources
 
 - [Qwen/Qwen3.6-35B-A3B model card](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)

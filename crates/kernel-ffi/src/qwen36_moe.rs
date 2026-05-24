@@ -3922,6 +3922,11 @@ fn qwen36_ffn_stage5_routed_gate_up_tap_enabled() -> bool {
         && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
 }
 
+fn qwen36_ffn_stage5_routed_finalize_tap_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_QWEN36_FFN_STAGE5_ROUTED_FINALIZE_TAP").is_some()
+        && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
+}
+
 fn qwen36_ffn_router_stage5_simd_env_enabled() -> bool {
     std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_STAGE5_SIMD").is_some()
         && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
@@ -4946,6 +4951,367 @@ fn qwen36_emit_ffn_routed_stage5_gate_up_tap(
         final_out_argmax,
         host_final_out_at_argmax,
         metal_final_out_at_argmax,
+    );
+
+    Ok(())
+}
+
+struct Qwen36RoutedFinalizeTapRow {
+    row: usize,
+    input: f32,
+    host_moe: f32,
+    metal_moe: f32,
+    host_shared: f32,
+    metal_shared: f32,
+    host_final: f32,
+    metal_final: f32,
+    final_host_host: f32,
+    final_metal_moe_host_shared: f32,
+    final_host_moe_metal_shared: f32,
+    final_metal_moe_metal_shared: f32,
+    host_down_acc: f32,
+    host_moe_recomputed: f32,
+    metal_mid_host_topk_down_acc: f32,
+    metal_mid_host_topk_moe: f32,
+    metal_mid_metal_topk_down_acc: f32,
+    metal_mid_metal_topk_moe: f32,
+    final_metal_mid_host_topk_host_shared: f32,
+    final_metal_mid_host_topk_metal_shared: f32,
+    final_metal_mid_metal_topk_host_shared: f32,
+    final_metal_mid_metal_topk_metal_shared: f32,
+    metal_moe_matches_metal_mid_host_topk: u8,
+    metal_moe_matches_metal_mid_metal_topk: u8,
+    host_final_matches_host_moe_host_shared: u8,
+    metal_final_matches_metal_moe_metal_shared: u8,
+}
+
+fn qwen36_final_from_parts(input: f32, moe: f32, shared: f32) -> f32 {
+    bf16_round_f32(input + moe + shared)
+}
+
+fn qwen36_exact_match_flag(a: f32, b: f32) -> u8 {
+    (a.to_bits() == b.to_bits()) as u8
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen36_build_routed_finalize_tap_row(
+    row: usize,
+    input: &[u16],
+    hidden: usize,
+    moe_intermediate: usize,
+    top_k: usize,
+    group_size: usize,
+    down_w: usize,
+    down_scale: usize,
+    down_zero: usize,
+    router_reference: &Qwen36FfnRouterReference,
+    shared_reference: &Qwen36FfnSharedReference,
+    routed_reference: &Qwen36FfnRoutedReference,
+    metal_topk_idx: &[u32],
+    metal_topk_weight: &[f32],
+    metal_expert_mid: &[f32],
+    metal_shared_out: &[f32],
+    metal_moe_out: &[f32],
+    metal_final_out: &[f32],
+) -> Qwen36RoutedFinalizeTapRow {
+    let input_value = bf16_bits_to_f32(input[row]);
+    let host_moe = routed_reference.moe_out[row];
+    let metal_moe = metal_moe_out[row];
+    let host_shared = shared_reference.shared_out[row];
+    let metal_shared = metal_shared_out[row];
+    let host_final = routed_reference.final_out[row];
+    let metal_final = metal_final_out[row];
+    let final_host_host = qwen36_final_from_parts(input_value, host_moe, host_shared);
+    let final_metal_moe_host_shared = qwen36_final_from_parts(input_value, metal_moe, host_shared);
+    let final_host_moe_metal_shared = qwen36_final_from_parts(input_value, host_moe, metal_shared);
+    let final_metal_moe_metal_shared =
+        qwen36_final_from_parts(input_value, metal_moe, metal_shared);
+    let (host_down_acc, host_moe_recomputed) = qwen36_routed_down_row_probe(
+        down_w,
+        down_scale,
+        down_zero,
+        row,
+        hidden,
+        moe_intermediate,
+        top_k,
+        group_size,
+        &router_reference.topk_idx,
+        &router_reference.topk_weight,
+        &routed_reference.expert_mid,
+    );
+    let (metal_mid_host_topk_down_acc, metal_mid_host_topk_moe) = qwen36_routed_down_row_probe(
+        down_w,
+        down_scale,
+        down_zero,
+        row,
+        hidden,
+        moe_intermediate,
+        top_k,
+        group_size,
+        &router_reference.topk_idx,
+        &router_reference.topk_weight,
+        metal_expert_mid,
+    );
+    let (metal_mid_metal_topk_down_acc, metal_mid_metal_topk_moe) = qwen36_routed_down_row_probe(
+        down_w,
+        down_scale,
+        down_zero,
+        row,
+        hidden,
+        moe_intermediate,
+        top_k,
+        group_size,
+        metal_topk_idx,
+        metal_topk_weight,
+        metal_expert_mid,
+    );
+    let final_metal_mid_host_topk_host_shared =
+        qwen36_final_from_parts(input_value, metal_mid_host_topk_moe, host_shared);
+    let final_metal_mid_host_topk_metal_shared =
+        qwen36_final_from_parts(input_value, metal_mid_host_topk_moe, metal_shared);
+    let final_metal_mid_metal_topk_host_shared =
+        qwen36_final_from_parts(input_value, metal_mid_metal_topk_moe, host_shared);
+    let final_metal_mid_metal_topk_metal_shared =
+        qwen36_final_from_parts(input_value, metal_mid_metal_topk_moe, metal_shared);
+
+    Qwen36RoutedFinalizeTapRow {
+        row,
+        input: input_value,
+        host_moe,
+        metal_moe,
+        host_shared,
+        metal_shared,
+        host_final,
+        metal_final,
+        final_host_host,
+        final_metal_moe_host_shared,
+        final_host_moe_metal_shared,
+        final_metal_moe_metal_shared,
+        host_down_acc,
+        host_moe_recomputed,
+        metal_mid_host_topk_down_acc,
+        metal_mid_host_topk_moe,
+        metal_mid_metal_topk_down_acc,
+        metal_mid_metal_topk_moe,
+        final_metal_mid_host_topk_host_shared,
+        final_metal_mid_host_topk_metal_shared,
+        final_metal_mid_metal_topk_host_shared,
+        final_metal_mid_metal_topk_metal_shared,
+        metal_moe_matches_metal_mid_host_topk: qwen36_exact_match_flag(
+            metal_moe,
+            metal_mid_host_topk_moe,
+        ),
+        metal_moe_matches_metal_mid_metal_topk: qwen36_exact_match_flag(
+            metal_moe,
+            metal_mid_metal_topk_moe,
+        ),
+        host_final_matches_host_moe_host_shared: qwen36_exact_match_flag(
+            host_final,
+            final_host_host,
+        ),
+        metal_final_matches_metal_moe_metal_shared: qwen36_exact_match_flag(
+            metal_final,
+            final_metal_moe_metal_shared,
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen36_emit_ffn_routed_stage5_finalize_tap(
+    ordinal: usize,
+    layer_idx: i32,
+    hidden: usize,
+    moe_intermediate: usize,
+    top_k: usize,
+    off_topk_val: usize,
+    off_topk_idx: usize,
+    off_shared_out: usize,
+    off_expert_mid: usize,
+    off_moe_out: usize,
+    weights: &Qwen36MoeFfnStepWeights,
+    int4: &Qwen36MoeFfnStepInt4,
+    workspace: &GpuBuffer,
+    output: &GpuBuffer,
+    shared_reference: &Qwen36FfnSharedReference,
+    routed_reference: &Qwen36FfnRoutedReference,
+    router_reference: &Qwen36FfnRouterReference,
+) -> Result<(), GpuError> {
+    crate::prefill_ffi::flush_metal_batch()?;
+    gpu_hal::sync(ordinal)?;
+
+    let workspace_bytes = workspace.to_host_bytes()?;
+    let workspace_f32 = qwen36_bytes_to_f32_vec(&workspace_bytes);
+    let workspace_len = workspace_f32.len();
+    let expert_mid_len = top_k * moe_intermediate;
+    let workspace_needed = (off_topk_val + top_k)
+        .max(off_topk_idx + top_k)
+        .max(off_shared_out + hidden)
+        .max(off_expert_mid + expert_mid_len)
+        .max(off_moe_out + hidden);
+    if workspace_len < workspace_needed {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::ffn_step_launch: routed finalize tap workspace too small: need {workspace_needed}, got {workspace_len}"
+        )));
+    }
+
+    let output_bytes = output.to_host_bytes()?;
+    let output_u16 = qwen36_bytes_to_u16_vec(&output_bytes);
+    if output_u16.len() < hidden {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::ffn_step_launch: routed finalize tap output too small: need {hidden}, got {}",
+            output_u16.len()
+        )));
+    }
+
+    let input = unsafe { std::slice::from_raw_parts(weights.input_hidden as *const u16, hidden) };
+    let metal_topk_weight = &workspace_f32[off_topk_val..off_topk_val + top_k];
+    let metal_topk_idx: Vec<u32> = workspace_f32[off_topk_idx..off_topk_idx + top_k]
+        .iter()
+        .map(|value| value.to_bits())
+        .collect();
+    let metal_shared_out = &workspace_f32[off_shared_out..off_shared_out + hidden];
+    let metal_expert_mid = &workspace_f32[off_expert_mid..off_expert_mid + expert_mid_len];
+    let metal_moe_out = &workspace_f32[off_moe_out..off_moe_out + hidden];
+    let metal_final_out = qwen36_bf16_slice_to_f32_vec(&output_u16[..hidden]);
+
+    let topk_idx_match = router_reference.topk_idx == metal_topk_idx;
+    let (topk_weight_max_abs, topk_weight_argmax) =
+        qwen36_max_abs_delta(&router_reference.topk_weight, metal_topk_weight);
+    let (shared_out_max_abs, shared_out_argmax) =
+        qwen36_max_abs_delta(&shared_reference.shared_out, metal_shared_out);
+    let host_shared_out_at_argmax = shared_reference
+        .shared_out
+        .get(shared_out_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let metal_shared_out_at_argmax = metal_shared_out
+        .get(shared_out_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let (moe_out_max_abs, moe_out_argmax) =
+        qwen36_max_abs_delta(&routed_reference.moe_out, metal_moe_out);
+    let (final_out_max_abs, final_out_argmax) =
+        qwen36_max_abs_delta(&routed_reference.final_out, &metal_final_out);
+
+    let group_size = int4.group_size.max(0) as usize;
+    let down_w = weights.down_proj_w as usize;
+    let down_scale = int4.down_proj_scale as usize;
+    let down_zero = int4.down_proj_zero as usize;
+    let moe_probe = qwen36_build_routed_finalize_tap_row(
+        moe_out_argmax,
+        input,
+        hidden,
+        moe_intermediate,
+        top_k,
+        group_size,
+        down_w,
+        down_scale,
+        down_zero,
+        router_reference,
+        shared_reference,
+        routed_reference,
+        &metal_topk_idx,
+        metal_topk_weight,
+        metal_expert_mid,
+        metal_shared_out,
+        metal_moe_out,
+        &metal_final_out,
+    );
+    let final_probe = qwen36_build_routed_finalize_tap_row(
+        final_out_argmax,
+        input,
+        hidden,
+        moe_intermediate,
+        top_k,
+        group_size,
+        down_w,
+        down_scale,
+        down_zero,
+        router_reference,
+        shared_reference,
+        routed_reference,
+        &metal_topk_idx,
+        metal_topk_weight,
+        metal_expert_mid,
+        metal_shared_out,
+        metal_moe_out,
+        &metal_final_out,
+    );
+
+    let router_path = if qwen36_ffn_router_stage5_simd_env_enabled() {
+        "simd"
+    } else {
+        "serial"
+    };
+    eprintln!(
+        "[qwen36-ffn-routed-finalize-tap] layer={} router_path={} hidden={} top_k={} topk_idx_match={} topk_weight_max_abs={:.8e} topk_weight_argmax={} shared_out_max_abs={:.8e} shared_out_argmax={} host_shared_out_at_argmax={:.8e} metal_shared_out_at_argmax={:.8e} moe_out_max_abs={:.8e} moe_out_argmax={} final_out_max_abs={:.8e} final_out_argmax={} moe_probe_row={} moe_input={:.8e} moe_host_moe={:.8e} moe_metal_moe={:.8e} moe_host_shared={:.8e} moe_metal_shared={:.8e} moe_host_final={:.8e} moe_metal_final={:.8e} moe_final_host_host={:.8e} moe_final_metal_moe_host_shared={:.8e} moe_final_host_moe_metal_shared={:.8e} moe_final_metal_moe_metal_shared={:.8e} moe_host_down_acc={:.8e} moe_host_moe_recomputed={:.8e} moe_metal_mid_host_topk_down_acc={:.8e} moe_metal_mid_host_topk_moe={:.8e} moe_metal_mid_metal_topk_down_acc={:.8e} moe_metal_mid_metal_topk_moe={:.8e} moe_final_metal_mid_host_topk_host_shared={:.8e} moe_final_metal_mid_host_topk_metal_shared={:.8e} moe_final_metal_mid_metal_topk_host_shared={:.8e} moe_final_metal_mid_metal_topk_metal_shared={:.8e} moe_metal_moe_matches_metal_mid_host_topk={} moe_metal_moe_matches_metal_mid_metal_topk={} moe_host_final_matches_host_moe_host_shared={} moe_metal_final_matches_metal_moe_metal_shared={} final_probe_row={} final_input={:.8e} final_host_moe={:.8e} final_metal_moe={:.8e} final_host_shared={:.8e} final_metal_shared={:.8e} final_host_final={:.8e} final_metal_final={:.8e} final_final_host_host={:.8e} final_final_metal_moe_host_shared={:.8e} final_final_host_moe_metal_shared={:.8e} final_final_metal_moe_metal_shared={:.8e} final_host_down_acc={:.8e} final_host_moe_recomputed={:.8e} final_metal_mid_host_topk_down_acc={:.8e} final_metal_mid_host_topk_moe={:.8e} final_metal_mid_metal_topk_down_acc={:.8e} final_metal_mid_metal_topk_moe={:.8e} final_final_metal_mid_host_topk_host_shared={:.8e} final_final_metal_mid_host_topk_metal_shared={:.8e} final_final_metal_mid_metal_topk_host_shared={:.8e} final_final_metal_mid_metal_topk_metal_shared={:.8e} final_metal_moe_matches_metal_mid_host_topk={} final_metal_moe_matches_metal_mid_metal_topk={} final_host_final_matches_host_moe_host_shared={} final_metal_final_matches_metal_moe_metal_shared={}",
+        layer_idx,
+        router_path,
+        hidden,
+        top_k,
+        topk_idx_match as u8,
+        topk_weight_max_abs,
+        topk_weight_argmax,
+        shared_out_max_abs,
+        shared_out_argmax,
+        host_shared_out_at_argmax,
+        metal_shared_out_at_argmax,
+        moe_out_max_abs,
+        moe_out_argmax,
+        final_out_max_abs,
+        final_out_argmax,
+        moe_probe.row,
+        moe_probe.input,
+        moe_probe.host_moe,
+        moe_probe.metal_moe,
+        moe_probe.host_shared,
+        moe_probe.metal_shared,
+        moe_probe.host_final,
+        moe_probe.metal_final,
+        moe_probe.final_host_host,
+        moe_probe.final_metal_moe_host_shared,
+        moe_probe.final_host_moe_metal_shared,
+        moe_probe.final_metal_moe_metal_shared,
+        moe_probe.host_down_acc,
+        moe_probe.host_moe_recomputed,
+        moe_probe.metal_mid_host_topk_down_acc,
+        moe_probe.metal_mid_host_topk_moe,
+        moe_probe.metal_mid_metal_topk_down_acc,
+        moe_probe.metal_mid_metal_topk_moe,
+        moe_probe.final_metal_mid_host_topk_host_shared,
+        moe_probe.final_metal_mid_host_topk_metal_shared,
+        moe_probe.final_metal_mid_metal_topk_host_shared,
+        moe_probe.final_metal_mid_metal_topk_metal_shared,
+        moe_probe.metal_moe_matches_metal_mid_host_topk,
+        moe_probe.metal_moe_matches_metal_mid_metal_topk,
+        moe_probe.host_final_matches_host_moe_host_shared,
+        moe_probe.metal_final_matches_metal_moe_metal_shared,
+        final_probe.row,
+        final_probe.input,
+        final_probe.host_moe,
+        final_probe.metal_moe,
+        final_probe.host_shared,
+        final_probe.metal_shared,
+        final_probe.host_final,
+        final_probe.metal_final,
+        final_probe.final_host_host,
+        final_probe.final_metal_moe_host_shared,
+        final_probe.final_host_moe_metal_shared,
+        final_probe.final_metal_moe_metal_shared,
+        final_probe.host_down_acc,
+        final_probe.host_moe_recomputed,
+        final_probe.metal_mid_host_topk_down_acc,
+        final_probe.metal_mid_host_topk_moe,
+        final_probe.metal_mid_metal_topk_down_acc,
+        final_probe.metal_mid_metal_topk_moe,
+        final_probe.final_metal_mid_host_topk_host_shared,
+        final_probe.final_metal_mid_host_topk_metal_shared,
+        final_probe.final_metal_mid_metal_topk_host_shared,
+        final_probe.final_metal_mid_metal_topk_metal_shared,
+        final_probe.metal_moe_matches_metal_mid_host_topk,
+        final_probe.metal_moe_matches_metal_mid_metal_topk,
+        final_probe.host_final_matches_host_moe_host_shared,
+        final_probe.metal_final_matches_metal_moe_metal_shared,
     );
 
     Ok(())
@@ -8889,7 +9255,12 @@ fn ffn_step_stage1_5_metal_host(
         let shared_host_correction = qwen36_ffn_stage5_shared_host_correction_enabled();
         let routed_host_correction = qwen36_ffn_stage5_routed_host_correction_enabled();
         let routed_gate_up_tap = qwen36_ffn_stage5_routed_gate_up_tap_enabled();
-        if shared_host_correction || routed_host_correction || routed_gate_up_tap {
+        let routed_finalize_tap = qwen36_ffn_stage5_routed_finalize_tap_enabled();
+        if shared_host_correction
+            || routed_host_correction
+            || routed_gate_up_tap
+            || routed_finalize_tap
+        {
             crate::prefill_ffi::flush_metal_batch()?;
             gpu_hal::sync(ordinal)?;
         }
@@ -8898,6 +9269,7 @@ fn ffn_step_stage1_5_metal_host(
             || shared_host_correction
             || routed_host_correction
             || routed_gate_up_tap
+            || routed_finalize_tap
         {
             let input =
                 unsafe { std::slice::from_raw_parts(weights.input_hidden as *const u16, hidden) };
@@ -8923,6 +9295,7 @@ fn ffn_step_stage1_5_metal_host(
             || shared_host_correction
             || routed_host_correction
             || routed_gate_up_tap
+            || routed_finalize_tap
         {
             let shared_expert_gate_w = unsafe {
                 std::slice::from_raw_parts(weights.shared_expert_gate_w as *const u16, hidden)
@@ -8952,20 +9325,20 @@ fn ffn_step_stage1_5_metal_host(
         } else {
             None
         };
-        let routed_reference = if routed_host_correction || routed_gate_up_tap {
+        let needs_routed_reference =
+            routed_host_correction || routed_gate_up_tap || routed_finalize_tap;
+        let routed_reference = if needs_routed_reference {
             let input =
                 unsafe { std::slice::from_raw_parts(weights.input_hidden as *const u16, hidden) };
             let router_reference = router_reference.as_ref().ok_or_else(|| {
-                GpuError::InvalidArg(
-                    "qwen36_moe::ffn_step_launch: routed tap/correction missing router reference"
-                        .into(),
-                )
+                GpuError::InvalidArg(String::from(
+                    "qwen36_moe::ffn_step_launch: routed tap/correction missing router reference",
+                ))
             })?;
             let shared_reference = shared_reference.as_ref().ok_or_else(|| {
-                GpuError::InvalidArg(
-                    "qwen36_moe::ffn_step_launch: routed tap/correction missing shared reference"
-                        .into(),
-                )
+                GpuError::InvalidArg(String::from(
+                    "qwen36_moe::ffn_step_launch: routed tap/correction missing shared reference",
+                ))
             })?;
             Some(qwen36_compute_ffn_routed_reference(
                 input,
@@ -9052,6 +9425,44 @@ fn ffn_step_stage1_5_metal_host(
                     router_reference.as_ref().ok_or_else(|| {
                         GpuError::InvalidArg(
                             "qwen36_moe::ffn_step_launch: routed gate/up tap missing router reference"
+                                .into(),
+                        )
+                    })?,
+                )?;
+            }
+            if routed_finalize_tap {
+                let routed_reference = routed_reference.as_ref().ok_or_else(|| {
+                    GpuError::InvalidArg(
+                        "qwen36_moe::ffn_step_launch: routed finalize tap missing routed reference"
+                            .into(),
+                    )
+                })?;
+                let shared_reference = shared_reference.as_ref().ok_or_else(|| {
+                    GpuError::InvalidArg(
+                        "qwen36_moe::ffn_step_launch: routed finalize tap missing shared reference"
+                            .into(),
+                    )
+                })?;
+                qwen36_emit_ffn_routed_stage5_finalize_tap(
+                    ordinal,
+                    params.layer_idx,
+                    hidden,
+                    moe_intermediate,
+                    top_k,
+                    off_topk_val,
+                    off_topk_idx,
+                    off_shared_out,
+                    off_expert_mid,
+                    off_moe_out,
+                    weights,
+                    int4,
+                    workspace,
+                    output,
+                    shared_reference,
+                    routed_reference,
+                    router_reference.as_ref().ok_or_else(|| {
+                        GpuError::InvalidArg(
+                            "qwen36_moe::ffn_step_launch: routed finalize tap missing router reference"
                                 .into(),
                         )
                     })?,
