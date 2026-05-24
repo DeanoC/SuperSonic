@@ -2845,38 +2845,27 @@ kernel void supersonic_qwen36_ffn_router_stage5(
         return;
     }
 
-    float partial_sq = 0.0f;
-    for (uint col = tid; col < params.hidden; col += 256u) {
-        float v = float(input_hidden[col]);
-        partial_sq += v * v;
-    }
-    scratch[tid] = partial_sq;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
-        if (tid < stride) {
-            scratch[tid] += scratch[tid + stride];
+    if (tid == 0u) {
+        float mean_sq = 0.0f;
+        for (uint col = 0u; col < params.hidden; ++col) {
+            float v = float(input_hidden[col]);
+            mean_sq += v * v;
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float inv_rms = rsqrt((mean_sq / float(params.hidden)) + rms_norm_eps);
+        for (uint col = 0u; col < params.hidden; ++col) {
+            workspace[params.off_h_norm + col] = bf16_round_rne_finite(
+                float(input_hidden[col]) * inv_rms * (1.0f + float(post_attn_norm[col]))
+            );
+        }
     }
-    float inv_rms = rsqrt((scratch[0] / float(params.hidden)) + rms_norm_eps);
-
-    for (uint col = tid; col < params.hidden; col += 256u) {
-        float x = bf16_round_rne_finite(
-            float(input_hidden[col]) * inv_rms * (1.0f + float(post_attn_norm[col]))
-        );
-        workspace[params.off_h_norm + col] = x;
-    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     float logit = -INFINITY;
     if (tid < params.num_experts) {
         float acc = 0.0f;
         uint row_base = tid * params.hidden;
         for (uint col = 0u; col < params.hidden; ++col) {
-            float x = bf16_round_rne_finite(
-                float(input_hidden[col]) * inv_rms * (1.0f + float(post_attn_norm[col]))
-            );
-            acc += float(gate[row_base + col]) * x;
+            acc += float(gate[row_base + col]) * workspace[params.off_h_norm + col];
         }
         logit = bf16_round_rne_finite(acc);
         workspace[params.hidden + tid] = logit;

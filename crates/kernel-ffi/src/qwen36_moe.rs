@@ -20,6 +20,7 @@
 use std::collections::HashMap;
 use std::ffi::{c_int, c_void};
 use std::os::raw::c_uint;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use gpu_hal::{Backend, BufferKind, GpuBuffer, GpuError, ScalarType};
@@ -38,6 +39,7 @@ static QWEN36_EXPERT_RESIDENCY_PROFILE: OnceLock<Mutex<Qwen36ExpertResidencyProf
 static QWEN36_BATCHED_PREFILL_FEASIBILITY_PROFILE: OnceLock<
     Mutex<Qwen36BatchedPrefillFeasibilityConfig>,
 > = OnceLock::new();
+static QWEN36_FFN_ROUTER_PARITY_TAP_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug, Clone, Default)]
 struct Qwen36RouteProfileAccumulator {
@@ -3893,6 +3895,213 @@ pub fn ffn_stage5_router_defer_wait_enabled() -> bool {
         && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
 }
 
+fn qwen36_ffn_router_stage5_parity_tap_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_QWEN36_FFN_ROUTER_STAGE5_PARITY_TAP").is_some()
+        && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
+}
+
+fn qwen36_ffn_router_stage5_parity_tap_max_calls() -> usize {
+    std::env::var("SUPERSONIC_METAL_QWEN36_FFN_ROUTER_STAGE5_PARITY_TAP_MAX_CALLS")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(40)
+}
+
+#[derive(Debug, Clone)]
+struct Qwen36FfnRouterReference {
+    h_norm: Vec<f32>,
+    logits: Vec<f32>,
+    topk_idx: Vec<u32>,
+    topk_weight: Vec<f32>,
+}
+
+fn qwen36_compute_ffn_router_reference(
+    input: &[u16],
+    norm_w: &[u16],
+    gate_w: &[u16],
+    hidden: usize,
+    num_experts: usize,
+    top_k: usize,
+    rms_norm_eps: f32,
+) -> Qwen36FfnRouterReference {
+    let mut mean_sq = 0.0f32;
+    for &bits in input {
+        let v = bf16_bits_to_f32(bits);
+        mean_sq += v * v;
+    }
+    let inv_rms = 1.0f32 / (mean_sq / hidden as f32 + rms_norm_eps).sqrt();
+
+    let mut h_norm = vec![0.0f32; hidden];
+    for col in 0..hidden {
+        let v = bf16_bits_to_f32(input[col]);
+        let w = bf16_bits_to_f32(norm_w[col]);
+        h_norm[col] = bf16_round_f32(v * inv_rms * (1.0 + w));
+    }
+
+    let mut logits = vec![0.0f32; num_experts];
+    for expert in 0..num_experts {
+        let row = expert * hidden;
+        let mut acc = 0.0f32;
+        for col in 0..hidden {
+            acc += bf16_bits_to_f32(gate_w[row + col]) * h_norm[col];
+        }
+        logits[expert] = bf16_round_f32(acc);
+    }
+
+    let row_max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut probs = vec![0.0f32; num_experts];
+    let mut row_sum = 0.0f32;
+    for expert in 0..num_experts {
+        let e = (logits[expert] - row_max).exp();
+        probs[expert] = e;
+        row_sum += e;
+    }
+    let inv_sum = 1.0f32 / row_sum;
+    for prob in probs.iter_mut() {
+        *prob = bf16_round_f32(*prob * inv_sum);
+    }
+
+    let mut topk_idx = vec![0u32; top_k];
+    let mut topk_weight = vec![0.0f32; top_k];
+    for kk in 0..top_k {
+        let mut best_idx = -1i32;
+        let mut best_val = f32::NEG_INFINITY;
+        for (expert, &v) in probs.iter().enumerate() {
+            if v > best_val || (v == best_val && best_idx >= 0 && (expert as i32) < best_idx) {
+                best_val = v;
+                best_idx = expert as i32;
+            }
+        }
+        topk_idx[kk] = best_idx as u32;
+        topk_weight[kk] = best_val;
+        if best_idx >= 0 {
+            probs[best_idx as usize] = f32::NEG_INFINITY;
+        }
+    }
+
+    let sum_k: f32 = topk_weight.iter().sum();
+    let inv_k = 1.0f32 / sum_k;
+    for weight in topk_weight.iter_mut() {
+        *weight = bf16_round_f32(*weight * inv_k);
+    }
+
+    Qwen36FfnRouterReference {
+        h_norm,
+        logits,
+        topk_idx,
+        topk_weight,
+    }
+}
+
+fn qwen36_bytes_to_f32_vec(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(4)
+        .map(|chunk| f32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect()
+}
+
+fn qwen36_bytes_to_u32_vec(bytes: &[u8]) -> Vec<u32> {
+    bytes
+        .chunks_exact(4)
+        .map(|chunk| u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect()
+}
+
+fn qwen36_max_abs_delta(expected: &[f32], got: &[f32]) -> (f32, usize) {
+    let mut max_abs = 0.0f32;
+    let mut max_idx = 0usize;
+    for (idx, (&a, &b)) in expected.iter().zip(got.iter()).enumerate() {
+        let delta = (a - b).abs();
+        if delta > max_abs || (delta.is_nan() && !max_abs.is_nan()) {
+            max_abs = delta;
+            max_idx = idx;
+        }
+    }
+    (max_abs, max_idx)
+}
+
+fn qwen36_join_u32(values: &[u32]) -> String {
+    values
+        .iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn qwen36_join_f32(values: &[f32]) -> String {
+    values
+        .iter()
+        .map(|value| format!("{value:.8}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn qwen36_emit_ffn_router_stage5_parity_tap(
+    ordinal: usize,
+    layer_idx: i32,
+    workspace: &GpuBuffer,
+    output_idx: &GpuBuffer,
+    hidden: usize,
+    num_experts: usize,
+    top_k: usize,
+    off_h_norm: usize,
+    off_router_logits: usize,
+    off_topk_val: usize,
+    off_topk_idx: usize,
+    reference: &Qwen36FfnRouterReference,
+) -> Result<(), GpuError> {
+    let call = QWEN36_FFN_ROUTER_PARITY_TAP_CALLS.fetch_add(1, Ordering::Relaxed);
+    if call >= qwen36_ffn_router_stage5_parity_tap_max_calls() {
+        return Ok(());
+    }
+
+    gpu_hal::sync(ordinal)?;
+    let workspace_bytes = workspace.to_host_bytes()?;
+    let workspace_f32 = qwen36_bytes_to_f32_vec(&workspace_bytes);
+    let output_idx_bytes = output_idx.to_host_bytes()?;
+    let output_idx_u32 = qwen36_bytes_to_u32_vec(&output_idx_bytes);
+
+    let h_norm = &workspace_f32[off_h_norm..off_h_norm + hidden];
+    let logits = &workspace_f32[off_router_logits..off_router_logits + num_experts];
+    let topk_weight = &workspace_f32[off_topk_val..off_topk_val + top_k];
+    let workspace_topk_idx: Vec<u32> = workspace_f32[off_topk_idx..off_topk_idx + top_k]
+        .iter()
+        .map(|value| value.to_bits())
+        .collect();
+    let output_topk_idx = &output_idx_u32[..top_k.min(output_idx_u32.len())];
+
+    let (h_norm_max_abs, h_norm_argmax) = qwen36_max_abs_delta(&reference.h_norm, h_norm);
+    let (logits_max_abs, logits_argmax) = qwen36_max_abs_delta(&reference.logits, logits);
+    let (topk_weight_max_abs, topk_weight_argmax) =
+        qwen36_max_abs_delta(&reference.topk_weight, topk_weight);
+    let workspace_idx_match = reference.topk_idx == workspace_topk_idx;
+    let output_idx_match = reference.topk_idx.as_slice() == output_topk_idx;
+    let topk_idx_match = workspace_idx_match && output_idx_match;
+
+    eprintln!(
+        "[qwen36-ffn-router-parity] call={} layer={} topk_idx_match={} workspace_idx_match={} output_idx_match={} h_norm_max_abs={:.8e} h_norm_argmax={} logits_max_abs={:.8e} logits_argmax={} topk_weight_max_abs={:.8e} topk_weight_argmax={} host_idx={} workspace_idx={} output_idx={} host_w={} metal_w={}",
+        call,
+        layer_idx,
+        topk_idx_match as u8,
+        workspace_idx_match as u8,
+        output_idx_match as u8,
+        h_norm_max_abs,
+        h_norm_argmax,
+        logits_max_abs,
+        logits_argmax,
+        topk_weight_max_abs,
+        topk_weight_argmax,
+        qwen36_join_u32(&reference.topk_idx),
+        qwen36_join_u32(&workspace_topk_idx),
+        qwen36_join_u32(output_topk_idx),
+        qwen36_join_f32(&reference.topk_weight),
+        qwen36_join_f32(topk_weight),
+    );
+
+    Ok(())
+}
+
 pub fn ffn_expert_direct_gather_stage5_metal_native_supported(
     params: Qwen36MoeFfnStepParams,
     weights: &Qwen36MoeFfnStepWeights,
@@ -6896,7 +7105,9 @@ pub fn ffn_step_launch(
     }
     let backend = output.backend();
     if backend == Backend::Metal {
-        return ffn_step_stage1_5_metal_host(params, weights, int4, output, output_idx, workspace);
+        return ffn_step_stage1_5_metal_host(
+            ordinal, params, weights, int4, output, output_idx, workspace,
+        );
     }
 
     let counters = sync_buf.as_mut_ptr() as *mut c_uint;
@@ -6970,6 +7181,7 @@ pub fn ffn_step_launch(
 }
 
 fn ffn_step_stage1_5_metal_host(
+    ordinal: usize,
     params: Qwen36MoeFfnStepParams,
     weights: &Qwen36MoeFfnStepWeights,
     int4: &Qwen36MoeFfnStepInt4,
@@ -7116,7 +7328,29 @@ fn ffn_step_stage1_5_metal_host(
             int4.group_size,
             "down_proj",
         )?;
-        return crate::prefill_ffi::metal_profile_time(
+        let router_reference = if qwen36_ffn_router_stage5_parity_tap_enabled() {
+            let input =
+                unsafe { std::slice::from_raw_parts(weights.input_hidden as *const u16, hidden) };
+            let norm_w = unsafe {
+                std::slice::from_raw_parts(weights.post_attn_norm_w as *const u16, hidden)
+            };
+            let gate_w = unsafe {
+                std::slice::from_raw_parts(weights.gate_w as *const u16, num_experts * hidden)
+            };
+            Some(qwen36_compute_ffn_router_reference(
+                input,
+                norm_w,
+                gate_w,
+                hidden,
+                num_experts,
+                top_k,
+                params.rms_norm_eps,
+            ))
+        } else {
+            None
+        };
+        let wait_for_completion = !ffn_stage5_router_defer_wait_enabled();
+        let status = crate::prefill_ffi::metal_profile_time(
             "qwen36_ffn_int4_stage5_with_router",
             "native",
             || unsafe {
@@ -7150,10 +7384,29 @@ fn ffn_step_stage1_5_metal_host(
                     workspace.as_mut_ptr() as *mut c_void,
                     output_idx.as_mut_ptr() as *mut c_void,
                     output.as_mut_ptr() as *mut c_void,
-                    !ffn_stage5_router_defer_wait_enabled(),
+                    wait_for_completion,
                 )
             },
         );
+        if status.is_ok() {
+            if let Some(reference) = router_reference.as_ref() {
+                qwen36_emit_ffn_router_stage5_parity_tap(
+                    ordinal,
+                    params.layer_idx,
+                    workspace,
+                    output_idx,
+                    hidden,
+                    num_experts,
+                    top_k,
+                    off_h_norm,
+                    off_router_logits,
+                    off_topk_val,
+                    off_topk_idx,
+                    reference,
+                )?;
+            }
+        }
+        return status;
     }
 
     let input = unsafe { std::slice::from_raw_parts(weights.input_hidden as *const u16, hidden) };

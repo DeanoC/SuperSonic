@@ -161,6 +161,22 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
         phase_default = script.build_env_overrides(phase_args, "default")
         self.assertEqual(phase_default["SUPERSONIC_METAL_PROFILE_QWEN36_FFN_PHASES"], "1")
 
+        tap_args = Namespace(
+            metal_profile=False,
+            metal_profile_phases=False,
+            router_parity_tap=True,
+            router_parity_tap_max_calls=3,
+        )
+        tap_router = script.build_env_overrides(tap_args, "full-stage5-router")
+        self.assertEqual(
+            tap_router["SUPERSONIC_METAL_QWEN36_FFN_ROUTER_STAGE5_PARITY_TAP"],
+            "1",
+        )
+        self.assertEqual(
+            tap_router["SUPERSONIC_METAL_QWEN36_FFN_ROUTER_STAGE5_PARITY_TAP_MAX_CALLS"],
+            "3",
+        )
+
     def test_promotion_gate_passes_only_real_improvements(self):
         script = sweep_qwen36_fused_routed_int4
         rows = [
@@ -324,6 +340,50 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
         self.assertEqual(candidate["fused_wall_gpu_ratio"], 4.0)
         self.assertEqual(candidate["wait_gpu_ratio"], 2.0)
         self.assertEqual(candidate["ffn_attribution_class"], "gpu_arithmetic")
+
+    def test_router_parity_tap_rows_are_parsed_and_rendered(self):
+        script = sweep_qwen36_fused_routed_int4
+        output = (
+            "[qwen36-ffn-router-parity] call=0 layer=5 topk_idx_match=0 "
+            "workspace_idx_match=0 output_idx_match=0 h_norm_max_abs=1.25000000e-01 "
+            "h_norm_argmax=17 logits_max_abs=2.50000000e-01 logits_argmax=33 "
+            "topk_weight_max_abs=3.12500000e-02 topk_weight_argmax=2 "
+            "host_idx=1,2,3 workspace_idx=1,4,3 output_idx=1,4,3 "
+            "host_w=0.50000000,0.25000000,0.12500000 "
+            "metal_w=0.46875000,0.28125000,0.12500000\n"
+        )
+
+        taps = script.parse_router_parity_taps(output)
+
+        self.assertEqual(len(taps), 1)
+        self.assertEqual(taps[0]["layer"], 5)
+        self.assertEqual(taps[0]["topk_idx_match"], 0)
+        self.assertEqual(taps[0]["host_idx"], "1,2,3")
+        self.assertAlmostEqual(taps[0]["logits_max_abs"], 0.25)
+
+        args = Namespace(
+            max_new_tokens=2,
+            context_size=64,
+            metal_profile=False,
+            metal_profile_phases=False,
+            router_parity_tap=True,
+            router_parity_tap_max_calls=3,
+            promotion_max_headline_ratio=0.999,
+            promotion_max_ffn_ratio=0.999,
+            promotion_max_component_regression_ratio=1.10,
+            promotion_max_command_buffer_wait_ratio=1.05,
+            promotion_max_fused_wall_gpu_ratio=4.0,
+            promotion_max_wait_gpu_ratio=4.0,
+            promotion_require_profile=False,
+        )
+        candidate = row("full-stage5-router", ids=[11, 353])
+        candidate["router_parity_taps"] = taps
+        report = script.build_report([row("default"), candidate], args, ["default", "full-stage5-router"], "smoke")
+        md = script.render_markdown(report)
+
+        self.assertIn("router_parity_tap: `True`", md)
+        self.assertIn("## Router Parity Tap", md)
+        self.assertIn("| hello | full-stage5-router | 5 | false |", md)
 
 
 if __name__ == "__main__":

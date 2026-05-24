@@ -977,6 +977,49 @@ under the same smoke:
    enough without token drift or fix the router stage so the whole FFN can be
    studied as one parity-clean larger pipeline.
 
+29. **Qwen3.6 full-stage5 router parity repair**
+   The router/RMSNorm/top-k side of `full-stage5-router` is now isolated and
+   repaired. A narrow diagnostic tap,
+   `SUPERSONIC_METAL_QWEN36_FFN_ROUTER_STAGE5_PARITY_TAP=1`, computes the host
+   router reference beside the native Metal stage-5 router path and emits
+   `[qwen36-ffn-router-parity]` rows for normalized hidden, router logits,
+   top-k indices, and top-k weights. The sweep harness exposes this as
+   `tests/metal/sweep_qwen36_fused_routed_int4.py --router-parity-tap` and
+   records the rows in JSON/Markdown reports.
+
+   The first tap proved the old four-token drift was not caused by top-k
+   selection: all 160 tapped layer calls matched indices, but the Metal router
+   RMSNorm reduction accumulated in a different order and allowed enough
+   normalized-hidden/logit drift to perturb later tokens. The Metal router
+   kernel now computes the stage-5 normalized hidden vector in host order before
+   the router dot products. The refreshed four-token tap preserved the default
+   IDs `[11, 271, 40, 599]`, reported zero top-k/workspace/output-index
+   mismatches across 160 tapped calls, and bounded the remaining differences at
+   `h_norm_max_abs=0.001953125`, `logits_max_abs=0.0`, and
+   `topk_weight_max_abs=0.0009765625`.
+
+   The refreshed seven-mode fused-routed sweep is now correctness-clean across
+   every tracked mode: `default`, `direct-gather`, `direct-defer-wait`,
+   `gpu-pack`, `full-stage5`, `full-stage5-router`, and `router-defer-wait`
+   all generated `[11, 271, 40, 599]`. Promotion remains correctly negative.
+   The default lane measured `209.8 ms/token` with `ffn_ms_avg=114.659`, while
+   `full-stage5-router` measured `453.2 ms/token` with
+   `ffn_ms_avg=361.197`, `fused_wall_ms=1444.370`,
+   `fused_gpu_ms=181.980`, `wall/GPU=7.94`, `command_buffer_wait=1687.037 ms`,
+   and `wait/GPU=9.27`. `router-defer-wait` collapsed the visible FFN bucket
+   to `3.258 ms` but still regressed headline decode to `389.8 ms/token` and
+   kept `command_buffer_wait=1435.791 ms`, confirming that pure wait deferral
+   only moves the fence cost.
+
+   The selector still chooses
+   `prototype_new_ffn_residency_or_compute_path` with
+   `sub_action=prototype_ffn_residency_or_submit_wait_path`; the default-lane
+   median remains FFN first (`113.809 ms`) ahead of linear attention
+   (`67.570 ms`), full attention (`19.479 ms`), and lm-head (`8.470 ms`).
+   The next FFN work can now start from parity-clean larger stage-5 pipelines.
+   It should target command-buffer granularity/residency and native-wall
+   collapse, not another top-k or scalar wait-deferral fix.
+
 ## Sources
 
 - [Qwen/Qwen3.6-35B-A3B model card](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)

@@ -183,6 +183,19 @@ def parse_profile(output: str, summary_prefix: str, op_prefix: str) -> dict[str,
     return {"summary": summary, "entries": entries}
 
 
+def parse_router_parity_taps(output: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for line in output.splitlines():
+        if not line.startswith("[qwen36-ffn-router-parity]"):
+            continue
+        fields = {
+            key: parse_number(value)
+            for key, value in parse_key_values(line).items()
+        }
+        rows.append(fields)
+    return rows
+
+
 def parse_modes(raw: str) -> list[str]:
     modes: list[str] = []
     for part in raw.split(","):
@@ -224,6 +237,13 @@ def build_env_overrides(args: argparse.Namespace, mode: str) -> dict[str, str]:
         overrides["SUPERSONIC_METAL_PROFILE"] = "1"
     if getattr(args, "metal_profile_phases", False):
         overrides["SUPERSONIC_METAL_PROFILE_QWEN36_FFN_PHASES"] = "1"
+    if getattr(args, "router_parity_tap", False):
+        overrides["SUPERSONIC_METAL_QWEN36_FFN_ROUTER_STAGE5_PARITY_TAP"] = "1"
+        max_calls = getattr(args, "router_parity_tap_max_calls", None)
+        if max_calls:
+            overrides["SUPERSONIC_METAL_QWEN36_FFN_ROUTER_STAGE5_PARITY_TAP_MAX_CALLS"] = str(
+                max_calls
+            )
     if mode == "packed":
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_PACKED_STAGE5"] = "1"
     elif mode == "direct-gather":
@@ -483,6 +503,7 @@ def run_row(args: argparse.Namespace, prompt_id: str, prompt: str, mode: str) ->
             "lifecycle_timings": parse_lifecycle_timings(output),
             "metal_profile": parse_profile(output, "[metal-profile]", "[metal-profile-op]"),
             "hal_profile": parse_profile(output, "[hal-profile]", "[hal-profile-op]"),
+            "router_parity_taps": parse_router_parity_taps(output),
             "output_tail": output_tail(output),
         }
         row["fused_op_ms"] = fused_op_ms(row)
@@ -505,6 +526,7 @@ def run_row(args: argparse.Namespace, prompt_id: str, prompt: str, mode: str) ->
             "lifecycle_timings": {},
             "metal_profile": parse_profile(output, "[metal-profile]", "[metal-profile-op]"),
             "hal_profile": parse_profile(output, "[hal-profile]", "[hal-profile-op]"),
+            "router_parity_taps": parse_router_parity_taps(output),
             "fused_op_ms": None,
             "output_tail": output_tail(output),
         }
@@ -857,6 +879,8 @@ def build_report(
         "context_size": args.context_size,
         "metal_profile": args.metal_profile,
         "metal_profile_phases": getattr(args, "metal_profile_phases", False),
+        "router_parity_tap": getattr(args, "router_parity_tap", False),
+        "router_parity_tap_max_calls": getattr(args, "router_parity_tap_max_calls", None),
         "promotion_thresholds": {
             "max_headline_ratio": args.promotion_max_headline_ratio,
             "max_ffn_ratio": args.promotion_max_ffn_ratio,
@@ -902,6 +926,7 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- max_new_tokens: `{report['max_new_tokens']}`",
         f"- metal_profile: `{report['metal_profile']}`",
         f"- metal_profile_phases: `{report.get('metal_profile_phases', False)}`",
+        f"- router_parity_tap: `{report.get('router_parity_tap', False)}`",
         f"- generated_ids_match: `{summary['generated_ids_match']}`",
         f"- promotion_gate_passed: `{promotion_gate.get('passed', False)}`",
         f"- promotion_gate_passed_modes: `{','.join(promotion_gate.get('passed_modes') or []) or '-'}`",
@@ -988,6 +1013,36 @@ def render_markdown(report: dict[str, Any]) -> str:
                         wait_gpu=render_float(prompt.get("wait_gpu_ratio"), 2),
                     )
                 )
+    tap_rows: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for row in report["rows"]:
+        for tap in row.get("router_parity_taps") or []:
+            tap_rows.append((row, tap))
+    if tap_rows:
+        lines.extend(
+            [
+                "",
+                "## Router Parity Tap",
+                "",
+                "| Prompt | Mode | Layer | Match | HNorm max | HNorm idx | Logit max | Logit idx | TopK weight max | Host idx | Metal idx |",
+                "|:---|:---|---:|:---:|---:|---:|---:|---:|---:|:---|:---|",
+            ]
+        )
+        for row, tap in tap_rows[:40]:
+            lines.append(
+                "| {prompt} | {mode} | {layer} | {match} | {hnorm} | {hnorm_idx} | {logits} | {logits_idx} | {weight} | {host_idx} | {metal_idx} |".format(
+                    prompt=row.get("prompt_id", ""),
+                    mode=row.get("mode", ""),
+                    layer=tap.get("layer", "-"),
+                    match=str(bool(tap.get("topk_idx_match"))).lower(),
+                    hnorm=render_float(tap.get("h_norm_max_abs"), 8),
+                    hnorm_idx=tap.get("h_norm_argmax", "-"),
+                    logits=render_float(tap.get("logits_max_abs"), 8),
+                    logits_idx=tap.get("logits_argmax", "-"),
+                    weight=render_float(tap.get("topk_weight_max_abs"), 8),
+                    host_idx=tap.get("host_idx", "-"),
+                    metal_idx=tap.get("workspace_idx", tap.get("output_idx", "-")),
+                )
+            )
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -1007,6 +1062,17 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--metal-profile-phases",
         action="store_true",
         help="split Qwen3.6 FFN Metal profile runs into per-phase command buffers",
+    )
+    parser.add_argument(
+        "--router-parity-tap",
+        action="store_true",
+        help="emit and parse Qwen3.6 full-stage5-router Metal-vs-host router parity rows",
+    )
+    parser.add_argument(
+        "--router-parity-tap-max-calls",
+        type=int,
+        default=40,
+        help="maximum router parity tap rows emitted by the runtime",
     )
     parser.add_argument(
         "--promotion-max-headline-ratio",
