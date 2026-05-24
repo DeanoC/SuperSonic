@@ -12086,7 +12086,7 @@ extern "C" int supersonic_metal_qwen36_ffn_expert_direct_gather_stage5(
         NSError* pipeline_error = nil;
         Qwen36FfnInt4Pipelines pipelines = qwen36_ffn_int4_pipelines(&pipeline_error);
         if (pipelines.expert_gate_up_tiled == nil ||
-            pipelines.expert_down_finalize_tiled == nil) {
+            pipelines.expert_down_finalize == nil) {
             return 1256;
         }
 
@@ -12156,7 +12156,7 @@ extern "C" int supersonic_metal_qwen36_ffn_expert_direct_gather_stage5(
                     threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
-            [encoder setComputePipelineState:pipelines.expert_down_finalize_tiled];
+            [encoder setComputePipelineState:pipelines.expert_down_finalize];
             [encoder setBuffer:workspace offset:workspace_offset atIndex:0];
             [encoder setBuffer:input_hidden offset:input_hidden_offset atIndex:1];
             [encoder setBuffer:down_proj offset:down_proj_offset atIndex:2];
@@ -12164,9 +12164,8 @@ extern "C" int supersonic_metal_qwen36_ffn_expert_direct_gather_stage5(
             [encoder setBuffer:down_zero offset:down_zero_offset atIndex:4];
             [encoder setBuffer:output offset:output_offset atIndex:5];
             [encoder setBytes:&down_params length:sizeof(down_params) atIndex:6];
-            [encoder setThreadgroupMemoryLength:8 * sizeof(float) atIndex:0];
             [encoder dispatchThreadgroups:MTLSizeMake(hidden, 1, 1)
-                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                    threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
         };
         if (wait_for_completion != 0) {
             return encode_or_submit_labeled(

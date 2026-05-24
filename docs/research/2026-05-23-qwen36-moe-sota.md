@@ -896,6 +896,28 @@ under the same smoke:
    rather than just shifting the same wait into linear attention or the next
    host read.
 
+26. **Qwen3.6 direct-gather FFN parity fix**
+   The raw expert direct-gather path now uses the same non-tiled
+   down-finalize reduction as the earlier parity-preserving expert-tiled
+   isolate, instead of the newer 256-thread tiled down-finalize leg. This keeps
+   `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_DIRECT_GATHER_STAGE5=1` as the
+   raw-resident expert candidate but removes the generated-token drift that
+   made the mode hard to reason about. The first patched four-token smoke with
+   Metal profiling generated the default IDs `[11, 271, 40, 599]`.
+   The refreshed fused-routed sweep confirms that both `direct-gather` and
+   `gpu-pack` now match default generated IDs, while `full-stage5`,
+   `full-stage5-router`, and `router-defer-wait` still generate
+   `[11, 353, 599, 264]`. Promotion remains negative because the fixed
+   direct-gather path is still dominated by submit/wait cost:
+   `default` ran at `214.2 ms/token` with `ffn_ms_avg=116.088`, while
+   `direct-gather` ran at `434.4 ms/token` with `ffn_ms_avg=334.901`,
+   `fused_wall_ms=1197.217`, `fused_gpu_ms=45.116`, `wall/GPU=26.54`, and
+   `wait/GPU=32.66`. This is nevertheless the cleaner next base for FFN work:
+   correctness no longer forces active expert packing, so the next
+   implementation should target the real waited command-buffer/native-wall gap
+   around the parity-preserving raw expert path, or fix the shared/router
+   portions of `full-stage5*` before trying to promote those larger kernels.
+
 ## Sources
 
 - [Qwen/Qwen3.6-35B-A3B model card](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)
