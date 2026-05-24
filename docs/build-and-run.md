@@ -720,9 +720,9 @@ one-token M5 Max smoke generated `[11]` and reported `gate_up_ms=3.260`,
 repeated expert-shape MPS GEMMs, while the default INT4 host expert work in the
 same profiled run was `73.851 ms` gate/up and `42.274 ms` down across 40 layers.
 The full `bench-perf` attribution lane writes this as `mps_expert_pilot` in
-schema-v7 JSON; the latest M5 Max run measured `150.6 ms/token` median with
-`ffn_ms_avg=96.761`, `linear_attn_ms_avg=54.181`, and a resident-MPS pilot of
-`gate_up_ms=0.619`, `down_ms=0.433`.
+schema-v8 JSON; the latest M5 Max run measured `162.6 ms/token` median with
+unprofiled `ffn_ms_avg=97.974`, unprofiled `linear_attn_ms_avg=31.335`, and a
+resident-MPS pilot of `gate_up_ms=0.628`, `down_ms=0.340`.
 `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_MPS_BRIDGE=1` enables the first
 real bridge experiment: active GPTQ experts are transposed/dequantized to FP16
 MPS buffers, MPS runs gate/up and down, and a small Metal finalizer writes the

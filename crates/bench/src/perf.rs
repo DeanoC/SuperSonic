@@ -20,6 +20,9 @@ pub struct AttributionTimings {
     pub stage_timings: Option<BTreeMap<String, f64>>,
     pub chain_breakdown: Option<BTreeMap<String, f64>>,
     pub lifecycle_timings: Option<BTreeMap<String, f64>>,
+    pub profile_stage_timings: Option<BTreeMap<String, f64>>,
+    pub profile_chain_breakdown: Option<BTreeMap<String, f64>>,
+    pub profile_lifecycle_timings: Option<BTreeMap<String, f64>>,
     pub mpp_pilot: Option<BTreeMap<String, f64>>,
     pub mps_expert_pilot: Option<BTreeMap<String, f64>>,
     pub qwen36_pack_cache: Option<BTreeMap<String, f64>>,
@@ -108,6 +111,9 @@ pub fn extract_attribution_timings(output: &str) -> AttributionTimings {
             .rev()
             .find(|l| l.starts_with("[qwen36-moe lifecycle-timings]"))
             .map(parse_numeric_fields),
+        profile_stage_timings: None,
+        profile_chain_breakdown: None,
+        profile_lifecycle_timings: None,
         mpp_pilot: output
             .lines()
             .rev()
@@ -270,12 +276,12 @@ pub fn run_one_combo(invocation: &ComboInvocation, policy: &RunPolicy) -> Result
     }
 
     // Warmup pass — discard.
-    let _ = invoke_supersonic(invocation, invocation.warmup_tokens, false);
+    let _ = invoke_supersonic(invocation, invocation.warmup_tokens, false, false);
 
     let mut samples = Vec::new();
     let mut last_err: Option<String> = None;
     for _ in 0..policy.measurement_runs {
-        match invoke_supersonic(invocation, invocation.max_new_tokens, false) {
+        match invoke_supersonic(invocation, invocation.max_new_tokens, false, false) {
             Ok(run) => samples.push(run.metrics.ms_per_step),
             Err(e) => last_err = Some(e),
         }
@@ -292,9 +298,41 @@ pub fn run_one_combo(invocation: &ComboInvocation, policy: &RunPolicy) -> Result
         let mut sorted = samples.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let median = sorted[sorted.len() / 2];
-        let attribution = invoke_supersonic(invocation, invocation.max_new_tokens, true)
+        let mut attribution = invoke_supersonic(invocation, invocation.max_new_tokens, true, false)
             .map(|run| run.attribution)
             .unwrap_or_default();
+        if should_collect_profile_attribution(invocation) {
+            if let Ok(profile_run) =
+                invoke_supersonic(invocation, invocation.max_new_tokens, true, true)
+            {
+                let profile = profile_run.attribution;
+                attribution.profile_stage_timings = profile.stage_timings;
+                attribution.profile_chain_breakdown = profile.chain_breakdown;
+                attribution.profile_lifecycle_timings = profile.lifecycle_timings;
+                attribution.metal_profile = profile.metal_profile;
+                attribution.hal_profile = profile.hal_profile;
+                if attribution.mpp_pilot.is_none() {
+                    attribution.mpp_pilot = profile.mpp_pilot;
+                }
+                if attribution.mps_expert_pilot.is_none() {
+                    attribution.mps_expert_pilot = profile.mps_expert_pilot;
+                }
+                if attribution.qwen36_pack_cache.is_none() {
+                    attribution.qwen36_pack_cache = profile.qwen36_pack_cache;
+                }
+                if attribution.qwen36_expert_residency.is_none() {
+                    attribution.qwen36_expert_residency = profile.qwen36_expert_residency;
+                }
+                if attribution.qwen36_expert_residency_policies.is_none() {
+                    attribution.qwen36_expert_residency_policies =
+                        profile.qwen36_expert_residency_policies;
+                }
+                if attribution.qwen36_expert_residency_policy_rows.is_none() {
+                    attribution.qwen36_expert_residency_policy_rows =
+                        profile.qwen36_expert_residency_policy_rows;
+                }
+            }
+        }
         (
             PerfStatus::Ok {
                 ms_per_step: median,
@@ -320,6 +358,9 @@ pub fn run_one_combo(invocation: &ComboInvocation, policy: &RunPolicy) -> Result
         stage_timings: attribution.stage_timings,
         chain_breakdown: attribution.chain_breakdown,
         lifecycle_timings: attribution.lifecycle_timings,
+        profile_stage_timings: attribution.profile_stage_timings,
+        profile_chain_breakdown: attribution.profile_chain_breakdown,
+        profile_lifecycle_timings: attribution.profile_lifecycle_timings,
         mpp_pilot: attribution.mpp_pilot,
         mps_expert_pilot: attribution.mps_expert_pilot,
         qwen36_pack_cache: attribution.qwen36_pack_cache,
@@ -336,6 +377,7 @@ fn invoke_supersonic(
     invocation: &ComboInvocation,
     max_new: u32,
     emit_stage_timings: bool,
+    metal_profile: bool,
 ) -> std::result::Result<ExtractedRun, String> {
     let mut cmd = Command::new(&invocation.binary);
     if let Some(backend) = &invocation.backend {
@@ -346,8 +388,10 @@ fn invoke_supersonic(
             .env("SUPERSONIC_QWEN36_DENSE_PREFILL_TOKEN_LOOP", "1");
         if emit_stage_timings {
             cmd.env("SUPERSONIC_METAL_QWEN36_MPP_PILOT", "1")
-                .env("SUPERSONIC_METAL_QWEN36_MPS_EXPERT_PILOT", "1")
-                .env("SUPERSONIC_METAL_PROFILE", "1");
+                .env("SUPERSONIC_METAL_QWEN36_MPS_EXPERT_PILOT", "1");
+        }
+        if metal_profile {
+            cmd.env("SUPERSONIC_METAL_PROFILE", "1");
         }
     }
     cmd.arg("--model")
@@ -386,6 +430,13 @@ fn invoke_supersonic(
         metrics,
         attribution: extract_attribution_timings(&combined),
     })
+}
+
+fn should_collect_profile_attribution(invocation: &ComboInvocation) -> bool {
+    invocation.arch == "apple-m5-max"
+        && invocation.model == "qwen3.6-35b-a3b"
+        && invocation.quant == "int4"
+        && invocation.backend.as_deref().unwrap_or("metal") == "metal"
 }
 
 fn apply_quant_flag(

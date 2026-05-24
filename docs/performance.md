@@ -1124,7 +1124,8 @@ optimization step is MPP/Metal-Tensor or MLX interop for large dense phases, not
 another single occupancy tweak.
 
 The harness records a warmup plus median-of-3 headline run at
-`--max-new-tokens 16`, then performs one additional `--emit-stage-timings`
+`--max-new-tokens 16`, then performs one additional unprofiled
+`--emit-stage-timings` attribution run and a separate Metal/HAL profile
 attribution run. For this Metal lane it also forces the dense prefill token loop
 (`SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL=0` and
 `SUPERSONIC_QWEN36_DENSE_PREFILL_TOKEN_LOOP=1`) because the default Qwen3.6
@@ -1133,44 +1134,53 @@ enables `SUPERSONIC_METAL_QWEN36_MPP_PILOT=1`, which emits a separate
 `[qwen36-moe mpp-pilot]` row for repeated exact `64x32x64` MPP tiles. It also
 enables `SUPERSONIC_METAL_QWEN36_MPS_EXPERT_PILOT=1`, which emits a resident
 FP16 Metal Performance Shaders row for Qwen3.6 active-expert GEMV shapes. It
-also enables `SUPERSONIC_METAL_PROFILE=1` for the attribution run so the profile
-JSON includes `metal_profile` and `hal_profile` objects with parseable per-op
-rows. These are runtime-adjacent MPP/MPS pilot measurements, not model matmul
-replacements. The attribution maps are stored in the same schema-v7 perf JSON as
+also enables `SUPERSONIC_METAL_PROFILE=1` only for the profile attribution run
+so the profile JSON includes `metal_profile` and `hal_profile` objects with
+parseable per-op rows without replacing the unprofiled stage table. These are
+runtime-adjacent MPP/MPS pilot measurements, not model matmul replacements. The
+attribution maps are stored in the same schema-v8 perf JSON as
 `stage_timings`, `chain_breakdown`, `lifecycle_timings`, `mpp_pilot`,
 `mps_expert_pilot`, `metal_profile`, and `hal_profile` without feeding back into
-the headline median. Schema v7 also preserves typed Qwen3.6 expert-residency
-policy rows with `resident_format`, `scope`, `miss_policy`, `capacity`, and the
-numeric counters so perf artifacts retain the scheduler identity.
+the headline median. When the profile pass carries extra split-dispatch
+overhead, its timing maps are kept separately as `profile_stage_timings`,
+`profile_chain_breakdown`, and `profile_lifecycle_timings`. Schema v8 also
+preserves typed Qwen3.6 expert-residency policy rows with `resident_format`,
+`scope`, `miss_policy`, `capacity`, and the numeric counters so perf artifacts
+retain the scheduler identity.
 
 <!-- AUTOGEN BELOW: apple-m5-max-metal -->
 | Model           |  INT4 |
 | --------------- | ----: |
-| qwen3.6-35b-a3b | 150.6 |
+| qwen3.6-35b-a3b | 162.6 |
 
 <!-- AUTOGEN END: apple-m5-max-metal -->
 
 Latest local attribution run
-(`target/bench-runs/2026-05-23-796ea84/perf/qwen3.6-35b-a3b_int4.json`):
+(`target/bench-runs/2026-05-24-aa72613/perf/qwen3.6-35b-a3b_int4.json`):
 
 | Metric | Value |
 |---|---:|
-| Headline median | 150.6 ms/token |
-| Stage total | 173.014 ms/token |
-| Chain | 167.612 ms/token |
-| LM head | 4.342 ms/token |
-| FFN | 96.761 ms/token |
-| Linear attention | 54.181 ms/token |
-| Full attention | 16.470 ms/token |
-| Prefill total | 1070.741 ms |
-| MPP pilot | 15.230 TFLOP/s |
-| MPS expert pilot gate/up | 0.619 ms, 5.423 TFLOP/s |
-| MPS expert pilot down | 0.433 ms, 3.878 TFLOP/s |
+| Headline median | 162.6 ms/token |
+| Stage total | 152.664 ms/token |
+| Profile stage total | 172.742 ms/token |
+| Chain | 147.732 ms/token |
+| LM head | 4.682 ms/token |
+| FFN | 97.974 ms/token |
+| Linear attention | 31.335 ms/token |
+| Profile linear attention | 53.165 ms/token |
+| Full attention | 18.213 ms/token |
+| Prefill total | 870.162 ms |
+| MPP pilot | 7.366 TFLOP/s |
+| MPS expert pilot gate/up | 0.628 ms, 5.346 TFLOP/s |
+| MPS expert pilot down | 0.340 ms, 4.936 TFLOP/s |
 
-The headline median is the unprofiled median-of-3 run (`149.2`, `150.6`,
-`153.5` ms/token). The stage table comes from the extra profile attribution run
-and carries profiling overhead, but follows the same default FFN path as the
-headline samples. A default one-token smoke generated the expected token `[11]`;
+The headline median is the unprofiled median-of-3 run (`182.7`, `162.6`,
+`145.7` ms/token). Schema-v8 stores unprofiled stage timings in
+`stage_timings` and preserves the split-profile timing maps under the
+`profile_*` fields; the profile pass still shows `qwen36_linear_int4_stage5`
+and `command_buffer_wait` as the top Metal rows, but the normal stage table no
+longer charges the seven-way linear profiling split to `linear_attn_ms_avg`. A
+default one-token smoke generated the expected token `[11]`;
 the latest local cold one-token profile measured `ffn_ms_avg=128.573`,
 with `qwen36_ffn_host_expert_gate_up` at 56.839 ms total and
 `qwen36_ffn_host_expert_down` at 36.181 ms total. The explicit full native FFN
@@ -1452,7 +1462,7 @@ both fused candidates failing headline, FFN, and command-buffer-wait gates.
 
 The first MPS bridge step is now an attribution probe, not a decode path. With
 `SUPERSONIC_METAL_QWEN36_MPS_EXPERT_PILOT=1`, the runner appends a
-`[qwen36-moe mps-expert-pilot]` row and bench perf JSON schema v7 records it as
+`[qwen36-moe mps-expert-pilot]` row and bench perf JSON schema v8 records it as
 `mps_expert_pilot`. This probe uses resident FP16 MPSMatrix inputs shaped like
 the active-expert gate/up and down GEMVs; it does not consume the GPTQ INT4
 expert tensors. On a one-token M5 Max smoke, the model still generated `[11]`

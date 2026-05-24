@@ -44,6 +44,9 @@ fn perf_cell_json_status_variants() {
         stage_timings: None,
         chain_breakdown: None,
         lifecycle_timings: None,
+        profile_stage_timings: None,
+        profile_chain_breakdown: None,
+        profile_lifecycle_timings: None,
         mpp_pilot: None,
         mps_expert_pilot: None,
         qwen36_pack_cache: None,
@@ -85,7 +88,7 @@ fn perf_cell_preserves_qwen36_expert_residency_policy_labels() {
     metrics.insert("copied_bytes".to_string(), 2014248960.0);
 
     let cell = PerfCellJson {
-        schema_version: 7,
+        schema_version: 8,
         model: "qwen3.6-35b-a3b".into(),
         quant: "int4".into(),
         arch: "apple-m5-max".into(),
@@ -100,6 +103,9 @@ fn perf_cell_preserves_qwen36_expert_residency_policy_labels() {
         stage_timings: None,
         chain_breakdown: None,
         lifecycle_timings: None,
+        profile_stage_timings: None,
+        profile_chain_breakdown: None,
+        profile_lifecycle_timings: None,
         mpp_pilot: None,
         mps_expert_pilot: None,
         qwen36_pack_cache: None,

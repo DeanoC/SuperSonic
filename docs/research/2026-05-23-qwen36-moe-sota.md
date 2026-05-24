@@ -621,6 +621,17 @@ under the same smoke:
    calls / 3.44 MiB to 210 calls / 0.86 MiB, so the measured next target remains
    command-buffer/native linear work and FFN rather than the residual copy.
 
+14. **Qwen3.6 bench attribution split**
+   Keep the next-bottleneck selector honest by separating normal timing
+   attribution from split-dispatch Metal profiling. `bench-perf` schema v8
+   stores `stage_timings`, `chain_breakdown`, and `lifecycle_timings` from an
+   unprofiled `--emit-stage-timings` run, then runs a separate
+   `SUPERSONIC_METAL_PROFILE=1` attribution pass for `metal_profile` and
+   `hal_profile`. The profiled timing maps remain available under
+   `profile_stage_timings`, `profile_chain_breakdown`, and
+   `profile_lifecycle_timings`, so command-buffer split overhead can be studied
+   without making it the headline stage attribution.
+
 ## Sources
 
 - [Qwen/Qwen3.6-35B-A3B model card](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)

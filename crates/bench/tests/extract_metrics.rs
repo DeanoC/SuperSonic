@@ -1,5 +1,12 @@
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use std::path::PathBuf;
 #[allow(unused_imports)]
-use supersonic_bench::perf::{extract_attribution_timings, extract_metrics, ExtractedMetrics};
+use supersonic_bench::perf::{
+    extract_attribution_timings, extract_metrics, run_one_combo, ComboInvocation, ExtractedMetrics,
+    RunPolicy,
+};
 
 const MODERN: &str = include_str!("fixtures/runner_output_modern.txt");
 const PHI4: &str = include_str!("fixtures/runner_output_phi4.txt");
@@ -127,4 +134,98 @@ fn extracts_qwen36_attribution_timing_maps() {
     let hal = timings.hal_profile.unwrap();
     assert_eq!(hal.summary.get("d2d"), Some(&4096.0));
     assert_eq!(hal.entries[0].total_bytes, Some(4096));
+}
+
+#[cfg(unix)]
+#[test]
+fn qwen36_apple_perf_keeps_unprofiled_timings_separate_from_profile_rows() {
+    let tmp = tempfile::tempdir().unwrap();
+    let script = tmp.path().join("fake_supersonic.sh");
+    std::fs::write(
+        &script,
+        r#"#!/bin/sh
+emit_stage=0
+for arg in "$@"; do
+  if [ "$arg" = "--emit-stage-timings" ]; then
+    emit_stage=1
+  fi
+done
+
+if [ -n "$SUPERSONIC_METAL_PROFILE" ]; then
+  echo "[result] prompt_tokens=1 generated_tokens=1 decode_ms=201 ms_per_step=201"
+  if [ "$emit_stage" = "1" ]; then
+    echo "[qwen36-moe stage-timings] gen_steps=1 chain_ms_avg=180 total_ms_avg=201"
+    echo "[qwen36-moe chain-breakdown] gen_steps=1 full_attn_ms_avg=9 linear_attn_ms_avg=77 ffn_ms_avg=88"
+    echo "[qwen36-moe lifecycle-timings] prefill_total_ms=22 generation_wall_ms=201"
+  fi
+  echo "[metal-profile] calls=1 total_ms=9 native_ms=7 host_ms=2"
+  echo "[metal-profile-op] op=command_buffer_wait path=runtime calls=1 mean_ms=3 total_ms=3 max_ms=3"
+  echo "[hal-profile] calls=1 total_ms=1 alloc_calls=0 alloc_bytes=0 h2d=0 d2h=0 d2d=0 memset=0 sync_calls=0"
+  echo "[hal-profile-op] op=sync calls=1 mean_ms=1 total_ms=1 max_ms=1 total_bytes=0"
+else
+  echo "[result] prompt_tokens=1 generated_tokens=1 decode_ms=100 ms_per_step=100"
+  if [ "$emit_stage" = "1" ]; then
+    echo "[qwen36-moe stage-timings] gen_steps=1 chain_ms_avg=90 total_ms_avg=101"
+    echo "[qwen36-moe chain-breakdown] gen_steps=1 full_attn_ms_avg=7 linear_attn_ms_avg=44 ffn_ms_avg=39"
+    echo "[qwen36-moe lifecycle-timings] prefill_total_ms=11 generation_wall_ms=101"
+    echo "[qwen36-moe mpp-pilot] status=ok tflops=15"
+    echo "[qwen36-moe mps-expert-pilot] status=ok gate_up_ms=0.6 down_ms=0.4"
+  fi
+fi
+"#,
+    )
+    .unwrap();
+    let mut perms = std::fs::metadata(&script).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).unwrap();
+
+    let invocation = ComboInvocation {
+        binary: script,
+        backend: Some("metal".into()),
+        arch: "apple-m5-max".into(),
+        model: "qwen3.6-35b-a3b".into(),
+        model_dir: PathBuf::from("/unused-model-dir"),
+        quant: "int4".into(),
+        specprefill_draft_dir: None,
+        prompt: "x".into(),
+        max_new_tokens: 1,
+        warmup_tokens: 1,
+    };
+    let policy = RunPolicy {
+        measurement_runs: 1,
+        cooldown_seconds: 0,
+    };
+
+    let cell = run_one_combo(&invocation, &policy).unwrap();
+    assert_eq!(cell.schema_version, 8);
+    assert_eq!(
+        cell.stage_timings
+            .as_ref()
+            .and_then(|m| m.get("total_ms_avg")),
+        Some(&101.0)
+    );
+    assert_eq!(
+        cell.profile_stage_timings
+            .as_ref()
+            .and_then(|m| m.get("total_ms_avg")),
+        Some(&201.0)
+    );
+    assert_eq!(
+        cell.chain_breakdown
+            .as_ref()
+            .and_then(|m| m.get("linear_attn_ms_avg")),
+        Some(&44.0)
+    );
+    assert_eq!(
+        cell.profile_chain_breakdown
+            .as_ref()
+            .and_then(|m| m.get("linear_attn_ms_avg")),
+        Some(&77.0)
+    );
+    assert!(cell.metal_profile.is_some());
+    assert!(cell.hal_profile.is_some());
+    assert_eq!(
+        cell.mpp_pilot.as_ref().and_then(|m| m.get("tflops")),
+        Some(&15.0)
+    );
 }
