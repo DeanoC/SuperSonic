@@ -663,6 +663,30 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
         self.assertIn("prompt_hello:generated_ids_mismatch", failures)
         self.assertIn("prompt_hello:missing_command_buffer_wait_profile", failures)
 
+    def test_promotion_gate_rejects_layer_output_mismatch_when_tapped(self):
+        script = sweep_qwen36_fused_routed_int4
+        baseline = row("default", ids=[11, 271])
+        candidate = row("direct-gather", ids=[11, 271], headline=90.0, ffn=40.0, wait=9.0)
+        baseline["layer_output_taps"] = [
+            {"position": 0, "layer": 0, "phase": "attn", "checksum": "same"},
+            {"position": 0, "layer": 0, "phase": "ffn", "checksum": "baseline"},
+        ]
+        candidate["layer_output_taps"] = [
+            {"position": 0, "layer": 0, "phase": "attn", "checksum": "same"},
+            {"position": 0, "layer": 0, "phase": "ffn", "checksum": "candidate"},
+        ]
+
+        gate = script.build_promotion_gate([baseline, candidate], ["default", "direct-gather"])
+
+        self.assertFalse(gate["passed"])
+        failures = gate["candidates"][0]["failures"]
+        self.assertIn("prompt_hello:layer_output_checksum_mismatch", failures)
+        prompt = gate["candidates"][0]["prompts"][0]
+        self.assertEqual(prompt["layer_output_compared_rows"], 2)
+        self.assertEqual(prompt["layer_output_checksum_mismatches"], 1)
+        self.assertEqual(prompt["layer_output_first_mismatch"]["layer"], 0)
+        self.assertEqual(prompt["layer_output_first_mismatch"]["phase"], "ffn")
+
     def test_render_markdown_includes_gate_rows(self):
         script = sweep_qwen36_fused_routed_int4
         args = Namespace(

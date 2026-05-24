@@ -1594,6 +1594,45 @@ under the same smoke:
    correctness target is bit-exact rounding/materialization, not another
    performance variant.
 
+45. **Qwen3.6 layer-output promotion gate**
+   The fused-routed sweep is now schema `v21`. The promotion gate now treats
+   `--layer-output-tap` as a correctness contract: if a default row and a
+   candidate row both include layer-output tap rows, every tapped
+   position/layer/phase checksum must match before the candidate can pass. A
+   generated-ID match is no longer sufficient for promotion when the hidden
+   stream was sampled.
+
+   The two-token component sweep used `--modes
+   default,full-stage5-router-simd-batch,
+   full-stage5-router-simd-batch-shared-gate-up-tiled,
+   full-stage5-router-simd-batch-shared-scalar-simd,
+   full-stage5-router-simd-batch-shared-down-tiled,
+   full-stage5-router-simd-batch-shared-tiled --max-new-tokens 2
+   --metal-profile --shared-parity-tap --shared-parity-tap-max-calls 80
+   --downstream-parity-tap --layer-output-tap --layer-output-delta-tap
+   --layer-output-delta-position 0 --layer-output-delta-layer 0
+   --layer-output-delta-phase ffn`. The plain
+   `full-stage5-router-simd-batch` row generated `[11,271]` like default and
+   matched the filtered layer `0` FFN row exactly, but the broader
+   layer-output tap still found its first hidden checksum mismatch later at
+   position `0`, layer `7`, phase `ffn`. That means sampled generated tokens
+   can hide hidden-stream drift over a short run.
+
+   The shared component rows all diverged by the second sampled token and
+   generated `[11,353]`. In the filtered numeric delta row,
+   `full-stage5-router-simd-batch-shared-gate-up-tiled` was the first
+   mismatching component: one BF16 element differed at index `225`, default
+   `3c93` (`0.0179443359375`) versus candidate `3c92`
+   (`0.017822265625`), with `max_abs_delta=1.220703125e-4` and
+   `max_ulp_delta=1`. The full shared-tiled row had two differing BF16
+   elements with the same one-ULP maximum.
+
+   The immediate policy result is that shared-tiled remains a negative/probe
+   path until the materialization is bit-exact, or until a future eval-based
+   tolerance gate is explicitly chosen. The next correctness target should be
+   stage-5 decode-batch hidden-stream parity under the layer-output tap, with
+   performance promotion gated on those checksums before headline speed.
+
 ## Sources
 
 - [Qwen/Qwen3.6-35B-A3B model card](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)

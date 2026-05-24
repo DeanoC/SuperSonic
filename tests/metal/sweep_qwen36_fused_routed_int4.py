@@ -16,7 +16,7 @@ from typing import Any
 
 
 MODEL = "qwen3.6-35b-a3b"
-SCHEMA = "qwen36-fused-routed-int4-sweep-v20"
+SCHEMA = "qwen36-fused-routed-int4-sweep-v21"
 DEFAULT_MAX_FUSED_WALL_GPU_RATIO = 4.0
 DEFAULT_MAX_WAIT_GPU_RATIO = 4.0
 COARSE_BATCH_SERIAL_MODE = "full-stage5-router-batch"
@@ -1700,6 +1700,91 @@ def append_ratio_gate(
         failures.append(regression_failure)
 
 
+def layer_output_pair_status(
+    baseline: dict[str, Any],
+    row: dict[str, Any],
+) -> dict[str, Any] | None:
+    baseline_taps = baseline.get("layer_output_taps") or []
+    candidate_taps = row.get("layer_output_taps") or []
+    if not baseline_taps and not candidate_taps:
+        return None
+    if not baseline_taps:
+        return {
+            "available": True,
+            "status": "missing_baseline",
+            "compared_rows": 0,
+            "checksum_mismatches": 0,
+            "missing_candidate_rows": 0,
+            "first_mismatch": None,
+        }
+    if not candidate_taps:
+        return {
+            "available": True,
+            "status": "missing_candidate",
+            "compared_rows": 0,
+            "checksum_mismatches": 0,
+            "missing_candidate_rows": len(baseline_taps),
+            "first_mismatch": None,
+        }
+
+    baseline_by_key = {
+        (
+            int(tap.get("position", 0)),
+            int(tap.get("layer", -1)),
+            str(tap.get("phase", "-")),
+        ): tap
+        for tap in baseline_taps
+    }
+    candidate_by_key = {
+        (
+            int(tap.get("position", 0)),
+            int(tap.get("layer", -1)),
+            str(tap.get("phase", "-")),
+        ): tap
+        for tap in candidate_taps
+    }
+
+    compared_rows = 0
+    checksum_mismatches = 0
+    missing_candidate_rows = 0
+    first_mismatch: dict[str, Any] | None = None
+    for key, baseline_tap in baseline_by_key.items():
+        candidate_tap = candidate_by_key.get(key)
+        if candidate_tap is None:
+            missing_candidate_rows += 1
+            if first_mismatch is None:
+                first_mismatch = {
+                    "position": key[0],
+                    "layer": key[1],
+                    "phase": key[2],
+                    "baseline_checksum": baseline_tap.get("checksum"),
+                    "candidate_checksum": None,
+                    "reason": "missing_candidate",
+                }
+            continue
+        compared_rows += 1
+        if candidate_tap.get("checksum") != baseline_tap.get("checksum"):
+            checksum_mismatches += 1
+            if first_mismatch is None:
+                first_mismatch = {
+                    "position": key[0],
+                    "layer": key[1],
+                    "phase": key[2],
+                    "baseline_checksum": baseline_tap.get("checksum"),
+                    "candidate_checksum": candidate_tap.get("checksum"),
+                    "reason": "checksum_mismatch",
+                }
+
+    return {
+        "available": True,
+        "status": "ok",
+        "compared_rows": compared_rows,
+        "checksum_mismatches": checksum_mismatches,
+        "missing_candidate_rows": missing_candidate_rows,
+        "first_mismatch": first_mismatch,
+    }
+
+
 def build_promotion_gate(
     rows: list[dict[str, Any]],
     modes: list[str],
@@ -1743,6 +1828,29 @@ def build_promotion_gate(
             prompt_failures: list[str] = []
             if (row.get("generated_ids") or []) != (baseline.get("generated_ids") or []):
                 prompt_failures.append("generated_ids_mismatch")
+            layer_output_status = layer_output_pair_status(baseline, row)
+            if layer_output_status is not None:
+                prompt_result["layer_output_compared_rows"] = layer_output_status.get(
+                    "compared_rows"
+                )
+                prompt_result["layer_output_checksum_mismatches"] = layer_output_status.get(
+                    "checksum_mismatches"
+                )
+                prompt_result["layer_output_missing_candidate_rows"] = layer_output_status.get(
+                    "missing_candidate_rows"
+                )
+                prompt_result["layer_output_first_mismatch"] = layer_output_status.get(
+                    "first_mismatch"
+                )
+                if layer_output_status.get("status") == "missing_baseline":
+                    prompt_failures.append("missing_layer_output_baseline")
+                elif layer_output_status.get("status") == "missing_candidate":
+                    prompt_failures.append("missing_layer_output_candidate")
+                else:
+                    if int(layer_output_status.get("checksum_mismatches") or 0) > 0:
+                        prompt_failures.append("layer_output_checksum_mismatch")
+                    if int(layer_output_status.get("missing_candidate_rows") or 0) > 0:
+                        prompt_failures.append("layer_output_missing_candidate_rows")
             append_ratio_gate(
                 prompt_failures,
                 prompt_result,
@@ -1837,6 +1945,7 @@ def build_promotion_gate(
             "max_component_regression_ratio": max_component_regression_ratio,
             "max_command_buffer_wait_ratio": max_command_buffer_wait_ratio,
             "require_profile": require_profile,
+            "require_layer_output_parity_when_tapped": True,
         },
         "candidates": candidates,
     }
@@ -2563,7 +2672,7 @@ def render_markdown(report: dict[str, Any]) -> str:
             )
         lines.append("")
         lines.append(
-            "The gate is nonfatal. A fused routed INT4 mode passes only when generated IDs match default, headline ms/token and FFN time improve, full-attention/linear-attention/lm-head stay inside the configured regression threshold, and command-buffer-wait attribution is present and not regressed when profile evidence is required."
+            "The gate is nonfatal. A fused routed INT4 mode passes only when generated IDs match default, tapped layer outputs match default when the layer-output tap is enabled, headline ms/token and FFN time improve, full-attention/linear-attention/lm-head stay inside the configured regression threshold, and command-buffer-wait attribution is present and not regressed when profile evidence is required."
         )
     gap_candidates = ffn_gap.get("candidates") or []
     if gap_candidates:
