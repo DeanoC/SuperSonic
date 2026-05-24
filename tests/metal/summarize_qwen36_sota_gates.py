@@ -13,7 +13,7 @@ from typing import Any
 
 
 MODEL_ROOT_ENV = 'SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models"'
-SCHEMA = "qwen36-sota-gate-summary-v5"
+SCHEMA = "qwen36-sota-gate-summary-v7"
 
 
 @dataclass(frozen=True)
@@ -98,6 +98,18 @@ GATE_SPECS = (
         refresh_command=(
             f"{MODEL_ROOT_ENV} python3 tests/metal/sweep_qwen36_mtp_acceptance.py "
             "--prompt-set smoke --metal-experiment"
+        ),
+    ),
+    GateSpec(
+        gate_id="lru_resident_cache",
+        label="LRU resident cache",
+        default_path=Path("target/qwen36_lru_resident_cache_sweep.json"),
+        expected_schema="qwen36-lru-resident-cache-sweep-v1",
+        gate_keys=("promotion_gate",),
+        kind="runtime_promotion",
+        refresh_command=(
+            f"{MODEL_ROOT_ENV} python3 tests/metal/sweep_qwen36_lru_resident_cache.py "
+            "--capacities 32,64 --metal-profile"
         ),
     ),
 )
@@ -321,6 +333,7 @@ def choose_next_action(rows: list[dict[str, Any]]) -> dict[str, Any]:
         row
         for row in rows
         if row.get("kind") == "residency_decision" and row.get("passed") is True
+        and row.get("superseded_by") is None
     ]
     if decision_passes:
         first = decision_passes[0]
@@ -405,17 +418,35 @@ def apply_supersession(rows: list[dict[str, Any]]) -> None:
     by_id = {str(row["gate_id"]): row for row in rows}
     static_runtime = by_id.get("static_topn_runtime")
     mps_estimate = by_id.get("mps_resident_table")
-    if static_runtime is None or mps_estimate is None:
-        return
-    if static_runtime.get("status") != "ok" or mps_estimate.get("status") != "ok":
-        return
-    if "mps-static-partial" not in failed_candidate_names(static_runtime):
-        return
-    mps_estimate["superseded_by"] = "static_topn_runtime:mps-static-partial"
-    mps_estimate["superseded_reason"] = (
-        "partial-hit resident MPS was already measured as a runtime candidate "
-        "and failed the static top-N promotion gate"
-    )
+    if (
+        static_runtime is not None
+        and mps_estimate is not None
+        and static_runtime.get("status") == "ok"
+        and mps_estimate.get("status") == "ok"
+        and "mps-static-partial" in failed_candidate_names(static_runtime)
+    ):
+        mps_estimate["superseded_by"] = "static_topn_runtime:mps-static-partial"
+        mps_estimate["superseded_reason"] = (
+            "partial-hit resident MPS was already measured as a runtime candidate "
+            "and failed the static top-N promotion gate"
+        )
+
+    lru_runtime = by_id.get("lru_resident_cache")
+    route_decision = by_id.get("route_residency")
+    if (
+        lru_runtime is not None
+        and route_decision is not None
+        and lru_runtime.get("status") == "ok"
+        and route_decision.get("status") == "ok"
+        and route_decision.get("recommendation") == "prototype_larger_lru_resident_cache"
+        and lru_runtime.get("passed") is False
+        and failed_candidate_names(lru_runtime)
+    ):
+        route_decision["superseded_by"] = "lru_resident_cache"
+        route_decision["superseded_reason"] = (
+            "larger LRU resident cache was already measured as a runtime candidate "
+            "and failed the promotion gate"
+        )
 
 
 def build_report(
@@ -568,6 +599,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="MTP acceptance sweep JSON",
     )
     parser.add_argument(
+        "--lru-json",
+        type=Path,
+        default=GATE_SPECS[6].default_path,
+        help="LRU resident cache runtime sweep JSON",
+    )
+    parser.add_argument(
         "--out-json",
         type=Path,
         default=Path("target/qwen36_sota_gate_summary.json"),
@@ -603,6 +640,7 @@ def paths_from_args(args: argparse.Namespace) -> dict[str, Path]:
         "mps_resident_table": args.mps_json,
         "route_residency": args.route_json,
         "mtp_acceptance": args.mtp_json,
+        "lru_resident_cache": args.lru_json,
     }
 
 

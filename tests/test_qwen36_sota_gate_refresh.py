@@ -51,6 +51,7 @@ class Qwen36SotaGateRefreshTests(unittest.TestCase):
             "mps_resident_table": root / "mps.json",
             "route_residency": root / "route.json",
             "mtp_acceptance": root / "mtp.json",
+            "lru_resident_cache": root / "lru.json",
         }
 
     def write_default_reports(self, root: Path) -> dict[str, Path]:
@@ -91,6 +92,12 @@ class Qwen36SotaGateRefreshTests(unittest.TestCase):
             "promotion_gate",
             {"passed": False, "failures": ["acceptance_below_threshold"]},
         )
+        write_report(
+            paths["lru_resident_cache"],
+            summary.GATE_SPECS[6].expected_schema,
+            "promotion_gate",
+            {"passed": False, "failures": ["command_buffer_wait_regressed"]},
+        )
         return paths
 
     def test_missing_reports_are_selected_by_default(self):
@@ -102,8 +109,8 @@ class Qwen36SotaGateRefreshTests(unittest.TestCase):
 
         self.assertEqual(report["schema"], refresh.SCHEMA)
         self.assertTrue(report["summary"]["dry_run"])
-        self.assertEqual(report["summary"]["selected_count"], 6)
-        self.assertEqual(report["summary"]["run_status_counts"], {"planned": 6})
+        self.assertEqual(report["summary"]["selected_count"], 7)
+        self.assertEqual(report["summary"]["run_status_counts"], {"planned": 7})
         self.assertEqual(set(row["input_status"] for row in rows), {"missing"})
         self.assertIn("sweep_qwen36_batched_prefill_variants.py", md)
         self.assertIn("Add `--run`", md)
@@ -117,7 +124,7 @@ class Qwen36SotaGateRefreshTests(unittest.TestCase):
         self.assertEqual({row["run_status"] for row in default_rows}, {"skipped"})
 
         all_rows = refresh.build_plan_rows(pre_report["rows"], refresh_all=True)
-        self.assertEqual(sum(1 for row in all_rows if row["selected"]), 6)
+        self.assertEqual(sum(1 for row in all_rows if row["selected"]), 7)
         self.assertEqual({row["selection_reason"] for row in all_rows}, {"all"})
 
         only_rows = refresh.build_plan_rows(
@@ -160,6 +167,8 @@ class Qwen36SotaGateRefreshTests(unittest.TestCase):
                     str(paths["route_residency"]),
                     "--mtp-json",
                     str(paths["mtp_acceptance"]),
+                    "--lru-json",
+                    str(paths["lru_resident_cache"]),
                     "--out-json",
                     str(out_json),
                     "--out-md",
@@ -172,7 +181,7 @@ class Qwen36SotaGateRefreshTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(report["schema"], refresh.SCHEMA)
         self.assertTrue(report["summary"]["dry_run"])
-        self.assertEqual(report["summary"]["selected_count"], 6)
+        self.assertEqual(report["summary"]["selected_count"], 7)
         self.assertTrue(md_exists)
 
 

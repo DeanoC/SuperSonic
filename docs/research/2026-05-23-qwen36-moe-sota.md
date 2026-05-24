@@ -551,7 +551,20 @@ under the same smoke:
    recommends a larger LRU resident cache, static resident table, or fused
    routed INT4 branch.
 
-9. **Qwen3.6 fused routed INT4 runtime sweep**
+9. **Qwen3.6 LRU resident-cache runtime sweep**
+   Turn `prototype_larger_lru_resident_cache` from a route-locality
+   recommendation into a runtime promotion gate. `tests/metal/sweep_qwen36_lru_resident_cache.py`
+   reuses the existing native INT4 packed hotset path, compares default decode
+   with capacity-labeled `lru-hotset-N` modes, captures residency and
+   Metal/HAL profile rows, and writes
+   `target/qwen36_lru_resident_cache_sweep.{json,md}`. Its nonfatal
+   `promotion_gate` uses the same runtime contract as the static and fused
+   probes: generated IDs must match default, headline decode and `ffn_ms_avg`
+   must improve, full-attention/linear-attention/lm-head must stay within the
+   regression threshold, and `command_buffer_wait` evidence must be present and
+   non-regressed when profile evidence is required.
+
+10. **Qwen3.6 fused routed INT4 runtime sweep**
    Preserve the fused routed INT4 branch as a measured runtime gate rather than
    a note in the performance docs. `tests/metal/sweep_qwen36_fused_routed_int4.py`
    compares `default`, `direct-gather`, and `gpu-pack` under the same prompt
@@ -563,19 +576,19 @@ under the same smoke:
    regression threshold, and `command_buffer_wait` evidence must be present and
    non-regressed when profile evidence is required.
 
-10. **Qwen3.6 SOTA gate summary**
+11. **Qwen3.6 SOTA gate summary**
    Preserve negative results as one roadmap-level artifact instead of leaving
    the promotion/viability decisions scattered across individual JSON files.
    `tests/metal/summarize_qwen36_sota_gates.py` reads the batched-prefill
    variant sweep, static top-N runtime sweep, fused routed INT4 runtime sweep,
-   MPS resident-table probe, route residency sweep, and MTP acceptance sweep
-   reports, then writes
-   `target/qwen36_sota_gate_summary.{json,md}`. The v5 schema records input
+   MPS resident-table probe, route residency sweep, MTP acceptance sweep, and
+   LRU resident-cache sweep reports, then writes
+   `target/qwen36_sota_gate_summary.{json,md}`. The v7 schema records input
    health, report age, passed and failed gate IDs, candidate failures, and a
    single `next_action`, plus the refresh command for each gate. It also marks
-   passed estimate gates as superseded when a newer runtime gate has already
-   measured and rejected the corresponding candidate, so the next action cannot
-   loop back to an already-negative prototype. Missing reports are nonfatal rows
+   passed estimate or decision gates as superseded when a newer runtime gate has
+   already measured and rejected the corresponding candidate, so the next action
+   cannot loop back to an already-negative prototype. Missing reports are nonfatal rows
    by default; `--require` turns absent, malformed, schema-mismatched, or
    missing-gate artifacts into a failed validation run, and `--max-age-hours`
    adds an mtime-based stale-report gate for local refresh runs.

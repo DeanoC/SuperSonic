@@ -652,7 +652,8 @@ required unless explicitly disabled.
 `tests/metal/summarize_qwen36_sota_gates.py` is the cross-harness summary for
 the current roadmap gates. It reads the batched-prefill variant sweep, static
 top-N runtime sweep, fused routed INT4 runtime sweep, MPS resident-table probe,
-route residency sweep, and MTP acceptance sweep JSON reports, then writes
+route residency sweep, MTP acceptance sweep, and LRU resident-cache sweep JSON
+reports, then writes
 `target/qwen36_sota_gate_summary.json`
 and `target/qwen36_sota_gate_summary.md`. Missing reports remain visible as rows
 by default, and each row includes the command that refreshes the corresponding
@@ -660,9 +661,9 @@ gate artifact. Add `--require` to make a local validation run fail closed on
 missing, malformed, schema-mismatched, stale, or missing-gate artifacts. Use
 `--max-age-hours N` when the summary must reject old target reports instead of
 quietly reusing yesterday's gate decisions.
-The v5 summary marks an estimate gate as superseded when a newer runtime sweep
-has already measured and rejected that candidate, keeping `next_action` pointed
-at untried implementation work.
+The v7 summary marks an estimate or decision gate as superseded when a newer
+runtime sweep has already measured and rejected that candidate, keeping
+`next_action` pointed at untried implementation work.
 `tests/metal/refresh_qwen36_sota_gates.py` turns those row-level refresh
 commands into a dry-run plan at
 `target/qwen36_sota_gate_refresh_plan.{json,md}`. It selects missing/stale/bad

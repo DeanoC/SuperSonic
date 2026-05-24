@@ -267,6 +267,12 @@ def add_gate_path_args(parser: argparse.ArgumentParser) -> None:
         default=gate_summary.GATE_SPECS[5].default_path,
         help="MTP acceptance sweep JSON",
     )
+    parser.add_argument(
+        "--lru-json",
+        type=Path,
+        default=gate_summary.GATE_SPECS[6].default_path,
+        help="LRU resident cache runtime sweep JSON",
+    )
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
