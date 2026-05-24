@@ -6,10 +6,13 @@
 //! GPU launch details live in the lower-level chain, persistent-decode,
 //! generation, and spec-verify modules.
 
-use std::path::Path;
+use std::{path::Path, ptr};
 
 use anyhow::{Context, Result};
 use gpu_hal::{set_backend, Backend};
+use kernel_ffi::qwen36_moe::{
+    Qwen36MoeFfnStepInt4, Qwen36MoeFfnStepParams, Qwen36MoeFfnStepWeights,
+};
 use model_store::BakedStore;
 
 use crate::profiling::PrefillProfileScope;
@@ -43,8 +46,113 @@ use crate::qwen36_moe_cli::vmm_config::{prepare_moe_runtime_config, should_use_q
 use crate::qwen36_moe_logits::XorshiftRng;
 use crate::qwen36_moe_speculative::SpeculativeStepResult;
 use crate::qwen36_moe_telemetry::{print_and_write_moe_residency_summary, MoeRouteRuntime};
-use crate::qwen36_moe_types::PositionPair;
+use crate::qwen36_moe_types::{LayerBuffers, PositionPair};
 use crate::registry::RegistryEntry;
+
+fn prewarm_qwen36_mps_static_topn_if_requested(
+    ordinal: usize,
+    backend: Backend,
+    geom: &crate::qwen36_moe_types::MultiLayerGeom,
+    layers: &mut [LayerBuffers],
+) -> Result<std::time::Duration> {
+    if backend != Backend::Metal
+        || std::env::var_os("SUPERSONIC_METAL_PREWARM_QWEN36_FFN_MPS_STATIC_TOPN").is_none()
+    {
+        return Ok(std::time::Duration::ZERO);
+    }
+
+    let started = std::time::Instant::now();
+    let mut attempted_layers = 0usize;
+    let mut warmed_layers = 0usize;
+    let mut allocations = 0usize;
+    let mut copied_bytes = 0usize;
+    let mut resident_capacity = 0usize;
+
+    for (layer_idx, layer) in layers.iter_mut().enumerate() {
+        let ffn = &mut layer.ffn;
+        let Some(int4) = &ffn.int4 else {
+            continue;
+        };
+        attempted_layers += 1;
+        let params = Qwen36MoeFfnStepParams {
+            stage: 5,
+            layer_idx: layer_idx as i32,
+            hidden: geom.hidden,
+            num_experts: geom.num_experts,
+            moe_intermediate: geom.moe_intermediate,
+            shared_intermediate: geom.shared_intermediate,
+            top_k: geom.top_k,
+            rms_norm_eps: geom.rms_norm_eps,
+        };
+        let weights = Qwen36MoeFfnStepWeights {
+            input_hidden: ptr::null(),
+            post_attn_norm_w: ffn.post_attn_norm_w.as_ptr(),
+            gate_w: ffn.gate_w.as_ptr(),
+            gate_up_proj_w: ffn.gate_up_proj_w.as_ptr(),
+            down_proj_w: ffn.down_proj_w.as_ptr(),
+            shared_gate_proj_w: ffn.shared_gate_proj_w.as_ptr(),
+            shared_up_proj_w: ffn.shared_up_proj_w.as_ptr(),
+            shared_down_proj_w: ffn.shared_down_proj_w.as_ptr(),
+            shared_expert_gate_w: ffn.shared_expert_gate_w.as_ptr(),
+        };
+        let fp8 = int4.group_size < 0;
+        let int4_ptrs = Qwen36MoeFfnStepInt4 {
+            group_size: int4.group_size,
+            gate_up_proj_scale: int4.gate_up_proj_scale.as_ptr(),
+            gate_up_proj_zero: if fp8 {
+                ptr::null()
+            } else {
+                int4.gate_up_proj_zero.as_ptr()
+            },
+            down_proj_scale: int4.down_proj_scale.as_ptr(),
+            down_proj_zero: if fp8 {
+                ptr::null()
+            } else {
+                int4.down_proj_zero.as_ptr()
+            },
+            shared_gate_proj_scale: int4.shared_gate_proj_scale.as_ptr(),
+            shared_gate_proj_zero: if fp8 {
+                ptr::null()
+            } else {
+                int4.shared_gate_proj_zero.as_ptr()
+            },
+            shared_up_proj_scale: int4.shared_up_proj_scale.as_ptr(),
+            shared_up_proj_zero: if fp8 {
+                ptr::null()
+            } else {
+                int4.shared_up_proj_zero.as_ptr()
+            },
+            shared_down_proj_scale: int4.shared_down_proj_scale.as_ptr(),
+            shared_down_proj_zero: if fp8 {
+                ptr::null()
+            } else {
+                int4.shared_down_proj_zero.as_ptr()
+            },
+        };
+        if let Some(stats) = kernel_ffi::qwen36_moe::qwen36_prewarm_mps_static_topn_rhs_for_metal(
+            ordinal, params, &weights, &int4_ptrs,
+        )
+        .with_context(|| format!("prewarm Qwen3.6 MPS static top-N RHS layer {layer_idx}"))?
+        {
+            warmed_layers += 1;
+            allocations += usize::from(stats.allocated);
+            copied_bytes += stats.copied_bytes;
+            resident_capacity = resident_capacity.max(stats.resident_capacity);
+        }
+    }
+
+    let elapsed = started.elapsed();
+    eprintln!(
+        "[qwen36-moe ffn-prewarm] mode=mps-static-topn status=ok attempted_layers={} warmed_layers={} allocations={} resident_capacity={} copied_bytes={} elapsed_ms={:.3}",
+        attempted_layers,
+        warmed_layers,
+        allocations,
+        resident_capacity,
+        copied_bytes,
+        elapsed.as_secs_f64() * 1000.0
+    );
+    Ok(elapsed)
+}
 
 /// Compute the `(rope, cache)` PositionPair for one step of the
 /// decode loop. In dense mode the rope and cache agree; in
@@ -386,8 +494,10 @@ fn decode_text(
         moe_runtime.async_staging_pages,
         persistent_decode,
     )?;
-    let layer_load_elapsed = layer_load_start.elapsed();
     let mut layers = loaded_layers.layers;
+    let _ffn_prewarm_elapsed =
+        prewarm_qwen36_mps_static_topn_if_requested(ordinal, backend, &geom, &mut layers)?;
+    let layer_load_elapsed = layer_load_start.elapsed();
     let _moe_expert_arena = loaded_layers.moe_expert_arena;
     let mut _moe_expert_residency = loaded_layers.moe_expert_residency;
     let virtual_kv_stats = virtual_kv_stats_for_layers(&layers);

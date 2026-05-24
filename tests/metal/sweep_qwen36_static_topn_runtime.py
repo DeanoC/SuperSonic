@@ -15,7 +15,7 @@ from typing import Any
 
 
 MODEL = "qwen3.6-35b-a3b"
-SCHEMA = "qwen36-static-topn-runtime-sweep-v3"
+SCHEMA = "qwen36-static-topn-runtime-sweep-v4"
 
 PROMPT_SETS: dict[str, list[tuple[str, str]]] = {
     "smoke": [
@@ -45,6 +45,8 @@ MODE_ALIASES: dict[str, str] = {
     "static-hotset": "static-hotset",
     "mps-static-partial": "mps-static-partial",
     "static-mps-partial": "mps-static-partial",
+    "mps-static-partial-prewarm": "mps-static-partial-prewarm",
+    "static-mps-partial-prewarm": "mps-static-partial-prewarm",
 }
 DEFAULT_MODES = "default,static,static-hotset,mps-static-partial"
 
@@ -89,6 +91,11 @@ def parse_chain_breakdown(output: str) -> dict[str, Any]:
 
 def parse_lifecycle_timings(output: str) -> dict[str, Any]:
     return parse_metric_line(output, "[qwen36-moe lifecycle-timings]")
+
+
+def parse_ffn_prewarm(output: str) -> dict[str, Any] | None:
+    parsed = parse_metric_line(output, "[qwen36-moe ffn-prewarm]")
+    return parsed or None
 
 
 def parse_expert_residency(output: str) -> dict[str, Any] | None:
@@ -244,7 +251,12 @@ def build_env_overrides(args: argparse.Namespace, mode: str) -> dict[str, str]:
         overrides["SUPERSONIC_METAL_QWEN36_FFN_EXPERT_HOTSET_CAPACITY"] = str(
             args.hotset_capacity
         )
-    if mode in {"static", "static-hotset", "mps-static-partial"}:
+    if mode in {
+        "static",
+        "static-hotset",
+        "mps-static-partial",
+        "mps-static-partial-prewarm",
+    }:
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_STATIC_TOPN"] = "1"
         overrides["SUPERSONIC_METAL_QWEN36_FFN_EXPERT_STATIC_TOPN_FILE"] = str(
             args.static_table_json
@@ -253,8 +265,10 @@ def build_env_overrides(args: argparse.Namespace, mode: str) -> dict[str, str]:
             overrides["SUPERSONIC_METAL_QWEN36_FFN_EXPERT_STATIC_TOPN_CAPACITY"] = str(
                 args.static_capacity
             )
-    if mode == "mps-static-partial":
+    if mode in {"mps-static-partial", "mps-static-partial-prewarm"}:
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_MPS_STATIC_TOPN_PARTIAL"] = "1"
+    if mode == "mps-static-partial-prewarm":
+        overrides["SUPERSONIC_METAL_PREWARM_QWEN36_FFN_MPS_STATIC_TOPN"] = "1"
     return overrides
 
 
@@ -335,6 +349,7 @@ def run_row(args: argparse.Namespace, prompt_id: str, prompt: str, mode: str) ->
             "stage_timings": parse_stage_timings(output),
             "chain_breakdown": parse_chain_breakdown(output),
             "lifecycle_timings": parse_lifecycle_timings(output),
+            "ffn_prewarm": parse_ffn_prewarm(output),
             "expert_residency": parse_expert_residency(output),
             "expert_residency_policies": parse_expert_residency_policies(output),
             "metal_profile": parse_profile(output, "[metal-profile]", "[metal-profile-op]"),
@@ -358,6 +373,7 @@ def run_row(args: argparse.Namespace, prompt_id: str, prompt: str, mode: str) ->
             "stage_timings": {},
             "chain_breakdown": {},
             "lifecycle_timings": {},
+            "ffn_prewarm": parse_ffn_prewarm(output),
             "expert_residency": None,
             "expert_residency_policies": [],
             "metal_profile": parse_profile(output, "[metal-profile]", "[metal-profile-op]"),
@@ -654,27 +670,31 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- promotion_gate_passed: `{promotion_gate.get('passed', False)}`",
         f"- promotion_gate_passed_modes: `{','.join(promotion_gate.get('passed_modes') or []) or '-'}`",
         "",
-        "| Prompt | Mode | Status | IDs | Decode ms | FFN ms avg | Exact hit rate | Slot hit rate | Copied GiB | Top Metal op | Top Metal ms | HAL ms | Wall s |",
-        "|:---|:---|:---|:---|---:|---:|---:|---:|---:|:---|---:|---:|---:|",
+        "| Prompt | Mode | Status | IDs | Decode ms | FFN ms avg | Prewarm ms | Exact hit rate | Slot hit rate | Copied GiB | Prewarm GiB | Top Metal op | Top Metal ms | HAL ms | Wall s |",
+        "|:---|:---|:---|:---|---:|---:|---:|---:|---:|---:|---:|:---|---:|---:|---:|",
     ]
     for row in report["rows"]:
         residency = row.get("expert_residency") or {}
+        prewarm = row.get("ffn_prewarm") or {}
         result = row.get("result") or {}
         chain = row.get("chain_breakdown") or {}
         top_metal = top_profile_op(row.get("metal_profile"))
         hal_summary = (row.get("hal_profile") or {}).get("summary") or {}
         copied_gib = float(residency.get("copied_bytes", 0) or 0) / (1024.0**3)
+        prewarm_gib = float(prewarm.get("copied_bytes", 0) or 0) / (1024.0**3)
         lines.append(
-            "| {prompt} | {mode} | {status} | {ids} | {decode} | {ffn} | {exact} | {slot} | {copied} | {top_op} | {top_ms} | {hal_ms} | {wall} |".format(
+            "| {prompt} | {mode} | {status} | {ids} | {decode} | {ffn} | {prewarm_ms} | {exact} | {slot} | {copied} | {prewarm_gib} | {top_op} | {top_ms} | {hal_ms} | {wall} |".format(
                 prompt=row.get("prompt_id", ""),
                 mode=row.get("mode", ""),
                 status=row.get("status", ""),
                 ids=",".join(str(item) for item in row.get("generated_ids", [])),
                 decode=render_float(result.get("decode_ms")),
                 ffn=render_float(chain.get("ffn_ms_avg")),
+                prewarm_ms=render_float(prewarm.get("elapsed_ms")),
                 exact=render_float(residency.get("exact_hit_rate"), 6),
                 slot=render_float(residency.get("slot_hit_rate"), 6),
                 copied=render_float(copied_gib, 3),
+                prewarm_gib=render_float(prewarm_gib, 3),
                 top_op=top_metal.get("op") or "-",
                 top_ms=render_float(top_metal.get("total_ms")),
                 hal_ms=render_float(hal_summary.get("total_ms")),
@@ -684,7 +704,7 @@ def render_markdown(report: dict[str, Any]) -> str:
     lines.extend(
         [
             "",
-            "Rows are separate process runs. Static modes measure within-run warm reuse across generated tokens; the first token still pays resident-table allocation on full-hit layers.",
+            "Rows are separate process runs. Static modes measure within-run warm reuse across generated tokens; the first token still pays resident-table allocation on full-hit layers unless the mode explicitly prewarms the resident table during setup.",
         ]
     )
     candidates = promotion_gate.get("candidates") or []
@@ -769,7 +789,16 @@ def main(argv: list[str]) -> int:
     args.model_dir = resolve_model_dir(args.model_dir, os.environ)
     modes = parse_modes(args.modes)
     if (
-        any(mode in {"static", "static-hotset", "mps-static-partial"} for mode in modes)
+        any(
+            mode
+            in {
+                "static",
+                "static-hotset",
+                "mps-static-partial",
+                "mps-static-partial-prewarm",
+            }
+            for mode in modes
+        )
         and not args.static_table_json.exists()
     ):
         print(

@@ -4045,6 +4045,14 @@ struct Qwen36MpsExpertStaticTopNCacheEntry {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Qwen36MpsStaticTopNPrewarmStats {
+    pub layer_idx: i32,
+    pub resident_capacity: usize,
+    pub allocated: bool,
+    pub copied_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Qwen36MpsStaticTopNHit {
     original_group: usize,
     slot: usize,
@@ -4911,6 +4919,68 @@ where
         return Ok(None);
     }
 
+    let (result, allocation, copied_bytes) = qwen36_with_static_topn_mps_rhs_cache_for_metal(
+        ordinal,
+        hidden,
+        moe_intermediate,
+        resident_experts,
+        group_size,
+        num_experts,
+        gate_up_proj_ptr,
+        gate_up_scale_ptr,
+        gate_up_zero_ptr,
+        down_proj_ptr,
+        down_scale_ptr,
+        down_zero_ptr,
+        |entry| f(entry, resident_capacity, &hits, &misses),
+    )?;
+    qwen36_mps_static_topn_expert_residency_profile_record(
+        resident_capacity,
+        misses.is_empty(),
+        false,
+        allocation,
+        active_experts.len(),
+        usize::from(allocation) * copied_bytes,
+        hits.len(),
+        misses.len(),
+        0,
+    );
+    Ok(Some(result))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen36_with_static_topn_mps_rhs_cache_for_metal<T, F>(
+    ordinal: usize,
+    hidden: usize,
+    moe_intermediate: usize,
+    resident_experts: &[usize],
+    group_size: usize,
+    num_experts: usize,
+    gate_up_proj_ptr: *const c_void,
+    gate_up_scale_ptr: *const c_void,
+    gate_up_zero_ptr: *const c_void,
+    down_proj_ptr: *const c_void,
+    down_scale_ptr: *const c_void,
+    down_zero_ptr: *const c_void,
+    f: F,
+) -> Result<(T, bool, usize), GpuError>
+where
+    F: FnOnce(&Qwen36MpsExpertStaticTopNCacheEntry) -> Result<T, GpuError>,
+{
+    qwen36_validate_active_expert_pack(
+        hidden,
+        moe_intermediate,
+        resident_experts,
+        group_size,
+        num_experts,
+        gate_up_proj_ptr,
+        gate_up_scale_ptr,
+        gate_up_zero_ptr,
+        down_proj_ptr,
+        down_scale_ptr,
+        down_zero_ptr,
+    )?;
+    let resident_capacity = resident_experts.len();
     let key = Qwen36PackedExpertCacheKey {
         gate_up_proj_ptr: gate_up_proj_ptr as usize,
         gate_up_scale_ptr: gate_up_scale_ptr as usize,
@@ -4979,24 +5049,73 @@ where
             Ok(())
         },
     )?;
-    qwen36_mps_static_topn_expert_residency_profile_record(
-        resident_capacity,
-        misses.is_empty(),
-        false,
-        allocation,
-        active_experts.len(),
-        usize::from(allocation) * copied_bytes,
-        hits.len(),
-        misses.len(),
-        0,
-    );
     let entry = cache.get(&key).ok_or_else(|| {
         GpuError::backend(
             Backend::Metal,
             "qwen36 MPS static top-N cache entry missing after fill".into(),
         )
     })?;
-    Ok(Some(f(entry, resident_capacity, &hits, &misses)?))
+    Ok((f(entry)?, allocation, copied_bytes))
+}
+
+fn qwen36_mps_static_topn_prewarm_supported(
+    params: Qwen36MoeFfnStepParams,
+    weights: &Qwen36MoeFfnStepWeights,
+    int4: &Qwen36MoeFfnStepInt4,
+) -> bool {
+    std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_MPS_STATIC_TOPN_PARTIAL").is_some()
+        && params.stage == 5
+        && params.hidden == 2048
+        && params.num_experts == 256
+        && params.moe_intermediate == 512
+        && params.top_k == 8
+        && int4.group_size == 128
+        && !crate::metal_native::disabled_by_env()
+        && !weights.gate_up_proj_w.is_null()
+        && !weights.down_proj_w.is_null()
+        && !int4.gate_up_proj_scale.is_null()
+        && !int4.gate_up_proj_zero.is_null()
+        && !int4.down_proj_scale.is_null()
+        && !int4.down_proj_zero.is_null()
+}
+
+pub fn qwen36_prewarm_mps_static_topn_rhs_for_metal(
+    ordinal: usize,
+    params: Qwen36MoeFfnStepParams,
+    weights: &Qwen36MoeFfnStepWeights,
+    int4: &Qwen36MoeFfnStepInt4,
+) -> Result<Option<Qwen36MpsStaticTopNPrewarmStats>, GpuError> {
+    if !qwen36_mps_static_topn_prewarm_supported(params, weights, int4) {
+        return Ok(None);
+    }
+    let Some((capacity, resident_experts)) =
+        qwen36_static_topn_layer_experts_from_env(params.layer_idx)?
+    else {
+        return Ok(None);
+    };
+    let hidden = params.hidden as usize;
+    let moe_intermediate = params.moe_intermediate as usize;
+    let (_, allocated, copied_bytes) = qwen36_with_static_topn_mps_rhs_cache_for_metal(
+        ordinal,
+        hidden,
+        moe_intermediate,
+        resident_experts,
+        int4.group_size as usize,
+        params.num_experts as usize,
+        weights.gate_up_proj_w,
+        int4.gate_up_proj_scale,
+        int4.gate_up_proj_zero,
+        weights.down_proj_w,
+        int4.down_proj_scale,
+        int4.down_proj_zero,
+        |_| Ok(()),
+    )?;
+    Ok(Some(Qwen36MpsStaticTopNPrewarmStats {
+        layer_idx: params.layer_idx,
+        resident_capacity: capacity,
+        allocated,
+        copied_bytes: usize::from(allocated) * copied_bytes,
+    }))
 }
 
 #[allow(clippy::too_many_arguments)]

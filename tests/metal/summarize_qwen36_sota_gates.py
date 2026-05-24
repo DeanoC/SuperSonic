@@ -44,12 +44,12 @@ GATE_SPECS = (
         gate_id="static_topn_runtime",
         label="Static top-N runtime",
         default_path=Path("target/qwen36_static_topn_runtime_sweep.json"),
-        expected_schema="qwen36-static-topn-runtime-sweep-v3",
+        expected_schema="qwen36-static-topn-runtime-sweep-v4",
         gate_keys=("promotion_gate",),
         kind="runtime_promotion",
         refresh_command=(
             f"{MODEL_ROOT_ENV} python3 tests/metal/sweep_qwen36_static_topn_runtime.py "
-            "--modes default,static,static-hotset,mps-static-partial --metal-profile"
+            "--modes default,static,static-hotset,mps-static-partial,mps-static-partial-prewarm --metal-profile"
         ),
     ),
     GateSpec(

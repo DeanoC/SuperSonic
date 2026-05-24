@@ -19,6 +19,7 @@ Generated 4 tokens (1 prompt + 4 new). EOS: no (max_new_tokens hit).
 [qwen36-moe stage-timings] gen_steps=4 embed_ms_avg=1.000 chain_ms_avg=210.000 lm_head_ms_avg=20.000 sample_ms_avg=0.100 detok_ms_avg=0.001 total_ms_avg=234.700 (chain_total_ms=840 lm_head_total_ms=80)
 [qwen36-moe chain-breakdown] gen_steps=4 full_attn_ms_avg=20.000 linear_attn_ms_avg=60.000 ffn_ms_avg=128.730 (full_attn_total_ms=80 linear_attn_total_ms=240 ffn_total_ms=514.9)
 [qwen36-moe lifecycle-timings] prompt_setup_ms=10.000 bake_open_ms=1.000 layer_load_ms=100.000 session_ms=1000.000 prefill_steps=0 prefill_embed_ms=0.000 prefill_chain_ms=0.000 prefill_total_ms=0.000 generation_wall_ms=939.000 total_wall_ms=1111.000
+[qwen36-moe ffn-prewarm] mode=mps-static-topn status=ok attempted_layers=40 warmed_layers=40 allocations=40 resident_capacity=64 copied_bytes=15753805824 elapsed_ms=5630.663
 [qwen36-expert-residency] calls=160 entries=40 exact_hits=9 route_refills=0 allocations=9 copied_bytes=879660288 exact_hit_rate=0.056250 slot_hits=900 slot_misses=380 slot_hit_rate=0.703125 evictions=0 avg_active_groups=8.000000 max_active_groups=8 avg_copy_bytes=97740032.000
 [qwen36-expert-residency-policy] resident_format=native_int4 scope=per_layer miss_policy=static_topn capacity=64 calls=160 exact_hits=9 route_refills=0 allocations=9 copied_bytes=879660288 exact_hit_rate=0.056250 slot_hits=900 slot_misses=380 slot_hit_rate=0.703125 evictions=0 avg_active_groups=8.000000 max_active_groups=8 avg_copy_bytes=97740032.000
 [metal-profile] calls=2 total_ms=12.000 native_ms=10.000 host_ms=2.000
@@ -38,6 +39,10 @@ class Qwen36StaticTopNRuntimeSweepTests(unittest.TestCase):
         self.assertAlmostEqual(
             parse.parse_chain_breakdown(SAMPLE_OUTPUT)["ffn_ms_avg"], 128.730
         )
+        prewarm = parse.parse_ffn_prewarm(SAMPLE_OUTPUT)
+        self.assertIsNotNone(prewarm)
+        self.assertEqual(prewarm["warmed_layers"], 40)
+        self.assertAlmostEqual(prewarm["elapsed_ms"], 5630.663)
         residency = parse.parse_expert_residency(SAMPLE_OUTPUT)
         self.assertIsNotNone(residency)
         self.assertEqual(residency["calls"], 160)
@@ -58,8 +63,8 @@ class Qwen36StaticTopNRuntimeSweepTests(unittest.TestCase):
         parse_modes = sweep_qwen36_static_topn_runtime.parse_modes
 
         self.assertEqual(
-            parse_modes("baseline,packed,static-hotset,static-mps-partial,baseline"),
-            ["default", "packed", "static-hotset", "mps-static-partial"],
+            parse_modes("baseline,packed,static-hotset,static-mps-partial-prewarm,baseline"),
+            ["default", "packed", "static-hotset", "mps-static-partial-prewarm"],
         )
         with self.assertRaises(ValueError):
             parse_modes("unknown")
@@ -88,6 +93,17 @@ class Qwen36StaticTopNRuntimeSweepTests(unittest.TestCase):
             "1",
         )
         self.assertNotIn("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_PACKED_STAGE5", env)
+
+        env = script.build_env_overrides(args, "mps-static-partial-prewarm")
+        self.assertEqual(env["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_STATIC_TOPN"], "1")
+        self.assertEqual(
+            env["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_MPS_STATIC_TOPN_PARTIAL"],
+            "1",
+        )
+        self.assertEqual(
+            env["SUPERSONIC_METAL_PREWARM_QWEN36_FFN_MPS_STATIC_TOPN"],
+            "1",
+        )
 
     def test_report_summary_detects_generation_mismatch(self):
         script = sweep_qwen36_static_topn_runtime

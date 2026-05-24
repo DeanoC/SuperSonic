@@ -490,6 +490,11 @@ under the same smoke:
    `mps-static-partial` mode so this path can be judged against the same
    generated-token parity and expert-residency rows as the native INT4 static
    probes.
+   The v4 sweep adds `mps-static-partial-prewarm`, which sets
+   `SUPERSONIC_METAL_PREWARM_QWEN36_FFN_MPS_STATIC_TOPN=1` and builds the
+   static FP16 MPS RHS cache during layer setup. This keeps the normal decode
+   row honest by separating one-time resident-table materialization from the
+   steady-state per-token MPS bridge and host-miss costs.
    The first measurement is a useful rejection signal: a profiled one-token
    smoke preserved `[11]`, but measured `decode_ms=6324`,
    `ffn_ms_avg=6073.323`, `slot_hit_rate=0.731250`, and
@@ -584,7 +589,7 @@ under the same smoke:
    MPS resident-table probe, route residency sweep, MTP acceptance sweep, LRU
    resident-cache sweep, linear decode sweep, and full-attention decode sweep
    reports, then writes
-   `target/qwen36_sota_gate_summary.{json,md}`. The v9 schema records input
+   `target/qwen36_sota_gate_summary.{json,md}`. The v10 schema records input
    health, report age, passed and failed gate IDs, candidate failures, and a
    single `next_action`, plus the refresh command for each gate. It also marks
    passed estimate or decision gates as superseded when a newer runtime gate has
@@ -602,11 +607,11 @@ under the same smoke:
    Close the loop when every SOTA runtime fork is negative. `tests/metal/select_qwen36_next_bottleneck.py`
    reads the refreshed SOTA gate summary plus the profiled default rows from
    the static top-N, fused routed INT4, LRU resident-cache, batched-prefill
-   linear/full-attention decode sweeps, and the latest optional `bench-perf`
+   linear/full-attention/lm-head decode sweeps, and the latest optional `bench-perf`
    schema-v9 Qwen3.6 INT4
    artifact under `target/bench-runs`. It ranks decode buckets, records the
    prefill best-vs-baseline row, preserves top Metal/HAL profile ops, and writes
-   `target/qwen36_next_bottleneck.{json,md}`. The v5 selector also reads
+   `target/qwen36_next_bottleneck.{json,md}`. The v6 selector also reads
    adjacent `meta.json` worktree fingerprints and only auto-consumes bench
    artifacts whose git SHA plus diff hash match the current checkout, so
    rejected uncommitted experiments do not silently become the headline default.
@@ -657,7 +662,7 @@ under the same smoke:
    to `28.171 ms` total. The next measured bottleneck remains FFN host expert
    work by absolute time, but the current negative FFN residency gates still
    make the next actionable target the largest non-exhausted bucket selected by
-   the v5 selector.
+   the v6 selector.
 
 16. **Qwen3.6 linear recurrent beta/g hoist rejection**
    The next tiny linear-kernel idea was measured and rejected instead of
@@ -747,6 +752,27 @@ under the same smoke:
    already tiny (`copy_d2h` `0.067 -> 0.004 ms` total), so a future lm-head
    win needs a fused lm-head/top-1 tail or a larger dense-matmul change rather
    than just replacing host argmax with a separate Metal argmax dispatch.
+
+20. **Qwen3.6 static MPS RHS prewarm gate**
+   After all narrow decode buckets were exhausted, the selector returned to
+   FFN for a larger measured path. The next resident-table slice is an
+   opt-in setup prewarm, not a default runtime change:
+   `SUPERSONIC_METAL_PREWARM_QWEN36_FFN_MPS_STATIC_TOPN=1` builds the existing
+   static top-N FP16 MPS RHS cache during layer setup, using the same shared
+   Metal buffers the decode bridge consumes. The static-topN runtime sweep's
+   `mps-static-partial-prewarm` mode captures a `[qwen36-moe ffn-prewarm]`
+   row with warmed layers, allocations, copied bytes, and elapsed setup time,
+   while decode timings show whether the warm resident bridge is still slower
+   after first-token materialization is removed from the measured token loop.
+   The first prewarm smoke preserved `[11]` and warmed all 40 layers, with
+   `resident_capacity=64`, `copied_bytes=15753805824` (`14.672 GiB`), and
+   `elapsed_ms=6666.916`. Runtime expert-residency copies dropped to zero, but
+   decode still regressed from `default` `333.2 ms/token` /
+   `ffn_ms_avg=159.650` to `mps-static-partial-prewarm`
+   `2473.8 ms/token` / `ffn_ms_avg=1543.206`; `command_buffer_wait` also
+   regressed from `130.018 ms` to `861.632 ms`. This is the clean decision
+   point before attempting a larger FFN kernel: the next FFN work should be a
+   fused native INT4 compute path rather than more FP16 MPS table residency.
 
 ## Sources
 
