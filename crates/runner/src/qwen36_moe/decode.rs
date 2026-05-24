@@ -48,12 +48,21 @@ use crate::qwen36_moe_types::{
 
 static QWEN36_DECODE_BATCH_ROUTE_SNAPSHOT_CALLS: AtomicUsize = AtomicUsize::new(0);
 static QWEN36_DECODE_BATCH_SHARED_PARITY_TAP_CALLS: AtomicUsize = AtomicUsize::new(0);
+static QWEN36_LAYER_OUTPUT_TAP_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+const LAYER_OUTPUT_TAP_PHASE_COUNT: usize = 2;
+const LAYER_OUTPUT_TAP_PHASES: [&str; 2] = ["attn", "ffn"];
 
 struct DecodeBatchSharedParitySnapshots {
     input: GpuBuffer,
     workspace: GpuBuffer,
     captured: Vec<bool>,
     workspace_floats: usize,
+}
+
+struct LayerOutputSnapshots {
+    output: GpuBuffer,
+    captured: Vec<[bool; LAYER_OUTPUT_TAP_PHASE_COUNT]>,
 }
 
 /// Workspace floats sufficient for the full-attn parity launcher's stage 5
@@ -197,6 +206,10 @@ fn qwen36_metal_decode_batch_shared_stage5_parity_tap_max_calls() -> usize {
         .and_then(|raw| raw.parse::<usize>().ok())
         .filter(|&value| value > 0)
         .unwrap_or(40)
+}
+
+fn qwen36_layer_output_tap_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_QWEN36_LAYER_OUTPUT_TAP").is_some()
 }
 
 fn qwen36_metal_router_stage5_simd_env_enabled() -> bool {
@@ -385,6 +398,112 @@ fn decode_batch_shared_snapshot_f32(bytes: &[u8]) -> Vec<f32> {
         .chunks_exact(4)
         .map(|chunk| f32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
         .collect()
+}
+
+fn fnv1a64_bytes(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for &byte in bytes {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x1000_0000_01b3);
+    }
+    hash
+}
+
+fn bf16_head_hex(bytes: &[u8], elems: usize) -> String {
+    bytes
+        .chunks_exact(2)
+        .take(elems)
+        .map(|chunk| format!("{:02x}{:02x}", chunk[1], chunk[0]))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn snapshot_layer_output(
+    ordinal: usize,
+    snapshots: &mut LayerOutputSnapshots,
+    layer_idx: usize,
+    phase_idx: usize,
+    src: *const std::ffi::c_void,
+    hidden: usize,
+) -> Result<()> {
+    if phase_idx >= LAYER_OUTPUT_TAP_PHASES.len() {
+        return Err(anyhow!("invalid qwen36 layer-output tap phase {phase_idx}"));
+    }
+    let bytes = hidden * std::mem::size_of::<u16>();
+    let row = layer_idx * LAYER_OUTPUT_TAP_PHASES.len() + phase_idx;
+    let dst = unsafe { (snapshots.output.as_mut_ptr() as *mut u8).add(row * bytes) }
+        as *mut std::ffi::c_void;
+    copy_d2d_decode(ordinal, dst, src, bytes)
+        .with_context(|| format!("snapshot qwen36 layer output tap layer={layer_idx}"))?;
+    if let Some(captured) = snapshots.captured.get_mut(layer_idx) {
+        captured[phase_idx] = true;
+    }
+    Ok(())
+}
+
+fn emit_layer_output_taps(
+    position: i32,
+    cache_pos: i32,
+    path: &str,
+    phase_profile: bool,
+    geom: &MultiLayerGeom,
+    snapshots: &LayerOutputSnapshots,
+) -> Result<()> {
+    let bytes = snapshots
+        .output
+        .to_host_bytes()
+        .context("d2h qwen36 layer-output tap snapshots")?;
+    let hidden = geom.hidden as usize;
+    let row_bytes = hidden * std::mem::size_of::<u16>();
+
+    for (layer_idx, captured) in snapshots.captured.iter().enumerate() {
+        for (phase_idx, &is_captured) in captured.iter().enumerate() {
+            if !is_captured {
+                continue;
+            }
+            let row = layer_idx * LAYER_OUTPUT_TAP_PHASES.len() + phase_idx;
+            let start = row * row_bytes;
+            let end = start + row_bytes;
+            if end > bytes.len() {
+                return Err(anyhow!(
+                    "qwen36 layer-output tap snapshot out of bounds: layer={layer_idx} phase={} end={end}/{}",
+                    LAYER_OUTPUT_TAP_PHASES[phase_idx],
+                    bytes.len()
+                ));
+            }
+            let row_bytes = &bytes[start..end];
+            let hidden_f32 = bf16_bytes_to_f32(row_bytes);
+            let mut l2 = 0.0f64;
+            let mut max_abs = 0.0f32;
+            let mut max_abs_idx = 0usize;
+            for (idx, &value) in hidden_f32.iter().enumerate() {
+                l2 += (value as f64) * (value as f64);
+                let abs = value.abs();
+                if abs > max_abs {
+                    max_abs = abs;
+                    max_abs_idx = idx;
+                }
+            }
+            let call = QWEN36_LAYER_OUTPUT_TAP_CALLS.fetch_add(1, Ordering::Relaxed);
+            eprintln!(
+                "[qwen36-layer-output-tap] call={} position={} cache_pos={} path={} phase_profile={} layer={} phase={} elems={} checksum={:016x} l2={:.8e} max_abs={:.8e} max_abs_idx={} head8={}",
+                call,
+                position,
+                cache_pos,
+                path,
+                phase_profile as u8,
+                layer_idx,
+                LAYER_OUTPUT_TAP_PHASES[phase_idx],
+                hidden_f32.len(),
+                fnv1a64_bytes(row_bytes),
+                l2.sqrt(),
+                max_abs,
+                max_abs_idx,
+                bf16_head_hex(row_bytes, 8),
+            );
+        }
+    }
+    Ok(())
 }
 
 fn emit_decode_batch_shared_parity_taps(
@@ -928,6 +1047,19 @@ fn run_chained_decode_impl_with_cache_pos(
     } else {
         None
     };
+    let mut layer_output_tap = if qwen36_layer_output_tap_enabled() {
+        Some(LayerOutputSnapshots {
+            output: GpuBuffer::zeros(
+                ordinal,
+                ScalarType::BF16,
+                &[layers.len(), LAYER_OUTPUT_TAP_PHASE_COUNT, hidden],
+            )
+            .context("alloc qwen36 layer-output tap snapshots")?,
+            captured: vec![[false; LAYER_OUTPUT_TAP_PHASE_COUNT]; layers.len()],
+        })
+    } else {
+        None
+    };
 
     let metal_decode_batch = if metal_decode_batch_requested {
         let guard = kernel_ffi::prefill_ffi::MetalBatchGuard::begin()
@@ -1303,6 +1435,16 @@ fn run_chained_decode_impl_with_cache_pos(
             )
             .context("d2d attn_output -> residual")?;
         }
+        if let Some(snapshots) = layer_output_tap.as_mut() {
+            snapshot_layer_output(
+                ordinal,
+                snapshots,
+                layer_idx,
+                0,
+                output_buf.as_ptr(),
+                hidden,
+            )?;
+        }
 
         // Swap front: the just-published value is now the "current input".
         front = 1 - front;
@@ -1474,6 +1616,16 @@ fn run_chained_decode_impl_with_cache_pos(
             &mut sync_buf,
         )
         .with_context(|| format!("ffn_step_launch (layer {layer_idx})"))?;
+        if let Some(snapshots) = layer_output_tap.as_mut() {
+            snapshot_layer_output(
+                ordinal,
+                snapshots,
+                layer_idx,
+                1,
+                ffn_stage5_output.as_ptr(),
+                hidden,
+            )?;
+        }
         if ffn_uses_router_native {
             if let Some(snapshot) = decode_batch_route_snapshot.as_mut() {
                 let bytes = geom.top_k as usize * std::mem::size_of::<u32>();
@@ -1544,6 +1696,21 @@ fn run_chained_decode_impl_with_cache_pos(
     }
     if let Some(snapshots) = decode_batch_shared_parity.as_ref() {
         emit_decode_batch_shared_parity_taps(position, cache_pos, geom, layers, snapshots)?;
+    }
+    if let Some(snapshots) = layer_output_tap.as_ref() {
+        let path = if metal_decode_batch_active {
+            "decode_batch"
+        } else {
+            "chained"
+        };
+        emit_layer_output_taps(
+            position,
+            cache_pos,
+            path,
+            qwen36_metal_decode_batch_phase_profile_enabled(),
+            geom,
+            snapshots,
+        )?;
     }
     if let Some(batch) = metal_decode_batch {
         batch

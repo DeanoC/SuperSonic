@@ -450,6 +450,7 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
             metal_profile=False,
             metal_profile_phases=False,
             downstream_parity_tap=True,
+            layer_output_tap=False,
         )
         downstream_default = script.build_env_overrides(downstream_args, "default")
         self.assertEqual(
@@ -457,9 +458,23 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
             "1",
         )
 
+        layer_output_args = Namespace(
+            metal_profile=False,
+            metal_profile_phases=False,
+            downstream_parity_tap=False,
+            layer_output_tap=True,
+        )
+        layer_output_default = script.build_env_overrides(layer_output_args, "default")
+        self.assertEqual(
+            layer_output_default["SUPERSONIC_QWEN36_LAYER_OUTPUT_TAP"],
+            "1",
+        )
+
         tap_args = Namespace(
             metal_profile=False,
             metal_profile_phases=False,
+            downstream_parity_tap=False,
+            layer_output_tap=False,
             router_parity_tap=True,
             router_parity_tap_max_calls=3,
             shared_parity_tap=True,
@@ -1224,6 +1239,7 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
             metal_profile=False,
             metal_profile_phases=False,
             downstream_parity_tap=True,
+            layer_output_tap=False,
             router_parity_tap=False,
             router_parity_tap_max_calls=40,
             shared_parity_tap=False,
@@ -1254,6 +1270,77 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
             report["summary"]["final_hidden_tap"]["comparisons"][0]["checksum_match"]
         )
         self.assertFalse(report["summary"]["logits_tap"]["comparisons"][0]["top1_match"])
+
+    def test_layer_output_taps_are_compared_and_rendered(self):
+        script = sweep_qwen36_fused_routed_int4
+        output = "\n".join(
+            [
+                "[qwen36-layer-output-tap] call=0 position=1 cache_pos=1 path=chained "
+                "phase_profile=0 layer=0 phase=attn elems=2048 "
+                "checksum=aaaabbbbccccdddd l2=1.25000000e+01 "
+                "max_abs=2.50000000e+00 max_abs_idx=17 head8=0001,0002",
+                "[qwen36-layer-output-tap] call=1 position=1 cache_pos=1 path=chained "
+                "phase_profile=0 layer=0 phase=ffn elems=2048 "
+                "checksum=1111222233334444 l2=1.35000000e+01 "
+                "max_abs=2.70000000e+00 max_abs_idx=19 head8=0003,0004",
+            ]
+        )
+        candidate_output = "\n".join(
+            [
+                "[qwen36-layer-output-tap] call=0 position=1 cache_pos=1 path=decode_batch "
+                "phase_profile=0 layer=0 phase=attn elems=2048 "
+                "checksum=aaaabbbbccccdddd l2=1.25000000e+01 "
+                "max_abs=2.50000000e+00 max_abs_idx=17 head8=0001,0002",
+                "[qwen36-layer-output-tap] call=1 position=1 cache_pos=1 path=decode_batch "
+                "phase_profile=0 layer=0 phase=ffn elems=2048 "
+                "checksum=ffff222233334444 l2=1.36000000e+01 "
+                "max_abs=2.80000000e+00 max_abs_idx=23 head8=0003,0005",
+            ]
+        )
+
+        default = row("default")
+        default["layer_output_taps"] = script.parse_layer_output_taps(output)
+        candidate = row("full-stage5-router-simd-batch-shared-tiled")
+        candidate["layer_output_taps"] = script.parse_layer_output_taps(candidate_output)
+
+        args = Namespace(
+            max_new_tokens=1,
+            context_size=64,
+            metal_profile=False,
+            metal_profile_phases=False,
+            downstream_parity_tap=False,
+            layer_output_tap=True,
+            router_parity_tap=False,
+            router_parity_tap_max_calls=40,
+            shared_parity_tap=False,
+            shared_parity_tap_max_calls=40,
+            decode_batch_route_snapshot=False,
+            promotion_max_headline_ratio=0.999,
+            promotion_max_ffn_ratio=0.999,
+            promotion_max_component_regression_ratio=1.10,
+            promotion_max_command_buffer_wait_ratio=1.05,
+            promotion_max_fused_wall_gpu_ratio=4.0,
+            promotion_max_wait_gpu_ratio=4.0,
+            promotion_require_profile=False,
+        )
+        report = script.build_report(
+            [default, candidate],
+            args,
+            ["default", "full-stage5-router-simd-batch-shared-tiled"],
+            "smoke",
+        )
+        md = script.render_markdown(report)
+
+        self.assertIn("layer_output_tap: `True`", md)
+        self.assertIn("layer_output_checksum_mismatches: `1`", md)
+        self.assertIn("## Layer Output Tap", md)
+        comparisons = report["summary"]["layer_output_tap"]["comparisons"]
+        self.assertTrue(comparisons[0]["checksum_match"])
+        self.assertFalse(comparisons[1]["checksum_match"])
+        self.assertEqual(
+            report["summary"]["layer_output_tap"]["first_mismatch"]["phase"],
+            "ffn",
+        )
 
     def test_router_parity_tap_selection_keeps_each_path(self):
         script = sweep_qwen36_fused_routed_int4

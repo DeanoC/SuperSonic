@@ -1463,6 +1463,47 @@ under the same smoke:
    within the decode-batch FFN finalize and residual accumulation for the first
    mismatching layer.
 
+42. **Qwen3.6 layer-output parity tap**
+   The fused-routed sweep is now schema `v18` and adds `--layer-output-tap`,
+   which sets `SUPERSONIC_QWEN36_LAYER_OUTPUT_TAP=1`. The decode runtime
+   snapshots each layer's post-attention residual and post-FFN residual into a
+   compact Metal buffer while the batch is still open, then emits
+   `[qwen36-layer-output-tap]` rows after the batch flush. Each row carries
+   `position`, `cache_pos`, `path`, phase-profile state, `layer`, `phase`
+   (`attn` or `ffn`), element count, checksum, norm/max, and head values. The
+   sweep compares candidate rows against the default row by prompt, position,
+   layer, and phase.
+
+   The four-token Metal run used
+   `--modes default,full-stage5-router-simd-batch-shared-tiled
+   --max-new-tokens 4 --metal-profile --shared-parity-tap
+   --shared-parity-tap-max-calls 160 --downstream-parity-tap
+   --layer-output-tap`. It reproduced the generated-ID failure:
+   default generated `[11,271,40,599]`, while the decode-batch shared-tiled
+   row generated `[11,353,599,264]`. The shared parity tap again stayed tight
+   over `160` rows with `max_shared_out_abs=2.44e-4`, and final-hidden/logits
+   drift matched section 41.
+
+   The layer-output tap found the first hidden-stream divergence at the start
+   of the chain, not at final RMSNorm. At position `0`, layer `0` post-attn
+   matched exactly (`c3790558cfcd8fe4` in both rows), but layer `0` post-FFN
+   diverged (`f1872ddeb26a59b0` default versus `68a1cc5202bd41e4`
+   decode-batch). The run captured `640` layer-output rows and compared `320`
+   candidate rows; `317` mismatched. The only matching comparisons were
+   position `0` layer `0` post-attn, plus position `1` layer `0` post-attn and
+   post-FFN. From position `2` onward every tapped layer phase differed, which
+   is expected once earlier generated-token history has diverged.
+
+   This narrows the next correctness target to the first layer's FFN finalize
+   path. Since layer `0` post-attn is clean and the batch-native shared-expert
+   tap is still within BF16-scale tolerance, the next probe should capture the
+   routed expert side of layer `0`: router logits/top-k for decode-batch,
+   routed gate/up, routed down output, combined routed output, pre-residual
+   shared+routed sum, and the final residual add. If routed expert output is
+   clean, focus on residual accumulation/materialization. If routed output is
+   already different, disable or parity-tap the batched expert gate/up and
+   down/combine kernels before attempting another performance promotion.
+
 ## Sources
 
 - [Qwen/Qwen3.6-35B-A3B model card](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)
