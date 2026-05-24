@@ -15,7 +15,7 @@ from typing import Any
 
 
 MODEL = "qwen3.6-35b-a3b"
-SCHEMA = "qwen36-fused-routed-int4-sweep-v3"
+SCHEMA = "qwen36-fused-routed-int4-sweep-v4"
 
 PROMPT_SETS: dict[str, list[tuple[str, str]]] = {
     "smoke": [("hello", "Hello")],
@@ -179,6 +179,8 @@ def build_env_overrides(args: argparse.Namespace, mode: str) -> dict[str, str]:
     }
     if args.metal_profile:
         overrides["SUPERSONIC_METAL_PROFILE"] = "1"
+    if getattr(args, "metal_profile_phases", False):
+        overrides["SUPERSONIC_METAL_PROFILE_QWEN36_FFN_PHASES"] = "1"
     if mode == "packed":
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_PACKED_STAGE5"] = "1"
     elif mode == "direct-gather":
@@ -606,6 +608,7 @@ def build_report(
         "max_new_tokens": args.max_new_tokens,
         "context_size": args.context_size,
         "metal_profile": args.metal_profile,
+        "metal_profile_phases": getattr(args, "metal_profile_phases", False),
         "promotion_thresholds": {
             "max_headline_ratio": args.promotion_max_headline_ratio,
             "max_ffn_ratio": args.promotion_max_ffn_ratio,
@@ -645,6 +648,7 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- modes: `{','.join(report['modes'])}`",
         f"- max_new_tokens: `{report['max_new_tokens']}`",
         f"- metal_profile: `{report['metal_profile']}`",
+        f"- metal_profile_phases: `{report.get('metal_profile_phases', False)}`",
         f"- generated_ids_match: `{summary['generated_ids_match']}`",
         f"- promotion_gate_passed: `{promotion_gate.get('passed', False)}`",
         f"- promotion_gate_passed_modes: `{','.join(promotion_gate.get('passed_modes') or []) or '-'}`",
@@ -711,6 +715,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=20260504)
     parser.add_argument("--timeout", type=int, default=1200)
     parser.add_argument("--metal-profile", action="store_true")
+    parser.add_argument(
+        "--metal-profile-phases",
+        action="store_true",
+        help="split Qwen3.6 FFN Metal profile runs into per-phase command buffers",
+    )
     parser.add_argument(
         "--promotion-max-headline-ratio",
         type=float,

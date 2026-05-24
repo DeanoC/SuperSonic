@@ -955,8 +955,10 @@ The first opt-in prototype smoke on this machine used the 512-token preset and
 generated the same `[271]` one-token sanity row. In normal mode it measured
 22.15s prefill, 268.55 ms/token decode, and no NIAH hit because only one token
 was requested. The profiled variant measured 34.20s prefill and 253.74
-ms/token decode; profile overhead is expected because
-`SUPERSONIC_METAL_PROFILE=1` splits the routed-expert phases. The profile rows
+ms/token decode; profile overhead was expected because that run split the
+routed-expert phases. Current profile runs keep Qwen3.6 FFN phases aggregate by
+default and only restore those per-phase waited command buffers when
+`SUPERSONIC_METAL_PROFILE_QWEN36_FFN_PHASES=1` is set. The split profile rows
 showed `qwen36_batched_prefill_grouped_expert_direct` at 5.024s native wall
 across 40 layers, GPU timestamps of 1.903s for
 `command_buffer_gpu:qwen36_batched_prefill_grouped_expert_gate_up` and 2.045s

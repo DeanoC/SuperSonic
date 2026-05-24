@@ -796,19 +796,19 @@ under the same smoke:
    instead of the default `[11, 271, 40, 599]` and regressed to
    `578.8 ms/token` / `ffn_ms_avg=480.816`.
 
-21. **Qwen3.6 refreshed SOTA selector after FFN v3/v4 gates**
+21. **Qwen3.6 refreshed SOTA selector after FFN v4/static-v4 gates**
    With the static top-N runtime report refreshed to schema v4 and the
-   fused-routed INT4 report refreshed to schema v3, the SOTA summary loads all
+   fused-routed INT4 report refreshed to schema v4, the SOTA summary loads all
    ten gate reports cleanly. The latest selector still names
    `prototype_new_ffn_residency_or_compute_path` with `ffn_ms_avg` as both the
    target and dominant bucket: median default FFN is `111.557 ms`, versus
-   `67.456 ms` for linear attention, `19.293 ms` for full attention, and
-   `8.453 ms` for lm-head. Since all tracked narrow FFN/linear/full/lm-head
+   `67.456 ms` for linear attention, `19.257 ms` for full attention, and
+   `8.923 ms` for lm-head. Since all tracked narrow FFN/linear/full/lm-head
    gates are now exhausted, the next FFN change should be a larger native INT4
    kernel design, not another small env-gated fork of the current decode path.
 
 22. **Qwen3.6 stage-5 router-in-Metal FFN probe**
-   The fused-routed INT4 sweep v3 adds `full-stage5-router`, guarded by
+   The fused-routed INT4 sweep includes `full-stage5-router`, guarded by
    `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER=1`, to test whether
    moving RMSNorm, router logits, softmax/top-k, and routed/shared INT4 stage-5
    projection work into the native Metal FFN path can remove the per-layer host
@@ -817,18 +817,38 @@ under the same smoke:
    `moe_intermediate=512`, `shared_intermediate=512`, `top_k=8`), INT4
    `group_size=128`, complete sidecars, and the normal host fallback for all
    other cases or when `SUPERSONIC_METAL_FORCE_HOST_NATIVE=1`.
-   The first one-token smoke compiled and generated the same ID as default
-   (`[11]`), proving the wiring and shader pipeline are viable. The four-token
-   sweep keeps the mode disabled: default generated `[11, 271, 40, 599]` at
-   `198.0 ms/token` with `ffn_ms_avg=106.242`, while
+   One-token smokes compiled and generated the same ID as default (`[11]`),
+   proving the wiring and shader pipeline are viable. The v4 four-token sweep
+   keeps the mode disabled: default generated `[11, 271, 40, 599]` at
+   `200.6 ms/token` with `ffn_ms_avg=106.849`, while
    `full-stage5-router` generated `[11, 353, 599, 264]` at
-   `341.4 ms/token` with `ffn_ms_avg=257.605`. Its profile is still valuable:
-   the stable op `qwen36_ffn_int4_stage5_with_router` reports
-   `1030.004 ms` total, and command-buffer wait rises from `266.025 ms` to
-   `1238.229 ms`. The next FFN attempt should keep this gate as evidence, but
+   `451.6 ms/token` with `ffn_ms_avg=353.337`. Its aggregate profile is still
+   valuable: the stable op `qwen36_ffn_int4_stage5_with_router` reports
+   `1512.266 ms` total, and command-buffer wait rises from `270.468 ms` to
+   `1679.689 ms`. The next FFN attempt should keep this gate as evidence, but
    target a more substantial resident/fused INT4 compute design with fewer
    waited sub-dispatches and better reduction/tiling behavior before promotion
    is considered.
+
+23. **Qwen3.6 aggregate FFN profile gate**
+   The first `full-stage5-router` probe showed that the FFN profile path itself
+   can dominate the gate when `SUPERSONIC_METAL_PROFILE=1` forces every FFN
+   sub-phase into a separately waited command buffer. Qwen3.6 FFN Metal profile
+   runs now keep the candidate stage aggregate by default, preserving the
+   stable outer profile ops such as `qwen36_ffn_int4_stage5`,
+   `qwen36_ffn_int4_stage5_with_router`, and
+   `qwen36_batched_prefill_grouped_expert_direct` without converting the
+   profile pass into a phase-split benchmark. The slower phase-attribution
+   behavior remains available with
+   `SUPERSONIC_METAL_PROFILE_QWEN36_FFN_PHASES=1` stacked on
+   `SUPERSONIC_METAL_PROFILE=1`, and the fused-routed sweep exposes that as
+   `--metal-profile-phases` for explicit attribution refreshes. The phase smoke
+   confirmed those rows still work: `full-stage5-router` emitted GPU totals for
+   `qwen36_ffn_int4_router_topk_stage5` (`12.470 ms`), expert gate/up
+   (`6.275 ms`), expert down/finalize (`5.517 ms`), and the shared phases.
+   This lets the promotion gate judge the fused FFN candidate with profiling
+   enabled while still keeping per-phase GPU timestamps available for
+   root-cause runs.
 
 ## Sources
 

@@ -87,7 +87,7 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
 
     def test_build_env_overrides_for_fused_modes(self):
         script = sweep_qwen36_fused_routed_int4
-        args = Namespace(metal_profile=True)
+        args = Namespace(metal_profile=True, metal_profile_phases=False)
 
         direct = script.build_env_overrides(args, "direct-gather")
         gpu_pack = script.build_env_overrides(args, "gpu-pack")
@@ -96,6 +96,7 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
         default = script.build_env_overrides(args, "default")
 
         self.assertEqual(direct["SUPERSONIC_METAL_PROFILE"], "1")
+        self.assertNotIn("SUPERSONIC_METAL_PROFILE_QWEN36_FFN_PHASES", direct)
         self.assertEqual(
             direct["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_DIRECT_GATHER_STAGE5"],
             "1",
@@ -120,6 +121,10 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
             full_stage5_router["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"],
             "1",
         )
+
+        phase_args = Namespace(metal_profile=True, metal_profile_phases=True)
+        phase_default = script.build_env_overrides(phase_args, "default")
+        self.assertEqual(phase_default["SUPERSONIC_METAL_PROFILE_QWEN36_FFN_PHASES"], "1")
 
     def test_promotion_gate_passes_only_real_improvements(self):
         script = sweep_qwen36_fused_routed_int4
@@ -168,6 +173,7 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
             max_new_tokens=2,
             context_size=64,
             metal_profile=True,
+            metal_profile_phases=False,
             promotion_max_headline_ratio=0.999,
             promotion_max_ffn_ratio=0.999,
             promotion_max_component_regression_ratio=1.10,

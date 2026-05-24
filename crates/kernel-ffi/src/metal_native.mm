@@ -709,6 +709,10 @@ int encode_blit_copy_or_submit(
     return 0;
 }
 
+bool qwen36_ffn_phase_profile_enabled() {
+    return NSProcessInfo.processInfo.environment[@"SUPERSONIC_METAL_PROFILE_QWEN36_FFN_PHASES"] != nil;
+}
+
 void configure_precise_math(MTLCompileOptions* options) {
     if (@available(macOS 15.0, *)) {
         options.mathMode = MTLMathModeSafe;
@@ -12294,7 +12298,7 @@ extern "C" int supersonic_metal_qwen36_batched_ffn_grouped_expert_direct(
                     threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         };
 
-        bool split_profile = NSProcessInfo.processInfo.environment[@"SUPERSONIC_METAL_PROFILE"] != nil;
+        bool split_profile = qwen36_ffn_phase_profile_enabled();
         if (split_profile) {
             if ((status = encode_or_submit_labeled(
                     encode_gate_up,
@@ -12871,7 +12875,7 @@ extern "C" int supersonic_metal_qwen36_ffn_int4_stage5(
                     threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
         };
 
-        bool split_profile = NSProcessInfo.processInfo.environment[@"SUPERSONIC_METAL_PROFILE"] != nil;
+        bool split_profile = qwen36_ffn_phase_profile_enabled();
         if (split_profile) {
             if ((status = encode_or_submit_labeled(encode_shared_gate_up, "qwen36_ffn_int4_shared_gate_up", 983, 984, 985, 986)) != 0) return status;
             if ((status = encode_or_submit_labeled(encode_shared_scalar, "qwen36_ffn_int4_shared_gate_scalar", 987, 988, 989, 990)) != 0) return status;
@@ -13184,7 +13188,7 @@ extern "C" int supersonic_metal_qwen36_ffn_int4_stage5_with_router(
                     threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         };
 
-        bool split_profile = NSProcessInfo.processInfo.environment[@"SUPERSONIC_METAL_PROFILE"] != nil;
+        bool split_profile = qwen36_ffn_phase_profile_enabled();
         if (split_profile) {
             if ((status = encode_or_submit_labeled(encode_router, "qwen36_ffn_int4_router_topk_stage5", 1416, 1417, 1418, 1419)) != 0) return status;
             if ((status = encode_or_submit_labeled(encode_shared_gate_up, "qwen36_ffn_int4_shared_gate_up", 1420, 1421, 1422, 1423)) != 0) return status;

@@ -343,7 +343,11 @@ Metal currently rejects or defers:
   `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_GPU_PACK_STAGE5=1`. It keeps the
   CPU out of the per-token copy loop and remaps top-k expert IDs inside the
   same Metal command buffer, but remains diagnostic-only because the measured
-  wall time is worse than the CPU pack path on this machine. Profile runs emit
+  wall time is worse than the CPU pack path on this machine. Profile runs keep
+  Qwen3.6 FFN candidate stages aggregate by default; set
+  `SUPERSONIC_METAL_PROFILE_QWEN36_FFN_PHASES=1` with
+  `SUPERSONIC_METAL_PROFILE=1` only when you need per-phase FFN command-buffer
+  attribution and accept the extra waited submits. Profile runs emit
   `[qwen36-expert-residency]` and `[qwen36-expert-residency-policy]`; set
   `SUPERSONIC_QWEN36_EXPERT_RESIDENCY_PROFILE=1` to collect the same residency
   counters without enabling the full Metal/HAL profile tables. The one-token
