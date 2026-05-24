@@ -1375,6 +1375,49 @@ under the same smoke:
    tap can distinguish true shared arithmetic drift from batch tap/reference
    sequencing should the shared tiled probes be reconsidered for promotion.
 
+40. **Qwen3.6 decode-batch shared parity tap**
+   The decode-batch lane now has the batch-native shared-expert tap called for
+   in section 39. When `--shared-parity-tap` is used, the sweep sets both the
+   original non-batch env and
+   `SUPERSONIC_METAL_QWEN36_DECODE_BATCH_SHARED_STAGE5_PARITY_TAP=1`. During a
+   Metal decode batch, the runtime suppresses the old live-buffer shared tap,
+   enqueues D2D snapshots of the exact FFN input row and FFN workspace after
+   each native stage-5 router call, and emits
+   `[qwen36-decode-batch-shared-parity]` after the batch flush. The fused
+   routed sweep schema is now `v16` and records those rows under
+   `decode_batch_shared_parity`.
+
+   The one-token smoke,
+   `--modes default,full-stage5-router-simd-batch-shared-tiled
+   --max-new-tokens 1 --shared-parity-tap --shared-parity-tap-max-calls 80`,
+   passed with `rows=2`, `ok=2`, and matching generated IDs. The old
+   non-batch `shared_parity` summary stayed empty in the batch row, while the
+   new decode-batch tap captured `40` rows on `all_tiled` with
+   `max_shared_gate_abs=8.58e-6`, `max_shared_up_abs=7.63e-6`,
+   `max_shared_mid_abs=4.96e-5`, `max_shared_scalar_abs=2.98e-7`, and
+   `max_shared_out_abs=2.44e-4`.
+
+   The four-token repeat,
+   `--max-new-tokens 4 --shared-parity-tap --shared-parity-tap-max-calls 160`,
+   reproduced the previous correctness failure:
+   default generated `[11,271,40,599]`, while
+   `full-stage5-router-simd-batch-shared-tiled` generated
+   `[11,353,599,264]`. However, the new batch-native shared tap remained
+   tight over `160` captured layer/token rows:
+   `max_shared_gate_abs=1.57e-4`, `max_shared_up_abs=1.59e-4`,
+   `max_shared_mid_abs=7.23e-5`, `max_shared_scalar_abs=9.02e-7`, and
+   `max_shared_out_abs=2.44e-4`.
+
+   This changes the next target. The shared tiled path is still not a
+   promotion candidate because the four-token IDs diverge and the profiled row
+   remains slower (`decode_ms=1630`, `qwen36_decode_batch=1146.375 ms`,
+   `command_buffer_wait=1201.580 ms`). But the batch-native evidence no longer
+   points at shared-expert arithmetic as the primary correctness gap. The next
+   probe should move downstream: capture per-token final hidden and/or lm-head
+   logits for decode-batch versus the default chained path, then bisect whether
+   the divergence appears before FFN finalize, in residual accumulation, or at
+   lm-head/sampling.
+
 ## Sources
 
 - [Qwen/Qwen3.6-35B-A3B model card](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)

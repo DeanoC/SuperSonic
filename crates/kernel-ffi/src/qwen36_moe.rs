@@ -3904,6 +3904,7 @@ fn qwen36_ffn_router_stage5_parity_tap_enabled() -> bool {
 fn qwen36_ffn_shared_stage5_parity_tap_enabled() -> bool {
     std::env::var_os("SUPERSONIC_METAL_QWEN36_FFN_SHARED_STAGE5_PARITY_TAP").is_some()
         && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
+        && !crate::prefill_ffi::metal_batch_is_active()
 }
 
 fn qwen36_ffn_router_stage5_simd_env_enabled() -> bool {
@@ -4342,6 +4343,152 @@ fn qwen36_emit_ffn_shared_stage5_parity_tap(
         shared_mid_argmax,
         shared_scalar_abs,
         reference.shared_scalar,
+        shared_scalar,
+        shared_out_max_abs,
+        shared_out_argmax,
+        host_shared_out_at_argmax,
+        metal_shared_out_at_argmax,
+    );
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn emit_decode_batch_shared_stage5_parity_tap_from_host(
+    call: usize,
+    position: i32,
+    cache_pos: i32,
+    layer_idx: i32,
+    router_path: &str,
+    phase_profile: bool,
+    input: &[u16],
+    workspace: &[f32],
+    params: Qwen36MoeFfnStepParams,
+    weights: &Qwen36MoeFfnStepWeights,
+    int4: &Qwen36MoeFfnStepInt4,
+) -> Result<(), GpuError> {
+    if params.stage != 5 {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::emit_decode_batch_shared_stage5_parity_tap_from_host requires stage 5, got {}",
+            params.stage
+        )));
+    }
+    if int4.group_size < 0 {
+        return Err(GpuError::InvalidArg(
+            "qwen36_moe::emit_decode_batch_shared_stage5_parity_tap_from_host does not support FP8 sidecars"
+                .into(),
+        ));
+    }
+    if !qwen36_ffn_int4_stage5_router_metal_native_supported(params, weights, int4) {
+        return Err(GpuError::InvalidArg(
+            "qwen36_moe::emit_decode_batch_shared_stage5_parity_tap_from_host requires the Qwen3.6 Metal INT4 router stage-5 path"
+                .into(),
+        ));
+    }
+
+    let hidden = params.hidden as usize;
+    let num_experts = params.num_experts as usize;
+    let shared_intermediate = params.shared_intermediate as usize;
+    let top_k = params.top_k as usize;
+    let off_router_logits = hidden;
+    let off_router_probs = hidden + num_experts;
+    let off_topk_val = off_router_probs + num_experts;
+    let off_topk_idx = off_topk_val + top_k;
+    let off_sg_scalar = off_topk_idx + top_k;
+    let off_sgp = off_sg_scalar + 1;
+    let off_sup = off_sgp + shared_intermediate;
+    let off_shared_mid = off_sup + shared_intermediate;
+    let off_shared_out = off_shared_mid + shared_intermediate;
+    let workspace_needed = off_shared_out + hidden;
+
+    if input.len() < hidden {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::emit_decode_batch_shared_stage5_parity_tap_from_host input too small: need {hidden}, got {}",
+            input.len()
+        )));
+    }
+    if workspace.len() < workspace_needed {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::emit_decode_batch_shared_stage5_parity_tap_from_host workspace too small: need {workspace_needed}, got {}",
+            workspace.len()
+        )));
+    }
+
+    let norm_w =
+        unsafe { std::slice::from_raw_parts(weights.post_attn_norm_w as *const u16, hidden) };
+    let gate_w =
+        unsafe { std::slice::from_raw_parts(weights.gate_w as *const u16, num_experts * hidden) };
+    let router_reference = qwen36_compute_ffn_router_reference(
+        &input[..hidden],
+        norm_w,
+        gate_w,
+        hidden,
+        num_experts,
+        top_k,
+        params.rms_norm_eps,
+    );
+
+    let shared_expert_gate_w =
+        unsafe { std::slice::from_raw_parts(weights.shared_expert_gate_w as *const u16, hidden) };
+    let shared_reference = qwen36_compute_ffn_shared_reference(
+        &router_reference.h_norm,
+        shared_expert_gate_w,
+        weights.shared_gate_proj_w as usize,
+        int4.shared_gate_proj_scale as usize,
+        int4.shared_gate_proj_zero as usize,
+        weights.shared_up_proj_w as usize,
+        int4.shared_up_proj_scale as usize,
+        int4.shared_up_proj_zero as usize,
+        weights.shared_down_proj_w as usize,
+        int4.shared_down_proj_scale as usize,
+        int4.shared_down_proj_zero as usize,
+        hidden,
+        shared_intermediate,
+        int4.group_size.max(0) as usize,
+    );
+
+    let shared_gate = &workspace[off_sgp..off_sgp + shared_intermediate];
+    let shared_up = &workspace[off_sup..off_sup + shared_intermediate];
+    let shared_mid = &workspace[off_shared_mid..off_shared_mid + shared_intermediate];
+    let shared_out = &workspace[off_shared_out..off_shared_out + hidden];
+    let shared_scalar = workspace[off_sg_scalar];
+
+    let (shared_gate_max_abs, shared_gate_argmax) =
+        qwen36_max_abs_delta(&shared_reference.shared_gate, shared_gate);
+    let (shared_up_max_abs, shared_up_argmax) =
+        qwen36_max_abs_delta(&shared_reference.shared_up, shared_up);
+    let (shared_mid_max_abs, shared_mid_argmax) =
+        qwen36_max_abs_delta(&shared_reference.shared_mid, shared_mid);
+    let (shared_out_max_abs, shared_out_argmax) =
+        qwen36_max_abs_delta(&shared_reference.shared_out, shared_out);
+    let shared_scalar_abs = (shared_reference.shared_scalar - shared_scalar).abs();
+    let host_shared_out_at_argmax = shared_reference
+        .shared_out
+        .get(shared_out_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let metal_shared_out_at_argmax = shared_out
+        .get(shared_out_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
+
+    eprintln!(
+        "[qwen36-decode-batch-shared-parity] call={} position={} cache_pos={} layer={} router_path={} phase_profile={} shared_path={} shared_gate_max_abs={:.8e} shared_gate_argmax={} shared_up_max_abs={:.8e} shared_up_argmax={} shared_mid_max_abs={:.8e} shared_mid_argmax={} shared_scalar_abs={:.8e} host_shared_scalar={:.8e} metal_shared_scalar={:.8e} shared_out_max_abs={:.8e} shared_out_argmax={} host_shared_out_at_argmax={:.8e} metal_shared_out_at_argmax={:.8e}",
+        call,
+        position,
+        cache_pos,
+        layer_idx,
+        router_path,
+        phase_profile as u8,
+        qwen36_ffn_shared_stage5_path_label(),
+        shared_gate_max_abs,
+        shared_gate_argmax,
+        shared_up_max_abs,
+        shared_up_argmax,
+        shared_mid_max_abs,
+        shared_mid_argmax,
+        shared_scalar_abs,
+        shared_reference.shared_scalar,
         shared_scalar,
         shared_out_max_abs,
         shared_out_argmax,

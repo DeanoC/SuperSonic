@@ -15,7 +15,7 @@ from typing import Any
 
 
 MODEL = "qwen3.6-35b-a3b"
-SCHEMA = "qwen36-fused-routed-int4-sweep-v15"
+SCHEMA = "qwen36-fused-routed-int4-sweep-v16"
 DEFAULT_MAX_FUSED_WALL_GPU_RATIO = 4.0
 DEFAULT_MAX_WAIT_GPU_RATIO = 4.0
 COARSE_BATCH_SERIAL_MODE = "full-stage5-router-batch"
@@ -442,6 +442,19 @@ def parse_shared_parity_taps(output: str) -> list[dict[str, Any]]:
     return rows
 
 
+def parse_decode_batch_shared_parity_taps(output: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for line in output.splitlines():
+        if not line.startswith("[qwen36-decode-batch-shared-parity]"):
+            continue
+        fields = {
+            key: parse_number(value)
+            for key, value in parse_key_values(line).items()
+        }
+        rows.append(fields)
+    return rows
+
+
 def parse_decode_batch_route_snapshots(output: str) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for line in output.splitlines():
@@ -494,11 +507,14 @@ def summarize_router_parity_taps(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def summarize_shared_parity_taps(rows: list[dict[str, Any]]) -> dict[str, Any]:
+def summarize_shared_parity_taps(
+    rows: list[dict[str, Any]],
+    field: str = "shared_parity_taps",
+) -> dict[str, Any]:
     taps = [
         tap
         for row in rows
-        for tap in (row.get("shared_parity_taps") or [])
+        for tap in (row.get(field) or [])
     ]
     paths = sorted({str(tap.get("shared_path") or "-") for tap in taps})
 
@@ -728,11 +744,15 @@ def build_env_overrides(args: argparse.Namespace, mode: str) -> dict[str, str]:
             )
     if getattr(args, "shared_parity_tap", False):
         overrides["SUPERSONIC_METAL_QWEN36_FFN_SHARED_STAGE5_PARITY_TAP"] = "1"
+        overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH_SHARED_STAGE5_PARITY_TAP"] = "1"
         max_calls = getattr(args, "shared_parity_tap_max_calls", None)
         if max_calls:
             overrides["SUPERSONIC_METAL_QWEN36_FFN_SHARED_STAGE5_PARITY_TAP_MAX_CALLS"] = str(
                 max_calls
             )
+            overrides[
+                "SUPERSONIC_METAL_QWEN36_DECODE_BATCH_SHARED_STAGE5_PARITY_TAP_MAX_CALLS"
+            ] = str(max_calls)
     if getattr(args, "decode_batch_route_snapshot", False):
         overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH_ROUTE_SNAPSHOT"] = "1"
     if mode == "packed":
@@ -1133,6 +1153,7 @@ def run_row(args: argparse.Namespace, prompt_id: str, prompt: str, mode: str) ->
             "hal_profile": parse_profile(output, "[hal-profile]", "[hal-profile-op]"),
             "router_parity_taps": parse_router_parity_taps(output),
             "shared_parity_taps": parse_shared_parity_taps(output),
+            "decode_batch_shared_parity_taps": parse_decode_batch_shared_parity_taps(output),
             "decode_batch_route_snapshots": parse_decode_batch_route_snapshots(output),
             "output_tail": output_tail(output),
         }
@@ -1159,6 +1180,7 @@ def run_row(args: argparse.Namespace, prompt_id: str, prompt: str, mode: str) ->
             "hal_profile": parse_profile(output, "[hal-profile]", "[hal-profile-op]"),
             "router_parity_taps": parse_router_parity_taps(output),
             "shared_parity_taps": parse_shared_parity_taps(output),
+            "decode_batch_shared_parity_taps": parse_decode_batch_shared_parity_taps(output),
             "decode_batch_route_snapshots": parse_decode_batch_route_snapshots(output),
             "fused_op_ms": None,
             "output_tail": output_tail(output),
@@ -1773,6 +1795,10 @@ def build_report(
     )
     summary["router_parity"] = summarize_router_parity_taps(rows)
     summary["shared_parity"] = summarize_shared_parity_taps(rows)
+    summary["decode_batch_shared_parity"] = summarize_shared_parity_taps(
+        rows,
+        "decode_batch_shared_parity_taps",
+    )
     summary["decode_batch_route_snapshot"] = summarize_decode_batch_route_snapshots(rows)
     return {
         "schema": SCHEMA,
@@ -1820,6 +1846,7 @@ def render_markdown(report: dict[str, Any]) -> str:
     ffn_gap = summary.get("ffn_residency_gap") or {}
     router_parity = summary.get("router_parity") or {}
     shared_parity = summary.get("shared_parity") or {}
+    decode_batch_shared_parity = summary.get("decode_batch_shared_parity") or {}
     route_snapshot = summary.get("decode_batch_route_snapshot") or {}
     decode_batch_coarse = summary.get("decode_batch_coarse") or {}
     deferred_phase = summary.get("decode_batch_deferred_phase") or {}
@@ -1846,6 +1873,8 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- router_parity_mismatches: `{router_parity.get('mismatch_count', 0)}`",
         f"- shared_parity_tap_count: `{shared_parity.get('tap_count', 0)}`",
         f"- shared_parity_max_out_abs: `{render_float(shared_parity.get('max_shared_out_abs'), 8)}`",
+        f"- decode_batch_shared_parity_tap_count: `{decode_batch_shared_parity.get('tap_count', 0)}`",
+        f"- decode_batch_shared_parity_max_out_abs: `{render_float(decode_batch_shared_parity.get('max_shared_out_abs'), 8)}`",
         f"- decode_batch_route_snapshot_count: `{route_snapshot.get('snapshot_count', 0)}`",
         f"- decode_batch_route_snapshot_mismatches: `{route_snapshot.get('mismatch_count', 0)}`",
         "",
@@ -2157,6 +2186,44 @@ def render_markdown(report: dict[str, Any]) -> str:
                     up_idx=tap.get("shared_up_argmax", "-"),
                     mid=render_float(tap.get("shared_mid_max_abs"), 8),
                     mid_idx=tap.get("shared_mid_argmax", "-"),
+                    scalar=render_float(tap.get("shared_scalar_abs"), 8),
+                    out=render_float(tap.get("shared_out_max_abs"), 8),
+                    out_idx=tap.get("shared_out_argmax", "-"),
+                    host_out=render_float(tap.get("host_shared_out_at_argmax"), 8),
+                    metal_out=render_float(tap.get("metal_shared_out_at_argmax"), 8),
+                )
+            )
+    decode_batch_shared_tap_rows: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for row in report["rows"]:
+        for tap in row.get("decode_batch_shared_parity_taps") or []:
+            decode_batch_shared_tap_rows.append((row, tap))
+    if decode_batch_shared_tap_rows:
+        lines.extend(
+            [
+                "",
+                "## Decode-Batch Shared Expert Parity Tap",
+                "",
+                "| Prompt | Mode | Router | Phase profile | Path | Call | Position | Layer | Gate max | Up max | Mid max | Scalar max | Shared out max | Shared out idx | Host out | Metal out |",
+                "|:---|:---|:---|:---|:---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+            ]
+        )
+        for row, tap in select_shared_parity_tap_rows(
+            decode_batch_shared_tap_rows,
+            limit=40,
+        ):
+            lines.append(
+                "| {prompt} | {mode} | {router} | {phase} | {path} | {call} | {position} | {layer} | {gate} | {up} | {mid} | {scalar} | {out} | {out_idx} | {host_out} | {metal_out} |".format(
+                    prompt=row.get("prompt_id", ""),
+                    mode=row.get("mode", ""),
+                    router=tap.get("router_path", "-"),
+                    phase=str(bool(tap.get("phase_profile"))).lower(),
+                    path=tap.get("shared_path", "-"),
+                    call=tap.get("call", "-"),
+                    position=tap.get("position", "-"),
+                    layer=tap.get("layer", "-"),
+                    gate=render_float(tap.get("shared_gate_max_abs"), 8),
+                    up=render_float(tap.get("shared_up_max_abs"), 8),
+                    mid=render_float(tap.get("shared_mid_max_abs"), 8),
                     scalar=render_float(tap.get("shared_scalar_abs"), 8),
                     out=render_float(tap.get("shared_out_max_abs"), 8),
                     out_idx=tap.get("shared_out_argmax", "-"),
