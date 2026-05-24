@@ -823,6 +823,11 @@ bool qwen36_ffn_shared_gate_up_tiled_enabled() {
         NSProcessInfo.processInfo.environment[@"SUPERSONIC_METAL_ENABLE_QWEN36_FFN_SHARED_GATE_UP_TILED"] != nil;
 }
 
+bool qwen36_ffn_shared_gate_up_exp2_enabled() {
+    return !qwen36_ffn_shared_gate_up_tiled_enabled() &&
+        NSProcessInfo.processInfo.environment[@"SUPERSONIC_METAL_ENABLE_QWEN36_FFN_SHARED_GATE_UP_EXP2"] != nil;
+}
+
 bool qwen36_ffn_shared_scalar_simd_enabled() {
     return qwen36_ffn_shared_all_tiled_enabled() ||
         NSProcessInfo.processInfo.environment[@"SUPERSONIC_METAL_ENABLE_QWEN36_FFN_SHARED_SCALAR_SIMD"] != nil;
@@ -2702,6 +2707,7 @@ struct Qwen36FfnInt4Pipelines {
     __strong id<MTLComputePipelineState> router_logits_simd_stage5 = nil;
     __strong id<MTLComputePipelineState> router_topk_stage5_from_logits = nil;
     __strong id<MTLComputePipelineState> shared_gate_up = nil;
+    __strong id<MTLComputePipelineState> shared_gate_up_exp2 = nil;
     __strong id<MTLComputePipelineState> shared_gate_up_tiled = nil;
     __strong id<MTLComputePipelineState> shared_scalar = nil;
     __strong id<MTLComputePipelineState> shared_scalar_simd = nil;
@@ -2807,6 +2813,10 @@ inline float bf16_round_rne_finite(float x) {
 
 inline float silu(float x) {
     return x * (1.0f / (1.0f + exp(-x)));
+}
+
+inline float silu_exp2(float x) {
+    return x * (1.0f / (1.0f + exp2(-x * 1.4426950408889634f)));
 }
 
 inline float int4_weight_2d(
@@ -3242,6 +3252,37 @@ kernel void supersonic_qwen36_ffn_shared_gate_up(
         workspace[params.off_sgp + row] = gate;
         workspace[params.off_sup + row] = up;
         workspace[params.off_shared_mid + row] = silu(gate) * up;
+    }
+}
+
+kernel void supersonic_qwen36_ffn_shared_gate_up_exp2(
+    device float* workspace [[buffer(0)]],
+    device const uchar* shared_gate_proj [[buffer(1)]],
+    device const bfloat* shared_gate_scale [[buffer(2)]],
+    device const bfloat* shared_gate_zero [[buffer(3)]],
+    device const uchar* shared_up_proj [[buffer(4)]],
+    device const bfloat* shared_up_scale [[buffer(5)]],
+    device const bfloat* shared_up_zero [[buffer(6)]],
+    constant Qwen36FfnInt4Params& params [[buffer(7)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_position_in_threadgroup]]
+) {
+    if (row >= params.shared_intermediate) {
+        return;
+    }
+    if (lane == 0) {
+        device const float* h_norm = workspace + params.off_h_norm;
+        float gate = int4_dot_2d_host_order(
+            shared_gate_proj, shared_gate_scale, shared_gate_zero,
+            h_norm, row, params.hidden, params.group_size
+        );
+        float up = int4_dot_2d_host_order(
+            shared_up_proj, shared_up_scale, shared_up_zero,
+            h_norm, row, params.hidden, params.group_size
+        );
+        workspace[params.off_sgp + row] = gate;
+        workspace[params.off_sup + row] = up;
+        workspace[params.off_shared_mid + row] = silu_exp2(gate) * up;
     }
 }
 
@@ -3978,6 +4019,7 @@ kernel void supersonic_qwen36_ffn_mps_transcode_down_lut(
                         @"supersonic_qwen36_ffn_router_logits_simd_stage5",
                         @"supersonic_qwen36_ffn_router_topk_stage5_from_logits",
                         @"supersonic_qwen36_ffn_shared_gate_up",
+                        @"supersonic_qwen36_ffn_shared_gate_up_exp2",
                         @"supersonic_qwen36_ffn_shared_gate_up_tiled",
                         @"supersonic_qwen36_ffn_shared_scalar",
                         @"supersonic_qwen36_ffn_shared_scalar_simd",
@@ -4035,6 +4077,8 @@ kernel void supersonic_qwen36_ffn_mps_transcode_down_lut(
                             pipelines.router_topk_stage5_from_logits = pipeline;
                         } else if ([name isEqualToString:@"supersonic_qwen36_ffn_shared_gate_up"]) {
                             pipelines.shared_gate_up = pipeline;
+                        } else if ([name isEqualToString:@"supersonic_qwen36_ffn_shared_gate_up_exp2"]) {
+                            pipelines.shared_gate_up_exp2 = pipeline;
                         } else if ([name isEqualToString:@"supersonic_qwen36_ffn_shared_gate_up_tiled"]) {
                             pipelines.shared_gate_up_tiled = pipeline;
                         } else if ([name isEqualToString:@"supersonic_qwen36_ffn_shared_scalar"]) {
@@ -4085,7 +4129,8 @@ kernel void supersonic_qwen36_ffn_mps_transcode_down_lut(
     bool ok = pipelines.router_topk != nil && pipelines.router_stage5 != nil &&
         pipelines.router_norm_stage5 != nil && pipelines.router_logits_simd_stage5 != nil &&
         pipelines.router_topk_stage5_from_logits != nil &&
-        pipelines.shared_gate_up != nil && pipelines.shared_gate_up_tiled != nil &&
+        pipelines.shared_gate_up != nil && pipelines.shared_gate_up_exp2 != nil &&
+        pipelines.shared_gate_up_tiled != nil &&
         pipelines.shared_scalar != nil && pipelines.shared_scalar_simd != nil &&
         pipelines.shared_down != nil && pipelines.shared_down_tiled != nil &&
         pipelines.expert_gate_up != nil && pipelines.expert_gate_up_tiled != nil &&
@@ -13248,12 +13293,14 @@ extern "C" int supersonic_metal_qwen36_ffn_int4_stage5(
         NSError* pipeline_error = nil;
         Qwen36FfnInt4Pipelines pipelines = qwen36_ffn_int4_pipelines(&pipeline_error);
         bool shared_gate_up_tiled = qwen36_ffn_shared_gate_up_tiled_enabled();
+        bool shared_gate_up_exp2 = qwen36_ffn_shared_gate_up_exp2_enabled();
         bool shared_scalar_simd = qwen36_ffn_shared_scalar_simd_enabled();
         bool shared_down_tiled = qwen36_ffn_shared_down_tiled_enabled();
         bool expert_gate_up_host_order = qwen36_ffn_expert_gate_up_host_order_enabled();
         if (pipelines.shared_gate_up == nil || pipelines.shared_scalar == nil ||
             pipelines.shared_down == nil || pipelines.expert_gate_up_tiled == nil ||
             pipelines.expert_down_finalize == nil ||
+            (shared_gate_up_exp2 && pipelines.shared_gate_up_exp2 == nil) ||
             (shared_gate_up_tiled && pipelines.shared_gate_up_tiled == nil) ||
             (shared_scalar_simd && pipelines.shared_scalar_simd == nil) ||
             (shared_down_tiled && pipelines.shared_down_tiled == nil) ||
@@ -13370,7 +13417,10 @@ extern "C" int supersonic_metal_qwen36_ffn_int4_stage5(
         };
 
         auto encode_shared_gate_up = [&](id<MTLComputeCommandEncoder> encoder) {
-            [encoder setComputePipelineState:shared_gate_up_tiled ? pipelines.shared_gate_up_tiled : pipelines.shared_gate_up];
+            id<MTLComputePipelineState> pipeline = shared_gate_up_tiled
+                ? pipelines.shared_gate_up_tiled
+                : (shared_gate_up_exp2 ? pipelines.shared_gate_up_exp2 : pipelines.shared_gate_up);
+            [encoder setComputePipelineState:pipeline];
             [encoder setBuffer:workspace offset:workspace_offset atIndex:0];
             [encoder setBuffer:shared_gate_proj offset:shared_gate_proj_offset atIndex:1];
             [encoder setBuffer:shared_gate_scale offset:shared_gate_scale_offset atIndex:2];
@@ -13453,7 +13503,10 @@ extern "C" int supersonic_metal_qwen36_ffn_int4_stage5(
                 }
                 return flush_metal_batch_after_qwen36_ffn_profile_phase();
             };
-            if ((status = submit_profile_phase(encode_shared_gate_up, "qwen36_ffn_int4_shared_gate_up", 983, 984, 985, 986)) != 0) return status;
+            const std::string shared_gate_label = shared_gate_up_exp2
+                ? "qwen36_ffn_int4_shared_gate_up_exp2"
+                : "qwen36_ffn_int4_shared_gate_up";
+            if ((status = submit_profile_phase(encode_shared_gate_up, shared_gate_label, 983, 984, 985, 986)) != 0) return status;
             if ((status = submit_profile_phase(encode_shared_scalar, "qwen36_ffn_int4_shared_gate_scalar", 987, 988, 989, 990)) != 0) return status;
             if ((status = submit_profile_phase(encode_shared_down, "qwen36_ffn_int4_shared_down", 991, 992, 993, 994)) != 0) return status;
             const std::string expert_gate_label = expert_gate_up_host_order
@@ -13566,6 +13619,7 @@ extern "C" int supersonic_metal_qwen36_ffn_int4_stage5_with_router(
         Qwen36FfnInt4Pipelines pipelines = qwen36_ffn_int4_pipelines(&pipeline_error);
         bool router_simd = qwen36_ffn_router_stage5_simd_enabled();
         bool shared_gate_up_tiled = qwen36_ffn_shared_gate_up_tiled_enabled();
+        bool shared_gate_up_exp2 = qwen36_ffn_shared_gate_up_exp2_enabled();
         bool shared_scalar_simd = qwen36_ffn_shared_scalar_simd_enabled();
         bool shared_down_tiled = qwen36_ffn_shared_down_tiled_enabled();
         bool expert_gate_up_host_order = qwen36_ffn_expert_gate_up_host_order_enabled();
@@ -13577,6 +13631,7 @@ extern "C" int supersonic_metal_qwen36_ffn_int4_stage5_with_router(
             pipelines.shared_scalar == nil || pipelines.shared_down == nil ||
             pipelines.expert_gate_up_tiled == nil ||
             pipelines.expert_down_finalize == nil ||
+            (shared_gate_up_exp2 && pipelines.shared_gate_up_exp2 == nil) ||
             (shared_gate_up_tiled && pipelines.shared_gate_up_tiled == nil) ||
             (shared_scalar_simd && pipelines.shared_scalar_simd == nil) ||
             (shared_down_tiled && pipelines.shared_down_tiled == nil) ||
@@ -13743,7 +13798,10 @@ extern "C" int supersonic_metal_qwen36_ffn_int4_stage5_with_router(
             }
         };
         auto encode_shared_gate_up = [&](id<MTLComputeCommandEncoder> encoder) {
-            [encoder setComputePipelineState:shared_gate_up_tiled ? pipelines.shared_gate_up_tiled : pipelines.shared_gate_up];
+            id<MTLComputePipelineState> pipeline = shared_gate_up_tiled
+                ? pipelines.shared_gate_up_tiled
+                : (shared_gate_up_exp2 ? pipelines.shared_gate_up_exp2 : pipelines.shared_gate_up);
+            [encoder setComputePipelineState:pipeline];
             [encoder setBuffer:workspace offset:workspace_offset atIndex:0];
             [encoder setBuffer:shared_gate_proj offset:shared_gate_proj_offset atIndex:1];
             [encoder setBuffer:shared_gate_scale offset:shared_gate_scale_offset atIndex:2];
@@ -13830,7 +13888,10 @@ extern "C" int supersonic_metal_qwen36_ffn_int4_stage5_with_router(
                 return flush_metal_batch_after_qwen36_ffn_profile_phase();
             };
             if ((status = submit_profile_phase(encode_router, router_profile_label, 1416, 1417, 1418, 1419)) != 0) return status;
-            if ((status = submit_profile_phase(encode_shared_gate_up, "qwen36_ffn_int4_shared_gate_up", 1420, 1421, 1422, 1423)) != 0) return status;
+            const std::string shared_gate_label = shared_gate_up_exp2
+                ? "qwen36_ffn_int4_shared_gate_up_exp2"
+                : "qwen36_ffn_int4_shared_gate_up";
+            if ((status = submit_profile_phase(encode_shared_gate_up, shared_gate_label, 1420, 1421, 1422, 1423)) != 0) return status;
             if ((status = submit_profile_phase(encode_shared_scalar, "qwen36_ffn_int4_shared_gate_scalar", 1424, 1425, 1426, 1427)) != 0) return status;
             if ((status = submit_profile_phase(encode_shared_down, "qwen36_ffn_int4_shared_down", 1428, 1429, 1430, 1431)) != 0) return status;
             const std::string expert_gate_label = expert_gate_up_host_order

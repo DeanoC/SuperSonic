@@ -2187,6 +2187,46 @@ under the same smoke:
    one-ulp BF16 boundary while continuing to fail hard on larger or non-localized
    drift.
 
+59. **Qwen3.6 shared-gate/up exp2 candidate**
+   The fused-routed sweep is now schema `v36`. It adds an env-gated shared-mid
+   implementation candidate,
+   `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_SHARED_GATE_UP_EXP2=1`, exposed through
+   the sweep mode `full-stage5-router-simd-batch-shared-gate-up-exp2`. The mode
+   keeps the normal host-order INT4 shared gate/up dot products, but computes
+   SiLU with an `exp2(-x * log2(e))` sigmoid inside
+   `supersonic_qwen36_ffn_shared_gate_up_exp2`. The shared parity path label is
+   `gate_up_exp2`, and Metal profiling can attribute the phase as
+   `qwen36_ffn_int4_shared_gate_up_exp2`.
+
+   Local validation passed:
+   `PYTHONPYCACHEPREFIX=/private/tmp/supersonic-pycache python3 -m py_compile
+   tests/metal/sweep_qwen36_fused_routed_int4.py
+   tests/test_qwen36_fused_routed_int4_sweep.py`,
+   `PYTHONPYCACHEPREFIX=/private/tmp/supersonic-pycache python3 -m unittest
+   tests.test_qwen36_fused_routed_int4_sweep`,
+   `cargo test -p kernel-ffi qwen36_moe --lib`, and
+   `cargo build --release -p runner --bin supersonic`. The focused Metal run
+   wrote `/private/tmp/qwen36_shared_gate_up_exp2_v36_1tok.{json,md}` with
+   `--modes default,full-stage5-router-simd-batch,full-stage5-router-simd-batch-shared-gate-up-exp2
+   --max-new-tokens 1 --context-size 64 --metal-profile --shared-parity-tap
+   --shared-parity-tap-max-calls 120 --routed-parity-tap
+   --routed-parity-tap-max-calls 120 --layer-output-tap
+   --layer-output-delta-tap --layer-output-delta-all
+   --no-promotion-require-profile`. All three rows ran and generated IDs matched
+   (`[11]`), but the promotion gate remained false.
+
+   The exp2 variant is therefore a retained negative probe, not a promotion
+   path. It reproduced the same first failure as the default decode-batch path:
+   layer `7` FFN, row `1621`, `max_abs_delta=0.00048828125`,
+   `max_ulp_delta=1`, source `shared_mid_to_shared_out_bf16_boundary`.
+   At the boundary row, shared gate/up still matched exactly while shared-mid
+   stayed lower by about `6e-8` (`0.336338878` versus `0.336338818`), and the
+   host recompute from Metal shared-mid still rounded to the Metal shared output
+   (`0.0123291016`) rather than the host shared output (`0.0123901367`). The
+   next correctness attempt needs a stronger host-compatible `expf`/division
+   contract or a targeted shared-mid correction probe; simply swapping Metal
+   `exp` for Metal `exp2` is insufficient.
+
 ## Sources
 
 - [Qwen/Qwen3.6-35B-A3B model card](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)

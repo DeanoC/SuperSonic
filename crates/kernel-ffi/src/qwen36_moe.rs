@@ -3952,16 +3952,19 @@ fn qwen36_ffn_shared_stage5_path_label() -> &'static str {
     let all = std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_SHARED_TILED").is_some();
     let gate_up = all
         || std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_SHARED_GATE_UP_TILED").is_some();
+    let gate_up_exp2 = !gate_up
+        && std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_SHARED_GATE_UP_EXP2").is_some();
     let scalar =
         all || std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_SHARED_SCALAR_SIMD").is_some();
     let down =
         all || std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_SHARED_DOWN_TILED").is_some();
-    match (gate_up, scalar, down) {
-        (true, true, true) => "all_tiled",
-        (true, false, false) => "gate_up_tiled",
-        (false, true, false) => "scalar_simd",
-        (false, false, true) => "down_tiled",
-        (false, false, false) => "host_order",
+    match (gate_up, gate_up_exp2, scalar, down) {
+        (true, false, true, true) => "all_tiled",
+        (true, false, false, false) => "gate_up_tiled",
+        (false, true, false, false) => "gate_up_exp2",
+        (false, false, true, false) => "scalar_simd",
+        (false, false, false, true) => "down_tiled",
+        (false, false, false, false) => "host_order",
         _ => "mixed",
     }
 }
