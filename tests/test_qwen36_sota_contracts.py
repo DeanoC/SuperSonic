@@ -35,6 +35,10 @@ mtp_sweep = load_script(
     "qwen36_sota_mtp_sweep",
     METAL_DIR / "sweep_qwen36_mtp_acceptance.py",
 )
+sota_summary = load_script(
+    "qwen36_sota_gate_summary",
+    METAL_DIR / "summarize_qwen36_sota_gates.py",
+)
 
 
 class Qwen36SotaContractTests(unittest.TestCase):
@@ -47,6 +51,28 @@ class Qwen36SotaContractTests(unittest.TestCase):
         self.assertEqual(static_sweep.SCHEMA, "qwen36-static-topn-runtime-sweep-v3")
         self.assertEqual(mps_probe.SCHEMA, "qwen36-mps-resident-table-probe-v2")
         self.assertEqual(mtp_sweep.SCHEMA, "qwen36-moe-mtp-acceptance-sweep-v2")
+        self.assertEqual(sota_summary.SCHEMA, "qwen36-sota-gate-summary-v1")
+
+    def test_sota_summary_tracks_current_gate_reports(self):
+        specs = {spec.gate_id: spec for spec in sota_summary.GATE_SPECS}
+
+        self.assertEqual(
+            specs["batched_prefill_variants"].expected_schema,
+            prefill_sweep.SCHEMA,
+        )
+        self.assertEqual(
+            specs["static_topn_runtime"].expected_schema,
+            static_sweep.SCHEMA,
+        )
+        self.assertEqual(
+            specs["mps_resident_table"].expected_schema,
+            mps_probe.SCHEMA,
+        )
+        self.assertEqual(
+            specs["mtp_acceptance"].expected_schema,
+            mtp_sweep.SCHEMA,
+        )
+        self.assertEqual(specs["mps_resident_table"].gate_keys, ("viability_gate",))
 
     def test_batched_prefill_variants_cover_documented_negative_gates(self):
         expected = {

@@ -540,6 +540,17 @@ under the same smoke:
    the coding prompt accepted 1/2. K=1 therefore remains an instrumentation path,
    not a policy-promotion candidate.
 
+8. **Qwen3.6 SOTA gate summary**
+   Preserve negative results as one roadmap-level artifact instead of leaving
+   the promotion/viability decisions scattered across individual JSON files.
+   `tests/metal/summarize_qwen36_sota_gates.py` reads the batched-prefill
+   variant sweep, static top-N runtime sweep, MPS resident-table probe, and MTP
+   acceptance sweep reports, then writes
+   `target/qwen36_sota_gate_summary.{json,md}`. The v1 schema records input
+   health, passed and failed gate IDs, candidate failures, and a single
+   `next_action`. Missing reports are nonfatal rows by default; `--require`
+   turns stale or absent gate artifacts into a failed validation run.
+
 ## Sources
 
 - [Qwen/Qwen3.6-35B-A3B model card](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)
