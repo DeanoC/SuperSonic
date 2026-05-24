@@ -1,5 +1,8 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
-use supersonic_bench::runs::{MetaJson, PerfCellJson, PerfStatus, RunDir};
+use supersonic_bench::runs::{
+    MetaJson, PerfCellJson, PerfStatus, Qwen36ExpertResidencyPolicyJson, RunDir,
+};
 
 #[test]
 fn meta_json_round_trip() {
@@ -46,6 +49,7 @@ fn perf_cell_json_status_variants() {
         qwen36_pack_cache: None,
         qwen36_expert_residency: None,
         qwen36_expert_residency_policies: None,
+        qwen36_expert_residency_policy_rows: None,
         metal_profile: None,
         hal_profile: None,
         gpu_temp_c_end: Some(60.0),
@@ -72,6 +76,58 @@ fn perf_cell_json_status_variants() {
     };
     let s = serde_json::to_string(&skipped).unwrap();
     assert!(s.contains("\"status\":\"skipped\""));
+}
+
+#[test]
+fn perf_cell_preserves_qwen36_expert_residency_policy_labels() {
+    let mut metrics = BTreeMap::new();
+    metrics.insert("calls".to_string(), 160.0);
+    metrics.insert("copied_bytes".to_string(), 2014248960.0);
+
+    let cell = PerfCellJson {
+        schema_version: 7,
+        model: "qwen3.6-35b-a3b".into(),
+        quant: "int4".into(),
+        arch: "apple-m5-max".into(),
+        backend: "metal".into(),
+        prompt: "The quick brown fox jumps over".into(),
+        max_new_tokens: 16,
+        status: PerfStatus::Ok {
+            ms_per_step: 150.6,
+            ms_per_tok: 150.6,
+            samples: vec![150.6],
+        },
+        stage_timings: None,
+        chain_breakdown: None,
+        lifecycle_timings: None,
+        mpp_pilot: None,
+        mps_expert_pilot: None,
+        qwen36_pack_cache: None,
+        qwen36_expert_residency: None,
+        qwen36_expert_residency_policies: None,
+        qwen36_expert_residency_policy_rows: Some(vec![Qwen36ExpertResidencyPolicyJson {
+            resident_format: "native_int4".into(),
+            scope: "per_layer".into(),
+            miss_policy: "exact_route".into(),
+            capacity: 8.0,
+            metrics,
+        }]),
+        metal_profile: None,
+        hal_profile: None,
+        gpu_temp_c_end: None,
+    };
+
+    let s = serde_json::to_string(&cell).unwrap();
+    assert!(s.contains("\"resident_format\":\"native_int4\""));
+    assert!(s.contains("\"miss_policy\":\"exact_route\""));
+
+    let parsed: PerfCellJson = serde_json::from_str(&s).unwrap();
+    let rows = parsed.qwen36_expert_residency_policy_rows.unwrap();
+    assert_eq!(rows[0].resident_format, "native_int4");
+    assert_eq!(rows[0].scope, "per_layer");
+    assert_eq!(rows[0].miss_policy, "exact_route");
+    assert_eq!(rows[0].capacity, 8.0);
+    assert_eq!(rows[0].metrics.get("copied_bytes"), Some(&2014248960.0));
 }
 
 #[test]

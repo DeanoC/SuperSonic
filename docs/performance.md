@@ -1121,10 +1121,12 @@ FP16 Metal Performance Shaders row for Qwen3.6 active-expert GEMV shapes. It
 also enables `SUPERSONIC_METAL_PROFILE=1` for the attribution run so the profile
 JSON includes `metal_profile` and `hal_profile` objects with parseable per-op
 rows. These are runtime-adjacent MPP/MPS pilot measurements, not model matmul
-replacements. The attribution maps are stored in the same schema-v6 perf JSON as
+replacements. The attribution maps are stored in the same schema-v7 perf JSON as
 `stage_timings`, `chain_breakdown`, `lifecycle_timings`, `mpp_pilot`,
 `mps_expert_pilot`, `metal_profile`, and `hal_profile` without feeding back into
-the headline median.
+the headline median. Schema v7 also preserves typed Qwen3.6 expert-residency
+policy rows with `resident_format`, `scope`, `miss_policy`, `capacity`, and the
+numeric counters so perf artifacts retain the scheduler identity.
 
 <!-- AUTOGEN BELOW: apple-m5-max-metal -->
 | Model           |  INT4 |
@@ -1390,7 +1392,7 @@ resident-matvec option if static full-hit rates are not high enough.
 
 The first MPS bridge step is now an attribution probe, not a decode path. With
 `SUPERSONIC_METAL_QWEN36_MPS_EXPERT_PILOT=1`, the runner appends a
-`[qwen36-moe mps-expert-pilot]` row and bench perf JSON schema v6 records it as
+`[qwen36-moe mps-expert-pilot]` row and bench perf JSON schema v7 records it as
 `mps_expert_pilot`. This probe uses resident FP16 MPSMatrix inputs shaped like
 the active-expert gate/up and down GEMVs; it does not consume the GPTQ INT4
 expert tensors. On a one-token M5 Max smoke, the model still generated `[11]`

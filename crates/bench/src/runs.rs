@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
-pub const SCHEMA_VERSION: u32 = 6;
+pub const SCHEMA_VERSION: u32 = 7;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetaJson {
@@ -64,10 +64,21 @@ pub struct PerfCellJson {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub qwen36_expert_residency_policies: Option<Vec<BTreeMap<String, f64>>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub qwen36_expert_residency_policy_rows: Option<Vec<Qwen36ExpertResidencyPolicyJson>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub metal_profile: Option<ProfileJson>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hal_profile: Option<ProfileJson>,
     pub gpu_temp_c_end: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Qwen36ExpertResidencyPolicyJson {
+    pub resident_format: String,
+    pub scope: String,
+    pub miss_policy: String,
+    pub capacity: f64,
+    pub metrics: BTreeMap<String, f64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

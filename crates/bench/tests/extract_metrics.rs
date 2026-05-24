@@ -111,6 +111,15 @@ fn extracts_qwen36_attribution_timing_maps() {
     let policies = timings.qwen36_expert_residency_policies.unwrap();
     assert_eq!(policies[0].get("capacity"), Some(&8.0));
     assert_eq!(policies[0].get("route_refills"), Some(&120.0));
+    let policy_rows = timings.qwen36_expert_residency_policy_rows.unwrap();
+    assert_eq!(policy_rows[0].resident_format, "native_int4");
+    assert_eq!(policy_rows[0].scope, "per_layer");
+    assert_eq!(policy_rows[0].miss_policy, "exact_route");
+    assert_eq!(policy_rows[0].capacity, 8.0);
+    assert_eq!(
+        policy_rows[0].metrics.get("copied_bytes"),
+        Some(&2014248960.0)
+    );
     let metal = timings.metal_profile.unwrap();
     assert_eq!(metal.summary.get("native_ms"), Some(&45.0));
     assert_eq!(metal.entries[0].op, "qwen36_ffn_int4_stage5");

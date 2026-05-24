@@ -1,4 +1,7 @@
-use crate::runs::{PerfCellJson, PerfStatus, ProfileEntryJson, ProfileJson, SCHEMA_VERSION};
+use crate::runs::{
+    PerfCellJson, PerfStatus, ProfileEntryJson, ProfileJson, Qwen36ExpertResidencyPolicyJson,
+    SCHEMA_VERSION,
+};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -22,6 +25,7 @@ pub struct AttributionTimings {
     pub qwen36_pack_cache: Option<BTreeMap<String, f64>>,
     pub qwen36_expert_residency: Option<BTreeMap<String, f64>>,
     pub qwen36_expert_residency_policies: Option<Vec<BTreeMap<String, f64>>>,
+    pub qwen36_expert_residency_policy_rows: Option<Vec<Qwen36ExpertResidencyPolicyJson>>,
     pub metal_profile: Option<ProfileJson>,
     pub hal_profile: Option<ProfileJson>,
 }
@@ -132,6 +136,14 @@ pub fn extract_attribution_timings(output: &str) -> AttributionTimings {
                 .collect();
             (!policies.is_empty()).then_some(policies)
         },
+        qwen36_expert_residency_policy_rows: {
+            let policies: Vec<_> = output
+                .lines()
+                .filter(|l| l.starts_with("[qwen36-expert-residency-policy]"))
+                .map(parse_qwen36_expert_residency_policy)
+                .collect();
+            (!policies.is_empty()).then_some(policies)
+        },
         metal_profile: extract_profile(output, "[metal-profile]", "[metal-profile-op]", true),
         hal_profile: extract_profile(output, "[hal-profile]", "[hal-profile-op]", false),
     }
@@ -158,6 +170,29 @@ fn parse_numeric_fields(line: &str) -> BTreeMap<String, f64> {
             Some((key.to_string(), value))
         })
         .collect()
+}
+
+fn parse_string_field(line: &str, key: &str) -> String {
+    let needle = format!("{key}=");
+    let Some(start) = line.find(&needle).map(|idx| idx + needle.len()) else {
+        return String::new();
+    };
+    let rest = &line[start..];
+    let end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
+    rest[..end]
+        .trim_end_matches(|c: char| c == ',' || c == ')')
+        .to_string()
+}
+
+fn parse_qwen36_expert_residency_policy(line: &str) -> Qwen36ExpertResidencyPolicyJson {
+    let metrics = parse_numeric_fields(line);
+    Qwen36ExpertResidencyPolicyJson {
+        resident_format: parse_string_field(line, "resident_format"),
+        scope: parse_string_field(line, "scope"),
+        miss_policy: parse_string_field(line, "miss_policy"),
+        capacity: metrics.get("capacity").copied().unwrap_or_default(),
+        metrics,
+    }
 }
 
 fn extract_profile(
@@ -290,6 +325,7 @@ pub fn run_one_combo(invocation: &ComboInvocation, policy: &RunPolicy) -> Result
         qwen36_pack_cache: attribution.qwen36_pack_cache,
         qwen36_expert_residency: attribution.qwen36_expert_residency,
         qwen36_expert_residency_policies: attribution.qwen36_expert_residency_policies,
+        qwen36_expert_residency_policy_rows: attribution.qwen36_expert_residency_policy_rows,
         metal_profile: attribution.metal_profile,
         hal_profile: attribution.hal_profile,
         gpu_temp_c_end: None,
