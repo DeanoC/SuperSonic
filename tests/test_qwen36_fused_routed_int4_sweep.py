@@ -278,6 +278,19 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
             tap_router["SUPERSONIC_METAL_QWEN36_FFN_ROUTER_STAGE5_PARITY_TAP_MAX_CALLS"],
             "3",
         )
+        snapshot_args = Namespace(
+            metal_profile=False,
+            metal_profile_phases=False,
+            router_parity_tap=False,
+            decode_batch_route_snapshot=True,
+        )
+        snapshot_router = script.build_env_overrides(
+            snapshot_args, "full-stage5-router-simd-batch-ffn-phases"
+        )
+        self.assertEqual(
+            snapshot_router["SUPERSONIC_METAL_QWEN36_DECODE_BATCH_ROUTE_SNAPSHOT"],
+            "1",
+        )
 
     def test_build_command_omits_stage_timing_for_batch_mode(self):
         script = sweep_qwen36_fused_routed_int4
@@ -715,6 +728,89 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
         simd_layers = {tap["layer"] for _, tap in selected if tap["router_path"] == "simd"}
         self.assertIn(39, serial_layers)
         self.assertIn(39, simd_layers)
+
+    def test_decode_batch_route_snapshots_are_compared_and_rendered(self):
+        script = sweep_qwen36_fused_routed_int4
+        output = (
+            "[qwen36-decode-batch-route-snapshot] call=0 position=64 "
+            "cache_pos=-1 router_path=serial phase_profile=1 layers=2 top_k=2 "
+            "captured_layers=2 entries=4 first_layer=0 last_layer=1 "
+            "checksum=123 routes=1,2;3,4\n"
+        )
+
+        snapshots = script.parse_decode_batch_route_snapshots(output)
+
+        self.assertEqual(len(snapshots), 1)
+        self.assertEqual(snapshots[0]["router_path"], "serial")
+        self.assertEqual(snapshots[0]["checksum"], 123)
+        self.assertEqual(snapshots[0]["routes"], "1,2;3,4")
+
+        serial = row("full-stage5-router-batch-ffn-phases")
+        serial["decode_batch_route_snapshots"] = snapshots
+        simd = row("full-stage5-router-simd-batch-ffn-phases")
+        simd["decode_batch_route_snapshots"] = [
+            {
+                **snapshots[0],
+                "router_path": "simd",
+                "checksum": 123,
+                "routes": "1,2;3,4",
+            }
+        ]
+        args = Namespace(
+            max_new_tokens=1,
+            context_size=64,
+            metal_profile=True,
+            metal_profile_phases=False,
+            router_parity_tap=False,
+            router_parity_tap_max_calls=40,
+            decode_batch_route_snapshot=True,
+            promotion_max_headline_ratio=0.999,
+            promotion_max_ffn_ratio=0.999,
+            promotion_max_component_regression_ratio=1.10,
+            promotion_max_command_buffer_wait_ratio=1.05,
+            promotion_max_fused_wall_gpu_ratio=4.0,
+            promotion_max_wait_gpu_ratio=4.0,
+            promotion_require_profile=False,
+        )
+        report = script.build_report(
+            [row("default"), serial, simd],
+            args,
+            [
+                "default",
+                "full-stage5-router-batch-ffn-phases",
+                "full-stage5-router-simd-batch-ffn-phases",
+            ],
+            "smoke",
+        )
+        md = script.render_markdown(report)
+
+        route_summary = report["summary"]["decode_batch_route_snapshot"]
+        self.assertEqual(route_summary["snapshot_count"], 2)
+        self.assertEqual(route_summary["mismatch_count"], 0)
+        self.assertEqual(route_summary["paths"], ["serial", "simd"])
+        self.assertIn("decode_batch_route_snapshot: `True`", md)
+        self.assertIn("## Decode Batch Route Snapshot", md)
+        self.assertIn(
+            "| hello | full-stage5-router-simd-batch-ffn-phases | simd | 0 | 64 | 2 | 123 | full-stage5-router-batch-ffn-phases | serial | true |",
+            md,
+        )
+
+        simd["decode_batch_route_snapshots"][0]["routes"] = "1,2;3,5"
+        simd["decode_batch_route_snapshots"][0]["checksum"] = 124
+        report = script.build_report(
+            [row("default"), serial, simd],
+            args,
+            [
+                "default",
+                "full-stage5-router-batch-ffn-phases",
+                "full-stage5-router-simd-batch-ffn-phases",
+            ],
+            "smoke",
+        )
+        self.assertEqual(
+            report["summary"]["decode_batch_route_snapshot"]["mismatch_count"],
+            1,
+        )
 
 
 if __name__ == "__main__":

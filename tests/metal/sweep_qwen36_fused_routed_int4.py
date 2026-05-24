@@ -15,7 +15,7 @@ from typing import Any
 
 
 MODEL = "qwen3.6-35b-a3b"
-SCHEMA = "qwen36-fused-routed-int4-sweep-v10"
+SCHEMA = "qwen36-fused-routed-int4-sweep-v11"
 DEFAULT_MAX_FUSED_WALL_GPU_RATIO = 4.0
 DEFAULT_MAX_WAIT_GPU_RATIO = 4.0
 BATCH_FAST_PROFILE_MODES = {
@@ -309,6 +309,19 @@ def parse_router_parity_taps(output: str) -> list[dict[str, Any]]:
     return rows
 
 
+def parse_decode_batch_route_snapshots(output: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for line in output.splitlines():
+        if not line.startswith("[qwen36-decode-batch-route-snapshot]"):
+            continue
+        fields = {
+            key: parse_number(value)
+            for key, value in parse_key_values(line).items()
+        }
+        rows.append(fields)
+    return rows
+
+
 def summarize_router_parity_taps(rows: list[dict[str, Any]]) -> dict[str, Any]:
     taps = [
         tap
@@ -400,6 +413,76 @@ def select_router_parity_tap_rows(
     return selected
 
 
+def iter_decode_batch_route_snapshots(
+    rows: list[dict[str, Any]],
+) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    return [
+        (row, snapshot)
+        for row in rows
+        for snapshot in (row.get("decode_batch_route_snapshots") or [])
+    ]
+
+
+def decode_batch_route_snapshot_comparisons(
+    rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    pairs = iter_decode_batch_route_snapshots(rows)
+    reference_by_key: dict[tuple[str, int], tuple[dict[str, Any], dict[str, Any]]] = {}
+    for row, snapshot in pairs:
+        prompt = str(row.get("prompt_id", ""))
+        call = int(snapshot.get("call", 0))
+        key = (prompt, call)
+        current = reference_by_key.get(key)
+        path = str(snapshot.get("router_path") or "")
+        if current is None or (current[1].get("router_path") == "simd" and path != "simd"):
+            reference_by_key[key] = (row, snapshot)
+
+    comparisons: list[dict[str, Any]] = []
+    for row, snapshot in pairs:
+        prompt = str(row.get("prompt_id", ""))
+        call = int(snapshot.get("call", 0))
+        reference = reference_by_key.get((prompt, call))
+        ref_row, ref_snapshot = reference if reference is not None else ({}, {})
+        checksum_match = snapshot.get("checksum") == ref_snapshot.get("checksum")
+        routes_match = snapshot.get("routes") == ref_snapshot.get("routes")
+        comparisons.append(
+            {
+                "prompt_id": prompt,
+                "mode": row.get("mode"),
+                "path": snapshot.get("router_path") or "-",
+                "call": call,
+                "checksum": snapshot.get("checksum"),
+                "routes": snapshot.get("routes"),
+                "reference_mode": ref_row.get("mode"),
+                "reference_path": ref_snapshot.get("router_path") or "-",
+                "reference_checksum": ref_snapshot.get("checksum"),
+                "match_reference": checksum_match and routes_match,
+            }
+        )
+    return comparisons
+
+
+def summarize_decode_batch_route_snapshots(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    pairs = iter_decode_batch_route_snapshots(rows)
+    snapshots = [snapshot for _, snapshot in pairs]
+    comparisons = decode_batch_route_snapshot_comparisons(rows)
+    mismatches = [
+        comparison
+        for comparison in comparisons
+        if not bool(comparison.get("match_reference"))
+    ]
+    return {
+        "snapshot_count": len(snapshots),
+        "mismatch_count": len(mismatches),
+        "paths": sorted({str(snapshot.get("router_path") or "-") for snapshot in snapshots}),
+        "max_captured_layers": max(
+            (int(snapshot.get("captured_layers") or 0) for snapshot in snapshots),
+            default=0,
+        ),
+        "mismatch_examples": mismatches[:20],
+    }
+
+
 def parse_modes(raw: str) -> list[str]:
     modes: list[str] = []
     for part in raw.split(","):
@@ -448,6 +531,8 @@ def build_env_overrides(args: argparse.Namespace, mode: str) -> dict[str, str]:
             overrides["SUPERSONIC_METAL_QWEN36_FFN_ROUTER_STAGE5_PARITY_TAP_MAX_CALLS"] = str(
                 max_calls
             )
+    if getattr(args, "decode_batch_route_snapshot", False):
+        overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH_ROUTE_SNAPSHOT"] = "1"
     if mode == "packed":
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_PACKED_STAGE5"] = "1"
     elif mode == "direct-gather":
@@ -783,6 +868,7 @@ def run_row(args: argparse.Namespace, prompt_id: str, prompt: str, mode: str) ->
             "metal_profile": parse_profile(output, "[metal-profile]", "[metal-profile-op]"),
             "hal_profile": parse_profile(output, "[hal-profile]", "[hal-profile-op]"),
             "router_parity_taps": parse_router_parity_taps(output),
+            "decode_batch_route_snapshots": parse_decode_batch_route_snapshots(output),
             "output_tail": output_tail(output),
         }
         row["fused_op_ms"] = fused_op_ms(row)
@@ -807,6 +893,7 @@ def run_row(args: argparse.Namespace, prompt_id: str, prompt: str, mode: str) ->
             "metal_profile": parse_profile(output, "[metal-profile]", "[metal-profile-op]"),
             "hal_profile": parse_profile(output, "[hal-profile]", "[hal-profile-op]"),
             "router_parity_taps": parse_router_parity_taps(output),
+            "decode_batch_route_snapshots": parse_decode_batch_route_snapshots(output),
             "fused_op_ms": None,
             "output_tail": output_tail(output),
         }
@@ -1161,6 +1248,7 @@ def build_report(
         args.promotion_max_wait_gpu_ratio,
     )
     summary["router_parity"] = summarize_router_parity_taps(rows)
+    summary["decode_batch_route_snapshot"] = summarize_decode_batch_route_snapshots(rows)
     return {
         "schema": SCHEMA,
         "model": MODEL,
@@ -1175,6 +1263,7 @@ def build_report(
         "metal_profile_phases": getattr(args, "metal_profile_phases", False),
         "router_parity_tap": getattr(args, "router_parity_tap", False),
         "router_parity_tap_max_calls": getattr(args, "router_parity_tap_max_calls", None),
+        "decode_batch_route_snapshot": getattr(args, "decode_batch_route_snapshot", False),
         "promotion_thresholds": {
             "max_headline_ratio": args.promotion_max_headline_ratio,
             "max_ffn_ratio": args.promotion_max_ffn_ratio,
@@ -1203,6 +1292,7 @@ def render_markdown(report: dict[str, Any]) -> str:
     promotion_gate = summary.get("promotion_gate") or {}
     ffn_gap = summary.get("ffn_residency_gap") or {}
     router_parity = summary.get("router_parity") or {}
+    route_snapshot = summary.get("decode_batch_route_snapshot") or {}
     lines = [
         "# Qwen3.6 Fused Routed INT4 Sweep",
         "",
@@ -1214,12 +1304,15 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- metal_profile: `{report['metal_profile']}`",
         f"- metal_profile_phases: `{report.get('metal_profile_phases', False)}`",
         f"- router_parity_tap: `{report.get('router_parity_tap', False)}`",
+        f"- decode_batch_route_snapshot: `{report.get('decode_batch_route_snapshot', False)}`",
         f"- generated_ids_match: `{summary['generated_ids_match']}`",
         f"- promotion_gate_passed: `{promotion_gate.get('passed', False)}`",
         f"- promotion_gate_passed_modes: `{','.join(promotion_gate.get('passed_modes') or []) or '-'}`",
         f"- ffn_gap_recommendation: `{ffn_gap.get('recommendation') or '-'}`",
         f"- router_parity_tap_count: `{router_parity.get('tap_count', 0)}`",
         f"- router_parity_mismatches: `{router_parity.get('mismatch_count', 0)}`",
+        f"- decode_batch_route_snapshot_count: `{route_snapshot.get('snapshot_count', 0)}`",
+        f"- decode_batch_route_snapshot_mismatches: `{route_snapshot.get('mismatch_count', 0)}`",
         "",
         "| Prompt | Mode | Status | IDs | Decode ms | FFN ms avg | Fused wall ms | Fused GPU ms | Batch lin GPU ms | Batch FFN GPU ms | Wall/GPU | Wait/GPU | FFN class | Top Metal op | Top Metal ms | HAL ms | Wall s |",
         "|:---|:---|:---|:---|---:|---:|---:|---:|---:|---:|---:|---:|:---|:---|---:|---:|---:|",
@@ -1278,6 +1371,51 @@ def render_markdown(report: dict[str, Any]) -> str:
                     expert_gate=render_float(row.get("decode_batch_ffn_expert_gate_up_gpu_ms")),
                     expert_down=render_float(row.get("decode_batch_ffn_expert_down_gpu_ms")),
                     total=render_float(row.get("decode_batch_ffn_gpu_ms")),
+                )
+            )
+    snapshot_comparisons = decode_batch_route_snapshot_comparisons(report["rows"])
+    if snapshot_comparisons:
+        lines.extend(
+            [
+                "",
+                "## Decode Batch Route Snapshot",
+                "",
+                "| Prompt | Mode | Path | Call | Pos | Captured | Checksum | Ref mode | Ref path | Match ref | Routes head |",
+                "|:---|:---|:---|---:|---:|---:|:---|:---|:---|:---:|:---|",
+            ]
+        )
+        snapshots_by_key = {
+            (
+                str(row.get("prompt_id", "")),
+                str(row.get("mode", "")),
+                int(snapshot.get("call", 0)),
+            ): snapshot
+            for row in report["rows"]
+            for snapshot in (row.get("decode_batch_route_snapshots") or [])
+        }
+        for comparison in snapshot_comparisons[:40]:
+            snapshot = snapshots_by_key.get(
+                (
+                    str(comparison.get("prompt_id", "")),
+                    str(comparison.get("mode", "")),
+                    int(comparison.get("call", 0)),
+                ),
+                {},
+            )
+            routes = str(snapshot.get("routes") or "-")
+            lines.append(
+                "| {prompt} | {mode} | {path} | {call} | {position} | {captured} | {checksum} | {ref_mode} | {ref_path} | {match} | {routes_head} |".format(
+                    prompt=comparison.get("prompt_id", ""),
+                    mode=comparison.get("mode", ""),
+                    path=comparison.get("path", "-"),
+                    call=comparison.get("call", "-"),
+                    position=snapshot.get("position", "-"),
+                    captured=snapshot.get("captured_layers", "-"),
+                    checksum=comparison.get("checksum", "-"),
+                    ref_mode=comparison.get("reference_mode", "-"),
+                    ref_path=comparison.get("reference_path", "-"),
+                    match=str(bool(comparison.get("match_reference"))).lower(),
+                    routes_head=(routes[:96] + "...") if len(routes) > 96 else routes,
                 )
             )
     candidates = promotion_gate.get("candidates") or []
@@ -1411,6 +1549,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         type=int,
         default=40,
         help="maximum router parity tap rows emitted by the runtime",
+    )
+    parser.add_argument(
+        "--decode-batch-route-snapshot",
+        action="store_true",
+        help="capture per-layer decode-batch FFN top-k route snapshots at batch end",
     )
     parser.add_argument(
         "--promotion-max-headline-ratio",

@@ -1190,6 +1190,45 @@ under the same smoke:
    phase lane, fix that batch/profile interaction before promoting the SIMD
    router as a performance candidate.
 
+35. **Qwen3.6 decode-batch route snapshot**
+   The decode-batch attribution lane now has a batch-compatible route snapshot
+   guard, `SUPERSONIC_METAL_QWEN36_DECODE_BATCH_ROUTE_SNAPSHOT=1`. Instead of
+   reading top-k routes after each layer, the runner copies each layer's
+   `ffn_output_idx` into a per-decode Metal buffer while the batch is still
+   open, then emits a single
+   `[qwen36-decode-batch-route-snapshot]` row after the existing final-hidden
+   synchronization. The fused-routed sweep is schema v11, exposes this with
+   `--decode-batch-route-snapshot`, records raw route snapshots in JSON, and
+   compares each snapshot-bearing mode against the serial batch reference by
+   checksum and exact route string.
+
+   The four-token Metal smoke used
+   `--modes default,full-stage5-router-batch-ffn-phases,full-stage5-router-simd-batch-ffn-phases
+   --metal-profile --decode-batch-route-snapshot`. It preserved generated IDs
+   across all modes: `[11, 271, 40, 599]`. The snapshot report captured 8
+   route rows total: 4 serial and 4 SIMD decode calls, each with all 40 layers
+   captured. Every SIMD checksum matched the serial reference:
+   `4123385977126816859`, `9921766482153130090`,
+   `12710036671302543390`, and `2177400112220283478`; the route-summary
+   mismatch count was zero.
+
+   With route equality proven inside the batch FFN phase lane, the SIMD router
+   path is correctness-clean for this smoke. The same run measured default at
+   `959.0 ms` decode and `ffn_ms_avg=134.399`. The serial batch FFN phase row
+   measured `2071.0 ms` decode, `decode_batch_ffn_gpu_ms=332.948`, and
+   router top-k GPU `213.669 ms`. The SIMD batch FFN phase row measured
+   `1497.0 ms` decode, `decode_batch_ffn_gpu_ms=224.532`, and router top-k GPU
+   `132.618 ms`. That is a 32.6% reduction in labeled FFN GPU time and a 37.9%
+   reduction in the router label in this attribution lane.
+
+   This still is not a promotion lane: FFN phase profiling intentionally
+   flushes around subdispatches, and native wrapper wall time remains far
+   above GPU timestamps (`1358.920 ms` fused wall versus `224.532 ms` fused
+   GPU for the SIMD row). The next measured target should keep SIMD router
+   enabled, return to the coarse decode-batch lane without per-FFN subphase
+   flushes, and decide whether the remaining blocker is batch/wait overhead or
+   the still-large router/shared scalar GPU work.
+
 ## Sources
 
 - [Qwen/Qwen3.6-35B-A3B model card](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)

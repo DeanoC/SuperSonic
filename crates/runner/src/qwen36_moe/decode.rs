@@ -25,6 +25,7 @@
 #![allow(dead_code)]
 
 use std::ptr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{anyhow, Context, Result};
 use gpu_hal::{copy_d2h, memset_zeros, Backend, GpuBuffer, GpuError, ScalarType};
@@ -43,6 +44,8 @@ use crate::qwen36_moe_logits::bf16_bytes_to_f32;
 use crate::qwen36_moe_types::{
     AttnLayerBuffers, DecodeOutputs, ExpertPrefetchPhase, ExpertRoute, LayerBuffers, MultiLayerGeom,
 };
+
+static QWEN36_DECODE_BATCH_ROUTE_SNAPSHOT_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 /// Workspace floats sufficient for the full-attn parity launcher's stage 5
 /// (the largest stage). Mirrors `parity_workspace_floats` in the per-block
@@ -162,6 +165,15 @@ fn qwen36_metal_decode_batch_ffn_profile_phases_enabled() -> bool {
     std::env::var_os("SUPERSONIC_METAL_QWEN36_DECODE_BATCH_PROFILE_FFN_PHASES").is_some()
 }
 
+fn qwen36_metal_decode_batch_route_snapshot_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_QWEN36_DECODE_BATCH_ROUTE_SNAPSHOT").is_some()
+}
+
+fn qwen36_metal_router_stage5_simd_env_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_STAGE5_SIMD").is_some()
+        && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
+}
+
 fn flush_active_metal_decode_batch(label: &str) -> Result<bool> {
     if !kernel_ffi::prefill_ffi::metal_batch_is_active() {
         return Ok(false);
@@ -212,6 +224,108 @@ fn copy_d2d_decode(
     } else {
         gpu_hal::copy_d2d(ordinal, dst, src, bytes)
     }
+}
+
+fn decode_batch_route_snapshot_checksum(
+    routes: &[u32],
+    captured_layers: &[bool],
+    top_k: usize,
+) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for (layer, &captured) in captured_layers.iter().enumerate() {
+        if !captured {
+            continue;
+        }
+        hash ^= layer as u64;
+        hash = hash.wrapping_mul(0x1000_0000_01b3);
+        for rank in 0..top_k {
+            let expert = routes[layer * top_k + rank] as u64;
+            hash ^= ((rank as u64) << 32) ^ expert;
+            hash = hash.wrapping_mul(0x1000_0000_01b3);
+        }
+    }
+    hash
+}
+
+fn format_decode_batch_route_snapshot(
+    routes: &[u32],
+    captured_layers: &[bool],
+    top_k: usize,
+) -> String {
+    captured_layers
+        .iter()
+        .enumerate()
+        .map(|(layer, &captured)| {
+            if !captured {
+                return "-".to_string();
+            }
+            let start = layer * top_k;
+            routes[start..start + top_k]
+                .iter()
+                .map(|expert| expert.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+fn decode_batch_route_snapshot_u32(bytes: &[u8]) -> Vec<u32> {
+    bytes
+        .chunks_exact(4)
+        .map(|chunk| u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect()
+}
+
+fn emit_decode_batch_route_snapshot(
+    position: i32,
+    cache_pos: i32,
+    top_k: usize,
+    captured_layers: &[bool],
+    route_snapshot: &GpuBuffer,
+) -> Result<()> {
+    let bytes = route_snapshot
+        .to_host_bytes()
+        .context("d2h qwen36 decode-batch route snapshot")?;
+    let routes = decode_batch_route_snapshot_u32(&bytes);
+    let captured_count = captured_layers.iter().filter(|&&captured| captured).count();
+    let entries = captured_count * top_k;
+    let first_layer = captured_layers
+        .iter()
+        .position(|&captured| captured)
+        .map(|layer| layer as i32)
+        .unwrap_or(-1);
+    let last_layer = captured_layers
+        .iter()
+        .rposition(|&captured| captured)
+        .map(|layer| layer as i32)
+        .unwrap_or(-1);
+    let checksum = decode_batch_route_snapshot_checksum(&routes, captured_layers, top_k);
+    let route_path = if qwen36_metal_router_stage5_simd_env_enabled() {
+        "simd"
+    } else {
+        "serial"
+    };
+    let phase_profile = qwen36_metal_decode_batch_ffn_profile_phases_enabled()
+        || qwen36_metal_decode_batch_profile_phases_enabled();
+    let call = QWEN36_DECODE_BATCH_ROUTE_SNAPSHOT_CALLS.fetch_add(1, Ordering::Relaxed);
+    eprintln!(
+        "[qwen36-decode-batch-route-snapshot] call={} position={} cache_pos={} router_path={} phase_profile={} layers={} top_k={} captured_layers={} entries={} first_layer={} last_layer={} checksum={} routes={}",
+        call,
+        position,
+        cache_pos,
+        route_path,
+        phase_profile as u8,
+        captured_layers.len(),
+        top_k,
+        captured_count,
+        entries,
+        first_layer,
+        last_layer,
+        checksum,
+        format_decode_batch_route_snapshot(&routes, captured_layers, top_k),
+    );
+    Ok(())
 }
 
 /// Copy `[hidden]` BF16 elements out of a GPU buffer into a freshly
@@ -594,12 +708,28 @@ fn run_chained_decode_impl_with_cache_pos(
         eprintln!("[trace] step pos={position} init_hidden L2={init_norm:.4}");
     }
 
-    let metal_decode_batch = if hidden_a.backend() == Backend::Metal
+    let metal_decode_batch_requested = hidden_a.backend() == Backend::Metal
         && qwen36_metal_decode_batch_enabled(
             capture,
             options.accurate_stage_timings,
             expert_prefetch.is_some(),
-        ) {
+        );
+    let mut decode_batch_route_snapshot =
+        if metal_decode_batch_requested && qwen36_metal_decode_batch_route_snapshot_enabled() {
+            Some(
+                GpuBuffer::zeros(
+                    ordinal,
+                    ScalarType::U32,
+                    &[layers.len(), geom.top_k as usize],
+                )
+                .context("alloc qwen36 decode-batch route snapshot")?,
+            )
+        } else {
+            None
+        };
+    let mut decode_batch_route_snapshot_captured = vec![false; layers.len()];
+
+    let metal_decode_batch = if metal_decode_batch_requested {
         let guard = kernel_ffi::prefill_ffi::MetalBatchGuard::begin()
             .map_err(|e| anyhow!("qwen36 Metal decode batch begin: {e}"))?;
         kernel_ffi::prefill_ffi::set_metal_batch_label("qwen36_decode_batch")
@@ -1132,6 +1262,19 @@ fn run_chained_decode_impl_with_cache_pos(
             &mut sync_buf,
         )
         .with_context(|| format!("ffn_step_launch (layer {layer_idx})"))?;
+        if ffn_uses_router_native {
+            if let Some(snapshot) = decode_batch_route_snapshot.as_mut() {
+                let bytes = geom.top_k as usize * std::mem::size_of::<u32>();
+                let dst = unsafe {
+                    (snapshot.as_mut_ptr() as *mut u8).add(layer_idx * bytes)
+                        as *mut std::ffi::c_void
+                };
+                copy_d2d_decode(ordinal, dst, ffn_output_idx.as_ptr(), bytes).with_context(
+                    || format!("snapshot decode-batch FFN top-k routes (layer {layer_idx})"),
+                )?;
+                decode_batch_route_snapshot_captured[layer_idx] = true;
+            }
+        }
         metal_queue_dirty = defer_layer_ffn_router || defer_layer_ffn_direct_gather;
         if options.accurate_stage_timings {
             gpu_hal::sync(ordinal).context("sync_after_ffn_step (accurate_stage_timings)")?;
@@ -1167,6 +1310,15 @@ fn run_chained_decode_impl_with_cache_pos(
     sync_metal_queue_for_host_read(final_buf, "download final hidden")?;
     let final_hidden_bytes =
         download_hidden_bf16(ordinal, final_buf, hidden).context("download final hidden")?;
+    if let Some(snapshot) = decode_batch_route_snapshot.as_ref() {
+        emit_decode_batch_route_snapshot(
+            position,
+            cache_pos,
+            geom.top_k as usize,
+            &decode_batch_route_snapshot_captured,
+            snapshot,
+        )?;
+    }
     if let Some(batch) = metal_decode_batch {
         batch
             .finish()
@@ -1227,4 +1379,34 @@ fn download_topk_routes(
             weight,
         })
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        decode_batch_route_snapshot_checksum, decode_batch_route_snapshot_u32,
+        format_decode_batch_route_snapshot,
+    };
+
+    #[test]
+    fn decode_batch_route_snapshot_formats_captured_layers() {
+        let routes = vec![1, 2, 3, 4, 5, 6];
+        let captured = vec![true, false, true];
+
+        assert_eq!(
+            format_decode_batch_route_snapshot(&routes, &captured, 2),
+            "1,2;-;5,6"
+        );
+        assert_ne!(
+            decode_batch_route_snapshot_checksum(&routes, &captured, 2),
+            decode_batch_route_snapshot_checksum(&routes, &[true, true, true], 2)
+        );
+    }
+
+    #[test]
+    fn decode_batch_route_snapshot_decodes_u32_bytes() {
+        let bytes = [7u32.to_ne_bytes(), 11u32.to_ne_bytes()].concat();
+
+        assert_eq!(decode_batch_route_snapshot_u32(&bytes), vec![7, 11]);
+    }
 }
