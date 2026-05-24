@@ -47,6 +47,10 @@ sota_summary = load_script(
     "qwen36_sota_gate_summary",
     METAL_DIR / "summarize_qwen36_sota_gates.py",
 )
+sota_refresh = load_script(
+    "qwen36_sota_gate_refresh",
+    METAL_DIR / "refresh_qwen36_sota_gates.py",
+)
 
 
 class Qwen36SotaContractTests(unittest.TestCase):
@@ -62,6 +66,7 @@ class Qwen36SotaContractTests(unittest.TestCase):
         self.assertEqual(route_sweep.SCHEMA, "qwen36-route-residency-sweep-v1")
         self.assertEqual(mtp_sweep.SCHEMA, "qwen36-moe-mtp-acceptance-sweep-v2")
         self.assertEqual(sota_summary.SCHEMA, "qwen36-sota-gate-summary-v4")
+        self.assertEqual(sota_refresh.SCHEMA, "qwen36-sota-gate-refresh-plan-v1")
 
     def test_sota_summary_tracks_current_gate_reports(self):
         specs = {spec.gate_id: spec for spec in sota_summary.GATE_SPECS}

@@ -660,6 +660,11 @@ gate artifact. Add `--require` to make a local validation run fail closed on
 missing, malformed, schema-mismatched, stale, or missing-gate artifacts. Use
 `--max-age-hours N` when the summary must reject old target reports instead of
 quietly reusing yesterday's gate decisions.
+`tests/metal/refresh_qwen36_sota_gates.py` turns those row-level refresh
+commands into a dry-run plan at
+`target/qwen36_sota_gate_refresh_plan.{json,md}`. It selects missing/stale/bad
+inputs by default, supports `--only <gate_id>` for a deliberate one-gate
+refresh, and executes the selected commands only when `--run` is provided.
 The current M5 Max perf gate points at linear-attention as the next measured
 multi-token per-token bucket after FFN fallback tightening. The 512-token
 `--metal-profile` smoke currently reports roughly 269 ms/token, 71.7 s prefill,

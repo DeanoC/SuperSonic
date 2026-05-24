@@ -576,7 +576,10 @@ under the same smoke:
    reports are nonfatal rows by default; `--require` turns absent, malformed,
    schema-mismatched, or missing-gate artifacts into a failed validation run,
    and `--max-age-hours` adds an mtime-based stale-report gate for local refresh
-   runs.
+   runs. `tests/metal/refresh_qwen36_sota_gates.py` consumes the same gate
+   surface and writes `target/qwen36_sota_gate_refresh_plan.{json,md}` so stale
+   or missing SOTA gates can be selected in one dry-run artifact before the
+   operator chooses `--run`.
 
 ## Sources
 
