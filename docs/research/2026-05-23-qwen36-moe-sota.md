@@ -600,9 +600,10 @@ under the same smoke:
 12. **Qwen3.6 next-bottleneck selector**
    Close the loop when every SOTA runtime fork is negative. `tests/metal/select_qwen36_next_bottleneck.py`
    reads the refreshed SOTA gate summary plus the profiled default rows from
-   the static top-N, fused routed INT4, LRU resident-cache, and batched-prefill
-   sweeps. It ranks decode buckets, records the prefill best-vs-baseline row,
-   preserves top Metal/HAL profile ops, and writes
+   the static top-N, fused routed INT4, LRU resident-cache, batched-prefill
+   sweeps, and the latest optional `bench-perf` schema-v8 Qwen3.6 INT4
+   artifact under `target/bench-runs`. It ranks decode buckets, records the
+   prefill best-vs-baseline row, preserves top Metal/HAL profile ops, and writes
    `target/qwen36_next_bottleneck.{json,md}`. If FFN is still the dominant
    bucket but the resident/static/fused/MPS/LRU FFN forks have all failed or
    been superseded, the selector names the largest non-exhausted bucket instead
@@ -630,7 +631,9 @@ under the same smoke:
    `hal_profile`. The profiled timing maps remain available under
    `profile_stage_timings`, `profile_chain_breakdown`, and
    `profile_lifecycle_timings`, so command-buffer split overhead can be studied
-   without making it the headline stage attribution.
+   without making it the headline stage attribution. The next-bottleneck
+   selector's v2 schema consumes this artifact when present, keeping the
+   current headline run in the same evidence bundle as the narrower sweep rows.
 
 ## Sources
 

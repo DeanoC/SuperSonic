@@ -74,7 +74,7 @@ class Qwen36SotaContractTests(unittest.TestCase):
         self.assertEqual(route_sweep.SCHEMA, "qwen36-route-residency-sweep-v1")
         self.assertEqual(mtp_sweep.SCHEMA, "qwen36-moe-mtp-acceptance-sweep-v2")
         self.assertEqual(lru_sweep.SCHEMA, "qwen36-lru-resident-cache-sweep-v1")
-        self.assertEqual(next_bottleneck.SCHEMA, "qwen36-next-bottleneck-v1")
+        self.assertEqual(next_bottleneck.SCHEMA, "qwen36-next-bottleneck-v2")
         self.assertEqual(sota_summary.SCHEMA, "qwen36-sota-gate-summary-v7")
         self.assertEqual(sota_refresh.SCHEMA, "qwen36-sota-gate-refresh-plan-v1")
 

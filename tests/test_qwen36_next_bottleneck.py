@@ -103,6 +103,46 @@ def prefill_report() -> dict:
     }
 
 
+def bench_perf_report() -> dict:
+    return {
+        "schema_version": 8,
+        "model": selector.MODEL,
+        "quant": "int4",
+        "arch": "apple-m5-max",
+        "backend": selector.BACKEND,
+        "status": "ok",
+        "ms_per_step": 162.6,
+        "samples": [182.7, 162.6, 145.7],
+        "stage_timings": {"lm_head_ms_avg": 4.682},
+        "chain_breakdown": {
+            "ffn_ms_avg": 97.974,
+            "linear_attn_ms_avg": 31.335,
+            "full_attn_ms_avg": 18.213,
+        },
+        "profile_stage_timings": {"lm_head_ms_avg": 4.187},
+        "profile_chain_breakdown": {
+            "ffn_ms_avg": 97.430,
+            "linear_attn_ms_avg": 53.165,
+            "full_attn_ms_avg": 17.510,
+        },
+        "metal_profile": {
+            "entries": [
+                {
+                    "op": "qwen36_linear_int4_stage5",
+                    "path": "native",
+                    "total_ms": 1166.320,
+                    "calls": 630,
+                }
+            ]
+        },
+        "hal_profile": {
+            "entries": [
+                {"op": "copy_h2d", "total_ms": 5419.327, "calls": 1389}
+            ]
+        },
+    }
+
+
 class Qwen36NextBottleneckTests(unittest.TestCase):
     def paths_in(self, root: Path) -> dict[str, Path]:
         return {
@@ -111,6 +151,8 @@ class Qwen36NextBottleneckTests(unittest.TestCase):
             "fused_json": root / "fused.json",
             "lru_json": root / "lru.json",
             "prefill_json": root / "prefill.json",
+            "bench_perf_json": None,
+            "bench_run_root": root / "empty-bench-runs",
             "out_json": root / "next.json",
             "out_md": root / "next.md",
         }
@@ -154,6 +196,32 @@ class Qwen36NextBottleneckTests(unittest.TestCase):
         self.assertEqual(report["prefill"]["best_mode"], "prototype-default")
         self.assertIn("prototype_linear_attention_orchestration", md)
 
+    def test_includes_schema_v8_bench_perf_as_runtime_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = self.write_default_inputs(Path(tmp))
+            bench_path = Path(tmp) / "bench.json"
+            write_json(bench_path, bench_perf_report())
+            paths["bench_perf_json"] = bench_path
+            report = selector.build_report(self.args_for(paths))
+            md = selector.render_markdown(report)
+
+        self.assertEqual(report["schema"], selector.SCHEMA)
+        self.assertEqual(report["input_reports"]["bench_perf"]["schema"], 8)
+        self.assertEqual(report["bench_perf"]["schema_version"], 8)
+        self.assertEqual(report["bench_perf"]["linear_attn_ms_avg"], 31.335)
+        self.assertEqual(report["bench_perf"]["profile_linear_attn_ms_avg"], 53.165)
+        buckets = {row["bucket"]: row for row in report["decode_bucket_ranking"]}
+        self.assertEqual(buckets["ffn_ms_avg"]["sample_count"], 4)
+        self.assertTrue(
+            any(
+                sample["source"] == "bench_perf" and sample["row"] == "bench_perf"
+                for sample in buckets["linear_attn_ms_avg"]["samples"]
+            )
+        )
+        self.assertEqual(report["top_metal_profile_ops"][0]["source"], "bench_perf")
+        self.assertIn("## Bench Perf", md)
+        self.assertIn("profile_linear_attn_ms_avg", md)
+
     def test_defers_when_sota_summary_has_specific_next_action(self):
         with tempfile.TemporaryDirectory() as tmp:
             paths = self.write_default_inputs(
@@ -183,6 +251,8 @@ class Qwen36NextBottleneckTests(unittest.TestCase):
                     str(paths["lru_json"]),
                     "--prefill-json",
                     str(paths["prefill_json"]),
+                    "--bench-run-root",
+                    str(paths["bench_run_root"]),
                     "--out-json",
                     str(paths["out_json"]),
                     "--out-md",

@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA = "qwen36-next-bottleneck-v1"
+SCHEMA = "qwen36-next-bottleneck-v2"
 MODEL = "qwen3.6-35b-a3b"
 BACKEND = "metal"
 FALLBACK_ACTION = "keep_default_lane_and_select_next_measured_bottleneck"
@@ -39,6 +39,23 @@ def load_report(path: Path) -> tuple[dict[str, Any] | None, str | None]:
     if not isinstance(loaded, dict):
         return None, "malformed report: top-level JSON value must be an object"
     return loaded, None
+
+
+def latest_bench_perf_json(run_root: Path) -> Path | None:
+    candidates = [
+        path
+        for path in run_root.glob("*/perf/qwen3.6-35b-a3b_int4.json")
+        if path.is_file()
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda path: path.stat().st_mtime)
+
+
+def report_schema(report: dict[str, Any] | None) -> Any:
+    if not report:
+        return None
+    return report.get("schema") or report.get("schema_version")
 
 
 def is_default_row(row: dict[str, Any]) -> bool:
@@ -102,6 +119,60 @@ def collect_bucket_samples(
                     }
                 )
     return samples
+
+
+def bench_perf_default_row(report: dict[str, Any]) -> dict[str, Any] | None:
+    if report.get("status") != "ok":
+        return None
+    return {
+        "prompt_id": "bench_perf",
+        "mode": "default",
+        "status": "ok",
+        "stage_timings": report.get("stage_timings"),
+        "chain_breakdown": report.get("chain_breakdown"),
+        "lifecycle_timings": report.get("lifecycle_timings"),
+        "profile_stage_timings": report.get("profile_stage_timings"),
+        "profile_chain_breakdown": report.get("profile_chain_breakdown"),
+        "profile_lifecycle_timings": report.get("profile_lifecycle_timings"),
+        "metal_profile": report.get("metal_profile"),
+        "hal_profile": report.get("hal_profile"),
+    }
+
+
+def bench_perf_runtime_report(report: dict[str, Any]) -> dict[str, Any] | None:
+    row = bench_perf_default_row(report)
+    if row is None:
+        return None
+    return {
+        "schema": f"bench-perf-v{report.get('schema_version', 'unknown')}",
+        "rows": [row],
+    }
+
+
+def summarize_bench_perf(
+    report: dict[str, Any] | None,
+    path: Path | None,
+) -> dict[str, Any] | None:
+    if not report or report.get("status") != "ok":
+        return None
+    chain = report.get("chain_breakdown") or {}
+    profile_chain = report.get("profile_chain_breakdown") or {}
+    stage = report.get("stage_timings") or {}
+    profile_stage = report.get("profile_stage_timings") or {}
+    return {
+        "path": str(path) if path is not None else None,
+        "schema_version": report.get("schema_version"),
+        "ms_per_step": report.get("ms_per_step"),
+        "samples": report.get("samples"),
+        "ffn_ms_avg": chain.get("ffn_ms_avg"),
+        "linear_attn_ms_avg": chain.get("linear_attn_ms_avg"),
+        "full_attn_ms_avg": chain.get("full_attn_ms_avg"),
+        "lm_head_ms_avg": stage.get("lm_head_ms_avg"),
+        "profile_ffn_ms_avg": profile_chain.get("ffn_ms_avg"),
+        "profile_linear_attn_ms_avg": profile_chain.get("linear_attn_ms_avg"),
+        "profile_full_attn_ms_avg": profile_chain.get("full_attn_ms_avg"),
+        "profile_lm_head_ms_avg": profile_stage.get("lm_head_ms_avg"),
+    }
 
 
 def summarize_buckets(
@@ -277,18 +348,49 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
             "path": str(path),
             "status": "ok" if error is None else "error",
             "error": error,
-            "schema": report.get("schema") if report else None,
+            "schema": report_schema(report),
         }
         if error is not None:
             errors.append(f"{name}: {error}")
         elif report is not None:
             loaded[name] = report
 
+    bench_perf_path = getattr(args, "bench_perf_json", None)
+    bench_perf_explicit = bench_perf_path is not None
+    if bench_perf_path is None:
+        bench_perf_path = latest_bench_perf_json(
+            getattr(args, "bench_run_root", Path("target/bench-runs"))
+        )
+    bench_perf_report = None
+    if bench_perf_path is None:
+        input_reports["bench_perf"] = {
+            "path": None,
+            "status": "missing_optional",
+            "error": None,
+            "schema": None,
+        }
+    else:
+        report, error = load_report(bench_perf_path)
+        input_reports["bench_perf"] = {
+            "path": str(bench_perf_path),
+            "status": "ok" if error is None else "error",
+            "error": error,
+            "schema": report_schema(report),
+        }
+        if error is not None and bench_perf_explicit:
+            errors.append(f"bench_perf: {error}")
+        elif report is not None:
+            bench_perf_report = report
+
     runtime_reports = {
         name: loaded[name]
         for name in ("static_topn_runtime", "fused_routed_int4", "lru_resident_cache")
         if name in loaded
     }
+    if bench_perf_report is not None:
+        normalized = bench_perf_runtime_report(bench_perf_report)
+        if normalized is not None:
+            runtime_reports["bench_perf"] = normalized
     samples = collect_bucket_samples(runtime_reports)
     sota_report = loaded.get("sota_summary")
     exhausted_buckets = {"ffn_ms_avg"} if sota_report and ffn_gate_family_exhausted(sota_report.get("summary") or {}) else set()
@@ -305,6 +407,7 @@ def build_report(args: argparse.Namespace) -> dict[str, Any]:
         ),
         "recommendation": recommendation,
         "decode_bucket_ranking": bucket_rows,
+        "bench_perf": summarize_bench_perf(bench_perf_report, bench_perf_path),
         "prefill": summarize_prefill(loaded.get("batched_prefill_variants")),
         "top_metal_profile_ops": top_profile_entries(runtime_reports, "metal_profile"),
         "top_hal_profile_ops": top_profile_entries(runtime_reports, "hal_profile"),
@@ -368,6 +471,21 @@ def render_markdown(report: dict[str, Any]) -> str:
                 f"- promotion_gate_passed: `{str(bool(prefill.get('promotion_gate_passed'))).lower()}`",
             ]
         )
+    bench = report.get("bench_perf") or {}
+    if bench:
+        lines.extend(
+            [
+                "",
+                "## Bench Perf",
+                "",
+                f"- path: `{bench.get('path') or '-'}`",
+                f"- schema_version: `{bench.get('schema_version') or '-'}`",
+                f"- ms_per_step: `{fmt_float(bench.get('ms_per_step'))}`",
+                f"- linear_attn_ms_avg: `{fmt_float(bench.get('linear_attn_ms_avg'))}`",
+                f"- profile_linear_attn_ms_avg: `{fmt_float(bench.get('profile_linear_attn_ms_avg'))}`",
+                f"- ffn_ms_avg: `{fmt_float(bench.get('ffn_ms_avg'))}`",
+            ]
+        )
     lines.extend(
         [
             "",
@@ -419,6 +537,17 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--prefill-json",
         type=Path,
         default=Path("target/qwen36_metal_batched_prefill_variant_sweep.json"),
+    )
+    parser.add_argument(
+        "--bench-perf-json",
+        type=Path,
+        help="optional bench-perf JSON; defaults to the newest target/bench-runs/*/perf/qwen3.6-35b-a3b_int4.json",
+    )
+    parser.add_argument(
+        "--bench-run-root",
+        type=Path,
+        default=Path("target/bench-runs"),
+        help="run root used to auto-discover the latest bench-perf JSON",
     )
     parser.add_argument(
         "--out-json",
