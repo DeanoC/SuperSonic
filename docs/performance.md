@@ -866,8 +866,9 @@ The local-main-target workflow for this machine is:
 10. MTP Metal prompt-suite sweep: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/sweep_qwen36_mtp_acceptance.py --prompt-set smoke --metal-experiment`
 11. static top-N resident-table probe: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/probe_qwen36_static_topn.py`
 12. static top-N warm runtime sweep: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/sweep_qwen36_static_topn_runtime.py --modes default,static,static-hotset`
-13. routed-expert FFN microbench: `target/release/qwen36_ffn_expert_microbench --iters 20 --warmup 3`
-14. long-context comparison: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/bench_qwen36_longctx.py --preset comparison`
+13. MPS resident-table viability probe: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/probe_qwen36_mps_resident_table.py --run-pilot --require-pilot`
+14. routed-expert FFN microbench: `target/release/qwen36_ffn_expert_microbench --iters 20 --warmup 3`
+15. long-context comparison: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/bench_qwen36_longctx.py --preset comparison`
 
 The Metal long-context harness writes `target/qwen36_metal_longctx.json` and
 `target/qwen36_metal_longctx.md`. It uses deterministic NIAH-style prompts and
@@ -1260,6 +1261,21 @@ and static+hotset measured `decode_ms=1450`, `ffn_ms_avg=262.215`, and
 residency scaffold, but Qwen3.6 Metal should next target either a dense
 resident MPS/MPP table that can serve partial hits cheaply, or return to the
 prefill/orchestration buckets already shown to dominate long-context runs.
+
+`tests/metal/probe_qwen36_mps_resident_table.py` turns that fork into an
+explicit gate. It consumes `target/qwen36_static_topn_mps_probe.json`, optionally
+runs the existing `[qwen36-moe mps-expert-pilot]` row, and writes
+`target/qwen36_mps_resident_table_probe.{json,md}` with all-resident MPS,
+full-hit-only, and optimistic partial-hit estimates. The first direct
+`--run-pilot` smoke measured `gate_up_ms=1.312` and `down_ms=0.757`, giving an
+all-resident FP16 MPS floor of 82.76 ms/token versus the 98.761 ms/token
+default FFN baseline. Capacity 64 costs 15.00 GiB of FP16 MPS RHS storage,
+covers 69.9% of routed assignments, but fully serves only 9.8% of layer calls.
+The full-hit-only estimate is therefore only 97.20 ms/token, while the
+deliberately optimistic partial-hit estimate is 87.58 ms/token. That keeps a
+dense resident MPS path interesting only if it can serve resident hits and miss
+fallbacks inside the same layer without rebuilding per-token FP16 slabs; a
+full-hit-only bridge is not enough.
 
 The GPU-side active-slab pack probe is opt-in behind
 `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_GPU_PACK_STAGE5=1` on top of the

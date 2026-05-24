@@ -437,6 +437,17 @@ under the same smoke:
    and static+hotset at `decode_ms=1450` / `ffn_ms_avg=262.215`. Static top-N
    therefore remains a negative gate and a profiling scaffold, not the next
    runtime promotion.
+   The resident MPS follow-up is now a viability harness rather than a runtime
+   replacement. `tests/metal/probe_qwen36_mps_resident_table.py` consumes the
+   static top-N report plus the `[qwen36-moe mps-expert-pilot]` row and writes
+   cost rows for all-resident MPS, full-hit-only fallback, and optimistic
+   partial-hit fallback. With the current v2 static table and direct-pilot
+   timings (`gate_up_ms=1.312`, `down_ms=0.757`), capacity 64 needs 15.00 GiB
+   of resident FP16 RHS data, covers 69.9% of routed assignments, fully serves
+   only 9.8% of layer calls, estimates 97.20 ms/token for a full-hit-only
+   bridge, and estimates 87.58 ms/token only under the optimistic partial-hit
+   model. The next runtime implementation should therefore be a partial-hit
+   resident table, not another full-hit-only static bridge.
 
 4. **Qwen3.6 MTP tensor audit**
    Parse local safetensors/bakes for MTP heads and write down the loader delta
