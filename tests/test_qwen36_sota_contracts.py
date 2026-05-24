@@ -27,6 +27,10 @@ static_sweep = load_script(
     "qwen36_sota_static_sweep",
     METAL_DIR / "sweep_qwen36_static_topn_runtime.py",
 )
+fused_sweep = load_script(
+    "qwen36_sota_fused_sweep",
+    METAL_DIR / "sweep_qwen36_fused_routed_int4.py",
+)
 mps_probe = load_script(
     "qwen36_sota_mps_probe",
     METAL_DIR / "probe_qwen36_mps_resident_table.py",
@@ -53,6 +57,7 @@ class Qwen36SotaContractTests(unittest.TestCase):
             "qwen36-metal-batched-prefill-variant-sweep-v2",
         )
         self.assertEqual(static_sweep.SCHEMA, "qwen36-static-topn-runtime-sweep-v3")
+        self.assertEqual(fused_sweep.SCHEMA, "qwen36-fused-routed-int4-sweep-v1")
         self.assertEqual(mps_probe.SCHEMA, "qwen36-mps-resident-table-probe-v2")
         self.assertEqual(route_sweep.SCHEMA, "qwen36-route-residency-sweep-v1")
         self.assertEqual(mtp_sweep.SCHEMA, "qwen36-moe-mtp-acceptance-sweep-v2")
@@ -68,6 +73,10 @@ class Qwen36SotaContractTests(unittest.TestCase):
         self.assertEqual(
             specs["static_topn_runtime"].expected_schema,
             static_sweep.SCHEMA,
+        )
+        self.assertEqual(
+            specs["fused_routed_int4"].expected_schema,
+            fused_sweep.SCHEMA,
         )
         self.assertEqual(
             specs["mps_resident_table"].expected_schema,
@@ -154,6 +163,56 @@ class Qwen36SotaContractTests(unittest.TestCase):
         gate = report["summary"]["promotion_gate"]
         self.assertTrue(gate["passed"])
         self.assertEqual(gate["passed_modes"], ["router-topk"])
+        self.assertIn("thresholds", gate)
+        self.assertIn("candidates", gate)
+
+    def test_fused_routed_int4_sweep_exposes_promotion_gate(self):
+        rows = [
+            {
+                "status": "ok",
+                "prompt_id": "p",
+                "mode": "default",
+                "generated_ids": [1, 2],
+                "result": {"ms_per_step": 100.0},
+                "stage_timings": {"lm_head_ms_avg": 5.0},
+                "chain_breakdown": {
+                    "ffn_ms_avg": 50.0,
+                    "full_attn_ms_avg": 10.0,
+                    "linear_attn_ms_avg": 20.0,
+                },
+                "metal_profile": {
+                    "entries": [{"op": "command_buffer_wait", "total_ms": 100.0}]
+                },
+            },
+            {
+                "status": "ok",
+                "prompt_id": "p",
+                "mode": "direct-gather",
+                "generated_ids": [1, 2],
+                "result": {"ms_per_step": 90.0},
+                "stage_timings": {"lm_head_ms_avg": 5.1},
+                "chain_breakdown": {
+                    "ffn_ms_avg": 45.0,
+                    "full_attn_ms_avg": 10.5,
+                    "linear_attn_ms_avg": 21.0,
+                },
+                "metal_profile": {
+                    "entries": [{"op": "command_buffer_wait", "total_ms": 102.0}]
+                },
+            },
+        ]
+        args = fused_sweep.parse_args([])
+
+        report = fused_sweep.build_report(
+            rows,
+            args,
+            ["default", "direct-gather"],
+            "smoke",
+        )
+
+        gate = report["summary"]["promotion_gate"]
+        self.assertTrue(gate["passed"])
+        self.assertEqual(gate["passed_modes"], ["direct-gather"])
         self.assertIn("thresholds", gate)
         self.assertIn("candidates", gate)
 

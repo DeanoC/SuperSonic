@@ -43,6 +43,14 @@ GATE_SPECS = (
         kind="runtime_promotion",
     ),
     GateSpec(
+        gate_id="fused_routed_int4",
+        label="Fused routed INT4",
+        default_path=Path("target/qwen36_fused_routed_int4_sweep.json"),
+        expected_schema="qwen36-fused-routed-int4-sweep-v1",
+        gate_keys=("promotion_gate",),
+        kind="runtime_promotion",
+    ),
+    GateSpec(
         gate_id="mps_resident_table",
         label="MPS resident table",
         default_path=Path("target/qwen36_mps_resident_table_probe.json"),
@@ -458,21 +466,27 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="static top-N runtime sweep JSON",
     )
     parser.add_argument(
-        "--mps-json",
+        "--fused-json",
         type=Path,
         default=GATE_SPECS[2].default_path,
+        help="fused routed INT4 runtime sweep JSON",
+    )
+    parser.add_argument(
+        "--mps-json",
+        type=Path,
+        default=GATE_SPECS[3].default_path,
         help="MPS resident table probe JSON",
     )
     parser.add_argument(
         "--route-json",
         type=Path,
-        default=GATE_SPECS[3].default_path,
+        default=GATE_SPECS[4].default_path,
         help="route residency sweep JSON",
     )
     parser.add_argument(
         "--mtp-json",
         type=Path,
-        default=GATE_SPECS[4].default_path,
+        default=GATE_SPECS[5].default_path,
         help="MTP acceptance sweep JSON",
     )
     parser.add_argument(
@@ -507,6 +521,7 @@ def paths_from_args(args: argparse.Namespace) -> dict[str, Path]:
     return {
         "batched_prefill_variants": args.prefill_json,
         "static_topn_runtime": args.static_runtime_json,
+        "fused_routed_int4": args.fused_json,
         "mps_resident_table": args.mps_json,
         "route_residency": args.route_json,
         "mtp_acceptance": args.mtp_json,

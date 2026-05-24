@@ -551,12 +551,25 @@ under the same smoke:
    recommends a larger LRU resident cache, static resident table, or fused
    routed INT4 branch.
 
-9. **Qwen3.6 SOTA gate summary**
+9. **Qwen3.6 fused routed INT4 runtime sweep**
+   Preserve the fused routed INT4 branch as a measured runtime gate rather than
+   a note in the performance docs. `tests/metal/sweep_qwen36_fused_routed_int4.py`
+   compares `default`, `direct-gather`, and `gpu-pack` under the same prompt
+   suite, captures Metal/HAL profile rows when requested, and writes
+   `target/qwen36_fused_routed_int4_sweep.{json,md}`. Its nonfatal
+   `promotion_gate` uses the same promotion contract as the resident-runtime
+   probes: generated IDs must match default, headline decode and `ffn_ms_avg`
+   must improve, full-attention/linear-attention/lm-head must stay within the
+   regression threshold, and `command_buffer_wait` evidence must be present and
+   non-regressed when profile evidence is required.
+
+10. **Qwen3.6 SOTA gate summary**
    Preserve negative results as one roadmap-level artifact instead of leaving
    the promotion/viability decisions scattered across individual JSON files.
    `tests/metal/summarize_qwen36_sota_gates.py` reads the batched-prefill
-   variant sweep, static top-N runtime sweep, MPS resident-table probe, route
-   residency sweep, and MTP acceptance sweep reports, then writes
+   variant sweep, static top-N runtime sweep, fused routed INT4 runtime sweep,
+   MPS resident-table probe, route residency sweep, and MTP acceptance sweep
+   reports, then writes
    `target/qwen36_sota_gate_summary.{json,md}`. The v2 schema records input
    health, report age, passed and failed gate IDs, candidate failures, and a
    single `next_action`. Missing reports are nonfatal rows by default; `--require`

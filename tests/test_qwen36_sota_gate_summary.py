@@ -37,6 +37,7 @@ class Qwen36SotaGateSummaryTests(unittest.TestCase):
         return {
             "batched_prefill_variants": root / "prefill.json",
             "static_topn_runtime": root / "static.json",
+            "fused_routed_int4": root / "fused.json",
             "mps_resident_table": root / "mps.json",
             "route_residency": root / "route.json",
             "mtp_acceptance": root / "mtp.json",
@@ -47,6 +48,7 @@ class Qwen36SotaGateSummaryTests(unittest.TestCase):
         root: Path,
         prefill_gate: dict | None = None,
         static_gate: dict | None = None,
+        fused_gate: dict | None = None,
         mps_gate: dict | None = None,
         route_gate: dict | None = None,
         mtp_gate: dict | None = None,
@@ -80,8 +82,25 @@ class Qwen36SotaGateSummaryTests(unittest.TestCase):
             },
         )
         write_report(
-            paths["mps_resident_table"],
+            paths["fused_routed_int4"],
             script.GATE_SPECS[2].expected_schema,
+            "promotion_gate",
+            fused_gate
+            if fused_gate is not None
+            else {
+                "passed": False,
+                "candidates": [
+                    {
+                        "mode": "direct-gather",
+                        "passed": False,
+                        "failures": ["ffn_not_improved"],
+                    }
+                ],
+            },
+        )
+        write_report(
+            paths["mps_resident_table"],
+            script.GATE_SPECS[3].expected_schema,
             "viability_gate",
             mps_gate
             if mps_gate is not None
@@ -100,7 +119,7 @@ class Qwen36SotaGateSummaryTests(unittest.TestCase):
         )
         write_report(
             paths["route_residency"],
-            script.GATE_SPECS[3].expected_schema,
+            script.GATE_SPECS[4].expected_schema,
             "decision_gate",
             route_gate
             if route_gate is not None
@@ -119,7 +138,7 @@ class Qwen36SotaGateSummaryTests(unittest.TestCase):
         )
         write_report(
             paths["mtp_acceptance"],
-            script.GATE_SPECS[4].expected_schema,
+            script.GATE_SPECS[5].expected_schema,
             "promotion_gate",
             mtp_gate
             if mtp_gate is not None
@@ -136,7 +155,7 @@ class Qwen36SotaGateSummaryTests(unittest.TestCase):
             report = script.build_report(self.paths_in(Path(tmp)))
 
         self.assertEqual(report["schema"], script.SCHEMA)
-        self.assertEqual(report["summary"]["status_counts"], {"missing": 5})
+        self.assertEqual(report["summary"]["status_counts"], {"missing": 6})
         self.assertFalse(report["summary"]["all_inputs_ok"])
         self.assertEqual(
             report["summary"]["next_action"]["action"],
@@ -215,7 +234,7 @@ class Qwen36SotaGateSummaryTests(unittest.TestCase):
             report["summary"]["next_action"]["action"],
             "prototype_partial_hit_resident_mps",
         )
-        self.assertEqual(report["rows"][2]["passed_candidates"], ["partial_hit_optimistic:64"])
+        self.assertEqual(report["rows"][3]["passed_candidates"], ["partial_hit_optimistic:64"])
 
     def test_route_decision_pass_is_next_when_runtime_and_viability_fail(self):
         script = summarize_qwen36_sota_gates
@@ -240,7 +259,7 @@ class Qwen36SotaGateSummaryTests(unittest.TestCase):
             report["summary"]["next_action"]["action"],
             "prototype_larger_lru_resident_cache",
         )
-        self.assertEqual(report["rows"][3]["passed_candidates"], ["lru_hotset:64"])
+        self.assertEqual(report["rows"][4]["passed_candidates"], ["lru_hotset:64"])
 
     def test_malformed_schema_mismatch_and_missing_gate_are_reported(self):
         script = summarize_qwen36_sota_gates
@@ -255,18 +274,24 @@ class Qwen36SotaGateSummaryTests(unittest.TestCase):
                 {"passed": True, "passed_modes": ["static"]},
             )
             paths["mps_resident_table"].write_text(
-                json.dumps({"schema": script.GATE_SPECS[2].expected_schema, "summary": {}})
+                json.dumps({"schema": script.GATE_SPECS[3].expected_schema, "summary": {}})
                 + "\n"
             )
             write_report(
                 paths["route_residency"],
-                script.GATE_SPECS[3].expected_schema,
+                script.GATE_SPECS[4].expected_schema,
                 "decision_gate",
                 {"passed": False, "recommendation": "prefer_fused_routed_int4"},
             )
             write_report(
+                paths["fused_routed_int4"],
+                script.GATE_SPECS[2].expected_schema,
+                "promotion_gate",
+                {"passed": False, "failures": ["ffn_not_improved"]},
+            )
+            write_report(
                 paths["mtp_acceptance"],
-                script.GATE_SPECS[4].expected_schema,
+                script.GATE_SPECS[5].expected_schema,
                 "promotion_gate",
                 {"passed": False, "failures": ["acceptance_below_threshold"]},
             )
@@ -276,6 +301,7 @@ class Qwen36SotaGateSummaryTests(unittest.TestCase):
         self.assertEqual(statuses["batched_prefill_variants"], "malformed")
         self.assertEqual(statuses["static_topn_runtime"], "schema_mismatch")
         self.assertEqual(statuses["mps_resident_table"], "missing_gate")
+        self.assertEqual(statuses["fused_routed_int4"], "ok")
         self.assertEqual(statuses["mtp_acceptance"], "ok")
         self.assertEqual(report["summary"]["input_failure_count"], 3)
         self.assertIn("static_topn_runtime", report["summary"]["next_action"]["blocked_reason"])
@@ -293,7 +319,7 @@ class Qwen36SotaGateSummaryTests(unittest.TestCase):
         statuses = {row["gate_id"]: row["status"] for row in report["rows"]}
         self.assertEqual(set(statuses.values()), {"stale"})
         self.assertFalse(report["summary"]["all_inputs_ok"])
-        self.assertEqual(report["summary"]["status_counts"], {"stale": 5})
+        self.assertEqual(report["summary"]["status_counts"], {"stale": 6})
         self.assertEqual(report["rows"][0]["recommendation_action"], "refresh_harness")
         self.assertIn("report age", report["rows"][0]["error"])
         self.assertIsNotNone(report["rows"][0]["mtime_utc"])
@@ -320,6 +346,8 @@ class Qwen36SotaGateSummaryTests(unittest.TestCase):
                     str(missing),
                     "--static-runtime-json",
                     str(paths["static_topn_runtime"]),
+                    "--fused-json",
+                    str(paths["fused_routed_int4"]),
                     "--mps-json",
                     str(paths["mps_resident_table"]),
                     "--route-json",

@@ -1396,6 +1396,28 @@ avoids random giant-buffer gathers. The native INT4 static top-N probe now
 covers the narrow static-table branch; MPS/MPP remains the next heavier
 resident-matvec option if static full-hit rates are not high enough.
 
+The fused routed INT4 variants are now covered by a promotion-gated runtime
+sweep rather than only one-off smoke notes:
+
+```bash
+SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" \
+  python3 tests/metal/sweep_qwen36_fused_routed_int4.py \
+    --prompt-set smoke --metal-profile
+```
+
+The sweep compares `default`, `direct-gather`, and `gpu-pack` under the same
+prompt and generated-token parity key, records Metal/HAL profile rows when
+requested, and writes `target/qwen36_fused_routed_int4_sweep.{json,md}`. Its
+nonfatal `promotion_gate` requires generated IDs to match default, headline
+decode and `ffn_ms_avg` to improve, full-attention/linear-attention/lm-head not
+to regress beyond the configured threshold, and `command_buffer_wait` evidence
+to be present and non-regressed. The SOTA summary consumes this report as the
+machine-readable gate for the fused routed INT4 fork. The first one-token
+profiled smoke preserved `[11]` for all modes and rejected both candidates:
+`default` measured `decode_ms=406` / `ffn_ms_avg=190.904`, `direct-gather`
+measured `806` / `661.302`, and `gpu-pack` measured `863` / `693.948`, with
+both fused candidates failing headline, FFN, and command-buffer-wait gates.
+
 The first MPS bridge step is now an attribution probe, not a decode path. With
 `SUPERSONIC_METAL_QWEN36_MPS_EXPERT_PILOT=1`, the runner appends a
 `[qwen36-moe mps-expert-pilot]` row and bench perf JSON schema v7 records it as
