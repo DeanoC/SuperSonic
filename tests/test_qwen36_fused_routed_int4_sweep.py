@@ -451,6 +451,8 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
             metal_profile_phases=False,
             router_parity_tap=True,
             router_parity_tap_max_calls=3,
+            shared_parity_tap=True,
+            shared_parity_tap_max_calls=5,
         )
         tap_router = script.build_env_overrides(tap_args, "full-stage5-router")
         self.assertEqual(
@@ -460,6 +462,14 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
         self.assertEqual(
             tap_router["SUPERSONIC_METAL_QWEN36_FFN_ROUTER_STAGE5_PARITY_TAP_MAX_CALLS"],
             "3",
+        )
+        self.assertEqual(
+            tap_router["SUPERSONIC_METAL_QWEN36_FFN_SHARED_STAGE5_PARITY_TAP"],
+            "1",
+        )
+        self.assertEqual(
+            tap_router["SUPERSONIC_METAL_QWEN36_FFN_SHARED_STAGE5_PARITY_TAP_MAX_CALLS"],
+            "5",
         )
         snapshot_args = Namespace(
             metal_profile=False,
@@ -1032,6 +1042,65 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
         self.assertIn("## Router Parity Tap", md)
         self.assertIn("| hello | full-stage5-router | simd | 5 | false | 1 |", md)
         self.assertEqual(report["summary"]["router_parity"]["paths"], ["simd"])
+
+    def test_shared_parity_tap_rows_are_parsed_and_rendered(self):
+        script = sweep_qwen36_fused_routed_int4
+        output = (
+            "[qwen36-ffn-shared-parity] call=0 layer=5 shared_path=gate_up_tiled "
+            "shared_gate_max_abs=1.25000000e-01 shared_gate_argmax=17 "
+            "shared_up_max_abs=6.25000000e-02 shared_up_argmax=19 "
+            "shared_mid_max_abs=5.00000000e-01 shared_mid_argmax=23 "
+            "shared_scalar_abs=3.12500000e-02 "
+            "host_shared_scalar=5.00000000e-01 metal_shared_scalar=5.31250000e-01 "
+            "shared_out_max_abs=2.50000000e-01 shared_out_argmax=33 "
+            "host_shared_out_at_argmax=1.25000000e+00 "
+            "metal_shared_out_at_argmax=1.00000000e+00\n"
+        )
+
+        taps = script.parse_shared_parity_taps(output)
+
+        self.assertEqual(len(taps), 1)
+        self.assertEqual(taps[0]["layer"], 5)
+        self.assertEqual(taps[0]["shared_path"], "gate_up_tiled")
+        self.assertAlmostEqual(taps[0]["shared_mid_max_abs"], 0.5)
+        self.assertEqual(taps[0]["shared_out_argmax"], 33)
+
+        args = Namespace(
+            max_new_tokens=2,
+            context_size=64,
+            metal_profile=False,
+            metal_profile_phases=False,
+            router_parity_tap=False,
+            router_parity_tap_max_calls=40,
+            shared_parity_tap=True,
+            shared_parity_tap_max_calls=3,
+            promotion_max_headline_ratio=0.999,
+            promotion_max_ffn_ratio=0.999,
+            promotion_max_component_regression_ratio=1.10,
+            promotion_max_command_buffer_wait_ratio=1.05,
+            promotion_max_fused_wall_gpu_ratio=4.0,
+            promotion_max_wait_gpu_ratio=4.0,
+            promotion_require_profile=False,
+        )
+        candidate = row("full-stage5-router-simd-batch-shared-gate-up-tiled")
+        candidate["shared_parity_taps"] = taps
+        report = script.build_report(
+            [row("default"), candidate],
+            args,
+            ["default", "full-stage5-router-simd-batch-shared-gate-up-tiled"],
+            "smoke",
+        )
+        md = script.render_markdown(report)
+
+        self.assertIn("shared_parity_tap: `True`", md)
+        self.assertIn("shared_parity_tap_count: `1`", md)
+        self.assertIn("shared_parity_max_out_abs: `0.25000000`", md)
+        self.assertIn("## Shared Expert Parity Tap", md)
+        self.assertIn(
+            "| hello | full-stage5-router-simd-batch-shared-gate-up-tiled | gate_up_tiled | 5 |",
+            md,
+        )
+        self.assertEqual(report["summary"]["shared_parity"]["paths"], ["gate_up_tiled"])
 
     def test_router_parity_tap_selection_keeps_each_path(self):
         script = sweep_qwen36_fused_routed_int4

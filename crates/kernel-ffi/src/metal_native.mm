@@ -98,6 +98,8 @@ struct Qwen36FfnInt4Params {
     uint32_t off_topk_val;
     uint32_t off_topk_idx;
     uint32_t off_sg_scalar;
+    uint32_t off_sgp;
+    uint32_t off_sup;
     uint32_t off_shared_mid;
     uint32_t off_shared_out;
     uint32_t off_expert_mid;
@@ -2738,6 +2740,8 @@ struct Qwen36FfnInt4Params {
     uint off_topk_val;
     uint off_topk_idx;
     uint off_sg_scalar;
+    uint off_sgp;
+    uint off_sup;
     uint off_shared_mid;
     uint off_shared_out;
     uint off_expert_mid;
@@ -3174,6 +3178,8 @@ kernel void supersonic_qwen36_ffn_shared_gate_up(
             shared_up_proj, shared_up_scale, shared_up_zero,
             h_norm, row, params.hidden, params.group_size
         );
+        workspace[params.off_sgp + row] = gate;
+        workspace[params.off_sup + row] = up;
         workspace[params.off_shared_mid + row] = silu(gate) * up;
     }
 }
@@ -3226,6 +3232,8 @@ kernel void supersonic_qwen36_ffn_shared_gate_up_tiled(
         float gate = simd_sum(gate_in);
         float up = simd_sum(up_in);
         if (lane == 0u) {
+            workspace[params.off_sgp + row] = gate;
+            workspace[params.off_sup + row] = up;
             workspace[params.off_shared_mid + row] = silu(gate) * up;
         }
     }
@@ -12386,6 +12394,8 @@ extern "C" int supersonic_metal_qwen36_ffn_expert_gate_up_down_finalize_tiled(
             static_cast<uint32_t>(off_topk_idx),
             0u,
             0u,
+            0u,
+            0u,
             static_cast<uint32_t>(off_shared_out),
             static_cast<uint32_t>(off_expert_mid),
             static_cast<uint32_t>(off_moe_out),
@@ -12532,6 +12542,8 @@ extern "C" int supersonic_metal_qwen36_ffn_expert_direct_gather_stage5(
             static_cast<uint32_t>(off_h_norm),
             static_cast<uint32_t>(off_topk_val),
             static_cast<uint32_t>(off_topk_idx),
+            0u,
+            0u,
             0u,
             0u,
             static_cast<uint32_t>(off_shared_out),
@@ -12960,6 +12972,8 @@ extern "C" int supersonic_metal_qwen36_ffn_expert_gpu_pack_gate_up_down_finalize
             static_cast<uint32_t>(off_topk_idx),
             0u,
             0u,
+            0u,
+            0u,
             static_cast<uint32_t>(off_shared_out),
             static_cast<uint32_t>(off_expert_mid),
             static_cast<uint32_t>(off_moe_out),
@@ -13223,6 +13237,8 @@ extern "C" int supersonic_metal_qwen36_ffn_int4_stage5(
             off_topk_val,
             off_topk_idx,
             off_sg_scalar,
+            off_sgp,
+            off_sup,
             off_shared_mid,
             off_shared_out,
             off_expert_mid,
@@ -13542,6 +13558,8 @@ extern "C" int supersonic_metal_qwen36_ffn_int4_stage5_with_router(
             off_topk_val,
             off_topk_idx,
             off_sg_scalar,
+            off_sgp,
+            off_sup,
             off_shared_mid,
             off_shared_out,
             off_expert_mid,
@@ -13823,6 +13841,8 @@ extern "C" int supersonic_metal_qwen36_ffn_expert_mps_transcode_int4_f16(
             0u,
             0u,
             0u,
+            0u,
+            0u,
         };
 
         auto encode = [&](id<MTLComputeCommandEncoder> encoder) {
@@ -13999,6 +14019,8 @@ extern "C" int supersonic_metal_qwen36_ffn_expert_mps_bridge_f16(
             0u,
             0u,
             static_cast<uint32_t>(off_topk_val),
+            0u,
+            0u,
             0u,
             0u,
             0u,
@@ -14211,6 +14233,8 @@ extern "C" int supersonic_metal_qwen36_ffn_expert_mps_bridge_indexed_f16(
             0u,
             0u,
             static_cast<uint32_t>(off_topk_val),
+            0u,
+            0u,
             0u,
             0u,
             0u,

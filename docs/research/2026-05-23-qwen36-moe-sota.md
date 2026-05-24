@@ -1335,6 +1335,46 @@ under the same smoke:
    a larger routed-expert arithmetic target where the existing tiled reductions
    are already accepted and the profile still has significant GPU work.
 
+39. **Qwen3.6 shared-expert parity tap**
+   The shared-expert parity tap now mirrors the router tap shape with
+   `SUPERSONIC_METAL_QWEN36_FFN_SHARED_STAGE5_PARITY_TAP=1` and
+   `SUPERSONIC_METAL_QWEN36_FFN_SHARED_STAGE5_PARITY_TAP_MAX_CALLS`. It emits
+   `[qwen36-ffn-shared-parity]` rows for `shared_gate`, `shared_up`,
+   `shared_mid`, `shared_scalar`, and `shared_out`; the v15 fused-routed sweep
+   parses those rows into `shared_parity` JSON and Markdown. The Metal native
+   shared gate/up kernels now also publish gate and up intermediates into the
+   already-reserved workspace slots, so the tap is reading real Metal state
+   rather than unwritten scratch.
+
+   A non-batched control run,
+   `--modes default,full-stage5-router,full-stage5-router-simd
+   --shared-parity-tap --shared-parity-tap-max-calls 80`, passed with
+   `rows=3`, `ok=3`, and matching generated IDs. Its shared tap was clean:
+   `max_shared_gate_abs=0`, `max_shared_up_abs=0`,
+   `max_shared_mid_abs=7.15e-7`, `max_shared_scalar_abs=2.98e-8`, and
+   `max_shared_out_abs=6.10e-5`. That validates the tap and the default
+   non-batched Metal shared path against the host-order reference.
+
+   The batched shared probe,
+   `--modes default,full-stage5-router-simd-batch,
+   full-stage5-router-simd-batch-shared-gate-up-tiled,
+   full-stage5-router-simd-batch-shared-scalar-simd,
+   full-stage5-router-simd-batch-shared-tiled --shared-parity-tap`, also
+   passed `rows=5`, `ok=5`, and one-token ID matching, but the shared tap
+   reported large deltas: `max_shared_gate_abs=15.61`,
+   `max_shared_up_abs=17.32`, `max_shared_mid_abs=126.21`,
+   `max_shared_scalar_abs=0.566`, and `max_shared_out_abs=6.828`. Router tap
+   rows stayed disabled in that run, confirming the shared and router tap gates
+   are independent.
+
+   Because the same tap is clean in non-batched stage-5 and noisy in batched
+   decode, the next correctness step is not another shared reduction rewrite.
+   The next implementation target should be a batch-native shared parity tap
+   inside the decode-batch FFN path, using the exact token/layer hidden row and
+   workspace buffers that `qwen36_decode_batch_ffn` consumes. Only after that
+   tap can distinguish true shared arithmetic drift from batch tap/reference
+   sequencing should the shared tiled probes be reconsidered for promotion.
+
 ## Sources
 
 - [Qwen/Qwen3.6-35B-A3B model card](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)

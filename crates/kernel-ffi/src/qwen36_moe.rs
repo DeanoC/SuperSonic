@@ -40,6 +40,7 @@ static QWEN36_BATCHED_PREFILL_FEASIBILITY_PROFILE: OnceLock<
     Mutex<Qwen36BatchedPrefillFeasibilityConfig>,
 > = OnceLock::new();
 static QWEN36_FFN_ROUTER_PARITY_TAP_CALLS: AtomicUsize = AtomicUsize::new(0);
+static QWEN36_FFN_SHARED_PARITY_TAP_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug, Clone, Default)]
 struct Qwen36RouteProfileAccumulator {
@@ -3900,6 +3901,11 @@ fn qwen36_ffn_router_stage5_parity_tap_enabled() -> bool {
         && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
 }
 
+fn qwen36_ffn_shared_stage5_parity_tap_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_QWEN36_FFN_SHARED_STAGE5_PARITY_TAP").is_some()
+        && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
+}
+
 fn qwen36_ffn_router_stage5_simd_env_enabled() -> bool {
     std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_STAGE5_SIMD").is_some()
         && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
@@ -3913,12 +3919,47 @@ fn qwen36_ffn_router_stage5_parity_tap_max_calls() -> usize {
         .unwrap_or(40)
 }
 
+fn qwen36_ffn_shared_stage5_parity_tap_max_calls() -> usize {
+    std::env::var("SUPERSONIC_METAL_QWEN36_FFN_SHARED_STAGE5_PARITY_TAP_MAX_CALLS")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(40)
+}
+
+fn qwen36_ffn_shared_stage5_path_label() -> &'static str {
+    let all = std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_SHARED_TILED").is_some();
+    let gate_up = all
+        || std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_SHARED_GATE_UP_TILED").is_some();
+    let scalar =
+        all || std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_SHARED_SCALAR_SIMD").is_some();
+    let down =
+        all || std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_SHARED_DOWN_TILED").is_some();
+    match (gate_up, scalar, down) {
+        (true, true, true) => "all_tiled",
+        (true, false, false) => "gate_up_tiled",
+        (false, true, false) => "scalar_simd",
+        (false, false, true) => "down_tiled",
+        (false, false, false) => "host_order",
+        _ => "mixed",
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Qwen36FfnRouterReference {
     h_norm: Vec<f32>,
     logits: Vec<f32>,
     topk_idx: Vec<u32>,
     topk_weight: Vec<f32>,
+}
+
+#[derive(Debug, Clone)]
+struct Qwen36FfnSharedReference {
+    shared_gate: Vec<f32>,
+    shared_up: Vec<f32>,
+    shared_mid: Vec<f32>,
+    shared_out: Vec<f32>,
+    shared_scalar: f32,
 }
 
 fn qwen36_compute_ffn_router_reference(
@@ -3996,6 +4037,83 @@ fn qwen36_compute_ffn_router_reference(
         logits,
         topk_idx,
         topk_weight,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen36_compute_ffn_shared_reference(
+    h_norm: &[f32],
+    shared_expert_gate_w: &[u16],
+    shared_gate_w: usize,
+    shared_gate_scale: usize,
+    shared_gate_zero: usize,
+    shared_up_w: usize,
+    shared_up_scale: usize,
+    shared_up_zero: usize,
+    shared_down_w: usize,
+    shared_down_scale: usize,
+    shared_down_zero: usize,
+    hidden: usize,
+    shared_intermediate: usize,
+    group_size: usize,
+) -> Qwen36FfnSharedReference {
+    let mut shared_gate = vec![0.0f32; shared_intermediate];
+    let mut shared_up = vec![0.0f32; shared_intermediate];
+    for row in 0..shared_intermediate {
+        shared_gate[row] = qwen36_dense_or_int4_dot_2d_unchecked(
+            shared_gate_w,
+            shared_gate_scale,
+            shared_gate_zero,
+            row,
+            hidden,
+            group_size,
+            h_norm,
+        );
+        shared_up[row] = qwen36_dense_or_int4_dot_2d_unchecked(
+            shared_up_w,
+            shared_up_scale,
+            shared_up_zero,
+            row,
+            hidden,
+            group_size,
+            h_norm,
+        );
+    }
+
+    let mut sg_acc = 0.0f32;
+    for col in 0..hidden {
+        sg_acc += bf16_bits_to_f32(shared_expert_gate_w[col]) * h_norm[col];
+    }
+    let shared_scalar = 1.0f32 / (1.0f32 + (-sg_acc).exp());
+
+    let mut shared_mid = vec![0.0f32; shared_intermediate];
+    for i in 0..shared_intermediate {
+        let gp = shared_gate[i];
+        let up = shared_up[i];
+        let silu = gp * (1.0f32 / (1.0f32 + (-gp).exp()));
+        shared_mid[i] = silu * up;
+    }
+
+    let mut shared_out = vec![0.0f32; hidden];
+    for row in 0..hidden {
+        let acc = qwen36_dense_or_int4_dot_2d_unchecked(
+            shared_down_w,
+            shared_down_scale,
+            shared_down_zero,
+            row,
+            shared_intermediate,
+            group_size,
+            &shared_mid,
+        );
+        shared_out[row] = bf16_round_f32(shared_scalar * acc);
+    }
+
+    Qwen36FfnSharedReference {
+        shared_gate,
+        shared_up,
+        shared_mid,
+        shared_out,
+        shared_scalar,
     }
 }
 
@@ -4159,6 +4277,76 @@ fn qwen36_emit_ffn_router_stage5_parity_tap(
         qwen36_join_u32(output_topk_idx),
         qwen36_join_f32(&reference.topk_weight),
         qwen36_join_f32(topk_weight),
+    );
+
+    Ok(())
+}
+
+fn qwen36_emit_ffn_shared_stage5_parity_tap(
+    ordinal: usize,
+    layer_idx: i32,
+    workspace: &GpuBuffer,
+    hidden: usize,
+    shared_intermediate: usize,
+    off_sg_scalar: usize,
+    off_sgp: usize,
+    off_sup: usize,
+    off_shared_mid: usize,
+    off_shared_out: usize,
+    reference: &Qwen36FfnSharedReference,
+) -> Result<(), GpuError> {
+    let call = QWEN36_FFN_SHARED_PARITY_TAP_CALLS.fetch_add(1, Ordering::Relaxed);
+    if call >= qwen36_ffn_shared_stage5_parity_tap_max_calls() {
+        return Ok(());
+    }
+
+    gpu_hal::sync(ordinal)?;
+    let workspace_bytes = workspace.to_host_bytes()?;
+    let workspace_f32 = qwen36_bytes_to_f32_vec(&workspace_bytes);
+
+    let shared_gate = &workspace_f32[off_sgp..off_sgp + shared_intermediate];
+    let shared_up = &workspace_f32[off_sup..off_sup + shared_intermediate];
+    let shared_mid = &workspace_f32[off_shared_mid..off_shared_mid + shared_intermediate];
+    let shared_out = &workspace_f32[off_shared_out..off_shared_out + hidden];
+    let shared_scalar = workspace_f32[off_sg_scalar];
+
+    let (shared_gate_max_abs, shared_gate_argmax) =
+        qwen36_max_abs_delta(&reference.shared_gate, shared_gate);
+    let (shared_up_max_abs, shared_up_argmax) =
+        qwen36_max_abs_delta(&reference.shared_up, shared_up);
+    let (shared_mid_max_abs, shared_mid_argmax) =
+        qwen36_max_abs_delta(&reference.shared_mid, shared_mid);
+    let (shared_out_max_abs, shared_out_argmax) =
+        qwen36_max_abs_delta(&reference.shared_out, shared_out);
+    let shared_scalar_abs = (reference.shared_scalar - shared_scalar).abs();
+    let host_shared_out_at_argmax = reference
+        .shared_out
+        .get(shared_out_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let metal_shared_out_at_argmax = shared_out
+        .get(shared_out_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
+
+    eprintln!(
+        "[qwen36-ffn-shared-parity] call={} layer={} shared_path={} shared_gate_max_abs={:.8e} shared_gate_argmax={} shared_up_max_abs={:.8e} shared_up_argmax={} shared_mid_max_abs={:.8e} shared_mid_argmax={} shared_scalar_abs={:.8e} host_shared_scalar={:.8e} metal_shared_scalar={:.8e} shared_out_max_abs={:.8e} shared_out_argmax={} host_shared_out_at_argmax={:.8e} metal_shared_out_at_argmax={:.8e}",
+        call,
+        layer_idx,
+        qwen36_ffn_shared_stage5_path_label(),
+        shared_gate_max_abs,
+        shared_gate_argmax,
+        shared_up_max_abs,
+        shared_up_argmax,
+        shared_mid_max_abs,
+        shared_mid_argmax,
+        shared_scalar_abs,
+        reference.shared_scalar,
+        shared_scalar,
+        shared_out_max_abs,
+        shared_out_argmax,
+        host_shared_out_at_argmax,
+        metal_shared_out_at_argmax,
     );
 
     Ok(())
@@ -7390,7 +7578,9 @@ fn ffn_step_stage1_5_metal_host(
             int4.group_size,
             "down_proj",
         )?;
-        let router_reference = if qwen36_ffn_router_stage5_parity_tap_enabled() {
+        let router_parity_tap = qwen36_ffn_router_stage5_parity_tap_enabled();
+        let shared_parity_tap = qwen36_ffn_shared_stage5_parity_tap_enabled();
+        let router_reference = if router_parity_tap || shared_parity_tap {
             let input =
                 unsafe { std::slice::from_raw_parts(weights.input_hidden as *const u16, hidden) };
             let norm_w = unsafe {
@@ -7407,6 +7597,35 @@ fn ffn_step_stage1_5_metal_host(
                 num_experts,
                 top_k,
                 params.rms_norm_eps,
+            ))
+        } else {
+            None
+        };
+        let shared_reference = if shared_parity_tap {
+            let shared_expert_gate_w = unsafe {
+                std::slice::from_raw_parts(weights.shared_expert_gate_w as *const u16, hidden)
+            };
+            let reference = router_reference.as_ref().ok_or_else(|| {
+                GpuError::InvalidArg(
+                    "qwen36_moe::ffn_step_launch: shared parity tap missing router reference"
+                        .into(),
+                )
+            })?;
+            Some(qwen36_compute_ffn_shared_reference(
+                &reference.h_norm,
+                shared_expert_gate_w,
+                weights.shared_gate_proj_w as usize,
+                int4.shared_gate_proj_scale as usize,
+                int4.shared_gate_proj_zero as usize,
+                weights.shared_up_proj_w as usize,
+                int4.shared_up_proj_scale as usize,
+                int4.shared_up_proj_zero as usize,
+                weights.shared_down_proj_w as usize,
+                int4.shared_down_proj_scale as usize,
+                int4.shared_down_proj_zero as usize,
+                hidden,
+                shared_intermediate,
+                int4.group_size.max(0) as usize,
             ))
         } else {
             None
@@ -7451,7 +7670,13 @@ fn ffn_step_stage1_5_metal_host(
             },
         );
         if status.is_ok() {
-            if let Some(reference) = router_reference.as_ref() {
+            if router_parity_tap {
+                let reference = router_reference.as_ref().ok_or_else(|| {
+                    GpuError::InvalidArg(
+                        "qwen36_moe::ffn_step_launch: router parity tap missing router reference"
+                            .into(),
+                    )
+                })?;
                 qwen36_emit_ffn_router_stage5_parity_tap(
                     ordinal,
                     params.layer_idx,
@@ -7464,6 +7689,21 @@ fn ffn_step_stage1_5_metal_host(
                     off_router_logits,
                     off_topk_val,
                     off_topk_idx,
+                    reference,
+                )?;
+            }
+            if let Some(reference) = shared_reference.as_ref() {
+                qwen36_emit_ffn_shared_stage5_parity_tap(
+                    ordinal,
+                    params.layer_idx,
+                    workspace,
+                    hidden,
+                    shared_intermediate,
+                    off_sg_scalar,
+                    off_sgp,
+                    off_sup,
+                    off_shared_mid,
+                    off_shared_out,
                     reference,
                 )?;
             }
