@@ -149,12 +149,17 @@ fn qwen36_metal_decode_batch_enabled(
         && !capture
         && !accurate_stage_timings
         && !has_expert_prefetch
-        && std::env::var_os("SUPERSONIC_METAL_PROFILE_QWEN36_FFN_PHASES").is_none()
+        && (std::env::var_os("SUPERSONIC_METAL_PROFILE_QWEN36_FFN_PHASES").is_none()
+            || qwen36_metal_decode_batch_ffn_profile_phases_enabled())
         && std::env::var_os("SUPERSONIC_METAL_QWEN36_FFN_ROUTER_STAGE5_PARITY_TAP").is_none()
 }
 
 fn qwen36_metal_decode_batch_profile_phases_enabled() -> bool {
     std::env::var_os("SUPERSONIC_METAL_QWEN36_DECODE_BATCH_PROFILE_PHASES").is_some()
+}
+
+fn qwen36_metal_decode_batch_ffn_profile_phases_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_QWEN36_DECODE_BATCH_PROFILE_FFN_PHASES").is_some()
 }
 
 fn flush_active_metal_decode_batch(label: &str) -> Result<bool> {

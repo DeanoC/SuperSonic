@@ -1084,6 +1084,39 @@ under the same smoke:
    reducing `qwen36_decode_batch_ffn` GPU time, with the phase mode kept as the
    proof harness for each FFN sub-kernel change.
 
+32. **Qwen3.6 batched FFN subphase attribution**
+   The FFN proof harness now has a narrower batch-compatible subphase mode,
+   `full-stage5-router-batch-ffn-phases`, guarded by
+   `SUPERSONIC_METAL_QWEN36_DECODE_BATCH_PROFILE_FFN_PHASES=1` stacked on
+   decode batching, stage-5 router FFN, and
+   `SUPERSONIC_METAL_PROFILE_QWEN36_FFN_PHASES=1`. The runner only allows
+   FFN phase profiling inside a decode batch when this env is present, and the
+   Metal native split-profile path flushes after each labeled FFN subdispatch
+   so the profile records stable per-phase GPU rows. The fused-routed INT4
+   sweep is now schema v8 and records JSON fields for router top-k, shared
+   gate/up, shared scalar, shared down, expert gate/up, expert down/finalize,
+   and the summed FFN-subphase GPU total.
+
+   The first smoke comparison preserved default generated IDs
+   `[11, 271, 40, 599]` across `default`,
+   `full-stage5-router-batch-phases`, and
+   `full-stage5-router-batch-ffn-phases`. In that run, default measured
+   `287.6 ms/token`. The coarse batch phase row measured `318.4 ms/token`,
+   with `decode_batch_ffn_gpu_ms=391.358` and
+   `decode_batch_linear_gpu_ms=32.729`. The FFN-subphase row measured
+   `516.8 ms/token` because it intentionally flushes every FFN subdispatch;
+   treat that row as attribution only, not as a promotion candidate.
+
+   The subphase GPU sum was `223.285 ms`: router top-k `119.303 ms`,
+   shared gate/up `32.349 ms`, shared scalar `22.823 ms`, expert gate/up
+   `21.293 ms`, expert down/finalize `13.962 ms`, and shared down
+   `13.555 ms`. Command-buffer wait rose to `1906.450 ms`
+   (`wait/GPU=8.54`) in the split lane, confirming the lane is profiling
+   overhead-heavy. The arithmetic signal is still clear: router top-k is about
+   53% of the labeled FFN GPU work, so the next optimization should target
+   `qwen36_ffn_int4_router_topk_stage5` before revisiting shared/expert matvec
+   tiling.
+
 ## Sources
 
 - [Qwen/Qwen3.6-35B-A3B model card](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)

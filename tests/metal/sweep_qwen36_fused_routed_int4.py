@@ -15,10 +15,14 @@ from typing import Any
 
 
 MODEL = "qwen3.6-35b-a3b"
-SCHEMA = "qwen36-fused-routed-int4-sweep-v7"
+SCHEMA = "qwen36-fused-routed-int4-sweep-v8"
 DEFAULT_MAX_FUSED_WALL_GPU_RATIO = 4.0
 DEFAULT_MAX_WAIT_GPU_RATIO = 4.0
-BATCH_FAST_PROFILE_MODES = {"full-stage5-router-batch", "full-stage5-router-batch-phases"}
+BATCH_FAST_PROFILE_MODES = {
+    "full-stage5-router-batch",
+    "full-stage5-router-batch-phases",
+    "full-stage5-router-batch-ffn-phases",
+}
 
 PROMPT_SETS: dict[str, list[tuple[str, str]]] = {
     "smoke": [("hello", "Hello")],
@@ -61,6 +65,10 @@ MODE_ALIASES: dict[str, str] = {
     "batch-router-phases": "full-stage5-router-batch-phases",
     "full-router-batch-phases": "full-stage5-router-batch-phases",
     "full-stage5-router-batch-phases": "full-stage5-router-batch-phases",
+    "router-batch-ffn-phases": "full-stage5-router-batch-ffn-phases",
+    "batch-router-ffn-phases": "full-stage5-router-batch-ffn-phases",
+    "full-router-batch-ffn-phases": "full-stage5-router-batch-ffn-phases",
+    "full-stage5-router-batch-ffn-phases": "full-stage5-router-batch-ffn-phases",
     "router-defer": "router-defer-wait",
     "router-defer-wait": "router-defer-wait",
     "defer-router-wait": "router-defer-wait",
@@ -76,6 +84,7 @@ FUSED_OP_NEEDLES = {
     "full-stage5-router": "qwen36_ffn_int4_stage5_with_router",
     "full-stage5-router-batch": "qwen36_ffn_int4_stage5_with_router",
     "full-stage5-router-batch-phases": "qwen36_ffn_int4_stage5_with_router",
+    "full-stage5-router-batch-ffn-phases": "qwen36_ffn_int4",
     "router-defer-wait": "qwen36_ffn_int4_stage5_with_router",
 }
 
@@ -121,6 +130,14 @@ FUSED_GPU_OP_PREFIXES = {
         "command_buffer_gpu:qwen36_ffn_int4_expert_gate_up_tiled_stage5",
         "command_buffer_gpu:qwen36_ffn_int4_expert_down_finalize",
     ),
+    "full-stage5-router-batch-ffn-phases": (
+        "command_buffer_gpu:qwen36_ffn_int4_router_topk_stage5",
+        "command_buffer_gpu:qwen36_ffn_int4_shared_gate_up",
+        "command_buffer_gpu:qwen36_ffn_int4_shared_gate_scalar",
+        "command_buffer_gpu:qwen36_ffn_int4_shared_down",
+        "command_buffer_gpu:qwen36_ffn_int4_expert_gate_up_tiled_stage5",
+        "command_buffer_gpu:qwen36_ffn_int4_expert_down_finalize",
+    ),
     "router-defer-wait": (
         "command_buffer_gpu:qwen36_ffn_int4_stage5_with_router",
         "command_buffer_gpu:qwen36_ffn_int4_router_topk_stage5",
@@ -130,6 +147,15 @@ FUSED_GPU_OP_PREFIXES = {
         "command_buffer_gpu:qwen36_ffn_int4_expert_gate_up_tiled_stage5",
         "command_buffer_gpu:qwen36_ffn_int4_expert_down_finalize",
     ),
+}
+
+BATCH_FFN_PHASE_GPU_FIELDS = {
+    "decode_batch_ffn_router_topk_gpu_ms": "command_buffer_gpu:qwen36_ffn_int4_router_topk_stage5",
+    "decode_batch_ffn_shared_gate_up_gpu_ms": "command_buffer_gpu:qwen36_ffn_int4_shared_gate_up",
+    "decode_batch_ffn_shared_scalar_gpu_ms": "command_buffer_gpu:qwen36_ffn_int4_shared_gate_scalar",
+    "decode_batch_ffn_shared_down_gpu_ms": "command_buffer_gpu:qwen36_ffn_int4_shared_down",
+    "decode_batch_ffn_expert_gate_up_gpu_ms": "command_buffer_gpu:qwen36_ffn_int4_expert_gate_up_tiled_stage5",
+    "decode_batch_ffn_expert_down_gpu_ms": "command_buffer_gpu:qwen36_ffn_int4_expert_down_finalize",
 }
 
 
@@ -296,6 +322,11 @@ def build_env_overrides(args: argparse.Namespace, mode: str) -> dict[str, str]:
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"] = "1"
         overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH"] = "1"
         overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH_PROFILE_PHASES"] = "1"
+    elif mode == "full-stage5-router-batch-ffn-phases":
+        overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"] = "1"
+        overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH"] = "1"
+        overrides["SUPERSONIC_METAL_PROFILE_QWEN36_FFN_PHASES"] = "1"
+        overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH_PROFILE_FFN_PHASES"] = "1"
     elif mode == "router-defer-wait":
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"] = "1"
         overrides["SUPERSONIC_METAL_QWEN36_DEFER_FFN_ROUTER_STAGE5_WAIT"] = "1"
@@ -455,6 +486,23 @@ def decode_batch_phase_gpu_ms(row: dict[str, Any], phase: str) -> float | None:
     )
 
 
+def batch_ffn_subphase_gpu_ms(row: dict[str, Any], field: str) -> float | None:
+    needle = BATCH_FFN_PHASE_GPU_FIELDS[field]
+    return profile_op_total(row.get("metal_profile"), needle)
+
+
+def batch_ffn_subphase_total_gpu_ms(row: dict[str, Any]) -> float | None:
+    total = 0.0
+    matched = False
+    for field in BATCH_FFN_PHASE_GPU_FIELDS:
+        value = row.get(field)
+        if value is None:
+            continue
+        matched = True
+        total += float(value)
+    return total if matched else None
+
+
 def safe_ratio(numerator: float | None, denominator: float | None) -> float | None:
     if numerator is None or denominator is None or denominator == 0:
         return None
@@ -495,6 +543,10 @@ def annotate_ffn_profile_fields(
         row["fused_gpu_ms"] = fused_gpu_ms(row)
         row["decode_batch_linear_gpu_ms"] = decode_batch_phase_gpu_ms(row, "linear_attn")
         row["decode_batch_ffn_gpu_ms"] = decode_batch_phase_gpu_ms(row, "ffn")
+        for field in BATCH_FFN_PHASE_GPU_FIELDS:
+            row[field] = batch_ffn_subphase_gpu_ms(row, field)
+        if row["decode_batch_ffn_gpu_ms"] is None:
+            row["decode_batch_ffn_gpu_ms"] = batch_ffn_subphase_total_gpu_ms(row)
         row["fused_wall_gpu_ratio"] = safe_ratio(row["fused_wall_ms"], row["fused_gpu_ms"])
         row["wait_gpu_ratio"] = safe_ratio(row["command_buffer_wait_ms"], row["fused_gpu_ms"])
         row["ffn_attribution_class"] = classify_ffn_attribution(
@@ -1021,6 +1073,36 @@ def render_markdown(report: dict[str, Any]) -> str:
                 wall=render_float(row.get("wall_seconds"), 1),
             )
         )
+    if any(
+        row.get(field) is not None
+        for row in report["rows"]
+        for field in BATCH_FFN_PHASE_GPU_FIELDS
+    ):
+        lines.extend(
+            [
+                "",
+                "## Batch FFN Subphases",
+                "",
+                "| Prompt | Mode | Router top-k GPU ms | Shared gate/up GPU ms | Shared scalar GPU ms | Shared down GPU ms | Expert gate/up GPU ms | Expert down GPU ms | Total GPU ms |",
+                "|:---|:---|---:|---:|---:|---:|---:|---:|---:|",
+            ]
+        )
+        for row in report["rows"]:
+            if not any(row.get(field) is not None for field in BATCH_FFN_PHASE_GPU_FIELDS):
+                continue
+            lines.append(
+                "| {prompt} | {mode} | {router} | {shared_gate} | {shared_scalar} | {shared_down} | {expert_gate} | {expert_down} | {total} |".format(
+                    prompt=row.get("prompt_id", ""),
+                    mode=row.get("mode", ""),
+                    router=render_float(row.get("decode_batch_ffn_router_topk_gpu_ms")),
+                    shared_gate=render_float(row.get("decode_batch_ffn_shared_gate_up_gpu_ms")),
+                    shared_scalar=render_float(row.get("decode_batch_ffn_shared_scalar_gpu_ms")),
+                    shared_down=render_float(row.get("decode_batch_ffn_shared_down_gpu_ms")),
+                    expert_gate=render_float(row.get("decode_batch_ffn_expert_gate_up_gpu_ms")),
+                    expert_down=render_float(row.get("decode_batch_ffn_expert_down_gpu_ms")),
+                    total=render_float(row.get("decode_batch_ffn_gpu_ms")),
+                )
+            )
     candidates = promotion_gate.get("candidates") or []
     if candidates:
         lines.extend(

@@ -721,6 +721,17 @@ bool qwen36_ffn_phase_profile_enabled() {
     return NSProcessInfo.processInfo.environment[@"SUPERSONIC_METAL_PROFILE_QWEN36_FFN_PHASES"] != nil;
 }
 
+bool qwen36_ffn_batch_phase_profile_enabled() {
+    return NSProcessInfo.processInfo.environment[@"SUPERSONIC_METAL_QWEN36_DECODE_BATCH_PROFILE_FFN_PHASES"] != nil;
+}
+
+int flush_metal_batch_after_qwen36_ffn_profile_phase() {
+    if (!qwen36_ffn_batch_phase_profile_enabled() || metal_batch_depth <= 0 || metal_batch_state == nullptr) {
+        return 0;
+    }
+    return metal_batch_flush();
+}
+
 void configure_precise_math(MTLCompileOptions* options) {
     if (@available(macOS 15.0, *)) {
         options.mathMode = MTLMathModeSafe;
@@ -12912,11 +12923,27 @@ extern "C" int supersonic_metal_qwen36_ffn_int4_stage5(
 
         bool split_profile = qwen36_ffn_phase_profile_enabled();
         if (split_profile) {
-            if ((status = encode_or_submit_labeled(encode_shared_gate_up, "qwen36_ffn_int4_shared_gate_up", 983, 984, 985, 986)) != 0) return status;
-            if ((status = encode_or_submit_labeled(encode_shared_scalar, "qwen36_ffn_int4_shared_gate_scalar", 987, 988, 989, 990)) != 0) return status;
-            if ((status = encode_or_submit_labeled(encode_shared_down, "qwen36_ffn_int4_shared_down", 991, 992, 993, 994)) != 0) return status;
-            if ((status = encode_or_submit_labeled(encode_expert_gate_up, "qwen36_ffn_int4_expert_gate_up_tiled_stage5", 995, 996, 997, 998)) != 0) return status;
-            return encode_or_submit_labeled(
+            auto submit_profile_phase = [&](auto encode_fn, const std::string& label,
+                                            int queue_error, int command_buffer_error,
+                                            int encoder_error, int completion_error) -> int {
+                int phase_status = encode_or_submit_labeled(
+                    encode_fn,
+                    label,
+                    queue_error,
+                    command_buffer_error,
+                    encoder_error,
+                    completion_error
+                );
+                if (phase_status != 0) {
+                    return phase_status;
+                }
+                return flush_metal_batch_after_qwen36_ffn_profile_phase();
+            };
+            if ((status = submit_profile_phase(encode_shared_gate_up, "qwen36_ffn_int4_shared_gate_up", 983, 984, 985, 986)) != 0) return status;
+            if ((status = submit_profile_phase(encode_shared_scalar, "qwen36_ffn_int4_shared_gate_scalar", 987, 988, 989, 990)) != 0) return status;
+            if ((status = submit_profile_phase(encode_shared_down, "qwen36_ffn_int4_shared_down", 991, 992, 993, 994)) != 0) return status;
+            if ((status = submit_profile_phase(encode_expert_gate_up, "qwen36_ffn_int4_expert_gate_up_tiled_stage5", 995, 996, 997, 998)) != 0) return status;
+            return submit_profile_phase(
                 encode_expert_down_finalize,
                 "qwen36_ffn_int4_expert_down_finalize",
                 999,
@@ -13207,12 +13234,28 @@ extern "C" int supersonic_metal_qwen36_ffn_int4_stage5_with_router(
 
         bool split_profile = qwen36_ffn_phase_profile_enabled();
         if (split_profile) {
-            if ((status = encode_or_submit_labeled(encode_router, "qwen36_ffn_int4_router_topk_stage5", 1416, 1417, 1418, 1419)) != 0) return status;
-            if ((status = encode_or_submit_labeled(encode_shared_gate_up, "qwen36_ffn_int4_shared_gate_up", 1420, 1421, 1422, 1423)) != 0) return status;
-            if ((status = encode_or_submit_labeled(encode_shared_scalar, "qwen36_ffn_int4_shared_gate_scalar", 1424, 1425, 1426, 1427)) != 0) return status;
-            if ((status = encode_or_submit_labeled(encode_shared_down, "qwen36_ffn_int4_shared_down", 1428, 1429, 1430, 1431)) != 0) return status;
-            if ((status = encode_or_submit_labeled(encode_expert_gate_up, "qwen36_ffn_int4_expert_gate_up_tiled_stage5", 1432, 1433, 1434, 1435)) != 0) return status;
-            return encode_or_submit_labeled(
+            auto submit_profile_phase = [&](auto encode_fn, const std::string& label,
+                                            int queue_error, int command_buffer_error,
+                                            int encoder_error, int completion_error) -> int {
+                int phase_status = encode_or_submit_labeled(
+                    encode_fn,
+                    label,
+                    queue_error,
+                    command_buffer_error,
+                    encoder_error,
+                    completion_error
+                );
+                if (phase_status != 0) {
+                    return phase_status;
+                }
+                return flush_metal_batch_after_qwen36_ffn_profile_phase();
+            };
+            if ((status = submit_profile_phase(encode_router, "qwen36_ffn_int4_router_topk_stage5", 1416, 1417, 1418, 1419)) != 0) return status;
+            if ((status = submit_profile_phase(encode_shared_gate_up, "qwen36_ffn_int4_shared_gate_up", 1420, 1421, 1422, 1423)) != 0) return status;
+            if ((status = submit_profile_phase(encode_shared_scalar, "qwen36_ffn_int4_shared_gate_scalar", 1424, 1425, 1426, 1427)) != 0) return status;
+            if ((status = submit_profile_phase(encode_shared_down, "qwen36_ffn_int4_shared_down", 1428, 1429, 1430, 1431)) != 0) return status;
+            if ((status = submit_profile_phase(encode_expert_gate_up, "qwen36_ffn_int4_expert_gate_up_tiled_stage5", 1432, 1433, 1434, 1435)) != 0) return status;
+            return submit_profile_phase(
                 encode_expert_down_finalize,
                 "qwen36_ffn_int4_expert_down_finalize",
                 1436,
