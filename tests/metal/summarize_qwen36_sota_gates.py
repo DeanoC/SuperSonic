@@ -7,11 +7,12 @@ import argparse
 import json
 import sys
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 
-SCHEMA = "qwen36-sota-gate-summary-v1"
+SCHEMA = "qwen36-sota-gate-summary-v2"
 
 
 @dataclass(frozen=True)
@@ -81,6 +82,21 @@ def load_json_report(path: Path) -> tuple[dict[str, Any] | None, str | None]:
     return loaded, None
 
 
+def report_mtime(path: Path) -> datetime | None:
+    try:
+        return datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
+    except FileNotFoundError:
+        return None
+
+
+def report_age_seconds(path: Path, now: datetime) -> tuple[str | None, float | None]:
+    mtime = report_mtime(path)
+    if mtime is None:
+        return None, None
+    age = max(0.0, (now - mtime).total_seconds())
+    return mtime.isoformat().replace("+00:00", "Z"), age
+
+
 def unique_strings(values: list[Any]) -> list[str]:
     out: list[str] = []
     for value in values:
@@ -148,12 +164,22 @@ def extract_gate(report: dict[str, Any], spec: GateSpec) -> tuple[str | None, di
     return None, None
 
 
-def build_gate_row(spec: GateSpec, path: Path) -> dict[str, Any]:
+def build_gate_row(
+    spec: GateSpec,
+    path: Path,
+    now: datetime | None = None,
+    max_age_seconds: float | None = None,
+) -> dict[str, Any]:
+    now = now or datetime.now(timezone.utc)
+    mtime_utc, age_seconds = report_age_seconds(path, now)
     base: dict[str, Any] = {
         "gate_id": spec.gate_id,
         "label": spec.label,
         "kind": spec.kind,
         "path": str(path),
+        "mtime_utc": mtime_utc,
+        "age_seconds": age_seconds,
+        "max_age_seconds": max_age_seconds,
         "expected_schema": spec.expected_schema,
         "schema": None,
         "status": "unknown",
@@ -185,6 +211,13 @@ def build_gate_row(spec: GateSpec, path: Path) -> dict[str, Any]:
     if schema != spec.expected_schema:
         status = "schema_mismatch"
         error = f"expected schema {spec.expected_schema}, got {schema!r}"
+    elif (
+        max_age_seconds is not None
+        and age_seconds is not None
+        and age_seconds > max_age_seconds
+    ):
+        status = "stale"
+        error = f"report age {age_seconds:.0f}s exceeds max age {max_age_seconds:.0f}s"
 
     return {
         **base,
@@ -270,6 +303,8 @@ def choose_next_action(rows: list[dict[str, Any]]) -> dict[str, Any]:
 def recommendation_for_row(row: dict[str, Any]) -> str:
     if row.get("status") == "missing":
         return "run_harness"
+    if row.get("status") == "stale":
+        return "refresh_harness"
     if row.get("status") in {"malformed", "schema_mismatch", "missing_gate"}:
         return "refresh_harness_or_parser"
     if row.get("passed") is True:
@@ -311,8 +346,21 @@ def build_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def build_report(paths: dict[str, Path]) -> dict[str, Any]:
-    rows = [build_gate_row(spec, paths.get(spec.gate_id, spec.default_path)) for spec in GATE_SPECS]
+def build_report(
+    paths: dict[str, Path],
+    now: datetime | None = None,
+    max_age_seconds: float | None = None,
+) -> dict[str, Any]:
+    now = now or datetime.now(timezone.utc)
+    rows = [
+        build_gate_row(
+            spec,
+            paths.get(spec.gate_id, spec.default_path),
+            now=now,
+            max_age_seconds=max_age_seconds,
+        )
+        for spec in GATE_SPECS
+    ]
     for row in rows:
         row["recommendation_action"] = recommendation_for_row(row)
     return {
@@ -336,6 +384,24 @@ def fmt_list(values: Any) -> str:
     return ", ".join(str(value) for value in values)
 
 
+def fmt_age(seconds: Any) -> str:
+    if seconds is None:
+        return "-"
+    try:
+        value = float(seconds)
+    except (TypeError, ValueError):
+        return "-"
+    if value < 60:
+        return f"{value:.0f}s"
+    minutes = value / 60
+    if minutes < 120:
+        return f"{minutes:.1f}m"
+    hours = minutes / 60
+    if hours < 72:
+        return f"{hours:.1f}h"
+    return f"{hours / 24:.1f}d"
+
+
 def render_markdown(report: dict[str, Any]) -> str:
     summary = report["summary"]
     next_action = summary["next_action"]
@@ -349,15 +415,15 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- next_action: `{next_action['action']}`",
         f"- blocked_reason: `{next_action.get('blocked_reason') or '-'}`",
         "",
-        "| Gate | Status | Passed | Candidates | Recommendation | Failures | Path |",
-        "|:---|:---|:---:|:---|:---|:---|:---|",
+        "| Gate | Status | Passed | Candidates | Recommendation | Failures | Path | Age |",
+        "|:---|:---|:---:|:---|:---|:---|:---|---:|",
     ]
     for row in report["rows"]:
         failures = row.get("failures") or []
         if row.get("error"):
             failures = [row["error"], *failures]
         lines.append(
-            "| {label} | {status} | {passed} | {candidates} | {rec} | {failures} | `{path}` |".format(
+            "| {label} | {status} | {passed} | {candidates} | {rec} | {failures} | `{path}` | {age} |".format(
                 label=row["label"],
                 status=row["status"],
                 passed=fmt_bool(row.get("passed")),
@@ -365,6 +431,7 @@ def render_markdown(report: dict[str, Any]) -> str:
                 rec=row.get("recommendation_action") or "-",
                 failures=fmt_list(failures),
                 path=row["path"],
+                age=fmt_age(row.get("age_seconds")),
             )
         )
     lines.extend(
@@ -428,6 +495,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="exit non-zero if inputs are not OK or any loaded gate did not pass",
     )
+    parser.add_argument(
+        "--max-age-hours",
+        type=float,
+        help="mark loaded gate reports stale when their file mtime is older than this many hours",
+    )
     return parser.parse_args(argv)
 
 
@@ -443,7 +515,10 @@ def paths_from_args(args: argparse.Namespace) -> dict[str, Path]:
 
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
-    report = build_report(paths_from_args(args))
+    max_age_seconds = (
+        args.max_age_hours * 3600.0 if args.max_age_hours is not None else None
+    )
+    report = build_report(paths_from_args(args), max_age_seconds=max_age_seconds)
     args.out_json.parent.mkdir(parents=True, exist_ok=True)
     args.out_json.write_text(json.dumps(report, indent=2) + "\n")
     args.out_md.parent.mkdir(parents=True, exist_ok=True)

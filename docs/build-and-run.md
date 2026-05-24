@@ -647,7 +647,9 @@ top-N runtime sweep, MPS resident-table probe, route residency sweep, and MTP
 acceptance sweep JSON reports, then writes `target/qwen36_sota_gate_summary.json`
 and `target/qwen36_sota_gate_summary.md`. Missing reports remain visible as rows
 by default; add `--require` to make a local validation run fail closed on
-missing, malformed, stale-schema, or missing-gate artifacts.
+missing, malformed, schema-mismatched, stale, or missing-gate artifacts. Use
+`--max-age-hours N` when the summary must reject old target reports instead of
+quietly reusing yesterday's gate decisions.
 The current M5 Max perf gate points at linear-attention as the next measured
 multi-token per-token bucket after FFN fallback tightening. The 512-token
 `--metal-profile` smoke currently reports roughly 269 ms/token, 71.7 s prefill,

@@ -869,7 +869,7 @@ The local-main-target workflow for this machine is:
 13. static top-N warm runtime sweep: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/sweep_qwen36_static_topn_runtime.py --modes default,static,static-hotset,mps-static-partial --metal-profile`
 14. MPS resident-table viability probe: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/probe_qwen36_mps_resident_table.py --run-pilot --require-pilot`
 15. route residency sweep: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/sweep_qwen36_route_residency.py --prompt-set smoke`
-16. SOTA gate summary: `python3 tests/metal/summarize_qwen36_sota_gates.py --require`
+16. SOTA gate summary: `python3 tests/metal/summarize_qwen36_sota_gates.py --require --max-age-hours 24`
 17. routed-expert FFN microbench: `target/release/qwen36_ffn_expert_microbench --iters 20 --warmup 3`
 18. long-context comparison: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/bench_qwen36_longctx.py --preset comparison`
 
@@ -1325,11 +1325,11 @@ more slab-cache or fused-INT4 work begins.
 individual sweeps. It reads the batched-prefill variant sweep, static top-N
 runtime sweep, MPS resident-table probe, route residency sweep, and MTP
 acceptance sweep JSON reports, then writes
-`target/qwen36_sota_gate_summary.{json,md}` with input status, passed/failed
-gate IDs, candidate failures, and the next action. Missing reports are
-preserved as rows by default; use `--require` when a local validation run
-should fail closed on absent, malformed, stale-schema, or missing-gate
-artifacts.
+`target/qwen36_sota_gate_summary.{json,md}` with input status, report age,
+passed/failed gate IDs, candidate failures, and the next action. Missing reports
+are preserved as rows by default; use `--require --max-age-hours 24` when a local
+validation run should fail closed on absent, malformed, schema-mismatched,
+stale, or missing-gate artifacts.
 
 The first partial-hit resident MPS runtime prototype is opt-in behind
 `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_MPS_STATIC_TOPN_PARTIAL=1` plus the

@@ -5,6 +5,7 @@ import json
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -278,6 +279,25 @@ class Qwen36SotaGateSummaryTests(unittest.TestCase):
         self.assertEqual(statuses["mtp_acceptance"], "ok")
         self.assertEqual(report["summary"]["input_failure_count"], 3)
         self.assertIn("static_topn_runtime", report["summary"]["next_action"]["blocked_reason"])
+
+    def test_stale_reports_are_input_failures_when_max_age_is_set(self):
+        script = summarize_qwen36_sota_gates
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = self.write_default_reports(Path(tmp))
+            report = script.build_report(
+                paths,
+                now=datetime.now(timezone.utc) + timedelta(hours=2),
+                max_age_seconds=3600.0,
+            )
+
+        statuses = {row["gate_id"]: row["status"] for row in report["rows"]}
+        self.assertEqual(set(statuses.values()), {"stale"})
+        self.assertFalse(report["summary"]["all_inputs_ok"])
+        self.assertEqual(report["summary"]["status_counts"], {"stale": 5})
+        self.assertEqual(report["rows"][0]["recommendation_action"], "refresh_harness")
+        self.assertIn("report age", report["rows"][0]["error"])
+        self.assertIsNotNone(report["rows"][0]["mtime_utc"])
+        self.assertGreater(report["rows"][0]["age_seconds"], 3600.0)
 
     def test_render_markdown_and_require_exit(self):
         script = summarize_qwen36_sota_gates
