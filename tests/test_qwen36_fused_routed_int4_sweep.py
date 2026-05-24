@@ -125,7 +125,7 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
 
         self.assertEqual(
             script.parse_modes(
-                "baseline,direct,direct-defer,defer-direct-wait,gpu-pack,gpack,stage5,native-stage5,router,router-simd,router-batch,batch-router,router-simd-batch,batch-router-simd,router-simd-batch-shared-tiled,batch-router-simd-shared-tiled,router-simd-batch-shared-gate-up-tiled,router-simd-batch-shared-scalar-simd,router-simd-batch-shared-down-tiled,router-simd-batch-routed-gate-up-host-order,router-simd-batch-shared-host-corrected-routed-gate-up-host-order,router-simd-batch-shared-host-corrected,router-simd-batch-shared-routed-host-corrected,router-batch-deferred-phases,batch-router-deferred-phases,router-simd-batch-deferred-phases,batch-router-simd-deferred-phases,router-simd-batch-shared-tiled-deferred-phases,batch-router-simd-shared-tiled-deferred-phases,router-batch-phases,batch-router-phases,router-batch-ffn-phases,batch-router-ffn-phases,router-simd-batch-phases,router-simd-batch-ffn-phases,router-simd-batch-shared-tiled-ffn-phases,batch-router-simd-shared-tiled-ffn-phases,router-defer"
+                "baseline,direct,direct-defer,defer-direct-wait,gpu-pack,gpack,stage5,native-stage5,router,router-simd,router-batch,batch-router,router-simd-batch,batch-router-simd,router-simd-batch-shared-tiled,batch-router-simd-shared-tiled,router-simd-batch-shared-gate-up-tiled,router-simd-batch-shared-scalar-simd,router-simd-batch-shared-down-tiled,router-simd-batch-routed-gate-up-tap,router-simd-batch-routed-gate-up-host-order-tap,router-simd-batch-routed-gate-up-host-order,router-simd-batch-shared-host-corrected-routed-gate-up-host-order,router-simd-batch-shared-host-corrected,router-simd-batch-shared-routed-host-corrected,router-batch-deferred-phases,batch-router-deferred-phases,router-simd-batch-deferred-phases,batch-router-simd-deferred-phases,router-simd-batch-shared-tiled-deferred-phases,batch-router-simd-shared-tiled-deferred-phases,router-batch-phases,batch-router-phases,router-batch-ffn-phases,batch-router-ffn-phases,router-simd-batch-phases,router-simd-batch-ffn-phases,router-simd-batch-shared-tiled-ffn-phases,batch-router-simd-shared-tiled-ffn-phases,router-defer"
             ),
             [
                 "default",
@@ -141,6 +141,8 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
                 "full-stage5-router-simd-batch-shared-gate-up-tiled",
                 "full-stage5-router-simd-batch-shared-scalar-simd",
                 "full-stage5-router-simd-batch-shared-down-tiled",
+                "full-stage5-router-simd-batch-routed-gate-up-tap",
+                "full-stage5-router-simd-batch-routed-gate-up-host-order-tap",
                 "full-stage5-router-simd-batch-routed-gate-up-host-order",
                 "full-stage5-router-simd-batch-shared-host-corrected-routed-gate-up-host-order",
                 "full-stage5-router-simd-batch-shared-host-corrected",
@@ -187,6 +189,16 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
         full_stage5_router_simd_batch_shared_down_tiled = script.build_env_overrides(
             args,
             "full-stage5-router-simd-batch-shared-down-tiled",
+        )
+        full_stage5_router_simd_batch_routed_gate_up_tap = script.build_env_overrides(
+            args,
+            "full-stage5-router-simd-batch-routed-gate-up-tap",
+        )
+        full_stage5_router_simd_batch_routed_gate_up_host_order_tap = (
+            script.build_env_overrides(
+                args,
+                "full-stage5-router-simd-batch-routed-gate-up-host-order-tap",
+            )
         )
         full_stage5_router_simd_batch_routed_gate_up_host_order = script.build_env_overrides(
             args,
@@ -338,6 +350,40 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
         self.assertEqual(
             full_stage5_router_simd_batch_shared_down_tiled[
                 "SUPERSONIC_METAL_ENABLE_QWEN36_FFN_SHARED_DOWN_TILED"
+            ],
+            "1",
+        )
+        self.assertEqual(
+            full_stage5_router_simd_batch_routed_gate_up_tap[
+                "SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_STAGE5_SIMD"
+            ],
+            "1",
+        )
+        self.assertEqual(
+            full_stage5_router_simd_batch_routed_gate_up_tap[
+                "SUPERSONIC_METAL_QWEN36_FFN_STAGE5_ROUTED_GATE_UP_TAP"
+            ],
+            "1",
+        )
+        self.assertEqual(
+            full_stage5_router_simd_batch_routed_gate_up_tap[
+                "SUPERSONIC_METAL_QWEN36_DECODE_BATCH"
+            ],
+            "1",
+        )
+        self.assertNotIn(
+            "SUPERSONIC_METAL_QWEN36_FFN_EXPERT_GATE_UP_HOST_ORDER_STAGE5",
+            full_stage5_router_simd_batch_routed_gate_up_tap,
+        )
+        self.assertEqual(
+            full_stage5_router_simd_batch_routed_gate_up_host_order_tap[
+                "SUPERSONIC_METAL_QWEN36_FFN_STAGE5_ROUTED_GATE_UP_TAP"
+            ],
+            "1",
+        )
+        self.assertEqual(
+            full_stage5_router_simd_batch_routed_gate_up_host_order_tap[
+                "SUPERSONIC_METAL_QWEN36_FFN_EXPERT_GATE_UP_HOST_ORDER_STAGE5"
             ],
             "1",
         )
@@ -1807,6 +1853,132 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
         self.assertIn("## Routed Host Correction", md)
         self.assertIn(
             "| hello | full-stage5-router-simd-batch-shared-routed-host-corrected | simd | 33 | true |",
+            md,
+        )
+        self.assertIn("| 17 | 2 | 1 | 1.25000000 | 1.24998474 | 0.00001526 |", md)
+
+    def test_routed_gate_up_tap_rows_are_parsed_and_rendered(self):
+        script = sweep_qwen36_fused_routed_int4
+        output = (
+            "[qwen36-ffn-routed-gate-up-tap] layer=6 router_path=simd "
+            "hidden=2048 top_k=8 topk_idx_match=1 topk_weight_max_abs=0.00000000e+00 "
+            "topk_weight_argmax=0 host_topk_weight_at_argmax=5.00000000e-01 "
+            "metal_topk_weight_at_argmax=5.00000000e-01 "
+            "expert_mid_max_abs=1.52587891e-05 "
+            "expert_mid_argmax=17 expert_mid_group=2 expert_mid_row=1 "
+            "host_expert_gate_at_mid_argmax=1.25000000e+00 "
+            "metal_expert_gate_at_mid_argmax=1.24998474e+00 "
+            "expert_gate_delta_at_mid_argmax=1.52587891e-05 "
+            "host_expert_up_at_mid_argmax=1.10000000e+00 "
+            "metal_expert_up_at_mid_argmax=1.09999084e+00 "
+            "expert_up_delta_at_mid_argmax=9.15527344e-06 "
+            "host_expert_silu_at_mid_argmax=9.71445143e-01 "
+            "metal_expert_silu_at_mid_argmax=9.71430421e-01 "
+            "expert_silu_delta_at_mid_argmax=1.47223473e-05 "
+            "host_expert_mid_at_argmax=1.00000000e+00 "
+            "metal_expert_mid_at_argmax=9.99984741e-01 "
+            "host_expert_mid_recomputed_at_argmax=1.06858969e+00 "
+            "metal_expert_mid_recomputed_at_argmax=1.06856441e+00 "
+            "expert_mid_recompute_delta_at_argmax=2.52723694e-05 "
+            "moe_out_max_abs=6.10351562e-05 moe_out_argmax=8 "
+            "host_moe_out_at_argmax=1.25732422e-02 "
+            "metal_moe_out_at_argmax=1.25122070e-02 "
+            "host_routed_down_acc_at_moe_argmax=1.25740000e-02 "
+            "host_routed_moe_out_recomputed_at_argmax=1.25732422e-02 "
+            "metal_mid_host_topk_down_acc_at_moe_argmax=1.25120000e-02 "
+            "metal_mid_host_topk_moe_out_at_argmax=1.25122070e-02 "
+            "metal_mid_metal_topk_down_acc_at_moe_argmax=1.25120000e-02 "
+            "metal_mid_metal_topk_moe_out_at_argmax=1.25122070e-02 "
+            "final_out_max_abs=1.22070312e-04 final_out_argmax=8 "
+            "host_final_out_at_argmax=1.26953125e-02 "
+            "metal_final_out_at_argmax=1.25732422e-02\n"
+        )
+
+        taps = script.parse_routed_gate_up_taps(output)
+
+        self.assertEqual(len(taps), 1)
+        self.assertEqual(taps[0]["layer"], 6)
+        self.assertEqual(taps[0]["router_path"], "simd")
+        self.assertEqual(taps[0]["moe_out_argmax"], 8)
+        self.assertEqual(taps[0]["expert_mid_group"], 2)
+        self.assertEqual(taps[0]["expert_mid_row"], 1)
+        self.assertEqual(taps[0]["topk_idx_match"], 1)
+        self.assertAlmostEqual(
+            taps[0]["expert_gate_delta_at_mid_argmax"],
+            0.0000152587891,
+        )
+        self.assertAlmostEqual(
+            taps[0]["expert_mid_recompute_delta_at_argmax"],
+            0.0000252723694,
+        )
+        self.assertAlmostEqual(taps[0]["final_out_max_abs"], 0.000122070312)
+
+        args = Namespace(
+            max_new_tokens=1,
+            context_size=64,
+            metal_profile=False,
+            metal_profile_phases=False,
+            router_parity_tap=False,
+            router_parity_tap_max_calls=40,
+            shared_parity_tap=False,
+            shared_parity_tap_max_calls=3,
+            routed_parity_tap=False,
+            routed_parity_tap_max_calls=3,
+            decode_batch_route_snapshot=False,
+            promotion_max_headline_ratio=0.999,
+            promotion_max_ffn_ratio=0.999,
+            promotion_max_component_regression_ratio=1.10,
+            promotion_max_command_buffer_wait_ratio=1.05,
+            promotion_max_fused_wall_gpu_ratio=4.0,
+            promotion_max_wait_gpu_ratio=4.0,
+            promotion_require_profile=False,
+        )
+        mode = "full-stage5-router-simd-batch-routed-gate-up-tap"
+        candidate = row(mode)
+        candidate["routed_gate_up_taps"] = taps
+        report = script.build_report(
+            [row("default"), candidate],
+            args,
+            ["default", mode],
+            "smoke",
+        )
+        md = script.render_markdown(report)
+
+        self.assertEqual(report["summary"]["routed_gate_up_tap"]["tap_count"], 1)
+        self.assertEqual(
+            report["summary"]["routed_gate_up_tap"][
+                "metal_mid_host_topk_matches_metal_count"
+            ],
+            1,
+        )
+        self.assertEqual(
+            report["summary"]["routed_gate_up_tap"]["max_topk_weight_abs"],
+            0.0,
+        )
+        self.assertAlmostEqual(
+            report["summary"]["routed_gate_up_tap"]["max_expert_gate_abs"],
+            0.0000152587891,
+        )
+        self.assertAlmostEqual(
+            report["summary"]["routed_gate_up_tap"][
+                "max_expert_mid_recompute_abs"
+            ],
+            0.0000252723694,
+        )
+        self.assertIn("routed_gate_up_tap_count: `1`", md)
+        self.assertIn(
+            "routed_gate_up_tap_metal_mid_host_topk_matches_metal_count: `1`",
+            md,
+        )
+        self.assertIn("routed_gate_up_tap_max_expert_gate_abs: `0.00001526`", md)
+        self.assertIn(
+            "routed_gate_up_tap_max_expert_mid_recompute_abs: `0.00002527`",
+            md,
+        )
+        self.assertIn("routed_gate_up_tap_max_final_out_abs: `0.00012207`", md)
+        self.assertIn("## Routed Gate/Up Tap", md)
+        self.assertIn(
+            "| hello | full-stage5-router-simd-batch-routed-gate-up-tap | simd | 6 | true |",
             md,
         )
         self.assertIn("| 17 | 2 | 1 | 1.25000000 | 1.24998474 | 0.00001526 |", md)

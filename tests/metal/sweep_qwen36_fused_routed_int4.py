@@ -16,7 +16,7 @@ from typing import Any
 
 
 MODEL = "qwen3.6-35b-a3b"
-SCHEMA = "qwen36-fused-routed-int4-sweep-v33"
+SCHEMA = "qwen36-fused-routed-int4-sweep-v34"
 DEFAULT_MAX_FUSED_WALL_GPU_RATIO = 4.0
 DEFAULT_MAX_WAIT_GPU_RATIO = 4.0
 COARSE_BATCH_SERIAL_MODE = "full-stage5-router-batch"
@@ -39,6 +39,12 @@ ROUTED_GATE_UP_HOST_ORDER_BATCH_SIMD_MODE = (
 SHARED_HOST_CORRECTED_ROUTED_GATE_UP_HOST_ORDER_BATCH_SIMD_MODE = (
     "full-stage5-router-simd-batch-shared-host-corrected-routed-gate-up-host-order"
 )
+ROUTED_GATE_UP_TAP_BATCH_SIMD_MODE = (
+    "full-stage5-router-simd-batch-routed-gate-up-tap"
+)
+ROUTED_GATE_UP_HOST_ORDER_TAP_BATCH_SIMD_MODE = (
+    "full-stage5-router-simd-batch-routed-gate-up-host-order-tap"
+)
 SHARED_TILED_MODES = {
     SHARED_TILED_BATCH_SIMD_MODE,
     SHARED_TILED_DEFERRED_SIMD_MODE,
@@ -60,6 +66,8 @@ BATCH_FAST_PROFILE_MODES = {
     SHARED_GATE_UP_TILED_BATCH_SIMD_MODE,
     SHARED_SCALAR_SIMD_BATCH_SIMD_MODE,
     SHARED_DOWN_TILED_BATCH_SIMD_MODE,
+    ROUTED_GATE_UP_TAP_BATCH_SIMD_MODE,
+    ROUTED_GATE_UP_HOST_ORDER_TAP_BATCH_SIMD_MODE,
     ROUTED_GATE_UP_HOST_ORDER_BATCH_SIMD_MODE,
     SHARED_HOST_CORRECTED_ROUTED_GATE_UP_HOST_ORDER_BATCH_SIMD_MODE,
     SHARED_HOST_CORRECTED_BATCH_SIMD_MODE,
@@ -70,6 +78,8 @@ BATCH_FAST_PROFILE_MODES = {
     "full-stage5-router-simd-batch-ffn-phases",
 }
 DIAGNOSTIC_ONLY_MODES = {
+    ROUTED_GATE_UP_TAP_BATCH_SIMD_MODE,
+    ROUTED_GATE_UP_HOST_ORDER_TAP_BATCH_SIMD_MODE,
     SHARED_HOST_CORRECTED_BATCH_SIMD_MODE,
     SHARED_HOST_CORRECTED_ROUTED_GATE_UP_HOST_ORDER_BATCH_SIMD_MODE,
     SHARED_ROUTED_HOST_CORRECTED_BATCH_SIMD_MODE,
@@ -138,6 +148,16 @@ MODE_ALIASES: dict[str, str] = {
     "full-router-simd-batch-routed-gate-up-host-order": ROUTED_GATE_UP_HOST_ORDER_BATCH_SIMD_MODE,
     "routed-gate-up-host-order": ROUTED_GATE_UP_HOST_ORDER_BATCH_SIMD_MODE,
     ROUTED_GATE_UP_HOST_ORDER_BATCH_SIMD_MODE: ROUTED_GATE_UP_HOST_ORDER_BATCH_SIMD_MODE,
+    "router-simd-batch-routed-gate-up-tap": ROUTED_GATE_UP_TAP_BATCH_SIMD_MODE,
+    "batch-router-simd-routed-gate-up-tap": ROUTED_GATE_UP_TAP_BATCH_SIMD_MODE,
+    "full-router-simd-batch-routed-gate-up-tap": ROUTED_GATE_UP_TAP_BATCH_SIMD_MODE,
+    "routed-gate-up-tap": ROUTED_GATE_UP_TAP_BATCH_SIMD_MODE,
+    ROUTED_GATE_UP_TAP_BATCH_SIMD_MODE: ROUTED_GATE_UP_TAP_BATCH_SIMD_MODE,
+    "router-simd-batch-routed-gate-up-host-order-tap": ROUTED_GATE_UP_HOST_ORDER_TAP_BATCH_SIMD_MODE,
+    "batch-router-simd-routed-gate-up-host-order-tap": ROUTED_GATE_UP_HOST_ORDER_TAP_BATCH_SIMD_MODE,
+    "full-router-simd-batch-routed-gate-up-host-order-tap": ROUTED_GATE_UP_HOST_ORDER_TAP_BATCH_SIMD_MODE,
+    "routed-gate-up-host-order-tap": ROUTED_GATE_UP_HOST_ORDER_TAP_BATCH_SIMD_MODE,
+    ROUTED_GATE_UP_HOST_ORDER_TAP_BATCH_SIMD_MODE: ROUTED_GATE_UP_HOST_ORDER_TAP_BATCH_SIMD_MODE,
     "router-simd-batch-shared-host-corrected-routed-gate-up-host-order": SHARED_HOST_CORRECTED_ROUTED_GATE_UP_HOST_ORDER_BATCH_SIMD_MODE,
     "batch-router-simd-shared-host-corrected-routed-gate-up-host-order": SHARED_HOST_CORRECTED_ROUTED_GATE_UP_HOST_ORDER_BATCH_SIMD_MODE,
     "full-router-simd-batch-shared-host-corrected-routed-gate-up-host-order": SHARED_HOST_CORRECTED_ROUTED_GATE_UP_HOST_ORDER_BATCH_SIMD_MODE,
@@ -207,6 +227,8 @@ FUSED_OP_NEEDLES = {
     SHARED_GATE_UP_TILED_BATCH_SIMD_MODE: "qwen36_ffn_int4_stage5_with_router",
     SHARED_SCALAR_SIMD_BATCH_SIMD_MODE: "qwen36_ffn_int4_stage5_with_router",
     SHARED_DOWN_TILED_BATCH_SIMD_MODE: "qwen36_ffn_int4_stage5_with_router",
+    ROUTED_GATE_UP_TAP_BATCH_SIMD_MODE: "qwen36_ffn_int4_stage5_with_router",
+    ROUTED_GATE_UP_HOST_ORDER_TAP_BATCH_SIMD_MODE: "qwen36_ffn_int4_stage5_with_router",
     ROUTED_GATE_UP_HOST_ORDER_BATCH_SIMD_MODE: "qwen36_ffn_int4_stage5_with_router",
     SHARED_HOST_CORRECTED_ROUTED_GATE_UP_HOST_ORDER_BATCH_SIMD_MODE: "qwen36_ffn_int4_stage5_with_router",
     SHARED_HOST_CORRECTED_BATCH_SIMD_MODE: "qwen36_ffn_int4_stage5_with_router",
@@ -349,6 +371,13 @@ FUSED_GPU_OP_PREFIXES[SHARED_SCALAR_SIMD_BATCH_SIMD_MODE] = FUSED_GPU_OP_PREFIXE
 FUSED_GPU_OP_PREFIXES[SHARED_DOWN_TILED_BATCH_SIMD_MODE] = FUSED_GPU_OP_PREFIXES[
     "full-stage5-router-simd-batch"
 ]
+FUSED_GPU_OP_PREFIXES[ROUTED_GATE_UP_TAP_BATCH_SIMD_MODE] = FUSED_GPU_OP_PREFIXES[
+    "full-stage5-router-simd-batch"
+]
+FUSED_GPU_OP_PREFIXES[ROUTED_GATE_UP_HOST_ORDER_TAP_BATCH_SIMD_MODE] = (
+    *FUSED_GPU_OP_PREFIXES["full-stage5-router-simd-batch"],
+    "command_buffer_gpu:qwen36_ffn_int4_expert_gate_up_host_order_stage5",
+)
 FUSED_GPU_OP_PREFIXES[ROUTED_GATE_UP_HOST_ORDER_BATCH_SIMD_MODE] = (
     *FUSED_GPU_OP_PREFIXES["full-stage5-router-simd-batch"],
     "command_buffer_gpu:qwen36_ffn_int4_expert_gate_up_host_order_stage5",
@@ -542,6 +571,19 @@ def parse_routed_host_corrections(output: str) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for line in output.splitlines():
         if not line.startswith("[qwen36-ffn-routed-host-correction]"):
+            continue
+        fields = {
+            key: parse_number(value)
+            for key, value in parse_key_values(line).items()
+        }
+        rows.append(fields)
+    return rows
+
+
+def parse_routed_gate_up_taps(output: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for line in output.splitlines():
+        if not line.startswith("[qwen36-ffn-routed-gate-up-tap]"):
             continue
         fields = {
             key: parse_number(value)
@@ -941,6 +983,160 @@ def summarize_routed_host_corrections(rows: list[dict[str, Any]]) -> dict[str, A
                 "metal_final_out_at_argmax": item.get("metal_final_out_at_argmax"),
                 "changed_output_elems": item.get("changed_output_elems"),
                 "first_changed_output": item.get("first_changed_output"),
+            }
+            for item in ranked[:20]
+        ],
+    }
+
+
+def summarize_routed_gate_up_taps(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    taps = [
+        tap
+        for row in rows
+        for tap in (row.get("routed_gate_up_taps") or [])
+    ]
+    paths = sorted({str(tap.get("router_path") or "-") for tap in taps})
+    metal_mid_host_topk_matches_host = [
+        tap
+        for tap in taps
+        if numeric_matches(
+            tap.get("host_moe_out_at_argmax"),
+            tap.get("metal_mid_host_topk_moe_out_at_argmax"),
+        )
+        is True
+    ]
+    metal_mid_host_topk_matches_metal = [
+        tap
+        for tap in taps
+        if numeric_matches(
+            tap.get("metal_moe_out_at_argmax"),
+            tap.get("metal_mid_host_topk_moe_out_at_argmax"),
+        )
+        is True
+    ]
+    metal_mid_metal_topk_matches_metal = [
+        tap
+        for tap in taps
+        if numeric_matches(
+            tap.get("metal_moe_out_at_argmax"),
+            tap.get("metal_mid_metal_topk_moe_out_at_argmax"),
+        )
+        is True
+    ]
+    ranked = sorted(
+        taps,
+        key=lambda tap: max(
+            float(tap.get("moe_out_max_abs") or 0.0),
+            float(tap.get("final_out_max_abs") or 0.0),
+            float(tap.get("expert_mid_max_abs") or 0.0),
+        ),
+        reverse=True,
+    )
+    return {
+        "tap_count": len(taps),
+        "paths": paths,
+        "metal_mid_host_topk_matches_host_count": len(metal_mid_host_topk_matches_host),
+        "metal_mid_host_topk_matches_metal_count": len(metal_mid_host_topk_matches_metal),
+        "metal_mid_metal_topk_matches_metal_count": len(metal_mid_metal_topk_matches_metal),
+        "max_expert_mid_abs": max(
+            (float(item.get("expert_mid_max_abs") or 0.0) for item in taps),
+            default=0.0,
+        ),
+        "max_expert_gate_abs": max(
+            (float(item.get("expert_gate_delta_at_mid_argmax") or 0.0) for item in taps),
+            default=0.0,
+        ),
+        "max_expert_up_abs": max(
+            (float(item.get("expert_up_delta_at_mid_argmax") or 0.0) for item in taps),
+            default=0.0,
+        ),
+        "max_expert_silu_abs": max(
+            (float(item.get("expert_silu_delta_at_mid_argmax") or 0.0) for item in taps),
+            default=0.0,
+        ),
+        "max_expert_mid_recompute_abs": max(
+            (
+                float(item.get("expert_mid_recompute_delta_at_argmax") or 0.0)
+                for item in taps
+            ),
+            default=0.0,
+        ),
+        "max_topk_weight_abs": max(
+            (float(item.get("topk_weight_max_abs") or 0.0) for item in taps),
+            default=0.0,
+        ),
+        "max_moe_out_abs": max(
+            (float(item.get("moe_out_max_abs") or 0.0) for item in taps),
+            default=0.0,
+        ),
+        "max_final_out_abs": max(
+            (float(item.get("final_out_max_abs") or 0.0) for item in taps),
+            default=0.0,
+        ),
+        "worst_examples": [
+            {
+                "layer": item.get("layer"),
+                "path": item.get("router_path") or "-",
+                "topk_idx_match": item.get("topk_idx_match"),
+                "topk_weight_max_abs": item.get("topk_weight_max_abs"),
+                "topk_weight_argmax": item.get("topk_weight_argmax"),
+                "expert_mid_max_abs": item.get("expert_mid_max_abs"),
+                "expert_mid_argmax": item.get("expert_mid_argmax"),
+                "expert_mid_group": item.get("expert_mid_group"),
+                "expert_mid_row": item.get("expert_mid_row"),
+                "host_expert_gate_at_mid_argmax": item.get(
+                    "host_expert_gate_at_mid_argmax"
+                ),
+                "metal_expert_gate_at_mid_argmax": item.get(
+                    "metal_expert_gate_at_mid_argmax"
+                ),
+                "expert_gate_delta_at_mid_argmax": item.get(
+                    "expert_gate_delta_at_mid_argmax"
+                ),
+                "host_expert_up_at_mid_argmax": item.get(
+                    "host_expert_up_at_mid_argmax"
+                ),
+                "metal_expert_up_at_mid_argmax": item.get(
+                    "metal_expert_up_at_mid_argmax"
+                ),
+                "expert_up_delta_at_mid_argmax": item.get(
+                    "expert_up_delta_at_mid_argmax"
+                ),
+                "host_expert_silu_at_mid_argmax": item.get(
+                    "host_expert_silu_at_mid_argmax"
+                ),
+                "metal_expert_silu_at_mid_argmax": item.get(
+                    "metal_expert_silu_at_mid_argmax"
+                ),
+                "expert_silu_delta_at_mid_argmax": item.get(
+                    "expert_silu_delta_at_mid_argmax"
+                ),
+                "host_expert_mid_recomputed_at_argmax": item.get(
+                    "host_expert_mid_recomputed_at_argmax"
+                ),
+                "metal_expert_mid_recomputed_at_argmax": item.get(
+                    "metal_expert_mid_recomputed_at_argmax"
+                ),
+                "expert_mid_recompute_delta_at_argmax": item.get(
+                    "expert_mid_recompute_delta_at_argmax"
+                ),
+                "moe_out_max_abs": item.get("moe_out_max_abs"),
+                "moe_out_argmax": item.get("moe_out_argmax"),
+                "host_moe_out_at_argmax": item.get("host_moe_out_at_argmax"),
+                "metal_moe_out_at_argmax": item.get("metal_moe_out_at_argmax"),
+                "host_routed_moe_out_recomputed_at_argmax": item.get(
+                    "host_routed_moe_out_recomputed_at_argmax"
+                ),
+                "metal_mid_host_topk_moe_out_at_argmax": item.get(
+                    "metal_mid_host_topk_moe_out_at_argmax"
+                ),
+                "metal_mid_metal_topk_moe_out_at_argmax": item.get(
+                    "metal_mid_metal_topk_moe_out_at_argmax"
+                ),
+                "final_out_max_abs": item.get("final_out_max_abs"),
+                "final_out_argmax": item.get("final_out_argmax"),
+                "host_final_out_at_argmax": item.get("host_final_out_at_argmax"),
+                "metal_final_out_at_argmax": item.get("metal_final_out_at_argmax"),
             }
             for item in ranked[:20]
         ],
@@ -2168,6 +2364,17 @@ def build_env_overrides(args: argparse.Namespace, mode: str) -> dict[str, str]:
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_STAGE5_SIMD"] = "1"
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_SHARED_DOWN_TILED"] = "1"
         overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH"] = "1"
+    elif mode == ROUTED_GATE_UP_TAP_BATCH_SIMD_MODE:
+        overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"] = "1"
+        overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_STAGE5_SIMD"] = "1"
+        overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH"] = "1"
+        overrides["SUPERSONIC_METAL_QWEN36_FFN_STAGE5_ROUTED_GATE_UP_TAP"] = "1"
+    elif mode == ROUTED_GATE_UP_HOST_ORDER_TAP_BATCH_SIMD_MODE:
+        overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"] = "1"
+        overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_STAGE5_SIMD"] = "1"
+        overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH"] = "1"
+        overrides["SUPERSONIC_METAL_QWEN36_FFN_STAGE5_ROUTED_GATE_UP_TAP"] = "1"
+        overrides["SUPERSONIC_METAL_QWEN36_FFN_EXPERT_GATE_UP_HOST_ORDER_STAGE5"] = "1"
     elif mode == ROUTED_GATE_UP_HOST_ORDER_BATCH_SIMD_MODE:
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"] = "1"
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_STAGE5_SIMD"] = "1"
@@ -2548,6 +2755,7 @@ def run_row(args: argparse.Namespace, prompt_id: str, prompt: str, mode: str) ->
             "decode_batch_routed_parity_taps": parse_decode_batch_routed_parity_taps(output),
             "shared_host_corrections": parse_shared_host_corrections(output),
             "routed_host_corrections": parse_routed_host_corrections(output),
+            "routed_gate_up_taps": parse_routed_gate_up_taps(output),
             "final_hidden_taps": parse_final_hidden_taps(output),
             "logits_taps": parse_logits_taps(output),
             "layer_output_taps": parse_layer_output_taps(output),
@@ -2582,6 +2790,7 @@ def run_row(args: argparse.Namespace, prompt_id: str, prompt: str, mode: str) ->
             "decode_batch_routed_parity_taps": parse_decode_batch_routed_parity_taps(output),
             "shared_host_corrections": parse_shared_host_corrections(output),
             "routed_host_corrections": parse_routed_host_corrections(output),
+            "routed_gate_up_taps": parse_routed_gate_up_taps(output),
             "final_hidden_taps": parse_final_hidden_taps(output),
             "logits_taps": parse_logits_taps(output),
             "layer_output_taps": parse_layer_output_taps(output),
@@ -3429,6 +3638,7 @@ def build_report(
     summary["decode_batch_routed_parity"] = summarize_routed_parity_taps(rows)
     summary["shared_host_correction"] = summarize_shared_host_corrections(rows)
     summary["routed_host_correction"] = summarize_routed_host_corrections(rows)
+    summary["routed_gate_up_tap"] = summarize_routed_gate_up_taps(rows)
     summary["final_hidden_tap"] = summarize_final_hidden_taps(rows)
     summary["logits_tap"] = summarize_logits_taps(rows)
     summary["layer_output_tap"] = summarize_layer_output_taps(rows)
@@ -3510,6 +3720,7 @@ def render_markdown(report: dict[str, Any]) -> str:
     decode_batch_routed_parity = summary.get("decode_batch_routed_parity") or {}
     shared_host_correction = summary.get("shared_host_correction") or {}
     routed_host_correction = summary.get("routed_host_correction") or {}
+    routed_gate_up_tap = summary.get("routed_gate_up_tap") or {}
     final_hidden_tap = summary.get("final_hidden_tap") or {}
     logits_tap = summary.get("logits_tap") or {}
     layer_output_tap = summary.get("layer_output_tap") or {}
@@ -3577,6 +3788,17 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- routed_host_correction_max_expert_mid_recompute_abs: `{render_float(routed_host_correction.get('max_expert_mid_recompute_abs'), 8)}`",
         f"- routed_host_correction_max_moe_out_abs: `{render_float(routed_host_correction.get('max_moe_out_abs'), 8)}`",
         f"- routed_host_correction_max_output_patch_abs: `{render_float(routed_host_correction.get('max_output_patch_abs'), 8)}`",
+        f"- routed_gate_up_tap_count: `{routed_gate_up_tap.get('tap_count', 0)}`",
+        f"- routed_gate_up_tap_metal_mid_host_topk_matches_host_count: `{routed_gate_up_tap.get('metal_mid_host_topk_matches_host_count', 0)}`",
+        f"- routed_gate_up_tap_metal_mid_host_topk_matches_metal_count: `{routed_gate_up_tap.get('metal_mid_host_topk_matches_metal_count', 0)}`",
+        f"- routed_gate_up_tap_metal_mid_metal_topk_matches_metal_count: `{routed_gate_up_tap.get('metal_mid_metal_topk_matches_metal_count', 0)}`",
+        f"- routed_gate_up_tap_max_topk_weight_abs: `{render_float(routed_gate_up_tap.get('max_topk_weight_abs'), 8)}`",
+        f"- routed_gate_up_tap_max_expert_gate_abs: `{render_float(routed_gate_up_tap.get('max_expert_gate_abs'), 8)}`",
+        f"- routed_gate_up_tap_max_expert_up_abs: `{render_float(routed_gate_up_tap.get('max_expert_up_abs'), 8)}`",
+        f"- routed_gate_up_tap_max_expert_silu_abs: `{render_float(routed_gate_up_tap.get('max_expert_silu_abs'), 8)}`",
+        f"- routed_gate_up_tap_max_expert_mid_recompute_abs: `{render_float(routed_gate_up_tap.get('max_expert_mid_recompute_abs'), 8)}`",
+        f"- routed_gate_up_tap_max_moe_out_abs: `{render_float(routed_gate_up_tap.get('max_moe_out_abs'), 8)}`",
+        f"- routed_gate_up_tap_max_final_out_abs: `{render_float(routed_gate_up_tap.get('max_final_out_abs'), 8)}`",
         f"- final_hidden_tap_count: `{final_hidden_tap.get('tap_count', 0)}`",
         f"- final_hidden_checksum_mismatches: `{final_hidden_tap.get('checksum_mismatch_count', 0)}`",
         f"- logits_tap_count: `{logits_tap.get('tap_count', 0)}`",
@@ -4177,6 +4399,95 @@ def render_markdown(report: dict[str, Any]) -> str:
                     metal_final=render_float(correction.get("metal_final_out_at_argmax"), 8),
                     changed=correction.get("changed_output_elems", "-"),
                     first=correction.get("first_changed_output", "-"),
+                )
+            )
+    routed_gate_up_tap_rows: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for row in report["rows"]:
+        for tap in row.get("routed_gate_up_taps") or []:
+            routed_gate_up_tap_rows.append((row, tap))
+    if routed_gate_up_tap_rows:
+        ranked_routed_gate_up_taps = sorted(
+            routed_gate_up_tap_rows,
+            key=lambda pair: max(
+                float(pair[1].get("moe_out_max_abs") or 0.0),
+                float(pair[1].get("final_out_max_abs") or 0.0),
+                float(pair[1].get("expert_mid_max_abs") or 0.0),
+            ),
+            reverse=True,
+        )
+        lines.extend(
+            [
+                "",
+                "## Routed Gate/Up Tap",
+                "",
+                "| Prompt | Mode | Router | Layer | TopK match | TopK weight max | Expert mid max | Expert mid idx | Group | Row | Host gate | Metal gate | Gate delta | Host up | Metal up | Up delta | Host SiLU | Metal SiLU | SiLU delta | Host mid | Metal mid | Host mid recompute | Metal mid recompute | Mid recompute delta | MoE out max | MoE out idx | Host MoE | Metal MoE | Host recompute | Metal-mid host-topK | Metal-mid metal-topK | Final out max | Final out idx | Host final | Metal final |",
+                "|:---|:---|:---|---:|:---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+            ]
+        )
+        for row, tap in ranked_routed_gate_up_taps[:40]:
+            lines.append(
+                "| {prompt} | {mode} | {path} | {layer} | {topk_match} | {topk_weight} | {mid} | {mid_idx} | {mid_group} | {mid_row} | {host_gate} | {metal_gate} | {gate_delta} | {host_up} | {metal_up} | {up_delta} | {host_silu} | {metal_silu} | {silu_delta} | {host_mid} | {metal_mid} | {host_mid_recompute} | {metal_mid_recompute} | {mid_recompute_delta} | {moe} | {moe_idx} | {host_moe} | {metal_moe} | {host_recompute} | {metal_mid_host_topk} | {metal_mid_metal_topk} | {final_out} | {final_idx} | {host_final} | {metal_final} |".format(
+                    prompt=row.get("prompt_id", ""),
+                    mode=row.get("mode", ""),
+                    path=tap.get("router_path", "-"),
+                    layer=tap.get("layer", "-"),
+                    topk_match=str(bool(tap.get("topk_idx_match"))).lower(),
+                    topk_weight=render_float(tap.get("topk_weight_max_abs"), 8),
+                    mid=render_float(tap.get("expert_mid_max_abs"), 8),
+                    mid_idx=tap.get("expert_mid_argmax", "-"),
+                    mid_group=tap.get("expert_mid_group", "-"),
+                    mid_row=tap.get("expert_mid_row", "-"),
+                    host_gate=render_float(
+                        tap.get("host_expert_gate_at_mid_argmax"), 8
+                    ),
+                    metal_gate=render_float(
+                        tap.get("metal_expert_gate_at_mid_argmax"), 8
+                    ),
+                    gate_delta=render_float(
+                        tap.get("expert_gate_delta_at_mid_argmax"), 8
+                    ),
+                    host_up=render_float(tap.get("host_expert_up_at_mid_argmax"), 8),
+                    metal_up=render_float(tap.get("metal_expert_up_at_mid_argmax"), 8),
+                    up_delta=render_float(
+                        tap.get("expert_up_delta_at_mid_argmax"), 8
+                    ),
+                    host_silu=render_float(
+                        tap.get("host_expert_silu_at_mid_argmax"), 8
+                    ),
+                    metal_silu=render_float(
+                        tap.get("metal_expert_silu_at_mid_argmax"), 8
+                    ),
+                    silu_delta=render_float(
+                        tap.get("expert_silu_delta_at_mid_argmax"), 8
+                    ),
+                    host_mid=render_float(tap.get("host_expert_mid_at_argmax"), 8),
+                    metal_mid=render_float(tap.get("metal_expert_mid_at_argmax"), 8),
+                    host_mid_recompute=render_float(
+                        tap.get("host_expert_mid_recomputed_at_argmax"), 8
+                    ),
+                    metal_mid_recompute=render_float(
+                        tap.get("metal_expert_mid_recomputed_at_argmax"), 8
+                    ),
+                    mid_recompute_delta=render_float(
+                        tap.get("expert_mid_recompute_delta_at_argmax"), 8
+                    ),
+                    moe=render_float(tap.get("moe_out_max_abs"), 8),
+                    moe_idx=tap.get("moe_out_argmax", "-"),
+                    host_moe=render_float(tap.get("host_moe_out_at_argmax"), 8),
+                    metal_moe=render_float(tap.get("metal_moe_out_at_argmax"), 8),
+                    host_recompute=render_float(
+                        tap.get("host_routed_moe_out_recomputed_at_argmax"), 8
+                    ),
+                    metal_mid_host_topk=render_float(
+                        tap.get("metal_mid_host_topk_moe_out_at_argmax"), 8
+                    ),
+                    metal_mid_metal_topk=render_float(
+                        tap.get("metal_mid_metal_topk_moe_out_at_argmax"), 8
+                    ),
+                    final_out=render_float(tap.get("final_out_max_abs"), 8),
+                    final_idx=tap.get("final_out_argmax", "-"),
+                    host_final=render_float(tap.get("host_final_out_at_argmax"), 8),
+                    metal_final=render_float(tap.get("metal_final_out_at_argmax"), 8),
                 )
             )
     final_hidden_comparisons = (summary.get("final_hidden_tap") or {}).get("comparisons") or []

@@ -45,7 +45,8 @@ inline void record_profile_elapsed(const char* op, const char* path, double elap
 }
 
 inline bool qwen36_ffn_routed_host_correction_probe_enabled() {
-    return std::getenv("SUPERSONIC_METAL_QWEN36_FFN_STAGE5_ROUTED_HOST_CORRECTION") != nullptr &&
+    return (std::getenv("SUPERSONIC_METAL_QWEN36_FFN_STAGE5_ROUTED_HOST_CORRECTION") != nullptr ||
+            std::getenv("SUPERSONIC_METAL_QWEN36_FFN_STAGE5_ROUTED_GATE_UP_TAP") != nullptr) &&
            std::getenv("SUPERSONIC_METAL_FORCE_HOST_NATIVE") == nullptr;
 }
 

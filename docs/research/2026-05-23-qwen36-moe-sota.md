@@ -2045,6 +2045,60 @@ under the same smoke:
    evaluation, SiLU/exp, or product materialization, the tiled FFN optimization
    path should stay behind the layer-output parity gate.
 
+56. **Qwen3.6 routed gate/up non-patching tap**
+   The fused-routed sweep is now schema `v34`. It adds a diagnostic-only,
+   non-patching routed gate/up tap behind
+   `SUPERSONIC_METAL_QWEN36_FFN_STAGE5_ROUTED_GATE_UP_TAP=1`, plus two modes:
+   `full-stage5-router-simd-batch-routed-gate-up-tap` for the normal tiled
+   path and `full-stage5-router-simd-batch-routed-gate-up-host-order-tap` for
+   the scalar host-order Metal probe. The Objective-C++ path now materializes
+   expert gate/up workspaces when either the routed host correction or the new
+   tap is enabled, while the Rust tap only reads back and reports
+   `[qwen36-ffn-routed-gate-up-tap]`; it does not patch `workspace` or
+   `output`.
+
+   After a release rebuild with `cargo build --release -p runner --bin
+   supersonic`, the v34 one-token Metal smoke wrote
+   `/private/tmp/qwen36_routed_gate_up_tap_v34_1tok.{json,md}` with
+   `--modes default,full-stage5-router-simd-batch,full-stage5-router-simd-batch-routed-gate-up-tap,full-stage5-router-simd-batch-routed-gate-up-host-order-tap,full-stage5-router-simd-batch-shared-routed-host-corrected
+   --max-new-tokens 1 --context-size 64 --metal-profile --layer-output-tap
+   --layer-output-delta-tap --layer-output-delta-all --no-promotion-require-profile`.
+   All five rows ran, generated IDs matched (`[11]`), and no row was
+   promotable. The tap summary recorded `80` routed gate/up rows, exact top-k
+   weights, `max_expert_gate_abs=1.1920929e-5`,
+   `max_expert_up_abs=1.1920929e-5`, `max_expert_silu_abs=1.33514404e-5`,
+   `max_expert_mid_recompute_abs=5.96046448e-5`,
+   `max_moe_out_abs=0.000244140625`, and
+   `max_final_out_abs=0.00048828125`.
+
+   The normal tiled tap did not perturb the layer-output policy: it matched the
+   uninstrumented SIMD batch row with `65` checksum mismatches, first at layer
+   `7` FFN (`max_abs_delta=0.00048828125`, `max_ulp_delta=1`, one differing
+   BF16 element) and still requiring the downstream tolerance envelope
+   `max_abs_delta=0.15625`, `max_ulp_delta=31081`, `1991` differing elements.
+   At that first visible cliff, the routed gate/up differences were small:
+   expert-mid index `128` (`group=0`, `row=128`) had
+   `expert_gate_delta=5.96046448e-7`, `expert_up_delta=1.43051147e-6`,
+   `expert_silu_delta=5.96046448e-7`, and
+   `expert_mid_recompute_delta=4.29153442e-6`. Recomputing routed down from the
+   Metal mid/top-k at the MoE argmax reproduced the host MoE value
+   (`-0.00253295898`), not the Metal MoE value (`-0.0025177002`), while the
+   final-output argmax was a different hidden index (`1621`). That shifts the
+   current tiled first-cliff suspicion away from gate/up itself and toward
+   shared/residual or routed-down/finalize composition at the output index.
+
+   The host-order tap also preserved the previous rejection: `67` layer-output
+   mismatches, first at layer `6` FFN, requiring
+   `max_abs_delta=0.71875`, `max_ulp_delta=31348`, and `2028` differing
+   elements downstream. At the layer `6` final/MoE argmax (`1846`), the
+   host-order gate/up/SwiGLU deltas were zero at the probed expert-mid row, and
+   host-vs-Metal expert-mid differed by only `1.49011612e-8`. The recomputed
+   routed-down values from Metal mid and top-k matched host
+   (`0.00823974609`), not the Metal MoE output (`0.00817871094`). That rules
+   out host-order gate/up as the source of the new layer `6` cliff and points
+   the next probe at routed expert down/finalize or final residual/add
+   ordering, ideally at both the MoE argmax and the final-output argmax.
+
 ## Sources
 
 - [Qwen/Qwen3.6-35B-A3B model card](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)
