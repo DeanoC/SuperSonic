@@ -81,7 +81,7 @@ class Qwen36SotaContractTests(unittest.TestCase):
             "qwen36-metal-batched-prefill-variant-sweep-v2",
         )
         self.assertEqual(static_sweep.SCHEMA, "qwen36-static-topn-runtime-sweep-v4")
-        self.assertEqual(fused_sweep.SCHEMA, "qwen36-fused-routed-int4-sweep-v1")
+        self.assertEqual(fused_sweep.SCHEMA, "qwen36-fused-routed-int4-sweep-v2")
         self.assertEqual(mps_probe.SCHEMA, "qwen36-mps-resident-table-probe-v2")
         self.assertEqual(route_sweep.SCHEMA, "qwen36-route-residency-sweep-v1")
         self.assertEqual(mtp_sweep.SCHEMA, "qwen36-moe-mtp-acceptance-sweep-v2")
@@ -113,6 +113,7 @@ class Qwen36SotaContractTests(unittest.TestCase):
             fused_sweep.SCHEMA,
         )
         self.assertIn("sweep_qwen36_fused_routed_int4.py", specs["fused_routed_int4"].refresh_command)
+        self.assertIn("full-stage5", specs["fused_routed_int4"].refresh_command)
         self.assertEqual(
             specs["mps_resident_table"].expected_schema,
             mps_probe.SCHEMA,

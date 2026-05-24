@@ -75,8 +75,8 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
         script = sweep_qwen36_fused_routed_int4
 
         self.assertEqual(
-            script.parse_modes("baseline,direct,gpu-pack,gpack"),
-            ["default", "direct-gather", "gpu-pack"],
+            script.parse_modes("baseline,direct,gpu-pack,gpack,stage5,native-stage5"),
+            ["default", "direct-gather", "gpu-pack", "full-stage5"],
         )
 
     def test_build_env_overrides_for_fused_modes(self):
@@ -85,6 +85,7 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
 
         direct = script.build_env_overrides(args, "direct-gather")
         gpu_pack = script.build_env_overrides(args, "gpu-pack")
+        full_stage5 = script.build_env_overrides(args, "full-stage5")
         default = script.build_env_overrides(args, "default")
 
         self.assertEqual(direct["SUPERSONIC_METAL_PROFILE"], "1")
@@ -104,6 +105,10 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
             gpu_pack["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_GPU_PACK_STAGE5"],
             "1",
         )
+        self.assertEqual(
+            full_stage5["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5"],
+            "1",
+        )
 
     def test_promotion_gate_passes_only_real_improvements(self):
         script = sweep_qwen36_fused_routed_int4
@@ -111,11 +116,12 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
             row("default"),
             row("direct-gather", headline=90.0, ffn=40.0, wait=9.0, fused=12.0),
             row("gpu-pack", headline=120.0, ffn=70.0, wait=30.0, fused=25.0),
+            row("full-stage5", headline=300.0, ffn=250.0, wait=80.0, fused=60.0),
         ]
 
         gate = script.build_promotion_gate(
             rows,
-            ["default", "direct-gather", "gpu-pack"],
+            ["default", "direct-gather", "gpu-pack", "full-stage5"],
         )
 
         self.assertTrue(gate["passed"])
@@ -123,6 +129,9 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
         failures = gate["candidates"][1]["failures"]
         self.assertIn("prompt_hello:headline_not_improved", failures)
         self.assertIn("prompt_hello:ffn_not_improved", failures)
+        full_failures = gate["candidates"][2]["failures"]
+        self.assertIn("prompt_hello:headline_not_improved", full_failures)
+        self.assertIn("prompt_hello:ffn_not_improved", full_failures)
 
     def test_promotion_gate_rejects_id_mismatch_and_missing_profile(self):
         script = sweep_qwen36_fused_routed_int4

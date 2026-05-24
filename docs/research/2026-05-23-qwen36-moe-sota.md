@@ -572,14 +572,26 @@ under the same smoke:
 10. **Qwen3.6 fused routed INT4 runtime sweep**
    Preserve the fused routed INT4 branch as a measured runtime gate rather than
    a note in the performance docs. `tests/metal/sweep_qwen36_fused_routed_int4.py`
-   compares `default`, `direct-gather`, and `gpu-pack` under the same prompt
-   suite, captures Metal/HAL profile rows when requested, and writes
+   compares `default`, `direct-gather`, `gpu-pack`, and the larger
+   `full-stage5` native FFN path under the same prompt suite, captures
+   Metal/HAL profile rows when requested, and writes
    `target/qwen36_fused_routed_int4_sweep.{json,md}`. Its nonfatal
    `promotion_gate` uses the same promotion contract as the resident-runtime
    probes: generated IDs must match default, headline decode and `ffn_ms_avg`
    must improve, full-attention/linear-attention/lm-head must stay within the
    regression threshold, and `command_buffer_wait` evidence must be present and
-   non-regressed when profile evidence is required.
+   non-regressed when profile evidence is required. The v2 schema adds
+   `full-stage5` via `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5=1`, so the
+   doc's larger fused-native INT4 recommendation is now a repeatable gate
+   instead of a hand-run smoke. The first one-token profiled v2 smoke preserved
+   `[11]` but rejected `full-stage5`: `default` measured `264.2 ms/token` with
+   `ffn_ms_avg=116.643`, while `full-stage5` measured `1190.1 ms/token` with
+   `ffn_ms_avg=1035.294` and `command_buffer_wait=1121.367 ms`.
+   The refreshed four-mode smoke wrote schema v2 and rejected every candidate:
+   `default` generated `[11, 271, 40, 599]` at `201.4 ms/token` /
+   `ffn_ms_avg=108.141`, while `direct-gather` and `full-stage5` generated
+   `[11, 353, 599, 264]` and therefore failed generated-ID parity before their
+   FFN/wait regressions are considered.
 
 11. **Qwen3.6 SOTA gate summary**
    Preserve negative results as one roadmap-level artifact instead of leaving
@@ -773,6 +785,27 @@ under the same smoke:
    regressed from `130.018 ms` to `861.632 ms`. This is the clean decision
    point before attempting a larger FFN kernel: the next FFN work should be a
    fused native INT4 compute path rather than more FP16 MPS table residency.
+   That path is now wired into the fused-routed runtime sweep as
+   `full-stage5`, keeping it env-gated and judged by the same generated-token,
+   FFN, component-regression, and command-buffer-wait contract as the smaller
+   direct-gather and GPU-pack FFN variants.
+   The refreshed v4 static sweep keeps this negative decision intact:
+   `mps-static-partial-prewarm` warmed all 40 layers and removed decode-loop
+   residency copies (`copied_bytes=0` in the runtime row after a
+   `15753805824` byte prewarm), but still generated `[11, 353, 599, 264]`
+   instead of the default `[11, 271, 40, 599]` and regressed to
+   `578.8 ms/token` / `ffn_ms_avg=480.816`.
+
+21. **Qwen3.6 refreshed SOTA selector after FFN v2/v4 gates**
+   With the static top-N runtime report refreshed to schema v4 and the
+   fused-routed INT4 report refreshed to schema v2, the SOTA summary loads all
+   ten gate reports cleanly. The latest selector still names
+   `prototype_new_ffn_residency_or_compute_path` with `ffn_ms_avg` as both the
+   target and dominant bucket: median default FFN is `111.557 ms`, versus
+   `67.456 ms` for linear attention, `19.716 ms` for full attention, and
+   `8.453 ms` for lm-head. Since all tracked narrow FFN/linear/full/lm-head
+   gates are now exhausted, the next FFN change should be a larger native INT4
+   kernel design, not another small env-gated fork of the current decode path.
 
 ## Sources
 

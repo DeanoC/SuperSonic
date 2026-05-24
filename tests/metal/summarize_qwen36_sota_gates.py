@@ -56,12 +56,12 @@ GATE_SPECS = (
         gate_id="fused_routed_int4",
         label="Fused routed INT4",
         default_path=Path("target/qwen36_fused_routed_int4_sweep.json"),
-        expected_schema="qwen36-fused-routed-int4-sweep-v1",
+        expected_schema="qwen36-fused-routed-int4-sweep-v2",
         gate_keys=("promotion_gate",),
         kind="runtime_promotion",
         refresh_command=(
             f"{MODEL_ROOT_ENV} python3 tests/metal/sweep_qwen36_fused_routed_int4.py "
-            "--prompt-set smoke --metal-profile"
+            "--prompt-set smoke --modes default,direct-gather,gpu-pack,full-stage5 --metal-profile"
         ),
     ),
     GateSpec(

@@ -15,7 +15,7 @@ from typing import Any
 
 
 MODEL = "qwen3.6-35b-a3b"
-SCHEMA = "qwen36-fused-routed-int4-sweep-v1"
+SCHEMA = "qwen36-fused-routed-int4-sweep-v2"
 
 PROMPT_SETS: dict[str, list[tuple[str, str]]] = {
     "smoke": [("hello", "Hello")],
@@ -39,13 +39,18 @@ MODE_ALIASES: dict[str, str] = {
     "direct-gather": "direct-gather",
     "gpu-pack": "gpu-pack",
     "gpack": "gpu-pack",
+    "full": "full-stage5",
+    "full-stage5": "full-stage5",
+    "native-stage5": "full-stage5",
+    "stage5": "full-stage5",
 }
-DEFAULT_MODES = "default,direct-gather,gpu-pack"
+DEFAULT_MODES = "default,direct-gather,gpu-pack,full-stage5"
 
 FUSED_OP_NEEDLES = {
     "packed": "qwen36_ffn_int4_expert_packed_stage5",
     "direct-gather": "qwen36_ffn_int4_expert_direct_gather_stage5",
     "gpu-pack": "qwen36_ffn_int4_expert_gpu_pack_stage5",
+    "full-stage5": "qwen36_ffn_int4_stage5",
 }
 
 
@@ -176,6 +181,8 @@ def build_env_overrides(args: argparse.Namespace, mode: str) -> dict[str, str]:
     elif mode == "gpu-pack":
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_PACKED_STAGE5"] = "1"
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_GPU_PACK_STAGE5"] = "1"
+    elif mode == "full-stage5":
+        overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5"] = "1"
     return overrides
 
 
