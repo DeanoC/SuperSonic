@@ -2169,6 +2169,29 @@ inline float int4_weight_2d(
     return bf16_round_rne_finite(float(nibble) * s - z * s);
 }
 
+inline float int4_weight_pair_dot_2d(
+    device const uchar* packed,
+    device const bfloat* scale,
+    device const bfloat* zero,
+    uint row,
+    uint byte_col,
+    uint cols,
+    uint group_size,
+    float x0,
+    float x1
+) {
+    uint col = byte_col << 1u;
+    uint byte_cols = (cols + 1u) / 2u;
+    uint packed_byte = uint(packed[row * byte_cols + byte_col]);
+    uint scale_cols = (cols + group_size - 1u) / group_size;
+    uint scale_idx = (row / group_size) * scale_cols + (col / group_size);
+    float s = float(scale[scale_idx]);
+    float z = float(zero[scale_idx]);
+    float w0 = bf16_round_rne_finite(float(packed_byte & 0xFu) * s - z * s);
+    float w1 = bf16_round_rne_finite(float((packed_byte >> 4u) & 0xFu) * s - z * s);
+    return w0 * x0 + w1 * x1;
+}
+
 kernel void supersonic_qwen36_linear_input_norm(
     device const bfloat* input_hidden [[buffer(0)]],
     device const bfloat* input_norm_w [[buffer(1)]],
@@ -2230,11 +2253,15 @@ kernel void supersonic_qwen36_linear_projections(
     }
     float partial = 0.0f;
     if (row < params.qkv_dim) {
-        for (uint col = lane; col < params.hidden; col += 32u) {
-            partial += int4_weight_2d(
+        uint byte_cols = (params.hidden + 1u) / 2u;
+        for (uint byte_col = lane; byte_col < byte_cols; byte_col += 32u) {
+            uint col = byte_col << 1u;
+            float x1 = (col + 1u) < params.hidden ? float(x_norm[col + 1u]) : 0.0f;
+            partial += int4_weight_pair_dot_2d(
                 in_proj_qkv, in_proj_qkv_scale, in_proj_qkv_zero,
-                row, col, params.hidden, params.group_size
-            ) * float(x_norm[col]);
+                row, byte_col, params.hidden, params.group_size,
+                float(x_norm[col]), x1
+            );
         }
         float acc = simd_sum(partial);
         if (lane == 0) {
@@ -2242,11 +2269,15 @@ kernel void supersonic_qwen36_linear_projections(
         }
     } else if (row < ab_base) {
         uint z_row = row - params.qkv_dim;
-        for (uint col = lane; col < params.hidden; col += 32u) {
-            partial += int4_weight_2d(
+        uint byte_cols = (params.hidden + 1u) / 2u;
+        for (uint byte_col = lane; byte_col < byte_cols; byte_col += 32u) {
+            uint col = byte_col << 1u;
+            float x1 = (col + 1u) < params.hidden ? float(x_norm[col + 1u]) : 0.0f;
+            partial += int4_weight_pair_dot_2d(
                 in_proj_z, in_proj_z_scale, in_proj_z_zero,
-                z_row, col, params.hidden, params.group_size
-            ) * float(x_norm[col]);
+                z_row, byte_col, params.hidden, params.group_size,
+                float(x_norm[col]), x1
+            );
         }
         float acc = simd_sum(partial);
         if (lane == 0) {
@@ -2432,12 +2463,16 @@ kernel void supersonic_qwen36_linear_out_proj_finalize(
         return;
     }
     float partial = 0.0f;
-    for (uint col = lane; col < params.val_dim; col += 32u) {
-        float w = int4_weight_2d(
+    uint byte_cols = (params.val_dim + 1u) / 2u;
+    for (uint byte_col = lane; byte_col < byte_cols; byte_col += 32u) {
+        uint col = byte_col << 1u;
+        float x1 = (col + 1u) < params.val_dim ? workspace[params.off_rec_out + col + 1u] : 0.0f;
+        partial += int4_weight_pair_dot_2d(
             out_proj, out_proj_scale, out_proj_zero,
-            row, col, params.val_dim, params.group_size
+            row, byte_col, params.val_dim, params.group_size,
+            workspace[params.off_rec_out + col],
+            x1
         );
-        partial += w * workspace[params.off_rec_out + col];
     }
     float acc = simd_sum(partial);
     if (lane == 0) {

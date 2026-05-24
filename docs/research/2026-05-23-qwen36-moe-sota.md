@@ -635,6 +635,21 @@ under the same smoke:
    selector's v2 schema consumes this artifact when present, keeping the
    current headline run in the same evidence bundle as the narrower sweep rows.
 
+15. **Qwen3.6 linear INT4 paired-nibble projection loop**
+   Act on the selector's linear-attention target inside the measured dominant
+   linear sub-ops. The Metal stage-5 linear INT4 projection and out-proj loops
+   now consume both nibbles from each packed byte per SIMD lane load, while
+   preserving the existing BF16 dequant rounding before accumulation. On the
+   Apple M5 Max Qwen3.6 INT4 `bench-perf` lane this moved the headline median
+   from `162.6` to `145.5 ms/token` and unprofiled `linear_attn_ms_avg` from
+   `31.335` to `28.690 ms`. Split-profile GPU rows confirm the intended local
+   effect: `qwen36_linear_int4_projections` dropped from `175.821` to
+   `70.896 ms` total and `qwen36_linear_int4_out_proj_finalize` from `58.545`
+   to `28.171 ms` total. The next measured bottleneck remains FFN host expert
+   work by absolute time, but the current negative FFN residency gates still
+   make the next actionable target the largest non-exhausted bucket selected by
+   the v2 selector.
+
 ## Sources
 
 - [Qwen/Qwen3.6-35B-A3B model card](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)

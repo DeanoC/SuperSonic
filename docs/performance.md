@@ -1160,27 +1160,35 @@ Latest local attribution run
 
 | Metric | Value |
 |---|---:|
-| Headline median | 162.6 ms/token |
-| Stage total | 152.664 ms/token |
-| Profile stage total | 172.742 ms/token |
-| Chain | 147.732 ms/token |
-| LM head | 4.682 ms/token |
-| FFN | 97.974 ms/token |
-| Linear attention | 31.335 ms/token |
-| Profile linear attention | 53.165 ms/token |
-| Full attention | 18.213 ms/token |
-| Prefill total | 870.162 ms |
-| MPP pilot | 7.366 TFLOP/s |
-| MPS expert pilot gate/up | 0.628 ms, 5.346 TFLOP/s |
-| MPS expert pilot down | 0.340 ms, 4.936 TFLOP/s |
+| Headline median | 145.5 ms/token |
+| Stage total | 139.930 ms/token |
+| Profile stage total | 174.814 ms/token |
+| Chain | 134.301 ms/token |
+| LM head | 5.393 ms/token |
+| FFN | 89.297 ms/token |
+| Linear attention | 28.690 ms/token |
+| Profile linear attention | 60.827 ms/token |
+| Full attention | 16.113 ms/token |
+| Prefill total | 801.291 ms |
+| MPP pilot | 9.958 TFLOP/s |
+| MPS expert pilot gate/up | 0.915 ms, 3.666 TFLOP/s |
+| MPS expert pilot down | 0.338 ms, 4.961 TFLOP/s |
 
-The headline median is the unprofiled median-of-3 run (`182.7`, `162.6`,
-`145.7` ms/token). Schema-v8 stores unprofiled stage timings in
+The headline median is the unprofiled median-of-3 run (`150.4`, `145.5`,
+`141.8` ms/token). Schema-v8 stores unprofiled stage timings in
 `stage_timings` and preserves the split-profile timing maps under the
 `profile_*` fields; the profile pass still shows `qwen36_linear_int4_stage5`
 and `command_buffer_wait` as the top Metal rows, but the normal stage table no
-longer charges the seven-way linear profiling split to `linear_attn_ms_avg`. A
-default one-token smoke generated the expected token `[11]`;
+longer charges the seven-way linear profiling split to `linear_attn_ms_avg`.
+The latest linear INT4 projection kernel consumes both nibbles from each
+packed byte per lane load, preserving BF16 dequant rounding while halving the
+packed-byte traffic for the projection and out-proj inner loops. Against the
+previous schema-v8 run (`162.6 ms/token`, `linear_attn_ms_avg=31.335`), this
+measured `145.5 ms/token` and `linear_attn_ms_avg=28.690`; split-profile GPU
+rows show `qwen36_linear_int4_projections` dropping from `175.821 ms` to
+`70.896 ms` total and `qwen36_linear_int4_out_proj_finalize` from `58.545 ms`
+to `28.171 ms` total. A default one-token smoke generated the expected token
+`[11]`;
 the latest local cold one-token profile measured `ffn_ms_avg=128.573`,
 with `qwen36_ffn_host_expert_gate_up` at 56.839 ms total and
 `qwen36_ffn_host_expert_down` at 36.181 ms total. The explicit full native FFN
