@@ -407,7 +407,7 @@ under the same smoke:
    the measured faster host-top-k and two-add residual path.
    The long-context harness now has a `--batched-prefill-variant` selector for
    these measured env-gated probes (`linear-direct-off`, `full-attn-tmajor`,
-   `split-qgate`, `router-topk`, and `fused-residual`) and records the selected
+   `split-qgate`, `router-topk`, and `fused-residual-off`) and records the selected
    variant plus env overrides in JSON rows. This keeps the negative/prototype
    gates reproducible without promoting them into the SuperSonic CLI.
 

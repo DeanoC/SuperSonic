@@ -3,7 +3,7 @@
 //! orchestrates them layer by layer.
 
 use std::collections::BTreeMap;
-use std::ffi::{c_char, c_int, c_void, CStr};
+use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
@@ -305,6 +305,15 @@ pub fn metal_batch_is_active() -> bool {
 
 pub fn set_metal_batch_label(label: &str) -> Result<(), GpuError> {
     metal_native::set_batch_label(label)
+}
+
+pub fn record_metal_profile_sample(op: &str, path: &str, elapsed_ms: f64) -> Result<(), GpuError> {
+    let op = CString::new(op)
+        .map_err(|_| GpuError::InvalidArg("metal profile op contains NUL byte".to_string()))?;
+    let path = CString::new(path)
+        .map_err(|_| GpuError::InvalidArg("metal profile path contains NUL byte".to_string()))?;
+    supersonic_metal_profile_record(op.as_ptr(), path.as_ptr(), elapsed_ms);
+    Ok(())
 }
 
 pub fn commit_metal_batch_current(label: &str) -> Result<(), GpuError> {
@@ -1534,6 +1543,43 @@ pub unsafe fn metal_full_attention_prefill_tmajor_bf16_f32(
     }
     metal_profile_time("full_attention_prefill_tmajor", "native", || unsafe {
         metal_native::full_attention_prefill_tmajor_bf16_f32(
+            q_heads,
+            kv_heads,
+            q_len,
+            kv_len,
+            head_dim,
+            scale,
+            seqlen_offset,
+            query,
+            key_ptr,
+            value_ptr,
+            out,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn metal_full_attention_prefill_tmajor_vec_bf16_f32(
+    q_heads: usize,
+    kv_heads: usize,
+    q_len: usize,
+    kv_len: usize,
+    head_dim: usize,
+    scale: f32,
+    seqlen_offset: usize,
+    query: &GpuBuffer,
+    key_ptr: *const c_void,
+    value_ptr: *const c_void,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if out.backend() != Backend::Metal {
+        return Err(GpuError::InvalidArg(
+            "metal_full_attention_prefill_tmajor_vec_bf16_f32 requires a Metal output buffer"
+                .into(),
+        ));
+    }
+    metal_profile_time("full_attention_prefill_tmajor_vec", "native", || unsafe {
+        metal_native::full_attention_prefill_tmajor_vec_bf16_f32(
             q_heads,
             kv_heads,
             q_len,

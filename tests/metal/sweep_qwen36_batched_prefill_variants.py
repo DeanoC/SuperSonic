@@ -34,7 +34,7 @@ MODE_ALIASES: dict[str, str] = {
 }
 DEFAULT_MODES = (
     "baseline,prototype-default,linear-direct-off,full-attn-tmajor,"
-    "split-qgate,router-topk,fused-residual"
+    "split-qgate,router-topk,fused-residual-off"
 )
 
 
@@ -70,6 +70,7 @@ def prototype_enabled(mode: str) -> bool:
 
 def args_for_mode(args: argparse.Namespace, mode: str) -> argparse.Namespace:
     run_args = copy.copy(args)
+    run_args.legacy_prefill_baseline = mode == "baseline"
     run_args.batched_prefill_prototype = prototype_enabled(mode)
     run_args.batched_prefill_variant = variant_for_mode(mode)
     return run_args
@@ -510,7 +511,7 @@ def render_markdown(report: dict[str, Any]) -> str:
     lines.extend(
         [
             "",
-            "Rows use the same deterministic NIAH prompt per context. `baseline` is the supported Metal per-token prefill path; all other modes enable the experimental batched-prefill prototype and one named env-gated variant.",
+            "Rows use the same deterministic NIAH prompt per context. `baseline` forces the legacy Metal per-token prefill path; all other modes run the default Metal batched-prefill path and, where applicable, one named env-gated variant.",
         ]
     )
     candidates = promotion_gate.get("candidates") or []

@@ -23,7 +23,7 @@ from typing import Any
 
 
 MODEL = "qwen3.6-35b-a3b"
-SCHEMA = "qwen36-moe-metal-longctx-bench-v5"
+SCHEMA = "qwen36-moe-metal-longctx-bench-v6"
 
 PRESETS: dict[str, dict[str, Any]] = {
     "smoke": {
@@ -48,11 +48,18 @@ PRESETS: dict[str, dict[str, Any]] = {
 
 BATCHED_PREFILL_VARIANTS: dict[str, dict[str, str]] = {
     "default": {},
+    "full-attn-vec-off": {"SUPERSONIC_QWEN36_MOE_METAL_FULL_ATTN_VEC": "0"},
     "linear-direct-off": {"SUPERSONIC_QWEN36_MOE_METAL_LINEAR_PREFILL_DIRECT": "0"},
-    "full-attn-tmajor": {"SUPERSONIC_QWEN36_MOE_METAL_FULL_ATTN_TMAJOR": "1"},
+    "full-attn-tmajor": {
+        "SUPERSONIC_QWEN36_MOE_METAL_FULL_ATTN_TMAJOR": "1",
+        "SUPERSONIC_QWEN36_MOE_METAL_FULL_ATTN_VEC": "0",
+    },
     "split-qgate": {"SUPERSONIC_QWEN36_MOE_METAL_SPLIT_QGATE": "1"},
     "router-topk": {"SUPERSONIC_QWEN36_MOE_METAL_ROUTER_TOPK": "1"},
-    "fused-residual": {"SUPERSONIC_QWEN36_MOE_METAL_FUSED_FFN_RESIDUAL": "1"},
+    "fused-residual-off": {"SUPERSONIC_QWEN36_MOE_METAL_FUSED_FFN_RESIDUAL": "0"},
+    "shared-expert-batch-off": {
+        "SUPERSONIC_QWEN36_MOE_METAL_SHARED_EXPERT_BATCH": "0"
+    },
 }
 
 
@@ -90,7 +97,7 @@ def resolve_model_dir(raw_model_dir: Path | None, env: dict[str, str]) -> Path:
     return Path.home() / ".cache" / "supersonic-metal-models" / MODEL
 
 
-def build_metal_env(base_env: dict[str, str]) -> dict[str, str]:
+def build_metal_env(base_env: dict[str, str], *, legacy_prefill: bool = False) -> dict[str, str]:
     env = base_env.copy()
     env["SUPERSONIC_BACKENDS"] = "metal"
 
@@ -104,10 +111,24 @@ def build_metal_env(base_env: dict[str, str]) -> dict[str, str]:
     ):
         env.pop(key, None)
 
-    env["SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL"] = "0"
-    env["SUPERSONIC_QWEN36_MOE_BATCHED_ATTN"] = "0"
-    env["SUPERSONIC_QWEN36_MOE_GROUPED_FFN"] = "0"
-    env["SUPERSONIC_QWEN36_DENSE_PREFILL_TOKEN_LOOP"] = "1"
+    for key in (
+        "SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL",
+        "SUPERSONIC_QWEN36_MOE_BATCHED_ATTN",
+        "SUPERSONIC_QWEN36_MOE_GROUPED_FFN",
+        "SUPERSONIC_QWEN36_DENSE_PREFILL_TOKEN_LOOP",
+        "SUPERSONIC_QWEN36_MOE_METAL_BATCHED_PREFILL_PROTOTYPE",
+    ):
+        env.pop(key, None)
+
+    if legacy_prefill:
+        env["SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL"] = "0"
+        env["SUPERSONIC_QWEN36_MOE_BATCHED_ATTN"] = "0"
+        env["SUPERSONIC_QWEN36_MOE_GROUPED_FFN"] = "0"
+        env["SUPERSONIC_QWEN36_DENSE_PREFILL_TOKEN_LOOP"] = "1"
+    else:
+        env["SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL"] = "1"
+        env["SUPERSONIC_QWEN36_MOE_BATCHED_ATTN"] = "1"
+        env["SUPERSONIC_QWEN36_MOE_GROUPED_FFN"] = "1"
     return env
 
 
@@ -133,6 +154,10 @@ def parse_key_values(line: str) -> dict[str, str]:
         key, raw = part.split("=", 1)
         values[key] = raw.rstrip(",)")
     return values
+
+
+def render_float(value: Any) -> str:
+    return f"{value:.3f}" if isinstance(value, (int, float)) else ""
 
 
 def parse_profile(output: str, summary_prefix: str, op_prefix: str) -> dict[str, Any] | None:
@@ -200,6 +225,27 @@ def parse_batched_prefill_plans(output: str) -> list[dict[str, Any]]:
                 parsed[key] = value
         plans.append(parsed)
     return plans
+
+
+def parse_prefill_progress(output: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for line in output.splitlines():
+        if not line.startswith("[qwen36-moe prefill-progress]"):
+            continue
+        parsed: dict[str, Any] = {}
+        for key, value in parse_key_values(line).items():
+            if key in {"mode", "variant"}:
+                parsed[key] = value
+                continue
+            try:
+                if any(ch in value for ch in ".eE"):
+                    parsed[key] = float(value)
+                else:
+                    parsed[key] = int(value)
+            except ValueError:
+                parsed[key] = value
+        rows.append(parsed)
+    return rows
 
 
 def append_batched_prefill_feasibility_markdown(md: str, rows: list[dict[str, Any]]) -> str:
@@ -271,6 +317,37 @@ def append_batched_prefill_plan_markdown(md: str, rows: list[dict[str, Any]]) ->
     return md.rstrip() + "\n" + "\n".join(lines) + "\n"
 
 
+def append_prefill_progress_markdown(md: str, rows: list[dict[str, Any]]) -> str:
+    profiled = [row for row in rows if row.get("prefill_progress")]
+    if not profiled:
+        return md
+    lines = [
+        "",
+        "### Prefill Progress",
+        "",
+        "| Context | Return | Mode | Variant | Tokens | Chunks | Last context | Embed ms | Chain ms | Elapsed ms |",
+        "|---:|---:|---|---|---:|---:|---:|---:|---:|---:|",
+    ]
+    for row in profiled:
+        progress = row.get("prefill_progress") or []
+        last = progress[-1] if progress else {}
+        lines.append(
+            "| {ctx} | {ret} | {mode} | {variant} | {tokens} | {chunks} | {last_ctx} | {embed} | {chain} | {elapsed} |".format(
+                ctx=row.get("context_tokens_requested", ""),
+                ret=row.get("returncode", ""),
+                mode=last.get("mode", ""),
+                variant=last.get("variant", ""),
+                tokens=last.get("tokens", ""),
+                chunks=last.get("chunks", ""),
+                last_ctx=last.get("last_context", ""),
+                embed=render_float(last.get("embed_ms")),
+                chain=render_float(last.get("chain_ms")),
+                elapsed=render_float(last.get("elapsed_ms")),
+            )
+        )
+    return md.rstrip() + "\n" + "\n".join(lines) + "\n"
+
+
 def append_profile_markdown(md: str, rows: list[dict[str, Any]]) -> str:
     profiled = [row for row in rows if row.get("metal_profile") or row.get("hal_profile")]
     if not profiled:
@@ -310,10 +387,14 @@ def run_one(
     expected_answer: str,
     warmup: bool,
 ) -> dict[str, Any]:
-    env = build_metal_env(os.environ)
+    env = build_metal_env(
+        os.environ,
+        legacy_prefill=args.legacy_prefill_baseline or args.batched_prefill_feasibility,
+    )
     variant_env_overrides: dict[str, str] = {}
     if args.batched_prefill_prototype:
         enable_metal_batched_prefill_prototype(env)
+    if args.batched_prefill_variant != "default":
         variant_env_overrides = apply_batched_prefill_variant(env, args.batched_prefill_variant)
     if args.batched_prefill_feasibility and not warmup:
         env["SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL_FEASIBILITY"] = "1"
@@ -388,6 +469,7 @@ def run_one(
             "stage": BASE.parse_stage_timings(output),
             "chain_breakdown": BASE.parse_chain_breakdown(output),
             "lifecycle": BASE.parse_lifecycle_timings(output),
+            "prefill_progress": parse_prefill_progress(output),
             "batched_prefill_feasibility": parse_batched_prefill_feasibility(output),
             "batched_prefill_plans": parse_batched_prefill_plans(output),
             "metal_profile": parse_profile(output, "[metal-profile]", "[metal-profile-op]"),
@@ -421,6 +503,7 @@ def run_one(
         "stage": BASE.parse_stage_timings(output),
         "chain_breakdown": BASE.parse_chain_breakdown(output),
         "lifecycle": BASE.parse_lifecycle_timings(output),
+        "prefill_progress": parse_prefill_progress(output),
         "batched_prefill_feasibility": parse_batched_prefill_feasibility(output),
         "batched_prefill_plans": parse_batched_prefill_plans(output),
         "metal_profile": parse_profile(output, "[metal-profile]", "[metal-profile-op]"),
@@ -483,23 +566,26 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--legacy-prefill-baseline",
+        action="store_true",
+        help="force the legacy per-token Metal prefill path for baseline comparisons",
+    )
+    parser.add_argument(
         "--batched-prefill-prototype",
         action="store_true",
         help=(
-            "run the experimental Metal batched-prefill path with direct "
-            "batched routed-expert compute"
+            "tag the run with the legacy Metal batched-prefill prototype env for "
+            "backward-compatible A/B reports"
         ),
     )
     parser.add_argument(
         "--batched-prefill-variant",
         choices=sorted(BATCHED_PREFILL_VARIANTS),
         default="default",
-        help="named env-gated variant for --batched-prefill-prototype A/B runs",
+        help="named env-gated variant for Metal batched-prefill A/B runs",
     )
     args = apply_preset_defaults(parser.parse_args())
     args.model_dir = resolve_model_dir(args.model_dir, os.environ)
-    if args.batched_prefill_variant != "default" and not args.batched_prefill_prototype:
-        parser.error("--batched-prefill-variant requires --batched-prefill-prototype")
 
     try:
         contexts = BASE.parse_int_list(args.contexts)
@@ -545,6 +631,7 @@ def main() -> int:
     summary = BASE.summarize(rows)
     md = append_batched_prefill_feasibility_markdown(BASE.markdown(rows, summary), rows)
     md = append_batched_prefill_plan_markdown(md, rows)
+    md = append_prefill_progress_markdown(md, rows)
     md = append_profile_markdown(md, rows)
     payload = {
         "schema": SCHEMA,
@@ -556,6 +643,7 @@ def main() -> int:
         "modes": ["int4"],
         "max_new_tokens": args.max_new_tokens,
         "metal_profile": args.metal_profile,
+        "legacy_prefill_baseline": args.legacy_prefill_baseline,
         "batched_prefill_feasibility": args.batched_prefill_feasibility,
         "batched_prefill_prototype": args.batched_prefill_prototype,
         "batched_prefill_variant": args.batched_prefill_variant,

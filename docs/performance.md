@@ -880,7 +880,7 @@ The local-main-target workflow for this machine is:
 3. long-context smoke: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/bench_qwen36_longctx.py --preset smoke`
 4. profile smoke: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/bench_qwen36_longctx.py --preset smoke --metal-profile`
 5. batched-prefill MoE feasibility: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/bench_qwen36_longctx.py --preset smoke --batched-prefill-feasibility`
-6. batched-prefill Metal prototype: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/bench_qwen36_longctx.py --preset smoke --batched-prefill-prototype`
+6. batched-prefill Metal default: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/bench_qwen36_longctx.py --preset smoke`
 7. batched-prefill variant sweep: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/sweep_qwen36_batched_prefill_variants.py --metal-profile`
 8. MTP tensor audit: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/audit_qwen36_mtp.py --require-complete-bake`
 9. MTP acceptance/policy probe: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/probe_qwen36_mtp_acceptance.py`
@@ -914,21 +914,34 @@ metadata a future Metal prefill kernel would consume: profiled tokens, chunks,
 expert segments, average rows per touched expert, and WMMA16 assignment
 coverage. It also emits `[qwen36-batched-prefill-plan]` rows for candidate
 64/128/256/512/1024-token chunks, recording scalar tail assignments, WMMA16
-padded assignments, and padding overhead. With `--batched-prefill-prototype`,
-the harness sets
-`SUPERSONIC_QWEN36_MOE_METAL_BATCHED_PREFILL_PROTOTYPE=1` and runs the
-experimental Metal batched-prefill path: Metal batched full-attention plus a
-direct routed-expert INT4 gate/up and down/combine kernel pair, with
-router/top-k and shared-expert work still on the existing host/primitive path.
+padded assignments, and padding overhead. The harness now runs the Metal
+batched-prefill path by default: Metal batched full-attention plus a direct
+routed-expert INT4 gate/up and down/combine kernel pair, with router/top-k
+still on the existing host path. Set `--legacy-prefill-baseline` when a report
+needs the older per-token Metal prefill baseline; `--batched-prefill-prototype`
+is retained as a compatibility/provenance tag for older A/B report modes. The
+shared-expert tail now opens one Metal batch per layer/chunk by default and
+uses the fused residual add to avoid the old batch-flushing two-add sequence;
+set
+`SUPERSONIC_QWEN36_MOE_METAL_SHARED_EXPERT_BATCH=0` to bisect back to the
+primitive sequence. Full-attention prefill now uses a prefill-specific
+time-major vector kernel by default. One threadgroup owns each `(query, head)`
+row, reduces the Q·K dot across `head_dim` once per KV token, and has lanes
+accumulate V dimensions; set `SUPERSONIC_QWEN36_MOE_METAL_FULL_ATTN_VEC=0` to
+fall back to the older scalar-per-output-dimension attention path.
 `--batched-prefill-variant` names the measured env-gated prototype probes
 without requiring hand-built environment overrides: `linear-direct-off`,
-`full-attn-tmajor`, `split-qgate`, `router-topk`, and `fused-residual`.
+`full-attn-vec-off`, `full-attn-tmajor`, `split-qgate`, `router-topk`,
+`fused-residual-off`, and `shared-expert-batch-off`.
 The harness records the selected variant and its env overrides per row so A/B
 comparison outputs are self-describing. The long-context JSON schema is now
-`qwen36-moe-metal-longctx-bench-v5` and
+`qwen36-moe-metal-longctx-bench-v6` and
 records `batched_prefill_prototype` at top level plus
 `metal_batched_prefill_prototype` and `batched_prefill_variant` per row;
-feasibility rows remain under `batched_prefill_plans`; set
+feasibility rows remain under `batched_prefill_plans`, and each row can carry
+`prefill_progress` entries from `[qwen36-moe prefill-progress]` so an 8192-token
+crash still preserves chunks/tokens completed, active variant, and elapsed
+prefill time; set
 `SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL_PLAN_CHUNKS=...` to override the planner
 chunk list without adding a SuperSonic CLI flag.
 `tests/metal/sweep_qwen36_batched_prefill_variants.py` wraps those variant
@@ -984,7 +997,47 @@ materializing the baked model buffers. That makes the next measured target
 prefill orchestration, linear-attention command-buffer volume, full-attention
 prefill, and routed-expert direct work, not per-token MPS slab materialization.
 
-The next orchestration slice targets `qwen36_linear_int4_stage5`, which had
+The current prefill-reduction pass adds crash-resilient progress telemetry,
+promotes the Metal shared-expert tail from separate primitive submissions into
+a batched command-buffer section, and adds the prefill-specific vector
+full-attention kernel. Profile runs split the shared section into stable labels
+(`qwen36_batched_prefill_shared_gate_up`,
+`qwen36_batched_prefill_shared_down_scalar`,
+`qwen36_batched_prefill_ffn_finalize`) while also recording aggregate
+`qwen36_batched_prefill_shared_expert_int4` wall time. The vector attention
+kernel is labelled `full_attention_prefill_tmajor_vec`.
+
+The first validation run for that pass used one-token NIAH smokes on 2026-05-25
+with no warmup. Baseline rows are the pre-change legacy Metal prefill path;
+prototype/vector rows use the promoted Metal batched-prefill path with the
+shared-expert batch enabled:
+
+| Context | Legacy prefill | Shared-batch prototype | Promoted vector prefill | Improvement vs legacy | Vector ms/tok | Progress row |
+|---:|---:|---:|---:|---:|---:|:---|
+| 512 | 25.33 s | 9.71 s | 7.01 s | 72.3% | 100.38 | 417 tokens, 1 chunk |
+| 2048 | 165.24 s | 75.31 s | 28.24 s | 82.9% | 199.31 | 1762 tokens, 4 chunks |
+| 8192 | - | 1018.00 s | 147.94 s | - | 613.29 | 7142 tokens, 14 chunks |
+
+The 8192 prototype row completed cleanly with generated ID `[271]`; the prior
+`-11` long-prefill failure did not reproduce on either prototype path. NIAH
+still reports NO for these rows because the run intentionally generates only
+one token. A no-`--batched-prefill-prototype` default rerun confirms the
+promoted runtime path: progress rows report
+`metal-default+full-attn-vec+shared-expert-batch` for 512, 2048, and 8192. The
+post-vector 512 profile names `command_buffer_wait` (8.57 s),
+`qwen36_linear_int4_stage5` (4.48 s), and
+`qwen36_batched_prefill_grouped_expert_direct` (3.47 s) as the largest native
+rows. The post-vector 2048 profile reports 37.63 s prefill under
+profiling, with `command_buffer_wait` (34.98 s), `qwen36_linear_int4_stage5`
+(18.78 s native), `qwen36_batched_prefill_grouped_expert_direct` (12.20 s
+native), HAL `copy_h2d` (10.78 s), and `full_attention_prefill_tmajor_vec`
+(2.01 s native) as the largest rows. The next measured bottleneck is therefore
+linear-attention command-buffer volume plus routed expert work at short
+contexts, and full-attention/KV bandwidth becomes visible again as context
+length grows.
+
+The earlier linear-attention orchestration slice targeted
+`qwen36_linear_int4_stage5`, which had
 12,540 waited calls in the profiled 512-token run. The normal Metal prototype
 now keeps the native stage-5 temporary output separate from the final residual
 destination, opens one Metal batch per linear-attention layer, and writes final
@@ -1008,7 +1061,8 @@ prefill, and native Q/gate splitting via
 `SUPERSONIC_QWEN36_MOE_METAL_SPLIT_QGATE=1` measured 11.00s prefill. With both
 probes disabled, the default path measured 10.73s prefill and generated the
 same `[271]` sanity row. The measured next bottleneck remains routed expert
-compute/residency, not these full-attention layout probes.
+compute/residency at the 512-token smoke size, while the 2048/8192 rows above
+shift the next long-context target to full-attention/KV bandwidth.
 
 Two routed-FFN micro-orchestration probes are also measured negative and remain
 opt-in only. `SUPERSONIC_QWEN36_MOE_METAL_FUSED_FFN_RESIDUAL=1` fuses

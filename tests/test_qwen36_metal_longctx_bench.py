@@ -70,14 +70,25 @@ class Qwen36MetalLongContextBenchTests(unittest.TestCase):
             }
         )
         self.assertEqual(env["SUPERSONIC_BACKENDS"], "metal")
-        self.assertEqual(env["SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL"], "0")
-        self.assertEqual(env["SUPERSONIC_QWEN36_MOE_BATCHED_ATTN"], "0")
-        self.assertEqual(env["SUPERSONIC_QWEN36_MOE_GROUPED_FFN"], "0")
-        self.assertEqual(env["SUPERSONIC_QWEN36_DENSE_PREFILL_TOKEN_LOOP"], "1")
+        self.assertEqual(env["SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL"], "1")
+        self.assertEqual(env["SUPERSONIC_QWEN36_MOE_BATCHED_ATTN"], "1")
+        self.assertEqual(env["SUPERSONIC_QWEN36_MOE_GROUPED_FFN"], "1")
+        self.assertNotIn("SUPERSONIC_QWEN36_DENSE_PREFILL_TOKEN_LOOP", env)
         self.assertNotIn("SUPERSONIC_VMM_KV", env)
         self.assertNotIn("SUPERSONIC_VMM_MOE_ISLANDS", env)
         self.assertNotIn("SUPERSONIC_MOE_ISLAND_CAP_EXPERTS", env)
         self.assertNotIn("SUPERSONIC_MOE_ISLAND_TELEMETRY_JSON", env)
+
+    def test_build_metal_env_can_force_legacy_prefill_baseline(self):
+        env = bench_qwen36_metal_longctx.build_metal_env(
+            {"PATH": os.environ.get("PATH", "")},
+            legacy_prefill=True,
+        )
+        self.assertEqual(env["SUPERSONIC_BACKENDS"], "metal")
+        self.assertEqual(env["SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL"], "0")
+        self.assertEqual(env["SUPERSONIC_QWEN36_MOE_BATCHED_ATTN"], "0")
+        self.assertEqual(env["SUPERSONIC_QWEN36_MOE_GROUPED_FFN"], "0")
+        self.assertEqual(env["SUPERSONIC_QWEN36_DENSE_PREFILL_TOKEN_LOOP"], "1")
 
     def test_enable_metal_batched_prefill_prototype_flips_opt_in_knobs(self):
         env = bench_qwen36_metal_longctx.build_metal_env(
@@ -102,11 +113,27 @@ class Qwen36MetalLongContextBenchTests(unittest.TestCase):
             env, "router-topk"
         )
 
+        self.assertEqual(overrides, {"SUPERSONIC_QWEN36_MOE_METAL_ROUTER_TOPK": "1"})
+        self.assertEqual(env["SUPERSONIC_QWEN36_MOE_METAL_ROUTER_TOPK"], "1")
+
+    def test_full_attn_tmajor_variant_disables_vector_kernel(self):
+        env = bench_qwen36_metal_longctx.build_metal_env(
+            {"PATH": os.environ.get("PATH", "")}
+        )
+
+        overrides = bench_qwen36_metal_longctx.apply_batched_prefill_variant(
+            env, "full-attn-tmajor"
+        )
+
         self.assertEqual(
             overrides,
-            {"SUPERSONIC_QWEN36_MOE_METAL_ROUTER_TOPK": "1"},
+            {
+                "SUPERSONIC_QWEN36_MOE_METAL_FULL_ATTN_TMAJOR": "1",
+                "SUPERSONIC_QWEN36_MOE_METAL_FULL_ATTN_VEC": "0",
+            },
         )
-        self.assertEqual(env["SUPERSONIC_QWEN36_MOE_METAL_ROUTER_TOPK"], "1")
+        self.assertEqual(env["SUPERSONIC_QWEN36_MOE_METAL_FULL_ATTN_TMAJOR"], "1")
+        self.assertEqual(env["SUPERSONIC_QWEN36_MOE_METAL_FULL_ATTN_VEC"], "0")
 
     def test_batched_prefill_variant_catalog_covers_measured_probes(self):
         self.assertIn(
@@ -115,10 +142,17 @@ class Qwen36MetalLongContextBenchTests(unittest.TestCase):
         self.assertIn(
             "full-attn-tmajor", bench_qwen36_metal_longctx.BATCHED_PREFILL_VARIANTS
         )
+        self.assertIn(
+            "full-attn-vec-off", bench_qwen36_metal_longctx.BATCHED_PREFILL_VARIANTS
+        )
         self.assertIn("split-qgate", bench_qwen36_metal_longctx.BATCHED_PREFILL_VARIANTS)
         self.assertIn("router-topk", bench_qwen36_metal_longctx.BATCHED_PREFILL_VARIANTS)
         self.assertIn(
-            "fused-residual", bench_qwen36_metal_longctx.BATCHED_PREFILL_VARIANTS
+            "fused-residual-off", bench_qwen36_metal_longctx.BATCHED_PREFILL_VARIANTS
+        )
+        self.assertIn(
+            "shared-expert-batch-off",
+            bench_qwen36_metal_longctx.BATCHED_PREFILL_VARIANTS,
         )
 
     def test_parse_profile_extracts_summary_and_entries(self):
@@ -157,6 +191,17 @@ class Qwen36MetalLongContextBenchTests(unittest.TestCase):
         self.assertEqual(plans[0]["chunk_size"], 128)
         self.assertEqual(plans[1]["chunks"], 1)
         self.assertAlmostEqual(plans[1]["wmma16_assignment_coverage"], 0.966243)
+
+    def test_parse_prefill_progress_keeps_last_partial_row(self):
+        output = """
+[qwen36-moe prefill-progress] mode=batched variant=metal-prototype+shared-expert-batch chunks=1 tokens=512 prefill_tokens=8191 last_context=512 embed_ms=0.123 chain_ms=1000.500 elapsed_ms=1001.000
+[qwen36-moe prefill-progress] mode=batched variant=metal-prototype+shared-expert-batch chunks=2 tokens=1024 prefill_tokens=8191 last_context=1024 embed_ms=0.250 chain_ms=2100.500 elapsed_ms=2101.000
+"""
+        rows = bench_qwen36_metal_longctx.parse_prefill_progress(output)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[-1]["tokens"], 1024)
+        self.assertEqual(rows[-1]["last_context"], 1024)
+        self.assertEqual(rows[-1]["variant"], "metal-prototype+shared-expert-batch")
 
     def test_append_batched_prefill_feasibility_markdown_adds_table(self):
         md = bench_qwen36_metal_longctx.append_batched_prefill_feasibility_markdown(
@@ -199,6 +244,33 @@ class Qwen36MetalLongContextBenchTests(unittest.TestCase):
         )
         self.assertIn("Batched-Prefill MoE Chunk Plan", md)
         self.assertIn("16.1%", md)
+
+    def test_append_prefill_progress_markdown_adds_table(self):
+        md = bench_qwen36_metal_longctx.append_prefill_progress_markdown(
+            "# report\n",
+            [
+                {
+                    "context_tokens_requested": 8192,
+                    "returncode": -11,
+                    "prefill_progress": [
+                        {
+                            "mode": "batched",
+                            "variant": "metal-prototype+shared-expert-batch",
+                            "tokens": 4096,
+                            "chunks": 8,
+                            "last_context": 4096,
+                            "embed_ms": 10.0,
+                            "chain_ms": 20000.0,
+                            "elapsed_ms": 20010.0,
+                        }
+                    ],
+                }
+            ],
+        )
+        self.assertIn("Prefill Progress", md)
+        self.assertIn("8192", md)
+        self.assertIn("-11", md)
+        self.assertIn("metal-prototype+shared-expert-batch", md)
 
     def test_append_profile_markdown_adds_profile_table(self):
         md = bench_qwen36_metal_longctx.append_profile_markdown(
