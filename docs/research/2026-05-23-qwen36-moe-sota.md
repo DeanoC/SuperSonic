@@ -2624,6 +2624,32 @@ under the same smoke:
    therefore stay on the routed expert gate/up arithmetic/residency path, but
    the host orchestration tax has been reduced in the default lane.
 
+70. **Qwen3.6 INT4 LUT paired-nibble accumulator**
+   Returned to the measured FFN expert arithmetic row with a keep-or-revert
+   rule. The default host INT4 dot path now uses one inlined paired-nibble LUT
+   accumulator for dense and expert projections. It preserves the existing
+   group LUT values, row order, and BF16 rounding boundaries, but consumes eight
+   packed bytes per inner loop body instead of repeating the byte-loop control
+   in every dot implementation.
+
+   Validation passed: `cargo test -p kernel-ffi qwen36_moe --lib`,
+   `rustfmt --check crates/kernel-ffi/src/qwen36_moe.rs`, `git diff --check
+   -- crates/kernel-ffi/src/qwen36_moe.rs`, `cargo build --release -p runner
+   --bin supersonic`, and the one-token Qwen3.6 Metal INT4 smoke with generated
+   id `[11]`. The promotion `bench-perf` run wrote
+   `target/bench-runs/2026-05-25-e7d8c04`.
+
+   The measured samples are `85.2`, `86.2`, and `89.4` ms/token, with
+   unprofiled `total_ms_avg=85.877`. The unprofiled stage table is now
+   `ffn_ms_avg=51.564`, `linear_attn_ms_avg=19.102`,
+   `full_attn_ms_avg=9.987`, and `lm_head_ms_avg=4.602`. Profile attribution
+   still names `qwen36_linear_int4_stage5` (`1020.759 ms`) and
+   `command_buffer_wait` (`1019.385 ms`) as the top profiled rows, followed by
+   FFN expert gate/up (`554.605 ms`) and down (`305.734 ms`). This is a real
+   small FFN arithmetic win over the `88.3 ms/token` worker-pool checkpoint, but
+   the next material target remains routed expert compute/residency rather than
+   another narrow router or loop-control cleanup.
+
 ## Sources
 
 - [Qwen/Qwen3.6-35B-A3B model card](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)

@@ -1251,6 +1251,19 @@ Profile attribution still names `qwen36_linear_int4_stage5` and
 `command_buffer_wait` as the top rows, followed by FFN host expert gate/up and
 down.
 
+The next retained FFN arithmetic cleanup keeps the exact INT4 LUT dequant
+semantics, but shares an inlined paired-nibble accumulator across dense and
+expert LUT dot products so each inner group consumes eight packed bytes per
+loop body. The current Apple M5 Max `bench-perf` run
+(`target/bench-runs/2026-05-25-e7d8c04/perf/qwen3.6-35b-a3b_int4.json`)
+measured samples `85.2`, `86.2`, `89.4` with unprofiled
+`total_ms_avg=85.877`. Attribution is now `ffn_ms_avg=51.564`,
+`linear_attn_ms_avg=19.102`, `full_attn_ms_avg=9.987`, and
+`lm_head_ms_avg=4.602`; the one-token Metal smoke still generated `[11]`.
+Profile attribution has FFN expert gate/up at `554.605 ms` total and expert
+down at `305.734 ms`, so the next real target is still a larger routed expert
+compute/residency step rather than more router work.
+
 The focused routed-expert microbench exercises the exact Qwen3.6 stage-5 INT4
 shape (`hidden=2048`, `num_experts=256`, `moe_intermediate=512`, `top_k=8`,
 `group_size=128`) without the rest of decode:

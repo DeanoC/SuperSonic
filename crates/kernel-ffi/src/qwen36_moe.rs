@@ -11227,6 +11227,53 @@ fn qwen36_int4_group_dequant_lut(scale: f32, zero: f32) -> [f32; 16] {
     std::array::from_fn(|q| bf16_round_f32(q as f32 * scale - zs))
 }
 
+#[inline(always)]
+unsafe fn qwen36_int4_lut_dot_pairs(
+    mut acc: f32,
+    packed: *const u8,
+    x: *const f32,
+    byte_count: usize,
+    lut: &[f32; 16],
+) -> f32 {
+    let mut byte = 0usize;
+    while byte + 8 <= byte_count {
+        let b0 = unsafe { *packed.add(byte) };
+        let b1 = unsafe { *packed.add(byte + 1) };
+        let b2 = unsafe { *packed.add(byte + 2) };
+        let b3 = unsafe { *packed.add(byte + 3) };
+        let b4 = unsafe { *packed.add(byte + 4) };
+        let b5 = unsafe { *packed.add(byte + 5) };
+        let b6 = unsafe { *packed.add(byte + 6) };
+        let b7 = unsafe { *packed.add(byte + 7) };
+        let x_base = unsafe { x.add(byte * 2) };
+        acc += lut[(b0 & 0x0f) as usize] * unsafe { *x_base.add(0) }
+            + lut[(b0 >> 4) as usize] * unsafe { *x_base.add(1) };
+        acc += lut[(b1 & 0x0f) as usize] * unsafe { *x_base.add(2) }
+            + lut[(b1 >> 4) as usize] * unsafe { *x_base.add(3) };
+        acc += lut[(b2 & 0x0f) as usize] * unsafe { *x_base.add(4) }
+            + lut[(b2 >> 4) as usize] * unsafe { *x_base.add(5) };
+        acc += lut[(b3 & 0x0f) as usize] * unsafe { *x_base.add(6) }
+            + lut[(b3 >> 4) as usize] * unsafe { *x_base.add(7) };
+        acc += lut[(b4 & 0x0f) as usize] * unsafe { *x_base.add(8) }
+            + lut[(b4 >> 4) as usize] * unsafe { *x_base.add(9) };
+        acc += lut[(b5 & 0x0f) as usize] * unsafe { *x_base.add(10) }
+            + lut[(b5 >> 4) as usize] * unsafe { *x_base.add(11) };
+        acc += lut[(b6 & 0x0f) as usize] * unsafe { *x_base.add(12) }
+            + lut[(b6 >> 4) as usize] * unsafe { *x_base.add(13) };
+        acc += lut[(b7 & 0x0f) as usize] * unsafe { *x_base.add(14) }
+            + lut[(b7 >> 4) as usize] * unsafe { *x_base.add(15) };
+        byte += 8;
+    }
+    while byte < byte_count {
+        let b = unsafe { *packed.add(byte) };
+        let x_base = unsafe { x.add(byte * 2) };
+        acc += lut[(b & 0x0f) as usize] * unsafe { *x_base.add(0) }
+            + lut[(b >> 4) as usize] * unsafe { *x_base.add(1) };
+        byte += 1;
+    }
+    acc
+}
+
 fn qwen36_build_dense_int4_dequant_luts(
     scale: usize,
     zero: usize,
@@ -11536,18 +11583,19 @@ fn qwen36_dense_or_int4_dot_2d_unchecked(
         let s = bf16_bits_to_f32(unsafe { *scale.add(scale_idx) });
         let z = bf16_bits_to_f32(unsafe { *zero.add(scale_idx) });
         let lut = qwen36_int4_group_dequant_lut(s, z);
-        let mut col = group_start;
-        let mut byte_idx = packed_base + group_start / 2;
-        while col + 1 < group_end {
-            let byte = unsafe { *packed.add(byte_idx) };
-            let w0 = lut[(byte & 0x0f) as usize];
-            let w1 = lut[((byte >> 4) & 0x0f) as usize];
-            acc += w0 * x[col] + w1 * x[col + 1];
-            col += 2;
-            byte_idx += 1;
-        }
+        let pair_cols = (group_end - group_start) & !1;
+        acc = unsafe {
+            qwen36_int4_lut_dot_pairs(
+                acc,
+                packed.add(packed_base + group_start / 2),
+                x.as_ptr().add(group_start),
+                pair_cols / 2,
+                &lut,
+            )
+        };
+        let col = group_start + pair_cols;
         if col < group_end {
-            let byte = unsafe { *packed.add(byte_idx) };
+            let byte = unsafe { *packed.add(packed_base + col / 2) };
             let w = lut[(byte & 0x0f) as usize];
             acc += w * x[col];
         }
@@ -11573,18 +11621,19 @@ fn qwen36_dense_int4_dot_2d_lut_unchecked(
         let group_start = scale_col * group_size;
         let group_end = cols.min(group_start + group_size);
         let lut = &luts[lut_base + scale_col];
-        let mut col = group_start;
-        let mut byte_idx = packed_base + group_start / 2;
-        while col + 1 < group_end {
-            let byte = unsafe { *packed.add(byte_idx) };
-            let w0 = lut[(byte & 0x0f) as usize];
-            let w1 = lut[((byte >> 4) & 0x0f) as usize];
-            acc += w0 * x[col] + w1 * x[col + 1];
-            col += 2;
-            byte_idx += 1;
-        }
+        let pair_cols = (group_end - group_start) & !1;
+        acc = unsafe {
+            qwen36_int4_lut_dot_pairs(
+                acc,
+                packed.add(packed_base + group_start / 2),
+                x.as_ptr().add(group_start),
+                pair_cols / 2,
+                lut,
+            )
+        };
+        let col = group_start + pair_cols;
         if col < group_end {
-            let byte = unsafe { *packed.add(byte_idx) };
+            let byte = unsafe { *packed.add(packed_base + col / 2) };
             acc += lut[(byte & 0x0f) as usize] * x[col];
         }
     }
@@ -11627,18 +11676,19 @@ fn qwen36_expert_dense_or_int4_dot_unchecked(
         let s = bf16_bits_to_f32(unsafe { *scale.add(scale_idx) });
         let z = bf16_bits_to_f32(unsafe { *zero.add(scale_idx) });
         let lut = qwen36_int4_group_dequant_lut(s, z);
-        let mut col = group_start;
-        let mut byte_idx = packed_base + group_start / 2;
-        while col + 1 < group_end {
-            let byte = unsafe { *packed.add(byte_idx) };
-            let w0 = lut[(byte & 0x0f) as usize];
-            let w1 = lut[((byte >> 4) & 0x0f) as usize];
-            acc += w0 * x[col] + w1 * x[col + 1];
-            col += 2;
-            byte_idx += 1;
-        }
+        let pair_cols = (group_end - group_start) & !1;
+        acc = unsafe {
+            qwen36_int4_lut_dot_pairs(
+                acc,
+                packed.add(packed_base + group_start / 2),
+                x.as_ptr().add(group_start),
+                pair_cols / 2,
+                &lut,
+            )
+        };
+        let col = group_start + pair_cols;
         if col < group_end {
-            let byte = unsafe { *packed.add(byte_idx) };
+            let byte = unsafe { *packed.add(packed_base + col / 2) };
             let w = lut[(byte & 0x0f) as usize];
             acc += w * x[col];
         }
@@ -11669,18 +11719,19 @@ fn qwen36_expert_int4_dot_lut_unchecked(
         let group_start = scale_col * group_size;
         let group_end = cols.min(group_start + group_size);
         let lut = &luts[lut_base + scale_col];
-        let mut col = group_start;
-        let mut byte_idx = packed_base + group_start / 2;
-        while col + 1 < group_end {
-            let byte = unsafe { *packed.add(byte_idx) };
-            let w0 = lut[(byte & 0x0f) as usize];
-            let w1 = lut[((byte >> 4) & 0x0f) as usize];
-            acc += w0 * x[col] + w1 * x[col + 1];
-            col += 2;
-            byte_idx += 1;
-        }
+        let pair_cols = (group_end - group_start) & !1;
+        acc = unsafe {
+            qwen36_int4_lut_dot_pairs(
+                acc,
+                packed.add(packed_base + group_start / 2),
+                x.as_ptr().add(group_start),
+                pair_cols / 2,
+                lut,
+            )
+        };
+        let col = group_start + pair_cols;
         if col < group_end {
-            let byte = unsafe { *packed.add(byte_idx) };
+            let byte = unsafe { *packed.add(packed_base + col / 2) };
             acc += lut[(byte & 0x0f) as usize] * x[col];
         }
     }
