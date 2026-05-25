@@ -10277,29 +10277,65 @@ fn ffn_step_stage1_5_metal_host(
         let shared_up_scale = int4.shared_up_proj_scale as usize;
         let shared_up_zero = int4.shared_up_proj_zero as usize;
         let group_size = int4.group_size.max(0) as usize;
+        let shared_gate_luts = qwen36_build_dense_int4_dequant_luts(
+            shared_gate_scale,
+            shared_gate_zero,
+            shared_intermediate,
+            hidden,
+            group_size,
+        );
+        let shared_up_luts = qwen36_build_dense_int4_dequant_luts(
+            shared_up_scale,
+            shared_up_zero,
+            shared_intermediate,
+            hidden,
+            group_size,
+        );
         qwen36_parallel_chunks2_mut(sgp, sup, 64, |start, gate_chunk, up_chunk| {
             for (local, (gate_out, up_out)) in
                 gate_chunk.iter_mut().zip(up_chunk.iter_mut()).enumerate()
             {
                 let row = start + local;
-                *gate_out = qwen36_dense_or_int4_dot_2d_unchecked(
-                    shared_gate_w,
-                    shared_gate_scale,
-                    shared_gate_zero,
-                    row,
-                    hidden,
-                    group_size,
-                    &h_norm,
-                );
-                *up_out = qwen36_dense_or_int4_dot_2d_unchecked(
-                    shared_up_w,
-                    shared_up_scale,
-                    shared_up_zero,
-                    row,
-                    hidden,
-                    group_size,
-                    &h_norm,
-                );
+                *gate_out = if let Some(luts) = shared_gate_luts.as_deref() {
+                    qwen36_dense_int4_dot_2d_lut_unchecked(
+                        shared_gate_w,
+                        row,
+                        hidden,
+                        group_size,
+                        &h_norm,
+                        luts,
+                    )
+                } else {
+                    qwen36_dense_or_int4_dot_2d_unchecked(
+                        shared_gate_w,
+                        shared_gate_scale,
+                        shared_gate_zero,
+                        row,
+                        hidden,
+                        group_size,
+                        &h_norm,
+                    )
+                };
+                *up_out = if let Some(luts) = shared_up_luts.as_deref() {
+                    qwen36_dense_int4_dot_2d_lut_unchecked(
+                        shared_up_w,
+                        row,
+                        hidden,
+                        group_size,
+                        &h_norm,
+                        luts,
+                    )
+                } else {
+                    qwen36_dense_or_int4_dot_2d_unchecked(
+                        shared_up_w,
+                        shared_up_scale,
+                        shared_up_zero,
+                        row,
+                        hidden,
+                        group_size,
+                        &h_norm,
+                    )
+                };
             }
         });
     });
@@ -10325,19 +10361,37 @@ fn ffn_step_stage1_5_metal_host(
         let shared_down_scale = int4.shared_down_proj_scale as usize;
         let shared_down_zero = int4.shared_down_proj_zero as usize;
         let group_size = int4.group_size.max(0) as usize;
+        let shared_down_luts = qwen36_build_dense_int4_dequant_luts(
+            shared_down_scale,
+            shared_down_zero,
+            hidden,
+            shared_intermediate,
+            group_size,
+        );
         let shared_out = &mut workspace[off_shared_out..off_shared_out + hidden];
         qwen36_parallel_chunks_mut(shared_out, 64, |start, chunk| {
             for (local, out) in chunk.iter_mut().enumerate() {
                 let row = start + local;
-                let acc = qwen36_dense_or_int4_dot_2d_unchecked(
-                    shared_down_w,
-                    shared_down_scale,
-                    shared_down_zero,
-                    row,
-                    shared_intermediate,
-                    group_size,
-                    &shared_mid,
-                );
+                let acc = if let Some(luts) = shared_down_luts.as_deref() {
+                    qwen36_dense_int4_dot_2d_lut_unchecked(
+                        shared_down_w,
+                        row,
+                        shared_intermediate,
+                        group_size,
+                        &shared_mid,
+                        luts,
+                    )
+                } else {
+                    qwen36_dense_or_int4_dot_2d_unchecked(
+                        shared_down_w,
+                        shared_down_scale,
+                        shared_down_zero,
+                        row,
+                        shared_intermediate,
+                        group_size,
+                        &shared_mid,
+                    )
+                };
                 *out = bf16_round_f32(sg_scalar * acc);
             }
         });
@@ -10830,23 +10884,45 @@ fn ffn_step_stage1_5_metal_host(
             let gate_up_zero = int4.gate_up_proj_zero as usize;
             let group_size = int4.group_size.max(0) as usize;
             let rows_per_group = 2 * moe_intermediate;
+            let gate_up_luts = qwen36_build_active_expert_int4_dequant_luts(
+                gate_up_scale,
+                gate_up_zero,
+                &active_experts,
+                rows_per_group,
+                hidden,
+                group_size,
+            );
             let gu = &mut workspace[off_expert_gu..off_expert_gu + active_groups * rows_per_group];
             qwen36_parallel_chunks_mut(gu, 64, |start, chunk| {
                 for (local, out) in chunk.iter_mut().enumerate() {
                     let flat_row = start + local;
                     let group = flat_row / rows_per_group;
                     let row = flat_row - group * rows_per_group;
-                    *out = qwen36_expert_dense_or_int4_dot_unchecked(
-                        gate_up_w,
-                        gate_up_scale,
-                        gate_up_zero,
-                        active_experts[group],
-                        row,
-                        rows_per_group,
-                        hidden,
-                        group_size,
-                        &h_norm,
-                    );
+                    *out = if let Some(luts) = gate_up_luts.as_deref() {
+                        qwen36_expert_int4_dot_lut_unchecked(
+                            gate_up_w,
+                            active_experts[group],
+                            group,
+                            row,
+                            rows_per_group,
+                            hidden,
+                            group_size,
+                            &h_norm,
+                            luts,
+                        )
+                    } else {
+                        qwen36_expert_dense_or_int4_dot_unchecked(
+                            gate_up_w,
+                            gate_up_scale,
+                            gate_up_zero,
+                            active_experts[group],
+                            row,
+                            rows_per_group,
+                            hidden,
+                            group_size,
+                            &h_norm,
+                        )
+                    };
                 }
             });
         });
@@ -10872,6 +10948,14 @@ fn ffn_step_stage1_5_metal_host(
         let down_scale = int4.down_proj_scale as usize;
         let down_zero = int4.down_proj_zero as usize;
         let group_size = int4.group_size.max(0) as usize;
+        let down_luts = qwen36_build_active_expert_int4_dequant_luts(
+            down_scale,
+            down_zero,
+            &active_experts,
+            hidden,
+            moe_intermediate,
+            group_size,
+        );
         let stack = &mut workspace[off_expert_stack..off_expert_stack + active_groups * hidden];
         qwen36_parallel_chunks_mut(stack, 64, |start, chunk| {
             for (local, out) in chunk.iter_mut().enumerate() {
@@ -10879,17 +10963,31 @@ fn ffn_step_stage1_5_metal_host(
                 let group = flat_row / hidden;
                 let row = flat_row - group * hidden;
                 let mid = &expert_mid[group * moe_intermediate..(group + 1) * moe_intermediate];
-                *out = qwen36_expert_dense_or_int4_dot_unchecked(
-                    down_w,
-                    down_scale,
-                    down_zero,
-                    active_experts[group],
-                    row,
-                    hidden,
-                    moe_intermediate,
-                    group_size,
-                    mid,
-                );
+                *out = if let Some(luts) = down_luts.as_deref() {
+                    qwen36_expert_int4_dot_lut_unchecked(
+                        down_w,
+                        active_experts[group],
+                        group,
+                        row,
+                        hidden,
+                        moe_intermediate,
+                        group_size,
+                        mid,
+                        luts,
+                    )
+                } else {
+                    qwen36_expert_dense_or_int4_dot_unchecked(
+                        down_w,
+                        down_scale,
+                        down_zero,
+                        active_experts[group],
+                        row,
+                        hidden,
+                        moe_intermediate,
+                        group_size,
+                        mid,
+                    )
+                };
             }
         });
         if params.stage == 3 {
@@ -11121,6 +11219,62 @@ fn qwen36_int4_group_dequant_lut(scale: f32, zero: f32) -> [f32; 16] {
     std::array::from_fn(|q| bf16_round_f32(q as f32 * scale - zs))
 }
 
+fn qwen36_build_dense_int4_dequant_luts(
+    scale: usize,
+    zero: usize,
+    rows: usize,
+    cols: usize,
+    group_size: usize,
+) -> Option<Vec<[f32; 16]>> {
+    if scale == 0 && zero == 0 {
+        return None;
+    }
+    let scale = scale as *const u16;
+    let zero = zero as *const u16;
+    let scale_rows = rows.div_ceil(group_size);
+    let scale_cols = cols.div_ceil(group_size);
+    let mut luts = Vec::with_capacity(scale_rows * scale_cols);
+    for scale_row in 0..scale_rows {
+        for scale_col in 0..scale_cols {
+            let scale_idx = scale_row * scale_cols + scale_col;
+            let s = bf16_bits_to_f32(unsafe { *scale.add(scale_idx) });
+            let z = bf16_bits_to_f32(unsafe { *zero.add(scale_idx) });
+            luts.push(qwen36_int4_group_dequant_lut(s, z));
+        }
+    }
+    Some(luts)
+}
+
+fn qwen36_build_active_expert_int4_dequant_luts(
+    scale: usize,
+    zero: usize,
+    active_experts: &[usize],
+    rows: usize,
+    cols: usize,
+    group_size: usize,
+) -> Option<Vec<[f32; 16]>> {
+    if scale == 0 && zero == 0 {
+        return None;
+    }
+    let scale = scale as *const u16;
+    let zero = zero as *const u16;
+    let scale_rows = rows.div_ceil(group_size);
+    let scale_cols = cols.div_ceil(group_size);
+    let mut luts = Vec::with_capacity(active_experts.len() * scale_rows * scale_cols);
+    for &expert in active_experts {
+        let expert_base = expert * scale_rows * scale_cols;
+        for scale_row in 0..scale_rows {
+            for scale_col in 0..scale_cols {
+                let scale_idx = expert_base + scale_row * scale_cols + scale_col;
+                let s = bf16_bits_to_f32(unsafe { *scale.add(scale_idx) });
+                let z = bf16_bits_to_f32(unsafe { *zero.add(scale_idx) });
+                luts.push(qwen36_int4_group_dequant_lut(s, z));
+            }
+        }
+    }
+    Some(luts)
+}
+
 fn qwen36_host_parallelism(len: usize, min_rows_per_worker: usize) -> usize {
     if len < min_rows_per_worker.saturating_mul(2) {
         return 1;
@@ -11244,6 +11398,42 @@ fn qwen36_dense_or_int4_dot_2d_unchecked(
     acc
 }
 
+fn qwen36_dense_int4_dot_2d_lut_unchecked(
+    weight: usize,
+    row: usize,
+    cols: usize,
+    group_size: usize,
+    x: &[f32],
+    luts: &[[f32; 16]],
+) -> f32 {
+    let mut acc = 0.0f32;
+    let packed = weight as *const u8;
+    let byte_cols = cols.div_ceil(2);
+    let scale_cols = cols.div_ceil(group_size);
+    let packed_base = row * byte_cols;
+    let lut_base = (row / group_size) * scale_cols;
+    for scale_col in 0..scale_cols {
+        let group_start = scale_col * group_size;
+        let group_end = cols.min(group_start + group_size);
+        let lut = &luts[lut_base + scale_col];
+        let mut col = group_start;
+        let mut byte_idx = packed_base + group_start / 2;
+        while col + 1 < group_end {
+            let byte = unsafe { *packed.add(byte_idx) };
+            let w0 = lut[(byte & 0x0f) as usize];
+            let w1 = lut[((byte >> 4) & 0x0f) as usize];
+            acc += w0 * x[col] + w1 * x[col + 1];
+            col += 2;
+            byte_idx += 1;
+        }
+        if col < group_end {
+            let byte = unsafe { *packed.add(byte_idx) };
+            acc += lut[(byte & 0x0f) as usize] * x[col];
+        }
+    }
+    acc
+}
+
 #[allow(clippy::too_many_arguments)]
 fn qwen36_expert_dense_or_int4_dot_unchecked(
     weight: usize,
@@ -11294,6 +11484,47 @@ fn qwen36_expert_dense_or_int4_dot_unchecked(
             let byte = unsafe { *packed.add(byte_idx) };
             let w = lut[(byte & 0x0f) as usize];
             acc += w * x[col];
+        }
+    }
+    acc
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen36_expert_int4_dot_lut_unchecked(
+    weight: usize,
+    expert: usize,
+    active_group: usize,
+    row: usize,
+    rows: usize,
+    cols: usize,
+    group_size: usize,
+    x: &[f32],
+    luts: &[[f32; 16]],
+) -> f32 {
+    let mut acc = 0.0f32;
+    let packed = weight as *const u8;
+    let byte_cols = cols.div_ceil(2);
+    let scale_rows = rows.div_ceil(group_size);
+    let scale_cols = cols.div_ceil(group_size);
+    let packed_base = (expert * rows + row) * byte_cols;
+    let lut_base = (active_group * scale_rows + row / group_size) * scale_cols;
+    for scale_col in 0..scale_cols {
+        let group_start = scale_col * group_size;
+        let group_end = cols.min(group_start + group_size);
+        let lut = &luts[lut_base + scale_col];
+        let mut col = group_start;
+        let mut byte_idx = packed_base + group_start / 2;
+        while col + 1 < group_end {
+            let byte = unsafe { *packed.add(byte_idx) };
+            let w0 = lut[(byte & 0x0f) as usize];
+            let w1 = lut[((byte >> 4) & 0x0f) as usize];
+            acc += w0 * x[col] + w1 * x[col + 1];
+            col += 2;
+            byte_idx += 1;
+        }
+        if col < group_end {
+            let byte = unsafe { *packed.add(byte_idx) };
+            acc += lut[(byte & 0x0f) as usize] * x[col];
         }
     }
     acc

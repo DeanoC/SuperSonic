@@ -2518,6 +2518,29 @@ under the same smoke:
    valid next local target, but the larger headline win came from removing the
    per-element dequant rounding overhead in the default lane.
 
+66. **Qwen3.6 active INT4 LUT precompute**
+   Reused the promoted host INT4 dequant table path one level higher in the FFN
+   call tree. The default Metal FFN host fallback now precomputes the active
+   dense shared-projection LUTs and the top-k expert LUTs once per layer/token,
+   then passes those tables into the row-parallel dot helpers. This keeps the
+   packed-nibble accumulation shape unchanged while avoiding repeated 16-entry
+   LUT construction for every output row.
+
+   Validation passed: `cargo test -p kernel-ffi qwen36_moe --lib`,
+   `git diff --check -- crates/kernel-ffi/src/qwen36_moe.rs`, and
+   `cargo build --release -p runner --bin supersonic`. The promotion
+   `bench-perf` run wrote `target/bench-runs/2026-05-25-d4a0875` and measured
+   headline median `111.2 ms/token` with samples `110.1`, `112.4`, `111.2`,
+   improving the previous LUT baseline of `113.8 ms/token`.
+
+   The unprofiled stage table moved from `ffn_ms_avg=70.578` to
+   `ffn_ms_avg=68.532`, with `linear_attn_ms_avg=25.421`,
+   `full_attn_ms_avg=12.068`, and `lm_head_ms_avg=4.711`. Profile attribution
+   still names the same next rows: `qwen36_linear_int4_stage5`
+   (`1049.598 ms` total), `command_buffer_wait` (`1044.441 ms`), then FFN host
+   expert gate/up (`578.624 ms`) and down (`337.009 ms`). This is a real but
+   incremental host-side cleanup, not the final FFN residency or compute path.
+
 ## Sources
 
 - [Qwen/Qwen3.6-35B-A3B model card](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)

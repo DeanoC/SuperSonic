@@ -1217,16 +1217,18 @@ with `qwen36_ffn_host_expert_gate_up` at 56.839 ms total and
 escape hatch also generated `[11]`, but remains too slow to promote
 (`ffn_ms_avg=640.553` in the same one-token smoke shape).
 
-The 2026-05-25 host INT4 dequant LUT update supersedes the `145.5 ms/token`
-baseline for the default lane. The FFN host dot helpers now build a 16-entry
-BF16-rounded dequant table per scale/zero group and use it for packed-nibble
-accumulation, avoiding per-element BF16 rounding in the inner loop. The current
-Apple M5 Max `bench-perf` run
-(`target/bench-runs/2026-05-25-edb5b06/perf/qwen3.6-35b-a3b_int4.json`)
-measured median `113.8 ms/token` with samples `113.6`, `113.8`, `117.0`.
-Unprofiled attribution is now `ffn_ms_avg=70.578`,
-`linear_attn_ms_avg=23.411`, `full_attn_ms_avg=12.340`, and
-`lm_head_ms_avg=4.706`; the profile pass still leaves
+The 2026-05-25 host INT4 dequant LUT updates supersede the `145.5 ms/token`
+baseline for the default lane. The FFN host dot helpers first moved to a
+16-entry BF16-rounded dequant table per scale/zero group, avoiding per-element
+BF16 rounding in the inner loop. A follow-up precomputes the active dense and
+top-k expert tables once per layer/token before the row-parallel dot loops,
+removing repeated table construction from the hot rows. The current Apple M5 Max
+`bench-perf` run
+(`target/bench-runs/2026-05-25-d4a0875/perf/qwen3.6-35b-a3b_int4.json`)
+measured median `111.2 ms/token` with samples `110.1`, `112.4`, `111.2`.
+Unprofiled attribution is now `ffn_ms_avg=68.532`,
+`linear_attn_ms_avg=25.421`, `full_attn_ms_avg=12.068`, and
+`lm_head_ms_avg=4.711`; the profile pass still leaves
 `qwen36_linear_int4_stage5`, `command_buffer_wait`, and FFN host expert
 gate/up + down as the next rows to attack.
 
