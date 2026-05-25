@@ -1222,15 +1222,21 @@ baseline for the default lane. The FFN host dot helpers first moved to a
 16-entry BF16-rounded dequant table per scale/zero group, avoiding per-element
 BF16 rounding in the inner loop. A follow-up precomputes the active dense and
 top-k expert tables once per layer/token before the row-parallel dot loops,
-removing repeated table construction from the hot rows. The current Apple M5 Max
-`bench-perf` run
-(`target/bench-runs/2026-05-25-d4a0875/perf/qwen3.6-35b-a3b_int4.json`)
-measured median `111.2 ms/token` with samples `110.1`, `112.4`, `111.2`.
-Unprofiled attribution is now `ffn_ms_avg=68.532`,
-`linear_attn_ms_avg=25.421`, `full_attn_ms_avg=12.068`, and
-`lm_head_ms_avg=4.711`; the profile pass still leaves
-`qwen36_linear_int4_stage5`, `command_buffer_wait`, and FFN host expert
-gate/up + down as the next rows to attack.
+removing repeated table construction from the hot rows.
+
+The follow-up Metal linear INT4 update groups packed-byte dot loops by their
+GPTQ scale column inside the native `qwen36_linear_int4_stage5` projection and
+out-projection kernels. That reuses each scale/zero pair across its 128-value
+group instead of recomputing the sidecar index and reloading the pair for every
+packed byte. The current Apple M5 Max `bench-perf` run
+(`target/bench-runs/2026-05-25-074fc95-3/perf/qwen3.6-35b-a3b_int4.json`)
+measured median `107.4 ms/token` with samples `107.4`, `107.2`, `107.7`.
+Unprofiled attribution is now `ffn_ms_avg=70.370`,
+`linear_attn_ms_avg=23.719`, `full_attn_ms_avg=12.327`, and
+`lm_head_ms_avg=4.566`; the one-token Metal smoke still generated `[11]`. The
+remaining top profile rows are `qwen36_linear_int4_stage5`,
+`command_buffer_wait`, and FFN host expert gate/up + down, with FFN again the
+largest unprofiled bucket.
 
 The focused routed-expert microbench exercises the exact Qwen3.6 stage-5 INT4
 shape (`hidden=2048`, `num_experts=256`, `moe_intermediate=512`, `top_k=8`,

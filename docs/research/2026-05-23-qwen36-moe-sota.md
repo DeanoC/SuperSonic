@@ -2541,6 +2541,33 @@ under the same smoke:
    expert gate/up (`578.624 ms`) and down (`337.009 ms`). This is a real but
    incremental host-side cleanup, not the final FFN residency or compute path.
 
+67. **Qwen3.6 linear INT4 sidecar grouping**
+   Acted on the post-LUT profile row for `qwen36_linear_int4_stage5`. The native
+   Metal linear-attention projection and out-projection kernels now iterate each
+   row's packed bytes by GPTQ scale column, so a scale/zero pair is loaded once
+   for its `group_size=128` band instead of recomputing the sidecar index and
+   loading the same pair for every packed byte. Lane-local byte order is
+   preserved, keeping the existing accumulation shape while reducing sidecar
+   traffic and integer work in the INT4 dot loops.
+
+   Validation passed: `cargo test -p kernel-ffi qwen36_moe --lib`,
+   `git diff --check -- crates/kernel-ffi/src/metal_native.mm`,
+   `cargo build --release -p runner --bin supersonic`, the one-token Metal INT4
+   smoke with generated id `[11]`, and the Apple M5 Max Qwen3.6 INT4
+   `bench-perf` gate. The promotion run wrote
+   `target/bench-runs/2026-05-25-074fc95-3` and measured headline median
+   `107.4 ms/token` with samples `107.4`, `107.2`, `107.7`, improving the
+   previous committed baseline of `111.2 ms/token`.
+
+   The unprofiled stage table is now `ffn_ms_avg=70.370`,
+   `linear_attn_ms_avg=23.719`, `full_attn_ms_avg=12.327`, and
+   `lm_head_ms_avg=4.566`. Profile attribution shows the linear projection GPU
+   row at `62.152 ms` total, with `qwen36_linear_int4_stage5`
+   (`1116.767 ms`) and `command_buffer_wait` (`1110.672 ms`) still high in the
+   profiled path. The next performance target moves back to FFN host expert
+   gate/up + down or a larger submit/residency reduction, because FFN is again
+   the largest unprofiled bucket.
+
 ## Sources
 
 - [Qwen/Qwen3.6-35B-A3B model card](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)

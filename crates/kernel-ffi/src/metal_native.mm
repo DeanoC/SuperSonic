@@ -2328,6 +2328,21 @@ inline float int4_weight_pair_dot_2d(
     return w0 * x0 + w1 * x1;
 }
 
+inline float int4_weight_pair_dot_scaled(
+    device const uchar* packed,
+    uint packed_idx,
+    float s,
+    float z,
+    float x0,
+    float x1
+) {
+    uint packed_byte = uint(packed[packed_idx]);
+    float zs = z * s;
+    float w0 = bf16_round_rne_finite(float(packed_byte & 0xFu) * s - zs);
+    float w1 = bf16_round_rne_finite(float((packed_byte >> 4u) & 0xFu) * s - zs);
+    return w0 * x0 + w1 * x1;
+}
+
 kernel void supersonic_qwen36_linear_input_norm(
     device const bfloat* input_hidden [[buffer(0)]],
     device const bfloat* input_norm_w [[buffer(1)]],
@@ -2390,14 +2405,28 @@ kernel void supersonic_qwen36_linear_projections(
     float partial = 0.0f;
     if (row < params.qkv_dim) {
         uint byte_cols = (params.hidden + 1u) / 2u;
-        for (uint byte_col = lane; byte_col < byte_cols; byte_col += 32u) {
-            uint col = byte_col << 1u;
-            float x1 = (col + 1u) < params.hidden ? float(x_norm[col + 1u]) : 0.0f;
-            partial += int4_weight_pair_dot_2d(
-                in_proj_qkv, in_proj_qkv_scale, in_proj_qkv_zero,
-                row, byte_col, params.hidden, params.group_size,
-                float(x_norm[col]), x1
-            );
+        uint scale_cols = (params.hidden + params.group_size - 1u) / params.group_size;
+        uint scale_base = (row / params.group_size) * scale_cols;
+        uint packed_base = row * byte_cols;
+        for (uint scale_col = 0; scale_col < scale_cols; ++scale_col) {
+            uint group_start = scale_col * params.group_size;
+            uint group_end = min(params.hidden, group_start + params.group_size);
+            uint byte_start = group_start >> 1u;
+            uint byte_end = (group_end + 1u) >> 1u;
+            float s = float(in_proj_qkv_scale[scale_base + scale_col]);
+            float z = float(in_proj_qkv_zero[scale_base + scale_col]);
+            for (uint byte_col = byte_start + lane; byte_col < byte_end; byte_col += 32u) {
+                uint col = byte_col << 1u;
+                float x1 = (col + 1u) < params.hidden ? float(x_norm[col + 1u]) : 0.0f;
+                partial += int4_weight_pair_dot_scaled(
+                    in_proj_qkv,
+                    packed_base + byte_col,
+                    s,
+                    z,
+                    float(x_norm[col]),
+                    x1
+                );
+            }
         }
         float acc = simd_sum(partial);
         if (lane == 0) {
@@ -2406,14 +2435,28 @@ kernel void supersonic_qwen36_linear_projections(
     } else if (row < ab_base) {
         uint z_row = row - params.qkv_dim;
         uint byte_cols = (params.hidden + 1u) / 2u;
-        for (uint byte_col = lane; byte_col < byte_cols; byte_col += 32u) {
-            uint col = byte_col << 1u;
-            float x1 = (col + 1u) < params.hidden ? float(x_norm[col + 1u]) : 0.0f;
-            partial += int4_weight_pair_dot_2d(
-                in_proj_z, in_proj_z_scale, in_proj_z_zero,
-                z_row, byte_col, params.hidden, params.group_size,
-                float(x_norm[col]), x1
-            );
+        uint scale_cols = (params.hidden + params.group_size - 1u) / params.group_size;
+        uint scale_base = (z_row / params.group_size) * scale_cols;
+        uint packed_base = z_row * byte_cols;
+        for (uint scale_col = 0; scale_col < scale_cols; ++scale_col) {
+            uint group_start = scale_col * params.group_size;
+            uint group_end = min(params.hidden, group_start + params.group_size);
+            uint byte_start = group_start >> 1u;
+            uint byte_end = (group_end + 1u) >> 1u;
+            float s = float(in_proj_z_scale[scale_base + scale_col]);
+            float z = float(in_proj_z_zero[scale_base + scale_col]);
+            for (uint byte_col = byte_start + lane; byte_col < byte_end; byte_col += 32u) {
+                uint col = byte_col << 1u;
+                float x1 = (col + 1u) < params.hidden ? float(x_norm[col + 1u]) : 0.0f;
+                partial += int4_weight_pair_dot_scaled(
+                    in_proj_z,
+                    packed_base + byte_col,
+                    s,
+                    z,
+                    float(x_norm[col]),
+                    x1
+                );
+            }
         }
         float acc = simd_sum(partial);
         if (lane == 0) {
@@ -2600,15 +2643,28 @@ kernel void supersonic_qwen36_linear_out_proj_finalize(
     }
     float partial = 0.0f;
     uint byte_cols = (params.val_dim + 1u) / 2u;
-    for (uint byte_col = lane; byte_col < byte_cols; byte_col += 32u) {
-        uint col = byte_col << 1u;
-        float x1 = (col + 1u) < params.val_dim ? workspace[params.off_rec_out + col + 1u] : 0.0f;
-        partial += int4_weight_pair_dot_2d(
-            out_proj, out_proj_scale, out_proj_zero,
-            row, byte_col, params.val_dim, params.group_size,
-            workspace[params.off_rec_out + col],
-            x1
-        );
+    uint scale_cols = (params.val_dim + params.group_size - 1u) / params.group_size;
+    uint scale_base = (row / params.group_size) * scale_cols;
+    uint packed_base = row * byte_cols;
+    for (uint scale_col = 0; scale_col < scale_cols; ++scale_col) {
+        uint group_start = scale_col * params.group_size;
+        uint group_end = min(params.val_dim, group_start + params.group_size);
+        uint byte_start = group_start >> 1u;
+        uint byte_end = (group_end + 1u) >> 1u;
+        float s = float(out_proj_scale[scale_base + scale_col]);
+        float z = float(out_proj_zero[scale_base + scale_col]);
+        for (uint byte_col = byte_start + lane; byte_col < byte_end; byte_col += 32u) {
+            uint col = byte_col << 1u;
+            float x1 = (col + 1u) < params.val_dim ? workspace[params.off_rec_out + col + 1u] : 0.0f;
+            partial += int4_weight_pair_dot_scaled(
+                out_proj,
+                packed_base + byte_col,
+                s,
+                z,
+                workspace[params.off_rec_out + col],
+                x1
+            );
+        }
     }
     float acc = simd_sum(partial);
     if (lane == 0) {
