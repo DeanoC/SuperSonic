@@ -3150,7 +3150,7 @@ pub fn linear_step_launch(
                     weights.norm_w,
                     weights.out_proj_w,
                     weights.conv_state,
-                    weights.recurrent_state as *mut c_void,
+                    weights.recurrent_state as *mut f32,
                     int4.group_size as c_int,
                     int4.in_proj_qkv_scale,
                     int4.in_proj_qkv_zero,
