@@ -2330,6 +2330,64 @@ under the same smoke:
    measured tolerance policy for these one-ulp BF16 residual boundaries before
    returning to performance work.
 
+62. **Qwen3.6 source-aware BF16 boundary policy**
+   The fused-routed sweep is now schema `v40`. It extends the existing
+   layer-output tolerance gate with an optional source-aware policy:
+   `--promotion-layer-output-allowed-sources` accepts a comma-separated list of
+   FFN residual attribution sources that are allowed to use the explicit
+   numeric tolerance envelope. When this list is non-empty, a checksum mismatch
+   is tolerated only if the layer-output delta is within the configured
+   `max_abs`, `max_ulp`, and differing-element thresholds and the
+   `[qwen36-ffn-residual-delta-attribution]` evidence classifies the row as one
+   of the allowed sources. Numeric-only tolerance remains available by leaving
+   the allowed-source list empty, but the Qwen3.6 Metal policy should use the
+   source-aware mode.
+
+   Local validation passed:
+   `PYTHONPYCACHEPREFIX=/private/tmp/supersonic-pycache python3 -m py_compile
+   tests/metal/sweep_qwen36_fused_routed_int4.py
+   tests/test_qwen36_fused_routed_int4_sweep.py`,
+   `PYTHONPYCACHEPREFIX=/private/tmp/supersonic-pycache python3 -m unittest
+   tests.test_qwen36_fused_routed_int4_sweep`, and
+   `cargo build --release -p runner --bin supersonic`. The focused Metal run
+   wrote `/private/tmp/qwen36_boundary_policy_v40_1tok.{json,md}` with
+   `--modes default,full-stage5-router-simd-batch,full-stage5-router-simd-batch-shared-mid-host-corrected
+   --max-new-tokens 1 --context-size 64 --metal-profile --shared-parity-tap
+   --shared-parity-tap-max-calls 120 --routed-parity-tap
+   --routed-parity-tap-max-calls 120 --layer-output-tap
+   --layer-output-delta-tap --layer-output-delta-all
+   --promotion-allow-layer-output-tolerance
+   --promotion-layer-output-max-abs-delta 0.00048828125
+   --promotion-layer-output-max-ulp-delta 2
+   --promotion-layer-output-max-differing-elems 1
+   --promotion-layer-output-allowed-sources
+   shared_mid_to_shared_out_bf16_boundary,moe_out_residual_rounding_boundary
+   --no-promotion-require-profile`. All three rows ran, generated IDs matched
+   (`[11]`), and the promotion gate remained false.
+
+   The policy does not rubber-stamp the current fast path. For
+   `full-stage5-router-simd-batch`, the first mismatch is the known layer `7`
+   `shared_mid_to_shared_out_bf16_boundary`, but the mode has `65`
+   layer-output mismatches and later rows require `max_abs_delta=0.15625`,
+   `max_ulp_delta=31081`, and `1991` differing elements. The source-aware
+   policy observes both the allowed shared-mid boundary and disallowed
+   `parity_delta_away_from_layer_max` rows (`32` disallowed, `32` missing source
+   rows). For the shared-mid-corrected diagnostic, the first mismatch is the
+   allowed layer `33` `moe_out_residual_rounding_boundary`, but later drift still
+   requires `max_abs_delta=0.0625`, `max_ulp_delta=30737`, and `1951` differing
+   elements with six disallowed rows.
+
+   The resulting policy recommendation is
+   `fix_non_boundary_layer_output_drift`, not "allow tolerance and promote".
+   This gives us a measured correctness boundary: one-ulp BF16 boundary rows can
+   be recognized without hiding broader drift, and the runtime should not move
+   back to performance promotion until the downstream non-boundary drift is
+   either removed or traced to a separately bounded source. The next useful
+   correctness probe is therefore a drift-containment experiment: apply the
+   existing host-correction diagnostics only as non-promotable taps to identify
+   the first layer where allowed one-row boundary drift expands into
+   `parity_delta_away_from_layer_max`.
+
 ## Sources
 
 - [Qwen/Qwen3.6-35B-A3B model card](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)

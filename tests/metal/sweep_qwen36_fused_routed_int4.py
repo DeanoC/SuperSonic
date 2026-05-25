@@ -16,9 +16,15 @@ from typing import Any
 
 
 MODEL = "qwen3.6-35b-a3b"
-SCHEMA = "qwen36-fused-routed-int4-sweep-v39"
+SCHEMA = "qwen36-fused-routed-int4-sweep-v40"
 DEFAULT_MAX_FUSED_WALL_GPU_RATIO = 4.0
 DEFAULT_MAX_WAIT_GPU_RATIO = 4.0
+BF16_BOUNDARY_SOURCES = {
+    "shared_mid_to_shared_out_bf16_boundary",
+    "shared_out_residual_rounding_boundary",
+    "moe_out_residual_rounding_boundary",
+    "final_residual_rounding_boundary",
+}
 COARSE_BATCH_SERIAL_MODE = "full-stage5-router-batch"
 COARSE_BATCH_SIMD_MODE = "full-stage5-router-simd-batch"
 DEFERRED_BATCH_SERIAL_MODE = "full-stage5-router-batch-deferred-phases"
@@ -513,6 +519,14 @@ def parse_key_values(line: str) -> dict[str, str]:
         key, raw = part.split("=", 1)
         values[key] = raw.rstrip(",)")
     return values
+
+
+def parse_csv_set(raw: Any) -> set[str]:
+    if raw is None:
+        return set()
+    if isinstance(raw, (set, list, tuple)):
+        return {str(item).strip() for item in raw if str(item).strip()}
+    return {part.strip() for part in str(raw).split(",") if part.strip()}
 
 
 def parse_number(raw: str) -> int | float | str:
@@ -1934,6 +1948,23 @@ def layer_output_tap_map(row: dict[str, Any]) -> dict[tuple[int, int, str], dict
     }
 
 
+def ffn_residual_delta_attribution_by_key(
+    attribution: dict[str, Any] | None,
+) -> dict[tuple[str, str, int, int, str], dict[str, Any]]:
+    if not attribution:
+        return {}
+    return {
+        (
+            str(item.get("prompt_id", "")),
+            str(item.get("mode", "")),
+            int(item.get("position", -1)),
+            int(item.get("layer", -1)),
+            str(item.get("phase", "-")),
+        ): item
+        for item in attribution.get("items") or []
+    }
+
+
 def build_layer_output_tolerance_prompt_result(
     baseline: dict[str, Any],
     row: dict[str, Any],
@@ -1943,7 +1974,11 @@ def build_layer_output_tolerance_prompt_result(
     layer_output_max_abs_delta: float,
     layer_output_max_ulp_delta: int,
     layer_output_max_differing_elems: int,
+    allowed_boundary_sources: set[str] | None = None,
+    ffn_residual_by_key: dict[tuple[str, str, int, int, str], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    allowed_boundary_sources = allowed_boundary_sources or set()
+    ffn_residual_by_key = ffn_residual_by_key or {}
     prompt_id = str(row.get("prompt_id", baseline.get("prompt_id", "")))
     mode = str(row.get("mode", ""))
     baseline_by_key = layer_output_tap_map(baseline)
@@ -1958,6 +1993,9 @@ def build_layer_output_tolerance_prompt_result(
         "missing_candidate_rows": 0,
         "missing_delta_evidence": 0,
         "length_mismatches": 0,
+        "missing_source_evidence": 0,
+        "disallowed_source_mismatches": 0,
+        "observed_sources": [],
         "required_max_abs_delta": 0.0,
         "required_max_ulp_delta": 0,
         "required_max_differing_elems": 0,
@@ -2020,6 +2058,13 @@ def build_layer_output_tolerance_prompt_result(
         max_abs_delta = float(delta.get("max_abs_delta") or 0.0)
         max_ulp_delta = int(delta.get("max_ulp_delta") or 0)
         differing_elems = int(delta.get("differing_elems") or 0)
+        source_key = (prompt_id, mode, key[0], key[1], key[2])
+        source_item = ffn_residual_by_key.get(source_key)
+        source = None if source_item is None else str(source_item.get("source", ""))
+        if source:
+            observed_sources = result["observed_sources"]
+            if source not in observed_sources:
+                observed_sources.append(source)
         result["required_max_abs_delta"] = max(
             float(result["required_max_abs_delta"]),
             max_abs_delta,
@@ -2039,8 +2084,16 @@ def build_layer_output_tolerance_prompt_result(
                 "differing_elems": differing_elems,
                 "max_abs_delta_idx": delta.get("max_abs_delta_idx"),
                 "max_ulp_delta_idx": delta.get("max_ulp_delta_idx"),
+                "source": source,
             }
         )
+        if allowed_boundary_sources:
+            if source_item is None:
+                result["missing_source_evidence"] += 1
+                mismatch["reason"] = "missing_ffn_residual_attribution"
+            elif source not in allowed_boundary_sources:
+                result["disallowed_source_mismatches"] += 1
+                mismatch["reason"] = "layer_output_source_not_allowed"
         if first_mismatch is None:
             first_mismatch = mismatch
 
@@ -2057,6 +2110,8 @@ def build_layer_output_tolerance_prompt_result(
             and int(result["missing_candidate_rows"]) == 0
             and int(result["missing_delta_evidence"]) == 0
             and int(result["length_mismatches"]) == 0
+            and int(result["missing_source_evidence"]) == 0
+            and int(result["disallowed_source_mismatches"]) == 0
             and float(result["required_max_abs_delta"]) <= layer_output_max_abs_delta
             and int(result["required_max_ulp_delta"]) <= layer_output_max_ulp_delta
             and int(result["required_max_differing_elems"])
@@ -2073,7 +2128,11 @@ def build_layer_output_tolerance_policy(
     layer_output_max_abs_delta: float = 0.0,
     layer_output_max_ulp_delta: int = 0,
     layer_output_max_differing_elems: int = 0,
+    allowed_boundary_sources: set[str] | None = None,
+    ffn_residual_by_key: dict[tuple[str, str, int, int, str], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    allowed_boundary_sources = allowed_boundary_sources or set()
+    ffn_residual_by_key = ffn_residual_by_key or {}
     prompt_ids: list[str] = []
     for row in rows:
         prompt_id = str(row.get("prompt_id", ""))
@@ -2102,6 +2161,9 @@ def build_layer_output_tolerance_policy(
                         "missing_candidate_rows": 0,
                         "missing_delta_evidence": 0,
                         "length_mismatches": 0,
+                        "missing_source_evidence": 0,
+                        "disallowed_source_mismatches": 0,
+                        "observed_sources": [],
                         "required_max_abs_delta": 0.0,
                         "required_max_ulp_delta": 0,
                         "required_max_differing_elems": 0,
@@ -2123,6 +2185,9 @@ def build_layer_output_tolerance_policy(
                         "missing_candidate_rows": 0,
                         "missing_delta_evidence": 0,
                         "length_mismatches": 0,
+                        "missing_source_evidence": 0,
+                        "disallowed_source_mismatches": 0,
+                        "observed_sources": [],
                         "required_max_abs_delta": 0.0,
                         "required_max_ulp_delta": 0,
                         "required_max_differing_elems": 0,
@@ -2141,6 +2206,8 @@ def build_layer_output_tolerance_policy(
                     layer_output_max_abs_delta=layer_output_max_abs_delta,
                     layer_output_max_ulp_delta=layer_output_max_ulp_delta,
                     layer_output_max_differing_elems=layer_output_max_differing_elems,
+                    allowed_boundary_sources=allowed_boundary_sources,
+                    ffn_residual_by_key=ffn_residual_by_key,
                 )
             )
 
@@ -2155,6 +2222,20 @@ def build_layer_output_tolerance_policy(
             int(item.get("missing_candidate_rows") or 0) for item in items
         )
         length_mismatches = sum(int(item.get("length_mismatches") or 0) for item in items)
+        missing_source_evidence = sum(
+            int(item.get("missing_source_evidence") or 0) for item in items
+        )
+        disallowed_source_mismatches = sum(
+            int(item.get("disallowed_source_mismatches") or 0) for item in items
+        )
+        observed_sources = sorted(
+            {
+                str(source)
+                for item in items
+                for source in (item.get("observed_sources") or [])
+                if str(source)
+            }
+        )
         required_max_abs_delta = max(
             (float(item.get("required_max_abs_delta") or 0.0) for item in items),
             default=0.0,
@@ -2176,6 +2257,9 @@ def build_layer_output_tolerance_policy(
                 "missing_candidate_rows": missing_candidate_rows,
                 "missing_delta_evidence": missing_delta_evidence,
                 "length_mismatches": length_mismatches,
+                "missing_source_evidence": missing_source_evidence,
+                "disallowed_source_mismatches": disallowed_source_mismatches,
+                "observed_sources": observed_sources,
                 "required_max_abs_delta": required_max_abs_delta,
                 "required_max_ulp_delta": required_max_ulp_delta,
                 "required_max_differing_elems": required_max_differing_elems,
@@ -2208,6 +2292,16 @@ def build_layer_output_tolerance_policy(
         or int(item.get("length_mismatches") or 0) > 0
         or int(item.get("missing_candidate_rows") or 0) > 0
     ]
+    modes_with_source_gaps = [
+        str(item.get("mode"))
+        for item in mode_results
+        if int(item.get("missing_source_evidence") or 0) > 0
+    ]
+    modes_with_disallowed_sources = [
+        str(item.get("mode"))
+        for item in mode_results
+        if int(item.get("disallowed_source_mismatches") or 0) > 0
+    ]
     modes_with_mismatches = [
         str(item.get("mode"))
         for item in mode_results
@@ -2225,6 +2319,8 @@ def build_layer_output_tolerance_policy(
         if int(item.get("checksum_mismatches") or 0) > 0
         and not bool(item.get("within_current_thresholds"))
         and str(item.get("mode")) not in modes_with_gaps
+        and str(item.get("mode")) not in modes_with_source_gaps
+        and str(item.get("mode")) not in modes_with_disallowed_sources
     ]
 
     if not candidate_modes:
@@ -2233,6 +2329,12 @@ def build_layer_output_tolerance_policy(
     elif modes_with_gaps:
         recommendation = "rerun_with_layer_output_delta_tap"
         reason = "layer-output mismatches need complete delta-tap evidence before tolerance can be selected"
+    elif modes_with_disallowed_sources:
+        recommendation = "fix_non_boundary_layer_output_drift"
+        reason = "some layer-output mismatches are outside the allowed BF16 boundary source policy"
+    elif modes_with_source_gaps:
+        recommendation = "rerun_with_ffn_residual_attribution"
+        reason = "source-aware layer-output tolerance needs FFN residual attribution evidence"
     elif modes_requiring_tolerance:
         recommendation = "choose_explicit_layer_output_tolerance_or_fix_kernel"
         reason = "candidate layer-output mismatches have measured BF16 deltas outside the current tolerance policy"
@@ -2252,6 +2354,7 @@ def build_layer_output_tolerance_policy(
             "max_abs_delta": layer_output_max_abs_delta,
             "max_ulp_delta": layer_output_max_ulp_delta,
             "max_differing_elems": layer_output_max_differing_elems,
+            "allowed_sources": sorted(allowed_boundary_sources),
         },
         "candidate_modes": candidate_modes,
         "recommendation": recommendation,
@@ -2262,6 +2365,8 @@ def build_layer_output_tolerance_policy(
         "modes_requiring_tolerance": modes_requiring_tolerance,
         "modes_within_current_tolerance": modes_within_current_tolerance,
         "modes_missing_delta_evidence": modes_with_gaps,
+        "modes_missing_source_evidence": modes_with_source_gaps,
+        "modes_with_disallowed_sources": modes_with_disallowed_sources,
         "mode_results": mode_results,
         "prompt_results": prompt_results,
     }
@@ -3338,7 +3443,11 @@ def layer_output_pair_status(
     max_abs_delta: float = 0.0,
     max_ulp_delta: int = 0,
     max_differing_elems: int = 0,
+    allowed_boundary_sources: set[str] | None = None,
+    ffn_residual_by_key: dict[tuple[str, str, int, int, str], dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
+    allowed_boundary_sources = allowed_boundary_sources or set()
+    ffn_residual_by_key = ffn_residual_by_key or {}
     baseline_taps = baseline.get("layer_output_taps") or []
     candidate_taps = row.get("layer_output_taps") or []
     if not baseline_taps and not candidate_taps:
@@ -3384,6 +3493,8 @@ def layer_output_pair_status(
     tolerated_checksum_mismatches = 0
     untolerated_checksum_mismatches = 0
     missing_candidate_rows = 0
+    missing_source_evidence = 0
+    disallowed_source_mismatches = 0
     first_mismatch: dict[str, Any] | None = None
     first_untolerated_mismatch: dict[str, Any] | None = None
     tolerance_examples: list[dict[str, Any]] = []
@@ -3423,7 +3534,16 @@ def layer_output_pair_status(
                     key[2],
                 )
             )
-            delta_ok = (
+            source_key = (
+                str(baseline.get("prompt_id", "")),
+                str(row.get("mode", "")),
+                key[0],
+                key[1],
+                key[2],
+            )
+            source_item = ffn_residual_by_key.get(source_key)
+            source = None if source_item is None else str(source_item.get("source", ""))
+            numeric_ok = (
                 allow_tolerance
                 and delta is not None
                 and delta.get("status") == "ok"
@@ -3432,6 +3552,15 @@ def layer_output_pair_status(
                 and int(delta.get("max_ulp_delta") or 0) <= max_ulp_delta
                 and int(delta.get("differing_elems") or 0) <= max_differing_elems
             )
+            source_ok = True
+            if numeric_ok and allowed_boundary_sources:
+                if source_item is None:
+                    missing_source_evidence += 1
+                    source_ok = False
+                elif source not in allowed_boundary_sources:
+                    disallowed_source_mismatches += 1
+                    source_ok = False
+            delta_ok = numeric_ok and source_ok
             if delta_ok:
                 tolerated_checksum_mismatches += 1
                 if len(tolerance_examples) < 20:
@@ -3441,6 +3570,7 @@ def layer_output_pair_status(
                             "max_abs_delta": delta.get("max_abs_delta"),
                             "max_ulp_delta": delta.get("max_ulp_delta"),
                             "differing_elems": delta.get("differing_elems"),
+                            "source": source,
                         }
                     )
             else:
@@ -3450,7 +3580,12 @@ def layer_output_pair_status(
                     reason = "missing_layer_output_delta"
                     if delta is not None:
                         reason = "layer_output_tolerance_exceeded"
+                    if numeric_ok and allowed_boundary_sources and source_item is None:
+                        reason = "missing_ffn_residual_attribution"
+                    elif numeric_ok and allowed_boundary_sources and source not in allowed_boundary_sources:
+                        reason = "layer_output_tolerance_source_not_allowed"
                 mismatch["reason"] = reason
+                mismatch["source"] = source
                 if delta is not None:
                     mismatch["max_abs_delta"] = delta.get("max_abs_delta")
                     mismatch["max_ulp_delta"] = delta.get("max_ulp_delta")
@@ -3466,6 +3601,8 @@ def layer_output_pair_status(
         "tolerated_checksum_mismatches": tolerated_checksum_mismatches,
         "untolerated_checksum_mismatches": untolerated_checksum_mismatches,
         "missing_candidate_rows": missing_candidate_rows,
+        "missing_source_evidence": missing_source_evidence,
+        "disallowed_source_mismatches": disallowed_source_mismatches,
         "first_mismatch": first_mismatch,
         "first_untolerated_mismatch": first_untolerated_mismatch,
         "tolerance_examples": tolerance_examples,
@@ -3484,7 +3621,11 @@ def build_promotion_gate(
     layer_output_max_abs_delta: float = 0.0,
     layer_output_max_ulp_delta: int = 0,
     layer_output_max_differing_elems: int = 0,
+    allowed_boundary_sources: set[str] | None = None,
+    ffn_residual_by_key: dict[tuple[str, str, int, int, str], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    allowed_boundary_sources = allowed_boundary_sources or set()
+    ffn_residual_by_key = ffn_residual_by_key or {}
     prompt_ids: list[str] = []
     for row in rows:
         prompt_id = str(row.get("prompt_id", ""))
@@ -3530,6 +3671,8 @@ def build_promotion_gate(
                 max_abs_delta=layer_output_max_abs_delta,
                 max_ulp_delta=layer_output_max_ulp_delta,
                 max_differing_elems=layer_output_max_differing_elems,
+                allowed_boundary_sources=allowed_boundary_sources,
+                ffn_residual_by_key=ffn_residual_by_key,
             )
             if layer_output_status is not None:
                 prompt_result["layer_output_compared_rows"] = layer_output_status.get(
@@ -3546,6 +3689,12 @@ def build_promotion_gate(
                 )
                 prompt_result["layer_output_missing_candidate_rows"] = layer_output_status.get(
                     "missing_candidate_rows"
+                )
+                prompt_result["layer_output_missing_source_evidence"] = (
+                    layer_output_status.get("missing_source_evidence")
+                )
+                prompt_result["layer_output_disallowed_source_mismatches"] = (
+                    layer_output_status.get("disallowed_source_mismatches")
                 )
                 prompt_result["layer_output_first_mismatch"] = layer_output_status.get(
                     "first_mismatch"
@@ -3564,7 +3713,21 @@ def build_promotion_gate(
                     if int(layer_output_status.get("checksum_mismatches") or 0) > 0:
                         if allow_layer_output_tolerance:
                             if int(layer_output_status.get("untolerated_checksum_mismatches") or 0) > 0:
-                                prompt_failures.append("layer_output_tolerance_exceeded")
+                                first_untolerated = (
+                                    layer_output_status.get("first_untolerated_mismatch") or {}
+                                )
+                                reason = first_untolerated.get(
+                                    "reason",
+                                    "layer_output_tolerance_exceeded",
+                                )
+                                if reason == "missing_ffn_residual_attribution":
+                                    prompt_failures.append("missing_ffn_residual_attribution")
+                                elif reason == "layer_output_tolerance_source_not_allowed":
+                                    prompt_failures.append(
+                                        "layer_output_tolerance_source_not_allowed"
+                                    )
+                                else:
+                                    prompt_failures.append("layer_output_tolerance_exceeded")
                         else:
                             prompt_failures.append("layer_output_checksum_mismatch")
                     if int(layer_output_status.get("missing_candidate_rows") or 0) > 0:
@@ -3668,6 +3831,7 @@ def build_promotion_gate(
             "layer_output_max_abs_delta": layer_output_max_abs_delta,
             "layer_output_max_ulp_delta": layer_output_max_ulp_delta,
             "layer_output_max_differing_elems": layer_output_max_differing_elems,
+            "layer_output_allowed_sources": sorted(allowed_boundary_sources),
         },
         "candidates": candidates,
     }
@@ -4033,8 +4197,18 @@ def summarize_with_gate(
     layer_output_max_abs_delta: float = 0.0,
     layer_output_max_ulp_delta: int = 0,
     layer_output_max_differing_elems: int = 0,
+    allowed_boundary_sources: set[str] | None = None,
 ) -> dict[str, Any]:
+    allowed_boundary_sources = allowed_boundary_sources or set()
     summary = summarize(rows)
+    layer_output_delta_summary = summarize_layer_output_delta_taps(rows)
+    ffn_residual_delta_attribution = build_ffn_residual_delta_attribution(
+        rows,
+        layer_output_delta_summary,
+    )
+    ffn_residual_by_key = ffn_residual_delta_attribution_by_key(
+        ffn_residual_delta_attribution,
+    )
     summary["promotion_gate"] = build_promotion_gate(
         rows,
         modes,
@@ -4047,6 +4221,8 @@ def summarize_with_gate(
         layer_output_max_abs_delta,
         layer_output_max_ulp_delta,
         layer_output_max_differing_elems,
+        allowed_boundary_sources,
+        ffn_residual_by_key,
     )
     summary["layer_output_tolerance_policy"] = build_layer_output_tolerance_policy(
         rows,
@@ -4055,7 +4231,11 @@ def summarize_with_gate(
         layer_output_max_abs_delta,
         layer_output_max_ulp_delta,
         layer_output_max_differing_elems,
+        allowed_boundary_sources,
+        ffn_residual_by_key,
     )
+    summary["layer_output_delta_tap"] = layer_output_delta_summary
+    summary["ffn_residual_delta_attribution"] = ffn_residual_delta_attribution
     summary["ffn_residency_gap"] = build_ffn_residency_gap(
         rows,
         modes,
@@ -4078,6 +4258,9 @@ def build_report(
         args.promotion_max_fused_wall_gpu_ratio,
         args.promotion_max_wait_gpu_ratio,
     )
+    allowed_boundary_sources = parse_csv_set(
+        getattr(args, "promotion_layer_output_allowed_sources", "")
+    )
     summary = summarize_with_gate(
         rows,
         modes,
@@ -4092,6 +4275,7 @@ def build_report(
         getattr(args, "promotion_layer_output_max_abs_delta", 0.0),
         getattr(args, "promotion_layer_output_max_ulp_delta", 0),
         getattr(args, "promotion_layer_output_max_differing_elems", 0),
+        allowed_boundary_sources,
     )
     summary["router_parity"] = summarize_router_parity_taps(rows)
     summary["shared_parity"] = summarize_shared_parity_taps(rows)
@@ -4111,10 +4295,13 @@ def build_report(
     summary["final_hidden_tap"] = summarize_final_hidden_taps(rows)
     summary["logits_tap"] = summarize_logits_taps(rows)
     summary["layer_output_tap"] = summarize_layer_output_taps(rows)
-    summary["layer_output_delta_tap"] = summarize_layer_output_delta_taps(rows)
-    summary["ffn_residual_delta_attribution"] = build_ffn_residual_delta_attribution(
-        rows,
-        summary["layer_output_delta_tap"],
+    summary["layer_output_delta_tap"] = summary.get(
+        "layer_output_delta_tap",
+        summarize_layer_output_delta_taps(rows),
+    )
+    summary["ffn_residual_delta_attribution"] = summary.get(
+        "ffn_residual_delta_attribution",
+        build_ffn_residual_delta_attribution(rows, summary["layer_output_delta_tap"]),
     )
     summary["decode_batch_route_snapshot"] = summarize_decode_batch_route_snapshots(rows)
     return {
@@ -4163,6 +4350,7 @@ def build_report(
             "layer_output_max_differing_elems": getattr(
                 args, "promotion_layer_output_max_differing_elems", 0
             ),
+            "layer_output_allowed_sources": sorted(allowed_boundary_sources),
         },
         "summary": summary,
         "rows": rows,
@@ -4219,6 +4407,7 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- promotion_layer_output_max_abs_delta: `{render_float((promotion_gate.get('thresholds') or {}).get('layer_output_max_abs_delta'), 8)}`",
         f"- promotion_layer_output_max_ulp_delta: `{(promotion_gate.get('thresholds') or {}).get('layer_output_max_ulp_delta', 0)}`",
         f"- promotion_layer_output_max_differing_elems: `{(promotion_gate.get('thresholds') or {}).get('layer_output_max_differing_elems', 0)}`",
+        f"- promotion_layer_output_allowed_sources: `{','.join((promotion_gate.get('thresholds') or {}).get('layer_output_allowed_sources') or []) or '-'}`",
         f"- layer_output_tolerance_recommendation: `{layer_output_tolerance.get('recommendation') or '-'}`",
         f"- layer_output_tolerance_max_required_abs_delta: `{render_float(layer_output_tolerance.get('max_required_abs_delta'), 8)}`",
         f"- layer_output_tolerance_max_required_ulp_delta: `{layer_output_tolerance.get('max_required_ulp_delta', 0)}`",
@@ -4226,6 +4415,8 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- layer_output_tolerance_modes_requiring: `{','.join(layer_output_tolerance.get('modes_requiring_tolerance') or []) or '-'}`",
         f"- layer_output_tolerance_modes_within_current: `{','.join(layer_output_tolerance.get('modes_within_current_tolerance') or []) or '-'}`",
         f"- layer_output_tolerance_modes_missing_evidence: `{','.join(layer_output_tolerance.get('modes_missing_delta_evidence') or []) or '-'}`",
+        f"- layer_output_tolerance_modes_missing_source_evidence: `{','.join(layer_output_tolerance.get('modes_missing_source_evidence') or []) or '-'}`",
+        f"- layer_output_tolerance_modes_with_disallowed_sources: `{','.join(layer_output_tolerance.get('modes_with_disallowed_sources') or []) or '-'}`",
         f"- router_parity_tap: `{report.get('router_parity_tap', False)}`",
         f"- shared_parity_tap: `{report.get('shared_parity_tap', False)}`",
         f"- routed_parity_tap: `{report.get('routed_parity_tap', False)}`",
@@ -5244,8 +5435,8 @@ def render_markdown(report: dict[str, Any]) -> str:
                 "",
                 "## Layer Output Tolerance Policy",
                 "",
-                "| Prompt | Mode | Diagnostic | Status | Mismatches | Missing evidence | Missing candidate | Required abs | Required ULP | Required elems | Within current | First mismatch |",
-                "|:---|:---|:---:|:---|---:|---:|---:|---:|---:|---:|:---:|:---|",
+                "| Prompt | Mode | Diagnostic | Status | Mismatches | Missing delta | Missing source | Disallowed source | Missing candidate | Required abs | Required ULP | Required elems | Within current | Sources | First mismatch |",
+                "|:---|:---|:---:|:---|---:|---:|---:|---:|---:|---:|---:|---:|:---:|:---|:---|",
             ]
         )
         for item in layer_output_tolerance_rows[:80]:
@@ -5258,19 +5449,23 @@ def render_markdown(report: dict[str, Any]) -> str:
                 )
             else:
                 first_label = "-"
+            sources = ",".join(item.get("observed_sources") or []) or "-"
             lines.append(
-                "| {prompt} | {mode} | {diagnostic} | {status} | {mismatches} | {missing_delta} | {missing_candidate} | {required_abs} | {required_ulp} | {required_elems} | {within} | {first} |".format(
+                "| {prompt} | {mode} | {diagnostic} | {status} | {mismatches} | {missing_delta} | {missing_source} | {disallowed_source} | {missing_candidate} | {required_abs} | {required_ulp} | {required_elems} | {within} | {sources} | {first} |".format(
                     prompt=item.get("prompt_id", ""),
                     mode=item.get("mode", ""),
                     diagnostic=str(item.get("diagnostic_only", False)).lower(),
                     status=item.get("status", "-"),
                     mismatches=item.get("checksum_mismatches", 0),
                     missing_delta=item.get("missing_delta_evidence", 0),
+                    missing_source=item.get("missing_source_evidence", 0),
+                    disallowed_source=item.get("disallowed_source_mismatches", 0),
                     missing_candidate=item.get("missing_candidate_rows", 0),
                     required_abs=render_float(item.get("required_max_abs_delta"), 8),
                     required_ulp=item.get("required_max_ulp_delta", 0),
                     required_elems=item.get("required_max_differing_elems", 0),
                     within=str(item.get("within_current_thresholds", False)).lower(),
+                    sources=sources,
                     first=first_label,
                 )
             )
@@ -5513,6 +5708,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         type=int,
         default=0,
         help="maximum differing BF16 elements allowed per row when layer-output tolerance is enabled",
+    )
+    parser.add_argument(
+        "--promotion-layer-output-allowed-sources",
+        default="",
+        help=(
+            "comma-separated FFN residual attribution sources allowed when layer-output "
+            "tolerance is enabled; empty keeps the legacy numeric-only policy"
+        ),
     )
     parser.add_argument(
         "--out-json",
