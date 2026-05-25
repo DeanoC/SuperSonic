@@ -2493,6 +2493,31 @@ under the same smoke:
    cliffs before the following FFN layer amplifies them into broad hidden-stream
    drift.
 
+65. **Qwen3.6 host INT4 dequant LUT promotion**
+   Return to the default FFN path instead of another row-snap diagnostic. The
+   host INT4 dot helpers now build a 16-entry BF16-rounded dequant LUT per
+   scale/zero group and consume packed nibbles from that table inside the inner
+   loop. This preserves the existing reconstructed BF16 value for each INT4
+   code, but avoids re-running BF16 rounding for every element of every routed
+   and shared FFN dot.
+
+   Local validation passed: `cargo test -p kernel-ffi qwen36_moe --lib`,
+   `git diff --check -- crates/kernel-ffi/src/qwen36_moe.rs`, and
+   `cargo build --release -p runner --bin supersonic`. The direct Metal default
+   smoke preserved `[11,271,40,599]`; per-smoke timing was noisy, but
+   `bench-perf` is the promotion gate. The current Apple M5 Max Qwen3.6 INT4
+   run wrote `target/bench-runs/2026-05-25-edb5b06` and measured headline
+   median `113.8 ms/token` with samples `113.6`, `113.8`, `117.0`.
+
+   The new unprofiled stage table is `ffn_ms_avg=70.578`,
+   `linear_attn_ms_avg=23.411`, `full_attn_ms_avg=12.340`, and
+   `lm_head_ms_avg=4.706`. The profile table still names the next measured
+   bottlenecks clearly: `qwen36_linear_int4_stage5` (`1056.814 ms` total),
+   `command_buffer_wait` (`1040.076 ms`), then FFN host expert gate/up
+   (`607.042 ms`) and down (`355.084 ms`). That keeps FFN host expert work as a
+   valid next local target, but the larger headline win came from removing the
+   per-element dequant rounding overhead in the default lane.
+
 ## Sources
 
 - [Qwen/Qwen3.6-35B-A3B model card](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)

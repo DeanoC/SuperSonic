@@ -11116,6 +11116,11 @@ fn bf16_bits_to_f32(bits: u16) -> f32 {
     f32::from_bits((bits as u32) << 16)
 }
 
+fn qwen36_int4_group_dequant_lut(scale: f32, zero: f32) -> [f32; 16] {
+    let zs = zero * scale;
+    std::array::from_fn(|q| bf16_round_f32(q as f32 * scale - zs))
+}
+
 fn qwen36_host_parallelism(len: usize, min_rows_per_worker: usize) -> usize {
     if len < min_rows_per_worker.saturating_mul(2) {
         return 1;
@@ -11219,20 +11224,20 @@ fn qwen36_dense_or_int4_dot_2d_unchecked(
         let scale_idx = scale_base + scale_col;
         let s = bf16_bits_to_f32(unsafe { *scale.add(scale_idx) });
         let z = bf16_bits_to_f32(unsafe { *zero.add(scale_idx) });
-        let zs = z * s;
+        let lut = qwen36_int4_group_dequant_lut(s, z);
         let mut col = group_start;
         let mut byte_idx = packed_base + group_start / 2;
         while col + 1 < group_end {
             let byte = unsafe { *packed.add(byte_idx) };
-            let w0 = bf16_round_f32((byte & 0x0f) as f32 * s - zs);
-            let w1 = bf16_round_f32(((byte >> 4) & 0x0f) as f32 * s - zs);
+            let w0 = lut[(byte & 0x0f) as usize];
+            let w1 = lut[((byte >> 4) & 0x0f) as usize];
             acc += w0 * x[col] + w1 * x[col + 1];
             col += 2;
             byte_idx += 1;
         }
         if col < group_end {
             let byte = unsafe { *packed.add(byte_idx) };
-            let w = bf16_round_f32((byte & 0x0f) as f32 * s - zs);
+            let w = lut[(byte & 0x0f) as usize];
             acc += w * x[col];
         }
     }
@@ -11274,20 +11279,20 @@ fn qwen36_expert_dense_or_int4_dot_unchecked(
         let scale_idx = scale_base + scale_col;
         let s = bf16_bits_to_f32(unsafe { *scale.add(scale_idx) });
         let z = bf16_bits_to_f32(unsafe { *zero.add(scale_idx) });
-        let zs = z * s;
+        let lut = qwen36_int4_group_dequant_lut(s, z);
         let mut col = group_start;
         let mut byte_idx = packed_base + group_start / 2;
         while col + 1 < group_end {
             let byte = unsafe { *packed.add(byte_idx) };
-            let w0 = bf16_round_f32((byte & 0x0f) as f32 * s - zs);
-            let w1 = bf16_round_f32(((byte >> 4) & 0x0f) as f32 * s - zs);
+            let w0 = lut[(byte & 0x0f) as usize];
+            let w1 = lut[((byte >> 4) & 0x0f) as usize];
             acc += w0 * x[col] + w1 * x[col + 1];
             col += 2;
             byte_idx += 1;
         }
         if col < group_end {
             let byte = unsafe { *packed.add(byte_idx) };
-            let w = bf16_round_f32((byte & 0x0f) as f32 * s - zs);
+            let w = lut[(byte & 0x0f) as usize];
             acc += w * x[col];
         }
     }
