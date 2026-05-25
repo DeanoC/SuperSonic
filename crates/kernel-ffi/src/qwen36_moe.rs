@@ -10126,7 +10126,9 @@ fn ffn_step_stage1_5_metal_host(
         std::slice::from_raw_parts_mut(workspace.as_mut_ptr() as *mut f32, workspace_len)
     };
 
-    let mut h_norm = Vec::<f32>::new();
+    // Later phases mutate disjoint workspace regions, so keep h_norm in-place
+    // instead of allocating and copying a per-layer Vec.
+    let h_norm_ptr = unsafe { workspace.as_ptr().add(off_h_norm) };
     crate::prefill_ffi::metal_profile_time("qwen36_ffn_host_router_topk", "host", || {
         let mut mean_sq = 0.0f32;
         for &bits in input {
@@ -10139,10 +10141,9 @@ fn ffn_step_stage1_5_metal_host(
             let w = bf16_bits_to_f32(norm_w[col]);
             workspace[off_h_norm + col] = bf16_round_f32(v * inv_rms * (1.0 + w));
         }
-        h_norm.clear();
-        h_norm.extend_from_slice(&workspace[off_h_norm..off_h_norm + hidden]);
 
         {
+            let h_norm = unsafe { std::slice::from_raw_parts(h_norm_ptr, hidden) };
             let router_logits = &mut workspace[off_router_logits..off_router_logits + num_experts];
             qwen36_parallel_chunks_mut(router_logits, 32, |start, chunk| {
                 for (local, logit) in chunk.iter_mut().enumerate() {
@@ -10199,6 +10200,7 @@ fn ffn_step_stage1_5_metal_host(
             output_idx[kk] = f32::to_bits(workspace[off_topk_idx + kk]) as i32;
         }
     });
+    let h_norm = unsafe { std::slice::from_raw_parts(h_norm_ptr, hidden) };
 
     if params.stage == 1 {
         return Ok(());

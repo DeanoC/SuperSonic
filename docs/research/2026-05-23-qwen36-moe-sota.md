@@ -2699,6 +2699,36 @@ under the same smoke:
    default-lane bottleneck remains the Metal linear stage/wait pair plus the
    reduced but still dominant FFN expert work.
 
+73. **Qwen3.6 host FFN h_norm workspace reuse**
+   The default Metal host FFN fallback no longer allocates and copies a fresh
+   `h_norm` vector after router normalization. The BF16-rounded normalized row
+   already lives in the FFN workspace, so later router/shared/expert host phases
+   now read that workspace row directly while writing disjoint workspace
+   regions. This keeps the existing dot arithmetic, row ordering, INT4 LUT
+   semantics, and generated-token behavior intact; it only removes a per-layer
+   heap allocation and 2048-float copy from the default lane.
+
+   Validation passed: `cargo test -p kernel-ffi qwen36_moe --lib`,
+   `cargo fmt --check -p kernel-ffi`, `git diff --check --
+   crates/kernel-ffi/src/qwen36_moe.rs`, `cargo build --release -p runner
+   --bin supersonic`, and the one-token Qwen3.6 Metal INT4 smoke with generated
+   id `[11]`.
+
+   The first `bench-perf` run wrote `target/bench-runs/2026-05-25-d20a655-8`
+   and measured median `58.1 ms/token` with samples `58.1`, `58.9`, and
+   `57.9`. The confirmation run wrote
+   `target/bench-runs/2026-05-25-d20a655-9` and measured median
+   `58.3 ms/token` with samples `58.3`, `60.3`, and `58.2`, confirming a small
+   headline improvement over the accepted `61.5 ms/token` AArch64 SIMD LUT
+   baseline. The unprofiled stage table in the confirmation run is
+   `ffn_ms_avg=32.611`, `linear_attn_ms_avg=15.954`,
+   `full_attn_ms_avg=5.737`, and `lm_head_ms_avg=4.659`; profile attribution
+   still names `command_buffer_wait` (`993.270 ms`) and
+   `qwen36_linear_int4_stage5` (`992.118 ms`) as the top rows, followed by FFN
+   host expert gate/up (`436.736 ms`) and down (`245.985 ms`). The next
+   measured target therefore remains the Metal linear stage/wait pair plus the
+   reduced FFN expert rows, not another residual or route-patch diagnostic.
+
 ## Sources
 
 - [Qwen/Qwen3.6-35B-A3B model card](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)

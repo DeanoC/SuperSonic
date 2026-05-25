@@ -1278,6 +1278,32 @@ expert down to `266.605 ms`. FFN remains the selected bottleneck, but the next
 candidate needs to be a larger routed expert compute/residency path rather than
 another reduction-loop cleanup.
 
+The retained AArch64 host INT4 LUT dot path uses NEON table lookup to
+materialize BF16-rounded weights from packed nibbles and accumulates four F32
+vectors per eight packed bytes. The confirmation `bench-perf` run
+(`target/bench-runs/2026-05-25-822b7d7-4/perf/qwen3.6-35b-a3b_int4.json`)
+measured median `61.5 ms/token` with samples `61.5`, `66.2`, `57.9`, improving
+the previous `78.0 ms/token` checkpoint. Unprofiled attribution was
+`ffn_ms_avg=32.238`, `linear_attn_ms_avg=16.016`,
+`full_attn_ms_avg=5.800`, and `lm_head_ms_avg=4.336`.
+
+The latest default-lane cleanup removes the per-layer `h_norm` heap copy from
+the Qwen3.6 Metal host FFN fallback. The normalized BF16-rounded row is already
+resident in the FFN workspace, so router/shared/expert host phases now read it
+from there while writing disjoint workspace regions. This keeps the same INT4
+dot arithmetic and generated-token behavior; it only trims host allocation and
+copy overhead. The first `bench-perf` run
+(`target/bench-runs/2026-05-25-d20a655-8/perf/qwen3.6-35b-a3b_int4.json`)
+measured median `58.1 ms/token` with samples `58.1`, `58.9`, `57.9`; the repeat
+(`target/bench-runs/2026-05-25-d20a655-9/perf/qwen3.6-35b-a3b_int4.json`)
+confirmed median `58.3 ms/token` with samples `58.3`, `60.3`, `58.2`. The
+repeat stage table is `ffn_ms_avg=32.611`, `linear_attn_ms_avg=15.954`,
+`full_attn_ms_avg=5.737`, and `lm_head_ms_avg=4.659`. Profile attribution still
+names `command_buffer_wait` (`993.270 ms`) and `qwen36_linear_int4_stage5`
+(`992.118 ms`) first, followed by FFN host expert gate/up (`436.736 ms`) and
+down (`245.985 ms`), so the next measured target is the Metal linear stage/wait
+pair plus the remaining FFN expert rows.
+
 The focused routed-expert microbench exercises the exact Qwen3.6 stage-5 INT4
 shape (`hidden=2048`, `num_experts=256`, `moe_intermediate=512`, `top_k=8`,
 `group_size=128`) without the rest of decode:
