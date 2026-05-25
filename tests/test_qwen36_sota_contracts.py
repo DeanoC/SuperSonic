@@ -1,0 +1,505 @@
+import importlib.util
+import sys
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+
+
+TESTS_DIR = Path(__file__).parent
+METAL_DIR = TESTS_DIR / "metal"
+
+
+def load_script(name: str, path: Path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+longctx = load_script("qwen36_sota_longctx", METAL_DIR / "bench_qwen36_longctx.py")
+prefill_sweep = load_script(
+    "qwen36_sota_prefill_sweep",
+    METAL_DIR / "sweep_qwen36_batched_prefill_variants.py",
+)
+static_sweep = load_script(
+    "qwen36_sota_static_sweep",
+    METAL_DIR / "sweep_qwen36_static_topn_runtime.py",
+)
+fused_sweep = load_script(
+    "qwen36_sota_fused_sweep",
+    METAL_DIR / "sweep_qwen36_fused_routed_int4.py",
+)
+mps_probe = load_script(
+    "qwen36_sota_mps_probe",
+    METAL_DIR / "probe_qwen36_mps_resident_table.py",
+)
+route_sweep = load_script(
+    "qwen36_sota_route_sweep",
+    METAL_DIR / "sweep_qwen36_route_residency.py",
+)
+mtp_sweep = load_script(
+    "qwen36_sota_mtp_sweep",
+    METAL_DIR / "sweep_qwen36_mtp_acceptance.py",
+)
+lru_sweep = load_script(
+    "qwen36_sota_lru_sweep",
+    METAL_DIR / "sweep_qwen36_lru_resident_cache.py",
+)
+linear_sweep = load_script(
+    "qwen36_sota_linear_sweep",
+    METAL_DIR / "sweep_qwen36_linear_decode.py",
+)
+full_sweep = load_script(
+    "qwen36_sota_full_sweep",
+    METAL_DIR / "sweep_qwen36_full_decode.py",
+)
+lm_head_tail_sweep = load_script(
+    "qwen36_sota_lm_head_tail_sweep",
+    METAL_DIR / "sweep_qwen36_lm_head_tail.py",
+)
+next_bottleneck = load_script(
+    "qwen36_sota_next_bottleneck",
+    METAL_DIR / "select_qwen36_next_bottleneck.py",
+)
+sota_summary = load_script(
+    "qwen36_sota_gate_summary",
+    METAL_DIR / "summarize_qwen36_sota_gates.py",
+)
+sota_refresh = load_script(
+    "qwen36_sota_gate_refresh",
+    METAL_DIR / "refresh_qwen36_sota_gates.py",
+)
+
+
+class Qwen36SotaContractTests(unittest.TestCase):
+    def test_schema_versions_match_current_sota_gate_surface(self):
+        self.assertEqual(longctx.SCHEMA, "qwen36-moe-metal-longctx-bench-v5")
+        self.assertEqual(
+            prefill_sweep.SCHEMA,
+            "qwen36-metal-batched-prefill-variant-sweep-v2",
+        )
+        self.assertEqual(static_sweep.SCHEMA, "qwen36-static-topn-runtime-sweep-v4")
+        self.assertEqual(fused_sweep.SCHEMA, "qwen36-fused-routed-int4-sweep-v5")
+        self.assertEqual(mps_probe.SCHEMA, "qwen36-mps-resident-table-probe-v2")
+        self.assertEqual(route_sweep.SCHEMA, "qwen36-route-residency-sweep-v1")
+        self.assertEqual(mtp_sweep.SCHEMA, "qwen36-moe-mtp-acceptance-sweep-v2")
+        self.assertEqual(lru_sweep.SCHEMA, "qwen36-lru-resident-cache-sweep-v1")
+        self.assertEqual(linear_sweep.SCHEMA, "qwen36-linear-decode-sweep-v1")
+        self.assertEqual(full_sweep.SCHEMA, "qwen36-full-decode-sweep-v1")
+        self.assertEqual(lm_head_tail_sweep.SCHEMA, "qwen36-lm-head-tail-sweep-v1")
+        self.assertEqual(next_bottleneck.SCHEMA, "qwen36-next-bottleneck-v7")
+        self.assertEqual(sota_summary.SCHEMA, "qwen36-sota-gate-summary-v10")
+        self.assertEqual(sota_refresh.SCHEMA, "qwen36-sota-gate-refresh-plan-v1")
+
+    def test_sota_summary_tracks_current_gate_reports(self):
+        specs = {spec.gate_id: spec for spec in sota_summary.GATE_SPECS}
+
+        self.assertEqual(
+            specs["batched_prefill_variants"].expected_schema,
+            prefill_sweep.SCHEMA,
+        )
+        self.assertEqual(
+            specs["static_topn_runtime"].expected_schema,
+            static_sweep.SCHEMA,
+        )
+        self.assertIn(
+            "mps-static-partial-prewarm",
+            specs["static_topn_runtime"].refresh_command,
+        )
+        self.assertEqual(
+            specs["fused_routed_int4"].expected_schema,
+            fused_sweep.SCHEMA,
+        )
+        self.assertIn("sweep_qwen36_fused_routed_int4.py", specs["fused_routed_int4"].refresh_command)
+        self.assertIn("full-stage5", specs["fused_routed_int4"].refresh_command)
+        self.assertIn("full-stage5-router", specs["fused_routed_int4"].refresh_command)
+        self.assertIn("direct-defer-wait", specs["fused_routed_int4"].refresh_command)
+        self.assertIn("router-defer-wait", specs["fused_routed_int4"].refresh_command)
+        self.assertEqual(
+            specs["mps_resident_table"].expected_schema,
+            mps_probe.SCHEMA,
+        )
+        self.assertEqual(
+            specs["route_residency"].expected_schema,
+            route_sweep.SCHEMA,
+        )
+        self.assertEqual(
+            specs["mtp_acceptance"].expected_schema,
+            mtp_sweep.SCHEMA,
+        )
+        self.assertEqual(
+            specs["lru_resident_cache"].expected_schema,
+            lru_sweep.SCHEMA,
+        )
+        self.assertIn("sweep_qwen36_lru_resident_cache.py", specs["lru_resident_cache"].refresh_command)
+        self.assertEqual(
+            specs["linear_decode_variants"].expected_schema,
+            linear_sweep.SCHEMA,
+        )
+        self.assertIn(
+            "sweep_qwen36_linear_decode.py",
+            specs["linear_decode_variants"].refresh_command,
+        )
+        self.assertEqual(
+            specs["full_attention_variants"].expected_schema,
+            full_sweep.SCHEMA,
+        )
+        self.assertIn(
+            "sweep_qwen36_full_decode.py",
+            specs["full_attention_variants"].refresh_command,
+        )
+        self.assertEqual(
+            specs["lm_head_tail_variants"].expected_schema,
+            lm_head_tail_sweep.SCHEMA,
+        )
+        self.assertIn(
+            "sweep_qwen36_lm_head_tail.py",
+            specs["lm_head_tail_variants"].refresh_command,
+        )
+        self.assertEqual(specs["mps_resident_table"].gate_keys, ("viability_gate",))
+        self.assertEqual(specs["route_residency"].gate_keys, ("decision_gate",))
+
+    def test_batched_prefill_variants_cover_documented_negative_gates(self):
+        expected = {
+            "default",
+            "linear-direct-off",
+            "full-attn-tmajor",
+            "split-qgate",
+            "router-topk",
+            "fused-residual",
+        }
+
+        self.assertEqual(set(longctx.BATCHED_PREFILL_VARIANTS), expected)
+        for variant in expected - {"default"}:
+            self.assertIn(variant, prefill_sweep.MODE_ALIASES)
+
+    def test_batched_prefill_sweep_exposes_promotion_gate(self):
+        rows = [
+            {
+                "context_tokens_requested": 512,
+                "sweep_mode": "baseline",
+                "status": "ok",
+                "generated_ids": [271],
+                "lifecycle": {"prefill_total_ms": 12000.0},
+                "stage": {"total_ms_avg": 100.0},
+                "chain_breakdown": {
+                    "ffn_ms_avg": 50.0,
+                    "full_attn_ms_avg": 10.0,
+                    "linear_attn_ms_avg": 20.0,
+                    "lm_head_ms_avg": 5.0,
+                },
+                "metal_profile": {
+                    "entries": [{"op": "command_buffer_wait", "total_ms": 100.0}]
+                },
+            },
+            {
+                "context_tokens_requested": 512,
+                "sweep_mode": "router-topk",
+                "status": "ok",
+                "generated_ids": [271],
+                "lifecycle": {"prefill_total_ms": 9000.0},
+                "stage": {"total_ms_avg": 90.0},
+                "chain_breakdown": {
+                    "ffn_ms_avg": 45.0,
+                    "full_attn_ms_avg": 10.5,
+                    "linear_attn_ms_avg": 21.0,
+                    "lm_head_ms_avg": 5.1,
+                },
+                "metal_profile": {
+                    "entries": [{"op": "command_buffer_wait", "total_ms": 102.0}]
+                },
+            },
+        ]
+        args = SimpleNamespace(
+            model_dir=Path("/tmp/model"),
+            max_new_tokens=1,
+            metal_profile=True,
+            batched_prefill_feasibility=False,
+            promotion_max_prefill_ratio=0.999,
+            promotion_max_decode_ratio=0.999,
+            promotion_max_ffn_ratio=0.999,
+            promotion_max_component_regression_ratio=1.10,
+            promotion_max_command_buffer_wait_ratio=1.05,
+            promotion_require_profile=True,
+            seed=20260504,
+        )
+
+        report = prefill_sweep.build_report(rows, args, [512], ["baseline", "router-topk"])
+
+        gate = report["summary"]["promotion_gate"]
+        self.assertTrue(gate["passed"])
+        self.assertEqual(gate["passed_modes"], ["router-topk"])
+        self.assertIn("thresholds", gate)
+        self.assertIn("candidates", gate)
+
+    def test_fused_routed_int4_sweep_exposes_promotion_gate(self):
+        rows = [
+            {
+                "status": "ok",
+                "prompt_id": "p",
+                "mode": "default",
+                "generated_ids": [1, 2],
+                "result": {"ms_per_step": 100.0},
+                "stage_timings": {"lm_head_ms_avg": 5.0},
+                "chain_breakdown": {
+                    "ffn_ms_avg": 50.0,
+                    "full_attn_ms_avg": 10.0,
+                    "linear_attn_ms_avg": 20.0,
+                },
+                "metal_profile": {
+                    "entries": [{"op": "command_buffer_wait", "total_ms": 100.0}]
+                },
+            },
+            {
+                "status": "ok",
+                "prompt_id": "p",
+                "mode": "direct-gather",
+                "generated_ids": [1, 2],
+                "result": {"ms_per_step": 90.0},
+                "stage_timings": {"lm_head_ms_avg": 5.1},
+                "chain_breakdown": {
+                    "ffn_ms_avg": 45.0,
+                    "full_attn_ms_avg": 10.5,
+                    "linear_attn_ms_avg": 21.0,
+                },
+                "metal_profile": {
+                    "entries": [{"op": "command_buffer_wait", "total_ms": 102.0}]
+                },
+            },
+        ]
+        args = fused_sweep.parse_args([])
+
+        report = fused_sweep.build_report(
+            rows,
+            args,
+            ["default", "direct-gather"],
+            "smoke",
+        )
+
+        gate = report["summary"]["promotion_gate"]
+        self.assertTrue(gate["passed"])
+        self.assertEqual(gate["passed_modes"], ["direct-gather"])
+        self.assertIn("thresholds", gate)
+        self.assertIn("candidates", gate)
+
+    def test_linear_decode_sweep_exposes_promotion_gate(self):
+        rows = [
+            {
+                "status": "ok",
+                "prompt_id": "p",
+                "mode": "default",
+                "generated_ids": [1, 2],
+                "result": {"ms_per_step": 100.0},
+                "stage_timings": {"lm_head_ms_avg": 5.0},
+                "chain_breakdown": {
+                    "ffn_ms_avg": 50.0,
+                    "full_attn_ms_avg": 10.0,
+                    "linear_attn_ms_avg": 20.0,
+                },
+                "metal_profile": {
+                    "entries": [{"op": "command_buffer_wait", "total_ms": 100.0}]
+                },
+            },
+            {
+                "status": "ok",
+                "prompt_id": "p",
+                "mode": "direct-off",
+                "generated_ids": [1, 2],
+                "result": {"ms_per_step": 90.0},
+                "stage_timings": {"lm_head_ms_avg": 5.1},
+                "chain_breakdown": {
+                    "ffn_ms_avg": 50.5,
+                    "full_attn_ms_avg": 10.5,
+                    "linear_attn_ms_avg": 15.0,
+                },
+                "metal_profile": {
+                    "entries": [{"op": "command_buffer_wait", "total_ms": 102.0}]
+                },
+            },
+        ]
+        args = linear_sweep.parse_args([])
+
+        report = linear_sweep.build_report(
+            rows,
+            args,
+            ["default", "direct-off"],
+            "smoke",
+        )
+
+        gate = report["summary"]["promotion_gate"]
+        self.assertTrue(gate["passed"])
+        self.assertEqual(gate["passed_modes"], ["direct-off"])
+        self.assertIn("thresholds", gate)
+        self.assertIn("candidates", gate)
+
+    def test_lm_head_tail_sweep_exposes_promotion_gate(self):
+        rows = [
+            {
+                "status": "ok",
+                "prompt_id": "p",
+                "mode": "default",
+                "generated_ids": [1, 2],
+                "result": {"ms_per_step": 100.0},
+                "stage_timings": {"lm_head_ms_avg": 5.0, "sample_ms_avg": 0.2},
+                "chain_breakdown": {
+                    "ffn_ms_avg": 50.0,
+                    "full_attn_ms_avg": 10.0,
+                    "linear_attn_ms_avg": 20.0,
+                },
+                "metal_profile": {
+                    "entries": [{"op": "command_buffer_wait", "total_ms": 100.0}]
+                },
+            },
+            {
+                "status": "ok",
+                "prompt_id": "p",
+                "mode": "gpu-argmax",
+                "generated_ids": [1, 2],
+                "result": {"ms_per_step": 90.0},
+                "stage_timings": {"lm_head_ms_avg": 4.0, "sample_ms_avg": 0.01},
+                "chain_breakdown": {
+                    "ffn_ms_avg": 50.5,
+                    "full_attn_ms_avg": 10.5,
+                    "linear_attn_ms_avg": 20.5,
+                },
+                "metal_profile": {
+                    "entries": [{"op": "command_buffer_wait", "total_ms": 102.0}]
+                },
+            },
+        ]
+        args = lm_head_tail_sweep.parse_args([])
+
+        report = lm_head_tail_sweep.build_report(
+            rows,
+            args,
+            ["default", "gpu-argmax"],
+            "smoke",
+        )
+
+        gate = report["summary"]["promotion_gate"]
+        self.assertTrue(gate["passed"])
+        self.assertEqual(gate["passed_modes"], ["gpu-argmax"])
+        self.assertIn("thresholds", gate)
+        self.assertIn("candidates", gate)
+
+    def test_static_residency_sweep_exposes_promotion_gate(self):
+        rows = [
+            {
+                "status": "ok",
+                "prompt_id": "p",
+                "mode": "default",
+                "generated_ids": [1, 2],
+                "result": {"ms_per_step": 100.0},
+                "stage_timings": {"lm_head_ms_avg": 5.0},
+                "chain_breakdown": {
+                    "ffn_ms_avg": 50.0,
+                    "full_attn_ms_avg": 10.0,
+                    "linear_attn_ms_avg": 20.0,
+                },
+                "metal_profile": {
+                    "entries": [{"op": "command_buffer_wait", "total_ms": 100.0}]
+                },
+            },
+            {
+                "status": "ok",
+                "prompt_id": "p",
+                "mode": "static",
+                "generated_ids": [1, 2],
+                "result": {"ms_per_step": 90.0},
+                "stage_timings": {"lm_head_ms_avg": 5.1},
+                "chain_breakdown": {
+                    "ffn_ms_avg": 45.0,
+                    "full_attn_ms_avg": 10.5,
+                    "linear_attn_ms_avg": 21.0,
+                },
+                "metal_profile": {
+                    "entries": [{"op": "command_buffer_wait", "total_ms": 102.0}]
+                },
+            },
+        ]
+        args = static_sweep.parse_args([])
+
+        report = static_sweep.build_report(rows, args, ["default", "static"], "smoke")
+
+        gate = report["summary"]["promotion_gate"]
+        self.assertTrue(gate["passed"])
+        self.assertEqual(gate["passed_modes"], ["static"])
+        self.assertIn("thresholds", gate)
+        self.assertIn("candidates", gate)
+
+    def test_mps_probe_exposes_viability_gate(self):
+        static_report = {
+            "schema": "qwen36-static-topn-mps-probe-v2",
+            "rows": [
+                {
+                    "capacity": 4,
+                    "evaluation_static_topn": {
+                        "calls": 4,
+                        "assignments": 8,
+                        "covered": 6,
+                        "misses": 2,
+                        "coverage": 0.75,
+                        "full_hit_calls": 0,
+                        "fallback_calls": 4,
+                        "full_hit_call_rate": 0.0,
+                    },
+                    "resident_mps_rhs": {"total_gib": 0.02},
+                }
+            ],
+        }
+        pilot = {"source": "manual", "status": "ok", "gate_up_ms": 1.0, "down_ms": 1.0}
+
+        report = mps_probe.build_report(
+            static_report,
+            pilot,
+            layers=2,
+            hidden=8,
+            moe_intermediate=4,
+            top_k=2,
+            baseline_ffn_ms=10.0,
+            baseline_source="contract test",
+        )
+
+        gate = report["summary"]["viability_gate"]
+        self.assertTrue(gate["passed"])
+        self.assertEqual(gate["recommendation"], "prototype_partial_hit_resident_mps")
+        self.assertIn("thresholds", gate)
+        self.assertIn("candidates", gate)
+
+    def test_mtp_sweep_exposes_promotion_gate(self):
+        rows = [
+            {
+                "status": "measured",
+                "acceptance": {
+                    "drafted_tokens": 2,
+                    "accepted_tokens": 2,
+                    "emitted_tokens": 3,
+                    "base_steps": 2,
+                    "replay_steps": 0,
+                    "full_accept_steps": 1,
+                    "zero_accept_steps": 0,
+                },
+            }
+        ]
+
+        report = mtp_sweep.build_report(
+            rows,
+            backend="metal",
+            mode="sequential",
+            prompt_set="custom",
+            env_overrides={"SUPERSONIC_QWEN36_METAL_MTP_EXPERIMENT": "1"},
+            promotion_min_acceptance=0.60,
+            promotion_max_target_steps_per_emitted=0.99,
+        )
+
+        gate = report["summary"]["promotion_gate"]
+        self.assertTrue(gate["passed"])
+        self.assertEqual(gate["failures"], [])
+        self.assertIn("min_acceptance_rate", gate)
+        self.assertIn("max_target_steps_per_emitted", gate)
+
+
+if __name__ == "__main__":
+    unittest.main()

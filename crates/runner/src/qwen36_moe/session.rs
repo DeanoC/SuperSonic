@@ -8,7 +8,6 @@ use crate::qwen36_moe_cli::layers::load_to_gpu;
 use crate::qwen36_moe_types::{LayerBuffers, MtpLayerBuffers, MultiLayerGeom};
 
 const MIB: f64 = (1024 * 1024) as f64;
-const QWEN36_NUM_SPECULATIVE_TOKENS: usize = 3;
 
 pub(crate) struct Qwen36DecodeSession {
     pub(crate) final_norm_w_buf: GpuBuffer,
@@ -35,6 +34,7 @@ pub(crate) fn prepare_decode_session(
     speculative_decode: bool,
     batched_spec_verify: bool,
     persistent_decode: bool,
+    max_speculative_tokens: usize,
     layers: &mut Vec<LayerBuffers>,
 ) -> Result<Qwen36DecodeSession> {
     let mtp_buffers_opt = if speculative_decode {
@@ -126,7 +126,7 @@ pub(crate) fn prepare_decode_session(
                 "  uploaded embed_tokens ({:.0} MiB BF16) and allocated MTP \
                  scratches (K={} drafts/step)",
                 (geom.vocab as f64 * geom.hidden as f64 * 2.0) / MIB,
-                QWEN36_NUM_SPECULATIVE_TOKENS,
+                max_speculative_tokens,
             );
         } else {
             println!(

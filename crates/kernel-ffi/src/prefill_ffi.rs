@@ -292,6 +292,10 @@ pub fn flush_metal_batch() -> Result<(), GpuError> {
     metal_native::flush_batch()
 }
 
+pub fn sync_metal_queue() -> Result<(), GpuError> {
+    metal_native::queue_sync()
+}
+
 /// True when a Metal batch is currently open (i.e. ops will be accumulated
 /// into the shared command buffer rather than committing one-by-one).
 /// Always false on non-Metal builds.
@@ -301,6 +305,10 @@ pub fn metal_batch_is_active() -> bool {
 
 pub fn set_metal_batch_label(label: &str) -> Result<(), GpuError> {
     metal_native::set_batch_label(label)
+}
+
+pub fn commit_metal_batch_current(label: &str) -> Result<(), GpuError> {
+    metal_native::commit_batch_current(label)
 }
 
 pub fn metal_copy_d2d(src: *const c_void, dst: *mut c_void, bytes: usize) -> Result<(), GpuError> {
@@ -1500,6 +1508,42 @@ pub fn metal_full_attention_prefill_strided_bf16_f32(
             query,
             key,
             value,
+            out,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn metal_full_attention_prefill_tmajor_bf16_f32(
+    q_heads: usize,
+    kv_heads: usize,
+    q_len: usize,
+    kv_len: usize,
+    head_dim: usize,
+    scale: f32,
+    seqlen_offset: usize,
+    query: &GpuBuffer,
+    key_ptr: *const c_void,
+    value_ptr: *const c_void,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if out.backend() != Backend::Metal {
+        return Err(GpuError::InvalidArg(
+            "metal_full_attention_prefill_tmajor_bf16_f32 requires a Metal output buffer".into(),
+        ));
+    }
+    metal_profile_time("full_attention_prefill_tmajor", "native", || unsafe {
+        metal_native::full_attention_prefill_tmajor_bf16_f32(
+            q_heads,
+            kv_heads,
+            q_len,
+            kv_len,
+            head_dim,
+            scale,
+            seqlen_offset,
+            query,
+            key_ptr,
+            value_ptr,
             out,
         )
     })
@@ -2944,6 +2988,51 @@ pub fn element_add_inplace(
     Ok(())
 }
 
+pub fn qwen36_router_softmax_topk_bf16(
+    n_tokens: usize,
+    num_experts: usize,
+    top_k: usize,
+    logits: &GpuBuffer,
+    topk_idx: &mut GpuBuffer,
+    topk_weight: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if logits.backend() != Backend::Metal {
+        return Err(GpuError::InvalidArg(
+            "qwen36_router_softmax_topk_bf16 requires Metal logits".into(),
+        ));
+    }
+    metal_profile_time(
+        "qwen36_batched_prefill_router_softmax_topk",
+        "native",
+        || {
+            metal_native::qwen36_router_softmax_topk_bf16(
+                n_tokens,
+                num_experts,
+                top_k,
+                logits,
+                topk_idx,
+                topk_weight,
+            )
+        },
+    )
+}
+
+pub fn qwen36_ffn_residual_add_bf16(
+    total_elems: usize,
+    residual: &mut GpuBuffer,
+    combined: &GpuBuffer,
+    shared: &GpuBuffer,
+) -> Result<(), GpuError> {
+    if residual.backend() != Backend::Metal {
+        return Err(GpuError::InvalidArg(
+            "qwen36_ffn_residual_add_bf16 requires a Metal residual buffer".into(),
+        ));
+    }
+    metal_profile_time("qwen36_batched_prefill_ffn_residual_add", "native", || {
+        metal_native::qwen36_ffn_residual_add_bf16(total_elems, residual, combined, shared)
+    })
+}
+
 // ---- Cast between dtypes ----
 
 /// Cast all elements from one dtype to another on GPU.
@@ -3544,6 +3633,35 @@ pub fn sigmoid_mul(
             return Err(ffi_error(format!("sigmoid_mul failed: {status}")));
         }
         Ok(())
+    })
+}
+
+/// BF16 row-wise scalar gate: `out[row, col] = data[row, col] * sigmoid(row_gate[row])`.
+pub fn sigmoid_mul_row_scalar_bf16(
+    ordinal: usize,
+    rows: usize,
+    cols: usize,
+    data: &GpuBuffer,
+    row_gate: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if out.backend() != Backend::Metal {
+        return Err(GpuError::backend(
+            out.backend(),
+            "sigmoid_mul_row_scalar_bf16 is currently implemented only for Metal".into(),
+        ));
+    }
+    let _ = ordinal;
+    if !metal_native::disabled_by_env() {
+        let result = metal_profile_time("sigmoid_mul_row_scalar", "native", || {
+            metal_native::sigmoid_mul_row_scalar_bf16(rows, cols, data, row_gate, out)
+        });
+        if result.is_ok() {
+            return result;
+        }
+    }
+    metal_profile_host_time("sigmoid_mul_row_scalar", || {
+        metal_host::sigmoid_mul_row_scalar_bf16(rows, cols, data, row_gate, out)
     })
 }
 

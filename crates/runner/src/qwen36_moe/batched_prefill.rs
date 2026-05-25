@@ -40,14 +40,15 @@ use std::ffi::c_void;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
-use gpu_hal::{copy_d2h, copy_h2d, GpuBuffer, ScalarType};
+use gpu_hal::{copy_d2h, copy_h2d, Backend, GpuBuffer, ScalarType};
 use kernel_ffi::prefill_ffi;
 use kernel_ffi::qwen36_moe::{
     attn_step_launch, batched_prefill_attn_full_launch, batched_prefill_grouped_expert_launch_raw,
     batched_prefill_router_permute_launch, batched_prefill_unpermute_combine_launch,
-    ffn_step_launch, linear_step_launch, Qwen36MoeAttnStepInt4, Qwen36MoeAttnStepParams,
-    Qwen36MoeAttnStepWeights, Qwen36MoeFfnStepInt4, Qwen36MoeFfnStepParams, Qwen36MoeFfnStepWeights,
-    Qwen36MoeLinearStepInt4, Qwen36MoeLinearStepParams, Qwen36MoeLinearStepWeights,
+    ffn_step_launch, linear_step_launch, linear_step_stage5_metal_native_into,
+    Qwen36MoeAttnStepInt4, Qwen36MoeAttnStepParams, Qwen36MoeAttnStepWeights, Qwen36MoeFfnStepInt4,
+    Qwen36MoeFfnStepParams, Qwen36MoeFfnStepWeights, Qwen36MoeLinearStepInt4,
+    Qwen36MoeLinearStepParams, Qwen36MoeLinearStepWeights,
 };
 use model_store::BakedStore;
 
@@ -134,20 +135,12 @@ impl RotaryTables {
                 sin_data.extend_from_slice(&s.to_le_bytes());
             }
         }
-        let cos = GpuBuffer::from_host_bytes(
-            ordinal,
-            ScalarType::BF16,
-            &[max_pos, half],
-            &cos_data,
-        )
-        .context("alloc rope cos")?;
-        let sin = GpuBuffer::from_host_bytes(
-            ordinal,
-            ScalarType::BF16,
-            &[max_pos, half],
-            &sin_data,
-        )
-        .context("alloc rope sin")?;
+        let cos =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[max_pos, half], &cos_data)
+                .context("alloc rope cos")?;
+        let sin =
+            GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[max_pos, half], &sin_data)
+                .context("alloc rope sin")?;
         Ok(Self { cos, sin })
     }
 }
@@ -161,14 +154,24 @@ struct FullAttnBatchScratch {
     qg_raw: GpuBuffer,
     /// `[N, H, hd]` BF16. q values extracted from qg_raw.
     q: GpuBuffer,
+    /// `[N, H, hd]` BF16. q after per-head RMSNorm and RoPE.
+    q_after: GpuBuffer,
     /// `[N, H, hd]` BF16. gate values extracted from qg_raw.
     gate: GpuBuffer,
     /// `[N, Hkv*hd]` BF16. k_proj output (also q_norm input view as `[N*Hkv, hd]`).
     k: GpuBuffer,
+    /// `[N, Hkv, hd]` BF16. k after per-head RMSNorm and RoPE.
+    k_after: GpuBuffer,
     /// `[N, Hkv*hd]` BF16. v_proj output.
     v: GpuBuffer,
     /// `[H, N, hd]` BF16. q transposed for M3 input.
     q_thsd: GpuBuffer,
+    /// `[kv_max_t, Hkv, hd]` BF16. Temporary time-major K prefix for the
+    /// legacy Metal full-attention layout path.
+    kv_prefix_k: GpuBuffer,
+    /// `[kv_max_t, Hkv, hd]` BF16. Temporary time-major V prefix for the
+    /// legacy Metal full-attention layout path.
+    kv_prefix_v: GpuBuffer,
     /// `[Hkv, kv_max_t, hd]` BF16. K cache transposed for M3 input.
     /// (Allocated but currently unused — the live path mallocs a per-call
     /// `[hkv, kv_len, hd]` since `kv_len` varies per chunk; this slot is
@@ -204,17 +207,25 @@ impl FullAttnBatchScratch {
         let q_dim = 2 * h * hd;
         let kv_dim = hkv * hd;
 
-        let x_norm = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[n, hidden])
-            .context("alloc x_norm")?;
-        let qg_raw = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[n, q_dim])
-            .context("alloc qg_raw")?;
+        let x_norm =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[n, hidden]).context("alloc x_norm")?;
+        let qg_raw =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[n, q_dim]).context("alloc qg_raw")?;
         let q = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[n, h, hd]).context("alloc q")?;
+        let q_after = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[n, h, hd])
+            .context("alloc q_after_norm")?;
         let gate =
             GpuBuffer::zeros(ordinal, ScalarType::BF16, &[n, h, hd]).context("alloc gate")?;
         let k = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[n, kv_dim]).context("alloc k")?;
+        let k_after = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[n, hkv, hd])
+            .context("alloc k_after_norm")?;
         let v = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[n, kv_dim]).context("alloc v")?;
-        let q_thsd = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[h, n, hd])
-            .context("alloc q_thsd")?;
+        let q_thsd =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[h, n, hd]).context("alloc q_thsd")?;
+        let kv_prefix_k = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[kv_max_t.max(1), hkv, hd])
+            .context("alloc kv_prefix_k")?;
+        let kv_prefix_v = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[kv_max_t.max(1), hkv, hd])
+            .context("alloc kv_prefix_v")?;
         let k_thsd = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[hkv, kv_max_t.max(1), hd])
             .context("alloc k_thsd")?;
         let v_thsd = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[hkv, kv_max_t.max(1), hd])
@@ -225,8 +236,8 @@ impl FullAttnBatchScratch {
             .context("alloc attn_out_nhd_f32")?;
         let attn_out_bf16 = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[n, h, hd])
             .context("alloc attn_out_bf16")?;
-        let gated = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[n, h, hd])
-            .context("alloc gated")?;
+        let gated =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[n, h, hd]).context("alloc gated")?;
         let o =
             GpuBuffer::zeros(ordinal, ScalarType::BF16, &[n, hidden]).context("alloc o_proj")?;
 
@@ -234,10 +245,14 @@ impl FullAttnBatchScratch {
             x_norm,
             qg_raw,
             q,
+            q_after,
             gate,
             k,
+            k_after,
             v,
             q_thsd,
+            kv_prefix_k,
+            kv_prefix_v,
             k_thsd,
             v_thsd,
             attn_out_f32,
@@ -287,8 +302,7 @@ pub(crate) fn run_batched_prefill_stub(
     // configurations. SpecPrefill sparse prompts are supported by staging
     // only kept tokens and applying RoPE through an indirect position-id
     // buffer, so they can use the same compact KV timeline as dense chunks.
-    let supports_batched =
-        supports_batched_path(layers, keep_mask, moe_expert_residency.is_some());
+    let supports_batched = supports_batched_path(layers, keep_mask, moe_expert_residency.is_some());
     if !supports_batched {
         return run_pertoken_chunked(
             ordinal,
@@ -323,13 +337,8 @@ pub(crate) fn run_batched_prefill_stub(
         .unwrap_or(1);
     let full_prompt_len = prompt_ids.len();
     let max_pos = max_kv_t.max(full_prompt_len).max(effective_prompt_len);
-    let rotary = RotaryTables::build(
-        ordinal,
-        max_pos,
-        geom.rotary_dim as usize,
-        geom.rope_theta,
-    )
-    .context("build rotary tables")?;
+    let rotary = RotaryTables::build(ordinal, max_pos, geom.rotary_dim as usize, geom.rope_theta)
+        .context("build rotary tables")?;
 
     // Allocate scratch sized for the LARGEST chunk we might use; per-chunk
     // code uses only the `n` prefix needed. At hidden=2048 hd=256 H=16 and
@@ -407,6 +416,11 @@ fn supports_batched_path(
     moe_expert_residency_active: bool,
 ) -> bool {
     let _ = keep_mask;
+    if gpu_hal::current_backend() == Backend::Metal
+        && std::env::var_os("SUPERSONIC_QWEN36_MOE_METAL_BATCHED_PREFILL_PROTOTYPE").is_none()
+    {
+        return false;
+    }
     if moe_expert_residency_active {
         return false;
     }
@@ -533,13 +547,18 @@ fn process_chunk_batched(
     }
 
     // Batched-attn enabled path: stage chunk on GPU and drive per-layer.
-    let _ = (persistent_scratch, moe_expert_residency, moe_runtime, moe_routes);
+    let _ = (
+        persistent_scratch,
+        moe_expert_residency,
+        moe_runtime,
+        moe_routes,
+    );
     let _ = (emit_stage_timings, full_prompt_len);
 
     // 1. Stage the N chunk tokens onto the GPU.
     let hidden = geom.hidden as usize;
-    let mut chunk_hidden = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[n, hidden])
-        .context("alloc chunk_hidden")?;
+    let mut chunk_hidden =
+        GpuBuffer::zeros(ordinal, ScalarType::BF16, &[n, hidden]).context("alloc chunk_hidden")?;
     let t0 = Instant::now();
     stage_chunk_tokens_on_gpu(
         ordinal,
@@ -581,8 +600,7 @@ fn process_chunk_batched(
 
     // Per-token fallback workspaces. Always allocated — used either by
     // linear-attn (always) or by per-token FFN (when grouped FFN is off).
-    let attn_ws_floats = full_attn_workspace_floats(geom)
-        .max(linear_attn_workspace_floats(geom))
+    let attn_ws_floats = full_attn_workspace_floats(geom).max(linear_attn_workspace_floats(geom))
         + geom.num_attention_heads as usize * pertoken_attn_extra_kv(layers);
     let attn_out_elems = full_attn_output_elems(geom);
     let mut attn_output = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[attn_out_elems])
@@ -593,10 +611,11 @@ fn process_chunk_batched(
         .context("alloc ffn_output")?;
     let mut ffn_output_idx = GpuBuffer::zeros(ordinal, ScalarType::U32, &[geom.top_k as usize])
         .context("alloc ffn_output_idx")?;
-    let mut ffn_workspace = GpuBuffer::zeros(ordinal, ScalarType::F32, &[ffn_workspace_floats(geom)])
-        .context("alloc ffn_workspace")?;
-    let mut sync_buf = GpuBuffer::zeros(ordinal, ScalarType::U8, &[96])
-        .context("alloc sync_buf")?;
+    let mut ffn_workspace =
+        GpuBuffer::zeros(ordinal, ScalarType::F32, &[ffn_workspace_floats(geom)])
+            .context("alloc ffn_workspace")?;
+    let mut sync_buf =
+        GpuBuffer::zeros(ordinal, ScalarType::U8, &[96]).context("alloc sync_buf")?;
 
     // M11 batched-FFN scratch — allocated once per chunk, reused per layer.
     let mut grouped_scratch = if use_grouped_ffn {
@@ -685,6 +704,7 @@ fn process_chunk_batched(
             process_ffn_pertoken(
                 ordinal,
                 geom,
+                layer_idx,
                 n,
                 &mut chunk_hidden,
                 &layer.ffn,
@@ -969,30 +989,41 @@ fn process_full_attn_layer_batched(
 
     // 3. Split q+gate. qg_raw layout per row: [h0_q[hd], h0_gate[hd],
     //    h1_q[hd], h1_gate[hd], ...] — interleaved per-head halves.
-    //    Extract into contiguous q[N,H,hd] and gate[N,H,hd] via per-head
-    //    d2d copies. (No batched primitive for this strided copy yet.)
-    let row_bytes = hd * 2;
-    for nn in 0..n {
-        for hh in 0..h {
-            let qg_row_off = (nn * q_dim + hh * 2 * hd) * 2;
-            let q_off = (nn * h * hd + hh * hd) * 2;
-            let gate_off = q_off; // same layout in `gate`
-            // q half
-            let src_q = scratch.qg_raw.offset_ptr(qg_row_off);
-            let dst_q = unsafe { (scratch.q.as_mut_ptr() as *mut u8).add(q_off) as *mut c_void };
-            gpu_hal::copy_d2d(ordinal, dst_q, src_q, row_bytes)
-                .context("split q")?;
-            // gate half
-            let src_g = scratch.qg_raw.offset_ptr(qg_row_off + hd * 2);
-            let dst_g =
-                unsafe { (scratch.gate.as_mut_ptr() as *mut u8).add(gate_off) as *mut c_void };
-            gpu_hal::copy_d2d(ordinal, dst_g, src_g, row_bytes).context("split gate")?;
+    let use_metal_split_qgate = chunk_hidden.backend() == Backend::Metal
+        && std::env::var("SUPERSONIC_QWEN36_MOE_METAL_SPLIT_QGATE")
+            .map(|v| v != "0")
+            .unwrap_or(false);
+    if use_metal_split_qgate {
+        prefill_ffi::split_qgate(
+            ordinal,
+            ScalarType::BF16,
+            n,
+            h,
+            hd,
+            &scratch.qg_raw,
+            &mut scratch.q,
+            &mut scratch.gate,
+        )
+        .map_err(|e| anyhow!("split qgate: {e}"))?;
+    } else {
+        let row_bytes = hd * 2;
+        for nn in 0..n {
+            for hh in 0..h {
+                let qg_row_off = (nn * q_dim + hh * 2 * hd) * 2;
+                let q_off = (nn * h * hd + hh * hd) * 2;
+                let src_q = scratch.qg_raw.offset_ptr(qg_row_off);
+                let dst_q =
+                    unsafe { (scratch.q.as_mut_ptr() as *mut u8).add(q_off) as *mut c_void };
+                gpu_hal::copy_d2d(ordinal, dst_q, src_q, row_bytes).context("split q")?;
+                let src_g = scratch.qg_raw.offset_ptr(qg_row_off + hd * 2);
+                let dst_g =
+                    unsafe { (scratch.gate.as_mut_ptr() as *mut u8).add(q_off) as *mut c_void };
+                gpu_hal::copy_d2d(ordinal, dst_g, src_g, row_bytes).context("split gate")?;
+            }
         }
     }
 
     // 4. Per-head q_norm + k_norm (RMSnorm on rows of head_dim).
-    let mut q_after = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[n * h, hd])
-        .context("alloc q_after_norm")?;
     prefill_ffi::rms_norm_rows(
         ordinal,
         ScalarType::BF16,
@@ -1001,11 +1032,9 @@ fn process_full_attn_layer_batched(
         geom.rms_norm_eps,
         &scratch.q,
         q_norm_w,
-        &mut q_after,
+        &mut scratch.q_after,
     )
     .map_err(|e| anyhow!("rms_norm_rows q: {e}"))?;
-    let mut k_after = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[n * hkv, hd])
-        .context("alloc k_after_norm")?;
     prefill_ffi::rms_norm_rows(
         ordinal,
         ScalarType::BF16,
@@ -1014,7 +1043,7 @@ fn process_full_attn_layer_batched(
         geom.rms_norm_eps,
         &scratch.k,
         k_norm_w,
-        &mut k_after,
+        &mut scratch.k_after,
     )
     .map_err(|e| anyhow!("rms_norm_rows k: {e}"))?;
 
@@ -1032,7 +1061,7 @@ fn process_full_attn_layer_batched(
             &rotary.cos,
             &rotary.sin,
             pos_ids,
-            &mut q_after,
+            &mut scratch.q_after,
         )
         .map_err(|e| anyhow!("rope q indirect: {e}"))?;
         prefill_ffi::apply_rope_prefill_indirect(
@@ -1045,7 +1074,7 @@ fn process_full_attn_layer_batched(
             &rotary.cos,
             &rotary.sin,
             pos_ids,
-            &mut k_after,
+            &mut scratch.k_after,
         )
         .map_err(|e| anyhow!("rope k indirect: {e}"))?;
     } else {
@@ -1059,7 +1088,7 @@ fn process_full_attn_layer_batched(
             &rotary.cos,
             &rotary.sin,
             past_len,
-            &mut q_after,
+            &mut scratch.q_after,
         )
         .map_err(|e| anyhow!("rope q: {e}"))?;
         prefill_ffi::apply_rope_prefill(
@@ -1072,7 +1101,7 @@ fn process_full_attn_layer_batched(
             &rotary.cos,
             &rotary.sin,
             past_len,
-            &mut k_after,
+            &mut scratch.k_after,
         )
         .map_err(|e| anyhow!("rope k: {e}"))?;
     }
@@ -1088,99 +1117,123 @@ fn process_full_attn_layer_batched(
     unsafe {
         let dst_k = (cache_k_ptr as *mut u8).add(cache_byte_off) as *mut c_void;
         let dst_v = (cache_v_ptr as *mut u8).add(cache_byte_off) as *mut c_void;
-        gpu_hal::copy_d2d(ordinal, dst_k, k_after.as_ptr(), copy_bytes)
+        gpu_hal::copy_d2d(ordinal, dst_k, scratch.k_after.as_ptr(), copy_bytes)
             .context("kv cache K write")?;
         gpu_hal::copy_d2d(ordinal, dst_v, scratch.v.as_ptr(), copy_bytes)
             .context("kv cache V write")?;
     }
 
-    // 7. Transpose q [n, h, hd] -> [h, n, hd] for M3 input.
-    prefill_ffi::transpose_shd_hsd(
-        ordinal,
-        ScalarType::BF16,
-        n,
-        h,
-        hd,
-        &q_after,
-        &mut scratch.q_thsd,
-    )
-    .map_err(|e| anyhow!("transpose q s,h,d -> h,s,d: {e}"))?;
-
-    //    Transpose KV cache prefix [past_len + n, hkv, hd] -> [hkv, past_len + n, hd].
     let kv_len = past_len + n;
-    // We need to wrap the cache as a GpuBuffer view to call transpose. Do
-    // a direct D2D into a re-shaped temporary. The transpose primitive
-    // takes a `&GpuBuffer` so we materialize a temp view by allocating
-    // and copying — wasteful but correct. (If profiling shows this as a
-    // hotspot, add a raw-pointer transpose variant.)
-    let mut kv_prefix_k = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[kv_len, hkv, hd])
-        .context("alloc kv_prefix_k")?;
-    let mut kv_prefix_v = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[kv_len, hkv, hd])
-        .context("alloc kv_prefix_v")?;
-    let kv_bytes = kv_len * row_kv_bytes;
-    gpu_hal::copy_d2d(ordinal, kv_prefix_k.as_mut_ptr(), cache_k_ptr, kv_bytes)
+    let use_metal_tmajor_full_attn = chunk_hidden.backend() == Backend::Metal
+        && std::env::var("SUPERSONIC_QWEN36_MOE_METAL_FULL_ATTN_TMAJOR")
+            .map(|v| v != "0")
+            .unwrap_or(false);
+
+    if use_metal_tmajor_full_attn {
+        // 7. Metal-only fast layout path. The native kernel reads the
+        // persistent time-major KV cache `[T,Hkv,D]` directly and writes
+        // `[N,H,D]` F32 output, avoiding the old prefix copy plus K/V/Q/output
+        // transpose chain for every full-attention layer.
+        unsafe {
+            prefill_ffi::metal_full_attention_prefill_tmajor_bf16_f32(
+                h,
+                hkv,
+                n,
+                kv_len,
+                hd,
+                scale,
+                past_len,
+                &scratch.q_after,
+                cache_k_ptr as *const c_void,
+                cache_v_ptr as *const c_void,
+                &mut scratch.attn_out_nhd_f32,
+            )
+        }
+        .map_err(|e| anyhow!("metal full_attention_prefill_tmajor: {e}"))?;
+    } else {
+        // 7. Legacy layout path: transpose q [n, h, hd] -> [h, n, hd] and
+        // materialize a compact head-major KV prefix for M3 input.
+        prefill_ffi::transpose_shd_hsd(
+            ordinal,
+            ScalarType::BF16,
+            n,
+            h,
+            hd,
+            &scratch.q_after,
+            &mut scratch.q_thsd,
+        )
+        .map_err(|e| anyhow!("transpose q s,h,d -> h,s,d: {e}"))?;
+
+        let kv_bytes = kv_len * row_kv_bytes;
+        gpu_hal::copy_d2d(
+            ordinal,
+            scratch.kv_prefix_k.as_mut_ptr(),
+            cache_k_ptr,
+            kv_bytes,
+        )
         .context("kv prefix copy K")?;
-    gpu_hal::copy_d2d(ordinal, kv_prefix_v.as_mut_ptr(), cache_v_ptr, kv_bytes)
+        gpu_hal::copy_d2d(
+            ordinal,
+            scratch.kv_prefix_v.as_mut_ptr(),
+            cache_v_ptr,
+            kv_bytes,
+        )
         .context("kv prefix copy V")?;
-    let mut k_thsd_prefix = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[hkv, kv_len, hd])
-        .context("alloc k_thsd_prefix")?;
-    let mut v_thsd_prefix = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[hkv, kv_len, hd])
-        .context("alloc v_thsd_prefix")?;
-    prefill_ffi::transpose_shd_hsd(
-        ordinal,
-        ScalarType::BF16,
-        kv_len,
-        hkv,
-        hd,
-        &kv_prefix_k,
-        &mut k_thsd_prefix,
-    )
-    .map_err(|e| anyhow!("transpose K: {e}"))?;
-    prefill_ffi::transpose_shd_hsd(
-        ordinal,
-        ScalarType::BF16,
-        kv_len,
-        hkv,
-        hd,
-        &kv_prefix_v,
-        &mut v_thsd_prefix,
-    )
-    .map_err(|e| anyhow!("transpose V: {e}"))?;
-    let _ = kv_max_t; // unused after transpose
+        prefill_ffi::transpose_shd_hsd(
+            ordinal,
+            ScalarType::BF16,
+            kv_len,
+            hkv,
+            hd,
+            &scratch.kv_prefix_k,
+            &mut scratch.k_thsd,
+        )
+        .map_err(|e| anyhow!("transpose K: {e}"))?;
+        prefill_ffi::transpose_shd_hsd(
+            ordinal,
+            ScalarType::BF16,
+            kv_len,
+            hkv,
+            hd,
+            &scratch.kv_prefix_v,
+            &mut scratch.v_thsd,
+        )
+        .map_err(|e| anyhow!("transpose V: {e}"))?;
+        let _ = kv_max_t;
 
-    // 8. M3 batched-Q full-attention.
-    batched_prefill_attn_full_launch(
-        ordinal,
-        1,        // batch
-        h,
-        hkv,
-        n,        // q_len
-        kv_len,
-        hd,
-        scale,
-        past_len, // seqlen_offset
-        &scratch.q_thsd,
-        &k_thsd_prefix,
-        &v_thsd_prefix,
-        &mut scratch.attn_out_f32,
-    )
-    .map_err(|e| anyhow!("batched_prefill_attn_full_launch: {e}"))?;
+        batched_prefill_attn_full_launch(
+            ordinal,
+            1, // batch
+            h,
+            hkv,
+            n, // q_len
+            kv_len,
+            hd,
+            scale,
+            past_len, // seqlen_offset
+            &scratch.q_thsd,
+            &scratch.k_thsd,
+            &scratch.v_thsd,
+            &mut scratch.attn_out_f32,
+        )
+        .map_err(|e| anyhow!("batched_prefill_attn_full_launch: {e}"))?;
 
-    // 9. Transpose attn_out F32 [h, n, hd] -> [n, h, hd]. Do it via
-    //    transpose_shd_hsd with s=h, h=n: it transposes [s, h, d] to
-    //    [h, s, d], so passing s=h, h=n yields the desired [n, h, hd].
-    prefill_ffi::transpose_shd_hsd(
-        ordinal,
-        ScalarType::F32,
-        h, // s
-        n, // h
-        hd,
-        &scratch.attn_out_f32,
-        &mut scratch.attn_out_nhd_f32,
-    )
-    .map_err(|e| anyhow!("transpose attn_out h,n,d -> n,h,d: {e}"))?;
+        // 8. Transpose attn_out F32 [h, n, hd] -> [n, h, hd]. Do it via
+        //    transpose_shd_hsd with s=h, h=n: it transposes [s, h, d] to
+        //    [h, s, d], so passing s=h, h=n yields the desired [n, h, hd].
+        prefill_ffi::transpose_shd_hsd(
+            ordinal,
+            ScalarType::F32,
+            h, // s
+            n, // h
+            hd,
+            &scratch.attn_out_f32,
+            &mut scratch.attn_out_nhd_f32,
+        )
+        .map_err(|e| anyhow!("transpose attn_out h,n,d -> n,h,d: {e}"))?;
+    }
 
-    // 10. Cast F32 -> BF16.
+    // 9. Cast F32 -> BF16.
     prefill_ffi::cast(
         ordinal,
         ScalarType::F32,
@@ -1308,8 +1361,23 @@ fn process_linear_attn_layer_pertoken(
         }
         None => Qwen36MoeLinearStepInt4::disabled(),
     };
+    let use_metal_direct_rows = chunk_hidden.backend() == Backend::Metal
+        && int4_ptrs.group_size == 128
+        && std::env::var_os("SUPERSONIC_METAL_PROFILE").is_none()
+        && std::env::var_os("SUPERSONIC_METAL_DISABLE_BATCH").is_none()
+        && std::env::var("SUPERSONIC_QWEN36_MOE_METAL_LINEAR_PREFILL_DIRECT")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+    let _metal_batch = if use_metal_direct_rows {
+        let guard = prefill_ffi::MetalBatchGuard::begin()
+            .map_err(|e| anyhow!("begin Metal linear direct-row batch: {e}"))?;
+        prefill_ffi::set_metal_batch_label("qwen36_linear_prefill_direct_rows")
+            .map_err(|e| anyhow!("label Metal linear direct-row batch: {e}"))?;
+        Some(guard)
+    } else {
+        None
+    };
     for t in 0..n {
-        reset_sync_buf(ordinal, sync_buf).context("reset sync_buf (linear-attn pertoken)")?;
         let token_byte_off = t * row_bytes;
         let input_ptr = chunk_hidden.offset_ptr(token_byte_off);
         let weights = Qwen36MoeLinearStepWeights {
@@ -1331,23 +1399,48 @@ fn process_linear_attn_layer_pertoken(
             conv_state: conv_state.as_mut_ptr(),
             recurrent_state: recurrent_state.as_mut_ptr() as *mut f32,
         };
-        linear_step_launch(
-            ordinal,
-            ScalarType::BF16,
-            params,
-            &weights,
-            &int4_ptrs,
-            attn_output,
-            attn_workspace,
-            sync_buf,
-        )
-        .with_context(|| format!("linear_step_launch (pertoken t={t})"))?;
-        // Copy attn_output[..hidden] back into chunk_hidden[t]
-        let dst = unsafe {
-            (chunk_hidden.as_mut_ptr() as *mut u8).add(token_byte_off) as *mut c_void
-        };
-        gpu_hal::copy_d2d(ordinal, dst, attn_output.as_ptr(), row_bytes)
-            .context("d2d linear-attn output -> chunk row")?;
+        if use_metal_direct_rows {
+            let dst = unsafe {
+                (chunk_hidden.as_mut_ptr() as *mut u8).add(token_byte_off) as *mut c_void
+            };
+            unsafe {
+                linear_step_stage5_metal_native_into(
+                    params,
+                    &weights,
+                    &int4_ptrs,
+                    attn_output,
+                    attn_workspace,
+                    dst,
+                    hidden,
+                    false,
+                )
+            }
+            .with_context(|| format!("linear_step_stage5_metal_native_into (pertoken t={t})"))?;
+        } else {
+            reset_sync_buf(ordinal, sync_buf).context("reset sync_buf (linear-attn pertoken)")?;
+            linear_step_launch(
+                ordinal,
+                ScalarType::BF16,
+                params,
+                &weights,
+                &int4_ptrs,
+                attn_output,
+                attn_workspace,
+                sync_buf,
+            )
+            .with_context(|| format!("linear_step_launch (pertoken t={t})"))?;
+            // Copy attn_output[..hidden] back into chunk_hidden[t]
+            let dst = unsafe {
+                (chunk_hidden.as_mut_ptr() as *mut u8).add(token_byte_off) as *mut c_void
+            };
+            gpu_hal::copy_d2d(ordinal, dst, attn_output.as_ptr(), row_bytes)
+                .context("d2d linear-attn output -> chunk row")?;
+        }
+    }
+    if let Some(batch) = _metal_batch {
+        batch
+            .finish()
+            .map_err(|e| anyhow!("finish Metal linear direct-row batch: {e}"))?;
     }
     Ok(())
 }
@@ -1461,9 +1554,8 @@ fn process_full_attn_layer_pertoken(
             sync_buf,
         )
         .with_context(|| format!("attn_step_launch (pertoken t={t})"))?;
-        let dst = unsafe {
-            (chunk_hidden.as_mut_ptr() as *mut u8).add(token_byte_off) as *mut c_void
-        };
+        let dst =
+            unsafe { (chunk_hidden.as_mut_ptr() as *mut u8).add(token_byte_off) as *mut c_void };
         gpu_hal::copy_d2d(ordinal, dst, attn_output.as_ptr(), row_bytes)
             .context("d2d full-attn output -> chunk row")?;
     }
@@ -1476,6 +1568,7 @@ fn process_full_attn_layer_pertoken(
 fn process_ffn_pertoken(
     ordinal: usize,
     geom: &MultiLayerGeom,
+    layer_idx: usize,
     n: usize,
     chunk_hidden: &mut GpuBuffer,
     ffn: &crate::qwen36_moe_types::FfnLayerBuffers,
@@ -1488,6 +1581,7 @@ fn process_ffn_pertoken(
     let row_bytes = hidden * 2;
     let params = Qwen36MoeFfnStepParams {
         stage: 5,
+        layer_idx: layer_idx as i32,
         hidden: geom.hidden,
         num_experts: geom.num_experts,
         moe_intermediate: geom.moe_intermediate,
@@ -1561,9 +1655,8 @@ fn process_ffn_pertoken(
             sync_buf,
         )
         .with_context(|| format!("ffn_step_launch (pertoken t={t})"))?;
-        let dst = unsafe {
-            (chunk_hidden.as_mut_ptr() as *mut u8).add(token_byte_off) as *mut c_void
-        };
+        let dst =
+            unsafe { (chunk_hidden.as_mut_ptr() as *mut u8).add(token_byte_off) as *mut c_void };
         gpu_hal::copy_d2d(ordinal, dst, ffn_output.as_ptr(), row_bytes)
             .context("d2d ffn output -> chunk row")?;
     }
@@ -1606,6 +1699,9 @@ struct GroupedFfnScratch {
     permuted_inverse: GpuBuffer,
     /// `[N * top_k, hidden]` BF16 — M10 expert outputs.
     expert_out: GpuBuffer,
+    /// `[N * top_k, moe_intermediate]` F32 — Metal direct routed expert
+    /// intermediate between gate/up and down/combine.
+    expert_mid: GpuBuffer,
     /// `[N, hidden]` BF16 — unpermute+combine output (sum of routed experts).
     combined: GpuBuffer,
     /// `[1]` u32 — M10 work-stealing counter (must be re-zeroed per launch).
@@ -1623,6 +1719,8 @@ struct GroupedFfnScratch {
     shared_gate_scalar: GpuBuffer,
     /// `[N, hidden]` BF16 — shared expert output after sigmoid gating.
     shared_out: GpuBuffer,
+    /// `[N, hidden]` BF16 — fallback temp for shared expert scalar gating.
+    shared_out_final: GpuBuffer,
 }
 
 impl GroupedFfnScratch {
@@ -1635,9 +1733,8 @@ impl GroupedFfnScratch {
 
         let h_norm = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[n, hidden])
             .context("alloc grouped_ffn h_norm")?;
-        let router_logits_bf16 =
-            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[n, num_experts])
-                .context("alloc grouped_ffn router_logits_bf16")?;
+        let router_logits_bf16 = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[n, num_experts])
+            .context("alloc grouped_ffn router_logits_bf16")?;
         let topk_idx = GpuBuffer::zeros(ordinal, ScalarType::U32, &[n, top_k])
             .context("alloc grouped_ffn topk_idx")?;
         let topk_weight = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[n, top_k])
@@ -1654,16 +1751,20 @@ impl GroupedFfnScratch {
             .context("alloc grouped_ffn permuted_inverse")?;
         let expert_out = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[nk, hidden])
             .context("alloc grouped_ffn expert_out")?;
+        let expert_mid = GpuBuffer::zeros(
+            ordinal,
+            ScalarType::F32,
+            &[nk, geom.moe_intermediate as usize],
+        )
+        .context("alloc grouped_ffn expert_mid")?;
         let combined = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[n, hidden])
             .context("alloc grouped_ffn combined")?;
         let expert_counters = GpuBuffer::zeros(ordinal, ScalarType::U32, &[1])
             .context("alloc grouped_ffn expert_counters")?;
-        let shared_gate =
-            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[n, shared_intermediate])
-                .context("alloc grouped_ffn shared_gate")?;
-        let shared_up =
-            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[n, shared_intermediate])
-                .context("alloc grouped_ffn shared_up")?;
+        let shared_gate = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[n, shared_intermediate])
+            .context("alloc grouped_ffn shared_gate")?;
+        let shared_up = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[n, shared_intermediate])
+            .context("alloc grouped_ffn shared_up")?;
         let shared_silu_mul =
             GpuBuffer::zeros(ordinal, ScalarType::BF16, &[n, shared_intermediate])
                 .context("alloc grouped_ffn shared_silu_mul")?;
@@ -1673,6 +1774,8 @@ impl GroupedFfnScratch {
             .context("alloc grouped_ffn shared_gate_scalar")?;
         let shared_out = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[n, hidden])
             .context("alloc grouped_ffn shared_out")?;
+        let shared_out_final = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[n, hidden])
+            .context("alloc grouped_ffn shared_out_final")?;
 
         Ok(Self {
             n,
@@ -1688,6 +1791,7 @@ impl GroupedFfnScratch {
             permuted_weight,
             permuted_inverse,
             expert_out,
+            expert_mid,
             combined,
             expert_counters,
             shared_gate,
@@ -1696,6 +1800,7 @@ impl GroupedFfnScratch {
             shared_down,
             shared_gate_scalar,
             shared_out,
+            shared_out_final,
         })
     }
 }
@@ -1733,17 +1838,19 @@ fn process_ffn_batched_grouped(
     scratch: &mut GroupedFfnScratch,
     _sync_buf: &mut GpuBuffer,
 ) -> Result<()> {
-    debug_assert_eq!(scratch.n, n, "GroupedFfnScratch sized for chunk_n != current n");
+    debug_assert_eq!(
+        scratch.n, n,
+        "GroupedFfnScratch sized for chunk_n != current n"
+    );
     let hidden = geom.hidden as usize;
     let num_experts = geom.num_experts as usize;
     let top_k = geom.top_k as usize;
     let moe_intermediate = geom.moe_intermediate as usize;
     let shared_intermediate = geom.shared_intermediate as usize;
 
-    let int4 = ffn
-        .int4
-        .as_ref()
-        .ok_or_else(|| anyhow!("grouped FFN requires INT4 sidecars; BF16-only path not supported"))?;
+    let int4 = ffn.int4.as_ref().ok_or_else(|| {
+        anyhow!("grouped FFN requires INT4 sidecars; BF16-only path not supported")
+    })?;
     let group_size = int4.group_size;
     if group_size != 128 {
         return Err(anyhow!(
@@ -1792,192 +1899,265 @@ fn process_ffn_batched_grouped(
     //    num_experts=256 this is 64*256*2 = 32 KiB D2H + 64*8*4 + 64*8*2 =
     //    ~2 KiB H2D per layer per chunk — negligible vs the matmul cost.
     //    (TODO: GPU softmax/top-K fusion as a future M12+ perf opportunity.)
-    let mut logits_bytes = vec![0u8; n * num_experts * 2];
-    copy_d2h(
-        ordinal,
-        logits_bytes.as_mut_ptr() as *mut c_void,
-        scratch.router_logits_bf16.as_ptr(),
-        logits_bytes.len(),
-    )
-    .context("d2h router_logits_bf16")?;
-    let mut topk_idx_host = vec![0i32; n * top_k];
-    let mut topk_weight_host = vec![0u16; n * top_k];
-    for token in 0..n {
-        let row_bf16 = unsafe {
-            std::slice::from_raw_parts(
-                (logits_bytes.as_ptr() as *const u16).add(token * num_experts),
-                num_experts,
-            )
-        };
-        // Widen BF16 → F32 to match the per-token kernel's Phase C, which
-        // reads workspace[OFF_ROUTER_LOGITS] as F32 (the value was stored
-        // via `bf16_round_rne_f32` in Phase B).
-        let row: Vec<f32> = row_bf16.iter().map(|&b| bf16_bits_to_f32(b)).collect();
-        // Match per-token kernel (`ffn_phase.cuh` Phase C): softmax with
-        // BF16-rounded probs, then top-K with low-index tie-breaking, then
-        // renormalise top-K to sum to 1 (BF16-rounded again).
-        let row_max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let exps: Vec<f32> = row.iter().map(|&v| (v - row_max).exp()).collect();
-        let row_sum: f32 = exps.iter().copied().sum();
-        let inv_sum = 1.0f32 / row_sum;
-        // BF16-round each prob to match the per-token kernel.
-        let mut probs: Vec<f32> = exps.iter().map(|&e| bf16_round_rne_f32(e * inv_sum)).collect();
+    let explicit_route_profile = std::env::var_os("SUPERSONIC_QWEN36_ROUTE_PROFILE").is_some()
+        || std::env::var_os("SUPERSONIC_QWEN36_ROUTE_PROFILE_DUMP_CALLS").is_some()
+        || std::env::var_os("SUPERSONIC_QWEN36_ROUTE_PROFILE_DUMP_TOPN_LAYERS").is_some()
+        || std::env::var_os("SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL_FEASIBILITY").is_some()
+        || std::env::var_os("SUPERSONIC_QWEN36_EXPERT_RESIDENCY_PROFILE").is_some()
+        || std::env::var_os("SUPERSONIC_QWEN36_PACK_CACHE_PROFILE").is_some();
+    let use_metal_router_topk = scratch.router_logits_bf16.backend() == Backend::Metal
+        && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
+        && !explicit_route_profile
+        && std::env::var_os("SUPERSONIC_METAL_PROFILE").is_none()
+        && std::env::var_os("SUPERSONIC_METAL_DISABLE_BATCH").is_none()
+        && std::env::var("SUPERSONIC_QWEN36_MOE_METAL_ROUTER_TOPK")
+            .map(|v| v != "0")
+            .unwrap_or(false);
+    let metal_router_expert_batch = if use_metal_router_topk {
+        let guard = prefill_ffi::MetalBatchGuard::begin()
+            .map_err(|e| anyhow!("begin Metal router/expert FFN batch: {e}"))?;
+        prefill_ffi::set_metal_batch_label("qwen36_batched_prefill_router_expert_direct")
+            .map_err(|e| anyhow!("label Metal router/expert FFN batch: {e}"))?;
+        Some(guard)
+    } else {
+        None
+    };
+    if use_metal_router_topk {
+        prefill_ffi::qwen36_router_softmax_topk_bf16(
+            n,
+            num_experts,
+            top_k,
+            &scratch.router_logits_bf16,
+            &mut scratch.topk_idx,
+            &mut scratch.topk_weight,
+        )
+        .map_err(|e| anyhow!("Metal router softmax top-k: {e}"))?;
+    } else {
+        let mut logits_bytes = vec![0u8; n * num_experts * 2];
+        copy_d2h(
+            ordinal,
+            logits_bytes.as_mut_ptr() as *mut c_void,
+            scratch.router_logits_bf16.as_ptr(),
+            logits_bytes.len(),
+        )
+        .context("d2h router_logits_bf16")?;
+        let mut topk_idx_host = vec![0i32; n * top_k];
+        let mut topk_weight_host = vec![0u16; n * top_k];
+        for token in 0..n {
+            let row_bf16 = unsafe {
+                std::slice::from_raw_parts(
+                    (logits_bytes.as_ptr() as *const u16).add(token * num_experts),
+                    num_experts,
+                )
+            };
+            // Widen BF16 → F32 to match the per-token kernel's Phase C, which
+            // reads workspace[OFF_ROUTER_LOGITS] as F32 (the value was stored
+            // via `bf16_round_rne_f32` in Phase B).
+            let row: Vec<f32> = row_bf16.iter().map(|&b| bf16_bits_to_f32(b)).collect();
+            // Match per-token kernel (`ffn_phase.cuh` Phase C): softmax with
+            // BF16-rounded probs, then top-K with low-index tie-breaking, then
+            // renormalise top-K to sum to 1 (BF16-rounded again).
+            let row_max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let exps: Vec<f32> = row.iter().map(|&v| (v - row_max).exp()).collect();
+            let row_sum: f32 = exps.iter().copied().sum();
+            let inv_sum = 1.0f32 / row_sum;
+            // BF16-round each prob to match the per-token kernel.
+            let mut probs: Vec<f32> = exps
+                .iter()
+                .map(|&e| bf16_round_rne_f32(e * inv_sum))
+                .collect();
 
-        // Top-K with low-index tie-break (mark with -inf as we go).
-        for k in 0..top_k {
-            let mut best_idx = -1i32;
-            let mut best_val = f32::NEG_INFINITY;
-            for (i, &v) in probs.iter().enumerate() {
-                if v > best_val
-                    || (v == best_val && best_idx >= 0 && (i as i32) < best_idx)
-                {
-                    best_val = v;
-                    best_idx = i as i32;
+            // Top-K with low-index tie-break (mark with -inf as we go).
+            for k in 0..top_k {
+                let mut best_idx = -1i32;
+                let mut best_val = f32::NEG_INFINITY;
+                for (i, &v) in probs.iter().enumerate() {
+                    if v > best_val || (v == best_val && best_idx >= 0 && (i as i32) < best_idx) {
+                        best_val = v;
+                        best_idx = i as i32;
+                    }
+                }
+                topk_idx_host[token * top_k + k] = best_idx;
+                topk_weight_host[token * top_k + k] = f32_to_bf16_bits(best_val);
+                // Mask the winner so the next iteration picks the next highest.
+                if best_idx >= 0 {
+                    probs[best_idx as usize] = f32::NEG_INFINITY;
                 }
             }
-            topk_idx_host[token * top_k + k] = best_idx;
-            topk_weight_host[token * top_k + k] = f32_to_bf16_bits(best_val);
-            // Mask the winner so the next iteration picks the next highest.
-            if best_idx >= 0 {
-                probs[best_idx as usize] = f32::NEG_INFINITY;
+            // Renormalise the top-K weights.
+            let sum_k: f32 = (0..top_k)
+                .map(|k| bf16_bits_to_f32(topk_weight_host[token * top_k + k]))
+                .sum();
+            let inv_k = 1.0f32 / sum_k;
+            for k in 0..top_k {
+                let w = bf16_bits_to_f32(topk_weight_host[token * top_k + k]);
+                topk_weight_host[token * top_k + k] =
+                    f32_to_bf16_bits(bf16_round_rne_f32(w * inv_k));
             }
+            let active_experts: Vec<usize> = (0..top_k)
+                .map(|k| topk_idx_host[token * top_k + k].max(0) as usize)
+                .collect();
+            kernel_ffi::qwen36_moe::qwen36_route_profile_record_active_experts(&active_experts);
         }
-        // Renormalise the top-K weights.
-        let sum_k: f32 = (0..top_k)
-            .map(|k| bf16_bits_to_f32(topk_weight_host[token * top_k + k]))
-            .sum();
-        let inv_k = 1.0f32 / sum_k;
-        for k in 0..top_k {
-            let w = bf16_bits_to_f32(topk_weight_host[token * top_k + k]);
-            topk_weight_host[token * top_k + k] = f32_to_bf16_bits(bf16_round_rne_f32(w * inv_k));
-        }
+        copy_h2d(
+            ordinal,
+            scratch.topk_idx.as_mut_ptr(),
+            topk_idx_host.as_ptr() as *const c_void,
+            topk_idx_host.len() * 4,
+        )
+        .context("h2d topk_idx")?;
+        copy_h2d(
+            ordinal,
+            scratch.topk_weight.as_mut_ptr(),
+            topk_weight_host.as_ptr() as *const c_void,
+            topk_weight_host.len() * 2,
+        )
+        .context("h2d topk_weight")?;
     }
-    copy_h2d(
-        ordinal,
-        scratch.topk_idx.as_mut_ptr(),
-        topk_idx_host.as_ptr() as *const c_void,
-        topk_idx_host.len() * 4,
-    )
-    .context("h2d topk_idx")?;
-    copy_h2d(
-        ordinal,
-        scratch.topk_weight.as_mut_ptr(),
-        topk_weight_host.as_ptr() as *const c_void,
-        topk_weight_host.len() * 2,
-    )
-    .context("h2d topk_weight")?;
 
-    // 4a. M9 router permute.
-    batched_prefill_router_permute_launch(
-        ordinal,
-        n,
-        top_k,
-        num_experts,
-        &scratch.topk_idx,
-        &scratch.topk_weight,
-        &mut scratch.expert_offsets,
-        &mut scratch.permuted_token_idx,
-        &mut scratch.permuted_kpos,
-        &mut scratch.permuted_weight,
-    )
-    .map_err(|e| anyhow!("M9 router permute: {e}"))?;
-
-    // 4b. Build host-side inverse: for each (token, kpos) pair, the dst slot
-    //     in the permuted_*[] arrays. M9's scatter is unstable (atomicAdd
-    //     cursor) so we have to read back permuted_token_idx + permuted_kpos
-    //     to know where each entry landed. O(N * top_k) — trivial cost.
-    let nk = n * top_k;
-    let mut perm_tok = vec![0i32; nk];
-    let mut perm_kpos = vec![0i32; nk];
-    copy_d2h(
-        ordinal,
-        perm_tok.as_mut_ptr() as *mut c_void,
-        scratch.permuted_token_idx.as_ptr(),
-        nk * 4,
-    )
-    .context("d2h permuted_token_idx")?;
-    copy_d2h(
-        ordinal,
-        perm_kpos.as_mut_ptr() as *mut c_void,
-        scratch.permuted_kpos.as_ptr(),
-        nk * 4,
-    )
-    .context("d2h permuted_kpos")?;
-    let mut inverse = vec![-1i32; nk];
-    for dst in 0..nk {
-        let token = perm_tok[dst];
-        let kpos = perm_kpos[dst];
-        if token < 0 || kpos < 0 || token >= n as i32 || kpos >= top_k as i32 {
-            return Err(anyhow!(
-                "M9 permutation out-of-range entry at dst={dst}: token={token} kpos={kpos}"
-            ));
+    if scratch.h_norm.backend() == Backend::Metal {
+        // Metal v1 prototype: keep the same host router/top-k contract but
+        // bypass the HIP M9/M10/M11 permutation kernels with direct batched
+        // routed-expert compute. This is correctness-first and opt-in through
+        // the outer Metal batched-prefill prototype gate.
+        unsafe {
+            kernel_ffi::qwen36_moe::batched_prefill_grouped_expert_direct_metal_launch_raw(
+                ordinal,
+                n,
+                top_k,
+                hidden,
+                moe_intermediate,
+                group_size,
+                &scratch.h_norm,
+                &scratch.topk_idx,
+                &scratch.topk_weight,
+                ffn.gate_up_proj_w.as_ptr(),
+                int4.gate_up_proj_scale.as_ptr(),
+                int4.gate_up_proj_zero.as_ptr(),
+                ffn.down_proj_w.as_ptr(),
+                int4.down_proj_scale.as_ptr(),
+                int4.down_proj_zero.as_ptr(),
+                &mut scratch.expert_mid,
+                &mut scratch.combined,
+            )
         }
-        let logical = token as usize * top_k + kpos as usize;
-        if inverse[logical] != -1 {
-            return Err(anyhow!(
-                "M9 permutation collision at logical entry token={token} kpos={kpos}"
-            ));
-        }
-        inverse[logical] = dst as i32;
-    }
-    for (logical, &v) in inverse.iter().enumerate() {
-        if v < 0 {
-            return Err(anyhow!(
-                "M9 permutation missing entry at logical={logical}"
-            ));
-        }
-    }
-    copy_h2d(
-        ordinal,
-        scratch.permuted_inverse.as_mut_ptr(),
-        inverse.as_ptr() as *const c_void,
-        nk * 4,
-    )
-    .context("h2d permuted_inverse")?;
-
-    // 5. M10 grouped expert GEMM. Counter MUST be zeroed before launch.
-    gpu_hal::memset_zeros(ordinal, scratch.expert_counters.as_mut_ptr(), 4)
-        .context("zero expert_counters")?;
-    // ResidentWeight as_ptr() may point to either a Dense GpuBuffer or a
-    // Virtual VMM allocation; the raw-pointer launcher accepts both.
-    let gate_up_w_ptr = ffn.gate_up_proj_w.as_ptr();
-    let down_w_ptr = ffn.down_proj_w.as_ptr();
-    unsafe {
-        batched_prefill_grouped_expert_launch_raw(
+        .map_err(|e| anyhow!("Metal direct grouped expert: {e}"))?;
+    } else {
+        // 4a. M9 router permute.
+        batched_prefill_router_permute_launch(
             ordinal,
             n,
             top_k,
             num_experts,
-            hidden,
-            moe_intermediate,
-            group_size,
-            &scratch.h_norm,
-            &scratch.expert_offsets,
-            &scratch.permuted_token_idx,
-            gate_up_w_ptr,
-            int4.gate_up_proj_scale.as_ptr(),
-            int4.gate_up_proj_zero.as_ptr(),
-            down_w_ptr,
-            int4.down_proj_scale.as_ptr(),
-            int4.down_proj_zero.as_ptr(),
-            &mut scratch.expert_out,
-            &mut scratch.expert_counters,
+            &scratch.topk_idx,
+            &scratch.topk_weight,
+            &mut scratch.expert_offsets,
+            &mut scratch.permuted_token_idx,
+            &mut scratch.permuted_kpos,
+            &mut scratch.permuted_weight,
         )
-    }
-    .map_err(|e| anyhow!("M10 grouped expert: {e}"))?;
+        .map_err(|e| anyhow!("M9 router permute: {e}"))?;
 
-    // 6. M11 unpermute + weighted combine.
-    batched_prefill_unpermute_combine_launch(
-        ordinal,
-        n,
-        top_k,
-        hidden,
-        &scratch.permuted_inverse,
-        &scratch.permuted_weight,
-        &scratch.expert_out,
-        &mut scratch.combined,
-    )
-    .map_err(|e| anyhow!("M11 unpermute combine: {e}"))?;
+        // 4b. Build host-side inverse: for each (token, kpos) pair, the dst slot
+        //     in the permuted_*[] arrays. M9's scatter is unstable (atomicAdd
+        //     cursor) so we have to read back permuted_token_idx + permuted_kpos
+        //     to know where each entry landed. O(N * top_k) — trivial cost.
+        let nk = n * top_k;
+        let mut perm_tok = vec![0i32; nk];
+        let mut perm_kpos = vec![0i32; nk];
+        copy_d2h(
+            ordinal,
+            perm_tok.as_mut_ptr() as *mut c_void,
+            scratch.permuted_token_idx.as_ptr(),
+            nk * 4,
+        )
+        .context("d2h permuted_token_idx")?;
+        copy_d2h(
+            ordinal,
+            perm_kpos.as_mut_ptr() as *mut c_void,
+            scratch.permuted_kpos.as_ptr(),
+            nk * 4,
+        )
+        .context("d2h permuted_kpos")?;
+        let mut inverse = vec![-1i32; nk];
+        for dst in 0..nk {
+            let token = perm_tok[dst];
+            let kpos = perm_kpos[dst];
+            if token < 0 || kpos < 0 || token >= n as i32 || kpos >= top_k as i32 {
+                return Err(anyhow!(
+                    "M9 permutation out-of-range entry at dst={dst}: token={token} kpos={kpos}"
+                ));
+            }
+            let logical = token as usize * top_k + kpos as usize;
+            if inverse[logical] != -1 {
+                return Err(anyhow!(
+                    "M9 permutation collision at logical entry token={token} kpos={kpos}"
+                ));
+            }
+            inverse[logical] = dst as i32;
+        }
+        for (logical, &v) in inverse.iter().enumerate() {
+            if v < 0 {
+                return Err(anyhow!("M9 permutation missing entry at logical={logical}"));
+            }
+        }
+        copy_h2d(
+            ordinal,
+            scratch.permuted_inverse.as_mut_ptr(),
+            inverse.as_ptr() as *const c_void,
+            nk * 4,
+        )
+        .context("h2d permuted_inverse")?;
+
+        // 5. M10 grouped expert GEMM. Counter MUST be zeroed before launch.
+        gpu_hal::memset_zeros(ordinal, scratch.expert_counters.as_mut_ptr(), 4)
+            .context("zero expert_counters")?;
+        // ResidentWeight as_ptr() may point to either a Dense GpuBuffer or a
+        // Virtual VMM allocation; the raw-pointer launcher accepts both.
+        let gate_up_w_ptr = ffn.gate_up_proj_w.as_ptr();
+        let down_w_ptr = ffn.down_proj_w.as_ptr();
+        unsafe {
+            batched_prefill_grouped_expert_launch_raw(
+                ordinal,
+                n,
+                top_k,
+                num_experts,
+                hidden,
+                moe_intermediate,
+                group_size,
+                &scratch.h_norm,
+                &scratch.expert_offsets,
+                &scratch.permuted_token_idx,
+                gate_up_w_ptr,
+                int4.gate_up_proj_scale.as_ptr(),
+                int4.gate_up_proj_zero.as_ptr(),
+                down_w_ptr,
+                int4.down_proj_scale.as_ptr(),
+                int4.down_proj_zero.as_ptr(),
+                &mut scratch.expert_out,
+                &mut scratch.expert_counters,
+            )
+        }
+        .map_err(|e| anyhow!("M10 grouped expert: {e}"))?;
+
+        // 6. M11 unpermute + weighted combine.
+        batched_prefill_unpermute_combine_launch(
+            ordinal,
+            n,
+            top_k,
+            hidden,
+            &scratch.permuted_inverse,
+            &scratch.permuted_weight,
+            &scratch.expert_out,
+            &mut scratch.combined,
+        )
+        .map_err(|e| anyhow!("M11 unpermute combine: {e}"))?;
+    }
+    if let Some(batch) = metal_router_expert_batch {
+        batch
+            .finish()
+            .map_err(|e| anyhow!("finish Metal router/expert FFN batch: {e}"))?;
+    }
 
     // 7. Shared expert (batched primitives).
     //
@@ -2059,77 +2239,80 @@ fn process_ffn_batched_grouped(
     )
     .map_err(|e| anyhow!("matmul shared_expert_gate: {e}"))?;
     //    7f. shared_out = sigmoid(shared_gate_scalar) * shared_down.
-    //         The scalar gate is broadcast across the hidden dim per token.
-    //         `sigmoid_mul(data, gate)` computes `data * sigmoid(gate)` over
-    //         matching shapes — but our gate is [N, 1] and data is [N, hidden].
-    //         We expand the gate to [N, hidden] on the host (cheap) and call
-    //         sigmoid_mul over the full N*hidden span.
-    expand_scalar_gate_bf16(
-        ordinal,
-        n,
-        hidden,
-        &scratch.shared_gate_scalar,
-        &mut scratch.shared_out, // reuse shared_out as the temp expanded gate
-    )?;
-    // Now shared_out holds the broadcast gate; we want out = down * sigmoid(gate).
-    // sigmoid_mul writes into the OUT slot from data + gate. Use a temporary
-    // alias: data=shared_down, gate=shared_out (expanded gate), out=shared_out
-    // — sigmoid_mul reads gate and data, then writes out. Aliasing out=gate is
-    // safe as long as the kernel reads gate before writing out per-element
-    // (it does). To be defensive, allocate a tiny temp. The cleanest path is
-    // to use a separate output: we'll reuse `shared_silu_mul` shape doesn't
-    // match (it's [N, shared_intermediate]) — so we need [N, hidden]. The
-    // simplest defensive fix is a local temporary. Allocation per layer is
-    // wasteful; instead we sequence: compute shared_out_temp into a separate
-    // buffer. But to keep the scratch struct stable, use a `combined`-shaped
-    // temp. Actually, sigmoid_mul on HIP reads both inputs into registers
-    // before writing the output (kernel `pfx_sigmoid_mul` uses `out[i] =
-    // data[i] * sigmoid(gate[i])` per thread — single load each), so
-    // out aliasing gate is safe. Verified in
-    // `kernels/qwen35_prefill/sigmoid_mul.hip` style kernels.
-    //
-    // Be conservative: allocate a transient buffer instead of relying on
-    // alias-safety semantics that may shift between backends. Cost is one
-    // alloc per layer per chunk = 40 * num_chunks; tiny.
-    let mut shared_out_final =
-        GpuBuffer::zeros(ordinal, ScalarType::BF16, &[n, hidden])
-            .context("alloc shared_out_final temp")?;
-    prefill_ffi::sigmoid_mul(
-        ordinal,
-        ScalarType::BF16,
-        n * hidden,
-        &scratch.shared_down,
-        &scratch.shared_out, // expanded gate
-        &mut shared_out_final,
-    )
-    .map_err(|e| anyhow!("sigmoid_mul shared: {e}"))?;
-    // Copy final result back into `scratch.shared_out` so downstream
-    // residual-add reads the right buffer.
-    gpu_hal::copy_d2d(
-        ordinal,
-        scratch.shared_out.as_mut_ptr(),
-        shared_out_final.as_ptr(),
-        n * hidden * 2,
-    )
-    .context("d2d shared_out_final -> shared_out")?;
+    //         Metal uses a row-scalar kernel so the `[N, 1]` gate never
+    //         round-trips through host memory as an expanded `[N, hidden]`
+    //         buffer. HIP/CUDA keep the older explicit expansion path for now.
+    if scratch.shared_down.backend() == Backend::Metal {
+        prefill_ffi::sigmoid_mul_row_scalar_bf16(
+            ordinal,
+            n,
+            hidden,
+            &scratch.shared_down,
+            &scratch.shared_gate_scalar,
+            &mut scratch.shared_out,
+        )
+        .map_err(|e| anyhow!("sigmoid_mul_row_scalar shared: {e}"))?;
+    } else {
+        expand_scalar_gate_bf16(
+            ordinal,
+            n,
+            hidden,
+            &scratch.shared_gate_scalar,
+            &mut scratch.shared_out, // reuse shared_out as the temp expanded gate
+        )?;
+        prefill_ffi::sigmoid_mul(
+            ordinal,
+            ScalarType::BF16,
+            n * hidden,
+            &scratch.shared_down,
+            &scratch.shared_out,
+            &mut scratch.shared_out_final,
+        )
+        .map_err(|e| anyhow!("sigmoid_mul shared: {e}"))?;
+        gpu_hal::copy_d2d(
+            ordinal,
+            scratch.shared_out.as_mut_ptr(),
+            scratch.shared_out_final.as_ptr(),
+            n * hidden * 2,
+        )
+        .context("d2d shared_out_final -> shared_out")?;
+    }
 
     // 8. Residual add: chunk_hidden += combined; chunk_hidden += shared_out.
-    prefill_ffi::element_add_inplace(
-        ordinal,
-        ScalarType::BF16,
-        n * hidden,
-        chunk_hidden,
-        &scratch.combined,
-    )
-    .map_err(|e| anyhow!("residual add (combined): {e}"))?;
-    prefill_ffi::element_add_inplace(
-        ordinal,
-        ScalarType::BF16,
-        n * hidden,
-        chunk_hidden,
-        &scratch.shared_out,
-    )
-    .map_err(|e| anyhow!("residual add (shared_out): {e}"))?;
+    // Opt-in diagnostic only: the fused Metal residual-add path preserves the
+    // two BF16 rounding points, but the current M5 Max smoke was slower than
+    // the existing two-add sequence.
+    let use_metal_fused_residual = chunk_hidden.backend() == Backend::Metal
+        && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
+        && std::env::var("SUPERSONIC_QWEN36_MOE_METAL_FUSED_FFN_RESIDUAL")
+            .map(|v| v != "0")
+            .unwrap_or(false);
+    if use_metal_fused_residual {
+        prefill_ffi::qwen36_ffn_residual_add_bf16(
+            n * hidden,
+            chunk_hidden,
+            &scratch.combined,
+            &scratch.shared_out,
+        )
+        .map_err(|e| anyhow!("fused residual add (combined + shared_out): {e}"))?;
+    } else {
+        prefill_ffi::element_add_inplace(
+            ordinal,
+            ScalarType::BF16,
+            n * hidden,
+            chunk_hidden,
+            &scratch.combined,
+        )
+        .map_err(|e| anyhow!("residual add (combined): {e}"))?;
+        prefill_ffi::element_add_inplace(
+            ordinal,
+            ScalarType::BF16,
+            n * hidden,
+            chunk_hidden,
+            &scratch.shared_out,
+        )
+        .map_err(|e| anyhow!("residual add (shared_out): {e}"))?;
+    }
 
     // Touch unused fields to keep the compiler happy on cfg(feature) gates.
     let _ = (geom, scratch.num_experts, scratch.top_k);

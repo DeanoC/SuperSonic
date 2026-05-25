@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Result};
 use clap::Parser;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use supersonic_bench::matrix::{run_matrix, BenchArch, MatrixConfig};
@@ -67,6 +68,10 @@ fn main() -> Result<()> {
     let quants = filter_csv(&cli.quants, combos.iter().map(|c| c.quant));
 
     let git_sha = capture_git_sha();
+    let git_status = capture_git_status_porcelain();
+    let git_dirty_paths = parse_git_dirty_paths(&git_status);
+    let git_dirty = !git_dirty_paths.is_empty();
+    let git_diff_hash = capture_git_diff_hash(&git_status);
     let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
     std::fs::create_dir_all(&cli.run_root)?;
     let run_path = allocate_run_dir(&cli.run_root, &git_sha, &today);
@@ -117,6 +122,9 @@ fn main() -> Result<()> {
         measurement_runs: cli.measurement_runs,
         cooldown_seconds: cli.cooldown_seconds,
         git_sha,
+        git_dirty,
+        git_dirty_paths,
+        git_diff_hash,
         runner_version,
     };
     run_matrix(&cfg, &rd)?;
@@ -163,6 +171,48 @@ fn capture_git_sha() -> String {
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_else(|_| "unknown".into())
+}
+
+fn capture_git_status_porcelain() -> String {
+    std::process::Command::new("git")
+        .args(["status", "--porcelain=v1", "--untracked-files=all"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default()
+}
+
+fn parse_git_dirty_paths(status: &str) -> Vec<String> {
+    status
+        .lines()
+        .filter_map(|line| {
+            if line.len() < 4 {
+                return None;
+            }
+            let path = line[3..].trim();
+            if path.is_empty() {
+                return None;
+            }
+            Some(
+                path.split_once(" -> ")
+                    .map(|(_, new_path)| new_path)
+                    .unwrap_or(path)
+                    .trim_matches('"')
+                    .to_string(),
+            )
+        })
+        .collect()
+}
+
+fn capture_git_diff_hash(status: &str) -> Option<String> {
+    let diff = std::process::Command::new("git")
+        .args(["diff", "--binary", "HEAD"])
+        .output()
+        .ok()?;
+    let mut hasher = Sha256::new();
+    hasher.update(status.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(&diff.stdout);
+    Some(format!("{:x}", hasher.finalize()))
 }
 
 fn capture_runner_version(binary: &PathBuf) -> String {

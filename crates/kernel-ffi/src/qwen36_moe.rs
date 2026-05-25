@@ -17,12 +17,1072 @@
     allow(unused_variables, unused_mut, unreachable_code)
 )]
 
+use std::collections::{HashMap, VecDeque};
 use std::ffi::{c_int, c_void};
 use std::os::raw::c_uint;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
-use gpu_hal::{Backend, GpuBuffer, GpuError, ScalarType};
+use gpu_hal::{Backend, BufferKind, GpuBuffer, GpuError, ScalarType};
+use half::f16;
 
 use crate::layer_desc::MAX_BATCH_SIZE;
+
+const QWEN36_ROUTE_PROFILE_DEFAULT_LAYERS: usize = 40;
+const QWEN36_ROUTE_PROFILE_DEFAULT_MAX_CALLS: usize = 16_384;
+const QWEN36_ROUTE_PROFILE_DEFAULT_CAPS: [usize; 6] = [2, 4, 8, 16, 32, 64];
+const QWEN36_BATCHED_PREFILL_PLAN_CHUNKS: [usize; 5] = [64, 128, 256, 512, 1024];
+
+static QWEN36_ROUTE_PROFILE: OnceLock<Mutex<Qwen36RouteProfileAccumulator>> = OnceLock::new();
+static QWEN36_EXPERT_RESIDENCY_PROFILE: OnceLock<Mutex<Qwen36ExpertResidencyProfileAccumulator>> =
+    OnceLock::new();
+static QWEN36_BATCHED_PREFILL_FEASIBILITY_PROFILE: OnceLock<
+    Mutex<Qwen36BatchedPrefillFeasibilityConfig>,
+> = OnceLock::new();
+static QWEN36_FFN_ROUTER_PARITY_TAP_CALLS: AtomicUsize = AtomicUsize::new(0);
+static QWEN36_FFN_SHARED_PARITY_TAP_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Debug, Clone, Default)]
+struct Qwen36RouteProfileAccumulator {
+    records: Vec<Vec<u16>>,
+    dropped_calls: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Qwen36RouteProfileSnapshot {
+    pub calls: u64,
+    pub dropped_calls: u64,
+    pub layers: usize,
+    pub assignments: u64,
+    pub unique_layer_experts: usize,
+    pub adjacent_hits: u64,
+    pub adjacent_total: u64,
+    pub cache_sims: Vec<Qwen36RouteCacheSim>,
+    pub topn_sims: Vec<Qwen36RouteTopNSim>,
+    pub topn_layers: Vec<Qwen36RouteTopNLayer>,
+    pub route_calls: Vec<Qwen36RouteCall>,
+}
+
+impl Qwen36RouteProfileSnapshot {
+    pub fn adjacent_hit_rate(&self) -> f64 {
+        if self.adjacent_total == 0 {
+            0.0
+        } else {
+            self.adjacent_hits as f64 / self.adjacent_total as f64
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Qwen36RouteCacheSim {
+    pub capacity: usize,
+    pub hits: u64,
+    pub misses: u64,
+}
+
+impl Qwen36RouteCacheSim {
+    pub fn hit_rate(&self) -> f64 {
+        let total = self.hits + self.misses;
+        if total == 0 {
+            0.0
+        } else {
+            self.hits as f64 / total as f64
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Qwen36RouteTopNSim {
+    pub capacity: usize,
+    pub covered: u64,
+    pub total: u64,
+}
+
+impl Qwen36RouteTopNSim {
+    pub fn coverage(&self) -> f64 {
+        if self.total == 0 {
+            0.0
+        } else {
+            self.covered as f64 / self.total as f64
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Qwen36RouteTopNLayer {
+    pub capacity: usize,
+    pub layer: usize,
+    pub experts: Vec<u16>,
+    pub counts: Vec<u64>,
+    pub covered: u64,
+    pub total: u64,
+}
+
+impl Qwen36RouteTopNLayer {
+    pub fn coverage(&self) -> f64 {
+        if self.total == 0 {
+            0.0
+        } else {
+            self.covered as f64 / self.total as f64
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Qwen36RouteCall {
+    pub call_idx: usize,
+    pub layer: usize,
+    pub experts: Vec<u16>,
+}
+
+#[derive(Debug, Clone)]
+struct Qwen36BatchedPrefillFeasibilityConfig {
+    layers: usize,
+    top_k: usize,
+    num_experts: usize,
+    chunk_size: usize,
+    prefill_tokens: usize,
+}
+
+impl Default for Qwen36BatchedPrefillFeasibilityConfig {
+    fn default() -> Self {
+        Self {
+            layers: QWEN36_ROUTE_PROFILE_DEFAULT_LAYERS,
+            top_k: 8,
+            num_experts: 256,
+            chunk_size: 512,
+            prefill_tokens: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Qwen36BatchedPrefillFeasibilityProfileSnapshot {
+    pub calls: u64,
+    pub dropped_calls: u64,
+    pub layers: usize,
+    pub top_k: usize,
+    pub num_experts: usize,
+    pub chunk_size: usize,
+    pub prefill_tokens: usize,
+    pub profiled_tokens: usize,
+    pub chunks: usize,
+    pub assignments: u64,
+    pub permutation_entries: u64,
+    pub expert_segments: u64,
+    pub wmma16_segments: u64,
+    pub wmma16_covered_assignments: u64,
+    pub wmma16_padded_assignments: u64,
+    pub scalar_tail_segments: u64,
+    pub scalar_tail_assignments: u64,
+    pub max_rows_per_segment: u64,
+    pub max_unique_experts_per_layer_chunk: usize,
+}
+
+impl Qwen36BatchedPrefillFeasibilityProfileSnapshot {
+    pub fn avg_unique_experts_per_layer_chunk(&self) -> f64 {
+        let denom = self.chunks.saturating_mul(self.layers);
+        if denom == 0 {
+            0.0
+        } else {
+            self.expert_segments as f64 / denom as f64
+        }
+    }
+
+    pub fn avg_rows_per_segment(&self) -> f64 {
+        if self.expert_segments == 0 {
+            0.0
+        } else {
+            self.assignments as f64 / self.expert_segments as f64
+        }
+    }
+
+    pub fn wmma16_assignment_coverage(&self) -> f64 {
+        if self.assignments == 0 {
+            0.0
+        } else {
+            self.wmma16_covered_assignments as f64 / self.assignments as f64
+        }
+    }
+
+    pub fn wmma16_padding_overhead(&self) -> f64 {
+        if self.assignments == 0 {
+            0.0
+        } else {
+            self.wmma16_padded_assignments
+                .saturating_sub(self.assignments) as f64
+                / self.assignments as f64
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Qwen36ExpertResidentFormat {
+    NativeInt4,
+    Fp16Mps,
+}
+
+impl Qwen36ExpertResidentFormat {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NativeInt4 => "native_int4",
+            Self::Fp16Mps => "fp16_mps",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Qwen36ExpertResidencyScope {
+    PerLayer,
+}
+
+impl Qwen36ExpertResidencyScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PerLayer => "per_layer",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Qwen36ExpertResidencyMissPolicy {
+    ExactRoute,
+    LruHotset,
+    GpuPack,
+    StaticTopN,
+}
+
+impl Qwen36ExpertResidencyMissPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ExactRoute => "exact_route",
+            Self::LruHotset => "lru_hotset",
+            Self::GpuPack => "gpu_pack",
+            Self::StaticTopN => "static_topn",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Qwen36ExpertResidencyProfileKey {
+    pub resident_format: Qwen36ExpertResidentFormat,
+    pub scope: Qwen36ExpertResidencyScope,
+    pub miss_policy: Qwen36ExpertResidencyMissPolicy,
+    pub capacity: usize,
+}
+
+impl Qwen36ExpertResidencyProfileKey {
+    fn new(miss_policy: Qwen36ExpertResidencyMissPolicy, capacity: usize) -> Self {
+        Self::with_format(
+            Qwen36ExpertResidentFormat::NativeInt4,
+            miss_policy,
+            capacity,
+        )
+    }
+
+    fn with_format(
+        resident_format: Qwen36ExpertResidentFormat,
+        miss_policy: Qwen36ExpertResidencyMissPolicy,
+        capacity: usize,
+    ) -> Self {
+        Self {
+            resident_format,
+            scope: Qwen36ExpertResidencyScope::PerLayer,
+            miss_policy,
+            capacity,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct Qwen36ExpertResidencyCounters {
+    calls: u64,
+    exact_hits: u64,
+    route_refills: u64,
+    allocations: u64,
+    copied_bytes: u64,
+    active_groups_total: u64,
+    max_active_groups: usize,
+    slot_hits: u64,
+    slot_misses: u64,
+    evictions: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct Qwen36ExpertResidencyProfileAccumulator {
+    totals: Qwen36ExpertResidencyCounters,
+    policies: HashMap<Qwen36ExpertResidencyProfileKey, Qwen36ExpertResidencyCounters>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Qwen36ExpertResidencyPolicySnapshot {
+    pub resident_format: &'static str,
+    pub scope: &'static str,
+    pub miss_policy: &'static str,
+    pub capacity: usize,
+    pub calls: u64,
+    pub exact_hits: u64,
+    pub route_refills: u64,
+    pub allocations: u64,
+    pub copied_bytes: u64,
+    pub active_groups_total: u64,
+    pub max_active_groups: usize,
+    pub slot_hits: u64,
+    pub slot_misses: u64,
+    pub evictions: u64,
+}
+
+impl Qwen36ExpertResidencyPolicySnapshot {
+    pub fn exact_hit_rate(&self) -> f64 {
+        if self.calls == 0 {
+            0.0
+        } else {
+            self.exact_hits as f64 / self.calls as f64
+        }
+    }
+
+    pub fn avg_active_groups(&self) -> f64 {
+        if self.calls == 0 {
+            0.0
+        } else {
+            self.active_groups_total as f64 / self.calls as f64
+        }
+    }
+
+    pub fn avg_copied_bytes(&self) -> f64 {
+        let copy_ops = self.route_refills + self.allocations;
+        if copy_ops == 0 {
+            0.0
+        } else {
+            self.copied_bytes as f64 / copy_ops as f64
+        }
+    }
+
+    pub fn slot_hit_rate(&self) -> f64 {
+        let total = self.slot_hits + self.slot_misses;
+        if total == 0 {
+            0.0
+        } else {
+            self.slot_hits as f64 / total as f64
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Qwen36ExpertResidencyProfileSnapshot {
+    pub calls: u64,
+    pub exact_hits: u64,
+    pub route_refills: u64,
+    pub allocations: u64,
+    pub copied_bytes: u64,
+    pub active_groups_total: u64,
+    pub max_active_groups: usize,
+    pub entries: usize,
+    pub slot_hits: u64,
+    pub slot_misses: u64,
+    pub evictions: u64,
+    pub policies: Vec<Qwen36ExpertResidencyPolicySnapshot>,
+}
+
+impl Qwen36ExpertResidencyProfileSnapshot {
+    pub fn exact_hit_rate(&self) -> f64 {
+        if self.calls == 0 {
+            0.0
+        } else {
+            self.exact_hits as f64 / self.calls as f64
+        }
+    }
+
+    pub fn avg_active_groups(&self) -> f64 {
+        if self.calls == 0 {
+            0.0
+        } else {
+            self.active_groups_total as f64 / self.calls as f64
+        }
+    }
+
+    pub fn avg_copied_bytes(&self) -> f64 {
+        let copy_ops = self.route_refills + self.allocations;
+        if copy_ops == 0 {
+            0.0
+        } else {
+            self.copied_bytes as f64 / copy_ops as f64
+        }
+    }
+
+    pub fn slot_hit_rate(&self) -> f64 {
+        let total = self.slot_hits + self.slot_misses;
+        if total == 0 {
+            0.0
+        } else {
+            self.slot_hits as f64 / total as f64
+        }
+    }
+}
+
+pub type Qwen36PackedExpertCacheProfileSnapshot = Qwen36ExpertResidencyProfileSnapshot;
+
+#[allow(clippy::too_many_arguments)]
+fn qwen36_expert_residency_counters_record(
+    counters: &mut Qwen36ExpertResidencyCounters,
+    exact_hit: bool,
+    route_refill: bool,
+    allocation: bool,
+    active_groups: usize,
+    copied_bytes: usize,
+    slot_hits: usize,
+    slot_misses: usize,
+    evictions: usize,
+) {
+    counters.calls += 1;
+    counters.active_groups_total += active_groups as u64;
+    counters.max_active_groups = counters.max_active_groups.max(active_groups);
+    if exact_hit {
+        counters.exact_hits += 1;
+    }
+    if route_refill {
+        counters.route_refills += 1;
+    }
+    if allocation {
+        counters.allocations += 1;
+    }
+    counters.copied_bytes += copied_bytes as u64;
+    counters.slot_hits += slot_hits as u64;
+    counters.slot_misses += slot_misses as u64;
+    counters.evictions += evictions as u64;
+}
+
+pub fn qwen36_route_profile_reset() {
+    if let Some(profile) = QWEN36_ROUTE_PROFILE.get() {
+        let mut profile = profile.lock().expect("qwen36 route profile mutex poisoned");
+        profile.records.clear();
+        profile.dropped_calls = 0;
+    }
+}
+
+pub fn qwen36_batched_prefill_feasibility_profile_reset() {
+    if let Some(profile) = QWEN36_BATCHED_PREFILL_FEASIBILITY_PROFILE.get() {
+        let mut profile = profile
+            .lock()
+            .expect("qwen36 batched prefill feasibility profile mutex poisoned");
+        *profile = Qwen36BatchedPrefillFeasibilityConfig::default();
+    }
+}
+
+pub fn qwen36_route_profile_snapshot() -> Qwen36RouteProfileSnapshot {
+    let Some(profile) = QWEN36_ROUTE_PROFILE.get() else {
+        return Qwen36RouteProfileSnapshot::default();
+    };
+    let profile = profile.lock().expect("qwen36 route profile mutex poisoned");
+    qwen36_route_profile_simulate(
+        &profile.records,
+        profile.dropped_calls,
+        qwen36_route_profile_layers(),
+    )
+}
+
+pub fn qwen36_batched_prefill_feasibility_profile_configure(
+    layers: usize,
+    top_k: usize,
+    num_experts: usize,
+    chunk_size: usize,
+    prefill_tokens: usize,
+) {
+    let profile = QWEN36_BATCHED_PREFILL_FEASIBILITY_PROFILE
+        .get_or_init(|| Mutex::new(Qwen36BatchedPrefillFeasibilityConfig::default()));
+    let mut profile = profile
+        .lock()
+        .expect("qwen36 batched prefill feasibility profile mutex poisoned");
+    *profile = Qwen36BatchedPrefillFeasibilityConfig {
+        layers: layers.max(1),
+        top_k: top_k.max(1),
+        num_experts: num_experts.max(1),
+        chunk_size: chunk_size.max(1),
+        prefill_tokens,
+    };
+}
+
+pub fn qwen36_batched_prefill_feasibility_profile_snapshot(
+) -> Qwen36BatchedPrefillFeasibilityProfileSnapshot {
+    let Some(route_profile) = QWEN36_ROUTE_PROFILE.get() else {
+        return Qwen36BatchedPrefillFeasibilityProfileSnapshot::default();
+    };
+    let route_profile = route_profile
+        .lock()
+        .expect("qwen36 route profile mutex poisoned");
+    let config = QWEN36_BATCHED_PREFILL_FEASIBILITY_PROFILE
+        .get()
+        .map(|profile| {
+            profile
+                .lock()
+                .expect("qwen36 batched prefill feasibility profile mutex poisoned")
+                .clone()
+        })
+        .unwrap_or_default();
+    qwen36_batched_prefill_feasibility_profile_simulate(
+        &route_profile.records,
+        route_profile.dropped_calls,
+        &config,
+    )
+}
+
+pub fn qwen36_batched_prefill_feasibility_plan_snapshots(
+) -> Vec<Qwen36BatchedPrefillFeasibilityProfileSnapshot> {
+    let Some(route_profile) = QWEN36_ROUTE_PROFILE.get() else {
+        return Vec::new();
+    };
+    let route_profile = route_profile
+        .lock()
+        .expect("qwen36 route profile mutex poisoned");
+    let config = QWEN36_BATCHED_PREFILL_FEASIBILITY_PROFILE
+        .get()
+        .map(|profile| {
+            profile
+                .lock()
+                .expect("qwen36 batched prefill feasibility profile mutex poisoned")
+                .clone()
+        })
+        .unwrap_or_default();
+    let mut chunk_sizes = qwen36_batched_prefill_plan_chunk_sizes(config.chunk_size);
+    chunk_sizes.sort_unstable();
+    chunk_sizes.dedup();
+    chunk_sizes
+        .into_iter()
+        .map(|chunk_size| {
+            let mut plan_config = config.clone();
+            plan_config.chunk_size = chunk_size.max(1);
+            qwen36_batched_prefill_feasibility_profile_simulate(
+                &route_profile.records,
+                route_profile.dropped_calls,
+                &plan_config,
+            )
+        })
+        .collect()
+}
+
+pub fn qwen36_packed_expert_cache_profile_reset() {
+    qwen36_expert_residency_profile_reset();
+}
+
+pub fn qwen36_expert_residency_profile_reset() {
+    if let Some(profile) = QWEN36_EXPERT_RESIDENCY_PROFILE.get() {
+        *profile
+            .lock()
+            .expect("qwen36 expert residency profile mutex poisoned") =
+            Qwen36ExpertResidencyProfileAccumulator::default();
+    }
+}
+
+pub fn qwen36_packed_expert_cache_profile_snapshot() -> Qwen36PackedExpertCacheProfileSnapshot {
+    qwen36_expert_residency_profile_snapshot()
+}
+
+pub fn qwen36_expert_residency_profile_snapshot() -> Qwen36ExpertResidencyProfileSnapshot {
+    let entries = QWEN36_PACKED_EXPERT_CACHE
+        .get()
+        .and_then(|cache| cache.lock().ok().map(|cache| cache.len()))
+        .unwrap_or(0)
+        + QWEN36_PACKED_EXPERT_HOTSET_CACHE
+            .get()
+            .and_then(|cache| cache.lock().ok().map(|cache| cache.len()))
+            .unwrap_or(0)
+        + QWEN36_PACKED_EXPERT_STATIC_TOPN_CACHE
+            .get()
+            .and_then(|cache| cache.lock().ok().map(|cache| cache.len()))
+            .unwrap_or(0)
+        + QWEN36_MPS_EXPERT_STATIC_TOPN_CACHE
+            .get()
+            .and_then(|cache| cache.lock().ok().map(|cache| cache.len()))
+            .unwrap_or(0);
+    let Some(profile) = QWEN36_EXPERT_RESIDENCY_PROFILE.get() else {
+        return Qwen36ExpertResidencyProfileSnapshot {
+            entries,
+            ..Qwen36ExpertResidencyProfileSnapshot::default()
+        };
+    };
+    let profile = profile
+        .lock()
+        .expect("qwen36 expert residency profile mutex poisoned");
+    let mut policies: Vec<_> = profile
+        .policies
+        .iter()
+        .map(|(key, counters)| Qwen36ExpertResidencyPolicySnapshot {
+            resident_format: key.resident_format.as_str(),
+            scope: key.scope.as_str(),
+            miss_policy: key.miss_policy.as_str(),
+            capacity: key.capacity,
+            calls: counters.calls,
+            exact_hits: counters.exact_hits,
+            route_refills: counters.route_refills,
+            allocations: counters.allocations,
+            copied_bytes: counters.copied_bytes,
+            active_groups_total: counters.active_groups_total,
+            max_active_groups: counters.max_active_groups,
+            slot_hits: counters.slot_hits,
+            slot_misses: counters.slot_misses,
+            evictions: counters.evictions,
+        })
+        .collect();
+    policies.sort_by_key(|policy| {
+        (
+            policy.resident_format,
+            policy.scope,
+            policy.miss_policy,
+            policy.capacity,
+        )
+    });
+    Qwen36ExpertResidencyProfileSnapshot {
+        calls: profile.totals.calls,
+        exact_hits: profile.totals.exact_hits,
+        route_refills: profile.totals.route_refills,
+        allocations: profile.totals.allocations,
+        copied_bytes: profile.totals.copied_bytes,
+        active_groups_total: profile.totals.active_groups_total,
+        max_active_groups: profile.totals.max_active_groups,
+        entries,
+        slot_hits: profile.totals.slot_hits,
+        slot_misses: profile.totals.slot_misses,
+        evictions: profile.totals.evictions,
+        policies,
+    }
+}
+
+fn qwen36_route_profile_enabled() -> bool {
+    crate::prefill_ffi::metal_profile_enabled()
+        || std::env::var_os("SUPERSONIC_QWEN36_ROUTE_PROFILE").is_some()
+        || std::env::var_os("SUPERSONIC_QWEN36_ROUTE_PROFILE_DUMP_CALLS").is_some()
+        || std::env::var_os("SUPERSONIC_QWEN36_ROUTE_PROFILE_DUMP_TOPN_LAYERS").is_some()
+        || std::env::var_os("SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL_FEASIBILITY").is_some()
+}
+
+pub fn qwen36_batched_prefill_feasibility_profile_enabled() -> bool {
+    crate::prefill_ffi::metal_profile_enabled()
+        || std::env::var_os("SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL_FEASIBILITY").is_some()
+}
+
+pub fn qwen36_route_profile_record_active_experts(active_experts: &[usize]) {
+    if qwen36_route_profile_enabled() {
+        qwen36_route_profile_record(active_experts);
+    }
+}
+
+fn qwen36_batched_prefill_plan_chunk_sizes(current_chunk_size: usize) -> Vec<usize> {
+    let mut sizes: Vec<usize> =
+        if let Ok(raw) = std::env::var("SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL_PLAN_CHUNKS") {
+            raw.split(',')
+                .filter_map(|part| part.trim().parse::<usize>().ok())
+                .filter(|&chunk| chunk > 0)
+                .collect()
+        } else {
+            QWEN36_BATCHED_PREFILL_PLAN_CHUNKS.to_vec()
+        };
+    sizes.push(current_chunk_size.max(1));
+    sizes
+}
+
+fn qwen36_expert_residency_profile_enabled() -> bool {
+    crate::prefill_ffi::metal_profile_enabled()
+        || std::env::var_os("SUPERSONIC_QWEN36_EXPERT_RESIDENCY_PROFILE").is_some()
+        || std::env::var_os("SUPERSONIC_QWEN36_PACK_CACHE_PROFILE").is_some()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen36_expert_residency_profile_record(
+    key: Qwen36ExpertResidencyProfileKey,
+    exact_hit: bool,
+    route_refill: bool,
+    allocation: bool,
+    active_groups: usize,
+    copied_bytes: usize,
+    slot_hits: usize,
+    slot_misses: usize,
+    evictions: usize,
+) {
+    if !qwen36_expert_residency_profile_enabled() {
+        return;
+    }
+    let profile = QWEN36_EXPERT_RESIDENCY_PROFILE
+        .get_or_init(|| Mutex::new(Qwen36ExpertResidencyProfileAccumulator::default()));
+    let mut profile = profile
+        .lock()
+        .expect("qwen36 expert residency profile mutex poisoned");
+    qwen36_expert_residency_counters_record(
+        &mut profile.totals,
+        exact_hit,
+        route_refill,
+        allocation,
+        active_groups,
+        copied_bytes,
+        slot_hits,
+        slot_misses,
+        evictions,
+    );
+    let policy = profile.policies.entry(key).or_default();
+    qwen36_expert_residency_counters_record(
+        policy,
+        exact_hit,
+        route_refill,
+        allocation,
+        active_groups,
+        copied_bytes,
+        slot_hits,
+        slot_misses,
+        evictions,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen36_packed_expert_cache_profile_record(
+    exact_hit: bool,
+    route_refill: bool,
+    allocation: bool,
+    active_groups: usize,
+    copied_bytes: usize,
+    slot_hits: usize,
+    slot_misses: usize,
+    evictions: usize,
+) {
+    qwen36_expert_residency_profile_record(
+        Qwen36ExpertResidencyProfileKey::new(
+            Qwen36ExpertResidencyMissPolicy::ExactRoute,
+            active_groups,
+        ),
+        exact_hit,
+        route_refill,
+        allocation,
+        active_groups,
+        copied_bytes,
+        slot_hits,
+        slot_misses,
+        evictions,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen36_hotset_expert_residency_profile_record(
+    capacity: usize,
+    exact_hit: bool,
+    route_refill: bool,
+    allocation: bool,
+    active_groups: usize,
+    copied_bytes: usize,
+    slot_hits: usize,
+    slot_misses: usize,
+    evictions: usize,
+) {
+    qwen36_expert_residency_profile_record(
+        Qwen36ExpertResidencyProfileKey::new(Qwen36ExpertResidencyMissPolicy::LruHotset, capacity),
+        exact_hit,
+        route_refill,
+        allocation,
+        active_groups,
+        copied_bytes,
+        slot_hits,
+        slot_misses,
+        evictions,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen36_static_topn_expert_residency_profile_record(
+    capacity: usize,
+    exact_hit: bool,
+    route_refill: bool,
+    allocation: bool,
+    active_groups: usize,
+    copied_bytes: usize,
+    slot_hits: usize,
+    slot_misses: usize,
+    evictions: usize,
+) {
+    qwen36_expert_residency_profile_record(
+        Qwen36ExpertResidencyProfileKey::new(Qwen36ExpertResidencyMissPolicy::StaticTopN, capacity),
+        exact_hit,
+        route_refill,
+        allocation,
+        active_groups,
+        copied_bytes,
+        slot_hits,
+        slot_misses,
+        evictions,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen36_mps_static_topn_expert_residency_profile_record(
+    capacity: usize,
+    exact_hit: bool,
+    route_refill: bool,
+    allocation: bool,
+    active_groups: usize,
+    copied_bytes: usize,
+    slot_hits: usize,
+    slot_misses: usize,
+    evictions: usize,
+) {
+    qwen36_expert_residency_profile_record(
+        Qwen36ExpertResidencyProfileKey::with_format(
+            Qwen36ExpertResidentFormat::Fp16Mps,
+            Qwen36ExpertResidencyMissPolicy::StaticTopN,
+            capacity,
+        ),
+        exact_hit,
+        route_refill,
+        allocation,
+        active_groups,
+        copied_bytes,
+        slot_hits,
+        slot_misses,
+        evictions,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen36_gpu_pack_expert_residency_profile_record(
+    exact_hit: bool,
+    route_refill: bool,
+    allocation: bool,
+    active_groups: usize,
+    copied_bytes: usize,
+    slot_hits: usize,
+    slot_misses: usize,
+    evictions: usize,
+) {
+    qwen36_expert_residency_profile_record(
+        Qwen36ExpertResidencyProfileKey::new(
+            Qwen36ExpertResidencyMissPolicy::GpuPack,
+            active_groups,
+        ),
+        exact_hit,
+        route_refill,
+        allocation,
+        active_groups,
+        copied_bytes,
+        slot_hits,
+        slot_misses,
+        evictions,
+    );
+}
+
+fn qwen36_route_profile_layers() -> usize {
+    std::env::var("SUPERSONIC_QWEN36_ROUTE_PROFILE_LAYERS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(QWEN36_ROUTE_PROFILE_DEFAULT_LAYERS)
+}
+
+fn qwen36_route_profile_capacities() -> Vec<usize> {
+    let mut capacities = std::env::var("SUPERSONIC_QWEN36_ROUTE_PROFILE_CAPACITIES")
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .filter_map(|part| part.trim().parse::<usize>().ok())
+                .filter(|&capacity| capacity > 0)
+                .collect::<Vec<_>>()
+        })
+        .filter(|capacities| !capacities.is_empty())
+        .unwrap_or_else(|| QWEN36_ROUTE_PROFILE_DEFAULT_CAPS.to_vec());
+    capacities.sort_unstable();
+    capacities.dedup();
+    capacities
+}
+
+fn qwen36_route_profile_max_calls() -> usize {
+    std::env::var("SUPERSONIC_QWEN36_ROUTE_PROFILE_MAX_CALLS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(QWEN36_ROUTE_PROFILE_DEFAULT_MAX_CALLS)
+}
+
+fn qwen36_route_profile_record(active_experts: &[usize]) {
+    let profile =
+        QWEN36_ROUTE_PROFILE.get_or_init(|| Mutex::new(Qwen36RouteProfileAccumulator::default()));
+    let mut profile = profile.lock().expect("qwen36 route profile mutex poisoned");
+    if profile.records.len() >= qwen36_route_profile_max_calls() {
+        profile.dropped_calls += 1;
+        return;
+    }
+    profile.records.push(
+        active_experts
+            .iter()
+            .map(|&expert| expert.min(u16::MAX as usize) as u16)
+            .collect(),
+    );
+}
+
+fn qwen36_route_profile_simulate(
+    records: &[Vec<u16>],
+    dropped_calls: u64,
+    layers: usize,
+) -> Qwen36RouteProfileSnapshot {
+    let mut snapshot = Qwen36RouteProfileSnapshot {
+        calls: records.len() as u64,
+        dropped_calls,
+        layers,
+        ..Qwen36RouteProfileSnapshot::default()
+    };
+    if records.is_empty() || layers == 0 {
+        return snapshot;
+    }
+
+    let mut unique_layer_experts = HashMap::<(usize, u16), ()>::new();
+    let mut per_layer_freq: Vec<HashMap<u16, u64>> = (0..layers).map(|_| HashMap::new()).collect();
+    for (call_idx, experts) in records.iter().enumerate() {
+        let layer = call_idx % layers;
+        snapshot.route_calls.push(Qwen36RouteCall {
+            call_idx,
+            layer,
+            experts: experts.clone(),
+        });
+        snapshot.assignments += experts.len() as u64;
+        for &expert in experts {
+            unique_layer_experts.insert((layer, expert), ());
+            *per_layer_freq[layer].entry(expert).or_insert(0) += 1;
+        }
+        if call_idx >= layers {
+            let prev = &records[call_idx - layers];
+            for &expert in experts {
+                snapshot.adjacent_total += 1;
+                if prev.contains(&expert) {
+                    snapshot.adjacent_hits += 1;
+                }
+            }
+        }
+    }
+    snapshot.unique_layer_experts = unique_layer_experts.len();
+
+    for capacity in qwen36_route_profile_capacities() {
+        let mut caches: Vec<Vec<u16>> = (0..layers).map(|_| Vec::new()).collect();
+        let mut sim = Qwen36RouteCacheSim {
+            capacity,
+            ..Qwen36RouteCacheSim::default()
+        };
+        for (call_idx, experts) in records.iter().enumerate() {
+            let layer = call_idx % layers;
+            let cache = &mut caches[layer];
+            for &expert in experts {
+                if let Some(pos) = cache.iter().position(|&cached| cached == expert) {
+                    sim.hits += 1;
+                    let expert = cache.remove(pos);
+                    cache.push(expert);
+                } else {
+                    sim.misses += 1;
+                    if cache.len() >= capacity {
+                        cache.remove(0);
+                    }
+                    cache.push(expert);
+                }
+            }
+        }
+        snapshot.cache_sims.push(sim);
+
+        let mut topn = Qwen36RouteTopNSim {
+            capacity,
+            total: snapshot.assignments,
+            ..Qwen36RouteTopNSim::default()
+        };
+        for (layer, freq) in per_layer_freq.iter().enumerate() {
+            let mut counts: Vec<(u16, u64)> = freq
+                .iter()
+                .map(|(&expert, &count)| (expert, count))
+                .collect();
+            counts.sort_unstable_by(|(lhs_expert, lhs_count), (rhs_expert, rhs_count)| {
+                rhs_count
+                    .cmp(lhs_count)
+                    .then_with(|| lhs_expert.cmp(rhs_expert))
+            });
+            let selected: Vec<(u16, u64)> = counts.into_iter().take(capacity).collect();
+            let covered = selected.iter().map(|(_, count)| *count).sum::<u64>();
+            let total = freq.values().copied().sum::<u64>();
+            topn.covered += covered;
+            snapshot.topn_layers.push(Qwen36RouteTopNLayer {
+                capacity,
+                layer,
+                experts: selected.iter().map(|(expert, _)| *expert).collect(),
+                counts: selected.iter().map(|(_, count)| *count).collect(),
+                covered,
+                total,
+            });
+        }
+        snapshot.topn_sims.push(topn);
+    }
+
+    snapshot
+}
+
+fn qwen36_batched_prefill_feasibility_profile_simulate(
+    records: &[Vec<u16>],
+    dropped_calls: u64,
+    config: &Qwen36BatchedPrefillFeasibilityConfig,
+) -> Qwen36BatchedPrefillFeasibilityProfileSnapshot {
+    let layers = config.layers.max(1);
+    let top_k = config.top_k.max(1);
+    let chunk_size = config.chunk_size.max(1);
+    let available_tokens = records.len() / layers;
+    let requested_tokens = if config.prefill_tokens == 0 {
+        available_tokens
+    } else {
+        config.prefill_tokens
+    };
+    let profiled_tokens = requested_tokens.min(available_tokens);
+    let chunks = if profiled_tokens == 0 {
+        0
+    } else {
+        profiled_tokens.div_ceil(chunk_size)
+    };
+    let mut snapshot = Qwen36BatchedPrefillFeasibilityProfileSnapshot {
+        calls: records.len() as u64,
+        dropped_calls,
+        layers,
+        top_k,
+        num_experts: config.num_experts.max(1),
+        chunk_size,
+        prefill_tokens: config.prefill_tokens,
+        profiled_tokens,
+        chunks,
+        ..Qwen36BatchedPrefillFeasibilityProfileSnapshot::default()
+    };
+    if profiled_tokens == 0 {
+        return snapshot;
+    }
+
+    for chunk_start in (0..profiled_tokens).step_by(chunk_size) {
+        let chunk_end = (chunk_start + chunk_size).min(profiled_tokens);
+        for layer in 0..layers {
+            let mut counts = HashMap::<u16, u64>::new();
+            for token in chunk_start..chunk_end {
+                let call_idx = token * layers + layer;
+                let Some(experts) = records.get(call_idx) else {
+                    continue;
+                };
+                for &expert in experts.iter().take(top_k) {
+                    *counts.entry(expert).or_insert(0) += 1;
+                    snapshot.assignments += 1;
+                }
+            }
+            snapshot.expert_segments += counts.len() as u64;
+            snapshot.max_unique_experts_per_layer_chunk = snapshot
+                .max_unique_experts_per_layer_chunk
+                .max(counts.len());
+            for rows in counts.values().copied() {
+                snapshot.max_rows_per_segment = snapshot.max_rows_per_segment.max(rows);
+                snapshot.wmma16_padded_assignments += rows.div_ceil(16) * 16;
+                if rows >= 16 {
+                    snapshot.wmma16_segments += 1;
+                    snapshot.wmma16_covered_assignments += rows;
+                } else {
+                    snapshot.scalar_tail_segments += 1;
+                    snapshot.scalar_tail_assignments += rows;
+                }
+            }
+        }
+    }
+    snapshot.permutation_entries = snapshot.assignments;
+    snapshot
+}
 
 /// Per-layer descriptor for the Qwen3.6-MoE megakernel. Field order and
 /// natural x86_64 alignment must match the C++ struct in
@@ -255,6 +1315,38 @@ impl Default for Qwen36MoeBatchSeqDesc {
 /// and must not be interpreted as a decode-path replacement.
 pub fn metal_mpp_tile_gemm_f16_tflops(size: u32, iterations: u32) -> Result<f64, GpuError> {
     crate::metal_native::mpp_tile_gemm_f16_tflops(size, iterations)
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct MetalMpsExpertF16Probe {
+    pub gate_up_ms: f64,
+    pub down_ms: f64,
+    pub gate_up_tflops: f64,
+    pub down_tflops: f64,
+}
+
+/// Attribution-only MPS probe for Qwen3.6 active-expert GEMV shapes.
+///
+/// This is a resident-FP16 vendor-library upper-bound probe. It does not use the
+/// GPTQ INT4 expert buffers directly and does not change the decode path.
+pub fn metal_mps_expert_f16_probe(
+    hidden: usize,
+    moe_intermediate: usize,
+    top_k: usize,
+    iterations: u32,
+) -> Result<MetalMpsExpertF16Probe, GpuError> {
+    let probe = crate::metal_native::qwen36_mps_expert_f16_probe(
+        hidden,
+        moe_intermediate,
+        top_k,
+        iterations,
+    )?;
+    Ok(MetalMpsExpertF16Probe {
+        gate_up_ms: probe.gate_up_ms,
+        down_ms: probe.down_ms,
+        gate_up_tflops: probe.gate_up_tflops,
+        down_tflops: probe.down_tflops,
+    })
 }
 
 #[cfg(any(supersonic_backend_hip, supersonic_backend_cuda))]
@@ -1301,7 +2393,7 @@ pub fn attn_step_launch(
     }
     let backend = output.backend();
     if backend == Backend::Metal {
-        return attn_step_stage1_5_metal_host(params, weights, int4, output, workspace);
+        return attn_step_stage1_5_metal_host(params, weights, int4, output, workspace, None);
     }
 
     let counters = sync_buf.as_mut_ptr() as *mut c_uint;
@@ -1376,12 +2468,48 @@ pub fn attn_step_launch(
     Ok(())
 }
 
+/// Metal-only stage-5 launcher that uses `output` as the attention scratch
+/// publication buffer, but writes the final residual hidden state to
+/// `final_output`. This trims the decode-chain handoff copy after full-attn
+/// layers while preserving the host fallback implementation.
+pub unsafe fn attn_step_stage5_metal_host_into(
+    params: Qwen36MoeAttnStepParams,
+    weights: &Qwen36MoeAttnStepWeights,
+    int4: &Qwen36MoeAttnStepInt4,
+    output: &mut GpuBuffer,
+    workspace: &mut GpuBuffer,
+    final_output: *mut c_void,
+    final_output_capacity: usize,
+) -> Result<(), GpuError> {
+    if output.backend() != Backend::Metal {
+        return Err(GpuError::backend(
+            output.backend(),
+            "qwen36_moe::attn_step_stage5_metal_host_into requires Metal output".into(),
+        ));
+    }
+    if params.stage != 5 {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::attn_step_stage5_metal_host_into requires stage=5, got {}",
+            params.stage
+        )));
+    }
+    attn_step_stage1_5_metal_host(
+        params,
+        weights,
+        int4,
+        output,
+        workspace,
+        Some((final_output, final_output_capacity)),
+    )
+}
+
 fn attn_step_stage1_5_metal_host(
     params: Qwen36MoeAttnStepParams,
     weights: &Qwen36MoeAttnStepWeights,
     int4: &Qwen36MoeAttnStepInt4,
     output: &mut GpuBuffer,
     workspace: &mut GpuBuffer,
+    final_output_override: Option<(*mut c_void, usize)>,
 ) -> Result<(), GpuError> {
     if output.dtype() != ScalarType::BF16 || workspace.dtype() != ScalarType::F32 {
         return Err(GpuError::InvalidArg(format!(
@@ -1521,41 +2649,92 @@ fn attn_step_stage1_5_metal_host(
             params.stage, output_len, output_elems
         )));
     }
+    if final_output_override.is_some() && params.stage != 5 {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::attn_step_launch: Metal direct final output requires stage=5, got {}",
+            params.stage
+        )));
+    }
+    let output_ptr = output.as_mut_ptr();
+    if let Some((final_output_ptr, final_output_capacity)) = final_output_override {
+        if final_output_ptr.is_null() || final_output_capacity < hidden {
+            return Err(GpuError::InvalidArg(format!(
+                "qwen36_moe::attn_step_launch: Metal stage5 final output too small: need {}, got {}",
+                hidden, final_output_capacity
+            )));
+        }
+    }
 
     let input = unsafe { std::slice::from_raw_parts(weights.input_hidden as *const u16, hidden) };
     let input_norm_w =
         unsafe { std::slice::from_raw_parts(weights.input_norm_w as *const u16, hidden) };
     let q_norm_w = unsafe { std::slice::from_raw_parts(weights.q_norm_w as *const u16, head_dim) };
-    let output =
-        unsafe { std::slice::from_raw_parts_mut(output.as_mut_ptr() as *mut u16, output_len) };
+    let output = unsafe { std::slice::from_raw_parts_mut(output_ptr as *mut u16, output_len) };
     let workspace = unsafe {
         std::slice::from_raw_parts_mut(workspace.as_mut_ptr() as *mut f32, workspace_len)
     };
 
-    let mut mean_sq = 0.0f32;
-    for &bits in input {
-        let v = bf16_bits_to_f32(bits);
-        mean_sq += v * v;
+    let x_norm =
+        crate::prefill_ffi::metal_profile_time("qwen36_full_attn_input_norm", "host", || {
+            let mut mean_sq = 0.0f32;
+            for &bits in input {
+                let v = bf16_bits_to_f32(bits);
+                mean_sq += v * v;
+            }
+            let inv_rms = 1.0f32 / (mean_sq / hidden as f32 + params.rms_norm_eps).sqrt();
+            let mut x_norm = vec![0.0f32; hidden];
+            for col in 0..hidden {
+                let v = bf16_bits_to_f32(input[col]);
+                let w = bf16_bits_to_f32(input_norm_w[col]);
+                x_norm[col] = bf16_round_f32(v * inv_rms * (1.0 + w));
+            }
+            x_norm
+        });
+
+    qwen36_validate_dense_or_int4_sidecars(
+        int4.q_proj_scale,
+        int4.q_proj_zero,
+        int4.group_size,
+        "q_proj",
+    )?;
+    if params.stage >= 2 {
+        qwen36_validate_dense_or_int4_sidecars(
+            int4.k_proj_scale,
+            int4.k_proj_zero,
+            int4.group_size,
+            "k_proj",
+        )?;
+        qwen36_validate_dense_or_int4_sidecars(
+            int4.v_proj_scale,
+            int4.v_proj_zero,
+            int4.group_size,
+            "v_proj",
+        )?;
     }
-    let inv_rms = 1.0f32 / (mean_sq / hidden as f32 + params.rms_norm_eps).sqrt();
-    let mut x_norm = vec![0.0f32; hidden];
-    for col in 0..hidden {
-        let v = bf16_bits_to_f32(input[col]);
-        let w = bf16_bits_to_f32(input_norm_w[col]);
-        x_norm[col] = bf16_round_f32(v * inv_rms * (1.0 + w));
+    if params.stage >= 5 {
+        qwen36_validate_dense_or_int4_sidecars(
+            int4.o_proj_scale,
+            int4.o_proj_zero,
+            int4.group_size,
+            "o_proj",
+        )?;
     }
 
-    for row in 0..q_out_dim {
-        let acc = qwen36_dense_or_int4_dot_2d(
-            weights.q_proj_w,
-            int4.q_proj_scale,
-            int4.q_proj_zero,
-            row,
-            hidden,
-            int4.group_size,
-            &x_norm,
-        )?;
-        workspace[off_q_raw + row] = bf16_round_f32(acc);
+    {
+        let q_w = weights.q_proj_w as usize;
+        let q_scale = int4.q_proj_scale as usize;
+        let q_zero = int4.q_proj_zero as usize;
+        let group_size = int4.group_size.max(0) as usize;
+        let q_raw = &mut workspace[off_q_raw..off_q_raw + q_out_dim];
+        qwen36_parallel_chunks_mut(q_raw, 64, |start, chunk| {
+            for (local, out) in chunk.iter_mut().enumerate() {
+                let row = start + local;
+                let acc = qwen36_dense_or_int4_dot_2d_unchecked(
+                    q_w, q_scale, q_zero, row, hidden, group_size, &x_norm,
+                );
+                *out = bf16_round_f32(acc);
+            }
+        });
     }
 
     for head in 0..num_heads {
@@ -1584,27 +2763,30 @@ fn attn_step_stage1_5_metal_host(
 
     let k_norm_w = unsafe { std::slice::from_raw_parts(weights.k_norm_w as *const u16, head_dim) };
 
-    for row in 0..kv_dim {
-        let k_acc = qwen36_dense_or_int4_dot_2d(
-            weights.k_proj_w,
-            int4.k_proj_scale,
-            int4.k_proj_zero,
-            row,
-            hidden,
-            int4.group_size,
-            &x_norm,
-        )?;
-        let v_acc = qwen36_dense_or_int4_dot_2d(
-            weights.v_proj_w,
-            int4.v_proj_scale,
-            int4.v_proj_zero,
-            row,
-            hidden,
-            int4.group_size,
-            &x_norm,
-        )?;
-        workspace[off_k_raw + row] = bf16_round_f32(k_acc);
-        workspace[off_v_raw + row] = bf16_round_f32(v_acc);
+    {
+        let (_, after_k) = workspace.split_at_mut(off_k_raw);
+        let (k_raw, after_v) = after_k.split_at_mut(kv_dim);
+        let (v_raw, _) = after_v.split_at_mut(kv_dim);
+        let k_w = weights.k_proj_w as usize;
+        let k_scale = int4.k_proj_scale as usize;
+        let k_zero = int4.k_proj_zero as usize;
+        let v_w = weights.v_proj_w as usize;
+        let v_scale = int4.v_proj_scale as usize;
+        let v_zero = int4.v_proj_zero as usize;
+        let group_size = int4.group_size.max(0) as usize;
+        qwen36_parallel_chunks2_mut(k_raw, v_raw, 64, |start, k_chunk, v_chunk| {
+            for (local, (k_out, v_out)) in k_chunk.iter_mut().zip(v_chunk.iter_mut()).enumerate() {
+                let row = start + local;
+                let k_acc = qwen36_dense_or_int4_dot_2d_unchecked(
+                    k_w, k_scale, k_zero, row, hidden, group_size, &x_norm,
+                );
+                let v_acc = qwen36_dense_or_int4_dot_2d_unchecked(
+                    v_w, v_scale, v_zero, row, hidden, group_size, &x_norm,
+                );
+                *k_out = bf16_round_f32(k_acc);
+                *v_out = bf16_round_f32(v_acc);
+            }
+        });
     }
 
     for head in 0..num_kv_heads {
@@ -1740,20 +2922,43 @@ fn attn_step_stage1_5_metal_host(
         }
     }
 
-    for row in 0..hidden {
-        let acc = qwen36_dense_or_int4_dot_2d(
-            weights.o_proj_w,
-            int4.o_proj_scale,
-            int4.o_proj_zero,
-            row,
-            q_normed_dim,
-            int4.group_size,
-            &workspace[off_gated..off_gated + q_normed_dim],
-        )?;
-        let o_out = bf16_round_f32(acc);
-        let result = bf16_round_f32(bf16_bits_to_f32(input[row]) + o_out);
-        workspace[off_o_out + row] = result;
-        output[row] = f32_to_bf16_bits(result);
+    let gated = workspace[off_gated..off_gated + q_normed_dim].to_vec();
+    {
+        let o_w = weights.o_proj_w as usize;
+        let o_scale = int4.o_proj_scale as usize;
+        let o_zero = int4.o_proj_zero as usize;
+        let group_size = int4.group_size.max(0) as usize;
+        let o_out = &mut workspace[off_o_out..off_o_out + hidden];
+        let publish_o_proj = |start: usize, out_chunk: &mut [f32], pub_chunk: &mut [u16]| {
+            for (local, (out, pub_out)) in
+                out_chunk.iter_mut().zip(pub_chunk.iter_mut()).enumerate()
+            {
+                let row = start + local;
+                let acc = qwen36_dense_or_int4_dot_2d_unchecked(
+                    o_w,
+                    o_scale,
+                    o_zero,
+                    row,
+                    q_normed_dim,
+                    group_size,
+                    &gated,
+                );
+                let proj = bf16_round_f32(acc);
+                let result = bf16_round_f32(bf16_bits_to_f32(input[row]) + proj);
+                *out = result;
+                *pub_out = f32_to_bf16_bits(result);
+            }
+        };
+        match final_output_override {
+            Some((final_output_ptr, _)) if final_output_ptr != output_ptr => {
+                let final_output =
+                    unsafe { std::slice::from_raw_parts_mut(final_output_ptr as *mut u16, hidden) };
+                qwen36_parallel_chunks2_mut(o_out, final_output, 64, publish_o_proj);
+            }
+            _ => {
+                qwen36_parallel_chunks2_mut(o_out, output, 64, publish_o_proj);
+            }
+        }
     }
 
     Ok(())
@@ -1832,6 +3037,44 @@ impl Qwen36MoeLinearStepInt4 {
     }
 }
 
+fn qwen36_linear_int4_stage5_metal_native_supported(
+    params: Qwen36MoeLinearStepParams,
+    weights: &Qwen36MoeLinearStepWeights,
+    int4: &Qwen36MoeLinearStepInt4,
+    output_capacity: usize,
+) -> bool {
+    std::env::var_os("SUPERSONIC_METAL_DISABLE_QWEN36_LINEAR_INT4_STAGE5").is_none()
+        && params.stage == 5
+        && params.hidden == 2048
+        && params.num_k_heads == 16
+        && params.num_v_heads == 32
+        && params.head_k_dim == 128
+        && params.head_v_dim == 128
+        && params.conv_kernel_dim == 4
+        && int4.group_size == 128
+        && output_capacity >= params.hidden as usize
+        && !crate::metal_native::disabled_by_env()
+        && !weights.input_hidden.is_null()
+        && !weights.input_norm_w.is_null()
+        && !weights.in_proj_qkv_w.is_null()
+        && !weights.in_proj_z_w.is_null()
+        && !weights.in_proj_a_w.is_null()
+        && !weights.in_proj_b_w.is_null()
+        && !weights.conv1d_w.is_null()
+        && !weights.dt_bias.is_null()
+        && !weights.a_log.is_null()
+        && !weights.norm_w.is_null()
+        && !weights.out_proj_w.is_null()
+        && !weights.conv_state.is_null()
+        && !weights.recurrent_state.is_null()
+        && !int4.in_proj_qkv_scale.is_null()
+        && !int4.in_proj_qkv_zero.is_null()
+        && !int4.in_proj_z_scale.is_null()
+        && !int4.in_proj_z_zero.is_null()
+        && !int4.out_proj_scale.is_null()
+        && !int4.out_proj_zero.is_null()
+}
+
 /// Safe wrapper for the PR 4b3 staged linear-attention parity launcher.
 /// Same workspace / sync_buf layout as [`attn_step_launch`]: 96-byte zero
 /// scratch (only counters[0] used here), F32 workspace sized for the
@@ -1862,7 +3105,9 @@ pub fn linear_step_launch(
     let backend = output.backend();
     if backend == Backend::Metal {
         if params.stage <= 5 {
-            return linear_step_stage1_5_metal_host(params, weights, int4, output, workspace);
+            return linear_step_stage1_5_metal_host(
+                params, weights, int4, output, workspace, None, true,
+            );
         }
         return Err(GpuError::InvalidArg(
             "qwen36_moe::linear_step_launch: Metal backend is wired for stages 1-5 only".into(),
@@ -1905,7 +3150,7 @@ pub fn linear_step_launch(
                     weights.norm_w,
                     weights.out_proj_w,
                     weights.conv_state,
-                    weights.recurrent_state,
+                    weights.recurrent_state as *mut f32,
                     int4.group_size as c_int,
                     int4.in_proj_qkv_scale,
                     int4.in_proj_qkv_zero,
@@ -1940,12 +3185,52 @@ pub fn linear_step_launch(
     Ok(())
 }
 
+/// Metal-only stage-5 launcher that uses `output` as the temporary
+/// normalized-hidden buffer, but writes the final residual result to
+/// `final_output`. This lets batched prefill keep each row in place without a
+/// CPU-side shared-memory D2D copy after every linear-attention token.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn linear_step_stage5_metal_native_into(
+    params: Qwen36MoeLinearStepParams,
+    weights: &Qwen36MoeLinearStepWeights,
+    int4: &Qwen36MoeLinearStepInt4,
+    output: &mut GpuBuffer,
+    workspace: &mut GpuBuffer,
+    final_output: *mut c_void,
+    final_output_capacity: usize,
+    wait_for_completion: bool,
+) -> Result<(), GpuError> {
+    if output.backend() != Backend::Metal {
+        return Err(GpuError::backend(
+            output.backend(),
+            "qwen36_moe::linear_step_stage5_metal_native_into requires Metal output".into(),
+        ));
+    }
+    if params.stage != 5 {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::linear_step_stage5_metal_native_into requires stage=5, got {}",
+            params.stage
+        )));
+    }
+    linear_step_stage1_5_metal_host(
+        params,
+        weights,
+        int4,
+        output,
+        workspace,
+        Some((final_output, final_output_capacity)),
+        wait_for_completion,
+    )
+}
+
 fn linear_step_stage1_5_metal_host(
     params: Qwen36MoeLinearStepParams,
     weights: &Qwen36MoeLinearStepWeights,
     int4: &Qwen36MoeLinearStepInt4,
     output: &mut GpuBuffer,
     workspace: &mut GpuBuffer,
+    final_output_override: Option<(*mut c_void, usize)>,
+    wait_for_completion: bool,
 ) -> Result<(), GpuError> {
     if output.dtype() != ScalarType::BF16 || workspace.dtype() != ScalarType::F32 {
         return Err(GpuError::InvalidArg(format!(
@@ -2067,13 +3352,91 @@ fn linear_step_stage1_5_metal_host(
             workspace.len_bytes() / std::mem::size_of::<f32>(),
         )));
     }
-    if output.len_bytes() / std::mem::size_of::<u16>() < output_len {
+    let output_capacity = output.len_bytes() / std::mem::size_of::<u16>();
+    if output_capacity < output_len {
         return Err(GpuError::InvalidArg(format!(
             "qwen36_moe::linear_step_launch: Metal stage{} output too small: \
              need {output_len} BF16 entries, got {}",
-            params.stage,
-            output.len_bytes() / std::mem::size_of::<u16>(),
+            params.stage, output_capacity,
         )));
+    }
+    let (final_output_ptr, final_output_capacity) =
+        final_output_override.unwrap_or_else(|| (output.as_mut_ptr(), output_capacity));
+    if params.stage == 5 && (final_output_ptr.is_null() || final_output_capacity < hidden) {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::linear_step_launch: Metal stage5 final output too small: \
+             need {hidden} BF16 entries, got {final_output_capacity}"
+        )));
+    }
+
+    qwen36_validate_dense_or_int4_sidecars(
+        int4.in_proj_qkv_scale,
+        int4.in_proj_qkv_zero,
+        int4.group_size,
+        "in_proj_qkv",
+    )?;
+    qwen36_validate_dense_or_int4_sidecars(
+        int4.in_proj_z_scale,
+        int4.in_proj_z_zero,
+        int4.group_size,
+        "in_proj_z",
+    )?;
+    if params.stage >= 5 {
+        qwen36_validate_dense_or_int4_sidecars(
+            int4.out_proj_scale,
+            int4.out_proj_zero,
+            int4.group_size,
+            "out_proj",
+        )?;
+    }
+
+    if qwen36_linear_int4_stage5_metal_native_supported(params, weights, int4, output_capacity) {
+        return crate::prefill_ffi::metal_profile_time(
+            "qwen36_linear_int4_stage5",
+            "native",
+            || unsafe {
+                crate::metal_native::qwen36_linear_int4_stage5(
+                    hidden,
+                    num_k_heads,
+                    num_v_heads,
+                    head_k_dim,
+                    head_v_dim,
+                    params.conv_kernel_dim as usize,
+                    int4.group_size as usize,
+                    params.rms_norm_eps,
+                    weights.input_hidden,
+                    weights.input_norm_w,
+                    weights.in_proj_qkv_w,
+                    int4.in_proj_qkv_scale,
+                    int4.in_proj_qkv_zero,
+                    weights.in_proj_z_w,
+                    int4.in_proj_z_scale,
+                    int4.in_proj_z_zero,
+                    weights.in_proj_a_w,
+                    weights.in_proj_b_w,
+                    weights.conv1d_w,
+                    weights.conv1d_bias,
+                    weights.dt_bias,
+                    weights.a_log,
+                    weights.norm_w,
+                    weights.out_proj_w,
+                    int4.out_proj_scale,
+                    int4.out_proj_zero,
+                    weights.conv_state,
+                    weights.recurrent_state as *mut c_void,
+                    workspace.as_mut_ptr() as *mut c_void,
+                    output.as_mut_ptr() as *mut c_void,
+                    final_output_ptr,
+                    wait_for_completion,
+                )
+            },
+        );
+    }
+    if final_output_override.is_some() {
+        return Err(GpuError::InvalidArg(
+            "qwen36_moe::linear_step_launch: Metal direct final output requires native stage5 INT4 support"
+                .into(),
+        ));
     }
 
     let input = unsafe { std::slice::from_raw_parts(weights.input_hidden as *const u16, hidden) };
@@ -2086,64 +3449,79 @@ fn linear_step_stage1_5_metal_host(
         std::slice::from_raw_parts(weights.in_proj_b_w as *const u16, num_v_heads * hidden)
     };
     let output =
-        unsafe { std::slice::from_raw_parts_mut(output.as_mut_ptr() as *mut u16, output_len) };
+        unsafe { std::slice::from_raw_parts_mut(output.as_mut_ptr() as *mut u16, output_capacity) };
     let workspace = unsafe {
         std::slice::from_raw_parts_mut(workspace.as_mut_ptr() as *mut f32, workspace_len)
     };
 
-    let mut mean_sq = 0.0f32;
-    for &bits in input {
-        let v = bf16_bits_to_f32(bits);
-        mean_sq += v * v;
-    }
-    let inv_rms = 1.0f32 / (mean_sq / hidden as f32 + params.rms_norm_eps).sqrt();
-    let mut x_norm = vec![0.0f32; hidden];
-    for col in 0..hidden {
-        let v = bf16_bits_to_f32(input[col]);
-        let w = bf16_bits_to_f32(input_norm_w[col]);
-        x_norm[col] = bf16_round_f32(v * inv_rms * (1.0 + w));
-    }
-
-    for row in 0..qkv_dim {
-        let acc = qwen36_dense_or_int4_dot_2d(
-            weights.in_proj_qkv_w,
-            int4.in_proj_qkv_scale,
-            int4.in_proj_qkv_zero,
-            row,
-            hidden,
-            int4.group_size,
-            &x_norm,
-        )?;
-        let rounded = bf16_round_f32(acc);
-        workspace[off_qkv_raw + row] = rounded;
-        if params.stage == 1 {
-            output[row] = f32_to_bf16_bits(rounded);
+    let x_norm = crate::prefill_ffi::metal_profile_time("qwen36_linear_input_norm", "host", || {
+        let mut mean_sq = 0.0f32;
+        for &bits in input {
+            let v = bf16_bits_to_f32(bits);
+            mean_sq += v * v;
         }
-    }
-    for row in 0..val_dim {
-        let acc = qwen36_dense_or_int4_dot_2d(
-            weights.in_proj_z_w,
-            int4.in_proj_z_scale,
-            int4.in_proj_z_zero,
-            row,
-            hidden,
-            int4.group_size,
-            &x_norm,
-        )?;
-        workspace[off_z_raw + row] = bf16_round_f32(acc);
-    }
-    for row in 0..num_v_heads {
-        let mut acc_a = 0.0f32;
-        let mut acc_b = 0.0f32;
-        let row_base = row * hidden;
+        let inv_rms = 1.0f32 / (mean_sq / hidden as f32 + params.rms_norm_eps).sqrt();
+        let mut x_norm = vec![0.0f32; hidden];
         for col in 0..hidden {
-            let x = x_norm[col];
-            acc_a += bf16_bits_to_f32(in_proj_a_w[row_base + col]) * x;
-            acc_b += bf16_bits_to_f32(in_proj_b_w[row_base + col]) * x;
+            let v = bf16_bits_to_f32(input[col]);
+            let w = bf16_bits_to_f32(input_norm_w[col]);
+            x_norm[col] = bf16_round_f32(v * inv_rms * (1.0 + w));
         }
-        workspace[off_a_raw + row] = bf16_round_f32(acc_a);
-        workspace[off_b_raw + row] = bf16_round_f32(acc_b);
-    }
+        x_norm
+    });
+
+    crate::prefill_ffi::metal_profile_time("qwen36_linear_int4_in_proj_qkv", "host", || {
+        let qkv_w = weights.in_proj_qkv_w as usize;
+        let qkv_scale = int4.in_proj_qkv_scale as usize;
+        let qkv_zero = int4.in_proj_qkv_zero as usize;
+        let group_size = int4.group_size.max(0) as usize;
+        let qkv = &mut workspace[off_qkv_raw..off_qkv_raw + qkv_dim];
+        qwen36_parallel_chunks_mut(qkv, 64, |start, chunk| {
+            for (local, out) in chunk.iter_mut().enumerate() {
+                let row = start + local;
+                let acc = qwen36_dense_or_int4_dot_2d_unchecked(
+                    qkv_w, qkv_scale, qkv_zero, row, hidden, group_size, &x_norm,
+                );
+                *out = bf16_round_f32(acc);
+            }
+        });
+        if params.stage == 1 {
+            for row in 0..qkv_dim {
+                output[row] = f32_to_bf16_bits(workspace[off_qkv_raw + row]);
+            }
+        }
+    });
+
+    crate::prefill_ffi::metal_profile_time("qwen36_linear_int4_in_proj_z", "host", || {
+        let z_w = weights.in_proj_z_w as usize;
+        let z_scale = int4.in_proj_z_scale as usize;
+        let z_zero = int4.in_proj_z_zero as usize;
+        let group_size = int4.group_size.max(0) as usize;
+        let z = &mut workspace[off_z_raw..off_z_raw + val_dim];
+        qwen36_parallel_chunks_mut(z, 64, |start, chunk| {
+            for (local, out) in chunk.iter_mut().enumerate() {
+                let row = start + local;
+                let acc = qwen36_dense_or_int4_dot_2d_unchecked(
+                    z_w, z_scale, z_zero, row, hidden, group_size, &x_norm,
+                );
+                *out = bf16_round_f32(acc);
+            }
+        });
+    });
+    crate::prefill_ffi::metal_profile_time("qwen36_linear_in_proj_ab", "host", || {
+        for row in 0..num_v_heads {
+            let mut acc_a = 0.0f32;
+            let mut acc_b = 0.0f32;
+            let row_base = row * hidden;
+            for col in 0..hidden {
+                let x = x_norm[col];
+                acc_a += bf16_bits_to_f32(in_proj_a_w[row_base + col]) * x;
+                acc_b += bf16_bits_to_f32(in_proj_b_w[row_base + col]) * x;
+            }
+            workspace[off_a_raw + row] = bf16_round_f32(acc_a);
+            workspace[off_b_raw + row] = bf16_round_f32(acc_b);
+        }
+    });
 
     if params.stage == 1 {
         return Ok(());
@@ -2161,185 +3539,201 @@ fn linear_step_stage1_5_metal_host(
     let conv_state =
         unsafe { std::slice::from_raw_parts_mut(weights.conv_state as *mut u16, qkv_dim * kstate) };
 
-    for ch in 0..qkv_dim {
-        let new_qkv = workspace[off_qkv_raw + ch];
-        let mut acc = 0.0f32;
-        for t in 0..kstate {
-            let state = bf16_bits_to_f32(conv_state[ch * kstate + t]);
-            acc += state * bf16_bits_to_f32(conv1d_w[ch * kernel + t]);
-        }
-        acc += new_qkv * bf16_bits_to_f32(conv1d_w[ch * kernel + kstate]);
-        if let Some(bias) = conv1d_bias {
-            acc += bf16_bits_to_f32(bias[ch]);
-        }
-        let conv_out = bf16_round_f32(acc);
-        let silu = bf16_round_f32(conv_out * (1.0 / (1.0 + (-conv_out).exp())));
-        workspace[off_qkv_raw + ch] = silu;
-        if params.stage == 2 {
-            output[ch] = f32_to_bf16_bits(silu);
-        }
-
-        if kstate > 0 {
-            for t in 0..kstate.saturating_sub(1) {
-                conv_state[ch * kstate + t] = conv_state[ch * kstate + t + 1];
+    crate::prefill_ffi::metal_profile_time("qwen36_linear_conv_silu_state", "host", || {
+        for ch in 0..qkv_dim {
+            let new_qkv = workspace[off_qkv_raw + ch];
+            let mut acc = 0.0f32;
+            for t in 0..kstate {
+                let state = bf16_bits_to_f32(conv_state[ch * kstate + t]);
+                acc += state * bf16_bits_to_f32(conv1d_w[ch * kernel + t]);
             }
-            conv_state[ch * kstate + (kstate - 1)] = f32_to_bf16_bits(new_qkv);
+            acc += new_qkv * bf16_bits_to_f32(conv1d_w[ch * kernel + kstate]);
+            if let Some(bias) = conv1d_bias {
+                acc += bf16_bits_to_f32(bias[ch]);
+            }
+            let conv_out = bf16_round_f32(acc);
+            let silu = bf16_round_f32(conv_out * (1.0 / (1.0 + (-conv_out).exp())));
+            workspace[off_qkv_raw + ch] = silu;
+            if params.stage == 2 {
+                output[ch] = f32_to_bf16_bits(silu);
+            }
+
+            if kstate > 0 {
+                for t in 0..kstate.saturating_sub(1) {
+                    conv_state[ch * kstate + t] = conv_state[ch * kstate + t + 1];
+                }
+                conv_state[ch * kstate + (kstate - 1)] = f32_to_bf16_bits(new_qkv);
+            }
         }
-    }
+    });
 
     if params.stage == 2 {
         return Ok(());
     }
 
-    for head in 0..num_k_heads {
-        let q_src = off_qkv_raw + head * head_k_dim;
-        let k_src = off_qkv_raw + key_dim + head * head_k_dim;
-        let q_dst = off_q_normed + head * head_k_dim;
-        let k_dst = off_k_normed + head * head_k_dim;
+    crate::prefill_ffi::metal_profile_time("qwen36_linear_qk_norm_repeat", "host", || {
+        for head in 0..num_k_heads {
+            let q_src = off_qkv_raw + head * head_k_dim;
+            let k_src = off_qkv_raw + key_dim + head * head_k_dim;
+            let q_dst = off_q_normed + head * head_k_dim;
+            let k_dst = off_k_normed + head * head_k_dim;
 
-        let mut q_ss = 0.0f32;
-        let mut k_ss = 0.0f32;
-        for i in 0..head_k_dim {
-            let q = workspace[q_src + i];
-            let k = workspace[k_src + i];
-            q_ss += q * q;
-            k_ss += k * k;
+            let mut q_ss = 0.0f32;
+            let mut k_ss = 0.0f32;
+            for i in 0..head_k_dim {
+                let q = workspace[q_src + i];
+                let k = workspace[k_src + i];
+                q_ss += q * q;
+                k_ss += k * k;
+            }
+            let q_denom = bf16_round_f32(bf16_round_f32(q_ss.sqrt()).max(1e-6));
+            let k_denom = bf16_round_f32(bf16_round_f32(k_ss.sqrt()).max(1e-6));
+            for i in 0..head_k_dim {
+                workspace[q_dst + i] = bf16_round_f32(workspace[q_src + i] / q_denom);
+                workspace[k_dst + i] = bf16_round_f32(workspace[k_src + i] / k_denom);
+            }
         }
-        let q_denom = bf16_round_f32(bf16_round_f32(q_ss.sqrt()).max(1e-6));
-        let k_denom = bf16_round_f32(bf16_round_f32(k_ss.sqrt()).max(1e-6));
-        for i in 0..head_k_dim {
-            workspace[q_dst + i] = bf16_round_f32(workspace[q_src + i] / q_denom);
-            workspace[k_dst + i] = bf16_round_f32(workspace[k_src + i] / k_denom);
-        }
-    }
 
-    let rep = num_v_heads / num_k_heads;
-    let q_scale = 1.0f32 / (head_k_dim as f32).sqrt();
-    for vhead in 0..num_v_heads {
-        let src_kh = vhead / rep;
-        let q_src = off_q_normed + src_kh * head_k_dim;
-        let k_src = off_k_normed + src_kh * head_k_dim;
-        let q_dst = off_q_rep + vhead * head_k_dim;
-        let k_dst = off_k_rep + vhead * head_k_dim;
-        for i in 0..head_k_dim {
-            let qs = bf16_round_f32(workspace[q_src + i] * q_scale);
-            let kn = workspace[k_src + i];
-            workspace[q_dst + i] = qs;
-            workspace[k_dst + i] = kn;
+        let rep = num_v_heads / num_k_heads;
+        let q_scale = 1.0f32 / (head_k_dim as f32).sqrt();
+        for vhead in 0..num_v_heads {
+            let src_kh = vhead / rep;
+            let q_src = off_q_normed + src_kh * head_k_dim;
+            let k_src = off_k_normed + src_kh * head_k_dim;
+            let q_dst = off_q_rep + vhead * head_k_dim;
+            let k_dst = off_k_rep + vhead * head_k_dim;
+            for i in 0..head_k_dim {
+                let qs = bf16_round_f32(workspace[q_src + i] * q_scale);
+                let kn = workspace[k_src + i];
+                workspace[q_dst + i] = qs;
+                workspace[k_dst + i] = kn;
+                if params.stage == 3 {
+                    output[vhead * head_k_dim + i] = f32_to_bf16_bits(qs);
+                    output[num_v_heads * head_k_dim + vhead * head_k_dim + i] =
+                        f32_to_bf16_bits(kn);
+                }
+            }
+            let v_src = off_qkv_raw + 2 * key_dim + vhead * head_v_dim;
+            let v_out = 2 * num_v_heads * head_k_dim + vhead * head_v_dim;
             if params.stage == 3 {
-                output[vhead * head_k_dim + i] = f32_to_bf16_bits(qs);
-                output[num_v_heads * head_k_dim + vhead * head_k_dim + i] = f32_to_bf16_bits(kn);
+                for i in 0..head_v_dim {
+                    output[v_out + i] = f32_to_bf16_bits(workspace[v_src + i]);
+                }
             }
         }
-        let v_src = off_qkv_raw + 2 * key_dim + vhead * head_v_dim;
-        let v_out = 2 * num_v_heads * head_k_dim + vhead * head_v_dim;
-        if params.stage == 3 {
-            for i in 0..head_v_dim {
-                output[v_out + i] = f32_to_bf16_bits(workspace[v_src + i]);
-            }
-        }
-    }
+    });
 
     if params.stage == 3 {
         return Ok(());
     }
 
-    let dt_bias = unsafe { std::slice::from_raw_parts(weights.dt_bias as *const u16, num_v_heads) };
-    let a_log = unsafe { std::slice::from_raw_parts(weights.a_log as *const u16, num_v_heads) };
-    let recurrent_state = unsafe {
-        std::slice::from_raw_parts_mut(
-            weights.recurrent_state,
-            num_v_heads * head_k_dim * head_v_dim,
-        )
-    };
-    for head in 0..num_v_heads {
-        let a_v = workspace[off_a_raw + head];
-        let b_v = workspace[off_b_raw + head];
-        let dt_b = bf16_bits_to_f32(dt_bias[head]);
-        let a_log_v = bf16_bits_to_f32(a_log[head]);
-        let softplus = (1.0 + (a_v + dt_b).exp()).ln();
-        workspace[off_beta + head] = 1.0 / (1.0 + (-b_v).exp());
-        workspace[off_g + head] = -softplus * a_log_v.exp();
-    }
+    crate::prefill_ffi::metal_profile_time("qwen36_linear_recurrent_update", "host", || {
+        let dt_bias =
+            unsafe { std::slice::from_raw_parts(weights.dt_bias as *const u16, num_v_heads) };
+        let a_log = unsafe { std::slice::from_raw_parts(weights.a_log as *const u16, num_v_heads) };
+        let recurrent_state = unsafe {
+            std::slice::from_raw_parts_mut(
+                weights.recurrent_state,
+                num_v_heads * head_k_dim * head_v_dim,
+            )
+        };
+        for head in 0..num_v_heads {
+            let a_v = workspace[off_a_raw + head];
+            let b_v = workspace[off_b_raw + head];
+            let dt_b = bf16_bits_to_f32(dt_bias[head]);
+            let a_log_v = bf16_bits_to_f32(a_log[head]);
+            let softplus = (1.0 + (a_v + dt_b).exp()).ln();
+            workspace[off_beta + head] = 1.0 / (1.0 + (-b_v).exp());
+            workspace[off_g + head] = -softplus * a_log_v.exp();
+        }
 
-    for head in 0..num_v_heads {
-        let beta = workspace[off_beta + head];
-        let gstep = workspace[off_g + head].exp();
-        let state_off = head * head_k_dim * head_v_dim;
-        let kv_off = off_k_rep + head * head_k_dim;
-        let qv_off = off_q_rep + head * head_k_dim;
-        let v_off = off_qkv_raw + 2 * key_dim + head * head_v_dim;
-        for e in 0..head_k_dim * head_v_dim {
-            recurrent_state[state_off + e] *= gstep;
-        }
-        let mut kv_mem = vec![0.0f32; head_v_dim];
-        for j in 0..head_v_dim {
-            let mut acc = 0.0f32;
-            for i in 0..head_k_dim {
-                acc += recurrent_state[state_off + i * head_v_dim + j] * workspace[kv_off + i];
+        for head in 0..num_v_heads {
+            let beta = workspace[off_beta + head];
+            let gstep = workspace[off_g + head].exp();
+            let state_off = head * head_k_dim * head_v_dim;
+            let kv_off = off_k_rep + head * head_k_dim;
+            let qv_off = off_q_rep + head * head_k_dim;
+            let v_off = off_qkv_raw + 2 * key_dim + head * head_v_dim;
+            for e in 0..head_k_dim * head_v_dim {
+                recurrent_state[state_off + e] *= gstep;
             }
-            kv_mem[j] = acc;
-        }
-        let mut delta = vec![0.0f32; head_v_dim];
-        for j in 0..head_v_dim {
-            delta[j] = (workspace[v_off + j] - kv_mem[j]) * beta;
-        }
-        for i in 0..head_k_dim {
+            let mut kv_mem = vec![0.0f32; head_v_dim];
             for j in 0..head_v_dim {
-                recurrent_state[state_off + i * head_v_dim + j] += workspace[kv_off + i] * delta[j];
+                let mut acc = 0.0f32;
+                for i in 0..head_k_dim {
+                    acc += recurrent_state[state_off + i * head_v_dim + j] * workspace[kv_off + i];
+                }
+                kv_mem[j] = acc;
             }
-        }
-        for j in 0..head_v_dim {
-            let mut acc = 0.0f32;
+            let mut delta = vec![0.0f32; head_v_dim];
+            for j in 0..head_v_dim {
+                delta[j] = (workspace[v_off + j] - kv_mem[j]) * beta;
+            }
             for i in 0..head_k_dim {
-                acc += recurrent_state[state_off + i * head_v_dim + j] * workspace[qv_off + i];
+                for j in 0..head_v_dim {
+                    recurrent_state[state_off + i * head_v_dim + j] +=
+                        workspace[kv_off + i] * delta[j];
+                }
             }
-            let rec = bf16_round_f32(acc);
-            workspace[off_rec_out + head * head_v_dim + j] = rec;
-            if params.stage == 4 {
-                output[head * head_v_dim + j] = f32_to_bf16_bits(rec);
+            for j in 0..head_v_dim {
+                let mut acc = 0.0f32;
+                for i in 0..head_k_dim {
+                    acc += recurrent_state[state_off + i * head_v_dim + j] * workspace[qv_off + i];
+                }
+                let rec = bf16_round_f32(acc);
+                workspace[off_rec_out + head * head_v_dim + j] = rec;
+                if params.stage == 4 {
+                    output[head * head_v_dim + j] = f32_to_bf16_bits(rec);
+                }
             }
         }
-    }
+    });
 
     if params.stage == 4 {
         return Ok(());
     }
 
-    let norm_w = unsafe { std::slice::from_raw_parts(weights.norm_w as *const u16, head_v_dim) };
-    for head in 0..num_v_heads {
-        let rec_off = off_rec_out + head * head_v_dim;
-        let z_off = off_z_raw + head * head_v_dim;
-        let mut mean_sq = 0.0f32;
-        for j in 0..head_v_dim {
-            let v = workspace[rec_off + j];
-            mean_sq += v * v;
+    crate::prefill_ffi::metal_profile_time("qwen36_linear_output_gate_norm", "host", || {
+        let norm_w =
+            unsafe { std::slice::from_raw_parts(weights.norm_w as *const u16, head_v_dim) };
+        for head in 0..num_v_heads {
+            let rec_off = off_rec_out + head * head_v_dim;
+            let z_off = off_z_raw + head * head_v_dim;
+            let mut mean_sq = 0.0f32;
+            for j in 0..head_v_dim {
+                let v = workspace[rec_off + j];
+                mean_sq += v * v;
+            }
+            let inv = 1.0f32 / (mean_sq / head_v_dim as f32 + params.rms_norm_eps).sqrt();
+            for j in 0..head_v_dim {
+                let rec = workspace[rec_off + j];
+                let nw = bf16_bits_to_f32(norm_w[j]);
+                let on = bf16_round_f32(rec * inv * nw);
+                let z = workspace[z_off + j];
+                let z_silu = bf16_round_f32(z * (1.0 / (1.0 + (-z).exp())));
+                workspace[rec_off + j] = bf16_round_f32(on * z_silu);
+            }
         }
-        let inv = 1.0f32 / (mean_sq / head_v_dim as f32 + params.rms_norm_eps).sqrt();
-        for j in 0..head_v_dim {
-            let rec = workspace[rec_off + j];
-            let nw = bf16_bits_to_f32(norm_w[j]);
-            let on = bf16_round_f32(rec * inv * nw);
-            let z = workspace[z_off + j];
-            let z_silu = bf16_round_f32(z * (1.0 / (1.0 + (-z).exp())));
-            workspace[rec_off + j] = bf16_round_f32(on * z_silu);
-        }
-    }
+    });
 
-    for row in 0..hidden {
-        let acc = qwen36_dense_or_int4_dot_2d(
-            weights.out_proj_w,
-            int4.out_proj_scale,
-            int4.out_proj_zero,
-            row,
-            val_dim,
-            int4.group_size,
-            &workspace[off_rec_out..off_rec_out + val_dim],
-        )?;
-        let o_out = bf16_round_f32(acc);
-        let residual = bf16_round_f32(bf16_bits_to_f32(input[row]) + o_out);
-        output[row] = f32_to_bf16_bits(residual);
-    }
+    crate::prefill_ffi::metal_profile_time("qwen36_linear_int4_out_proj", "host", || {
+        let rec_out = &workspace[off_rec_out..off_rec_out + val_dim];
+        let out_w = weights.out_proj_w as usize;
+        let out_scale = int4.out_proj_scale as usize;
+        let out_zero = int4.out_proj_zero as usize;
+        let group_size = int4.group_size.max(0) as usize;
+        qwen36_parallel_chunks_mut(&mut output[..hidden], 64, |start, chunk| {
+            for (local, out) in chunk.iter_mut().enumerate() {
+                let row = start + local;
+                let acc = qwen36_dense_or_int4_dot_2d_unchecked(
+                    out_w, out_scale, out_zero, row, val_dim, group_size, rec_out,
+                );
+                let o_out = bf16_round_f32(acc);
+                let residual = bf16_round_f32(bf16_bits_to_f32(input[row]) + o_out);
+                *out = f32_to_bf16_bits(residual);
+            }
+        });
+    });
 
     Ok(())
 }
@@ -2350,6 +3744,7 @@ fn linear_step_stage1_5_metal_host(
 #[derive(Debug, Clone, Copy)]
 pub struct Qwen36MoeFfnStepParams {
     pub stage: i32,
+    pub layer_idx: i32,
     pub hidden: i32,
     pub num_experts: i32,
     pub moe_intermediate: i32,
@@ -2420,6 +3815,5619 @@ impl Qwen36MoeFfnStepInt4 {
     }
 }
 
+fn qwen36_ffn_int4_stage5_metal_native_supported(
+    params: Qwen36MoeFfnStepParams,
+    weights: &Qwen36MoeFfnStepWeights,
+    int4: &Qwen36MoeFfnStepInt4,
+) -> bool {
+    std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5").is_some()
+        && params.stage == 5
+        && params.hidden == 2048
+        && params.num_experts == 256
+        && params.moe_intermediate == 512
+        && params.shared_intermediate == 512
+        && params.top_k == 8
+        && int4.group_size == 128
+        && !crate::metal_native::disabled_by_env()
+        && !weights.input_hidden.is_null()
+        && !weights.shared_expert_gate_w.is_null()
+        && !weights.shared_gate_proj_w.is_null()
+        && !weights.shared_up_proj_w.is_null()
+        && !weights.shared_down_proj_w.is_null()
+        && !weights.gate_up_proj_w.is_null()
+        && !weights.down_proj_w.is_null()
+        && !int4.shared_gate_proj_scale.is_null()
+        && !int4.shared_gate_proj_zero.is_null()
+        && !int4.shared_up_proj_scale.is_null()
+        && !int4.shared_up_proj_zero.is_null()
+        && !int4.shared_down_proj_scale.is_null()
+        && !int4.shared_down_proj_zero.is_null()
+        && !int4.gate_up_proj_scale.is_null()
+        && !int4.gate_up_proj_zero.is_null()
+        && !int4.down_proj_scale.is_null()
+        && !int4.down_proj_zero.is_null()
+}
+
+fn qwen36_ffn_int4_stage5_router_metal_native_supported(
+    params: Qwen36MoeFfnStepParams,
+    weights: &Qwen36MoeFfnStepWeights,
+    int4: &Qwen36MoeFfnStepInt4,
+) -> bool {
+    std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER").is_some()
+        && params.stage == 5
+        && params.hidden == 2048
+        && params.num_experts == 256
+        && params.moe_intermediate == 512
+        && params.shared_intermediate == 512
+        && params.top_k == 8
+        && int4.group_size == 128
+        && !crate::metal_native::disabled_by_env()
+        && !weights.input_hidden.is_null()
+        && !weights.post_attn_norm_w.is_null()
+        && !weights.gate_w.is_null()
+        && !weights.shared_expert_gate_w.is_null()
+        && !weights.shared_gate_proj_w.is_null()
+        && !weights.shared_up_proj_w.is_null()
+        && !weights.shared_down_proj_w.is_null()
+        && !weights.gate_up_proj_w.is_null()
+        && !weights.down_proj_w.is_null()
+        && !int4.shared_gate_proj_scale.is_null()
+        && !int4.shared_gate_proj_zero.is_null()
+        && !int4.shared_up_proj_scale.is_null()
+        && !int4.shared_up_proj_zero.is_null()
+        && !int4.shared_down_proj_scale.is_null()
+        && !int4.shared_down_proj_zero.is_null()
+        && !int4.gate_up_proj_scale.is_null()
+        && !int4.gate_up_proj_zero.is_null()
+        && !int4.down_proj_scale.is_null()
+        && !int4.down_proj_zero.is_null()
+}
+
+pub fn ffn_stage5_router_metal_native_supported(
+    params: Qwen36MoeFfnStepParams,
+    weights: &Qwen36MoeFfnStepWeights,
+    int4: &Qwen36MoeFfnStepInt4,
+) -> bool {
+    qwen36_ffn_int4_stage5_router_metal_native_supported(params, weights, int4)
+}
+
+pub fn ffn_stage5_router_defer_wait_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_QWEN36_DEFER_FFN_ROUTER_STAGE5_WAIT").is_some()
+        && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
+}
+
+fn qwen36_ffn_router_stage5_parity_tap_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_QWEN36_FFN_ROUTER_STAGE5_PARITY_TAP").is_some()
+        && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
+}
+
+fn qwen36_ffn_shared_stage5_parity_tap_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_QWEN36_FFN_SHARED_STAGE5_PARITY_TAP").is_some()
+        && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
+        && !crate::prefill_ffi::metal_batch_is_active()
+}
+
+fn qwen36_ffn_stage5_shared_host_correction_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_QWEN36_FFN_STAGE5_SHARED_HOST_CORRECTION").is_some()
+        && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
+}
+
+fn qwen36_ffn_stage5_shared_mid_host_correction_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_QWEN36_FFN_STAGE5_SHARED_MID_HOST_CORRECTION").is_some()
+        && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
+}
+
+fn qwen36_ffn_stage5_routed_host_correction_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_QWEN36_FFN_STAGE5_ROUTED_HOST_CORRECTION").is_some()
+        && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
+}
+
+fn qwen36_ffn_stage5_routed_down_host_recompute_correction_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_QWEN36_FFN_STAGE5_ROUTED_DOWN_HOST_RECOMPUTE_CORRECTION")
+        .is_some()
+        && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
+}
+
+fn qwen36_ffn_stage5_routed_down_host_recompute_correction_layer() -> Option<i32> {
+    std::env::var("SUPERSONIC_METAL_QWEN36_FFN_STAGE5_ROUTED_DOWN_HOST_RECOMPUTE_CORRECTION_LAYER")
+        .ok()
+        .and_then(|raw| raw.parse::<i32>().ok())
+}
+
+fn qwen36_ffn_stage5_routed_down_host_recompute_correction_enabled_for_layer(
+    layer_idx: i32,
+) -> bool {
+    qwen36_ffn_stage5_routed_down_host_recompute_correction_enabled()
+        && qwen36_ffn_stage5_routed_down_host_recompute_correction_layer()
+            .map_or(true, |target| target == layer_idx)
+}
+
+fn qwen36_ffn_stage5_residual_host_snap_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_QWEN36_FFN_STAGE5_RESIDUAL_HOST_SNAP").is_some()
+        && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
+}
+
+fn qwen36_ffn_stage5_residual_host_snap_layer() -> Option<i32> {
+    std::env::var("SUPERSONIC_METAL_QWEN36_FFN_STAGE5_RESIDUAL_HOST_SNAP_LAYER")
+        .ok()
+        .and_then(|raw| raw.parse::<i32>().ok())
+}
+
+fn qwen36_ffn_stage5_residual_host_snap_row() -> Option<usize> {
+    std::env::var("SUPERSONIC_METAL_QWEN36_FFN_STAGE5_RESIDUAL_HOST_SNAP_ROW")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+}
+
+fn qwen36_ffn_stage5_residual_host_snap_enabled_for_layer(layer_idx: i32) -> bool {
+    qwen36_ffn_stage5_residual_host_snap_enabled()
+        && qwen36_ffn_stage5_residual_host_snap_layer().is_some_and(|target| target == layer_idx)
+        && qwen36_ffn_stage5_residual_host_snap_row().is_some()
+}
+
+fn qwen36_ffn_stage5_routed_gate_up_tap_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_QWEN36_FFN_STAGE5_ROUTED_GATE_UP_TAP").is_some()
+        && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
+}
+
+fn qwen36_ffn_stage5_routed_finalize_tap_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_QWEN36_FFN_STAGE5_ROUTED_FINALIZE_TAP").is_some()
+        && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
+}
+
+fn qwen36_ffn_router_stage5_simd_env_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_STAGE5_SIMD").is_some()
+        && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
+}
+
+fn qwen36_ffn_router_stage5_parity_tap_max_calls() -> usize {
+    std::env::var("SUPERSONIC_METAL_QWEN36_FFN_ROUTER_STAGE5_PARITY_TAP_MAX_CALLS")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(40)
+}
+
+fn qwen36_ffn_shared_stage5_parity_tap_max_calls() -> usize {
+    std::env::var("SUPERSONIC_METAL_QWEN36_FFN_SHARED_STAGE5_PARITY_TAP_MAX_CALLS")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(40)
+}
+
+fn qwen36_ffn_shared_stage5_path_label() -> &'static str {
+    let all = std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_SHARED_TILED").is_some();
+    let gate_up = all
+        || std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_SHARED_GATE_UP_TILED").is_some();
+    let gate_up_exp2 = !gate_up
+        && std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_SHARED_GATE_UP_EXP2").is_some();
+    let scalar =
+        all || std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_SHARED_SCALAR_SIMD").is_some();
+    let down =
+        all || std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_SHARED_DOWN_TILED").is_some();
+    match (gate_up, gate_up_exp2, scalar, down) {
+        (true, false, true, true) => "all_tiled",
+        (true, false, false, false) => "gate_up_tiled",
+        (false, true, false, false) => "gate_up_exp2",
+        (false, false, true, false) => "scalar_simd",
+        (false, false, false, true) => "down_tiled",
+        (false, false, false, false) => "host_order",
+        _ => "mixed",
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Qwen36FfnRouterReference {
+    h_norm: Vec<f32>,
+    logits: Vec<f32>,
+    topk_idx: Vec<u32>,
+    topk_weight: Vec<f32>,
+}
+
+#[derive(Debug, Clone)]
+struct Qwen36FfnSharedReference {
+    shared_gate: Vec<f32>,
+    shared_up: Vec<f32>,
+    shared_mid: Vec<f32>,
+    shared_out: Vec<f32>,
+    shared_scalar: f32,
+}
+
+#[derive(Debug, Clone)]
+struct Qwen36FfnRoutedReference {
+    expert_gate: Vec<f32>,
+    expert_up: Vec<f32>,
+    expert_silu: Vec<f32>,
+    expert_mid: Vec<f32>,
+    moe_out: Vec<f32>,
+    final_out: Vec<f32>,
+}
+
+fn qwen36_compute_ffn_router_reference(
+    input: &[u16],
+    norm_w: &[u16],
+    gate_w: &[u16],
+    hidden: usize,
+    num_experts: usize,
+    top_k: usize,
+    rms_norm_eps: f32,
+) -> Qwen36FfnRouterReference {
+    let mut mean_sq = 0.0f32;
+    for &bits in input {
+        let v = bf16_bits_to_f32(bits);
+        mean_sq += v * v;
+    }
+    let inv_rms = 1.0f32 / (mean_sq / hidden as f32 + rms_norm_eps).sqrt();
+
+    let mut h_norm = vec![0.0f32; hidden];
+    for col in 0..hidden {
+        let v = bf16_bits_to_f32(input[col]);
+        let w = bf16_bits_to_f32(norm_w[col]);
+        h_norm[col] = bf16_round_f32(v * inv_rms * (1.0 + w));
+    }
+
+    let mut logits = vec![0.0f32; num_experts];
+    for expert in 0..num_experts {
+        let row = expert * hidden;
+        let mut acc = 0.0f32;
+        for col in 0..hidden {
+            acc += bf16_bits_to_f32(gate_w[row + col]) * h_norm[col];
+        }
+        logits[expert] = bf16_round_f32(acc);
+    }
+
+    let row_max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut probs = vec![0.0f32; num_experts];
+    let mut row_sum = 0.0f32;
+    for expert in 0..num_experts {
+        let e = (logits[expert] - row_max).exp();
+        probs[expert] = e;
+        row_sum += e;
+    }
+    let inv_sum = 1.0f32 / row_sum;
+    for prob in probs.iter_mut() {
+        *prob = bf16_round_f32(*prob * inv_sum);
+    }
+
+    let mut topk_idx = vec![0u32; top_k];
+    let mut topk_weight = vec![0.0f32; top_k];
+    for kk in 0..top_k {
+        let mut best_idx = -1i32;
+        let mut best_val = f32::NEG_INFINITY;
+        for (expert, &v) in probs.iter().enumerate() {
+            if v > best_val || (v == best_val && best_idx >= 0 && (expert as i32) < best_idx) {
+                best_val = v;
+                best_idx = expert as i32;
+            }
+        }
+        topk_idx[kk] = best_idx as u32;
+        topk_weight[kk] = best_val;
+        if best_idx >= 0 {
+            probs[best_idx as usize] = f32::NEG_INFINITY;
+        }
+    }
+
+    let sum_k: f32 = topk_weight.iter().sum();
+    let inv_k = 1.0f32 / sum_k;
+    for weight in topk_weight.iter_mut() {
+        *weight = bf16_round_f32(*weight * inv_k);
+    }
+
+    Qwen36FfnRouterReference {
+        h_norm,
+        logits,
+        topk_idx,
+        topk_weight,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen36_compute_ffn_shared_reference(
+    h_norm: &[f32],
+    shared_expert_gate_w: &[u16],
+    shared_gate_w: usize,
+    shared_gate_scale: usize,
+    shared_gate_zero: usize,
+    shared_up_w: usize,
+    shared_up_scale: usize,
+    shared_up_zero: usize,
+    shared_down_w: usize,
+    shared_down_scale: usize,
+    shared_down_zero: usize,
+    hidden: usize,
+    shared_intermediate: usize,
+    group_size: usize,
+) -> Qwen36FfnSharedReference {
+    let mut shared_gate = vec![0.0f32; shared_intermediate];
+    let mut shared_up = vec![0.0f32; shared_intermediate];
+    for row in 0..shared_intermediate {
+        shared_gate[row] = qwen36_dense_or_int4_dot_2d_unchecked(
+            shared_gate_w,
+            shared_gate_scale,
+            shared_gate_zero,
+            row,
+            hidden,
+            group_size,
+            h_norm,
+        );
+        shared_up[row] = qwen36_dense_or_int4_dot_2d_unchecked(
+            shared_up_w,
+            shared_up_scale,
+            shared_up_zero,
+            row,
+            hidden,
+            group_size,
+            h_norm,
+        );
+    }
+
+    let mut sg_acc = 0.0f32;
+    for col in 0..hidden {
+        sg_acc += bf16_bits_to_f32(shared_expert_gate_w[col]) * h_norm[col];
+    }
+    let shared_scalar = 1.0f32 / (1.0f32 + (-sg_acc).exp());
+
+    let mut shared_mid = vec![0.0f32; shared_intermediate];
+    for i in 0..shared_intermediate {
+        let gp = shared_gate[i];
+        let up = shared_up[i];
+        let silu = gp * (1.0f32 / (1.0f32 + (-gp).exp()));
+        shared_mid[i] = silu * up;
+    }
+
+    let mut shared_out = vec![0.0f32; hidden];
+    for row in 0..hidden {
+        let acc = qwen36_dense_or_int4_dot_2d_unchecked(
+            shared_down_w,
+            shared_down_scale,
+            shared_down_zero,
+            row,
+            shared_intermediate,
+            group_size,
+            &shared_mid,
+        );
+        shared_out[row] = bf16_round_f32(shared_scalar * acc);
+    }
+
+    Qwen36FfnSharedReference {
+        shared_gate,
+        shared_up,
+        shared_mid,
+        shared_out,
+        shared_scalar,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen36_shared_down_row_probe(
+    shared_down_w: usize,
+    shared_down_scale: usize,
+    shared_down_zero: usize,
+    row: usize,
+    shared_intermediate: usize,
+    group_size: usize,
+    shared_scalar: f32,
+    shared_mid: &[f32],
+) -> (f32, f32, f32) {
+    let acc = qwen36_dense_or_int4_dot_2d_unchecked(
+        shared_down_w,
+        shared_down_scale,
+        shared_down_zero,
+        row,
+        shared_intermediate,
+        group_size,
+        shared_mid,
+    );
+    let gated = shared_scalar * acc;
+    (acc, gated, bf16_round_f32(gated))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen36_compute_ffn_routed_reference(
+    input: &[u16],
+    h_norm: &[f32],
+    shared_out: &[f32],
+    topk_idx: &[u32],
+    topk_weight: &[f32],
+    gate_up_w: usize,
+    gate_up_scale: usize,
+    gate_up_zero: usize,
+    down_w: usize,
+    down_scale: usize,
+    down_zero: usize,
+    hidden: usize,
+    moe_intermediate: usize,
+    top_k: usize,
+    group_size: usize,
+) -> Qwen36FfnRoutedReference {
+    let rows_per_group = 2 * moe_intermediate;
+    let mut expert_gate = vec![0.0f32; top_k * moe_intermediate];
+    let mut expert_up = vec![0.0f32; top_k * moe_intermediate];
+    let mut expert_silu = vec![0.0f32; top_k * moe_intermediate];
+    let mut expert_mid = vec![0.0f32; top_k * moe_intermediate];
+    for group in 0..top_k {
+        let expert = topk_idx[group] as usize;
+        let mid_base = group * moe_intermediate;
+        for row in 0..moe_intermediate {
+            let gate = qwen36_expert_dense_or_int4_dot_unchecked(
+                gate_up_w,
+                gate_up_scale,
+                gate_up_zero,
+                expert,
+                row,
+                rows_per_group,
+                hidden,
+                group_size,
+                h_norm,
+            );
+            let up = qwen36_expert_dense_or_int4_dot_unchecked(
+                gate_up_w,
+                gate_up_scale,
+                gate_up_zero,
+                expert,
+                moe_intermediate + row,
+                rows_per_group,
+                hidden,
+                group_size,
+                h_norm,
+            );
+            let silu = gate * (1.0f32 / (1.0f32 + (-gate).exp()));
+            expert_gate[mid_base + row] = gate;
+            expert_up[mid_base + row] = up;
+            expert_silu[mid_base + row] = silu;
+            expert_mid[mid_base + row] = silu * up;
+        }
+    }
+
+    let mut moe_out = vec![0.0f32; hidden];
+    let mut final_out = vec![0.0f32; hidden];
+    for row in 0..hidden {
+        let mut acc = 0.0f32;
+        for group in 0..top_k {
+            let expert = topk_idx[group] as usize;
+            let mid = &expert_mid[group * moe_intermediate..(group + 1) * moe_intermediate];
+            let down = qwen36_expert_dense_or_int4_dot_unchecked(
+                down_w,
+                down_scale,
+                down_zero,
+                expert,
+                row,
+                hidden,
+                moe_intermediate,
+                group_size,
+                mid,
+            );
+            acc += topk_weight[group] * down;
+        }
+        let moe = bf16_round_f32(acc);
+        moe_out[row] = moe;
+        final_out[row] = bf16_round_f32(bf16_bits_to_f32(input[row]) + moe + shared_out[row]);
+    }
+
+    Qwen36FfnRoutedReference {
+        expert_gate,
+        expert_up,
+        expert_silu,
+        expert_mid,
+        moe_out,
+        final_out,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen36_routed_down_row_probe(
+    down_w: usize,
+    down_scale: usize,
+    down_zero: usize,
+    row: usize,
+    hidden: usize,
+    moe_intermediate: usize,
+    top_k: usize,
+    group_size: usize,
+    topk_idx: &[u32],
+    topk_weight: &[f32],
+    expert_mid: &[f32],
+) -> (f32, f32) {
+    let mut acc = 0.0f32;
+    for group in 0..top_k {
+        let expert = topk_idx[group] as usize;
+        let mid = &expert_mid[group * moe_intermediate..(group + 1) * moe_intermediate];
+        let down = qwen36_expert_dense_or_int4_dot_unchecked(
+            down_w,
+            down_scale,
+            down_zero,
+            expert,
+            row,
+            hidden,
+            moe_intermediate,
+            group_size,
+            mid,
+        );
+        acc += topk_weight[group] * down;
+    }
+    (acc, bf16_round_f32(acc))
+}
+
+fn qwen36_bytes_to_f32_vec(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(4)
+        .map(|chunk| f32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect()
+}
+
+fn qwen36_bytes_to_u32_vec(bytes: &[u8]) -> Vec<u32> {
+    bytes
+        .chunks_exact(4)
+        .map(|chunk| u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect()
+}
+
+fn qwen36_bytes_to_u16_vec(bytes: &[u8]) -> Vec<u16> {
+    bytes
+        .chunks_exact(2)
+        .map(|chunk| u16::from_ne_bytes([chunk[0], chunk[1]]))
+        .collect()
+}
+
+fn qwen36_bf16_slice_to_f32_vec(values: &[u16]) -> Vec<f32> {
+    values.iter().map(|&bits| bf16_bits_to_f32(bits)).collect()
+}
+
+fn qwen36_max_abs_delta(expected: &[f32], got: &[f32]) -> (f32, usize) {
+    let mut max_abs = 0.0f32;
+    let mut max_idx = 0usize;
+    for (idx, (&a, &b)) in expected.iter().zip(got.iter()).enumerate() {
+        let delta = (a - b).abs();
+        if delta > max_abs || (delta.is_nan() && !max_abs.is_nan()) {
+            max_abs = delta;
+            max_idx = idx;
+        }
+    }
+    (max_abs, max_idx)
+}
+
+fn qwen36_argmax_f32(values: &[f32]) -> (usize, f32) {
+    let mut best_idx = 0usize;
+    let mut best_value = f32::NEG_INFINITY;
+    for (idx, &value) in values.iter().enumerate() {
+        if value > best_value || (value == best_value && idx < best_idx) {
+            best_idx = idx;
+            best_value = value;
+        }
+    }
+    (best_idx, best_value)
+}
+
+fn qwen36_first_u32_mismatch(expected: &[u32], got: &[u32]) -> i32 {
+    let min_len = expected.len().min(got.len());
+    for idx in 0..min_len {
+        if expected[idx] != got[idx] {
+            return idx as i32;
+        }
+    }
+    if expected.len() != got.len() {
+        return min_len as i32;
+    }
+    -1
+}
+
+fn qwen36_join_u32(values: &[u32]) -> String {
+    values
+        .iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn qwen36_join_f32(values: &[f32]) -> String {
+    values
+        .iter()
+        .map(|value| format!("{value:.8}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn qwen36_emit_ffn_router_stage5_parity_tap(
+    ordinal: usize,
+    layer_idx: i32,
+    workspace: &GpuBuffer,
+    output_idx: &GpuBuffer,
+    hidden: usize,
+    num_experts: usize,
+    top_k: usize,
+    off_h_norm: usize,
+    off_router_logits: usize,
+    off_topk_val: usize,
+    off_topk_idx: usize,
+    reference: &Qwen36FfnRouterReference,
+) -> Result<(), GpuError> {
+    let call = QWEN36_FFN_ROUTER_PARITY_TAP_CALLS.fetch_add(1, Ordering::Relaxed);
+    if call >= qwen36_ffn_router_stage5_parity_tap_max_calls() {
+        return Ok(());
+    }
+
+    gpu_hal::sync(ordinal)?;
+    let workspace_bytes = workspace.to_host_bytes()?;
+    let workspace_f32 = qwen36_bytes_to_f32_vec(&workspace_bytes);
+    let output_idx_bytes = output_idx.to_host_bytes()?;
+    let output_idx_u32 = qwen36_bytes_to_u32_vec(&output_idx_bytes);
+
+    let h_norm = &workspace_f32[off_h_norm..off_h_norm + hidden];
+    let logits = &workspace_f32[off_router_logits..off_router_logits + num_experts];
+    let topk_weight = &workspace_f32[off_topk_val..off_topk_val + top_k];
+    let workspace_topk_idx: Vec<u32> = workspace_f32[off_topk_idx..off_topk_idx + top_k]
+        .iter()
+        .map(|value| value.to_bits())
+        .collect();
+    let output_topk_idx = &output_idx_u32[..top_k.min(output_idx_u32.len())];
+
+    let (h_norm_max_abs, h_norm_argmax) = qwen36_max_abs_delta(&reference.h_norm, h_norm);
+    let (logits_max_abs, logits_argmax) = qwen36_max_abs_delta(&reference.logits, logits);
+    let (topk_weight_max_abs, topk_weight_argmax) =
+        qwen36_max_abs_delta(&reference.topk_weight, topk_weight);
+    let workspace_idx_match = reference.topk_idx == workspace_topk_idx;
+    let output_idx_match = reference.topk_idx.as_slice() == output_topk_idx;
+    let topk_idx_match = workspace_idx_match && output_idx_match;
+    let workspace_first_idx_mismatch =
+        qwen36_first_u32_mismatch(&reference.topk_idx, &workspace_topk_idx);
+    let output_first_idx_mismatch = qwen36_first_u32_mismatch(&reference.topk_idx, output_topk_idx);
+    let topk_first_mismatch = match (workspace_first_idx_mismatch, output_first_idx_mismatch) {
+        (-1, -1) => -1,
+        (-1, output) => output,
+        (workspace, -1) => workspace,
+        (workspace, output) => workspace.min(output),
+    };
+    let (host_top_logit_idx, host_top_logit) = qwen36_argmax_f32(&reference.logits);
+    let (metal_top_logit_idx, metal_top_logit) = qwen36_argmax_f32(logits);
+    let host_logit_at_metal_top = reference
+        .logits
+        .get(metal_top_logit_idx)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let metal_logit_at_host_top = logits.get(host_top_logit_idx).copied().unwrap_or(f32::NAN);
+    let router_path = if qwen36_ffn_router_stage5_simd_env_enabled() {
+        "simd"
+    } else {
+        "serial"
+    };
+
+    eprintln!(
+        "[qwen36-ffn-router-parity] call={} layer={} router_path={} topk_idx_match={} workspace_idx_match={} output_idx_match={} topk_first_mismatch={} workspace_first_idx_mismatch={} output_first_idx_mismatch={} h_norm_max_abs={:.8e} h_norm_argmax={} logits_max_abs={:.8e} logits_argmax={} host_top_logit_idx={} metal_top_logit_idx={} host_top_logit={:.8e} metal_top_logit={:.8e} host_logit_at_metal_top={:.8e} metal_logit_at_host_top={:.8e} topk_weight_max_abs={:.8e} topk_weight_argmax={} host_idx={} workspace_idx={} output_idx={} host_w={} metal_w={}",
+        call,
+        layer_idx,
+        router_path,
+        topk_idx_match as u8,
+        workspace_idx_match as u8,
+        output_idx_match as u8,
+        topk_first_mismatch,
+        workspace_first_idx_mismatch,
+        output_first_idx_mismatch,
+        h_norm_max_abs,
+        h_norm_argmax,
+        logits_max_abs,
+        logits_argmax,
+        host_top_logit_idx,
+        metal_top_logit_idx,
+        host_top_logit,
+        metal_top_logit,
+        host_logit_at_metal_top,
+        metal_logit_at_host_top,
+        topk_weight_max_abs,
+        topk_weight_argmax,
+        qwen36_join_u32(&reference.topk_idx),
+        qwen36_join_u32(&workspace_topk_idx),
+        qwen36_join_u32(output_topk_idx),
+        qwen36_join_f32(&reference.topk_weight),
+        qwen36_join_f32(topk_weight),
+    );
+
+    Ok(())
+}
+
+fn qwen36_emit_ffn_shared_stage5_parity_tap(
+    ordinal: usize,
+    layer_idx: i32,
+    workspace: &GpuBuffer,
+    hidden: usize,
+    shared_intermediate: usize,
+    off_sg_scalar: usize,
+    off_sgp: usize,
+    off_sup: usize,
+    off_shared_mid: usize,
+    off_shared_out: usize,
+    weights: &Qwen36MoeFfnStepWeights,
+    int4: &Qwen36MoeFfnStepInt4,
+    reference: &Qwen36FfnSharedReference,
+) -> Result<(), GpuError> {
+    let call = QWEN36_FFN_SHARED_PARITY_TAP_CALLS.fetch_add(1, Ordering::Relaxed);
+    if call >= qwen36_ffn_shared_stage5_parity_tap_max_calls() {
+        return Ok(());
+    }
+
+    gpu_hal::sync(ordinal)?;
+    let workspace_bytes = workspace.to_host_bytes()?;
+    let workspace_f32 = qwen36_bytes_to_f32_vec(&workspace_bytes);
+
+    let shared_gate = &workspace_f32[off_sgp..off_sgp + shared_intermediate];
+    let shared_up = &workspace_f32[off_sup..off_sup + shared_intermediate];
+    let shared_mid = &workspace_f32[off_shared_mid..off_shared_mid + shared_intermediate];
+    let shared_out = &workspace_f32[off_shared_out..off_shared_out + hidden];
+    let shared_scalar = workspace_f32[off_sg_scalar];
+
+    let (shared_gate_max_abs, shared_gate_argmax) =
+        qwen36_max_abs_delta(&reference.shared_gate, shared_gate);
+    let (shared_up_max_abs, shared_up_argmax) =
+        qwen36_max_abs_delta(&reference.shared_up, shared_up);
+    let (shared_mid_max_abs, shared_mid_argmax) =
+        qwen36_max_abs_delta(&reference.shared_mid, shared_mid);
+    let (shared_out_max_abs, shared_out_argmax) =
+        qwen36_max_abs_delta(&reference.shared_out, shared_out);
+    let shared_scalar_abs = (reference.shared_scalar - shared_scalar).abs();
+    let host_shared_gate_at_mid_argmax = reference
+        .shared_gate
+        .get(shared_mid_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let metal_shared_gate_at_mid_argmax = shared_gate
+        .get(shared_mid_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let host_shared_up_at_mid_argmax = reference
+        .shared_up
+        .get(shared_mid_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let metal_shared_up_at_mid_argmax = shared_up
+        .get(shared_mid_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let host_shared_mid_at_argmax = reference
+        .shared_mid
+        .get(shared_mid_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let metal_shared_mid_at_argmax = shared_mid
+        .get(shared_mid_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let host_shared_out_at_argmax = reference
+        .shared_out
+        .get(shared_out_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let metal_shared_out_at_argmax = shared_out
+        .get(shared_out_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let shared_down_w = weights.shared_down_proj_w as usize;
+    let shared_down_scale = int4.shared_down_proj_scale as usize;
+    let shared_down_zero = int4.shared_down_proj_zero as usize;
+    let group_size = int4.group_size.max(0) as usize;
+    let (
+        host_shared_down_acc_at_out_argmax,
+        host_shared_gated_at_out_argmax,
+        host_shared_out_recomputed_at_argmax,
+    ) = qwen36_shared_down_row_probe(
+        shared_down_w,
+        shared_down_scale,
+        shared_down_zero,
+        shared_out_argmax,
+        shared_intermediate,
+        group_size,
+        reference.shared_scalar,
+        &reference.shared_mid,
+    );
+    let (
+        metal_mid_host_shared_down_acc_at_out_argmax,
+        metal_mid_host_shared_gated_at_out_argmax,
+        metal_mid_host_shared_out_at_argmax,
+    ) = qwen36_shared_down_row_probe(
+        shared_down_w,
+        shared_down_scale,
+        shared_down_zero,
+        shared_out_argmax,
+        shared_intermediate,
+        group_size,
+        shared_scalar,
+        shared_mid,
+    );
+
+    eprintln!(
+        "[qwen36-ffn-shared-parity] call={} layer={} shared_path={} shared_gate_max_abs={:.8e} shared_gate_argmax={} shared_up_max_abs={:.8e} shared_up_argmax={} shared_mid_max_abs={:.8e} shared_mid_argmax={} host_shared_gate_at_mid_argmax={:.8e} metal_shared_gate_at_mid_argmax={:.8e} host_shared_up_at_mid_argmax={:.8e} metal_shared_up_at_mid_argmax={:.8e} host_shared_mid_at_argmax={:.8e} metal_shared_mid_at_argmax={:.8e} shared_scalar_abs={:.8e} host_shared_scalar={:.8e} metal_shared_scalar={:.8e} shared_out_max_abs={:.8e} shared_out_argmax={} host_shared_out_at_argmax={:.8e} metal_shared_out_at_argmax={:.8e} host_shared_down_acc_at_out_argmax={:.8e} host_shared_gated_at_out_argmax={:.8e} host_shared_out_recomputed_at_argmax={:.8e} metal_mid_host_shared_down_acc_at_out_argmax={:.8e} metal_mid_host_shared_gated_at_out_argmax={:.8e} metal_mid_host_shared_out_at_argmax={:.8e}",
+        call,
+        layer_idx,
+        qwen36_ffn_shared_stage5_path_label(),
+        shared_gate_max_abs,
+        shared_gate_argmax,
+        shared_up_max_abs,
+        shared_up_argmax,
+        shared_mid_max_abs,
+        shared_mid_argmax,
+        host_shared_gate_at_mid_argmax,
+        metal_shared_gate_at_mid_argmax,
+        host_shared_up_at_mid_argmax,
+        metal_shared_up_at_mid_argmax,
+        host_shared_mid_at_argmax,
+        metal_shared_mid_at_argmax,
+        shared_scalar_abs,
+        reference.shared_scalar,
+        shared_scalar,
+        shared_out_max_abs,
+        shared_out_argmax,
+        host_shared_out_at_argmax,
+        metal_shared_out_at_argmax,
+        host_shared_down_acc_at_out_argmax,
+        host_shared_gated_at_out_argmax,
+        host_shared_out_recomputed_at_argmax,
+        metal_mid_host_shared_down_acc_at_out_argmax,
+        metal_mid_host_shared_gated_at_out_argmax,
+        metal_mid_host_shared_out_at_argmax,
+    );
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen36_apply_ffn_shared_stage5_host_correction(
+    ordinal: usize,
+    layer_idx: i32,
+    hidden: usize,
+    off_shared_out: usize,
+    off_moe_out: usize,
+    weights: &Qwen36MoeFfnStepWeights,
+    workspace: &mut GpuBuffer,
+    output: &mut GpuBuffer,
+    reference: &Qwen36FfnSharedReference,
+) -> Result<(), GpuError> {
+    crate::prefill_ffi::flush_metal_batch()?;
+    gpu_hal::sync(ordinal)?;
+
+    let workspace_len = workspace.len_bytes() / std::mem::size_of::<f32>();
+    if workspace_len < off_moe_out + hidden {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::ffn_step_launch: shared host correction workspace too small: need {}, got {}",
+            off_moe_out + hidden,
+            workspace_len
+        )));
+    }
+    if output.len_bytes() / std::mem::size_of::<u16>() < hidden {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::ffn_step_launch: shared host correction output too small: need {hidden}, got {}",
+            output.len_bytes() / std::mem::size_of::<u16>()
+        )));
+    }
+
+    let input = unsafe { std::slice::from_raw_parts(weights.input_hidden as *const u16, hidden) };
+    let workspace = unsafe {
+        std::slice::from_raw_parts_mut(workspace.as_mut_ptr() as *mut f32, workspace_len)
+    };
+    let output = unsafe { std::slice::from_raw_parts_mut(output.as_mut_ptr() as *mut u16, hidden) };
+
+    let mut shared_out_max_abs = 0.0f32;
+    let mut shared_out_argmax = 0usize;
+    let mut host_shared_out_at_argmax = f32::NAN;
+    let mut metal_shared_out_at_argmax = f32::NAN;
+    let mut output_patch_max_abs = 0.0f32;
+    let mut output_patch_argmax = 0usize;
+    let mut changed_output_elems = 0usize;
+    let mut first_changed_output = usize::MAX;
+
+    for row in 0..hidden {
+        let metal_shared = workspace[off_shared_out + row];
+        let host_shared = reference.shared_out[row];
+        let shared_abs = (host_shared - metal_shared).abs();
+        if row == 0 || shared_abs > shared_out_max_abs {
+            shared_out_max_abs = shared_abs;
+            shared_out_argmax = row;
+            host_shared_out_at_argmax = host_shared;
+            metal_shared_out_at_argmax = metal_shared;
+        }
+
+        let before = bf16_bits_to_f32(output[row]);
+        workspace[off_shared_out + row] = host_shared;
+        let corrected = bf16_round_f32(
+            bf16_bits_to_f32(input[row]) + workspace[off_moe_out + row] + host_shared,
+        );
+        let corrected_bits = f32_to_bf16_bits(corrected);
+        let after = bf16_bits_to_f32(corrected_bits);
+        let patch_abs = (after - before).abs();
+        if patch_abs > output_patch_max_abs {
+            output_patch_max_abs = patch_abs;
+            output_patch_argmax = row;
+        }
+        if corrected_bits != output[row] {
+            changed_output_elems += 1;
+            if first_changed_output == usize::MAX {
+                first_changed_output = row;
+            }
+        }
+        output[row] = corrected_bits;
+    }
+
+    let first_changed_output = if first_changed_output == usize::MAX {
+        -1isize
+    } else {
+        first_changed_output as isize
+    };
+    eprintln!(
+        "[qwen36-ffn-shared-host-correction] layer={} shared_path={} hidden={} shared_out_max_abs={:.8e} shared_out_argmax={} host_shared_out_at_argmax={:.8e} metal_shared_out_at_argmax={:.8e} output_patch_max_abs={:.8e} output_patch_argmax={} changed_output_elems={} first_changed_output={}",
+        layer_idx,
+        qwen36_ffn_shared_stage5_path_label(),
+        hidden,
+        shared_out_max_abs,
+        shared_out_argmax,
+        host_shared_out_at_argmax,
+        metal_shared_out_at_argmax,
+        output_patch_max_abs,
+        output_patch_argmax,
+        changed_output_elems,
+        first_changed_output,
+    );
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen36_apply_ffn_shared_mid_stage5_host_correction(
+    ordinal: usize,
+    layer_idx: i32,
+    hidden: usize,
+    shared_intermediate: usize,
+    off_shared_mid: usize,
+    off_shared_out: usize,
+    off_moe_out: usize,
+    weights: &Qwen36MoeFfnStepWeights,
+    int4: &Qwen36MoeFfnStepInt4,
+    workspace: &mut GpuBuffer,
+    output: &mut GpuBuffer,
+    reference: &Qwen36FfnSharedReference,
+) -> Result<(), GpuError> {
+    crate::prefill_ffi::flush_metal_batch()?;
+    gpu_hal::sync(ordinal)?;
+
+    let workspace_len = workspace.len_bytes() / std::mem::size_of::<f32>();
+    let needed = (off_shared_mid + shared_intermediate)
+        .max(off_shared_out + hidden)
+        .max(off_moe_out + hidden);
+    if workspace_len < needed {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::ffn_step_launch: shared-mid host correction workspace too small: need {needed}, got {workspace_len}",
+        )));
+    }
+    if output.len_bytes() / std::mem::size_of::<u16>() < hidden {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::ffn_step_launch: shared-mid host correction output too small: need {hidden}, got {}",
+            output.len_bytes() / std::mem::size_of::<u16>()
+        )));
+    }
+
+    let input = unsafe { std::slice::from_raw_parts(weights.input_hidden as *const u16, hidden) };
+    let workspace = unsafe {
+        std::slice::from_raw_parts_mut(workspace.as_mut_ptr() as *mut f32, workspace_len)
+    };
+    let output = unsafe { std::slice::from_raw_parts_mut(output.as_mut_ptr() as *mut u16, hidden) };
+
+    let mut shared_mid_max_abs = 0.0f32;
+    let mut shared_mid_argmax = 0usize;
+    let mut host_shared_mid_at_argmax = f32::NAN;
+    let mut metal_shared_mid_at_argmax = f32::NAN;
+    let mut changed_shared_mid_elems = 0usize;
+    for row in 0..shared_intermediate {
+        let metal_mid = workspace[off_shared_mid + row];
+        let host_mid = reference.shared_mid[row];
+        let mid_abs = (host_mid - metal_mid).abs();
+        if row == 0 || mid_abs > shared_mid_max_abs {
+            shared_mid_max_abs = mid_abs;
+            shared_mid_argmax = row;
+            host_shared_mid_at_argmax = host_mid;
+            metal_shared_mid_at_argmax = metal_mid;
+        }
+        if metal_mid != host_mid {
+            changed_shared_mid_elems += 1;
+        }
+        workspace[off_shared_mid + row] = host_mid;
+    }
+
+    let mut shared_out_patch_max_abs = 0.0f32;
+    let mut shared_out_patch_argmax = 0usize;
+    let mut host_shared_out_at_argmax = f32::NAN;
+    let mut metal_shared_out_at_argmax = f32::NAN;
+    let mut output_patch_max_abs = 0.0f32;
+    let mut output_patch_argmax = 0usize;
+    let mut changed_shared_out_elems = 0usize;
+    let mut changed_output_elems = 0usize;
+    let mut first_changed_output = usize::MAX;
+    let shared_mid = &reference.shared_mid;
+    for row in 0..hidden {
+        let metal_shared = workspace[off_shared_out + row];
+        let (_, _, corrected_shared) = qwen36_shared_down_row_probe(
+            weights.shared_down_proj_w as usize,
+            int4.shared_down_proj_scale as usize,
+            int4.shared_down_proj_zero as usize,
+            row,
+            shared_intermediate,
+            int4.group_size.max(0) as usize,
+            reference.shared_scalar,
+            shared_mid,
+        );
+        let shared_abs = (corrected_shared - metal_shared).abs();
+        if row == 0 || shared_abs > shared_out_patch_max_abs {
+            shared_out_patch_max_abs = shared_abs;
+            shared_out_patch_argmax = row;
+            host_shared_out_at_argmax = corrected_shared;
+            metal_shared_out_at_argmax = metal_shared;
+        }
+        if metal_shared != corrected_shared {
+            changed_shared_out_elems += 1;
+        }
+
+        let before = bf16_bits_to_f32(output[row]);
+        workspace[off_shared_out + row] = corrected_shared;
+        let corrected = bf16_round_f32(
+            bf16_bits_to_f32(input[row]) + workspace[off_moe_out + row] + corrected_shared,
+        );
+        let corrected_bits = f32_to_bf16_bits(corrected);
+        let after = bf16_bits_to_f32(corrected_bits);
+        let patch_abs = (after - before).abs();
+        if patch_abs > output_patch_max_abs {
+            output_patch_max_abs = patch_abs;
+            output_patch_argmax = row;
+        }
+        if corrected_bits != output[row] {
+            changed_output_elems += 1;
+            if first_changed_output == usize::MAX {
+                first_changed_output = row;
+            }
+        }
+        output[row] = corrected_bits;
+    }
+
+    let first_changed_output = if first_changed_output == usize::MAX {
+        -1isize
+    } else {
+        first_changed_output as isize
+    };
+    eprintln!(
+        "[qwen36-ffn-shared-mid-host-correction] layer={} shared_path={} hidden={} shared_intermediate={} shared_mid_max_abs={:.8e} shared_mid_argmax={} host_shared_mid_at_argmax={:.8e} metal_shared_mid_at_argmax={:.8e} shared_out_patch_max_abs={:.8e} shared_out_patch_argmax={} host_shared_out_at_argmax={:.8e} metal_shared_out_at_argmax={:.8e} output_patch_max_abs={:.8e} output_patch_argmax={} changed_shared_mid_elems={} changed_shared_out_elems={} changed_output_elems={} first_changed_output={}",
+        layer_idx,
+        qwen36_ffn_shared_stage5_path_label(),
+        hidden,
+        shared_intermediate,
+        shared_mid_max_abs,
+        shared_mid_argmax,
+        host_shared_mid_at_argmax,
+        metal_shared_mid_at_argmax,
+        shared_out_patch_max_abs,
+        shared_out_patch_argmax,
+        host_shared_out_at_argmax,
+        metal_shared_out_at_argmax,
+        output_patch_max_abs,
+        output_patch_argmax,
+        changed_shared_mid_elems,
+        changed_shared_out_elems,
+        changed_output_elems,
+        first_changed_output,
+    );
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen36_emit_ffn_routed_stage5_gate_up_tap(
+    ordinal: usize,
+    layer_idx: i32,
+    hidden: usize,
+    moe_intermediate: usize,
+    top_k: usize,
+    off_topk_val: usize,
+    off_topk_idx: usize,
+    off_expert_gu: usize,
+    off_expert_mid: usize,
+    off_moe_out: usize,
+    weights: &Qwen36MoeFfnStepWeights,
+    int4: &Qwen36MoeFfnStepInt4,
+    workspace: &GpuBuffer,
+    output: &GpuBuffer,
+    reference: &Qwen36FfnRoutedReference,
+    router_reference: &Qwen36FfnRouterReference,
+) -> Result<(), GpuError> {
+    crate::prefill_ffi::flush_metal_batch()?;
+    gpu_hal::sync(ordinal)?;
+
+    let workspace_bytes = workspace.to_host_bytes()?;
+    let workspace_f32 = qwen36_bytes_to_f32_vec(&workspace_bytes);
+    let workspace_len = workspace_f32.len();
+    let expert_mid_len = top_k * moe_intermediate;
+    let expert_gu_len = top_k * 2 * moe_intermediate;
+    if workspace_len < off_expert_gu + expert_gu_len
+        || workspace_len < off_expert_mid + expert_mid_len
+        || workspace_len < off_moe_out + hidden
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::ffn_step_launch: routed gate/up tap workspace too small: need {}, got {}",
+            (off_expert_gu + expert_gu_len)
+                .max(off_expert_mid + expert_mid_len)
+                .max(off_moe_out + hidden),
+            workspace_len
+        )));
+    }
+
+    let output_bytes = output.to_host_bytes()?;
+    let output_u16 = qwen36_bytes_to_u16_vec(&output_bytes);
+    if output_u16.len() < hidden {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::ffn_step_launch: routed gate/up tap output too small: need {hidden}, got {}",
+            output_u16.len()
+        )));
+    }
+
+    let metal_expert_gu = &workspace_f32[off_expert_gu..off_expert_gu + expert_gu_len];
+    let metal_expert_mid = &workspace_f32[off_expert_mid..off_expert_mid + expert_mid_len];
+    let metal_topk_weight = &workspace_f32[off_topk_val..off_topk_val + top_k];
+    let metal_topk_idx: Vec<u32> = workspace_f32[off_topk_idx..off_topk_idx + top_k]
+        .iter()
+        .map(|value| value.to_bits())
+        .collect();
+    let final_out = qwen36_bf16_slice_to_f32_vec(&output_u16[..hidden]);
+
+    let (expert_mid_max_abs, expert_mid_argmax) =
+        qwen36_max_abs_delta(&reference.expert_mid, metal_expert_mid);
+    let topk_idx_match = router_reference.topk_idx == metal_topk_idx;
+    let (topk_weight_max_abs, topk_weight_argmax) =
+        qwen36_max_abs_delta(&router_reference.topk_weight, metal_topk_weight);
+    let host_topk_weight_at_argmax = router_reference
+        .topk_weight
+        .get(topk_weight_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let metal_topk_weight_at_argmax = metal_topk_weight
+        .get(topk_weight_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let host_expert_mid_at_argmax = reference
+        .expert_mid
+        .get(expert_mid_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let metal_expert_mid_at_argmax = metal_expert_mid
+        .get(expert_mid_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let expert_mid_group = expert_mid_argmax / moe_intermediate;
+    let expert_mid_row = expert_mid_argmax % moe_intermediate;
+    let metal_gu_base = expert_mid_group * 2 * moe_intermediate;
+    let host_expert_gate_at_mid_argmax = reference
+        .expert_gate
+        .get(expert_mid_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let metal_expert_gate_at_mid_argmax = metal_expert_gu
+        .get(metal_gu_base + expert_mid_row)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let host_expert_up_at_mid_argmax = reference
+        .expert_up
+        .get(expert_mid_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let metal_expert_up_at_mid_argmax = metal_expert_gu
+        .get(metal_gu_base + moe_intermediate + expert_mid_row)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let host_expert_silu_at_mid_argmax = reference
+        .expert_silu
+        .get(expert_mid_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let metal_expert_silu_at_mid_argmax = metal_expert_gate_at_mid_argmax
+        * (1.0f32 / (1.0f32 + (-metal_expert_gate_at_mid_argmax).exp()));
+    let host_expert_mid_recomputed_at_argmax =
+        host_expert_silu_at_mid_argmax * host_expert_up_at_mid_argmax;
+    let metal_expert_mid_recomputed_at_argmax =
+        metal_expert_silu_at_mid_argmax * metal_expert_up_at_mid_argmax;
+    let expert_gate_delta_at_mid_argmax =
+        (host_expert_gate_at_mid_argmax - metal_expert_gate_at_mid_argmax).abs();
+    let expert_up_delta_at_mid_argmax =
+        (host_expert_up_at_mid_argmax - metal_expert_up_at_mid_argmax).abs();
+    let expert_silu_delta_at_mid_argmax =
+        (host_expert_silu_at_mid_argmax - metal_expert_silu_at_mid_argmax).abs();
+    let expert_mid_recompute_delta_at_argmax =
+        (host_expert_mid_recomputed_at_argmax - metal_expert_mid_recomputed_at_argmax).abs();
+
+    let moe_out = &workspace_f32[off_moe_out..off_moe_out + hidden];
+    let (moe_out_max_abs, moe_out_argmax) = qwen36_max_abs_delta(&reference.moe_out, moe_out);
+    let host_moe_out_at_argmax = reference
+        .moe_out
+        .get(moe_out_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let metal_moe_out_at_argmax = moe_out.get(moe_out_argmax).copied().unwrap_or(f32::NAN);
+    let (final_out_max_abs, final_out_argmax) =
+        qwen36_max_abs_delta(&reference.final_out, &final_out);
+    let host_final_out_at_argmax = reference
+        .final_out
+        .get(final_out_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let metal_final_out_at_argmax = final_out.get(final_out_argmax).copied().unwrap_or(f32::NAN);
+
+    let group_size = int4.group_size.max(0) as usize;
+    let down_w = weights.down_proj_w as usize;
+    let down_scale = int4.down_proj_scale as usize;
+    let down_zero = int4.down_proj_zero as usize;
+    let (host_routed_down_acc_at_moe_argmax, host_routed_moe_out_recomputed_at_argmax) =
+        qwen36_routed_down_row_probe(
+            down_w,
+            down_scale,
+            down_zero,
+            moe_out_argmax,
+            hidden,
+            moe_intermediate,
+            top_k,
+            group_size,
+            &router_reference.topk_idx,
+            &router_reference.topk_weight,
+            &reference.expert_mid,
+        );
+    let (metal_mid_host_topk_down_acc_at_moe_argmax, metal_mid_host_topk_moe_out_at_argmax) =
+        qwen36_routed_down_row_probe(
+            down_w,
+            down_scale,
+            down_zero,
+            moe_out_argmax,
+            hidden,
+            moe_intermediate,
+            top_k,
+            group_size,
+            &router_reference.topk_idx,
+            &router_reference.topk_weight,
+            metal_expert_mid,
+        );
+    let (metal_mid_metal_topk_down_acc_at_moe_argmax, metal_mid_metal_topk_moe_out_at_argmax) =
+        qwen36_routed_down_row_probe(
+            down_w,
+            down_scale,
+            down_zero,
+            moe_out_argmax,
+            hidden,
+            moe_intermediate,
+            top_k,
+            group_size,
+            &metal_topk_idx,
+            metal_topk_weight,
+            metal_expert_mid,
+        );
+
+    let router_path = if qwen36_ffn_router_stage5_simd_env_enabled() {
+        "simd"
+    } else {
+        "serial"
+    };
+    eprintln!(
+        "[qwen36-ffn-routed-gate-up-tap] layer={} router_path={} hidden={} top_k={} topk_idx_match={} topk_weight_max_abs={:.8e} topk_weight_argmax={} host_topk_weight_at_argmax={:.8e} metal_topk_weight_at_argmax={:.8e} expert_mid_max_abs={:.8e} expert_mid_argmax={} expert_mid_group={} expert_mid_row={} host_expert_gate_at_mid_argmax={:.8e} metal_expert_gate_at_mid_argmax={:.8e} expert_gate_delta_at_mid_argmax={:.8e} host_expert_up_at_mid_argmax={:.8e} metal_expert_up_at_mid_argmax={:.8e} expert_up_delta_at_mid_argmax={:.8e} host_expert_silu_at_mid_argmax={:.8e} metal_expert_silu_at_mid_argmax={:.8e} expert_silu_delta_at_mid_argmax={:.8e} host_expert_mid_at_argmax={:.8e} metal_expert_mid_at_argmax={:.8e} host_expert_mid_recomputed_at_argmax={:.8e} metal_expert_mid_recomputed_at_argmax={:.8e} expert_mid_recompute_delta_at_argmax={:.8e} moe_out_max_abs={:.8e} moe_out_argmax={} host_moe_out_at_argmax={:.8e} metal_moe_out_at_argmax={:.8e} host_routed_down_acc_at_moe_argmax={:.8e} host_routed_moe_out_recomputed_at_argmax={:.8e} metal_mid_host_topk_down_acc_at_moe_argmax={:.8e} metal_mid_host_topk_moe_out_at_argmax={:.8e} metal_mid_metal_topk_down_acc_at_moe_argmax={:.8e} metal_mid_metal_topk_moe_out_at_argmax={:.8e} final_out_max_abs={:.8e} final_out_argmax={} host_final_out_at_argmax={:.8e} metal_final_out_at_argmax={:.8e}",
+        layer_idx,
+        router_path,
+        hidden,
+        top_k,
+        topk_idx_match as u8,
+        topk_weight_max_abs,
+        topk_weight_argmax,
+        host_topk_weight_at_argmax,
+        metal_topk_weight_at_argmax,
+        expert_mid_max_abs,
+        expert_mid_argmax,
+        expert_mid_group,
+        expert_mid_row,
+        host_expert_gate_at_mid_argmax,
+        metal_expert_gate_at_mid_argmax,
+        expert_gate_delta_at_mid_argmax,
+        host_expert_up_at_mid_argmax,
+        metal_expert_up_at_mid_argmax,
+        expert_up_delta_at_mid_argmax,
+        host_expert_silu_at_mid_argmax,
+        metal_expert_silu_at_mid_argmax,
+        expert_silu_delta_at_mid_argmax,
+        host_expert_mid_at_argmax,
+        metal_expert_mid_at_argmax,
+        host_expert_mid_recomputed_at_argmax,
+        metal_expert_mid_recomputed_at_argmax,
+        expert_mid_recompute_delta_at_argmax,
+        moe_out_max_abs,
+        moe_out_argmax,
+        host_moe_out_at_argmax,
+        metal_moe_out_at_argmax,
+        host_routed_down_acc_at_moe_argmax,
+        host_routed_moe_out_recomputed_at_argmax,
+        metal_mid_host_topk_down_acc_at_moe_argmax,
+        metal_mid_host_topk_moe_out_at_argmax,
+        metal_mid_metal_topk_down_acc_at_moe_argmax,
+        metal_mid_metal_topk_moe_out_at_argmax,
+        final_out_max_abs,
+        final_out_argmax,
+        host_final_out_at_argmax,
+        metal_final_out_at_argmax,
+    );
+
+    Ok(())
+}
+
+struct Qwen36RoutedFinalizeTapRow {
+    row: usize,
+    input: f32,
+    host_moe: f32,
+    metal_moe: f32,
+    host_shared: f32,
+    metal_shared: f32,
+    host_final: f32,
+    metal_final: f32,
+    final_host_host: f32,
+    final_metal_moe_host_shared: f32,
+    final_host_moe_metal_shared: f32,
+    final_metal_moe_metal_shared: f32,
+    host_down_acc: f32,
+    host_moe_recomputed: f32,
+    metal_mid_host_topk_down_acc: f32,
+    metal_mid_host_topk_moe: f32,
+    metal_mid_metal_topk_down_acc: f32,
+    metal_mid_metal_topk_moe: f32,
+    final_metal_mid_host_topk_host_shared: f32,
+    final_metal_mid_host_topk_metal_shared: f32,
+    final_metal_mid_metal_topk_host_shared: f32,
+    final_metal_mid_metal_topk_metal_shared: f32,
+    metal_moe_matches_metal_mid_host_topk: u8,
+    metal_moe_matches_metal_mid_metal_topk: u8,
+    host_final_matches_host_moe_host_shared: u8,
+    metal_final_matches_metal_moe_metal_shared: u8,
+}
+
+fn qwen36_final_from_parts(input: f32, moe: f32, shared: f32) -> f32 {
+    bf16_round_f32(input + moe + shared)
+}
+
+fn qwen36_exact_match_flag(a: f32, b: f32) -> u8 {
+    (a.to_bits() == b.to_bits()) as u8
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen36_build_routed_finalize_tap_row(
+    row: usize,
+    input: &[u16],
+    hidden: usize,
+    moe_intermediate: usize,
+    top_k: usize,
+    group_size: usize,
+    down_w: usize,
+    down_scale: usize,
+    down_zero: usize,
+    router_reference: &Qwen36FfnRouterReference,
+    shared_reference: &Qwen36FfnSharedReference,
+    routed_reference: &Qwen36FfnRoutedReference,
+    metal_topk_idx: &[u32],
+    metal_topk_weight: &[f32],
+    metal_expert_mid: &[f32],
+    metal_shared_out: &[f32],
+    metal_moe_out: &[f32],
+    metal_final_out: &[f32],
+) -> Qwen36RoutedFinalizeTapRow {
+    let input_value = bf16_bits_to_f32(input[row]);
+    let host_moe = routed_reference.moe_out[row];
+    let metal_moe = metal_moe_out[row];
+    let host_shared = shared_reference.shared_out[row];
+    let metal_shared = metal_shared_out[row];
+    let host_final = routed_reference.final_out[row];
+    let metal_final = metal_final_out[row];
+    let final_host_host = qwen36_final_from_parts(input_value, host_moe, host_shared);
+    let final_metal_moe_host_shared = qwen36_final_from_parts(input_value, metal_moe, host_shared);
+    let final_host_moe_metal_shared = qwen36_final_from_parts(input_value, host_moe, metal_shared);
+    let final_metal_moe_metal_shared =
+        qwen36_final_from_parts(input_value, metal_moe, metal_shared);
+    let (host_down_acc, host_moe_recomputed) = qwen36_routed_down_row_probe(
+        down_w,
+        down_scale,
+        down_zero,
+        row,
+        hidden,
+        moe_intermediate,
+        top_k,
+        group_size,
+        &router_reference.topk_idx,
+        &router_reference.topk_weight,
+        &routed_reference.expert_mid,
+    );
+    let (metal_mid_host_topk_down_acc, metal_mid_host_topk_moe) = qwen36_routed_down_row_probe(
+        down_w,
+        down_scale,
+        down_zero,
+        row,
+        hidden,
+        moe_intermediate,
+        top_k,
+        group_size,
+        &router_reference.topk_idx,
+        &router_reference.topk_weight,
+        metal_expert_mid,
+    );
+    let (metal_mid_metal_topk_down_acc, metal_mid_metal_topk_moe) = qwen36_routed_down_row_probe(
+        down_w,
+        down_scale,
+        down_zero,
+        row,
+        hidden,
+        moe_intermediate,
+        top_k,
+        group_size,
+        metal_topk_idx,
+        metal_topk_weight,
+        metal_expert_mid,
+    );
+    let final_metal_mid_host_topk_host_shared =
+        qwen36_final_from_parts(input_value, metal_mid_host_topk_moe, host_shared);
+    let final_metal_mid_host_topk_metal_shared =
+        qwen36_final_from_parts(input_value, metal_mid_host_topk_moe, metal_shared);
+    let final_metal_mid_metal_topk_host_shared =
+        qwen36_final_from_parts(input_value, metal_mid_metal_topk_moe, host_shared);
+    let final_metal_mid_metal_topk_metal_shared =
+        qwen36_final_from_parts(input_value, metal_mid_metal_topk_moe, metal_shared);
+
+    Qwen36RoutedFinalizeTapRow {
+        row,
+        input: input_value,
+        host_moe,
+        metal_moe,
+        host_shared,
+        metal_shared,
+        host_final,
+        metal_final,
+        final_host_host,
+        final_metal_moe_host_shared,
+        final_host_moe_metal_shared,
+        final_metal_moe_metal_shared,
+        host_down_acc,
+        host_moe_recomputed,
+        metal_mid_host_topk_down_acc,
+        metal_mid_host_topk_moe,
+        metal_mid_metal_topk_down_acc,
+        metal_mid_metal_topk_moe,
+        final_metal_mid_host_topk_host_shared,
+        final_metal_mid_host_topk_metal_shared,
+        final_metal_mid_metal_topk_host_shared,
+        final_metal_mid_metal_topk_metal_shared,
+        metal_moe_matches_metal_mid_host_topk: qwen36_exact_match_flag(
+            metal_moe,
+            metal_mid_host_topk_moe,
+        ),
+        metal_moe_matches_metal_mid_metal_topk: qwen36_exact_match_flag(
+            metal_moe,
+            metal_mid_metal_topk_moe,
+        ),
+        host_final_matches_host_moe_host_shared: qwen36_exact_match_flag(
+            host_final,
+            final_host_host,
+        ),
+        metal_final_matches_metal_moe_metal_shared: qwen36_exact_match_flag(
+            metal_final,
+            final_metal_moe_metal_shared,
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen36_emit_ffn_routed_stage5_finalize_tap(
+    ordinal: usize,
+    layer_idx: i32,
+    hidden: usize,
+    moe_intermediate: usize,
+    top_k: usize,
+    off_topk_val: usize,
+    off_topk_idx: usize,
+    off_shared_out: usize,
+    off_expert_mid: usize,
+    off_moe_out: usize,
+    weights: &Qwen36MoeFfnStepWeights,
+    int4: &Qwen36MoeFfnStepInt4,
+    workspace: &GpuBuffer,
+    output: &GpuBuffer,
+    shared_reference: &Qwen36FfnSharedReference,
+    routed_reference: &Qwen36FfnRoutedReference,
+    router_reference: &Qwen36FfnRouterReference,
+) -> Result<(), GpuError> {
+    crate::prefill_ffi::flush_metal_batch()?;
+    gpu_hal::sync(ordinal)?;
+
+    let workspace_bytes = workspace.to_host_bytes()?;
+    let workspace_f32 = qwen36_bytes_to_f32_vec(&workspace_bytes);
+    let workspace_len = workspace_f32.len();
+    let expert_mid_len = top_k * moe_intermediate;
+    let workspace_needed = (off_topk_val + top_k)
+        .max(off_topk_idx + top_k)
+        .max(off_shared_out + hidden)
+        .max(off_expert_mid + expert_mid_len)
+        .max(off_moe_out + hidden);
+    if workspace_len < workspace_needed {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::ffn_step_launch: routed finalize tap workspace too small: need {workspace_needed}, got {workspace_len}"
+        )));
+    }
+
+    let output_bytes = output.to_host_bytes()?;
+    let output_u16 = qwen36_bytes_to_u16_vec(&output_bytes);
+    if output_u16.len() < hidden {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::ffn_step_launch: routed finalize tap output too small: need {hidden}, got {}",
+            output_u16.len()
+        )));
+    }
+
+    let input = unsafe { std::slice::from_raw_parts(weights.input_hidden as *const u16, hidden) };
+    let metal_topk_weight = &workspace_f32[off_topk_val..off_topk_val + top_k];
+    let metal_topk_idx: Vec<u32> = workspace_f32[off_topk_idx..off_topk_idx + top_k]
+        .iter()
+        .map(|value| value.to_bits())
+        .collect();
+    let metal_shared_out = &workspace_f32[off_shared_out..off_shared_out + hidden];
+    let metal_expert_mid = &workspace_f32[off_expert_mid..off_expert_mid + expert_mid_len];
+    let metal_moe_out = &workspace_f32[off_moe_out..off_moe_out + hidden];
+    let metal_final_out = qwen36_bf16_slice_to_f32_vec(&output_u16[..hidden]);
+
+    let topk_idx_match = router_reference.topk_idx == metal_topk_idx;
+    let (topk_weight_max_abs, topk_weight_argmax) =
+        qwen36_max_abs_delta(&router_reference.topk_weight, metal_topk_weight);
+    let (shared_out_max_abs, shared_out_argmax) =
+        qwen36_max_abs_delta(&shared_reference.shared_out, metal_shared_out);
+    let host_shared_out_at_argmax = shared_reference
+        .shared_out
+        .get(shared_out_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let metal_shared_out_at_argmax = metal_shared_out
+        .get(shared_out_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let (moe_out_max_abs, moe_out_argmax) =
+        qwen36_max_abs_delta(&routed_reference.moe_out, metal_moe_out);
+    let (final_out_max_abs, final_out_argmax) =
+        qwen36_max_abs_delta(&routed_reference.final_out, &metal_final_out);
+
+    let group_size = int4.group_size.max(0) as usize;
+    let down_w = weights.down_proj_w as usize;
+    let down_scale = int4.down_proj_scale as usize;
+    let down_zero = int4.down_proj_zero as usize;
+    let moe_probe = qwen36_build_routed_finalize_tap_row(
+        moe_out_argmax,
+        input,
+        hidden,
+        moe_intermediate,
+        top_k,
+        group_size,
+        down_w,
+        down_scale,
+        down_zero,
+        router_reference,
+        shared_reference,
+        routed_reference,
+        &metal_topk_idx,
+        metal_topk_weight,
+        metal_expert_mid,
+        metal_shared_out,
+        metal_moe_out,
+        &metal_final_out,
+    );
+    let final_probe = qwen36_build_routed_finalize_tap_row(
+        final_out_argmax,
+        input,
+        hidden,
+        moe_intermediate,
+        top_k,
+        group_size,
+        down_w,
+        down_scale,
+        down_zero,
+        router_reference,
+        shared_reference,
+        routed_reference,
+        &metal_topk_idx,
+        metal_topk_weight,
+        metal_expert_mid,
+        metal_shared_out,
+        metal_moe_out,
+        &metal_final_out,
+    );
+
+    let router_path = if qwen36_ffn_router_stage5_simd_env_enabled() {
+        "simd"
+    } else {
+        "serial"
+    };
+    eprintln!(
+        "[qwen36-ffn-routed-finalize-tap] layer={} router_path={} hidden={} top_k={} topk_idx_match={} topk_weight_max_abs={:.8e} topk_weight_argmax={} shared_out_max_abs={:.8e} shared_out_argmax={} host_shared_out_at_argmax={:.8e} metal_shared_out_at_argmax={:.8e} moe_out_max_abs={:.8e} moe_out_argmax={} final_out_max_abs={:.8e} final_out_argmax={} moe_probe_row={} moe_input={:.8e} moe_host_moe={:.8e} moe_metal_moe={:.8e} moe_host_shared={:.8e} moe_metal_shared={:.8e} moe_host_final={:.8e} moe_metal_final={:.8e} moe_final_host_host={:.8e} moe_final_metal_moe_host_shared={:.8e} moe_final_host_moe_metal_shared={:.8e} moe_final_metal_moe_metal_shared={:.8e} moe_host_down_acc={:.8e} moe_host_moe_recomputed={:.8e} moe_metal_mid_host_topk_down_acc={:.8e} moe_metal_mid_host_topk_moe={:.8e} moe_metal_mid_metal_topk_down_acc={:.8e} moe_metal_mid_metal_topk_moe={:.8e} moe_final_metal_mid_host_topk_host_shared={:.8e} moe_final_metal_mid_host_topk_metal_shared={:.8e} moe_final_metal_mid_metal_topk_host_shared={:.8e} moe_final_metal_mid_metal_topk_metal_shared={:.8e} moe_metal_moe_matches_metal_mid_host_topk={} moe_metal_moe_matches_metal_mid_metal_topk={} moe_host_final_matches_host_moe_host_shared={} moe_metal_final_matches_metal_moe_metal_shared={} final_probe_row={} final_input={:.8e} final_host_moe={:.8e} final_metal_moe={:.8e} final_host_shared={:.8e} final_metal_shared={:.8e} final_host_final={:.8e} final_metal_final={:.8e} final_final_host_host={:.8e} final_final_metal_moe_host_shared={:.8e} final_final_host_moe_metal_shared={:.8e} final_final_metal_moe_metal_shared={:.8e} final_host_down_acc={:.8e} final_host_moe_recomputed={:.8e} final_metal_mid_host_topk_down_acc={:.8e} final_metal_mid_host_topk_moe={:.8e} final_metal_mid_metal_topk_down_acc={:.8e} final_metal_mid_metal_topk_moe={:.8e} final_final_metal_mid_host_topk_host_shared={:.8e} final_final_metal_mid_host_topk_metal_shared={:.8e} final_final_metal_mid_metal_topk_host_shared={:.8e} final_final_metal_mid_metal_topk_metal_shared={:.8e} final_metal_moe_matches_metal_mid_host_topk={} final_metal_moe_matches_metal_mid_metal_topk={} final_host_final_matches_host_moe_host_shared={} final_metal_final_matches_metal_moe_metal_shared={}",
+        layer_idx,
+        router_path,
+        hidden,
+        top_k,
+        topk_idx_match as u8,
+        topk_weight_max_abs,
+        topk_weight_argmax,
+        shared_out_max_abs,
+        shared_out_argmax,
+        host_shared_out_at_argmax,
+        metal_shared_out_at_argmax,
+        moe_out_max_abs,
+        moe_out_argmax,
+        final_out_max_abs,
+        final_out_argmax,
+        moe_probe.row,
+        moe_probe.input,
+        moe_probe.host_moe,
+        moe_probe.metal_moe,
+        moe_probe.host_shared,
+        moe_probe.metal_shared,
+        moe_probe.host_final,
+        moe_probe.metal_final,
+        moe_probe.final_host_host,
+        moe_probe.final_metal_moe_host_shared,
+        moe_probe.final_host_moe_metal_shared,
+        moe_probe.final_metal_moe_metal_shared,
+        moe_probe.host_down_acc,
+        moe_probe.host_moe_recomputed,
+        moe_probe.metal_mid_host_topk_down_acc,
+        moe_probe.metal_mid_host_topk_moe,
+        moe_probe.metal_mid_metal_topk_down_acc,
+        moe_probe.metal_mid_metal_topk_moe,
+        moe_probe.final_metal_mid_host_topk_host_shared,
+        moe_probe.final_metal_mid_host_topk_metal_shared,
+        moe_probe.final_metal_mid_metal_topk_host_shared,
+        moe_probe.final_metal_mid_metal_topk_metal_shared,
+        moe_probe.metal_moe_matches_metal_mid_host_topk,
+        moe_probe.metal_moe_matches_metal_mid_metal_topk,
+        moe_probe.host_final_matches_host_moe_host_shared,
+        moe_probe.metal_final_matches_metal_moe_metal_shared,
+        final_probe.row,
+        final_probe.input,
+        final_probe.host_moe,
+        final_probe.metal_moe,
+        final_probe.host_shared,
+        final_probe.metal_shared,
+        final_probe.host_final,
+        final_probe.metal_final,
+        final_probe.final_host_host,
+        final_probe.final_metal_moe_host_shared,
+        final_probe.final_host_moe_metal_shared,
+        final_probe.final_metal_moe_metal_shared,
+        final_probe.host_down_acc,
+        final_probe.host_moe_recomputed,
+        final_probe.metal_mid_host_topk_down_acc,
+        final_probe.metal_mid_host_topk_moe,
+        final_probe.metal_mid_metal_topk_down_acc,
+        final_probe.metal_mid_metal_topk_moe,
+        final_probe.final_metal_mid_host_topk_host_shared,
+        final_probe.final_metal_mid_host_topk_metal_shared,
+        final_probe.final_metal_mid_metal_topk_host_shared,
+        final_probe.final_metal_mid_metal_topk_metal_shared,
+        final_probe.metal_moe_matches_metal_mid_host_topk,
+        final_probe.metal_moe_matches_metal_mid_metal_topk,
+        final_probe.host_final_matches_host_moe_host_shared,
+        final_probe.metal_final_matches_metal_moe_metal_shared,
+    );
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen36_apply_ffn_routed_stage5_host_correction(
+    ordinal: usize,
+    layer_idx: i32,
+    hidden: usize,
+    moe_intermediate: usize,
+    top_k: usize,
+    off_topk_val: usize,
+    off_topk_idx: usize,
+    off_expert_gu: usize,
+    off_expert_mid: usize,
+    off_moe_out: usize,
+    weights: &Qwen36MoeFfnStepWeights,
+    int4: &Qwen36MoeFfnStepInt4,
+    workspace: &mut GpuBuffer,
+    output: &mut GpuBuffer,
+    reference: &Qwen36FfnRoutedReference,
+    router_reference: &Qwen36FfnRouterReference,
+) -> Result<(), GpuError> {
+    crate::prefill_ffi::flush_metal_batch()?;
+    gpu_hal::sync(ordinal)?;
+
+    let workspace_len = workspace.len_bytes() / std::mem::size_of::<f32>();
+    let expert_mid_len = top_k * moe_intermediate;
+    let expert_gu_len = top_k * 2 * moe_intermediate;
+    if workspace_len < off_expert_gu + expert_gu_len
+        || workspace_len < off_expert_mid + expert_mid_len
+        || workspace_len < off_moe_out + hidden
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::ffn_step_launch: routed host correction workspace too small: need {}, got {}",
+            (off_expert_gu + expert_gu_len)
+                .max(off_expert_mid + expert_mid_len)
+                .max(off_moe_out + hidden),
+            workspace_len
+        )));
+    }
+    if output.len_bytes() / std::mem::size_of::<u16>() < hidden {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::ffn_step_launch: routed host correction output too small: need {hidden}, got {}",
+            output.len_bytes() / std::mem::size_of::<u16>()
+        )));
+    }
+
+    let workspace = unsafe {
+        std::slice::from_raw_parts_mut(workspace.as_mut_ptr() as *mut f32, workspace_len)
+    };
+    let output = unsafe { std::slice::from_raw_parts_mut(output.as_mut_ptr() as *mut u16, hidden) };
+    let metal_expert_gu = workspace[off_expert_gu..off_expert_gu + expert_gu_len].to_vec();
+    let metal_expert_mid = workspace[off_expert_mid..off_expert_mid + expert_mid_len].to_vec();
+    let metal_topk_weight = workspace[off_topk_val..off_topk_val + top_k].to_vec();
+    let metal_topk_idx: Vec<u32> = workspace[off_topk_idx..off_topk_idx + top_k]
+        .iter()
+        .map(|value| value.to_bits())
+        .collect();
+    let (expert_mid_max_abs, expert_mid_argmax) =
+        qwen36_max_abs_delta(&reference.expert_mid, &metal_expert_mid);
+    let topk_idx_match = router_reference.topk_idx == metal_topk_idx;
+    let (topk_weight_max_abs, topk_weight_argmax) =
+        qwen36_max_abs_delta(&router_reference.topk_weight, &metal_topk_weight);
+    let host_topk_weight_at_argmax = router_reference
+        .topk_weight
+        .get(topk_weight_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let metal_topk_weight_at_argmax = metal_topk_weight
+        .get(topk_weight_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let host_expert_mid_at_argmax = reference
+        .expert_mid
+        .get(expert_mid_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let metal_expert_mid_at_argmax = metal_expert_mid
+        .get(expert_mid_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let expert_mid_group = expert_mid_argmax / moe_intermediate;
+    let expert_mid_row = expert_mid_argmax % moe_intermediate;
+    let metal_gu_base = expert_mid_group * 2 * moe_intermediate;
+    let host_expert_gate_at_mid_argmax = reference
+        .expert_gate
+        .get(expert_mid_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let metal_expert_gate_at_mid_argmax = metal_expert_gu
+        .get(metal_gu_base + expert_mid_row)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let host_expert_up_at_mid_argmax = reference
+        .expert_up
+        .get(expert_mid_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let metal_expert_up_at_mid_argmax = metal_expert_gu
+        .get(metal_gu_base + moe_intermediate + expert_mid_row)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let host_expert_silu_at_mid_argmax = reference
+        .expert_silu
+        .get(expert_mid_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let metal_expert_silu_at_mid_argmax = metal_expert_gate_at_mid_argmax
+        * (1.0f32 / (1.0f32 + (-metal_expert_gate_at_mid_argmax).exp()));
+    let host_expert_mid_recomputed_at_argmax =
+        host_expert_silu_at_mid_argmax * host_expert_up_at_mid_argmax;
+    let metal_expert_mid_recomputed_at_argmax =
+        metal_expert_silu_at_mid_argmax * metal_expert_up_at_mid_argmax;
+    let expert_gate_delta_at_mid_argmax =
+        (host_expert_gate_at_mid_argmax - metal_expert_gate_at_mid_argmax).abs();
+    let expert_up_delta_at_mid_argmax =
+        (host_expert_up_at_mid_argmax - metal_expert_up_at_mid_argmax).abs();
+    let expert_silu_delta_at_mid_argmax =
+        (host_expert_silu_at_mid_argmax - metal_expert_silu_at_mid_argmax).abs();
+    let expert_mid_recompute_delta_at_argmax =
+        (host_expert_mid_recomputed_at_argmax - metal_expert_mid_recomputed_at_argmax).abs();
+
+    let mut moe_out_max_abs = 0.0f32;
+    let mut moe_out_argmax = 0usize;
+    let mut host_moe_out_at_argmax = f32::NAN;
+    let mut metal_moe_out_at_argmax = f32::NAN;
+    let mut output_patch_max_abs = 0.0f32;
+    let mut output_patch_argmax = 0usize;
+    let mut host_final_out_at_argmax = f32::NAN;
+    let mut metal_final_out_at_argmax = f32::NAN;
+    let mut changed_output_elems = 0usize;
+    let mut first_changed_output = usize::MAX;
+
+    for row in 0..hidden {
+        let metal_moe = workspace[off_moe_out + row];
+        let host_moe = reference.moe_out[row];
+        let moe_abs = (host_moe - metal_moe).abs();
+        if row == 0 || moe_abs > moe_out_max_abs {
+            moe_out_max_abs = moe_abs;
+            moe_out_argmax = row;
+            host_moe_out_at_argmax = host_moe;
+            metal_moe_out_at_argmax = metal_moe;
+        }
+
+        let before = bf16_bits_to_f32(output[row]);
+        let host_final = reference.final_out[row];
+        let patch_abs = (host_final - before).abs();
+        if row == 0 || patch_abs > output_patch_max_abs {
+            output_patch_max_abs = patch_abs;
+            output_patch_argmax = row;
+            host_final_out_at_argmax = host_final;
+            metal_final_out_at_argmax = before;
+        }
+        workspace[off_moe_out + row] = host_moe;
+        let corrected_bits = f32_to_bf16_bits(host_final);
+        if corrected_bits != output[row] {
+            changed_output_elems += 1;
+            if first_changed_output == usize::MAX {
+                first_changed_output = row;
+            }
+        }
+        output[row] = corrected_bits;
+    }
+
+    let group_size = int4.group_size.max(0) as usize;
+    let down_w = weights.down_proj_w as usize;
+    let down_scale = int4.down_proj_scale as usize;
+    let down_zero = int4.down_proj_zero as usize;
+    let (host_routed_down_acc_at_moe_argmax, host_routed_moe_out_recomputed_at_argmax) =
+        qwen36_routed_down_row_probe(
+            down_w,
+            down_scale,
+            down_zero,
+            moe_out_argmax,
+            hidden,
+            moe_intermediate,
+            top_k,
+            group_size,
+            &router_reference.topk_idx,
+            &router_reference.topk_weight,
+            &reference.expert_mid,
+        );
+    let (metal_mid_host_topk_down_acc_at_moe_argmax, metal_mid_host_topk_moe_out_at_argmax) =
+        qwen36_routed_down_row_probe(
+            down_w,
+            down_scale,
+            down_zero,
+            moe_out_argmax,
+            hidden,
+            moe_intermediate,
+            top_k,
+            group_size,
+            &router_reference.topk_idx,
+            &router_reference.topk_weight,
+            &metal_expert_mid,
+        );
+    let (metal_mid_metal_topk_down_acc_at_moe_argmax, metal_mid_metal_topk_moe_out_at_argmax) =
+        qwen36_routed_down_row_probe(
+            down_w,
+            down_scale,
+            down_zero,
+            moe_out_argmax,
+            hidden,
+            moe_intermediate,
+            top_k,
+            group_size,
+            &metal_topk_idx,
+            &metal_topk_weight,
+            &metal_expert_mid,
+        );
+
+    let first_changed_output = if first_changed_output == usize::MAX {
+        -1isize
+    } else {
+        first_changed_output as isize
+    };
+    let router_path = if qwen36_ffn_router_stage5_simd_env_enabled() {
+        "simd"
+    } else {
+        "serial"
+    };
+    eprintln!(
+        "[qwen36-ffn-routed-host-correction] layer={} router_path={} hidden={} top_k={} topk_idx_match={} topk_weight_max_abs={:.8e} topk_weight_argmax={} host_topk_weight_at_argmax={:.8e} metal_topk_weight_at_argmax={:.8e} expert_mid_max_abs={:.8e} expert_mid_argmax={} expert_mid_group={} expert_mid_row={} host_expert_gate_at_mid_argmax={:.8e} metal_expert_gate_at_mid_argmax={:.8e} expert_gate_delta_at_mid_argmax={:.8e} host_expert_up_at_mid_argmax={:.8e} metal_expert_up_at_mid_argmax={:.8e} expert_up_delta_at_mid_argmax={:.8e} host_expert_silu_at_mid_argmax={:.8e} metal_expert_silu_at_mid_argmax={:.8e} expert_silu_delta_at_mid_argmax={:.8e} host_expert_mid_at_argmax={:.8e} metal_expert_mid_at_argmax={:.8e} host_expert_mid_recomputed_at_argmax={:.8e} metal_expert_mid_recomputed_at_argmax={:.8e} expert_mid_recompute_delta_at_argmax={:.8e} moe_out_max_abs={:.8e} moe_out_argmax={} host_moe_out_at_argmax={:.8e} metal_moe_out_at_argmax={:.8e} host_routed_down_acc_at_moe_argmax={:.8e} host_routed_moe_out_recomputed_at_argmax={:.8e} metal_mid_host_topk_down_acc_at_moe_argmax={:.8e} metal_mid_host_topk_moe_out_at_argmax={:.8e} metal_mid_metal_topk_down_acc_at_moe_argmax={:.8e} metal_mid_metal_topk_moe_out_at_argmax={:.8e} output_patch_max_abs={:.8e} output_patch_argmax={} host_final_out_at_argmax={:.8e} metal_final_out_at_argmax={:.8e} changed_output_elems={} first_changed_output={}",
+        layer_idx,
+        router_path,
+        hidden,
+        top_k,
+        topk_idx_match as u8,
+        topk_weight_max_abs,
+        topk_weight_argmax,
+        host_topk_weight_at_argmax,
+        metal_topk_weight_at_argmax,
+        expert_mid_max_abs,
+        expert_mid_argmax,
+        expert_mid_group,
+        expert_mid_row,
+        host_expert_gate_at_mid_argmax,
+        metal_expert_gate_at_mid_argmax,
+        expert_gate_delta_at_mid_argmax,
+        host_expert_up_at_mid_argmax,
+        metal_expert_up_at_mid_argmax,
+        expert_up_delta_at_mid_argmax,
+        host_expert_silu_at_mid_argmax,
+        metal_expert_silu_at_mid_argmax,
+        expert_silu_delta_at_mid_argmax,
+        host_expert_mid_at_argmax,
+        metal_expert_mid_at_argmax,
+        host_expert_mid_recomputed_at_argmax,
+        metal_expert_mid_recomputed_at_argmax,
+        expert_mid_recompute_delta_at_argmax,
+        moe_out_max_abs,
+        moe_out_argmax,
+        host_moe_out_at_argmax,
+        metal_moe_out_at_argmax,
+        host_routed_down_acc_at_moe_argmax,
+        host_routed_moe_out_recomputed_at_argmax,
+        metal_mid_host_topk_down_acc_at_moe_argmax,
+        metal_mid_host_topk_moe_out_at_argmax,
+        metal_mid_metal_topk_down_acc_at_moe_argmax,
+        metal_mid_metal_topk_moe_out_at_argmax,
+        output_patch_max_abs,
+        output_patch_argmax,
+        host_final_out_at_argmax,
+        metal_final_out_at_argmax,
+        changed_output_elems,
+        first_changed_output,
+    );
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen36_apply_ffn_routed_down_stage5_host_recompute_correction(
+    ordinal: usize,
+    layer_idx: i32,
+    hidden: usize,
+    moe_intermediate: usize,
+    top_k: usize,
+    off_topk_val: usize,
+    off_topk_idx: usize,
+    off_shared_out: usize,
+    off_expert_mid: usize,
+    off_moe_out: usize,
+    weights: &Qwen36MoeFfnStepWeights,
+    int4: &Qwen36MoeFfnStepInt4,
+    workspace: &mut GpuBuffer,
+    output: &mut GpuBuffer,
+    reference: &Qwen36FfnRoutedReference,
+    router_reference: &Qwen36FfnRouterReference,
+) -> Result<(), GpuError> {
+    crate::prefill_ffi::flush_metal_batch()?;
+    gpu_hal::sync(ordinal)?;
+
+    let workspace_len = workspace.len_bytes() / std::mem::size_of::<f32>();
+    let expert_mid_len = top_k * moe_intermediate;
+    let needed = (off_topk_val + top_k)
+        .max(off_topk_idx + top_k)
+        .max(off_shared_out + hidden)
+        .max(off_expert_mid + expert_mid_len)
+        .max(off_moe_out + hidden);
+    if workspace_len < needed {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::ffn_step_launch: routed-down host recompute correction workspace too small: need {needed}, got {workspace_len}",
+        )));
+    }
+    if output.len_bytes() / std::mem::size_of::<u16>() < hidden {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::ffn_step_launch: routed-down host recompute correction output too small: need {hidden}, got {}",
+            output.len_bytes() / std::mem::size_of::<u16>()
+        )));
+    }
+
+    let input = unsafe { std::slice::from_raw_parts(weights.input_hidden as *const u16, hidden) };
+    let workspace = unsafe {
+        std::slice::from_raw_parts_mut(workspace.as_mut_ptr() as *mut f32, workspace_len)
+    };
+    let output = unsafe { std::slice::from_raw_parts_mut(output.as_mut_ptr() as *mut u16, hidden) };
+    let metal_topk_weight = workspace[off_topk_val..off_topk_val + top_k].to_vec();
+    let metal_topk_idx: Vec<u32> = workspace[off_topk_idx..off_topk_idx + top_k]
+        .iter()
+        .map(|value| value.to_bits())
+        .collect();
+    let metal_expert_mid = workspace[off_expert_mid..off_expert_mid + expert_mid_len].to_vec();
+    let metal_moe_out = workspace[off_moe_out..off_moe_out + hidden].to_vec();
+
+    let topk_idx_match = router_reference.topk_idx == metal_topk_idx;
+    let (topk_weight_max_abs, topk_weight_argmax) =
+        qwen36_max_abs_delta(&router_reference.topk_weight, &metal_topk_weight);
+    let (expert_mid_max_abs, expert_mid_argmax) =
+        qwen36_max_abs_delta(&reference.expert_mid, &metal_expert_mid);
+    let expert_mid_group = expert_mid_argmax / moe_intermediate;
+    let expert_mid_row = expert_mid_argmax % moe_intermediate;
+    let host_expert_mid_at_argmax = reference
+        .expert_mid
+        .get(expert_mid_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let metal_expert_mid_at_argmax = metal_expert_mid
+        .get(expert_mid_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
+
+    let group_size = int4.group_size.max(0) as usize;
+    let down_w = weights.down_proj_w as usize;
+    let down_scale = int4.down_proj_scale as usize;
+    let down_zero = int4.down_proj_zero as usize;
+
+    let mut metal_moe_vs_recomputed_max_abs = 0.0f32;
+    let mut metal_moe_vs_recomputed_argmax = 0usize;
+    let mut host_moe_vs_recomputed_max_abs = 0.0f32;
+    let mut host_moe_vs_recomputed_argmax = 0usize;
+    let mut output_patch_max_abs = 0.0f32;
+    let mut output_patch_argmax = 0usize;
+    let mut final_vs_host_max_abs = 0.0f32;
+    let mut final_vs_host_argmax = 0usize;
+    let mut recomputed_down_acc_at_moe_argmax = f32::NAN;
+    let mut recomputed_moe_at_moe_argmax = f32::NAN;
+    let mut host_moe_at_moe_argmax = f32::NAN;
+    let mut metal_moe_at_moe_argmax = f32::NAN;
+    let mut recomputed_moe_at_host_argmax = f32::NAN;
+    let mut host_moe_at_host_argmax = f32::NAN;
+    let mut metal_moe_at_host_argmax = f32::NAN;
+    let mut host_final_at_final_argmax = f32::NAN;
+    let mut recomputed_final_at_final_argmax = f32::NAN;
+    let mut changed_moe_elems = 0usize;
+    let mut changed_output_elems = 0usize;
+    let mut first_changed_output = usize::MAX;
+
+    for row in 0..hidden {
+        let (down_acc, recomputed_moe) = qwen36_routed_down_row_probe(
+            down_w,
+            down_scale,
+            down_zero,
+            row,
+            hidden,
+            moe_intermediate,
+            top_k,
+            group_size,
+            &metal_topk_idx,
+            &metal_topk_weight,
+            &metal_expert_mid,
+        );
+        let metal_moe = metal_moe_out[row];
+        let host_moe = reference.moe_out[row];
+        let metal_delta = (recomputed_moe - metal_moe).abs();
+        if row == 0 || metal_delta > metal_moe_vs_recomputed_max_abs {
+            metal_moe_vs_recomputed_max_abs = metal_delta;
+            metal_moe_vs_recomputed_argmax = row;
+            recomputed_down_acc_at_moe_argmax = down_acc;
+            recomputed_moe_at_moe_argmax = recomputed_moe;
+            host_moe_at_moe_argmax = host_moe;
+            metal_moe_at_moe_argmax = metal_moe;
+        }
+        let host_delta = (recomputed_moe - host_moe).abs();
+        if row == 0 || host_delta > host_moe_vs_recomputed_max_abs {
+            host_moe_vs_recomputed_max_abs = host_delta;
+            host_moe_vs_recomputed_argmax = row;
+            recomputed_moe_at_host_argmax = recomputed_moe;
+            host_moe_at_host_argmax = host_moe;
+            metal_moe_at_host_argmax = metal_moe;
+        }
+        if recomputed_moe.to_bits() != metal_moe.to_bits() {
+            changed_moe_elems += 1;
+        }
+
+        let before = bf16_bits_to_f32(output[row]);
+        workspace[off_moe_out + row] = recomputed_moe;
+        let recomputed_final = bf16_round_f32(
+            bf16_bits_to_f32(input[row]) + recomputed_moe + workspace[off_shared_out + row],
+        );
+        let recomputed_bits = f32_to_bf16_bits(recomputed_final);
+        let patch_abs = (recomputed_final - before).abs();
+        if row == 0 || patch_abs > output_patch_max_abs {
+            output_patch_max_abs = patch_abs;
+            output_patch_argmax = row;
+        }
+        let final_host_abs = (recomputed_final - reference.final_out[row]).abs();
+        if row == 0 || final_host_abs > final_vs_host_max_abs {
+            final_vs_host_max_abs = final_host_abs;
+            final_vs_host_argmax = row;
+            host_final_at_final_argmax = reference.final_out[row];
+            recomputed_final_at_final_argmax = recomputed_final;
+        }
+        if recomputed_bits != output[row] {
+            changed_output_elems += 1;
+            if first_changed_output == usize::MAX {
+                first_changed_output = row;
+            }
+        }
+        output[row] = recomputed_bits;
+    }
+
+    let first_changed_output = if first_changed_output == usize::MAX {
+        -1isize
+    } else {
+        first_changed_output as isize
+    };
+    let router_path = if qwen36_ffn_router_stage5_simd_env_enabled() {
+        "simd"
+    } else {
+        "serial"
+    };
+    eprintln!(
+        "[qwen36-ffn-routed-down-host-recompute-correction] layer={} router_path={} hidden={} top_k={} topk_idx_match={} topk_weight_max_abs={:.8e} topk_weight_argmax={} expert_mid_max_abs={:.8e} expert_mid_argmax={} expert_mid_group={} expert_mid_row={} host_expert_mid_at_argmax={:.8e} metal_expert_mid_at_argmax={:.8e} metal_moe_vs_recomputed_max_abs={:.8e} metal_moe_vs_recomputed_argmax={} recomputed_down_acc_at_moe_argmax={:.8e} recomputed_moe_at_moe_argmax={:.8e} host_moe_at_moe_argmax={:.8e} metal_moe_at_moe_argmax={:.8e} host_moe_vs_recomputed_max_abs={:.8e} host_moe_vs_recomputed_argmax={} recomputed_moe_at_host_argmax={:.8e} host_moe_at_host_argmax={:.8e} metal_moe_at_host_argmax={:.8e} output_patch_max_abs={:.8e} output_patch_argmax={} final_vs_host_max_abs={:.8e} final_vs_host_argmax={} host_final_at_final_argmax={:.8e} recomputed_final_at_final_argmax={:.8e} changed_moe_elems={} changed_output_elems={} first_changed_output={}",
+        layer_idx,
+        router_path,
+        hidden,
+        top_k,
+        topk_idx_match as u8,
+        topk_weight_max_abs,
+        topk_weight_argmax,
+        expert_mid_max_abs,
+        expert_mid_argmax,
+        expert_mid_group,
+        expert_mid_row,
+        host_expert_mid_at_argmax,
+        metal_expert_mid_at_argmax,
+        metal_moe_vs_recomputed_max_abs,
+        metal_moe_vs_recomputed_argmax,
+        recomputed_down_acc_at_moe_argmax,
+        recomputed_moe_at_moe_argmax,
+        host_moe_at_moe_argmax,
+        metal_moe_at_moe_argmax,
+        host_moe_vs_recomputed_max_abs,
+        host_moe_vs_recomputed_argmax,
+        recomputed_moe_at_host_argmax,
+        host_moe_at_host_argmax,
+        metal_moe_at_host_argmax,
+        output_patch_max_abs,
+        output_patch_argmax,
+        final_vs_host_max_abs,
+        final_vs_host_argmax,
+        host_final_at_final_argmax,
+        recomputed_final_at_final_argmax,
+        changed_moe_elems,
+        changed_output_elems,
+        first_changed_output,
+    );
+
+    Ok(())
+}
+
+fn qwen36_apply_ffn_residual_stage5_host_snap(
+    ordinal: usize,
+    layer_idx: i32,
+    hidden: usize,
+    output: &mut GpuBuffer,
+    reference: &Qwen36FfnRoutedReference,
+    row: usize,
+) -> Result<(), GpuError> {
+    crate::prefill_ffi::flush_metal_batch()?;
+    gpu_hal::sync(ordinal)?;
+
+    if row >= hidden {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::ffn_step_launch: residual host snap row {row} out of bounds for hidden={hidden}",
+        )));
+    }
+    if output.len_bytes() / std::mem::size_of::<u16>() < hidden {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::ffn_step_launch: residual host snap output too small: need {hidden}, got {}",
+            output.len_bytes() / std::mem::size_of::<u16>()
+        )));
+    }
+
+    let output = unsafe { std::slice::from_raw_parts_mut(output.as_mut_ptr() as *mut u16, hidden) };
+    let before_bits = output[row];
+    let before = bf16_bits_to_f32(before_bits);
+    let host = reference.final_out.get(row).copied().ok_or_else(|| {
+        GpuError::InvalidArg(format!(
+            "qwen36_moe::ffn_step_launch: residual host snap reference row {row} missing"
+        ))
+    })?;
+    let corrected = bf16_round_f32(host);
+    let corrected_bits = f32_to_bf16_bits(corrected);
+    output[row] = corrected_bits;
+
+    eprintln!(
+        "[qwen36-ffn-residual-host-snap] layer={} row={} hidden={} host_final={:.8e} metal_final={:.8e} corrected_final={:.8e} patch_abs={:.8e} changed={}",
+        layer_idx,
+        row,
+        hidden,
+        host,
+        before,
+        corrected,
+        (corrected - before).abs(),
+        (before_bits != corrected_bits) as u8,
+    );
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn emit_decode_batch_shared_stage5_parity_tap_from_host(
+    call: usize,
+    position: i32,
+    cache_pos: i32,
+    layer_idx: i32,
+    router_path: &str,
+    phase_profile: bool,
+    input: &[u16],
+    workspace: &[f32],
+    params: Qwen36MoeFfnStepParams,
+    weights: &Qwen36MoeFfnStepWeights,
+    int4: &Qwen36MoeFfnStepInt4,
+) -> Result<(), GpuError> {
+    if params.stage != 5 {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::emit_decode_batch_shared_stage5_parity_tap_from_host requires stage 5, got {}",
+            params.stage
+        )));
+    }
+    if int4.group_size < 0 {
+        return Err(GpuError::InvalidArg(
+            "qwen36_moe::emit_decode_batch_shared_stage5_parity_tap_from_host does not support FP8 sidecars"
+                .into(),
+        ));
+    }
+    if !qwen36_ffn_int4_stage5_router_metal_native_supported(params, weights, int4) {
+        return Err(GpuError::InvalidArg(
+            "qwen36_moe::emit_decode_batch_shared_stage5_parity_tap_from_host requires the Qwen3.6 Metal INT4 router stage-5 path"
+                .into(),
+        ));
+    }
+
+    let hidden = params.hidden as usize;
+    let num_experts = params.num_experts as usize;
+    let shared_intermediate = params.shared_intermediate as usize;
+    let top_k = params.top_k as usize;
+    let off_router_logits = hidden;
+    let off_router_probs = hidden + num_experts;
+    let off_topk_val = off_router_probs + num_experts;
+    let off_topk_idx = off_topk_val + top_k;
+    let off_sg_scalar = off_topk_idx + top_k;
+    let off_sgp = off_sg_scalar + 1;
+    let off_sup = off_sgp + shared_intermediate;
+    let off_shared_mid = off_sup + shared_intermediate;
+    let off_shared_out = off_shared_mid + shared_intermediate;
+    let workspace_needed = off_shared_out + hidden;
+
+    if input.len() < hidden {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::emit_decode_batch_shared_stage5_parity_tap_from_host input too small: need {hidden}, got {}",
+            input.len()
+        )));
+    }
+    if workspace.len() < workspace_needed {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::emit_decode_batch_shared_stage5_parity_tap_from_host workspace too small: need {workspace_needed}, got {}",
+            workspace.len()
+        )));
+    }
+
+    let norm_w =
+        unsafe { std::slice::from_raw_parts(weights.post_attn_norm_w as *const u16, hidden) };
+    let gate_w =
+        unsafe { std::slice::from_raw_parts(weights.gate_w as *const u16, num_experts * hidden) };
+    let router_reference = qwen36_compute_ffn_router_reference(
+        &input[..hidden],
+        norm_w,
+        gate_w,
+        hidden,
+        num_experts,
+        top_k,
+        params.rms_norm_eps,
+    );
+
+    let shared_expert_gate_w =
+        unsafe { std::slice::from_raw_parts(weights.shared_expert_gate_w as *const u16, hidden) };
+    let shared_reference = qwen36_compute_ffn_shared_reference(
+        &router_reference.h_norm,
+        shared_expert_gate_w,
+        weights.shared_gate_proj_w as usize,
+        int4.shared_gate_proj_scale as usize,
+        int4.shared_gate_proj_zero as usize,
+        weights.shared_up_proj_w as usize,
+        int4.shared_up_proj_scale as usize,
+        int4.shared_up_proj_zero as usize,
+        weights.shared_down_proj_w as usize,
+        int4.shared_down_proj_scale as usize,
+        int4.shared_down_proj_zero as usize,
+        hidden,
+        shared_intermediate,
+        int4.group_size.max(0) as usize,
+    );
+
+    let shared_gate = &workspace[off_sgp..off_sgp + shared_intermediate];
+    let shared_up = &workspace[off_sup..off_sup + shared_intermediate];
+    let shared_mid = &workspace[off_shared_mid..off_shared_mid + shared_intermediate];
+    let shared_out = &workspace[off_shared_out..off_shared_out + hidden];
+    let shared_scalar = workspace[off_sg_scalar];
+
+    let (shared_gate_max_abs, shared_gate_argmax) =
+        qwen36_max_abs_delta(&shared_reference.shared_gate, shared_gate);
+    let (shared_up_max_abs, shared_up_argmax) =
+        qwen36_max_abs_delta(&shared_reference.shared_up, shared_up);
+    let (shared_mid_max_abs, shared_mid_argmax) =
+        qwen36_max_abs_delta(&shared_reference.shared_mid, shared_mid);
+    let (shared_out_max_abs, shared_out_argmax) =
+        qwen36_max_abs_delta(&shared_reference.shared_out, shared_out);
+    let shared_scalar_abs = (shared_reference.shared_scalar - shared_scalar).abs();
+    let host_shared_gate_at_mid_argmax = shared_reference
+        .shared_gate
+        .get(shared_mid_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let metal_shared_gate_at_mid_argmax = shared_gate
+        .get(shared_mid_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let host_shared_up_at_mid_argmax = shared_reference
+        .shared_up
+        .get(shared_mid_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let metal_shared_up_at_mid_argmax = shared_up
+        .get(shared_mid_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let host_shared_mid_at_argmax = shared_reference
+        .shared_mid
+        .get(shared_mid_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let metal_shared_mid_at_argmax = shared_mid
+        .get(shared_mid_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let host_shared_out_at_argmax = shared_reference
+        .shared_out
+        .get(shared_out_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let metal_shared_out_at_argmax = shared_out
+        .get(shared_out_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let shared_down_w = weights.shared_down_proj_w as usize;
+    let shared_down_scale = int4.shared_down_proj_scale as usize;
+    let shared_down_zero = int4.shared_down_proj_zero as usize;
+    let group_size = int4.group_size.max(0) as usize;
+    let (
+        host_shared_down_acc_at_out_argmax,
+        host_shared_gated_at_out_argmax,
+        host_shared_out_recomputed_at_argmax,
+    ) = qwen36_shared_down_row_probe(
+        shared_down_w,
+        shared_down_scale,
+        shared_down_zero,
+        shared_out_argmax,
+        shared_intermediate,
+        group_size,
+        shared_reference.shared_scalar,
+        &shared_reference.shared_mid,
+    );
+    let (
+        metal_mid_host_shared_down_acc_at_out_argmax,
+        metal_mid_host_shared_gated_at_out_argmax,
+        metal_mid_host_shared_out_at_argmax,
+    ) = qwen36_shared_down_row_probe(
+        shared_down_w,
+        shared_down_scale,
+        shared_down_zero,
+        shared_out_argmax,
+        shared_intermediate,
+        group_size,
+        shared_scalar,
+        shared_mid,
+    );
+
+    eprintln!(
+        "[qwen36-decode-batch-shared-parity] call={} position={} cache_pos={} layer={} router_path={} phase_profile={} shared_path={} shared_gate_max_abs={:.8e} shared_gate_argmax={} shared_up_max_abs={:.8e} shared_up_argmax={} shared_mid_max_abs={:.8e} shared_mid_argmax={} host_shared_gate_at_mid_argmax={:.8e} metal_shared_gate_at_mid_argmax={:.8e} host_shared_up_at_mid_argmax={:.8e} metal_shared_up_at_mid_argmax={:.8e} host_shared_mid_at_argmax={:.8e} metal_shared_mid_at_argmax={:.8e} shared_scalar_abs={:.8e} host_shared_scalar={:.8e} metal_shared_scalar={:.8e} shared_out_max_abs={:.8e} shared_out_argmax={} host_shared_out_at_argmax={:.8e} metal_shared_out_at_argmax={:.8e} host_shared_down_acc_at_out_argmax={:.8e} host_shared_gated_at_out_argmax={:.8e} host_shared_out_recomputed_at_argmax={:.8e} metal_mid_host_shared_down_acc_at_out_argmax={:.8e} metal_mid_host_shared_gated_at_out_argmax={:.8e} metal_mid_host_shared_out_at_argmax={:.8e}",
+        call,
+        position,
+        cache_pos,
+        layer_idx,
+        router_path,
+        phase_profile as u8,
+        qwen36_ffn_shared_stage5_path_label(),
+        shared_gate_max_abs,
+        shared_gate_argmax,
+        shared_up_max_abs,
+        shared_up_argmax,
+        shared_mid_max_abs,
+        shared_mid_argmax,
+        host_shared_gate_at_mid_argmax,
+        metal_shared_gate_at_mid_argmax,
+        host_shared_up_at_mid_argmax,
+        metal_shared_up_at_mid_argmax,
+        host_shared_mid_at_argmax,
+        metal_shared_mid_at_argmax,
+        shared_scalar_abs,
+        shared_reference.shared_scalar,
+        shared_scalar,
+        shared_out_max_abs,
+        shared_out_argmax,
+        host_shared_out_at_argmax,
+        metal_shared_out_at_argmax,
+        host_shared_down_acc_at_out_argmax,
+        host_shared_gated_at_out_argmax,
+        host_shared_out_recomputed_at_argmax,
+        metal_mid_host_shared_down_acc_at_out_argmax,
+        metal_mid_host_shared_gated_at_out_argmax,
+        metal_mid_host_shared_out_at_argmax,
+    );
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn emit_decode_batch_routed_stage5_parity_tap_from_host(
+    call: usize,
+    position: i32,
+    cache_pos: i32,
+    layer_idx: i32,
+    router_path: &str,
+    phase_profile: bool,
+    input: &[u16],
+    workspace: &[f32],
+    output: &[u16],
+    output_idx: &[u32],
+    params: Qwen36MoeFfnStepParams,
+    weights: &Qwen36MoeFfnStepWeights,
+    int4: &Qwen36MoeFfnStepInt4,
+) -> Result<(), GpuError> {
+    if params.stage != 5 {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::emit_decode_batch_routed_stage5_parity_tap_from_host requires stage 5, got {}",
+            params.stage
+        )));
+    }
+    if int4.group_size < 0 {
+        return Err(GpuError::InvalidArg(
+            "qwen36_moe::emit_decode_batch_routed_stage5_parity_tap_from_host does not support FP8 sidecars"
+                .into(),
+        ));
+    }
+    if !qwen36_ffn_int4_stage5_router_metal_native_supported(params, weights, int4) {
+        return Err(GpuError::InvalidArg(
+            "qwen36_moe::emit_decode_batch_routed_stage5_parity_tap_from_host requires the Qwen3.6 Metal INT4 router stage-5 path"
+                .into(),
+        ));
+    }
+
+    let hidden = params.hidden as usize;
+    let num_experts = params.num_experts as usize;
+    let moe_intermediate = params.moe_intermediate as usize;
+    let shared_intermediate = params.shared_intermediate as usize;
+    let top_k = params.top_k as usize;
+    let off_router_logits = hidden;
+    let off_router_probs = hidden + num_experts;
+    let off_topk_val = off_router_probs + num_experts;
+    let off_topk_idx = off_topk_val + top_k;
+    let off_sg_scalar = off_topk_idx + top_k;
+    let off_sgp = off_sg_scalar + 1;
+    let off_sup = off_sgp + shared_intermediate;
+    let off_shared_mid = off_sup + shared_intermediate;
+    let off_shared_out = off_shared_mid + shared_intermediate;
+    let off_expert_gu = off_shared_out + hidden;
+    let off_expert_mid = off_expert_gu + top_k * 2 * moe_intermediate;
+    let off_expert_stack = off_expert_mid + top_k * moe_intermediate;
+    let off_moe_out = off_expert_stack + top_k * hidden;
+    let workspace_needed = off_moe_out + hidden;
+
+    if input.len() < hidden {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::emit_decode_batch_routed_stage5_parity_tap_from_host input too small: need {hidden}, got {}",
+            input.len()
+        )));
+    }
+    if output.len() < hidden {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::emit_decode_batch_routed_stage5_parity_tap_from_host output too small: need {hidden}, got {}",
+            output.len()
+        )));
+    }
+    if output_idx.len() < top_k {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::emit_decode_batch_routed_stage5_parity_tap_from_host output_idx too small: need {top_k}, got {}",
+            output_idx.len()
+        )));
+    }
+    if workspace.len() < workspace_needed {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::emit_decode_batch_routed_stage5_parity_tap_from_host workspace too small: need {workspace_needed}, got {}",
+            workspace.len()
+        )));
+    }
+
+    let norm_w =
+        unsafe { std::slice::from_raw_parts(weights.post_attn_norm_w as *const u16, hidden) };
+    let gate_w =
+        unsafe { std::slice::from_raw_parts(weights.gate_w as *const u16, num_experts * hidden) };
+    let router_reference = qwen36_compute_ffn_router_reference(
+        &input[..hidden],
+        norm_w,
+        gate_w,
+        hidden,
+        num_experts,
+        top_k,
+        params.rms_norm_eps,
+    );
+
+    let shared_expert_gate_w =
+        unsafe { std::slice::from_raw_parts(weights.shared_expert_gate_w as *const u16, hidden) };
+    let shared_reference = qwen36_compute_ffn_shared_reference(
+        &router_reference.h_norm,
+        shared_expert_gate_w,
+        weights.shared_gate_proj_w as usize,
+        int4.shared_gate_proj_scale as usize,
+        int4.shared_gate_proj_zero as usize,
+        weights.shared_up_proj_w as usize,
+        int4.shared_up_proj_scale as usize,
+        int4.shared_up_proj_zero as usize,
+        weights.shared_down_proj_w as usize,
+        int4.shared_down_proj_scale as usize,
+        int4.shared_down_proj_zero as usize,
+        hidden,
+        shared_intermediate,
+        int4.group_size.max(0) as usize,
+    );
+    let routed_reference = qwen36_compute_ffn_routed_reference(
+        &input[..hidden],
+        &router_reference.h_norm,
+        &shared_reference.shared_out,
+        &router_reference.topk_idx,
+        &router_reference.topk_weight,
+        weights.gate_up_proj_w as usize,
+        int4.gate_up_proj_scale as usize,
+        int4.gate_up_proj_zero as usize,
+        weights.down_proj_w as usize,
+        int4.down_proj_scale as usize,
+        int4.down_proj_zero as usize,
+        hidden,
+        moe_intermediate,
+        top_k,
+        int4.group_size.max(0) as usize,
+    );
+
+    let topk_weight = &workspace[off_topk_val..off_topk_val + top_k];
+    let workspace_topk_idx: Vec<u32> = workspace[off_topk_idx..off_topk_idx + top_k]
+        .iter()
+        .map(|value| value.to_bits())
+        .collect();
+    let output_topk_idx = &output_idx[..top_k];
+    let expert_mid = &workspace[off_expert_mid..off_expert_mid + top_k * moe_intermediate];
+    let moe_out = &workspace[off_moe_out..off_moe_out + hidden];
+    let final_out = qwen36_bf16_slice_to_f32_vec(&output[..hidden]);
+
+    let (topk_weight_max_abs, topk_weight_argmax) =
+        qwen36_max_abs_delta(&router_reference.topk_weight, topk_weight);
+    let workspace_idx_match = router_reference.topk_idx == workspace_topk_idx;
+    let output_idx_match = router_reference.topk_idx.as_slice() == output_topk_idx;
+    let topk_idx_match = workspace_idx_match && output_idx_match;
+    let workspace_first_idx_mismatch =
+        qwen36_first_u32_mismatch(&router_reference.topk_idx, &workspace_topk_idx);
+    let output_first_idx_mismatch =
+        qwen36_first_u32_mismatch(&router_reference.topk_idx, output_topk_idx);
+    let topk_first_mismatch = match (workspace_first_idx_mismatch, output_first_idx_mismatch) {
+        (-1, -1) => -1,
+        (-1, output) => output,
+        (workspace, -1) => workspace,
+        (workspace, output) => workspace.min(output),
+    };
+
+    let (expert_mid_max_abs, expert_mid_argmax) =
+        qwen36_max_abs_delta(&routed_reference.expert_mid, expert_mid);
+    let (moe_out_max_abs, moe_out_argmax) =
+        qwen36_max_abs_delta(&routed_reference.moe_out, moe_out);
+    let (final_out_max_abs, final_out_argmax) =
+        qwen36_max_abs_delta(&routed_reference.final_out, &final_out);
+    let host_expert_mid_at_argmax = routed_reference
+        .expert_mid
+        .get(expert_mid_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let metal_expert_mid_at_argmax = expert_mid
+        .get(expert_mid_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let host_moe_out_at_argmax = routed_reference
+        .moe_out
+        .get(moe_out_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let metal_moe_out_at_argmax = moe_out.get(moe_out_argmax).copied().unwrap_or(f32::NAN);
+    let host_final_out_at_argmax = routed_reference
+        .final_out
+        .get(final_out_argmax)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let metal_final_out_at_argmax = final_out.get(final_out_argmax).copied().unwrap_or(f32::NAN);
+
+    eprintln!(
+        "[qwen36-decode-batch-routed-parity] call={} position={} cache_pos={} layer={} router_path={} phase_profile={} topk_idx_match={} workspace_idx_match={} output_idx_match={} topk_first_mismatch={} workspace_first_idx_mismatch={} output_first_idx_mismatch={} topk_weight_max_abs={:.8e} topk_weight_argmax={} expert_mid_max_abs={:.8e} expert_mid_argmax={} host_expert_mid_at_argmax={:.8e} metal_expert_mid_at_argmax={:.8e} moe_out_max_abs={:.8e} moe_out_argmax={} host_moe_out_at_argmax={:.8e} metal_moe_out_at_argmax={:.8e} final_out_max_abs={:.8e} final_out_argmax={} host_final_out_at_argmax={:.8e} metal_final_out_at_argmax={:.8e} host_idx={} workspace_idx={} output_idx={} host_w={} metal_w={}",
+        call,
+        position,
+        cache_pos,
+        layer_idx,
+        router_path,
+        phase_profile as u8,
+        topk_idx_match as u8,
+        workspace_idx_match as u8,
+        output_idx_match as u8,
+        topk_first_mismatch,
+        workspace_first_idx_mismatch,
+        output_first_idx_mismatch,
+        topk_weight_max_abs,
+        topk_weight_argmax,
+        expert_mid_max_abs,
+        expert_mid_argmax,
+        host_expert_mid_at_argmax,
+        metal_expert_mid_at_argmax,
+        moe_out_max_abs,
+        moe_out_argmax,
+        host_moe_out_at_argmax,
+        metal_moe_out_at_argmax,
+        final_out_max_abs,
+        final_out_argmax,
+        host_final_out_at_argmax,
+        metal_final_out_at_argmax,
+        qwen36_join_u32(&router_reference.topk_idx),
+        qwen36_join_u32(&workspace_topk_idx),
+        qwen36_join_u32(output_topk_idx),
+        qwen36_join_f32(&router_reference.topk_weight),
+        qwen36_join_f32(topk_weight),
+    );
+
+    Ok(())
+}
+
+pub fn ffn_expert_direct_gather_stage5_metal_native_supported(
+    params: Qwen36MoeFfnStepParams,
+    weights: &Qwen36MoeFfnStepWeights,
+    int4: &Qwen36MoeFfnStepInt4,
+) -> bool {
+    qwen36_ffn_expert_direct_gather_stage5_metal_native_supported(params, weights, int4)
+}
+
+pub fn ffn_expert_direct_gather_defer_wait_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_QWEN36_DEFER_FFN_DIRECT_GATHER_STAGE5_WAIT").is_some()
+        && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
+}
+
+fn qwen36_ffn_expert_gate_up_tiled_metal_native_supported(
+    params: Qwen36MoeFfnStepParams,
+    weights: &Qwen36MoeFfnStepWeights,
+    int4: &Qwen36MoeFfnStepInt4,
+) -> bool {
+    std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_GATE_UP_TILED").is_some()
+        && params.stage >= 3
+        && params.hidden == 2048
+        && params.moe_intermediate == 512
+        && params.top_k > 0
+        && params.top_k <= 8
+        && int4.group_size == 128
+        && !crate::metal_native::disabled_by_env()
+        && !weights.gate_up_proj_w.is_null()
+        && !int4.gate_up_proj_scale.is_null()
+        && !int4.gate_up_proj_zero.is_null()
+}
+
+fn qwen36_ffn_expert_tiled_stage5_metal_native_supported(
+    params: Qwen36MoeFfnStepParams,
+    weights: &Qwen36MoeFfnStepWeights,
+    int4: &Qwen36MoeFfnStepInt4,
+) -> bool {
+    std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_TILED_STAGE5").is_some()
+        && params.stage == 5
+        && params.hidden == 2048
+        && params.num_experts == 256
+        && params.moe_intermediate == 512
+        && params.top_k == 8
+        && int4.group_size == 128
+        && !crate::metal_native::disabled_by_env()
+        && !weights.input_hidden.is_null()
+        && !weights.gate_up_proj_w.is_null()
+        && !weights.down_proj_w.is_null()
+        && !int4.gate_up_proj_scale.is_null()
+        && !int4.gate_up_proj_zero.is_null()
+        && !int4.down_proj_scale.is_null()
+        && !int4.down_proj_zero.is_null()
+}
+
+fn qwen36_ffn_expert_packed_stage5_metal_native_supported(
+    params: Qwen36MoeFfnStepParams,
+    weights: &Qwen36MoeFfnStepWeights,
+    int4: &Qwen36MoeFfnStepInt4,
+) -> bool {
+    std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_PACKED_STAGE5").is_some()
+        && params.stage == 5
+        && params.hidden == 2048
+        && params.num_experts == 256
+        && params.moe_intermediate == 512
+        && params.top_k == 8
+        && int4.group_size == 128
+        && !crate::metal_native::disabled_by_env()
+        && !weights.input_hidden.is_null()
+        && !weights.gate_up_proj_w.is_null()
+        && !weights.down_proj_w.is_null()
+        && !int4.gate_up_proj_scale.is_null()
+        && !int4.gate_up_proj_zero.is_null()
+        && !int4.down_proj_scale.is_null()
+        && !int4.down_proj_zero.is_null()
+}
+
+fn qwen36_ffn_expert_direct_gather_stage5_metal_native_supported(
+    params: Qwen36MoeFfnStepParams,
+    weights: &Qwen36MoeFfnStepWeights,
+    int4: &Qwen36MoeFfnStepInt4,
+) -> bool {
+    std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_DIRECT_GATHER_STAGE5").is_some()
+        && params.stage == 5
+        && params.hidden == 2048
+        && params.num_experts == 256
+        && params.moe_intermediate == 512
+        && params.top_k == 8
+        && int4.group_size == 128
+        && !crate::metal_native::disabled_by_env()
+        && !weights.input_hidden.is_null()
+        && !weights.gate_up_proj_w.is_null()
+        && !weights.down_proj_w.is_null()
+        && !int4.gate_up_proj_scale.is_null()
+        && !int4.gate_up_proj_zero.is_null()
+        && !int4.down_proj_scale.is_null()
+        && !int4.down_proj_zero.is_null()
+}
+
+fn qwen36_ffn_expert_gpu_pack_stage5_metal_native_supported(
+    params: Qwen36MoeFfnStepParams,
+    weights: &Qwen36MoeFfnStepWeights,
+    int4: &Qwen36MoeFfnStepInt4,
+) -> bool {
+    std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_GPU_PACK_STAGE5").is_some()
+        && qwen36_ffn_expert_packed_stage5_metal_native_supported(params, weights, int4)
+}
+
+fn qwen36_ffn_expert_mps_bridge_stage5_supported(
+    params: Qwen36MoeFfnStepParams,
+    weights: &Qwen36MoeFfnStepWeights,
+    int4: &Qwen36MoeFfnStepInt4,
+) -> bool {
+    std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_MPS_BRIDGE").is_some()
+        && params.stage == 5
+        && params.hidden == 2048
+        && params.num_experts == 256
+        && params.moe_intermediate == 512
+        && params.top_k == 8
+        && int4.group_size == 128
+        && !crate::metal_native::disabled_by_env()
+        && !weights.input_hidden.is_null()
+        && !weights.gate_up_proj_w.is_null()
+        && !weights.down_proj_w.is_null()
+        && !int4.gate_up_proj_scale.is_null()
+        && !int4.gate_up_proj_zero.is_null()
+        && !int4.down_proj_scale.is_null()
+        && !int4.down_proj_zero.is_null()
+}
+
+fn qwen36_ffn_expert_mps_static_topn_partial_stage5_supported(
+    params: Qwen36MoeFfnStepParams,
+    weights: &Qwen36MoeFfnStepWeights,
+    int4: &Qwen36MoeFfnStepInt4,
+) -> bool {
+    std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_MPS_STATIC_TOPN_PARTIAL").is_some()
+        && params.stage == 5
+        && params.hidden == 2048
+        && params.num_experts == 256
+        && params.moe_intermediate == 512
+        && params.top_k == 8
+        && int4.group_size == 128
+        && !crate::metal_native::disabled_by_env()
+        && !weights.input_hidden.is_null()
+        && !weights.gate_up_proj_w.is_null()
+        && !weights.down_proj_w.is_null()
+        && !int4.gate_up_proj_scale.is_null()
+        && !int4.gate_up_proj_zero.is_null()
+        && !int4.down_proj_scale.is_null()
+        && !int4.down_proj_zero.is_null()
+}
+
+struct Qwen36PackedExpertBuffers {
+    gate_up_proj: GpuBuffer,
+    gate_up_scale: GpuBuffer,
+    gate_up_zero: GpuBuffer,
+    down_proj: GpuBuffer,
+    down_scale: GpuBuffer,
+    down_zero: GpuBuffer,
+}
+
+struct Qwen36MpsExpertBridgeBuffers {
+    h_norm: GpuBuffer,
+    gate_up_rhs: GpuBuffer,
+    gate_up_out: GpuBuffer,
+    down_lhs: GpuBuffer,
+    down_rhs: GpuBuffer,
+    down_out: GpuBuffer,
+}
+
+struct Qwen36MpsExpertBridgeScratch {
+    h_norm: GpuBuffer,
+    gate_up_out: GpuBuffer,
+    down_lhs: GpuBuffer,
+    down_out: GpuBuffer,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct Qwen36PackedExpertCacheKey {
+    gate_up_proj_ptr: usize,
+    gate_up_scale_ptr: usize,
+    gate_up_zero_ptr: usize,
+    down_proj_ptr: usize,
+    down_scale_ptr: usize,
+    down_zero_ptr: usize,
+    hidden: usize,
+    moe_intermediate: usize,
+    group_size: usize,
+    active_groups: usize,
+}
+
+struct Qwen36PackedExpertCacheEntry {
+    active_experts: Vec<usize>,
+    buffers: Qwen36PackedExpertBuffers,
+}
+
+struct Qwen36PackedExpertHotsetCacheEntry {
+    slot_experts: Vec<Option<usize>>,
+    slot_last_used: Vec<u64>,
+    next_stamp: u64,
+    buffers: Qwen36PackedExpertBuffers,
+}
+
+struct Qwen36PackedExpertStaticTopNCacheEntry {
+    resident_experts: Vec<usize>,
+    buffers: Qwen36PackedExpertBuffers,
+}
+
+struct Qwen36MpsExpertStaticTopNCacheEntry {
+    resident_experts: Vec<usize>,
+    gate_up_rhs: GpuBuffer,
+    down_rhs: GpuBuffer,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Qwen36MpsStaticTopNPrewarmStats {
+    pub layer_idx: i32,
+    pub resident_capacity: usize,
+    pub allocated: bool,
+    pub copied_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Qwen36MpsStaticTopNHit {
+    original_group: usize,
+    slot: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+struct Qwen36StaticTopNTable {
+    layers_by_capacity: HashMap<usize, Vec<Vec<usize>>>,
+}
+
+impl Qwen36StaticTopNTable {
+    fn capacity_exists(&self, capacity: usize) -> bool {
+        self.layers_by_capacity.contains_key(&capacity)
+    }
+
+    fn largest_capacity(&self) -> Option<usize> {
+        self.layers_by_capacity.keys().copied().max()
+    }
+
+    fn layer_experts(&self, capacity: usize, layer_idx: usize) -> Option<&[usize]> {
+        self.layers_by_capacity
+            .get(&capacity)
+            .and_then(|layers| layers.get(layer_idx))
+            .map(Vec::as_slice)
+            .filter(|experts| !experts.is_empty())
+    }
+}
+
+static QWEN36_PACKED_EXPERT_CACHE: OnceLock<
+    Mutex<HashMap<Qwen36PackedExpertCacheKey, Qwen36PackedExpertCacheEntry>>,
+> = OnceLock::new();
+static QWEN36_PACKED_EXPERT_HOTSET_CACHE: OnceLock<
+    Mutex<HashMap<Qwen36PackedExpertCacheKey, Qwen36PackedExpertHotsetCacheEntry>>,
+> = OnceLock::new();
+static QWEN36_PACKED_EXPERT_STATIC_TOPN_CACHE: OnceLock<
+    Mutex<HashMap<Qwen36PackedExpertCacheKey, Qwen36PackedExpertStaticTopNCacheEntry>>,
+> = OnceLock::new();
+static QWEN36_MPS_EXPERT_STATIC_TOPN_CACHE: OnceLock<
+    Mutex<HashMap<Qwen36PackedExpertCacheKey, Qwen36MpsExpertStaticTopNCacheEntry>>,
+> = OnceLock::new();
+static QWEN36_STATIC_TOPN_TABLE: OnceLock<Result<Qwen36StaticTopNTable, String>> = OnceLock::new();
+
+fn qwen36_parse_static_topn_experts(
+    value: &serde_json::Value,
+    path: &str,
+) -> Result<Vec<usize>, String> {
+    let experts = value
+        .as_array()
+        .ok_or_else(|| format!("{path}: experts must be an array"))?;
+    let mut parsed = Vec::with_capacity(experts.len());
+    for (idx, expert) in experts.iter().enumerate() {
+        let expert = expert
+            .as_u64()
+            .ok_or_else(|| format!("{path}[{idx}]: expert must be an integer"))?;
+        parsed.push(
+            usize::try_from(expert)
+                .map_err(|_| format!("{path}[{idx}]: expert {expert} does not fit in usize"))?,
+        );
+    }
+    Ok(parsed)
+}
+
+fn qwen36_parse_static_topn_layer_rows(
+    capacity: usize,
+    value: &serde_json::Value,
+) -> Result<Vec<Vec<usize>>, String> {
+    let mut layers: Vec<Vec<usize>> = Vec::new();
+    if let Some(rows) = value.get("layers").and_then(|value| value.as_array()) {
+        for (row_idx, row) in rows.iter().enumerate() {
+            let layer_idx = row
+                .get("layer")
+                .and_then(|value| value.as_u64())
+                .ok_or_else(|| {
+                    format!("static_tables.{capacity}.layers[{row_idx}]: missing integer layer")
+                })?;
+            let layer_idx = usize::try_from(layer_idx).map_err(|_| {
+                format!("static_tables.{capacity}.layers[{row_idx}]: layer does not fit in usize")
+            })?;
+            let experts = row.get("experts").ok_or_else(|| {
+                format!("static_tables.{capacity}.layers[{row_idx}]: missing experts")
+            })?;
+            if layers.len() <= layer_idx {
+                layers.resize_with(layer_idx + 1, Vec::new);
+            }
+            layers[layer_idx] = qwen36_parse_static_topn_experts(
+                experts,
+                &format!("static_tables.{capacity}.layers[{row_idx}].experts"),
+            )?;
+        }
+        return Ok(layers);
+    }
+
+    let object = value
+        .as_object()
+        .ok_or_else(|| format!("static_tables.{capacity}: expected object"))?;
+    for (layer_key, layer_value) in object {
+        let layer_idx = layer_key.parse::<usize>().map_err(|err| {
+            format!("static_tables.{capacity}.{layer_key}: invalid layer key: {err}")
+        })?;
+        let experts_value = layer_value.get("experts").unwrap_or(layer_value);
+        if layers.len() <= layer_idx {
+            layers.resize_with(layer_idx + 1, Vec::new);
+        }
+        layers[layer_idx] = qwen36_parse_static_topn_experts(
+            experts_value,
+            &format!("static_tables.{capacity}.{layer_key}.experts"),
+        )?;
+    }
+    Ok(layers)
+}
+
+fn qwen36_parse_static_topn_table_json(raw: &str) -> Result<Qwen36StaticTopNTable, String> {
+    let root: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|err| format!("failed to parse static top-N JSON: {err}"))?;
+    let tables = root
+        .get("static_tables")
+        .ok_or_else(|| "static top-N JSON missing static_tables".to_string())?
+        .as_object()
+        .ok_or_else(|| "static_tables must be an object".to_string())?;
+    let mut layers_by_capacity = HashMap::new();
+    for (capacity_key, value) in tables {
+        let capacity = capacity_key.parse::<usize>().map_err(|err| {
+            format!("static_tables capacity key {capacity_key:?} is invalid: {err}")
+        })?;
+        if capacity == 0 {
+            return Err("static_tables capacity must be > 0".into());
+        }
+        let layers = qwen36_parse_static_topn_layer_rows(capacity, value)?;
+        if !layers.is_empty() {
+            layers_by_capacity.insert(capacity, layers);
+        }
+    }
+    if layers_by_capacity.is_empty() {
+        return Err("static_tables did not contain any layer tables".into());
+    }
+    Ok(Qwen36StaticTopNTable { layers_by_capacity })
+}
+
+fn qwen36_static_topn_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_STATIC_TOPN").is_some()
+}
+
+fn qwen36_static_topn_table_from_env() -> Result<Option<&'static Qwen36StaticTopNTable>, GpuError> {
+    if !qwen36_static_topn_enabled() {
+        return Ok(None);
+    }
+    let table = QWEN36_STATIC_TOPN_TABLE.get_or_init(|| {
+        let path = std::env::var("SUPERSONIC_METAL_QWEN36_FFN_EXPERT_STATIC_TOPN_FILE")
+            .map_err(|_| {
+                "SUPERSONIC_METAL_QWEN36_FFN_EXPERT_STATIC_TOPN_FILE is required when static top-N is enabled"
+                    .to_string()
+            })?;
+        let raw = std::fs::read_to_string(&path)
+            .map_err(|err| format!("failed to read static top-N file {path}: {err}"))?;
+        qwen36_parse_static_topn_table_json(&raw)
+    });
+    match table {
+        Ok(table) => Ok(Some(table)),
+        Err(err) => Err(GpuError::backend(
+            Backend::Metal,
+            format!("qwen36 static top-N table load failed: {err}"),
+        )),
+    }
+}
+
+fn qwen36_static_topn_requested_capacity() -> Result<Option<usize>, GpuError> {
+    match std::env::var("SUPERSONIC_METAL_QWEN36_FFN_EXPERT_STATIC_TOPN_CAPACITY") {
+        Ok(value) => value
+            .parse::<usize>()
+            .ok()
+            .filter(|&capacity| capacity > 0)
+            .map(Some)
+            .ok_or_else(|| {
+                GpuError::InvalidArg(format!(
+                    "invalid SUPERSONIC_METAL_QWEN36_FFN_EXPERT_STATIC_TOPN_CAPACITY={value:?}"
+                ))
+            }),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(err) => Err(GpuError::InvalidArg(format!(
+            "invalid static top-N capacity env: {err}"
+        ))),
+    }
+}
+
+fn qwen36_static_topn_layer_experts_from_env(
+    layer_idx: i32,
+) -> Result<Option<(usize, &'static [usize])>, GpuError> {
+    let Some(table) = qwen36_static_topn_table_from_env()? else {
+        return Ok(None);
+    };
+    if layer_idx < 0 {
+        return Ok(None);
+    }
+    let requested_capacity = qwen36_static_topn_requested_capacity()?;
+    let capacity = if let Some(capacity) = requested_capacity {
+        if !table.capacity_exists(capacity) {
+            return Err(GpuError::InvalidArg(format!(
+                "static top-N table does not contain requested capacity {capacity}"
+            )));
+        }
+        capacity
+    } else {
+        table.largest_capacity().ok_or_else(|| {
+            GpuError::InvalidArg("static top-N table does not contain any capacity".into())
+        })?
+    };
+    let Some(resident_experts) = table.layer_experts(capacity, layer_idx as usize) else {
+        return Ok(None);
+    };
+    Ok(Some((capacity, resident_experts)))
+}
+
+fn qwen36_static_topn_expert_to_slot(
+    layer_idx: i32,
+    resident_experts: &[usize],
+    num_experts: usize,
+    capacity: usize,
+) -> Result<Vec<Option<usize>>, GpuError> {
+    let mut expert_to_slot = vec![None; num_experts];
+    for (slot, &expert) in resident_experts.iter().enumerate() {
+        if expert >= num_experts {
+            return Err(GpuError::InvalidArg(format!(
+                "static top-N table layer {layer_idx} capacity {capacity} has expert {expert} >= num_experts {num_experts}"
+            )));
+        }
+        if expert_to_slot[expert].replace(slot).is_some() {
+            return Err(GpuError::InvalidArg(format!(
+                "static top-N table layer {layer_idx} capacity {capacity} contains duplicate expert {expert}"
+            )));
+        }
+    }
+    Ok(expert_to_slot)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen36_validate_active_expert_pack(
+    hidden: usize,
+    moe_intermediate: usize,
+    active_experts: &[usize],
+    group_size: usize,
+    num_experts: usize,
+    gate_up_proj_ptr: *const c_void,
+    gate_up_scale_ptr: *const c_void,
+    gate_up_zero_ptr: *const c_void,
+    down_proj_ptr: *const c_void,
+    down_scale_ptr: *const c_void,
+    down_zero_ptr: *const c_void,
+) -> Result<(), GpuError> {
+    if active_experts.is_empty() {
+        return Err(GpuError::InvalidArg(
+            "qwen36_pack_active_experts_for_metal: active_experts must not be empty".into(),
+        ));
+    }
+    if group_size == 0
+        || hidden == 0
+        || moe_intermediate == 0
+        || hidden % 2 != 0
+        || moe_intermediate % 2 != 0
+        || hidden % group_size != 0
+        || moe_intermediate % group_size != 0
+        || (2 * moe_intermediate) % group_size != 0
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_pack_active_experts_for_metal: unsupported geometry hidden={hidden} moe_intermediate={moe_intermediate} group_size={group_size}"
+        )));
+    }
+    if gate_up_proj_ptr.is_null()
+        || gate_up_scale_ptr.is_null()
+        || gate_up_zero_ptr.is_null()
+        || down_proj_ptr.is_null()
+        || down_scale_ptr.is_null()
+        || down_zero_ptr.is_null()
+    {
+        return Err(GpuError::InvalidArg(
+            "qwen36_pack_active_experts_for_metal: null expert tensor pointer".into(),
+        ));
+    }
+    for &expert in active_experts {
+        if expert >= num_experts {
+            return Err(GpuError::InvalidArg(format!(
+                "qwen36_pack_active_experts_for_metal: expert index {expert} >= num_experts {num_experts}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen36_alloc_packed_experts_for_metal(
+    ordinal: usize,
+    hidden: usize,
+    moe_intermediate: usize,
+    active_groups: usize,
+    group_size: usize,
+) -> Result<Qwen36PackedExpertBuffers, GpuError> {
+    let groups = active_groups;
+    let gate_up_rows = 2 * moe_intermediate;
+    let gate_up_byte_cols = hidden / 2;
+    let gate_up_sidecar_rows = gate_up_rows / group_size;
+    let gate_up_sidecar_cols = hidden / group_size;
+
+    let down_rows = hidden;
+    let down_byte_cols = moe_intermediate / 2;
+    let down_sidecar_rows = hidden / group_size;
+    let down_sidecar_cols = moe_intermediate / group_size;
+
+    let gate_up_proj = GpuBuffer::alloc_with_kind(
+        ordinal,
+        ScalarType::U8,
+        &[groups, gate_up_rows, gate_up_byte_cols],
+        BufferKind::Scratch,
+    )?;
+    let gate_up_scale = GpuBuffer::alloc_with_kind(
+        ordinal,
+        ScalarType::BF16,
+        &[groups, gate_up_sidecar_rows, gate_up_sidecar_cols],
+        BufferKind::Scratch,
+    )?;
+    let gate_up_zero = GpuBuffer::alloc_with_kind(
+        ordinal,
+        ScalarType::BF16,
+        &[groups, gate_up_sidecar_rows, gate_up_sidecar_cols],
+        BufferKind::Scratch,
+    )?;
+    let down_proj = GpuBuffer::alloc_with_kind(
+        ordinal,
+        ScalarType::U8,
+        &[groups, down_rows, down_byte_cols],
+        BufferKind::Scratch,
+    )?;
+    let down_scale = GpuBuffer::alloc_with_kind(
+        ordinal,
+        ScalarType::BF16,
+        &[groups, down_sidecar_rows, down_sidecar_cols],
+        BufferKind::Scratch,
+    )?;
+    let down_zero = GpuBuffer::alloc_with_kind(
+        ordinal,
+        ScalarType::BF16,
+        &[groups, down_sidecar_rows, down_sidecar_cols],
+        BufferKind::Scratch,
+    )?;
+
+    Ok(Qwen36PackedExpertBuffers {
+        gate_up_proj,
+        gate_up_scale,
+        gate_up_zero,
+        down_proj,
+        down_scale,
+        down_zero,
+    })
+}
+
+fn qwen36_packed_expert_copy_bytes(
+    hidden: usize,
+    moe_intermediate: usize,
+    active_groups: usize,
+    group_size: usize,
+) -> usize {
+    let gate_up_rows = 2 * moe_intermediate;
+    let gate_up_byte_cols = hidden / 2;
+    let gate_up_bytes_per_expert = gate_up_rows * gate_up_byte_cols;
+    let gate_up_sidecar_rows = gate_up_rows / group_size;
+    let gate_up_sidecar_cols = hidden / group_size;
+    let gate_up_sidecar_elems_per_expert = gate_up_sidecar_rows * gate_up_sidecar_cols;
+
+    let down_rows = hidden;
+    let down_byte_cols = moe_intermediate / 2;
+    let down_bytes_per_expert = down_rows * down_byte_cols;
+    let down_sidecar_rows = hidden / group_size;
+    let down_sidecar_cols = moe_intermediate / group_size;
+    let down_sidecar_elems_per_expert = down_sidecar_rows * down_sidecar_cols;
+
+    let bf16_bytes = std::mem::size_of::<u16>();
+    active_groups
+        * (gate_up_bytes_per_expert
+            + down_bytes_per_expert
+            + 2 * gate_up_sidecar_elems_per_expert * bf16_bytes
+            + 2 * down_sidecar_elems_per_expert * bf16_bytes)
+}
+
+fn qwen36_packed_expert_hotset_capacity(top_k: usize) -> Option<usize> {
+    if std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_PACK_HOTSET").is_none() {
+        return None;
+    }
+    let capacity = std::env::var("SUPERSONIC_METAL_QWEN36_FFN_EXPERT_HOTSET_CAPACITY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(16);
+    Some(capacity.clamp(top_k, 256))
+}
+
+fn qwen36_hotset_choose_slot(
+    slot_experts: &[Option<usize>],
+    slot_last_used: &[u64],
+    protected_slots: &[bool],
+    expert: usize,
+) -> (usize, bool, bool) {
+    if let Some(slot) = slot_experts
+        .iter()
+        .position(|&slot_expert| slot_expert == Some(expert))
+    {
+        return (slot, true, false);
+    }
+    if let Some(slot) = slot_experts
+        .iter()
+        .enumerate()
+        .find_map(|(slot, expert)| (expert.is_none() && !protected_slots[slot]).then_some(slot))
+    {
+        return (slot, false, false);
+    }
+    let (slot, _) = slot_last_used
+        .iter()
+        .enumerate()
+        .filter(|(slot, _)| !protected_slots[*slot])
+        .min_by_key(|(_, stamp)| *stamp)
+        .expect("qwen36 hotset capacity must leave at least one unprotected slot");
+    (slot, false, true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen36_fill_packed_expert_slot_for_metal(
+    hidden: usize,
+    moe_intermediate: usize,
+    expert: usize,
+    slot: usize,
+    group_size: usize,
+    gate_up_proj_ptr: *const c_void,
+    gate_up_scale_ptr: *const c_void,
+    gate_up_zero_ptr: *const c_void,
+    down_proj_ptr: *const c_void,
+    down_scale_ptr: *const c_void,
+    down_zero_ptr: *const c_void,
+    buffers: &mut Qwen36PackedExpertBuffers,
+) {
+    let gate_up_rows = 2 * moe_intermediate;
+    let gate_up_byte_cols = hidden / 2;
+    let gate_up_bytes_per_expert = gate_up_rows * gate_up_byte_cols;
+    let gate_up_sidecar_rows = gate_up_rows / group_size;
+    let gate_up_sidecar_cols = hidden / group_size;
+    let gate_up_sidecar_elems_per_expert = gate_up_sidecar_rows * gate_up_sidecar_cols;
+
+    let down_rows = hidden;
+    let down_byte_cols = moe_intermediate / 2;
+    let down_bytes_per_expert = down_rows * down_byte_cols;
+    let down_sidecar_rows = hidden / group_size;
+    let down_sidecar_cols = moe_intermediate / group_size;
+    let down_sidecar_elems_per_expert = down_sidecar_rows * down_sidecar_cols;
+
+    let gate_up_src = gate_up_proj_ptr as *const u8;
+    let gate_up_scale_src = gate_up_scale_ptr as *const u16;
+    let gate_up_zero_src = gate_up_zero_ptr as *const u16;
+    let down_src = down_proj_ptr as *const u8;
+    let down_scale_src = down_scale_ptr as *const u16;
+    let down_zero_src = down_zero_ptr as *const u16;
+    let gate_up_dst = buffers.gate_up_proj.as_mut_ptr() as *mut u8;
+    let gate_up_scale_dst = buffers.gate_up_scale.as_mut_ptr() as *mut u16;
+    let gate_up_zero_dst = buffers.gate_up_zero.as_mut_ptr() as *mut u16;
+    let down_dst = buffers.down_proj.as_mut_ptr() as *mut u8;
+    let down_scale_dst = buffers.down_scale.as_mut_ptr() as *mut u16;
+    let down_zero_dst = buffers.down_zero.as_mut_ptr() as *mut u16;
+
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            gate_up_src.add(expert * gate_up_bytes_per_expert),
+            gate_up_dst.add(slot * gate_up_bytes_per_expert),
+            gate_up_bytes_per_expert,
+        );
+        std::ptr::copy_nonoverlapping(
+            gate_up_scale_src.add(expert * gate_up_sidecar_elems_per_expert),
+            gate_up_scale_dst.add(slot * gate_up_sidecar_elems_per_expert),
+            gate_up_sidecar_elems_per_expert,
+        );
+        std::ptr::copy_nonoverlapping(
+            gate_up_zero_src.add(expert * gate_up_sidecar_elems_per_expert),
+            gate_up_zero_dst.add(slot * gate_up_sidecar_elems_per_expert),
+            gate_up_sidecar_elems_per_expert,
+        );
+        std::ptr::copy_nonoverlapping(
+            down_src.add(expert * down_bytes_per_expert),
+            down_dst.add(slot * down_bytes_per_expert),
+            down_bytes_per_expert,
+        );
+        std::ptr::copy_nonoverlapping(
+            down_scale_src.add(expert * down_sidecar_elems_per_expert),
+            down_scale_dst.add(slot * down_sidecar_elems_per_expert),
+            down_sidecar_elems_per_expert,
+        );
+        std::ptr::copy_nonoverlapping(
+            down_zero_src.add(expert * down_sidecar_elems_per_expert),
+            down_zero_dst.add(slot * down_sidecar_elems_per_expert),
+            down_sidecar_elems_per_expert,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen36_fill_packed_experts_for_metal(
+    hidden: usize,
+    moe_intermediate: usize,
+    active_experts: &[usize],
+    group_size: usize,
+    gate_up_proj_ptr: *const c_void,
+    gate_up_scale_ptr: *const c_void,
+    gate_up_zero_ptr: *const c_void,
+    down_proj_ptr: *const c_void,
+    down_scale_ptr: *const c_void,
+    down_zero_ptr: *const c_void,
+    buffers: &mut Qwen36PackedExpertBuffers,
+) {
+    let gate_up_rows = 2 * moe_intermediate;
+    let gate_up_byte_cols = hidden / 2;
+    let gate_up_bytes_per_expert = gate_up_rows * gate_up_byte_cols;
+    let gate_up_sidecar_rows = gate_up_rows / group_size;
+    let gate_up_sidecar_cols = hidden / group_size;
+    let gate_up_sidecar_elems_per_expert = gate_up_sidecar_rows * gate_up_sidecar_cols;
+
+    let down_rows = hidden;
+    let down_byte_cols = moe_intermediate / 2;
+    let down_bytes_per_expert = down_rows * down_byte_cols;
+    let down_sidecar_rows = hidden / group_size;
+    let down_sidecar_cols = moe_intermediate / group_size;
+    let down_sidecar_elems_per_expert = down_sidecar_rows * down_sidecar_cols;
+
+    let gate_up_src = gate_up_proj_ptr as *const u8;
+    let gate_up_scale_src = gate_up_scale_ptr as *const u16;
+    let gate_up_zero_src = gate_up_zero_ptr as *const u16;
+    let down_src = down_proj_ptr as *const u8;
+    let down_scale_src = down_scale_ptr as *const u16;
+    let down_zero_src = down_zero_ptr as *const u16;
+    let gate_up_dst = buffers.gate_up_proj.as_mut_ptr() as *mut u8;
+    let gate_up_scale_dst = buffers.gate_up_scale.as_mut_ptr() as *mut u16;
+    let gate_up_zero_dst = buffers.gate_up_zero.as_mut_ptr() as *mut u16;
+    let down_dst = buffers.down_proj.as_mut_ptr() as *mut u8;
+    let down_scale_dst = buffers.down_scale.as_mut_ptr() as *mut u16;
+    let down_zero_dst = buffers.down_zero.as_mut_ptr() as *mut u16;
+
+    for (group, &expert) in active_experts.iter().enumerate() {
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                gate_up_src.add(expert * gate_up_bytes_per_expert),
+                gate_up_dst.add(group * gate_up_bytes_per_expert),
+                gate_up_bytes_per_expert,
+            );
+            std::ptr::copy_nonoverlapping(
+                gate_up_scale_src.add(expert * gate_up_sidecar_elems_per_expert),
+                gate_up_scale_dst.add(group * gate_up_sidecar_elems_per_expert),
+                gate_up_sidecar_elems_per_expert,
+            );
+            std::ptr::copy_nonoverlapping(
+                gate_up_zero_src.add(expert * gate_up_sidecar_elems_per_expert),
+                gate_up_zero_dst.add(group * gate_up_sidecar_elems_per_expert),
+                gate_up_sidecar_elems_per_expert,
+            );
+            std::ptr::copy_nonoverlapping(
+                down_src.add(expert * down_bytes_per_expert),
+                down_dst.add(group * down_bytes_per_expert),
+                down_bytes_per_expert,
+            );
+            std::ptr::copy_nonoverlapping(
+                down_scale_src.add(expert * down_sidecar_elems_per_expert),
+                down_scale_dst.add(group * down_sidecar_elems_per_expert),
+                down_sidecar_elems_per_expert,
+            );
+            std::ptr::copy_nonoverlapping(
+                down_zero_src.add(expert * down_sidecar_elems_per_expert),
+                down_zero_dst.add(group * down_sidecar_elems_per_expert),
+                down_sidecar_elems_per_expert,
+            );
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen36_pack_active_experts_for_metal(
+    ordinal: usize,
+    hidden: usize,
+    moe_intermediate: usize,
+    active_experts: &[usize],
+    group_size: usize,
+    num_experts: usize,
+    gate_up_proj_ptr: *const c_void,
+    gate_up_scale_ptr: *const c_void,
+    gate_up_zero_ptr: *const c_void,
+    down_proj_ptr: *const c_void,
+    down_scale_ptr: *const c_void,
+    down_zero_ptr: *const c_void,
+) -> Result<Qwen36PackedExpertBuffers, GpuError> {
+    qwen36_validate_active_expert_pack(
+        hidden,
+        moe_intermediate,
+        active_experts,
+        group_size,
+        num_experts,
+        gate_up_proj_ptr,
+        gate_up_scale_ptr,
+        gate_up_zero_ptr,
+        down_proj_ptr,
+        down_scale_ptr,
+        down_zero_ptr,
+    )?;
+    let mut buffers = qwen36_alloc_packed_experts_for_metal(
+        ordinal,
+        hidden,
+        moe_intermediate,
+        active_experts.len(),
+        group_size,
+    )?;
+    qwen36_fill_packed_experts_for_metal(
+        hidden,
+        moe_intermediate,
+        active_experts,
+        group_size,
+        gate_up_proj_ptr,
+        gate_up_scale_ptr,
+        gate_up_zero_ptr,
+        down_proj_ptr,
+        down_scale_ptr,
+        down_zero_ptr,
+        &mut buffers,
+    );
+    Ok(buffers)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen36_with_static_topn_packed_experts_for_metal<T, F>(
+    ordinal: usize,
+    layer_idx: i32,
+    hidden: usize,
+    moe_intermediate: usize,
+    active_experts: &[usize],
+    group_size: usize,
+    num_experts: usize,
+    workspace: &mut [f32],
+    off_topk_idx: usize,
+    gate_up_proj_ptr: *const c_void,
+    gate_up_scale_ptr: *const c_void,
+    gate_up_zero_ptr: *const c_void,
+    down_proj_ptr: *const c_void,
+    down_scale_ptr: *const c_void,
+    down_zero_ptr: *const c_void,
+    f: F,
+) -> Result<Option<T>, GpuError>
+where
+    F: FnOnce(&Qwen36PackedExpertBuffers) -> Result<T, GpuError>,
+{
+    qwen36_validate_active_expert_pack(
+        hidden,
+        moe_intermediate,
+        active_experts,
+        group_size,
+        num_experts,
+        gate_up_proj_ptr,
+        gate_up_scale_ptr,
+        gate_up_zero_ptr,
+        down_proj_ptr,
+        down_scale_ptr,
+        down_zero_ptr,
+    )?;
+    if off_topk_idx + active_experts.len() > workspace.len() {
+        return Err(GpuError::InvalidArg(
+            "qwen36 static top-N packed expert cache topk workspace out of bounds".into(),
+        ));
+    }
+
+    let Some((capacity, resident_experts)) = qwen36_static_topn_layer_experts_from_env(layer_idx)?
+    else {
+        return Ok(None);
+    };
+    let resident_capacity = resident_experts.len();
+    let expert_to_slot =
+        qwen36_static_topn_expert_to_slot(layer_idx, resident_experts, num_experts, capacity)?;
+
+    let mut active_slots = Vec::with_capacity(active_experts.len());
+    let mut slot_hits = 0usize;
+    let mut slot_misses = 0usize;
+    for &expert in active_experts {
+        if let Some(slot) = expert_to_slot[expert] {
+            slot_hits += 1;
+            active_slots.push(slot);
+        } else {
+            slot_misses += 1;
+        }
+    }
+    if slot_misses > 0 {
+        qwen36_static_topn_expert_residency_profile_record(
+            resident_capacity,
+            false,
+            false,
+            false,
+            active_experts.len(),
+            0,
+            slot_hits,
+            slot_misses,
+            0,
+        );
+        return Ok(None);
+    }
+
+    let key = Qwen36PackedExpertCacheKey {
+        gate_up_proj_ptr: gate_up_proj_ptr as usize,
+        gate_up_scale_ptr: gate_up_scale_ptr as usize,
+        gate_up_zero_ptr: gate_up_zero_ptr as usize,
+        down_proj_ptr: down_proj_ptr as usize,
+        down_scale_ptr: down_scale_ptr as usize,
+        down_zero_ptr: down_zero_ptr as usize,
+        hidden,
+        moe_intermediate,
+        group_size,
+        active_groups: resident_capacity,
+    };
+    let cache = QWEN36_PACKED_EXPERT_STATIC_TOPN_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache.lock().map_err(|_| {
+        GpuError::backend(
+            Backend::Metal,
+            "qwen36 packed expert static top-N cache mutex poisoned".into(),
+        )
+    })?;
+    let mut allocation = false;
+    let copied_bytes =
+        qwen36_packed_expert_copy_bytes(hidden, moe_intermediate, resident_capacity, group_size);
+    crate::prefill_ffi::metal_profile_time(
+        "qwen36_ffn_int4_expert_static_topn_pack_stage5",
+        "host",
+        || -> Result<(), GpuError> {
+            match cache.entry(key) {
+                std::collections::hash_map::Entry::Occupied(entry) => {
+                    if entry.get().resident_experts.as_slice() != resident_experts {
+                        return Err(GpuError::backend(
+                            Backend::Metal,
+                            "qwen36 static top-N cache key collision with different resident experts"
+                                .into(),
+                        ));
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(vacant) => {
+                    let mut buffers = qwen36_alloc_packed_experts_for_metal(
+                        ordinal,
+                        hidden,
+                        moe_intermediate,
+                        resident_capacity,
+                        group_size,
+                    )?;
+                    for (slot, &expert) in resident_experts.iter().enumerate() {
+                        qwen36_fill_packed_expert_slot_for_metal(
+                            hidden,
+                            moe_intermediate,
+                            expert,
+                            slot,
+                            group_size,
+                            gate_up_proj_ptr,
+                            gate_up_scale_ptr,
+                            gate_up_zero_ptr,
+                            down_proj_ptr,
+                            down_scale_ptr,
+                            down_zero_ptr,
+                            &mut buffers,
+                        );
+                    }
+                    vacant.insert(Qwen36PackedExpertStaticTopNCacheEntry {
+                        resident_experts: resident_experts.to_vec(),
+                        buffers,
+                    });
+                    allocation = true;
+                }
+            }
+            Ok(())
+        },
+    )?;
+    for (group, &slot) in active_slots.iter().enumerate() {
+        workspace[off_topk_idx + group] = f32::from_bits(slot as u32);
+    }
+    qwen36_static_topn_expert_residency_profile_record(
+        resident_capacity,
+        true,
+        false,
+        allocation,
+        active_experts.len(),
+        usize::from(allocation) * copied_bytes,
+        slot_hits,
+        0,
+        0,
+    );
+    let entry = cache.get(&key).ok_or_else(|| {
+        GpuError::backend(
+            Backend::Metal,
+            "qwen36 packed expert static top-N cache entry missing after fill".into(),
+        )
+    })?;
+    Ok(Some(f(&entry.buffers)?))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen36_with_static_topn_mps_rhs_for_metal<T, F>(
+    ordinal: usize,
+    layer_idx: i32,
+    hidden: usize,
+    moe_intermediate: usize,
+    active_experts: &[usize],
+    group_size: usize,
+    num_experts: usize,
+    gate_up_proj_ptr: *const c_void,
+    gate_up_scale_ptr: *const c_void,
+    gate_up_zero_ptr: *const c_void,
+    down_proj_ptr: *const c_void,
+    down_scale_ptr: *const c_void,
+    down_zero_ptr: *const c_void,
+    f: F,
+) -> Result<Option<T>, GpuError>
+where
+    F: FnOnce(
+        &Qwen36MpsExpertStaticTopNCacheEntry,
+        usize,
+        &[Qwen36MpsStaticTopNHit],
+        &[usize],
+    ) -> Result<T, GpuError>,
+{
+    qwen36_validate_active_expert_pack(
+        hidden,
+        moe_intermediate,
+        active_experts,
+        group_size,
+        num_experts,
+        gate_up_proj_ptr,
+        gate_up_scale_ptr,
+        gate_up_zero_ptr,
+        down_proj_ptr,
+        down_scale_ptr,
+        down_zero_ptr,
+    )?;
+    let Some((capacity, resident_experts)) = qwen36_static_topn_layer_experts_from_env(layer_idx)?
+    else {
+        return Ok(None);
+    };
+    let resident_capacity = resident_experts.len();
+    let expert_to_slot =
+        qwen36_static_topn_expert_to_slot(layer_idx, resident_experts, num_experts, capacity)?;
+
+    let mut hits = Vec::with_capacity(active_experts.len());
+    let mut misses = Vec::with_capacity(active_experts.len());
+    for (group, &expert) in active_experts.iter().enumerate() {
+        if let Some(slot) = expert_to_slot[expert] {
+            hits.push(Qwen36MpsStaticTopNHit {
+                original_group: group,
+                slot,
+            });
+        } else {
+            misses.push(group);
+        }
+    }
+    if hits.is_empty() {
+        qwen36_mps_static_topn_expert_residency_profile_record(
+            resident_capacity,
+            false,
+            false,
+            false,
+            active_experts.len(),
+            0,
+            0,
+            misses.len(),
+            0,
+        );
+        return Ok(None);
+    }
+
+    let (result, allocation, copied_bytes) = qwen36_with_static_topn_mps_rhs_cache_for_metal(
+        ordinal,
+        hidden,
+        moe_intermediate,
+        resident_experts,
+        group_size,
+        num_experts,
+        gate_up_proj_ptr,
+        gate_up_scale_ptr,
+        gate_up_zero_ptr,
+        down_proj_ptr,
+        down_scale_ptr,
+        down_zero_ptr,
+        |entry| f(entry, resident_capacity, &hits, &misses),
+    )?;
+    qwen36_mps_static_topn_expert_residency_profile_record(
+        resident_capacity,
+        misses.is_empty(),
+        false,
+        allocation,
+        active_experts.len(),
+        usize::from(allocation) * copied_bytes,
+        hits.len(),
+        misses.len(),
+        0,
+    );
+    Ok(Some(result))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen36_with_static_topn_mps_rhs_cache_for_metal<T, F>(
+    ordinal: usize,
+    hidden: usize,
+    moe_intermediate: usize,
+    resident_experts: &[usize],
+    group_size: usize,
+    num_experts: usize,
+    gate_up_proj_ptr: *const c_void,
+    gate_up_scale_ptr: *const c_void,
+    gate_up_zero_ptr: *const c_void,
+    down_proj_ptr: *const c_void,
+    down_scale_ptr: *const c_void,
+    down_zero_ptr: *const c_void,
+    f: F,
+) -> Result<(T, bool, usize), GpuError>
+where
+    F: FnOnce(&Qwen36MpsExpertStaticTopNCacheEntry) -> Result<T, GpuError>,
+{
+    qwen36_validate_active_expert_pack(
+        hidden,
+        moe_intermediate,
+        resident_experts,
+        group_size,
+        num_experts,
+        gate_up_proj_ptr,
+        gate_up_scale_ptr,
+        gate_up_zero_ptr,
+        down_proj_ptr,
+        down_scale_ptr,
+        down_zero_ptr,
+    )?;
+    let resident_capacity = resident_experts.len();
+    let key = Qwen36PackedExpertCacheKey {
+        gate_up_proj_ptr: gate_up_proj_ptr as usize,
+        gate_up_scale_ptr: gate_up_scale_ptr as usize,
+        gate_up_zero_ptr: gate_up_zero_ptr as usize,
+        down_proj_ptr: down_proj_ptr as usize,
+        down_scale_ptr: down_scale_ptr as usize,
+        down_zero_ptr: down_zero_ptr as usize,
+        hidden,
+        moe_intermediate,
+        group_size,
+        active_groups: resident_capacity,
+    };
+    let cache = QWEN36_MPS_EXPERT_STATIC_TOPN_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache.lock().map_err(|_| {
+        GpuError::backend(
+            Backend::Metal,
+            "qwen36 MPS expert static top-N cache mutex poisoned".into(),
+        )
+    })?;
+    let mut allocation = false;
+    let copied_bytes =
+        resident_capacity * hidden * (3 * moe_intermediate) * std::mem::size_of::<u16>();
+    crate::prefill_ffi::metal_profile_time(
+        "qwen36_ffn_int4_expert_mps_static_topn_pack_f16_lut",
+        "host",
+        || -> Result<(), GpuError> {
+            match cache.entry(key) {
+                std::collections::hash_map::Entry::Occupied(entry) => {
+                    if entry.get().resident_experts.as_slice() != resident_experts {
+                        return Err(GpuError::backend(
+                            Backend::Metal,
+                            "qwen36 MPS static top-N cache key collision with different resident experts"
+                                .into(),
+                        ));
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(vacant) => {
+                    let (mut gate_up_rhs, mut down_rhs) = qwen36_alloc_mps_static_topn_rhs(
+                        ordinal,
+                        hidden,
+                        moe_intermediate,
+                        resident_capacity,
+                    )?;
+                    qwen36_fill_mps_static_topn_rhs_lut(
+                        hidden,
+                        moe_intermediate,
+                        resident_experts,
+                        group_size,
+                        gate_up_proj_ptr,
+                        gate_up_scale_ptr,
+                        gate_up_zero_ptr,
+                        down_proj_ptr,
+                        down_scale_ptr,
+                        down_zero_ptr,
+                        &mut gate_up_rhs,
+                        &mut down_rhs,
+                    );
+                    vacant.insert(Qwen36MpsExpertStaticTopNCacheEntry {
+                        resident_experts: resident_experts.to_vec(),
+                        gate_up_rhs,
+                        down_rhs,
+                    });
+                    allocation = true;
+                }
+            }
+            Ok(())
+        },
+    )?;
+    let entry = cache.get(&key).ok_or_else(|| {
+        GpuError::backend(
+            Backend::Metal,
+            "qwen36 MPS static top-N cache entry missing after fill".into(),
+        )
+    })?;
+    Ok((f(entry)?, allocation, copied_bytes))
+}
+
+fn qwen36_mps_static_topn_prewarm_supported(
+    params: Qwen36MoeFfnStepParams,
+    weights: &Qwen36MoeFfnStepWeights,
+    int4: &Qwen36MoeFfnStepInt4,
+) -> bool {
+    std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_MPS_STATIC_TOPN_PARTIAL").is_some()
+        && params.stage == 5
+        && params.hidden == 2048
+        && params.num_experts == 256
+        && params.moe_intermediate == 512
+        && params.top_k == 8
+        && int4.group_size == 128
+        && !crate::metal_native::disabled_by_env()
+        && !weights.gate_up_proj_w.is_null()
+        && !weights.down_proj_w.is_null()
+        && !int4.gate_up_proj_scale.is_null()
+        && !int4.gate_up_proj_zero.is_null()
+        && !int4.down_proj_scale.is_null()
+        && !int4.down_proj_zero.is_null()
+}
+
+pub fn qwen36_prewarm_mps_static_topn_rhs_for_metal(
+    ordinal: usize,
+    params: Qwen36MoeFfnStepParams,
+    weights: &Qwen36MoeFfnStepWeights,
+    int4: &Qwen36MoeFfnStepInt4,
+) -> Result<Option<Qwen36MpsStaticTopNPrewarmStats>, GpuError> {
+    if !qwen36_mps_static_topn_prewarm_supported(params, weights, int4) {
+        return Ok(None);
+    }
+    let Some((capacity, resident_experts)) =
+        qwen36_static_topn_layer_experts_from_env(params.layer_idx)?
+    else {
+        return Ok(None);
+    };
+    let hidden = params.hidden as usize;
+    let moe_intermediate = params.moe_intermediate as usize;
+    let (_, allocated, copied_bytes) = qwen36_with_static_topn_mps_rhs_cache_for_metal(
+        ordinal,
+        hidden,
+        moe_intermediate,
+        resident_experts,
+        int4.group_size as usize,
+        params.num_experts as usize,
+        weights.gate_up_proj_w,
+        int4.gate_up_proj_scale,
+        int4.gate_up_proj_zero,
+        weights.down_proj_w,
+        int4.down_proj_scale,
+        int4.down_proj_zero,
+        |_| Ok(()),
+    )?;
+    Ok(Some(Qwen36MpsStaticTopNPrewarmStats {
+        layer_idx: params.layer_idx,
+        resident_capacity: capacity,
+        allocated,
+        copied_bytes: usize::from(allocated) * copied_bytes,
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen36_with_cached_packed_experts_for_metal<T, F>(
+    ordinal: usize,
+    hidden: usize,
+    moe_intermediate: usize,
+    active_experts: &[usize],
+    group_size: usize,
+    num_experts: usize,
+    gate_up_proj_ptr: *const c_void,
+    gate_up_scale_ptr: *const c_void,
+    gate_up_zero_ptr: *const c_void,
+    down_proj_ptr: *const c_void,
+    down_scale_ptr: *const c_void,
+    down_zero_ptr: *const c_void,
+    f: F,
+) -> Result<T, GpuError>
+where
+    F: FnOnce(&Qwen36PackedExpertBuffers) -> Result<T, GpuError>,
+{
+    qwen36_validate_active_expert_pack(
+        hidden,
+        moe_intermediate,
+        active_experts,
+        group_size,
+        num_experts,
+        gate_up_proj_ptr,
+        gate_up_scale_ptr,
+        gate_up_zero_ptr,
+        down_proj_ptr,
+        down_scale_ptr,
+        down_zero_ptr,
+    )?;
+    let key = Qwen36PackedExpertCacheKey {
+        gate_up_proj_ptr: gate_up_proj_ptr as usize,
+        gate_up_scale_ptr: gate_up_scale_ptr as usize,
+        gate_up_zero_ptr: gate_up_zero_ptr as usize,
+        down_proj_ptr: down_proj_ptr as usize,
+        down_scale_ptr: down_scale_ptr as usize,
+        down_zero_ptr: down_zero_ptr as usize,
+        hidden,
+        moe_intermediate,
+        group_size,
+        active_groups: active_experts.len(),
+    };
+    let cache = QWEN36_PACKED_EXPERT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache.lock().map_err(|_| {
+        GpuError::backend(
+            Backend::Metal,
+            "qwen36 packed expert cache mutex poisoned".into(),
+        )
+    })?;
+    crate::prefill_ffi::metal_profile_time(
+        "qwen36_ffn_int4_expert_pack_stage5",
+        "host",
+        || -> Result<(), GpuError> {
+            let copy_bytes = qwen36_packed_expert_copy_bytes(
+                hidden,
+                moe_intermediate,
+                active_experts.len(),
+                group_size,
+            );
+            if let Some(entry) = cache.get_mut(&key) {
+                if entry.active_experts != active_experts {
+                    qwen36_fill_packed_experts_for_metal(
+                        hidden,
+                        moe_intermediate,
+                        active_experts,
+                        group_size,
+                        gate_up_proj_ptr,
+                        gate_up_scale_ptr,
+                        gate_up_zero_ptr,
+                        down_proj_ptr,
+                        down_scale_ptr,
+                        down_zero_ptr,
+                        &mut entry.buffers,
+                    );
+                    entry.active_experts.clear();
+                    entry.active_experts.extend_from_slice(active_experts);
+                    qwen36_packed_expert_cache_profile_record(
+                        false,
+                        true,
+                        false,
+                        active_experts.len(),
+                        copy_bytes,
+                        0,
+                        active_experts.len(),
+                        0,
+                    );
+                } else {
+                    qwen36_packed_expert_cache_profile_record(
+                        true,
+                        false,
+                        false,
+                        active_experts.len(),
+                        0,
+                        active_experts.len(),
+                        0,
+                        0,
+                    );
+                }
+                return Ok(());
+            }
+            let mut buffers = qwen36_alloc_packed_experts_for_metal(
+                ordinal,
+                hidden,
+                moe_intermediate,
+                active_experts.len(),
+                group_size,
+            )?;
+            qwen36_fill_packed_experts_for_metal(
+                hidden,
+                moe_intermediate,
+                active_experts,
+                group_size,
+                gate_up_proj_ptr,
+                gate_up_scale_ptr,
+                gate_up_zero_ptr,
+                down_proj_ptr,
+                down_scale_ptr,
+                down_zero_ptr,
+                &mut buffers,
+            );
+            cache.insert(
+                key,
+                Qwen36PackedExpertCacheEntry {
+                    active_experts: active_experts.to_vec(),
+                    buffers,
+                },
+            );
+            qwen36_packed_expert_cache_profile_record(
+                false,
+                false,
+                true,
+                active_experts.len(),
+                copy_bytes,
+                0,
+                active_experts.len(),
+                0,
+            );
+            Ok(())
+        },
+    )?;
+    let entry = cache.get(&key).ok_or_else(|| {
+        GpuError::backend(
+            Backend::Metal,
+            "qwen36 packed expert cache entry missing after fill".into(),
+        )
+    })?;
+    f(&entry.buffers)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen36_with_gpu_pack_buffers_for_metal<T, F>(
+    ordinal: usize,
+    hidden: usize,
+    moe_intermediate: usize,
+    active_experts: &[usize],
+    group_size: usize,
+    num_experts: usize,
+    gate_up_proj_ptr: *const c_void,
+    gate_up_scale_ptr: *const c_void,
+    gate_up_zero_ptr: *const c_void,
+    down_proj_ptr: *const c_void,
+    down_scale_ptr: *const c_void,
+    down_zero_ptr: *const c_void,
+    f: F,
+) -> Result<T, GpuError>
+where
+    F: FnOnce(&Qwen36PackedExpertBuffers) -> Result<T, GpuError>,
+{
+    qwen36_validate_active_expert_pack(
+        hidden,
+        moe_intermediate,
+        active_experts,
+        group_size,
+        num_experts,
+        gate_up_proj_ptr,
+        gate_up_scale_ptr,
+        gate_up_zero_ptr,
+        down_proj_ptr,
+        down_scale_ptr,
+        down_zero_ptr,
+    )?;
+    let key = Qwen36PackedExpertCacheKey {
+        gate_up_proj_ptr: gate_up_proj_ptr as usize,
+        gate_up_scale_ptr: gate_up_scale_ptr as usize,
+        gate_up_zero_ptr: gate_up_zero_ptr as usize,
+        down_proj_ptr: down_proj_ptr as usize,
+        down_scale_ptr: down_scale_ptr as usize,
+        down_zero_ptr: down_zero_ptr as usize,
+        hidden,
+        moe_intermediate,
+        group_size,
+        active_groups: active_experts.len(),
+    };
+    let cache = QWEN36_PACKED_EXPERT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache.lock().map_err(|_| {
+        GpuError::backend(
+            Backend::Metal,
+            "qwen36 GPU packed expert cache mutex poisoned".into(),
+        )
+    })?;
+    crate::prefill_ffi::metal_profile_time(
+        "qwen36_ffn_int4_expert_gpu_pack_alloc_stage5",
+        "host",
+        || -> Result<(), GpuError> {
+            if cache.contains_key(&key) {
+                qwen36_gpu_pack_expert_residency_profile_record(
+                    false,
+                    true,
+                    false,
+                    active_experts.len(),
+                    0,
+                    0,
+                    active_experts.len(),
+                    0,
+                );
+                return Ok(());
+            }
+            let buffers = qwen36_alloc_packed_experts_for_metal(
+                ordinal,
+                hidden,
+                moe_intermediate,
+                active_experts.len(),
+                group_size,
+            )?;
+            cache.insert(
+                key,
+                Qwen36PackedExpertCacheEntry {
+                    active_experts: Vec::new(),
+                    buffers,
+                },
+            );
+            qwen36_gpu_pack_expert_residency_profile_record(
+                false,
+                false,
+                true,
+                active_experts.len(),
+                0,
+                0,
+                active_experts.len(),
+                0,
+            );
+            Ok(())
+        },
+    )?;
+    let entry = cache.get(&key).ok_or_else(|| {
+        GpuError::backend(
+            Backend::Metal,
+            "qwen36 GPU packed expert cache entry missing after allocation".into(),
+        )
+    })?;
+    f(&entry.buffers)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen36_with_hotset_packed_experts_for_metal<T, F>(
+    ordinal: usize,
+    hidden: usize,
+    moe_intermediate: usize,
+    active_experts: &[usize],
+    group_size: usize,
+    num_experts: usize,
+    capacity: usize,
+    workspace: &mut [f32],
+    off_topk_idx: usize,
+    gate_up_proj_ptr: *const c_void,
+    gate_up_scale_ptr: *const c_void,
+    gate_up_zero_ptr: *const c_void,
+    down_proj_ptr: *const c_void,
+    down_scale_ptr: *const c_void,
+    down_zero_ptr: *const c_void,
+    f: F,
+) -> Result<T, GpuError>
+where
+    F: FnOnce(&Qwen36PackedExpertBuffers) -> Result<T, GpuError>,
+{
+    qwen36_validate_active_expert_pack(
+        hidden,
+        moe_intermediate,
+        active_experts,
+        group_size,
+        num_experts,
+        gate_up_proj_ptr,
+        gate_up_scale_ptr,
+        gate_up_zero_ptr,
+        down_proj_ptr,
+        down_scale_ptr,
+        down_zero_ptr,
+    )?;
+    if capacity < active_experts.len() {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36 hotset packed expert cache capacity {capacity} < active groups {}",
+            active_experts.len()
+        )));
+    }
+    if off_topk_idx + active_experts.len() > workspace.len() {
+        return Err(GpuError::InvalidArg(
+            "qwen36 hotset packed expert cache topk workspace out of bounds".into(),
+        ));
+    }
+
+    let key = Qwen36PackedExpertCacheKey {
+        gate_up_proj_ptr: gate_up_proj_ptr as usize,
+        gate_up_scale_ptr: gate_up_scale_ptr as usize,
+        gate_up_zero_ptr: gate_up_zero_ptr as usize,
+        down_proj_ptr: down_proj_ptr as usize,
+        down_scale_ptr: down_scale_ptr as usize,
+        down_zero_ptr: down_zero_ptr as usize,
+        hidden,
+        moe_intermediate,
+        group_size,
+        active_groups: capacity,
+    };
+    let cache = QWEN36_PACKED_EXPERT_HOTSET_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache.lock().map_err(|_| {
+        GpuError::backend(
+            Backend::Metal,
+            "qwen36 packed expert hotset cache mutex poisoned".into(),
+        )
+    })?;
+    crate::prefill_ffi::metal_profile_time(
+        "qwen36_ffn_int4_expert_pack_hotset_stage5",
+        "host",
+        || -> Result<(), GpuError> {
+            let mut allocation = false;
+            if let std::collections::hash_map::Entry::Vacant(vacant) = cache.entry(key) {
+                let buffers = qwen36_alloc_packed_experts_for_metal(
+                    ordinal,
+                    hidden,
+                    moe_intermediate,
+                    capacity,
+                    group_size,
+                )?;
+                vacant.insert(Qwen36PackedExpertHotsetCacheEntry {
+                    slot_experts: vec![None; capacity],
+                    slot_last_used: vec![0; capacity],
+                    next_stamp: 1,
+                    buffers,
+                });
+                allocation = true;
+            }
+            let entry = cache.get_mut(&key).ok_or_else(|| {
+                GpuError::backend(
+                    Backend::Metal,
+                    "qwen36 packed expert hotset cache entry missing after allocation".into(),
+                )
+            })?;
+            let bytes_per_expert =
+                qwen36_packed_expert_copy_bytes(hidden, moe_intermediate, 1, group_size);
+            let mut protected_slots = vec![false; capacity];
+            let mut slot_hits = 0usize;
+            let mut slot_misses = 0usize;
+            let mut evictions = 0usize;
+            for (group, &expert) in active_experts.iter().enumerate() {
+                let (slot, hit, eviction) = qwen36_hotset_choose_slot(
+                    &entry.slot_experts,
+                    &entry.slot_last_used,
+                    &protected_slots,
+                    expert,
+                );
+                if hit {
+                    slot_hits += 1;
+                } else {
+                    slot_misses += 1;
+                    evictions += usize::from(eviction);
+                    qwen36_fill_packed_expert_slot_for_metal(
+                        hidden,
+                        moe_intermediate,
+                        expert,
+                        slot,
+                        group_size,
+                        gate_up_proj_ptr,
+                        gate_up_scale_ptr,
+                        gate_up_zero_ptr,
+                        down_proj_ptr,
+                        down_scale_ptr,
+                        down_zero_ptr,
+                        &mut entry.buffers,
+                    );
+                    entry.slot_experts[slot] = Some(expert);
+                }
+                entry.slot_last_used[slot] = entry.next_stamp;
+                entry.next_stamp = entry.next_stamp.wrapping_add(1).max(1);
+                protected_slots[slot] = true;
+                workspace[off_topk_idx + group] = f32::from_bits(slot as u32);
+            }
+            qwen36_hotset_expert_residency_profile_record(
+                capacity,
+                slot_misses == 0,
+                slot_misses > 0,
+                allocation,
+                active_experts.len(),
+                slot_misses * bytes_per_expert,
+                slot_hits,
+                slot_misses,
+                evictions,
+            );
+            Ok(())
+        },
+    )?;
+    let entry = cache.get(&key).ok_or_else(|| {
+        GpuError::backend(
+            Backend::Metal,
+            "qwen36 packed expert hotset cache entry missing after fill".into(),
+        )
+    })?;
+    f(&entry.buffers)
+}
+
+fn f32_to_f16_bits(x: f32) -> u16 {
+    f16::from_f32(x).to_bits()
+}
+
+fn push_f16_bits(bytes: &mut Vec<u8>, bits: u16) {
+    bytes.extend_from_slice(&bits.to_le_bytes());
+}
+
+#[cfg(test)]
+fn alloc_f16_byte_vec(elements: usize) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(elements * 2);
+    bytes.resize(elements * 2, 0);
+    bytes
+}
+
+#[cfg(test)]
+fn write_f16_byte(bytes: &mut [u8], index: usize, bits: u16) {
+    let offset = index * 2;
+    bytes[offset..offset + 2].copy_from_slice(&bits.to_le_bytes());
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen36_expert_int4_weight_unchecked(
+    weight: usize,
+    scale: usize,
+    zero: usize,
+    expert: usize,
+    row: usize,
+    rows: usize,
+    col: usize,
+    cols: usize,
+    group_size: usize,
+) -> f32 {
+    let packed = weight as *const u8;
+    let scale = scale as *const u16;
+    let zero = zero as *const u16;
+    let byte_cols = cols.div_ceil(2);
+    let scale_rows = rows.div_ceil(group_size);
+    let scale_cols = cols.div_ceil(group_size);
+    let packed_base = (expert * rows + row) * byte_cols;
+    let scale_base = (expert * scale_rows + row / group_size) * scale_cols;
+    let byte = unsafe { *packed.add(packed_base + col / 2) };
+    let nibble = if col & 1 == 0 {
+        byte & 0x0f
+    } else {
+        (byte >> 4) & 0x0f
+    };
+    let scale_idx = scale_base + col / group_size;
+    let s = bf16_bits_to_f32(unsafe { *scale.add(scale_idx) });
+    let z = bf16_bits_to_f32(unsafe { *zero.add(scale_idx) });
+    bf16_round_f32(nibble as f32 * s - z * s)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen36_pack_mps_expert_bridge_bytes_scalar(
+    hidden: usize,
+    moe_intermediate: usize,
+    active_experts: &[usize],
+    h_norm: &[f32],
+    group_size: usize,
+    gate_up_proj_ptr: *const c_void,
+    gate_up_scale_ptr: *const c_void,
+    gate_up_zero_ptr: *const c_void,
+    down_proj_ptr: *const c_void,
+    down_scale_ptr: *const c_void,
+    down_zero_ptr: *const c_void,
+) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let active_groups = active_experts.len();
+    let gate_up_rows = 2 * moe_intermediate;
+    let mut h_norm_bytes = Vec::with_capacity(active_groups * hidden * 2);
+    let mut gate_up_rhs_bytes = Vec::with_capacity(active_groups * hidden * gate_up_rows * 2);
+    let mut down_rhs_bytes = Vec::with_capacity(active_groups * moe_intermediate * hidden * 2);
+
+    for _ in 0..active_groups {
+        for &x in h_norm {
+            push_f16_bits(&mut h_norm_bytes, f32_to_f16_bits(x));
+        }
+    }
+
+    let gate_up_w = gate_up_proj_ptr as usize;
+    let gate_up_scale = gate_up_scale_ptr as usize;
+    let gate_up_zero = gate_up_zero_ptr as usize;
+    let down_w = down_proj_ptr as usize;
+    let down_scale = down_scale_ptr as usize;
+    let down_zero = down_zero_ptr as usize;
+
+    for &expert in active_experts {
+        for col in 0..hidden {
+            for row in 0..gate_up_rows {
+                let w = qwen36_expert_int4_weight_unchecked(
+                    gate_up_w,
+                    gate_up_scale,
+                    gate_up_zero,
+                    expert,
+                    row,
+                    gate_up_rows,
+                    col,
+                    hidden,
+                    group_size,
+                );
+                push_f16_bits(&mut gate_up_rhs_bytes, f32_to_f16_bits(w));
+            }
+        }
+        for col in 0..moe_intermediate {
+            for row in 0..hidden {
+                let w = qwen36_expert_int4_weight_unchecked(
+                    down_w,
+                    down_scale,
+                    down_zero,
+                    expert,
+                    row,
+                    hidden,
+                    col,
+                    moe_intermediate,
+                    group_size,
+                );
+                push_f16_bits(&mut down_rhs_bytes, f32_to_f16_bits(w));
+            }
+        }
+    }
+    (h_norm_bytes, gate_up_rhs_bytes, down_rhs_bytes)
+}
+
+fn qwen36_int4_f16_lut(scale_bits: u16, zero_bits: u16) -> [u16; 16] {
+    let s = bf16_bits_to_f32(scale_bits);
+    let z = bf16_bits_to_f32(zero_bits);
+    let zs = z * s;
+    std::array::from_fn(|idx| f32_to_f16_bits(bf16_round_f32(idx as f32 * s - zs)))
+}
+
+#[inline(always)]
+fn qwen36_int4_f16_pair_lut(scale_bits: u16, zero_bits: u16) -> [u32; 256] {
+    let nibble_lut = qwen36_int4_f16_lut(scale_bits, zero_bits);
+    std::array::from_fn(|byte| {
+        let lo = nibble_lut[byte & 0x0f] as u32;
+        let hi = (nibble_lut[(byte >> 4) & 0x0f] as u32) << 16;
+        lo | hi
+    })
+}
+
+#[inline(always)]
+fn write_f16_unaligned(bytes: &mut [u8], index: usize, bits: u16) {
+    unsafe {
+        std::ptr::write_unaligned(bytes.as_mut_ptr().add(index * 2).cast::<u16>(), bits);
+    }
+}
+
+#[inline(always)]
+fn write_f16_pair_unaligned(bytes: &mut [u8], index: usize, bits: u32) {
+    unsafe {
+        std::ptr::write_unaligned(bytes.as_mut_ptr().add(index * 2).cast::<u32>(), bits);
+    }
+}
+
+#[inline(always)]
+fn read_f16_unaligned(bytes: &[u8], index: usize) -> u16 {
+    unsafe { std::ptr::read_unaligned(bytes.as_ptr().add(index * 2).cast::<u16>()) }
+}
+
+fn qwen36_gpu_buffer_as_mut_bytes(buffer: &mut GpuBuffer) -> &mut [u8] {
+    unsafe { std::slice::from_raw_parts_mut(buffer.as_mut_ptr().cast::<u8>(), buffer.len_bytes()) }
+}
+
+#[repr(align(16))]
+struct Qwen36F16Chunk16([u16; 16]);
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn qwen36_store_f16_chunk16_stream(dst: *mut u8, values: &Qwen36F16Chunk16) {
+    std::arch::asm!(
+        "ldr q0, [{src}]",
+        "ldr q1, [{src}, #16]",
+        "stnp q0, q1, [{dst}]",
+        src = in(reg) values.0.as_ptr(),
+        dst = in(reg) dst,
+        out("v0") _,
+        out("v1") _,
+        options(nostack, preserves_flags)
+    );
+}
+
+#[inline(always)]
+fn qwen36_write_f16_chunk16(
+    bytes: &mut [u8],
+    index: usize,
+    values: &Qwen36F16Chunk16,
+    stream: bool,
+) {
+    let dst = unsafe { bytes.as_mut_ptr().add(index * 2) };
+    #[cfg(target_arch = "aarch64")]
+    if stream {
+        unsafe {
+            qwen36_store_f16_chunk16_stream(dst, values);
+        }
+        return;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(values.0.as_ptr().cast::<u8>(), dst, 32);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen36_pack_transposed_int4_f16_lut(
+    src: *const u8,
+    scale: *const u16,
+    zero: *const u16,
+    expert: usize,
+    rows: usize,
+    cols: usize,
+    group_size: usize,
+    dst: &mut [u8],
+    dst_group_base: usize,
+    dst_col_stride: usize,
+    stream_stores: bool,
+) {
+    let byte_cols = cols.div_ceil(2);
+    let scale_rows = rows.div_ceil(group_size);
+    let scale_cols = cols.div_ceil(group_size);
+    let mut tile = vec![0u8; group_size * group_size * 2];
+
+    for row_group in 0..scale_rows {
+        let row_start = row_group * group_size;
+        let row_end = (row_start + group_size).min(rows);
+        let tile_rows = row_end - row_start;
+        for scale_col in 0..scale_cols {
+            let col_start = scale_col * group_size;
+            let col_end = (col_start + group_size).min(cols);
+            let tile_cols = col_end - col_start;
+            let tile_byte_cols = tile_cols.div_ceil(2);
+            let scale_idx = (expert * scale_rows + row_group) * scale_cols + scale_col;
+            let pair_lut =
+                unsafe { qwen36_int4_f16_pair_lut(*scale.add(scale_idx), *zero.add(scale_idx)) };
+
+            for (tile_row, row) in (row_start..row_end).enumerate() {
+                let tile_row_base = tile_row * tile_cols;
+                let packed_base = (expert * rows + row) * byte_cols;
+                let mut byte_offset = 0usize;
+                while byte_offset < tile_byte_cols {
+                    let byte = unsafe { *src.add(packed_base + col_start / 2 + byte_offset) };
+                    let col0 = 2 * byte_offset;
+                    let col1 = col0 + 1;
+                    if col1 < tile_cols {
+                        write_f16_pair_unaligned(
+                            &mut tile,
+                            tile_row_base + col0,
+                            pair_lut[byte as usize],
+                        );
+                    } else {
+                        write_f16_unaligned(
+                            &mut tile,
+                            tile_row_base + col0,
+                            pair_lut[byte as usize] as u16,
+                        );
+                    }
+                    byte_offset += 1;
+                }
+            }
+
+            for tile_col in 0..tile_cols {
+                let dst_base = dst_group_base + (col_start + tile_col) * dst_col_stride + row_start;
+                let mut tile_row = 0usize;
+                if stream_stores {
+                    let mut chunk = Qwen36F16Chunk16([0; 16]);
+                    while tile_row + 16 <= tile_rows {
+                        for idx in 0..16 {
+                            chunk.0[idx] =
+                                read_f16_unaligned(&tile, (tile_row + idx) * tile_cols + tile_col);
+                        }
+                        qwen36_write_f16_chunk16(dst, dst_base + tile_row, &chunk, true);
+                        tile_row += 16;
+                    }
+                }
+                while tile_row < tile_rows {
+                    write_f16_unaligned(
+                        dst,
+                        dst_base + tile_row,
+                        read_f16_unaligned(&tile, tile_row * tile_cols + tile_col),
+                    );
+                    tile_row += 1;
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(test)]
+fn qwen36_pack_mps_expert_bridge_bytes_lut(
+    hidden: usize,
+    moe_intermediate: usize,
+    active_experts: &[usize],
+    h_norm: &[f32],
+    group_size: usize,
+    gate_up_proj_ptr: *const c_void,
+    gate_up_scale_ptr: *const c_void,
+    gate_up_zero_ptr: *const c_void,
+    down_proj_ptr: *const c_void,
+    down_scale_ptr: *const c_void,
+    down_zero_ptr: *const c_void,
+) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let active_groups = active_experts.len();
+    let gate_up_rows = 2 * moe_intermediate;
+    let mut h_norm_bytes = alloc_f16_byte_vec(active_groups * hidden);
+    let mut gate_up_rhs_bytes = alloc_f16_byte_vec(active_groups * hidden * gate_up_rows);
+    let mut down_rhs_bytes = alloc_f16_byte_vec(active_groups * moe_intermediate * hidden);
+
+    for group in 0..active_groups {
+        let dst_base = group * hidden;
+        for (col, &x) in h_norm.iter().enumerate() {
+            write_f16_byte(&mut h_norm_bytes, dst_base + col, f32_to_f16_bits(x));
+        }
+    }
+
+    let gate_up_w = gate_up_proj_ptr as *const u8;
+    let gate_up_scale = gate_up_scale_ptr as *const u16;
+    let gate_up_zero = gate_up_zero_ptr as *const u16;
+    let down_w = down_proj_ptr as *const u8;
+    let down_scale = down_scale_ptr as *const u16;
+    let down_zero = down_zero_ptr as *const u16;
+
+    for (group, &expert) in active_experts.iter().enumerate() {
+        qwen36_pack_transposed_int4_f16_lut(
+            gate_up_w,
+            gate_up_scale,
+            gate_up_zero,
+            expert,
+            gate_up_rows,
+            hidden,
+            group_size,
+            &mut gate_up_rhs_bytes,
+            group * hidden * gate_up_rows,
+            gate_up_rows,
+            false,
+        );
+        qwen36_pack_transposed_int4_f16_lut(
+            down_w,
+            down_scale,
+            down_zero,
+            expert,
+            hidden,
+            moe_intermediate,
+            group_size,
+            &mut down_rhs_bytes,
+            group * moe_intermediate * hidden,
+            hidden,
+            false,
+        );
+    }
+    (h_norm_bytes, gate_up_rhs_bytes, down_rhs_bytes)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen36_fill_mps_expert_bridge_buffers_lut(
+    hidden: usize,
+    moe_intermediate: usize,
+    active_experts: &[usize],
+    h_norm: &[f32],
+    group_size: usize,
+    gate_up_proj_ptr: *const c_void,
+    gate_up_scale_ptr: *const c_void,
+    gate_up_zero_ptr: *const c_void,
+    down_proj_ptr: *const c_void,
+    down_scale_ptr: *const c_void,
+    down_zero_ptr: *const c_void,
+    bridge: &mut Qwen36MpsExpertBridgeBuffers,
+    stream_stores: bool,
+) {
+    let active_groups = active_experts.len();
+    let gate_up_rows = 2 * moe_intermediate;
+
+    {
+        let h_norm_bytes = qwen36_gpu_buffer_as_mut_bytes(&mut bridge.h_norm);
+        for group in 0..active_groups {
+            let dst_base = group * hidden;
+            for (col, &x) in h_norm.iter().enumerate() {
+                write_f16_unaligned(h_norm_bytes, dst_base + col, f32_to_f16_bits(x));
+            }
+        }
+    }
+
+    let gate_up_w = gate_up_proj_ptr as *const u8;
+    let gate_up_scale = gate_up_scale_ptr as *const u16;
+    let gate_up_zero = gate_up_zero_ptr as *const u16;
+    let down_w = down_proj_ptr as *const u8;
+    let down_scale = down_scale_ptr as *const u16;
+    let down_zero = down_zero_ptr as *const u16;
+
+    for (group, &expert) in active_experts.iter().enumerate() {
+        qwen36_pack_transposed_int4_f16_lut(
+            gate_up_w,
+            gate_up_scale,
+            gate_up_zero,
+            expert,
+            gate_up_rows,
+            hidden,
+            group_size,
+            qwen36_gpu_buffer_as_mut_bytes(&mut bridge.gate_up_rhs),
+            group * hidden * gate_up_rows,
+            gate_up_rows,
+            stream_stores,
+        );
+        qwen36_pack_transposed_int4_f16_lut(
+            down_w,
+            down_scale,
+            down_zero,
+            expert,
+            hidden,
+            moe_intermediate,
+            group_size,
+            qwen36_gpu_buffer_as_mut_bytes(&mut bridge.down_rhs),
+            group * moe_intermediate * hidden,
+            hidden,
+            stream_stores,
+        );
+    }
+    if stream_stores {
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen36_build_mps_expert_bridge_buffers(
+    ordinal: usize,
+    hidden: usize,
+    moe_intermediate: usize,
+    active_experts: &[usize],
+    h_norm: &[f32],
+    group_size: usize,
+    gate_up_proj_ptr: *const c_void,
+    gate_up_scale_ptr: *const c_void,
+    gate_up_zero_ptr: *const c_void,
+    down_proj_ptr: *const c_void,
+    down_scale_ptr: *const c_void,
+    down_zero_ptr: *const c_void,
+    use_lut_pack: bool,
+) -> Result<Qwen36MpsExpertBridgeBuffers, GpuError> {
+    let active_groups = active_experts.len();
+    let gate_up_rows = 2 * moe_intermediate;
+    if use_lut_pack {
+        let mut bridge = qwen36_alloc_mps_expert_bridge_buffers(
+            ordinal,
+            hidden,
+            moe_intermediate,
+            active_groups,
+        )?;
+        qwen36_fill_mps_expert_bridge_buffers_lut(
+            hidden,
+            moe_intermediate,
+            active_experts,
+            h_norm,
+            group_size,
+            gate_up_proj_ptr,
+            gate_up_scale_ptr,
+            gate_up_zero_ptr,
+            down_proj_ptr,
+            down_scale_ptr,
+            down_zero_ptr,
+            &mut bridge,
+            std::env::var_os("SUPERSONIC_METAL_QWEN36_MPS_BRIDGE_CPU_TRANSCODE_STREAM").is_some(),
+        );
+        return Ok(bridge);
+    }
+    let (h_norm_bytes, gate_up_rhs_bytes, down_rhs_bytes) =
+        qwen36_pack_mps_expert_bridge_bytes_scalar(
+            hidden,
+            moe_intermediate,
+            active_experts,
+            h_norm,
+            group_size,
+            gate_up_proj_ptr,
+            gate_up_scale_ptr,
+            gate_up_zero_ptr,
+            down_proj_ptr,
+            down_scale_ptr,
+            down_zero_ptr,
+        );
+
+    let h_norm = GpuBuffer::from_host_bytes(
+        ordinal,
+        ScalarType::F16,
+        &[active_groups, hidden],
+        &h_norm_bytes,
+    )?;
+    let gate_up_rhs = GpuBuffer::from_host_bytes(
+        ordinal,
+        ScalarType::F16,
+        &[active_groups, hidden, gate_up_rows],
+        &gate_up_rhs_bytes,
+    )?;
+    let gate_up_out = GpuBuffer::zeros(ordinal, ScalarType::F16, &[active_groups, gate_up_rows])?;
+    let down_lhs = GpuBuffer::zeros(ordinal, ScalarType::F16, &[active_groups, moe_intermediate])?;
+    let down_rhs = GpuBuffer::from_host_bytes(
+        ordinal,
+        ScalarType::F16,
+        &[active_groups, moe_intermediate, hidden],
+        &down_rhs_bytes,
+    )?;
+    let down_out = GpuBuffer::zeros(ordinal, ScalarType::F16, &[active_groups, hidden])?;
+
+    Ok(Qwen36MpsExpertBridgeBuffers {
+        h_norm,
+        gate_up_rhs,
+        gate_up_out,
+        down_lhs,
+        down_rhs,
+        down_out,
+    })
+}
+
+fn qwen36_alloc_mps_expert_bridge_scratch(
+    ordinal: usize,
+    hidden: usize,
+    moe_intermediate: usize,
+    active_groups: usize,
+) -> Result<Qwen36MpsExpertBridgeScratch, GpuError> {
+    let gate_up_rows = 2 * moe_intermediate;
+    let h_norm = GpuBuffer::alloc_with_kind(
+        ordinal,
+        ScalarType::F16,
+        &[active_groups, hidden],
+        BufferKind::Scratch,
+    )?;
+    let gate_up_out = GpuBuffer::alloc_with_kind(
+        ordinal,
+        ScalarType::F16,
+        &[active_groups, gate_up_rows],
+        BufferKind::Scratch,
+    )?;
+    let down_lhs = GpuBuffer::alloc_with_kind(
+        ordinal,
+        ScalarType::F16,
+        &[active_groups, moe_intermediate],
+        BufferKind::Scratch,
+    )?;
+    let down_out = GpuBuffer::alloc_with_kind(
+        ordinal,
+        ScalarType::F16,
+        &[active_groups, hidden],
+        BufferKind::Scratch,
+    )?;
+    Ok(Qwen36MpsExpertBridgeScratch {
+        h_norm,
+        gate_up_out,
+        down_lhs,
+        down_out,
+    })
+}
+
+fn qwen36_fill_mps_expert_h_norm(
+    hidden: usize,
+    active_groups: usize,
+    h_norm: &[f32],
+    h_norm_f16: &mut GpuBuffer,
+) {
+    let h_norm_bytes = qwen36_gpu_buffer_as_mut_bytes(h_norm_f16);
+    for group in 0..active_groups {
+        let dst_base = group * hidden;
+        for (col, &x) in h_norm.iter().enumerate() {
+            write_f16_unaligned(h_norm_bytes, dst_base + col, f32_to_f16_bits(x));
+        }
+    }
+}
+
+fn qwen36_alloc_mps_static_topn_rhs(
+    ordinal: usize,
+    hidden: usize,
+    moe_intermediate: usize,
+    capacity: usize,
+) -> Result<(GpuBuffer, GpuBuffer), GpuError> {
+    let gate_up_rows = 2 * moe_intermediate;
+    let gate_up_rhs = GpuBuffer::alloc_with_kind(
+        ordinal,
+        ScalarType::F16,
+        &[capacity, hidden, gate_up_rows],
+        BufferKind::Scratch,
+    )?;
+    let down_rhs = GpuBuffer::alloc_with_kind(
+        ordinal,
+        ScalarType::F16,
+        &[capacity, moe_intermediate, hidden],
+        BufferKind::Scratch,
+    )?;
+    Ok((gate_up_rhs, down_rhs))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen36_fill_mps_static_topn_rhs_lut(
+    hidden: usize,
+    moe_intermediate: usize,
+    resident_experts: &[usize],
+    group_size: usize,
+    gate_up_proj_ptr: *const c_void,
+    gate_up_scale_ptr: *const c_void,
+    gate_up_zero_ptr: *const c_void,
+    down_proj_ptr: *const c_void,
+    down_scale_ptr: *const c_void,
+    down_zero_ptr: *const c_void,
+    gate_up_rhs: &mut GpuBuffer,
+    down_rhs: &mut GpuBuffer,
+) {
+    let gate_up_rows = 2 * moe_intermediate;
+    let gate_up_w = gate_up_proj_ptr as *const u8;
+    let gate_up_scale = gate_up_scale_ptr as *const u16;
+    let gate_up_zero = gate_up_zero_ptr as *const u16;
+    let down_w = down_proj_ptr as *const u8;
+    let down_scale = down_scale_ptr as *const u16;
+    let down_zero = down_zero_ptr as *const u16;
+    let stream_stores =
+        std::env::var_os("SUPERSONIC_METAL_QWEN36_MPS_BRIDGE_CPU_TRANSCODE_STREAM").is_some();
+
+    for (slot, &expert) in resident_experts.iter().enumerate() {
+        qwen36_pack_transposed_int4_f16_lut(
+            gate_up_w,
+            gate_up_scale,
+            gate_up_zero,
+            expert,
+            gate_up_rows,
+            hidden,
+            group_size,
+            qwen36_gpu_buffer_as_mut_bytes(gate_up_rhs),
+            slot * hidden * gate_up_rows,
+            gate_up_rows,
+            stream_stores,
+        );
+        qwen36_pack_transposed_int4_f16_lut(
+            down_w,
+            down_scale,
+            down_zero,
+            expert,
+            hidden,
+            moe_intermediate,
+            group_size,
+            qwen36_gpu_buffer_as_mut_bytes(down_rhs),
+            slot * moe_intermediate * hidden,
+            hidden,
+            stream_stores,
+        );
+    }
+    if stream_stores {
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+    }
+}
+
+fn qwen36_alloc_mps_expert_bridge_buffers(
+    ordinal: usize,
+    hidden: usize,
+    moe_intermediate: usize,
+    active_groups: usize,
+) -> Result<Qwen36MpsExpertBridgeBuffers, GpuError> {
+    let gate_up_rows = 2 * moe_intermediate;
+    let h_norm = GpuBuffer::alloc_with_kind(
+        ordinal,
+        ScalarType::F16,
+        &[active_groups, hidden],
+        BufferKind::Scratch,
+    )?;
+    let gate_up_rhs = GpuBuffer::alloc_with_kind(
+        ordinal,
+        ScalarType::F16,
+        &[active_groups, hidden, gate_up_rows],
+        BufferKind::Scratch,
+    )?;
+    let gate_up_out = GpuBuffer::alloc_with_kind(
+        ordinal,
+        ScalarType::F16,
+        &[active_groups, gate_up_rows],
+        BufferKind::Scratch,
+    )?;
+    let down_lhs = GpuBuffer::alloc_with_kind(
+        ordinal,
+        ScalarType::F16,
+        &[active_groups, moe_intermediate],
+        BufferKind::Scratch,
+    )?;
+    let down_rhs = GpuBuffer::alloc_with_kind(
+        ordinal,
+        ScalarType::F16,
+        &[active_groups, moe_intermediate, hidden],
+        BufferKind::Scratch,
+    )?;
+    let down_out = GpuBuffer::alloc_with_kind(
+        ordinal,
+        ScalarType::F16,
+        &[active_groups, hidden],
+        BufferKind::Scratch,
+    )?;
+
+    Ok(Qwen36MpsExpertBridgeBuffers {
+        h_norm,
+        gate_up_rhs,
+        gate_up_out,
+        down_lhs,
+        down_rhs,
+        down_out,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen36_try_mps_static_topn_partial_for_metal(
+    output_ordinal: usize,
+    params: Qwen36MoeFfnStepParams,
+    weights: &Qwen36MoeFfnStepWeights,
+    int4: &Qwen36MoeFfnStepInt4,
+    hidden: usize,
+    moe_intermediate: usize,
+    top_k: usize,
+    num_experts: usize,
+    active_experts: &[usize],
+    input: &[u16],
+    output: &mut [u16],
+    workspace: &mut [f32],
+    workspace_ptr: *mut c_void,
+    output_ptr: *mut c_void,
+    off_h_norm: usize,
+    off_topk_val: usize,
+    off_topk_idx: usize,
+    off_shared_out: usize,
+    off_expert_gu: usize,
+    off_expert_mid: usize,
+    off_expert_stack: usize,
+    off_moe_out: usize,
+) -> Result<Option<()>, GpuError> {
+    qwen36_with_static_topn_mps_rhs_for_metal(
+        output_ordinal,
+        params.layer_idx,
+        hidden,
+        moe_intermediate,
+        active_experts,
+        int4.group_size as usize,
+        num_experts,
+        weights.gate_up_proj_w,
+        int4.gate_up_proj_scale,
+        int4.gate_up_proj_zero,
+        weights.down_proj_w,
+        int4.down_proj_scale,
+        int4.down_proj_zero,
+        |resident, resident_capacity, hits, miss_groups| {
+            let hit_count = hits.len();
+            let original_topk_vals: Vec<f32> = (0..top_k)
+                .map(|group| workspace[off_topk_val + group])
+                .collect();
+            let original_topk_idx: Vec<f32> = (0..top_k)
+                .map(|group| workspace[off_topk_idx + group])
+                .collect();
+
+            let mut scratch = crate::prefill_ffi::metal_profile_time(
+                "qwen36_ffn_int4_expert_mps_static_topn_alloc_f16",
+                "host",
+                || {
+                    qwen36_alloc_mps_expert_bridge_scratch(
+                        output_ordinal,
+                        hidden,
+                        moe_intermediate,
+                        hit_count,
+                    )
+                },
+            )?;
+            crate::prefill_ffi::metal_profile_time(
+                "qwen36_ffn_int4_expert_mps_static_topn_hnorm_f16",
+                "host",
+                || {
+                    qwen36_fill_mps_expert_h_norm(
+                        hidden,
+                        hit_count,
+                        &workspace[off_h_norm..off_h_norm + hidden],
+                        &mut scratch.h_norm,
+                    );
+                },
+            );
+
+            for (hit_group, hit) in hits.iter().enumerate() {
+                workspace[off_topk_idx + hit_group] = f32::from_bits(hit.slot as u32);
+                workspace[off_topk_val + hit_group] = original_topk_vals[hit.original_group];
+            }
+
+            let mps_result = crate::prefill_ffi::metal_profile_time(
+                "qwen36_ffn_int4_expert_mps_static_topn_partial_f16",
+                "native",
+                || unsafe {
+                    crate::metal_native::qwen36_ffn_expert_mps_bridge_indexed_f16(
+                        hidden,
+                        moe_intermediate,
+                        hit_count,
+                        resident_capacity,
+                        workspace_ptr,
+                        weights.input_hidden,
+                        scratch.h_norm.as_ptr(),
+                        resident.gate_up_rhs.as_ptr(),
+                        scratch.gate_up_out.as_mut_ptr(),
+                        scratch.down_lhs.as_mut_ptr(),
+                        resident.down_rhs.as_ptr(),
+                        scratch.down_out.as_mut_ptr(),
+                        output_ptr,
+                        off_topk_val,
+                        off_topk_idx,
+                        off_shared_out,
+                        off_moe_out,
+                        true,
+                    )
+                },
+            );
+            for group in 0..top_k {
+                workspace[off_topk_val + group] = original_topk_vals[group];
+                workspace[off_topk_idx + group] = original_topk_idx[group];
+            }
+            mps_result?;
+
+            if miss_groups.is_empty() {
+                return Ok(());
+            }
+
+            let h_norm_for_miss = workspace[off_h_norm..off_h_norm + hidden].to_vec();
+            crate::prefill_ffi::metal_profile_time(
+                "qwen36_ffn_host_expert_mps_static_topn_miss_gate_up",
+                "host",
+                || {
+                    let gate_up_w = weights.gate_up_proj_w as usize;
+                    let gate_up_scale = int4.gate_up_proj_scale as usize;
+                    let gate_up_zero = int4.gate_up_proj_zero as usize;
+                    let group_size = int4.group_size.max(0) as usize;
+                    let rows_per_group = 2 * moe_intermediate;
+                    let gu = &mut workspace
+                        [off_expert_gu..off_expert_gu + miss_groups.len() * rows_per_group];
+                    qwen36_parallel_chunks_mut(gu, 64, |start, chunk| {
+                        for (local, out) in chunk.iter_mut().enumerate() {
+                            let flat_row = start + local;
+                            let miss_group = flat_row / rows_per_group;
+                            let row = flat_row - miss_group * rows_per_group;
+                            let original_group = miss_groups[miss_group];
+                            *out = qwen36_expert_dense_or_int4_dot_unchecked(
+                                gate_up_w,
+                                gate_up_scale,
+                                gate_up_zero,
+                                active_experts[original_group],
+                                row,
+                                rows_per_group,
+                                hidden,
+                                group_size,
+                                &h_norm_for_miss,
+                            );
+                        }
+                    });
+                },
+            );
+
+            crate::prefill_ffi::metal_profile_time(
+                "qwen36_ffn_host_expert_mps_static_topn_miss_silu",
+                "host",
+                || {
+                    for group in 0..miss_groups.len() {
+                        let gu_base = off_expert_gu + group * 2 * moe_intermediate;
+                        let mid_base = off_expert_mid + group * moe_intermediate;
+                        for i in 0..moe_intermediate {
+                            let gp = workspace[gu_base + i];
+                            let up = workspace[gu_base + moe_intermediate + i];
+                            let silu = gp * (1.0f32 / (1.0f32 + (-gp).exp()));
+                            workspace[mid_base + i] = silu * up;
+                        }
+                    }
+                },
+            );
+
+            let expert_mid = workspace
+                [off_expert_mid..off_expert_mid + miss_groups.len() * moe_intermediate]
+                .to_vec();
+            crate::prefill_ffi::metal_profile_time(
+                "qwen36_ffn_host_expert_mps_static_topn_miss_down",
+                "host",
+                || {
+                    let down_w = weights.down_proj_w as usize;
+                    let down_scale = int4.down_proj_scale as usize;
+                    let down_zero = int4.down_proj_zero as usize;
+                    let group_size = int4.group_size.max(0) as usize;
+                    let stack = &mut workspace
+                        [off_expert_stack..off_expert_stack + miss_groups.len() * hidden];
+                    qwen36_parallel_chunks_mut(stack, 64, |start, chunk| {
+                        for (local, out) in chunk.iter_mut().enumerate() {
+                            let flat_row = start + local;
+                            let miss_group = flat_row / hidden;
+                            let row = flat_row - miss_group * hidden;
+                            let original_group = miss_groups[miss_group];
+                            let mid = &expert_mid[miss_group * moe_intermediate
+                                ..(miss_group + 1) * moe_intermediate];
+                            *out = qwen36_expert_dense_or_int4_dot_unchecked(
+                                down_w,
+                                down_scale,
+                                down_zero,
+                                active_experts[original_group],
+                                row,
+                                hidden,
+                                moe_intermediate,
+                                group_size,
+                                mid,
+                            );
+                        }
+                    });
+                },
+            );
+
+            crate::prefill_ffi::metal_profile_time(
+                "qwen36_ffn_host_expert_mps_static_topn_miss_finalize",
+                "host",
+                || {
+                    for row in 0..hidden {
+                        let mut acc = workspace[off_moe_out + row];
+                        for (miss_group, &original_group) in miss_groups.iter().enumerate() {
+                            acc += original_topk_vals[original_group]
+                                * workspace[off_expert_stack + miss_group * hidden + row];
+                        }
+                        let moe = bf16_round_f32(acc);
+                        workspace[off_moe_out + row] = moe;
+                        let val = bf16_round_f32(
+                            bf16_bits_to_f32(input[row]) + moe + workspace[off_shared_out + row],
+                        );
+                        output[row] = f32_to_bf16_bits(val);
+                    }
+                },
+            );
+            Ok(())
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn ffn_expert_gate_up_tiled_metal_launch(
+    hidden: usize,
+    moe_intermediate: usize,
+    top_k: usize,
+    group_size: usize,
+    workspace: &mut GpuBuffer,
+    gate_up_proj: &GpuBuffer,
+    gate_up_scale: &GpuBuffer,
+    gate_up_zero: &GpuBuffer,
+    off_h_norm: usize,
+    off_topk_idx: usize,
+    off_expert_mid: usize,
+) -> Result<(), GpuError> {
+    if workspace.backend() != Backend::Metal {
+        return Err(GpuError::InvalidArg(
+            "qwen36_moe::ffn_expert_gate_up_tiled_metal_launch requires Metal buffers".into(),
+        ));
+    }
+    if workspace.dtype() != ScalarType::F32
+        || gate_up_proj.dtype() != ScalarType::U8
+        || gate_up_scale.dtype() != ScalarType::BF16
+        || gate_up_zero.dtype() != ScalarType::BF16
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::ffn_expert_gate_up_tiled_metal_launch expects F32/U8/BF16/BF16, got {:?}/{:?}/{:?}/{:?}",
+            workspace.dtype(),
+            gate_up_proj.dtype(),
+            gate_up_scale.dtype(),
+            gate_up_zero.dtype()
+        )));
+    }
+    unsafe {
+        crate::metal_native::qwen36_ffn_expert_gate_up_tiled(
+            hidden,
+            moe_intermediate,
+            top_k,
+            group_size,
+            workspace.as_mut_ptr(),
+            gate_up_proj.as_ptr(),
+            gate_up_scale.as_ptr(),
+            gate_up_zero.as_ptr(),
+            off_h_norm,
+            off_topk_idx,
+            off_expert_mid,
+            true,
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn ffn_expert_tiled_stage5_metal_launch(
+    hidden: usize,
+    moe_intermediate: usize,
+    top_k: usize,
+    group_size: usize,
+    workspace: &mut GpuBuffer,
+    input_hidden: &GpuBuffer,
+    gate_up_proj: &GpuBuffer,
+    gate_up_scale: &GpuBuffer,
+    gate_up_zero: &GpuBuffer,
+    down_proj: &GpuBuffer,
+    down_scale: &GpuBuffer,
+    down_zero: &GpuBuffer,
+    output: &mut GpuBuffer,
+    off_h_norm: usize,
+    off_topk_val: usize,
+    off_topk_idx: usize,
+    off_shared_out: usize,
+    off_expert_mid: usize,
+    off_moe_out: usize,
+) -> Result<(), GpuError> {
+    if workspace.backend() != Backend::Metal {
+        return Err(GpuError::InvalidArg(
+            "qwen36_moe::ffn_expert_tiled_stage5_metal_launch requires Metal buffers".into(),
+        ));
+    }
+    if workspace.dtype() != ScalarType::F32
+        || input_hidden.dtype() != ScalarType::BF16
+        || gate_up_proj.dtype() != ScalarType::U8
+        || gate_up_scale.dtype() != ScalarType::BF16
+        || gate_up_zero.dtype() != ScalarType::BF16
+        || down_proj.dtype() != ScalarType::U8
+        || down_scale.dtype() != ScalarType::BF16
+        || down_zero.dtype() != ScalarType::BF16
+        || output.dtype() != ScalarType::BF16
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::ffn_expert_tiled_stage5_metal_launch expects F32/BF16/U8/BF16/BF16/U8/BF16/BF16/BF16, got {:?}/{:?}/{:?}/{:?}/{:?}/{:?}/{:?}/{:?}/{:?}",
+            workspace.dtype(),
+            input_hidden.dtype(),
+            gate_up_proj.dtype(),
+            gate_up_scale.dtype(),
+            gate_up_zero.dtype(),
+            down_proj.dtype(),
+            down_scale.dtype(),
+            down_zero.dtype(),
+            output.dtype()
+        )));
+    }
+    unsafe {
+        crate::metal_native::qwen36_ffn_expert_gate_up_down_finalize_tiled(
+            hidden,
+            moe_intermediate,
+            top_k,
+            group_size,
+            workspace.as_mut_ptr(),
+            input_hidden.as_ptr(),
+            gate_up_proj.as_ptr(),
+            gate_up_scale.as_ptr(),
+            gate_up_zero.as_ptr(),
+            down_proj.as_ptr(),
+            down_scale.as_ptr(),
+            down_zero.as_ptr(),
+            output.as_mut_ptr(),
+            off_h_norm,
+            off_topk_val,
+            off_topk_idx,
+            off_shared_out,
+            off_expert_mid,
+            off_moe_out,
+            true,
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn ffn_expert_direct_gather_stage5_metal_launch(
+    hidden: usize,
+    moe_intermediate: usize,
+    top_k: usize,
+    group_size: usize,
+    workspace: &mut GpuBuffer,
+    input_hidden: &GpuBuffer,
+    gate_up_proj: &GpuBuffer,
+    gate_up_scale: &GpuBuffer,
+    gate_up_zero: &GpuBuffer,
+    down_proj: &GpuBuffer,
+    down_scale: &GpuBuffer,
+    down_zero: &GpuBuffer,
+    output: &mut GpuBuffer,
+    off_h_norm: usize,
+    off_topk_val: usize,
+    off_topk_idx: usize,
+    off_shared_out: usize,
+    off_expert_mid: usize,
+    off_moe_out: usize,
+) -> Result<(), GpuError> {
+    if workspace.backend() != Backend::Metal
+        || input_hidden.backend() != Backend::Metal
+        || gate_up_proj.backend() != Backend::Metal
+        || gate_up_scale.backend() != Backend::Metal
+        || gate_up_zero.backend() != Backend::Metal
+        || down_proj.backend() != Backend::Metal
+        || down_scale.backend() != Backend::Metal
+        || down_zero.backend() != Backend::Metal
+        || output.backend() != Backend::Metal
+    {
+        return Err(GpuError::InvalidArg(
+            "qwen36_moe::ffn_expert_direct_gather_stage5_metal_launch requires all buffers on Metal"
+                .into(),
+        ));
+    }
+    if workspace.dtype() != ScalarType::F32
+        || input_hidden.dtype() != ScalarType::BF16
+        || gate_up_proj.dtype() != ScalarType::U8
+        || gate_up_scale.dtype() != ScalarType::BF16
+        || gate_up_zero.dtype() != ScalarType::BF16
+        || down_proj.dtype() != ScalarType::U8
+        || down_scale.dtype() != ScalarType::BF16
+        || down_zero.dtype() != ScalarType::BF16
+        || output.dtype() != ScalarType::BF16
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::ffn_expert_direct_gather_stage5_metal_launch expects F32/BF16/U8/BF16/BF16/U8/BF16/BF16/BF16, got {:?}/{:?}/{:?}/{:?}/{:?}/{:?}/{:?}/{:?}/{:?}",
+            workspace.dtype(),
+            input_hidden.dtype(),
+            gate_up_proj.dtype(),
+            gate_up_scale.dtype(),
+            gate_up_zero.dtype(),
+            down_proj.dtype(),
+            down_scale.dtype(),
+            down_zero.dtype(),
+            output.dtype()
+        )));
+    }
+    unsafe {
+        crate::metal_native::qwen36_ffn_expert_direct_gather_stage5(
+            hidden,
+            moe_intermediate,
+            top_k,
+            group_size,
+            workspace.as_mut_ptr(),
+            input_hidden.as_ptr(),
+            gate_up_proj.as_ptr(),
+            gate_up_scale.as_ptr(),
+            gate_up_zero.as_ptr(),
+            down_proj.as_ptr(),
+            down_scale.as_ptr(),
+            down_zero.as_ptr(),
+            output.as_mut_ptr(),
+            off_h_norm,
+            off_topk_val,
+            off_topk_idx,
+            off_shared_out,
+            off_expert_mid,
+            off_moe_out,
+            true,
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn ffn_expert_gpu_pack_stage5_metal_launch(
+    hidden: usize,
+    moe_intermediate: usize,
+    top_k: usize,
+    group_size: usize,
+    workspace: &mut GpuBuffer,
+    input_hidden: &GpuBuffer,
+    gate_up_proj_src: &GpuBuffer,
+    gate_up_scale_src: &GpuBuffer,
+    gate_up_zero_src: &GpuBuffer,
+    down_proj_src: &GpuBuffer,
+    down_scale_src: &GpuBuffer,
+    down_zero_src: &GpuBuffer,
+    gate_up_proj_dst: &mut GpuBuffer,
+    gate_up_scale_dst: &mut GpuBuffer,
+    gate_up_zero_dst: &mut GpuBuffer,
+    down_proj_dst: &mut GpuBuffer,
+    down_scale_dst: &mut GpuBuffer,
+    down_zero_dst: &mut GpuBuffer,
+    output: &mut GpuBuffer,
+    off_h_norm: usize,
+    off_topk_val: usize,
+    off_topk_idx: usize,
+    off_shared_out: usize,
+    off_expert_mid: usize,
+    off_moe_out: usize,
+) -> Result<(), GpuError> {
+    if workspace.backend() != Backend::Metal
+        || input_hidden.backend() != Backend::Metal
+        || gate_up_proj_src.backend() != Backend::Metal
+        || gate_up_scale_src.backend() != Backend::Metal
+        || gate_up_zero_src.backend() != Backend::Metal
+        || down_proj_src.backend() != Backend::Metal
+        || down_scale_src.backend() != Backend::Metal
+        || down_zero_src.backend() != Backend::Metal
+        || gate_up_proj_dst.backend() != Backend::Metal
+        || gate_up_scale_dst.backend() != Backend::Metal
+        || gate_up_zero_dst.backend() != Backend::Metal
+        || down_proj_dst.backend() != Backend::Metal
+        || down_scale_dst.backend() != Backend::Metal
+        || down_zero_dst.backend() != Backend::Metal
+        || output.backend() != Backend::Metal
+    {
+        return Err(GpuError::InvalidArg(
+            "qwen36_moe::ffn_expert_gpu_pack_stage5_metal_launch requires all buffers on Metal"
+                .into(),
+        ));
+    }
+    if workspace.dtype() != ScalarType::F32
+        || input_hidden.dtype() != ScalarType::BF16
+        || gate_up_proj_src.dtype() != ScalarType::U8
+        || gate_up_scale_src.dtype() != ScalarType::BF16
+        || gate_up_zero_src.dtype() != ScalarType::BF16
+        || down_proj_src.dtype() != ScalarType::U8
+        || down_scale_src.dtype() != ScalarType::BF16
+        || down_zero_src.dtype() != ScalarType::BF16
+        || gate_up_proj_dst.dtype() != ScalarType::U8
+        || gate_up_scale_dst.dtype() != ScalarType::BF16
+        || gate_up_zero_dst.dtype() != ScalarType::BF16
+        || down_proj_dst.dtype() != ScalarType::U8
+        || down_scale_dst.dtype() != ScalarType::BF16
+        || down_zero_dst.dtype() != ScalarType::BF16
+        || output.dtype() != ScalarType::BF16
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::ffn_expert_gpu_pack_stage5_metal_launch dtype mismatch: workspace={:?} input_hidden={:?} gate_up_src={:?}/{:?}/{:?} down_src={:?}/{:?}/{:?} gate_up_dst={:?}/{:?}/{:?} down_dst={:?}/{:?}/{:?} output={:?}",
+            workspace.dtype(),
+            input_hidden.dtype(),
+            gate_up_proj_src.dtype(),
+            gate_up_scale_src.dtype(),
+            gate_up_zero_src.dtype(),
+            down_proj_src.dtype(),
+            down_scale_src.dtype(),
+            down_zero_src.dtype(),
+            gate_up_proj_dst.dtype(),
+            gate_up_scale_dst.dtype(),
+            gate_up_zero_dst.dtype(),
+            down_proj_dst.dtype(),
+            down_scale_dst.dtype(),
+            down_zero_dst.dtype(),
+            output.dtype()
+        )));
+    }
+    unsafe {
+        crate::metal_native::qwen36_ffn_expert_gpu_pack_gate_up_down_finalize_tiled(
+            hidden,
+            moe_intermediate,
+            top_k,
+            group_size,
+            workspace.as_mut_ptr(),
+            input_hidden.as_ptr(),
+            gate_up_proj_src.as_ptr(),
+            gate_up_scale_src.as_ptr(),
+            gate_up_zero_src.as_ptr(),
+            down_proj_src.as_ptr(),
+            down_scale_src.as_ptr(),
+            down_zero_src.as_ptr(),
+            gate_up_proj_dst.as_mut_ptr(),
+            gate_up_scale_dst.as_mut_ptr(),
+            gate_up_zero_dst.as_mut_ptr(),
+            down_proj_dst.as_mut_ptr(),
+            down_scale_dst.as_mut_ptr(),
+            down_zero_dst.as_mut_ptr(),
+            output.as_mut_ptr(),
+            off_h_norm,
+            off_topk_val,
+            off_topk_idx,
+            off_shared_out,
+            off_expert_mid,
+            off_moe_out,
+            true,
+        )
+    }
+}
+
 /// Safe wrapper for the PR 4b4 staged MoE FFN parity launcher.
 ///
 /// `output` must be a BF16 buffer with at least `max(top_k, hidden)` elements
@@ -2476,7 +9484,9 @@ pub fn ffn_step_launch(
     }
     let backend = output.backend();
     if backend == Backend::Metal {
-        return ffn_step_stage1_5_metal_host(params, weights, int4, output, output_idx, workspace);
+        return ffn_step_stage1_5_metal_host(
+            ordinal, params, weights, int4, output, output_idx, workspace,
+        );
     }
 
     let counters = sync_buf.as_mut_ptr() as *mut c_uint;
@@ -2550,6 +9560,7 @@ pub fn ffn_step_launch(
 }
 
 fn ffn_step_stage1_5_metal_host(
+    ordinal: usize,
     params: Qwen36MoeFfnStepParams,
     weights: &Qwen36MoeFfnStepWeights,
     int4: &Qwen36MoeFfnStepInt4,
@@ -2665,11 +9676,448 @@ fn ffn_step_stage1_5_metal_host(
         )));
     }
 
+    if qwen36_ffn_int4_stage5_router_metal_native_supported(params, weights, int4) {
+        qwen36_validate_dense_or_int4_sidecars(
+            int4.shared_gate_proj_scale,
+            int4.shared_gate_proj_zero,
+            int4.group_size,
+            "shared_gate_proj",
+        )?;
+        qwen36_validate_dense_or_int4_sidecars(
+            int4.shared_up_proj_scale,
+            int4.shared_up_proj_zero,
+            int4.group_size,
+            "shared_up_proj",
+        )?;
+        qwen36_validate_dense_or_int4_sidecars(
+            int4.shared_down_proj_scale,
+            int4.shared_down_proj_zero,
+            int4.group_size,
+            "shared_down_proj",
+        )?;
+        qwen36_validate_dense_or_int4_sidecars(
+            int4.gate_up_proj_scale,
+            int4.gate_up_proj_zero,
+            int4.group_size,
+            "gate_up_proj",
+        )?;
+        qwen36_validate_dense_or_int4_sidecars(
+            int4.down_proj_scale,
+            int4.down_proj_zero,
+            int4.group_size,
+            "down_proj",
+        )?;
+        let router_parity_tap = qwen36_ffn_router_stage5_parity_tap_enabled();
+        let shared_parity_tap = qwen36_ffn_shared_stage5_parity_tap_enabled();
+        let shared_host_correction = qwen36_ffn_stage5_shared_host_correction_enabled();
+        let shared_mid_host_correction = qwen36_ffn_stage5_shared_mid_host_correction_enabled();
+        let routed_host_correction = qwen36_ffn_stage5_routed_host_correction_enabled();
+        let routed_down_host_recompute_correction =
+            qwen36_ffn_stage5_routed_down_host_recompute_correction_enabled_for_layer(
+                params.layer_idx,
+            );
+        let residual_host_snap =
+            qwen36_ffn_stage5_residual_host_snap_enabled_for_layer(params.layer_idx);
+        let routed_gate_up_tap = qwen36_ffn_stage5_routed_gate_up_tap_enabled();
+        let routed_finalize_tap = qwen36_ffn_stage5_routed_finalize_tap_enabled();
+        if shared_host_correction
+            || shared_mid_host_correction
+            || routed_host_correction
+            || routed_down_host_recompute_correction
+            || residual_host_snap
+            || routed_gate_up_tap
+            || routed_finalize_tap
+        {
+            crate::prefill_ffi::flush_metal_batch()?;
+            gpu_hal::sync(ordinal)?;
+        }
+        let router_reference = if router_parity_tap
+            || shared_parity_tap
+            || shared_host_correction
+            || shared_mid_host_correction
+            || routed_host_correction
+            || routed_down_host_recompute_correction
+            || residual_host_snap
+            || routed_gate_up_tap
+            || routed_finalize_tap
+        {
+            let input =
+                unsafe { std::slice::from_raw_parts(weights.input_hidden as *const u16, hidden) };
+            let norm_w = unsafe {
+                std::slice::from_raw_parts(weights.post_attn_norm_w as *const u16, hidden)
+            };
+            let gate_w = unsafe {
+                std::slice::from_raw_parts(weights.gate_w as *const u16, num_experts * hidden)
+            };
+            Some(qwen36_compute_ffn_router_reference(
+                input,
+                norm_w,
+                gate_w,
+                hidden,
+                num_experts,
+                top_k,
+                params.rms_norm_eps,
+            ))
+        } else {
+            None
+        };
+        let shared_reference = if shared_parity_tap
+            || shared_host_correction
+            || shared_mid_host_correction
+            || routed_host_correction
+            || routed_down_host_recompute_correction
+            || residual_host_snap
+            || routed_gate_up_tap
+            || routed_finalize_tap
+        {
+            let shared_expert_gate_w = unsafe {
+                std::slice::from_raw_parts(weights.shared_expert_gate_w as *const u16, hidden)
+            };
+            let reference = router_reference.as_ref().ok_or_else(|| {
+                GpuError::InvalidArg(
+                    "qwen36_moe::ffn_step_launch: shared parity tap missing router reference"
+                        .into(),
+                )
+            })?;
+            Some(qwen36_compute_ffn_shared_reference(
+                &reference.h_norm,
+                shared_expert_gate_w,
+                weights.shared_gate_proj_w as usize,
+                int4.shared_gate_proj_scale as usize,
+                int4.shared_gate_proj_zero as usize,
+                weights.shared_up_proj_w as usize,
+                int4.shared_up_proj_scale as usize,
+                int4.shared_up_proj_zero as usize,
+                weights.shared_down_proj_w as usize,
+                int4.shared_down_proj_scale as usize,
+                int4.shared_down_proj_zero as usize,
+                hidden,
+                shared_intermediate,
+                int4.group_size.max(0) as usize,
+            ))
+        } else {
+            None
+        };
+        let needs_routed_reference = routed_host_correction
+            || routed_down_host_recompute_correction
+            || residual_host_snap
+            || routed_gate_up_tap
+            || routed_finalize_tap;
+        let routed_reference = if needs_routed_reference {
+            let input =
+                unsafe { std::slice::from_raw_parts(weights.input_hidden as *const u16, hidden) };
+            let router_reference = router_reference.as_ref().ok_or_else(|| {
+                GpuError::InvalidArg(String::from(
+                    "qwen36_moe::ffn_step_launch: routed tap/correction missing router reference",
+                ))
+            })?;
+            let shared_reference = shared_reference.as_ref().ok_or_else(|| {
+                GpuError::InvalidArg(String::from(
+                    "qwen36_moe::ffn_step_launch: routed tap/correction missing shared reference",
+                ))
+            })?;
+            Some(qwen36_compute_ffn_routed_reference(
+                input,
+                &router_reference.h_norm,
+                &shared_reference.shared_out,
+                &router_reference.topk_idx,
+                &router_reference.topk_weight,
+                weights.gate_up_proj_w as usize,
+                int4.gate_up_proj_scale as usize,
+                int4.gate_up_proj_zero as usize,
+                weights.down_proj_w as usize,
+                int4.down_proj_scale as usize,
+                int4.down_proj_zero as usize,
+                hidden,
+                moe_intermediate,
+                top_k,
+                int4.group_size.max(0) as usize,
+            ))
+        } else {
+            None
+        };
+        let wait_for_completion = !ffn_stage5_router_defer_wait_enabled();
+        let status = crate::prefill_ffi::metal_profile_time(
+            "qwen36_ffn_int4_stage5_with_router",
+            "native",
+            || unsafe {
+                crate::metal_native::qwen36_ffn_int4_stage5_with_router(
+                    hidden,
+                    num_experts,
+                    moe_intermediate,
+                    shared_intermediate,
+                    top_k,
+                    int4.group_size as usize,
+                    params.rms_norm_eps,
+                    weights.input_hidden,
+                    weights.post_attn_norm_w,
+                    weights.gate_w,
+                    weights.shared_expert_gate_w,
+                    weights.shared_gate_proj_w,
+                    int4.shared_gate_proj_scale,
+                    int4.shared_gate_proj_zero,
+                    weights.shared_up_proj_w,
+                    int4.shared_up_proj_scale,
+                    int4.shared_up_proj_zero,
+                    weights.shared_down_proj_w,
+                    int4.shared_down_proj_scale,
+                    int4.shared_down_proj_zero,
+                    weights.gate_up_proj_w,
+                    int4.gate_up_proj_scale,
+                    int4.gate_up_proj_zero,
+                    weights.down_proj_w,
+                    int4.down_proj_scale,
+                    int4.down_proj_zero,
+                    workspace.as_mut_ptr() as *mut c_void,
+                    output_idx.as_mut_ptr() as *mut c_void,
+                    output.as_mut_ptr() as *mut c_void,
+                    wait_for_completion,
+                )
+            },
+        );
+        if status.is_ok() {
+            if routed_gate_up_tap {
+                let reference = routed_reference.as_ref().ok_or_else(|| {
+                    GpuError::InvalidArg(
+                        "qwen36_moe::ffn_step_launch: routed gate/up tap missing reference".into(),
+                    )
+                })?;
+                qwen36_emit_ffn_routed_stage5_gate_up_tap(
+                    ordinal,
+                    params.layer_idx,
+                    hidden,
+                    moe_intermediate,
+                    top_k,
+                    off_topk_val,
+                    off_topk_idx,
+                    off_expert_gu,
+                    off_expert_mid,
+                    off_moe_out,
+                    weights,
+                    int4,
+                    workspace,
+                    output,
+                    reference,
+                    router_reference.as_ref().ok_or_else(|| {
+                        GpuError::InvalidArg(
+                            "qwen36_moe::ffn_step_launch: routed gate/up tap missing router reference"
+                                .into(),
+                        )
+                    })?,
+                )?;
+            }
+            if routed_finalize_tap {
+                let routed_reference = routed_reference.as_ref().ok_or_else(|| {
+                    GpuError::InvalidArg(
+                        "qwen36_moe::ffn_step_launch: routed finalize tap missing routed reference"
+                            .into(),
+                    )
+                })?;
+                let shared_reference = shared_reference.as_ref().ok_or_else(|| {
+                    GpuError::InvalidArg(
+                        "qwen36_moe::ffn_step_launch: routed finalize tap missing shared reference"
+                            .into(),
+                    )
+                })?;
+                qwen36_emit_ffn_routed_stage5_finalize_tap(
+                    ordinal,
+                    params.layer_idx,
+                    hidden,
+                    moe_intermediate,
+                    top_k,
+                    off_topk_val,
+                    off_topk_idx,
+                    off_shared_out,
+                    off_expert_mid,
+                    off_moe_out,
+                    weights,
+                    int4,
+                    workspace,
+                    output,
+                    shared_reference,
+                    routed_reference,
+                    router_reference.as_ref().ok_or_else(|| {
+                        GpuError::InvalidArg(
+                            "qwen36_moe::ffn_step_launch: routed finalize tap missing router reference"
+                                .into(),
+                        )
+                    })?,
+                )?;
+            }
+            if shared_mid_host_correction {
+                let reference = shared_reference.as_ref().ok_or_else(|| {
+                    GpuError::InvalidArg(
+                        "qwen36_moe::ffn_step_launch: shared-mid host correction missing reference"
+                            .into(),
+                    )
+                })?;
+                qwen36_apply_ffn_shared_mid_stage5_host_correction(
+                    ordinal,
+                    params.layer_idx,
+                    hidden,
+                    shared_intermediate,
+                    off_shared_mid,
+                    off_shared_out,
+                    off_moe_out,
+                    weights,
+                    int4,
+                    workspace,
+                    output,
+                    reference,
+                )?;
+            }
+            if shared_host_correction {
+                let reference = shared_reference.as_ref().ok_or_else(|| {
+                    GpuError::InvalidArg(
+                        "qwen36_moe::ffn_step_launch: shared host correction missing reference"
+                            .into(),
+                    )
+                })?;
+                qwen36_apply_ffn_shared_stage5_host_correction(
+                    ordinal,
+                    params.layer_idx,
+                    hidden,
+                    off_shared_out,
+                    off_moe_out,
+                    weights,
+                    workspace,
+                    output,
+                    reference,
+                )?;
+            }
+            if routed_down_host_recompute_correction {
+                let reference = routed_reference.as_ref().ok_or_else(|| {
+                    GpuError::InvalidArg(
+                        "qwen36_moe::ffn_step_launch: routed-down host recompute correction missing reference"
+                            .into(),
+                    )
+                })?;
+                qwen36_apply_ffn_routed_down_stage5_host_recompute_correction(
+                    ordinal,
+                    params.layer_idx,
+                    hidden,
+                    moe_intermediate,
+                    top_k,
+                    off_topk_val,
+                    off_topk_idx,
+                    off_shared_out,
+                    off_expert_mid,
+                    off_moe_out,
+                    weights,
+                    int4,
+                    workspace,
+                    output,
+                    reference,
+                    router_reference.as_ref().ok_or_else(|| {
+                        GpuError::InvalidArg(
+                            "qwen36_moe::ffn_step_launch: routed-down host recompute correction missing router reference"
+                                .into(),
+                        )
+                    })?,
+                )?;
+            }
+            if routed_host_correction {
+                let reference = routed_reference.as_ref().ok_or_else(|| {
+                    GpuError::InvalidArg(
+                        "qwen36_moe::ffn_step_launch: routed host correction missing reference"
+                            .into(),
+                    )
+                })?;
+                qwen36_apply_ffn_routed_stage5_host_correction(
+                    ordinal,
+                    params.layer_idx,
+                    hidden,
+                    moe_intermediate,
+                    top_k,
+                    off_topk_val,
+                    off_topk_idx,
+                    off_expert_gu,
+                    off_expert_mid,
+                    off_moe_out,
+                    weights,
+                    int4,
+                    workspace,
+                    output,
+                    reference,
+                    router_reference.as_ref().ok_or_else(|| {
+                        GpuError::InvalidArg(
+                            "qwen36_moe::ffn_step_launch: routed host correction missing router reference"
+                                .into(),
+                        )
+                    })?,
+                )?;
+            }
+            if residual_host_snap {
+                let reference = routed_reference.as_ref().ok_or_else(|| {
+                    GpuError::InvalidArg(
+                        "qwen36_moe::ffn_step_launch: residual host snap missing reference".into(),
+                    )
+                })?;
+                let row = qwen36_ffn_stage5_residual_host_snap_row().ok_or_else(|| {
+                    GpuError::InvalidArg(
+                        "qwen36_moe::ffn_step_launch: residual host snap missing row".into(),
+                    )
+                })?;
+                qwen36_apply_ffn_residual_stage5_host_snap(
+                    ordinal,
+                    params.layer_idx,
+                    hidden,
+                    output,
+                    reference,
+                    row,
+                )?;
+            }
+            if router_parity_tap {
+                let reference = router_reference.as_ref().ok_or_else(|| {
+                    GpuError::InvalidArg(
+                        "qwen36_moe::ffn_step_launch: router parity tap missing router reference"
+                            .into(),
+                    )
+                })?;
+                qwen36_emit_ffn_router_stage5_parity_tap(
+                    ordinal,
+                    params.layer_idx,
+                    workspace,
+                    output_idx,
+                    hidden,
+                    num_experts,
+                    top_k,
+                    off_h_norm,
+                    off_router_logits,
+                    off_topk_val,
+                    off_topk_idx,
+                    reference,
+                )?;
+            }
+            if let Some(reference) = shared_reference.as_ref() {
+                qwen36_emit_ffn_shared_stage5_parity_tap(
+                    ordinal,
+                    params.layer_idx,
+                    workspace,
+                    hidden,
+                    shared_intermediate,
+                    off_sg_scalar,
+                    off_sgp,
+                    off_sup,
+                    off_shared_mid,
+                    off_shared_out,
+                    weights,
+                    int4,
+                    reference,
+                )?;
+            }
+        }
+        return status;
+    }
+
     let input = unsafe { std::slice::from_raw_parts(weights.input_hidden as *const u16, hidden) };
     let norm_w =
         unsafe { std::slice::from_raw_parts(weights.post_attn_norm_w as *const u16, hidden) };
     let gate_w =
         unsafe { std::slice::from_raw_parts(weights.gate_w as *const u16, num_experts * hidden) };
+    let workspace_ptr = workspace.as_mut_ptr();
+    let output_ptr = output.as_mut_ptr();
+    let output_ordinal = output.device_ordinal();
     let output =
         unsafe { std::slice::from_raw_parts_mut(output.as_mut_ptr() as *mut u16, output_len) };
     let output_idx =
@@ -2678,68 +10126,81 @@ fn ffn_step_stage1_5_metal_host(
         std::slice::from_raw_parts_mut(workspace.as_mut_ptr() as *mut f32, workspace_len)
     };
 
-    let mut mean_sq = 0.0f32;
-    for &bits in input {
-        let v = bf16_bits_to_f32(bits);
-        mean_sq += v * v;
-    }
-    let inv_rms = 1.0f32 / (mean_sq / hidden as f32 + params.rms_norm_eps).sqrt();
-    for col in 0..hidden {
-        let v = bf16_bits_to_f32(input[col]);
-        let w = bf16_bits_to_f32(norm_w[col]);
-        workspace[off_h_norm + col] = bf16_round_f32(v * inv_rms * (1.0 + w));
-    }
-
-    for expert in 0..num_experts {
-        let mut acc = 0.0f32;
-        let row = expert * hidden;
-        for col in 0..hidden {
-            acc += bf16_bits_to_f32(gate_w[row + col]) * workspace[off_h_norm + col];
+    // Later phases mutate disjoint workspace regions, so keep h_norm in-place
+    // instead of allocating and copying a per-layer Vec.
+    let h_norm_ptr = unsafe { workspace.as_ptr().add(off_h_norm) };
+    crate::prefill_ffi::metal_profile_time("qwen36_ffn_host_router_topk", "host", || {
+        let mut mean_sq = 0.0f32;
+        for &bits in input {
+            let v = bf16_bits_to_f32(bits);
+            mean_sq += v * v;
         }
-        workspace[off_router_logits + expert] = bf16_round_f32(acc);
-    }
+        let inv_rms = 1.0f32 / (mean_sq / hidden as f32 + params.rms_norm_eps).sqrt();
+        for col in 0..hidden {
+            let v = bf16_bits_to_f32(input[col]);
+            let w = bf16_bits_to_f32(norm_w[col]);
+            workspace[off_h_norm + col] = bf16_round_f32(v * inv_rms * (1.0 + w));
+        }
 
-    let row_max = workspace[off_router_logits..off_router_logits + num_experts]
-        .iter()
-        .copied()
-        .fold(f32::NEG_INFINITY, f32::max);
-    let mut row_sum = 0.0f32;
-    for expert in 0..num_experts {
-        let e = (workspace[off_router_logits + expert] - row_max).exp();
-        workspace[off_router_probs + expert] = e;
-        row_sum += e;
-    }
-    let inv_sum = 1.0f32 / row_sum;
-    for expert in 0..num_experts {
-        workspace[off_router_probs + expert] =
-            bf16_round_f32(workspace[off_router_probs + expert] * inv_sum);
-    }
+        {
+            let h_norm = unsafe { std::slice::from_raw_parts(h_norm_ptr, hidden) };
+            let router_logits = &mut workspace[off_router_logits..off_router_logits + num_experts];
+            qwen36_parallel_chunks_mut(router_logits, 32, |start, chunk| {
+                for (local, logit) in chunk.iter_mut().enumerate() {
+                    let expert = start + local;
+                    let mut acc = 0.0f32;
+                    let row = expert * hidden;
+                    for col in 0..hidden {
+                        acc += bf16_bits_to_f32(gate_w[row + col]) * h_norm[col];
+                    }
+                    *logit = bf16_round_f32(acc);
+                }
+            });
+        }
 
-    for kk in 0..top_k {
-        let mut best_idx = -1i32;
-        let mut best_val = f32::NEG_INFINITY;
+        let row_max = workspace[off_router_logits..off_router_logits + num_experts]
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, f32::max);
+        let mut row_sum = 0.0f32;
         for expert in 0..num_experts {
-            let v = workspace[off_router_probs + expert];
-            if v > best_val || (v == best_val && best_idx >= 0 && (expert as i32) < best_idx) {
-                best_val = v;
-                best_idx = expert as i32;
+            let e = (workspace[off_router_logits + expert] - row_max).exp();
+            workspace[off_router_probs + expert] = e;
+            row_sum += e;
+        }
+        let inv_sum = 1.0f32 / row_sum;
+        for expert in 0..num_experts {
+            workspace[off_router_probs + expert] =
+                bf16_round_f32(workspace[off_router_probs + expert] * inv_sum);
+        }
+
+        for kk in 0..top_k {
+            let mut best_idx = -1i32;
+            let mut best_val = f32::NEG_INFINITY;
+            for expert in 0..num_experts {
+                let v = workspace[off_router_probs + expert];
+                if v > best_val || (v == best_val && best_idx >= 0 && (expert as i32) < best_idx) {
+                    best_val = v;
+                    best_idx = expert as i32;
+                }
+            }
+            workspace[off_topk_idx + kk] = f32::from_bits(best_idx as u32);
+            workspace[off_topk_val + kk] = best_val;
+            if best_idx >= 0 {
+                workspace[off_router_probs + best_idx as usize] = f32::NEG_INFINITY;
             }
         }
-        workspace[off_topk_idx + kk] = f32::from_bits(best_idx as u32);
-        workspace[off_topk_val + kk] = best_val;
-        if best_idx >= 0 {
-            workspace[off_router_probs + best_idx as usize] = f32::NEG_INFINITY;
-        }
-    }
 
-    let sum_k: f32 = (0..top_k).map(|kk| workspace[off_topk_val + kk]).sum();
-    let inv_k = 1.0f32 / sum_k;
-    for kk in 0..top_k {
-        let w = bf16_round_f32(workspace[off_topk_val + kk] * inv_k);
-        workspace[off_topk_val + kk] = w;
-        output[kk] = f32_to_bf16_bits(w);
-        output_idx[kk] = f32::to_bits(workspace[off_topk_idx + kk]) as i32;
-    }
+        let sum_k: f32 = (0..top_k).map(|kk| workspace[off_topk_val + kk]).sum();
+        let inv_k = 1.0f32 / sum_k;
+        for kk in 0..top_k {
+            let w = bf16_round_f32(workspace[off_topk_val + kk] * inv_k);
+            workspace[off_topk_val + kk] = w;
+            output[kk] = f32_to_bf16_bits(w);
+            output_idx[kk] = f32::to_bits(workspace[off_topk_idx + kk]) as i32;
+        }
+    });
+    let h_norm = unsafe { std::slice::from_raw_parts(h_norm_ptr, hidden) };
 
     if params.stage == 1 {
         return Ok(());
@@ -2747,140 +10208,838 @@ fn ffn_step_stage1_5_metal_host(
 
     let shared_expert_gate_w =
         unsafe { std::slice::from_raw_parts(weights.shared_expert_gate_w as *const u16, hidden) };
+    qwen36_validate_dense_or_int4_sidecars(
+        int4.shared_gate_proj_scale,
+        int4.shared_gate_proj_zero,
+        int4.group_size,
+        "shared_gate_proj",
+    )?;
+    qwen36_validate_dense_or_int4_sidecars(
+        int4.shared_up_proj_scale,
+        int4.shared_up_proj_zero,
+        int4.group_size,
+        "shared_up_proj",
+    )?;
+    qwen36_validate_dense_or_int4_sidecars(
+        int4.shared_down_proj_scale,
+        int4.shared_down_proj_zero,
+        int4.group_size,
+        "shared_down_proj",
+    )?;
+    qwen36_validate_dense_or_int4_sidecars(
+        int4.gate_up_proj_scale,
+        int4.gate_up_proj_zero,
+        int4.group_size,
+        "gate_up_proj",
+    )?;
+    qwen36_validate_dense_or_int4_sidecars(
+        int4.down_proj_scale,
+        int4.down_proj_zero,
+        int4.group_size,
+        "down_proj",
+    )?;
 
-    for row in 0..shared_intermediate {
-        let gate_acc = qwen36_dense_or_int4_dot_2d(
-            weights.shared_gate_proj_w,
-            int4.shared_gate_proj_scale,
-            int4.shared_gate_proj_zero,
-            row,
-            hidden,
-            int4.group_size,
-            &workspace[off_h_norm..off_h_norm + hidden],
-        )?;
-        let up_acc = qwen36_dense_or_int4_dot_2d(
-            weights.shared_up_proj_w,
-            int4.shared_up_proj_scale,
-            int4.shared_up_proj_zero,
-            row,
-            hidden,
-            int4.group_size,
-            &workspace[off_h_norm..off_h_norm + hidden],
-        )?;
-        workspace[off_sgp + row] = gate_acc;
-        workspace[off_sup + row] = up_acc;
+    if qwen36_ffn_int4_stage5_metal_native_supported(params, weights, int4) {
+        return crate::prefill_ffi::metal_profile_time(
+            "qwen36_ffn_int4_stage5",
+            "native",
+            || unsafe {
+                crate::metal_native::qwen36_ffn_int4_stage5(
+                    hidden,
+                    num_experts,
+                    moe_intermediate,
+                    shared_intermediate,
+                    top_k,
+                    int4.group_size as usize,
+                    weights.input_hidden,
+                    weights.shared_expert_gate_w,
+                    weights.shared_gate_proj_w,
+                    int4.shared_gate_proj_scale,
+                    int4.shared_gate_proj_zero,
+                    weights.shared_up_proj_w,
+                    int4.shared_up_proj_scale,
+                    int4.shared_up_proj_zero,
+                    weights.shared_down_proj_w,
+                    int4.shared_down_proj_scale,
+                    int4.shared_down_proj_zero,
+                    weights.gate_up_proj_w,
+                    int4.gate_up_proj_scale,
+                    int4.gate_up_proj_zero,
+                    weights.down_proj_w,
+                    int4.down_proj_scale,
+                    int4.down_proj_zero,
+                    workspace.as_mut_ptr() as *mut c_void,
+                    output.as_mut_ptr() as *mut c_void,
+                    true,
+                )
+            },
+        );
     }
-    let mut sg_acc = 0.0f32;
-    for col in 0..hidden {
-        sg_acc += bf16_bits_to_f32(shared_expert_gate_w[col]) * workspace[off_h_norm + col];
-    }
-    workspace[off_sg_scalar] = 1.0f32 / (1.0f32 + (-sg_acc).exp());
 
-    for i in 0..shared_intermediate {
-        let gp = workspace[off_sgp + i];
-        let up = workspace[off_sup + i];
-        let silu = gp * (1.0f32 / (1.0f32 + (-gp).exp()));
-        workspace[off_shared_mid + i] = silu * up;
-    }
+    crate::prefill_ffi::metal_profile_time("qwen36_ffn_host_shared_gate_up", "host", || {
+        let (_, after_sgp) = workspace.split_at_mut(off_sgp);
+        let (sgp, after_sup) = after_sgp.split_at_mut(shared_intermediate);
+        let (sup, _) = after_sup.split_at_mut(shared_intermediate);
+        let shared_gate_w = weights.shared_gate_proj_w as usize;
+        let shared_gate_scale = int4.shared_gate_proj_scale as usize;
+        let shared_gate_zero = int4.shared_gate_proj_zero as usize;
+        let shared_up_w = weights.shared_up_proj_w as usize;
+        let shared_up_scale = int4.shared_up_proj_scale as usize;
+        let shared_up_zero = int4.shared_up_proj_zero as usize;
+        let group_size = int4.group_size.max(0) as usize;
+        let shared_gate_luts = qwen36_build_dense_int4_dequant_luts(
+            shared_gate_scale,
+            shared_gate_zero,
+            shared_intermediate,
+            hidden,
+            group_size,
+        );
+        let shared_up_luts = qwen36_build_dense_int4_dequant_luts(
+            shared_up_scale,
+            shared_up_zero,
+            shared_intermediate,
+            hidden,
+            group_size,
+        );
+        qwen36_parallel_chunks2_mut(sgp, sup, 64, |start, gate_chunk, up_chunk| {
+            for (local, (gate_out, up_out)) in
+                gate_chunk.iter_mut().zip(up_chunk.iter_mut()).enumerate()
+            {
+                let row = start + local;
+                *gate_out = if let Some(luts) = shared_gate_luts.as_deref() {
+                    qwen36_dense_int4_dot_2d_lut_unchecked(
+                        shared_gate_w,
+                        row,
+                        hidden,
+                        group_size,
+                        &h_norm,
+                        luts,
+                    )
+                } else {
+                    qwen36_dense_or_int4_dot_2d_unchecked(
+                        shared_gate_w,
+                        shared_gate_scale,
+                        shared_gate_zero,
+                        row,
+                        hidden,
+                        group_size,
+                        &h_norm,
+                    )
+                };
+                *up_out = if let Some(luts) = shared_up_luts.as_deref() {
+                    qwen36_dense_int4_dot_2d_lut_unchecked(
+                        shared_up_w,
+                        row,
+                        hidden,
+                        group_size,
+                        &h_norm,
+                        luts,
+                    )
+                } else {
+                    qwen36_dense_or_int4_dot_2d_unchecked(
+                        shared_up_w,
+                        shared_up_scale,
+                        shared_up_zero,
+                        row,
+                        hidden,
+                        group_size,
+                        &h_norm,
+                    )
+                };
+            }
+        });
+    });
+    crate::prefill_ffi::metal_profile_time("qwen36_ffn_host_shared_scalar_silu", "host", || {
+        let mut sg_acc = 0.0f32;
+        for col in 0..hidden {
+            sg_acc += bf16_bits_to_f32(shared_expert_gate_w[col]) * h_norm[col];
+        }
+        workspace[off_sg_scalar] = 1.0f32 / (1.0f32 + (-sg_acc).exp());
+
+        for i in 0..shared_intermediate {
+            let gp = workspace[off_sgp + i];
+            let up = workspace[off_sup + i];
+            let silu = gp * (1.0f32 / (1.0f32 + (-gp).exp()));
+            workspace[off_shared_mid + i] = silu * up;
+        }
+    });
 
     let sg_scalar = workspace[off_sg_scalar];
-    for row in 0..hidden {
-        let acc = qwen36_dense_or_int4_dot_2d(
-            weights.shared_down_proj_w,
-            int4.shared_down_proj_scale,
-            int4.shared_down_proj_zero,
-            row,
+    let shared_mid = workspace[off_shared_mid..off_shared_mid + shared_intermediate].to_vec();
+    crate::prefill_ffi::metal_profile_time("qwen36_ffn_host_shared_down", "host", || {
+        let shared_down_w = weights.shared_down_proj_w as usize;
+        let shared_down_scale = int4.shared_down_proj_scale as usize;
+        let shared_down_zero = int4.shared_down_proj_zero as usize;
+        let group_size = int4.group_size.max(0) as usize;
+        let shared_down_luts = qwen36_build_dense_int4_dequant_luts(
+            shared_down_scale,
+            shared_down_zero,
+            hidden,
             shared_intermediate,
-            int4.group_size,
-            &workspace[off_shared_mid..off_shared_mid + shared_intermediate],
-        )?;
-        let val = bf16_round_f32(sg_scalar * acc);
-        workspace[off_shared_out + row] = val;
+            group_size,
+        );
+        let shared_out = &mut workspace[off_shared_out..off_shared_out + hidden];
+        qwen36_parallel_chunks_mut(shared_out, 64, |start, chunk| {
+            for (local, out) in chunk.iter_mut().enumerate() {
+                let row = start + local;
+                let acc = if let Some(luts) = shared_down_luts.as_deref() {
+                    qwen36_dense_int4_dot_2d_lut_unchecked(
+                        shared_down_w,
+                        row,
+                        shared_intermediate,
+                        group_size,
+                        &shared_mid,
+                        luts,
+                    )
+                } else {
+                    qwen36_dense_or_int4_dot_2d_unchecked(
+                        shared_down_w,
+                        shared_down_scale,
+                        shared_down_zero,
+                        row,
+                        shared_intermediate,
+                        group_size,
+                        &shared_mid,
+                    )
+                };
+                *out = bf16_round_f32(sg_scalar * acc);
+            }
+        });
         if params.stage == 2 {
-            output[row] = f32_to_bf16_bits(val);
+            for row in 0..hidden {
+                output[row] = f32_to_bf16_bits(shared_out[row]);
+            }
         }
-    }
+    });
 
     if params.stage == 2 {
         return Ok(());
     }
 
     let active_groups = if params.stage == 3 { 1 } else { top_k };
-    for group in 0..active_groups {
-        let expert = f32::to_bits(workspace[off_topk_idx + group]) as i32 as usize;
-        let gu_base = off_expert_gu + group * 2 * moe_intermediate;
-        for row in 0..(2 * moe_intermediate) {
-            let acc = qwen36_expert_dense_or_int4_dot(
+    let active_experts: Vec<usize> = (0..active_groups)
+        .map(|group| f32::to_bits(workspace[off_topk_idx + group]) as i32 as usize)
+        .collect();
+    if qwen36_route_profile_enabled() {
+        qwen36_route_profile_record(&active_experts);
+    }
+    if qwen36_ffn_expert_mps_static_topn_partial_stage5_supported(params, weights, int4) {
+        if let Some(()) = qwen36_try_mps_static_topn_partial_for_metal(
+            output_ordinal,
+            params,
+            weights,
+            int4,
+            hidden,
+            moe_intermediate,
+            top_k,
+            num_experts,
+            &active_experts,
+            input,
+            output,
+            workspace,
+            workspace_ptr,
+            output_ptr,
+            off_h_norm,
+            off_topk_val,
+            off_topk_idx,
+            off_shared_out,
+            off_expert_gu,
+            off_expert_mid,
+            off_expert_stack,
+            off_moe_out,
+        )? {
+            return Ok(());
+        }
+    }
+    if qwen36_ffn_expert_mps_bridge_stage5_supported(params, weights, int4) {
+        let cpu_transcode =
+            std::env::var_os("SUPERSONIC_METAL_QWEN36_MPS_BRIDGE_CPU_TRANSCODE").is_some();
+        let mut bridge = if cpu_transcode {
+            let use_lut_pack =
+                std::env::var_os("SUPERSONIC_METAL_QWEN36_MPS_BRIDGE_CPU_TRANSCODE_LUT").is_some();
+            let pack_op = if use_lut_pack {
+                "qwen36_ffn_int4_expert_mps_bridge_pack_f16_lut"
+            } else {
+                "qwen36_ffn_int4_expert_mps_bridge_pack_f16"
+            };
+            crate::prefill_ffi::metal_profile_time(pack_op, "host", || {
+                qwen36_build_mps_expert_bridge_buffers(
+                    output_ordinal,
+                    hidden,
+                    moe_intermediate,
+                    &active_experts,
+                    &h_norm,
+                    int4.group_size as usize,
+                    weights.gate_up_proj_w,
+                    int4.gate_up_proj_scale,
+                    int4.gate_up_proj_zero,
+                    weights.down_proj_w,
+                    int4.down_proj_scale,
+                    int4.down_proj_zero,
+                    use_lut_pack,
+                )
+            })?
+        } else {
+            let mut bridge = crate::prefill_ffi::metal_profile_time(
+                "qwen36_ffn_int4_expert_mps_bridge_alloc_f16",
+                "host",
+                || {
+                    qwen36_alloc_mps_expert_bridge_buffers(
+                        output_ordinal,
+                        hidden,
+                        moe_intermediate,
+                        active_groups,
+                    )
+                },
+            )?;
+            let profile_transcode = std::env::var_os("SUPERSONIC_METAL_PROFILE").is_some();
+            crate::prefill_ffi::metal_profile_time(
+                "qwen36_ffn_int4_expert_mps_transcode_int4_f16",
+                "native",
+                || unsafe {
+                    crate::metal_native::qwen36_ffn_expert_mps_transcode_int4_f16(
+                        hidden,
+                        moe_intermediate,
+                        active_groups,
+                        int4.group_size as usize,
+                        workspace_ptr,
+                        weights.gate_up_proj_w,
+                        int4.gate_up_proj_scale,
+                        int4.gate_up_proj_zero,
+                        weights.down_proj_w,
+                        int4.down_proj_scale,
+                        int4.down_proj_zero,
+                        bridge.h_norm.as_mut_ptr(),
+                        bridge.gate_up_rhs.as_mut_ptr(),
+                        bridge.down_rhs.as_mut_ptr(),
+                        off_h_norm,
+                        off_topk_idx,
+                        profile_transcode,
+                    )
+                },
+            )?;
+            bridge
+        };
+        crate::prefill_ffi::metal_profile_time(
+            "qwen36_ffn_int4_expert_mps_bridge_f16",
+            "native",
+            || unsafe {
+                crate::metal_native::qwen36_ffn_expert_mps_bridge_f16(
+                    hidden,
+                    moe_intermediate,
+                    active_groups,
+                    workspace_ptr,
+                    weights.input_hidden,
+                    bridge.h_norm.as_ptr(),
+                    bridge.gate_up_rhs.as_ptr(),
+                    bridge.gate_up_out.as_mut_ptr(),
+                    bridge.down_lhs.as_mut_ptr(),
+                    bridge.down_rhs.as_ptr(),
+                    bridge.down_out.as_mut_ptr(),
+                    output_ptr,
+                    off_topk_val,
+                    off_shared_out,
+                    off_moe_out,
+                    true,
+                )
+            },
+        )?;
+        return Ok(());
+    }
+    if qwen36_ffn_expert_direct_gather_stage5_metal_native_supported(params, weights, int4) {
+        crate::prefill_ffi::metal_profile_time(
+            "qwen36_ffn_int4_expert_direct_gather_stage5",
+            "native",
+            || unsafe {
+                crate::metal_native::qwen36_ffn_expert_direct_gather_stage5(
+                    hidden,
+                    moe_intermediate,
+                    active_groups,
+                    int4.group_size as usize,
+                    workspace_ptr,
+                    weights.input_hidden,
+                    weights.gate_up_proj_w,
+                    int4.gate_up_proj_scale,
+                    int4.gate_up_proj_zero,
+                    weights.down_proj_w,
+                    int4.down_proj_scale,
+                    int4.down_proj_zero,
+                    output_ptr,
+                    off_h_norm,
+                    off_topk_val,
+                    off_topk_idx,
+                    off_shared_out,
+                    off_expert_mid,
+                    off_moe_out,
+                    !ffn_expert_direct_gather_defer_wait_enabled(),
+                )
+            },
+        )?;
+        return Ok(());
+    }
+    if qwen36_ffn_expert_packed_stage5_metal_native_supported(params, weights, int4) {
+        if qwen36_ffn_expert_gpu_pack_stage5_metal_native_supported(params, weights, int4) {
+            qwen36_with_gpu_pack_buffers_for_metal(
+                output_ordinal,
+                hidden,
+                moe_intermediate,
+                &active_experts,
+                int4.group_size as usize,
+                num_experts,
                 weights.gate_up_proj_w,
                 int4.gate_up_proj_scale,
                 int4.gate_up_proj_zero,
-                expert,
-                row,
-                2 * moe_intermediate,
-                hidden,
-                int4.group_size,
-                &workspace[off_h_norm..off_h_norm + hidden],
-            )?;
-            workspace[gu_base + row] = acc;
-        }
-
-        let mid_base = off_expert_mid + group * moe_intermediate;
-        for i in 0..moe_intermediate {
-            let gp = workspace[gu_base + i];
-            let up = workspace[gu_base + moe_intermediate + i];
-            let silu = gp * (1.0f32 / (1.0f32 + (-gp).exp()));
-            workspace[mid_base + i] = silu * up;
-        }
-
-        let stack_base = off_expert_stack + group * hidden;
-        for row in 0..hidden {
-            let acc = qwen36_expert_dense_or_int4_dot(
                 weights.down_proj_w,
                 int4.down_proj_scale,
                 int4.down_proj_zero,
-                expert,
-                row,
+                |packed| {
+                    crate::prefill_ffi::metal_profile_time(
+                        "qwen36_ffn_int4_expert_gpu_pack_stage5",
+                        "native",
+                        || unsafe {
+                            crate::metal_native::qwen36_ffn_expert_gpu_pack_gate_up_down_finalize_tiled(
+                                hidden,
+                                moe_intermediate,
+                                active_groups,
+                                int4.group_size as usize,
+                                workspace_ptr,
+                                weights.input_hidden,
+                                weights.gate_up_proj_w,
+                                int4.gate_up_proj_scale,
+                                int4.gate_up_proj_zero,
+                                weights.down_proj_w,
+                                int4.down_proj_scale,
+                                int4.down_proj_zero,
+                                packed.gate_up_proj.as_ptr() as *mut c_void,
+                                packed.gate_up_scale.as_ptr() as *mut c_void,
+                                packed.gate_up_zero.as_ptr() as *mut c_void,
+                                packed.down_proj.as_ptr() as *mut c_void,
+                                packed.down_scale.as_ptr() as *mut c_void,
+                                packed.down_zero.as_ptr() as *mut c_void,
+                                output_ptr,
+                                off_h_norm,
+                                off_topk_val,
+                                off_topk_idx,
+                                off_shared_out,
+                                off_expert_mid,
+                                off_moe_out,
+                                true,
+                            )
+                        },
+                    )
+                },
+            )?;
+            return Ok(());
+        }
+        if let Some(()) = qwen36_with_static_topn_packed_experts_for_metal(
+            output_ordinal,
+            params.layer_idx,
+            hidden,
+            moe_intermediate,
+            &active_experts,
+            int4.group_size as usize,
+            num_experts,
+            workspace,
+            off_topk_idx,
+            weights.gate_up_proj_w,
+            int4.gate_up_proj_scale,
+            int4.gate_up_proj_zero,
+            weights.down_proj_w,
+            int4.down_proj_scale,
+            int4.down_proj_zero,
+            |packed| {
+                crate::prefill_ffi::metal_profile_time(
+                    "qwen36_ffn_int4_expert_packed_static_topn_stage5",
+                    "native",
+                    || unsafe {
+                        crate::metal_native::qwen36_ffn_expert_gate_up_down_finalize_tiled(
+                            hidden,
+                            moe_intermediate,
+                            active_groups,
+                            int4.group_size as usize,
+                            workspace_ptr,
+                            weights.input_hidden,
+                            packed.gate_up_proj.as_ptr(),
+                            packed.gate_up_scale.as_ptr(),
+                            packed.gate_up_zero.as_ptr(),
+                            packed.down_proj.as_ptr(),
+                            packed.down_scale.as_ptr(),
+                            packed.down_zero.as_ptr(),
+                            output_ptr,
+                            off_h_norm,
+                            off_topk_val,
+                            off_topk_idx,
+                            off_shared_out,
+                            off_expert_mid,
+                            off_moe_out,
+                            true,
+                        )
+                    },
+                )
+            },
+        )? {
+            return Ok(());
+        }
+        if let Some(hotset_capacity) = qwen36_packed_expert_hotset_capacity(active_groups) {
+            qwen36_with_hotset_packed_experts_for_metal(
+                output_ordinal,
                 hidden,
                 moe_intermediate,
-                int4.group_size,
-                &workspace[mid_base..mid_base + moe_intermediate],
+                &active_experts,
+                int4.group_size as usize,
+                num_experts,
+                hotset_capacity,
+                workspace,
+                off_topk_idx,
+                weights.gate_up_proj_w,
+                int4.gate_up_proj_scale,
+                int4.gate_up_proj_zero,
+                weights.down_proj_w,
+                int4.down_proj_scale,
+                int4.down_proj_zero,
+                |packed| {
+                    crate::prefill_ffi::metal_profile_time(
+                        "qwen36_ffn_int4_expert_packed_hotset_stage5",
+                        "native",
+                        || unsafe {
+                            crate::metal_native::qwen36_ffn_expert_gate_up_down_finalize_tiled(
+                                hidden,
+                                moe_intermediate,
+                                active_groups,
+                                int4.group_size as usize,
+                                workspace_ptr,
+                                weights.input_hidden,
+                                packed.gate_up_proj.as_ptr(),
+                                packed.gate_up_scale.as_ptr(),
+                                packed.gate_up_zero.as_ptr(),
+                                packed.down_proj.as_ptr(),
+                                packed.down_scale.as_ptr(),
+                                packed.down_zero.as_ptr(),
+                                output_ptr,
+                                off_h_norm,
+                                off_topk_val,
+                                off_topk_idx,
+                                off_shared_out,
+                                off_expert_mid,
+                                off_moe_out,
+                                true,
+                            )
+                        },
+                    )
+                },
             )?;
-            workspace[stack_base + row] = acc;
-            if params.stage == 3 && group == 0 {
-                output[row] = f32_to_bf16_bits(bf16_round_f32(acc));
+            return Ok(());
+        }
+        for group in 0..active_groups {
+            workspace[off_topk_idx + group] = f32::from_bits(group as u32);
+        }
+        let use_pack_cache =
+            std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_PACK_CACHE").is_some()
+                && std::env::var_os("SUPERSONIC_METAL_DISABLE_QWEN36_FFN_EXPERT_PACK_CACHE")
+                    .is_none();
+        if !use_pack_cache {
+            let packed = crate::prefill_ffi::metal_profile_time(
+                "qwen36_ffn_int4_expert_pack_stage5",
+                "host",
+                || {
+                    qwen36_pack_active_experts_for_metal(
+                        output_ordinal,
+                        hidden,
+                        moe_intermediate,
+                        &active_experts,
+                        int4.group_size as usize,
+                        num_experts,
+                        weights.gate_up_proj_w,
+                        int4.gate_up_proj_scale,
+                        int4.gate_up_proj_zero,
+                        weights.down_proj_w,
+                        int4.down_proj_scale,
+                        int4.down_proj_zero,
+                    )
+                },
+            )?;
+            crate::prefill_ffi::metal_profile_time(
+                "qwen36_ffn_int4_expert_packed_stage5",
+                "native",
+                || unsafe {
+                    crate::metal_native::qwen36_ffn_expert_gate_up_down_finalize_tiled(
+                        hidden,
+                        moe_intermediate,
+                        active_groups,
+                        int4.group_size as usize,
+                        workspace_ptr,
+                        weights.input_hidden,
+                        packed.gate_up_proj.as_ptr(),
+                        packed.gate_up_scale.as_ptr(),
+                        packed.gate_up_zero.as_ptr(),
+                        packed.down_proj.as_ptr(),
+                        packed.down_scale.as_ptr(),
+                        packed.down_zero.as_ptr(),
+                        output_ptr,
+                        off_h_norm,
+                        off_topk_val,
+                        off_topk_idx,
+                        off_shared_out,
+                        off_expert_mid,
+                        off_moe_out,
+                        true,
+                    )
+                },
+            )?;
+            return Ok(());
+        }
+        qwen36_with_cached_packed_experts_for_metal(
+            output_ordinal,
+            hidden,
+            moe_intermediate,
+            &active_experts,
+            int4.group_size as usize,
+            num_experts,
+            weights.gate_up_proj_w,
+            int4.gate_up_proj_scale,
+            int4.gate_up_proj_zero,
+            weights.down_proj_w,
+            int4.down_proj_scale,
+            int4.down_proj_zero,
+            |packed| {
+                crate::prefill_ffi::metal_profile_time(
+                    "qwen36_ffn_int4_expert_packed_stage5",
+                    "native",
+                    || unsafe {
+                        crate::metal_native::qwen36_ffn_expert_gate_up_down_finalize_tiled(
+                            hidden,
+                            moe_intermediate,
+                            active_groups,
+                            int4.group_size as usize,
+                            workspace_ptr,
+                            weights.input_hidden,
+                            packed.gate_up_proj.as_ptr(),
+                            packed.gate_up_scale.as_ptr(),
+                            packed.gate_up_zero.as_ptr(),
+                            packed.down_proj.as_ptr(),
+                            packed.down_scale.as_ptr(),
+                            packed.down_zero.as_ptr(),
+                            output_ptr,
+                            off_h_norm,
+                            off_topk_val,
+                            off_topk_idx,
+                            off_shared_out,
+                            off_expert_mid,
+                            off_moe_out,
+                            true,
+                        )
+                    },
+                )
+            },
+        )?;
+        return Ok(());
+    }
+    if qwen36_ffn_expert_tiled_stage5_metal_native_supported(params, weights, int4) {
+        crate::prefill_ffi::metal_profile_time(
+            "qwen36_ffn_int4_expert_gate_up_down_finalize_tiled",
+            "native",
+            || unsafe {
+                crate::metal_native::qwen36_ffn_expert_gate_up_down_finalize_tiled(
+                    hidden,
+                    moe_intermediate,
+                    active_groups,
+                    int4.group_size as usize,
+                    workspace_ptr,
+                    weights.input_hidden,
+                    weights.gate_up_proj_w,
+                    int4.gate_up_proj_scale,
+                    int4.gate_up_proj_zero,
+                    weights.down_proj_w,
+                    int4.down_proj_scale,
+                    int4.down_proj_zero,
+                    output_ptr,
+                    off_h_norm,
+                    off_topk_val,
+                    off_topk_idx,
+                    off_shared_out,
+                    off_expert_mid,
+                    off_moe_out,
+                    true,
+                )
+            },
+        )?;
+        return Ok(());
+    }
+
+    if qwen36_ffn_expert_gate_up_tiled_metal_native_supported(params, weights, int4) {
+        crate::prefill_ffi::metal_profile_time(
+            "qwen36_ffn_int4_expert_gate_up_tiled",
+            "native",
+            || unsafe {
+                crate::metal_native::qwen36_ffn_expert_gate_up_tiled(
+                    hidden,
+                    moe_intermediate,
+                    active_groups,
+                    int4.group_size as usize,
+                    workspace_ptr,
+                    weights.gate_up_proj_w,
+                    int4.gate_up_proj_scale,
+                    int4.gate_up_proj_zero,
+                    off_h_norm,
+                    off_topk_idx,
+                    off_expert_mid,
+                    true,
+                )
+            },
+        )?;
+    } else {
+        crate::prefill_ffi::metal_profile_time("qwen36_ffn_host_expert_gate_up", "host", || {
+            let gate_up_w = weights.gate_up_proj_w as usize;
+            let gate_up_scale = int4.gate_up_proj_scale as usize;
+            let gate_up_zero = int4.gate_up_proj_zero as usize;
+            let group_size = int4.group_size.max(0) as usize;
+            let rows_per_group = 2 * moe_intermediate;
+            let gate_up_luts = qwen36_build_active_expert_int4_dequant_luts(
+                gate_up_scale,
+                gate_up_zero,
+                &active_experts,
+                rows_per_group,
+                hidden,
+                group_size,
+            );
+            let gu = &mut workspace[off_expert_gu..off_expert_gu + active_groups * rows_per_group];
+            qwen36_parallel_chunks_mut(gu, 64, |start, chunk| {
+                for (local, out) in chunk.iter_mut().enumerate() {
+                    let flat_row = start + local;
+                    let group = flat_row / rows_per_group;
+                    let row = flat_row - group * rows_per_group;
+                    *out = if let Some(luts) = gate_up_luts.as_deref() {
+                        qwen36_expert_int4_dot_lut_unchecked(
+                            gate_up_w,
+                            active_experts[group],
+                            group,
+                            row,
+                            rows_per_group,
+                            hidden,
+                            group_size,
+                            &h_norm,
+                            luts,
+                        )
+                    } else {
+                        qwen36_expert_dense_or_int4_dot_unchecked(
+                            gate_up_w,
+                            gate_up_scale,
+                            gate_up_zero,
+                            active_experts[group],
+                            row,
+                            rows_per_group,
+                            hidden,
+                            group_size,
+                            &h_norm,
+                        )
+                    };
+                }
+            });
+        });
+
+        crate::prefill_ffi::metal_profile_time("qwen36_ffn_host_expert_silu", "host", || {
+            for group in 0..active_groups {
+                let gu_base = off_expert_gu + group * 2 * moe_intermediate;
+                let mid_base = off_expert_mid + group * moe_intermediate;
+                for i in 0..moe_intermediate {
+                    let gp = workspace[gu_base + i];
+                    let up = workspace[gu_base + moe_intermediate + i];
+                    let silu = gp * (1.0f32 / (1.0f32 + (-gp).exp()));
+                    workspace[mid_base + i] = silu * up;
+                }
+            }
+        });
+    }
+
+    let expert_mid =
+        workspace[off_expert_mid..off_expert_mid + active_groups * moe_intermediate].to_vec();
+    crate::prefill_ffi::metal_profile_time("qwen36_ffn_host_expert_down", "host", || {
+        let down_w = weights.down_proj_w as usize;
+        let down_scale = int4.down_proj_scale as usize;
+        let down_zero = int4.down_proj_zero as usize;
+        let group_size = int4.group_size.max(0) as usize;
+        let down_luts = qwen36_build_active_expert_int4_dequant_luts(
+            down_scale,
+            down_zero,
+            &active_experts,
+            hidden,
+            moe_intermediate,
+            group_size,
+        );
+        let stack = &mut workspace[off_expert_stack..off_expert_stack + active_groups * hidden];
+        qwen36_parallel_chunks_mut(stack, 64, |start, chunk| {
+            for (local, out) in chunk.iter_mut().enumerate() {
+                let flat_row = start + local;
+                let group = flat_row / hidden;
+                let row = flat_row - group * hidden;
+                let mid = &expert_mid[group * moe_intermediate..(group + 1) * moe_intermediate];
+                *out = if let Some(luts) = down_luts.as_deref() {
+                    qwen36_expert_int4_dot_lut_unchecked(
+                        down_w,
+                        active_experts[group],
+                        group,
+                        row,
+                        hidden,
+                        moe_intermediate,
+                        group_size,
+                        mid,
+                        luts,
+                    )
+                } else {
+                    qwen36_expert_dense_or_int4_dot_unchecked(
+                        down_w,
+                        down_scale,
+                        down_zero,
+                        active_experts[group],
+                        row,
+                        hidden,
+                        moe_intermediate,
+                        group_size,
+                        mid,
+                    )
+                };
+            }
+        });
+        if params.stage == 3 {
+            for row in 0..hidden {
+                output[row] = f32_to_bf16_bits(bf16_round_f32(stack[row]));
             }
         }
-    }
+    });
 
     if params.stage == 3 {
         return Ok(());
     }
 
-    for row in 0..hidden {
-        let mut acc = 0.0f32;
-        for group in 0..top_k {
-            acc += workspace[off_topk_val + group]
-                * workspace[off_expert_stack + group * hidden + row];
+    crate::prefill_ffi::metal_profile_time("qwen36_ffn_host_finalize", "host", || {
+        for row in 0..hidden {
+            let mut acc = 0.0f32;
+            for group in 0..top_k {
+                acc += workspace[off_topk_val + group]
+                    * workspace[off_expert_stack + group * hidden + row];
+            }
+            let val = bf16_round_f32(acc);
+            workspace[off_moe_out + row] = val;
+            if params.stage == 4 {
+                output[row] = f32_to_bf16_bits(val);
+            }
         }
-        let val = bf16_round_f32(acc);
-        workspace[off_moe_out + row] = val;
-        if params.stage == 4 {
-            output[row] = f32_to_bf16_bits(val);
-        }
-    }
+    });
 
     if params.stage == 4 {
         return Ok(());
     }
 
-    for row in 0..hidden {
-        let val = bf16_round_f32(
-            bf16_bits_to_f32(input[row])
-                + workspace[off_moe_out + row]
-                + workspace[off_shared_out + row],
-        );
-        output[row] = f32_to_bf16_bits(val);
-    }
+    crate::prefill_ffi::metal_profile_time("qwen36_ffn_host_residual", "host", || {
+        for row in 0..hidden {
+            let val = bf16_round_f32(
+                bf16_bits_to_f32(input[row])
+                    + workspace[off_moe_out + row]
+                    + workspace[off_shared_out + row],
+            );
+            output[row] = f32_to_bf16_bits(val);
+        }
+    });
 
     Ok(())
 }
@@ -3065,130 +11224,619 @@ fn bf16_bits_to_f32(bits: u16) -> f32 {
     f32::from_bits((bits as u32) << 16)
 }
 
-fn qwen36_int4_value_2d(
-    packed: &[u8],
-    scale: &[u16],
-    zero: &[u16],
-    row: usize,
-    col: usize,
-    cols: usize,
-    group_size: usize,
-) -> f32 {
-    let byte_cols = cols.div_ceil(2);
-    let byte = packed[row * byte_cols + col / 2];
-    let nibble = if col & 1 == 0 {
-        byte & 0x0f
-    } else {
-        (byte >> 4) & 0x0f
-    };
-    let scale_cols = cols.div_ceil(group_size);
-    let scale_idx = (row / group_size) * scale_cols + col / group_size;
-    let s = bf16_bits_to_f32(scale[scale_idx]);
-    let z = bf16_bits_to_f32(zero[scale_idx]);
-    bf16_round_f32(nibble as f32 * s - z * s)
+fn qwen36_int4_group_dequant_lut(scale: f32, zero: f32) -> [f32; 16] {
+    let zs = zero * scale;
+    std::array::from_fn(|q| bf16_round_f32(q as f32 * scale - zs))
 }
 
-fn qwen36_dense_or_int4_dot_2d(
-    weight: *const c_void,
+#[inline(always)]
+unsafe fn qwen36_int4_lut_dot_pairs(
+    mut acc: f32,
+    packed: *const u8,
+    x: *const f32,
+    byte_count: usize,
+    lut: &[f32; 16],
+) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        return unsafe { qwen36_int4_lut_dot_pairs_neon(acc, packed, x, byte_count, lut) };
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        qwen36_int4_lut_dot_pairs_scalar(acc, packed, x, byte_count, lut)
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+#[inline(always)]
+fn qwen36_int4_lut_dot_pairs_scalar(
+    mut acc: f32,
+    packed: *const u8,
+    x: *const f32,
+    byte_count: usize,
+    lut: &[f32; 16],
+) -> f32 {
+    let mut byte = 0usize;
+    let mut acc0 = 0.0f32;
+    let mut acc1 = 0.0f32;
+    let mut acc2 = 0.0f32;
+    let mut acc3 = 0.0f32;
+    let mut acc4 = 0.0f32;
+    let mut acc5 = 0.0f32;
+    let mut acc6 = 0.0f32;
+    let mut acc7 = 0.0f32;
+    while byte + 8 <= byte_count {
+        let b0 = unsafe { *packed.add(byte) };
+        let b1 = unsafe { *packed.add(byte + 1) };
+        let b2 = unsafe { *packed.add(byte + 2) };
+        let b3 = unsafe { *packed.add(byte + 3) };
+        let b4 = unsafe { *packed.add(byte + 4) };
+        let b5 = unsafe { *packed.add(byte + 5) };
+        let b6 = unsafe { *packed.add(byte + 6) };
+        let b7 = unsafe { *packed.add(byte + 7) };
+        let x_base = unsafe { x.add(byte * 2) };
+        acc0 += lut[(b0 & 0x0f) as usize] * unsafe { *x_base.add(0) }
+            + lut[(b0 >> 4) as usize] * unsafe { *x_base.add(1) };
+        acc1 += lut[(b1 & 0x0f) as usize] * unsafe { *x_base.add(2) }
+            + lut[(b1 >> 4) as usize] * unsafe { *x_base.add(3) };
+        acc2 += lut[(b2 & 0x0f) as usize] * unsafe { *x_base.add(4) }
+            + lut[(b2 >> 4) as usize] * unsafe { *x_base.add(5) };
+        acc3 += lut[(b3 & 0x0f) as usize] * unsafe { *x_base.add(6) }
+            + lut[(b3 >> 4) as usize] * unsafe { *x_base.add(7) };
+        acc4 += lut[(b4 & 0x0f) as usize] * unsafe { *x_base.add(8) }
+            + lut[(b4 >> 4) as usize] * unsafe { *x_base.add(9) };
+        acc5 += lut[(b5 & 0x0f) as usize] * unsafe { *x_base.add(10) }
+            + lut[(b5 >> 4) as usize] * unsafe { *x_base.add(11) };
+        acc6 += lut[(b6 & 0x0f) as usize] * unsafe { *x_base.add(12) }
+            + lut[(b6 >> 4) as usize] * unsafe { *x_base.add(13) };
+        acc7 += lut[(b7 & 0x0f) as usize] * unsafe { *x_base.add(14) }
+            + lut[(b7 >> 4) as usize] * unsafe { *x_base.add(15) };
+        byte += 8;
+    }
+    acc += acc0 + acc1 + acc2 + acc3 + acc4 + acc5 + acc6 + acc7;
+    while byte < byte_count {
+        let b = unsafe { *packed.add(byte) };
+        let x_base = unsafe { x.add(byte * 2) };
+        acc += lut[(b & 0x0f) as usize] * unsafe { *x_base.add(0) }
+            + lut[(b >> 4) as usize] * unsafe { *x_base.add(1) };
+        byte += 1;
+    }
+    acc
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn qwen36_int4_lut_dot_pairs_neon(
+    mut acc: f32,
+    packed: *const u8,
+    x: *const f32,
+    byte_count: usize,
+    lut: &[f32; 16],
+) -> f32 {
+    use std::arch::aarch64::*;
+
+    let mut lut_bytes = [0u8; 32];
+    for (idx, value) in lut.iter().enumerate() {
+        let bf16 = (value.to_bits() >> 16) as u16;
+        lut_bytes[idx * 2] = bf16 as u8;
+        lut_bytes[idx * 2 + 1] = (bf16 >> 8) as u8;
+    }
+    let table = unsafe { vld1q_u8_x2(lut_bytes.as_ptr()) };
+    let low_mask = unsafe { vdup_n_u8(0x0f) };
+    let one = unsafe { vdupq_n_u8(1) };
+
+    let mut byte = 0usize;
+    let mut acc0 = unsafe { vdupq_n_f32(0.0) };
+    let mut acc1 = unsafe { vdupq_n_f32(0.0) };
+    let mut acc2 = unsafe { vdupq_n_f32(0.0) };
+    let mut acc3 = unsafe { vdupq_n_f32(0.0) };
+    while byte + 8 <= byte_count {
+        let packed8 = unsafe { vld1_u8(packed.add(byte)) };
+        let lo = unsafe { vand_u8(packed8, low_mask) };
+        let hi = unsafe { vshr_n_u8::<4>(packed8) };
+        let zipped = unsafe { vzip_u8(lo, hi) };
+        let nibbles = unsafe { vcombine_u8(zipped.0, zipped.1) };
+        let idx_lo = unsafe { vshlq_n_u8::<1>(nibbles) };
+        let idx_hi = unsafe { vorrq_u8(idx_lo, one) };
+        let bf16_lo_bytes = unsafe { vqtbl2q_u8(table, idx_lo) };
+        let bf16_hi_bytes = unsafe { vqtbl2q_u8(table, idx_hi) };
+
+        let bf16_0 = unsafe {
+            vorrq_u16(
+                vmovl_u8(vget_low_u8(bf16_lo_bytes)),
+                vshlq_n_u16::<8>(vmovl_u8(vget_low_u8(bf16_hi_bytes))),
+            )
+        };
+        let bf16_1 = unsafe {
+            vorrq_u16(
+                vmovl_u8(vget_high_u8(bf16_lo_bytes)),
+                vshlq_n_u16::<8>(vmovl_u8(vget_high_u8(bf16_hi_bytes))),
+            )
+        };
+        let w0 = unsafe { vreinterpretq_f32_u32(vshll_n_u16::<16>(vget_low_u16(bf16_0))) };
+        let w1 = unsafe { vreinterpretq_f32_u32(vshll_n_u16::<16>(vget_high_u16(bf16_0))) };
+        let w2 = unsafe { vreinterpretq_f32_u32(vshll_n_u16::<16>(vget_low_u16(bf16_1))) };
+        let w3 = unsafe { vreinterpretq_f32_u32(vshll_n_u16::<16>(vget_high_u16(bf16_1))) };
+        let x_base = unsafe { x.add(byte * 2) };
+        acc0 = unsafe { vfmaq_f32(acc0, w0, vld1q_f32(x_base)) };
+        acc1 = unsafe { vfmaq_f32(acc1, w1, vld1q_f32(x_base.add(4))) };
+        acc2 = unsafe { vfmaq_f32(acc2, w2, vld1q_f32(x_base.add(8))) };
+        acc3 = unsafe { vfmaq_f32(acc3, w3, vld1q_f32(x_base.add(12))) };
+        byte += 8;
+    }
+    acc += unsafe { vaddvq_f32(acc0) + vaddvq_f32(acc1) + vaddvq_f32(acc2) + vaddvq_f32(acc3) };
+    while byte < byte_count {
+        let b = unsafe { *packed.add(byte) };
+        let x_base = unsafe { x.add(byte * 2) };
+        acc += lut[(b & 0x0f) as usize] * unsafe { *x_base.add(0) }
+            + lut[(b >> 4) as usize] * unsafe { *x_base.add(1) };
+        byte += 1;
+    }
+    acc
+}
+
+fn qwen36_build_dense_int4_dequant_luts(
+    scale: usize,
+    zero: usize,
+    rows: usize,
+    cols: usize,
+    group_size: usize,
+) -> Option<Vec<[f32; 16]>> {
+    if scale == 0 && zero == 0 {
+        return None;
+    }
+    let scale = scale as *const u16;
+    let zero = zero as *const u16;
+    let scale_rows = rows.div_ceil(group_size);
+    let scale_cols = cols.div_ceil(group_size);
+    let mut luts = Vec::with_capacity(scale_rows * scale_cols);
+    for scale_row in 0..scale_rows {
+        for scale_col in 0..scale_cols {
+            let scale_idx = scale_row * scale_cols + scale_col;
+            let s = bf16_bits_to_f32(unsafe { *scale.add(scale_idx) });
+            let z = bf16_bits_to_f32(unsafe { *zero.add(scale_idx) });
+            luts.push(qwen36_int4_group_dequant_lut(s, z));
+        }
+    }
+    Some(luts)
+}
+
+fn qwen36_build_active_expert_int4_dequant_luts(
+    scale: usize,
+    zero: usize,
+    active_experts: &[usize],
+    rows: usize,
+    cols: usize,
+    group_size: usize,
+) -> Option<Vec<[f32; 16]>> {
+    if scale == 0 && zero == 0 {
+        return None;
+    }
+    let scale = scale as *const u16;
+    let zero = zero as *const u16;
+    let scale_rows = rows.div_ceil(group_size);
+    let scale_cols = cols.div_ceil(group_size);
+    let mut luts = Vec::with_capacity(active_experts.len() * scale_rows * scale_cols);
+    for &expert in active_experts {
+        let expert_base = expert * scale_rows * scale_cols;
+        for scale_row in 0..scale_rows {
+            for scale_col in 0..scale_cols {
+                let scale_idx = expert_base + scale_row * scale_cols + scale_col;
+                let s = bf16_bits_to_f32(unsafe { *scale.add(scale_idx) });
+                let z = bf16_bits_to_f32(unsafe { *zero.add(scale_idx) });
+                luts.push(qwen36_int4_group_dequant_lut(s, z));
+            }
+        }
+    }
+    Some(luts)
+}
+
+fn qwen36_host_parallelism(len: usize, min_rows_per_worker: usize) -> usize {
+    if len < min_rows_per_worker.saturating_mul(2) {
+        return 1;
+    }
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    workers.min(len.div_ceil(min_rows_per_worker)).max(1)
+}
+
+struct Qwen36ParallelCompletion {
+    remaining: AtomicUsize,
+    waiter: std::thread::Thread,
+}
+
+impl Qwen36ParallelCompletion {
+    fn new(count: usize) -> Self {
+        Self {
+            remaining: AtomicUsize::new(count),
+            waiter: std::thread::current(),
+        }
+    }
+
+    fn finish_one(&self) {
+        if self.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.waiter.unpark();
+        }
+    }
+
+    fn wait(&self) {
+        while self.remaining.load(Ordering::Acquire) != 0 {
+            std::thread::park();
+        }
+    }
+}
+
+struct Qwen36ParallelJob {
+    func: unsafe fn(usize, usize, usize),
+    ctx: usize,
+    start: usize,
+    len: usize,
+    done: usize,
+}
+
+struct Qwen36ParallelPool {
+    queue: Mutex<VecDeque<Qwen36ParallelJob>>,
+    cvar: Condvar,
+}
+
+static QWEN36_PARALLEL_POOL: OnceLock<Arc<Qwen36ParallelPool>> = OnceLock::new();
+
+fn qwen36_parallel_pool() -> &'static Arc<Qwen36ParallelPool> {
+    QWEN36_PARALLEL_POOL.get_or_init(|| {
+        let pool = Arc::new(Qwen36ParallelPool {
+            queue: Mutex::new(VecDeque::new()),
+            cvar: Condvar::new(),
+        });
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        for idx in 0..workers {
+            let worker_pool = Arc::clone(&pool);
+            std::thread::Builder::new()
+                .name(format!("qwen36-host-{idx}"))
+                .spawn(move || loop {
+                    let job = {
+                        let mut queue = worker_pool
+                            .queue
+                            .lock()
+                            .expect("qwen36 parallel queue poisoned");
+                        loop {
+                            if let Some(job) = queue.pop_front() {
+                                break job;
+                            }
+                            queue = worker_pool
+                                .cvar
+                                .wait(queue)
+                                .expect("qwen36 parallel queue poisoned");
+                        }
+                    };
+                    unsafe {
+                        (job.func)(job.ctx, job.start, job.len);
+                    }
+                    unsafe {
+                        (*(job.done as *const Qwen36ParallelCompletion)).finish_one();
+                    }
+                })
+                .expect("failed to spawn qwen36 host worker");
+        }
+        pool
+    })
+}
+
+struct Qwen36ChunkCtx<T, F> {
+    base: *mut T,
+    f: *const F,
+}
+
+unsafe fn qwen36_run_chunk_job<T, F>(ctx: usize, start: usize, len: usize)
+where
+    T: Send,
+    F: Fn(usize, &mut [T]) + Sync,
+{
+    let ctx = unsafe { &*(ctx as *const Qwen36ChunkCtx<T, F>) };
+    let chunk = unsafe { std::slice::from_raw_parts_mut(ctx.base.add(start), len) };
+    let f = unsafe { &*ctx.f };
+    f(start, chunk);
+}
+
+fn qwen36_parallel_chunks_mut<T, F>(slice: &mut [T], min_rows_per_worker: usize, f: F)
+where
+    T: Send,
+    F: Fn(usize, &mut [T]) + Sync,
+{
+    let workers = qwen36_host_parallelism(slice.len(), min_rows_per_worker);
+    if workers <= 1 {
+        f(0, slice);
+        return;
+    }
+    let chunk = slice.len().div_ceil(workers);
+    let chunks = slice.len().div_ceil(chunk);
+    let done = Qwen36ParallelCompletion::new(chunks);
+    let ctx = Qwen36ChunkCtx {
+        base: slice.as_mut_ptr(),
+        f: &f as *const F,
+    };
+    let pool = qwen36_parallel_pool();
+    {
+        let mut queue = pool.queue.lock().expect("qwen36 parallel queue poisoned");
+        for chunk_idx in 0..chunks {
+            let start = chunk_idx * chunk;
+            let len = slice.len().saturating_sub(start).min(chunk);
+            queue.push_back(Qwen36ParallelJob {
+                func: qwen36_run_chunk_job::<T, F>,
+                ctx: &ctx as *const Qwen36ChunkCtx<T, F> as usize,
+                start,
+                len,
+                done: &done as *const Qwen36ParallelCompletion as usize,
+            });
+        }
+    }
+    pool.cvar.notify_all();
+    done.wait();
+}
+
+struct Qwen36Chunk2Ctx<T, U, F> {
+    a_base: *mut T,
+    b_base: *mut U,
+    f: *const F,
+}
+
+unsafe fn qwen36_run_chunk2_job<T, U, F>(ctx: usize, start: usize, len: usize)
+where
+    T: Send,
+    U: Send,
+    F: Fn(usize, &mut [T], &mut [U]) + Sync,
+{
+    let ctx = unsafe { &*(ctx as *const Qwen36Chunk2Ctx<T, U, F>) };
+    let a = unsafe { std::slice::from_raw_parts_mut(ctx.a_base.add(start), len) };
+    let b = unsafe { std::slice::from_raw_parts_mut(ctx.b_base.add(start), len) };
+    let f = unsafe { &*ctx.f };
+    f(start, a, b);
+}
+
+fn qwen36_parallel_chunks2_mut<T, U, F>(a: &mut [T], b: &mut [U], min_rows_per_worker: usize, f: F)
+where
+    T: Send,
+    U: Send,
+    F: Fn(usize, &mut [T], &mut [U]) + Sync,
+{
+    debug_assert_eq!(a.len(), b.len());
+    let workers = qwen36_host_parallelism(a.len(), min_rows_per_worker);
+    if workers <= 1 {
+        f(0, a, b);
+        return;
+    }
+    let chunk = a.len().div_ceil(workers);
+    let chunks = a.len().div_ceil(chunk);
+    let done = Qwen36ParallelCompletion::new(chunks);
+    let ctx = Qwen36Chunk2Ctx {
+        a_base: a.as_mut_ptr(),
+        b_base: b.as_mut_ptr(),
+        f: &f as *const F,
+    };
+    let pool = qwen36_parallel_pool();
+    {
+        let mut queue = pool.queue.lock().expect("qwen36 parallel queue poisoned");
+        for chunk_idx in 0..chunks {
+            let start = chunk_idx * chunk;
+            let len = a.len().saturating_sub(start).min(chunk);
+            queue.push_back(Qwen36ParallelJob {
+                func: qwen36_run_chunk2_job::<T, U, F>,
+                ctx: &ctx as *const Qwen36Chunk2Ctx<T, U, F> as usize,
+                start,
+                len,
+                done: &done as *const Qwen36ParallelCompletion as usize,
+            });
+        }
+    }
+    pool.cvar.notify_all();
+    done.wait();
+}
+
+fn qwen36_validate_dense_or_int4_sidecars(
     scale: *const c_void,
     zero: *const c_void,
-    row: usize,
-    cols: usize,
     group_size: i32,
-    x: &[f32],
-) -> Result<f32, GpuError> {
-    if weight.is_null() {
-        return Err(GpuError::InvalidArg(
-            "qwen36_moe: Metal fallback received a null weight pointer".into(),
-        ));
-    }
+    label: &str,
+) -> Result<(), GpuError> {
     if scale.is_null() && zero.is_null() {
-        let w = unsafe { std::slice::from_raw_parts(weight as *const u16, (row + 1) * cols) };
-        let row_base = row * cols;
-        let mut acc = 0.0f32;
-        for col in 0..cols {
-            acc += bf16_bits_to_f32(w[row_base + col]) * x[col];
-        }
-        return Ok(acc);
+        return Ok(());
     }
     if scale.is_null() || zero.is_null() || group_size <= 0 {
-        return Err(GpuError::InvalidArg(
-            "qwen36_moe: Metal INT4 fallback requires paired scale/zero pointers and positive group_size"
-                .into(),
-        ));
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe: Metal INT4 fallback requires paired scale/zero pointers \
+             and positive group_size for {label}"
+        )));
     }
-    let group_size = group_size as usize;
-    let packed_len = (row + 1) * cols.div_ceil(2);
-    let scale_len = (row / group_size + 1) * cols.div_ceil(group_size);
-    let packed = unsafe { std::slice::from_raw_parts(weight as *const u8, packed_len) };
-    let scale = unsafe { std::slice::from_raw_parts(scale as *const u16, scale_len) };
-    let zero = unsafe { std::slice::from_raw_parts(zero as *const u16, scale_len) };
+    Ok(())
+}
+
+fn qwen36_dense_or_int4_dot_2d_unchecked(
+    weight: usize,
+    scale: usize,
+    zero: usize,
+    row: usize,
+    cols: usize,
+    group_size: usize,
+    x: &[f32],
+) -> f32 {
     let mut acc = 0.0f32;
-    for col in 0..cols {
-        acc += qwen36_int4_value_2d(packed, scale, zero, row, col, cols, group_size) * x[col];
+    if scale == 0 && zero == 0 {
+        let w = weight as *const u16;
+        let row_base = row * cols;
+        for col in 0..cols {
+            acc += bf16_bits_to_f32(unsafe { *w.add(row_base + col) }) * x[col];
+        }
+        return acc;
     }
-    Ok(acc)
+    let packed = weight as *const u8;
+    let scale = scale as *const u16;
+    let zero = zero as *const u16;
+    let byte_cols = cols.div_ceil(2);
+    let scale_cols = cols.div_ceil(group_size);
+    let packed_base = row * byte_cols;
+    let scale_base = (row / group_size) * scale_cols;
+    for scale_col in 0..scale_cols {
+        let group_start = scale_col * group_size;
+        let group_end = cols.min(group_start + group_size);
+        let scale_idx = scale_base + scale_col;
+        let s = bf16_bits_to_f32(unsafe { *scale.add(scale_idx) });
+        let z = bf16_bits_to_f32(unsafe { *zero.add(scale_idx) });
+        let lut = qwen36_int4_group_dequant_lut(s, z);
+        let pair_cols = (group_end - group_start) & !1;
+        acc = unsafe {
+            qwen36_int4_lut_dot_pairs(
+                acc,
+                packed.add(packed_base + group_start / 2),
+                x.as_ptr().add(group_start),
+                pair_cols / 2,
+                &lut,
+            )
+        };
+        let col = group_start + pair_cols;
+        if col < group_end {
+            let byte = unsafe { *packed.add(packed_base + col / 2) };
+            let w = lut[(byte & 0x0f) as usize];
+            acc += w * x[col];
+        }
+    }
+    acc
+}
+
+fn qwen36_dense_int4_dot_2d_lut_unchecked(
+    weight: usize,
+    row: usize,
+    cols: usize,
+    group_size: usize,
+    x: &[f32],
+    luts: &[[f32; 16]],
+) -> f32 {
+    let mut acc = 0.0f32;
+    let packed = weight as *const u8;
+    let byte_cols = cols.div_ceil(2);
+    let scale_cols = cols.div_ceil(group_size);
+    let packed_base = row * byte_cols;
+    let lut_base = (row / group_size) * scale_cols;
+    for scale_col in 0..scale_cols {
+        let group_start = scale_col * group_size;
+        let group_end = cols.min(group_start + group_size);
+        let lut = &luts[lut_base + scale_col];
+        let pair_cols = (group_end - group_start) & !1;
+        acc = unsafe {
+            qwen36_int4_lut_dot_pairs(
+                acc,
+                packed.add(packed_base + group_start / 2),
+                x.as_ptr().add(group_start),
+                pair_cols / 2,
+                lut,
+            )
+        };
+        let col = group_start + pair_cols;
+        if col < group_end {
+            let byte = unsafe { *packed.add(packed_base + col / 2) };
+            acc += lut[(byte & 0x0f) as usize] * x[col];
+        }
+    }
+    acc
 }
 
 #[allow(clippy::too_many_arguments)]
-fn qwen36_expert_dense_or_int4_dot(
-    weight: *const c_void,
-    scale: *const c_void,
-    zero: *const c_void,
+fn qwen36_expert_dense_or_int4_dot_unchecked(
+    weight: usize,
+    scale: usize,
+    zero: usize,
     expert: usize,
     row: usize,
     rows: usize,
     cols: usize,
-    group_size: i32,
+    group_size: usize,
     x: &[f32],
-) -> Result<f32, GpuError> {
-    if weight.is_null() {
-        return Err(GpuError::InvalidArg(
-            "qwen36_moe: Metal expert fallback received a null weight pointer".into(),
-        ));
-    }
-    if scale.is_null() && zero.is_null() {
-        let len = (expert * rows + row + 1) * cols;
-        let w = unsafe { std::slice::from_raw_parts(weight as *const u16, len) };
+) -> f32 {
+    let mut acc = 0.0f32;
+    if scale == 0 && zero == 0 {
+        let w = weight as *const u16;
         let row_base = (expert * rows + row) * cols;
-        let mut acc = 0.0f32;
         for col in 0..cols {
-            acc += bf16_bits_to_f32(w[row_base + col]) * x[col];
+            acc += bf16_bits_to_f32(unsafe { *w.add(row_base + col) }) * x[col];
         }
-        return Ok(acc);
+        return acc;
     }
-    if scale.is_null() || zero.is_null() || group_size <= 0 {
-        return Err(GpuError::InvalidArg(
-            "qwen36_moe: Metal expert INT4 fallback requires paired scale/zero pointers and positive group_size"
-                .into(),
-        ));
-    }
-    let group_size = group_size as usize;
+    let packed = weight as *const u8;
+    let scale = scale as *const u16;
+    let zero = zero as *const u16;
     let byte_cols = cols.div_ceil(2);
     let scale_rows = rows.div_ceil(group_size);
     let scale_cols = cols.div_ceil(group_size);
-    let packed_len = (expert * rows + row + 1) * byte_cols;
-    let scale_len = (expert * scale_rows + row / group_size + 1) * scale_cols;
-    let packed = unsafe { std::slice::from_raw_parts(weight as *const u8, packed_len) };
-    let scale = unsafe { std::slice::from_raw_parts(scale as *const u16, scale_len) };
-    let zero = unsafe { std::slice::from_raw_parts(zero as *const u16, scale_len) };
     let packed_base = (expert * rows + row) * byte_cols;
     let scale_base = (expert * scale_rows + row / group_size) * scale_cols;
-    let mut acc = 0.0f32;
-    for col in 0..cols {
-        let byte = packed[packed_base + col / 2];
-        let nibble = if col & 1 == 0 {
-            byte & 0x0f
-        } else {
-            (byte >> 4) & 0x0f
+    for scale_col in 0..scale_cols {
+        let group_start = scale_col * group_size;
+        let group_end = cols.min(group_start + group_size);
+        let scale_idx = scale_base + scale_col;
+        let s = bf16_bits_to_f32(unsafe { *scale.add(scale_idx) });
+        let z = bf16_bits_to_f32(unsafe { *zero.add(scale_idx) });
+        let lut = qwen36_int4_group_dequant_lut(s, z);
+        let pair_cols = (group_end - group_start) & !1;
+        acc = unsafe {
+            qwen36_int4_lut_dot_pairs(
+                acc,
+                packed.add(packed_base + group_start / 2),
+                x.as_ptr().add(group_start),
+                pair_cols / 2,
+                &lut,
+            )
         };
-        let scale_idx = scale_base + col / group_size;
-        let s = bf16_bits_to_f32(scale[scale_idx]);
-        let z = bf16_bits_to_f32(zero[scale_idx]);
-        let w = bf16_round_f32(nibble as f32 * s - z * s);
-        acc += w * x[col];
+        let col = group_start + pair_cols;
+        if col < group_end {
+            let byte = unsafe { *packed.add(packed_base + col / 2) };
+            let w = lut[(byte & 0x0f) as usize];
+            acc += w * x[col];
+        }
     }
-    Ok(acc)
+    acc
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen36_expert_int4_dot_lut_unchecked(
+    weight: usize,
+    expert: usize,
+    active_group: usize,
+    row: usize,
+    rows: usize,
+    cols: usize,
+    group_size: usize,
+    x: &[f32],
+    luts: &[[f32; 16]],
+) -> f32 {
+    let mut acc = 0.0f32;
+    let packed = weight as *const u8;
+    let byte_cols = cols.div_ceil(2);
+    let scale_rows = rows.div_ceil(group_size);
+    let scale_cols = cols.div_ceil(group_size);
+    let packed_base = (expert * rows + row) * byte_cols;
+    let lut_base = (active_group * scale_rows + row / group_size) * scale_cols;
+    for scale_col in 0..scale_cols {
+        let group_start = scale_col * group_size;
+        let group_end = cols.min(group_start + group_size);
+        let lut = &luts[lut_base + scale_col];
+        let pair_cols = (group_end - group_start) & !1;
+        acc = unsafe {
+            qwen36_int4_lut_dot_pairs(
+                acc,
+                packed.add(packed_base + group_start / 2),
+                x.as_ptr().add(group_start),
+                pair_cols / 2,
+                lut,
+            )
+        };
+        let col = group_start + pair_cols;
+        if col < group_end {
+            let byte = unsafe { *packed.add(packed_base + col / 2) };
+            acc += lut[(byte & 0x0f) as usize] * x[col];
+        }
+    }
+    acc
 }
 
 /// Safe wrapper for the GPU final RMSNorm + lm_head GEMV.
@@ -3716,6 +12364,30 @@ pub fn batched_prefill_attn_full_launch(
     out: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
     let backend = query.backend();
+    if backend == Backend::Metal {
+        if batch_size != 1 {
+            return Err(GpuError::backend(
+                backend,
+                format!(
+                    "qwen36_moe::batched_prefill_attn_full_launch Metal path supports batch_size=1, got {batch_size}"
+                ),
+            ));
+        }
+        return crate::prefill_ffi::metal_full_attention_prefill_strided_bf16_f32(
+            q_heads,
+            kv_heads,
+            q_len,
+            kv_len,
+            kv_len,
+            head_dim,
+            scale,
+            seqlen_offset,
+            query,
+            key,
+            value,
+            out,
+        );
+    }
     if backend != Backend::Hip && backend != Backend::Cuda {
         return Err(GpuError::backend(
             backend,
@@ -3776,6 +12448,147 @@ pub fn batched_prefill_attn_full_launch(
         ));
     }
     Ok(())
+}
+
+/// Metal v1 direct routed-expert prefill prototype.
+///
+/// This bypasses the HIP M9/M10/M11 router-permute path and consumes the
+/// already materialized top-k tables directly:
+/// - `x_norm`: BF16 `[n_tokens, hidden]`
+/// - `topk_idx`: U32 `[n_tokens, top_k]`
+/// - `topk_weight`: BF16 `[n_tokens, top_k]`
+/// - `expert_mid`: F32 `[n_tokens * top_k, moe_intermediate]`
+/// - `combined`: BF16 `[n_tokens, hidden]`
+///
+/// SAFETY: raw weight pointers must refer to live Metal buffers on `ordinal`.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn batched_prefill_grouped_expert_direct_metal_launch_raw(
+    ordinal: usize,
+    n_tokens: usize,
+    top_k: usize,
+    hidden: usize,
+    moe_intermediate: usize,
+    group_size: usize,
+    x_norm: &GpuBuffer,
+    topk_idx: &GpuBuffer,
+    topk_weight: &GpuBuffer,
+    gate_up_proj: *const c_void,
+    gate_up_scale: *const c_void,
+    gate_up_zero: *const c_void,
+    down_proj: *const c_void,
+    down_scale: *const c_void,
+    down_zero: *const c_void,
+    expert_mid: &mut GpuBuffer,
+    combined: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    let backend = x_norm.backend();
+    if backend != Backend::Metal {
+        return Err(GpuError::backend(
+            backend,
+            "qwen36_moe::batched_prefill_grouped_expert_direct_metal_launch_raw requires Metal backend"
+                .to_string(),
+        ));
+    }
+    if topk_idx.backend() != Backend::Metal
+        || topk_weight.backend() != Backend::Metal
+        || expert_mid.backend() != Backend::Metal
+        || combined.backend() != Backend::Metal
+    {
+        return Err(GpuError::InvalidArg(
+            "qwen36_moe::batched_prefill_grouped_expert_direct_metal_launch_raw requires all buffers on Metal"
+                .into(),
+        ));
+    }
+    if x_norm.dtype() != ScalarType::BF16
+        || topk_idx.dtype() != ScalarType::U32
+        || topk_weight.dtype() != ScalarType::BF16
+        || expert_mid.dtype() != ScalarType::F32
+        || combined.dtype() != ScalarType::BF16
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::batched_prefill_grouped_expert_direct_metal_launch_raw dtype mismatch: x_norm={:?} topk_idx={:?} topk_weight={:?} expert_mid={:?} combined={:?}",
+            x_norm.dtype(),
+            topk_idx.dtype(),
+            topk_weight.dtype(),
+            expert_mid.dtype(),
+            combined.dtype(),
+        )));
+    }
+    if n_tokens == 0
+        || top_k == 0
+        || hidden == 0
+        || moe_intermediate == 0
+        || group_size == 0
+        || gate_up_proj.is_null()
+        || gate_up_scale.is_null()
+        || gate_up_zero.is_null()
+        || down_proj.is_null()
+        || down_scale.is_null()
+        || down_zero.is_null()
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::batched_prefill_grouped_expert_direct_metal_launch_raw invalid shape: n_tokens={n_tokens} top_k={top_k} hidden={hidden} moe_intermediate={moe_intermediate} group_size={group_size}"
+        )));
+    }
+    let expected_routes = n_tokens.checked_mul(top_k).ok_or_else(|| {
+        GpuError::InvalidArg(
+            "qwen36_moe::batched_prefill_grouped_expert_direct_metal_launch_raw top-k size overflow"
+                .into(),
+        )
+    })?;
+    let expected_mid = expected_routes.checked_mul(moe_intermediate).ok_or_else(|| {
+        GpuError::InvalidArg(
+            "qwen36_moe::batched_prefill_grouped_expert_direct_metal_launch_raw expert_mid size overflow"
+                .into(),
+        )
+    })?;
+    let expected_combined = n_tokens.checked_mul(hidden).ok_or_else(|| {
+        GpuError::InvalidArg(
+            "qwen36_moe::batched_prefill_grouped_expert_direct_metal_launch_raw combined size overflow"
+                .into(),
+        )
+    })?;
+    if x_norm.elem_count() < expected_combined
+        || topk_idx.elem_count() < expected_routes
+        || topk_weight.elem_count() < expected_routes
+        || expert_mid.elem_count() < expected_mid
+        || combined.elem_count() < expected_combined
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::batched_prefill_grouped_expert_direct_metal_launch_raw buffer too small: x_norm={} topk_idx={} topk_weight={} expert_mid={} combined={}",
+            x_norm.elem_count(),
+            topk_idx.elem_count(),
+            topk_weight.elem_count(),
+            expert_mid.elem_count(),
+            combined.elem_count(),
+        )));
+    }
+    let _ = ordinal;
+    crate::prefill_ffi::metal_profile_time(
+        "qwen36_batched_prefill_grouped_expert_direct",
+        "native",
+        || unsafe {
+            crate::metal_native::qwen36_batched_prefill_grouped_expert_direct(
+                n_tokens,
+                top_k,
+                hidden,
+                moe_intermediate,
+                group_size,
+                x_norm.as_ptr(),
+                topk_idx.as_ptr(),
+                topk_weight.as_ptr(),
+                gate_up_proj,
+                gate_up_scale,
+                gate_up_zero,
+                down_proj,
+                down_scale,
+                down_zero,
+                expert_mid.as_mut_ptr(),
+                combined.as_mut_ptr(),
+                true,
+            )
+        },
+    )
 }
 
 /// Stage B (M9) router permutation safe wrapper.
@@ -4223,6 +13036,318 @@ mod tests {
         assert!(d.kv_cache_k.is_null());
         assert!(d.linear_recurrent_state.is_null());
         assert!(d.experts_gate_up_w.is_null());
+    }
+
+    #[test]
+    fn qwen36_static_topn_table_parser_reads_probe_export() {
+        let raw = r#"{
+            "schema": "qwen36-static-topn-mps-probe-v2",
+            "static_tables": {
+                "4": {
+                    "layers": [
+                        {"layer": 0, "experts": [7, 1], "counts": [3, 2]},
+                        {"layer": 2, "experts": [5, 4], "counts": [9, 1]}
+                    ]
+                },
+                "8": {
+                    "1": [3, 2, 1]
+                }
+            }
+        }"#;
+        let table = qwen36_parse_static_topn_table_json(raw).expect("parse static top-N table");
+
+        assert!(table.capacity_exists(4));
+        assert!(table.capacity_exists(8));
+        assert_eq!(table.largest_capacity(), Some(8));
+        assert_eq!(table.layer_experts(4, 0), Some([7, 1].as_slice()));
+        assert_eq!(table.layer_experts(4, 1), None);
+        assert_eq!(table.layer_experts(4, 2), Some([5, 4].as_slice()));
+        assert_eq!(table.layer_experts(8, 1), Some([3, 2, 1].as_slice()));
+    }
+
+    #[test]
+    fn qwen36_static_topn_slot_map_validates_table_rows() {
+        let slots = qwen36_static_topn_expert_to_slot(3, &[7, 1, 5], 8, 3).expect("valid slot map");
+        assert_eq!(slots[7], Some(0));
+        assert_eq!(slots[1], Some(1));
+        assert_eq!(slots[5], Some(2));
+        assert_eq!(slots[0], None);
+
+        let duplicate = qwen36_static_topn_expert_to_slot(3, &[7, 1, 7], 8, 3);
+        assert!(duplicate.is_err());
+        let out_of_range = qwen36_static_topn_expert_to_slot(3, &[8], 8, 3);
+        assert!(out_of_range.is_err());
+    }
+
+    #[test]
+    fn qwen36_mps_static_topn_profile_key_uses_fp16_mps_format() {
+        let key = Qwen36ExpertResidencyProfileKey::with_format(
+            Qwen36ExpertResidentFormat::Fp16Mps,
+            Qwen36ExpertResidencyMissPolicy::StaticTopN,
+            64,
+        );
+
+        assert_eq!(key.resident_format.as_str(), "fp16_mps");
+        assert_eq!(key.miss_policy.as_str(), "static_topn");
+        assert_eq!(key.capacity, 64);
+    }
+
+    #[test]
+    fn qwen36_route_profile_simulates_layer_locality() {
+        let records = vec![
+            vec![1, 2],
+            vec![3, 4],
+            vec![1, 5],
+            vec![6, 4],
+            vec![1, 2],
+            vec![6, 7],
+        ];
+        let snapshot = qwen36_route_profile_simulate(&records, 0, 2);
+
+        assert_eq!(snapshot.calls, 6);
+        assert_eq!(snapshot.assignments, 12);
+        assert_eq!(snapshot.unique_layer_experts, 7);
+        assert_eq!(snapshot.adjacent_hits, 4);
+        assert_eq!(snapshot.adjacent_total, 8);
+        assert_eq!(snapshot.route_calls.len(), 6);
+        assert_eq!(snapshot.route_calls[3].layer, 1);
+        assert_eq!(snapshot.route_calls[3].experts, vec![6, 4]);
+
+        let cap2 = snapshot
+            .cache_sims
+            .iter()
+            .find(|sim| sim.capacity == 2)
+            .expect("cap2 cache sim");
+        assert_eq!(cap2.hits, 4);
+        assert_eq!(cap2.misses, 8);
+
+        let top2 = snapshot
+            .topn_sims
+            .iter()
+            .find(|sim| sim.capacity == 2)
+            .expect("cap2 top-n sim");
+        assert_eq!(top2.covered, 9);
+        assert_eq!(top2.total, 12);
+
+        let layer0_top2 = snapshot
+            .topn_layers
+            .iter()
+            .find(|row| row.capacity == 2 && row.layer == 0)
+            .expect("layer0 cap2 top-n row");
+        assert_eq!(layer0_top2.experts, vec![1, 2]);
+        assert_eq!(layer0_top2.counts, vec![3, 2]);
+        assert_eq!(layer0_top2.covered, 5);
+        assert_eq!(layer0_top2.total, 6);
+    }
+
+    #[test]
+    fn qwen36_batched_prefill_feasibility_groups_routes_by_chunk_and_layer() {
+        let records = vec![
+            vec![1, 2],
+            vec![5, 6],
+            vec![1, 3],
+            vec![5, 7],
+            vec![1, 4],
+            vec![8, 9],
+        ];
+        let config = Qwen36BatchedPrefillFeasibilityConfig {
+            layers: 2,
+            top_k: 2,
+            num_experts: 10,
+            chunk_size: 2,
+            prefill_tokens: 3,
+        };
+        let snapshot = qwen36_batched_prefill_feasibility_profile_simulate(&records, 0, &config);
+
+        assert_eq!(snapshot.calls, 6);
+        assert_eq!(snapshot.profiled_tokens, 3);
+        assert_eq!(snapshot.chunks, 2);
+        assert_eq!(snapshot.assignments, 12);
+        assert_eq!(snapshot.permutation_entries, 12);
+        assert_eq!(snapshot.expert_segments, 10);
+        assert_eq!(snapshot.max_unique_experts_per_layer_chunk, 3);
+        assert_eq!(snapshot.max_rows_per_segment, 2);
+        assert_eq!(snapshot.scalar_tail_segments, 10);
+        assert_eq!(snapshot.scalar_tail_assignments, 12);
+        assert_eq!(snapshot.wmma16_padded_assignments, 160);
+        assert_eq!(snapshot.avg_unique_experts_per_layer_chunk(), 2.5);
+        assert!((snapshot.avg_rows_per_segment() - 1.2).abs() < 1e-6);
+        assert_eq!(snapshot.wmma16_assignment_coverage(), 0.0);
+        assert!((snapshot.wmma16_padding_overhead() - (148.0 / 12.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn qwen36_packed_expert_copy_bytes_matches_stage5_geometry() {
+        let bytes = qwen36_packed_expert_copy_bytes(2048, 512, 8, 128);
+        assert_eq!(bytes, 12_589_056);
+    }
+
+    #[test]
+    fn qwen36_hotset_slot_selection_reuses_hits_and_protects_current_call() {
+        let slots = vec![Some(7), Some(9), None, Some(11)];
+        let last_used = vec![10, 1, 0, 3];
+        let protected = vec![false; 4];
+        assert_eq!(
+            qwen36_hotset_choose_slot(&slots, &last_used, &protected, 9),
+            (1, true, false)
+        );
+        assert_eq!(
+            qwen36_hotset_choose_slot(&slots, &last_used, &protected, 13),
+            (2, false, false)
+        );
+
+        let protected = vec![false, true, true, false];
+        assert_eq!(
+            qwen36_hotset_choose_slot(&slots, &last_used, &protected, 13),
+            (3, false, true)
+        );
+    }
+
+    fn test_int4_blob(num_experts: usize, rows: usize, cols: usize) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(num_experts * rows * cols.div_ceil(2));
+        for expert in 0..num_experts {
+            for row in 0..rows {
+                for col in (0..cols).step_by(2) {
+                    let lo = ((expert * 3 + row * 5 + col) & 0x0f) as u8;
+                    let hi = ((expert * 7 + row * 11 + col + 1) & 0x0f) as u8;
+                    bytes.push(lo | (hi << 4));
+                }
+            }
+        }
+        bytes
+    }
+
+    fn test_bf16_sidecar(
+        num_experts: usize,
+        rows: usize,
+        cols: usize,
+        group_size: usize,
+        base: f32,
+    ) -> Vec<u16> {
+        let scale_rows = rows.div_ceil(group_size);
+        let scale_cols = cols.div_ceil(group_size);
+        let mut values = Vec::with_capacity(num_experts * scale_rows * scale_cols);
+        for expert in 0..num_experts {
+            for row_group in 0..scale_rows {
+                for col_group in 0..scale_cols {
+                    let value = base + 0.03125 * expert as f32 + 0.0078125 * row_group as f32
+                        - 0.00390625 * col_group as f32;
+                    values.push(half::bf16::from_f32(value).to_bits());
+                }
+            }
+        }
+        values
+    }
+
+    #[test]
+    fn qwen36_mps_bridge_lut_pack_matches_scalar_pack() {
+        let hidden = 8;
+        let moe_intermediate = 4;
+        let gate_up_rows = 2 * moe_intermediate;
+        let group_size = 4;
+        let num_experts = 3;
+        let active_experts = [2usize, 0usize];
+        let h_norm = [0.25, -1.0, 2.0, 0.5, -0.125, 1.5, -2.5, 3.0];
+
+        let gate_up = test_int4_blob(num_experts, gate_up_rows, hidden);
+        let gate_up_scale = test_bf16_sidecar(num_experts, gate_up_rows, hidden, group_size, 0.125);
+        let gate_up_zero = test_bf16_sidecar(num_experts, gate_up_rows, hidden, group_size, 0.5);
+        let down = test_int4_blob(num_experts, hidden, moe_intermediate);
+        let down_scale =
+            test_bf16_sidecar(num_experts, hidden, moe_intermediate, group_size, 0.0625);
+        let down_zero = test_bf16_sidecar(num_experts, hidden, moe_intermediate, group_size, 0.25);
+
+        let scalar = qwen36_pack_mps_expert_bridge_bytes_scalar(
+            hidden,
+            moe_intermediate,
+            &active_experts,
+            &h_norm,
+            group_size,
+            gate_up.as_ptr().cast(),
+            gate_up_scale.as_ptr().cast(),
+            gate_up_zero.as_ptr().cast(),
+            down.as_ptr().cast(),
+            down_scale.as_ptr().cast(),
+            down_zero.as_ptr().cast(),
+        );
+        let lut = qwen36_pack_mps_expert_bridge_bytes_lut(
+            hidden,
+            moe_intermediate,
+            &active_experts,
+            &h_norm,
+            group_size,
+            gate_up.as_ptr().cast(),
+            gate_up_scale.as_ptr().cast(),
+            gate_up_zero.as_ptr().cast(),
+            down.as_ptr().cast(),
+            down_scale.as_ptr().cast(),
+            down_zero.as_ptr().cast(),
+        );
+
+        assert_eq!(lut.0, scalar.0, "h_norm pack mismatch");
+        assert_eq!(lut.1, scalar.1, "gate/up RHS pack mismatch");
+        assert_eq!(lut.2, scalar.2, "down RHS pack mismatch");
+    }
+
+    #[test]
+    #[ignore = "microbench for the Qwen3.6 MPS bridge CPU transcode experiment"]
+    fn qwen36_mps_bridge_cpu_pack_lut_microbench() {
+        let hidden = 2048;
+        let moe_intermediate = 512;
+        let gate_up_rows = 2 * moe_intermediate;
+        let group_size = 128;
+        let num_experts = 8;
+        let active_experts: Vec<usize> = (0..8).collect();
+        let h_norm: Vec<f32> = (0..hidden)
+            .map(|idx| ((idx as i32 % 17) as f32 - 8.0) * 0.03125)
+            .collect();
+        let gate_up = test_int4_blob(num_experts, gate_up_rows, hidden);
+        let gate_up_scale =
+            test_bf16_sidecar(num_experts, gate_up_rows, hidden, group_size, 0.03125);
+        let gate_up_zero = test_bf16_sidecar(num_experts, gate_up_rows, hidden, group_size, 7.0);
+        let down = test_int4_blob(num_experts, hidden, moe_intermediate);
+        let down_scale =
+            test_bf16_sidecar(num_experts, hidden, moe_intermediate, group_size, 0.03125);
+        let down_zero = test_bf16_sidecar(num_experts, hidden, moe_intermediate, group_size, 7.0);
+
+        let scalar_start = std::time::Instant::now();
+        let scalar = qwen36_pack_mps_expert_bridge_bytes_scalar(
+            hidden,
+            moe_intermediate,
+            &active_experts,
+            &h_norm,
+            group_size,
+            gate_up.as_ptr().cast(),
+            gate_up_scale.as_ptr().cast(),
+            gate_up_zero.as_ptr().cast(),
+            down.as_ptr().cast(),
+            down_scale.as_ptr().cast(),
+            down_zero.as_ptr().cast(),
+        );
+        let scalar_ms = scalar_start.elapsed().as_secs_f64() * 1000.0;
+
+        let lut_start = std::time::Instant::now();
+        let lut = qwen36_pack_mps_expert_bridge_bytes_lut(
+            hidden,
+            moe_intermediate,
+            &active_experts,
+            &h_norm,
+            group_size,
+            gate_up.as_ptr().cast(),
+            gate_up_scale.as_ptr().cast(),
+            gate_up_zero.as_ptr().cast(),
+            down.as_ptr().cast(),
+            down_scale.as_ptr().cast(),
+            down_zero.as_ptr().cast(),
+        );
+        let lut_ms = lut_start.elapsed().as_secs_f64() * 1000.0;
+
+        assert_eq!(lut, scalar);
+        eprintln!(
+            "qwen36_mps_bridge_cpu_pack_lut_microbench scalar_ms={scalar_ms:.3} lut_ms={lut_ms:.3} speedup={:.2}x bytes={}",
+            scalar_ms / lut_ms.max(f64::MIN_POSITIVE),
+            lut.0.len() + lut.1.len() + lut.2.len()
+        );
     }
 
     #[cfg(all(target_os = "macos", supersonic_backend_metal))]
@@ -5269,6 +14394,7 @@ mod tests {
 
         let params = Qwen36MoeFfnStepParams {
             stage: 1,
+            layer_idx: 0,
             hidden: hidden as i32,
             num_experts: num_experts as i32,
             moe_intermediate: 4,
@@ -5427,6 +14553,7 @@ mod tests {
 
             let params = Qwen36MoeFfnStepParams {
                 stage,
+                layer_idx: 0,
                 hidden: hidden as i32,
                 num_experts: num_experts as i32,
                 moe_intermediate: moe_intermediate as i32,
@@ -9509,6 +18636,7 @@ mod tests {
 
         let params = Qwen36MoeFfnStepParams {
             stage: 1,
+            layer_idx: 0,
             hidden: geom.hidden,
             num_experts: geom.num_experts,
             moe_intermediate: geom.moe_intermediate,
@@ -9677,6 +18805,7 @@ mod tests {
 
         let params = Qwen36MoeFfnStepParams {
             stage: 2,
+            layer_idx: 0,
             hidden: geom.hidden,
             num_experts: geom.num_experts,
             moe_intermediate: geom.moe_intermediate,
@@ -9855,6 +18984,7 @@ mod tests {
 
         let params = Qwen36MoeFfnStepParams {
             stage: 3,
+            layer_idx: 0,
             hidden: geom.hidden,
             num_experts: geom.num_experts,
             moe_intermediate: geom.moe_intermediate,
@@ -10022,6 +19152,7 @@ mod tests {
 
         let params = Qwen36MoeFfnStepParams {
             stage: 4,
+            layer_idx: 0,
             hidden: geom.hidden,
             num_experts: geom.num_experts,
             moe_intermediate: geom.moe_intermediate,
@@ -10189,6 +19320,7 @@ mod tests {
 
         let params = Qwen36MoeFfnStepParams {
             stage: 5,
+            layer_idx: 0,
             hidden: geom.hidden,
             num_experts: geom.num_experts,
             moe_intermediate: geom.moe_intermediate,
@@ -10440,6 +19572,7 @@ mod tests {
 
         let params = Qwen36MoeFfnStepParams {
             stage: 2,
+            layer_idx: 0,
             hidden: geom.hidden,
             num_experts: geom.num_experts,
             moe_intermediate: geom.moe_intermediate,
@@ -10681,6 +19814,7 @@ mod tests {
 
         let params = Qwen36MoeFfnStepParams {
             stage: 3,
+            layer_idx: 0,
             hidden: geom.hidden,
             num_experts: geom.num_experts,
             moe_intermediate: geom.moe_intermediate,
@@ -10913,6 +20047,7 @@ mod tests {
 
         let params = Qwen36MoeFfnStepParams {
             stage: 5,
+            layer_idx: 0,
             hidden: geom.hidden,
             num_experts: geom.num_experts,
             moe_intermediate: geom.moe_intermediate,

@@ -823,12 +823,287 @@ Apple M5 Max Metal is the main Apple-silicon target for Qwen3.6 bring-up. The
 current benchmark lane is deliberately narrow: `qwen3.6-35b-a3b` with INT4
 weights on the chained Metal decode path. This section is a performance harness
 checkpoint, not a claim that the HIP feature set has been ported to Metal.
+The latest checkpoint promotes the fused Qwen3.6 stage-5 linear-attention INT4
+Metal path into the default lane, with `SUPERSONIC_METAL_DISABLE_QWEN36_LINEAR_INT4_STAGE5=1`
+kept as the host fallback escape hatch. Decode now lets that native stage-5
+linear path publish directly into the next residual buffer by default, avoiding
+the old `attn_output -> residual` D2D handoff; set
+`SUPERSONIC_METAL_DISABLE_QWEN36_LINEAR_DECODE_DIRECT=1` to retain the older
+handoff for bisection. The default FFN lane remains the host-orchestrated INT4
+fallback, but routed expert gate/up and down work is now batched across top-k
+experts to reduce per-layer thread orchestration. Native FFN projection work
+remains explicit opt-in with
+`SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5=1`; profile runs no longer
+switch the FFN implementation underneath the headline lane. A newer
+gate/up-only tiled routed-expert kernel is also available as a diagnostic
+microbench and explicit decode experiment via
+`SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_GATE_UP_TILED=1`, but it is not
+promoted because the real decode path must still synchronize back to host for
+expert down/finalize. The follow-up combined routed-expert gate/up +
+down/finalize path is available behind
+`SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_TILED_STAGE5=1`; it keeps the
+`expert_mid` workspace device-side, but remains diagnostic-only because the
+real model profile points at command-buffer wait and bake-buffer residency
+rather than raw shader arithmetic. The packed active-expert variant behind
+`SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_PACKED_STAGE5=1` copies only routed
+top-k expert slabs into compact scratch buffers before launching the same
+combined shader. It is a residency attribution experiment, not a default
+runtime path.
+
+The direct-output handoff is an orchestration cleanup, not a new headline
+bottleneck fix. On the 2026-05-24 Apple M5 Max comparison, the default lane
+measured `144.7 ms/token` versus `145.2 ms/token` with
+`SUPERSONIC_METAL_DISABLE_QWEN36_LINEAR_DECODE_DIRECT=1`; HAL `copy_d2d` fell
+from 840 calls / 3.44 MiB to 210 calls / 0.86 MiB. That confirms the old copy
+handoff is avoidable but too small to explain current decode time.
+The lm-head tail now has the same measured-gate treatment:
+`SUPERSONIC_METAL_ENABLE_QWEN36_LM_HEAD_GPU_ARGMAX=1` keeps greedy top-1
+selection on Metal and reads back only the chosen token when full host logits
+are not needed. It remains opt-in until the lm-head tail sweep proves a
+headline and `lm_head_ms_avg` win with generated-ID parity. The first
+four-token smoke preserved IDs `[11, 271, 40, 599]` and lowered full-logit D2H
+from `0.067 ms` total to `0.004 ms`, but failed promotion because
+`lm_head_ms_avg` moved from `9.044` to `9.389 ms`; the measured next lm-head
+idea should fuse top-1 selection into the lm-head tail or change the dense
+matmul shape, not add a separate argmax dispatch.
 
 Reproduce the run with:
 
 ```bash
 SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" cargo run --release -p supersonic-bench --bin bench-perf -- --arch apple-m5-max --models qwen3.6-35b-a3b --quants int4
 ```
+
+The local-main-target workflow for this machine is:
+
+1. quick smoke: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" cargo test --release -p runner --test qwen36_moe_metal_smoke -- --ignored --nocapture`
+2. headline decode gate: the `bench-perf --arch apple-m5-max --models qwen3.6-35b-a3b --quants int4` command above
+3. long-context smoke: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/bench_qwen36_longctx.py --preset smoke`
+4. profile smoke: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/bench_qwen36_longctx.py --preset smoke --metal-profile`
+5. batched-prefill MoE feasibility: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/bench_qwen36_longctx.py --preset smoke --batched-prefill-feasibility`
+6. batched-prefill Metal prototype: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/bench_qwen36_longctx.py --preset smoke --batched-prefill-prototype`
+7. batched-prefill variant sweep: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/sweep_qwen36_batched_prefill_variants.py --metal-profile`
+8. MTP tensor audit: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/audit_qwen36_mtp.py --require-complete-bake`
+9. MTP acceptance/policy probe: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/probe_qwen36_mtp_acceptance.py`
+10. MTP Metal K=1 experiment: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/probe_qwen36_mtp_acceptance.py --metal-experiment`
+11. MTP Metal prompt-suite sweep: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/sweep_qwen36_mtp_acceptance.py --prompt-set smoke --metal-experiment`
+12. static top-N resident-table probe: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/probe_qwen36_static_topn.py`
+13. static top-N warm runtime sweep: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/sweep_qwen36_static_topn_runtime.py --modes default,static,static-hotset,mps-static-partial --metal-profile`
+14. linear decode variant sweep: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/sweep_qwen36_linear_decode.py --prompt-set smoke --metal-profile`
+15. full-attention decode variant sweep: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/sweep_qwen36_full_decode.py --prompt-set smoke --metal-profile`
+16. lm-head tail variant sweep: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/sweep_qwen36_lm_head_tail.py --prompt-set smoke --metal-profile`
+17. MPS resident-table viability probe: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/probe_qwen36_mps_resident_table.py --run-pilot --require-pilot`
+18. route residency sweep: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/sweep_qwen36_route_residency.py --prompt-set smoke`
+19. LRU resident-cache sweep: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/sweep_qwen36_lru_resident_cache.py --capacities 32,64 --metal-profile`
+20. fused routed INT4 sweep: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/sweep_qwen36_fused_routed_int4.py --prompt-set smoke --metal-profile`
+21. SOTA gate refresh plan: `python3 tests/metal/refresh_qwen36_sota_gates.py --max-age-hours 24`
+22. SOTA gate summary: `python3 tests/metal/summarize_qwen36_sota_gates.py --require --max-age-hours 24`
+23. next bottleneck selector: `python3 tests/metal/select_qwen36_next_bottleneck.py --require-selected`
+24. routed-expert FFN microbench: `target/release/qwen36_ffn_expert_microbench --iters 20 --warmup 3`
+24. long-context comparison: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" python3 tests/metal/bench_qwen36_longctx.py --preset comparison`
+
+The Metal long-context harness writes `target/qwen36_metal_longctx.json` and
+`target/qwen36_metal_longctx.md`. It uses deterministic NIAH-style prompts and
+the supported `int4` Metal lane only, then reports generated-token sanity,
+NIAH hit/miss, `stage_timings`, `chain_breakdown`, and `lifecycle_timings`.
+When `--metal-profile` is set, the harness also records parsed `metal_profile`
+and `hal_profile` summaries from the machine-readable profile lines. When
+`--batched-prefill-feasibility` is set, the harness still forces the known-good
+Metal per-token prefill path, but it enables route capture and records
+`batched_prefill_feasibility` rows that summarize the grouped-MoE permutation
+metadata a future Metal prefill kernel would consume: profiled tokens, chunks,
+expert segments, average rows per touched expert, and WMMA16 assignment
+coverage. It also emits `[qwen36-batched-prefill-plan]` rows for candidate
+64/128/256/512/1024-token chunks, recording scalar tail assignments, WMMA16
+padded assignments, and padding overhead. With `--batched-prefill-prototype`,
+the harness sets
+`SUPERSONIC_QWEN36_MOE_METAL_BATCHED_PREFILL_PROTOTYPE=1` and runs the
+experimental Metal batched-prefill path: Metal batched full-attention plus a
+direct routed-expert INT4 gate/up and down/combine kernel pair, with
+router/top-k and shared-expert work still on the existing host/primitive path.
+`--batched-prefill-variant` names the measured env-gated prototype probes
+without requiring hand-built environment overrides: `linear-direct-off`,
+`full-attn-tmajor`, `split-qgate`, `router-topk`, and `fused-residual`.
+The harness records the selected variant and its env overrides per row so A/B
+comparison outputs are self-describing. The long-context JSON schema is now
+`qwen36-moe-metal-longctx-bench-v5` and
+records `batched_prefill_prototype` at top level plus
+`metal_batched_prefill_prototype` and `batched_prefill_variant` per row;
+feasibility rows remain under `batched_prefill_plans`; set
+`SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL_PLAN_CHUNKS=...` to override the planner
+chunk list without adding a SuperSonic CLI flag.
+`tests/metal/sweep_qwen36_batched_prefill_variants.py` wraps those variant
+knobs into a parity-preserving A/B harness. It runs the supported `baseline`
+mode plus `prototype-default` and the named prototype variants against the same
+deterministic NIAH prompt per context, then writes
+`target/qwen36_metal_batched_prefill_variant_sweep.{json,md}` with generated ID
+parity, prefill ratios versus baseline, lifecycle/stage rows, optional
+Metal/HAL profiles, and the exact variant/env gate used by each row. Its v2
+schema adds a nonfatal `promotion_gate` summary: a candidate must preserve
+generated IDs, improve prefill, headline decode, and `ffn_ms_avg`, avoid more
+than the configured full-attention/linear-attention/lm-head regression ratio,
+and include non-regressed `command_buffer_wait` profile evidence unless
+`--no-promotion-require-profile` is used.
+The 512-token smoke is a real prefill run and is slow on the current chained
+Metal path; use `--preset comparison` as a long-running sweep before selecting
+the next runtime optimization target. The first v3 feasibility smoke on this
+machine profiled 417 prefill tokens and showed the 512/1024-token plans tied at
+one chunk with 82.7% WMMA16 assignment coverage, 23,048 scalar-tail assignments,
+and 54.6% WMMA16 padding overhead. Chunk 64 fell to 37.3% WMMA16 coverage and
+228.0% padding overhead, so the first Metal grouped-compute prototype should
+start at the moderate/full-prompt chunk end, not tiny chunks.
+The first opt-in prototype smoke on this machine used the 512-token preset and
+generated the same `[271]` one-token sanity row. In normal mode it measured
+22.15s prefill, 268.55 ms/token decode, and no NIAH hit because only one token
+was requested. The profiled variant measured 34.20s prefill and 253.74
+ms/token decode; profile overhead was expected because that run split the
+routed-expert phases. Current profile runs keep Qwen3.6 FFN phases aggregate by
+default and only restore those per-phase waited command buffers when
+`SUPERSONIC_METAL_PROFILE_QWEN36_FFN_PHASES=1` is set. The split profile rows
+showed `qwen36_batched_prefill_grouped_expert_direct` at 5.024s native wall
+across 40 layers, GPU timestamps of 1.903s for
+`command_buffer_gpu:qwen36_batched_prefill_grouped_expert_gate_up` and 2.045s
+for `command_buffer_gpu:qwen36_batched_prefill_grouped_expert_down_combine`,
+while `command_buffer_wait` was still the top Metal row at 33.184s and HAL
+`copy_h2d` accounted for 4.335s. On Apple UMA this is buffer
+materialization/copy bookkeeping rather than PCIe upload.
+
+The next measured slice removes the shared-expert scalar-gate host broadcast in
+the Metal batched-prefill prototype. A native BF16 row-scalar sigmoid multiply
+keeps the `[N, 1]` gate on Metal and writes the `[N, hidden]` shared output
+directly. The follow-up 512-token normal prototype smoke measured 12.47s
+prefill and 172.54 ms/token with the same `[271]` generated-token sanity row.
+The profiled run still carries heavy attribution overhead, but the new
+`sigmoid_mul_row_scalar` row itself is small: 40 calls, 11.859 ms native wall,
+and 0.725 ms GPU timestamp total. It also removes 40 D2H scalar-gate reads, 40
+expanded-gate H2D writes, 40 transient temp allocations, and about 68 MB of D2D
+traffic from the prior prototype profile. The remaining top rows are
+`command_buffer_wait`, `qwen36_linear_int4_stage5`,
+`qwen36_batched_prefill_grouped_expert_direct`, and
+`full_attention_prefill_strided`; HAL `copy_h2d` is still dominated by
+materializing the baked model buffers. That makes the next measured target
+prefill orchestration, linear-attention command-buffer volume, full-attention
+prefill, and routed-expert direct work, not per-token MPS slab materialization.
+
+The next orchestration slice targets `qwen36_linear_int4_stage5`, which had
+12,540 waited calls in the profiled 512-token run. The normal Metal prototype
+now keeps the native stage-5 temporary output separate from the final residual
+destination, opens one Metal batch per linear-attention layer, and writes final
+rows directly into `chunk_hidden`; this removes the per-token CPU D2D row copy
+and collapses the waited linear submits for normal runs. Attribution runs keep
+the old waited path when `SUPERSONIC_METAL_PROFILE=1` so the per-phase profile
+rows stay comparable. On the 512-token smoke, the direct-off control
+(`SUPERSONIC_QWEN36_MOE_METAL_LINEAR_PREFILL_DIRECT=0`) measured 13.30s
+prefill and 191.99 ms/token with `[271]`; the direct-row batch measured 10.89s
+prefill and 179.14 ms/token with the same generated ID. The next measured
+targets remain full-attention prefill and routed-expert direct compute, while a
+proper batched linear-attention kernel would be the larger follow-up.
+
+The full-attention follow-up keeps only allocation reuse on by default. The
+batched prefill path now reuses Q-after-norm, K-after-norm, and KV-prefix
+scratch buffers instead of allocating them inside every full-attention layer.
+Two apparent layout fixes were measured but left opt-in because they did not
+beat the default path on the 512-token Metal smoke: direct time-major KV
+attention via `SUPERSONIC_QWEN36_MOE_METAL_FULL_ATTN_TMAJOR=1` measured 11.09s
+prefill, and native Q/gate splitting via
+`SUPERSONIC_QWEN36_MOE_METAL_SPLIT_QGATE=1` measured 11.00s prefill. With both
+probes disabled, the default path measured 10.73s prefill and generated the
+same `[271]` sanity row. The measured next bottleneck remains routed expert
+compute/residency, not these full-attention layout probes.
+
+Two routed-FFN micro-orchestration probes are also measured negative and remain
+opt-in only. `SUPERSONIC_QWEN36_MOE_METAL_FUSED_FFN_RESIDUAL=1` fuses
+`chunk_hidden += combined` and `chunk_hidden += shared_out` into one Metal
+kernel while preserving the two BF16 rounding points, but measured 11.03s
+prefill versus a 10.65s disabled-path control. `SUPERSONIC_QWEN36_MOE_METAL_ROUTER_TOPK=1`
+is the matching router probe: it runs router softmax/top-k on Metal and batches
+it with routed expert direct in normal runs. It preserves the `[271]` sanity
+row, but measured 11.63s prefill versus an 11.05s host-top-k control. The
+default lane keeps both off. The next FFN work should target routed expert
+compute/residency, not standalone router top-k or residual-add reshuffling.
+`tests/metal/audit_qwen36_mtp.py` is the speculative-decode readiness audit. It
+checks the source snapshot for the split MTP expert tensors and the INT4 bake
+for the 19 folded `mtp.*` tensors loaded by the runtime. On this local M5 Max
+cache, the audit reports `source=complete` with 1,560 `mtp.*` tensors and
+`bake=complete` with all 19 runtime MTP tensors, so the model files are ready
+for the MTP acceptance gate. The runner now emits a machine-readable
+`[qwen36-mtp-acceptance]` row when
+`SUPERSONIC_QWEN36_MTP_ACCEPTANCE_PROFILE=1` or `--emit-stage-timings` is used
+with speculative decode. The row records drafted tokens, accepted tokens,
+acceptance rate, emitted tokens, base verify steps, batched replay steps, and
+target steps per emitted token. `tests/metal/probe_qwen36_mtp_acceptance.py`
+captures that telemetry on enabled backends and records the expected
+`policy_blocked` result on Metal today. Metal speculative decode remains
+unsupported by default. For measurement only, `--metal-experiment` sets
+`SUPERSONIC_QWEN36_METAL_MTP_EXPERIMENT=1` and runs the sequential K=1 Metal
+path. The probe forces `SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL=0` on Metal so
+the experiment does not accidentally enter the HIP/CUDA-only grouped prefill
+launcher. Batched verify and K>1 promotion remain blocked until that row
+reports real acceptance without mixing the result into FFN latency. The first
+local K=1 smoke completed in 24.3s with `drafted_tokens=2`,
+`accepted_tokens=1`, `acceptance_rate=0.5`, and
+`target_steps_per_emitted=1.0`; this proves the Metal path can run and measure
+acceptance, but it is not a throughput win by itself because every emitted token
+still required one target-model step. `tests/metal/sweep_qwen36_mtp_acceptance.py`
+extends that one-prompt result across a smoke or comparison prompt suite and
+writes aggregate `drafted_tokens`, `accepted_tokens`, `acceptance_rate`, and
+`target_steps_per_emitted` rows to
+`target/qwen36_mtp_acceptance_sweep.{json,md}`. The sweep now reports a
+machine-readable `promotion_gate` using aggregate acceptance and target-model
+steps per emitted token, and `--metal-profile` preserves parsed Metal/HAL
+attribution rows for each prompt. The first smoke sweep completed both rows in
+34.7s: the profiling prompt accepted 0/2 drafts, the coding prompt accepted
+1/2 drafts, aggregate acceptance was 25.0%, and aggregate
+`target_steps_per_emitted` remained 1.0. This keeps K=1 as an instrumentation
+path, not a supported-speed path.
+`tests/metal/probe_qwen36_static_topn.py` is the first static resident-table
+probe. The runner now has gated machine-readable route dumps:
+`SUPERSONIC_QWEN36_ROUTE_PROFILE_DUMP_TOPN_LAYERS=1` emits
+`[qwen36-route-topn-layer]` rows with per-layer expert IDs and counts, while
+`SUPERSONIC_QWEN36_ROUTE_PROFILE_DUMP_CALLS=1` emits `[qwen36-route-call]`
+rows for real active expert sets. The probe uses those rows to build static
+top-N sets from a calibration prompt, evaluate them against a separate
+coding-shaped prompt, export a `static_tables` JSON object for runtime probes,
+and size both native INT4 resident tables and resident FP16 MPS RHS tables. For
+Qwen3.6 geometry, each resident expert costs roughly 1.50 MiB as native INT4
+packed weights plus GPTQ sidecars, or 6 MiB of FP16 MPS RHS data (gate/up plus
+down). Capacities 2/4/8/16 across 40 layers imply about
+0.12/0.23/0.47/0.94 GiB for native INT4 residency and
+0.47/0.94/1.88/3.75 GiB for FP16 RHS residency before h_norm/output scratch or
+miss fallback.
+The packed native INT4 static-table runtime probe is opt-in on top of the
+packed stage-5 path:
+`SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_PACKED_STAGE5=1`,
+`SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_STATIC_TOPN=1`,
+`SUPERSONIC_METAL_QWEN36_FFN_EXPERT_STATIC_TOPN_FILE=target/qwen36_static_topn_mps_probe.json`,
+and optionally
+`SUPERSONIC_METAL_QWEN36_FFN_EXPERT_STATIC_TOPN_CAPACITY=<N>`. It uses a
+per-layer resident native INT4 table on full hits and falls back to the
+existing packed/hotset path when any active expert is missing.
+The first local two-prompt smoke used a profiling/agentic calibration prompt
+and a coding-shaped evaluation prompt at context 256. It collected 160
+calibration top-N rows and 880 evaluation route calls. Assignment coverage on
+the evaluation prompt was 9.1%/14.9%/23.1%/35.8% for capacities 2/4/8/16, and
+capacity 16 fully covered only 0.5% of layer calls, leaving 876/880 calls on the
+miss fallback. The result is a useful negative gate: a small static resident MPS
+table is unlikely to beat the default path unless the fallback is very cheap or
+the table is prompt/domain-specialized.
+
+Current 512-token `--metal-profile` smoke checkpoint on this M5 Max after the
+FFN fallback tightening and profile parser work:
+
+| Context | total ms/tok | tok/s | prefill s | lm-head ms | full-attn ms | linear-attn ms | FFN ms | likely row bottleneck | top Metal op |
+|---:|---:|---:|---:|---:|---:|---:|---:|:---|:---|
+| 512 | 269.24 | 3.71 | 71.71 | 97.92 | 33.60 | 73.31 | 63.96 | lm-head | `qwen36_ffn_int4_stage5` |
+
+The original 512-token smoke measured roughly 2598.56 ms/token with
+prefill_total_ms=1001228.792 and FFN as the top per-token stage. The first
+row-parallel FFN pass cut prefill to roughly 553 seconds and moved the measured
+bottleneck to linear-attention; follow-up linear-attention and full-attention
+projection passes cut prefill to roughly 160 seconds. The current profiled
+smoke cuts prefill to roughly 72 seconds, records a clear NIAH miss row, and
+shows two distinct bottlenecks: the one-token row is lm-head/tail dominated,
+while Metal profile totals are still dominated by the FFN stage and
+`command_buffer_wait`.
 
 Capture the native Metal hardware profile before starting runtime optimization:
 
@@ -864,33 +1139,545 @@ optimization step is MPP/Metal-Tensor or MLX interop for large dense phases, not
 another single occupancy tweak.
 
 The harness records a warmup plus median-of-3 headline run at
-`--max-new-tokens 16`, then performs one additional `--emit-stage-timings`
+`--max-new-tokens 16`, then performs one additional unprofiled
+`--emit-stage-timings` attribution run and a separate Metal/HAL profile
 attribution run. For this Metal lane it also forces the dense prefill token loop
 (`SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL=0` and
 `SUPERSONIC_QWEN36_DENSE_PREFILL_TOKEN_LOOP=1`) because the default Qwen3.6
 batched prefill router-permute path is HIP/CUDA-only. The attribution run also
 enables `SUPERSONIC_METAL_QWEN36_MPP_PILOT=1`, which emits a separate
-`[qwen36-moe mpp-pilot]` row for repeated exact `64x32x64` MPP tiles. This is a
-runtime-adjacent MPP pilot measurement, not a model matmul replacement. The
-attribution maps are stored in the same perf JSON as `stage_timings`,
-`chain_breakdown`, `lifecycle_timings`, and `mpp_pilot` without feeding back
-into the headline median.
+`[qwen36-moe mpp-pilot]` row for repeated exact `64x32x64` MPP tiles. It also
+enables `SUPERSONIC_METAL_QWEN36_MPS_EXPERT_PILOT=1`, which emits a resident
+FP16 Metal Performance Shaders row for Qwen3.6 active-expert GEMV shapes. It
+also enables `SUPERSONIC_METAL_PROFILE=1` only for the profile attribution run
+so the profile JSON includes `metal_profile` and `hal_profile` objects with
+parseable per-op rows without replacing the unprofiled stage table. These are
+runtime-adjacent MPP/MPS pilot measurements, not model matmul replacements. The
+attribution maps are stored in the same schema-v9 perf JSON as
+`stage_timings`, `chain_breakdown`, `lifecycle_timings`, `mpp_pilot`,
+`mps_expert_pilot`, `metal_profile`, and `hal_profile` without feeding back into
+the headline median. When the profile pass carries extra split-dispatch
+overhead, its timing maps are kept separately as `profile_stage_timings`,
+`profile_chain_breakdown`, and `profile_lifecycle_timings`. Schema v9 also
+preserves typed Qwen3.6 expert-residency policy rows with `resident_format`,
+`scope`, `miss_policy`, `capacity`, and the numeric counters so perf artifacts
+retain the scheduler identity, and `meta.json` records git dirty paths plus a
+worktree diff hash so selector auto-discovery consumes only artifacts matching
+the current checkout unless a historical JSON is supplied explicitly.
+
+Qwen3.6 linear stage-5 profile attribution is aggregate by default: the
+ordinary `SUPERSONIC_METAL_PROFILE=1` pass keeps `qwen36_linear_int4_stage5` as
+one native profile row and one GPU timestamp row. Use
+`SUPERSONIC_METAL_PROFILE_QWEN36_LINEAR_PHASES=1` only for explicit phase
+attribution; it restores the per-phase waited command buffers for
+`qwen36_linear_int4_input_norm`, projections, recurrent update, output gate,
+and out-proj finalize. This keeps default perf JSON from promoting
+phase-profile wait overhead into the next-bottleneck decision.
 
 <!-- AUTOGEN BELOW: apple-m5-max-metal -->
 | Model           |  INT4 |
 | --------------- | ----: |
-| qwen3.6-35b-a3b | 2374.6 |
+| qwen3.6-35b-a3b | 162.6 |
 
 <!-- AUTOGEN END: apple-m5-max-metal -->
 
+Latest local attribution run
+(`target/bench-runs/2026-05-24-aa72613/perf/qwen3.6-35b-a3b_int4.json`):
+
+| Metric | Value |
+|---|---:|
+| Headline median | 145.5 ms/token |
+| Stage total | 139.930 ms/token |
+| Profile stage total | 174.814 ms/token |
+| Chain | 134.301 ms/token |
+| LM head | 5.393 ms/token |
+| FFN | 89.297 ms/token |
+| Linear attention | 28.690 ms/token |
+| Profile linear attention | 60.827 ms/token |
+| Full attention | 16.113 ms/token |
+| Prefill total | 801.291 ms |
+| MPP pilot | 9.958 TFLOP/s |
+| MPS expert pilot gate/up | 0.915 ms, 3.666 TFLOP/s |
+| MPS expert pilot down | 0.338 ms, 4.961 TFLOP/s |
+
+The headline median is the unprofiled median-of-3 run (`150.4`, `145.5`,
+`141.8` ms/token). Current schema-v9 runs store unprofiled stage timings in
+`stage_timings` and preserves the split-profile timing maps under the
+`profile_*` fields; the profile pass still shows `qwen36_linear_int4_stage5`
+and `command_buffer_wait` as the top Metal rows, but the normal stage table no
+longer charges the seven-way linear profiling split to `linear_attn_ms_avg`.
+The latest linear INT4 projection kernel consumes both nibbles from each
+packed byte per lane load, preserving BF16 dequant rounding while halving the
+packed-byte traffic for the projection and out-proj inner loops. Against the
+previous schema-v8 run (`162.6 ms/token`, `linear_attn_ms_avg=31.335`), this
+measured `145.5 ms/token` and `linear_attn_ms_avg=28.690`; split-profile GPU
+rows show `qwen36_linear_int4_projections` dropping from `175.821 ms` to
+`70.896 ms` total and `qwen36_linear_int4_out_proj_finalize` from `58.545 ms`
+to `28.171 ms` total. Follow-up beta/g recurrent-update hoist probes were
+measured and rejected: moving beta/g into the q/k repeat dispatch was headline
+flat (`145.1 ms/token`) and regressed split recurrent/qk rows, while a
+lane-0 threadgroup variant was also headline flat (`145.6 ms/token`) with a
+slower split recurrent row. Keep the paired-nibble kernel as the default
+linear-attention state. A default one-token smoke generated the expected token
+`[11]`;
+the latest local cold one-token profile measured `ffn_ms_avg=128.573`,
+with `qwen36_ffn_host_expert_gate_up` at 56.839 ms total and
+`qwen36_ffn_host_expert_down` at 36.181 ms total. The explicit full native FFN
+escape hatch also generated `[11]`, but remains too slow to promote
+(`ffn_ms_avg=640.553` in the same one-token smoke shape).
+
+The 2026-05-25 host INT4 dequant LUT updates supersede the `145.5 ms/token`
+baseline for the default lane. The FFN host dot helpers first moved to a
+16-entry BF16-rounded dequant table per scale/zero group, avoiding per-element
+BF16 rounding in the inner loop. A follow-up precomputes the active dense and
+top-k expert tables once per layer/token before the row-parallel dot loops,
+removing repeated table construction from the hot rows.
+
+The follow-up Metal linear INT4 update groups packed-byte dot loops by their
+GPTQ scale column inside the native `qwen36_linear_int4_stage5` projection and
+out-projection kernels. That reuses each scale/zero pair across its 128-value
+group instead of recomputing the sidecar index and reloading the pair for every
+packed byte.
+
+The latest FFN host router update parallelizes the 256-row BF16 router-logit
+matvec after the h_norm write, then reuses that h_norm snapshot through the
+later host FFN phases. The current Apple M5 Max `bench-perf` run
+(`target/bench-runs/2026-05-25-7ec91da/perf/qwen3.6-35b-a3b_int4.json`)
+measured median `96.5 ms/token` with samples `108.8`, `96.5`, `96.1`.
+Unprofiled attribution is now `ffn_ms_avg=60.912`,
+`linear_attn_ms_avg=19.545`, `full_attn_ms_avg=11.610`, and
+`lm_head_ms_avg=4.514`; the one-token Metal smoke still generated `[11]`.
+The follow-up host orchestration update routes the hot Qwen3.6 host row helpers
+through a persistent worker pool with atomic countdown completion instead of
+spawning scoped threads for every router/shared/expert phase. The current Apple
+M5 Max `bench-perf` run
+(`target/bench-runs/2026-05-25-fb8eb60-12/perf/qwen3.6-35b-a3b_int4.json`)
+measured median `88.3 ms/token`, improving the `96.5 ms/token` router baseline.
+Unprofiled attribution is now `ffn_ms_avg=53.543`,
+`linear_attn_ms_avg=19.088`, `full_attn_ms_avg=10.232`, and
+`lm_head_ms_avg=4.928`; the one-token Metal smoke still generated `[11]`.
+Profile attribution still names `qwen36_linear_int4_stage5` and
+`command_buffer_wait` as the top rows, followed by FFN host expert gate/up and
+down.
+
+The next retained FFN arithmetic cleanup keeps the exact INT4 LUT dequant
+semantics, but shares an inlined paired-nibble accumulator across dense and
+expert LUT dot products so each inner group consumes eight packed bytes per
+loop body. The current Apple M5 Max `bench-perf` run
+(`target/bench-runs/2026-05-25-e7d8c04/perf/qwen3.6-35b-a3b_int4.json`)
+measured samples `85.2`, `86.2`, `89.4` with unprofiled
+`total_ms_avg=85.877`. Attribution is now `ffn_ms_avg=51.564`,
+`linear_attn_ms_avg=19.102`, `full_attn_ms_avg=9.987`, and
+`lm_head_ms_avg=4.602`; the one-token Metal smoke still generated `[11]`.
+Profile attribution has FFN expert gate/up at `554.605 ms` total and expert
+down at `305.734 ms`, so the next real target is still a larger routed expert
+compute/residency step rather than more router work.
+
+The following compute-path update splits the same paired-nibble LUT dot loop
+into independent accumulators, reducing the long scalar dependency chain while
+staying within the existing FFN parity tolerance. The current Apple M5 Max
+`bench-perf` run
+(`target/bench-runs/2026-05-25-0c3f940/perf/qwen3.6-35b-a3b_int4.json`)
+measured samples `83.6`, `78.0`, `73.7` with unprofiled
+`total_ms_avg=72.762`. Attribution is now `ffn_ms_avg=42.501`,
+`linear_attn_ms_avg=17.073`, `full_attn_ms_avg=8.078`, and
+`lm_head_ms_avg=4.638`; the one-token Metal smoke still generated `[11]`.
+Profile attribution shows FFN expert gate/up reduced to `457.864 ms` total and
+expert down to `266.605 ms`. FFN remains the selected bottleneck, but the next
+candidate needs to be a larger routed expert compute/residency path rather than
+another reduction-loop cleanup.
+
+The retained AArch64 host INT4 LUT dot path uses NEON table lookup to
+materialize BF16-rounded weights from packed nibbles and accumulates four F32
+vectors per eight packed bytes. The confirmation `bench-perf` run
+(`target/bench-runs/2026-05-25-822b7d7-4/perf/qwen3.6-35b-a3b_int4.json`)
+measured median `61.5 ms/token` with samples `61.5`, `66.2`, `57.9`, improving
+the previous `78.0 ms/token` checkpoint. Unprofiled attribution was
+`ffn_ms_avg=32.238`, `linear_attn_ms_avg=16.016`,
+`full_attn_ms_avg=5.800`, and `lm_head_ms_avg=4.336`.
+
+The latest default-lane cleanup removes the per-layer `h_norm` heap copy from
+the Qwen3.6 Metal host FFN fallback. The normalized BF16-rounded row is already
+resident in the FFN workspace, so router/shared/expert host phases now read it
+from there while writing disjoint workspace regions. This keeps the same INT4
+dot arithmetic and generated-token behavior; it only trims host allocation and
+copy overhead. The first `bench-perf` run
+(`target/bench-runs/2026-05-25-d20a655-8/perf/qwen3.6-35b-a3b_int4.json`)
+measured median `58.1 ms/token` with samples `58.1`, `58.9`, `57.9`; the repeat
+(`target/bench-runs/2026-05-25-d20a655-9/perf/qwen3.6-35b-a3b_int4.json`)
+confirmed median `58.3 ms/token` with samples `58.3`, `60.3`, `58.2`. The
+repeat stage table is `ffn_ms_avg=32.611`, `linear_attn_ms_avg=15.954`,
+`full_attn_ms_avg=5.737`, and `lm_head_ms_avg=4.659`. Profile attribution still
+names `command_buffer_wait` (`993.270 ms`) and `qwen36_linear_int4_stage5`
+(`992.118 ms`) first, followed by FFN host expert gate/up (`436.736 ms`) and
+down (`245.985 ms`), so the next measured target is the Metal linear stage/wait
+pair plus the remaining FFN expert rows.
+
+The closeout long-context pass confirms that decode has improved enough for
+prefill stability and orchestration to be the next Apple target. The interrupted
+comparison run completed usable console rows for 512 and 2048 requested context
+tokens: 512 measured `72.683 ms/token` (`13.758 tok/s`) with
+`prefill_total_ms=22799.604`, while 2048 measured `159.044 ms/token`
+(`6.288 tok/s`) with `prefill_total_ms=159455.302`. Both rows missed the NIAH
+answer with the short generation cap used for the smoke. A separate recorded
+8192-token no-warmup row wrote
+`target/qwen36_metal_longctx_8192_final.{json,md}` after `1431.64s`, but
+returned `-11` before generated IDs, stage timings, or lifecycle timings were
+emitted. The prompt did contain the expected needle (`SSB-NEEDLE-68696`), so
+this is a runtime stability/long-prefill failure, not a prompt construction
+failure. Treat 512/2048 as the current long-context performance evidence and
+8192 as a failing gate that must be fixed before claiming long-context support
+on Metal.
+
+The focused routed-expert microbench exercises the exact Qwen3.6 stage-5 INT4
+shape (`hidden=2048`, `num_experts=256`, `moe_intermediate=512`, `top_k=8`,
+`group_size=128`) without the rest of decode:
+
+```bash
+cargo build --release -p runner --bin qwen36_ffn_expert_microbench
+target/release/qwen36_ffn_expert_microbench --iters 20 --warmup 3
+```
+
+The binary reports gate/up-only, the original combined tiled stage-5 path, the
+direct-gather fused routed INT4 path, and the GPU-pack fused routed INT4 path.
+All four rows use the same synthetic Qwen3.6 stage-5 geometry and validate
+against the CPU oracle, so the GPU-pack row is the apples-to-apples microbench
+for the route-sweep fallback when static residency misses too often.
+
+On this M5 Max, the four-row Metal validation run reports `mean_ms=0.5351` for
+gate/up, `0.4984` for the original combined stage-5 path, `0.3369` for
+direct-gather fused stage-5, and `0.5331` for GPU-pack fused stage-5; every row
+has `mismatches=0`. Wired into decode with
+`SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_GATE_UP_TILED=1`, the same kernel
+still generates `[11]`, and the Metal profile shows only 8.418 ms total GPU
+time for `command_buffer_gpu:qwen36_ffn_int4_expert_gate_up_tiled` across
+40 layers. The wall-time op row is much worse, however:
+`qwen36_ffn_int4_expert_gate_up_tiled` records 277.396 ms total because each
+layer must wait before the host expert-down path reads `expert_mid`. That makes
+the gate/up-only decode experiment a diagnostic step, not the default path.
+
+The combined opt-in path with
+`SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_TILED_STAGE5=1` also generates
+`[11]`, but it is not promotable. An unprofiled one-token smoke measured
+`ffn_ms_avg=1276.670`; the profiled one-token smoke measured
+`ffn_ms_avg=1458.677`, with
+`qwen36_ffn_int4_expert_gate_up_down_finalize_tiled` at 1414.646 ms wall time
+across 40 layers, but only 19.760 ms total GPU time for
+`command_buffer_gpu:qwen36_ffn_int4_expert_gate_up_down_finalize_tiled`.
+`command_buffer_wait` accounts for 1561.827 ms total in the same run. The
+combined microbench proves the arithmetic path is cheap on synthetic resident
+buffers; the real decode path is now pointing at command-buffer waits plus
+large GPTQ bake-buffer residency/page movement.
+
+The packed active-expert path is the first residency experiment on the real
+model. With `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_PACKED_STAGE5=1`, the
+unprofiled one-token smoke still generates `[11]` and improves the pathological
+combined path to `337.4 ms/token` with `ffn_ms_avg=177.706`. The profiled run
+measures `376.1 ms/token`, `ffn_ms_avg=184.798`, `100.287 ms` total in
+`qwen36_ffn_int4_expert_pack_stage5`, `43.556 ms` total in
+`qwen36_ffn_int4_expert_packed_stage5`, and `21.075 ms` total GPU time for the
+combined shader. `command_buffer_wait` drops from the pathological
+`1561.827 ms` to `182.291 ms`, so packing confirms that the giant expert
+buffers caused most of the previous wall time. It is still slower than the
+default FFN lane because the per-token CPU pack copies active expert slabs from
+every layer. The next runtime optimization should therefore focus on persistent
+hot-expert packing, prefetch/residency reuse across tokens, or an MPS/MPP-backed
+expert matvec bridge before any routed-expert FFN path is made default.
+
+A follow-up reuse-cache probe is intentionally opt-in behind
+`SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_PACK_CACHE=1` while the packed expert
+path is enabled. On a four-token profiled smoke, the cache preserved the same
+tokens `[11, 353, 599, 264]` and reduced HAL alloc/free churn from 2431/2431
+calls to 1711/1471 calls, but it did not improve latency: the cached run
+measured `234.7 ms/token`, `ffn_ms_avg=128.730`, and `280.597 ms` total in
+`qwen36_ffn_int4_expert_pack_stage5`; the no-cache control measured
+`217.6 ms/token`, `ffn_ms_avg=126.803`, and `248.724 ms` in the same pack bucket.
+That rules out a simple per-layer scratch-slab cache as the next promotion
+target. The next FFN work should either keep packed experts resident without
+recopying on route churn, or move the expert matvecs to a Metal Performance
+Shaders / MPP bridge that avoids the CPU slab-pack step entirely.
+Profile runs now emit `[qwen36-expert-residency]` plus one
+`[qwen36-expert-residency-policy]` row per resident expert policy. The legacy
+`[qwen36-pack-cache]` line is still emitted for older parsers. A four-token
+Apple M5 Max profile with the packed expert path and exact-route pack cache
+enabled generated `[11, 353, 599, 264]` and measured
+`279.5 ms/token`, `ffn_ms_avg=162.420`, and
+`qwen36_ffn_int4_expert_pack_stage5=384.124 ms` across 160 layer calls. The
+cache profile reported `calls=160`, `entries=40`, `exact_hits=0`,
+`route_refills=120`, `allocations=40`, and `copied_bytes=2014248960`, with
+`avg_copy_bytes=12589056` per refill/allocation. That confirms the scratch cache
+is saving allocation churn but not slab-copy churn: every post-allocation layer
+call saw a different active-expert set. The next packed-path experiment needs a
+larger resident hot set or a different addressing scheme; an exact-route
+per-layer cache is not worth promoting.
+
+The resident hot-set follow-up is opt-in behind
+`SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_PACK_HOTSET=1`; capacity defaults to
+16 and can be set with
+`SUPERSONIC_METAL_QWEN36_FFN_EXPERT_HOTSET_CAPACITY`. It reuses the same packed
+kernel but maps each top-k expert to a resident slot, so only slot misses are
+recopied. The 16-slot Apple M5 Max profile preserved `[11, 353, 599, 264]` and
+cut copied bytes to `1356470784`, with `slot_hits=418`, `slot_misses=862`,
+`slot_hit_rate=0.326562`, and `evictions=222`, but measured `298.0 ms/token`
+and `ffn_ms_avg=161.142`. A 32-slot run avoided evictions and improved host pack
+time to `337.429 ms`, but copied bytes barely changed (`1345455360`) and wall
+time worsened to `304.2 ms/token`, with
+`qwen36_ffn_int4_expert_packed_hotset_stage5=185.272 ms`. That rules out a
+straight LRU hotset as the next promotion path.
+
+The static top-N resident follow-up is opt-in behind
+`SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_STATIC_TOPN=1` while the packed
+expert path is enabled. It loads `static_tables` from
+`SUPERSONIC_METAL_QWEN36_FFN_EXPERT_STATIC_TOPN_FILE`, chooses the largest
+exported capacity unless
+`SUPERSONIC_METAL_QWEN36_FFN_EXPERT_STATIC_TOPN_CAPACITY` is set, and fills a
+per-layer native INT4 resident table once. Full-hit calls remap top-k experts
+to resident slots and run `qwen36_ffn_int4_expert_packed_static_topn_stage5`;
+misses record `miss_policy=static_topn` in the expert-residency profile and
+fall through to the existing packed/hotset/default path.
+The first Apple M5 Max one-token smoke used the regenerated v2 probe table.
+The probe's capacity-64 row covered 69.858% of evaluation assignments, and the
+runtime smoke preserved generation parity with `[11]`. It is not a latency win
+on the cold first token: `decode_ms=507`, `ffn_ms_avg=369.071`, and the
+residency profile reported `exact_hits=9/40`, `slot_hit_rate=0.731250`, and
+`copied_bytes=879660288` for static-table allocations. That validates the
+runtime wiring and miss fallback, but leaves promotion blocked on warm
+multi-token reuse and/or a cheaper hybrid fallback for the 31/40 non-full-hit
+layer calls.
+`tests/metal/sweep_qwen36_static_topn_runtime.py` is the follow-up warm-token
+comparison harness for that question. It runs separate process rows for modes
+such as `default`, `static`, and `static-hotset`, keeps generated IDs as the
+per-prompt parity key, and records stage timings, chain breakdown, lifecycle
+timings, expert-residency totals, and per-policy rows in
+`target/qwen36_static_topn_runtime_sweep.{json,md}`. With `--metal-profile`
+it also preserves parsed `metal_profile` and `hal_profile` objects per row and
+renders the top Metal/HAL attribution in Markdown, which makes the comparison
+prompt set usable as a profiling gate rather than a Hello-only smoke. The v3
+schema adds a nonfatal `promotion_gate`: a resident mode must preserve
+generated IDs versus `default`, improve headline ms/token and `ffn_ms_avg`,
+keep full-attention, linear-attention, and lm-head inside the configured
+regression ratio, and include non-regressed `command_buffer_wait` profile
+evidence unless `--no-promotion-require-profile` is used.
+The first four-token smoke preserved `[11, 353, 599, 264]` across all three
+modes but ruled out promotion: default measured `decode_ms=702` and
+`ffn_ms_avg=98.761`, static measured `decode_ms=951`, `ffn_ms_avg=177.563`,
+`exact_hits=10/160`, `slot_hit_rate=0.508594`, and `copied_bytes=980372736`,
+and static+hotset measured `decode_ms=1450`, `ffn_ms_avg=262.215`, and
+`copied_bytes=2234557440`. The native static table is useful as a measured
+residency scaffold, but Qwen3.6 Metal should next target either a dense
+resident MPS/MPP table that can serve partial hits cheaply, or return to the
+prefill/orchestration buckets already shown to dominate long-context runs.
+
+`tests/metal/probe_qwen36_mps_resident_table.py` turns that fork into an
+explicit gate. It consumes `target/qwen36_static_topn_mps_probe.json`, optionally
+runs the existing `[qwen36-moe mps-expert-pilot]` row, and writes
+`target/qwen36_mps_resident_table_probe.{json,md}` with all-resident MPS,
+full-hit-only, and optimistic partial-hit estimates. The v2 report adds a
+nonfatal `viability_gate` with resident-RHS size, projected speedup, assignment
+coverage, and full-hit-rate thresholds; a passing partial-hit row is a reason
+to prototype only if the runtime can avoid per-token FP16 RHS rebuilds, not a
+default-promotion signal. The first direct
+`--run-pilot` smoke measured `gate_up_ms=1.312` and `down_ms=0.757`, giving an
+all-resident FP16 MPS floor of 82.76 ms/token versus the 98.761 ms/token
+default FFN baseline. Capacity 64 costs 15.00 GiB of FP16 MPS RHS storage,
+covers 69.9% of routed assignments, but fully serves only 9.8% of layer calls.
+The full-hit-only estimate is therefore only 97.20 ms/token, while the
+deliberately optimistic partial-hit estimate is 87.58 ms/token. That keeps a
+dense resident MPS path interesting only if it can serve resident hits and miss
+fallbacks inside the same layer without rebuilding per-token FP16 slabs; a
+full-hit-only bridge is not enough.
+`tests/metal/sweep_qwen36_route_residency.py` is the prompt-suite version of
+the route-locality rows. It runs the default Metal lane with
+`SUPERSONIC_QWEN36_ROUTE_PROFILE=1`, aggregates `[qwen36-route-profile]`,
+`[qwen36-route-cache-sim]`, and `[qwen36-route-topn]` rows across prompts, and
+writes `target/qwen36_route_residency_sweep.{json,md}`. Its v1
+`decision_gate` compares LRU hot-set hit rate with oracle static top-N coverage
+so the next residency fork can be selected from measured route evidence before
+more slab-cache or fused-INT4 work begins.
+`tests/metal/summarize_qwen36_sota_gates.py` is the aggregation step after the
+individual sweeps. It reads the batched-prefill variant sweep, static top-N
+runtime sweep, fused routed INT4 runtime sweep, MPS resident-table probe, route
+residency sweep, MTP acceptance sweep, LRU resident-cache sweep, linear decode
+sweep, and full-attention decode sweep JSON reports, then writes
+`target/qwen36_sota_gate_summary.{json,md}` with input status, report age,
+passed/failed gate IDs, candidate failures, refresh commands, and the next
+action. Missing reports are preserved as rows by default; use
+`--require --max-age-hours 24` when a local validation run should fail closed on
+absent, malformed, schema-mismatched, stale, or missing-gate artifacts.
+The v9 summary also records `superseded_gates`; this prevents an older
+estimate or decision pass from taking `next_action` after the corresponding
+runtime candidate has already been measured and rejected.
+`tests/metal/refresh_qwen36_sota_gates.py` is the operational companion for
+that summary: by default it writes
+`target/qwen36_sota_gate_refresh_plan.{json,md}` with only the missing, stale,
+malformed, schema-mismatched, or missing-gate rows selected; add `--run` to
+execute those trusted local refresh commands in order, or `--only <gate_id>` to
+force-refresh one gate even when its current report is already OK.
+`tests/metal/select_qwen36_next_bottleneck.py` is the follow-up when that
+summary lands on `keep_default_lane_and_select_next_measured_bottleneck`. It
+reads the refreshed gate summary plus the profiled default rows from the
+runtime sweeps, ranks decode buckets, marks FFN exhausted when the resident,
+static, fused, MPS, and LRU forks all have negative runtime evidence, marks
+linear and full attention exhausted after their variant gates fail, and writes
+`target/qwen36_next_bottleneck.{json,md}` with the next bucket to prototype.
+
+The first partial-hit resident MPS runtime prototype is opt-in behind
+`SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_MPS_STATIC_TOPN_PARTIAL=1` plus the
+same static-table env used by native INT4 static top-N. It materializes a
+per-layer FP16 MPS RHS table once from the static top-N experts, remaps only the
+resident-hit routed groups to table slots, runs an indexed MPS bridge for those
+hits, then computes miss groups on the existing host INT4 path and combines
+both contributions before the residual write. Profile rows use
+`resident_format=fp16_mps`, `miss_policy=static_topn`, and stable op names
+`qwen36_ffn_int4_expert_mps_static_topn_pack_f16_lut`,
+`qwen36_ffn_int4_expert_mps_static_topn_partial_f16`, and
+`qwen36_ffn_host_expert_mps_static_topn_miss_*`. The warm sweep mode
+`mps-static-partial` compares this path against `default`, `static`, and
+`static-hotset` with the same generated-ID parity key. This is still a
+diagnostic path, not a promoted default.
+
+The first measured result is negative. A profiled one-token smoke preserved the
+generated id `[11]`, but reported `decode_ms=6324`, `ffn_ms_avg=6073.323`,
+`slot_hit_rate=0.731250`, and `copied_bytes=15753805824`. The native indexed
+MPS bridge itself was `365.052 ms` across 40 layer calls, while
+`qwen36_ffn_int4_expert_mps_static_topn_pack_f16_lut` took `5630.663 ms` on
+the host and HAL `copy_h2d` accounted for `4481.851 ms` / `17886298368` bytes.
+The warm four-token sweep preserved `[11, 353, 599, 264]`, but measured
+`default` at `decode_ms=702`, `ffn_ms_avg=94.930` versus
+`mps-static-partial` at `decode_ms=7839`, `ffn_ms_avg=1845.066`,
+`slot_hit_rate=0.507812`, and `copied_gib=14.672`. This confirms the prototype
+as a correctness/profiling harness only: the RHS materialization and
+MPS/host-split overhead swamp the resident-hit matmuls.
+
+The GPU-side active-slab pack probe is opt-in behind
+`SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_GPU_PACK_STAGE5=1` on top of the
+packed expert path. It allocates compact per-layer scratch once, copies the
+current top-k expert slabs from the original baked Metal buffers in the FFN
+command buffer, remaps `topk_idx` to compact group IDs, then runs the existing
+packed gate/up and down/finalize shader. The four-token Apple M5 Max smoke
+preserved `[11, 353, 599, 264]`, so the remap and packed shader parity are good,
+but it measured `777.3 ms/token`, `ffn_ms_avg=641.772`, and
+`qwen36_ffn_int4_expert_gpu_pack_stage5=2417.156 ms` across 160 layer calls.
+The command-buffer GPU attribution for the fused pack+expert shader was only
+`64.400 ms`, while `command_buffer_wait` was `2678.881 ms`; moving slab
+materialization from CPU to GPU therefore did not solve the residency/wait
+problem.
+
+The direct-gather follow-up is opt-in behind
+`SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_DIRECT_GATHER_STAGE5=1`. It keeps
+the original top-k expert IDs, reads the baked expert buffers directly, and uses
+a 256-thread tiled down/finalize kernel so the down projection has the same
+wide reduction shape as gate/up. It also preserved `[11, 353, 599, 264]`, but
+the unprofiled four-token smoke measured `308.8 ms/token` with
+`ffn_ms_avg=249.990`; the profiled run measured `756.8 ms/token`,
+`ffn_ms_avg=616.225`, and
+`qwen36_ffn_int4_expert_direct_gather_stage5=2318.450 ms` across 160 layer
+calls, while the command-buffer GPU attribution for the direct gather command
+was only `55.965 ms`. That confirms the direct original-buffer gather is still
+wait/residency dominated on this model. The useful next FFN direction is an
+explicit resident representation that avoids per-token active-slab rebuilds and
+avoids random giant-buffer gathers. The native INT4 static top-N probe now
+covers the narrow static-table branch; MPS/MPP remains the next heavier
+resident-matvec option if static full-hit rates are not high enough.
+
+The fused routed INT4 variants are now covered by a promotion-gated runtime
+sweep rather than only one-off smoke notes:
+
+```bash
+SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" \
+  python3 tests/metal/sweep_qwen36_fused_routed_int4.py \
+    --prompt-set smoke --metal-profile
+```
+
+The sweep compares `default`, `direct-gather`, and `gpu-pack` under the same
+prompt and generated-token parity key, records Metal/HAL profile rows when
+requested, and writes `target/qwen36_fused_routed_int4_sweep.{json,md}`. Its
+nonfatal `promotion_gate` requires generated IDs to match default, headline
+decode and `ffn_ms_avg` to improve, full-attention/linear-attention/lm-head not
+to regress beyond the configured threshold, and `command_buffer_wait` evidence
+to be present and non-regressed. The SOTA summary consumes this report as the
+machine-readable gate for the fused routed INT4 fork. The first one-token
+profiled smoke preserved `[11]` for all modes and rejected both candidates:
+`default` measured `decode_ms=406` / `ffn_ms_avg=190.904`, `direct-gather`
+measured `806` / `661.302`, and `gpu-pack` measured `863` / `693.948`, with
+both fused candidates failing headline, FFN, and command-buffer-wait gates.
+
+The first MPS bridge step is now an attribution probe, not a decode path. With
+`SUPERSONIC_METAL_QWEN36_MPS_EXPERT_PILOT=1`, the runner appends a
+`[qwen36-moe mps-expert-pilot]` row and bench perf JSON schema v9 records it as
+`mps_expert_pilot`. This probe uses resident FP16 MPSMatrix inputs shaped like
+the active-expert gate/up and down GEMVs; it does not consume the GPTQ INT4
+expert tensors. On a one-token M5 Max smoke, the model still generated `[11]`
+and the probe measured `gate_up_ms=3.260`, `down_ms=2.975`,
+`gate_up_tflops=1.029`, and `down_tflops=0.564` for 100 repeated GEMMs. In the
+full `bench-perf` attribution run, the same resident-shape pilot measured
+`gate_up_ms=0.619` and `down_ms=0.433`; the default INT4 host expert path
+reported `qwen36_ffn_host_expert_gate_up=963.798 ms` and
+`qwen36_ffn_host_expert_down=508.565 ms` across the profiled prefill+decode
+calls.
+
+The first real MPS bridge is opt-in behind
+`SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_MPS_BRIDGE=1`. It uses the real
+active GPTQ experts, transposes/dequantizes those slabs to FP16 MPS layout on
+the CPU by default only when
+`SUPERSONIC_METAL_QWEN36_MPS_BRIDGE_CPU_TRANSCODE=1`; otherwise it uses a
+GPU-side INT4-to-FP16 transcode with a 16-entry threadgroup LUT per GPTQ
+scale/zero group before MPSMatrix gate/up and down consume the FP16 slabs. The
+original CPU-pack profile generated `[11]`, but measured `1707.3 ms/token` with
+`ffn_ms_avg=1502.344`. Profile attribution named the first blocker:
+`qwen36_ffn_int4_expert_mps_bridge_pack_f16=1365.389 ms` across 40 layers,
+while `command_buffer_gpu:qwen36_ffn_int4_expert_mps_bridge_f16=34.032 ms`.
+The GPU LUT transcode path is correct and the normal async smoke improved
+slightly to `1683.6 ms/token`, with `ffn_ms_avg=1473.939` and generated token
+`[11]`. It is still not promotable: the profiled GPU-transcode run measured
+`1766.4 ms/token`, `ffn_ms_avg=1538.500`,
+`qwen36_ffn_int4_expert_mps_transcode_int4_f16=1404.914 ms` wall time, and
+`command_buffer_gpu:qwen36_ffn_int4_expert_mps_transcode_int4_f16=66.239 ms`
+across 40 layers. That rules out per-token FP16 MPS slab materialization as the
+mainline route. A tiled packed-byte CPU LUT pack is available for investigation
+with `SUPERSONIC_METAL_QWEN36_MPS_BRIDGE_CPU_TRANSCODE_LUT=1`. Its release
+microbench improves the 50.4 MB active-slab pack from `44.725 ms` to
+`16.602 ms` by mapping each packed INT4 byte to a pair of FP16 values and
+transposing through cache-sized tiles. The LUT bridge now materializes directly
+into Metal shared buffers, avoiding the prior intermediate CPU slab plus
+`MTLBuffer` memcpy. The optional
+`SUPERSONIC_METAL_QWEN36_MPS_BRIDGE_CPU_TRANSCODE_STREAM=1` mode uses paired
+non-temporal ARM stores for the one-way transposed FP16 flush. The real bridge
+generated `[11]` and improved the old LUT result substantially, but it still is
+not promotable: unprofiled decode measured `868.1 ms/token`,
+`ffn_ms_avg=688.849`, and the profiled stream-store run measured
+`907.5 ms/token`, `ffn_ms_avg=695.173`, and
+`qwen36_ffn_int4_expert_mps_bridge_pack_f16_lut=556.425 ms` across 40 layers.
+On Apple UMA this is not PCIe upload cost; the remaining blocker is per-token
+FP16 MPS slab rebuild/consumption. The next FFN experiment should either keep
+active FP16 experts resident across route reuse, or return to a fully fused
+routed-expert INT4 path that avoids MPSMatrix RHS rebuilds entirely. Profile
+runs now emit Qwen3.6 route-locality lines to decide between those paths:
+`[qwen36-route-profile]` reports adjacent-token same-layer reuse. By default,
+`[qwen36-route-cache-sim]` simulates per-layer LRU resident-slab budgets of
+2/4/8/16/32/64 experts, and `[qwen36-route-topn]` reports oracle top-N coverage
+for the same budgets; override with
+`SUPERSONIC_QWEN36_ROUTE_PROFILE_CAPACITIES`. A 4-token Apple M5 Max profile generated `[11, 353, 599,
+264]` and measured `adjacent_hit_rate=0.400000`; the per-layer LRU hit rates
+were 0.5%/2.5%/23.0%/32.7% for capacities 2/4/8/16, while oracle top-N
+coverage was 19.2%/34.4%/57.6%/83.2%. That is enough to reject a tiny LRU
+resident cache as the next immediate optimization, but it leaves a larger
+hot-set cache or fused routed INT4 path as the next measured fork.
+`SUPERSONIC_QWEN36_ROUTE_PROFILE_LAYERS` defaults to `40` for
+Qwen3.6-35B-A3B and can be overridden for smaller parity runs.
+`tests/metal/sweep_qwen36_route_residency.py` preserves those rows as a
+prompt-suite report with a nonfatal `decision_gate`: if LRU hit-rate clears the
+configured threshold, the next branch is a larger resident cache; if only
+oracle top-N coverage clears, the next branch is a static resident table; if
+neither clears, the report recommends a fused routed INT4 path over additional
+slab-residency experiments.
+
 Unsupported Metal constraints remain explicit for this target: persistent
 decode, KV-FP8, speculative decode, batching, and Metal VMM are not benchmarked
-or claimed here yet. The benchmark baseline plus the native Metal profile should
-drive the next runtime optimization target. Because the Qwen3.6 hero lane uses
-GPTQ-packed INT4 weights and the public MPP tile currently consumes FP16
-`MTLTensor` inputs, the next runtime PR should either prove an INT4-compatible
-MPP packing/dequant bridge or keep MPP as an attribution-only pilot while the
-native Metal path targets fused FFN/MoE dispatch overhead.
+or claimed here yet. Because the Qwen3.6 hero lane uses GPTQ-packed INT4
+weights and the public MPP tile currently consumes FP16 `MTLTensor` inputs, MPP
+stays attribution-only until an INT4-compatible packing/dequant bridge is
+measured.
 
 ## How to reproduce
 

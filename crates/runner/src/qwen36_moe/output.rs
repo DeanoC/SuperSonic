@@ -59,6 +59,65 @@ pub(crate) fn dump_final_hidden_if_requested(
     Ok(())
 }
 
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for &byte in bytes {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x1000_0000_01b3);
+    }
+    hash
+}
+
+fn bf16_head_hex(bytes: &[u8], elems: usize) -> String {
+    bytes
+        .chunks_exact(2)
+        .take(elems)
+        .map(|chunk| format!("{:02x}{:02x}", chunk[1], chunk[0]))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+pub(crate) fn emit_final_hidden_tap_if_requested(
+    step: usize,
+    gen_index: usize,
+    position: i32,
+    path: &str,
+    lm_head_folded: bool,
+    final_hidden_bytes: &[u8],
+) {
+    if std::env::var_os("SUPERSONIC_QWEN36_FINAL_HIDDEN_TAP").is_none()
+        && std::env::var_os("SUPERSONIC_QWEN36_DOWNSTREAM_PARITY_TAP").is_none()
+    {
+        return;
+    }
+    let hidden = bf16_bytes_to_f32(final_hidden_bytes);
+    let mut l2 = 0.0f64;
+    let mut max_abs = 0.0f32;
+    let mut max_abs_idx = 0usize;
+    for (idx, &value) in hidden.iter().enumerate() {
+        l2 += (value as f64) * (value as f64);
+        let abs = value.abs();
+        if abs > max_abs {
+            max_abs = abs;
+            max_abs_idx = idx;
+        }
+    }
+    eprintln!(
+        "[qwen36-final-hidden-tap] step={} gen_index={} position={} path={} lm_head_folded={} elems={} checksum={:016x} l2={:.8e} max_abs={:.8e} max_abs_idx={} head8={}",
+        step,
+        gen_index,
+        position,
+        path,
+        lm_head_folded as u8,
+        hidden.len(),
+        fnv1a64(final_hidden_bytes),
+        l2.sqrt(),
+        max_abs,
+        max_abs_idx,
+        bf16_head_hex(final_hidden_bytes, 8),
+    );
+}
+
 pub(crate) fn dump_logits_if_requested(step: usize, logits: &[u8]) -> Result<()> {
     let Ok(dump_path) = std::env::var("SUPERSONIC_QWEN36_DUMP_LOGITS") else {
         return Ok(());
@@ -70,6 +129,52 @@ pub(crate) fn dump_logits_if_requested(step: usize, logits: &[u8]) -> Result<()>
         logits.len()
     );
     Ok(())
+}
+
+pub(crate) fn emit_logits_tap_if_requested(
+    step: usize,
+    gen_index: usize,
+    position: i32,
+    path: &str,
+    lm_head_folded: bool,
+    logits: &[u8],
+) {
+    if std::env::var_os("SUPERSONIC_QWEN36_LOGITS_TAP").is_none()
+        && std::env::var_os("SUPERSONIC_QWEN36_DOWNSTREAM_PARITY_TAP").is_none()
+    {
+        return;
+    }
+    let logits_f32 = bf16_bytes_to_f32(logits);
+    let mut top: Vec<(usize, f32)> = Vec::with_capacity(5);
+    for (idx, &value) in logits_f32.iter().enumerate() {
+        let insert_at = top
+            .iter()
+            .position(|&(_, existing)| value > existing)
+            .unwrap_or(top.len());
+        if insert_at < 5 {
+            top.insert(insert_at, (idx, value));
+            top.truncate(5);
+        }
+    }
+    let (top1_idx, top1_val) = top.first().copied().unwrap_or((usize::MAX, f32::NAN));
+    let top5 = top
+        .iter()
+        .map(|(idx, value)| format!("{}:{:.8e}", idx, value))
+        .collect::<Vec<_>>()
+        .join(",");
+    eprintln!(
+        "[qwen36-logits-tap] step={} gen_index={} position={} path={} lm_head_folded={} elems={} checksum={:016x} top1_idx={} top1_val={:.8e} top5={}",
+        step,
+        gen_index,
+        position,
+        path,
+        lm_head_folded as u8,
+        logits_f32.len(),
+        fnv1a64(logits),
+        top1_idx,
+        top1_val,
+        top5,
+    );
 }
 
 pub(crate) fn print_last_logits_if_requested(dump_last_logits: bool, last_logits_bytes: &[u8]) {

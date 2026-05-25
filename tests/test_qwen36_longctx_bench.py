@@ -104,6 +104,22 @@ class Qwen36LongContextBenchTests(unittest.TestCase):
         self.assertEqual(summary[0]["likely_bottleneck"], "full_attn")
         self.assertIn("full-attention", bench_qwen36_longctx.recommendation(summary))
 
+    def test_summarize_accepts_metal_int4_as_baseline(self):
+        rows = [
+            {
+                "context_tokens_requested": 512,
+                "mode": "int4",
+                "returncode": 0,
+                "stage": {"total_ms_avg": 42.0},
+                "chain_breakdown": {"full_attn_ms_avg": 30.0},
+                "lifecycle": {"prefill_total_ms": 1000.0, "generation_wall_ms": 43.0},
+            }
+        ]
+        summary = bench_qwen36_longctx.summarize(rows)
+        self.assertEqual(summary[0]["best_mode"], "int4")
+        self.assertEqual(summary[0]["baseline_ms_per_tok"], 42.0)
+        self.assertEqual(summary[0]["best_vs_baseline_pct"], 0.0)
+
     def test_parse_result_accepts_qwen36_generated_summary(self):
         output = "Generated 1 token (418 prompt + 1 new). EOS: no (max_new_tokens hit)."
         result = bench_qwen36_longctx.parse_result(output)

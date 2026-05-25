@@ -403,6 +403,7 @@ fn compile_metal_stubs(manifest_dir: &Path) {
     metal.compile("kernel_ffi_metal_native");
     println!("cargo:rustc-link-lib=framework=Foundation");
     println!("cargo:rustc-link-lib=framework=Metal");
+    println!("cargo:rustc-link-lib=framework=MetalPerformanceShaders");
     if have_mtl4_mpp {
         println!("cargo:rustc-link-lib=framework=MetalPerformancePrimitives");
     }

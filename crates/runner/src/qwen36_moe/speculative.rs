@@ -257,9 +257,22 @@ pub struct SpeculativeStepResult {
     /// Tokens to commit this step, in order. Always length 1..=K+1
     /// (always at least one token: the corrected/bonus token).
     pub emitted_tokens: Vec<u32>,
+    /// Number of MTP draft tokens proposed by this step. This is the
+    /// denominator for acceptance-rate telemetry; it may be zero near
+    /// the end of a short generation where only the corrected token
+    /// slot remains.
+    pub n_drafted: usize,
     /// Number of MTP drafts accepted (0..=K). Exposed for stats /
     /// `--emit-stage-timings` / acceptance-rate logging.
     pub n_accepted: usize,
+    /// Number of base-model verify chains run by this step. Sequential
+    /// verify stops at first rejection, while batched verify always
+    /// runs K+1 chains.
+    pub base_steps: usize,
+    /// Extra base-model replay chains after batched partial acceptance.
+    /// Sequential verify mutates state in order and therefore leaves
+    /// this at zero.
+    pub replay_steps: usize,
     /// `[hidden]` BF16 little-endian — the final-hidden bytes from
     /// the LAST base decode step that ran during this iteration.
     /// Becomes the next speculative step's `h_base` per the vLLM
@@ -369,14 +382,14 @@ where
         // even when a tunable disables speculation, avoiding the
         // stalled-loop failure mode the `--speculative-decode
         // --num-speculative-tokens=0` knob would otherwise hit.
-        let (predicted, fh) = base_step(
-            PositionPair::split(base_rope, base_cache),
-            first_token_id,
-        )
-        .context("speculative: K=0 fallback base step")?;
+        let (predicted, fh) = base_step(PositionPair::split(base_rope, base_cache), first_token_id)
+            .context("speculative: K=0 fallback base step")?;
         return Ok(SpeculativeStepResult {
             emitted_tokens: vec![predicted],
+            n_drafted: 0,
             n_accepted: 0,
+            base_steps: 1,
+            replay_steps: 0,
             final_hidden_bytes: fh,
         });
     }
@@ -438,7 +451,10 @@ where
             emitted.push(predicted);
             return Ok(SpeculativeStepResult {
                 emitted_tokens: emitted,
+                n_drafted: num_drafts,
                 n_accepted: k,
+                base_steps: k + 1,
+                replay_steps: 0,
                 final_hidden_bytes: fh,
             });
         }
@@ -457,7 +473,10 @@ where
     emitted.push(bonus);
     Ok(SpeculativeStepResult {
         emitted_tokens: emitted,
+        n_drafted: num_drafts,
         n_accepted: num_drafts,
+        base_steps: num_drafts + 1,
+        replay_steps: 0,
         final_hidden_bytes: fh,
     })
 }
@@ -545,11 +564,9 @@ where
         // K=0 degenerate: single base step. Same fallback as the
         // per-step driver — preserves the "always emit ≥1 token"
         // contract for engine forward progress.
-        let outputs = base_step_batched(&[(
-            PositionPair::split(base_rope, base_cache),
-            first_token_id,
-        )])
-        .context("speculative_batched: K=0 fallback base step")?;
+        let outputs =
+            base_step_batched(&[(PositionPair::split(base_rope, base_cache), first_token_id)])
+                .context("speculative_batched: K=0 fallback base step")?;
         if outputs.len() != 1 {
             anyhow::bail!(
                 "speculative_batched: K=0 closure returned {} outputs, \
@@ -560,7 +577,10 @@ where
         let (predicted, fh) = outputs.into_iter().next().unwrap();
         return Ok(SpeculativeStepResult {
             emitted_tokens: vec![predicted],
+            n_drafted: 0,
             n_accepted: 0,
+            base_steps: 1,
+            replay_steps: 0,
             final_hidden_bytes: fh,
         });
     }
@@ -659,7 +679,10 @@ where
 
     Ok(SpeculativeStepResult {
         emitted_tokens: emitted,
+        n_drafted: num_drafts,
         n_accepted,
+        base_steps: num_drafts + 1,
+        replay_steps: 0,
         final_hidden_bytes,
     })
 }

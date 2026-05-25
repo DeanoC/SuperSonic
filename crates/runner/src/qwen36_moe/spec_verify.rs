@@ -20,8 +20,6 @@ use crate::qwen36_moe_types::{
     DecodeOutputs, LayerBuffers, MtpLayerBuffers, MultiLayerGeom, PositionPair,
 };
 
-const QWEN36_NUM_SPECULATIVE_TOKENS: usize = 3;
-
 pub(crate) struct Qwen36SpecChainStep<'a> {
     pub(crate) ordinal: usize,
     pub(crate) geom: &'a MultiLayerGeom,
@@ -281,20 +279,19 @@ pub(crate) struct Qwen36SpeculativeExtension<'a> {
     pub(crate) first_token: u32,
     pub(crate) stage_timings: &'a mut Qwen36StageTimingTotals,
     pub(crate) emit_stage_timings: bool,
+    pub(crate) max_drafts: usize,
 }
 
 pub(crate) fn run_speculative_extension(
     mut args: Qwen36SpeculativeExtension<'_>,
 ) -> Result<SpeculativeStepResult> {
-    let dynamic_k = args
-        .loop_state
-        .speculative_draft_count(QWEN36_NUM_SPECULATIVE_TOKENS);
+    let dynamic_k = args.loop_state.speculative_draft_count(args.max_drafts);
 
     if let Some(snapshot) = args.linear_attn_snapshot.as_deref_mut() {
         refresh_linear_attn_state(args.ordinal, args.layers, snapshot)
             .context("refresh linear-attn snapshot before batched verify")?;
 
-        let result = run_speculative_decode_step_batched(
+        let mut result = run_speculative_decode_step_batched(
             args.ordinal,
             args.geom,
             args.mtp,
@@ -331,6 +328,7 @@ pub(crate) fn run_speculative_extension(
             &result,
             dynamic_k,
         ) {
+            result.replay_steps = replay.len();
             restore_and_replay_accepted_prefix(Qwen36SpecReplayAccepted {
                 ordinal: args.ordinal,
                 geom: args.geom,

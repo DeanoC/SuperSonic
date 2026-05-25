@@ -6,10 +6,13 @@
 //! GPU launch details live in the lower-level chain, persistent-decode,
 //! generation, and spec-verify modules.
 
-use std::path::Path;
+use std::{path::Path, ptr};
 
 use anyhow::{Context, Result};
 use gpu_hal::{set_backend, Backend};
+use kernel_ffi::qwen36_moe::{
+    Qwen36MoeFfnStepInt4, Qwen36MoeFfnStepParams, Qwen36MoeFfnStepWeights,
+};
 use model_store::BakedStore;
 
 use crate::profiling::PrefillProfileScope;
@@ -25,7 +28,8 @@ use crate::qwen36_moe_cli::output::{
     print_sampling_summary,
 };
 use crate::qwen36_moe_cli::policy::{
-    resolve_context_size, validate_cuda_v1_flags, validate_decode_backend, validate_metal_v1_flags,
+    max_speculative_tokens_for_backend, metal_mtp_experiment_enabled, resolve_context_size,
+    validate_cuda_v1_flags, validate_decode_backend, validate_metal_v1_flags,
     validate_persistent_kv_fp8_flags,
 };
 use crate::qwen36_moe_cli::prompt::{
@@ -40,9 +44,115 @@ use crate::qwen36_moe_cli::vmm::{
 };
 use crate::qwen36_moe_cli::vmm_config::{prepare_moe_runtime_config, should_use_qwen36_kv_vmm};
 use crate::qwen36_moe_logits::XorshiftRng;
+use crate::qwen36_moe_speculative::SpeculativeStepResult;
 use crate::qwen36_moe_telemetry::{print_and_write_moe_residency_summary, MoeRouteRuntime};
-use crate::qwen36_moe_types::PositionPair;
+use crate::qwen36_moe_types::{LayerBuffers, PositionPair};
 use crate::registry::RegistryEntry;
+
+fn prewarm_qwen36_mps_static_topn_if_requested(
+    ordinal: usize,
+    backend: Backend,
+    geom: &crate::qwen36_moe_types::MultiLayerGeom,
+    layers: &mut [LayerBuffers],
+) -> Result<std::time::Duration> {
+    if backend != Backend::Metal
+        || std::env::var_os("SUPERSONIC_METAL_PREWARM_QWEN36_FFN_MPS_STATIC_TOPN").is_none()
+    {
+        return Ok(std::time::Duration::ZERO);
+    }
+
+    let started = std::time::Instant::now();
+    let mut attempted_layers = 0usize;
+    let mut warmed_layers = 0usize;
+    let mut allocations = 0usize;
+    let mut copied_bytes = 0usize;
+    let mut resident_capacity = 0usize;
+
+    for (layer_idx, layer) in layers.iter_mut().enumerate() {
+        let ffn = &mut layer.ffn;
+        let Some(int4) = &ffn.int4 else {
+            continue;
+        };
+        attempted_layers += 1;
+        let params = Qwen36MoeFfnStepParams {
+            stage: 5,
+            layer_idx: layer_idx as i32,
+            hidden: geom.hidden,
+            num_experts: geom.num_experts,
+            moe_intermediate: geom.moe_intermediate,
+            shared_intermediate: geom.shared_intermediate,
+            top_k: geom.top_k,
+            rms_norm_eps: geom.rms_norm_eps,
+        };
+        let weights = Qwen36MoeFfnStepWeights {
+            input_hidden: ptr::null(),
+            post_attn_norm_w: ffn.post_attn_norm_w.as_ptr(),
+            gate_w: ffn.gate_w.as_ptr(),
+            gate_up_proj_w: ffn.gate_up_proj_w.as_ptr(),
+            down_proj_w: ffn.down_proj_w.as_ptr(),
+            shared_gate_proj_w: ffn.shared_gate_proj_w.as_ptr(),
+            shared_up_proj_w: ffn.shared_up_proj_w.as_ptr(),
+            shared_down_proj_w: ffn.shared_down_proj_w.as_ptr(),
+            shared_expert_gate_w: ffn.shared_expert_gate_w.as_ptr(),
+        };
+        let fp8 = int4.group_size < 0;
+        let int4_ptrs = Qwen36MoeFfnStepInt4 {
+            group_size: int4.group_size,
+            gate_up_proj_scale: int4.gate_up_proj_scale.as_ptr(),
+            gate_up_proj_zero: if fp8 {
+                ptr::null()
+            } else {
+                int4.gate_up_proj_zero.as_ptr()
+            },
+            down_proj_scale: int4.down_proj_scale.as_ptr(),
+            down_proj_zero: if fp8 {
+                ptr::null()
+            } else {
+                int4.down_proj_zero.as_ptr()
+            },
+            shared_gate_proj_scale: int4.shared_gate_proj_scale.as_ptr(),
+            shared_gate_proj_zero: if fp8 {
+                ptr::null()
+            } else {
+                int4.shared_gate_proj_zero.as_ptr()
+            },
+            shared_up_proj_scale: int4.shared_up_proj_scale.as_ptr(),
+            shared_up_proj_zero: if fp8 {
+                ptr::null()
+            } else {
+                int4.shared_up_proj_zero.as_ptr()
+            },
+            shared_down_proj_scale: int4.shared_down_proj_scale.as_ptr(),
+            shared_down_proj_zero: if fp8 {
+                ptr::null()
+            } else {
+                int4.shared_down_proj_zero.as_ptr()
+            },
+        };
+        if let Some(stats) = kernel_ffi::qwen36_moe::qwen36_prewarm_mps_static_topn_rhs_for_metal(
+            ordinal, params, &weights, &int4_ptrs,
+        )
+        .with_context(|| format!("prewarm Qwen3.6 MPS static top-N RHS layer {layer_idx}"))?
+        {
+            warmed_layers += 1;
+            allocations += usize::from(stats.allocated);
+            copied_bytes += stats.copied_bytes;
+            resident_capacity = resident_capacity.max(stats.resident_capacity);
+        }
+    }
+
+    let elapsed = started.elapsed();
+    eprintln!(
+        "[qwen36-moe ffn-prewarm] mode=mps-static-topn status=ok attempted_layers={} warmed_layers={} allocations={} resident_capacity={} copied_bytes={} elapsed_ms={:.3}",
+        attempted_layers,
+        warmed_layers,
+        allocations,
+        resident_capacity,
+        copied_bytes,
+        elapsed.as_secs_f64() * 1000.0
+    );
+    Ok(elapsed)
+}
 
 /// Compute the `(rope, cache)` PositionPair for one step of the
 /// decode loop. In dense mode the rope and cache agree; in
@@ -69,6 +179,95 @@ pub(crate) fn current_position(
             };
             PositionPair::split(rope, loop_state_position)
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Qwen36MtpAcceptanceStats {
+    mode: &'static str,
+    steps: usize,
+    drafted_tokens: usize,
+    accepted_tokens: usize,
+    emitted_tokens: usize,
+    base_steps: usize,
+    replay_steps: usize,
+    full_accept_steps: usize,
+    zero_accept_steps: usize,
+    max_accept: usize,
+}
+
+impl Qwen36MtpAcceptanceStats {
+    fn new(batched_spec_verify: bool) -> Self {
+        Self {
+            mode: if batched_spec_verify {
+                "batched"
+            } else {
+                "sequential"
+            },
+            steps: 0,
+            drafted_tokens: 0,
+            accepted_tokens: 0,
+            emitted_tokens: 0,
+            base_steps: 0,
+            replay_steps: 0,
+            full_accept_steps: 0,
+            zero_accept_steps: 0,
+            max_accept: 0,
+        }
+    }
+
+    fn record(&mut self, result: &SpeculativeStepResult) {
+        self.steps += 1;
+        self.drafted_tokens += result.n_drafted;
+        self.accepted_tokens += result.n_accepted;
+        self.emitted_tokens += result.emitted_tokens.len();
+        self.base_steps += result.base_steps;
+        self.replay_steps += result.replay_steps;
+        self.max_accept = self.max_accept.max(result.n_accepted);
+        if result.n_drafted > 0 && result.n_accepted == result.n_drafted {
+            self.full_accept_steps += 1;
+        }
+        if result.n_accepted == 0 {
+            self.zero_accept_steps += 1;
+        }
+    }
+
+    fn print_if_requested(&self, enabled: bool) {
+        if !enabled || self.steps == 0 {
+            return;
+        }
+        let acceptance_rate = if self.drafted_tokens > 0 {
+            self.accepted_tokens as f64 / self.drafted_tokens as f64
+        } else {
+            0.0
+        };
+        let emitted_per_step = self.emitted_tokens as f64 / self.steps as f64;
+        let target_steps = self.base_steps + self.replay_steps;
+        let target_steps_per_emitted = if self.emitted_tokens > 0 {
+            target_steps as f64 / self.emitted_tokens as f64
+        } else {
+            0.0
+        };
+        eprintln!(
+            "[qwen36-mtp-acceptance] mode={} steps={} drafted_tokens={} \
+             accepted_tokens={} acceptance_rate={:.6} emitted_tokens={} \
+             emitted_per_step={:.6} base_steps={} replay_steps={} \
+             target_steps_per_emitted={:.6} full_accept_steps={} \
+             zero_accept_steps={} max_accept={}",
+            self.mode,
+            self.steps,
+            self.drafted_tokens,
+            self.accepted_tokens,
+            acceptance_rate,
+            self.emitted_tokens,
+            emitted_per_step,
+            self.base_steps,
+            self.replay_steps,
+            target_steps_per_emitted,
+            self.full_accept_steps,
+            self.zero_accept_steps,
+            self.max_accept,
+        );
     }
 }
 
@@ -295,13 +494,22 @@ fn decode_text(
         moe_runtime.async_staging_pages,
         persistent_decode,
     )?;
-    let layer_load_elapsed = layer_load_start.elapsed();
     let mut layers = loaded_layers.layers;
+    let _ffn_prewarm_elapsed =
+        prewarm_qwen36_mps_static_topn_if_requested(ordinal, backend, &geom, &mut layers)?;
+    let layer_load_elapsed = layer_load_start.elapsed();
     let _moe_expert_arena = loaded_layers.moe_expert_arena;
     let mut _moe_expert_residency = loaded_layers.moe_expert_residency;
     let virtual_kv_stats = virtual_kv_stats_for_layers(&layers);
     print_virtual_kv_stats_if_active(virtual_kv_stats, kv_fp8, backend, ordinal);
     let session_start = std::time::Instant::now();
+    let max_speculative_tokens = max_speculative_tokens_for_backend(backend);
+    if speculative_decode && backend == Backend::Metal && metal_mtp_experiment_enabled() {
+        eprintln!(
+            "[qwen36-mtp-metal-experiment] enabled=1 max_drafts={} verify=sequential status=experimental",
+            max_speculative_tokens
+        );
+    }
     let session = prepare_decode_session(
         &store,
         ordinal,
@@ -312,6 +520,7 @@ fn decode_text(
         speculative_decode,
         batched_spec_verify,
         persistent_decode,
+        max_speculative_tokens,
         &mut layers,
     )?;
     let session_elapsed = session_start.elapsed();
@@ -374,6 +583,15 @@ fn decode_text(
             prompt_ids.len(),
         );
     }
+    if kernel_ffi::qwen36_moe::qwen36_batched_prefill_feasibility_profile_enabled() {
+        kernel_ffi::qwen36_moe::qwen36_batched_prefill_feasibility_profile_configure(
+            layers.len(),
+            geom.top_k as usize,
+            geom.num_experts as usize,
+            crate::qwen36_moe_cli::batched_prefill::PREFILL_CHUNK_SIZE_WMMA_FULL,
+            effective_prompt_len.saturating_sub(1),
+        );
+    }
     let backend_label = format!("{backend:?}");
     let mut prefill_profile = Some(PrefillProfileScope::new(
         profile_prefill,
@@ -405,6 +623,10 @@ fn decode_text(
     // is a real GPU+sync measurement. CPU-side stages (embed lookup, lm_head
     // GEMV, sampling, detokenize) are pure host work.
     let mut stage_timings = Qwen36StageTimingTotals::default();
+    let mtp_acceptance_profile =
+        std::env::var_os("SUPERSONIC_QWEN36_MTP_ACCEPTANCE_PROFILE").is_some();
+    let mut mtp_acceptance_stats =
+        speculative_decode.then(|| Qwen36MtpAcceptanceStats::new(batched_spec_verify));
     let mut prefill_steps = 0usize;
     let mut prefill_embed_elapsed = std::time::Duration::ZERO;
     let mut prefill_chain_elapsed = std::time::Duration::ZERO;
@@ -706,8 +928,12 @@ fn decode_text(
                 first_token: next_token,
                 stage_timings: &mut stage_timings,
                 emit_stage_timings,
+                max_drafts: max_speculative_tokens,
             })?;
 
+            if let Some(stats) = mtp_acceptance_stats.as_mut() {
+                stats.record(&result);
+            }
             if loop_state.append_speculative_emissions(&result, tokenizer.as_ref(), eos_id) {
                 break;
             }
@@ -758,7 +984,11 @@ fn decode_text(
             to_ms(decode_wall_start.elapsed()),
         );
     }
+    if let Some(stats) = mtp_acceptance_stats.as_ref() {
+        stats.print_if_requested(mtp_acceptance_profile || emit_stage_timings);
+    }
     emit_mpp_pilot_if_requested(emit_stage_timings);
+    emit_mps_expert_pilot_if_requested(emit_stage_timings);
 
     Ok(())
 }
@@ -783,6 +1013,51 @@ fn emit_mpp_pilot_if_requested(emit_stage_timings: bool) {
         Err(err) => eprintln!(
             "[qwen36-moe mpp-pilot] status=error size={} iterations={} tflops=0.000 error={}",
             size, iterations, err
+        ),
+    }
+}
+
+fn emit_mps_expert_pilot_if_requested(emit_stage_timings: bool) {
+    if !emit_stage_timings || std::env::var_os("SUPERSONIC_METAL_QWEN36_MPS_EXPERT_PILOT").is_none()
+    {
+        return;
+    }
+    let hidden = std::env::var("SUPERSONIC_METAL_QWEN36_MPS_EXPERT_HIDDEN")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(2048);
+    let moe_intermediate = std::env::var("SUPERSONIC_METAL_QWEN36_MPS_EXPERT_MOE_INTERMEDIATE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(512);
+    let top_k = std::env::var("SUPERSONIC_METAL_QWEN36_MPS_EXPERT_TOP_K")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(8);
+    let iterations = std::env::var("SUPERSONIC_METAL_QWEN36_MPS_EXPERT_ITERS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(100);
+    match kernel_ffi::qwen36_moe::metal_mps_expert_f16_probe(
+        hidden,
+        moe_intermediate,
+        top_k,
+        iterations,
+    ) {
+        Ok(probe) => eprintln!(
+            "[qwen36-moe mps-expert-pilot] status=ok hidden={} moe_intermediate={} top_k={} iterations={} gate_up_ms={:.3} down_ms={:.3} gate_up_tflops={:.3} down_tflops={:.3}",
+            hidden,
+            moe_intermediate,
+            top_k,
+            iterations,
+            probe.gate_up_ms,
+            probe.down_ms,
+            probe.gate_up_tflops,
+            probe.down_tflops,
+        ),
+        Err(err) => eprintln!(
+            "[qwen36-moe mps-expert-pilot] status=error hidden={} moe_intermediate={} top_k={} iterations={} gate_up_ms=0.000 down_ms=0.000 gate_up_tflops=0.000 down_tflops=0.000 error={}",
+            hidden, moe_intermediate, top_k, iterations, err
         ),
     }
 }

@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 9;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetaJson {
@@ -11,6 +11,12 @@ pub struct MetaJson {
     pub run_id: String,
     pub timestamp_utc: String,
     pub git_sha: String,
+    #[serde(default)]
+    pub git_dirty: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub git_dirty_paths: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_diff_hash: Option<String>,
     pub hostname: String,
     pub arch: String,
     pub rocminfo: String,
@@ -54,8 +60,56 @@ pub struct PerfCellJson {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lifecycle_timings: Option<BTreeMap<String, f64>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_stage_timings: Option<BTreeMap<String, f64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_chain_breakdown: Option<BTreeMap<String, f64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_lifecycle_timings: Option<BTreeMap<String, f64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub mpp_pilot: Option<BTreeMap<String, f64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mps_expert_pilot: Option<BTreeMap<String, f64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qwen36_pack_cache: Option<BTreeMap<String, f64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qwen36_expert_residency: Option<BTreeMap<String, f64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qwen36_expert_residency_policies: Option<Vec<BTreeMap<String, f64>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qwen36_expert_residency_policy_rows: Option<Vec<Qwen36ExpertResidencyPolicyJson>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metal_profile: Option<ProfileJson>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hal_profile: Option<ProfileJson>,
     pub gpu_temp_c_end: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Qwen36ExpertResidencyPolicyJson {
+    pub resident_format: String,
+    pub scope: String,
+    pub miss_policy: String,
+    pub capacity: f64,
+    pub metrics: BTreeMap<String, f64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProfileJson {
+    pub summary: BTreeMap<String, f64>,
+    pub entries: Vec<ProfileEntryJson>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProfileEntryJson {
+    pub op: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    pub calls: u64,
+    pub mean_ms: f64,
+    pub total_ms: f64,
+    pub max_ms: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone)]

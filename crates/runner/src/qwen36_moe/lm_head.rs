@@ -42,3 +42,48 @@ pub(crate) fn launch_lm_head_from_final_hidden_bytes(
         .to_host_bytes()
         .context("d2h logits from GPU lm_head")
 }
+
+pub(crate) fn launch_lm_head_top1_from_final_hidden_bytes(
+    ordinal: usize,
+    geom: &MultiLayerGeom,
+    final_hidden_bytes: &[u8],
+    buffers: LmHeadBuffers<'_>,
+) -> Result<u32> {
+    gpu_hal::copy_h2d(
+        ordinal,
+        buffers.final_hidden.as_mut_ptr(),
+        final_hidden_bytes.as_ptr() as *const _,
+        final_hidden_bytes.len(),
+    )
+    .context("h2d final_hidden -> final_hidden_buf")?;
+    kernel_ffi::qwen36_moe::lm_head_launch(
+        ordinal,
+        geom.hidden,
+        geom.vocab,
+        geom.rms_norm_eps,
+        buffers.final_hidden,
+        buffers.final_norm_w,
+        buffers.lm_head_w,
+        buffers.logits,
+        None,
+        buffers.counter,
+    )
+    .context("gpu lm_head launch")?;
+    launch_top1_from_logits(geom, buffers.logits, buffers.counter)
+}
+
+pub(crate) fn launch_top1_from_logits(
+    geom: &MultiLayerGeom,
+    logits: &GpuBuffer,
+    out_index: &mut GpuBuffer,
+) -> Result<u32> {
+    kernel_ffi::metal_argmax_bf16_into(logits, out_index, geom.vocab as usize)
+        .context("metal argmax over lm_head logits")?;
+    if kernel_ffi::prefill_ffi::metal_batch_is_active() {
+        kernel_ffi::prefill_ffi::flush_metal_batch().context("flush metal argmax batch")?;
+    }
+    let bytes = out_index
+        .to_host_bytes()
+        .context("d2h greedy token from Metal argmax")?;
+    Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}

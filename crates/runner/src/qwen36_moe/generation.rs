@@ -2,12 +2,16 @@ use std::io::Write as _;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use gpu_hal::GpuBuffer;
+use gpu_hal::{Backend, GpuBuffer};
 
 use crate::qwen36_moe_cli::decode_loop::Qwen36DecodeLoopState;
-use crate::qwen36_moe_cli::lm_head::{launch_lm_head_from_final_hidden_bytes, LmHeadBuffers};
+use crate::qwen36_moe_cli::lm_head::{
+    launch_lm_head_from_final_hidden_bytes, launch_lm_head_top1_from_final_hidden_bytes,
+    launch_top1_from_logits, LmHeadBuffers,
+};
 use crate::qwen36_moe_cli::output::{
-    dump_final_hidden_if_requested, dump_logits_if_requested, print_decoded_token,
+    dump_final_hidden_if_requested, dump_logits_if_requested, emit_final_hidden_tap_if_requested,
+    emit_logits_tap_if_requested, print_decoded_token,
 };
 use crate::qwen36_moe_cli::timing::{Qwen36StageTimingTotals, SamplingParams};
 use crate::qwen36_moe_logits::{sample_bf16_logits, XorshiftRng};
@@ -34,6 +38,28 @@ pub(crate) struct Qwen36GenerationStep<'a> {
     pub(crate) stage_timings: &'a mut Qwen36StageTimingTotals,
 }
 
+fn metal_gpu_argmax_enabled(
+    sampling: SamplingParams,
+    dump_last_logits: bool,
+    logits_buf: &GpuBuffer,
+) -> bool {
+    std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_LM_HEAD_GPU_ARGMAX").is_some()
+        && logits_buf.backend() == Backend::Metal
+        && (sampling.temperature <= 0.0 || sampling.top_k == 1)
+        && !dump_last_logits
+        && std::env::var_os("SUPERSONIC_QWEN36_DUMP_LOGITS").is_none()
+}
+
+fn downstream_tap_path_label(lm_head_folded: bool) -> &'static str {
+    if std::env::var_os("SUPERSONIC_METAL_QWEN36_DECODE_BATCH").is_some() {
+        "decode_batch"
+    } else if lm_head_folded {
+        "persistent"
+    } else {
+        "chained"
+    }
+}
+
 pub(crate) fn run_generation_step(args: Qwen36GenerationStep<'_>) -> Result<u32> {
     let Qwen36GenerationStep {
         ordinal,
@@ -57,14 +83,25 @@ pub(crate) fn run_generation_step(args: Qwen36GenerationStep<'_>) -> Result<u32>
     } = args;
 
     dump_final_hidden_if_requested(step, loop_state.position, &outputs.final_hidden_bytes)?;
+    let gen_index = loop_state.generated_ids.len();
+    let tap_path = downstream_tap_path_label(lm_head_folded);
+    emit_final_hidden_tap_if_requested(
+        step,
+        gen_index,
+        loop_state.position,
+        tap_path,
+        lm_head_folded,
+        &outputs.final_hidden_bytes,
+    );
 
     let t2 = std::time::Instant::now();
-    let logits = if lm_head_folded {
-        logits_buf
-            .to_host_bytes()
-            .context("d2h logits from folded GPU lm_head")?
-    } else {
-        launch_lm_head_from_final_hidden_bytes(
+    let gpu_argmax = metal_gpu_argmax_enabled(sampling, dump_last_logits, logits_buf);
+    let (logits, gpu_next_token) = if gpu_argmax && lm_head_folded {
+        let token = launch_top1_from_logits(geom, logits_buf, counter_buf)
+            .context("folded GPU lm_head Metal argmax")?;
+        (None, Some(token))
+    } else if gpu_argmax {
+        let token = launch_lm_head_top1_from_final_hidden_bytes(
             ordinal,
             geom,
             &outputs.final_hidden_bytes,
@@ -76,22 +113,64 @@ pub(crate) fn run_generation_step(args: Qwen36GenerationStep<'_>) -> Result<u32>
                 counter: counter_buf,
             },
         )
-        .context("standalone GPU lm_head")?
+        .context("standalone GPU lm_head Metal argmax")?;
+        (None, Some(token))
+    } else if lm_head_folded {
+        let bytes = logits_buf
+            .to_host_bytes()
+            .context("d2h logits from folded GPU lm_head")?;
+        (Some(bytes), None)
+    } else {
+        let bytes = launch_lm_head_from_final_hidden_bytes(
+            ordinal,
+            geom,
+            &outputs.final_hidden_bytes,
+            LmHeadBuffers {
+                final_norm_w: final_norm_w_buf,
+                lm_head_w: lm_head_w_buf,
+                final_hidden: final_hidden_buf,
+                logits: logits_buf,
+                counter: counter_buf,
+            },
+        )
+        .context("standalone GPU lm_head")?;
+        (Some(bytes), None)
     };
+
     if dump_last_logits {
-        loop_state.record_last_logits(&logits);
+        let logits = logits
+            .as_ref()
+            .expect("gpu argmax is disabled when dump_last_logits is set");
+        loop_state.record_last_logits(logits);
     }
     let t_lm_head_step = t2.elapsed();
-    dump_logits_if_requested(step, &logits)?;
+    if let Some(logits) = logits.as_ref() {
+        dump_logits_if_requested(step, logits)?;
+        emit_logits_tap_if_requested(
+            step,
+            gen_index,
+            loop_state.position,
+            tap_path,
+            lm_head_folded,
+            logits,
+        );
+    }
 
     let t3 = std::time::Instant::now();
-    let next_token = sample_bf16_logits(
-        &logits,
-        sampling.temperature,
-        sampling.top_k,
-        sampling.top_p,
-        rng,
-    );
+    let next_token = if let Some(token) = gpu_next_token {
+        token
+    } else {
+        let logits = logits
+            .as_ref()
+            .expect("full logits are present when GPU argmax is disabled");
+        sample_bf16_logits(
+            logits,
+            sampling.temperature,
+            sampling.top_k,
+            sampling.top_p,
+            rng,
+        )
+    };
     let t_sample_step = t3.elapsed();
     loop_state.generated_ids.push(next_token);
 
