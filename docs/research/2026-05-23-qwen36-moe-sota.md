@@ -2762,6 +2762,28 @@ under the same smoke:
    performance checkpoint; the retained headline target remains the confirmed
    `58.3 ms/token` run from the h_norm workspace reuse.
 
+75. **Qwen3.6 AArch64 LUT byte-table precompute rejection**
+   A wider CPU-side INT4 idea was measured and rejected: carrying the
+   AArch64 NEON BF16 byte lookup table inside the precomputed INT4 LUT object
+   so `qwen36_int4_lut_dot_pairs_neon` could load it directly instead of
+   rebuilding the 32-byte table inside every dot group. The change preserved
+   the same BF16-rounded dequant values and one-token Metal smoke generated
+   `[11]`, but it did not beat the retained headline.
+
+   Validation before rejection passed: `cargo fmt --check -p kernel-ffi`,
+   `git diff --check -- crates/kernel-ffi/src/qwen36_moe.rs`,
+   `cargo test -p kernel-ffi qwen36_moe --lib`, `cargo build --release -p
+   runner --bin supersonic`, and the direct Qwen3.6 Metal INT4 smoke. The first
+   `bench-perf` run wrote `target/bench-runs/2026-05-25-8d2037a` and measured
+   median `59.3 ms/token` with samples `59.3`, `64.3`, and `56.2`; the repeat
+   wrote `target/bench-runs/2026-05-25-8d2037a-2` and measured median
+   `61.1 ms/token` with samples `61.1`, `63.3`, and `60.6`. The repeat stage
+   table regressed to `ffn_ms_avg=36.619` and `total_ms_avg=64.580` versus the
+   retained `58.3 ms/token` checkpoint, so the code was reverted. The profile
+   rows did shrink expert gate/up/down in isolation, but not enough to overcome
+   the stage/headline regression; do not promote this table-shape change
+   without a different batching strategy and a confirmed median win.
+
 ## Sources
 
 - [Qwen/Qwen3.6-35B-A3B model card](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)
