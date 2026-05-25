@@ -1228,15 +1228,19 @@ The follow-up Metal linear INT4 update groups packed-byte dot loops by their
 GPTQ scale column inside the native `qwen36_linear_int4_stage5` projection and
 out-projection kernels. That reuses each scale/zero pair across its 128-value
 group instead of recomputing the sidecar index and reloading the pair for every
-packed byte. The current Apple M5 Max `bench-perf` run
-(`target/bench-runs/2026-05-25-074fc95-3/perf/qwen3.6-35b-a3b_int4.json`)
-measured median `107.4 ms/token` with samples `107.4`, `107.2`, `107.7`.
-Unprofiled attribution is now `ffn_ms_avg=70.370`,
-`linear_attn_ms_avg=23.719`, `full_attn_ms_avg=12.327`, and
-`lm_head_ms_avg=4.566`; the one-token Metal smoke still generated `[11]`. The
-remaining top profile rows are `qwen36_linear_int4_stage5`,
-`command_buffer_wait`, and FFN host expert gate/up + down, with FFN again the
-largest unprofiled bucket.
+packed byte.
+
+The latest FFN host router update parallelizes the 256-row BF16 router-logit
+matvec after the h_norm write, then reuses that h_norm snapshot through the
+later host FFN phases. The current Apple M5 Max `bench-perf` run
+(`target/bench-runs/2026-05-25-7ec91da/perf/qwen3.6-35b-a3b_int4.json`)
+measured median `96.5 ms/token` with samples `108.8`, `96.5`, `96.1`.
+Unprofiled attribution is now `ffn_ms_avg=60.912`,
+`linear_attn_ms_avg=19.545`, `full_attn_ms_avg=11.610`, and
+`lm_head_ms_avg=4.514`; the one-token Metal smoke still generated `[11]`.
+Profile attribution shows `qwen36_ffn_host_router_topk` reduced to
+`104.827 ms` total. The remaining top rows are `qwen36_linear_int4_stage5`,
+`command_buffer_wait`, and FFN host expert gate/up + down.
 
 The focused routed-expert microbench exercises the exact Qwen3.6 stage-5 INT4
 shape (`hidden=2048`, `num_experts=256`, `moe_intermediate=512`, `top_k=8`,

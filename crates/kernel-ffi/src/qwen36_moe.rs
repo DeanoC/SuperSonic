@@ -10126,6 +10126,7 @@ fn ffn_step_stage1_5_metal_host(
         std::slice::from_raw_parts_mut(workspace.as_mut_ptr() as *mut f32, workspace_len)
     };
 
+    let mut h_norm = Vec::<f32>::new();
     crate::prefill_ffi::metal_profile_time("qwen36_ffn_host_router_topk", "host", || {
         let mut mean_sq = 0.0f32;
         for &bits in input {
@@ -10138,14 +10139,23 @@ fn ffn_step_stage1_5_metal_host(
             let w = bf16_bits_to_f32(norm_w[col]);
             workspace[off_h_norm + col] = bf16_round_f32(v * inv_rms * (1.0 + w));
         }
+        h_norm.clear();
+        h_norm.extend_from_slice(&workspace[off_h_norm..off_h_norm + hidden]);
 
-        for expert in 0..num_experts {
-            let mut acc = 0.0f32;
-            let row = expert * hidden;
-            for col in 0..hidden {
-                acc += bf16_bits_to_f32(gate_w[row + col]) * workspace[off_h_norm + col];
-            }
-            workspace[off_router_logits + expert] = bf16_round_f32(acc);
+        {
+            let router_logits =
+                &mut workspace[off_router_logits..off_router_logits + num_experts];
+            qwen36_parallel_chunks_mut(router_logits, 32, |start, chunk| {
+                for (local, logit) in chunk.iter_mut().enumerate() {
+                    let expert = start + local;
+                    let mut acc = 0.0f32;
+                    let row = expert * hidden;
+                    for col in 0..hidden {
+                        acc += bf16_bits_to_f32(gate_w[row + col]) * h_norm[col];
+                    }
+                    *logit = bf16_round_f32(acc);
+                }
+            });
         }
 
         let row_max = workspace[off_router_logits..off_router_logits + num_experts]
@@ -10265,7 +10275,6 @@ fn ffn_step_stage1_5_metal_host(
         );
     }
 
-    let h_norm = workspace[off_h_norm..off_h_norm + hidden].to_vec();
     crate::prefill_ffi::metal_profile_time("qwen36_ffn_host_shared_gate_up", "host", || {
         let (_, after_sgp) = workspace.split_at_mut(off_sgp);
         let (sgp, after_sup) = after_sgp.split_at_mut(shared_intermediate);

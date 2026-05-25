@@ -2568,6 +2568,33 @@ under the same smoke:
    gate/up + down or a larger submit/residency reduction, because FFN is again
    the largest unprofiled bucket.
 
+68. **Qwen3.6 host router-logit parallelization**
+   Acted on the FFN host row that remained outside the expert gate/up and down
+   dots. The default Metal FFN host fallback now snapshots the BF16-rounded
+   h_norm row once after normalization, then computes the 256 router logits with
+   `qwen36_parallel_chunks_mut` over router rows. Later host FFN phases reuse the
+   same h_norm snapshot, preserving the existing router/top-k math and BF16
+   materialization while removing a serial 256x2048 BF16 matvec from the hot
+   path.
+
+   Validation passed: `cargo test -p kernel-ffi qwen36_moe --lib`,
+   `git diff --check -- crates/kernel-ffi/src/qwen36_moe.rs`,
+   `cargo build --release -p runner --bin supersonic`, the one-token Metal INT4
+   smoke with generated id `[11]`, and the Apple M5 Max Qwen3.6 INT4
+   `bench-perf` gate. The promotion run wrote
+   `target/bench-runs/2026-05-25-7ec91da` and measured headline median
+   `96.5 ms/token` with samples `108.8`, `96.5`, `96.1`, improving the previous
+   committed baseline of `107.4 ms/token`.
+
+   The unprofiled stage table is now `ffn_ms_avg=60.912`,
+   `linear_attn_ms_avg=19.545`, `full_attn_ms_avg=11.610`, and
+   `lm_head_ms_avg=4.514`. The profiled router row dropped from
+   `221.587 ms` total to `104.827 ms`; the remaining large rows are
+   `qwen36_linear_int4_stage5` (`1087.470 ms`), `command_buffer_wait`
+   (`1081.464 ms`), and FFN host expert gate/up (`598.296 ms`) plus down
+   (`341.078 ms`). The next direct FFN target is therefore expert gate/up/down
+   arithmetic or a broader submit/residency path, not router/top-k.
+
 ## Sources
 
 - [Qwen/Qwen3.6-35B-A3B model card](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)
