@@ -1313,6 +1313,22 @@ names `command_buffer_wait` (`993.270 ms`) and `qwen36_linear_int4_stage5`
 down (`245.985 ms`), so the next measured target is the Metal linear stage/wait
 pair plus the remaining FFN expert rows.
 
+The closeout long-context pass confirms that decode has improved enough for
+prefill stability and orchestration to be the next Apple target. The interrupted
+comparison run completed usable console rows for 512 and 2048 requested context
+tokens: 512 measured `72.683 ms/token` (`13.758 tok/s`) with
+`prefill_total_ms=22799.604`, while 2048 measured `159.044 ms/token`
+(`6.288 tok/s`) with `prefill_total_ms=159455.302`. Both rows missed the NIAH
+answer with the short generation cap used for the smoke. A separate recorded
+8192-token no-warmup row wrote
+`target/qwen36_metal_longctx_8192_final.{json,md}` after `1431.64s`, but
+returned `-11` before generated IDs, stage timings, or lifecycle timings were
+emitted. The prompt did contain the expected needle (`SSB-NEEDLE-68696`), so
+this is a runtime stability/long-prefill failure, not a prompt construction
+failure. Treat 512/2048 as the current long-context performance evidence and
+8192 as a failing gate that must be fixed before claiming long-context support
+on Metal.
+
 The focused routed-expert microbench exercises the exact Qwen3.6 stage-5 INT4
 shape (`hidden=2048`, `num_experts=256`, `moe_intermediate=512`, `top_k=8`,
 `group_size=128`) without the rest of decode:

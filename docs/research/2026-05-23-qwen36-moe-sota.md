@@ -2784,6 +2784,30 @@ under the same smoke:
    the stage/headline regression; do not promote this table-shape change
    without a different batching strategy and a confirmed median win.
 
+76. **Qwen3.6 performance-pass closeout**
+   The retained Apple M5 Max headline for this pass is still the h_norm
+   workspace reuse checkpoint: `58.3 ms/token` median from
+   `target/bench-runs/2026-05-25-d20a655-9`, with samples `58.3`, `60.3`,
+   and `58.2`. The later aggregate-linear-profile change was validation and
+   attribution cleanup rather than a performance checkpoint, and the AArch64
+   LUT byte-table candidate was reverted after failing to beat that median.
+
+   The final long-context pass makes the next target less ambiguous. Usable
+   console rows from the interrupted comparison run measured 512 requested
+   context tokens at `72.683 ms/token` with `prefill_total_ms=22799.604`, and
+   2048 requested context tokens at `159.044 ms/token` with
+   `prefill_total_ms=159455.302`. A recorded 8192 no-warmup run wrote
+   `target/qwen36_metal_longctx_8192_final.{json,md}` after `1431.64s`, but
+   exited with `returncode=-11` before timings or generated IDs were emitted.
+   The generated prompt did include the expected NIAH value
+   `SSB-NEEDLE-68696`, so the failure is a runtime stability/long-prefill gate.
+
+   The minimal PR closeout should therefore avoid more row-patching
+   diagnostics. Ship the retained decode wins and profiling harnesses, document
+   the 8192 failure plainly, and make the next runtime pass either a Metal
+   prefill stability fix or a command-buffer/orchestration reduction for the
+   measured `qwen36_linear_int4_stage5` plus `command_buffer_wait` pair.
+
 ## Sources
 
 - [Qwen/Qwen3.6-35B-A3B model card](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)
