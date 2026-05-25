@@ -1264,6 +1264,20 @@ Profile attribution has FFN expert gate/up at `554.605 ms` total and expert
 down at `305.734 ms`, so the next real target is still a larger routed expert
 compute/residency step rather than more router work.
 
+The following compute-path update splits the same paired-nibble LUT dot loop
+into independent accumulators, reducing the long scalar dependency chain while
+staying within the existing FFN parity tolerance. The current Apple M5 Max
+`bench-perf` run
+(`target/bench-runs/2026-05-25-0c3f940/perf/qwen3.6-35b-a3b_int4.json`)
+measured samples `83.6`, `78.0`, `73.7` with unprofiled
+`total_ms_avg=72.762`. Attribution is now `ffn_ms_avg=42.501`,
+`linear_attn_ms_avg=17.073`, `full_attn_ms_avg=8.078`, and
+`lm_head_ms_avg=4.638`; the one-token Metal smoke still generated `[11]`.
+Profile attribution shows FFN expert gate/up reduced to `457.864 ms` total and
+expert down to `266.605 ms`. FFN remains the selected bottleneck, but the next
+candidate needs to be a larger routed expert compute/residency path rather than
+another reduction-loop cleanup.
+
 The focused routed-expert microbench exercises the exact Qwen3.6 stage-5 INT4
 shape (`hidden=2048`, `num_experts=256`, `moe_intermediate=512`, `top_k=8`,
 `group_size=128`) without the rest of decode:

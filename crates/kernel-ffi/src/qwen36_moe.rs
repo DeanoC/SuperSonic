@@ -11236,6 +11236,14 @@ unsafe fn qwen36_int4_lut_dot_pairs(
     lut: &[f32; 16],
 ) -> f32 {
     let mut byte = 0usize;
+    let mut acc0 = 0.0f32;
+    let mut acc1 = 0.0f32;
+    let mut acc2 = 0.0f32;
+    let mut acc3 = 0.0f32;
+    let mut acc4 = 0.0f32;
+    let mut acc5 = 0.0f32;
+    let mut acc6 = 0.0f32;
+    let mut acc7 = 0.0f32;
     while byte + 8 <= byte_count {
         let b0 = unsafe { *packed.add(byte) };
         let b1 = unsafe { *packed.add(byte + 1) };
@@ -11246,24 +11254,25 @@ unsafe fn qwen36_int4_lut_dot_pairs(
         let b6 = unsafe { *packed.add(byte + 6) };
         let b7 = unsafe { *packed.add(byte + 7) };
         let x_base = unsafe { x.add(byte * 2) };
-        acc += lut[(b0 & 0x0f) as usize] * unsafe { *x_base.add(0) }
+        acc0 += lut[(b0 & 0x0f) as usize] * unsafe { *x_base.add(0) }
             + lut[(b0 >> 4) as usize] * unsafe { *x_base.add(1) };
-        acc += lut[(b1 & 0x0f) as usize] * unsafe { *x_base.add(2) }
+        acc1 += lut[(b1 & 0x0f) as usize] * unsafe { *x_base.add(2) }
             + lut[(b1 >> 4) as usize] * unsafe { *x_base.add(3) };
-        acc += lut[(b2 & 0x0f) as usize] * unsafe { *x_base.add(4) }
+        acc2 += lut[(b2 & 0x0f) as usize] * unsafe { *x_base.add(4) }
             + lut[(b2 >> 4) as usize] * unsafe { *x_base.add(5) };
-        acc += lut[(b3 & 0x0f) as usize] * unsafe { *x_base.add(6) }
+        acc3 += lut[(b3 & 0x0f) as usize] * unsafe { *x_base.add(6) }
             + lut[(b3 >> 4) as usize] * unsafe { *x_base.add(7) };
-        acc += lut[(b4 & 0x0f) as usize] * unsafe { *x_base.add(8) }
+        acc4 += lut[(b4 & 0x0f) as usize] * unsafe { *x_base.add(8) }
             + lut[(b4 >> 4) as usize] * unsafe { *x_base.add(9) };
-        acc += lut[(b5 & 0x0f) as usize] * unsafe { *x_base.add(10) }
+        acc5 += lut[(b5 & 0x0f) as usize] * unsafe { *x_base.add(10) }
             + lut[(b5 >> 4) as usize] * unsafe { *x_base.add(11) };
-        acc += lut[(b6 & 0x0f) as usize] * unsafe { *x_base.add(12) }
+        acc6 += lut[(b6 & 0x0f) as usize] * unsafe { *x_base.add(12) }
             + lut[(b6 >> 4) as usize] * unsafe { *x_base.add(13) };
-        acc += lut[(b7 & 0x0f) as usize] * unsafe { *x_base.add(14) }
+        acc7 += lut[(b7 & 0x0f) as usize] * unsafe { *x_base.add(14) }
             + lut[(b7 >> 4) as usize] * unsafe { *x_base.add(15) };
         byte += 8;
     }
+    acc += acc0 + acc1 + acc2 + acc3 + acc4 + acc5 + acc6 + acc7;
     while byte < byte_count {
         let b = unsafe { *packed.add(byte) };
         let x_base = unsafe { x.add(byte * 2) };

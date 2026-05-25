@@ -2650,6 +2650,31 @@ under the same smoke:
    the next material target remains routed expert compute/residency rather than
    another narrow router or loop-control cleanup.
 
+71. **Qwen3.6 INT4 LUT multi-accumulator dot**
+   Kept the paired-nibble LUT path on the default host FFN fallback and split
+   its inner dot product into eight independent accumulators. This targets the
+   routed expert gate/up and down rows directly by reducing the scalar
+   dependency chain inside each INT4 dot. The change deliberately stays inside
+   the existing LUT dequant path and does not add a new runtime flag.
+
+   Validation passed: `cargo test -p kernel-ffi qwen36_moe --lib`,
+   `rustfmt --check crates/kernel-ffi/src/qwen36_moe.rs`, `git diff --check
+   -- crates/kernel-ffi/src/qwen36_moe.rs`, `cargo build --release -p runner
+   --bin supersonic`, and the one-token Qwen3.6 Metal INT4 smoke with generated
+   id `[11]`. The promotion `bench-perf` run wrote
+   `target/bench-runs/2026-05-25-0c3f940`.
+
+   The measured samples are `83.6`, `78.0`, and `73.7` ms/token, with
+   unprofiled `total_ms_avg=72.762`. The unprofiled stage table is now
+   `ffn_ms_avg=42.501`, `linear_attn_ms_avg=17.073`,
+   `full_attn_ms_avg=8.078`, and `lm_head_ms_avg=4.638`. Profile attribution
+   shows FFN expert gate/up reduced to `457.864 ms` total and down to
+   `266.605 ms`, while `qwen36_linear_int4_stage5` (`1002.996 ms`) and
+   `command_buffer_wait` (`996.815 ms`) remain the top profiled rows. This is a
+   measured default-lane gain over the `85.877 ms/token` paired-nibble
+   checkpoint; the next useful FFN step should be a larger routed expert
+   compute/residency path, not another small loop cleanup.
+
 ## Sources
 
 - [Qwen/Qwen3.6-35B-A3B model card](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)
