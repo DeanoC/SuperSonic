@@ -3942,6 +3942,29 @@ fn qwen36_ffn_stage5_routed_down_host_recompute_correction_enabled_for_layer(
             .map_or(true, |target| target == layer_idx)
 }
 
+fn qwen36_ffn_stage5_residual_host_snap_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_QWEN36_FFN_STAGE5_RESIDUAL_HOST_SNAP").is_some()
+        && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
+}
+
+fn qwen36_ffn_stage5_residual_host_snap_layer() -> Option<i32> {
+    std::env::var("SUPERSONIC_METAL_QWEN36_FFN_STAGE5_RESIDUAL_HOST_SNAP_LAYER")
+        .ok()
+        .and_then(|raw| raw.parse::<i32>().ok())
+}
+
+fn qwen36_ffn_stage5_residual_host_snap_row() -> Option<usize> {
+    std::env::var("SUPERSONIC_METAL_QWEN36_FFN_STAGE5_RESIDUAL_HOST_SNAP_ROW")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+}
+
+fn qwen36_ffn_stage5_residual_host_snap_enabled_for_layer(layer_idx: i32) -> bool {
+    qwen36_ffn_stage5_residual_host_snap_enabled()
+        && qwen36_ffn_stage5_residual_host_snap_layer().is_some_and(|target| target == layer_idx)
+        && qwen36_ffn_stage5_residual_host_snap_row().is_some()
+}
+
 fn qwen36_ffn_stage5_routed_gate_up_tap_enabled() -> bool {
     std::env::var_os("SUPERSONIC_METAL_QWEN36_FFN_STAGE5_ROUTED_GATE_UP_TAP").is_some()
         && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
@@ -5964,6 +5987,56 @@ fn qwen36_apply_ffn_routed_down_stage5_host_recompute_correction(
         changed_moe_elems,
         changed_output_elems,
         first_changed_output,
+    );
+
+    Ok(())
+}
+
+fn qwen36_apply_ffn_residual_stage5_host_snap(
+    ordinal: usize,
+    layer_idx: i32,
+    hidden: usize,
+    output: &mut GpuBuffer,
+    reference: &Qwen36FfnRoutedReference,
+    row: usize,
+) -> Result<(), GpuError> {
+    crate::prefill_ffi::flush_metal_batch()?;
+    gpu_hal::sync(ordinal)?;
+
+    if row >= hidden {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::ffn_step_launch: residual host snap row {row} out of bounds for hidden={hidden}",
+        )));
+    }
+    if output.len_bytes() / std::mem::size_of::<u16>() < hidden {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::ffn_step_launch: residual host snap output too small: need {hidden}, got {}",
+            output.len_bytes() / std::mem::size_of::<u16>()
+        )));
+    }
+
+    let output = unsafe { std::slice::from_raw_parts_mut(output.as_mut_ptr() as *mut u16, hidden) };
+    let before_bits = output[row];
+    let before = bf16_bits_to_f32(before_bits);
+    let host = reference.final_out.get(row).copied().ok_or_else(|| {
+        GpuError::InvalidArg(format!(
+            "qwen36_moe::ffn_step_launch: residual host snap reference row {row} missing"
+        ))
+    })?;
+    let corrected = bf16_round_f32(host);
+    let corrected_bits = f32_to_bf16_bits(corrected);
+    output[row] = corrected_bits;
+
+    eprintln!(
+        "[qwen36-ffn-residual-host-snap] layer={} row={} hidden={} host_final={:.8e} metal_final={:.8e} corrected_final={:.8e} patch_abs={:.8e} changed={}",
+        layer_idx,
+        row,
+        hidden,
+        host,
+        before,
+        corrected,
+        (corrected - before).abs(),
+        (before_bits != corrected_bits) as u8,
     );
 
     Ok(())
@@ -9643,12 +9716,15 @@ fn ffn_step_stage1_5_metal_host(
             qwen36_ffn_stage5_routed_down_host_recompute_correction_enabled_for_layer(
                 params.layer_idx,
             );
+        let residual_host_snap =
+            qwen36_ffn_stage5_residual_host_snap_enabled_for_layer(params.layer_idx);
         let routed_gate_up_tap = qwen36_ffn_stage5_routed_gate_up_tap_enabled();
         let routed_finalize_tap = qwen36_ffn_stage5_routed_finalize_tap_enabled();
         if shared_host_correction
             || shared_mid_host_correction
             || routed_host_correction
             || routed_down_host_recompute_correction
+            || residual_host_snap
             || routed_gate_up_tap
             || routed_finalize_tap
         {
@@ -9661,6 +9737,7 @@ fn ffn_step_stage1_5_metal_host(
             || shared_mid_host_correction
             || routed_host_correction
             || routed_down_host_recompute_correction
+            || residual_host_snap
             || routed_gate_up_tap
             || routed_finalize_tap
         {
@@ -9689,6 +9766,7 @@ fn ffn_step_stage1_5_metal_host(
             || shared_mid_host_correction
             || routed_host_correction
             || routed_down_host_recompute_correction
+            || residual_host_snap
             || routed_gate_up_tap
             || routed_finalize_tap
         {
@@ -9722,6 +9800,7 @@ fn ffn_step_stage1_5_metal_host(
         };
         let needs_routed_reference = routed_host_correction
             || routed_down_host_recompute_correction
+            || residual_host_snap
             || routed_gate_up_tap
             || routed_finalize_tap;
         let routed_reference = if needs_routed_reference {
@@ -9966,6 +10045,26 @@ fn ffn_step_stage1_5_metal_host(
                                 .into(),
                         )
                     })?,
+                )?;
+            }
+            if residual_host_snap {
+                let reference = routed_reference.as_ref().ok_or_else(|| {
+                    GpuError::InvalidArg(
+                        "qwen36_moe::ffn_step_launch: residual host snap missing reference".into(),
+                    )
+                })?;
+                let row = qwen36_ffn_stage5_residual_host_snap_row().ok_or_else(|| {
+                    GpuError::InvalidArg(
+                        "qwen36_moe::ffn_step_launch: residual host snap missing row".into(),
+                    )
+                })?;
+                qwen36_apply_ffn_residual_stage5_host_snap(
+                    ordinal,
+                    params.layer_idx,
+                    hidden,
+                    output,
+                    reference,
+                    row,
                 )?;
             }
             if router_parity_tap {

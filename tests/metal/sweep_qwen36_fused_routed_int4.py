@@ -16,7 +16,7 @@ from typing import Any
 
 
 MODEL = "qwen3.6-35b-a3b"
-SCHEMA = "qwen36-fused-routed-int4-sweep-v41"
+SCHEMA = "qwen36-fused-routed-int4-sweep-v42"
 DEFAULT_MAX_FUSED_WALL_GPU_RATIO = 4.0
 DEFAULT_MAX_WAIT_GPU_RATIO = 4.0
 BF16_BOUNDARY_SOURCES = {
@@ -45,6 +45,12 @@ SHARED_MID_ROUTED_DOWN_RECOMPUTED_BATCH_SIMD_MODE = (
 )
 SHARED_MID_ROUTED_DOWN_RECOMPUTED_LAYER33_BATCH_SIMD_MODE = (
     "full-stage5-router-simd-batch-shared-mid-routed-down-host-recomputed-layer33"
+)
+RESIDUAL_SNAP_LAYER7_BATCH_SIMD_MODE = (
+    "full-stage5-router-simd-batch-residual-snap-layer7-row1621"
+)
+SHARED_MID_RESIDUAL_SNAP_LAYER33_BATCH_SIMD_MODE = (
+    "full-stage5-router-simd-batch-shared-mid-residual-snap-layer33-row8"
 )
 SHARED_ROUTED_HOST_CORRECTED_BATCH_SIMD_MODE = (
     "full-stage5-router-simd-batch-shared-routed-host-corrected"
@@ -100,6 +106,8 @@ BATCH_FAST_PROFILE_MODES = {
     SHARED_MID_HOST_CORRECTED_BATCH_SIMD_MODE,
     SHARED_MID_ROUTED_DOWN_RECOMPUTED_BATCH_SIMD_MODE,
     SHARED_MID_ROUTED_DOWN_RECOMPUTED_LAYER33_BATCH_SIMD_MODE,
+    RESIDUAL_SNAP_LAYER7_BATCH_SIMD_MODE,
+    SHARED_MID_RESIDUAL_SNAP_LAYER33_BATCH_SIMD_MODE,
     SHARED_ROUTED_HOST_CORRECTED_BATCH_SIMD_MODE,
     "full-stage5-router-batch-phases",
     "full-stage5-router-batch-ffn-phases",
@@ -115,6 +123,8 @@ DIAGNOSTIC_ONLY_MODES = {
     SHARED_MID_HOST_CORRECTED_BATCH_SIMD_MODE,
     SHARED_MID_ROUTED_DOWN_RECOMPUTED_BATCH_SIMD_MODE,
     SHARED_MID_ROUTED_DOWN_RECOMPUTED_LAYER33_BATCH_SIMD_MODE,
+    RESIDUAL_SNAP_LAYER7_BATCH_SIMD_MODE,
+    SHARED_MID_RESIDUAL_SNAP_LAYER33_BATCH_SIMD_MODE,
     SHARED_HOST_CORRECTED_ROUTED_GATE_UP_HOST_ORDER_BATCH_SIMD_MODE,
     SHARED_ROUTED_HOST_CORRECTED_BATCH_SIMD_MODE,
 }
@@ -230,6 +240,14 @@ MODE_ALIASES: dict[str, str] = {
     "full-router-simd-batch-shared-mid-routed-down-host-recomputed-layer33": SHARED_MID_ROUTED_DOWN_RECOMPUTED_LAYER33_BATCH_SIMD_MODE,
     "shared-mid-routed-down-host-recomputed-layer33": SHARED_MID_ROUTED_DOWN_RECOMPUTED_LAYER33_BATCH_SIMD_MODE,
     SHARED_MID_ROUTED_DOWN_RECOMPUTED_LAYER33_BATCH_SIMD_MODE: SHARED_MID_ROUTED_DOWN_RECOMPUTED_LAYER33_BATCH_SIMD_MODE,
+    "router-simd-batch-residual-snap-layer7-row1621": RESIDUAL_SNAP_LAYER7_BATCH_SIMD_MODE,
+    "batch-router-simd-residual-snap-layer7-row1621": RESIDUAL_SNAP_LAYER7_BATCH_SIMD_MODE,
+    "residual-snap-layer7-row1621": RESIDUAL_SNAP_LAYER7_BATCH_SIMD_MODE,
+    RESIDUAL_SNAP_LAYER7_BATCH_SIMD_MODE: RESIDUAL_SNAP_LAYER7_BATCH_SIMD_MODE,
+    "router-simd-batch-shared-mid-residual-snap-layer33-row8": SHARED_MID_RESIDUAL_SNAP_LAYER33_BATCH_SIMD_MODE,
+    "batch-router-simd-shared-mid-residual-snap-layer33-row8": SHARED_MID_RESIDUAL_SNAP_LAYER33_BATCH_SIMD_MODE,
+    "shared-mid-residual-snap-layer33-row8": SHARED_MID_RESIDUAL_SNAP_LAYER33_BATCH_SIMD_MODE,
+    SHARED_MID_RESIDUAL_SNAP_LAYER33_BATCH_SIMD_MODE: SHARED_MID_RESIDUAL_SNAP_LAYER33_BATCH_SIMD_MODE,
     "router-simd-batch-shared-routed-host-corrected": SHARED_ROUTED_HOST_CORRECTED_BATCH_SIMD_MODE,
     "batch-router-simd-shared-routed-host-corrected": SHARED_ROUTED_HOST_CORRECTED_BATCH_SIMD_MODE,
     "full-router-simd-batch-shared-routed-host-corrected": SHARED_ROUTED_HOST_CORRECTED_BATCH_SIMD_MODE,
@@ -301,6 +319,8 @@ FUSED_OP_NEEDLES = {
     SHARED_MID_HOST_CORRECTED_BATCH_SIMD_MODE: "qwen36_ffn_int4_stage5_with_router",
     SHARED_MID_ROUTED_DOWN_RECOMPUTED_BATCH_SIMD_MODE: "qwen36_ffn_int4_stage5_with_router",
     SHARED_MID_ROUTED_DOWN_RECOMPUTED_LAYER33_BATCH_SIMD_MODE: "qwen36_ffn_int4_stage5_with_router",
+    RESIDUAL_SNAP_LAYER7_BATCH_SIMD_MODE: "qwen36_ffn_int4_stage5_with_router",
+    SHARED_MID_RESIDUAL_SNAP_LAYER33_BATCH_SIMD_MODE: "qwen36_ffn_int4_stage5_with_router",
     SHARED_ROUTED_HOST_CORRECTED_BATCH_SIMD_MODE: "qwen36_ffn_int4_stage5_with_router",
     "full-stage5-router-batch-phases": "qwen36_ffn_int4_stage5_with_router",
     "full-stage5-router-batch-ffn-phases": "qwen36_ffn_int4",
@@ -477,6 +497,12 @@ FUSED_GPU_OP_PREFIXES[SHARED_MID_ROUTED_DOWN_RECOMPUTED_BATCH_SIMD_MODE] = FUSED
 ]
 FUSED_GPU_OP_PREFIXES[
     SHARED_MID_ROUTED_DOWN_RECOMPUTED_LAYER33_BATCH_SIMD_MODE
+] = FUSED_GPU_OP_PREFIXES["full-stage5-router-simd-batch"]
+FUSED_GPU_OP_PREFIXES[RESIDUAL_SNAP_LAYER7_BATCH_SIMD_MODE] = FUSED_GPU_OP_PREFIXES[
+    "full-stage5-router-simd-batch"
+]
+FUSED_GPU_OP_PREFIXES[
+    SHARED_MID_RESIDUAL_SNAP_LAYER33_BATCH_SIMD_MODE
 ] = FUSED_GPU_OP_PREFIXES["full-stage5-router-simd-batch"]
 FUSED_GPU_OP_PREFIXES[SHARED_ROUTED_HOST_CORRECTED_BATCH_SIMD_MODE] = FUSED_GPU_OP_PREFIXES[
     "full-stage5-router-simd-batch"
@@ -695,6 +721,19 @@ def parse_routed_down_host_recompute_corrections(output: str) -> list[dict[str, 
     rows: list[dict[str, Any]] = []
     for line in output.splitlines():
         if not line.startswith("[qwen36-ffn-routed-down-host-recompute-correction]"):
+            continue
+        fields = {
+            key: parse_number(value)
+            for key, value in parse_key_values(line).items()
+        }
+        rows.append(fields)
+    return rows
+
+
+def parse_residual_host_snaps(output: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for line in output.splitlines():
+        if not line.startswith("[qwen36-ffn-residual-host-snap]"):
             continue
         fields = {
             key: parse_number(value)
@@ -1310,6 +1349,42 @@ def summarize_routed_down_host_recompute_corrections(
                 "first_changed_output": item.get("first_changed_output"),
             }
             for item in ranked[:20]
+        ],
+    }
+
+
+def summarize_residual_host_snaps(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    snaps = [
+        snap
+        for row in rows
+        for snap in (row.get("residual_host_snaps") or [])
+    ]
+    changed = [snap for snap in snaps if int(snap.get("changed") or 0) != 0]
+    ranked = sorted(
+        snaps,
+        key=lambda snap: float(snap.get("patch_abs") or 0.0),
+        reverse=True,
+    )
+    return {
+        "snap_count": len(snaps),
+        "changed_count": len(changed),
+        "layers": sorted({int(snap.get("layer", -1)) for snap in snaps}),
+        "rows": sorted({int(snap.get("row", -1)) for snap in snaps}),
+        "max_patch_abs": max(
+            (float(snap.get("patch_abs") or 0.0) for snap in snaps),
+            default=0.0,
+        ),
+        "worst_examples": [
+            {
+                "layer": snap.get("layer"),
+                "row": snap.get("row"),
+                "host_final": snap.get("host_final"),
+                "metal_final": snap.get("metal_final"),
+                "corrected_final": snap.get("corrected_final"),
+                "patch_abs": snap.get("patch_abs"),
+                "changed": snap.get("changed"),
+            }
+            for snap in ranked[:20]
         ],
     }
 
@@ -3198,6 +3273,21 @@ def build_env_overrides(args: argparse.Namespace, mode: str) -> dict[str, str]:
         overrides[
             "SUPERSONIC_METAL_QWEN36_FFN_STAGE5_ROUTED_DOWN_HOST_RECOMPUTE_CORRECTION_LAYER"
         ] = "33"
+    elif mode == RESIDUAL_SNAP_LAYER7_BATCH_SIMD_MODE:
+        overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"] = "1"
+        overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_STAGE5_SIMD"] = "1"
+        overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH"] = "1"
+        overrides["SUPERSONIC_METAL_QWEN36_FFN_STAGE5_RESIDUAL_HOST_SNAP"] = "1"
+        overrides["SUPERSONIC_METAL_QWEN36_FFN_STAGE5_RESIDUAL_HOST_SNAP_LAYER"] = "7"
+        overrides["SUPERSONIC_METAL_QWEN36_FFN_STAGE5_RESIDUAL_HOST_SNAP_ROW"] = "1621"
+    elif mode == SHARED_MID_RESIDUAL_SNAP_LAYER33_BATCH_SIMD_MODE:
+        overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"] = "1"
+        overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_STAGE5_SIMD"] = "1"
+        overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH"] = "1"
+        overrides["SUPERSONIC_METAL_QWEN36_FFN_STAGE5_SHARED_MID_HOST_CORRECTION"] = "1"
+        overrides["SUPERSONIC_METAL_QWEN36_FFN_STAGE5_RESIDUAL_HOST_SNAP"] = "1"
+        overrides["SUPERSONIC_METAL_QWEN36_FFN_STAGE5_RESIDUAL_HOST_SNAP_LAYER"] = "33"
+        overrides["SUPERSONIC_METAL_QWEN36_FFN_STAGE5_RESIDUAL_HOST_SNAP_ROW"] = "8"
     elif mode == SHARED_ROUTED_HOST_CORRECTED_BATCH_SIMD_MODE:
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"] = "1"
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_STAGE5_SIMD"] = "1"
@@ -3566,6 +3656,7 @@ def run_row(args: argparse.Namespace, prompt_id: str, prompt: str, mode: str) ->
             "routed_down_host_recompute_corrections": parse_routed_down_host_recompute_corrections(
                 output
             ),
+            "residual_host_snaps": parse_residual_host_snaps(output),
             "routed_gate_up_taps": parse_routed_gate_up_taps(output),
             "routed_finalize_taps": parse_routed_finalize_taps(output),
             "final_hidden_taps": parse_final_hidden_taps(output),
@@ -3606,6 +3697,7 @@ def run_row(args: argparse.Namespace, prompt_id: str, prompt: str, mode: str) ->
             "routed_down_host_recompute_corrections": parse_routed_down_host_recompute_corrections(
                 output
             ),
+            "residual_host_snaps": parse_residual_host_snaps(output),
             "routed_gate_up_taps": parse_routed_gate_up_taps(output),
             "routed_finalize_taps": parse_routed_finalize_taps(output),
             "final_hidden_taps": parse_final_hidden_taps(output),
@@ -4549,6 +4641,7 @@ def build_report(
     summary["routed_down_host_recompute_correction"] = (
         summarize_routed_down_host_recompute_corrections(rows)
     )
+    summary["residual_host_snap"] = summarize_residual_host_snaps(rows)
     summary["routed_gate_up_tap"] = summarize_routed_gate_up_taps(rows)
     summary["routed_finalize_tap"] = summarize_routed_finalize_taps(rows)
     summary["final_hidden_tap"] = summarize_final_hidden_taps(rows)
@@ -4638,6 +4731,7 @@ def render_markdown(report: dict[str, Any]) -> str:
     shared_mid_host_correction = summary.get("shared_mid_host_correction") or {}
     routed_host_correction = summary.get("routed_host_correction") or {}
     routed_down_recompute = summary.get("routed_down_host_recompute_correction") or {}
+    residual_host_snap = summary.get("residual_host_snap") or {}
     routed_gate_up_tap = summary.get("routed_gate_up_tap") or {}
     routed_finalize_tap = summary.get("routed_finalize_tap") or {}
     final_hidden_tap = summary.get("final_hidden_tap") or {}
@@ -4727,6 +4821,9 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- routed_down_host_recompute_correction_max_host_moe_vs_recomputed_abs: `{render_float(routed_down_recompute.get('max_host_moe_vs_recomputed_abs'), 8)}`",
         f"- routed_down_host_recompute_correction_max_final_vs_host_abs: `{render_float(routed_down_recompute.get('max_final_vs_host_abs'), 8)}`",
         f"- routed_down_host_recompute_correction_max_output_patch_abs: `{render_float(routed_down_recompute.get('max_output_patch_abs'), 8)}`",
+        f"- residual_host_snap_count: `{residual_host_snap.get('snap_count', 0)}`",
+        f"- residual_host_snap_changed_count: `{residual_host_snap.get('changed_count', 0)}`",
+        f"- residual_host_snap_max_patch_abs: `{render_float(residual_host_snap.get('max_patch_abs'), 8)}`",
         f"- routed_gate_up_tap_count: `{routed_gate_up_tap.get('tap_count', 0)}`",
         f"- routed_gate_up_tap_metal_mid_host_topk_matches_host_count: `{routed_gate_up_tap.get('metal_mid_host_topk_matches_host_count', 0)}`",
         f"- routed_gate_up_tap_metal_mid_host_topk_matches_metal_count: `{routed_gate_up_tap.get('metal_mid_host_topk_matches_metal_count', 0)}`",
@@ -5460,6 +5557,39 @@ def render_markdown(report: dict[str, Any]) -> str:
                     changed_moe=correction.get("changed_moe_elems", "-"),
                     changed_output=correction.get("changed_output_elems", "-"),
                     first=correction.get("first_changed_output", "-"),
+                )
+            )
+    residual_snap_rows: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for row in report["rows"]:
+        for snap in row.get("residual_host_snaps") or []:
+            residual_snap_rows.append((row, snap))
+    if residual_snap_rows:
+        ranked_residual_snaps = sorted(
+            residual_snap_rows,
+            key=lambda pair: float(pair[1].get("patch_abs") or 0.0),
+            reverse=True,
+        )
+        lines.extend(
+            [
+                "",
+                "## Residual Host Snap",
+                "",
+                "| Prompt | Mode | Layer | Row | Host final | Metal final | Corrected final | Patch abs | Changed |",
+                "|:---|:---|---:|---:|---:|---:|---:|---:|:---:|",
+            ]
+        )
+        for row, snap in ranked_residual_snaps[:40]:
+            lines.append(
+                "| {prompt} | {mode} | {layer} | {row_idx} | {host} | {metal} | {corrected} | {patch} | {changed} |".format(
+                    prompt=row.get("prompt_id", ""),
+                    mode=row.get("mode", ""),
+                    layer=snap.get("layer", "-"),
+                    row_idx=snap.get("row", "-"),
+                    host=render_float(snap.get("host_final"), 8),
+                    metal=render_float(snap.get("metal_final"), 8),
+                    corrected=render_float(snap.get("corrected_final"), 8),
+                    patch=render_float(snap.get("patch_abs"), 8),
+                    changed=str(bool(snap.get("changed"))).lower(),
                 )
             )
     routed_gate_up_tap_rows: list[tuple[dict[str, Any], dict[str, Any]]] = []

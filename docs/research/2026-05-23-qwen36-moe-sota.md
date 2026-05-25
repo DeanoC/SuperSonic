@@ -2434,6 +2434,65 @@ under the same smoke:
    to identify the first operation that amplifies the prior layer's single-row
    BF16 change.
 
+64. **Qwen3.6 residual host-snap diagnostic**
+   The fused-routed sweep is now schema `v42`. It adds a narrow runtime
+   diagnostic that can overwrite one configured stage-5 FFN output row with the
+   host reference final residual after the Metal native FFN completes:
+   `SUPERSONIC_METAL_QWEN36_FFN_STAGE5_RESIDUAL_HOST_SNAP=1`,
+   `SUPERSONIC_METAL_QWEN36_FFN_STAGE5_RESIDUAL_HOST_SNAP_LAYER=<layer>`, and
+   `SUPERSONIC_METAL_QWEN36_FFN_STAGE5_RESIDUAL_HOST_SNAP_ROW=<hidden-row>`.
+   The sweep exposes two non-promotable modes:
+   `full-stage5-router-simd-batch-residual-snap-layer7-row1621` and
+   `full-stage5-router-simd-batch-shared-mid-residual-snap-layer33-row8`. The
+   latter also keeps the existing shared-mid host correction enabled. Runtime
+   rows are emitted as `[qwen36-ffn-residual-host-snap]`, parsed into
+   `residual_host_snap`, and rendered in Markdown.
+
+   Local validation passed:
+   `PYTHONPYCACHEPREFIX=/private/tmp/supersonic-pycache python3 -m py_compile
+   tests/metal/sweep_qwen36_fused_routed_int4.py
+   tests/test_qwen36_fused_routed_int4_sweep.py`,
+   `PYTHONPYCACHEPREFIX=/private/tmp/supersonic-pycache python3 -m unittest
+   tests.test_qwen36_fused_routed_int4_sweep` (`37` tests),
+   `cargo test -p kernel-ffi qwen36_moe --lib`, `cargo fmt --check`, and
+   `cargo build --release -p runner --bin supersonic`.
+
+   The focused one-token Metal sweep wrote
+   `/private/tmp/qwen36_residual_snap_v42_1tok.{json,md}` with
+   `--modes default,full-stage5-router-simd-batch,
+   full-stage5-router-simd-batch-residual-snap-layer7-row1621,
+   full-stage5-router-simd-batch-shared-mid-host-corrected,
+   full-stage5-router-simd-batch-shared-mid-residual-snap-layer33-row8`
+   plus the same source-aware layer-output policy, shared/routed parity taps,
+   and all-layer delta taps. All five rows ran, generated IDs matched (`[11]`),
+   and promotion stayed false because the snap modes are diagnostic-only.
+
+   The one-token containment result is decisive. Snapping only layer `7` row
+   `1621` changed that row by `0.00048828125`, removed the layer `8` expansion,
+   and reduced the uncorrected path from `65` layer-output mismatches to the
+   later layer-`33`/`34` pattern (`13` mismatches). With shared-mid correction
+   plus snapping layer `33` row `8`, the one-token candidate had zero
+   layer-output delta mismatches, so the layer-`34` expansion is propagation
+   from that single row rather than independent routed-down/finalize drift.
+
+   A smaller two-token follow-up wrote
+   `/private/tmp/qwen36_residual_snap_v42_2tok.{json,md}` for
+   `default,full-stage5-router-simd-batch-shared-mid-residual-snap-layer33-row8`.
+   It still generated `[11,271]`, but hidden-stream promotion remained blocked:
+   position `1` now has an allowed `moe_out_residual_rounding_boundary` at layer
+   `11`, followed by the first `parity_delta_away_from_layer_max` expansion at
+   layer `12` (`max_abs_delta=0.0009765625`, `max_ulp_delta=28689`, `334`
+   differing elements). The diagnostic snapped layer `33` row `8` twice; the
+   first snap changed by `0.000122070312`, while the second token's layer-`33`
+   value already matched and changed by `0`.
+
+   The next correction step should therefore make the residual-snap/replay
+   diagnostic position-aware or multi-boundary, then replay the newly exposed
+   token-1 layer `11`/`12` transition. The useful target is no longer
+   routed-down/finalize; it is containment of repeated one-row BF16 residual
+   cliffs before the following FFN layer amplifies them into broad hidden-stream
+   drift.
+
 ## Sources
 
 - [Qwen/Qwen3.6-35B-A3B model card](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)
