@@ -1165,6 +1165,15 @@ retain the scheduler identity, and `meta.json` records git dirty paths plus a
 worktree diff hash so selector auto-discovery consumes only artifacts matching
 the current checkout unless a historical JSON is supplied explicitly.
 
+Qwen3.6 linear stage-5 profile attribution is aggregate by default: the
+ordinary `SUPERSONIC_METAL_PROFILE=1` pass keeps `qwen36_linear_int4_stage5` as
+one native profile row and one GPU timestamp row. Use
+`SUPERSONIC_METAL_PROFILE_QWEN36_LINEAR_PHASES=1` only for explicit phase
+attribution; it restores the per-phase waited command buffers for
+`qwen36_linear_int4_input_norm`, projections, recurrent update, output gate,
+and out-proj finalize. This keeps default perf JSON from promoting
+phase-profile wait overhead into the next-bottleneck decision.
+
 <!-- AUTOGEN BELOW: apple-m5-max-metal -->
 | Model           |  INT4 |
 | --------------- | ----: |

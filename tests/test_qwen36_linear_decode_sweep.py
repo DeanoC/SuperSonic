@@ -102,13 +102,14 @@ class Qwen36LinearDecodeSweepTests(unittest.TestCase):
 
     def test_build_env_overrides_for_linear_modes(self):
         script = sweep_qwen36_linear_decode
-        args = Namespace(metal_profile=True)
+        args = Namespace(metal_profile=True, metal_profile_phases=False)
 
         default = script.build_env_overrides(args, "default")
         direct_off = script.build_env_overrides(args, "direct-off")
         host = script.build_env_overrides(args, "host-linear")
 
         self.assertEqual(default["SUPERSONIC_METAL_PROFILE"], "1")
+        self.assertNotIn("SUPERSONIC_METAL_PROFILE_QWEN36_LINEAR_PHASES", default)
         self.assertNotIn("SUPERSONIC_METAL_DISABLE_QWEN36_LINEAR_DECODE_DIRECT", default)
         self.assertEqual(
             direct_off["SUPERSONIC_METAL_DISABLE_QWEN36_LINEAR_DECODE_DIRECT"],
@@ -120,6 +121,14 @@ class Qwen36LinearDecodeSweepTests(unittest.TestCase):
         )
         self.assertEqual(
             host["SUPERSONIC_METAL_DISABLE_QWEN36_LINEAR_INT4_STAGE5"],
+            "1",
+        )
+
+        phase_args = Namespace(metal_profile=False, metal_profile_phases=True)
+        phase_default = script.build_env_overrides(phase_args, "default")
+        self.assertEqual(phase_default["SUPERSONIC_METAL_PROFILE"], "1")
+        self.assertEqual(
+            phase_default["SUPERSONIC_METAL_PROFILE_QWEN36_LINEAR_PHASES"],
             "1",
         )
 
@@ -162,6 +171,7 @@ class Qwen36LinearDecodeSweepTests(unittest.TestCase):
             max_new_tokens=2,
             context_size=64,
             metal_profile=True,
+            metal_profile_phases=False,
             promotion_max_headline_ratio=0.999,
             promotion_max_linear_ratio=0.999,
             promotion_max_component_regression_ratio=1.10,

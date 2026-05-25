@@ -806,6 +806,10 @@ bool qwen36_ffn_phase_profile_enabled() {
     return NSProcessInfo.processInfo.environment[@"SUPERSONIC_METAL_PROFILE_QWEN36_FFN_PHASES"] != nil;
 }
 
+bool qwen36_linear_phase_profile_enabled() {
+    return NSProcessInfo.processInfo.environment[@"SUPERSONIC_METAL_PROFILE_QWEN36_LINEAR_PHASES"] != nil;
+}
+
 bool qwen36_ffn_batch_phase_profile_enabled() {
     return NSProcessInfo.processInfo.environment[@"SUPERSONIC_METAL_QWEN36_DECODE_BATCH_PROFILE_FFN_PHASES"] != nil;
 }
@@ -12366,7 +12370,7 @@ extern "C" int supersonic_metal_qwen36_linear_int4_stage5(
                     threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
         };
 
-        bool split_profile = NSProcessInfo.processInfo.environment[@"SUPERSONIC_METAL_PROFILE"] != nil;
+        bool split_profile = qwen36_linear_phase_profile_enabled();
         if (split_profile) {
             if ((status = encode_or_submit_labeled(encode_input_norm, "qwen36_linear_int4_input_norm", 1149, 1150, 1151, 1152)) != 0) return status;
             if ((status = encode_or_submit_labeled(encode_projections, "qwen36_linear_int4_projections", 1153, 1154, 1155, 1156)) != 0) return status;

@@ -172,6 +172,9 @@ def build_env_overrides(args: argparse.Namespace, mode: str) -> dict[str, str]:
     overrides = {"SUPERSONIC_BACKENDS": "metal"}
     if args.metal_profile:
         overrides["SUPERSONIC_METAL_PROFILE"] = "1"
+    if args.metal_profile_phases:
+        overrides["SUPERSONIC_METAL_PROFILE"] = "1"
+        overrides["SUPERSONIC_METAL_PROFILE_QWEN36_LINEAR_PHASES"] = "1"
     if mode == "direct-off":
         overrides["SUPERSONIC_METAL_DISABLE_QWEN36_LINEAR_DECODE_DIRECT"] = "1"
     elif mode == "host-linear":
@@ -657,6 +660,7 @@ def build_report(
         "max_new_tokens": args.max_new_tokens,
         "context_size": args.context_size,
         "metal_profile": args.metal_profile,
+        "metal_profile_phases": args.metal_profile_phases,
         "promotion_thresholds": {
             "max_headline_ratio": args.promotion_max_headline_ratio,
             "max_linear_ratio": args.promotion_max_linear_ratio,
@@ -698,6 +702,7 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- modes: `{','.join(report['modes'])}`",
         f"- max_new_tokens: `{report['max_new_tokens']}`",
         f"- metal_profile: `{report['metal_profile']}`",
+        f"- metal_profile_phases: `{report['metal_profile_phases']}`",
         f"- generated_ids_match: `{summary['generated_ids_match']}`",
         f"- promotion_gate_passed: `{promotion_gate.get('passed', False)}`",
         f"- promotion_gate_passed_modes: `{','.join(promotion_gate.get('passed_modes') or []) or '-'}`",
@@ -766,6 +771,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=20260504)
     parser.add_argument("--timeout", type=int, default=1200)
     parser.add_argument("--metal-profile", action="store_true")
+    parser.add_argument(
+        "--metal-profile-phases",
+        action="store_true",
+        help="split Qwen3.6 linear stage-5 into per-phase Metal profile command buffers",
+    )
     parser.add_argument(
         "--promotion-max-headline-ratio",
         type=float,

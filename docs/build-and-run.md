@@ -344,6 +344,10 @@ Metal currently rejects or defers:
   CPU out of the per-token copy loop and remaps top-k expert IDs inside the
   same Metal command buffer, but remains diagnostic-only because the measured
   wall time is worse than the CPU pack path on this machine. Profile runs keep
+  Qwen3.6 linear stage-5 aggregate by default; set
+  `SUPERSONIC_METAL_PROFILE_QWEN36_LINEAR_PHASES=1` with
+  `SUPERSONIC_METAL_PROFILE=1` only when you need per-phase linear command-buffer
+  attribution and accept the extra waited submits. Profile runs keep
   Qwen3.6 FFN candidate stages aggregate by default; set
   `SUPERSONIC_METAL_PROFILE_QWEN36_FFN_PHASES=1` with
   `SUPERSONIC_METAL_PROFILE=1` only when you need per-phase FFN command-buffer

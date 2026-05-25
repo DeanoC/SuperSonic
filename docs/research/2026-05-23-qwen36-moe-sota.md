@@ -2729,6 +2729,39 @@ under the same smoke:
    measured target therefore remains the Metal linear stage/wait pair plus the
    reduced FFN expert rows, not another residual or route-patch diagnostic.
 
+74. **Qwen3.6 aggregate linear profile gate**
+   Qwen3.6 linear stage-5 profiling now mirrors the FFN profile policy:
+   `SUPERSONIC_METAL_PROFILE=1` keeps the native linear stage aggregate by
+   default, while the heavier per-phase command-buffer split is restored only
+   with `SUPERSONIC_METAL_PROFILE_QWEN36_LINEAR_PHASES=1`. This keeps ordinary
+   bench/profile artifacts from inflating `command_buffer_wait` simply because
+   profile collection split every linear subdispatch into a separate waited
+   command buffer. The linear decode sweep exposes the opt-in as
+   `--metal-profile-phases`, stacked on `--metal-profile`.
+
+   Validation passed: `python3 -m unittest tests.test_qwen36_linear_decode_sweep`,
+   `git diff --check -- crates/kernel-ffi/src/metal_native.mm
+   tests/metal/sweep_qwen36_linear_decode.py
+   tests/test_qwen36_linear_decode_sweep.py`, and
+   `cargo build --release -p runner --bin supersonic`.
+
+   Two one-token Metal smokes both generated `[11]`. The aggregate profile run
+   emitted 33 command-buffer waits, aggregate `qwen36_linear_int4_stage5`
+   native time (`112.249 ms`), and aggregate GPU time
+   `command_buffer_gpu:qwen36_linear_int4_stage5` (`15.152 ms`) with no
+   per-phase linear GPU rows. The explicit phase run emitted 213
+   command-buffer waits and restored the phase GPU rows, led by
+   `command_buffer_gpu:qwen36_linear_int4_projections` (`12.039 ms`),
+   recurrent update (`5.510 ms`), and out-proj finalize (`4.495 ms`). The
+   follow-up `bench-perf` artifact
+   `target/bench-runs/2026-05-25-beb844f/perf/qwen3.6-35b-a3b_int4.json`
+   confirmed schema v9 still writes `metal_profile` and `hal_profile`; it now
+   contains zero default linear subdispatch rows and keeps the aggregate
+   `qwen36_linear_int4_stage5` row (`409.808 ms`, 630 calls). That bench was
+   noisy at median `64.0 ms/token` (`64.0`, `69.6`, `60.6`) and is not a new
+   performance checkpoint; the retained headline target remains the confirmed
+   `58.3 ms/token` run from the h_norm workspace reuse.
+
 ## Sources
 
 - [Qwen/Qwen3.6-35B-A3B model card](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)
