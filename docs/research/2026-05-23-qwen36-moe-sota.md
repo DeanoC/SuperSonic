@@ -2675,6 +2675,30 @@ under the same smoke:
    checkpoint; the next useful FFN step should be a larger routed expert
    compute/residency path, not another small loop cleanup.
 
+72. **Qwen3.6 AArch64 SIMD INT4 LUT dot**
+   The default host INT4 LUT dot now has an AArch64 NEON path. It preserves the
+   existing BF16-rounded 16-entry dequant LUT, uses table lookup to materialize
+   BF16 weights from packed nibbles, and accumulates four F32 vectors per eight
+   packed bytes. Non-AArch64 builds keep the scalar multi-accumulator path.
+
+   Validation passed: `cargo test -p kernel-ffi qwen36_moe --lib`,
+   `cargo build --release -p runner --bin supersonic`, the one-token Qwen3.6
+   Metal INT4 smoke with generated id `[11]`, `rustfmt --check
+   crates/kernel-ffi/src/qwen36_moe.rs`, and `git diff --check
+   -- crates/kernel-ffi/src/qwen36_moe.rs`.
+
+   The first `bench-perf` run was noisy: headline median improved to
+   `62.2 ms/token`, but `total_ms_avg` stayed at `75.252`. A repeat full
+   `bench-perf` run wrote `target/bench-runs/2026-05-25-822b7d7-4` and
+   confirmed the promotion: headline median `61.5 ms/token` versus the previous
+   accepted `78.0`, unprofiled `total_ms_avg=58.702` versus `72.762`, and
+   `ffn_ms_avg=32.238` versus `42.501`. Profile attribution shows the intended
+   expert-row effect: `qwen36_ffn_host_expert_gate_up` dropped to `408.952 ms`
+   from `457.864 ms`, `qwen36_ffn_host_expert_down` to `241.171 ms` from
+   `266.605 ms`, and shared INT4 host rows also improved. The next measured
+   default-lane bottleneck remains the Metal linear stage/wait pair plus the
+   reduced but still dominant FFN expert work.
+
 ## Sources
 
 - [Qwen/Qwen3.6-35B-A3B model card](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)

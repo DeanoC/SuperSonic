@@ -11235,6 +11235,25 @@ unsafe fn qwen36_int4_lut_dot_pairs(
     byte_count: usize,
     lut: &[f32; 16],
 ) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        return unsafe { qwen36_int4_lut_dot_pairs_neon(acc, packed, x, byte_count, lut) };
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        qwen36_int4_lut_dot_pairs_scalar(acc, packed, x, byte_count, lut)
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+#[inline(always)]
+fn qwen36_int4_lut_dot_pairs_scalar(
+    mut acc: f32,
+    packed: *const u8,
+    x: *const f32,
+    byte_count: usize,
+    lut: &[f32; 16],
+) -> f32 {
     let mut byte = 0usize;
     let mut acc0 = 0.0f32;
     let mut acc1 = 0.0f32;
@@ -11273,6 +11292,77 @@ unsafe fn qwen36_int4_lut_dot_pairs(
         byte += 8;
     }
     acc += acc0 + acc1 + acc2 + acc3 + acc4 + acc5 + acc6 + acc7;
+    while byte < byte_count {
+        let b = unsafe { *packed.add(byte) };
+        let x_base = unsafe { x.add(byte * 2) };
+        acc += lut[(b & 0x0f) as usize] * unsafe { *x_base.add(0) }
+            + lut[(b >> 4) as usize] * unsafe { *x_base.add(1) };
+        byte += 1;
+    }
+    acc
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn qwen36_int4_lut_dot_pairs_neon(
+    mut acc: f32,
+    packed: *const u8,
+    x: *const f32,
+    byte_count: usize,
+    lut: &[f32; 16],
+) -> f32 {
+    use std::arch::aarch64::*;
+
+    let mut lut_bytes = [0u8; 32];
+    for (idx, value) in lut.iter().enumerate() {
+        let bf16 = (value.to_bits() >> 16) as u16;
+        lut_bytes[idx * 2] = bf16 as u8;
+        lut_bytes[idx * 2 + 1] = (bf16 >> 8) as u8;
+    }
+    let table = unsafe { vld1q_u8_x2(lut_bytes.as_ptr()) };
+    let low_mask = unsafe { vdup_n_u8(0x0f) };
+    let one = unsafe { vdupq_n_u8(1) };
+
+    let mut byte = 0usize;
+    let mut acc0 = unsafe { vdupq_n_f32(0.0) };
+    let mut acc1 = unsafe { vdupq_n_f32(0.0) };
+    let mut acc2 = unsafe { vdupq_n_f32(0.0) };
+    let mut acc3 = unsafe { vdupq_n_f32(0.0) };
+    while byte + 8 <= byte_count {
+        let packed8 = unsafe { vld1_u8(packed.add(byte)) };
+        let lo = unsafe { vand_u8(packed8, low_mask) };
+        let hi = unsafe { vshr_n_u8::<4>(packed8) };
+        let zipped = unsafe { vzip_u8(lo, hi) };
+        let nibbles = unsafe { vcombine_u8(zipped.0, zipped.1) };
+        let idx_lo = unsafe { vshlq_n_u8::<1>(nibbles) };
+        let idx_hi = unsafe { vorrq_u8(idx_lo, one) };
+        let bf16_lo_bytes = unsafe { vqtbl2q_u8(table, idx_lo) };
+        let bf16_hi_bytes = unsafe { vqtbl2q_u8(table, idx_hi) };
+
+        let bf16_0 = unsafe {
+            vorrq_u16(
+                vmovl_u8(vget_low_u8(bf16_lo_bytes)),
+                vshlq_n_u16::<8>(vmovl_u8(vget_low_u8(bf16_hi_bytes))),
+            )
+        };
+        let bf16_1 = unsafe {
+            vorrq_u16(
+                vmovl_u8(vget_high_u8(bf16_lo_bytes)),
+                vshlq_n_u16::<8>(vmovl_u8(vget_high_u8(bf16_hi_bytes))),
+            )
+        };
+        let w0 = unsafe { vreinterpretq_f32_u32(vshll_n_u16::<16>(vget_low_u16(bf16_0))) };
+        let w1 = unsafe { vreinterpretq_f32_u32(vshll_n_u16::<16>(vget_high_u16(bf16_0))) };
+        let w2 = unsafe { vreinterpretq_f32_u32(vshll_n_u16::<16>(vget_low_u16(bf16_1))) };
+        let w3 = unsafe { vreinterpretq_f32_u32(vshll_n_u16::<16>(vget_high_u16(bf16_1))) };
+        let x_base = unsafe { x.add(byte * 2) };
+        acc0 = unsafe { vfmaq_f32(acc0, w0, vld1q_f32(x_base)) };
+        acc1 = unsafe { vfmaq_f32(acc1, w1, vld1q_f32(x_base.add(4))) };
+        acc2 = unsafe { vfmaq_f32(acc2, w2, vld1q_f32(x_base.add(8))) };
+        acc3 = unsafe { vfmaq_f32(acc3, w3, vld1q_f32(x_base.add(12))) };
+        byte += 8;
+    }
+    acc += unsafe { vaddvq_f32(acc0) + vaddvq_f32(acc1) + vaddvq_f32(acc2) + vaddvq_f32(acc3) };
     while byte < byte_count {
         let b = unsafe { *packed.add(byte) };
         let x_base = unsafe { x.add(byte * 2) };
