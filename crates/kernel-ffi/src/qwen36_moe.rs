@@ -17,11 +17,11 @@
     allow(unused_variables, unused_mut, unreachable_code)
 )]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::{c_int, c_void};
 use std::os::raw::c_uint;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use gpu_hal::{Backend, BufferKind, GpuBuffer, GpuError, ScalarType};
 use half::f16;
@@ -10143,8 +10143,7 @@ fn ffn_step_stage1_5_metal_host(
         h_norm.extend_from_slice(&workspace[off_h_norm..off_h_norm + hidden]);
 
         {
-            let router_logits =
-                &mut workspace[off_router_logits..off_router_logits + num_experts];
+            let router_logits = &mut workspace[off_router_logits..off_router_logits + num_experts];
             qwen36_parallel_chunks_mut(router_logits, 32, |start, chunk| {
                 for (local, logit) in chunk.iter_mut().enumerate() {
                     let expert = start + local;
@@ -11294,6 +11293,105 @@ fn qwen36_host_parallelism(len: usize, min_rows_per_worker: usize) -> usize {
     workers.min(len.div_ceil(min_rows_per_worker)).max(1)
 }
 
+struct Qwen36ParallelCompletion {
+    remaining: AtomicUsize,
+    waiter: std::thread::Thread,
+}
+
+impl Qwen36ParallelCompletion {
+    fn new(count: usize) -> Self {
+        Self {
+            remaining: AtomicUsize::new(count),
+            waiter: std::thread::current(),
+        }
+    }
+
+    fn finish_one(&self) {
+        if self.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.waiter.unpark();
+        }
+    }
+
+    fn wait(&self) {
+        while self.remaining.load(Ordering::Acquire) != 0 {
+            std::thread::park();
+        }
+    }
+}
+
+struct Qwen36ParallelJob {
+    func: unsafe fn(usize, usize, usize),
+    ctx: usize,
+    start: usize,
+    len: usize,
+    done: usize,
+}
+
+struct Qwen36ParallelPool {
+    queue: Mutex<VecDeque<Qwen36ParallelJob>>,
+    cvar: Condvar,
+}
+
+static QWEN36_PARALLEL_POOL: OnceLock<Arc<Qwen36ParallelPool>> = OnceLock::new();
+
+fn qwen36_parallel_pool() -> &'static Arc<Qwen36ParallelPool> {
+    QWEN36_PARALLEL_POOL.get_or_init(|| {
+        let pool = Arc::new(Qwen36ParallelPool {
+            queue: Mutex::new(VecDeque::new()),
+            cvar: Condvar::new(),
+        });
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        for idx in 0..workers {
+            let worker_pool = Arc::clone(&pool);
+            std::thread::Builder::new()
+                .name(format!("qwen36-host-{idx}"))
+                .spawn(move || loop {
+                    let job = {
+                        let mut queue = worker_pool
+                            .queue
+                            .lock()
+                            .expect("qwen36 parallel queue poisoned");
+                        loop {
+                            if let Some(job) = queue.pop_front() {
+                                break job;
+                            }
+                            queue = worker_pool
+                                .cvar
+                                .wait(queue)
+                                .expect("qwen36 parallel queue poisoned");
+                        }
+                    };
+                    unsafe {
+                        (job.func)(job.ctx, job.start, job.len);
+                    }
+                    unsafe {
+                        (*(job.done as *const Qwen36ParallelCompletion)).finish_one();
+                    }
+                })
+                .expect("failed to spawn qwen36 host worker");
+        }
+        pool
+    })
+}
+
+struct Qwen36ChunkCtx<T, F> {
+    base: *mut T,
+    f: *const F,
+}
+
+unsafe fn qwen36_run_chunk_job<T, F>(ctx: usize, start: usize, len: usize)
+where
+    T: Send,
+    F: Fn(usize, &mut [T]) + Sync,
+{
+    let ctx = unsafe { &*(ctx as *const Qwen36ChunkCtx<T, F>) };
+    let chunk = unsafe { std::slice::from_raw_parts_mut(ctx.base.add(start), len) };
+    let f = unsafe { &*ctx.f };
+    f(start, chunk);
+}
+
 fn qwen36_parallel_chunks_mut<T, F>(slice: &mut [T], min_rows_per_worker: usize, f: F)
 where
     T: Send,
@@ -11305,13 +11403,48 @@ where
         return;
     }
     let chunk = slice.len().div_ceil(workers);
-    let f = &f;
-    std::thread::scope(|scope| {
-        for (chunk_idx, chunk_slice) in slice.chunks_mut(chunk).enumerate() {
+    let chunks = slice.len().div_ceil(chunk);
+    let done = Qwen36ParallelCompletion::new(chunks);
+    let ctx = Qwen36ChunkCtx {
+        base: slice.as_mut_ptr(),
+        f: &f as *const F,
+    };
+    let pool = qwen36_parallel_pool();
+    {
+        let mut queue = pool.queue.lock().expect("qwen36 parallel queue poisoned");
+        for chunk_idx in 0..chunks {
             let start = chunk_idx * chunk;
-            scope.spawn(move || f(start, chunk_slice));
+            let len = slice.len().saturating_sub(start).min(chunk);
+            queue.push_back(Qwen36ParallelJob {
+                func: qwen36_run_chunk_job::<T, F>,
+                ctx: &ctx as *const Qwen36ChunkCtx<T, F> as usize,
+                start,
+                len,
+                done: &done as *const Qwen36ParallelCompletion as usize,
+            });
         }
-    });
+    }
+    pool.cvar.notify_all();
+    done.wait();
+}
+
+struct Qwen36Chunk2Ctx<T, U, F> {
+    a_base: *mut T,
+    b_base: *mut U,
+    f: *const F,
+}
+
+unsafe fn qwen36_run_chunk2_job<T, U, F>(ctx: usize, start: usize, len: usize)
+where
+    T: Send,
+    U: Send,
+    F: Fn(usize, &mut [T], &mut [U]) + Sync,
+{
+    let ctx = unsafe { &*(ctx as *const Qwen36Chunk2Ctx<T, U, F>) };
+    let a = unsafe { std::slice::from_raw_parts_mut(ctx.a_base.add(start), len) };
+    let b = unsafe { std::slice::from_raw_parts_mut(ctx.b_base.add(start), len) };
+    let f = unsafe { &*ctx.f };
+    f(start, a, b);
 }
 
 fn qwen36_parallel_chunks2_mut<T, U, F>(a: &mut [T], b: &mut [U], min_rows_per_worker: usize, f: F)
@@ -11327,15 +11460,30 @@ where
         return;
     }
     let chunk = a.len().div_ceil(workers);
-    let f = &f;
-    std::thread::scope(|scope| {
-        for (chunk_idx, (a_chunk, b_chunk)) in
-            a.chunks_mut(chunk).zip(b.chunks_mut(chunk)).enumerate()
-        {
+    let chunks = a.len().div_ceil(chunk);
+    let done = Qwen36ParallelCompletion::new(chunks);
+    let ctx = Qwen36Chunk2Ctx {
+        a_base: a.as_mut_ptr(),
+        b_base: b.as_mut_ptr(),
+        f: &f as *const F,
+    };
+    let pool = qwen36_parallel_pool();
+    {
+        let mut queue = pool.queue.lock().expect("qwen36 parallel queue poisoned");
+        for chunk_idx in 0..chunks {
             let start = chunk_idx * chunk;
-            scope.spawn(move || f(start, a_chunk, b_chunk));
+            let len = a.len().saturating_sub(start).min(chunk);
+            queue.push_back(Qwen36ParallelJob {
+                func: qwen36_run_chunk2_job::<T, U, F>,
+                ctx: &ctx as *const Qwen36Chunk2Ctx<T, U, F> as usize,
+                start,
+                len,
+                done: &done as *const Qwen36ParallelCompletion as usize,
+            });
         }
-    });
+    }
+    pool.cvar.notify_all();
+    done.wait();
 }
 
 fn qwen36_validate_dense_or_int4_sidecars(

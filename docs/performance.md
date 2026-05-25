@@ -1238,9 +1238,18 @@ measured median `96.5 ms/token` with samples `108.8`, `96.5`, `96.1`.
 Unprofiled attribution is now `ffn_ms_avg=60.912`,
 `linear_attn_ms_avg=19.545`, `full_attn_ms_avg=11.610`, and
 `lm_head_ms_avg=4.514`; the one-token Metal smoke still generated `[11]`.
-Profile attribution shows `qwen36_ffn_host_router_topk` reduced to
-`104.827 ms` total. The remaining top rows are `qwen36_linear_int4_stage5`,
-`command_buffer_wait`, and FFN host expert gate/up + down.
+The follow-up host orchestration update routes the hot Qwen3.6 host row helpers
+through a persistent worker pool with atomic countdown completion instead of
+spawning scoped threads for every router/shared/expert phase. The current Apple
+M5 Max `bench-perf` run
+(`target/bench-runs/2026-05-25-fb8eb60-12/perf/qwen3.6-35b-a3b_int4.json`)
+measured median `88.3 ms/token`, improving the `96.5 ms/token` router baseline.
+Unprofiled attribution is now `ffn_ms_avg=53.543`,
+`linear_attn_ms_avg=19.088`, `full_attn_ms_avg=10.232`, and
+`lm_head_ms_avg=4.928`; the one-token Metal smoke still generated `[11]`.
+Profile attribution still names `qwen36_linear_int4_stage5` and
+`command_buffer_wait` as the top rows, followed by FFN host expert gate/up and
+down.
 
 The focused routed-expert microbench exercises the exact Qwen3.6 stage-5 INT4
 shape (`hidden=2048`, `num_experts=256`, `moe_intermediate=512`, `top_k=8`,

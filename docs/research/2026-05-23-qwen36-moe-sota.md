@@ -2595,6 +2595,35 @@ under the same smoke:
    (`341.078 ms`). The next direct FFN target is therefore expert gate/up/down
    arithmetic or a broader submit/residency path, not router/top-k.
 
+69. **Qwen3.6 persistent host FFN worker pool**
+   Acted on the broader FFN host orchestration boundary instead of another
+   narrow arithmetic row. The default Qwen3.6 Metal host fallback now routes the
+   hot `qwen36_parallel_chunks_mut` and `qwen36_parallel_chunks2_mut` helpers
+   through a persistent worker pool with atomic countdown completion. This
+   keeps the existing row partitioning, dot order, BF16 rounding points, and
+   stage behavior intact while avoiding fresh scoped thread creation and
+   per-call `Arc<Mutex+Condvar>` completion allocation for every
+   router/shared/expert phase in every layer.
+
+   Validation passed: `cargo test -p kernel-ffi qwen36_moe --lib`,
+   `cargo build --release -p runner --bin supersonic`, `rustfmt --check
+   crates/kernel-ffi/src/qwen36_moe.rs`, and the one-token Qwen3.6 Metal INT4
+   smoke with generated id `[11]`. The promotion `bench-perf` runs wrote
+   `target/bench-runs/2026-05-25-fb8eb60-11` for the initial pool and
+   `target/bench-runs/2026-05-25-fb8eb60-12` after the atomic completion
+   cleanup. The final measured headline median is `88.3 ms/token`, improving
+   the previous accepted baseline of `96.5 ms/token`.
+
+   The unprofiled stage table is now `ffn_ms_avg=53.543`,
+   `linear_attn_ms_avg=19.088`, `full_attn_ms_avg=10.232`, and
+   `lm_head_ms_avg=4.928`. Profile
+   attribution still names `command_buffer_wait` (`979.313 ms`) and
+   `qwen36_linear_int4_stage5` (`979.161 ms`) as the top profiled rows,
+   followed by FFN expert gate/up (`557.977 ms`) and down (`319.859 ms`). The
+   next measured target should
+   therefore stay on the routed expert gate/up arithmetic/residency path, but
+   the host orchestration tax has been reduced in the default lane.
+
 ## Sources
 
 - [Qwen/Qwen3.6-35B-A3B model card](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)
