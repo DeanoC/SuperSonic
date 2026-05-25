@@ -2275,6 +2275,61 @@ under the same smoke:
    rounding probe/fix for the normal decode-batch path, not another shared
    gate/up approximation experiment.
 
+61. **Qwen3.6 routed-down recompute probe**
+   The fused-routed sweep is now schema `v39`. It adds a diagnostic-only routed
+   down host-recompute correction behind
+   `SUPERSONIC_METAL_QWEN36_FFN_STAGE5_ROUTED_DOWN_HOST_RECOMPUTE_CORRECTION=1`,
+   plus an optional single-layer filter,
+   `SUPERSONIC_METAL_QWEN36_FFN_STAGE5_ROUTED_DOWN_HOST_RECOMPUTE_CORRECTION_LAYER`.
+   The sweep exposes two non-promotable modes:
+   `full-stage5-router-simd-batch-shared-mid-routed-down-host-recomputed` and
+   `full-stage5-router-simd-batch-shared-mid-routed-down-host-recomputed-layer33`.
+   The diagnostic reads Metal top-k, expert-mid, and MoE output, recomputes the
+   routed down/final combine on the host from the Metal intermediates, patches
+   MoE/final output for the active layer, and emits
+   `[qwen36-ffn-routed-down-host-recompute-correction]` rows.
+
+   Local validation passed:
+   `PYTHONPYCACHEPREFIX=/private/tmp/supersonic-pycache python3 -m py_compile
+   tests/metal/sweep_qwen36_fused_routed_int4.py
+   tests/test_qwen36_fused_routed_int4_sweep.py`,
+   `PYTHONPYCACHEPREFIX=/private/tmp/supersonic-pycache python3 -m unittest
+   tests.test_qwen36_fused_routed_int4_sweep`,
+   `cargo test -p kernel-ffi qwen36_moe --lib`, and
+   `cargo build --release -p runner --bin supersonic`. The focused Metal run
+   wrote
+   `/private/tmp/qwen36_routed_down_host_recompute_v39_rebuilt_1tok.{json,md}`
+   with
+   `--modes default,full-stage5-router-simd-batch-shared-mid-host-corrected,full-stage5-router-simd-batch-shared-mid-routed-down-host-recomputed,full-stage5-router-simd-batch-shared-mid-routed-down-host-recomputed-layer33
+   --max-new-tokens 1 --context-size 64 --metal-profile --shared-parity-tap
+   --shared-parity-tap-max-calls 120 --routed-parity-tap
+   --routed-parity-tap-max-calls 120 --layer-output-tap
+   --layer-output-delta-tap --layer-output-delta-all
+   --no-promotion-require-profile`. All four rows ran, generated IDs matched
+   (`[11]`), and the promotion gate stayed false because the new modes are
+   diagnostic-only and still carry layer-output checksum drift.
+
+   The all-layer routed-down recompute is intentionally too invasive: it changes
+   one early BF16 boundary at layer `0`, then the tiny change grows into
+   downstream layer-output drift (`79` checksum mismatches and
+   `max_abs_delta=0.53125`). The layer-filtered mode is the useful attribution
+   result. With only layer `33` active, it emitted exactly one correction row and
+   made no output patch (`changed_moe_elems=0`, `changed_output_elems=0`). Top-k
+   indices and weights matched, `expert_mid_max_abs=4.76837158e-6`, and the
+   Metal MoE already matched the host recompute from Metal expert-mid/top-k
+   exactly (`metal_moe_vs_recomputed_max_abs=0.0`). The host reference differed
+   from that recompute by one BF16 step at row `8`
+   (`host_moe=-0.0219726562`, recomputed/Metal `-0.0220947266`), carrying the
+   same `0.000122070312` final-output delta.
+
+   That rules out routed-down/finalize math as the source of the remaining
+   layer `33` cliff. The boundary is upstream of routed down: tiny routed
+   expert-mid differences, with exact top-k, are enough to flip the BF16 rounded
+   MoE value at one residual row. The next correctness decision should be either
+   a routed expert-mid host-compatible SiLU/multiply experiment, or an explicit
+   measured tolerance policy for these one-ulp BF16 residual boundaries before
+   returning to performance work.
+
 ## Sources
 
 - [Qwen/Qwen3.6-35B-A3B model card](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)

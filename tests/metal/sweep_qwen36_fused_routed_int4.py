@@ -16,7 +16,7 @@ from typing import Any
 
 
 MODEL = "qwen3.6-35b-a3b"
-SCHEMA = "qwen36-fused-routed-int4-sweep-v37"
+SCHEMA = "qwen36-fused-routed-int4-sweep-v39"
 DEFAULT_MAX_FUSED_WALL_GPU_RATIO = 4.0
 DEFAULT_MAX_WAIT_GPU_RATIO = 4.0
 COARSE_BATCH_SERIAL_MODE = "full-stage5-router-batch"
@@ -33,6 +33,12 @@ SHARED_DOWN_TILED_BATCH_SIMD_MODE = "full-stage5-router-simd-batch-shared-down-t
 SHARED_HOST_CORRECTED_BATCH_SIMD_MODE = "full-stage5-router-simd-batch-shared-host-corrected"
 SHARED_MID_HOST_CORRECTED_BATCH_SIMD_MODE = (
     "full-stage5-router-simd-batch-shared-mid-host-corrected"
+)
+SHARED_MID_ROUTED_DOWN_RECOMPUTED_BATCH_SIMD_MODE = (
+    "full-stage5-router-simd-batch-shared-mid-routed-down-host-recomputed"
+)
+SHARED_MID_ROUTED_DOWN_RECOMPUTED_LAYER33_BATCH_SIMD_MODE = (
+    "full-stage5-router-simd-batch-shared-mid-routed-down-host-recomputed-layer33"
 )
 SHARED_ROUTED_HOST_CORRECTED_BATCH_SIMD_MODE = (
     "full-stage5-router-simd-batch-shared-routed-host-corrected"
@@ -86,6 +92,8 @@ BATCH_FAST_PROFILE_MODES = {
     SHARED_HOST_CORRECTED_ROUTED_GATE_UP_HOST_ORDER_BATCH_SIMD_MODE,
     SHARED_HOST_CORRECTED_BATCH_SIMD_MODE,
     SHARED_MID_HOST_CORRECTED_BATCH_SIMD_MODE,
+    SHARED_MID_ROUTED_DOWN_RECOMPUTED_BATCH_SIMD_MODE,
+    SHARED_MID_ROUTED_DOWN_RECOMPUTED_LAYER33_BATCH_SIMD_MODE,
     SHARED_ROUTED_HOST_CORRECTED_BATCH_SIMD_MODE,
     "full-stage5-router-batch-phases",
     "full-stage5-router-batch-ffn-phases",
@@ -99,6 +107,8 @@ DIAGNOSTIC_ONLY_MODES = {
     ROUTED_GATE_UP_HOST_ORDER_FINALIZE_TAP_BATCH_SIMD_MODE,
     SHARED_HOST_CORRECTED_BATCH_SIMD_MODE,
     SHARED_MID_HOST_CORRECTED_BATCH_SIMD_MODE,
+    SHARED_MID_ROUTED_DOWN_RECOMPUTED_BATCH_SIMD_MODE,
+    SHARED_MID_ROUTED_DOWN_RECOMPUTED_LAYER33_BATCH_SIMD_MODE,
     SHARED_HOST_CORRECTED_ROUTED_GATE_UP_HOST_ORDER_BATCH_SIMD_MODE,
     SHARED_ROUTED_HOST_CORRECTED_BATCH_SIMD_MODE,
 }
@@ -204,6 +214,16 @@ MODE_ALIASES: dict[str, str] = {
     "full-router-simd-batch-shared-mid-host-corrected": SHARED_MID_HOST_CORRECTED_BATCH_SIMD_MODE,
     "shared-mid-host-corrected": SHARED_MID_HOST_CORRECTED_BATCH_SIMD_MODE,
     SHARED_MID_HOST_CORRECTED_BATCH_SIMD_MODE: SHARED_MID_HOST_CORRECTED_BATCH_SIMD_MODE,
+    "router-simd-batch-shared-mid-routed-down-host-recomputed": SHARED_MID_ROUTED_DOWN_RECOMPUTED_BATCH_SIMD_MODE,
+    "batch-router-simd-shared-mid-routed-down-host-recomputed": SHARED_MID_ROUTED_DOWN_RECOMPUTED_BATCH_SIMD_MODE,
+    "full-router-simd-batch-shared-mid-routed-down-host-recomputed": SHARED_MID_ROUTED_DOWN_RECOMPUTED_BATCH_SIMD_MODE,
+    "shared-mid-routed-down-host-recomputed": SHARED_MID_ROUTED_DOWN_RECOMPUTED_BATCH_SIMD_MODE,
+    SHARED_MID_ROUTED_DOWN_RECOMPUTED_BATCH_SIMD_MODE: SHARED_MID_ROUTED_DOWN_RECOMPUTED_BATCH_SIMD_MODE,
+    "router-simd-batch-shared-mid-routed-down-host-recomputed-layer33": SHARED_MID_ROUTED_DOWN_RECOMPUTED_LAYER33_BATCH_SIMD_MODE,
+    "batch-router-simd-shared-mid-routed-down-host-recomputed-layer33": SHARED_MID_ROUTED_DOWN_RECOMPUTED_LAYER33_BATCH_SIMD_MODE,
+    "full-router-simd-batch-shared-mid-routed-down-host-recomputed-layer33": SHARED_MID_ROUTED_DOWN_RECOMPUTED_LAYER33_BATCH_SIMD_MODE,
+    "shared-mid-routed-down-host-recomputed-layer33": SHARED_MID_ROUTED_DOWN_RECOMPUTED_LAYER33_BATCH_SIMD_MODE,
+    SHARED_MID_ROUTED_DOWN_RECOMPUTED_LAYER33_BATCH_SIMD_MODE: SHARED_MID_ROUTED_DOWN_RECOMPUTED_LAYER33_BATCH_SIMD_MODE,
     "router-simd-batch-shared-routed-host-corrected": SHARED_ROUTED_HOST_CORRECTED_BATCH_SIMD_MODE,
     "batch-router-simd-shared-routed-host-corrected": SHARED_ROUTED_HOST_CORRECTED_BATCH_SIMD_MODE,
     "full-router-simd-batch-shared-routed-host-corrected": SHARED_ROUTED_HOST_CORRECTED_BATCH_SIMD_MODE,
@@ -273,6 +293,8 @@ FUSED_OP_NEEDLES = {
     SHARED_HOST_CORRECTED_ROUTED_GATE_UP_HOST_ORDER_BATCH_SIMD_MODE: "qwen36_ffn_int4_stage5_with_router",
     SHARED_HOST_CORRECTED_BATCH_SIMD_MODE: "qwen36_ffn_int4_stage5_with_router",
     SHARED_MID_HOST_CORRECTED_BATCH_SIMD_MODE: "qwen36_ffn_int4_stage5_with_router",
+    SHARED_MID_ROUTED_DOWN_RECOMPUTED_BATCH_SIMD_MODE: "qwen36_ffn_int4_stage5_with_router",
+    SHARED_MID_ROUTED_DOWN_RECOMPUTED_LAYER33_BATCH_SIMD_MODE: "qwen36_ffn_int4_stage5_with_router",
     SHARED_ROUTED_HOST_CORRECTED_BATCH_SIMD_MODE: "qwen36_ffn_int4_stage5_with_router",
     "full-stage5-router-batch-phases": "qwen36_ffn_int4_stage5_with_router",
     "full-stage5-router-batch-ffn-phases": "qwen36_ffn_int4",
@@ -444,6 +466,12 @@ FUSED_GPU_OP_PREFIXES[SHARED_HOST_CORRECTED_BATCH_SIMD_MODE] = FUSED_GPU_OP_PREF
 FUSED_GPU_OP_PREFIXES[SHARED_MID_HOST_CORRECTED_BATCH_SIMD_MODE] = FUSED_GPU_OP_PREFIXES[
     "full-stage5-router-simd-batch"
 ]
+FUSED_GPU_OP_PREFIXES[SHARED_MID_ROUTED_DOWN_RECOMPUTED_BATCH_SIMD_MODE] = FUSED_GPU_OP_PREFIXES[
+    "full-stage5-router-simd-batch"
+]
+FUSED_GPU_OP_PREFIXES[
+    SHARED_MID_ROUTED_DOWN_RECOMPUTED_LAYER33_BATCH_SIMD_MODE
+] = FUSED_GPU_OP_PREFIXES["full-stage5-router-simd-batch"]
 FUSED_GPU_OP_PREFIXES[SHARED_ROUTED_HOST_CORRECTED_BATCH_SIMD_MODE] = FUSED_GPU_OP_PREFIXES[
     "full-stage5-router-simd-batch"
 ]
@@ -640,6 +668,19 @@ def parse_routed_host_corrections(output: str) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for line in output.splitlines():
         if not line.startswith("[qwen36-ffn-routed-host-correction]"):
+            continue
+        fields = {
+            key: parse_number(value)
+            for key, value in parse_key_values(line).items()
+        }
+        rows.append(fields)
+    return rows
+
+
+def parse_routed_down_host_recompute_corrections(output: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for line in output.splitlines():
+        if not line.startswith("[qwen36-ffn-routed-down-host-recompute-correction]"):
             continue
         fields = {
             key: parse_number(value)
@@ -1136,6 +1177,121 @@ def summarize_routed_host_corrections(rows: list[dict[str, Any]]) -> dict[str, A
                 "output_patch_argmax": item.get("output_patch_argmax"),
                 "host_final_out_at_argmax": item.get("host_final_out_at_argmax"),
                 "metal_final_out_at_argmax": item.get("metal_final_out_at_argmax"),
+                "changed_output_elems": item.get("changed_output_elems"),
+                "first_changed_output": item.get("first_changed_output"),
+            }
+            for item in ranked[:20]
+        ],
+    }
+
+
+def summarize_routed_down_host_recompute_corrections(
+    rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    corrections = [
+        correction
+        for row in rows
+        for correction in (row.get("routed_down_host_recompute_corrections") or [])
+    ]
+    paths = sorted({str(correction.get("router_path") or "-") for correction in corrections})
+    changed = [
+        correction
+        for correction in corrections
+        if int(correction.get("changed_output_elems") or 0) > 0
+    ]
+    ranked = sorted(
+        corrections,
+        key=lambda correction: max(
+            float(correction.get("metal_moe_vs_recomputed_max_abs") or 0.0),
+            float(correction.get("host_moe_vs_recomputed_max_abs") or 0.0),
+            float(correction.get("final_vs_host_max_abs") or 0.0),
+            float(correction.get("output_patch_max_abs") or 0.0),
+        ),
+        reverse=True,
+    )
+    return {
+        "correction_count": len(corrections),
+        "changed_count": len(changed),
+        "paths": paths,
+        "max_topk_weight_abs": max(
+            (float(item.get("topk_weight_max_abs") or 0.0) for item in corrections),
+            default=0.0,
+        ),
+        "max_expert_mid_abs": max(
+            (float(item.get("expert_mid_max_abs") or 0.0) for item in corrections),
+            default=0.0,
+        ),
+        "max_metal_moe_vs_recomputed_abs": max(
+            (
+                float(item.get("metal_moe_vs_recomputed_max_abs") or 0.0)
+                for item in corrections
+            ),
+            default=0.0,
+        ),
+        "max_host_moe_vs_recomputed_abs": max(
+            (
+                float(item.get("host_moe_vs_recomputed_max_abs") or 0.0)
+                for item in corrections
+            ),
+            default=0.0,
+        ),
+        "max_output_patch_abs": max(
+            (float(item.get("output_patch_max_abs") or 0.0) for item in corrections),
+            default=0.0,
+        ),
+        "max_final_vs_host_abs": max(
+            (float(item.get("final_vs_host_max_abs") or 0.0) for item in corrections),
+            default=0.0,
+        ),
+        "max_changed_moe_elems": max(
+            (int(item.get("changed_moe_elems") or 0) for item in corrections),
+            default=0,
+        ),
+        "max_changed_output_elems": max(
+            (int(item.get("changed_output_elems") or 0) for item in corrections),
+            default=0,
+        ),
+        "worst_examples": [
+            {
+                "layer": item.get("layer"),
+                "path": item.get("router_path") or "-",
+                "topk_idx_match": item.get("topk_idx_match"),
+                "topk_weight_max_abs": item.get("topk_weight_max_abs"),
+                "expert_mid_max_abs": item.get("expert_mid_max_abs"),
+                "expert_mid_argmax": item.get("expert_mid_argmax"),
+                "host_expert_mid_at_argmax": item.get("host_expert_mid_at_argmax"),
+                "metal_expert_mid_at_argmax": item.get("metal_expert_mid_at_argmax"),
+                "metal_moe_vs_recomputed_max_abs": item.get(
+                    "metal_moe_vs_recomputed_max_abs"
+                ),
+                "metal_moe_vs_recomputed_argmax": item.get(
+                    "metal_moe_vs_recomputed_argmax"
+                ),
+                "recomputed_moe_at_moe_argmax": item.get(
+                    "recomputed_moe_at_moe_argmax"
+                ),
+                "host_moe_at_moe_argmax": item.get("host_moe_at_moe_argmax"),
+                "metal_moe_at_moe_argmax": item.get("metal_moe_at_moe_argmax"),
+                "host_moe_vs_recomputed_max_abs": item.get(
+                    "host_moe_vs_recomputed_max_abs"
+                ),
+                "host_moe_vs_recomputed_argmax": item.get(
+                    "host_moe_vs_recomputed_argmax"
+                ),
+                "recomputed_moe_at_host_argmax": item.get(
+                    "recomputed_moe_at_host_argmax"
+                ),
+                "host_moe_at_host_argmax": item.get("host_moe_at_host_argmax"),
+                "metal_moe_at_host_argmax": item.get("metal_moe_at_host_argmax"),
+                "output_patch_max_abs": item.get("output_patch_max_abs"),
+                "output_patch_argmax": item.get("output_patch_argmax"),
+                "final_vs_host_max_abs": item.get("final_vs_host_max_abs"),
+                "final_vs_host_argmax": item.get("final_vs_host_argmax"),
+                "host_final_at_final_argmax": item.get("host_final_at_final_argmax"),
+                "recomputed_final_at_final_argmax": item.get(
+                    "recomputed_final_at_final_argmax"
+                ),
+                "changed_moe_elems": item.get("changed_moe_elems"),
                 "changed_output_elems": item.get("changed_output_elems"),
                 "first_changed_output": item.get("first_changed_output"),
             }
@@ -2670,6 +2826,25 @@ def build_env_overrides(args: argparse.Namespace, mode: str) -> dict[str, str]:
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_STAGE5_SIMD"] = "1"
         overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH"] = "1"
         overrides["SUPERSONIC_METAL_QWEN36_FFN_STAGE5_SHARED_MID_HOST_CORRECTION"] = "1"
+    elif mode == SHARED_MID_ROUTED_DOWN_RECOMPUTED_BATCH_SIMD_MODE:
+        overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"] = "1"
+        overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_STAGE5_SIMD"] = "1"
+        overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH"] = "1"
+        overrides["SUPERSONIC_METAL_QWEN36_FFN_STAGE5_SHARED_MID_HOST_CORRECTION"] = "1"
+        overrides[
+            "SUPERSONIC_METAL_QWEN36_FFN_STAGE5_ROUTED_DOWN_HOST_RECOMPUTE_CORRECTION"
+        ] = "1"
+    elif mode == SHARED_MID_ROUTED_DOWN_RECOMPUTED_LAYER33_BATCH_SIMD_MODE:
+        overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"] = "1"
+        overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_STAGE5_SIMD"] = "1"
+        overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH"] = "1"
+        overrides["SUPERSONIC_METAL_QWEN36_FFN_STAGE5_SHARED_MID_HOST_CORRECTION"] = "1"
+        overrides[
+            "SUPERSONIC_METAL_QWEN36_FFN_STAGE5_ROUTED_DOWN_HOST_RECOMPUTE_CORRECTION"
+        ] = "1"
+        overrides[
+            "SUPERSONIC_METAL_QWEN36_FFN_STAGE5_ROUTED_DOWN_HOST_RECOMPUTE_CORRECTION_LAYER"
+        ] = "33"
     elif mode == SHARED_ROUTED_HOST_CORRECTED_BATCH_SIMD_MODE:
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"] = "1"
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_STAGE5_SIMD"] = "1"
@@ -3035,6 +3210,9 @@ def run_row(args: argparse.Namespace, prompt_id: str, prompt: str, mode: str) ->
             "shared_host_corrections": parse_shared_host_corrections(output),
             "shared_mid_host_corrections": parse_shared_mid_host_corrections(output),
             "routed_host_corrections": parse_routed_host_corrections(output),
+            "routed_down_host_recompute_corrections": parse_routed_down_host_recompute_corrections(
+                output
+            ),
             "routed_gate_up_taps": parse_routed_gate_up_taps(output),
             "routed_finalize_taps": parse_routed_finalize_taps(output),
             "final_hidden_taps": parse_final_hidden_taps(output),
@@ -3072,6 +3250,9 @@ def run_row(args: argparse.Namespace, prompt_id: str, prompt: str, mode: str) ->
             "shared_host_corrections": parse_shared_host_corrections(output),
             "shared_mid_host_corrections": parse_shared_mid_host_corrections(output),
             "routed_host_corrections": parse_routed_host_corrections(output),
+            "routed_down_host_recompute_corrections": parse_routed_down_host_recompute_corrections(
+                output
+            ),
             "routed_gate_up_taps": parse_routed_gate_up_taps(output),
             "routed_finalize_taps": parse_routed_finalize_taps(output),
             "final_hidden_taps": parse_final_hidden_taps(output),
@@ -3922,6 +4103,9 @@ def build_report(
     summary["shared_host_correction"] = summarize_shared_host_corrections(rows)
     summary["shared_mid_host_correction"] = summarize_shared_mid_host_corrections(rows)
     summary["routed_host_correction"] = summarize_routed_host_corrections(rows)
+    summary["routed_down_host_recompute_correction"] = (
+        summarize_routed_down_host_recompute_corrections(rows)
+    )
     summary["routed_gate_up_tap"] = summarize_routed_gate_up_taps(rows)
     summary["routed_finalize_tap"] = summarize_routed_finalize_taps(rows)
     summary["final_hidden_tap"] = summarize_final_hidden_taps(rows)
@@ -4006,6 +4190,7 @@ def render_markdown(report: dict[str, Any]) -> str:
     shared_host_correction = summary.get("shared_host_correction") or {}
     shared_mid_host_correction = summary.get("shared_mid_host_correction") or {}
     routed_host_correction = summary.get("routed_host_correction") or {}
+    routed_down_recompute = summary.get("routed_down_host_recompute_correction") or {}
     routed_gate_up_tap = summary.get("routed_gate_up_tap") or {}
     routed_finalize_tap = summary.get("routed_finalize_tap") or {}
     final_hidden_tap = summary.get("final_hidden_tap") or {}
@@ -4080,6 +4265,12 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- routed_host_correction_max_expert_mid_recompute_abs: `{render_float(routed_host_correction.get('max_expert_mid_recompute_abs'), 8)}`",
         f"- routed_host_correction_max_moe_out_abs: `{render_float(routed_host_correction.get('max_moe_out_abs'), 8)}`",
         f"- routed_host_correction_max_output_patch_abs: `{render_float(routed_host_correction.get('max_output_patch_abs'), 8)}`",
+        f"- routed_down_host_recompute_correction_count: `{routed_down_recompute.get('correction_count', 0)}`",
+        f"- routed_down_host_recompute_correction_changed_count: `{routed_down_recompute.get('changed_count', 0)}`",
+        f"- routed_down_host_recompute_correction_max_metal_moe_vs_recomputed_abs: `{render_float(routed_down_recompute.get('max_metal_moe_vs_recomputed_abs'), 8)}`",
+        f"- routed_down_host_recompute_correction_max_host_moe_vs_recomputed_abs: `{render_float(routed_down_recompute.get('max_host_moe_vs_recomputed_abs'), 8)}`",
+        f"- routed_down_host_recompute_correction_max_final_vs_host_abs: `{render_float(routed_down_recompute.get('max_final_vs_host_abs'), 8)}`",
+        f"- routed_down_host_recompute_correction_max_output_patch_abs: `{render_float(routed_down_recompute.get('max_output_patch_abs'), 8)}`",
         f"- routed_gate_up_tap_count: `{routed_gate_up_tap.get('tap_count', 0)}`",
         f"- routed_gate_up_tap_metal_mid_host_topk_matches_host_count: `{routed_gate_up_tap.get('metal_mid_host_topk_matches_host_count', 0)}`",
         f"- routed_gate_up_tap_metal_mid_host_topk_matches_metal_count: `{routed_gate_up_tap.get('metal_mid_host_topk_matches_metal_count', 0)}`",
@@ -4744,6 +4935,74 @@ def render_markdown(report: dict[str, Any]) -> str:
                     host_final=render_float(correction.get("host_final_out_at_argmax"), 8),
                     metal_final=render_float(correction.get("metal_final_out_at_argmax"), 8),
                     changed=correction.get("changed_output_elems", "-"),
+                    first=correction.get("first_changed_output", "-"),
+                )
+            )
+    routed_down_recompute_rows: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for row in report["rows"]:
+        for correction in row.get("routed_down_host_recompute_corrections") or []:
+            routed_down_recompute_rows.append((row, correction))
+    if routed_down_recompute_rows:
+        ranked_routed_down_recompute = sorted(
+            routed_down_recompute_rows,
+            key=lambda pair: max(
+                float(pair[1].get("metal_moe_vs_recomputed_max_abs") or 0.0),
+                float(pair[1].get("host_moe_vs_recomputed_max_abs") or 0.0),
+                float(pair[1].get("final_vs_host_max_abs") or 0.0),
+                float(pair[1].get("output_patch_max_abs") or 0.0),
+            ),
+            reverse=True,
+        )
+        lines.extend(
+            [
+                "",
+                "## Routed Down Host Recompute Correction",
+                "",
+                "| Prompt | Mode | Router | Layer | TopK match | TopK weight max | Expert mid max | Expert mid idx | Metal-vs-recompute max | Metal-vs-recompute idx | Recomputed MoE | Host MoE | Metal MoE | Host-vs-recompute max | Host-vs-recompute idx | Recomputed at host idx | Host at host idx | Metal at host idx | Output patch max | Output patch idx | Final-vs-host max | Final-vs-host idx | Host final | Recomputed final | Changed MoE | Changed output | First changed |",
+                "|:---|:---|:---|---:|:---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+            ]
+        )
+        for row, correction in ranked_routed_down_recompute[:40]:
+            lines.append(
+                "| {prompt} | {mode} | {path} | {layer} | {topk_match} | {topk_weight} | {mid} | {mid_idx} | {metal_delta} | {metal_idx} | {recomputed_moe} | {host_moe} | {metal_moe} | {host_delta} | {host_idx} | {recomputed_host} | {host_host} | {metal_host} | {patch} | {patch_idx} | {final_delta} | {final_idx} | {host_final} | {recomputed_final} | {changed_moe} | {changed_output} | {first} |".format(
+                    prompt=row.get("prompt_id", ""),
+                    mode=row.get("mode", ""),
+                    path=correction.get("router_path", "-"),
+                    layer=correction.get("layer", "-"),
+                    topk_match=str(bool(correction.get("topk_idx_match"))).lower(),
+                    topk_weight=render_float(correction.get("topk_weight_max_abs"), 8),
+                    mid=render_float(correction.get("expert_mid_max_abs"), 8),
+                    mid_idx=correction.get("expert_mid_argmax", "-"),
+                    metal_delta=render_float(
+                        correction.get("metal_moe_vs_recomputed_max_abs"), 8
+                    ),
+                    metal_idx=correction.get("metal_moe_vs_recomputed_argmax", "-"),
+                    recomputed_moe=render_float(
+                        correction.get("recomputed_moe_at_moe_argmax"), 8
+                    ),
+                    host_moe=render_float(correction.get("host_moe_at_moe_argmax"), 8),
+                    metal_moe=render_float(correction.get("metal_moe_at_moe_argmax"), 8),
+                    host_delta=render_float(
+                        correction.get("host_moe_vs_recomputed_max_abs"), 8
+                    ),
+                    host_idx=correction.get("host_moe_vs_recomputed_argmax", "-"),
+                    recomputed_host=render_float(
+                        correction.get("recomputed_moe_at_host_argmax"), 8
+                    ),
+                    host_host=render_float(correction.get("host_moe_at_host_argmax"), 8),
+                    metal_host=render_float(correction.get("metal_moe_at_host_argmax"), 8),
+                    patch=render_float(correction.get("output_patch_max_abs"), 8),
+                    patch_idx=correction.get("output_patch_argmax", "-"),
+                    final_delta=render_float(correction.get("final_vs_host_max_abs"), 8),
+                    final_idx=correction.get("final_vs_host_argmax", "-"),
+                    host_final=render_float(
+                        correction.get("host_final_at_final_argmax"), 8
+                    ),
+                    recomputed_final=render_float(
+                        correction.get("recomputed_final_at_final_argmax"), 8
+                    ),
+                    changed_moe=correction.get("changed_moe_elems", "-"),
+                    changed_output=correction.get("changed_output_elems", "-"),
                     first=correction.get("first_changed_output", "-"),
                 )
             )

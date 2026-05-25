@@ -125,7 +125,7 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
 
         self.assertEqual(
             script.parse_modes(
-                "baseline,direct,direct-defer,defer-direct-wait,gpu-pack,gpack,stage5,native-stage5,router,router-simd,router-batch,batch-router,router-simd-batch,batch-router-simd,router-simd-batch-shared-tiled,batch-router-simd-shared-tiled,router-simd-batch-shared-gate-up-tiled,router-simd-batch-shared-gate-up-exp2,router-simd-batch-shared-scalar-simd,router-simd-batch-shared-down-tiled,router-simd-batch-routed-gate-up-tap,router-simd-batch-routed-gate-up-host-order-tap,router-simd-batch-routed-gate-up-host-order,router-simd-batch-shared-host-corrected-routed-gate-up-host-order,router-simd-batch-shared-host-corrected,router-simd-batch-shared-mid-host-corrected,router-simd-batch-shared-routed-host-corrected,router-batch-deferred-phases,batch-router-deferred-phases,router-simd-batch-deferred-phases,batch-router-simd-deferred-phases,router-simd-batch-shared-tiled-deferred-phases,batch-router-simd-shared-tiled-deferred-phases,router-batch-phases,batch-router-phases,router-batch-ffn-phases,batch-router-ffn-phases,router-simd-batch-phases,router-simd-batch-ffn-phases,router-simd-batch-shared-tiled-ffn-phases,batch-router-simd-shared-tiled-ffn-phases,router-defer"
+                "baseline,direct,direct-defer,defer-direct-wait,gpu-pack,gpack,stage5,native-stage5,router,router-simd,router-batch,batch-router,router-simd-batch,batch-router-simd,router-simd-batch-shared-tiled,batch-router-simd-shared-tiled,router-simd-batch-shared-gate-up-tiled,router-simd-batch-shared-gate-up-exp2,router-simd-batch-shared-scalar-simd,router-simd-batch-shared-down-tiled,router-simd-batch-routed-gate-up-tap,router-simd-batch-routed-gate-up-host-order-tap,router-simd-batch-routed-gate-up-host-order,router-simd-batch-shared-host-corrected-routed-gate-up-host-order,router-simd-batch-shared-host-corrected,router-simd-batch-shared-mid-host-corrected,router-simd-batch-shared-mid-routed-down-host-recomputed,router-simd-batch-shared-mid-routed-down-host-recomputed-layer33,router-simd-batch-shared-routed-host-corrected,router-batch-deferred-phases,batch-router-deferred-phases,router-simd-batch-deferred-phases,batch-router-simd-deferred-phases,router-simd-batch-shared-tiled-deferred-phases,batch-router-simd-shared-tiled-deferred-phases,router-batch-phases,batch-router-phases,router-batch-ffn-phases,batch-router-ffn-phases,router-simd-batch-phases,router-simd-batch-ffn-phases,router-simd-batch-shared-tiled-ffn-phases,batch-router-simd-shared-tiled-ffn-phases,router-defer"
             ),
             [
                 "default",
@@ -148,6 +148,8 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
                 "full-stage5-router-simd-batch-shared-host-corrected-routed-gate-up-host-order",
                 "full-stage5-router-simd-batch-shared-host-corrected",
                 "full-stage5-router-simd-batch-shared-mid-host-corrected",
+                "full-stage5-router-simd-batch-shared-mid-routed-down-host-recomputed",
+                "full-stage5-router-simd-batch-shared-mid-routed-down-host-recomputed-layer33",
                 "full-stage5-router-simd-batch-shared-routed-host-corrected",
                 "full-stage5-router-batch-deferred-phases",
                 "full-stage5-router-simd-batch-deferred-phases",
@@ -233,6 +235,18 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
         full_stage5_router_simd_batch_shared_mid_host_corrected = script.build_env_overrides(
             args,
             "full-stage5-router-simd-batch-shared-mid-host-corrected",
+        )
+        full_stage5_router_simd_batch_shared_mid_routed_down_recomputed = (
+            script.build_env_overrides(
+                args,
+                "full-stage5-router-simd-batch-shared-mid-routed-down-host-recomputed",
+            )
+        )
+        full_stage5_router_simd_batch_shared_mid_routed_down_recomputed_layer33 = (
+            script.build_env_overrides(
+                args,
+                "full-stage5-router-simd-batch-shared-mid-routed-down-host-recomputed-layer33",
+            )
         )
         full_stage5_router_simd_batch_shared_routed_host_corrected = script.build_env_overrides(
             args,
@@ -530,6 +544,42 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
                 "SUPERSONIC_METAL_QWEN36_FFN_STAGE5_SHARED_MID_HOST_CORRECTION"
             ],
             "1",
+        )
+        self.assertEqual(
+            full_stage5_router_simd_batch_shared_mid_routed_down_recomputed[
+                "SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_STAGE5_SIMD"
+            ],
+            "1",
+        )
+        self.assertEqual(
+            full_stage5_router_simd_batch_shared_mid_routed_down_recomputed[
+                "SUPERSONIC_METAL_QWEN36_DECODE_BATCH"
+            ],
+            "1",
+        )
+        self.assertEqual(
+            full_stage5_router_simd_batch_shared_mid_routed_down_recomputed[
+                "SUPERSONIC_METAL_QWEN36_FFN_STAGE5_SHARED_MID_HOST_CORRECTION"
+            ],
+            "1",
+        )
+        self.assertEqual(
+            full_stage5_router_simd_batch_shared_mid_routed_down_recomputed[
+                "SUPERSONIC_METAL_QWEN36_FFN_STAGE5_ROUTED_DOWN_HOST_RECOMPUTE_CORRECTION"
+            ],
+            "1",
+        )
+        self.assertEqual(
+            full_stage5_router_simd_batch_shared_mid_routed_down_recomputed_layer33[
+                "SUPERSONIC_METAL_QWEN36_FFN_STAGE5_ROUTED_DOWN_HOST_RECOMPUTE_CORRECTION"
+            ],
+            "1",
+        )
+        self.assertEqual(
+            full_stage5_router_simd_batch_shared_mid_routed_down_recomputed_layer33[
+                "SUPERSONIC_METAL_QWEN36_FFN_STAGE5_ROUTED_DOWN_HOST_RECOMPUTE_CORRECTION_LAYER"
+            ],
+            "33",
         )
         self.assertEqual(
             full_stage5_router_simd_batch_shared_routed_host_corrected[
@@ -870,6 +920,16 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
             "Hello",
             "full-stage5-router-simd-batch-shared-mid-host-corrected",
         )
+        simd_batch_shared_mid_routed_down_recomputed = script.build_command(
+            args,
+            "Hello",
+            "full-stage5-router-simd-batch-shared-mid-routed-down-host-recomputed",
+        )
+        simd_batch_shared_mid_routed_down_recomputed_layer33 = script.build_command(
+            args,
+            "Hello",
+            "full-stage5-router-simd-batch-shared-mid-routed-down-host-recomputed-layer33",
+        )
         simd_batch_shared_routed_host_corrected = script.build_command(
             args,
             "Hello",
@@ -890,6 +950,11 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
         self.assertNotIn("--emit-stage-timings", simd_batch_shared_tiled_ffn_phases)
         self.assertNotIn("--emit-stage-timings", simd_batch_shared_host_corrected)
         self.assertNotIn("--emit-stage-timings", simd_batch_shared_mid_host_corrected)
+        self.assertNotIn("--emit-stage-timings", simd_batch_shared_mid_routed_down_recomputed)
+        self.assertNotIn(
+            "--emit-stage-timings",
+            simd_batch_shared_mid_routed_down_recomputed_layer33,
+        )
         self.assertNotIn("--emit-stage-timings", simd_batch_shared_routed_host_corrected)
         self.assertIn("--emit-generated-json", batch)
 
@@ -1142,6 +1207,8 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
         for mode in (
             "full-stage5-router-simd-batch-shared-host-corrected",
             "full-stage5-router-simd-batch-shared-mid-host-corrected",
+            "full-stage5-router-simd-batch-shared-mid-routed-down-host-recomputed",
+            "full-stage5-router-simd-batch-shared-mid-routed-down-host-recomputed-layer33",
             "full-stage5-router-simd-batch-shared-routed-host-corrected",
         ):
             candidate = row(mode, ids=[11, 271], headline=90.0, ffn=40.0, wait=9.0)
@@ -2019,6 +2086,91 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
             md,
         )
         self.assertIn("| 17 | 2 | 1 | 1.25000000 | 1.24998474 | 0.00001526 |", md)
+
+    def test_routed_down_host_recompute_correction_rows_are_parsed_and_rendered(self):
+        script = sweep_qwen36_fused_routed_int4
+        output = (
+            "[qwen36-ffn-routed-down-host-recompute-correction] layer=33 "
+            "router_path=simd hidden=2048 top_k=8 topk_idx_match=1 "
+            "topk_weight_max_abs=0.00000000e+00 topk_weight_argmax=0 "
+            "expert_mid_max_abs=1.19209290e-07 expert_mid_argmax=12 "
+            "expert_mid_group=0 expert_mid_row=12 "
+            "host_expert_mid_at_argmax=1.00000000e+00 "
+            "metal_expert_mid_at_argmax=9.99999881e-01 "
+            "metal_moe_vs_recomputed_max_abs=1.22070312e-04 "
+            "metal_moe_vs_recomputed_argmax=8 "
+            "recomputed_down_acc_at_moe_argmax=-2.19726562e-02 "
+            "recomputed_moe_at_moe_argmax=-2.19726562e-02 "
+            "host_moe_at_moe_argmax=-2.19726562e-02 "
+            "metal_moe_at_moe_argmax=-2.20947266e-02 "
+            "host_moe_vs_recomputed_max_abs=0.00000000e+00 "
+            "host_moe_vs_recomputed_argmax=0 "
+            "recomputed_moe_at_host_argmax=1.00000000e-03 "
+            "host_moe_at_host_argmax=1.00000000e-03 "
+            "metal_moe_at_host_argmax=1.00000000e-03 "
+            "output_patch_max_abs=1.22070312e-04 output_patch_argmax=8 "
+            "final_vs_host_max_abs=0.00000000e+00 final_vs_host_argmax=0 "
+            "host_final_at_final_argmax=1.26953125e-02 "
+            "recomputed_final_at_final_argmax=1.26953125e-02 "
+            "changed_moe_elems=1 changed_output_elems=1 first_changed_output=8\n"
+        )
+
+        corrections = script.parse_routed_down_host_recompute_corrections(output)
+
+        self.assertEqual(len(corrections), 1)
+        self.assertEqual(corrections[0]["layer"], 33)
+        self.assertEqual(corrections[0]["router_path"], "simd")
+        self.assertEqual(corrections[0]["metal_moe_vs_recomputed_argmax"], 8)
+        self.assertAlmostEqual(
+            corrections[0]["metal_moe_vs_recomputed_max_abs"],
+            0.000122070312,
+        )
+
+        args = Namespace(
+            max_new_tokens=1,
+            context_size=64,
+            metal_profile=False,
+            metal_profile_phases=False,
+            router_parity_tap=False,
+            router_parity_tap_max_calls=40,
+            shared_parity_tap=False,
+            shared_parity_tap_max_calls=3,
+            routed_parity_tap=False,
+            routed_parity_tap_max_calls=3,
+            decode_batch_route_snapshot=False,
+            promotion_max_headline_ratio=0.999,
+            promotion_max_ffn_ratio=0.999,
+            promotion_max_component_regression_ratio=1.10,
+            promotion_max_command_buffer_wait_ratio=1.05,
+            promotion_max_fused_wall_gpu_ratio=4.0,
+            promotion_max_wait_gpu_ratio=4.0,
+            promotion_require_profile=False,
+        )
+        mode = "full-stage5-router-simd-batch-shared-mid-routed-down-host-recomputed"
+        candidate = row(mode)
+        candidate["routed_down_host_recompute_corrections"] = corrections
+        report = script.build_report(
+            [row("default"), candidate],
+            args,
+            ["default", mode],
+            "smoke",
+        )
+        md = script.render_markdown(report)
+
+        summary = report["summary"]["routed_down_host_recompute_correction"]
+        self.assertEqual(summary["correction_count"], 1)
+        self.assertEqual(summary["changed_count"], 1)
+        self.assertAlmostEqual(summary["max_metal_moe_vs_recomputed_abs"], 0.000122070312)
+        self.assertIn("routed_down_host_recompute_correction_count: `1`", md)
+        self.assertIn(
+            "routed_down_host_recompute_correction_max_metal_moe_vs_recomputed_abs: `0.00012207`",
+            md,
+        )
+        self.assertIn("## Routed Down Host Recompute Correction", md)
+        self.assertIn(
+            "| hello | full-stage5-router-simd-batch-shared-mid-routed-down-host-recomputed | simd | 33 | true |",
+            md,
+        )
 
     def test_routed_gate_up_tap_rows_are_parsed_and_rendered(self):
         script = sweep_qwen36_fused_routed_int4
