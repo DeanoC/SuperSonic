@@ -1290,6 +1290,14 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
             policy["prompt_results"][0]["observed_sources"],
             ["shared_mid_to_shared_out_bf16_boundary"],
         )
+        self.assertEqual(
+            report["summary"]["drift_containment"]["recommendation"],
+            "drift_contained_by_boundary_policy",
+        )
+        self.assertEqual(
+            report["summary"]["drift_containment"]["contained_modes"],
+            ["direct-gather"],
+        )
 
         args.promotion_layer_output_allowed_sources = "moe_out_residual_rounding_boundary"
         rejected = script.build_report(
@@ -1314,6 +1322,132 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
             rejected_policy["modes_with_disallowed_sources"],
             ["direct-gather"],
         )
+
+    def test_drift_containment_reports_first_parity_expansion_layer(self):
+        script = sweep_qwen36_fused_routed_int4
+        baseline = row("default", ids=[11])
+        candidate = row(
+            "full-stage5-router-simd-batch",
+            ids=[11],
+            headline=90.0,
+            ffn=40.0,
+            wait=9.0,
+        )
+        baseline["layer_output_delta_taps"] = [
+            {
+                "position": 0,
+                "layer": 7,
+                "phase": "ffn",
+                "path": "chained",
+                "checksum": "base7",
+                "bf16": "3c00,bdc1",
+            },
+            {
+                "position": 0,
+                "layer": 8,
+                "phase": "ffn",
+                "path": "chained",
+                "checksum": "base8",
+                "bf16": "3c00,bdc1",
+            },
+        ]
+        candidate["layer_output_delta_taps"] = [
+            {
+                "position": 0,
+                "layer": 7,
+                "phase": "ffn",
+                "path": "decode_batch",
+                "checksum": "cand7",
+                "bf16": "3c00,bdc2",
+            },
+            {
+                "position": 0,
+                "layer": 8,
+                "phase": "ffn",
+                "path": "decode_batch",
+                "checksum": "cand8",
+                "bf16": "3c00,bdc2",
+            },
+        ]
+        candidate["decode_batch_shared_parity_taps"] = [
+            {
+                "position": 0,
+                "layer": 7,
+                "shared_mid_argmax": 23,
+                "shared_out_argmax": 1,
+                "host_shared_out_at_argmax": 0.0123901367,
+                "metal_shared_out_at_argmax": 0.0123291016,
+                "metal_mid_host_shared_out_at_argmax": 0.0123291016,
+            },
+            {
+                "position": 0,
+                "layer": 8,
+                "shared_mid_argmax": 24,
+                "shared_out_argmax": 3,
+                "host_shared_out_at_argmax": 0.0123901367,
+                "metal_shared_out_at_argmax": 0.0123291016,
+                "metal_mid_host_shared_out_at_argmax": 0.0123291016,
+            },
+        ]
+        candidate["decode_batch_routed_parity_taps"] = [
+            {
+                "position": 0,
+                "layer": 7,
+                "topk_idx_match": 1,
+                "moe_out_argmax": 10,
+                "final_out_argmax": 1,
+            },
+            {
+                "position": 0,
+                "layer": 8,
+                "topk_idx_match": 1,
+                "moe_out_argmax": 10,
+                "final_out_argmax": 11,
+            },
+        ]
+
+        args = Namespace(
+            max_new_tokens=1,
+            context_size=64,
+            metal_profile=True,
+            metal_profile_phases=False,
+            promotion_max_headline_ratio=0.999,
+            promotion_max_ffn_ratio=0.999,
+            promotion_max_component_regression_ratio=1.10,
+            promotion_max_command_buffer_wait_ratio=1.05,
+            promotion_max_fused_wall_gpu_ratio=4.0,
+            promotion_max_wait_gpu_ratio=4.0,
+            promotion_require_profile=False,
+            promotion_allow_layer_output_tolerance=True,
+            promotion_layer_output_max_abs_delta=0.001,
+            promotion_layer_output_max_ulp_delta=1,
+            promotion_layer_output_max_differing_elems=1,
+            promotion_layer_output_allowed_sources="shared_mid_to_shared_out_bf16_boundary",
+        )
+        report = script.build_report(
+            [baseline, candidate],
+            args,
+            ["default", "full-stage5-router-simd-batch"],
+            "smoke",
+        )
+        containment = report["summary"]["drift_containment"]
+        prompt = containment["prompt_results"][0]
+        md = script.render_markdown(report)
+
+        self.assertEqual(
+            containment["recommendation"],
+            "bisect_first_parity_expansion_layer",
+        )
+        self.assertEqual(
+            containment["modes_with_expansion"],
+            ["full-stage5-router-simd-batch"],
+        )
+        self.assertEqual(prompt["status"], "expanded")
+        self.assertEqual(prompt["first_allowed_boundary"]["layer"], 7)
+        self.assertEqual(prompt["first_parity_expansion"]["layer"], 8)
+        self.assertEqual(prompt["layers_after_boundary"], 1)
+        self.assertIn("drift_containment_recommendation: `bisect_first_parity_expansion_layer`", md)
+        self.assertIn("## Drift Containment", md)
 
     def test_promotion_gate_rejects_host_correction_diagnostic_modes(self):
         script = sweep_qwen36_fused_routed_int4

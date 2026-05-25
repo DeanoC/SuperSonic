@@ -2388,6 +2388,52 @@ under the same smoke:
    the first layer where allowed one-row boundary drift expands into
    `parity_delta_away_from_layer_max`.
 
+63. **Qwen3.6 drift-containment attribution**
+   The fused-routed sweep is now schema `v41`. It adds a `drift_containment`
+   summary built from the existing layer-output delta and FFN residual
+   attribution rows, so this is a harness/reporting change rather than a new
+   runtime path. The summary uses
+   `--promotion-layer-output-allowed-sources` when provided, otherwise the known
+   BF16 boundary source set, then reports the first later
+   `parity_delta_away_from_layer_max` row for each candidate mode/prompt.
+
+   Local validation passed:
+   `PYTHONPYCACHEPREFIX=/private/tmp/supersonic-pycache python3 -m py_compile
+   tests/metal/sweep_qwen36_fused_routed_int4.py
+   tests/test_qwen36_fused_routed_int4_sweep.py` and
+   `PYTHONPYCACHEPREFIX=/private/tmp/supersonic-pycache python3 -m unittest
+   tests.test_qwen36_fused_routed_int4_sweep` (`36` tests). The focused Metal
+   refresh wrote `/private/tmp/qwen36_drift_containment_v41_1tok.{json,md}`
+   using the same source-aware one-token command as section 62, with
+   `--promotion-layer-output-allowed-sources
+   shared_mid_to_shared_out_bf16_boundary,moe_out_residual_rounding_boundary`.
+   All three rows ran, generated IDs matched (`[11]`), and promotion remained
+   false.
+
+   The new containment recommendation is
+   `bisect_first_parity_expansion_layer`. For
+   `full-stage5-router-simd-batch`, the allowed boundary is still layer `7`
+   `shared_mid_to_shared_out_bf16_boundary` at index `1621`
+   (`max_abs_delta=0.00048828125`, `max_ulp_delta=1`, one differing element),
+   and the first expanded row is layer `8`
+   `parity_delta_away_from_layer_max` at index `101`
+   (`max_abs_delta=0.0009765625`, `max_ulp_delta=80`, `308` differing
+   elements). For `full-stage5-router-simd-batch-shared-mid-host-corrected`,
+   the allowed boundary is layer `33` `moe_out_residual_rounding_boundary` at
+   index `8` (`max_abs_delta=0.0001220703125`, `max_ulp_delta=2`, one differing
+   element), and the first expanded row is layer `34`
+   `parity_delta_away_from_layer_max` at index `100`
+   (`max_abs_delta=0.0009765625`, `max_ulp_delta=32`, `173` differing
+   elements).
+
+   That makes the next correction target sharper: the one-ULP BF16 boundary
+   itself is not the only problem. The following FFN layer consumes the drift
+   and produces a much broader non-boundary delta, so the next useful probe
+   should either patch/snap the residual immediately after the allowed boundary
+   in a diagnostic mode or add a layer-local replay around layers `8` and `34`
+   to identify the first operation that amplifies the prior layer's single-row
+   BF16 change.
+
 ## Sources
 
 - [Qwen/Qwen3.6-35B-A3B model card](https://huggingface.co/Qwen/Qwen3.6-35B-A3B)

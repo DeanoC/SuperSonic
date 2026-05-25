@@ -16,7 +16,7 @@ from typing import Any
 
 
 MODEL = "qwen3.6-35b-a3b"
-SCHEMA = "qwen36-fused-routed-int4-sweep-v40"
+SCHEMA = "qwen36-fused-routed-int4-sweep-v41"
 DEFAULT_MAX_FUSED_WALL_GPU_RATIO = 4.0
 DEFAULT_MAX_WAIT_GPU_RATIO = 4.0
 BF16_BOUNDARY_SOURCES = {
@@ -2372,6 +2372,254 @@ def build_layer_output_tolerance_policy(
     }
 
 
+def ffn_residual_item_sort_key(item: dict[str, Any]) -> tuple[int, int, str]:
+    return (
+        int(item.get("position", -1)),
+        int(item.get("layer", -1)),
+        str(item.get("phase", "")),
+    )
+
+
+def ffn_residual_item_after(
+    item: dict[str, Any],
+    anchor: dict[str, Any],
+) -> bool:
+    return ffn_residual_item_sort_key(item) > ffn_residual_item_sort_key(anchor)
+
+
+def ffn_residual_item_within_tolerance(
+    item: dict[str, Any],
+    *,
+    enforce_tolerance: bool,
+    max_abs_delta: float,
+    max_ulp_delta: int,
+    max_differing_elems: int,
+) -> bool:
+    if not enforce_tolerance:
+        return True
+    return (
+        float(item.get("max_abs_delta") or 0.0) <= max_abs_delta
+        and int(item.get("max_ulp_delta") or 0) <= max_ulp_delta
+        and int(item.get("differing_elems") or 0) <= max_differing_elems
+    )
+
+
+def concise_ffn_residual_item(item: dict[str, Any] | None) -> dict[str, Any] | None:
+    if item is None:
+        return None
+    return {
+        "prompt_id": item.get("prompt_id"),
+        "mode": item.get("mode"),
+        "position": item.get("position"),
+        "layer": item.get("layer"),
+        "phase": item.get("phase"),
+        "source": item.get("source"),
+        "delta_idx": item.get("delta_idx"),
+        "max_abs_delta": item.get("max_abs_delta"),
+        "max_ulp_delta": item.get("max_ulp_delta"),
+        "differing_elems": item.get("differing_elems"),
+    }
+
+
+def build_drift_containment_summary(
+    rows: list[dict[str, Any]],
+    modes: list[str],
+    layer_output_delta_summary: dict[str, Any],
+    ffn_residual_delta_attribution: dict[str, Any],
+    *,
+    allow_layer_output_tolerance: bool,
+    layer_output_max_abs_delta: float,
+    layer_output_max_ulp_delta: int,
+    layer_output_max_differing_elems: int,
+    allowed_boundary_sources: set[str] | None = None,
+) -> dict[str, Any]:
+    boundary_sources = set(allowed_boundary_sources or BF16_BOUNDARY_SOURCES)
+    prompt_ids: list[str] = []
+    for row in rows:
+        prompt_id = str(row.get("prompt_id", ""))
+        if prompt_id and prompt_id not in prompt_ids:
+            prompt_ids.append(prompt_id)
+    candidate_modes = [mode for mode in modes if mode != "default"]
+    items_by_prompt_mode: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for item in ffn_residual_delta_attribution.get("items") or []:
+        key = (str(item.get("prompt_id", "")), str(item.get("mode", "")))
+        items_by_prompt_mode.setdefault(key, []).append(item)
+    for items in items_by_prompt_mode.values():
+        items.sort(key=ffn_residual_item_sort_key)
+
+    prompt_results: list[dict[str, Any]] = []
+    for mode in candidate_modes:
+        for prompt_id in prompt_ids:
+            items = items_by_prompt_mode.get((prompt_id, mode), [])
+            boundary_items = [
+                item for item in items if str(item.get("source", "")) in boundary_sources
+            ]
+            allowed_boundary_items = [
+                item
+                for item in boundary_items
+                if ffn_residual_item_within_tolerance(
+                    item,
+                    enforce_tolerance=allow_layer_output_tolerance,
+                    max_abs_delta=layer_output_max_abs_delta,
+                    max_ulp_delta=layer_output_max_ulp_delta,
+                    max_differing_elems=layer_output_max_differing_elems,
+                )
+            ]
+            first_boundary = allowed_boundary_items[0] if allowed_boundary_items else None
+            if first_boundary is None:
+                parity_expansions = [
+                    item
+                    for item in items
+                    if str(item.get("source", "")) == "parity_delta_away_from_layer_max"
+                ]
+            else:
+                parity_expansions = [
+                    item
+                    for item in items
+                    if str(item.get("source", "")) == "parity_delta_away_from_layer_max"
+                    and ffn_residual_item_after(item, first_boundary)
+                ]
+            first_expansion = parity_expansions[0] if parity_expansions else None
+            source_counts = {
+                source: sum(1 for item in items if str(item.get("source", "")) == source)
+                for source in sorted({str(item.get("source", "")) for item in items})
+                if source
+            }
+            if not items:
+                status = "no_ffn_residual_drift"
+            elif first_boundary is None and parity_expansions:
+                status = "expanded_without_allowed_boundary"
+            elif first_boundary is None:
+                status = "missing_allowed_boundary"
+            elif first_expansion is None:
+                status = "contained"
+            else:
+                status = "expanded"
+            layers_after_boundary = None
+            if first_boundary is not None and first_expansion is not None:
+                layers_after_boundary = int(first_expansion.get("layer", -1)) - int(
+                    first_boundary.get("layer", -1)
+                )
+            prompt_results.append(
+                {
+                    "prompt_id": prompt_id,
+                    "mode": mode,
+                    "diagnostic_only": mode in DIAGNOSTIC_ONLY_MODES,
+                    "status": status,
+                    "contained": status in {"contained", "no_ffn_residual_drift"},
+                    "item_count": len(items),
+                    "boundary_row_count": len(boundary_items),
+                    "allowed_boundary_row_count": len(allowed_boundary_items),
+                    "parity_expansion_count": len(parity_expansions),
+                    "source_counts": source_counts,
+                    "first_allowed_boundary": concise_ffn_residual_item(first_boundary),
+                    "first_parity_expansion": concise_ffn_residual_item(first_expansion),
+                    "layers_after_boundary": layers_after_boundary,
+                }
+            )
+
+    mode_results: list[dict[str, Any]] = []
+    for mode in candidate_modes:
+        items = [item for item in prompt_results if item.get("mode") == mode]
+        expansions = [
+            item.get("first_parity_expansion")
+            for item in items
+            if item.get("first_parity_expansion")
+        ]
+        boundaries = [
+            item.get("first_allowed_boundary")
+            for item in items
+            if item.get("first_allowed_boundary")
+        ]
+        first_expansion = min(expansions, key=ffn_residual_item_sort_key) if expansions else None
+        first_boundary = min(boundaries, key=ffn_residual_item_sort_key) if boundaries else None
+        mode_results.append(
+            {
+                "mode": mode,
+                "diagnostic_only": mode in DIAGNOSTIC_ONLY_MODES,
+                "prompt_count": len(items),
+                "contained": bool(items) and all(bool(item.get("contained")) for item in items),
+                "statuses": sorted({str(item.get("status", "")) for item in items}),
+                "item_count": sum(int(item.get("item_count") or 0) for item in items),
+                "allowed_boundary_row_count": sum(
+                    int(item.get("allowed_boundary_row_count") or 0) for item in items
+                ),
+                "parity_expansion_count": sum(
+                    int(item.get("parity_expansion_count") or 0) for item in items
+                ),
+                "first_allowed_boundary": first_boundary,
+                "first_parity_expansion": first_expansion,
+            }
+        )
+
+    delta_mismatches = [
+        item
+        for item in layer_output_delta_summary.get("comparisons") or []
+        if item.get("checksum_match") is False
+    ]
+    unattributed_mismatches = max(
+        0,
+        len(delta_mismatches) - int(ffn_residual_delta_attribution.get("item_count") or 0),
+    )
+    modes_with_expansion = [
+        str(item.get("mode"))
+        for item in mode_results
+        if int(item.get("parity_expansion_count") or 0) > 0
+    ]
+    modes_missing_boundary = [
+        str(item.get("mode"))
+        for item in mode_results
+        if int(item.get("item_count") or 0) > 0
+        and int(item.get("allowed_boundary_row_count") or 0) == 0
+    ]
+    contained_modes = [
+        str(item.get("mode")) for item in mode_results if bool(item.get("contained"))
+    ]
+    all_expansions = [
+        item.get("first_parity_expansion")
+        for item in mode_results
+        if item.get("first_parity_expansion")
+    ]
+    first_expansion = (
+        min(all_expansions, key=ffn_residual_item_sort_key) if all_expansions else None
+    )
+    if not candidate_modes:
+        recommendation = "run_candidate_sweep"
+        reason = "no candidate modes were provided"
+    elif modes_with_expansion:
+        recommendation = "bisect_first_parity_expansion_layer"
+        reason = "allowed BF16 boundary drift expands into parity-delta-away rows downstream"
+    elif modes_missing_boundary:
+        recommendation = "rerun_with_boundary_diagnostic_modes"
+        reason = "FFN residual drift exists but no allowed boundary source was observed"
+    elif unattributed_mismatches:
+        recommendation = "rerun_with_ffn_residual_attribution"
+        reason = "some layer-output delta mismatches do not have FFN residual attribution"
+    else:
+        recommendation = "drift_contained_by_boundary_policy"
+        reason = "no downstream parity-delta-away expansion was observed"
+
+    return {
+        "boundary_sources": sorted(boundary_sources),
+        "tolerance_enforced": allow_layer_output_tolerance,
+        "thresholds": {
+            "max_abs_delta": layer_output_max_abs_delta,
+            "max_ulp_delta": layer_output_max_ulp_delta,
+            "max_differing_elems": layer_output_max_differing_elems,
+        },
+        "candidate_modes": candidate_modes,
+        "recommendation": recommendation,
+        "reason": reason,
+        "modes_with_expansion": modes_with_expansion,
+        "modes_missing_boundary": modes_missing_boundary,
+        "contained_modes": contained_modes,
+        "unattributed_layer_output_mismatch_count": unattributed_mismatches,
+        "first_parity_expansion": first_expansion,
+        "mode_results": mode_results,
+        "prompt_results": prompt_results,
+    }
+
+
 def matching_decode_batch_tap(
     row: dict[str, Any],
     field: str,
@@ -4236,6 +4484,17 @@ def summarize_with_gate(
     )
     summary["layer_output_delta_tap"] = layer_output_delta_summary
     summary["ffn_residual_delta_attribution"] = ffn_residual_delta_attribution
+    summary["drift_containment"] = build_drift_containment_summary(
+        rows,
+        modes,
+        layer_output_delta_summary,
+        ffn_residual_delta_attribution,
+        allow_layer_output_tolerance=allow_layer_output_tolerance,
+        layer_output_max_abs_delta=layer_output_max_abs_delta,
+        layer_output_max_ulp_delta=layer_output_max_ulp_delta,
+        layer_output_max_differing_elems=layer_output_max_differing_elems,
+        allowed_boundary_sources=allowed_boundary_sources,
+    )
     summary["ffn_residency_gap"] = build_ffn_residency_gap(
         rows,
         modes,
@@ -4386,6 +4645,8 @@ def render_markdown(report: dict[str, Any]) -> str:
     layer_output_tap = summary.get("layer_output_tap") or {}
     layer_output_delta_tap = summary.get("layer_output_delta_tap") or {}
     ffn_residual_delta = summary.get("ffn_residual_delta_attribution") or {}
+    drift_containment = summary.get("drift_containment") or {}
+    drift_first_expansion = drift_containment.get("first_parity_expansion") or {}
     route_snapshot = summary.get("decode_batch_route_snapshot") or {}
     decode_batch_coarse = summary.get("decode_batch_coarse") or {}
     deferred_phase = summary.get("decode_batch_deferred_phase") or {}
@@ -4417,6 +4678,10 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- layer_output_tolerance_modes_missing_evidence: `{','.join(layer_output_tolerance.get('modes_missing_delta_evidence') or []) or '-'}`",
         f"- layer_output_tolerance_modes_missing_source_evidence: `{','.join(layer_output_tolerance.get('modes_missing_source_evidence') or []) or '-'}`",
         f"- layer_output_tolerance_modes_with_disallowed_sources: `{','.join(layer_output_tolerance.get('modes_with_disallowed_sources') or []) or '-'}`",
+        f"- drift_containment_recommendation: `{drift_containment.get('recommendation') or '-'}`",
+        f"- drift_containment_modes_with_expansion: `{','.join(drift_containment.get('modes_with_expansion') or []) or '-'}`",
+        f"- drift_containment_contained_modes: `{','.join(drift_containment.get('contained_modes') or []) or '-'}`",
+        f"- drift_containment_first_expansion: `{drift_first_expansion.get('mode') or '-'}:{drift_first_expansion.get('layer', '-')}:{drift_first_expansion.get('source') or '-'}`",
         f"- router_parity_tap: `{report.get('router_parity_tap', False)}`",
         f"- shared_parity_tap: `{report.get('shared_parity_tap', False)}`",
         f"- routed_parity_tap: `{report.get('routed_parity_tap', False)}`",
@@ -5467,6 +5732,57 @@ def render_markdown(report: dict[str, Any]) -> str:
                     within=str(item.get("within_current_thresholds", False)).lower(),
                     sources=sources,
                     first=first_label,
+                )
+            )
+    drift_containment_rows = (
+        (summary.get("drift_containment") or {}).get("prompt_results") or []
+    )
+    if drift_containment_rows:
+        lines.extend(
+            [
+                "",
+                "## Drift Containment",
+                "",
+                "| Prompt | Mode | Diagnostic | Status | Boundary rows | Parity expansions | First boundary | First expansion | Layers after boundary | Sources |",
+                "|:---|:---|:---:|:---|---:|---:|:---|:---|---:|:---|",
+            ]
+        )
+        for item in drift_containment_rows[:80]:
+            boundary = item.get("first_allowed_boundary") or {}
+            expansion = item.get("first_parity_expansion") or {}
+            boundary_label = (
+                "{layer}:{source}".format(
+                    layer=boundary.get("layer", "-"),
+                    source=boundary.get("source", "-"),
+                )
+                if boundary
+                else "-"
+            )
+            expansion_label = (
+                "{layer}:{source}".format(
+                    layer=expansion.get("layer", "-"),
+                    source=expansion.get("source", "-"),
+                )
+                if expansion
+                else "-"
+            )
+            source_counts = item.get("source_counts") or {}
+            sources = ",".join(
+                f"{source}:{count}" for source, count in source_counts.items()
+            ) or "-"
+            layers_after = item.get("layers_after_boundary")
+            lines.append(
+                "| {prompt} | {mode} | {diagnostic} | {status} | {boundary_rows} | {expansions} | {boundary} | {expansion} | {layers_after} | {sources} |".format(
+                    prompt=item.get("prompt_id", ""),
+                    mode=item.get("mode", ""),
+                    diagnostic=str(item.get("diagnostic_only", False)).lower(),
+                    status=item.get("status", "-"),
+                    boundary_rows=item.get("allowed_boundary_row_count", 0),
+                    expansions=item.get("parity_expansion_count", 0),
+                    boundary=boundary_label,
+                    expansion=expansion_label,
+                    layers_after="-" if layers_after is None else layers_after,
+                    sources=sources,
                 )
             )
     layer_output_delta_comparisons = (
