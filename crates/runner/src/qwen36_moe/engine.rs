@@ -678,6 +678,17 @@ fn decode_text(
             prefill_chain_elapsed += t_prefill;
             loop_state.position += dense_prefill_count as i32;
             loop_state.current_token = prompt_ids[dense_prefill_count];
+            eprintln!(
+                "[qwen36-moe prefill-progress] mode=dense-token-loop variant=legacy \
+                 chunks=1 tokens={} prefill_tokens={} last_context={} embed_ms={:.3} \
+                 chain_ms={:.3} elapsed_ms={:.3}",
+                dense_prefill_count,
+                dense_prefill_count,
+                dense_prefill_count,
+                0.0,
+                t_prefill.as_secs_f64() * 1000.0,
+                t_prefill.as_secs_f64() * 1000.0,
+            );
         }
     }
 

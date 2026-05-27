@@ -545,16 +545,18 @@ On the first 512-token smoke, the 512/1024-token plans tied because the prompt
 had 417 profiled prefill tokens: 82.7% WMMA16 assignment coverage, 23,048
 scalar-tail assignments, and 54.6% WMMA16 padding overhead. Smaller chunks
 increased scalar tails sharply.
-With `--batched-prefill-prototype`, the harness flips the explicit
-`SUPERSONIC_QWEN36_MOE_METAL_BATCHED_PREFILL_PROTOTYPE=1` opt-in and runs the
-experimental Metal batched-prefill route. This path uses Metal batched
-full-attention and a direct routed-expert INT4 kernel pair for grouped MoE
-prefill while keeping router/top-k and shared-expert work on the existing host
-or primitive path. It is not the supported default lane yet.
+The Metal long-context harness now runs the Metal batched-prefill route by
+default. This path uses Metal batched full-attention and a direct routed-expert
+INT4 kernel pair for grouped MoE prefill while keeping router/top-k on the
+existing host path; set `--legacy-prefill-baseline` to force the older
+per-token Metal prefill baseline for A/B reports. `--batched-prefill-prototype`
+is retained as a compatibility/provenance tag for reports that still separate
+prototype-default from baseline modes.
 `--batched-prefill-variant` makes the env-gated prototype probes reproducible
-from the harness: `linear-direct-off`, `full-attn-tmajor`, `split-qgate`,
-`router-topk`, and `fused-residual`. The JSON rows record both the variant name
-and the exact env overrides used for the run.
+from the harness: `linear-direct-off`, `full-attn-vec-off`, `full-attn-tmajor`,
+`split-qgate`, `router-topk`, `fused-residual-off`, and
+`shared-expert-batch-off`. The JSON rows record both the variant name and the
+exact env overrides used for the run.
 `tests/metal/sweep_qwen36_batched_prefill_variants.py` runs the supported
 `baseline`, `prototype-default`, and selected named variants against the same
 deterministic NIAH prompt per context. It writes

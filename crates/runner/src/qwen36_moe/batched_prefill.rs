@@ -7,10 +7,11 @@
 //! attention layers and the MoE FFN keep the per-token chained launchers
 //! (their batched paths land in M9-M11 / a follow-up).
 //!
-//! When `SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL=1` is set the engine
-//! routes prefill through `run_batched_prefill_stub` instead of running
-//! the prefill iterations of its main per-step loop. This module owns
-//! the *prefill range only* — the FIRST generation step (where
+//! The engine routes prefill through `run_batched_prefill_stub` by default
+//! instead of running the prefill iterations of its main per-step loop.
+//! Set `SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL=0` to bisect back to the
+//! legacy token loop. This module owns the *prefill range only* — the
+//! FIRST generation step (where
 //! `step + 1 == effective_prompt_len` and logits are computed) is left
 //! to the engine's main loop.
 //!
@@ -111,6 +112,88 @@ pub(crate) struct BatchedPrefillTimings {
     pub chain_total: Duration,
     pub chunks: usize,
     pub tokens: usize,
+}
+
+fn metal_profile_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_PROFILE").is_some()
+}
+
+fn batched_prefill_variant_label(backend: Backend) -> String {
+    let force_host_native = std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_some();
+    let mut parts = if backend == Backend::Metal {
+        if std::env::var_os("SUPERSONIC_QWEN36_MOE_METAL_BATCHED_PREFILL_PROTOTYPE").is_some() {
+            vec!["metal-prototype"]
+        } else {
+            vec!["metal-default"]
+        }
+    } else {
+        vec!["batched"]
+    };
+    if force_host_native {
+        parts.push("force-host-native");
+    }
+
+    let metal_native_enabled = backend == Backend::Metal && !force_host_native;
+    let full_attn_tmajor_enabled = metal_native_enabled
+        && std::env::var("SUPERSONIC_QWEN36_MOE_METAL_FULL_ATTN_TMAJOR")
+            .map(|v| v != "0")
+            .unwrap_or(false);
+    let full_attn_vec_enabled = metal_native_enabled
+        && !full_attn_tmajor_enabled
+        && std::env::var("SUPERSONIC_QWEN36_MOE_METAL_FULL_ATTN_VEC")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+    let shared_expert_batch_enabled = metal_native_enabled
+        && std::env::var("SUPERSONIC_QWEN36_MOE_METAL_SHARED_EXPERT_BATCH")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+
+    if full_attn_tmajor_enabled {
+        parts.push("full-attn-tmajor");
+    }
+    if full_attn_vec_enabled {
+        parts.push("full-attn-vec");
+    }
+    if metal_native_enabled
+        && std::env::var("SUPERSONIC_QWEN36_MOE_METAL_ROUTER_TOPK")
+            .map(|v| v != "0")
+            .unwrap_or(false)
+    {
+        parts.push("router-topk");
+    }
+    if shared_expert_batch_enabled {
+        parts.push("shared-expert-batch");
+    }
+    if shared_expert_batch_enabled
+        && std::env::var("SUPERSONIC_QWEN36_MOE_METAL_FUSED_FFN_RESIDUAL")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    {
+        parts.push("fused-residual");
+    }
+    parts.join("+")
+}
+
+fn emit_prefill_progress(
+    mode: &str,
+    variant: &str,
+    timings: &BatchedPrefillTimings,
+    prefill_tokens: usize,
+    last_context: usize,
+    elapsed: Duration,
+) {
+    eprintln!(
+        "[qwen36-moe prefill-progress] mode={mode} variant={variant} \
+         chunks={} tokens={} prefill_tokens={} last_context={} embed_ms={:.3} \
+         chain_ms={:.3} elapsed_ms={:.3}",
+        timings.chunks,
+        timings.tokens,
+        prefill_tokens,
+        last_context,
+        timings.embed_total.as_secs_f64() * 1000.0,
+        timings.chain_total.as_secs_f64() * 1000.0,
+        elapsed.as_secs_f64() * 1000.0,
+    );
 }
 
 /// CPU-built RoPE cos/sin tables uploaded once per orchestrator invocation.
@@ -352,6 +435,8 @@ pub(crate) fn run_batched_prefill_stub(
     // FFN/linear-attn fallbacks; pull them through the orchestrator.
     let mut persistent_scratch = persistent_scratch;
     let mut moe_expert_residency = moe_expert_residency;
+    let variant = batched_prefill_variant_label(gpu_hal::current_backend());
+    let prefill_start = Instant::now();
 
     let mut step = 0usize;
     while step < prefill_count {
@@ -390,6 +475,14 @@ pub(crate) fn run_batched_prefill_stub(
         let _ = t_chunk;
 
         step += n;
+        emit_prefill_progress(
+            "batched",
+            &variant,
+            &timings,
+            prefill_count,
+            step,
+            prefill_start.elapsed(),
+        );
     }
 
     Ok(timings)
@@ -416,11 +509,6 @@ fn supports_batched_path(
     moe_expert_residency_active: bool,
 ) -> bool {
     let _ = keep_mask;
-    if gpu_hal::current_backend() == Backend::Metal
-        && std::env::var_os("SUPERSONIC_QWEN36_MOE_METAL_BATCHED_PREFILL_PROTOTYPE").is_none()
-    {
-        return false;
-    }
     if moe_expert_residency_active {
         return false;
     }
@@ -1124,10 +1212,17 @@ fn process_full_attn_layer_batched(
     }
 
     let kv_len = past_len + n;
-    let use_metal_tmajor_full_attn = chunk_hidden.backend() == Backend::Metal
+    let metal_native_enabled = chunk_hidden.backend() == Backend::Metal
+        && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none();
+    let use_metal_tmajor_full_attn = metal_native_enabled
         && std::env::var("SUPERSONIC_QWEN36_MOE_METAL_FULL_ATTN_TMAJOR")
             .map(|v| v != "0")
             .unwrap_or(false);
+    let use_metal_vec_full_attn = metal_native_enabled
+        && !use_metal_tmajor_full_attn
+        && std::env::var("SUPERSONIC_QWEN36_MOE_METAL_FULL_ATTN_VEC")
+            .map(|v| v != "0")
+            .unwrap_or(true);
 
     if use_metal_tmajor_full_attn {
         // 7. Metal-only fast layout path. The native kernel reads the
@@ -1150,6 +1245,23 @@ fn process_full_attn_layer_batched(
             )
         }
         .map_err(|e| anyhow!("metal full_attention_prefill_tmajor: {e}"))?;
+    } else if use_metal_vec_full_attn {
+        unsafe {
+            prefill_ffi::metal_full_attention_prefill_tmajor_vec_bf16_f32(
+                h,
+                hkv,
+                n,
+                kv_len,
+                hd,
+                scale,
+                past_len,
+                &scratch.q_after,
+                cache_k_ptr as *const c_void,
+                cache_v_ptr as *const c_void,
+                &mut scratch.attn_out_nhd_f32,
+            )
+        }
+        .map_err(|e| anyhow!("metal full_attention_prefill_tmajor_vec: {e}"))?;
     } else {
         // 7. Legacy layout path: transpose q [n, h, hd] -> [h, n, hd] and
         // materialize a compact head-major KV prefix for M3 input.
@@ -2159,8 +2271,26 @@ fn process_ffn_batched_grouped(
             .map_err(|e| anyhow!("finish Metal router/expert FFN batch: {e}"))?;
     }
 
-    // 7. Shared expert (batched primitives).
-    //
+    // 7. Shared expert (batched primitives). On Metal, encode the shared
+    // expert tail in one command buffer by default. Profile runs split at
+    // phase labels so the report can still attribute the work.
+    let use_metal_shared_expert_batch = scratch.h_norm.backend() == Backend::Metal
+        && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
+        && std::env::var("SUPERSONIC_QWEN36_MOE_METAL_SHARED_EXPERT_BATCH")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+    let metal_shared_profile = use_metal_shared_expert_batch && metal_profile_enabled();
+    let metal_shared_start = metal_shared_profile.then(Instant::now);
+    let metal_shared_batch = if use_metal_shared_expert_batch {
+        let guard = prefill_ffi::MetalBatchGuard::begin()
+            .map_err(|e| anyhow!("begin Metal shared FFN batch: {e}"))?;
+        prefill_ffi::set_metal_batch_label("qwen36_batched_prefill_shared_expert_int4")
+            .map_err(|e| anyhow!("label Metal shared FFN batch: {e}"))?;
+        Some(guard)
+    } else {
+        None
+    };
+
     //    7a. shared_gate = INT4_matmul(h_norm, shared_gate_proj_w)
     //         shape [shared_intermediate, hidden] INT4 → out [N, shared_intermediate]
     prefill_ffi::matmul_rhs_transposed_int4(
@@ -2206,6 +2336,12 @@ fn process_ffn_batched_grouped(
         &mut scratch.shared_silu_mul,
     )
     .map_err(|e| anyhow!("swiglu_mul shared: {e}"))?;
+    if metal_shared_profile {
+        prefill_ffi::commit_metal_batch_current("qwen36_batched_prefill_shared_gate_up")
+            .map_err(|e| anyhow!("profile commit Metal shared gate/up: {e}"))?;
+        prefill_ffi::set_metal_batch_label("qwen36_batched_prefill_shared_down_scalar")
+            .map_err(|e| anyhow!("label Metal shared down/scalar: {e}"))?;
+    }
     //    7d. shared_down = INT4_matmul(shared_silu_mul, shared_down_proj_w)
     //         shape [hidden, shared_intermediate] INT4 → out [N, hidden]
     prefill_ffi::matmul_rhs_transposed_int4(
@@ -2277,6 +2413,12 @@ fn process_ffn_batched_grouped(
         )
         .context("d2d shared_out_final -> shared_out")?;
     }
+    if metal_shared_profile {
+        prefill_ffi::commit_metal_batch_current("qwen36_batched_prefill_shared_down_scalar")
+            .map_err(|e| anyhow!("profile commit Metal shared down/scalar: {e}"))?;
+        prefill_ffi::set_metal_batch_label("qwen36_batched_prefill_ffn_finalize")
+            .map_err(|e| anyhow!("label Metal FFN finalize: {e}"))?;
+    }
 
     // 8. Residual add: chunk_hidden += combined; chunk_hidden += shared_out.
     // Opt-in diagnostic only: the fused Metal residual-add path preserves the
@@ -2284,9 +2426,10 @@ fn process_ffn_batched_grouped(
     // the existing two-add sequence.
     let use_metal_fused_residual = chunk_hidden.backend() == Backend::Metal
         && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
+        && use_metal_shared_expert_batch
         && std::env::var("SUPERSONIC_QWEN36_MOE_METAL_FUSED_FFN_RESIDUAL")
             .map(|v| v != "0")
-            .unwrap_or(false);
+            .unwrap_or(true);
     if use_metal_fused_residual {
         prefill_ffi::qwen36_ffn_residual_add_bf16(
             n * hidden,
@@ -2312,6 +2455,19 @@ fn process_ffn_batched_grouped(
             &scratch.shared_out,
         )
         .map_err(|e| anyhow!("residual add (shared_out): {e}"))?;
+    }
+    if let Some(batch) = metal_shared_batch {
+        batch
+            .finish()
+            .map_err(|e| anyhow!("finish Metal shared FFN batch: {e}"))?;
+    }
+    if let Some(start) = metal_shared_start {
+        prefill_ffi::record_metal_profile_sample(
+            "qwen36_batched_prefill_shared_expert_int4",
+            "native",
+            start.elapsed().as_secs_f64() * 1000.0,
+        )
+        .map_err(|e| anyhow!("record Metal shared FFN profile: {e}"))?;
     }
 
     // Touch unused fields to keep the compiler happy on cfg(feature) gates.

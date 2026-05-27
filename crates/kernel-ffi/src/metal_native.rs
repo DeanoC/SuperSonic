@@ -529,6 +529,19 @@ unsafe extern "C" {
         value_ptr: *const c_void,
         out_ptr: *mut c_void,
     ) -> c_int;
+    fn supersonic_metal_full_attention_prefill_tmajor_vec_bf16_f32(
+        q_heads: usize,
+        kv_heads: usize,
+        q_len: usize,
+        kv_len: usize,
+        head_dim: usize,
+        scale: f32,
+        seqlen_offset: usize,
+        query_ptr: *const c_void,
+        key_ptr: *const c_void,
+        value_ptr: *const c_void,
+        out_ptr: *mut c_void,
+    ) -> c_int;
     fn supersonic_metal_full_attention_decode_bf16_f32(
         q_heads: usize,
         kv_heads: usize,
@@ -3181,6 +3194,73 @@ pub(crate) unsafe fn full_attention_prefill_tmajor_bf16_f32(
             Backend::Metal,
             format!(
                 "metal native full_attention_prefill_tmajor_bf16_f32 failed with status {status}"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn full_attention_prefill_tmajor_vec_bf16_f32(
+    q_heads: usize,
+    kv_heads: usize,
+    q_len: usize,
+    kv_len: usize,
+    head_dim: usize,
+    scale: f32,
+    seqlen_offset: usize,
+    query: &GpuBuffer,
+    key_ptr: *const c_void,
+    value_ptr: *const c_void,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if query.dtype() != ScalarType::BF16 {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native full_attention_prefill_tmajor_vec expects BF16 query, got {:?}",
+            query.dtype()
+        )));
+    }
+    if out.dtype() != ScalarType::F32 {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native full_attention_prefill_tmajor_vec expects F32 output, got {:?}",
+            out.dtype()
+        )));
+    }
+    if q_heads == 0
+        || kv_heads == 0
+        || q_heads % kv_heads != 0
+        || q_len == 0
+        || kv_len == 0
+        || head_dim == 0
+        || head_dim > 256
+        || key_ptr.is_null()
+        || value_ptr.is_null()
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native full_attention_prefill_tmajor_vec invalid shape: q_heads={q_heads} kv_heads={kv_heads} q_len={q_len} kv_len={kv_len} head_dim={head_dim}"
+        )));
+    }
+    let status = unsafe {
+        supersonic_metal_full_attention_prefill_tmajor_vec_bf16_f32(
+            q_heads,
+            kv_heads,
+            q_len,
+            kv_len,
+            head_dim,
+            scale,
+            seqlen_offset,
+            query.as_ptr(),
+            key_ptr,
+            value_ptr,
+            out.as_mut_ptr(),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!(
+                "metal native full_attention_prefill_tmajor_vec_bf16_f32 failed with status {status}"
             ),
         ));
     }
@@ -5913,6 +5993,27 @@ pub(crate) unsafe fn full_attention_prefill_tmajor_bf16_f32(
     Err(GpuError::backend(
         Backend::Metal,
         "metal native full_attention_prefill_tmajor_bf16_f32 is not compiled".into(),
+    ))
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn full_attention_prefill_tmajor_vec_bf16_f32(
+    _q_heads: usize,
+    _kv_heads: usize,
+    _q_len: usize,
+    _kv_len: usize,
+    _head_dim: usize,
+    _scale: f32,
+    _seqlen_offset: usize,
+    _query: &GpuBuffer,
+    _key_ptr: *const c_void,
+    _value_ptr: *const c_void,
+    _out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    Err(GpuError::backend(
+        Backend::Metal,
+        "metal native full_attention_prefill_tmajor_vec_bf16_f32 is not compiled".into(),
     ))
 }
 
