@@ -30,11 +30,13 @@ fn run_one_combo_takes_median_of_three() {
         specprefill_draft_dir: None,
         prompt: "The quick brown fox jumps over".into(),
         max_new_tokens: 16,
+        context_size: None,
         warmup_tokens: 2,
     };
     let policy = RunPolicy {
         measurement_runs: 3,
         cooldown_seconds: 0,
+        collect_attribution: true,
     };
     let cell = run_one_combo(&invocation, &policy).unwrap();
     use supersonic_bench::runs::PerfStatus;
@@ -63,11 +65,13 @@ fn run_one_combo_records_error_on_missing_binary() {
         specprefill_draft_dir: None,
         prompt: "x".into(),
         max_new_tokens: 1,
+        context_size: None,
         warmup_tokens: 1,
     };
     let policy = RunPolicy {
         measurement_runs: 1,
         cooldown_seconds: 0,
+        collect_attribution: true,
     };
     let cell = run_one_combo(&invocation, &policy).unwrap();
     use supersonic_bench::runs::PerfStatus;

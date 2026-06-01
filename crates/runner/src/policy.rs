@@ -33,8 +33,21 @@ pub(crate) fn validate_global_flags(
     {
         anyhow::bail!("--q4km/--q4km-gptq are currently supported only for Qwen models");
     }
-    if q4km_like && backend != Backend::Cuda {
-        anyhow::bail!("--q4km/--q4km-gptq are currently supported only on CUDA");
+    if cli.q4km
+        && !(backend == Backend::Cuda
+            || (backend == Backend::Metal && model_variant.family() == ModelFamily::Qwen36Moe))
+    {
+        anyhow::bail!(
+            "--q4km raw GGML blocks are currently supported on CUDA Qwen paths and Metal Qwen3.5/3.6 MoE"
+        );
+    }
+    if cli.q4km_gptq
+        && !(backend == Backend::Cuda
+            || (backend == Backend::Metal && model_variant.family() == ModelFamily::Qwen36Moe))
+    {
+        anyhow::bail!(
+            "--q4km-gptq is currently supported on CUDA Qwen paths and Metal Qwen3.5/3.6 MoE"
+        );
     }
     if matches!(model_variant.family(), ModelFamily::Qwen3Moe) {
         if !cli.int4 || profile != QuantProfile::Int4Gptq {
@@ -158,6 +171,26 @@ mod tests {
             Backend::Hip,
         )
         .expect("GPTQ remains the wired Qwen3.6 native INT4 path");
+    }
+
+    #[test]
+    fn allows_q4km_gptq_for_qwen35_moe_on_metal() {
+        validate_global_flags(
+            &cli(&["--q4km-gptq"]),
+            &ModelVariant::Qwen3_5_35B_A3B,
+            Backend::Metal,
+        )
+        .expect("Qwen3.5-35B-A3B uses the Metal MoE native INT4 path");
+    }
+
+    #[test]
+    fn allows_raw_q4km_for_qwen35_moe_on_metal() {
+        validate_global_flags(
+            &cli(&["--q4km"]),
+            &ModelVariant::Qwen3_5_35B_A3B,
+            Backend::Metal,
+        )
+        .expect("Qwen3.5-35B-A3B Metal MoE has a raw GGML Q4_K_M expert path");
     }
 }
 

@@ -877,6 +877,350 @@ Reproduce the run with:
 SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" cargo run --release -p supersonic-bench --bin bench-perf -- --arch apple-m5-max --models qwen3.6-35b-a3b --quants int4
 ```
 
+### Qwen3.5-35B-A3B Q4_K_M public comparison checkpoint
+
+The Qwen3.5-35B-A3B Q4_K_M Metal lane is tracked separately from the Qwen3.6
+INT4 gate because it is intended to compare against public llama.cpp and MLX
+M5 Max numbers for the same model/quant target. The current SuperSonic
+checkpoint is a direct single-sequence greedy generation run, empty prompt
+(`""`, tokenized as one prompt token), 512 generated tokens, and no attribution
+or Metal profile pass:
+
+```bash
+target/release/supersonic --backend metal \
+  --model qwen3.5-35b-a3b \
+  --model-dir "$HOME/.cache/supersonic-metal-models/qwen3.5-35b-a3b" \
+  --q4km \
+  --prompt "" \
+  --context-size 1024 \
+  --max-new-tokens 512 \
+  --temperature 0 \
+  --top-k 1 \
+  --sampling-seed 20260504 \
+  --no-download
+```
+
+Current 2026-06-01 result on this M5 Max:
+
+| Engine | Model/quant | Workload | ms/tok | tok/s | Source |
+|---|---|---|---:|---:|---|
+| SuperSonic | Qwen3.5-35B-A3B Q4_K_M | 1-token prompt + 512 generated, promoted exact-order FFN path | 67.3 | 14.9 | `/tmp/qwen35_default_after_scalar_fuse_patch_512.log` |
+| llama.cpp | Qwen3.5-35B-A3B Q4_K_M | public M5 Max generation number | ~11.0 | 91.0 | public reference |
+| MLX | Qwen3.5-35B-A3B Q4_K_M | public M5 Max generation number | ~7.2 | 139.0 | public reference |
+
+Short smoke runs are too noisy for headline comparison: 16-token samples ranged
+from ~125 to ~201 ms/token depending on command-buffer scheduling and warm
+state, while longer runs settle much lower. The 2026-06-01 FFN Q4_K lane-pair
+helper was retained only for the gate/up projection. In the 64-token split
+check, scalar Q4_K measured 91.5 ms/token, gate/up-pair-only measured 79.9
+ms/token with identical generated IDs, down-pair-only measured 87.6 ms/token
+but diverged at token 12, and both pair helpers measured 82.6 ms/token but
+diverged at token 9. The default therefore keeps gate/up pair-dot enabled and
+leaves the down pair-dot path behind
+`SUPERSONIC_METAL_ENABLE_QWEN36_FFN_Q4K_PAIR_DOWN`. The full preset run after
+that change reported samples `[70.7, 68.7, 69.6, 69.7, 69.6]`, so the
+headline was 69.6 ms/token. A follow-up reset-sync-buffer cleanup kept the
+counter reset on fallback kernels but skipped the unused reset before Metal
+native attention/FFN phases. The repeatable preset then reported samples
+`[69.0, 69.0, 68.7, 69.0, 68.8]`, setting the pre-exact-order headline to a
+69.0 ms/token median. Direct 512-token no-JSON controls on that path measured
+67.6 and 67.0 ms/token and generated identical 512-token streams; they matched
+the earlier default through token 173. The 128-token control matched the earlier
+default exactly. A separate `--emit-generated-json` control diverged early, so
+the benchmark preset and reproduction command omit that flag.
+
+The 2026-06-01 exact-order FFN update promoted two Metal paths that preserve the
+default generated stream while recovering some of the speed from previously
+unsafe tiled/SIMD experiments:
+
+- Router logits now use the exact-order SIMD path by default unless
+  `SUPERSONIC_METAL_DISABLE_QWEN36_FFN_ROUTER_STAGE5_EXACT_SIMD=1` is set. It
+  keeps lane 0's accumulation order aligned with the serial router while the
+  other lanes materialize products. A 128-token default-vs-promoted check
+  matched every generated ID and moved from 68.3 to 62.6 ms/token
+  (`/tmp/qwen35_q4km_default_128_after_exact.log` vs.
+  `/tmp/qwen35_q4km_default_exact_promoted_128.log`).
+- Shared gate/up now uses the exact-order SIMD path by default unless
+  `SUPERSONIC_METAL_DISABLE_QWEN36_FFN_SHARED_GATE_UP_EXACT_SIMD=1` is set. It
+  keeps the host-order INT4 pair-add pattern for gate/up while parallelizing the
+  dequant/product step. A split FFN profile measured
+  `qwen36_ffn_int4_shared_gate_up_exact_simd` at 0.0759 ms/layer versus the
+  previous shared gate/up phase around 0.164 ms/layer, with matching generated
+  IDs through the 16-token profile and the 64-token smoke.
+- The promoted default 512-token comparison initially measured 65.5 ms/token
+  (`/tmp/qwen35_q4km_default_exact_promoted_512.log`). A later current-tree
+  control after the native full-attention diagnostics measured 67.3 ms/token
+  (`/tmp/qwen35_default_after_scalar_fuse_patch_512.log`), matching the earlier
+  generated stream through token 286 before late argmax drift. The quick
+  headline now uses the later current-tree 67.3 ms/token checkpoint. This is a
+  one-shot direct decode checkpoint, not yet a refreshed five-repetition
+  `bench-perf --preset qwen35-q4km-m5-max-gen512` median.
+- A follow-up exact-order shared-scalar SIMD probe reduced the split-profile
+  shared scalar phase from about 0.117 to 0.102 ms/layer and matched the first
+  128 generated tokens, but diverged later in the 512-token stream. It remains
+  opt-in behind `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_SHARED_SCALAR_EXACT_SIMD=1`
+  and is not part of the headline path.
+  The decode-batch shared/routed parity taps now support position/layer filters
+  so late shared-scalar drift can be inspected without snapshotting every layer
+  of every generated token:
+  `SUPERSONIC_METAL_QWEN36_DECODE_BATCH_SHARED_STAGE5_PARITY_TAP_POSITION`,
+  `..._LAYER`, and the routed equivalents
+  `SUPERSONIC_METAL_QWEN36_DECODE_BATCH_ROUTED_STAGE5_PARITY_TAP_POSITION` /
+  `..._LAYER`. A filtered smoke at position 1, layer 0 emitted a single shared
+  parity line and correctly labeled the path as
+  `gate_up_exact_simd+scalar_exact_simd`
+  (`/tmp/qwen35_filtered_shared_parity_smoke.log`).
+- Follow-up compatibility probes did not improve the headline. The
+  expression-matched shared-down exact SIMD path matched the 128-token stream
+  but slowed that check to 64.9 ms/token
+  (`/tmp/qwen35_q4km_shared_down_pair_expr_exact_simd_128.log`), so it remains
+  opt-in behind `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_SHARED_DOWN_EXACT_SIMD=1`.
+  A top-k-parallel expert-down/finalize path also matched the 128-token stream
+  but slowed to 65.4 ms/token
+  (`/tmp/qwen35_q4km_expert_down_topk_parallel_128.log`), so it remains opt-in
+  behind `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_DOWN_TOPK_PARALLEL=1`.
+  The router exact-multirow probe was slower and diverged late in the 128-token
+  stream; it is opt-in only behind
+  `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_STAGE5_EXACT_MULTIROW=1`.
+
+The current gap is therefore not a one-line launch-count fix; the Metal profile
+still points at the chained per-layer decode structure and command-buffer waits.
+A naive experiment that coalesced phase command buffers reduced command-buffer
+count but increased wait time. The latest clean 64-token control with
+`SUPERSONIC_METAL_QWEN36_DECODE_BATCH_SYNC_PHASES=1` matched the default
+generated IDs but slowed from 80.0 to 94.7 ms/token, so the default path keeps
+the existing per-phase commit ordering for overlap.
+
+Follow-up optimization probes on 2026-06-01 kept the headline unchanged but
+identified the next safe work area:
+
+- Disabling decode-batch preserved the 128-token stream but slowed the run to
+  87.9 ms/token (`/tmp/qwen35_q4km_disable_decode_batch_128.log`), so the
+  decode-batch path remains required for the headline lane.
+- Existing shared-FFN tiled variants are faster but not parity-safe:
+  `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_SHARED_TILED=1` measured 58.7 ms/token
+  but diverged at token 0; shared gate/up tiled measured 61.1 ms/token and
+  diverged at token 0; shared down tiled measured 67.5 ms/token and diverged at
+  token 2; shared scalar SIMD measured 68.1 ms/token and diverged at token 0;
+  shared gate/up `exp2` measured 71.3 ms/token and diverged at token 21.
+- A refreshed split FFN phase profile on the promoted exact path
+  (`/tmp/qwen35_ffn_phase_profile_current_16.log`) kept the generated IDs
+  aligned for 16 tokens and again made the router block the largest FFN
+  sub-phase: `qwen36_ffn_int4_router_topk_stage5_exact_simd` averaged
+  0.4293 ms/layer, followed by expert down finalize at 0.1305 ms/layer, shared
+  scalar at 0.1188 ms/layer, shared gate/up exact SIMD at 0.0777 ms/layer,
+  shared down at 0.0666 ms/layer, and expert gate/up at 0.0533 ms/layer. The
+  profile is wall-clock distorted by phase flushes but remains useful for
+  ranking the next kernel target.
+- Follow-up router/scheduling probes did not improve the headline. An opt-in
+  exact SIMD router-norm kernel
+  (`SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_NORM_EXACT_SIMD=1`) matched the
+  128-token stream but slowed to 68.6 ms/token
+  (`/tmp/qwen35_router_norm_exact_simd_128.log`). Retesting exact-multirow
+  router logits matched 128 tokens but slowed to 73.6 ms/token
+  (`/tmp/qwen35_router_exact_multirow_128_retest.log`). Replacing router exact
+  scratch barriers with SIMD-group barriers diverged after token 104 and was
+  reverted; replacing the scratch/barrier reduction with SIMD shuffles preserved
+  the 128-token stream but slowed to 72.7 ms/token and was also reverted. A
+  narrower FFN deferred-commit interval probe
+  (`SUPERSONIC_METAL_QWEN36_DECODE_BATCH_FFN_COMMIT_INTERVAL=2`) matched the
+  128-token stream but slowed to 71.7 ms/token
+  (`/tmp/qwen35_ffn_commit_interval2_128.log`), confirming that the current
+  per-FFN commits are buying enough CPU/GPU overlap to offset their launch cost.
+- The opt-in native full-attention path is also a real speed lever but not
+  promotable yet. `SUPERSONIC_METAL_ENABLE_QWEN36_FULL_ATTN_NATIVE=1` measured
+  58.4 ms/token on a 128-token run but diverged at token 0. Adding
+  `SUPERSONIC_METAL_QWEN36_FULL_ATTN_HOST_ORDER_STAGE5=1` preserved the first
+  four generated tokens but slowed to 77.4 ms/token and diverged at token 4.
+  Layer-output taps for one generated token put the first plain-native checksum
+  mismatch at layer 19 attention; the host-order variant's first checksum
+  mismatch moved to layer 27 attention.
+  Follow-up probes split the native host-order switch into opt-in exact
+  sub-boundaries:
+  `SUPERSONIC_METAL_QWEN36_FULL_ATTN_EXACT_INPUT_NORM=1`,
+  `..._EXACT_PROJECTIONS=1`, `..._EXACT_QK_NORM_ROPE_CACHE=1`,
+  `..._EXACT_SCORES=1`, `..._EXACT_VALUES=1`, and
+  `..._EXACT_OUT_PROJ=1`. On layer 3 at position 1, exact input RMSNorm alone
+  reduced the layer-attention BF16 mismatch from 150 elements to 1 and restored
+  the second generated token; exact input+out-proj made that layer output
+  byte-identical. On all native full-attention layers, exact input alone and
+  exact input+out-proj still diverged after two matching tokens, while the full
+  exact mask still matched only four tokens. A checksum sweep showed exact
+  input+out-proj first differed at layer 27 attention on position 0, pointing at
+  later-layer projection/cache sensitivity; these switches remain diagnostic
+  only.
+- A later layer-3-only native-full-attention diagnosis narrowed the earliest
+  remaining full-exact drift to the softmax/value substage rather than K/V cache
+  or projection layout. With
+  `SUPERSONIC_METAL_ENABLE_QWEN36_FULL_ATTN_NATIVE=1`,
+  `SUPERSONIC_METAL_QWEN36_FULL_ATTN_NATIVE_MAX_LAYER=3`, and
+  `SUPERSONIC_METAL_QWEN36_FULL_ATTN_HOST_ORDER_STAGE5=1`, the generated stream
+  matched baseline through four tokens and diverged on token five
+  (`/tmp/qwen35_native_l3_full_exact_8.log`: `[219673, 177277, 79609, 239919,
+  100335, ...]` vs baseline token five `96946`). The new opt-in K/V cache tap
+  (`SUPERSONIC_QWEN36_FULL_ATTN_KV_CACHE_TAP=1`) showed byte-identical K/V
+  prefixes for layer 3 through position 4
+  (`/tmp/qwen35_direct_kv_l3_5.log`,
+  `/tmp/qwen35_native_l3_full_exact_kv_5.log`). The new workspace-region tap
+  (`SUPERSONIC_QWEN36_FULL_ATTN_WORKSPACE_TAP=1`) showed byte-identical `q_raw`,
+  `k_raw`, `v_raw`, `q_normed`, `k_normed`, `q_rot`, and `k_rot` at layer 3
+  position 4; the first differing region was `attn`
+  (`/tmp/qwen35_direct_ws_l3_pos4.log`,
+  `/tmp/qwen35_native_l3_full_exact_ws_pos4.log`). Rounding the native attention
+  vector before the gate did not improve the generated prefix and was reverted.
+  A follow-up probability tap
+  (`SUPERSONIC_METAL_QWEN36_FULL_ATTN_PROB_TAP=1`) confirmed that the first
+  full-exact native difference is already in the softmax probabilities:
+  `/tmp/qwen35_direct_ws_prob_l3_pos4.log` and
+  `/tmp/qwen35_native_l3_full_exact_ws_prob_pos4.log` had matching upstream
+  regions but different `prob_tap` checksums (`e4d583f9b9cf9f71` vs
+  `da883fa3c9439dff`), with the visible head differing by one low byte on the
+  fourth probability (`...03,ec,19,3c` vs `...04,ec,19,3c`). Enabling
+  `SUPERSONIC_METAL_QWEN36_FULL_ATTN_PRECISE_EXP=1` did not improve the
+  generated prefix after the diagnostic flag was wired through host-order mode
+  (`/tmp/qwen35_native_l3_full_exact_precise_exp_fixed_8.log`).
+  BF16-rounding the native softmax probabilities before the value accumulation
+  was also negative, diverging earlier at the third generated token
+  (`/tmp/qwen35_native_l3_full_exact_round_probs_8.log`), and that probe was
+  reverted.
+  A later score tap (`SUPERSONIC_METAL_QWEN36_FULL_ATTN_SCORE_TAP=1`) proved
+  the raw QK scores are not the source of that drift: at layer 3 / position 4,
+  direct and native host-order both reported `score_tap=cee588fd52bf23ca`,
+  while the probability tap still differed (`e4d583f9b9cf9f71` direct vs
+  `da883fa3c9439dff` native). The comparison logs are
+  `/tmp/qwen35_direct_ws_score_prob_l3_pos4.log` and
+  `/tmp/qwen35_native_ws_score_prob_l3_pos4.log`, so the remaining parity target
+  is specifically the softmax `exp/sum/div` boundary.
+  Follow-up exp/denominator taps narrowed that further: with
+  `SUPERSONIC_METAL_QWEN36_FULL_ATTN_EXP_TAP=1` and
+  `SUPERSONIC_METAL_QWEN36_FULL_ATTN_DENOM_TAP=1`, direct and native still had
+  matching scores (`cee588fd52bf23ca`) and denominators (`20595a8ca0a4a804`),
+  but differed in `exp_tap` (`e2ceea3c19782125` direct vs
+  `009160bee7917489` native), carrying into the same probability mismatch.
+  `SUPERSONIC_METAL_QWEN36_FULL_ATTN_PRECISE_EXP=1` produced the same native
+  exp/prob checksums, so the mismatch is Metal's exp result versus the CPU/Rust
+  exp used by the direct path rather than a fast-math option. A transient
+  `exp2(x * log2(e))` compatibility probe was worse, increasing the visible
+  exp mismatches from 26/80 words to 62/80 words and leaving the same divergent
+  fifth token (`/tmp/qwen35_native_ws_softmax_words_exp2_l3_pos4.log`), so that
+  hook was removed. A Cephes-style polynomial exp diagnostic
+  (`SUPERSONIC_METAL_QWEN36_FULL_ATTN_POLY_EXP=1`) moved the softmax boundary in
+  the right direction. With explicit f32 materialization points in the
+  polynomial, the same layer/position reduced exp mismatches to 4/80 words and
+  probability mismatches to 7/80 words, but still produced the native fifth
+  token (`100335` instead of direct `96946`). A `volatile` materialization
+  helper produced the same taps as the bitcast helper
+  (`/tmp/qwen35_native_ws_softmax_words_poly_volatile_exp_l3_pos4.log`).
+  The remaining fifth-token flip was then isolated to value accumulation rather
+  than the softmax probabilities: a transient four-input exp overfit made
+  `score_tap`, `exp_tap`, `denom_tap`, and `prob_tap` byte-identical while the
+  `attn` checksum still differed and the generated token stayed native
+  (`/tmp/qwen35_native_ws_softmax_words_poly_overfit_exp_l3_pos4.log`).
+  Adding explicit f32 round points to the host-order value accumulation
+  (`acc += p * v`) made `attn` and `gated` byte-identical under the same
+  transient exp overfit and restored the direct fifth token
+  (`/tmp/qwen35_native_ws_softmax_words_poly_overfit_rounded_values_l3_pos4.log`).
+  With the overfit removed, the retained polynomial-exp plus rounded-value path
+  now matches the direct generated stream through token 10 and first diverges at
+  token 11 on a 16-token layer-3-limited probe
+  (`/tmp/qwen35_native_l3_poly_value_round_16.log` vs
+  `/tmp/qwen35_direct_16_after_value_round.log`).
+  Forcing `precise` locals in that polynomial was not viable because the
+  runtime Metal compile failed with status 1200
+  (`/tmp/qwen35_native_ws_softmax_words_poly_precise_exp_l3_pos4.log`). Logs:
+  `/tmp/qwen35_direct_ws_softmax_taps_l3_pos4.log`,
+  `/tmp/qwen35_native_ws_softmax_taps_l3_pos4.log`, and
+  `/tmp/qwen35_native_ws_softmax_taps_precise_exp_l3_pos4.log`; word dumps:
+  `/tmp/qwen35_native_ws_softmax_words_poly_round_exp_l3_pos4.log`.
+  A later native-values dispatch cleanup removed redundant lanes from the
+  current values kernel: the shader computes one `(head, dim)` row per
+  threadgroup and only lane 0 writes, so dispatching 32 lanes duplicated the
+  same softmax/value accumulation 32 times. With the dispatch reduced to one
+  thread per group, the opt-in plain native full-attention 128-token probe
+  improved to 53.6 ms/token
+  (`/tmp/qwen35_native_full_attn_values_1lane_128.log`) while remaining
+  non-promotable because it still diverges at token 0. The host-order native
+  diagnostic preserved the known first-four-token prefix and still diverged
+  afterward (`/tmp/qwen35_native_host_order_values_1lane_8.log`), so the next
+  correctness target remains the full-attention softmax probability drift.
+  A follow-up rewrite changed the native values kernel from one threadgroup per
+  `(head, dim)` to one threadgroup per head: lane 0 computes the softmax once
+  into threadgroup memory and the 256 lanes accumulate value dimensions in
+  parallel. This removes the structural 256x softmax recomputation per head,
+  but the opt-in plain native 128-token probe stayed in the same performance
+  band at 53.0 ms/token (`/tmp/qwen35_native_plain_tgsoftmax_128.log`), so the
+  immediate wall-clock bottleneck is not the duplicated values softmax alone.
+  The host-order polynomial-exp diagnostic retained the same 16-token boundary
+  as before after this rewrite
+  (`/tmp/qwen35_native_l3_poly_value_round_tgsoftmax_16.log`: matches direct
+  through token 10, diverges at token 11).
+  Offline comparison of the captured score taps showed the direct CPU path is
+  exactly Darwin/libSystem `expf` on both position-4 and position-11 dumps,
+  while Python double `exp` and a musl/Arm-style double-intermediate table exp
+  each miss one captured word. A temporary Metal table-exp probe using double
+  intermediates was removed after runtime shader compilation failed with
+  `'double' is not supported in Metal`
+  (`/tmp/qwen35_native_table_exp_compile_error.log`). Small coefficient and
+  range-reduction nudges to the retained float polynomial improved the captured
+  mismatch count only from 12 to 11 words and were not kept.
+- A split full-attention phase profiler
+  (`SUPERSONIC_METAL_PROFILE_QWEN36_FULL_ATTN_PHASES=1`) showed that the native
+  values rewrite is no longer the main wall-clock target. Because decode-batch
+  coalesces labels, the useful diagnostic run disabled decode batching:
+  `/tmp/qwen35_native_full_attn_phase_profile_nobatch_4.log`
+  (`SUPERSONIC_METAL_QWEN36_DISABLE_DECODE_BATCH=1`,
+  `SUPERSONIC_METAL_ENABLE_QWEN36_FULL_ATTN_NATIVE=1`). Over 4 generated tokens
+  and 10 full-attention layers per token, full-attention GPU time was roughly
+  6.1 ms total, about 1.5 ms/token in the unbatched/profiled shape. The largest
+  full-attention sub-phases were projections at 3.808 ms total and output
+  projection/finalize at 1.939 ms total; values were only 0.259 ms total. The
+  same profile still made FFN/decode scheduling the dominant optimization area,
+  not native full-attention values.
+- An opt-in fused shared gate/up + shared-scalar FFN probe was added behind
+  `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_SHARED_GATE_UP_SCALAR_FUSED=1`. The
+  first variant preserved the promoted exact shared gate/up path and computed
+  the shared scalar in an extra threadgroup using the same lane-0 serial dot
+  order as the default scalar kernel. A 128-token check matched the default
+  generated IDs exactly and moved from 75.3 to 70.9 ms/token
+  (`/tmp/qwen35_default_after_scalar_fuse_patch_128.log` vs.
+  `/tmp/qwen35_shared_scalar_fused_serial_128.log`). The 512-token gate failed:
+  the fused path diverged at token 4 and measured 65.2 ms/token
+  (`/tmp/qwen35_shared_scalar_fused_serial_512.log`), while the current default
+  512-token control measured 67.3 ms/token
+  (`/tmp/qwen35_default_after_scalar_fuse_patch_512.log`). A follow-up row-0
+  fused variant kept the original shared gate/up grid shape and computed the
+  scalar from row 0 of that kernel. It avoided the early token-4 divergence but
+  still drifted late in the 512-token stream and slowed to 69.9 ms/token
+  (`/tmp/qwen35_shared_scalar_fused_row0_512.log`). The fused scalar path
+  therefore remains diagnostic/opt-in and is not part of the headline path.
+- Split FFN profiling is distorted by the extra phase flushes, but it is still
+  useful directionally: on a 32-token profile run, router/top-k was the largest
+  FFN GPU sub-phase (`qwen36_ffn_int4_router_topk_stage5`, 543.7 ms total),
+  followed by shared gate/up (195.7 ms), expert down finalize (152.5 ms),
+  shared scalar (139.0 ms), shared down (77.6 ms), and expert gate/up (62.5
+  ms). A future router optimization still needs a full generated-stream parity
+  gate. The current SIMD router probe matched top-k indices and weights across
+  664 tapped router calls through a 17-token run, with maximum observed
+  differences of 0.015625 in normalized hidden values, 0.0625 in router logits,
+  and 0.0009765625 in top-k weights; however, the full 128-token SIMD-router
+  run still diverged at token 16 and did not show a consistent speed win.
+
+The repeatable harness preset for future comparisons is:
+
+```bash
+SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" \
+  cargo run --release -p supersonic-bench --bin bench-perf -- \
+  --preset qwen35-q4km-m5-max-gen512
+```
+
+This preset tracks the public `llama-bench` generation shape (`tg512`:
+`n_prompt=0`, `n_gen=512`, five repetitions). llama.cpp defaults to
+`n_batch=2048` and `n_ubatch=512`; those batch knobs affect prompt processing
+and prefilled-context tests, while this comparison is single-stream decode at
+zero prefilled depth. SuperSonic currently uses the BOS token for an empty
+prompt, so its closest comparable workload is one prompt token plus 512
+generated tokens with `--context-size 1024`.
+
 The local-main-target workflow for this machine is:
 
 1. quick smoke: `SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" cargo test --release -p runner --test qwen36_moe_metal_smoke -- --ignored --nocapture`

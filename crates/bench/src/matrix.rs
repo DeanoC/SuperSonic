@@ -258,6 +258,14 @@ pub static SUPPORTED_COMBOS: &[ComboDescriptor] = &[
         arch: BenchArch::AppleM5Max,
         min_vram_gib: 21.0,
     },
+    // Public M5 Max comparison target: Qwen3.5-35B-A3B with raw GGML Q4_K_M
+    // blocks sourced from the public GGUF bake.
+    ComboDescriptor {
+        model: "qwen3.5-35b-a3b",
+        quant: "q4km",
+        arch: BenchArch::AppleM5Max,
+        min_vram_gib: 21.0,
+    },
     // CUDA sm86 Qwen3.6-MoE prefill lanes. `int4-specNNN` is INT4 plus
     // Qwen3.5-0.8B cross-family SpecPrefill cosine keep ratio NNN/100.
     ComboDescriptor {
@@ -325,9 +333,11 @@ pub struct MatrixConfig {
     pub specprefill_draft_dir_resolver: Box<dyn Fn(&str) -> Option<PathBuf>>,
     pub prompt: String,
     pub max_new_tokens: u32,
+    pub context_size: Option<u32>,
     pub warmup_tokens: u32,
     pub measurement_runs: u32,
     pub cooldown_seconds: u32,
+    pub collect_attribution: bool,
     pub git_sha: String,
     pub git_dirty: bool,
     pub git_dirty_paths: Vec<String>,
@@ -415,11 +425,13 @@ pub fn run_matrix(cfg: &MatrixConfig, rd: &RunDir) -> Result<()> {
                 specprefill_draft_dir: (cfg.specprefill_draft_dir_resolver)(model),
                 prompt: cfg.prompt.clone(),
                 max_new_tokens: cfg.max_new_tokens,
+                context_size: cfg.context_size,
                 warmup_tokens: cfg.warmup_tokens,
             };
             let policy = RunPolicy {
                 measurement_runs: cfg.measurement_runs,
                 cooldown_seconds: cfg.cooldown_seconds,
+                collect_attribution: cfg.collect_attribution,
             };
             let cell = run_one_combo(&invocation, &policy)?;
             rd.write_perf(&cell)?;
