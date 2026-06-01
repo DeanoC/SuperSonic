@@ -13,9 +13,9 @@ def main():
     render = sub.add_parser("markdown")
     render.add_argument("--run", required=True, type=Path)
     render.add_argument("--out", required=True, type=Path,
-                        help="Repo root containing docs/quality.md and docs/performance.md")
+                        help="Repo root containing docs/quality.md and docs/detailed_performance.md")
     render.add_argument("--perf-zone-key", default="bench-perf-matrix",
-                        help="AUTOGEN zone key to update in docs/performance.md")
+                        help="AUTOGEN zone key to update in docs/detailed_performance.md")
 
     diff = sub.add_parser("diff")
     diff.add_argument("--run-a", required=True, type=Path)
@@ -31,7 +31,7 @@ def main():
             arch = json.loads(meta_path.read_text()).get("arch")
             if arch == "apple-m5-max":
                 perf_zone_key = "apple-m5-max-metal"
-        perf_doc = (args.out / "docs" / "performance.md")
+        perf_doc = (args.out / "docs" / "detailed_performance.md")
         if perf_doc.exists():
             updated = replace_autogen_zone(perf_doc.read_text(), perf_zone_key, perf_md)
             perf_doc.write_text(updated)

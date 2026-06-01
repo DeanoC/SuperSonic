@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 #
 # Benchmark the full HIP gfx1100 quant matrix and emit a markdown table to
-# stdout. Mirrors the gfx1150 numbers in `docs/performance.md` (same prompt,
+# stdout. Mirrors the gfx1150 numbers in `docs/detailed_performance.md` (same prompt,
 # same `MAX_NEW`) so cross-arch comparisons stay apples-to-apples.
 #
 # Each cell: 3s cooldown → 1 warmup run → median of 3 measurement runs.
 # The cooldown + median was added 2026-05-04 after a previous version of
 # the matrix without these controls produced numbers biased upward by
-# thermal accumulation across cells (see docs/performance.md § Methodology).
+# thermal accumulation across cells (see docs/detailed_performance.md § Methodology).
 #
 # Full sweep on a 7900 XTX with warm bakes is ~3 minutes (was ~1 minute
 # before the 3-run-median; the extra runs stabilize the larger-model cells).
@@ -49,7 +49,7 @@ bench_one() {
     # 3s cooldown to bleed thermal state from the previous cell. Without
     # this, serial benches over 7 models accumulate enough heat that the
     # larger Qwen3.5 cells measure 1.5-2x slower than steady-state. See
-    # docs/performance.md § Methodology.
+    # docs/detailed_performance.md § Methodology.
     sleep 3
     # Warm up once (kernel JIT, page cache).
     "$SUPERSONIC" --model "$model" --model-dir "$model_dir" \

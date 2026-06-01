@@ -41,8 +41,16 @@ CONTEXTS='4096' NUM_CHUNKS=1 CONFIG=both REFERENCE_SMOKE=1 \
   ./tests/sm86/bench_llama31_pg19_smoke.sh \
   /path/to/Meta-Llama-3.1-8B
 
-# apple-m4 (Apple silicon) — Qwen3.5-0.8B Metal bughunt gate
+# Apple silicon — Qwen3.5-0.8B Metal bughunt gate
 SUPERSONIC_BACKENDS=metal QWEN35_MODEL_DIR=/path/to/Qwen3.5-0.8B ./tests/metal/qwen35_bughunt_gate.sh
+
+# Apple M5 Max large-model Metal coverage
+SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" \
+  cargo test --release -p runner --test metal_large_model_smoke -- --ignored --nocapture
+
+# Apple M5 Max Qwen3.6-MoE INT4 smoke
+SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" \
+  cargo test --release -p runner --test qwen36_moe_metal_smoke -- --ignored --nocapture
 ```
 
 ### Adding tests for a new machine
@@ -73,7 +81,12 @@ The persistent decode megakernel can occasionally hang the GPU at 100% utilizati
 
 For CUDA specifically, treat `sm86` as the validated target for now. Other NVIDIA architectures may work, but they are not yet part of the checked support matrix.
 
-For Metal specifically, treat Apple M4 as the validated target for now. Other
+For Metal specifically, Apple M4 remains the small Qwen3.5 validation lane.
+Apple M5 Max is the current large-model lane: it covers Qwen3.5 BF16 smokes,
+Qwen3/Qwen3.6 MoE INT4 smokes, Gemma 4 BF16/INT4 smokes, and Phi-4 mini
+BF16/INT4/FP8-runtime smokes through the component/chained Metal paths. The
+Qwen3.6-MoE Apple M5 Max performance gate is
+`bench-perf --arch apple-m5-max --models qwen3.6-35b-a3b --quants int4`.
 
 ## Per-feature parity tests
 

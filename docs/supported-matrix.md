@@ -192,7 +192,7 @@ lane, not a Hopper-specific retune.
 
 ¹ Smoke-tested and benchmarked on an NVIDIA H100 80GB HBM3 on 2026-05-07 with
   CUDA 13.0 / driver 580.126.09, using the `bakes-v2` BF16 release artifacts.
-  See [docs/performance.md](performance.md#cuda--sm90-nvidia-h100-80gb-hbm3).
+  See [docs/detailed_performance.md](detailed_performance.md#cuda--sm90-nvidia-h100-80gb-hbm3).
 ² Registered on `sm90` by reusing the validated CUDA `sm86` entry for this
   model/lane. Dedicated H100 parity coverage is pending; if you need strict
   certification for one of these inherited lanes, run the matching `tests/sm86`

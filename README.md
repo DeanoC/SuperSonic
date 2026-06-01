@@ -37,7 +37,9 @@ to disable network fetches.
   features (KV-FP8, VMM, SpecPrefill, DFlash, MoE prefetch, certified-KV)
   with the feature×feature grid and a picker for common use cases.
 - **[Performance](docs/performance.md)** — measured decode throughput per
-  (model, arch, quant) and runtime-feature impact.
+  (model, arch, quant), summarized as headline matrices.
+- **[Detailed performance](docs/detailed_performance.md)** — methodology,
+  attribution tables, historical logs, and runtime-feature impact.
 - **[Build and run](docs/build-and-run.md)** — per-backend build commands
   and the validated `supersonic` invocation set.
 - **[OpenAI-compatible server](docs/server.md)** — `supersonic-serve`
