@@ -2503,6 +2503,120 @@ pub unsafe fn attn_step_stage5_metal_host_into(
     )
 }
 
+const QWEN36_FULL_ATTN_NATIVE_MAX_SCORE_TOKENS: usize = 128;
+
+pub fn attn_step_stage5_metal_native_supported(
+    params: Qwen36MoeAttnStepParams,
+    weights: &Qwen36MoeAttnStepWeights,
+    int4: &Qwen36MoeAttnStepInt4,
+    output_capacity: usize,
+) -> bool {
+    let eff_cache_pos = if params.cache_pos >= 0 {
+        params.cache_pos
+    } else {
+        params.position
+    };
+    std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FULL_ATTN_NATIVE").is_some()
+        && std::env::var_os("SUPERSONIC_METAL_DISABLE_QWEN36_FULL_ATTN_NATIVE").is_none()
+        && params.stage == 5
+        && params.hidden == 2048
+        && params.num_heads == 16
+        && params.num_kv_heads == 2
+        && params.head_dim == 256
+        && params.rotary_dim >= 0
+        && params.rotary_dim <= params.head_dim
+        && eff_cache_pos >= 0
+        && (eff_cache_pos as usize) < QWEN36_FULL_ATTN_NATIVE_MAX_SCORE_TOKENS
+        && weights.kv_max_t > eff_cache_pos
+        && int4.group_size == 128
+        && output_capacity >= params.hidden as usize
+        && !crate::metal_native::disabled_by_env()
+        && !weights.input_hidden.is_null()
+        && !weights.input_norm_w.is_null()
+        && !weights.q_proj_w.is_null()
+        && !weights.k_proj_w.is_null()
+        && !weights.v_proj_w.is_null()
+        && !weights.q_norm_w.is_null()
+        && !weights.k_norm_w.is_null()
+        && !weights.o_proj_w.is_null()
+        && !weights.kv_cache_k.is_null()
+        && !weights.kv_cache_v.is_null()
+        && !int4.q_proj_scale.is_null()
+        && !int4.q_proj_zero.is_null()
+        && !int4.k_proj_scale.is_null()
+        && !int4.k_proj_zero.is_null()
+        && !int4.v_proj_scale.is_null()
+        && !int4.v_proj_zero.is_null()
+        && !int4.o_proj_scale.is_null()
+        && !int4.o_proj_zero.is_null()
+}
+
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn attn_step_stage5_metal_native_into(
+    params: Qwen36MoeAttnStepParams,
+    weights: &Qwen36MoeAttnStepWeights,
+    int4: &Qwen36MoeAttnStepInt4,
+    rope_cos: *const c_void,
+    rope_sin: *const c_void,
+    output: &mut GpuBuffer,
+    workspace: &mut GpuBuffer,
+    final_output: *mut c_void,
+    final_output_capacity: usize,
+    wait_for_completion: bool,
+) -> Result<(), GpuError> {
+    if output.backend() != Backend::Metal {
+        return Err(GpuError::backend(
+            output.backend(),
+            "qwen36_moe::attn_step_stage5_metal_native_into requires Metal output".into(),
+        ));
+    }
+    if !attn_step_stage5_metal_native_supported(params, weights, int4, final_output_capacity) {
+        return Err(GpuError::InvalidArg(
+            "qwen36_moe::attn_step_stage5_metal_native_into unsupported configuration".into(),
+        ));
+    }
+    unsafe {
+        crate::metal_native::qwen36_full_attn_int4_stage5(
+            params.hidden as usize,
+            params.num_heads as usize,
+            params.num_kv_heads as usize,
+            params.head_dim as usize,
+            params.rotary_dim as usize,
+            int4.group_size as usize,
+            params.position,
+            params.cache_pos,
+            weights.kv_max_t as usize,
+            QWEN36_FULL_ATTN_NATIVE_MAX_SCORE_TOKENS,
+            params.rms_norm_eps,
+            params.rope_theta,
+            rope_cos,
+            rope_sin,
+            weights.input_hidden,
+            weights.input_norm_w,
+            weights.q_proj_w,
+            int4.q_proj_scale,
+            int4.q_proj_zero,
+            weights.k_proj_w,
+            int4.k_proj_scale,
+            int4.k_proj_zero,
+            weights.v_proj_w,
+            int4.v_proj_scale,
+            int4.v_proj_zero,
+            weights.q_norm_w,
+            weights.k_norm_w,
+            weights.o_proj_w,
+            int4.o_proj_scale,
+            int4.o_proj_zero,
+            weights.kv_cache_k,
+            weights.kv_cache_v,
+            workspace.as_mut_ptr(),
+            output.as_mut_ptr(),
+            final_output,
+            wait_for_completion,
+        )
+    }
+}
+
 fn attn_step_stage1_5_metal_host(
     params: Qwen36MoeAttnStepParams,
     weights: &Qwen36MoeAttnStepWeights,
@@ -2624,8 +2738,36 @@ fn attn_step_stage1_5_metal_host(
     } else {
         q_normed_dim
     };
+    let score_tap_elems = if params.stage >= 5
+        && std::env::var_os("SUPERSONIC_METAL_QWEN36_FULL_ATTN_SCORE_TAP").is_some()
+    {
+        num_heads * kv_len
+    } else {
+        0
+    };
+    let prob_tap_elems = if params.stage >= 5
+        && std::env::var_os("SUPERSONIC_METAL_QWEN36_FULL_ATTN_PROB_TAP").is_some()
+    {
+        num_heads * kv_len
+    } else {
+        0
+    };
+    let exp_tap_elems = if params.stage >= 5
+        && std::env::var_os("SUPERSONIC_METAL_QWEN36_FULL_ATTN_EXP_TAP").is_some()
+    {
+        num_heads * kv_len
+    } else {
+        0
+    };
+    let denom_tap_elems = if params.stage >= 5
+        && std::env::var_os("SUPERSONIC_METAL_QWEN36_FULL_ATTN_DENOM_TAP").is_some()
+    {
+        num_heads
+    } else {
+        0
+    };
     let workspace_len = if params.stage >= 5 {
-        off_o_out + hidden
+        off_o_out + hidden + score_tap_elems + prob_tap_elems + exp_tap_elems + denom_tap_elems
     } else if params.stage >= 4 {
         off_attn + q_normed_dim
     } else if params.stage >= 3 {
@@ -2878,10 +3020,41 @@ fn attn_step_stage1_5_metal_host(
                 scores[t] = score;
                 max_score = max_score.max(score);
             }
+            if std::env::var_os("SUPERSONIC_METAL_QWEN36_FULL_ATTN_SCORE_TAP").is_some() {
+                let score_base = off_o_out + hidden + hq * kv_len;
+                let score_end = score_base + kv_len;
+                if score_end <= workspace.len() {
+                    workspace[score_base..score_end].copy_from_slice(&scores);
+                }
+            }
             let mut denom = 0.0f32;
             for score in scores.iter_mut() {
                 *score = (*score - max_score).exp();
                 denom += *score;
+            }
+            if std::env::var_os("SUPERSONIC_METAL_QWEN36_FULL_ATTN_EXP_TAP").is_some() {
+                let exp_base = off_o_out + hidden + score_tap_elems + prob_tap_elems + hq * kv_len;
+                let exp_end = exp_base + kv_len;
+                if exp_end <= workspace.len() {
+                    workspace[exp_base..exp_end].copy_from_slice(&scores);
+                }
+            }
+            if std::env::var_os("SUPERSONIC_METAL_QWEN36_FULL_ATTN_DENOM_TAP").is_some() {
+                let denom_base =
+                    off_o_out + hidden + score_tap_elems + prob_tap_elems + exp_tap_elems;
+                let denom_idx = denom_base + hq;
+                if denom_idx < workspace.len() {
+                    workspace[denom_idx] = denom;
+                }
+            }
+            if std::env::var_os("SUPERSONIC_METAL_QWEN36_FULL_ATTN_PROB_TAP").is_some() {
+                let prob_base = off_o_out + hidden + score_tap_elems + hq * kv_len;
+                let prob_end = prob_base + kv_len;
+                if prob_end <= workspace.len() {
+                    for t in 0..kv_len {
+                        workspace[prob_base + t] = scores[t] / denom;
+                    }
+                }
             }
             for i in 0..head_dim {
                 let mut acc = 0.0f32;
@@ -3782,8 +3955,10 @@ pub struct Qwen36MoeFfnStepWeights {
 #[derive(Debug, Clone, Copy)]
 pub struct Qwen36MoeFfnStepInt4 {
     pub group_size: i32,
+    pub gate_up_proj_type: i32,
     pub gate_up_proj_scale: *const c_void,
     pub gate_up_proj_zero: *const c_void,
+    pub down_proj_type: i32,
     pub down_proj_scale: *const c_void,
     pub down_proj_zero: *const c_void,
     pub shared_gate_proj_scale: *const c_void,
@@ -3801,8 +3976,10 @@ impl Qwen36MoeFfnStepInt4 {
     pub const fn disabled() -> Self {
         Self {
             group_size: 0,
+            gate_up_proj_type: 0,
             gate_up_proj_scale: std::ptr::null(),
             gate_up_proj_zero: std::ptr::null(),
+            down_proj_type: 0,
             down_proj_scale: std::ptr::null(),
             down_proj_zero: std::ptr::null(),
             shared_gate_proj_scale: std::ptr::null(),
@@ -3815,12 +3992,38 @@ impl Qwen36MoeFfnStepInt4 {
     }
 }
 
+fn qwen36_lowbit_native_int4(qtype: i32) -> bool {
+    qtype == 4
+}
+
+fn qwen36_lowbit_ggml_k(qtype: i32) -> bool {
+    matches!(qtype, 12 | 13 | 14)
+}
+
+fn qwen36_lowbit_supported(qtype: i32) -> bool {
+    qwen36_lowbit_native_int4(qtype) || qwen36_lowbit_ggml_k(qtype)
+}
+
+fn qwen36_lowbit_has_required_sidecars(
+    qtype: i32,
+    scale: *const c_void,
+    zero: *const c_void,
+) -> bool {
+    qwen36_lowbit_ggml_k(qtype) || (!scale.is_null() && !zero.is_null())
+}
+
+fn qwen36_stage5_env_or_raw_ggml(env_name: &str, int4: &Qwen36MoeFfnStepInt4) -> bool {
+    std::env::var_os(env_name).is_some()
+        || qwen36_lowbit_ggml_k(int4.gate_up_proj_type)
+        || qwen36_lowbit_ggml_k(int4.down_proj_type)
+}
+
 fn qwen36_ffn_int4_stage5_metal_native_supported(
     params: Qwen36MoeFfnStepParams,
     weights: &Qwen36MoeFfnStepWeights,
     int4: &Qwen36MoeFfnStepInt4,
 ) -> bool {
-    std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5").is_some()
+    qwen36_stage5_env_or_raw_ggml("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5", int4)
         && params.stage == 5
         && params.hidden == 2048
         && params.num_experts == 256
@@ -3842,10 +4045,18 @@ fn qwen36_ffn_int4_stage5_metal_native_supported(
         && !int4.shared_up_proj_zero.is_null()
         && !int4.shared_down_proj_scale.is_null()
         && !int4.shared_down_proj_zero.is_null()
-        && !int4.gate_up_proj_scale.is_null()
-        && !int4.gate_up_proj_zero.is_null()
-        && !int4.down_proj_scale.is_null()
-        && !int4.down_proj_zero.is_null()
+        && qwen36_lowbit_supported(int4.gate_up_proj_type)
+        && qwen36_lowbit_has_required_sidecars(
+            int4.gate_up_proj_type,
+            int4.gate_up_proj_scale,
+            int4.gate_up_proj_zero,
+        )
+        && qwen36_lowbit_supported(int4.down_proj_type)
+        && qwen36_lowbit_has_required_sidecars(
+            int4.down_proj_type,
+            int4.down_proj_scale,
+            int4.down_proj_zero,
+        )
 }
 
 fn qwen36_ffn_int4_stage5_router_metal_native_supported(
@@ -3853,8 +4064,10 @@ fn qwen36_ffn_int4_stage5_router_metal_native_supported(
     weights: &Qwen36MoeFfnStepWeights,
     int4: &Qwen36MoeFfnStepInt4,
 ) -> bool {
-    std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER").is_some()
-        && params.stage == 5
+    qwen36_stage5_env_or_raw_ggml(
+        "SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER",
+        int4,
+    ) && params.stage == 5
         && params.hidden == 2048
         && params.num_experts == 256
         && params.moe_intermediate == 512
@@ -3877,10 +4090,18 @@ fn qwen36_ffn_int4_stage5_router_metal_native_supported(
         && !int4.shared_up_proj_zero.is_null()
         && !int4.shared_down_proj_scale.is_null()
         && !int4.shared_down_proj_zero.is_null()
-        && !int4.gate_up_proj_scale.is_null()
-        && !int4.gate_up_proj_zero.is_null()
-        && !int4.down_proj_scale.is_null()
-        && !int4.down_proj_zero.is_null()
+        && qwen36_lowbit_supported(int4.gate_up_proj_type)
+        && qwen36_lowbit_has_required_sidecars(
+            int4.gate_up_proj_type,
+            int4.gate_up_proj_scale,
+            int4.gate_up_proj_zero,
+        )
+        && qwen36_lowbit_supported(int4.down_proj_type)
+        && qwen36_lowbit_has_required_sidecars(
+            int4.down_proj_type,
+            int4.down_proj_scale,
+            int4.down_proj_zero,
+        )
 }
 
 pub fn ffn_stage5_router_metal_native_supported(
@@ -3893,6 +4114,7 @@ pub fn ffn_stage5_router_metal_native_supported(
 
 pub fn ffn_stage5_router_defer_wait_enabled() -> bool {
     std::env::var_os("SUPERSONIC_METAL_QWEN36_DEFER_FFN_ROUTER_STAGE5_WAIT").is_some()
+        && std::env::var_os("SUPERSONIC_METAL_QWEN36_SYNC_FFN_ROUTER_STAGE5_WAIT").is_none()
         && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
 }
 
@@ -4002,17 +4224,42 @@ fn qwen36_ffn_shared_stage5_path_label() -> &'static str {
         || std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_SHARED_GATE_UP_TILED").is_some();
     let gate_up_exp2 = !gate_up
         && std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_SHARED_GATE_UP_EXP2").is_some();
+    let gate_up_exact = !gate_up
+        && !gate_up_exp2
+        && std::env::var_os("SUPERSONIC_METAL_DISABLE_QWEN36_FFN_SHARED_GATE_UP_EXACT_SIMD")
+            .is_none();
     let scalar =
         all || std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_SHARED_SCALAR_SIMD").is_some();
+    let scalar_exact = !scalar
+        && std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_SHARED_SCALAR_EXACT_SIMD")
+            .is_some();
     let down =
         all || std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_SHARED_DOWN_TILED").is_some();
-    match (gate_up, gate_up_exp2, scalar, down) {
-        (true, false, true, true) => "all_tiled",
-        (true, false, false, false) => "gate_up_tiled",
-        (false, true, false, false) => "gate_up_exp2",
-        (false, false, true, false) => "scalar_simd",
-        (false, false, false, true) => "down_tiled",
-        (false, false, false, false) => "host_order",
+    let down_exact = !down
+        && std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_SHARED_DOWN_EXACT_SIMD").is_some();
+    match (
+        gate_up,
+        gate_up_exp2,
+        gate_up_exact,
+        scalar,
+        scalar_exact,
+        down,
+        down_exact,
+    ) {
+        (true, false, false, true, false, true, false) => "all_tiled",
+        (true, false, false, false, false, false, false) => "gate_up_tiled",
+        (false, true, false, false, false, false, false) => "gate_up_exp2",
+        (false, false, true, false, false, false, false) => "gate_up_exact_simd",
+        (false, false, true, false, true, false, false) => "gate_up_exact_simd+scalar_exact_simd",
+        (false, false, true, false, false, false, true) => "gate_up_exact_simd+down_exact_simd",
+        (false, false, true, false, true, false, true) => {
+            "gate_up_exact_simd+scalar_exact_simd+down_exact_simd"
+        }
+        (false, false, false, true, false, false, false) => "scalar_simd",
+        (false, false, false, false, true, false, false) => "scalar_exact_simd",
+        (false, false, false, false, false, true, false) => "down_tiled",
+        (false, false, false, false, false, false, true) => "down_exact_simd",
+        (false, false, false, false, false, false, false) => "host_order",
         _ => "mixed",
     }
 }
@@ -6528,6 +6775,8 @@ fn qwen36_ffn_expert_tiled_stage5_metal_native_supported(
         && !weights.input_hidden.is_null()
         && !weights.gate_up_proj_w.is_null()
         && !weights.down_proj_w.is_null()
+        && qwen36_lowbit_native_int4(int4.gate_up_proj_type)
+        && qwen36_lowbit_native_int4(int4.down_proj_type)
         && !int4.gate_up_proj_scale.is_null()
         && !int4.gate_up_proj_zero.is_null()
         && !int4.down_proj_scale.is_null()
@@ -6550,6 +6799,8 @@ fn qwen36_ffn_expert_packed_stage5_metal_native_supported(
         && !weights.input_hidden.is_null()
         && !weights.gate_up_proj_w.is_null()
         && !weights.down_proj_w.is_null()
+        && qwen36_lowbit_native_int4(int4.gate_up_proj_type)
+        && qwen36_lowbit_native_int4(int4.down_proj_type)
         && !int4.gate_up_proj_scale.is_null()
         && !int4.gate_up_proj_zero.is_null()
         && !int4.down_proj_scale.is_null()
@@ -6592,6 +6843,8 @@ fn qwen36_ffn_expert_mps_bridge_stage5_supported(
     weights: &Qwen36MoeFfnStepWeights,
     int4: &Qwen36MoeFfnStepInt4,
 ) -> bool {
+    let cpu_transcode =
+        std::env::var_os("SUPERSONIC_METAL_QWEN36_MPS_BRIDGE_CPU_TRANSCODE").is_some();
     std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_MPS_BRIDGE").is_some()
         && params.stage == 5
         && params.hidden == 2048
@@ -6603,10 +6856,21 @@ fn qwen36_ffn_expert_mps_bridge_stage5_supported(
         && !weights.input_hidden.is_null()
         && !weights.gate_up_proj_w.is_null()
         && !weights.down_proj_w.is_null()
-        && !int4.gate_up_proj_scale.is_null()
-        && !int4.gate_up_proj_zero.is_null()
-        && !int4.down_proj_scale.is_null()
-        && !int4.down_proj_zero.is_null()
+        && qwen36_lowbit_supported(int4.gate_up_proj_type)
+        && qwen36_lowbit_has_required_sidecars(
+            int4.gate_up_proj_type,
+            int4.gate_up_proj_scale,
+            int4.gate_up_proj_zero,
+        )
+        && qwen36_lowbit_supported(int4.down_proj_type)
+        && qwen36_lowbit_has_required_sidecars(
+            int4.down_proj_type,
+            int4.down_proj_scale,
+            int4.down_proj_zero,
+        )
+        && (!cpu_transcode
+            || (qwen36_lowbit_native_int4(int4.gate_up_proj_type)
+                && qwen36_lowbit_native_int4(int4.down_proj_type)))
 }
 
 fn qwen36_ffn_expert_mps_static_topn_partial_stage5_supported(
@@ -9863,9 +10127,11 @@ fn ffn_step_stage1_5_metal_host(
                     int4.shared_down_proj_scale,
                     int4.shared_down_proj_zero,
                     weights.gate_up_proj_w,
+                    int4.gate_up_proj_type,
                     int4.gate_up_proj_scale,
                     int4.gate_up_proj_zero,
                     weights.down_proj_w,
+                    int4.down_proj_type,
                     int4.down_proj_scale,
                     int4.down_proj_zero,
                     workspace.as_mut_ptr() as *mut c_void,
@@ -10263,9 +10529,11 @@ fn ffn_step_stage1_5_metal_host(
                     int4.shared_down_proj_scale,
                     int4.shared_down_proj_zero,
                     weights.gate_up_proj_w,
+                    int4.gate_up_proj_type,
                     int4.gate_up_proj_scale,
                     int4.gate_up_proj_zero,
                     weights.down_proj_w,
+                    int4.down_proj_type,
                     int4.down_proj_scale,
                     int4.down_proj_zero,
                     workspace.as_mut_ptr() as *mut c_void,
@@ -10504,9 +10772,11 @@ fn ffn_step_stage1_5_metal_host(
                         int4.group_size as usize,
                         workspace_ptr,
                         weights.gate_up_proj_w,
+                        int4.gate_up_proj_type,
                         int4.gate_up_proj_scale,
                         int4.gate_up_proj_zero,
                         weights.down_proj_w,
+                        int4.down_proj_type,
                         int4.down_proj_scale,
                         int4.down_proj_zero,
                         bridge.h_norm.as_mut_ptr(),
@@ -19595,8 +19865,10 @@ mod tests {
         };
         let int4_ptrs = Qwen36MoeFfnStepInt4 {
             group_size,
+            gate_up_proj_type: 4,
             gate_up_proj_scale: std::ptr::null(),
             gate_up_proj_zero: std::ptr::null(),
+            down_proj_type: 4,
             down_proj_scale: std::ptr::null(),
             down_proj_zero: std::ptr::null(),
             shared_gate_proj_scale: sgp_scale_buf.as_ptr(),
@@ -19835,9 +20107,11 @@ mod tests {
         };
         let int4_ptrs = Qwen36MoeFfnStepInt4 {
             group_size,
+            gate_up_proj_type: 4,
             gate_up_proj_scale: gup_scale_buf.as_ptr(),
             gate_up_proj_zero: gup_zero_buf.as_ptr(),
             // down_proj stays BF16 until step 5 wires Phase I.
+            down_proj_type: 4,
             down_proj_scale: std::ptr::null(),
             down_proj_zero: std::ptr::null(),
             shared_gate_proj_scale: sgp_scale_buf.as_ptr(),
@@ -20068,8 +20342,10 @@ mod tests {
         };
         let int4_ptrs = Qwen36MoeFfnStepInt4 {
             group_size,
+            gate_up_proj_type: 4,
             gate_up_proj_scale: gup_scale_buf.as_ptr(),
             gate_up_proj_zero: gup_zero_buf.as_ptr(),
+            down_proj_type: 4,
             down_proj_scale: dp_scale_buf.as_ptr(),
             down_proj_zero: dp_zero_buf.as_ptr(),
             shared_gate_proj_scale: sgp_scale_buf.as_ptr(),

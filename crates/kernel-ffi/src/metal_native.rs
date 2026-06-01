@@ -114,9 +114,11 @@ unsafe extern "C" {
         shared_down_scale_ptr: *const c_void,
         shared_down_zero_ptr: *const c_void,
         gate_up_proj_ptr: *const c_void,
+        gate_up_proj_type: c_int,
         gate_up_scale_ptr: *const c_void,
         gate_up_zero_ptr: *const c_void,
         down_proj_ptr: *const c_void,
+        down_proj_type: c_int,
         down_scale_ptr: *const c_void,
         down_zero_ptr: *const c_void,
         workspace_ptr: *mut c_void,
@@ -145,9 +147,11 @@ unsafe extern "C" {
         shared_down_scale_ptr: *const c_void,
         shared_down_zero_ptr: *const c_void,
         gate_up_proj_ptr: *const c_void,
+        gate_up_proj_type: c_int,
         gate_up_scale_ptr: *const c_void,
         gate_up_zero_ptr: *const c_void,
         down_proj_ptr: *const c_void,
+        down_proj_type: c_int,
         down_scale_ptr: *const c_void,
         down_zero_ptr: *const c_void,
         workspace_ptr: *mut c_void,
@@ -313,9 +317,11 @@ unsafe extern "C" {
         group_size: usize,
         workspace_ptr: *mut c_void,
         gate_up_proj_ptr: *const c_void,
+        gate_up_proj_type: c_int,
         gate_up_scale_ptr: *const c_void,
         gate_up_zero_ptr: *const c_void,
         down_proj_ptr: *const c_void,
+        down_proj_type: c_int,
         down_scale_ptr: *const c_void,
         down_zero_ptr: *const c_void,
         h_norm_f16_ptr: *mut c_void,
@@ -354,6 +360,44 @@ unsafe extern "C" {
         out_proj_zero_ptr: *const c_void,
         conv_state_ptr: *mut c_void,
         recurrent_state_ptr: *mut c_void,
+        workspace_ptr: *mut c_void,
+        output_ptr: *mut c_void,
+        final_output_ptr: *mut c_void,
+        wait_for_completion: c_int,
+    ) -> c_int;
+    fn supersonic_metal_qwen36_full_attn_int4_stage5(
+        hidden: usize,
+        num_heads: usize,
+        num_kv_heads: usize,
+        head_dim: usize,
+        rotary_dim: usize,
+        group_size: usize,
+        position: i32,
+        cache_pos: i32,
+        kv_max_t: usize,
+        max_score_tokens: usize,
+        rms_norm_eps: f32,
+        rope_theta: f32,
+        rope_cos_ptr: *const c_void,
+        rope_sin_ptr: *const c_void,
+        input_hidden_ptr: *const c_void,
+        input_norm_w_ptr: *const c_void,
+        q_proj_ptr: *const c_void,
+        q_proj_scale_ptr: *const c_void,
+        q_proj_zero_ptr: *const c_void,
+        k_proj_ptr: *const c_void,
+        k_proj_scale_ptr: *const c_void,
+        k_proj_zero_ptr: *const c_void,
+        v_proj_ptr: *const c_void,
+        v_proj_scale_ptr: *const c_void,
+        v_proj_zero_ptr: *const c_void,
+        q_norm_w_ptr: *const c_void,
+        k_norm_w_ptr: *const c_void,
+        o_proj_ptr: *const c_void,
+        o_proj_scale_ptr: *const c_void,
+        o_proj_zero_ptr: *const c_void,
+        kv_cache_k_ptr: *mut c_void,
+        kv_cache_v_ptr: *mut c_void,
         workspace_ptr: *mut c_void,
         output_ptr: *mut c_void,
         final_output_ptr: *mut c_void,
@@ -1718,6 +1762,127 @@ pub(crate) unsafe fn qwen36_linear_int4_stage5(
 
 #[cfg(all(target_os = "macos", supersonic_backend_metal))]
 #[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn qwen36_full_attn_int4_stage5(
+    hidden: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+    group_size: usize,
+    position: i32,
+    cache_pos: i32,
+    kv_max_t: usize,
+    max_score_tokens: usize,
+    rms_norm_eps: f32,
+    rope_theta: f32,
+    rope_cos: *const c_void,
+    rope_sin: *const c_void,
+    input_hidden: *const c_void,
+    input_norm_w: *const c_void,
+    q_proj: *const c_void,
+    q_proj_scale: *const c_void,
+    q_proj_zero: *const c_void,
+    k_proj: *const c_void,
+    k_proj_scale: *const c_void,
+    k_proj_zero: *const c_void,
+    v_proj: *const c_void,
+    v_proj_scale: *const c_void,
+    v_proj_zero: *const c_void,
+    q_norm_w: *const c_void,
+    k_norm_w: *const c_void,
+    o_proj: *const c_void,
+    o_proj_scale: *const c_void,
+    o_proj_zero: *const c_void,
+    kv_cache_k: *mut c_void,
+    kv_cache_v: *mut c_void,
+    workspace: *mut c_void,
+    output: *mut c_void,
+    final_output: *mut c_void,
+    wait_for_completion: bool,
+) -> Result<(), GpuError> {
+    if hidden == 0
+        || num_heads == 0
+        || num_kv_heads == 0
+        || head_dim == 0
+        || group_size == 0
+        || max_score_tokens == 0
+        || input_hidden.is_null()
+        || input_norm_w.is_null()
+        || q_proj.is_null()
+        || q_proj_scale.is_null()
+        || q_proj_zero.is_null()
+        || k_proj.is_null()
+        || k_proj_scale.is_null()
+        || k_proj_zero.is_null()
+        || v_proj.is_null()
+        || v_proj_scale.is_null()
+        || v_proj_zero.is_null()
+        || q_norm_w.is_null()
+        || k_norm_w.is_null()
+        || o_proj.is_null()
+        || o_proj_scale.is_null()
+        || o_proj_zero.is_null()
+        || rope_cos.is_null()
+        || rope_sin.is_null()
+        || workspace.is_null()
+        || output.is_null()
+        || final_output.is_null()
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "metal native qwen36_full_attn_int4_stage5 invalid shape: hidden={hidden} num_heads={num_heads} num_kv_heads={num_kv_heads} head_dim={head_dim} group_size={group_size} max_score_tokens={max_score_tokens}"
+        )));
+    }
+    let status = unsafe {
+        supersonic_metal_qwen36_full_attn_int4_stage5(
+            hidden,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            rotary_dim,
+            group_size,
+            position,
+            cache_pos,
+            kv_max_t,
+            max_score_tokens,
+            rms_norm_eps,
+            rope_theta,
+            rope_cos,
+            rope_sin,
+            input_hidden,
+            input_norm_w,
+            q_proj,
+            q_proj_scale,
+            q_proj_zero,
+            k_proj,
+            k_proj_scale,
+            k_proj_zero,
+            v_proj,
+            v_proj_scale,
+            v_proj_zero,
+            q_norm_w,
+            k_norm_w,
+            o_proj,
+            o_proj_scale,
+            o_proj_zero,
+            kv_cache_k,
+            kv_cache_v,
+            workspace,
+            output,
+            final_output,
+            i32::from(wait_for_completion),
+        )
+    };
+    if status != 0 {
+        return Err(GpuError::backend(
+            Backend::Metal,
+            format!("metal native qwen36_full_attn_int4_stage5 failed with status {status}"),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", supersonic_backend_metal))]
+#[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn qwen36_ffn_expert_gate_up_tiled(
     hidden: usize,
     moe_intermediate: usize,
@@ -1995,9 +2160,11 @@ pub(crate) unsafe fn qwen36_ffn_expert_mps_transcode_int4_f16(
     group_size: usize,
     workspace: *mut c_void,
     gate_up_proj: *const c_void,
+    gate_up_proj_type: i32,
     gate_up_scale: *const c_void,
     gate_up_zero: *const c_void,
     down_proj: *const c_void,
+    down_proj_type: i32,
     down_scale: *const c_void,
     down_zero: *const c_void,
     h_norm_f16: *mut c_void,
@@ -2034,9 +2201,11 @@ pub(crate) unsafe fn qwen36_ffn_expert_mps_transcode_int4_f16(
             group_size,
             workspace,
             gate_up_proj,
+            gate_up_proj_type,
             gate_up_scale,
             gate_up_zero,
             down_proj,
+            down_proj_type,
             down_scale,
             down_zero,
             h_norm_f16,
@@ -2380,9 +2549,11 @@ pub(crate) unsafe fn qwen36_ffn_int4_stage5(
     shared_down_scale: *const c_void,
     shared_down_zero: *const c_void,
     gate_up_proj: *const c_void,
+    gate_up_proj_type: i32,
     gate_up_scale: *const c_void,
     gate_up_zero: *const c_void,
     down_proj: *const c_void,
+    down_proj_type: i32,
     down_scale: *const c_void,
     down_zero: *const c_void,
     workspace: *mut c_void,
@@ -2422,9 +2593,11 @@ pub(crate) unsafe fn qwen36_ffn_int4_stage5(
             shared_down_scale,
             shared_down_zero,
             gate_up_proj,
+            gate_up_proj_type,
             gate_up_scale,
             gate_up_zero,
             down_proj,
+            down_proj_type,
             down_scale,
             down_zero,
             workspace,
@@ -2465,9 +2638,11 @@ pub(crate) unsafe fn qwen36_ffn_int4_stage5_with_router(
     shared_down_scale: *const c_void,
     shared_down_zero: *const c_void,
     gate_up_proj: *const c_void,
+    gate_up_proj_type: i32,
     gate_up_scale: *const c_void,
     gate_up_zero: *const c_void,
     down_proj: *const c_void,
+    down_proj_type: i32,
     down_scale: *const c_void,
     down_zero: *const c_void,
     workspace: *mut c_void,
@@ -2512,9 +2687,11 @@ pub(crate) unsafe fn qwen36_ffn_int4_stage5_with_router(
             shared_down_scale,
             shared_down_zero,
             gate_up_proj,
+            gate_up_proj_type,
             gate_up_scale,
             gate_up_zero,
             down_proj,
+            down_proj_type,
             down_scale,
             down_zero,
             workspace,
@@ -5459,6 +5636,52 @@ pub(crate) unsafe fn qwen36_linear_int4_stage5(
 
 #[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
 #[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn qwen36_full_attn_int4_stage5(
+    _hidden: usize,
+    _num_heads: usize,
+    _num_kv_heads: usize,
+    _head_dim: usize,
+    _rotary_dim: usize,
+    _group_size: usize,
+    _position: i32,
+    _cache_pos: i32,
+    _kv_max_t: usize,
+    _max_score_tokens: usize,
+    _rms_norm_eps: f32,
+    _rope_theta: f32,
+    _rope_cos: *const c_void,
+    _rope_sin: *const c_void,
+    _input_hidden: *const c_void,
+    _input_norm_w: *const c_void,
+    _q_proj: *const c_void,
+    _q_proj_scale: *const c_void,
+    _q_proj_zero: *const c_void,
+    _k_proj: *const c_void,
+    _k_proj_scale: *const c_void,
+    _k_proj_zero: *const c_void,
+    _v_proj: *const c_void,
+    _v_proj_scale: *const c_void,
+    _v_proj_zero: *const c_void,
+    _q_norm_w: *const c_void,
+    _k_norm_w: *const c_void,
+    _o_proj: *const c_void,
+    _o_proj_scale: *const c_void,
+    _o_proj_zero: *const c_void,
+    _kv_cache_k: *mut c_void,
+    _kv_cache_v: *mut c_void,
+    _workspace: *mut c_void,
+    _output: *mut c_void,
+    _final_output: *mut c_void,
+    _wait_for_completion: bool,
+) -> Result<(), GpuError> {
+    Err(GpuError::backend(
+        Backend::Metal,
+        "metal native qwen36_full_attn_int4_stage5 is not compiled".into(),
+    ))
+}
+
+#[cfg(not(all(target_os = "macos", supersonic_backend_metal)))]
+#[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn qwen36_ffn_expert_gate_up_tiled(
     _hidden: usize,
     _moe_intermediate: usize,
@@ -5681,9 +5904,11 @@ pub(crate) unsafe fn qwen36_ffn_expert_mps_transcode_int4_f16(
     _group_size: usize,
     _workspace: *mut c_void,
     _gate_up_proj: *const c_void,
+    _gate_up_proj_type: i32,
     _gate_up_scale: *const c_void,
     _gate_up_zero: *const c_void,
     _down_proj: *const c_void,
+    _down_proj_type: i32,
     _down_scale: *const c_void,
     _down_zero: *const c_void,
     _h_norm_f16: *mut c_void,
@@ -5720,9 +5945,11 @@ pub(crate) unsafe fn qwen36_ffn_int4_stage5(
     _shared_down_scale: *const c_void,
     _shared_down_zero: *const c_void,
     _gate_up_proj: *const c_void,
+    _gate_up_proj_type: i32,
     _gate_up_scale: *const c_void,
     _gate_up_zero: *const c_void,
     _down_proj: *const c_void,
+    _down_proj_type: i32,
     _down_scale: *const c_void,
     _down_zero: *const c_void,
     _workspace: *mut c_void,
@@ -6190,9 +6417,11 @@ pub(crate) unsafe fn qwen36_ffn_int4_stage5_with_router(
     _shared_down_scale: *const c_void,
     _shared_down_zero: *const c_void,
     _gate_up_proj: *const c_void,
+    _gate_up_proj_type: i32,
     _gate_up_scale: *const c_void,
     _gate_up_zero: *const c_void,
     _down_proj: *const c_void,
+    _down_proj_type: i32,
     _down_scale: *const c_void,
     _down_zero: *const c_void,
     _workspace: *mut c_void,

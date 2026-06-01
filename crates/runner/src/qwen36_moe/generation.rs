@@ -43,21 +43,11 @@ fn metal_gpu_argmax_enabled(
     dump_last_logits: bool,
     logits_buf: &GpuBuffer,
 ) -> bool {
-    std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_LM_HEAD_GPU_ARGMAX").is_some()
-        && logits_buf.backend() == Backend::Metal
+    logits_buf.backend() == Backend::Metal
         && (sampling.temperature <= 0.0 || sampling.top_k == 1)
         && !dump_last_logits
         && std::env::var_os("SUPERSONIC_QWEN36_DUMP_LOGITS").is_none()
-}
-
-fn downstream_tap_path_label(lm_head_folded: bool) -> &'static str {
-    if std::env::var_os("SUPERSONIC_METAL_QWEN36_DECODE_BATCH").is_some() {
-        "decode_batch"
-    } else if lm_head_folded {
-        "persistent"
-    } else {
-        "chained"
-    }
+        && std::env::var_os("SUPERSONIC_METAL_DISABLE_QWEN36_LM_HEAD_GPU_ARGMAX").is_none()
 }
 
 pub(crate) fn run_generation_step(args: Qwen36GenerationStep<'_>) -> Result<u32> {
@@ -84,7 +74,7 @@ pub(crate) fn run_generation_step(args: Qwen36GenerationStep<'_>) -> Result<u32>
 
     dump_final_hidden_if_requested(step, loop_state.position, &outputs.final_hidden_bytes)?;
     let gen_index = loop_state.generated_ids.len();
-    let tap_path = downstream_tap_path_label(lm_head_folded);
+    let tap_path = outputs.path_label;
     emit_final_hidden_tap_if_requested(
         step,
         gen_index,

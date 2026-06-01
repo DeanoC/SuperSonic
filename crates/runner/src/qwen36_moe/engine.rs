@@ -13,6 +13,7 @@ use gpu_hal::{set_backend, Backend};
 use kernel_ffi::qwen36_moe::{
     Qwen36MoeFfnStepInt4, Qwen36MoeFfnStepParams, Qwen36MoeFfnStepWeights,
 };
+use model_store::manifest::QuantProfile;
 use model_store::BakedStore;
 
 use crate::profiling::PrefillProfileScope;
@@ -98,12 +99,14 @@ fn prewarm_qwen36_mps_static_topn_if_requested(
         let fp8 = int4.group_size < 0;
         let int4_ptrs = Qwen36MoeFfnStepInt4 {
             group_size: int4.group_size,
+            gate_up_proj_type: int4.gate_up_proj_type,
             gate_up_proj_scale: int4.gate_up_proj_scale.as_ptr(),
             gate_up_proj_zero: if fp8 {
                 ptr::null()
             } else {
                 int4.gate_up_proj_zero.as_ptr()
             },
+            down_proj_type: int4.down_proj_type,
             down_proj_scale: int4.down_proj_scale.as_ptr(),
             down_proj_zero: if fp8 {
                 ptr::null()
@@ -340,7 +343,7 @@ fn run_inner(
         sampling,
         cli.emit_stage_timings,
         cli.speculative_decode,
-        cli.fp8_runtime,
+        crate::bakes::effective_quant_profile(cli)?,
         requires_int4_bake,
         cli.batched_spec_verify,
         entry.backend,
@@ -385,7 +388,7 @@ fn decode_text(
     sampling: SamplingParams,
     emit_stage_timings: bool,
     speculative_decode: bool,
-    fp8_runtime: bool,
+    quant_profile: QuantProfile,
     int4_runtime: bool,
     batched_spec_verify: bool,
     backend: Backend,
@@ -420,7 +423,7 @@ fn decode_text(
     print_prompt_summary(prompt, &prompt_ids);
 
     let bake_open_start = std::time::Instant::now();
-    let bake = select_decode_bake(model_dir, fp8_runtime, int4_runtime)?;
+    let bake = select_decode_bake(model_dir, quant_profile, int4_runtime)?;
     if !bake.weight_mode.is_int4() {
         match backend {
             Backend::Cuda => anyhow::bail!(

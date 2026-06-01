@@ -1706,12 +1706,14 @@ fn process_ffn_pertoken(
             let fp8 = s.group_size < 0;
             Qwen36MoeFfnStepInt4 {
                 group_size: s.group_size,
+                gate_up_proj_type: s.gate_up_proj_type,
                 gate_up_proj_scale: s.gate_up_proj_scale.as_ptr(),
                 gate_up_proj_zero: if fp8 {
                     std::ptr::null()
                 } else {
                     s.gate_up_proj_zero.as_ptr()
                 },
+                down_proj_type: s.down_proj_type,
                 down_proj_scale: s.down_proj_scale.as_ptr(),
                 down_proj_zero: if fp8 {
                     std::ptr::null()
