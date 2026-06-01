@@ -407,10 +407,14 @@ Current Apple M4 / Apple M5 Max checkpoint:
 
 The current Qwen3.6 optimization target is measured from the Apple M5 Max
 bench/profile loop rather than guessed up front. As of the latest local
-checkpoint, FFN fallback tightening brought the headline decode gate below
-330 ms/token; linear-attention is now the largest per-token attribution bucket,
-while the native FFN profile path still shows command-buffer wait as the thing
-to fix before making it default.
+checkpoint, the retained headline is `58.3 ms/token` (`17.2 tok/s`) from
+`target/bench-runs/2026-05-25-d20a655-9`, with samples `58.3`, `60.3`, and
+`58.2`. The unprofiled stage table is `ffn_ms_avg=32.611`,
+`linear_attn_ms_avg=15.954`, `full_attn_ms_avg=5.737`, and
+`lm_head_ms_avg=4.659`. The profile pass still names `command_buffer_wait` and
+`qwen36_linear_int4_stage5` first, followed by FFN host expert gate/up/down, so
+the next measured target is the Metal linear stage/wait pair plus the remaining
+FFN expert rows.
 
 ### Large model setup
 
@@ -747,16 +751,14 @@ away from slab rebuilding, whether CPU or GPU driven, and toward a different
 fused INT4 addressing scheme or eliminating the per-token packed slab
 path.
 `SUPERSONIC_METAL_QWEN36_MPS_EXPERT_PILOT=1` adds a resident-FP16
-Metal Performance Shaders attribution row for the active-expert GEMV shapes. A
-one-token M5 Max smoke generated `[11]` and reported `gate_up_ms=3.260`,
-`down_ms=2.975`, `gate_up_tflops=1.029`, and `down_tflops=0.564` for 100
-repeated expert-shape MPS GEMMs, while the default INT4 host expert work in the
-same profiled run was `73.851 ms` gate/up and `42.274 ms` down across 40 layers.
-The current `bench-perf` attribution lane writes this as `mps_expert_pilot` in
-schema-v9 JSON. The latest recorded M5 Max run before the schema bump measured
-`162.6 ms/token` median with unprofiled `ffn_ms_avg=97.974`, unprofiled
-`linear_attn_ms_avg=31.335`, and a resident-MPS pilot of `gate_up_ms=0.628`,
-`down_ms=0.340`.
+Metal Performance Shaders attribution row for the active-expert GEMV shapes. The
+current retained `bench-perf` profile writes this as `mps_expert_pilot` in
+schema-v9 JSON. The retained M5 Max run
+`target/bench-runs/2026-05-25-d20a655-9` measured `58.3 ms/token` median and
+recorded a resident-MPS pilot of `gate_up_ms=0.627`, `down_ms=0.343`,
+`gate_up_tflops=5.355`, and `down_tflops=4.894`. That row is attribution only:
+the real default lane remains the INT4 host fallback because the measured MPS
+bridge candidates still lose once active expert materialization is included.
 `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_MPS_BRIDGE=1` enables the first
 real bridge experiment: active GPTQ experts are transposed/dequantized to FP16
 MPS buffers, MPS runs gate/up and down, and a small Metal finalizer writes the

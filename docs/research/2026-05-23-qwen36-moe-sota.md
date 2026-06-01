@@ -221,7 +221,7 @@ SuperSonic mapping:
 
 ## What SuperSonic Has Already Learned
 
-Current local measurements in `docs/performance.md` show a tight negative
+Current local measurements in `docs/detailed_performance.md` show a tight negative
 result:
 
 - CPU active-slab packing proves the large original expert buffers cause real
@@ -238,7 +238,7 @@ representation.
 
 Local sources:
 
-- [Apple M5 Max Metal Qwen3.6 measurements](../performance.md#metal--apple-m5-max-apple-m5-max)
+- [Apple M5 Max Metal Qwen3.6 measurements](../detailed_performance.md#metal--apple-m5-max-apple-m5-max)
 - [Qwen3.6 batched-prefill grouped MoE design](2026-05-05-qwen36-moe-batched-prefill-results.md)
 
 ## Recommended SuperSonic Roadmap
@@ -2825,5 +2825,5 @@ under the same smoke:
 - [KTransformers KT-Kernel README](https://github.com/kvcache-ai/ktransformers/blob/main/kt-kernel/README.md)
 - [KTransformers releases](https://github.com/kvcache-ai/ktransformers/releases)
 - [Qwen3.6 speculative decoding RTX 3090 benchmark repo](https://github.com/thc1006/qwen3.6-speculative-decoding-rtx3090)
-- [SuperSonic Apple M5 Max Metal Qwen3.6 measurements](../performance.md#metal--apple-m5-max-apple-m5-max)
+- [SuperSonic Apple M5 Max Metal Qwen3.6 measurements](../detailed_performance.md#metal--apple-m5-max-apple-m5-max)
 - [SuperSonic Qwen3.6 batched-prefill grouped MoE design](2026-05-05-qwen36-moe-batched-prefill-results.md)

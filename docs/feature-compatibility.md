@@ -5,7 +5,7 @@ of feature × model × architecture are validated, which are mutually
 exclusive, and which use cases each combination targets.
 
 This doc tracks **correctness**. For measured speedups see
-[performance.md § Runtime feature impact](performance.md#runtime-feature-impact).
+[detailed_performance.md § Runtime feature impact](detailed_performance.md#runtime-feature-impact).
 For the model × quant × arch baseline see
 [supported-matrix.md](supported-matrix.md).
 
@@ -13,7 +13,16 @@ CUDA `sm90` currently follows the `sm86` CUDA feature surface: H100-class
 devices compile native SM90 CUDA kernels but reuse the validated `sm86`
 registry geometry and feature gates. Dedicated H100 validation is tracked in
 [supported-matrix.md § CUDA on sm90](supported-matrix.md#cuda-on-sm90) and
-[performance.md § CUDA — sm90](performance.md#cuda--sm90-nvidia-h100-80gb-hbm3).
+[detailed_performance.md § CUDA — sm90](detailed_performance.md#cuda--sm90-nvidia-h100-80gb-hbm3).
+
+Metal `apple-m5-max` has a broader model/quant coverage surface than Apple M4
+now, but it is still a component/chained decode surface. Qwen3.6-35B-A3B INT4,
+Qwen3-30B-A3B INT4, Gemma 4 BF16/INT4, and Phi-4 mini BF16/INT4/FP8-runtime
+coverage lives in [supported-matrix.md](supported-matrix.md#metal-on-apple-m4--apple-m5-max).
+The advanced runtime features below remain unsupported on Metal unless a row
+explicitly says otherwise: Qwen3.6 persistent decode, KV-FP8, VMM,
+SpecPrefill/DFlash-style speculative paths, MoE prefetch, and batching are not
+part of the Apple M5 Max feature surface today.
 
 ## How to read
 
@@ -266,7 +275,7 @@ supersonic --backend hip --model qwen3.5-9b --model-dir /path/to/9B \
 Use INT4 GPTQ + VMM (default ON for this model on HIP). For long
 contexts, add `--kv-fp8` for additional KV headroom (validated
 2026-05-03; ~1% step-time overhead, see
-[performance.md § Runtime feature impact](performance.md#runtime-feature-impact)).
+[detailed_performance.md § Runtime feature impact](detailed_performance.md#runtime-feature-impact)).
 
 ```bash
 supersonic --backend hip --model qwen3.6-35b-a3b \
@@ -299,4 +308,4 @@ supersonic --backend hip --model qwen3.5-0.8b --model-dir /path/to/0.8B \
 
 This doc is correctness-only. For measured impact (ms/step, % TTFT,
 VRAM delta) see
-[performance.md § Runtime feature impact](performance.md#runtime-feature-impact).
+[detailed_performance.md § Runtime feature impact](detailed_performance.md#runtime-feature-impact).
