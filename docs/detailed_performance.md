@@ -1007,6 +1007,15 @@ identical generated IDs
 decode on the mixed-layout bake; it is still a staged correctness gate, not a
 headline performance result.
 
+The 128-token raw profiling gate then ran with `--context-size 256`,
+`--max-new-tokens 128`, and `--emit-stage-timings`. It preserved the 8-token
+prefix above and measured `105.7 ms/token` over 128 generated tokens. Stage
+attribution was `chain=100.3 ms/token`, `lm_head=3.8 ms/token`,
+`full_attn=7.8 ms/token`, `linear_attn=12.4 ms/token`, and
+`ffn=79.9 ms/token`; generation wall time was 13.53s. This makes FFN, and
+specifically staged raw routed-expert work, the first optimization target once
+the raw lane reaches the 512-token benchmark gate.
+
 Short smoke runs are too noisy for headline comparison: 16-token samples ranged
 from ~125 to ~201 ms/token depending on command-buffer scheduling and warm
 state, while longer runs settle much lower. The 2026-06-01 FFN Q4_K lane-pair
