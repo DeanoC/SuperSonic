@@ -189,11 +189,13 @@ fi
         specprefill_draft_dir: None,
         prompt: "x".into(),
         max_new_tokens: 1,
+        context_size: None,
         warmup_tokens: 1,
     };
     let policy = RunPolicy {
         measurement_runs: 1,
         cooldown_seconds: 0,
+        collect_attribution: true,
     };
 
     let cell = run_one_combo(&invocation, &policy).unwrap();

@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -11,6 +11,10 @@ use supersonic_bench::runs::{allocate_run_dir, RunDir};
 struct Cli {
     #[arg(long, default_value = "gfx1100")]
     arch: String,
+    /// Named benchmark preset. Presets overwrite arch/model/quant/token policy
+    /// fields so the measured workload is reproducible.
+    #[arg(long, value_enum)]
+    preset: Option<PerfPreset>,
     #[arg(long, default_value = "all")]
     models: String,
     #[arg(long, default_value = "all")]
@@ -19,12 +23,17 @@ struct Cli {
     prompt: String,
     #[arg(long, default_value_t = 16)]
     max_new_tokens: u32,
+    #[arg(long)]
+    context_size: Option<u32>,
     #[arg(long, default_value_t = 2)]
     warmup_tokens: u32,
     #[arg(long, default_value_t = 3)]
     measurement_runs: u32,
     #[arg(long, default_value_t = 3)]
     cooldown_seconds: u32,
+    /// Skip extra attribution/profile runs after measured samples.
+    #[arg(long)]
+    no_attribution: bool,
     #[arg(long, default_value = "./target/release/supersonic")]
     binary: PathBuf,
     #[arg(long, default_value = "./target/bench-runs")]
@@ -37,6 +46,13 @@ struct Cli {
     /// model, e.g. "qwen3.6-35b-a3b=/models/Qwen3.5-0.8B".
     #[arg(long = "specprefill-draft-dir", value_parser = parse_kv)]
     specprefill_draft_dirs: Vec<(String, PathBuf)>,
+}
+
+#[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+enum PerfPreset {
+    /// Public llama.cpp-style M5 Max generation benchmark:
+    /// qwen3.5-35b-a3b Q4_K_M, tg/gen 512, ctx1024, one warmup, five measured reps.
+    Qwen35Q4kmM5MaxGen512,
 }
 
 fn parse_kv(s: &str) -> Result<(String, PathBuf), String> {
@@ -61,7 +77,8 @@ fn parse_model_dir(s: &str) -> Result<ModelDirArg, String> {
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+    apply_preset(&mut cli);
     let arch = BenchArch::parse(&cli.arch).ok_or_else(|| anyhow!("unknown arch: {}", cli.arch))?;
     let combos = supersonic_bench::matrix::combos_for_arch(arch.clone());
     let models = filter_csv(&cli.models, combos.iter().map(|c| c.model));
@@ -118,9 +135,11 @@ fn main() -> Result<()> {
         specprefill_draft_dir_resolver: draft_resolver,
         prompt: cli.prompt,
         max_new_tokens: cli.max_new_tokens,
+        context_size: cli.context_size,
         warmup_tokens: cli.warmup_tokens,
         measurement_runs: cli.measurement_runs,
         cooldown_seconds: cli.cooldown_seconds,
+        collect_attribution: !cli.no_attribution,
         git_sha,
         git_dirty,
         git_dirty_paths,
@@ -130,6 +149,72 @@ fn main() -> Result<()> {
     run_matrix(&cfg, &rd)?;
     println!("[bench-perf] wrote {}", run_path.display());
     Ok(())
+}
+
+fn apply_preset(cli: &mut Cli) {
+    match cli.preset {
+        Some(PerfPreset::Qwen35Q4kmM5MaxGen512) => {
+            cli.arch = "apple-m5-max".into();
+            cli.models = "qwen3.5-35b-a3b".into();
+            cli.quants = "q4km-gptq".into();
+            cli.prompt.clear();
+            cli.max_new_tokens = 512;
+            cli.context_size = Some(1024);
+            cli.warmup_tokens = 512;
+            cli.measurement_runs = 5;
+            cli.cooldown_seconds = 0;
+            cli.no_attribution = true;
+        }
+        None => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{apply_preset, Cli, PerfPreset};
+    use clap::Parser;
+
+    #[test]
+    fn qwen35_q4km_m5max_gen512_preset_cli_name_is_stable() {
+        let cli = Cli::try_parse_from(["bench-perf", "--preset", "qwen35-q4km-m5-max-gen512"])
+            .expect("preset should parse with the documented CLI spelling");
+
+        assert_eq!(cli.preset, Some(PerfPreset::Qwen35Q4kmM5MaxGen512));
+    }
+
+    #[test]
+    fn qwen35_q4km_m5max_gen512_preset_matches_public_generation_shape() {
+        let mut cli = Cli {
+            arch: "gfx1100".into(),
+            preset: Some(PerfPreset::Qwen35Q4kmM5MaxGen512),
+            models: "all".into(),
+            quants: "all".into(),
+            prompt: "The quick brown fox jumps over".into(),
+            max_new_tokens: 16,
+            context_size: None,
+            warmup_tokens: 2,
+            measurement_runs: 3,
+            cooldown_seconds: 3,
+            no_attribution: false,
+            binary: "./target/release/supersonic".into(),
+            run_root: "./target/bench-runs".into(),
+            model_dirs: vec![],
+            specprefill_draft_dirs: vec![],
+        };
+
+        apply_preset(&mut cli);
+
+        assert_eq!(cli.arch, "apple-m5-max");
+        assert_eq!(cli.models, "qwen3.5-35b-a3b");
+        assert_eq!(cli.quants, "q4km-gptq");
+        assert_eq!(cli.prompt, "");
+        assert_eq!(cli.max_new_tokens, 512);
+        assert_eq!(cli.context_size, Some(1024));
+        assert_eq!(cli.warmup_tokens, 512);
+        assert_eq!(cli.measurement_runs, 5);
+        assert_eq!(cli.cooldown_seconds, 0);
+        assert!(cli.no_attribution);
+    }
 }
 
 fn normalize_model_dirs(

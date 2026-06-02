@@ -87,6 +87,24 @@ Qwen3/Qwen3.6 MoE INT4 smokes, Gemma 4 BF16/INT4 smokes, and Phi-4 mini
 BF16/INT4/FP8-runtime smokes through the component/chained Metal paths. The
 Qwen3.6-MoE Apple M5 Max performance gate is
 `bench-perf --arch apple-m5-max --models qwen3.6-35b-a3b --quants int4`.
+For the public llama.cpp-style Qwen3.5-35B-A3B Q4_K_M comparison on M5 Max,
+run the Q4_K_M-sourced GPTQ/native-INT4 Metal lane:
+
+```bash
+SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" \
+  cargo run --release -p supersonic-bench --bin bench-perf -- \
+  --preset qwen35-q4km-m5-max-gen512
+```
+
+This preset records the SuperSonic generation benchmark with a 512-token
+generation run, `--q4km-gptq`, `--context-size 1024`, one 512-token warmup, five measured
+repetitions, and no extra attribution/profile passes. It mirrors the public
+`llama-bench` `tg512` shape (`n_prompt=0`, `n_gen=512`, five repetitions);
+SuperSonic currently seeds the run with the model BOS token for an empty
+prompt, so the recorded row is "1 prompt token + 512 generated". llama.cpp's
+batch defaults (`n_batch=2048`, `n_ubatch=512`) are prompt-processing knobs;
+they are recorded as comparison context but are not a separate SuperSonic
+decode setting for this single-stream generation lane.
 
 ## Per-feature parity tests
 

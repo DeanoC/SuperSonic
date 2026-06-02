@@ -549,6 +549,12 @@ def map_gguf_name(name: str, weight_prefix: str) -> str | None:
         "ffn_gate.weight": f"{lp}.mlp.gate_proj.weight",
         "ffn_up.weight": f"{lp}.mlp.up_proj.weight",
         "ffn_down.weight": f"{lp}.mlp.down_proj.weight",
+        # Qwen3.5/3.6 MoE tensors in llama.cpp GGUF naming.
+        "ffn_gate_inp.weight": f"{lp}.mlp.gate.weight",
+        "ffn_gate_inp_shexp.weight": f"{lp}.mlp.shared_expert_gate.weight",
+        "ffn_gate_shexp.weight": f"{lp}.mlp.shared_expert.gate_proj.weight",
+        "ffn_up_shexp.weight": f"{lp}.mlp.shared_expert.up_proj.weight",
+        "ffn_down_shexp.weight": f"{lp}.mlp.shared_expert.down_proj.weight",
         "attn_q.weight": f"{lp}.self_attn.q_proj.weight",
         "attn_k.weight": f"{lp}.self_attn.k_proj.weight",
         "attn_v.weight": f"{lp}.self_attn.v_proj.weight",
@@ -929,6 +935,89 @@ def emit_tensor(
     return quantized
 
 
+def ggml_k_blocks_3d(gguf: GgufFile, info: GgufTensorInfo) -> tuple[np.ndarray, int, int, int]:
+    """Return raw GGML K-block bytes as `[experts, rows, row_bytes]`."""
+    if len(info.dims) != 3:
+        raise SystemExit(f"{info.name}: expected GGUF dims [cols, rows, experts], got {info.dims}")
+    raw_layout = ggml_k_layout(info.ggml_type)
+    if raw_layout is None:
+        raise SystemExit(
+            f"{info.name}: expected GGML K-block expert tensor, got {ggml_type_name(info.ggml_type)}"
+        )
+    cols, rows, experts = info.dims
+    row_bytes = ggml_row_size(info.ggml_type, cols)
+    raw = np.frombuffer(raw_gguf_tensor_bytes(gguf, info), dtype=np.uint8)
+    expected = experts * rows * row_bytes
+    if raw.size != expected:
+        raise SystemExit(
+            f"{info.name}: raw byte count {raw.size} does not match "
+            f"experts={experts} rows={rows} row_bytes={row_bytes}"
+        )
+    return raw.reshape(experts, rows, row_bytes), experts, rows, row_bytes
+
+
+def append_qwen36_moe_expert_gguf_tensors(
+    tensors_out: list[tuple[str, bytes, list[int], str, str]],
+    gguf: GgufFile,
+    by_gguf_name: dict[str, GgufTensorInfo],
+    consumed: set[str],
+    weight_prefix: str,
+    layer_types: list[str],
+) -> int:
+    """Fuse llama.cpp MoE GGUF expert tensors into SuperSonic runtime names."""
+    quantized = 0
+    for layer in range(len(layer_types)):
+        lp = f"{weight_prefix}.layers.{layer}.mlp"
+        gate_name = f"blk.{layer}.ffn_gate_exps.weight"
+        up_name = f"blk.{layer}.ffn_up_exps.weight"
+        down_name = f"blk.{layer}.ffn_down_exps.weight"
+        present = [name for name in (gate_name, up_name, down_name) if name in by_gguf_name]
+        if not present:
+            continue
+        if len(present) != 3:
+            missing = sorted({gate_name, up_name, down_name} - set(present))
+            raise SystemExit(f"layer {layer}: incomplete MoE expert GGUF set, missing {missing}")
+
+        gate = by_gguf_name[gate_name]
+        up = by_gguf_name[up_name]
+        down = by_gguf_name[down_name]
+        if gate.ggml_type != up.ggml_type:
+            raise SystemExit(
+                f"layer {layer}: gate/up expert GGML types differ: "
+                f"{ggml_type_name(gate.ggml_type)} vs {ggml_type_name(up.ggml_type)}"
+            )
+
+        gate_blocks, experts, gate_rows, gate_row_bytes = ggml_k_blocks_3d(gguf, gate)
+        up_blocks, up_experts, up_rows, up_row_bytes = ggml_k_blocks_3d(gguf, up)
+        if (experts, gate_row_bytes) != (up_experts, up_row_bytes):
+            raise SystemExit(
+                f"layer {layer}: gate/up expert layouts differ: "
+                f"gate experts={experts} row_bytes={gate_row_bytes}, "
+                f"up experts={up_experts} row_bytes={up_row_bytes}"
+            )
+        gate_up = np.concatenate([gate_blocks, up_blocks], axis=1)
+        tensors_out.append((
+            f"{lp}.experts.gate_up_proj",
+            gate_up.tobytes(),
+            [experts, gate_rows + up_rows, gate_row_bytes],
+            "u8",
+            ggml_k_layout(gate.ggml_type),
+        ))
+
+        down_blocks, down_experts, down_rows, down_row_bytes = ggml_k_blocks_3d(gguf, down)
+        tensors_out.append((
+            f"{lp}.experts.down_proj",
+            down_blocks.tobytes(),
+            [down_experts, down_rows, down_row_bytes],
+            "u8",
+            ggml_k_layout(down.ggml_type),
+        ))
+
+        consumed.update((gate_name, up_name, down_name))
+        quantized += 2
+    return quantized
+
+
 def encode_tensor_entries(
     name: str,
     t: torch.Tensor,
@@ -943,6 +1032,8 @@ def encode_tensor_entries(
     raw_dtype_override: str | None = None,
 ) -> tuple[list[tuple[str, bytes, list[int], str, str]], bool]:
     entries: list[tuple[str, bytes, list[int], str, str]] = []
+    if name.endswith(".mlp.shared_expert_gate.weight") and t.dim() == 1:
+        t = t.reshape(1, t.shape[0])
     shape = list(t.shape)
     if is_q4km_target(name, shape, group_size):
         if is_fused_expert_target(name):
@@ -1072,7 +1163,20 @@ def bake_from_gguf(args, weight_prefix: str, layer_types: list[str], family: str
         tensors_out: list[tuple[str, bytes, list[int], str, str]] = []
         quantized = 0
         skipped = 0
+        by_gguf_name = {info.name: info for info in gguf.tensors}
+        consumed: set[str] = set()
+        if family == "qwen36-moe":
+            quantized += append_qwen36_moe_expert_gguf_tensors(
+                tensors_out,
+                gguf,
+                by_gguf_name,
+                consumed,
+                weight_prefix,
+                layer_types,
+            )
         for i, info in enumerate(gguf.tensors, 1):
+            if info.name in consumed:
+                continue
             mapped = map_gguf_name(info.name, weight_prefix)
             if mapped is None:
                 skipped += 1

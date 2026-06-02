@@ -210,8 +210,10 @@ pub struct LinearAttnInt4Sidecars {
 /// `shared_expert_gate` stay BF16.
 pub struct FfnInt4Sidecars {
     pub group_size: i32,
+    pub gate_up_proj_type: i32,
     pub gate_up_proj_scale: GpuBuffer,
     pub gate_up_proj_zero: GpuBuffer,
+    pub down_proj_type: i32,
     pub down_proj_scale: GpuBuffer,
     pub down_proj_zero: GpuBuffer,
     pub shared_gate_proj_scale: GpuBuffer,
@@ -347,6 +349,7 @@ impl LayerBuffers {
 /// are useful for granular parity diagnostics; `final_hidden_bytes` is what
 /// final RMSnorm + lm_head consume.
 pub struct DecodeOutputs {
+    pub path_label: &'static str,
     pub final_hidden_bytes: Vec<u8>,
     pub per_layer_attn_out: Vec<Vec<u8>>,
     pub per_layer_ffn_out: Vec<Vec<u8>>,

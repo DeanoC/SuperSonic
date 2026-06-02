@@ -261,6 +261,7 @@ pub struct ComboInvocation {
     pub specprefill_draft_dir: Option<PathBuf>,
     pub prompt: String,
     pub max_new_tokens: u32,
+    pub context_size: Option<u32>,
     pub warmup_tokens: u32,
 }
 
@@ -268,6 +269,7 @@ pub struct ComboInvocation {
 pub struct RunPolicy {
     pub measurement_runs: u32,
     pub cooldown_seconds: u32,
+    pub collect_attribution: bool,
 }
 
 pub fn run_one_combo(invocation: &ComboInvocation, policy: &RunPolicy) -> Result<PerfCellJson> {
@@ -298,10 +300,14 @@ pub fn run_one_combo(invocation: &ComboInvocation, policy: &RunPolicy) -> Result
         let mut sorted = samples.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let median = sorted[sorted.len() / 2];
-        let mut attribution = invoke_supersonic(invocation, invocation.max_new_tokens, true, false)
-            .map(|run| run.attribution)
-            .unwrap_or_default();
-        if should_collect_profile_attribution(invocation) {
+        let mut attribution = if policy.collect_attribution {
+            invoke_supersonic(invocation, invocation.max_new_tokens, true, false)
+                .map(|run| run.attribution)
+                .unwrap_or_default()
+        } else {
+            AttributionTimings::default()
+        };
+        if policy.collect_attribution && should_collect_profile_attribution(invocation) {
             if let Ok(profile_run) =
                 invoke_supersonic(invocation, invocation.max_new_tokens, true, true)
             {
@@ -383,7 +389,12 @@ fn invoke_supersonic(
     if let Some(backend) = &invocation.backend {
         cmd.arg("--backend").arg(backend);
     }
-    if invocation.arch == "apple-m5-max" && invocation.model == "qwen3.6-35b-a3b" {
+    if invocation.arch == "apple-m5-max"
+        && matches!(
+            invocation.model.as_str(),
+            "qwen3.5-35b-a3b" | "qwen3.6-35b-a3b"
+        )
+    {
         cmd.env("SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL", "0")
             .env("SUPERSONIC_QWEN36_DENSE_PREFILL_TOKEN_LOOP", "1");
         if emit_stage_timings {
@@ -402,6 +413,9 @@ fn invoke_supersonic(
         .arg(&invocation.prompt)
         .arg("--max-new-tokens")
         .arg(max_new.to_string());
+    if let Some(context_size) = invocation.context_size {
+        cmd.arg("--context-size").arg(context_size.to_string());
+    }
     if emit_stage_timings {
         cmd.arg("--emit-stage-timings");
     }
@@ -434,8 +448,11 @@ fn invoke_supersonic(
 
 fn should_collect_profile_attribution(invocation: &ComboInvocation) -> bool {
     invocation.arch == "apple-m5-max"
-        && invocation.model == "qwen3.6-35b-a3b"
-        && invocation.quant == "int4"
+        && matches!(
+            invocation.model.as_str(),
+            "qwen3.5-35b-a3b" | "qwen3.6-35b-a3b"
+        )
+        && matches!(invocation.quant.as_str(), "int4" | "q4km" | "q4km-gptq")
         && invocation.backend.as_deref().unwrap_or("metal") == "metal"
 }
 
@@ -454,6 +471,12 @@ fn apply_quant_flag(
         }
         "kv-fp8" => {
             cmd.arg("--kv-fp8");
+        }
+        "q4km" => {
+            cmd.arg("--q4km");
+        }
+        "q4km-gptq" => {
+            cmd.arg("--q4km-gptq");
         }
         "int8" => {
             cmd.arg("--int8");

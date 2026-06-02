@@ -61,8 +61,8 @@ def write_tiny_gguf(path: Path) -> None:
     tensors = [
         ("token_embd.weight", [4, 2], bake_q4km.GGML_TYPE_F32, torch.arange(8, dtype=torch.float32).reshape(2, 4).numpy().tobytes()),
         ("output_norm.weight", [4], bake_q4km.GGML_TYPE_F32, torch.full((4,), 2.0, dtype=torch.float32).numpy().tobytes()),
-        ("blk.0.ffn_gate.weight", [256, 1], bake_q4km.GGML_TYPE_Q4_K, _q4_k_block()),
-        ("blk.0.ffn_up.weight", [32, 1], bake_q4km.GGML_TYPE_Q8_0, _q8_0_block()),
+        ("blk.0.ffn_gate.weight", [256, 128], bake_q4km.GGML_TYPE_Q4_K, _q4_k_block() * 128),
+        ("blk.0.ffn_up.weight", [128, 128], bake_q4km.GGML_TYPE_Q8_0, _q8_0_block() * (128 * 4)),
     ]
     offset = 0
     infos = []
@@ -104,12 +104,12 @@ class BakeQ4KmGgufTest(unittest.TestCase):
             self.assertEqual(manifest["source_format"], "gguf")
             self.assertEqual(manifest["source_quant"], "ggml-q4-k-family")
             self.assertEqual(by_name["model.language_model.embed_tokens.weight"]["shape"], [2, 4])
-            self.assertEqual(by_name["model.language_model.norm.weight"]["dtype"], "f32")
-            self.assertEqual(by_name["model.language_model.layers.0.mlp.gate_proj.weight"]["layout"], "Int4Quantized")
-            self.assertEqual(by_name["model.language_model.layers.0.mlp.gate_proj.weight"]["shape"], [1, 128])
-            self.assertEqual(by_name["model.language_model.layers.0.mlp.gate_proj.weight_int4_scale"]["shape"], [1, 2])
-            self.assertEqual(by_name["model.language_model.layers.0.mlp.up_proj.weight"]["dtype"], "bf16")
-            self.assertEqual(by_name["model.language_model.layers.0.mlp.up_proj.weight"]["shape"], [1, 32])
+            self.assertEqual(by_name["model.language_model.norm.weight"]["dtype"], "bf16")
+            self.assertEqual(by_name["model.language_model.layers.0.mlp.gate_proj.weight"]["layout"], "GgmlQ4K")
+            self.assertEqual(by_name["model.language_model.layers.0.mlp.gate_proj.weight"]["shape"], [128, 144])
+            self.assertEqual(by_name["model.language_model.layers.0.mlp.up_proj.weight"]["layout"], "Int4Quantized")
+            self.assertEqual(by_name["model.language_model.layers.0.mlp.up_proj.weight"]["shape"], [128, 64])
+            self.assertEqual(by_name["model.language_model.layers.0.mlp.up_proj.weight_int4_scale"]["shape"], [1, 1])
 
     def test_gptq_quantizer_uses_hessian_files(self) -> None:
         with tempfile.TemporaryDirectory() as td:

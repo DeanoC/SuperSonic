@@ -274,6 +274,7 @@ impl PersistentScratch {
         // `--emit-stage-timings` still surfaces *something*. Per-phase
         // breakdowns require running through the chained path.
         Ok(DecodeOutputs {
+            path_label: "persistent",
             final_hidden_bytes,
             per_layer_attn_out: Vec::new(),
             per_layer_ffn_out: Vec::new(),
@@ -500,6 +501,7 @@ impl PersistentScratch {
         .context("d2h hidden_ping -> final_hidden_bytes")?;
 
         Ok(DecodeOutputs {
+            path_label: "persistent",
             final_hidden_bytes,
             per_layer_attn_out: Vec::new(),
             per_layer_ffn_out: Vec::new(),

@@ -37,7 +37,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from bake_int4 import is_int4_target
-from bake_q4km import is_q4km_target
+from bake_q4km import is_q4km_target, map_gguf_name
 
 
 HIDDEN = 2048
@@ -153,6 +153,19 @@ FUSED_EXPERT_NAMES = (
 
 
 class Qwen36MoeBakeClassificationTest(unittest.TestCase):
+    def test_qwen35_moe_gguf_names_map_to_runtime_names(self) -> None:
+        prefix = "model.language_model"
+        expected = {
+            "blk.0.ffn_gate_inp.weight": "model.language_model.layers.0.mlp.gate.weight",
+            "blk.0.ffn_gate_inp_shexp.weight": "model.language_model.layers.0.mlp.shared_expert_gate.weight",
+            "blk.0.ffn_gate_shexp.weight": "model.language_model.layers.0.mlp.shared_expert.gate_proj.weight",
+            "blk.0.ffn_up_shexp.weight": "model.language_model.layers.0.mlp.shared_expert.up_proj.weight",
+            "blk.0.ffn_down_shexp.weight": "model.language_model.layers.0.mlp.shared_expert.down_proj.weight",
+        }
+        for gguf_name, runtime_name in expected.items():
+            with self.subTest(gguf_name=gguf_name):
+                self.assertEqual(map_gguf_name(gguf_name, prefix), runtime_name)
+
     def test_int4_target_split(self) -> None:
         for name, want_int4, _ in EXPECTATIONS:
             with self.subTest(name=name):

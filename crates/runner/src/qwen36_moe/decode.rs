@@ -30,8 +30,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use anyhow::{anyhow, Context, Result};
 use gpu_hal::{copy_d2h, memset_zeros, Backend, GpuBuffer, GpuError, ScalarType};
 use kernel_ffi::qwen36_moe::{
-    attn_step_launch, attn_step_stage5_metal_host_into,
-    emit_decode_batch_routed_stage5_parity_tap_from_host,
+    attn_step_launch, attn_step_stage5_metal_host_into, attn_step_stage5_metal_native_into,
+    attn_step_stage5_metal_native_supported, emit_decode_batch_routed_stage5_parity_tap_from_host,
     emit_decode_batch_shared_stage5_parity_tap_from_host,
     ffn_expert_direct_gather_defer_wait_enabled,
     ffn_expert_direct_gather_stage5_metal_native_supported, ffn_stage5_router_defer_wait_enabled,
@@ -44,7 +44,8 @@ use kernel_ffi::qwen36_moe::{
 
 use crate::qwen36_moe_logits::bf16_bytes_to_f32;
 use crate::qwen36_moe_types::{
-    AttnLayerBuffers, DecodeOutputs, ExpertPrefetchPhase, ExpertRoute, LayerBuffers, MultiLayerGeom,
+    AttnLayerBuffers, DecodeOutputs, ExpertPrefetchPhase, ExpertRoute, FullAttnKvCache,
+    LayerBuffers, MultiLayerGeom,
 };
 
 static QWEN36_DECODE_BATCH_ROUTE_SNAPSHOT_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -52,6 +53,7 @@ static QWEN36_DECODE_BATCH_SHARED_PARITY_TAP_CALLS: AtomicUsize = AtomicUsize::n
 static QWEN36_DECODE_BATCH_ROUTED_PARITY_TAP_CALLS: AtomicUsize = AtomicUsize::new(0);
 static QWEN36_LAYER_OUTPUT_TAP_CALLS: AtomicUsize = AtomicUsize::new(0);
 static QWEN36_LAYER_OUTPUT_DELTA_TAP_CALLS: AtomicUsize = AtomicUsize::new(0);
+static QWEN36_DECODE_BATCH_FFN_COMMIT_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 const LAYER_OUTPUT_TAP_PHASE_COUNT: usize = 2;
 const LAYER_OUTPUT_TAP_PHASES: [&str; 2] = ["attn", "ffn"];
@@ -68,6 +70,33 @@ struct DecodeBatchSharedParitySnapshots {
 struct LayerOutputSnapshots {
     output: GpuBuffer,
     captured: Vec<[bool; LAYER_OUTPUT_TAP_PHASE_COUNT]>,
+}
+
+struct DecodeRotaryRow {
+    cos: GpuBuffer,
+    sin: GpuBuffer,
+}
+
+impl DecodeRotaryRow {
+    fn build(ordinal: usize, position: i32, rotary_dim: usize, theta: f32) -> Result<Self> {
+        let half = rotary_dim / 2;
+        let mut cos_data = Vec::with_capacity(half * std::mem::size_of::<u16>());
+        let mut sin_data = Vec::with_capacity(half * std::mem::size_of::<u16>());
+        let theta_log = theta.ln();
+        for i in 0..half {
+            let exponent = (i as f32 / half as f32) * theta_log;
+            let freq = position as f32 * (-exponent).exp();
+            let c = half::bf16::from_f32(freq.cos());
+            let s = half::bf16::from_f32(freq.sin());
+            cos_data.extend_from_slice(&c.to_le_bytes());
+            sin_data.extend_from_slice(&s.to_le_bytes());
+        }
+        let cos = GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[half], &cos_data)
+            .context("alloc qwen36 decode rope cos row")?;
+        let sin = GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[half], &sin_data)
+            .context("alloc qwen36 decode rope sin row")?;
+        Ok(Self { cos, sin })
+    }
 }
 
 /// Workspace floats sufficient for the full-attn parity launcher's stage 5
@@ -125,7 +154,6 @@ fn metal_linear_decode_direct_enabled(int4: &Qwen36MoeLinearStepInt4) -> bool {
 
 fn metal_full_attn_decode_direct_enabled(int4: &Qwen36MoeAttnStepInt4) -> bool {
     int4.group_size == 128
-        && std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FULL_ATTN_DECODE_DIRECT").is_some()
         && std::env::var_os("SUPERSONIC_METAL_DISABLE_QWEN36_FULL_ATTN_DECODE_DIRECT").is_none()
         && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
 }
@@ -171,7 +199,7 @@ fn qwen36_metal_decode_batch_enabled(
     accurate_stage_timings: bool,
     has_expert_prefetch: bool,
 ) -> bool {
-    std::env::var_os("SUPERSONIC_METAL_QWEN36_DECODE_BATCH").is_some()
+    std::env::var_os("SUPERSONIC_METAL_QWEN36_DISABLE_DECODE_BATCH").is_none()
         && !capture
         && !accurate_stage_timings
         && !has_expert_prefetch
@@ -186,6 +214,18 @@ fn qwen36_metal_decode_batch_profile_phases_enabled() -> bool {
 
 fn qwen36_metal_decode_batch_profile_phases_deferred_enabled() -> bool {
     std::env::var_os("SUPERSONIC_METAL_QWEN36_DECODE_BATCH_PROFILE_PHASES_DEFERRED").is_some()
+}
+
+fn qwen36_metal_decode_batch_deferred_commits_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_QWEN36_DECODE_BATCH_SYNC_PHASES").is_none()
+}
+
+fn qwen36_metal_decode_batch_ffn_commit_interval() -> usize {
+    std::env::var("SUPERSONIC_METAL_QWEN36_DECODE_BATCH_FFN_COMMIT_INTERVAL")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(1)
 }
 
 fn qwen36_metal_decode_batch_ffn_profile_phases_enabled() -> bool {
@@ -218,6 +258,37 @@ fn qwen36_metal_decode_batch_shared_stage5_parity_tap_max_calls() -> usize {
         .unwrap_or(40)
 }
 
+fn qwen36_metal_decode_batch_shared_stage5_parity_tap_position() -> Option<i32> {
+    std::env::var("SUPERSONIC_METAL_QWEN36_DECODE_BATCH_SHARED_STAGE5_PARITY_TAP_POSITION")
+        .or_else(|_| std::env::var("SUPERSONIC_METAL_QWEN36_FFN_SHARED_STAGE5_PARITY_TAP_POSITION"))
+        .ok()
+        .and_then(|raw| raw.parse::<i32>().ok())
+}
+
+fn qwen36_metal_decode_batch_shared_stage5_parity_tap_layer() -> Option<usize> {
+    std::env::var("SUPERSONIC_METAL_QWEN36_DECODE_BATCH_SHARED_STAGE5_PARITY_TAP_LAYER")
+        .or_else(|_| std::env::var("SUPERSONIC_METAL_QWEN36_FFN_SHARED_STAGE5_PARITY_TAP_LAYER"))
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+}
+
+fn qwen36_metal_decode_batch_shared_stage5_parity_tap_matches(
+    position: i32,
+    layer_idx: usize,
+) -> bool {
+    if let Some(wanted) = qwen36_metal_decode_batch_shared_stage5_parity_tap_position() {
+        if position != wanted {
+            return false;
+        }
+    }
+    if let Some(wanted) = qwen36_metal_decode_batch_shared_stage5_parity_tap_layer() {
+        if layer_idx != wanted {
+            return false;
+        }
+    }
+    true
+}
+
 fn qwen36_metal_decode_batch_routed_stage5_parity_tap_max_calls() -> usize {
     std::env::var("SUPERSONIC_METAL_QWEN36_DECODE_BATCH_ROUTED_STAGE5_PARITY_TAP_MAX_CALLS")
         .ok()
@@ -226,9 +297,49 @@ fn qwen36_metal_decode_batch_routed_stage5_parity_tap_max_calls() -> usize {
         .unwrap_or(40)
 }
 
+fn qwen36_metal_decode_batch_routed_stage5_parity_tap_position() -> Option<i32> {
+    std::env::var("SUPERSONIC_METAL_QWEN36_DECODE_BATCH_ROUTED_STAGE5_PARITY_TAP_POSITION")
+        .ok()
+        .and_then(|raw| raw.parse::<i32>().ok())
+}
+
+fn qwen36_metal_decode_batch_routed_stage5_parity_tap_layer() -> Option<usize> {
+    std::env::var("SUPERSONIC_METAL_QWEN36_DECODE_BATCH_ROUTED_STAGE5_PARITY_TAP_LAYER")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+}
+
+fn qwen36_metal_decode_batch_routed_stage5_parity_tap_matches(
+    position: i32,
+    layer_idx: usize,
+) -> bool {
+    if let Some(wanted) = qwen36_metal_decode_batch_routed_stage5_parity_tap_position() {
+        if position != wanted {
+            return false;
+        }
+    }
+    if let Some(wanted) = qwen36_metal_decode_batch_routed_stage5_parity_tap_layer() {
+        if layer_idx != wanted {
+            return false;
+        }
+    }
+    true
+}
+
 fn qwen36_layer_output_tap_enabled() -> bool {
     std::env::var_os("SUPERSONIC_QWEN36_LAYER_OUTPUT_TAP").is_some()
         || qwen36_layer_output_delta_tap_enabled()
+}
+
+fn qwen36_layer_output_tap_should_snapshot(
+    position: i32,
+    layer_idx: usize,
+    phase_idx: usize,
+) -> bool {
+    if std::env::var_os("SUPERSONIC_QWEN36_LAYER_OUTPUT_TAP").is_some() {
+        return true;
+    }
+    qwen36_layer_output_delta_tap_matches(position, layer_idx, phase_idx)
 }
 
 fn qwen36_layer_output_delta_tap_enabled() -> bool {
@@ -285,9 +396,27 @@ fn qwen36_metal_router_stage5_simd_env_enabled() -> bool {
         && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
 }
 
+fn qwen36_metal_router_stage5_exact_simd_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_DISABLE_QWEN36_FFN_ROUTER_STAGE5_EXACT_SIMD").is_none()
+        && !qwen36_metal_router_stage5_simd_env_enabled()
+        && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
+}
+
+fn qwen36_full_attn_native_layer_limit() -> Option<usize> {
+    std::env::var("SUPERSONIC_METAL_QWEN36_FULL_ATTN_NATIVE_MAX_LAYER")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+}
+
+fn qwen36_full_attn_native_enabled_for_layer(layer_idx: usize) -> bool {
+    qwen36_full_attn_native_layer_limit().map_or(true, |max_layer| layer_idx <= max_layer)
+}
+
 fn qwen36_metal_decode_batch_router_path_label() -> &'static str {
     if qwen36_metal_router_stage5_simd_env_enabled() {
         "simd"
+    } else if qwen36_metal_router_stage5_exact_simd_enabled() {
+        "exact-simd"
     } else {
         "serial"
     }
@@ -314,7 +443,16 @@ fn flush_metal_decode_batch_profile_phase(label: &str, profile_label: &str) -> R
     if !kernel_ffi::prefill_ffi::metal_batch_is_active() {
         return Ok(());
     }
-    if qwen36_metal_decode_batch_profile_phases_deferred_enabled() {
+    if qwen36_metal_decode_batch_deferred_commits_enabled()
+        || qwen36_metal_decode_batch_profile_phases_deferred_enabled()
+    {
+        let ffn_commit_interval = qwen36_metal_decode_batch_ffn_commit_interval();
+        if profile_label == "qwen36_decode_batch_ffn" && ffn_commit_interval > 1 {
+            let call_idx = QWEN36_DECODE_BATCH_FFN_COMMIT_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+            if call_idx % ffn_commit_interval != 0 {
+                return Ok(());
+            }
+        }
         kernel_ffi::prefill_ffi::commit_metal_batch_current(profile_label)
             .map_err(|e| anyhow!("{label} Metal batch deferred commit: {e}"))?;
         return Ok(());
@@ -344,13 +482,22 @@ fn sync_metal_queue_for_host_read(buffer: &GpuBuffer, label: &str) -> Result<()>
     sync_metal_queue_for_host_boundary(buffer.backend(), label)
 }
 
+fn sync_decode_queue(ordinal: usize, backend: Backend, label: &str) -> Result<()> {
+    if backend == Backend::Metal {
+        sync_metal_queue_for_host_boundary(backend, label)
+    } else {
+        gpu_hal::sync(ordinal).with_context(|| format!("{label} (accurate_stage_timings)"))
+    }
+}
+
 fn copy_d2d_decode(
     ordinal: usize,
+    backend: Backend,
     dst: *mut std::ffi::c_void,
     src: *const std::ffi::c_void,
     bytes: usize,
 ) -> Result<(), GpuError> {
-    if kernel_ffi::prefill_ffi::metal_batch_is_active() {
+    if backend == Backend::Metal {
         kernel_ffi::prefill_ffi::metal_copy_d2d(src, dst, bytes)
     } else {
         gpu_hal::copy_d2d(ordinal, dst, src, bytes)
@@ -501,6 +648,57 @@ fn bf16_full_hex(bytes: &[u8]) -> String {
         .join(",")
 }
 
+fn byte_head_hex(bytes: &[u8], elems: usize) -> String {
+    bytes
+        .iter()
+        .take(elems)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn f32_word_head_hex(bytes: &[u8], elems: usize) -> String {
+    bytes
+        .chunks_exact(4)
+        .take(elems)
+        .map(|chunk| {
+            let word = u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            format!("{word:08x}")
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn qwen36_full_attn_workspace_tap_word_count() -> Option<usize> {
+    std::env::var("SUPERSONIC_QWEN36_FULL_ATTN_WORKSPACE_TAP_WORDS")
+        .ok()
+        .map(|raw| raw.trim().parse::<usize>().unwrap_or(16).max(1))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_full_attn_workspace_tap_words(
+    position: i32,
+    cache_pos: i32,
+    path: &str,
+    layer_idx: usize,
+    region: &str,
+    bytes: &[u8],
+    elems: usize,
+) {
+    if let Some(count) = qwen36_full_attn_workspace_tap_word_count() {
+        eprintln!(
+            "[qwen36-full-attn-workspace-tap-words] position={} cache_pos={} path={} layer={} region={} elems={} words={}",
+            position,
+            cache_pos,
+            path,
+            layer_idx,
+            region,
+            elems,
+            f32_word_head_hex(bytes, count),
+        );
+    }
+}
+
 fn snapshot_layer_output(
     ordinal: usize,
     snapshots: &mut LayerOutputSnapshots,
@@ -516,11 +714,391 @@ fn snapshot_layer_output(
     let row = layer_idx * LAYER_OUTPUT_TAP_PHASES.len() + phase_idx;
     let dst = unsafe { (snapshots.output.as_mut_ptr() as *mut u8).add(row * bytes) }
         as *mut std::ffi::c_void;
-    copy_d2d_decode(ordinal, dst, src, bytes)
+    copy_d2d_decode(ordinal, snapshots.output.backend(), dst, src, bytes)
         .with_context(|| format!("snapshot qwen36 layer output tap layer={layer_idx}"))?;
     if let Some(captured) = snapshots.captured.get_mut(layer_idx) {
         captured[phase_idx] = true;
     }
+    Ok(())
+}
+
+fn qwen36_full_attn_kv_cache_tap_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_QWEN36_FULL_ATTN_KV_CACHE_TAP").is_some()
+}
+
+fn qwen36_full_attn_kv_cache_tap_position() -> Option<i32> {
+    std::env::var("SUPERSONIC_QWEN36_FULL_ATTN_KV_CACHE_TAP_POSITION")
+        .ok()
+        .and_then(|raw| raw.parse::<i32>().ok())
+}
+
+fn qwen36_full_attn_kv_cache_tap_layer() -> Option<usize> {
+    std::env::var("SUPERSONIC_QWEN36_FULL_ATTN_KV_CACHE_TAP_LAYER")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+}
+
+fn qwen36_full_attn_kv_cache_tap_matches(position: i32, layer_idx: usize) -> bool {
+    if !qwen36_full_attn_kv_cache_tap_enabled() {
+        return false;
+    }
+    if let Some(wanted) = qwen36_full_attn_kv_cache_tap_position() {
+        if position != wanted {
+            return false;
+        }
+    }
+    if let Some(wanted) = qwen36_full_attn_kv_cache_tap_layer() {
+        if layer_idx != wanted {
+            return false;
+        }
+    }
+    true
+}
+
+fn qwen36_full_attn_workspace_tap_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_QWEN36_FULL_ATTN_WORKSPACE_TAP").is_some()
+}
+
+fn qwen36_full_attn_workspace_tap_position() -> Option<i32> {
+    std::env::var("SUPERSONIC_QWEN36_FULL_ATTN_WORKSPACE_TAP_POSITION")
+        .ok()
+        .and_then(|raw| raw.parse::<i32>().ok())
+}
+
+fn qwen36_full_attn_workspace_tap_layer() -> Option<usize> {
+    std::env::var("SUPERSONIC_QWEN36_FULL_ATTN_WORKSPACE_TAP_LAYER")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+}
+
+fn qwen36_full_attn_workspace_tap_matches(position: i32, layer_idx: usize) -> bool {
+    if !qwen36_full_attn_workspace_tap_enabled() {
+        return false;
+    }
+    if let Some(wanted) = qwen36_full_attn_workspace_tap_position() {
+        if position != wanted {
+            return false;
+        }
+    }
+    if let Some(wanted) = qwen36_full_attn_workspace_tap_layer() {
+        if layer_idx != wanted {
+            return false;
+        }
+    }
+    true
+}
+
+fn download_full_attn_kv_prefix(
+    ordinal: usize,
+    cache: &FullAttnKvCache,
+    elems: usize,
+) -> Result<(Vec<u8>, Vec<u8>, ScalarType)> {
+    let dtype = cache
+        .k
+        .as_ref()
+        .map(|b| b.dtype())
+        .or_else(|| cache.v.as_ref().map(|b| b.dtype()))
+        .unwrap_or_else(|| {
+            if cache.kv_scale_k.is_some() || cache.kv_scale_v.is_some() {
+                ScalarType::U8
+            } else {
+                ScalarType::BF16
+            }
+        });
+    let bytes = elems
+        .checked_mul(dtype.size_in_bytes())
+        .ok_or_else(|| anyhow!("qwen36 full-attn KV cache tap byte count overflow"))?;
+    if bytes == 0 {
+        return Ok((Vec::new(), Vec::new(), dtype));
+    }
+    let k_bytes = if let Some(k) = cache.k.as_ref() {
+        if bytes > k.len_bytes() {
+            return Err(anyhow!(
+                "qwen36 full-attn K cache tap prefix out of bounds: {bytes}/{} bytes",
+                k.len_bytes()
+            ));
+        }
+        let mut out = vec![0u8; bytes];
+        copy_d2h(
+            ordinal,
+            out.as_mut_ptr() as *mut std::ffi::c_void,
+            k.as_ptr(),
+            bytes,
+        )
+        .context("d2h qwen36 full-attn K cache tap")?;
+        out
+    } else if let Some(k) = cache.virtual_kv_cache_k.as_ref() {
+        k.to_host_prefix_bytes(bytes)
+            .context("d2h qwen36 virtual full-attn K cache tap")?
+    } else {
+        return Err(anyhow!(
+            "qwen36 full-attn K cache tap has no backing buffer"
+        ));
+    };
+    let v_bytes = if let Some(v) = cache.v.as_ref() {
+        if bytes > v.len_bytes() {
+            return Err(anyhow!(
+                "qwen36 full-attn V cache tap prefix out of bounds: {bytes}/{} bytes",
+                v.len_bytes()
+            ));
+        }
+        let mut out = vec![0u8; bytes];
+        copy_d2h(
+            ordinal,
+            out.as_mut_ptr() as *mut std::ffi::c_void,
+            v.as_ptr(),
+            bytes,
+        )
+        .context("d2h qwen36 full-attn V cache tap")?;
+        out
+    } else if let Some(v) = cache.virtual_kv_cache_v.as_ref() {
+        v.to_host_prefix_bytes(bytes)
+            .context("d2h qwen36 virtual full-attn V cache tap")?
+    } else {
+        return Err(anyhow!(
+            "qwen36 full-attn V cache tap has no backing buffer"
+        ));
+    };
+    Ok((k_bytes, v_bytes, dtype))
+}
+
+fn emit_full_attn_workspace_tap(
+    ordinal: usize,
+    position: i32,
+    cache_pos: i32,
+    layer_idx: usize,
+    geom: &MultiLayerGeom,
+    workspace: &GpuBuffer,
+    path: &str,
+) -> Result<()> {
+    let num_heads = geom.num_attention_heads as usize;
+    let num_kv_heads = geom.num_kv_heads as usize;
+    let head_dim = geom.head_dim as usize;
+    let hidden = geom.hidden as usize;
+    let q_dim = num_heads * head_dim;
+    let q_out_dim = 2 * q_dim;
+    let kv_dim = num_kv_heads * head_dim;
+    let off_q_raw = 0usize;
+    let off_k_raw = q_out_dim;
+    let off_v_raw = off_k_raw + kv_dim;
+    let off_q_normed = off_v_raw + kv_dim;
+    let off_k_normed = off_q_normed + q_dim;
+    let off_q_rot = off_k_normed + kv_dim;
+    let off_k_rot = off_q_rot + q_dim;
+    let off_attn = off_k_rot + kv_dim;
+    let off_gated = off_attn + q_dim;
+    let off_o_out = off_gated + q_dim;
+    let eff_cache_pos = if cache_pos >= 0 { cache_pos } else { position };
+    let kv_len = (eff_cache_pos + 1).max(0) as usize;
+    let score_tap_elems =
+        if std::env::var_os("SUPERSONIC_METAL_QWEN36_FULL_ATTN_SCORE_TAP").is_some() {
+            num_heads * kv_len
+        } else {
+            0
+        };
+    let prob_tap_elems = if std::env::var_os("SUPERSONIC_METAL_QWEN36_FULL_ATTN_PROB_TAP").is_some()
+    {
+        num_heads * kv_len
+    } else {
+        0
+    };
+    let exp_tap_elems = if std::env::var_os("SUPERSONIC_METAL_QWEN36_FULL_ATTN_EXP_TAP").is_some() {
+        num_heads * kv_len
+    } else {
+        0
+    };
+    let denom_tap_elems =
+        if std::env::var_os("SUPERSONIC_METAL_QWEN36_FULL_ATTN_DENOM_TAP").is_some() {
+            num_heads
+        } else {
+            0
+        };
+    let workspace_len =
+        off_o_out + hidden + score_tap_elems + prob_tap_elems + exp_tap_elems + denom_tap_elems;
+    let bytes = workspace_len * std::mem::size_of::<f32>();
+    if bytes > workspace.len_bytes() {
+        return Err(anyhow!(
+            "qwen36 full-attn workspace tap out of bounds: {bytes}/{} bytes",
+            workspace.len_bytes()
+        ));
+    }
+    let mut all = vec![0u8; bytes];
+    copy_d2h(
+        ordinal,
+        all.as_mut_ptr() as *mut std::ffi::c_void,
+        workspace.as_ptr(),
+        bytes,
+    )
+    .context("d2h qwen36 full-attn workspace tap")?;
+    let regions = [
+        ("q_raw", off_q_raw, q_out_dim),
+        ("k_raw", off_k_raw, kv_dim),
+        ("v_raw", off_v_raw, kv_dim),
+        ("q_normed", off_q_normed, q_dim),
+        ("k_normed", off_k_normed, kv_dim),
+        ("q_rot", off_q_rot, q_dim),
+        ("k_rot", off_k_rot, kv_dim),
+        ("attn", off_attn, q_dim),
+        ("gated", off_gated, q_dim),
+        ("o_out", off_o_out, hidden),
+    ];
+    for (name, start, elems) in regions {
+        let start_b = start * std::mem::size_of::<f32>();
+        let end_b = start_b + elems * std::mem::size_of::<f32>();
+        let bytes = &all[start_b..end_b];
+        eprintln!(
+            "[qwen36-full-attn-workspace-tap] position={} cache_pos={} path={} layer={} region={} elems={} checksum={:016x} head16={}",
+            position,
+            cache_pos,
+            path,
+            layer_idx,
+            name,
+            elems,
+            fnv1a64_bytes(bytes),
+            byte_head_hex(bytes, 16),
+        );
+    }
+    if score_tap_elems > 0 {
+        let start = off_o_out + hidden;
+        let start_b = start * std::mem::size_of::<f32>();
+        let end_b = start_b + score_tap_elems * std::mem::size_of::<f32>();
+        let bytes = &all[start_b..end_b];
+        eprintln!(
+            "[qwen36-full-attn-workspace-tap] position={} cache_pos={} path={} layer={} region=score_tap elems={} checksum={:016x} head16={}",
+            position,
+            cache_pos,
+            path,
+            layer_idx,
+            score_tap_elems,
+            fnv1a64_bytes(bytes),
+            byte_head_hex(bytes, 16),
+        );
+        emit_full_attn_workspace_tap_words(
+            position,
+            cache_pos,
+            path,
+            layer_idx,
+            "score_tap",
+            bytes,
+            score_tap_elems,
+        );
+    }
+    if prob_tap_elems > 0 {
+        let start = off_o_out + hidden + score_tap_elems;
+        let start_b = start * std::mem::size_of::<f32>();
+        let end_b = start_b + prob_tap_elems * std::mem::size_of::<f32>();
+        let bytes = &all[start_b..end_b];
+        eprintln!(
+            "[qwen36-full-attn-workspace-tap] position={} cache_pos={} path={} layer={} region=prob_tap elems={} checksum={:016x} head16={}",
+            position,
+            cache_pos,
+            path,
+            layer_idx,
+            prob_tap_elems,
+            fnv1a64_bytes(bytes),
+            byte_head_hex(bytes, 16),
+        );
+        emit_full_attn_workspace_tap_words(
+            position,
+            cache_pos,
+            path,
+            layer_idx,
+            "prob_tap",
+            bytes,
+            prob_tap_elems,
+        );
+    }
+    if exp_tap_elems > 0 {
+        let start = off_o_out + hidden + score_tap_elems + prob_tap_elems;
+        let start_b = start * std::mem::size_of::<f32>();
+        let end_b = start_b + exp_tap_elems * std::mem::size_of::<f32>();
+        let bytes = &all[start_b..end_b];
+        eprintln!(
+            "[qwen36-full-attn-workspace-tap] position={} cache_pos={} path={} layer={} region=exp_tap elems={} checksum={:016x} head16={}",
+            position,
+            cache_pos,
+            path,
+            layer_idx,
+            exp_tap_elems,
+            fnv1a64_bytes(bytes),
+            byte_head_hex(bytes, 16),
+        );
+        emit_full_attn_workspace_tap_words(
+            position,
+            cache_pos,
+            path,
+            layer_idx,
+            "exp_tap",
+            bytes,
+            exp_tap_elems,
+        );
+    }
+    if denom_tap_elems > 0 {
+        let start = off_o_out + hidden + score_tap_elems + prob_tap_elems + exp_tap_elems;
+        let start_b = start * std::mem::size_of::<f32>();
+        let end_b = start_b + denom_tap_elems * std::mem::size_of::<f32>();
+        let bytes = &all[start_b..end_b];
+        eprintln!(
+            "[qwen36-full-attn-workspace-tap] position={} cache_pos={} path={} layer={} region=denom_tap elems={} checksum={:016x} head16={}",
+            position,
+            cache_pos,
+            path,
+            layer_idx,
+            denom_tap_elems,
+            fnv1a64_bytes(bytes),
+            byte_head_hex(bytes, 16),
+        );
+        emit_full_attn_workspace_tap_words(
+            position,
+            cache_pos,
+            path,
+            layer_idx,
+            "denom_tap",
+            bytes,
+            denom_tap_elems,
+        );
+    }
+    Ok(())
+}
+
+fn emit_full_attn_kv_cache_tap(
+    ordinal: usize,
+    position: i32,
+    cache_pos: i32,
+    layer_idx: usize,
+    geom: &MultiLayerGeom,
+    cache: &FullAttnKvCache,
+    path: &str,
+) -> Result<()> {
+    let eff_cache_pos = if cache_pos >= 0 { cache_pos } else { position };
+    let kv_len = (eff_cache_pos + 1).max(0) as usize;
+    let kv_dim = (geom.num_kv_heads as usize) * (geom.head_dim as usize);
+    let elems = kv_len
+        .checked_mul(kv_dim)
+        .ok_or_else(|| anyhow!("qwen36 full-attn KV cache tap element count overflow"))?;
+    let (k_bytes, v_bytes, dtype) = download_full_attn_kv_prefix(ordinal, cache, elems)?;
+    let (k_head, v_head) = if dtype == ScalarType::BF16 {
+        (bf16_head_hex(&k_bytes, 8), bf16_head_hex(&v_bytes, 8))
+    } else {
+        (byte_head_hex(&k_bytes, 16), byte_head_hex(&v_bytes, 16))
+    };
+    eprintln!(
+        "[qwen36-full-attn-kv-cache-tap] position={} cache_pos={} eff_cache_pos={} path={} layer={} kv_len={} kv_dim={} dtype={:?} k_bytes={} k_checksum={:016x} k_head={} v_bytes={} v_checksum={:016x} v_head={}",
+        position,
+        cache_pos,
+        eff_cache_pos,
+        path,
+        layer_idx,
+        kv_len,
+        kv_dim,
+        dtype,
+        k_bytes.len(),
+        fnv1a64_bytes(&k_bytes),
+        k_head,
+        v_bytes.len(),
+        fnv1a64_bytes(&v_bytes),
+        v_head,
+    );
     Ok(())
 }
 
@@ -632,6 +1210,9 @@ fn emit_decode_batch_shared_parity_taps(
         if !snapshots.captured.get(layer_idx).copied().unwrap_or(false) {
             continue;
         }
+        if !qwen36_metal_decode_batch_shared_stage5_parity_tap_matches(position, layer_idx) {
+            continue;
+        }
         let call = QWEN36_DECODE_BATCH_SHARED_PARITY_TAP_CALLS.fetch_add(1, Ordering::Relaxed);
         if call >= max_calls {
             continue;
@@ -679,12 +1260,14 @@ fn emit_decode_batch_shared_parity_taps(
                 let fp8 = s.group_size < 0;
                 Qwen36MoeFfnStepInt4 {
                     group_size: s.group_size,
+                    gate_up_proj_type: s.gate_up_proj_type,
                     gate_up_proj_scale: s.gate_up_proj_scale.as_ptr(),
                     gate_up_proj_zero: if fp8 {
                         ptr::null()
                     } else {
                         s.gate_up_proj_zero.as_ptr()
                     },
+                    down_proj_type: s.down_proj_type,
                     down_proj_scale: s.down_proj_scale.as_ptr(),
                     down_proj_zero: if fp8 {
                         ptr::null()
@@ -770,6 +1353,9 @@ fn emit_decode_batch_routed_parity_taps(
         if !snapshots.captured.get(layer_idx).copied().unwrap_or(false) {
             continue;
         }
+        if !qwen36_metal_decode_batch_routed_stage5_parity_tap_matches(position, layer_idx) {
+            continue;
+        }
         let call = QWEN36_DECODE_BATCH_ROUTED_PARITY_TAP_CALLS.fetch_add(1, Ordering::Relaxed);
         if call >= max_calls {
             continue;
@@ -830,12 +1416,14 @@ fn emit_decode_batch_routed_parity_taps(
                 let fp8 = s.group_size < 0;
                 Qwen36MoeFfnStepInt4 {
                     group_size: s.group_size,
+                    gate_up_proj_type: s.gate_up_proj_type,
                     gate_up_proj_scale: s.gate_up_proj_scale.as_ptr(),
                     gate_up_proj_zero: if fp8 {
                         ptr::null()
                     } else {
                         s.gate_up_proj_zero.as_ptr()
                     },
+                    down_proj_type: s.down_proj_type,
                     down_proj_scale: s.down_proj_scale.as_ptr(),
                     down_proj_zero: if fp8 {
                         ptr::null()
@@ -1213,8 +1801,16 @@ fn run_chained_decode_impl_with_cache_pos(
         })
         .max()
         .unwrap_or(0);
+    let full_attn_tap_regions =
+        usize::from(std::env::var_os("SUPERSONIC_METAL_QWEN36_FULL_ATTN_SCORE_TAP").is_some())
+            + usize::from(std::env::var_os("SUPERSONIC_METAL_QWEN36_FULL_ATTN_PROB_TAP").is_some())
+            + usize::from(std::env::var_os("SUPERSONIC_METAL_QWEN36_FULL_ATTN_EXP_TAP").is_some())
+            + usize::from(
+                std::env::var_os("SUPERSONIC_METAL_QWEN36_FULL_ATTN_DENOM_TAP").is_some(),
+            );
+    let attn_extra_regions = full_attn_tap_regions.max(1);
     let attn_extra = if max_kv_t > 0 {
-        geom.num_attention_heads as usize * max_kv_t
+        geom.num_attention_heads as usize * max_kv_t * attn_extra_regions
     } else {
         0
     };
@@ -1236,6 +1832,17 @@ fn run_chained_decode_impl_with_cache_pos(
     let ffn_ws_floats = ffn_workspace_floats(geom);
     let mut ffn_workspace = GpuBuffer::zeros(ordinal, ScalarType::F32, &[ffn_ws_floats])
         .context("alloc ffn_workspace")?;
+
+    let native_full_attn_rope = if hidden_a.backend() == Backend::Metal
+        && std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FULL_ATTN_NATIVE").is_some()
+    {
+        Some(
+            DecodeRotaryRow::build(ordinal, position, geom.rotary_dim as usize, geom.rope_theta)
+                .context("build qwen36 decode RoPE row")?,
+        )
+    } else {
+        None
+    };
 
     let mut sync_buf =
         GpuBuffer::zeros(ordinal, ScalarType::U8, &[96]).context("alloc sync_buf")?;
@@ -1345,17 +1952,6 @@ fn run_chained_decode_impl_with_cache_pos(
 
     for (layer_idx, layer) in layers.iter_mut().enumerate() {
         // ---- Attention ----
-        if metal_queue_dirty && matches!(layer.attn, AttnLayerBuffers::Full { .. }) {
-            sync_metal_queue_for_host_boundary(
-                if front == 0 {
-                    hidden_a.backend()
-                } else {
-                    hidden_b.backend()
-                },
-                "sync before full-attn host read",
-            )?;
-            metal_queue_dirty = false;
-        }
         // Capture the *const input pointer + *mut output pointer based on
         // current `front`. Borrowing both `hidden_a` and `hidden_b`
         // mutably at the same time isn't possible; pointer arithmetic is.
@@ -1369,7 +1965,6 @@ fn run_chained_decode_impl_with_cache_pos(
         } else {
             (hidden_b.as_ptr(), &mut hidden_a)
         };
-        reset_sync_buf(ordinal, &mut sync_buf).context("reset sync_buf (attn)")?;
         let mut attn_output_published = false;
         let defer_layer_ffn_router = {
             let ffn = &layer.ffn;
@@ -1399,12 +1994,14 @@ fn run_chained_decode_impl_with_cache_pos(
                     let fp8 = s.group_size < 0;
                     Qwen36MoeFfnStepInt4 {
                         group_size: s.group_size,
+                        gate_up_proj_type: s.gate_up_proj_type,
                         gate_up_proj_scale: s.gate_up_proj_scale.as_ptr(),
                         gate_up_proj_zero: if fp8 {
                             ptr::null()
                         } else {
                             s.gate_up_proj_zero.as_ptr()
                         },
+                        down_proj_type: s.down_proj_type,
                         down_proj_scale: s.down_proj_scale.as_ptr(),
                         down_proj_zero: if fp8 {
                             ptr::null()
@@ -1439,7 +2036,7 @@ fn run_chained_decode_impl_with_cache_pos(
                 && std::env::var_os("SUPERSONIC_METAL_DISABLE_QWEN36_LINEAR_DECODE_DIRECT")
                     .is_none()
                 && std::env::var_os("SUPERSONIC_METAL_DISABLE_QWEN36_LINEAR_INT4_STAGE5").is_none()
-                && ffn_stage5_router_defer_wait_enabled()
+                && (metal_decode_batch_active || ffn_stage5_router_defer_wait_enabled())
                 && ffn_stage5_router_metal_native_supported(params, &weights, &int4)
         };
 
@@ -1518,15 +2115,47 @@ fn run_chained_decode_impl_with_cache_pos(
                     None => Qwen36MoeAttnStepInt4::disabled(),
                 };
                 let t_k = std::time::Instant::now();
-                let use_metal_direct = output_buf.backend() == Backend::Metal
+                let use_metal_native = output_buf.backend() == Backend::Metal
+                    && attn_step_stage5_metal_native_supported(
+                        params, &weights, &int4_ptrs, hidden,
+                    )
+                    && qwen36_full_attn_native_enabled_for_layer(layer_idx);
+                let use_metal_direct = !use_metal_native
+                    && output_buf.backend() == Backend::Metal
                     && metal_full_attn_decode_direct_enabled(&int4_ptrs);
-                if metal_decode_batch_active {
+                if (metal_queue_dirty || metal_decode_batch_active) && !use_metal_native {
                     sync_metal_queue_for_host_boundary(
                         input_backend,
                         "sync before full-attn host read",
                     )?;
+                    metal_queue_dirty = false;
                 }
-                if use_metal_direct {
+                if use_metal_native {
+                    unsafe {
+                        attn_step_stage5_metal_native_into(
+                            params,
+                            &weights,
+                            &int4_ptrs,
+                            native_full_attn_rope
+                                .as_ref()
+                                .map(|row| row.cos.as_ptr())
+                                .unwrap_or(ptr::null()),
+                            native_full_attn_rope
+                                .as_ref()
+                                .map(|row| row.sin.as_ptr())
+                                .unwrap_or(ptr::null()),
+                            &mut attn_output,
+                            &mut attn_workspace,
+                            output_buf.as_mut_ptr(),
+                            hidden,
+                            !metal_decode_batch_active,
+                        )
+                    }
+                    .with_context(|| {
+                        format!("attn_step_stage5_metal_native_into (layer {layer_idx})")
+                    })?;
+                    attn_output_published = true;
+                } else if use_metal_direct {
                     unsafe {
                         attn_step_stage5_metal_host_into(
                             params,
@@ -1543,6 +2172,7 @@ fn run_chained_decode_impl_with_cache_pos(
                     })?;
                     attn_output_published = true;
                 } else {
+                    reset_sync_buf(ordinal, &mut sync_buf).context("reset sync_buf (attn)")?;
                     attn_step_launch(
                         ordinal,
                         ScalarType::BF16,
@@ -1555,9 +2185,48 @@ fn run_chained_decode_impl_with_cache_pos(
                     )
                     .with_context(|| format!("attn_step_launch (layer {layer_idx}, full)"))?;
                 }
+                if qwen36_full_attn_kv_cache_tap_matches(position, layer_idx) {
+                    sync_metal_queue_for_host_boundary(
+                        output_buf.backend(),
+                        "sync before full-attn KV cache tap",
+                    )?;
+                    if let Some(cache) = kv_cache.as_ref() {
+                        let path = if use_metal_native {
+                            "native"
+                        } else if use_metal_direct {
+                            "direct"
+                        } else {
+                            "kernel"
+                        };
+                        emit_full_attn_kv_cache_tap(
+                            ordinal, position, cache_pos, layer_idx, geom, cache, path,
+                        )?;
+                    }
+                }
+                if qwen36_full_attn_workspace_tap_matches(position, layer_idx) {
+                    sync_metal_queue_for_host_boundary(
+                        output_buf.backend(),
+                        "sync before full-attn workspace tap",
+                    )?;
+                    let path = if use_metal_native {
+                        "native"
+                    } else if use_metal_direct {
+                        "direct"
+                    } else {
+                        "kernel"
+                    };
+                    emit_full_attn_workspace_tap(
+                        ordinal,
+                        position,
+                        cache_pos,
+                        layer_idx,
+                        geom,
+                        &attn_workspace,
+                        path,
+                    )?;
+                }
                 if options.accurate_stage_timings {
-                    gpu_hal::sync(ordinal)
-                        .context("sync_after_attn_step (accurate_stage_timings)")?;
+                    sync_decode_queue(ordinal, output_buf.backend(), "sync_after_attn_step")?;
                 }
                 t_full_attn += t_k.elapsed();
             }
@@ -1662,6 +2331,8 @@ fn run_chained_decode_impl_with_cache_pos(
                     })?;
                     attn_output_published = true;
                 } else {
+                    reset_sync_buf(ordinal, &mut sync_buf)
+                        .context("reset sync_buf (linear-attn)")?;
                     linear_step_launch(
                         ordinal,
                         ScalarType::BF16,
@@ -1675,8 +2346,7 @@ fn run_chained_decode_impl_with_cache_pos(
                     .with_context(|| format!("linear_step_launch (layer {layer_idx})"))?;
                 }
                 if options.accurate_stage_timings {
-                    gpu_hal::sync(ordinal)
-                        .context("sync_after_linear_step (accurate_stage_timings)")?;
+                    sync_decode_queue(ordinal, output_buf.backend(), "sync_after_linear_step")?;
                 }
                 if use_metal_direct {
                     flush_metal_decode_batch_profile_phase(
@@ -1694,6 +2364,7 @@ fn run_chained_decode_impl_with_cache_pos(
             // can publish directly to this buffer and skips this D2D copy.
             copy_d2d_decode(
                 ordinal,
+                output_buf.backend(),
                 output_buf.as_mut_ptr(),
                 attn_output.as_ptr(),
                 hidden * 2,
@@ -1701,14 +2372,16 @@ fn run_chained_decode_impl_with_cache_pos(
             .context("d2d attn_output -> residual")?;
         }
         if let Some(snapshots) = layer_output_tap.as_mut() {
-            snapshot_layer_output(
-                ordinal,
-                snapshots,
-                layer_idx,
-                0,
-                output_buf.as_ptr(),
-                hidden,
-            )?;
+            if qwen36_layer_output_tap_should_snapshot(position, layer_idx, 0) {
+                snapshot_layer_output(
+                    ordinal,
+                    snapshots,
+                    layer_idx,
+                    0,
+                    output_buf.as_ptr(),
+                    hidden,
+                )?;
+            }
         }
 
         // Swap front: the just-published value is now the "current input".
@@ -1735,7 +2408,6 @@ fn run_chained_decode_impl_with_cache_pos(
         }
 
         // ---- FFN ----
-        reset_sync_buf(ordinal, &mut sync_buf).context("reset sync_buf (ffn)")?;
         let (input_ptr, output_buf): (_, &mut GpuBuffer) = if front == 0 {
             (hidden_a.as_ptr(), &mut hidden_b)
         } else {
@@ -1769,12 +2441,14 @@ fn run_chained_decode_impl_with_cache_pos(
                 let fp8 = s.group_size < 0;
                 Qwen36MoeFfnStepInt4 {
                     group_size: s.group_size,
+                    gate_up_proj_type: s.gate_up_proj_type,
                     gate_up_proj_scale: s.gate_up_proj_scale.as_ptr(),
                     gate_up_proj_zero: if fp8 {
                         ptr::null()
                     } else {
                         s.gate_up_proj_zero.as_ptr()
                     },
+                    down_proj_type: s.down_proj_type,
                     down_proj_scale: s.down_proj_scale.as_ptr(),
                     down_proj_zero: if fp8 {
                         ptr::null()
@@ -1830,6 +2504,8 @@ fn run_chained_decode_impl_with_cache_pos(
                 ..params_stage5
             };
             let t_router = std::time::Instant::now();
+            reset_sync_buf(ordinal, &mut sync_buf)
+                .context("reset sync_buf (ffn router prefetch)")?;
             ffn_step_launch(
                 ordinal,
                 ScalarType::BF16,
@@ -1843,8 +2519,11 @@ fn run_chained_decode_impl_with_cache_pos(
             )
             .with_context(|| format!("ffn_step_launch router prefetch (layer {layer_idx})"))?;
             if options.accurate_stage_timings {
-                gpu_hal::sync(ordinal)
-                    .context("sync_after_ffn_router_prefetch (accurate_stage_timings)")?;
+                sync_decode_queue(
+                    ordinal,
+                    ffn_output.backend(),
+                    "sync_after_ffn_router_prefetch",
+                )?;
             }
             t_ffn += t_router.elapsed();
 
@@ -1852,23 +2531,35 @@ fn run_chained_decode_impl_with_cache_pos(
                 .with_context(|| format!("download FFN top-k routes (layer {layer_idx})"))?;
             prefetch(ExpertPrefetchPhase::Demand, layer_idx, &routes)
                 .with_context(|| format!("prefetch routed experts (layer {layer_idx})"))?;
-            reset_sync_buf(ordinal, &mut sync_buf)
-                .context("reset sync_buf (ffn after prefetch)")?;
         }
         if ffn_uses_router_native {
             if let Some(snapshots) = decode_batch_shared_parity.as_mut() {
-                let bytes = hidden * std::mem::size_of::<u16>();
-                let dst = unsafe {
-                    (snapshots.input.as_mut_ptr() as *mut u8).add(layer_idx * bytes)
-                        as *mut std::ffi::c_void
-                };
-                copy_d2d_decode(ordinal, dst, input_ptr, bytes).with_context(|| {
-                    format!("snapshot decode-batch FFN shared input (layer {layer_idx})")
-                })?;
+                let should_snapshot_shared = decode_batch_shared_parity_tap
+                    && qwen36_metal_decode_batch_shared_stage5_parity_tap_matches(
+                        position, layer_idx,
+                    );
+                let should_snapshot_routed = decode_batch_routed_parity_tap
+                    && qwen36_metal_decode_batch_routed_stage5_parity_tap_matches(
+                        position, layer_idx,
+                    );
+                if should_snapshot_shared || should_snapshot_routed {
+                    let bytes = hidden * std::mem::size_of::<u16>();
+                    let dst = unsafe {
+                        (snapshots.input.as_mut_ptr() as *mut u8).add(layer_idx * bytes)
+                            as *mut std::ffi::c_void
+                    };
+                    copy_d2d_decode(ordinal, snapshots.input.backend(), dst, input_ptr, bytes)
+                        .with_context(|| {
+                            format!("snapshot decode-batch FFN shared input (layer {layer_idx})")
+                        })?;
+                }
             }
         }
         let t_k = std::time::Instant::now();
         let ffn_stage5_output = output_buf;
+        if !ffn_uses_router_native {
+            reset_sync_buf(ordinal, &mut sync_buf).context("reset sync_buf (ffn)")?;
+        }
         ffn_step_launch(
             ordinal,
             ScalarType::BF16,
@@ -1882,14 +2573,16 @@ fn run_chained_decode_impl_with_cache_pos(
         )
         .with_context(|| format!("ffn_step_launch (layer {layer_idx})"))?;
         if let Some(snapshots) = layer_output_tap.as_mut() {
-            snapshot_layer_output(
-                ordinal,
-                snapshots,
-                layer_idx,
-                1,
-                ffn_stage5_output.as_ptr(),
-                hidden,
-            )?;
+            if qwen36_layer_output_tap_should_snapshot(position, layer_idx, 1) {
+                snapshot_layer_output(
+                    ordinal,
+                    snapshots,
+                    layer_idx,
+                    1,
+                    ffn_stage5_output.as_ptr(),
+                    hidden,
+                )?;
+            }
         }
         if ffn_uses_router_native {
             if let Some(snapshot) = decode_batch_route_snapshot.as_mut() {
@@ -1898,21 +2591,45 @@ fn run_chained_decode_impl_with_cache_pos(
                     (snapshot.as_mut_ptr() as *mut u8).add(layer_idx * bytes)
                         as *mut std::ffi::c_void
                 };
-                copy_d2d_decode(ordinal, dst, ffn_output_idx.as_ptr(), bytes).with_context(
-                    || format!("snapshot decode-batch FFN top-k routes (layer {layer_idx})"),
-                )?;
+                copy_d2d_decode(
+                    ordinal,
+                    snapshot.backend(),
+                    dst,
+                    ffn_output_idx.as_ptr(),
+                    bytes,
+                )
+                .with_context(|| {
+                    format!("snapshot decode-batch FFN top-k routes (layer {layer_idx})")
+                })?;
                 decode_batch_route_snapshot_captured[layer_idx] = true;
             }
             if let Some(snapshots) = decode_batch_shared_parity.as_mut() {
-                let bytes = snapshots.workspace_floats * std::mem::size_of::<f32>();
-                let dst = unsafe {
-                    (snapshots.workspace.as_mut_ptr() as *mut u8).add(layer_idx * bytes)
-                        as *mut std::ffi::c_void
-                };
-                copy_d2d_decode(ordinal, dst, ffn_workspace.as_ptr(), bytes).with_context(
-                    || format!("snapshot decode-batch FFN shared workspace (layer {layer_idx})"),
-                )?;
-                if decode_batch_routed_parity_tap {
+                let should_snapshot_shared = decode_batch_shared_parity_tap
+                    && qwen36_metal_decode_batch_shared_stage5_parity_tap_matches(
+                        position, layer_idx,
+                    );
+                let should_snapshot_routed = decode_batch_routed_parity_tap
+                    && qwen36_metal_decode_batch_routed_stage5_parity_tap_matches(
+                        position, layer_idx,
+                    );
+                if should_snapshot_shared || should_snapshot_routed {
+                    let bytes = snapshots.workspace_floats * std::mem::size_of::<f32>();
+                    let dst = unsafe {
+                        (snapshots.workspace.as_mut_ptr() as *mut u8).add(layer_idx * bytes)
+                            as *mut std::ffi::c_void
+                    };
+                    copy_d2d_decode(
+                        ordinal,
+                        snapshots.workspace.backend(),
+                        dst,
+                        ffn_workspace.as_ptr(),
+                        bytes,
+                    )
+                    .with_context(|| {
+                        format!("snapshot decode-batch FFN shared workspace (layer {layer_idx})")
+                    })?;
+                }
+                if should_snapshot_routed {
                     let output_bytes = hidden * std::mem::size_of::<u16>();
                     let output_dst = unsafe {
                         (snapshots.output.as_mut_ptr() as *mut u8).add(layer_idx * output_bytes)
@@ -1920,6 +2637,7 @@ fn run_chained_decode_impl_with_cache_pos(
                     };
                     copy_d2d_decode(
                         ordinal,
+                        snapshots.output.backend(),
                         output_dst,
                         ffn_stage5_output.as_ptr(),
                         output_bytes,
@@ -1933,19 +2651,25 @@ fn run_chained_decode_impl_with_cache_pos(
                         (snapshots.output_idx.as_mut_ptr() as *mut u8).add(layer_idx * idx_bytes)
                             as *mut std::ffi::c_void
                     };
-                    copy_d2d_decode(ordinal, idx_dst, ffn_output_idx.as_ptr(), idx_bytes)
-                        .with_context(|| {
-                            format!(
-                                "snapshot decode-batch FFN routed output_idx (layer {layer_idx})"
-                            )
-                        })?;
+                    copy_d2d_decode(
+                        ordinal,
+                        snapshots.output_idx.backend(),
+                        idx_dst,
+                        ffn_output_idx.as_ptr(),
+                        idx_bytes,
+                    )
+                    .with_context(|| {
+                        format!("snapshot decode-batch FFN routed output_idx (layer {layer_idx})")
+                    })?;
                 }
-                snapshots.captured[layer_idx] = true;
+                if should_snapshot_shared || should_snapshot_routed {
+                    snapshots.captured[layer_idx] = true;
+                }
             }
         }
         metal_queue_dirty = defer_layer_ffn_router || defer_layer_ffn_direct_gather;
         if options.accurate_stage_timings {
-            gpu_hal::sync(ordinal).context("sync_after_ffn_step (accurate_stage_timings)")?;
+            sync_decode_queue(ordinal, ffn_stage5_output.backend(), "sync_after_ffn_step")?;
         }
         if ffn_uses_router_native {
             flush_metal_decode_batch_profile_phase(
@@ -2019,6 +2743,11 @@ fn run_chained_decode_impl_with_cache_pos(
     }
 
     Ok(DecodeOutputs {
+        path_label: if metal_decode_batch_active {
+            "decode_batch"
+        } else {
+            "chained"
+        },
         final_hidden_bytes,
         per_layer_attn_out,
         per_layer_ffn_out,

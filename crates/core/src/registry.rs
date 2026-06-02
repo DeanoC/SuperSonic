@@ -33,6 +33,7 @@ pub enum ModelVariant {
     Qwen3_5_2B,
     Qwen3_5_4B,
     Qwen3_5_9B,
+    Qwen3_5_35B_A3B,
     Qwen3_30B_A3B,
     Qwen3_6_27B,
     Qwen3_6_35B_A3B,
@@ -49,6 +50,10 @@ impl ModelVariant {
             "qwen3.5-2b" | "qwen35-2b" | "2b" => Some(Self::Qwen3_5_2B),
             "qwen3.5-4b" | "qwen35-4b" | "4b" => Some(Self::Qwen3_5_4B),
             "qwen3.5-9b" | "qwen35-9b" | "9b" => Some(Self::Qwen3_5_9B),
+            "qwen3.5-35b-a3b"
+            | "qwen35-35b-a3b"
+            | "qwen3.5-35b-a3b-gptq-int4"
+            | "qwen35-35b-a3b-gptq-int4" => Some(Self::Qwen3_5_35B_A3B),
             "qwen3-30b-a3b" | "qwen3-30b-a3b-int4" | "qwen3moe-30b-a3b" => {
                 Some(Self::Qwen3_30B_A3B)
             }
@@ -72,6 +77,7 @@ impl ModelVariant {
             Self::Qwen3_5_2B => "Qwen/Qwen3.5-2B",
             Self::Qwen3_5_4B => "Qwen/Qwen3.5-4B",
             Self::Qwen3_5_9B => "Qwen/Qwen3.5-9B",
+            Self::Qwen3_5_35B_A3B => "Qwen/Qwen3.5-35B-A3B",
             Self::Qwen3_30B_A3B => "Qwen/Qwen3-30B-A3B",
             Self::Qwen3_6_27B => "Qwen/Qwen3.6-27B-FP8",
             Self::Qwen3_6_35B_A3B => "Qwen/Qwen3.6-35B-A3B-FP8",
@@ -89,6 +95,7 @@ impl ModelVariant {
             | Self::Qwen3_5_4B
             | Self::Qwen3_5_9B
             | Self::Qwen3_6_27B => ModelFamily::Qwen35,
+            Self::Qwen3_5_35B_A3B => ModelFamily::Qwen36Moe,
             Self::Qwen3_30B_A3B => ModelFamily::Qwen3Moe,
             Self::Qwen3_6_35B_A3B => ModelFamily::Qwen36Moe,
             Self::Gemma4_E2B | Self::Gemma4_E4B => ModelFamily::Gemma4,
@@ -105,6 +112,7 @@ impl fmt::Display for ModelVariant {
             Self::Qwen3_5_2B => write!(f, "qwen3.5-2b"),
             Self::Qwen3_5_4B => write!(f, "qwen3.5-4b"),
             Self::Qwen3_5_9B => write!(f, "qwen3.5-9b"),
+            Self::Qwen3_5_35B_A3B => write!(f, "qwen3.5-35b-a3b"),
             Self::Qwen3_30B_A3B => write!(f, "qwen3-30b-a3b"),
             Self::Qwen3_6_27B => write!(f, "qwen3.6-27b"),
             Self::Qwen3_6_35B_A3B => write!(f, "qwen3.6-35b-a3b"),
@@ -973,6 +981,29 @@ static REGISTRY: &[RegistryEntry] = &[
             scratch_floats: 16_384,
         }),
     },
+    // Qwen3.5-35B-A3B is the public non-FP8 MoE model used by the external
+    // M5 Max Q4_K_M comparisons. It shares the Qwen3_5Moe geometry and
+    // Qwen36Moe runtime layout already used by the FP8-labelled sibling.
+    RegistryEntry {
+        model: ModelVariant::Qwen3_5_35B_A3B,
+        backend: Backend::Metal,
+        arch: GpuArch::AppleM5Max,
+        vram: VramBudget {
+            fixed_bytes: 20 * GIB,
+            overhead_factor: 1.1,
+        },
+        params: FamilyParams::Qwen36Moe(Qwen36MoeKernelParams {
+            weight_prefix: "model.language_model",
+            kv_chunk_size: 256,
+            proj_buf_floats: 16_480,
+            attn_scratch_floats: 24_576,
+            moe_scratch_floats: 4_096,
+            num_experts: 256,
+            top_k: 8,
+            moe_intermediate_size: 512,
+            shared_expert_intermediate_size: 512,
+        }),
+    },
     // Qwen3.6-35B-A3B INT4 GPTQ on AMD gfx1100. Primary AMD v1 target.
     // BF16 won't fit 24 GiB; this entry assumes the INT4 bake. PR 3
     // wires it for the dry-run path; PR 6 lands the kernel.
@@ -1101,6 +1132,7 @@ pub fn supported_models_list() -> Vec<&'static str> {
             ModelVariant::Qwen3_5_2B => "qwen3.5-2b",
             ModelVariant::Qwen3_5_4B => "qwen3.5-4b",
             ModelVariant::Qwen3_5_9B => "qwen3.5-9b",
+            ModelVariant::Qwen3_5_35B_A3B => "qwen3.5-35b-a3b",
             ModelVariant::Qwen3_30B_A3B => "qwen3-30b-a3b",
             ModelVariant::Qwen3_6_27B => "qwen3.6-27b",
             ModelVariant::Qwen3_6_35B_A3B => "qwen3.6-35b-a3b",
@@ -1260,6 +1292,28 @@ mod tests {
     }
 
     #[test]
+    fn qwen35_35b_a3b_aliases_are_public_and_canonical() {
+        assert_eq!(
+            ModelVariant::from_cli_str("qwen3.5-35b-a3b"),
+            Some(ModelVariant::Qwen3_5_35B_A3B)
+        );
+        assert_eq!(
+            ModelVariant::from_cli_str("qwen35-35b-a3b-gptq-int4"),
+            Some(ModelVariant::Qwen3_5_35B_A3B)
+        );
+        assert_eq!(
+            ModelVariant::Qwen3_5_35B_A3B.hf_model_id(),
+            "Qwen/Qwen3.5-35B-A3B"
+        );
+        assert_eq!(
+            ModelVariant::Qwen3_5_35B_A3B.family(),
+            ModelFamily::Qwen36Moe
+        );
+        assert_eq!(ModelVariant::Qwen3_5_35B_A3B.to_string(), "qwen3.5-35b-a3b");
+        assert!(supported_models_list().contains(&"qwen3.5-35b-a3b"));
+    }
+
+    #[test]
     fn qwen3_moe_aliases_and_registry_are_public() {
         assert_eq!(
             ModelVariant::from_cli_str("qwen3-30b-a3b-int4"),
@@ -1382,6 +1436,11 @@ mod tests {
             &Backend::Metal,
             &GpuArch::AppleM5Max,
         );
+        let qwen35_moe_m5 = lookup(
+            &ModelVariant::Qwen3_5_35B_A3B,
+            &Backend::Metal,
+            &GpuArch::AppleM5Max,
+        );
         let qwen36_moe_m5 = lookup(
             &ModelVariant::Qwen3_6_35B_A3B,
             &Backend::Metal,
@@ -1392,6 +1451,7 @@ mod tests {
         assert!(e4b_m5.is_some());
         assert!(e9b_m5.is_some());
         assert!(qwen3_moe_m5.is_some());
+        assert!(qwen35_moe_m5.is_some());
         assert!(qwen36_moe_m5.is_some());
         assert!(phi4_m5.is_some());
         assert!(gemma_e2b_m5.is_some());
@@ -1418,6 +1478,11 @@ mod tests {
         );
         assert!(
             supported_archs_for(&ModelVariant::Qwen3_30B_A3B, &Backend::Metal)
+                .iter()
+                .any(|arch| arch == "apple-m5-max")
+        );
+        assert!(
+            supported_archs_for(&ModelVariant::Qwen3_5_35B_A3B, &Backend::Metal)
                 .iter()
                 .any(|arch| arch == "apple-m5-max")
         );

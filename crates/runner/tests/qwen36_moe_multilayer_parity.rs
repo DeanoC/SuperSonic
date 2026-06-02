@@ -348,8 +348,10 @@ fn build_ffn_layer(
         let shared_down_proj_w = upload_u8(ordinal, &[hidden, is_dim / 2], &sdp, "sdp packed");
         let int4 = FfnInt4Sidecars {
             group_size,
+            gate_up_proj_type: 4,
             gate_up_proj_scale: upload_bf16(ordinal, &[gs.len() / 2], &gs, "gate_up scale"),
             gate_up_proj_zero: upload_bf16(ordinal, &[gz.len() / 2], &gz, "gate_up zero"),
+            down_proj_type: 4,
             down_proj_scale: upload_bf16(ordinal, &[ds.len() / 2], &ds, "down_proj scale"),
             down_proj_zero: upload_bf16(ordinal, &[dz.len() / 2], &dz, "down_proj zero"),
             shared_gate_proj_scale: upload_bf16(ordinal, &[sgs.len() / 2], &sgs, "sgp scale"),
