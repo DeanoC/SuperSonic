@@ -53,6 +53,9 @@ enum PerfPreset {
     /// Public llama.cpp-style M5 Max generation benchmark:
     /// qwen3.5-35b-a3b Q4_K_M, tg/gen 512, ctx1024, one warmup, five measured reps.
     Qwen35Q4kmM5MaxGen512,
+    /// Raw GGUF Q4_K_M equivalent M5 Max benchmark:
+    /// qwen3.5-35b-a3b raw Q4_K_M, tg/gen 512, ctx1024, one warmup, five measured reps.
+    Qwen35RawQ4kmM5MaxGen512,
 }
 
 fn parse_kv(s: &str) -> Result<(String, PathBuf), String> {
@@ -154,19 +157,26 @@ fn main() -> Result<()> {
 fn apply_preset(cli: &mut Cli) {
     match cli.preset {
         Some(PerfPreset::Qwen35Q4kmM5MaxGen512) => {
-            cli.arch = "apple-m5-max".into();
-            cli.models = "qwen3.5-35b-a3b".into();
-            cli.quants = "q4km-gptq".into();
-            cli.prompt.clear();
-            cli.max_new_tokens = 512;
-            cli.context_size = Some(1024);
-            cli.warmup_tokens = 512;
-            cli.measurement_runs = 5;
-            cli.cooldown_seconds = 0;
-            cli.no_attribution = true;
+            apply_qwen35_q4km_m5max_gen512(cli, "q4km-gptq");
+        }
+        Some(PerfPreset::Qwen35RawQ4kmM5MaxGen512) => {
+            apply_qwen35_q4km_m5max_gen512(cli, "q4km");
         }
         None => {}
     }
+}
+
+fn apply_qwen35_q4km_m5max_gen512(cli: &mut Cli, quant: &str) {
+    cli.arch = "apple-m5-max".into();
+    cli.models = "qwen3.5-35b-a3b".into();
+    cli.quants = quant.into();
+    cli.prompt.clear();
+    cli.max_new_tokens = 512;
+    cli.context_size = Some(1024);
+    cli.warmup_tokens = 512;
+    cli.measurement_runs = 5;
+    cli.cooldown_seconds = 0;
+    cli.no_attribution = true;
 }
 
 #[cfg(test)]
@@ -180,6 +190,14 @@ mod tests {
             .expect("preset should parse with the documented CLI spelling");
 
         assert_eq!(cli.preset, Some(PerfPreset::Qwen35Q4kmM5MaxGen512));
+    }
+
+    #[test]
+    fn qwen35_raw_q4km_m5max_gen512_preset_cli_name_is_stable() {
+        let cli = Cli::try_parse_from(["bench-perf", "--preset", "qwen35-raw-q4km-m5-max-gen512"])
+            .expect("raw preset should parse with the documented CLI spelling");
+
+        assert_eq!(cli.preset, Some(PerfPreset::Qwen35RawQ4kmM5MaxGen512));
     }
 
     #[test]
@@ -207,6 +225,40 @@ mod tests {
         assert_eq!(cli.arch, "apple-m5-max");
         assert_eq!(cli.models, "qwen3.5-35b-a3b");
         assert_eq!(cli.quants, "q4km-gptq");
+        assert_eq!(cli.prompt, "");
+        assert_eq!(cli.max_new_tokens, 512);
+        assert_eq!(cli.context_size, Some(1024));
+        assert_eq!(cli.warmup_tokens, 512);
+        assert_eq!(cli.measurement_runs, 5);
+        assert_eq!(cli.cooldown_seconds, 0);
+        assert!(cli.no_attribution);
+    }
+
+    #[test]
+    fn qwen35_raw_q4km_m5max_gen512_preset_matches_public_generation_shape() {
+        let mut cli = Cli {
+            arch: "gfx1100".into(),
+            preset: Some(PerfPreset::Qwen35RawQ4kmM5MaxGen512),
+            models: "all".into(),
+            quants: "all".into(),
+            prompt: "The quick brown fox jumps over".into(),
+            max_new_tokens: 16,
+            context_size: None,
+            warmup_tokens: 2,
+            measurement_runs: 3,
+            cooldown_seconds: 3,
+            no_attribution: false,
+            binary: "./target/release/supersonic".into(),
+            run_root: "./target/bench-runs".into(),
+            model_dirs: vec![],
+            specprefill_draft_dirs: vec![],
+        };
+
+        apply_preset(&mut cli);
+
+        assert_eq!(cli.arch, "apple-m5-max");
+        assert_eq!(cli.models, "qwen3.5-35b-a3b");
+        assert_eq!(cli.quants, "q4km");
         assert_eq!(cli.prompt, "");
         assert_eq!(cli.max_new_tokens, 512);
         assert_eq!(cli.context_size, Some(1024));
