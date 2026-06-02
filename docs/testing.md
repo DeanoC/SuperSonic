@@ -141,6 +141,15 @@ samples, median `ms_per_step`, and derived `tok_per_s`. Raw `--q4km` is not yet
 a SuperSonic Metal row; add it to the benchmark matrix only after the Metal
 dense/shared projection kernels carry raw GGML qtype metadata.
 
+To inspect a raw Q4_K_M bake before enabling it in SuperSonic, run the manifest
+audit. It reads `manifest.json` and `config.json` only, reports every required
+Qwen3.5/3.6 MoE projection, and exits `2` while current Metal blockers remain:
+
+```bash
+cargo run -p runner --bin qwen36_q4km_manifest_audit -- \
+  --model-dir /path/to/qwen3.5-35b-a3b
+```
+
 ## Per-feature parity tests
 
 Several runtime features ship a Rust integration test that shells out

@@ -954,6 +954,19 @@ optimization gate is based on the refreshed local llama.cpp median: start that
 phase when SuperSonic reaches at least 90% of the locally measured llama.cpp
 throughput for this workload.
 
+Before raw `--q4km` is promoted into the SuperSonic matrix, use the manifest
+audit to inventory the raw bake and keep the missing Metal ABI work explicit:
+
+```bash
+cargo run -p runner --bin qwen36_q4km_manifest_audit -- \
+  --model-dir /path/to/qwen3.5-35b-a3b
+```
+
+The current audit model intentionally treats routed expert raw GGML K-blocks as
+supported and dense/full-attention, linear-attention, shared-expert, and lm-head
+raw GGML K-blocks as blockers until those descriptors carry per-projection raw
+qtype metadata.
+
 Short smoke runs are too noisy for headline comparison: 16-token samples ranged
 from ~125 to ~201 ms/token depending on command-buffer scheduling and warm
 state, while longer runs settle much lower. The 2026-06-01 FFN Q4_K lane-pair

@@ -80,6 +80,10 @@ path = "src/bin/bench_prefill_attn.rs"
 name = "qwen36_ffn_expert_microbench"
 path = "src/bin/qwen36_ffn_expert_microbench.rs"
 
+[[bin]]
+name = "qwen36_q4km_manifest_audit"
+path = "src/bin/qwen36_q4km_manifest_audit.rs"
+
 [dependencies]
 machine-profile = { path = "../machine-profile" }
 supersonic-core = { path = "../core" }
