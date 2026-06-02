@@ -1137,6 +1137,32 @@ Q4_K_M smoke on Apple M5 Max exited cleanly and emitted one aggregate row per
 cold capture (`82.790 ms` total across 160 invocations). Use both env flags for
 future 128-token gates when Metal trace tooling is too heavyweight.
 
+A current-tree 2026-06-02 rerun after the online-attention rebuild kept the raw
+default 32-token stream unchanged:
+`[49602, 165189, 184475, 145239, 31375, 47477, 11625, 58985, 757, 155221,
+22937, 2926, 79609, 6906, 124641, 171294, 16544, 93186, 2661, 53625, 154878,
+1686, 91745, 25088, 9696, 23920, 206853, 198643, 60811, 10332, 10265,
+233548]`, measuring `120.3 ms/token` with `ffn_ms_avg=93.189` on the short
+smoke. The compact split profile again put router/top-k first:
+`qwen36_ffn_int4_router_topk_stage5_exact_simd` was `85.733 ms` total across
+160 invocations, ahead of expert down (`26.336 ms`) and shared-gate scalar
+(`22.911 ms`). Disabling the exact SIMD router path diverged at token 3 and did
+not materially improve the same 32-token timing (`120.5 ms/token`), so the next
+router optimization should keep the exact-order logits path and focus on a
+parity-safe top-k/softmax reduction or launch/barrier consolidation.
+
+The follow-up added a router subphase profile gate:
+`SUPERSONIC_METAL_PROFILE_QWEN36_ROUTER_PHASES=1` splits the existing FFN phase
+profile into router norm, router logits, and router top-k labels. On the same
+4-token raw Q4_K_M smoke, default router subphases were norm `38.943 ms`,
+logits `16.848 ms`, and top-k `17.561 ms` across 160 invocations. An opt-in
+parity-safe router norm variant,
+`SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_NORM_PARALLEL_STORE=1`, keeps the
+mean-square sum in the original serial order but parallelizes the normalized
+store. It preserved the 32-token generated stream and cut the profiled router
+norm phase to `22.607 ms`, but the end-to-end 32-token smoke stayed slower
+(`145.1 ms/token`, `ffn_ms_avg=116.280`), so it remains opt-in.
+
 The 2026-06-02 128-token raw Q4_K_M follow-up used the same two split-profile
 env flags on Apple M5 Max, prompt `Hello`, context 256, and greedy seed
 `20260504`. It preserved the known 128-token stream and measured
@@ -1350,6 +1376,41 @@ identified the next safe work area:
   (`/tmp/qwen35_native_table_exp_compile_error.log`). Small coefficient and
   range-reduction nudges to the retained float polynomial improved the captured
   mismatch count only from 12 to 11 words and were not kept.
+  A 2026-06-02 follow-up stopped tuning the known-drifting split
+  score/probability path and added an opt-in online-softmax full-attention
+  kernel behind `SUPERSONIC_METAL_QWEN36_FULL_ATTN_ONLINE=1`. The new kernel
+  follows the shipped MLX `sdpa_vector` and llama.cpp Metal flash-attention
+  recurrence: each sequence partition carries `(max_score, sum_exp_score,
+  output_accumulator)`, then partitions are merged with the same max-rescale
+  factor instead of materializing normalized probabilities first. On the
+  available local `qwen3.6-35b-a3b` `--int4` bake, the online path compiled
+  and matched both default and split-native generated IDs for 32-token
+  deterministic smokes. The current rebuilt check generated
+  `[11, 271, 40, 599, 264, 3377, 440, 264, 1957, 13, 271, 40, 599, 264, 1957,
+  421, 15339, 264, 999, 13, 561, 999, 5435, 264, 1103, 314, 4105, 13, 353,
+  1144, 310, 1301]` on both paths. The warm online run measured
+  `53.1 ms/token` with `full_attn_ms_avg=6.406`; the split-native comparison
+  measured `55.7 ms/token` with `full_attn_ms_avg=6.558`. The online gate now
+  has its own 1024-token cap instead of the split-native path's 128-token score
+  cap. A prior 160-token deterministic INT4 smoke with `--context-size 256`
+  completed
+  through the old limit and matched the split/native-fallback stream exactly;
+  online measured `48.2 ms/token` with `full_attn_ms_avg=5.240`, while the
+  split/native-fallback comparison measured `48.3 ms/token` with
+  `full_attn_ms_avg=5.417`. A 512-token online INT4 smoke with
+  `--context-size 1024` also completed with `KV cache cap = 513`, measuring
+  `62.0 ms/token`, `full_attn_ms_avg=15.433`, `linear_attn_ms_avg=17.168`, and
+  `ffn_ms_avg=25.365`. Keep the online path opt-in for now: it is the right
+  upstream-shaped comparison lane, but it is not yet a headline speed win, and
+  the local raw `--q4km` / `--q4km-gptq` bakes were unavailable under
+  `--no-download` in this checkout. Two closer MLX-vector micro-shapes were
+  tried and rejected on the 32-token smoke: moving the per-lane V accumulator
+  into private locals stayed token-identical but raised `full_attn_ms_avg` to
+  `7.596` with a local array and `6.837` with scalar accumulators; caching the
+  eight per-lane Q values before the key loop also stayed token-identical but
+  measured `full_attn_ms_avg=6.531`. Those edits were not kept because the
+  current Metal codegen appears to prefer the lower-register-pressure shared
+  scratch form in this kernel.
 - A split full-attention phase profiler
   (`SUPERSONIC_METAL_PROFILE_QWEN36_FULL_ATTN_PHASES=1`) showed that the native
   values rewrite is no longer the main wall-clock target. Because decode-batch

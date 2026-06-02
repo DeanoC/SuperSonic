@@ -2512,6 +2512,19 @@ pub unsafe fn attn_step_stage5_metal_host_into(
 }
 
 const QWEN36_FULL_ATTN_NATIVE_MAX_SCORE_TOKENS: usize = 128;
+const QWEN36_FULL_ATTN_ONLINE_MAX_TOKENS: usize = 1024;
+
+fn qwen36_full_attn_online_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_QWEN36_FULL_ATTN_ONLINE").is_some()
+}
+
+fn qwen36_full_attn_native_token_cap() -> usize {
+    if qwen36_full_attn_online_enabled() {
+        QWEN36_FULL_ATTN_ONLINE_MAX_TOKENS
+    } else {
+        QWEN36_FULL_ATTN_NATIVE_MAX_SCORE_TOKENS
+    }
+}
 
 pub fn attn_step_stage5_metal_native_supported(
     params: Qwen36MoeAttnStepParams,
@@ -2534,7 +2547,7 @@ pub fn attn_step_stage5_metal_native_supported(
         && params.rotary_dim >= 0
         && params.rotary_dim <= params.head_dim
         && eff_cache_pos >= 0
-        && (eff_cache_pos as usize) < QWEN36_FULL_ATTN_NATIVE_MAX_SCORE_TOKENS
+        && (eff_cache_pos as usize) < qwen36_full_attn_native_token_cap()
         && weights.kv_max_t > eff_cache_pos
         && int4.group_size == 128
         && qwen36_lowbit_native_int4(int4.q_proj_type)
@@ -2598,7 +2611,7 @@ pub unsafe fn attn_step_stage5_metal_native_into(
             params.position,
             params.cache_pos,
             weights.kv_max_t as usize,
-            QWEN36_FULL_ATTN_NATIVE_MAX_SCORE_TOKENS,
+            qwen36_full_attn_native_token_cap(),
             params.rms_norm_eps,
             params.rope_theta,
             rope_cos,
