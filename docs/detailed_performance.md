@@ -913,6 +913,7 @@ Current 2026-06-01 result on this M5 Max:
 | Engine | Model/quant | Workload | ms/tok | tok/s | Source |
 |---|---|---|---:|---:|---|
 | SuperSonic | Qwen3.5-35B-A3B Q4_K_M | 1-token prompt + 512 generated, promoted exact-order FFN path | 67.3 | 14.9 | `/tmp/qwen35_default_after_scalar_fuse_patch_512.log` |
+| SuperSonic | Qwen3.5-35B-A3B raw Q4_K_M | empty prompt + 512 generated, staged mixed-layout raw path | 73.6 | 13.6 | `target/bench-runs/2026-06-02-0f7b114/perf/qwen3.5-35b-a3b_q4km.json` |
 | llama.cpp | Qwen3.5-35B-A3B Q4_K_M | public M5 Max generation number | ~11.0 | 91.0 | public reference |
 | MLX | Qwen3.5-35B-A3B Q4_K_M | public M5 Max generation number | ~7.2 | 139.0 | public reference |
 
@@ -951,13 +952,24 @@ python3 -m oracle.bench.external.external_main \
 
 The external JSON cells live under the latest `target/bench-runs/*/external/`
 run directory and record engine version, exact command, workload metadata,
-samples, median `ms_per_step`, and derived `tok_per_s`. The fusion/megakernel
-optimization gate is based on the refreshed local llama.cpp median: start that
-phase when SuperSonic reaches at least 90% of the locally measured llama.cpp
-throughput for this workload.
+samples, median `ms_per_step`, and derived `tok_per_s`. The raw SuperSonic
+staged lane is reproduced with:
 
-Before raw `--q4km` is promoted into the SuperSonic matrix, use the manifest
-audit to inventory the raw bake and keep layout coverage explicit:
+```bash
+cargo run --release -p supersonic-bench --bin bench-perf -- \
+  --preset qwen35-raw-q4km-m5-max-gen512 \
+  --model-dir qwen3.5-35b-a3b="$HOME/.cache/supersonic-metal-models/qwen3.5-35b-a3b"
+```
+
+The 2026-06-02 run (`target/bench-runs/2026-06-02-0f7b114`) used one 512-token
+warmup and five measured samples: `[74.3, 73.6, 77.6, 71.7, 71.0]`, median
+`73.6 ms/token` (`13.6 tok/s`). The fusion/megakernel optimization gate is
+based on the refreshed local llama.cpp median: start that phase when SuperSonic
+reaches at least 90% of the locally measured llama.cpp throughput for this
+workload.
+
+Before changing the raw `--q4km` SuperSonic matrix row, use the manifest audit
+to inventory the raw bake and keep layout coverage explicit:
 
 ```bash
 cargo run -p runner --bin qwen36_q4km_manifest_audit -- \

@@ -77,17 +77,17 @@ runs, and runtime-feature deltas, see
 | Model | Option | ms/tok | tok/s |
 |---|---|---:|---:|
 | qwen3.5-35b-a3b | Q4_K_M-sourced GPTQ, 1-token prompt + 512 generated tokens | 67.3 | 14.9 |
+| qwen3.5-35b-a3b | raw Q4_K_M staged path, empty prompt + 512 generated tokens | 73.6 | 13.6 |
 | qwen3.6-35b-a3b | INT4, 6-token prompt + 16 generated tokens | 58.3 | 17.2 |
 | qwen3.6-35b-a3b | INT4, 512-token long-context smoke | 72.683 | 13.8 |
 | qwen3.6-35b-a3b | INT4, 2048-token long-context smoke | 159.044 | 6.3 |
 
 Historical public reference numbers for the same Qwen3.5-35B-A3B Q4_K_M source
 target on M5 Max are llama.cpp at 91 tok/s (~11.0 ms/tok) and MLX at 139 tok/s
-(~7.2 ms/tok). The SuperSonic Metal row currently uses the Q4_K_M-sourced
-GPTQ/native-INT4 bake, not raw GGUF K-blocks; local raw-reference refreshes now
-run through `oracle.bench.external.external_main` for llama.cpp and MLX. Raw
-SuperSonic `--q4km` has one-token staged smoke coverage but is not promoted to
-this matrix until a 512-token local median is available.
+(~7.2 ms/tok). SuperSonic tracks separate `q4km-gptq` and raw `q4km` lanes:
+`q4km-gptq` is the faster native-sidecar control path, while raw `q4km` is the
+external-equivalence staged path. Local raw-reference refreshes run through
+`oracle.bench.external.external_main` for llama.cpp and MLX.
 
 Apple M5 Max Metal also has correctness coverage for `qwen3-30b-a3b` INT4,
 Gemma 4 BF16/INT4, and Phi-4 mini BF16/INT4/FP8-runtime. Those lanes are
