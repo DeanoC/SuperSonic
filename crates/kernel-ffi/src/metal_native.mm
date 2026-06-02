@@ -12,7 +12,10 @@
 #include <cstring>
 #include <mutex>
 #include <stdint.h>
+#include <stdio.h>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 extern "C" int supersonic_metal_lookup_buffer(
     const void* ptr,
@@ -53,6 +56,88 @@ inline void record_profile_elapsed(const char* op, const char* path, double elap
     if (std::isfinite(elapsed_ms) && elapsed_ms >= 0.0) {
         supersonic_metal_profile_record(op, path, elapsed_ms);
     }
+}
+
+struct Qwen36FfnPhaseStats {
+    uint64_t count = 0;
+    double total_ms = 0.0;
+    double min_ms = 0.0;
+    double max_ms = 0.0;
+};
+
+std::mutex& qwen36_ffn_phase_summary_mutex() {
+    static std::mutex* mutex = new std::mutex();
+    return *mutex;
+}
+
+std::unordered_map<std::string, Qwen36FfnPhaseStats>& qwen36_ffn_phase_summary_stats() {
+    static std::unordered_map<std::string, Qwen36FfnPhaseStats>* stats =
+        new std::unordered_map<std::string, Qwen36FfnPhaseStats>();
+    return *stats;
+}
+
+bool qwen36_ffn_phase_summary_stdout_enabled() {
+    return std::getenv("SUPERSONIC_METAL_PROFILE_QWEN36_FFN_PHASES_STDOUT") != nullptr;
+}
+
+void qwen36_ffn_phase_summary_print() {
+    if (!qwen36_ffn_phase_summary_stdout_enabled()) {
+        return;
+    }
+    std::vector<std::pair<std::string, Qwen36FfnPhaseStats>> rows;
+    {
+        std::lock_guard<std::mutex> lock(qwen36_ffn_phase_summary_mutex());
+        for (const auto& entry : qwen36_ffn_phase_summary_stats()) {
+            rows.push_back(entry);
+        }
+    }
+    std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) {
+        return a.first < b.first;
+    });
+    for (const auto& row : rows) {
+        const Qwen36FfnPhaseStats& s = row.second;
+        if (s.count == 0) {
+            continue;
+        }
+        std::fprintf(
+            stderr,
+            "[qwen36-moe ffn-phase-summary] label=%s count=%llu total_ms=%.3f avg_ms=%.3f min_ms=%.3f max_ms=%.3f\n",
+            row.first.c_str(),
+            static_cast<unsigned long long>(s.count),
+            s.total_ms,
+            s.total_ms / static_cast<double>(s.count),
+            s.min_ms,
+            s.max_ms
+        );
+    }
+}
+
+void qwen36_ffn_phase_summary_register_once() {
+    static std::once_flag once;
+    std::call_once(once, []() {
+        std::atexit(qwen36_ffn_phase_summary_print);
+    });
+}
+
+void qwen36_ffn_phase_summary_record(const std::string& label, double elapsed_ms) {
+    if (!qwen36_ffn_phase_summary_stdout_enabled() ||
+        label.find("qwen36_ffn_int4_") != 0 ||
+        !std::isfinite(elapsed_ms) ||
+        elapsed_ms < 0.0) {
+        return;
+    }
+    qwen36_ffn_phase_summary_register_once();
+    std::lock_guard<std::mutex> lock(qwen36_ffn_phase_summary_mutex());
+    Qwen36FfnPhaseStats& s = qwen36_ffn_phase_summary_stats()[label];
+    if (s.count == 0) {
+        s.min_ms = elapsed_ms;
+        s.max_ms = elapsed_ms;
+    } else {
+        s.min_ms = std::min(s.min_ms, elapsed_ms);
+        s.max_ms = std::max(s.max_ms, elapsed_ms);
+    }
+    s.count += 1;
+    s.total_ms += elapsed_ms;
 }
 
 inline bool qwen36_ffn_routed_host_correction_probe_enabled() {
@@ -167,6 +252,7 @@ inline void record_command_buffer_gpu_profile(id<MTLCommandBuffer> command_buffe
     if (!label.empty()) {
         std::string labeled_op = "command_buffer_gpu:" + label;
         record_profile_elapsed(labeled_op.c_str(), "runtime", gpu_elapsed_ms);
+        qwen36_ffn_phase_summary_record(label, gpu_elapsed_ms);
     }
 }
 

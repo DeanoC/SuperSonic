@@ -1128,10 +1128,14 @@ stable win: the flagged run measured `100.5 ms/token` with `ffn=74.8 ms/token`,
 while the following default control measured `96.8 ms/token` with
 `ffn=72.6 ms/token`. Keep down pair-dot opt-in. The built-in split profiler
 (`SUPERSONIC_METAL_PROFILE_QWEN36_FFN_PHASES=1`) still slows the run enough to
-confirm FFN dominance but does not emit a stdout subphase table in this capture
-path; the next useful instrumentation change is a compact router/shared/routed
-FFN subphase summary that can be compared across 128-token gates without Metal
-trace tooling.
+confirm FFN dominance, so a compact stdout summary was added behind the
+additional
+`SUPERSONIC_METAL_PROFILE_QWEN36_FFN_PHASES_STDOUT=1` opt-in. A 4-token raw
+Q4_K_M smoke on Apple M5 Max exited cleanly and emitted one aggregate row per
+`qwen36_ffn_int4_*` command-buffer label, with
+`qwen36_ffn_int4_router_topk_stage5_exact_simd` the largest split phase in that
+cold capture (`82.790 ms` total across 160 invocations). Use both env flags for
+future 128-token gates when Metal trace tooling is too heavyweight.
 
 The current gap is therefore not a one-line launch-count fix; the Metal profile
 still points at the chained per-layer decode structure and command-buffer waits.
