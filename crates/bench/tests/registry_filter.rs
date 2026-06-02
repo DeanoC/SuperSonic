@@ -35,7 +35,7 @@ fn apple_m5_max_includes_qwen_moe_metal_lanes() {
     assert!(model_quants.contains(&("qwen3.5-35b-a3b", "q4km-gptq")));
     assert!(
         !model_quants.contains(&("qwen3.5-35b-a3b", "q4km")),
-        "raw GGUF Q4_K_M should be added only after Metal dense/shared projections consume raw qtype metadata"
+        "raw GGUF Q4_K_M should be added only after local correctness and 512-token benchmark evidence is recorded"
     );
     assert!(!model_quants.contains(&("qwen3.6-35b-a3b", "kv-fp8")));
 }

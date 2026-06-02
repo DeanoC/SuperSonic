@@ -219,30 +219,24 @@ fn has_int4_sidecars(
 }
 
 fn support_for(
-    family: Qwen36Q4KmProjectionFamily,
+    _family: Qwen36Q4KmProjectionFamily,
     status: &Qwen36Q4KmProjectionStatus,
     name: &str,
 ) -> (bool, Option<String>) {
-    match (family, status) {
-        (_, Qwen36Q4KmProjectionStatus::Missing) => (
+    match status {
+        Qwen36Q4KmProjectionStatus::Missing => (
             false,
             Some("required tensor is missing from the manifest".to_string()),
         ),
-        (_, Qwen36Q4KmProjectionStatus::UnsupportedLayout) => (
-            false,
-            Some(format!("{name}: layout is not supported by the current Qwen36 Metal path")),
-        ),
-        (_, Qwen36Q4KmProjectionStatus::NativeInt4Sidecars)
-        | (_, Qwen36Q4KmProjectionStatus::Bf16OrUnquantized) => (true, None),
-        (Qwen36Q4KmProjectionFamily::RoutedExpert, Qwen36Q4KmProjectionStatus::RawGgmlKBlock) => {
-            (true, None)
-        }
-        (_, Qwen36Q4KmProjectionStatus::RawGgmlKBlock) => (
+        Qwen36Q4KmProjectionStatus::UnsupportedLayout => (
             false,
             Some(format!(
-                "{name}: raw GGML K-block projection needs Metal loader/kernel support that consumes per-projection qtype metadata"
+                "{name}: layout is not supported by the current Qwen36 Metal path"
             )),
         ),
+        Qwen36Q4KmProjectionStatus::NativeInt4Sidecars
+        | Qwen36Q4KmProjectionStatus::Bf16OrUnquantized
+        | Qwen36Q4KmProjectionStatus::RawGgmlKBlock => (true, None),
     }
 }
 
@@ -309,7 +303,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_dense_and_shared_q4k_are_blockers_but_routed_experts_are_supported() {
+    fn raw_q4k_manifest_is_supported_when_all_required_layouts_are_known() {
         let mut tensors = Vec::new();
         for li in 0..4 {
             let lp = format!("model.language_model.layers.{li}");
@@ -344,13 +338,13 @@ mod tests {
         let report = audit_qwen36_q4km_manifest(&manifest(tensors), &spec());
 
         assert_eq!(report.summary.raw_ggml_k_blocks, 33);
-        assert_eq!(report.summary.current_metal_blockers, 25);
+        assert_eq!(report.summary.current_metal_blockers, 0);
         assert!(report
             .projections
             .iter()
             .any(|p| { p.name.ends_with("experts.gate_up_proj") && p.supported_by_current_metal }));
         assert!(report.projections.iter().any(|p| {
-            p.name.ends_with("linear_attn.in_proj_qkv.weight") && !p.supported_by_current_metal
+            p.name.ends_with("linear_attn.in_proj_qkv.weight") && p.supported_by_current_metal
         }));
     }
 

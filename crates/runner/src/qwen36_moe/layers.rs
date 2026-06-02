@@ -147,22 +147,8 @@ fn ggml_lowbit_type_for_layout(store: &BakedStore, name: &str) -> Result<i32> {
     }
 }
 
-fn ensure_q4km_native_sidecars(store: &BakedStore, names: &[String]) -> Result<()> {
-    for name in names {
-        if !matches!(
-            store_layout_qwen36(store, name),
-            Some(LayoutTag::GgmlQ4K | LayoutTag::GgmlQ5K | LayoutTag::GgmlQ6K)
-        ) {
-            continue;
-        }
-        let scale_name = format!("{name}_int4_scale");
-        if !store_contains_qwen36(store, &scale_name) {
-            return Err(anyhow!(
-                "{name}: raw GGML q4km dense projection lacks native INT4 sidecars; use --q4km-gptq for this runtime"
-            ));
-        }
-    }
-    Ok(())
+fn ignored_lowbit_sidecar(ordinal: usize) -> Result<GpuBuffer> {
+    GpuBuffer::zeros(ordinal, ScalarType::U8, &[1]).context("alloc ignored lowbit sidecar")
 }
 
 /// Build one layer's worth of GPU-resident weight + state buffers from a
@@ -205,17 +191,6 @@ pub(crate) fn load_layer_buffers(
 
     let attn = if text_config.is_full_attention(layer_idx) {
         let fa = format!("{lp}.self_attn");
-        if weight_mode == Qwen36WeightMode::Q4Km {
-            ensure_q4km_native_sidecars(
-                store,
-                &[
-                    format!("{fa}.q_proj.weight"),
-                    format!("{fa}.k_proj.weight"),
-                    format!("{fa}.v_proj.weight"),
-                    format!("{fa}.o_proj.weight"),
-                ],
-            )?;
-        }
         let (q_proj_type, k_proj_type, v_proj_type, o_proj_type) =
             if weight_mode == Qwen36WeightMode::Q4Km {
                 (
@@ -233,7 +208,7 @@ pub(crate) fn load_layer_buffers(
                 )
             };
         let int4 = match weight_mode {
-            Qwen36WeightMode::Int4 | Qwen36WeightMode::Q4Km => Some(FullAttnInt4Sidecars {
+            Qwen36WeightMode::Int4 => Some(FullAttnInt4Sidecars {
                 group_size: QWEN36_MOE_INT4_GROUP_SIZE,
                 q_proj_type,
                 q_proj_scale: load_to_gpu(
@@ -263,6 +238,21 @@ pub(crate) fn load_layer_buffers(
                     &format!("{fa}.o_proj.weight_int4_scale"),
                 )?,
                 o_proj_zero: load_to_gpu(store, ordinal, &format!("{fa}.o_proj.weight_int4_zero"))?,
+            }),
+            Qwen36WeightMode::Q4Km => Some(FullAttnInt4Sidecars {
+                group_size: QWEN36_MOE_INT4_GROUP_SIZE,
+                q_proj_type,
+                q_proj_scale: ignored_lowbit_sidecar(ordinal)?,
+                q_proj_zero: ignored_lowbit_sidecar(ordinal)?,
+                k_proj_type,
+                k_proj_scale: ignored_lowbit_sidecar(ordinal)?,
+                k_proj_zero: ignored_lowbit_sidecar(ordinal)?,
+                v_proj_type,
+                v_proj_scale: ignored_lowbit_sidecar(ordinal)?,
+                v_proj_zero: ignored_lowbit_sidecar(ordinal)?,
+                o_proj_type,
+                o_proj_scale: ignored_lowbit_sidecar(ordinal)?,
+                o_proj_zero: ignored_lowbit_sidecar(ordinal)?,
             }),
             Qwen36WeightMode::Fp8 => Some(FullAttnInt4Sidecars {
                 group_size: -QWEN36_MOE_FP8_BLOCK_SIZE,
@@ -448,16 +438,6 @@ pub(crate) fn load_layer_buffers(
         let recurrent_state = GpuBuffer::zeros(ordinal, ScalarType::F32, &[state_elems])
             .with_context(|| format!("alloc recurrent_state (layer {layer_idx})"))?;
 
-        if weight_mode == Qwen36WeightMode::Q4Km {
-            ensure_q4km_native_sidecars(
-                store,
-                &[
-                    format!("{la}.in_proj_qkv.weight"),
-                    format!("{la}.in_proj_z.weight"),
-                    format!("{la}.out_proj.weight"),
-                ],
-            )?;
-        }
         let (in_proj_qkv_type, in_proj_z_type, out_proj_type) =
             if weight_mode == Qwen36WeightMode::Q4Km {
                 (
@@ -473,7 +453,7 @@ pub(crate) fn load_layer_buffers(
                 )
             };
         let int4 = match weight_mode {
-            Qwen36WeightMode::Int4 | Qwen36WeightMode::Q4Km => Some(LinearAttnInt4Sidecars {
+            Qwen36WeightMode::Int4 => Some(LinearAttnInt4Sidecars {
                 group_size: QWEN36_MOE_INT4_GROUP_SIZE,
                 in_proj_qkv_type,
                 in_proj_qkv_scale: load_to_gpu(
@@ -508,6 +488,18 @@ pub(crate) fn load_layer_buffers(
                     ordinal,
                     &format!("{la}.out_proj.weight_int4_zero"),
                 )?,
+            }),
+            Qwen36WeightMode::Q4Km => Some(LinearAttnInt4Sidecars {
+                group_size: QWEN36_MOE_INT4_GROUP_SIZE,
+                in_proj_qkv_type,
+                in_proj_qkv_scale: ignored_lowbit_sidecar(ordinal)?,
+                in_proj_qkv_zero: ignored_lowbit_sidecar(ordinal)?,
+                in_proj_z_type,
+                in_proj_z_scale: ignored_lowbit_sidecar(ordinal)?,
+                in_proj_z_zero: ignored_lowbit_sidecar(ordinal)?,
+                out_proj_type,
+                out_proj_scale: ignored_lowbit_sidecar(ordinal)?,
+                out_proj_zero: ignored_lowbit_sidecar(ordinal)?,
             }),
             Qwen36WeightMode::Fp8 => Some(LinearAttnInt4Sidecars {
                 group_size: -QWEN36_MOE_FP8_BLOCK_SIZE,
@@ -561,16 +553,6 @@ pub(crate) fn load_layer_buffers(
     let mp = format!("{lp}.mlp");
     // Fused-expert sidecars use `_int4_scale`/`_int4_zero` (no `.weight`).
     // Shared-expert MLPs use the dense `<name>.weight_int4_scale` form.
-    if weight_mode == Qwen36WeightMode::Q4Km {
-        ensure_q4km_native_sidecars(
-            store,
-            &[
-                format!("{mp}.shared_expert.gate_proj.weight"),
-                format!("{mp}.shared_expert.up_proj.weight"),
-                format!("{mp}.shared_expert.down_proj.weight"),
-            ],
-        )?;
-    }
     let ffn_int4 = match weight_mode {
         Qwen36WeightMode::Int4 => Some(FfnInt4Sidecars {
             group_size: QWEN36_MOE_INT4_GROUP_SIZE,
@@ -645,44 +627,20 @@ pub(crate) fn load_layer_buffers(
                 store,
                 &format!("{mp}.shared_expert.gate_proj.weight"),
             )?,
-            shared_gate_proj_scale: load_to_gpu(
-                store,
-                ordinal,
-                &format!("{mp}.shared_expert.gate_proj.weight_int4_scale"),
-            )?,
-            shared_gate_proj_zero: load_to_gpu(
-                store,
-                ordinal,
-                &format!("{mp}.shared_expert.gate_proj.weight_int4_zero"),
-            )?,
+            shared_gate_proj_scale: ignored_lowbit_sidecar(ordinal)?,
+            shared_gate_proj_zero: ignored_lowbit_sidecar(ordinal)?,
             shared_up_proj_type: ggml_lowbit_type_for_layout(
                 store,
                 &format!("{mp}.shared_expert.up_proj.weight"),
             )?,
-            shared_up_proj_scale: load_to_gpu(
-                store,
-                ordinal,
-                &format!("{mp}.shared_expert.up_proj.weight_int4_scale"),
-            )?,
-            shared_up_proj_zero: load_to_gpu(
-                store,
-                ordinal,
-                &format!("{mp}.shared_expert.up_proj.weight_int4_zero"),
-            )?,
+            shared_up_proj_scale: ignored_lowbit_sidecar(ordinal)?,
+            shared_up_proj_zero: ignored_lowbit_sidecar(ordinal)?,
             shared_down_proj_type: ggml_lowbit_type_for_layout(
                 store,
                 &format!("{mp}.shared_expert.down_proj.weight"),
             )?,
-            shared_down_proj_scale: load_to_gpu(
-                store,
-                ordinal,
-                &format!("{mp}.shared_expert.down_proj.weight_int4_scale"),
-            )?,
-            shared_down_proj_zero: load_to_gpu(
-                store,
-                ordinal,
-                &format!("{mp}.shared_expert.down_proj.weight_int4_zero"),
-            )?,
+            shared_down_proj_scale: ignored_lowbit_sidecar(ordinal)?,
+            shared_down_proj_zero: ignored_lowbit_sidecar(ordinal)?,
         }),
         Qwen36WeightMode::Fp8 => Some(FfnInt4Sidecars {
             group_size: -QWEN36_MOE_FP8_BLOCK_SIZE,

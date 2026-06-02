@@ -2537,6 +2537,10 @@ pub fn attn_step_stage5_metal_native_supported(
         && (eff_cache_pos as usize) < QWEN36_FULL_ATTN_NATIVE_MAX_SCORE_TOKENS
         && weights.kv_max_t > eff_cache_pos
         && int4.group_size == 128
+        && qwen36_lowbit_native_int4(int4.q_proj_type)
+        && qwen36_lowbit_native_int4(int4.k_proj_type)
+        && qwen36_lowbit_native_int4(int4.v_proj_type)
+        && qwen36_lowbit_native_int4(int4.o_proj_type)
         && output_capacity >= params.hidden as usize
         && !crate::metal_native::disabled_by_env()
         && !weights.input_hidden.is_null()
@@ -3248,6 +3252,9 @@ fn qwen36_linear_int4_stage5_metal_native_supported(
         && params.head_v_dim == 128
         && params.conv_kernel_dim == 4
         && int4.group_size == 128
+        && qwen36_lowbit_native_int4(int4.in_proj_qkv_type)
+        && qwen36_lowbit_native_int4(int4.in_proj_z_type)
+        && qwen36_lowbit_native_int4(int4.out_proj_type)
         && output_capacity >= params.hidden as usize
         && !crate::metal_native::disabled_by_env()
         && !weights.input_hidden.is_null()
@@ -4098,6 +4105,9 @@ fn qwen36_ffn_int4_stage5_metal_native_supported(
         && !weights.shared_down_proj_w.is_null()
         && !weights.gate_up_proj_w.is_null()
         && !weights.down_proj_w.is_null()
+        && qwen36_lowbit_native_int4(int4.shared_gate_proj_type)
+        && qwen36_lowbit_native_int4(int4.shared_up_proj_type)
+        && qwen36_lowbit_native_int4(int4.shared_down_proj_type)
         && !int4.shared_gate_proj_scale.is_null()
         && !int4.shared_gate_proj_zero.is_null()
         && !int4.shared_up_proj_scale.is_null()
@@ -4143,6 +4153,9 @@ fn qwen36_ffn_int4_stage5_router_metal_native_supported(
         && !weights.shared_down_proj_w.is_null()
         && !weights.gate_up_proj_w.is_null()
         && !weights.down_proj_w.is_null()
+        && qwen36_lowbit_native_int4(int4.shared_gate_proj_type)
+        && qwen36_lowbit_native_int4(int4.shared_up_proj_type)
+        && qwen36_lowbit_native_int4(int4.shared_down_proj_type)
         && !int4.shared_gate_proj_scale.is_null()
         && !int4.shared_gate_proj_zero.is_null()
         && !int4.shared_up_proj_scale.is_null()
@@ -12167,13 +12180,13 @@ fn qwen36_dense_or_int4_dot_2d_unchecked(
     x: &[f32],
 ) -> f32 {
     let mut acc = 0.0f32;
-    if scale == 0 && zero == 0 {
-        if qwen36_lowbit_ggml_k(qtype) {
-            for col in 0..cols {
-                acc += qwen36_ggml_k_dequant_scalar(weight, qtype, row, col, cols) * x[col];
-            }
-            return acc;
+    if qwen36_lowbit_ggml_k(qtype) {
+        for col in 0..cols {
+            acc += qwen36_ggml_k_dequant_scalar(weight, qtype, row, col, cols) * x[col];
         }
+        return acc;
+    }
+    if scale == 0 && zero == 0 {
         let w = weight as *const u16;
         let row_base = row * cols;
         for col in 0..cols {

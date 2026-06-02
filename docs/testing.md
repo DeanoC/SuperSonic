@@ -138,12 +138,13 @@ python3 -m oracle.bench.external.external_main \
 
 Those JSON cells record the exact command, engine version, workload settings,
 samples, median `ms_per_step`, and derived `tok_per_s`. Raw `--q4km` is not yet
-a SuperSonic Metal row; add it to the benchmark matrix only after the Metal
-dense/shared projection kernels consume raw GGML qtype metadata.
+a SuperSonic headline Metal row; add it to the benchmark matrix only after the
+raw staged path has local correctness and 512-token benchmark evidence recorded.
 
-To inspect a raw Q4_K_M bake before enabling it in SuperSonic, run the manifest
-audit. It reads `manifest.json` and `config.json` only, reports every required
-Qwen3.5/3.6 MoE projection, and exits `2` while current Metal blockers remain:
+To inspect a raw Q4_K_M bake before benchmarking it in SuperSonic, run the
+manifest audit. It reads `manifest.json` and `config.json` only, reports every
+required Qwen3.5/3.6 MoE projection, and exits `2` only for missing tensors or
+unsupported layouts:
 
 ```bash
 cargo run -p runner --bin qwen36_q4km_manifest_audit -- \

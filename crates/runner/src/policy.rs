@@ -33,9 +33,12 @@ pub(crate) fn validate_global_flags(
     {
         anyhow::bail!("--q4km/--q4km-gptq are currently supported only for Qwen models");
     }
-    if cli.q4km && backend != Backend::Cuda {
+    if cli.q4km
+        && !(backend == Backend::Cuda
+            || (backend == Backend::Metal && model_variant.family() == ModelFamily::Qwen36Moe))
+    {
         anyhow::bail!(
-            "--q4km raw GGML blocks are currently supported only on CUDA Qwen paths; use --q4km-gptq on Metal"
+            "--q4km raw GGML blocks are currently supported only on CUDA Qwen paths and Metal Qwen3.5/3.6 MoE"
         );
     }
     if cli.q4km_gptq
@@ -181,16 +184,13 @@ mod tests {
     }
 
     #[test]
-    fn rejects_raw_q4km_for_qwen35_moe_on_metal() {
-        let err = validate_global_flags(
+    fn allows_raw_q4km_for_qwen35_moe_on_metal() {
+        validate_global_flags(
             &cli(&["--q4km"]),
             &ModelVariant::Qwen3_5_35B_A3B,
             Backend::Metal,
         )
-        .expect_err("raw GGML q4km lacks Metal dense projection support")
-        .to_string();
-
-        assert!(err.contains("use --q4km-gptq on Metal"));
+        .expect("Qwen3.5/3.6 MoE Metal can load raw GGML q4km through the staged path");
     }
 }
 
