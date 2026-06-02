@@ -882,15 +882,17 @@ SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" cargo run --re
 The Qwen3.5-35B-A3B Q4_K_M Metal lane is tracked separately from the Qwen3.6
 INT4 gate because it is intended to compare against public llama.cpp and MLX
 M5 Max numbers for the same model/quant target. The current SuperSonic
-checkpoint is a direct single-sequence greedy generation run, empty prompt
-(`""`, tokenized as one prompt token), 512 generated tokens, and no attribution
-or Metal profile pass:
+checkpoint uses the Q4_K_M-sourced GPTQ/native-INT4 bake (`--q4km-gptq`), not
+raw GGML K-blocks (`--q4km`), because the Metal dense projection kernels consume
+native INT4 sidecars. The run is direct single-sequence greedy generation, empty
+prompt (`""`, tokenized as one prompt token), 512 generated tokens, and no
+attribution or Metal profile pass:
 
 ```bash
 target/release/supersonic --backend metal \
   --model qwen3.5-35b-a3b \
   --model-dir "$HOME/.cache/supersonic-metal-models/qwen3.5-35b-a3b" \
-  --q4km \
+  --q4km-gptq \
   --prompt "" \
   --context-size 1024 \
   --max-new-tokens 512 \

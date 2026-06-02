@@ -156,7 +156,7 @@ fn apply_preset(cli: &mut Cli) {
         Some(PerfPreset::Qwen35Q4kmM5MaxGen512) => {
             cli.arch = "apple-m5-max".into();
             cli.models = "qwen3.5-35b-a3b".into();
-            cli.quants = "q4km".into();
+            cli.quants = "q4km-gptq".into();
             cli.prompt.clear();
             cli.max_new_tokens = 512;
             cli.context_size = Some(1024);
@@ -206,7 +206,7 @@ mod tests {
 
         assert_eq!(cli.arch, "apple-m5-max");
         assert_eq!(cli.models, "qwen3.5-35b-a3b");
-        assert_eq!(cli.quants, "q4km");
+        assert_eq!(cli.quants, "q4km-gptq");
         assert_eq!(cli.prompt, "");
         assert_eq!(cli.max_new_tokens, 512);
         assert_eq!(cli.context_size, Some(1024));

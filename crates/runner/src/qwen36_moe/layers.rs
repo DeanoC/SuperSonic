@@ -147,6 +147,24 @@ fn ggml_lowbit_type_for_layout(store: &BakedStore, name: &str) -> Result<i32> {
     }
 }
 
+fn ensure_q4km_native_sidecars(store: &BakedStore, names: &[String]) -> Result<()> {
+    for name in names {
+        if !matches!(
+            store_layout_qwen36(store, name),
+            Some(LayoutTag::GgmlQ4K | LayoutTag::GgmlQ5K | LayoutTag::GgmlQ6K)
+        ) {
+            continue;
+        }
+        let scale_name = format!("{name}_int4_scale");
+        if !store_contains_qwen36(store, &scale_name) {
+            return Err(anyhow!(
+                "{name}: raw GGML q4km dense projection lacks native INT4 sidecars; use --q4km-gptq for this runtime"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Build one layer's worth of GPU-resident weight + state buffers from a
 /// BakedStore. Decides full-attn vs linear-attn by consulting the config's
 /// `layer_types` (every 4th layer is full per the standard hybrid pattern).
@@ -187,6 +205,17 @@ pub(crate) fn load_layer_buffers(
 
     let attn = if text_config.is_full_attention(layer_idx) {
         let fa = format!("{lp}.self_attn");
+        if weight_mode == Qwen36WeightMode::Q4Km {
+            ensure_q4km_native_sidecars(
+                store,
+                &[
+                    format!("{fa}.q_proj.weight"),
+                    format!("{fa}.k_proj.weight"),
+                    format!("{fa}.v_proj.weight"),
+                    format!("{fa}.o_proj.weight"),
+                ],
+            )?;
+        }
         let int4 = match weight_mode {
             Qwen36WeightMode::Int4 | Qwen36WeightMode::Q4Km => Some(FullAttnInt4Sidecars {
                 group_size: QWEN36_MOE_INT4_GROUP_SIZE,
@@ -395,6 +424,16 @@ pub(crate) fn load_layer_buffers(
         let recurrent_state = GpuBuffer::zeros(ordinal, ScalarType::F32, &[state_elems])
             .with_context(|| format!("alloc recurrent_state (layer {layer_idx})"))?;
 
+        if weight_mode == Qwen36WeightMode::Q4Km {
+            ensure_q4km_native_sidecars(
+                store,
+                &[
+                    format!("{la}.in_proj_qkv.weight"),
+                    format!("{la}.in_proj_z.weight"),
+                    format!("{la}.out_proj.weight"),
+                ],
+            )?;
+        }
         let int4 = match weight_mode {
             Qwen36WeightMode::Int4 | Qwen36WeightMode::Q4Km => Some(LinearAttnInt4Sidecars {
                 group_size: QWEN36_MOE_INT4_GROUP_SIZE,
@@ -478,6 +517,16 @@ pub(crate) fn load_layer_buffers(
     let mp = format!("{lp}.mlp");
     // Fused-expert sidecars use `_int4_scale`/`_int4_zero` (no `.weight`).
     // Shared-expert MLPs use the dense `<name>.weight_int4_scale` form.
+    if weight_mode == Qwen36WeightMode::Q4Km {
+        ensure_q4km_native_sidecars(
+            store,
+            &[
+                format!("{mp}.shared_expert.gate_proj.weight"),
+                format!("{mp}.shared_expert.up_proj.weight"),
+                format!("{mp}.shared_expert.down_proj.weight"),
+            ],
+        )?;
+    }
     let ffn_int4 = match weight_mode {
         Qwen36WeightMode::Int4 => Some(FfnInt4Sidecars {
             group_size: QWEN36_MOE_INT4_GROUP_SIZE,

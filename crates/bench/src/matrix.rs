@@ -258,11 +258,12 @@ pub static SUPPORTED_COMBOS: &[ComboDescriptor] = &[
         arch: BenchArch::AppleM5Max,
         min_vram_gib: 21.0,
     },
-    // Public M5 Max comparison target: Qwen3.5-35B-A3B with raw GGML Q4_K_M
-    // blocks sourced from the public GGUF bake.
+    // Public M5 Max comparison target: Qwen3.5-35B-A3B with Q4_K_M-sourced
+    // GPTQ sidecars, because Metal dense projection kernels consume native
+    // INT4 sidecars rather than raw GGML K-blocks.
     ComboDescriptor {
         model: "qwen3.5-35b-a3b",
-        quant: "q4km",
+        quant: "q4km-gptq",
         arch: BenchArch::AppleM5Max,
         min_vram_gib: 21.0,
     },
