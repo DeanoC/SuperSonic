@@ -1119,6 +1119,20 @@ unsafe tiled/SIMD experiments:
   stream; it is opt-in only behind
   `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_STAGE5_EXACT_MULTIROW=1`.
 
+The 2026-06-02 raw `--q4km` parity/perf pass rechecked the existing down
+pair-dot switch on the mixed-layout raw bake. With
+`SUPERSONIC_METAL_ENABLE_QWEN36_FFN_Q4K_PAIR_DOWN=1`, the 8-token deterministic
+smoke preserved the known generated IDs, but the 128-token gate diverged near
+the end of the stream. Same-session 128-token profiles also did not show a
+stable win: the flagged run measured `100.5 ms/token` with `ffn=74.8 ms/token`,
+while the following default control measured `96.8 ms/token` with
+`ffn=72.6 ms/token`. Keep down pair-dot opt-in. The built-in split profiler
+(`SUPERSONIC_METAL_PROFILE_QWEN36_FFN_PHASES=1`) still slows the run enough to
+confirm FFN dominance but does not emit a stdout subphase table in this capture
+path; the next useful instrumentation change is a compact router/shared/routed
+FFN subphase summary that can be compared across 128-token gates without Metal
+trace tooling.
+
 The current gap is therefore not a one-line launch-count fix; the Metal profile
 still points at the chained per-layer decode structure and command-buffer waits.
 A naive experiment that coalesced phase command buffers reduced command-buffer
