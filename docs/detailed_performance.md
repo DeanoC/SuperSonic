@@ -887,7 +887,7 @@ raw GGML K-blocks (`--q4km`), because the Metal dense projection kernels consume
 native INT4 sidecars. The external adapter harness now records llama.cpp from a
 raw GGUF Q4_K_M file and MLX from a matching MLX model directory. Raw `--q4km`
 should become a SuperSonic matrix row only after the Metal full-attention,
-linear-attention, shared-expert, and lm-head projection descriptors carry raw
+linear-attention, shared-expert, and lm-head projection kernels consume raw
 GGML qtype metadata. The SuperSonic control run is direct single-sequence greedy
 generation, empty prompt (`""`, tokenized as one prompt token), 512 generated
 tokens, and no attribution or Metal profile pass:
@@ -964,8 +964,8 @@ cargo run -p runner --bin qwen36_q4km_manifest_audit -- \
 
 The current audit model intentionally treats routed expert raw GGML K-blocks as
 supported and dense/full-attention, linear-attention, shared-expert, and lm-head
-raw GGML K-blocks as blockers until those descriptors carry per-projection raw
-qtype metadata.
+raw GGML K-blocks as blockers until the Metal loader/kernels consume the
+per-projection raw qtype metadata.
 
 Short smoke runs are too noisy for headline comparison: 16-token samples ranged
 from ~125 to ~201 ms/token depending on command-buffer scheduling and warm

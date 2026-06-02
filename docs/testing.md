@@ -139,7 +139,7 @@ python3 -m oracle.bench.external.external_main \
 Those JSON cells record the exact command, engine version, workload settings,
 samples, median `ms_per_step`, and derived `tok_per_s`. Raw `--q4km` is not yet
 a SuperSonic Metal row; add it to the benchmark matrix only after the Metal
-dense/shared projection kernels carry raw GGML qtype metadata.
+dense/shared projection kernels consume raw GGML qtype metadata.
 
 To inspect a raw Q4_K_M bake before enabling it in SuperSonic, run the manifest
 audit. It reads `manifest.json` and `config.json` only, reports every required

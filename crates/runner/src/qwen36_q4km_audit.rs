@@ -240,7 +240,7 @@ fn support_for(
         (_, Qwen36Q4KmProjectionStatus::RawGgmlKBlock) => (
             false,
             Some(format!(
-                "{name}: raw GGML K-block projection needs per-projection qtype metadata and Metal kernel support"
+                "{name}: raw GGML K-block projection needs Metal loader/kernel support that consumes per-projection qtype metadata"
             )),
         ),
     }
