@@ -999,6 +999,14 @@ That smoke generated token id `[49602]` and measured `2478.3 ms/token`
 staged raw GGML expert path is correctness-oriented and far slower than the
 `--q4km-gptq` control lane.
 
+The follow-up 8-token deterministic gate used the same prompt, context, greedy
+sampling, and seed without `--emit-stage-timings`. Two consecutive runs produced
+identical generated IDs
+`[49602, 165189, 184475, 145239, 31375, 47477, 11625, 58985]` and measured
+`373.7 ms/token` then `379.0 ms/token`. This confirms repeatable short raw
+decode on the mixed-layout bake; it is still a staged correctness gate, not a
+headline performance result.
+
 Short smoke runs are too noisy for headline comparison: 16-token samples ranged
 from ~125 to ~201 ms/token depending on command-buffer scheduling and warm
 state, while longer runs settle much lower. The 2026-06-01 FFN Q4_K lane-pair
