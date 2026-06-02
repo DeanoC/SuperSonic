@@ -2842,6 +2842,7 @@ fn attn_step_stage1_5_metal_host(
         });
 
     qwen36_validate_dense_or_int4_sidecars(
+        int4.q_proj_type,
         int4.q_proj_scale,
         int4.q_proj_zero,
         int4.group_size,
@@ -2849,12 +2850,14 @@ fn attn_step_stage1_5_metal_host(
     )?;
     if params.stage >= 2 {
         qwen36_validate_dense_or_int4_sidecars(
+            int4.k_proj_type,
             int4.k_proj_scale,
             int4.k_proj_zero,
             int4.group_size,
             "k_proj",
         )?;
         qwen36_validate_dense_or_int4_sidecars(
+            int4.v_proj_type,
             int4.v_proj_scale,
             int4.v_proj_zero,
             int4.group_size,
@@ -2863,6 +2866,7 @@ fn attn_step_stage1_5_metal_host(
     }
     if params.stage >= 5 {
         qwen36_validate_dense_or_int4_sidecars(
+            int4.o_proj_type,
             int4.o_proj_scale,
             int4.o_proj_zero,
             int4.group_size,
@@ -2874,13 +2878,14 @@ fn attn_step_stage1_5_metal_host(
         let q_w = weights.q_proj_w as usize;
         let q_scale = int4.q_proj_scale as usize;
         let q_zero = int4.q_proj_zero as usize;
+        let q_type = int4.q_proj_type;
         let group_size = int4.group_size.max(0) as usize;
         let q_raw = &mut workspace[off_q_raw..off_q_raw + q_out_dim];
         qwen36_parallel_chunks_mut(q_raw, 64, |start, chunk| {
             for (local, out) in chunk.iter_mut().enumerate() {
                 let row = start + local;
                 let acc = qwen36_dense_or_int4_dot_2d_unchecked(
-                    q_w, q_scale, q_zero, row, hidden, group_size, &x_norm,
+                    q_w, q_scale, q_zero, q_type, row, hidden, group_size, &x_norm,
                 );
                 *out = bf16_round_f32(acc);
             }
@@ -2920,18 +2925,20 @@ fn attn_step_stage1_5_metal_host(
         let k_w = weights.k_proj_w as usize;
         let k_scale = int4.k_proj_scale as usize;
         let k_zero = int4.k_proj_zero as usize;
+        let k_type = int4.k_proj_type;
         let v_w = weights.v_proj_w as usize;
         let v_scale = int4.v_proj_scale as usize;
         let v_zero = int4.v_proj_zero as usize;
+        let v_type = int4.v_proj_type;
         let group_size = int4.group_size.max(0) as usize;
         qwen36_parallel_chunks2_mut(k_raw, v_raw, 64, |start, k_chunk, v_chunk| {
             for (local, (k_out, v_out)) in k_chunk.iter_mut().zip(v_chunk.iter_mut()).enumerate() {
                 let row = start + local;
                 let k_acc = qwen36_dense_or_int4_dot_2d_unchecked(
-                    k_w, k_scale, k_zero, row, hidden, group_size, &x_norm,
+                    k_w, k_scale, k_zero, k_type, row, hidden, group_size, &x_norm,
                 );
                 let v_acc = qwen36_dense_or_int4_dot_2d_unchecked(
-                    v_w, v_scale, v_zero, row, hidden, group_size, &x_norm,
+                    v_w, v_scale, v_zero, v_type, row, hidden, group_size, &x_norm,
                 );
                 *k_out = bf16_round_f32(k_acc);
                 *v_out = bf16_round_f32(v_acc);
@@ -3108,6 +3115,7 @@ fn attn_step_stage1_5_metal_host(
         let o_w = weights.o_proj_w as usize;
         let o_scale = int4.o_proj_scale as usize;
         let o_zero = int4.o_proj_zero as usize;
+        let o_type = int4.o_proj_type;
         let group_size = int4.group_size.max(0) as usize;
         let o_out = &mut workspace[off_o_out..off_o_out + hidden];
         let publish_o_proj = |start: usize, out_chunk: &mut [f32], pub_chunk: &mut [u16]| {
@@ -3119,6 +3127,7 @@ fn attn_step_stage1_5_metal_host(
                     o_w,
                     o_scale,
                     o_zero,
+                    o_type,
                     row,
                     q_normed_dim,
                     group_size,
@@ -3557,12 +3566,14 @@ fn linear_step_stage1_5_metal_host(
     }
 
     qwen36_validate_dense_or_int4_sidecars(
+        int4.in_proj_qkv_type,
         int4.in_proj_qkv_scale,
         int4.in_proj_qkv_zero,
         int4.group_size,
         "in_proj_qkv",
     )?;
     qwen36_validate_dense_or_int4_sidecars(
+        int4.in_proj_z_type,
         int4.in_proj_z_scale,
         int4.in_proj_z_zero,
         int4.group_size,
@@ -3570,6 +3581,7 @@ fn linear_step_stage1_5_metal_host(
     )?;
     if params.stage >= 5 {
         qwen36_validate_dense_or_int4_sidecars(
+            int4.out_proj_type,
             int4.out_proj_scale,
             int4.out_proj_zero,
             int4.group_size,
@@ -3661,13 +3673,14 @@ fn linear_step_stage1_5_metal_host(
         let qkv_w = weights.in_proj_qkv_w as usize;
         let qkv_scale = int4.in_proj_qkv_scale as usize;
         let qkv_zero = int4.in_proj_qkv_zero as usize;
+        let qkv_type = int4.in_proj_qkv_type;
         let group_size = int4.group_size.max(0) as usize;
         let qkv = &mut workspace[off_qkv_raw..off_qkv_raw + qkv_dim];
         qwen36_parallel_chunks_mut(qkv, 64, |start, chunk| {
             for (local, out) in chunk.iter_mut().enumerate() {
                 let row = start + local;
                 let acc = qwen36_dense_or_int4_dot_2d_unchecked(
-                    qkv_w, qkv_scale, qkv_zero, row, hidden, group_size, &x_norm,
+                    qkv_w, qkv_scale, qkv_zero, qkv_type, row, hidden, group_size, &x_norm,
                 );
                 *out = bf16_round_f32(acc);
             }
@@ -3683,13 +3696,14 @@ fn linear_step_stage1_5_metal_host(
         let z_w = weights.in_proj_z_w as usize;
         let z_scale = int4.in_proj_z_scale as usize;
         let z_zero = int4.in_proj_z_zero as usize;
+        let z_type = int4.in_proj_z_type;
         let group_size = int4.group_size.max(0) as usize;
         let z = &mut workspace[off_z_raw..off_z_raw + val_dim];
         qwen36_parallel_chunks_mut(z, 64, |start, chunk| {
             for (local, out) in chunk.iter_mut().enumerate() {
                 let row = start + local;
                 let acc = qwen36_dense_or_int4_dot_2d_unchecked(
-                    z_w, z_scale, z_zero, row, hidden, group_size, &x_norm,
+                    z_w, z_scale, z_zero, z_type, row, hidden, group_size, &x_norm,
                 );
                 *out = bf16_round_f32(acc);
             }
@@ -3908,12 +3922,13 @@ fn linear_step_stage1_5_metal_host(
         let out_w = weights.out_proj_w as usize;
         let out_scale = int4.out_proj_scale as usize;
         let out_zero = int4.out_proj_zero as usize;
+        let out_type = int4.out_proj_type;
         let group_size = int4.group_size.max(0) as usize;
         qwen36_parallel_chunks_mut(&mut output[..hidden], 64, |start, chunk| {
             for (local, out) in chunk.iter_mut().enumerate() {
                 let row = start + local;
                 let acc = qwen36_dense_or_int4_dot_2d_unchecked(
-                    out_w, out_scale, out_zero, row, val_dim, group_size, rec_out,
+                    out_w, out_scale, out_zero, out_type, row, val_dim, group_size, rec_out,
                 );
                 let o_out = bf16_round_f32(acc);
                 let residual = bf16_round_f32(bf16_bits_to_f32(input[row]) + o_out);
@@ -4030,6 +4045,30 @@ fn qwen36_lowbit_has_required_sidecars(
     zero: *const c_void,
 ) -> bool {
     qwen36_lowbit_ggml_k(qtype) || (!scale.is_null() && !zero.is_null())
+}
+
+fn qwen36_validate_dense_or_lowbit_sidecars(
+    qtype: i32,
+    scale: *const c_void,
+    zero: *const c_void,
+    group_size: i32,
+    label: &str,
+) -> Result<(), GpuError> {
+    if qtype == 0 && scale.is_null() && zero.is_null() {
+        return Ok(());
+    }
+    if !qwen36_lowbit_supported(qtype) {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe: unsupported lowbit qtype {qtype} for {label}"
+        )));
+    }
+    if !qwen36_lowbit_has_required_sidecars(qtype, scale, zero) || group_size <= 0 {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe: Metal lowbit fallback requires raw GGML K-blocks \
+             or paired scale/zero pointers with positive group_size for {label}"
+        )));
+    }
+    Ok(())
 }
 
 fn qwen36_stage5_env_or_raw_ggml(env_name: &str, int4: &Qwen36MoeFfnStepInt4) -> bool {
@@ -4394,12 +4433,15 @@ fn qwen36_compute_ffn_shared_reference(
     h_norm: &[f32],
     shared_expert_gate_w: &[u16],
     shared_gate_w: usize,
+    shared_gate_type: i32,
     shared_gate_scale: usize,
     shared_gate_zero: usize,
     shared_up_w: usize,
+    shared_up_type: i32,
     shared_up_scale: usize,
     shared_up_zero: usize,
     shared_down_w: usize,
+    shared_down_type: i32,
     shared_down_scale: usize,
     shared_down_zero: usize,
     hidden: usize,
@@ -4413,6 +4455,7 @@ fn qwen36_compute_ffn_shared_reference(
             shared_gate_w,
             shared_gate_scale,
             shared_gate_zero,
+            shared_gate_type,
             row,
             hidden,
             group_size,
@@ -4422,6 +4465,7 @@ fn qwen36_compute_ffn_shared_reference(
             shared_up_w,
             shared_up_scale,
             shared_up_zero,
+            shared_up_type,
             row,
             hidden,
             group_size,
@@ -4449,6 +4493,7 @@ fn qwen36_compute_ffn_shared_reference(
             shared_down_w,
             shared_down_scale,
             shared_down_zero,
+            shared_down_type,
             row,
             shared_intermediate,
             group_size,
@@ -4469,6 +4514,7 @@ fn qwen36_compute_ffn_shared_reference(
 #[allow(clippy::too_many_arguments)]
 fn qwen36_shared_down_row_probe(
     shared_down_w: usize,
+    shared_down_type: i32,
     shared_down_scale: usize,
     shared_down_zero: usize,
     row: usize,
@@ -4481,6 +4527,7 @@ fn qwen36_shared_down_row_probe(
         shared_down_w,
         shared_down_scale,
         shared_down_zero,
+        shared_down_type,
         row,
         shared_intermediate,
         group_size,
@@ -4877,6 +4924,7 @@ fn qwen36_emit_ffn_shared_stage5_parity_tap(
         host_shared_out_recomputed_at_argmax,
     ) = qwen36_shared_down_row_probe(
         shared_down_w,
+        int4.shared_down_proj_type,
         shared_down_scale,
         shared_down_zero,
         shared_out_argmax,
@@ -4891,6 +4939,7 @@ fn qwen36_emit_ffn_shared_stage5_parity_tap(
         metal_mid_host_shared_out_at_argmax,
     ) = qwen36_shared_down_row_probe(
         shared_down_w,
+        int4.shared_down_proj_type,
         shared_down_scale,
         shared_down_zero,
         shared_out_argmax,
@@ -5110,6 +5159,7 @@ fn qwen36_apply_ffn_shared_mid_stage5_host_correction(
         let metal_shared = workspace[off_shared_out + row];
         let (_, _, corrected_shared) = qwen36_shared_down_row_probe(
             weights.shared_down_proj_w as usize,
+            int4.shared_down_proj_type,
             int4.shared_down_proj_scale as usize,
             int4.shared_down_proj_zero as usize,
             row,
@@ -6390,12 +6440,15 @@ pub fn emit_decode_batch_shared_stage5_parity_tap_from_host(
         &router_reference.h_norm,
         shared_expert_gate_w,
         weights.shared_gate_proj_w as usize,
+        int4.shared_gate_proj_type,
         int4.shared_gate_proj_scale as usize,
         int4.shared_gate_proj_zero as usize,
         weights.shared_up_proj_w as usize,
+        int4.shared_up_proj_type,
         int4.shared_up_proj_scale as usize,
         int4.shared_up_proj_zero as usize,
         weights.shared_down_proj_w as usize,
+        int4.shared_down_proj_type,
         int4.shared_down_proj_scale as usize,
         int4.shared_down_proj_zero as usize,
         hidden,
@@ -6464,6 +6517,7 @@ pub fn emit_decode_batch_shared_stage5_parity_tap_from_host(
         host_shared_out_recomputed_at_argmax,
     ) = qwen36_shared_down_row_probe(
         shared_down_w,
+        int4.shared_down_proj_type,
         shared_down_scale,
         shared_down_zero,
         shared_out_argmax,
@@ -6478,6 +6532,7 @@ pub fn emit_decode_batch_shared_stage5_parity_tap_from_host(
         metal_mid_host_shared_out_at_argmax,
     ) = qwen36_shared_down_row_probe(
         shared_down_w,
+        int4.shared_down_proj_type,
         shared_down_scale,
         shared_down_zero,
         shared_out_argmax,
@@ -6626,12 +6681,15 @@ pub fn emit_decode_batch_routed_stage5_parity_tap_from_host(
         &router_reference.h_norm,
         shared_expert_gate_w,
         weights.shared_gate_proj_w as usize,
+        int4.shared_gate_proj_type,
         int4.shared_gate_proj_scale as usize,
         int4.shared_gate_proj_zero as usize,
         weights.shared_up_proj_w as usize,
+        int4.shared_up_proj_type,
         int4.shared_up_proj_scale as usize,
         int4.shared_up_proj_zero as usize,
         weights.shared_down_proj_w as usize,
+        int4.shared_down_proj_type,
         int4.shared_down_proj_scale as usize,
         int4.shared_down_proj_zero as usize,
         hidden,
@@ -9962,30 +10020,35 @@ fn ffn_step_stage1_5_metal_host(
 
     if qwen36_ffn_int4_stage5_router_metal_native_supported(params, weights, int4) {
         qwen36_validate_dense_or_int4_sidecars(
+            int4.shared_gate_proj_type,
             int4.shared_gate_proj_scale,
             int4.shared_gate_proj_zero,
             int4.group_size,
             "shared_gate_proj",
         )?;
         qwen36_validate_dense_or_int4_sidecars(
+            int4.shared_up_proj_type,
             int4.shared_up_proj_scale,
             int4.shared_up_proj_zero,
             int4.group_size,
             "shared_up_proj",
         )?;
         qwen36_validate_dense_or_int4_sidecars(
+            int4.shared_down_proj_type,
             int4.shared_down_proj_scale,
             int4.shared_down_proj_zero,
             int4.group_size,
             "shared_down_proj",
         )?;
         qwen36_validate_dense_or_int4_sidecars(
+            int4.gate_up_proj_type,
             int4.gate_up_proj_scale,
             int4.gate_up_proj_zero,
             int4.group_size,
             "gate_up_proj",
         )?;
         qwen36_validate_dense_or_int4_sidecars(
+            int4.down_proj_type,
             int4.down_proj_scale,
             int4.down_proj_zero,
             int4.group_size,
@@ -10067,12 +10130,15 @@ fn ffn_step_stage1_5_metal_host(
                 &reference.h_norm,
                 shared_expert_gate_w,
                 weights.shared_gate_proj_w as usize,
+                int4.shared_gate_proj_type,
                 int4.shared_gate_proj_scale as usize,
                 int4.shared_gate_proj_zero as usize,
                 weights.shared_up_proj_w as usize,
+                int4.shared_up_proj_type,
                 int4.shared_up_proj_scale as usize,
                 int4.shared_up_proj_zero as usize,
                 weights.shared_down_proj_w as usize,
+                int4.shared_down_proj_type,
                 int4.shared_down_proj_scale as usize,
                 int4.shared_down_proj_zero as usize,
                 hidden,
@@ -10495,30 +10561,35 @@ fn ffn_step_stage1_5_metal_host(
     let shared_expert_gate_w =
         unsafe { std::slice::from_raw_parts(weights.shared_expert_gate_w as *const u16, hidden) };
     qwen36_validate_dense_or_int4_sidecars(
+        int4.shared_gate_proj_type,
         int4.shared_gate_proj_scale,
         int4.shared_gate_proj_zero,
         int4.group_size,
         "shared_gate_proj",
     )?;
     qwen36_validate_dense_or_int4_sidecars(
+        int4.shared_up_proj_type,
         int4.shared_up_proj_scale,
         int4.shared_up_proj_zero,
         int4.group_size,
         "shared_up_proj",
     )?;
     qwen36_validate_dense_or_int4_sidecars(
+        int4.shared_down_proj_type,
         int4.shared_down_proj_scale,
         int4.shared_down_proj_zero,
         int4.group_size,
         "shared_down_proj",
     )?;
     qwen36_validate_dense_or_int4_sidecars(
+        int4.gate_up_proj_type,
         int4.gate_up_proj_scale,
         int4.gate_up_proj_zero,
         int4.group_size,
         "gate_up_proj",
     )?;
     qwen36_validate_dense_or_int4_sidecars(
+        int4.down_proj_type,
         int4.down_proj_scale,
         int4.down_proj_zero,
         int4.group_size,
@@ -10569,26 +10640,36 @@ fn ffn_step_stage1_5_metal_host(
         let (sgp, after_sup) = after_sgp.split_at_mut(shared_intermediate);
         let (sup, _) = after_sup.split_at_mut(shared_intermediate);
         let shared_gate_w = weights.shared_gate_proj_w as usize;
+        let shared_gate_type = int4.shared_gate_proj_type;
         let shared_gate_scale = int4.shared_gate_proj_scale as usize;
         let shared_gate_zero = int4.shared_gate_proj_zero as usize;
         let shared_up_w = weights.shared_up_proj_w as usize;
+        let shared_up_type = int4.shared_up_proj_type;
         let shared_up_scale = int4.shared_up_proj_scale as usize;
         let shared_up_zero = int4.shared_up_proj_zero as usize;
         let group_size = int4.group_size.max(0) as usize;
-        let shared_gate_luts = qwen36_build_dense_int4_dequant_luts(
-            shared_gate_scale,
-            shared_gate_zero,
-            shared_intermediate,
-            hidden,
-            group_size,
-        );
-        let shared_up_luts = qwen36_build_dense_int4_dequant_luts(
-            shared_up_scale,
-            shared_up_zero,
-            shared_intermediate,
-            hidden,
-            group_size,
-        );
+        let shared_gate_luts = if qwen36_lowbit_native_int4(shared_gate_type) {
+            qwen36_build_dense_int4_dequant_luts(
+                shared_gate_scale,
+                shared_gate_zero,
+                shared_intermediate,
+                hidden,
+                group_size,
+            )
+        } else {
+            None
+        };
+        let shared_up_luts = if qwen36_lowbit_native_int4(shared_up_type) {
+            qwen36_build_dense_int4_dequant_luts(
+                shared_up_scale,
+                shared_up_zero,
+                shared_intermediate,
+                hidden,
+                group_size,
+            )
+        } else {
+            None
+        };
         qwen36_parallel_chunks2_mut(sgp, sup, 64, |start, gate_chunk, up_chunk| {
             for (local, (gate_out, up_out)) in
                 gate_chunk.iter_mut().zip(up_chunk.iter_mut()).enumerate()
@@ -10608,6 +10689,7 @@ fn ffn_step_stage1_5_metal_host(
                         shared_gate_w,
                         shared_gate_scale,
                         shared_gate_zero,
+                        shared_gate_type,
                         row,
                         hidden,
                         group_size,
@@ -10628,6 +10710,7 @@ fn ffn_step_stage1_5_metal_host(
                         shared_up_w,
                         shared_up_scale,
                         shared_up_zero,
+                        shared_up_type,
                         row,
                         hidden,
                         group_size,
@@ -10656,16 +10739,21 @@ fn ffn_step_stage1_5_metal_host(
     let shared_mid = workspace[off_shared_mid..off_shared_mid + shared_intermediate].to_vec();
     crate::prefill_ffi::metal_profile_time("qwen36_ffn_host_shared_down", "host", || {
         let shared_down_w = weights.shared_down_proj_w as usize;
+        let shared_down_type = int4.shared_down_proj_type;
         let shared_down_scale = int4.shared_down_proj_scale as usize;
         let shared_down_zero = int4.shared_down_proj_zero as usize;
         let group_size = int4.group_size.max(0) as usize;
-        let shared_down_luts = qwen36_build_dense_int4_dequant_luts(
-            shared_down_scale,
-            shared_down_zero,
-            hidden,
-            shared_intermediate,
-            group_size,
-        );
+        let shared_down_luts = if qwen36_lowbit_native_int4(shared_down_type) {
+            qwen36_build_dense_int4_dequant_luts(
+                shared_down_scale,
+                shared_down_zero,
+                hidden,
+                shared_intermediate,
+                group_size,
+            )
+        } else {
+            None
+        };
         let shared_out = &mut workspace[off_shared_out..off_shared_out + hidden];
         qwen36_parallel_chunks_mut(shared_out, 64, |start, chunk| {
             for (local, out) in chunk.iter_mut().enumerate() {
@@ -10684,6 +10772,7 @@ fn ffn_step_stage1_5_metal_host(
                         shared_down_w,
                         shared_down_scale,
                         shared_down_zero,
+                        shared_down_type,
                         row,
                         shared_intermediate,
                         group_size,
@@ -11514,9 +11603,142 @@ fn bf16_bits_to_f32(bits: u16) -> f32 {
     f32::from_bits((bits as u32) << 16)
 }
 
+fn f16_bits_to_f32(bits: u16) -> f32 {
+    half::f16::from_bits(bits).to_f32()
+}
+
 fn qwen36_int4_group_dequant_lut(scale: f32, zero: f32) -> [f32; 16] {
     let zs = zero * scale;
     std::array::from_fn(|q| bf16_round_f32(q as f32 * scale - zs))
+}
+
+fn qwen36_ggml_k_row_bytes(qtype: i32, cols: usize) -> usize {
+    let blocks = cols / 256;
+    match qtype {
+        12 => blocks * 144,
+        13 => blocks * 176,
+        14 => blocks * 210,
+        _ => cols.div_ceil(2),
+    }
+}
+
+fn qwen36_ggml_q4_k_scale_min(j: usize, q: *const u8) -> (i32, i32) {
+    unsafe {
+        if j < 4 {
+            ((*q.add(j) & 63) as i32, (*q.add(j + 4) & 63) as i32)
+        } else {
+            (
+                ((*q.add(j + 4) & 0x0f) | ((*q.add(j - 4) >> 6) << 4)) as i32,
+                (((*q.add(j + 4) >> 4) | ((*q.add(j) >> 6) << 4)) & 63) as i32,
+            )
+        }
+    }
+}
+
+fn qwen36_read_f16_unaligned(p: *const u8) -> f32 {
+    let bits = unsafe { (*p as u16) | ((*p.add(1) as u16) << 8) };
+    f16_bits_to_f32(bits)
+}
+
+fn qwen36_ggml_k_dequant_scalar(
+    data: usize,
+    qtype: i32,
+    row: usize,
+    col: usize,
+    cols: usize,
+) -> f32 {
+    let block = col / 256;
+    let inb = col - block * 256;
+    let row_bytes = qwen36_ggml_k_row_bytes(qtype, cols);
+    let b = unsafe { (data as *const u8).add(row * row_bytes) };
+    match qtype {
+        12 => {
+            let b = unsafe { b.add(block * 144) };
+            let d = qwen36_read_f16_unaligned(b);
+            let dmin = unsafe { qwen36_read_f16_unaligned(b.add(2)) };
+            let sc = unsafe { b.add(4) };
+            let qs = unsafe { b.add(16) };
+            let g = inb / 64;
+            let sub = (inb % 64) / 32;
+            let j = 2 * g + sub;
+            let (scale, minv) = qwen36_ggml_q4_k_scale_min(j, sc);
+            let qbyte = unsafe { *qs.add(g * 32 + (inb % 32)) };
+            let q = if sub != 0 {
+                ((qbyte >> 4) & 0x0f) as i32
+            } else {
+                (qbyte & 0x0f) as i32
+            };
+            d * scale as f32 * q as f32 - dmin * minv as f32
+        }
+        13 => {
+            let b = unsafe { b.add(block * 176) };
+            let d = qwen36_read_f16_unaligned(b);
+            let dmin = unsafe { qwen36_read_f16_unaligned(b.add(2)) };
+            let sc = unsafe { b.add(4) };
+            let qh = unsafe { b.add(16) };
+            let ql = unsafe { b.add(48) };
+            let g = inb / 64;
+            let sub = (inb % 64) / 32;
+            let j = 2 * g + sub;
+            let (scale, minv) = qwen36_ggml_q4_k_scale_min(j, sc);
+            let idx = inb % 32;
+            let qbyte = unsafe { *ql.add(g * 32 + idx) };
+            let lo = if sub != 0 {
+                ((qbyte >> 4) & 0x0f) as i32
+            } else {
+                (qbyte & 0x0f) as i32
+            };
+            let high_mask = if sub != 0 {
+                2u8 << (2 * g)
+            } else {
+                1u8 << (2 * g)
+            };
+            let hi = if unsafe { *qh.add(idx) } & high_mask != 0 {
+                16
+            } else {
+                0
+            };
+            d * scale as f32 * (lo + hi) as f32 - dmin * minv as f32
+        }
+        14 => {
+            let b = unsafe { b.add(block * 210) };
+            let ql = b;
+            let qh = unsafe { b.add(128) };
+            let sc = unsafe { b.add(192) as *const i8 };
+            let d = unsafe { qwen36_read_f16_unaligned(b.add(208)) };
+            let half_idx = inb / 128;
+            let pos = inb - half_idx * 128;
+            let idx = pos % 32;
+            let qh_byte = unsafe { *qh.add(half_idx * 32 + idx) };
+            let (q, scale_idx) = if pos < 32 {
+                (
+                    (unsafe { *ql.add(half_idx * 64 + idx) } & 0x0f) as i32
+                        | (((qh_byte >> 0) & 3) as i32) << 4,
+                    half_idx * 8 + idx / 16,
+                )
+            } else if pos < 64 {
+                (
+                    (unsafe { *ql.add(half_idx * 64 + 32 + idx) } & 0x0f) as i32
+                        | (((qh_byte >> 2) & 3) as i32) << 4,
+                    half_idx * 8 + idx / 16 + 2,
+                )
+            } else if pos < 96 {
+                (
+                    ((unsafe { *ql.add(half_idx * 64 + idx) } >> 4) & 0x0f) as i32
+                        | (((qh_byte >> 4) & 3) as i32) << 4,
+                    half_idx * 8 + idx / 16 + 4,
+                )
+            } else {
+                (
+                    ((unsafe { *ql.add(half_idx * 64 + 32 + idx) } >> 4) & 0x0f) as i32
+                        | (((qh_byte >> 6) & 3) as i32) << 4,
+                    half_idx * 8 + idx / 16 + 6,
+                )
+            };
+            d * unsafe { *sc.add(scale_idx) } as f32 * (q - 32) as f32
+        }
+        _ => 0.0,
+    }
 }
 
 #[inline(always)]
@@ -11925,27 +12147,20 @@ where
 }
 
 fn qwen36_validate_dense_or_int4_sidecars(
+    qtype: i32,
     scale: *const c_void,
     zero: *const c_void,
     group_size: i32,
     label: &str,
 ) -> Result<(), GpuError> {
-    if scale.is_null() && zero.is_null() {
-        return Ok(());
-    }
-    if scale.is_null() || zero.is_null() || group_size <= 0 {
-        return Err(GpuError::InvalidArg(format!(
-            "qwen36_moe: Metal INT4 fallback requires paired scale/zero pointers \
-             and positive group_size for {label}"
-        )));
-    }
-    Ok(())
+    qwen36_validate_dense_or_lowbit_sidecars(qtype, scale, zero, group_size, label)
 }
 
 fn qwen36_dense_or_int4_dot_2d_unchecked(
     weight: usize,
     scale: usize,
     zero: usize,
+    qtype: i32,
     row: usize,
     cols: usize,
     group_size: usize,
@@ -11953,6 +12168,12 @@ fn qwen36_dense_or_int4_dot_2d_unchecked(
 ) -> f32 {
     let mut acc = 0.0f32;
     if scale == 0 && zero == 0 {
+        if qwen36_lowbit_ggml_k(qtype) {
+            for col in 0..cols {
+                acc += qwen36_ggml_k_dequant_scalar(weight, qtype, row, col, cols) * x[col];
+            }
+            return acc;
+        }
         let w = weight as *const u16;
         let row_base = row * cols;
         for col in 0..cols {
