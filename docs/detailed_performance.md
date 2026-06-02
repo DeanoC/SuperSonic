@@ -1137,6 +1137,31 @@ Q4_K_M smoke on Apple M5 Max exited cleanly and emitted one aggregate row per
 cold capture (`82.790 ms` total across 160 invocations). Use both env flags for
 future 128-token gates when Metal trace tooling is too heavyweight.
 
+The 2026-06-02 128-token raw Q4_K_M follow-up used the same two split-profile
+env flags on Apple M5 Max, prompt `Hello`, context 256, and greedy seed
+`20260504`. It preserved the known 128-token stream and measured
+`145.7 ms/token` under the intentionally slowed split profile. Stage timing
+still pointed at FFN (`ffn=117.5 ms/token`, `full_attn=8.5 ms/token`,
+`linear_attn=13.2 ms/token`). The compact phase summary reported 5120 calls per
+FFN subphase: router/top-k exact SIMD was largest at `2113.243 ms` total,
+followed by expert down finalize (`648.422 ms`), shared scalar (`578.275 ms`),
+shared gate/up exact SIMD (`384.761 ms`), shared down (`343.259 ms`), and
+expert gate/up tiled (`286.565 ms`). The split rows account for only part of
+the FFN stage wall time, so the remaining optimization target is still
+submission/wait structure around the FFN stage, not just one arithmetic kernel.
+
+A normal-lane 128-token Metal/HAL profile with `SUPERSONIC_METAL_PROFILE=1` and
+without split profiling measured `69.2 ms/token` and preserved the same
+generated IDs. Top Metal rows were `command_buffer_wait=4317.971 ms`,
+`command_buffer_gpu:qwen36_decode_batch_ffn=3931.515 ms`, and
+`qwen36_ffn_int4_stage5_with_router=3232.937 ms` across 5120 FFN calls.
+`command_buffer_gpu:qwen36_decode_batch_linear_attn` was much smaller at
+`711.453 ms`, while the final lm-head GEMV profile row
+(`matmul_rhs_transposed_gemv_m1_tiled`) was `369.473 ms`. Retesting the existing
+deferred FFN wait switch
+(`SUPERSONIC_METAL_QWEN36_DEFER_FFN_ROUTER_STAGE5_WAIT=1`) preserved the same
+128-token stream but slowed to `73.1 ms/token`, so it remains diagnostic-only.
+
 The current gap is therefore not a one-line launch-count fix; the Metal profile
 still points at the chained per-layer decode structure and command-buffer waits.
 A naive experiment that coalesced phase command buffers reduced command-buffer
@@ -1286,6 +1311,14 @@ identified the next safe work area:
   `/tmp/qwen35_native_ws_softmax_taps_l3_pos4.log`, and
   `/tmp/qwen35_native_ws_softmax_taps_precise_exp_l3_pos4.log`; word dumps:
   `/tmp/qwen35_native_ws_softmax_words_poly_round_exp_l3_pos4.log`.
+  A 2026-06-02 all-layer retest with
+  `SUPERSONIC_METAL_ENABLE_QWEN36_FULL_ATTN_NATIVE=1`,
+  `SUPERSONIC_METAL_QWEN36_FULL_ATTN_HOST_ORDER_STAGE5=1`, and
+  `SUPERSONIC_METAL_QWEN36_FULL_ATTN_POLY_EXP=1` did not generalize the
+  layer-3-limited improvement: it diverged on the second generated token
+  (`[49602, 58985, ...]` instead of `[49602, 165189, ...]`) and measured
+  `151.5 ms/token` on a 16-token smoke. Keep this path diagnostic-only until a
+  broader softmax/value compatibility fix is found.
   A later native-values dispatch cleanup removed redundant lanes from the
   current values kernel: the shader computes one `(head, dim)` row per
   threadgroup and only lane 0 writes, so dispatching 32 lanes duplicated the
