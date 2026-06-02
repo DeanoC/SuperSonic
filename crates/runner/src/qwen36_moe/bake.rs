@@ -73,17 +73,9 @@ pub(crate) fn select_decode_bake(
         }
         (fp8_dir, Qwen36WeightMode::Fp8)
     } else if profile == QuantProfile::Q4Km {
-        let q4km_dir = model_store::bake_dir_q4km(model_dir);
-        if !q4km_dir.exists() {
-            return Err(anyhow!(
-                "--q4km requested but no raw GGML Q4_K_M bake exists at {}. \
-                 Create one with `python3 oracle/bake_q4km.py --model-dir {} --model <qwen3.5-35b-a3b-or-qwen3.6-35b-a3b> --gguf-file /path/to/model.gguf` \
-                 or allow the release bake download.",
-                q4km_dir.display(),
-                model_dir.display()
-            ));
-        }
-        (q4km_dir, Qwen36WeightMode::Q4Km)
+        return Err(anyhow!(
+            "--q4km raw GGML Q4_K_M bakes are not supported by the Qwen3.5/3.6 MoE decode runtime because dense attention and shared-expert projections require native INT4 sidecars. Use --q4km-gptq instead."
+        ));
     } else if profile == QuantProfile::Q4KmGptq {
         if !q4km_gptq_dir.exists() {
             return Err(anyhow!(
@@ -163,16 +155,17 @@ mod tests {
     }
 
     #[test]
-    fn select_decode_bake_selects_raw_q4km_for_moe_decode() {
+    fn select_decode_bake_rejects_raw_q4km_for_moe_decode() {
         let model_dir = temp_model_dir("raw-q4km");
         let q4km_dir = model_store::bake_dir_q4km(&model_dir);
         fs::create_dir_all(&q4km_dir).expect("create q4km bake dir");
 
-        let selected = select_decode_bake(&model_dir, QuantProfile::Q4Km, true)
-            .expect("raw q4km should select the GGML K-block MoE runtime mode");
+        let err = match select_decode_bake(&model_dir, QuantProfile::Q4Km, true) {
+            Ok(_) => panic!("raw q4km lacks native INT4 sidecars for MoE dense projections"),
+            Err(err) => err.to_string(),
+        };
 
-        assert_eq!(selected.bake_dir, q4km_dir);
-        assert_eq!(selected.weight_mode, Qwen36WeightMode::Q4Km);
+        assert!(err.contains("Use --q4km-gptq instead"));
         let _ = fs::remove_dir_all(model_dir);
     }
 
