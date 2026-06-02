@@ -1,0 +1,3 @@
+# First non-comment line must exactly match `python3 -m mlx_lm --version`.
+# Update this after installing the local MLX-LM environment used for published refs.
+mlx-lm version not pinned

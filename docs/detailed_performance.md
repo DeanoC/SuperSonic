@@ -884,9 +884,13 @@ INT4 gate because it is intended to compare against public llama.cpp and MLX
 M5 Max numbers for the same model/quant target. The current SuperSonic
 checkpoint uses the Q4_K_M-sourced GPTQ/native-INT4 bake (`--q4km-gptq`), not
 raw GGML K-blocks (`--q4km`), because the Metal dense projection kernels consume
-native INT4 sidecars. The run is direct single-sequence greedy generation, empty
-prompt (`""`, tokenized as one prompt token), 512 generated tokens, and no
-attribution or Metal profile pass:
+native INT4 sidecars. The external adapter harness now records llama.cpp from a
+raw GGUF Q4_K_M file and MLX from a matching MLX model directory. Raw `--q4km`
+should become a SuperSonic matrix row only after the Metal full-attention,
+linear-attention, shared-expert, and lm-head projection descriptors carry raw
+GGML qtype metadata. The SuperSonic control run is direct single-sequence greedy
+generation, empty prompt (`""`, tokenized as one prompt token), 512 generated
+tokens, and no attribution or Metal profile pass:
 
 ```bash
 target/release/supersonic --backend metal \
@@ -909,6 +913,46 @@ Current 2026-06-01 result on this M5 Max:
 | SuperSonic | Qwen3.5-35B-A3B Q4_K_M | 1-token prompt + 512 generated, promoted exact-order FFN path | 67.3 | 14.9 | `/tmp/qwen35_default_after_scalar_fuse_patch_512.log` |
 | llama.cpp | Qwen3.5-35B-A3B Q4_K_M | public M5 Max generation number | ~11.0 | 91.0 | public reference |
 | MLX | Qwen3.5-35B-A3B Q4_K_M | public M5 Max generation number | ~7.2 | 139.0 | public reference |
+
+To refresh local external references, pin the first line of
+`tools/external/llama-cpp-version.txt` to `llama-bench --version` and the first
+line of `tools/external/mlx-lm-version.txt` to `python3 -m mlx_lm --version`,
+then run the raw GGUF llama.cpp reference:
+
+```bash
+python3 -m oracle.bench.external.external_main \
+  --engine llama.cpp \
+  --models qwen3.5-35b-a3b \
+  --quants q4km \
+  --model-dir qwen3.5-35b-a3b=/path/to/qwen3.5-35b-a3b-q4_k_m.gguf \
+  --prompt "" \
+  --prompt-tokens 0 \
+  --context-size 1024 \
+  --max-new-tokens 512 \
+  --measurement-runs 5
+```
+
+Run the matching MLX model-directory reference separately:
+
+```bash
+python3 -m oracle.bench.external.external_main \
+  --engine mlx-lm \
+  --models qwen3.5-35b-a3b \
+  --quants q4km \
+  --model-dir qwen3.5-35b-a3b=/path/to/mlx/qwen3.5-35b-a3b-q4 \
+  --prompt "" \
+  --prompt-tokens 0 \
+  --context-size 1024 \
+  --max-new-tokens 512 \
+  --measurement-runs 5
+```
+
+The external JSON cells live under the latest `target/bench-runs/*/external/`
+run directory and record engine version, exact command, workload metadata,
+samples, median `ms_per_step`, and derived `tok_per_s`. The fusion/megakernel
+optimization gate is based on the refreshed local llama.cpp median: start that
+phase when SuperSonic reaches at least 90% of the locally measured llama.cpp
+throughput for this workload.
 
 Short smoke runs are too noisy for headline comparison: 16-token samples ranged
 from ~125 to ~201 ms/token depending on command-buffer scheduling and warm

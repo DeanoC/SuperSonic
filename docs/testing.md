@@ -88,7 +88,7 @@ BF16/INT4/FP8-runtime smokes through the component/chained Metal paths. The
 Qwen3.6-MoE Apple M5 Max performance gate is
 `bench-perf --arch apple-m5-max --models qwen3.6-35b-a3b --quants int4`.
 For the public llama.cpp-style Qwen3.5-35B-A3B Q4_K_M comparison on M5 Max,
-run the Q4_K_M-sourced GPTQ/native-INT4 Metal lane:
+run the SuperSonic Q4_K_M-sourced GPTQ/native-INT4 Metal control lane:
 
 ```bash
 SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" \
@@ -97,14 +97,49 @@ SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" \
 ```
 
 This preset records the SuperSonic generation benchmark with a 512-token
-generation run, `--q4km-gptq`, `--context-size 1024`, one 512-token warmup, five measured
-repetitions, and no extra attribution/profile passes. It mirrors the public
-`llama-bench` `tg512` shape (`n_prompt=0`, `n_gen=512`, five repetitions);
-SuperSonic currently seeds the run with the model BOS token for an empty
-prompt, so the recorded row is "1 prompt token + 512 generated". llama.cpp's
-batch defaults (`n_batch=2048`, `n_ubatch=512`) are prompt-processing knobs;
-they are recorded as comparison context but are not a separate SuperSonic
-decode setting for this single-stream generation lane.
+generation run, `--q4km-gptq`, `--context-size 1024`, one 512-token warmup, five
+measured repetitions, and no extra attribution/profile passes. SuperSonic
+currently seeds the run with the model BOS token for an empty prompt, so the
+recorded row is "1 prompt token + 512 generated".
+
+External references are measured through the adapter harness after pinning
+local engine versions in `tools/external/llama-cpp-version.txt` and
+`tools/external/mlx-lm-version.txt`. The llama.cpp adapter consumes the raw
+GGUF Q4_K_M file:
+
+```bash
+python3 -m oracle.bench.external.external_main \
+  --engine llama.cpp \
+  --models qwen3.5-35b-a3b \
+  --quants q4km \
+  --model-dir qwen3.5-35b-a3b=/path/to/qwen3.5-35b-a3b-q4_k_m.gguf \
+  --prompt "" \
+  --prompt-tokens 0 \
+  --context-size 1024 \
+  --max-new-tokens 512 \
+  --measurement-runs 5
+```
+
+The MLX adapter consumes a matching MLX model directory and records that
+artifact kind in the JSON cell:
+
+```bash
+python3 -m oracle.bench.external.external_main \
+  --engine mlx-lm \
+  --models qwen3.5-35b-a3b \
+  --quants q4km \
+  --model-dir qwen3.5-35b-a3b=/path/to/mlx/qwen3.5-35b-a3b-q4 \
+  --prompt "" \
+  --prompt-tokens 0 \
+  --context-size 1024 \
+  --max-new-tokens 512 \
+  --measurement-runs 5
+```
+
+Those JSON cells record the exact command, engine version, workload settings,
+samples, median `ms_per_step`, and derived `tok_per_s`. Raw `--q4km` is not yet
+a SuperSonic Metal row; add it to the benchmark matrix only after the Metal
+dense/shared projection kernels carry raw GGML qtype metadata.
 
 ## Per-feature parity tests
 

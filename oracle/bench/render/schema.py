@@ -108,8 +108,12 @@ EXTERNAL_CELL_SCHEMA = {
         "quant": {"type": "string"},
         "status": {"enum": ["ok", "unsupported_by_engine", "error"]},
         "ms_per_step": {"type": ["number", "null"]},
+        "tok_per_s": {"type": ["number", "null"]},
         "samples": {"type": ["array", "null"], "items": {"type": "number"}},
         "stderr_tail": {"type": ["string", "null"]},
+        "command": {"type": ["array", "null"], "items": {"type": "string"}},
+        "workload": {"type": ["object", "null"]},
+        "extras": {"type": "object"},
     },
 }
 

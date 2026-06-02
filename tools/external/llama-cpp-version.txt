@@ -1,0 +1,3 @@
+# First non-comment line must exactly match `llama-bench --version`.
+# Update this after installing the local llama.cpp build used for published refs.
+llama.cpp version not pinned

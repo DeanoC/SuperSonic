@@ -81,11 +81,11 @@ runs, and runtime-feature deltas, see
 | qwen3.6-35b-a3b | INT4, 512-token long-context smoke | 72.683 | 13.8 |
 | qwen3.6-35b-a3b | INT4, 2048-token long-context smoke | 159.044 | 6.3 |
 
-Public reference numbers for the same Qwen3.5-35B-A3B Q4_K_M source target on
-M5 Max are llama.cpp at 91 tok/s (~11.0 ms/tok) and MLX at 139 tok/s
-(~7.2 ms/tok). The SuperSonic Metal path currently uses the Q4_K_M-sourced
-GPTQ/native-INT4 bake and is 16% of the llama.cpp throughput on the 512-token
-generation checkpoint above.
+Historical public reference numbers for the same Qwen3.5-35B-A3B Q4_K_M source
+target on M5 Max are llama.cpp at 91 tok/s (~11.0 ms/tok) and MLX at 139 tok/s
+(~7.2 ms/tok). The SuperSonic Metal row currently uses the Q4_K_M-sourced
+GPTQ/native-INT4 bake, not raw GGUF K-blocks; local raw-reference refreshes now
+run through `oracle.bench.external.external_main` for llama.cpp and MLX.
 
 Apple M5 Max Metal also has correctness coverage for `qwen3-30b-a3b` INT4,
 Gemma 4 BF16/INT4, and Phi-4 mini BF16/INT4/FP8-runtime. Those lanes are
