@@ -107,6 +107,15 @@ def parse_ms_per_token_samples(text: str) -> list[float]:
         tps = float(match.group(1))
         if tps > 0:
             samples.append(1000.0 / tps)
+    for line in text.splitlines():
+        if re.search(r"\btg\d+\b", line, re.I):
+            cols = [col.strip() for col in line.strip().strip("|").split("|")]
+            if len(cols) >= 2:
+                speed = re.match(r"([0-9]+(?:\.[0-9]+)?)", cols[-1])
+                if speed:
+                    tps = float(speed.group(1))
+                    if tps > 0:
+                        samples.append(1000.0 / tps)
     for match in re.finditer(r"([0-9]+(?:\.[0-9]+)?)\s*ms/(?:tok|token|step)", text, re.I):
         samples.append(float(match.group(1)))
     for match in re.finditer(r"ms/(?:tok|token|step)[:\s=]+([0-9]+(?:\.[0-9]+)?)", text, re.I):

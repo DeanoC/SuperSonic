@@ -23,13 +23,19 @@ class LlamaCppVersionMismatch(RuntimeError):
 class LlamaCppAdapter(ExternalAdapter):
     name = "llama.cpp"
 
-    def __init__(self, version_pin_file: Path = DEFAULT_PIN, binary: str = "llama-bench"):
+    def __init__(
+        self,
+        version_pin_file: Path = DEFAULT_PIN,
+        binary: str = "llama-bench",
+        version_binary: str = "llama-cli",
+    ):
         self.binary = binary
+        self.version_binary = version_binary
         self.pin_file = version_pin_file
 
     def assert_version_match(self) -> None:
         pinned = read_pinned_version(self.pin_file)
-        actual = get_engine_version([self.binary, "--version"])
+        actual = get_engine_version([self.version_binary, "--version"])
         if pinned != actual:
             raise LlamaCppVersionMismatch(
                 f"llama.cpp pinned={pinned!r} actual={actual!r}; bump {self.pin_file} or install pinned version"
@@ -52,7 +58,7 @@ class LlamaCppAdapter(ExternalAdapter):
 
     def measure_workload(self, model: str, quant: str, model_dir: Path,
                          workload: ExternalWorkload) -> dict:
-        version = get_engine_version([self.binary, "--version"])
+        version = get_engine_version([self.version_binary, "--version"])
         if not self.supports(model, quant):
             return build_external_cell(
                 engine=self.name,
@@ -75,13 +81,19 @@ class LlamaCppAdapter(ExternalAdapter):
                 workload=workload,
                 stderr_tail=str(exc),
             )
-        cmd = self._command(model_path, workload)
+        cmd = self._command(model_path, workload, repetitions=1)
         time.sleep(3)
         try:
             subprocess.run(self._warmup_command(model_path, workload), capture_output=True, text=True, check=True)
-            out = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            combined = (out.stdout or "") + "\n" + (out.stderr or "")
-            samples = parse_ms_per_token_samples(combined)
+            samples: list[float] = []
+            last_output = ""
+            for _ in range(workload.measurement_runs):
+                out = subprocess.run(cmd, capture_output=True, text=True, check=True)
+                combined = (out.stdout or "") + "\n" + (out.stderr or "")
+                last_output = combined
+                parsed = parse_ms_per_token_samples(combined)
+                if parsed:
+                    samples.append(parsed[-1])
             if samples:
                 return build_external_cell(
                     engine=self.name,
@@ -94,7 +106,12 @@ class LlamaCppAdapter(ExternalAdapter):
                     ms_samples=samples,
                     extras={
                         "model_path": str(model_path),
-                        "batch_context": "llama-bench defaults unless overridden by local binary",
+                        "version_command": [self.version_binary, "--version"],
+                        "batch_context": (
+                            "llama-bench exposes n-prompt/n-gen plus batch flags, not an explicit ctx-size flag; "
+                            "adapter records context_size=1024 as the target workload while the command uses "
+                            "n-prompt/n-gen and default batch-size=2048, ubatch-size=512"
+                        ),
                     },
                 )
             return build_external_cell(
@@ -105,7 +122,7 @@ class LlamaCppAdapter(ExternalAdapter):
                 status="error",
                 workload=workload,
                 command=cmd,
-                stderr_tail=combined[-2000:],
+                stderr_tail=last_output[-2000:],
             )
         except subprocess.CalledProcessError as exc:
             tail = ((exc.stdout or "") + "\n" + (exc.stderr or ""))[-2000:]
@@ -130,16 +147,14 @@ class LlamaCppAdapter(ExternalAdapter):
             raise FileNotFoundError(f"no .gguf file found in {model_dir}")
         raise FileNotFoundError(f"multiple .gguf files found in {model_dir}; pass the exact GGUF path")
 
-    def _command(self, model_path: Path, workload: ExternalWorkload) -> list[str]:
+    def _command(self, model_path: Path, workload: ExternalWorkload, repetitions: int) -> list[str]:
         cmd = [
             self.binary,
             "-m", str(model_path),
-            "-p", str(workload.prompt_tokens if workload.prompt_tokens is not None else 0),
+            "-p", str(self._bench_prompt_tokens(workload)),
             "-n", str(workload.max_new_tokens),
-            "-r", str(workload.measurement_runs),
+            "-r", str(repetitions),
         ]
-        if workload.context_size is not None:
-            cmd.extend(["-c", str(workload.context_size)])
         return cmd
 
     def _warmup_command(self, model_path: Path, workload: ExternalWorkload) -> list[str]:
@@ -154,4 +169,12 @@ class LlamaCppAdapter(ExternalAdapter):
             top_k=workload.top_k,
             seed=workload.seed,
         )
-        return self._command(model_path, warm)
+        return self._command(model_path, warm, repetitions=max(1, workload.warmup_runs))
+
+    def _bench_prompt_tokens(self, workload: ExternalWorkload) -> int:
+        # Current llama-bench rejects a zero-token prompt for this model/context
+        # path. SuperSonic also seeds an empty prompt with BOS, so use one
+        # prompt token while preserving prompt_tokens=0 in workload metadata for
+        # the public "empty prompt/BOS-compatible" target.
+        requested = workload.prompt_tokens if workload.prompt_tokens is not None else 0
+        return max(1, requested)

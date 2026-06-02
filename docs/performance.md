@@ -82,12 +82,14 @@ runs, and runtime-feature deltas, see
 | qwen3.6-35b-a3b | INT4, 512-token long-context smoke | 72.683 | 13.8 |
 | qwen3.6-35b-a3b | INT4, 2048-token long-context smoke | 159.044 | 6.3 |
 
-Historical public reference numbers for the same Qwen3.5-35B-A3B Q4_K_M source
-target on M5 Max are llama.cpp at 91 tok/s (~11.0 ms/tok) and MLX at 139 tok/s
-(~7.2 ms/tok). SuperSonic tracks separate `q4km-gptq` and raw `q4km` lanes:
+The current local pinned llama.cpp reference for the same raw GGUF Q4_K_M
+target is `15.1 ms/tok` / `66.0 tok/s` on M5 Max
+(`llama.cpp` version `9430`, five independent `llama-bench` samples). Older
+public reference numbers for this target are llama.cpp at 91 tok/s and MLX at
+139 tok/s; the local MLX refresh is still pending a matching MLX model
+directory. SuperSonic tracks separate `q4km-gptq` and raw `q4km` lanes:
 `q4km-gptq` is the faster native-sidecar control path, while raw `q4km` is the
-external-equivalence staged path. Local raw-reference refreshes run through
-`oracle.bench.external.external_main` for llama.cpp and MLX.
+external-equivalence staged path.
 
 Apple M5 Max Metal also has correctness coverage for `qwen3-30b-a3b` INT4,
 Gemma 4 BF16/INT4, and Phi-4 mini BF16/INT4/FP8-runtime. Those lanes are

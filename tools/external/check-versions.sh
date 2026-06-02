@@ -35,6 +35,6 @@ check_one() {
 
 failed=0
 check_one hipfire hipfire "hipfire --version" || failed=1
-check_one llama-cpp llama-bench "llama-bench --version" || failed=1
+check_one llama-cpp llama-cli "llama-cli --version" || failed=1
 check_one mlx-lm python3 "python3 -m mlx_lm --version" || failed=1
 exit $failed

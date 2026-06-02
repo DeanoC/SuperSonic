@@ -104,8 +104,9 @@ recorded row is "1 prompt token + 512 generated".
 
 External references are measured through the adapter harness after pinning
 local engine versions in `tools/external/llama-cpp-version.txt` and
-`tools/external/mlx-lm-version.txt`. The llama.cpp adapter consumes the raw
-GGUF Q4_K_M file:
+`tools/external/mlx-lm-version.txt`. For Homebrew llama.cpp builds, the pin is
+captured from `llama-cli --version` while the measurement still runs through
+`llama-bench`. The llama.cpp adapter consumes the raw GGUF Q4_K_M file:
 
 ```bash
 python3 -m oracle.bench.external.external_main \
@@ -137,9 +138,10 @@ python3 -m oracle.bench.external.external_main \
 ```
 
 Those JSON cells record the exact command, engine version, workload settings,
-samples, median `ms_per_step`, and derived `tok_per_s`. Raw `--q4km` is not yet
-a SuperSonic headline Metal row; add it to the benchmark matrix only after the
-raw staged path has local correctness and 512-token benchmark evidence recorded.
+samples, median `ms_per_step`, derived `tok_per_s`, and engine-specific notes
+such as llama-bench's batch defaults. Raw `--q4km` is now a staged SuperSonic
+headline Metal row after the local correctness gates and 512-token benchmark;
+keep it separate from the faster `q4km-gptq` control lane.
 
 To inspect a raw Q4_K_M bake before benchmarking it in SuperSonic, run the
 manifest audit. It reads `manifest.json` and `config.json` only, reports every

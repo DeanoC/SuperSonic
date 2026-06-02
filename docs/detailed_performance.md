@@ -880,19 +880,16 @@ SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" cargo run --re
 ### Qwen3.5-35B-A3B Q4_K_M public comparison checkpoint
 
 The Qwen3.5-35B-A3B Q4_K_M Metal lane is tracked separately from the Qwen3.6
-INT4 gate because it is intended to compare against public llama.cpp and MLX
-M5 Max numbers for the same model/quant target. The current SuperSonic
-checkpoint uses the Q4_K_M-sourced GPTQ/native-INT4 bake (`--q4km-gptq`), not
-raw GGML K-blocks (`--q4km`), because the Metal dense projection kernels consume
-native INT4 sidecars. The external adapter harness now records llama.cpp from a
-raw GGUF Q4_K_M file and MLX from a matching MLX model directory. Raw `--q4km`
-has a correctness-first staged SuperSonic path that accepts mixed Q4_K_M bakes
-where dense/shared projections remain native INT4 sidecars and routed experts
-use GGML K-block tensors, but it is not a headline performance row until local
-correctness and 512-token benchmark evidence are recorded. The SuperSonic
-control run is direct single-sequence greedy generation, empty prompt (`""`,
-tokenized as one prompt token), 512 generated tokens, and no attribution or
-Metal profile pass:
+INT4 gate because it is intended to compare against llama.cpp and MLX M5 Max
+numbers for the same model/quant target. The SuperSonic control checkpoint uses
+the Q4_K_M-sourced GPTQ/native-INT4 bake (`--q4km-gptq`), while the raw
+external-equivalence checkpoint uses staged mixed-layout raw GGML K-blocks
+(`--q4km`). The external adapter harness records llama.cpp from a raw GGUF
+Q4_K_M file and MLX from a matching MLX model directory. Raw `--q4km` accepts
+mixed Q4_K_M bakes where dense/shared projections remain native INT4 sidecars
+and routed experts use GGML K-block tensors. The SuperSonic control run is
+direct single-sequence greedy generation, empty prompt (`""`, tokenized as one
+prompt token), 512 generated tokens, and no attribution or Metal profile pass:
 
 ```bash
 target/release/supersonic --backend metal \
@@ -908,19 +905,24 @@ target/release/supersonic --backend metal \
   --no-download
 ```
 
-Current 2026-06-01 result on this M5 Max:
+Current local result on this M5 Max:
 
 | Engine | Model/quant | Workload | ms/tok | tok/s | Source |
 |---|---|---|---:|---:|---|
 | SuperSonic | Qwen3.5-35B-A3B Q4_K_M | 1-token prompt + 512 generated, promoted exact-order FFN path | 67.3 | 14.9 | `/tmp/qwen35_default_after_scalar_fuse_patch_512.log` |
 | SuperSonic | Qwen3.5-35B-A3B raw Q4_K_M | empty prompt + 512 generated, staged mixed-layout raw path | 73.6 | 13.6 | `target/bench-runs/2026-06-02-0f7b114/perf/qwen3.5-35b-a3b_q4km.json` |
-| llama.cpp | Qwen3.5-35B-A3B Q4_K_M | public M5 Max generation number | ~11.0 | 91.0 | public reference |
-| MLX | Qwen3.5-35B-A3B Q4_K_M | public M5 Max generation number | ~7.2 | 139.0 | public reference |
+| llama.cpp | Qwen3.5-35B-A3B raw GGUF Q4_K_M | empty/BOS-compatible prompt + 512 generated, five independent `llama-bench` samples | 15.1 | 66.0 | `target/bench-runs/2026-06-02-0f7b114/external/llama.cpp/qwen3.5-35b-a3b_q4km.json` |
+| llama.cpp | Qwen3.5-35B-A3B Q4_K_M | older public M5 Max generation number | ~11.0 | 91.0 | historical public reference |
+| MLX | Qwen3.5-35B-A3B Q4_K_M | older public M5 Max generation number | ~7.2 | 139.0 | historical public reference; local refresh pending MLX artifact |
 
 To refresh local external references, pin the first line of
-`tools/external/llama-cpp-version.txt` to `llama-bench --version` and the first
+`tools/external/llama-cpp-version.txt` to `llama-cli --version` and the first
 line of `tools/external/mlx-lm-version.txt` to `python3 -m mlx_lm --version`,
-then run the raw GGUF llama.cpp reference:
+then run the raw GGUF llama.cpp reference. On the local Homebrew build,
+`llama-bench` does not expose `--version` or an explicit `--ctx-size` flag; the
+adapter records `context_size=1024` as workload metadata, uses `-p 1` for the
+empty/BOS-compatible prompt, and records the command's default `batch-size=2048`
+and `ubatch-size=512` context:
 
 ```bash
 python3 -m oracle.bench.external.external_main \
@@ -952,8 +954,22 @@ python3 -m oracle.bench.external.external_main \
 
 The external JSON cells live under the latest `target/bench-runs/*/external/`
 run directory and record engine version, exact command, workload metadata,
-samples, median `ms_per_step`, and derived `tok_per_s`. The raw SuperSonic
-staged lane is reproduced with:
+samples, median `ms_per_step`, derived `tok_per_s`, and engine-specific
+batch/context notes. The 2026-06-02 local llama.cpp cell used
+`version: 9430 (d48a56eff)` with command:
+
+```bash
+llama-bench \
+  -m "$HOME/.cache/supersonic-metal-models/qwen3.5-35b-a3b-gguf/Qwen3.5-35B-A3B-Q4_K_M.gguf" \
+  -p 1 \
+  -n 512 \
+  -r 1
+```
+
+It ran one warmup and five measured samples:
+`[14.015, 14.436, 15.145, 15.394, 16.609] ms/token`, median
+`15.145 ms/token` (`66.03 tok/s`). The raw SuperSonic staged lane is
+reproduced with:
 
 ```bash
 cargo run --release -p supersonic-bench --bin bench-perf -- \
@@ -963,13 +979,14 @@ cargo run --release -p supersonic-bench --bin bench-perf -- \
 
 The 2026-06-02 run (`target/bench-runs/2026-06-02-0f7b114`) used one 512-token
 warmup and five measured samples: `[74.3, 73.6, 77.6, 71.7, 71.0]`, median
-`73.6 ms/token` (`13.6 tok/s`). The fusion/megakernel optimization gate is
-based on the refreshed local llama.cpp median: start that phase when SuperSonic
-reaches at least 90% of the locally measured llama.cpp throughput for this
-workload.
+`73.6 ms/token` (`13.6 tok/s`). Against the refreshed local llama.cpp median,
+raw SuperSonic is currently about 20.6% of llama.cpp throughput. The
+fusion/megakernel optimization gate is therefore closed: start that phase only
+after raw SuperSonic reaches at least 90% of the local llama.cpp throughput,
+currently about `59.4 tok/s`.
 
-Before changing the raw `--q4km` SuperSonic matrix row, use the manifest audit
-to inventory the raw bake and keep layout coverage explicit:
+Before changing the raw `--q4km` implementation or matrix row, use the manifest
+audit to inventory the raw bake and keep layout coverage explicit:
 
 ```bash
 cargo run -p runner --bin qwen36_q4km_manifest_audit -- \
@@ -979,8 +996,7 @@ cargo run -p runner --bin qwen36_q4km_manifest_audit -- \
 The current audit model treats raw GGML K-block dense, linear-attention,
 shared-expert, routed-expert, and lm-head layouts as supported by the staged
 Metal correctness path. It still reports missing tensors and unsupported layouts
-as blockers; headline matrix promotion waits for local correctness and 512-token
-benchmark evidence.
+as blockers.
 
 The 2026-06-02 local raw-bake audit passed for
 `$HOME/.cache/supersonic-metal-models/qwen3.5-35b-a3b` with 40 layers

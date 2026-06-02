@@ -13,8 +13,11 @@ def test_common_speed_parser_handles_tok_s_and_ms_token():
         "generation: 91.0 tok/s\n"
         "fallback ms/token: 11.5\n"
         "| test | tg 512 | 139.0 t/s |\n"
+        "| qwen35moe 35B.A3B Q4_K - Medium | 20.49 GiB | BLAS,MTL | 6 | tg512 | 90.31 ± 0.42 |\n"
     )
-    assert sorted(samples) == pytest.approx(sorted([1000.0 / 91.0, 11.5, 1000.0 / 139.0]))
+    assert sorted(samples) == pytest.approx(
+        sorted([1000.0 / 91.0, 11.5, 1000.0 / 139.0, 1000.0 / 90.31])
+    )
 
 
 def test_llama_cpp_version_check_passes_when_pinned(tmp_path):
@@ -72,6 +75,11 @@ def test_llama_cpp_adapter_builds_tg512_command_and_schema(tmp_path):
     assert cell["workload"]["max_new_tokens"] == 512
     assert "-n" in cell["command"]
     assert "512" in cell["command"]
+    assert "-c" not in cell["command"]
+    assert cell["command"][cell["command"].index("-p") + 1] == "1"
+    assert cell["command"][cell["command"].index("-r") + 1] == "1"
+    assert len(cell["samples"]) == workload.measurement_runs
+    assert cell["extras"]["version_command"] == ["llama-cli", "--version"]
 
 
 def test_mlx_lm_version_check_raises_on_mismatch(tmp_path):
