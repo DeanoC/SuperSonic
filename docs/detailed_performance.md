@@ -886,11 +886,13 @@ checkpoint uses the Q4_K_M-sourced GPTQ/native-INT4 bake (`--q4km-gptq`), not
 raw GGML K-blocks (`--q4km`), because the Metal dense projection kernels consume
 native INT4 sidecars. The external adapter harness now records llama.cpp from a
 raw GGUF Q4_K_M file and MLX from a matching MLX model directory. Raw `--q4km`
-should become a SuperSonic matrix row only after the Metal full-attention,
-linear-attention, shared-expert, and lm-head projection kernels consume raw
-GGML qtype metadata. The SuperSonic control run is direct single-sequence greedy
-generation, empty prompt (`""`, tokenized as one prompt token), 512 generated
-tokens, and no attribution or Metal profile pass:
+has a correctness-first staged SuperSonic path that accepts mixed Q4_K_M bakes
+where dense/shared projections remain native INT4 sidecars and routed experts
+use GGML K-block tensors, but it is not a headline performance row until local
+correctness and 512-token benchmark evidence are recorded. The SuperSonic
+control run is direct single-sequence greedy generation, empty prompt (`""`,
+tokenized as one prompt token), 512 generated tokens, and no attribution or
+Metal profile pass:
 
 ```bash
 target/release/supersonic --backend metal \
@@ -967,6 +969,35 @@ shared-expert, routed-expert, and lm-head layouts as supported by the staged
 Metal correctness path. It still reports missing tensors and unsupported layouts
 as blockers; headline matrix promotion waits for local correctness and 512-token
 benchmark evidence.
+
+The 2026-06-02 local raw-bake audit passed for
+`$HOME/.cache/supersonic-metal-models/qwen3.5-35b-a3b` with 40 layers
+(`full=10`, `linear=30`), 331 projections, 251 native INT4 sidecar layouts,
+80 raw GGML K-block layouts, and zero missing or unsupported blockers. A
+one-token Metal smoke then completed with:
+
+```bash
+cargo run --release -p runner --bin supersonic -- \
+  --backend metal \
+  --model qwen3.5-35b-a3b \
+  --model-dir "$HOME/.cache/supersonic-metal-models/qwen3.5-35b-a3b" \
+  --q4km \
+  --prompt "Hello" \
+  --context-size 64 \
+  --max-new-tokens 1 \
+  --temperature 0 \
+  --top-k 1 \
+  --sampling-seed 20260504 \
+  --no-download \
+  --emit-stage-timings \
+  --emit-generated-json
+```
+
+That smoke generated token id `[49602]` and measured `2478.3 ms/token`
+(`full_attn=37.7 ms`, `linear_attn=109.3 ms`, `ffn=2191.7 ms`,
+`lm_head=138.1 ms`). Treat this only as raw-path load/decode evidence: the
+staged raw GGML expert path is correctness-oriented and far slower than the
+`--q4km-gptq` control lane.
 
 Short smoke runs are too noisy for headline comparison: 16-token samples ranged
 from ~125 to ~201 ms/token depending on command-buffer scheduling and warm
