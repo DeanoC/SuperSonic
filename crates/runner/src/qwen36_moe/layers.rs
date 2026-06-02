@@ -216,27 +216,47 @@ pub(crate) fn load_layer_buffers(
                 ],
             )?;
         }
+        let (q_proj_type, k_proj_type, v_proj_type, o_proj_type) =
+            if weight_mode == Qwen36WeightMode::Q4Km {
+                (
+                    ggml_lowbit_type_for_layout(store, &format!("{fa}.q_proj.weight"))?,
+                    ggml_lowbit_type_for_layout(store, &format!("{fa}.k_proj.weight"))?,
+                    ggml_lowbit_type_for_layout(store, &format!("{fa}.v_proj.weight"))?,
+                    ggml_lowbit_type_for_layout(store, &format!("{fa}.o_proj.weight"))?,
+                )
+            } else {
+                (
+                    QWEN36_MOE_LOWBIT_NATIVE_INT4,
+                    QWEN36_MOE_LOWBIT_NATIVE_INT4,
+                    QWEN36_MOE_LOWBIT_NATIVE_INT4,
+                    QWEN36_MOE_LOWBIT_NATIVE_INT4,
+                )
+            };
         let int4 = match weight_mode {
             Qwen36WeightMode::Int4 | Qwen36WeightMode::Q4Km => Some(FullAttnInt4Sidecars {
                 group_size: QWEN36_MOE_INT4_GROUP_SIZE,
+                q_proj_type,
                 q_proj_scale: load_to_gpu(
                     store,
                     ordinal,
                     &format!("{fa}.q_proj.weight_int4_scale"),
                 )?,
                 q_proj_zero: load_to_gpu(store, ordinal, &format!("{fa}.q_proj.weight_int4_zero"))?,
+                k_proj_type,
                 k_proj_scale: load_to_gpu(
                     store,
                     ordinal,
                     &format!("{fa}.k_proj.weight_int4_scale"),
                 )?,
                 k_proj_zero: load_to_gpu(store, ordinal, &format!("{fa}.k_proj.weight_int4_zero"))?,
+                v_proj_type,
                 v_proj_scale: load_to_gpu(
                     store,
                     ordinal,
                     &format!("{fa}.v_proj.weight_int4_scale"),
                 )?,
                 v_proj_zero: load_to_gpu(store, ordinal, &format!("{fa}.v_proj.weight_int4_zero"))?,
+                o_proj_type,
                 o_proj_scale: load_to_gpu(
                     store,
                     ordinal,
@@ -246,24 +266,28 @@ pub(crate) fn load_layer_buffers(
             }),
             Qwen36WeightMode::Fp8 => Some(FullAttnInt4Sidecars {
                 group_size: -QWEN36_MOE_FP8_BLOCK_SIZE,
+                q_proj_type: QWEN36_MOE_LOWBIT_NATIVE_INT4,
                 q_proj_scale: load_to_gpu(
                     store,
                     ordinal,
                     &format!("{fa}.q_proj.weight_scale_inv"),
                 )?,
                 q_proj_zero: GpuBuffer::zeros(ordinal, ScalarType::U8, &[1])?,
+                k_proj_type: QWEN36_MOE_LOWBIT_NATIVE_INT4,
                 k_proj_scale: load_to_gpu(
                     store,
                     ordinal,
                     &format!("{fa}.k_proj.weight_scale_inv"),
                 )?,
                 k_proj_zero: GpuBuffer::zeros(ordinal, ScalarType::U8, &[1])?,
+                v_proj_type: QWEN36_MOE_LOWBIT_NATIVE_INT4,
                 v_proj_scale: load_to_gpu(
                     store,
                     ordinal,
                     &format!("{fa}.v_proj.weight_scale_inv"),
                 )?,
                 v_proj_zero: GpuBuffer::zeros(ordinal, ScalarType::U8, &[1])?,
+                o_proj_type: QWEN36_MOE_LOWBIT_NATIVE_INT4,
                 o_proj_scale: load_to_gpu(
                     store,
                     ordinal,
@@ -434,9 +458,24 @@ pub(crate) fn load_layer_buffers(
                 ],
             )?;
         }
+        let (in_proj_qkv_type, in_proj_z_type, out_proj_type) =
+            if weight_mode == Qwen36WeightMode::Q4Km {
+                (
+                    ggml_lowbit_type_for_layout(store, &format!("{la}.in_proj_qkv.weight"))?,
+                    ggml_lowbit_type_for_layout(store, &format!("{la}.in_proj_z.weight"))?,
+                    ggml_lowbit_type_for_layout(store, &format!("{la}.out_proj.weight"))?,
+                )
+            } else {
+                (
+                    QWEN36_MOE_LOWBIT_NATIVE_INT4,
+                    QWEN36_MOE_LOWBIT_NATIVE_INT4,
+                    QWEN36_MOE_LOWBIT_NATIVE_INT4,
+                )
+            };
         let int4 = match weight_mode {
             Qwen36WeightMode::Int4 | Qwen36WeightMode::Q4Km => Some(LinearAttnInt4Sidecars {
                 group_size: QWEN36_MOE_INT4_GROUP_SIZE,
+                in_proj_qkv_type,
                 in_proj_qkv_scale: load_to_gpu(
                     store,
                     ordinal,
@@ -447,6 +486,7 @@ pub(crate) fn load_layer_buffers(
                     ordinal,
                     &format!("{la}.in_proj_qkv.weight_int4_zero"),
                 )?,
+                in_proj_z_type,
                 in_proj_z_scale: load_to_gpu(
                     store,
                     ordinal,
@@ -457,6 +497,7 @@ pub(crate) fn load_layer_buffers(
                     ordinal,
                     &format!("{la}.in_proj_z.weight_int4_zero"),
                 )?,
+                out_proj_type,
                 out_proj_scale: load_to_gpu(
                     store,
                     ordinal,
@@ -470,18 +511,21 @@ pub(crate) fn load_layer_buffers(
             }),
             Qwen36WeightMode::Fp8 => Some(LinearAttnInt4Sidecars {
                 group_size: -QWEN36_MOE_FP8_BLOCK_SIZE,
+                in_proj_qkv_type: QWEN36_MOE_LOWBIT_NATIVE_INT4,
                 in_proj_qkv_scale: load_to_gpu(
                     store,
                     ordinal,
                     &format!("{la}.in_proj_qkv.weight_scale_inv"),
                 )?,
                 in_proj_qkv_zero: GpuBuffer::zeros(ordinal, ScalarType::U8, &[1])?,
+                in_proj_z_type: QWEN36_MOE_LOWBIT_NATIVE_INT4,
                 in_proj_z_scale: load_to_gpu(
                     store,
                     ordinal,
                     &format!("{la}.in_proj_z.weight_scale_inv"),
                 )?,
                 in_proj_z_zero: GpuBuffer::zeros(ordinal, ScalarType::U8, &[1])?,
+                out_proj_type: QWEN36_MOE_LOWBIT_NATIVE_INT4,
                 out_proj_scale: load_to_gpu(
                     store,
                     ordinal,
@@ -552,6 +596,7 @@ pub(crate) fn load_layer_buffers(
                 ordinal,
                 &format!("{mp}.experts.down_proj_int4_zero"),
             )?,
+            shared_gate_proj_type: QWEN36_MOE_LOWBIT_NATIVE_INT4,
             shared_gate_proj_scale: load_to_gpu(
                 store,
                 ordinal,
@@ -562,6 +607,7 @@ pub(crate) fn load_layer_buffers(
                 ordinal,
                 &format!("{mp}.shared_expert.gate_proj.weight_int4_zero"),
             )?,
+            shared_up_proj_type: QWEN36_MOE_LOWBIT_NATIVE_INT4,
             shared_up_proj_scale: load_to_gpu(
                 store,
                 ordinal,
@@ -572,6 +618,7 @@ pub(crate) fn load_layer_buffers(
                 ordinal,
                 &format!("{mp}.shared_expert.up_proj.weight_int4_zero"),
             )?,
+            shared_down_proj_type: QWEN36_MOE_LOWBIT_NATIVE_INT4,
             shared_down_proj_scale: load_to_gpu(
                 store,
                 ordinal,
@@ -594,6 +641,10 @@ pub(crate) fn load_layer_buffers(
             down_proj_type: ggml_lowbit_type_for_layout(store, &format!("{mp}.experts.down_proj"))?,
             down_proj_scale: GpuBuffer::zeros(ordinal, ScalarType::U8, &[1])?,
             down_proj_zero: GpuBuffer::zeros(ordinal, ScalarType::U8, &[1])?,
+            shared_gate_proj_type: ggml_lowbit_type_for_layout(
+                store,
+                &format!("{mp}.shared_expert.gate_proj.weight"),
+            )?,
             shared_gate_proj_scale: load_to_gpu(
                 store,
                 ordinal,
@@ -604,6 +655,10 @@ pub(crate) fn load_layer_buffers(
                 ordinal,
                 &format!("{mp}.shared_expert.gate_proj.weight_int4_zero"),
             )?,
+            shared_up_proj_type: ggml_lowbit_type_for_layout(
+                store,
+                &format!("{mp}.shared_expert.up_proj.weight"),
+            )?,
             shared_up_proj_scale: load_to_gpu(
                 store,
                 ordinal,
@@ -613,6 +668,10 @@ pub(crate) fn load_layer_buffers(
                 store,
                 ordinal,
                 &format!("{mp}.shared_expert.up_proj.weight_int4_zero"),
+            )?,
+            shared_down_proj_type: ggml_lowbit_type_for_layout(
+                store,
+                &format!("{mp}.shared_expert.down_proj.weight"),
             )?,
             shared_down_proj_scale: load_to_gpu(
                 store,
@@ -641,18 +700,21 @@ pub(crate) fn load_layer_buffers(
             )?,
             down_proj_type: QWEN36_MOE_LOWBIT_NATIVE_INT4,
             down_proj_zero: GpuBuffer::zeros(ordinal, ScalarType::U8, &[1])?,
+            shared_gate_proj_type: QWEN36_MOE_LOWBIT_NATIVE_INT4,
             shared_gate_proj_scale: load_to_gpu(
                 store,
                 ordinal,
                 &format!("{mp}.shared_expert.gate_proj.weight_scale_inv"),
             )?,
             shared_gate_proj_zero: GpuBuffer::zeros(ordinal, ScalarType::U8, &[1])?,
+            shared_up_proj_type: QWEN36_MOE_LOWBIT_NATIVE_INT4,
             shared_up_proj_scale: load_to_gpu(
                 store,
                 ordinal,
                 &format!("{mp}.shared_expert.up_proj.weight_scale_inv"),
             )?,
             shared_up_proj_zero: GpuBuffer::zeros(ordinal, ScalarType::U8, &[1])?,
+            shared_down_proj_type: QWEN36_MOE_LOWBIT_NATIVE_INT4,
             shared_down_proj_scale: load_to_gpu(
                 store,
                 ordinal,

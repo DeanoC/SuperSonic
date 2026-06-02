@@ -2335,12 +2335,16 @@ impl Default for Qwen36MoeAttnStepWeights {
 #[derive(Debug, Clone, Copy)]
 pub struct Qwen36MoeAttnStepInt4 {
     pub group_size: i32,
+    pub q_proj_type: i32,
     pub q_proj_scale: *const c_void,
     pub q_proj_zero: *const c_void,
+    pub k_proj_type: i32,
     pub k_proj_scale: *const c_void,
     pub k_proj_zero: *const c_void,
+    pub v_proj_type: i32,
     pub v_proj_scale: *const c_void,
     pub v_proj_zero: *const c_void,
+    pub o_proj_type: i32,
     pub o_proj_scale: *const c_void,
     pub o_proj_zero: *const c_void,
 }
@@ -2351,12 +2355,16 @@ impl Qwen36MoeAttnStepInt4 {
     pub const fn disabled() -> Self {
         Self {
             group_size: 0,
+            q_proj_type: 0,
             q_proj_scale: std::ptr::null(),
             q_proj_zero: std::ptr::null(),
+            k_proj_type: 0,
             k_proj_scale: std::ptr::null(),
             k_proj_zero: std::ptr::null(),
+            v_proj_type: 0,
             v_proj_scale: std::ptr::null(),
             v_proj_zero: std::ptr::null(),
+            o_proj_type: 0,
             o_proj_scale: std::ptr::null(),
             o_proj_zero: std::ptr::null(),
         }
@@ -3187,10 +3195,13 @@ pub struct Qwen36MoeLinearStepWeights {
 #[derive(Debug, Clone, Copy)]
 pub struct Qwen36MoeLinearStepInt4 {
     pub group_size: i32,
+    pub in_proj_qkv_type: i32,
     pub in_proj_qkv_scale: *const c_void,
     pub in_proj_qkv_zero: *const c_void,
+    pub in_proj_z_type: i32,
     pub in_proj_z_scale: *const c_void,
     pub in_proj_z_zero: *const c_void,
+    pub out_proj_type: i32,
     pub out_proj_scale: *const c_void,
     pub out_proj_zero: *const c_void,
 }
@@ -3200,10 +3211,13 @@ impl Qwen36MoeLinearStepInt4 {
     pub const fn disabled() -> Self {
         Self {
             group_size: 0,
+            in_proj_qkv_type: 0,
             in_proj_qkv_scale: std::ptr::null(),
             in_proj_qkv_zero: std::ptr::null(),
+            in_proj_z_type: 0,
             in_proj_z_scale: std::ptr::null(),
             in_proj_z_zero: std::ptr::null(),
+            out_proj_type: 0,
             out_proj_scale: std::ptr::null(),
             out_proj_zero: std::ptr::null(),
         }
@@ -3961,10 +3975,13 @@ pub struct Qwen36MoeFfnStepInt4 {
     pub down_proj_type: i32,
     pub down_proj_scale: *const c_void,
     pub down_proj_zero: *const c_void,
+    pub shared_gate_proj_type: i32,
     pub shared_gate_proj_scale: *const c_void,
     pub shared_gate_proj_zero: *const c_void,
+    pub shared_up_proj_type: i32,
     pub shared_up_proj_scale: *const c_void,
     pub shared_up_proj_zero: *const c_void,
+    pub shared_down_proj_type: i32,
     pub shared_down_proj_scale: *const c_void,
     pub shared_down_proj_zero: *const c_void,
 }
@@ -3982,10 +3999,13 @@ impl Qwen36MoeFfnStepInt4 {
             down_proj_type: 0,
             down_proj_scale: std::ptr::null(),
             down_proj_zero: std::ptr::null(),
+            shared_gate_proj_type: 0,
             shared_gate_proj_scale: std::ptr::null(),
             shared_gate_proj_zero: std::ptr::null(),
+            shared_up_proj_type: 0,
             shared_up_proj_scale: std::ptr::null(),
             shared_up_proj_zero: std::ptr::null(),
+            shared_down_proj_type: 0,
             shared_down_proj_scale: std::ptr::null(),
             shared_down_proj_zero: std::ptr::null(),
         }
@@ -15048,12 +15068,16 @@ mod tests {
             kv_max_t: 0,
         };
         let int4 = Qwen36MoeAttnStepInt4 {
+            q_proj_type: 4,
             q_proj_scale: q_proj_scale.as_ptr(),
             q_proj_zero: q_proj_zero.as_ptr(),
+            k_proj_type: 0,
             k_proj_scale: std::ptr::null(),
             k_proj_zero: std::ptr::null(),
+            v_proj_type: 0,
             v_proj_scale: std::ptr::null(),
             v_proj_zero: std::ptr::null(),
+            o_proj_type: 0,
             o_proj_scale: std::ptr::null(),
             o_proj_zero: std::ptr::null(),
             group_size: group_size as i32,
@@ -17390,12 +17414,16 @@ mod tests {
         };
         let int4_ptrs = Qwen36MoeAttnStepInt4 {
             group_size,
+            q_proj_type: 4,
             q_proj_scale: q_scale_buf.as_ptr(),
             q_proj_zero: q_zero_buf.as_ptr(),
+            k_proj_type: 4,
             k_proj_scale: k_scale_buf.as_ptr(),
             k_proj_zero: k_zero_buf.as_ptr(),
+            v_proj_type: 4,
             v_proj_scale: v_scale_buf.as_ptr(),
             v_proj_zero: v_zero_buf.as_ptr(),
+            o_proj_type: 4,
             o_proj_scale: o_scale_buf.as_ptr(),
             o_proj_zero: o_zero_buf.as_ptr(),
         };
@@ -18694,10 +18722,13 @@ mod tests {
         };
         let int4_ptrs = Qwen36MoeLinearStepInt4 {
             group_size,
+            in_proj_qkv_type: 4,
             in_proj_qkv_scale: qkv_scale_buf.as_ptr(),
             in_proj_qkv_zero: qkv_zero_buf.as_ptr(),
+            in_proj_z_type: 4,
             in_proj_z_scale: z_scale_buf.as_ptr(),
             in_proj_z_zero: z_zero_buf.as_ptr(),
+            out_proj_type: 4,
             out_proj_scale: out_scale_buf.as_ptr(),
             out_proj_zero: out_zero_buf.as_ptr(),
         };
@@ -19871,10 +19902,13 @@ mod tests {
             down_proj_type: 4,
             down_proj_scale: std::ptr::null(),
             down_proj_zero: std::ptr::null(),
+            shared_gate_proj_type: 4,
             shared_gate_proj_scale: sgp_scale_buf.as_ptr(),
             shared_gate_proj_zero: sgp_zero_buf.as_ptr(),
+            shared_up_proj_type: 4,
             shared_up_proj_scale: sup_scale_buf.as_ptr(),
             shared_up_proj_zero: sup_zero_buf.as_ptr(),
+            shared_down_proj_type: 4,
             shared_down_proj_scale: sdp_scale_buf.as_ptr(),
             shared_down_proj_zero: sdp_zero_buf.as_ptr(),
         };
@@ -20114,10 +20148,13 @@ mod tests {
             down_proj_type: 4,
             down_proj_scale: std::ptr::null(),
             down_proj_zero: std::ptr::null(),
+            shared_gate_proj_type: 4,
             shared_gate_proj_scale: sgp_scale_buf.as_ptr(),
             shared_gate_proj_zero: sgp_zero_buf.as_ptr(),
+            shared_up_proj_type: 4,
             shared_up_proj_scale: sup_scale_buf.as_ptr(),
             shared_up_proj_zero: sup_zero_buf.as_ptr(),
+            shared_down_proj_type: 4,
             shared_down_proj_scale: sdp_scale_buf.as_ptr(),
             shared_down_proj_zero: sdp_zero_buf.as_ptr(),
         };
@@ -20348,10 +20385,13 @@ mod tests {
             down_proj_type: 4,
             down_proj_scale: dp_scale_buf.as_ptr(),
             down_proj_zero: dp_zero_buf.as_ptr(),
+            shared_gate_proj_type: 4,
             shared_gate_proj_scale: sgp_scale_buf.as_ptr(),
             shared_gate_proj_zero: sgp_zero_buf.as_ptr(),
+            shared_up_proj_type: 4,
             shared_up_proj_scale: sup_scale_buf.as_ptr(),
             shared_up_proj_zero: sup_zero_buf.as_ptr(),
+            shared_down_proj_type: 4,
             shared_down_proj_scale: sdp_scale_buf.as_ptr(),
             shared_down_proj_zero: sdp_zero_buf.as_ptr(),
         };
