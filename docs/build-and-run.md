@@ -371,8 +371,12 @@ Metal currently rejects or defers:
   `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_FUSED_EXACT=1` selects the
   monolithic exact router candidate instead of the default split exact-SIMD
   router. It is useful for launch-count and local router-parity attribution, but
-  remains diagnostic-only because the raw Q4_K_M stream diverges from the
-  default exact-SIMD router path. Profile runs emit
+  remains diagnostic-only because its stream-stable command-buffer cadence is
+  slower than the default exact-SIMD router path. When this fused router is
+  enabled, decode batch now avoids splitting each FFN into its own deferred
+  command buffer by default; set
+  `SUPERSONIC_METAL_QWEN36_DECODE_BATCH_FFN_COMMIT_INTERVAL=N` to override that
+  cadence during scheduling experiments. Profile runs emit
   `[qwen36-expert-residency]` and `[qwen36-expert-residency-policy]`; set
   `SUPERSONIC_QWEN36_EXPERT_RESIDENCY_PROFILE=1` to collect the same residency
   counters without enabling the full Metal/HAL profile tables. The one-token

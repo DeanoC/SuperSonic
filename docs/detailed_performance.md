@@ -1330,13 +1330,37 @@ measured `68.5 ms/token` (`14.60 tok/s`) and diverged at generated-token index
 `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_FUSED_EXACT=1` diagnostic-only; local
 router parity is not enough for stream parity on the target raw lane.
 
+Follow-up boundary checks showed that the fused router math was not the source
+of the drift. A position-12 layer-output tap matched all 80 captured
+attention/FFN rows between exact-SIMD and fused exact, and no-tap fused runs
+matched the exact generated stream at 13, 16, and 32 generated tokens. The
+fused 64-token run
+(`/tmp/supersonic-qwen35-raw-q4km-fused-exact-notap-64.log`) diverged later at
+generated-token index 33 (`27797` vs. `207577`), while the exact-SIMD 64-token
+control (`/tmp/supersonic-qwen35-raw-q4km-exact-simd-notap-64.log`) matched the
+128-token exact prefix. Forcing the whole decode batch into the sync-phase
+cadence with `SUPERSONIC_METAL_QWEN36_DECODE_BATCH_SYNC_PHASES=1`
+(`/tmp/supersonic-qwen35-raw-q4km-fused-exact-sync-phases-64.log`) restored the
+64-token fused stream but slowed it from `68.1 ms/token` to `81.3 ms/token`.
+Using the narrower existing
+`SUPERSONIC_METAL_QWEN36_DECODE_BATCH_FFN_COMMIT_INTERVAL=9999`
+(`/tmp/supersonic-qwen35-raw-q4km-fused-exact-ffn-commit-9999-64.log`) also
+restored the stream at `76.4 ms/token` in the same investigation. The runtime
+now applies that no-per-layer-FFN-deferred-commit cadence automatically when
+`SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_FUSED_EXACT=1` is set, unless an
+explicit `SUPERSONIC_METAL_QWEN36_DECODE_BATCH_FFN_COMMIT_INTERVAL` override is
+provided. Rebuilt verification remained parity-clean
+(`/tmp/supersonic-qwen35-raw-q4km-fused-exact-default-safe-64-repeat.log`), with
+current warmed samples landing at `89.2 ms/token` for the default fused-safe
+cadence and `83.6 ms/token` for an explicit interval-9999 rerun
+(`/tmp/supersonic-qwen35-raw-q4km-fused-exact-ffn-commit-9999-64-newbin.log`).
+
 The current gap is therefore not a one-line launch-count fix; the Metal profile
 still points at the chained per-layer decode structure and command-buffer waits.
-A naive experiment that coalesced phase command buffers reduced command-buffer
-count but increased wait time. The latest clean 64-token control with
-`SUPERSONIC_METAL_QWEN36_DECODE_BATCH_SYNC_PHASES=1` matched the default
-generated IDs but slowed from 80.0 to 94.7 ms/token, so the default path keeps
-the existing per-phase commit ordering for overlap.
+For the promoted exact-SIMD router, the default path keeps the existing
+per-phase commit ordering for overlap. For the diagnostic fused-exact router,
+the stream-safe FFN commit cadence is useful evidence that the drift is a
+scheduling/resource-ordering problem, but it is not a performance promotion.
 
 Follow-up optimization probes on 2026-06-01 kept the headline unchanged but
 identified the next safe work area:

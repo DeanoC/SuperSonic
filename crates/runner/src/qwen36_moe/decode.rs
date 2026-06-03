@@ -223,11 +223,19 @@ fn qwen36_metal_decode_batch_deferred_commits_enabled() -> bool {
 }
 
 fn qwen36_metal_decode_batch_ffn_commit_interval() -> usize {
-    std::env::var("SUPERSONIC_METAL_QWEN36_DECODE_BATCH_FFN_COMMIT_INTERVAL")
+    if let Some(value) = std::env::var("SUPERSONIC_METAL_QWEN36_DECODE_BATCH_FFN_COMMIT_INTERVAL")
         .ok()
         .and_then(|raw| raw.trim().parse::<usize>().ok())
         .filter(|&value| value > 0)
-        .unwrap_or(1)
+    {
+        return value;
+    }
+    if qwen36_metal_router_stage5_fused_exact_env_enabled() {
+        // The monolithic fused router is stream-stable only when its FFN stage
+        // is not split into its own deferred command buffer per layer.
+        return usize::MAX;
+    }
+    1
 }
 
 fn qwen36_metal_decode_batch_ffn_profile_phases_enabled() -> bool {
