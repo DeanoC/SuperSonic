@@ -370,9 +370,9 @@ Metal currently rejects or defers:
   `SUPERSONIC_METAL_QWEN36_FFN_ROUTER_STAGE5_PARITY_TAP_LAYER`.
   `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_FUSED_EXACT=1` selects the
   monolithic exact router candidate instead of the default split exact-SIMD
-  router; it is useful for parity and launch-count attribution, but remains a
-  diagnostic option because same-session measurements are slower than the
-  default. Profile runs emit
+  router. It is useful for launch-count and local router-parity attribution, but
+  remains diagnostic-only because the raw Q4_K_M stream diverges from the
+  default exact-SIMD router path. Profile runs emit
   `[qwen36-expert-residency]` and `[qwen36-expert-residency-policy]`; set
   `SUPERSONIC_QWEN36_EXPERT_RESIDENCY_PROFILE=1` to collect the same residency
   counters without enabling the full Metal/HAL profile tables. The one-token

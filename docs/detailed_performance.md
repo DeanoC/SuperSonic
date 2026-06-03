@@ -1314,6 +1314,22 @@ IDs, but the fused candidate was slower: default exact-SIMD
 router can be made parity-clean, but the current monolithic shape is not the
 speed win.
 
+The actual raw Q4_K_M target lane was rechecked immediately after that control
+run using the existing local bake at
+`$HOME/.cache/supersonic-metal-models/qwen3.5-35b-a3b/.supersonic/v2-q4km`.
+The 8-token fused-router tap
+(`/tmp/supersonic-qwen35-raw-q4km-router-fused-exact-decode-batch-tap-8.log`)
+again captured all 320 layer rows with exact router agreement against the host
+reference. However, no-tap 128-token A/B showed the monolithic fused router is
+not stream-parity-safe on raw Q4_K_M: default exact-SIMD
+(`/tmp/supersonic-qwen35-raw-q4km-router-exact-simd-decode-batch-128.log`)
+measured `67.3 ms/token` (`14.86 tok/s`), while fused exact
+(`/tmp/supersonic-qwen35-raw-q4km-router-fused-exact-decode-batch-128.log`)
+measured `68.5 ms/token` (`14.60 tok/s`) and diverged at generated-token index
+12 (`79609` vs. `194939`). Keep
+`SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_FUSED_EXACT=1` diagnostic-only; local
+router parity is not enough for stream parity on the target raw lane.
+
 The current gap is therefore not a one-line launch-count fix; the Metal profile
 still points at the chained per-layer decode structure and command-buffer waits.
 A naive experiment that coalesced phase command buffers reduced command-buffer
