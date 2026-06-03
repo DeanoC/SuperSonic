@@ -376,15 +376,13 @@ Metal currently rejects or defers:
   diagnostic-only and intentionally doubles FFN stage work so the aggregate
   baseline can be compared against the split-phase total. Add
   `SUPERSONIC_METAL_PROFILE_QWEN36_ROUTER_PHASES=1` to split the router block
-  into norm/logits/top-k labels. A parity-oriented top-k selector probe,
-  `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_TOPK_PARALLEL_SELECT=1`, keeps the
-  same BF16-rounded probability scratch as the default top-k kernel but selects
-  each routed expert with an 8-way deterministic block scan instead of a full
-  serial scan on thread 0. This path now emits a resource-specific Metal barrier
-  for the top-k workspace/output-index buffers; earlier reduction-only variants
-  were parity-clean under taps but diverged in repeated 512-token no-tap gates.
-  It remains opt-in while longer benchmark coverage accumulates. Decode-batch
-  router parity can be tapped without forcing the older chained router path by setting
+  into norm/logits/top-k labels. The default router top-k selector keeps the
+  same BF16-rounded probability scratch as the serial kernel but selects each
+  routed expert with an 8-way deterministic block scan and emits a
+  resource-specific Metal barrier for the top-k workspace/output-index buffers.
+  Set `SUPERSONIC_METAL_DISABLE_QWEN36_FFN_ROUTER_TOPK_PARALLEL_SELECT=1` to
+  force the older serial scan for comparison. Decode-batch router parity can be
+  tapped without forcing the older chained router path by setting
   `SUPERSONIC_METAL_QWEN36_DECODE_BATCH_ROUTER_STAGE5_PARITY_TAP=1`; narrow it
   with the matching `_MAX_CALLS`, `_POSITION`, and `_LAYER` suffixes. The legacy
   non-batch router tap also supports
