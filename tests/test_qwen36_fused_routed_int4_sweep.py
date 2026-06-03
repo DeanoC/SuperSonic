@@ -1982,6 +1982,17 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
                     "total_ms": 12.0,
                     "max_ms": 7.0,
                 },
+                {
+                    "op": (
+                        "command_buffer_gpu:"
+                        "qwen36_ffn_int4_expert_down_finalize_rowpair_topk_parallel"
+                    ),
+                    "path": "runtime",
+                    "calls": 2,
+                    "mean_ms": 3.0,
+                    "total_ms": 6.0,
+                    "max_ms": 4.0,
+                },
             ]
         )
 
@@ -1992,9 +2003,9 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
         )
 
         self.assertEqual(candidate["decode_batch_ffn_expert_gate_up_gpu_ms"], 8.0)
-        self.assertEqual(candidate["decode_batch_ffn_expert_down_gpu_ms"], 12.0)
-        self.assertEqual(candidate["decode_batch_ffn_gpu_ms"], 20.0)
-        self.assertEqual(candidate["fused_gpu_ms"], 20.0)
+        self.assertEqual(candidate["decode_batch_ffn_expert_down_gpu_ms"], 18.0)
+        self.assertEqual(candidate["decode_batch_ffn_gpu_ms"], 26.0)
+        self.assertEqual(candidate["fused_gpu_ms"], 26.0)
 
     def test_router_parity_tap_rows_are_parsed_and_rendered(self):
         script = sweep_qwen36_fused_routed_int4

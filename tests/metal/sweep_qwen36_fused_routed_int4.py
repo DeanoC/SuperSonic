@@ -554,6 +554,7 @@ BATCH_FFN_PHASE_GPU_FIELDS = {
     "decode_batch_ffn_expert_down_gpu_ms": (
         "command_buffer_gpu:qwen36_ffn_int4_expert_down_finalize",
         "command_buffer_gpu:qwen36_ffn_int4_expert_down_finalize_multirow",
+        "command_buffer_gpu:qwen36_ffn_int4_expert_down_finalize_rowpair_topk_parallel",
     ),
 }
 

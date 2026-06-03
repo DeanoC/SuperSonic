@@ -329,6 +329,11 @@ Metal currently rejects or defers:
   top-k-parallel expert-down/finalize variant. It reuses the raw GGML Q4_K
   pair-dot helper when running `--q4km`, but remains diagnostic-only because
   same-session 128-token A/B was slower than the default FFN finalizer.
+  `SUPERSONIC_METAL_DIAG_QWEN36_FFN_EXPERT_DOWN_ROWPAIR_TOPK_PARALLEL=1`
+  tests a two-row, top-k-parallel raw Q4_K_M expert-down/finalize variant. It
+  is diagnostic-only: a 128-token A/B preserved the stream and reduced the
+  profiled expert-down phase, but the 512-token gate diverged later in the
+  stream.
   `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_DOWN_GATHERED=1` tests the
   MLX-shaped selected-expert down path: compute `[top_k, hidden]` down outputs
   into the existing FFN workspace, then combine top-k weights in a separate

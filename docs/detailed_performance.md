@@ -1418,6 +1418,19 @@ identified the next safe work area:
   `qwen36_ffn_int4_expert_down_finalize_multirow`; the 4-token label smoke
   emitted both names and preserved the known prefix
   (`/tmp/supersonic-qwen35-raw-q4km-multirow-label-smoke-4.log`).
+  A follow-up rowpair/top-k-parallel expert-down probe is available only behind
+  `SUPERSONIC_METAL_DIAG_QWEN36_FFN_EXPERT_DOWN_ROWPAIR_TOPK_PARALLEL=1`.
+  It computes two output rows per threadgroup while assigning one simdgroup per
+  top-k expert. The 8-token smoke preserved the known raw Q4_K_M prefix
+  (`/tmp/supersonic-qwen35-raw-q4km-rowpair-topk-smoke-8.log`), and a
+  128-token profiled A/B matched the generated stream while reducing expert
+  down finalize from `586.979 ms` (`0.1146 ms/call`) to `521.111 ms`
+  (`0.1018 ms/call`) and moving the profiled run from `120.1` to
+  `116.3 ms/token`
+  (`/tmp/supersonic-qwen35-raw-q4km-rowpair-{default,enabled}-ab-128.log`).
+  It is not promotable: the 512-token gate was faster (`63.0` vs
+  `64.8 ms/token`) but diverged at generated-token index 251
+  (`/tmp/supersonic-qwen35-raw-q4km-rowpair-{default,enabled}-gate-512.log`).
 - The opt-in native full-attention path is also a real speed lever but not
   promotable yet. `SUPERSONIC_METAL_ENABLE_QWEN36_FULL_ATTN_NATIVE=1` measured
   58.4 ms/token on a 128-token run but diverged at token 0. Adding
