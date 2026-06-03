@@ -1248,6 +1248,22 @@ as the older commit-interval result: simple loop unrolling or wider FFN command
 grouping is not enough; any deeper FFN fusion has to preserve the compiler's
 current exact reduction shape or move a larger, naturally synchronized phase.
 
+A fresh 2026-06-03 default raw `--q4km` 512-token profile after committing the
+diagnostic gathered path measured `90.8 ms/token` under `--emit-stage-timings`
+(`/tmp/supersonic-qwen35-raw-q4km-512-stage-20260603.log`). The breakdown was
+`chain=85.536 ms/token`, `lm_head=3.125`, `full_attn=16.767`,
+`linear_attn=11.428`, and `ffn=57.165`, so the profiled raw lane is still
+FFN-dominated at the long benchmark length. A narrow router top-k parallel
+selection prototype was then tried: it kept the same BF16 softmax probability
+rounding and attempted to parallelize only the selected-expert scan. The
+128-token same-settings A/B was faster in isolation (`70.7 ms/token` versus
+default `73.3`) but diverged from the default generated stream at token 9
+(`/tmp/supersonic-router-topk-parallel-select-128-20260603.log` versus
+`/tmp/supersonic-router-topk-default-128-20260603.log`), so that prototype was
+removed. The next FFN attempt should therefore target a larger exact router/FFN
+phase consolidation with explicit top-k parity taps, not a silent replacement
+of the top-k scan order.
+
 The current gap is therefore not a one-line launch-count fix; the Metal profile
 still points at the chained per-layer decode structure and command-buffer waits.
 A naive experiment that coalesced phase command buffers reduced command-buffer
