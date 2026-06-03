@@ -1398,6 +1398,26 @@ identified the next safe work area:
   128-token stream but slowed to 71.7 ms/token
   (`/tmp/qwen35_ffn_commit_interval2_128.log`), confirming that the current
   per-FFN commits are buying enough CPU/GPU overlap to offset their launch cost.
+  A current-tree revisit of the same scheduling lever kept 64-token streams
+  aligned for intervals 1, 2, 4, 8, and 9999; interval 9999 was fastest in that
+  short smoke (`77.8 ms/token` vs `81.2 ms/token` for interval 1,
+  `/tmp/supersonic-qwen35-raw-q4km-exact-ffn-interval-9999-64.log`). Two
+  128-token pairs also matched and showed a small interval-9999 edge
+  (`66.05` vs `67.35 ms/token` median), but the 512-token gate did not promote:
+  interval 9999 diverged at generated-token index 408 for only `0.1 ms/token`
+  improvement (`65.4` vs `65.5 ms/token`;
+  `/tmp/supersonic-qwen35-raw-q4km-exact-interval9999-512-gate.log`).
+  Keep the promoted exact-SIMD path on the default interval-1 cadence.
+  Rechecking the MLX-shaped gathered expert-down path in the same tree also
+  tied the default rather than improving it: three 128-token pairs measured
+  equal medians of `64.3 ms/token`, with pairwise generated streams matching in
+  two of three pairs and one late pairwise divergence at token 97
+  (`/tmp/supersonic-qwen35-raw-q4km-gathered-current-ab-*.log`).
+  The split profiler now labels raw Q4_K_M expert subphases precisely as
+  `qwen36_ffn_int4_expert_gate_up_multirow_stage5` and
+  `qwen36_ffn_int4_expert_down_finalize_multirow`; the 4-token label smoke
+  emitted both names and preserved the known prefix
+  (`/tmp/supersonic-qwen35-raw-q4km-multirow-label-smoke-4.log`).
 - The opt-in native full-attention path is also a real speed lever but not
   promotable yet. `SUPERSONIC_METAL_ENABLE_QWEN36_FULL_ATTN_NATIVE=1` measured
   58.4 ms/token on a 128-token run but diverged at token 0. Adding

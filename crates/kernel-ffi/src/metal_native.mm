@@ -16311,13 +16311,17 @@ extern "C" int supersonic_metal_qwen36_ffn_int4_stage5(
             if ((status = submit_profile_phase(encode_shared_down, shared_down_label, 991, 992, 993, 994)) != 0) return status;
             const std::string expert_gate_label = expert_gate_up_host_order
                 ? "qwen36_ffn_int4_expert_gate_up_host_order_stage5"
-                : "qwen36_ffn_int4_expert_gate_up_tiled_stage5";
+                : (raw_ggml_experts
+                    ? "qwen36_ffn_int4_expert_gate_up_multirow_stage5"
+                    : "qwen36_ffn_int4_expert_gate_up_tiled_stage5");
             if ((status = submit_profile_phase(encode_expert_gate_up, expert_gate_label, 995, 996, 997, 998)) != 0) return status;
             const std::string expert_down_label = expert_down_topk_parallel
                 ? "qwen36_ffn_int4_expert_down_finalize_topk_parallel"
                 : (expert_down_gathered
                     ? "qwen36_ffn_int4_expert_down_gathered"
-                    : "qwen36_ffn_int4_expert_down_finalize");
+                    : (raw_ggml_experts
+                        ? "qwen36_ffn_int4_expert_down_finalize_multirow"
+                        : "qwen36_ffn_int4_expert_down_finalize"));
             return submit_profile_phase(
                 encode_expert_down_finalize,
                 expert_down_label,
@@ -16871,13 +16875,17 @@ extern "C" int supersonic_metal_qwen36_ffn_int4_stage5_with_router(
             if ((status = submit_profile_phase(encode_shared_down, shared_down_label, 1428, 1429, 1430, 1431)) != 0) return status;
             const std::string expert_gate_label = expert_gate_up_host_order
                 ? "qwen36_ffn_int4_expert_gate_up_host_order_stage5"
-                : "qwen36_ffn_int4_expert_gate_up_tiled_stage5";
+                : (raw_ggml_experts
+                    ? "qwen36_ffn_int4_expert_gate_up_multirow_stage5"
+                    : "qwen36_ffn_int4_expert_gate_up_tiled_stage5");
             if ((status = submit_profile_phase(encode_expert_gate_up, expert_gate_label, 1432, 1433, 1434, 1435)) != 0) return status;
             const std::string expert_down_label = expert_down_topk_parallel
                 ? "qwen36_ffn_int4_expert_down_finalize_topk_parallel"
                 : (expert_down_gathered
                     ? "qwen36_ffn_int4_expert_down_gathered"
-                    : "qwen36_ffn_int4_expert_down_finalize");
+                    : (raw_ggml_experts
+                        ? "qwen36_ffn_int4_expert_down_finalize_multirow"
+                        : "qwen36_ffn_int4_expert_down_finalize"));
             return submit_profile_phase(
                 encode_expert_down_finalize,
                 expert_down_label,
