@@ -4208,6 +4208,17 @@ fn qwen36_ffn_router_stage5_parity_tap_enabled() -> bool {
         && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
 }
 
+fn qwen36_ffn_router_stage5_parity_tap_layer() -> Option<i32> {
+    std::env::var("SUPERSONIC_METAL_QWEN36_FFN_ROUTER_STAGE5_PARITY_TAP_LAYER")
+        .ok()
+        .and_then(|raw| raw.parse::<i32>().ok())
+}
+
+fn qwen36_ffn_router_stage5_parity_tap_enabled_for_layer(layer_idx: i32) -> bool {
+    qwen36_ffn_router_stage5_parity_tap_enabled()
+        && qwen36_ffn_router_stage5_parity_tap_layer().map_or(true, |target| target == layer_idx)
+}
+
 fn qwen36_ffn_shared_stage5_parity_tap_enabled() -> bool {
     std::env::var_os("SUPERSONIC_METAL_QWEN36_FFN_SHARED_STAGE5_PARITY_TAP").is_some()
         && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
@@ -4837,6 +4848,153 @@ fn qwen36_emit_ffn_router_stage5_parity_tap(
         call,
         layer_idx,
         router_path,
+        topk_idx_match as u8,
+        workspace_idx_match as u8,
+        output_idx_match as u8,
+        topk_first_mismatch,
+        workspace_first_idx_mismatch,
+        output_first_idx_mismatch,
+        h_norm_max_abs,
+        h_norm_argmax,
+        logits_max_abs,
+        logits_argmax,
+        host_top_logit_idx,
+        metal_top_logit_idx,
+        host_top_logit,
+        metal_top_logit,
+        host_logit_at_metal_top,
+        metal_logit_at_host_top,
+        topk_weight_max_abs,
+        topk_weight_argmax,
+        qwen36_join_u32(&reference.topk_idx),
+        qwen36_join_u32(&workspace_topk_idx),
+        qwen36_join_u32(output_topk_idx),
+        qwen36_join_f32(&reference.topk_weight),
+        qwen36_join_f32(topk_weight),
+    );
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn emit_decode_batch_router_stage5_parity_tap_from_host(
+    call: usize,
+    position: i32,
+    cache_pos: i32,
+    layer_idx: i32,
+    router_path: &str,
+    phase_profile: bool,
+    input: &[u16],
+    workspace: &[f32],
+    output_idx: &[u32],
+    params: Qwen36MoeFfnStepParams,
+    weights: &Qwen36MoeFfnStepWeights,
+    int4: &Qwen36MoeFfnStepInt4,
+) -> Result<(), GpuError> {
+    if params.stage != 5 {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::emit_decode_batch_router_stage5_parity_tap_from_host requires stage 5, got {}",
+            params.stage
+        )));
+    }
+    if int4.group_size < 0 {
+        return Err(GpuError::InvalidArg(
+            "qwen36_moe::emit_decode_batch_router_stage5_parity_tap_from_host does not support FP8 sidecars"
+                .into(),
+        ));
+    }
+    if !qwen36_ffn_int4_stage5_router_metal_native_supported(params, weights, int4) {
+        return Err(GpuError::InvalidArg(
+            "qwen36_moe::emit_decode_batch_router_stage5_parity_tap_from_host requires the Qwen3.6 Metal INT4 router stage-5 path"
+                .into(),
+        ));
+    }
+
+    let hidden = params.hidden as usize;
+    let num_experts = params.num_experts as usize;
+    let top_k = params.top_k as usize;
+    let off_h_norm = 0;
+    let off_router_logits = hidden;
+    let off_router_probs = off_router_logits + num_experts;
+    let off_topk_val = off_router_probs + num_experts;
+    let off_topk_idx = off_topk_val + top_k;
+    let workspace_needed = off_topk_idx + top_k;
+
+    if input.len() < hidden {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::emit_decode_batch_router_stage5_parity_tap_from_host input too small: need {hidden}, got {}",
+            input.len()
+        )));
+    }
+    if workspace.len() < workspace_needed {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::emit_decode_batch_router_stage5_parity_tap_from_host workspace too small: need {workspace_needed}, got {}",
+            workspace.len()
+        )));
+    }
+    if output_idx.len() < top_k {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::emit_decode_batch_router_stage5_parity_tap_from_host output_idx too small: need {top_k}, got {}",
+            output_idx.len()
+        )));
+    }
+
+    let norm_w =
+        unsafe { std::slice::from_raw_parts(weights.post_attn_norm_w as *const u16, hidden) };
+    let gate_w =
+        unsafe { std::slice::from_raw_parts(weights.gate_w as *const u16, num_experts * hidden) };
+    let reference = qwen36_compute_ffn_router_reference(
+        &input[..hidden],
+        norm_w,
+        gate_w,
+        hidden,
+        num_experts,
+        top_k,
+        params.rms_norm_eps,
+    );
+
+    let h_norm = &workspace[off_h_norm..off_h_norm + hidden];
+    let logits = &workspace[off_router_logits..off_router_logits + num_experts];
+    let topk_weight = &workspace[off_topk_val..off_topk_val + top_k];
+    let workspace_topk_idx: Vec<u32> = workspace[off_topk_idx..off_topk_idx + top_k]
+        .iter()
+        .map(|value| value.to_bits())
+        .collect();
+    let output_topk_idx = &output_idx[..top_k];
+
+    let (h_norm_max_abs, h_norm_argmax) = qwen36_max_abs_delta(&reference.h_norm, h_norm);
+    let (logits_max_abs, logits_argmax) = qwen36_max_abs_delta(&reference.logits, logits);
+    let (topk_weight_max_abs, topk_weight_argmax) =
+        qwen36_max_abs_delta(&reference.topk_weight, topk_weight);
+    let workspace_idx_match = reference.topk_idx == workspace_topk_idx;
+    let output_idx_match = reference.topk_idx.as_slice() == output_topk_idx;
+    let topk_idx_match = workspace_idx_match && output_idx_match;
+    let workspace_first_idx_mismatch =
+        qwen36_first_u32_mismatch(&reference.topk_idx, &workspace_topk_idx);
+    let output_first_idx_mismatch = qwen36_first_u32_mismatch(&reference.topk_idx, output_topk_idx);
+    let topk_first_mismatch = match (workspace_first_idx_mismatch, output_first_idx_mismatch) {
+        (-1, -1) => -1,
+        (-1, output) => output,
+        (workspace, -1) => workspace,
+        (workspace, output) => workspace.min(output),
+    };
+    let (host_top_logit_idx, host_top_logit) = qwen36_argmax_f32(&reference.logits);
+    let (metal_top_logit_idx, metal_top_logit) = qwen36_argmax_f32(logits);
+    let host_logit_at_metal_top = reference
+        .logits
+        .get(metal_top_logit_idx)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let metal_logit_at_host_top = logits.get(host_top_logit_idx).copied().unwrap_or(f32::NAN);
+
+    eprintln!(
+        "[qwen36-decode-batch-router-parity] call={} position={} cache_pos={} layer={} router_path={} phase_profile={} topk_idx_match={} workspace_idx_match={} output_idx_match={} topk_first_mismatch={} workspace_first_idx_mismatch={} output_first_idx_mismatch={} h_norm_max_abs={:.8e} h_norm_argmax={} logits_max_abs={:.8e} logits_argmax={} host_top_logit_idx={} metal_top_logit_idx={} host_top_logit={:.8e} metal_top_logit={:.8e} host_logit_at_metal_top={:.8e} metal_logit_at_host_top={:.8e} topk_weight_max_abs={:.8e} topk_weight_argmax={} host_idx={} workspace_idx={} output_idx={} host_w={} metal_w={}",
+        call,
+        position,
+        cache_pos,
+        layer_idx,
+        router_path,
+        phase_profile as u8,
         topk_idx_match as u8,
         workspace_idx_match as u8,
         output_idx_match as u8,
@@ -10080,7 +10238,8 @@ fn ffn_step_stage1_5_metal_host(
             int4.group_size,
             "down_proj",
         )?;
-        let router_parity_tap = qwen36_ffn_router_stage5_parity_tap_enabled();
+        let router_parity_tap =
+            qwen36_ffn_router_stage5_parity_tap_enabled_for_layer(params.layer_idx);
         let shared_parity_tap = qwen36_ffn_shared_stage5_parity_tap_enabled();
         let shared_host_correction = qwen36_ffn_stage5_shared_host_correction_enabled();
         let shared_mid_host_correction = qwen36_ffn_stage5_shared_mid_host_correction_enabled();

@@ -848,6 +848,8 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
             layer_output_tap=False,
             router_parity_tap=True,
             router_parity_tap_max_calls=3,
+            decode_batch_router_parity_tap=True,
+            decode_batch_router_parity_tap_max_calls=4,
             shared_parity_tap=True,
             shared_parity_tap_max_calls=5,
             routed_parity_tap=True,
@@ -861,6 +863,16 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
         self.assertEqual(
             tap_router["SUPERSONIC_METAL_QWEN36_FFN_ROUTER_STAGE5_PARITY_TAP_MAX_CALLS"],
             "3",
+        )
+        self.assertEqual(
+            tap_router["SUPERSONIC_METAL_QWEN36_DECODE_BATCH_ROUTER_STAGE5_PARITY_TAP"],
+            "1",
+        )
+        self.assertEqual(
+            tap_router[
+                "SUPERSONIC_METAL_QWEN36_DECODE_BATCH_ROUTER_STAGE5_PARITY_TAP_MAX_CALLS"
+            ],
+            "4",
         )
         self.assertEqual(
             tap_router["SUPERSONIC_METAL_QWEN36_FFN_SHARED_STAGE5_PARITY_TAP"],
@@ -1979,6 +1991,76 @@ class Qwen36FusedRoutedInt4SweepTests(unittest.TestCase):
         self.assertIn("## Router Parity Tap", md)
         self.assertIn("| hello | full-stage5-router | simd | 5 | false | 1 |", md)
         self.assertEqual(report["summary"]["router_parity"]["paths"], ["simd"])
+
+    def test_decode_batch_router_parity_tap_rows_are_parsed_and_rendered(self):
+        script = sweep_qwen36_fused_routed_int4
+        output = (
+            "[qwen36-decode-batch-router-parity] call=0 position=64 cache_pos=64 "
+            "layer=5 router_path=simd phase_profile=1 topk_idx_match=1 "
+            "workspace_idx_match=1 output_idx_match=1 topk_first_mismatch=-1 "
+            "workspace_first_idx_mismatch=-1 output_first_idx_mismatch=-1 "
+            "h_norm_max_abs=1.25000000e-01 h_norm_argmax=17 "
+            "logits_max_abs=2.50000000e-01 logits_argmax=33 "
+            "host_top_logit_idx=2 metal_top_logit_idx=2 "
+            "host_top_logit=1.25000000e+00 metal_top_logit=1.25000000e+00 "
+            "host_logit_at_metal_top=1.25000000e+00 "
+            "metal_logit_at_host_top=1.25000000e+00 "
+            "topk_weight_max_abs=3.12500000e-02 topk_weight_argmax=2 "
+            "host_idx=1,2,3 workspace_idx=1,2,3 output_idx=1,2,3 "
+            "host_w=0.50000000,0.25000000,0.12500000 "
+            "metal_w=0.50000000,0.28125000,0.12500000\n"
+        )
+
+        taps = script.parse_decode_batch_router_parity_taps(output)
+
+        self.assertEqual(len(taps), 1)
+        self.assertEqual(taps[0]["position"], 64)
+        self.assertEqual(taps[0]["cache_pos"], 64)
+        self.assertEqual(taps[0]["layer"], 5)
+        self.assertEqual(taps[0]["router_path"], "simd")
+        self.assertEqual(taps[0]["topk_idx_match"], 1)
+        self.assertEqual(taps[0]["host_idx"], "1,2,3")
+        self.assertAlmostEqual(taps[0]["logits_max_abs"], 0.25)
+
+        args = Namespace(
+            max_new_tokens=2,
+            context_size=64,
+            metal_profile=False,
+            metal_profile_phases=False,
+            router_parity_tap=False,
+            router_parity_tap_max_calls=40,
+            decode_batch_router_parity_tap=True,
+            decode_batch_router_parity_tap_max_calls=3,
+            promotion_max_headline_ratio=0.999,
+            promotion_max_ffn_ratio=0.999,
+            promotion_max_component_regression_ratio=1.10,
+            promotion_max_command_buffer_wait_ratio=1.05,
+            promotion_max_fused_wall_gpu_ratio=4.0,
+            promotion_max_wait_gpu_ratio=4.0,
+            promotion_require_profile=False,
+        )
+        candidate = row("full-stage5-router-simd-batch-shared-tiled")
+        candidate["decode_batch_router_parity_taps"] = taps
+        report = script.build_report(
+            [row("default"), candidate],
+            args,
+            ["default", "full-stage5-router-simd-batch-shared-tiled"],
+            "smoke",
+        )
+        md = script.render_markdown(report)
+
+        self.assertIn("decode_batch_router_parity_tap: `True`", md)
+        self.assertIn("decode_batch_router_parity_tap_count: `1`", md)
+        self.assertIn("decode_batch_router_parity_mismatches: `0`", md)
+        self.assertIn("## Decode-Batch Router Parity Tap", md)
+        self.assertIn(
+            "| hello | full-stage5-router-simd-batch-shared-tiled | simd | true | 0 | 64 | 64 | 5 | true | -1 |",
+            md,
+        )
+        self.assertEqual(
+            report["summary"]["decode_batch_router_parity"]["paths"],
+            ["simd"],
+        )
 
     def test_shared_parity_tap_rows_are_parsed_and_rendered(self):
         script = sweep_qwen36_fused_routed_int4

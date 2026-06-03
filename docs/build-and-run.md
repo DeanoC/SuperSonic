@@ -360,7 +360,14 @@ Metal currently rejects or defers:
   Qwen3.6 FFN candidate stages aggregate by default; set
   `SUPERSONIC_METAL_PROFILE_QWEN36_FFN_PHASES=1` with
   `SUPERSONIC_METAL_PROFILE=1` only when you need per-phase FFN command-buffer
-  attribution and accept the extra waited submits. Profile runs emit
+  attribution and accept the extra waited submits. Add
+  `SUPERSONIC_METAL_PROFILE_QWEN36_ROUTER_PHASES=1` to split the router block
+  into norm/logits/top-k labels. Decode-batch router parity can be tapped
+  without forcing the older chained router path by setting
+  `SUPERSONIC_METAL_QWEN36_DECODE_BATCH_ROUTER_STAGE5_PARITY_TAP=1`; narrow it
+  with the matching `_MAX_CALLS`, `_POSITION`, and `_LAYER` suffixes. The legacy
+  non-batch router tap also supports
+  `SUPERSONIC_METAL_QWEN36_FFN_ROUTER_STAGE5_PARITY_TAP_LAYER`. Profile runs emit
   `[qwen36-expert-residency]` and `[qwen36-expert-residency-policy]`; set
   `SUPERSONIC_QWEN36_EXPERT_RESIDENCY_PROFILE=1` to collect the same residency
   counters without enabling the full Metal/HAL profile tables. The one-token

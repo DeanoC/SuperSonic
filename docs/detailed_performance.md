@@ -1264,6 +1264,35 @@ removed. The next FFN attempt should therefore target a larger exact router/FFN
 phase consolidation with explicit top-k parity taps, not a silent replacement
 of the top-k scan order.
 
+The follow-up added the decode-batch-native router parity tap
+`SUPERSONIC_METAL_QWEN36_DECODE_BATCH_ROUTER_STAGE5_PARITY_TAP=1`, with
+`_MAX_CALLS`, `_POSITION`, and `_LAYER` filters. This keeps the default
+decode-batch FFN path active while recomputing the host router reference from
+captured input/workspace/output-index snapshots. The legacy non-batch router
+tap now also accepts
+`SUPERSONIC_METAL_QWEN36_FFN_ROUTER_STAGE5_PARITY_TAP_LAYER`. A one-token raw
+Q4_K_M smoke at layer 0 emitted a matching decode-batch row, and an 8-token
+cross-layer probe (`/tmp/supersonic-decode-batch-router-tap-8tok.log`) captured
+320 router rows with `topk_idx_match=1`, `workspace_idx_match=1`, and
+`output_idx_match=1` throughout. Router selection is therefore not the current
+source of divergence in the default raw lane; optimization can focus on
+preserving the exact selection while reducing the router/FFN phase cost.
+
+A current-tree router-subphase split profile on the same raw Q4_K_M lane
+(`/tmp/supersonic-qwen35-raw-q4km-ffn-router-subphase-16.log`) preserved the
+known 16-token greedy stream:
+`[49602, 165189, 184475, 145239, 31375, 47477, 11625, 58985, 757, 155221,
+22937, 2926, 79609, 6906, 124641, 171294]`. The intentionally slowed split
+profile measured `289.3 ms/token` and still showed FFN dominance. Across 640
+FFN calls, the largest split GPU labels were expert down finalize
+(`89.415 ms`, `0.1397 ms/call`), shared scalar (`80.992 ms`, `0.1266 ms/call`),
+router norm warp-store (`74.047 ms`, `0.1157 ms/call`), router top-k from
+logits (`71.739 ms`, `0.1121 ms/call`), and router logits exact SIMD
+(`66.545 ms`, `0.1040 ms/call`). The next kernel experiment should avoid
+changing top-k ordering and instead look for a parity-safe consolidation or
+scratch/barrier reduction across the exact router subphases and adjacent FFN
+work.
+
 The current gap is therefore not a one-line launch-count fix; the Metal profile
 still points at the chained per-layer decode structure and command-buffer waits.
 A naive experiment that coalesced phase command buffers reduced command-buffer
