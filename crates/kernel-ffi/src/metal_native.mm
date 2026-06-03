@@ -5019,7 +5019,6 @@ kernel void supersonic_qwen36_ffn_router_topk_stage5_from_logits_parallel_select
     device uint* output_idx [[buffer(1)]],
     constant Qwen36FfnInt4Params& params [[buffer(2)]],
     threadgroup float* scratch [[threadgroup(0)]],
-    threadgroup uint* scratch_idx [[threadgroup(1)]],
     uint tid [[thread_index_in_threadgroup]]
 ) {
     if (params.num_experts > 256u || params.top_k > 16u) {
@@ -5055,28 +5054,39 @@ kernel void supersonic_qwen36_ffn_router_topk_stage5_from_logits_parallel_select
 
     float sum_k = 0.0f;
     for (uint k = 0u; k < params.top_k; ++k) {
-        scratch[256u + tid] = scratch[tid];
-        scratch_idx[tid] = (tid < params.num_experts) ? tid : 0xffffffffu;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        for (uint stride = 128u; stride > 0u; stride >>= 1u) {
-            if (tid < stride) {
-                float a_val = scratch[256u + tid];
-                float b_val = scratch[256u + tid + stride];
-                uint a_idx = scratch_idx[tid];
-                uint b_idx = scratch_idx[tid + stride];
-                if (b_val > a_val || (b_val == a_val && b_idx < a_idx)) {
-                    scratch[256u + tid] = b_val;
-                    scratch_idx[tid] = b_idx;
+        // Fixed block scans preserve the serial lower-index tie-break without the
+        // reduction-tree cadence that diverged in no-tap 512-token runs.
+        if (tid < 8u) {
+            uint base = tid * 32u;
+            float best_val = -INFINITY;
+            uint best_idx = params.num_experts;
+            for (uint i = 0u; i < 32u; ++i) {
+                uint expert = base + i;
+                if (expert < params.num_experts) {
+                    float prob = scratch[expert];
+                    if (prob > best_val || (prob == best_val && expert < best_idx)) {
+                        best_val = prob;
+                        best_idx = expert;
+                    }
                 }
             }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+            scratch[256u + tid] = best_val;
+            scratch[264u + tid] = float(best_idx);
         }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
         if (tid == 0u) {
-            float best_val = scratch[256u];
-            uint best_idx = scratch_idx[0];
-            scratch[512u + k] = best_val;
+            float best_val = -INFINITY;
+            uint best_idx = params.num_experts;
+            for (uint block = 0u; block < 8u; ++block) {
+                float block_val = scratch[256u + block];
+                uint block_idx = uint(scratch[264u + block]);
+                if (block_val > best_val || (block_val == best_val && block_idx < best_idx)) {
+                    best_val = block_val;
+                    best_idx = block_idx;
+                }
+            }
+            scratch[272u + k] = best_val;
             output_idx[k] = best_idx;
             sum_k += best_val;
             workspace[params.off_topk_idx + k] = as_type<float>(best_idx);
@@ -5091,7 +5101,7 @@ kernel void supersonic_qwen36_ffn_router_topk_stage5_from_logits_parallel_select
         float inv_k = 1.0f / sum_k;
         for (uint k = 0u; k < params.top_k; ++k) {
             workspace[params.off_topk_val + k] =
-                bf16_round_rne_finite(scratch[512u + k] * inv_k);
+                bf16_round_rne_finite(scratch[272u + k] * inv_k);
         }
     }
 }
@@ -17188,12 +17198,13 @@ extern "C" int supersonic_metal_qwen36_ffn_int4_stage5_with_router(
             [encoder setBuffer:workspace offset:workspace_offset atIndex:0];
             [encoder setBuffer:output_idx offset:output_idx_offset atIndex:1];
             [encoder setBytes:&params length:sizeof(params) atIndex:2];
-            [encoder setThreadgroupMemoryLength:(router_topk_parallel_select ? (512 + 16) : (256 + 16)) * sizeof(float) atIndex:0];
-            if (router_topk_parallel_select) {
-                [encoder setThreadgroupMemoryLength:256 * sizeof(uint32_t) atIndex:1];
-            }
+            [encoder setThreadgroupMemoryLength:(router_topk_parallel_select ? (272 + 16) : (256 + 16)) * sizeof(float) atIndex:0];
             [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1)
                     threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            if (router_topk_parallel_select) {
+                id<MTLResource> topk_outputs[] = { workspace, output_idx };
+                [encoder memoryBarrierWithResources:topk_outputs count:2];
+            }
         };
         auto encode_router = [&](id<MTLComputeCommandEncoder> encoder) {
             if (router_split) {

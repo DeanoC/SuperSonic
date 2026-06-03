@@ -1175,6 +1175,27 @@ opt-in), but the stream instability keeps the parallel selector diagnostic-only
 (`/tmp/supersonic-qwen35-raw-q4km-router-topk-{default,parallel}-512-serial.log`,
 `/tmp/supersonic-qwen35-raw-q4km-router-topk-parallel-512-repeat.log`).
 
+The 2026-06-03 bug hunt isolated that instability to the no-tap Metal command
+cadence around the top-k selector outputs. Targeted decode-batch router parity
+taps at the observed divergent positions (`44`, then `227`, then `39`) matched
+all 40 layers and also made the generated prefix match, so the tap's extra
+snapshot/copy ordering was masking the issue rather than exposing a local
+router math error. A single-float-scratch reduction and then an 8-way block
+selector both still produced at least one divergent 512-token repeat without
+an explicit output barrier. The accepted fix keeps the 8-way deterministic
+block selector and adds a Metal `memoryBarrierWithResources` for the top-k
+workspace and output-index buffers immediately after the top-k dispatch.
+After rebuilding, the opt-in path matched the stable default stream for the
+128-token gate (`/tmp/supersonic-qwen35-raw-q4km-router-topk-blockselect-128.log`)
+and for two 512-token gates:
+`/tmp/supersonic-qwen35-raw-q4km-router-topk-resourcebarrier-512.log` and
+`/tmp/supersonic-qwen35-raw-q4km-router-topk-resourcebarrier-512-repeat.log`.
+The matched 512-token samples measured `88.4` and `86.0 ms/token`, versus the
+same-session stable default at `92.2 ms/token`
+(`/tmp/supersonic-qwen35-raw-q4km-router-topk-default-512-fixed.log`).
+Keep the flag opt-in until it has broader prompt/model coverage, but the prior
+512-token divergence is fixed for the target raw Q4_K_M gate.
+
 A current-tree 2026-06-02 rerun after the online-attention rebuild kept the raw
 default 32-token stream unchanged:
 `[49602, 165189, 184475, 145239, 31375, 47477, 11625, 58985, 757, 155221,
