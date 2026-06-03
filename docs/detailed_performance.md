@@ -1163,6 +1163,21 @@ store. It preserved the 32-token generated stream and cut the profiled router
 norm phase to `22.607 ms`, but the end-to-end 32-token smoke stayed slower
 (`145.1 ms/token`, `ffn_ms_avg=116.280`), so it remains opt-in.
 
+The next parity-safe router-norm probe narrowed that store parallelism to one
+SIMD-width group. It also keeps the mean-square sum serial and preserved the
+same 32-token generated stream. The short router subphase profile reported norm
+`54.421 ms`, logits `48.140 ms`, and top-k `53.072 ms` across 160 invocations.
+A controlled 2026-06-03 A/B pass promoted this path to default: three
+32-token pairs measured median total `139.9 ms/token` with the SIMD-width
+store vs `149.9 ms/token` for the old serial-store default, with FFN median
+`112.6` vs `121.2 ms/token`. A two-pair 128-token confirmation preserved the
+known 128-token stream and measured `90.5`/`88.9 ms/token` vs old-default
+`97.7`/`94.1 ms/token`. Set
+`SUPERSONIC_METAL_DISABLE_QWEN36_FFN_ROUTER_NORM_WARP_STORE=1` to recover the
+old serial-store router norm path, or combine that disable with
+`SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_NORM_PARALLEL_STORE=1` to re-test
+the older 256-thread store experiment.
+
 The 2026-06-02 128-token raw Q4_K_M follow-up used the same two split-profile
 env flags on Apple M5 Max, prompt `Hello`, context 256, and greedy seed
 `20260504`. It preserved the known 128-token stream and measured

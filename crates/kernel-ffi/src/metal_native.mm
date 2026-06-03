@@ -1066,6 +1066,10 @@ bool qwen36_ffn_router_norm_parallel_store_enabled() {
     return NSProcessInfo.processInfo.environment[@"SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_NORM_PARALLEL_STORE"] != nil;
 }
 
+bool qwen36_ffn_router_norm_warp_store_enabled() {
+    return NSProcessInfo.processInfo.environment[@"SUPERSONIC_METAL_DISABLE_QWEN36_FFN_ROUTER_NORM_WARP_STORE"] == nil;
+}
+
 bool qwen36_ffn_shared_all_tiled_enabled() {
     return NSProcessInfo.processInfo.environment[@"SUPERSONIC_METAL_ENABLE_QWEN36_FFN_SHARED_TILED"] != nil;
 }
@@ -3986,6 +3990,7 @@ struct Qwen36FfnInt4Pipelines {
     __strong id<MTLComputePipelineState> router_stage5 = nil;
     __strong id<MTLComputePipelineState> router_norm_stage5 = nil;
     __strong id<MTLComputePipelineState> router_norm_parallel_store_stage5 = nil;
+    __strong id<MTLComputePipelineState> router_norm_warp_store_stage5 = nil;
     __strong id<MTLComputePipelineState> router_norm_exact_simd_stage5 = nil;
     __strong id<MTLComputePipelineState> router_logits_simd_stage5 = nil;
     __strong id<MTLComputePipelineState> router_logits_exact_simd_stage5 = nil;
@@ -4644,6 +4649,37 @@ kernel void supersonic_qwen36_ffn_router_norm_parallel_store_stage5(
     float inv_rms = scratch[0];
 
     for (uint col = tid; col < params.hidden; col += 256u) {
+        workspace[params.off_h_norm + col] = bf16_round_rne_finite(
+            float(input_hidden[col]) * inv_rms * (1.0f + float(post_attn_norm[col]))
+        );
+    }
+}
+
+kernel void supersonic_qwen36_ffn_router_norm_warp_store_stage5(
+    device const bfloat* input_hidden [[buffer(0)]],
+    device const bfloat* post_attn_norm [[buffer(1)]],
+    device float* workspace [[buffer(2)]],
+    constant Qwen36FfnInt4Params& params [[buffer(3)]],
+    constant float& rms_norm_eps [[buffer(4)]],
+    threadgroup float* scratch [[threadgroup(0)]],
+    uint lane [[thread_index_in_threadgroup]]
+) {
+    if (params.hidden > 4096u || lane >= 32u) {
+        return;
+    }
+
+    if (lane == 0u) {
+        float mean_sq = 0.0f;
+        for (uint col = 0u; col < params.hidden; ++col) {
+            float v = float(input_hidden[col]);
+            mean_sq += v * v;
+        }
+        scratch[0] = rsqrt((mean_sq / float(params.hidden)) + rms_norm_eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv_rms = scratch[0];
+
+    for (uint col = lane; col < params.hidden; col += 32u) {
         workspace[params.off_h_norm + col] = bf16_round_rne_finite(
             float(input_hidden[col]) * inv_rms * (1.0f + float(post_attn_norm[col]))
         );
@@ -6046,6 +6082,7 @@ kernel void supersonic_qwen36_ffn_mps_transcode_down_lut(
                         @"supersonic_qwen36_ffn_router_stage5",
                         @"supersonic_qwen36_ffn_router_norm_stage5",
                         @"supersonic_qwen36_ffn_router_norm_parallel_store_stage5",
+                        @"supersonic_qwen36_ffn_router_norm_warp_store_stage5",
                         @"supersonic_qwen36_ffn_router_norm_exact_simd_stage5",
                         @"supersonic_qwen36_ffn_router_logits_simd_stage5",
                         @"supersonic_qwen36_ffn_router_logits_exact_simd_stage5",
@@ -6113,6 +6150,8 @@ kernel void supersonic_qwen36_ffn_mps_transcode_down_lut(
                             pipelines.router_norm_stage5 = pipeline;
                         } else if ([name isEqualToString:@"supersonic_qwen36_ffn_router_norm_parallel_store_stage5"]) {
                             pipelines.router_norm_parallel_store_stage5 = pipeline;
+                        } else if ([name isEqualToString:@"supersonic_qwen36_ffn_router_norm_warp_store_stage5"]) {
+                            pipelines.router_norm_warp_store_stage5 = pipeline;
                         } else if ([name isEqualToString:@"supersonic_qwen36_ffn_router_norm_exact_simd_stage5"]) {
                             pipelines.router_norm_exact_simd_stage5 = pipeline;
                         } else if ([name isEqualToString:@"supersonic_qwen36_ffn_router_logits_simd_stage5"]) {
@@ -6191,6 +6230,7 @@ kernel void supersonic_qwen36_ffn_mps_transcode_down_lut(
     bool ok = pipelines.router_topk != nil && pipelines.router_stage5 != nil &&
         pipelines.router_norm_stage5 != nil &&
         pipelines.router_norm_parallel_store_stage5 != nil &&
+        pipelines.router_norm_warp_store_stage5 != nil &&
         pipelines.router_norm_exact_simd_stage5 != nil &&
         pipelines.router_logits_simd_stage5 != nil &&
         pipelines.router_logits_exact_simd_stage5 != nil &&
@@ -16269,8 +16309,11 @@ extern "C" int supersonic_metal_qwen36_ffn_int4_stage5_with_router(
         bool router_simd = qwen36_ffn_router_stage5_simd_enabled();
         bool router_exact_simd = !router_simd && qwen36_ffn_router_stage5_exact_simd_enabled();
         bool router_norm_exact_simd = router_exact_simd && qwen36_ffn_router_norm_exact_simd_enabled();
-        bool router_norm_parallel_store =
+        bool router_norm_warp_store =
             router_exact_simd && !router_norm_exact_simd &&
+            qwen36_ffn_router_norm_warp_store_enabled();
+        bool router_norm_parallel_store =
+            router_exact_simd && !router_norm_exact_simd && !router_norm_warp_store &&
             qwen36_ffn_router_norm_parallel_store_enabled();
         bool router_exact_multirow = router_exact_simd && qwen36_ffn_router_stage5_exact_multirow_enabled();
         bool router_split = router_simd || router_exact_simd;
@@ -16292,9 +16335,11 @@ extern "C" int supersonic_metal_qwen36_ffn_int4_stage5_with_router(
         if ((!router_split && pipelines.router_stage5 == nil) ||
             (router_split && ((router_norm_exact_simd
                                   ? pipelines.router_norm_exact_simd_stage5
-                                  : (router_norm_parallel_store
-                                      ? pipelines.router_norm_parallel_store_stage5
-                                      : pipelines.router_norm_stage5)) == nil ||
+                                  : (router_norm_warp_store
+                                      ? pipelines.router_norm_warp_store_stage5
+                                      : (router_norm_parallel_store
+                                          ? pipelines.router_norm_parallel_store_stage5
+                                          : pipelines.router_norm_stage5))) == nil ||
                              (router_simd && pipelines.router_logits_simd_stage5 == nil) ||
                              (router_exact_simd && pipelines.router_logits_exact_simd_stage5 == nil) ||
                              (router_exact_multirow && pipelines.router_logits_exact_multirow_stage5 == nil) ||
@@ -16441,17 +16486,20 @@ extern "C" int supersonic_metal_qwen36_ffn_int4_stage5_with_router(
         auto encode_router_norm = [&](id<MTLComputeCommandEncoder> encoder) {
             [encoder setComputePipelineState:router_norm_exact_simd
                 ? pipelines.router_norm_exact_simd_stage5
-                : (router_norm_parallel_store
-                    ? pipelines.router_norm_parallel_store_stage5
-                    : pipelines.router_norm_stage5)];
+                : (router_norm_warp_store
+                    ? pipelines.router_norm_warp_store_stage5
+                    : (router_norm_parallel_store
+                        ? pipelines.router_norm_parallel_store_stage5
+                        : pipelines.router_norm_stage5))];
             [encoder setBuffer:input_hidden offset:input_hidden_offset atIndex:0];
             [encoder setBuffer:post_attn_norm offset:post_attn_norm_offset atIndex:1];
             [encoder setBuffer:workspace offset:workspace_offset atIndex:2];
             [encoder setBytes:&params length:sizeof(params) atIndex:3];
             [encoder setBytes:&rms_norm_eps length:sizeof(rms_norm_eps) atIndex:4];
             [encoder setThreadgroupMemoryLength:256 * sizeof(float) atIndex:0];
+            bool router_norm_uses_warp_group = router_norm_exact_simd || router_norm_warp_store;
             [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1)
-                    threadsPerThreadgroup:MTLSizeMake(router_norm_exact_simd ? 32 : 256, 1, 1)];
+                    threadsPerThreadgroup:MTLSizeMake(router_norm_uses_warp_group ? 32 : 256, 1, 1)];
         };
         auto encode_router_logits = [&](id<MTLComputeCommandEncoder> encoder) {
             [encoder setComputePipelineState:router_exact_simd
@@ -16614,7 +16662,9 @@ extern "C" int supersonic_metal_qwen36_ffn_int4_stage5_with_router(
                         ? "qwen36_ffn_int4_router_topk_stage5_exact_multirow"
                         : (router_norm_exact_simd
                             ? "qwen36_ffn_int4_router_topk_stage5_exact_simd_norm_exact_simd"
-                            : "qwen36_ffn_int4_router_topk_stage5_exact_simd"))
+                            : (router_norm_warp_store
+                                ? "qwen36_ffn_int4_router_topk_stage5_exact_simd_norm_warp_store"
+                                : "qwen36_ffn_int4_router_topk_stage5_exact_simd")))
                     : "qwen36_ffn_int4_router_topk_stage5");
             auto submit_profile_phase = [&](auto encode_fn, const std::string& label,
                                             int queue_error, int command_buffer_error,
@@ -16635,9 +16685,11 @@ extern "C" int supersonic_metal_qwen36_ffn_int4_stage5_with_router(
             if (router_split && qwen36_ffn_router_phase_profile_enabled()) {
                 const std::string router_norm_label = router_norm_exact_simd
                     ? "qwen36_ffn_int4_router_norm_stage5_exact_simd"
-                    : (router_norm_parallel_store
-                        ? "qwen36_ffn_int4_router_norm_stage5_parallel_store"
-                        : "qwen36_ffn_int4_router_norm_stage5");
+                    : (router_norm_warp_store
+                        ? "qwen36_ffn_int4_router_norm_stage5_warp_store"
+                        : (router_norm_parallel_store
+                            ? "qwen36_ffn_int4_router_norm_stage5_parallel_store"
+                            : "qwen36_ffn_int4_router_norm_stage5"));
                 const std::string router_logits_label = router_exact_simd
                     ? (router_exact_multirow
                         ? "qwen36_ffn_int4_router_logits_stage5_exact_multirow"
