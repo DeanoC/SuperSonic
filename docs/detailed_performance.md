@@ -1151,6 +1151,20 @@ calls, while the split subphase summary summed to roughly the same total
 (`/tmp/supersonic-qwen35-raw-q4km-ffn-baseline-profile-1tok.log`), which
 points the next FFN speed work back at in-kernel work and inter-stage scheduling
 rather than hidden split-profile GPU timing inflation.
+The next router/top-k probe adds
+`SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_TOPK_PARALLEL_SELECT=1`. It keeps the
+default top-k kernel's BF16-rounded probability scratch, then replaces the
+thread-0 serial selected-expert scan with a threadgroup reduction that uses the
+same value/index tie-break. A 1-token raw Q4_K_M router-split profile preserved
+`Generated ids: [49602]` and reduced the profiled router top-k phase from
+`8.909 ms` total across 40 FFN calls
+(`/tmp/supersonic-qwen35-raw-q4km-router-split-baseline-profile-1tok.log`) to
+`1.421 ms`
+(`/tmp/supersonic-qwen35-raw-q4km-router-topk-parallel-profile-1tok.log`).
+A 32-token A/B matched generated IDs exactly and measured `81.4 ms/token`
+default vs `69.7 ms/token` with the opt-in
+(`/tmp/supersonic-qwen35-raw-q4km-router-topk-{default,parallel}-32.log`).
+Keep it opt-in until a 128/512-token serial gate confirms the shorter result.
 
 A current-tree 2026-06-02 rerun after the online-attention rebuild kept the raw
 default 32-token stream unchanged:
