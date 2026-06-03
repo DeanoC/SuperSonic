@@ -1139,6 +1139,18 @@ Q4_K_M smoke on Apple M5 Max exited cleanly and emitted one aggregate row per
 `qwen36_ffn_int4_router_topk_stage5_exact_simd` the largest split phase in that
 cold capture (`82.790 ms` total across 160 invocations). Use both env flags for
 future 128-token gates when Metal trace tooling is too heavyweight.
+`SUPERSONIC_METAL_PROFILE_QWEN36_FFN_PHASES_BASELINE=1` now adds a whole-stage
+FFN baseline row to the same split-profile run before the per-phase submits.
+That baseline intentionally runs the FFN stage twice, so it is not a throughput
+mode; it exists to compare the normal single-command-buffer stage GPU time with
+the sum of split command buffers and quantify launch/wait attribution.
+A 1-token raw Q4_K_M smoke emitted the expected
+`qwen36_ffn_int4_stage5_with_router_profile_baseline` row and preserved
+`Generated ids: [49602]`. The baseline was `69.374 ms` total across 40 FFN
+calls, while the split subphase summary summed to roughly the same total
+(`/tmp/supersonic-qwen35-raw-q4km-ffn-baseline-profile-1tok.log`), which
+points the next FFN speed work back at in-kernel work and inter-stage scheduling
+rather than hidden split-profile GPU timing inflation.
 
 A current-tree 2026-06-02 rerun after the online-attention rebuild kept the raw
 default 32-token stream unchanged:

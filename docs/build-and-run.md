@@ -371,6 +371,10 @@ Metal currently rejects or defers:
   `SUPERSONIC_METAL_PROFILE_QWEN36_FFN_PHASES=1` with
   `SUPERSONIC_METAL_PROFILE=1` only when you need per-phase FFN command-buffer
   attribution and accept the extra waited submits. Add
+  `SUPERSONIC_METAL_PROFILE_QWEN36_FFN_PHASES_BASELINE=1` to prepend one normal
+  whole-stage FFN command buffer in the same split-profile run; this is
+  diagnostic-only and intentionally doubles FFN stage work so the aggregate
+  baseline can be compared against the split-phase total. Add
   `SUPERSONIC_METAL_PROFILE_QWEN36_ROUTER_PHASES=1` to split the router block
   into norm/logits/top-k labels. Decode-batch router parity can be tapped
   without forcing the older chained router path by setting

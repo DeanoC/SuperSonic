@@ -1134,6 +1134,10 @@ bool qwen36_ffn_phase_profile_enabled() {
     return NSProcessInfo.processInfo.environment[@"SUPERSONIC_METAL_PROFILE_QWEN36_FFN_PHASES"] != nil;
 }
 
+bool qwen36_ffn_phase_profile_baseline_enabled() {
+    return NSProcessInfo.processInfo.environment[@"SUPERSONIC_METAL_PROFILE_QWEN36_FFN_PHASES_BASELINE"] != nil;
+}
+
 bool qwen36_ffn_router_phase_profile_enabled() {
     return NSProcessInfo.processInfo.environment[@"SUPERSONIC_METAL_PROFILE_QWEN36_ROUTER_PHASES"] != nil;
 }
@@ -16655,6 +16659,22 @@ extern "C" int supersonic_metal_qwen36_ffn_int4_stage5(
                                 : (raw_ggml_experts ? ((hidden + 7) / 8) : hidden))), 1, 1)
                     threadsPerThreadgroup:MTLSizeMake(expert_down_rowpair_topk_parallel ? 512 : ((raw_ggml_experts || expert_down_topk_parallel || expert_down_multirow_topk_parallel) ? 256 : 32), 1, 1)];
         };
+        auto encode_stage = [&](id<MTLComputeCommandEncoder> encoder) {
+            encode_shared_gate_up(encoder);
+            [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            if (!shared_gate_up_scalar_fused) {
+                encode_shared_scalar(encoder);
+                [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            }
+            encode_shared_down(encoder);
+            [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            encode_expert_gate_up(encoder);
+            [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            encode_expert_down_finalize(encoder);
+            if (expert_down_rowpair_topk_parallel) {
+                [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            }
+        };
 
         bool split_profile = qwen36_ffn_phase_profile_enabled();
         if (split_profile) {
@@ -16674,6 +16694,15 @@ extern "C" int supersonic_metal_qwen36_ffn_int4_stage5(
                 }
                 return flush_metal_batch_after_qwen36_ffn_profile_phase();
             };
+            if (qwen36_ffn_phase_profile_baseline_enabled()) {
+                if ((status = submit_profile_phase(
+                         encode_stage,
+                         "qwen36_ffn_int4_stage5_profile_baseline",
+                         1003,
+                         1004,
+                         1005,
+                         1006)) != 0) return status;
+            }
             const std::string shared_gate_label = shared_gate_up_exp2
                 ? "qwen36_ffn_int4_shared_gate_up_exp2"
                 : (shared_gate_up_exact_simd
@@ -16718,23 +16747,6 @@ extern "C" int supersonic_metal_qwen36_ffn_int4_stage5(
                 1002
             );
         }
-
-        auto encode_stage = [&](id<MTLComputeCommandEncoder> encoder) {
-            encode_shared_gate_up(encoder);
-            [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
-            if (!shared_gate_up_scalar_fused) {
-                encode_shared_scalar(encoder);
-                [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
-            }
-            encode_shared_down(encoder);
-            [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
-            encode_expert_gate_up(encoder);
-            [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
-            encode_expert_down_finalize(encoder);
-            if (expert_down_rowpair_topk_parallel) {
-                [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
-            }
-        };
         if (wait_for_completion != 0) {
             return encode_or_submit_labeled(
                 encode_stage,
@@ -17263,6 +17275,24 @@ extern "C" int supersonic_metal_qwen36_ffn_int4_stage5_with_router(
             [encoder dispatchThreadgroups:MTLSizeMake((hidden + 1) / 2, 1, 1)
                     threadsPerThreadgroup:MTLSizeMake(512, 1, 1)];
         };
+        auto encode_stage = [&](id<MTLComputeCommandEncoder> encoder) {
+            encode_router(encoder);
+            [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            encode_shared_gate_up(encoder);
+            [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            if (!shared_gate_up_scalar_fused) {
+                encode_shared_scalar(encoder);
+                [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            }
+            encode_shared_down(encoder);
+            [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            encode_expert_gate_up(encoder);
+            [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            encode_expert_down_finalize(encoder);
+            if (expert_down_rowpair_topk_parallel) {
+                [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            }
+        };
 
         bool split_profile = qwen36_ffn_phase_profile_enabled();
         if (split_profile) {
@@ -17295,6 +17325,15 @@ extern "C" int supersonic_metal_qwen36_ffn_int4_stage5_with_router(
                 }
                 return flush_metal_batch_after_qwen36_ffn_profile_phase();
             };
+            if (qwen36_ffn_phase_profile_baseline_enabled()) {
+                if ((status = submit_profile_phase(
+                         encode_stage,
+                         "qwen36_ffn_int4_stage5_with_router_profile_baseline",
+                         1456,
+                         1457,
+                         1458,
+                         1459)) != 0) return status;
+            }
             if (router_split && qwen36_ffn_router_phase_profile_enabled()) {
                 const std::string router_norm_label = router_norm_exact_simd
                     ? "qwen36_ffn_int4_router_norm_stage5_exact_simd"
@@ -17375,25 +17414,6 @@ extern "C" int supersonic_metal_qwen36_ffn_int4_stage5_with_router(
                 1439
             );
         }
-
-        auto encode_stage = [&](id<MTLComputeCommandEncoder> encoder) {
-            encode_router(encoder);
-            [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
-            encode_shared_gate_up(encoder);
-            [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
-            if (!shared_gate_up_scalar_fused) {
-                encode_shared_scalar(encoder);
-                [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
-            }
-            encode_shared_down(encoder);
-            [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
-            encode_expert_gate_up(encoder);
-            [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
-            encode_expert_down_finalize(encoder);
-            if (expert_down_rowpair_topk_parallel) {
-                [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
-            }
-        };
         if (wait_for_completion != 0) {
             return encode_or_submit_labeled(
                 encode_stage,
