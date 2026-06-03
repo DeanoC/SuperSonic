@@ -157,6 +157,10 @@ inline bool qwen36_ffn_expert_down_topk_parallel_enabled() {
            std::getenv("SUPERSONIC_METAL_FORCE_HOST_NATIVE") == nullptr;
 }
 
+inline bool qwen36_ffn_expert_down_topk_parallel_disabled() {
+    return std::getenv("SUPERSONIC_METAL_DISABLE_QWEN36_FFN_EXPERT_DOWN_TOPK_PARALLEL") != nullptr;
+}
+
 inline bool qwen36_ffn_expert_down_rowpair_topk_parallel_enabled() {
     return std::getenv("SUPERSONIC_METAL_DIAG_QWEN36_FFN_EXPERT_DOWN_ROWPAIR_TOPK_PARALLEL") != nullptr &&
            std::getenv("SUPERSONIC_METAL_FORCE_HOST_NATIVE") == nullptr;
@@ -16289,6 +16293,11 @@ extern "C" int supersonic_metal_qwen36_ffn_int4_stage5(
             static_cast<uint32_t>(down_proj_type) != QWEN36_LOWBIT_NATIVE_INT4;
         expert_down_rowpair_topk_parallel =
             expert_down_rowpair_topk_parallel && raw_ggml_experts && top_k <= 8;
+        expert_down_topk_parallel =
+            !expert_down_rowpair_topk_parallel &&
+            (expert_down_topk_parallel ||
+             (!qwen36_ffn_expert_down_topk_parallel_disabled() && raw_ggml_experts)) &&
+            raw_ggml_experts && top_k <= 8;
         if (pipelines.shared_gate_up == nil || pipelines.shared_scalar == nil ||
             pipelines.shared_down == nil || pipelines.expert_gate_up_tiled == nil ||
             pipelines.expert_down_finalize == nil ||
@@ -16751,6 +16760,11 @@ extern "C" int supersonic_metal_qwen36_ffn_int4_stage5_with_router(
             static_cast<uint32_t>(down_proj_type) != QWEN36_LOWBIT_NATIVE_INT4;
         expert_down_rowpair_topk_parallel =
             expert_down_rowpair_topk_parallel && raw_ggml_experts && top_k <= 8;
+        expert_down_topk_parallel =
+            !expert_down_rowpair_topk_parallel &&
+            (expert_down_topk_parallel ||
+             (!qwen36_ffn_expert_down_topk_parallel_disabled() && raw_ggml_experts)) &&
+            raw_ggml_experts && top_k <= 8;
         bool expert_down_rowpair_compare =
             qwen36_ffn_expert_down_rowpair_compare_enabled() &&
             raw_ggml_experts && top_k <= 8;

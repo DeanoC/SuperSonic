@@ -1112,9 +1112,12 @@ unsafe tiled/SIMD experiments:
   (`/tmp/qwen35_q4km_shared_down_pair_expr_exact_simd_128.log`), so it remains
   opt-in behind `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_SHARED_DOWN_EXACT_SIMD=1`.
   A top-k-parallel expert-down/finalize path also matched the 128-token stream
-  but slowed to 65.4 ms/token
-  (`/tmp/qwen35_q4km_expert_down_topk_parallel_128.log`), so it remains opt-in
-  behind `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_DOWN_TOPK_PARALLEL=1`.
+  but slowed to 65.4 ms/token in that early check
+  (`/tmp/qwen35_q4km_expert_down_topk_parallel_128.log`). A later 512-token
+  gate revalidated the same one-row top-k shape as deterministic, so current
+  raw GGML expert-down/finalize uses it by default with
+  `SUPERSONIC_METAL_DISABLE_QWEN36_FFN_EXPERT_DOWN_TOPK_PARALLEL=1` retained for
+  A/B against the older multirow finalizer.
   The router exact-multirow probe was slower and diverged late in the 128-token
   stream; it is opt-in only behind
   `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_STAGE5_EXACT_MULTIROW=1`.
@@ -1218,9 +1221,9 @@ top-k-parallel raw runs preserved the known generated stream and measured
 `62.6`, `60.9`, and `62.6 ms/token`. A same-session A/B kept all six streams
 identical and measured default `60.6`, `61.3`, `67.3 ms/token` versus
 top-k-parallel `63.3`, `64.6`, `63.7 ms/token`
-(`/tmp/supersonic-ffn-topk-ab-20260603-103332`). Keep
-`SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_DOWN_TOPK_PARALLEL=1`
-diagnostic-only; it is now raw-Q4_K-correct but not a performance promotion.
+(`/tmp/supersonic-ffn-topk-ab-20260603-103332`). The one-row top-k path was
+later promoted to the automatic raw-GGML expert-down candidate after repeated
+512-token checks stayed deterministic.
 
 A follow-up implemented the MLX-shaped selected-expert down path behind
 `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_DOWN_GATHERED=1`. Instead of looping
@@ -1431,6 +1434,19 @@ identified the next safe work area:
   It is not promotable: the 512-token gate was faster (`63.0` vs
   `64.8 ms/token`) but diverged at generated-token index 251
   (`/tmp/supersonic-qwen35-raw-q4km-rowpair-{default,enabled}-gate-512.log`).
+  Repeated investigation runs confirmed that this is a nondeterministic
+  two-row rowpair issue rather than top-k parallelism in general: rowpair
+  repeats diverged from each other, a same-input scratch compare reported
+  `diff_count=0`, and the one-row top-k-parallel control matched the default
+  stream twice over 512 tokens (`65.8` and `62.8 ms/token`). The current
+  automatic raw-GGML top-k run without the enable env also matched the
+  default 512-token stream at `64.7 ms/token`
+  (`/tmp/supersonic-qwen35-raw-q4km-topk-auto-gate-512-a.log`), and a
+  1-token split-profile smoke confirmed the dispatch label
+  `qwen36_ffn_int4_expert_down_finalize_topk_parallel`
+  (`/tmp/supersonic-qwen35-raw-q4km-topk-auto-profile-1tok.log`). Keep
+  rowpair quarantined behind
+  `SUPERSONIC_METAL_DIAG_QWEN36_FFN_EXPERT_DOWN_ROWPAIR_TOPK_PARALLEL=1`.
 - The opt-in native full-attention path is also a real speed lever but not
   promotable yet. `SUPERSONIC_METAL_ENABLE_QWEN36_FULL_ATTN_NATIVE=1` measured
   58.4 ms/token on a 128-token run but diverged at token 0. Adding
