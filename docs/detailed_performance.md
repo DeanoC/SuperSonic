@@ -1447,6 +1447,20 @@ identified the next safe work area:
   (`/tmp/supersonic-qwen35-raw-q4km-topk-auto-profile-1tok.log`). Keep
   rowpair quarantined behind
   `SUPERSONIC_METAL_DIAG_QWEN36_FFN_EXPERT_DOWN_ROWPAIR_TOPK_PARALLEL=1`.
+  A safer two-row follow-up is available behind
+  `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_DOWN_MULTIROW_TOPK_PARALLEL=1`.
+  It keeps one simdgroup per selected expert, computes two rows serially inside
+  each expert simdgroup, stores isolated `[2][top_k]` scratch, and combines both
+  rows from one owner simdgroup. It is deterministic but not faster: the
+  1-token profile smoke emitted
+  `qwen36_ffn_int4_expert_down_finalize_multirow_topk_parallel`
+  (`/tmp/supersonic-qwen35-raw-q4km-multirow-topk-profile-1tok.log`), the
+  8-token smoke matched the known prefix
+  (`/tmp/supersonic-qwen35-raw-q4km-multirow-topk-smoke-8.log`), and two
+  512-token gates matched the default stream exactly at `66.6` and
+  `66.7 ms/token`
+  (`/tmp/supersonic-qwen35-raw-q4km-multirow-topk-gate-512-{a,b}.log`).
+  Keep the one-row top-k path as the default.
 - The opt-in native full-attention path is also a real speed lever but not
   promotable yet. `SUPERSONIC_METAL_ENABLE_QWEN36_FULL_ATTN_NATIVE=1` measured
   58.4 ms/token on a 128-token run but diverged at token 0. Adding
