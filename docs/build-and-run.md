@@ -325,6 +325,15 @@ Metal currently rejects or defers:
   same combined shader. It is also diagnostic-only: it proves the giant-buffer
   residency fault is real, but the CPU packing cost is still too high for the
   default lane. Two reuse probes are available for attribution only:
+  `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_DOWN_TOPK_PARALLEL=1` tests a
+  top-k-parallel expert-down/finalize variant. It reuses the raw GGML Q4_K
+  pair-dot helper when running `--q4km`, but remains diagnostic-only because
+  same-session 128-token A/B was slower than the default FFN finalizer.
+  `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_DOWN_GATHERED=1` tests the
+  MLX-shaped selected-expert down path: compute `[top_k, hidden]` down outputs
+  into the existing FFN workspace, then combine top-k weights in a separate
+  finalizer. It is parity-safe for the current raw Q4_K_M lane, but remains
+  diagnostic-only until repeated runs show a real decode-speed win.
   `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_PACK_CACHE=1` caches exact
   per-layer active sets, while
   `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_PACK_HOTSET=1` keeps an LRU

@@ -1203,6 +1203,51 @@ deferred FFN wait switch
 (`SUPERSONIC_METAL_QWEN36_DEFER_FFN_ROUTER_STAGE5_WAIT=1`) preserved the same
 128-token stream but slowed to `73.1 ms/token`, so it remains diagnostic-only.
 
+The next 2026-06-03 FFN follow-up checked the opt-in expert-down top-k-parallel
+finalizer against the raw Q4_K_M lane and external source shape. llama.cpp's
+Metal Q4_K path keeps QK_K=256 block dot work lane-local with scale/min terms
+inside the dot kernel
+([source](https://fossies.org/linux/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal)),
+while MLX's MoE path expresses routed FFN as `SwitchGLU` over `gather_qmm` and
+sorts expert indices only once the selected-index set is large enough
+([source](https://raw.githubusercontent.com/ml-explore/mlx-lm/main/mlx_lm/models/switch_layers.py)).
+For SuperSonic's single-token raw decode, the analogous safe step was to reuse
+the existing raw GGML Q4_K pair-dot helper in the top-k-parallel down finalizer
+instead of adding another dequant order. After that fix, three 128-token
+top-k-parallel raw runs preserved the known generated stream and measured
+`62.6`, `60.9`, and `62.6 ms/token`. A same-session A/B kept all six streams
+identical and measured default `60.6`, `61.3`, `67.3 ms/token` versus
+top-k-parallel `63.3`, `64.6`, `63.7 ms/token`
+(`/tmp/supersonic-ffn-topk-ab-20260603-103332`). Keep
+`SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_DOWN_TOPK_PARALLEL=1`
+diagnostic-only; it is now raw-Q4_K-correct but not a performance promotion.
+
+A follow-up implemented the MLX-shaped selected-expert down path behind
+`SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_DOWN_GATHERED=1`. Instead of looping
+top-k inside each output row, it writes per-selected-expert down outputs as
+`[top_k, hidden]` into the existing FFN workspace slot and then combines the
+top-k weights in a separate finalizer kernel. The 8-token deterministic raw
+Q4_K_M smoke matched the default stream, and a same-session 128-token A/B
+matched all generated IDs while measuring default `62.3 ms/token`
+(`/tmp/supersonic-ffn-gathered-default-128.log`) versus gathered
+`62.0 ms/token` (`/tmp/supersonic-ffn-gathered-enabled-128.log`). Keep it
+diagnostic-only for now: this proves the MLX-style shape is parity-safe in the
+SuperSonic workspace, but the extra dispatch/barrier does not yet move the
+larger command-buffer-wait bottleneck.
+
+The immediate fusion/scheduling follow-up also stayed negative. Rechecking the
+existing FFN deferred-commit interval on the same 128-token raw Q4_K_M stream
+kept IDs aligned but slowed interval 2 to `67.6 ms/token`
+(`/tmp/supersonic-ffn-commit-interval2-128.log`) and interval 4 to
+`71.5 ms/token` (`/tmp/supersonic-ffn-commit-interval4-128.log`) versus the
+same-session `62.3 ms/token` control. A local top_k=8 unrolled expert-down
+finalizer prototype matched the 8-token smoke but diverged in the 128-token run
+and slowed to `69.4 ms/token` (`/tmp/supersonic-ffn-topk8-unrolled-128.log`),
+so it was removed instead of retained as an opt-in flag. The lesson is the same
+as the older commit-interval result: simple loop unrolling or wider FFN command
+grouping is not enough; any deeper FFN fusion has to preserve the compiler's
+current exact reduction shape or move a larger, naturally synchronized phase.
+
 The current gap is therefore not a one-line launch-count fix; the Metal profile
 still points at the chained per-layer decode structure and command-buffer waits.
 A naive experiment that coalesced phase command buffers reduced command-buffer
