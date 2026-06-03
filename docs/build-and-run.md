@@ -324,7 +324,22 @@ Metal currently rejects or defers:
   routed top-k expert slabs into compact scratch buffers before running the
   same combined shader. It is also diagnostic-only: it proves the giant-buffer
   residency fault is real, but the CPU packing cost is still too high for the
-  default lane. Two reuse probes are available for attribution only:
+  default lane. The raw GGML expert-down/finalize lane now uses the stable
+  one-row top-k-parallel variant by default for `top_k <= 8`; set
+  `SUPERSONIC_METAL_DISABLE_QWEN36_FFN_EXPERT_DOWN_TOPK_PARALLEL=1` to force
+  the older multirow finalizer for A/B checks. The explicit
+  `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_DOWN_TOPK_PARALLEL=1` switch is
+  still accepted for older scripts, but is no longer required for raw `--q4km`.
+  `SUPERSONIC_METAL_DIAG_QWEN36_FFN_EXPERT_DOWN_ROWPAIR_TOPK_PARALLEL=1`
+  tests a two-row, top-k-parallel raw Q4_K_M expert-down/finalize variant. It
+  is diagnostic-only/quarantined: a 128-token A/B preserved the stream and
+  reduced the profiled expert-down phase, but repeated 512-token gates showed
+  nondeterministic late divergence.
+  `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_DOWN_GATHERED=1` tests the
+  MLX-shaped selected-expert down path: compute `[top_k, hidden]` down outputs
+  into the existing FFN workspace, then combine top-k weights in a separate
+  finalizer. It is parity-safe for the current raw Q4_K_M lane, but remains
+  diagnostic-only until repeated runs show a real decode-speed win.
   `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_PACK_CACHE=1` caches exact
   per-layer active sets, while
   `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_PACK_HOTSET=1` keeps an LRU
@@ -351,7 +366,23 @@ Metal currently rejects or defers:
   Qwen3.6 FFN candidate stages aggregate by default; set
   `SUPERSONIC_METAL_PROFILE_QWEN36_FFN_PHASES=1` with
   `SUPERSONIC_METAL_PROFILE=1` only when you need per-phase FFN command-buffer
-  attribution and accept the extra waited submits. Profile runs emit
+  attribution and accept the extra waited submits. Add
+  `SUPERSONIC_METAL_PROFILE_QWEN36_ROUTER_PHASES=1` to split the router block
+  into norm/logits/top-k labels. Decode-batch router parity can be tapped
+  without forcing the older chained router path by setting
+  `SUPERSONIC_METAL_QWEN36_DECODE_BATCH_ROUTER_STAGE5_PARITY_TAP=1`; narrow it
+  with the matching `_MAX_CALLS`, `_POSITION`, and `_LAYER` suffixes. The legacy
+  non-batch router tap also supports
+  `SUPERSONIC_METAL_QWEN36_FFN_ROUTER_STAGE5_PARITY_TAP_LAYER`.
+  `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_FUSED_EXACT=1` selects the
+  monolithic exact router candidate instead of the default split exact-SIMD
+  router. It is useful for launch-count and local router-parity attribution, but
+  remains diagnostic-only because its stream-stable command-buffer cadence is
+  slower than the default exact-SIMD router path. When this fused router is
+  enabled, decode batch now avoids splitting each FFN into its own deferred
+  command buffer by default; set
+  `SUPERSONIC_METAL_QWEN36_DECODE_BATCH_FFN_COMMIT_INTERVAL=N` to override that
+  cadence during scheduling experiments. Profile runs emit
   `[qwen36-expert-residency]` and `[qwen36-expert-residency-policy]`; set
   `SUPERSONIC_QWEN36_EXPERT_RESIDENCY_PROFILE=1` to collect the same residency
   counters without enabling the full Metal/HAL profile tables. The one-token

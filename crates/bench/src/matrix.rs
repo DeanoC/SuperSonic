@@ -267,6 +267,15 @@ pub static SUPPORTED_COMBOS: &[ComboDescriptor] = &[
         arch: BenchArch::AppleM5Max,
         min_vram_gib: 21.0,
     },
+    // Raw GGUF Q4_K_M staged Metal lane. This is intentionally separate from
+    // the Q4_K_M-sourced GPTQ control row above so external-equivalence work
+    // does not blur into the faster native-sidecar path.
+    ComboDescriptor {
+        model: "qwen3.5-35b-a3b",
+        quant: "q4km",
+        arch: BenchArch::AppleM5Max,
+        min_vram_gib: 21.0,
+    },
     // CUDA sm86 Qwen3.6-MoE prefill lanes. `int4-specNNN` is INT4 plus
     // Qwen3.5-0.8B cross-family SpecPrefill cosine keep ratio NNN/100.
     ComboDescriptor {

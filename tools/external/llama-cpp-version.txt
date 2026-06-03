@@ -1,0 +1,3 @@
+# First non-comment line must exactly match `llama-cli --version`.
+# Update this after installing the local llama.cpp build used for published refs.
+version: 9430 (d48a56eff)

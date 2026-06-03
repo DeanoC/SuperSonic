@@ -1451,18 +1451,21 @@ fn process_linear_attn_layer_pertoken(
             let fp8 = s.group_size < 0;
             Qwen36MoeLinearStepInt4 {
                 group_size: s.group_size,
+                in_proj_qkv_type: s.in_proj_qkv_type,
                 in_proj_qkv_scale: s.in_proj_qkv_scale.as_ptr(),
                 in_proj_qkv_zero: if fp8 {
                     std::ptr::null()
                 } else {
                     s.in_proj_qkv_zero.as_ptr()
                 },
+                in_proj_z_type: s.in_proj_z_type,
                 in_proj_z_scale: s.in_proj_z_scale.as_ptr(),
                 in_proj_z_zero: if fp8 {
                     std::ptr::null()
                 } else {
                     s.in_proj_z_zero.as_ptr()
                 },
+                out_proj_type: s.out_proj_type,
                 out_proj_scale: s.out_proj_scale.as_ptr(),
                 out_proj_zero: if fp8 {
                     std::ptr::null()
@@ -1597,24 +1600,28 @@ fn process_full_attn_layer_pertoken(
             let fp8 = s.group_size < 0;
             Qwen36MoeAttnStepInt4 {
                 group_size: s.group_size,
+                q_proj_type: s.q_proj_type,
                 q_proj_scale: s.q_proj_scale.as_ptr(),
                 q_proj_zero: if fp8 {
                     std::ptr::null()
                 } else {
                     s.q_proj_zero.as_ptr()
                 },
+                k_proj_type: s.k_proj_type,
                 k_proj_scale: s.k_proj_scale.as_ptr(),
                 k_proj_zero: if fp8 {
                     std::ptr::null()
                 } else {
                     s.k_proj_zero.as_ptr()
                 },
+                v_proj_type: s.v_proj_type,
                 v_proj_scale: s.v_proj_scale.as_ptr(),
                 v_proj_zero: if fp8 {
                     std::ptr::null()
                 } else {
                     s.v_proj_zero.as_ptr()
                 },
+                o_proj_type: s.o_proj_type,
                 o_proj_scale: s.o_proj_scale.as_ptr(),
                 o_proj_zero: if fp8 {
                     std::ptr::null()
@@ -1720,18 +1727,21 @@ fn process_ffn_pertoken(
                 } else {
                     s.down_proj_zero.as_ptr()
                 },
+                shared_gate_proj_type: s.shared_gate_proj_type,
                 shared_gate_proj_scale: s.shared_gate_proj_scale.as_ptr(),
                 shared_gate_proj_zero: if fp8 {
                     std::ptr::null()
                 } else {
                     s.shared_gate_proj_zero.as_ptr()
                 },
+                shared_up_proj_type: s.shared_up_proj_type,
                 shared_up_proj_scale: s.shared_up_proj_scale.as_ptr(),
                 shared_up_proj_zero: if fp8 {
                     std::ptr::null()
                 } else {
                     s.shared_up_proj_zero.as_ptr()
                 },
+                shared_down_proj_type: s.shared_down_proj_type,
                 shared_down_proj_scale: s.shared_down_proj_scale.as_ptr(),
                 shared_down_proj_zero: if fp8 {
                     std::ptr::null()

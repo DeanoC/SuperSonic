@@ -27,6 +27,7 @@ BF16_BOUNDARY_SOURCES = {
 }
 COARSE_BATCH_SERIAL_MODE = "full-stage5-router-batch"
 COARSE_BATCH_SIMD_MODE = "full-stage5-router-simd-batch"
+ROUTER_FUSED_EXACT_BATCH_MODE = "full-stage5-router-fused-exact-batch"
 DEFERRED_BATCH_SERIAL_MODE = "full-stage5-router-batch-deferred-phases"
 DEFERRED_BATCH_SIMD_MODE = "full-stage5-router-simd-batch-deferred-phases"
 SHARED_TILED_BATCH_SIMD_MODE = "full-stage5-router-simd-batch-shared-tiled"
@@ -87,6 +88,7 @@ SHARED_COMPONENT_MODES = {
 BATCH_FAST_PROFILE_MODES = {
     "full-stage5-router-batch",
     "full-stage5-router-simd-batch",
+    ROUTER_FUSED_EXACT_BATCH_MODE,
     "full-stage5-router-batch-deferred-phases",
     "full-stage5-router-simd-batch-deferred-phases",
     SHARED_TILED_BATCH_SIMD_MODE,
@@ -115,6 +117,7 @@ BATCH_FAST_PROFILE_MODES = {
     "full-stage5-router-simd-batch-ffn-phases",
 }
 DIAGNOSTIC_ONLY_MODES = {
+    ROUTER_FUSED_EXACT_BATCH_MODE,
     ROUTED_GATE_UP_TAP_BATCH_SIMD_MODE,
     ROUTED_GATE_UP_HOST_ORDER_TAP_BATCH_SIMD_MODE,
     ROUTED_FINALIZE_TAP_BATCH_SIMD_MODE,
@@ -174,6 +177,10 @@ MODE_ALIASES: dict[str, str] = {
     "batch-router-simd": "full-stage5-router-simd-batch",
     "full-router-simd-batch": "full-stage5-router-simd-batch",
     "full-stage5-router-simd-batch": "full-stage5-router-simd-batch",
+    "router-fused-exact-batch": ROUTER_FUSED_EXACT_BATCH_MODE,
+    "batch-router-fused-exact": ROUTER_FUSED_EXACT_BATCH_MODE,
+    "full-router-fused-exact-batch": ROUTER_FUSED_EXACT_BATCH_MODE,
+    ROUTER_FUSED_EXACT_BATCH_MODE: ROUTER_FUSED_EXACT_BATCH_MODE,
     "router-simd-batch-shared-tiled": SHARED_TILED_BATCH_SIMD_MODE,
     "batch-router-simd-shared-tiled": SHARED_TILED_BATCH_SIMD_MODE,
     "full-router-simd-batch-shared-tiled": SHARED_TILED_BATCH_SIMD_MODE,
@@ -340,6 +347,7 @@ FUSED_GPU_OP_PREFIXES = {
         "command_buffer_gpu:qwen36_ffn_int4_shared_gate_scalar",
         "command_buffer_gpu:qwen36_ffn_int4_shared_down",
         "command_buffer_gpu:qwen36_ffn_int4_expert_gate_up_tiled_stage5",
+        "command_buffer_gpu:qwen36_ffn_int4_expert_gate_up_multirow_stage5",
         "command_buffer_gpu:qwen36_ffn_int4_expert_down_finalize",
     ),
     "full-stage5-router": (
@@ -350,6 +358,7 @@ FUSED_GPU_OP_PREFIXES = {
         "command_buffer_gpu:qwen36_ffn_int4_shared_gate_scalar",
         "command_buffer_gpu:qwen36_ffn_int4_shared_down",
         "command_buffer_gpu:qwen36_ffn_int4_expert_gate_up_tiled_stage5",
+        "command_buffer_gpu:qwen36_ffn_int4_expert_gate_up_multirow_stage5",
         "command_buffer_gpu:qwen36_ffn_int4_expert_down_finalize",
     ),
     "full-stage5-router-simd": (
@@ -359,6 +368,7 @@ FUSED_GPU_OP_PREFIXES = {
         "command_buffer_gpu:qwen36_ffn_int4_shared_gate_scalar",
         "command_buffer_gpu:qwen36_ffn_int4_shared_down",
         "command_buffer_gpu:qwen36_ffn_int4_expert_gate_up_tiled_stage5",
+        "command_buffer_gpu:qwen36_ffn_int4_expert_gate_up_multirow_stage5",
         "command_buffer_gpu:qwen36_ffn_int4_expert_down_finalize",
     ),
     "full-stage5-router-batch": (
@@ -369,6 +379,7 @@ FUSED_GPU_OP_PREFIXES = {
         "command_buffer_gpu:qwen36_ffn_int4_shared_gate_scalar",
         "command_buffer_gpu:qwen36_ffn_int4_shared_down",
         "command_buffer_gpu:qwen36_ffn_int4_expert_gate_up_tiled_stage5",
+        "command_buffer_gpu:qwen36_ffn_int4_expert_gate_up_multirow_stage5",
         "command_buffer_gpu:qwen36_ffn_int4_expert_down_finalize",
     ),
     "full-stage5-router-simd-batch": (
@@ -379,6 +390,7 @@ FUSED_GPU_OP_PREFIXES = {
         "command_buffer_gpu:qwen36_ffn_int4_shared_gate_scalar",
         "command_buffer_gpu:qwen36_ffn_int4_shared_down",
         "command_buffer_gpu:qwen36_ffn_int4_expert_gate_up_tiled_stage5",
+        "command_buffer_gpu:qwen36_ffn_int4_expert_gate_up_multirow_stage5",
         "command_buffer_gpu:qwen36_ffn_int4_expert_down_finalize",
     ),
     "full-stage5-router-batch-deferred-phases": (
@@ -389,6 +401,7 @@ FUSED_GPU_OP_PREFIXES = {
         "command_buffer_gpu:qwen36_ffn_int4_shared_gate_scalar",
         "command_buffer_gpu:qwen36_ffn_int4_shared_down",
         "command_buffer_gpu:qwen36_ffn_int4_expert_gate_up_tiled_stage5",
+        "command_buffer_gpu:qwen36_ffn_int4_expert_gate_up_multirow_stage5",
         "command_buffer_gpu:qwen36_ffn_int4_expert_down_finalize",
     ),
     "full-stage5-router-simd-batch-deferred-phases": (
@@ -399,6 +412,7 @@ FUSED_GPU_OP_PREFIXES = {
         "command_buffer_gpu:qwen36_ffn_int4_shared_gate_scalar",
         "command_buffer_gpu:qwen36_ffn_int4_shared_down",
         "command_buffer_gpu:qwen36_ffn_int4_expert_gate_up_tiled_stage5",
+        "command_buffer_gpu:qwen36_ffn_int4_expert_gate_up_multirow_stage5",
         "command_buffer_gpu:qwen36_ffn_int4_expert_down_finalize",
     ),
     "full-stage5-router-batch-phases": (
@@ -409,6 +423,7 @@ FUSED_GPU_OP_PREFIXES = {
         "command_buffer_gpu:qwen36_ffn_int4_shared_gate_scalar",
         "command_buffer_gpu:qwen36_ffn_int4_shared_down",
         "command_buffer_gpu:qwen36_ffn_int4_expert_gate_up_tiled_stage5",
+        "command_buffer_gpu:qwen36_ffn_int4_expert_gate_up_multirow_stage5",
         "command_buffer_gpu:qwen36_ffn_int4_expert_down_finalize",
     ),
     "full-stage5-router-simd-batch-phases": (
@@ -419,6 +434,7 @@ FUSED_GPU_OP_PREFIXES = {
         "command_buffer_gpu:qwen36_ffn_int4_shared_gate_scalar",
         "command_buffer_gpu:qwen36_ffn_int4_shared_down",
         "command_buffer_gpu:qwen36_ffn_int4_expert_gate_up_tiled_stage5",
+        "command_buffer_gpu:qwen36_ffn_int4_expert_gate_up_multirow_stage5",
         "command_buffer_gpu:qwen36_ffn_int4_expert_down_finalize",
     ),
     "full-stage5-router-batch-ffn-phases": (
@@ -427,6 +443,7 @@ FUSED_GPU_OP_PREFIXES = {
         "command_buffer_gpu:qwen36_ffn_int4_shared_gate_scalar",
         "command_buffer_gpu:qwen36_ffn_int4_shared_down",
         "command_buffer_gpu:qwen36_ffn_int4_expert_gate_up_tiled_stage5",
+        "command_buffer_gpu:qwen36_ffn_int4_expert_gate_up_multirow_stage5",
         "command_buffer_gpu:qwen36_ffn_int4_expert_down_finalize",
     ),
     "full-stage5-router-simd-batch-ffn-phases": (
@@ -435,6 +452,7 @@ FUSED_GPU_OP_PREFIXES = {
         "command_buffer_gpu:qwen36_ffn_int4_shared_gate_scalar",
         "command_buffer_gpu:qwen36_ffn_int4_shared_down",
         "command_buffer_gpu:qwen36_ffn_int4_expert_gate_up_tiled_stage5",
+        "command_buffer_gpu:qwen36_ffn_int4_expert_gate_up_multirow_stage5",
         "command_buffer_gpu:qwen36_ffn_int4_expert_down_finalize",
     ),
     "router-defer-wait": (
@@ -444,6 +462,7 @@ FUSED_GPU_OP_PREFIXES = {
         "command_buffer_gpu:qwen36_ffn_int4_shared_gate_scalar",
         "command_buffer_gpu:qwen36_ffn_int4_shared_down",
         "command_buffer_gpu:qwen36_ffn_int4_expert_gate_up_tiled_stage5",
+        "command_buffer_gpu:qwen36_ffn_int4_expert_gate_up_multirow_stage5",
         "command_buffer_gpu:qwen36_ffn_int4_expert_down_finalize",
     ),
 }
@@ -529,10 +548,13 @@ BATCH_FFN_PHASE_GPU_FIELDS = {
     "decode_batch_ffn_shared_down_gpu_ms": ("command_buffer_gpu:qwen36_ffn_int4_shared_down",),
     "decode_batch_ffn_expert_gate_up_gpu_ms": (
         "command_buffer_gpu:qwen36_ffn_int4_expert_gate_up_tiled_stage5",
+        "command_buffer_gpu:qwen36_ffn_int4_expert_gate_up_multirow_stage5",
         "command_buffer_gpu:qwen36_ffn_int4_expert_gate_up_host_order_stage5",
     ),
     "decode_batch_ffn_expert_down_gpu_ms": (
         "command_buffer_gpu:qwen36_ffn_int4_expert_down_finalize",
+        "command_buffer_gpu:qwen36_ffn_int4_expert_down_finalize_multirow",
+        "command_buffer_gpu:qwen36_ffn_int4_expert_down_finalize_rowpair_topk_parallel",
     ),
 }
 
@@ -656,6 +678,19 @@ def parse_decode_batch_shared_parity_taps(output: str) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for line in output.splitlines():
         if not line.startswith("[qwen36-decode-batch-shared-parity]"):
+            continue
+        fields = {
+            key: parse_number(value)
+            for key, value in parse_key_values(line).items()
+        }
+        rows.append(fields)
+    return rows
+
+
+def parse_decode_batch_router_parity_taps(output: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for line in output.splitlines():
+        if not line.startswith("[qwen36-decode-batch-router-parity]"):
             continue
         fields = {
             key: parse_number(value)
@@ -834,11 +869,14 @@ def parse_decode_batch_route_snapshots(output: str) -> list[dict[str, Any]]:
     return rows
 
 
-def summarize_router_parity_taps(rows: list[dict[str, Any]]) -> dict[str, Any]:
+def summarize_router_parity_taps(
+    rows: list[dict[str, Any]],
+    field: str = "router_parity_taps",
+) -> dict[str, Any]:
     taps = [
         tap
         for row in rows
-        for tap in (row.get("router_parity_taps") or [])
+        for tap in (row.get(field) or [])
     ]
     paths = sorted({str(tap.get("router_path") or "-") for tap in taps})
     mismatches = [tap for tap in taps if not bool(tap.get("topk_idx_match"))]
@@ -3142,6 +3180,13 @@ def build_env_overrides(args: argparse.Namespace, mode: str) -> dict[str, str]:
             overrides["SUPERSONIC_METAL_QWEN36_FFN_ROUTER_STAGE5_PARITY_TAP_MAX_CALLS"] = str(
                 max_calls
             )
+    if getattr(args, "decode_batch_router_parity_tap", False):
+        overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH_ROUTER_STAGE5_PARITY_TAP"] = "1"
+        max_calls = getattr(args, "decode_batch_router_parity_tap_max_calls", None)
+        if max_calls:
+            overrides[
+                "SUPERSONIC_METAL_QWEN36_DECODE_BATCH_ROUTER_STAGE5_PARITY_TAP_MAX_CALLS"
+            ] = str(max_calls)
     if getattr(args, "shared_parity_tap", False):
         overrides["SUPERSONIC_METAL_QWEN36_FFN_SHARED_STAGE5_PARITY_TAP"] = "1"
         overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH_SHARED_STAGE5_PARITY_TAP"] = "1"
@@ -3181,6 +3226,10 @@ def build_env_overrides(args: argparse.Namespace, mode: str) -> dict[str, str]:
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_STAGE5_SIMD"] = "1"
     elif mode == "full-stage5-router-batch":
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"] = "1"
+        overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH"] = "1"
+    elif mode == ROUTER_FUSED_EXACT_BATCH_MODE:
+        overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"] = "1"
+        overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_FUSED_EXACT"] = "1"
         overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH"] = "1"
     elif mode == "full-stage5-router-simd-batch":
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"] = "1"
@@ -3649,6 +3698,7 @@ def run_row(args: argparse.Namespace, prompt_id: str, prompt: str, mode: str) ->
             "router_parity_taps": parse_router_parity_taps(output),
             "shared_parity_taps": parse_shared_parity_taps(output),
             "decode_batch_shared_parity_taps": parse_decode_batch_shared_parity_taps(output),
+            "decode_batch_router_parity_taps": parse_decode_batch_router_parity_taps(output),
             "decode_batch_routed_parity_taps": parse_decode_batch_routed_parity_taps(output),
             "shared_host_corrections": parse_shared_host_corrections(output),
             "shared_mid_host_corrections": parse_shared_mid_host_corrections(output),
@@ -3690,6 +3740,7 @@ def run_row(args: argparse.Namespace, prompt_id: str, prompt: str, mode: str) ->
             "router_parity_taps": parse_router_parity_taps(output),
             "shared_parity_taps": parse_shared_parity_taps(output),
             "decode_batch_shared_parity_taps": parse_decode_batch_shared_parity_taps(output),
+            "decode_batch_router_parity_taps": parse_decode_batch_router_parity_taps(output),
             "decode_batch_routed_parity_taps": parse_decode_batch_routed_parity_taps(output),
             "shared_host_corrections": parse_shared_host_corrections(output),
             "shared_mid_host_corrections": parse_shared_mid_host_corrections(output),
@@ -4634,6 +4685,10 @@ def build_report(
         rows,
         "decode_batch_shared_parity_taps",
     )
+    summary["decode_batch_router_parity"] = summarize_router_parity_taps(
+        rows,
+        "decode_batch_router_parity_taps",
+    )
     summary["decode_batch_routed_parity"] = summarize_routed_parity_taps(rows)
     summary["shared_host_correction"] = summarize_shared_host_corrections(rows)
     summary["shared_mid_host_correction"] = summarize_shared_mid_host_corrections(rows)
@@ -4677,6 +4732,12 @@ def build_report(
         "layer_output_delta_phase": getattr(args, "layer_output_delta_phase", None),
         "router_parity_tap": getattr(args, "router_parity_tap", False),
         "router_parity_tap_max_calls": getattr(args, "router_parity_tap_max_calls", None),
+        "decode_batch_router_parity_tap": getattr(
+            args, "decode_batch_router_parity_tap", False
+        ),
+        "decode_batch_router_parity_tap_max_calls": getattr(
+            args, "decode_batch_router_parity_tap_max_calls", None
+        ),
         "shared_parity_tap": getattr(args, "shared_parity_tap", False),
         "shared_parity_tap_max_calls": getattr(args, "shared_parity_tap_max_calls", None),
         "routed_parity_tap": getattr(args, "routed_parity_tap", False),
@@ -4726,6 +4787,7 @@ def render_markdown(report: dict[str, Any]) -> str:
     router_parity = summary.get("router_parity") or {}
     shared_parity = summary.get("shared_parity") or {}
     decode_batch_shared_parity = summary.get("decode_batch_shared_parity") or {}
+    decode_batch_router_parity = summary.get("decode_batch_router_parity") or {}
     decode_batch_routed_parity = summary.get("decode_batch_routed_parity") or {}
     shared_host_correction = summary.get("shared_host_correction") or {}
     shared_mid_host_correction = summary.get("shared_mid_host_correction") or {}
@@ -4777,6 +4839,7 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- drift_containment_contained_modes: `{','.join(drift_containment.get('contained_modes') or []) or '-'}`",
         f"- drift_containment_first_expansion: `{drift_first_expansion.get('mode') or '-'}:{drift_first_expansion.get('layer', '-')}:{drift_first_expansion.get('source') or '-'}`",
         f"- router_parity_tap: `{report.get('router_parity_tap', False)}`",
+        f"- decode_batch_router_parity_tap: `{report.get('decode_batch_router_parity_tap', False)}`",
         f"- shared_parity_tap: `{report.get('shared_parity_tap', False)}`",
         f"- routed_parity_tap: `{report.get('routed_parity_tap', False)}`",
         f"- decode_batch_route_snapshot: `{report.get('decode_batch_route_snapshot', False)}`",
@@ -4788,6 +4851,8 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- decode_batch_deferred_phase_recommendation: `{deferred_phase.get('recommendation') or '-'}`",
         f"- router_parity_tap_count: `{router_parity.get('tap_count', 0)}`",
         f"- router_parity_mismatches: `{router_parity.get('mismatch_count', 0)}`",
+        f"- decode_batch_router_parity_tap_count: `{decode_batch_router_parity.get('tap_count', 0)}`",
+        f"- decode_batch_router_parity_mismatches: `{decode_batch_router_parity.get('mismatch_count', 0)}`",
         f"- shared_parity_tap_count: `{shared_parity.get('tap_count', 0)}`",
         f"- shared_parity_max_out_abs: `{render_float(shared_parity.get('max_shared_out_abs'), 8)}`",
         f"- decode_batch_shared_parity_tap_count: `{decode_batch_shared_parity.get('tap_count', 0)}`",
@@ -5136,6 +5201,61 @@ def render_markdown(report: dict[str, Any]) -> str:
                     weight=render_float(tap.get("topk_weight_max_abs"), 8),
                     host_idx=tap.get("host_idx", "-"),
                     metal_idx=tap.get("workspace_idx", tap.get("output_idx", "-")),
+                )
+            )
+    decode_batch_router_tap_rows: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for row in report["rows"]:
+        for tap in row.get("decode_batch_router_parity_taps") or []:
+            decode_batch_router_tap_rows.append((row, tap))
+    if decode_batch_router_tap_rows:
+        lines.extend(
+            [
+                "",
+                "## Decode-Batch Router Parity Tap",
+                "",
+                "| Prompt | Mode | Router | Phase profile | Call | Position | Cache pos | Layer | Match | First mismatch | HNorm max | HNorm idx | Logit max | Logit idx | Host top | Metal top | Host@Metal | Metal@Host | TopK weight max | Host idx | Workspace idx | Output idx |",
+                "|:---|:---|:---|:---|---:|---:|---:|---:|:---:|---:|---:|---:|---:|---:|:---|:---|---:|---:|---:|:---|:---|:---|",
+            ]
+        )
+        for row, tap in select_router_parity_tap_rows(
+            decode_batch_router_tap_rows,
+            limit=40,
+        ):
+            host_top = "{idx}:{value}".format(
+                idx=tap.get("host_top_logit_idx", "-"),
+                value=render_float(tap.get("host_top_logit"), 8),
+            )
+            metal_top = "{idx}:{value}".format(
+                idx=tap.get("metal_top_logit_idx", "-"),
+                value=render_float(tap.get("metal_top_logit"), 8),
+            )
+            lines.append(
+                "| {prompt} | {mode} | {router} | {phase} | {call} | {position} | {cache_pos} | {layer} | {match} | {first_mismatch} | {hnorm} | {hnorm_idx} | {logits} | {logits_idx} | {host_top} | {metal_top} | {host_at_metal} | {metal_at_host} | {weight} | {host_idx} | {workspace_idx} | {output_idx} |".format(
+                    prompt=row.get("prompt_id", ""),
+                    mode=row.get("mode", ""),
+                    router=tap.get("router_path", "-"),
+                    phase=str(bool(tap.get("phase_profile"))).lower(),
+                    call=tap.get("call", "-"),
+                    position=tap.get("position", "-"),
+                    cache_pos=tap.get("cache_pos", "-"),
+                    layer=tap.get("layer", "-"),
+                    match=str(bool(tap.get("topk_idx_match"))).lower(),
+                    first_mismatch=tap.get(
+                        "topk_first_mismatch",
+                        tap.get("workspace_first_idx_mismatch", "-"),
+                    ),
+                    hnorm=render_float(tap.get("h_norm_max_abs"), 8),
+                    hnorm_idx=tap.get("h_norm_argmax", "-"),
+                    logits=render_float(tap.get("logits_max_abs"), 8),
+                    logits_idx=tap.get("logits_argmax", "-"),
+                    host_top=host_top,
+                    metal_top=metal_top,
+                    host_at_metal=render_float(tap.get("host_logit_at_metal_top"), 8),
+                    metal_at_host=render_float(tap.get("metal_logit_at_host_top"), 8),
+                    weight=render_float(tap.get("topk_weight_max_abs"), 8),
+                    host_idx=tap.get("host_idx", "-"),
+                    workspace_idx=tap.get("workspace_idx", "-"),
+                    output_idx=tap.get("output_idx", "-"),
                 )
             )
     shared_tap_rows: list[tuple[dict[str, Any], dict[str, Any]]] = []
@@ -6062,6 +6182,17 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         type=int,
         default=40,
         help="maximum router parity tap rows emitted by the runtime",
+    )
+    parser.add_argument(
+        "--decode-batch-router-parity-tap",
+        action="store_true",
+        help="emit and parse Qwen3.6 decode-batch Metal-vs-host router parity rows",
+    )
+    parser.add_argument(
+        "--decode-batch-router-parity-tap-max-calls",
+        type=int,
+        default=40,
+        help="maximum decode-batch router parity tap rows emitted by the runtime",
     )
     parser.add_argument(
         "--shared-parity-tap",

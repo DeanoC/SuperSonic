@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from oracle.bench.render.schema import (
-    META_SCHEMA, PERF_CELL_SCHEMA, validate_meta, validate_perf_cell,
+    META_SCHEMA, PERF_CELL_SCHEMA, validate_external_cell, validate_meta, validate_perf_cell,
 )
 
 FIXTURE_DIR = Path(__file__).parent / "fixtures" / "run_minimal"
@@ -83,3 +83,29 @@ def test_perf_cell_invalid_status_rejected():
     }
     with pytest.raises(Exception):
         validate_perf_cell(cell)
+
+
+def test_external_cell_accepts_workload_metadata():
+    cell = {
+        "schema_version": 1,
+        "engine": "llama.cpp",
+        "engine_version": "llama.cpp build 1234",
+        "model": "qwen3.5-35b-a3b",
+        "quant": "q4km",
+        "status": "ok",
+        "ms_per_step": 11.0,
+        "tok_per_s": 90.9,
+        "samples": [10.9, 11.0, 11.1],
+        "stderr_tail": None,
+        "command": ["llama-bench", "-m", "/models/qwen.gguf", "-n", "512"],
+        "workload": {
+            "prompt": "",
+            "prompt_tokens": 0,
+            "max_new_tokens": 512,
+            "context_size": 1024,
+            "warmup_runs": 1,
+            "measurement_runs": 5,
+        },
+        "extras": {"batch_context": "llama-bench defaults"},
+    }
+    validate_external_cell(cell)

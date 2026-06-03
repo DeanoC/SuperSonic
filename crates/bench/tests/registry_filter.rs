@@ -32,6 +32,7 @@ fn apple_m5_max_includes_qwen_moe_metal_lanes() {
 
     assert_eq!(BenchArch::AppleM5Max.backend(), Some("metal"));
     assert!(model_quants.contains(&("qwen3.6-35b-a3b", "int4")));
+    assert!(model_quants.contains(&("qwen3.5-35b-a3b", "q4km-gptq")));
     assert!(model_quants.contains(&("qwen3.5-35b-a3b", "q4km")));
     assert!(!model_quants.contains(&("qwen3.6-35b-a3b", "kv-fp8")));
 }

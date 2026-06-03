@@ -1,9 +1,13 @@
 use anyhow::{anyhow, Context, Result};
+use model_store::manifest::LayoutTag;
 use model_store::BakedStore;
 use qwen36_moe::config::TextConfig;
 
-use crate::qwen36_moe_cli::layers::QWEN36_MOE_INT4_GROUP_SIZE;
-use crate::qwen36_moe_logits::dequant_int4_to_bf16_bytes;
+use crate::qwen36_moe_cli::layers::{
+    QWEN36_MOE_INT4_GROUP_SIZE, QWEN36_MOE_LOWBIT_GGML_Q4_K, QWEN36_MOE_LOWBIT_GGML_Q5_K,
+    QWEN36_MOE_LOWBIT_GGML_Q6_K,
+};
+use crate::qwen36_moe_logits::{dequant_ggml_k_to_bf16_bytes, dequant_int4_to_bf16_bytes};
 use crate::qwen36_moe_types::MultiLayerGeom;
 
 const MIB: f64 = (1024 * 1024) as f64;
@@ -77,6 +81,22 @@ pub(crate) fn load_lm_head_bf16(
             vocab,
             hidden,
             QWEN36_MOE_INT4_GROUP_SIZE as usize,
+        ))
+    } else if let Some(qtype) = match store.layout(&lm_name) {
+        Some(LayoutTag::GgmlQ4K) => Some(QWEN36_MOE_LOWBIT_GGML_Q4_K),
+        Some(LayoutTag::GgmlQ5K) => Some(QWEN36_MOE_LOWBIT_GGML_Q5_K),
+        Some(LayoutTag::GgmlQ6K) => Some(QWEN36_MOE_LOWBIT_GGML_Q6_K),
+        _ => None,
+    } {
+        let vocab = geom.vocab as usize;
+        let hidden = geom.hidden as usize;
+        println!(
+            "  dequantizing lm_head GGML K-block [{vocab}, {hidden}] (≈{:.1} MiB → {:.1} MiB BF16)…",
+            lm_packed.len() as f64 / MIB,
+            (vocab * hidden * 2) as f64 / MIB,
+        );
+        Ok(dequant_ggml_k_to_bf16_bytes(
+            &lm_packed, qtype, vocab, hidden,
         ))
     } else {
         Ok(lm_packed)

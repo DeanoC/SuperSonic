@@ -2335,12 +2335,16 @@ impl Default for Qwen36MoeAttnStepWeights {
 #[derive(Debug, Clone, Copy)]
 pub struct Qwen36MoeAttnStepInt4 {
     pub group_size: i32,
+    pub q_proj_type: i32,
     pub q_proj_scale: *const c_void,
     pub q_proj_zero: *const c_void,
+    pub k_proj_type: i32,
     pub k_proj_scale: *const c_void,
     pub k_proj_zero: *const c_void,
+    pub v_proj_type: i32,
     pub v_proj_scale: *const c_void,
     pub v_proj_zero: *const c_void,
+    pub o_proj_type: i32,
     pub o_proj_scale: *const c_void,
     pub o_proj_zero: *const c_void,
 }
@@ -2351,12 +2355,16 @@ impl Qwen36MoeAttnStepInt4 {
     pub const fn disabled() -> Self {
         Self {
             group_size: 0,
+            q_proj_type: 0,
             q_proj_scale: std::ptr::null(),
             q_proj_zero: std::ptr::null(),
+            k_proj_type: 0,
             k_proj_scale: std::ptr::null(),
             k_proj_zero: std::ptr::null(),
+            v_proj_type: 0,
             v_proj_scale: std::ptr::null(),
             v_proj_zero: std::ptr::null(),
+            o_proj_type: 0,
             o_proj_scale: std::ptr::null(),
             o_proj_zero: std::ptr::null(),
         }
@@ -2504,6 +2512,19 @@ pub unsafe fn attn_step_stage5_metal_host_into(
 }
 
 const QWEN36_FULL_ATTN_NATIVE_MAX_SCORE_TOKENS: usize = 128;
+const QWEN36_FULL_ATTN_ONLINE_MAX_TOKENS: usize = 1024;
+
+fn qwen36_full_attn_online_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_QWEN36_FULL_ATTN_ONLINE").is_some()
+}
+
+fn qwen36_full_attn_native_token_cap() -> usize {
+    if qwen36_full_attn_online_enabled() {
+        QWEN36_FULL_ATTN_ONLINE_MAX_TOKENS
+    } else {
+        QWEN36_FULL_ATTN_NATIVE_MAX_SCORE_TOKENS
+    }
+}
 
 pub fn attn_step_stage5_metal_native_supported(
     params: Qwen36MoeAttnStepParams,
@@ -2526,9 +2547,13 @@ pub fn attn_step_stage5_metal_native_supported(
         && params.rotary_dim >= 0
         && params.rotary_dim <= params.head_dim
         && eff_cache_pos >= 0
-        && (eff_cache_pos as usize) < QWEN36_FULL_ATTN_NATIVE_MAX_SCORE_TOKENS
+        && (eff_cache_pos as usize) < qwen36_full_attn_native_token_cap()
         && weights.kv_max_t > eff_cache_pos
         && int4.group_size == 128
+        && qwen36_lowbit_native_int4(int4.q_proj_type)
+        && qwen36_lowbit_native_int4(int4.k_proj_type)
+        && qwen36_lowbit_native_int4(int4.v_proj_type)
+        && qwen36_lowbit_native_int4(int4.o_proj_type)
         && output_capacity >= params.hidden as usize
         && !crate::metal_native::disabled_by_env()
         && !weights.input_hidden.is_null()
@@ -2586,7 +2611,7 @@ pub unsafe fn attn_step_stage5_metal_native_into(
             params.position,
             params.cache_pos,
             weights.kv_max_t as usize,
-            QWEN36_FULL_ATTN_NATIVE_MAX_SCORE_TOKENS,
+            qwen36_full_attn_native_token_cap(),
             params.rms_norm_eps,
             params.rope_theta,
             rope_cos,
@@ -2834,6 +2859,7 @@ fn attn_step_stage1_5_metal_host(
         });
 
     qwen36_validate_dense_or_int4_sidecars(
+        int4.q_proj_type,
         int4.q_proj_scale,
         int4.q_proj_zero,
         int4.group_size,
@@ -2841,12 +2867,14 @@ fn attn_step_stage1_5_metal_host(
     )?;
     if params.stage >= 2 {
         qwen36_validate_dense_or_int4_sidecars(
+            int4.k_proj_type,
             int4.k_proj_scale,
             int4.k_proj_zero,
             int4.group_size,
             "k_proj",
         )?;
         qwen36_validate_dense_or_int4_sidecars(
+            int4.v_proj_type,
             int4.v_proj_scale,
             int4.v_proj_zero,
             int4.group_size,
@@ -2855,6 +2883,7 @@ fn attn_step_stage1_5_metal_host(
     }
     if params.stage >= 5 {
         qwen36_validate_dense_or_int4_sidecars(
+            int4.o_proj_type,
             int4.o_proj_scale,
             int4.o_proj_zero,
             int4.group_size,
@@ -2866,13 +2895,14 @@ fn attn_step_stage1_5_metal_host(
         let q_w = weights.q_proj_w as usize;
         let q_scale = int4.q_proj_scale as usize;
         let q_zero = int4.q_proj_zero as usize;
+        let q_type = int4.q_proj_type;
         let group_size = int4.group_size.max(0) as usize;
         let q_raw = &mut workspace[off_q_raw..off_q_raw + q_out_dim];
         qwen36_parallel_chunks_mut(q_raw, 64, |start, chunk| {
             for (local, out) in chunk.iter_mut().enumerate() {
                 let row = start + local;
                 let acc = qwen36_dense_or_int4_dot_2d_unchecked(
-                    q_w, q_scale, q_zero, row, hidden, group_size, &x_norm,
+                    q_w, q_scale, q_zero, q_type, row, hidden, group_size, &x_norm,
                 );
                 *out = bf16_round_f32(acc);
             }
@@ -2912,18 +2942,20 @@ fn attn_step_stage1_5_metal_host(
         let k_w = weights.k_proj_w as usize;
         let k_scale = int4.k_proj_scale as usize;
         let k_zero = int4.k_proj_zero as usize;
+        let k_type = int4.k_proj_type;
         let v_w = weights.v_proj_w as usize;
         let v_scale = int4.v_proj_scale as usize;
         let v_zero = int4.v_proj_zero as usize;
+        let v_type = int4.v_proj_type;
         let group_size = int4.group_size.max(0) as usize;
         qwen36_parallel_chunks2_mut(k_raw, v_raw, 64, |start, k_chunk, v_chunk| {
             for (local, (k_out, v_out)) in k_chunk.iter_mut().zip(v_chunk.iter_mut()).enumerate() {
                 let row = start + local;
                 let k_acc = qwen36_dense_or_int4_dot_2d_unchecked(
-                    k_w, k_scale, k_zero, row, hidden, group_size, &x_norm,
+                    k_w, k_scale, k_zero, k_type, row, hidden, group_size, &x_norm,
                 );
                 let v_acc = qwen36_dense_or_int4_dot_2d_unchecked(
-                    v_w, v_scale, v_zero, row, hidden, group_size, &x_norm,
+                    v_w, v_scale, v_zero, v_type, row, hidden, group_size, &x_norm,
                 );
                 *k_out = bf16_round_f32(k_acc);
                 *v_out = bf16_round_f32(v_acc);
@@ -3100,6 +3132,7 @@ fn attn_step_stage1_5_metal_host(
         let o_w = weights.o_proj_w as usize;
         let o_scale = int4.o_proj_scale as usize;
         let o_zero = int4.o_proj_zero as usize;
+        let o_type = int4.o_proj_type;
         let group_size = int4.group_size.max(0) as usize;
         let o_out = &mut workspace[off_o_out..off_o_out + hidden];
         let publish_o_proj = |start: usize, out_chunk: &mut [f32], pub_chunk: &mut [u16]| {
@@ -3111,6 +3144,7 @@ fn attn_step_stage1_5_metal_host(
                     o_w,
                     o_scale,
                     o_zero,
+                    o_type,
                     row,
                     q_normed_dim,
                     group_size,
@@ -3187,10 +3221,13 @@ pub struct Qwen36MoeLinearStepWeights {
 #[derive(Debug, Clone, Copy)]
 pub struct Qwen36MoeLinearStepInt4 {
     pub group_size: i32,
+    pub in_proj_qkv_type: i32,
     pub in_proj_qkv_scale: *const c_void,
     pub in_proj_qkv_zero: *const c_void,
+    pub in_proj_z_type: i32,
     pub in_proj_z_scale: *const c_void,
     pub in_proj_z_zero: *const c_void,
+    pub out_proj_type: i32,
     pub out_proj_scale: *const c_void,
     pub out_proj_zero: *const c_void,
 }
@@ -3200,10 +3237,13 @@ impl Qwen36MoeLinearStepInt4 {
     pub const fn disabled() -> Self {
         Self {
             group_size: 0,
+            in_proj_qkv_type: 0,
             in_proj_qkv_scale: std::ptr::null(),
             in_proj_qkv_zero: std::ptr::null(),
+            in_proj_z_type: 0,
             in_proj_z_scale: std::ptr::null(),
             in_proj_z_zero: std::ptr::null(),
+            out_proj_type: 0,
             out_proj_scale: std::ptr::null(),
             out_proj_zero: std::ptr::null(),
         }
@@ -3225,6 +3265,9 @@ fn qwen36_linear_int4_stage5_metal_native_supported(
         && params.head_v_dim == 128
         && params.conv_kernel_dim == 4
         && int4.group_size == 128
+        && qwen36_lowbit_native_int4(int4.in_proj_qkv_type)
+        && qwen36_lowbit_native_int4(int4.in_proj_z_type)
+        && qwen36_lowbit_native_int4(int4.out_proj_type)
         && output_capacity >= params.hidden as usize
         && !crate::metal_native::disabled_by_env()
         && !weights.input_hidden.is_null()
@@ -3543,12 +3586,14 @@ fn linear_step_stage1_5_metal_host(
     }
 
     qwen36_validate_dense_or_int4_sidecars(
+        int4.in_proj_qkv_type,
         int4.in_proj_qkv_scale,
         int4.in_proj_qkv_zero,
         int4.group_size,
         "in_proj_qkv",
     )?;
     qwen36_validate_dense_or_int4_sidecars(
+        int4.in_proj_z_type,
         int4.in_proj_z_scale,
         int4.in_proj_z_zero,
         int4.group_size,
@@ -3556,6 +3601,7 @@ fn linear_step_stage1_5_metal_host(
     )?;
     if params.stage >= 5 {
         qwen36_validate_dense_or_int4_sidecars(
+            int4.out_proj_type,
             int4.out_proj_scale,
             int4.out_proj_zero,
             int4.group_size,
@@ -3647,13 +3693,14 @@ fn linear_step_stage1_5_metal_host(
         let qkv_w = weights.in_proj_qkv_w as usize;
         let qkv_scale = int4.in_proj_qkv_scale as usize;
         let qkv_zero = int4.in_proj_qkv_zero as usize;
+        let qkv_type = int4.in_proj_qkv_type;
         let group_size = int4.group_size.max(0) as usize;
         let qkv = &mut workspace[off_qkv_raw..off_qkv_raw + qkv_dim];
         qwen36_parallel_chunks_mut(qkv, 64, |start, chunk| {
             for (local, out) in chunk.iter_mut().enumerate() {
                 let row = start + local;
                 let acc = qwen36_dense_or_int4_dot_2d_unchecked(
-                    qkv_w, qkv_scale, qkv_zero, row, hidden, group_size, &x_norm,
+                    qkv_w, qkv_scale, qkv_zero, qkv_type, row, hidden, group_size, &x_norm,
                 );
                 *out = bf16_round_f32(acc);
             }
@@ -3669,13 +3716,14 @@ fn linear_step_stage1_5_metal_host(
         let z_w = weights.in_proj_z_w as usize;
         let z_scale = int4.in_proj_z_scale as usize;
         let z_zero = int4.in_proj_z_zero as usize;
+        let z_type = int4.in_proj_z_type;
         let group_size = int4.group_size.max(0) as usize;
         let z = &mut workspace[off_z_raw..off_z_raw + val_dim];
         qwen36_parallel_chunks_mut(z, 64, |start, chunk| {
             for (local, out) in chunk.iter_mut().enumerate() {
                 let row = start + local;
                 let acc = qwen36_dense_or_int4_dot_2d_unchecked(
-                    z_w, z_scale, z_zero, row, hidden, group_size, &x_norm,
+                    z_w, z_scale, z_zero, z_type, row, hidden, group_size, &x_norm,
                 );
                 *out = bf16_round_f32(acc);
             }
@@ -3894,12 +3942,13 @@ fn linear_step_stage1_5_metal_host(
         let out_w = weights.out_proj_w as usize;
         let out_scale = int4.out_proj_scale as usize;
         let out_zero = int4.out_proj_zero as usize;
+        let out_type = int4.out_proj_type;
         let group_size = int4.group_size.max(0) as usize;
         qwen36_parallel_chunks_mut(&mut output[..hidden], 64, |start, chunk| {
             for (local, out) in chunk.iter_mut().enumerate() {
                 let row = start + local;
                 let acc = qwen36_dense_or_int4_dot_2d_unchecked(
-                    out_w, out_scale, out_zero, row, val_dim, group_size, rec_out,
+                    out_w, out_scale, out_zero, out_type, row, val_dim, group_size, rec_out,
                 );
                 let o_out = bf16_round_f32(acc);
                 let residual = bf16_round_f32(bf16_bits_to_f32(input[row]) + o_out);
@@ -3961,10 +4010,13 @@ pub struct Qwen36MoeFfnStepInt4 {
     pub down_proj_type: i32,
     pub down_proj_scale: *const c_void,
     pub down_proj_zero: *const c_void,
+    pub shared_gate_proj_type: i32,
     pub shared_gate_proj_scale: *const c_void,
     pub shared_gate_proj_zero: *const c_void,
+    pub shared_up_proj_type: i32,
     pub shared_up_proj_scale: *const c_void,
     pub shared_up_proj_zero: *const c_void,
+    pub shared_down_proj_type: i32,
     pub shared_down_proj_scale: *const c_void,
     pub shared_down_proj_zero: *const c_void,
 }
@@ -3982,10 +4034,13 @@ impl Qwen36MoeFfnStepInt4 {
             down_proj_type: 0,
             down_proj_scale: std::ptr::null(),
             down_proj_zero: std::ptr::null(),
+            shared_gate_proj_type: 0,
             shared_gate_proj_scale: std::ptr::null(),
             shared_gate_proj_zero: std::ptr::null(),
+            shared_up_proj_type: 0,
             shared_up_proj_scale: std::ptr::null(),
             shared_up_proj_zero: std::ptr::null(),
+            shared_down_proj_type: 0,
             shared_down_proj_scale: std::ptr::null(),
             shared_down_proj_zero: std::ptr::null(),
         }
@@ -4010,6 +4065,30 @@ fn qwen36_lowbit_has_required_sidecars(
     zero: *const c_void,
 ) -> bool {
     qwen36_lowbit_ggml_k(qtype) || (!scale.is_null() && !zero.is_null())
+}
+
+fn qwen36_validate_dense_or_lowbit_sidecars(
+    qtype: i32,
+    scale: *const c_void,
+    zero: *const c_void,
+    group_size: i32,
+    label: &str,
+) -> Result<(), GpuError> {
+    if qtype == 0 && scale.is_null() && zero.is_null() {
+        return Ok(());
+    }
+    if !qwen36_lowbit_supported(qtype) {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe: unsupported lowbit qtype {qtype} for {label}"
+        )));
+    }
+    if !qwen36_lowbit_has_required_sidecars(qtype, scale, zero) || group_size <= 0 {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe: Metal lowbit fallback requires raw GGML K-blocks \
+             or paired scale/zero pointers with positive group_size for {label}"
+        )));
+    }
+    Ok(())
 }
 
 fn qwen36_stage5_env_or_raw_ggml(env_name: &str, int4: &Qwen36MoeFfnStepInt4) -> bool {
@@ -4039,6 +4118,9 @@ fn qwen36_ffn_int4_stage5_metal_native_supported(
         && !weights.shared_down_proj_w.is_null()
         && !weights.gate_up_proj_w.is_null()
         && !weights.down_proj_w.is_null()
+        && qwen36_lowbit_native_int4(int4.shared_gate_proj_type)
+        && qwen36_lowbit_native_int4(int4.shared_up_proj_type)
+        && qwen36_lowbit_native_int4(int4.shared_down_proj_type)
         && !int4.shared_gate_proj_scale.is_null()
         && !int4.shared_gate_proj_zero.is_null()
         && !int4.shared_up_proj_scale.is_null()
@@ -4084,6 +4166,9 @@ fn qwen36_ffn_int4_stage5_router_metal_native_supported(
         && !weights.shared_down_proj_w.is_null()
         && !weights.gate_up_proj_w.is_null()
         && !weights.down_proj_w.is_null()
+        && qwen36_lowbit_native_int4(int4.shared_gate_proj_type)
+        && qwen36_lowbit_native_int4(int4.shared_up_proj_type)
+        && qwen36_lowbit_native_int4(int4.shared_down_proj_type)
         && !int4.shared_gate_proj_scale.is_null()
         && !int4.shared_gate_proj_zero.is_null()
         && !int4.shared_up_proj_scale.is_null()
@@ -4121,6 +4206,17 @@ pub fn ffn_stage5_router_defer_wait_enabled() -> bool {
 fn qwen36_ffn_router_stage5_parity_tap_enabled() -> bool {
     std::env::var_os("SUPERSONIC_METAL_QWEN36_FFN_ROUTER_STAGE5_PARITY_TAP").is_some()
         && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
+}
+
+fn qwen36_ffn_router_stage5_parity_tap_layer() -> Option<i32> {
+    std::env::var("SUPERSONIC_METAL_QWEN36_FFN_ROUTER_STAGE5_PARITY_TAP_LAYER")
+        .ok()
+        .and_then(|raw| raw.parse::<i32>().ok())
+}
+
+fn qwen36_ffn_router_stage5_parity_tap_enabled_for_layer(layer_idx: i32) -> bool {
+    qwen36_ffn_router_stage5_parity_tap_enabled()
+        && qwen36_ffn_router_stage5_parity_tap_layer().map_or(true, |target| target == layer_idx)
 }
 
 fn qwen36_ffn_shared_stage5_parity_tap_enabled() -> bool {
@@ -4200,6 +4296,31 @@ fn qwen36_ffn_stage5_routed_finalize_tap_enabled() -> bool {
 fn qwen36_ffn_router_stage5_simd_env_enabled() -> bool {
     std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_STAGE5_SIMD").is_some()
         && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
+}
+
+fn qwen36_ffn_router_stage5_fused_exact_env_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_FUSED_EXACT").is_some()
+        && !qwen36_ffn_router_stage5_simd_env_enabled()
+        && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
+}
+
+fn qwen36_ffn_router_stage5_exact_simd_env_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_DISABLE_QWEN36_FFN_ROUTER_STAGE5_EXACT_SIMD").is_none()
+        && !qwen36_ffn_router_stage5_simd_env_enabled()
+        && !qwen36_ffn_router_stage5_fused_exact_env_enabled()
+        && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
+}
+
+fn qwen36_ffn_router_stage5_path_label() -> &'static str {
+    if qwen36_ffn_router_stage5_simd_env_enabled() {
+        "simd"
+    } else if qwen36_ffn_router_stage5_fused_exact_env_enabled() {
+        "fused-exact"
+    } else if qwen36_ffn_router_stage5_exact_simd_env_enabled() {
+        "exact-simd"
+    } else {
+        "serial"
+    }
 }
 
 fn qwen36_ffn_router_stage5_parity_tap_max_calls() -> usize {
@@ -4374,12 +4495,15 @@ fn qwen36_compute_ffn_shared_reference(
     h_norm: &[f32],
     shared_expert_gate_w: &[u16],
     shared_gate_w: usize,
+    shared_gate_type: i32,
     shared_gate_scale: usize,
     shared_gate_zero: usize,
     shared_up_w: usize,
+    shared_up_type: i32,
     shared_up_scale: usize,
     shared_up_zero: usize,
     shared_down_w: usize,
+    shared_down_type: i32,
     shared_down_scale: usize,
     shared_down_zero: usize,
     hidden: usize,
@@ -4393,6 +4517,7 @@ fn qwen36_compute_ffn_shared_reference(
             shared_gate_w,
             shared_gate_scale,
             shared_gate_zero,
+            shared_gate_type,
             row,
             hidden,
             group_size,
@@ -4402,6 +4527,7 @@ fn qwen36_compute_ffn_shared_reference(
             shared_up_w,
             shared_up_scale,
             shared_up_zero,
+            shared_up_type,
             row,
             hidden,
             group_size,
@@ -4429,6 +4555,7 @@ fn qwen36_compute_ffn_shared_reference(
             shared_down_w,
             shared_down_scale,
             shared_down_zero,
+            shared_down_type,
             row,
             shared_intermediate,
             group_size,
@@ -4449,6 +4576,7 @@ fn qwen36_compute_ffn_shared_reference(
 #[allow(clippy::too_many_arguments)]
 fn qwen36_shared_down_row_probe(
     shared_down_w: usize,
+    shared_down_type: i32,
     shared_down_scale: usize,
     shared_down_zero: usize,
     row: usize,
@@ -4461,6 +4589,7 @@ fn qwen36_shared_down_row_probe(
         shared_down_w,
         shared_down_scale,
         shared_down_zero,
+        shared_down_type,
         row,
         shared_intermediate,
         group_size,
@@ -4733,17 +4862,160 @@ fn qwen36_emit_ffn_router_stage5_parity_tap(
         .copied()
         .unwrap_or(f32::NAN);
     let metal_logit_at_host_top = logits.get(host_top_logit_idx).copied().unwrap_or(f32::NAN);
-    let router_path = if qwen36_ffn_router_stage5_simd_env_enabled() {
-        "simd"
-    } else {
-        "serial"
-    };
+    let router_path = qwen36_ffn_router_stage5_path_label();
 
     eprintln!(
         "[qwen36-ffn-router-parity] call={} layer={} router_path={} topk_idx_match={} workspace_idx_match={} output_idx_match={} topk_first_mismatch={} workspace_first_idx_mismatch={} output_first_idx_mismatch={} h_norm_max_abs={:.8e} h_norm_argmax={} logits_max_abs={:.8e} logits_argmax={} host_top_logit_idx={} metal_top_logit_idx={} host_top_logit={:.8e} metal_top_logit={:.8e} host_logit_at_metal_top={:.8e} metal_logit_at_host_top={:.8e} topk_weight_max_abs={:.8e} topk_weight_argmax={} host_idx={} workspace_idx={} output_idx={} host_w={} metal_w={}",
         call,
         layer_idx,
         router_path,
+        topk_idx_match as u8,
+        workspace_idx_match as u8,
+        output_idx_match as u8,
+        topk_first_mismatch,
+        workspace_first_idx_mismatch,
+        output_first_idx_mismatch,
+        h_norm_max_abs,
+        h_norm_argmax,
+        logits_max_abs,
+        logits_argmax,
+        host_top_logit_idx,
+        metal_top_logit_idx,
+        host_top_logit,
+        metal_top_logit,
+        host_logit_at_metal_top,
+        metal_logit_at_host_top,
+        topk_weight_max_abs,
+        topk_weight_argmax,
+        qwen36_join_u32(&reference.topk_idx),
+        qwen36_join_u32(&workspace_topk_idx),
+        qwen36_join_u32(output_topk_idx),
+        qwen36_join_f32(&reference.topk_weight),
+        qwen36_join_f32(topk_weight),
+    );
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn emit_decode_batch_router_stage5_parity_tap_from_host(
+    call: usize,
+    position: i32,
+    cache_pos: i32,
+    layer_idx: i32,
+    router_path: &str,
+    phase_profile: bool,
+    input: &[u16],
+    workspace: &[f32],
+    output_idx: &[u32],
+    params: Qwen36MoeFfnStepParams,
+    weights: &Qwen36MoeFfnStepWeights,
+    int4: &Qwen36MoeFfnStepInt4,
+) -> Result<(), GpuError> {
+    if params.stage != 5 {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::emit_decode_batch_router_stage5_parity_tap_from_host requires stage 5, got {}",
+            params.stage
+        )));
+    }
+    if int4.group_size < 0 {
+        return Err(GpuError::InvalidArg(
+            "qwen36_moe::emit_decode_batch_router_stage5_parity_tap_from_host does not support FP8 sidecars"
+                .into(),
+        ));
+    }
+    if !qwen36_ffn_int4_stage5_router_metal_native_supported(params, weights, int4) {
+        return Err(GpuError::InvalidArg(
+            "qwen36_moe::emit_decode_batch_router_stage5_parity_tap_from_host requires the Qwen3.6 Metal INT4 router stage-5 path"
+                .into(),
+        ));
+    }
+
+    let hidden = params.hidden as usize;
+    let num_experts = params.num_experts as usize;
+    let top_k = params.top_k as usize;
+    let off_h_norm = 0;
+    let off_router_logits = hidden;
+    let off_router_probs = off_router_logits + num_experts;
+    let off_topk_val = off_router_probs + num_experts;
+    let off_topk_idx = off_topk_val + top_k;
+    let workspace_needed = off_topk_idx + top_k;
+
+    if input.len() < hidden {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::emit_decode_batch_router_stage5_parity_tap_from_host input too small: need {hidden}, got {}",
+            input.len()
+        )));
+    }
+    if workspace.len() < workspace_needed {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::emit_decode_batch_router_stage5_parity_tap_from_host workspace too small: need {workspace_needed}, got {}",
+            workspace.len()
+        )));
+    }
+    if output_idx.len() < top_k {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::emit_decode_batch_router_stage5_parity_tap_from_host output_idx too small: need {top_k}, got {}",
+            output_idx.len()
+        )));
+    }
+
+    let norm_w =
+        unsafe { std::slice::from_raw_parts(weights.post_attn_norm_w as *const u16, hidden) };
+    let gate_w =
+        unsafe { std::slice::from_raw_parts(weights.gate_w as *const u16, num_experts * hidden) };
+    let reference = qwen36_compute_ffn_router_reference(
+        &input[..hidden],
+        norm_w,
+        gate_w,
+        hidden,
+        num_experts,
+        top_k,
+        params.rms_norm_eps,
+    );
+
+    let h_norm = &workspace[off_h_norm..off_h_norm + hidden];
+    let logits = &workspace[off_router_logits..off_router_logits + num_experts];
+    let topk_weight = &workspace[off_topk_val..off_topk_val + top_k];
+    let workspace_topk_idx: Vec<u32> = workspace[off_topk_idx..off_topk_idx + top_k]
+        .iter()
+        .map(|value| value.to_bits())
+        .collect();
+    let output_topk_idx = &output_idx[..top_k];
+
+    let (h_norm_max_abs, h_norm_argmax) = qwen36_max_abs_delta(&reference.h_norm, h_norm);
+    let (logits_max_abs, logits_argmax) = qwen36_max_abs_delta(&reference.logits, logits);
+    let (topk_weight_max_abs, topk_weight_argmax) =
+        qwen36_max_abs_delta(&reference.topk_weight, topk_weight);
+    let workspace_idx_match = reference.topk_idx == workspace_topk_idx;
+    let output_idx_match = reference.topk_idx.as_slice() == output_topk_idx;
+    let topk_idx_match = workspace_idx_match && output_idx_match;
+    let workspace_first_idx_mismatch =
+        qwen36_first_u32_mismatch(&reference.topk_idx, &workspace_topk_idx);
+    let output_first_idx_mismatch = qwen36_first_u32_mismatch(&reference.topk_idx, output_topk_idx);
+    let topk_first_mismatch = match (workspace_first_idx_mismatch, output_first_idx_mismatch) {
+        (-1, -1) => -1,
+        (-1, output) => output,
+        (workspace, -1) => workspace,
+        (workspace, output) => workspace.min(output),
+    };
+    let (host_top_logit_idx, host_top_logit) = qwen36_argmax_f32(&reference.logits);
+    let (metal_top_logit_idx, metal_top_logit) = qwen36_argmax_f32(logits);
+    let host_logit_at_metal_top = reference
+        .logits
+        .get(metal_top_logit_idx)
+        .copied()
+        .unwrap_or(f32::NAN);
+    let metal_logit_at_host_top = logits.get(host_top_logit_idx).copied().unwrap_or(f32::NAN);
+
+    eprintln!(
+        "[qwen36-decode-batch-router-parity] call={} position={} cache_pos={} layer={} router_path={} phase_profile={} topk_idx_match={} workspace_idx_match={} output_idx_match={} topk_first_mismatch={} workspace_first_idx_mismatch={} output_first_idx_mismatch={} h_norm_max_abs={:.8e} h_norm_argmax={} logits_max_abs={:.8e} logits_argmax={} host_top_logit_idx={} metal_top_logit_idx={} host_top_logit={:.8e} metal_top_logit={:.8e} host_logit_at_metal_top={:.8e} metal_logit_at_host_top={:.8e} topk_weight_max_abs={:.8e} topk_weight_argmax={} host_idx={} workspace_idx={} output_idx={} host_w={} metal_w={}",
+        call,
+        position,
+        cache_pos,
+        layer_idx,
+        router_path,
+        phase_profile as u8,
         topk_idx_match as u8,
         workspace_idx_match as u8,
         output_idx_match as u8,
@@ -4857,6 +5129,7 @@ fn qwen36_emit_ffn_shared_stage5_parity_tap(
         host_shared_out_recomputed_at_argmax,
     ) = qwen36_shared_down_row_probe(
         shared_down_w,
+        int4.shared_down_proj_type,
         shared_down_scale,
         shared_down_zero,
         shared_out_argmax,
@@ -4871,6 +5144,7 @@ fn qwen36_emit_ffn_shared_stage5_parity_tap(
         metal_mid_host_shared_out_at_argmax,
     ) = qwen36_shared_down_row_probe(
         shared_down_w,
+        int4.shared_down_proj_type,
         shared_down_scale,
         shared_down_zero,
         shared_out_argmax,
@@ -5090,6 +5364,7 @@ fn qwen36_apply_ffn_shared_mid_stage5_host_correction(
         let metal_shared = workspace[off_shared_out + row];
         let (_, _, corrected_shared) = qwen36_shared_down_row_probe(
             weights.shared_down_proj_w as usize,
+            int4.shared_down_proj_type,
             int4.shared_down_proj_scale as usize,
             int4.shared_down_proj_zero as usize,
             row,
@@ -5346,11 +5621,7 @@ fn qwen36_emit_ffn_routed_stage5_gate_up_tap(
             metal_expert_mid,
         );
 
-    let router_path = if qwen36_ffn_router_stage5_simd_env_enabled() {
-        "simd"
-    } else {
-        "serial"
-    };
+    let router_path = qwen36_ffn_router_stage5_path_label();
     eprintln!(
         "[qwen36-ffn-routed-gate-up-tap] layer={} router_path={} hidden={} top_k={} topk_idx_match={} topk_weight_max_abs={:.8e} topk_weight_argmax={} host_topk_weight_at_argmax={:.8e} metal_topk_weight_at_argmax={:.8e} expert_mid_max_abs={:.8e} expert_mid_argmax={} expert_mid_group={} expert_mid_row={} host_expert_gate_at_mid_argmax={:.8e} metal_expert_gate_at_mid_argmax={:.8e} expert_gate_delta_at_mid_argmax={:.8e} host_expert_up_at_mid_argmax={:.8e} metal_expert_up_at_mid_argmax={:.8e} expert_up_delta_at_mid_argmax={:.8e} host_expert_silu_at_mid_argmax={:.8e} metal_expert_silu_at_mid_argmax={:.8e} expert_silu_delta_at_mid_argmax={:.8e} host_expert_mid_at_argmax={:.8e} metal_expert_mid_at_argmax={:.8e} host_expert_mid_recomputed_at_argmax={:.8e} metal_expert_mid_recomputed_at_argmax={:.8e} expert_mid_recompute_delta_at_argmax={:.8e} moe_out_max_abs={:.8e} moe_out_argmax={} host_moe_out_at_argmax={:.8e} metal_moe_out_at_argmax={:.8e} host_routed_down_acc_at_moe_argmax={:.8e} host_routed_moe_out_recomputed_at_argmax={:.8e} metal_mid_host_topk_down_acc_at_moe_argmax={:.8e} metal_mid_host_topk_moe_out_at_argmax={:.8e} metal_mid_metal_topk_down_acc_at_moe_argmax={:.8e} metal_mid_metal_topk_moe_out_at_argmax={:.8e} final_out_max_abs={:.8e} final_out_argmax={} host_final_out_at_argmax={:.8e} metal_final_out_at_argmax={:.8e}",
         layer_idx,
@@ -5681,11 +5952,7 @@ fn qwen36_emit_ffn_routed_stage5_finalize_tap(
         &metal_final_out,
     );
 
-    let router_path = if qwen36_ffn_router_stage5_simd_env_enabled() {
-        "simd"
-    } else {
-        "serial"
-    };
+    let router_path = qwen36_ffn_router_stage5_path_label();
     eprintln!(
         "[qwen36-ffn-routed-finalize-tap] layer={} router_path={} hidden={} top_k={} topk_idx_match={} topk_weight_max_abs={:.8e} topk_weight_argmax={} shared_out_max_abs={:.8e} shared_out_argmax={} host_shared_out_at_argmax={:.8e} metal_shared_out_at_argmax={:.8e} moe_out_max_abs={:.8e} moe_out_argmax={} final_out_max_abs={:.8e} final_out_argmax={} moe_probe_row={} moe_input={:.8e} moe_host_moe={:.8e} moe_metal_moe={:.8e} moe_host_shared={:.8e} moe_metal_shared={:.8e} moe_host_final={:.8e} moe_metal_final={:.8e} moe_final_host_host={:.8e} moe_final_metal_moe_host_shared={:.8e} moe_final_host_moe_metal_shared={:.8e} moe_final_metal_moe_metal_shared={:.8e} moe_host_down_acc={:.8e} moe_host_moe_recomputed={:.8e} moe_metal_mid_host_topk_down_acc={:.8e} moe_metal_mid_host_topk_moe={:.8e} moe_metal_mid_metal_topk_down_acc={:.8e} moe_metal_mid_metal_topk_moe={:.8e} moe_final_metal_mid_host_topk_host_shared={:.8e} moe_final_metal_mid_host_topk_metal_shared={:.8e} moe_final_metal_mid_metal_topk_host_shared={:.8e} moe_final_metal_mid_metal_topk_metal_shared={:.8e} moe_metal_moe_matches_metal_mid_host_topk={} moe_metal_moe_matches_metal_mid_metal_topk={} moe_host_final_matches_host_moe_host_shared={} moe_metal_final_matches_metal_moe_metal_shared={} final_probe_row={} final_input={:.8e} final_host_moe={:.8e} final_metal_moe={:.8e} final_host_shared={:.8e} final_metal_shared={:.8e} final_host_final={:.8e} final_metal_final={:.8e} final_final_host_host={:.8e} final_final_metal_moe_host_shared={:.8e} final_final_host_moe_metal_shared={:.8e} final_final_metal_moe_metal_shared={:.8e} final_host_down_acc={:.8e} final_host_moe_recomputed={:.8e} final_metal_mid_host_topk_down_acc={:.8e} final_metal_mid_host_topk_moe={:.8e} final_metal_mid_metal_topk_down_acc={:.8e} final_metal_mid_metal_topk_moe={:.8e} final_final_metal_mid_host_topk_host_shared={:.8e} final_final_metal_mid_host_topk_metal_shared={:.8e} final_final_metal_mid_metal_topk_host_shared={:.8e} final_final_metal_mid_metal_topk_metal_shared={:.8e} final_metal_moe_matches_metal_mid_host_topk={} final_metal_moe_matches_metal_mid_metal_topk={} final_host_final_matches_host_moe_host_shared={} final_metal_final_matches_metal_moe_metal_shared={}",
         layer_idx,
@@ -5973,11 +6240,7 @@ fn qwen36_apply_ffn_routed_stage5_host_correction(
     } else {
         first_changed_output as isize
     };
-    let router_path = if qwen36_ffn_router_stage5_simd_env_enabled() {
-        "simd"
-    } else {
-        "serial"
-    };
+    let router_path = qwen36_ffn_router_stage5_path_label();
     eprintln!(
         "[qwen36-ffn-routed-host-correction] layer={} router_path={} hidden={} top_k={} topk_idx_match={} topk_weight_max_abs={:.8e} topk_weight_argmax={} host_topk_weight_at_argmax={:.8e} metal_topk_weight_at_argmax={:.8e} expert_mid_max_abs={:.8e} expert_mid_argmax={} expert_mid_group={} expert_mid_row={} host_expert_gate_at_mid_argmax={:.8e} metal_expert_gate_at_mid_argmax={:.8e} expert_gate_delta_at_mid_argmax={:.8e} host_expert_up_at_mid_argmax={:.8e} metal_expert_up_at_mid_argmax={:.8e} expert_up_delta_at_mid_argmax={:.8e} host_expert_silu_at_mid_argmax={:.8e} metal_expert_silu_at_mid_argmax={:.8e} expert_silu_delta_at_mid_argmax={:.8e} host_expert_mid_at_argmax={:.8e} metal_expert_mid_at_argmax={:.8e} host_expert_mid_recomputed_at_argmax={:.8e} metal_expert_mid_recomputed_at_argmax={:.8e} expert_mid_recompute_delta_at_argmax={:.8e} moe_out_max_abs={:.8e} moe_out_argmax={} host_moe_out_at_argmax={:.8e} metal_moe_out_at_argmax={:.8e} host_routed_down_acc_at_moe_argmax={:.8e} host_routed_moe_out_recomputed_at_argmax={:.8e} metal_mid_host_topk_down_acc_at_moe_argmax={:.8e} metal_mid_host_topk_moe_out_at_argmax={:.8e} metal_mid_metal_topk_down_acc_at_moe_argmax={:.8e} metal_mid_metal_topk_moe_out_at_argmax={:.8e} output_patch_max_abs={:.8e} output_patch_argmax={} host_final_out_at_argmax={:.8e} metal_final_out_at_argmax={:.8e} changed_output_elems={} first_changed_output={}",
         layer_idx,
@@ -6194,11 +6457,7 @@ fn qwen36_apply_ffn_routed_down_stage5_host_recompute_correction(
     } else {
         first_changed_output as isize
     };
-    let router_path = if qwen36_ffn_router_stage5_simd_env_enabled() {
-        "simd"
-    } else {
-        "serial"
-    };
+    let router_path = qwen36_ffn_router_stage5_path_label();
     eprintln!(
         "[qwen36-ffn-routed-down-host-recompute-correction] layer={} router_path={} hidden={} top_k={} topk_idx_match={} topk_weight_max_abs={:.8e} topk_weight_argmax={} expert_mid_max_abs={:.8e} expert_mid_argmax={} expert_mid_group={} expert_mid_row={} host_expert_mid_at_argmax={:.8e} metal_expert_mid_at_argmax={:.8e} metal_moe_vs_recomputed_max_abs={:.8e} metal_moe_vs_recomputed_argmax={} recomputed_down_acc_at_moe_argmax={:.8e} recomputed_moe_at_moe_argmax={:.8e} host_moe_at_moe_argmax={:.8e} metal_moe_at_moe_argmax={:.8e} host_moe_vs_recomputed_max_abs={:.8e} host_moe_vs_recomputed_argmax={} recomputed_moe_at_host_argmax={:.8e} host_moe_at_host_argmax={:.8e} metal_moe_at_host_argmax={:.8e} output_patch_max_abs={:.8e} output_patch_argmax={} final_vs_host_max_abs={:.8e} final_vs_host_argmax={} host_final_at_final_argmax={:.8e} recomputed_final_at_final_argmax={:.8e} changed_moe_elems={} changed_output_elems={} first_changed_output={}",
         layer_idx,
@@ -6370,12 +6629,15 @@ pub fn emit_decode_batch_shared_stage5_parity_tap_from_host(
         &router_reference.h_norm,
         shared_expert_gate_w,
         weights.shared_gate_proj_w as usize,
+        int4.shared_gate_proj_type,
         int4.shared_gate_proj_scale as usize,
         int4.shared_gate_proj_zero as usize,
         weights.shared_up_proj_w as usize,
+        int4.shared_up_proj_type,
         int4.shared_up_proj_scale as usize,
         int4.shared_up_proj_zero as usize,
         weights.shared_down_proj_w as usize,
+        int4.shared_down_proj_type,
         int4.shared_down_proj_scale as usize,
         int4.shared_down_proj_zero as usize,
         hidden,
@@ -6444,6 +6706,7 @@ pub fn emit_decode_batch_shared_stage5_parity_tap_from_host(
         host_shared_out_recomputed_at_argmax,
     ) = qwen36_shared_down_row_probe(
         shared_down_w,
+        int4.shared_down_proj_type,
         shared_down_scale,
         shared_down_zero,
         shared_out_argmax,
@@ -6458,6 +6721,7 @@ pub fn emit_decode_batch_shared_stage5_parity_tap_from_host(
         metal_mid_host_shared_out_at_argmax,
     ) = qwen36_shared_down_row_probe(
         shared_down_w,
+        int4.shared_down_proj_type,
         shared_down_scale,
         shared_down_zero,
         shared_out_argmax,
@@ -6606,12 +6870,15 @@ pub fn emit_decode_batch_routed_stage5_parity_tap_from_host(
         &router_reference.h_norm,
         shared_expert_gate_w,
         weights.shared_gate_proj_w as usize,
+        int4.shared_gate_proj_type,
         int4.shared_gate_proj_scale as usize,
         int4.shared_gate_proj_zero as usize,
         weights.shared_up_proj_w as usize,
+        int4.shared_up_proj_type,
         int4.shared_up_proj_scale as usize,
         int4.shared_up_proj_zero as usize,
         weights.shared_down_proj_w as usize,
+        int4.shared_down_proj_type,
         int4.shared_down_proj_scale as usize,
         int4.shared_down_proj_zero as usize,
         hidden,
@@ -9942,36 +10209,42 @@ fn ffn_step_stage1_5_metal_host(
 
     if qwen36_ffn_int4_stage5_router_metal_native_supported(params, weights, int4) {
         qwen36_validate_dense_or_int4_sidecars(
+            int4.shared_gate_proj_type,
             int4.shared_gate_proj_scale,
             int4.shared_gate_proj_zero,
             int4.group_size,
             "shared_gate_proj",
         )?;
         qwen36_validate_dense_or_int4_sidecars(
+            int4.shared_up_proj_type,
             int4.shared_up_proj_scale,
             int4.shared_up_proj_zero,
             int4.group_size,
             "shared_up_proj",
         )?;
         qwen36_validate_dense_or_int4_sidecars(
+            int4.shared_down_proj_type,
             int4.shared_down_proj_scale,
             int4.shared_down_proj_zero,
             int4.group_size,
             "shared_down_proj",
         )?;
         qwen36_validate_dense_or_int4_sidecars(
+            int4.gate_up_proj_type,
             int4.gate_up_proj_scale,
             int4.gate_up_proj_zero,
             int4.group_size,
             "gate_up_proj",
         )?;
         qwen36_validate_dense_or_int4_sidecars(
+            int4.down_proj_type,
             int4.down_proj_scale,
             int4.down_proj_zero,
             int4.group_size,
             "down_proj",
         )?;
-        let router_parity_tap = qwen36_ffn_router_stage5_parity_tap_enabled();
+        let router_parity_tap =
+            qwen36_ffn_router_stage5_parity_tap_enabled_for_layer(params.layer_idx);
         let shared_parity_tap = qwen36_ffn_shared_stage5_parity_tap_enabled();
         let shared_host_correction = qwen36_ffn_stage5_shared_host_correction_enabled();
         let shared_mid_host_correction = qwen36_ffn_stage5_shared_mid_host_correction_enabled();
@@ -10047,12 +10320,15 @@ fn ffn_step_stage1_5_metal_host(
                 &reference.h_norm,
                 shared_expert_gate_w,
                 weights.shared_gate_proj_w as usize,
+                int4.shared_gate_proj_type,
                 int4.shared_gate_proj_scale as usize,
                 int4.shared_gate_proj_zero as usize,
                 weights.shared_up_proj_w as usize,
+                int4.shared_up_proj_type,
                 int4.shared_up_proj_scale as usize,
                 int4.shared_up_proj_zero as usize,
                 weights.shared_down_proj_w as usize,
+                int4.shared_down_proj_type,
                 int4.shared_down_proj_scale as usize,
                 int4.shared_down_proj_zero as usize,
                 hidden,
@@ -10475,30 +10751,35 @@ fn ffn_step_stage1_5_metal_host(
     let shared_expert_gate_w =
         unsafe { std::slice::from_raw_parts(weights.shared_expert_gate_w as *const u16, hidden) };
     qwen36_validate_dense_or_int4_sidecars(
+        int4.shared_gate_proj_type,
         int4.shared_gate_proj_scale,
         int4.shared_gate_proj_zero,
         int4.group_size,
         "shared_gate_proj",
     )?;
     qwen36_validate_dense_or_int4_sidecars(
+        int4.shared_up_proj_type,
         int4.shared_up_proj_scale,
         int4.shared_up_proj_zero,
         int4.group_size,
         "shared_up_proj",
     )?;
     qwen36_validate_dense_or_int4_sidecars(
+        int4.shared_down_proj_type,
         int4.shared_down_proj_scale,
         int4.shared_down_proj_zero,
         int4.group_size,
         "shared_down_proj",
     )?;
     qwen36_validate_dense_or_int4_sidecars(
+        int4.gate_up_proj_type,
         int4.gate_up_proj_scale,
         int4.gate_up_proj_zero,
         int4.group_size,
         "gate_up_proj",
     )?;
     qwen36_validate_dense_or_int4_sidecars(
+        int4.down_proj_type,
         int4.down_proj_scale,
         int4.down_proj_zero,
         int4.group_size,
@@ -10549,26 +10830,36 @@ fn ffn_step_stage1_5_metal_host(
         let (sgp, after_sup) = after_sgp.split_at_mut(shared_intermediate);
         let (sup, _) = after_sup.split_at_mut(shared_intermediate);
         let shared_gate_w = weights.shared_gate_proj_w as usize;
+        let shared_gate_type = int4.shared_gate_proj_type;
         let shared_gate_scale = int4.shared_gate_proj_scale as usize;
         let shared_gate_zero = int4.shared_gate_proj_zero as usize;
         let shared_up_w = weights.shared_up_proj_w as usize;
+        let shared_up_type = int4.shared_up_proj_type;
         let shared_up_scale = int4.shared_up_proj_scale as usize;
         let shared_up_zero = int4.shared_up_proj_zero as usize;
         let group_size = int4.group_size.max(0) as usize;
-        let shared_gate_luts = qwen36_build_dense_int4_dequant_luts(
-            shared_gate_scale,
-            shared_gate_zero,
-            shared_intermediate,
-            hidden,
-            group_size,
-        );
-        let shared_up_luts = qwen36_build_dense_int4_dequant_luts(
-            shared_up_scale,
-            shared_up_zero,
-            shared_intermediate,
-            hidden,
-            group_size,
-        );
+        let shared_gate_luts = if qwen36_lowbit_native_int4(shared_gate_type) {
+            qwen36_build_dense_int4_dequant_luts(
+                shared_gate_scale,
+                shared_gate_zero,
+                shared_intermediate,
+                hidden,
+                group_size,
+            )
+        } else {
+            None
+        };
+        let shared_up_luts = if qwen36_lowbit_native_int4(shared_up_type) {
+            qwen36_build_dense_int4_dequant_luts(
+                shared_up_scale,
+                shared_up_zero,
+                shared_intermediate,
+                hidden,
+                group_size,
+            )
+        } else {
+            None
+        };
         qwen36_parallel_chunks2_mut(sgp, sup, 64, |start, gate_chunk, up_chunk| {
             for (local, (gate_out, up_out)) in
                 gate_chunk.iter_mut().zip(up_chunk.iter_mut()).enumerate()
@@ -10588,6 +10879,7 @@ fn ffn_step_stage1_5_metal_host(
                         shared_gate_w,
                         shared_gate_scale,
                         shared_gate_zero,
+                        shared_gate_type,
                         row,
                         hidden,
                         group_size,
@@ -10608,6 +10900,7 @@ fn ffn_step_stage1_5_metal_host(
                         shared_up_w,
                         shared_up_scale,
                         shared_up_zero,
+                        shared_up_type,
                         row,
                         hidden,
                         group_size,
@@ -10636,16 +10929,21 @@ fn ffn_step_stage1_5_metal_host(
     let shared_mid = workspace[off_shared_mid..off_shared_mid + shared_intermediate].to_vec();
     crate::prefill_ffi::metal_profile_time("qwen36_ffn_host_shared_down", "host", || {
         let shared_down_w = weights.shared_down_proj_w as usize;
+        let shared_down_type = int4.shared_down_proj_type;
         let shared_down_scale = int4.shared_down_proj_scale as usize;
         let shared_down_zero = int4.shared_down_proj_zero as usize;
         let group_size = int4.group_size.max(0) as usize;
-        let shared_down_luts = qwen36_build_dense_int4_dequant_luts(
-            shared_down_scale,
-            shared_down_zero,
-            hidden,
-            shared_intermediate,
-            group_size,
-        );
+        let shared_down_luts = if qwen36_lowbit_native_int4(shared_down_type) {
+            qwen36_build_dense_int4_dequant_luts(
+                shared_down_scale,
+                shared_down_zero,
+                hidden,
+                shared_intermediate,
+                group_size,
+            )
+        } else {
+            None
+        };
         let shared_out = &mut workspace[off_shared_out..off_shared_out + hidden];
         qwen36_parallel_chunks_mut(shared_out, 64, |start, chunk| {
             for (local, out) in chunk.iter_mut().enumerate() {
@@ -10664,6 +10962,7 @@ fn ffn_step_stage1_5_metal_host(
                         shared_down_w,
                         shared_down_scale,
                         shared_down_zero,
+                        shared_down_type,
                         row,
                         shared_intermediate,
                         group_size,
@@ -11494,9 +11793,142 @@ fn bf16_bits_to_f32(bits: u16) -> f32 {
     f32::from_bits((bits as u32) << 16)
 }
 
+fn f16_bits_to_f32(bits: u16) -> f32 {
+    half::f16::from_bits(bits).to_f32()
+}
+
 fn qwen36_int4_group_dequant_lut(scale: f32, zero: f32) -> [f32; 16] {
     let zs = zero * scale;
     std::array::from_fn(|q| bf16_round_f32(q as f32 * scale - zs))
+}
+
+fn qwen36_ggml_k_row_bytes(qtype: i32, cols: usize) -> usize {
+    let blocks = cols / 256;
+    match qtype {
+        12 => blocks * 144,
+        13 => blocks * 176,
+        14 => blocks * 210,
+        _ => cols.div_ceil(2),
+    }
+}
+
+fn qwen36_ggml_q4_k_scale_min(j: usize, q: *const u8) -> (i32, i32) {
+    unsafe {
+        if j < 4 {
+            ((*q.add(j) & 63) as i32, (*q.add(j + 4) & 63) as i32)
+        } else {
+            (
+                ((*q.add(j + 4) & 0x0f) | ((*q.add(j - 4) >> 6) << 4)) as i32,
+                (((*q.add(j + 4) >> 4) | ((*q.add(j) >> 6) << 4)) & 63) as i32,
+            )
+        }
+    }
+}
+
+fn qwen36_read_f16_unaligned(p: *const u8) -> f32 {
+    let bits = unsafe { (*p as u16) | ((*p.add(1) as u16) << 8) };
+    f16_bits_to_f32(bits)
+}
+
+fn qwen36_ggml_k_dequant_scalar(
+    data: usize,
+    qtype: i32,
+    row: usize,
+    col: usize,
+    cols: usize,
+) -> f32 {
+    let block = col / 256;
+    let inb = col - block * 256;
+    let row_bytes = qwen36_ggml_k_row_bytes(qtype, cols);
+    let b = unsafe { (data as *const u8).add(row * row_bytes) };
+    match qtype {
+        12 => {
+            let b = unsafe { b.add(block * 144) };
+            let d = qwen36_read_f16_unaligned(b);
+            let dmin = unsafe { qwen36_read_f16_unaligned(b.add(2)) };
+            let sc = unsafe { b.add(4) };
+            let qs = unsafe { b.add(16) };
+            let g = inb / 64;
+            let sub = (inb % 64) / 32;
+            let j = 2 * g + sub;
+            let (scale, minv) = qwen36_ggml_q4_k_scale_min(j, sc);
+            let qbyte = unsafe { *qs.add(g * 32 + (inb % 32)) };
+            let q = if sub != 0 {
+                ((qbyte >> 4) & 0x0f) as i32
+            } else {
+                (qbyte & 0x0f) as i32
+            };
+            d * scale as f32 * q as f32 - dmin * minv as f32
+        }
+        13 => {
+            let b = unsafe { b.add(block * 176) };
+            let d = qwen36_read_f16_unaligned(b);
+            let dmin = unsafe { qwen36_read_f16_unaligned(b.add(2)) };
+            let sc = unsafe { b.add(4) };
+            let qh = unsafe { b.add(16) };
+            let ql = unsafe { b.add(48) };
+            let g = inb / 64;
+            let sub = (inb % 64) / 32;
+            let j = 2 * g + sub;
+            let (scale, minv) = qwen36_ggml_q4_k_scale_min(j, sc);
+            let idx = inb % 32;
+            let qbyte = unsafe { *ql.add(g * 32 + idx) };
+            let lo = if sub != 0 {
+                ((qbyte >> 4) & 0x0f) as i32
+            } else {
+                (qbyte & 0x0f) as i32
+            };
+            let high_mask = if sub != 0 {
+                2u8 << (2 * g)
+            } else {
+                1u8 << (2 * g)
+            };
+            let hi = if unsafe { *qh.add(idx) } & high_mask != 0 {
+                16
+            } else {
+                0
+            };
+            d * scale as f32 * (lo + hi) as f32 - dmin * minv as f32
+        }
+        14 => {
+            let b = unsafe { b.add(block * 210) };
+            let ql = b;
+            let qh = unsafe { b.add(128) };
+            let sc = unsafe { b.add(192) as *const i8 };
+            let d = unsafe { qwen36_read_f16_unaligned(b.add(208)) };
+            let half_idx = inb / 128;
+            let pos = inb - half_idx * 128;
+            let idx = pos % 32;
+            let qh_byte = unsafe { *qh.add(half_idx * 32 + idx) };
+            let (q, scale_idx) = if pos < 32 {
+                (
+                    (unsafe { *ql.add(half_idx * 64 + idx) } & 0x0f) as i32
+                        | (((qh_byte >> 0) & 3) as i32) << 4,
+                    half_idx * 8 + idx / 16,
+                )
+            } else if pos < 64 {
+                (
+                    (unsafe { *ql.add(half_idx * 64 + 32 + idx) } & 0x0f) as i32
+                        | (((qh_byte >> 2) & 3) as i32) << 4,
+                    half_idx * 8 + idx / 16 + 2,
+                )
+            } else if pos < 96 {
+                (
+                    ((unsafe { *ql.add(half_idx * 64 + idx) } >> 4) & 0x0f) as i32
+                        | (((qh_byte >> 4) & 3) as i32) << 4,
+                    half_idx * 8 + idx / 16 + 4,
+                )
+            } else {
+                (
+                    ((unsafe { *ql.add(half_idx * 64 + 32 + idx) } >> 4) & 0x0f) as i32
+                        | (((qh_byte >> 6) & 3) as i32) << 4,
+                    half_idx * 8 + idx / 16 + 6,
+                )
+            };
+            d * unsafe { *sc.add(scale_idx) } as f32 * (q - 32) as f32
+        }
+        _ => 0.0,
+    }
 }
 
 #[inline(always)]
@@ -11905,33 +12337,32 @@ where
 }
 
 fn qwen36_validate_dense_or_int4_sidecars(
+    qtype: i32,
     scale: *const c_void,
     zero: *const c_void,
     group_size: i32,
     label: &str,
 ) -> Result<(), GpuError> {
-    if scale.is_null() && zero.is_null() {
-        return Ok(());
-    }
-    if scale.is_null() || zero.is_null() || group_size <= 0 {
-        return Err(GpuError::InvalidArg(format!(
-            "qwen36_moe: Metal INT4 fallback requires paired scale/zero pointers \
-             and positive group_size for {label}"
-        )));
-    }
-    Ok(())
+    qwen36_validate_dense_or_lowbit_sidecars(qtype, scale, zero, group_size, label)
 }
 
 fn qwen36_dense_or_int4_dot_2d_unchecked(
     weight: usize,
     scale: usize,
     zero: usize,
+    qtype: i32,
     row: usize,
     cols: usize,
     group_size: usize,
     x: &[f32],
 ) -> f32 {
     let mut acc = 0.0f32;
+    if qwen36_lowbit_ggml_k(qtype) {
+        for col in 0..cols {
+            acc += qwen36_ggml_k_dequant_scalar(weight, qtype, row, col, cols) * x[col];
+        }
+        return acc;
+    }
     if scale == 0 && zero == 0 {
         let w = weight as *const u16;
         let row_base = row * cols;
@@ -15048,12 +15479,16 @@ mod tests {
             kv_max_t: 0,
         };
         let int4 = Qwen36MoeAttnStepInt4 {
+            q_proj_type: 4,
             q_proj_scale: q_proj_scale.as_ptr(),
             q_proj_zero: q_proj_zero.as_ptr(),
+            k_proj_type: 0,
             k_proj_scale: std::ptr::null(),
             k_proj_zero: std::ptr::null(),
+            v_proj_type: 0,
             v_proj_scale: std::ptr::null(),
             v_proj_zero: std::ptr::null(),
+            o_proj_type: 0,
             o_proj_scale: std::ptr::null(),
             o_proj_zero: std::ptr::null(),
             group_size: group_size as i32,
@@ -17390,12 +17825,16 @@ mod tests {
         };
         let int4_ptrs = Qwen36MoeAttnStepInt4 {
             group_size,
+            q_proj_type: 4,
             q_proj_scale: q_scale_buf.as_ptr(),
             q_proj_zero: q_zero_buf.as_ptr(),
+            k_proj_type: 4,
             k_proj_scale: k_scale_buf.as_ptr(),
             k_proj_zero: k_zero_buf.as_ptr(),
+            v_proj_type: 4,
             v_proj_scale: v_scale_buf.as_ptr(),
             v_proj_zero: v_zero_buf.as_ptr(),
+            o_proj_type: 4,
             o_proj_scale: o_scale_buf.as_ptr(),
             o_proj_zero: o_zero_buf.as_ptr(),
         };
@@ -18694,10 +19133,13 @@ mod tests {
         };
         let int4_ptrs = Qwen36MoeLinearStepInt4 {
             group_size,
+            in_proj_qkv_type: 4,
             in_proj_qkv_scale: qkv_scale_buf.as_ptr(),
             in_proj_qkv_zero: qkv_zero_buf.as_ptr(),
+            in_proj_z_type: 4,
             in_proj_z_scale: z_scale_buf.as_ptr(),
             in_proj_z_zero: z_zero_buf.as_ptr(),
+            out_proj_type: 4,
             out_proj_scale: out_scale_buf.as_ptr(),
             out_proj_zero: out_zero_buf.as_ptr(),
         };
@@ -19871,10 +20313,13 @@ mod tests {
             down_proj_type: 4,
             down_proj_scale: std::ptr::null(),
             down_proj_zero: std::ptr::null(),
+            shared_gate_proj_type: 4,
             shared_gate_proj_scale: sgp_scale_buf.as_ptr(),
             shared_gate_proj_zero: sgp_zero_buf.as_ptr(),
+            shared_up_proj_type: 4,
             shared_up_proj_scale: sup_scale_buf.as_ptr(),
             shared_up_proj_zero: sup_zero_buf.as_ptr(),
+            shared_down_proj_type: 4,
             shared_down_proj_scale: sdp_scale_buf.as_ptr(),
             shared_down_proj_zero: sdp_zero_buf.as_ptr(),
         };
@@ -20114,10 +20559,13 @@ mod tests {
             down_proj_type: 4,
             down_proj_scale: std::ptr::null(),
             down_proj_zero: std::ptr::null(),
+            shared_gate_proj_type: 4,
             shared_gate_proj_scale: sgp_scale_buf.as_ptr(),
             shared_gate_proj_zero: sgp_zero_buf.as_ptr(),
+            shared_up_proj_type: 4,
             shared_up_proj_scale: sup_scale_buf.as_ptr(),
             shared_up_proj_zero: sup_zero_buf.as_ptr(),
+            shared_down_proj_type: 4,
             shared_down_proj_scale: sdp_scale_buf.as_ptr(),
             shared_down_proj_zero: sdp_zero_buf.as_ptr(),
         };
@@ -20348,10 +20796,13 @@ mod tests {
             down_proj_type: 4,
             down_proj_scale: dp_scale_buf.as_ptr(),
             down_proj_zero: dp_zero_buf.as_ptr(),
+            shared_gate_proj_type: 4,
             shared_gate_proj_scale: sgp_scale_buf.as_ptr(),
             shared_gate_proj_zero: sgp_zero_buf.as_ptr(),
+            shared_up_proj_type: 4,
             shared_up_proj_scale: sup_scale_buf.as_ptr(),
             shared_up_proj_zero: sup_zero_buf.as_ptr(),
+            shared_down_proj_type: 4,
             shared_down_proj_scale: sdp_scale_buf.as_ptr(),
             shared_down_proj_zero: sdp_zero_buf.as_ptr(),
         };

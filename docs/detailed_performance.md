@@ -880,13 +880,16 @@ SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" cargo run --re
 ### Qwen3.5-35B-A3B Q4_K_M public comparison checkpoint
 
 The Qwen3.5-35B-A3B Q4_K_M Metal lane is tracked separately from the Qwen3.6
-INT4 gate because it is intended to compare against public llama.cpp and MLX
-M5 Max numbers for the same model/quant target. The current SuperSonic
-checkpoint uses the Q4_K_M-sourced GPTQ/native-INT4 bake (`--q4km-gptq`), not
-raw GGML K-blocks (`--q4km`), because the Metal dense projection kernels consume
-native INT4 sidecars. The run is direct single-sequence greedy generation, empty
-prompt (`""`, tokenized as one prompt token), 512 generated tokens, and no
-attribution or Metal profile pass:
+INT4 gate because it is intended to compare against llama.cpp and MLX M5 Max
+numbers for the same model/quant target. The SuperSonic control checkpoint uses
+the Q4_K_M-sourced GPTQ/native-INT4 bake (`--q4km-gptq`), while the raw
+external-equivalence checkpoint uses staged mixed-layout raw GGML K-blocks
+(`--q4km`). The external adapter harness records llama.cpp from a raw GGUF
+Q4_K_M file and MLX from a matching MLX model directory. Raw `--q4km` accepts
+mixed Q4_K_M bakes where dense/shared projections remain native INT4 sidecars
+and routed experts use GGML K-block tensors. The SuperSonic control run is
+direct single-sequence greedy generation, empty prompt (`""`, tokenized as one
+prompt token), 512 generated tokens, and no attribution or Metal profile pass:
 
 ```bash
 target/release/supersonic --backend metal \
@@ -902,13 +905,144 @@ target/release/supersonic --backend metal \
   --no-download
 ```
 
-Current 2026-06-01 result on this M5 Max:
+Current local result on this M5 Max:
 
 | Engine | Model/quant | Workload | ms/tok | tok/s | Source |
 |---|---|---|---:|---:|---|
 | SuperSonic | Qwen3.5-35B-A3B Q4_K_M | 1-token prompt + 512 generated, promoted exact-order FFN path | 67.3 | 14.9 | `/tmp/qwen35_default_after_scalar_fuse_patch_512.log` |
-| llama.cpp | Qwen3.5-35B-A3B Q4_K_M | public M5 Max generation number | ~11.0 | 91.0 | public reference |
-| MLX | Qwen3.5-35B-A3B Q4_K_M | public M5 Max generation number | ~7.2 | 139.0 | public reference |
+| SuperSonic | Qwen3.5-35B-A3B raw Q4_K_M | empty prompt + 512 generated, staged mixed-layout raw path | 73.6 | 13.6 | `target/bench-runs/2026-06-02-0f7b114/perf/qwen3.5-35b-a3b_q4km.json` |
+| llama.cpp | Qwen3.5-35B-A3B raw GGUF Q4_K_M | empty/BOS-compatible prompt + 512 generated, five independent `llama-bench` samples | 15.1 | 66.0 | `target/bench-runs/2026-06-02-0f7b114/external/llama.cpp/qwen3.5-35b-a3b_q4km.json` |
+| llama.cpp | Qwen3.5-35B-A3B Q4_K_M | older public M5 Max generation number | ~11.0 | 91.0 | historical public reference |
+| MLX | Qwen3.5-35B-A3B Q4_K_M | older public M5 Max generation number | ~7.2 | 139.0 | historical public reference; local refresh pending MLX artifact |
+
+To refresh local external references, pin the first line of
+`tools/external/llama-cpp-version.txt` to `llama-cli --version` and the first
+line of `tools/external/mlx-lm-version.txt` to `python3 -m mlx_lm --version`,
+then run the raw GGUF llama.cpp reference. On the local Homebrew build,
+`llama-bench` does not expose `--version` or an explicit `--ctx-size` flag; the
+adapter records `context_size=1024` as workload metadata, uses `-p 1` for the
+empty/BOS-compatible prompt, and records the command's default `batch-size=2048`
+and `ubatch-size=512` context:
+
+```bash
+python3 -m oracle.bench.external.external_main \
+  --engine llama.cpp \
+  --models qwen3.5-35b-a3b \
+  --quants q4km \
+  --model-dir qwen3.5-35b-a3b=/path/to/qwen3.5-35b-a3b-q4_k_m.gguf \
+  --prompt "" \
+  --prompt-tokens 0 \
+  --context-size 1024 \
+  --max-new-tokens 512 \
+  --measurement-runs 5
+```
+
+Run the matching MLX model-directory reference separately:
+
+```bash
+python3 -m oracle.bench.external.external_main \
+  --engine mlx-lm \
+  --models qwen3.5-35b-a3b \
+  --quants q4km \
+  --model-dir qwen3.5-35b-a3b=/path/to/mlx/qwen3.5-35b-a3b-q4 \
+  --prompt "" \
+  --prompt-tokens 0 \
+  --context-size 1024 \
+  --max-new-tokens 512 \
+  --measurement-runs 5
+```
+
+The external JSON cells live under the latest `target/bench-runs/*/external/`
+run directory and record engine version, exact command, workload metadata,
+samples, median `ms_per_step`, derived `tok_per_s`, and engine-specific
+batch/context notes. The 2026-06-02 local llama.cpp cell used
+`version: 9430 (d48a56eff)` with command:
+
+```bash
+llama-bench \
+  -m "$HOME/.cache/supersonic-metal-models/qwen3.5-35b-a3b-gguf/Qwen3.5-35B-A3B-Q4_K_M.gguf" \
+  -p 1 \
+  -n 512 \
+  -r 1
+```
+
+It ran one warmup and five measured samples:
+`[14.015, 14.436, 15.145, 15.394, 16.609] ms/token`, median
+`15.145 ms/token` (`66.03 tok/s`). The raw SuperSonic staged lane is
+reproduced with:
+
+```bash
+cargo run --release -p supersonic-bench --bin bench-perf -- \
+  --preset qwen35-raw-q4km-m5-max-gen512 \
+  --model-dir qwen3.5-35b-a3b="$HOME/.cache/supersonic-metal-models/qwen3.5-35b-a3b"
+```
+
+The 2026-06-02 run (`target/bench-runs/2026-06-02-0f7b114`) used one 512-token
+warmup and five measured samples: `[74.3, 73.6, 77.6, 71.7, 71.0]`, median
+`73.6 ms/token` (`13.6 tok/s`). Against the refreshed local llama.cpp median,
+raw SuperSonic is currently about 20.6% of llama.cpp throughput. The
+fusion/megakernel optimization gate is therefore closed: start that phase only
+after raw SuperSonic reaches at least 90% of the local llama.cpp throughput,
+currently about `59.4 tok/s`.
+
+Before changing the raw `--q4km` implementation or matrix row, use the manifest
+audit to inventory the raw bake and keep layout coverage explicit:
+
+```bash
+cargo run -p runner --bin qwen36_q4km_manifest_audit -- \
+  --model-dir /path/to/qwen3.5-35b-a3b
+```
+
+The current audit model treats raw GGML K-block dense, linear-attention,
+shared-expert, routed-expert, and lm-head layouts as supported by the staged
+Metal correctness path. It still reports missing tensors and unsupported layouts
+as blockers.
+
+The 2026-06-02 local raw-bake audit passed for
+`$HOME/.cache/supersonic-metal-models/qwen3.5-35b-a3b` with 40 layers
+(`full=10`, `linear=30`), 331 projections, 251 native INT4 sidecar layouts,
+80 raw GGML K-block layouts, and zero missing or unsupported blockers. A
+one-token Metal smoke then completed with:
+
+```bash
+cargo run --release -p runner --bin supersonic -- \
+  --backend metal \
+  --model qwen3.5-35b-a3b \
+  --model-dir "$HOME/.cache/supersonic-metal-models/qwen3.5-35b-a3b" \
+  --q4km \
+  --prompt "Hello" \
+  --context-size 64 \
+  --max-new-tokens 1 \
+  --temperature 0 \
+  --top-k 1 \
+  --sampling-seed 20260504 \
+  --no-download \
+  --emit-stage-timings \
+  --emit-generated-json
+```
+
+That smoke generated token id `[49602]` and measured `2478.3 ms/token`
+(`full_attn=37.7 ms`, `linear_attn=109.3 ms`, `ffn=2191.7 ms`,
+`lm_head=138.1 ms`). Treat this only as raw-path load/decode evidence: the
+staged raw GGML expert path is correctness-oriented and far slower than the
+`--q4km-gptq` control lane.
+
+The follow-up 8-token deterministic gate used the same prompt, context, greedy
+sampling, and seed without `--emit-stage-timings`. Two consecutive runs produced
+identical generated IDs
+`[49602, 165189, 184475, 145239, 31375, 47477, 11625, 58985]` and measured
+`373.7 ms/token` then `379.0 ms/token`. This confirms repeatable short raw
+decode on the mixed-layout bake; it is still a staged correctness gate, not a
+headline performance result.
+
+The 128-token raw profiling gate then ran with `--context-size 256`,
+`--max-new-tokens 128`, and `--emit-stage-timings`. It preserved the 8-token
+prefix above and measured `105.7 ms/token` over 128 generated tokens. Stage
+attribution was `chain=100.3 ms/token`, `lm_head=3.8 ms/token`,
+`full_attn=7.8 ms/token`, `linear_attn=12.4 ms/token`, and
+`ffn=79.9 ms/token`; generation wall time was 13.53s. This makes FFN, and
+specifically staged raw routed-expert work, the first optimization target once
+the raw lane reaches the 512-token benchmark gate.
 
 Short smoke runs are too noisy for headline comparison: 16-token samples ranged
 from ~125 to ~201 ms/token depending on command-buffer scheduling and warm
@@ -978,20 +1112,258 @@ unsafe tiled/SIMD experiments:
   (`/tmp/qwen35_q4km_shared_down_pair_expr_exact_simd_128.log`), so it remains
   opt-in behind `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_SHARED_DOWN_EXACT_SIMD=1`.
   A top-k-parallel expert-down/finalize path also matched the 128-token stream
-  but slowed to 65.4 ms/token
-  (`/tmp/qwen35_q4km_expert_down_topk_parallel_128.log`), so it remains opt-in
-  behind `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_DOWN_TOPK_PARALLEL=1`.
+  but slowed to 65.4 ms/token in that early check
+  (`/tmp/qwen35_q4km_expert_down_topk_parallel_128.log`). A later 512-token
+  gate revalidated the same one-row top-k shape as deterministic, so current
+  raw GGML expert-down/finalize uses it by default with
+  `SUPERSONIC_METAL_DISABLE_QWEN36_FFN_EXPERT_DOWN_TOPK_PARALLEL=1` retained for
+  A/B against the older multirow finalizer.
   The router exact-multirow probe was slower and diverged late in the 128-token
   stream; it is opt-in only behind
   `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_STAGE5_EXACT_MULTIROW=1`.
 
+The 2026-06-02 raw `--q4km` parity/perf pass rechecked the existing down
+pair-dot switch on the mixed-layout raw bake. With
+`SUPERSONIC_METAL_ENABLE_QWEN36_FFN_Q4K_PAIR_DOWN=1`, the 8-token deterministic
+smoke preserved the known generated IDs, but the 128-token gate diverged near
+the end of the stream. Same-session 128-token profiles also did not show a
+stable win: the flagged run measured `100.5 ms/token` with `ffn=74.8 ms/token`,
+while the following default control measured `96.8 ms/token` with
+`ffn=72.6 ms/token`. Keep down pair-dot opt-in. The built-in split profiler
+(`SUPERSONIC_METAL_PROFILE_QWEN36_FFN_PHASES=1`) still slows the run enough to
+confirm FFN dominance, so a compact stdout summary was added behind the
+additional
+`SUPERSONIC_METAL_PROFILE_QWEN36_FFN_PHASES_STDOUT=1` opt-in. A 4-token raw
+Q4_K_M smoke on Apple M5 Max exited cleanly and emitted one aggregate row per
+`qwen36_ffn_int4_*` command-buffer label, with
+`qwen36_ffn_int4_router_topk_stage5_exact_simd` the largest split phase in that
+cold capture (`82.790 ms` total across 160 invocations). Use both env flags for
+future 128-token gates when Metal trace tooling is too heavyweight.
+
+A current-tree 2026-06-02 rerun after the online-attention rebuild kept the raw
+default 32-token stream unchanged:
+`[49602, 165189, 184475, 145239, 31375, 47477, 11625, 58985, 757, 155221,
+22937, 2926, 79609, 6906, 124641, 171294, 16544, 93186, 2661, 53625, 154878,
+1686, 91745, 25088, 9696, 23920, 206853, 198643, 60811, 10332, 10265,
+233548]`, measuring `120.3 ms/token` with `ffn_ms_avg=93.189` on the short
+smoke. The compact split profile again put router/top-k first:
+`qwen36_ffn_int4_router_topk_stage5_exact_simd` was `85.733 ms` total across
+160 invocations, ahead of expert down (`26.336 ms`) and shared-gate scalar
+(`22.911 ms`). Disabling the exact SIMD router path diverged at token 3 and did
+not materially improve the same 32-token timing (`120.5 ms/token`), so the next
+router optimization should keep the exact-order logits path and focus on a
+parity-safe top-k/softmax reduction or launch/barrier consolidation.
+
+The follow-up added a router subphase profile gate:
+`SUPERSONIC_METAL_PROFILE_QWEN36_ROUTER_PHASES=1` splits the existing FFN phase
+profile into router norm, router logits, and router top-k labels. On the same
+4-token raw Q4_K_M smoke, default router subphases were norm `38.943 ms`,
+logits `16.848 ms`, and top-k `17.561 ms` across 160 invocations. An opt-in
+parity-safe router norm variant,
+`SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_NORM_PARALLEL_STORE=1`, keeps the
+mean-square sum in the original serial order but parallelizes the normalized
+store. It preserved the 32-token generated stream and cut the profiled router
+norm phase to `22.607 ms`, but the end-to-end 32-token smoke stayed slower
+(`145.1 ms/token`, `ffn_ms_avg=116.280`), so it remains opt-in.
+
+The next parity-safe router-norm probe narrowed that store parallelism to one
+SIMD-width group. It also keeps the mean-square sum serial and preserved the
+same 32-token generated stream. The short router subphase profile reported norm
+`54.421 ms`, logits `48.140 ms`, and top-k `53.072 ms` across 160 invocations.
+A controlled 2026-06-03 A/B pass promoted this path to default: three
+32-token pairs measured median total `139.9 ms/token` with the SIMD-width
+store vs `149.9 ms/token` for the old serial-store default, with FFN median
+`112.6` vs `121.2 ms/token`. A two-pair 128-token confirmation preserved the
+known 128-token stream and measured `90.5`/`88.9 ms/token` vs old-default
+`97.7`/`94.1 ms/token`. Set
+`SUPERSONIC_METAL_DISABLE_QWEN36_FFN_ROUTER_NORM_WARP_STORE=1` to recover the
+old serial-store router norm path, or combine that disable with
+`SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_NORM_PARALLEL_STORE=1` to re-test
+the older 256-thread store experiment.
+
+The 2026-06-02 128-token raw Q4_K_M follow-up used the same two split-profile
+env flags on Apple M5 Max, prompt `Hello`, context 256, and greedy seed
+`20260504`. It preserved the known 128-token stream and measured
+`145.7 ms/token` under the intentionally slowed split profile. Stage timing
+still pointed at FFN (`ffn=117.5 ms/token`, `full_attn=8.5 ms/token`,
+`linear_attn=13.2 ms/token`). The compact phase summary reported 5120 calls per
+FFN subphase: router/top-k exact SIMD was largest at `2113.243 ms` total,
+followed by expert down finalize (`648.422 ms`), shared scalar (`578.275 ms`),
+shared gate/up exact SIMD (`384.761 ms`), shared down (`343.259 ms`), and
+expert gate/up tiled (`286.565 ms`). The split rows account for only part of
+the FFN stage wall time, so the remaining optimization target is still
+submission/wait structure around the FFN stage, not just one arithmetic kernel.
+
+A normal-lane 128-token Metal/HAL profile with `SUPERSONIC_METAL_PROFILE=1` and
+without split profiling measured `69.2 ms/token` and preserved the same
+generated IDs. Top Metal rows were `command_buffer_wait=4317.971 ms`,
+`command_buffer_gpu:qwen36_decode_batch_ffn=3931.515 ms`, and
+`qwen36_ffn_int4_stage5_with_router=3232.937 ms` across 5120 FFN calls.
+`command_buffer_gpu:qwen36_decode_batch_linear_attn` was much smaller at
+`711.453 ms`, while the final lm-head GEMV profile row
+(`matmul_rhs_transposed_gemv_m1_tiled`) was `369.473 ms`. Retesting the existing
+deferred FFN wait switch
+(`SUPERSONIC_METAL_QWEN36_DEFER_FFN_ROUTER_STAGE5_WAIT=1`) preserved the same
+128-token stream but slowed to `73.1 ms/token`, so it remains diagnostic-only.
+
+The next 2026-06-03 FFN follow-up checked the opt-in expert-down top-k-parallel
+finalizer against the raw Q4_K_M lane and external source shape. llama.cpp's
+Metal Q4_K path keeps QK_K=256 block dot work lane-local with scale/min terms
+inside the dot kernel
+([source](https://fossies.org/linux/llama.cpp/ggml/src/ggml-metal/ggml-metal.metal)),
+while MLX's MoE path expresses routed FFN as `SwitchGLU` over `gather_qmm` and
+sorts expert indices only once the selected-index set is large enough
+([source](https://raw.githubusercontent.com/ml-explore/mlx-lm/main/mlx_lm/models/switch_layers.py)).
+For SuperSonic's single-token raw decode, the analogous safe step was to reuse
+the existing raw GGML Q4_K pair-dot helper in the top-k-parallel down finalizer
+instead of adding another dequant order. After that fix, three 128-token
+top-k-parallel raw runs preserved the known generated stream and measured
+`62.6`, `60.9`, and `62.6 ms/token`. A same-session A/B kept all six streams
+identical and measured default `60.6`, `61.3`, `67.3 ms/token` versus
+top-k-parallel `63.3`, `64.6`, `63.7 ms/token`
+(`/tmp/supersonic-ffn-topk-ab-20260603-103332`). The one-row top-k path was
+later promoted to the automatic raw-GGML expert-down candidate after repeated
+512-token checks stayed deterministic.
+
+A follow-up implemented the MLX-shaped selected-expert down path behind
+`SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_DOWN_GATHERED=1`. Instead of looping
+top-k inside each output row, it writes per-selected-expert down outputs as
+`[top_k, hidden]` into the existing FFN workspace slot and then combines the
+top-k weights in a separate finalizer kernel. The 8-token deterministic raw
+Q4_K_M smoke matched the default stream, and a same-session 128-token A/B
+matched all generated IDs while measuring default `62.3 ms/token`
+(`/tmp/supersonic-ffn-gathered-default-128.log`) versus gathered
+`62.0 ms/token` (`/tmp/supersonic-ffn-gathered-enabled-128.log`). Keep it
+diagnostic-only for now: this proves the MLX-style shape is parity-safe in the
+SuperSonic workspace, but the extra dispatch/barrier does not yet move the
+larger command-buffer-wait bottleneck.
+
+The immediate fusion/scheduling follow-up also stayed negative. Rechecking the
+existing FFN deferred-commit interval on the same 128-token raw Q4_K_M stream
+kept IDs aligned but slowed interval 2 to `67.6 ms/token`
+(`/tmp/supersonic-ffn-commit-interval2-128.log`) and interval 4 to
+`71.5 ms/token` (`/tmp/supersonic-ffn-commit-interval4-128.log`) versus the
+same-session `62.3 ms/token` control. A local top_k=8 unrolled expert-down
+finalizer prototype matched the 8-token smoke but diverged in the 128-token run
+and slowed to `69.4 ms/token` (`/tmp/supersonic-ffn-topk8-unrolled-128.log`),
+so it was removed instead of retained as an opt-in flag. The lesson is the same
+as the older commit-interval result: simple loop unrolling or wider FFN command
+grouping is not enough; any deeper FFN fusion has to preserve the compiler's
+current exact reduction shape or move a larger, naturally synchronized phase.
+
+A fresh 2026-06-03 default raw `--q4km` 512-token profile after committing the
+diagnostic gathered path measured `90.8 ms/token` under `--emit-stage-timings`
+(`/tmp/supersonic-qwen35-raw-q4km-512-stage-20260603.log`). The breakdown was
+`chain=85.536 ms/token`, `lm_head=3.125`, `full_attn=16.767`,
+`linear_attn=11.428`, and `ffn=57.165`, so the profiled raw lane is still
+FFN-dominated at the long benchmark length. A narrow router top-k parallel
+selection prototype was then tried: it kept the same BF16 softmax probability
+rounding and attempted to parallelize only the selected-expert scan. The
+128-token same-settings A/B was faster in isolation (`70.7 ms/token` versus
+default `73.3`) but diverged from the default generated stream at token 9
+(`/tmp/supersonic-router-topk-parallel-select-128-20260603.log` versus
+`/tmp/supersonic-router-topk-default-128-20260603.log`), so that prototype was
+removed. The next FFN attempt should therefore target a larger exact router/FFN
+phase consolidation with explicit top-k parity taps, not a silent replacement
+of the top-k scan order.
+
+The follow-up added the decode-batch-native router parity tap
+`SUPERSONIC_METAL_QWEN36_DECODE_BATCH_ROUTER_STAGE5_PARITY_TAP=1`, with
+`_MAX_CALLS`, `_POSITION`, and `_LAYER` filters. This keeps the default
+decode-batch FFN path active while recomputing the host router reference from
+captured input/workspace/output-index snapshots. The legacy non-batch router
+tap now also accepts
+`SUPERSONIC_METAL_QWEN36_FFN_ROUTER_STAGE5_PARITY_TAP_LAYER`. A one-token raw
+Q4_K_M smoke at layer 0 emitted a matching decode-batch row, and an 8-token
+cross-layer probe (`/tmp/supersonic-decode-batch-router-tap-8tok.log`) captured
+320 router rows with `topk_idx_match=1`, `workspace_idx_match=1`, and
+`output_idx_match=1` throughout. Router selection is therefore not the current
+source of divergence in the default raw lane; optimization can focus on
+preserving the exact selection while reducing the router/FFN phase cost.
+
+A current-tree router-subphase split profile on the same raw Q4_K_M lane
+(`/tmp/supersonic-qwen35-raw-q4km-ffn-router-subphase-16.log`) preserved the
+known 16-token greedy stream:
+`[49602, 165189, 184475, 145239, 31375, 47477, 11625, 58985, 757, 155221,
+22937, 2926, 79609, 6906, 124641, 171294]`. The intentionally slowed split
+profile measured `289.3 ms/token` and still showed FFN dominance. Across 640
+FFN calls, the largest split GPU labels were expert down finalize
+(`89.415 ms`, `0.1397 ms/call`), shared scalar (`80.992 ms`, `0.1266 ms/call`),
+router norm warp-store (`74.047 ms`, `0.1157 ms/call`), router top-k from
+logits (`71.739 ms`, `0.1121 ms/call`), and router logits exact SIMD
+(`66.545 ms`, `0.1040 ms/call`). The next kernel experiment should avoid
+changing top-k ordering and instead look for a parity-safe consolidation or
+scratch/barrier reduction across the exact router subphases and adjacent FFN
+work.
+
+An opt-in fused exact router selector was added on 2026-06-03:
+`SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_FUSED_EXACT=1`. It routes the native
+stage-5 FFN through the existing monolithic router kernel instead of the default
+split exact-SIMD norm/logits/top-k sequence, and the diagnostic labels now report
+`router_path=fused-exact`. The local raw GGML Q4_K_M bake was not present
+(`/Users/deano/.cache/supersonic-metal-models/qwen3.6-35b-a3b/.supersonic/v2-q4km`
+was missing), so the validation used the available
+`v2-int4-gptq` control lane. With decode-batch active and the router parity tap
+enabled, the 8-token probe
+(`/tmp/supersonic-qwen35-int4-router-fused-exact-decode-batch-tap-8.log`)
+captured all 320 layer rows with `topk_idx_match=1`,
+`workspace_idx_match=1`, `output_idx_match=1`, and zero h-norm/logit/top-k
+weight deltas. Same-session 128-token no-tap A/B preserved identical generated
+IDs, but the fused candidate was slower: default exact-SIMD
+(`/tmp/supersonic-qwen35-int4-router-exact-simd-decode-batch-128.log`) measured
+`55.4 ms/token` (`18.05 tok/s`), while fused exact
+(`/tmp/supersonic-qwen35-int4-router-fused-exact-decode-batch-128.log`) measured
+`60.9 ms/token` (`16.42 tok/s`). Keep it diagnostic-only; it proves the fused
+router can be made parity-clean, but the current monolithic shape is not the
+speed win.
+
+The actual raw Q4_K_M target lane was rechecked immediately after that control
+run using the existing local bake at
+`$HOME/.cache/supersonic-metal-models/qwen3.5-35b-a3b/.supersonic/v2-q4km`.
+The 8-token fused-router tap
+(`/tmp/supersonic-qwen35-raw-q4km-router-fused-exact-decode-batch-tap-8.log`)
+again captured all 320 layer rows with exact router agreement against the host
+reference. However, no-tap 128-token A/B showed the monolithic fused router is
+not stream-parity-safe on raw Q4_K_M: default exact-SIMD
+(`/tmp/supersonic-qwen35-raw-q4km-router-exact-simd-decode-batch-128.log`)
+measured `67.3 ms/token` (`14.86 tok/s`), while fused exact
+(`/tmp/supersonic-qwen35-raw-q4km-router-fused-exact-decode-batch-128.log`)
+measured `68.5 ms/token` (`14.60 tok/s`) and diverged at generated-token index
+12 (`79609` vs. `194939`). Keep
+`SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_FUSED_EXACT=1` diagnostic-only; local
+router parity is not enough for stream parity on the target raw lane.
+
+Follow-up boundary checks showed that the fused router math was not the source
+of the drift. A position-12 layer-output tap matched all 80 captured
+attention/FFN rows between exact-SIMD and fused exact, and no-tap fused runs
+matched the exact generated stream at 13, 16, and 32 generated tokens. The
+fused 64-token run
+(`/tmp/supersonic-qwen35-raw-q4km-fused-exact-notap-64.log`) diverged later at
+generated-token index 33 (`27797` vs. `207577`), while the exact-SIMD 64-token
+control (`/tmp/supersonic-qwen35-raw-q4km-exact-simd-notap-64.log`) matched the
+128-token exact prefix. Forcing the whole decode batch into the sync-phase
+cadence with `SUPERSONIC_METAL_QWEN36_DECODE_BATCH_SYNC_PHASES=1`
+(`/tmp/supersonic-qwen35-raw-q4km-fused-exact-sync-phases-64.log`) restored the
+64-token fused stream but slowed it from `68.1 ms/token` to `81.3 ms/token`.
+Using the narrower existing
+`SUPERSONIC_METAL_QWEN36_DECODE_BATCH_FFN_COMMIT_INTERVAL=9999`
+(`/tmp/supersonic-qwen35-raw-q4km-fused-exact-ffn-commit-9999-64.log`) also
+restored the stream at `76.4 ms/token` in the same investigation. The runtime
+now applies that no-per-layer-FFN-deferred-commit cadence automatically when
+`SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_FUSED_EXACT=1` is set, unless an
+explicit `SUPERSONIC_METAL_QWEN36_DECODE_BATCH_FFN_COMMIT_INTERVAL` override is
+provided. Rebuilt verification remained parity-clean
+(`/tmp/supersonic-qwen35-raw-q4km-fused-exact-default-safe-64-repeat.log`), with
+current warmed samples landing at `89.2 ms/token` for the default fused-safe
+cadence and `83.6 ms/token` for an explicit interval-9999 rerun
+(`/tmp/supersonic-qwen35-raw-q4km-fused-exact-ffn-commit-9999-64-newbin.log`).
+
 The current gap is therefore not a one-line launch-count fix; the Metal profile
 still points at the chained per-layer decode structure and command-buffer waits.
-A naive experiment that coalesced phase command buffers reduced command-buffer
-count but increased wait time. The latest clean 64-token control with
-`SUPERSONIC_METAL_QWEN36_DECODE_BATCH_SYNC_PHASES=1` matched the default
-generated IDs but slowed from 80.0 to 94.7 ms/token, so the default path keeps
-the existing per-phase commit ordering for overlap.
+For the promoted exact-SIMD router, the default path keeps the existing
+per-phase commit ordering for overlap. For the diagnostic fused-exact router,
+the stream-safe FFN commit cadence is useful evidence that the drift is a
+scheduling/resource-ordering problem, but it is not a performance promotion.
 
 Follow-up optimization probes on 2026-06-01 kept the headline unchanged but
 identified the next safe work area:
@@ -1029,6 +1401,52 @@ identified the next safe work area:
   128-token stream but slowed to 71.7 ms/token
   (`/tmp/qwen35_ffn_commit_interval2_128.log`), confirming that the current
   per-FFN commits are buying enough CPU/GPU overlap to offset their launch cost.
+  A current-tree revisit of the same scheduling lever kept 64-token streams
+  aligned for intervals 1, 2, 4, 8, and 9999; interval 9999 was fastest in that
+  short smoke (`77.8 ms/token` vs `81.2 ms/token` for interval 1,
+  `/tmp/supersonic-qwen35-raw-q4km-exact-ffn-interval-9999-64.log`). Two
+  128-token pairs also matched and showed a small interval-9999 edge
+  (`66.05` vs `67.35 ms/token` median), but the 512-token gate did not promote:
+  interval 9999 diverged at generated-token index 408 for only `0.1 ms/token`
+  improvement (`65.4` vs `65.5 ms/token`;
+  `/tmp/supersonic-qwen35-raw-q4km-exact-interval9999-512-gate.log`).
+  Keep the promoted exact-SIMD path on the default interval-1 cadence.
+  Rechecking the MLX-shaped gathered expert-down path in the same tree also
+  tied the default rather than improving it: three 128-token pairs measured
+  equal medians of `64.3 ms/token`, with pairwise generated streams matching in
+  two of three pairs and one late pairwise divergence at token 97
+  (`/tmp/supersonic-qwen35-raw-q4km-gathered-current-ab-*.log`).
+  The split profiler now labels raw Q4_K_M expert subphases precisely as
+  `qwen36_ffn_int4_expert_gate_up_multirow_stage5` and
+  `qwen36_ffn_int4_expert_down_finalize_multirow`; the 4-token label smoke
+  emitted both names and preserved the known prefix
+  (`/tmp/supersonic-qwen35-raw-q4km-multirow-label-smoke-4.log`).
+  A follow-up rowpair/top-k-parallel expert-down probe is available only behind
+  `SUPERSONIC_METAL_DIAG_QWEN36_FFN_EXPERT_DOWN_ROWPAIR_TOPK_PARALLEL=1`.
+  It computes two output rows per threadgroup while assigning one simdgroup per
+  top-k expert. The 8-token smoke preserved the known raw Q4_K_M prefix
+  (`/tmp/supersonic-qwen35-raw-q4km-rowpair-topk-smoke-8.log`), and a
+  128-token profiled A/B matched the generated stream while reducing expert
+  down finalize from `586.979 ms` (`0.1146 ms/call`) to `521.111 ms`
+  (`0.1018 ms/call`) and moving the profiled run from `120.1` to
+  `116.3 ms/token`
+  (`/tmp/supersonic-qwen35-raw-q4km-rowpair-{default,enabled}-ab-128.log`).
+  It is not promotable: the 512-token gate was faster (`63.0` vs
+  `64.8 ms/token`) but diverged at generated-token index 251
+  (`/tmp/supersonic-qwen35-raw-q4km-rowpair-{default,enabled}-gate-512.log`).
+  Repeated investigation runs confirmed that this is a nondeterministic
+  two-row rowpair issue rather than top-k parallelism in general: rowpair
+  repeats diverged from each other, a same-input scratch compare reported
+  `diff_count=0`, and the one-row top-k-parallel control matched the default
+  stream twice over 512 tokens (`65.8` and `62.8 ms/token`). The current
+  automatic raw-GGML top-k run without the enable env also matched the
+  default 512-token stream at `64.7 ms/token`
+  (`/tmp/supersonic-qwen35-raw-q4km-topk-auto-gate-512-a.log`), and a
+  1-token split-profile smoke confirmed the dispatch label
+  `qwen36_ffn_int4_expert_down_finalize_topk_parallel`
+  (`/tmp/supersonic-qwen35-raw-q4km-topk-auto-profile-1tok.log`). Keep
+  rowpair quarantined behind
+  `SUPERSONIC_METAL_DIAG_QWEN36_FFN_EXPERT_DOWN_ROWPAIR_TOPK_PARALLEL=1`.
 - The opt-in native full-attention path is also a real speed lever but not
   promotable yet. `SUPERSONIC_METAL_ENABLE_QWEN36_FULL_ATTN_NATIVE=1` measured
   58.4 ms/token on a 128-token run but diverged at token 0. Adding
@@ -1134,6 +1552,14 @@ identified the next safe work area:
   `/tmp/qwen35_native_ws_softmax_taps_l3_pos4.log`, and
   `/tmp/qwen35_native_ws_softmax_taps_precise_exp_l3_pos4.log`; word dumps:
   `/tmp/qwen35_native_ws_softmax_words_poly_round_exp_l3_pos4.log`.
+  A 2026-06-02 all-layer retest with
+  `SUPERSONIC_METAL_ENABLE_QWEN36_FULL_ATTN_NATIVE=1`,
+  `SUPERSONIC_METAL_QWEN36_FULL_ATTN_HOST_ORDER_STAGE5=1`, and
+  `SUPERSONIC_METAL_QWEN36_FULL_ATTN_POLY_EXP=1` did not generalize the
+  layer-3-limited improvement: it diverged on the second generated token
+  (`[49602, 58985, ...]` instead of `[49602, 165189, ...]`) and measured
+  `151.5 ms/token` on a 16-token smoke. Keep this path diagnostic-only until a
+  broader softmax/value compatibility fix is found.
   A later native-values dispatch cleanup removed redundant lanes from the
   current values kernel: the shader computes one `(head, dim)` row per
   threadgroup and only lane 0 writes, so dispatching 32 lanes duplicated the
@@ -1165,6 +1591,41 @@ identified the next safe work area:
   (`/tmp/qwen35_native_table_exp_compile_error.log`). Small coefficient and
   range-reduction nudges to the retained float polynomial improved the captured
   mismatch count only from 12 to 11 words and were not kept.
+  A 2026-06-02 follow-up stopped tuning the known-drifting split
+  score/probability path and added an opt-in online-softmax full-attention
+  kernel behind `SUPERSONIC_METAL_QWEN36_FULL_ATTN_ONLINE=1`. The new kernel
+  follows the shipped MLX `sdpa_vector` and llama.cpp Metal flash-attention
+  recurrence: each sequence partition carries `(max_score, sum_exp_score,
+  output_accumulator)`, then partitions are merged with the same max-rescale
+  factor instead of materializing normalized probabilities first. On the
+  available local `qwen3.6-35b-a3b` `--int4` bake, the online path compiled
+  and matched both default and split-native generated IDs for 32-token
+  deterministic smokes. The current rebuilt check generated
+  `[11, 271, 40, 599, 264, 3377, 440, 264, 1957, 13, 271, 40, 599, 264, 1957,
+  421, 15339, 264, 999, 13, 561, 999, 5435, 264, 1103, 314, 4105, 13, 353,
+  1144, 310, 1301]` on both paths. The warm online run measured
+  `53.1 ms/token` with `full_attn_ms_avg=6.406`; the split-native comparison
+  measured `55.7 ms/token` with `full_attn_ms_avg=6.558`. The online gate now
+  has its own 1024-token cap instead of the split-native path's 128-token score
+  cap. A prior 160-token deterministic INT4 smoke with `--context-size 256`
+  completed
+  through the old limit and matched the split/native-fallback stream exactly;
+  online measured `48.2 ms/token` with `full_attn_ms_avg=5.240`, while the
+  split/native-fallback comparison measured `48.3 ms/token` with
+  `full_attn_ms_avg=5.417`. A 512-token online INT4 smoke with
+  `--context-size 1024` also completed with `KV cache cap = 513`, measuring
+  `62.0 ms/token`, `full_attn_ms_avg=15.433`, `linear_attn_ms_avg=17.168`, and
+  `ffn_ms_avg=25.365`. Keep the online path opt-in for now: it is the right
+  upstream-shaped comparison lane, but it is not yet a headline speed win, and
+  the local raw `--q4km` / `--q4km-gptq` bakes were unavailable under
+  `--no-download` in this checkout. Two closer MLX-vector micro-shapes were
+  tried and rejected on the 32-token smoke: moving the per-lane V accumulator
+  into private locals stayed token-identical but raised `full_attn_ms_avg` to
+  `7.596` with a local array and `6.837` with scalar accumulators; caching the
+  eight per-lane Q values before the key loop also stayed token-identical but
+  measured `full_attn_ms_avg=6.531`. Those edits were not kept because the
+  current Metal codegen appears to prefer the lower-register-pressure shared
+  scratch form in this kernel.
 - A split full-attention phase profiler
   (`SUPERSONIC_METAL_PROFILE_QWEN36_FULL_ATTN_PHASES=1`) showed that the native
   values rewrite is no longer the main wall-clock target. Because decode-batch

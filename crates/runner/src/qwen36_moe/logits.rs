@@ -177,6 +177,149 @@ pub fn dequant_int4_to_bf16_bytes(
     out
 }
 
+fn f16_le_to_f32(bytes: &[u8], offset: usize) -> f32 {
+    let bits = u16::from_le_bytes([bytes[offset], bytes[offset + 1]]);
+    half::f16::from_bits(bits).to_f32()
+}
+
+fn ggml_k_row_bytes(qtype: i32, cols: usize) -> usize {
+    assert_eq!(cols % 256, 0, "GGML K-block cols must be divisible by 256");
+    let blocks = cols / 256;
+    match qtype {
+        12 => blocks * 144,
+        13 => blocks * 176,
+        14 => blocks * 210,
+        _ => panic!("unsupported GGML K-block qtype {qtype}"),
+    }
+}
+
+fn ggml_q4_k_scale_min(j: usize, q: &[u8]) -> (i32, i32) {
+    if j < 4 {
+        ((q[j] & 63) as i32, (q[j + 4] & 63) as i32)
+    } else {
+        (
+            ((q[j + 4] & 0x0f) | ((q[j - 4] >> 6) << 4)) as i32,
+            (((q[j + 4] >> 4) | ((q[j] >> 6) << 4)) & 63) as i32,
+        )
+    }
+}
+
+fn ggml_k_dequant_scalar(packed: &[u8], qtype: i32, row: usize, col: usize, cols: usize) -> f32 {
+    let block = col / 256;
+    let inb = col - block * 256;
+    let row_bytes = ggml_k_row_bytes(qtype, cols);
+    let b = row * row_bytes
+        + match qtype {
+            12 => block * 144,
+            13 => block * 176,
+            14 => block * 210,
+            _ => unreachable!(),
+        };
+    match qtype {
+        12 => {
+            let d = f16_le_to_f32(packed, b);
+            let dmin = f16_le_to_f32(packed, b + 2);
+            let sc = &packed[b + 4..b + 16];
+            let qs = &packed[b + 16..b + 144];
+            let g = inb / 64;
+            let sub = (inb % 64) / 32;
+            let (scale, minv) = ggml_q4_k_scale_min(2 * g + sub, sc);
+            let qbyte = qs[g * 32 + (inb % 32)];
+            let q = if sub != 0 {
+                ((qbyte >> 4) & 0x0f) as i32
+            } else {
+                (qbyte & 0x0f) as i32
+            };
+            d * scale as f32 * q as f32 - dmin * minv as f32
+        }
+        13 => {
+            let d = f16_le_to_f32(packed, b);
+            let dmin = f16_le_to_f32(packed, b + 2);
+            let sc = &packed[b + 4..b + 16];
+            let qh = &packed[b + 16..b + 48];
+            let ql = &packed[b + 48..b + 176];
+            let g = inb / 64;
+            let sub = (inb % 64) / 32;
+            let idx = inb % 32;
+            let (scale, minv) = ggml_q4_k_scale_min(2 * g + sub, sc);
+            let qbyte = ql[g * 32 + idx];
+            let lo = if sub != 0 {
+                ((qbyte >> 4) & 0x0f) as i32
+            } else {
+                (qbyte & 0x0f) as i32
+            };
+            let high_mask = if sub != 0 {
+                2u8 << (2 * g)
+            } else {
+                1u8 << (2 * g)
+            };
+            let hi = if qh[idx] & high_mask != 0 { 16 } else { 0 };
+            d * scale as f32 * (lo + hi) as f32 - dmin * minv as f32
+        }
+        14 => {
+            let ql = &packed[b..b + 128];
+            let qh = &packed[b + 128..b + 192];
+            let sc = &packed[b + 192..b + 208];
+            let d = f16_le_to_f32(packed, b + 208);
+            let half_idx = inb / 128;
+            let pos = inb - half_idx * 128;
+            let idx = pos % 32;
+            let qh_byte = qh[half_idx * 32 + idx];
+            let (q, scale_idx) = if pos < 32 {
+                (
+                    (ql[half_idx * 64 + idx] & 0x0f) as i32 | (((qh_byte >> 0) & 3) as i32) << 4,
+                    half_idx * 8 + idx / 16,
+                )
+            } else if pos < 64 {
+                (
+                    (ql[half_idx * 64 + 32 + idx] & 0x0f) as i32
+                        | (((qh_byte >> 2) & 3) as i32) << 4,
+                    half_idx * 8 + idx / 16 + 2,
+                )
+            } else if pos < 96 {
+                (
+                    ((ql[half_idx * 64 + idx] >> 4) & 0x0f) as i32
+                        | (((qh_byte >> 4) & 3) as i32) << 4,
+                    half_idx * 8 + idx / 16 + 4,
+                )
+            } else {
+                (
+                    ((ql[half_idx * 64 + 32 + idx] >> 4) & 0x0f) as i32
+                        | (((qh_byte >> 6) & 3) as i32) << 4,
+                    half_idx * 8 + idx / 16 + 6,
+                )
+            };
+            d * sc[scale_idx] as i8 as f32 * (q - 32) as f32
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// Dequantize raw GGML Q4_K/Q5_K/Q6_K rows to BF16 bytes for host-upload
+/// paths such as the standalone Metal lm_head.
+pub fn dequant_ggml_k_to_bf16_bytes(
+    packed: &[u8],
+    qtype: i32,
+    out_dim: usize,
+    in_dim: usize,
+) -> Vec<u8> {
+    let row_bytes = ggml_k_row_bytes(qtype, in_dim);
+    assert_eq!(
+        packed.len(),
+        out_dim * row_bytes,
+        "GGML K-block size mismatch"
+    );
+    let mut out = Vec::with_capacity(out_dim * in_dim * 2);
+    for row in 0..out_dim {
+        for col in 0..in_dim {
+            let bf = f32_to_bf16_bits(ggml_k_dequant_scalar(packed, qtype, row, col, in_dim));
+            out.push((bf & 0xFF) as u8);
+            out.push((bf >> 8) as u8);
+        }
+    }
+    out
+}
+
 /// Tiny dependency-free xorshift64 RNG. Deterministic given the seed.
 pub struct XorshiftRng(u64);
 
@@ -333,5 +476,28 @@ mod tests {
             (logit - expected).abs() < 1e-2,
             "logit {logit} far from expected {expected}"
         );
+    }
+
+    #[test]
+    fn dequant_ggml_q4_k_to_bf16_bytes_decodes_uniform_block() {
+        let mut block = vec![0u8; 144];
+        block[0..2].copy_from_slice(&half::f16::from_f32(0.5).to_bits().to_le_bytes());
+        block[2..4].copy_from_slice(&half::f16::from_f32(0.0).to_bits().to_le_bytes());
+        for j in 0..4 {
+            block[4 + j] = 1;
+            block[8 + j] = 1;
+        }
+        for j in 8..12 {
+            block[4 + j] = 1;
+        }
+        for b in &mut block[16..144] {
+            *b = 0x33;
+        }
+
+        let bf16 = dequant_ggml_k_to_bf16_bytes(&block, 12, 1, 256);
+        let vals = bf16_bytes_to_f32(&bf16);
+
+        assert_eq!(vals.len(), 256);
+        assert!(vals.iter().all(|v| (*v - 1.5).abs() < 1e-6));
     }
 }

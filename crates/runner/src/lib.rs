@@ -43,6 +43,7 @@ pub mod qwen36_moe_telemetry;
 #[path = "qwen36_moe/types.rs"]
 pub mod qwen36_moe_types;
 pub mod profile;
+pub mod qwen36_q4km_audit;
 pub mod registry;
 pub mod specprefill;
 pub mod tensor_bytes;

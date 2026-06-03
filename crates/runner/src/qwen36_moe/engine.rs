@@ -113,18 +113,21 @@ fn prewarm_qwen36_mps_static_topn_if_requested(
             } else {
                 int4.down_proj_zero.as_ptr()
             },
+            shared_gate_proj_type: int4.shared_gate_proj_type,
             shared_gate_proj_scale: int4.shared_gate_proj_scale.as_ptr(),
             shared_gate_proj_zero: if fp8 {
                 ptr::null()
             } else {
                 int4.shared_gate_proj_zero.as_ptr()
             },
+            shared_up_proj_type: int4.shared_up_proj_type,
             shared_up_proj_scale: int4.shared_up_proj_scale.as_ptr(),
             shared_up_proj_zero: if fp8 {
                 ptr::null()
             } else {
                 int4.shared_up_proj_zero.as_ptr()
             },
+            shared_down_proj_type: int4.shared_down_proj_type,
             shared_down_proj_scale: int4.shared_down_proj_scale.as_ptr(),
             shared_down_proj_zero: if fp8 {
                 ptr::null()

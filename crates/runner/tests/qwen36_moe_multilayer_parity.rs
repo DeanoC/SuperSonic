@@ -138,12 +138,16 @@ fn build_full_attn_layer(
         let o_proj_w = upload_u8(ordinal, &[hidden, h * d / 2], &op, "o_proj packed");
         let int4 = FullAttnInt4Sidecars {
             group_size,
+            q_proj_type: 4,
             q_proj_scale: upload_bf16(ordinal, &[qs.len() / 2], &qs, "q scale"),
             q_proj_zero: upload_bf16(ordinal, &[qz.len() / 2], &qz, "q zero"),
+            k_proj_type: 4,
             k_proj_scale: upload_bf16(ordinal, &[ks.len() / 2], &ks, "k scale"),
             k_proj_zero: upload_bf16(ordinal, &[kz.len() / 2], &kz, "k zero"),
+            v_proj_type: 4,
             v_proj_scale: upload_bf16(ordinal, &[vs.len() / 2], &vs, "v scale"),
             v_proj_zero: upload_bf16(ordinal, &[vz.len() / 2], &vz, "v zero"),
+            o_proj_type: 4,
             o_proj_scale: upload_bf16(ordinal, &[os.len() / 2], &os, "o scale"),
             o_proj_zero: upload_bf16(ordinal, &[oz.len() / 2], &oz, "o zero"),
         };
@@ -230,10 +234,13 @@ fn build_linear_attn_layer(
         let out_proj_w = upload_u8(ordinal, &[hidden, val_dim / 2], &op, "out_proj packed");
         let int4 = LinearAttnInt4Sidecars {
             group_size,
+            in_proj_qkv_type: 4,
             in_proj_qkv_scale: upload_bf16(ordinal, &[qs.len() / 2], &qs, "in_proj_qkv scale"),
             in_proj_qkv_zero: upload_bf16(ordinal, &[qz.len() / 2], &qz, "in_proj_qkv zero"),
+            in_proj_z_type: 4,
             in_proj_z_scale: upload_bf16(ordinal, &[zs.len() / 2], &zs, "in_proj_z scale"),
             in_proj_z_zero: upload_bf16(ordinal, &[zz.len() / 2], &zz, "in_proj_z zero"),
+            out_proj_type: 4,
             out_proj_scale: upload_bf16(ordinal, &[os.len() / 2], &os, "out_proj scale"),
             out_proj_zero: upload_bf16(ordinal, &[oz.len() / 2], &oz, "out_proj zero"),
         };
@@ -354,10 +361,13 @@ fn build_ffn_layer(
             down_proj_type: 4,
             down_proj_scale: upload_bf16(ordinal, &[ds.len() / 2], &ds, "down_proj scale"),
             down_proj_zero: upload_bf16(ordinal, &[dz.len() / 2], &dz, "down_proj zero"),
+            shared_gate_proj_type: 4,
             shared_gate_proj_scale: upload_bf16(ordinal, &[sgs.len() / 2], &sgs, "sgp scale"),
             shared_gate_proj_zero: upload_bf16(ordinal, &[sgz.len() / 2], &sgz, "sgp zero"),
+            shared_up_proj_type: 4,
             shared_up_proj_scale: upload_bf16(ordinal, &[sus.len() / 2], &sus, "sup scale"),
             shared_up_proj_zero: upload_bf16(ordinal, &[suz.len() / 2], &suz, "sup zero"),
+            shared_down_proj_type: 4,
             shared_down_proj_scale: upload_bf16(ordinal, &[sds.len() / 2], &sds, "sdp scale"),
             shared_down_proj_zero: upload_bf16(ordinal, &[sdz.len() / 2], &sdz, "sdp zero"),
         };
