@@ -330,6 +330,10 @@ Metal currently rejects or defers:
   the older multirow finalizer for A/B checks. The explicit
   `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_DOWN_TOPK_PARALLEL=1` switch is
   still accepted for older scripts, but is no longer required for raw `--q4km`.
+  `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_DOWN_MULTIROW_TOPK_PARALLEL=1`
+  tests a two-row-per-threadgroup top-k variant that keeps one-row top-k
+  semantics with isolated per-row scratch; it is diagnostic-only until it shows
+  a real speedup over the one-row default.
   `SUPERSONIC_METAL_DIAG_QWEN36_FFN_EXPERT_DOWN_ROWPAIR_TOPK_PARALLEL=1`
   tests a two-row, top-k-parallel raw Q4_K_M expert-down/finalize variant. It
   is diagnostic-only/quarantined: a 128-token A/B preserved the stream and
