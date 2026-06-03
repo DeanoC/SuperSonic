@@ -380,7 +380,8 @@ Metal currently rejects or defers:
   `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_TOPK_PARALLEL_SELECT=1`, keeps the
   same BF16-rounded probability scratch as the default top-k kernel but selects
   each routed expert with a threadgroup reduction instead of a serial scan on
-  thread 0. Decode-batch router parity can be tapped
+  thread 0. It remains diagnostic-only after repeated 512-token gates showed
+  long-run divergence. Decode-batch router parity can be tapped
   without forcing the older chained router path by setting
   `SUPERSONIC_METAL_QWEN36_DECODE_BATCH_ROUTER_STAGE5_PARITY_TAP=1`; narrow it
   with the matching `_MAX_CALLS`, `_POSITION`, and `_LAYER` suffixes. The legacy

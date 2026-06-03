@@ -1164,7 +1164,16 @@ same value/index tie-break. A 1-token raw Q4_K_M router-split profile preserved
 A 32-token A/B matched generated IDs exactly and measured `81.4 ms/token`
 default vs `69.7 ms/token` with the opt-in
 (`/tmp/supersonic-qwen35-raw-q4km-router-topk-{default,parallel}-32.log`).
-Keep it opt-in until a 128/512-token serial gate confirms the shorter result.
+A 128-token serial gate also matched exactly, measuring `65.5 ms/token`
+default vs `61.6 ms/token` opt-in
+(`/tmp/supersonic-qwen35-raw-q4km-router-topk-{default,parallel}-128-serial.log`).
+The 512-token promotion gate failed, though: the first opt-in run diverged from
+default at generated-token index 44, and a repeat opt-in run diverged at index
+264 while also differing from the first opt-in run at index 44. Timings were
+still slightly faster (`63.2 ms/token` default vs `62.5` and `60.6 ms/token`
+opt-in), but the stream instability keeps the parallel selector diagnostic-only
+(`/tmp/supersonic-qwen35-raw-q4km-router-topk-{default,parallel}-512-serial.log`,
+`/tmp/supersonic-qwen35-raw-q4km-router-topk-parallel-512-repeat.log`).
 
 A current-tree 2026-06-02 rerun after the online-attention rebuild kept the raw
 default 32-token stream unchanged:
