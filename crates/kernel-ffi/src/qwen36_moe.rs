@@ -4298,6 +4298,31 @@ fn qwen36_ffn_router_stage5_simd_env_enabled() -> bool {
         && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
 }
 
+fn qwen36_ffn_router_stage5_fused_exact_env_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_FUSED_EXACT").is_some()
+        && !qwen36_ffn_router_stage5_simd_env_enabled()
+        && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
+}
+
+fn qwen36_ffn_router_stage5_exact_simd_env_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_DISABLE_QWEN36_FFN_ROUTER_STAGE5_EXACT_SIMD").is_none()
+        && !qwen36_ffn_router_stage5_simd_env_enabled()
+        && !qwen36_ffn_router_stage5_fused_exact_env_enabled()
+        && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
+}
+
+fn qwen36_ffn_router_stage5_path_label() -> &'static str {
+    if qwen36_ffn_router_stage5_simd_env_enabled() {
+        "simd"
+    } else if qwen36_ffn_router_stage5_fused_exact_env_enabled() {
+        "fused-exact"
+    } else if qwen36_ffn_router_stage5_exact_simd_env_enabled() {
+        "exact-simd"
+    } else {
+        "serial"
+    }
+}
+
 fn qwen36_ffn_router_stage5_parity_tap_max_calls() -> usize {
     std::env::var("SUPERSONIC_METAL_QWEN36_FFN_ROUTER_STAGE5_PARITY_TAP_MAX_CALLS")
         .ok()
@@ -4837,11 +4862,7 @@ fn qwen36_emit_ffn_router_stage5_parity_tap(
         .copied()
         .unwrap_or(f32::NAN);
     let metal_logit_at_host_top = logits.get(host_top_logit_idx).copied().unwrap_or(f32::NAN);
-    let router_path = if qwen36_ffn_router_stage5_simd_env_enabled() {
-        "simd"
-    } else {
-        "serial"
-    };
+    let router_path = qwen36_ffn_router_stage5_path_label();
 
     eprintln!(
         "[qwen36-ffn-router-parity] call={} layer={} router_path={} topk_idx_match={} workspace_idx_match={} output_idx_match={} topk_first_mismatch={} workspace_first_idx_mismatch={} output_first_idx_mismatch={} h_norm_max_abs={:.8e} h_norm_argmax={} logits_max_abs={:.8e} logits_argmax={} host_top_logit_idx={} metal_top_logit_idx={} host_top_logit={:.8e} metal_top_logit={:.8e} host_logit_at_metal_top={:.8e} metal_logit_at_host_top={:.8e} topk_weight_max_abs={:.8e} topk_weight_argmax={} host_idx={} workspace_idx={} output_idx={} host_w={} metal_w={}",
@@ -5600,11 +5621,7 @@ fn qwen36_emit_ffn_routed_stage5_gate_up_tap(
             metal_expert_mid,
         );
 
-    let router_path = if qwen36_ffn_router_stage5_simd_env_enabled() {
-        "simd"
-    } else {
-        "serial"
-    };
+    let router_path = qwen36_ffn_router_stage5_path_label();
     eprintln!(
         "[qwen36-ffn-routed-gate-up-tap] layer={} router_path={} hidden={} top_k={} topk_idx_match={} topk_weight_max_abs={:.8e} topk_weight_argmax={} host_topk_weight_at_argmax={:.8e} metal_topk_weight_at_argmax={:.8e} expert_mid_max_abs={:.8e} expert_mid_argmax={} expert_mid_group={} expert_mid_row={} host_expert_gate_at_mid_argmax={:.8e} metal_expert_gate_at_mid_argmax={:.8e} expert_gate_delta_at_mid_argmax={:.8e} host_expert_up_at_mid_argmax={:.8e} metal_expert_up_at_mid_argmax={:.8e} expert_up_delta_at_mid_argmax={:.8e} host_expert_silu_at_mid_argmax={:.8e} metal_expert_silu_at_mid_argmax={:.8e} expert_silu_delta_at_mid_argmax={:.8e} host_expert_mid_at_argmax={:.8e} metal_expert_mid_at_argmax={:.8e} host_expert_mid_recomputed_at_argmax={:.8e} metal_expert_mid_recomputed_at_argmax={:.8e} expert_mid_recompute_delta_at_argmax={:.8e} moe_out_max_abs={:.8e} moe_out_argmax={} host_moe_out_at_argmax={:.8e} metal_moe_out_at_argmax={:.8e} host_routed_down_acc_at_moe_argmax={:.8e} host_routed_moe_out_recomputed_at_argmax={:.8e} metal_mid_host_topk_down_acc_at_moe_argmax={:.8e} metal_mid_host_topk_moe_out_at_argmax={:.8e} metal_mid_metal_topk_down_acc_at_moe_argmax={:.8e} metal_mid_metal_topk_moe_out_at_argmax={:.8e} final_out_max_abs={:.8e} final_out_argmax={} host_final_out_at_argmax={:.8e} metal_final_out_at_argmax={:.8e}",
         layer_idx,
@@ -5935,11 +5952,7 @@ fn qwen36_emit_ffn_routed_stage5_finalize_tap(
         &metal_final_out,
     );
 
-    let router_path = if qwen36_ffn_router_stage5_simd_env_enabled() {
-        "simd"
-    } else {
-        "serial"
-    };
+    let router_path = qwen36_ffn_router_stage5_path_label();
     eprintln!(
         "[qwen36-ffn-routed-finalize-tap] layer={} router_path={} hidden={} top_k={} topk_idx_match={} topk_weight_max_abs={:.8e} topk_weight_argmax={} shared_out_max_abs={:.8e} shared_out_argmax={} host_shared_out_at_argmax={:.8e} metal_shared_out_at_argmax={:.8e} moe_out_max_abs={:.8e} moe_out_argmax={} final_out_max_abs={:.8e} final_out_argmax={} moe_probe_row={} moe_input={:.8e} moe_host_moe={:.8e} moe_metal_moe={:.8e} moe_host_shared={:.8e} moe_metal_shared={:.8e} moe_host_final={:.8e} moe_metal_final={:.8e} moe_final_host_host={:.8e} moe_final_metal_moe_host_shared={:.8e} moe_final_host_moe_metal_shared={:.8e} moe_final_metal_moe_metal_shared={:.8e} moe_host_down_acc={:.8e} moe_host_moe_recomputed={:.8e} moe_metal_mid_host_topk_down_acc={:.8e} moe_metal_mid_host_topk_moe={:.8e} moe_metal_mid_metal_topk_down_acc={:.8e} moe_metal_mid_metal_topk_moe={:.8e} moe_final_metal_mid_host_topk_host_shared={:.8e} moe_final_metal_mid_host_topk_metal_shared={:.8e} moe_final_metal_mid_metal_topk_host_shared={:.8e} moe_final_metal_mid_metal_topk_metal_shared={:.8e} moe_metal_moe_matches_metal_mid_host_topk={} moe_metal_moe_matches_metal_mid_metal_topk={} moe_host_final_matches_host_moe_host_shared={} moe_metal_final_matches_metal_moe_metal_shared={} final_probe_row={} final_input={:.8e} final_host_moe={:.8e} final_metal_moe={:.8e} final_host_shared={:.8e} final_metal_shared={:.8e} final_host_final={:.8e} final_metal_final={:.8e} final_final_host_host={:.8e} final_final_metal_moe_host_shared={:.8e} final_final_host_moe_metal_shared={:.8e} final_final_metal_moe_metal_shared={:.8e} final_host_down_acc={:.8e} final_host_moe_recomputed={:.8e} final_metal_mid_host_topk_down_acc={:.8e} final_metal_mid_host_topk_moe={:.8e} final_metal_mid_metal_topk_down_acc={:.8e} final_metal_mid_metal_topk_moe={:.8e} final_final_metal_mid_host_topk_host_shared={:.8e} final_final_metal_mid_host_topk_metal_shared={:.8e} final_final_metal_mid_metal_topk_host_shared={:.8e} final_final_metal_mid_metal_topk_metal_shared={:.8e} final_metal_moe_matches_metal_mid_host_topk={} final_metal_moe_matches_metal_mid_metal_topk={} final_host_final_matches_host_moe_host_shared={} final_metal_final_matches_metal_moe_metal_shared={}",
         layer_idx,
@@ -6227,11 +6240,7 @@ fn qwen36_apply_ffn_routed_stage5_host_correction(
     } else {
         first_changed_output as isize
     };
-    let router_path = if qwen36_ffn_router_stage5_simd_env_enabled() {
-        "simd"
-    } else {
-        "serial"
-    };
+    let router_path = qwen36_ffn_router_stage5_path_label();
     eprintln!(
         "[qwen36-ffn-routed-host-correction] layer={} router_path={} hidden={} top_k={} topk_idx_match={} topk_weight_max_abs={:.8e} topk_weight_argmax={} host_topk_weight_at_argmax={:.8e} metal_topk_weight_at_argmax={:.8e} expert_mid_max_abs={:.8e} expert_mid_argmax={} expert_mid_group={} expert_mid_row={} host_expert_gate_at_mid_argmax={:.8e} metal_expert_gate_at_mid_argmax={:.8e} expert_gate_delta_at_mid_argmax={:.8e} host_expert_up_at_mid_argmax={:.8e} metal_expert_up_at_mid_argmax={:.8e} expert_up_delta_at_mid_argmax={:.8e} host_expert_silu_at_mid_argmax={:.8e} metal_expert_silu_at_mid_argmax={:.8e} expert_silu_delta_at_mid_argmax={:.8e} host_expert_mid_at_argmax={:.8e} metal_expert_mid_at_argmax={:.8e} host_expert_mid_recomputed_at_argmax={:.8e} metal_expert_mid_recomputed_at_argmax={:.8e} expert_mid_recompute_delta_at_argmax={:.8e} moe_out_max_abs={:.8e} moe_out_argmax={} host_moe_out_at_argmax={:.8e} metal_moe_out_at_argmax={:.8e} host_routed_down_acc_at_moe_argmax={:.8e} host_routed_moe_out_recomputed_at_argmax={:.8e} metal_mid_host_topk_down_acc_at_moe_argmax={:.8e} metal_mid_host_topk_moe_out_at_argmax={:.8e} metal_mid_metal_topk_down_acc_at_moe_argmax={:.8e} metal_mid_metal_topk_moe_out_at_argmax={:.8e} output_patch_max_abs={:.8e} output_patch_argmax={} host_final_out_at_argmax={:.8e} metal_final_out_at_argmax={:.8e} changed_output_elems={} first_changed_output={}",
         layer_idx,
@@ -6448,11 +6457,7 @@ fn qwen36_apply_ffn_routed_down_stage5_host_recompute_correction(
     } else {
         first_changed_output as isize
     };
-    let router_path = if qwen36_ffn_router_stage5_simd_env_enabled() {
-        "simd"
-    } else {
-        "serial"
-    };
+    let router_path = qwen36_ffn_router_stage5_path_label();
     eprintln!(
         "[qwen36-ffn-routed-down-host-recompute-correction] layer={} router_path={} hidden={} top_k={} topk_idx_match={} topk_weight_max_abs={:.8e} topk_weight_argmax={} expert_mid_max_abs={:.8e} expert_mid_argmax={} expert_mid_group={} expert_mid_row={} host_expert_mid_at_argmax={:.8e} metal_expert_mid_at_argmax={:.8e} metal_moe_vs_recomputed_max_abs={:.8e} metal_moe_vs_recomputed_argmax={} recomputed_down_acc_at_moe_argmax={:.8e} recomputed_moe_at_moe_argmax={:.8e} host_moe_at_moe_argmax={:.8e} metal_moe_at_moe_argmax={:.8e} host_moe_vs_recomputed_max_abs={:.8e} host_moe_vs_recomputed_argmax={} recomputed_moe_at_host_argmax={:.8e} host_moe_at_host_argmax={:.8e} metal_moe_at_host_argmax={:.8e} output_patch_max_abs={:.8e} output_patch_argmax={} final_vs_host_max_abs={:.8e} final_vs_host_argmax={} host_final_at_final_argmax={:.8e} recomputed_final_at_final_argmax={:.8e} changed_moe_elems={} changed_output_elems={} first_changed_output={}",
         layer_idx,

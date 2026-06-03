@@ -1059,6 +1059,10 @@ bool qwen36_ffn_router_stage5_exact_simd_enabled() {
     return NSProcessInfo.processInfo.environment[@"SUPERSONIC_METAL_DISABLE_QWEN36_FFN_ROUTER_STAGE5_EXACT_SIMD"] == nil;
 }
 
+bool qwen36_ffn_router_stage5_fused_exact_enabled() {
+    return NSProcessInfo.processInfo.environment[@"SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_FUSED_EXACT"] != nil;
+}
+
 bool qwen36_ffn_router_stage5_exact_multirow_enabled() {
     return NSProcessInfo.processInfo.environment[@"SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_STAGE5_EXACT_MULTIROW"] != nil;
 }
@@ -16423,7 +16427,9 @@ extern "C" int supersonic_metal_qwen36_ffn_int4_stage5_with_router(
         NSError* pipeline_error = nil;
         Qwen36FfnInt4Pipelines pipelines = qwen36_ffn_int4_pipelines(&pipeline_error);
         bool router_simd = qwen36_ffn_router_stage5_simd_enabled();
-        bool router_exact_simd = !router_simd && qwen36_ffn_router_stage5_exact_simd_enabled();
+        bool router_fused_exact = !router_simd && qwen36_ffn_router_stage5_fused_exact_enabled();
+        bool router_exact_simd =
+            !router_simd && !router_fused_exact && qwen36_ffn_router_stage5_exact_simd_enabled();
         bool router_norm_exact_simd = router_exact_simd && qwen36_ffn_router_norm_exact_simd_enabled();
         bool router_norm_warp_store =
             router_exact_simd && !router_norm_exact_simd &&
@@ -16799,7 +16805,9 @@ extern "C" int supersonic_metal_qwen36_ffn_int4_stage5_with_router(
         if (split_profile) {
             std::string router_profile_label = router_simd
                 ? "qwen36_ffn_int4_router_topk_stage5_simd"
-                : (router_exact_simd
+                : (router_fused_exact
+                    ? "qwen36_ffn_int4_router_topk_stage5_fused_exact"
+                    : (router_exact_simd
                     ? (router_exact_multirow
                         ? "qwen36_ffn_int4_router_topk_stage5_exact_multirow"
                         : (router_norm_exact_simd
@@ -16807,7 +16815,7 @@ extern "C" int supersonic_metal_qwen36_ffn_int4_stage5_with_router(
                             : (router_norm_warp_store
                                 ? "qwen36_ffn_int4_router_topk_stage5_exact_simd_norm_warp_store"
                                 : "qwen36_ffn_int4_router_topk_stage5_exact_simd")))
-                    : "qwen36_ffn_int4_router_topk_stage5");
+                    : "qwen36_ffn_int4_router_topk_stage5"));
             auto submit_profile_phase = [&](auto encode_fn, const std::string& label,
                                             int queue_error, int command_buffer_error,
                                             int encoder_error, int completion_error) -> int {

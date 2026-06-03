@@ -27,6 +27,7 @@ BF16_BOUNDARY_SOURCES = {
 }
 COARSE_BATCH_SERIAL_MODE = "full-stage5-router-batch"
 COARSE_BATCH_SIMD_MODE = "full-stage5-router-simd-batch"
+ROUTER_FUSED_EXACT_BATCH_MODE = "full-stage5-router-fused-exact-batch"
 DEFERRED_BATCH_SERIAL_MODE = "full-stage5-router-batch-deferred-phases"
 DEFERRED_BATCH_SIMD_MODE = "full-stage5-router-simd-batch-deferred-phases"
 SHARED_TILED_BATCH_SIMD_MODE = "full-stage5-router-simd-batch-shared-tiled"
@@ -87,6 +88,7 @@ SHARED_COMPONENT_MODES = {
 BATCH_FAST_PROFILE_MODES = {
     "full-stage5-router-batch",
     "full-stage5-router-simd-batch",
+    ROUTER_FUSED_EXACT_BATCH_MODE,
     "full-stage5-router-batch-deferred-phases",
     "full-stage5-router-simd-batch-deferred-phases",
     SHARED_TILED_BATCH_SIMD_MODE,
@@ -174,6 +176,10 @@ MODE_ALIASES: dict[str, str] = {
     "batch-router-simd": "full-stage5-router-simd-batch",
     "full-router-simd-batch": "full-stage5-router-simd-batch",
     "full-stage5-router-simd-batch": "full-stage5-router-simd-batch",
+    "router-fused-exact-batch": ROUTER_FUSED_EXACT_BATCH_MODE,
+    "batch-router-fused-exact": ROUTER_FUSED_EXACT_BATCH_MODE,
+    "full-router-fused-exact-batch": ROUTER_FUSED_EXACT_BATCH_MODE,
+    ROUTER_FUSED_EXACT_BATCH_MODE: ROUTER_FUSED_EXACT_BATCH_MODE,
     "router-simd-batch-shared-tiled": SHARED_TILED_BATCH_SIMD_MODE,
     "batch-router-simd-shared-tiled": SHARED_TILED_BATCH_SIMD_MODE,
     "full-router-simd-batch-shared-tiled": SHARED_TILED_BATCH_SIMD_MODE,
@@ -3204,6 +3210,10 @@ def build_env_overrides(args: argparse.Namespace, mode: str) -> dict[str, str]:
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_STAGE5_SIMD"] = "1"
     elif mode == "full-stage5-router-batch":
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"] = "1"
+        overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH"] = "1"
+    elif mode == ROUTER_FUSED_EXACT_BATCH_MODE:
+        overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"] = "1"
+        overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_FUSED_EXACT"] = "1"
         overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH"] = "1"
     elif mode == "full-stage5-router-simd-batch":
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"] = "1"

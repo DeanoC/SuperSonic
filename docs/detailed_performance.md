@@ -1293,6 +1293,27 @@ changing top-k ordering and instead look for a parity-safe consolidation or
 scratch/barrier reduction across the exact router subphases and adjacent FFN
 work.
 
+An opt-in fused exact router selector was added on 2026-06-03:
+`SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_FUSED_EXACT=1`. It routes the native
+stage-5 FFN through the existing monolithic router kernel instead of the default
+split exact-SIMD norm/logits/top-k sequence, and the diagnostic labels now report
+`router_path=fused-exact`. The local raw GGML Q4_K_M bake was not present
+(`/Users/deano/.cache/supersonic-metal-models/qwen3.6-35b-a3b/.supersonic/v2-q4km`
+was missing), so the validation used the available
+`v2-int4-gptq` control lane. With decode-batch active and the router parity tap
+enabled, the 8-token probe
+(`/tmp/supersonic-qwen35-int4-router-fused-exact-decode-batch-tap-8.log`)
+captured all 320 layer rows with `topk_idx_match=1`,
+`workspace_idx_match=1`, `output_idx_match=1`, and zero h-norm/logit/top-k
+weight deltas. Same-session 128-token no-tap A/B preserved identical generated
+IDs, but the fused candidate was slower: default exact-SIMD
+(`/tmp/supersonic-qwen35-int4-router-exact-simd-decode-batch-128.log`) measured
+`55.4 ms/token` (`18.05 tok/s`), while fused exact
+(`/tmp/supersonic-qwen35-int4-router-fused-exact-decode-batch-128.log`) measured
+`60.9 ms/token` (`16.42 tok/s`). Keep it diagnostic-only; it proves the fused
+router can be made parity-clean, but the current monolithic shape is not the
+speed win.
+
 The current gap is therefore not a one-line launch-count fix; the Metal profile
 still points at the chained per-layer decode structure and command-buffer waits.
 A naive experiment that coalesced phase command buffers reduced command-buffer

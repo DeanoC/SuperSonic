@@ -440,9 +440,16 @@ fn qwen36_metal_router_stage5_simd_env_enabled() -> bool {
         && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
 }
 
+fn qwen36_metal_router_stage5_fused_exact_env_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_FUSED_EXACT").is_some()
+        && !qwen36_metal_router_stage5_simd_env_enabled()
+        && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
+}
+
 fn qwen36_metal_router_stage5_exact_simd_enabled() -> bool {
     std::env::var_os("SUPERSONIC_METAL_DISABLE_QWEN36_FFN_ROUTER_STAGE5_EXACT_SIMD").is_none()
         && !qwen36_metal_router_stage5_simd_env_enabled()
+        && !qwen36_metal_router_stage5_fused_exact_env_enabled()
         && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
 }
 
@@ -459,6 +466,8 @@ fn qwen36_full_attn_native_enabled_for_layer(layer_idx: usize) -> bool {
 fn qwen36_metal_decode_batch_router_path_label() -> &'static str {
     if qwen36_metal_router_stage5_simd_env_enabled() {
         "simd"
+    } else if qwen36_metal_router_stage5_fused_exact_env_enabled() {
+        "fused-exact"
     } else if qwen36_metal_router_stage5_exact_simd_enabled() {
         "exact-simd"
     } else {
