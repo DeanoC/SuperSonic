@@ -16994,6 +16994,8 @@ extern "C" int supersonic_metal_qwen36_ffn_int4_stage5_with_router(
                              (router_simd && pipelines.router_logits_simd_stage5 == nil) ||
                              (router_exact_simd && pipelines.router_logits_exact_simd_stage5 == nil) ||
                              (router_exact_multirow && pipelines.router_logits_exact_multirow_stage5 == nil) ||
+                             (router_topk_parallel_select &&
+                              pipelines.router_topk_stage5_from_logits_parallel_select == nil) ||
                              pipelines.router_topk_stage5_from_logits == nil)) ||
             pipelines.shared_gate_up == nil ||
             pipelines.shared_scalar == nil || pipelines.shared_down == nil ||
