@@ -1522,6 +1522,21 @@ identified the next safe work area:
   improvement (`65.4` vs `65.5 ms/token`;
   `/tmp/supersonic-qwen35-raw-q4km-exact-interval9999-512-gate.log`).
   Keep the promoted exact-SIMD path on the default interval-1 cadence.
+  A 2026-06-04 scheduling revisit kept the generated stream aligned but did
+  not prove a chain-level win. FFN commit intervals 4, 8, and 9999 matched the
+  128-token stream; after warm repeat, interval 9999 tied the default
+  (`95.0` vs `95.1 ms/token`). Coarse
+  `SUPERSONIC_METAL_QWEN36_DECODE_BATCH_SYNC_PHASES=1` was stream-safe but
+  slower (`96.1 ms/token`). A temporary linear-attention commit interval hook
+  also matched the stream, but linear-only intervals 8 and 9999 did not beat the
+  warmed default (`95.3` and `96.6 ms/token`). Combining linear interval 8 with
+  FFN interval 9999 matched all 512 generated IDs across two runs and measured
+  `88.8` and `89.2 ms/token`, but both runs had slower chain/FFN buckets than
+  the warmed default control (`chain=85.769/86.116`, `ffn=57.707/58.048` vs
+  default `chain=84.483`, `ffn=55.955`). The hook was removed; keep this bucket
+  pointed at a larger FFN residency/submit-wait redesign rather than another
+  phase-commit cadence tweak
+  (`/tmp/supersonic-{ffn-commit-interval-4-128,ffn-commit-interval-8-128,ffn-commit-interval-9999-128,ffn-commit-9999-repeat-128,decode-batch-sync-phases-128,linear-commit-interval-8-128,linear-commit-interval-9999-128,linear8-ffn9999-512,linear8-ffn9999-repeat-512,decode-batch-default-repeat-512}.log`).
   Rechecking the MLX-shaped gathered expert-down path in the same tree also
   tied the default rather than improving it: three 128-token pairs measured
   equal medians of `64.3 ms/token`, with pairwise generated streams matching in
