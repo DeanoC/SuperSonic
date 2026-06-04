@@ -7162,6 +7162,28 @@ fn qwen36_ffn_expert_mps_static_topn_partial_stage5_supported(
         && !int4.down_proj_zero.is_null()
 }
 
+fn qwen36_ffn_expert_static_topn_partial_stage5_supported(
+    params: Qwen36MoeFfnStepParams,
+    weights: &Qwen36MoeFfnStepWeights,
+    int4: &Qwen36MoeFfnStepInt4,
+) -> bool {
+    std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_STATIC_TOPN_PARTIAL").is_some()
+        && params.stage == 5
+        && params.hidden == 2048
+        && params.num_experts == 256
+        && params.moe_intermediate == 512
+        && params.top_k == 8
+        && int4.group_size == 128
+        && !crate::metal_native::disabled_by_env()
+        && !weights.input_hidden.is_null()
+        && !weights.gate_up_proj_w.is_null()
+        && !weights.down_proj_w.is_null()
+        && !int4.gate_up_proj_scale.is_null()
+        && !int4.gate_up_proj_zero.is_null()
+        && !int4.down_proj_scale.is_null()
+        && !int4.down_proj_zero.is_null()
+}
+
 struct Qwen36PackedExpertBuffers {
     gate_up_proj: GpuBuffer,
     gate_up_scale: GpuBuffer,
@@ -8024,6 +8046,170 @@ where
         )
     })?;
     Ok(Some(f(&entry.buffers)?))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen36_with_static_topn_partial_packed_experts_for_metal<T, F>(
+    ordinal: usize,
+    layer_idx: i32,
+    hidden: usize,
+    moe_intermediate: usize,
+    active_experts: &[usize],
+    group_size: usize,
+    num_experts: usize,
+    gate_up_proj_ptr: *const c_void,
+    gate_up_scale_ptr: *const c_void,
+    gate_up_zero_ptr: *const c_void,
+    down_proj_ptr: *const c_void,
+    down_scale_ptr: *const c_void,
+    down_zero_ptr: *const c_void,
+    f: F,
+) -> Result<Option<T>, GpuError>
+where
+    F: FnOnce(
+        &Qwen36PackedExpertStaticTopNCacheEntry,
+        usize,
+        &[Qwen36MpsStaticTopNHit],
+        &[usize],
+    ) -> Result<T, GpuError>,
+{
+    qwen36_validate_active_expert_pack(
+        hidden,
+        moe_intermediate,
+        active_experts,
+        group_size,
+        num_experts,
+        gate_up_proj_ptr,
+        gate_up_scale_ptr,
+        gate_up_zero_ptr,
+        down_proj_ptr,
+        down_scale_ptr,
+        down_zero_ptr,
+    )?;
+    let Some((capacity, resident_experts)) = qwen36_static_topn_layer_experts_from_env(layer_idx)?
+    else {
+        return Ok(None);
+    };
+    let resident_capacity = resident_experts.len();
+    let expert_to_slot =
+        qwen36_static_topn_expert_to_slot(layer_idx, resident_experts, num_experts, capacity)?;
+
+    let mut hits = Vec::with_capacity(active_experts.len());
+    let mut misses = Vec::with_capacity(active_experts.len());
+    for (group, &expert) in active_experts.iter().enumerate() {
+        if let Some(slot) = expert_to_slot[expert] {
+            hits.push(Qwen36MpsStaticTopNHit {
+                original_group: group,
+                slot,
+            });
+        } else {
+            misses.push(group);
+        }
+    }
+    if hits.is_empty() {
+        qwen36_static_topn_expert_residency_profile_record(
+            resident_capacity,
+            false,
+            false,
+            false,
+            active_experts.len(),
+            0,
+            0,
+            misses.len(),
+            0,
+        );
+        return Ok(None);
+    }
+
+    let key = Qwen36PackedExpertCacheKey {
+        gate_up_proj_ptr: gate_up_proj_ptr as usize,
+        gate_up_scale_ptr: gate_up_scale_ptr as usize,
+        gate_up_zero_ptr: gate_up_zero_ptr as usize,
+        down_proj_ptr: down_proj_ptr as usize,
+        down_scale_ptr: down_scale_ptr as usize,
+        down_zero_ptr: down_zero_ptr as usize,
+        hidden,
+        moe_intermediate,
+        group_size,
+        active_groups: resident_capacity,
+    };
+    let cache = QWEN36_PACKED_EXPERT_STATIC_TOPN_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache.lock().map_err(|_| {
+        GpuError::backend(
+            Backend::Metal,
+            "qwen36 packed expert static top-N partial cache mutex poisoned".into(),
+        )
+    })?;
+    let mut allocation = false;
+    let copied_bytes =
+        qwen36_packed_expert_copy_bytes(hidden, moe_intermediate, resident_capacity, group_size);
+    crate::prefill_ffi::metal_profile_time(
+        "qwen36_ffn_int4_expert_static_topn_partial_pack_stage5",
+        "host",
+        || -> Result<(), GpuError> {
+            match cache.entry(key) {
+                std::collections::hash_map::Entry::Occupied(entry) => {
+                    if entry.get().resident_experts.as_slice() != resident_experts {
+                        return Err(GpuError::backend(
+                            Backend::Metal,
+                            "qwen36 static top-N partial cache key collision with different resident experts"
+                                .into(),
+                        ));
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(vacant) => {
+                    let mut buffers = qwen36_alloc_packed_experts_for_metal(
+                        ordinal,
+                        hidden,
+                        moe_intermediate,
+                        resident_capacity,
+                        group_size,
+                    )?;
+                    for (slot, &expert) in resident_experts.iter().enumerate() {
+                        qwen36_fill_packed_expert_slot_for_metal(
+                            hidden,
+                            moe_intermediate,
+                            expert,
+                            slot,
+                            group_size,
+                            gate_up_proj_ptr,
+                            gate_up_scale_ptr,
+                            gate_up_zero_ptr,
+                            down_proj_ptr,
+                            down_scale_ptr,
+                            down_zero_ptr,
+                            &mut buffers,
+                        );
+                    }
+                    vacant.insert(Qwen36PackedExpertStaticTopNCacheEntry {
+                        resident_experts: resident_experts.to_vec(),
+                        buffers,
+                    });
+                    allocation = true;
+                }
+            }
+            Ok(())
+        },
+    )?;
+    let entry = cache.get(&key).ok_or_else(|| {
+        GpuError::backend(
+            Backend::Metal,
+            "qwen36 packed expert static top-N partial cache entry missing after fill".into(),
+        )
+    })?;
+    let result = f(entry, resident_capacity, &hits, &misses)?;
+    qwen36_static_topn_expert_residency_profile_record(
+        resident_capacity,
+        misses.is_empty(),
+        false,
+        allocation,
+        active_experts.len(),
+        usize::from(allocation) * copied_bytes,
+        hits.len(),
+        misses.len(),
+        0,
+    );
+    Ok(Some(result))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -9403,6 +9589,209 @@ fn qwen36_alloc_mps_expert_bridge_buffers(
         down_rhs,
         down_out,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen36_try_static_topn_partial_packed_for_metal(
+    output_ordinal: usize,
+    params: Qwen36MoeFfnStepParams,
+    weights: &Qwen36MoeFfnStepWeights,
+    int4: &Qwen36MoeFfnStepInt4,
+    hidden: usize,
+    moe_intermediate: usize,
+    top_k: usize,
+    num_experts: usize,
+    active_experts: &[usize],
+    input: &[u16],
+    output: &mut [u16],
+    workspace: &mut [f32],
+    workspace_ptr: *mut c_void,
+    output_ptr: *mut c_void,
+    off_h_norm: usize,
+    off_topk_val: usize,
+    off_topk_idx: usize,
+    off_shared_out: usize,
+    off_expert_gu: usize,
+    off_expert_mid: usize,
+    off_expert_stack: usize,
+    off_moe_out: usize,
+) -> Result<Option<()>, GpuError> {
+    qwen36_with_static_topn_partial_packed_experts_for_metal(
+        output_ordinal,
+        params.layer_idx,
+        hidden,
+        moe_intermediate,
+        active_experts,
+        int4.group_size as usize,
+        num_experts,
+        weights.gate_up_proj_w,
+        int4.gate_up_proj_scale,
+        int4.gate_up_proj_zero,
+        weights.down_proj_w,
+        int4.down_proj_scale,
+        int4.down_proj_zero,
+        |resident, _resident_capacity, hits, miss_groups| {
+            let hit_count = hits.len();
+            let original_topk_vals: Vec<f32> = (0..top_k)
+                .map(|group| workspace[off_topk_val + group])
+                .collect();
+            let original_topk_idx: Vec<f32> = (0..top_k)
+                .map(|group| workspace[off_topk_idx + group])
+                .collect();
+
+            for (hit_group, hit) in hits.iter().enumerate() {
+                workspace[off_topk_idx + hit_group] = f32::from_bits(hit.slot as u32);
+                workspace[off_topk_val + hit_group] = original_topk_vals[hit.original_group];
+            }
+
+            let native_result = crate::prefill_ffi::metal_profile_time(
+                "qwen36_ffn_int4_expert_packed_static_topn_partial_stage5",
+                "native",
+                || unsafe {
+                    crate::metal_native::qwen36_ffn_expert_gate_up_down_finalize_tiled(
+                        hidden,
+                        moe_intermediate,
+                        hit_count,
+                        int4.group_size as usize,
+                        workspace_ptr,
+                        weights.input_hidden,
+                        resident.buffers.gate_up_proj.as_ptr(),
+                        resident.buffers.gate_up_scale.as_ptr(),
+                        resident.buffers.gate_up_zero.as_ptr(),
+                        resident.buffers.down_proj.as_ptr(),
+                        resident.buffers.down_scale.as_ptr(),
+                        resident.buffers.down_zero.as_ptr(),
+                        output_ptr,
+                        off_h_norm,
+                        off_topk_val,
+                        off_topk_idx,
+                        off_shared_out,
+                        off_expert_mid,
+                        off_moe_out,
+                        true,
+                    )
+                },
+            );
+            for group in 0..top_k {
+                workspace[off_topk_val + group] = original_topk_vals[group];
+                workspace[off_topk_idx + group] = original_topk_idx[group];
+            }
+            native_result?;
+
+            if miss_groups.is_empty() {
+                return Ok(());
+            }
+
+            let h_norm_for_miss = workspace[off_h_norm..off_h_norm + hidden].to_vec();
+            crate::prefill_ffi::metal_profile_time(
+                "qwen36_ffn_host_expert_static_topn_partial_miss_gate_up",
+                "host",
+                || {
+                    let gate_up_w = weights.gate_up_proj_w as usize;
+                    let gate_up_scale = int4.gate_up_proj_scale as usize;
+                    let gate_up_zero = int4.gate_up_proj_zero as usize;
+                    let group_size = int4.group_size.max(0) as usize;
+                    let rows_per_group = 2 * moe_intermediate;
+                    let gu = &mut workspace
+                        [off_expert_gu..off_expert_gu + miss_groups.len() * rows_per_group];
+                    qwen36_parallel_chunks_mut(gu, 64, |start, chunk| {
+                        for (local, out) in chunk.iter_mut().enumerate() {
+                            let flat_row = start + local;
+                            let miss_group = flat_row / rows_per_group;
+                            let row = flat_row - miss_group * rows_per_group;
+                            let original_group = miss_groups[miss_group];
+                            *out = qwen36_expert_dense_or_int4_dot_unchecked(
+                                gate_up_w,
+                                gate_up_scale,
+                                gate_up_zero,
+                                active_experts[original_group],
+                                row,
+                                rows_per_group,
+                                hidden,
+                                group_size,
+                                &h_norm_for_miss,
+                            );
+                        }
+                    });
+                },
+            );
+
+            crate::prefill_ffi::metal_profile_time(
+                "qwen36_ffn_host_expert_static_topn_partial_miss_silu",
+                "host",
+                || {
+                    for group in 0..miss_groups.len() {
+                        let gu_base = off_expert_gu + group * 2 * moe_intermediate;
+                        let mid_base = off_expert_mid + group * moe_intermediate;
+                        for i in 0..moe_intermediate {
+                            let gp = workspace[gu_base + i];
+                            let up = workspace[gu_base + moe_intermediate + i];
+                            let silu = gp * (1.0f32 / (1.0f32 + (-gp).exp()));
+                            workspace[mid_base + i] = silu * up;
+                        }
+                    }
+                },
+            );
+
+            let expert_mid = workspace
+                [off_expert_mid..off_expert_mid + miss_groups.len() * moe_intermediate]
+                .to_vec();
+            crate::prefill_ffi::metal_profile_time(
+                "qwen36_ffn_host_expert_static_topn_partial_miss_down",
+                "host",
+                || {
+                    let down_w = weights.down_proj_w as usize;
+                    let down_scale = int4.down_proj_scale as usize;
+                    let down_zero = int4.down_proj_zero as usize;
+                    let group_size = int4.group_size.max(0) as usize;
+                    let stack = &mut workspace
+                        [off_expert_stack..off_expert_stack + miss_groups.len() * hidden];
+                    qwen36_parallel_chunks_mut(stack, 64, |start, chunk| {
+                        for (local, out) in chunk.iter_mut().enumerate() {
+                            let flat_row = start + local;
+                            let miss_group = flat_row / hidden;
+                            let row = flat_row - miss_group * hidden;
+                            let original_group = miss_groups[miss_group];
+                            let mid = &expert_mid[miss_group * moe_intermediate
+                                ..(miss_group + 1) * moe_intermediate];
+                            *out = qwen36_expert_dense_or_int4_dot_unchecked(
+                                down_w,
+                                down_scale,
+                                down_zero,
+                                active_experts[original_group],
+                                row,
+                                hidden,
+                                moe_intermediate,
+                                group_size,
+                                mid,
+                            );
+                        }
+                    });
+                },
+            );
+
+            crate::prefill_ffi::metal_profile_time(
+                "qwen36_ffn_host_expert_static_topn_partial_miss_finalize",
+                "host",
+                || {
+                    for row in 0..hidden {
+                        let mut acc = workspace[off_moe_out + row];
+                        for (miss_group, &original_group) in miss_groups.iter().enumerate() {
+                            acc += original_topk_vals[original_group]
+                                * workspace[off_expert_stack + miss_group * hidden + row];
+                        }
+                        let moe = bf16_round_f32(acc);
+                        workspace[off_moe_out + row] = moe;
+                        let val = bf16_round_f32(
+                            bf16_bits_to_f32(input[row]) + moe + workspace[off_shared_out + row],
+                        );
+                        output[row] = f32_to_bf16_bits(val);
+                    }
+                },
+            );
+            Ok(())
+        },
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -10989,6 +11378,34 @@ fn ffn_step_stage1_5_metal_host(
         .collect();
     if qwen36_route_profile_enabled() {
         qwen36_route_profile_record(&active_experts);
+    }
+    if qwen36_ffn_expert_static_topn_partial_stage5_supported(params, weights, int4) {
+        if let Some(()) = qwen36_try_static_topn_partial_packed_for_metal(
+            output_ordinal,
+            params,
+            weights,
+            int4,
+            hidden,
+            moe_intermediate,
+            top_k,
+            num_experts,
+            &active_experts,
+            input,
+            output,
+            workspace,
+            workspace_ptr,
+            output_ptr,
+            off_h_norm,
+            off_topk_val,
+            off_topk_idx,
+            off_shared_out,
+            off_expert_gu,
+            off_expert_mid,
+            off_expert_stack,
+            off_moe_out,
+        )? {
+            return Ok(());
+        }
     }
     if qwen36_ffn_expert_mps_static_topn_partial_stage5_supported(params, weights, int4) {
         if let Some(()) = qwen36_try_mps_static_topn_partial_for_metal(

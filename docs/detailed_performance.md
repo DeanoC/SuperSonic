@@ -2495,6 +2495,26 @@ residency scaffold, but Qwen3.6 Metal should next target either a dense
 resident MPS/MPP table that can serve partial hits cheaply, or return to the
 prefill/orchestration buckets already shown to dominate long-context runs.
 
+The native partial-hit static Top-N follow-up is opt-in behind
+`SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_STATIC_TOPN_PARTIAL=1`. It uses the
+same resident packed INT4 static table as the full-hit static path, remaps only
+resident routed groups into the first hit-count top-k slots, runs the existing
+native packed FFN shader for those hits, restores the original route workspace,
+then computes miss groups with the host fallback and adds them into the partial
+`moe_out`. This explicitly tests the non-MPS version of the partial resident
+fork. The first one-token profiled smoke matched generated IDs across
+`default`, `static`, and `static-partial`, but rejected the candidate:
+`static-partial` measured `574.7 ms/token`, `ffn_ms_avg=483.074`, and copied
+`3.670 GiB` while allocating all 40 resident tables
+(`target/qwen36_static_topn_partial_smoke.{json,md}`). A four-token warm sweep
+also rejected it: both static modes diverged from the default stream after the
+first token, and `static-partial` was slower than full-hit `static`
+(`210.6` vs `104.2 ms/token`, `ffn=159.293` vs `76.689`;
+`target/qwen36_static_topn_partial_warm4.{json,md}`). Keep this mode
+diagnostic; partial resident INT4 needs either a cheaper all-layer prewarm plus
+a parity-safe default comparison, or a different in-kernel partial combine
+before it is worth promoting.
+
 `tests/metal/probe_qwen36_mps_resident_table.py` turns that fork into an
 explicit gate. It consumes `target/qwen36_static_topn_mps_probe.json`, optionally
 runs the existing `[qwen36-moe mps-expert-pilot]` row, and writes

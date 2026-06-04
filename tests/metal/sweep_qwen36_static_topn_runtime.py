@@ -42,13 +42,15 @@ MODE_ALIASES: dict[str, str] = {
     "packed": "packed",
     "hotset": "hotset",
     "static": "static",
+    "static-partial": "static-partial",
+    "partial-static": "static-partial",
     "static-hotset": "static-hotset",
     "mps-static-partial": "mps-static-partial",
     "static-mps-partial": "mps-static-partial",
     "mps-static-partial-prewarm": "mps-static-partial-prewarm",
     "static-mps-partial-prewarm": "mps-static-partial-prewarm",
 }
-DEFAULT_MODES = "default,static,static-hotset,mps-static-partial"
+DEFAULT_MODES = "default,static,static-partial,static-hotset,mps-static-partial"
 
 
 def parse_key_values(line: str) -> dict[str, str]:
@@ -244,7 +246,7 @@ def build_env_overrides(args: argparse.Namespace, mode: str) -> dict[str, str]:
     }
     if args.metal_profile:
         overrides["SUPERSONIC_METAL_PROFILE"] = "1"
-    if mode in {"packed", "hotset", "static", "static-hotset"}:
+    if mode in {"packed", "hotset", "static", "static-partial", "static-hotset"}:
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_PACKED_STAGE5"] = "1"
     if mode in {"hotset", "static-hotset"}:
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_PACK_HOTSET"] = "1"
@@ -253,6 +255,7 @@ def build_env_overrides(args: argparse.Namespace, mode: str) -> dict[str, str]:
         )
     if mode in {
         "static",
+        "static-partial",
         "static-hotset",
         "mps-static-partial",
         "mps-static-partial-prewarm",
@@ -265,6 +268,8 @@ def build_env_overrides(args: argparse.Namespace, mode: str) -> dict[str, str]:
             overrides["SUPERSONIC_METAL_QWEN36_FFN_EXPERT_STATIC_TOPN_CAPACITY"] = str(
                 args.static_capacity
             )
+    if mode == "static-partial":
+        overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_STATIC_TOPN_PARTIAL"] = "1"
     if mode in {"mps-static-partial", "mps-static-partial-prewarm"}:
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_MPS_STATIC_TOPN_PARTIAL"] = "1"
     if mode == "mps-static-partial-prewarm":
