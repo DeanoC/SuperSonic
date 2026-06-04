@@ -15,7 +15,7 @@ from typing import Any
 
 
 MODEL = "qwen3.6-35b-a3b"
-SCHEMA = "qwen36-static-topn-runtime-sweep-v5"
+SCHEMA = "qwen36-static-topn-runtime-sweep-v6"
 
 PROMPT_SETS: dict[str, list[tuple[str, str]]] = {
     "smoke": [
@@ -40,6 +40,9 @@ MODE_ALIASES: dict[str, str] = {
     "baseline": "default",
     "default": "default",
     "packed": "packed",
+    "packed-exact": "packed-routed-host-order",
+    "packed-host-order": "packed-routed-host-order",
+    "packed-routed-host-order": "packed-routed-host-order",
     "hotset": "hotset",
     "static": "static",
     "static-partial": "static-partial",
@@ -53,6 +56,7 @@ MODE_ALIASES: dict[str, str] = {
 DEFAULT_MODES = "default,static,static-partial,static-hotset,mps-static-partial"
 EXPERIMENTAL_FAMILY_MODES = {
     "packed",
+    "packed-routed-host-order",
     "hotset",
     "static",
     "static-partial",
@@ -60,6 +64,8 @@ EXPERIMENTAL_FAMILY_MODES = {
     "mps-static-partial",
     "mps-static-partial-prewarm",
 }
+KNOWN_SILU_ULP_DRIFT_MODES = {"packed-routed-host-order"}
+KNOWN_SILU_ULP_STRICT_TOKENS = 16
 
 
 def parse_key_values(line: str) -> dict[str, str]:
@@ -255,8 +261,18 @@ def build_env_overrides(args: argparse.Namespace, mode: str) -> dict[str, str]:
     }
     if args.metal_profile:
         overrides["SUPERSONIC_METAL_PROFILE"] = "1"
-    if mode in {"packed", "hotset", "static", "static-partial", "static-hotset"}:
+    if mode in {
+        "packed",
+        "packed-routed-host-order",
+        "hotset",
+        "static",
+        "static-partial",
+        "static-hotset",
+    }:
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_PACKED_STAGE5"] = "1"
+    if mode == "packed-routed-host-order":
+        overrides["SUPERSONIC_METAL_QWEN36_FFN_EXPERT_GATE_UP_HOST_ORDER_STAGE5"] = "1"
+        overrides["SUPERSONIC_METAL_QWEN36_FFN_EXPERT_DOWN_HOST_ORDER_STAGE5"] = "1"
     if mode in {"hotset", "static-hotset"}:
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_PACK_HOTSET"] = "1"
         overrides["SUPERSONIC_METAL_QWEN36_FFN_EXPERT_HOTSET_CAPACITY"] = str(
@@ -671,6 +687,76 @@ def build_experimental_family_parity(
     }
 
 
+def first_id_mismatch(reference: list[int], candidate: list[int]) -> int | None:
+    for idx, (expected, got) in enumerate(zip(reference, candidate)):
+        if expected != got:
+            return idx
+    if len(reference) != len(candidate):
+        return min(len(reference), len(candidate))
+    return None
+
+
+def build_known_silu_ulp_id_drift(
+    rows: list[dict[str, Any]],
+    modes: list[str],
+    *,
+    strict_tokens: int = KNOWN_SILU_ULP_STRICT_TOKENS,
+) -> dict[str, Any]:
+    prompt_ids: list[str] = []
+    for row in rows:
+        prompt_id = str(row.get("prompt_id", ""))
+        if prompt_id and prompt_id not in prompt_ids:
+            prompt_ids.append(prompt_id)
+    rows_by_key = {
+        (str(row.get("prompt_id", "")), str(row.get("mode", ""))): row
+        for row in rows
+    }
+    items: list[dict[str, Any]] = []
+    for prompt_id in prompt_ids:
+        baseline = rows_by_key.get((prompt_id, "default"))
+        if baseline is None or baseline.get("status") != "ok":
+            continue
+        reference_ids = baseline.get("generated_ids") or []
+        for mode in modes:
+            if mode not in KNOWN_SILU_ULP_DRIFT_MODES:
+                continue
+            row = rows_by_key.get((prompt_id, mode))
+            if row is None or row.get("status") != "ok":
+                continue
+            generated_ids = row.get("generated_ids") or []
+            mismatch_idx = first_id_mismatch(reference_ids, generated_ids)
+            known = mismatch_idx is not None and mismatch_idx >= strict_tokens
+            strict_violation = mismatch_idx is not None and mismatch_idx < strict_tokens
+            items.append(
+                {
+                    "prompt_id": prompt_id,
+                    "mode": mode,
+                    "source": "routed_expert_silu_ulp_boundary",
+                    "strict_tokens": strict_tokens,
+                    "first_mismatch_index": mismatch_idx,
+                    "known_after_strict_window": known,
+                    "strict_window_violation": strict_violation,
+                    "reference_generated_ids": reference_ids,
+                    "generated_ids": generated_ids,
+                }
+            )
+    known_items = [item for item in items if item.get("known_after_strict_window")]
+    strict_violations = [item for item in items if item.get("strict_window_violation")]
+    matched = [item for item in items if item.get("first_mismatch_index") is None]
+    return {
+        "enabled": any(mode in KNOWN_SILU_ULP_DRIFT_MODES for mode in modes),
+        "source": "routed_expert_silu_ulp_boundary",
+        "strict_tokens": strict_tokens,
+        "known_count": len(known_items),
+        "strict_violation_count": len(strict_violations),
+        "matched_count": len(matched),
+        "status": "strict_violation"
+        if strict_violations
+        else ("known_long_run_drift" if known_items else "strict_match"),
+        "items": items,
+    }
+
+
 def summarize_with_gate(
     rows: list[dict[str, Any]],
     modes: list[str],
@@ -696,6 +782,7 @@ def summarize_with_gate(
         modes,
         experimental_family_reference_mode,
     )
+    summary["known_silu_ulp_id_drift"] = build_known_silu_ulp_id_drift(rows, modes)
     return summary
 
 
@@ -757,6 +844,7 @@ def render_markdown(report: dict[str, Any]) -> str:
     summary = report["summary"]
     promotion_gate = summary.get("promotion_gate") or {}
     family = summary.get("experimental_family_parity") or {}
+    known_silu = summary.get("known_silu_ulp_id_drift") or {}
     lines = [
         "# Qwen3.6 Static Top-N Runtime Sweep",
         "",
@@ -765,6 +853,8 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- max_new_tokens: `{report['max_new_tokens']}`",
         f"- generated_ids_match: `{summary['generated_ids_match']}`",
         f"- experimental_family_generated_ids_match: `{family.get('generated_ids_match', True)}`",
+        f"- known_silu_ulp_id_drift_status: `{known_silu.get('status', '-')}`",
+        f"- known_silu_ulp_strict_tokens: `{known_silu.get('strict_tokens', KNOWN_SILU_ULP_STRICT_TOKENS)}`",
         f"- promotion_gate_passed: `{promotion_gate.get('passed', False)}`",
         f"- promotion_gate_passed_modes: `{','.join(promotion_gate.get('passed_modes') or []) or '-'}`",
         "",
@@ -833,6 +923,32 @@ def render_markdown(report: dict[str, Any]) -> str:
                     ),
                     modes=",".join(str(item) for item in prompt.get("modes", [])),
                     mismatches=",".join(mismatched_modes) or "-",
+                )
+            )
+    known_items = known_silu.get("items") or []
+    if known_items:
+        lines.extend(
+            [
+                "",
+                "## Known SiLU ULP Drift",
+                "",
+                "This section is diagnostic only. Exact host-order routed FFN still requires strict generated-ID parity in the first smoke window; later divergence is classified as the known routed expert SiLU ulp boundary when the first mismatch occurs after that window.",
+                "",
+                "| Prompt | Mode | Source | Strict tokens | First mismatch | Known after strict window | Strict violation |",
+                "|:---|:---|:---|---:|---:|:---:|:---:|",
+            ]
+        )
+        for item in known_items:
+            first = item.get("first_mismatch_index")
+            lines.append(
+                "| {prompt} | {mode} | {source} | {strict} | {first} | {known} | {violation} |".format(
+                    prompt=item.get("prompt_id"),
+                    mode=item.get("mode"),
+                    source=item.get("source"),
+                    strict=item.get("strict_tokens"),
+                    first="-" if first is None else first,
+                    known=str(item.get("known_after_strict_window", False)).lower(),
+                    violation=str(item.get("strict_window_violation", False)).lower(),
                 )
             )
     candidates = promotion_gate.get("candidates") or []

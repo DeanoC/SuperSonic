@@ -4288,9 +4288,24 @@ fn qwen36_ffn_stage5_routed_gate_up_tap_enabled() -> bool {
         && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
 }
 
+fn qwen36_ffn_stage5_routed_silu_tap_enabled() -> bool {
+    std::env::var_os("SUPERSONIC_METAL_QWEN36_FFN_STAGE5_ROUTED_SILU_TAP").is_some()
+        && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
+}
+
 fn qwen36_ffn_stage5_routed_finalize_tap_enabled() -> bool {
     std::env::var_os("SUPERSONIC_METAL_QWEN36_FFN_STAGE5_ROUTED_FINALIZE_TAP").is_some()
         && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
+}
+
+fn qwen36_ffn_stage5_routed_tap_layer() -> Option<i32> {
+    std::env::var("SUPERSONIC_METAL_QWEN36_FFN_STAGE5_ROUTED_TAP_LAYER")
+        .ok()
+        .and_then(|raw| raw.parse::<i32>().ok())
+}
+
+fn qwen36_ffn_stage5_routed_tap_enabled_for_layer(layer_idx: i32) -> bool {
+    qwen36_ffn_stage5_routed_tap_layer().map_or(true, |target| target == layer_idx)
 }
 
 fn qwen36_ffn_router_stage5_simd_env_enabled() -> bool {
@@ -4803,6 +4818,31 @@ fn qwen36_routed_down_row_probe(
         acc += topk_weight[group] * down;
     }
     (acc, bf16_round_f32(acc))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen36_routed_down_row_group_probe(
+    down_w: usize,
+    down_scale: usize,
+    down_zero: usize,
+    row: usize,
+    hidden: usize,
+    moe_intermediate: usize,
+    group_size: usize,
+    expert: usize,
+    mid: &[f32],
+) -> f32 {
+    qwen36_expert_dense_or_int4_dot_unchecked(
+        down_w,
+        down_scale,
+        down_zero,
+        expert,
+        row,
+        hidden,
+        moe_intermediate,
+        group_size,
+        mid,
+    )
 }
 
 fn qwen36_bytes_to_f32_vec(bytes: &[u8]) -> Vec<f32> {
@@ -5534,6 +5574,9 @@ fn qwen36_emit_ffn_routed_stage5_gate_up_tap(
     reference: &Qwen36FfnRoutedReference,
     router_reference: &Qwen36FfnRouterReference,
 ) -> Result<(), GpuError> {
+    if !qwen36_ffn_stage5_routed_tap_enabled_for_layer(layer_idx) {
+        return Ok(());
+    }
     crate::prefill_ffi::flush_metal_batch()?;
     gpu_hal::sync(ordinal)?;
 
@@ -5567,6 +5610,7 @@ fn qwen36_emit_ffn_routed_stage5_gate_up_tap(
     let metal_expert_gu = &workspace_f32[off_expert_gu..off_expert_gu + expert_gu_len];
     let metal_expert_mid = &workspace_f32[off_expert_mid..off_expert_mid + expert_mid_len];
     let metal_topk_weight = &workspace_f32[off_topk_val..off_topk_val + top_k];
+    let silu_tap = qwen36_ffn_stage5_routed_silu_tap_enabled();
     let metal_topk_idx: Vec<u32> = workspace_f32[off_topk_idx..off_topk_idx + top_k]
         .iter()
         .map(|value| value.to_bits())
@@ -5575,6 +5619,39 @@ fn qwen36_emit_ffn_routed_stage5_gate_up_tap(
 
     let (expert_mid_max_abs, expert_mid_argmax) =
         qwen36_max_abs_delta(&reference.expert_mid, metal_expert_mid);
+    let metal_expert_gate: Vec<f32> = (0..expert_mid_len)
+        .map(|idx| {
+            let group = idx / moe_intermediate;
+            let row = idx % moe_intermediate;
+            metal_expert_gu[group * 2 * moe_intermediate + row]
+        })
+        .collect();
+    let metal_expert_gu_second: Vec<f32> = (0..expert_mid_len)
+        .map(|idx| {
+            let group = idx / moe_intermediate;
+            let row = idx % moe_intermediate;
+            metal_expert_gu[group * 2 * moe_intermediate + moe_intermediate + row]
+        })
+        .collect();
+    let metal_expert_up: Vec<f32> = if silu_tap {
+        reference.expert_up.clone()
+    } else {
+        metal_expert_gu_second.clone()
+    };
+    let metal_expert_silu: Vec<f32> = if silu_tap {
+        metal_expert_gu_second
+    } else {
+        metal_expert_gate
+            .iter()
+            .map(|gate| *gate * (1.0f32 / (1.0f32 + (-*gate).exp())))
+            .collect()
+    };
+    let (expert_gate_max_abs, expert_gate_argmax) =
+        qwen36_max_abs_delta(&reference.expert_gate, &metal_expert_gate);
+    let (expert_up_max_abs, expert_up_argmax) =
+        qwen36_max_abs_delta(&reference.expert_up, &metal_expert_up);
+    let (expert_silu_max_abs, expert_silu_argmax) =
+        qwen36_max_abs_delta(&reference.expert_silu, &metal_expert_silu);
     let topk_idx_match = router_reference.topk_idx == metal_topk_idx;
     let (topk_weight_max_abs, topk_weight_argmax) =
         qwen36_max_abs_delta(&router_reference.topk_weight, metal_topk_weight);
@@ -5616,14 +5693,23 @@ fn qwen36_emit_ffn_routed_stage5_gate_up_tap(
     let metal_expert_up_at_mid_argmax = metal_expert_gu
         .get(metal_gu_base + moe_intermediate + expert_mid_row)
         .copied()
+        .filter(|_| !silu_tap)
+        .or_else(|| reference.expert_up.get(expert_mid_argmax).copied())
         .unwrap_or(f32::NAN);
     let host_expert_silu_at_mid_argmax = reference
         .expert_silu
         .get(expert_mid_argmax)
         .copied()
         .unwrap_or(f32::NAN);
-    let metal_expert_silu_at_mid_argmax = metal_expert_gate_at_mid_argmax
-        * (1.0f32 / (1.0f32 + (-metal_expert_gate_at_mid_argmax).exp()));
+    let metal_expert_silu_at_mid_argmax = if silu_tap {
+        metal_expert_gu
+            .get(metal_gu_base + moe_intermediate + expert_mid_row)
+            .copied()
+            .unwrap_or(f32::NAN)
+    } else {
+        metal_expert_gate_at_mid_argmax
+            * (1.0f32 / (1.0f32 + (-metal_expert_gate_at_mid_argmax).exp()))
+    };
     let host_expert_mid_recomputed_at_argmax =
         host_expert_silu_at_mid_argmax * host_expert_up_at_mid_argmax;
     let metal_expert_mid_recomputed_at_argmax =
@@ -5700,19 +5786,67 @@ fn qwen36_emit_ffn_routed_stage5_gate_up_tap(
             metal_topk_weight,
             metal_expert_mid,
         );
+    let mut down_group_max_abs = 0.0f32;
+    let mut down_group_argmax = 0usize;
+    let mut host_down_at_group_argmax = f32::NAN;
+    let mut metal_mid_down_at_group_argmax = f32::NAN;
+    let mut topk_weight_at_down_group_argmax = f32::NAN;
+    for group in 0..top_k {
+        let expert = router_reference.topk_idx[group] as usize;
+        let host_mid =
+            &reference.expert_mid[group * moe_intermediate..(group + 1) * moe_intermediate];
+        let metal_mid = &metal_expert_mid[group * moe_intermediate..(group + 1) * moe_intermediate];
+        let host_down = qwen36_routed_down_row_group_probe(
+            down_w,
+            down_scale,
+            down_zero,
+            moe_out_argmax,
+            hidden,
+            moe_intermediate,
+            group_size,
+            expert,
+            host_mid,
+        );
+        let metal_down = qwen36_routed_down_row_group_probe(
+            down_w,
+            down_scale,
+            down_zero,
+            moe_out_argmax,
+            hidden,
+            moe_intermediate,
+            group_size,
+            expert,
+            metal_mid,
+        );
+        let delta = (host_down - metal_down).abs();
+        if group == 0 || delta > down_group_max_abs {
+            down_group_max_abs = delta;
+            down_group_argmax = group;
+            host_down_at_group_argmax = host_down;
+            metal_mid_down_at_group_argmax = metal_down;
+            topk_weight_at_down_group_argmax = router_reference.topk_weight[group];
+        }
+    }
 
     let router_path = qwen36_ffn_router_stage5_path_label();
     eprintln!(
-        "[qwen36-ffn-routed-gate-up-tap] layer={} router_path={} hidden={} top_k={} topk_idx_match={} topk_weight_max_abs={:.8e} topk_weight_argmax={} host_topk_weight_at_argmax={:.8e} metal_topk_weight_at_argmax={:.8e} expert_mid_max_abs={:.8e} expert_mid_argmax={} expert_mid_group={} expert_mid_row={} host_expert_gate_at_mid_argmax={:.8e} metal_expert_gate_at_mid_argmax={:.8e} expert_gate_delta_at_mid_argmax={:.8e} host_expert_up_at_mid_argmax={:.8e} metal_expert_up_at_mid_argmax={:.8e} expert_up_delta_at_mid_argmax={:.8e} host_expert_silu_at_mid_argmax={:.8e} metal_expert_silu_at_mid_argmax={:.8e} expert_silu_delta_at_mid_argmax={:.8e} host_expert_mid_at_argmax={:.8e} metal_expert_mid_at_argmax={:.8e} host_expert_mid_recomputed_at_argmax={:.8e} metal_expert_mid_recomputed_at_argmax={:.8e} expert_mid_recompute_delta_at_argmax={:.8e} moe_out_max_abs={:.8e} moe_out_argmax={} host_moe_out_at_argmax={:.8e} metal_moe_out_at_argmax={:.8e} host_routed_down_acc_at_moe_argmax={:.8e} host_routed_moe_out_recomputed_at_argmax={:.8e} metal_mid_host_topk_down_acc_at_moe_argmax={:.8e} metal_mid_host_topk_moe_out_at_argmax={:.8e} metal_mid_metal_topk_down_acc_at_moe_argmax={:.8e} metal_mid_metal_topk_moe_out_at_argmax={:.8e} final_out_max_abs={:.8e} final_out_argmax={} host_final_out_at_argmax={:.8e} metal_final_out_at_argmax={:.8e}",
+        "[qwen36-ffn-routed-gate-up-tap] layer={} router_path={} hidden={} top_k={} tap_second={} topk_idx_match={} topk_weight_max_abs={:.8e} topk_weight_argmax={} host_topk_weight_at_argmax={:.8e} metal_topk_weight_at_argmax={:.8e} expert_gate_max_abs={:.8e} expert_gate_argmax={} expert_up_max_abs={:.8e} expert_up_argmax={} expert_silu_max_abs={:.8e} expert_silu_argmax={} expert_mid_max_abs={:.8e} expert_mid_argmax={} expert_mid_group={} expert_mid_row={} host_expert_gate_at_mid_argmax={:.8e} metal_expert_gate_at_mid_argmax={:.8e} expert_gate_delta_at_mid_argmax={:.8e} host_expert_up_at_mid_argmax={:.8e} metal_expert_up_at_mid_argmax={:.8e} expert_up_delta_at_mid_argmax={:.8e} host_expert_silu_at_mid_argmax={:.8e} metal_expert_silu_at_mid_argmax={:.8e} expert_silu_delta_at_mid_argmax={:.8e} host_expert_mid_at_argmax={:.8e} metal_expert_mid_at_argmax={:.8e} host_expert_mid_recomputed_at_argmax={:.8e} metal_expert_mid_recomputed_at_argmax={:.8e} expert_mid_recompute_delta_at_argmax={:.8e} moe_out_max_abs={:.8e} moe_out_argmax={} host_moe_out_at_argmax={:.8e} metal_moe_out_at_argmax={:.8e} host_routed_down_acc_at_moe_argmax={:.8e} host_routed_moe_out_recomputed_at_argmax={:.8e} metal_mid_host_topk_down_acc_at_moe_argmax={:.8e} metal_mid_host_topk_moe_out_at_argmax={:.8e} metal_mid_metal_topk_down_acc_at_moe_argmax={:.8e} metal_mid_metal_topk_moe_out_at_argmax={:.8e} down_group_max_abs={:.8e} down_group_argmax={} host_down_at_group_argmax={:.8e} metal_mid_down_at_group_argmax={:.8e} topk_weight_at_down_group_argmax={:.8e} weighted_down_group_delta_at_argmax={:.8e} final_out_max_abs={:.8e} final_out_argmax={} host_final_out_at_argmax={:.8e} metal_final_out_at_argmax={:.8e}",
         layer_idx,
         router_path,
         hidden,
         top_k,
+        if silu_tap { "silu" } else { "up" },
         topk_idx_match as u8,
         topk_weight_max_abs,
         topk_weight_argmax,
         host_topk_weight_at_argmax,
         metal_topk_weight_at_argmax,
+        expert_gate_max_abs,
+        expert_gate_argmax,
+        expert_up_max_abs,
+        expert_up_argmax,
+        expert_silu_max_abs,
+        expert_silu_argmax,
         expert_mid_max_abs,
         expert_mid_argmax,
         expert_mid_group,
@@ -5741,6 +5875,12 @@ fn qwen36_emit_ffn_routed_stage5_gate_up_tap(
         metal_mid_host_topk_moe_out_at_argmax,
         metal_mid_metal_topk_down_acc_at_moe_argmax,
         metal_mid_metal_topk_moe_out_at_argmax,
+        down_group_max_abs,
+        down_group_argmax,
+        host_down_at_group_argmax,
+        metal_mid_down_at_group_argmax,
+        topk_weight_at_down_group_argmax,
+        topk_weight_at_down_group_argmax * down_group_max_abs,
         final_out_max_abs,
         final_out_argmax,
         host_final_out_at_argmax,
@@ -5930,6 +6070,9 @@ fn qwen36_emit_ffn_routed_stage5_finalize_tap(
     routed_reference: &Qwen36FfnRoutedReference,
     router_reference: &Qwen36FfnRouterReference,
 ) -> Result<(), GpuError> {
+    if !qwen36_ffn_stage5_routed_tap_enabled_for_layer(layer_idx) {
+        return Ok(());
+    }
     crate::prefill_ffi::flush_metal_batch()?;
     gpu_hal::sync(ordinal)?;
 
@@ -9748,6 +9891,7 @@ fn qwen36_try_static_topn_partial_packed_for_metal(
                         off_shared_out,
                         off_expert_mid,
                         off_moe_out,
+                        u32::MAX as usize,
                         true,
                     )
                 },
@@ -10221,6 +10365,7 @@ pub fn ffn_expert_tiled_stage5_metal_launch(
             off_shared_out,
             off_expert_mid,
             off_moe_out,
+            u32::MAX as usize,
             true,
         )
     }
@@ -10725,6 +10870,7 @@ fn ffn_step_stage1_5_metal_host(
         let residual_host_snap =
             qwen36_ffn_stage5_residual_host_snap_enabled_for_layer(params.layer_idx);
         let routed_gate_up_tap = qwen36_ffn_stage5_routed_gate_up_tap_enabled();
+        let routed_silu_tap = qwen36_ffn_stage5_routed_silu_tap_enabled();
         let routed_finalize_tap = qwen36_ffn_stage5_routed_finalize_tap_enabled();
         if shared_host_correction
             || shared_mid_host_correction
@@ -10732,6 +10878,7 @@ fn ffn_step_stage1_5_metal_host(
             || routed_down_host_recompute_correction
             || residual_host_snap
             || routed_gate_up_tap
+            || routed_silu_tap
             || routed_finalize_tap
         {
             crate::prefill_ffi::flush_metal_batch()?;
@@ -11131,6 +11278,8 @@ fn ffn_step_stage1_5_metal_host(
     let output_ordinal = output.device_ordinal();
     let workspace_tap_buf = workspace as *const GpuBuffer;
     let output_tap_buf = output as *const GpuBuffer;
+    let workspace_tap_mut_buf = workspace as *mut GpuBuffer;
+    let output_tap_mut_buf = output as *mut GpuBuffer;
     let output =
         unsafe { std::slice::from_raw_parts_mut(output.as_mut_ptr() as *mut u16, output_len) };
     let output_idx =
@@ -11647,7 +11796,9 @@ fn ffn_step_stage1_5_metal_host(
     }
     if qwen36_ffn_expert_packed_stage5_metal_native_supported(params, weights, int4) {
         let packed_stage5_reference = if qwen36_ffn_stage5_routed_gate_up_tap_enabled()
+            || qwen36_ffn_stage5_routed_silu_tap_enabled()
             || qwen36_ffn_stage5_routed_finalize_tap_enabled()
+            || qwen36_ffn_stage5_routed_host_correction_enabled()
         {
             Some(qwen36_build_ffn_stage5_reference(
                 params,
@@ -11756,6 +11907,7 @@ fn ffn_step_stage1_5_metal_host(
                             off_shared_out,
                             off_expert_mid,
                             off_moe_out,
+                            u32::MAX as usize,
                             true,
                         )
                     },
@@ -11806,6 +11958,7 @@ fn ffn_step_stage1_5_metal_host(
                                 off_shared_out,
                                 off_expert_mid,
                                 off_moe_out,
+                                u32::MAX as usize,
                                 true,
                             )
                         },
@@ -11866,13 +12019,24 @@ fn ffn_step_stage1_5_metal_host(
                         off_shared_out,
                         off_expert_mid,
                         off_moe_out,
+                        if ((qwen36_ffn_stage5_routed_gate_up_tap_enabled()
+                            || qwen36_ffn_stage5_routed_silu_tap_enabled())
+                            && qwen36_ffn_stage5_routed_tap_enabled_for_layer(params.layer_idx))
+                            || qwen36_ffn_stage5_routed_host_correction_enabled()
+                        {
+                            off_expert_gu
+                        } else {
+                            u32::MAX as usize
+                        },
                         true,
                     )
                 },
             );
             if status.is_ok() {
                 if let Some(reference) = packed_stage5_reference.as_ref() {
-                    if qwen36_ffn_stage5_routed_gate_up_tap_enabled() {
+                    if qwen36_ffn_stage5_routed_gate_up_tap_enabled()
+                        || qwen36_ffn_stage5_routed_silu_tap_enabled()
+                    {
                         qwen36_emit_ffn_routed_stage5_gate_up_tap(
                             output_ordinal,
                             params.layer_idx,
@@ -11909,6 +12073,26 @@ fn ffn_step_stage1_5_metal_host(
                             unsafe { &*workspace_tap_buf },
                             unsafe { &*output_tap_buf },
                             &reference.shared,
+                            &reference.routed,
+                            &reference.router,
+                        )?;
+                    }
+                    if qwen36_ffn_stage5_routed_host_correction_enabled() {
+                        qwen36_apply_ffn_routed_stage5_host_correction(
+                            output_ordinal,
+                            params.layer_idx,
+                            hidden,
+                            moe_intermediate,
+                            top_k,
+                            off_topk_val,
+                            off_topk_idx,
+                            off_expert_gu,
+                            off_expert_mid,
+                            off_moe_out,
+                            weights,
+                            int4,
+                            unsafe { &mut *workspace_tap_mut_buf },
+                            unsafe { &mut *output_tap_mut_buf },
                             &reference.routed,
                             &reference.router,
                         )?;
@@ -11956,6 +12140,7 @@ fn ffn_step_stage1_5_metal_host(
                             off_shared_out,
                             off_expert_mid,
                             off_moe_out,
+                            u32::MAX as usize,
                             true,
                         )
                     },
@@ -11989,6 +12174,7 @@ fn ffn_step_stage1_5_metal_host(
                     off_shared_out,
                     off_expert_mid,
                     off_moe_out,
+                    u32::MAX as usize,
                     true,
                 )
             },

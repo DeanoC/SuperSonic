@@ -193,6 +193,7 @@ unsafe extern "C" {
         off_shared_out: usize,
         off_expert_mid: usize,
         off_moe_out: usize,
+        off_expert_gu: usize,
         wait_for_completion: c_int,
     ) -> c_int;
     fn supersonic_metal_qwen36_ffn_expert_gpu_pack_gate_up_down_finalize_tiled(
@@ -1957,6 +1958,7 @@ pub(crate) unsafe fn qwen36_ffn_expert_gate_up_down_finalize_tiled(
     off_shared_out: usize,
     off_expert_mid: usize,
     off_moe_out: usize,
+    off_expert_gu: usize,
     wait_for_completion: bool,
 ) -> Result<(), GpuError> {
     if hidden == 0
@@ -1998,6 +2000,7 @@ pub(crate) unsafe fn qwen36_ffn_expert_gate_up_down_finalize_tiled(
             off_shared_out,
             off_expert_mid,
             off_moe_out,
+            off_expert_gu,
             i32::from(wait_for_completion),
         )
     };
@@ -5724,6 +5727,7 @@ pub(crate) unsafe fn qwen36_ffn_expert_gate_up_down_finalize_tiled(
     _off_shared_out: usize,
     _off_expert_mid: usize,
     _off_moe_out: usize,
+    _off_expert_gu: usize,
     _wait_for_completion: bool,
 ) -> Result<(), GpuError> {
     Err(GpuError::backend(
