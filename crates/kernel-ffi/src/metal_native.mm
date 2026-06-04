@@ -1167,7 +1167,7 @@ bool qwen36_ffn_router_stage5_fused_exact_enabled() {
 }
 
 bool qwen36_ffn_router_topk_parallel_select_enabled() {
-    return NSProcessInfo.processInfo.environment[@"SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_TOPK_PARALLEL_SELECT"] != nil;
+    return NSProcessInfo.processInfo.environment[@"SUPERSONIC_METAL_DISABLE_QWEN36_FFN_ROUTER_TOPK_PARALLEL_SELECT"] == nil;
 }
 
 bool qwen36_ffn_router_stage5_exact_multirow_enabled() {

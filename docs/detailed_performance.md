@@ -1193,8 +1193,29 @@ and for two 512-token gates:
 The matched 512-token samples measured `88.4` and `86.0 ms/token`, versus the
 same-session stable default at `92.2 ms/token`
 (`/tmp/supersonic-qwen35-raw-q4km-router-topk-default-512-fixed.log`).
-Keep the flag opt-in until it has broader prompt/model coverage, but the prior
-512-token divergence is fixed for the target raw Q4_K_M gate.
+The flag remained opt-in at that point until broader prompt/model coverage
+could confirm the fix beyond the original target prompt.
+
+A broader 2026-06-03 validation sweep then covered three 512-token prompts with
+one default control and two opt-in repeats each:
+`hello` (`1` prompt token), `code` (`25` prompt tokens), and `long_prefill`
+(`49` prompt tokens). All generated ID streams matched exactly: opt-in A,
+opt-in B, and opt-in A vs. B had no first mismatch for all three prompts.
+The sweep summary is
+`/tmp/supersonic-router-topk-sweep-20260603/summary.json`; per-run logs live
+under `/tmp/supersonic-router-topk-sweep-20260603/`. The matched timings were
+`94.2` default vs `90.1`/`92.9 ms/token` for `hello`, `88.6` default vs
+`88.6`/`88.6` for `code`, and `91.1` default vs `89.2`/`89.7` for
+`long_prefill`. With that coverage in place, the block-scan top-k selector is
+promoted to default and the serial scan remains available with
+`SUPERSONIC_METAL_DISABLE_QWEN36_FFN_ROUTER_TOPK_PARALLEL_SELECT=1`.
+The post-promotion 512-token `hello` gate matched the disable-flag serial scan
+exactly. The first promoted-default timing sample was noisy at `96.3 ms/token`
+(`/tmp/supersonic-router-topk-promoted-default-512.log`), but the immediate
+repeat landed at `90.1 ms/token`
+(`/tmp/supersonic-router-topk-promoted-default-512-repeat.log`) against the
+serial-disable comparison at `90.5 ms/token`
+(`/tmp/supersonic-router-topk-promoted-disable-512.log`).
 
 A current-tree 2026-06-02 rerun after the online-attention rebuild kept the raw
 default 32-token stream unchanged:
