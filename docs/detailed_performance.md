@@ -1537,6 +1537,16 @@ identified the next safe work area:
   pointed at a larger FFN residency/submit-wait redesign rather than another
   phase-commit cadence tweak
   (`/tmp/supersonic-{ffn-commit-interval-4-128,ffn-commit-interval-8-128,ffn-commit-interval-9999-128,ffn-commit-9999-repeat-128,decode-batch-sync-phases-128,linear-commit-interval-8-128,linear-commit-interval-9999-128,linear8-ffn9999-512,linear8-ffn9999-repeat-512,decode-batch-default-repeat-512}.log`).
+  A follow-up generic Metal-batch barrier probe also matched generated streams
+  but was slower. Temporarily skipping the helper-level post-encode
+  `memoryBarrierWithScope:MTLBarrierScopeBuffers` preserved the 8-token prefix
+  and the full 128-token stream, but the 128-token control was faster
+  (`88.1 ms/token`, `ffn=64.182`) than the skip variant (`92.2 ms/token`,
+  `ffn=66.129`). Keep the helper-level barrier in place; if submit/wait is
+  revisited, target a more explicit resident FFN representation or a staged
+  command-buffer design rather than removing generic hazard ordering
+  (`/tmp/supersonic-skip-post-encode-barrier-{smoke-8,smoke-repeat-8,128}.log`,
+  `/tmp/supersonic-post-encode-barrier-default-control-{8,128}.log`).
   Rechecking the MLX-shaped gathered expert-down path in the same tree also
   tied the default rather than improving it: three 128-token pairs measured
   equal medians of `64.3 ms/token`, with pairwise generated streams matching in
