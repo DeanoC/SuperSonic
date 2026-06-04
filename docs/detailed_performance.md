@@ -1442,6 +1442,40 @@ per-phase commit ordering for overlap. For the diagnostic fused-exact router,
 the stream-safe FFN commit cadence is useful evidence that the drift is a
 scheduling/resource-ordering problem, but it is not a performance promotion.
 
+The 2026-06-04 follow-up tested a narrower router-logits consolidation shape:
+a temporary 2-expert exact-pair kernel kept one simdgroup per expert and the
+same lane-0 32-column accumulation order as
+`qwen36_ffn_int4_router_logits_stage5_exact_simd`, but packed two experts into
+each threadgroup to reduce threadgroup count without using the previously
+rejected 8-expert multirow shape. It was parity-clean but slower, so the code
+was removed rather than kept as another startup-time pipeline. The 8-token
+smoke preserved the known prefix
+(`/tmp/supersonic-router-logits-exact-pair-smoke-8.log`). A 16-token split
+profile preserved the generated IDs but moved router logits from the current
+default `62.574 ms` total (`0.098 ms/call`) to `72.777 ms` total
+(`0.114 ms/call`) across 640 calls
+(`/tmp/supersonic-router-logits-exact-pair-profile-16.log`). A normal-lane
+128-token A/B also matched the default stream exactly, but slowed from
+`97.8 ms/token` (`ffn=70.213 ms/token`) to `100.2 ms/token`
+(`ffn=72.061 ms/token`)
+(`/tmp/supersonic-router-logits-exact-pair-ab-{default,pair}-128.log`). This
+rules out small exact-multirow router-logits packing as the next promotion
+target; the next FFN target should either avoid changing router-logit work
+ordering entirely or move to a different bucket such as shared-scalar
+scheduling or expert-down accumulation.
+
+A same-day `SUPERSONIC_METAL_PROFILE=1` default diagnostic
+(`/tmp/supersonic-current-default-metal-profile-128.log`) should be treated as
+timing-only because profiling changed the generated stream at token 9. It
+measured `90.1 ms/token`, with `ffn=65.348 ms/token`, full attention
+`8.834 ms/token`, linear attention `12.243 ms/token`, and lm-head
+`3.314 ms/token`. The top profile rows were
+`qwen36_ffn_int4_stage5_with_router` at `8196.516 ms`,
+`command_buffer_wait` at `7437.951 ms`, aggregate `command_buffer_gpu` at
+`3984.655 ms`, and labeled FFN command-buffer GPU time at `2949.334 ms` over
+5120 FFN calls. This keeps the next target in FFN scheduling/command-buffer
+structure rather than another local router-logits packing kernel.
+
 Follow-up optimization probes on 2026-06-01 kept the headline unchanged but
 identified the next safe work area:
 
