@@ -2479,21 +2479,31 @@ timings, expert-residency totals, and per-policy rows in
 `target/qwen36_static_topn_runtime_sweep.{json,md}`. With `--metal-profile`
 it also preserves parsed `metal_profile` and `hal_profile` objects per row and
 renders the top Metal/HAL attribution in Markdown, which makes the comparison
-prompt set usable as a profiling gate rather than a Hello-only smoke. The v3
-schema adds a nonfatal `promotion_gate`: a resident mode must preserve
+prompt set usable as a profiling gate rather than a Hello-only smoke. The v5
+schema keeps the nonfatal `promotion_gate`: a resident mode must preserve
 generated IDs versus `default`, improve headline ms/token and `ffn_ms_avg`,
 keep full-attention, linear-attention, and lm-head inside the configured
 regression ratio, and include non-regressed `command_buffer_wait` profile
-evidence unless `--no-promotion-require-profile` is used.
-The first four-token smoke preserved `[11, 353, 599, 264]` across all three
-modes but ruled out promotion: default measured `decode_ms=702` and
-`ffn_ms_avg=98.761`, static measured `decode_ms=951`, `ffn_ms_avg=177.563`,
-`exact_hits=10/160`, `slot_hit_rate=0.508594`, and `copied_bytes=980372736`,
-and static+hotset measured `decode_ms=1450`, `ffn_ms_avg=262.215`, and
-`copied_bytes=2234557440`. The native static table is useful as a measured
-residency scaffold, but Qwen3.6 Metal should next target either a dense
-resident MPS/MPP table that can serve partial hits cheaply, or return to the
-prefill/orchestration buckets already shown to dominate long-context runs.
+evidence unless `--no-promotion-require-profile` is used. It also adds a
+separate `experimental_family_parity` block for packed/static-family modes.
+That section is diagnostic only: it can confirm that residency variants still
+match the packed-family stream, but it cannot promote a mode unless the normal
+default-based gate also passes.
+The first four-token static smoke established a packed/static-family stream of
+`[11, 353, 599, 264]` and ruled out latency promotion: the default-row baseline
+in that run measured `decode_ms=702` and `ffn_ms_avg=98.761`, static measured
+`decode_ms=951`, `ffn_ms_avg=177.563`, `exact_hits=10/160`,
+`slot_hit_rate=0.508594`, and `copied_bytes=980372736`, and static+hotset
+measured `decode_ms=1450`, `ffn_ms_avg=262.215`, and
+`copied_bytes=2234557440`. Later divergence work showed that the packed,
+direct-gather, static, and static-partial FFN family currently follows
+`[11, 353, 599, 264]`, while the default/full-native path follows
+`[11, 271, 40, 599]`. Treat the packed-family stream as experimental residency
+coverage only until the standalone routed-expert arithmetic drift is fixed.
+The v5 validation smoke in `target/qwen36_static_topn_family_parity4.{json,md}`
+records that split explicitly: `generated_ids_match=false`,
+`experimental_family_generated_ids_match=true`, and
+`promotion_gate_passed=false` for `default,packed,static,static-partial`.
 
 The native partial-hit static Top-N follow-up is opt-in behind
 `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_STATIC_TOPN_PARTIAL=1`. It uses the
@@ -2589,8 +2599,9 @@ generated id `[11]`, but reported `decode_ms=6324`, `ffn_ms_avg=6073.323`,
 MPS bridge itself was `365.052 ms` across 40 layer calls, while
 `qwen36_ffn_int4_expert_mps_static_topn_pack_f16_lut` took `5630.663 ms` on
 the host and HAL `copy_h2d` accounted for `4481.851 ms` / `17886298368` bytes.
-The warm four-token sweep preserved `[11, 353, 599, 264]`, but measured
-`default` at `decode_ms=702`, `ffn_ms_avg=94.930` versus
+The warm four-token sweep preserved the packed-family stream
+`[11, 353, 599, 264]`, but measured the default-row baseline at
+`decode_ms=702`, `ffn_ms_avg=94.930` versus
 `mps-static-partial` at `decode_ms=7839`, `ffn_ms_avg=1845.066`,
 `slot_hit_rate=0.507812`, and `copied_gib=14.672`. This confirms the prototype
 as a correctness/profiling harness only: the RHS materialization and
@@ -2602,8 +2613,9 @@ packed expert path. It allocates compact per-layer scratch once, copies the
 current top-k expert slabs from the original baked Metal buffers in the FFN
 command buffer, remaps `topk_idx` to compact group IDs, then runs the existing
 packed gate/up and down/finalize shader. The four-token Apple M5 Max smoke
-preserved `[11, 353, 599, 264]`, so the remap and packed shader parity are good,
-but it measured `777.3 ms/token`, `ffn_ms_avg=641.772`, and
+preserved the packed-family stream `[11, 353, 599, 264]`, so the remap and
+packed shader agree with the experimental packed path, but it measured
+`777.3 ms/token`, `ffn_ms_avg=641.772`, and
 `qwen36_ffn_int4_expert_gpu_pack_stage5=2417.156 ms` across 160 layer calls.
 The command-buffer GPU attribution for the fused pack+expert shader was only
 `64.400 ms`, while `command_buffer_wait` was `2678.881 ms`; moving slab
@@ -2614,18 +2626,21 @@ The direct-gather follow-up is opt-in behind
 `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_DIRECT_GATHER_STAGE5=1`. It keeps
 the original top-k expert IDs, reads the baked expert buffers directly, and uses
 a 256-thread tiled down/finalize kernel so the down projection has the same
-wide reduction shape as gate/up. It also preserved `[11, 353, 599, 264]`, but
-the unprofiled four-token smoke measured `308.8 ms/token` with
+wide reduction shape as gate/up. It also preserved the packed-family stream
+`[11, 353, 599, 264]`, but the unprofiled four-token smoke measured
+`308.8 ms/token` with
 `ffn_ms_avg=249.990`; the profiled run measured `756.8 ms/token`,
 `ffn_ms_avg=616.225`, and
 `qwen36_ffn_int4_expert_direct_gather_stage5=2318.450 ms` across 160 layer
 calls, while the command-buffer GPU attribution for the direct gather command
 was only `55.965 ms`. That confirms the direct original-buffer gather is still
-wait/residency dominated on this model. The useful next FFN direction is an
-explicit resident representation that avoids per-token active-slab rebuilds and
-avoids random giant-buffer gathers. The native INT4 static top-N probe now
-covers the narrow static-table branch; MPS/MPP remains the next heavier
-resident-matvec option if static full-hit rates are not high enough.
+wait/residency dominated on this model. Current divergence taps put the first
+packed/default checksum split in layer 33 FFN on token 1, with shared output and
+top-k routing matching but routed-expert arithmetic drifting before the final
+add. The useful next FFN direction is therefore two-track: keep packed/static
+residency experiments behind the diagnostic family-parity report, and fix
+standalone routed-expert parity against the default/full-native path before any
+packed-family optimization can graduate.
 
 The fused routed INT4 variants are now covered by a promotion-gated runtime
 sweep rather than only one-off smoke notes:

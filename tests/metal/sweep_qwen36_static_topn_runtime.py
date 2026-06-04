@@ -15,7 +15,7 @@ from typing import Any
 
 
 MODEL = "qwen3.6-35b-a3b"
-SCHEMA = "qwen36-static-topn-runtime-sweep-v4"
+SCHEMA = "qwen36-static-topn-runtime-sweep-v5"
 
 PROMPT_SETS: dict[str, list[tuple[str, str]]] = {
     "smoke": [
@@ -51,6 +51,15 @@ MODE_ALIASES: dict[str, str] = {
     "static-mps-partial-prewarm": "mps-static-partial-prewarm",
 }
 DEFAULT_MODES = "default,static,static-partial,static-hotset,mps-static-partial"
+EXPERIMENTAL_FAMILY_MODES = {
+    "packed",
+    "hotset",
+    "static",
+    "static-partial",
+    "static-hotset",
+    "mps-static-partial",
+    "mps-static-partial-prewarm",
+}
 
 
 def parse_key_values(line: str) -> dict[str, str]:
@@ -588,9 +597,84 @@ def build_promotion_gate(
     }
 
 
+def build_experimental_family_parity(
+    rows: list[dict[str, Any]],
+    modes: list[str],
+    requested_reference_mode: str = "packed",
+) -> dict[str, Any]:
+    prompt_ids: list[str] = []
+    for row in rows:
+        prompt_id = str(row.get("prompt_id", ""))
+        if prompt_id and prompt_id not in prompt_ids:
+            prompt_ids.append(prompt_id)
+    family_modes = [mode for mode in modes if mode in EXPERIMENTAL_FAMILY_MODES]
+    rows_by_key = {
+        (str(row.get("prompt_id", "")), row.get("mode")): row
+        for row in rows
+    }
+    mismatches: list[dict[str, Any]] = []
+    prompt_summaries: list[dict[str, Any]] = []
+    for prompt_id in prompt_ids:
+        prompt_rows = [
+            rows_by_key[(prompt_id, mode)]
+            for mode in family_modes
+            if (prompt_id, mode) in rows_by_key
+            and rows_by_key[(prompt_id, mode)].get("status") == "ok"
+        ]
+        if not prompt_rows:
+            continue
+        reference = rows_by_key.get((prompt_id, requested_reference_mode))
+        if reference is None or reference.get("status") != "ok":
+            reference = prompt_rows[0]
+        reference_mode = str(reference.get("mode") or "")
+        reference_ids = reference.get("generated_ids") or []
+        compared: list[dict[str, Any]] = []
+        prompt_mismatches: list[dict[str, Any]] = []
+        for row in prompt_rows:
+            generated_ids = row.get("generated_ids") or []
+            matched = generated_ids == reference_ids
+            compared.append(
+                {
+                    "mode": row.get("mode"),
+                    "generated_ids": generated_ids,
+                    "match": matched,
+                }
+            )
+            if not matched:
+                mismatch = {
+                    "prompt_id": prompt_id,
+                    "mode": row.get("mode"),
+                    "reference_mode": reference_mode,
+                    "reference_generated_ids": reference_ids,
+                    "generated_ids": generated_ids,
+                }
+                prompt_mismatches.append(mismatch)
+                mismatches.append(mismatch)
+        prompt_summaries.append(
+            {
+                "prompt_id": prompt_id,
+                "reference_mode": reference_mode,
+                "reference_generated_ids": reference_ids,
+                "modes": [str(row.get("mode") or "") for row in prompt_rows],
+                "generated_ids_match": not prompt_mismatches,
+                "comparisons": compared,
+            }
+        )
+    return {
+        "enabled": bool(family_modes),
+        "reference_mode_requested": requested_reference_mode,
+        "modes": family_modes,
+        "generated_ids_match": not mismatches,
+        "generated_id_mismatches": mismatches,
+        "prompt_summaries": prompt_summaries,
+        "diagnostic_only": True,
+    }
+
+
 def summarize_with_gate(
     rows: list[dict[str, Any]],
     modes: list[str],
+    experimental_family_reference_mode: str = "packed",
     max_headline_ratio: float = 0.999,
     max_ffn_ratio: float = 0.999,
     max_component_regression_ratio: float = 1.10,
@@ -606,6 +690,11 @@ def summarize_with_gate(
         max_component_regression_ratio,
         max_command_buffer_wait_ratio,
         require_profile,
+    )
+    summary["experimental_family_parity"] = build_experimental_family_parity(
+        rows,
+        modes,
+        experimental_family_reference_mode,
     )
     return summary
 
@@ -626,6 +715,7 @@ def build_report(
         "static_table_json": str(args.static_table_json),
         "static_capacity": args.static_capacity,
         "hotset_capacity": args.hotset_capacity,
+        "experimental_family_reference_mode": args.experimental_family_reference_mode,
         "promotion_thresholds": {
             "max_headline_ratio": args.promotion_max_headline_ratio,
             "max_ffn_ratio": args.promotion_max_ffn_ratio,
@@ -636,6 +726,7 @@ def build_report(
         "summary": summarize_with_gate(
             rows,
             modes,
+            args.experimental_family_reference_mode,
             args.promotion_max_headline_ratio,
             args.promotion_max_ffn_ratio,
             args.promotion_max_component_regression_ratio,
@@ -665,6 +756,7 @@ def top_profile_op(profile: dict[str, Any] | None) -> dict[str, Any]:
 def render_markdown(report: dict[str, Any]) -> str:
     summary = report["summary"]
     promotion_gate = summary.get("promotion_gate") or {}
+    family = summary.get("experimental_family_parity") or {}
     lines = [
         "# Qwen3.6 Static Top-N Runtime Sweep",
         "",
@@ -672,6 +764,7 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- modes: `{','.join(report['modes'])}`",
         f"- max_new_tokens: `{report['max_new_tokens']}`",
         f"- generated_ids_match: `{summary['generated_ids_match']}`",
+        f"- experimental_family_generated_ids_match: `{family.get('generated_ids_match', True)}`",
         f"- promotion_gate_passed: `{promotion_gate.get('passed', False)}`",
         f"- promotion_gate_passed_modes: `{','.join(promotion_gate.get('passed_modes') or []) or '-'}`",
         "",
@@ -712,6 +805,36 @@ def render_markdown(report: dict[str, Any]) -> str:
             "Rows are separate process runs. Static modes measure within-run warm reuse across generated tokens; the first token still pays resident-table allocation on full-hit layers unless the mode explicitly prewarms the resident table during setup.",
         ]
     )
+    family_prompts = family.get("prompt_summaries") or []
+    if family_prompts:
+        lines.extend(
+            [
+                "",
+                "## Experimental Family Parity",
+                "",
+                "This section is diagnostic only. It compares packed/static-family modes against the requested family reference and does not affect the default-based promotion gate.",
+                "",
+                "| Prompt | Reference mode | Reference IDs | Compared modes | Mismatches |",
+                "|:---|:---|:---|:---|:---|",
+            ]
+        )
+        for prompt in family_prompts:
+            mismatched_modes = [
+                str(item.get("mode"))
+                for item in prompt.get("comparisons") or []
+                if not item.get("match")
+            ]
+            lines.append(
+                "| {prompt_id} | {reference_mode} | {reference_ids} | {modes} | {mismatches} |".format(
+                    prompt_id=prompt.get("prompt_id"),
+                    reference_mode=prompt.get("reference_mode"),
+                    reference_ids=",".join(
+                        str(item) for item in prompt.get("reference_generated_ids", [])
+                    ),
+                    modes=",".join(str(item) for item in prompt.get("modes", [])),
+                    mismatches=",".join(mismatched_modes) or "-",
+                )
+            )
     candidates = promotion_gate.get("candidates") or []
     if candidates:
         lines.extend(
@@ -754,6 +877,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--static-capacity", type=int)
     parser.add_argument("--hotset-capacity", type=int, default=64)
     parser.add_argument("--metal-profile", action="store_true")
+    parser.add_argument(
+        "--experimental-family-reference-mode",
+        choices=sorted(EXPERIMENTAL_FAMILY_MODES),
+        default="packed",
+        help="reference mode for diagnostic packed/static-family parity reporting",
+    )
     parser.add_argument(
         "--promotion-max-headline-ratio",
         type=float,

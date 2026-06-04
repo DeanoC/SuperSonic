@@ -4412,6 +4412,13 @@ struct Qwen36FfnRoutedReference {
     final_out: Vec<f32>,
 }
 
+#[derive(Debug, Clone)]
+struct Qwen36FfnStage5Reference {
+    router: Qwen36FfnRouterReference,
+    shared: Qwen36FfnSharedReference,
+    routed: Qwen36FfnRoutedReference,
+}
+
 fn qwen36_compute_ffn_router_reference(
     input: &[u16],
     norm_w: &[u16],
@@ -4688,6 +4695,79 @@ fn qwen36_compute_ffn_routed_reference(
         expert_mid,
         moe_out,
         final_out,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qwen36_build_ffn_stage5_reference(
+    params: Qwen36MoeFfnStepParams,
+    weights: &Qwen36MoeFfnStepWeights,
+    int4: &Qwen36MoeFfnStepInt4,
+    hidden: usize,
+    num_experts: usize,
+    moe_intermediate: usize,
+    shared_intermediate: usize,
+    top_k: usize,
+) -> Qwen36FfnStage5Reference {
+    let input = unsafe { std::slice::from_raw_parts(weights.input_hidden as *const u16, hidden) };
+    let norm_w =
+        unsafe { std::slice::from_raw_parts(weights.post_attn_norm_w as *const u16, hidden) };
+    let gate_w =
+        unsafe { std::slice::from_raw_parts(weights.gate_w as *const u16, num_experts * hidden) };
+    let shared_expert_gate_w =
+        unsafe { std::slice::from_raw_parts(weights.shared_expert_gate_w as *const u16, hidden) };
+    let group_size = int4.group_size.max(0) as usize;
+
+    let router = qwen36_compute_ffn_router_reference(
+        input,
+        norm_w,
+        gate_w,
+        hidden,
+        num_experts,
+        top_k,
+        params.rms_norm_eps,
+    );
+    let shared = qwen36_compute_ffn_shared_reference(
+        &router.h_norm,
+        shared_expert_gate_w,
+        weights.shared_gate_proj_w as usize,
+        int4.shared_gate_proj_type,
+        int4.shared_gate_proj_scale as usize,
+        int4.shared_gate_proj_zero as usize,
+        weights.shared_up_proj_w as usize,
+        int4.shared_up_proj_type,
+        int4.shared_up_proj_scale as usize,
+        int4.shared_up_proj_zero as usize,
+        weights.shared_down_proj_w as usize,
+        int4.shared_down_proj_type,
+        int4.shared_down_proj_scale as usize,
+        int4.shared_down_proj_zero as usize,
+        hidden,
+        shared_intermediate,
+        group_size,
+    );
+    let routed = qwen36_compute_ffn_routed_reference(
+        input,
+        &router.h_norm,
+        &shared.shared_out,
+        &router.topk_idx,
+        &router.topk_weight,
+        weights.gate_up_proj_w as usize,
+        int4.gate_up_proj_scale as usize,
+        int4.gate_up_proj_zero as usize,
+        weights.down_proj_w as usize,
+        int4.down_proj_scale as usize,
+        int4.down_proj_zero as usize,
+        hidden,
+        moe_intermediate,
+        top_k,
+        group_size,
+    );
+
+    Qwen36FfnStage5Reference {
+        router,
+        shared,
+        routed,
     }
 }
 
@@ -11049,6 +11129,8 @@ fn ffn_step_stage1_5_metal_host(
     let workspace_ptr = workspace.as_mut_ptr();
     let output_ptr = output.as_mut_ptr();
     let output_ordinal = output.device_ordinal();
+    let workspace_tap_buf = workspace as *const GpuBuffer;
+    let output_tap_buf = output as *const GpuBuffer;
     let output =
         unsafe { std::slice::from_raw_parts_mut(output.as_mut_ptr() as *mut u16, output_len) };
     let output_idx =
@@ -11564,6 +11646,22 @@ fn ffn_step_stage1_5_metal_host(
         return Ok(());
     }
     if qwen36_ffn_expert_packed_stage5_metal_native_supported(params, weights, int4) {
+        let packed_stage5_reference = if qwen36_ffn_stage5_routed_gate_up_tap_enabled()
+            || qwen36_ffn_stage5_routed_finalize_tap_enabled()
+        {
+            Some(qwen36_build_ffn_stage5_reference(
+                params,
+                weights,
+                int4,
+                hidden,
+                num_experts,
+                moe_intermediate,
+                shared_intermediate,
+                top_k,
+            ))
+        } else {
+            None
+        };
         if qwen36_ffn_expert_gpu_pack_stage5_metal_native_supported(params, weights, int4) {
             qwen36_with_gpu_pack_buffers_for_metal(
                 output_ordinal,
@@ -11744,7 +11842,7 @@ fn ffn_step_stage1_5_metal_host(
                     )
                 },
             )?;
-            crate::prefill_ffi::metal_profile_time(
+            let status = crate::prefill_ffi::metal_profile_time(
                 "qwen36_ffn_int4_expert_packed_stage5",
                 "native",
                 || unsafe {
@@ -11771,7 +11869,53 @@ fn ffn_step_stage1_5_metal_host(
                         true,
                     )
                 },
-            )?;
+            );
+            if status.is_ok() {
+                if let Some(reference) = packed_stage5_reference.as_ref() {
+                    if qwen36_ffn_stage5_routed_gate_up_tap_enabled() {
+                        qwen36_emit_ffn_routed_stage5_gate_up_tap(
+                            output_ordinal,
+                            params.layer_idx,
+                            hidden,
+                            moe_intermediate,
+                            top_k,
+                            off_topk_val,
+                            off_topk_idx,
+                            off_expert_gu,
+                            off_expert_mid,
+                            off_moe_out,
+                            weights,
+                            int4,
+                            unsafe { &*workspace_tap_buf },
+                            unsafe { &*output_tap_buf },
+                            &reference.routed,
+                            &reference.router,
+                        )?;
+                    }
+                    if qwen36_ffn_stage5_routed_finalize_tap_enabled() {
+                        qwen36_emit_ffn_routed_stage5_finalize_tap(
+                            output_ordinal,
+                            params.layer_idx,
+                            hidden,
+                            moe_intermediate,
+                            top_k,
+                            off_topk_val,
+                            off_topk_idx,
+                            off_shared_out,
+                            off_expert_mid,
+                            off_moe_out,
+                            weights,
+                            int4,
+                            unsafe { &*workspace_tap_buf },
+                            unsafe { &*output_tap_buf },
+                            &reference.shared,
+                            &reference.routed,
+                            &reference.router,
+                        )?;
+                    }
+                }
+            }
+            status?;
             return Ok(());
         }
         qwen36_with_cached_packed_experts_for_metal(
