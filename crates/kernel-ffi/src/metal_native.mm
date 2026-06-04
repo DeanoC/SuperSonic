@@ -17117,6 +17117,7 @@ extern "C" int supersonic_metal_qwen36_ffn_int4_stage5_with_router(
             !expert_down_topk_parallel && !expert_down_multirow_topk_parallel &&
             !expert_down_rowpair_topk_parallel &&
             qwen36_ffn_expert_down_gathered_enabled();
+        bool expert_down_host_order = qwen36_ffn_expert_down_host_order_enabled();
         bool raw_ggml_experts =
             static_cast<uint32_t>(gate_up_proj_type) != QWEN36_LOWBIT_NATIVE_INT4 ||
             static_cast<uint32_t>(down_proj_type) != QWEN36_LOWBIT_NATIVE_INT4;
@@ -17182,7 +17183,8 @@ extern "C" int supersonic_metal_qwen36_ffn_int4_stage5_with_router(
             (shared_scalar_simd && pipelines.shared_scalar_simd == nil) ||
             (shared_down_exact_simd && pipelines.shared_down_exact_simd == nil) ||
             (shared_down_tiled && pipelines.shared_down_tiled == nil) ||
-            (expert_gate_up_host_order && pipelines.expert_gate_up_host_order == nil)) {
+            (expert_gate_up_host_order && pipelines.expert_gate_up_host_order == nil) ||
+            (expert_down_host_order && pipelines.expert_down_finalize_host_order == nil)) {
             return 1393;
         }
 
@@ -17484,15 +17486,17 @@ extern "C" int supersonic_metal_qwen36_ffn_int4_stage5_with_router(
                         threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
                 return;
             }
-            [encoder setComputePipelineState:expert_down_multirow_topk_parallel
-                ? pipelines.expert_down_finalize_multirow_topk_parallel
-                : (expert_down_topk_parallel
-                    ? pipelines.expert_down_finalize_topk_parallel
-                    : (expert_down_rowpair_topk_parallel
-                        ? pipelines.expert_down_finalize_rowpair_topk_parallel
-                        : (raw_ggml_experts
-                            ? pipelines.expert_down_finalize_multirow
-                            : pipelines.expert_down_finalize)))];
+            [encoder setComputePipelineState:expert_down_host_order
+                ? pipelines.expert_down_finalize_host_order
+                : (expert_down_multirow_topk_parallel
+                    ? pipelines.expert_down_finalize_multirow_topk_parallel
+                    : (expert_down_topk_parallel
+                        ? pipelines.expert_down_finalize_topk_parallel
+                        : (expert_down_rowpair_topk_parallel
+                            ? pipelines.expert_down_finalize_rowpair_topk_parallel
+                            : (raw_ggml_experts
+                                ? pipelines.expert_down_finalize_multirow
+                                : pipelines.expert_down_finalize))))];
             [encoder setBuffer:workspace offset:workspace_offset atIndex:0];
             [encoder setBuffer:input_hidden offset:input_hidden_offset atIndex:1];
             [encoder setBuffer:down_proj offset:down_proj_offset atIndex:2];
@@ -17500,21 +17504,25 @@ extern "C" int supersonic_metal_qwen36_ffn_int4_stage5_with_router(
             [encoder setBuffer:down_zero offset:down_zero_offset atIndex:4];
             [encoder setBuffer:output offset:output_offset atIndex:5];
             [encoder setBytes:&params length:sizeof(params) atIndex:6];
-            if (expert_down_multirow_topk_parallel) {
+            if (!expert_down_host_order && expert_down_multirow_topk_parallel) {
                 [encoder setThreadgroupMemoryLength:2 * top_k * sizeof(float) atIndex:0];
-            } else if (expert_down_topk_parallel) {
+            } else if (!expert_down_host_order && expert_down_topk_parallel) {
                 [encoder setThreadgroupMemoryLength:top_k * sizeof(float) atIndex:0];
-            } else if (expert_down_rowpair_topk_parallel) {
+            } else if (!expert_down_host_order && expert_down_rowpair_topk_parallel) {
                 [encoder setThreadgroupMemoryLength:2 * top_k * sizeof(float) atIndex:0];
             }
-            [encoder dispatchThreadgroups:MTLSizeMake(expert_down_multirow_topk_parallel
-                        ? ((hidden + 1) / 2)
-                        : (expert_down_topk_parallel
-                            ? hidden
-                            : (expert_down_rowpair_topk_parallel
-                                ? ((hidden + 1) / 2)
-                                : (raw_ggml_experts ? ((hidden + 7) / 8) : hidden))), 1, 1)
-                    threadsPerThreadgroup:MTLSizeMake(expert_down_rowpair_topk_parallel ? 512 : ((raw_ggml_experts || expert_down_topk_parallel || expert_down_multirow_topk_parallel) ? 256 : 32), 1, 1)];
+            [encoder dispatchThreadgroups:MTLSizeMake(expert_down_host_order
+                        ? hidden
+                        : (expert_down_multirow_topk_parallel
+                            ? ((hidden + 1) / 2)
+                            : (expert_down_topk_parallel
+                                ? hidden
+                                : (expert_down_rowpair_topk_parallel
+                                    ? ((hidden + 1) / 2)
+                                    : (raw_ggml_experts ? ((hidden + 7) / 8) : hidden)))), 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(expert_down_host_order
+                        ? 1
+                        : (expert_down_rowpair_topk_parallel ? 512 : ((raw_ggml_experts || expert_down_topk_parallel || expert_down_multirow_topk_parallel) ? 256 : 32)), 1, 1)];
         };
         auto encode_expert_down_rowpair_compare = [&](id<MTLComputeCommandEncoder> encoder) {
             [encoder setComputePipelineState:pipelines.expert_down_rowpair_compare_multirow];
@@ -17659,7 +17667,7 @@ extern "C" int supersonic_metal_qwen36_ffn_int4_stage5_with_router(
                     expert_down_rowpair_compare_call_index
                 );
             }
-            const std::string expert_down_label = qwen36_ffn_expert_down_host_order_enabled()
+            const std::string expert_down_label = expert_down_host_order
                 ? "qwen36_ffn_int4_expert_down_finalize_host_order_stage5"
                 : (expert_down_multirow_topk_parallel
                     ? "qwen36_ffn_int4_expert_down_finalize_multirow_topk_parallel"
