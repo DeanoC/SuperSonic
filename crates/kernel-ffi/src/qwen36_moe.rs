@@ -7313,6 +7313,8 @@ fn qwen36_ffn_expert_direct_gather_stage5_metal_native_supported(
         && !weights.input_hidden.is_null()
         && !weights.gate_up_proj_w.is_null()
         && !weights.down_proj_w.is_null()
+        && qwen36_lowbit_native_int4(int4.gate_up_proj_type)
+        && qwen36_lowbit_native_int4(int4.down_proj_type)
         && !int4.gate_up_proj_scale.is_null()
         && !int4.gate_up_proj_zero.is_null()
         && !int4.down_proj_scale.is_null()
@@ -7401,6 +7403,8 @@ fn qwen36_ffn_expert_static_topn_partial_stage5_supported(
         && !weights.input_hidden.is_null()
         && !weights.gate_up_proj_w.is_null()
         && !weights.down_proj_w.is_null()
+        && qwen36_lowbit_native_int4(int4.gate_up_proj_type)
+        && qwen36_lowbit_native_int4(int4.down_proj_type)
         && !int4.gate_up_proj_scale.is_null()
         && !int4.gate_up_proj_zero.is_null()
         && !int4.down_proj_scale.is_null()
@@ -14628,6 +14632,81 @@ mod tests {
     fn qwen36_packed_expert_copy_bytes_matches_stage5_geometry() {
         let bytes = qwen36_packed_expert_copy_bytes(2048, 512, 8, 128);
         assert_eq!(bytes, 12_589_056);
+    }
+
+    #[test]
+    fn qwen36_static_topn_partial_requires_native_int4_layout() {
+        const ENV: &str = "SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_STATIC_TOPN_PARTIAL";
+        struct EnvRestore {
+            name: &'static str,
+            value: Option<std::ffi::OsString>,
+        }
+        impl Drop for EnvRestore {
+            fn drop(&mut self) {
+                unsafe {
+                    match &self.value {
+                        Some(value) => std::env::set_var(self.name, value),
+                        None => std::env::remove_var(self.name),
+                    }
+                }
+            }
+        }
+
+        let _restore = EnvRestore {
+            name: ENV,
+            value: std::env::var_os(ENV),
+        };
+        unsafe {
+            std::env::set_var(ENV, "1");
+        }
+
+        let ptr = 1usize as *const c_void;
+        let params = Qwen36MoeFfnStepParams {
+            stage: 5,
+            layer_idx: 0,
+            hidden: 2048,
+            num_experts: 256,
+            moe_intermediate: 512,
+            shared_intermediate: 0,
+            top_k: 8,
+            rms_norm_eps: 0.0,
+        };
+        let weights = Qwen36MoeFfnStepWeights {
+            input_hidden: ptr,
+            post_attn_norm_w: std::ptr::null(),
+            gate_w: std::ptr::null(),
+            gate_up_proj_w: ptr,
+            down_proj_w: ptr,
+            shared_gate_proj_w: std::ptr::null(),
+            shared_up_proj_w: std::ptr::null(),
+            shared_down_proj_w: std::ptr::null(),
+            shared_expert_gate_w: std::ptr::null(),
+        };
+        let mut int4 = Qwen36MoeFfnStepInt4 {
+            group_size: 128,
+            gate_up_proj_type: 4,
+            gate_up_proj_scale: ptr,
+            gate_up_proj_zero: ptr,
+            down_proj_type: 4,
+            down_proj_scale: ptr,
+            down_proj_zero: ptr,
+            ..Qwen36MoeFfnStepInt4::disabled()
+        };
+
+        assert!(qwen36_ffn_expert_static_topn_partial_stage5_supported(
+            params, &weights, &int4
+        ));
+
+        int4.gate_up_proj_type = 12;
+        assert!(!qwen36_ffn_expert_static_topn_partial_stage5_supported(
+            params, &weights, &int4
+        ));
+
+        int4.gate_up_proj_type = 4;
+        int4.down_proj_type = 13;
+        assert!(!qwen36_ffn_expert_static_topn_partial_stage5_supported(
+            params, &weights, &int4
+        ));
     }
 
     #[test]
