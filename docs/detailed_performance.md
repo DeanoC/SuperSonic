@@ -1442,6 +1442,40 @@ per-phase commit ordering for overlap. For the diagnostic fused-exact router,
 the stream-safe FFN commit cadence is useful evidence that the drift is a
 scheduling/resource-ordering problem, but it is not a performance promotion.
 
+The 2026-06-04 follow-up tested a narrower router-logits consolidation shape:
+a temporary 2-expert exact-pair kernel kept one simdgroup per expert and the
+same lane-0 32-column accumulation order as
+`qwen36_ffn_int4_router_logits_stage5_exact_simd`, but packed two experts into
+each threadgroup to reduce threadgroup count without using the previously
+rejected 8-expert multirow shape. It was parity-clean but slower, so the code
+was removed rather than kept as another startup-time pipeline. The 8-token
+smoke preserved the known prefix
+(`/tmp/supersonic-router-logits-exact-pair-smoke-8.log`). A 16-token split
+profile preserved the generated IDs but moved router logits from the current
+default `62.574 ms` total (`0.098 ms/call`) to `72.777 ms` total
+(`0.114 ms/call`) across 640 calls
+(`/tmp/supersonic-router-logits-exact-pair-profile-16.log`). A normal-lane
+128-token A/B also matched the default stream exactly, but slowed from
+`97.8 ms/token` (`ffn=70.213 ms/token`) to `100.2 ms/token`
+(`ffn=72.061 ms/token`)
+(`/tmp/supersonic-router-logits-exact-pair-ab-{default,pair}-128.log`). This
+rules out small exact-multirow router-logits packing as the next promotion
+target; the next FFN target should either avoid changing router-logit work
+ordering entirely or move to a different bucket such as shared-scalar
+scheduling or expert-down accumulation.
+
+A same-day `SUPERSONIC_METAL_PROFILE=1` default diagnostic
+(`/tmp/supersonic-current-default-metal-profile-128.log`) should be treated as
+timing-only because profiling changed the generated stream at token 9. It
+measured `90.1 ms/token`, with `ffn=65.348 ms/token`, full attention
+`8.834 ms/token`, linear attention `12.243 ms/token`, and lm-head
+`3.314 ms/token`. The top profile rows were
+`qwen36_ffn_int4_stage5_with_router` at `8196.516 ms`,
+`command_buffer_wait` at `7437.951 ms`, aggregate `command_buffer_gpu` at
+`3984.655 ms`, and labeled FFN command-buffer GPU time at `2949.334 ms` over
+5120 FFN calls. This keeps the next target in FFN scheduling/command-buffer
+structure rather than another local router-logits packing kernel.
+
 Follow-up optimization probes on 2026-06-01 kept the headline unchanged but
 identified the next safe work area:
 
@@ -1488,6 +1522,31 @@ identified the next safe work area:
   improvement (`65.4` vs `65.5 ms/token`;
   `/tmp/supersonic-qwen35-raw-q4km-exact-interval9999-512-gate.log`).
   Keep the promoted exact-SIMD path on the default interval-1 cadence.
+  A 2026-06-04 scheduling revisit kept the generated stream aligned but did
+  not prove a chain-level win. FFN commit intervals 4, 8, and 9999 matched the
+  128-token stream; after warm repeat, interval 9999 tied the default
+  (`95.0` vs `95.1 ms/token`). Coarse
+  `SUPERSONIC_METAL_QWEN36_DECODE_BATCH_SYNC_PHASES=1` was stream-safe but
+  slower (`96.1 ms/token`). A temporary linear-attention commit interval hook
+  also matched the stream, but linear-only intervals 8 and 9999 did not beat the
+  warmed default (`95.3` and `96.6 ms/token`). Combining linear interval 8 with
+  FFN interval 9999 matched all 512 generated IDs across two runs and measured
+  `88.8` and `89.2 ms/token`, but both runs had slower chain/FFN buckets than
+  the warmed default control (`chain=85.769/86.116`, `ffn=57.707/58.048` vs
+  default `chain=84.483`, `ffn=55.955`). The hook was removed; keep this bucket
+  pointed at a larger FFN residency/submit-wait redesign rather than another
+  phase-commit cadence tweak
+  (`/tmp/supersonic-{ffn-commit-interval-4-128,ffn-commit-interval-8-128,ffn-commit-interval-9999-128,ffn-commit-9999-repeat-128,decode-batch-sync-phases-128,linear-commit-interval-8-128,linear-commit-interval-9999-128,linear8-ffn9999-512,linear8-ffn9999-repeat-512,decode-batch-default-repeat-512}.log`).
+  A follow-up generic Metal-batch barrier probe also matched generated streams
+  but was slower. Temporarily skipping the helper-level post-encode
+  `memoryBarrierWithScope:MTLBarrierScopeBuffers` preserved the 8-token prefix
+  and the full 128-token stream, but the 128-token control was faster
+  (`88.1 ms/token`, `ffn=64.182`) than the skip variant (`92.2 ms/token`,
+  `ffn=66.129`). Keep the helper-level barrier in place; if submit/wait is
+  revisited, target a more explicit resident FFN representation or a staged
+  command-buffer design rather than removing generic hazard ordering
+  (`/tmp/supersonic-skip-post-encode-barrier-{smoke-8,smoke-repeat-8,128}.log`,
+  `/tmp/supersonic-post-encode-barrier-default-control-{8,128}.log`).
   Rechecking the MLX-shaped gathered expert-down path in the same tree also
   tied the default rather than improving it: three 128-token pairs measured
   equal medians of `64.3 ms/token`, with pairwise generated streams matching in
@@ -2420,21 +2479,51 @@ timings, expert-residency totals, and per-policy rows in
 `target/qwen36_static_topn_runtime_sweep.{json,md}`. With `--metal-profile`
 it also preserves parsed `metal_profile` and `hal_profile` objects per row and
 renders the top Metal/HAL attribution in Markdown, which makes the comparison
-prompt set usable as a profiling gate rather than a Hello-only smoke. The v3
-schema adds a nonfatal `promotion_gate`: a resident mode must preserve
+prompt set usable as a profiling gate rather than a Hello-only smoke. The v5
+schema keeps the nonfatal `promotion_gate`: a resident mode must preserve
 generated IDs versus `default`, improve headline ms/token and `ffn_ms_avg`,
 keep full-attention, linear-attention, and lm-head inside the configured
 regression ratio, and include non-regressed `command_buffer_wait` profile
-evidence unless `--no-promotion-require-profile` is used.
-The first four-token smoke preserved `[11, 353, 599, 264]` across all three
-modes but ruled out promotion: default measured `decode_ms=702` and
-`ffn_ms_avg=98.761`, static measured `decode_ms=951`, `ffn_ms_avg=177.563`,
-`exact_hits=10/160`, `slot_hit_rate=0.508594`, and `copied_bytes=980372736`,
-and static+hotset measured `decode_ms=1450`, `ffn_ms_avg=262.215`, and
-`copied_bytes=2234557440`. The native static table is useful as a measured
-residency scaffold, but Qwen3.6 Metal should next target either a dense
-resident MPS/MPP table that can serve partial hits cheaply, or return to the
-prefill/orchestration buckets already shown to dominate long-context runs.
+evidence unless `--no-promotion-require-profile` is used. It also adds a
+separate `experimental_family_parity` block for packed/static-family modes.
+That section is diagnostic only: it can confirm that residency variants still
+match the packed-family stream, but it cannot promote a mode unless the normal
+default-based gate also passes.
+The first four-token static smoke established a packed/static-family stream of
+`[11, 353, 599, 264]` and ruled out latency promotion: the default-row baseline
+in that run measured `decode_ms=702` and `ffn_ms_avg=98.761`, static measured
+`decode_ms=951`, `ffn_ms_avg=177.563`, `exact_hits=10/160`,
+`slot_hit_rate=0.508594`, and `copied_bytes=980372736`, and static+hotset
+measured `decode_ms=1450`, `ffn_ms_avg=262.215`, and
+`copied_bytes=2234557440`. Later divergence work showed that the packed,
+direct-gather, static, and static-partial FFN family currently follows
+`[11, 353, 599, 264]`, while the default/full-native path follows
+`[11, 271, 40, 599]`. Treat the packed-family stream as experimental residency
+coverage only until the standalone routed-expert arithmetic drift is fixed.
+The v5 validation smoke in `target/qwen36_static_topn_family_parity4.{json,md}`
+records that split explicitly: `generated_ids_match=false`,
+`experimental_family_generated_ids_match=true`, and
+`promotion_gate_passed=false` for `default,packed,static,static-partial`.
+
+The native partial-hit static Top-N follow-up is opt-in behind
+`SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_STATIC_TOPN_PARTIAL=1`. It uses the
+same resident packed INT4 static table as the full-hit static path, remaps only
+resident routed groups into the first hit-count top-k slots, runs the existing
+native packed FFN shader for those hits, restores the original route workspace,
+then computes miss groups with the host fallback and adds them into the partial
+`moe_out`. This explicitly tests the non-MPS version of the partial resident
+fork. The first one-token profiled smoke matched generated IDs across
+`default`, `static`, and `static-partial`, but rejected the candidate:
+`static-partial` measured `574.7 ms/token`, `ffn_ms_avg=483.074`, and copied
+`3.670 GiB` while allocating all 40 resident tables
+(`target/qwen36_static_topn_partial_smoke.{json,md}`). A four-token warm sweep
+also rejected it: both static modes diverged from the default stream after the
+first token, and `static-partial` was slower than full-hit `static`
+(`210.6` vs `104.2 ms/token`, `ffn=159.293` vs `76.689`;
+`target/qwen36_static_topn_partial_warm4.{json,md}`). Keep this mode
+diagnostic; partial resident INT4 needs either a cheaper all-layer prewarm plus
+a parity-safe default comparison, or a different in-kernel partial combine
+before it is worth promoting.
 
 `tests/metal/probe_qwen36_mps_resident_table.py` turns that fork into an
 explicit gate. It consumes `target/qwen36_static_topn_mps_probe.json`, optionally
@@ -2510,8 +2599,9 @@ generated id `[11]`, but reported `decode_ms=6324`, `ffn_ms_avg=6073.323`,
 MPS bridge itself was `365.052 ms` across 40 layer calls, while
 `qwen36_ffn_int4_expert_mps_static_topn_pack_f16_lut` took `5630.663 ms` on
 the host and HAL `copy_h2d` accounted for `4481.851 ms` / `17886298368` bytes.
-The warm four-token sweep preserved `[11, 353, 599, 264]`, but measured
-`default` at `decode_ms=702`, `ffn_ms_avg=94.930` versus
+The warm four-token sweep preserved the packed-family stream
+`[11, 353, 599, 264]`, but measured the default-row baseline at
+`decode_ms=702`, `ffn_ms_avg=94.930` versus
 `mps-static-partial` at `decode_ms=7839`, `ffn_ms_avg=1845.066`,
 `slot_hit_rate=0.507812`, and `copied_gib=14.672`. This confirms the prototype
 as a correctness/profiling harness only: the RHS materialization and
@@ -2523,8 +2613,9 @@ packed expert path. It allocates compact per-layer scratch once, copies the
 current top-k expert slabs from the original baked Metal buffers in the FFN
 command buffer, remaps `topk_idx` to compact group IDs, then runs the existing
 packed gate/up and down/finalize shader. The four-token Apple M5 Max smoke
-preserved `[11, 353, 599, 264]`, so the remap and packed shader parity are good,
-but it measured `777.3 ms/token`, `ffn_ms_avg=641.772`, and
+preserved the packed-family stream `[11, 353, 599, 264]`, so the remap and
+packed shader agree with the experimental packed path, but it measured
+`777.3 ms/token`, `ffn_ms_avg=641.772`, and
 `qwen36_ffn_int4_expert_gpu_pack_stage5=2417.156 ms` across 160 layer calls.
 The command-buffer GPU attribution for the fused pack+expert shader was only
 `64.400 ms`, while `command_buffer_wait` was `2678.881 ms`; moving slab
@@ -2535,18 +2626,21 @@ The direct-gather follow-up is opt-in behind
 `SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_DIRECT_GATHER_STAGE5=1`. It keeps
 the original top-k expert IDs, reads the baked expert buffers directly, and uses
 a 256-thread tiled down/finalize kernel so the down projection has the same
-wide reduction shape as gate/up. It also preserved `[11, 353, 599, 264]`, but
-the unprofiled four-token smoke measured `308.8 ms/token` with
+wide reduction shape as gate/up. It also preserved the packed-family stream
+`[11, 353, 599, 264]`, but the unprofiled four-token smoke measured
+`308.8 ms/token` with
 `ffn_ms_avg=249.990`; the profiled run measured `756.8 ms/token`,
 `ffn_ms_avg=616.225`, and
 `qwen36_ffn_int4_expert_direct_gather_stage5=2318.450 ms` across 160 layer
 calls, while the command-buffer GPU attribution for the direct gather command
 was only `55.965 ms`. That confirms the direct original-buffer gather is still
-wait/residency dominated on this model. The useful next FFN direction is an
-explicit resident representation that avoids per-token active-slab rebuilds and
-avoids random giant-buffer gathers. The native INT4 static top-N probe now
-covers the narrow static-table branch; MPS/MPP remains the next heavier
-resident-matvec option if static full-hit rates are not high enough.
+wait/residency dominated on this model. Current divergence taps put the first
+packed/default checksum split in layer 33 FFN on token 1, with shared output and
+top-k routing matching but routed-expert arithmetic drifting before the final
+add. The useful next FFN direction is therefore two-track: keep packed/static
+residency experiments behind the diagnostic family-parity report, and fix
+standalone routed-expert parity against the default/full-native path before any
+packed-family optimization can graduate.
 
 The fused routed INT4 variants are now covered by a promotion-gated runtime
 sweep rather than only one-off smoke notes:

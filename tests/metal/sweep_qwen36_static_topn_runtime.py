@@ -15,7 +15,7 @@ from typing import Any
 
 
 MODEL = "qwen3.6-35b-a3b"
-SCHEMA = "qwen36-static-topn-runtime-sweep-v4"
+SCHEMA = "qwen36-static-topn-runtime-sweep-v6"
 
 PROMPT_SETS: dict[str, list[tuple[str, str]]] = {
     "smoke": [
@@ -40,15 +40,32 @@ MODE_ALIASES: dict[str, str] = {
     "baseline": "default",
     "default": "default",
     "packed": "packed",
+    "packed-exact": "packed-routed-host-order",
+    "packed-host-order": "packed-routed-host-order",
+    "packed-routed-host-order": "packed-routed-host-order",
     "hotset": "hotset",
     "static": "static",
+    "static-partial": "static-partial",
+    "partial-static": "static-partial",
     "static-hotset": "static-hotset",
     "mps-static-partial": "mps-static-partial",
     "static-mps-partial": "mps-static-partial",
     "mps-static-partial-prewarm": "mps-static-partial-prewarm",
     "static-mps-partial-prewarm": "mps-static-partial-prewarm",
 }
-DEFAULT_MODES = "default,static,static-hotset,mps-static-partial"
+DEFAULT_MODES = "default,static,static-partial,static-hotset,mps-static-partial"
+EXPERIMENTAL_FAMILY_MODES = {
+    "packed",
+    "packed-routed-host-order",
+    "hotset",
+    "static",
+    "static-partial",
+    "static-hotset",
+    "mps-static-partial",
+    "mps-static-partial-prewarm",
+}
+KNOWN_SILU_ULP_DRIFT_MODES = {"packed-routed-host-order"}
+KNOWN_SILU_ULP_STRICT_TOKENS = 16
 
 
 def parse_key_values(line: str) -> dict[str, str]:
@@ -244,8 +261,18 @@ def build_env_overrides(args: argparse.Namespace, mode: str) -> dict[str, str]:
     }
     if args.metal_profile:
         overrides["SUPERSONIC_METAL_PROFILE"] = "1"
-    if mode in {"packed", "hotset", "static", "static-hotset"}:
+    if mode in {
+        "packed",
+        "packed-routed-host-order",
+        "hotset",
+        "static",
+        "static-partial",
+        "static-hotset",
+    }:
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_PACKED_STAGE5"] = "1"
+    if mode == "packed-routed-host-order":
+        overrides["SUPERSONIC_METAL_QWEN36_FFN_EXPERT_GATE_UP_HOST_ORDER_STAGE5"] = "1"
+        overrides["SUPERSONIC_METAL_QWEN36_FFN_EXPERT_DOWN_HOST_ORDER_STAGE5"] = "1"
     if mode in {"hotset", "static-hotset"}:
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_PACK_HOTSET"] = "1"
         overrides["SUPERSONIC_METAL_QWEN36_FFN_EXPERT_HOTSET_CAPACITY"] = str(
@@ -253,6 +280,7 @@ def build_env_overrides(args: argparse.Namespace, mode: str) -> dict[str, str]:
         )
     if mode in {
         "static",
+        "static-partial",
         "static-hotset",
         "mps-static-partial",
         "mps-static-partial-prewarm",
@@ -265,6 +293,8 @@ def build_env_overrides(args: argparse.Namespace, mode: str) -> dict[str, str]:
             overrides["SUPERSONIC_METAL_QWEN36_FFN_EXPERT_STATIC_TOPN_CAPACITY"] = str(
                 args.static_capacity
             )
+    if mode == "static-partial":
+        overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_STATIC_TOPN_PARTIAL"] = "1"
     if mode in {"mps-static-partial", "mps-static-partial-prewarm"}:
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_MPS_STATIC_TOPN_PARTIAL"] = "1"
     if mode == "mps-static-partial-prewarm":
@@ -583,9 +613,154 @@ def build_promotion_gate(
     }
 
 
+def build_experimental_family_parity(
+    rows: list[dict[str, Any]],
+    modes: list[str],
+    requested_reference_mode: str = "packed",
+) -> dict[str, Any]:
+    prompt_ids: list[str] = []
+    for row in rows:
+        prompt_id = str(row.get("prompt_id", ""))
+        if prompt_id and prompt_id not in prompt_ids:
+            prompt_ids.append(prompt_id)
+    family_modes = [mode for mode in modes if mode in EXPERIMENTAL_FAMILY_MODES]
+    rows_by_key = {
+        (str(row.get("prompt_id", "")), row.get("mode")): row
+        for row in rows
+    }
+    mismatches: list[dict[str, Any]] = []
+    prompt_summaries: list[dict[str, Any]] = []
+    for prompt_id in prompt_ids:
+        prompt_rows = [
+            rows_by_key[(prompt_id, mode)]
+            for mode in family_modes
+            if (prompt_id, mode) in rows_by_key
+            and rows_by_key[(prompt_id, mode)].get("status") == "ok"
+        ]
+        if not prompt_rows:
+            continue
+        reference = rows_by_key.get((prompt_id, requested_reference_mode))
+        if reference is None or reference.get("status") != "ok":
+            reference = prompt_rows[0]
+        reference_mode = str(reference.get("mode") or "")
+        reference_ids = reference.get("generated_ids") or []
+        compared: list[dict[str, Any]] = []
+        prompt_mismatches: list[dict[str, Any]] = []
+        for row in prompt_rows:
+            generated_ids = row.get("generated_ids") or []
+            matched = generated_ids == reference_ids
+            compared.append(
+                {
+                    "mode": row.get("mode"),
+                    "generated_ids": generated_ids,
+                    "match": matched,
+                }
+            )
+            if not matched:
+                mismatch = {
+                    "prompt_id": prompt_id,
+                    "mode": row.get("mode"),
+                    "reference_mode": reference_mode,
+                    "reference_generated_ids": reference_ids,
+                    "generated_ids": generated_ids,
+                }
+                prompt_mismatches.append(mismatch)
+                mismatches.append(mismatch)
+        prompt_summaries.append(
+            {
+                "prompt_id": prompt_id,
+                "reference_mode": reference_mode,
+                "reference_generated_ids": reference_ids,
+                "modes": [str(row.get("mode") or "") for row in prompt_rows],
+                "generated_ids_match": not prompt_mismatches,
+                "comparisons": compared,
+            }
+        )
+    return {
+        "enabled": bool(family_modes),
+        "reference_mode_requested": requested_reference_mode,
+        "modes": family_modes,
+        "generated_ids_match": not mismatches,
+        "generated_id_mismatches": mismatches,
+        "prompt_summaries": prompt_summaries,
+        "diagnostic_only": True,
+    }
+
+
+def first_id_mismatch(reference: list[int], candidate: list[int]) -> int | None:
+    for idx, (expected, got) in enumerate(zip(reference, candidate)):
+        if expected != got:
+            return idx
+    if len(reference) != len(candidate):
+        return min(len(reference), len(candidate))
+    return None
+
+
+def build_known_silu_ulp_id_drift(
+    rows: list[dict[str, Any]],
+    modes: list[str],
+    *,
+    strict_tokens: int = KNOWN_SILU_ULP_STRICT_TOKENS,
+) -> dict[str, Any]:
+    prompt_ids: list[str] = []
+    for row in rows:
+        prompt_id = str(row.get("prompt_id", ""))
+        if prompt_id and prompt_id not in prompt_ids:
+            prompt_ids.append(prompt_id)
+    rows_by_key = {
+        (str(row.get("prompt_id", "")), str(row.get("mode", ""))): row
+        for row in rows
+    }
+    items: list[dict[str, Any]] = []
+    for prompt_id in prompt_ids:
+        baseline = rows_by_key.get((prompt_id, "default"))
+        if baseline is None or baseline.get("status") != "ok":
+            continue
+        reference_ids = baseline.get("generated_ids") or []
+        for mode in modes:
+            if mode not in KNOWN_SILU_ULP_DRIFT_MODES:
+                continue
+            row = rows_by_key.get((prompt_id, mode))
+            if row is None or row.get("status") != "ok":
+                continue
+            generated_ids = row.get("generated_ids") or []
+            mismatch_idx = first_id_mismatch(reference_ids, generated_ids)
+            known = mismatch_idx is not None and mismatch_idx >= strict_tokens
+            strict_violation = mismatch_idx is not None and mismatch_idx < strict_tokens
+            items.append(
+                {
+                    "prompt_id": prompt_id,
+                    "mode": mode,
+                    "source": "routed_expert_silu_ulp_boundary",
+                    "strict_tokens": strict_tokens,
+                    "first_mismatch_index": mismatch_idx,
+                    "known_after_strict_window": known,
+                    "strict_window_violation": strict_violation,
+                    "reference_generated_ids": reference_ids,
+                    "generated_ids": generated_ids,
+                }
+            )
+    known_items = [item for item in items if item.get("known_after_strict_window")]
+    strict_violations = [item for item in items if item.get("strict_window_violation")]
+    matched = [item for item in items if item.get("first_mismatch_index") is None]
+    return {
+        "enabled": any(mode in KNOWN_SILU_ULP_DRIFT_MODES for mode in modes),
+        "source": "routed_expert_silu_ulp_boundary",
+        "strict_tokens": strict_tokens,
+        "known_count": len(known_items),
+        "strict_violation_count": len(strict_violations),
+        "matched_count": len(matched),
+        "status": "strict_violation"
+        if strict_violations
+        else ("known_long_run_drift" if known_items else "strict_match"),
+        "items": items,
+    }
+
+
 def summarize_with_gate(
     rows: list[dict[str, Any]],
     modes: list[str],
+    experimental_family_reference_mode: str = "packed",
     max_headline_ratio: float = 0.999,
     max_ffn_ratio: float = 0.999,
     max_component_regression_ratio: float = 1.10,
@@ -602,6 +777,12 @@ def summarize_with_gate(
         max_command_buffer_wait_ratio,
         require_profile,
     )
+    summary["experimental_family_parity"] = build_experimental_family_parity(
+        rows,
+        modes,
+        experimental_family_reference_mode,
+    )
+    summary["known_silu_ulp_id_drift"] = build_known_silu_ulp_id_drift(rows, modes)
     return summary
 
 
@@ -621,6 +802,7 @@ def build_report(
         "static_table_json": str(args.static_table_json),
         "static_capacity": args.static_capacity,
         "hotset_capacity": args.hotset_capacity,
+        "experimental_family_reference_mode": args.experimental_family_reference_mode,
         "promotion_thresholds": {
             "max_headline_ratio": args.promotion_max_headline_ratio,
             "max_ffn_ratio": args.promotion_max_ffn_ratio,
@@ -631,6 +813,7 @@ def build_report(
         "summary": summarize_with_gate(
             rows,
             modes,
+            args.experimental_family_reference_mode,
             args.promotion_max_headline_ratio,
             args.promotion_max_ffn_ratio,
             args.promotion_max_component_regression_ratio,
@@ -660,6 +843,8 @@ def top_profile_op(profile: dict[str, Any] | None) -> dict[str, Any]:
 def render_markdown(report: dict[str, Any]) -> str:
     summary = report["summary"]
     promotion_gate = summary.get("promotion_gate") or {}
+    family = summary.get("experimental_family_parity") or {}
+    known_silu = summary.get("known_silu_ulp_id_drift") or {}
     lines = [
         "# Qwen3.6 Static Top-N Runtime Sweep",
         "",
@@ -667,6 +852,9 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- modes: `{','.join(report['modes'])}`",
         f"- max_new_tokens: `{report['max_new_tokens']}`",
         f"- generated_ids_match: `{summary['generated_ids_match']}`",
+        f"- experimental_family_generated_ids_match: `{family.get('generated_ids_match', True)}`",
+        f"- known_silu_ulp_id_drift_status: `{known_silu.get('status', '-')}`",
+        f"- known_silu_ulp_strict_tokens: `{known_silu.get('strict_tokens', KNOWN_SILU_ULP_STRICT_TOKENS)}`",
         f"- promotion_gate_passed: `{promotion_gate.get('passed', False)}`",
         f"- promotion_gate_passed_modes: `{','.join(promotion_gate.get('passed_modes') or []) or '-'}`",
         "",
@@ -707,6 +895,62 @@ def render_markdown(report: dict[str, Any]) -> str:
             "Rows are separate process runs. Static modes measure within-run warm reuse across generated tokens; the first token still pays resident-table allocation on full-hit layers unless the mode explicitly prewarms the resident table during setup.",
         ]
     )
+    family_prompts = family.get("prompt_summaries") or []
+    if family_prompts:
+        lines.extend(
+            [
+                "",
+                "## Experimental Family Parity",
+                "",
+                "This section is diagnostic only. It compares packed/static-family modes against the requested family reference and does not affect the default-based promotion gate.",
+                "",
+                "| Prompt | Reference mode | Reference IDs | Compared modes | Mismatches |",
+                "|:---|:---|:---|:---|:---|",
+            ]
+        )
+        for prompt in family_prompts:
+            mismatched_modes = [
+                str(item.get("mode"))
+                for item in prompt.get("comparisons") or []
+                if not item.get("match")
+            ]
+            lines.append(
+                "| {prompt_id} | {reference_mode} | {reference_ids} | {modes} | {mismatches} |".format(
+                    prompt_id=prompt.get("prompt_id"),
+                    reference_mode=prompt.get("reference_mode"),
+                    reference_ids=",".join(
+                        str(item) for item in prompt.get("reference_generated_ids", [])
+                    ),
+                    modes=",".join(str(item) for item in prompt.get("modes", [])),
+                    mismatches=",".join(mismatched_modes) or "-",
+                )
+            )
+    known_items = known_silu.get("items") or []
+    if known_items:
+        lines.extend(
+            [
+                "",
+                "## Known SiLU ULP Drift",
+                "",
+                "This section is diagnostic only. Exact host-order routed FFN still requires strict generated-ID parity in the first smoke window; later divergence is classified as the known routed expert SiLU ulp boundary when the first mismatch occurs after that window.",
+                "",
+                "| Prompt | Mode | Source | Strict tokens | First mismatch | Known after strict window | Strict violation |",
+                "|:---|:---|:---|---:|---:|:---:|:---:|",
+            ]
+        )
+        for item in known_items:
+            first = item.get("first_mismatch_index")
+            lines.append(
+                "| {prompt} | {mode} | {source} | {strict} | {first} | {known} | {violation} |".format(
+                    prompt=item.get("prompt_id"),
+                    mode=item.get("mode"),
+                    source=item.get("source"),
+                    strict=item.get("strict_tokens"),
+                    first="-" if first is None else first,
+                    known=str(item.get("known_after_strict_window", False)).lower(),
+                    violation=str(item.get("strict_window_violation", False)).lower(),
+                )
+            )
     candidates = promotion_gate.get("candidates") or []
     if candidates:
         lines.extend(
@@ -749,6 +993,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--static-capacity", type=int)
     parser.add_argument("--hotset-capacity", type=int, default=64)
     parser.add_argument("--metal-profile", action="store_true")
+    parser.add_argument(
+        "--experimental-family-reference-mode",
+        choices=sorted(EXPERIMENTAL_FAMILY_MODES),
+        default="packed",
+        help="reference mode for diagnostic packed/static-family parity reporting",
+    )
     parser.add_argument(
         "--promotion-max-headline-ratio",
         type=float,

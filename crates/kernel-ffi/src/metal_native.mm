@@ -143,12 +143,39 @@ void qwen36_ffn_phase_summary_record(const std::string& label, double elapsed_ms
 
 inline bool qwen36_ffn_routed_host_correction_probe_enabled() {
     return (std::getenv("SUPERSONIC_METAL_QWEN36_FFN_STAGE5_ROUTED_HOST_CORRECTION") != nullptr ||
-            std::getenv("SUPERSONIC_METAL_QWEN36_FFN_STAGE5_ROUTED_GATE_UP_TAP") != nullptr) &&
+            std::getenv("SUPERSONIC_METAL_QWEN36_FFN_STAGE5_ROUTED_GATE_UP_TAP") != nullptr ||
+            std::getenv("SUPERSONIC_METAL_QWEN36_FFN_STAGE5_ROUTED_SILU_TAP") != nullptr) &&
            std::getenv("SUPERSONIC_METAL_FORCE_HOST_NATIVE") == nullptr;
 }
 
 inline bool qwen36_ffn_expert_gate_up_host_order_enabled() {
     return std::getenv("SUPERSONIC_METAL_QWEN36_FFN_EXPERT_GATE_UP_HOST_ORDER_STAGE5") != nullptr &&
+           std::getenv("SUPERSONIC_METAL_FORCE_HOST_NATIVE") == nullptr;
+}
+
+inline bool qwen36_ffn_expert_gate_up_silu_tap_enabled() {
+    return std::getenv("SUPERSONIC_METAL_QWEN36_FFN_STAGE5_ROUTED_SILU_TAP") != nullptr &&
+           std::getenv("SUPERSONIC_METAL_FORCE_HOST_NATIVE") == nullptr;
+}
+
+inline bool qwen36_ffn_expert_gate_up_precise_silu_enabled() {
+    return std::getenv("SUPERSONIC_METAL_QWEN36_FFN_EXPERT_GATE_UP_PRECISE_SILU_STAGE5") != nullptr &&
+           std::getenv("SUPERSONIC_METAL_FORCE_HOST_NATIVE") == nullptr;
+}
+
+inline uint32_t qwen36_ffn_expert_gate_up_debug_flags() {
+    uint32_t flags = 0u;
+    if (qwen36_ffn_expert_gate_up_silu_tap_enabled()) {
+        flags |= 1u;
+    }
+    if (qwen36_ffn_expert_gate_up_precise_silu_enabled()) {
+        flags |= 2u;
+    }
+    return flags;
+}
+
+inline bool qwen36_ffn_expert_down_host_order_enabled() {
+    return std::getenv("SUPERSONIC_METAL_QWEN36_FFN_EXPERT_DOWN_HOST_ORDER_STAGE5") != nullptr &&
            std::getenv("SUPERSONIC_METAL_FORCE_HOST_NATIVE") == nullptr;
 }
 
@@ -425,6 +452,7 @@ struct Qwen36FfnExpertGateUpTiledParams {
     uint off_expert_mid;
     uint off_expert_gu;
     uint gate_up_proj_type;
+    uint debug_flags;
 };
 
 struct Qwen36FfnExpertPackParams {
@@ -4129,6 +4157,7 @@ struct Qwen36FfnInt4Pipelines {
     __strong id<MTLComputePipelineState> expert_gate_up_multirow = nil;
     __strong id<MTLComputePipelineState> expert_gate_up_host_order = nil;
     __strong id<MTLComputePipelineState> expert_down_finalize = nil;
+    __strong id<MTLComputePipelineState> expert_down_finalize_host_order = nil;
     __strong id<MTLComputePipelineState> expert_down_finalize_tiled = nil;
     __strong id<MTLComputePipelineState> expert_down_finalize_multirow = nil;
     __strong id<MTLComputePipelineState> expert_down_finalize_rowpair_topk_parallel = nil;
@@ -4208,6 +4237,7 @@ struct Qwen36FfnExpertGateUpTiledParams {
     uint off_expert_mid;
     uint off_expert_gu;
     uint gate_up_proj_type;
+    uint debug_flags;
 };
 
 struct Qwen36FfnExpertPackParams {
@@ -4241,6 +4271,13 @@ inline float bf16_round_rne_finite(float x) {
 
 inline float silu(float x) {
     return x * (1.0f / (1.0f + exp(-x)));
+}
+
+inline float silu_stage5(float x, uint debug_flags) {
+    if ((debug_flags & 2u) != 0u) {
+        return x * (1.0f / (1.0f + precise::exp(-x)));
+    }
+    return silu(x);
 }
 
 inline float silu_exp2(float x) {
@@ -4354,18 +4391,70 @@ inline float int4_dot_expert_host_order(
         float s = float(scale[scale_idx]);
         float z = float(zero[scale_idx]);
         float zs = z * s;
-        uint col = group_start;
+        uint pair_cols = (group_end - group_start) & ~1u;
+        uint byte_count = pair_cols / 2u;
+        uint byte = 0u;
         uint byte_idx = packed_base + group_start / 2u;
-        while (col + 1u < group_end) {
-            uint packed_byte = uint(packed[byte_idx]);
+        float4 acc0 = float4(0.0f);
+        float4 acc1 = float4(0.0f);
+        float4 acc2 = float4(0.0f);
+        float4 acc3 = float4(0.0f);
+        while (byte + 8u <= byte_count) {
+            uint b0 = uint(packed[byte_idx + byte]);
+            uint b1 = uint(packed[byte_idx + byte + 1u]);
+            uint b2 = uint(packed[byte_idx + byte + 2u]);
+            uint b3 = uint(packed[byte_idx + byte + 3u]);
+            uint b4 = uint(packed[byte_idx + byte + 4u]);
+            uint b5 = uint(packed[byte_idx + byte + 5u]);
+            uint b6 = uint(packed[byte_idx + byte + 6u]);
+            uint b7 = uint(packed[byte_idx + byte + 7u]);
+            uint x_base = group_start + byte * 2u;
+            float4 w0 = float4(
+                bf16_round_rne_finite(float(b0 & 0x0Fu) * s - zs),
+                bf16_round_rne_finite(float((b0 >> 4u) & 0x0Fu) * s - zs),
+                bf16_round_rne_finite(float(b1 & 0x0Fu) * s - zs),
+                bf16_round_rne_finite(float((b1 >> 4u) & 0x0Fu) * s - zs)
+            );
+            float4 w1 = float4(
+                bf16_round_rne_finite(float(b2 & 0x0Fu) * s - zs),
+                bf16_round_rne_finite(float((b2 >> 4u) & 0x0Fu) * s - zs),
+                bf16_round_rne_finite(float(b3 & 0x0Fu) * s - zs),
+                bf16_round_rne_finite(float((b3 >> 4u) & 0x0Fu) * s - zs)
+            );
+            float4 w2 = float4(
+                bf16_round_rne_finite(float(b4 & 0x0Fu) * s - zs),
+                bf16_round_rne_finite(float((b4 >> 4u) & 0x0Fu) * s - zs),
+                bf16_round_rne_finite(float(b5 & 0x0Fu) * s - zs),
+                bf16_round_rne_finite(float((b5 >> 4u) & 0x0Fu) * s - zs)
+            );
+            float4 w3 = float4(
+                bf16_round_rne_finite(float(b6 & 0x0Fu) * s - zs),
+                bf16_round_rne_finite(float((b6 >> 4u) & 0x0Fu) * s - zs),
+                bf16_round_rne_finite(float(b7 & 0x0Fu) * s - zs),
+                bf16_round_rne_finite(float((b7 >> 4u) & 0x0Fu) * s - zs)
+            );
+            acc0 = fma(w0, float4(x[x_base], x[x_base + 1u], x[x_base + 2u], x[x_base + 3u]), acc0);
+            acc1 = fma(w1, float4(x[x_base + 4u], x[x_base + 5u], x[x_base + 6u], x[x_base + 7u]), acc1);
+            acc2 = fma(w2, float4(x[x_base + 8u], x[x_base + 9u], x[x_base + 10u], x[x_base + 11u]), acc2);
+            acc3 = fma(w3, float4(x[x_base + 12u], x[x_base + 13u], x[x_base + 14u], x[x_base + 15u]), acc3);
+            byte += 8u;
+        }
+        float sum0 = (acc0.x + acc0.y) + (acc0.z + acc0.w);
+        float sum1 = (acc1.x + acc1.y) + (acc1.z + acc1.w);
+        float sum2 = (acc2.x + acc2.y) + (acc2.z + acc2.w);
+        float sum3 = (acc3.x + acc3.y) + (acc3.z + acc3.w);
+        acc += ((sum0 + sum1) + sum2) + sum3;
+        while (byte < byte_count) {
+            uint packed_byte = uint(packed[byte_idx + byte]);
+            uint col = group_start + byte * 2u;
             float w0 = bf16_round_rne_finite(float(packed_byte & 0xFu) * s - zs);
             float w1 = bf16_round_rne_finite(float((packed_byte >> 4u) & 0xFu) * s - zs);
             acc += w0 * x[col] + w1 * x[col + 1u];
-            col += 2u;
-            byte_idx += 1u;
+            byte += 1u;
         }
+        uint col = group_start + pair_cols;
         if (col < group_end) {
-            uint packed_byte = uint(packed[byte_idx]);
+            uint packed_byte = uint(packed[byte_idx + byte]);
             float w = bf16_round_rne_finite(float(packed_byte & 0xFu) * s - zs);
             acc += w * x[col];
         }
@@ -5634,13 +5723,15 @@ kernel void supersonic_qwen36_ffn_expert_gate_up_tiled(
         float gate = simd_sum(gate_in);
         float up = simd_sum(up_in);
         if (lane == 0u) {
+            float gate_silu = silu_stage5(gate, params.debug_flags);
             if (params.off_expert_gu != QWEN36_FFN_NO_EXPERT_GU_TAP) {
                 uint gu_base = params.off_expert_gu + group * (2u * params.moe_intermediate);
                 workspace[gu_base + row] = gate;
-                workspace[gu_base + params.moe_intermediate + row] = up;
+                workspace[gu_base + params.moe_intermediate + row] =
+                    ((params.debug_flags & 1u) != 0u) ? gate_silu : up;
             }
             workspace[params.off_expert_mid + group * params.moe_intermediate + row] =
-                silu(gate) * up;
+                gate_silu * up;
         }
     }
 }
@@ -5724,13 +5815,15 @@ kernel void supersonic_qwen36_ffn_expert_gate_up_host_order(
         expert, params.moe_intermediate + row, rows,
         params.hidden, params.group_size, h_norm
     );
+    float gate_silu = silu_stage5(gate, params.debug_flags);
     if (params.off_expert_gu != QWEN36_FFN_NO_EXPERT_GU_TAP) {
         uint gu_base = params.off_expert_gu + group * (2u * params.moe_intermediate);
         workspace[gu_base + row] = gate;
-        workspace[gu_base + params.moe_intermediate + row] = up;
+        workspace[gu_base + params.moe_intermediate + row] =
+            ((params.debug_flags & 1u) != 0u) ? gate_silu : up;
     }
-    workspace[params.off_expert_mid + group * params.moe_intermediate + row] =
-        silu(gate) * up;
+    float mid = gate_silu * up;
+    workspace[params.off_expert_mid + group * params.moe_intermediate + row] = mid;
 }
 
 kernel void supersonic_qwen36_ffn_expert_down_finalize(
@@ -5770,6 +5863,41 @@ kernel void supersonic_qwen36_ffn_expert_down_finalize(
         );
         output[row] = bfloat(final);
     }
+}
+
+kernel void supersonic_qwen36_ffn_expert_down_finalize_host_order(
+    device float* workspace [[buffer(0)]],
+    device const bfloat* input_hidden [[buffer(1)]],
+    device const uchar* down_proj [[buffer(2)]],
+    device const bfloat* down_scale [[buffer(3)]],
+    device const bfloat* down_zero [[buffer(4)]],
+    device bfloat* output [[buffer(5)]],
+    constant Qwen36FfnInt4Params& params [[buffer(6)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint thread_id [[thread_index_in_threadgroup]]
+) {
+    if (thread_id != 0u || row >= params.hidden) {
+        return;
+    }
+    float moe_acc = 0.0f;
+    for (uint group = 0u; group < params.top_k; ++group) {
+        uint expert = as_type<uint>(workspace[params.off_topk_idx + group]);
+        device const float* expert_mid =
+            workspace + params.off_expert_mid + group * params.moe_intermediate;
+        float down = lowbit_dot_expert_host_order(
+            down_proj, down_scale, down_zero,
+            params.down_proj_type,
+            expert, row, params.hidden, params.moe_intermediate, params.group_size,
+            expert_mid
+        );
+        moe_acc += workspace[params.off_topk_val + group] * down;
+    }
+    float moe = bf16_round_rne_finite(moe_acc);
+    workspace[params.off_moe_out + row] = moe;
+    float final = bf16_round_rne_finite(
+        float(input_hidden[row]) + moe + workspace[params.off_shared_out + row]
+    );
+    output[row] = bfloat(final);
 }
 
 kernel void supersonic_qwen36_ffn_expert_down_finalize_tiled(
@@ -6626,6 +6754,7 @@ kernel void supersonic_qwen36_ffn_mps_transcode_down_lut(
                         @"supersonic_qwen36_ffn_expert_gate_up_multirow",
                         @"supersonic_qwen36_ffn_expert_gate_up_host_order",
                         @"supersonic_qwen36_ffn_expert_down_finalize",
+                        @"supersonic_qwen36_ffn_expert_down_finalize_host_order",
                         @"supersonic_qwen36_ffn_expert_down_finalize_tiled",
                         @"supersonic_qwen36_ffn_expert_down_finalize_multirow",
                         @"supersonic_qwen36_ffn_expert_down_finalize_rowpair_topk_parallel",
@@ -6724,6 +6853,8 @@ kernel void supersonic_qwen36_ffn_mps_transcode_down_lut(
                             pipelines.expert_gate_up_host_order = pipeline;
                         } else if ([name isEqualToString:@"supersonic_qwen36_ffn_expert_down_finalize"]) {
                             pipelines.expert_down_finalize = pipeline;
+                        } else if ([name isEqualToString:@"supersonic_qwen36_ffn_expert_down_finalize_host_order"]) {
+                            pipelines.expert_down_finalize_host_order = pipeline;
                         } else if ([name isEqualToString:@"supersonic_qwen36_ffn_expert_down_finalize_tiled"]) {
                             pipelines.expert_down_finalize_tiled = pipeline;
                         } else if ([name isEqualToString:@"supersonic_qwen36_ffn_expert_down_finalize_multirow"]) {
@@ -6788,7 +6919,8 @@ kernel void supersonic_qwen36_ffn_mps_transcode_down_lut(
         pipelines.expert_gate_up != nil && pipelines.expert_gate_up_tiled != nil &&
         pipelines.expert_gate_up_multirow != nil &&
         pipelines.expert_gate_up_host_order != nil &&
-        pipelines.expert_down_finalize != nil && pipelines.expert_down_finalize_tiled != nil &&
+        pipelines.expert_down_finalize != nil && pipelines.expert_down_finalize_host_order != nil &&
+        pipelines.expert_down_finalize_tiled != nil &&
         pipelines.expert_down_finalize_multirow != nil &&
         pipelines.expert_down_finalize_rowpair_topk_parallel != nil &&
         pipelines.expert_down_rowpair_compare_multirow != nil &&
@@ -15564,6 +15696,7 @@ extern "C" int supersonic_metal_qwen36_ffn_expert_gate_up_tiled(
             static_cast<uint32_t>(off_expert_mid),
             QWEN36_FFN_NO_EXPERT_GU_TAP,
             QWEN36_LOWBIT_NATIVE_INT4,
+            0u,
         };
 
         auto encode = [&](id<MTLComputeCommandEncoder> encoder) {
@@ -15618,6 +15751,7 @@ extern "C" int supersonic_metal_qwen36_ffn_expert_gate_up_down_finalize_tiled(
     size_t off_shared_out,
     size_t off_expert_mid,
     size_t off_moe_out,
+    size_t off_expert_gu,
     int wait_for_completion
 ) {
     @autoreleasepool {
@@ -15632,7 +15766,8 @@ extern "C" int supersonic_metal_qwen36_ffn_expert_gate_up_down_finalize_tiled(
             top_k > UINT32_MAX || group_size > UINT32_MAX ||
             off_h_norm > UINT32_MAX || off_topk_val > UINT32_MAX ||
             off_topk_idx > UINT32_MAX || off_shared_out > UINT32_MAX ||
-            off_expert_mid > UINT32_MAX || off_moe_out > UINT32_MAX) {
+            off_expert_mid > UINT32_MAX || off_moe_out > UINT32_MAX ||
+            off_expert_gu > UINT32_MAX) {
             return 1194;
         }
         if ((hidden % 2) != 0 || (moe_intermediate % 2) != 0) {
@@ -15641,7 +15776,11 @@ extern "C" int supersonic_metal_qwen36_ffn_expert_gate_up_down_finalize_tiled(
 
         NSError* pipeline_error = nil;
         Qwen36FfnInt4Pipelines pipelines = qwen36_ffn_int4_pipelines(&pipeline_error);
-        if (pipelines.expert_gate_up_tiled == nil || pipelines.expert_down_finalize == nil) {
+        bool expert_gate_up_host_order = qwen36_ffn_expert_gate_up_host_order_enabled();
+        bool expert_down_host_order = qwen36_ffn_expert_down_host_order_enabled();
+        if (pipelines.expert_gate_up_tiled == nil || pipelines.expert_down_finalize == nil ||
+            (expert_gate_up_host_order && pipelines.expert_gate_up_host_order == nil) ||
+            (expert_down_host_order && pipelines.expert_down_finalize_host_order == nil)) {
             return 1196;
         }
 
@@ -15681,8 +15820,9 @@ extern "C" int supersonic_metal_qwen36_ffn_expert_gate_up_down_finalize_tiled(
             static_cast<uint32_t>(off_h_norm),
             static_cast<uint32_t>(off_topk_idx),
             static_cast<uint32_t>(off_expert_mid),
-            QWEN36_FFN_NO_EXPERT_GU_TAP,
+            static_cast<uint32_t>(off_expert_gu),
             QWEN36_LOWBIT_NATIVE_INT4,
+            qwen36_ffn_expert_gate_up_debug_flags(),
         };
         Qwen36FfnInt4Params down_params = {
             static_cast<uint32_t>(hidden),
@@ -15707,18 +15847,24 @@ extern "C" int supersonic_metal_qwen36_ffn_expert_gate_up_down_finalize_tiled(
         };
 
         auto encode = [&](id<MTLComputeCommandEncoder> encoder) {
-            [encoder setComputePipelineState:pipelines.expert_gate_up_tiled];
+            [encoder setComputePipelineState:(expert_gate_up_host_order
+                ? pipelines.expert_gate_up_host_order
+                : pipelines.expert_gate_up_tiled)];
             [encoder setBuffer:workspace offset:workspace_offset atIndex:0];
             [encoder setBuffer:gate_up_proj offset:gate_up_proj_offset atIndex:1];
             [encoder setBuffer:gate_up_scale offset:gate_up_scale_offset atIndex:2];
             [encoder setBuffer:gate_up_zero offset:gate_up_zero_offset atIndex:3];
             [encoder setBytes:&gate_params length:sizeof(gate_params) atIndex:4];
-            [encoder setThreadgroupMemoryLength:16 * sizeof(float) atIndex:0];
+            if (!expert_gate_up_host_order) {
+                [encoder setThreadgroupMemoryLength:16 * sizeof(float) atIndex:0];
+            }
             [encoder dispatchThreadgroups:MTLSizeMake(moe_intermediate, top_k, 1)
-                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                    threadsPerThreadgroup:MTLSizeMake(expert_gate_up_host_order ? 32 : 256, 1, 1)];
             [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
 
-            [encoder setComputePipelineState:pipelines.expert_down_finalize];
+            [encoder setComputePipelineState:(expert_down_host_order
+                ? pipelines.expert_down_finalize_host_order
+                : pipelines.expert_down_finalize)];
             [encoder setBuffer:workspace offset:workspace_offset atIndex:0];
             [encoder setBuffer:input_hidden offset:input_hidden_offset atIndex:1];
             [encoder setBuffer:down_proj offset:down_proj_offset atIndex:2];
@@ -15727,7 +15873,7 @@ extern "C" int supersonic_metal_qwen36_ffn_expert_gate_up_down_finalize_tiled(
             [encoder setBuffer:output offset:output_offset atIndex:5];
             [encoder setBytes:&down_params length:sizeof(down_params) atIndex:6];
             [encoder dispatchThreadgroups:MTLSizeMake(hidden, 1, 1)
-                    threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                    threadsPerThreadgroup:MTLSizeMake(expert_down_host_order ? 1 : 32, 1, 1)];
         };
         if (wait_for_completion != 0) {
             return encode_or_submit_labeled(
@@ -15838,6 +15984,7 @@ extern "C" int supersonic_metal_qwen36_ffn_expert_direct_gather_stage5(
             static_cast<uint32_t>(off_expert_mid),
             QWEN36_FFN_NO_EXPERT_GU_TAP,
             QWEN36_LOWBIT_NATIVE_INT4,
+            0u,
         };
         Qwen36FfnInt4Params down_params = {
             static_cast<uint32_t>(hidden),
@@ -16271,6 +16418,7 @@ extern "C" int supersonic_metal_qwen36_ffn_expert_gpu_pack_gate_up_down_finalize
             static_cast<uint32_t>(off_expert_mid),
             QWEN36_FFN_NO_EXPERT_GU_TAP,
             QWEN36_LOWBIT_NATIVE_INT4,
+            0u,
         };
         Qwen36FfnInt4Params down_params = {
             static_cast<uint32_t>(hidden),
@@ -16621,6 +16769,7 @@ extern "C" int supersonic_metal_qwen36_ffn_int4_stage5(
             off_expert_mid,
             off_expert_gu_probe,
             static_cast<uint32_t>(gate_up_proj_type),
+            qwen36_ffn_expert_gate_up_debug_flags(),
         };
 
         auto encode_shared_gate_up = [&](id<MTLComputeCommandEncoder> encoder) {
@@ -16828,17 +16977,19 @@ extern "C" int supersonic_metal_qwen36_ffn_int4_stage5(
                     ? "qwen36_ffn_int4_expert_gate_up_multirow_stage5"
                     : "qwen36_ffn_int4_expert_gate_up_tiled_stage5");
             if ((status = submit_profile_phase(encode_expert_gate_up, expert_gate_label, 995, 996, 997, 998)) != 0) return status;
-            const std::string expert_down_label = expert_down_multirow_topk_parallel
-                ? "qwen36_ffn_int4_expert_down_finalize_multirow_topk_parallel"
-                : (expert_down_topk_parallel
-                    ? "qwen36_ffn_int4_expert_down_finalize_topk_parallel"
-                    : (expert_down_rowpair_topk_parallel
-                        ? "qwen36_ffn_int4_expert_down_finalize_rowpair_topk_parallel"
-                        : (expert_down_gathered
-                            ? "qwen36_ffn_int4_expert_down_gathered"
-                            : (raw_ggml_experts
-                                ? "qwen36_ffn_int4_expert_down_finalize_multirow"
-                                : "qwen36_ffn_int4_expert_down_finalize"))));
+            const std::string expert_down_label = qwen36_ffn_expert_down_host_order_enabled()
+                ? "qwen36_ffn_int4_expert_down_finalize_host_order_stage5"
+                : (expert_down_multirow_topk_parallel
+                    ? "qwen36_ffn_int4_expert_down_finalize_multirow_topk_parallel"
+                    : (expert_down_topk_parallel
+                        ? "qwen36_ffn_int4_expert_down_finalize_topk_parallel"
+                        : (expert_down_rowpair_topk_parallel
+                            ? "qwen36_ffn_int4_expert_down_finalize_rowpair_topk_parallel"
+                            : (expert_down_gathered
+                                ? "qwen36_ffn_int4_expert_down_gathered"
+                                : (raw_ggml_experts
+                                    ? "qwen36_ffn_int4_expert_down_finalize_multirow"
+                                    : "qwen36_ffn_int4_expert_down_finalize")))));
             return submit_profile_phase(
                 encode_expert_down_finalize,
                 expert_down_label,
@@ -16966,6 +17117,7 @@ extern "C" int supersonic_metal_qwen36_ffn_int4_stage5_with_router(
             !expert_down_topk_parallel && !expert_down_multirow_topk_parallel &&
             !expert_down_rowpair_topk_parallel &&
             qwen36_ffn_expert_down_gathered_enabled();
+        bool expert_down_host_order = qwen36_ffn_expert_down_host_order_enabled();
         bool raw_ggml_experts =
             static_cast<uint32_t>(gate_up_proj_type) != QWEN36_LOWBIT_NATIVE_INT4 ||
             static_cast<uint32_t>(down_proj_type) != QWEN36_LOWBIT_NATIVE_INT4;
@@ -17031,7 +17183,8 @@ extern "C" int supersonic_metal_qwen36_ffn_int4_stage5_with_router(
             (shared_scalar_simd && pipelines.shared_scalar_simd == nil) ||
             (shared_down_exact_simd && pipelines.shared_down_exact_simd == nil) ||
             (shared_down_tiled && pipelines.shared_down_tiled == nil) ||
-            (expert_gate_up_host_order && pipelines.expert_gate_up_host_order == nil)) {
+            (expert_gate_up_host_order && pipelines.expert_gate_up_host_order == nil) ||
+            (expert_down_host_order && pipelines.expert_down_finalize_host_order == nil)) {
             return 1393;
         }
 
@@ -17154,6 +17307,7 @@ extern "C" int supersonic_metal_qwen36_ffn_int4_stage5_with_router(
             off_expert_mid,
             off_expert_gu_probe,
             static_cast<uint32_t>(gate_up_proj_type),
+            qwen36_ffn_expert_gate_up_debug_flags(),
         };
         auto encode_router_norm = [&](id<MTLComputeCommandEncoder> encoder) {
             [encoder setComputePipelineState:router_norm_exact_simd
@@ -17332,15 +17486,17 @@ extern "C" int supersonic_metal_qwen36_ffn_int4_stage5_with_router(
                         threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
                 return;
             }
-            [encoder setComputePipelineState:expert_down_multirow_topk_parallel
-                ? pipelines.expert_down_finalize_multirow_topk_parallel
-                : (expert_down_topk_parallel
-                    ? pipelines.expert_down_finalize_topk_parallel
-                    : (expert_down_rowpair_topk_parallel
-                        ? pipelines.expert_down_finalize_rowpair_topk_parallel
-                        : (raw_ggml_experts
-                            ? pipelines.expert_down_finalize_multirow
-                            : pipelines.expert_down_finalize)))];
+            [encoder setComputePipelineState:expert_down_host_order
+                ? pipelines.expert_down_finalize_host_order
+                : (expert_down_multirow_topk_parallel
+                    ? pipelines.expert_down_finalize_multirow_topk_parallel
+                    : (expert_down_topk_parallel
+                        ? pipelines.expert_down_finalize_topk_parallel
+                        : (expert_down_rowpair_topk_parallel
+                            ? pipelines.expert_down_finalize_rowpair_topk_parallel
+                            : (raw_ggml_experts
+                                ? pipelines.expert_down_finalize_multirow
+                                : pipelines.expert_down_finalize))))];
             [encoder setBuffer:workspace offset:workspace_offset atIndex:0];
             [encoder setBuffer:input_hidden offset:input_hidden_offset atIndex:1];
             [encoder setBuffer:down_proj offset:down_proj_offset atIndex:2];
@@ -17348,21 +17504,25 @@ extern "C" int supersonic_metal_qwen36_ffn_int4_stage5_with_router(
             [encoder setBuffer:down_zero offset:down_zero_offset atIndex:4];
             [encoder setBuffer:output offset:output_offset atIndex:5];
             [encoder setBytes:&params length:sizeof(params) atIndex:6];
-            if (expert_down_multirow_topk_parallel) {
+            if (!expert_down_host_order && expert_down_multirow_topk_parallel) {
                 [encoder setThreadgroupMemoryLength:2 * top_k * sizeof(float) atIndex:0];
-            } else if (expert_down_topk_parallel) {
+            } else if (!expert_down_host_order && expert_down_topk_parallel) {
                 [encoder setThreadgroupMemoryLength:top_k * sizeof(float) atIndex:0];
-            } else if (expert_down_rowpair_topk_parallel) {
+            } else if (!expert_down_host_order && expert_down_rowpair_topk_parallel) {
                 [encoder setThreadgroupMemoryLength:2 * top_k * sizeof(float) atIndex:0];
             }
-            [encoder dispatchThreadgroups:MTLSizeMake(expert_down_multirow_topk_parallel
-                        ? ((hidden + 1) / 2)
-                        : (expert_down_topk_parallel
-                            ? hidden
-                            : (expert_down_rowpair_topk_parallel
-                                ? ((hidden + 1) / 2)
-                                : (raw_ggml_experts ? ((hidden + 7) / 8) : hidden))), 1, 1)
-                    threadsPerThreadgroup:MTLSizeMake(expert_down_rowpair_topk_parallel ? 512 : ((raw_ggml_experts || expert_down_topk_parallel || expert_down_multirow_topk_parallel) ? 256 : 32), 1, 1)];
+            [encoder dispatchThreadgroups:MTLSizeMake(expert_down_host_order
+                        ? hidden
+                        : (expert_down_multirow_topk_parallel
+                            ? ((hidden + 1) / 2)
+                            : (expert_down_topk_parallel
+                                ? hidden
+                                : (expert_down_rowpair_topk_parallel
+                                    ? ((hidden + 1) / 2)
+                                    : (raw_ggml_experts ? ((hidden + 7) / 8) : hidden)))), 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(expert_down_host_order
+                        ? 1
+                        : (expert_down_rowpair_topk_parallel ? 512 : ((raw_ggml_experts || expert_down_topk_parallel || expert_down_multirow_topk_parallel) ? 256 : 32)), 1, 1)];
         };
         auto encode_expert_down_rowpair_compare = [&](id<MTLComputeCommandEncoder> encoder) {
             [encoder setComputePipelineState:pipelines.expert_down_rowpair_compare_multirow];
@@ -17507,17 +17667,19 @@ extern "C" int supersonic_metal_qwen36_ffn_int4_stage5_with_router(
                     expert_down_rowpair_compare_call_index
                 );
             }
-            const std::string expert_down_label = expert_down_multirow_topk_parallel
-                ? "qwen36_ffn_int4_expert_down_finalize_multirow_topk_parallel"
-                : (expert_down_topk_parallel
-                    ? "qwen36_ffn_int4_expert_down_finalize_topk_parallel"
-                    : (expert_down_rowpair_topk_parallel
-                        ? "qwen36_ffn_int4_expert_down_finalize_rowpair_topk_parallel"
-                        : (expert_down_gathered
-                            ? "qwen36_ffn_int4_expert_down_gathered"
-                            : (raw_ggml_experts
-                                ? "qwen36_ffn_int4_expert_down_finalize_multirow"
-                                : "qwen36_ffn_int4_expert_down_finalize"))));
+            const std::string expert_down_label = expert_down_host_order
+                ? "qwen36_ffn_int4_expert_down_finalize_host_order_stage5"
+                : (expert_down_multirow_topk_parallel
+                    ? "qwen36_ffn_int4_expert_down_finalize_multirow_topk_parallel"
+                    : (expert_down_topk_parallel
+                        ? "qwen36_ffn_int4_expert_down_finalize_topk_parallel"
+                        : (expert_down_rowpair_topk_parallel
+                            ? "qwen36_ffn_int4_expert_down_finalize_rowpair_topk_parallel"
+                            : (expert_down_gathered
+                                ? "qwen36_ffn_int4_expert_down_gathered"
+                                : (raw_ggml_experts
+                                    ? "qwen36_ffn_int4_expert_down_finalize_multirow"
+                                    : "qwen36_ffn_int4_expert_down_finalize")))));
             return submit_profile_phase(
                 encode_expert_down_finalize,
                 expert_down_label,

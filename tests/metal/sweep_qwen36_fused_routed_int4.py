@@ -16,14 +16,16 @@ from typing import Any
 
 
 MODEL = "qwen3.6-35b-a3b"
-SCHEMA = "qwen36-fused-routed-int4-sweep-v42"
+SCHEMA = "qwen36-fused-routed-int4-sweep-v43"
 DEFAULT_MAX_FUSED_WALL_GPU_RATIO = 4.0
 DEFAULT_MAX_WAIT_GPU_RATIO = 4.0
+ROUTED_SILU_ULP_BOUNDARY_SOURCE = "routed_expert_silu_ulp_boundary"
 BF16_BOUNDARY_SOURCES = {
     "shared_mid_to_shared_out_bf16_boundary",
     "shared_out_residual_rounding_boundary",
     "moe_out_residual_rounding_boundary",
     "final_residual_rounding_boundary",
+    ROUTED_SILU_ULP_BOUNDARY_SOURCE,
 }
 COARSE_BATCH_SERIAL_MODE = "full-stage5-router-batch"
 COARSE_BATCH_SIMD_MODE = "full-stage5-router-simd-batch"
@@ -59,6 +61,9 @@ SHARED_ROUTED_HOST_CORRECTED_BATCH_SIMD_MODE = (
 ROUTED_GATE_UP_HOST_ORDER_BATCH_SIMD_MODE = (
     "full-stage5-router-simd-batch-routed-gate-up-host-order"
 )
+ROUTED_GATE_DOWN_HOST_ORDER_BATCH_SIMD_MODE = (
+    "full-stage5-router-simd-batch-routed-gate-down-host-order"
+)
 SHARED_HOST_CORRECTED_ROUTED_GATE_UP_HOST_ORDER_BATCH_SIMD_MODE = (
     "full-stage5-router-simd-batch-shared-host-corrected-routed-gate-up-host-order"
 )
@@ -73,6 +78,9 @@ ROUTED_FINALIZE_TAP_BATCH_SIMD_MODE = (
 )
 ROUTED_GATE_UP_HOST_ORDER_FINALIZE_TAP_BATCH_SIMD_MODE = (
     "full-stage5-router-simd-batch-routed-gate-up-host-order-finalize-tap"
+)
+ROUTED_GATE_DOWN_HOST_ORDER_SILU_TAP_BATCH_SIMD_MODE = (
+    "full-stage5-router-simd-batch-routed-gate-down-host-order-silu-tap"
 )
 SHARED_TILED_MODES = {
     SHARED_TILED_BATCH_SIMD_MODE,
@@ -103,6 +111,8 @@ BATCH_FAST_PROFILE_MODES = {
     ROUTED_FINALIZE_TAP_BATCH_SIMD_MODE,
     ROUTED_GATE_UP_HOST_ORDER_FINALIZE_TAP_BATCH_SIMD_MODE,
     ROUTED_GATE_UP_HOST_ORDER_BATCH_SIMD_MODE,
+    ROUTED_GATE_DOWN_HOST_ORDER_BATCH_SIMD_MODE,
+    ROUTED_GATE_DOWN_HOST_ORDER_SILU_TAP_BATCH_SIMD_MODE,
     SHARED_HOST_CORRECTED_ROUTED_GATE_UP_HOST_ORDER_BATCH_SIMD_MODE,
     SHARED_HOST_CORRECTED_BATCH_SIMD_MODE,
     SHARED_MID_HOST_CORRECTED_BATCH_SIMD_MODE,
@@ -122,6 +132,8 @@ DIAGNOSTIC_ONLY_MODES = {
     ROUTED_GATE_UP_HOST_ORDER_TAP_BATCH_SIMD_MODE,
     ROUTED_FINALIZE_TAP_BATCH_SIMD_MODE,
     ROUTED_GATE_UP_HOST_ORDER_FINALIZE_TAP_BATCH_SIMD_MODE,
+    ROUTED_GATE_DOWN_HOST_ORDER_BATCH_SIMD_MODE,
+    ROUTED_GATE_DOWN_HOST_ORDER_SILU_TAP_BATCH_SIMD_MODE,
     SHARED_HOST_CORRECTED_BATCH_SIMD_MODE,
     SHARED_MID_HOST_CORRECTED_BATCH_SIMD_MODE,
     SHARED_MID_ROUTED_DOWN_RECOMPUTED_BATCH_SIMD_MODE,
@@ -203,6 +215,12 @@ MODE_ALIASES: dict[str, str] = {
     "full-router-simd-batch-routed-gate-up-host-order": ROUTED_GATE_UP_HOST_ORDER_BATCH_SIMD_MODE,
     "routed-gate-up-host-order": ROUTED_GATE_UP_HOST_ORDER_BATCH_SIMD_MODE,
     ROUTED_GATE_UP_HOST_ORDER_BATCH_SIMD_MODE: ROUTED_GATE_UP_HOST_ORDER_BATCH_SIMD_MODE,
+    "router-simd-batch-routed-gate-down-host-order": ROUTED_GATE_DOWN_HOST_ORDER_BATCH_SIMD_MODE,
+    "batch-router-simd-routed-gate-down-host-order": ROUTED_GATE_DOWN_HOST_ORDER_BATCH_SIMD_MODE,
+    "full-router-simd-batch-routed-gate-down-host-order": ROUTED_GATE_DOWN_HOST_ORDER_BATCH_SIMD_MODE,
+    "routed-gate-down-host-order": ROUTED_GATE_DOWN_HOST_ORDER_BATCH_SIMD_MODE,
+    "routed-exact-host-order": ROUTED_GATE_DOWN_HOST_ORDER_BATCH_SIMD_MODE,
+    ROUTED_GATE_DOWN_HOST_ORDER_BATCH_SIMD_MODE: ROUTED_GATE_DOWN_HOST_ORDER_BATCH_SIMD_MODE,
     "router-simd-batch-routed-gate-up-tap": ROUTED_GATE_UP_TAP_BATCH_SIMD_MODE,
     "batch-router-simd-routed-gate-up-tap": ROUTED_GATE_UP_TAP_BATCH_SIMD_MODE,
     "full-router-simd-batch-routed-gate-up-tap": ROUTED_GATE_UP_TAP_BATCH_SIMD_MODE,
@@ -223,6 +241,12 @@ MODE_ALIASES: dict[str, str] = {
     "full-router-simd-batch-routed-gate-up-host-order-finalize-tap": ROUTED_GATE_UP_HOST_ORDER_FINALIZE_TAP_BATCH_SIMD_MODE,
     "routed-gate-up-host-order-finalize-tap": ROUTED_GATE_UP_HOST_ORDER_FINALIZE_TAP_BATCH_SIMD_MODE,
     ROUTED_GATE_UP_HOST_ORDER_FINALIZE_TAP_BATCH_SIMD_MODE: ROUTED_GATE_UP_HOST_ORDER_FINALIZE_TAP_BATCH_SIMD_MODE,
+    "router-simd-batch-routed-gate-down-host-order-silu-tap": ROUTED_GATE_DOWN_HOST_ORDER_SILU_TAP_BATCH_SIMD_MODE,
+    "batch-router-simd-routed-gate-down-host-order-silu-tap": ROUTED_GATE_DOWN_HOST_ORDER_SILU_TAP_BATCH_SIMD_MODE,
+    "full-router-simd-batch-routed-gate-down-host-order-silu-tap": ROUTED_GATE_DOWN_HOST_ORDER_SILU_TAP_BATCH_SIMD_MODE,
+    "routed-gate-down-host-order-silu-tap": ROUTED_GATE_DOWN_HOST_ORDER_SILU_TAP_BATCH_SIMD_MODE,
+    "routed-exact-host-order-silu-tap": ROUTED_GATE_DOWN_HOST_ORDER_SILU_TAP_BATCH_SIMD_MODE,
+    ROUTED_GATE_DOWN_HOST_ORDER_SILU_TAP_BATCH_SIMD_MODE: ROUTED_GATE_DOWN_HOST_ORDER_SILU_TAP_BATCH_SIMD_MODE,
     "router-simd-batch-shared-host-corrected-routed-gate-up-host-order": SHARED_HOST_CORRECTED_ROUTED_GATE_UP_HOST_ORDER_BATCH_SIMD_MODE,
     "batch-router-simd-shared-host-corrected-routed-gate-up-host-order": SHARED_HOST_CORRECTED_ROUTED_GATE_UP_HOST_ORDER_BATCH_SIMD_MODE,
     "full-router-simd-batch-shared-host-corrected-routed-gate-up-host-order": SHARED_HOST_CORRECTED_ROUTED_GATE_UP_HOST_ORDER_BATCH_SIMD_MODE,
@@ -321,6 +345,8 @@ FUSED_OP_NEEDLES = {
     ROUTED_FINALIZE_TAP_BATCH_SIMD_MODE: "qwen36_ffn_int4_stage5_with_router",
     ROUTED_GATE_UP_HOST_ORDER_FINALIZE_TAP_BATCH_SIMD_MODE: "qwen36_ffn_int4_stage5_with_router",
     ROUTED_GATE_UP_HOST_ORDER_BATCH_SIMD_MODE: "qwen36_ffn_int4_stage5_with_router",
+    ROUTED_GATE_DOWN_HOST_ORDER_BATCH_SIMD_MODE: "qwen36_ffn_int4_stage5_with_router",
+    ROUTED_GATE_DOWN_HOST_ORDER_SILU_TAP_BATCH_SIMD_MODE: "qwen36_ffn_int4_stage5_with_router",
     SHARED_HOST_CORRECTED_ROUTED_GATE_UP_HOST_ORDER_BATCH_SIMD_MODE: "qwen36_ffn_int4_stage5_with_router",
     SHARED_HOST_CORRECTED_BATCH_SIMD_MODE: "qwen36_ffn_int4_stage5_with_router",
     SHARED_MID_HOST_CORRECTED_BATCH_SIMD_MODE: "qwen36_ffn_int4_stage5_with_router",
@@ -500,6 +526,16 @@ FUSED_GPU_OP_PREFIXES[ROUTED_GATE_UP_HOST_ORDER_FINALIZE_TAP_BATCH_SIMD_MODE] = 
 FUSED_GPU_OP_PREFIXES[ROUTED_GATE_UP_HOST_ORDER_BATCH_SIMD_MODE] = (
     *FUSED_GPU_OP_PREFIXES["full-stage5-router-simd-batch"],
     "command_buffer_gpu:qwen36_ffn_int4_expert_gate_up_host_order_stage5",
+)
+FUSED_GPU_OP_PREFIXES[ROUTED_GATE_DOWN_HOST_ORDER_BATCH_SIMD_MODE] = (
+    *FUSED_GPU_OP_PREFIXES["full-stage5-router-simd-batch"],
+    "command_buffer_gpu:qwen36_ffn_int4_expert_gate_up_host_order_stage5",
+    "command_buffer_gpu:qwen36_ffn_int4_expert_down_finalize_host_order_stage5",
+)
+FUSED_GPU_OP_PREFIXES[ROUTED_GATE_DOWN_HOST_ORDER_SILU_TAP_BATCH_SIMD_MODE] = (
+    *FUSED_GPU_OP_PREFIXES["full-stage5-router-simd-batch"],
+    "command_buffer_gpu:qwen36_ffn_int4_expert_gate_up_host_order_stage5",
+    "command_buffer_gpu:qwen36_ffn_int4_expert_down_finalize_host_order_stage5",
 )
 FUSED_GPU_OP_PREFIXES[SHARED_HOST_CORRECTED_ROUTED_GATE_UP_HOST_ORDER_BATCH_SIMD_MODE] = (
     *FUSED_GPU_OP_PREFIXES["full-stage5-router-simd-batch"],
@@ -2531,6 +2567,8 @@ def concise_ffn_residual_item(item: dict[str, Any] | None) -> dict[str, Any] | N
         "max_abs_delta": item.get("max_abs_delta"),
         "max_ulp_delta": item.get("max_ulp_delta"),
         "differing_elems": item.get("differing_elems"),
+        "routed_silu_delta": item.get("routed_silu_delta"),
+        "routed_silu_mid_delta": item.get("routed_silu_mid_delta"),
     }
 
 
@@ -2745,6 +2783,29 @@ def matching_decode_batch_tap(
     return None
 
 
+def matching_routed_silu_tap(row: dict[str, Any], layer: int) -> dict[str, Any] | None:
+    matches = [
+        tap
+        for tap in (row.get("routed_gate_up_taps") or [])
+        if int(tap.get("layer", -1)) == layer
+        and str(tap.get("tap_second", "")) == "silu"
+        and float(tap.get("expert_silu_delta_at_mid_argmax") or 0.0) > 0.0
+        and float(tap.get("expert_mid_max_abs") or 0.0) > 0.0
+        and float(tap.get("expert_gate_delta_at_mid_argmax") or 0.0) == 0.0
+        and float(tap.get("expert_up_delta_at_mid_argmax") or 0.0) == 0.0
+    ]
+    if not matches:
+        return None
+    return max(
+        matches,
+        key=lambda tap: (
+            float(tap.get("expert_silu_delta_at_mid_argmax") or 0.0),
+            float(tap.get("expert_mid_max_abs") or 0.0),
+            float(tap.get("final_out_max_abs") or 0.0),
+        ),
+    )
+
+
 def numeric_delta(a: Any, b: Any) -> float | None:
     if a is None or b is None:
         return None
@@ -2791,6 +2852,7 @@ def build_ffn_residual_delta_attribution(
             position,
             layer,
         )
+        routed_silu = matching_routed_silu_tap(row, layer)
 
         shared_idx = None if shared is None else int(shared.get("shared_out_argmax", -1))
         moe_idx = None if routed is None else int(routed.get("moe_out_argmax", -1))
@@ -2811,7 +2873,9 @@ def build_ffn_residual_delta_attribution(
                 shared.get("metal_mid_host_shared_out_at_argmax"),
             )
 
-        if final_matches and shared_matches and topk_match is not False:
+        if routed_silu is not None:
+            source = ROUTED_SILU_ULP_BOUNDARY_SOURCE
+        elif final_matches and shared_matches and topk_match is not False:
             if (
                 metal_mid_host_out_matches_metal is True
                 and metal_mid_host_out_matches_host is False
@@ -2845,6 +2909,12 @@ def build_ffn_residual_delta_attribution(
             "baseline_value_at_delta": comparison.get("baseline_value_at_max_abs"),
             "candidate_value_at_delta": comparison.get("candidate_value_at_max_abs"),
             "source": source,
+            "routed_silu_delta": None
+            if routed_silu is None
+            else routed_silu.get("expert_silu_delta_at_mid_argmax"),
+            "routed_silu_mid_delta": None
+            if routed_silu is None
+            else routed_silu.get("expert_mid_max_abs"),
             "topk_idx_match": topk_match,
             "shared_out_argmax": shared_idx,
             "shared_out_argmax_matches_delta": shared_matches,
@@ -3282,11 +3352,25 @@ def build_env_overrides(args: argparse.Namespace, mode: str) -> dict[str, str]:
         overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH"] = "1"
         overrides["SUPERSONIC_METAL_QWEN36_FFN_STAGE5_ROUTED_FINALIZE_TAP"] = "1"
         overrides["SUPERSONIC_METAL_QWEN36_FFN_EXPERT_GATE_UP_HOST_ORDER_STAGE5"] = "1"
+    elif mode == ROUTED_GATE_DOWN_HOST_ORDER_SILU_TAP_BATCH_SIMD_MODE:
+        overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"] = "1"
+        overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_STAGE5_SIMD"] = "1"
+        overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH"] = "1"
+        overrides["SUPERSONIC_METAL_QWEN36_FFN_STAGE5_ROUTED_SILU_TAP"] = "1"
+        overrides["SUPERSONIC_METAL_QWEN36_FFN_STAGE5_ROUTED_FINALIZE_TAP"] = "1"
+        overrides["SUPERSONIC_METAL_QWEN36_FFN_EXPERT_GATE_UP_HOST_ORDER_STAGE5"] = "1"
+        overrides["SUPERSONIC_METAL_QWEN36_FFN_EXPERT_DOWN_HOST_ORDER_STAGE5"] = "1"
     elif mode == ROUTED_GATE_UP_HOST_ORDER_BATCH_SIMD_MODE:
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"] = "1"
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_STAGE5_SIMD"] = "1"
         overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH"] = "1"
         overrides["SUPERSONIC_METAL_QWEN36_FFN_EXPERT_GATE_UP_HOST_ORDER_STAGE5"] = "1"
+    elif mode == ROUTED_GATE_DOWN_HOST_ORDER_BATCH_SIMD_MODE:
+        overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"] = "1"
+        overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_STAGE5_SIMD"] = "1"
+        overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH"] = "1"
+        overrides["SUPERSONIC_METAL_QWEN36_FFN_EXPERT_GATE_UP_HOST_ORDER_STAGE5"] = "1"
+        overrides["SUPERSONIC_METAL_QWEN36_FFN_EXPERT_DOWN_HOST_ORDER_STAGE5"] = "1"
     elif mode == SHARED_HOST_CORRECTED_ROUTED_GATE_UP_HOST_ORDER_BATCH_SIMD_MODE:
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"] = "1"
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_STAGE5_SIMD"] = "1"
@@ -4751,6 +4835,9 @@ def build_report(
             "max_fused_wall_gpu_ratio": args.promotion_max_fused_wall_gpu_ratio,
             "max_wait_gpu_ratio": args.promotion_max_wait_gpu_ratio,
             "require_profile": args.promotion_require_profile,
+            "known_silu_ulp_tolerance": getattr(
+                args, "promotion_known_silu_ulp_tolerance", False
+            ),
             "allow_layer_output_tolerance": getattr(
                 args, "promotion_allow_layer_output_tolerance", False
             ),
@@ -4820,6 +4907,7 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- layer_output_tap: `{report.get('layer_output_tap', False)}`",
         f"- layer_output_delta_tap: `{report.get('layer_output_delta_tap', False)}`",
         f"- layer_output_delta_all: `{report.get('layer_output_delta_all', False)}`",
+        f"- promotion_known_silu_ulp_tolerance: `{(report.get('promotion_thresholds') or {}).get('known_silu_ulp_tolerance', False)}`",
         f"- promotion_allow_layer_output_tolerance: `{(promotion_gate.get('thresholds') or {}).get('allow_layer_output_tolerance', False)}`",
         f"- promotion_layer_output_max_abs_delta: `{render_float((promotion_gate.get('thresholds') or {}).get('layer_output_max_abs_delta'), 8)}`",
         f"- promotion_layer_output_max_ulp_delta: `{(promotion_gate.get('thresholds') or {}).get('layer_output_max_ulp_delta', 0)}`",
@@ -6269,6 +6357,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="allow layer-output checksum mismatches only when delta rows prove they are within the explicit numeric thresholds",
     )
     parser.add_argument(
+        "--promotion-known-silu-ulp-tolerance",
+        action="store_true",
+        help=(
+            "use the known routed expert SiLU ulp drift policy: enable layer-output "
+            "tolerance, allow only known BF16/SiLU boundary sources, and use one-BF16-ulp row thresholds"
+        ),
+    )
+    parser.add_argument(
         "--promotion-layer-output-max-abs-delta",
         type=float,
         default=0.0,
@@ -6309,6 +6405,23 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
+    if args.promotion_known_silu_ulp_tolerance:
+        args.promotion_allow_layer_output_tolerance = True
+        args.promotion_layer_output_max_abs_delta = max(
+            float(args.promotion_layer_output_max_abs_delta or 0.0),
+            2.44140625e-4,
+        )
+        args.promotion_layer_output_max_ulp_delta = max(
+            int(args.promotion_layer_output_max_ulp_delta or 0),
+            1,
+        )
+        args.promotion_layer_output_max_differing_elems = max(
+            int(args.promotion_layer_output_max_differing_elems or 0),
+            2048,
+        )
+        requested_sources = parse_csv_set(args.promotion_layer_output_allowed_sources)
+        requested_sources.update(BF16_BOUNDARY_SOURCES)
+        args.promotion_layer_output_allowed_sources = ",".join(sorted(requested_sources))
     args.model_dir = resolve_model_dir(args.model_dir, os.environ)
     modes = parse_modes(args.modes)
     prompts = select_prompts(args)
