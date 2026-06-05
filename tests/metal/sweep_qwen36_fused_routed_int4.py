@@ -16,7 +16,7 @@ from typing import Any
 
 
 MODEL = "qwen3.6-35b-a3b"
-SCHEMA = "qwen36-fused-routed-int4-sweep-v43"
+SCHEMA = "qwen36-fused-routed-int4-sweep-v44"
 DEFAULT_MAX_FUSED_WALL_GPU_RATIO = 4.0
 DEFAULT_MAX_WAIT_GPU_RATIO = 4.0
 ROUTED_SILU_ULP_BOUNDARY_SOURCE = "routed_expert_silu_ulp_boundary"

@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use supersonic_bench::runs::{
-    MetaJson, PerfCellJson, PerfStatus, Qwen36ExpertResidencyPolicyJson, RunDir,
+    MetaJson, PerfCellJson, PerfStatus, QuantArtifactJson, Qwen36ExpertResidencyPolicyJson, RunDir,
 };
 
 #[test]
@@ -43,6 +43,7 @@ fn perf_cell_json_status_variants() {
         quant: "bf16".into(),
         arch: "gfx1100".into(),
         backend: "hip".into(),
+        quant_artifact: None,
         prompt: "The quick brown fox jumps over".into(),
         max_new_tokens: 16,
         status: PerfStatus::Ok {
@@ -97,11 +98,12 @@ fn perf_cell_preserves_qwen36_expert_residency_policy_labels() {
     metrics.insert("copied_bytes".to_string(), 2014248960.0);
 
     let cell = PerfCellJson {
-        schema_version: 9,
+        schema_version: 10,
         model: "qwen3.6-35b-a3b".into(),
         quant: "int4".into(),
         arch: "apple-m5-max".into(),
         backend: "metal".into(),
+        quant_artifact: None,
         prompt: "The quick brown fox jumps over".into(),
         max_new_tokens: 16,
         status: PerfStatus::Ok {
@@ -143,6 +145,57 @@ fn perf_cell_preserves_qwen36_expert_residency_policy_labels() {
     assert_eq!(rows[0].miss_policy, "exact_route");
     assert_eq!(rows[0].capacity, 8.0);
     assert_eq!(rows[0].metrics.get("copied_bytes"), Some(&2014248960.0));
+}
+
+#[test]
+fn perf_cell_preserves_lower_precision_quant_artifact_metadata() {
+    let cell = PerfCellJson {
+        schema_version: 10,
+        model: "qwen3.5-0.8b".into(),
+        quant: "int2-4-mixed".into(),
+        arch: "apple-m5-max".into(),
+        backend: "metal".into(),
+        quant_artifact: Some(QuantArtifactJson {
+            profile: "autoround-int2-4-mixed".into(),
+            source_format: "gguf-or-supersonic-bake".into(),
+            source_quant: "SignRoundV2 adaptive INT2/INT4 mixed-bit weight-only".into(),
+            producer: "intel/auto-round --enable_alg_ext AutoScheme".into(),
+            runtime_supported: false,
+            average_bits_per_weight: Some(3.0),
+            notes: vec!["quality gate before runtime support".into()],
+        }),
+        prompt: "The quick brown fox jumps over".into(),
+        max_new_tokens: 16,
+        status: PerfStatus::Skipped {
+            reason: "experimental lower-precision candidate".into(),
+        },
+        stage_timings: None,
+        chain_breakdown: None,
+        lifecycle_timings: None,
+        profile_stage_timings: None,
+        profile_chain_breakdown: None,
+        profile_lifecycle_timings: None,
+        mpp_pilot: None,
+        mps_expert_pilot: None,
+        qwen36_pack_cache: None,
+        qwen36_expert_residency: None,
+        qwen36_expert_residency_policies: None,
+        qwen36_expert_residency_policy_rows: None,
+        metal_profile: None,
+        hal_profile: None,
+        gpu_temp_c_end: None,
+    };
+
+    let s = serde_json::to_string(&cell).unwrap();
+    assert!(s.contains("\"quant_artifact\""));
+    assert!(s.contains("\"average_bits_per_weight\":3.0"));
+    let parsed: PerfCellJson = serde_json::from_str(&s).unwrap();
+    let artifact = parsed
+        .quant_artifact
+        .expect("quant_artifact should round-trip");
+    assert_eq!(artifact.profile, "autoround-int2-4-mixed");
+    assert_eq!(artifact.average_bits_per_weight, Some(3.0));
+    assert!(!artifact.runtime_supported);
 }
 
 #[test]

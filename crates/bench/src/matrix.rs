@@ -6,7 +6,7 @@
 //! the runner registry, you MUST update this table or the test fails.
 
 use crate::perf::{run_one_combo, ComboInvocation, RunPolicy};
-use crate::runs::{MetaJson, PerfCellJson, PerfStatus, RunDir, SCHEMA_VERSION};
+use crate::runs::{MetaJson, PerfCellJson, PerfStatus, QuantArtifactJson, RunDir, SCHEMA_VERSION};
 use anyhow::Result;
 use chrono::Utc;
 use std::path::PathBuf;
@@ -57,6 +57,33 @@ pub struct ComboDescriptor {
     pub quant: &'static str, // "bf16" | "int4" | "fp8r" | "kv-fp8" | "int8"
     pub arch: BenchArch,
     pub min_vram_gib: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LowerPrecisionCandidate {
+    pub model: &'static str,
+    pub quant: &'static str,
+    pub arch: BenchArch,
+    pub profile: &'static str,
+    pub source_format: &'static str,
+    pub source_quant: &'static str,
+    pub producer: &'static str,
+    pub average_bits_per_weight: Option<f64>,
+    pub notes: &'static [&'static str],
+}
+
+impl LowerPrecisionCandidate {
+    pub fn quant_artifact(&self) -> QuantArtifactJson {
+        QuantArtifactJson {
+            profile: self.profile.to_string(),
+            source_format: self.source_format.to_string(),
+            source_quant: self.source_quant.to_string(),
+            producer: self.producer.to_string(),
+            runtime_supported: false,
+            average_bits_per_weight: self.average_bits_per_weight,
+            notes: self.notes.iter().map(|note| (*note).to_string()).collect(),
+        }
+    }
 }
 
 /// Mirrors docs/feature-compatibility.md + docs/performance.md as of 2026-05-05.
@@ -304,8 +331,86 @@ pub static SUPPORTED_COMBOS: &[ComboDescriptor] = &[
     },
 ];
 
+/// Explicit lower-precision probe lanes. These are intentionally not part of
+/// `SUPPORTED_COMBOS`: asking for one writes a skipped perf cell with artifact
+/// metadata until loader/runtime support exists. Keeping the lanes source-owned
+/// lets docs and future AutoRound/SignRoundV2 artifacts use stable names.
+pub static LOWER_PRECISION_CANDIDATES: &[LowerPrecisionCandidate] = &[
+    LowerPrecisionCandidate {
+        model: "qwen3.5-0.8b",
+        quant: "int3",
+        arch: BenchArch::AppleM5Max,
+        profile: "autoround-int3",
+        source_format: "gguf-or-supersonic-bake",
+        source_quant: "SignRoundV2 INT3 weight-only",
+        producer: "intel/auto-round --enable_alg_ext",
+        average_bits_per_weight: Some(3.0),
+        notes: &[
+            "small-model artifact probe before Qwen3.5/Qwen3.6 35B kernels",
+            "quality gate must pass before runtime support is added",
+        ],
+    },
+    LowerPrecisionCandidate {
+        model: "qwen3.5-0.8b",
+        quant: "int2-4-mixed",
+        arch: BenchArch::AppleM5Max,
+        profile: "autoround-int2-4-mixed",
+        source_format: "gguf-or-supersonic-bake",
+        source_quant: "SignRoundV2 adaptive INT2/INT4 mixed-bit weight-only",
+        producer: "intel/auto-round --enable_alg_ext AutoScheme",
+        average_bits_per_weight: Some(3.0),
+        notes: &[
+            "candidate inspired by SignRoundV2 adaptive bit allocation",
+            "records mixed-bit metadata before kernels consume it",
+        ],
+    },
+    LowerPrecisionCandidate {
+        model: "qwen3.5-0.8b",
+        quant: "mxfp4",
+        arch: BenchArch::AppleM5Max,
+        profile: "autoround-mxfp4",
+        source_format: "supersonic-bake",
+        source_quant: "SignRoundV2 MXFP4 weight-only",
+        producer: "intel/auto-round --enable_alg_ext",
+        average_bits_per_weight: Some(4.0),
+        notes: &[
+            "format probe only; Metal unpack/dequant cost decides whether it becomes a perf lane",
+        ],
+    },
+    LowerPrecisionCandidate {
+        model: "qwen3.5-35b-a3b",
+        quant: "int2-4-mixed",
+        arch: BenchArch::AppleM5Max,
+        profile: "autoround-int2-4-mixed",
+        source_format: "gguf-or-supersonic-bake",
+        source_quant: "SignRoundV2 adaptive INT2/INT4 mixed-bit weight-only",
+        producer: "intel/auto-round --enable_alg_ext AutoScheme",
+        average_bits_per_weight: Some(3.0),
+        notes: &["target-model placeholder; run only after the qwen3.5-0.8b artifact probe passes"],
+    },
+];
+
 pub fn combos_for_arch(arch: BenchArch) -> Vec<&'static ComboDescriptor> {
     SUPPORTED_COMBOS.iter().filter(|c| c.arch == arch).collect()
+}
+
+pub fn lower_precision_candidates_for_arch(
+    arch: BenchArch,
+) -> Vec<&'static LowerPrecisionCandidate> {
+    LOWER_PRECISION_CANDIDATES
+        .iter()
+        .filter(|c| c.arch == arch)
+        .collect()
+}
+
+pub fn lower_precision_candidate(
+    model: &str,
+    quant: &str,
+    arch: &BenchArch,
+) -> Option<&'static LowerPrecisionCandidate> {
+    LOWER_PRECISION_CANDIDATES
+        .iter()
+        .find(|c| c.model == model && c.quant == quant && c.arch == *arch)
 }
 
 /// True iff `(model, quant, arch)` can be run by `bench-perf`. Most entries
@@ -389,22 +494,33 @@ pub fn run_matrix(cfg: &MatrixConfig, rd: &RunDir) -> Result<()> {
             // qwen3.6-35b-a3b + bf16). Record a Skipped cell rather than
             // letting the runner produce a useless Error cell.
             if !is_supported_combo(model, quant, &cfg.arch) {
+                let lower_precision_candidate = lower_precision_candidate(model, quant, &cfg.arch);
+                let reason = if let Some(candidate) = lower_precision_candidate {
+                    format!(
+                        "experimental lower-precision candidate for {}: ({}, {}) uses {} but runtime support is not implemented yet",
+                        cfg.arch.as_str(),
+                        candidate.model,
+                        candidate.quant,
+                        candidate.profile
+                    )
+                } else {
+                    format!(
+                        "unsupported combo for {}: ({}, {}) not in SUPPORTED_COMBOS",
+                        cfg.arch.as_str(),
+                        model,
+                        quant
+                    )
+                };
                 let cell = PerfCellJson {
                     schema_version: SCHEMA_VERSION,
                     model: model.clone(),
                     quant: quant.clone(),
                     arch: cfg.arch.as_str().to_string(),
                     backend: cfg.arch.backend().unwrap_or("auto").to_string(),
+                    quant_artifact: lower_precision_candidate.map(|c| c.quant_artifact()),
                     prompt: cfg.prompt.clone(),
                     max_new_tokens: cfg.max_new_tokens,
-                    status: PerfStatus::Skipped {
-                        reason: format!(
-                            "unsupported combo for {}: ({}, {}) not in SUPPORTED_COMBOS",
-                            cfg.arch.as_str(),
-                            model,
-                            quant
-                        ),
-                    },
+                    status: PerfStatus::Skipped { reason },
                     stage_timings: None,
                     chain_breakdown: None,
                     lifecycle_timings: None,

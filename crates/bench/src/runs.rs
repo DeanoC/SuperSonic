@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
-pub const SCHEMA_VERSION: u32 = 9;
+pub const SCHEMA_VERSION: u32 = 10;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetaJson {
@@ -49,6 +49,8 @@ pub struct PerfCellJson {
     pub quant: String,
     pub arch: String,
     pub backend: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quant_artifact: Option<QuantArtifactJson>,
     pub prompt: String,
     pub max_new_tokens: u32,
     #[serde(flatten)]
@@ -82,6 +84,19 @@ pub struct PerfCellJson {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hal_profile: Option<ProfileJson>,
     pub gpu_temp_c_end: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct QuantArtifactJson {
+    pub profile: String,
+    pub source_format: String,
+    pub source_quant: String,
+    pub producer: String,
+    pub runtime_supported: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub average_bits_per_weight: Option<f64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

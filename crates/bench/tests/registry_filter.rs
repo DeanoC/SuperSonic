@@ -1,4 +1,7 @@
-use supersonic_bench::matrix::{combos_for_arch, is_supported_combo, BenchArch};
+use supersonic_bench::matrix::{
+    combos_for_arch, is_supported_combo, lower_precision_candidate,
+    lower_precision_candidates_for_arch, BenchArch,
+};
 
 #[test]
 fn gfx1100_includes_shipping_models() {
@@ -35,6 +38,29 @@ fn apple_m5_max_includes_qwen_moe_metal_lanes() {
     assert!(model_quants.contains(&("qwen3.5-35b-a3b", "q4km-gptq")));
     assert!(model_quants.contains(&("qwen3.5-35b-a3b", "q4km")));
     assert!(!model_quants.contains(&("qwen3.6-35b-a3b", "kv-fp8")));
+}
+
+#[test]
+fn apple_m5_max_tracks_lower_precision_candidates_separately() {
+    let candidates = lower_precision_candidates_for_arch(BenchArch::AppleM5Max);
+    let model_quants: Vec<(&str, &str)> = candidates.iter().map(|c| (c.model, c.quant)).collect();
+
+    assert!(model_quants.contains(&("qwen3.5-0.8b", "int3")));
+    assert!(model_quants.contains(&("qwen3.5-0.8b", "int2-4-mixed")));
+    assert!(model_quants.contains(&("qwen3.5-0.8b", "mxfp4")));
+    assert!(model_quants.contains(&("qwen3.5-35b-a3b", "int2-4-mixed")));
+    assert!(
+        !is_supported_combo("qwen3.5-0.8b", "int2-4-mixed", &BenchArch::AppleM5Max),
+        "lower-precision probes must stay out of SUPPORTED_COMBOS until runtime support exists"
+    );
+
+    let artifact =
+        lower_precision_candidate("qwen3.5-0.8b", "int2-4-mixed", &BenchArch::AppleM5Max)
+            .expect("candidate should be registered")
+            .quant_artifact();
+    assert_eq!(artifact.profile, "autoround-int2-4-mixed");
+    assert_eq!(artifact.average_bits_per_weight, Some(3.0));
+    assert!(!artifact.runtime_supported);
 }
 
 #[test]

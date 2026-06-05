@@ -358,6 +358,7 @@ pub fn run_one_combo(invocation: &ComboInvocation, policy: &RunPolicy) -> Result
             .backend
             .clone()
             .unwrap_or_else(|| "auto".to_string()),
+        quant_artifact: None,
         prompt: invocation.prompt.clone(),
         max_new_tokens: invocation.max_new_tokens,
         status,
