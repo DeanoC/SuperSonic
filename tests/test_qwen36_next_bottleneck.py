@@ -141,7 +141,7 @@ def prefill_report() -> dict:
 
 def bench_perf_report() -> dict:
     return {
-        "schema_version": 9,
+        "schema_version": 10,
         "model": selector.MODEL,
         "quant": "int4",
         "arch": "apple-m5-max",
@@ -248,7 +248,7 @@ class Qwen36NextBottleneckTests(unittest.TestCase):
         self.assertEqual(report["prefill"]["best_mode"], "prototype-default")
         self.assertIn("prototype_linear_attention_orchestration", md)
 
-    def test_includes_schema_v9_bench_perf_as_runtime_evidence(self):
+    def test_includes_schema_v10_bench_perf_as_runtime_evidence(self):
         with tempfile.TemporaryDirectory() as tmp:
             paths = self.write_default_inputs(Path(tmp))
             bench_path = Path(tmp) / "bench.json"
@@ -258,8 +258,8 @@ class Qwen36NextBottleneckTests(unittest.TestCase):
             md = selector.render_markdown(report)
 
         self.assertEqual(report["schema"], selector.SCHEMA)
-        self.assertEqual(report["input_reports"]["bench_perf"]["schema"], 9)
-        self.assertEqual(report["bench_perf"]["schema_version"], 9)
+        self.assertEqual(report["input_reports"]["bench_perf"]["schema"], 10)
+        self.assertEqual(report["bench_perf"]["schema_version"], 10)
         self.assertEqual(report["bench_perf"]["linear_attn_ms_avg"], 31.335)
         self.assertEqual(report["bench_perf"]["profile_linear_attn_ms_avg"], 53.165)
         buckets = {row["bucket"]: row for row in report["decode_bucket_ranking"]}
@@ -346,7 +346,7 @@ class Qwen36NextBottleneckTests(unittest.TestCase):
             write_json(
                 matching.parent.parent / "meta.json",
                 {
-                    "schema_version": 9,
+                    "schema_version": 10,
                     "git_sha": "abc1234",
                     "git_dirty": True,
                     "git_dirty_paths": ["crates/kernel-ffi/src/metal_native.mm"],
@@ -356,7 +356,7 @@ class Qwen36NextBottleneckTests(unittest.TestCase):
             write_json(
                 stale.parent.parent / "meta.json",
                 {
-                    "schema_version": 9,
+                    "schema_version": 10,
                     "git_sha": "abc1234",
                     "git_dirty": True,
                     "git_dirty_paths": ["crates/kernel-ffi/src/metal_native.mm"],
@@ -385,7 +385,7 @@ class Qwen36NextBottleneckTests(unittest.TestCase):
             write_json(
                 stale.parent.parent / "meta.json",
                 {
-                    "schema_version": 9,
+                    "schema_version": 10,
                     "git_sha": "abc1234",
                     "git_dirty": True,
                     "git_dirty_paths": ["crates/kernel-ffi/src/metal_native.mm"],

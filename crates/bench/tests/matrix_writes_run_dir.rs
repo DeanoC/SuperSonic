@@ -118,3 +118,47 @@ fn matrix_runs_ad_hoc_sm86_specprefill_lane() {
         "ad hoc sm86 spec lane should not be filtered out: {cell_text}"
     );
 }
+
+#[test]
+fn matrix_writes_skipped_lower_precision_candidate_with_artifact_metadata() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = MatrixConfig {
+        arch: BenchArch::AppleM5Max,
+        models: vec!["qwen3.5-0.8b".into()],
+        quants: vec!["int2-4-mixed".into()],
+        binary: PathBuf::from("/bin/false"),
+        model_dir_resolver: Box::new(|_| Ok(PathBuf::from("/nonexistent"))),
+        specprefill_draft_dir_resolver: Box::new(|_| None),
+        prompt: "x".into(),
+        max_new_tokens: 1,
+        context_size: None,
+        warmup_tokens: 1,
+        measurement_runs: 1,
+        cooldown_seconds: 0,
+        collect_attribution: true,
+        git_sha: "test".into(),
+        git_dirty: false,
+        git_dirty_paths: vec![],
+        git_diff_hash: Some("clean".into()),
+        runner_version: "test 0.0.0".into(),
+    };
+    let rd = RunDir::new(tmp.path().join("run-lower-precision-skip"));
+    run_matrix(&cfg, &rd).unwrap();
+    let cell_text = std::fs::read_to_string(rd.perf_path("qwen3.5-0.8b", "int2-4-mixed")).unwrap();
+    assert!(
+        cell_text.contains("\"status\": \"skipped\""),
+        "expected skipped status, got: {cell_text}"
+    );
+    assert!(
+        cell_text.contains("experimental lower-precision candidate"),
+        "expected lower-precision reason, got: {cell_text}"
+    );
+    assert!(
+        cell_text.contains("\"quant_artifact\""),
+        "expected quant artifact metadata, got: {cell_text}"
+    );
+    assert!(
+        cell_text.contains("\"profile\": \"autoround-int2-4-mixed\""),
+        "expected AutoRound profile metadata, got: {cell_text}"
+    );
+}

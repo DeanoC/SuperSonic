@@ -130,6 +130,12 @@ pub struct QuantMethodMeta {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parameters: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub average_bits_per_weight: Option<f32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub candidate_weight_bits: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mixed_precision_assignment: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calibration_corpus: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calibration_samples: Option<u32>,
@@ -200,5 +206,34 @@ mod tests {
         assert!(QuantProfile::Int4Hqq.is_native_int4_runtime());
         assert!(QuantProfile::Higgs4.is_runtime_backed_lowbit());
         assert!(!QuantProfile::Bf16.is_native_int4_runtime());
+    }
+
+    #[test]
+    fn quant_method_meta_round_trips_lower_precision_artifact_fields() {
+        let meta = QuantMethodMeta {
+            profile: "autoround-int2-4-mixed".to_string(),
+            parameters: Some(serde_json::json!({"enable_alg_ext": true})),
+            average_bits_per_weight: Some(3.0),
+            candidate_weight_bits: vec!["int2".to_string(), "int4".to_string()],
+            mixed_precision_assignment: Some(serde_json::json!({
+                "layers.0.mlp.down_proj": "int4",
+                "layers.1.mlp.down_proj": "int2"
+            })),
+            calibration_corpus: Some("wikitext2".to_string()),
+            calibration_samples: Some(128),
+            calibration_seqlen: Some(2048),
+            calibration_seed: Some(20260504),
+            source_dtype: Some("bf16".to_string()),
+            producer_version: Some("auto-round enable_alg_ext".to_string()),
+        };
+
+        let s = serde_json::to_string(&meta).unwrap();
+        assert!(s.contains("\"average_bits_per_weight\":3.0"));
+        assert!(s.contains("\"candidate_weight_bits\":[\"int2\",\"int4\"]"));
+        let parsed: QuantMethodMeta = serde_json::from_str(&s).unwrap();
+        assert_eq!(parsed.profile, "autoround-int2-4-mixed");
+        assert_eq!(parsed.average_bits_per_weight, Some(3.0));
+        assert_eq!(parsed.candidate_weight_bits, vec!["int2", "int4"]);
+        assert!(parsed.mixed_precision_assignment.is_some());
     }
 }
