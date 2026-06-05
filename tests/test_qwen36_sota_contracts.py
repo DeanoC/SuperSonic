@@ -116,8 +116,8 @@ class Qwen36SotaContractTests(unittest.TestCase):
         self.assertIn("full-stage5", specs["fused_routed_int4"].refresh_command)
         self.assertIn("full-stage5-router", specs["fused_routed_int4"].refresh_command)
         self.assertIn("direct-defer-wait", specs["fused_routed_int4"].refresh_command)
-        self.assertIn("direct-gather-batch", specs["fused_routed_int4"].refresh_command)
-        self.assertIn("direct-defer-wait-batch", specs["fused_routed_int4"].refresh_command)
+        self.assertNotIn("direct-gather-batch", specs["fused_routed_int4"].refresh_command)
+        self.assertNotIn("direct-defer-wait-batch", specs["fused_routed_int4"].refresh_command)
         self.assertIn("router-defer-wait", specs["fused_routed_int4"].refresh_command)
         self.assertEqual(
             specs["mps_resident_table"].expected_schema,
@@ -163,70 +163,23 @@ class Qwen36SotaContractTests(unittest.TestCase):
         self.assertEqual(specs["mps_resident_table"].gate_keys, ("viability_gate",))
         self.assertEqual(specs["route_residency"].gate_keys, ("decision_gate",))
 
-    def test_fused_direct_batch_modes_set_residency_env(self):
-        modes = fused_sweep.parse_modes(
-            "direct-batch,direct-batch-defer-wait,direct-gather-batch,direct-defer-wait-batch"
-        )
-        self.assertEqual(
-            modes,
-            [
-                fused_sweep.DIRECT_GATHER_BATCH_MODE,
-                fused_sweep.DIRECT_DEFER_WAIT_BATCH_MODE,
-            ],
-        )
-        self.assertIn(
-            fused_sweep.DIRECT_GATHER_BATCH_MODE,
-            fused_sweep.BATCH_FAST_PROFILE_MODES,
-        )
-        self.assertIn(
-            fused_sweep.DIRECT_DEFER_WAIT_BATCH_MODE,
-            fused_sweep.BATCH_FAST_PROFILE_MODES,
-        )
+    def test_fused_direct_batch_modes_are_not_exposed_until_native_shared_split(self):
+        for alias in (
+            "direct-batch",
+            "batch-direct",
+            "direct-gather-batch",
+            "direct-batch-defer",
+            "direct-batch-defer-wait",
+            "batch-direct-defer",
+            "batch-direct-defer-wait",
+            "direct-defer-wait-batch",
+        ):
+            self.assertNotIn(alias, fused_sweep.MODE_ALIASES)
 
-        args = SimpleNamespace(metal_profile=True)
-        direct_batch_env = fused_sweep.build_env_overrides(
-            args,
-            fused_sweep.DIRECT_GATHER_BATCH_MODE,
-        )
-        self.assertEqual(
-            direct_batch_env["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_DIRECT_GATHER_STAGE5"],
-            "1",
-        )
-        self.assertEqual(
-            direct_batch_env["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"],
-            "1",
-        )
-        self.assertEqual(direct_batch_env["SUPERSONIC_METAL_QWEN36_DECODE_BATCH"], "1")
-        self.assertNotIn(
-            "SUPERSONIC_METAL_QWEN36_DEFER_FFN_DIRECT_GATHER_STAGE5_WAIT",
-            direct_batch_env,
-        )
-        self.assertNotIn(
-            "SUPERSONIC_METAL_QWEN36_DEFER_FFN_ROUTER_STAGE5_WAIT",
-            direct_batch_env,
-        )
-
-        defer_batch_env = fused_sweep.build_env_overrides(
-            args,
-            fused_sweep.DIRECT_DEFER_WAIT_BATCH_MODE,
-        )
-        self.assertEqual(
-            defer_batch_env["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_DIRECT_GATHER_STAGE5"],
-            "1",
-        )
-        self.assertEqual(
-            defer_batch_env["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"],
-            "1",
-        )
-        self.assertEqual(defer_batch_env["SUPERSONIC_METAL_QWEN36_DECODE_BATCH"], "1")
-        self.assertEqual(
-            defer_batch_env["SUPERSONIC_METAL_QWEN36_DEFER_FFN_DIRECT_GATHER_STAGE5_WAIT"],
-            "1",
-        )
-        self.assertEqual(
-            defer_batch_env["SUPERSONIC_METAL_QWEN36_DEFER_FFN_ROUTER_STAGE5_WAIT"],
-            "1",
-        )
+        self.assertNotIn("direct-gather-batch", fused_sweep.DEFAULT_MODES)
+        self.assertNotIn("direct-defer-wait-batch", fused_sweep.DEFAULT_MODES)
+        self.assertNotIn("direct-gather-batch", fused_sweep.BATCH_FAST_PROFILE_MODES)
+        self.assertNotIn("direct-defer-wait-batch", fused_sweep.BATCH_FAST_PROFILE_MODES)
 
     def test_batched_prefill_variants_cover_documented_negative_gates(self):
         expected = {

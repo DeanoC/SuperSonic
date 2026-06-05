@@ -27,8 +27,6 @@ BF16_BOUNDARY_SOURCES = {
     "final_residual_rounding_boundary",
     ROUTED_SILU_ULP_BOUNDARY_SOURCE,
 }
-DIRECT_GATHER_BATCH_MODE = "direct-gather-batch"
-DIRECT_DEFER_WAIT_BATCH_MODE = "direct-defer-wait-batch"
 COARSE_BATCH_SERIAL_MODE = "full-stage5-router-batch"
 COARSE_BATCH_SIMD_MODE = "full-stage5-router-simd-batch"
 ROUTER_FUSED_EXACT_BATCH_MODE = "full-stage5-router-fused-exact-batch"
@@ -96,8 +94,6 @@ SHARED_COMPONENT_MODES = {
     SHARED_DOWN_TILED_BATCH_SIMD_MODE,
 }
 BATCH_FAST_PROFILE_MODES = {
-    DIRECT_GATHER_BATCH_MODE,
-    DIRECT_DEFER_WAIT_BATCH_MODE,
     "full-stage5-router-batch",
     "full-stage5-router-simd-batch",
     ROUTER_FUSED_EXACT_BATCH_MODE,
@@ -171,14 +167,6 @@ MODE_ALIASES: dict[str, str] = {
     "direct-defer": "direct-defer-wait",
     "direct-defer-wait": "direct-defer-wait",
     "defer-direct-wait": "direct-defer-wait",
-    "direct-batch": DIRECT_GATHER_BATCH_MODE,
-    "batch-direct": DIRECT_GATHER_BATCH_MODE,
-    "direct-gather-batch": DIRECT_GATHER_BATCH_MODE,
-    "direct-batch-defer": DIRECT_DEFER_WAIT_BATCH_MODE,
-    "direct-batch-defer-wait": DIRECT_DEFER_WAIT_BATCH_MODE,
-    "batch-direct-defer": DIRECT_DEFER_WAIT_BATCH_MODE,
-    "batch-direct-defer-wait": DIRECT_DEFER_WAIT_BATCH_MODE,
-    "direct-defer-wait-batch": DIRECT_DEFER_WAIT_BATCH_MODE,
     "gpu-pack": "gpu-pack",
     "gpack": "gpu-pack",
     "full": "full-stage5",
@@ -331,14 +319,12 @@ MODE_ALIASES: dict[str, str] = {
     "router-defer-wait": "router-defer-wait",
     "defer-router-wait": "router-defer-wait",
 }
-DEFAULT_MODES = "default,direct-gather,direct-defer-wait,direct-gather-batch,direct-defer-wait-batch,gpu-pack,full-stage5,full-stage5-router,router-defer-wait"
+DEFAULT_MODES = "default,direct-gather,direct-defer-wait,gpu-pack,full-stage5,full-stage5-router,router-defer-wait"
 
 FUSED_OP_NEEDLES = {
     "packed": "qwen36_ffn_int4_expert_packed_stage5",
     "direct-gather": "qwen36_ffn_int4_expert_direct_gather_stage5",
     "direct-defer-wait": "qwen36_ffn_int4_expert_direct_gather_stage5",
-    DIRECT_GATHER_BATCH_MODE: "qwen36_ffn_int4_stage5_with_router",
-    DIRECT_DEFER_WAIT_BATCH_MODE: "qwen36_ffn_int4_stage5_with_router",
     "gpu-pack": "qwen36_ffn_int4_expert_gpu_pack_stage5",
     "full-stage5": "qwen36_ffn_int4_stage5",
     "full-stage5-router": "qwen36_ffn_int4_stage5_with_router",
@@ -380,28 +366,6 @@ FUSED_GPU_OP_PREFIXES = {
     "packed": ("command_buffer_gpu:qwen36_ffn_int4_expert_packed_stage5",),
     "direct-gather": ("command_buffer_gpu:qwen36_ffn_int4_expert_direct_gather_stage5",),
     "direct-defer-wait": ("command_buffer_gpu:qwen36_ffn_int4_expert_direct_gather_stage5",),
-    DIRECT_GATHER_BATCH_MODE: (
-        "command_buffer_gpu:qwen36_decode_batch",
-        "command_buffer_gpu:qwen36_ffn_int4_stage5_with_router",
-        "command_buffer_gpu:qwen36_ffn_int4_router_topk_stage5",
-        "command_buffer_gpu:qwen36_ffn_int4_shared_gate_up",
-        "command_buffer_gpu:qwen36_ffn_int4_shared_gate_scalar",
-        "command_buffer_gpu:qwen36_ffn_int4_shared_down",
-        "command_buffer_gpu:qwen36_ffn_int4_expert_gate_up_tiled_stage5",
-        "command_buffer_gpu:qwen36_ffn_int4_expert_gate_up_multirow_stage5",
-        "command_buffer_gpu:qwen36_ffn_int4_expert_down_finalize",
-    ),
-    DIRECT_DEFER_WAIT_BATCH_MODE: (
-        "command_buffer_gpu:qwen36_decode_batch",
-        "command_buffer_gpu:qwen36_ffn_int4_stage5_with_router",
-        "command_buffer_gpu:qwen36_ffn_int4_router_topk_stage5",
-        "command_buffer_gpu:qwen36_ffn_int4_shared_gate_up",
-        "command_buffer_gpu:qwen36_ffn_int4_shared_gate_scalar",
-        "command_buffer_gpu:qwen36_ffn_int4_shared_down",
-        "command_buffer_gpu:qwen36_ffn_int4_expert_gate_up_tiled_stage5",
-        "command_buffer_gpu:qwen36_ffn_int4_expert_gate_up_multirow_stage5",
-        "command_buffer_gpu:qwen36_ffn_int4_expert_down_finalize",
-    ),
     "gpu-pack": ("command_buffer_gpu:qwen36_ffn_int4_expert_gpu_pack",),
     "full-stage5": (
         "command_buffer_gpu:qwen36_ffn_int4_stage5",
@@ -3320,16 +3284,6 @@ def build_env_overrides(args: argparse.Namespace, mode: str) -> dict[str, str]:
     elif mode == "direct-defer-wait":
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_DIRECT_GATHER_STAGE5"] = "1"
         overrides["SUPERSONIC_METAL_QWEN36_DEFER_FFN_DIRECT_GATHER_STAGE5_WAIT"] = "1"
-    elif mode == DIRECT_GATHER_BATCH_MODE:
-        overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_DIRECT_GATHER_STAGE5"] = "1"
-        overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"] = "1"
-        overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH"] = "1"
-    elif mode == DIRECT_DEFER_WAIT_BATCH_MODE:
-        overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_DIRECT_GATHER_STAGE5"] = "1"
-        overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER"] = "1"
-        overrides["SUPERSONIC_METAL_QWEN36_DEFER_FFN_DIRECT_GATHER_STAGE5_WAIT"] = "1"
-        overrides["SUPERSONIC_METAL_QWEN36_DEFER_FFN_ROUTER_STAGE5_WAIT"] = "1"
-        overrides["SUPERSONIC_METAL_QWEN36_DECODE_BATCH"] = "1"
     elif mode == "gpu-pack":
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_PACKED_STAGE5"] = "1"
         overrides["SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_GPU_PACK_STAGE5"] = "1"
