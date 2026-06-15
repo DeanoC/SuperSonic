@@ -442,9 +442,9 @@ pub(crate) struct Cli {
     #[arg(long)]
     pub(crate) bake_release: Option<String>,
 
-    /// Enable DFlash speculative decoding. Requires `--model qwen3.5-9b`,
-    /// `--int4`, and `--dflash-draft-dir`. Target is the Qwen3.5-9B INT4
-    /// bake; draft is the DFlash 5-layer checkpoint shared via Arc.
+    /// Enable DFlash speculative decoding. Requires `--model qwen3.5-9b`
+    /// or `qwen3.6-27b`, a low-bit target bake, and `--dflash-draft-dir`.
+    /// Draft is the DFlash checkpoint shared with target embeddings/head via Arc.
     #[arg(long)]
     pub(crate) dflash: bool,
 
