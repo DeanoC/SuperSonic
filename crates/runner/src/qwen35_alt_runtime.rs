@@ -53,13 +53,18 @@ fn run_qwen35_dflash(
             cli.download_bake,
             model_store::fetch::version_ok_for_variant(variant, &bake_dir),
         ) {
+            let local_bake_ok = dflash_local_bake_ok(cli, variant);
             let canonical_model = model_variant.to_string();
             match try_download_bake(cli, variant, &canonical_model, &bake_dir) {
                 Ok(true) => {
                     eprintln!("[fetch] installed {variant} bake at {}", bake_dir.display());
                 }
                 Ok(false) => {
-                    if q4km_like(cli) {
+                    if local_bake_ok {
+                        eprintln!(
+                            "[fetch] no {variant} bake downloaded; falling back to local bake"
+                        );
+                    } else if q4km_like(cli) {
                         anyhow::bail!(
                             "no {variant} bake at {} and --no-download set.\n\
                              Rerun with --gguf-file /path/to/model.gguf to create a local raw GGML q4km bake, \
@@ -76,7 +81,9 @@ fn run_qwen35_dflash(
                     }
                 }
                 Err(e) => {
-                    if q4km_like(cli) {
+                    if local_bake_ok {
+                        eprintln!("[fetch] {e}; falling back to local bake");
+                    } else if q4km_like(cli) {
                         anyhow::bail!(
                             "could not obtain {variant} bake for --dflash: {e}\n\n\
                              Rerun with --gguf-file /path/to/model.gguf to create a local raw GGML q4km bake, \
@@ -96,4 +103,44 @@ fn run_qwen35_dflash(
     }
 
     qwen35_dflash_engine::run_qwen35_dflash(cli, model_variant, entry, ordinal, total_vram)
+}
+
+fn dflash_local_bake_ok(cli: &Cli, variant: model_store::fetch::BakeVariant) -> bool {
+    variant == model_store::fetch::BakeVariant::Q4Km && cli.gguf_file.is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+    use model_store::fetch::BakeVariant;
+
+    use super::dflash_local_bake_ok;
+    use crate::Cli;
+
+    fn cli(extra: &[&str]) -> Cli {
+        let mut args = vec!["supersonic", "--model-dir", "/tmp/model", "--dry-run"];
+        args.extend_from_slice(extra);
+        Cli::parse_from(args)
+    }
+
+    #[test]
+    fn dflash_allows_local_raw_q4km_bake_from_gguf() {
+        assert!(dflash_local_bake_ok(
+            &cli(&["--q4km", "--gguf-file", "/tmp/model.gguf"]),
+            BakeVariant::Q4Km
+        ));
+    }
+
+    #[test]
+    fn dflash_q4km_download_preflight_still_bails_without_gguf_source() {
+        assert!(!dflash_local_bake_ok(&cli(&["--q4km"]), BakeVariant::Q4Km));
+    }
+
+    #[test]
+    fn dflash_q4km_gptq_is_not_locally_baked_from_raw_gguf() {
+        assert!(!dflash_local_bake_ok(
+            &cli(&["--q4km-gptq"]),
+            BakeVariant::Q4KmGptq
+        ));
+    }
 }
