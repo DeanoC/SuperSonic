@@ -33,11 +33,14 @@ pub(crate) fn load_decode_layers_with_vmm_strategy(
     moe_vmm_mode: MoeExpertVmmMode,
     moe_island_cap_experts: Option<usize>,
     moe_island_protected_experts: Option<usize>,
+    moe_fixed_hot_experts: Option<usize>,
     moe_prefetch_mode: MoeIslandPrefetchMode,
     moe_prefetch_ranks: usize,
     moe_transition_min_observations: u32,
     moe_async_prefetch: bool,
     moe_async_staging_pages: usize,
+    moe_prefetch_evict: bool,
+    moe_prefetch_evict_min_probability: f64,
     persistent_decode: bool,
 ) -> Result<Qwen36DecodeLayers> {
     if let Some(cap_experts) = moe_island_cap_experts {
@@ -57,7 +60,7 @@ pub(crate) fn load_decode_layers_with_vmm_strategy(
         )? {
             unreachable!("forced VMM expert check should either return true or error");
         }
-        let config = MoeExpertResidencyConfig::new(1)?;
+        let config = MoeExpertResidencyConfig::new(1)?.with_prefetch_evict(moe_prefetch_evict);
         let mut manager = MoeExpertResidencyManager::new(ordinal, config);
         let layers = load_all_layer_buffers(
             store,
@@ -96,15 +99,28 @@ pub(crate) fn load_decode_layers_with_vmm_strategy(
         } else {
             0
         };
+        let max_fixed_hot_pages = if let Some(fixed_hot_experts) = moe_fixed_hot_experts {
+            let pages = manager
+                .page_budget_for_routed_experts(fixed_hot_experts)
+                .context(
+                    "derive sparse MoE fixed-hot page budget from routed expert tensor layout",
+                )?
+                .min(max_resident_pages);
+            manager.set_max_fixed_hot_pages(pages);
+            pages
+        } else {
+            0
+        };
         let arena_stats = manager.arena().stats();
         let residency_stats = manager.stats();
         println!(
             "  [vmm] Qwen3.6-MoE sparse routed expert residency active on backend={} device {ordinal}: \
-             tensors={} max_pages={} protected_pages={} logical={:.2}MiB resident={:.2}MiB reserved={:.2}MiB",
+             tensors={} max_pages={} protected_pages={} fixed_hot_pages={} logical={:.2}MiB resident={:.2}MiB reserved={:.2}MiB",
             backend,
             residency_stats.registered_tensors,
             max_resident_pages,
             max_protected_pages,
+            max_fixed_hot_pages,
             arena_stats.logical_bytes as f64 / MIB,
             arena_stats.resident_bytes as f64 / MIB,
             arena_stats.reserved_bytes as f64 / MIB,
@@ -132,6 +148,12 @@ pub(crate) fn load_decode_layers_with_vmm_strategy(
         if moe_async_prefetch {
             println!(
                 "  [vmm] sparse MoE async page-in active (staging_pages={moe_async_staging_pages})"
+            );
+        }
+        if moe_prefetch_evict {
+            println!(
+                "  [vmm] sparse MoE prefetch eviction active \
+                 (transition_min_probability={moe_prefetch_evict_min_probability:.2})"
             );
         }
         return Ok(Qwen36DecodeLayers {

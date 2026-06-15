@@ -5,6 +5,7 @@ use crate::qwen36_moe_telemetry::{MoeIslandPrefetchMode, MoeSparseTelemetry};
 
 pub(crate) const DEFAULT_SPARSE_MOE_PREFETCH_RANKS: usize = 4;
 pub(crate) const DEFAULT_SPARSE_MOE_TRANSITION_MIN_OBSERVATIONS: u32 = 1;
+pub(crate) const DEFAULT_SPARSE_MOE_PREFETCH_EVICT_MIN_PROBABILITY: f64 = 0.90;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MoeExpertVmmMode {
@@ -30,12 +31,18 @@ pub(crate) struct MoeRuntimeConfig {
     pub(crate) vmm_mode: MoeExpertVmmMode,
     pub(crate) island_cap_experts: Option<usize>,
     pub(crate) protected_experts: Option<usize>,
+    pub(crate) fixed_hot_experts: Option<usize>,
     pub(crate) sparse_requested: bool,
     pub(crate) prefetch_mode: MoeIslandPrefetchMode,
     pub(crate) prefetch_ranks: usize,
     pub(crate) transition_min_observations: u32,
     pub(crate) async_prefetch: bool,
     pub(crate) async_staging_pages: usize,
+    pub(crate) prefetch_evict: bool,
+    pub(crate) prefetch_evict_min_probability: f64,
+    pub(crate) protect_demand_routes: bool,
+    pub(crate) hot_protect_min_hits: Option<u32>,
+    pub(crate) fixed_hot_min_hits: Option<u32>,
     pub(crate) sparse_telemetry: Option<MoeSparseTelemetry>,
 }
 
@@ -74,6 +81,23 @@ pub(crate) fn moe_island_protected_experts_from_env_value(
 pub(crate) fn moe_island_protected_experts_from_env() -> Result<Option<usize>> {
     let raw = std::env::var("SUPERSONIC_MOE_ISLAND_PROTECTED_EXPERTS").ok();
     moe_island_protected_experts_from_env_value(raw.as_deref())
+}
+
+pub(crate) fn moe_island_fixed_hot_experts_from_env_value(
+    raw: Option<&str>,
+) -> Result<Option<usize>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let value = raw.parse::<usize>().with_context(|| {
+        format!("parse SUPERSONIC_MOE_ISLAND_FIXED_HOT_EXPERTS={raw:?} as non-negative integer")
+    })?;
+    Ok((value > 0).then_some(value))
+}
+
+pub(crate) fn moe_island_fixed_hot_experts_from_env() -> Result<Option<usize>> {
+    let raw = std::env::var("SUPERSONIC_MOE_ISLAND_FIXED_HOT_EXPERTS").ok();
+    moe_island_fixed_hot_experts_from_env_value(raw.as_deref())
 }
 
 pub(crate) fn moe_island_prefetch_ranks_from_env_value(
@@ -201,6 +225,106 @@ pub(crate) fn moe_island_async_staging_pages_from_env() -> Result<usize> {
     moe_island_async_staging_pages_from_env_value(raw.as_deref())
 }
 
+pub(crate) fn moe_island_prefetch_evict_from_env_value(raw: Option<&str>) -> Result<bool> {
+    match raw {
+        None | Some("0") | Some("off") | Some("disabled") | Some("false") => Ok(false),
+        Some("1") | Some("on") | Some("enabled") | Some("true") => Ok(true),
+        Some(other) => Err(anyhow!(
+            "SUPERSONIC_MOE_ISLAND_PREFETCH_EVICT must be unset, 0, 1, off, on, disabled, enabled, false, or true; got {other:?}"
+        )),
+    }
+}
+
+pub(crate) fn moe_island_prefetch_evict_from_env() -> Result<bool> {
+    let raw = std::env::var("SUPERSONIC_MOE_ISLAND_PREFETCH_EVICT").ok();
+    moe_island_prefetch_evict_from_env_value(raw.as_deref())
+}
+
+pub(crate) fn moe_island_prefetch_evict_min_probability_from_env_value(
+    raw: Option<&str>,
+) -> Result<f64> {
+    let Some(raw) = raw else {
+        return Ok(DEFAULT_SPARSE_MOE_PREFETCH_EVICT_MIN_PROBABILITY);
+    };
+    let probability = raw.parse::<f64>().with_context(|| {
+        format!("parse SUPERSONIC_MOE_ISLAND_PREFETCH_EVICT_MIN_PROB={raw:?} as probability")
+    })?;
+    if !(0.0..=1.0).contains(&probability) {
+        anyhow::bail!(
+            "SUPERSONIC_MOE_ISLAND_PREFETCH_EVICT_MIN_PROB must be in 0.0..=1.0; got {probability}"
+        );
+    }
+    Ok(probability)
+}
+
+pub(crate) fn moe_island_prefetch_evict_min_probability_from_env() -> Result<f64> {
+    let raw = std::env::var("SUPERSONIC_MOE_ISLAND_PREFETCH_EVICT_MIN_PROB").ok();
+    moe_island_prefetch_evict_min_probability_from_env_value(raw.as_deref())
+}
+
+pub(crate) fn moe_island_protect_demand_from_env_value(raw: Option<&str>) -> Result<bool> {
+    match raw {
+        None | Some("0") | Some("off") | Some("disabled") | Some("false") => Ok(false),
+        Some("1") | Some("on") | Some("enabled") | Some("true") => Ok(true),
+        Some(other) => Err(anyhow!(
+            "SUPERSONIC_MOE_ISLAND_PROTECT_DEMAND must be unset, 0, 1, off, on, disabled, enabled, false, or true; got {other:?}"
+        )),
+    }
+}
+
+pub(crate) fn moe_island_protect_demand_from_env() -> Result<bool> {
+    let raw = std::env::var("SUPERSONIC_MOE_ISLAND_PROTECT_DEMAND").ok();
+    moe_island_protect_demand_from_env_value(raw.as_deref())
+}
+
+pub(crate) fn moe_island_hot_protect_min_hits_from_env_value(
+    raw: Option<&str>,
+) -> Result<Option<u32>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    match raw {
+        "0" | "off" | "disabled" | "false" => return Ok(None),
+        _ => {}
+    }
+    let min_hits = raw.parse::<u32>().with_context(|| {
+        format!("parse SUPERSONIC_MOE_ISLAND_HOT_PROTECT_MIN_HITS={raw:?} as positive integer")
+    })?;
+    if min_hits == 0 {
+        anyhow::bail!("SUPERSONIC_MOE_ISLAND_HOT_PROTECT_MIN_HITS must be > 0");
+    }
+    Ok(Some(min_hits))
+}
+
+pub(crate) fn moe_island_hot_protect_min_hits_from_env() -> Result<Option<u32>> {
+    let raw = std::env::var("SUPERSONIC_MOE_ISLAND_HOT_PROTECT_MIN_HITS").ok();
+    moe_island_hot_protect_min_hits_from_env_value(raw.as_deref())
+}
+
+pub(crate) fn moe_island_fixed_hot_min_hits_from_env_value(
+    raw: Option<&str>,
+) -> Result<Option<u32>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    match raw {
+        "0" | "off" | "disabled" | "false" => return Ok(None),
+        _ => {}
+    }
+    let min_hits = raw.parse::<u32>().with_context(|| {
+        format!("parse SUPERSONIC_MOE_ISLAND_FIXED_HOT_MIN_HITS={raw:?} as positive integer")
+    })?;
+    if min_hits == 0 {
+        anyhow::bail!("SUPERSONIC_MOE_ISLAND_FIXED_HOT_MIN_HITS must be > 0");
+    }
+    Ok(Some(min_hits))
+}
+
+pub(crate) fn moe_island_fixed_hot_min_hits_from_env() -> Result<Option<u32>> {
+    let raw = std::env::var("SUPERSONIC_MOE_ISLAND_FIXED_HOT_MIN_HITS").ok();
+    moe_island_fixed_hot_min_hits_from_env_value(raw.as_deref())
+}
+
 pub(crate) fn prepare_moe_runtime_config(
     speculative_decode: bool,
     persistent_decode: bool,
@@ -219,6 +343,7 @@ pub(crate) fn prepare_moe_runtime_config(
     }
     let island_cap_experts = moe_island_cap_experts_from_env()?;
     let protected_experts = moe_island_protected_experts_from_env()?;
+    let fixed_hot_experts = moe_island_fixed_hot_experts_from_env()?;
     if island_cap_experts.is_some() && speculative_decode {
         anyhow::bail!(
             "SUPERSONIC_MOE_ISLAND_CAP_EXPERTS sparse residency is not wired through speculative decode yet"
@@ -240,8 +365,30 @@ pub(crate) fn prepare_moe_runtime_config(
     )?;
     let async_prefetch = moe_island_async_prefetch_from_env()?;
     let async_staging_pages = moe_island_async_staging_pages_from_env()?;
+    let prefetch_evict = moe_island_prefetch_evict_from_env()?;
+    let prefetch_evict_min_probability = moe_island_prefetch_evict_min_probability_from_env()?;
+    let protect_demand_routes = moe_island_protect_demand_from_env()?;
+    let hot_protect_min_hits = moe_island_hot_protect_min_hits_from_env()?;
+    let fixed_hot_min_hits = moe_island_fixed_hot_min_hits_from_env()?;
     if prefetch_mode != MoeIslandPrefetchMode::Disabled && !sparse_requested {
         anyhow::bail!("SUPERSONIC_MOE_ISLAND_PREFETCH requires SUPERSONIC_MOE_ISLAND_CAP_EXPERTS");
+    }
+    if prefetch_evict {
+        if !sparse_requested {
+            anyhow::bail!(
+                "SUPERSONIC_MOE_ISLAND_PREFETCH_EVICT requires SUPERSONIC_MOE_ISLAND_CAP_EXPERTS"
+            );
+        }
+        if prefetch_mode == MoeIslandPrefetchMode::Disabled {
+            anyhow::bail!(
+                "SUPERSONIC_MOE_ISLAND_PREFETCH_EVICT=1 requires SUPERSONIC_MOE_ISLAND_PREFETCH=previous-token, previous-token-resident, or transition"
+            );
+        }
+    }
+    if !prefetch_evict && std::env::var("SUPERSONIC_MOE_ISLAND_PREFETCH_EVICT_MIN_PROB").is_ok() {
+        anyhow::bail!(
+            "SUPERSONIC_MOE_ISLAND_PREFETCH_EVICT_MIN_PROB requires SUPERSONIC_MOE_ISLAND_PREFETCH_EVICT=1"
+        );
     }
     if async_prefetch {
         if !sparse_requested {
@@ -265,6 +412,52 @@ pub(crate) fn prepare_moe_runtime_config(
             "SUPERSONIC_MOE_ISLAND_PROTECTED_EXPERTS requires SUPERSONIC_MOE_ISLAND_CAP_EXPERTS"
         );
     }
+    if fixed_hot_experts.is_some() && !sparse_requested {
+        anyhow::bail!(
+            "SUPERSONIC_MOE_ISLAND_FIXED_HOT_EXPERTS requires SUPERSONIC_MOE_ISLAND_CAP_EXPERTS"
+        );
+    }
+    if protect_demand_routes {
+        if !sparse_requested {
+            anyhow::bail!(
+                "SUPERSONIC_MOE_ISLAND_PROTECT_DEMAND requires SUPERSONIC_MOE_ISLAND_CAP_EXPERTS"
+            );
+        }
+        if protected_experts.is_none() {
+            anyhow::bail!(
+                "SUPERSONIC_MOE_ISLAND_PROTECT_DEMAND=1 requires SUPERSONIC_MOE_ISLAND_PROTECTED_EXPERTS"
+            );
+        }
+    }
+    if hot_protect_min_hits.is_some() {
+        if !sparse_requested {
+            anyhow::bail!(
+                "SUPERSONIC_MOE_ISLAND_HOT_PROTECT_MIN_HITS requires SUPERSONIC_MOE_ISLAND_CAP_EXPERTS"
+            );
+        }
+        if protected_experts.is_none() {
+            anyhow::bail!(
+                "SUPERSONIC_MOE_ISLAND_HOT_PROTECT_MIN_HITS requires SUPERSONIC_MOE_ISLAND_PROTECTED_EXPERTS"
+            );
+        }
+    }
+    if fixed_hot_min_hits.is_some() {
+        if !sparse_requested {
+            anyhow::bail!(
+                "SUPERSONIC_MOE_ISLAND_FIXED_HOT_MIN_HITS requires SUPERSONIC_MOE_ISLAND_CAP_EXPERTS"
+            );
+        }
+        if fixed_hot_experts.is_none() {
+            anyhow::bail!(
+                "SUPERSONIC_MOE_ISLAND_FIXED_HOT_MIN_HITS requires SUPERSONIC_MOE_ISLAND_FIXED_HOT_EXPERTS"
+            );
+        }
+    }
+    if fixed_hot_experts.is_some() && fixed_hot_min_hits.is_none() {
+        anyhow::bail!(
+            "SUPERSONIC_MOE_ISLAND_FIXED_HOT_EXPERTS requires SUPERSONIC_MOE_ISLAND_FIXED_HOT_MIN_HITS"
+        );
+    }
 
     let sparse_telemetry = MoeSparseTelemetry::from_env(
         sparse_requested,
@@ -286,12 +479,18 @@ pub(crate) fn prepare_moe_runtime_config(
         vmm_mode,
         island_cap_experts,
         protected_experts,
+        fixed_hot_experts,
         sparse_requested,
         prefetch_mode,
         prefetch_ranks,
         transition_min_observations,
         async_prefetch,
         async_staging_pages,
+        prefetch_evict,
+        prefetch_evict_min_probability,
+        protect_demand_routes,
+        hot_protect_min_hits,
+        fixed_hot_min_hits,
         sparse_telemetry,
     })
 }
@@ -370,9 +569,13 @@ pub(crate) fn should_try_moe_expert_vmm(
 #[cfg(test)]
 mod tests {
     use super::{
+        moe_island_fixed_hot_experts_from_env_value, moe_island_fixed_hot_min_hits_from_env_value,
+        moe_island_hot_protect_min_hits_from_env_value, moe_island_prefetch_evict_from_env_value,
+        moe_island_prefetch_evict_min_probability_from_env_value,
         moe_island_prefetch_ranks_from_env_value,
         moe_island_prefetch_transition_min_observations_from_env_value,
-        qwen36_kv_vmm_mode_from_env_value, Qwen36KvVmmMode,
+        moe_island_protect_demand_from_env_value, qwen36_kv_vmm_mode_from_env_value,
+        Qwen36KvVmmMode,
     };
     use crate::qwen36_moe_telemetry::MoeIslandPrefetchMode;
     use gpu_hal::Backend;
@@ -519,5 +722,106 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn moe_prefetch_evict_env_accepts_boolean_aliases() {
+        assert!(!moe_island_prefetch_evict_from_env_value(None).unwrap());
+        assert!(!moe_island_prefetch_evict_from_env_value(Some("0")).unwrap());
+        assert!(!moe_island_prefetch_evict_from_env_value(Some("off")).unwrap());
+        assert!(!moe_island_prefetch_evict_from_env_value(Some("false")).unwrap());
+        assert!(moe_island_prefetch_evict_from_env_value(Some("1")).unwrap());
+        assert!(moe_island_prefetch_evict_from_env_value(Some("on")).unwrap());
+        assert!(moe_island_prefetch_evict_from_env_value(Some("true")).unwrap());
+        assert!(moe_island_prefetch_evict_from_env_value(Some("yes")).is_err());
+    }
+
+    #[test]
+    fn moe_prefetch_evict_min_probability_accepts_unit_interval() {
+        assert_eq!(
+            moe_island_prefetch_evict_min_probability_from_env_value(None).unwrap(),
+            0.90
+        );
+        assert_eq!(
+            moe_island_prefetch_evict_min_probability_from_env_value(Some("0")).unwrap(),
+            0.0
+        );
+        assert_eq!(
+            moe_island_prefetch_evict_min_probability_from_env_value(Some("1.0")).unwrap(),
+            1.0
+        );
+        assert!(moe_island_prefetch_evict_min_probability_from_env_value(Some("-0.1")).is_err());
+        assert!(moe_island_prefetch_evict_min_probability_from_env_value(Some("1.1")).is_err());
+    }
+
+    #[test]
+    fn moe_protect_demand_env_accepts_boolean_aliases() {
+        assert!(!moe_island_protect_demand_from_env_value(None).unwrap());
+        assert!(!moe_island_protect_demand_from_env_value(Some("0")).unwrap());
+        assert!(!moe_island_protect_demand_from_env_value(Some("off")).unwrap());
+        assert!(!moe_island_protect_demand_from_env_value(Some("false")).unwrap());
+        assert!(moe_island_protect_demand_from_env_value(Some("1")).unwrap());
+        assert!(moe_island_protect_demand_from_env_value(Some("on")).unwrap());
+        assert!(moe_island_protect_demand_from_env_value(Some("true")).unwrap());
+        assert!(moe_island_protect_demand_from_env_value(Some("yes")).is_err());
+    }
+
+    #[test]
+    fn moe_hot_protect_min_hits_accepts_positive_integer_or_disabled() {
+        assert_eq!(
+            moe_island_hot_protect_min_hits_from_env_value(None).unwrap(),
+            None
+        );
+        assert_eq!(
+            moe_island_hot_protect_min_hits_from_env_value(Some("0")).unwrap(),
+            None
+        );
+        assert_eq!(
+            moe_island_hot_protect_min_hits_from_env_value(Some("off")).unwrap(),
+            None
+        );
+        assert_eq!(
+            moe_island_hot_protect_min_hits_from_env_value(Some("32")).unwrap(),
+            Some(32)
+        );
+        assert!(moe_island_hot_protect_min_hits_from_env_value(Some("yes")).is_err());
+    }
+
+    #[test]
+    fn moe_fixed_hot_experts_accepts_non_negative_integer() {
+        assert_eq!(
+            moe_island_fixed_hot_experts_from_env_value(None).unwrap(),
+            None
+        );
+        assert_eq!(
+            moe_island_fixed_hot_experts_from_env_value(Some("0")).unwrap(),
+            None
+        );
+        assert_eq!(
+            moe_island_fixed_hot_experts_from_env_value(Some("64")).unwrap(),
+            Some(64)
+        );
+        assert!(moe_island_fixed_hot_experts_from_env_value(Some("yes")).is_err());
+    }
+
+    #[test]
+    fn moe_fixed_hot_min_hits_accepts_positive_integer_or_disabled() {
+        assert_eq!(
+            moe_island_fixed_hot_min_hits_from_env_value(None).unwrap(),
+            None
+        );
+        assert_eq!(
+            moe_island_fixed_hot_min_hits_from_env_value(Some("0")).unwrap(),
+            None
+        );
+        assert_eq!(
+            moe_island_fixed_hot_min_hits_from_env_value(Some("off")).unwrap(),
+            None
+        );
+        assert_eq!(
+            moe_island_fixed_hot_min_hits_from_env_value(Some("32")).unwrap(),
+            Some(32)
+        );
+        assert!(moe_island_fixed_hot_min_hits_from_env_value(Some("yes")).is_err());
     }
 }

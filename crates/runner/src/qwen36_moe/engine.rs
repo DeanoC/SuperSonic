@@ -23,7 +23,7 @@ use crate::qwen36_moe_cli::decode_loop::Qwen36DecodeLoopState;
 use crate::qwen36_moe_cli::dry_run::{print_report, run_qwen36_moe_dry_run, DryRunReport};
 use crate::qwen36_moe_cli::generation::{run_generation_step, Qwen36GenerationStep};
 use crate::qwen36_moe_cli::geom::build_multi_layer_geom;
-use crate::qwen36_moe_cli::host::lookup_embed_row;
+use crate::qwen36_moe_cli::host::{lookup_embed_row, lookup_embed_row_timed};
 use crate::qwen36_moe_cli::output::{
     print_decode_stream_start, print_generation_summary, print_last_logits_if_requested,
     print_sampling_summary,
@@ -362,6 +362,7 @@ fn run_inner(
         cli.profile_prefill_json.as_deref(),
         &cli.model,
         keep_mask,
+        cli.progress_heartbeat_seconds,
     )?;
     Ok(())
 }
@@ -403,6 +404,7 @@ fn decode_text(
     profile_prefill_json: Option<&Path>,
     model_name: &str,
     keep_mask: Option<Vec<bool>>,
+    progress_heartbeat_seconds: f64,
 ) -> Result<()> {
     validate_speculative_sampling(speculative_decode, sampling)?;
 
@@ -415,8 +417,27 @@ fn decode_text(
     }
 
     let decode_wall_start = std::time::Instant::now();
+    let progress_interval = (progress_heartbeat_seconds > 0.0)
+        .then(|| std::time::Duration::from_secs_f64(progress_heartbeat_seconds));
+    let mut last_progress = decode_wall_start
+        .checked_sub(progress_interval.unwrap_or(std::time::Duration::ZERO))
+        .unwrap_or(decode_wall_start);
+    let mut progress = |phase: &str, detail: String, force: bool| {
+        let Some(interval) = progress_interval else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        if force || now.duration_since(last_progress) >= interval {
+            eprintln!(
+                "[qwen36-moe progress] phase={phase} elapsed_ms={} {detail}",
+                now.duration_since(decode_wall_start).as_millis()
+            );
+            last_progress = now;
+        }
+    };
     let weight_prefix = report.kernel_params.weight_prefix;
 
+    progress("prompt_setup", "start".to_string(), true);
     let prompt_setup_start = std::time::Instant::now();
     let prompt_setup = prepare_prompt(model_dir, &report.config.text_config, prompt)?;
     let prompt_setup_elapsed = prompt_setup_start.elapsed();
@@ -425,6 +446,12 @@ fn decode_text(
     let eos_id = prompt_setup.eos_id;
     print_prompt_summary(prompt, &prompt_ids);
 
+    progress(
+        "prompt_setup",
+        format!("done prompt_tokens={}", prompt_ids.len()),
+        true,
+    );
+    progress("bake_open", "start".to_string(), true);
     let bake_open_start = std::time::Instant::now();
     let bake = select_decode_bake(model_dir, quant_profile, int4_runtime)?;
     if !bake.weight_mode.is_int4() {
@@ -450,6 +477,11 @@ fn decode_text(
     let store = BakedStore::open(&bake.bake_dir)
         .with_context(|| format!("open BakedStore at {}", bake.bake_dir.display()))?;
     let bake_open_elapsed = bake_open_start.elapsed();
+    progress(
+        "bake_open",
+        format!("done bake_dir={}", bake.bake_dir.display()),
+        true,
+    );
 
     let geom = build_multi_layer_geom(&report.config.text_config, &report.kernel_params);
 
@@ -471,7 +503,6 @@ fn decode_text(
         kv_max_t,
     );
 
-    let layer_load_start = std::time::Instant::now();
     let mut moe_runtime = prepare_moe_runtime_config(
         speculative_decode,
         persistent_decode,
@@ -479,6 +510,15 @@ fn decode_text(
         geom.top_k as usize,
     )?;
     let kv_vmm = should_use_qwen36_kv_vmm(backend, ordinal)?;
+    progress(
+        "layer_load",
+        format!(
+            "start layers={} kv_max_t={} sparse_vmm={:?}",
+            geom.num_layers, kv_max_t, moe_runtime.vmm_mode
+        ),
+        true,
+    );
+    let layer_load_start = std::time::Instant::now();
     let loaded_layers = load_decode_layers_with_vmm_strategy(
         &store,
         ordinal,
@@ -493,11 +533,14 @@ fn decode_text(
         moe_runtime.vmm_mode,
         moe_runtime.island_cap_experts,
         moe_runtime.protected_experts,
+        moe_runtime.fixed_hot_experts,
         moe_runtime.prefetch_mode,
         moe_runtime.prefetch_ranks,
         moe_runtime.transition_min_observations,
         moe_runtime.async_prefetch,
         moe_runtime.async_staging_pages,
+        moe_runtime.prefetch_evict,
+        moe_runtime.prefetch_evict_min_probability,
         persistent_decode,
     )?;
     let mut layers = loaded_layers.layers;
@@ -508,6 +551,12 @@ fn decode_text(
     let mut _moe_expert_residency = loaded_layers.moe_expert_residency;
     let virtual_kv_stats = virtual_kv_stats_for_layers(&layers);
     print_virtual_kv_stats_if_active(virtual_kv_stats, kv_fp8, backend, ordinal);
+    progress(
+        "layer_load",
+        format!("done elapsed_ms={}", layer_load_elapsed.as_millis()),
+        true,
+    );
+    progress("session", "start".to_string(), true);
     let session_start = std::time::Instant::now();
     let max_speculative_tokens = max_speculative_tokens_for_backend(backend);
     if speculative_decode && backend == Backend::Metal && metal_mtp_experiment_enabled() {
@@ -530,6 +579,11 @@ fn decode_text(
         &mut layers,
     )?;
     let session_elapsed = session_start.elapsed();
+    progress(
+        "session",
+        format!("done elapsed_ms={}", session_elapsed.as_millis()),
+        true,
+    );
     let Qwen36DecodeSession {
         final_norm_w_buf,
         lm_head_w_buf,
@@ -643,6 +697,8 @@ fn decode_text(
         moe_runtime.sparse_requested,
         moe_runtime.prefetch_mode,
         moe_runtime.transition_min_observations,
+        moe_runtime.hot_protect_min_hits,
+        moe_runtime.fixed_hot_min_hits,
     );
     // Batched-Q prefill opt-in. Read once. When set the new chunked
     // host orchestrator drives the prefill range
@@ -763,6 +819,19 @@ fn decode_text(
             effective_prompt_len,
             prompt_ids.len(),
         );
+        progress(
+            if is_gen_step { "generate" } else { "prefill" },
+            format!(
+                "step={} total_steps={} rope_position={} cache_position={} generated={} current_token={}",
+                step,
+                loop_state.total_steps,
+                position.rope,
+                position.cache,
+                loop_state.generated_ids.len(),
+                loop_state.current_token
+            ),
+            false,
+        );
         if batched_prefill_disabled
             && dense_prefill_token_loop
             && !is_gen_step
@@ -797,18 +866,35 @@ fn decode_text(
 
         // Embed lookup for the current token.
         let t0 = std::time::Instant::now();
-        let initial_hidden = lookup_embed_row(
-            &store,
-            weight_prefix,
-            loop_state.current_token as usize,
-            geom.hidden as usize,
-        )
-        .with_context(|| {
-            format!(
-                "embed lookup token {} (step {step})",
-                loop_state.current_token
+        let (initial_hidden, embed_lookup_timing) = if emit_stage_timings {
+            let (row, timing) = lookup_embed_row_timed(
+                &store,
+                weight_prefix,
+                loop_state.current_token as usize,
+                geom.hidden as usize,
             )
-        })?;
+            .with_context(|| {
+                format!(
+                    "embed lookup token {} (step {step})",
+                    loop_state.current_token
+                )
+            })?;
+            (row, Some(timing))
+        } else {
+            let row = lookup_embed_row(
+                &store,
+                weight_prefix,
+                loop_state.current_token as usize,
+                geom.hidden as usize,
+            )
+            .with_context(|| {
+                format!(
+                    "embed lookup token {} (step {step})",
+                    loop_state.current_token
+                )
+            })?;
+            (row, None)
+        };
         let t_embed_step = t0.elapsed();
 
         // Run the chain. Linear-attn state mutates in `layers` in place.
@@ -889,6 +975,7 @@ fn decode_text(
             tokenizer: tokenizer.as_ref(),
             sampling,
             t_embed_step,
+            embed_lookup_timing,
             t_chain_step,
             outputs: &outputs,
             final_norm_w_buf: &final_norm_w_buf,

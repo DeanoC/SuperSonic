@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -94,6 +95,10 @@ pub(crate) fn print_and_write_moe_residency_summary(
              prefetch_requests={} prefetch_hits={} prefetch_misses={} \
              prefetch_page_hits={} prefetch_page_misses={} \
              prefetch_skipped={} prefetch_skipped_pages={} \
+             prefetch_evicted_pages={} \
+             fixed_hot_pages={} fixed_hot_page_budget={} fixed_hot_requests={} \
+             fixed_hot_hits={} fixed_hot_misses={} fixed_hot_skipped={} \
+             fixed_hot_evicted_pages={} \
              uploaded={:.2}MiB unmapped={:.2}MiB \
              resident={:.2}MiB peak_resident={:.2}MiB reserved={:.2}MiB \
              kv_resident={:.2}MiB total_vmm_resident={:.2}MiB total_vmm_reserved={:.2}MiB",
@@ -115,6 +120,14 @@ pub(crate) fn print_and_write_moe_residency_summary(
             residency.prefetch_page_misses,
             residency.prefetch_skipped,
             residency.prefetch_skipped_pages,
+            residency.prefetch_evicted_pages,
+            residency.fixed_hot_pages,
+            residency.fixed_hot_page_budget,
+            residency.fixed_hot_requests,
+            residency.fixed_hot_hits,
+            residency.fixed_hot_misses,
+            residency.fixed_hot_skipped,
+            residency.fixed_hot_evicted_pages,
             residency.uploaded_bytes as f64 / MIB,
             residency.unmapped_bytes as f64 / MIB,
             arena.resident_bytes as f64 / MIB,
@@ -132,6 +145,10 @@ pub(crate) fn print_and_write_moe_residency_summary(
              evicted_slices={} evicted_pages={} prefetch_requests={} \
              prefetch_hits={} prefetch_misses={} prefetch_page_hits={} \
              prefetch_page_misses={} prefetch_skipped={} prefetch_skipped_pages={} \
+             prefetch_evicted_pages={} \
+             fixed_hot_pages={} fixed_hot_page_budget={} fixed_hot_requests={} \
+             fixed_hot_hits={} fixed_hot_misses={} fixed_hot_skipped={} \
+             fixed_hot_evicted_pages={} \
              uploaded={:.2}MiB unmapped={:.2}MiB \
              resident={:.2}MiB reserved={:.2}MiB kv_resident={:.2}MiB \
              total_vmm_resident={:.2}MiB total_vmm_reserved={:.2}MiB",
@@ -151,6 +168,14 @@ pub(crate) fn print_and_write_moe_residency_summary(
             residency.prefetch_page_misses,
             residency.prefetch_skipped,
             residency.prefetch_skipped_pages,
+            residency.prefetch_evicted_pages,
+            residency.fixed_hot_pages,
+            residency.fixed_hot_page_budget,
+            residency.fixed_hot_requests,
+            residency.fixed_hot_hits,
+            residency.fixed_hot_misses,
+            residency.fixed_hot_skipped,
+            residency.fixed_hot_evicted_pages,
             residency.uploaded_bytes as f64 / MIB,
             residency.unmapped_bytes as f64 / MIB,
             arena.resident_bytes as f64 / MIB,
@@ -242,6 +267,12 @@ mod tests {
 
         predictor.update(&routes, &previous_routes);
         assert_eq!(predictor.candidates(&previous_routes, 2), vec![20]);
+        let scored = predictor.scored_candidates(&previous_routes, 2);
+        assert_eq!(scored.len(), 1);
+        assert_eq!(scored[0].expert_idx, 20);
+        assert_eq!(scored[0].observations, 2);
+        assert_eq!(scored[0].repeats, 2);
+        assert_eq!(scored[0].reuse_probability(), 1.0);
 
         let later_routes = [
             ExpertRoute {
@@ -257,6 +288,9 @@ mod tests {
         ];
         predictor.update(&later_routes, &previous_routes);
         assert_eq!(predictor.candidates(&previous_routes, 2), vec![20, 10]);
+        let scored = predictor.scored_candidates(&previous_routes, 2);
+        assert_eq!(scored[0].expert_idx, 20);
+        assert!(scored[0].reuse_probability() > scored[1].reuse_probability());
     }
 
     #[test]
@@ -348,6 +382,24 @@ pub(crate) struct MoeTransitionPredictor {
     repeated_current_by_previous_rank: Vec<u32>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MoeTransitionCandidate {
+    pub(crate) expert_idx: usize,
+    pub(crate) previous_rank: usize,
+    pub(crate) repeats: u32,
+    pub(crate) observations: u32,
+}
+
+impl MoeTransitionCandidate {
+    pub(crate) fn reuse_probability(self) -> f64 {
+        if self.observations == 0 {
+            0.0
+        } else {
+            self.repeats as f64 / self.observations as f64
+        }
+    }
+}
+
 impl MoeTransitionPredictor {
     pub(crate) fn new(top_k: usize, min_observations: u32) -> Self {
         Self {
@@ -369,7 +421,11 @@ impl MoeTransitionPredictor {
         }
     }
 
-    pub(crate) fn candidates(&self, previous_routes: &[usize], limit: usize) -> Vec<usize> {
+    pub(crate) fn scored_candidates(
+        &self,
+        previous_routes: &[usize],
+        limit: usize,
+    ) -> Vec<MoeTransitionCandidate> {
         let mut scored = Vec::new();
         for (previous_rank, &expert_idx) in previous_routes.iter().take(self.top_k).enumerate() {
             let observations = self.observations_by_previous_rank[previous_rank];
@@ -380,17 +436,26 @@ impl MoeTransitionPredictor {
             if repeats == 0 {
                 continue;
             }
-            scored.push((repeats, observations, previous_rank, expert_idx));
+            scored.push(MoeTransitionCandidate {
+                expert_idx,
+                previous_rank,
+                repeats,
+                observations,
+            });
         }
         scored.sort_by(|a, b| {
-            let lhs = (a.0 as u64) * (b.1 as u64);
-            let rhs = (b.0 as u64) * (a.1 as u64);
-            rhs.cmp(&lhs).then_with(|| a.2.cmp(&b.2))
+            let lhs = (a.repeats as u64) * (b.observations as u64);
+            let rhs = (b.repeats as u64) * (a.observations as u64);
+            rhs.cmp(&lhs)
+                .then_with(|| a.previous_rank.cmp(&b.previous_rank))
         });
-        scored
+        scored.into_iter().take(limit).collect()
+    }
+
+    pub(crate) fn candidates(&self, previous_routes: &[usize], limit: usize) -> Vec<usize> {
+        self.scored_candidates(previous_routes, limit)
             .into_iter()
-            .take(limit)
-            .map(|(_, _, _, expert_idx)| expert_idx)
+            .map(|candidate| candidate.expert_idx)
             .collect()
     }
 }
@@ -399,6 +464,7 @@ pub(crate) struct MoeRouteRuntime {
     pub(crate) previous_topk_by_layer: Vec<Vec<usize>>,
     pub(crate) route_telemetry: Option<MoeRouteTelemetry>,
     pub(crate) transition_predictors: Option<Vec<MoeTransitionPredictor>>,
+    pub(crate) hot_expert_counts: Option<Vec<HashMap<usize, u32>>>,
 }
 
 impl MoeRouteRuntime {
@@ -408,15 +474,20 @@ impl MoeRouteRuntime {
         sparse_moe_requested: bool,
         prefetch_mode: MoeIslandPrefetchMode,
         transition_min_observations: u32,
+        hot_protect_min_hits: Option<u32>,
+        fixed_hot_min_hits: Option<u32>,
     ) -> Self {
         let route_telemetry = sparse_moe_requested.then(|| MoeRouteTelemetry::new(top_k));
         let transition_predictors = prefetch_mode.transition_weighted().then(|| {
             vec![MoeTransitionPredictor::new(top_k, transition_min_observations); num_layers]
         });
+        let hot_expert_counts = (hot_protect_min_hits.is_some() || fixed_hot_min_hits.is_some())
+            .then(|| vec![HashMap::<usize, u32>::new(); num_layers]);
         Self {
             previous_topk_by_layer: vec![Vec::new(); num_layers],
             route_telemetry,
             transition_predictors,
+            hot_expert_counts,
         }
     }
 
@@ -750,12 +821,18 @@ impl MoeSparseTelemetry {
                 "prefetch_page_misses": after.stats.prefetch_page_misses.saturating_sub(before.stats.prefetch_page_misses),
                 "prefetch_skipped": after.stats.prefetch_skipped.saturating_sub(before.stats.prefetch_skipped),
                 "prefetch_skipped_pages": after.stats.prefetch_skipped_pages.saturating_sub(before.stats.prefetch_skipped_pages),
+                "prefetch_evicted_pages": after.stats.prefetch_evicted_pages.saturating_sub(before.stats.prefetch_evicted_pages),
                 "prefetch_uploaded_bytes": after.stats.prefetch_uploaded_bytes.saturating_sub(before.stats.prefetch_uploaded_bytes),
                 "protect_requests": after.stats.protect_requests.saturating_sub(before.stats.protect_requests),
                 "protect_hits": after.stats.protect_hits.saturating_sub(before.stats.protect_hits),
                 "protect_misses": after.stats.protect_misses.saturating_sub(before.stats.protect_misses),
                 "protect_demotions": after.stats.protect_demotions.saturating_sub(before.stats.protect_demotions),
                 "protected_evicted_pages": after.stats.protected_evicted_pages.saturating_sub(before.stats.protected_evicted_pages),
+                "fixed_hot_requests": after.stats.fixed_hot_requests.saturating_sub(before.stats.fixed_hot_requests),
+                "fixed_hot_hits": after.stats.fixed_hot_hits.saturating_sub(before.stats.fixed_hot_hits),
+                "fixed_hot_misses": after.stats.fixed_hot_misses.saturating_sub(before.stats.fixed_hot_misses),
+                "fixed_hot_skipped": after.stats.fixed_hot_skipped.saturating_sub(before.stats.fixed_hot_skipped),
+                "fixed_hot_evicted_pages": after.stats.fixed_hot_evicted_pages.saturating_sub(before.stats.fixed_hot_evicted_pages),
                 "async_scheduled_pages": after.stats.async_scheduled_pages.saturating_sub(before.stats.async_scheduled_pages),
                 "async_completed_pages": after.stats.async_completed_pages.saturating_sub(before.stats.async_completed_pages),
                 "async_waited_pages": after.stats.async_waited_pages.saturating_sub(before.stats.async_waited_pages),
@@ -768,6 +845,8 @@ impl MoeSparseTelemetry {
                 "pages": after.stats.resident_pages,
                 "protected_pages": after.stats.protected_pages,
                 "protected_page_budget": after.stats.protected_page_budget,
+                "fixed_hot_pages": after.stats.fixed_hot_pages,
+                "fixed_hot_page_budget": after.stats.fixed_hot_page_budget,
                 "page_backed_slices": after.stats.page_backed_slices,
                 "logical_bytes": after.arena.logical_resident_bytes,
                 "physical_bytes": after.arena.resident_bytes,
@@ -789,6 +868,7 @@ impl MoeSparseTelemetry {
                 "prefetch_page_misses": after.stats.prefetch_page_misses,
                 "prefetch_skipped": after.stats.prefetch_skipped,
                 "prefetch_skipped_pages": after.stats.prefetch_skipped_pages,
+                "prefetch_evicted_pages": after.stats.prefetch_evicted_pages,
                 "prefetch_uploaded_bytes": after.stats.prefetch_uploaded_bytes,
                 "protected_pages": after.stats.protected_pages,
                 "protected_page_budget": after.stats.protected_page_budget,
@@ -797,6 +877,13 @@ impl MoeSparseTelemetry {
                 "protect_misses": after.stats.protect_misses,
                 "protect_demotions": after.stats.protect_demotions,
                 "protected_evicted_pages": after.stats.protected_evicted_pages,
+                "fixed_hot_pages": after.stats.fixed_hot_pages,
+                "fixed_hot_page_budget": after.stats.fixed_hot_page_budget,
+                "fixed_hot_requests": after.stats.fixed_hot_requests,
+                "fixed_hot_hits": after.stats.fixed_hot_hits,
+                "fixed_hot_misses": after.stats.fixed_hot_misses,
+                "fixed_hot_skipped": after.stats.fixed_hot_skipped,
+                "fixed_hot_evicted_pages": after.stats.fixed_hot_evicted_pages,
                 "async_scheduled_pages": after.stats.async_scheduled_pages,
                 "async_completed_pages": after.stats.async_completed_pages,
                 "async_waited_pages": after.stats.async_waited_pages,
@@ -837,9 +924,11 @@ impl MoeSparseTelemetry {
                 "registered_tensors": final_snapshot.stats.registered_tensors,
                 "max_resident_pages": manager.max_resident_pages(),
                 "max_protected_pages": manager.max_protected_pages(),
+                "max_fixed_hot_pages": manager.max_fixed_hot_pages(),
                 "final_resident_slices": final_snapshot.stats.resident_slices,
                 "final_resident_pages": final_snapshot.stats.resident_pages,
                 "final_protected_pages": final_snapshot.stats.protected_pages,
+                "final_fixed_hot_pages": final_snapshot.stats.fixed_hot_pages,
                 "final_page_backed_slices": final_snapshot.stats.page_backed_slices,
                 "peak_resident_slices": self.peak_resident_slices,
                 "peak_resident_pages": self.peak_resident_pages,
@@ -879,6 +968,7 @@ impl MoeSparseTelemetry {
                 "prefetch_page_misses": final_snapshot.stats.prefetch_page_misses,
                 "prefetch_skipped": final_snapshot.stats.prefetch_skipped,
                 "prefetch_skipped_pages": final_snapshot.stats.prefetch_skipped_pages,
+                "prefetch_evicted_pages": final_snapshot.stats.prefetch_evicted_pages,
                 "prefetch_uploaded_bytes": final_snapshot.stats.prefetch_uploaded_bytes,
                 "protected_pages": final_snapshot.stats.protected_pages,
                 "protected_page_budget": final_snapshot.stats.protected_page_budget,
@@ -887,6 +977,13 @@ impl MoeSparseTelemetry {
                 "protect_misses": final_snapshot.stats.protect_misses,
                 "protect_demotions": final_snapshot.stats.protect_demotions,
                 "protected_evicted_pages": final_snapshot.stats.protected_evicted_pages,
+                "fixed_hot_pages": final_snapshot.stats.fixed_hot_pages,
+                "fixed_hot_page_budget": final_snapshot.stats.fixed_hot_page_budget,
+                "fixed_hot_requests": final_snapshot.stats.fixed_hot_requests,
+                "fixed_hot_hits": final_snapshot.stats.fixed_hot_hits,
+                "fixed_hot_misses": final_snapshot.stats.fixed_hot_misses,
+                "fixed_hot_skipped": final_snapshot.stats.fixed_hot_skipped,
+                "fixed_hot_evicted_pages": final_snapshot.stats.fixed_hot_evicted_pages,
                 "async_scheduled_pages": final_snapshot.stats.async_scheduled_pages,
                 "async_completed_pages": final_snapshot.stats.async_completed_pages,
                 "async_waited_pages": final_snapshot.stats.async_waited_pages,

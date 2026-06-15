@@ -1,6 +1,6 @@
 //! Page-level bookkeeping helpers for Qwen3.6-MoE sparse residency.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 
 use gpu_hal::{GpuEvent, GpuStream, PinnedHostBuffer};
@@ -83,11 +83,13 @@ pub(crate) fn ranges_overlap(a_start: usize, a_end: usize, b_start: usize, b_end
 pub(crate) fn select_lru_resident_page(
     resident_pages: &HashMap<ResidentPageKey, ResidentPage>,
     protected_pages: &HashMap<ResidentPageKey, u64>,
+    fixed_hot_pages: &HashSet<ResidentPageKey>,
 ) -> Option<(ResidentPageKey, ResidentPage)> {
     resident_pages
         .iter()
         .min_by_key(|(key, page)| {
             (
+                fixed_hot_pages.contains(key),
                 protected_pages.contains_key(key),
                 page.last_used,
                 page.tensor_idx,
