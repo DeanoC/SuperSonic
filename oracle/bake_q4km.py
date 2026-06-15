@@ -1285,7 +1285,15 @@ def main() -> None:
         weight_prefix = infer_weight_prefix(sorted(tensor_index(files)))
     model_name = (args.model or "").lower()
     family = "qwen36-moe" if "35b-a3b" in model_name else "qwen35"
-    out_dir = args.out_dir or (args.model_dir / ".supersonic" / f"v{FORMAT_VERSION}-q4km")
+    if args.out_dir is not None:
+        out_dir = args.out_dir
+    else:
+        bake_suffix = (
+            "q4km-gptq"
+            if args.gguf_file is not None and args.gguf_native_int4
+            else "q4km"
+        )
+        out_dir = args.model_dir / ".supersonic" / f"v{FORMAT_VERSION}-{bake_suffix}"
 
     if args.gguf_file is not None:
         bake_from_gguf(args, weight_prefix, layer_types, family, out_dir)
