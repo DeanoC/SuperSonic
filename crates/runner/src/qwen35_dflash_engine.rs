@@ -548,6 +548,17 @@ pub fn run_qwen35_dflash(
          generated={} decode_ms={decode_ms:.0}",
         generated_ids.len()
     );
+    let ms_per_tok = if generated_ids.is_empty() {
+        0.0
+    } else {
+        decode_ms / generated_ids.len() as f64
+    };
+    eprintln!(
+        "[result] prompt_tokens={} generated_tokens={} decode_ms={decode_ms:.0} \
+         ms_per_tok={ms_per_tok:.2}",
+        prompt_ids.len(),
+        generated_ids.len()
+    );
     let ms_other = (decode_ms - ms_draft - ms_verify - ms_redecode).max(0.0);
     eprintln!(
         "[dflash] breakdown ms: draft={ms_draft:.0} verify={ms_verify:.0} \
