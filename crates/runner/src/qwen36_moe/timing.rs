@@ -25,6 +25,11 @@ pub(crate) struct Qwen36StageTimingTotals {
     chain_full_attn_us: u64,
     chain_linear_attn_us: u64,
     chain_ffn_us: u64,
+    sparse_lookahead_prefetch_us: u64,
+    sparse_router_launch_us: u64,
+    sparse_route_d2h_us: u64,
+    sparse_demand_prefetch_us: u64,
+    sparse_ffn_launch_us: u64,
 }
 
 impl Qwen36StageTimingTotals {
@@ -67,6 +72,11 @@ impl Qwen36StageTimingTotals {
         self.chain_full_attn_us += outputs.kernel_full_attn_us;
         self.chain_linear_attn_us += outputs.kernel_linear_attn_us;
         self.chain_ffn_us += outputs.kernel_ffn_us;
+        self.sparse_lookahead_prefetch_us += outputs.sparse_lookahead_prefetch_us;
+        self.sparse_router_launch_us += outputs.sparse_router_launch_us;
+        self.sparse_route_d2h_us += outputs.sparse_route_d2h_us;
+        self.sparse_demand_prefetch_us += outputs.sparse_demand_prefetch_us;
+        self.sparse_ffn_launch_us += outputs.sparse_ffn_launch_us;
     }
 
     pub(crate) fn print_if_requested(&self, emit_stage_timings: bool) {
@@ -112,5 +122,38 @@ impl Qwen36StageTimingTotals {
             linear_attn_ms,
             ffn_ms,
         );
+        let sparse_total_us = self
+            .sparse_lookahead_prefetch_us
+            .saturating_add(self.sparse_router_launch_us)
+            .saturating_add(self.sparse_route_d2h_us)
+            .saturating_add(self.sparse_demand_prefetch_us)
+            .saturating_add(self.sparse_ffn_launch_us);
+        if sparse_total_us > 0 {
+            let lookahead_ms = (self.sparse_lookahead_prefetch_us as f64) / 1000.0;
+            let router_ms = (self.sparse_router_launch_us as f64) / 1000.0;
+            let route_d2h_ms = (self.sparse_route_d2h_us as f64) / 1000.0;
+            let demand_ms = (self.sparse_demand_prefetch_us as f64) / 1000.0;
+            let ffn_launch_ms = (self.sparse_ffn_launch_us as f64) / 1000.0;
+            eprintln!(
+                "[qwen36-moe sparse-breakdown] gen_steps={} \
+                 lookahead_prefetch_ms_avg={:.3} router_launch_ms_avg={:.3} \
+                 route_d2h_ms_avg={:.3} demand_prefetch_ms_avg={:.3} \
+                 ffn_launch_ms_avg={:.3} \
+                 (lookahead_total_ms={:.1} router_total_ms={:.1} \
+                 route_d2h_total_ms={:.1} demand_total_ms={:.1} \
+                 ffn_launch_total_ms={:.1})",
+                self.gen_steps,
+                lookahead_ms / n,
+                router_ms / n,
+                route_d2h_ms / n,
+                demand_ms / n,
+                ffn_launch_ms / n,
+                lookahead_ms,
+                router_ms,
+                route_d2h_ms,
+                demand_ms,
+                ffn_launch_ms,
+            );
+        }
     }
 }

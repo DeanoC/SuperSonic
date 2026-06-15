@@ -63,9 +63,12 @@ visible in the per-token chain breakdown for these measured decode steps.
 
 The sparse `cap320` row cut total residency from 15.16 GiB to 1.41 GiB at 8k,
 but it was much slower: prefill was 3.63x dense and decode ms/token was 3.19x
-dense. The sparse sweep was stopped after this row while the wrapper was
-idle-waiting, because the 16k sparse rows would be expensive and the first row
-already showed the sparse path is not currently performance-competitive.
+dense. Follow-up work on `perf/qwen36-sparse-vmm-longctx-regression` found that
+this row's `full_attn_ms_avg` was misattributed: segmented sparse persistent
+decode had been reporting router, route D2H, residency page-in/remap, and FFN
+resume work in the full-attention timing bucket. A corrected repro measured
+`full_attn_ms_avg=48.19` and `ffn_ms_avg=114.43` for 8k `cap320`, so the sparse
+regression is in FFN/residency rather than full attention.
 
 The NIAH hit was false for all rows despite identical generated IDs across the
 dense and KV-FP8 rows at each context. These runs used only 4 generated tokens,
@@ -75,6 +78,6 @@ answer recovery.
 ## Next
 
 Do not spend the next pass on 16k sparse timings until the sparse prefill and
-full-attention decode regressions are understood. The higher-value next step is
-to inspect why `cap320` makes full-attention decode 3x slower despite the much
-smaller MoE residency, then rerun only the 8k sparse and sparse+KV-FP8 rows.
+FFN/residency regressions are understood. The higher-value next step is to
+separate page-in/remap time from FFN-only kernel time, then rerun only the 8k
+sparse and sparse+KV-FP8 rows.

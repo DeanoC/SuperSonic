@@ -136,6 +136,34 @@ def main() -> int:
     parser.add_argument("--timeout", type=int, default=2400)
     parser.add_argument("--seed", type=int, default=20260504)
     parser.add_argument("--out-dir", type=Path, default=Path("target/qwen36_longctx_profiles"))
+    parser.add_argument(
+        "--sparse-prefetch",
+        choices=["previous-token", "previous-token-resident", "transition"],
+        help="pass --sparse-prefetch through to sparse long-context rows",
+    )
+    parser.add_argument(
+        "--sparse-prefetch-ranks",
+        help="pass --sparse-prefetch-ranks through to sparse long-context rows",
+    )
+    parser.add_argument(
+        "--sparse-prefetch-transition-min-obs",
+        type=int,
+        help="pass --sparse-prefetch-transition-min-obs through to transition rows",
+    )
+    parser.add_argument(
+        "--sparse-protected-experts",
+        help="pass --sparse-protected-experts through to sparse long-context rows",
+    )
+    parser.add_argument(
+        "--sparse-async-prefetch",
+        action="store_true",
+        help="pass --sparse-async-prefetch through to sparse long-context rows",
+    )
+    parser.add_argument(
+        "--sparse-async-staging-pages",
+        type=int,
+        help="pass --sparse-async-staging-pages through to sparse long-context rows",
+    )
     parser.add_argument("--max-gpu-use", type=int, default=10)
     parser.add_argument("--max-mem-use", type=int, default=5)
     parser.add_argument("--gpu-idle-timeout", type=int, default=7200)
@@ -186,6 +214,28 @@ def main() -> int:
                 "--out-md",
                 str(out_md),
             ]
+            if args.sparse_prefetch:
+                cmd.extend(["--sparse-prefetch", args.sparse_prefetch])
+            if args.sparse_prefetch_ranks:
+                cmd.extend(["--sparse-prefetch-ranks", args.sparse_prefetch_ranks])
+            if args.sparse_prefetch_transition_min_obs is not None:
+                cmd.extend(
+                    [
+                        "--sparse-prefetch-transition-min-obs",
+                        str(args.sparse_prefetch_transition_min_obs),
+                    ]
+                )
+            if args.sparse_protected_experts:
+                cmd.extend(["--sparse-protected-experts", args.sparse_protected_experts])
+            if args.sparse_async_prefetch:
+                cmd.append("--sparse-async-prefetch")
+            if args.sparse_async_staging_pages is not None:
+                cmd.extend(
+                    [
+                        "--sparse-async-staging-pages",
+                        str(args.sparse_async_staging_pages),
+                    ]
+                )
             print(f"[profile-row] context={context} mode={mode}", flush=True)
             proc = subprocess.run(cmd)
             if proc.returncode != 0:

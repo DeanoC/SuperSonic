@@ -65,6 +65,9 @@ class BenchMode:
     sparse_cap: int | None = None
     prefetch_mode: str | None = None
     prefetch_ranks: str | None = None
+    protected_experts: str | None = None
+    async_prefetch: bool = False
+    async_staging_pages: int | None = None
 
 
 def parse_int_list(raw: str) -> list[int]:
@@ -83,7 +86,40 @@ def parse_int_list(raw: str) -> list[int]:
     return deduped
 
 
-def parse_modes(raw: str, sparse_caps: list[int]) -> list[BenchMode]:
+def sparse_policy_suffix(args: argparse.Namespace) -> str:
+    suffix = ""
+    if args.sparse_prefetch:
+        suffix += f"-{args.sparse_prefetch}"
+        if args.sparse_prefetch_ranks:
+            suffix += f"-r{args.sparse_prefetch_ranks}"
+    if args.sparse_protected_experts is not None:
+        suffix += f"-protect{args.sparse_protected_experts}"
+    if args.sparse_async_prefetch:
+        suffix += "-async"
+        if args.sparse_async_staging_pages is not None:
+            suffix += f"-s{args.sparse_async_staging_pages}"
+    return suffix
+
+
+def sparse_mode(
+    label: str,
+    kv_fp8: bool,
+    cap: int,
+    args: argparse.Namespace,
+) -> BenchMode:
+    return BenchMode(
+        f"{label}{sparse_policy_suffix(args)}",
+        kv_fp8=kv_fp8,
+        sparse_cap=cap,
+        prefetch_mode=args.sparse_prefetch,
+        prefetch_ranks=args.sparse_prefetch_ranks,
+        protected_experts=args.sparse_protected_experts,
+        async_prefetch=args.sparse_async_prefetch,
+        async_staging_pages=args.sparse_async_staging_pages,
+    )
+
+
+def parse_modes(raw: str, sparse_caps: list[int], args: argparse.Namespace) -> list[BenchMode]:
     modes: list[BenchMode] = []
     for part in raw.split(","):
         name = part.strip().lower().replace("_", "-")
@@ -95,10 +131,10 @@ def parse_modes(raw: str, sparse_caps: list[int]) -> list[BenchMode]:
             modes.append(BenchMode("int4-kv-fp8", kv_fp8=True))
         elif name in {"sparse", "cap"}:
             for cap in sparse_caps:
-                modes.append(BenchMode(f"cap{cap}", kv_fp8=False, sparse_cap=cap))
+                modes.append(sparse_mode(f"cap{cap}", kv_fp8=False, cap=cap, args=args))
         elif name in {"sparse-kv-fp8", "cap-kv-fp8"}:
             for cap in sparse_caps:
-                modes.append(BenchMode(f"cap{cap}-kv-fp8", kv_fp8=True, sparse_cap=cap))
+                modes.append(sparse_mode(f"cap{cap}-kv-fp8", kv_fp8=True, cap=cap, args=args))
         else:
             raise ValueError(f"unknown mode {part!r}")
     if not modes:
@@ -165,6 +201,13 @@ def parse_stage_timings(output: str) -> dict[str, float]:
 
 def parse_chain_breakdown(output: str) -> dict[str, float]:
     match = re.search(r"\[qwen36-moe chain-breakdown\]\s+(.+)", output)
+    if not match:
+        return {}
+    return parse_key_value_floats(match.group(1))
+
+
+def parse_sparse_breakdown(output: str) -> dict[str, float]:
+    match = re.search(r"\[qwen36-moe sparse-breakdown\]\s+(.+)", output)
     if not match:
         return {}
     return parse_key_value_floats(match.group(1))
@@ -311,6 +354,10 @@ def build_run_env(
     env.pop("SUPERSONIC_MOE_ISLAND_TELEMETRY_JSON", None)
     env.pop("SUPERSONIC_MOE_ISLAND_PREFETCH", None)
     env.pop("SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS", None)
+    env.pop("SUPERSONIC_MOE_ISLAND_PREFETCH_TRANSITION_MIN_OBS", None)
+    env.pop("SUPERSONIC_MOE_ISLAND_PROTECTED_EXPERTS", None)
+    env.pop("SUPERSONIC_MOE_ISLAND_ASYNC_PREFETCH", None)
+    env.pop("SUPERSONIC_MOE_ISLAND_ASYNC_STAGING_PAGES", None)
     env.pop("SUPERSONIC_VMM_MOE_ISLANDS", None)
     env.pop("SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL", None)
     env.pop("SUPERSONIC_QWEN36_MOE_BATCHED_ATTN", None)
@@ -324,6 +371,18 @@ def build_run_env(
             env["SUPERSONIC_MOE_ISLAND_PREFETCH"] = mode.prefetch_mode
         if mode.prefetch_ranks:
             env["SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS"] = mode.prefetch_ranks
+        if mode.prefetch_mode == "transition" and args.sparse_prefetch_transition_min_obs is not None:
+            env["SUPERSONIC_MOE_ISLAND_PREFETCH_TRANSITION_MIN_OBS"] = str(
+                args.sparse_prefetch_transition_min_obs
+            )
+        if mode.protected_experts is not None:
+            env["SUPERSONIC_MOE_ISLAND_PROTECTED_EXPERTS"] = mode.protected_experts
+        if mode.async_prefetch:
+            env["SUPERSONIC_MOE_ISLAND_ASYNC_PREFETCH"] = "1"
+            if mode.async_staging_pages is not None:
+                env["SUPERSONIC_MOE_ISLAND_ASYNC_STAGING_PAGES"] = str(
+                    mode.async_staging_pages
+                )
     if getattr(args, "no_batched_prefill", False):
         # M13: batched prefill is the default; this flag disables all three
         # stages of the batched path for A/B comparison against the legacy
@@ -406,6 +465,7 @@ def run_one(
             "generated_ids": parse_tokens(output),
             "stage": parse_stage_timings(output),
             "chain_breakdown": parse_chain_breakdown(output),
+            "sparse_breakdown": parse_sparse_breakdown(output),
             "lifecycle": parse_lifecycle_timings(output),
             "result": parse_result(output),
             "vmm_residency": dense_vmm_residency(output),
@@ -433,6 +493,7 @@ def run_one(
         "generated_ids": parse_tokens(output),
         "stage": parse_stage_timings(output),
         "chain_breakdown": parse_chain_breakdown(output),
+        "sparse_breakdown": parse_sparse_breakdown(output),
         "lifecycle": parse_lifecycle_timings(output),
         "result": parse_result(output),
         "stdout_tail": proc.stdout[-1600:],
@@ -663,6 +724,34 @@ def main() -> int:
              "(plus _BATCHED_ATTN=0 and _GROUPED_FFN=0) to bench against "
              "the legacy per-token persistent-decode path for A/B comparison.",
     )
+    parser.add_argument(
+        "--sparse-prefetch",
+        choices=["previous-token", "previous-token-resident", "transition"],
+        help="set SUPERSONIC_MOE_ISLAND_PREFETCH for sparse cap rows",
+    )
+    parser.add_argument(
+        "--sparse-prefetch-ranks",
+        help="set SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS for sparse cap rows",
+    )
+    parser.add_argument(
+        "--sparse-prefetch-transition-min-obs",
+        type=int,
+        help="set SUPERSONIC_MOE_ISLAND_PREFETCH_TRANSITION_MIN_OBS for transition rows",
+    )
+    parser.add_argument(
+        "--sparse-protected-experts",
+        help="set SUPERSONIC_MOE_ISLAND_PROTECTED_EXPERTS for sparse cap rows",
+    )
+    parser.add_argument(
+        "--sparse-async-prefetch",
+        action="store_true",
+        help="set SUPERSONIC_MOE_ISLAND_ASYNC_PREFETCH=1 for sparse cap rows",
+    )
+    parser.add_argument(
+        "--sparse-async-staging-pages",
+        type=int,
+        help="set SUPERSONIC_MOE_ISLAND_ASYNC_STAGING_PAGES for sparse cap rows",
+    )
     parser.add_argument("--out-json", type=Path, default=Path("target/qwen36_longctx.json"))
     parser.add_argument("--out-md", type=Path, default=Path("target/qwen36_longctx.md"))
     args = apply_preset_defaults(parser.parse_args())
@@ -670,9 +759,19 @@ def main() -> int:
     try:
         contexts = parse_int_list(args.contexts)
         sparse_caps = parse_int_list(args.sparse_caps)
-        modes = parse_modes(args.modes, sparse_caps)
+        modes = parse_modes(args.modes, sparse_caps, args)
     except ValueError as exc:
         parser.error(str(exc))
+    if args.sparse_prefetch_ranks is not None and not args.sparse_prefetch:
+        parser.error("--sparse-prefetch-ranks requires --sparse-prefetch")
+    if args.sparse_prefetch_transition_min_obs is not None and args.sparse_prefetch != "transition":
+        parser.error("--sparse-prefetch-transition-min-obs requires --sparse-prefetch=transition")
+    if args.sparse_async_prefetch and not args.sparse_prefetch:
+        parser.error("--sparse-async-prefetch requires --sparse-prefetch")
+    if args.sparse_async_staging_pages is not None and args.sparse_async_staging_pages <= 0:
+        parser.error("--sparse-async-staging-pages must be > 0")
+    if args.sparse_async_staging_pages is not None and not args.sparse_async_prefetch:
+        parser.error("--sparse-async-staging-pages requires --sparse-async-prefetch")
     if args.max_new_tokens <= 0:
         parser.error("--max-new-tokens must be > 0")
     if args.warmup_new_tokens <= 0:
@@ -721,6 +820,12 @@ def main() -> int:
         "preset": args.preset,
         "contexts": contexts,
         "modes": [mode.label for mode in modes],
+        "sparse_prefetch": args.sparse_prefetch,
+        "sparse_prefetch_ranks": args.sparse_prefetch_ranks,
+        "sparse_prefetch_transition_min_obs": args.sparse_prefetch_transition_min_obs,
+        "sparse_protected_experts": args.sparse_protected_experts,
+        "sparse_async_prefetch": args.sparse_async_prefetch,
+        "sparse_async_staging_pages": args.sparse_async_staging_pages,
         "max_new_tokens": args.max_new_tokens,
         "seed": args.seed,
         "summary": summary,
