@@ -4954,11 +4954,13 @@ int persistent_decode_device(
     const bool coop_requested =
         std::getenv("SUPERSONIC_QWEN4B_COOP") != nullptr || preset_coop_hint;
     constexpr int block_size = 256;
-    // LDS: reduction scratch [block_size] + input cache [max(batch_size * hidden_dim, intermediate_size)]
-    //      + FP8 LUT [256] (only when fp8_scales != nullptr, but always allocated for simplicity)
-    const size_t input_cache = static_cast<size_t>(hidden_dim) * batch_size > static_cast<size_t>(intermediate_size)
-        ? static_cast<size_t>(hidden_dim) * batch_size
-        : static_cast<size_t>(intermediate_size);
+    // LDS: reduction scratch [block_size] + input cache + FP8 LUT [256].
+    // The persistent kernel no longer caches the full MLP intermediate in LDS;
+    // down-proj streams it from global scratch. Keep enough cache for hidden
+    // vectors and attention/output-projection inputs on Qwen3.5/3.6.
+    const size_t hidden_cache = static_cast<size_t>(hidden_dim) * batch_size;
+    const size_t attention_cache = static_cast<size_t>(hidden_dim) * 2;
+    const size_t input_cache = hidden_cache > attention_cache ? hidden_cache : attention_cache;
     const size_t fp8_lut_size = 256;  // FP8 E4M3 → F32 lookup table
     const size_t shared_bytes = (block_size + input_cache + fp8_lut_size) * sizeof(float);
 

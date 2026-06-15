@@ -1188,6 +1188,7 @@ def bake_from_gguf(args, weight_prefix: str, layer_types: list[str], family: str
             raw_layout = ggml_k_layout(info.ggml_type)
             if (
                 raw_layout is not None
+                and not args.gguf_native_int4
                 # The runtime lm-head path expects BF16 or native INT4 sidecars,
                 # not raw GGML K-block bytes.
                 and mapped != "lm_head.weight"
@@ -1234,8 +1235,16 @@ def bake_from_gguf(args, weight_prefix: str, layer_types: list[str], family: str
             raise SystemExit("GGUF import produced no SuperSonic tensors; unsupported tensor naming?")
         tensors_out.sort(key=lambda x: x[0])
         log(f"[q4km] quantized {quantized} tensors, skipped {skipped} unmapped GGUF tensors")
-        source_quant = "ggml-q4-k-family+gptq-hessian" if quantizer == QUANT_GPTQ else "ggml-q4-k-family"
-        quant_profile = "q4km-ggml-v1"
+        if args.gguf_native_int4:
+            source_quant = (
+                "ggml-q4-k-family+native-gptq-hessian"
+                if quantizer == QUANT_GPTQ
+                else "ggml-q4-k-family+native-minmax"
+            )
+            quant_profile = "q4km-gptq-v1"
+        else:
+            source_quant = "ggml-q4-k-family+gptq-hessian" if quantizer == QUANT_GPTQ else "ggml-q4-k-family"
+            quant_profile = "q4km-ggml-v1"
         write_bake(out_dir, tensors_out, family, "gguf", source_quant, quant_profile)
     finally:
         gguf.close()
@@ -1246,6 +1255,17 @@ def main() -> None:
     ap.add_argument("--model-dir", required=True, type=Path)
     ap.add_argument("--model", default=None)
     ap.add_argument("--gguf-file", type=Path, default=None)
+    ap.add_argument(
+        "--gguf-native-int4",
+        action="store_true",
+        help=(
+            "When importing GGUF, dequantize GGML K-block projection tensors "
+            "and emit SuperSonic's native INT4 sidecar layout instead of raw "
+            "GGML blocks. This produces a q4km-gptq runtime package; with the "
+            "default --quantizer minmax it is calibration-free but not "
+            "Hessian-GPTQ quality."
+        ),
+    )
     ap.add_argument("--group-size", type=int, default=128)
     ap.add_argument("--out-dir", type=Path, default=None)
     ap.add_argument("--quantizer", choices=[QUANT_MINMAX, QUANT_GPTQ], default=QUANT_MINMAX)

@@ -361,6 +361,7 @@ fn run_inner(
         cli.profile_prefill,
         cli.profile_prefill_json.as_deref(),
         &cli.model,
+        cli.ignore_eos,
         keep_mask,
     )?;
     Ok(())
@@ -402,6 +403,7 @@ fn decode_text(
     profile_prefill: bool,
     profile_prefill_json: Option<&Path>,
     model_name: &str,
+    ignore_eos: bool,
     keep_mask: Option<Vec<bool>>,
 ) -> Result<()> {
     validate_speculative_sampling(speculative_decode, sampling)?;
@@ -422,7 +424,11 @@ fn decode_text(
     let prompt_setup_elapsed = prompt_setup_start.elapsed();
     let tokenizer = prompt_setup.tokenizer;
     let prompt_ids = prompt_setup.prompt_ids;
-    let eos_id = prompt_setup.eos_id;
+    let eos_id = if ignore_eos {
+        None
+    } else {
+        prompt_setup.eos_id
+    };
     print_prompt_summary(prompt, &prompt_ids);
 
     let bake_open_start = std::time::Instant::now();

@@ -54,7 +54,7 @@ pub(crate) fn run_qwen35_decode_loop(
 
     let decode_start = Instant::now();
     for step in 0..decode.cli.max_new_tokens {
-        if decode.eos_ids.contains(&next_token) {
+        if !decode.cli.ignore_eos && decode.eos_ids.contains(&next_token) {
             break;
         }
 

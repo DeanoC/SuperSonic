@@ -27,6 +27,10 @@ pub(crate) struct Cli {
     #[arg(long, default_value = "8")]
     pub(crate) max_new_tokens: usize,
 
+    /// Continue until --max-new-tokens even if the model emits EOS.
+    #[arg(long)]
+    pub(crate) ignore_eos: bool,
+
     /// Sampling temperature. 0 = greedy argmax (default; reproducible).
     /// Typical sampled values: 0.7–1.0.
     #[arg(long, default_value = "0.0")]
