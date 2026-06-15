@@ -134,6 +134,7 @@ def main() -> int:
     parser.add_argument("--sparse-caps")
     parser.add_argument("--max-new-tokens", type=int, default=4)
     parser.add_argument("--timeout", type=int, default=2400)
+    parser.add_argument("--heartbeat-seconds", type=float, default=30.0)
     parser.add_argument("--seed", type=int, default=20260504)
     parser.add_argument("--out-dir", type=Path, default=Path("target/qwen36_longctx_profiles"))
     parser.add_argument(
@@ -155,6 +156,25 @@ def main() -> int:
         help="pass --sparse-protected-experts through to sparse long-context rows",
     )
     parser.add_argument(
+        "--sparse-protect-demand",
+        action="store_true",
+        help="pass --sparse-protect-demand through to sparse long-context rows",
+    )
+    parser.add_argument(
+        "--sparse-hot-protect-min-hits",
+        type=int,
+        help="pass --sparse-hot-protect-min-hits through to sparse long-context rows",
+    )
+    parser.add_argument(
+        "--sparse-fixed-hot-experts",
+        help="pass --sparse-fixed-hot-experts through to sparse long-context rows",
+    )
+    parser.add_argument(
+        "--sparse-fixed-hot-min-hits",
+        type=int,
+        help="pass --sparse-fixed-hot-min-hits through to sparse long-context rows",
+    )
+    parser.add_argument(
         "--sparse-async-prefetch",
         action="store_true",
         help="pass --sparse-async-prefetch through to sparse long-context rows",
@@ -163,6 +183,16 @@ def main() -> int:
         "--sparse-async-staging-pages",
         type=int,
         help="pass --sparse-async-staging-pages through to sparse long-context rows",
+    )
+    parser.add_argument(
+        "--sparse-prefetch-evict",
+        action="store_true",
+        help="pass --sparse-prefetch-evict through to sparse long-context rows",
+    )
+    parser.add_argument(
+        "--sparse-prefetch-evict-min-prob",
+        type=float,
+        help="pass --sparse-prefetch-evict-min-prob through to sparse long-context rows",
     )
     parser.add_argument("--max-gpu-use", type=int, default=10)
     parser.add_argument("--max-mem-use", type=int, default=5)
@@ -207,6 +237,8 @@ def main() -> int:
                 "--no-warmup",
                 "--timeout",
                 str(args.timeout),
+                "--heartbeat-seconds",
+                str(args.heartbeat_seconds),
                 "--seed",
                 str(args.seed),
                 "--out-json",
@@ -227,6 +259,24 @@ def main() -> int:
                 )
             if args.sparse_protected_experts:
                 cmd.extend(["--sparse-protected-experts", args.sparse_protected_experts])
+            if args.sparse_protect_demand:
+                cmd.append("--sparse-protect-demand")
+            if args.sparse_hot_protect_min_hits is not None:
+                cmd.extend(
+                    [
+                        "--sparse-hot-protect-min-hits",
+                        str(args.sparse_hot_protect_min_hits),
+                    ]
+                )
+            if args.sparse_fixed_hot_experts:
+                cmd.extend(["--sparse-fixed-hot-experts", args.sparse_fixed_hot_experts])
+            if args.sparse_fixed_hot_min_hits is not None:
+                cmd.extend(
+                    [
+                        "--sparse-fixed-hot-min-hits",
+                        str(args.sparse_fixed_hot_min_hits),
+                    ]
+                )
             if args.sparse_async_prefetch:
                 cmd.append("--sparse-async-prefetch")
             if args.sparse_async_staging_pages is not None:
@@ -234,6 +284,15 @@ def main() -> int:
                     [
                         "--sparse-async-staging-pages",
                         str(args.sparse_async_staging_pages),
+                    ]
+                )
+            if args.sparse_prefetch_evict:
+                cmd.append("--sparse-prefetch-evict")
+            if args.sparse_prefetch_evict_min_prob is not None:
+                cmd.extend(
+                    [
+                        "--sparse-prefetch-evict-min-prob",
+                        str(args.sparse_prefetch_evict_min_prob),
                     ]
                 )
             print(f"[profile-row] context={context} mode={mode}", flush=True)
