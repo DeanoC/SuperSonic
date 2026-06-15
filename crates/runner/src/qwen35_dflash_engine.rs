@@ -1,6 +1,6 @@
-//! Qwen3.5-9B DFlash speculative-decoding engine (M3.3).
+//! Dense Qwen DFlash speculative-decoding engine (M3.3).
 //!
-//! Drives the target (Qwen3.5-9B INT4) and the DFlash draft together through
+//! Drives a dense Qwen low-bit target and the DFlash draft together through
 //! the speculative loop described in `docs/dflash.md` §5–§6:
 //!
 //! 1. Prefill target with prompt (via `prefill_with_taps`); keep the last
@@ -24,7 +24,7 @@
 //!    f. Rewind target's full-attention `kv_filled` to `L + accepted + 1`.
 //!    g. Crop the draft's KV cache to the new committed length.
 
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 use std::time::Instant;
 
 use anyhow::{anyhow, bail, Result};
@@ -34,11 +34,12 @@ use qwen35::state::LinearStateSnapshot;
 use qwen35::weights::Qwen35Weights;
 use qwen35_dflash as dflash;
 
+use crate::bakes::{effective_quant_profile, load_qwen35_weights};
 use crate::decode_engine::DecodeEngine;
 use crate::registry::{FamilyParams, ModelVariant, RegistryEntry};
 use crate::Cli;
 
-/// Run the Qwen3.5-9B DFlash speculative decoder. Parallels
+/// Run the dense-Qwen DFlash speculative decoder. Parallels
 /// `phi4_engine::run_phi4` in shape — but drives both target and draft
 /// models through the speculative loop.
 pub fn run_qwen35_dflash(
@@ -49,11 +50,26 @@ pub fn run_qwen35_dflash(
     total_vram: u64,
 ) -> Result<()> {
     // --------- 1. Validate CLI combo -------------------------------------
-    if !cli.int4 {
-        bail!("--dflash requires --int4 (Qwen3.5-9B INT4 target)");
+    if !matches!(
+        model_variant,
+        ModelVariant::Qwen3_5_9B | ModelVariant::Qwen3_6_27B
+    ) {
+        bail!(
+            "--dflash is supported for --model qwen3.5-9b and qwen3.6-27b \
+             (got {model_variant})"
+        );
     }
-    if model_variant.to_string() != "qwen3.5-9b" {
-        bail!("--dflash is only supported for --model qwen3.5-9b (got {model_variant})");
+    let profile = effective_quant_profile(cli)?;
+    if !matches!(
+        profile,
+        model_store::manifest::QuantProfile::Int4Gptq
+            | model_store::manifest::QuantProfile::Int4Awq
+            | model_store::manifest::QuantProfile::Int4Autoround
+            | model_store::manifest::QuantProfile::Int4Hqq
+            | model_store::manifest::QuantProfile::Q4Km
+            | model_store::manifest::QuantProfile::Q4KmGptq
+    ) {
+        bail!("--dflash requires a low-bit target bake (--int4, --q4km, or --q4km-gptq)");
     }
     let draft_dir = cli
         .dflash_draft_dir
@@ -80,7 +96,7 @@ pub fn run_qwen35_dflash(
         }
     };
     if !params.use_4b_kernel {
-        bail!("--dflash requires the 4B kernel path (qwen3.5-9b INT4)");
+        bail!("--dflash requires the 4B kernel path");
     }
     let weight_prefix: &'static str = params.weight_prefix;
 
@@ -103,7 +119,7 @@ pub fn run_qwen35_dflash(
     let tokenizer = crate::load_tokenizer(&tokenizer_path)?;
     let prompt_ids = crate::resolve_prompt_token_ids(cli, &tokenizer)?;
 
-    // --------- 3. VRAM estimate (target INT4 + ~2 GiB draft) -------------
+    // --------- 3. VRAM estimate (low-bit target + ~2 GiB draft) ----------
     let context_tokens = cli
         .context_size
         .unwrap_or(prompt_ids.len() + cli.max_new_tokens);
@@ -115,14 +131,24 @@ pub fn run_qwen35_dflash(
         );
     }
     let kv_per_token = text_config.kv_bytes_per_token(ScalarType::BF16.size_in_bytes());
-    let target_fixed = (entry.vram.fixed_bytes as f64 * 0.37) as u64; // INT4 scaling
+    let target_fixed = match profile {
+        model_store::manifest::QuantProfile::Q4Km => (entry.vram.fixed_bytes as f64 * 0.28) as u64,
+        model_store::manifest::QuantProfile::Q4KmGptq
+        | model_store::manifest::QuantProfile::Int4Gptq
+        | model_store::manifest::QuantProfile::Int4Awq
+        | model_store::manifest::QuantProfile::Int4Autoround
+        | model_store::manifest::QuantProfile::Int4Hqq => {
+            (entry.vram.fixed_bytes as f64 * 0.37) as u64
+        }
+        _ => (entry.vram.fixed_bytes as f64 * 0.37) as u64,
+    };
     let target_kv = kv_per_token * context_tokens as u64;
     let draft_fixed: u64 = 2 * 1024 * 1024 * 1024; // ~2 GiB for DFlash draft weights + scratch
     let estimated =
         ((target_fixed + target_kv + draft_fixed) as f64 * entry.vram.overhead_factor) as u64;
     let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
     eprintln!(
-        "[vram] estimated={:.2}GiB (target weights={:.2}GiB + target KV={:.2}GiB + draft={:.2}GiB) \
+        "[vram] estimated={:.2}GiB (target {profile} weights={:.2}GiB + target KV={:.2}GiB + draft={:.2}GiB) \
          available={:.1}GiB",
         gib(estimated),
         gib(target_fixed),
@@ -141,15 +167,18 @@ pub fn run_qwen35_dflash(
 
     gpu_hal::set_device(ordinal).map_err(|e| anyhow!("set_device: {e}"))?;
 
-    // --------- 4. Load target weights (INT4 bake) ------------------------
+    // --------- 4. Load target weights (selected low-bit bake) ------------
     let t0 = Instant::now();
     let target_weights =
-        load_target_int4_weights(cli, entry, &text_config, ordinal, weight_prefix)?;
+        load_target_lowbit_weights(cli, model_variant, &text_config, ordinal, weight_prefix)?;
     eprintln!(
-        "[weights] target (INT4, group_size={}) loaded in {:.0}ms",
+        "[weights] target ({profile}, group_size={}) loaded in {:.0}ms",
         target_weights.int4_group_size,
         t0.elapsed().as_millis(),
     );
+    if !target_weights.is_int4 {
+        bail!("--dflash target loader did not produce low-bit weights for {profile}");
+    }
 
     // Grab Arc clones of embed_tokens + lm_head before moving weights into
     // the engine — the draft borrows them without owning them (docs §7).
@@ -283,19 +312,20 @@ pub fn run_qwen35_dflash(
     let mut committed_len: usize = prompt_ids.len();
     let mut generated_ids: Vec<u32> = Vec::new();
     let eos_ids: Vec<u32> = text_config.eos_token_ids();
-    // Default block_size = 3: the fused verify path (now the only verify
-    // path after M4.3c) caps B at 3 on Qwen3.5-9B because the 4B
-    // megakernel's 64 KiB LDS budget has to hold (block_size + B*hidden
-    // + fp8_lut) * 4 bytes. 4*4096 = 16384 floats exceeds the 15872
-    // float budget — verify_block_fused_decode errors out with a
-    // diagnostic if the user forces --dflash-block >= 4 on 9B.
-    // Historical context: the M4.1 prefill verify path had no such cap
-    // and used DEFAULT_BLOCK_SIZE=4 per project_m4_2_findings; see git
-    // history before M4.3c for the B=4 vs B=16 sweep.
-    const DEFAULT_BLOCK_SIZE: usize = 3;
+    // Qwen3.5-9B keeps the historical fused-verify default of B=3. The
+    // Qwen3.6-27B comparison path defaults to the draft checkpoint's full
+    // block size (16 for the Lucebox DFlash draft); if the fused verifier
+    // cannot fit the model shape in LDS, the loop falls back to sequential
+    // verify below.
+    const DEFAULT_FUSED_BLOCK_SIZE: usize = 3;
+    let default_block_size = if matches!(model_variant, ModelVariant::Qwen3_6_27B) {
+        draft_config.block_size
+    } else {
+        DEFAULT_FUSED_BLOCK_SIZE.min(draft_config.block_size)
+    };
     let block_size = cli
         .dflash_block
-        .unwrap_or(DEFAULT_BLOCK_SIZE.min(draft_config.block_size));
+        .unwrap_or(default_block_size);
     if block_size == 0 || block_size > draft_config.block_size {
         bail!(
             "--dflash-block must be in 1..={} (got {block_size})",
@@ -358,7 +388,8 @@ pub fn run_qwen35_dflash(
         //     position b reads the K/V written by positions 0..b of the
         //     same launch.
         let t_verify = Instant::now();
-        let verify_logits = target_engine.verify_block_fused_decode(&draft_candidates, l)?;
+        let verify_logits =
+            verify_block_for_dflash(&mut target_engine, &draft_candidates, l, &tap_layers)?;
         ms_verify += t_verify.elapsed().as_secs_f64() * 1000.0;
 
         // 8d. Accept check, full protocol (docs/dflash.md §6):
@@ -517,6 +548,17 @@ pub fn run_qwen35_dflash(
          generated={} decode_ms={decode_ms:.0}",
         generated_ids.len()
     );
+    let ms_per_tok = if generated_ids.is_empty() {
+        0.0
+    } else {
+        decode_ms / generated_ids.len() as f64
+    };
+    eprintln!(
+        "[result] prompt_tokens={} generated_tokens={} decode_ms={decode_ms:.0} \
+         ms_per_tok={ms_per_tok:.2}",
+        prompt_ids.len(),
+        generated_ids.len()
+    );
     let ms_other = (decode_ms - ms_draft - ms_verify - ms_redecode).max(0.0);
     eprintln!(
         "[dflash] breakdown ms: draft={ms_draft:.0} verify={ms_verify:.0} \
@@ -546,26 +588,60 @@ fn parse_tap_override(raw: &str, num_target_layers: usize) -> Result<Vec<usize>>
     Ok(out)
 }
 
-fn load_target_int4_weights(
+fn load_target_lowbit_weights(
     cli: &Cli,
-    _entry: &RegistryEntry,
+    model_variant: &ModelVariant,
     text_config: &qwen35::config::TextConfig,
     ordinal: usize,
     weight_prefix: &str,
 ) -> Result<Qwen35Weights> {
-    let bake_dir = model_store::fetch::BakeVariant::Int4Gptq.bake_dir(&cli.model_dir);
-    if !model_store::version_ok(&bake_dir) {
-        bail!(
-            "Qwen3.5-9B INT4 bake not found at {}. Run:\n  python oracle/bake_int4.py --model-dir {}\n\
-             (or run once without --dflash to let the release-bake downloader populate it).",
-            bake_dir.display(),
-            cli.model_dir.display(),
-        );
+    load_qwen35_weights(
+        cli,
+        model_variant,
+        text_config,
+        ordinal,
+        weight_prefix,
+        true, // DFlash dispatcher already called ensure_hf_metadata_present.
+        crate::policy::q4km_like(cli),
+    )
+    .map_err(|e| anyhow!("load target low-bit weights: {e}"))
+}
+
+fn verify_block_for_dflash(
+    target_engine: &mut DecodeEngine,
+    tokens: &[u32],
+    pos_offset: usize,
+    tap_layers: &[usize],
+) -> Result<Vec<Vec<f32>>> {
+    let needs_sequential = tokens.len() > kernel_ffi::MAX_BATCH_SIZE;
+    if !needs_sequential {
+        match target_engine.verify_block_fused_decode(tokens, pos_offset) {
+            Ok(logits) => return Ok(logits),
+            Err(err) => {
+                let msg = err.to_string();
+                if !msg.contains("shared-memory budget exceeded") {
+                    return Err(err);
+                }
+            }
+        }
     }
-    let store = model_store::BakedStore::open(&bake_dir)
-        .map_err(|e| anyhow!("open target INT4 bake: {e}"))?;
-    Qwen35Weights::load_baked(&store, text_config, ordinal, weight_prefix)
-        .map_err(|e| anyhow!("load target INT4 weights: {e}"))
+
+    static NOTICE: Once = Once::new();
+    NOTICE.call_once(|| {
+        eprintln!(
+            "[dflash] fused verify does not fit this target shape/block; \
+             using sequential target verify fallback"
+        );
+    });
+
+    let mut logits = Vec::with_capacity(tokens.len());
+    for (i, &tok) in tokens.iter().enumerate() {
+        let (step_logits, _tap_bytes) = target_engine
+            .decode_step_with_taps_kernel(tok, pos_offset + i, tap_layers)
+            .map_err(|e| anyhow!("sequential verify decode step {i}: {e}"))?;
+        logits.push(step_logits);
+    }
+    Ok(logits)
 }
 
 /// Concatenate per-tap `[hidden_dim]` BF16 blobs into a single
@@ -662,22 +738,56 @@ fn draft_forward_and_sample(
     .map_err(|e| anyhow!("draft forward: {e}"))?;
 
     // 4) lm_head projection → block_logits [block_size, vocab].
-    let lm_head = &target_engine.weights().lm_head;
+    let target_weights = target_engine.weights();
+    let lm_head = &target_weights.lm_head;
+    let lm_head_buf: &GpuBuffer = lm_head.as_ref();
     let vocab = draft_weights.config.vocab_size;
     let mut block_logits = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[block_size, vocab])
         .map_err(|e| anyhow!("alloc block_logits: {e}"))?;
-    kernel_ffi::matmul_rhs_transposed_4b(
-        ordinal,
-        ScalarType::BF16,
-        1,          // batch
-        block_size, // m
-        vocab,      // n
-        hidden,     // k
-        final_hidden,
-        &**lm_head,
-        &mut block_logits,
-    )
-    .map_err(|e| anyhow!("draft lm_head: {e}"))?;
+    let lm_head_qtype = qwen35::weights::infer_lowbit_type(
+        lm_head_buf,
+        hidden,
+        target_weights.lm_head_int4_scale.is_some(),
+    );
+    if lm_head_qtype != 0 {
+        let scale = target_weights
+            .lm_head_int4_scale
+            .as_ref()
+            .unwrap_or(lm_head_buf);
+        let zero = target_weights
+            .lm_head_int4_zero
+            .as_ref()
+            .unwrap_or(lm_head_buf);
+        kernel_ffi::prefill_ffi::matmul_rhs_transposed_int4(
+            ordinal,
+            1,          // batch
+            block_size, // m
+            vocab,      // n
+            hidden,     // k
+            final_hidden,
+            lm_head_buf,
+            scale,
+            zero,
+            target_weights.lm_head_awq_inv_scale.as_ref(),
+            target_weights.int4_group_size,
+            lm_head_qtype,
+            &mut block_logits,
+        )
+        .map_err(|e| anyhow!("draft lm_head low-bit matmul: {e}"))?;
+    } else {
+        kernel_ffi::matmul_rhs_transposed_4b(
+            ordinal,
+            ScalarType::BF16,
+            1,          // batch
+            block_size, // m
+            vocab,      // n
+            hidden,     // k
+            final_hidden,
+            lm_head_buf,
+            &mut block_logits,
+        )
+        .map_err(|e| anyhow!("draft lm_head: {e}"))?;
+    }
 
     // 5) D2H + argmax per position.
     let logits_bytes = block_logits
@@ -700,6 +810,12 @@ fn draft_forward_and_sample(
         }
         candidates.push(best_idx);
         let _ = row_elems;
+    }
+    if let Some(first) = candidates.first_mut() {
+        // Lucebox DFlash treats slot 0 as the previous target token, not a
+        // free draft proposal: noise_ids[0] = bonus_seed and then
+        // draft_tok[0] is forced back to that same token after projection.
+        *first = bonus_seed;
     }
 
     // Retain the final-hidden bytes for potential debugging; cost is a

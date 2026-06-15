@@ -76,6 +76,11 @@ def run_one(args: argparse.Namespace, name: str, prompt: str, warmup: bool = Fal
         cmd.append("--emit-stage-timings")
     if args.kv_fp8:
         cmd.append("--kv-fp8")
+    if args.dflash:
+        cmd.append("--dflash")
+        cmd.extend(["--dflash-draft-dir", str(args.dflash_draft_dir)])
+        if args.dflash_block:
+            cmd.extend(["--dflash-block", str(args.dflash_block)])
 
     env = os.environ.copy()
     env["SUPERSONIC_BACKENDS"] = args.backend
@@ -137,6 +142,13 @@ def main() -> int:
     parser.add_argument("--ignore-eos", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--emit-stage-timings", action="store_true")
     parser.add_argument("--kv-fp8", action="store_true")
+    parser.add_argument("--dflash", action="store_true")
+    parser.add_argument(
+        "--dflash-draft-dir",
+        type=Path,
+        default=Path("/mnt/data/tmp/qwen36-27b-dflash-q8-bf16"),
+    )
+    parser.add_argument("--dflash-block", type=int, default=0)
     parser.add_argument("--out-json", type=Path, default=Path("target/qwen36_he_supersonic.json"))
     args = parser.parse_args()
 
@@ -183,6 +195,9 @@ def main() -> int:
         "model": args.model,
         "model_dir": str(args.model_dir),
         "quant": args.quant,
+        "dflash": args.dflash,
+        "dflash_draft_dir": str(args.dflash_draft_dir) if args.dflash else None,
+        "dflash_block": args.dflash_block if args.dflash_block else None,
         "backend": args.backend,
         "context_size": args.context_size,
         "n_gen": args.n_gen,

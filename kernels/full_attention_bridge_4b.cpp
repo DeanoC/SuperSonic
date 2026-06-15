@@ -3825,6 +3825,7 @@ int matmul_int4_dequant_device(
     const void* zero,
     const void* awq_inv_scale,
     int group_size,
+    int quant_type,
     void* out
 ) {
     ScopedHipDevice scoped(device_ordinal);
@@ -3844,6 +3845,7 @@ int matmul_int4_dequant_device(
         static_cast<const T*>(zero),
         static_cast<const T*>(awq_inv_scale),
         group_size,
+        quant_type,
         static_cast<T*>(out));
     hipError_t launch_err = hipGetLastError();
     hipError_t sync_err = hipDeviceSynchronize();
@@ -3937,7 +3939,15 @@ extern "C" int supersonic_qwen35_4b_hip_matmul_int4_dequant(
     int quant_type,
     void* out) {
     constexpr int QWEN35_LOWBIT_NATIVE_INT4 = 4;
-    if (quant_type != QWEN35_LOWBIT_NATIVE_INT4) {
+    constexpr int QWEN35_LOWBIT_GGML_Q4_K = 12;
+    constexpr int QWEN35_LOWBIT_GGML_Q5_K = 13;
+    constexpr int QWEN35_LOWBIT_GGML_Q6_K = 14;
+    const bool native_int4 = quant_type == QWEN35_LOWBIT_NATIVE_INT4;
+    const bool ggml_k =
+        quant_type == QWEN35_LOWBIT_GGML_Q4_K ||
+        quant_type == QWEN35_LOWBIT_GGML_Q5_K ||
+        quant_type == QWEN35_LOWBIT_GGML_Q6_K;
+    if (!native_int4 && !ggml_k) {
         return 273;
     }
 
@@ -3950,7 +3960,7 @@ extern "C" int supersonic_qwen35_4b_hip_matmul_int4_dequant(
         // GPTQ bakes use group_size=128, so this path activates in
         // practice; other group sizes fall back to the scalar kernel.
         constexpr int TILED_BK = 64;
-        if (group_size % TILED_BK == 0 &&
+        if (native_int4 && group_size % TILED_BK == 0 &&
             device_supports_wmma_bf16(static_cast<int>(device_ordinal))) {
             return matmul_int4_dequant_wmma_bf16_device(
                 static_cast<int>(device_ordinal), batch_elems, m, n, k,
@@ -3958,7 +3968,7 @@ extern "C" int supersonic_qwen35_4b_hip_matmul_int4_dequant(
         }
         return matmul_int4_dequant_device<hip_bfloat16>(
             static_cast<int>(device_ordinal), batch_elems, m, n, k,
-            lhs, rhs_int4, scale, zero, awq_inv_scale, group_size, out);
+            lhs, rhs_int4, scale, zero, awq_inv_scale, group_size, quant_type, out);
     }
     default:
         return 272;

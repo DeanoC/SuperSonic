@@ -51,6 +51,7 @@ pub fn forward<'a>(
     target_hidden_raw: &GpuBuffer,
     params: ForwardParams,
 ) -> Result<&'a GpuBuffer, GpuError> {
+    let trace = std::env::var_os("SUPERSONIC_DFLASH_TRACE").is_some();
     let cfg = &weights.config;
     let ordinal = scratch.ordinal;
     let dtype = ScalarType::BF16;
@@ -108,6 +109,12 @@ pub fn forward<'a>(
     }
 
     // ----- Per-round fuser (runs once, reused by every layer) -----
+    if trace {
+        eprintln!(
+            "[dflash-forward] fuser ctx_len={ctx_len} q_len={q_len} hidden={hidden} fuser_in={}",
+            cfg.fuser_in_dim()
+        );
+    }
     prefill_ffi::matmul_rhs_transposed(
         ordinal,
         dtype,
@@ -119,6 +126,9 @@ pub fn forward<'a>(
         &weights.fc_w,
         &mut scratch.target_hidden_ctx,
     )?;
+    if trace {
+        eprintln!("[dflash-forward] fuser matmul ok");
+    }
     prefill_ffi::rms_norm_rows_plain(
         ordinal,
         dtype,
@@ -129,6 +139,9 @@ pub fn forward<'a>(
         &weights.hidden_norm_w,
         &mut scratch.target_hidden_ctx_norm,
     )?;
+    if trace {
+        eprintln!("[dflash-forward] fuser norm ok");
+    }
 
     // ----- Initial hidden = noise_embedding (D2D copy) -----
     let hidden_bytes = q_len * hidden * bf16_bytes;
@@ -146,6 +159,9 @@ pub fn forward<'a>(
 
     // ----- Per-layer loop -----
     for (idx, layer) in weights.layers.iter().enumerate() {
+        if trace {
+            eprintln!("[dflash-forward] layer {idx} start");
+        }
         let layer_kv = &mut state.layers[idx];
 
         // 1) input_layernorm (noise side only).
@@ -159,6 +175,9 @@ pub fn forward<'a>(
             &layer.input_norm_w,
             &mut scratch.hidden_norm,
         )?;
+        if trace {
+            eprintln!("[dflash-forward] layer {idx} input norm ok");
+        }
 
         // 2) Concat [target_hidden_ctx_norm; hidden_norm] into norm_concat.
         let ctx_bytes = ctx_len * hidden * bf16_bytes;
@@ -191,6 +210,9 @@ pub fn forward<'a>(
             &layer.q_proj_w,
             &mut scratch.q_proj,
         )?;
+        if trace {
+            eprintln!("[dflash-forward] layer {idx} q proj ok");
+        }
         prefill_ffi::matmul_rhs_transposed(
             ordinal,
             dtype,
@@ -202,6 +224,9 @@ pub fn forward<'a>(
             &layer.k_proj_w,
             &mut scratch.k_concat,
         )?;
+        if trace {
+            eprintln!("[dflash-forward] layer {idx} k proj ok");
+        }
         prefill_ffi::matmul_rhs_transposed(
             ordinal,
             dtype,
@@ -213,6 +238,9 @@ pub fn forward<'a>(
             &layer.v_proj_w,
             &mut scratch.v_concat,
         )?;
+        if trace {
+            eprintln!("[dflash-forward] layer {idx} v proj ok");
+        }
 
         // 4) Per-head q_norm / k_norm (in-place over head_dim).
         prefill_ffi::rms_norm_rows_plain_inplace(
@@ -224,6 +252,9 @@ pub fn forward<'a>(
             &mut scratch.q_proj,
             &layer.q_norm_w,
         )?;
+        if trace {
+            eprintln!("[dflash-forward] layer {idx} q norm ok");
+        }
         prefill_ffi::rms_norm_rows_plain_inplace(
             ordinal,
             dtype,
@@ -233,6 +264,9 @@ pub fn forward<'a>(
             &mut scratch.k_concat,
             &layer.k_norm_w,
         )?;
+        if trace {
+            eprintln!("[dflash-forward] layer {idx} k norm ok");
+        }
 
         // 5) RoPE — full-dim rotary. Q at pos_offset + ctx_len; K across full
         //    kv_seq starting at pos_offset. V is not rotated (dflash.py).
@@ -248,6 +282,9 @@ pub fn forward<'a>(
             pos_offset,
             &mut scratch.k_concat,
         )?;
+        if trace {
+            eprintln!("[dflash-forward] layer {idx} k rope ok");
+        }
         prefill_ffi::apply_rope_prefill(
             ordinal,
             dtype,
@@ -260,6 +297,9 @@ pub fn forward<'a>(
             pos_offset + ctx_len,
             &mut scratch.q_proj,
         )?;
+        if trace {
+            eprintln!("[dflash-forward] layer {idx} q rope ok");
+        }
 
         // 6) Append this round's K/V to the per-layer cache.
         //    Dst offset = past_len * row_bytes. Source is the current round's
@@ -303,6 +343,9 @@ pub fn forward<'a>(
             &layer_kv.cache_v,
             &mut scratch.attn_out,
         )?;
+        if trace {
+            eprintln!("[dflash-forward] layer {idx} attention ok");
+        }
 
         // 8) o_proj into hidden_b, residual-add into hidden_a.
         prefill_ffi::matmul_rhs_transposed(
@@ -316,6 +359,9 @@ pub fn forward<'a>(
             &layer.o_proj_w,
             &mut scratch.hidden_b,
         )?;
+        if trace {
+            eprintln!("[dflash-forward] layer {idx} o proj ok");
+        }
         let hidden_elems = q_len * hidden;
         prefill_ffi::element_add_inplace(
             ordinal,
@@ -336,6 +382,9 @@ pub fn forward<'a>(
             &layer.post_attn_norm_w,
             &mut scratch.post_attn_norm,
         )?;
+        if trace {
+            eprintln!("[dflash-forward] layer {idx} post norm ok");
+        }
         prefill_ffi::matmul_rhs_transposed(
             ordinal,
             dtype,
@@ -347,6 +396,9 @@ pub fn forward<'a>(
             &layer.gate_proj_w,
             &mut scratch.gate,
         )?;
+        if trace {
+            eprintln!("[dflash-forward] layer {idx} gate proj ok");
+        }
         prefill_ffi::matmul_rhs_transposed(
             ordinal,
             dtype,
@@ -358,6 +410,9 @@ pub fn forward<'a>(
             &layer.up_proj_w,
             &mut scratch.up,
         )?;
+        if trace {
+            eprintln!("[dflash-forward] layer {idx} up proj ok");
+        }
         prefill_ffi::swiglu_mul(
             ordinal,
             dtype,
@@ -377,6 +432,9 @@ pub fn forward<'a>(
             &layer.down_proj_w,
             &mut scratch.hidden_b,
         )?;
+        if trace {
+            eprintln!("[dflash-forward] layer {idx} down proj ok");
+        }
         prefill_ffi::element_add_inplace(
             ordinal,
             dtype,
@@ -400,6 +458,9 @@ pub fn forward<'a>(
         &weights.norm_w,
         &mut scratch.final_hidden,
     )?;
+    if trace {
+        eprintln!("[dflash-forward] final norm ok");
+    }
 
     Ok(&scratch.final_hidden)
 }
