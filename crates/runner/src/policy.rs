@@ -35,18 +35,25 @@ pub(crate) fn validate_global_flags(
     }
     if cli.q4km
         && !(backend == Backend::Cuda
+            || (backend == Backend::Hip
+                && model_variant.family() == ModelFamily::Qwen36Moe)
             || (backend == Backend::Metal && model_variant.family() == ModelFamily::Qwen36Moe))
     {
         anyhow::bail!(
-            "--q4km raw GGML blocks are currently supported only on CUDA Qwen paths and Metal Qwen3.5/3.6 MoE"
+            "--q4km raw GGML blocks are currently supported only on CUDA Qwen paths, HIP Qwen3.6 MoE, and Metal Qwen3.5/3.6 MoE"
         );
     }
     if cli.q4km_gptq
         && !(backend == Backend::Cuda
+            || (backend == Backend::Hip
+                && matches!(
+                    model_variant.family(),
+                    ModelFamily::Qwen35 | ModelFamily::Qwen36Moe
+                ))
             || (backend == Backend::Metal && model_variant.family() == ModelFamily::Qwen36Moe))
     {
         anyhow::bail!(
-            "--q4km-gptq is currently supported on CUDA Qwen paths and Metal Qwen3.5/3.6 MoE"
+            "--q4km-gptq is currently supported on CUDA Qwen paths, HIP Qwen3.5/3.6 paths, and Metal Qwen3.5/3.6 MoE"
         );
     }
     if matches!(model_variant.family(), ModelFamily::Qwen3Moe) {
@@ -191,6 +198,22 @@ mod tests {
             Backend::Metal,
         )
         .expect("Qwen3.5/3.6 MoE Metal can load raw GGML q4km through the staged path");
+    }
+
+    #[test]
+    fn rejects_raw_q4km_for_qwen36_dense_on_hip() {
+        validate_global_flags(&cli(&["--q4km"]), &ModelVariant::Qwen3_6_27B, Backend::Hip)
+            .expect_err("Qwen3.6-27B HIP dense kernels require native INT4 sidecars");
+    }
+
+    #[test]
+    fn allows_q4km_gptq_for_qwen36_dense_on_hip() {
+        validate_global_flags(
+            &cli(&["--q4km-gptq"]),
+            &ModelVariant::Qwen3_6_27B,
+            Backend::Hip,
+        )
+        .expect("Qwen3.6-27B HIP can load Q4KM-sourced native INT4 through the Qwen3.5 dense path");
     }
 }
 

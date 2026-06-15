@@ -4980,9 +4980,13 @@ __global__ void supersonic_qwen35_persistent_decode_kernel(
 
     // FP8 E4M3 → F32 lookup table in LDS (256 entries = 1KB).
     // Placed after the input cache area. Populated once, used for all FP8 dequant.
-    // LDS is sized by the bridge as: block_size + max(B*hidden_dim, intermediate_size).
+    // LDS is sized by the bridge as: block_size + max(B*hidden_dim, 2*hidden_dim).
+    // MLP down-proj reads the SwiGLU intermediate from global scratch so large
+    // models do not require `intermediate_size` floats of LDS.
     // The LUT sits after the input cache region.
-    const int lds_input_size = (B * hidden_dim > intermediate_size) ? B * hidden_dim : intermediate_size;
+    const int hidden_cache = B * hidden_dim;
+    const int attention_cache = hidden_dim * 2;
+    const int lds_input_size = hidden_cache > attention_cache ? hidden_cache : attention_cache;
     float* fp8_lut = lds + bs + lds_input_size;
 
     // Populate FP8 LUT: thread i fills entry i (256 threads → 256 entries, one pass).
@@ -6583,9 +6587,7 @@ __global__ void supersonic_qwen35_persistent_decode_kernel(
         // Process one batch item at a time: cache SwiGLU output in LDS, work-steal
         const unsigned long long mlp_down_clock = clock64();
         for (int b = 0; b < B; b++) {
-            for (int c = tid; c < L.intermediate_size; c += bs)
-                lds_input[c] = gate_up[b * intermediate_size * 2 + c];
-            __syncthreads();
+            const float* swiglu_b = gate_up + b * intermediate_size * 2;
 
             if (blockIdx.x == 0 && tid == 0) { counters[0] = 0; __threadfence(); }
             grid_barrier(barrier_counter, barrier_flag, nb);
@@ -6616,12 +6618,12 @@ __global__ void supersonic_qwen35_persistent_decode_kernel(
                             float w[8];
                             int4_dequant_8(pk, d_sc, d_zr, sr_g, c, sc_cols, gsz, w);
                             apply_awq_inv_scale_8(w, d_awq_inv, c);
-                            p += w[0]*lds_input[c] + w[1]*lds_input[c+1] + w[2]*lds_input[c+2] + w[3]*lds_input[c+3]
-                               + w[4]*lds_input[c+4] + w[5]*lds_input[c+5] + w[6]*lds_input[c+6] + w[7]*lds_input[c+7];
+                            p += w[0]*swiglu_b[c] + w[1]*swiglu_b[c+1] + w[2]*swiglu_b[c+2] + w[3]*swiglu_b[c+3]
+                               + w[4]*swiglu_b[c+4] + w[5]*swiglu_b[c+5] + w[6]*swiglu_b[c+6] + w[7]*swiglu_b[c+7];
                         }
                         for (int c = is8 + tid; c < L.intermediate_size; c += bs)
                             p += int4_dequant_scalar(L.down_proj_w, int4_scales[layer].down_proj_scale, int4_scales[layer].down_proj_zero, my_row, c, L.intermediate_size, gsz) *
-                                 awq_inv_scale_at(d_awq_inv, c) * lds_input[c];
+                                 awq_inv_scale_at(d_awq_inv, c) * swiglu_b[c];
 
                         lds[tid] = p;
                         __syncthreads();
@@ -6661,12 +6663,12 @@ __global__ void supersonic_qwen35_persistent_decode_kernel(
                                 float w[8];
                                 int4_dequant_8(pk, d_sc, d_zr, sr_g, c, sc_cols, gsz, w);
                                 apply_awq_inv_scale_8(w, d_awq_inv, c);
-                                p += w[0]*lds_input[c] + w[1]*lds_input[c+1] + w[2]*lds_input[c+2] + w[3]*lds_input[c+3]
-                                   + w[4]*lds_input[c+4] + w[5]*lds_input[c+5] + w[6]*lds_input[c+6] + w[7]*lds_input[c+7];
+                                p += w[0]*swiglu_b[c] + w[1]*swiglu_b[c+1] + w[2]*swiglu_b[c+2] + w[3]*swiglu_b[c+3]
+                                   + w[4]*swiglu_b[c+4] + w[5]*swiglu_b[c+5] + w[6]*swiglu_b[c+6] + w[7]*swiglu_b[c+7];
                             }
                             for (int c = is8 + lane_d; c < L.intermediate_size; c += warpSize)
                                 p += int4_dequant_scalar(L.down_proj_w, int4_scales[layer].down_proj_scale, int4_scales[layer].down_proj_zero, my_row, c, L.intermediate_size, gsz) *
-                                     awq_inv_scale_at(d_awq_inv, c) * lds_input[c];
+                                     awq_inv_scale_at(d_awq_inv, c) * swiglu_b[c];
                         } else if (down_fp8) {
                             const uint8_t* d_fp8 = static_cast<const uint8_t*>(L.down_proj_w) + static_cast<size_t>(my_row) * L.intermediate_size;
                             const hip_bfloat16* d_scales = static_cast<const hip_bfloat16*>(fp8_scales[layer].down_proj_scale);
@@ -6681,10 +6683,10 @@ __global__ void supersonic_qwen35_persistent_decode_kernel(
                                 float w1 = bf16_round_rne_f32_finite((fp8_lut[(pk>>8) & 0xFF] * static_cast<float>(d_scales[sb + (c+1) / bsz])));
                                 float w2 = bf16_round_rne_f32_finite((fp8_lut[(pk>>16) & 0xFF] * static_cast<float>(d_scales[sb + (c+2) / bsz])));
                                 float w3 = bf16_round_rne_f32_finite((fp8_lut[(pk>>24)] * static_cast<float>(d_scales[sb + (c+3) / bsz])));
-                                p += w0*lds_input[c] + w1*lds_input[c+1] + w2*lds_input[c+2] + w3*lds_input[c+3];
+                                p += w0*swiglu_b[c] + w1*swiglu_b[c+1] + w2*swiglu_b[c+2] + w3*swiglu_b[c+3];
                             }
                             for (int c = is4 + lane_d; c < L.intermediate_size; c += warpSize)
-                                p += fp8_dequant_weight_lut(L.down_proj_w, fp8_scales[layer].down_proj_scale, my_row, c, L.intermediate_size, bsz, fp8_lut) * lds_input[c];
+                                p += fp8_dequant_weight_lut(L.down_proj_w, fp8_scales[layer].down_proj_scale, my_row, c, L.intermediate_size, bsz, fp8_lut) * swiglu_b[c];
                         } else {
                             const T* wr = static_cast<const T*>(L.down_proj_w) + static_cast<size_t>(my_row) * L.intermediate_size;
                             const int is4 = L.intermediate_size & ~3;
@@ -6693,11 +6695,11 @@ __global__ void supersonic_qwen35_persistent_decode_kernel(
                                 float w1 = supersonic_qwen35_to_float(wr[c+1]);
                                 float w2 = supersonic_qwen35_to_float(wr[c+2]);
                                 float w3 = supersonic_qwen35_to_float(wr[c+3]);
-                                p += w0*lds_input[c]   + w1*lds_input[c+1]
-                                   + w2*lds_input[c+2] + w3*lds_input[c+3];
+                                p += w0*swiglu_b[c]   + w1*swiglu_b[c+1]
+                                   + w2*swiglu_b[c+2] + w3*swiglu_b[c+3];
                             }
                             for (int c = is4 + lane_d; c < L.intermediate_size; c += warpSize)
-                                p += supersonic_qwen35_to_float(wr[c]) * lds_input[c];
+                                p += supersonic_qwen35_to_float(wr[c]) * swiglu_b[c];
                         }
                         float result = wave_reduce_sum_f32(p);
                         if (lane_d == 0) {

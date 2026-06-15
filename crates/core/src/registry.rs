@@ -417,6 +417,25 @@ static REGISTRY: &[RegistryEntry] = &[
         }),
     },
     RegistryEntry {
+        model: ModelVariant::Qwen3_6_27B,
+        backend: Backend::Hip,
+        arch: GpuArch::Gfx1100,
+        vram: VramBudget {
+            fixed_bytes: 22 * GIB,
+            overhead_factor: 1.05,
+        },
+        params: FamilyParams::Qwen35(Qwen35KernelParams {
+            // Qwen3.6-27B: qkv 8192 + z 6144 + b/a 48 each.
+            proj_buf_floats: 16480,
+            // Floor for 3*nh*hd + nh*aligned_kv_t at short contexts.
+            // The runner still expands this from --context-size.
+            attn_scratch_floats: 24576,
+            weight_prefix: "model.language_model",
+            kv_chunk_size: 256,
+            use_4b_kernel: true,
+        }),
+    },
+    RegistryEntry {
         model: ModelVariant::Qwen3_5_0_8B,
         backend: Backend::Hip,
         arch: GpuArch::Gfx1150,
@@ -1220,6 +1239,7 @@ mod tests {
             ModelVariant::Qwen3_5_2B,
             ModelVariant::Qwen3_5_4B,
             ModelVariant::Qwen3_5_9B,
+            ModelVariant::Qwen3_6_27B,
             ModelVariant::Qwen3_30B_A3B,
             ModelVariant::Gemma4_E2B,
             ModelVariant::Gemma4_E4B,
@@ -1260,6 +1280,21 @@ mod tests {
     fn cuda_sm86_qwen36_27b_registry_params_match_geometry() {
         let entry = lookup(&ModelVariant::Qwen3_6_27B, &Backend::Cuda, &GpuArch::Sm86)
             .expect("qwen3.6-27b CUDA sm86 registry entry");
+        match entry.params {
+            FamilyParams::Qwen35(params) => {
+                assert_eq!(params.weight_prefix, "model.language_model");
+                assert!(params.use_4b_kernel);
+                assert_eq!(params.proj_buf_floats, 16_480);
+                assert_eq!(params.attn_scratch_floats, 24_576);
+            }
+            _ => panic!("qwen3.6-27b must use the Qwen hybrid-attention engine"),
+        }
+    }
+
+    #[test]
+    fn hip_gfx1100_qwen36_27b_registry_params_match_geometry() {
+        let entry = lookup(&ModelVariant::Qwen3_6_27B, &Backend::Hip, &GpuArch::Gfx1100)
+            .expect("qwen3.6-27b HIP gfx1100 registry entry");
         match entry.params {
             FamilyParams::Qwen35(params) => {
                 assert_eq!(params.weight_prefix, "model.language_model");
