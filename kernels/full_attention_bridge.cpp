@@ -1807,7 +1807,7 @@ int swiglu_mul_device(
         static_cast<const T*>(up),
         static_cast<T*>(out));
     if (hipGetLastError() != hipSuccess) return 121;
-    if (hipDeviceSynchronize() != hipSuccess) return 122;
+    if (maybe_sync() != hipSuccess) return 122;
     return 0;
 }
 
@@ -2770,7 +2770,7 @@ int rms_norm_device(
         static_cast<const T*>(weight),
         static_cast<T*>(out));
     if (hipGetLastError() != hipSuccess) return 71;
-    if (hipDeviceSynchronize() != hipSuccess) return 72;
+    if (maybe_sync() != hipSuccess) return 72;
     return 0;
 }
 

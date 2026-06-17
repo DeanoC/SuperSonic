@@ -11839,6 +11839,7 @@ impl DecodeEngine {
         prefix_len: usize,
         tap_layers: &[usize],
         capture_rollback: bool,
+        capture_gpu_taps: bool,
     ) -> Result<prefill_engine::PrefillTreeVerifyResult> {
         if self.kv_fp8 {
             anyhow::bail!("verify_tree_prefill does not support kv_fp8");
@@ -11888,6 +11889,7 @@ impl DecodeEngine {
                 Some(tap_layers),
                 true,
                 capture_rollback,
+                capture_gpu_taps,
                 &mut cache,
             )?;
             self.dflash_prefill_tree_cache = Some(cache);
@@ -11899,6 +11901,27 @@ impl DecodeEngine {
                 .map_err(|e| anyhow::anyhow!("reset sync after tree prefill verify: {e}"))?;
         }
         Ok(result)
+    }
+
+    pub fn copy_prefill_tree_verify_taps_to_gpu_history(
+        &mut self,
+        accepted_indices: &[usize],
+        commit_len: usize,
+        tap_history_gpu: &mut GpuBuffer,
+        start_row: usize,
+        row_bytes: usize,
+    ) -> Result<()> {
+        let cache = self
+            .dflash_prefill_tree_cache
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("tree tap capture requested without cache"))?;
+        cache.copy_tap_capture_to_gpu_history(
+            accepted_indices,
+            commit_len,
+            tap_history_gpu,
+            start_row,
+            row_bytes,
+        )
     }
 
     fn verify_block_prefill_append_impl(
@@ -12075,6 +12098,45 @@ impl DecodeEngine {
             self.ordinal,
             self.kv_chunk_size,
         )?;
+        if profile_verify {
+            eprintln!(
+                "[dflash-profile] tree_rollback commit_len={} accepted={} apply={:.2}ms",
+                commit_len,
+                accepted_indices.len(),
+                t_rollback.elapsed().as_secs_f64() * 1000.0,
+            );
+        }
+        if std::env::var_os("SUPERSONIC_DFLASH_TREE_VERIFY_STRICT_SYNC").is_some() {
+            self.scratch
+                .reset_sync()
+                .map_err(|e| anyhow::anyhow!("reset sync after prefill tree rollback: {e}"))?;
+        }
+        Ok(())
+    }
+
+    pub fn commit_prefill_tree_verify_owned(
+        &mut self,
+        mut result: prefill_engine::PrefillTreeVerifyResult,
+        accepted_indices: &[usize],
+        commit_len: usize,
+    ) -> Result<()> {
+        let profile_verify = std::env::var_os("SUPERSONIC_DFLASH_PROFILE_VERIFY").is_some();
+        let t_rollback = std::time::Instant::now();
+        prefill_engine::apply_prefill_tree_rollback(
+            &mut self.state,
+            &self.weights.config,
+            &result,
+            accepted_indices,
+            commit_len,
+            self.ordinal,
+            self.kv_chunk_size,
+        )?;
+        if let (Some(cache), Some(rollback)) = (
+            self.dflash_prefill_tree_cache.as_mut(),
+            result.rollback.take(),
+        ) {
+            cache.recycle_rollback(rollback);
+        }
         if profile_verify {
             eprintln!(
                 "[dflash-profile] tree_rollback commit_len={} accepted={} apply={:.2}ms",

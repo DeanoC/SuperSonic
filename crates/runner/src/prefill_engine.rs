@@ -477,11 +477,39 @@ fn mmq_q8_1_workspace_bytes(batch: usize, m: usize, k: usize) -> usize {
     batch * ((k + Q8_BLOCK - 1) / Q8_BLOCK) * m * Q8_BLOCK_BYTES
 }
 
+fn ensure_mmq_q8_1_workspace<'a>(
+    workspace: &'a mut Option<GpuBuffer>,
+    ordinal: usize,
+    batch: usize,
+    m: usize,
+    k: usize,
+    label: &str,
+) -> Result<&'a mut GpuBuffer> {
+    let q8_bytes = mmq_q8_1_workspace_bytes(batch, m, k).max(1);
+    let needs_alloc = workspace
+        .as_ref()
+        .map(|buf| buf.len_bytes() < q8_bytes)
+        .unwrap_or(true);
+    if needs_alloc {
+        *workspace = Some(
+            GpuBuffer::alloc(ordinal, ScalarType::U8, &[q8_bytes])
+                .map_err(|e| anyhow::anyhow!("{label}: {e}"))?,
+        );
+    }
+    workspace
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("{label}: missing workspace after allocation"))
+}
+
 pub(crate) fn q6_k_mmq_lm_head_enabled(m: usize) -> bool {
     if env::var_os("SUPERSONIC_DISABLE_Q6_K_MMQ_LM_HEAD").is_some() {
         return false;
     }
     env::var_os("SUPERSONIC_ENABLE_Q6_K_MMQ_LM_HEAD").is_some() || m == 8
+}
+
+fn q6_k_mmq_mlp_down_enabled() -> bool {
+    env::var_os("SUPERSONIC_DISABLE_Q6_K_MMQ_MLP_DOWN").is_none()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -528,6 +556,68 @@ pub(crate) fn maybe_matmul_q6_k_mmq_lm_head(
     .map_err(|e| anyhow::anyhow!("q6_k_mmq lm_head quantize q8_1: {e}"))?;
     prefill_ffi::matmul_mmq_q8_1_q6_k(ordinal, batch, m, n, k, &q8_workspace, weight, out)
         .map_err(|e| anyhow::anyhow!("q6_k_mmq lm_head matmul: {e}"))?;
+    Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn maybe_matmul_q6_k_mmq_mlp_down(
+    ordinal: usize,
+    batch: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    qtype: i32,
+    scale: Option<&GpuBuffer>,
+    int4_scale: Option<&GpuBuffer>,
+    int4_zero: Option<&GpuBuffer>,
+    awq_inv_scale: Option<&GpuBuffer>,
+    lhs: &GpuBuffer,
+    weight: &GpuBuffer,
+    out: &mut GpuBuffer,
+    q8_workspace: &mut Option<GpuBuffer>,
+) -> Result<bool> {
+    if !q6_k_mmq_mlp_down_enabled()
+        || gpu_hal::current_backend() != Backend::Hip
+        || batch != 1
+        || m == 0
+        || n == 0
+        || k == 0
+        || qtype != qwen35::weights::LOWBIT_GGML_Q6_K
+        || scale.is_some()
+        || int4_scale.is_some()
+        || int4_zero.is_some()
+        || awq_inv_scale.is_some()
+        || k % 256 != 0
+    {
+        return Ok(false);
+    }
+
+    if !prefill_ffi::device_supports_wmma_i8(ordinal)
+        .map_err(|e| anyhow::anyhow!("q6_k_mmq MLP down arch probe: {e}"))?
+    {
+        return Ok(false);
+    }
+
+    let q8_workspace = ensure_mmq_q8_1_workspace(
+        q8_workspace,
+        ordinal,
+        batch,
+        m,
+        k,
+        "q6_k_mmq MLP down q8 workspace",
+    )?;
+    prefill_ffi::quantize_mmq_q8_1(
+        ordinal,
+        batch,
+        m,
+        k,
+        lhs,
+        qwen35::weights::LOWBIT_GGML_Q6_K,
+        q8_workspace,
+    )
+    .map_err(|e| anyhow::anyhow!("q6_k_mmq MLP down quantize q8_1: {e}"))?;
+    prefill_ffi::matmul_mmq_q8_1_q6_k(ordinal, batch, m, n, k, q8_workspace, weight, out)
+        .map_err(|e| anyhow::anyhow!("q6_k_mmq MLP down matmul: {e}"))?;
     Ok(true)
 }
 
@@ -1366,6 +1456,7 @@ pub struct PrefillAppendLayerRollback {
 pub struct PrefillTreeVerifyResult {
     pub target_next: Vec<u32>,
     pub tap_hiddens_all: Option<Vec<Vec<u8>>>,
+    pub tap_hiddens_gpu: bool,
     pub rollback: Option<PrefillTreeRollback>,
 }
 
@@ -1424,6 +1515,8 @@ struct PrefillScratch {
     residual_f32: Option<GpuBuffer>,
     /// [seq_len, intermediate_size] BF16 — MLP intermediate
     mlp_buf: GpuBuffer,
+    /// Grow-only Q8_1 activation workspace for optional Q6_K MMQ paths.
+    q6_k_mmq_q8_workspace: Option<GpuBuffer>,
     /// [1, vocab_size] BF16 — logits output
     #[allow(dead_code)]
     logits_buf: GpuBuffer,
@@ -1489,6 +1582,10 @@ struct PrefillScratch {
     linear_gated_s_first: GpuBuffer,
     /// [linear_num_value_heads, linear_key_head_dim, linear_value_head_dim] F32
     linear_dummy_state: GpuBuffer,
+    /// [tree_len, num_taps * hidden_dim] BF16, used by cached DDTree verify only.
+    tree_tap_capture_gpu: Option<GpuBuffer>,
+    tree_tap_capture_row_bytes: usize,
+    tree_tap_capture_rows: usize,
 }
 
 impl PrefillScratch {
@@ -1570,6 +1667,7 @@ impl PrefillScratch {
             },
             mlp_buf: GpuBuffer::alloc(ordinal, ScalarType::BF16, &[seq_len, intermediate])
                 .map_err(|e| anyhow::anyhow!("prefill mlp_buf: {e}"))?,
+            q6_k_mmq_q8_workspace: None,
             logits_buf: GpuBuffer::alloc(ordinal, ScalarType::BF16, &[1, config.vocab_size])
                 .map_err(|e| anyhow::anyhow!("prefill logits: {e}"))?,
             attn_q: GpuBuffer::alloc(ordinal, ScalarType::BF16, &[num_q_heads, seq_len, head_dim])
@@ -1660,6 +1758,9 @@ impl PrefillScratch {
                 .map_err(|e| anyhow::anyhow!("prefill linear_gated_s_first: {e}"))?,
             linear_dummy_state: GpuBuffer::alloc(ordinal, ScalarType::F32, &[nv, khd, vhd])
                 .map_err(|e| anyhow::anyhow!("prefill linear_dummy_state: {e}"))?,
+            tree_tap_capture_gpu: None,
+            tree_tap_capture_row_bytes: 0,
+            tree_tap_capture_rows: 0,
         })
     }
 }
@@ -1837,6 +1938,126 @@ impl PrefillScratch {
         self.materialize_hidden_bf16_from_f32(ordinal, total_elems, label)?;
         Ok(())
     }
+
+    fn ensure_tree_tap_capture(
+        &mut self,
+        ordinal: usize,
+        tree_len: usize,
+        tap_count: usize,
+        hidden_dim: usize,
+    ) -> Result<()> {
+        if tree_len == 0 || tap_count == 0 {
+            self.tree_tap_capture_gpu = None;
+            self.tree_tap_capture_row_bytes = 0;
+            self.tree_tap_capture_rows = 0;
+            return Ok(());
+        }
+        let row_elems = tap_count * hidden_dim;
+        let row_bytes = row_elems * ScalarType::BF16.size_in_bytes();
+        let needs_alloc = self
+            .tree_tap_capture_gpu
+            .as_ref()
+            .map(|buf| buf.len_bytes() < tree_len * row_bytes)
+            .unwrap_or(true)
+            || self.tree_tap_capture_row_bytes != row_bytes
+            || self.tree_tap_capture_rows < tree_len;
+        if needs_alloc {
+            self.tree_tap_capture_gpu = Some(
+                GpuBuffer::alloc(ordinal, ScalarType::BF16, &[tree_len, row_elems])
+                    .map_err(|e| anyhow::anyhow!("tree tap capture alloc: {e}"))?,
+            );
+            self.tree_tap_capture_row_bytes = row_bytes;
+            self.tree_tap_capture_rows = tree_len;
+        }
+        Ok(())
+    }
+
+    fn tree_tap_capture_sink(
+        &mut self,
+        start_row: usize,
+        row_bytes: usize,
+    ) -> Result<PrefillAppendGpuTapSink<'_>> {
+        let buffer = self
+            .tree_tap_capture_gpu
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("tree tap capture requested before allocation"))?;
+        Ok(PrefillAppendGpuTapSink {
+            buffer,
+            start_row,
+            row_bytes,
+        })
+    }
+
+    fn copy_hidden_to_tree_tap_capture(
+        &mut self,
+        ordinal: usize,
+        tap_slot: usize,
+        tap_count: usize,
+        tree_len: usize,
+        hidden_dim: usize,
+    ) -> Result<()> {
+        let row_bytes = self.tree_tap_capture_row_bytes;
+        let hidden: &GpuBuffer = unsafe { &*(&self.hidden as *const GpuBuffer) };
+        let mut sink = self.tree_tap_capture_sink(0, row_bytes)?;
+        copy_tap_rows_to_gpu_history(
+            ordinal, &mut sink, tap_slot, tap_count, hidden, tree_len, hidden_dim,
+        )
+    }
+
+    fn copy_tree_tap_capture_to_gpu_history(
+        &self,
+        ordinal: usize,
+        accepted_indices: &[usize],
+        commit_len: usize,
+        tap_history_gpu: &mut GpuBuffer,
+        start_row: usize,
+        row_bytes: usize,
+    ) -> Result<()> {
+        if commit_len == 0 {
+            return Ok(());
+        }
+        if accepted_indices.len() < commit_len {
+            return Err(anyhow::anyhow!(
+                "tree tap gather has {} accepted indices, need {commit_len}",
+                accepted_indices.len()
+            ));
+        }
+        if row_bytes == 0 || self.tree_tap_capture_row_bytes != row_bytes {
+            return Err(anyhow::anyhow!(
+                "tree tap capture row_bytes {} != destination row_bytes {}",
+                self.tree_tap_capture_row_bytes,
+                row_bytes
+            ));
+        }
+        let capture = self
+            .tree_tap_capture_gpu
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("tree tap capture buffer is missing"))?;
+        let dst_start = start_row * row_bytes;
+        if dst_start + commit_len * row_bytes > tap_history_gpu.len_bytes() {
+            return Err(anyhow::anyhow!(
+                "tree tap gather destination exceeds buffer: offset {} + len {} > {}",
+                dst_start,
+                commit_len * row_bytes,
+                tap_history_gpu.len_bytes()
+            ));
+        }
+        for (out_row, &tree_row) in accepted_indices.iter().take(commit_len).enumerate() {
+            if tree_row >= self.tree_tap_capture_rows {
+                return Err(anyhow::anyhow!(
+                    "tree tap gather row {tree_row} out of range {}",
+                    self.tree_tap_capture_rows
+                ));
+            }
+            let dst_off = dst_start + out_row * row_bytes;
+            let src_off = tree_row * row_bytes;
+            let dst =
+                unsafe { (tap_history_gpu.as_mut_ptr() as *mut u8).add(dst_off) as *mut c_void };
+            copy_d2d_batched(ordinal, dst, capture.offset_ptr(src_off), row_bytes)
+                .map_err(|e| anyhow::anyhow!("tree tap gather row {out_row}: {e}"))?;
+        }
+        Ok(())
+    }
 }
 
 pub struct PrefillAppendVerifyCache {
@@ -1856,9 +2077,12 @@ pub struct PrefillTreeVerifyCache {
     positions_gpu: GpuBuffer,
     parent_ids_gpu: GpuBuffer,
     visibility_gpu: GpuBuffer,
+    greedy_logits_gpu: GpuBuffer,
+    greedy_indices_gpu: GpuBuffer,
     token_id_bytes: Vec<u8>,
     position_bytes: Vec<u8>,
     parent_id_bytes: Vec<u8>,
+    rollback: Option<PrefillTreeRollback>,
 }
 
 impl PrefillTreeVerifyCache {
@@ -1872,6 +2096,11 @@ impl PrefillTreeVerifyCache {
             .map_err(|e| anyhow::anyhow!("tree cache parent ids alloc: {e}"))?;
         let visibility_gpu = GpuBuffer::alloc(ordinal, ScalarType::U8, &[tree_len, tree_len])
             .map_err(|e| anyhow::anyhow!("tree cache visibility alloc: {e}"))?;
+        let greedy_logits_gpu =
+            GpuBuffer::alloc(ordinal, ScalarType::BF16, &[tree_len, config.vocab_size])
+                .map_err(|e| anyhow::anyhow!("tree cache greedy logits alloc: {e}"))?;
+        let greedy_indices_gpu = GpuBuffer::alloc(ordinal, ScalarType::U32, &[tree_len])
+            .map_err(|e| anyhow::anyhow!("tree cache greedy indices alloc: {e}"))?;
 
         Ok(Self {
             tree_len,
@@ -1881,14 +2110,38 @@ impl PrefillTreeVerifyCache {
             positions_gpu,
             parent_ids_gpu,
             visibility_gpu,
+            greedy_logits_gpu,
+            greedy_indices_gpu,
             token_id_bytes: Vec::with_capacity(tree_len * 4),
             position_bytes: Vec::with_capacity(tree_len * 4),
             parent_id_bytes: Vec::with_capacity(tree_len * 4),
+            rollback: None,
         })
     }
 
     fn matches(&self, tree_len: usize, ordinal: usize) -> bool {
         self.tree_len == tree_len && self.ordinal == ordinal
+    }
+
+    fn take_rollback(
+        &mut self,
+        config: &TextConfig,
+        prefix_len: usize,
+    ) -> Result<PrefillTreeRollback> {
+        if let Some(mut rollback) = self.rollback.take() {
+            if tree_rollback_matches(config, &rollback, self.tree_len, self.ordinal) {
+                rollback.prefix_len = prefix_len;
+                rollback.tree_len = self.tree_len;
+                return Ok(rollback);
+            }
+        }
+        alloc_tree_rollback(config, self.tree_len, prefix_len, self.ordinal)
+    }
+
+    pub fn recycle_rollback(&mut self, rollback: PrefillTreeRollback) {
+        if rollback.tree_len == self.tree_len {
+            self.rollback = Some(rollback);
+        }
     }
 
     fn upload_inputs(
@@ -1949,6 +2202,134 @@ impl PrefillTreeVerifyCache {
 
         Ok(())
     }
+
+    pub fn copy_tap_capture_to_gpu_history(
+        &self,
+        accepted_indices: &[usize],
+        commit_len: usize,
+        tap_history_gpu: &mut GpuBuffer,
+        start_row: usize,
+        row_bytes: usize,
+    ) -> Result<()> {
+        self.scratch.copy_tree_tap_capture_to_gpu_history(
+            self.ordinal,
+            accepted_indices,
+            commit_len,
+            tap_history_gpu,
+            start_row,
+            row_bytes,
+        )
+    }
+
+    fn compute_greedy_ids(
+        &mut self,
+        weights: &Qwen35Weights,
+        config: &TextConfig,
+        use_4b_kernel: bool,
+    ) -> Result<Vec<u32>> {
+        if gpu_hal::current_backend() != Backend::Hip {
+            let (ids, _normed) = compute_greedy_for_range(
+                &self.scratch.hidden,
+                weights,
+                config,
+                0,
+                self.tree_len,
+                use_4b_kernel,
+                self.ordinal,
+            )?;
+            return Ok(ids);
+        }
+
+        let hidden_dim = config.hidden_size;
+        let vocab_size = config.vocab_size;
+        rms_norm_rows_model(
+            config,
+            self.ordinal,
+            self.tree_len,
+            hidden_dim,
+            &self.scratch.hidden,
+            &weights.norm_weight,
+            &mut self.scratch.normed,
+            "tree cache greedy final norm",
+        )?;
+
+        if let Some((qtype, scale, zero)) = weights.lm_head_lowbit_params(hidden_dim) {
+            if !maybe_matmul_q6_k_mmq_lm_head(
+                self.ordinal,
+                1,
+                self.tree_len,
+                vocab_size,
+                hidden_dim,
+                qtype,
+                weights.lm_head_awq_inv_scale.as_ref(),
+                &self.scratch.normed,
+                &*weights.lm_head,
+                &mut self.greedy_logits_gpu,
+            )? {
+                prefill_ffi::matmul_rhs_transposed_int4(
+                    self.ordinal,
+                    1,
+                    self.tree_len,
+                    vocab_size,
+                    hidden_dim,
+                    &self.scratch.normed,
+                    &*weights.lm_head,
+                    scale,
+                    zero,
+                    weights.lm_head_awq_inv_scale.as_ref(),
+                    weights.int4_group_size,
+                    qtype,
+                    &mut self.greedy_logits_gpu,
+                )
+                .map_err(|e| anyhow::anyhow!("tree cache greedy lm_head int4: {e}"))?;
+            }
+        } else if self.tree_len > 1 {
+            kernel_ffi::matmul_rhs_transposed_4b(
+                self.ordinal,
+                ScalarType::BF16,
+                1,
+                self.tree_len,
+                vocab_size,
+                hidden_dim,
+                &self.scratch.normed,
+                &*weights.lm_head,
+                &mut self.greedy_logits_gpu,
+            )
+            .map_err(|e| anyhow::anyhow!("tree cache greedy lm_head tiled: {e}"))?;
+        } else {
+            let mut counter = GpuBuffer::zeros(self.ordinal, ScalarType::U32, &[1])
+                .map_err(|e| anyhow::anyhow!("tree cache greedy matvec counter: {e}"))?;
+            kernel_ffi::standalone_matvec(
+                self.ordinal,
+                ScalarType::BF16,
+                &mut self.greedy_logits_gpu,
+                &self.scratch.normed,
+                &*weights.lm_head,
+                hidden_dim,
+                vocab_size,
+                &mut counter,
+            )
+            .map_err(|e| anyhow::anyhow!("tree cache greedy lm_head matvec: {e}"))?;
+        }
+
+        prefill_ffi::argmax_bf16_rows(
+            self.ordinal,
+            self.tree_len,
+            vocab_size,
+            &self.greedy_logits_gpu,
+            &mut self.greedy_indices_gpu,
+        )
+        .map_err(|e| anyhow::anyhow!("tree cache greedy argmax: {e}"))?;
+        let ids_bytes = self
+            .greedy_indices_gpu
+            .to_host_bytes()
+            .map_err(|e| anyhow::anyhow!("tree cache greedy ids D2H: {e}"))?;
+        Ok(ids_bytes
+            .chunks_exact(4)
+            .take(self.tree_len)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect())
+    }
 }
 
 impl PrefillAppendVerifyCache {
@@ -2007,6 +2388,128 @@ impl PrefillAppendVerifyCache {
             self.rollback = Some(rollback);
         }
     }
+}
+
+fn alloc_tree_rollback(
+    config: &TextConfig,
+    tree_len: usize,
+    prefix_len: usize,
+    ordinal: usize,
+) -> Result<PrefillTreeRollback> {
+    let kern = config.linear_conv_kernel_dim;
+    let khd = config.linear_key_head_dim;
+    let vhd = config.linear_value_head_dim;
+    let qkv_dim = config.linear_num_key_heads * khd * 2 + config.linear_num_value_heads * vhd;
+    let recurrent_trace_dtype = dflash_rollback_trace_dtype();
+    let mut per_layer = Vec::with_capacity(config.num_hidden_layers);
+    for idx in 0..config.num_hidden_layers {
+        if config.is_full_attention(idx) {
+            let tree_k = GpuBuffer::alloc(
+                ordinal,
+                ScalarType::BF16,
+                &[config.num_key_value_heads, tree_len, config.head_dim],
+            )
+            .map_err(|e| anyhow::anyhow!("tree rollback K layer {idx}: {e}"))?;
+            let tree_v = GpuBuffer::alloc(
+                ordinal,
+                ScalarType::BF16,
+                &[config.num_key_value_heads, tree_len, config.head_dim],
+            )
+            .map_err(|e| anyhow::anyhow!("tree rollback V layer {idx}: {e}"))?;
+            per_layer.push(Some(PrefillTreeLayerRollback::Full { tree_k, tree_v }));
+        } else {
+            let conv_input =
+                GpuBuffer::alloc(ordinal, ScalarType::BF16, &[qkv_dim, kern - 1 + tree_len])
+                    .map_err(|e| anyhow::anyhow!("tree rollback conv_input layer {idx}: {e}"))?;
+            let recurrent_trace = if recurrent_trace_dtype == ScalarType::U8 {
+                GpuBuffer::alloc(
+                    ordinal,
+                    recurrent_trace_dtype,
+                    &[dflash_q8_trace_bytes(
+                        config.linear_num_value_heads,
+                        tree_len,
+                        khd,
+                        vhd,
+                    )],
+                )
+            } else {
+                GpuBuffer::alloc(
+                    ordinal,
+                    recurrent_trace_dtype,
+                    &[config.linear_num_value_heads, tree_len, khd, vhd],
+                )
+            }
+            .map_err(|e| anyhow::anyhow!("tree rollback recurrent trace layer {idx}: {e}"))?;
+            per_layer.push(Some(PrefillTreeLayerRollback::Linear {
+                conv_input,
+                recurrent_trace,
+            }));
+        }
+    }
+    Ok(PrefillTreeRollback {
+        prefix_len,
+        tree_len,
+        per_layer,
+    })
+}
+
+fn tree_rollback_matches(
+    config: &TextConfig,
+    rollback: &PrefillTreeRollback,
+    tree_len: usize,
+    ordinal: usize,
+) -> bool {
+    if rollback.tree_len != tree_len || rollback.per_layer.len() != config.num_hidden_layers {
+        return false;
+    }
+    let kern = config.linear_conv_kernel_dim;
+    let khd = config.linear_key_head_dim;
+    let vhd = config.linear_value_head_dim;
+    let qkv_dim = config.linear_num_key_heads * khd * 2 + config.linear_num_value_heads * vhd;
+    let expected_trace_dtype = dflash_rollback_trace_dtype();
+    let expected_trace_bytes = if expected_trace_dtype == ScalarType::U8 {
+        dflash_q8_trace_bytes(config.linear_num_value_heads, tree_len, khd, vhd)
+    } else {
+        config.linear_num_value_heads * tree_len * khd * vhd * expected_trace_dtype.size_in_bytes()
+    };
+    let expected_conv_bytes = qkv_dim * (kern - 1 + tree_len) * ScalarType::BF16.size_in_bytes();
+    let expected_kv_bytes =
+        config.num_key_value_heads * tree_len * config.head_dim * ScalarType::BF16.size_in_bytes();
+
+    for (idx, layer) in rollback.per_layer.iter().enumerate() {
+        if config.is_full_attention(idx) {
+            let Some(PrefillTreeLayerRollback::Full { tree_k, tree_v }) = layer else {
+                return false;
+            };
+            if tree_k.device_ordinal() != ordinal
+                || tree_v.device_ordinal() != ordinal
+                || tree_k.dtype() != ScalarType::BF16
+                || tree_v.dtype() != ScalarType::BF16
+                || tree_k.len_bytes() < expected_kv_bytes
+                || tree_v.len_bytes() < expected_kv_bytes
+            {
+                return false;
+            }
+        } else {
+            let Some(PrefillTreeLayerRollback::Linear {
+                conv_input,
+                recurrent_trace,
+            }) = layer
+            else {
+                return false;
+            };
+            if conv_input.device_ordinal() != ordinal
+                || recurrent_trace.device_ordinal() != ordinal
+                || conv_input.dtype() != ScalarType::BF16
+                || recurrent_trace.dtype() != expected_trace_dtype
+                || conv_input.len_bytes() < expected_conv_bytes
+                || recurrent_trace.len_bytes() < expected_trace_bytes
+            {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 fn alloc_append_rollback(
@@ -3779,6 +4282,7 @@ pub fn prefill_tree_verify(
         tap_layers,
         greedy_only,
         capture_rollback,
+        false,
         None,
     )
 }
@@ -3799,6 +4303,7 @@ pub fn prefill_tree_verify_cached(
     tap_layers: Option<&[usize]>,
     greedy_only: bool,
     capture_rollback: bool,
+    capture_gpu_taps: bool,
     cache: &mut PrefillTreeVerifyCache,
 ) -> Result<PrefillTreeVerifyResult> {
     prefill_tree_verify_impl(
@@ -3816,6 +4321,7 @@ pub fn prefill_tree_verify_cached(
         tap_layers,
         greedy_only,
         capture_rollback,
+        capture_gpu_taps,
         Some(cache),
     )
 }
@@ -3836,6 +4342,7 @@ fn prefill_tree_verify_impl(
     tap_layers: Option<&[usize]>,
     greedy_only: bool,
     capture_rollback: bool,
+    capture_gpu_taps: bool,
     cache: Option<&mut PrefillTreeVerifyCache>,
 ) -> Result<PrefillTreeVerifyResult> {
     if token_ids.is_empty() {
@@ -3892,14 +4399,25 @@ fn prefill_tree_verify_impl(
         ms_setup += t_setup.elapsed().as_secs_f64() * 1000.0;
     }
 
+    let tap_count = tap_layers.map(|tap| tap.len()).unwrap_or(0);
+    let use_gpu_tap_capture = capture_gpu_taps && tap_count > 0;
+    if use_gpu_tap_capture {
+        cache
+            .scratch
+            .ensure_tree_tap_capture(ordinal, tree_len, tap_count, hidden_dim)?;
+    }
+
+    let mut rollback = if capture_rollback {
+        Some(cache.take_rollback(config, prefix_len)?)
+    } else {
+        None
+    };
     let scratch = &mut cache.scratch;
-    let mut tap_hiddens_all: Option<Vec<Vec<u8>>> =
-        tap_layers.map(|tap| vec![Vec::with_capacity(tree_len * hidden_dim * 2); tap.len()]);
-    let mut rollback = capture_rollback.then(|| PrefillTreeRollback {
-        prefix_len,
-        tree_len,
-        per_layer: (0..config.num_hidden_layers).map(|_| None).collect(),
-    });
+    let mut tap_hiddens_all: Option<Vec<Vec<u8>>> = if use_gpu_tap_capture {
+        None
+    } else {
+        tap_layers.map(|tap| vec![Vec::with_capacity(tree_len * hidden_dim * 2); tap.len()])
+    };
 
     let t_embed = std::time::Instant::now();
     prefill_ffi::embedding_lookup(
@@ -3994,16 +4512,22 @@ fn prefill_tree_verify_impl(
         if profile {
             ms_mlp += t_mlp.elapsed().as_secs_f64() * 1000.0;
         }
-        if let (Some(tap), Some(out_all)) = (tap_layers, tap_hiddens_all.as_mut()) {
+        if let Some(tap) = tap_layers {
             let t_taps = std::time::Instant::now();
             for (slot, &target_layer) in tap.iter().enumerate() {
                 if target_layer == idx {
-                    let hidden_bytes = hidden_dim * ScalarType::BF16.size_in_bytes();
-                    let tree_bytes = tree_len * hidden_bytes;
-                    let host = scratch.hidden.to_host_bytes().map_err(|e| {
-                        anyhow::anyhow!("tree verify dflash tap history D2H layer {idx}: {e}")
-                    })?;
-                    out_all[slot].extend_from_slice(&host[..tree_bytes]);
+                    if use_gpu_tap_capture {
+                        scratch.copy_hidden_to_tree_tap_capture(
+                            ordinal, slot, tap_count, tree_len, hidden_dim,
+                        )?;
+                    } else if let Some(out_all) = tap_hiddens_all.as_mut() {
+                        let hidden_bytes = hidden_dim * ScalarType::BF16.size_in_bytes();
+                        let tree_bytes = tree_len * hidden_bytes;
+                        let host = scratch.hidden.to_host_bytes().map_err(|e| {
+                            anyhow::anyhow!("tree verify dflash tap history D2H layer {idx}: {e}")
+                        })?;
+                        out_all[slot].extend_from_slice(&host[..tree_bytes]);
+                    }
                 }
             }
             if profile {
@@ -4013,19 +4537,11 @@ fn prefill_tree_verify_impl(
     }
 
     let t_logits = std::time::Instant::now();
-    let (target_next, _normed) = if greedy_only {
-        compute_greedy_for_range(
-            &scratch.hidden,
-            weights,
-            config,
-            0,
-            tree_len,
-            use_4b_kernel,
-            ordinal,
-        )?
+    let target_next = if greedy_only {
+        cache.compute_greedy_ids(weights, config, use_4b_kernel)?
     } else {
         let (logits, normed) = compute_logits_for_range(
-            &scratch.hidden,
+            &cache.scratch.hidden,
             weights,
             config,
             0,
@@ -4047,7 +4563,8 @@ fn prefill_tree_verify_impl(
                 best_idx
             })
             .collect();
-        (ids, normed)
+        let _ = normed;
+        ids
     };
     if profile {
         ms_logits += t_logits.elapsed().as_secs_f64() * 1000.0;
@@ -4070,6 +4587,7 @@ fn prefill_tree_verify_impl(
     Ok(PrefillTreeVerifyResult {
         target_next,
         tap_hiddens_all,
+        tap_hiddens_gpu: use_gpu_tap_capture,
         rollback,
     })
 }
@@ -5607,24 +6125,39 @@ fn prefill_tree_full_attention_layer(
     )
     .map_err(|e| anyhow::anyhow!("tree layer {idx} V transpose: {e}"))?;
     if let Some(slot) = capture_slot.as_deref_mut() {
-        let mut tree_k = GpuBuffer::alloc(
-            ordinal,
-            ScalarType::BF16,
-            &[num_kv_heads, tree_len, head_dim],
-        )
-        .map_err(|e| anyhow::anyhow!("tree layer {idx} rollback K alloc: {e}"))?;
-        let mut tree_v = GpuBuffer::alloc(
-            ordinal,
-            ScalarType::BF16,
-            &[num_kv_heads, tree_len, head_dim],
-        )
-        .map_err(|e| anyhow::anyhow!("tree layer {idx} rollback V alloc: {e}"))?;
         let bytes = num_kv_heads * tree_len * head_dim * elem_bytes;
+        let needs_alloc = !matches!(
+            slot.as_ref(),
+            Some(PrefillTreeLayerRollback::Full { tree_k, tree_v })
+                if tree_k.device_ordinal() == ordinal
+                    && tree_v.device_ordinal() == ordinal
+                    && tree_k.dtype() == ScalarType::BF16
+                    && tree_v.dtype() == ScalarType::BF16
+                    && tree_k.len_bytes() >= bytes
+                    && tree_v.len_bytes() >= bytes
+        );
+        if needs_alloc {
+            let tree_k = GpuBuffer::alloc(
+                ordinal,
+                ScalarType::BF16,
+                &[num_kv_heads, tree_len, head_dim],
+            )
+            .map_err(|e| anyhow::anyhow!("tree layer {idx} rollback K alloc: {e}"))?;
+            let tree_v = GpuBuffer::alloc(
+                ordinal,
+                ScalarType::BF16,
+                &[num_kv_heads, tree_len, head_dim],
+            )
+            .map_err(|e| anyhow::anyhow!("tree layer {idx} rollback V alloc: {e}"))?;
+            *slot = Some(PrefillTreeLayerRollback::Full { tree_k, tree_v });
+        }
+        let Some(PrefillTreeLayerRollback::Full { tree_k, tree_v }) = slot.as_mut() else {
+            unreachable!("tree full-attention rollback slot was just initialized");
+        };
         copy_d2d_batched(ordinal, tree_k.as_mut_ptr(), scratch.attn_k.as_ptr(), bytes)
             .map_err(|e| anyhow::anyhow!("tree layer {idx} rollback K capture: {e}"))?;
         copy_d2d_batched(ordinal, tree_v.as_mut_ptr(), scratch.attn_v.as_ptr(), bytes)
             .map_err(|e| anyhow::anyhow!("tree layer {idx} rollback V capture: {e}"))?;
-        *slot = Some(PrefillTreeLayerRollback::Full { tree_k, tree_v });
     }
     prefill_ffi::transpose_shd_hsd(
         ordinal,
@@ -6938,6 +7471,85 @@ fn prefill_linear_attention_layer(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn delta_recurrent_tree_prefill_capture_with_trace(
+    ordinal: usize,
+    idx: usize,
+    nv: usize,
+    tree_len: usize,
+    khd: usize,
+    vhd: usize,
+    recurrent_initial: &GpuBuffer,
+    linear_q_trans: &GpuBuffer,
+    linear_k_trans: &GpuBuffer,
+    linear_v_trans: &GpuBuffer,
+    linear_beta: &GpuBuffer,
+    linear_g: &GpuBuffer,
+    parent_ids_gpu: &GpuBuffer,
+    linear_delta_out: &mut GpuBuffer,
+    recurrent_trace: &mut GpuBuffer,
+) -> Result<()> {
+    if recurrent_trace.dtype() == ScalarType::U8 {
+        prefill_ffi::delta_recurrent_tree_prefill_capture_q8_trace(
+            ordinal,
+            ScalarType::F32,
+            nv,
+            tree_len,
+            khd,
+            vhd,
+            recurrent_initial,
+            linear_q_trans,
+            linear_k_trans,
+            linear_v_trans,
+            linear_beta,
+            linear_g,
+            parent_ids_gpu,
+            linear_delta_out,
+            recurrent_trace,
+        )
+        .map_err(|e| anyhow::anyhow!("tree layer {idx} delta recurrent Q8 trace capture: {e}"))?;
+    } else if recurrent_trace.dtype() == ScalarType::BF16 {
+        prefill_ffi::delta_recurrent_tree_prefill_capture_bf16_trace(
+            ordinal,
+            ScalarType::F32,
+            nv,
+            tree_len,
+            khd,
+            vhd,
+            recurrent_initial,
+            linear_q_trans,
+            linear_k_trans,
+            linear_v_trans,
+            linear_beta,
+            linear_g,
+            parent_ids_gpu,
+            linear_delta_out,
+            recurrent_trace,
+        )
+        .map_err(|e| anyhow::anyhow!("tree layer {idx} delta recurrent BF16 trace capture: {e}"))?;
+    } else {
+        prefill_ffi::delta_recurrent_tree_prefill_capture(
+            ordinal,
+            ScalarType::F32,
+            nv,
+            tree_len,
+            khd,
+            vhd,
+            recurrent_initial,
+            linear_q_trans,
+            linear_k_trans,
+            linear_v_trans,
+            linear_beta,
+            linear_g,
+            parent_ids_gpu,
+            linear_delta_out,
+            recurrent_trace,
+        )
+        .map_err(|e| anyhow::anyhow!("tree layer {idx} delta recurrent capture: {e}"))?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn prefill_tree_linear_attention_layer(
     weights: &Qwen35Weights,
     state: &ModelState,
@@ -6966,41 +7578,80 @@ fn prefill_tree_linear_attention_layer(
     let qkv_dim = key_dim * 2 + val_dim;
     let z_dim = val_dim;
 
-    matmul_proj(
-        ordinal,
-        1,
-        tree_len,
-        qkv_dim,
-        hidden_dim,
-        &scratch.normed,
-        &lw.qkv_proj_w,
-        lw.qkv_proj_scale.as_ref(),
-        lw.qkv_proj_int8_scale.as_ref(),
-        weights.fp8_block_size,
-        &mut scratch.proj_buf,
-        lw.qkv_proj_int4_scale.as_ref(),
-        lw.qkv_proj_int4_zero.as_ref(),
-        lw.qkv_proj_awq_inv_scale.as_ref(),
-        weights.int4_group_size,
-    )?;
+    let fused_qkvz_enabled = if env::var_os("SUPERSONIC_DISABLE_FUSED_QKVZ").is_some() {
+        false
+    } else {
+        env::var_os("SUPERSONIC_ENABLE_FUSED_QKVZ").is_some()
+            || (config.hidden_size == 5120 && config.num_hidden_layers == 64)
+    };
+    let use_fused_qkvz =
+        fused_qkvz_enabled && scratch.normed.backend() == Backend::Hip && lw.qkvz_proj_w.is_some();
 
-    matmul_proj(
-        ordinal,
-        1,
-        tree_len,
-        z_dim,
-        hidden_dim,
-        &scratch.normed,
-        &lw.z_proj_w,
-        lw.z_proj_scale.as_ref(),
-        lw.z_proj_int8_scale.as_ref(),
-        weights.fp8_block_size,
-        &mut scratch.proj_buf2,
-        lw.z_proj_int4_scale.as_ref(),
-        lw.z_proj_int4_zero.as_ref(),
-        lw.z_proj_awq_inv_scale.as_ref(),
-        weights.int4_group_size,
-    )?;
+    if use_fused_qkvz {
+        matmul_proj(
+            ordinal,
+            1,
+            tree_len,
+            qkv_dim + z_dim,
+            hidden_dim,
+            &scratch.normed,
+            lw.qkvz_proj_w.as_ref().expect("checked fused QKVZ weight"),
+            None,
+            None,
+            weights.fp8_block_size,
+            &mut scratch.mlp_buf,
+            None,
+            None,
+            None,
+            0,
+        )?;
+        prefill_ffi::split_qkvz_bf16(
+            ordinal,
+            tree_len,
+            qkv_dim,
+            z_dim,
+            &scratch.mlp_buf,
+            &mut scratch.proj_buf,
+            &mut scratch.proj_buf2,
+        )
+        .map_err(|e| anyhow::anyhow!("tree layer {idx} fused QKVZ split: {e}"))?;
+    } else {
+        matmul_proj(
+            ordinal,
+            1,
+            tree_len,
+            qkv_dim,
+            hidden_dim,
+            &scratch.normed,
+            &lw.qkv_proj_w,
+            lw.qkv_proj_scale.as_ref(),
+            lw.qkv_proj_int8_scale.as_ref(),
+            weights.fp8_block_size,
+            &mut scratch.proj_buf,
+            lw.qkv_proj_int4_scale.as_ref(),
+            lw.qkv_proj_int4_zero.as_ref(),
+            lw.qkv_proj_awq_inv_scale.as_ref(),
+            weights.int4_group_size,
+        )?;
+
+        matmul_proj(
+            ordinal,
+            1,
+            tree_len,
+            z_dim,
+            hidden_dim,
+            &scratch.normed,
+            &lw.z_proj_w,
+            lw.z_proj_scale.as_ref(),
+            lw.z_proj_int8_scale.as_ref(),
+            weights.fp8_block_size,
+            &mut scratch.proj_buf2,
+            lw.z_proj_int4_scale.as_ref(),
+            lw.z_proj_int4_zero.as_ref(),
+            lw.z_proj_awq_inv_scale.as_ref(),
+            weights.int4_group_size,
+        )?;
+    }
 
     let use_fused_ba =
         lw.ba_proj_w.is_some() && scratch.normed.backend() != gpu_hal::Backend::Metal;
@@ -7087,20 +7738,57 @@ fn prefill_tree_linear_attention_layer(
         )
         .map_err(|e| anyhow::anyhow!("tree layer {idx} conv pad fill: {e}"))?;
     }
-    let conv_input_capture = if capture_slot.is_some() {
-        let mut captured = GpuBuffer::alloc(ordinal, ScalarType::BF16, &[qkv_dim, pad + tree_len])
-            .map_err(|e| anyhow::anyhow!("tree layer {idx} rollback conv_input alloc: {e}"))?;
+    let recurrent_trace_dtype = dflash_rollback_trace_dtype();
+    if let Some(slot) = capture_slot.as_deref_mut() {
+        let conv_bytes = qkv_dim * (pad + tree_len) * ScalarType::BF16.size_in_bytes();
+        let trace_bytes = if recurrent_trace_dtype == ScalarType::U8 {
+            dflash_q8_trace_bytes(nv, tree_len, khd, vhd)
+        } else {
+            nv * tree_len * khd * vhd * recurrent_trace_dtype.size_in_bytes()
+        };
+        let needs_alloc = !matches!(
+            slot.as_ref(),
+            Some(PrefillTreeLayerRollback::Linear {
+                conv_input,
+                recurrent_trace,
+            }) if conv_input.device_ordinal() == ordinal
+                && recurrent_trace.device_ordinal() == ordinal
+                && conv_input.dtype() == ScalarType::BF16
+                && recurrent_trace.dtype() == recurrent_trace_dtype
+                && conv_input.len_bytes() >= conv_bytes
+                && recurrent_trace.len_bytes() >= trace_bytes
+        );
+        if needs_alloc {
+            let conv_input =
+                GpuBuffer::alloc(ordinal, ScalarType::BF16, &[qkv_dim, pad + tree_len]).map_err(
+                    |e| anyhow::anyhow!("tree layer {idx} rollback conv_input alloc: {e}"),
+                )?;
+            let recurrent_trace = if recurrent_trace_dtype == ScalarType::U8 {
+                GpuBuffer::alloc(
+                    ordinal,
+                    recurrent_trace_dtype,
+                    &[dflash_q8_trace_bytes(nv, tree_len, khd, vhd)],
+                )
+            } else {
+                GpuBuffer::alloc(ordinal, recurrent_trace_dtype, &[nv, tree_len, khd, vhd])
+            }
+            .map_err(|e| anyhow::anyhow!("tree recurrent trace alloc: {e}"))?;
+            *slot = Some(PrefillTreeLayerRollback::Linear {
+                conv_input,
+                recurrent_trace,
+            });
+        }
+        let Some(PrefillTreeLayerRollback::Linear { conv_input, .. }) = slot.as_mut() else {
+            unreachable!("tree linear rollback slot was just initialized");
+        };
         copy_d2d_batched(
             ordinal,
-            captured.as_mut_ptr(),
+            conv_input.as_mut_ptr(),
             scratch.conv_input.as_ptr(),
-            qkv_dim * (pad + tree_len) * ScalarType::BF16.size_in_bytes(),
+            conv_bytes,
         )
         .map_err(|e| anyhow::anyhow!("tree layer {idx} rollback conv_input capture: {e}"))?;
-        Some(captured)
-    } else {
-        None
-    };
+    }
 
     prefill_ffi::linear_tree_conv_pack(
         ordinal,
@@ -7117,7 +7805,26 @@ fn prefill_tree_linear_attention_layer(
     )
     .map_err(|e| anyhow::anyhow!("tree layer {idx} conv: {e}"))?;
 
-    if gpu_hal::current_backend() == Backend::Hip {
+    let use_fused_qkv_prepare = gpu_hal::current_backend() == Backend::Hip
+        && std::env::var_os("SUPERSONIC_DFLASH_DISABLE_FUSED_QKV_PREP").is_none();
+    if use_fused_qkv_prepare {
+        let q_scale = 1.0 / (khd as f32).sqrt();
+        prefill_ffi::split_norm_transpose_qkv_bf16(
+            ordinal,
+            tree_len,
+            nk,
+            nv,
+            khd,
+            vhd,
+            q_scale,
+            1e-6,
+            &scratch.proj_buf,
+            &mut scratch.linear_q_trans,
+            &mut scratch.linear_k_trans,
+            &mut scratch.linear_v_trans,
+        )
+        .map_err(|e| anyhow::anyhow!("tree layer {idx} fused QKV prepare: {e}"))?;
+    } else if gpu_hal::current_backend() == Backend::Hip {
         prefill_ffi::split_qkv_bf16_to_f32(
             ordinal,
             tree_len,
@@ -7177,37 +7884,39 @@ fn prefill_tree_linear_attention_layer(
         .map_err(|e| anyhow::anyhow!("tree layer {idx} V cast: {e}"))?;
     }
 
-    prefill_ffi::l2norm(
-        ordinal,
-        ScalarType::F32,
-        tree_len * nk,
-        khd,
-        1e-6,
-        &scratch.linear_q_f32,
-        &mut scratch.linear_q_normed,
-    )
-    .map_err(|e| anyhow::anyhow!("tree layer {idx} Q l2norm: {e}"))?;
-    let q_scale = 1.0 / (khd as f32).sqrt();
-    prefill_ffi::mul_scalar(
-        ordinal,
-        ScalarType::F32,
-        tree_len * key_dim,
-        q_scale,
-        &scratch.linear_q_normed,
-        &mut scratch.linear_q_scaled,
-    )
-    .map_err(|e| anyhow::anyhow!("tree layer {idx} Q scale: {e}"))?;
+    if !use_fused_qkv_prepare {
+        prefill_ffi::l2norm(
+            ordinal,
+            ScalarType::F32,
+            tree_len * nk,
+            khd,
+            1e-6,
+            &scratch.linear_q_f32,
+            &mut scratch.linear_q_normed,
+        )
+        .map_err(|e| anyhow::anyhow!("tree layer {idx} Q l2norm: {e}"))?;
+        let q_scale = 1.0 / (khd as f32).sqrt();
+        prefill_ffi::mul_scalar(
+            ordinal,
+            ScalarType::F32,
+            tree_len * key_dim,
+            q_scale,
+            &scratch.linear_q_normed,
+            &mut scratch.linear_q_scaled,
+        )
+        .map_err(|e| anyhow::anyhow!("tree layer {idx} Q scale: {e}"))?;
 
-    prefill_ffi::l2norm(
-        ordinal,
-        ScalarType::F32,
-        tree_len * nk,
-        khd,
-        1e-6,
-        &scratch.linear_k_f32,
-        &mut scratch.linear_k_normed,
-    )
-    .map_err(|e| anyhow::anyhow!("tree layer {idx} K l2norm: {e}"))?;
+        prefill_ffi::l2norm(
+            ordinal,
+            ScalarType::F32,
+            tree_len * nk,
+            khd,
+            1e-6,
+            &scratch.linear_k_f32,
+            &mut scratch.linear_k_normed,
+        )
+        .map_err(|e| anyhow::anyhow!("tree layer {idx} K l2norm: {e}"))?;
+    }
 
     if use_fused_ba {
         prefill_ffi::compute_beta_g_ba_bf16(
@@ -7281,77 +7990,68 @@ fn prefill_tree_linear_attention_layer(
         .map_err(|e| anyhow::anyhow!("tree layer {idx} beta/g: {e}"))?;
     }
 
-    let head_repeat = nv / nk;
-    if head_repeat == 1 {
+    if !use_fused_qkv_prepare {
+        let head_repeat = nv / nk;
+        if head_repeat == 1 {
+            prefill_ffi::transpose_shd_hsd(
+                ordinal,
+                ScalarType::F32,
+                tree_len,
+                nk,
+                khd,
+                &scratch.linear_q_scaled,
+                &mut scratch.linear_q_trans,
+            )
+            .map_err(|e| anyhow::anyhow!("tree layer {idx} Q linear transpose: {e}"))?;
+        } else {
+            prefill_ffi::repeat_interleave_transpose_hsd(
+                ordinal,
+                ScalarType::F32,
+                tree_len,
+                nk,
+                khd,
+                head_repeat,
+                &scratch.linear_q_scaled,
+                &mut scratch.linear_q_trans,
+            )
+            .map_err(|e| anyhow::anyhow!("tree layer {idx} Q repeat+transpose: {e}"))?;
+        };
+        if head_repeat == 1 {
+            prefill_ffi::transpose_shd_hsd(
+                ordinal,
+                ScalarType::F32,
+                tree_len,
+                nk,
+                khd,
+                &scratch.linear_k_normed,
+                &mut scratch.linear_k_trans,
+            )
+            .map_err(|e| anyhow::anyhow!("tree layer {idx} K linear transpose: {e}"))?;
+        } else {
+            prefill_ffi::repeat_interleave_transpose_hsd(
+                ordinal,
+                ScalarType::F32,
+                tree_len,
+                nk,
+                khd,
+                head_repeat,
+                &scratch.linear_k_normed,
+                &mut scratch.linear_k_trans,
+            )
+            .map_err(|e| anyhow::anyhow!("tree layer {idx} K repeat+transpose: {e}"))?;
+        };
         prefill_ffi::transpose_shd_hsd(
             ordinal,
             ScalarType::F32,
             tree_len,
-            nk,
-            khd,
-            &scratch.linear_q_scaled,
-            &mut scratch.linear_q_trans,
+            nv,
+            vhd,
+            &scratch.linear_v_f32,
+            &mut scratch.linear_v_trans,
         )
-        .map_err(|e| anyhow::anyhow!("tree layer {idx} Q linear transpose: {e}"))?;
-    } else {
-        prefill_ffi::repeat_interleave_transpose_hsd(
-            ordinal,
-            ScalarType::F32,
-            tree_len,
-            nk,
-            khd,
-            head_repeat,
-            &scratch.linear_q_scaled,
-            &mut scratch.linear_q_trans,
-        )
-        .map_err(|e| anyhow::anyhow!("tree layer {idx} Q repeat+transpose: {e}"))?;
-    };
-    if head_repeat == 1 {
-        prefill_ffi::transpose_shd_hsd(
-            ordinal,
-            ScalarType::F32,
-            tree_len,
-            nk,
-            khd,
-            &scratch.linear_k_normed,
-            &mut scratch.linear_k_trans,
-        )
-        .map_err(|e| anyhow::anyhow!("tree layer {idx} K linear transpose: {e}"))?;
-    } else {
-        prefill_ffi::repeat_interleave_transpose_hsd(
-            ordinal,
-            ScalarType::F32,
-            tree_len,
-            nk,
-            khd,
-            head_repeat,
-            &scratch.linear_k_normed,
-            &mut scratch.linear_k_trans,
-        )
-        .map_err(|e| anyhow::anyhow!("tree layer {idx} K repeat+transpose: {e}"))?;
-    };
-    prefill_ffi::transpose_shd_hsd(
-        ordinal,
-        ScalarType::F32,
-        tree_len,
-        nv,
-        vhd,
-        &scratch.linear_v_f32,
-        &mut scratch.linear_v_trans,
-    )
-    .map_err(|e| anyhow::anyhow!("tree layer {idx} V linear transpose: {e}"))?;
-
-    let recurrent_trace_dtype = dflash_rollback_trace_dtype();
-    let mut recurrent_trace = if recurrent_trace_dtype == ScalarType::U8 {
-        GpuBuffer::alloc(
-            ordinal,
-            recurrent_trace_dtype,
-            &[dflash_q8_trace_bytes(nv, tree_len, khd, vhd)],
-        )
-    } else {
-        GpuBuffer::alloc(ordinal, recurrent_trace_dtype, &[nv, tree_len, khd, vhd])
+        .map_err(|e| anyhow::anyhow!("tree layer {idx} V linear transpose: {e}"))?;
     }
-    .map_err(|e| anyhow::anyhow!("tree recurrent trace alloc: {e}"))?;
+
     let zero_recurrent;
     let recurrent_initial = if let Some(rec_state) = state.layers[idx].recurrent_state.as_ref() {
         rec_state
@@ -7360,10 +8060,17 @@ fn prefill_tree_linear_attention_layer(
             .map_err(|e| anyhow::anyhow!("tree zero recurrent alloc: {e}"))?;
         &zero_recurrent
     };
-    if recurrent_trace.dtype() == ScalarType::U8 {
-        prefill_ffi::delta_recurrent_tree_prefill_capture_q8_trace(
+
+    if let Some(slot) = capture_slot.as_deref_mut() {
+        let Some(PrefillTreeLayerRollback::Linear {
+            recurrent_trace, ..
+        }) = slot.as_mut()
+        else {
+            unreachable!("tree linear rollback slot was initialized before recurrent capture");
+        };
+        delta_recurrent_tree_prefill_capture_with_trace(
             ordinal,
-            ScalarType::F32,
+            idx,
             nv,
             tree_len,
             khd,
@@ -7376,53 +8083,36 @@ fn prefill_tree_linear_attention_layer(
             &scratch.linear_g,
             parent_ids_gpu,
             &mut scratch.linear_delta_out,
-            &mut recurrent_trace,
-        )
-        .map_err(|e| anyhow::anyhow!("tree layer {idx} delta recurrent Q8 trace capture: {e}"))?;
-    } else if recurrent_trace.dtype() == ScalarType::BF16 {
-        prefill_ffi::delta_recurrent_tree_prefill_capture_bf16_trace(
-            ordinal,
-            ScalarType::F32,
-            nv,
-            tree_len,
-            khd,
-            vhd,
-            recurrent_initial,
-            &scratch.linear_q_trans,
-            &scratch.linear_k_trans,
-            &scratch.linear_v_trans,
-            &scratch.linear_beta,
-            &scratch.linear_g,
-            parent_ids_gpu,
-            &mut scratch.linear_delta_out,
-            &mut recurrent_trace,
-        )
-        .map_err(|e| anyhow::anyhow!("tree layer {idx} delta recurrent BF16 trace capture: {e}"))?;
-    } else {
-        prefill_ffi::delta_recurrent_tree_prefill_capture(
-            ordinal,
-            ScalarType::F32,
-            nv,
-            tree_len,
-            khd,
-            vhd,
-            recurrent_initial,
-            &scratch.linear_q_trans,
-            &scratch.linear_k_trans,
-            &scratch.linear_v_trans,
-            &scratch.linear_beta,
-            &scratch.linear_g,
-            parent_ids_gpu,
-            &mut scratch.linear_delta_out,
-            &mut recurrent_trace,
-        )
-        .map_err(|e| anyhow::anyhow!("tree layer {idx} delta recurrent capture: {e}"))?;
-    }
-    if let (Some(slot), Some(conv_input)) = (capture_slot.as_deref_mut(), conv_input_capture) {
-        *slot = Some(PrefillTreeLayerRollback::Linear {
-            conv_input,
             recurrent_trace,
-        });
+        )?;
+    } else {
+        let mut recurrent_trace = if recurrent_trace_dtype == ScalarType::U8 {
+            GpuBuffer::alloc(
+                ordinal,
+                recurrent_trace_dtype,
+                &[dflash_q8_trace_bytes(nv, tree_len, khd, vhd)],
+            )
+        } else {
+            GpuBuffer::alloc(ordinal, recurrent_trace_dtype, &[nv, tree_len, khd, vhd])
+        }
+        .map_err(|e| anyhow::anyhow!("tree recurrent trace alloc: {e}"))?;
+        delta_recurrent_tree_prefill_capture_with_trace(
+            ordinal,
+            idx,
+            nv,
+            tree_len,
+            khd,
+            vhd,
+            recurrent_initial,
+            &scratch.linear_q_trans,
+            &scratch.linear_k_trans,
+            &scratch.linear_v_trans,
+            &scratch.linear_beta,
+            &scratch.linear_g,
+            parent_ids_gpu,
+            &mut scratch.linear_delta_out,
+            &mut recurrent_trace,
+        )?;
     }
 
     prefill_ffi::dflash_extract_recurrent_attn(
@@ -7437,40 +8127,57 @@ fn prefill_tree_linear_attention_layer(
     )
     .map_err(|e| anyhow::anyhow!("tree layer {idx} recurrent/attn extract: {e}"))?;
 
-    prefill_ffi::transpose_shd_hsd(
-        ordinal,
-        ScalarType::BF16,
-        tree_len,
-        nv,
-        vhd,
-        &scratch.proj_buf2,
-        &mut scratch.linear_z_trans,
-    )
-    .map_err(|e| anyhow::anyhow!("tree layer {idx} Z transpose: {e}"))?;
+    let use_fused_gated_epilogue = gpu_hal::current_backend() == Backend::Hip
+        && std::env::var_os("SUPERSONIC_DFLASH_DISABLE_FUSED_GATED_EPILOGUE").is_none();
+    if use_fused_gated_epilogue {
+        prefill_ffi::rms_norm_gated_sfirst_bf16(
+            ordinal,
+            tree_len,
+            nv,
+            vhd,
+            config.rms_norm_eps as f32,
+            &scratch.linear_attn_output,
+            &scratch.proj_buf2,
+            &lw.norm_w_bf16,
+            &mut scratch.linear_gated_s_first,
+        )
+        .map_err(|e| anyhow::anyhow!("tree layer {idx} fused gated epilogue: {e}"))?;
+    } else {
+        prefill_ffi::transpose_shd_hsd(
+            ordinal,
+            ScalarType::BF16,
+            tree_len,
+            nv,
+            vhd,
+            &scratch.proj_buf2,
+            &mut scratch.linear_z_trans,
+        )
+        .map_err(|e| anyhow::anyhow!("tree layer {idx} Z transpose: {e}"))?;
 
-    prefill_ffi::rms_norm_gated(
-        ordinal,
-        ScalarType::BF16,
-        nv * tree_len,
-        vhd,
-        config.rms_norm_eps as f32,
-        &scratch.linear_attn_output,
-        &scratch.linear_z_trans,
-        &lw.norm_w_bf16,
-        &mut scratch.linear_gated_out,
-    )
-    .map_err(|e| anyhow::anyhow!("tree layer {idx} gated norm: {e}"))?;
+        prefill_ffi::rms_norm_gated(
+            ordinal,
+            ScalarType::BF16,
+            nv * tree_len,
+            vhd,
+            config.rms_norm_eps as f32,
+            &scratch.linear_attn_output,
+            &scratch.linear_z_trans,
+            &lw.norm_w_bf16,
+            &mut scratch.linear_gated_out,
+        )
+        .map_err(|e| anyhow::anyhow!("tree layer {idx} gated norm: {e}"))?;
 
-    prefill_ffi::transpose_shd_hsd(
-        ordinal,
-        ScalarType::BF16,
-        nv,
-        tree_len,
-        vhd,
-        &scratch.linear_gated_out,
-        &mut scratch.linear_gated_s_first,
-    )
-    .map_err(|e| anyhow::anyhow!("tree layer {idx} gated transpose: {e}"))?;
+        prefill_ffi::transpose_shd_hsd(
+            ordinal,
+            ScalarType::BF16,
+            nv,
+            tree_len,
+            vhd,
+            &scratch.linear_gated_out,
+            &mut scratch.linear_gated_s_first,
+        )
+        .map_err(|e| anyhow::anyhow!("tree layer {idx} gated transpose: {e}"))?;
+    }
 
     matmul_proj(
         ordinal,
@@ -7513,7 +8220,7 @@ fn prefill_mlp_layer(
     let hidden_dim = config.hidden_size;
     let intermediate = config.intermediate_size;
 
-    // gate_proj: normed [seq, hidden] × gate_w [intermediate, hidden]^T → [seq, intermediate]
+    // gate_proj: normed [seq, hidden] x gate_w [intermediate, hidden]^T -> [seq, intermediate]
     if let Some(sc) = lw.gate_proj_int8_scale.as_ref() {
         matmul_int8_mixed_host(
             ordinal,
@@ -7551,7 +8258,7 @@ fn prefill_mlp_layer(
         )?;
     }
 
-    // up_proj: normed [seq, hidden] × up_w [intermediate, hidden]^T → [seq, intermediate]
+    // up_proj: normed [seq, hidden] x up_w [intermediate, hidden]^T -> [seq, intermediate]
     if let Some(sc) = lw.up_proj_int8_scale.as_ref() {
         matmul_int8_mixed_host(
             ordinal,
@@ -7596,7 +8303,7 @@ fn prefill_mlp_layer(
         &mut scratch.mlp_buf,
     )?;
 
-    // down_proj: mlp_buf [seq, intermediate] × down_w [hidden, intermediate]^T → [seq, hidden]
+    // down_proj: mlp_buf [seq, intermediate] x down_w [hidden, intermediate]^T -> [seq, hidden]
     if let Some(sc) = lw.down_proj_int8_scale.as_ref() {
         matmul_int8_mixed_host(
             ordinal,
@@ -7615,23 +8322,45 @@ fn prefill_mlp_layer(
             &mut scratch.proj_buf,
         )?;
     } else {
-        matmul_proj(
+        let down_qtype = qwen35::weights::infer_lowbit_type(
+            &lw.down_proj_w,
+            intermediate,
+            lw.down_proj_int4_scale.is_some(),
+        );
+        if !maybe_matmul_q6_k_mmq_mlp_down(
             ordinal,
             1,
             seq_len,
             hidden_dim,
             intermediate,
-            &scratch.mlp_buf,
-            &lw.down_proj_w,
+            down_qtype,
             lw.down_proj_scale.as_ref(),
-            lw.down_proj_int8_scale.as_ref(),
-            weights.fp8_block_size,
-            &mut scratch.proj_buf,
             lw.down_proj_int4_scale.as_ref(),
             lw.down_proj_int4_zero.as_ref(),
             lw.down_proj_awq_inv_scale.as_ref(),
-            weights.int4_group_size,
-        )?;
+            &scratch.mlp_buf,
+            &lw.down_proj_w,
+            &mut scratch.proj_buf,
+            &mut scratch.q6_k_mmq_q8_workspace,
+        )? {
+            matmul_proj(
+                ordinal,
+                1,
+                seq_len,
+                hidden_dim,
+                intermediate,
+                &scratch.mlp_buf,
+                &lw.down_proj_w,
+                lw.down_proj_scale.as_ref(),
+                lw.down_proj_int8_scale.as_ref(),
+                weights.fp8_block_size,
+                &mut scratch.proj_buf,
+                lw.down_proj_int4_scale.as_ref(),
+                lw.down_proj_int4_zero.as_ref(),
+                lw.down_proj_awq_inv_scale.as_ref(),
+                weights.int4_group_size,
+            )?;
+        }
     }
 
     // Residual: hidden += down_proj output

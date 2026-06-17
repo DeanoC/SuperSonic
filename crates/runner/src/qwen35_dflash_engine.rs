@@ -45,7 +45,7 @@ use crate::prefill_engine::{PrefillAppendVerifyResult, PrefillTreeVerifyResult};
 use crate::registry::{FamilyParams, ModelVariant, RegistryEntry};
 use crate::Cli;
 
-const DDTREE_DEFAULT_BUDGET: usize = 14;
+const DDTREE_DEFAULT_BUDGET: usize = 15;
 const DDTREE_DEFAULT_TOP_K: usize = 4;
 
 #[derive(Debug, Clone)]
@@ -534,6 +534,7 @@ pub fn run_qwen35_dflash(
                 l,
                 &tap_layers,
                 ddtree_direct_rollback,
+                dflash_gpu_tap_history_enabled(),
             )?
         } else {
             let gpu_tap_history = if dflash_gpu_tap_history_enabled() {
@@ -740,21 +741,46 @@ pub fn run_qwen35_dflash(
                     let indices = accepted_tree_indices
                         .as_ref()
                         .ok_or_else(|| anyhow!("DDTree commit missing accepted tree indices"))?;
-                    let taps_bytes = if result.result.rollback.is_some() {
-                        target_engine.commit_prefill_tree_verify(
-                            &result.result,
+                    let tree_width = result.tree.width();
+                    let tree_result = result.result;
+                    let taps_bytes = if tree_result.rollback.is_some() {
+                        let use_gpu_taps = tree_result.tap_hiddens_gpu;
+                        let host_taps = if use_gpu_taps {
+                            Vec::new()
+                        } else {
+                            let per_tap =
+                                tree_result.tap_hiddens_all.as_ref().ok_or_else(|| {
+                                    anyhow!("tree prefill verifier did not return tap history")
+                                })?;
+                            flatten_tap_history_indices(
+                                per_tap,
+                                tree_width,
+                                text_config.hidden_size,
+                                indices,
+                            )?
+                        };
+                        target_engine.commit_prefill_tree_verify_owned(
+                            tree_result,
                             indices,
                             accepted_len,
                         )?;
-                        let per_tap = result.result.tap_hiddens_all.as_ref().ok_or_else(|| {
-                            anyhow!("tree prefill verifier did not return tap history")
-                        })?;
-                        flatten_tap_history_indices(
-                            per_tap,
-                            result.tree.width(),
-                            text_config.hidden_size,
-                            indices,
-                        )?
+                        if use_gpu_taps {
+                            if !dflash_gpu_tap_history_enabled() {
+                                bail!(
+                                    "tree prefill verifier captured GPU taps while GPU tap history is disabled"
+                                );
+                            }
+                            target_engine.copy_prefill_tree_verify_taps_to_gpu_history(
+                                indices,
+                                accepted_len,
+                                &mut tap_history_gpu,
+                                tap_history_len,
+                                per_tap_row_bytes,
+                            )?;
+                            Vec::new()
+                        } else {
+                            host_taps
+                        }
                     } else {
                         let append_result = if dflash_gpu_tap_history_enabled() {
                             target_engine
@@ -1448,6 +1474,7 @@ fn verify_ddtree_for_dflash(
     pos_offset: usize,
     tap_layers: &[usize],
     capture_rollback: bool,
+    capture_gpu_taps: bool,
 ) -> Result<DFlashVerifyOutput> {
     static NOTICE: Once = Once::new();
     NOTICE.call_once(|| {
@@ -1463,6 +1490,7 @@ fn verify_ddtree_for_dflash(
         pos_offset,
         tap_layers,
         capture_rollback,
+        capture_gpu_taps,
     )?;
     if result.target_next.len() != plan.flat_tokens.len() {
         bail!(
