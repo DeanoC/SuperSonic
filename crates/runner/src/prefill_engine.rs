@@ -515,6 +515,12 @@ pub(crate) fn maybe_matmul_q6_k_mmq_lm_head(
         return Ok(false);
     }
 
+    if !prefill_ffi::device_supports_wmma_i8(ordinal)
+        .map_err(|e| anyhow::anyhow!("q6_k_mmq lm_head arch probe: {e}"))?
+    {
+        return Ok(false);
+    }
+
     let q8_bytes = mmq_q8_1_workspace_bytes(batch, m, k);
     let mut q8_workspace = GpuBuffer::alloc(ordinal, ScalarType::U8, &[q8_bytes.max(1)])
         .map_err(|e| anyhow::anyhow!("q6_k_mmq lm_head q8 workspace: {e}"))?;

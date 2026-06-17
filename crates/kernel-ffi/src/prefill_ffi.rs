@@ -1165,6 +1165,11 @@ unsafe extern "C" {
         out: *mut c_void,
     ) -> c_int;
 
+    fn supersonic_qwen35_4b_hip_device_supports_wmma_i8(
+        device_ordinal: usize,
+        out_supported: *mut c_int,
+    ) -> c_int;
+
     #[cfg(supersonic_backend_cuda)]
     fn supersonic_qwen35_4b_hip_matmul_int8(
         dtype: c_int,
@@ -3909,6 +3914,21 @@ pub fn matmul_mmq_q8_1_q6_k(
         }
         Ok(())
     })
+}
+
+pub fn device_supports_wmma_i8(ordinal: usize) -> Result<bool, GpuError> {
+    if gpu_hal::current_backend() != Backend::Hip {
+        return Ok(false);
+    }
+    let mut supported: c_int = 0;
+    let status =
+        unsafe { supersonic_qwen35_4b_hip_device_supports_wmma_i8(ordinal, &mut supported) };
+    if status != 0 {
+        return Err(ffi_error(format!(
+            "device_supports_wmma_i8 failed: {status}"
+        )));
+    }
+    Ok(supported != 0)
 }
 
 pub fn matmul_rhs_transposed_int8(

@@ -3656,6 +3656,20 @@ static bool device_supports_wmma_bf16(int device_ordinal) {
     return cached[device_ordinal];
 }
 
+static bool compiled_supports_wmma_i8() {
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || \
+    defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__) || \
+    defined(__gfx1152__)
+    return true;
+#else
+    return false;
+#endif
+}
+
+static bool device_supports_wmma_i8(int device_ordinal) {
+    return compiled_supports_wmma_i8() && device_supports_wmma_bf16(device_ordinal);
+}
+
 static int matmul_rhs_transposed_tiled_wmma_bf16_device(
     int device_ordinal,
     size_t batch_elems,
@@ -4375,6 +4389,7 @@ static int matmul_mmq_q8_1_q6_k_device(
     void* out
 ) {
     ScopedHipDevice scoped(device_ordinal);
+    if (!device_supports_wmma_i8(device_ordinal)) return 309;
     if (m <= 0 || n <= 0 || k <= 0 || (k % 256) != 0) return 305;
     constexpr int MMQ_X = 16;
     constexpr int MMQ_Y = 128;
@@ -4404,6 +4419,14 @@ static int matmul_mmq_q8_1_q6_k_device(
     hipError_t sync_err = maybe_sync();
     if (launch_err != hipSuccess) return 306;
     if (sync_err != hipSuccess) return 307;
+    return 0;
+}
+
+extern "C" int supersonic_qwen35_4b_hip_device_supports_wmma_i8(
+    size_t device_ordinal,
+    int* out_supported) {
+    if (out_supported == nullptr) return 310;
+    *out_supported = device_supports_wmma_i8(static_cast<int>(device_ordinal)) ? 1 : 0;
     return 0;
 }
 
