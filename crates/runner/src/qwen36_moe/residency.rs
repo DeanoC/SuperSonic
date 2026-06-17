@@ -531,6 +531,13 @@ impl MoeExpertResidencyManager {
             .last()
             .map(|page| page.offset + page.len)
             .unwrap_or(logical_offset + logical_len);
+        let slice_pages: HashSet<_> = pages
+            .iter()
+            .map(|span| ResidentPageKey {
+                tensor_idx,
+                page_offset: span.offset,
+            })
+            .collect();
 
         self.promote_completed_pending_pages()?;
         self.clock += 1;
@@ -623,7 +630,7 @@ impl MoeExpertResidencyManager {
                     >= self.config.max_resident_pages
                 {
                     let evicted_before = self.evicted_pages;
-                    self.evict_lru_page()?;
+                    self.evict_lru_page_except(&slice_pages)?;
                     self.prefetch_evicted_pages += self.evicted_pages - evicted_before;
                 }
             }
@@ -636,7 +643,7 @@ impl MoeExpertResidencyManager {
                 >= self.config.max_resident_pages
             {
                 let evicted_before = self.evicted_pages;
-                self.evict_lru_page()?;
+                self.evict_lru_page_except(&slice_pages)?;
                 if kind.is_prefetch() {
                     self.prefetch_evicted_pages += self.evicted_pages - evicted_before;
                 }
@@ -853,10 +860,18 @@ impl MoeExpertResidencyManager {
     }
 
     fn evict_lru_page(&mut self) -> Result<()> {
+        self.evict_lru_page_except(&HashSet::new())
+    }
+
+    fn evict_lru_page_except(
+        &mut self,
+        unevictable_pages: &HashSet<ResidentPageKey>,
+    ) -> Result<()> {
         let Some((victim, page)) = select_lru_resident_page(
             &self.resident_pages,
             &self.protected_pages,
             &self.fixed_hot_pages,
+            unevictable_pages,
         ) else {
             if let Some(key) = self.pending_pages.keys().next().copied() {
                 self.wait_pending_page(key)?;

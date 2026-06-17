@@ -84,9 +84,11 @@ pub(crate) fn select_lru_resident_page(
     resident_pages: &HashMap<ResidentPageKey, ResidentPage>,
     protected_pages: &HashMap<ResidentPageKey, u64>,
     fixed_hot_pages: &HashSet<ResidentPageKey>,
+    unevictable_pages: &HashSet<ResidentPageKey>,
 ) -> Option<(ResidentPageKey, ResidentPage)> {
     resident_pages
         .iter()
+        .filter(|(key, _)| !unevictable_pages.contains(key))
         .min_by_key(|(key, page)| {
             (
                 fixed_hot_pages.contains(key),

@@ -370,6 +370,69 @@ fn fixed_hot_pages_are_preferred_without_refresh_churn() {
 }
 
 #[test]
+fn demand_load_keeps_new_pages_over_fixed_hot_victims() {
+    with_supported_vmm_backend(
+        "demand_load_keeps_new_pages_over_fixed_hot_victims",
+        |_backend| {
+            let probe_tmp = synthetic_store(1, 4096);
+            let probe_store = BakedStore::open(probe_tmp.path()).expect("open probe store");
+            let mut probe =
+                MoeExpertResidencyManager::new(0, MoeExpertResidencyConfig::new(1).unwrap());
+            probe
+                .register_tensor(
+                    &probe_store,
+                    0,
+                    MoeExpertProjection::GateUp,
+                    "model.layers.0.mlp.experts.gate_up_proj",
+                    1,
+                )
+                .expect("register probe tensor");
+            let expert_bytes = probe.tensors[0].page_bytes * 2;
+
+            let tmp = synthetic_store(2, expert_bytes);
+            let store = BakedStore::open(tmp.path()).expect("open synthetic store");
+            let mut manager =
+                MoeExpertResidencyManager::new(0, MoeExpertResidencyConfig::new(2).unwrap());
+            manager.set_max_fixed_hot_pages(1);
+            manager
+                .register_tensor(
+                    &store,
+                    0,
+                    MoeExpertProjection::GateUp,
+                    "model.layers.0.mlp.experts.gate_up_proj",
+                    2,
+                )
+                .expect("register tensor");
+
+            let e0 = MoeExpertKey {
+                layer_idx: 0,
+                expert_idx: 0,
+                projection: MoeExpertProjection::GateUp,
+            };
+            let e1 = MoeExpertKey {
+                layer_idx: 0,
+                expert_idx: 1,
+                projection: MoeExpertProjection::GateUp,
+            };
+
+            manager.ensure_resident(&store, e0).expect("load expert 0");
+            manager
+                .mark_fixed_hot_resident(e0)
+                .expect("mark one expert 0 page fixed hot");
+            assert_eq!(manager.stats().fixed_hot_pages, 1);
+
+            manager.ensure_resident(&store, e1).expect("load expert 1");
+
+            assert!(!manager.is_resident(e0));
+            assert!(manager.is_resident(e1));
+            assert_eq!(manager.stats().resident_pages, 2);
+            assert_eq!(manager.stats().fixed_hot_pages, 0);
+            assert_eq!(manager.stats().fixed_hot_evicted_pages, 1);
+        },
+    );
+}
+
+#[test]
 fn prefetch_does_not_evict_when_page_budget_is_full() {
     with_supported_vmm_backend(
         "prefetch_does_not_evict_when_page_budget_is_full",
