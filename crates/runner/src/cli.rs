@@ -76,6 +76,11 @@ pub(crate) struct Cli {
     #[arg(long)]
     pub(crate) profile_prefill_json: Option<PathBuf>,
 
+    /// Emit coarse runner progress heartbeats while long decode phases are active.
+    /// Disabled by default; useful for long-context profiling where prefill can be quiet.
+    #[arg(long, default_value = "0.0")]
+    pub(crate) progress_heartbeat_seconds: f64,
+
     /// Enable Qwen3.6-MoE self-speculative decode.
     ///
     /// When set, the engine loads the multi-token-prediction (MTP) head

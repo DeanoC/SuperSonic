@@ -15,6 +15,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -59,12 +60,135 @@ PRESETS: dict[str, dict[str, Any]] = {
 
 
 @dataclass(frozen=True)
+class RunResult:
+    returncode: int
+    stdout: str
+    stderr: str
+    timed_out: bool = False
+
+
+def rocm_smi_snapshot() -> tuple[int | None, int | None, list[int]]:
+    proc = subprocess.run(
+        ["rocm-smi", "--showuse", "--showmemuse", "--showpidgpus"],
+        text=True,
+        capture_output=True,
+    )
+    if proc.returncode != 0:
+        return None, None, []
+    gpu_uses: list[int] = []
+    mem_uses: list[int] = []
+    pids: list[int] = []
+    for line in (proc.stdout + proc.stderr).splitlines():
+        gpu_match = re.search(r"GPU use \(%\):\s*([0-9]+)", line)
+        if gpu_match:
+            gpu_uses.append(int(gpu_match.group(1)))
+        mem_match = re.search(r"VRAM%\):\s*([0-9]+)", line)
+        if mem_match:
+            mem_uses.append(int(mem_match.group(1)))
+        pid_match = re.search(r"PID\s+([0-9]+)\s+is using\s+([0-9]+)\s+DRM", line)
+        if pid_match and int(pid_match.group(2)) > 0:
+            pids.append(int(pid_match.group(1)))
+    gpu_use = max(gpu_uses) if gpu_uses else None
+    mem_use = max(mem_uses) if mem_uses else None
+    return gpu_use, mem_use, pids
+
+
+def run_with_heartbeat(
+    cmd: list[str],
+    env: dict[str, str],
+    timeout_seconds: int,
+    heartbeat_seconds: float,
+    label: str,
+) -> RunResult:
+    start = time.monotonic()
+    deadline = start + timeout_seconds
+    next_heartbeat = start + heartbeat_seconds
+    stdout_chunks: list[str] = []
+    stderr_chunks: list[str] = []
+
+    def drain_pipe(pipe: Any, chunks: list[str], live: bool) -> None:
+        try:
+            for line in pipe:
+                chunks.append(line)
+                if live:
+                    print(line, end="", file=sys.stderr, flush=True)
+        finally:
+            pipe.close()
+
+    proc = subprocess.Popen(
+        cmd,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        bufsize=1,
+    )
+    assert proc.stdout is not None
+    assert proc.stderr is not None
+    stdout_thread = threading.Thread(
+        target=drain_pipe, args=(proc.stdout, stdout_chunks, False), daemon=True
+    )
+    stderr_thread = threading.Thread(
+        target=drain_pipe, args=(proc.stderr, stderr_chunks, True), daemon=True
+    )
+    stdout_thread.start()
+    stderr_thread.start()
+    print(f"[bench-start] label={label} pid={proc.pid}", flush=True)
+    timed_out = False
+    while True:
+        returncode = proc.poll()
+        now = time.monotonic()
+        if returncode is not None:
+            break
+        if now >= deadline:
+            timed_out = True
+            proc.kill()
+            returncode = proc.wait()
+            break
+        if heartbeat_seconds > 0 and now >= next_heartbeat:
+            gpu_use, mem_use, pids = rocm_smi_snapshot()
+            print(
+                "[bench-heartbeat] "
+                f"label={label} pid={proc.pid} elapsed={now - start:.0f}s "
+                f"gpu_use={gpu_use if gpu_use is not None else '?'}% "
+                f"mem_use={mem_use if mem_use is not None else '?'}% pids={pids}",
+                flush=True,
+            )
+            next_heartbeat = now + heartbeat_seconds
+        time.sleep(1.0)
+    stdout_thread.join(timeout=5.0)
+    stderr_thread.join(timeout=5.0)
+    stdout = "".join(stdout_chunks)
+    stderr = "".join(stderr_chunks)
+    elapsed = time.monotonic() - start
+    print(
+        f"[bench-done] label={label} pid={proc.pid} returncode={returncode} "
+        f"elapsed={elapsed:.1f}s timed_out={timed_out}",
+        flush=True,
+    )
+    return RunResult(
+        returncode=returncode if returncode is not None else -1,
+        stdout=stdout,
+        stderr=stderr,
+        timed_out=timed_out,
+    )
+
+
+@dataclass(frozen=True)
 class BenchMode:
     label: str
     kv_fp8: bool
     sparse_cap: int | None = None
     prefetch_mode: str | None = None
     prefetch_ranks: str | None = None
+    protected_experts: str | None = None
+    protect_demand: bool = False
+    hot_protect_min_hits: int | None = None
+    fixed_hot_experts: str | None = None
+    fixed_hot_min_hits: int | None = None
+    async_prefetch: bool = False
+    async_staging_pages: int | None = None
+    prefetch_evict: bool = False
 
 
 def parse_int_list(raw: str) -> list[int]:
@@ -83,7 +207,57 @@ def parse_int_list(raw: str) -> list[int]:
     return deduped
 
 
-def parse_modes(raw: str, sparse_caps: list[int]) -> list[BenchMode]:
+def sparse_policy_suffix(args: argparse.Namespace) -> str:
+    suffix = ""
+    if args.sparse_prefetch:
+        suffix += f"-{args.sparse_prefetch}"
+        if args.sparse_prefetch_ranks:
+            suffix += f"-r{args.sparse_prefetch_ranks}"
+    if args.sparse_protected_experts is not None:
+        suffix += f"-protect{args.sparse_protected_experts}"
+    if args.sparse_protect_demand:
+        suffix += "-protect-demand"
+    if args.sparse_hot_protect_min_hits is not None:
+        suffix += f"-hot{args.sparse_hot_protect_min_hits}"
+    if args.sparse_fixed_hot_experts is not None:
+        suffix += f"-fixedhot{args.sparse_fixed_hot_experts}"
+        if args.sparse_fixed_hot_min_hits is not None:
+            suffix += f"h{args.sparse_fixed_hot_min_hits}"
+    if args.sparse_async_prefetch:
+        suffix += "-async"
+        if args.sparse_async_staging_pages is not None:
+            suffix += f"-s{args.sparse_async_staging_pages}"
+    if args.sparse_prefetch_evict:
+        suffix += "-evict"
+        if args.sparse_prefetch_evict_min_prob is not None:
+            suffix += f"-p{args.sparse_prefetch_evict_min_prob:g}"
+    return suffix
+
+
+def sparse_mode(
+    label: str,
+    kv_fp8: bool,
+    cap: int,
+    args: argparse.Namespace,
+) -> BenchMode:
+    return BenchMode(
+        f"{label}{sparse_policy_suffix(args)}",
+        kv_fp8=kv_fp8,
+        sparse_cap=cap,
+        prefetch_mode=args.sparse_prefetch,
+        prefetch_ranks=args.sparse_prefetch_ranks,
+        protected_experts=args.sparse_protected_experts,
+        protect_demand=args.sparse_protect_demand,
+        hot_protect_min_hits=args.sparse_hot_protect_min_hits,
+        fixed_hot_experts=args.sparse_fixed_hot_experts,
+        fixed_hot_min_hits=args.sparse_fixed_hot_min_hits,
+        async_prefetch=args.sparse_async_prefetch,
+        async_staging_pages=args.sparse_async_staging_pages,
+        prefetch_evict=args.sparse_prefetch_evict,
+    )
+
+
+def parse_modes(raw: str, sparse_caps: list[int], args: argparse.Namespace) -> list[BenchMode]:
     modes: list[BenchMode] = []
     for part in raw.split(","):
         name = part.strip().lower().replace("_", "-")
@@ -95,10 +269,10 @@ def parse_modes(raw: str, sparse_caps: list[int]) -> list[BenchMode]:
             modes.append(BenchMode("int4-kv-fp8", kv_fp8=True))
         elif name in {"sparse", "cap"}:
             for cap in sparse_caps:
-                modes.append(BenchMode(f"cap{cap}", kv_fp8=False, sparse_cap=cap))
+                modes.append(sparse_mode(f"cap{cap}", kv_fp8=False, cap=cap, args=args))
         elif name in {"sparse-kv-fp8", "cap-kv-fp8"}:
             for cap in sparse_caps:
-                modes.append(BenchMode(f"cap{cap}-kv-fp8", kv_fp8=True, sparse_cap=cap))
+                modes.append(sparse_mode(f"cap{cap}-kv-fp8", kv_fp8=True, cap=cap, args=args))
         else:
             raise ValueError(f"unknown mode {part!r}")
     if not modes:
@@ -165,6 +339,20 @@ def parse_stage_timings(output: str) -> dict[str, float]:
 
 def parse_chain_breakdown(output: str) -> dict[str, float]:
     match = re.search(r"\[qwen36-moe chain-breakdown\]\s+(.+)", output)
+    if not match:
+        return {}
+    return parse_key_value_floats(match.group(1))
+
+
+def parse_sparse_breakdown(output: str) -> dict[str, float]:
+    match = re.search(r"\[qwen36-moe sparse-breakdown\]\s+(.+)", output)
+    if not match:
+        return {}
+    return parse_key_value_floats(match.group(1))
+
+
+def parse_embed_breakdown(output: str) -> dict[str, float]:
+    match = re.search(r"\[qwen36-moe embed-breakdown\]\s+(.+)", output)
     if not match:
         return {}
     return parse_key_value_floats(match.group(1))
@@ -311,6 +499,16 @@ def build_run_env(
     env.pop("SUPERSONIC_MOE_ISLAND_TELEMETRY_JSON", None)
     env.pop("SUPERSONIC_MOE_ISLAND_PREFETCH", None)
     env.pop("SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS", None)
+    env.pop("SUPERSONIC_MOE_ISLAND_PREFETCH_TRANSITION_MIN_OBS", None)
+    env.pop("SUPERSONIC_MOE_ISLAND_PROTECTED_EXPERTS", None)
+    env.pop("SUPERSONIC_MOE_ISLAND_PROTECT_DEMAND", None)
+    env.pop("SUPERSONIC_MOE_ISLAND_HOT_PROTECT_MIN_HITS", None)
+    env.pop("SUPERSONIC_MOE_ISLAND_FIXED_HOT_EXPERTS", None)
+    env.pop("SUPERSONIC_MOE_ISLAND_FIXED_HOT_MIN_HITS", None)
+    env.pop("SUPERSONIC_MOE_ISLAND_ASYNC_PREFETCH", None)
+    env.pop("SUPERSONIC_MOE_ISLAND_ASYNC_STAGING_PAGES", None)
+    env.pop("SUPERSONIC_MOE_ISLAND_PREFETCH_EVICT", None)
+    env.pop("SUPERSONIC_MOE_ISLAND_PREFETCH_EVICT_MIN_PROB", None)
     env.pop("SUPERSONIC_VMM_MOE_ISLANDS", None)
     env.pop("SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL", None)
     env.pop("SUPERSONIC_QWEN36_MOE_BATCHED_ATTN", None)
@@ -324,6 +522,36 @@ def build_run_env(
             env["SUPERSONIC_MOE_ISLAND_PREFETCH"] = mode.prefetch_mode
         if mode.prefetch_ranks:
             env["SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS"] = mode.prefetch_ranks
+        if mode.prefetch_mode == "transition" and args.sparse_prefetch_transition_min_obs is not None:
+            env["SUPERSONIC_MOE_ISLAND_PREFETCH_TRANSITION_MIN_OBS"] = str(
+                args.sparse_prefetch_transition_min_obs
+            )
+        if mode.protected_experts is not None:
+            env["SUPERSONIC_MOE_ISLAND_PROTECTED_EXPERTS"] = mode.protected_experts
+        if mode.protect_demand:
+            env["SUPERSONIC_MOE_ISLAND_PROTECT_DEMAND"] = "1"
+        if mode.hot_protect_min_hits is not None:
+            env["SUPERSONIC_MOE_ISLAND_HOT_PROTECT_MIN_HITS"] = str(
+                mode.hot_protect_min_hits
+            )
+        if mode.fixed_hot_experts is not None:
+            env["SUPERSONIC_MOE_ISLAND_FIXED_HOT_EXPERTS"] = mode.fixed_hot_experts
+        if mode.fixed_hot_min_hits is not None:
+            env["SUPERSONIC_MOE_ISLAND_FIXED_HOT_MIN_HITS"] = str(
+                mode.fixed_hot_min_hits
+            )
+        if mode.async_prefetch:
+            env["SUPERSONIC_MOE_ISLAND_ASYNC_PREFETCH"] = "1"
+            if mode.async_staging_pages is not None:
+                env["SUPERSONIC_MOE_ISLAND_ASYNC_STAGING_PAGES"] = str(
+                    mode.async_staging_pages
+                )
+        if mode.prefetch_evict:
+            env["SUPERSONIC_MOE_ISLAND_PREFETCH_EVICT"] = "1"
+            if args.sparse_prefetch_evict_min_prob is not None:
+                env["SUPERSONIC_MOE_ISLAND_PREFETCH_EVICT_MIN_PROB"] = str(
+                    args.sparse_prefetch_evict_min_prob
+                )
     if getattr(args, "no_batched_prefill", False):
         # M13: batched prefill is the default; this flag disables all three
         # stages of the batched path for A/B comparison against the legacy
@@ -369,6 +597,8 @@ def run_one(
         str(args.seed),
         "--no-download",
         "--emit-stage-timings",
+        "--progress-heartbeat-seconds",
+        str(args.heartbeat_seconds),
         "--emit-generated-json",
     ]
     if mode.kv_fp8:
@@ -377,18 +607,17 @@ def run_one(
         cmd.append("--no-persistent-decode")
 
     start = time.monotonic()
-    try:
-        proc = subprocess.run(
-            cmd,
-            text=True,
-            capture_output=True,
-            timeout=args.timeout,
-            env=env,
-        )
-    except subprocess.TimeoutExpired as exc:
+    proc = run_with_heartbeat(
+        cmd,
+        env,
+        args.timeout,
+        args.heartbeat_seconds,
+        f"{mode.label}-{context_tokens}{'-warmup' if warmup else ''}",
+    )
+    if proc.timed_out:
         elapsed = time.monotonic() - start
-        stdout = exc.stdout.decode(errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
-        stderr = exc.stderr.decode(errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+        stdout = proc.stdout
+        stderr = proc.stderr
         output = stdout + stderr
         return {
             "context_tokens_requested": context_tokens,
@@ -406,6 +635,8 @@ def run_one(
             "generated_ids": parse_tokens(output),
             "stage": parse_stage_timings(output),
             "chain_breakdown": parse_chain_breakdown(output),
+            "sparse_breakdown": parse_sparse_breakdown(output),
+            "embed_breakdown": parse_embed_breakdown(output),
             "lifecycle": parse_lifecycle_timings(output),
             "result": parse_result(output),
             "vmm_residency": dense_vmm_residency(output),
@@ -433,6 +664,8 @@ def run_one(
         "generated_ids": parse_tokens(output),
         "stage": parse_stage_timings(output),
         "chain_breakdown": parse_chain_breakdown(output),
+        "sparse_breakdown": parse_sparse_breakdown(output),
+        "embed_breakdown": parse_embed_breakdown(output),
         "lifecycle": parse_lifecycle_timings(output),
         "result": parse_result(output),
         "stdout_tail": proc.stdout[-1600:],
@@ -643,6 +876,12 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=20260504)
     parser.add_argument("--timeout", type=int)
     parser.add_argument(
+        "--heartbeat-seconds",
+        type=float,
+        default=30.0,
+        help="print benchmark child PID and GPU status while a row is running; use 0 to disable",
+    )
+    parser.add_argument(
         "--warmup",
         action=argparse.BooleanOptionalAction,
         default=None,
@@ -663,6 +902,63 @@ def main() -> int:
              "(plus _BATCHED_ATTN=0 and _GROUPED_FFN=0) to bench against "
              "the legacy per-token persistent-decode path for A/B comparison.",
     )
+    parser.add_argument(
+        "--sparse-prefetch",
+        choices=["previous-token", "previous-token-resident", "transition"],
+        help="set SUPERSONIC_MOE_ISLAND_PREFETCH for sparse cap rows",
+    )
+    parser.add_argument(
+        "--sparse-prefetch-ranks",
+        help="set SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS for sparse cap rows",
+    )
+    parser.add_argument(
+        "--sparse-prefetch-transition-min-obs",
+        type=int,
+        help="set SUPERSONIC_MOE_ISLAND_PREFETCH_TRANSITION_MIN_OBS for transition rows",
+    )
+    parser.add_argument(
+        "--sparse-protected-experts",
+        help="set SUPERSONIC_MOE_ISLAND_PROTECTED_EXPERTS for sparse cap rows",
+    )
+    parser.add_argument(
+        "--sparse-protect-demand",
+        action="store_true",
+        help="set SUPERSONIC_MOE_ISLAND_PROTECT_DEMAND=1 for sparse cap rows",
+    )
+    parser.add_argument(
+        "--sparse-hot-protect-min-hits",
+        type=int,
+        help="set SUPERSONIC_MOE_ISLAND_HOT_PROTECT_MIN_HITS for sparse cap rows",
+    )
+    parser.add_argument(
+        "--sparse-fixed-hot-experts",
+        help="set SUPERSONIC_MOE_ISLAND_FIXED_HOT_EXPERTS for sparse cap rows",
+    )
+    parser.add_argument(
+        "--sparse-fixed-hot-min-hits",
+        type=int,
+        help="set SUPERSONIC_MOE_ISLAND_FIXED_HOT_MIN_HITS for sparse cap rows",
+    )
+    parser.add_argument(
+        "--sparse-async-prefetch",
+        action="store_true",
+        help="set SUPERSONIC_MOE_ISLAND_ASYNC_PREFETCH=1 for sparse cap rows",
+    )
+    parser.add_argument(
+        "--sparse-async-staging-pages",
+        type=int,
+        help="set SUPERSONIC_MOE_ISLAND_ASYNC_STAGING_PAGES for sparse cap rows",
+    )
+    parser.add_argument(
+        "--sparse-prefetch-evict",
+        action="store_true",
+        help="set SUPERSONIC_MOE_ISLAND_PREFETCH_EVICT=1 for sparse cap rows",
+    )
+    parser.add_argument(
+        "--sparse-prefetch-evict-min-prob",
+        type=float,
+        help="set SUPERSONIC_MOE_ISLAND_PREFETCH_EVICT_MIN_PROB for sparse cap rows",
+    )
     parser.add_argument("--out-json", type=Path, default=Path("target/qwen36_longctx.json"))
     parser.add_argument("--out-md", type=Path, default=Path("target/qwen36_longctx.md"))
     args = apply_preset_defaults(parser.parse_args())
@@ -670,13 +966,45 @@ def main() -> int:
     try:
         contexts = parse_int_list(args.contexts)
         sparse_caps = parse_int_list(args.sparse_caps)
-        modes = parse_modes(args.modes, sparse_caps)
+        modes = parse_modes(args.modes, sparse_caps, args)
     except ValueError as exc:
         parser.error(str(exc))
+    if args.sparse_prefetch_ranks is not None and not args.sparse_prefetch:
+        parser.error("--sparse-prefetch-ranks requires --sparse-prefetch")
+    if args.sparse_prefetch_transition_min_obs is not None and args.sparse_prefetch != "transition":
+        parser.error("--sparse-prefetch-transition-min-obs requires --sparse-prefetch=transition")
+    if args.sparse_async_prefetch and not args.sparse_prefetch:
+        parser.error("--sparse-async-prefetch requires --sparse-prefetch")
+    if args.sparse_protect_demand and args.sparse_protected_experts is None:
+        parser.error("--sparse-protect-demand requires --sparse-protected-experts")
+    if args.sparse_hot_protect_min_hits is not None and args.sparse_protected_experts is None:
+        parser.error("--sparse-hot-protect-min-hits requires --sparse-protected-experts")
+    if args.sparse_hot_protect_min_hits is not None and args.sparse_hot_protect_min_hits <= 0:
+        parser.error("--sparse-hot-protect-min-hits must be > 0")
+    if args.sparse_fixed_hot_experts is not None and args.sparse_fixed_hot_min_hits is None:
+        parser.error("--sparse-fixed-hot-experts requires --sparse-fixed-hot-min-hits")
+    if args.sparse_fixed_hot_min_hits is not None and args.sparse_fixed_hot_experts is None:
+        parser.error("--sparse-fixed-hot-min-hits requires --sparse-fixed-hot-experts")
+    if args.sparse_fixed_hot_min_hits is not None and args.sparse_fixed_hot_min_hits <= 0:
+        parser.error("--sparse-fixed-hot-min-hits must be > 0")
+    if args.sparse_async_staging_pages is not None and args.sparse_async_staging_pages <= 0:
+        parser.error("--sparse-async-staging-pages must be > 0")
+    if args.sparse_async_staging_pages is not None and not args.sparse_async_prefetch:
+        parser.error("--sparse-async-staging-pages requires --sparse-async-prefetch")
+    if args.sparse_prefetch_evict and not args.sparse_prefetch:
+        parser.error("--sparse-prefetch-evict requires --sparse-prefetch")
+    if args.sparse_prefetch_evict_min_prob is not None and not args.sparse_prefetch_evict:
+        parser.error("--sparse-prefetch-evict-min-prob requires --sparse-prefetch-evict")
+    if args.sparse_prefetch_evict_min_prob is not None and not (
+        0.0 <= args.sparse_prefetch_evict_min_prob <= 1.0
+    ):
+        parser.error("--sparse-prefetch-evict-min-prob must be in 0.0..=1.0")
     if args.max_new_tokens <= 0:
         parser.error("--max-new-tokens must be > 0")
     if args.warmup_new_tokens <= 0:
         parser.error("--warmup-new-tokens must be > 0")
+    if args.heartbeat_seconds < 0:
+        parser.error("--heartbeat-seconds must be >= 0")
     if not args.binary.exists():
         raise FileNotFoundError(args.binary)
     if not args.model_dir.exists():
@@ -721,6 +1049,18 @@ def main() -> int:
         "preset": args.preset,
         "contexts": contexts,
         "modes": [mode.label for mode in modes],
+        "sparse_prefetch": args.sparse_prefetch,
+        "sparse_prefetch_ranks": args.sparse_prefetch_ranks,
+        "sparse_prefetch_transition_min_obs": args.sparse_prefetch_transition_min_obs,
+        "sparse_protected_experts": args.sparse_protected_experts,
+        "sparse_protect_demand": args.sparse_protect_demand,
+        "sparse_hot_protect_min_hits": args.sparse_hot_protect_min_hits,
+        "sparse_fixed_hot_experts": args.sparse_fixed_hot_experts,
+        "sparse_fixed_hot_min_hits": args.sparse_fixed_hot_min_hits,
+        "sparse_async_prefetch": args.sparse_async_prefetch,
+        "sparse_async_staging_pages": args.sparse_async_staging_pages,
+        "sparse_prefetch_evict": args.sparse_prefetch_evict,
+        "sparse_prefetch_evict_min_prob": args.sparse_prefetch_evict_min_prob,
         "max_new_tokens": args.max_new_tokens,
         "seed": args.seed,
         "summary": summary,

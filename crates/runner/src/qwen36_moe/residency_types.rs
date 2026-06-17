@@ -28,6 +28,10 @@ pub struct MoeExpertResidencyConfig {
     /// page-granular on HIP/CUDA. The engine converts that expert cap into this
     /// page budget conservatively.
     pub max_resident_pages: usize,
+    /// Allow lookahead prefetch to evict least-recently-used resident pages
+    /// when the page budget is full. Disabled by default so prefetch remains
+    /// non-disruptive unless an experiment opts in.
+    pub prefetch_evict: bool,
 }
 
 impl MoeExpertResidencyConfig {
@@ -35,7 +39,15 @@ impl MoeExpertResidencyConfig {
         if max_resident_pages == 0 {
             anyhow::bail!("max_resident_pages must be > 0");
         }
-        Ok(Self { max_resident_pages })
+        Ok(Self {
+            max_resident_pages,
+            prefetch_evict: false,
+        })
+    }
+
+    pub fn with_prefetch_evict(mut self, prefetch_evict: bool) -> Self {
+        self.prefetch_evict = prefetch_evict;
+        self
     }
 }
 
@@ -60,6 +72,7 @@ pub struct MoeExpertResidencyStats {
     pub prefetch_page_misses: u64,
     pub prefetch_skipped: u64,
     pub prefetch_skipped_pages: u64,
+    pub prefetch_evicted_pages: u64,
     pub prefetch_uploaded_bytes: usize,
     pub protected_pages: usize,
     pub protected_page_budget: usize,
@@ -68,6 +81,13 @@ pub struct MoeExpertResidencyStats {
     pub protect_misses: u64,
     pub protect_demotions: u64,
     pub protected_evicted_pages: u64,
+    pub fixed_hot_pages: usize,
+    pub fixed_hot_page_budget: usize,
+    pub fixed_hot_requests: u64,
+    pub fixed_hot_hits: u64,
+    pub fixed_hot_misses: u64,
+    pub fixed_hot_skipped: u64,
+    pub fixed_hot_evicted_pages: u64,
     pub async_scheduled_pages: u64,
     pub async_completed_pages: u64,
     pub async_waited_pages: u64,

@@ -366,6 +366,11 @@ pub struct DecodeOutputs {
     pub kernel_full_attn_us: u64,
     pub kernel_linear_attn_us: u64,
     pub kernel_ffn_us: u64,
+    pub sparse_lookahead_prefetch_us: u64,
+    pub sparse_router_launch_us: u64,
+    pub sparse_route_d2h_us: u64,
+    pub sparse_demand_prefetch_us: u64,
+    pub sparse_ffn_launch_us: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

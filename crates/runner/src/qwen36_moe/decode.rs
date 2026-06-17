@@ -3002,6 +3002,11 @@ fn run_chained_decode_impl_with_cache_pos(
         kernel_full_attn_us: t_full_attn.as_micros() as u64,
         kernel_linear_attn_us: t_linear_attn.as_micros() as u64,
         kernel_ffn_us: t_ffn.as_micros() as u64,
+        sparse_lookahead_prefetch_us: 0,
+        sparse_router_launch_us: 0,
+        sparse_route_d2h_us: 0,
+        sparse_demand_prefetch_us: 0,
+        sparse_ffn_launch_us: 0,
     })
 }
 

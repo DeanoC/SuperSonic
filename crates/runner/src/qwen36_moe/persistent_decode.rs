@@ -281,6 +281,11 @@ impl PersistentScratch {
             kernel_full_attn_us: elapsed_us,
             kernel_linear_attn_us: 0,
             kernel_ffn_us: 0,
+            sparse_lookahead_prefetch_us: 0,
+            sparse_router_launch_us: 0,
+            sparse_route_d2h_us: 0,
+            sparse_demand_prefetch_us: 0,
+            sparse_ffn_launch_us: 0,
         })
     }
 
@@ -424,11 +429,23 @@ impl PersistentScratch {
         )
         .context("h2d initial_hidden -> hidden_ping")?;
 
-        let t_launch = std::time::Instant::now();
+        let mut router_launch_us = 0u64;
+        let mut route_d2h_us = 0u64;
+        let mut lookahead_us = 0u64;
+        let mut demand_us = 0u64;
+        let mut ffn_launch_us = 0u64;
+        let mut router_us = 0u64;
+        let mut ffn_us = 0u64;
         for layer_idx in 0..self.num_layers {
+            let t_lookahead = std::time::Instant::now();
             prefetch(ExpertPrefetchPhase::Lookahead, layer_idx, &[]).with_context(|| {
                 format!("lookahead prefetch routed experts (layer {layer_idx})")
             })?;
+            let lookahead_elapsed = t_lookahead.elapsed().as_micros() as u64;
+            lookahead_us = lookahead_us.saturating_add(lookahead_elapsed);
+            ffn_us = ffn_us.saturating_add(lookahead_elapsed);
+
+            let t_router_launch = std::time::Instant::now();
             persistent_decode_launch_range(
                 ordinal,
                 ScalarType::BF16,
@@ -455,13 +472,26 @@ impl PersistentScratch {
             )
             .map_err(|e: GpuError| anyhow!(e))
             .with_context(|| format!("persistent router-only launch (layer {layer_idx})"))?;
+            let router_elapsed = t_router_launch.elapsed().as_micros() as u64;
+            router_launch_us = router_launch_us.saturating_add(router_elapsed);
+            router_us = router_us.saturating_add(router_elapsed);
 
+            let t_route_d2h = std::time::Instant::now();
             let routes = self
                 .download_topk_routes(ordinal)
                 .with_context(|| format!("download FFN top-k routes (layer {layer_idx})"))?;
+            let route_d2h_elapsed = t_route_d2h.elapsed().as_micros() as u64;
+            route_d2h_us = route_d2h_us.saturating_add(route_d2h_elapsed);
+            router_us = router_us.saturating_add(route_d2h_elapsed);
+
+            let t_demand = std::time::Instant::now();
             prefetch(ExpertPrefetchPhase::Demand, layer_idx, &routes)
                 .with_context(|| format!("prefetch routed experts (layer {layer_idx})"))?;
+            let demand_elapsed = t_demand.elapsed().as_micros() as u64;
+            demand_us = demand_us.saturating_add(demand_elapsed);
+            ffn_us = ffn_us.saturating_add(demand_elapsed);
 
+            let t_ffn = std::time::Instant::now();
             persistent_decode_launch_range(
                 ordinal,
                 ScalarType::BF16,
@@ -488,8 +518,10 @@ impl PersistentScratch {
             )
             .map_err(|e: GpuError| anyhow!(e))
             .with_context(|| format!("persistent ffn-only launch (layer {layer_idx})"))?;
+            let ffn_elapsed = t_ffn.elapsed().as_micros() as u64;
+            ffn_launch_us = ffn_launch_us.saturating_add(ffn_elapsed);
+            ffn_us = ffn_us.saturating_add(ffn_elapsed);
         }
-        let elapsed_us = t_launch.elapsed().as_micros() as u64;
 
         let mut final_hidden_bytes = vec![0u8; hidden_bytes];
         copy_d2h(
@@ -505,9 +537,14 @@ impl PersistentScratch {
             final_hidden_bytes,
             per_layer_attn_out: Vec::new(),
             per_layer_ffn_out: Vec::new(),
-            kernel_full_attn_us: elapsed_us,
+            kernel_full_attn_us: router_us,
             kernel_linear_attn_us: 0,
-            kernel_ffn_us: 0,
+            kernel_ffn_us: ffn_us,
+            sparse_lookahead_prefetch_us: lookahead_us,
+            sparse_router_launch_us: router_launch_us,
+            sparse_route_d2h_us: route_d2h_us,
+            sparse_demand_prefetch_us: demand_us,
+            sparse_ffn_launch_us: ffn_launch_us,
         })
     }
 

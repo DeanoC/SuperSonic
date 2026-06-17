@@ -35,7 +35,9 @@ pub struct MoeExpertResidencyManager {
     resident: HashMap<MoeExpertKey, ResidentSlice>,
     resident_pages: HashMap<ResidentPageKey, ResidentPage>,
     protected_pages: HashMap<ResidentPageKey, u64>,
+    fixed_hot_pages: HashSet<ResidentPageKey>,
     max_protected_pages: usize,
+    max_fixed_hot_pages: usize,
     clock: u64,
     hits: u64,
     misses: u64,
@@ -52,12 +54,18 @@ pub struct MoeExpertResidencyManager {
     prefetch_page_misses: u64,
     prefetch_skipped: u64,
     prefetch_skipped_pages: u64,
+    prefetch_evicted_pages: u64,
     prefetch_uploaded_bytes: usize,
     protect_requests: u64,
     protect_hits: u64,
     protect_misses: u64,
     protect_demotions: u64,
     protected_evicted_pages: u64,
+    fixed_hot_requests: u64,
+    fixed_hot_hits: u64,
+    fixed_hot_misses: u64,
+    fixed_hot_skipped: u64,
+    fixed_hot_evicted_pages: u64,
     async_page_in: Option<AsyncPageIn>,
     pending_pages: HashMap<ResidentPageKey, PendingPage>,
     async_scheduled_pages: u64,
@@ -72,7 +80,17 @@ pub struct MoeExpertResidencyManager {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ResidencyAccessKind {
     Demand,
-    Prefetch,
+    Prefetch { allow_evict: bool },
+}
+
+impl ResidencyAccessKind {
+    fn is_prefetch(self) -> bool {
+        matches!(self, Self::Prefetch { .. })
+    }
+
+    fn allows_prefetch_evict(self, config: MoeExpertResidencyConfig) -> bool {
+        matches!(self, Self::Prefetch { allow_evict: true }) && config.prefetch_evict
+    }
 }
 
 impl MoeExpertResidencyManager {
@@ -85,7 +103,9 @@ impl MoeExpertResidencyManager {
             resident: HashMap::new(),
             resident_pages: HashMap::new(),
             protected_pages: HashMap::new(),
+            fixed_hot_pages: HashSet::new(),
             max_protected_pages: 0,
+            max_fixed_hot_pages: 0,
             clock: 0,
             hits: 0,
             misses: 0,
@@ -102,12 +122,18 @@ impl MoeExpertResidencyManager {
             prefetch_page_misses: 0,
             prefetch_skipped: 0,
             prefetch_skipped_pages: 0,
+            prefetch_evicted_pages: 0,
             prefetch_uploaded_bytes: 0,
             protect_requests: 0,
             protect_hits: 0,
             protect_misses: 0,
             protect_demotions: 0,
             protected_evicted_pages: 0,
+            fixed_hot_requests: 0,
+            fixed_hot_hits: 0,
+            fixed_hot_misses: 0,
+            fixed_hot_skipped: 0,
+            fixed_hot_evicted_pages: 0,
             async_page_in: None,
             pending_pages: HashMap::new(),
             async_scheduled_pages: 0,
@@ -150,6 +176,7 @@ impl MoeExpertResidencyManager {
             prefetch_page_misses: self.prefetch_page_misses,
             prefetch_skipped: self.prefetch_skipped,
             prefetch_skipped_pages: self.prefetch_skipped_pages,
+            prefetch_evicted_pages: self.prefetch_evicted_pages,
             prefetch_uploaded_bytes: self.prefetch_uploaded_bytes,
             protected_pages: self.protected_pages.len(),
             protected_page_budget: self.max_protected_pages,
@@ -158,6 +185,13 @@ impl MoeExpertResidencyManager {
             protect_misses: self.protect_misses,
             protect_demotions: self.protect_demotions,
             protected_evicted_pages: self.protected_evicted_pages,
+            fixed_hot_pages: self.fixed_hot_pages.len(),
+            fixed_hot_page_budget: self.max_fixed_hot_pages,
+            fixed_hot_requests: self.fixed_hot_requests,
+            fixed_hot_hits: self.fixed_hot_hits,
+            fixed_hot_misses: self.fixed_hot_misses,
+            fixed_hot_skipped: self.fixed_hot_skipped,
+            fixed_hot_evicted_pages: self.fixed_hot_evicted_pages,
             async_scheduled_pages: self.async_scheduled_pages,
             async_completed_pages: self.async_completed_pages,
             async_waited_pages: self.async_waited_pages,
@@ -204,12 +238,14 @@ impl MoeExpertResidencyManager {
     }
 
     pub fn set_max_resident_pages(&mut self, max_resident_pages: usize) -> Result<()> {
-        self.config = MoeExpertResidencyConfig::new(max_resident_pages)?;
+        self.config = MoeExpertResidencyConfig::new(max_resident_pages)?
+            .with_prefetch_evict(self.config.prefetch_evict);
         while self.resident_pages.len() + self.pending_pages.len() > self.config.max_resident_pages
         {
             self.evict_lru_page()?;
         }
         self.clamp_protected_pages();
+        self.clamp_fixed_hot_pages();
         Ok(())
     }
 
@@ -220,6 +256,15 @@ impl MoeExpertResidencyManager {
     pub fn set_max_protected_pages(&mut self, max_protected_pages: usize) {
         self.max_protected_pages = max_protected_pages.min(self.config.max_resident_pages);
         self.clamp_protected_pages();
+    }
+
+    pub fn max_fixed_hot_pages(&self) -> usize {
+        self.max_fixed_hot_pages
+    }
+
+    pub fn set_max_fixed_hot_pages(&mut self, max_fixed_hot_pages: usize) {
+        self.max_fixed_hot_pages = max_fixed_hot_pages.min(self.config.max_resident_pages);
+        self.clamp_fixed_hot_pages();
     }
 
     pub fn page_budget_for_routed_experts(&self, routed_experts: usize) -> Result<usize> {
@@ -332,8 +377,18 @@ impl MoeExpertResidencyManager {
         self.ensure_resident_with_kind(store, key, ResidencyAccessKind::Demand)
     }
 
+    #[allow(dead_code)]
     pub fn prefetch_resident(&mut self, store: &BakedStore, key: MoeExpertKey) -> Result<()> {
-        self.ensure_resident_with_kind(store, key, ResidencyAccessKind::Prefetch)
+        self.prefetch_resident_with_evict(store, key, self.config.prefetch_evict)
+    }
+
+    pub fn prefetch_resident_with_evict(
+        &mut self,
+        store: &BakedStore,
+        key: MoeExpertKey,
+        allow_evict: bool,
+    ) -> Result<()> {
+        self.ensure_resident_with_kind(store, key, ResidencyAccessKind::Prefetch { allow_evict })
     }
 
     pub fn protect_resident(&mut self, key: MoeExpertKey) -> Result<()> {
@@ -374,13 +429,59 @@ impl MoeExpertResidencyManager {
         Ok(())
     }
 
+    pub fn mark_fixed_hot_resident(&mut self, key: MoeExpertKey) -> Result<()> {
+        self.fixed_hot_requests += 1;
+        if self.max_fixed_hot_pages == 0 {
+            self.fixed_hot_misses += 1;
+            return Ok(());
+        }
+        let Some(resident) = self.resident.get(&key).cloned() else {
+            self.fixed_hot_misses += 1;
+            return Ok(());
+        };
+        let tensor = &self.tensors[resident.tensor_idx];
+        let pages = page_spans(
+            tensor.page_bytes,
+            resident.page_offset,
+            resident.page_len,
+            tensor.len_bytes,
+        );
+        let mut admitted = 0usize;
+        let mut already_fixed = 0usize;
+        for span in pages {
+            let page_key = ResidentPageKey {
+                tensor_idx: resident.tensor_idx,
+                page_offset: span.offset,
+            };
+            if !self.resident_pages.contains_key(&page_key) {
+                continue;
+            }
+            if self.fixed_hot_pages.contains(&page_key) {
+                already_fixed += 1;
+                continue;
+            }
+            if self.fixed_hot_pages.len() >= self.max_fixed_hot_pages {
+                self.fixed_hot_skipped += 1;
+                continue;
+            }
+            self.fixed_hot_pages.insert(page_key);
+            admitted += 1;
+        }
+        if admitted == 0 && already_fixed == 0 {
+            self.fixed_hot_misses += 1;
+        } else {
+            self.fixed_hot_hits += 1;
+        }
+        Ok(())
+    }
+
     fn ensure_resident_with_kind(
         &mut self,
         store: &BakedStore,
         key: MoeExpertKey,
         kind: ResidencyAccessKind,
     ) -> Result<()> {
-        if kind == ResidencyAccessKind::Prefetch {
+        if kind.is_prefetch() {
             self.prefetch_requests += 1;
         }
         let tensor_idx = self.tensor_idx(key.layer_idx, key.projection)?;
@@ -430,6 +531,13 @@ impl MoeExpertResidencyManager {
             .last()
             .map(|page| page.offset + page.len)
             .unwrap_or(logical_offset + logical_len);
+        let slice_pages: HashSet<_> = pages
+            .iter()
+            .map(|span| ResidentPageKey {
+                tensor_idx,
+                page_offset: span.offset,
+            })
+            .collect();
 
         self.promote_completed_pending_pages()?;
         self.clock += 1;
@@ -442,12 +550,12 @@ impl MoeExpertResidencyManager {
             });
             if all_pages_resident {
                 self.hits += 1;
-                if kind == ResidencyAccessKind::Prefetch {
+                if kind.is_prefetch() {
                     self.prefetch_hits += 1;
                 }
                 for span in &pages {
                     self.page_hits += 1;
-                    if kind == ResidencyAccessKind::Prefetch {
+                    if kind.is_prefetch() {
                         self.prefetch_page_hits += 1;
                     }
                     if let Some(page) = self.resident_pages.get_mut(&ResidentPageKey {
@@ -463,7 +571,7 @@ impl MoeExpertResidencyManager {
         }
 
         self.misses += 1;
-        if kind == ResidencyAccessKind::Prefetch {
+        if kind.is_prefetch() {
             self.prefetch_misses += 1;
         }
         let mut missing_pages = Vec::new();
@@ -475,7 +583,7 @@ impl MoeExpertResidencyManager {
             if let Some(page) = self.resident_pages.get_mut(&page_key) {
                 page.last_used = self.clock;
                 self.page_hits += 1;
-                if kind == ResidencyAccessKind::Prefetch {
+                if kind.is_prefetch() {
                     self.prefetch_page_hits += 1;
                 }
             } else {
@@ -488,7 +596,7 @@ impl MoeExpertResidencyManager {
                         self.wait_pending_page(page_key)?;
                     }
                     self.page_hits += 1;
-                    if kind == ResidencyAccessKind::Prefetch {
+                    if kind.is_prefetch() {
                         self.prefetch_page_hits += 1;
                     }
                 } else {
@@ -497,7 +605,8 @@ impl MoeExpertResidencyManager {
             }
         }
 
-        if kind == ResidencyAccessKind::Prefetch {
+        let prefetch_can_evict = kind.allows_prefetch_evict(self.config);
+        if kind.is_prefetch() && !prefetch_can_evict {
             let free_pages = self
                 .config
                 .max_resident_pages
@@ -512,11 +621,20 @@ impl MoeExpertResidencyManager {
             }
         }
         self.page_misses += missing_pages.len() as u64;
-        if kind == ResidencyAccessKind::Prefetch {
+        if kind.is_prefetch() {
             self.prefetch_page_misses += missing_pages.len() as u64;
         }
         for span in missing_pages {
-            if kind == ResidencyAccessKind::Prefetch
+            if kind.is_prefetch() && prefetch_can_evict {
+                while self.resident_pages.len() + self.pending_pages.len()
+                    >= self.config.max_resident_pages
+                {
+                    let evicted_before = self.evicted_pages;
+                    self.evict_lru_page_except(&slice_pages)?;
+                    self.prefetch_evicted_pages += self.evicted_pages - evicted_before;
+                }
+            }
+            if kind.is_prefetch()
                 && self.schedule_async_page(store, tensor_idx, allocation_id, &name, span)?
             {
                 continue;
@@ -524,7 +642,11 @@ impl MoeExpertResidencyManager {
             while self.resident_pages.len() + self.pending_pages.len()
                 >= self.config.max_resident_pages
             {
-                self.evict_lru_page()?;
+                let evicted_before = self.evicted_pages;
+                self.evict_lru_page_except(&slice_pages)?;
+                if kind.is_prefetch() {
+                    self.prefetch_evicted_pages += self.evicted_pages - evicted_before;
+                }
             }
 
             store
@@ -542,7 +664,7 @@ impl MoeExpertResidencyManager {
                     )
                 })?;
             self.uploaded_bytes += span.copy_len;
-            if kind == ResidencyAccessKind::Prefetch {
+            if kind.is_prefetch() {
                 self.prefetch_uploaded_bytes += span.copy_len;
             }
             self.resident_pages.insert(
@@ -738,15 +860,26 @@ impl MoeExpertResidencyManager {
     }
 
     fn evict_lru_page(&mut self) -> Result<()> {
-        let Some((victim, page)) =
-            select_lru_resident_page(&self.resident_pages, &self.protected_pages)
-        else {
+        self.evict_lru_page_except(&HashSet::new())
+    }
+
+    fn evict_lru_page_except(
+        &mut self,
+        unevictable_pages: &HashSet<ResidentPageKey>,
+    ) -> Result<()> {
+        let Some((victim, page)) = select_lru_resident_page(
+            &self.resident_pages,
+            &self.protected_pages,
+            &self.fixed_hot_pages,
+            unevictable_pages,
+        ) else {
             if let Some(key) = self.pending_pages.keys().next().copied() {
                 self.wait_pending_page(key)?;
             }
             return Ok(());
         };
         let victim_was_protected = self.protected_pages.contains_key(&victim);
+        let victim_was_fixed_hot = self.fixed_hot_pages.contains(&victim);
 
         let tensor = &self.tensors[page.tensor_idx];
         let allocation = self
@@ -768,6 +901,9 @@ impl MoeExpertResidencyManager {
             if self.protected_pages.remove(&victim).is_some() {
                 self.protected_evicted_pages += 1;
             }
+            if self.fixed_hot_pages.remove(&victim) {
+                self.fixed_hot_evicted_pages += 1;
+            }
             let removed_slices = remove_slices_overlapping(
                 &mut self.resident,
                 page.tensor_idx,
@@ -785,8 +921,13 @@ impl MoeExpertResidencyManager {
             remove_slices_overlapping_ranges(&mut self.resident, page.tensor_idx, &removed_ranges);
         let demoted = prune_protected_pages(&mut self.protected_pages, &self.resident_pages);
         self.protect_demotions += demoted as u64;
+        self.fixed_hot_pages
+            .retain(|key| self.resident_pages.contains_key(key));
         if victim_was_protected {
             self.protected_evicted_pages += 1;
+        }
+        if victim_was_fixed_hot {
+            self.fixed_hot_evicted_pages += 1;
         }
         self.evicted_pages += removed_pages as u64;
         self.evicted_slices += removed_slices as u64;
@@ -800,6 +941,24 @@ impl MoeExpertResidencyManager {
             };
             self.protected_pages.remove(&victim);
             self.protect_demotions += 1;
+        }
+    }
+
+    fn clamp_fixed_hot_pages(&mut self) {
+        if self.fixed_hot_pages.len() <= self.max_fixed_hot_pages {
+            return;
+        }
+        let mut pages: Vec<_> = self.fixed_hot_pages.iter().copied().collect();
+        pages.sort_by_key(|key| {
+            self.resident_pages
+                .get(key)
+                .map(|page| (page.last_used, page.tensor_idx, page.page_offset))
+                .unwrap_or((u64::MAX, key.tensor_idx, key.page_offset))
+        });
+        let remove_count = self.fixed_hot_pages.len() - self.max_fixed_hot_pages;
+        for key in pages.into_iter().take(remove_count) {
+            self.fixed_hot_pages.remove(&key);
+            self.fixed_hot_skipped += 1;
         }
     }
 

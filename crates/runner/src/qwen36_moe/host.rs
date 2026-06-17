@@ -2,6 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use model_store::manifest::LayoutTag;
 use model_store::BakedStore;
 use qwen36_moe::config::TextConfig;
+use std::time::{Duration, Instant};
 
 use crate::qwen36_moe_cli::layers::{
     QWEN36_MOE_INT4_GROUP_SIZE, QWEN36_MOE_LOWBIT_GGML_Q4_K, QWEN36_MOE_LOWBIT_GGML_Q5_K,
@@ -12,6 +13,12 @@ use crate::qwen36_moe_types::MultiLayerGeom;
 
 const MIB: f64 = (1024 * 1024) as f64;
 
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct EmbedLookupTiming {
+    pub(crate) raw_bytes: Duration,
+    pub(crate) copy: Duration,
+}
+
 /// Look up one row of the embedding table on the host. The full
 /// embed_tokens tensor is BF16 `[vocab, hidden]`; this slices the requested
 /// row from the mmap-backed raw payload to avoid a full GPU upload.
@@ -21,10 +28,22 @@ pub(crate) fn lookup_embed_row(
     token_id: usize,
     hidden: usize,
 ) -> Result<Vec<u8>> {
+    let (row, _) = lookup_embed_row_timed(store, weight_prefix, token_id, hidden)?;
+    Ok(row)
+}
+
+pub(crate) fn lookup_embed_row_timed(
+    store: &BakedStore,
+    weight_prefix: &str,
+    token_id: usize,
+    hidden: usize,
+) -> Result<(Vec<u8>, EmbedLookupTiming)> {
     let name = format!("{weight_prefix}.embed_tokens.weight");
+    let t_raw = Instant::now();
     let bytes = store
         .raw_bytes(&name)
         .ok_or_else(|| anyhow!("missing {name} in bake"))?;
+    let raw_bytes = t_raw.elapsed();
     let row_bytes = hidden * 2;
     let start = token_id * row_bytes;
     let end = start + row_bytes;
@@ -34,7 +53,10 @@ pub(crate) fn lookup_embed_row(
             bytes.len()
         ));
     }
-    Ok(bytes[start..end].to_vec())
+    let t_copy = Instant::now();
+    let row = bytes[start..end].to_vec();
+    let copy = t_copy.elapsed();
+    Ok((row, EmbedLookupTiming { raw_bytes, copy }))
 }
 
 /// Pull the host-side bytes for a tensor used by CPU-side setup paths.

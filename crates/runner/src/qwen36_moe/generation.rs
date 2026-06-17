@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use gpu_hal::{Backend, GpuBuffer};
 
 use crate::qwen36_moe_cli::decode_loop::Qwen36DecodeLoopState;
+use crate::qwen36_moe_cli::host::EmbedLookupTiming;
 use crate::qwen36_moe_cli::lm_head::{
     launch_lm_head_from_final_hidden_bytes, launch_lm_head_top1_from_final_hidden_bytes,
     launch_top1_from_logits, LmHeadBuffers,
@@ -26,6 +27,7 @@ pub(crate) struct Qwen36GenerationStep<'a> {
     pub(crate) tokenizer: Option<&'a tokenizers::Tokenizer>,
     pub(crate) sampling: SamplingParams,
     pub(crate) t_embed_step: Duration,
+    pub(crate) embed_lookup_timing: Option<EmbedLookupTiming>,
     pub(crate) t_chain_step: Duration,
     pub(crate) outputs: &'a DecodeOutputs,
     pub(crate) final_norm_w_buf: &'a GpuBuffer,
@@ -60,6 +62,7 @@ pub(crate) fn run_generation_step(args: Qwen36GenerationStep<'_>) -> Result<u32>
         tokenizer,
         sampling,
         t_embed_step,
+        embed_lookup_timing,
         t_chain_step,
         outputs,
         final_norm_w_buf,
@@ -176,6 +179,7 @@ pub(crate) fn run_generation_step(args: Qwen36GenerationStep<'_>) -> Result<u32>
         t_sample_step,
         t_detok_step,
         outputs,
+        embed_lookup_timing,
     );
 
     Ok(next_token)
