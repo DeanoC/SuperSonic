@@ -453,9 +453,10 @@ pub(crate) struct Cli {
     #[arg(long)]
     pub(crate) dflash: bool,
 
-    /// Path to the DFlash draft checkpoint directory (e.g.
-    /// `z-lab/Qwen3.5-9B-DFlash` extracted locally). Must contain
-    /// `config.json` and `model.safetensors`.
+    /// Path to the DFlash draft checkpoint config directory (e.g.
+    /// `z-lab/Qwen3.5-9B-DFlash` extracted locally). Normally contains
+    /// `config.json` and `model.safetensors`; GGUF draft weights can be
+    /// selected by setting `SUPERSONIC_DFLASH_DRAFT_GGUF`.
     #[arg(long)]
     pub(crate) dflash_draft_dir: Option<PathBuf>,
 

@@ -79,7 +79,7 @@ pub struct DFlashLayerWeights {
     pub q_proj_w: LinearWeight,
     pub k_proj_w: LinearWeight,
     pub v_proj_w: LinearWeight,
-    pub kv_proj_w: LinearWeight,
+    pub kv_proj_w: Option<LinearWeight>,
     pub o_proj_w: LinearWeight,
 
     // Per-head RMSNorm over head_dim (NOT hidden_size). Shape [head_dim].
@@ -201,7 +201,7 @@ impl DFlashWeights {
                 q_proj_w,
                 k_proj_w,
                 v_proj_w,
-                kv_proj_w,
+                kv_proj_w: Some(kv_proj_w),
                 o_proj_w,
                 q_norm_w,
                 k_norm_w,
@@ -266,11 +266,19 @@ impl DFlashWeights {
             let v_proj_w = Self::linear_from_gguf(
                 loader.load_linear_to_gpu(&format!("blk.{idx}.attn_v.weight"), ordinal)?,
             );
-            let kv_proj_w = Self::linear_from_gguf(loader.load_concat_dim0_linear_to_gpu(
+            let kv_proj_w = match loader.load_concat_dim0_linear_to_gpu(
                 &format!("blk.{idx}.attn_k.weight"),
                 &format!("blk.{idx}.attn_v.weight"),
                 ordinal,
-            )?);
+            ) {
+                Ok(parts) => Some(Self::linear_from_gguf(parts)),
+                Err(LoadError::UnexpectedTensor(msg))
+                    if msg.contains("cannot concat GGUF linears") =>
+                {
+                    None
+                }
+                Err(err) => return Err(err),
+            };
             let o_proj_w = Self::linear_from_gguf(
                 loader.load_linear_to_gpu(&format!("blk.{idx}.attn_output.weight"), ordinal)?,
             );
