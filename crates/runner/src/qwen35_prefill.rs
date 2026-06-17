@@ -1,5 +1,5 @@
 use anyhow::Result;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::decode_engine::DecodeEngine;
@@ -175,11 +175,95 @@ pub(crate) fn run_qwen35_prefill(
         });
     }
 
-    let prefill_result = if cli.trace_prefill_layers {
+    if std::env::var_os("SUPERSONIC_QWEN35_PREFILL_DECODE_LOOP").is_some() {
+        let mut logits = engine.prefill_native(&prompt_ids[..1])?;
+        for (pos, &token_id) in prompt_ids.iter().enumerate().skip(1) {
+            logits = engine.decode_step_batch(&[token_id], pos)?.remove(0);
+        }
+        let first = DecodeEngine::greedy_sample(&logits);
+        eprintln!(
+            "[prefill] sequential decode-loop prefill done in {:.0}ms",
+            prefill_start.elapsed().as_millis()
+        );
+        profile.finish()?;
+        return Ok(Qwen35Prefill {
+            logits,
+            native_trace: None,
+            next_token: first,
+        });
+    }
+
+    let dump_layer_hiddens_dir =
+        std::env::var_os("SUPERSONIC_QWEN35_DUMP_LAYER_HIDDENS_DIR").map(PathBuf::from);
+    let dump_layer_components_dir =
+        std::env::var_os("SUPERSONIC_QWEN35_DUMP_LAYER_COMPONENTS_DIR").map(PathBuf::from);
+    let trace_prefill_layers = cli.trace_prefill_layers
+        || dump_layer_hiddens_dir.is_some()
+        || dump_layer_components_dir.is_some();
+    let prefill_result = if trace_prefill_layers {
         engine.prefill_native_with_trace(prompt_ids)?
     } else {
         engine.prefill_native_with_final_norm(prompt_ids)?
     };
+    if let (Some(path), Some(final_norm)) = (
+        std::env::var_os("SUPERSONIC_QWEN35_DUMP_FINAL_NORM"),
+        prefill_result.final_norm_trace.as_ref(),
+    ) {
+        let path = std::path::PathBuf::from(path);
+        std::fs::write(&path, final_norm)
+            .map_err(|e| anyhow::anyhow!("write final norm dump {}: {e}", path.display()))?;
+        eprintln!("[prefill] dumped final norm to {}", path.display());
+    }
+    if let (Some(dir), Some(layer_hiddens)) = (
+        dump_layer_hiddens_dir.as_ref(),
+        prefill_result.layer_hidden_trace.as_ref(),
+    ) {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| anyhow::anyhow!("create layer hidden dump dir {}: {e}", dir.display()))?;
+        for (idx, bytes) in layer_hiddens.iter().enumerate() {
+            let path = dir.join(format!("layer_{idx:02}.bf16"));
+            std::fs::write(&path, bytes)
+                .map_err(|e| anyhow::anyhow!("write layer hidden dump {}: {e}", path.display()))?;
+        }
+        eprintln!(
+            "[prefill] dumped {} layer hidden rows to {}",
+            layer_hiddens.len(),
+            dir.display()
+        );
+    }
+    if let Some(dir) = dump_layer_components_dir.as_ref() {
+        std::fs::create_dir_all(dir).map_err(|e| {
+            anyhow::anyhow!("create layer component dump dir {}: {e}", dir.display())
+        })?;
+        let attn = dump_trace_rows(
+            dir,
+            "attn",
+            prefill_result.layer_attn_trace.as_ref(),
+            "attn residual",
+        )?;
+        let post = dump_trace_rows(
+            dir,
+            "post",
+            prefill_result.layer_post_attn_norm_trace.as_ref(),
+            "post-attn norm",
+        )?;
+        let mlp = dump_trace_rows(
+            dir,
+            "mlp",
+            prefill_result.layer_mlp_out_trace.as_ref(),
+            "MLP output",
+        )?;
+        let hidden = dump_trace_rows(
+            dir,
+            "hidden",
+            prefill_result.layer_hidden_trace.as_ref(),
+            "hidden",
+        )?;
+        eprintln!(
+            "[prefill] dumped layer component rows to {} (attn={attn}, post={post}, mlp={mlp}, hidden={hidden})",
+            dir.display()
+        );
+    }
     let first = sample_qwen_prefill_token(
         &prefill_result,
         host_lm_head_rescorer.filter(|_| allow_host_lm_head_rescore),
@@ -201,6 +285,21 @@ pub(crate) fn run_qwen35_prefill(
         )),
         next_token: first,
     })
+}
+
+fn dump_trace_rows(
+    dir: &Path,
+    prefix: &str,
+    rows: Option<&Vec<Vec<u8>>>,
+    label: &str,
+) -> Result<usize> {
+    let rows = rows.ok_or_else(|| anyhow::anyhow!("missing {label} trace rows"))?;
+    for (idx, bytes) in rows.iter().enumerate() {
+        let path = dir.join(format!("{prefix}_{idx:02}.bf16"));
+        std::fs::write(&path, bytes)
+            .map_err(|e| anyhow::anyhow!("write {label} dump {}: {e}", path.display()))?;
+    }
+    Ok(rows.len())
 }
 
 fn sample_qwen_prefill_token(

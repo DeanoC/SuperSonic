@@ -21,22 +21,28 @@ use kernel_ffi::qwen36_moe::batched_prefill_grouped_expert_launch;
 fn upload_i32(ordinal: usize, host: &[i32], shape: &[usize]) -> GpuBuffer {
     assert_eq!(host.len(), shape.iter().product::<usize>());
     let mut buf = GpuBuffer::zeros(ordinal, ScalarType::U32, shape).expect("alloc i32");
-    let bytes = unsafe {
-        std::slice::from_raw_parts(host.as_ptr() as *const u8, host.len() * 4)
-    };
-    gpu_hal::copy_h2d(ordinal, buf.as_mut_ptr(), bytes.as_ptr() as *const _, bytes.len())
-        .expect("h2d i32");
+    let bytes = unsafe { std::slice::from_raw_parts(host.as_ptr() as *const u8, host.len() * 4) };
+    gpu_hal::copy_h2d(
+        ordinal,
+        buf.as_mut_ptr(),
+        bytes.as_ptr() as *const _,
+        bytes.len(),
+    )
+    .expect("h2d i32");
     buf
 }
 
 fn upload_bf16(ordinal: usize, host: &[half::bf16], shape: &[usize]) -> GpuBuffer {
     assert_eq!(host.len(), shape.iter().product::<usize>());
     let mut buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, shape).expect("alloc bf16");
-    let bytes = unsafe {
-        std::slice::from_raw_parts(host.as_ptr() as *const u8, host.len() * 2)
-    };
-    gpu_hal::copy_h2d(ordinal, buf.as_mut_ptr(), bytes.as_ptr() as *const _, bytes.len())
-        .expect("h2d bf16");
+    let bytes = unsafe { std::slice::from_raw_parts(host.as_ptr() as *const u8, host.len() * 2) };
+    gpu_hal::copy_h2d(
+        ordinal,
+        buf.as_mut_ptr(),
+        bytes.as_ptr() as *const _,
+        bytes.len(),
+    )
+    .expect("h2d bf16");
     buf
 }
 
@@ -81,11 +87,7 @@ fn bf16_round_rne_f32(x: f32) -> f32 {
 
 /// Same dequant formula as `int4_dequant_8` / `int4_dequant_scalar`:
 ///   `bf16_round_rne_f32(nibble * scale - zero * scale)`
-fn int4_dequant_scalar(
-    nibble: u32,
-    scale_bf16: half::bf16,
-    zero_bf16: half::bf16,
-) -> f32 {
+fn int4_dequant_scalar(nibble: u32, scale_bf16: half::bf16, zero_bf16: half::bf16) -> f32 {
     let s = scale_bf16.to_f32();
     let z = zero_bf16.to_f32();
     bf16_round_rne_f32((nibble as f32) * s - z * s)
@@ -108,18 +110,13 @@ fn make_x_norm(n_tokens: usize, hidden: usize, seed: u64) -> Vec<half::bf16> {
     for _ in 0..n_tokens * hidden {
         let (next, raw) = lcg(state);
         state = next;
-        let v = ((raw % 10_000) as f32) / 10_000.0 - 0.5;   // [-0.5, 0.5)
+        let v = ((raw % 10_000) as f32) / 10_000.0 - 0.5; // [-0.5, 0.5)
         out.push(half::bf16::from_f32(v * 0.4));
     }
     out
 }
 
-fn make_topk_idx(
-    n_tokens: usize,
-    top_k: usize,
-    num_experts: usize,
-    seed: u64,
-) -> Vec<i32> {
+fn make_topk_idx(n_tokens: usize, top_k: usize, num_experts: usize, seed: u64) -> Vec<i32> {
     let mut state = seed;
     let mut out = Vec::with_capacity(n_tokens * top_k);
     for _ in 0..n_tokens {
@@ -185,7 +182,7 @@ fn make_int4_slab(
     for byte in packed.iter_mut() {
         let (next, raw) = lcg(state);
         state = next;
-        *byte = (raw & 0xFF) as u8;     // both nibbles random in [0, 16).
+        *byte = (raw & 0xFF) as u8; // both nibbles random in [0, 16).
     }
 
     let mut scales = vec![half::bf16::ZERO; scale_rows * scale_cols];
@@ -265,7 +262,14 @@ fn cpu_grouped_expert(
     down_s: &[half::bf16],
     down_z: &[half::bf16],
 ) -> Vec<half::bf16> {
-    let Shape { n_tokens, top_k, num_experts, hidden, moe_intermediate, .. } = shape;
+    let Shape {
+        n_tokens,
+        top_k,
+        num_experts,
+        hidden,
+        moe_intermediate,
+        ..
+    } = shape;
     let i = moe_intermediate;
     let two_i = 2 * i;
 
@@ -323,8 +327,7 @@ fn cpu_grouped_expert(
             // Phase I: down @ mid → out_row[hidden] BF16.
             for r in 0..hidden {
                 let val = int4_matvec_row(dp_w, dp_s, dp_z, hidden, i, GROUP_SIZE, r, &mid);
-                out[row * hidden + r] =
-                    half::bf16::from_f32(bf16_round_rne_f32(val));
+                out[row * hidden + r] = half::bf16::from_f32(bf16_round_rne_f32(val));
             }
         }
     }
@@ -340,9 +343,17 @@ fn run_one_shape(ordinal: usize, shape: Shape, seed: u64) {
 
     // Synthesize inputs.
     let x_norm_host = make_x_norm(shape.n_tokens, shape.hidden, seed);
-    let topk_idx_host = make_topk_idx(shape.n_tokens, shape.top_k, shape.num_experts, seed.wrapping_add(0x101));
+    let topk_idx_host = make_topk_idx(
+        shape.n_tokens,
+        shape.top_k,
+        shape.num_experts,
+        seed.wrapping_add(0x101),
+    );
     let (offsets_host, perm_token_host) = cpu_router_permute(
-        shape.n_tokens, shape.top_k, shape.num_experts, &topk_idx_host,
+        shape.n_tokens,
+        shape.top_k,
+        shape.num_experts,
+        &topk_idx_host,
     );
 
     // Synthesize per-expert INT4 weights. Layouts match the bake:
@@ -350,27 +361,32 @@ fn run_one_shape(ordinal: usize, shape: Shape, seed: u64) {
     //   down:    [E, hidden, I/2] u8 + [E, hidden/gs, I/gs] BF16.
     let two_i = 2 * shape.moe_intermediate;
     let mut gu_w_all: Vec<u8> = Vec::with_capacity(shape.num_experts * two_i * (shape.hidden / 2));
-    let mut gu_s_all: Vec<half::bf16> = Vec::with_capacity(
-        shape.num_experts * (two_i / GROUP_SIZE) * (shape.hidden / GROUP_SIZE)
-    );
+    let mut gu_s_all: Vec<half::bf16> =
+        Vec::with_capacity(shape.num_experts * (two_i / GROUP_SIZE) * (shape.hidden / GROUP_SIZE));
     let mut gu_z_all: Vec<half::bf16> = Vec::with_capacity(gu_s_all.capacity());
     for e in 0..shape.num_experts {
-        let (w, s, z) = make_int4_slab(two_i, shape.hidden, GROUP_SIZE, seed.wrapping_add(0x200 + e as u64));
+        let (w, s, z) = make_int4_slab(
+            two_i,
+            shape.hidden,
+            GROUP_SIZE,
+            seed.wrapping_add(0x200 + e as u64),
+        );
         gu_w_all.extend_from_slice(&w);
         gu_s_all.extend_from_slice(&s);
         gu_z_all.extend_from_slice(&z);
     }
 
-    let mut dp_w_all: Vec<u8> = Vec::with_capacity(
-        shape.num_experts * shape.hidden * (shape.moe_intermediate / 2)
-    );
+    let mut dp_w_all: Vec<u8> =
+        Vec::with_capacity(shape.num_experts * shape.hidden * (shape.moe_intermediate / 2));
     let mut dp_s_all: Vec<half::bf16> = Vec::with_capacity(
-        shape.num_experts * (shape.hidden / GROUP_SIZE) * (shape.moe_intermediate / GROUP_SIZE)
+        shape.num_experts * (shape.hidden / GROUP_SIZE) * (shape.moe_intermediate / GROUP_SIZE),
     );
     let mut dp_z_all: Vec<half::bf16> = Vec::with_capacity(dp_s_all.capacity());
     for e in 0..shape.num_experts {
         let (w, s, z) = make_int4_slab(
-            shape.hidden, shape.moe_intermediate, GROUP_SIZE,
+            shape.hidden,
+            shape.moe_intermediate,
+            GROUP_SIZE,
             seed.wrapping_add(0x300 + e as u64),
         );
         dp_w_all.extend_from_slice(&w);
@@ -383,32 +399,57 @@ fn run_one_shape(ordinal: usize, shape: Shape, seed: u64) {
     let offsets_buf = upload_i32(ordinal, &offsets_host, &[shape.num_experts + 1]);
     let perm_token_buf = upload_i32(ordinal, &perm_token_host, &[total_rows]);
 
-    let gu_w_buf = upload_u8(ordinal, &gu_w_all, &[shape.num_experts, two_i, shape.hidden / 2]);
+    let gu_w_buf = upload_u8(
+        ordinal,
+        &gu_w_all,
+        &[shape.num_experts, two_i, shape.hidden / 2],
+    );
     let gu_s_buf = upload_bf16(
-        ordinal, &gu_s_all,
-        &[shape.num_experts, two_i / GROUP_SIZE, shape.hidden / GROUP_SIZE],
+        ordinal,
+        &gu_s_all,
+        &[
+            shape.num_experts,
+            two_i / GROUP_SIZE,
+            shape.hidden / GROUP_SIZE,
+        ],
     );
     let gu_z_buf = upload_bf16(
-        ordinal, &gu_z_all,
-        &[shape.num_experts, two_i / GROUP_SIZE, shape.hidden / GROUP_SIZE],
+        ordinal,
+        &gu_z_all,
+        &[
+            shape.num_experts,
+            two_i / GROUP_SIZE,
+            shape.hidden / GROUP_SIZE,
+        ],
     );
     let dp_w_buf = upload_u8(
-        ordinal, &dp_w_all,
+        ordinal,
+        &dp_w_all,
         &[shape.num_experts, shape.hidden, shape.moe_intermediate / 2],
     );
     let dp_s_buf = upload_bf16(
-        ordinal, &dp_s_all,
-        &[shape.num_experts, shape.hidden / GROUP_SIZE, shape.moe_intermediate / GROUP_SIZE],
+        ordinal,
+        &dp_s_all,
+        &[
+            shape.num_experts,
+            shape.hidden / GROUP_SIZE,
+            shape.moe_intermediate / GROUP_SIZE,
+        ],
     );
     let dp_z_buf = upload_bf16(
-        ordinal, &dp_z_all,
-        &[shape.num_experts, shape.hidden / GROUP_SIZE, shape.moe_intermediate / GROUP_SIZE],
+        ordinal,
+        &dp_z_all,
+        &[
+            shape.num_experts,
+            shape.hidden / GROUP_SIZE,
+            shape.moe_intermediate / GROUP_SIZE,
+        ],
     );
 
     let mut out_buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[total_rows, shape.hidden])
         .expect("alloc expert_out");
-    let mut counters_buf = GpuBuffer::zeros(ordinal, ScalarType::U32, &[1])
-        .expect("alloc counters");
+    let mut counters_buf =
+        GpuBuffer::zeros(ordinal, ScalarType::U32, &[1]).expect("alloc counters");
 
     batched_prefill_grouped_expert_launch(
         ordinal,
@@ -436,9 +477,16 @@ fn run_one_shape(ordinal: usize, shape: Shape, seed: u64) {
     let got_bf16 = download_bf16(&out_buf);
 
     let want_bf16 = cpu_grouped_expert(
-        shape, &x_norm_host, &perm_token_host, &offsets_host,
-        &gu_w_all, &gu_s_all, &gu_z_all,
-        &dp_w_all, &dp_s_all, &dp_z_all,
+        shape,
+        &x_norm_host,
+        &perm_token_host,
+        &offsets_host,
+        &gu_w_all,
+        &gu_s_all,
+        &gu_z_all,
+        &dp_w_all,
+        &dp_s_all,
+        &dp_z_all,
     );
 
     // Tolerances. INT4 GEMV + WMMA + BF16 quantisation noise pushes
@@ -482,7 +530,7 @@ fn run_one_shape(ordinal: usize, shape: Shape, seed: u64) {
             if mag > max_magnitude {
                 max_magnitude = mag;
             }
-            dot   += (g as f64) * (w as f64);
+            dot += (g as f64) * (w as f64);
             nrm_g += (g as f64) * (g as f64);
             nrm_w += (w as f64) * (w as f64);
             if w.abs() > 1e-6 || g.abs() > 1e-6 {
@@ -513,9 +561,15 @@ fn run_one_shape(ordinal: usize, shape: Shape, seed: u64) {
         shape.num_experts,
         shape.hidden,
         shape.moe_intermediate,
-        max_abs, arow, acol, g_aat, w_aat,
-        max_magnitude, max_abs_norm,
-        min_cos, min_cos_row,
+        max_abs,
+        arow,
+        acol,
+        g_aat,
+        w_aat,
+        max_magnitude,
+        max_abs_norm,
+        min_cos,
+        min_cos_row,
         nz,
         total_rows * shape.hidden,
     );
@@ -565,7 +619,13 @@ fn grouped_expert_matches_cpu_reference() {
     ] {
         run_one_shape(
             ordinal,
-            Shape { n_tokens, top_k, num_experts, hidden, moe_intermediate: moe_int },
+            Shape {
+                n_tokens,
+                top_k,
+                num_experts,
+                hidden,
+                moe_intermediate: moe_int,
+            },
             seed,
         );
     }

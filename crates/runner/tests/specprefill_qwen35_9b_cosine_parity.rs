@@ -39,9 +39,7 @@ fn run_supersonic_capture_logits(args: &[&str]) -> anyhow::Result<Vec<f32>> {
         .collect()
 }
 
-fn run_supersonic_capture_logits_and_text(
-    args: &[&str],
-) -> anyhow::Result<(Vec<f32>, String)> {
+fn run_supersonic_capture_logits_and_text(args: &[&str]) -> anyhow::Result<(Vec<f32>, String)> {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_supersonic"));
     cmd.args(args);
     cmd.arg("--dump-last-logits");
@@ -87,16 +85,30 @@ fn run_supersonic_capture_logits_and_text(
 }
 
 fn cossim(a: &[f32], b: &[f32]) -> f64 {
-    let dot: f64 = a.iter().zip(b).map(|(x, y)| f64::from(*x) * f64::from(*y)).sum();
+    let dot: f64 = a
+        .iter()
+        .zip(b)
+        .map(|(x, y)| f64::from(*x) * f64::from(*y))
+        .sum();
     let na: f64 = a.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
     let nb: f64 = b.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
-    if na == 0.0 || nb == 0.0 { 0.0 } else { dot / (na * nb) }
+    if na == 0.0 || nb == 0.0 {
+        0.0
+    } else {
+        dot / (na * nb)
+    }
 }
 
 fn argmax(v: &[f32]) -> usize {
     v.iter()
         .enumerate()
-        .fold((0usize, f32::NEG_INFINITY), |a, (i, &x)| if x > a.1 { (i, x) } else { a })
+        .fold((0usize, f32::NEG_INFINITY), |a, (i, &x)| {
+            if x > a.1 {
+                (i, x)
+            } else {
+                a
+            }
+        })
         .0
 }
 
@@ -141,18 +153,26 @@ fn run_parity_check(
 ) {
     let prompt = "The transformer architecture has revolutionized natural language processing through its self-attention mechanism, allowing models to weigh the importance of different parts of the input sequence dynamically. Unlike recurrent networks, transformers can process all tokens in parallel during training, making them highly efficient on modern accelerator hardware. The attention computation involves three projections — query, key, and value — followed by a softmax-normalized dot product that produces a weighted combination of value vectors. Multi-head attention extends this by performing several attention operations in parallel across different learned subspaces, then concatenating and projecting the results. Feed-forward networks between attention layers introduce non-linearity. Residual connections and layer normalization stabilize gradients during training. The overall result is";
     let common: Vec<&str> = vec![
-        "--backend", "hip",
-        "--model", "qwen3.5-9b",
-        "--model-dir", target,
-        "--prompt", prompt,
-        "--max-new-tokens", "1",
+        "--backend",
+        "hip",
+        "--model",
+        "qwen3.5-9b",
+        "--model-dir",
+        target,
+        "--prompt",
+        prompt,
+        "--max-new-tokens",
+        "1",
     ];
     let dense_logits = run_supersonic_capture_logits(&common).expect("dense");
     let mut sparse_args = common.clone();
     sparse_args.extend_from_slice(&[
-        "--specprefill-draft-dir", draft,
-        "--specprefill-algorithm", "cosine",
-        "--specprefill-keep-ratio", keep_ratio,
+        "--specprefill-draft-dir",
+        draft,
+        "--specprefill-algorithm",
+        "cosine",
+        "--specprefill-keep-ratio",
+        keep_ratio,
     ]);
     let sparse_logits = run_supersonic_capture_logits(&sparse_args).expect("sparse cosine");
     assert_eq!(
@@ -170,9 +190,18 @@ fn run_parity_check(
         "[cosine parity {expected_label}] cossim={:.6} dense_argmax={} sparse_argmax={} top5_overlap={}/5",
         cs, dense_argmax, sparse_argmax, overlap
     );
-    assert_eq!(dense_argmax, sparse_argmax, "[{expected_label}] argmax mismatch");
-    assert!(cs >= cossim_floor, "[{expected_label}] cossim {cs} < {cossim_floor}");
-    assert!(overlap >= 4, "[{expected_label}] top-5 overlap {overlap} < 4");
+    assert_eq!(
+        dense_argmax, sparse_argmax,
+        "[{expected_label}] argmax mismatch"
+    );
+    assert!(
+        cs >= cossim_floor,
+        "[{expected_label}] cossim {cs} < {cossim_floor}"
+    );
+    assert!(
+        overlap >= 4,
+        "[{expected_label}] top-5 overlap {overlap} < 4"
+    );
 }
 
 #[test]
@@ -201,18 +230,26 @@ fn cosine_qwen35_9b_keep_100_multitoken_identity() {
     };
     let prompt = "The transformer architecture has revolutionized natural language processing through its self-attention mechanism, allowing models to weigh the importance of different parts of the input sequence dynamically. Unlike recurrent networks, transformers can process all tokens in parallel during training, making them highly efficient on modern accelerator hardware. The attention computation involves three projections — query, key, and value — followed by a softmax-normalized dot product that produces a weighted combination of value vectors. Multi-head attention extends this by performing several attention operations in parallel across different learned subspaces, then concatenating and projecting the results. Feed-forward networks between attention layers introduce non-linearity. Residual connections and layer normalization stabilize gradients during training. The overall result is";
     let common: Vec<&str> = vec![
-        "--backend", "hip",
-        "--model", "qwen3.5-9b",
-        "--model-dir", &target,
-        "--prompt", prompt,
-        "--max-new-tokens", "8",
+        "--backend",
+        "hip",
+        "--model",
+        "qwen3.5-9b",
+        "--model-dir",
+        &target,
+        "--prompt",
+        prompt,
+        "--max-new-tokens",
+        "8",
     ];
     let (_, dense_text) = run_supersonic_capture_logits_and_text(&common).expect("dense");
     let mut sparse_args = common.clone();
     sparse_args.extend_from_slice(&[
-        "--specprefill-draft-dir", &draft,
-        "--specprefill-algorithm", "cosine",
-        "--specprefill-keep-ratio", "1.00",
+        "--specprefill-draft-dir",
+        &draft,
+        "--specprefill-algorithm",
+        "cosine",
+        "--specprefill-keep-ratio",
+        "1.00",
     ]);
     let (_, sparse_text) =
         run_supersonic_capture_logits_and_text(&sparse_args).expect("sparse cosine");

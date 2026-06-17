@@ -6,20 +6,26 @@ use std::time::Instant;
 
 pub fn detect() -> CacheHierarchy {
     let sys = Path::new("/sys/devices/system/cpu/cpu0/cache");
-    let mut h = CacheHierarchy { l1d: None, l2: None, l3: None };
+    let mut h = CacheHierarchy {
+        l1d: None,
+        l2: None,
+        l3: None,
+    };
     if let Ok(entries) = fs::read_dir(sys) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            if !name.starts_with("index") { continue; }
-            let level: Option<u32> = read_str(&entry.path().join("level"))
-                .and_then(|s| s.parse().ok());
+            if !name.starts_with("index") {
+                continue;
+            }
+            let level: Option<u32> =
+                read_str(&entry.path().join("level")).and_then(|s| s.parse().ok());
             let kind = read_str(&entry.path().join("type")).unwrap_or_default();
             let size = read_size(&entry.path().join("size")).unwrap_or(0);
             let line = read_str(&entry.path().join("coherency_line_size"))
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(64);
-            let ways = read_str(&entry.path().join("ways_of_associativity"))
-                .and_then(|s| s.parse().ok());
+            let ways =
+                read_str(&entry.path().join("ways_of_associativity")).and_then(|s| s.parse().ok());
             let cl = CacheLevel {
                 size_bytes: size,
                 line_bytes: line,
@@ -76,7 +82,9 @@ fn pointer_chase_ns(bytes: usize) -> f64 {
     let iters = 10_000_000usize;
     let start = Instant::now();
     let mut p = 0usize;
-    for _ in 0..iters { p = chain[p]; }
+    for _ in 0..iters {
+        p = chain[p];
+    }
     let elapsed = start.elapsed();
     black_box(p);
     elapsed.as_nanos() as f64 / iters as f64
@@ -89,7 +97,9 @@ fn read_bandwidth_gb_s(bytes: usize) -> f64 {
     let start = Instant::now();
     let mut acc: u64 = 0;
     for _ in 0..iters {
-        for &v in &buf { acc = acc.wrapping_add(v); }
+        for &v in &buf {
+            acc = acc.wrapping_add(v);
+        }
     }
     let elapsed = start.elapsed().as_secs_f64();
     black_box(acc);

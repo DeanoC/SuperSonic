@@ -670,14 +670,14 @@ __device__ inline void qwen36_moe_linear_step_device(
 
     // -- Phase F: beta + g per V-head ---------------------------------------
     // beta[h] = sigmoid(b_raw[h])                                  (F32)
-    // g[h]    = -softplus(a_raw[h] + dt_bias[h]) * exp(A_log[h])   (F32)
+    // g[h]    = -softplus(a_raw[h] + dt_bias[h]) * a_log_exp[h]     (F32)
     //
     // V is small (32 on 35B-A3B) so we do this on block 0 only — every
     // other block parks at the post-F grid_barrier below.
     //
     // No pre-F barrier: Phase F reads only `a_raw`, `b_raw` (Phase B writes,
     // long since published) and the host-uploaded BF16 tables `dt_bias` /
-    // `a_log`. Phase F doesn't touch counters[0] (block-0-only, no atomic
+    // `a_log_exp`. Phase F doesn't touch counters[0] (block-0-only, no atomic
     // claim). counters[0] is left at V from Phase E's work-stealing; the
     // post-F barrier (below) resets it to 0 in time for Phase G.
     if (blockIdx.x == 0) {
@@ -685,8 +685,7 @@ __device__ inline void qwen36_moe_linear_step_device(
             const float a_v       = workspace[OFF_A_RAW + h];
             const float b_v       = workspace[OFF_B_RAW + h];
             const float dt_b      = static_cast<float>(dt_bias[h]);
-            const float a_log_v   = static_cast<float>(a_log[h]);
-            const float a_log_exp = expf(a_log_v);
+            const float a_log_exp = static_cast<float>(a_log[h]);
             const float arg       = a_v + dt_b;
             const float softplus  = log1pf(expf(arg));
             workspace[OFF_BETA + h] = 1.0f / (1.0f + expf(-b_v));

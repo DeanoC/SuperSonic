@@ -3,14 +3,14 @@ use qwen35::state::ModelState;
 
 use crate::decode_engine::{ComponentLayerTrace, ComponentLinearTrace, DecodeEngine};
 use crate::prefill_engine;
-use crate::tensor_bytes::{
-    bf16_bytes_to_f32 as decode_bf16_le, f32_bytes_to_f32 as decode_f32_le, f32_to_bf16_bytes,
-};
-use crate::validate;
 use crate::qwen35_trace_utils::{
     bf16_residual_sum, bf16_round, build_linear_decode_v_reference, fp8_e4m3_to_f32_host,
     sigmoid_fast,
 };
+use crate::tensor_bytes::{
+    bf16_bytes_to_f32 as decode_bf16_le, f32_bytes_to_f32 as decode_f32_le, f32_to_bf16_bytes,
+};
+use crate::validate;
 
 pub(crate) fn trace_component_input_layer(
     engine: &DecodeEngine,
@@ -850,7 +850,6 @@ pub(crate) fn trace_persistent_full_attn_layer(
     }
     Ok(())
 }
-
 
 pub(crate) fn trace_component_layer(
     engine: &DecodeEngine,

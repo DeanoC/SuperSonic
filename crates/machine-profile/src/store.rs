@@ -67,13 +67,18 @@ mod tests {
             profile_version: "machine-profile/0.1.0".into(),
             fingerprint: fp.into(),
             fingerprint_components: FingerprintComponents {
-                cpu: "x".into(), gpus: vec![], driver: "y".into(), isa: vec![],
+                cpu: "x".into(),
+                gpus: vec![],
+                driver: "y".into(),
+                isa: vec![],
             },
             captured_at: "2026-05-06T00:00:00Z".into(),
             warnings: vec![],
-            cpu: None, gpus: vec![],
+            cpu: None,
+            gpus: vec![],
             system: SystemInfo {
-                ram_bytes: 1, os: "linux user@host".into(),
+                ram_bytes: 1,
+                os: "linux user@host".into(),
                 kernel_driver: Some("u@h".into()),
             },
         }

@@ -45,6 +45,19 @@ __device__ inline hip_bfloat16 pfx_from_float<hip_bfloat16>(float value) {
     return hip_bfloat16(value);
 }
 
+__device__ inline float pfx_exp_fast(float x) {
+    return __expf(x);
+}
+
+__device__ inline float pfx_sigmoid_fast(float x) {
+    if (x >= 0.0f) {
+        const float e = pfx_exp_fast(-x);
+        return 1.0f / (1.0f + e);
+    }
+    const float e = pfx_exp_fast(x);
+    return e / (1.0f + e);
+}
+
 __device__ inline float pfx_wave_sum(float value) {
     for (int offset = warpSize / 2; offset > 0; offset /= 2) {
         value += __shfl_down(value, offset);
@@ -65,6 +78,53 @@ __global__ void pfx_element_add_kernel(
     const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (idx >= total_elems) return;
     out[idx] = pfx_from_float<T>(pfx_to_float(lhs[idx]) + pfx_to_float(rhs[idx]));
+}
+
+__global__ void pfx_argmax_bf16_rows_kernel(
+    size_t rows,
+    size_t cols,
+    const hip_bfloat16* __restrict__ logits,
+    uint32_t* __restrict__ out_index
+) {
+    __shared__ float shared_vals[256];
+    __shared__ uint32_t shared_idx[256];
+
+    const size_t row = blockIdx.x;
+    if (row >= rows) return;
+    const unsigned int tid = threadIdx.x;
+    const hip_bfloat16* row_logits = logits + row * cols;
+
+    float best_val = -1.0e30f;
+    uint32_t best_idx = 0;
+    for (size_t col = tid; col < cols; col += blockDim.x) {
+        const float val = static_cast<float>(row_logits[col]);
+        const uint32_t idx = static_cast<uint32_t>(col);
+        if (val > best_val || (val == best_val && idx < best_idx)) {
+            best_val = val;
+            best_idx = idx;
+        }
+    }
+
+    shared_vals[tid] = best_val;
+    shared_idx[tid] = best_idx;
+    __syncthreads();
+
+    for (unsigned int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
+        if (tid < offset) {
+            const float rhs_val = shared_vals[tid + offset];
+            const uint32_t rhs_idx = shared_idx[tid + offset];
+            if (rhs_val > shared_vals[tid] ||
+                (rhs_val == shared_vals[tid] && rhs_idx < shared_idx[tid])) {
+                shared_vals[tid] = rhs_val;
+                shared_idx[tid] = rhs_idx;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        out_index[row] = shared_idx[0];
+    }
 }
 
 // ---- Kernel 2: RoPE for prefill ----
@@ -342,6 +402,25 @@ __global__ void pfx_transpose_shd_hsd_kernel(
     dst[dst_off] = src[idx];
 }
 
+__global__ void pfx_transpose_shd_to_cache_bf16_kernel(
+    int S, int H, int D,
+    int cache_len,
+    int dst_pos,
+    const hip_bfloat16* __restrict__ src,
+    hip_bfloat16* __restrict__ cache
+) {
+    const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t total = static_cast<size_t>(S) * H * D;
+    if (idx >= total) return;
+
+    const int d = static_cast<int>(idx % D);
+    const int h = static_cast<int>((idx / D) % H);
+    const int s = static_cast<int>(idx / (static_cast<size_t>(D) * H));
+
+    const size_t dst_off = (static_cast<size_t>(h) * cache_len + dst_pos + s) * D + d;
+    cache[dst_off] = src[idx];
+}
+
 // ---- Kernel 4: Transpose [S, C] -> [C, pad + S] with left zero-padding ----
 // For causal conv1d input preparation.
 // src: [S, C] row-major
@@ -390,6 +469,45 @@ __global__ void pfx_extract_conv_state_kernel(
     dst[dst_off] = src[src_off];
 }
 
+// ---- Kernel 5b: Prepare conv input and next conv tail in one pass ----
+// src: [S, C] row-major current QKV projection
+// old_tail: [C, pad] row-major previous conv tail
+// conv_input: [C, pad + S] row-major with old_tail prepended then src transposed
+// new_tail: [C, pad] row-major, extracted from the final pad rows of src
+
+template <typename T>
+__global__ void pfx_prepare_conv_input_tail_kernel(
+    int S, int C, int pad,
+    const T* src,
+    const T* old_tail,
+    T* conv_input,
+    T* new_tail
+) {
+    const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t total_len = static_cast<size_t>(pad + S);
+    const size_t conv_total = static_cast<size_t>(C) * total_len;
+    const size_t tail_total = static_cast<size_t>(C) * pad;
+    const size_t total = conv_total > tail_total ? conv_total : tail_total;
+    if (idx >= total) return;
+
+    if (idx < conv_total) {
+        const int c = static_cast<int>(idx / total_len);
+        const int t = static_cast<int>(idx - static_cast<size_t>(c) * total_len);
+        if (t < pad) {
+            conv_input[idx] = old_tail[static_cast<size_t>(c) * pad + t];
+        } else {
+            conv_input[idx] = src[static_cast<size_t>(t - pad) * C + c];
+        }
+    }
+
+    if (idx < tail_total) {
+        const int c = static_cast<int>(idx / pad);
+        const int t = static_cast<int>(idx - static_cast<size_t>(c) * pad);
+        const int src_row = S - pad + t;
+        new_tail[idx] = src[static_cast<size_t>(src_row) * C + c];
+    }
+}
+
 // ---- Kernel 6: Fused sigmoid-gate multiply ----
 // out[i] = data[i] * sigmoid(gate[i])
 
@@ -405,6 +523,35 @@ __global__ void pfx_sigmoid_mul_kernel(
     const float g = pfx_to_float(gate[idx]);
     const float sigmoid_g = 1.0f / (1.0f + expf(-g));
     out[idx] = pfx_from_float<T>(pfx_to_float(data[idx]) * sigmoid_g);
+}
+
+// Fused full-attention epilogue staging:
+//   1. read F32 attention output in [H, S, D],
+//   2. round to BF16 to match the old cast kernel,
+//   3. transpose to [S, H, D],
+//   4. apply the BF16 attention gate in S-first layout.
+__global__ void pfx_cast_transpose_gate_hsd_to_shd_bf16_kernel(
+    int S,
+    int H,
+    int D,
+    const float* __restrict__ attn_hsd,
+    const hip_bfloat16* __restrict__ gate_shd,
+    hip_bfloat16* __restrict__ out_shd
+) {
+    const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t total = static_cast<size_t>(S) * H * D;
+    if (idx >= total) return;
+
+    const int d = static_cast<int>(idx % D);
+    const int h = static_cast<int>((idx / D) % H);
+    const int s = static_cast<int>(idx / (static_cast<size_t>(D) * H));
+    const size_t src_off = (static_cast<size_t>(h) * S + s) * D + d;
+
+    const hip_bfloat16 rounded = hip_bfloat16(attn_hsd[src_off]);
+    const float x = static_cast<float>(rounded);
+    const float g = static_cast<float>(gate_shd[idx]);
+    const float sigmoid_g = 1.0f / (1.0f + expf(-g));
+    out_shd[idx] = hip_bfloat16(x * sigmoid_g);
 }
 
 // ---- Kernel 7: Compute beta and g for delta recurrent ----
@@ -444,6 +591,33 @@ __global__ void pfx_compute_beta_g_kernel(
     g[static_cast<size_t>(h) * seq_len + t] = pfx_from_float<T>(-sp * ale);
 }
 
+__global__ void pfx_compute_beta_g_ba_bf16_kernel(
+    int seq_len,
+    int nv,
+    const hip_bfloat16* BA,        // [seq_len, 2*nv], first B then A
+    const hip_bfloat16* dt_bias,   // [nv]
+    const hip_bfloat16* a_log_exp, // [nv]
+    float* beta,                   // [nv, seq_len]
+    float* g                       // [nv, seq_len]
+) {
+    const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t total = static_cast<size_t>(seq_len) * nv;
+    if (idx >= total) return;
+
+    const int t = static_cast<int>(idx / nv);
+    const int h = static_cast<int>(idx % nv);
+    const size_t row = static_cast<size_t>(t) * static_cast<size_t>(2 * nv);
+
+    const float b_val = pfx_to_float(BA[row + h]);
+    beta[static_cast<size_t>(h) * seq_len + t] = 1.0f / (1.0f + expf(-b_val));
+
+    const float a_val = pfx_to_float(BA[row + static_cast<size_t>(nv) + h]);
+    const float dt = pfx_to_float(dt_bias[h]);
+    const float ale = pfx_to_float(a_log_exp[h]);
+    const float sp = logf(1.0f + expf(a_val + dt));
+    g[static_cast<size_t>(h) * seq_len + t] = -sp * ale;
+}
+
 // ---- Kernel 8: Split gated Q projection ----
 // src: [S, num_heads, 2*head_dim] — each head has [query(hd) | gate(hd)]
 // query_out: [S, num_heads, head_dim]
@@ -468,6 +642,58 @@ __global__ void pfx_split_qgate_kernel(
                           + static_cast<size_t>(h) * head_dim * 2;
     query_out[idx] = src[src_base + d];
     gate_out[idx] = src[src_base + head_dim + d];
+}
+
+__global__ void pfx_split_qgate_norm_bf16_kernel(
+    int S,
+    int num_heads,
+    int head_dim,
+    float eps,
+    const hip_bfloat16* __restrict__ src,
+    const hip_bfloat16* __restrict__ norm_w,
+    hip_bfloat16* __restrict__ query_out,
+    hip_bfloat16* __restrict__ gate_out
+) {
+    const int row = static_cast<int>(blockIdx.x);
+    const int rows = S * num_heads;
+    if (row >= rows) return;
+
+    const int tid = threadIdx.x;
+    const int s = row / num_heads;
+    const int h = row - s * num_heads;
+    const size_t src_base = static_cast<size_t>(s) * num_heads * head_dim * 2
+                          + static_cast<size_t>(h) * head_dim * 2;
+    const size_t out_base = static_cast<size_t>(row) * head_dim;
+
+    float partial = 0.0f;
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+        const float x = static_cast<float>(src[src_base + d]);
+        partial += x * x;
+    }
+
+    __shared__ float shared_sum[256];
+    shared_sum[tid] = partial;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared_sum[tid] += shared_sum[tid + stride];
+        }
+        __syncthreads();
+    }
+
+    __shared__ float inv_rms;
+    if (tid == 0) {
+        inv_rms = rsqrtf(shared_sum[0] / static_cast<float>(head_dim) + eps);
+    }
+    __syncthreads();
+
+    for (int d = tid; d < head_dim; d += blockDim.x) {
+        const float x = static_cast<float>(src[src_base + d]);
+        const float w = static_cast<float>(norm_w[d]);
+        query_out[out_base + d] = hip_bfloat16(x * inv_rms * w);
+        gate_out[out_base + d] = src[src_base + head_dim + d];
+    }
 }
 
 // ---- Kernel 9: Split interleaved QKV ----
@@ -501,6 +727,231 @@ __global__ void pfx_split_qkv_kernel(
     }
 }
 
+__global__ void pfx_split_kv_bf16_kernel(
+    int S,
+    int kv_dim,
+    const hip_bfloat16* src,
+    hip_bfloat16* K_out,
+    hip_bfloat16* V_out
+) {
+    const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t total = static_cast<size_t>(S) * kv_dim;
+    if (idx >= total) return;
+
+    const int s = static_cast<int>(idx / kv_dim);
+    const int c = static_cast<int>(idx % kv_dim);
+    const size_t src_base = static_cast<size_t>(s) * static_cast<size_t>(2 * kv_dim);
+    K_out[idx] = src[src_base + c];
+    V_out[idx] = src[src_base + static_cast<size_t>(kv_dim) + c];
+}
+
+__global__ void pfx_split_qkv_bf16_to_f32_kernel(
+    int S,
+    int key_dim,
+    int val_dim,
+    const hip_bfloat16* src,
+    float* Q_out,
+    float* K_out,
+    float* V_out
+) {
+    const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int qkv_dim = key_dim * 2 + val_dim;
+    const size_t total = static_cast<size_t>(S) * qkv_dim;
+    if (idx >= total) return;
+
+    const int s = static_cast<int>(idx / qkv_dim);
+    const int c = static_cast<int>(idx % qkv_dim);
+    const float val = static_cast<float>(src[idx]);
+
+    if (c < key_dim) {
+        Q_out[static_cast<size_t>(s) * key_dim + c] = val;
+    } else if (c < key_dim * 2) {
+        K_out[static_cast<size_t>(s) * key_dim + (c - key_dim)] = val;
+    } else {
+        V_out[static_cast<size_t>(s) * val_dim + (c - key_dim * 2)] = val;
+    }
+}
+
+__global__ void pfx_split_norm_transpose_qkv_bf16_kernel(
+    int S,
+    int nk,
+    int nv,
+    int khd,
+    int vhd,
+    float q_scale,
+    float eps,
+    const hip_bfloat16* src,
+    float* Q_out,
+    float* K_out,
+    float* V_out
+) {
+    const int key_dim = nk * khd;
+    const int val_dim = nv * vhd;
+    const int qkv_dim = 2 * key_dim + val_dim;
+    const int q_rows = S * nk;
+    const int kv_rows = S * nv;
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+
+    if (row < q_rows) {
+        const int s = row / nk;
+        const int h = row - s * nk;
+        const size_t src_base = static_cast<size_t>(s) * qkv_dim +
+                                static_cast<size_t>(h) * khd;
+        float partial = 0.0f;
+        for (int d = tid; d < khd; d += blockDim.x) {
+            const float x = static_cast<float>(src[src_base + d]);
+            partial += x * x;
+        }
+
+        __shared__ float shared_sum[256];
+        shared_sum[tid] = partial;
+        __syncthreads();
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) shared_sum[tid] += shared_sum[tid + stride];
+            __syncthreads();
+        }
+
+        __shared__ float shared_inv_norm;
+        if (tid == 0) shared_inv_norm = rsqrtf(shared_sum[0] + eps);
+        __syncthreads();
+
+        for (int d = tid; d < khd; d += blockDim.x) {
+            const float val =
+                (static_cast<float>(src[src_base + d]) * shared_inv_norm) * q_scale;
+            for (int oh = h; oh < nv; oh += nk) {
+                Q_out[(static_cast<size_t>(oh) * S + s) * khd + d] = val;
+            }
+        }
+        return;
+    }
+
+    const int k_row = row - q_rows;
+    if (k_row < q_rows) {
+        const int s = k_row / nk;
+        const int h = k_row - s * nk;
+        const size_t src_base = static_cast<size_t>(s) * qkv_dim +
+                                static_cast<size_t>(key_dim) +
+                                static_cast<size_t>(h) * khd;
+        float partial = 0.0f;
+        for (int d = tid; d < khd; d += blockDim.x) {
+            const float x = static_cast<float>(src[src_base + d]);
+            partial += x * x;
+        }
+
+        __shared__ float shared_sum[256];
+        shared_sum[tid] = partial;
+        __syncthreads();
+        for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+            if (tid < stride) shared_sum[tid] += shared_sum[tid + stride];
+            __syncthreads();
+        }
+
+        __shared__ float shared_inv_norm;
+        if (tid == 0) shared_inv_norm = rsqrtf(shared_sum[0] + eps);
+        __syncthreads();
+
+        for (int d = tid; d < khd; d += blockDim.x) {
+            const float val = static_cast<float>(src[src_base + d]) * shared_inv_norm;
+            for (int oh = h; oh < nv; oh += nk) {
+                K_out[(static_cast<size_t>(oh) * S + s) * khd + d] = val;
+            }
+        }
+        return;
+    }
+
+    const int v_row = k_row - q_rows;
+    if (v_row >= kv_rows) return;
+    const int s = v_row / nv;
+    const int h = v_row - s * nv;
+    const size_t src_base = static_cast<size_t>(s) * qkv_dim +
+                            static_cast<size_t>(2 * key_dim) +
+                            static_cast<size_t>(h) * vhd;
+    for (int d = tid; d < vhd; d += blockDim.x) {
+        V_out[(static_cast<size_t>(h) * S + s) * vhd + d] =
+            static_cast<float>(src[src_base + d]);
+    }
+}
+
+__global__ void pfx_rms_norm_gated_sfirst_bf16_kernel(
+    int S,
+    int nv,
+    int vhd,
+    float eps,
+    const hip_bfloat16* hidden_hsd,
+    const hip_bfloat16* gate_sfirst,
+    const hip_bfloat16* weight,
+    hip_bfloat16* out_sfirst
+) {
+    const int row = blockIdx.x;
+    const int total_rows = S * nv;
+    if (row >= total_rows) return;
+
+    const int tid = threadIdx.x;
+    const int s = row / nv;
+    const int h = row - s * nv;
+    const hip_bfloat16* row_hidden =
+        hidden_hsd + (static_cast<size_t>(h) * S + s) * vhd;
+    const hip_bfloat16* row_gate =
+        gate_sfirst + static_cast<size_t>(s) * nv * vhd + static_cast<size_t>(h) * vhd;
+    hip_bfloat16* row_out =
+        out_sfirst + static_cast<size_t>(s) * nv * vhd + static_cast<size_t>(h) * vhd;
+
+    float partial = 0.0f;
+    for (int col = tid; col < vhd; col += blockDim.x) {
+        const float x = static_cast<float>(row_hidden[col]);
+        partial += x * x;
+    }
+
+    __shared__ float shared_sum[256];
+    shared_sum[tid] = partial;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) shared_sum[tid] += shared_sum[tid + stride];
+        __syncthreads();
+    }
+
+    __shared__ float shared_inv_rms;
+    if (tid == 0) {
+        const float mean = shared_sum[0] / static_cast<float>(vhd);
+        shared_inv_rms = rsqrtf(mean + eps);
+    }
+    __syncthreads();
+
+    for (int col = tid; col < vhd; col += blockDim.x) {
+        const float x = static_cast<float>(row_hidden[col]);
+        const float gate_x = static_cast<float>(row_gate[col]);
+        const float gate_silu = gate_x * pfx_sigmoid_fast(gate_x);
+        const float weight_val = static_cast<float>(weight[col]);
+        row_out[col] = hip_bfloat16(x * shared_inv_rms * weight_val * gate_silu);
+    }
+}
+
+__global__ void pfx_split_qkvz_bf16_kernel(
+    int S,
+    int qkv_dim,
+    int z_dim,
+    const hip_bfloat16* src,
+    hip_bfloat16* QKV_out,
+    hip_bfloat16* Z_out
+) {
+    const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int total_dim = qkv_dim + z_dim;
+    const size_t total = static_cast<size_t>(S) * total_dim;
+    if (idx >= total) return;
+
+    const int s = static_cast<int>(idx / total_dim);
+    const int c = static_cast<int>(idx % total_dim);
+    const hip_bfloat16 val = src[idx];
+
+    if (c < qkv_dim) {
+        QKV_out[static_cast<size_t>(s) * qkv_dim + c] = val;
+    } else {
+        Z_out[static_cast<size_t>(s) * z_dim + (c - qkv_dim)] = val;
+    }
+}
+
 // ---- Kernel 10: Repeat interleave along head dimension ----
 // src: [S, n_heads, head_dim] → dst: [S, n_heads * repeats, head_dim]
 // Each head is repeated 'repeats' times consecutively.
@@ -519,7 +970,32 @@ __global__ void pfx_repeat_interleave_heads_kernel(
     const int d = static_cast<int>(idx % head_dim);
     const int oh = static_cast<int>((idx / head_dim) % out_heads);
     const int s = static_cast<int>(idx / (static_cast<size_t>(head_dim) * out_heads));
-    const int src_h = oh / repeats;
+    const int src_h = oh % n_heads;
+
+    const size_t src_off = static_cast<size_t>(s) * n_heads * head_dim
+                         + static_cast<size_t>(src_h) * head_dim + d;
+    dst[idx] = src[src_off];
+}
+
+// Fused repeat-interleave and transpose:
+//   src [S, n_heads, head_dim]
+//   dst [n_heads * repeats, S, head_dim]
+// This is equivalent to repeat_interleave_heads followed by transpose_shd_hsd.
+template <typename T>
+__global__ void pfx_repeat_interleave_transpose_hsd_kernel(
+    int S, int n_heads, int head_dim, int repeats,
+    const T* src,
+    T* dst
+) {
+    const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int out_heads = n_heads * repeats;
+    const size_t total = static_cast<size_t>(out_heads) * S * head_dim;
+    if (idx >= total) return;
+
+    const int d = static_cast<int>(idx % head_dim);
+    const int s = static_cast<int>((idx / head_dim) % S);
+    const int oh = static_cast<int>(idx / (static_cast<size_t>(head_dim) * S));
+    const int src_h = oh % n_heads;
 
     const size_t src_off = static_cast<size_t>(s) * n_heads * head_dim
                          + static_cast<size_t>(src_h) * head_dim + d;

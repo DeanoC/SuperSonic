@@ -1,10 +1,11 @@
 #![recursion_limit = "512"]
 
-mod bakes;
 mod backend_runtime;
+mod bakes;
 mod certified_kv;
 mod cli;
 mod decode_engine;
+mod dflash_ddtree;
 mod gemma4_engine;
 mod gemma4_int4_engine;
 mod gemma4_runtime;
@@ -72,14 +73,14 @@ mod validate;
 use anyhow::Result;
 use clap::Parser;
 
-pub(crate) use cli::Cli;
-pub(crate) use bakes::{should_fetch_exact_bake, try_download_bake};
+pub(crate) use backend_runtime::resolve_oracle_device;
 use backend_runtime::{
     install_arch_profile, lookup_registry_entry, query_gpu_info, resolve_backend,
 };
+pub(crate) use bakes::{should_fetch_exact_bake, try_download_bake};
+pub(crate) use cli::Cli;
 use gemma4_runtime::run_gemma4;
 pub(crate) use model_files::{load_tokenizer, resolve_prompt_token_ids};
-pub(crate) use backend_runtime::resolve_oracle_device;
 use policy::{
     q4km_like, validate_dflash_flags, validate_gfx942_policy, validate_global_flags,
     validate_specprefill_flags,

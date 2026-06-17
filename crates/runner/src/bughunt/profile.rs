@@ -103,11 +103,7 @@ impl Drop for ProfileGuard {
     }
 }
 
-pub(crate) fn print_profile_summary(
-    prompt_name: &str,
-    phase: &str,
-    profile: &MetalProfileReport,
-) {
+pub(crate) fn print_profile_summary(prompt_name: &str, phase: &str, profile: &MetalProfileReport) {
     println!(
         "PROFILE prompt={} phase={} total_calls={} native_calls={} host_calls={} total_ms={:.1} native_ms={:.1} host_ms={:.1}",
         prompt_name,

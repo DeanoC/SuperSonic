@@ -219,6 +219,17 @@ pub(crate) fn ffi_profile_time_result<T, F>(
 where
     F: FnOnce() -> Result<T, GpuError>,
 {
+    ffi_profile_time_result_key(op.to_string(), ordinal, f)
+}
+
+pub(crate) fn ffi_profile_time_result_key<T, F>(
+    op: String,
+    ordinal: usize,
+    f: F,
+) -> Result<T, GpuError>
+where
+    F: FnOnce() -> Result<T, GpuError>,
+{
     if !ffi_profile_enabled() {
         return f();
     }
@@ -233,9 +244,9 @@ where
     let mut profile = profile.lock().expect("ffi profile mutex poisoned");
     let entry = profile
         .entries
-        .entry(op.to_string())
+        .entry(op.clone())
         .or_insert_with(|| FfiProfileEntry {
-            op: op.to_string(),
+            op,
             calls: 0,
             total_ms: 0.0,
             max_ms: 0.0,
@@ -799,6 +810,14 @@ unsafe extern "C" {
         out: *mut c_void,
     ) -> c_int;
 
+    fn supersonic_qwen35_hip_argmax_bf16_rows(
+        device_ordinal: usize,
+        rows: usize,
+        cols: usize,
+        logits: *const c_void,
+        out_index: *mut c_void,
+    ) -> c_int;
+
     fn supersonic_qwen35_hip_apply_rope_prefill(
         dtype: c_int,
         device_ordinal: usize,
@@ -871,6 +890,27 @@ unsafe extern "C" {
         out: *mut c_void,
     ) -> c_int;
 
+    fn supersonic_qwen35_hip_transpose_shd_to_cache_bf16(
+        device_ordinal: usize,
+        s: usize,
+        h: usize,
+        d: usize,
+        cache_len: usize,
+        dst_pos: usize,
+        src: *const c_void,
+        cache: *mut c_void,
+    ) -> c_int;
+
+    fn supersonic_qwen35_hip_cast_transpose_gate_bf16(
+        device_ordinal: usize,
+        s: usize,
+        heads: usize,
+        head_dim: usize,
+        attn_hsd: *const c_void,
+        gate_shd: *const c_void,
+        out_shd: *mut c_void,
+    ) -> c_int;
+
     fn supersonic_qwen35_hip_compute_beta_g(
         dtype: c_int,
         device_ordinal: usize,
@@ -878,6 +918,17 @@ unsafe extern "C" {
         nv: usize,
         b: *const c_void,
         a: *const c_void,
+        dt_bias: *const c_void,
+        a_log_exp: *const c_void,
+        beta: *mut c_void,
+        g: *mut c_void,
+    ) -> c_int;
+
+    fn supersonic_qwen35_hip_compute_beta_g_ba_bf16(
+        device_ordinal: usize,
+        seq_len: usize,
+        nv: usize,
+        ba: *const c_void,
         dt_bias: *const c_void,
         a_log_exp: *const c_void,
         beta: *mut c_void,
@@ -895,6 +946,18 @@ unsafe extern "C" {
         gate_out: *mut c_void,
     ) -> c_int;
 
+    fn supersonic_qwen35_hip_split_qgate_norm_bf16(
+        device_ordinal: usize,
+        s: usize,
+        num_heads: usize,
+        head_dim: usize,
+        eps: f32,
+        src: *const c_void,
+        norm_w: *const c_void,
+        query_out: *mut c_void,
+        gate_out: *mut c_void,
+    ) -> c_int;
+
     fn supersonic_qwen35_hip_split_qkv(
         dtype: c_int,
         device_ordinal: usize,
@@ -907,7 +970,63 @@ unsafe extern "C" {
         v: *mut c_void,
     ) -> c_int;
 
+    fn supersonic_qwen35_hip_split_qkv_bf16_to_f32(
+        device_ordinal: usize,
+        s: usize,
+        key_dim: usize,
+        val_dim: usize,
+        src: *const c_void,
+        q: *mut c_void,
+        k: *mut c_void,
+        v: *mut c_void,
+    ) -> c_int;
+
+    fn supersonic_qwen35_hip_split_kv_bf16(
+        device_ordinal: usize,
+        s: usize,
+        kv_dim: usize,
+        src: *const c_void,
+        k: *mut c_void,
+        v: *mut c_void,
+    ) -> c_int;
+
+    fn supersonic_qwen35_hip_split_norm_transpose_qkv_bf16(
+        device_ordinal: usize,
+        s: usize,
+        nk: usize,
+        nv: usize,
+        khd: usize,
+        vhd: usize,
+        q_scale: f32,
+        eps: f32,
+        src: *const c_void,
+        q: *mut c_void,
+        k: *mut c_void,
+        v: *mut c_void,
+    ) -> c_int;
+
+    fn supersonic_qwen35_hip_split_qkvz_bf16(
+        device_ordinal: usize,
+        s: usize,
+        qkv_dim: usize,
+        z_dim: usize,
+        src: *const c_void,
+        qkv: *mut c_void,
+        z: *mut c_void,
+    ) -> c_int;
+
     fn supersonic_qwen35_hip_repeat_interleave_heads(
+        dtype: c_int,
+        device_ordinal: usize,
+        s: usize,
+        n_heads: usize,
+        head_dim: usize,
+        repeats: usize,
+        src: *const c_void,
+        dst: *mut c_void,
+    ) -> c_int;
+
+    fn supersonic_qwen35_hip_repeat_interleave_transpose_hsd(
         dtype: c_int,
         device_ordinal: usize,
         s: usize,
@@ -936,6 +1055,18 @@ unsafe extern "C" {
         kern_minus_1: usize,
         src: *const c_void,
         dst: *mut c_void,
+    ) -> c_int;
+
+    fn supersonic_qwen35_hip_prepare_conv_input_tail(
+        dtype: c_int,
+        device_ordinal: usize,
+        s: usize,
+        c: usize,
+        pad: usize,
+        src: *const c_void,
+        old_tail: *const c_void,
+        conv_input: *mut c_void,
+        new_tail: *mut c_void,
     ) -> c_int;
 
     fn supersonic_qwen35_hip_fused_rms_norm_linear(
@@ -995,6 +1126,48 @@ unsafe extern "C" {
         group_size: c_int,
         quant_type: c_int,
         out: *mut c_void,
+    ) -> c_int;
+
+    fn supersonic_qwen35_4b_hip_matmul_ggml_pair_dequant(
+        dtype: c_int,
+        device_ordinal: usize,
+        batch_elems: usize,
+        m: c_int,
+        n_each: c_int,
+        k: c_int,
+        lhs: *const c_void,
+        rhs_first: *const c_void,
+        rhs_second: *const c_void,
+        quant_type: c_int,
+        out: *mut c_void,
+    ) -> c_int;
+
+    fn supersonic_qwen35_4b_hip_quantize_mmq_q8_1(
+        dtype: c_int,
+        device_ordinal: usize,
+        batch_elems: usize,
+        m: c_int,
+        k: c_int,
+        lhs: *const c_void,
+        quant_type: c_int,
+        out: *mut c_void,
+    ) -> c_int;
+
+    fn supersonic_qwen35_4b_hip_matmul_mmq_q8_1_q6_k(
+        dtype: c_int,
+        device_ordinal: usize,
+        batch_elems: usize,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        q8: *const c_void,
+        rhs_q6: *const c_void,
+        out: *mut c_void,
+    ) -> c_int;
+
+    fn supersonic_qwen35_4b_hip_device_supports_wmma_i8(
+        device_ordinal: usize,
+        out_supported: *mut c_int,
     ) -> c_int;
 
     #[cfg(supersonic_backend_cuda)]
@@ -1101,6 +1274,26 @@ unsafe extern "C" {
         out: *mut c_void,
     ) -> c_int;
 
+    fn supersonic_qwen35_hip_full_attention_tree_prefill(
+        dtype: c_int,
+        device_ordinal: usize,
+        batch_size: usize,
+        q_heads: usize,
+        kv_heads: usize,
+        tree_len: usize,
+        prefix_len: usize,
+        head_dim: usize,
+        num_kv_groups: usize,
+        scale: f32,
+        query: *const c_void,
+        prefix_key: *const c_void,
+        prefix_value: *const c_void,
+        tree_key: *const c_void,
+        tree_value: *const c_void,
+        visibility: *const c_void,
+        out: *mut c_void,
+    ) -> c_int;
+
     fn supersonic_qwen35_hip_full_attention_decode_flat(
         dtype: c_int,
         device_ordinal: usize,
@@ -1145,6 +1338,20 @@ unsafe extern "C" {
         kernel_size: usize,
         mixed_qkv: *const c_void,
         weights: *const c_void,
+        out: *mut c_void,
+    ) -> c_int;
+
+    fn supersonic_qwen35_hip_linear_tree_conv_pack(
+        dtype: c_int,
+        device_ordinal: usize,
+        batch_size: usize,
+        conv_dim: usize,
+        total_len: usize,
+        tree_len: usize,
+        kernel_size: usize,
+        mixed_qkv: *const c_void,
+        weights: *const c_void,
+        parent_ids: *const c_void,
         out: *mut c_void,
     ) -> c_int;
 
@@ -1242,6 +1449,165 @@ unsafe extern "C" {
         out: *mut c_void,
     ) -> c_int;
 
+    fn supersonic_qwen35_hip_delta_recurrent_prefill_capture(
+        dtype: c_int,
+        device_ordinal: usize,
+        batch_heads: usize,
+        seq_len: usize,
+        k_head_dim: usize,
+        v_head_dim: usize,
+        initial_state: *const c_void,
+        query: *const c_void,
+        key: *const c_void,
+        value: *const c_void,
+        beta: *const c_void,
+        g: *const c_void,
+        out: *mut c_void,
+        state_trace: *mut c_void,
+    ) -> c_int;
+
+    fn supersonic_qwen35_hip_delta_recurrent_prefill_capture_bf16_trace(
+        dtype: c_int,
+        device_ordinal: usize,
+        batch_heads: usize,
+        seq_len: usize,
+        k_head_dim: usize,
+        v_head_dim: usize,
+        initial_state: *const c_void,
+        query: *const c_void,
+        key: *const c_void,
+        value: *const c_void,
+        beta: *const c_void,
+        g: *const c_void,
+        out: *mut c_void,
+        state_trace: *mut c_void,
+    ) -> c_int;
+
+    fn supersonic_qwen35_hip_delta_recurrent_prefill_capture_q8_trace(
+        dtype: c_int,
+        device_ordinal: usize,
+        batch_heads: usize,
+        seq_len: usize,
+        k_head_dim: usize,
+        v_head_dim: usize,
+        initial_state: *const c_void,
+        query: *const c_void,
+        key: *const c_void,
+        value: *const c_void,
+        beta: *const c_void,
+        g: *const c_void,
+        out: *mut c_void,
+        state_trace: *mut c_void,
+    ) -> c_int;
+
+    fn supersonic_qwen35_hip_delta_recurrent_tree_prefill_capture(
+        dtype: c_int,
+        device_ordinal: usize,
+        batch_heads: usize,
+        seq_len: usize,
+        k_head_dim: usize,
+        v_head_dim: usize,
+        initial_state: *const c_void,
+        query: *const c_void,
+        key: *const c_void,
+        value: *const c_void,
+        beta: *const c_void,
+        g: *const c_void,
+        parent_ids: *const c_void,
+        out: *mut c_void,
+        state_trace: *mut c_void,
+    ) -> c_int;
+
+    fn supersonic_qwen35_hip_dflash_apply_rollback(
+        dtype: c_int,
+        device_ordinal: usize,
+        qkv_dim: usize,
+        conv_state_len: usize,
+        conv_input_len: usize,
+        chunk_len: usize,
+        commit_len: usize,
+        num_v_heads: usize,
+        head_k_dim: usize,
+        head_v_dim: usize,
+        conv_input: *const c_void,
+        conv_state: *mut c_void,
+        recurrent_trace: *const c_void,
+        recurrent_state: *mut c_void,
+    ) -> c_int;
+
+    fn supersonic_qwen35_hip_dflash_apply_rollback_bf16_trace(
+        dtype: c_int,
+        device_ordinal: usize,
+        qkv_dim: usize,
+        conv_state_len: usize,
+        conv_input_len: usize,
+        chunk_len: usize,
+        commit_len: usize,
+        num_v_heads: usize,
+        head_k_dim: usize,
+        head_v_dim: usize,
+        conv_input: *const c_void,
+        conv_state: *mut c_void,
+        recurrent_trace: *const c_void,
+        recurrent_state: *mut c_void,
+    ) -> c_int;
+
+    fn supersonic_qwen35_hip_dflash_apply_rollback_q8_trace(
+        dtype: c_int,
+        device_ordinal: usize,
+        qkv_dim: usize,
+        conv_state_len: usize,
+        conv_input_len: usize,
+        chunk_len: usize,
+        commit_len: usize,
+        num_v_heads: usize,
+        head_k_dim: usize,
+        head_v_dim: usize,
+        conv_input: *const c_void,
+        conv_state: *mut c_void,
+        recurrent_trace: *const c_void,
+        recurrent_state: *mut c_void,
+    ) -> c_int;
+
+    fn supersonic_qwen35_hip_dflash_apply_tree_rollback(
+        dtype: c_int,
+        device_ordinal: usize,
+        qkv_dim: usize,
+        conv_state_len: usize,
+        conv_input_len: usize,
+        tree_len: usize,
+        commit_len: usize,
+        num_v_heads: usize,
+        head_k_dim: usize,
+        head_v_dim: usize,
+        conv_input: *const c_void,
+        accepted_indices: *const c_void,
+        conv_state: *mut c_void,
+        recurrent_trace: *const c_void,
+        recurrent_state: *mut c_void,
+    ) -> c_int;
+
+    fn supersonic_qwen35_hip_fill_conv_tail(
+        dtype: c_int,
+        device_ordinal: usize,
+        qkv_dim: usize,
+        pad: usize,
+        total_len: usize,
+        tail: *const c_void,
+        conv_input: *mut c_void,
+    ) -> c_int;
+
+    fn supersonic_qwen35_hip_dflash_extract_recurrent_attn(
+        device_ordinal: usize,
+        num_v_heads: usize,
+        chunk_len: usize,
+        head_k_dim: usize,
+        head_v_dim: usize,
+        delta_out: *const c_void,
+        recurrent_state: *mut c_void,
+        attn_output: *mut c_void,
+    ) -> c_int;
+
     fn supersonic_qwen35_hip_l2norm(
         dtype: c_int,
         device_ordinal: usize,
@@ -1261,6 +1627,15 @@ unsafe extern "C" {
         out: *mut c_void,
     ) -> c_int;
 
+    fn supersonic_qwen35_hip_swiglu_mul_split(
+        dtype: c_int,
+        device_ordinal: usize,
+        rows: usize,
+        cols: usize,
+        gate_up: *const c_void,
+        out: *mut c_void,
+    ) -> c_int;
+
     fn supersonic_qwen35_hip_rms_norm_gated(
         dtype: c_int,
         device_ordinal: usize,
@@ -1271,6 +1646,18 @@ unsafe extern "C" {
         gate: *const c_void,
         weight: *const c_void,
         out: *mut c_void,
+    ) -> c_int;
+
+    fn supersonic_qwen35_hip_rms_norm_gated_sfirst_bf16(
+        device_ordinal: usize,
+        s: usize,
+        nv: usize,
+        vhd: usize,
+        eps: f32,
+        hidden_hsd: *const c_void,
+        gate_sfirst: *const c_void,
+        weight: *const c_void,
+        out_sfirst: *mut c_void,
     ) -> c_int;
 
     fn supersonic_qwen35_hip_mul_scalar(
@@ -1478,6 +1865,68 @@ pub fn full_attention_prefill(
         if status != 0 {
             return Err(ffi_error(format!(
                 "full_attention_prefill failed: {status}"
+            )));
+        }
+        Ok(())
+    })
+}
+
+/// Full attention over a tree-structured verify batch.
+///
+/// Queries and tree K/V use `[batch, heads, tree_len, head_dim]` layout.
+/// Prefix K/V use `[batch, kv_heads, prefix_len, head_dim]`. Every tree query
+/// attends all prefix positions and only the tree positions marked nonzero in
+/// the row-major `visibility[tree_len, tree_len]` mask.
+#[allow(clippy::too_many_arguments)]
+pub fn full_attention_tree_prefill(
+    ordinal: usize,
+    dtype: ScalarType,
+    batch_size: usize,
+    q_heads: usize,
+    kv_heads: usize,
+    tree_len: usize,
+    prefix_len: usize,
+    head_dim: usize,
+    scale: f32,
+    query: &GpuBuffer,
+    prefix_key: &GpuBuffer,
+    prefix_value: &GpuBuffer,
+    tree_key: &GpuBuffer,
+    tree_value: &GpuBuffer,
+    visibility: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if out.backend() == Backend::Metal {
+        return Err(ffi_error(
+            "full_attention_tree_prefill is not implemented for Metal".into(),
+        ));
+    }
+    let num_kv_groups = q_heads / kv_heads;
+    ffi_profile_time_result("qwen.full_attention_tree_prefill", ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_hip_full_attention_tree_prefill(
+                dtype.kernel_dtype_code(),
+                ordinal,
+                batch_size,
+                q_heads,
+                kv_heads,
+                tree_len,
+                prefix_len,
+                head_dim,
+                num_kv_groups,
+                scale,
+                query.as_ptr(),
+                prefix_key.as_ptr(),
+                prefix_value.as_ptr(),
+                tree_key.as_ptr(),
+                tree_value.as_ptr(),
+                visibility.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!(
+                "full_attention_tree_prefill failed: {status}"
             )));
         }
         Ok(())
@@ -1785,6 +2234,55 @@ pub fn linear_prefill_conv_pack(
             return Err(ffi_error(format!(
                 "linear_prefill_conv_pack failed: {status}"
             )));
+        }
+        Ok(())
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn linear_tree_conv_pack(
+    ordinal: usize,
+    dtype: ScalarType,
+    batch_size: usize,
+    conv_dim: usize,
+    total_len: usize,
+    tree_len: usize,
+    kernel_size: usize,
+    mixed_qkv: &GpuBuffer,
+    weights: &GpuBuffer,
+    parent_ids: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if out.backend() == Backend::Metal {
+        return Err(ffi_error(
+            "linear_tree_conv_pack is not implemented for Metal".into(),
+        ));
+    }
+    if parent_ids.dtype() != ScalarType::U32 || parent_ids.elem_count() < tree_len {
+        return Err(GpuError::InvalidArg(format!(
+            "linear_tree_conv_pack parent_ids must be U32[{tree_len}], got {:?}[{}]",
+            parent_ids.dtype(),
+            parent_ids.elem_count()
+        )));
+    }
+    ffi_profile_time_result("qwen.linear_tree_conv_pack", ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_hip_linear_tree_conv_pack(
+                dtype.kernel_dtype_code(),
+                ordinal,
+                batch_size,
+                conv_dim,
+                total_len,
+                tree_len,
+                kernel_size,
+                mixed_qkv.as_ptr(),
+                weights.as_ptr(),
+                parent_ids.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!("linear_tree_conv_pack failed: {status}")));
         }
         Ok(())
     })
@@ -2124,6 +2622,537 @@ pub fn delta_recurrent_prefill(
     })
 }
 
+/// Delta recurrent state accumulation for append verification, with
+/// per-token recurrent states captured as
+/// `[batch_heads, seq_len, k_head_dim, v_head_dim]`.
+pub fn delta_recurrent_prefill_capture(
+    ordinal: usize,
+    dtype: ScalarType,
+    batch_heads: usize,
+    seq_len: usize,
+    k_head_dim: usize,
+    v_head_dim: usize,
+    initial_state: &GpuBuffer,
+    query: &GpuBuffer,
+    key: &GpuBuffer,
+    value: &GpuBuffer,
+    beta: &GpuBuffer,
+    g: &GpuBuffer,
+    out: &mut GpuBuffer,
+    state_trace: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if out.backend() == Backend::Metal {
+        return Err(ffi_error(
+            "delta_recurrent_prefill_capture is not implemented for Metal".into(),
+        ));
+    }
+    ffi_profile_time_result("qwen.delta_recurrent_prefill_capture", ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_hip_delta_recurrent_prefill_capture(
+                dtype.kernel_dtype_code(),
+                ordinal,
+                batch_heads,
+                seq_len,
+                k_head_dim,
+                v_head_dim,
+                initial_state.as_ptr(),
+                query.as_ptr(),
+                key.as_ptr(),
+                value.as_ptr(),
+                beta.as_ptr(),
+                g.as_ptr(),
+                out.as_mut_ptr(),
+                state_trace.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!(
+                "delta_recurrent_prefill_capture failed: {status}"
+            )));
+        }
+        Ok(())
+    })
+}
+
+/// Delta recurrent append verification with per-token recurrent states stored
+/// as BF16 while accumulation and the final recurrent state remain F32.
+#[allow(clippy::too_many_arguments)]
+pub fn delta_recurrent_prefill_capture_bf16_trace(
+    ordinal: usize,
+    dtype: ScalarType,
+    batch_heads: usize,
+    seq_len: usize,
+    k_head_dim: usize,
+    v_head_dim: usize,
+    initial_state: &GpuBuffer,
+    query: &GpuBuffer,
+    key: &GpuBuffer,
+    value: &GpuBuffer,
+    beta: &GpuBuffer,
+    g: &GpuBuffer,
+    out: &mut GpuBuffer,
+    state_trace: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if out.backend() == Backend::Metal {
+        return Err(ffi_error(
+            "delta_recurrent_prefill_capture_bf16_trace is not implemented for Metal".into(),
+        ));
+    }
+    if dtype != ScalarType::F32
+        || state_trace.dtype() != ScalarType::BF16
+        || k_head_dim != 128
+        || v_head_dim != 128
+    {
+        return Err(ffi_error(
+            "delta_recurrent_prefill_capture_bf16_trace requires F32 state, BF16 trace, k/v head dim 128"
+                .into(),
+        ));
+    }
+    ffi_profile_time_result(
+        "qwen.delta_recurrent_prefill_capture_bf16_trace",
+        ordinal,
+        || {
+            let status = unsafe {
+                supersonic_qwen35_hip_delta_recurrent_prefill_capture_bf16_trace(
+                    dtype.kernel_dtype_code(),
+                    ordinal,
+                    batch_heads,
+                    seq_len,
+                    k_head_dim,
+                    v_head_dim,
+                    initial_state.as_ptr(),
+                    query.as_ptr(),
+                    key.as_ptr(),
+                    value.as_ptr(),
+                    beta.as_ptr(),
+                    g.as_ptr(),
+                    out.as_mut_ptr(),
+                    state_trace.as_mut_ptr(),
+                )
+            };
+            if status != 0 {
+                return Err(ffi_error(format!(
+                    "delta_recurrent_prefill_capture_bf16_trace failed: {status}"
+                )));
+            }
+            Ok(())
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn delta_recurrent_prefill_capture_q8_trace(
+    ordinal: usize,
+    dtype: ScalarType,
+    batch_heads: usize,
+    seq_len: usize,
+    k_head_dim: usize,
+    v_head_dim: usize,
+    initial_state: &GpuBuffer,
+    query: &GpuBuffer,
+    key: &GpuBuffer,
+    value: &GpuBuffer,
+    beta: &GpuBuffer,
+    g: &GpuBuffer,
+    out: &mut GpuBuffer,
+    state_trace: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if out.backend() == Backend::Metal {
+        return Err(ffi_error(
+            "delta_recurrent_prefill_capture_q8_trace is not implemented for Metal".into(),
+        ));
+    }
+    if dtype != ScalarType::F32
+        || state_trace.dtype() != ScalarType::U8
+        || k_head_dim != 128
+        || v_head_dim != 128
+    {
+        return Err(ffi_error(
+            "delta_recurrent_prefill_capture_q8_trace requires F32 state, U8 trace, k/v head dim 128"
+                .into(),
+        ));
+    }
+    ffi_profile_time_result(
+        "qwen.delta_recurrent_prefill_capture_q8_trace",
+        ordinal,
+        || {
+            let status = unsafe {
+                supersonic_qwen35_hip_delta_recurrent_prefill_capture_q8_trace(
+                    dtype.kernel_dtype_code(),
+                    ordinal,
+                    batch_heads,
+                    seq_len,
+                    k_head_dim,
+                    v_head_dim,
+                    initial_state.as_ptr(),
+                    query.as_ptr(),
+                    key.as_ptr(),
+                    value.as_ptr(),
+                    beta.as_ptr(),
+                    g.as_ptr(),
+                    out.as_mut_ptr(),
+                    state_trace.as_mut_ptr(),
+                )
+            };
+            if status != 0 {
+                return Err(ffi_error(format!(
+                    "delta_recurrent_prefill_capture_q8_trace failed: {status}"
+                )));
+            }
+            Ok(())
+        },
+    )
+}
+
+/// Parent-aware DeltaNet accumulation for tree-structured DFlash verify.
+///
+/// `parent_ids[t]` is `-1` for a node whose parent is the already-committed
+/// root state, otherwise it indexes a previous node in `[0, seq_len)`.
+/// Currently implemented for HIP F32 K/V head dim 128, matching the optimized
+/// append-capture kernel used by Qwen3.6 DFlash.
+pub fn delta_recurrent_tree_prefill_capture(
+    ordinal: usize,
+    dtype: ScalarType,
+    batch_heads: usize,
+    seq_len: usize,
+    k_head_dim: usize,
+    v_head_dim: usize,
+    initial_state: &GpuBuffer,
+    query: &GpuBuffer,
+    key: &GpuBuffer,
+    value: &GpuBuffer,
+    beta: &GpuBuffer,
+    g: &GpuBuffer,
+    parent_ids: &GpuBuffer,
+    out: &mut GpuBuffer,
+    state_trace: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if out.backend() == Backend::Metal {
+        return Err(ffi_error(
+            "delta_recurrent_tree_prefill_capture is not implemented for Metal".into(),
+        ));
+    }
+    if dtype != ScalarType::F32 || k_head_dim != 128 || v_head_dim != 128 {
+        return Err(ffi_error(
+            "delta_recurrent_tree_prefill_capture requires F32 k_head_dim=128 v_head_dim=128"
+                .into(),
+        ));
+    }
+    ffi_profile_time_result("qwen.delta_recurrent_tree_prefill_capture", ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_hip_delta_recurrent_tree_prefill_capture(
+                dtype.kernel_dtype_code(),
+                ordinal,
+                batch_heads,
+                seq_len,
+                k_head_dim,
+                v_head_dim,
+                initial_state.as_ptr(),
+                query.as_ptr(),
+                key.as_ptr(),
+                value.as_ptr(),
+                beta.as_ptr(),
+                g.as_ptr(),
+                parent_ids.as_ptr(),
+                out.as_mut_ptr(),
+                state_trace.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!(
+                "delta_recurrent_tree_prefill_capture failed: {status}"
+            )));
+        }
+        Ok(())
+    })
+}
+
+pub fn dflash_apply_rollback(
+    ordinal: usize,
+    conv_dtype: ScalarType,
+    qkv_dim: usize,
+    conv_state_len: usize,
+    conv_input_len: usize,
+    chunk_len: usize,
+    commit_len: usize,
+    num_v_heads: usize,
+    head_k_dim: usize,
+    head_v_dim: usize,
+    conv_input: &GpuBuffer,
+    conv_state: &mut GpuBuffer,
+    recurrent_trace: &GpuBuffer,
+    recurrent_state: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if conv_input.backend() == Backend::Metal {
+        return Err(ffi_error(
+            "dflash_apply_rollback is not implemented for Metal".into(),
+        ));
+    }
+    ffi_profile_time_result("qwen.dflash_apply_rollback", ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_hip_dflash_apply_rollback(
+                conv_dtype.kernel_dtype_code(),
+                ordinal,
+                qkv_dim,
+                conv_state_len,
+                conv_input_len,
+                chunk_len,
+                commit_len,
+                num_v_heads,
+                head_k_dim,
+                head_v_dim,
+                conv_input.as_ptr(),
+                conv_state.as_mut_ptr(),
+                recurrent_trace.as_ptr(),
+                recurrent_state.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!("dflash_apply_rollback failed: {status}")));
+        }
+        Ok(())
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn dflash_apply_rollback_bf16_trace(
+    ordinal: usize,
+    conv_dtype: ScalarType,
+    qkv_dim: usize,
+    conv_state_len: usize,
+    conv_input_len: usize,
+    chunk_len: usize,
+    commit_len: usize,
+    num_v_heads: usize,
+    head_k_dim: usize,
+    head_v_dim: usize,
+    conv_input: &GpuBuffer,
+    conv_state: &mut GpuBuffer,
+    recurrent_trace: &GpuBuffer,
+    recurrent_state: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if conv_input.backend() == Backend::Metal {
+        return Err(ffi_error(
+            "dflash_apply_rollback_bf16_trace is not implemented for Metal".into(),
+        ));
+    }
+    if recurrent_trace.dtype() != ScalarType::BF16 {
+        return Err(ffi_error(
+            "dflash_apply_rollback_bf16_trace requires BF16 recurrent_trace".into(),
+        ));
+    }
+    ffi_profile_time_result("qwen.dflash_apply_rollback_bf16_trace", ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_hip_dflash_apply_rollback_bf16_trace(
+                conv_dtype.kernel_dtype_code(),
+                ordinal,
+                qkv_dim,
+                conv_state_len,
+                conv_input_len,
+                chunk_len,
+                commit_len,
+                num_v_heads,
+                head_k_dim,
+                head_v_dim,
+                conv_input.as_ptr(),
+                conv_state.as_mut_ptr(),
+                recurrent_trace.as_ptr(),
+                recurrent_state.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!(
+                "dflash_apply_rollback_bf16_trace failed: {status}"
+            )));
+        }
+        Ok(())
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn dflash_apply_rollback_q8_trace(
+    ordinal: usize,
+    conv_dtype: ScalarType,
+    qkv_dim: usize,
+    conv_state_len: usize,
+    conv_input_len: usize,
+    chunk_len: usize,
+    commit_len: usize,
+    num_v_heads: usize,
+    head_k_dim: usize,
+    head_v_dim: usize,
+    conv_input: &GpuBuffer,
+    conv_state: &mut GpuBuffer,
+    recurrent_trace: &GpuBuffer,
+    recurrent_state: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if conv_input.backend() == Backend::Metal {
+        return Err(ffi_error(
+            "dflash_apply_rollback_q8_trace is not implemented for Metal".into(),
+        ));
+    }
+    if recurrent_trace.dtype() != ScalarType::U8 {
+        return Err(ffi_error(
+            "dflash_apply_rollback_q8_trace requires U8 recurrent_trace".into(),
+        ));
+    }
+    ffi_profile_time_result("qwen.dflash_apply_rollback_q8_trace", ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_hip_dflash_apply_rollback_q8_trace(
+                conv_dtype.kernel_dtype_code(),
+                ordinal,
+                qkv_dim,
+                conv_state_len,
+                conv_input_len,
+                chunk_len,
+                commit_len,
+                num_v_heads,
+                head_k_dim,
+                head_v_dim,
+                conv_input.as_ptr(),
+                conv_state.as_mut_ptr(),
+                recurrent_trace.as_ptr(),
+                recurrent_state.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!(
+                "dflash_apply_rollback_q8_trace failed: {status}"
+            )));
+        }
+        Ok(())
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn dflash_apply_tree_rollback(
+    ordinal: usize,
+    conv_dtype: ScalarType,
+    qkv_dim: usize,
+    conv_state_len: usize,
+    conv_input_len: usize,
+    tree_len: usize,
+    commit_len: usize,
+    num_v_heads: usize,
+    head_k_dim: usize,
+    head_v_dim: usize,
+    conv_input: &GpuBuffer,
+    accepted_indices: &GpuBuffer,
+    conv_state: &mut GpuBuffer,
+    recurrent_trace: &GpuBuffer,
+    recurrent_state: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if conv_input.backend() == Backend::Metal {
+        return Err(ffi_error(
+            "dflash_apply_tree_rollback is not implemented for Metal".into(),
+        ));
+    }
+    if accepted_indices.dtype() != ScalarType::U32 || accepted_indices.elem_count() < commit_len {
+        return Err(GpuError::InvalidArg(format!(
+            "dflash_apply_tree_rollback accepted_indices must be U32[{commit_len}], got {:?}[{}]",
+            accepted_indices.dtype(),
+            accepted_indices.elem_count()
+        )));
+    }
+    ffi_profile_time_result("qwen.dflash_apply_tree_rollback", ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_hip_dflash_apply_tree_rollback(
+                conv_dtype.kernel_dtype_code(),
+                ordinal,
+                qkv_dim,
+                conv_state_len,
+                conv_input_len,
+                tree_len,
+                commit_len,
+                num_v_heads,
+                head_k_dim,
+                head_v_dim,
+                conv_input.as_ptr(),
+                accepted_indices.as_ptr(),
+                conv_state.as_mut_ptr(),
+                recurrent_trace.as_ptr(),
+                recurrent_state.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!(
+                "dflash_apply_tree_rollback failed: {status}"
+            )));
+        }
+        Ok(())
+    })
+}
+
+pub fn fill_conv_tail(
+    ordinal: usize,
+    dtype: ScalarType,
+    qkv_dim: usize,
+    pad: usize,
+    total_len: usize,
+    tail: &GpuBuffer,
+    conv_input: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if conv_input.backend() == Backend::Metal {
+        return Err(ffi_error(
+            "fill_conv_tail is not implemented for Metal".into(),
+        ));
+    }
+    ffi_profile_time_result("qwen.fill_conv_tail", ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_hip_fill_conv_tail(
+                dtype.kernel_dtype_code(),
+                ordinal,
+                qkv_dim,
+                pad,
+                total_len,
+                tail.as_ptr(),
+                conv_input.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!("fill_conv_tail failed: {status}")));
+        }
+        Ok(())
+    })
+}
+
+pub fn dflash_extract_recurrent_attn(
+    ordinal: usize,
+    num_v_heads: usize,
+    chunk_len: usize,
+    head_k_dim: usize,
+    head_v_dim: usize,
+    delta_out: &GpuBuffer,
+    recurrent_state: &mut GpuBuffer,
+    attn_output: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if delta_out.backend() != Backend::Hip {
+        return Err(ffi_error(
+            "dflash_extract_recurrent_attn is only implemented for HIP".into(),
+        ));
+    }
+    ffi_profile_time_result("qwen.dflash_extract_recurrent_attn", ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_hip_dflash_extract_recurrent_attn(
+                ordinal,
+                num_v_heads,
+                chunk_len,
+                head_k_dim,
+                head_v_dim,
+                delta_out.as_ptr(),
+                recurrent_state.as_mut_ptr(),
+                attn_output.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!(
+                "dflash_extract_recurrent_attn failed: {status}"
+            )));
+        }
+        Ok(())
+    })
+}
+
 /// L2 normalization per row.
 pub fn l2norm(
     ordinal: usize,
@@ -2208,6 +3237,39 @@ pub fn swiglu_mul(
     })
 }
 
+/// SwiGLU from a packed `[rows, 2 * cols]` buffer where each row is
+/// `[gate..., up...]`.
+pub fn swiglu_mul_split(
+    ordinal: usize,
+    dtype: ScalarType,
+    rows: usize,
+    cols: usize,
+    gate_up: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if out.backend() == Backend::Metal {
+        return Err(ffi_error(
+            "swiglu_mul_split is only implemented for HIP/CUDA backends".to_string(),
+        ));
+    }
+    ffi_profile_time_result("qwen.swiglu_mul_split", ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_hip_swiglu_mul_split(
+                dtype.kernel_dtype_code(),
+                ordinal,
+                rows,
+                cols,
+                gate_up.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!("swiglu_mul_split failed: {status}")));
+        }
+        Ok(())
+    })
+}
+
 /// RMSNorm with SiLU gating: out = rms_norm(hidden) * weight * silu(gate).
 pub fn rms_norm_gated(
     ordinal: usize,
@@ -2264,6 +3326,45 @@ pub fn rms_norm_gated(
         };
         if status != 0 {
             return Err(ffi_error(format!("rms_norm_gated failed: {status}")));
+        }
+        Ok(())
+    })
+}
+
+pub fn rms_norm_gated_sfirst_bf16(
+    ordinal: usize,
+    s: usize,
+    nv: usize,
+    vhd: usize,
+    eps: f32,
+    hidden_hsd: &GpuBuffer,
+    gate_sfirst: &GpuBuffer,
+    weight: &GpuBuffer,
+    out_sfirst: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if out_sfirst.backend() != Backend::Hip {
+        return Err(ffi_error(
+            "rms_norm_gated_sfirst_bf16 is only implemented for HIP".into(),
+        ));
+    }
+    ffi_profile_time_result("qwen.rms_norm_gated_sfirst_bf16", ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_hip_rms_norm_gated_sfirst_bf16(
+                ordinal,
+                s,
+                nv,
+                vhd,
+                eps,
+                hidden_hsd.as_ptr(),
+                gate_sfirst.as_ptr(),
+                weight.as_ptr(),
+                out_sfirst.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!(
+                "rms_norm_gated_sfirst_bf16 failed: {status}"
+            )));
         }
         Ok(())
     })
@@ -2452,7 +3553,15 @@ pub fn matmul_rhs_transposed(
             metal_host::matmul_rhs_transposed(dtype, batch_elems, m, n, k, lhs, rhs, out)
         });
     }
-    ffi_profile_time_result("qwen.matmul_rhs_transposed", ordinal, || {
+    let profile_key = if std::env::var_os("SUPERSONIC_DFLASH_PROFILE_FFI_SHAPES").is_some() {
+        format!(
+            "qwen.matmul_rhs_transposed[b={} m={} n={} k={} dtype={:?}]",
+            batch_elems, m, n, k, dtype
+        )
+    } else {
+        "qwen.matmul_rhs_transposed".to_string()
+    };
+    ffi_profile_time_result_key(profile_key, ordinal, || {
         let status = unsafe {
             supersonic_qwen35_4b_hip_matmul_rhs_transposed_tiled(
                 dtype.kernel_dtype_code(),
@@ -2625,7 +3734,15 @@ pub fn matmul_rhs_transposed_int4(
             )
         });
     }
-    ffi_profile_time_result("qwen.matmul_rhs_transposed_int4", ordinal, || {
+    let profile_key = if std::env::var_os("SUPERSONIC_DFLASH_PROFILE_FFI_SHAPES").is_some() {
+        format!(
+            "qwen.matmul_rhs_transposed_int4[b={} m={} n={} k={} g={} qt={}]",
+            batch_elems, m, n, k, group_size, quant_type
+        )
+    } else {
+        "qwen.matmul_rhs_transposed_int4".to_string()
+    };
+    ffi_profile_time_result_key(profile_key, ordinal, || {
         let status = unsafe {
             supersonic_qwen35_4b_hip_matmul_int4_dequant(
                 ScalarType::BF16.kernel_dtype_code(),
@@ -2653,6 +3770,165 @@ pub fn matmul_rhs_transposed_int4(
         }
         Ok(())
     })
+}
+
+/// GGML low-bit pair matmul: out `[batch, m, 2 * n_each]` contains
+/// `[lhs * rhs_first^T, lhs * rhs_second^T]` per row.
+pub fn matmul_rhs_transposed_ggml_pair(
+    ordinal: usize,
+    batch_elems: usize,
+    m: usize,
+    n_each: usize,
+    k: usize,
+    lhs: &GpuBuffer,
+    rhs_first: &GpuBuffer,
+    rhs_second: &GpuBuffer,
+    quant_type: i32,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if out.backend() == Backend::Metal {
+        return Err(ffi_error(
+            "matmul_rhs_transposed_ggml_pair is only implemented for HIP/CUDA backends".to_string(),
+        ));
+    }
+    let profile_key = if std::env::var_os("SUPERSONIC_DFLASH_PROFILE_FFI_SHAPES").is_some() {
+        format!(
+            "qwen.matmul_rhs_transposed_ggml_pair[b={} m={} n_each={} k={} qt={}]",
+            batch_elems, m, n_each, k, quant_type
+        )
+    } else {
+        "qwen.matmul_rhs_transposed_ggml_pair".to_string()
+    };
+    ffi_profile_time_result_key(profile_key, ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_4b_hip_matmul_ggml_pair_dequant(
+                ScalarType::BF16.kernel_dtype_code(),
+                ordinal,
+                batch_elems,
+                m as c_int,
+                n_each as c_int,
+                k as c_int,
+                lhs.as_ptr(),
+                rhs_first.as_ptr(),
+                rhs_second.as_ptr(),
+                quant_type as c_int,
+                out.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!(
+                "matmul_rhs_transposed_ggml_pair failed: {status}"
+            )));
+        }
+        Ok(())
+    })
+}
+
+/// Harness-facing Q8_1/MMQ activation quantization.
+///
+/// The output layout uses 144 bytes per `[128]` activation block, matching
+/// llama.cpp's `block_q8_1_mmq` size. Q4_K/Q5_K store DS4 metadata; Q6_K
+/// stores D4 metadata. This is not wired into runtime dispatch.
+pub fn quantize_mmq_q8_1(
+    ordinal: usize,
+    batch_elems: usize,
+    m: usize,
+    k: usize,
+    lhs: &GpuBuffer,
+    quant_type: i32,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if out.backend() == Backend::Metal {
+        return Err(ffi_error(
+            "quantize_mmq_q8_1 is only implemented for HIP/CUDA backends".to_string(),
+        ));
+    }
+    let profile_key = if std::env::var_os("SUPERSONIC_DFLASH_PROFILE_FFI_SHAPES").is_some() {
+        format!(
+            "qwen.quantize_mmq_q8_1[b={} m={} k={} qt={}]",
+            batch_elems, m, k, quant_type
+        )
+    } else {
+        "qwen.quantize_mmq_q8_1".to_string()
+    };
+    ffi_profile_time_result_key(profile_key, ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_4b_hip_quantize_mmq_q8_1(
+                ScalarType::BF16.kernel_dtype_code(),
+                ordinal,
+                batch_elems,
+                m as c_int,
+                k as c_int,
+                lhs.as_ptr(),
+                quant_type as c_int,
+                out.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!("quantize_mmq_q8_1 failed: {status}")));
+        }
+        Ok(())
+    })
+}
+
+/// Harness-facing Q6_K MMQ consumer for the Q8_1 activation workspace.
+///
+/// This is intentionally not wired into runtime dispatch yet; it exists to
+/// validate the Lucebox/llama-style `mmq_y=128` Q6_K tile path in isolation.
+pub fn matmul_mmq_q8_1_q6_k(
+    ordinal: usize,
+    batch_elems: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    q8: &GpuBuffer,
+    rhs_q6: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if out.backend() == Backend::Metal {
+        return Err(ffi_error(
+            "matmul_mmq_q8_1_q6_k is only implemented for HIP/CUDA backends".to_string(),
+        ));
+    }
+    let profile_key = if std::env::var_os("SUPERSONIC_DFLASH_PROFILE_FFI_SHAPES").is_some() {
+        format!("qwen.matmul_mmq_q8_1_q6_k[b={batch_elems} m={m} n={n} k={k}]")
+    } else {
+        "qwen.matmul_mmq_q8_1_q6_k".to_string()
+    };
+    ffi_profile_time_result_key(profile_key, ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_4b_hip_matmul_mmq_q8_1_q6_k(
+                ScalarType::BF16.kernel_dtype_code(),
+                ordinal,
+                batch_elems,
+                m as c_int,
+                n as c_int,
+                k as c_int,
+                q8.as_ptr(),
+                rhs_q6.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!("matmul_mmq_q8_1_q6_k failed: {status}")));
+        }
+        Ok(())
+    })
+}
+
+pub fn device_supports_wmma_i8(ordinal: usize) -> Result<bool, GpuError> {
+    if gpu_hal::current_backend() != Backend::Hip {
+        return Ok(false);
+    }
+    let mut supported: c_int = 0;
+    let status =
+        unsafe { supersonic_qwen35_4b_hip_device_supports_wmma_i8(ordinal, &mut supported) };
+    if status != 0 {
+        return Err(ffi_error(format!(
+            "device_supports_wmma_i8 failed: {status}"
+        )));
+    }
+    Ok(supported != 0)
 }
 
 pub fn matmul_rhs_transposed_int8(
@@ -3165,6 +4441,61 @@ pub fn element_add(
     })
 }
 
+pub fn argmax_bf16_rows(
+    ordinal: usize,
+    rows: usize,
+    cols: usize,
+    logits: &GpuBuffer,
+    out_index: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if gpu_hal::current_backend() != Backend::Hip {
+        return Err(ffi_error(
+            "argmax_bf16_rows requires the HIP backend".to_string(),
+        ));
+    }
+    if rows == 0 || cols == 0 {
+        return Err(GpuError::InvalidArg(
+            "argmax_bf16_rows requires non-zero rows and cols".into(),
+        ));
+    }
+    if logits.dtype() != ScalarType::BF16 {
+        return Err(GpuError::InvalidArg(format!(
+            "argmax_bf16_rows logits must be BF16, got {:?}",
+            logits.dtype()
+        )));
+    }
+    if logits.elem_count() < rows.saturating_mul(cols) {
+        return Err(GpuError::InvalidArg(format!(
+            "argmax_bf16_rows logits has {} elems, need {}",
+            logits.elem_count(),
+            rows.saturating_mul(cols)
+        )));
+    }
+    if out_index.dtype() != ScalarType::U32 || out_index.elem_count() < rows {
+        return Err(GpuError::InvalidArg(format!(
+            "argmax_bf16_rows output must be U32[{rows}], got {:?}[{}]",
+            out_index.dtype(),
+            out_index.elem_count()
+        )));
+    }
+
+    ffi_profile_time_result("qwen.argmax_bf16_rows", ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_hip_argmax_bf16_rows(
+                ordinal,
+                rows,
+                cols,
+                logits.as_ptr(),
+                out_index.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!("argmax_bf16_rows failed: {status}")));
+        }
+        Ok(())
+    })
+}
+
 // ---- RoPE for prefill ----
 
 /// Apply RoPE in-place on tensor [seq_len, num_heads, head_dim].
@@ -3548,6 +4879,58 @@ pub fn transpose_shd_hsd(
     })
 }
 
+/// Transpose BF16 from [S, H, D] directly into a cache laid out as
+/// [H, cache_len, D] at rows [dst_pos, dst_pos + S).
+pub fn transpose_shd_to_cache_bf16(
+    ordinal: usize,
+    s: usize,
+    h: usize,
+    d: usize,
+    cache_len: usize,
+    dst_pos: usize,
+    src: &GpuBuffer,
+    cache: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if cache.backend() == Backend::Metal {
+        return Err(ffi_error(
+            "transpose_shd_to_cache_bf16 is currently implemented only for HIP/CUDA".into(),
+        ));
+    }
+    if src.dtype() != ScalarType::BF16 || cache.dtype() != ScalarType::BF16 {
+        return Err(GpuError::InvalidArg(format!(
+            "transpose_shd_to_cache_bf16 expects BF16 buffers; got src={:?} cache={:?}",
+            src.dtype(),
+            cache.dtype()
+        )));
+    }
+    if dst_pos.checked_add(s).is_none_or(|end| end > cache_len) {
+        return Err(GpuError::InvalidArg(format!(
+            "transpose_shd_to_cache_bf16 dst range [{dst_pos}, {}) exceeds cache_len {cache_len}",
+            dst_pos + s
+        )));
+    }
+    ffi_profile_time_result("qwen.transpose_shd_to_cache_bf16", ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_hip_transpose_shd_to_cache_bf16(
+                ordinal,
+                s,
+                h,
+                d,
+                cache_len,
+                dst_pos,
+                src.as_ptr(),
+                cache.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!(
+                "transpose_shd_to_cache_bf16 failed: {status}"
+            )));
+        }
+        Ok(())
+    })
+}
+
 // ---- Transpose + pad for conv input ----
 
 /// Transpose [S, C] -> [C, pad + S] with zero-padding on the left.
@@ -3639,6 +5022,47 @@ pub fn extract_conv_state(
     })
 }
 
+/// Prepare `[C, pad + S]` conv input from an existing tail and current `[S, C]`
+/// QKV rows, while also extracting the next `[C, pad]` tail.
+pub fn prepare_conv_input_tail(
+    ordinal: usize,
+    dtype: ScalarType,
+    s: usize,
+    c: usize,
+    pad: usize,
+    src: &GpuBuffer,
+    old_tail: &GpuBuffer,
+    conv_input: &mut GpuBuffer,
+    new_tail: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if conv_input.backend() == Backend::Metal {
+        return Err(ffi_error(
+            "prepare_conv_input_tail is only implemented for HIP/CUDA backends".to_string(),
+        ));
+    }
+    ffi_profile_time_result("qwen.prepare_conv_input_tail", ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_hip_prepare_conv_input_tail(
+                dtype.kernel_dtype_code(),
+                ordinal,
+                s,
+                c,
+                pad,
+                src.as_ptr(),
+                old_tail.as_ptr(),
+                conv_input.as_mut_ptr(),
+                new_tail.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!(
+                "prepare_conv_input_tail failed: {status}"
+            )));
+        }
+        Ok(())
+    })
+}
+
 // ---- Sigmoid-gate multiply ----
 
 /// out[i] = data[i] * sigmoid(gate[i]). Fused for gated attention.
@@ -3677,6 +5101,86 @@ pub fn sigmoid_mul(
         };
         if status != 0 {
             return Err(ffi_error(format!("sigmoid_mul failed: {status}")));
+        }
+        Ok(())
+    })
+}
+
+/// In-place variant of [`sigmoid_mul`]. Safe for HIP because each lane reads
+/// and writes only its own `data[idx]` element.
+pub fn sigmoid_mul_inplace(
+    ordinal: usize,
+    dtype: ScalarType,
+    total_elems: usize,
+    data: &mut GpuBuffer,
+    gate: &GpuBuffer,
+) -> Result<(), GpuError> {
+    if data.backend() == Backend::Metal {
+        return Err(ffi_error(
+            "sigmoid_mul_inplace is currently implemented only for HIP".into(),
+        ));
+    }
+    ffi_profile_time_result("qwen.sigmoid_mul_inplace", ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_hip_sigmoid_mul(
+                dtype.kernel_dtype_code(),
+                ordinal,
+                total_elems,
+                data.as_ptr(),
+                gate.as_ptr(),
+                data.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!("sigmoid_mul_inplace failed: {status}")));
+        }
+        Ok(())
+    })
+}
+
+/// Fused full-attention post processing for HIP:
+/// F32 `[heads, S, D]` attention output -> BF16 `[S, heads, D]`, then gate.
+pub fn cast_transpose_gate_hsd_to_shd_bf16(
+    ordinal: usize,
+    s: usize,
+    heads: usize,
+    head_dim: usize,
+    attn_hsd: &GpuBuffer,
+    gate_shd: &GpuBuffer,
+    out_shd: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if out_shd.backend() == Backend::Metal {
+        return Err(ffi_error(
+            "cast_transpose_gate_hsd_to_shd_bf16 is currently implemented only for HIP".into(),
+        ));
+    }
+    if attn_hsd.dtype() != ScalarType::F32
+        || gate_shd.dtype() != ScalarType::BF16
+        || out_shd.dtype() != ScalarType::BF16
+    {
+        return Err(ffi_error(format!(
+            "cast_transpose_gate_hsd_to_shd_bf16 expects F32 attention, BF16 gate/out; got {:?}, {:?}, {:?}",
+            attn_hsd.dtype(),
+            gate_shd.dtype(),
+            out_shd.dtype()
+        )));
+    }
+    ffi_profile_time_result("qwen.cast_transpose_gate_bf16", ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_hip_cast_transpose_gate_bf16(
+                ordinal,
+                s,
+                heads,
+                head_dim,
+                attn_hsd.as_ptr(),
+                gate_shd.as_ptr(),
+                out_shd.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!(
+                "cast_transpose_gate_hsd_to_shd_bf16 failed: {status}"
+            )));
         }
         Ok(())
     })
@@ -3764,6 +5268,38 @@ pub fn compute_beta_g(
     })
 }
 
+pub fn compute_beta_g_ba_bf16(
+    ordinal: usize,
+    seq_len: usize,
+    nv: usize,
+    ba: &GpuBuffer,
+    dt_bias: &GpuBuffer,
+    a_log_exp: &GpuBuffer,
+    beta: &mut GpuBuffer,
+    g: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    ffi_profile_time_result("qwen.compute_beta_g_ba_bf16", ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_hip_compute_beta_g_ba_bf16(
+                ordinal,
+                seq_len,
+                nv,
+                ba.as_ptr(),
+                dt_bias.as_ptr(),
+                a_log_exp.as_ptr(),
+                beta.as_mut_ptr(),
+                g.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!(
+                "compute_beta_g_ba_bf16 failed: {status}"
+            )));
+        }
+        Ok(())
+    })
+}
+
 // ---- Split gated Q projection ----
 
 /// Split [S, num_heads, 2*head_dim] into query [S, num_heads, head_dim] and gate [S, num_heads, head_dim].
@@ -3806,6 +5342,61 @@ pub fn split_qgate(
         };
         if status != 0 {
             return Err(ffi_error(format!("split_qgate failed: {status}")));
+        }
+        Ok(())
+    })
+}
+
+/// Split gated full-attention Q projection and plain-RMSNorm the query rows.
+///
+/// Inputs are BF16 `[S, heads, 2*head_dim]`; outputs are BF16 query and gate
+/// buffers in `[S, heads, head_dim]`. This matches `split_qgate` followed by
+/// `rms_norm_rows_plain(..., rows=S*heads, cols=head_dim)` on the query side.
+pub fn split_qgate_norm_bf16(
+    ordinal: usize,
+    s: usize,
+    num_heads: usize,
+    head_dim: usize,
+    eps: f32,
+    src: &GpuBuffer,
+    norm_w: &GpuBuffer,
+    query_out: &mut GpuBuffer,
+    gate_out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if query_out.backend() == Backend::Metal {
+        return Err(ffi_error(
+            "split_qgate_norm_bf16 is currently implemented only for HIP/CUDA".into(),
+        ));
+    }
+    if src.dtype() != ScalarType::BF16
+        || norm_w.dtype() != ScalarType::BF16
+        || query_out.dtype() != ScalarType::BF16
+        || gate_out.dtype() != ScalarType::BF16
+    {
+        return Err(ffi_error(format!(
+            "split_qgate_norm_bf16 expects BF16 buffers; got src={:?} norm={:?} query={:?} gate={:?}",
+            src.dtype(),
+            norm_w.dtype(),
+            query_out.dtype(),
+            gate_out.dtype()
+        )));
+    }
+    ffi_profile_time_result("qwen.split_qgate_norm_bf16", ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_hip_split_qgate_norm_bf16(
+                ordinal,
+                s,
+                num_heads,
+                head_dim,
+                eps,
+                src.as_ptr(),
+                norm_w.as_ptr(),
+                query_out.as_mut_ptr(),
+                gate_out.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!("split_qgate_norm_bf16 failed: {status}")));
         }
         Ok(())
     })
@@ -3861,6 +5452,150 @@ pub fn split_qkv(
     })
 }
 
+pub fn split_qkv_bf16_to_f32(
+    ordinal: usize,
+    s: usize,
+    key_dim: usize,
+    val_dim: usize,
+    src: &GpuBuffer,
+    q: &mut GpuBuffer,
+    k: &mut GpuBuffer,
+    v: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if q.backend() != Backend::Hip {
+        return Err(ffi_error(
+            "split_qkv_bf16_to_f32 is only implemented for HIP".into(),
+        ));
+    }
+    ffi_profile_time_result("qwen.split_qkv_bf16_to_f32", ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_hip_split_qkv_bf16_to_f32(
+                ordinal,
+                s,
+                key_dim,
+                val_dim,
+                src.as_ptr(),
+                q.as_mut_ptr(),
+                k.as_mut_ptr(),
+                v.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!("split_qkv_bf16_to_f32 failed: {status}")));
+        }
+        Ok(())
+    })
+}
+
+pub fn split_kv_bf16(
+    ordinal: usize,
+    s: usize,
+    kv_dim: usize,
+    src: &GpuBuffer,
+    k: &mut GpuBuffer,
+    v: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if k.backend() != Backend::Hip {
+        return Err(ffi_error(
+            "split_kv_bf16 is only implemented for HIP".into(),
+        ));
+    }
+    ffi_profile_time_result("qwen.split_kv_bf16", ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_hip_split_kv_bf16(
+                ordinal,
+                s,
+                kv_dim,
+                src.as_ptr(),
+                k.as_mut_ptr(),
+                v.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!("split_kv_bf16 failed: {status}")));
+        }
+        Ok(())
+    })
+}
+
+pub fn split_norm_transpose_qkv_bf16(
+    ordinal: usize,
+    s: usize,
+    nk: usize,
+    nv: usize,
+    khd: usize,
+    vhd: usize,
+    q_scale: f32,
+    eps: f32,
+    src: &GpuBuffer,
+    q: &mut GpuBuffer,
+    k: &mut GpuBuffer,
+    v: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if q.backend() != Backend::Hip {
+        return Err(ffi_error(
+            "split_norm_transpose_qkv_bf16 is only implemented for HIP".into(),
+        ));
+    }
+    ffi_profile_time_result("qwen.split_norm_transpose_qkv_bf16", ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_hip_split_norm_transpose_qkv_bf16(
+                ordinal,
+                s,
+                nk,
+                nv,
+                khd,
+                vhd,
+                q_scale,
+                eps,
+                src.as_ptr(),
+                q.as_mut_ptr(),
+                k.as_mut_ptr(),
+                v.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!(
+                "split_norm_transpose_qkv_bf16 failed: {status}"
+            )));
+        }
+        Ok(())
+    })
+}
+
+pub fn split_qkvz_bf16(
+    ordinal: usize,
+    s: usize,
+    qkv_dim: usize,
+    z_dim: usize,
+    src: &GpuBuffer,
+    qkv: &mut GpuBuffer,
+    z: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if qkv.backend() != Backend::Hip {
+        return Err(ffi_error(
+            "split_qkvz_bf16 is only implemented for HIP".into(),
+        ));
+    }
+    ffi_profile_time_result("qwen.split_qkvz_bf16", ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_hip_split_qkvz_bf16(
+                ordinal,
+                s,
+                qkv_dim,
+                z_dim,
+                src.as_ptr(),
+                qkv.as_mut_ptr(),
+                z.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!("split_qkvz_bf16 failed: {status}")));
+        }
+        Ok(())
+    })
+}
+
 // ---- Repeat interleave heads ----
 
 /// Repeat each head `repeats` times: [S, n_heads, head_dim] → [S, n_heads * repeats, head_dim].
@@ -3907,6 +5642,60 @@ pub fn repeat_interleave_heads(
         if status != 0 {
             return Err(ffi_error(format!(
                 "repeat_interleave_heads failed: {status}"
+            )));
+        }
+        Ok(())
+    })
+}
+
+pub fn repeat_interleave_transpose_hsd(
+    ordinal: usize,
+    dtype: ScalarType,
+    s: usize,
+    n_heads: usize,
+    head_dim: usize,
+    repeats: usize,
+    src: &GpuBuffer,
+    dst: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if dst.backend() == Backend::Metal {
+        let mut expanded = GpuBuffer::zeros(ordinal, dtype, &[s, n_heads * repeats, head_dim])?;
+        repeat_interleave_heads(
+            ordinal,
+            dtype,
+            s,
+            n_heads,
+            head_dim,
+            repeats,
+            src,
+            &mut expanded,
+        )?;
+        return transpose_shd_hsd(
+            ordinal,
+            dtype,
+            s,
+            n_heads * repeats,
+            head_dim,
+            &expanded,
+            dst,
+        );
+    }
+    ffi_profile_time_result("qwen.repeat_interleave_transpose_hsd", ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_hip_repeat_interleave_transpose_hsd(
+                dtype.kernel_dtype_code(),
+                ordinal,
+                s,
+                n_heads,
+                head_dim,
+                repeats,
+                src.as_ptr(),
+                dst.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!(
+                "repeat_interleave_transpose_hsd failed: {status}"
             )));
         }
         Ok(())

@@ -515,7 +515,8 @@ int delta_recurrent_prefill_device(
     const void* value,
     const void* beta,
     const void* g,
-    void* out
+    void* out,
+    void* state_trace
 ) {
     ScopedHipDevice scoped(device_ordinal);
     if (k_head_dim > 256) return 69;
@@ -539,8 +540,82 @@ int delta_recurrent_prefill_device(
         static_cast<const T*>(value),
         static_cast<const T*>(beta),
         static_cast<const T*>(g),
-        static_cast<T*>(out));
+        static_cast<T*>(out),
+        static_cast<T*>(state_trace));
     if (cudaGetLastError() != cudaSuccess) return 67;
+    return 0;
+}
+
+template <typename T>
+int dflash_apply_rollback_device(
+    int device_ordinal,
+    int qkv_dim,
+    int conv_state_len,
+    int conv_input_len,
+    int chunk_len,
+    int commit_len,
+    int num_v_heads,
+    int head_k_dim,
+    int head_v_dim,
+    const void* conv_input,
+    void* conv_state,
+    const void* recurrent_trace,
+    void* recurrent_state
+) {
+    ScopedHipDevice scoped(device_ordinal);
+    if (commit_len <= 0 || commit_len > chunk_len) return 73;
+    const int conv_total = qkv_dim * conv_state_len;
+    const int rec_total = num_v_heads * head_k_dim * head_v_dim;
+    const int total = conv_total > rec_total ? conv_total : rec_total;
+    constexpr int block = 256;
+    const unsigned int grid = static_cast<unsigned int>((total + block - 1) / block);
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(supersonic_qwen35_dflash_apply_rollback_kernel<T>),
+        dim3(grid),
+        dim3(block),
+        0,
+        0,
+        qkv_dim,
+        conv_state_len,
+        conv_input_len,
+        chunk_len,
+        commit_len,
+        num_v_heads,
+        head_k_dim,
+        head_v_dim,
+        static_cast<const T*>(conv_input),
+        static_cast<T*>(conv_state),
+        static_cast<const float*>(recurrent_trace),
+        static_cast<float*>(recurrent_state));
+    if (cudaGetLastError() != cudaSuccess) return 74;
+    return 0;
+}
+
+template <typename T>
+int fill_conv_tail_device(
+    int device_ordinal,
+    int qkv_dim,
+    int pad,
+    int total_len,
+    const void* tail,
+    void* conv_input
+) {
+    ScopedHipDevice scoped(device_ordinal);
+    const int total = qkv_dim * pad;
+    constexpr int block = 256;
+    const unsigned int grid = static_cast<unsigned int>((total + block - 1) / block);
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(supersonic_qwen35_fill_conv_tail_kernel<T>),
+        dim3(grid),
+        dim3(block),
+        0,
+        0,
+        qkv_dim,
+        pad,
+        total_len,
+        static_cast<const T*>(tail),
+        static_cast<T*>(conv_input));
+    if (cudaGetLastError() != cudaSuccess) return 76;
     return 0;
 }
 
@@ -2274,7 +2349,8 @@ extern "C" int supersonic_qwen35_hip_delta_recurrent_prefill(
             value,
             beta,
             g,
-            out);
+            out,
+            nullptr);
     case 1:
         return delta_recurrent_prefill_device<float>(
             static_cast<int>(device_ordinal),
@@ -2288,7 +2364,8 @@ extern "C" int supersonic_qwen35_hip_delta_recurrent_prefill(
             value,
             beta,
             g,
-            out);
+            out,
+            nullptr);
     case 2:
         return delta_recurrent_prefill_device<hip_bfloat16>(
             static_cast<int>(device_ordinal),
@@ -2302,7 +2379,178 @@ extern "C" int supersonic_qwen35_hip_delta_recurrent_prefill(
             value,
             beta,
             g,
-            out);
+            out,
+            nullptr);
+    default:
+        return 66;
+    }
+}
+
+extern "C" int supersonic_qwen35_hip_delta_recurrent_prefill_capture(
+    int dtype,
+    size_t device_ordinal,
+    size_t batch_heads,
+    size_t seq_len,
+    size_t k_head_dim,
+    size_t v_head_dim,
+    const void* initial_state,
+    const void* query,
+    const void* key,
+    const void* value,
+    const void* beta,
+    const void* g,
+    void* out,
+    void* state_trace) {
+    switch (dtype) {
+    case 0:
+        return delta_recurrent_prefill_device<half>(
+            static_cast<int>(device_ordinal),
+            static_cast<int>(batch_heads),
+            static_cast<int>(seq_len),
+            static_cast<int>(k_head_dim),
+            static_cast<int>(v_head_dim),
+            initial_state,
+            query,
+            key,
+            value,
+            beta,
+            g,
+            out,
+            state_trace);
+    case 1:
+        return delta_recurrent_prefill_device<float>(
+            static_cast<int>(device_ordinal),
+            static_cast<int>(batch_heads),
+            static_cast<int>(seq_len),
+            static_cast<int>(k_head_dim),
+            static_cast<int>(v_head_dim),
+            initial_state,
+            query,
+            key,
+            value,
+            beta,
+            g,
+            out,
+            state_trace);
+    case 2:
+        return delta_recurrent_prefill_device<hip_bfloat16>(
+            static_cast<int>(device_ordinal),
+            static_cast<int>(batch_heads),
+            static_cast<int>(seq_len),
+            static_cast<int>(k_head_dim),
+            static_cast<int>(v_head_dim),
+            initial_state,
+            query,
+            key,
+            value,
+            beta,
+            g,
+            out,
+            state_trace);
+    default:
+        return 66;
+    }
+}
+
+extern "C" int supersonic_qwen35_hip_dflash_apply_rollback(
+    int dtype,
+    size_t device_ordinal,
+    size_t qkv_dim,
+    size_t conv_state_len,
+    size_t conv_input_len,
+    size_t chunk_len,
+    size_t commit_len,
+    size_t num_v_heads,
+    size_t head_k_dim,
+    size_t head_v_dim,
+    const void* conv_input,
+    void* conv_state,
+    const void* recurrent_trace,
+    void* recurrent_state) {
+    switch (dtype) {
+    case 0:
+        return dflash_apply_rollback_device<half>(
+            static_cast<int>(device_ordinal),
+            static_cast<int>(qkv_dim),
+            static_cast<int>(conv_state_len),
+            static_cast<int>(conv_input_len),
+            static_cast<int>(chunk_len),
+            static_cast<int>(commit_len),
+            static_cast<int>(num_v_heads),
+            static_cast<int>(head_k_dim),
+            static_cast<int>(head_v_dim),
+            conv_input,
+            conv_state,
+            recurrent_trace,
+            recurrent_state);
+    case 1:
+        return dflash_apply_rollback_device<float>(
+            static_cast<int>(device_ordinal),
+            static_cast<int>(qkv_dim),
+            static_cast<int>(conv_state_len),
+            static_cast<int>(conv_input_len),
+            static_cast<int>(chunk_len),
+            static_cast<int>(commit_len),
+            static_cast<int>(num_v_heads),
+            static_cast<int>(head_k_dim),
+            static_cast<int>(head_v_dim),
+            conv_input,
+            conv_state,
+            recurrent_trace,
+            recurrent_state);
+    case 2:
+        return dflash_apply_rollback_device<hip_bfloat16>(
+            static_cast<int>(device_ordinal),
+            static_cast<int>(qkv_dim),
+            static_cast<int>(conv_state_len),
+            static_cast<int>(conv_input_len),
+            static_cast<int>(chunk_len),
+            static_cast<int>(commit_len),
+            static_cast<int>(num_v_heads),
+            static_cast<int>(head_k_dim),
+            static_cast<int>(head_v_dim),
+            conv_input,
+            conv_state,
+            recurrent_trace,
+            recurrent_state);
+    default:
+        return 66;
+    }
+}
+
+extern "C" int supersonic_qwen35_hip_fill_conv_tail(
+    int dtype,
+    size_t device_ordinal,
+    size_t qkv_dim,
+    size_t pad,
+    size_t total_len,
+    const void* tail,
+    void* conv_input) {
+    switch (dtype) {
+    case 0:
+        return fill_conv_tail_device<half>(
+            static_cast<int>(device_ordinal),
+            static_cast<int>(qkv_dim),
+            static_cast<int>(pad),
+            static_cast<int>(total_len),
+            tail,
+            conv_input);
+    case 1:
+        return fill_conv_tail_device<float>(
+            static_cast<int>(device_ordinal),
+            static_cast<int>(qkv_dim),
+            static_cast<int>(pad),
+            static_cast<int>(total_len),
+            tail,
+            conv_input);
+    case 2:
+        return fill_conv_tail_device<hip_bfloat16>(
+            static_cast<int>(device_ordinal),
+            static_cast<int>(qkv_dim),
+            static_cast<int>(pad),
+            static_cast<int>(total_len),
+            tail,
+            conv_input);
     default:
         return 66;
     }
