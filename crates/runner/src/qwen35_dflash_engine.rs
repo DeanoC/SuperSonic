@@ -45,8 +45,8 @@ use crate::prefill_engine::{PrefillAppendVerifyResult, PrefillTreeVerifyResult};
 use crate::registry::{FamilyParams, ModelVariant, RegistryEntry};
 use crate::Cli;
 
-const DDTREE_DEFAULT_BUDGET: usize = 22;
-const DDTREE_DEFAULT_TOP_K: usize = 8;
+const DDTREE_DEFAULT_BUDGET: usize = 14;
+const DDTREE_DEFAULT_TOP_K: usize = 4;
 
 #[derive(Debug, Clone)]
 struct DFlashDDTreeProbeConfig {
@@ -560,7 +560,7 @@ pub fn run_qwen35_dflash(
         // 8d. Accept check. Chain mode compares adjacent draft positions;
         // DDTree mode follows the target posterior through matching child
         // edges and commits that accepted branch path.
-        let (accept_n, carried_seed, mut committed_block, mut accepted_tree_indices) =
+        let (accept_n, mut carried_seed, mut committed_block, mut accepted_tree_indices) =
             match &verify_output {
                 DFlashVerifyOutput::Tree(tree_output) => {
                     let (indices, carried, _terminal_index) =
@@ -600,12 +600,12 @@ pub fn run_qwen35_dflash(
                 }
             };
 
-        let accepted_len = accept_n.min(remaining_budget);
+        let mut accepted_len = accept_n.min(remaining_budget);
         committed_block.truncate(accepted_len);
         if let Some(indices) = accepted_tree_indices.as_mut() {
             indices.truncate(accepted_len);
         }
-        let finish_after_commit = accepted_len >= remaining_budget
+        let mut finish_after_commit = accepted_len >= remaining_budget
             || (!cli.ignore_eos && committed_block.iter().any(|t| eos_ids.contains(t)));
         if trace_accept {
             eprintln!(
@@ -756,47 +756,78 @@ pub fn run_qwen35_dflash(
                             indices,
                         )?
                     } else {
-                        let append_result = target_engine.verify_block_prefill_append_captured(
-                            &committed_block,
-                            l,
-                            &tap_layers,
-                        )?;
+                        let append_result = if dflash_gpu_tap_history_enabled() {
+                            target_engine
+                                .verify_block_prefill_append_captured_lazy_acceptance_gpu_taps(
+                                    &committed_block,
+                                    l,
+                                    &tap_layers,
+                                    &mut tap_history_gpu,
+                                    tap_history_len,
+                                    per_tap_row_bytes,
+                                )?
+                        } else {
+                            target_engine.verify_block_prefill_append_captured_lazy_acceptance(
+                                &committed_block,
+                                l,
+                                &tap_layers,
+                            )?
+                        };
                         let append_next = append_result.target_next.as_ref().ok_or_else(|| {
                             anyhow!("append reverify did not return greedy target IDs")
                         })?;
-                        let append_seed = append_next
-                            .get(accepted_len - 1)
-                            .copied()
-                            .ok_or_else(|| anyhow!("append reverify returned no carried seed"))?;
-                        if append_seed != carried_seed {
-                            bail!(
-                                "DDTree carried seed mismatch after append reverify: tree={} append={}",
-                                carried_seed,
-                                append_seed
-                            );
+                        let (append_accept_len, append_seed) =
+                            append_reverify_accept_len(append_next, &committed_block)?;
+                        if append_accept_len != accepted_len || append_seed != carried_seed {
+                            if append_accept_len != accepted_len {
+                                eprintln!(
+                                    "[dflash-ddtree-verify] append reverify trimmed accept from {} \
+                                     to {} (tree_seed={} append_seed={})",
+                                    accepted_len, append_accept_len, carried_seed, append_seed
+                                );
+                            } else {
+                                eprintln!(
+                                    "[dflash-ddtree-verify] append reverify corrected carried seed \
+                                     at accept_len={} (tree_seed={} append_seed={})",
+                                    accepted_len, carried_seed, append_seed
+                                );
+                            }
+                            accepted_len = append_accept_len;
+                            committed_block.truncate(accepted_len);
+                            if let Some(indices) = accepted_tree_indices.as_mut() {
+                                indices.truncate(accepted_len);
+                            }
+                            carried_seed = append_seed;
+                            finish_after_commit = accepted_len >= remaining_budget
+                                || (!cli.ignore_eos
+                                    && committed_block.iter().any(|t| eos_ids.contains(t)));
                         }
                         target_engine.commit_prefill_append_verify(&append_result, accepted_len)?;
-                        let per_tap = append_result
-                            .tap_hiddens_all
-                            .as_ref()
-                            .ok_or_else(|| anyhow!("append reverify did not return tap history"))?;
-                        flatten_tap_history(per_tap, accepted_len, text_config.hidden_size)?
+                        if let Some(per_tap) = append_result.tap_hiddens_all.as_ref() {
+                            flatten_tap_history(per_tap, accepted_len, text_config.hidden_size)?
+                        } else if dflash_gpu_tap_history_enabled() {
+                            Vec::new()
+                        } else {
+                            bail!("append reverify did not return tap history");
+                        }
                     };
                     let expected_tap_bytes = accepted_len * per_tap_row_bytes;
-                    if taps_bytes.len() != expected_tap_bytes {
+                    if !taps_bytes.is_empty() && taps_bytes.len() != expected_tap_bytes {
                         bail!(
                             "tree verifier accepted tap gather returned {} tap bytes, expected {}",
                             taps_bytes.len(),
                             expected_tap_bytes,
                         );
                     }
-                    upload_taps_to_gpu_history(
-                        &mut tap_history_gpu,
-                        tap_history_len,
-                        per_tap_row_bytes,
-                        &taps_bytes,
-                    )?;
-                    tap_history.extend_from_slice(&taps_bytes);
+                    if !taps_bytes.is_empty() {
+                        upload_taps_to_gpu_history(
+                            &mut tap_history_gpu,
+                            tap_history_len,
+                            per_tap_row_bytes,
+                            &taps_bytes,
+                        )?;
+                        tap_history.extend_from_slice(&taps_bytes);
+                    }
                     tap_history_len += accepted_len;
                     next_bonus_seed = Some(carried_seed);
                     ms_rollback += t_rollback.elapsed().as_secs_f64() * 1000.0;
@@ -846,7 +877,7 @@ pub fn run_qwen35_dflash(
         // it samples. Without this, generation would keep rolling past
         // an EOS that appeared inside a speculative commit block.
         committed_len = l + accepted_len;
-        accepted_total += accept_n;
+        accepted_total += accepted_len;
         let mut hit_eos = false;
         for &t in committed_block.iter() {
             generated_ids.push(t);
@@ -1166,6 +1197,34 @@ fn chain_accept_needs_more(target_next: &[u32], tokens: &[u32], verify_len: usiz
         }
     }
     accept_n > target_next.len()
+}
+
+fn append_reverify_accept_len(
+    append_next: &[u32],
+    committed_block: &[u32],
+) -> Result<(usize, u32)> {
+    if committed_block.is_empty() {
+        bail!("append reverify committed block is empty");
+    }
+    let mut accept_n = 1usize;
+    while accept_n < committed_block.len() {
+        let pred = append_next.get(accept_n - 1).copied().ok_or_else(|| {
+            anyhow!(
+                "append reverify returned {} greedy IDs, insufficient for accept_n={accept_n} committed_len={}",
+                append_next.len(),
+                committed_block.len()
+            )
+        })?;
+        if pred != committed_block[accept_n] {
+            break;
+        }
+        accept_n += 1;
+    }
+    let carried_seed = append_next
+        .get(accept_n - 1)
+        .copied()
+        .ok_or_else(|| anyhow!("append reverify returned no carried seed"))?;
+    Ok((accept_n, carried_seed))
 }
 
 fn verify_block_prefill_append_windowed(
@@ -1841,7 +1900,10 @@ fn probe_ddtree_round(
 
 #[cfg(test)]
 mod tests {
-    use super::{chain_accept_needs_more, dflash_verify_len_for_round, dflash_window_step};
+    use super::{
+        append_reverify_accept_len, chain_accept_needs_more, dflash_verify_len_for_round,
+        dflash_window_step,
+    };
     use std::sync::{Mutex, OnceLock};
 
     fn env_lock() -> &'static Mutex<()> {
@@ -1930,5 +1992,35 @@ mod tests {
             &tokens,
             tokens.len()
         ));
+    }
+
+    #[test]
+    fn append_reverify_accept_len_keeps_full_match_seed() {
+        let committed = [10, 20, 30];
+        let append_next = [20, 30, 99];
+
+        assert_eq!(
+            append_reverify_accept_len(&append_next, &committed).unwrap(),
+            (3, 99)
+        );
+    }
+
+    #[test]
+    fn append_reverify_accept_len_trims_on_first_mismatch() {
+        let committed = [10, 20, 30, 40];
+        let append_next = [20, 31, 99, 100];
+
+        assert_eq!(
+            append_reverify_accept_len(&append_next, &committed).unwrap(),
+            (2, 31)
+        );
+    }
+
+    #[test]
+    fn append_reverify_accept_len_errors_when_seed_missing() {
+        let committed = [10, 20, 30];
+        let append_next = [20];
+
+        assert!(append_reverify_accept_len(&append_next, &committed).is_err());
     }
 }

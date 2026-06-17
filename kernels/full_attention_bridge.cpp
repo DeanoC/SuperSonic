@@ -204,6 +204,88 @@ int full_attention_tree_prefill_device(
     return 0;
 }
 
+template <typename T, int BM, int BK>
+static int launch_tree_tiled(
+    int batch_size, int q_heads, int kv_heads,
+    int tree_len, int prefix_len, int head_dim, int num_kv_groups,
+    float scale,
+    const void* query,
+    const void* prefix_key,
+    const void* prefix_value,
+    const void* tree_key,
+    const void* tree_value,
+    const void* visibility,
+    void* out
+) {
+    const int grid_x = (tree_len + BM - 1) / BM;
+    dim3 grid(grid_x, q_heads, batch_size);
+    dim3 block(32, BM, 1);
+    const size_t lds_bytes = static_cast<size_t>(2) * BK * head_dim * sizeof(T);
+    if (lds_bytes > 48 * 1024) return 143;
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(supersonic_qwen35_full_attention_tree_prefill_tiled_kernel<T, BM, BK>),
+        grid, block, lds_bytes, 0,
+        batch_size, q_heads, kv_heads, tree_len, prefix_len, head_dim,
+        num_kv_groups, scale,
+        static_cast<const T*>(query),
+        static_cast<const T*>(prefix_key),
+        static_cast<const T*>(prefix_value),
+        static_cast<const T*>(tree_key),
+        static_cast<const T*>(tree_value),
+        static_cast<const uint8_t*>(visibility),
+        static_cast<float*>(out));
+    if (hipGetLastError() != hipSuccess) return 144;
+    if (hipDeviceSynchronize() != hipSuccess) return 145;
+    return 0;
+}
+
+template <typename T>
+int full_attention_tree_prefill_tiled_device(
+    int device_ordinal,
+    int batch_size,
+    int q_heads,
+    int kv_heads,
+    int tree_len,
+    int prefix_len,
+    int head_dim,
+    int num_kv_groups,
+    float scale,
+    const void* query,
+    const void* prefix_key,
+    const void* prefix_value,
+    const void* tree_key,
+    const void* tree_value,
+    const void* visibility,
+    void* out
+) {
+    constexpr int BM = 4;
+    if (head_dim > 8 * 32) return 142;
+    if (tree_len <= 0) return 0;
+
+    ScopedHipDevice scoped(device_ordinal);
+
+    hipDeviceProp_t props;
+    if (hipGetDeviceProperties(&props, device_ordinal) != hipSuccess) return 146;
+    if (props.warpSize != 32) return 147;
+
+    if (head_dim <= 64) {
+        return launch_tree_tiled<T, BM, 128>(
+            batch_size, q_heads, kv_heads, tree_len, prefix_len, head_dim,
+            num_kv_groups, scale, query, prefix_key, prefix_value,
+            tree_key, tree_value, visibility, out);
+    } else if (head_dim <= 128) {
+        return launch_tree_tiled<T, BM, 64>(
+            batch_size, q_heads, kv_heads, tree_len, prefix_len, head_dim,
+            num_kv_groups, scale, query, prefix_key, prefix_value,
+            tree_key, tree_value, visibility, out);
+    } else {
+        return launch_tree_tiled<T, BM, 32>(
+            batch_size, q_heads, kv_heads, tree_len, prefix_len, head_dim,
+            num_kv_groups, scale, query, prefix_key, prefix_value,
+            tree_key, tree_value, visibility, out);
+    }
+}
+
 // Dispatch the K-tiled kernel with the right BK template instantiation for
 // the given head_dim. BK is picked to keep LDS (= 2 * BK * head_dim * sizeof(T))
 // under the 48 KiB safety cap on RDNA3:
@@ -836,6 +918,84 @@ int delta_recurrent_tree_prefill_capture_f32_k128_device(
     return 0;
 }
 
+int delta_recurrent_tree_prefill_capture_bf16_trace_f32_k128_device(
+    int device_ordinal,
+    int batch_heads,
+    int seq_len,
+    const void* initial_state,
+    const void* query,
+    const void* key,
+    const void* value,
+    const void* beta,
+    const void* g,
+    const void* parent_ids,
+    void* out,
+    void* state_trace
+) {
+    ScopedHipDevice scoped(device_ordinal);
+    if (parent_ids == nullptr || state_trace == nullptr) return 69;
+    constexpr int threads = 128;
+    hipLaunchKernelGGL(
+        supersonic_qwen35_delta_recurrent_tree_prefill_capture_bf16_trace_transposed_f32_k128_kernel,
+        dim3(128, batch_heads),
+        dim3(threads),
+        0,
+        0,
+        batch_heads,
+        seq_len,
+        static_cast<const float*>(initial_state),
+        static_cast<const float*>(query),
+        static_cast<const float*>(key),
+        static_cast<const float*>(value),
+        static_cast<const float*>(beta),
+        static_cast<const float*>(g),
+        static_cast<const int*>(parent_ids),
+        static_cast<float*>(out),
+        static_cast<hip_bfloat16*>(state_trace));
+    if (hipGetLastError() != hipSuccess) return 67;
+    if (maybe_sync() != hipSuccess) return 68;
+    return 0;
+}
+
+int delta_recurrent_tree_prefill_capture_q8_trace_f32_k128_device(
+    int device_ordinal,
+    int batch_heads,
+    int seq_len,
+    const void* initial_state,
+    const void* query,
+    const void* key,
+    const void* value,
+    const void* beta,
+    const void* g,
+    const void* parent_ids,
+    void* out,
+    void* state_trace
+) {
+    ScopedHipDevice scoped(device_ordinal);
+    if (parent_ids == nullptr || state_trace == nullptr) return 69;
+    constexpr int threads = 128;
+    hipLaunchKernelGGL(
+        supersonic_qwen35_delta_recurrent_tree_prefill_capture_q8_trace_transposed_f32_k128_kernel,
+        dim3(128, batch_heads),
+        dim3(threads),
+        0,
+        0,
+        batch_heads,
+        seq_len,
+        static_cast<const float*>(initial_state),
+        static_cast<const float*>(query),
+        static_cast<const float*>(key),
+        static_cast<const float*>(value),
+        static_cast<const float*>(beta),
+        static_cast<const float*>(g),
+        static_cast<const int*>(parent_ids),
+        static_cast<float*>(out),
+        static_cast<uint8_t*>(state_trace));
+    if (hipGetLastError() != hipSuccess) return 67;
+    if (maybe_sync() != hipSuccess) return 68;
+    return 0;
+}
+
 template <typename T>
 int dflash_apply_rollback_device(
     int device_ordinal,
@@ -1041,6 +1201,105 @@ int dflash_apply_tree_rollback_device(
         static_cast<const uint32_t*>(accepted_indices),
         static_cast<T*>(conv_state),
         static_cast<const float*>(recurrent_trace),
+        static_cast<float*>(recurrent_state));
+    if (hipGetLastError() != hipSuccess) return 74;
+    if (maybe_sync() != hipSuccess) return 75;
+    return 0;
+}
+
+template <typename T>
+int dflash_apply_tree_rollback_bf16_trace_device(
+    int device_ordinal,
+    int qkv_dim,
+    int conv_state_len,
+    int conv_input_len,
+    int tree_len,
+    int commit_len,
+    int num_v_heads,
+    int head_k_dim,
+    int head_v_dim,
+    const void* conv_input,
+    const void* accepted_indices,
+    void* conv_state,
+    const void* recurrent_trace,
+    void* recurrent_state
+) {
+    ScopedHipDevice scoped(device_ordinal);
+    if (commit_len <= 0 || commit_len > tree_len) return 73;
+    if (conv_input_len < conv_state_len + tree_len) return 76;
+    const int conv_total = qkv_dim * conv_state_len;
+    const int rec_total = num_v_heads * head_k_dim * head_v_dim;
+    const int total = conv_total > rec_total ? conv_total : rec_total;
+    constexpr int block = 256;
+    const unsigned int grid = static_cast<unsigned int>((total + block - 1) / block);
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(supersonic_qwen35_dflash_apply_tree_rollback_bf16_trace_kernel<T>),
+        dim3(grid),
+        dim3(block),
+        0,
+        0,
+        qkv_dim,
+        conv_state_len,
+        conv_input_len,
+        tree_len,
+        commit_len,
+        num_v_heads,
+        head_k_dim,
+        head_v_dim,
+        static_cast<const T*>(conv_input),
+        static_cast<const uint32_t*>(accepted_indices),
+        static_cast<T*>(conv_state),
+        static_cast<const hip_bfloat16*>(recurrent_trace),
+        static_cast<float*>(recurrent_state));
+    if (hipGetLastError() != hipSuccess) return 74;
+    if (maybe_sync() != hipSuccess) return 75;
+    return 0;
+}
+
+template <typename T>
+int dflash_apply_tree_rollback_q8_trace_device(
+    int device_ordinal,
+    int qkv_dim,
+    int conv_state_len,
+    int conv_input_len,
+    int tree_len,
+    int commit_len,
+    int num_v_heads,
+    int head_k_dim,
+    int head_v_dim,
+    const void* conv_input,
+    const void* accepted_indices,
+    void* conv_state,
+    const void* recurrent_trace,
+    void* recurrent_state
+) {
+    ScopedHipDevice scoped(device_ordinal);
+    if (commit_len <= 0 || commit_len > tree_len) return 73;
+    if (conv_input_len < conv_state_len + tree_len) return 76;
+    if (head_k_dim % 32 != 0) return 77;
+    const int conv_total = qkv_dim * conv_state_len;
+    const int rec_total = num_v_heads * head_k_dim * head_v_dim;
+    const int total = conv_total > rec_total ? conv_total : rec_total;
+    constexpr int block = 256;
+    const unsigned int grid = static_cast<unsigned int>((total + block - 1) / block);
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(supersonic_qwen35_dflash_apply_tree_rollback_q8_trace_kernel<T>),
+        dim3(grid),
+        dim3(block),
+        0,
+        0,
+        qkv_dim,
+        conv_state_len,
+        conv_input_len,
+        tree_len,
+        commit_len,
+        num_v_heads,
+        head_k_dim,
+        head_v_dim,
+        static_cast<const T*>(conv_input),
+        static_cast<const uint32_t*>(accepted_indices),
+        static_cast<T*>(conv_state),
+        static_cast<const uint8_t*>(recurrent_trace),
         static_cast<float*>(recurrent_state));
     if (hipGetLastError() != hipSuccess) return 74;
     if (maybe_sync() != hipSuccess) return 75;
@@ -2697,6 +2956,37 @@ extern "C" int supersonic_qwen35_hip_full_attention_tree_prefill(
     const void* tree_value,
     const void* visibility,
     void* out) {
+
+    // Default: use the tree K-tiled FlashAttention-style kernel for BF16.
+    // It shares prefix K/V tile loads across several tree queries in a block,
+    // while preserving the legacy prefix-then-tree online softmax order.
+    // SUPERSONIC_DFLASH_TREE_ATTN_TILED=0 forces the legacy single-warp path.
+    static const bool disable_tiled = []{
+        const char* e = std::getenv("SUPERSONIC_DFLASH_TREE_ATTN_TILED");
+        return e != nullptr && e[0] == '0';
+    }();
+
+    if (!disable_tiled && dtype == 2) {
+        int rc = full_attention_tree_prefill_tiled_device<hip_bfloat16>(
+            static_cast<int>(device_ordinal),
+            static_cast<int>(batch_size),
+            static_cast<int>(q_heads),
+            static_cast<int>(kv_heads),
+            static_cast<int>(tree_len),
+            static_cast<int>(prefix_len),
+            static_cast<int>(head_dim),
+            static_cast<int>(num_kv_groups),
+            scale,
+            query,
+            prefix_key,
+            prefix_value,
+            tree_key,
+            tree_value,
+            visibility,
+            out);
+        if (rc == 0) return 0;
+    }
+
     switch (dtype) {
     case 0:
         return full_attention_tree_prefill_device<half>(
@@ -3161,6 +3451,74 @@ extern "C" int supersonic_qwen35_hip_delta_recurrent_tree_prefill_capture(
         state_trace);
 }
 
+extern "C" int supersonic_qwen35_hip_delta_recurrent_tree_prefill_capture_bf16_trace(
+    int dtype,
+    size_t device_ordinal,
+    size_t batch_heads,
+    size_t seq_len,
+    size_t k_head_dim,
+    size_t v_head_dim,
+    const void* initial_state,
+    const void* query,
+    const void* key,
+    const void* value,
+    const void* beta,
+    const void* g,
+    const void* parent_ids,
+    void* out,
+    void* state_trace) {
+    if (dtype != 1 || k_head_dim != 128 || v_head_dim != 128) {
+        return 66;
+    }
+    return delta_recurrent_tree_prefill_capture_bf16_trace_f32_k128_device(
+        static_cast<int>(device_ordinal),
+        static_cast<int>(batch_heads),
+        static_cast<int>(seq_len),
+        initial_state,
+        query,
+        key,
+        value,
+        beta,
+        g,
+        parent_ids,
+        out,
+        state_trace);
+}
+
+extern "C" int supersonic_qwen35_hip_delta_recurrent_tree_prefill_capture_q8_trace(
+    int dtype,
+    size_t device_ordinal,
+    size_t batch_heads,
+    size_t seq_len,
+    size_t k_head_dim,
+    size_t v_head_dim,
+    const void* initial_state,
+    const void* query,
+    const void* key,
+    const void* value,
+    const void* beta,
+    const void* g,
+    const void* parent_ids,
+    void* out,
+    void* state_trace) {
+    if (dtype != 1 || k_head_dim != 128 || v_head_dim != 128 || k_head_dim % 32 != 0) {
+        return 66;
+    }
+    return delta_recurrent_tree_prefill_capture_q8_trace_f32_k128_device(
+        static_cast<int>(device_ordinal),
+        static_cast<int>(batch_heads),
+        static_cast<int>(seq_len),
+        initial_state,
+        query,
+        key,
+        value,
+        beta,
+        g,
+        parent_ids,
+        out,
+        state_trace);
+}
+
 extern "C" int supersonic_qwen35_hip_dflash_apply_rollback(
     int dtype,
     size_t device_ordinal,
@@ -3410,6 +3768,146 @@ extern "C" int supersonic_qwen35_hip_dflash_apply_tree_rollback(
             recurrent_state);
     case 2:
         return dflash_apply_tree_rollback_device<hip_bfloat16>(
+            static_cast<int>(device_ordinal),
+            static_cast<int>(qkv_dim),
+            static_cast<int>(conv_state_len),
+            static_cast<int>(conv_input_len),
+            static_cast<int>(tree_len),
+            static_cast<int>(commit_len),
+            static_cast<int>(num_v_heads),
+            static_cast<int>(head_k_dim),
+            static_cast<int>(head_v_dim),
+            conv_input,
+            accepted_indices,
+            conv_state,
+            recurrent_trace,
+            recurrent_state);
+    default:
+        return 66;
+    }
+}
+
+extern "C" int supersonic_qwen35_hip_dflash_apply_tree_rollback_bf16_trace(
+    int dtype,
+    size_t device_ordinal,
+    size_t qkv_dim,
+    size_t conv_state_len,
+    size_t conv_input_len,
+    size_t tree_len,
+    size_t commit_len,
+    size_t num_v_heads,
+    size_t head_k_dim,
+    size_t head_v_dim,
+    const void* conv_input,
+    const void* accepted_indices,
+    void* conv_state,
+    const void* recurrent_trace,
+    void* recurrent_state) {
+    switch (dtype) {
+    case 0:
+        return dflash_apply_tree_rollback_bf16_trace_device<half>(
+            static_cast<int>(device_ordinal),
+            static_cast<int>(qkv_dim),
+            static_cast<int>(conv_state_len),
+            static_cast<int>(conv_input_len),
+            static_cast<int>(tree_len),
+            static_cast<int>(commit_len),
+            static_cast<int>(num_v_heads),
+            static_cast<int>(head_k_dim),
+            static_cast<int>(head_v_dim),
+            conv_input,
+            accepted_indices,
+            conv_state,
+            recurrent_trace,
+            recurrent_state);
+    case 1:
+        return dflash_apply_tree_rollback_bf16_trace_device<float>(
+            static_cast<int>(device_ordinal),
+            static_cast<int>(qkv_dim),
+            static_cast<int>(conv_state_len),
+            static_cast<int>(conv_input_len),
+            static_cast<int>(tree_len),
+            static_cast<int>(commit_len),
+            static_cast<int>(num_v_heads),
+            static_cast<int>(head_k_dim),
+            static_cast<int>(head_v_dim),
+            conv_input,
+            accepted_indices,
+            conv_state,
+            recurrent_trace,
+            recurrent_state);
+    case 2:
+        return dflash_apply_tree_rollback_bf16_trace_device<hip_bfloat16>(
+            static_cast<int>(device_ordinal),
+            static_cast<int>(qkv_dim),
+            static_cast<int>(conv_state_len),
+            static_cast<int>(conv_input_len),
+            static_cast<int>(tree_len),
+            static_cast<int>(commit_len),
+            static_cast<int>(num_v_heads),
+            static_cast<int>(head_k_dim),
+            static_cast<int>(head_v_dim),
+            conv_input,
+            accepted_indices,
+            conv_state,
+            recurrent_trace,
+            recurrent_state);
+    default:
+        return 66;
+    }
+}
+
+extern "C" int supersonic_qwen35_hip_dflash_apply_tree_rollback_q8_trace(
+    int dtype,
+    size_t device_ordinal,
+    size_t qkv_dim,
+    size_t conv_state_len,
+    size_t conv_input_len,
+    size_t tree_len,
+    size_t commit_len,
+    size_t num_v_heads,
+    size_t head_k_dim,
+    size_t head_v_dim,
+    const void* conv_input,
+    const void* accepted_indices,
+    void* conv_state,
+    const void* recurrent_trace,
+    void* recurrent_state) {
+    switch (dtype) {
+    case 0:
+        return dflash_apply_tree_rollback_q8_trace_device<half>(
+            static_cast<int>(device_ordinal),
+            static_cast<int>(qkv_dim),
+            static_cast<int>(conv_state_len),
+            static_cast<int>(conv_input_len),
+            static_cast<int>(tree_len),
+            static_cast<int>(commit_len),
+            static_cast<int>(num_v_heads),
+            static_cast<int>(head_k_dim),
+            static_cast<int>(head_v_dim),
+            conv_input,
+            accepted_indices,
+            conv_state,
+            recurrent_trace,
+            recurrent_state);
+    case 1:
+        return dflash_apply_tree_rollback_q8_trace_device<float>(
+            static_cast<int>(device_ordinal),
+            static_cast<int>(qkv_dim),
+            static_cast<int>(conv_state_len),
+            static_cast<int>(conv_input_len),
+            static_cast<int>(tree_len),
+            static_cast<int>(commit_len),
+            static_cast<int>(num_v_heads),
+            static_cast<int>(head_k_dim),
+            static_cast<int>(head_v_dim),
+            conv_input,
+            accepted_indices,
+            conv_state,
+            recurrent_trace,
+            recurrent_state);
+    case 2:
+        return dflash_apply_tree_rollback_q8_trace_device<hip_bfloat16>(
             static_cast<int>(device_ordinal),
             static_cast<int>(qkv_dim),
             static_cast<int>(conv_state_len),
