@@ -36,15 +36,134 @@ fn ensure_f32_on_gpu(buf: GpuBuffer, ordinal: usize) -> Result<GpuBuffer, model_
     Ok(out)
 }
 
+fn ensure_bf16_on_gpu(buf: GpuBuffer, ordinal: usize) -> Result<GpuBuffer, model_store::Error> {
+    if buf.dtype() == ScalarType::BF16 {
+        return Ok(buf);
+    }
+    if buf.dtype() != ScalarType::F32 {
+        return Err(model_store::Error::Other(format!(
+            "norm.weight: unsupported dtype {:?} (expected F32 or BF16)",
+            buf.dtype()
+        )));
+    }
+    let elems = buf.elem_count();
+    let mut out = GpuBuffer::zeros(ordinal, ScalarType::BF16, buf.shape())
+        .map_err(|e| model_store::Error::Other(format!("norm_w bf16 alloc: {e}")))?;
+    kernel_ffi::prefill_ffi::cast(
+        ordinal,
+        ScalarType::F32,
+        ScalarType::BF16,
+        elems,
+        &buf,
+        &mut out,
+    )
+    .map_err(|e| model_store::Error::Other(format!("norm_w f32->bf16 cast: {e}")))?;
+    Ok(out)
+}
+
+fn fused_ba_projection_from_store(
+    store: &model_store::BakedStore,
+    b_name: &str,
+    a_name: &str,
+    ordinal: usize,
+) -> Result<Option<GpuBuffer>, model_store::Error> {
+    let Some(b_meta) = store.meta(b_name) else {
+        return Ok(None);
+    };
+    let Some(a_meta) = store.meta(a_name) else {
+        return Ok(None);
+    };
+    if b_meta.dtype != "bf16"
+        || a_meta.dtype != "bf16"
+        || b_meta.layout != LayoutTag::Raw
+        || a_meta.layout != LayoutTag::Raw
+        || b_meta.shape != a_meta.shape
+        || b_meta.shape.len() != 2
+    {
+        return Ok(None);
+    }
+
+    let b_bytes = store
+        .raw_bytes(b_name)
+        .ok_or_else(|| model_store::Error::NotFound(b_name.to_string()))?;
+    let a_bytes = store
+        .raw_bytes(a_name)
+        .ok_or_else(|| model_store::Error::NotFound(a_name.to_string()))?;
+    let mut fused = Vec::with_capacity(b_bytes.len() + a_bytes.len());
+    fused.extend_from_slice(b_bytes);
+    fused.extend_from_slice(a_bytes);
+
+    let rows = b_meta.shape[0] * 2;
+    let cols = b_meta.shape[1];
+    GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[rows, cols], &fused)
+        .map(Some)
+        .map_err(model_store::Error::Gpu)
+}
+
+fn fused_qkvz_projection_from_store(
+    store: &model_store::BakedStore,
+    qkv_name: &str,
+    z_name: &str,
+    ordinal: usize,
+) -> Result<Option<GpuBuffer>, model_store::Error> {
+    let Some(qkv_meta) = store.meta(qkv_name) else {
+        return Ok(None);
+    };
+    let Some(z_meta) = store.meta(z_name) else {
+        return Ok(None);
+    };
+    if qkv_meta.dtype != "u8"
+        || z_meta.dtype != "u8"
+        || qkv_meta.layout != z_meta.layout
+        || !matches!(
+            qkv_meta.layout,
+            LayoutTag::GgmlQ4K | LayoutTag::GgmlQ5K | LayoutTag::GgmlQ6K
+        )
+        || qkv_meta.shape.len() != 2
+        || z_meta.shape.len() != 2
+        || qkv_meta.shape[1] != z_meta.shape[1]
+    {
+        return Ok(None);
+    }
+
+    let qkv_bytes = store
+        .raw_bytes(qkv_name)
+        .ok_or_else(|| model_store::Error::NotFound(qkv_name.to_string()))?;
+    let z_bytes = store
+        .raw_bytes(z_name)
+        .ok_or_else(|| model_store::Error::NotFound(z_name.to_string()))?;
+    let mut fused = Vec::with_capacity(qkv_bytes.len() + z_bytes.len());
+    fused.extend_from_slice(qkv_bytes);
+    fused.extend_from_slice(z_bytes);
+
+    let rows = qkv_meta.shape[0] + z_meta.shape[0];
+    let cols = qkv_meta.shape[1];
+    GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[rows, cols], &fused)
+        .map(Some)
+        .map_err(model_store::Error::Gpu)
+}
+
+fn fused_qkvz_enabled(config: &TextConfig) -> bool {
+    if std::env::var_os("SUPERSONIC_DISABLE_FUSED_QKVZ").is_some() {
+        return false;
+    }
+    std::env::var_os("SUPERSONIC_ENABLE_FUSED_QKVZ").is_some()
+        || (config.hidden_size == 5120 && config.num_hidden_layers == 64)
+}
+
 pub const LOWBIT_NATIVE_INT4: i32 = 4;
 pub const LOWBIT_HIGGS4: i32 = 20;
 pub const LOWBIT_QUIP_E8: i32 = 21;
 pub const LOWBIT_QTIP_TRELLIS2: i32 = 22;
+pub const LOWBIT_GGML_Q8_0: i32 = 8;
 pub const LOWBIT_GGML_Q4_K: i32 = 12;
 pub const LOWBIT_GGML_Q5_K: i32 = 13;
 pub const LOWBIT_GGML_Q6_K: i32 = 14;
 
 pub fn ggml_k_row_bytes(qtype: i32, cols: usize) -> Option<usize> {
+    if qtype == LOWBIT_GGML_Q8_0 {
+        return (cols % 32 == 0).then_some((cols / 32) * 34);
+    }
     if cols % 256 != 0 {
         return None;
     }
@@ -65,7 +184,12 @@ pub fn infer_lowbit_type(weight: &GpuBuffer, logical_cols: usize, native_int4: b
         return LOWBIT_NATIVE_INT4;
     }
     let row_bytes = weight.shape()[1];
-    for qtype in [LOWBIT_GGML_Q4_K, LOWBIT_GGML_Q5_K, LOWBIT_GGML_Q6_K] {
+    for qtype in [
+        LOWBIT_GGML_Q8_0,
+        LOWBIT_GGML_Q4_K,
+        LOWBIT_GGML_Q5_K,
+        LOWBIT_GGML_Q6_K,
+    ] {
         if ggml_k_row_bytes(qtype, logical_cols) == Some(row_bytes) {
             return qtype;
         }
@@ -104,6 +228,30 @@ pub struct Qwen35Weights {
     pub int8_baked_store: Option<Arc<model_store::BakedStore>>,
     /// Outlier threshold used by the mixed INT8 path.
     pub int8_outlier_threshold: f32,
+}
+
+impl Qwen35Weights {
+    pub fn lm_head_lowbit_params(
+        &self,
+        logical_cols: usize,
+    ) -> Option<(i32, &GpuBuffer, &GpuBuffer)> {
+        let qtype = infer_lowbit_type(
+            self.lm_head.as_ref(),
+            logical_cols,
+            self.lm_head_int4_scale.is_some(),
+        );
+        if qtype == 0 {
+            return None;
+        }
+        if qtype == LOWBIT_NATIVE_INT4 {
+            let scale = self.lm_head_int4_scale.as_ref()?;
+            let zero = self.lm_head_int4_zero.as_ref()?;
+            Some((qtype, scale, zero))
+        } else {
+            let weight = self.lm_head.as_ref();
+            Some((qtype, weight, weight))
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -147,13 +295,16 @@ pub struct LayerWeights {
 pub struct LinearWeights {
     pub qkv_proj_w: GpuBuffer, // [6144, hidden]
     pub z_proj_w: GpuBuffer,   // [2048, hidden]
-    pub b_proj_w: GpuBuffer,   // [16, hidden]
-    pub a_proj_w: GpuBuffer,   // [16, hidden]
-    pub conv1d_w: GpuBuffer,   // [6144, 1, 4]
-    pub out_proj_w: GpuBuffer, // [hidden, 2048]
-    pub dt_bias: GpuBuffer,    // [16]
-    pub a_log_exp: GpuBuffer,  // [16] — exp(-A_log) precomputed on CPU
-    pub norm_w: GpuBuffer,     // [128] — F32
+    pub qkvz_proj_w: Option<GpuBuffer>,
+    pub b_proj_w: GpuBuffer, // [16, hidden]
+    pub a_proj_w: GpuBuffer, // [16, hidden]
+    pub ba_proj_w: Option<GpuBuffer>,
+    pub conv1d_w: GpuBuffer,    // [6144, 1, 4]
+    pub out_proj_w: GpuBuffer,  // [hidden, 2048]
+    pub dt_bias: GpuBuffer,     // [16]
+    pub a_log_exp: GpuBuffer,   // [16] — exp(-A_log) precomputed on CPU
+    pub norm_w: GpuBuffer,      // [128] — F32
+    pub norm_w_bf16: GpuBuffer, // [128] — BF16 for gated RMSNorm component path
     // FP8 scale_inv (None when BF16)
     pub qkv_proj_scale: Option<GpuBuffer>,
     pub z_proj_scale: Option<GpuBuffer>,
@@ -305,13 +456,20 @@ impl Qwen35Weights {
                 let linear = LinearWeights {
                     qkv_proj_w: loader.load_to_gpu(&format!("{la}.in_proj_qkv.weight"), ordinal)?,
                     z_proj_w: loader.load_to_gpu(&format!("{la}.in_proj_z.weight"), ordinal)?,
+                    qkvz_proj_w: None,
                     b_proj_w: loader.load_to_gpu(&format!("{la}.in_proj_b.weight"), ordinal)?,
                     a_proj_w: loader.load_to_gpu(&format!("{la}.in_proj_a.weight"), ordinal)?,
+                    ba_proj_w: None,
                     conv1d_w: loader.load_to_gpu(&format!("{la}.conv1d.weight"), ordinal)?,
                     out_proj_w: loader.load_to_gpu(&format!("{la}.out_proj.weight"), ordinal)?,
                     dt_bias: loader.load_to_gpu(&format!("{la}.dt_bias"), ordinal)?,
                     a_log_exp,
                     norm_w: ensure_f32_on_gpu(
+                        loader.load_to_gpu(&format!("{la}.norm.weight"), ordinal)?,
+                        ordinal,
+                    )
+                    .map_err(|e| LoadError::UnsupportedDtype(e.to_string()))?,
+                    norm_w_bf16: ensure_bf16_on_gpu(
                         loader.load_to_gpu(&format!("{la}.norm.weight"), ordinal)?,
                         ordinal,
                     )
@@ -579,16 +737,28 @@ impl Qwen35Weights {
                 let qkv_awq_inv = load_awq_inv_scale(&qkv_name)?;
                 let z_awq_inv = load_awq_inv_scale(&z_name)?;
                 let out_awq_inv = load_awq_inv_scale(&out_name)?;
+                let ba_proj_w = fused_ba_projection_from_store(store, &b_name, &a_name, ordinal)?;
+                let qkvz_proj_w = if fused_qkvz_enabled(config) {
+                    fused_qkvz_projection_from_store(store, &qkv_name, &z_name, ordinal)?
+                } else {
+                    None
+                };
                 let linear = LinearWeights {
                     qkv_proj_w: store.load_to_gpu(&qkv_name, ordinal)?,
                     z_proj_w: store.load_to_gpu(&z_name, ordinal)?,
+                    qkvz_proj_w,
                     b_proj_w: store.load_to_gpu(&b_name, ordinal)?,
                     a_proj_w: store.load_to_gpu(&a_name, ordinal)?,
+                    ba_proj_w,
                     conv1d_w: store.load_to_gpu(&format!("{la}.conv1d.weight"), ordinal)?,
                     out_proj_w: store.load_to_gpu(&out_name, ordinal)?,
                     dt_bias: store.load_to_gpu(&format!("{la}.dt_bias"), ordinal)?,
                     a_log_exp: store.load_to_gpu(&format!("{la}.A_log"), ordinal)?,
                     norm_w: ensure_f32_on_gpu(
+                        store.load_to_gpu(&format!("{la}.norm.weight"), ordinal)?,
+                        ordinal,
+                    )?,
+                    norm_w_bf16: ensure_bf16_on_gpu(
                         store.load_to_gpu(&format!("{la}.norm.weight"), ordinal)?,
                         ordinal,
                     )?,

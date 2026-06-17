@@ -3862,10 +3862,10 @@ fn linear_step_stage1_5_metal_host(
             let a_v = workspace[off_a_raw + head];
             let b_v = workspace[off_b_raw + head];
             let dt_b = bf16_bits_to_f32(dt_bias[head]);
-            let a_log_v = bf16_bits_to_f32(a_log[head]);
+            let a_log_exp = bf16_bits_to_f32(a_log[head]);
             let softplus = (1.0 + (a_v + dt_b).exp()).ln();
             workspace[off_beta + head] = 1.0 / (1.0 + (-b_v).exp());
-            workspace[off_g + head] = -softplus * a_log_v.exp();
+            workspace[off_g + head] = -softplus * a_log_exp;
         }
 
         for head in 0..num_v_heads {

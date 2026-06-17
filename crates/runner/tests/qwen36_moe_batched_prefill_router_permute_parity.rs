@@ -25,22 +25,28 @@ use kernel_ffi::qwen36_moe::batched_prefill_router_permute_launch;
 fn upload_i32(ordinal: usize, host: &[i32], shape: &[usize]) -> GpuBuffer {
     assert_eq!(host.len(), shape.iter().product::<usize>());
     let mut buf = GpuBuffer::zeros(ordinal, ScalarType::U32, shape).expect("alloc i32");
-    let bytes = unsafe {
-        std::slice::from_raw_parts(host.as_ptr() as *const u8, host.len() * 4)
-    };
-    gpu_hal::copy_h2d(ordinal, buf.as_mut_ptr(), bytes.as_ptr() as *const _, bytes.len())
-        .expect("h2d i32");
+    let bytes = unsafe { std::slice::from_raw_parts(host.as_ptr() as *const u8, host.len() * 4) };
+    gpu_hal::copy_h2d(
+        ordinal,
+        buf.as_mut_ptr(),
+        bytes.as_ptr() as *const _,
+        bytes.len(),
+    )
+    .expect("h2d i32");
     buf
 }
 
 fn upload_bf16(ordinal: usize, host: &[half::bf16], shape: &[usize]) -> GpuBuffer {
     assert_eq!(host.len(), shape.iter().product::<usize>());
     let mut buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, shape).expect("alloc bf16");
-    let bytes = unsafe {
-        std::slice::from_raw_parts(host.as_ptr() as *const u8, host.len() * 2)
-    };
-    gpu_hal::copy_h2d(ordinal, buf.as_mut_ptr(), bytes.as_ptr() as *const _, bytes.len())
-        .expect("h2d bf16");
+    let bytes = unsafe { std::slice::from_raw_parts(host.as_ptr() as *const u8, host.len() * 2) };
+    gpu_hal::copy_h2d(
+        ordinal,
+        buf.as_mut_ptr(),
+        bytes.as_ptr() as *const _,
+        bytes.len(),
+    )
+    .expect("h2d bf16");
     buf
 }
 
@@ -171,8 +177,7 @@ fn run_one_shape(ordinal: usize, n_tokens: usize, top_k: usize, num_experts: usi
         GpuBuffer::zeros(ordinal, ScalarType::U32, &[total]).expect("alloc p_token");
     let mut p_kpos_buf =
         GpuBuffer::zeros(ordinal, ScalarType::U32, &[total]).expect("alloc p_kpos");
-    let mut p_w_buf =
-        GpuBuffer::zeros(ordinal, ScalarType::BF16, &[total]).expect("alloc p_w");
+    let mut p_w_buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[total]).expect("alloc p_w");
 
     batched_prefill_router_permute_launch(
         ordinal,

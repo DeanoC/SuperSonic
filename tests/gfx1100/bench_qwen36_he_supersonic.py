@@ -100,8 +100,8 @@ def run_one(args: argparse.Namespace, name: str, prompt: str, warmup: bool = Fal
         "name": name,
         "returncode": proc.returncode,
         "wall_s": elapsed,
-        "stdout_tail": proc.stdout[-4000:],
-        "stderr_tail": proc.stderr[-4000:],
+        "stdout_tail": proc.stdout[-args.tail_chars :],
+        "stderr_tail": proc.stderr[-args.tail_chars :],
     }
     if match:
         row.update(
@@ -137,6 +137,8 @@ def main() -> int:
     parser.add_argument("--warmup-new-tokens", type=int, default=2)
     parser.add_argument("--seed", type=int, default=20260504)
     parser.add_argument("--timeout", type=int, default=900)
+    parser.add_argument("--tail-chars", type=int, default=4000)
+    parser.add_argument("--start-index", type=int, default=0)
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--warmup", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--ignore-eos", action=argparse.BooleanOptionalAction, default=True)
@@ -155,6 +157,9 @@ def main() -> int:
     if not args.binary.exists():
         raise FileNotFoundError(args.binary)
     prompts = load_lucebox_prompts(args.lucebox_bench)
+    if args.start_index < 0 or args.start_index > len(prompts):
+        raise ValueError(f"--start-index must be in 0..{len(prompts)}")
+    prompts = prompts[args.start_index :]
     if args.limit > 0:
         prompts = prompts[: args.limit]
 

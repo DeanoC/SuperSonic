@@ -19,8 +19,13 @@ fn upload_bf16(ordinal: usize, host: &[half::bf16], shape: &[usize]) -> GpuBuffe
     assert_eq!(host.len(), shape.iter().product::<usize>());
     let mut buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, shape).expect("alloc bf16");
     let bytes = unsafe { std::slice::from_raw_parts(host.as_ptr() as *const u8, host.len() * 2) };
-    gpu_hal::copy_h2d(ordinal, buf.as_mut_ptr(), bytes.as_ptr() as *const _, bytes.len())
-        .expect("h2d bf16");
+    gpu_hal::copy_h2d(
+        ordinal,
+        buf.as_mut_ptr(),
+        bytes.as_ptr() as *const _,
+        bytes.len(),
+    )
+    .expect("h2d bf16");
     buf
 }
 
@@ -53,10 +58,17 @@ fn make_host_bf16(n: usize, seed: usize) -> (Vec<half::bf16>, Vec<f32>) {
 }
 
 fn cpu_attention_fp32(
-    batch: usize, q_heads: usize, kv_heads: usize,
-    q_len: usize, kv_len: usize, head_dim: usize,
-    scale: f32, seqlen_offset: usize,
-    q: &[f32], k: &[f32], v: &[f32],
+    batch: usize,
+    q_heads: usize,
+    kv_heads: usize,
+    q_len: usize,
+    kv_len: usize,
+    head_dim: usize,
+    scale: f32,
+    seqlen_offset: usize,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
 ) -> Vec<f32> {
     let groups = q_heads / kv_heads;
     let mut out = vec![0.0f32; batch * q_heads * q_len * head_dim];
@@ -72,13 +84,22 @@ fn cpu_attention_fp32(
                 for kp in 0..limit {
                     let k_row = k_head + kp * head_dim;
                     let mut s = 0.0f32;
-                    for d in 0..head_dim { s += q[q_off + d] * k[k_row + d]; }
+                    for d in 0..head_dim {
+                        s += q[q_off + d] * k[k_row + d];
+                    }
                     scores[kp] = s * scale;
                 }
                 let mut m = f32::NEG_INFINITY;
-                for &s in &scores { if s > m { m = s; } }
+                for &s in &scores {
+                    if s > m {
+                        m = s;
+                    }
+                }
                 let mut denom = 0.0f32;
-                for s in scores.iter_mut() { *s = (*s - m).exp(); denom += *s; }
+                for s in scores.iter_mut() {
+                    *s = (*s - m).exp();
+                    denom += *s;
+                }
                 let inv = if denom > 0.0 { 1.0 / denom } else { 0.0 };
                 let out_off = ((b * q_heads + hq) * q_len + qi) * head_dim;
                 for d in 0..head_dim {
@@ -118,20 +139,41 @@ fn run_one_shape(
     let q_buf = upload_bf16(ordinal, &q_bf, &[batch, q_heads, q_len, head_dim]);
     let k_buf = upload_bf16(ordinal, &k_bf, &[batch, kv_heads, kv_len, head_dim]);
     let v_buf = upload_bf16(ordinal, &v_bf, &[batch, kv_heads, kv_len, head_dim]);
-    let mut out_buf = GpuBuffer::zeros(
-        ordinal, ScalarType::F32, &[batch, q_heads, q_len, head_dim],
-    ).expect("alloc out");
+    let mut out_buf =
+        GpuBuffer::zeros(ordinal, ScalarType::F32, &[batch, q_heads, q_len, head_dim])
+            .expect("alloc out");
 
     batched_prefill_attn_full_launch(
-        ordinal, batch, q_heads, kv_heads, q_len, kv_len, head_dim,
-        scale, seqlen_offset, &q_buf, &k_buf, &v_buf, &mut out_buf,
-    ).expect("ffi");
+        ordinal,
+        batch,
+        q_heads,
+        kv_heads,
+        q_len,
+        kv_len,
+        head_dim,
+        scale,
+        seqlen_offset,
+        &q_buf,
+        &k_buf,
+        &v_buf,
+        &mut out_buf,
+    )
+    .expect("ffi");
     gpu_hal::sync(ordinal).expect("sync");
 
     let got = download_f32(&out_buf);
     let want = cpu_attention_fp32(
-        batch, q_heads, kv_heads, q_len, kv_len, head_dim,
-        scale, seqlen_offset, &q_f32, &k_f32, &v_f32,
+        batch,
+        q_heads,
+        kv_heads,
+        q_len,
+        kv_len,
+        head_dim,
+        scale,
+        seqlen_offset,
+        &q_f32,
+        &k_f32,
+        &v_f32,
     );
 
     // Tolerances: max_abs guards correctness for normal-magnitude outputs
@@ -147,13 +189,23 @@ fn run_one_shape(
     for i in 0..got.len() {
         let a = (got[i] - want[i]).abs();
         let r = a / want[i].abs().max(1e-3);
-        if a > max_abs { max_abs = a; }
-        if r > max_rel { max_rel = r; }
+        if a > max_abs {
+            max_abs = a;
+        }
+        if r > max_rel {
+            max_rel = r;
+        }
     }
     assert!(
         max_abs < 2e-2 && max_rel < 5e-2,
         "shape q_h={} kv_h={} q_len={} kv_len={} hd={}: max_abs={} max_rel={}",
-        q_heads, kv_heads, q_len, kv_len, head_dim, max_abs, max_rel,
+        q_heads,
+        kv_heads,
+        q_len,
+        kv_len,
+        head_dim,
+        max_abs,
+        max_rel,
     );
 }
 
@@ -173,9 +225,9 @@ fn batched_prefill_attn_full_parity_sweep() {
         (4, 2, 16, 16, 128),
         // Production shape
         (16, 2, 16, 16, 256),
-        (16, 2, 15, 15, 256),  // tail: q_len % BM == 3
-        (16, 2, 17, 17, 256),  // tail: q_len % BM == 1
-        (16, 2, 33, 64, 256),  // tail with kv_len > q_len (chunk after past tokens)
+        (16, 2, 15, 15, 256), // tail: q_len % BM == 3
+        (16, 2, 17, 17, 256), // tail: q_len % BM == 1
+        (16, 2, 33, 64, 256), // tail with kv_len > q_len (chunk after past tokens)
         (16, 2, 64, 64, 256),
         (16, 2, 256, 256, 256),
         (16, 2, 512, 512, 256),
@@ -183,6 +235,15 @@ fn batched_prefill_attn_full_parity_sweep() {
         (16, 2, 16, 256, 256),
     ] {
         let seqlen_offset = if kv_len > q_len { kv_len - q_len } else { 0 };
-        run_one_shape(ordinal, q_heads, kv_heads, q_len, kv_len, head_dim, seqlen_offset, 0xC36E);
+        run_one_shape(
+            ordinal,
+            q_heads,
+            kv_heads,
+            q_len,
+            kv_len,
+            head_dim,
+            seqlen_offset,
+            0xC36E,
+        );
     }
 }

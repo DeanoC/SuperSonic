@@ -857,6 +857,10 @@ pub struct DecodeEngine {
     /// only once per fused-verify call chain. Re-allocated if the block
     /// size changes between calls.
     dflash_fused_verify_cache: Option<DFlashFusedVerifyCache>,
+    /// Cached scratch for the prefill-append DFlash verifier. The current
+    /// Qwen3.6 path verifies in fixed B=8 chunks, so reusing this avoids
+    /// re-allocating the prefill component scratch every segment.
+    dflash_prefill_append_cache: Option<prefill_engine::PrefillAppendVerifyCache>,
     /// Reusable fixed-size scratch for component full-attention decode.
     /// Avoids per-layer-per-step allocation churn on single-sequence
     /// component decode paths.
@@ -3980,10 +3984,7 @@ impl DecodeEngine {
         }
 
         let lm_head_start = Instant::now();
-        if let (Some(scale), Some(zero)) = (
-            self.weights.lm_head_int4_scale.as_ref(),
-            self.weights.lm_head_int4_zero.as_ref(),
-        ) {
+        if let Some((qtype, scale, zero)) = self.weights.lm_head_lowbit_params(hidden_dim) {
             kernel_ffi::prefill_ffi::matmul_rhs_transposed_int4(
                 self.ordinal,
                 1,
@@ -3996,7 +3997,7 @@ impl DecodeEngine {
                 zero,
                 self.weights.lm_head_awq_inv_scale.as_ref(),
                 self.weights.int4_group_size,
-                qwen35::weights::LOWBIT_NATIVE_INT4,
+                qtype,
                 &mut self.logits_buf,
             )
             .map_err(|e| anyhow::anyhow!("component decode lm_head int4 matmul: {e}"))?;
@@ -9454,7 +9455,8 @@ impl DecodeEngine {
         let packed_width = 2 * khd + vhd + 2;
         let mut packed_host = vec![0f32; nv * packed_width];
         for v_head in 0..nv {
-            let k_head = v_head / head_repeat;
+            let num_k_heads = nv / head_repeat;
+            let k_head = v_head % num_k_heads;
             let out_base = v_head * packed_width;
             let q_base = k_head * khd;
             let k_base = k_head * khd;
@@ -10185,6 +10187,7 @@ impl DecodeEngine {
             batch_size,
             dflash_tap_cache: None,
             dflash_fused_verify_cache: None,
+            dflash_prefill_append_cache: None,
             component_full_attn_scratch,
             component_mlp_scratch,
             metal_v2_scratch: None,
@@ -11337,10 +11340,7 @@ impl DecodeEngine {
             hidden_dim,
         )
         .map_err(|e| anyhow::anyhow!("dflash-taps final rms_norm: {e}"))?;
-        if let (Some(scale), Some(zero)) = (
-            self.weights.lm_head_int4_scale.as_ref(),
-            self.weights.lm_head_int4_zero.as_ref(),
-        ) {
+        if let Some((qtype, scale, zero)) = self.weights.lm_head_lowbit_params(hidden_dim) {
             kernel_ffi::prefill_ffi::matmul_rhs_transposed_int4(
                 self.ordinal,
                 1,
@@ -11353,7 +11353,7 @@ impl DecodeEngine {
                 zero,
                 self.weights.lm_head_awq_inv_scale.as_ref(),
                 self.weights.int4_group_size,
-                qwen35::weights::LOWBIT_NATIVE_INT4,
+                qtype,
                 &mut self.logits_buf,
             )
             .map_err(|e| anyhow::anyhow!("dflash-taps lm_head int4 matmul: {e}"))?;
@@ -11390,6 +11390,342 @@ impl DecodeEngine {
         Ok((logits_f32, tap_host))
     }
 
+    /// Decode a consecutive committed DFlash block while capturing tap rows.
+    ///
+    /// Returns the logits for the final token in `token_ids` and tap bytes in
+    /// draft input layout `[token_ids.len(), num_taps * hidden_dim]` BF16.
+    pub fn decode_block_with_taps_kernel(
+        &mut self,
+        token_ids: &[u32],
+        pos_offset: usize,
+        tap_layers: &[usize],
+    ) -> Result<(Vec<f32>, Vec<u8>)> {
+        if token_ids.is_empty() {
+            anyhow::bail!("decode_block_with_taps_kernel requires non-empty token_ids");
+        }
+        if token_ids.len() == 1 {
+            return self.decode_step_with_taps_kernel(token_ids[0], pos_offset, tap_layers);
+        }
+        let hidden_dim = self.weights.config.hidden_size;
+        const MAX_INPUT_CACHE_FLOATS: usize = 15872;
+        let max_chunk = if hidden_dim == 0 || 2 * hidden_dim > MAX_INPUT_CACHE_FLOATS {
+            1
+        } else {
+            (MAX_INPUT_CACHE_FLOATS / hidden_dim).min(kernel_ffi::MAX_BATCH_SIZE)
+        };
+        if max_chunk <= 1 {
+            let mut all_taps = Vec::new();
+            let mut final_logits = Vec::new();
+            for (i, &tok) in token_ids.iter().enumerate() {
+                let (logits, taps) =
+                    self.decode_step_with_taps_kernel(tok, pos_offset + i, tap_layers)?;
+                all_taps.extend_from_slice(&taps);
+                if i + 1 == token_ids.len() {
+                    final_logits = logits;
+                }
+            }
+            return Ok((final_logits, all_taps));
+        }
+
+        let per_pos_tap_bytes = tap_layers.len() * hidden_dim * ScalarType::BF16.size_in_bytes();
+        let mut all_taps = Vec::with_capacity(token_ids.len() * per_pos_tap_bytes);
+        let mut final_logits: Option<Vec<f32>> = None;
+        let mut start = 0usize;
+        while start < token_ids.len() {
+            let remaining = token_ids.len() - start;
+            let step = if remaining > max_chunk && remaining - max_chunk == 1 {
+                max_chunk - 1
+            } else {
+                remaining.min(max_chunk)
+            };
+            if step == 1 {
+                let (logits, taps) = self.decode_step_with_taps_kernel(
+                    token_ids[start],
+                    pos_offset + start,
+                    tap_layers,
+                )?;
+                all_taps.extend_from_slice(&taps);
+                if start + 1 == token_ids.len() {
+                    final_logits = Some(logits);
+                }
+                start += 1;
+                continue;
+            }
+
+            let need_logits = start + step == token_ids.len();
+            let (logits, taps) = self.decode_block_with_taps_kernel_chunk(
+                &token_ids[start..start + step],
+                pos_offset + start,
+                tap_layers,
+                need_logits,
+            )?;
+            all_taps.extend_from_slice(&taps);
+            if need_logits {
+                final_logits = logits;
+            }
+            start += step;
+        }
+
+        let final_logits = final_logits.ok_or_else(|| {
+            anyhow::anyhow!("decode_block_with_taps_kernel did not produce final logits")
+        })?;
+        Ok((final_logits, all_taps))
+    }
+
+    fn decode_block_with_taps_kernel_chunk(
+        &mut self,
+        token_ids: &[u32],
+        pos_offset: usize,
+        tap_layers: &[usize],
+        need_logits: bool,
+    ) -> Result<(Option<Vec<f32>>, Vec<u8>)> {
+        if !self.use_4b_kernel {
+            anyhow::bail!("decode_block_with_taps_kernel requires use_4b_kernel");
+        }
+        if self.batch_size != 1 {
+            anyhow::bail!("decode_block_with_taps_kernel requires batch_size=1");
+        }
+        if tap_layers.is_empty() {
+            anyhow::bail!("decode_block_with_taps_kernel requires at least one tap layer");
+        }
+        let b = token_ids.len();
+        if b <= 1 || b > kernel_ffi::MAX_BATCH_SIZE {
+            anyhow::bail!("decode_block_with_taps_kernel_chunk requires B in 2..=MAX_BATCH_SIZE");
+        }
+
+        let (hidden_dim, intermediate_size, vocab_size, num_layers, rms_norm_eps) = {
+            let c = &self.weights.config;
+            (
+                c.hidden_size,
+                c.intermediate_size,
+                c.vocab_size,
+                c.num_hidden_layers,
+                c.rms_norm_eps as f32,
+            )
+        };
+        for &li in tap_layers {
+            if li >= num_layers {
+                anyhow::bail!("tap layer {li} out of range (num_hidden_layers={num_layers})");
+            }
+        }
+
+        let max_pos = pos_offset + b - 1;
+        {
+            let config = &self.weights.config;
+            for (i, ls) in self.state.layers.iter_mut().enumerate() {
+                if config.is_full_attention(i) {
+                    ls.ensure_kv_capacity(
+                        max_pos,
+                        self.ordinal,
+                        config,
+                        self.kv_chunk_size,
+                        self.kv_fp8,
+                    )
+                    .map_err(|e| anyhow::anyhow!("dflash block-taps ensure KV layer {i}: {e}"))?;
+                }
+            }
+        }
+        self.check_attn_scratch_budget()?;
+
+        let mut cache = match self.dflash_fused_verify_cache.take() {
+            Some(c) if c.block_size == b => c,
+            _ => DFlashFusedVerifyCache::alloc(
+                self.ordinal,
+                b,
+                hidden_dim,
+                intermediate_size,
+                vocab_size,
+                num_layers,
+                self.proj_buf_floats,
+                self.attn_scratch_floats,
+            )?,
+        };
+
+        let descs = build_layer_descs(&self.weights, &self.state, pos_offset);
+        self.scratch
+            .upload_descs(&descs)
+            .map_err(|e| anyhow::anyhow!("dflash block-taps upload descs: {e}"))?;
+
+        let state_refs: Vec<&ModelState> = (0..b).map(|_| &self.state).collect();
+        let seqlen_offsets: Vec<usize> = (0..b).map(|bi| pos_offset + bi).collect();
+        let batch_descs = build_batch_seq_descs(
+            &state_refs,
+            &seqlen_offsets,
+            /* kv_fp8 */ false,
+        )
+        .ok_or_else(|| {
+            anyhow::anyhow!("dflash block-taps: build_batch_seq_descs returned None for B={b}")
+        })?;
+        let desc_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                batch_descs.as_ptr() as *const u8,
+                batch_descs.len() * std::mem::size_of::<kernel_ffi::BatchSeqDesc>(),
+            )
+        };
+        gpu_hal::copy_h2d(
+            self.ordinal,
+            cache.batch_desc_device.as_mut_ptr(),
+            desc_bytes.as_ptr() as *const c_void,
+            desc_bytes.len(),
+        )
+        .map_err(|e| anyhow::anyhow!("dflash block-taps upload batch-seq descs: {e}"))?;
+
+        let row_bytes = hidden_dim * ScalarType::BF16.size_in_bytes();
+        for (bi, &tid_val) in token_ids.iter().enumerate() {
+            let src_offset = tid_val as usize * row_bytes;
+            let dst_offset = bi * row_bytes;
+            gpu_hal::copy_d2d(
+                self.ordinal,
+                unsafe { (cache.hidden_io.as_ptr() as *mut u8).add(dst_offset) as *mut c_void },
+                self.weights.embed_tokens.offset_ptr(src_offset),
+                row_bytes,
+            )
+            .map_err(|e| anyhow::anyhow!("dflash block-taps embedding slot {bi}: {e}"))?;
+        }
+
+        let num_taps = tap_layers.len();
+        let mut tap_workspace =
+            GpuBuffer::zeros(self.ordinal, ScalarType::BF16, &[num_taps, b, hidden_dim])
+                .map_err(|e| anyhow::anyhow!("alloc block tap_workspace: {e}"))?;
+        let tap_ints: Vec<i32> = tap_layers.iter().map(|&li| li as i32).collect();
+        let tap_ints_bytes: Vec<u8> = tap_ints.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let tap_layers_buf = GpuBuffer::from_host_bytes(
+            self.ordinal,
+            ScalarType::U8,
+            &[tap_ints_bytes.len()],
+            &tap_ints_bytes,
+        )
+        .map_err(|e| anyhow::anyhow!("upload block tap_layers: {e}"))?;
+
+        gpu_hal::memset_zeros(
+            self.ordinal,
+            cache.workspace.as_mut_ptr(),
+            cache.workspace.len_bytes(),
+        )
+        .map_err(|e| anyhow::anyhow!("dflash block-taps clear workspace: {e}"))?;
+        self.scratch
+            .reset_sync()
+            .map_err(|e| anyhow::anyhow!("dflash block-taps reset sync: {e}"))?;
+
+        kernel_ffi::persistent_decode_4b(
+            self.ordinal,
+            ScalarType::BF16,
+            num_layers,
+            hidden_dim,
+            intermediate_size,
+            pos_offset,
+            &self.scratch.desc_device,
+            &mut cache.hidden_io,
+            &mut cache.workspace,
+            &mut self.scratch.sync_buf,
+            &self.rotary.cos,
+            &self.rotary.sin,
+            self.rotary.rotary_dim,
+            self.proj_buf_floats,
+            self.attn_scratch_floats,
+            self.fp8_scale_device.as_ref(),
+            None,
+            b,
+            Some(&cache.batch_desc_device),
+            self.int4_scale_device.as_ref(),
+            false,
+            false,
+            Some(&mut tap_workspace),
+            Some(&tap_layers_buf),
+        )
+        .map_err(|e| anyhow::anyhow!("dflash block-taps persistent_decode_4b: {e}"))?;
+
+        let filled = pos_offset + b;
+        {
+            let config = &self.weights.config;
+            for (i, ls) in self.state.layers.iter_mut().enumerate() {
+                if config.is_full_attention(i) {
+                    ls.set_kv_filled(filled);
+                }
+            }
+        }
+
+        let logits = if need_logits {
+            let last_offset = (b - 1) * row_bytes;
+            gpu_hal::copy_d2d(
+                self.ordinal,
+                self.hidden_io.as_ptr() as *mut c_void,
+                unsafe {
+                    (cache.hidden_io.as_ptr() as *const u8).add(last_offset) as *const c_void
+                },
+                row_bytes,
+            )
+            .map_err(|e| anyhow::anyhow!("dflash block-taps copy final hidden: {e}"))?;
+            kernel_ffi::rms_norm_4b(
+                self.ordinal,
+                ScalarType::BF16,
+                &mut self.normed_buf,
+                &self.hidden_io,
+                &self.weights.norm_weight,
+                rms_norm_eps,
+                hidden_dim,
+            )
+            .map_err(|e| anyhow::anyhow!("dflash block-taps final rms_norm: {e}"))?;
+            if let Some((qtype, scale, zero)) = self.weights.lm_head_lowbit_params(hidden_dim) {
+                kernel_ffi::prefill_ffi::matmul_rhs_transposed_int4(
+                    self.ordinal,
+                    1,
+                    1,
+                    vocab_size,
+                    hidden_dim,
+                    &self.normed_buf,
+                    &*self.weights.lm_head,
+                    scale,
+                    zero,
+                    self.weights.lm_head_awq_inv_scale.as_ref(),
+                    self.weights.int4_group_size,
+                    qtype,
+                    &mut self.logits_buf,
+                )
+                .map_err(|e| anyhow::anyhow!("dflash block-taps lm_head int4 matmul: {e}"))?;
+            } else {
+                kernel_ffi::standalone_matvec_4b(
+                    self.ordinal,
+                    ScalarType::BF16,
+                    &mut self.logits_buf,
+                    &self.normed_buf,
+                    &*self.weights.lm_head,
+                    hidden_dim,
+                    vocab_size,
+                    &mut self.matvec_counter,
+                )
+                .map_err(|e| anyhow::anyhow!("dflash block-taps lm_head matvec: {e}"))?;
+            }
+            let logits_bytes = self
+                .logits_buf
+                .to_host_bytes()
+                .map_err(|e| anyhow::anyhow!("dflash block-taps logits D2H: {e}"))?;
+            Some(
+                logits_bytes
+                    .chunks_exact(2)
+                    .map(|b| half::bf16::from_le_bytes([b[0], b[1]]).to_f32())
+                    .collect(),
+            )
+        } else {
+            None
+        };
+
+        let tap_host = tap_workspace
+            .to_host_bytes()
+            .map_err(|e| anyhow::anyhow!("dflash block-taps D2H: {e}"))?;
+        let tap_row_bytes = hidden_dim * ScalarType::BF16.size_in_bytes();
+        let mut per_position = Vec::with_capacity(b * num_taps * tap_row_bytes);
+        for bi in 0..b {
+            for ti in 0..num_taps {
+                let start = (ti * b + bi) * tap_row_bytes;
+                per_position.extend_from_slice(&tap_host[start..start + tap_row_bytes]);
+            }
+        }
+
+        self.dflash_fused_verify_cache = Some(cache);
+        Ok((logits, per_position))
+    }
+
     /// Mutable access to the engine's primary `ModelState`. Used by the
     /// DFlash speculative engine to snapshot/restore linear-attention state.
     pub fn state_mut(&mut self) -> &mut ModelState {
@@ -11414,6 +11750,296 @@ impl DecodeEngine {
                 ls.set_kv_filled(new_len);
             }
         }
+    }
+
+    /// DFlash experimental verifier: use the prefill component kernels as an
+    /// append-only B-token target pass. This avoids the persistent kernel's
+    /// `B * hidden_dim` LDS limit and lets us benchmark a true block-sized
+    /// verifier against the current chunked persistent path.
+    pub fn verify_block_prefill_append(
+        &mut self,
+        tokens: &[u32],
+        pos_offset: usize,
+    ) -> Result<Vec<Vec<f32>>> {
+        Ok(self
+            .verify_block_prefill_append_impl(tokens, pos_offset, None, false, false, None, None)?
+            .logits)
+    }
+
+    pub fn verify_block_prefill_append_captured(
+        &mut self,
+        tokens: &[u32],
+        pos_offset: usize,
+        tap_layers: &[usize],
+    ) -> Result<prefill_engine::PrefillAppendVerifyResult> {
+        self.verify_block_prefill_append_impl(
+            tokens,
+            pos_offset,
+            Some(tap_layers),
+            true,
+            true,
+            None,
+            None,
+        )
+    }
+
+    pub fn verify_block_prefill_append_captured_lazy_acceptance(
+        &mut self,
+        tokens: &[u32],
+        pos_offset: usize,
+        tap_layers: &[usize],
+    ) -> Result<prefill_engine::PrefillAppendVerifyResult> {
+        self.verify_block_prefill_append_impl(
+            tokens,
+            pos_offset,
+            Some(tap_layers),
+            true,
+            true,
+            Some(tokens),
+            None,
+        )
+    }
+
+    pub fn verify_block_prefill_append_captured_lazy_acceptance_gpu_taps(
+        &mut self,
+        tokens: &[u32],
+        pos_offset: usize,
+        tap_layers: &[usize],
+        tap_history_gpu: &mut GpuBuffer,
+        tap_history_start_row: usize,
+        tap_history_row_bytes: usize,
+    ) -> Result<prefill_engine::PrefillAppendVerifyResult> {
+        let sink = prefill_engine::PrefillAppendGpuTapSink {
+            buffer: tap_history_gpu,
+            start_row: tap_history_start_row,
+            row_bytes: tap_history_row_bytes,
+        };
+        self.verify_block_prefill_append_impl(
+            tokens,
+            pos_offset,
+            Some(tap_layers),
+            true,
+            true,
+            Some(tokens),
+            Some(sink),
+        )
+    }
+
+    pub fn verify_tree_prefill_captured(
+        &mut self,
+        tokens: &[u32],
+        positions: &[usize],
+        parent_ids: &[i32],
+        visibility: &[u8],
+        prefix_len: usize,
+        tap_layers: &[usize],
+        capture_rollback: bool,
+    ) -> Result<prefill_engine::PrefillTreeVerifyResult> {
+        if self.kv_fp8 {
+            anyhow::bail!("verify_tree_prefill does not support kv_fp8");
+        }
+        if tokens.is_empty() {
+            anyhow::bail!("verify_tree_prefill: tokens must be non-empty");
+        }
+
+        let result = prefill_engine::prefill_tree_verify(
+            &self.weights,
+            &mut self.state,
+            &self.rotary,
+            tokens,
+            positions,
+            parent_ids,
+            visibility,
+            prefix_len,
+            self.ordinal,
+            self.kv_chunk_size,
+            self.use_4b_kernel,
+            Some(tap_layers),
+            true,
+            capture_rollback,
+        )?;
+        self.scratch
+            .reset_sync()
+            .map_err(|e| anyhow::anyhow!("reset sync after tree prefill verify: {e}"))?;
+        Ok(result)
+    }
+
+    fn verify_block_prefill_append_impl(
+        &mut self,
+        tokens: &[u32],
+        pos_offset: usize,
+        tap_layers: Option<&[usize]>,
+        capture_rollback: bool,
+        greedy_only: bool,
+        greedy_compare_tokens: Option<&[u32]>,
+        gpu_tap_sink: Option<prefill_engine::PrefillAppendGpuTapSink<'_>>,
+    ) -> Result<prefill_engine::PrefillAppendVerifyResult> {
+        if self.kv_fp8 {
+            anyhow::bail!("verify_block_prefill_append does not support kv_fp8");
+        }
+        if tokens.is_empty() {
+            anyhow::bail!("verify_block_prefill_append: tokens must be non-empty");
+        }
+
+        let max_pos = pos_offset + tokens.len() - 1;
+        {
+            let config = &self.weights.config;
+            for (idx, layer_state) in self.state.layers.iter_mut().enumerate() {
+                if config.is_full_attention(idx) {
+                    layer_state
+                        .ensure_kv_capacity(
+                            max_pos,
+                            self.ordinal,
+                            config,
+                            self.kv_chunk_size,
+                            false,
+                        )
+                        .map_err(|e| {
+                            anyhow::anyhow!("prefill append ensure KV layer {idx}: {e}")
+                        })?;
+                }
+            }
+        }
+
+        let mut cache = match self.dflash_prefill_append_cache.take() {
+            Some(cache) => cache,
+            None => prefill_engine::PrefillAppendVerifyCache::new(
+                &self.weights.config,
+                tokens.len(),
+                self.ordinal,
+            )?,
+        };
+        let mut gpu_tap_sink = gpu_tap_sink;
+        let result = prefill_engine::prefill_append_verify_cached_with_gpu_taps(
+            &self.weights,
+            &mut self.state,
+            &self.rotary,
+            tokens,
+            pos_offset,
+            self.ordinal,
+            self.kv_chunk_size,
+            self.use_4b_kernel,
+            tap_layers,
+            capture_rollback,
+            greedy_only,
+            greedy_compare_tokens,
+            &mut cache,
+            gpu_tap_sink.as_mut(),
+        )?;
+        self.dflash_prefill_append_cache = Some(cache);
+        self.scratch
+            .reset_sync()
+            .map_err(|e| anyhow::anyhow!("reset sync after prefill append verify: {e}"))?;
+        Ok(result)
+    }
+
+    pub fn commit_prefill_append_verify(
+        &mut self,
+        result: &prefill_engine::PrefillAppendVerifyResult,
+        commit_len: usize,
+    ) -> Result<()> {
+        prefill_engine::apply_prefill_append_rollback(
+            &mut self.state,
+            &self.weights.config,
+            result,
+            commit_len,
+            self.ordinal,
+        )?;
+        self.scratch
+            .reset_sync()
+            .map_err(|e| anyhow::anyhow!("reset sync after prefill append rollback: {e}"))?;
+        Ok(())
+    }
+
+    pub fn commit_prefill_append_verify_owned(
+        &mut self,
+        mut result: prefill_engine::PrefillAppendVerifyResult,
+        commit_len: usize,
+    ) -> Result<()> {
+        prefill_engine::apply_prefill_append_rollback(
+            &mut self.state,
+            &self.weights.config,
+            &result,
+            commit_len,
+            self.ordinal,
+        )?;
+        if let (Some(cache), Some(rollback)) = (
+            self.dflash_prefill_append_cache.as_mut(),
+            result.rollback.take(),
+        ) {
+            cache.recycle_rollback(rollback);
+        }
+        self.scratch
+            .reset_sync()
+            .map_err(|e| anyhow::anyhow!("reset sync after prefill append rollback: {e}"))?;
+        Ok(())
+    }
+
+    pub fn commit_prefill_append_full_accept(
+        &mut self,
+        result: &prefill_engine::PrefillAppendVerifyResult,
+    ) -> Result<()> {
+        let rollback = result.rollback.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("prefill append result did not capture rollback state")
+        })?;
+        let new_len = rollback.pos_offset + rollback.chunk_len;
+        let config = &self.weights.config;
+        for (idx, layer_state) in self.state.layers.iter_mut().enumerate() {
+            if config.is_full_attention(idx) {
+                layer_state.set_kv_filled(new_len);
+            }
+        }
+        self.scratch
+            .reset_sync()
+            .map_err(|e| anyhow::anyhow!("reset sync after prefill append full accept: {e}"))?;
+        Ok(())
+    }
+
+    pub fn commit_prefill_append_full_accept_owned(
+        &mut self,
+        mut result: prefill_engine::PrefillAppendVerifyResult,
+    ) -> Result<()> {
+        let rollback = result.rollback.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("prefill append result did not capture rollback state")
+        })?;
+        let new_len = rollback.pos_offset + rollback.chunk_len;
+        let config = &self.weights.config;
+        for (idx, layer_state) in self.state.layers.iter_mut().enumerate() {
+            if config.is_full_attention(idx) {
+                layer_state.set_kv_filled(new_len);
+            }
+        }
+        if let (Some(cache), Some(rollback)) = (
+            self.dflash_prefill_append_cache.as_mut(),
+            result.rollback.take(),
+        ) {
+            cache.recycle_rollback(rollback);
+        }
+        self.scratch
+            .reset_sync()
+            .map_err(|e| anyhow::anyhow!("reset sync after prefill append full accept: {e}"))?;
+        Ok(())
+    }
+
+    pub fn commit_prefill_tree_verify(
+        &mut self,
+        result: &prefill_engine::PrefillTreeVerifyResult,
+        accepted_indices: &[usize],
+        commit_len: usize,
+    ) -> Result<()> {
+        prefill_engine::apply_prefill_tree_rollback(
+            &mut self.state,
+            &self.weights.config,
+            result,
+            accepted_indices,
+            commit_len,
+            self.ordinal,
+            self.kv_chunk_size,
+        )?;
+        self.scratch
+            .reset_sync()
+            .map_err(|e| anyhow::anyhow!("reset sync after prefill tree rollback: {e}"))?;
+        Ok(())
     }
 
     /// DFlash M4.3 fused verify: single `persistent_decode_4b` megakernel
@@ -11484,25 +12110,24 @@ impl DecodeEngine {
         };
 
         // The 4B megakernel's shared-memory footprint per workgroup is
-        //   (block_size + max(B × hidden_dim, intermediate_size) + fp8_lut) × sizeof(f32)
-        // with kernel block_size = 256 and fp8_lut = 256. gfx1150 caps
-        // LDS at 64 KiB per workgroup → 16384 floats total. Reserve 2
-        // KiB (512 floats) for block_size + fp8_lut, leaving 15872
-        // floats for the input cache. 9B (hidden=4096) tops out at B=3;
-        // 4B (hidden=2048) tops out at B=7. If a user passes a larger
-        // --dflash-block the launch fails with HIP status 254 and a
-        // confusing error — fail fast here instead with the math
-        // spelled out.
+        //   (block_size + max(B * hidden_dim, 2 * hidden_dim) + fp8_lut) * sizeof(f32).
+        // gfx1100/gfx115x cap LDS at 64 KiB per workgroup, or 16384 floats.
+        // Reserve 512 floats for block_size + fp8_lut, leaving 15872 floats
+        // for the input cache. Qwen3.6-27B (hidden=5120) therefore fits B=3.
+        // If a user passes a larger --dflash-block, fail before HIP returns a
+        // less helpful launch error.
         const MAX_INPUT_CACHE_FLOATS: usize = 15872;
-        let input_cache = (b * hidden_dim).max(intermediate_size);
+        let input_cache = (b * hidden_dim).max(2 * hidden_dim);
         if input_cache > MAX_INPUT_CACHE_FLOATS {
+            let max_b = (MAX_INPUT_CACHE_FLOATS / hidden_dim.max(1)).max(1);
             anyhow::bail!(
                 "verify_block_fused_decode: shared-memory budget exceeded \
-                 (B={b} × hidden_dim={hidden_dim} = {}, intermediate={intermediate_size}; \
+                 (B={b} * hidden_dim={hidden_dim} = {}, 2 * hidden_dim = {}; \
                  cap = {MAX_INPUT_CACHE_FLOATS} floats). \
-                 Lower --dflash-block to ≤ {}.",
+                 Lower --dflash-block to <= {}.",
                 b * hidden_dim,
-                MAX_INPUT_CACHE_FLOATS.min(b * hidden_dim) / hidden_dim.max(1),
+                2 * hidden_dim,
+                max_b,
             );
         }
 
@@ -11602,10 +12227,13 @@ impl DecodeEngine {
             .reset_sync()
             .map_err(|e| anyhow::anyhow!("fused verify reset sync: {e}"))?;
 
+        let profile_verify = std::env::var_os("SUPERSONIC_DFLASH_PROFILE_VERIFY").is_some();
+
         // Launch the fused megakernel. `pos_offset` as the kernel's
         // `seqlen_offset` arg is ignored because `batch_descs` is
         // non-null; pass it through for consistency with the batched
         // call site.
+        let persistent_start = Instant::now();
         kernel_ffi::persistent_decode_4b(
             self.ordinal,
             ScalarType::BF16,
@@ -11633,6 +12261,7 @@ impl DecodeEngine {
             None,  // tap_layers: ignored when tap_workspace is None
         )
         .map_err(|e| anyhow::anyhow!("fused verify persistent_decode_4b: {e}"))?;
+        let persistent_ms = persistent_start.elapsed().as_secs_f64() * 1000.0;
 
         // Deliberately do NOT advance `kv_filled` on any layer. The
         // DFlash engine rolls the K/V cursor back via
@@ -11640,6 +12269,7 @@ impl DecodeEngine {
         // `restore_linear` after the accept decision.
 
         // Final RMSNorm (multirow) + tiled lm_head over all B hiddens.
+        let rms_start = Instant::now();
         kernel_ffi::rms_norm_4b_multirow(
             self.ordinal,
             ScalarType::BF16,
@@ -11651,11 +12281,10 @@ impl DecodeEngine {
             &mut cache.normed_buf,
         )
         .map_err(|e| anyhow::anyhow!("fused verify final rms_norm: {e}"))?;
+        let rms_ms = rms_start.elapsed().as_secs_f64() * 1000.0;
 
-        if let (Some(scale), Some(zero)) = (
-            self.weights.lm_head_int4_scale.as_ref(),
-            self.weights.lm_head_int4_zero.as_ref(),
-        ) {
+        let lm_head_start = Instant::now();
+        if let Some((qtype, scale, zero)) = self.weights.lm_head_lowbit_params(hidden_dim) {
             kernel_ffi::prefill_ffi::matmul_rhs_transposed_int4(
                 self.ordinal,
                 1,
@@ -11668,7 +12297,7 @@ impl DecodeEngine {
                 zero,
                 self.weights.lm_head_awq_inv_scale.as_ref(),
                 self.weights.int4_group_size,
-                qwen35::weights::LOWBIT_NATIVE_INT4,
+                qtype,
                 &mut cache.logits_buf,
             )
             .map_err(|e| anyhow::anyhow!("fused verify lm_head int4 matmul: {e}"))?;
@@ -11686,11 +12315,14 @@ impl DecodeEngine {
             )
             .map_err(|e| anyhow::anyhow!("fused verify lm_head matmul: {e}"))?;
         }
+        let lm_head_ms = lm_head_start.elapsed().as_secs_f64() * 1000.0;
 
+        let d2h_start = Instant::now();
         let logits_host = cache
             .logits_buf
             .to_host_bytes()
             .map_err(|e| anyhow::anyhow!("fused verify logits D2H: {e}"))?;
+        let d2h_ms = d2h_start.elapsed().as_secs_f64() * 1000.0;
         let row_stride_bytes = vocab_size * ScalarType::BF16.size_in_bytes();
         let mut logits_per_pos = Vec::with_capacity(b);
         for bi in 0..b {
@@ -11701,6 +12333,12 @@ impl DecodeEngine {
                 .map(|c| half::bf16::from_le_bytes([c[0], c[1]]).to_f32())
                 .collect();
             logits_per_pos.push(row);
+        }
+
+        if profile_verify {
+            eprintln!(
+                "[dflash-profile] fused_verify B={b} pos={pos_offset} persistent={persistent_ms:.2}ms rms={rms_ms:.2}ms lm_head={lm_head_ms:.2}ms d2h={d2h_ms:.2}ms"
+            );
         }
 
         self.dflash_fused_verify_cache = Some(cache);
@@ -12161,10 +12799,7 @@ impl DecodeEngine {
         timings.rms_norm_ms = start.elapsed().as_secs_f64() * 1000.0;
 
         let start = Instant::now();
-        if let (Some(scale), Some(zero)) = (
-            self.weights.lm_head_int4_scale.as_ref(),
-            self.weights.lm_head_int4_zero.as_ref(),
-        ) {
+        if let Some((qtype, scale, zero)) = self.weights.lm_head_lowbit_params(config.hidden_size) {
             kernel_ffi::prefill_ffi::matmul_rhs_transposed_int4(
                 self.ordinal,
                 1,
@@ -12177,7 +12812,7 @@ impl DecodeEngine {
                 zero,
                 self.weights.lm_head_awq_inv_scale.as_ref(),
                 self.weights.int4_group_size,
-                qwen35::weights::LOWBIT_NATIVE_INT4,
+                qtype,
                 &mut self.logits_buf,
             )
             .map_err(|e| anyhow::anyhow!("tiled lm_head batch int4 matmul: {e}"))?;

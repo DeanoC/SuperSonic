@@ -111,6 +111,26 @@ int transpose_shd_hsd_device(int device_ordinal,
     return 0;
 }
 
+int transpose_shd_to_cache_bf16_device(int device_ordinal,
+                                       int S, int H, int D,
+                                       int cache_len,
+                                       int dst_pos,
+                                       const void* src,
+                                       void* cache) {
+    ScopedHipDevice scoped(device_ordinal);
+    const size_t total = static_cast<size_t>(S) * H * D;
+    constexpr int block = 256;
+    const unsigned int grid = static_cast<unsigned int>((total + block - 1) / block);
+    hipLaunchKernelGGL(
+        pfx_transpose_shd_to_cache_bf16_kernel,
+        dim3(grid), dim3(block), 0, 0,
+        S, H, D, cache_len, dst_pos,
+        static_cast<const hip_bfloat16*>(src),
+        static_cast<hip_bfloat16*>(cache));
+    if (cudaGetLastError() != cudaSuccess) return 323;
+    return 0;
+}
+
 // ---- transpose + pad for conv ----
 
 template <typename T>
@@ -155,6 +175,34 @@ int extract_conv_state_device(int device_ordinal,
     return 0;
 }
 
+// ---- prepare conv input and next tail ----
+
+template <typename T>
+int prepare_conv_input_tail_device(int device_ordinal,
+                                   int S, int C, int pad,
+                                   const void* src,
+                                   const void* old_tail,
+                                   void* conv_input,
+                                   void* new_tail) {
+    ScopedHipDevice scoped(device_ordinal);
+    if (S < pad) return 343;
+    const size_t conv_total = static_cast<size_t>(C) * static_cast<size_t>(pad + S);
+    const size_t tail_total = static_cast<size_t>(C) * static_cast<size_t>(pad);
+    const size_t total = conv_total > tail_total ? conv_total : tail_total;
+    constexpr int block = 256;
+    const unsigned int grid = static_cast<unsigned int>((total + block - 1) / block);
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(pfx_prepare_conv_input_tail_kernel<T>),
+        dim3(grid), dim3(block), 0, 0,
+        S, C, pad,
+        static_cast<const T*>(src),
+        static_cast<const T*>(old_tail),
+        static_cast<T*>(conv_input),
+        static_cast<T*>(new_tail));
+    if (cudaGetLastError() != cudaSuccess) return 344;
+    return 0;
+}
+
 // ---- sigmoid_mul ----
 
 template <typename T>
@@ -171,6 +219,26 @@ int sigmoid_mul_device(int device_ordinal, size_t total_elems,
         static_cast<const T*>(gate),
         static_cast<T*>(out));
     if (cudaGetLastError() != cudaSuccess) return 351;
+    return 0;
+}
+
+int cast_transpose_gate_bf16_device(int device_ordinal,
+                                    int S, int H, int D,
+                                    const void* attn_hsd,
+                                    const void* gate_shd,
+                                    void* out_shd) {
+    ScopedHipDevice scoped(device_ordinal);
+    const size_t total = static_cast<size_t>(S) * H * D;
+    constexpr int block = 256;
+    const unsigned int grid = static_cast<unsigned int>((total + block - 1) / block);
+    hipLaunchKernelGGL(
+        pfx_cast_transpose_gate_hsd_to_shd_bf16_kernel,
+        dim3(grid), dim3(block), 0, 0,
+        S, H, D,
+        static_cast<const float*>(attn_hsd),
+        static_cast<const hip_bfloat16*>(gate_shd),
+        static_cast<hip_bfloat16*>(out_shd));
+    if (cudaGetLastError() != cudaSuccess) return 353;
     return 0;
 }
 
@@ -200,6 +268,29 @@ int compute_beta_g_device(int device_ordinal,
     return 0;
 }
 
+int compute_beta_g_ba_bf16_device(int device_ordinal,
+                                  int seq_len, int nv,
+                                  const void* BA,
+                                  const void* dt_bias,
+                                  const void* a_log_exp,
+                                  void* beta, void* g) {
+    ScopedHipDevice scoped(device_ordinal);
+    const size_t total = static_cast<size_t>(seq_len) * nv;
+    constexpr int block = 256;
+    const unsigned int grid = static_cast<unsigned int>((total + block - 1) / block);
+    hipLaunchKernelGGL(
+        pfx_compute_beta_g_ba_bf16_kernel,
+        dim3(grid), dim3(block), 0, 0,
+        seq_len, nv,
+        static_cast<const hip_bfloat16*>(BA),
+        static_cast<const hip_bfloat16*>(dt_bias),
+        static_cast<const hip_bfloat16*>(a_log_exp),
+        static_cast<float*>(beta),
+        static_cast<float*>(g));
+    if (cudaGetLastError() != cudaSuccess) return 363;
+    return 0;
+}
+
 // ---- split_qgate ----
 
 template <typename T>
@@ -218,6 +309,39 @@ int split_qgate_device(int device_ordinal,
         static_cast<T*>(query_out),
         static_cast<T*>(gate_out));
     if (cudaGetLastError() != cudaSuccess) return 371;
+    return 0;
+}
+
+int split_qgate_norm_bf16_device(
+    int device_ordinal,
+    int S,
+    int num_heads,
+    int head_dim,
+    float eps,
+    const void* src,
+    const void* norm_w,
+    void* query_out,
+    void* gate_out
+) {
+    ScopedHipDevice scoped(device_ordinal);
+    const int rows = S * num_heads;
+    if (rows <= 0 || head_dim <= 0) return 373;
+    constexpr int block = 256;
+    hipLaunchKernelGGL(
+        pfx_split_qgate_norm_bf16_kernel,
+        dim3(static_cast<unsigned int>(rows)),
+        dim3(block),
+        0,
+        0,
+        S,
+        num_heads,
+        head_dim,
+        eps,
+        static_cast<const hip_bfloat16*>(src),
+        static_cast<const hip_bfloat16*>(norm_w),
+        static_cast<hip_bfloat16*>(query_out),
+        static_cast<hip_bfloat16*>(gate_out));
+    if (cudaGetLastError() != cudaSuccess) return 374;
     return 0;
 }
 
@@ -770,6 +894,25 @@ extern "C" int supersonic_qwen35_hip_transpose_shd_hsd(
     }
 }
 
+extern "C" int supersonic_qwen35_hip_transpose_shd_to_cache_bf16(
+    size_t device_ordinal,
+    size_t S, size_t H, size_t D,
+    size_t cache_len,
+    size_t dst_pos,
+    const void* src,
+    void* cache
+) {
+    return transpose_shd_to_cache_bf16_device(
+        static_cast<int>(device_ordinal),
+        static_cast<int>(S),
+        static_cast<int>(H),
+        static_cast<int>(D),
+        static_cast<int>(cache_len),
+        static_cast<int>(dst_pos),
+        src,
+        cache);
+}
+
 extern "C" int supersonic_qwen35_hip_transpose_pad_conv(
     int dtype, size_t device_ordinal,
     size_t S, size_t C, size_t pad,
@@ -802,6 +945,26 @@ extern "C" int supersonic_qwen35_hip_extract_conv_state(
     }
 }
 
+extern "C" int supersonic_qwen35_hip_prepare_conv_input_tail(
+    int dtype, size_t device_ordinal,
+    size_t S, size_t C, size_t pad,
+    const void* src, const void* old_tail,
+    void* conv_input, void* new_tail
+) {
+    switch (dtype) {
+    case 0: return prepare_conv_input_tail_device<half>(static_cast<int>(device_ordinal),
+                static_cast<int>(S), static_cast<int>(C), static_cast<int>(pad),
+                src, old_tail, conv_input, new_tail);
+    case 1: return prepare_conv_input_tail_device<float>(static_cast<int>(device_ordinal),
+                static_cast<int>(S), static_cast<int>(C), static_cast<int>(pad),
+                src, old_tail, conv_input, new_tail);
+    case 2: return prepare_conv_input_tail_device<hip_bfloat16>(static_cast<int>(device_ordinal),
+                static_cast<int>(S), static_cast<int>(C), static_cast<int>(pad),
+                src, old_tail, conv_input, new_tail);
+    default: return 346;
+    }
+}
+
 extern "C" int supersonic_qwen35_hip_sigmoid_mul(
     int dtype, size_t device_ordinal, size_t total_elems,
     const void* data, const void* gate, void* out
@@ -812,6 +975,25 @@ extern "C" int supersonic_qwen35_hip_sigmoid_mul(
     case 2: return sigmoid_mul_device<hip_bfloat16>(static_cast<int>(device_ordinal), total_elems, data, gate, out);
     default: return 350;
     }
+}
+
+extern "C" int supersonic_qwen35_hip_cast_transpose_gate_bf16(
+    size_t device_ordinal,
+    size_t S,
+    size_t H,
+    size_t D,
+    const void* attn_hsd,
+    const void* gate_shd,
+    void* out_shd
+) {
+    return cast_transpose_gate_bf16_device(
+        static_cast<int>(device_ordinal),
+        static_cast<int>(S),
+        static_cast<int>(H),
+        static_cast<int>(D),
+        attn_hsd,
+        gate_shd,
+        out_shd);
 }
 
 extern "C" int supersonic_qwen35_hip_compute_beta_g(
@@ -832,6 +1014,21 @@ extern "C" int supersonic_qwen35_hip_compute_beta_g(
     }
 }
 
+extern "C" int supersonic_qwen35_hip_compute_beta_g_ba_bf16(
+    size_t device_ordinal,
+    size_t seq_len, size_t nv,
+    const void* BA,
+    const void* dt_bias,
+    const void* a_log_exp,
+    void* beta, void* g
+) {
+    return compute_beta_g_ba_bf16_device(
+        static_cast<int>(device_ordinal),
+        static_cast<int>(seq_len),
+        static_cast<int>(nv),
+        BA, dt_bias, a_log_exp, beta, g);
+}
+
 extern "C" int supersonic_qwen35_hip_split_qgate(
     int dtype, size_t device_ordinal,
     size_t S, size_t num_heads, size_t head_dim,
@@ -846,6 +1043,29 @@ extern "C" int supersonic_qwen35_hip_split_qgate(
                 static_cast<int>(S), static_cast<int>(num_heads), static_cast<int>(head_dim), src, query_out, gate_out);
     default: return 370;
     }
+}
+
+extern "C" int supersonic_qwen35_hip_split_qgate_norm_bf16(
+    size_t device_ordinal,
+    size_t S,
+    size_t num_heads,
+    size_t head_dim,
+    float eps,
+    const void* src,
+    const void* norm_w,
+    void* query_out,
+    void* gate_out
+) {
+    return split_qgate_norm_bf16_device(
+        static_cast<int>(device_ordinal),
+        static_cast<int>(S),
+        static_cast<int>(num_heads),
+        static_cast<int>(head_dim),
+        eps,
+        src,
+        norm_w,
+        query_out,
+        gate_out);
 }
 
 extern "C" int supersonic_qwen35_hip_split_qkv(

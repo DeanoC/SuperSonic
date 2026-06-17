@@ -4,10 +4,10 @@
 //!   - All outputs finite (no NaN / no Inf).
 //!   - Runtime under a generous 2 s sanity ceiling (hang / explosion catch).
 //!
-//! M3.1 gates (round 2+, `past_len > 0`):
-//!   - Per-layer KV cache append produces finite outputs.
-//!   - `DFlashState::crop` rolls the fill cursor back without leaking state.
-//!   - Third round with past_len > 0 and varying ctx_len is also finite.
+//! M3.1 gates (round 2+):
+//!   - The Lucebox-compatible stateless draft path produces finite outputs.
+//!   - Context windows larger than the 16-token draft block are accepted.
+//!   - Repeated calls do not leak draft KV state across rounds.
 //!
 //! The plan's <2 ms target cannot be met by the vanilla per-layer-GEMM
 //! design on gfx1150 — ~75 launches dominates wall time at q_len=16.
@@ -90,6 +90,22 @@ fn count_non_finite(bytes: &[u8]) -> (usize, usize) {
     (bad, total)
 }
 
+fn upload_fuser_input(ordinal: usize, scratch: &mut DFlashScratch, bytes: &[u8]) {
+    assert!(
+        bytes.len() <= scratch.fuser_input.len_bytes(),
+        "fuser input too small: {} < {}",
+        scratch.fuser_input.len_bytes(),
+        bytes.len()
+    );
+    gpu_hal::copy_h2d(
+        ordinal,
+        scratch.fuser_input.as_mut_ptr(),
+        bytes.as_ptr() as *const std::ffi::c_void,
+        bytes.len(),
+    )
+    .expect("upload fuser_input");
+}
+
 #[test]
 #[ignore = "requires the 2 GiB z-lab/Qwen3.5-9B-DFlash checkpoint + HIP runtime"]
 fn forward_smoke() {
@@ -113,7 +129,9 @@ fn forward_smoke() {
     let max_ctx = 256_usize;
     let rotary = RotaryTables::build(&config, ordinal, max_ctx).expect("build RoPE tables");
 
-    let mut scratch = DFlashScratch::new(ordinal, &config).expect("alloc scratch");
+    let ctx_capacity = 64_usize;
+    let mut scratch = DFlashScratch::new_with_ctx_capacity(ordinal, &config, ctx_capacity)
+        .expect("alloc scratch");
     let mut state = DFlashState::new(ordinal, &config, max_ctx).expect("alloc state");
 
     let q_len = config.block_size;
@@ -127,24 +145,18 @@ fn forward_smoke() {
             .expect("upload noise_embedding");
 
     let target_bytes = random_bf16_bytes(ctx_len * num_taps_hidden, 0xB1007_u64);
-    let target_hidden_raw = GpuBuffer::from_host_bytes(
-        ordinal,
-        ScalarType::BF16,
-        &[1, ctx_len, num_taps_hidden],
-        &target_bytes,
-    )
-    .expect("upload target_hidden_raw");
+    upload_fuser_input(ordinal, &mut scratch, &target_bytes);
 
     // ---- Warmup (5 rounds, resetting cache between to avoid overflow) ----
     for _ in 0..5 {
         state.reset();
+        upload_fuser_input(ordinal, &mut scratch, &target_bytes);
         let _ = forward(
             &weights,
             &mut state,
             &mut scratch,
             &rotary,
             &noise_embedding,
-            &target_hidden_raw,
             ForwardParams {
                 ctx_len,
                 q_len,
@@ -166,7 +178,6 @@ fn forward_smoke() {
             &mut scratch,
             &rotary,
             &noise_embedding,
-            &target_hidden_raw,
             ForwardParams {
                 ctx_len,
                 q_len,
@@ -180,13 +191,13 @@ fn forward_smoke() {
 
     // ---- Round-1 correctness ----
     state.reset();
+    upload_fuser_input(ordinal, &mut scratch, &target_bytes);
     let r1 = forward(
         &weights,
         &mut state,
         &mut scratch,
         &rotary,
         &noise_embedding,
-        &target_hidden_raw,
         ForwardParams {
             ctx_len,
             q_len,
@@ -196,9 +207,8 @@ fn forward_smoke() {
     .expect("round-1 forward");
     gpu_hal::sync(ordinal).expect("round-1 sync");
     assert_eq!(
-        state.kv_filled,
-        ctx_len + q_len,
-        "round 1 must leave kv_filled at ctx+q_len"
+        state.kv_filled, 0,
+        "stateless draft forward must not carry KV rows between rounds"
     );
     let r1_bytes = read_final_hidden_to_host(ordinal, r1);
     let (bad, total) = count_non_finite(&r1_bytes);
@@ -207,26 +217,10 @@ fn forward_smoke() {
         "round 1 final_hidden has {bad}/{total} non-finite values"
     );
 
-    // ---- M3.1 crop-and-round-2 path ----
-    // Simulate: accepted 8 draft tokens + 1 bonus = commit 9 positions this round.
-    // kv_filled was ctx+q_len=17; crop to ctx+accepted+1 = 1+8+1 = 10.
-    let committed = ctx_len + 8 + 1;
-    state.crop(committed);
-    assert_eq!(
-        state.kv_filled, committed,
-        "crop must truncate to committed length"
-    );
-
-    // Round 2: past_len = committed (10), with a new single-tap ctx and full q_len.
-    let ctx_len_r2 = 1;
+    // Round 2: stateless replay with a larger target-history window.
+    let ctx_len_r2 = 10;
     let target_bytes_r2 = random_bf16_bytes(ctx_len_r2 * num_taps_hidden, 0xB1008_u64);
-    let target_hidden_raw_r2 = GpuBuffer::from_host_bytes(
-        ordinal,
-        ScalarType::BF16,
-        &[1, ctx_len_r2, num_taps_hidden],
-        &target_bytes_r2,
-    )
-    .expect("upload round-2 target_hidden_raw");
+    upload_fuser_input(ordinal, &mut scratch, &target_bytes_r2);
     let noise_bytes_r2 = random_bf16_bytes(q_len * hidden, 0xDF1A6_u64);
     let noise_embedding_r2 = GpuBuffer::from_host_bytes(
         ordinal,
@@ -242,19 +236,17 @@ fn forward_smoke() {
         &mut scratch,
         &rotary,
         &noise_embedding_r2,
-        &target_hidden_raw_r2,
         ForwardParams {
             ctx_len: ctx_len_r2,
             q_len,
-            pos_offset: committed,
+            pos_offset: 0,
         },
     )
     .expect("round-2 forward");
     gpu_hal::sync(ordinal).expect("round-2 sync");
     assert_eq!(
-        state.kv_filled,
-        committed + ctx_len_r2 + q_len,
-        "round 2 must append ctx+q to post-crop fill"
+        state.kv_filled, 0,
+        "round 2 must still leave no persistent draft KV state"
     );
     let r2_bytes = read_final_hidden_to_host(ordinal, r2);
     let (bad, total) = count_non_finite(&r2_bytes);
@@ -263,29 +255,20 @@ fn forward_smoke() {
         "round 2 final_hidden has {bad}/{total} non-finite values"
     );
 
-    // ---- Round 3 with ctx_len > 1 (simulates a longer acceptance streak) ----
-    let committed_r2 = committed + 5 + 1; // accepted 5 draft tokens + 1 bonus in round 2
-    state.crop(committed_r2);
-    let ctx_len_r3 = 5 + 1; // taps from the 5 accepted + 1 bonus target steps
+    // ---- Round 3 with ctx_len > block_size (full target-history window) ----
+    let ctx_len_r3 = q_len + 8;
     let target_bytes_r3 = random_bf16_bytes(ctx_len_r3 * num_taps_hidden, 0xB1009_u64);
-    let target_hidden_raw_r3 = GpuBuffer::from_host_bytes(
-        ordinal,
-        ScalarType::BF16,
-        &[1, ctx_len_r3, num_taps_hidden],
-        &target_bytes_r3,
-    )
-    .expect("upload round-3 target_hidden_raw");
+    upload_fuser_input(ordinal, &mut scratch, &target_bytes_r3);
     let r3 = forward(
         &weights,
         &mut state,
         &mut scratch,
         &rotary,
         &noise_embedding_r2,
-        &target_hidden_raw_r3,
         ForwardParams {
             ctx_len: ctx_len_r3,
             q_len,
-            pos_offset: committed_r2,
+            pos_offset: 0,
         },
     )
     .expect("round-3 forward");
@@ -302,8 +285,8 @@ fn forward_smoke() {
          over {trials} trials (M2 baseline; M4 megakernel-ification target < 2 ms)"
     );
     println!(
-        "multi-round: round-2 past={committed} ctx={ctx_len_r2}, \
-         round-3 past={committed_r2} ctx={ctx_len_r3}; both finite"
+        "multi-round stateless: round-2 ctx={ctx_len_r2}, \
+         round-3 ctx={ctx_len_r3}; both finite"
     );
     assert!(
         per_call_ms < 2000.0,

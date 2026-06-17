@@ -12,14 +12,16 @@
 //! (`runner::…`) for external consumers.
 
 #[cfg(feature = "bughunt")]
-pub mod bughunt;
-#[cfg(feature = "bughunt")]
 pub mod backend_runtime;
+#[cfg(feature = "bughunt")]
+pub mod bughunt;
 pub mod decode_engine;
+pub mod dflash_ddtree;
 pub mod gemma4_engine;
 pub mod gemma4_int4_engine;
 pub mod oracle;
 pub mod prefill_engine;
+pub mod profile;
 #[path = "qwen36_moe/decode.rs"]
 pub mod qwen36_moe_decode;
 #[path = "qwen36_moe/logits.rs"]
@@ -42,7 +44,6 @@ pub mod qwen36_moe_state;
 pub mod qwen36_moe_telemetry;
 #[path = "qwen36_moe/types.rs"]
 pub mod qwen36_moe_types;
-pub mod profile;
 pub mod qwen36_q4km_audit;
 pub mod registry;
 pub mod specprefill;

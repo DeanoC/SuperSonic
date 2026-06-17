@@ -30,25 +30,41 @@ fn bench_shape(
     let q_buf = upload_zeros_bf16(ordinal, &[batch, q_heads, q_len, head_dim]);
     let k_buf = upload_zeros_bf16(ordinal, &[batch, kv_heads, kv_len, head_dim]);
     let v_buf = upload_zeros_bf16(ordinal, &[batch, kv_heads, kv_len, head_dim]);
-    let mut out_buf = GpuBuffer::zeros(
-        ordinal, ScalarType::F32, &[batch, q_heads, q_len, head_dim],
-    ).expect("alloc out");
+    let mut out_buf =
+        GpuBuffer::zeros(ordinal, ScalarType::F32, &[batch, q_heads, q_len, head_dim])
+            .expect("alloc out");
 
     let seqlen_offset = if kv_len > q_len { kv_len - q_len } else { 0 };
 
     let mut call = || {
         prefill_ffi::full_attention_prefill(
-            ordinal, ScalarType::BF16,
-            batch, q_heads, kv_heads, q_len, kv_len, head_dim,
-            scale, seqlen_offset, &q_buf, &k_buf, &v_buf, &mut out_buf,
-        ).expect("ffi");
+            ordinal,
+            ScalarType::BF16,
+            batch,
+            q_heads,
+            kv_heads,
+            q_len,
+            kv_len,
+            head_dim,
+            scale,
+            seqlen_offset,
+            &q_buf,
+            &k_buf,
+            &v_buf,
+            &mut out_buf,
+        )
+        .expect("ffi");
     };
 
-    for _ in 0..3 { call(); }
+    for _ in 0..3 {
+        call();
+    }
     gpu_hal::sync(ordinal).expect("sync");
 
     let t0 = Instant::now();
-    for _ in 0..iters { call(); }
+    for _ in 0..iters {
+        call();
+    }
     gpu_hal::sync(ordinal).expect("sync");
     let dt = t0.elapsed().as_secs_f64();
     dt * 1000.0 / iters as f64
@@ -80,7 +96,10 @@ fn main() {
 
     for (q_heads, kv_heads, head_dim) in configs {
         println!("\n=== q_heads={q_heads} kv_heads={kv_heads} head_dim={head_dim} ===");
-        println!("{:>8} {:>8} {:>10}  {:>10}", "q_len", "kv_len", "ms/call", "tok/s");
+        println!(
+            "{:>8} {:>8} {:>10}  {:>10}",
+            "q_len", "kv_len", "ms/call", "tok/s"
+        );
         for &n in &[256usize, 1024, 4096, 16384] {
             // Bulk prefill: q_len == kv_len mimics the first chunk of a long prompt.
             let iters = if n >= 4096 { 5 } else { 20 };

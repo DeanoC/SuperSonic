@@ -65,7 +65,9 @@ pub(crate) fn run_native_prefill_with_trace(
     let (debug_linear_layer, debug_full_layer, debug_mlp_layer) =
         debug_layer_flags(debug_layer, debug_kind);
     if debug_full_layer.is_some() || debug_mlp_layer.is_some() {
-        bail!("native full-attention/MLP debug traces are not available in the current prefill API");
+        bail!(
+            "native full-attention/MLP debug traces are not available in the current prefill API"
+        );
     }
     prefill_engine::prefill(
         &runtime.weights,

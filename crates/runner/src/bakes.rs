@@ -416,12 +416,7 @@ mod tests {
     use crate::Cli;
 
     fn cli(extra: &[&str]) -> Cli {
-        let mut args = vec![
-            "supersonic",
-            "--model-dir",
-            "/tmp/model",
-            "--dry-run",
-        ];
+        let mut args = vec!["supersonic", "--model-dir", "/tmp/model", "--dry-run"];
         args.extend_from_slice(extra);
         Cli::parse_from(args)
     }

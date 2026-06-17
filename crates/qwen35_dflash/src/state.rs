@@ -19,6 +19,7 @@ use crate::config::DFlashConfig;
 pub struct DFlashScratch {
     pub ordinal: usize,
     pub block_size: usize,
+    pub ctx_capacity: usize,
 
     // Fuser path: input is tap-vectors concatenated along hidden dim.
     // Shape [1, block_size, num_taps * hidden] before fc; re-used as
@@ -40,6 +41,7 @@ pub struct DFlashScratch {
     //   k/v concat: [1, ctx_len + q_len, kv_out_dim]
     pub q_proj: GpuBuffer,
     pub norm_concat: GpuBuffer,
+    pub kv_concat: GpuBuffer,
     pub k_concat: GpuBuffer,
     pub v_concat: GpuBuffer,
 
@@ -54,6 +56,7 @@ pub struct DFlashScratch {
     // Final hidden (pre-lm_head) and logits.
     pub final_hidden: GpuBuffer,
     pub logits: GpuBuffer,
+    pub argmax_indices: GpuBuffer,
 
     // Small scratch for the work-stealing matvec counter.
     pub matvec_counter: GpuBuffer,
@@ -61,8 +64,16 @@ pub struct DFlashScratch {
 
 impl DFlashScratch {
     pub fn new(ordinal: usize, config: &DFlashConfig) -> Result<Self, GpuError> {
+        Self::new_with_ctx_capacity(ordinal, config, config.block_size)
+    }
+
+    pub fn new_with_ctx_capacity(
+        ordinal: usize,
+        config: &DFlashConfig,
+        ctx_capacity: usize,
+    ) -> Result<Self, GpuError> {
         let q_len = config.block_size;
-        let ctx_len = config.block_size;
+        let ctx_len = ctx_capacity.max(1);
         let hidden = config.hidden_size;
         let q_out = config.q_out_dim();
         let kv_out = config.kv_out_dim();
@@ -73,6 +84,7 @@ impl DFlashScratch {
         Ok(Self {
             ordinal,
             block_size: config.block_size,
+            ctx_capacity: ctx_len,
 
             fuser_input: GpuBuffer::zeros(
                 ordinal,
@@ -97,6 +109,11 @@ impl DFlashScratch {
                 ScalarType::BF16,
                 &[1, ctx_len + q_len, hidden],
             )?,
+            kv_concat: GpuBuffer::zeros(
+                ordinal,
+                ScalarType::BF16,
+                &[1, ctx_len + q_len, 2 * kv_out],
+            )?,
             k_concat: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, ctx_len + q_len, kv_out])?,
             v_concat: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, ctx_len + q_len, kv_out])?,
 
@@ -107,7 +124,8 @@ impl DFlashScratch {
             swiglu_out: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, q_len, intermediate])?,
 
             final_hidden: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, q_len, hidden])?,
-            logits: GpuBuffer::zeros(ordinal, ScalarType::F32, &[1, q_len, vocab])?,
+            logits: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[q_len, vocab])?,
+            argmax_indices: GpuBuffer::zeros(ordinal, ScalarType::U32, &[q_len])?,
 
             matvec_counter: GpuBuffer::zeros(ordinal, ScalarType::F32, &[1])?,
         })

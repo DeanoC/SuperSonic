@@ -299,7 +299,10 @@ impl PrefixCache {
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
-            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
             let short_namespace = namespace.get(..16).unwrap_or(&namespace);
             if !name.starts_with(short_namespace) {
                 continue;
@@ -547,18 +550,39 @@ mod tests {
             CacheRetention::from_openai(Some("24h")),
             CacheRetention::TwentyFourHours
         );
-        assert_eq!(CacheRetention::from_openai(Some("disk")), CacheRetention::TwentyFourHours);
-        assert_eq!(CacheRetention::from_openai(Some("none")), CacheRetention::None);
-        assert_eq!(CacheRetention::from_openai(Some("off")), CacheRetention::None);
+        assert_eq!(
+            CacheRetention::from_openai(Some("disk")),
+            CacheRetention::TwentyFourHours
+        );
+        assert_eq!(
+            CacheRetention::from_openai(Some("none")),
+            CacheRetention::None
+        );
+        assert_eq!(
+            CacheRetention::from_openai(Some("off")),
+            CacheRetention::None
+        );
     }
 
     #[test]
     fn scope_hash_includes_model_key_and_user() {
         let base = scope_from_parts("model-a", Some("key-a"), Some("user-a"));
-        assert_eq!(base, scope_from_parts("model-a", Some("key-a"), Some("user-a")));
-        assert_ne!(base, scope_from_parts("model-b", Some("key-a"), Some("user-a")));
-        assert_ne!(base, scope_from_parts("model-a", Some("key-b"), Some("user-a")));
-        assert_ne!(base, scope_from_parts("model-a", Some("key-a"), Some("user-b")));
+        assert_eq!(
+            base,
+            scope_from_parts("model-a", Some("key-a"), Some("user-a"))
+        );
+        assert_ne!(
+            base,
+            scope_from_parts("model-b", Some("key-a"), Some("user-a"))
+        );
+        assert_ne!(
+            base,
+            scope_from_parts("model-a", Some("key-b"), Some("user-a"))
+        );
+        assert_ne!(
+            base,
+            scope_from_parts("model-a", Some("key-a"), Some("user-b"))
+        );
     }
 
     #[test]

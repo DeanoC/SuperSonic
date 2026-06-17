@@ -120,11 +120,7 @@ struct Cli {
 
     /// Maximum number of resident prefix snapshots. Snapshots clone model
     /// state on GPU, so the default is intentionally conservative.
-    #[arg(
-        long,
-        env = "SUPERSONIC_PREFIX_CACHE_MAX_ENTRIES",
-        default_value_t = 1
-    )]
+    #[arg(long, env = "SUPERSONIC_PREFIX_CACHE_MAX_ENTRIES", default_value_t = 1)]
     prefix_cache_max_entries: usize,
 
     /// Maximum resident prefix snapshot bytes. Defaults to an automatic
