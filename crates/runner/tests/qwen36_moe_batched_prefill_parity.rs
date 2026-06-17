@@ -48,16 +48,30 @@ fn run_supersonic_capture_logits(
 }
 
 fn cossim(a: &[f32], b: &[f32]) -> f64 {
-    let dot: f64 = a.iter().zip(b).map(|(x, y)| f64::from(*x) * f64::from(*y)).sum();
+    let dot: f64 = a
+        .iter()
+        .zip(b)
+        .map(|(x, y)| f64::from(*x) * f64::from(*y))
+        .sum();
     let na: f64 = a.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
     let nb: f64 = b.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
-    if na == 0.0 || nb == 0.0 { 0.0 } else { dot / (na * nb) }
+    if na == 0.0 || nb == 0.0 {
+        0.0
+    } else {
+        dot / (na * nb)
+    }
 }
 
 fn argmax(v: &[f32]) -> usize {
     v.iter()
         .enumerate()
-        .fold((0usize, f32::NEG_INFINITY), |a, (i, &x)| if x > a.1 { (i, x) } else { a })
+        .fold((0usize, f32::NEG_INFINITY), |a, (i, &x)| {
+            if x > a.1 {
+                (i, x)
+            } else {
+                a
+            }
+        })
         .0
 }
 
@@ -81,11 +95,16 @@ fn batched_prefill_matches_per_token() {
     let prompt = "The transformer architecture has revolutionized natural language processing through its self-attention mechanism, allowing models to weigh the importance of different parts of the input sequence dynamically. Unlike recurrent networks, transformers can process all tokens in parallel during training, making them highly efficient on modern accelerator hardware. The overall result is";
 
     let common: Vec<&str> = vec![
-        "--backend", "hip",
-        "--model", "qwen3.6-35b-a3b",
-        "--model-dir", &target,
-        "--prompt", prompt,
-        "--max-new-tokens", "1",
+        "--backend",
+        "hip",
+        "--model",
+        "qwen3.6-35b-a3b",
+        "--model-dir",
+        &target,
+        "--prompt",
+        prompt,
+        "--max-new-tokens",
+        "1",
     ];
 
     // M13: explicitly disable all three stages to get the LEGACY per-token
@@ -101,8 +120,7 @@ fn batched_prefill_matches_per_token() {
     .expect("baseline (per-token, env=0 forced)");
     // No env vars set → the new default: batched prefill + batched attn +
     // grouped FFN all active.
-    let batched = run_supersonic_capture_logits(&common, &[])
-        .expect("batched (default)");
+    let batched = run_supersonic_capture_logits(&common, &[]).expect("batched (default)");
 
     assert_eq!(
         baseline.len(),
@@ -128,5 +146,9 @@ fn batched_prefill_matches_per_token() {
         "cossim {:.6} < 0.999 (per-token vs batched diverged beyond INT4/BF16 noise)",
         cs
     );
-    assert_eq!(am_b, am_n, "argmax mismatch: per-token={} batched={}", am_b, am_n);
+    assert_eq!(
+        am_b, am_n,
+        "argmax mismatch: per-token={} batched={}",
+        am_b, am_n
+    );
 }

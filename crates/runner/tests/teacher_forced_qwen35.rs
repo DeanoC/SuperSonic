@@ -11,8 +11,8 @@ fn teacher_forced_qwen35_emits_json_line() {
             return;
         }
     };
-    let bin = std::env::var("SUPERSONIC_BIN")
-        .unwrap_or_else(|_| "./target/release/supersonic".into());
+    let bin =
+        std::env::var("SUPERSONIC_BIN").unwrap_or_else(|_| "./target/release/supersonic".into());
     let out = std::process::Command::new(&bin)
         .args([
             "--model",

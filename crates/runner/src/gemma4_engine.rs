@@ -2313,7 +2313,14 @@ impl Gemma4Engine {
                 &mut self.counter,
             )?;
             let mut gated_act = GpuBuffer::zeros(device, dtype, &[1, ple_hidden])?;
-            g4::gelu_tanh_gate_mul(device, dtype, &mut gated_act, &gated, &pli_slice, ple_hidden)?;
+            g4::gelu_tanh_gate_mul(
+                device,
+                dtype,
+                &mut gated_act,
+                &gated,
+                &pli_slice,
+                ple_hidden,
+            )?;
             let mut projected = GpuBuffer::zeros(device, dtype, &[1, hidden_size])?;
             g4::matvec_batched(
                 device,

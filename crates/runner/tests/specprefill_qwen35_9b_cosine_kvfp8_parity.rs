@@ -50,9 +50,7 @@ fn run_supersonic_capture_logits(args: &[&str]) -> anyhow::Result<Vec<f32>> {
         .collect()
 }
 
-fn run_supersonic_capture_logits_and_text(
-    args: &[&str],
-) -> anyhow::Result<(Vec<f32>, String)> {
+fn run_supersonic_capture_logits_and_text(args: &[&str]) -> anyhow::Result<(Vec<f32>, String)> {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_supersonic"));
     cmd.args(args);
     cmd.arg("--dump-last-logits");
@@ -98,16 +96,30 @@ fn run_supersonic_capture_logits_and_text(
 }
 
 fn cossim(a: &[f32], b: &[f32]) -> f64 {
-    let dot: f64 = a.iter().zip(b).map(|(x, y)| f64::from(*x) * f64::from(*y)).sum();
+    let dot: f64 = a
+        .iter()
+        .zip(b)
+        .map(|(x, y)| f64::from(*x) * f64::from(*y))
+        .sum();
     let na: f64 = a.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
     let nb: f64 = b.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>().sqrt();
-    if na == 0.0 || nb == 0.0 { 0.0 } else { dot / (na * nb) }
+    if na == 0.0 || nb == 0.0 {
+        0.0
+    } else {
+        dot / (na * nb)
+    }
 }
 
 fn argmax(v: &[f32]) -> usize {
     v.iter()
         .enumerate()
-        .fold((0usize, f32::NEG_INFINITY), |a, (i, &x)| if x > a.1 { (i, x) } else { a })
+        .fold((0usize, f32::NEG_INFINITY), |a, (i, &x)| {
+            if x > a.1 {
+                (i, x)
+            } else {
+                a
+            }
+        })
         .0
 }
 
@@ -153,20 +165,28 @@ fn run_parity_check(
     cossim_floor: f64,
 ) {
     let common: Vec<&str> = vec![
-        "--backend", "hip",
-        "--model", "qwen3.5-9b",
-        "--model-dir", target,
-        "--prompt", PROMPT,
-        "--max-new-tokens", "1",
+        "--backend",
+        "hip",
+        "--model",
+        "qwen3.5-9b",
+        "--model-dir",
+        target,
+        "--prompt",
+        PROMPT,
+        "--max-new-tokens",
+        "1",
         "--kv-fp8",
     ];
     let dense_logits = run_supersonic_capture_logits(&common).expect("dense kv-fp8");
     let mut sparse_args = common.clone();
     sparse_args.extend_from_slice(&[
-        "--specprefill-draft-dir", draft,
-        "--specprefill-algorithm", "cosine",
+        "--specprefill-draft-dir",
+        draft,
+        "--specprefill-algorithm",
+        "cosine",
         "--specprefill-unload-draft",
-        "--specprefill-keep-ratio", keep_ratio,
+        "--specprefill-keep-ratio",
+        keep_ratio,
     ]);
     let sparse_logits =
         run_supersonic_capture_logits(&sparse_args).expect("sparse cosine + kv-fp8");
@@ -185,9 +205,18 @@ fn run_parity_check(
         "[cosine kv-fp8 parity {expected_label}] cossim={:.6} dense_argmax={} sparse_argmax={} top5_overlap={}/5",
         cs, dense_argmax, sparse_argmax, overlap
     );
-    assert_eq!(dense_argmax, sparse_argmax, "[{expected_label}] argmax mismatch");
-    assert!(cs >= cossim_floor, "[{expected_label}] cossim {cs} < {cossim_floor}");
-    assert!(overlap >= 4, "[{expected_label}] top-5 overlap {overlap} < 4");
+    assert_eq!(
+        dense_argmax, sparse_argmax,
+        "[{expected_label}] argmax mismatch"
+    );
+    assert!(
+        cs >= cossim_floor,
+        "[{expected_label}] cossim {cs} < {cossim_floor}"
+    );
+    assert!(
+        overlap >= 4,
+        "[{expected_label}] top-5 overlap {overlap} < 4"
+    );
 }
 
 #[test]
@@ -205,7 +234,13 @@ fn cosine_kvfp8_qwen35_9b_keep_100_identity() {
         Some(t) => t,
         None => return,
     };
-    run_parity_check(&target, &draft, "1.00", "cosine kv-fp8 keep=1.00 identity", 0.999);
+    run_parity_check(
+        &target,
+        &draft,
+        "1.00",
+        "cosine kv-fp8 keep=1.00 identity",
+        0.999,
+    );
 }
 
 #[test]
@@ -215,25 +250,39 @@ fn cosine_kvfp8_qwen35_9b_keep_100_multitoken_identity() {
         None => return,
     };
     let common: Vec<&str> = vec![
-        "--backend", "hip",
-        "--model", "qwen3.5-9b",
-        "--model-dir", &target,
-        "--prompt", PROMPT,
-        "--max-new-tokens", "8",
+        "--backend",
+        "hip",
+        "--model",
+        "qwen3.5-9b",
+        "--model-dir",
+        &target,
+        "--prompt",
+        PROMPT,
+        "--max-new-tokens",
+        "8",
         "--kv-fp8",
     ];
     let (_, dense_text) = run_supersonic_capture_logits_and_text(&common).expect("dense kv-fp8");
     let mut sparse_args = common.clone();
     sparse_args.extend_from_slice(&[
-        "--specprefill-draft-dir", &draft,
-        "--specprefill-algorithm", "cosine",
+        "--specprefill-draft-dir",
+        &draft,
+        "--specprefill-algorithm",
+        "cosine",
         "--specprefill-unload-draft",
-        "--specprefill-keep-ratio", "1.00",
+        "--specprefill-keep-ratio",
+        "1.00",
     ]);
     let (_, sparse_text) =
         run_supersonic_capture_logits_and_text(&sparse_args).expect("sparse cosine + kv-fp8");
-    eprintln!("[cosine kv-fp8 multitoken-identity] dense:  {:?}", dense_text);
-    eprintln!("[cosine kv-fp8 multitoken-identity] sparse: {:?}", sparse_text);
+    eprintln!(
+        "[cosine kv-fp8 multitoken-identity] dense:  {:?}",
+        dense_text
+    );
+    eprintln!(
+        "[cosine kv-fp8 multitoken-identity] sparse: {:?}",
+        sparse_text
+    );
     assert_eq!(
         dense_text.trim(),
         sparse_text.trim(),

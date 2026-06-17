@@ -3,9 +3,7 @@ use qwen35::state::{LayerState, ModelState};
 
 use crate::decode_engine::DecodeEngine;
 use crate::prefill_engine;
-use crate::tensor_bytes::{
-    bf16_bytes_to_f32 as decode_bf16_le, f32_bytes_to_f32 as decode_f32_le,
-};
+use crate::tensor_bytes::{bf16_bytes_to_f32 as decode_bf16_le, f32_bytes_to_f32 as decode_f32_le};
 
 pub(crate) fn trace_kv_cache(
     engine: &DecodeEngine,

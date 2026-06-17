@@ -23,17 +23,16 @@ fn make_bf16_kv_cache(
         })
         .collect();
     let host_f32: Vec<f32> = host.iter().map(|b| b.to_f32()).collect();
-    let mut buf = GpuBuffer::zeros(
+    let mut buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, kv_heads, cap, head_dim])
+        .expect("alloc kv");
+    let bytes = unsafe { std::slice::from_raw_parts(host.as_ptr() as *const u8, host.len() * 2) };
+    gpu_hal::copy_h2d(
         ordinal,
-        ScalarType::BF16,
-        &[1, kv_heads, cap, head_dim],
+        buf.as_mut_ptr(),
+        bytes.as_ptr() as *const _,
+        bytes.len(),
     )
-    .expect("alloc kv");
-    let bytes = unsafe {
-        std::slice::from_raw_parts(host.as_ptr() as *const u8, host.len() * 2)
-    };
-    gpu_hal::copy_h2d(ordinal, buf.as_mut_ptr(), bytes.as_ptr() as *const _, bytes.len())
-        .expect("h2d kv");
+    .expect("h2d kv");
     (buf, host_f32)
 }
 
@@ -62,17 +61,16 @@ fn pflash_cosine_score_matches_cpu_reference() {
     }
     let ordinal = 0usize;
     let kv_heads = 4usize;
-    let cap = 200usize;            // > n_pos so the kernel exercises the cap-stride path
-    let head_dim = 128usize;       // realistic Qwen3.5 head_dim
-    let n_pos = 137usize;          // non-power-of-two prompt length, < cap
+    let cap = 200usize; // > n_pos so the kernel exercises the cap-stride path
+    let head_dim = 128usize; // realistic Qwen3.5 head_dim
+    let n_pos = 137usize; // non-power-of-two prompt length, < cap
     let block_size = 32usize;
     let n_blocks = (n_pos + block_size - 1) / block_size; // = 5
     let last_pos = n_pos - 1;
     let kv_dim = kv_heads * head_dim;
 
     let (k_buf, k_host) = make_bf16_kv_cache(ordinal, kv_heads, cap, head_dim, 0);
-    let mut scores = GpuBuffer::zeros(ordinal, ScalarType::F32, &[n_blocks])
-        .expect("alloc scores");
+    let mut scores = GpuBuffer::zeros(ordinal, ScalarType::F32, &[n_blocks]).expect("alloc scores");
 
     pflash_cosine_score(
         ordinal,

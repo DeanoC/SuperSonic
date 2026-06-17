@@ -17,6 +17,7 @@ struct Qwen35DecodeLayerDesc {
     float input_norm_eps;
     const void* post_attn_norm_w;      // [hidden_size] BF16
     float post_attn_norm_eps;
+    int rms_norm_add_unit_offset;      // 1 for Gemma-style RMSNorm weight+1, 0 for plain RMSNorm
     // --- MLP weights (both layer types) ---
     const void* gate_proj_w;           // [intermediate_size, hidden_size] BF16
     const void* up_proj_w;             // [intermediate_size, hidden_size] BF16
@@ -360,6 +361,147 @@ __global__ void supersonic_qwen35_full_attention_prefill_kernel(
     }
 }
 
+template <typename T>
+__global__ void supersonic_qwen35_full_attention_tree_prefill_kernel(
+    int batch_size,
+    int q_heads,
+    int kv_heads,
+    int tree_len,
+    int prefix_len,
+    int head_dim,
+    int num_kv_groups,
+    float scale,
+    const T* query,
+    const T* prefix_key,
+    const T* prefix_value,
+    const T* tree_key,
+    const T* tree_value,
+    const uint8_t* visibility,
+    float* out,
+    unsigned int* row_counter
+) {
+    const int lane = threadIdx.x;
+    if (lane >= warpSize) {
+        return;
+    }
+
+    const int total_rows = batch_size * q_heads * tree_len;
+    while (true) {
+        unsigned int row = 0;
+        if (lane == 0) {
+            row = atomicAdd(row_counter, 1u);
+        }
+        row = __shfl(row, 0);
+        if ((int)row >= total_rows) {
+            return;
+        }
+
+        const int q_pos = row % tree_len;
+        const int q_head = (row / tree_len) % q_heads;
+        const int batch = row / (tree_len * q_heads);
+        const int kv_head = q_head / num_kv_groups;
+
+        const T* q_row = query + (((batch * q_heads + q_head) * tree_len + q_pos) * head_dim);
+        const T* prefix_k_head = prefix_key + ((batch * kv_heads + kv_head) * prefix_len * head_dim);
+        const T* prefix_v_head = prefix_value + ((batch * kv_heads + kv_head) * prefix_len * head_dim);
+        const T* tree_k_head = tree_key + ((batch * kv_heads + kv_head) * tree_len * head_dim);
+        const T* tree_v_head = tree_value + ((batch * kv_heads + kv_head) * tree_len * head_dim);
+        float* out_row = out + (((batch * q_heads + q_head) * tree_len + q_pos) * head_dim);
+
+        float local_acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+        int local_dims[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
+        int local_count = 0;
+        for (int d = lane; d < head_dim && local_count < 8; d += warpSize) {
+            local_dims[local_count++] = d;
+        }
+
+        __shared__ float shared_max;
+        __shared__ float shared_alpha;
+        __shared__ float shared_weight;
+        __shared__ float shared_denom;
+        __shared__ float shared_inv_denom;
+
+        if (lane == 0) {
+            shared_max = -INFINITY;
+            shared_denom = 0.0f;
+        }
+        __syncthreads();
+
+        for (int k_pos = 0; k_pos < prefix_len; ++k_pos) {
+            const T* k_row = prefix_k_head + k_pos * head_dim;
+            const T* v_row = prefix_v_head + k_pos * head_dim;
+
+            float partial = 0.0f;
+            for (int d = lane; d < head_dim; d += warpSize) {
+                partial += supersonic_qwen35_to_float(q_row[d]) * supersonic_qwen35_to_float(k_row[d]);
+            }
+            const float score = supersonic_qwen35_wave_sum(partial) * scale;
+
+            if (lane == 0) {
+                const float m_old = shared_max;
+                const float m_new = score > m_old ? score : m_old;
+                const float alpha = (m_old == -INFINITY) ? 0.0f : expf(m_old - m_new);
+                shared_alpha = alpha;
+                shared_weight = expf(score - m_new);
+                shared_denom = shared_denom * alpha + shared_weight;
+                shared_max = m_new;
+            }
+            __syncthreads();
+
+            const float alpha = shared_alpha;
+            const float weight = shared_weight;
+            for (int i = 0; i < local_count; ++i) {
+                local_acc[i] =
+                    local_acc[i] * alpha + weight * supersonic_qwen35_to_float(v_row[local_dims[i]]);
+            }
+            __syncthreads();
+        }
+
+        for (int k_pos = 0; k_pos < tree_len; ++k_pos) {
+            if (visibility[q_pos * tree_len + k_pos] == 0) {
+                continue;
+            }
+            const T* k_row = tree_k_head + k_pos * head_dim;
+            const T* v_row = tree_v_head + k_pos * head_dim;
+
+            float partial = 0.0f;
+            for (int d = lane; d < head_dim; d += warpSize) {
+                partial += supersonic_qwen35_to_float(q_row[d]) * supersonic_qwen35_to_float(k_row[d]);
+            }
+            const float score = supersonic_qwen35_wave_sum(partial) * scale;
+
+            if (lane == 0) {
+                const float m_old = shared_max;
+                const float m_new = score > m_old ? score : m_old;
+                const float alpha = (m_old == -INFINITY) ? 0.0f : expf(m_old - m_new);
+                shared_alpha = alpha;
+                shared_weight = expf(score - m_new);
+                shared_denom = shared_denom * alpha + shared_weight;
+                shared_max = m_new;
+            }
+            __syncthreads();
+
+            const float alpha = shared_alpha;
+            const float weight = shared_weight;
+            for (int i = 0; i < local_count; ++i) {
+                local_acc[i] =
+                    local_acc[i] * alpha + weight * supersonic_qwen35_to_float(v_row[local_dims[i]]);
+            }
+            __syncthreads();
+        }
+
+        if (lane == 0) {
+            shared_inv_denom = shared_denom > 0.0f ? 1.0f / shared_denom : 0.0f;
+        }
+        __syncthreads();
+        const float inv_denom = shared_inv_denom;
+        for (int i = 0; i < local_count; ++i) {
+            out_row[local_dims[i]] = local_acc[i] * inv_denom;
+        }
+        __syncthreads();
+    }
+}
+
 // Stage 3: K-tiled FlashAttention-style prefill attention.
 //
 // Grid:  (ceil(q_len / BM), q_heads, batch)
@@ -531,6 +673,67 @@ __global__ void supersonic_qwen35_linear_prefill_conv_pack_kernel(
     for (int tap = 0; tap < kernel_size; ++tap) {
         acc += supersonic_qwen35_to_float(mixed_qkv[input_c_offset + t + static_cast<size_t>(tap)]) *
             supersonic_qwen35_to_float(weights[weight_offset + static_cast<size_t>(tap)]);
+    }
+
+    const float silu = acc * supersonic_qwen35_sigmoid_fast(acc);
+    out[tid] = supersonic_qwen35_from_float<T>(silu);
+}
+
+template <typename T>
+__global__ void supersonic_qwen35_linear_tree_conv_pack_kernel(
+    int batch_size,
+    int conv_dim,
+    int total_len,
+    int tree_len,
+    int kernel_size,
+    const T* mixed_qkv,
+    const T* weights,
+    const int* parent_ids,
+    T* out
+) {
+    const size_t tid = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x;
+    const size_t output_elems =
+        static_cast<size_t>(batch_size) * static_cast<size_t>(tree_len) * static_cast<size_t>(conv_dim);
+    if (tid >= output_elems) {
+        return;
+    }
+
+    const size_t b = tid / (static_cast<size_t>(tree_len) * static_cast<size_t>(conv_dim));
+    const size_t rem = tid - b * static_cast<size_t>(tree_len) * static_cast<size_t>(conv_dim);
+    const int t = static_cast<int>(rem / static_cast<size_t>(conv_dim));
+    const size_t c = rem - static_cast<size_t>(t) * static_cast<size_t>(conv_dim);
+
+    const int state_len = kernel_size - 1;
+    const size_t input_b_offset =
+        b * static_cast<size_t>(conv_dim) * static_cast<size_t>(total_len);
+    const size_t input_c_offset = input_b_offset + c * static_cast<size_t>(total_len);
+    const size_t weight_offset = c * static_cast<size_t>(kernel_size);
+
+    float acc = 0.0f;
+    for (int tap = 0; tap < kernel_size; ++tap) {
+        const int steps = state_len - tap;
+        int source_col = state_len + t;
+        if (steps > 0) {
+            int node = t;
+            int walked = 0;
+            while (walked < steps) {
+                const int parent = parent_ids[node];
+                if (parent < 0) {
+                    break;
+                }
+                node = parent;
+                ++walked;
+            }
+            if (walked == steps) {
+                source_col = state_len + node;
+            } else {
+                source_col = tap + walked;
+            }
+        }
+        if (source_col >= 0 && source_col < total_len) {
+            acc += supersonic_qwen35_to_float(mixed_qkv[input_c_offset + static_cast<size_t>(source_col)]) *
+                supersonic_qwen35_to_float(weights[weight_offset + static_cast<size_t>(tap)]);
+        }
     }
 
     const float silu = acc * supersonic_qwen35_sigmoid_fast(acc);
@@ -877,7 +1080,8 @@ __global__ void supersonic_qwen35_linear_decode_prepare_kernel(
 
     const int batch = pair / num_v_heads;
     const int v_head = pair - batch * num_v_heads;
-    const int k_head = v_head / head_repeat;
+    const int num_k_heads = num_v_heads / head_repeat;
+    const int k_head = v_head % num_k_heads;
     const int mixed_batch_base = batch * conv_dim;
     const int state_batch_base = batch * conv_dim * state_len;
     const int pair_out_base = pair * packed_width;
@@ -1005,6 +1209,7 @@ __device__ inline void supersonic_qwen35_delta_recurrent_prefill_impl(
     const T* beta,
     const T* g,
     T* out,
+    T* state_trace,
     int tid
 ) {
     const int total_threads = batch_heads * v_head_dim;
@@ -1050,6 +1255,15 @@ __device__ inline void supersonic_qwen35_delta_recurrent_prefill_impl(
             state[k_idx] += supersonic_qwen35_to_float(key[key_row + k_idx]) * delta;
         }
 
+        if (state_trace) {
+            const int trace_base =
+                ((bh * seq_len + t) * k_head_dim) * v_head_dim + v_idx;
+            for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
+                state_trace[trace_base + k_idx * v_head_dim] =
+                    supersonic_qwen35_from_float<T>(state[k_idx]);
+            }
+        }
+
         float out_t = 0.0f;
         for (int k_idx = 0; k_idx < k_head_dim; ++k_idx) {
             out_t += state[k_idx] * supersonic_qwen35_to_float(query[key_row + k_idx]);
@@ -1075,7 +1289,8 @@ __global__ void supersonic_qwen35_delta_recurrent_prefill_kernel(
     const T* value,
     const T* beta,
     const T* g,
-    T* out
+    T* out,
+    T* state_trace
 ) {
     const int tid = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
     supersonic_qwen35_delta_recurrent_prefill_impl(
@@ -1090,8 +1305,675 @@ __global__ void supersonic_qwen35_delta_recurrent_prefill_kernel(
         beta,
         g,
         out,
+        state_trace,
         tid
     );
+}
+
+__device__ inline float supersonic_qwen35_block_sum_128(float value, float* smem) {
+    const int tid = threadIdx.x;
+    smem[tid] = value;
+    __syncthreads();
+    if (tid < 64) smem[tid] += smem[tid + 64];
+    __syncthreads();
+    if (tid < 32) smem[tid] += smem[tid + 32];
+    __syncthreads();
+    if (tid < 16) smem[tid] += smem[tid + 16];
+    __syncthreads();
+    if (tid < 8) smem[tid] += smem[tid + 8];
+    __syncthreads();
+    if (tid < 4) smem[tid] += smem[tid + 4];
+    __syncthreads();
+    if (tid < 2) smem[tid] += smem[tid + 2];
+    __syncthreads();
+    if (tid < 1) smem[tid] += smem[tid + 1];
+    __syncthreads();
+    const float sum = smem[0];
+    __syncthreads();
+    return sum;
+}
+
+__device__ inline float supersonic_qwen35_block_sum_128_wave(float value, float* smem) {
+    const int tid = threadIdx.x;
+    const int lane = tid % warpSize;
+    const int wave = tid / warpSize;
+    const int waves = (blockDim.x + warpSize - 1) / warpSize;
+
+    value = supersonic_qwen35_wave_sum(value);
+    if (lane == 0) {
+        smem[wave] = value;
+    }
+    __syncthreads();
+
+    float total = 0.0f;
+    if (wave == 0) {
+        total = lane < waves ? smem[lane] : 0.0f;
+        total = supersonic_qwen35_wave_sum(total);
+        if (lane == 0) {
+            smem[0] = total;
+        }
+    }
+    __syncthreads();
+    return smem[0];
+}
+
+__global__ __launch_bounds__(128, 2)
+void supersonic_qwen35_delta_recurrent_prefill_capture_f32_k128_legacy_kernel(
+    int batch_heads,
+    int seq_len,
+    const float* __restrict__ initial_state,
+    const float* __restrict__ query,
+    const float* __restrict__ key,
+    const float* __restrict__ value,
+    const float* __restrict__ beta,
+    const float* __restrict__ g,
+    float* __restrict__ out,
+    float* __restrict__ state_trace
+) {
+    constexpr int K = 128;
+    constexpr int V = 128;
+    const int k_idx = threadIdx.x;
+    const int v_idx = blockIdx.x;
+    const int bh = blockIdx.y;
+
+    __shared__ float reduce_smem[K];
+
+    const int state_stride = K * V;
+    const int token_stride_k = seq_len * K;
+    const int token_stride_v = seq_len * V;
+    const int token_stride_s = seq_len;
+    const int out_base = bh * (seq_len + K) * V;
+
+    float state = initial_state[bh * state_stride + k_idx * V + v_idx];
+
+    for (int t = 0; t < seq_len; ++t) {
+        const int key_row = bh * token_stride_k + t * K;
+        const int value_row = bh * token_stride_v + t * V;
+        const int beta_row = bh * token_stride_s + t;
+        const float g_t = expf(g[beta_row]);
+        const float k_t = key[key_row + k_idx];
+
+        state *= g_t;
+        const float kv_mem = supersonic_qwen35_block_sum_128(state * k_t, reduce_smem);
+        const float delta = (value[value_row + v_idx] - kv_mem) * beta[beta_row];
+
+        state += k_t * delta;
+        state_trace[((bh * seq_len + t) * K + k_idx) * V + v_idx] = state;
+
+        const float out_t =
+            supersonic_qwen35_block_sum_128(state * query[key_row + k_idx], reduce_smem);
+        if (k_idx == 0) {
+            out[out_base + t * V + v_idx] = out_t;
+        }
+    }
+
+    const int state_out = out_base + seq_len * V;
+    out[state_out + k_idx * V + v_idx] = state;
+}
+
+__global__ __launch_bounds__(128, 2)
+void supersonic_qwen35_delta_recurrent_prefill_capture_f32_k128_kernel(
+    int batch_heads,
+    int seq_len,
+    const float* __restrict__ initial_state,
+    const float* __restrict__ query,
+    const float* __restrict__ key,
+    const float* __restrict__ value,
+    const float* __restrict__ beta,
+    const float* __restrict__ g,
+    float* __restrict__ out,
+    float* __restrict__ state_trace
+) {
+    constexpr int K = 128;
+    constexpr int V = 128;
+    const int k_idx = threadIdx.x;
+    const int v_idx = blockIdx.x;
+    const int bh = blockIdx.y;
+
+    __shared__ float reduce_smem[K];
+
+    const int state_stride = K * V;
+    const int token_stride_k = seq_len * K;
+    const int token_stride_v = seq_len * V;
+    const int token_stride_s = seq_len;
+    const int out_base = bh * (seq_len + K) * V;
+
+    float state = initial_state[bh * state_stride + k_idx * V + v_idx];
+
+    for (int t = 0; t < seq_len; ++t) {
+        const int key_row = bh * token_stride_k + t * K;
+        const int value_row = bh * token_stride_v + t * V;
+        const int beta_row = bh * token_stride_s + t;
+        const float g_t = expf(g[beta_row]);
+        const float k_t = key[key_row + k_idx];
+
+        state *= g_t;
+        const float kv_mem = supersonic_qwen35_block_sum_128_wave(state * k_t, reduce_smem);
+        const float delta = (value[value_row + v_idx] - kv_mem) * beta[beta_row];
+
+        state += k_t * delta;
+        state_trace[((bh * seq_len + t) * K + k_idx) * V + v_idx] = state;
+
+        const float out_t =
+            supersonic_qwen35_block_sum_128_wave(state * query[key_row + k_idx], reduce_smem);
+        if (k_idx == 0) {
+            out[out_base + t * V + v_idx] = out_t;
+        }
+    }
+
+    const int state_out = out_base + seq_len * V;
+    out[state_out + k_idx * V + v_idx] = state;
+}
+
+__global__ __launch_bounds__(128, 2)
+void supersonic_qwen35_delta_recurrent_prefill_capture_bf16_trace_f32_k128_kernel(
+    int batch_heads,
+    int seq_len,
+    const float* __restrict__ initial_state,
+    const float* __restrict__ query,
+    const float* __restrict__ key,
+    const float* __restrict__ value,
+    const float* __restrict__ beta,
+    const float* __restrict__ g,
+    float* __restrict__ out,
+    hip_bfloat16* __restrict__ state_trace
+) {
+    constexpr int K = 128;
+    constexpr int V = 128;
+    const int k_idx = threadIdx.x;
+    const int v_idx = blockIdx.x;
+    const int bh = blockIdx.y;
+
+    __shared__ float reduce_smem[K];
+
+    const int state_stride = K * V;
+    const int token_stride_k = seq_len * K;
+    const int token_stride_v = seq_len * V;
+    const int token_stride_s = seq_len;
+    const int out_base = bh * (seq_len + K) * V;
+
+    float state = initial_state[bh * state_stride + k_idx * V + v_idx];
+
+    for (int t = 0; t < seq_len; ++t) {
+        const int key_row = bh * token_stride_k + t * K;
+        const int value_row = bh * token_stride_v + t * V;
+        const int beta_row = bh * token_stride_s + t;
+        const float g_t = expf(g[beta_row]);
+        const float k_t = key[key_row + k_idx];
+
+        state *= g_t;
+        const float kv_mem = supersonic_qwen35_block_sum_128_wave(state * k_t, reduce_smem);
+        const float delta = (value[value_row + v_idx] - kv_mem) * beta[beta_row];
+
+        state += k_t * delta;
+        state_trace[((bh * seq_len + t) * K + k_idx) * V + v_idx] =
+            supersonic_qwen35_from_float<hip_bfloat16>(state);
+
+        const float out_t =
+            supersonic_qwen35_block_sum_128_wave(state * query[key_row + k_idx], reduce_smem);
+        if (k_idx == 0) {
+            out[out_base + t * V + v_idx] = out_t;
+        }
+    }
+
+    const int state_out = out_base + seq_len * V;
+    out[state_out + k_idx * V + v_idx] = state;
+}
+
+__global__ __launch_bounds__(128, 2)
+void supersonic_qwen35_delta_recurrent_prefill_capture_bf16_trace_transposed_f32_k128_kernel(
+    int batch_heads,
+    int seq_len,
+    const float* __restrict__ initial_state,
+    const float* __restrict__ query,
+    const float* __restrict__ key,
+    const float* __restrict__ value,
+    const float* __restrict__ beta,
+    const float* __restrict__ g,
+    float* __restrict__ out,
+    hip_bfloat16* __restrict__ state_trace
+) {
+    constexpr int K = 128;
+    constexpr int V = 128;
+    const int k_idx = threadIdx.x;
+    const int v_idx = blockIdx.x;
+    const int bh = blockIdx.y;
+
+    __shared__ float reduce_smem[K];
+
+    const int state_stride = K * V;
+    const int token_stride_k = seq_len * K;
+    const int token_stride_v = seq_len * V;
+    const int token_stride_s = seq_len;
+    const int out_base = bh * (seq_len + K) * V;
+
+    float state = initial_state[bh * state_stride + k_idx * V + v_idx];
+
+    for (int t = 0; t < seq_len; ++t) {
+        const int key_row = bh * token_stride_k + t * K;
+        const int value_row = bh * token_stride_v + t * V;
+        const int beta_row = bh * token_stride_s + t;
+        const float g_t = expf(g[beta_row]);
+        const float k_t = key[key_row + k_idx];
+
+        state *= g_t;
+        const float kv_mem = supersonic_qwen35_block_sum_128_wave(state * k_t, reduce_smem);
+        const float delta = (value[value_row + v_idx] - kv_mem) * beta[beta_row];
+
+        state += k_t * delta;
+        state_trace[((bh * seq_len + t) * V + v_idx) * K + k_idx] =
+            supersonic_qwen35_from_float<hip_bfloat16>(state);
+
+        const float out_t =
+            supersonic_qwen35_block_sum_128_wave(state * query[key_row + k_idx], reduce_smem);
+        if (k_idx == 0) {
+            out[out_base + t * V + v_idx] = out_t;
+        }
+    }
+
+    const int state_out = out_base + seq_len * V;
+    out[state_out + k_idx * V + v_idx] = state;
+}
+
+__device__ __forceinline__ void qwen35_store_q8_0_block_scale(uint8_t* dst, half d_half) {
+    union {
+        half h;
+        uint16_t u;
+    } bits;
+    bits.h = d_half;
+    dst[0] = static_cast<uint8_t>(bits.u & 0xffu);
+    dst[1] = static_cast<uint8_t>((bits.u >> 8) & 0xffu);
+}
+
+__device__ __forceinline__ half qwen35_load_q8_0_block_scale(const uint8_t* src) {
+    union {
+        uint16_t u;
+        half h;
+    } bits;
+    bits.u = static_cast<uint16_t>(src[0]) |
+        (static_cast<uint16_t>(src[1]) << 8);
+    return bits.h;
+}
+
+__global__ __launch_bounds__(128, 2)
+void supersonic_qwen35_delta_recurrent_prefill_capture_q8_trace_transposed_f32_k128_kernel(
+    int batch_heads,
+    int seq_len,
+    const float* __restrict__ initial_state,
+    const float* __restrict__ query,
+    const float* __restrict__ key,
+    const float* __restrict__ value,
+    const float* __restrict__ beta,
+    const float* __restrict__ g,
+    float* __restrict__ out,
+    uint8_t* __restrict__ state_trace
+) {
+    constexpr int K = 128;
+    constexpr int V = 128;
+    constexpr int QK8_0 = 32;
+    constexpr int Q8_0_BLOCK_BYTES = 34;
+    const int k_idx = threadIdx.x;
+    const int v_idx = blockIdx.x;
+    const int bh = blockIdx.y;
+    const int q8_block = k_idx / QK8_0;
+    const int q8_lane = k_idx - q8_block * QK8_0;
+
+    __shared__ float reduce_smem[K];
+
+    const int state_stride = K * V;
+    const int token_stride_k = seq_len * K;
+    const int token_stride_v = seq_len * V;
+    const int token_stride_s = seq_len;
+    const int out_base = bh * (seq_len + K) * V;
+
+    float state = initial_state[bh * state_stride + k_idx * V + v_idx];
+
+    for (int t = 0; t < seq_len; ++t) {
+        const int key_row = bh * token_stride_k + t * K;
+        const int value_row = bh * token_stride_v + t * V;
+        const int beta_row = bh * token_stride_s + t;
+        const float g_t = expf(g[beta_row]);
+        const float k_t = key[key_row + k_idx];
+
+        state *= g_t;
+        const float kv_mem = supersonic_qwen35_block_sum_128_wave(state * k_t, reduce_smem);
+        const float delta = (value[value_row + v_idx] - kv_mem) * beta[beta_row];
+
+        state += k_t * delta;
+
+        float amax = fabsf(state);
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            amax = fmaxf(amax, __shfl_xor(amax, offset));
+        }
+        const float d = amax / 127.0f;
+        const float id = d == 0.0f ? 0.0f : 1.0f / d;
+        const int q = static_cast<int>(roundf(state * id));
+        const int row_base =
+            (((bh * seq_len + t) * V + v_idx) * (K / QK8_0) + q8_block) * Q8_0_BLOCK_BYTES;
+        if (q8_lane == 0) {
+            qwen35_store_q8_0_block_scale(state_trace + row_base, __float2half(d));
+        }
+        state_trace[row_base + 2 + q8_lane] = static_cast<uint8_t>(static_cast<int8_t>(q));
+
+        const float out_t =
+            supersonic_qwen35_block_sum_128_wave(state * query[key_row + k_idx], reduce_smem);
+        if (k_idx == 0) {
+            out[out_base + t * V + v_idx] = out_t;
+        }
+    }
+
+    const int state_out = out_base + seq_len * V;
+    out[state_out + k_idx * V + v_idx] = state;
+}
+
+__global__ __launch_bounds__(128, 2)
+void supersonic_qwen35_delta_recurrent_tree_prefill_capture_f32_k128_kernel(
+    int batch_heads,
+    int seq_len,
+    const float* __restrict__ initial_state,
+    const float* __restrict__ query,
+    const float* __restrict__ key,
+    const float* __restrict__ value,
+    const float* __restrict__ beta,
+    const float* __restrict__ g,
+    const int* __restrict__ parent_ids,
+    float* __restrict__ out,
+    float* __restrict__ state_trace
+) {
+    constexpr int K = 128;
+    constexpr int V = 128;
+    const int k_idx = threadIdx.x;
+    const int v_idx = blockIdx.x;
+    const int bh = blockIdx.y;
+
+    __shared__ float reduce_smem[K];
+
+    const int state_stride = K * V;
+    const int token_stride_k = seq_len * K;
+    const int token_stride_v = seq_len * V;
+    const int token_stride_s = seq_len;
+    const int out_base = bh * (seq_len + K) * V;
+
+    float last_state = initial_state[bh * state_stride + k_idx * V + v_idx];
+    for (int t = 0; t < seq_len; ++t) {
+        const int parent = parent_ids[t];
+        float state = parent < 0
+            ? initial_state[bh * state_stride + k_idx * V + v_idx]
+            : state_trace[((bh * seq_len + parent) * K + k_idx) * V + v_idx];
+
+        const int key_row = bh * token_stride_k + t * K;
+        const int value_row = bh * token_stride_v + t * V;
+        const int beta_row = bh * token_stride_s + t;
+        const float g_t = expf(g[beta_row]);
+        const float k_t = key[key_row + k_idx];
+
+        state *= g_t;
+        const float kv_mem = supersonic_qwen35_block_sum_128(state * k_t, reduce_smem);
+        const float delta = (value[value_row + v_idx] - kv_mem) * beta[beta_row];
+
+        state += k_t * delta;
+        state_trace[((bh * seq_len + t) * K + k_idx) * V + v_idx] = state;
+        last_state = state;
+
+        const float out_t =
+            supersonic_qwen35_block_sum_128(state * query[key_row + k_idx], reduce_smem);
+        if (k_idx == 0) {
+            out[out_base + t * V + v_idx] = out_t;
+        }
+    }
+
+    const int state_out = out_base + seq_len * V;
+    out[state_out + k_idx * V + v_idx] = last_state;
+}
+
+template <typename T>
+__global__ void supersonic_qwen35_dflash_apply_rollback_kernel(
+    int qkv_dim,
+    int conv_state_len,
+    int conv_input_len,
+    int chunk_len,
+    int commit_len,
+    int num_v_heads,
+    int head_k_dim,
+    int head_v_dim,
+    const T* conv_input,
+    T* conv_state,
+    const float* recurrent_trace,
+    float* recurrent_state
+) {
+    const int idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    const int conv_total = qkv_dim * conv_state_len;
+    const int rec_head_elems = head_k_dim * head_v_dim;
+    const int rec_total = num_v_heads * rec_head_elems;
+
+    if (idx < conv_total) {
+        const int ch = idx / conv_state_len;
+        const int tap = idx - ch * conv_state_len;
+        conv_state[idx] = conv_input[ch * conv_input_len + commit_len + tap];
+    }
+
+    if (idx < rec_total) {
+        const int h = idx / rec_head_elems;
+        const int rem = idx - h * rec_head_elems;
+        const int accepted_idx = commit_len - 1;
+        recurrent_state[idx] =
+            recurrent_trace[(h * chunk_len + accepted_idx) * rec_head_elems + rem];
+    }
+}
+
+template <typename T>
+__global__ void supersonic_qwen35_dflash_apply_rollback_bf16_trace_kernel(
+    int qkv_dim,
+    int conv_state_len,
+    int conv_input_len,
+    int chunk_len,
+    int commit_len,
+    int num_v_heads,
+    int head_k_dim,
+    int head_v_dim,
+    const T* conv_input,
+    T* conv_state,
+    const hip_bfloat16* recurrent_trace,
+    float* recurrent_state
+) {
+    const int idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    const int conv_total = qkv_dim * conv_state_len;
+    const int rec_head_elems = head_k_dim * head_v_dim;
+    const int rec_total = num_v_heads * rec_head_elems;
+
+    if (idx < conv_total) {
+        const int ch = idx / conv_state_len;
+        const int tap = idx - ch * conv_state_len;
+        conv_state[idx] = conv_input[ch * conv_input_len + commit_len + tap];
+    }
+
+    if (idx < rec_total) {
+        const int h = idx / rec_head_elems;
+        const int rem = idx - h * rec_head_elems;
+        const int accepted_idx = commit_len - 1;
+        recurrent_state[idx] = static_cast<float>(
+            recurrent_trace[(h * chunk_len + accepted_idx) * rec_head_elems + rem]);
+    }
+}
+
+template <typename T>
+__global__ void supersonic_qwen35_dflash_apply_rollback_bf16_trace_transposed_kernel(
+    int qkv_dim,
+    int conv_state_len,
+    int conv_input_len,
+    int chunk_len,
+    int commit_len,
+    int num_v_heads,
+    int head_k_dim,
+    int head_v_dim,
+    const T* conv_input,
+    T* conv_state,
+    const hip_bfloat16* recurrent_trace,
+    float* recurrent_state
+) {
+    const int idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    const int conv_total = qkv_dim * conv_state_len;
+    const int rec_head_elems = head_k_dim * head_v_dim;
+    const int rec_total = num_v_heads * rec_head_elems;
+
+    if (idx < conv_total) {
+        const int ch = idx / conv_state_len;
+        const int tap = idx - ch * conv_state_len;
+        conv_state[idx] = conv_input[ch * conv_input_len + commit_len + tap];
+    }
+
+    if (idx < rec_total) {
+        const int h = idx / rec_head_elems;
+        const int rem = idx - h * rec_head_elems;
+        const int k = rem / head_v_dim;
+        const int v = rem - k * head_v_dim;
+        const int accepted_idx = commit_len - 1;
+        recurrent_state[idx] = static_cast<float>(
+            recurrent_trace[((h * chunk_len + accepted_idx) * head_v_dim + v) * head_k_dim + k]);
+    }
+}
+
+template <typename T>
+__global__ void supersonic_qwen35_dflash_apply_rollback_q8_trace_kernel(
+    int qkv_dim,
+    int conv_state_len,
+    int conv_input_len,
+    int chunk_len,
+    int commit_len,
+    int num_v_heads,
+    int head_k_dim,
+    int head_v_dim,
+    const T* conv_input,
+    T* conv_state,
+    const uint8_t* recurrent_trace,
+    float* recurrent_state
+) {
+    constexpr int QK8_0 = 32;
+    constexpr int Q8_0_BLOCK_BYTES = 34;
+    const int idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    const int conv_total = qkv_dim * conv_state_len;
+    const int rec_head_elems = head_k_dim * head_v_dim;
+    const int rec_total = num_v_heads * rec_head_elems;
+
+    if (idx < conv_total) {
+        const int ch = idx / conv_state_len;
+        const int tap = idx - ch * conv_state_len;
+        conv_state[idx] = conv_input[ch * conv_input_len + commit_len + tap];
+    }
+
+    if (idx < rec_total) {
+        const int h = idx / rec_head_elems;
+        const int rem = idx - h * rec_head_elems;
+        const int k = rem / head_v_dim;
+        const int v = rem - k * head_v_dim;
+        const int accepted_idx = commit_len - 1;
+        const int q8_block = k / QK8_0;
+        const int q8_lane = k - q8_block * QK8_0;
+        const int row_base =
+            (((h * chunk_len + accepted_idx) * head_v_dim + v) * (head_k_dim / QK8_0)
+             + q8_block) * Q8_0_BLOCK_BYTES;
+        const half d_half = qwen35_load_q8_0_block_scale(recurrent_trace + row_base);
+        const int8_t q = static_cast<int8_t>(recurrent_trace[row_base + 2 + q8_lane]);
+        recurrent_state[idx] = static_cast<float>(q) * __half2float(d_half);
+    }
+}
+
+template <typename T>
+__global__ void supersonic_qwen35_dflash_apply_tree_rollback_kernel(
+    int qkv_dim,
+    int conv_state_len,
+    int conv_input_len,
+    int tree_len,
+    int commit_len,
+    int num_v_heads,
+    int head_k_dim,
+    int head_v_dim,
+    const T* conv_input,
+    const uint32_t* accepted_indices,
+    T* conv_state,
+    const float* recurrent_trace,
+    float* recurrent_state
+) {
+    const int idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    const int conv_total = qkv_dim * conv_state_len;
+    const int rec_head_elems = head_k_dim * head_v_dim;
+    const int rec_total = num_v_heads * rec_head_elems;
+
+    if (idx < conv_total) {
+        const int ch = idx / conv_state_len;
+        const int tap = idx - ch * conv_state_len;
+        const int logical = commit_len + tap - conv_state_len;
+        int src_col = commit_len + tap;
+        if (logical >= 0) {
+            const uint32_t node = accepted_indices[logical];
+            src_col = conv_state_len + static_cast<int>(node);
+        }
+        if (src_col >= 0 && src_col < conv_input_len) {
+            conv_state[idx] = conv_input[ch * conv_input_len + src_col];
+        }
+    }
+
+    if (idx < rec_total) {
+        const int h = idx / rec_head_elems;
+        const int rem = idx - h * rec_head_elems;
+        const uint32_t accepted_idx = accepted_indices[commit_len - 1];
+        if (accepted_idx < static_cast<uint32_t>(tree_len)) {
+            recurrent_state[idx] =
+                recurrent_trace[(h * tree_len + static_cast<int>(accepted_idx)) * rec_head_elems + rem];
+        }
+    }
+}
+
+template <typename T>
+__global__ void supersonic_qwen35_fill_conv_tail_kernel(
+    int qkv_dim,
+    int pad,
+    int total_len,
+    const T* tail,
+    T* conv_input
+) {
+    const int idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    const int total = qkv_dim * pad;
+    if (idx >= total) return;
+    const int ch = idx / pad;
+    const int tap = idx - ch * pad;
+    conv_input[ch * total_len + tap] = tail[idx];
+}
+
+__global__ void supersonic_qwen35_dflash_extract_recurrent_attn_kernel(
+    int num_v_heads,
+    int chunk_len,
+    int head_k_dim,
+    int head_v_dim,
+    const float* __restrict__ delta_out,
+    float* __restrict__ recurrent_state,
+    hip_bfloat16* __restrict__ attn_output
+) {
+    const int idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    const int out_rows = chunk_len + head_k_dim;
+    const int attn_total = num_v_heads * chunk_len * head_v_dim;
+    const int state_total = num_v_heads * head_k_dim * head_v_dim;
+    const int head_attn_elems = chunk_len * head_v_dim;
+    const int head_state_elems = head_k_dim * head_v_dim;
+    const int delta_head_stride = out_rows * head_v_dim;
+
+    if (idx < attn_total) {
+        const int h = idx / head_attn_elems;
+        const int rem = idx - h * head_attn_elems;
+        const int t = rem / head_v_dim;
+        const int v = rem - t * head_v_dim;
+        const int src = h * delta_head_stride + t * head_v_dim + v;
+        attn_output[idx] = hip_bfloat16(delta_out[src]);
+    }
+
+    if (idx < state_total) {
+        const int h = idx / head_state_elems;
+        const int rem = idx - h * head_state_elems;
+        const int k = rem / head_v_dim;
+        const int v = rem - k * head_v_dim;
+        const int src = h * delta_head_stride + (chunk_len + k) * head_v_dim + v;
+        recurrent_state[idx] = delta_out[src];
+    }
 }
 
 template <typename T, int MAX_K = 256>
@@ -1826,6 +2708,27 @@ __global__ void supersonic_qwen35_swiglu_mul_kernel(
     }
     const float gate_x = supersonic_qwen35_to_float(gate[idx]);
     const float up_x = supersonic_qwen35_to_float(up[idx]);
+    const float silu = gate_x / (1.0f + expf(-gate_x));
+    out[idx] = supersonic_qwen35_from_float<T>(silu * up_x);
+}
+
+template <typename T>
+__global__ void supersonic_qwen35_swiglu_mul_split_kernel(
+    int rows,
+    int cols,
+    const T* gate_up,
+    T* out
+) {
+    const int idx = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    const int elem_count = rows * cols;
+    if (idx >= elem_count) {
+        return;
+    }
+    const int row = idx / cols;
+    const int col = idx - row * cols;
+    const T* row_base = gate_up + static_cast<size_t>(row) * cols * 2;
+    const float gate_x = supersonic_qwen35_to_float(row_base[col]);
+    const float up_x = supersonic_qwen35_to_float(row_base[cols + col]);
     const float silu = gate_x / (1.0f + expf(-gate_x));
     out[idx] = supersonic_qwen35_from_float<T>(silu * up_x);
 }

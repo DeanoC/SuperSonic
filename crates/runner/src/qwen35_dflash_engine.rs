@@ -24,6 +24,7 @@
 //!    f. Rewind target's full-attention `kv_filled` to `L + accepted + 1`.
 //!    g. Crop the draft's KV cache to the new committed length.
 
+use std::env;
 use std::sync::{Arc, Once};
 use std::time::Instant;
 
@@ -36,8 +37,42 @@ use qwen35_dflash as dflash;
 
 use crate::bakes::{effective_quant_profile, load_qwen35_weights};
 use crate::decode_engine::DecodeEngine;
+use crate::dflash_ddtree::{
+    accepted_tokens_for_path, build_ddtree, build_verify_plan, extract_draft_topk_bf16,
+    follow_verified_tree, DDTree,
+};
+use crate::prefill_engine::{PrefillAppendVerifyResult, PrefillTreeVerifyResult};
 use crate::registry::{FamilyParams, ModelVariant, RegistryEntry};
 use crate::Cli;
+
+const DDTREE_DEFAULT_BUDGET: usize = 22;
+const DDTREE_DEFAULT_TOP_K: usize = 8;
+
+#[derive(Debug, Clone)]
+struct DFlashDDTreeProbeConfig {
+    budget: usize,
+    top_k: usize,
+    temperature: f32,
+    chain_seed: bool,
+}
+
+#[derive(Debug, Clone)]
+struct DFlashDDTreeProbeRound {
+    depth_limit: usize,
+    top_k: usize,
+    budget: usize,
+    nodes: usize,
+    width: usize,
+    max_depth: usize,
+    top1_head: Vec<u32>,
+    tree: DDTree,
+}
+
+#[derive(Debug, Clone)]
+struct DraftRoundOutput {
+    candidates: Vec<u32>,
+    ddtree_probe: Option<DFlashDDTreeProbeRound>,
+}
 
 /// Run the dense-Qwen DFlash speculative decoder. Parallels
 /// `phi4_engine::run_phi4` in shape — but drives both target and draft
@@ -280,14 +315,25 @@ pub fn run_qwen35_dflash(
     .map_err(|e| anyhow!("load draft weights: {e}"))?;
     eprintln!("[dflash] draft weights loaded");
 
+    let draft_ctx_capacity = context_tokens.max(1);
     let draft_max_ctx = cli
         .context_size
         .map(|c| c.max(draft_config.block_size * 4))
-        .unwrap_or_else(|| (context_tokens + draft_config.block_size).max(1024));
+        .unwrap_or_else(|| (draft_ctx_capacity + draft_config.block_size).max(1024));
     let draft_rotary = dflash::RotaryTables::build(&draft_config, ordinal, draft_max_ctx)
         .map_err(|e| anyhow!("build draft RoPE: {e}"))?;
-    let mut draft_scratch = dflash::state::DFlashScratch::new(ordinal, &draft_config)
-        .map_err(|e| anyhow!("alloc draft scratch: {e}"))?;
+    let mut draft_scratch = dflash::state::DFlashScratch::new_with_ctx_capacity(
+        ordinal,
+        &draft_config,
+        draft_ctx_capacity,
+    )
+    .map_err(|e| anyhow!("alloc draft scratch: {e}"))?;
+    let mut draft_noise_embedding = GpuBuffer::zeros(
+        ordinal,
+        ScalarType::BF16,
+        &[1, draft_config.block_size, draft_config.hidden_size],
+    )
+    .map_err(|e| anyhow!("alloc draft noise embedding scratch: {e}"))?;
     let mut draft_state = dflash::state::DFlashState::new(ordinal, &draft_config, draft_max_ctx)
         .map_err(|e| anyhow!("alloc draft state: {e}"))?;
 
@@ -299,9 +345,24 @@ pub fn run_qwen35_dflash(
         prompt_ids.len(),
         prefill_start.elapsed().as_millis(),
     );
-    let mut round_taps: Vec<u8> =
-        flatten_tap_blobs(&prefill_result.tap_hiddens.unwrap_or_default());
-    let mut round_taps_len: usize = 1; // T=1 after prefill (last prompt token).
+    let per_tap_row_bytes =
+        tap_layers.len() * text_config.hidden_size * ScalarType::BF16.size_in_bytes();
+    let mut tap_history: Vec<u8> = match prefill_result.tap_hiddens_all.as_ref() {
+        Some(per_tap) => flatten_tap_history(per_tap, prompt_ids.len(), text_config.hidden_size)?,
+        None => flatten_tap_history(
+            &prefill_result.tap_hiddens.unwrap_or_default(),
+            1,
+            text_config.hidden_size,
+        )?,
+    };
+    let mut tap_history_len: usize = if per_tap_row_bytes == 0 {
+        0
+    } else {
+        tap_history.len() / per_tap_row_bytes
+    };
+    if tap_history_len == 0 {
+        bail!("DFlash prefill did not produce any target tap history");
+    }
 
     // Sample the first bonus_seed from prefill's last logits (greedy @ T=0).
     let mut bonus_seed: u32 = DecodeEngine::greedy_sample(&prefill_result.logits);
@@ -323,17 +384,33 @@ pub fn run_qwen35_dflash(
     } else {
         DEFAULT_FUSED_BLOCK_SIZE.min(draft_config.block_size)
     };
-    let block_size = cli
-        .dflash_block
-        .unwrap_or(default_block_size);
+    let block_size = cli.dflash_block.unwrap_or(default_block_size);
     if block_size == 0 || block_size > draft_config.block_size {
         bail!(
             "--dflash-block must be in 1..={} (got {block_size})",
             draft_config.block_size,
         );
     }
+    let tap_history_capacity = tap_history_len + cli.max_new_tokens + block_size;
+    let mut tap_history_gpu = GpuBuffer::zeros(
+        ordinal,
+        ScalarType::BF16,
+        &[
+            tap_history_capacity,
+            tap_layers.len() * text_config.hidden_size,
+        ],
+    )
+    .map_err(|e| anyhow!("alloc GPU tap history: {e}"))?;
+    upload_taps_to_gpu_history(&mut tap_history_gpu, 0, per_tap_row_bytes, &tap_history)?;
 
     // --------- 8. Speculative loop ---------------------------------------
+    let profile_ffi = env::var_os("SUPERSONIC_DFLASH_PROFILE_FFI").is_some();
+    if profile_ffi {
+        gpu_hal::hal_profile_set_enabled(true);
+        gpu_hal::hal_profile_reset();
+        kernel_ffi::prefill_ffi::ffi_profile_set_enabled(true);
+        kernel_ffi::prefill_ffi::ffi_profile_reset();
+    }
     let decode_start = Instant::now();
     let mut rounds_run: usize = 0;
     let mut accepted_total: usize = 0;
@@ -343,44 +420,102 @@ pub fn run_qwen35_dflash(
     let mut ms_draft: f64 = 0.0;
     let mut ms_verify: f64 = 0.0;
     let mut ms_redecode: f64 = 0.0;
+    let mut ms_rollback: f64 = 0.0;
+    let trace_accept = env::var_os("SUPERSONIC_DFLASH_TRACE_ACCEPT").is_some();
+    let ddtree_probe = ddtree_probe_config_from_env()?;
+    let ddtree_verify = ddtree_verify_config_from_env()?;
+    let ddtree_direct_rollback = env::var_os("SUPERSONIC_DFLASH_DDTREE_DIRECT_ROLLBACK").is_some();
+    if let Some(config) = ddtree_probe.as_ref() {
+        eprintln!(
+            "[dflash-ddtree-probe] enabled budget={} top_k={} temp={} chain_seed={}",
+            config.budget, config.top_k, config.temperature, config.chain_seed
+        );
+    }
+    if let Some(config) = ddtree_verify.as_ref() {
+        let commit_mode = if ddtree_direct_rollback {
+            "tree-rollback"
+        } else {
+            "append-reverify"
+        };
+        eprintln!(
+            "[dflash-ddtree-verify] enabled budget={} top_k={} temp={} chain_seed={} commit={}",
+            config.budget, config.top_k, config.temperature, config.chain_seed, commit_mode
+        );
+    }
     while generated_ids.len() < cli.max_new_tokens {
-        if eos_ids.contains(&bonus_seed) {
+        if !cli.ignore_eos && eos_ids.contains(&bonus_seed) {
+            generated_ids.push(bonus_seed);
+            break;
+        }
+
+        let remaining_budget = cli.max_new_tokens - generated_ids.len();
+        if remaining_budget == 1 {
+            if trace_accept {
+                eprintln!(
+                    "[ss-trace] final carried seed l={} bonus_seed={} commit_n=1",
+                    committed_len, bonus_seed
+                );
+            }
             generated_ids.push(bonus_seed);
             break;
         }
 
         rounds_run += 1;
         let l = committed_len;
+        let ddtree_build_config = ddtree_verify.as_ref().or(ddtree_probe.as_ref());
+        let verify_len = dflash_verify_len_for_round(remaining_budget, block_size);
+        let ddtree_depth_limit = if ddtree_verify.is_some() {
+            remaining_budget.saturating_sub(1)
+        } else {
+            block_size.saturating_sub(1)
+        };
 
-        // 8a. Draft forward: noise_embedding = embed([bonus_seed, MASK, …])
-        // of length B; target_hidden_raw carries ctx_len=round_taps_len tap
-        // rows (1 after prefill, accepted_len after every round). Output
-        // hidden is projected through target's lm_head → B block logits →
-        // argmax → B candidates at positions L..L+B-1.
+        // 8a. Draft forward: Lucebox's draft graph is stateless and attends
+        // over a target-feature history window plus the current noise block.
+        // Feed the tail of the target tap history, not only the newest rows.
+        let draft_ctx = tap_history_len.min(draft_scratch.ctx_capacity);
+        let tap_start_row = tap_history_len - draft_ctx;
         let t_draft = Instant::now();
-        let (draft_candidates, draft_final_hidden_bytes) = draft_forward_and_sample(
+        let draft_output = draft_forward_and_sample(
             &mut draft_state,
             &mut draft_scratch,
+            &mut draft_noise_embedding,
             &draft_rotary,
             &draft_weights,
             &target_engine,
-            &round_taps,
-            round_taps_len,
+            &tap_history_gpu,
+            tap_start_row,
+            draft_ctx,
             bonus_seed,
             block_size,
             draft_config.dflash_config.mask_token_id,
+            ddtree_build_config,
+            ddtree_depth_limit,
             ordinal,
         )?;
-        let _ = draft_final_hidden_bytes; // retained for future logits caching
         ms_draft += t_draft.elapsed().as_secs_f64() * 1000.0;
+        if ddtree_probe.is_some() {
+            if let Some(probe) = draft_output.ddtree_probe.as_ref() {
+                eprintln!(
+                    "[dflash-ddtree-probe] round={} L={} K={} budget={} nodes={} width={} max_depth={} top1_head={:?}",
+                    rounds_run - 1,
+                    probe.depth_limit,
+                    probe.top_k,
+                    probe.budget,
+                    probe.nodes,
+                    probe.width,
+                    probe.max_depth,
+                    probe.top1_head,
+                );
+            }
+        }
+        let draft_tree = draft_output
+            .ddtree_probe
+            .as_ref()
+            .map(|round| round.tree.clone());
+        let draft_candidates = draft_output.candidates;
 
-        // 8b. Snapshot linear state (before verify mutates it).
-        let snap: LinearStateSnapshot = target_engine
-            .state_mut()
-            .snapshot_linear()
-            .map_err(|e| anyhow!("snapshot linear: {e}"))?;
-
-        // 8c. Verify: one `persistent_decode_4b` megakernel launch at
+        // 8b. Verify: one `persistent_decode_4b` megakernel launch at
         //     positions `[l, l+B)`. Shared-cache BatchSeqDesc aliases the
         //     live sequence's KV/linear buffers across all B batch slots
         //     with `seqlen_offset[b] = l + b`; the kernel runs the B
@@ -388,92 +523,321 @@ pub fn run_qwen35_dflash(
         //     position b reads the K/V written by positions 0..b of the
         //     same launch.
         let t_verify = Instant::now();
-        let verify_logits =
-            verify_block_for_dflash(&mut target_engine, &draft_candidates, l, &tap_layers)?;
-        ms_verify += t_verify.elapsed().as_secs_f64() * 1000.0;
-
-        // 8d. Accept check, full protocol (docs/dflash.md §6):
-        //   preds[0]   = argmax(prev_logits)            (target's pick at L;
-        //                                                = bonus_seed)
-        //   preds[i+1] = argmax(verify_logits[i])       (target's pick at L+i+1
-        //                                                given draft_candidates[..=i] at
-        //                                                L..L+i)
-        //   accepted = longest j in 0..=B where
-        //              preds[0..j] == draft_candidates[0..j].
-        //   bonus = preds[accepted]      (target's pick at L+accepted).
-        //
-        // Note: preds[0] is meaningful. If draft_candidates[0] != bonus_seed
-        // we reject immediately (accepted=0) and commit just bonus_seed at
-        // position L. This is the "d_0 verified" path — the target's pick
-        // at L is authoritative regardless of what the draft said.
-        let pred_at = |i: usize, verify: &[Vec<f32>]| -> u32 {
-            if i == 0 {
-                bonus_seed
+        let verify_output = if ddtree_verify.is_some() {
+            let tree = draft_tree
+                .as_ref()
+                .ok_or_else(|| anyhow!("DDTree verify enabled but draft tree was not built"))?;
+            verify_ddtree_for_dflash(
+                &mut target_engine,
+                draft_candidates[0],
+                tree,
+                l,
+                &tap_layers,
+                ddtree_direct_rollback,
+            )?
+        } else {
+            let gpu_tap_history = if dflash_gpu_tap_history_enabled() {
+                Some((&mut tap_history_gpu, tap_history_len, per_tap_row_bytes))
             } else {
-                DecodeEngine::greedy_sample(&verify[i - 1])
-            }
+                None
+            };
+            verify_block_for_dflash(
+                &mut target_engine,
+                &draft_candidates[..verify_len],
+                l,
+                &tap_layers,
+                gpu_tap_history,
+            )?
         };
-        // Cap accepted at block_size-1 so accepted_len <= block_size — the
-        // draft's scratch buffers are sized for ctx_len <= block_size and
-        // our next-round round_taps_len = accepted_len.
-        let mut accepted = 0usize;
-        while accepted < block_size - 1 {
-            let pred = pred_at(accepted, &verify_logits);
-            if pred == draft_candidates[accepted] {
-                accepted += 1;
-            } else {
-                break;
+        ms_verify += t_verify.elapsed().as_secs_f64() * 1000.0;
+        let target_next_ids = verify_output.greedy_ids()?;
+        let target_next: Vec<u32> = if trace_accept {
+            target_next_ids.clone()
+        } else {
+            Vec::new()
+        };
+
+        // 8d. Accept check. Chain mode compares adjacent draft positions;
+        // DDTree mode follows the target posterior through matching child
+        // edges and commits that accepted branch path.
+        let (accept_n, carried_seed, mut committed_block, mut accepted_tree_indices) =
+            match &verify_output {
+                DFlashVerifyOutput::Tree(tree_output) => {
+                    let (indices, carried, _terminal_index) =
+                        follow_verified_tree(&tree_output.tree, &target_next_ids);
+                    let tokens = accepted_tokens_for_path(
+                        tree_output.root_token,
+                        &tree_output.tree,
+                        &indices,
+                    );
+                    (tokens.len(), carried, tokens, Some(indices))
+                }
+                _ => {
+                    let mut accept_n = 1usize;
+                    while accept_n < verify_len {
+                        if accept_n > target_next_ids.len() {
+                            bail!(
+                                "captured prefill verifier returned {} greedy IDs, insufficient for accept_n={accept_n} verify_len={verify_len}",
+                                target_next_ids.len()
+                            );
+                        }
+                        let pred = target_next_ids[accept_n - 1];
+                        if pred == draft_candidates[accept_n] {
+                            accept_n += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    let carried_seed = *target_next_ids
+                        .get(accept_n - 1)
+                        .ok_or_else(|| anyhow!("target verifier returned no carried seed"))?;
+                    (
+                        accept_n,
+                        carried_seed,
+                        draft_candidates[..accept_n].to_vec(),
+                        None,
+                    )
+                }
+            };
+
+        let accepted_len = accept_n.min(remaining_budget);
+        committed_block.truncate(accepted_len);
+        if let Some(indices) = accepted_tree_indices.as_mut() {
+            indices.truncate(accepted_len);
+        }
+        let finish_after_commit = accepted_len >= remaining_budget
+            || (!cli.ignore_eos && committed_block.iter().any(|t| eos_ids.contains(t)));
+        if trace_accept {
+            eprintln!(
+                "[ss-trace] round={} l={} draft_ctx={} verify_len={} bonus_seed={} draft={:?} target_next={:?} accept_n={} carried_seed={} commit_n={} committed={:?} tree_indices={:?}",
+                rounds_run - 1,
+                l,
+                draft_ctx,
+                verify_len,
+                bonus_seed,
+                draft_candidates,
+                target_next,
+                accept_n,
+                carried_seed,
+                accepted_len,
+                committed_block,
+                accepted_tree_indices,
+            );
+        }
+
+        let mut next_bonus_seed: Option<u32> = None;
+        if !finish_after_commit {
+            match verify_output {
+                DFlashVerifyOutput::Captured(result) => {
+                    let t_rollback = Instant::now();
+                    if let Some(per_tap) = result.tap_hiddens_all.as_ref() {
+                        let taps_bytes =
+                            flatten_tap_history(per_tap, verify_len, text_config.hidden_size)?;
+                        let expected_tap_bytes = verify_len * per_tap_row_bytes;
+                        if taps_bytes.len() != expected_tap_bytes {
+                            bail!(
+                                "captured prefill verifier returned {} tap bytes, expected {}",
+                                taps_bytes.len(),
+                                expected_tap_bytes,
+                            );
+                        }
+                        let committed_tap_bytes = accepted_len * per_tap_row_bytes;
+                        upload_taps_to_gpu_history(
+                            &mut tap_history_gpu,
+                            tap_history_len,
+                            per_tap_row_bytes,
+                            &taps_bytes[..committed_tap_bytes],
+                        )?;
+                        tap_history.extend_from_slice(&taps_bytes[..committed_tap_bytes]);
+                    } else if !dflash_gpu_tap_history_enabled() {
+                        bail!("captured prefill verifier did not return tap history");
+                    }
+                    if accepted_len == verify_len {
+                        target_engine.commit_prefill_append_full_accept_owned(result)?;
+                    } else {
+                        target_engine.commit_prefill_append_verify_owned(result, accepted_len)?;
+                    }
+                    tap_history_len += accepted_len;
+                    next_bonus_seed = Some(carried_seed);
+                    ms_rollback += t_rollback.elapsed().as_secs_f64() * 1000.0;
+                }
+                DFlashVerifyOutput::CapturedWindowed(result) => {
+                    let t_rollback = Instant::now();
+                    let mut remaining = accepted_len;
+                    let mut committed_taps = Vec::with_capacity(accepted_len * per_tap_row_bytes);
+                    let mut copied_tap_rows = 0usize;
+                    let mut committed = false;
+                    for segment in &result.segments {
+                        if remaining == 0 {
+                            break;
+                        }
+                        let expected_start = accepted_len - remaining;
+                        if segment.start != expected_start {
+                            bail!(
+                                "windowed prefill segment start {} != expected {}",
+                                segment.start,
+                                expected_start
+                            );
+                        }
+                        let take = remaining.min(segment.len);
+                        if let Some(per_tap) = segment.result.tap_hiddens_all.as_ref() {
+                            let taps_bytes =
+                                flatten_tap_history(per_tap, segment.len, text_config.hidden_size)?;
+                            let take_bytes = take * per_tap_row_bytes;
+                            if taps_bytes.len() < take_bytes {
+                                bail!(
+                                    "windowed prefill tap segment too short: got {} need {}",
+                                    taps_bytes.len(),
+                                    take_bytes
+                                );
+                            }
+                            upload_taps_to_gpu_history(
+                                &mut tap_history_gpu,
+                                tap_history_len + copied_tap_rows,
+                                per_tap_row_bytes,
+                                &taps_bytes[..take_bytes],
+                            )?;
+                            committed_taps.extend_from_slice(&taps_bytes[..take_bytes]);
+                        } else if !dflash_gpu_tap_history_enabled() {
+                            bail!("windowed prefill verifier did not return tap history");
+                        }
+                        copied_tap_rows += take;
+
+                        if remaining <= segment.len {
+                            if remaining == segment.len {
+                                target_engine.commit_prefill_append_full_accept(&segment.result)?;
+                            } else {
+                                target_engine
+                                    .commit_prefill_append_verify(&segment.result, remaining)?;
+                            }
+                            committed = true;
+                            remaining = 0;
+                            break;
+                        }
+                        remaining -= segment.len;
+                    }
+                    if !committed || remaining != 0 {
+                        bail!(
+                            "windowed prefill commit could not cover accepted_len={} with {} segments",
+                            accepted_len,
+                            result.segments.len()
+                        );
+                    }
+                    if copied_tap_rows != accepted_len {
+                        bail!(
+                            "windowed prefill verifier copied {} tap rows, expected {}",
+                            copied_tap_rows,
+                            accepted_len,
+                        );
+                    }
+                    tap_history.extend_from_slice(&committed_taps);
+                    tap_history_len += accepted_len;
+                    next_bonus_seed = Some(carried_seed);
+                    ms_rollback += t_rollback.elapsed().as_secs_f64() * 1000.0;
+                }
+                DFlashVerifyOutput::Tree(result) => {
+                    let t_rollback = Instant::now();
+                    let indices = accepted_tree_indices
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("DDTree commit missing accepted tree indices"))?;
+                    let taps_bytes = if result.result.rollback.is_some() {
+                        target_engine.commit_prefill_tree_verify(
+                            &result.result,
+                            indices,
+                            accepted_len,
+                        )?;
+                        let per_tap = result.result.tap_hiddens_all.as_ref().ok_or_else(|| {
+                            anyhow!("tree prefill verifier did not return tap history")
+                        })?;
+                        flatten_tap_history_indices(
+                            per_tap,
+                            result.tree.width(),
+                            text_config.hidden_size,
+                            indices,
+                        )?
+                    } else {
+                        let append_result = target_engine.verify_block_prefill_append_captured(
+                            &committed_block,
+                            l,
+                            &tap_layers,
+                        )?;
+                        let append_next = append_result.target_next.as_ref().ok_or_else(|| {
+                            anyhow!("append reverify did not return greedy target IDs")
+                        })?;
+                        let append_seed = append_next
+                            .get(accepted_len - 1)
+                            .copied()
+                            .ok_or_else(|| anyhow!("append reverify returned no carried seed"))?;
+                        if append_seed != carried_seed {
+                            bail!(
+                                "DDTree carried seed mismatch after append reverify: tree={} append={}",
+                                carried_seed,
+                                append_seed
+                            );
+                        }
+                        target_engine.commit_prefill_append_verify(&append_result, accepted_len)?;
+                        let per_tap = append_result
+                            .tap_hiddens_all
+                            .as_ref()
+                            .ok_or_else(|| anyhow!("append reverify did not return tap history"))?;
+                        flatten_tap_history(per_tap, accepted_len, text_config.hidden_size)?
+                    };
+                    let expected_tap_bytes = accepted_len * per_tap_row_bytes;
+                    if taps_bytes.len() != expected_tap_bytes {
+                        bail!(
+                            "tree verifier accepted tap gather returned {} tap bytes, expected {}",
+                            taps_bytes.len(),
+                            expected_tap_bytes,
+                        );
+                    }
+                    upload_taps_to_gpu_history(
+                        &mut tap_history_gpu,
+                        tap_history_len,
+                        per_tap_row_bytes,
+                        &taps_bytes,
+                    )?;
+                    tap_history.extend_from_slice(&taps_bytes);
+                    tap_history_len += accepted_len;
+                    next_bonus_seed = Some(carried_seed);
+                    ms_rollback += t_rollback.elapsed().as_secs_f64() * 1000.0;
+                }
+                DFlashVerifyOutput::Fallback { snap, .. } => {
+                    // Restore linear, rewind full-attn kv_filled, then re-decode
+                    // the committed tokens to rewrite full-attn K/V and capture
+                    // target-feature rows for the next draft round.
+                    target_engine
+                        .state_mut()
+                        .restore_linear(&snap, ordinal)
+                        .map_err(|e| anyhow!("restore linear: {e}"))?;
+                    target_engine.rewind_full_kv_filled(l);
+
+                    let t_redecode = Instant::now();
+                    let (logits, taps_bytes) = target_engine.decode_block_with_taps_kernel(
+                        &committed_block,
+                        l,
+                        &tap_layers,
+                    )?;
+                    let expected_tap_bytes = accepted_len * per_tap_row_bytes;
+                    if taps_bytes.len() != expected_tap_bytes {
+                        bail!(
+                            "decode_block_with_taps_kernel returned {} tap bytes, expected {}",
+                            taps_bytes.len(),
+                            expected_tap_bytes,
+                        );
+                    }
+                    upload_taps_to_gpu_history(
+                        &mut tap_history_gpu,
+                        tap_history_len,
+                        per_tap_row_bytes,
+                        &taps_bytes,
+                    )?;
+                    tap_history.extend_from_slice(&taps_bytes);
+                    tap_history_len += accepted_len;
+                    next_bonus_seed = Some(DecodeEngine::greedy_sample(&logits));
+                    ms_redecode += t_redecode.elapsed().as_secs_f64() * 1000.0;
+                }
             }
         }
-        // bonus lives at position L+accepted. verify_logits has len = block_size
-        // so pred_at(accepted) indexes at most verify_logits[block_size-2].
-        let bonus = pred_at(accepted, &verify_logits);
-
-        // 8e. Restore linear, rewind full-attn kv_filled, then re-decode
-        //     the committed tokens to rewrite full-attn K/V and capture a
-        //     tap row per committed position so the next round's
-        //     target_hidden carries `ctx_len = accepted_len` context.
-        target_engine
-            .state_mut()
-            .restore_linear(&snap, ordinal)
-            .map_err(|e| anyhow!("restore linear: {e}"))?;
-        target_engine.rewind_full_kv_filled(l);
-
-        // Committed sequence this round: [d_0, ..., d_{accepted-1}, bonus]
-        // at positions [L, L+1, ..., L+accepted] — length accepted+1.
-        let accepted_len = accepted + 1;
-        let mut committed_block: Vec<u32> = Vec::with_capacity(accepted_len);
-        committed_block.extend_from_slice(&draft_candidates[..accepted]);
-        committed_block.push(bonus);
-
-        // Capture taps at every re-decoded position so the next round sees
-        // `ctx_len = accepted_len` tap rows covering the newly committed
-        // block. target_hidden_raw layout expected by the draft:
-        // `[1, ctx_len, num_taps * hidden]` BF16, row-major per ctx pos.
-        let per_tap_row_bytes =
-            tap_layers.len() * text_config.hidden_size * ScalarType::BF16.size_in_bytes();
-        let mut stacked_taps: Vec<u8> = Vec::with_capacity(accepted_len * per_tap_row_bytes);
-        let mut final_round_logits: Option<Vec<f32>> = None;
-        let t_redecode = Instant::now();
-        for (i, &tok) in committed_block.iter().enumerate() {
-            let seqlen_offset = l + i;
-            let (logits, taps_bytes) =
-                target_engine.decode_step_with_taps_kernel(tok, seqlen_offset, &tap_layers)?;
-            if taps_bytes.len() != per_tap_row_bytes {
-                bail!(
-                    "decode_step_with_taps_kernel returned {} bytes, expected {}",
-                    taps_bytes.len(),
-                    per_tap_row_bytes,
-                );
-            }
-            stacked_taps.extend_from_slice(&taps_bytes);
-            if i + 1 == committed_block.len() {
-                final_round_logits = Some(logits);
-            }
-        }
-        ms_redecode += t_redecode.elapsed().as_secs_f64() * 1000.0;
-        round_taps = stacked_taps;
-        round_taps_len = accepted_len;
 
         // 8f. Advance counters + record generated.
         // Stop as soon as any committed token is EOS — every committed
@@ -482,11 +846,11 @@ pub fn run_qwen35_dflash(
         // it samples. Without this, generation would keep rolling past
         // an EOS that appeared inside a speculative commit block.
         committed_len = l + accepted_len;
-        accepted_total += accepted;
+        accepted_total += accept_n;
         let mut hit_eos = false;
         for &t in committed_block.iter() {
             generated_ids.push(t);
-            if eos_ids.contains(&t) {
+            if !cli.ignore_eos && eos_ids.contains(&t) {
                 hit_eos = true;
                 break;
             }
@@ -497,27 +861,12 @@ pub fn run_qwen35_dflash(
         if hit_eos {
             break;
         }
-        bonus_seed = match final_round_logits {
-            Some(logits) => DecodeEngine::greedy_sample(&logits),
-            None => bonus, // fallback; should always be Some since accepted_len >= 1
-        };
+        if finish_after_commit {
+            break;
+        }
+        bonus_seed = next_bonus_seed.ok_or_else(|| anyhow!("missing DFlash next bonus seed"))?;
 
-        // 8g. Crop the draft's KV cache in draft-coordinate space.
-        // `DFlashState::crop` truncates physical rows, so it must be passed
-        // a draft-side row count — not the target-coord `committed_len`
-        // (which includes prompt_len and is larger than the draft cursor
-        // for any non-empty prompt, silently no-op'ing the crop and
-        // leaving the rejected noise tail in cache). Post-forward,
-        //   draft_state.kv_filled = kv_pre + ctx_len + block_size
-        // and the draft-side noise rows committed this round are the
-        // `accepted` rows at the head of the noise block (the bonus is
-        // target-picked and has no draft noise row). So the keeper is
-        //   kv_pre + ctx_len + accepted
-        //     = draft_state.kv_filled - (block_size - accepted)
-        // which drops exactly the rejected noise tail.
-        let rejected_tail = block_size - accepted;
-        let draft_keep = draft_state.kv_filled.saturating_sub(rejected_tail);
-        draft_state.crop(draft_keep);
+        draft_state.reset();
     }
 
     let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
@@ -559,14 +908,115 @@ pub fn run_qwen35_dflash(
         prompt_ids.len(),
         generated_ids.len()
     );
-    let ms_other = (decode_ms - ms_draft - ms_verify - ms_redecode).max(0.0);
+    let ms_other = (decode_ms - ms_draft - ms_verify - ms_redecode - ms_rollback).max(0.0);
     eprintln!(
         "[dflash] breakdown ms: draft={ms_draft:.0} verify={ms_verify:.0} \
-         redecode={ms_redecode:.0} other={ms_other:.0}",
+         redecode={ms_redecode:.0} rollback={ms_rollback:.0} other={ms_other:.0}",
     );
+    if profile_ffi {
+        let ffi = kernel_ffi::prefill_ffi::ffi_profile_snapshot();
+        let hal = gpu_hal::hal_profile_snapshot();
+        eprintln!(
+            "[dflash-ffi-profile] calls={} total_ms={:.3}",
+            ffi.total_calls, ffi.total_ms
+        );
+        for entry in ffi.entries.iter().take(40) {
+            eprintln!(
+                "[dflash-ffi-profile] op={} calls={} mean_ms={:.4} total_ms={:.3} max_ms={:.3}",
+                entry.op,
+                entry.calls,
+                entry.mean_ms(),
+                entry.total_ms,
+                entry.max_ms,
+            );
+        }
+        eprintln!(
+            "[dflash-hal-profile] calls={} total_ms={:.3} alloc_calls={} alloc_bytes={} h2d={} d2h={} d2d={} memset={} sync_calls={}",
+            hal.total_calls,
+            hal.total_ms,
+            hal.alloc_calls,
+            hal.alloc_bytes,
+            hal.h2d_bytes,
+            hal.d2h_bytes,
+            hal.d2d_bytes,
+            hal.memset_bytes,
+            hal.sync_calls,
+        );
+        for entry in hal.entries.iter().take(20) {
+            let mean_ms = if entry.calls > 0 {
+                entry.total_ms / entry.calls as f64
+            } else {
+                0.0
+            };
+            eprintln!(
+                "[dflash-hal-profile] op={} calls={} mean_ms={:.4} total_ms={:.3} max_ms={:.3} bytes={}",
+                entry.op,
+                entry.calls,
+                mean_ms,
+                entry.total_ms,
+                entry.max_ms,
+                entry.total_bytes,
+            );
+        }
+        kernel_ffi::prefill_ffi::ffi_profile_set_enabled(false);
+        gpu_hal::hal_profile_set_enabled(false);
+    }
 
     let _ = draft_rotary; // drop order guard (rotary/scratch hold GPU buffers)
     Ok(())
+}
+
+fn ddtree_probe_config_from_env() -> Result<Option<DFlashDDTreeProbeConfig>> {
+    ddtree_config_from_env("SUPERSONIC_DFLASH_DDTREE_PROBE")
+}
+
+fn ddtree_verify_config_from_env() -> Result<Option<DFlashDDTreeProbeConfig>> {
+    ddtree_config_from_env("SUPERSONIC_DFLASH_DDTREE_VERIFY")
+}
+
+fn ddtree_config_from_env(trigger: &str) -> Result<Option<DFlashDDTreeProbeConfig>> {
+    if env::var_os(trigger).is_none() {
+        return Ok(None);
+    }
+    let budget = parse_env_usize("SUPERSONIC_DFLASH_DDTREE_BUDGET", DDTREE_DEFAULT_BUDGET)?;
+    let top_k = parse_env_usize("SUPERSONIC_DFLASH_DDTREE_TOP_K", DDTREE_DEFAULT_TOP_K)?;
+    let temperature = parse_env_f32("SUPERSONIC_DFLASH_DDTREE_TEMP", 1.0)?;
+    if budget == 0 {
+        bail!("SUPERSONIC_DFLASH_DDTREE_BUDGET must be > 0");
+    }
+    if top_k == 0 {
+        bail!("SUPERSONIC_DFLASH_DDTREE_TOP_K must be > 0");
+    }
+    if !temperature.is_finite() || temperature <= 0.0 {
+        bail!("SUPERSONIC_DFLASH_DDTREE_TEMP must be finite and > 0");
+    }
+
+    Ok(Some(DFlashDDTreeProbeConfig {
+        budget,
+        top_k,
+        temperature,
+        chain_seed: env::var_os("SUPERSONIC_DFLASH_DDTREE_NO_CHAIN_SEED").is_none(),
+    }))
+}
+
+fn parse_env_usize(name: &str, default: usize) -> Result<usize> {
+    match env::var(name) {
+        Ok(raw) => raw
+            .parse::<usize>()
+            .map_err(|e| anyhow!("{name} must be an unsigned integer: {e}")),
+        Err(env::VarError::NotPresent) => Ok(default),
+        Err(env::VarError::NotUnicode(_)) => bail!("{name} must be valid UTF-8"),
+    }
+}
+
+fn parse_env_f32(name: &str, default: f32) -> Result<f32> {
+    match env::var(name) {
+        Ok(raw) => raw
+            .parse::<f32>()
+            .map_err(|e| anyhow!("{name} must be a float: {e}")),
+        Err(env::VarError::NotPresent) => Ok(default),
+        Err(env::VarError::NotUnicode(_)) => bail!("{name} must be valid UTF-8"),
+    }
 }
 
 /// Parse `--dflash-tap-layers "1,8,15"` into a validated Vec<usize>.
@@ -607,22 +1057,310 @@ fn load_target_lowbit_weights(
     .map_err(|e| anyhow!("load target low-bit weights: {e}"))
 }
 
+enum DFlashVerifyOutput {
+    Captured(PrefillAppendVerifyResult),
+    CapturedWindowed(CapturedWindowedVerifyOutput),
+    Tree(PrefillTreeVerifyOutput),
+    Fallback {
+        logits: Vec<Vec<f32>>,
+        snap: LinearStateSnapshot,
+    },
+}
+
+struct CapturedWindowedVerifyOutput {
+    segments: Vec<CapturedWindowSegment>,
+    target_next: Vec<u32>,
+}
+
+struct CapturedWindowSegment {
+    start: usize,
+    len: usize,
+    result: PrefillAppendVerifyResult,
+}
+
+struct PrefillTreeVerifyOutput {
+    root_token: u32,
+    tree: DDTree,
+    result: PrefillTreeVerifyResult,
+}
+
+impl DFlashVerifyOutput {
+    fn greedy_ids(&self) -> Result<Vec<u32>> {
+        match self {
+            Self::Captured(result) => result.target_next.clone().ok_or_else(|| {
+                anyhow!("captured prefill verifier did not return greedy target IDs")
+            }),
+            Self::CapturedWindowed(result) => Ok(result.target_next.clone()),
+            Self::Tree(result) => Ok(result.result.target_next.clone()),
+            Self::Fallback { logits, .. } => Ok(logits
+                .iter()
+                .map(|row| DecodeEngine::greedy_sample(row))
+                .collect()),
+        }
+    }
+}
+
+fn dflash_prefill_window_scan_chunk() -> usize {
+    env::var("SUPERSONIC_DFLASH_VERIFY_SCAN_CHUNK")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(16)
+}
+
+fn dflash_prefill_window_min_tail() -> usize {
+    env::var("SUPERSONIC_DFLASH_VERIFY_MIN_TAIL")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(4)
+}
+
+fn dflash_final_verify_min_len(block_size: usize) -> Option<usize> {
+    if env::var_os("SUPERSONIC_DFLASH_DISABLE_FINAL_VERIFY_PAD").is_some() {
+        return None;
+    }
+    Some(
+        env::var("SUPERSONIC_DFLASH_FINAL_VERIFY_MIN_LEN")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(block_size),
+    )
+}
+
+fn dflash_verify_len_for_round(remaining_budget: usize, block_size: usize) -> usize {
+    let clamped = block_size.min(remaining_budget);
+    if remaining_budget >= block_size {
+        return clamped;
+    }
+    let Some(min_len) = dflash_final_verify_min_len(block_size) else {
+        return clamped;
+    };
+    clamped.max(min_len.min(block_size))
+}
+
+fn dflash_gpu_tap_history_enabled() -> bool {
+    env::var_os("SUPERSONIC_DFLASH_DISABLE_GPU_TAP_HISTORY").is_none()
+}
+
+fn dflash_window_step(remaining: usize, scan_chunk: usize, min_tail: usize) -> usize {
+    let step = scan_chunk.min(remaining);
+    let tail = remaining - step;
+    if tail > 0 && tail < min_tail {
+        remaining
+    } else {
+        step
+    }
+}
+
+fn chain_accept_needs_more(target_next: &[u32], tokens: &[u32], verify_len: usize) -> bool {
+    let mut accept_n = 1usize;
+    while accept_n < verify_len {
+        if accept_n > target_next.len() {
+            return true;
+        }
+        if target_next[accept_n - 1] == tokens[accept_n] {
+            accept_n += 1;
+        } else {
+            return false;
+        }
+    }
+    accept_n > target_next.len()
+}
+
+fn verify_block_prefill_append_windowed(
+    target_engine: &mut DecodeEngine,
+    tokens: &[u32],
+    pos_offset: usize,
+    tap_layers: &[usize],
+    scan_chunk: usize,
+    mut gpu_tap_history: Option<(&mut GpuBuffer, usize, usize)>,
+) -> Result<CapturedWindowedVerifyOutput> {
+    if scan_chunk == 0 {
+        bail!("prefill append window scan chunk must be > 0");
+    }
+
+    let mut segments = Vec::new();
+    let mut target_next = Vec::new();
+    let min_tail = dflash_prefill_window_min_tail();
+    let mut start = 0usize;
+    while start < tokens.len() {
+        let step = dflash_window_step(tokens.len() - start, scan_chunk, min_tail);
+        let result = if let Some((history, base_row, row_bytes)) = gpu_tap_history.as_mut() {
+            target_engine.verify_block_prefill_append_captured_lazy_acceptance_gpu_taps(
+                &tokens[start..start + step],
+                pos_offset + start,
+                tap_layers,
+                &mut **history,
+                *base_row + start,
+                *row_bytes,
+            )?
+        } else {
+            target_engine.verify_block_prefill_append_captured_lazy_acceptance(
+                &tokens[start..start + step],
+                pos_offset + start,
+                tap_layers,
+            )?
+        };
+        let ids = result
+            .target_next
+            .clone()
+            .ok_or_else(|| anyhow!("windowed prefill verifier did not return greedy target IDs"))?;
+        if ids.is_empty() {
+            bail!("windowed prefill verifier returned no greedy target IDs");
+        }
+        target_next.extend(ids);
+        segments.push(CapturedWindowSegment {
+            start,
+            len: step,
+            result,
+        });
+
+        if !chain_accept_needs_more(&target_next, tokens, tokens.len()) {
+            break;
+        }
+        start += step;
+    }
+
+    Ok(CapturedWindowedVerifyOutput {
+        segments,
+        target_next,
+    })
+}
+
 fn verify_block_for_dflash(
     target_engine: &mut DecodeEngine,
     tokens: &[u32],
     pos_offset: usize,
     tap_layers: &[usize],
-) -> Result<Vec<Vec<f32>>> {
+    mut gpu_tap_history: Option<(&mut GpuBuffer, usize, usize)>,
+) -> Result<DFlashVerifyOutput> {
+    let force_prefill = env::var_os("SUPERSONIC_DFLASH_PREFILL_VERIFY").is_some();
+    let disable_prefill = env::var_os("SUPERSONIC_DFLASH_DISABLE_PREFILL_VERIFY").is_some();
+    let chunk_size = dflash_fused_verify_chunk_size(target_engine);
+    let config = &target_engine.weights().config;
+    let prefer_prefill_append = config.hidden_size == 5120 && config.num_hidden_layers == 64;
+    let use_prefill_append = force_prefill
+        || (!disable_prefill
+            && (prefer_prefill_append || (chunk_size > 0 && tokens.len() > chunk_size)));
+
+    if use_prefill_append {
+        static PREFILL_NOTICE: Once = Once::new();
+        PREFILL_NOTICE.call_once(|| {
+            eprintln!("[dflash] using prefill-append target verifier");
+        });
+        let scan_chunk = dflash_prefill_window_scan_chunk();
+        if scan_chunk < tokens.len()
+            && env::var_os("SUPERSONIC_DFLASH_DISABLE_VERIFY_ROW_SCAN").is_none()
+        {
+            match verify_block_prefill_append_windowed(
+                target_engine,
+                tokens,
+                pos_offset,
+                tap_layers,
+                scan_chunk,
+                gpu_tap_history
+                    .as_mut()
+                    .map(|(history, start_row, row_bytes)| {
+                        (&mut **history, *start_row, *row_bytes)
+                    }),
+            ) {
+                Ok(result) => return Ok(DFlashVerifyOutput::CapturedWindowed(result)),
+                Err(err) if force_prefill => {
+                    return Err(anyhow!("windowed prefill append verify failed: {err}"));
+                }
+                Err(err) => {
+                    return Err(anyhow!("windowed prefill append verify failed: {err}"));
+                }
+            }
+        }
+        let captured_result =
+            if let Some((history, start_row, row_bytes)) = gpu_tap_history.as_mut() {
+                target_engine.verify_block_prefill_append_captured_lazy_acceptance_gpu_taps(
+                    tokens,
+                    pos_offset,
+                    tap_layers,
+                    &mut **history,
+                    *start_row,
+                    *row_bytes,
+                )
+            } else {
+                target_engine.verify_block_prefill_append_captured_lazy_acceptance(
+                    tokens, pos_offset, tap_layers,
+                )
+            };
+        match captured_result {
+            Ok(result) => return Ok(DFlashVerifyOutput::Captured(result)),
+            Err(err) if force_prefill => {
+                return Err(anyhow!("prefill append verify failed: {err}"));
+            }
+            Err(err) => {
+                static PREFILL_FALLBACK_NOTICE: Once = Once::new();
+                PREFILL_FALLBACK_NOTICE.call_once(|| {
+                    eprintln!(
+                        "[dflash] prefill-append verifier failed ({err}); \
+                         falling back to persistent verifier"
+                    );
+                });
+            }
+        }
+    }
+
+    let snap: LinearStateSnapshot = target_engine
+        .state_mut()
+        .snapshot_linear()
+        .map_err(|e| anyhow!("snapshot linear: {e}"))?;
+
     let needs_sequential = tokens.len() > kernel_ffi::MAX_BATCH_SIZE;
     if !needs_sequential {
         match target_engine.verify_block_fused_decode(tokens, pos_offset) {
-            Ok(logits) => return Ok(logits),
+            Ok(logits) => return Ok(DFlashVerifyOutput::Fallback { logits, snap }),
             Err(err) => {
                 let msg = err.to_string();
                 if !msg.contains("shared-memory budget exceeded") {
                     return Err(err);
                 }
             }
+        }
+    }
+
+    if chunk_size > 0 && chunk_size < tokens.len() {
+        let mut out = Vec::with_capacity(tokens.len());
+        let mut start = 0usize;
+        while start < tokens.len() {
+            let remaining = tokens.len() - start;
+            let step = if remaining > chunk_size && remaining - chunk_size == 1 && chunk_size > 1 {
+                chunk_size - 1
+            } else {
+                remaining.min(chunk_size)
+            };
+            let end = start + step;
+            match target_engine.verify_block_fused_decode(&tokens[start..end], pos_offset + start) {
+                Ok(mut logits) => {
+                    out.append(&mut logits);
+                    start = end;
+                }
+                Err(err) => {
+                    let msg = err.to_string();
+                    if start == 0 && msg.contains("shared-memory budget exceeded") {
+                        break;
+                    }
+                    return Err(anyhow!(
+                        "chunked fused verify failed at token {start}: {err}"
+                    ));
+                }
+            }
+        }
+        if out.len() == tokens.len() {
+            static CHUNK_NOTICE: Once = Once::new();
+            CHUNK_NOTICE.call_once(|| {
+                eprintln!(
+                    "[dflash] fused verify split block={} into chunks of {} for LDS budget",
+                    tokens.len(),
+                    chunk_size
+                );
+            });
+            return Ok(DFlashVerifyOutput::Fallback { logits: out, snap });
         }
     }
 
@@ -641,94 +1379,266 @@ fn verify_block_for_dflash(
             .map_err(|e| anyhow!("sequential verify decode step {i}: {e}"))?;
         logits.push(step_logits);
     }
-    Ok(logits)
+    Ok(DFlashVerifyOutput::Fallback { logits, snap })
 }
 
-/// Concatenate per-tap `[hidden_dim]` BF16 blobs into a single
-/// `[num_taps * hidden_dim]` byte vector (the draft's `target_hidden_raw`
-/// expects this layout for a single ctx position).
-fn flatten_tap_blobs(per_tap: &[Vec<u8>]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(per_tap.iter().map(|v| v.len()).sum());
-    for v in per_tap {
-        out.extend_from_slice(v);
+fn verify_ddtree_for_dflash(
+    target_engine: &mut DecodeEngine,
+    root_token: u32,
+    tree: &DDTree,
+    pos_offset: usize,
+    tap_layers: &[usize],
+    capture_rollback: bool,
+) -> Result<DFlashVerifyOutput> {
+    static NOTICE: Once = Once::new();
+    NOTICE.call_once(|| {
+        eprintln!("[dflash] using DDTree target verifier");
+    });
+
+    let plan = build_verify_plan(tree, root_token, pos_offset);
+    let result = target_engine.verify_tree_prefill_captured(
+        &plan.flat_tokens,
+        &plan.positions,
+        &plan.parent_ids,
+        &plan.visibility,
+        pos_offset,
+        tap_layers,
+        capture_rollback,
+    )?;
+    if result.target_next.len() != plan.flat_tokens.len() {
+        bail!(
+            "DDTree verifier returned {} posterior IDs, expected {}",
+            result.target_next.len(),
+            plan.flat_tokens.len()
+        );
     }
-    out
+    Ok(DFlashVerifyOutput::Tree(PrefillTreeVerifyOutput {
+        root_token,
+        tree: tree.clone(),
+        result,
+    }))
+}
+
+fn dflash_fused_verify_chunk_size(target_engine: &DecodeEngine) -> usize {
+    const MAX_INPUT_CACHE_FLOATS: usize = 15872;
+    let hidden_dim = target_engine.weights().config.hidden_size;
+    if hidden_dim == 0 || 2 * hidden_dim > MAX_INPUT_CACHE_FLOATS {
+        return 0;
+    }
+    (MAX_INPUT_CACHE_FLOATS / hidden_dim).min(kernel_ffi::MAX_BATCH_SIZE)
+}
+
+fn upload_taps_to_gpu_history(
+    tap_history_gpu: &mut GpuBuffer,
+    start_row: usize,
+    row_bytes: usize,
+    taps: &[u8],
+) -> Result<()> {
+    if taps.is_empty() {
+        return Ok(());
+    }
+    if row_bytes == 0 || taps.len() % row_bytes != 0 {
+        bail!(
+            "tap upload byte length {} is not a multiple of row_bytes {}",
+            taps.len(),
+            row_bytes
+        );
+    }
+    let dst_offset = start_row * row_bytes;
+    if dst_offset + taps.len() > tap_history_gpu.len_bytes() {
+        bail!(
+            "GPU tap history write exceeds buffer: offset {} + len {} > {}",
+            dst_offset,
+            taps.len(),
+            tap_history_gpu.len_bytes()
+        );
+    }
+    let dst = unsafe {
+        (tap_history_gpu.as_mut_ptr() as *mut u8).add(dst_offset) as *mut std::ffi::c_void
+    };
+    gpu_hal::copy_h2d(
+        tap_history_gpu.device_ordinal(),
+        dst,
+        taps.as_ptr() as *const std::ffi::c_void,
+        taps.len(),
+    )
+    .map_err(|e| anyhow!("upload tap history: {e}"))
+}
+
+/// Convert tap-major BF16 history into draft input layout.
+///
+/// Input is one `[num_positions, hidden_dim]` byte vector per tap layer.
+/// Output is `[num_positions, num_taps * hidden_dim]`, row-major by target
+/// position, matching Lucebox's `target_hidden_cat`.
+fn flatten_tap_history(
+    per_tap: &[Vec<u8>],
+    num_positions: usize,
+    hidden_dim: usize,
+) -> Result<Vec<u8>> {
+    if per_tap.is_empty() {
+        bail!("flatten_tap_history requires at least one tap layer");
+    }
+    let row_bytes = hidden_dim * ScalarType::BF16.size_in_bytes();
+    let expected = num_positions * row_bytes;
+    for (idx, tap) in per_tap.iter().enumerate() {
+        if tap.len() != expected {
+            bail!(
+                "tap history {idx} has {} bytes, expected {expected} \
+                 ({num_positions} positions * {hidden_dim} hidden * 2)",
+                tap.len(),
+            );
+        }
+    }
+    let mut out = Vec::with_capacity(num_positions * per_tap.len() * row_bytes);
+    for pos in 0..num_positions {
+        let start = pos * row_bytes;
+        for tap in per_tap {
+            out.extend_from_slice(&tap[start..start + row_bytes]);
+        }
+    }
+    Ok(out)
+}
+
+fn flatten_tap_history_indices(
+    per_tap: &[Vec<u8>],
+    num_positions: usize,
+    hidden_dim: usize,
+    indices: &[usize],
+) -> Result<Vec<u8>> {
+    if per_tap.is_empty() {
+        bail!("flatten_tap_history_indices requires at least one tap layer");
+    }
+    let row_bytes = hidden_dim * ScalarType::BF16.size_in_bytes();
+    let expected = num_positions * row_bytes;
+    for (idx, tap) in per_tap.iter().enumerate() {
+        if tap.len() != expected {
+            bail!(
+                "indexed tap history {idx} has {} bytes, expected {expected} \
+                 ({num_positions} positions * hidden_dim {hidden_dim} * bf16)",
+                tap.len(),
+            );
+        }
+    }
+    let mut out = Vec::with_capacity(indices.len() * per_tap.len() * row_bytes);
+    for &row in indices {
+        if row >= num_positions {
+            bail!("tap gather row {row} out of range num_positions={num_positions}");
+        }
+        let start = row * row_bytes;
+        for tap in per_tap {
+            out.extend_from_slice(&tap[start..start + row_bytes]);
+        }
+    }
+    Ok(out)
 }
 
 /// Drive the DFlash draft's forward pass for one round and sample B
-/// candidate tokens via the target's `lm_head`. Returns
-/// `(candidates, draft_final_hidden_bytes)`.
+/// candidate tokens via the target's `lm_head`.
 ///
-/// Simplifications for M3:
-///   * `ctx_len = round_taps_len` (always 1 here post-M3, matching §5.2's
-///     first-round T=1 case).
-///   * `noise_embedding = embed_tokens([bonus_seed, MASK, …])` — B entries.
+/// The draft path mirrors Lucebox's stateless draft graph: every round sees a
+/// target-feature history window plus the current `[bonus_seed, MASK, ...]`
+/// noise block, with positions local to that window.
 fn draft_forward_and_sample(
     draft_state: &mut dflash::state::DFlashState,
     draft_scratch: &mut dflash::state::DFlashScratch,
+    noise_embedding: &mut GpuBuffer,
     draft_rotary: &dflash::RotaryTables,
     draft_weights: &dflash::DFlashWeights,
     target_engine: &DecodeEngine,
-    round_taps: &[u8],
+    tap_history_gpu: &GpuBuffer,
+    tap_start_row: usize,
     round_taps_len: usize,
     bonus_seed: u32,
     block_size: usize,
     mask_token_id: u32,
+    ddtree_probe_config: Option<&DFlashDDTreeProbeConfig>,
+    ddtree_depth_limit: usize,
     ordinal: usize,
-) -> Result<(Vec<u32>, Vec<u8>)> {
+) -> Result<DraftRoundOutput> {
     if round_taps_len == 0 {
         bail!("draft_forward: round_taps_len must be > 0");
     }
+    let profile = env::var_os("SUPERSONIC_DFLASH_PROFILE_DRAFT").is_some();
+    let mut ms_noise = 0.0_f64;
+    let mut ms_tap_copy = 0.0_f64;
+    let mut ms_forward = 0.0_f64;
+    let mut ms_lm_head = 0.0_f64;
+    let mut ms_argmax = 0.0_f64;
+    let mut ms_tree_probe = 0.0_f64;
     let hidden = draft_weights.config.hidden_size;
     let num_taps = draft_weights.config.num_taps();
-    let expected_bytes = round_taps_len * num_taps * hidden * ScalarType::BF16.size_in_bytes();
-    if round_taps.len() != expected_bytes {
+    let tap_row_bytes = num_taps * hidden * ScalarType::BF16.size_in_bytes();
+    let expected_bytes = round_taps_len * tap_row_bytes;
+    let src_offset = tap_start_row * tap_row_bytes;
+    if src_offset + expected_bytes > tap_history_gpu.len_bytes() {
         bail!(
-            "round_taps byte length {} != expected {} ({}ctx × {}tap × {}hidden × 2)",
-            round_taps.len(),
+            "GPU tap history read exceeds buffer: offset {} + len {} > {}",
+            src_offset,
             expected_bytes,
-            round_taps_len,
-            num_taps,
-            hidden,
+            tap_history_gpu.len_bytes()
         );
     }
 
     // 1) Build noise_embedding = embed([bonus_seed, MASK, …, MASK]).
+    let t_noise = Instant::now();
     let target_embed = &target_engine.weights().embed_tokens;
     let row_bytes = hidden * ScalarType::BF16.size_in_bytes();
-    let noise_embedding = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, block_size, hidden])
-        .map_err(|e| anyhow!("alloc noise_embedding: {e}"))?;
+    let expected_noise_bytes = block_size * row_bytes;
+    if noise_embedding.len_bytes() < expected_noise_bytes {
+        bail!(
+            "draft noise embedding scratch has {} bytes, need {}",
+            noise_embedding.len_bytes(),
+            expected_noise_bytes
+        );
+    }
     for i in 0..block_size {
         let tok = if i == 0 { bonus_seed } else { mask_token_id };
         let src_off = tok as usize * row_bytes;
         let dst_off = i * row_bytes;
         gpu_hal::copy_d2d(
             ordinal,
-            unsafe { (noise_embedding.as_ptr() as *mut u8).add(dst_off) as *mut std::ffi::c_void },
+            unsafe {
+                (noise_embedding.as_mut_ptr() as *mut u8).add(dst_off) as *mut std::ffi::c_void
+            },
             target_embed.offset_ptr(src_off),
             row_bytes,
         )
         .map_err(|e| anyhow!("noise_embedding gather slot {i}: {e}"))?;
     }
+    if profile {
+        ms_noise += t_noise.elapsed().as_secs_f64() * 1000.0;
+    }
 
-    // 2) Upload target_hidden_raw [1, round_taps_len, num_taps*hidden].
-    let target_hidden_raw = GpuBuffer::from_host_bytes(
+    // 2) Copy target_hidden_raw [1, round_taps_len, num_taps*hidden] into
+    // reusable draft scratch. `forward()` reads only the leading ctx rows.
+    let t_tap_copy = Instant::now();
+    if expected_bytes > draft_scratch.fuser_input.len_bytes() {
+        bail!(
+            "draft fuser_input scratch has {} bytes, need {}",
+            draft_scratch.fuser_input.len_bytes(),
+            expected_bytes
+        );
+    }
+    gpu_hal::copy_d2d(
         ordinal,
-        ScalarType::BF16,
-        &[1, round_taps_len, num_taps * hidden],
-        round_taps,
+        draft_scratch.fuser_input.as_mut_ptr(),
+        tap_history_gpu.offset_ptr(src_offset),
+        expected_bytes,
     )
-    .map_err(|e| anyhow!("upload target_hidden_raw: {e}"))?;
+    .map_err(|e| anyhow!("copy target_hidden_raw: {e}"))?;
+    if profile {
+        ms_tap_copy += t_tap_copy.elapsed().as_secs_f64() * 1000.0;
+    }
 
     // 3) Draft forward.
-    let pos_offset = draft_state.kv_filled;
-    let final_hidden = dflash::forward::forward(
+    let t_forward = Instant::now();
+    let pos_offset = 0;
+    dflash::forward::forward(
         draft_weights,
         draft_state,
         draft_scratch,
         draft_rotary,
-        &noise_embedding,
-        &target_hidden_raw,
+        noise_embedding,
         dflash::ForwardParams {
             ctx_len: round_taps_len,
             q_len: block_size,
@@ -736,42 +1646,38 @@ fn draft_forward_and_sample(
         },
     )
     .map_err(|e| anyhow!("draft forward: {e}"))?;
+    if profile {
+        ms_forward += t_forward.elapsed().as_secs_f64() * 1000.0;
+    }
 
-    // 4) lm_head projection → block_logits [block_size, vocab].
+    // 4) lm_head projection -> persistent draft logits scratch [block_size, vocab].
+    let t_lm_head = Instant::now();
     let target_weights = target_engine.weights();
     let lm_head = &target_weights.lm_head;
     let lm_head_buf: &GpuBuffer = lm_head.as_ref();
     let vocab = draft_weights.config.vocab_size;
-    let mut block_logits = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[block_size, vocab])
-        .map_err(|e| anyhow!("alloc block_logits: {e}"))?;
-    let lm_head_qtype = qwen35::weights::infer_lowbit_type(
-        lm_head_buf,
-        hidden,
-        target_weights.lm_head_int4_scale.is_some(),
-    );
-    if lm_head_qtype != 0 {
-        let scale = target_weights
-            .lm_head_int4_scale
-            .as_ref()
-            .unwrap_or(lm_head_buf);
-        let zero = target_weights
-            .lm_head_int4_zero
-            .as_ref()
-            .unwrap_or(lm_head_buf);
+    if draft_scratch.logits.elem_count() < block_size * vocab {
+        bail!(
+            "draft logits scratch has {} elems, need {}",
+            draft_scratch.logits.elem_count(),
+            block_size * vocab
+        );
+    }
+    if let Some((lm_head_qtype, scale, zero)) = target_weights.lm_head_lowbit_params(hidden) {
         kernel_ffi::prefill_ffi::matmul_rhs_transposed_int4(
             ordinal,
             1,          // batch
             block_size, // m
             vocab,      // n
             hidden,     // k
-            final_hidden,
+            &draft_scratch.final_hidden,
             lm_head_buf,
             scale,
             zero,
             target_weights.lm_head_awq_inv_scale.as_ref(),
             target_weights.int4_group_size,
             lm_head_qtype,
-            &mut block_logits,
+            &mut draft_scratch.logits,
         )
         .map_err(|e| anyhow!("draft lm_head low-bit matmul: {e}"))?;
     } else {
@@ -782,34 +1688,40 @@ fn draft_forward_and_sample(
             block_size, // m
             vocab,      // n
             hidden,     // k
-            final_hidden,
+            &draft_scratch.final_hidden,
             lm_head_buf,
-            &mut block_logits,
+            &mut draft_scratch.logits,
         )
         .map_err(|e| anyhow!("draft lm_head: {e}"))?;
     }
+    if profile {
+        ms_lm_head += t_lm_head.elapsed().as_secs_f64() * 1000.0;
+    }
 
-    // 5) D2H + argmax per position.
-    let logits_bytes = block_logits
+    // 5) GPU argmax per position, then D2H only the token IDs.
+    let t_argmax = Instant::now();
+    kernel_ffi::prefill_ffi::argmax_bf16_rows(
+        ordinal,
+        block_size,
+        vocab,
+        &draft_scratch.logits,
+        &mut draft_scratch.argmax_indices,
+    )
+    .map_err(|e| anyhow!("draft logits argmax: {e}"))?;
+    let argmax_bytes = draft_scratch
+        .argmax_indices
         .to_host_bytes()
-        .map_err(|e| anyhow!("block_logits D2H: {e}"))?;
-    let mut candidates = Vec::with_capacity(block_size);
-    let row_elems = vocab;
-    let row_stride_bytes = vocab * ScalarType::BF16.size_in_bytes();
-    for i in 0..block_size {
-        let start = i * row_stride_bytes;
-        let slice = &logits_bytes[start..start + row_stride_bytes];
-        let mut best_idx: u32 = 0;
-        let mut best_val = f32::NEG_INFINITY;
-        for (j, chunk) in slice.chunks_exact(2).enumerate() {
-            let v = half::bf16::from_le_bytes([chunk[0], chunk[1]]).to_f32();
-            if v > best_val {
-                best_val = v;
-                best_idx = j as u32;
-            }
-        }
-        candidates.push(best_idx);
-        let _ = row_elems;
+        .map_err(|e| anyhow!("draft argmax indices D2H: {e}"))?;
+    let mut candidates: Vec<u32> = argmax_bytes
+        .chunks_exact(4)
+        .take(block_size)
+        .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect();
+    if candidates.len() != block_size {
+        bail!(
+            "draft argmax returned {} candidates, expected {block_size}",
+            candidates.len()
+        );
     }
     if let Some(first) = candidates.first_mut() {
         // Lucebox DFlash treats slot 0 as the previous target token, not a
@@ -817,12 +1729,206 @@ fn draft_forward_and_sample(
         // draft_tok[0] is forced back to that same token after projection.
         *first = bonus_seed;
     }
+    if profile {
+        ms_argmax += t_argmax.elapsed().as_secs_f64() * 1000.0;
+    }
 
-    // Retain the final-hidden bytes for potential debugging; cost is a
-    // single D2H of [block_size * hidden] BF16 bytes.
-    let draft_final_hidden_bytes = final_hidden
-        .to_host_bytes()
-        .map_err(|e| anyhow!("draft final_hidden D2H: {e}"))?;
+    let t_tree_probe = Instant::now();
+    let ddtree_probe = match ddtree_probe_config {
+        Some(config) => Some(probe_ddtree_round(
+            &candidates,
+            &draft_scratch.logits,
+            block_size,
+            ddtree_depth_limit,
+            vocab,
+            config,
+        )?),
+        None => None,
+    };
+    if profile {
+        ms_tree_probe += t_tree_probe.elapsed().as_secs_f64() * 1000.0;
+        eprintln!(
+            "[dflash-profile] draft outer ctx={} q={} noise={:.2}ms tap_copy={:.2}ms forward={:.2}ms lm_head={:.2}ms argmax={:.2}ms tree_probe={:.2}ms",
+            round_taps_len,
+            block_size,
+            ms_noise,
+            ms_tap_copy,
+            ms_forward,
+            ms_lm_head,
+            ms_argmax,
+            ms_tree_probe,
+        );
+    }
 
-    Ok((candidates, draft_final_hidden_bytes))
+    Ok(DraftRoundOutput {
+        candidates,
+        ddtree_probe,
+    })
+}
+
+fn probe_ddtree_round(
+    candidates: &[u32],
+    draft_logits: &GpuBuffer,
+    block_size: usize,
+    depth_limit: usize,
+    vocab: usize,
+    config: &DFlashDDTreeProbeConfig,
+) -> Result<DFlashDDTreeProbeRound> {
+    let depth_limit = depth_limit.min(block_size.saturating_sub(1));
+    let top_k = if config.budget > depth_limit {
+        config.top_k.min(vocab)
+    } else {
+        1
+    };
+    let (top_log_probs, top_token_ids) = if depth_limit == 0 {
+        (Vec::new(), Vec::new())
+    } else if top_k == 1 {
+        let ids = candidates
+            .iter()
+            .skip(1)
+            .take(depth_limit)
+            .copied()
+            .collect::<Vec<_>>();
+        (vec![0.0; depth_limit], ids)
+    } else {
+        let row_bytes = vocab * ScalarType::BF16.size_in_bytes();
+        let needed = block_size * row_bytes;
+        let logits_bytes = draft_logits
+            .to_host_bytes()
+            .map_err(|e| anyhow!("dflash ddtree probe logits D2H: {e}"))?;
+        if logits_bytes.len() < needed {
+            bail!(
+                "dflash ddtree probe logits D2H returned {} bytes, expected at least {}",
+                logits_bytes.len(),
+                needed
+            );
+        }
+        extract_draft_topk_bf16(
+            &logits_bytes[row_bytes..row_bytes + depth_limit * row_bytes],
+            depth_limit,
+            vocab,
+            top_k,
+            config.temperature,
+        )
+    };
+
+    let tree = build_ddtree(
+        &top_log_probs,
+        &top_token_ids,
+        depth_limit,
+        top_k,
+        config.budget,
+        config.chain_seed,
+    );
+    let top1_head = top_token_ids
+        .chunks(top_k)
+        .take(6)
+        .filter_map(|row| row.first().copied())
+        .collect::<Vec<_>>();
+    let max_depth = tree.depths.iter().copied().max().unwrap_or(0);
+
+    Ok(DFlashDDTreeProbeRound {
+        depth_limit,
+        top_k,
+        budget: config.budget,
+        nodes: tree.n_nodes(),
+        width: tree.width(),
+        max_depth,
+        top1_head,
+        tree,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{chain_accept_needs_more, dflash_verify_len_for_round, dflash_window_step};
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn verify_len_pads_final_partial_rounds_by_default() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::remove_var("SUPERSONIC_DFLASH_DISABLE_FINAL_VERIFY_PAD");
+        std::env::remove_var("SUPERSONIC_DFLASH_FINAL_VERIFY_MIN_LEN");
+        assert_eq!(dflash_verify_len_for_round(3, 16), 16);
+        assert_eq!(dflash_verify_len_for_round(8, 16), 16);
+        assert_eq!(dflash_verify_len_for_round(20, 16), 16);
+    }
+
+    #[test]
+    fn verify_len_can_override_final_partial_minimum() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::remove_var("SUPERSONIC_DFLASH_DISABLE_FINAL_VERIFY_PAD");
+        std::env::set_var("SUPERSONIC_DFLASH_FINAL_VERIFY_MIN_LEN", "8");
+        assert_eq!(dflash_verify_len_for_round(3, 16), 8);
+        assert_eq!(dflash_verify_len_for_round(8, 16), 8);
+        assert_eq!(dflash_verify_len_for_round(12, 16), 12);
+        assert_eq!(dflash_verify_len_for_round(20, 16), 16);
+        std::env::remove_var("SUPERSONIC_DFLASH_FINAL_VERIFY_MIN_LEN");
+    }
+
+    #[test]
+    fn verify_len_can_restore_budget_clamp() {
+        let _guard = env_lock().lock().unwrap();
+        std::env::set_var("SUPERSONIC_DFLASH_DISABLE_FINAL_VERIFY_PAD", "1");
+        std::env::remove_var("SUPERSONIC_DFLASH_FINAL_VERIFY_MIN_LEN");
+        assert_eq!(dflash_verify_len_for_round(3, 16), 3);
+        assert_eq!(dflash_verify_len_for_round(8, 16), 8);
+        assert_eq!(dflash_verify_len_for_round(20, 16), 16);
+        std::env::remove_var("SUPERSONIC_DFLASH_DISABLE_FINAL_VERIFY_PAD");
+    }
+
+    #[test]
+    fn window_step_absorbs_tiny_tail() {
+        assert_eq!(dflash_window_step(10, 8, 4), 10);
+        assert_eq!(dflash_window_step(11, 8, 4), 11);
+    }
+
+    #[test]
+    fn window_step_keeps_normal_tail() {
+        assert_eq!(dflash_window_step(12, 8, 4), 8);
+        assert_eq!(dflash_window_step(16, 8, 4), 8);
+    }
+
+    #[test]
+    fn window_step_handles_short_remaining() {
+        assert_eq!(dflash_window_step(1, 8, 4), 1);
+        assert_eq!(dflash_window_step(7, 8, 4), 7);
+    }
+
+    #[test]
+    fn chain_accept_fetches_carried_seed_after_full_window_match() {
+        let tokens = [10, 20, 30, 40];
+        let target_next = [20, 30, 40];
+
+        assert!(chain_accept_needs_more(&target_next, &tokens, tokens.len()));
+    }
+
+    #[test]
+    fn chain_accept_stops_when_mismatch_is_known() {
+        let tokens = [10, 20, 30, 40];
+        let target_next = [20, 31, 99];
+
+        assert!(!chain_accept_needs_more(
+            &target_next,
+            &tokens,
+            tokens.len()
+        ));
+    }
+
+    #[test]
+    fn chain_accept_has_enough_for_single_token_verify() {
+        let tokens = [10];
+        let target_next = [20];
+
+        assert!(!chain_accept_needs_more(
+            &target_next,
+            &tokens,
+            tokens.len()
+        ));
+    }
 }

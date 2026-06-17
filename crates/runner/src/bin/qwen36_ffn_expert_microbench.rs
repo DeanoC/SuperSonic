@@ -423,8 +423,7 @@ fn main() -> Result<()> {
     let mut output = GpuBuffer::zeros(0, ScalarType::BF16, &[HIDDEN])?;
     let mut direct_output = GpuBuffer::zeros(0, ScalarType::BF16, &[HIDDEN])?;
     let mut gpu_pack_output = GpuBuffer::zeros(0, ScalarType::BF16, &[HIDDEN])?;
-    let mut gate_up_gpu_pack =
-        GpuBuffer::zeros(0, ScalarType::U8, &[TOP_K, rows, HIDDEN / 2])?;
+    let mut gate_up_gpu_pack = GpuBuffer::zeros(0, ScalarType::U8, &[TOP_K, rows, HIDDEN / 2])?;
     let mut gate_up_scale_gpu_pack = GpuBuffer::zeros(
         0,
         ScalarType::BF16,
@@ -435,11 +434,8 @@ fn main() -> Result<()> {
         ScalarType::BF16,
         &[TOP_K, rows / GROUP_SIZE, HIDDEN / GROUP_SIZE],
     )?;
-    let mut down_gpu_pack = GpuBuffer::zeros(
-        0,
-        ScalarType::U8,
-        &[TOP_K, HIDDEN, MOE_INTERMEDIATE / 2],
-    )?;
+    let mut down_gpu_pack =
+        GpuBuffer::zeros(0, ScalarType::U8, &[TOP_K, HIDDEN, MOE_INTERMEDIATE / 2])?;
     let mut down_scale_gpu_pack = GpuBuffer::zeros(
         0,
         ScalarType::BF16,

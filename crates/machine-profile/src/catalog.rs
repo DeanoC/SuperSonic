@@ -92,7 +92,9 @@ pub fn lookup_gpu(arch: &str, pci_id: Option<&str>) -> Option<GpuPeaks> {
 }
 
 pub fn lookup_cpu(model: &str) -> Option<CpuPeaks> {
-    CPUS.iter().find(|e| model.contains(e.pattern)).map(|e| e.peaks)
+    CPUS.iter()
+        .find(|e| model.contains(e.pattern))
+        .map(|e| e.peaks)
 }
 
 #[cfg(test)]

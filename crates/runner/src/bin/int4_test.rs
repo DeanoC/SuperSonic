@@ -7,6 +7,7 @@ use anyhow::{anyhow, Result};
 use gpu_hal::{GpuBuffer, ScalarType};
 use half::{bf16, f16};
 use kernel_ffi::prefill_ffi;
+use std::time::Instant;
 
 fn f32_to_bf16_bytes(vals: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(vals.len() * 2);
@@ -167,13 +168,37 @@ fn ggml_q6k_row(row: usize) -> (Vec<u8>, Vec<f32>) {
     (out, vals)
 }
 
+fn ggml_q8_0_row(row: usize) -> (Vec<u8>, Vec<f32>) {
+    let d = f16::from_f32(0.03125 + (row % 7) as f32 * 0.001953125).to_f32();
+    let mut out = Vec::with_capacity(34);
+    push_f16_le(&mut out, d);
+    let mut vals = vec![0f32; 32];
+    for (l, val) in vals.iter_mut().enumerate() {
+        let q = (((row * 17 + l * 11 + 13) % 255) as i16 - 127) as i8;
+        out.push(q as u8);
+        *val = bf16_round(d * q as f32);
+    }
+    (out, vals)
+}
+
 fn run_ggml_case(
     ordinal: usize,
     name: &str,
     qtype: i32,
     row_fn: fn(usize) -> (Vec<u8>, Vec<f32>),
 ) -> Result<()> {
-    let (m, n, k) = (3usize, 17usize, 256usize);
+    run_ggml_case_shape(ordinal, name, qtype, row_fn, 3, 17, 256)
+}
+
+fn run_ggml_case_shape(
+    ordinal: usize,
+    name: &str,
+    qtype: i32,
+    row_fn: fn(usize) -> (Vec<u8>, Vec<f32>),
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<()> {
     println!("=== {name}: m={m} n={n} k={k} ===");
     let mut lhs = vec![0f32; m * k];
     for mi in 0..m {
@@ -184,8 +209,12 @@ fn run_ggml_case(
     let mut rhs = Vec::new();
     let mut rows = Vec::new();
     for ni in 0..n {
-        let (bytes, vals) = row_fn(ni);
-        rhs.extend_from_slice(&bytes);
+        let mut vals = Vec::with_capacity(k);
+        for block in 0..ggml_blocks_for(qtype, k)? {
+            let (bytes, block_vals) = row_fn(ni.wrapping_mul(131).wrapping_add(block));
+            rhs.extend_from_slice(&bytes);
+            vals.extend_from_slice(&block_vals);
+        }
         rows.push(vals);
     }
     let row_bytes = rhs.len() / n;
@@ -244,6 +273,682 @@ fn run_ggml_case(
     println!("  max_abs={max_abs:.5e} bad={nbad}/{}", m * n);
     if nbad > 0 {
         return Err(anyhow!("{name} mismatches"));
+    }
+    Ok(())
+}
+
+fn ggml_row_bytes_for(qtype: i32, k: usize) -> Result<usize> {
+    qwen35::weights::ggml_k_row_bytes(qtype, k)
+        .ok_or_else(|| anyhow!("unsupported GGML qtype {qtype} for k={k}"))
+}
+
+fn ggml_block_cols_for(qtype: i32) -> usize {
+    if qtype == qwen35::weights::LOWBIT_GGML_Q8_0 {
+        32
+    } else {
+        256
+    }
+}
+
+fn ggml_blocks_for(qtype: i32, k: usize) -> Result<usize> {
+    let block_cols = ggml_block_cols_for(qtype);
+    if k % block_cols != 0 {
+        return Err(anyhow!(
+            "GGML qtype {qtype} bench requires k multiple of {block_cols}, got {k}"
+        ));
+    }
+    Ok(k / block_cols)
+}
+
+fn make_ggml_k_slab(
+    n: usize,
+    k: usize,
+    qtype: i32,
+    row_fn: fn(usize) -> (Vec<u8>, Vec<f32>),
+) -> Result<Vec<u8>> {
+    let row_bytes = ggml_row_bytes_for(qtype, k)?;
+    let blocks = ggml_blocks_for(qtype, k)?;
+    let mut out = Vec::with_capacity(n * row_bytes);
+    for row in 0..n {
+        for block in 0..blocks {
+            let (bytes, _) = row_fn(row.wrapping_mul(131).wrapping_add(block));
+            out.extend_from_slice(&bytes);
+        }
+    }
+    Ok(out)
+}
+
+fn make_bench_lhs(m: usize, k: usize) -> Vec<f32> {
+    let mut lhs = vec![0f32; m * k];
+    for mi in 0..m {
+        for ki in 0..k {
+            let x = (mi as f32 + 1.0) * 0.017 + (ki as f32) * 0.0017;
+            lhs[mi * k + ki] = bf16_round(x.sin() * 0.75);
+        }
+    }
+    lhs
+}
+
+fn expected_q8_1_group(vals: &[f32]) -> (f32, f32, Vec<i8>) {
+    let amax = vals
+        .iter()
+        .fold(0.0f32, |acc, &v| if v.abs() > acc { v.abs() } else { acc });
+    let d = if amax > 0.0 { amax / 127.0 } else { 0.0 };
+    let inv = if amax > 0.0 { 127.0 / amax } else { 0.0 };
+    let sum = vals.iter().sum::<f32>();
+    let qs = vals
+        .iter()
+        .map(|&v| (v * inv).round().clamp(-127.0, 127.0) as i8)
+        .collect();
+    (d, sum, qs)
+}
+
+fn reference_q8_1_matmul(m: usize, n: usize, k: usize, lhs: &[f32], rows: &[Vec<f32>]) -> Vec<f32> {
+    let mut out = vec![0f32; m * n];
+    for mi in 0..m {
+        for ni in 0..n {
+            let mut acc = 0f32;
+            for group in 0..(k / 32) {
+                let start = mi * k + group * 32;
+                let (d, _, qs) = expected_q8_1_group(&lhs[start..start + 32]);
+                for (i, &q) in qs.iter().enumerate() {
+                    acc += rows[ni][group * 32 + i] * d * q as f32;
+                }
+            }
+            out[mi * n + ni] = bf16_round(acc);
+        }
+    }
+    out
+}
+
+fn run_mmq_q6_matmul_case(ordinal: usize, name: &str, m: usize, n: usize, k: usize) -> Result<()> {
+    println!("=== {name}: m={m} n={n} k={k} ===");
+    if k % 256 != 0 {
+        return Err(anyhow!("Q6_K MMQ case requires k multiple of 256, got {k}"));
+    }
+
+    let lhs = make_bench_lhs(m, k);
+    let mut rhs = Vec::new();
+    let mut rows = Vec::new();
+    for ni in 0..n {
+        let mut vals = Vec::with_capacity(k);
+        for block in 0..ggml_blocks_for(qwen35::weights::LOWBIT_GGML_Q6_K, k)? {
+            let (bytes, block_vals) = ggml_q6k_row(ni.wrapping_mul(131).wrapping_add(block));
+            rhs.extend_from_slice(&bytes);
+            vals.extend_from_slice(&block_vals);
+        }
+        rows.push(vals);
+    }
+    let row_bytes = ggml_row_bytes_for(qwen35::weights::LOWBIT_GGML_Q6_K, k)?;
+    let lhs_gpu =
+        GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[m, k], &f32_to_bf16_bytes(&lhs))
+            .map_err(|e| anyhow!("lhs upload: {e}"))?;
+    let rhs_gpu = GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[n, row_bytes], &rhs)
+        .map_err(|e| anyhow!("rhs upload: {e}"))?;
+    let workspace_bytes = mmq_q8_1_workspace_bytes(1, m, k)?;
+    let mut q8_gpu = GpuBuffer::alloc(ordinal, ScalarType::U8, &[workspace_bytes])
+        .map_err(|e| anyhow!("q8 workspace alloc: {e}"))?;
+    let mut out_gpu = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[m, n])
+        .map_err(|e| anyhow!("out alloc: {e}"))?;
+
+    prefill_ffi::quantize_mmq_q8_1(
+        ordinal,
+        1,
+        m,
+        k,
+        &lhs_gpu,
+        qwen35::weights::LOWBIT_GGML_Q6_K,
+        &mut q8_gpu,
+    )
+    .map_err(|e| anyhow!("q8_1 quant: {e}"))?;
+    prefill_ffi::matmul_mmq_q8_1_q6_k(ordinal, 1, m, n, k, &q8_gpu, &rhs_gpu, &mut out_gpu)
+        .map_err(|e| anyhow!("q6 mmq matmul: {e}"))?;
+
+    let out_host = bf16_bytes_to_f32(
+        &out_gpu
+            .to_host_bytes()
+            .map_err(|e| anyhow!("out d2h: {e}"))?,
+    );
+    let ref_out = reference_q8_1_matmul(m, n, k, &lhs, &rows);
+
+    let mut nbad = 0usize;
+    let mut max_abs = 0f32;
+    let mut max_rel = 0f32;
+    let mut first_bad = None;
+    for mi in 0..m {
+        for ni in 0..n {
+            let idx = mi * n + ni;
+            let g = out_host[idx];
+            let r = ref_out[idx];
+            let abs = (g - r).abs();
+            let rel = abs / r.abs().max(1.0e-5);
+            max_abs = max_abs.max(abs);
+            max_rel = max_rel.max(rel);
+            if abs > 0.35 && rel > 0.03 {
+                nbad += 1;
+                if first_bad.is_none() {
+                    first_bad = Some((mi, ni, g, r));
+                }
+            }
+        }
+    }
+    println!(
+        "  max_abs={max_abs:.5e} max_rel={max_rel:.5e} bad={nbad}/{}",
+        m * n
+    );
+    if let Some((mi, ni, g, r)) = first_bad {
+        println!("  first bad @ [{mi},{ni}]: gpu={g:.6} ref={r:.6}");
+    }
+    if nbad > 0 {
+        return Err(anyhow!("{name} mismatches"));
+    }
+    Ok(())
+}
+
+fn run_mmq_q8_quant_case(ordinal: usize, name: &str, qtype: i32) -> Result<()> {
+    let m = 2usize;
+    let k = 256usize;
+    println!("=== {name} Q8_1 quant layout: m={m} k={k} ===");
+    let lhs = make_bench_lhs(m, k);
+    let lhs_gpu =
+        GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[m, k], &f32_to_bf16_bytes(&lhs))
+            .map_err(|e| anyhow!("lhs upload: {e}"))?;
+    let workspace_bytes = mmq_q8_1_workspace_bytes(1, m, k)?;
+    let mut q8_gpu = GpuBuffer::alloc(ordinal, ScalarType::U8, &[workspace_bytes])
+        .map_err(|e| anyhow!("q8 workspace alloc: {e}"))?;
+    prefill_ffi::quantize_mmq_q8_1(ordinal, 1, m, k, &lhs_gpu, qtype, &mut q8_gpu)
+        .map_err(|e| anyhow!("q8_1 quant: {e}"))?;
+    gpu_hal::sync(ordinal).map_err(|e| anyhow!("q8 sync: {e}"))?;
+    let out = q8_gpu.to_host_bytes().map_err(|e| anyhow!("q8 d2h: {e}"))?;
+
+    let blocks_per_row = k / 128;
+    let mut nbad = 0usize;
+    let mut max_q_diff = 0i32;
+    let mut max_meta_abs = 0f32;
+    for row in 0..m {
+        for block in 0..blocks_per_row {
+            // Lucebox/ggml MMQ stores activation blocks as
+            // [k_block][row][block_q8_1_mmq], not [row][k_block].
+            let block_base = (block * m + row) * 144;
+            for group in 0..4 {
+                let start = row * k + block * 128 + group * 32;
+                let vals = &lhs[start..start + 32];
+                let (d, sum, expected_qs) = expected_q8_1_group(vals);
+                let qs_base = block_base + 16 + group * 32;
+                for (i, &expected) in expected_qs.iter().enumerate() {
+                    let got = out[qs_base + i] as i8;
+                    let diff = (got as i32 - expected as i32).abs();
+                    max_q_diff = max_q_diff.max(diff);
+                    if diff != 0 {
+                        nbad += 1;
+                    }
+                }
+                if qtype == qwen35::weights::LOWBIT_GGML_Q6_K {
+                    let off = block_base + group * 4;
+                    let got =
+                        f32::from_le_bytes([out[off], out[off + 1], out[off + 2], out[off + 3]]);
+                    max_meta_abs = max_meta_abs.max((got - d).abs());
+                    if (got - d).abs() > 1.0e-6 {
+                        nbad += 1;
+                    }
+                } else {
+                    let off = block_base + group * 4;
+                    let got_d =
+                        f16::from_bits(u16::from_le_bytes([out[off], out[off + 1]])).to_f32();
+                    let got_sum =
+                        f16::from_bits(u16::from_le_bytes([out[off + 2], out[off + 3]])).to_f32();
+                    let exp_d = f16::from_f32(d).to_f32();
+                    let exp_sum = f16::from_f32(sum).to_f32();
+                    max_meta_abs = max_meta_abs.max((got_d - exp_d).abs());
+                    max_meta_abs = max_meta_abs.max((got_sum - exp_sum).abs());
+                    if (got_d - exp_d).abs() > 0.0 || (got_sum - exp_sum).abs() > 0.0 {
+                        nbad += 1;
+                    }
+                }
+            }
+        }
+    }
+    println!("  max_q_diff={max_q_diff} max_meta_abs={max_meta_abs:.5e} bad={nbad}");
+    if nbad > 0 {
+        return Err(anyhow!("{name} Q8_1 quant layout mismatches"));
+    }
+    Ok(())
+}
+
+fn bench_ggml_hot_shape(
+    ordinal: usize,
+    name: &str,
+    qtype: i32,
+    row_fn: fn(usize) -> (Vec<u8>, Vec<f32>),
+    m: usize,
+    n: usize,
+    k: usize,
+    iterations: usize,
+) -> Result<()> {
+    let row_bytes = ggml_row_bytes_for(qtype, k)?;
+    println!("=== bench {name}: m={m} n={n} k={k} row_bytes={row_bytes} iters={iterations} ===");
+
+    let lhs = make_bench_lhs(m, k);
+    let rhs = make_ggml_k_slab(n, k, qtype, row_fn)?;
+    let lhs_gpu =
+        GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[m, k], &f32_to_bf16_bytes(&lhs))
+            .map_err(|e| anyhow!("lhs upload: {e}"))?;
+    let rhs_gpu = GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[n, row_bytes], &rhs)
+        .map_err(|e| anyhow!("rhs upload: {e}"))?;
+    let dummy_gpu = GpuBuffer::from_host_bytes(
+        ordinal,
+        ScalarType::BF16,
+        &[1, 1],
+        &f32_to_bf16_bytes(&[0.0]),
+    )
+    .map_err(|e| anyhow!("dummy upload: {e}"))?;
+    let mut out_gpu = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[m, n])
+        .map_err(|e| anyhow!("out alloc: {e}"))?;
+
+    for _ in 0..3 {
+        prefill_ffi::matmul_rhs_transposed_int4(
+            ordinal,
+            1,
+            m,
+            n,
+            k,
+            &lhs_gpu,
+            &rhs_gpu,
+            &dummy_gpu,
+            &dummy_gpu,
+            None,
+            128,
+            qtype,
+            &mut out_gpu,
+        )
+        .map_err(|e| anyhow!("warmup ggml matmul: {e}"))?;
+    }
+    gpu_hal::sync(ordinal).map_err(|e| anyhow!("warmup sync: {e}"))?;
+
+    let mut samples = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let start = Instant::now();
+        prefill_ffi::matmul_rhs_transposed_int4(
+            ordinal,
+            1,
+            m,
+            n,
+            k,
+            &lhs_gpu,
+            &rhs_gpu,
+            &dummy_gpu,
+            &dummy_gpu,
+            None,
+            128,
+            qtype,
+            &mut out_gpu,
+        )
+        .map_err(|e| anyhow!("bench ggml matmul: {e}"))?;
+        gpu_hal::sync(ordinal).map_err(|e| anyhow!("bench sync: {e}"))?;
+        samples.push(start.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mean = samples.iter().sum::<f64>() / samples.len() as f64;
+    let p50 = samples[samples.len() / 2];
+    let p90 = samples[((samples.len() * 9) / 10).min(samples.len() - 1)];
+    println!("  mean_ms={mean:.4} p50_ms={p50:.4} p90_ms={p90:.4}");
+    Ok(())
+}
+
+fn mmq_q8_1_workspace_bytes(batch: usize, m: usize, k: usize) -> Result<usize> {
+    if k % 128 != 0 {
+        return Err(anyhow!(
+            "MMQ Q8_1 workspace requires k multiple of 128, got {k}"
+        ));
+    }
+    Ok(batch * m * (k / 128) * 144)
+}
+
+fn bench_mmq_q8_quant_hot_shape(
+    ordinal: usize,
+    name: &str,
+    qtype: i32,
+    m: usize,
+    k: usize,
+    iterations: usize,
+) -> Result<()> {
+    let workspace_bytes = mmq_q8_1_workspace_bytes(1, m, k)?;
+    println!(
+        "=== bench {name} q8_1 quant: m={m} k={k} workspace_bytes={workspace_bytes} iters={iterations} ==="
+    );
+
+    let lhs = make_bench_lhs(m, k);
+    let lhs_gpu =
+        GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[m, k], &f32_to_bf16_bytes(&lhs))
+            .map_err(|e| anyhow!("lhs upload: {e}"))?;
+    let mut q8_gpu = GpuBuffer::alloc(ordinal, ScalarType::U8, &[workspace_bytes])
+        .map_err(|e| anyhow!("q8 workspace alloc: {e}"))?;
+
+    for _ in 0..3 {
+        prefill_ffi::quantize_mmq_q8_1(ordinal, 1, m, k, &lhs_gpu, qtype, &mut q8_gpu)
+            .map_err(|e| anyhow!("warmup q8_1 quant: {e}"))?;
+    }
+    gpu_hal::sync(ordinal).map_err(|e| anyhow!("warmup sync: {e}"))?;
+
+    let mut samples = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let start = Instant::now();
+        prefill_ffi::quantize_mmq_q8_1(ordinal, 1, m, k, &lhs_gpu, qtype, &mut q8_gpu)
+            .map_err(|e| anyhow!("bench q8_1 quant: {e}"))?;
+        gpu_hal::sync(ordinal).map_err(|e| anyhow!("bench sync: {e}"))?;
+        samples.push(start.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mean = samples.iter().sum::<f64>() / samples.len() as f64;
+    let p50 = samples[samples.len() / 2];
+    let p90 = samples[((samples.len() * 9) / 10).min(samples.len() - 1)];
+    println!("  mean_ms={mean:.4} p50_ms={p50:.4} p90_ms={p90:.4}");
+    Ok(())
+}
+
+fn bench_mmq_q6_matmul_hot_shape(
+    ordinal: usize,
+    name: &str,
+    m: usize,
+    n: usize,
+    k: usize,
+    iterations: usize,
+) -> Result<()> {
+    let row_bytes = ggml_row_bytes_for(qwen35::weights::LOWBIT_GGML_Q6_K, k)?;
+    let workspace_bytes = mmq_q8_1_workspace_bytes(1, m, k)?;
+    println!(
+        "=== bench {name} q6_k mmq: m={m} n={n} k={k} row_bytes={row_bytes} workspace_bytes={workspace_bytes} iters={iterations} ==="
+    );
+
+    let lhs = make_bench_lhs(m, k);
+    let rhs = make_ggml_k_slab(n, k, qwen35::weights::LOWBIT_GGML_Q6_K, ggml_q6k_row)?;
+    let lhs_gpu =
+        GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[m, k], &f32_to_bf16_bytes(&lhs))
+            .map_err(|e| anyhow!("lhs upload: {e}"))?;
+    let rhs_gpu = GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[n, row_bytes], &rhs)
+        .map_err(|e| anyhow!("rhs upload: {e}"))?;
+    let mut q8_gpu = GpuBuffer::alloc(ordinal, ScalarType::U8, &[workspace_bytes])
+        .map_err(|e| anyhow!("q8 workspace alloc: {e}"))?;
+    let mut out_gpu = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[m, n])
+        .map_err(|e| anyhow!("out alloc: {e}"))?;
+
+    prefill_ffi::quantize_mmq_q8_1(
+        ordinal,
+        1,
+        m,
+        k,
+        &lhs_gpu,
+        qwen35::weights::LOWBIT_GGML_Q6_K,
+        &mut q8_gpu,
+    )
+    .map_err(|e| anyhow!("q8_1 quant: {e}"))?;
+    for _ in 0..3 {
+        prefill_ffi::matmul_mmq_q8_1_q6_k(ordinal, 1, m, n, k, &q8_gpu, &rhs_gpu, &mut out_gpu)
+            .map_err(|e| anyhow!("warmup q6 mmq matmul: {e}"))?;
+    }
+    gpu_hal::sync(ordinal).map_err(|e| anyhow!("warmup sync: {e}"))?;
+
+    let mut samples = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let start = Instant::now();
+        prefill_ffi::matmul_mmq_q8_1_q6_k(ordinal, 1, m, n, k, &q8_gpu, &rhs_gpu, &mut out_gpu)
+            .map_err(|e| anyhow!("bench q6 mmq matmul: {e}"))?;
+        gpu_hal::sync(ordinal).map_err(|e| anyhow!("bench sync: {e}"))?;
+        samples.push(start.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mean = samples.iter().sum::<f64>() / samples.len() as f64;
+    let p50 = samples[samples.len() / 2];
+    let p90 = samples[((samples.len() * 9) / 10).min(samples.len() - 1)];
+    println!("  mean_ms={mean:.4} p50_ms={p50:.4} p90_ms={p90:.4}");
+    Ok(())
+}
+
+fn maybe_run_ggml_hot_benches(ordinal: usize) -> Result<()> {
+    if std::env::var_os("SUPERSONIC_INT4_TEST_BENCH_GGML_HOT").is_none() {
+        return Ok(());
+    }
+    let iterations = std::env::var("SUPERSONIC_INT4_TEST_BENCH_ITERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(20)
+        .max(1);
+    bench_ggml_hot_shape(
+        ordinal,
+        "Q4_K mlp gate/up hot",
+        qwen35::weights::LOWBIT_GGML_Q4_K,
+        ggml_q4k_row,
+        8,
+        17_408,
+        5_120,
+        iterations,
+    )?;
+    bench_ggml_hot_shape(
+        ordinal,
+        "Q6_K down hot",
+        qwen35::weights::LOWBIT_GGML_Q6_K,
+        ggml_q6k_row,
+        8,
+        5_120,
+        17_408,
+        iterations,
+    )?;
+    bench_ggml_hot_shape(
+        ordinal,
+        "Q4_K down hot",
+        qwen35::weights::LOWBIT_GGML_Q4_K,
+        ggml_q4k_row,
+        8,
+        5_120,
+        17_408,
+        iterations,
+    )?;
+    bench_ggml_hot_shape(
+        ordinal,
+        "Q5_K linear hot",
+        qwen35::weights::LOWBIT_GGML_Q5_K,
+        ggml_q5k_row,
+        8,
+        5_120,
+        6_144,
+        iterations,
+    )?;
+    bench_ggml_hot_shape(
+        ordinal,
+        "Q6_K vocab row-scan hot",
+        qwen35::weights::LOWBIT_GGML_Q6_K,
+        ggml_q6k_row,
+        8,
+        248_320,
+        5_120,
+        iterations,
+    )?;
+    bench_ggml_hot_shape(
+        ordinal,
+        "Q6_K mid linear hot",
+        qwen35::weights::LOWBIT_GGML_Q6_K,
+        ggml_q6k_row,
+        8,
+        10_240,
+        5_120,
+        iterations,
+    )?;
+    bench_ggml_hot_shape(
+        ordinal,
+        "Q6_K small linear hot",
+        qwen35::weights::LOWBIT_GGML_Q6_K,
+        ggml_q6k_row,
+        8,
+        1_024,
+        5_120,
+        iterations,
+    )?;
+    if std::env::var_os("SUPERSONIC_INT4_TEST_BENCH_MMQ_Q8").is_some() {
+        bench_mmq_q8_quant_hot_shape(
+            ordinal,
+            "Q4_K mlp gate/up hot",
+            qwen35::weights::LOWBIT_GGML_Q4_K,
+            8,
+            5_120,
+            iterations,
+        )?;
+        bench_mmq_q8_quant_hot_shape(
+            ordinal,
+            "Q6_K down hot",
+            qwen35::weights::LOWBIT_GGML_Q6_K,
+            8,
+            17_408,
+            iterations,
+        )?;
+        bench_mmq_q8_quant_hot_shape(
+            ordinal,
+            "Q4_K down hot",
+            qwen35::weights::LOWBIT_GGML_Q4_K,
+            8,
+            17_408,
+            iterations,
+        )?;
+        bench_mmq_q8_quant_hot_shape(
+            ordinal,
+            "Q5_K linear hot",
+            qwen35::weights::LOWBIT_GGML_Q5_K,
+            8,
+            6_144,
+            iterations,
+        )?;
+        bench_mmq_q8_quant_hot_shape(
+            ordinal,
+            "Q6_K vocab row-scan hot",
+            qwen35::weights::LOWBIT_GGML_Q6_K,
+            8,
+            5_120,
+            iterations,
+        )?;
+    }
+    if std::env::var_os("SUPERSONIC_INT4_TEST_BENCH_MMQ_Q6_MATMUL").is_some() {
+        bench_mmq_q6_matmul_hot_shape(ordinal, "Q6_K down hot", 8, 5_120, 17_408, iterations)?;
+        bench_mmq_q6_matmul_hot_shape(
+            ordinal,
+            "Q6_K vocab row-scan hot",
+            8,
+            248_320,
+            5_120,
+            iterations,
+        )?;
+        bench_mmq_q6_matmul_hot_shape(
+            ordinal,
+            "Q6_K mid linear hot",
+            8,
+            10_240,
+            5_120,
+            iterations,
+        )?;
+        bench_mmq_q6_matmul_hot_shape(
+            ordinal,
+            "Q6_K small linear hot",
+            8,
+            1_024,
+            5_120,
+            iterations,
+        )?;
+    }
+    if std::env::var_os("SUPERSONIC_INT4_TEST_BENCH_M16_HOT").is_some() {
+        bench_ggml_hot_shape(
+            ordinal,
+            "Q4_K mlp gate/up hot m16",
+            qwen35::weights::LOWBIT_GGML_Q4_K,
+            ggml_q4k_row,
+            16,
+            17_408,
+            5_120,
+            iterations,
+        )?;
+        bench_ggml_hot_shape(
+            ordinal,
+            "Q4_K down hot m16",
+            qwen35::weights::LOWBIT_GGML_Q4_K,
+            ggml_q4k_row,
+            16,
+            5_120,
+            17_408,
+            iterations,
+        )?;
+        bench_ggml_hot_shape(
+            ordinal,
+            "Q5_K linear hot m16",
+            qwen35::weights::LOWBIT_GGML_Q5_K,
+            ggml_q5k_row,
+            16,
+            5_120,
+            6_144,
+            iterations,
+        )?;
+        bench_ggml_hot_shape(
+            ordinal,
+            "Q6_K down hot m16",
+            qwen35::weights::LOWBIT_GGML_Q6_K,
+            ggml_q6k_row,
+            16,
+            5_120,
+            17_408,
+            iterations,
+        )?;
+        bench_ggml_hot_shape(
+            ordinal,
+            "Q6_K vocab row-scan hot m16",
+            qwen35::weights::LOWBIT_GGML_Q6_K,
+            ggml_q6k_row,
+            16,
+            248_320,
+            5_120,
+            iterations,
+        )?;
+        bench_ggml_hot_shape(
+            ordinal,
+            "Q6_K mid linear hot m16",
+            qwen35::weights::LOWBIT_GGML_Q6_K,
+            ggml_q6k_row,
+            16,
+            10_240,
+            5_120,
+            iterations,
+        )?;
+        bench_mmq_q8_quant_hot_shape(
+            ordinal,
+            "Q6_K down hot m16",
+            qwen35::weights::LOWBIT_GGML_Q6_K,
+            16,
+            17_408,
+            iterations,
+        )?;
+        bench_mmq_q8_quant_hot_shape(
+            ordinal,
+            "Q6_K vocab row-scan hot m16",
+            qwen35::weights::LOWBIT_GGML_Q6_K,
+            16,
+            5_120,
+            iterations,
+        )?;
+        bench_mmq_q6_matmul_hot_shape(ordinal, "Q6_K down hot m16", 16, 5_120, 17_408, iterations)?;
+        bench_mmq_q6_matmul_hot_shape(
+            ordinal,
+            "Q6_K vocab row-scan hot m16",
+            16,
+            248_320,
+            5_120,
+            iterations,
+        )?;
+        bench_mmq_q6_matmul_hot_shape(
+            ordinal,
+            "Q6_K mid linear hot m16",
+            16,
+            10_240,
+            5_120,
+            iterations,
+        )?;
     }
     Ok(())
 }
@@ -462,6 +1167,12 @@ fn main() -> Result<()> {
     }
     run_ggml_case(
         ordinal,
+        "GGML Q8_0",
+        qwen35::weights::LOWBIT_GGML_Q8_0,
+        ggml_q8_0_row,
+    )?;
+    run_ggml_case(
+        ordinal,
         "GGML Q4_K",
         qwen35::weights::LOWBIT_GGML_Q4_K,
         ggml_q4k_row,
@@ -478,6 +1189,84 @@ fn main() -> Result<()> {
         qwen35::weights::LOWBIT_GGML_Q6_K,
         ggml_q6k_row,
     )?;
+    run_ggml_case_shape(
+        ordinal,
+        "GGML Q8_0 m8 aligned",
+        qwen35::weights::LOWBIT_GGML_Q8_0,
+        ggml_q8_0_row,
+        8,
+        32,
+        256,
+    )?;
+    run_ggml_case_shape(
+        ordinal,
+        "GGML Q4_K m8 aligned",
+        qwen35::weights::LOWBIT_GGML_Q4_K,
+        ggml_q4k_row,
+        8,
+        32,
+        256,
+    )?;
+    run_ggml_case_shape(
+        ordinal,
+        "GGML Q5_K m8 aligned",
+        qwen35::weights::LOWBIT_GGML_Q5_K,
+        ggml_q5k_row,
+        8,
+        32,
+        256,
+    )?;
+    run_ggml_case_shape(
+        ordinal,
+        "GGML Q6_K m8 aligned",
+        qwen35::weights::LOWBIT_GGML_Q6_K,
+        ggml_q6k_row,
+        8,
+        32,
+        256,
+    )?;
+    run_ggml_case_shape(
+        ordinal,
+        "GGML Q8_0 m16 aligned",
+        qwen35::weights::LOWBIT_GGML_Q8_0,
+        ggml_q8_0_row,
+        16,
+        32,
+        256,
+    )?;
+    run_ggml_case_shape(
+        ordinal,
+        "GGML Q4_K m16 aligned",
+        qwen35::weights::LOWBIT_GGML_Q4_K,
+        ggml_q4k_row,
+        16,
+        32,
+        256,
+    )?;
+    run_ggml_case_shape(
+        ordinal,
+        "GGML Q5_K m16 aligned",
+        qwen35::weights::LOWBIT_GGML_Q5_K,
+        ggml_q5k_row,
+        16,
+        32,
+        256,
+    )?;
+    run_ggml_case_shape(
+        ordinal,
+        "GGML Q6_K m16 aligned",
+        qwen35::weights::LOWBIT_GGML_Q6_K,
+        ggml_q6k_row,
+        16,
+        32,
+        256,
+    )?;
+    run_mmq_q8_quant_case(ordinal, "GGML Q4_K", qwen35::weights::LOWBIT_GGML_Q4_K)?;
+    run_mmq_q8_quant_case(ordinal, "GGML Q5_K", qwen35::weights::LOWBIT_GGML_Q5_K)?;
+    run_mmq_q8_quant_case(ordinal, "GGML Q6_K", qwen35::weights::LOWBIT_GGML_Q6_K)?;
+    run_mmq_q6_matmul_case(ordinal, "GGML Q6_K MMQ m8", 8, 128, 256)?;
+    run_mmq_q6_matmul_case(ordinal, "GGML Q6_K MMQ m16", 16, 128, 512)?;
+    maybe_run_ggml_hot_benches(ordinal)?;
 
     Ok(())
 }
