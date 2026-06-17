@@ -12,7 +12,9 @@ use std::path::Path;
 use gpu_hal::{GpuBuffer, GpuError, ScalarType};
 use half::{bf16, f16};
 use memmap2::Mmap;
-use qwen35::weights::{ggml_k_row_bytes, LOWBIT_GGML_Q8_0};
+use qwen35::weights::{
+    ggml_k_row_bytes, LOWBIT_GGML_Q4_K, LOWBIT_GGML_Q5_K, LOWBIT_GGML_Q6_K, LOWBIT_GGML_Q8_0,
+};
 use safetensors::SafeTensors;
 
 #[derive(Debug)]
@@ -192,6 +194,9 @@ impl WeightLoader {
 const GGML_TYPE_F32: u32 = 0;
 const GGML_TYPE_F16: u32 = 1;
 const GGML_TYPE_Q8_0: u32 = 8;
+const GGML_TYPE_Q4_K: u32 = 12;
+const GGML_TYPE_Q5_K: u32 = 13;
+const GGML_TYPE_Q6_K: u32 = 14;
 const GGML_TYPE_BF16: u32 = 30;
 
 #[derive(Debug, Clone)]
@@ -403,16 +408,22 @@ impl GgufWeightLoader {
         let logical_cols = tensor.dims[0];
         let logical_rows = tensor.dims[1];
         match tensor.tensor_type {
-            GGML_TYPE_Q8_0 => {
-                let row_bytes =
-                    ggml_k_row_bytes(LOWBIT_GGML_Q8_0, logical_cols).ok_or_else(|| {
-                        LoadError::UnexpectedTensor(format!(
-                            "GGUF Q8_0 tensor {name} has invalid K={logical_cols}"
-                        ))
-                    })?;
+            GGML_TYPE_Q8_0 | GGML_TYPE_Q4_K | GGML_TYPE_Q5_K | GGML_TYPE_Q6_K => {
+                let quant_type = gguf_linear_quant_type(tensor.tensor_type).ok_or_else(|| {
+                    LoadError::UnsupportedDtype(format!(
+                        "GGUF linear tensor {name} has unsupported ggml type {}",
+                        tensor.tensor_type
+                    ))
+                })?;
+                let row_bytes = ggml_k_row_bytes(quant_type, logical_cols).ok_or_else(|| {
+                    LoadError::UnexpectedTensor(format!(
+                        "GGUF quantized tensor {name} has invalid K={logical_cols} for type {}",
+                        tensor.tensor_type
+                    ))
+                })?;
                 Ok(LinearHostParts {
                     dtype: ScalarType::U8,
-                    quant_type: LOWBIT_GGML_Q8_0,
+                    quant_type,
                     logical_rows,
                     logical_cols,
                     upload_shape: vec![logical_rows, row_bytes],
@@ -581,22 +592,38 @@ fn gguf_tensor_nbytes(dims: &[usize], tensor_type: u32) -> Result<usize, LoadErr
         GGML_TYPE_F16 | GGML_TYPE_BF16 => elems
             .checked_mul(2)
             .ok_or_else(|| LoadError::InvalidGguf("16-bit tensor byte size overflows".into())),
-        GGML_TYPE_Q8_0 => {
+        GGML_TYPE_Q8_0 | GGML_TYPE_Q4_K | GGML_TYPE_Q5_K | GGML_TYPE_Q6_K => {
             if dims.len() != 2 {
                 return Err(LoadError::UnexpectedTensor(format!(
-                    "Q8_0 tensor must be rank-2, got {dims:?}"
+                    "quantized GGUF tensor must be rank-2, got {dims:?}"
                 )));
             }
-            let row_bytes = ggml_k_row_bytes(LOWBIT_GGML_Q8_0, dims[0]).ok_or_else(|| {
-                LoadError::UnexpectedTensor(format!("Q8_0 tensor has invalid K={}", dims[0]))
+            let quant_type = gguf_linear_quant_type(tensor_type).ok_or_else(|| {
+                LoadError::UnsupportedDtype(format!("unsupported GGUF tensor type {tensor_type}"))
             })?;
-            dims[1]
-                .checked_mul(row_bytes)
-                .ok_or_else(|| LoadError::InvalidGguf("Q8_0 tensor byte size overflows".into()))
+            let row_bytes = ggml_k_row_bytes(quant_type, dims[0]).ok_or_else(|| {
+                LoadError::UnexpectedTensor(format!(
+                    "quantized GGUF tensor has invalid K={} for type {tensor_type}",
+                    dims[0]
+                ))
+            })?;
+            dims[1].checked_mul(row_bytes).ok_or_else(|| {
+                LoadError::InvalidGguf("quantized GGUF tensor byte size overflows".into())
+            })
         }
         other => Err(LoadError::UnsupportedDtype(format!(
             "unsupported GGUF tensor type {other}"
         ))),
+    }
+}
+
+fn gguf_linear_quant_type(tensor_type: u32) -> Option<i32> {
+    match tensor_type {
+        GGML_TYPE_Q8_0 => Some(LOWBIT_GGML_Q8_0),
+        GGML_TYPE_Q4_K => Some(LOWBIT_GGML_Q4_K),
+        GGML_TYPE_Q5_K => Some(LOWBIT_GGML_Q5_K),
+        GGML_TYPE_Q6_K => Some(LOWBIT_GGML_Q6_K),
+        _ => None,
     }
 }
 

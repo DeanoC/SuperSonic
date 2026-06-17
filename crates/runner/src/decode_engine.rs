@@ -861,6 +861,10 @@ pub struct DecodeEngine {
     /// Qwen3.6 path verifies in fixed B=8 chunks, so reusing this avoids
     /// re-allocating the prefill component scratch every segment.
     dflash_prefill_append_cache: Option<prefill_engine::PrefillAppendVerifyCache>,
+    /// Cached scratch and metadata buffers for DDTree prefill verification.
+    /// Reused across rounds with the same tree width to avoid per-round
+    /// `PrefillScratch` allocation and small metadata GPU uploads.
+    dflash_prefill_tree_cache: Option<prefill_engine::PrefillTreeVerifyCache>,
     /// Reusable fixed-size scratch for component full-attention decode.
     /// Avoids per-layer-per-step allocation churn on single-sequence
     /// component decode paths.
@@ -10188,6 +10192,7 @@ impl DecodeEngine {
             dflash_tap_cache: None,
             dflash_fused_verify_cache: None,
             dflash_prefill_append_cache: None,
+            dflash_prefill_tree_cache: None,
             component_full_attn_scratch,
             component_mlp_scratch,
             metal_v2_scratch: None,
@@ -11842,25 +11847,57 @@ impl DecodeEngine {
             anyhow::bail!("verify_tree_prefill: tokens must be non-empty");
         }
 
-        let result = prefill_engine::prefill_tree_verify(
-            &self.weights,
-            &mut self.state,
-            &self.rotary,
-            tokens,
-            positions,
-            parent_ids,
-            visibility,
-            prefix_len,
-            self.ordinal,
-            self.kv_chunk_size,
-            self.use_4b_kernel,
-            Some(tap_layers),
-            true,
-            capture_rollback,
-        )?;
-        self.scratch
-            .reset_sync()
-            .map_err(|e| anyhow::anyhow!("reset sync after tree prefill verify: {e}"))?;
+        let result = if std::env::var_os("SUPERSONIC_DFLASH_DISABLE_TREE_VERIFY_CACHE").is_some() {
+            prefill_engine::prefill_tree_verify(
+                &self.weights,
+                &mut self.state,
+                &self.rotary,
+                tokens,
+                positions,
+                parent_ids,
+                visibility,
+                prefix_len,
+                self.ordinal,
+                self.kv_chunk_size,
+                self.use_4b_kernel,
+                Some(tap_layers),
+                true,
+                capture_rollback,
+            )?
+        } else {
+            let mut cache = match self.dflash_prefill_tree_cache.take() {
+                Some(cache) => cache,
+                None => prefill_engine::PrefillTreeVerifyCache::new(
+                    &self.weights.config,
+                    tokens.len(),
+                    self.ordinal,
+                )?,
+            };
+            let result = prefill_engine::prefill_tree_verify_cached(
+                &self.weights,
+                &mut self.state,
+                &self.rotary,
+                tokens,
+                positions,
+                parent_ids,
+                visibility,
+                prefix_len,
+                self.ordinal,
+                self.kv_chunk_size,
+                self.use_4b_kernel,
+                Some(tap_layers),
+                true,
+                capture_rollback,
+                &mut cache,
+            )?;
+            self.dflash_prefill_tree_cache = Some(cache);
+            result
+        };
+        if std::env::var_os("SUPERSONIC_DFLASH_TREE_VERIFY_STRICT_SYNC").is_some() {
+            self.scratch
+                .reset_sync()
+                .map_err(|e| anyhow::anyhow!("reset sync after tree prefill verify: {e}"))?;
+        }
         Ok(result)
     }
 
@@ -12027,6 +12064,8 @@ impl DecodeEngine {
         accepted_indices: &[usize],
         commit_len: usize,
     ) -> Result<()> {
+        let profile_verify = std::env::var_os("SUPERSONIC_DFLASH_PROFILE_VERIFY").is_some();
+        let t_rollback = std::time::Instant::now();
         prefill_engine::apply_prefill_tree_rollback(
             &mut self.state,
             &self.weights.config,
@@ -12036,9 +12075,19 @@ impl DecodeEngine {
             self.ordinal,
             self.kv_chunk_size,
         )?;
-        self.scratch
-            .reset_sync()
-            .map_err(|e| anyhow::anyhow!("reset sync after prefill tree rollback: {e}"))?;
+        if profile_verify {
+            eprintln!(
+                "[dflash-profile] tree_rollback commit_len={} accepted={} apply={:.2}ms",
+                commit_len,
+                accepted_indices.len(),
+                t_rollback.elapsed().as_secs_f64() * 1000.0,
+            );
+        }
+        if std::env::var_os("SUPERSONIC_DFLASH_TREE_VERIFY_STRICT_SYNC").is_some() {
+            self.scratch
+                .reset_sync()
+                .map_err(|e| anyhow::anyhow!("reset sync after prefill tree rollback: {e}"))?;
+        }
         Ok(())
     }
 

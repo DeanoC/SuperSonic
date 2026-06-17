@@ -305,8 +305,9 @@ pub fn forward<'a>(
             eprintln!("[dflash-forward] layer {idx} q proj ok");
         }
         let use_fused_kv = std::env::var_os("SUPERSONIC_DFLASH_DISABLE_DRAFT_FUSED_KV").is_none();
-        if use_fused_kv {
+        if use_fused_kv && layer.kv_proj_w.is_some() {
             let t_kv_proj = std::time::Instant::now();
+            let kv_proj_w = layer.kv_proj_w.as_ref().expect("checked is_some");
             draft_matmul_rhs_transposed(
                 ordinal,
                 dtype,
@@ -315,7 +316,7 @@ pub fn forward<'a>(
                 2 * kv_out,
                 hidden,
                 &scratch.norm_concat,
-                &layer.kv_proj_w,
+                kv_proj_w,
                 &weights.dummy_lowbit_scale,
                 &mut scratch.kv_concat,
             )?;

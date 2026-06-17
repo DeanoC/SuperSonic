@@ -1518,6 +1518,42 @@ unsafe extern "C" {
         state_trace: *mut c_void,
     ) -> c_int;
 
+    fn supersonic_qwen35_hip_delta_recurrent_tree_prefill_capture_bf16_trace(
+        dtype: c_int,
+        device_ordinal: usize,
+        batch_heads: usize,
+        seq_len: usize,
+        k_head_dim: usize,
+        v_head_dim: usize,
+        initial_state: *const c_void,
+        query: *const c_void,
+        key: *const c_void,
+        value: *const c_void,
+        beta: *const c_void,
+        g: *const c_void,
+        parent_ids: *const c_void,
+        out: *mut c_void,
+        state_trace: *mut c_void,
+    ) -> c_int;
+
+    fn supersonic_qwen35_hip_delta_recurrent_tree_prefill_capture_q8_trace(
+        dtype: c_int,
+        device_ordinal: usize,
+        batch_heads: usize,
+        seq_len: usize,
+        k_head_dim: usize,
+        v_head_dim: usize,
+        initial_state: *const c_void,
+        query: *const c_void,
+        key: *const c_void,
+        value: *const c_void,
+        beta: *const c_void,
+        g: *const c_void,
+        parent_ids: *const c_void,
+        out: *mut c_void,
+        state_trace: *mut c_void,
+    ) -> c_int;
+
     fn supersonic_qwen35_hip_dflash_apply_rollback(
         dtype: c_int,
         device_ordinal: usize,
@@ -1570,6 +1606,42 @@ unsafe extern "C" {
     ) -> c_int;
 
     fn supersonic_qwen35_hip_dflash_apply_tree_rollback(
+        dtype: c_int,
+        device_ordinal: usize,
+        qkv_dim: usize,
+        conv_state_len: usize,
+        conv_input_len: usize,
+        tree_len: usize,
+        commit_len: usize,
+        num_v_heads: usize,
+        head_k_dim: usize,
+        head_v_dim: usize,
+        conv_input: *const c_void,
+        accepted_indices: *const c_void,
+        conv_state: *mut c_void,
+        recurrent_trace: *const c_void,
+        recurrent_state: *mut c_void,
+    ) -> c_int;
+
+    fn supersonic_qwen35_hip_dflash_apply_tree_rollback_bf16_trace(
+        dtype: c_int,
+        device_ordinal: usize,
+        qkv_dim: usize,
+        conv_state_len: usize,
+        conv_input_len: usize,
+        tree_len: usize,
+        commit_len: usize,
+        num_v_heads: usize,
+        head_k_dim: usize,
+        head_v_dim: usize,
+        conv_input: *const c_void,
+        accepted_indices: *const c_void,
+        conv_state: *mut c_void,
+        recurrent_trace: *const c_void,
+        recurrent_state: *mut c_void,
+    ) -> c_int;
+
+    fn supersonic_qwen35_hip_dflash_apply_tree_rollback_q8_trace(
         dtype: c_int,
         device_ordinal: usize,
         qkv_dim: usize,
@@ -2867,6 +2939,138 @@ pub fn delta_recurrent_tree_prefill_capture(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn delta_recurrent_tree_prefill_capture_bf16_trace(
+    ordinal: usize,
+    dtype: ScalarType,
+    batch_heads: usize,
+    seq_len: usize,
+    k_head_dim: usize,
+    v_head_dim: usize,
+    initial_state: &GpuBuffer,
+    query: &GpuBuffer,
+    key: &GpuBuffer,
+    value: &GpuBuffer,
+    beta: &GpuBuffer,
+    g: &GpuBuffer,
+    parent_ids: &GpuBuffer,
+    out: &mut GpuBuffer,
+    state_trace: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if out.backend() == Backend::Metal {
+        return Err(ffi_error(
+            "delta_recurrent_tree_prefill_capture_bf16_trace is not implemented for Metal".into(),
+        ));
+    }
+    if dtype != ScalarType::F32
+        || state_trace.dtype() != ScalarType::BF16
+        || k_head_dim != 128
+        || v_head_dim != 128
+    {
+        return Err(ffi_error(
+            "delta_recurrent_tree_prefill_capture_bf16_trace requires F32 state, BF16 trace, k/v head dim 128"
+                .into(),
+        ));
+    }
+    ffi_profile_time_result(
+        "qwen.delta_recurrent_tree_prefill_capture_bf16_trace",
+        ordinal,
+        || {
+            let status = unsafe {
+                supersonic_qwen35_hip_delta_recurrent_tree_prefill_capture_bf16_trace(
+                    dtype.kernel_dtype_code(),
+                    ordinal,
+                    batch_heads,
+                    seq_len,
+                    k_head_dim,
+                    v_head_dim,
+                    initial_state.as_ptr(),
+                    query.as_ptr(),
+                    key.as_ptr(),
+                    value.as_ptr(),
+                    beta.as_ptr(),
+                    g.as_ptr(),
+                    parent_ids.as_ptr(),
+                    out.as_mut_ptr(),
+                    state_trace.as_mut_ptr(),
+                )
+            };
+            if status != 0 {
+                return Err(ffi_error(format!(
+                    "delta_recurrent_tree_prefill_capture_bf16_trace failed: {status}"
+                )));
+            }
+            Ok(())
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn delta_recurrent_tree_prefill_capture_q8_trace(
+    ordinal: usize,
+    dtype: ScalarType,
+    batch_heads: usize,
+    seq_len: usize,
+    k_head_dim: usize,
+    v_head_dim: usize,
+    initial_state: &GpuBuffer,
+    query: &GpuBuffer,
+    key: &GpuBuffer,
+    value: &GpuBuffer,
+    beta: &GpuBuffer,
+    g: &GpuBuffer,
+    parent_ids: &GpuBuffer,
+    out: &mut GpuBuffer,
+    state_trace: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if out.backend() == Backend::Metal {
+        return Err(ffi_error(
+            "delta_recurrent_tree_prefill_capture_q8_trace is not implemented for Metal".into(),
+        ));
+    }
+    if dtype != ScalarType::F32
+        || state_trace.dtype() != ScalarType::U8
+        || k_head_dim != 128
+        || v_head_dim != 128
+    {
+        return Err(ffi_error(
+            "delta_recurrent_tree_prefill_capture_q8_trace requires F32 state, U8 trace, k/v head dim 128"
+                .into(),
+        ));
+    }
+    ffi_profile_time_result(
+        "qwen.delta_recurrent_tree_prefill_capture_q8_trace",
+        ordinal,
+        || {
+            let status = unsafe {
+                supersonic_qwen35_hip_delta_recurrent_tree_prefill_capture_q8_trace(
+                    dtype.kernel_dtype_code(),
+                    ordinal,
+                    batch_heads,
+                    seq_len,
+                    k_head_dim,
+                    v_head_dim,
+                    initial_state.as_ptr(),
+                    query.as_ptr(),
+                    key.as_ptr(),
+                    value.as_ptr(),
+                    beta.as_ptr(),
+                    g.as_ptr(),
+                    parent_ids.as_ptr(),
+                    out.as_mut_ptr(),
+                    state_trace.as_mut_ptr(),
+                )
+            };
+            if status != 0 {
+                return Err(ffi_error(format!(
+                    "delta_recurrent_tree_prefill_capture_q8_trace failed: {status}"
+                )));
+            }
+            Ok(())
+        },
+    )
+}
+
 pub fn dflash_apply_rollback(
     ordinal: usize,
     conv_dtype: ScalarType,
@@ -3077,6 +3281,138 @@ pub fn dflash_apply_tree_rollback(
         if status != 0 {
             return Err(ffi_error(format!(
                 "dflash_apply_tree_rollback failed: {status}"
+            )));
+        }
+        Ok(())
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn dflash_apply_tree_rollback_bf16_trace(
+    ordinal: usize,
+    conv_dtype: ScalarType,
+    qkv_dim: usize,
+    conv_state_len: usize,
+    conv_input_len: usize,
+    tree_len: usize,
+    commit_len: usize,
+    num_v_heads: usize,
+    head_k_dim: usize,
+    head_v_dim: usize,
+    conv_input: &GpuBuffer,
+    accepted_indices: &GpuBuffer,
+    conv_state: &mut GpuBuffer,
+    recurrent_trace: &GpuBuffer,
+    recurrent_state: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if conv_input.backend() == Backend::Metal {
+        return Err(ffi_error(
+            "dflash_apply_tree_rollback_bf16_trace is not implemented for Metal".into(),
+        ));
+    }
+    if recurrent_trace.dtype() != ScalarType::BF16 {
+        return Err(ffi_error(
+            "dflash_apply_tree_rollback_bf16_trace requires BF16 recurrent_trace".into(),
+        ));
+    }
+    if accepted_indices.dtype() != ScalarType::U32 || accepted_indices.elem_count() < commit_len {
+        return Err(GpuError::InvalidArg(format!(
+            "dflash_apply_tree_rollback_bf16_trace accepted_indices must be U32[{commit_len}], got {:?}[{}]",
+            accepted_indices.dtype(),
+            accepted_indices.elem_count()
+        )));
+    }
+    ffi_profile_time_result(
+        "qwen.dflash_apply_tree_rollback_bf16_trace",
+        ordinal,
+        || {
+            let status = unsafe {
+                supersonic_qwen35_hip_dflash_apply_tree_rollback_bf16_trace(
+                    conv_dtype.kernel_dtype_code(),
+                    ordinal,
+                    qkv_dim,
+                    conv_state_len,
+                    conv_input_len,
+                    tree_len,
+                    commit_len,
+                    num_v_heads,
+                    head_k_dim,
+                    head_v_dim,
+                    conv_input.as_ptr(),
+                    accepted_indices.as_ptr(),
+                    conv_state.as_mut_ptr(),
+                    recurrent_trace.as_ptr(),
+                    recurrent_state.as_mut_ptr(),
+                )
+            };
+            if status != 0 {
+                return Err(ffi_error(format!(
+                    "dflash_apply_tree_rollback_bf16_trace failed: {status}"
+                )));
+            }
+            Ok(())
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn dflash_apply_tree_rollback_q8_trace(
+    ordinal: usize,
+    conv_dtype: ScalarType,
+    qkv_dim: usize,
+    conv_state_len: usize,
+    conv_input_len: usize,
+    tree_len: usize,
+    commit_len: usize,
+    num_v_heads: usize,
+    head_k_dim: usize,
+    head_v_dim: usize,
+    conv_input: &GpuBuffer,
+    accepted_indices: &GpuBuffer,
+    conv_state: &mut GpuBuffer,
+    recurrent_trace: &GpuBuffer,
+    recurrent_state: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if conv_input.backend() == Backend::Metal {
+        return Err(ffi_error(
+            "dflash_apply_tree_rollback_q8_trace is not implemented for Metal".into(),
+        ));
+    }
+    if recurrent_trace.dtype() != ScalarType::U8 {
+        return Err(ffi_error(
+            "dflash_apply_tree_rollback_q8_trace requires U8 recurrent_trace".into(),
+        ));
+    }
+    if accepted_indices.dtype() != ScalarType::U32 || accepted_indices.elem_count() < commit_len {
+        return Err(GpuError::InvalidArg(format!(
+            "dflash_apply_tree_rollback_q8_trace accepted_indices must be U32[{commit_len}], got {:?}[{}]",
+            accepted_indices.dtype(),
+            accepted_indices.elem_count()
+        )));
+    }
+    ffi_profile_time_result("qwen.dflash_apply_tree_rollback_q8_trace", ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_hip_dflash_apply_tree_rollback_q8_trace(
+                conv_dtype.kernel_dtype_code(),
+                ordinal,
+                qkv_dim,
+                conv_state_len,
+                conv_input_len,
+                tree_len,
+                commit_len,
+                num_v_heads,
+                head_k_dim,
+                head_v_dim,
+                conv_input.as_ptr(),
+                accepted_indices.as_ptr(),
+                conv_state.as_mut_ptr(),
+                recurrent_trace.as_ptr(),
+                recurrent_state.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!(
+                "dflash_apply_tree_rollback_q8_trace failed: {status}"
             )));
         }
         Ok(())
