@@ -3656,18 +3656,12 @@ static bool device_supports_wmma_bf16(int device_ordinal) {
     return cached[device_ordinal];
 }
 
-static bool compiled_supports_wmma_i8() {
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || \
-    defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__) || \
-    defined(__gfx1152__)
-    return true;
-#else
-    return false;
-#endif
-}
-
 static bool device_supports_wmma_i8(int device_ordinal) {
-    return compiled_supports_wmma_i8() && device_supports_wmma_bf16(device_ordinal);
+    // Keep i8 WMMA aligned with the same runtime gfx11 arch probe used by the
+    // BF16 WMMA paths. Host-side `__gfx1100__` style macros are not a reliable
+    // guard for this bridge function even when the HIP device code is built for
+    // gfx1100.
+    return device_supports_wmma_bf16(device_ordinal);
 }
 
 static int matmul_rhs_transposed_tiled_wmma_bf16_device(
