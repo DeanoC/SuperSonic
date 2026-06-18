@@ -1,6 +1,6 @@
 # Qwen3.6 Lucebox Parity Log
 
-Last updated: 2026-06-17
+Last updated: 2026-06-18
 
 Purpose: durable working log for the Qwen3.6-27B DFlash Lucebox parity effort on RX 7900 XTX / gfx1100. Keep this file current before and after profiling or benchmark runs so context compaction does not cause stale results, repeated sweeps, or reverted experiments to be treated as new evidence.
 
@@ -15,9 +15,77 @@ This file is the authoritative memory for this performance thread. On resume:
 
 Current exact next action:
 
-- Do not start another performance idea from stale memory. The winning budget-15 change has been promoted in source and validated without the budget env override.
-- Branch `codex/lucebox-parity-tree-qkvz` contains validated tree QKVZ/QKV-prep/gated-epilogue fusions, greedy-cache reuse, tree GPU tap capture, tree rollback-buffer reuse, RMSNorm/SwiGLU low-sync changes, the gfx11 i8 WMMA support-probe fix, and default-on Q6_K MMQ MLP-down.
-- Source now has `DDTREE_DEFAULT_BUDGET = 15` and `DDTREE_DEFAULT_TOP_K = 4` in `crates/runner/src/qwen35_dflash_engine.rs`.
+- Do not start another performance idea from stale memory. PR #263 is merged into `main`; the winning budget-15 change is now the merged baseline.
+- Active next-performance branch: `codex/qwen36-next-roofline`.
+- Source on merged `main` has `DDTREE_DEFAULT_BUDGET = 15` and `DDTREE_DEFAULT_TOP_K = 4` in `crates/runner/src/qwen35_dflash_engine.rs`.
+- New roofline report: `docs/qwen36-lucebox-next-roofline.md`.
+- Fresh post-PR #263 full-suite baseline:
+  - `target/qwen36_lucebox_next/baseline_10x256.json`
+  - mean 85.52 tok/s, weighted 84.39 tok/s, min 74.96, max 99.50, generated 1654.
+  - This reproduces the PR #263 checkpoint (`85.35 mean / 84.23 weighted`) within noise.
+- Fresh internal verify profile:
+  - `target/qwen36_lucebox_next/profile_verify_he01_fulltail.json`
+  - he_01 generated 179 tokens, 2314 ms decode, 77.34 tok/s.
+  - DFlash breakdown: draft=385 ms, verify=1843 ms, rollback=86 ms.
+  - Verify buckets over 21 rounds: linear attention=1166.90 ms, full attention=584.54 ms, logits/greedy=69.47 ms, MLP=8.25 ms.
+- Fresh FFI shape profile:
+  - `target/qwen36_lucebox_next/profile_ffi_shapes_he01.json`
+  - Use for shape/call ranking only; FFI profiling inserts syncs and distorts macro bucket times.
+- `rocprofv3` status:
+  - Installed AMD ROCm 7.1.1 rpath `rocprofiler-sdk` because Fedora has no native `rocprofv3` provider on this machine.
+  - Fixed the profiler/runtime mismatch by also installing matching AMD rpath runtime packages: `hip-runtime-amd-rpath7.1.1`, `hsa-rocr-rpath7.1.1`, `hsa-amd-aqlprofile-rpath7.1.1`, `comgr-rpath7.1.1`, and `rocminfo-rpath7.1.1`.
+  - Use `env -u HSA_OVERRIDE_GFX_VERSION LD_LIBRARY_PATH=/opt/rocm-7.1.1/lib SUPERSONIC_BACKENDS=hip /opt/rocm-7.1.1/bin/rocprofv3 ...`.
+  - `--version` and `--list-avail` work; counter inventory is at `target/qwen36_lucebox_next/rocprofv3-list-avail.txt`.
+  - Trace collection now works for both `/usr/bin/hip_add_kernel` and SuperSonic. Key artifacts: `target/qwen36_lucebox_next/rocprof_opt/hip_add_opt_runtime_kernel_trace.csv`, `target/qwen36_lucebox_next/rocprof_opt/supersonic_he01_tiny_trace_kernel_trace.csv`, and `target/qwen36_lucebox_next/rocprof_opt/supersonic_he01_256_trace_kernel_trace.csv`.
+  - Full-tail trace artifact `target/qwen36_lucebox_next/rocprof_opt/supersonic_he01_256_trace_kernel_stats.csv`: he_01 generated 179 tokens, decode 2451 ms, DFlash draft=389 ms, verify=1908 ms, rollback=154 ms. Top kernel rows are dense INT4 matmul 1020 ms, GGML qtype 12 669 ms, Q6_K MMQ 386 ms, recurrent prefill 300 ms, tree recurrent 182 ms, qtype 14 179 ms, full tree attention 92 ms.
+  - PMC works if counter groups are small. Working artifacts include `target/qwen36_lucebox_next/rocprof_opt/hip_add_opt_pmc_sqwaves_counter_collection.csv` and `target/qwen36_lucebox_next/rocprof_opt/supersonic_he01_256_pmc_sqwaves_allkernels_counter_collection.csv`.
+  - For SuperSonic PMC, prefer all-kernel collection on a representative `n_gen=256` run and filter CSV offline; `--kernel-include-regex` and short 2/32-token runs can miss the tree verifier path or silently produce no useful counter CSV.
+  - Do not combine too many PMC counters in one pass. The broad set `SQ_WAVES Wavefronts OccupancyPercent VALUInsts FETCH_SIZE WRITE_SIZE L2CacheHit` exceeded hardware collection capabilities and left a child benchmark process that had to be killed.
+  - `GPUBusy` read as zero in the first tree-targeted PMC smoke; rely on `SQ_WAVES` and trace timing first, then add separate memory/VALU/L2 passes only after checking each group.
+  - Keep the isolated `/opt/rocm-7.1.1` profiling lane for RX 7900 XTX. Revisit a system-wide ROCm upgrade when the planned RDNA4 card arrives.
+- Current implementation direction:
+  - Phase 1A implemented and kept: Q8 tree recurrent direct-attention output. It preserves Q8 rollback trace bytes, writes BF16 attention rows directly, and skips the old `dflash_extract_recurrent_attn` launch on the default Q8 tree trace path.
+  - Rollback gate: `SUPERSONIC_DFLASH_DISABLE_TREE_DIRECT_ATTENTION=1`.
+  - Phase 1B implemented and kept: tree verify now reuses the existing HIP `prepare_conv_input_tail` helper, replacing the old `transpose_pad_conv` + `fill_conv_tail` pair on the tree path. It writes the helper's next-tail output to scratch `linear_new_tail` only, so tree acceptance/rollback semantics remain deferred.
+  - Rollback gate: existing `SUPERSONIC_DFLASH_DISABLE_FUSED_CONV_PREP=1`.
+  - Phase 1C tried and rejected as a default: direct BA projection + beta/g fusion. The opt-in path exists behind `SUPERSONIC_DFLASH_ENABLE_FUSED_BA_DIRECT=1`, with `SUPERSONIC_DFLASH_DISABLE_FUSED_BA_DIRECT=1` also respected for bisects, but profiling showed the scalar fused projection is much slower than the existing generic BF16 matmul plus beta/g epilogue.
+  - Phase 1D implemented and kept: tree full-attention K/V transposes now use one paired HIP launch instead of two separate `transpose_shd_hsd` launches. Rollback gate: `SUPERSONIC_DFLASH_DISABLE_TREE_FULL_KV_TRANSPOSE=1`.
+  - Phase 1E implemented but default-off: strided tree full-attention prefix K/V avoids per-round contiguous prefix allocation/copy and has exact parity, but the current kernel is slower than the contiguous-prefix fallback. Keep it as an opt-in profiling/future-kernel path with `SUPERSONIC_DFLASH_ENABLE_TREE_FULL_PREFIX_STRIDED=1`; `SUPERSONIC_DFLASH_DISABLE_TREE_FULL_PREFIX_STRIDED=1` is a hard off-switch.
+  - Phase 1F implemented and kept: precompute the tree convolution source-column map once in `PrefillTreeVerifyCache` and use an indexed `linear_tree_conv_pack` HIP helper so each channel element does not re-walk `parent_ids`. Rollback gate: `SUPERSONIC_DFLASH_DISABLE_TREE_CONV_SOURCE_MAP=1`.
+  - Build passed: `HIP_ARCH=gfx1100 cargo build --release --bin supersonic`.
+  - New ignored GPU parity test passed with `/opt/rocm-7.1.1`: `cargo test -p runner --test dflash_tree_delta_parity dflash_tree_delta_q8_direct_attention_matches_extract_path --release -- --ignored --nocapture`.
+  - New ignored GPU conv-prep parity test passed with `/opt/rocm-7.1.1`: `cargo test -p runner --test dflash_tree_conv_pack_parity dflash_tree_conv_input_prepare_matches_transpose_plus_tail --release -- --ignored --nocapture`.
+  - Full A/B artifacts with explicit `SUPERSONIC_DFLASH_DDTREE_VERIFY=1 SUPERSONIC_DFLASH_DDTREE_DIRECT_ROLLBACK=1`:
+    - Direct: `target/qwen36_lucebox_next/tree_direct_attn_10x256.json`, mean 85.69 tok/s, weighted 84.56, min 75.13, generated 1654.
+    - Gate disabled path: `target/qwen36_lucebox_next/tree_direct_attn_disabled_10x256.json`, mean 85.08 tok/s, weighted 83.96, min 74.63, generated 1654.
+    - Combined direct-attn + tree conv-prep: `target/qwen36_lucebox_next/tree_convprep_direct_attn_10x256.json`, mean 86.11 tok/s, weighted 84.98, min 75.70, max 100.30, generated 1654.
+    - Combined gated fallback (`SUPERSONIC_DFLASH_DISABLE_TREE_DIRECT_ATTENTION=1 SUPERSONIC_DFLASH_DISABLE_FUSED_CONV_PREP=1`): `target/qwen36_lucebox_next/tree_convprep_direct_attn_disabled_10x256.json`, mean 85.12 tok/s, weighted 84.01, min 74.68, max 99.01, generated 1654.
+    - Fresh current default after leaving direct BA opt-in only: `target/qwen36_lucebox_next/tree_phase1_default_10x256.json`, mean 86.05 tok/s, weighted 84.93, min 75.53, max 100.10, generated 1654.
+    - K/V pair transpose current default: `target/qwen36_lucebox_next/tree_full_kv_pair_10x256.json`, mean 86.12 tok/s, weighted 84.97, min 75.53, max 100.50, generated 1654.
+    - K/V pair transpose rollback gate: `target/qwen36_lucebox_next/tree_full_kv_pair_disabled_10x256.json`, mean 85.97 tok/s, weighted 84.85, min 75.41, max 100.20, generated 1654.
+    - Strided prefix opt-in path: `target/qwen36_lucebox_next/tree_full_prefix_strided_10x256.json`, mean 86.21 tok/s, weighted 85.07, min 75.59, max 100.30, generated 1654.
+    - Strided prefix disabled/current default path: `target/qwen36_lucebox_next/tree_full_prefix_strided_disabled_10x256.json`, mean 86.27 tok/s, weighted 85.14, min 75.70, max 100.50, generated 1654.
+    - Rebuilt final default after making strided prefix opt-in: `target/qwen36_lucebox_next/tree_phase1e_final_default_10x256.json`, mean 86.30 tok/s, weighted 85.18, min 75.70, max 100.91, generated 1654.
+    - Indexed tree conv source-map current default: `target/qwen36_lucebox_next/tree_conv_source_map_10x256.json`, mean 86.42 tok/s, weighted 85.30, min 75.93, max 100.81, generated 1654.
+    - Indexed tree conv source-map rollback gate: `target/qwen36_lucebox_next/tree_conv_source_map_disabled_10x256.json`, mean 86.34 tok/s, weighted 85.18, min 75.76, max 100.81, generated 1654.
+    - Fresh baseline: `target/qwen36_lucebox_next/baseline_10x256.json`, mean 85.52 tok/s, weighted 84.39, min 74.96, generated 1654.
+  - FFI shape profile: `target/qwen36_lucebox_next/tree_direct_attn_profile_ffi_shapes_he01.json`, new `qwen.delta_recurrent_tree_prefill_capture_q8_trace_attn` is 1008 calls / 207.58 ms, and `qwen.dflash_extract_recurrent_attn` is no longer present on the Q8 tree path.
+  - Combined FFI shape profile: `target/qwen36_lucebox_next/tree_convprep_direct_attn_profile_ffi_shapes_he01.json`, `qwen.prepare_conv_input_tail` is 1008 calls / 27.43 ms; `qwen.transpose_pad_conv`, `qwen.fill_conv_tail`, and `qwen.dflash_extract_recurrent_attn` are absent from the optimized tree path. Remaining nearby costs include `qwen.delta_recurrent_tree_prefill_capture_q8_trace_attn` 1008 calls / 206.65 ms, `qwen.full_attention_tree_prefill` 336 calls / 108.51 ms, and `qwen.linear_tree_conv_pack` 1008 calls / 30.59 ms.
+  - Direct BA opt-in FFI profile: `target/qwen36_lucebox_next/tree_direct_ba_profile_ffi_shapes_he01.json`, `qwen.project_ba_compute_beta_g_bf16` is 960 calls / 271.90 ms. Default-off profile: `target/qwen36_lucebox_next/tree_direct_ba_defaultoff_profile_ffi_shapes_he01.json`, old `qwen.matmul_rhs_transposed[b=1 m=16 n=96 k=5120 dtype=BF16]` is 1008 calls / 67.14 ms and `qwen.compute_beta_g_ba_bf16` is 1008 calls / 26.67 ms. The fused BA candidate is therefore rejected until it gets an MFMA-class implementation.
+  - K/V pair FFI shape profile: `target/qwen36_lucebox_next/tree_full_kv_pair_profile_ffi_shapes_he01.json`, `qwen.transpose_shd_hsd` drops to 336 calls / 14.09 ms, with new `qwen.transpose_shd_hsd_pair` at 336 calls / 8.94 ms. Previous Phase 1 default had `qwen.transpose_shd_hsd` at 1008 calls / 31.41 ms.
+  - Strided prefix FFI shape profile: `target/qwen36_lucebox_next/tree_full_prefix_strided_profile_ffi_shapes_he01.json`, `qwen.full_attention_tree_prefill_strided` is 336 calls / 121.96 ms versus the contiguous path at 336 calls / 108.36 ms in `tree_full_kv_pair_profile_ffi_shapes_he01.json`. HAL allocation calls drop from 897 to 225 and D2D bytes drop from 1.21 GB to 0.89 GB, but macro throughput is fractionally better with striding disabled, so the path is opt-in only.
+  - Indexed tree conv source-map FFI shape profile: `target/qwen36_lucebox_next/tree_conv_source_map_profile_ffi_shapes_he01.json`, `qwen.linear_tree_conv_pack_indexed` is 1008 calls / 30.06 ms versus the old parent-walk `qwen.linear_tree_conv_pack` at 1008 calls / 30.58 ms. Extra source-map upload raises H2D calls from 105 to 126 and bytes from 10 KB to 15 KB, so the win is intentionally tiny.
+  - New ignored GPU K/V pair parity test passed with `/opt/rocm-7.1.1`: `cargo test -p runner --test dflash_tree_conv_pack_parity dflash_tree_full_kv_pair_transpose_matches_separate_calls --release -- --ignored --nocapture`.
+  - New ignored GPU strided-prefix parity test passed with `/opt/rocm-7.1.1`: `cargo test -p runner --test dflash_tree_conv_pack_parity dflash_tree_full_attention_strided_prefix_matches_contiguous_prefix --release -- --ignored --nocapture`.
+  - New ignored GPU indexed-conv parity test passed with `/opt/rocm-7.1.1`: `cargo test -p runner --test dflash_tree_conv_pack_parity dflash_tree_conv_pack_indexed_matches_parent_walk_fixture --release -- --ignored --nocapture`.
+  - Normalized stdout tails and generated-token counts in `tree_convprep_direct_attn_10x256.json`, `tree_phase1_default_10x256.json`, `tree_full_kv_pair_10x256.json`, `tree_full_kv_pair_disabled_10x256.json`, `tree_full_prefix_strided_10x256.json`, `tree_full_prefix_strided_disabled_10x256.json`, `tree_phase1e_final_default_10x256.json`, `tree_conv_source_map_10x256.json`, and `tree_conv_source_map_disabled_10x256.json` match both `baseline_10x256.json` and `tree_convprep_direct_attn_disabled_10x256.json`.
+  - Combined result is a small `+1.2%` weighted win versus the two-gate fallback, not the full next performance step.
+  - Next target remains the tree verify small-M projection train plus tree attention: `matmul_rhs_transposed_int4`/Q6_K projection shapes, `delta_recurrent_tree_prefill_capture_q8_trace_attn`, `linear_tree_conv_pack`, remaining transposes, and full tree attention.
+  - Second target is tree full attention.
+  - Do not repeat direct BA scalar fusion, MLP-only, lm-head, rollback, or host setup unless a new profile changes the bucket shape.
+- Invalid smoke runs from this phase, do not use as evidence:
+  - `target/qwen36_lucebox_next/tree_direct_attn_profile_he01.json` and `target/qwen36_lucebox_next/tree_direct_attn_disabled_profile_he01.json` accidentally used `q4km-gptq` and generated 175 tokens.
+  - `target/qwen36_lucebox_next/tree_direct_attn_ddtree_he01.json`, `target/qwen36_lucebox_next/tree_direct_attn_disabled_ddtree_he01.json`, `target/qwen36_lucebox_next/tree_direct_attn_ddtree_profile_he01.json`, and `target/qwen36_lucebox_next/tree_direct_attn_disabled_ddtree_profile_he01.json` missed `SUPERSONIC_DFLASH_DDTREE_DIRECT_ROLLBACK=1`, used `commit=append-reverify`, and are invalid for PR #263 comparisons.
 - Best validated no-env default before the budget change:
   - `target/qwen36_lucebox20/tree_q6k_mmq_mlp_down_default_budget14_top4_10x256.json`
   - mean 66.23 tok/s, weighted 65.39, min 58.24, max 77.34, generated 1654.

@@ -134,6 +134,7 @@ int full_attention_tree_prefill_device(
     int kv_heads,
     int tree_len,
     int prefix_len,
+    int prefix_stride,
     int head_dim,
     int num_kv_groups,
     float scale,
@@ -186,6 +187,7 @@ int full_attention_tree_prefill_device(
         kv_heads,
         tree_len,
         prefix_len,
+        prefix_stride,
         head_dim,
         num_kv_groups,
         scale,
@@ -207,7 +209,7 @@ int full_attention_tree_prefill_device(
 template <typename T, int BM, int BK>
 static int launch_tree_tiled(
     int batch_size, int q_heads, int kv_heads,
-    int tree_len, int prefix_len, int head_dim, int num_kv_groups,
+    int tree_len, int prefix_len, int prefix_stride, int head_dim, int num_kv_groups,
     float scale,
     const void* query,
     const void* prefix_key,
@@ -225,8 +227,8 @@ static int launch_tree_tiled(
     hipLaunchKernelGGL(
         HIP_KERNEL_NAME(supersonic_qwen35_full_attention_tree_prefill_tiled_kernel<T, BM, BK>),
         grid, block, lds_bytes, 0,
-        batch_size, q_heads, kv_heads, tree_len, prefix_len, head_dim,
-        num_kv_groups, scale,
+        batch_size, q_heads, kv_heads, tree_len, prefix_len, prefix_stride,
+        head_dim, num_kv_groups, scale,
         static_cast<const T*>(query),
         static_cast<const T*>(prefix_key),
         static_cast<const T*>(prefix_value),
@@ -247,6 +249,7 @@ int full_attention_tree_prefill_tiled_device(
     int kv_heads,
     int tree_len,
     int prefix_len,
+    int prefix_stride,
     int head_dim,
     int num_kv_groups,
     float scale,
@@ -270,17 +273,17 @@ int full_attention_tree_prefill_tiled_device(
 
     if (head_dim <= 64) {
         return launch_tree_tiled<T, BM, 128>(
-            batch_size, q_heads, kv_heads, tree_len, prefix_len, head_dim,
+            batch_size, q_heads, kv_heads, tree_len, prefix_len, prefix_stride, head_dim,
             num_kv_groups, scale, query, prefix_key, prefix_value,
             tree_key, tree_value, visibility, out);
     } else if (head_dim <= 128) {
         return launch_tree_tiled<T, BM, 64>(
-            batch_size, q_heads, kv_heads, tree_len, prefix_len, head_dim,
+            batch_size, q_heads, kv_heads, tree_len, prefix_len, prefix_stride, head_dim,
             num_kv_groups, scale, query, prefix_key, prefix_value,
             tree_key, tree_value, visibility, out);
     } else {
         return launch_tree_tiled<T, BM, 32>(
-            batch_size, q_heads, kv_heads, tree_len, prefix_len, head_dim,
+            batch_size, q_heads, kv_heads, tree_len, prefix_len, prefix_stride, head_dim,
             num_kv_groups, scale, query, prefix_key, prefix_value,
             tree_key, tree_value, visibility, out);
     }
@@ -436,6 +439,48 @@ int linear_tree_conv_pack_device(
         static_cast<const T*>(mixed_qkv),
         static_cast<const T*>(weights),
         static_cast<const int*>(parent_ids),
+        static_cast<T*>(out));
+    if (hipGetLastError() != hipSuccess) return 60;
+    if (hipDeviceSynchronize() != hipSuccess) return 61;
+    return 0;
+}
+
+template <typename T>
+int linear_tree_conv_pack_indexed_device(
+    int device_ordinal,
+    int batch_size,
+    int conv_dim,
+    int total_len,
+    int tree_len,
+    int kernel_size,
+    int source_stride,
+    const void* mixed_qkv,
+    const void* weights,
+    const void* source_cols,
+    void* out
+) {
+    ScopedHipDevice scoped(device_ordinal);
+    if (kernel_size <= 0 || source_stride < kernel_size || total_len < kernel_size - 1 + tree_len) return 60;
+    if (source_cols == nullptr) return 62;
+    constexpr int block = 256;
+    const size_t out_elems = static_cast<size_t>(batch_size) * static_cast<size_t>(tree_len) *
+        static_cast<size_t>(conv_dim);
+    const unsigned int grid = static_cast<unsigned int>((out_elems + block - 1) / block);
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(supersonic_qwen35_linear_tree_conv_pack_indexed_kernel<T>),
+        dim3(grid),
+        dim3(block),
+        0,
+        0,
+        batch_size,
+        conv_dim,
+        total_len,
+        tree_len,
+        kernel_size,
+        source_stride,
+        static_cast<const T*>(mixed_qkv),
+        static_cast<const T*>(weights),
+        static_cast<const int*>(source_cols),
         static_cast<T*>(out));
     if (hipGetLastError() != hipSuccess) return 60;
     if (hipDeviceSynchronize() != hipSuccess) return 61;
@@ -990,6 +1035,45 @@ int delta_recurrent_tree_prefill_capture_q8_trace_f32_k128_device(
         static_cast<const float*>(g),
         static_cast<const int*>(parent_ids),
         static_cast<float*>(out),
+        static_cast<uint8_t*>(state_trace));
+    if (hipGetLastError() != hipSuccess) return 67;
+    if (maybe_sync() != hipSuccess) return 68;
+    return 0;
+}
+
+int delta_recurrent_tree_prefill_capture_q8_trace_attn_f32_k128_device(
+    int device_ordinal,
+    int batch_heads,
+    int seq_len,
+    const void* initial_state,
+    const void* query,
+    const void* key,
+    const void* value,
+    const void* beta,
+    const void* g,
+    const void* parent_ids,
+    void* attn_output,
+    void* state_trace
+) {
+    ScopedHipDevice scoped(device_ordinal);
+    if (parent_ids == nullptr || attn_output == nullptr || state_trace == nullptr) return 69;
+    constexpr int threads = 128;
+    hipLaunchKernelGGL(
+        supersonic_qwen35_delta_recurrent_tree_prefill_capture_q8_trace_attn_bf16_transposed_f32_k128_kernel,
+        dim3(128, batch_heads),
+        dim3(threads),
+        0,
+        0,
+        batch_heads,
+        seq_len,
+        static_cast<const float*>(initial_state),
+        static_cast<const float*>(query),
+        static_cast<const float*>(key),
+        static_cast<const float*>(value),
+        static_cast<const float*>(beta),
+        static_cast<const float*>(g),
+        static_cast<const int*>(parent_ids),
+        static_cast<hip_bfloat16*>(attn_output),
         static_cast<uint8_t*>(state_trace));
     if (hipGetLastError() != hipSuccess) return 67;
     if (maybe_sync() != hipSuccess) return 68;
@@ -2938,7 +3022,7 @@ extern "C" int supersonic_qwen35_hip_full_attention_prefill(
     }
 }
 
-extern "C" int supersonic_qwen35_hip_full_attention_tree_prefill(
+static int full_attention_tree_prefill_dispatch(
     int dtype,
     size_t device_ordinal,
     size_t batch_size,
@@ -2946,6 +3030,7 @@ extern "C" int supersonic_qwen35_hip_full_attention_tree_prefill(
     size_t kv_heads,
     size_t tree_len,
     size_t prefix_len,
+    size_t prefix_stride,
     size_t head_dim,
     size_t num_kv_groups,
     float scale,
@@ -2974,6 +3059,7 @@ extern "C" int supersonic_qwen35_hip_full_attention_tree_prefill(
             static_cast<int>(kv_heads),
             static_cast<int>(tree_len),
             static_cast<int>(prefix_len),
+            static_cast<int>(prefix_stride),
             static_cast<int>(head_dim),
             static_cast<int>(num_kv_groups),
             scale,
@@ -2996,6 +3082,7 @@ extern "C" int supersonic_qwen35_hip_full_attention_tree_prefill(
             static_cast<int>(kv_heads),
             static_cast<int>(tree_len),
             static_cast<int>(prefix_len),
+            static_cast<int>(prefix_stride),
             static_cast<int>(head_dim),
             static_cast<int>(num_kv_groups),
             scale,
@@ -3014,6 +3101,7 @@ extern "C" int supersonic_qwen35_hip_full_attention_tree_prefill(
             static_cast<int>(kv_heads),
             static_cast<int>(tree_len),
             static_cast<int>(prefix_len),
+            static_cast<int>(prefix_stride),
             static_cast<int>(head_dim),
             static_cast<int>(num_kv_groups),
             scale,
@@ -3032,6 +3120,7 @@ extern "C" int supersonic_qwen35_hip_full_attention_tree_prefill(
             static_cast<int>(kv_heads),
             static_cast<int>(tree_len),
             static_cast<int>(prefix_len),
+            static_cast<int>(prefix_stride),
             static_cast<int>(head_dim),
             static_cast<int>(num_kv_groups),
             scale,
@@ -3045,6 +3134,55 @@ extern "C" int supersonic_qwen35_hip_full_attention_tree_prefill(
     default:
         return 64;
     }
+}
+
+extern "C" int supersonic_qwen35_hip_full_attention_tree_prefill(
+    int dtype,
+    size_t device_ordinal,
+    size_t batch_size,
+    size_t q_heads,
+    size_t kv_heads,
+    size_t tree_len,
+    size_t prefix_len,
+    size_t head_dim,
+    size_t num_kv_groups,
+    float scale,
+    const void* query,
+    const void* prefix_key,
+    const void* prefix_value,
+    const void* tree_key,
+    const void* tree_value,
+    const void* visibility,
+    void* out) {
+    return full_attention_tree_prefill_dispatch(
+        dtype, device_ordinal, batch_size, q_heads, kv_heads, tree_len,
+        prefix_len, prefix_len, head_dim, num_kv_groups, scale,
+        query, prefix_key, prefix_value, tree_key, tree_value, visibility, out);
+}
+
+extern "C" int supersonic_qwen35_hip_full_attention_tree_prefill_strided(
+    int dtype,
+    size_t device_ordinal,
+    size_t batch_size,
+    size_t q_heads,
+    size_t kv_heads,
+    size_t tree_len,
+    size_t prefix_len,
+    size_t prefix_stride,
+    size_t head_dim,
+    size_t num_kv_groups,
+    float scale,
+    const void* query,
+    const void* prefix_key,
+    const void* prefix_value,
+    const void* tree_key,
+    const void* tree_value,
+    const void* visibility,
+    void* out) {
+    return full_attention_tree_prefill_dispatch(
+        dtype, device_ordinal, batch_size, q_heads, kv_heads, tree_len,
+        prefix_len, prefix_stride, head_dim, num_kv_groups, scale,
+        query, prefix_key, prefix_value, tree_key, tree_value, visibility, out);
 }
 
 extern "C" int supersonic_qwen35_hip_linear_prefill_conv_pack(
@@ -3145,6 +3283,64 @@ extern "C" int supersonic_qwen35_hip_linear_tree_conv_pack(
             mixed_qkv,
             weights,
             parent_ids,
+            out);
+    default:
+        return 64;
+    }
+}
+
+extern "C" int supersonic_qwen35_hip_linear_tree_conv_pack_indexed(
+    int dtype,
+    size_t device_ordinal,
+    size_t batch_size,
+    size_t conv_dim,
+    size_t total_len,
+    size_t tree_len,
+    size_t kernel_size,
+    size_t source_stride,
+    const void* mixed_qkv,
+    const void* weights,
+    const void* source_cols,
+    void* out) {
+    switch (dtype) {
+    case 0:
+        return linear_tree_conv_pack_indexed_device<half>(
+            static_cast<int>(device_ordinal),
+            static_cast<int>(batch_size),
+            static_cast<int>(conv_dim),
+            static_cast<int>(total_len),
+            static_cast<int>(tree_len),
+            static_cast<int>(kernel_size),
+            static_cast<int>(source_stride),
+            mixed_qkv,
+            weights,
+            source_cols,
+            out);
+    case 1:
+        return linear_tree_conv_pack_indexed_device<float>(
+            static_cast<int>(device_ordinal),
+            static_cast<int>(batch_size),
+            static_cast<int>(conv_dim),
+            static_cast<int>(total_len),
+            static_cast<int>(tree_len),
+            static_cast<int>(kernel_size),
+            static_cast<int>(source_stride),
+            mixed_qkv,
+            weights,
+            source_cols,
+            out);
+    case 2:
+        return linear_tree_conv_pack_indexed_device<hip_bfloat16>(
+            static_cast<int>(device_ordinal),
+            static_cast<int>(batch_size),
+            static_cast<int>(conv_dim),
+            static_cast<int>(total_len),
+            static_cast<int>(tree_len),
+            static_cast<int>(kernel_size),
+            static_cast<int>(source_stride),
+            mixed_qkv,
+            weights,
+            source_cols,
             out);
     default:
         return 64;
@@ -3516,6 +3712,40 @@ extern "C" int supersonic_qwen35_hip_delta_recurrent_tree_prefill_capture_q8_tra
         g,
         parent_ids,
         out,
+        state_trace);
+}
+
+extern "C" int supersonic_qwen35_hip_delta_recurrent_tree_prefill_capture_q8_trace_attn(
+    int dtype,
+    size_t device_ordinal,
+    size_t batch_heads,
+    size_t seq_len,
+    size_t k_head_dim,
+    size_t v_head_dim,
+    const void* initial_state,
+    const void* query,
+    const void* key,
+    const void* value,
+    const void* beta,
+    const void* g,
+    const void* parent_ids,
+    void* attn_output,
+    void* state_trace) {
+    if (dtype != 1 || k_head_dim != 128 || v_head_dim != 128 || k_head_dim % 32 != 0) {
+        return 66;
+    }
+    return delta_recurrent_tree_prefill_capture_q8_trace_attn_f32_k128_device(
+        static_cast<int>(device_ordinal),
+        static_cast<int>(batch_heads),
+        static_cast<int>(seq_len),
+        initial_state,
+        query,
+        key,
+        value,
+        beta,
+        g,
+        parent_ids,
+        attn_output,
         state_trace);
 }
 

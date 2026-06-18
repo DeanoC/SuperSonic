@@ -107,6 +107,81 @@ fn dflash_tree_delta_matches_cpu_branching_fixture() -> Result<()> {
     Ok(())
 }
 
+#[test]
+#[ignore = "requires a HIP GPU and /dev/kfd access"]
+fn dflash_tree_delta_q8_direct_attention_matches_extract_path() -> Result<()> {
+    let ordinal = 0usize;
+    let inputs = Inputs::new();
+    let parent_ids = upload_i32(ordinal, &[-1, 0, 0, 2])?;
+    let gpu = inputs.upload(ordinal)?;
+
+    let trace_bytes = q8_trace_bytes(BH, SEQ, K, V);
+    let mut old_out = GpuBuffer::zeros(ordinal, ScalarType::F32, &[BH, SEQ + K, V])?;
+    let mut old_trace = GpuBuffer::zeros(ordinal, ScalarType::U8, &[trace_bytes])?;
+    let mut old_attn = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[BH, SEQ, V])?;
+    let mut old_dummy_state = GpuBuffer::zeros(ordinal, ScalarType::F32, &[BH, K, V])?;
+    let mut direct_attn = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[BH, SEQ, V])?;
+    let mut direct_trace = GpuBuffer::zeros(ordinal, ScalarType::U8, &[trace_bytes])?;
+
+    kernel_ffi::prefill_ffi::delta_recurrent_tree_prefill_capture_q8_trace(
+        ordinal,
+        ScalarType::F32,
+        BH,
+        SEQ,
+        K,
+        V,
+        &gpu.initial,
+        &gpu.query,
+        &gpu.key,
+        &gpu.value,
+        &gpu.beta,
+        &gpu.g,
+        &parent_ids,
+        &mut old_out,
+        &mut old_trace,
+    )?;
+    kernel_ffi::prefill_ffi::dflash_extract_recurrent_attn(
+        ordinal,
+        BH,
+        SEQ,
+        K,
+        V,
+        &old_out,
+        &mut old_dummy_state,
+        &mut old_attn,
+    )?;
+
+    kernel_ffi::prefill_ffi::delta_recurrent_tree_prefill_capture_q8_trace_attn(
+        ordinal,
+        ScalarType::F32,
+        BH,
+        SEQ,
+        K,
+        V,
+        &gpu.initial,
+        &gpu.query,
+        &gpu.key,
+        &gpu.value,
+        &gpu.beta,
+        &gpu.g,
+        &parent_ids,
+        &mut direct_attn,
+        &mut direct_trace,
+    )?;
+
+    assert_eq!(
+        old_attn.to_host_bytes()?,
+        direct_attn.to_host_bytes()?,
+        "direct BF16 attention output must match extract path"
+    );
+    assert_eq!(
+        old_trace.to_host_bytes()?,
+        direct_trace.to_host_bytes()?,
+        "direct path must preserve Q8 rollback trace bytes"
+    );
+    Ok(())
+}
+
 struct Inputs {
     initial: Vec<f32>,
     query: Vec<f32>,
@@ -213,6 +288,17 @@ fn upload_i32(ordinal: usize, values: &[i32]) -> Result<GpuBuffer> {
         .collect::<Vec<_>>();
     GpuBuffer::from_host_bytes(ordinal, ScalarType::U32, &[values.len()], &bytes)
         .map_err(Into::into)
+}
+
+fn q8_trace_bytes(
+    batch_heads: usize,
+    seq_len: usize,
+    k_head_dim: usize,
+    v_head_dim: usize,
+) -> usize {
+    const QK8_0: usize = 32;
+    const Q8_0_BLOCK_BYTES: usize = 34;
+    batch_heads * seq_len * v_head_dim * (k_head_dim / QK8_0) * Q8_0_BLOCK_BYTES
 }
 
 fn download_f32(buffer: &GpuBuffer) -> Result<Vec<f32>> {
