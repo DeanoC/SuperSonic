@@ -2076,12 +2076,15 @@ pub struct PrefillTreeVerifyCache {
     token_ids_gpu: GpuBuffer,
     positions_gpu: GpuBuffer,
     parent_ids_gpu: GpuBuffer,
+    conv_source_cols_gpu: GpuBuffer,
+    conv_source_cols_stride: usize,
     visibility_gpu: GpuBuffer,
     greedy_logits_gpu: GpuBuffer,
     greedy_indices_gpu: GpuBuffer,
     token_id_bytes: Vec<u8>,
     position_bytes: Vec<u8>,
     parent_id_bytes: Vec<u8>,
+    conv_source_col_bytes: Vec<u8>,
     rollback: Option<PrefillTreeRollback>,
 }
 
@@ -2094,6 +2097,13 @@ impl PrefillTreeVerifyCache {
             .map_err(|e| anyhow::anyhow!("tree cache positions alloc: {e}"))?;
         let parent_ids_gpu = GpuBuffer::alloc(ordinal, ScalarType::U32, &[tree_len])
             .map_err(|e| anyhow::anyhow!("tree cache parent ids alloc: {e}"))?;
+        let conv_source_cols_stride = config.linear_conv_kernel_dim.max(1);
+        let conv_source_cols_gpu = GpuBuffer::alloc(
+            ordinal,
+            ScalarType::U32,
+            &[tree_len, conv_source_cols_stride],
+        )
+        .map_err(|e| anyhow::anyhow!("tree cache conv source cols alloc: {e}"))?;
         let visibility_gpu = GpuBuffer::alloc(ordinal, ScalarType::U8, &[tree_len, tree_len])
             .map_err(|e| anyhow::anyhow!("tree cache visibility alloc: {e}"))?;
         let greedy_logits_gpu =
@@ -2109,12 +2119,15 @@ impl PrefillTreeVerifyCache {
             token_ids_gpu,
             positions_gpu,
             parent_ids_gpu,
+            conv_source_cols_gpu,
+            conv_source_cols_stride,
             visibility_gpu,
             greedy_logits_gpu,
             greedy_indices_gpu,
             token_id_bytes: Vec::with_capacity(tree_len * 4),
             position_bytes: Vec::with_capacity(tree_len * 4),
             parent_id_bytes: Vec::with_capacity(tree_len * 4),
+            conv_source_col_bytes: Vec::with_capacity(tree_len * conv_source_cols_stride * 4),
             rollback: None,
         })
     }
@@ -2191,6 +2204,25 @@ impl PrefillTreeVerifyCache {
             self.parent_id_bytes.len(),
         )
         .map_err(|e| anyhow::anyhow!("tree verify upload parent IDs: {e}"))?;
+
+        self.conv_source_col_bytes.clear();
+        self.conv_source_col_bytes
+            .reserve(parent_ids.len() * self.conv_source_cols_stride * 4);
+        for t in 0..parent_ids.len() {
+            for tap in 0..self.conv_source_cols_stride {
+                let source_col =
+                    tree_conv_source_col(parent_ids, t, tap, self.conv_source_cols_stride)?;
+                self.conv_source_col_bytes
+                    .extend_from_slice(&(source_col as u32).to_le_bytes());
+            }
+        }
+        copy_h2d(
+            self.ordinal,
+            self.conv_source_cols_gpu.as_mut_ptr(),
+            self.conv_source_col_bytes.as_ptr() as *const c_void,
+            self.conv_source_col_bytes.len(),
+        )
+        .map_err(|e| anyhow::anyhow!("tree verify upload conv source columns: {e}"))?;
 
         copy_h2d(
             self.ordinal,
@@ -4287,6 +4319,46 @@ pub fn prefill_tree_verify(
     )
 }
 
+fn tree_conv_source_col(
+    parent_ids: &[i32],
+    t: usize,
+    tap: usize,
+    kernel_size: usize,
+) -> Result<usize> {
+    let state_len = kernel_size.saturating_sub(1);
+    let steps = state_len.saturating_sub(tap);
+    if steps == 0 {
+        return Ok(state_len + t);
+    }
+
+    let mut node = t;
+    let mut walked = 0usize;
+    while walked < steps {
+        let parent = *parent_ids
+            .get(node)
+            .ok_or_else(|| anyhow::anyhow!("tree conv source node {node} out of range"))?;
+        if parent < 0 {
+            break;
+        }
+        let parent = usize::try_from(parent)
+            .map_err(|_| anyhow::anyhow!("tree conv source invalid parent id {parent}"))?;
+        if parent >= parent_ids.len() {
+            return Err(anyhow::anyhow!(
+                "tree conv source parent id {parent} out of range {}",
+                parent_ids.len()
+            ));
+        }
+        node = parent;
+        walked += 1;
+    }
+
+    if walked == steps {
+        Ok(state_len + node)
+    } else {
+        Ok(tap + walked)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn prefill_tree_verify_cached(
     weights: &Qwen35Weights,
@@ -4485,6 +4557,8 @@ fn prefill_tree_verify_impl(
                 prefix_len,
                 ordinal,
                 &cache.parent_ids_gpu,
+                &cache.conv_source_cols_gpu,
+                cache.conv_source_cols_stride,
                 capture_slot,
             )?;
             if profile {
@@ -6104,26 +6178,43 @@ fn prefill_tree_full_attention_layer(
         weights.int4_group_size,
     )?;
 
-    prefill_ffi::transpose_shd_hsd(
-        ordinal,
-        ScalarType::BF16,
-        tree_len,
-        num_kv_heads,
-        head_dim,
-        &scratch.proj_buf2,
-        &mut scratch.attn_k,
-    )
-    .map_err(|e| anyhow::anyhow!("tree layer {idx} K transpose: {e}"))?;
-    prefill_ffi::transpose_shd_hsd(
-        ordinal,
-        ScalarType::BF16,
-        tree_len,
-        num_kv_heads,
-        head_dim,
-        &scratch.full_v_buf,
-        &mut scratch.attn_v,
-    )
-    .map_err(|e| anyhow::anyhow!("tree layer {idx} V transpose: {e}"))?;
+    let use_fused_tree_full_kv_transpose = gpu_hal::current_backend() == Backend::Hip
+        && std::env::var_os("SUPERSONIC_DFLASH_DISABLE_TREE_FULL_KV_TRANSPOSE").is_none();
+    if use_fused_tree_full_kv_transpose {
+        prefill_ffi::transpose_shd_hsd_pair(
+            ordinal,
+            ScalarType::BF16,
+            tree_len,
+            num_kv_heads,
+            head_dim,
+            &scratch.proj_buf2,
+            &scratch.full_v_buf,
+            &mut scratch.attn_k,
+            &mut scratch.attn_v,
+        )
+        .map_err(|e| anyhow::anyhow!("tree layer {idx} fused K/V transpose: {e}"))?;
+    } else {
+        prefill_ffi::transpose_shd_hsd(
+            ordinal,
+            ScalarType::BF16,
+            tree_len,
+            num_kv_heads,
+            head_dim,
+            &scratch.proj_buf2,
+            &mut scratch.attn_k,
+        )
+        .map_err(|e| anyhow::anyhow!("tree layer {idx} K transpose: {e}"))?;
+        prefill_ffi::transpose_shd_hsd(
+            ordinal,
+            ScalarType::BF16,
+            tree_len,
+            num_kv_heads,
+            head_dim,
+            &scratch.full_v_buf,
+            &mut scratch.attn_v,
+        )
+        .map_err(|e| anyhow::anyhow!("tree layer {idx} V transpose: {e}"))?;
+    }
     if let Some(slot) = capture_slot.as_deref_mut() {
         let bytes = num_kv_heads * tree_len * head_dim * elem_bytes;
         let needs_alloc = !matches!(
@@ -6171,98 +6262,139 @@ fn prefill_tree_full_attention_layer(
     .map_err(|e| anyhow::anyhow!("tree layer {idx} Q transpose: {e}"))?;
 
     let ls = &state.layers[idx];
-    let prefix_k_storage;
-    let prefix_v_storage;
-    let zero_prefix_k;
-    let zero_prefix_v;
-    let prefix_k_ref: &GpuBuffer;
-    let prefix_v_ref: &GpuBuffer;
-    if prefix_len == 0 {
-        zero_prefix_k = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[num_kv_heads, 1, head_dim])
-            .map_err(|e| anyhow::anyhow!("tree zero prefix K alloc: {e}"))?;
-        zero_prefix_v = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[num_kv_heads, 1, head_dim])
-            .map_err(|e| anyhow::anyhow!("tree zero prefix V alloc: {e}"))?;
-        prefix_k_ref = &zero_prefix_k;
-        prefix_v_ref = &zero_prefix_v;
-    } else {
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let use_strided_tree_prefix = prefix_len > 0
+        && gpu_hal::current_backend() == Backend::Hip
+        && std::env::var_os("SUPERSONIC_DFLASH_ENABLE_TREE_FULL_PREFIX_STRIDED").is_some()
+        && std::env::var_os("SUPERSONIC_DFLASH_DISABLE_TREE_FULL_PREFIX_STRIDED").is_none();
+    if use_strided_tree_prefix {
         let cap = ls.kv_capacity();
         if cap < prefix_len {
             return Err(anyhow::anyhow!(
                 "tree layer {idx}: KV capacity {cap} < prefix_len {prefix_len}"
             ));
         }
-        if !ls.has_virtual_kv_cache() && cap == prefix_len {
-            prefix_k_ref = ls
-                .kv_cache_k
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("tree layer {idx} missing K cache"))?;
-            prefix_v_ref = ls
-                .kv_cache_v
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("tree layer {idx} missing V cache"))?;
+        let prefix_k = ls
+            .kv_cache_k_offset_ptr(0)
+            .ok_or_else(|| anyhow::anyhow!("tree layer {idx} missing K cache"))?;
+        let prefix_v = ls
+            .kv_cache_v_offset_ptr(0)
+            .ok_or_else(|| anyhow::anyhow!("tree layer {idx} missing V cache"))?;
+        prefill_ffi::full_attention_tree_prefill_strided_raw(
+            ordinal,
+            ScalarType::BF16,
+            1,
+            num_q_heads,
+            num_kv_heads,
+            tree_len,
+            prefix_len,
+            cap,
+            head_dim,
+            scale,
+            &scratch.attn_q,
+            prefix_k,
+            prefix_v,
+            &scratch.attn_k,
+            &scratch.attn_v,
+            visibility_gpu,
+            &mut scratch.attn_out_f32,
+        )
+        .map_err(|e| anyhow::anyhow!("tree layer {idx} strided attention: {e}"))?;
+    } else {
+        let prefix_k_storage;
+        let prefix_v_storage;
+        let zero_prefix_k;
+        let zero_prefix_v;
+        let prefix_k_ref: &GpuBuffer;
+        let prefix_v_ref: &GpuBuffer;
+        if prefix_len == 0 {
+            zero_prefix_k =
+                GpuBuffer::zeros(ordinal, ScalarType::BF16, &[num_kv_heads, 1, head_dim])
+                    .map_err(|e| anyhow::anyhow!("tree zero prefix K alloc: {e}"))?;
+            zero_prefix_v =
+                GpuBuffer::zeros(ordinal, ScalarType::BF16, &[num_kv_heads, 1, head_dim])
+                    .map_err(|e| anyhow::anyhow!("tree zero prefix V alloc: {e}"))?;
+            prefix_k_ref = &zero_prefix_k;
+            prefix_v_ref = &zero_prefix_v;
         } else {
-            prefix_k_storage = GpuBuffer::alloc(
-                ordinal,
-                ScalarType::BF16,
-                &[num_kv_heads, prefix_len, head_dim],
-            )
-            .map_err(|e| anyhow::anyhow!("tree prefix K alloc: {e}"))?;
-            prefix_v_storage = GpuBuffer::alloc(
-                ordinal,
-                ScalarType::BF16,
-                &[num_kv_heads, prefix_len, head_dim],
-            )
-            .map_err(|e| anyhow::anyhow!("tree prefix V alloc: {e}"))?;
-            let cap_stride = cap * head_dim * elem_bytes;
-            let contig_stride = prefix_len * head_dim * elem_bytes;
-            let copy_bytes = prefix_len * head_dim * elem_bytes;
-            for h in 0..num_kv_heads {
-                let src_k = ls
-                    .kv_cache_k_offset_ptr(h * cap_stride)
-                    .ok_or_else(|| anyhow::anyhow!("tree layer {idx} missing K cache"))?;
-                let src_v = ls
-                    .kv_cache_v_offset_ptr(h * cap_stride)
-                    .ok_or_else(|| anyhow::anyhow!("tree layer {idx} missing V cache"))?;
-                copy_d2d_batched(
-                    ordinal,
-                    prefix_k_storage.offset_ptr(h * contig_stride) as *mut c_void,
-                    src_k,
-                    copy_bytes,
-                )
-                .map_err(|e| anyhow::anyhow!("tree layer {idx} prefix K copy h={h}: {e}"))?;
-                copy_d2d_batched(
-                    ordinal,
-                    prefix_v_storage.offset_ptr(h * contig_stride) as *mut c_void,
-                    src_v,
-                    copy_bytes,
-                )
-                .map_err(|e| anyhow::anyhow!("tree layer {idx} prefix V copy h={h}: {e}"))?;
+            let cap = ls.kv_capacity();
+            if cap < prefix_len {
+                return Err(anyhow::anyhow!(
+                    "tree layer {idx}: KV capacity {cap} < prefix_len {prefix_len}"
+                ));
             }
-            prefix_k_ref = &prefix_k_storage;
-            prefix_v_ref = &prefix_v_storage;
+            if !ls.has_virtual_kv_cache() && cap == prefix_len {
+                prefix_k_ref = ls
+                    .kv_cache_k
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("tree layer {idx} missing K cache"))?;
+                prefix_v_ref = ls
+                    .kv_cache_v
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("tree layer {idx} missing V cache"))?;
+            } else {
+                prefix_k_storage = GpuBuffer::alloc(
+                    ordinal,
+                    ScalarType::BF16,
+                    &[num_kv_heads, prefix_len, head_dim],
+                )
+                .map_err(|e| anyhow::anyhow!("tree prefix K alloc: {e}"))?;
+                prefix_v_storage = GpuBuffer::alloc(
+                    ordinal,
+                    ScalarType::BF16,
+                    &[num_kv_heads, prefix_len, head_dim],
+                )
+                .map_err(|e| anyhow::anyhow!("tree prefix V alloc: {e}"))?;
+                let cap_stride = cap * head_dim * elem_bytes;
+                let contig_stride = prefix_len * head_dim * elem_bytes;
+                let copy_bytes = prefix_len * head_dim * elem_bytes;
+                for h in 0..num_kv_heads {
+                    let src_k = ls
+                        .kv_cache_k_offset_ptr(h * cap_stride)
+                        .ok_or_else(|| anyhow::anyhow!("tree layer {idx} missing K cache"))?;
+                    let src_v = ls
+                        .kv_cache_v_offset_ptr(h * cap_stride)
+                        .ok_or_else(|| anyhow::anyhow!("tree layer {idx} missing V cache"))?;
+                    copy_d2d_batched(
+                        ordinal,
+                        prefix_k_storage.offset_ptr(h * contig_stride) as *mut c_void,
+                        src_k,
+                        copy_bytes,
+                    )
+                    .map_err(|e| anyhow::anyhow!("tree layer {idx} prefix K copy h={h}: {e}"))?;
+                    copy_d2d_batched(
+                        ordinal,
+                        prefix_v_storage.offset_ptr(h * contig_stride) as *mut c_void,
+                        src_v,
+                        copy_bytes,
+                    )
+                    .map_err(|e| anyhow::anyhow!("tree layer {idx} prefix V copy h={h}: {e}"))?;
+                }
+                prefix_k_ref = &prefix_k_storage;
+                prefix_v_ref = &prefix_v_storage;
+            }
         }
-    }
 
-    let scale = 1.0 / (head_dim as f32).sqrt();
-    prefill_ffi::full_attention_tree_prefill(
-        ordinal,
-        ScalarType::BF16,
-        1,
-        num_q_heads,
-        num_kv_heads,
-        tree_len,
-        prefix_len,
-        head_dim,
-        scale,
-        &scratch.attn_q,
-        prefix_k_ref,
-        prefix_v_ref,
-        &scratch.attn_k,
-        &scratch.attn_v,
-        visibility_gpu,
-        &mut scratch.attn_out_f32,
-    )
-    .map_err(|e| anyhow::anyhow!("tree layer {idx} attention: {e}"))?;
+        prefill_ffi::full_attention_tree_prefill(
+            ordinal,
+            ScalarType::BF16,
+            1,
+            num_q_heads,
+            num_kv_heads,
+            tree_len,
+            prefix_len,
+            head_dim,
+            scale,
+            &scratch.attn_q,
+            prefix_k_ref,
+            prefix_v_ref,
+            &scratch.attn_k,
+            &scratch.attn_v,
+            visibility_gpu,
+            &mut scratch.attn_out_f32,
+        )
+        .map_err(|e| anyhow::anyhow!("tree layer {idx} attention: {e}"))?;
+    }
 
     let fused_attn_gate_prep = has_attn_gate
         && gpu_hal::current_backend() == Backend::Hip
@@ -7487,8 +7619,39 @@ fn delta_recurrent_tree_prefill_capture_with_trace(
     parent_ids_gpu: &GpuBuffer,
     linear_delta_out: &mut GpuBuffer,
     recurrent_trace: &mut GpuBuffer,
-) -> Result<()> {
+    linear_attn_output: Option<&mut GpuBuffer>,
+) -> Result<bool> {
     if recurrent_trace.dtype() == ScalarType::U8 {
+        if gpu_hal::current_backend() == Backend::Hip
+            && env::var_os("SUPERSONIC_DFLASH_DISABLE_TREE_DIRECT_ATTENTION").is_none()
+        {
+            if let Some(attn_output) = linear_attn_output {
+                prefill_ffi::delta_recurrent_tree_prefill_capture_q8_trace_attn(
+                    ordinal,
+                    ScalarType::F32,
+                    nv,
+                    tree_len,
+                    khd,
+                    vhd,
+                    recurrent_initial,
+                    linear_q_trans,
+                    linear_k_trans,
+                    linear_v_trans,
+                    linear_beta,
+                    linear_g,
+                    parent_ids_gpu,
+                    attn_output,
+                    recurrent_trace,
+                )
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "tree layer {idx} delta recurrent Q8 trace direct attention: {e}"
+                    )
+                })?;
+                return Ok(true);
+            }
+        }
+
         prefill_ffi::delta_recurrent_tree_prefill_capture_q8_trace(
             ordinal,
             ScalarType::F32,
@@ -7546,7 +7709,7 @@ fn delta_recurrent_tree_prefill_capture_with_trace(
         )
         .map_err(|e| anyhow::anyhow!("tree layer {idx} delta recurrent capture: {e}"))?;
     }
-    Ok(())
+    Ok(false)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7560,6 +7723,8 @@ fn prefill_tree_linear_attention_layer(
     prefix_len: usize,
     ordinal: usize,
     parent_ids_gpu: &GpuBuffer,
+    conv_source_cols_gpu: &GpuBuffer,
+    conv_source_cols_stride: usize,
     mut capture_slot: Option<&mut Option<PrefillTreeLayerRollback>>,
 ) -> Result<()> {
     let lw = weights.layers[idx]
@@ -7655,7 +7820,27 @@ fn prefill_tree_linear_attention_layer(
 
     let use_fused_ba =
         lw.ba_proj_w.is_some() && scratch.normed.backend() != gpu_hal::Backend::Metal;
-    if use_fused_ba {
+    // Experimental scalar fused path. Current profiling shows the generic BF16 matmul plus
+    // beta/g epilogue is faster, so keep this opt-in until it gets an MFMA implementation.
+    let use_direct_ba = use_fused_ba
+        && gpu_hal::current_backend() == Backend::Hip
+        && std::env::var_os("SUPERSONIC_DFLASH_ENABLE_FUSED_BA_DIRECT").is_some()
+        && std::env::var_os("SUPERSONIC_DFLASH_DISABLE_FUSED_BA_DIRECT").is_none();
+    if use_direct_ba {
+        prefill_ffi::project_ba_compute_beta_g_bf16(
+            ordinal,
+            tree_len,
+            hidden_dim,
+            nv,
+            &scratch.normed,
+            lw.ba_proj_w.as_ref().expect("checked fused BA weight"),
+            &lw.dt_bias,
+            &lw.a_log_exp,
+            &mut scratch.linear_beta,
+            &mut scratch.linear_g,
+        )
+        .map_err(|e| anyhow::anyhow!("tree layer {idx} direct BA beta/g: {e}"))?;
+    } else if use_fused_ba {
         matmul_proj(
             ordinal,
             1,
@@ -7712,31 +7897,53 @@ fn prefill_tree_linear_attention_layer(
     }
 
     let pad = kern - 1;
-    prefill_ffi::transpose_pad_conv(
-        ordinal,
-        ScalarType::BF16,
-        tree_len,
-        qkv_dim,
-        pad,
-        &scratch.proj_buf,
-        &mut scratch.conv_input,
-    )
-    .map_err(|e| anyhow::anyhow!("tree layer {idx} conv transpose+pad: {e}"))?;
-
-    if prefix_len > 0 {
+    let use_fused_tree_conv_prep = gpu_hal::current_backend() == Backend::Hip
+        && prefix_len > 0
+        && tree_len >= pad
+        && std::env::var_os("SUPERSONIC_DFLASH_DISABLE_FUSED_CONV_PREP").is_none();
+    if use_fused_tree_conv_prep {
         let conv_state = state.layers[idx].conv_state.as_ref().ok_or_else(|| {
             anyhow::anyhow!("tree layer {idx} missing conv_state for prefix_len={prefix_len}")
         })?;
-        prefill_ffi::fill_conv_tail(
+        prefill_ffi::prepare_conv_input_tail(
             ordinal,
             ScalarType::BF16,
+            tree_len,
             qkv_dim,
             pad,
-            pad + tree_len,
+            &scratch.proj_buf,
             conv_state,
             &mut scratch.conv_input,
+            &mut scratch.linear_new_tail,
         )
-        .map_err(|e| anyhow::anyhow!("tree layer {idx} conv pad fill: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("tree layer {idx} fused conv prepare: {e}"))?;
+    } else {
+        prefill_ffi::transpose_pad_conv(
+            ordinal,
+            ScalarType::BF16,
+            tree_len,
+            qkv_dim,
+            pad,
+            &scratch.proj_buf,
+            &mut scratch.conv_input,
+        )
+        .map_err(|e| anyhow::anyhow!("tree layer {idx} conv transpose+pad: {e}"))?;
+
+        if prefix_len > 0 {
+            let conv_state = state.layers[idx].conv_state.as_ref().ok_or_else(|| {
+                anyhow::anyhow!("tree layer {idx} missing conv_state for prefix_len={prefix_len}")
+            })?;
+            prefill_ffi::fill_conv_tail(
+                ordinal,
+                ScalarType::BF16,
+                qkv_dim,
+                pad,
+                pad + tree_len,
+                conv_state,
+                &mut scratch.conv_input,
+            )
+            .map_err(|e| anyhow::anyhow!("tree layer {idx} conv pad fill: {e}"))?;
+        }
     }
     let recurrent_trace_dtype = dflash_rollback_trace_dtype();
     if let Some(slot) = capture_slot.as_deref_mut() {
@@ -7790,20 +7997,42 @@ fn prefill_tree_linear_attention_layer(
         .map_err(|e| anyhow::anyhow!("tree layer {idx} rollback conv_input capture: {e}"))?;
     }
 
-    prefill_ffi::linear_tree_conv_pack(
-        ordinal,
-        ScalarType::BF16,
-        1,
-        qkv_dim,
-        pad + tree_len,
-        tree_len,
-        kern,
-        &scratch.conv_input,
-        &lw.conv1d_w,
-        parent_ids_gpu,
-        &mut scratch.proj_buf,
-    )
-    .map_err(|e| anyhow::anyhow!("tree layer {idx} conv: {e}"))?;
+    let use_indexed_tree_conv = gpu_hal::current_backend() == Backend::Hip
+        && conv_source_cols_stride >= kern
+        && conv_source_cols_gpu.elem_count() >= tree_len * conv_source_cols_stride
+        && std::env::var_os("SUPERSONIC_DFLASH_DISABLE_TREE_CONV_SOURCE_MAP").is_none();
+    if use_indexed_tree_conv {
+        prefill_ffi::linear_tree_conv_pack_indexed(
+            ordinal,
+            ScalarType::BF16,
+            1,
+            qkv_dim,
+            pad + tree_len,
+            tree_len,
+            kern,
+            conv_source_cols_stride,
+            &scratch.conv_input,
+            &lw.conv1d_w,
+            conv_source_cols_gpu,
+            &mut scratch.proj_buf,
+        )
+        .map_err(|e| anyhow::anyhow!("tree layer {idx} indexed conv: {e}"))?;
+    } else {
+        prefill_ffi::linear_tree_conv_pack(
+            ordinal,
+            ScalarType::BF16,
+            1,
+            qkv_dim,
+            pad + tree_len,
+            tree_len,
+            kern,
+            &scratch.conv_input,
+            &lw.conv1d_w,
+            parent_ids_gpu,
+            &mut scratch.proj_buf,
+        )
+        .map_err(|e| anyhow::anyhow!("tree layer {idx} conv: {e}"))?;
+    }
 
     let use_fused_qkv_prepare = gpu_hal::current_backend() == Backend::Hip
         && std::env::var_os("SUPERSONIC_DFLASH_DISABLE_FUSED_QKV_PREP").is_none();
@@ -7918,7 +8147,9 @@ fn prefill_tree_linear_attention_layer(
         .map_err(|e| anyhow::anyhow!("tree layer {idx} K l2norm: {e}"))?;
     }
 
-    if use_fused_ba {
+    if use_direct_ba {
+        // beta/g were produced directly from the fused BA projection above.
+    } else if use_fused_ba {
         prefill_ffi::compute_beta_g_ba_bf16(
             ordinal,
             tree_len,
@@ -8061,7 +8292,7 @@ fn prefill_tree_linear_attention_layer(
         &zero_recurrent
     };
 
-    if let Some(slot) = capture_slot.as_deref_mut() {
+    let direct_attn = if let Some(slot) = capture_slot.as_deref_mut() {
         let Some(PrefillTreeLayerRollback::Linear {
             recurrent_trace, ..
         }) = slot.as_mut()
@@ -8084,7 +8315,8 @@ fn prefill_tree_linear_attention_layer(
             parent_ids_gpu,
             &mut scratch.linear_delta_out,
             recurrent_trace,
-        )?;
+            Some(&mut scratch.linear_attn_output),
+        )?
     } else {
         let mut recurrent_trace = if recurrent_trace_dtype == ScalarType::U8 {
             GpuBuffer::alloc(
@@ -8112,20 +8344,23 @@ fn prefill_tree_linear_attention_layer(
             parent_ids_gpu,
             &mut scratch.linear_delta_out,
             &mut recurrent_trace,
-        )?;
-    }
+            Some(&mut scratch.linear_attn_output),
+        )?
+    };
 
-    prefill_ffi::dflash_extract_recurrent_attn(
-        ordinal,
-        nv,
-        tree_len,
-        khd,
-        vhd,
-        &scratch.linear_delta_out,
-        &mut scratch.linear_dummy_state,
-        &mut scratch.linear_attn_output,
-    )
-    .map_err(|e| anyhow::anyhow!("tree layer {idx} recurrent/attn extract: {e}"))?;
+    if !direct_attn {
+        prefill_ffi::dflash_extract_recurrent_attn(
+            ordinal,
+            nv,
+            tree_len,
+            khd,
+            vhd,
+            &scratch.linear_delta_out,
+            &mut scratch.linear_dummy_state,
+            &mut scratch.linear_attn_output,
+        )
+        .map_err(|e| anyhow::anyhow!("tree layer {idx} recurrent/attn extract: {e}"))?;
+    }
 
     let use_fused_gated_epilogue = gpu_hal::current_backend() == Backend::Hip
         && std::env::var_os("SUPERSONIC_DFLASH_DISABLE_FUSED_GATED_EPILOGUE").is_none();

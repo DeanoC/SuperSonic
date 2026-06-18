@@ -11,3 +11,4 @@ __pycache__/
 .claude/scheduled_tasks.lock
 .worktree/
 .worktrees/
+.rocprofv3/

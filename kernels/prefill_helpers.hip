@@ -402,6 +402,27 @@ __global__ void pfx_transpose_shd_hsd_kernel(
     dst[dst_off] = src[idx];
 }
 
+template <typename T>
+__global__ void pfx_transpose_shd_hsd_pair_kernel(
+    int S, int H, int D,
+    const T* src_a,
+    const T* src_b,
+    T* dst_a,
+    T* dst_b
+) {
+    const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const size_t total = static_cast<size_t>(S) * H * D;
+    if (idx >= total) return;
+
+    const int d = static_cast<int>(idx % D);
+    const int h = static_cast<int>((idx / D) % H);
+    const int s = static_cast<int>(idx / (static_cast<size_t>(D) * H));
+
+    const size_t dst_off = static_cast<size_t>(h) * S * D + static_cast<size_t>(s) * D + d;
+    dst_a[dst_off] = src_a[idx];
+    dst_b[dst_off] = src_b[idx];
+}
+
 __global__ void pfx_transpose_shd_to_cache_bf16_kernel(
     int S, int H, int D,
     int cache_len,
@@ -616,6 +637,86 @@ __global__ void pfx_compute_beta_g_ba_bf16_kernel(
     const float ale = pfx_to_float(a_log_exp[h]);
     const float sp = logf(1.0f + expf(a_val + dt));
     g[static_cast<size_t>(h) * seq_len + t] = -sp * ale;
+}
+
+#define PFX_BA_TILE_M 16
+#define PFX_BA_TILE_N 16
+#define PFX_BA_TILE_K 32
+
+__global__ void pfx_project_ba_compute_beta_g_bf16_kernel(
+    int seq_len,
+    int hidden_dim,
+    int nv,
+    const hip_bfloat16* __restrict__ hidden,   // [seq_len, hidden_dim]
+    const hip_bfloat16* __restrict__ ba_weight, // [2*nv, hidden_dim]
+    const hip_bfloat16* __restrict__ dt_bias,   // [nv]
+    const hip_bfloat16* __restrict__ a_log_exp, // [nv]
+    float* __restrict__ beta,                   // [nv, seq_len]
+    float* __restrict__ g                       // [nv, seq_len]
+) {
+    const int tx = threadIdx.x % PFX_BA_TILE_N;
+    const int ty = threadIdx.x / PFX_BA_TILE_N;
+
+    const int tile_row = blockIdx.y * PFX_BA_TILE_M;
+    const int tile_col = blockIdx.x * PFX_BA_TILE_N;
+    const int row = tile_row + ty;
+    const int col = tile_col + tx;
+    const int out_cols = 2 * nv;
+
+    __shared__ float s_hidden[PFX_BA_TILE_M][PFX_BA_TILE_K];
+    __shared__ float s_weight[PFX_BA_TILE_N][PFX_BA_TILE_K];
+
+    float acc = 0.0f;
+    for (int kk_base = 0; kk_base < hidden_dim; kk_base += PFX_BA_TILE_K) {
+        for (int i = threadIdx.x; i < PFX_BA_TILE_M * PFX_BA_TILE_K; i += blockDim.x) {
+            const int lr = i / PFX_BA_TILE_K;
+            const int lc = i % PFX_BA_TILE_K;
+            const int gr = tile_row + lr;
+            const int gc = kk_base + lc;
+            if (gr < seq_len && gc < hidden_dim) {
+                s_hidden[lr][lc] =
+                    pfx_to_float(hidden[static_cast<size_t>(gr) * hidden_dim + gc]);
+            } else {
+                s_hidden[lr][lc] = 0.0f;
+            }
+        }
+
+        for (int i = threadIdx.x; i < PFX_BA_TILE_N * PFX_BA_TILE_K; i += blockDim.x) {
+            const int wr = i / PFX_BA_TILE_K;
+            const int wc = i % PFX_BA_TILE_K;
+            const int gn = tile_col + wr;
+            const int gk = kk_base + wc;
+            if (gn < out_cols && gk < hidden_dim) {
+                s_weight[wr][wc] =
+                    pfx_to_float(ba_weight[static_cast<size_t>(gn) * hidden_dim + gk]);
+            } else {
+                s_weight[wr][wc] = 0.0f;
+            }
+        }
+
+        __syncthreads();
+
+        if (row < seq_len && col < out_cols) {
+            for (int kk = 0; kk < PFX_BA_TILE_K; ++kk) {
+                acc += s_hidden[ty][kk] * s_weight[tx][kk];
+            }
+        }
+
+        __syncthreads();
+    }
+
+    if (row >= seq_len || col >= out_cols) return;
+
+    const float val = pfx_to_float(pfx_from_float<hip_bfloat16>(acc));
+    if (col < nv) {
+        beta[static_cast<size_t>(col) * seq_len + row] = 1.0f / (1.0f + expf(-val));
+    } else {
+        const int h = col - nv;
+        const float dt = pfx_to_float(dt_bias[h]);
+        const float ale = pfx_to_float(a_log_exp[h]);
+        const float sp = logf(1.0f + expf(val + dt));
+        g[static_cast<size_t>(h) * seq_len + row] = -sp * ale;
+    }
 }
 
 // ---- Kernel 8: Split gated Q projection ----

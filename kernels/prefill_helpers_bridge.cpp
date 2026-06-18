@@ -233,6 +233,28 @@ int transpose_shd_hsd_device(int device_ordinal,
     return 0;
 }
 
+template <typename T>
+int transpose_shd_hsd_pair_device(int device_ordinal,
+                                  int S, int H, int D,
+                                  const void* src_a, const void* src_b,
+                                  void* dst_a, void* dst_b) {
+    ScopedHipDevice scoped(device_ordinal);
+    const size_t total = static_cast<size_t>(S) * H * D;
+    constexpr int block = 256;
+    const unsigned int grid = static_cast<unsigned int>((total + block - 1) / block);
+    hipLaunchKernelGGL(
+        HIP_KERNEL_NAME(pfx_transpose_shd_hsd_pair_kernel<T>),
+        dim3(grid), dim3(block), 0, 0,
+        S, H, D,
+        static_cast<const T*>(src_a),
+        static_cast<const T*>(src_b),
+        static_cast<T*>(dst_a),
+        static_cast<T*>(dst_b));
+    if (hipGetLastError() != hipSuccess) return 323;
+    if (maybe_sync() != hipSuccess) return 324;
+    return 0;
+}
+
 int transpose_shd_to_cache_bf16_device(int device_ordinal,
                                        int S, int H, int D,
                                        int cache_len,
@@ -418,6 +440,34 @@ int compute_beta_g_ba_bf16_device(int device_ordinal,
         static_cast<float*>(g));
     if (hipGetLastError() != hipSuccess) return 363;
     if (maybe_sync() != hipSuccess) return 364;
+    return 0;
+}
+
+int project_ba_compute_beta_g_bf16_device(int device_ordinal,
+                                          int seq_len, int hidden_dim, int nv,
+                                          const void* hidden,
+                                          const void* ba_weight,
+                                          const void* dt_bias,
+                                          const void* a_log_exp,
+                                          void* beta, void* g) {
+    ScopedHipDevice scoped(device_ordinal);
+    constexpr int block = PFX_BA_TILE_M * PFX_BA_TILE_N;
+    const unsigned int grid_x =
+        static_cast<unsigned int>((2 * nv + PFX_BA_TILE_N - 1) / PFX_BA_TILE_N);
+    const unsigned int grid_y =
+        static_cast<unsigned int>((seq_len + PFX_BA_TILE_M - 1) / PFX_BA_TILE_M);
+    hipLaunchKernelGGL(
+        pfx_project_ba_compute_beta_g_bf16_kernel,
+        dim3(grid_x, grid_y), dim3(block), 0, 0,
+        seq_len, hidden_dim, nv,
+        static_cast<const hip_bfloat16*>(hidden),
+        static_cast<const hip_bfloat16*>(ba_weight),
+        static_cast<const hip_bfloat16*>(dt_bias),
+        static_cast<const hip_bfloat16*>(a_log_exp),
+        static_cast<float*>(beta),
+        static_cast<float*>(g));
+    if (hipGetLastError() != hipSuccess) return 365;
+    if (maybe_sync() != hipSuccess) return 366;
     return 0;
 }
 
@@ -831,6 +881,26 @@ extern "C" int supersonic_qwen35_hip_transpose_shd_hsd(
     }
 }
 
+extern "C" int supersonic_qwen35_hip_transpose_shd_hsd_pair(
+    int dtype, size_t device_ordinal,
+    size_t S, size_t H, size_t D,
+    const void* src_a, const void* src_b,
+    void* dst_a, void* dst_b
+) {
+    switch (dtype) {
+    case 0: return transpose_shd_hsd_pair_device<half>(static_cast<int>(device_ordinal),
+                static_cast<int>(S), static_cast<int>(H), static_cast<int>(D),
+                src_a, src_b, dst_a, dst_b);
+    case 1: return transpose_shd_hsd_pair_device<float>(static_cast<int>(device_ordinal),
+                static_cast<int>(S), static_cast<int>(H), static_cast<int>(D),
+                src_a, src_b, dst_a, dst_b);
+    case 2: return transpose_shd_hsd_pair_device<hip_bfloat16>(static_cast<int>(device_ordinal),
+                static_cast<int>(S), static_cast<int>(H), static_cast<int>(D),
+                src_a, src_b, dst_a, dst_b);
+    default: return 325;
+    }
+}
+
 extern "C" int supersonic_qwen35_hip_transpose_shd_to_cache_bf16(
     size_t device_ordinal,
     size_t S, size_t H, size_t D,
@@ -964,6 +1034,31 @@ extern "C" int supersonic_qwen35_hip_compute_beta_g_ba_bf16(
         static_cast<int>(seq_len),
         static_cast<int>(nv),
         BA, dt_bias, a_log_exp, beta, g);
+}
+
+extern "C" int supersonic_qwen35_hip_project_ba_compute_beta_g_bf16(
+    size_t device_ordinal,
+    size_t seq_len,
+    size_t hidden_dim,
+    size_t nv,
+    const void* hidden,
+    const void* ba_weight,
+    const void* dt_bias,
+    const void* a_log_exp,
+    void* beta,
+    void* g
+) {
+    return project_ba_compute_beta_g_bf16_device(
+        static_cast<int>(device_ordinal),
+        static_cast<int>(seq_len),
+        static_cast<int>(hidden_dim),
+        static_cast<int>(nv),
+        hidden,
+        ba_weight,
+        dt_bias,
+        a_log_exp,
+        beta,
+        g);
 }
 
 extern "C" int supersonic_qwen35_hip_split_qgate(

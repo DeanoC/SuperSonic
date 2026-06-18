@@ -881,6 +881,18 @@ unsafe extern "C" {
         dst: *mut c_void,
     ) -> c_int;
 
+    fn supersonic_qwen35_hip_transpose_shd_hsd_pair(
+        dtype: c_int,
+        device_ordinal: usize,
+        s: usize,
+        h: usize,
+        d: usize,
+        src_a: *const c_void,
+        src_b: *const c_void,
+        dst_a: *mut c_void,
+        dst_b: *mut c_void,
+    ) -> c_int;
+
     fn supersonic_qwen35_hip_sigmoid_mul(
         dtype: c_int,
         device_ordinal: usize,
@@ -929,6 +941,19 @@ unsafe extern "C" {
         seq_len: usize,
         nv: usize,
         ba: *const c_void,
+        dt_bias: *const c_void,
+        a_log_exp: *const c_void,
+        beta: *mut c_void,
+        g: *mut c_void,
+    ) -> c_int;
+
+    fn supersonic_qwen35_hip_project_ba_compute_beta_g_bf16(
+        device_ordinal: usize,
+        seq_len: usize,
+        hidden_dim: usize,
+        nv: usize,
+        hidden: *const c_void,
+        ba_weight: *const c_void,
         dt_bias: *const c_void,
         a_log_exp: *const c_void,
         beta: *mut c_void,
@@ -1294,6 +1319,27 @@ unsafe extern "C" {
         out: *mut c_void,
     ) -> c_int;
 
+    fn supersonic_qwen35_hip_full_attention_tree_prefill_strided(
+        dtype: c_int,
+        device_ordinal: usize,
+        batch_size: usize,
+        q_heads: usize,
+        kv_heads: usize,
+        tree_len: usize,
+        prefix_len: usize,
+        prefix_stride: usize,
+        head_dim: usize,
+        num_kv_groups: usize,
+        scale: f32,
+        query: *const c_void,
+        prefix_key: *const c_void,
+        prefix_value: *const c_void,
+        tree_key: *const c_void,
+        tree_value: *const c_void,
+        visibility: *const c_void,
+        out: *mut c_void,
+    ) -> c_int;
+
     fn supersonic_qwen35_hip_full_attention_decode_flat(
         dtype: c_int,
         device_ordinal: usize,
@@ -1352,6 +1398,21 @@ unsafe extern "C" {
         mixed_qkv: *const c_void,
         weights: *const c_void,
         parent_ids: *const c_void,
+        out: *mut c_void,
+    ) -> c_int;
+
+    fn supersonic_qwen35_hip_linear_tree_conv_pack_indexed(
+        dtype: c_int,
+        device_ordinal: usize,
+        batch_size: usize,
+        conv_dim: usize,
+        total_len: usize,
+        tree_len: usize,
+        kernel_size: usize,
+        source_stride: usize,
+        mixed_qkv: *const c_void,
+        weights: *const c_void,
+        source_cols: *const c_void,
         out: *mut c_void,
     ) -> c_int;
 
@@ -1551,6 +1612,24 @@ unsafe extern "C" {
         g: *const c_void,
         parent_ids: *const c_void,
         out: *mut c_void,
+        state_trace: *mut c_void,
+    ) -> c_int;
+
+    fn supersonic_qwen35_hip_delta_recurrent_tree_prefill_capture_q8_trace_attn(
+        dtype: c_int,
+        device_ordinal: usize,
+        batch_heads: usize,
+        seq_len: usize,
+        k_head_dim: usize,
+        v_head_dim: usize,
+        initial_state: *const c_void,
+        query: *const c_void,
+        key: *const c_void,
+        value: *const c_void,
+        beta: *const c_void,
+        g: *const c_void,
+        parent_ids: *const c_void,
+        attn_output: *mut c_void,
         state_trace: *mut c_void,
     ) -> c_int;
 
@@ -2005,6 +2084,77 @@ pub fn full_attention_tree_prefill(
     })
 }
 
+/// Full tree attention where prefix K/V are laid out as
+/// `[batch, kv_heads, prefix_stride, head_dim]` and only the first
+/// `prefix_len` rows per head are live.
+#[allow(clippy::too_many_arguments)]
+pub fn full_attention_tree_prefill_strided_raw(
+    ordinal: usize,
+    dtype: ScalarType,
+    batch_size: usize,
+    q_heads: usize,
+    kv_heads: usize,
+    tree_len: usize,
+    prefix_len: usize,
+    prefix_stride: usize,
+    head_dim: usize,
+    scale: f32,
+    query: &GpuBuffer,
+    prefix_key: *const c_void,
+    prefix_value: *const c_void,
+    tree_key: &GpuBuffer,
+    tree_value: &GpuBuffer,
+    visibility: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if out.backend() == Backend::Metal {
+        return Err(ffi_error(
+            "full_attention_tree_prefill_strided_raw is not implemented for Metal".into(),
+        ));
+    }
+    if prefix_key.is_null() || prefix_value.is_null() {
+        return Err(ffi_error(
+            "full_attention_tree_prefill_strided_raw got null prefix K/V".into(),
+        ));
+    }
+    if prefix_stride < prefix_len {
+        return Err(ffi_error(format!(
+            "full_attention_tree_prefill_strided_raw prefix_stride {prefix_stride} < prefix_len {prefix_len}"
+        )));
+    }
+    let num_kv_groups = q_heads / kv_heads;
+    ffi_profile_time_result("qwen.full_attention_tree_prefill_strided", ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_hip_full_attention_tree_prefill_strided(
+                dtype.kernel_dtype_code(),
+                ordinal,
+                batch_size,
+                q_heads,
+                kv_heads,
+                tree_len,
+                prefix_len,
+                prefix_stride,
+                head_dim,
+                num_kv_groups,
+                scale,
+                query.as_ptr(),
+                prefix_key,
+                prefix_value,
+                tree_key.as_ptr(),
+                tree_value.as_ptr(),
+                visibility.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!(
+                "full_attention_tree_prefill_strided failed: {status}"
+            )));
+        }
+        Ok(())
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn metal_full_attention_prefill_strided_bf16_f32(
     q_heads: usize,
@@ -2355,6 +2505,64 @@ pub fn linear_tree_conv_pack(
         };
         if status != 0 {
             return Err(ffi_error(format!("linear_tree_conv_pack failed: {status}")));
+        }
+        Ok(())
+    })
+}
+
+pub fn linear_tree_conv_pack_indexed(
+    ordinal: usize,
+    dtype: ScalarType,
+    batch_size: usize,
+    conv_dim: usize,
+    total_len: usize,
+    tree_len: usize,
+    kernel_size: usize,
+    source_stride: usize,
+    mixed_qkv: &GpuBuffer,
+    weights: &GpuBuffer,
+    source_cols: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if out.backend() == Backend::Metal {
+        return Err(ffi_error(
+            "linear_tree_conv_pack_indexed is not implemented for Metal".into(),
+        ));
+    }
+    if source_stride < kernel_size {
+        return Err(GpuError::InvalidArg(format!(
+            "linear_tree_conv_pack_indexed source_stride {source_stride} < kernel_size {kernel_size}"
+        )));
+    }
+    if source_cols.dtype() != ScalarType::U32 || source_cols.elem_count() < tree_len * source_stride
+    {
+        return Err(GpuError::InvalidArg(format!(
+            "linear_tree_conv_pack_indexed source_cols must be U32[tree_len * source_stride], got {:?}[{}] for {tree_len} * {source_stride}",
+            source_cols.dtype(),
+            source_cols.elem_count()
+        )));
+    }
+    ffi_profile_time_result("qwen.linear_tree_conv_pack_indexed", ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_hip_linear_tree_conv_pack_indexed(
+                dtype.kernel_dtype_code(),
+                ordinal,
+                batch_size,
+                conv_dim,
+                total_len,
+                tree_len,
+                kernel_size,
+                source_stride,
+                mixed_qkv.as_ptr(),
+                weights.as_ptr(),
+                source_cols.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!(
+                "linear_tree_conv_pack_indexed failed: {status}"
+            )));
         }
         Ok(())
     })
@@ -3064,6 +3272,74 @@ pub fn delta_recurrent_tree_prefill_capture_q8_trace(
             if status != 0 {
                 return Err(ffi_error(format!(
                     "delta_recurrent_tree_prefill_capture_q8_trace failed: {status}"
+                )));
+            }
+            Ok(())
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn delta_recurrent_tree_prefill_capture_q8_trace_attn(
+    ordinal: usize,
+    dtype: ScalarType,
+    batch_heads: usize,
+    seq_len: usize,
+    k_head_dim: usize,
+    v_head_dim: usize,
+    initial_state: &GpuBuffer,
+    query: &GpuBuffer,
+    key: &GpuBuffer,
+    value: &GpuBuffer,
+    beta: &GpuBuffer,
+    g: &GpuBuffer,
+    parent_ids: &GpuBuffer,
+    attn_output: &mut GpuBuffer,
+    state_trace: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if attn_output.backend() == Backend::Metal {
+        return Err(ffi_error(
+            "delta_recurrent_tree_prefill_capture_q8_trace_attn is not implemented for Metal"
+                .into(),
+        ));
+    }
+    if dtype != ScalarType::F32
+        || attn_output.dtype() != ScalarType::BF16
+        || state_trace.dtype() != ScalarType::U8
+        || k_head_dim != 128
+        || v_head_dim != 128
+    {
+        return Err(ffi_error(
+            "delta_recurrent_tree_prefill_capture_q8_trace_attn requires F32 state, BF16 attention output, U8 trace, k/v head dim 128"
+                .into(),
+        ));
+    }
+    ffi_profile_time_result(
+        "qwen.delta_recurrent_tree_prefill_capture_q8_trace_attn",
+        ordinal,
+        || {
+            let status = unsafe {
+                supersonic_qwen35_hip_delta_recurrent_tree_prefill_capture_q8_trace_attn(
+                    dtype.kernel_dtype_code(),
+                    ordinal,
+                    batch_heads,
+                    seq_len,
+                    k_head_dim,
+                    v_head_dim,
+                    initial_state.as_ptr(),
+                    query.as_ptr(),
+                    key.as_ptr(),
+                    value.as_ptr(),
+                    beta.as_ptr(),
+                    g.as_ptr(),
+                    parent_ids.as_ptr(),
+                    attn_output.as_mut_ptr(),
+                    state_trace.as_mut_ptr(),
+                )
+            };
+            if status != 0 {
+                return Err(ffi_error(format!(
+                    "delta_recurrent_tree_prefill_capture_q8_trace_attn failed: {status}"
                 )));
             }
             Ok(())
@@ -5215,6 +5491,45 @@ pub fn transpose_shd_hsd(
     })
 }
 
+/// Transpose two tensors from [S, H, D] layout to [H, S, D] layout in one HIP launch.
+pub fn transpose_shd_hsd_pair(
+    ordinal: usize,
+    dtype: ScalarType,
+    s: usize,
+    h: usize,
+    d: usize,
+    src_a: &GpuBuffer,
+    src_b: &GpuBuffer,
+    dst_a: &mut GpuBuffer,
+    dst_b: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if dst_a.backend() == Backend::Metal || dst_b.backend() == Backend::Metal {
+        transpose_shd_hsd(ordinal, dtype, s, h, d, src_a, dst_a)?;
+        return transpose_shd_hsd(ordinal, dtype, s, h, d, src_b, dst_b);
+    }
+    ffi_profile_time_result("qwen.transpose_shd_hsd_pair", ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_hip_transpose_shd_hsd_pair(
+                dtype.kernel_dtype_code(),
+                ordinal,
+                s,
+                h,
+                d,
+                src_a.as_ptr(),
+                src_b.as_ptr(),
+                dst_a.as_mut_ptr(),
+                dst_b.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!(
+                "transpose_shd_hsd_pair failed: {status}"
+            )));
+        }
+        Ok(())
+    })
+}
+
 /// Transpose BF16 from [S, H, D] directly into a cache laid out as
 /// [H, cache_len, D] at rows [dst_pos, dst_pos + S).
 pub fn transpose_shd_to_cache_bf16(
@@ -5630,6 +5945,64 @@ pub fn compute_beta_g_ba_bf16(
         if status != 0 {
             return Err(ffi_error(format!(
                 "compute_beta_g_ba_bf16 failed: {status}"
+            )));
+        }
+        Ok(())
+    })
+}
+
+pub fn project_ba_compute_beta_g_bf16(
+    ordinal: usize,
+    seq_len: usize,
+    hidden_dim: usize,
+    nv: usize,
+    hidden: &GpuBuffer,
+    ba_weight: &GpuBuffer,
+    dt_bias: &GpuBuffer,
+    a_log_exp: &GpuBuffer,
+    beta: &mut GpuBuffer,
+    g: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if hidden.backend() == Backend::Metal {
+        return Err(ffi_error(
+            "project_ba_compute_beta_g_bf16 is only implemented for HIP/CUDA backends".into(),
+        ));
+    }
+    if hidden.dtype() != ScalarType::BF16
+        || ba_weight.dtype() != ScalarType::BF16
+        || dt_bias.dtype() != ScalarType::BF16
+        || a_log_exp.dtype() != ScalarType::BF16
+        || beta.dtype() != ScalarType::F32
+        || g.dtype() != ScalarType::F32
+    {
+        return Err(ffi_error(format!(
+            "project_ba_compute_beta_g_bf16 expects BF16 hidden/weights/biases and F32 beta/g, got hidden={:?} ba={:?} dt={:?} a_log={:?} beta={:?} g={:?}",
+            hidden.dtype(),
+            ba_weight.dtype(),
+            dt_bias.dtype(),
+            a_log_exp.dtype(),
+            beta.dtype(),
+            g.dtype()
+        )));
+    }
+    ffi_profile_time_result("qwen.project_ba_compute_beta_g_bf16", ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_hip_project_ba_compute_beta_g_bf16(
+                ordinal,
+                seq_len,
+                hidden_dim,
+                nv,
+                hidden.as_ptr(),
+                ba_weight.as_ptr(),
+                dt_bias.as_ptr(),
+                a_log_exp.as_ptr(),
+                beta.as_mut_ptr(),
+                g.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!(
+                "project_ba_compute_beta_g_bf16 failed: {status}"
             )));
         }
         Ok(())
