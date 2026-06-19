@@ -1455,6 +1455,7 @@ extern "C" {
         final_norm_w: *const c_void,
         lm_head_w: *const c_void,
         logits_out: *mut c_void,
+        top1_out: *mut c_uint,
         counters: *mut c_uint,
         barrier_counter: *mut c_uint,
         barrier_flag: *mut c_uint,
@@ -2038,11 +2039,15 @@ pub struct Qwen36MoePersistentLmHeadFold<'a> {
     /// `[hidden]` BF16. Same final_norm tensor the standalone
     /// `lm_head_launch` consumes.
     pub final_norm_w: &'a GpuBuffer,
-    /// `[vocab, hidden]` BF16. Pre-dequantized at engine startup from
-    /// the bake's INT4 lm_head; the kernel reads BF16 only.
+    /// `[vocab, hidden]` BF16. The bake may store INT4 on disk, but the
+    /// folded kernel reads the pre-dequantized BF16 upload.
     pub lm_head_w: &'a GpuBuffer,
-    /// `[vocab]` BF16 output buffer. Kernel writes one logit per row.
-    pub logits_out: &'a mut GpuBuffer,
+    /// Optional `[vocab]` BF16 output buffer. Kernel writes one logit per row
+    /// when full logits are needed for sampling or diagnostics.
+    pub logits_out: Option<&'a mut GpuBuffer>,
+    /// Optional `[1]` U32 output buffer for greedy decode. When present, the
+    /// persistent kernel reduces the lm_head argmax internally.
+    pub top1_out: Option<&'a mut GpuBuffer>,
     /// Vocab size. Must be `> 0` and match `lm_head_w.shape()[0]`.
     pub vocab: i32,
 }
@@ -2052,6 +2057,9 @@ pub enum Qwen36MoePersistentMode {
     Full,
     RouterOnly,
     FfnOnly,
+    AttnOnly,
+    FfnStage(i32),
+    LinearStage(i32),
 }
 
 impl Qwen36MoePersistentMode {
@@ -2061,6 +2069,9 @@ impl Qwen36MoePersistentMode {
             Self::Full => 0,
             Self::RouterOnly => 1,
             Self::FfnOnly => 2,
+            Self::AttnOnly => 3,
+            Self::FfnStage(stage) => 3 + stage,
+            Self::LinearStage(stage) => 8 + stage,
         }
     }
 }
@@ -2142,6 +2153,20 @@ pub fn persistent_decode_launch_range(
             "qwen36_moe::persistent_decode_launch: only BF16 wired, got {dtype:?}"
         )));
     }
+    if let Qwen36MoePersistentMode::FfnStage(stage) = mode {
+        if !(1..=5).contains(&stage) {
+            return Err(GpuError::InvalidArg(format!(
+                "qwen36_moe::persistent_decode_launch: FFN stage mode must be in 1..=5, got {stage}"
+            )));
+        }
+    }
+    if let Qwen36MoePersistentMode::LinearStage(stage) = mode {
+        if !(1..=5).contains(&stage) {
+            return Err(GpuError::InvalidArg(format!(
+                "qwen36_moe::persistent_decode_launch: linear stage mode must be in 1..=5, got {stage}"
+            )));
+        }
+    }
     let backend = layers_device.backend();
     let counters = sync_buf.as_mut_ptr() as *mut c_uint;
     let barrier_counter = unsafe { (counters as *mut u8).add(64) as *mut c_uint };
@@ -2159,20 +2184,53 @@ pub fn persistent_decode_launch_range(
 
     // Fold pointers default to null; the kernel skips the lm_head phase
     // when any of the three is null.
-    let (vocab, final_norm_w_ptr, lm_head_w_ptr, logits_out_ptr) = match lm_head_fold {
-        Some(mut f) => (
-            f.vocab,
-            f.final_norm_w.as_ptr(),
-            f.lm_head_w.as_ptr(),
-            f.logits_out.as_mut_ptr(),
+    let (vocab, final_norm_w_ptr, lm_head_w_ptr, logits_out_ptr, top1_out_ptr) = match lm_head_fold
+    {
+        Some(mut f) => {
+            let logits_out_ptr = f
+                .logits_out
+                .as_deref_mut()
+                .map(|buf| buf.as_mut_ptr())
+                .unwrap_or(std::ptr::null_mut());
+            let top1_out_ptr = f
+                .top1_out
+                .as_deref_mut()
+                .map(|buf| buf.as_mut_ptr() as *mut c_uint)
+                .unwrap_or(std::ptr::null_mut());
+            (
+                f.vocab,
+                f.final_norm_w.as_ptr(),
+                f.lm_head_w.as_ptr(),
+                logits_out_ptr,
+                top1_out_ptr,
+            )
+        }
+        None => (
+            0,
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
         ),
-        None => (0, std::ptr::null(), std::ptr::null(), std::ptr::null_mut()),
     };
 
     let op = match mode {
         Qwen36MoePersistentMode::Full => "qwen36.persistent_decode",
         Qwen36MoePersistentMode::RouterOnly => "qwen36.persistent_router_only",
         Qwen36MoePersistentMode::FfnOnly => "qwen36.persistent_ffn_only",
+        Qwen36MoePersistentMode::AttnOnly => "qwen36.persistent_attn_only",
+        Qwen36MoePersistentMode::FfnStage(1) => "qwen36.persistent_ffn_stage1",
+        Qwen36MoePersistentMode::FfnStage(2) => "qwen36.persistent_ffn_stage2",
+        Qwen36MoePersistentMode::FfnStage(3) => "qwen36.persistent_ffn_stage3",
+        Qwen36MoePersistentMode::FfnStage(4) => "qwen36.persistent_ffn_stage4",
+        Qwen36MoePersistentMode::FfnStage(5) => "qwen36.persistent_ffn_stage5",
+        Qwen36MoePersistentMode::FfnStage(_) => "qwen36.persistent_ffn_stage_invalid",
+        Qwen36MoePersistentMode::LinearStage(1) => "qwen36.persistent_linear_stage1",
+        Qwen36MoePersistentMode::LinearStage(2) => "qwen36.persistent_linear_stage2",
+        Qwen36MoePersistentMode::LinearStage(3) => "qwen36.persistent_linear_stage3",
+        Qwen36MoePersistentMode::LinearStage(4) => "qwen36.persistent_linear_stage4",
+        Qwen36MoePersistentMode::LinearStage(5) => "qwen36.persistent_linear_stage5",
+        Qwen36MoePersistentMode::LinearStage(_) => "qwen36.persistent_linear_stage_invalid",
     };
     crate::prefill_ffi::ffi_profile_time_result(op, ordinal, || {
         let status: c_int = match backend {
@@ -2219,6 +2277,7 @@ pub fn persistent_decode_launch_range(
                         final_norm_w_ptr,
                         lm_head_w_ptr,
                         logits_out_ptr,
+                        top1_out_ptr,
                         counters,
                         barrier_counter,
                         barrier_flag,

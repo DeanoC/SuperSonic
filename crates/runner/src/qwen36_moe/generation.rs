@@ -23,6 +23,7 @@ pub(crate) struct Qwen36GenerationStep<'a> {
     pub(crate) geom: &'a MultiLayerGeom,
     pub(crate) step: usize,
     pub(crate) lm_head_folded: bool,
+    pub(crate) lm_head_folded_top1: bool,
     pub(crate) dump_last_logits: bool,
     pub(crate) tokenizer: Option<&'a tokenizers::Tokenizer>,
     pub(crate) sampling: SamplingParams,
@@ -40,12 +41,12 @@ pub(crate) struct Qwen36GenerationStep<'a> {
     pub(crate) stage_timings: &'a mut Qwen36StageTimingTotals,
 }
 
-fn metal_gpu_argmax_enabled(
+fn gpu_argmax_enabled(
     sampling: SamplingParams,
     dump_last_logits: bool,
     logits_buf: &GpuBuffer,
 ) -> bool {
-    logits_buf.backend() == Backend::Metal
+    matches!(logits_buf.backend(), Backend::Metal | Backend::Hip)
         && (sampling.temperature <= 0.0 || sampling.top_k == 1)
         && !dump_last_logits
         && std::env::var_os("SUPERSONIC_QWEN36_DUMP_LOGITS").is_none()
@@ -58,6 +59,7 @@ pub(crate) fn run_generation_step(args: Qwen36GenerationStep<'_>) -> Result<u32>
         geom,
         step,
         lm_head_folded,
+        lm_head_folded_top1,
         dump_last_logits,
         tokenizer,
         sampling,
@@ -88,10 +90,16 @@ pub(crate) fn run_generation_step(args: Qwen36GenerationStep<'_>) -> Result<u32>
     );
 
     let t2 = std::time::Instant::now();
-    let gpu_argmax = metal_gpu_argmax_enabled(sampling, dump_last_logits, logits_buf);
-    let (logits, gpu_next_token) = if gpu_argmax && lm_head_folded {
-        let token = launch_top1_from_logits(geom, logits_buf, counter_buf)
-            .context("folded GPU lm_head Metal argmax")?;
+    let gpu_argmax = gpu_argmax_enabled(sampling, dump_last_logits, logits_buf);
+    let (logits, gpu_next_token) = if gpu_argmax && lm_head_folded_top1 {
+        let bytes = counter_buf
+            .to_host_bytes()
+            .context("d2h folded GPU lm_head top1 token")?;
+        let token = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        (None, Some(token))
+    } else if gpu_argmax && lm_head_folded {
+        let token = launch_top1_from_logits(ordinal, geom, logits_buf, counter_buf)
+            .context("folded GPU lm_head argmax")?;
         (None, Some(token))
     } else if gpu_argmax {
         let token = launch_lm_head_top1_from_final_hidden_bytes(

@@ -534,3 +534,79 @@ fn disable_prefill_profiles() {
     kernel_ffi::prefill_ffi::ffi_profile_set_enabled(false);
     gpu_hal::hal_profile_set_enabled(false);
 }
+
+pub(crate) struct Qwen36DecodeProfileScope {
+    active: bool,
+    start: std::time::Instant,
+}
+
+impl Qwen36DecodeProfileScope {
+    pub(crate) fn new_from_env() -> Self {
+        let active = std::env::var_os("SUPERSONIC_QWEN36_PROFILE_FFI").is_some();
+        if active {
+            gpu_hal::hal_profile_set_enabled(true);
+            kernel_ffi::prefill_ffi::ffi_profile_set_enabled(true);
+            gpu_hal::hal_profile_reset();
+            kernel_ffi::prefill_ffi::ffi_profile_reset();
+        }
+        Self {
+            active,
+            start: std::time::Instant::now(),
+        }
+    }
+
+    pub(crate) fn finish(mut self) {
+        if !self.active {
+            return;
+        }
+        let wall_ms = self.start.elapsed().as_secs_f64() * 1000.0;
+        let ffi = kernel_ffi::prefill_ffi::ffi_profile_snapshot();
+        let hal = gpu_hal::hal_profile_snapshot();
+        eprintln!(
+            "[qwen36-decode-ffi-profile] wall_ms={:.3} ffi_calls={} ffi_ms={:.3} hal_calls={} hal_ms={:.3} alloc_calls={} alloc_bytes={} h2d={} d2h={} d2d={} memset={} sync_calls={}",
+            wall_ms,
+            ffi.total_calls,
+            ffi.total_ms,
+            hal.total_calls,
+            hal.total_ms,
+            hal.alloc_calls,
+            hal.alloc_bytes,
+            hal.h2d_bytes,
+            hal.d2h_bytes,
+            hal.d2d_bytes,
+            hal.memset_bytes,
+            hal.sync_calls,
+        );
+        for entry in ffi.entries.iter().take(40) {
+            eprintln!(
+                "[qwen36-decode-ffi-profile-op] op={} calls={} mean_ms={:.4} total_ms={:.3} max_ms={:.3}",
+                entry.op,
+                entry.calls,
+                entry.mean_ms(),
+                entry.total_ms,
+                entry.max_ms,
+            );
+        }
+        for entry in hal.entries.iter().take(20) {
+            eprintln!(
+                "[qwen36-decode-hal-profile-op] op={} calls={} mean_ms={:.4} total_ms={:.3} max_ms={:.3} bytes={}",
+                entry.op,
+                entry.calls,
+                entry.mean_ms(),
+                entry.total_ms,
+                entry.max_ms,
+                entry.total_bytes,
+            );
+        }
+        disable_prefill_profiles();
+        self.active = false;
+    }
+}
+
+impl Drop for Qwen36DecodeProfileScope {
+    fn drop(&mut self) {
+        if self.active {
+            disable_prefill_profiles();
+        }
+    }
+}

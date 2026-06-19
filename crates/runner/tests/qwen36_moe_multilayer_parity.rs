@@ -747,6 +747,7 @@ fn multilayer_persistent_decode_matches_chained() {
             position,
             runner::qwen36_moe_persistent_decode::CACHE_POS_INHERIT,
             None,
+            true,
         )
         .expect("PersistentScratch::run");
     let persistent_final = persistent_outputs.final_hidden_bytes;

@@ -29,8 +29,8 @@ use kernel_ffi::qwen36_moe::{
 };
 
 use crate::qwen36_moe_decode::{
-    ffn_output_elems, ffn_workspace_floats, full_attn_output_elems, full_attn_workspace_floats,
-    reset_sync_buf,
+    ffn_output_elems, ffn_workspace_floats, full_attn_output_elems,
+    full_attn_score_workspace_floats, full_attn_workspace_floats, reset_sync_buf,
 };
 use crate::qwen36_moe_types::{MtpLayerBuffers, MultiLayerGeom};
 
@@ -96,11 +96,7 @@ pub fn alloc_mtp_forward_scratch(
     geom: &MultiLayerGeom,
     kv_max_t: usize,
 ) -> Result<MtpForwardScratch> {
-    let attn_extra = if kv_max_t > 0 {
-        (geom.num_attention_heads as usize) * kv_max_t
-    } else {
-        0
-    };
+    let attn_extra = full_attn_score_workspace_floats(geom, kv_max_t);
     let attn_output = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[full_attn_output_elems(geom)])
         .context("alloc mtp attn_output")?;
     let attn_workspace = GpuBuffer::zeros(

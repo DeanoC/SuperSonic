@@ -61,7 +61,7 @@ pub(crate) fn run_spec_chain_step(args: Qwen36SpecChainStep<'_>) -> Result<Decod
         // as the pre-PR-#211 inherit-from-position path; in
         // SpecPrefill+MTP the verify replay writes accepted draft
         // tokens at the compact slot while RoPE rotates absolute.
-        scratch.run(args.ordinal, &initial_hidden, rope, cache, None)?
+        scratch.run(args.ordinal, &initial_hidden, rope, cache, None, true)?
     } else if !args.position.is_dense() {
         run_chained_decode_fast_with_cache_pos(
             args.ordinal,

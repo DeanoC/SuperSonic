@@ -154,16 +154,12 @@ __device__ inline void qwen36_moe_ffn_step_device(
 
     // BF16-round each h_norm element so the matmul reads what PyTorch reads.
     // HF `Qwen3_5MoeRMSNorm` `(1.0 + weight)` unit offset for
-    // `post_attention_layernorm`. Block 0 also stages the F32 of-BF16 view
-    // into workspace[OFF_H_NORM] for any later stages that prefer global
-    // memory.
+    // `post_attention_layernorm`. The normalised vector stays in per-block
+    // LDS; later FFN phases read their local copy directly.
     for (int col = tid; col < hidden; col += block_size) {
         const float w = static_cast<float>(post_attn_norm_w[col]);
         const float v = bf16_round_rne_f32(h_norm_lds[col] * inv_rms_input * (1.0f + w));
         h_norm_lds[col] = v;
-        if (blockIdx.x == 0) {
-            workspace[OFF_H_NORM + col] = v;
-        }
     }
     __syncthreads();
 
@@ -260,7 +256,7 @@ __device__ inline void qwen36_moe_ffn_step_device(
 
         // Step 4: top-k via k iterations. Each iter does a 256-wide argmax
         // reduction on `router_probs`, then masks the winner. With K=8 this
-        // is 8 cycles → fine for a megakernel; a heap would beat it for
+        // is 8 cycles -- fine for a megakernel; a heap would beat it for
         // larger k but k=8 is fixed in the model card.
         //
         // Tie-breaking: torch.topk returns the lowest index on ties; we
@@ -343,137 +339,133 @@ __device__ inline void qwen36_moe_ffn_step_device(
 
     const int Is_ = shared_intermediate;
     const int total_rows_d = 2 * Is_ + 1;
-    for (;;) {
-        __shared__ unsigned int my_row_d_s;
-        if (tid == 0) {
-            my_row_d_s = atomicAdd(&counters[0], 1u);
-        }
-        __syncthreads();
-        const int my_row = static_cast<int>(my_row_d_s);
-        if (my_row >= total_rows_d) break;
-
-        const T* w_row = nullptr;
-        const void* i4_slab = nullptr;
-        const hip_bfloat16* i4_scale = nullptr;
-        const hip_bfloat16* i4_zero  = nullptr;
-        int      i4_row = 0;
-        int      write_offset;
-        bool     is_gate_row = false;
-        if (my_row < Is_) {
-            if (shared_gate_proj_scale != nullptr) {
-                i4_slab  = reinterpret_cast<const void*>(shared_gate_proj_w);
-                i4_scale = shared_gate_proj_scale;
-                i4_zero  = shared_gate_proj_zero;
-                i4_row   = my_row;
-            } else {
-                w_row = shared_gate_proj_w + static_cast<size_t>(my_row) * hidden;
-            }
-            write_offset = OFF_SGP + my_row;
-        } else if (my_row < 2 * Is_) {
-            const int local = my_row - Is_;
-            if (shared_up_proj_scale != nullptr) {
-                i4_slab  = reinterpret_cast<const void*>(shared_up_proj_w);
-                i4_scale = shared_up_proj_scale;
-                i4_zero  = shared_up_proj_zero;
-                i4_row   = local;
-            } else {
-                w_row = shared_up_proj_w + static_cast<size_t>(local) * hidden;
-            }
-            write_offset = OFF_SUP + local;
-        } else {
-            // Single-row "[1, hidden]" weight; dot it with h_norm and apply
-            // sigmoid() before storing into SG_SCALAR. Always BF16 — the
-            // INT4 bake excludes `shared_expert_gate`.
-            w_row        = shared_expert_gate_w;
-            write_offset = OFF_SG_SCALAR;
-            is_gate_row  = true;
-        }
-
-        float partial = 0.0f;
-        if (i4_scale != nullptr && !fp8_mode) {
-            partial = int4_dq8_matvec_partial(
-                static_cast<const uint8_t*>(i4_slab),
-                i4_scale, i4_zero, h_norm_lds,
-                i4_row, hidden, quant_group_size,
-                tid, block_size);
-        } else if (i4_scale != nullptr) {
-            partial = fp8_matvec_partial(
-                i4_slab,
-                i4_scale,
-                h_norm_lds,
-                i4_row, hidden, quant_group_size,
-                tid, block_size);
-        } else {
-            for (int col = tid; col < hidden; col += block_size) {
-                partial += static_cast<float>(w_row[col]) * h_norm_lds[col];
-            }
-        }
-        shared_scratch[tid] = partial;
-        __syncthreads();
-        for (int s = block_size / 2; s > 0; s >>= 1) {
-            if (tid < s) shared_scratch[tid] += shared_scratch[tid + s];
-            __syncthreads();
-        }
-        if (tid == 0) {
-            float val = shared_scratch[0];
-            if (is_gate_row) {
-                val = 1.0f / (1.0f + expf(-val));
-            }
-            workspace[write_offset] = val;
-        }
-        __syncthreads();
-    }
-
-    // -- Phase E: smid = silu(sgp) * sup  (block-0 only, F32 throughout) ---
-    grid_barrier_reset_counter(barrier_counter, barrier_flag, num_blocks,
-                               &counters[0]);
-    if (blockIdx.x == 0) {
-        for (int i = tid; i < Is_; i += block_size) {
-            const float gp     = workspace[OFF_SGP + i];
-            const float up     = workspace[OFF_SUP + i];
-            const float sigmoid_gp = 1.0f / (1.0f + expf(-gp));
-            const float silu_gp    = gp * sigmoid_gp;
-            workspace[OFF_SHARED_MID + i] = silu_gp * up;
-        }
-        __syncthreads();
-    }
-
-    // -- Phase F: shared_out = sg_scalar * (smid @ down_proj.T) ------------
-    grid_barrier_reset_counter(barrier_counter, barrier_flag, num_blocks,
-                               &counters[0]);
-    {
-        const float sg_scalar = workspace[OFF_SG_SCALAR];
+    const bool shared_direct_mid_scalar =
+        (shared_gate_proj_scale != nullptr) &&
+        (shared_up_proj_scale != nullptr) &&
+        !fp8_mode;
+    if (shared_direct_mid_scalar) {
+        const uint8_t* gate_slab =
+            reinterpret_cast<const uint8_t*>(shared_gate_proj_w);
+        const uint8_t* up_slab =
+            reinterpret_cast<const uint8_t*>(shared_up_proj_w);
+        __shared__ float shared_scratch_up[256];
         for (;;) {
-            __shared__ unsigned int my_row_f_s;
+            __shared__ unsigned int my_row_d_s;
             if (tid == 0) {
-                my_row_f_s = atomicAdd(&counters[0], 1u);
+                my_row_d_s = atomicAdd(&counters[0], 1u);
             }
             __syncthreads();
-            const int my_row = static_cast<int>(my_row_f_s);
-            if (my_row >= hidden) break;
+            const int my_row = static_cast<int>(my_row_d_s);
+            if (my_row > Is_) break;
+
+            if (my_row < Is_) {
+                qwen36_float_pair partials = int4_dq8_pair_matvec_partial_same_row(
+                    gate_slab,
+                    shared_gate_proj_scale, shared_gate_proj_zero,
+                    up_slab,
+                    shared_up_proj_scale, shared_up_proj_zero,
+                    h_norm_lds,
+                    my_row, hidden, quant_group_size,
+                    tid, block_size);
+                shared_scratch[tid] = partials.first;
+                shared_scratch_up[tid] = partials.second;
+                __syncthreads();
+                for (int s = block_size / 2; s > 0; s >>= 1) {
+                    if (tid < s) {
+                        shared_scratch[tid] += shared_scratch[tid + s];
+                        shared_scratch_up[tid] += shared_scratch_up[tid + s];
+                    }
+                    __syncthreads();
+                }
+                if (tid == 0) {
+                    const float gp = shared_scratch[0];
+                    const float up = shared_scratch_up[0];
+                    const float sigmoid_gp = 1.0f / (1.0f + expf(-gp));
+                    workspace[OFF_SHARED_MID + my_row] = (gp * sigmoid_gp) * up;
+                }
+            } else {
+                const T* w_row = shared_expert_gate_w;
+                float partial = 0.0f;
+                for (int col = tid; col < hidden; col += block_size) {
+                    partial += static_cast<float>(w_row[col]) * h_norm_lds[col];
+                }
+                shared_scratch[tid] = partial;
+                __syncthreads();
+                for (int s = block_size / 2; s > 0; s >>= 1) {
+                    if (tid < s) shared_scratch[tid] += shared_scratch[tid + s];
+                    __syncthreads();
+                }
+                if (tid == 0) {
+                    const float val = shared_scratch[0];
+                    workspace[OFF_SG_SCALAR] = 1.0f / (1.0f + expf(-val));
+                }
+            }
+            __syncthreads();
+        }
+    } else {
+        for (;;) {
+            __shared__ unsigned int my_row_d_s;
+            if (tid == 0) {
+                my_row_d_s = atomicAdd(&counters[0], 1u);
+            }
+            __syncthreads();
+            const int my_row = static_cast<int>(my_row_d_s);
+            if (my_row >= total_rows_d) break;
+
+            const T* w_row = nullptr;
+            const void* i4_slab = nullptr;
+            const hip_bfloat16* i4_scale = nullptr;
+            const hip_bfloat16* i4_zero  = nullptr;
+            int      i4_row = 0;
+            int      write_offset;
+            bool     is_gate_row = false;
+            if (my_row < Is_) {
+                if (shared_gate_proj_scale != nullptr) {
+                    i4_slab  = reinterpret_cast<const void*>(shared_gate_proj_w);
+                    i4_scale = shared_gate_proj_scale;
+                    i4_zero  = shared_gate_proj_zero;
+                    i4_row   = my_row;
+                } else {
+                    w_row = shared_gate_proj_w + static_cast<size_t>(my_row) * hidden;
+                }
+                write_offset = OFF_SGP + my_row;
+            } else if (my_row < 2 * Is_) {
+                const int local = my_row - Is_;
+                if (shared_up_proj_scale != nullptr) {
+                    i4_slab  = reinterpret_cast<const void*>(shared_up_proj_w);
+                    i4_scale = shared_up_proj_scale;
+                    i4_zero  = shared_up_proj_zero;
+                    i4_row   = local;
+                } else {
+                    w_row = shared_up_proj_w + static_cast<size_t>(local) * hidden;
+                }
+                write_offset = OFF_SUP + local;
+            } else {
+                // Single-row "[1, hidden]" weight; dot it with h_norm and apply
+                // sigmoid() before storing into SG_SCALAR. Always BF16 — the
+                // INT4 bake excludes `shared_expert_gate`.
+                w_row        = shared_expert_gate_w;
+                write_offset = OFF_SG_SCALAR;
+                is_gate_row  = true;
+            }
 
             float partial = 0.0f;
-            if (shared_down_proj_scale != nullptr && !fp8_mode) {
+            if (i4_scale != nullptr && !fp8_mode) {
                 partial = int4_dq8_matvec_partial(
-                    reinterpret_cast<const uint8_t*>(shared_down_proj_w),
-                    static_cast<const hip_bfloat16*>(shared_down_proj_scale),
-                    static_cast<const hip_bfloat16*>(shared_down_proj_zero),
-                    workspace + OFF_SHARED_MID,
-                    my_row, Is_, quant_group_size,
+                    static_cast<const uint8_t*>(i4_slab),
+                    i4_scale, i4_zero, h_norm_lds,
+                    i4_row, hidden, quant_group_size,
                     tid, block_size);
-            } else if (shared_down_proj_scale != nullptr) {
+            } else if (i4_scale != nullptr) {
                 partial = fp8_matvec_partial(
-                    reinterpret_cast<const void*>(shared_down_proj_w),
-                    static_cast<const hip_bfloat16*>(shared_down_proj_scale),
-                    workspace + OFF_SHARED_MID,
-                    my_row, Is_, quant_group_size,
+                    i4_slab,
+                    i4_scale,
+                    h_norm_lds,
+                    i4_row, hidden, quant_group_size,
                     tid, block_size);
             } else {
-                const T* w_row =
-                    shared_down_proj_w + static_cast<size_t>(my_row) * Is_;
-                for (int col = tid; col < Is_; col += block_size) {
-                    partial += static_cast<float>(w_row[col])
-                               * workspace[OFF_SHARED_MID + col];
+                for (int col = tid; col < hidden; col += block_size) {
+                    partial += static_cast<float>(w_row[col]) * h_norm_lds[col];
                 }
             }
             shared_scratch[tid] = partial;
@@ -483,13 +475,137 @@ __device__ inline void qwen36_moe_ffn_step_device(
                 __syncthreads();
             }
             if (tid == 0) {
-                const float val = bf16_round_rne_f32(sg_scalar * shared_scratch[0]);
-                workspace[OFF_SHARED_OUT + my_row] = val;
-                if (stage == 2) {
-                    output[my_row] = static_cast<T>(val);
+                float val = shared_scratch[0];
+                if (is_gate_row) {
+                    val = 1.0f / (1.0f + expf(-val));
                 }
+                workspace[write_offset] = val;
             }
             __syncthreads();
+        }
+    }
+
+    if (shared_direct_mid_scalar) {
+        grid_barrier_reset_counter(barrier_counter, barrier_flag, num_blocks,
+                                   &counters[0]);
+    } else {
+        // -- Phase E: smid = silu(sgp) * sup  (block-0 only, F32 throughout) ---
+        grid_barrier_reset_counter(barrier_counter, barrier_flag, num_blocks,
+                                   &counters[0]);
+        if (blockIdx.x == 0) {
+            for (int i = tid; i < Is_; i += block_size) {
+                const float gp     = workspace[OFF_SGP + i];
+                const float up     = workspace[OFF_SUP + i];
+                const float sigmoid_gp = 1.0f / (1.0f + expf(-gp));
+                const float silu_gp    = gp * sigmoid_gp;
+                workspace[OFF_SHARED_MID + i] = silu_gp * up;
+            }
+            __syncthreads();
+        }
+
+        // -- Phase F: shared_out = sg_scalar * (smid @ down_proj.T) ------------
+        grid_barrier_reset_counter(barrier_counter, barrier_flag, num_blocks,
+                                   &counters[0]);
+    }
+
+    {
+        const float sg_scalar = workspace[OFF_SG_SCALAR];
+        bool wmma_handled_f = false;
+#ifdef SUPERSONIC_QWEN36_HAS_WMMA_BF16
+        if constexpr (USE_WMMA) {
+            if (shared_down_proj_scale != nullptr && !fp8_mode) {
+                const int gsc_f = Is_ / quant_group_size;
+                const int wave_id = tid >> 5;
+                const int lane = tid & 31;
+                const int lane_row = lane & 15;
+                const int lane_half = lane >> 4;
+                const uint8_t* packed =
+                    reinterpret_cast<const uint8_t*>(shared_down_proj_w);
+                const float* mid = workspace + OFF_SHARED_MID;
+                for (;;) {
+                    __shared__ unsigned int row_base_f_s;
+                    if (tid == 0) {
+                        row_base_f_s = atomicAdd(&counters[0], 128u);
+                    }
+                    __syncthreads();
+                    const int row_base = static_cast<int>(row_base_f_s);
+                    if (row_base >= hidden) break;
+
+                    const int rhs_row_idx = row_base + wave_id * 16 + lane_row;
+                    const bool rhs_in_range = rhs_row_idx < hidden;
+                    const uint8_t* slab_row = rhs_in_range
+                        ? packed + static_cast<size_t>(rhs_row_idx) * (Is_ / 2)
+                        : nullptr;
+
+                    qwen36_float8 acc = wmma_int4_matvec_partial_16rows(
+                        slab_row,
+                        static_cast<const hip_bfloat16*>(shared_down_proj_scale),
+                        static_cast<const hip_bfloat16*>(shared_down_proj_zero),
+                        rhs_row_idx, rhs_in_range,
+                        mid, Is_, gsc_f, quant_group_size, lane_row);
+
+                    if (lane_half == 0 && rhs_in_range) {
+                        const float val = bf16_round_rne_f32(sg_scalar * acc[0]);
+                        workspace[OFF_SHARED_OUT + rhs_row_idx] = val;
+                        if (stage == 2) {
+                            output[rhs_row_idx] = static_cast<T>(val);
+                        }
+                    }
+                    __syncthreads();
+                }
+                wmma_handled_f = true;
+            }
+        }
+#endif
+        if (!wmma_handled_f) {
+            for (;;) {
+                __shared__ unsigned int my_row_f_s;
+                if (tid == 0) {
+                    my_row_f_s = atomicAdd(&counters[0], 1u);
+                }
+                __syncthreads();
+                const int my_row = static_cast<int>(my_row_f_s);
+                if (my_row >= hidden) break;
+
+                float partial = 0.0f;
+                if (shared_down_proj_scale != nullptr && !fp8_mode) {
+                    partial = int4_dq8_matvec_partial(
+                        reinterpret_cast<const uint8_t*>(shared_down_proj_w),
+                        static_cast<const hip_bfloat16*>(shared_down_proj_scale),
+                        static_cast<const hip_bfloat16*>(shared_down_proj_zero),
+                        workspace + OFF_SHARED_MID,
+                        my_row, Is_, quant_group_size,
+                        tid, block_size);
+                } else if (shared_down_proj_scale != nullptr) {
+                    partial = fp8_matvec_partial(
+                        reinterpret_cast<const void*>(shared_down_proj_w),
+                        static_cast<const hip_bfloat16*>(shared_down_proj_scale),
+                        workspace + OFF_SHARED_MID,
+                        my_row, Is_, quant_group_size,
+                        tid, block_size);
+                } else {
+                    const T* w_row =
+                        shared_down_proj_w + static_cast<size_t>(my_row) * Is_;
+                    for (int col = tid; col < Is_; col += block_size) {
+                        partial += static_cast<float>(w_row[col])
+                                   * workspace[OFF_SHARED_MID + col];
+                    }
+                }
+                shared_scratch[tid] = partial;
+                __syncthreads();
+                for (int s = block_size / 2; s > 0; s >>= 1) {
+                    if (tid < s) shared_scratch[tid] += shared_scratch[tid + s];
+                    __syncthreads();
+                }
+                if (tid == 0) {
+                    const float val = bf16_round_rne_f32(sg_scalar * shared_scratch[0]);
+                    workspace[OFF_SHARED_OUT + my_row] = val;
+                    if (stage == 2) {
+                        output[my_row] = static_cast<T>(val);
+                    }
+                }
+                __syncthreads();
+            }
         }
     }
 
@@ -529,6 +645,17 @@ __device__ inline void qwen36_moe_ffn_step_device(
     // group reads its counter.
     grid_barrier_reset_counter(barrier_counter, barrier_flag, num_blocks,
                                &counters[0]);
+
+    bool direct_mid_wmma = false;
+#ifdef SUPERSONIC_QWEN36_HAS_WMMA_BF16
+    if constexpr (USE_WMMA) {
+        // Production INT4 stages can write EXPERT_MID directly from paired
+        // gate/up WMMA tiles. Stage 3 keeps the legacy path because it
+        // profiles only group 0 and all blocks must agree on barrier count.
+        direct_mid_wmma =
+            (stage > 3) && (gate_up_proj_scale != nullptr) && !fp8_mode;
+    }
+#endif
 
     // Each block reads its own group's expert index. All blocks within a
     // group compute the same `e`; different groups compute different `e`.
@@ -573,33 +700,77 @@ __device__ inline void qwen36_moe_ffn_step_device(
                 const int lane = tid & 31;
                 const int lane_row = lane & 15;
                 const int lane_half = lane >> 4;
-                for (;;) {
-                    __shared__ unsigned int row_base_s;
-                    if (tid == 0) {
-                        row_base_s = atomicAdd(&counters[group_id], 128u);
+                if (direct_mid_wmma) {
+                    const int mid_off = OFF_EXPERT_MID + group_id * I_;
+                    for (;;) {
+                        __shared__ unsigned int row_base_s;
+                        if (tid == 0) {
+                            row_base_s = atomicAdd(&counters[group_id], 128u);
+                        }
+                        __syncthreads();
+                        const int row_base_block = static_cast<int>(row_base_s);
+                        if (row_base_block >= I_) break;
+
+                        const int mid_row =
+                            row_base_block + wave_id * 16 + lane_row;
+                        const bool row_in_range = mid_row < I_;
+                        const int gate_row_idx = mid_row;
+                        const int up_row_idx = I_ + mid_row;
+                        const uint8_t* gate_row = row_in_range
+                            ? gu_slab_packed +
+                              static_cast<size_t>(gate_row_idx) * (hidden / 2)
+                            : nullptr;
+                        const uint8_t* up_row = row_in_range
+                            ? gu_slab_packed +
+                              static_cast<size_t>(up_row_idx) * (hidden / 2)
+                            : nullptr;
+
+                        qwen36_float8_pair gate_up_acc =
+                            wmma_int4_pair_matvec_partial_16rows(
+                                gate_row, gate_row_idx,
+                                up_row, up_row_idx,
+                                gu_slab_scale, gu_slab_zero,
+                                row_in_range,
+                                h_norm_lds, hidden,
+                                gsc_gu, quant_group_size, lane_row);
+
+                        if (lane_half == 0 && row_in_range) {
+                            const float gp = gate_up_acc.first[0];
+                            const float up = gate_up_acc.second[0];
+                            const float sigmoid_gp = 1.0f / (1.0f + expf(-gp));
+                            workspace[mid_off + mid_row] = (gp * sigmoid_gp) * up;
+                        }
+                        __syncthreads();
                     }
-                    __syncthreads();
-                    const int row_base_block = static_cast<int>(row_base_s);
-                    if (row_base_block >= two_I) break;
+                } else {
+                    for (;;) {
+                        __shared__ unsigned int row_base_s;
+                        if (tid == 0) {
+                            row_base_s = atomicAdd(&counters[group_id], 128u);
+                        }
+                        __syncthreads();
+                        const int row_base_block = static_cast<int>(row_base_s);
+                        if (row_base_block >= two_I) break;
 
-                    const int rhs_row_idx =
-                        row_base_block + wave_id * 16 + lane_row;
-                    const bool rhs_in_range = rhs_row_idx < two_I;
-                    const uint8_t* slab_row = rhs_in_range
-                        ? gu_slab_packed +
-                          static_cast<size_t>(rhs_row_idx) * (hidden / 2)
-                        : nullptr;
+                        const int rhs_row_idx =
+                            row_base_block + wave_id * 16 + lane_row;
+                        const bool rhs_in_range = rhs_row_idx < two_I;
+                        const uint8_t* slab_row = rhs_in_range
+                            ? gu_slab_packed +
+                              static_cast<size_t>(rhs_row_idx) * (hidden / 2)
+                            : nullptr;
 
-                    qwen36_float8 acc = wmma_int4_matvec_partial_16rows(
-                        slab_row, gu_slab_scale, gu_slab_zero,
-                        rhs_row_idx, rhs_in_range,
-                        h_norm_lds, hidden,
-                        gsc_gu, quant_group_size, lane_row);
+                        qwen36_float8 acc = wmma_int4_matvec_partial_16rows(
+                            slab_row, gu_slab_scale, gu_slab_zero,
+                            rhs_row_idx, rhs_in_range,
+                            h_norm_lds, hidden,
+                            gsc_gu, quant_group_size, lane_row);
 
-                    if (lane_half == 0 && rhs_in_range) {
-                        workspace[gu_off + rhs_row_idx] = acc[0];
+                        if (lane_half == 0 && rhs_in_range) {
+                            workspace[gu_off + rhs_row_idx] = acc[0];
+                        }
+                        __syncthreads();
                     }
-                    __syncthreads();
                 }
                 wmma_handled_g = true;
             }
@@ -650,28 +821,33 @@ __device__ inline void qwen36_moe_ffn_step_device(
         }
     }
 
-    // Barrier 1: publish EXPERT_GU writes (all groups) before Phase H reads.
-    grid_barrier(barrier_counter, barrier_flag, num_blocks);
+    if (direct_mid_wmma) {
+        // Direct paired Phase G wrote EXPERT_MID; publish it before Phase I.
+        grid_barrier(barrier_counter, barrier_flag, num_blocks);
+    } else {
+        // Barrier 1: publish EXPERT_GU writes (all groups) before Phase H reads.
+        grid_barrier(barrier_counter, barrier_flag, num_blocks);
 
-    // Phase H: mid = silu(gu[:I]) * gu[I:], one block per active group.
-    {
-        const int sub_id = blockIdx.x / K_;
-        if (sub_id == 0 && group_active) {
-            const int gu_off  = OFF_EXPERT_GU + group_id * two_I;
-            const int mid_off = OFF_EXPERT_MID + group_id * I_;
-            for (int i = tid; i < I_; i += block_size) {
-                const float gp = workspace[gu_off + i];
-                const float up = workspace[gu_off + I_ + i];
-                const float sigmoid_gp = 1.0f / (1.0f + expf(-gp));
-                const float silu_gp    = gp * sigmoid_gp;
-                workspace[mid_off + i] = silu_gp * up;
+        // Phase H: mid = silu(gu[:I]) * gu[I:], one block per active group.
+        {
+            const int sub_id = blockIdx.x / K_;
+            if (sub_id == 0 && group_active) {
+                const int gu_off  = OFF_EXPERT_GU + group_id * two_I;
+                const int mid_off = OFF_EXPERT_MID + group_id * I_;
+                for (int i = tid; i < I_; i += block_size) {
+                    const float gp = workspace[gu_off + i];
+                    const float up = workspace[gu_off + I_ + i];
+                    const float sigmoid_gp = 1.0f / (1.0f + expf(-gp));
+                    const float silu_gp    = gp * sigmoid_gp;
+                    workspace[mid_off + i] = silu_gp * up;
+                }
+                __syncthreads();
             }
-            __syncthreads();
         }
-    }
 
-    // Barrier 2: publish EXPERT_MID writes (all groups) before Phase I reads.
-    grid_barrier(barrier_counter, barrier_flag, num_blocks);
+        // Barrier 2: publish EXPERT_MID writes (all groups) before Phase I reads.
+        grid_barrier(barrier_counter, barrier_flag, num_blocks);
+    }
 
     // Phase I: matvec down_proj_w[e].T @ mid → EXPERT_STACK[g*hidden..].
     if (group_active) {
@@ -796,66 +972,38 @@ __device__ inline void qwen36_moe_ffn_step_device(
         return;
     }
 
-    // -- Phase J: moe_out = sum_j (topk_w[j] * expert_stack[j])  -----------
+    // -- Phase J/K: weighted MoE sum + final residual add ------------------
     // Single weighted reduction across `k` experts. F32 accumulation,
     // BF16-round once at the store. Matches
     // `(topk_w_renorm.unsqueeze(-1) * expert_stack).sum(0).to(dtype)`.
-    grid_barrier_reset_counter(barrier_counter, barrier_flag, num_blocks,
-                               &counters[0]);
-    {
-        for (;;) {
-            __shared__ unsigned int my_row_j_s;
-            if (tid == 0) {
-                my_row_j_s = atomicAdd(&counters[0], 1u);
-            }
-            __syncthreads();
-            const int my_row = static_cast<int>(my_row_j_s);
-            if (my_row >= hidden) break;
-
-            // Sequential per-row sum on a single thread (k=8).
-            if (tid == 0) {
-                float acc = 0.0f;
-                for (int j = 0; j < K_; j++) {
-                    const float w = workspace[OFF_TOPK_VAL + j];
-                    const float v = workspace[OFF_EXPERT_STACK + j * hidden + my_row];
-                    acc += w * v;
-                }
-                const float val = bf16_round_rne_f32(acc);
-                workspace[OFF_MOE_OUT + my_row] = val;
-                if (stage == 4) {
-                    output[my_row] = static_cast<T>(val);
-                }
-            }
-            __syncthreads();
+    //
+    // This phase is row-independent. The original work-stealing loop used
+    // one thread per block to process each hidden row, which paid thousands
+    // of block barriers per token on 35B-A3B. A grid-stride loop keeps the
+    // same arithmetic order per row while letting all lanes cover the 2048
+    // rows directly.
+    grid_barrier(barrier_counter, barrier_flag, num_blocks);
+    for (int row = blockIdx.x * block_size + tid;
+         row < hidden;
+         row += num_blocks * block_size) {
+        float acc = 0.0f;
+        for (int j = 0; j < K_; j++) {
+            const float w = workspace[OFF_TOPK_VAL + j];
+            const float v = workspace[OFF_EXPERT_STACK + j * hidden + row];
+            acc += w * v;
         }
-    }
-
-    if (stage < 5) {
-        return;
-    }
-
-    // -- Phase K: residual add — output_hidden = input + moe + shared  -----
-    // F32 sum with one BF16 round at the store, matching the oracle's
-    // `(input_hidden.f32 + moe_out.f32 + shared_out.f32).to(dtype)`.
-    grid_barrier_reset_counter(barrier_counter, barrier_flag, num_blocks,
-                               &counters[0]);
-    for (;;) {
-        __shared__ unsigned int my_row_k_s;
-        if (tid == 0) {
-            my_row_k_s = atomicAdd(&counters[0], 1u);
+        const float val = bf16_round_rne_f32(acc);
+        if (stage == 4) {
+            workspace[OFF_MOE_OUT + row] = val;
+            output[row] = static_cast<T>(val);
+        } else {
+            // Full decode consumes moe_out immediately for the residual add,
+            // so avoid a global store/read pair and the extra grid barrier.
+            const float in_f   = static_cast<float>(input_hidden[row]);
+            const float shr_f  = workspace[OFF_SHARED_OUT + row];
+            const float result = bf16_round_rne_f32(in_f + val + shr_f);
+            output[row] = static_cast<T>(result);
         }
-        __syncthreads();
-        const int my_row = static_cast<int>(my_row_k_s);
-        if (my_row >= hidden) break;
-
-        if (tid == 0) {
-            const float in_f   = static_cast<float>(input_hidden[my_row]);
-            const float moe_f  = workspace[OFF_MOE_OUT + my_row];
-            const float shr_f  = workspace[OFF_SHARED_OUT + my_row];
-            const float val    = bf16_round_rne_f32(in_f + moe_f + shr_f);
-            output[my_row] = static_cast<T>(val);
-        }
-        __syncthreads();
     }
 }
 

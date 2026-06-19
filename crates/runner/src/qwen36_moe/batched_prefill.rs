@@ -59,8 +59,9 @@ use crate::qwen36_moe_cli::engine::current_position;
 use crate::qwen36_moe_cli::host::lookup_embed_row;
 use crate::qwen36_moe_cli::vmm_config::MoeRuntimeConfig;
 use crate::qwen36_moe_decode::{
-    ffn_output_elems, ffn_workspace_floats, full_attn_output_elems, full_attn_workspace_floats,
-    linear_attn_workspace_floats, reset_sync_buf,
+    ffn_output_elems, ffn_workspace_floats, full_attn_output_elems,
+    full_attn_score_workspace_floats, full_attn_workspace_floats, linear_attn_workspace_floats,
+    reset_sync_buf,
 };
 use crate::qwen36_moe_persistent_decode::PersistentScratch;
 use crate::qwen36_moe_residency::MoeExpertResidencyManager;
@@ -623,6 +624,7 @@ fn process_chunk_batched(
                 is_gen_step: false,
                 emit_stage_timings,
                 fold: None,
+                download_final_hidden: true,
             })?;
             let t_chain_step = t1.elapsed();
             loop_state.position += 1;
@@ -688,8 +690,8 @@ fn process_chunk_batched(
 
     // Per-token fallback workspaces. Always allocated — used either by
     // linear-attn (always) or by per-token FFN (when grouped FFN is off).
-    let attn_ws_floats = full_attn_workspace_floats(geom).max(linear_attn_workspace_floats(geom))
-        + geom.num_attention_heads as usize * pertoken_attn_extra_kv(layers);
+    let attn_ws_floats = (full_attn_workspace_floats(geom) + pertoken_attn_extra_kv(geom, layers))
+        .max(linear_attn_workspace_floats(geom));
     let attn_out_elems = full_attn_output_elems(geom);
     let mut attn_output = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[attn_out_elems])
         .context("alloc attn_output")?;
@@ -862,8 +864,8 @@ fn stage_chunk_tokens_on_gpu(
 /// Per-token attn workspace's `attn_extra` term: extra F32 floats the
 /// per-token full-attn kernel needs when KV cache is enabled (one row of
 /// scores per Q head per cache slot).
-fn pertoken_attn_extra_kv(layers: &[LayerBuffers]) -> usize {
-    layers
+fn pertoken_attn_extra_kv(geom: &MultiLayerGeom, layers: &[LayerBuffers]) -> usize {
+    let max_kv_t = layers
         .iter()
         .filter_map(|l| match &l.attn {
             AttnLayerBuffers::Full {
@@ -872,7 +874,8 @@ fn pertoken_attn_extra_kv(layers: &[LayerBuffers]) -> usize {
             _ => None,
         })
         .max()
-        .unwrap_or(0)
+        .unwrap_or(0);
+    full_attn_score_workspace_floats(geom, max_kv_t)
 }
 
 /// Per-token chunked fallback. Used when `supports_batched_path` returns
@@ -957,6 +960,7 @@ fn run_pertoken_chunked(
                 is_gen_step: false,
                 emit_stage_timings,
                 fold: None,
+                download_final_hidden: true,
             })?;
             let t_chain_step = t1.elapsed();
             loop_state.position += 1;

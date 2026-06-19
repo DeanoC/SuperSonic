@@ -83,19 +83,39 @@ __device__ inline void reset_counters_16(
     unsigned int* __restrict__ barrier_flag,
     int                        num_blocks
 ) {
-    // Sync: every block has exited the previous phase.
-    grid_barrier(barrier_counter, barrier_flag, num_blocks);
-    if (blockIdx.x == 0 && threadIdx.x < 16) {
-        counters[threadIdx.x] = 0u;
+    __syncthreads();
+    __threadfence();
+    if (threadIdx.x == 0) {
+        unsigned int phase = __atomic_load_n(barrier_flag, __ATOMIC_RELAXED);
+        unsigned int old = atomicAdd(barrier_counter, 1u);
+        if (old == static_cast<unsigned int>(num_blocks) - 1) {
+            for (int i = 0; i < 16; ++i) {
+                __atomic_store_n(counters + i, 0u, __ATOMIC_RELAXED);
+            }
+            __atomic_store_n(barrier_counter, 0u, __ATOMIC_RELAXED);
+            __atomic_store_n(barrier_flag, phase + 1, __ATOMIC_RELEASE);
+        } else {
+            while (__atomic_load_n(barrier_flag, __ATOMIC_ACQUIRE) == phase) {}
+        }
     }
-    // Publish: counter resets visible before the next phase reads them.
-    grid_barrier(barrier_counter, barrier_flag, num_blocks);
+    __syncthreads();
 }
 
 enum PersistentDecodeMode {
     PERSISTENT_MODE_FULL = 0,
     PERSISTENT_MODE_ROUTER_ONLY = 1,
     PERSISTENT_MODE_FFN_ONLY = 2,
+    PERSISTENT_MODE_ATTN_ONLY = 3,
+    PERSISTENT_MODE_FFN_STAGE1 = 4,
+    PERSISTENT_MODE_FFN_STAGE2 = 5,
+    PERSISTENT_MODE_FFN_STAGE3 = 6,
+    PERSISTENT_MODE_FFN_STAGE4 = 7,
+    PERSISTENT_MODE_FFN_STAGE5 = 8,
+    PERSISTENT_MODE_LINEAR_STAGE1 = 9,
+    PERSISTENT_MODE_LINEAR_STAGE2 = 10,
+    PERSISTENT_MODE_LINEAR_STAGE3 = 11,
+    PERSISTENT_MODE_LINEAR_STAGE4 = 12,
+    PERSISTENT_MODE_LINEAR_STAGE5 = 13,
 };
 
 // Persistent decode kernel template. Instantiated by the bridge for
@@ -158,6 +178,7 @@ __global__ void qwen36_moe_persistent_decode_kernel(
     const T* __restrict__                final_norm_w,           // [hidden] BF16, nullable
     const T* __restrict__                lm_head_w,              // [vocab, hidden] BF16, nullable
     T*       __restrict__                logits_out,             // [vocab] BF16, nullable
+    unsigned int* __restrict__           top1_out,               // [1] U32, nullable
     unsigned int* __restrict__           counters,
     unsigned int* __restrict__           barrier_counter,
     unsigned int* __restrict__           barrier_flag) {
@@ -186,14 +207,19 @@ __global__ void qwen36_moe_persistent_decode_kernel(
         grid_barrier(barrier_counter, barrier_flag, num_blocks);
     }
 
-    if (mode == PERSISTENT_MODE_FFN_ONLY) {
+    if (mode == PERSISTENT_MODE_FFN_ONLY ||
+        (mode >= PERSISTENT_MODE_FFN_STAGE1 &&
+         mode <= PERSISTENT_MODE_FFN_STAGE5)) {
         const DecodeLayerDesc& d = layers[start_layer];
         const Int4ScaleDesc* i4 =
             (int4_scales != nullptr) ? &int4_scales[start_layer] : nullptr;
         const int i4_gs = (i4 != nullptr) ? i4->group_size : 0;
+        const int ffn_stage = (mode == PERSISTENT_MODE_FFN_ONLY)
+            ? 5
+            : (mode - PERSISTENT_MODE_FFN_STAGE1 + 1);
 
         qwen36_moe_ffn_step_device<T, USE_WMMA>(
-            /*stage*/ 5,
+            ffn_stage,
             hidden, num_experts,
             moe_intermediate, shared_intermediate, top_k,
             rms_norm_eps,
@@ -221,6 +247,47 @@ __global__ void qwen36_moe_persistent_decode_kernel(
             ffn_topk_idx_scratch,
             workspace,
             counters, barrier_counter, barrier_flag);
+        return;
+    }
+
+    if (mode >= PERSISTENT_MODE_LINEAR_STAGE1 &&
+        mode <= PERSISTENT_MODE_LINEAR_STAGE5) {
+        const DecodeLayerDesc& d = layers[start_layer];
+        const Int4ScaleDesc* i4 =
+            (int4_scales != nullptr) ? &int4_scales[start_layer] : nullptr;
+        const int i4_gs = (i4 != nullptr) ? i4->group_size : 0;
+        const int linear_stage = mode - PERSISTENT_MODE_LINEAR_STAGE1 + 1;
+
+        qwen36_moe_linear_step_device<T, USE_WMMA>(
+            linear_stage,
+            hidden, num_k_heads, num_v_heads,
+            head_k_dim, head_v_dim, conv_kernel_dim, rms_norm_eps,
+            hidden_ping,
+            static_cast<const T*>(d.input_norm_w),
+            static_cast<const T*>(d.linear_in_proj_qkv_w),
+            static_cast<const T*>(d.linear_in_proj_z_w),
+            static_cast<const T*>(d.linear_in_proj_a_w),
+            static_cast<const T*>(d.linear_in_proj_b_w),
+            static_cast<const T*>(d.linear_conv1d_w),
+            /*conv1d_bias*/ static_cast<const T*>(nullptr),
+            static_cast<const T*>(d.linear_dt_bias),
+            static_cast<const T*>(d.linear_a_log_exp),
+            static_cast<const T*>(d.linear_norm_w),
+            static_cast<const T*>(d.linear_out_proj_w),
+            static_cast<T*>(d.linear_conv_state),
+            static_cast<float*>(d.linear_recurrent_state),
+            i4_gs,
+            i4 ? static_cast<const hip_bfloat16*>(i4->linear_in_proj_qkv_scale) : nullptr,
+            i4 ? static_cast<const hip_bfloat16*>(i4->linear_in_proj_qkv_zero)  : nullptr,
+            i4 ? static_cast<const hip_bfloat16*>(i4->linear_in_proj_z_scale)   : nullptr,
+            i4 ? static_cast<const hip_bfloat16*>(i4->linear_in_proj_z_zero)    : nullptr,
+            i4 ? static_cast<const hip_bfloat16*>(i4->linear_out_proj_scale)    : nullptr,
+            i4 ? static_cast<const hip_bfloat16*>(i4->linear_out_proj_zero)     : nullptr,
+            hidden_pong,
+            workspace,
+            counters, barrier_counter, barrier_flag,
+            /*suppress_stage_publish*/ true,
+            /*mutate_state*/ linear_stage == 5);
         return;
     }
 
@@ -301,6 +368,13 @@ __global__ void qwen36_moe_persistent_decode_kernel(
                 counters, barrier_counter, barrier_flag);
         }
 
+        if (mode == PERSISTENT_MODE_ATTN_ONLY) {
+            // Profiling-only split: leave the post-attention residual in
+            // hidden_pong so a following FfnOnly launch can complete the
+            // same layer without rerunning attention.
+            return;
+        }
+
         // Reset counters[0..16] before FFN. Attn/linear only used
         // counters[0]; FFN needs counters[0..2*top_k] all clean.
         reset_counters_16(counters, barrier_counter, barrier_flag, num_blocks);
@@ -371,8 +445,8 @@ __global__ void qwen36_moe_persistent_decode_kernel(
     // Phase 3f: folded final RMSnorm + lm_head GEMV. Skipped when any
     // of the three buffers is null (the engine sets them all null on
     // prefill steps to short-circuit the lm_head work).
-    if (final_norm_w != nullptr && lm_head_w != nullptr && logits_out != nullptr
-        && vocab > 0) {
+    if (final_norm_w != nullptr && lm_head_w != nullptr &&
+        (logits_out != nullptr || top1_out != nullptr) && vocab > 0) {
         // counters[0..16] are dirty from the last layer's ffn phase;
         // reset_counters_16 syncs across blocks AND publishes the layer
         // loop's writes to in_buf (= hidden_ping after the per-layer
@@ -382,7 +456,8 @@ __global__ void qwen36_moe_persistent_decode_kernel(
         qwen36_moe_lm_head_device<T, USE_WMMA>(
             hidden, vocab, rms_norm_eps,
             in_buf, final_norm_w, lm_head_w, logits_out,
-            counters);
+            top1_out, workspace,
+            counters, barrier_counter, barrier_flag, num_blocks);
     }
 }
 

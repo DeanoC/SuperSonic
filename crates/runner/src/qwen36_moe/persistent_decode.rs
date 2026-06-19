@@ -49,12 +49,14 @@ pub const CACHE_POS_INHERIT: i32 = Qwen36MoeAttnStepParams::CACHE_POS_INHERIT;
 pub struct LmHeadFold<'a> {
     pub final_norm_w: &'a GpuBuffer,
     pub lm_head_w: &'a GpuBuffer,
-    pub logits_out: &'a mut GpuBuffer,
+    pub logits_out: Option<&'a mut GpuBuffer>,
+    pub top1_out: Option<&'a mut GpuBuffer>,
     pub vocab: i32,
 }
 
 use crate::qwen36_moe_decode::{
-    ffn_workspace_floats, full_attn_workspace_floats, linear_attn_workspace_floats,
+    ffn_workspace_floats, full_attn_score_workspace_floats, full_attn_workspace_floats,
+    linear_attn_workspace_floats, reset_sync_buf,
 };
 use crate::qwen36_moe_logits::bf16_bytes_to_f32;
 use crate::qwen36_moe_types::{
@@ -73,6 +75,7 @@ use crate::qwen36_moe_types::{
 pub struct PersistentScratch {
     pub geom: Qwen36MoePersistentGeom,
     pub num_layers: usize,
+    pub layer_is_full_attention: Vec<bool>,
     /// `[num_layers]` descriptors uploaded as opaque U8 bytes.
     pub layer_descs_dev: GpuBuffer,
     /// `[num_layers]` INT4 sidecar descriptors. `None` for BF16 bakes.
@@ -106,6 +109,7 @@ impl PersistentScratch {
     /// need `&mut layers`.
     pub fn new(ordinal: usize, geom: &MultiLayerGeom, layers: &mut [LayerBuffers]) -> Result<Self> {
         let num_layers = layers.len();
+        let layer_is_full_attention = layers.iter().map(LayerBuffers::is_full_attn).collect();
         let descs = build_layer_descs(layers);
         let layer_descs_dev =
             upload_descs(ordinal, &descs).context("upload layer descriptor array")?;
@@ -126,9 +130,10 @@ impl PersistentScratch {
         let hidden_pong = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[hidden])
             .context("alloc persistent hidden_pong")?;
 
-        // Kv-cache adds OFF_SCORES = [num_attention_heads * kv_max_t] F32
-        // when any full-attn layer carries a cache. Mirror the chained
-        // driver's `attn_extra` calc.
+        // KV-cache adds per-head score/partial workspace when any
+        // full-attn layer carries a cache. Mirror the chained driver's
+        // score-stride calc so the HIP tiled-attention path can use
+        // tile-local online-softmax partials.
         let max_kv_t = layers
             .iter()
             .filter_map(|l| match &l.attn {
@@ -139,15 +144,11 @@ impl PersistentScratch {
             })
             .max()
             .unwrap_or(0);
-        let attn_extra = if max_kv_t > 0 {
-            geom.num_attention_heads as usize * max_kv_t
-        } else {
-            0
-        };
-        let ws_floats = full_attn_workspace_floats(geom)
+        let full_attn_ws =
+            full_attn_workspace_floats(geom) + full_attn_score_workspace_floats(geom, max_kv_t);
+        let ws_floats = full_attn_ws
             .max(linear_attn_workspace_floats(geom))
-            .max(ffn_workspace_floats(geom))
-            + attn_extra;
+            .max(ffn_workspace_floats(geom));
         let workspace = GpuBuffer::zeros(ordinal, ScalarType::F32, &[ws_floats])
             .context("alloc persistent workspace")?;
         let ffn_topk_idx_scratch =
@@ -178,6 +179,7 @@ impl PersistentScratch {
         Ok(Self {
             geom: pgeom,
             num_layers,
+            layer_is_full_attention,
             layer_descs_dev,
             int4_scales_dev,
             kv_fp8_descs_dev,
@@ -190,7 +192,8 @@ impl PersistentScratch {
     }
 
     /// One decode step. H2D the freshly-embedded `initial_hidden` into
-    /// `hidden_ping`, run the megakernel, D2H the final hidden back.
+    /// `hidden_ping`, run the megakernel, and optionally D2H the final
+    /// hidden back.
     /// Mutates the linear-attn state in place (via the pointers cached
     /// in `layer_descs_dev`) — same semantics as
     /// `run_chained_decode_fast`.
@@ -210,6 +213,7 @@ impl PersistentScratch {
         // prefill and MTP draft layers use that shape.
         cache_pos: i32,
         lm_head_fold: Option<LmHeadFold<'_>>,
+        download_final_hidden: bool,
     ) -> Result<DecodeOutputs> {
         let hidden_bytes = self.geom.hidden as usize * 2;
         if initial_hidden_bytes.len() != hidden_bytes {
@@ -231,6 +235,7 @@ impl PersistentScratch {
             final_norm_w: f.final_norm_w,
             lm_head_w: f.lm_head_w,
             logits_out: f.logits_out,
+            top1_out: f.top1_out,
             vocab: f.vocab,
         });
 
@@ -256,18 +261,22 @@ impl PersistentScratch {
         .context("persistent_decode_launch")?;
         let elapsed_us = t_launch.elapsed().as_micros() as u64;
 
-        // D2H the final hidden — same as run_chained_decode_fast does at
-        // the end of its chain. The bridge syncs (hipDeviceSynchronize)
-        // before returning, so this measurement covers real GPU compute
-        // time, not host queue time.
-        let mut final_hidden_bytes = vec![0u8; hidden_bytes];
-        copy_d2h(
-            ordinal,
-            final_hidden_bytes.as_mut_ptr() as *mut _,
-            self.hidden_ping.as_ptr(),
-            hidden_bytes,
-        )
-        .context("d2h hidden_ping -> final_hidden_bytes")?;
+        // D2H the final hidden only when a downstream host consumer needs it.
+        // Folded generation can consume logits/token from the same stream and
+        // let that later transfer be the synchronization point.
+        let final_hidden_bytes = if download_final_hidden {
+            let mut bytes = vec![0u8; hidden_bytes];
+            copy_d2h(
+                ordinal,
+                bytes.as_mut_ptr() as *mut _,
+                self.hidden_ping.as_ptr(),
+                hidden_bytes,
+            )
+            .context("d2h hidden_ping -> final_hidden_bytes")?;
+            bytes
+        } else {
+            Vec::new()
+        };
 
         // Stage attribution isn't recoverable inside one launch — we
         // lump the whole wall-clock into `kernel_full_attn_us` so
@@ -545,6 +554,218 @@ impl PersistentScratch {
             sparse_route_d2h_us: route_d2h_us,
             sparse_demand_prefetch_us: demand_us,
             sparse_ffn_launch_us: ffn_launch_us,
+        })
+    }
+
+    /// Profiling-only segmented decode. Splits every layer into attention-only
+    /// and FFN-only persistent entry points, but skips VMM remap and route
+    /// downloads. This is intentionally slower than [`Self::run`]; use it only
+    /// under `SUPERSONIC_QWEN36_SEGMENTED_PROFILE=1` so rocprof can attribute
+    /// the one-launch megakernel's layer halves.
+    pub fn run_segmented_profile(
+        &mut self,
+        ordinal: usize,
+        initial_hidden_bytes: &[u8],
+        position: i32,
+        cache_pos: i32,
+    ) -> Result<DecodeOutputs> {
+        let hidden_bytes = self.geom.hidden as usize * 2;
+        if initial_hidden_bytes.len() != hidden_bytes {
+            return Err(anyhow!(
+                "initial_hidden_bytes len {} != expected {} (hidden*2 BF16 bytes)",
+                initial_hidden_bytes.len(),
+                hidden_bytes,
+            ));
+        }
+        copy_h2d(
+            ordinal,
+            self.hidden_ping.as_mut_ptr(),
+            initial_hidden_bytes.as_ptr() as *const _,
+            hidden_bytes,
+        )
+        .context("h2d initial_hidden -> hidden_ping")?;
+
+        let mut attn_us = 0u64;
+        let mut ffn_us = 0u64;
+        let ffn_stage_profile = std::env::var_os("SUPERSONIC_QWEN36_FFN_STAGE_PROFILE").is_some();
+        let linear_stage_profile =
+            std::env::var_os("SUPERSONIC_QWEN36_LINEAR_STAGE_PROFILE").is_some();
+        for layer_idx in 0..self.num_layers {
+            if linear_stage_profile && !self.layer_is_full_attention[layer_idx] {
+                for stage in 1..=5 {
+                    reset_sync_buf(ordinal, &mut self.sync_buf).with_context(|| {
+                        format!("reset sync_buf (segmented linear stage {stage} layer {layer_idx})")
+                    })?;
+                    let t_attn = std::time::Instant::now();
+                    persistent_decode_launch_range(
+                        ordinal,
+                        ScalarType::BF16,
+                        self.geom,
+                        layer_idx,
+                        layer_idx + 1,
+                        Qwen36MoePersistentMode::LinearStage(stage),
+                        position,
+                        cache_pos,
+                        &self.layer_descs_dev,
+                        self.int4_scales_dev.as_ref(),
+                        self.kv_fp8_descs_dev.as_ref(),
+                        self.num_layers,
+                        &mut self.hidden_ping,
+                        &mut self.hidden_pong,
+                        &mut self.workspace,
+                        &mut self.ffn_topk_idx_scratch,
+                        &mut self.sync_buf,
+                        None,
+                        -1,
+                        None,
+                        1,
+                        None,
+                    )
+                    .map_err(|e: GpuError| anyhow!(e))
+                    .with_context(|| {
+                        format!(
+                            "persistent segmented linear stage {stage} launch (layer {layer_idx})"
+                        )
+                    })?;
+                    attn_us = attn_us.saturating_add(t_attn.elapsed().as_micros() as u64);
+                }
+            } else {
+                reset_sync_buf(ordinal, &mut self.sync_buf).with_context(|| {
+                    format!("reset sync_buf (segmented attention layer {layer_idx})")
+                })?;
+                let t_attn = std::time::Instant::now();
+                persistent_decode_launch_range(
+                    ordinal,
+                    ScalarType::BF16,
+                    self.geom,
+                    layer_idx,
+                    layer_idx + 1,
+                    Qwen36MoePersistentMode::AttnOnly,
+                    position,
+                    cache_pos,
+                    &self.layer_descs_dev,
+                    self.int4_scales_dev.as_ref(),
+                    self.kv_fp8_descs_dev.as_ref(),
+                    self.num_layers,
+                    &mut self.hidden_ping,
+                    &mut self.hidden_pong,
+                    &mut self.workspace,
+                    &mut self.ffn_topk_idx_scratch,
+                    &mut self.sync_buf,
+                    None,
+                    -1,
+                    None,
+                    1,
+                    None,
+                )
+                .map_err(|e: GpuError| anyhow!(e))
+                .with_context(|| {
+                    format!("persistent segmented attention launch (layer {layer_idx})")
+                })?;
+                attn_us = attn_us.saturating_add(t_attn.elapsed().as_micros() as u64);
+            }
+
+            if ffn_stage_profile {
+                // Profiling-only cumulative stages. Each launch recomputes
+                // from post-attention hidden_pong; stage 5 is the final one
+                // and writes the real layer output to hidden_ping.
+                for stage in 1..=5 {
+                    reset_sync_buf(ordinal, &mut self.sync_buf).with_context(|| {
+                        format!("reset sync_buf (segmented ffn stage {stage} layer {layer_idx})")
+                    })?;
+                    let t_ffn = std::time::Instant::now();
+                    persistent_decode_launch_range(
+                        ordinal,
+                        ScalarType::BF16,
+                        self.geom,
+                        layer_idx,
+                        layer_idx + 1,
+                        Qwen36MoePersistentMode::FfnStage(stage),
+                        position,
+                        cache_pos,
+                        &self.layer_descs_dev,
+                        self.int4_scales_dev.as_ref(),
+                        self.kv_fp8_descs_dev.as_ref(),
+                        self.num_layers,
+                        &mut self.hidden_ping,
+                        &mut self.hidden_pong,
+                        &mut self.workspace,
+                        &mut self.ffn_topk_idx_scratch,
+                        &mut self.sync_buf,
+                        None,
+                        -1,
+                        None,
+                        1,
+                        None,
+                    )
+                    .map_err(|e: GpuError| anyhow!(e))
+                    .with_context(|| {
+                        format!("persistent segmented ffn stage {stage} launch (layer {layer_idx})")
+                    })?;
+                    ffn_us = ffn_us.saturating_add(t_ffn.elapsed().as_micros() as u64);
+                }
+            } else {
+                reset_sync_buf(ordinal, &mut self.sync_buf)
+                    .with_context(|| format!("reset sync_buf (segmented ffn layer {layer_idx})"))?;
+                let t_ffn = std::time::Instant::now();
+                persistent_decode_launch_range(
+                    ordinal,
+                    ScalarType::BF16,
+                    self.geom,
+                    layer_idx,
+                    layer_idx + 1,
+                    Qwen36MoePersistentMode::FfnOnly,
+                    position,
+                    cache_pos,
+                    &self.layer_descs_dev,
+                    self.int4_scales_dev.as_ref(),
+                    self.kv_fp8_descs_dev.as_ref(),
+                    self.num_layers,
+                    &mut self.hidden_ping,
+                    &mut self.hidden_pong,
+                    &mut self.workspace,
+                    &mut self.ffn_topk_idx_scratch,
+                    &mut self.sync_buf,
+                    None,
+                    -1,
+                    None,
+                    1,
+                    None,
+                )
+                .map_err(|e: GpuError| anyhow!(e))
+                .with_context(|| format!("persistent segmented ffn launch (layer {layer_idx})"))?;
+                ffn_us = ffn_us.saturating_add(t_ffn.elapsed().as_micros() as u64);
+            }
+        }
+
+        let mut final_hidden_bytes = vec![0u8; hidden_bytes];
+        copy_d2h(
+            ordinal,
+            final_hidden_bytes.as_mut_ptr() as *mut _,
+            self.hidden_ping.as_ptr(),
+            hidden_bytes,
+        )
+        .context("d2h hidden_ping -> final_hidden_bytes")?;
+
+        Ok(DecodeOutputs {
+            path_label: if ffn_stage_profile {
+                "persistent-segmented-ffn-stage-profile"
+            } else if linear_stage_profile {
+                "persistent-segmented-linear-stage-profile"
+            } else {
+                "persistent-segmented-profile"
+            },
+            final_hidden_bytes,
+            per_layer_attn_out: Vec::new(),
+            per_layer_ffn_out: Vec::new(),
+            kernel_full_attn_us: attn_us,
+            kernel_linear_attn_us: 0,
+            kernel_ffn_us: ffn_us,
+            sparse_lookahead_prefetch_us: 0,
+            sparse_router_launch_us: attn_us,
+            sparse_route_d2h_us: 0,
+            sparse_demand_prefetch_us: 0,
+            sparse_ffn_launch_us: ffn_us,
         })
     }
 
