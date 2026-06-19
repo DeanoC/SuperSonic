@@ -3996,6 +3996,7 @@ static int matmul_int4_dequant_wmma_bf16_device(
                             batch_elems, n, k,
                             static_cast<const hip_bfloat16*>(lhs),
                             static_cast<const uint8_t*>(rhs_int4),
+                            nullptr,
                             static_cast<hip_bfloat16*>(out));
                     } else {
                         hipLaunchKernelGGL(
@@ -4004,6 +4005,7 @@ static int matmul_int4_dequant_wmma_bf16_device(
                             batch_elems, n, k,
                             static_cast<const hip_bfloat16*>(lhs),
                             static_cast<const uint8_t*>(rhs_int4),
+                            nullptr,
                             static_cast<hip_bfloat16*>(out));
                     }
                 } else if (quant_type == QWEN35_LOWBIT_GGML_Q4_K) {
@@ -4014,6 +4016,7 @@ static int matmul_int4_dequant_wmma_bf16_device(
                             batch_elems, n, k,
                             static_cast<const hip_bfloat16*>(lhs),
                             static_cast<const uint8_t*>(rhs_int4),
+                            nullptr,
                             static_cast<hip_bfloat16*>(out));
                     } else {
                         hipLaunchKernelGGL(
@@ -4022,6 +4025,7 @@ static int matmul_int4_dequant_wmma_bf16_device(
                             batch_elems, n, k,
                             static_cast<const hip_bfloat16*>(lhs),
                             static_cast<const uint8_t*>(rhs_int4),
+                            nullptr,
                             static_cast<hip_bfloat16*>(out));
                     }
                 } else if (quant_type == QWEN35_LOWBIT_GGML_Q5_K) {
@@ -4032,6 +4036,7 @@ static int matmul_int4_dequant_wmma_bf16_device(
                             batch_elems, n, k,
                             static_cast<const hip_bfloat16*>(lhs),
                             static_cast<const uint8_t*>(rhs_int4),
+                            nullptr,
                             static_cast<hip_bfloat16*>(out));
                     } else {
                         hipLaunchKernelGGL(
@@ -4040,6 +4045,7 @@ static int matmul_int4_dequant_wmma_bf16_device(
                             batch_elems, n, k,
                             static_cast<const hip_bfloat16*>(lhs),
                             static_cast<const uint8_t*>(rhs_int4),
+                            nullptr,
                             static_cast<hip_bfloat16*>(out));
                     }
                 } else if (quant_type == QWEN35_LOWBIT_GGML_Q6_K) {
@@ -4050,6 +4056,7 @@ static int matmul_int4_dequant_wmma_bf16_device(
                             batch_elems, n, k,
                             static_cast<const hip_bfloat16*>(lhs),
                             static_cast<const uint8_t*>(rhs_int4),
+                            nullptr,
                             static_cast<hip_bfloat16*>(out));
                     } else {
                         hipLaunchKernelGGL(
@@ -4058,6 +4065,7 @@ static int matmul_int4_dequant_wmma_bf16_device(
                             batch_elems, n, k,
                             static_cast<const hip_bfloat16*>(lhs),
                             static_cast<const uint8_t*>(rhs_int4),
+                            nullptr,
                             static_cast<hip_bfloat16*>(out));
                     }
                 }
@@ -4286,6 +4294,130 @@ static int matmul_int4_dequant_wmma_bf16_device(
     return 0;
 }
 
+static int matmul_int4_dequant_residual_add_bf16_device(
+    int device_ordinal,
+    size_t batch_elems,
+    int m, int n, int k,
+    const void* lhs,
+    const void* rhs_int4,
+    const void* awq_inv_scale,
+    int quant_type,
+    const void* residual,
+    void* out
+) {
+    ScopedHipDevice scoped(device_ordinal);
+    constexpr int QWEN35_LOWBIT_GGML_Q8_0 = 8;
+    constexpr int QWEN35_LOWBIT_GGML_Q4_K = 12;
+    constexpr int QWEN35_LOWBIT_GGML_Q5_K = 13;
+    constexpr int QWEN35_LOWBIT_GGML_Q6_K = 14;
+    const bool ggml_k =
+        quant_type == QWEN35_LOWBIT_GGML_Q8_0 ||
+        quant_type == QWEN35_LOWBIT_GGML_Q4_K ||
+        quant_type == QWEN35_LOWBIT_GGML_Q5_K ||
+        quant_type == QWEN35_LOWBIT_GGML_Q6_K;
+    if (!ggml_k) return 312;
+    if (!device_supports_wmma_bf16(device_ordinal)) return 313;
+    if (lhs == nullptr || rhs_int4 == nullptr || residual == nullptr || out == nullptr) return 314;
+    if (m != 16 || n <= 0 || k <= 0 || (n % 16) != 0 || (k % 256) != 0) return 315;
+    if (awq_inv_scale != nullptr) return 316;
+
+    const bool trunc_dequant =
+        quant_type != QWEN35_LOWBIT_GGML_Q8_0 &&
+        std::getenv("SUPERSONIC_DFLASH_DISABLE_GGML_TRUNC_DEQUANT") == nullptr;
+    constexpr int TILE_N = 16;
+    const int grid_x = (n + TILE_N - 1) / TILE_N;
+    const int grid_z = static_cast<int>(batch_elems);
+    const int threads = 32;
+
+    if (quant_type == QWEN35_LOWBIT_GGML_Q8_0) {
+        if (trunc_dequant) {
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME(supersonic_qwen35_matmul_ggml_dequant_wmma_m16_qtype_kernel<QWEN35_LOWBIT_GGML_Q8_0, true, true>),
+                dim3(grid_x, 1, grid_z), dim3(threads), 0, 0,
+                batch_elems, n, k,
+                static_cast<const hip_bfloat16*>(lhs),
+                static_cast<const uint8_t*>(rhs_int4),
+                static_cast<const hip_bfloat16*>(residual),
+                static_cast<hip_bfloat16*>(out));
+        } else {
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME(supersonic_qwen35_matmul_ggml_dequant_wmma_m16_qtype_kernel<QWEN35_LOWBIT_GGML_Q8_0, false, true>),
+                dim3(grid_x, 1, grid_z), dim3(threads), 0, 0,
+                batch_elems, n, k,
+                static_cast<const hip_bfloat16*>(lhs),
+                static_cast<const uint8_t*>(rhs_int4),
+                static_cast<const hip_bfloat16*>(residual),
+                static_cast<hip_bfloat16*>(out));
+        }
+    } else if (quant_type == QWEN35_LOWBIT_GGML_Q4_K) {
+        if (trunc_dequant) {
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME(supersonic_qwen35_matmul_ggml_dequant_wmma_m16_qtype_kernel<QWEN35_LOWBIT_GGML_Q4_K, true, true>),
+                dim3(grid_x, 1, grid_z), dim3(threads), 0, 0,
+                batch_elems, n, k,
+                static_cast<const hip_bfloat16*>(lhs),
+                static_cast<const uint8_t*>(rhs_int4),
+                static_cast<const hip_bfloat16*>(residual),
+                static_cast<hip_bfloat16*>(out));
+        } else {
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME(supersonic_qwen35_matmul_ggml_dequant_wmma_m16_qtype_kernel<QWEN35_LOWBIT_GGML_Q4_K, false, true>),
+                dim3(grid_x, 1, grid_z), dim3(threads), 0, 0,
+                batch_elems, n, k,
+                static_cast<const hip_bfloat16*>(lhs),
+                static_cast<const uint8_t*>(rhs_int4),
+                static_cast<const hip_bfloat16*>(residual),
+                static_cast<hip_bfloat16*>(out));
+        }
+    } else if (quant_type == QWEN35_LOWBIT_GGML_Q5_K) {
+        if (trunc_dequant) {
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME(supersonic_qwen35_matmul_ggml_dequant_wmma_m16_qtype_kernel<QWEN35_LOWBIT_GGML_Q5_K, true, true>),
+                dim3(grid_x, 1, grid_z), dim3(threads), 0, 0,
+                batch_elems, n, k,
+                static_cast<const hip_bfloat16*>(lhs),
+                static_cast<const uint8_t*>(rhs_int4),
+                static_cast<const hip_bfloat16*>(residual),
+                static_cast<hip_bfloat16*>(out));
+        } else {
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME(supersonic_qwen35_matmul_ggml_dequant_wmma_m16_qtype_kernel<QWEN35_LOWBIT_GGML_Q5_K, false, true>),
+                dim3(grid_x, 1, grid_z), dim3(threads), 0, 0,
+                batch_elems, n, k,
+                static_cast<const hip_bfloat16*>(lhs),
+                static_cast<const uint8_t*>(rhs_int4),
+                static_cast<const hip_bfloat16*>(residual),
+                static_cast<hip_bfloat16*>(out));
+        }
+    } else if (quant_type == QWEN35_LOWBIT_GGML_Q6_K) {
+        if (trunc_dequant) {
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME(supersonic_qwen35_matmul_ggml_dequant_wmma_m16_qtype_kernel<QWEN35_LOWBIT_GGML_Q6_K, true, true>),
+                dim3(grid_x, 1, grid_z), dim3(threads), 0, 0,
+                batch_elems, n, k,
+                static_cast<const hip_bfloat16*>(lhs),
+                static_cast<const uint8_t*>(rhs_int4),
+                static_cast<const hip_bfloat16*>(residual),
+                static_cast<hip_bfloat16*>(out));
+        } else {
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME(supersonic_qwen35_matmul_ggml_dequant_wmma_m16_qtype_kernel<QWEN35_LOWBIT_GGML_Q6_K, false, true>),
+                dim3(grid_x, 1, grid_z), dim3(threads), 0, 0,
+                batch_elems, n, k,
+                static_cast<const hip_bfloat16*>(lhs),
+                static_cast<const uint8_t*>(rhs_int4),
+                static_cast<const hip_bfloat16*>(residual),
+                static_cast<hip_bfloat16*>(out));
+        }
+    }
+
+    hipError_t launch_err = hipGetLastError();
+    hipError_t sync_err = maybe_sync();
+    if (launch_err != hipSuccess) return 317;
+    if (sync_err != hipSuccess) return 318;
+    return 0;
+}
+
 static int matmul_ggml_pair_wmma_bf16_device(
     int device_ordinal,
     size_t batch_elems,
@@ -4311,6 +4443,94 @@ static int matmul_ggml_pair_wmma_bf16_device(
 
     constexpr int TILE_M = 16;
     constexpr int TILE_N = 16;
+    const bool enable_m16_qtype =
+        m == TILE_M && (n_each % TILE_N) == 0 && (k % 256) == 0 &&
+        std::getenv("SUPERSONIC_DFLASH_DISABLE_GGML_PAIR_M16_QTYPE") == nullptr;
+    if (enable_m16_qtype) {
+        const int n_out = n_each * 2;
+        const int grid_x = (n_out + TILE_N - 1) / TILE_N;
+        const int grid_z = static_cast<int>(batch_elems);
+        const int threads = 32;
+        const bool trunc_dequant =
+            quant_type != QWEN35_LOWBIT_GGML_Q8_0 &&
+            std::getenv("SUPERSONIC_DFLASH_DISABLE_GGML_TRUNC_DEQUANT") == nullptr;
+        if (quant_type == QWEN35_LOWBIT_GGML_Q8_0) {
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME(supersonic_qwen35_matmul_ggml_pair_wmma_m16_qtype_kernel<QWEN35_LOWBIT_GGML_Q8_0, false>),
+                dim3(grid_x, 1, grid_z), dim3(threads), 0, 0,
+                batch_elems, n_each, k,
+                static_cast<const hip_bfloat16*>(lhs),
+                static_cast<const uint8_t*>(rhs_first),
+                static_cast<const uint8_t*>(rhs_second),
+                static_cast<hip_bfloat16*>(out));
+        } else if (quant_type == QWEN35_LOWBIT_GGML_Q4_K) {
+            if (trunc_dequant) {
+                hipLaunchKernelGGL(
+                    HIP_KERNEL_NAME(supersonic_qwen35_matmul_ggml_pair_wmma_m16_qtype_kernel<QWEN35_LOWBIT_GGML_Q4_K, true>),
+                    dim3(grid_x, 1, grid_z), dim3(threads), 0, 0,
+                    batch_elems, n_each, k,
+                    static_cast<const hip_bfloat16*>(lhs),
+                    static_cast<const uint8_t*>(rhs_first),
+                    static_cast<const uint8_t*>(rhs_second),
+                    static_cast<hip_bfloat16*>(out));
+            } else {
+                hipLaunchKernelGGL(
+                    HIP_KERNEL_NAME(supersonic_qwen35_matmul_ggml_pair_wmma_m16_qtype_kernel<QWEN35_LOWBIT_GGML_Q4_K, false>),
+                    dim3(grid_x, 1, grid_z), dim3(threads), 0, 0,
+                    batch_elems, n_each, k,
+                    static_cast<const hip_bfloat16*>(lhs),
+                    static_cast<const uint8_t*>(rhs_first),
+                    static_cast<const uint8_t*>(rhs_second),
+                    static_cast<hip_bfloat16*>(out));
+            }
+        } else if (quant_type == QWEN35_LOWBIT_GGML_Q5_K) {
+            if (trunc_dequant) {
+                hipLaunchKernelGGL(
+                    HIP_KERNEL_NAME(supersonic_qwen35_matmul_ggml_pair_wmma_m16_qtype_kernel<QWEN35_LOWBIT_GGML_Q5_K, true>),
+                    dim3(grid_x, 1, grid_z), dim3(threads), 0, 0,
+                    batch_elems, n_each, k,
+                    static_cast<const hip_bfloat16*>(lhs),
+                    static_cast<const uint8_t*>(rhs_first),
+                    static_cast<const uint8_t*>(rhs_second),
+                    static_cast<hip_bfloat16*>(out));
+            } else {
+                hipLaunchKernelGGL(
+                    HIP_KERNEL_NAME(supersonic_qwen35_matmul_ggml_pair_wmma_m16_qtype_kernel<QWEN35_LOWBIT_GGML_Q5_K, false>),
+                    dim3(grid_x, 1, grid_z), dim3(threads), 0, 0,
+                    batch_elems, n_each, k,
+                    static_cast<const hip_bfloat16*>(lhs),
+                    static_cast<const uint8_t*>(rhs_first),
+                    static_cast<const uint8_t*>(rhs_second),
+                    static_cast<hip_bfloat16*>(out));
+            }
+        } else if (quant_type == QWEN35_LOWBIT_GGML_Q6_K) {
+            if (trunc_dequant) {
+                hipLaunchKernelGGL(
+                    HIP_KERNEL_NAME(supersonic_qwen35_matmul_ggml_pair_wmma_m16_qtype_kernel<QWEN35_LOWBIT_GGML_Q6_K, true>),
+                    dim3(grid_x, 1, grid_z), dim3(threads), 0, 0,
+                    batch_elems, n_each, k,
+                    static_cast<const hip_bfloat16*>(lhs),
+                    static_cast<const uint8_t*>(rhs_first),
+                    static_cast<const uint8_t*>(rhs_second),
+                    static_cast<hip_bfloat16*>(out));
+            } else {
+                hipLaunchKernelGGL(
+                    HIP_KERNEL_NAME(supersonic_qwen35_matmul_ggml_pair_wmma_m16_qtype_kernel<QWEN35_LOWBIT_GGML_Q6_K, false>),
+                    dim3(grid_x, 1, grid_z), dim3(threads), 0, 0,
+                    batch_elems, n_each, k,
+                    static_cast<const hip_bfloat16*>(lhs),
+                    static_cast<const uint8_t*>(rhs_first),
+                    static_cast<const uint8_t*>(rhs_second),
+                    static_cast<hip_bfloat16*>(out));
+            }
+        }
+        hipError_t launch_err = hipGetLastError();
+        hipError_t sync_err = maybe_sync();
+        if (launch_err != hipSuccess) return 320;
+        if (sync_err != hipSuccess) return 321;
+        return 0;
+    }
+
     const int n_out = n_each * 2;
     const int grid_x = (n_out + TILE_N - 1) / TILE_N;
     const int grid_y = (m + TILE_M - 1) / TILE_M;
@@ -4329,6 +4549,116 @@ static int matmul_ggml_pair_wmma_bf16_device(
     hipError_t sync_err = maybe_sync();
     if (launch_err != hipSuccess) return 296;
     if (sync_err != hipSuccess) return 297;
+    return 0;
+}
+
+static int matmul_ggml_pair_swiglu_wmma_bf16_device(
+    int device_ordinal,
+    size_t batch_elems,
+    int m, int n_each, int k,
+    const void* lhs,
+    const void* rhs_gate,
+    const void* rhs_up,
+    int quant_type,
+    void* out
+) {
+    ScopedHipDevice scoped(device_ordinal);
+    constexpr int QWEN35_LOWBIT_GGML_Q8_0 = 8;
+    constexpr int QWEN35_LOWBIT_GGML_Q4_K = 12;
+    constexpr int QWEN35_LOWBIT_GGML_Q5_K = 13;
+    constexpr int QWEN35_LOWBIT_GGML_Q6_K = 14;
+    const bool ggml_k =
+        quant_type == QWEN35_LOWBIT_GGML_Q8_0 ||
+        quant_type == QWEN35_LOWBIT_GGML_Q4_K ||
+        quant_type == QWEN35_LOWBIT_GGML_Q5_K ||
+        quant_type == QWEN35_LOWBIT_GGML_Q6_K;
+    if (!ggml_k) return 322;
+    if (!device_supports_wmma_bf16(device_ordinal)) return 323;
+
+    constexpr int TILE_M = 16;
+    constexpr int TILE_N = 16;
+    if (m != TILE_M || (n_each % TILE_N) != 0 || (k % 256) != 0) return 324;
+
+    const int grid_x = (n_each + TILE_N - 1) / TILE_N;
+    const int grid_z = static_cast<int>(batch_elems);
+    const int threads = 32;
+    const bool trunc_dequant =
+        quant_type != QWEN35_LOWBIT_GGML_Q8_0 &&
+        std::getenv("SUPERSONIC_DFLASH_DISABLE_GGML_TRUNC_DEQUANT") == nullptr;
+    if (quant_type == QWEN35_LOWBIT_GGML_Q8_0) {
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(supersonic_qwen35_matmul_ggml_pair_swiglu_wmma_m16_qtype_kernel<QWEN35_LOWBIT_GGML_Q8_0, false>),
+            dim3(grid_x, 1, grid_z), dim3(threads), 0, 0,
+            batch_elems, n_each, k,
+            static_cast<const hip_bfloat16*>(lhs),
+            static_cast<const uint8_t*>(rhs_gate),
+                static_cast<const uint8_t*>(rhs_up),
+                static_cast<hip_bfloat16*>(out));
+    } else if (quant_type == QWEN35_LOWBIT_GGML_Q4_K) {
+        if (trunc_dequant) {
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME(supersonic_qwen35_matmul_ggml_pair_swiglu_wmma_m16_qtype_kernel<QWEN35_LOWBIT_GGML_Q4_K, true>),
+                dim3(grid_x, 1, grid_z), dim3(threads), 0, 0,
+                batch_elems, n_each, k,
+                static_cast<const hip_bfloat16*>(lhs),
+                static_cast<const uint8_t*>(rhs_gate),
+                static_cast<const uint8_t*>(rhs_up),
+                static_cast<hip_bfloat16*>(out));
+        } else {
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME(supersonic_qwen35_matmul_ggml_pair_swiglu_wmma_m16_qtype_kernel<QWEN35_LOWBIT_GGML_Q4_K, false>),
+                dim3(grid_x, 1, grid_z), dim3(threads), 0, 0,
+                batch_elems, n_each, k,
+                static_cast<const hip_bfloat16*>(lhs),
+                static_cast<const uint8_t*>(rhs_gate),
+                static_cast<const uint8_t*>(rhs_up),
+                static_cast<hip_bfloat16*>(out));
+        }
+    } else if (quant_type == QWEN35_LOWBIT_GGML_Q5_K) {
+        if (trunc_dequant) {
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME(supersonic_qwen35_matmul_ggml_pair_swiglu_wmma_m16_qtype_kernel<QWEN35_LOWBIT_GGML_Q5_K, true>),
+                dim3(grid_x, 1, grid_z), dim3(threads), 0, 0,
+                batch_elems, n_each, k,
+                static_cast<const hip_bfloat16*>(lhs),
+                static_cast<const uint8_t*>(rhs_gate),
+                static_cast<const uint8_t*>(rhs_up),
+                static_cast<hip_bfloat16*>(out));
+        } else {
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME(supersonic_qwen35_matmul_ggml_pair_swiglu_wmma_m16_qtype_kernel<QWEN35_LOWBIT_GGML_Q5_K, false>),
+                dim3(grid_x, 1, grid_z), dim3(threads), 0, 0,
+                batch_elems, n_each, k,
+                static_cast<const hip_bfloat16*>(lhs),
+                static_cast<const uint8_t*>(rhs_gate),
+                static_cast<const uint8_t*>(rhs_up),
+                static_cast<hip_bfloat16*>(out));
+        }
+    } else if (quant_type == QWEN35_LOWBIT_GGML_Q6_K) {
+        if (trunc_dequant) {
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME(supersonic_qwen35_matmul_ggml_pair_swiglu_wmma_m16_qtype_kernel<QWEN35_LOWBIT_GGML_Q6_K, true>),
+                dim3(grid_x, 1, grid_z), dim3(threads), 0, 0,
+                batch_elems, n_each, k,
+                static_cast<const hip_bfloat16*>(lhs),
+                static_cast<const uint8_t*>(rhs_gate),
+                static_cast<const uint8_t*>(rhs_up),
+                static_cast<hip_bfloat16*>(out));
+        } else {
+            hipLaunchKernelGGL(
+                HIP_KERNEL_NAME(supersonic_qwen35_matmul_ggml_pair_swiglu_wmma_m16_qtype_kernel<QWEN35_LOWBIT_GGML_Q6_K, false>),
+                dim3(grid_x, 1, grid_z), dim3(threads), 0, 0,
+                batch_elems, n_each, k,
+                static_cast<const hip_bfloat16*>(lhs),
+                static_cast<const uint8_t*>(rhs_gate),
+                static_cast<const uint8_t*>(rhs_up),
+                static_cast<hip_bfloat16*>(out));
+        }
+    }
+    hipError_t launch_err = hipGetLastError();
+    hipError_t sync_err = maybe_sync();
+    if (launch_err != hipSuccess) return 325;
+    if (sync_err != hipSuccess) return 326;
     return 0;
 }
 
@@ -4380,6 +4710,7 @@ static int matmul_mmq_q8_1_q6_k_device(
     int k,
     const void* q8,
     const void* rhs_q6,
+    const void* residual,
     void* out
 ) {
     ScopedHipDevice scoped(device_ordinal);
@@ -4395,24 +4726,117 @@ static int matmul_mmq_q8_1_q6_k_device(
     const size_t shared_bytes =
         static_cast<size_t>(PADDED_TILE_Y_INTS + MMQ_Y * MMQ_MMA_TILE_X_K_Q6_K) *
         sizeof(int);
+    const bool hot_exact =
+        m == MMQ_X && (n % MMQ_Y) == 0 &&
+        std::getenv("SUPERSONIC_DFLASH_DISABLE_Q6_K_MMQ_HOT_EXACT") == nullptr;
 
-    hipLaunchKernelGGL(
-        supersonic_qwen35_matmul_mmq_q8_1_q6_k_kernel,
-        dim3(grid_x, grid_y, grid_z),
-        dim3(32, 8),
-        shared_bytes,
-        0,
-        batch_elems,
-        m,
-        n,
-        k,
-        static_cast<const uint8_t*>(q8),
-        static_cast<const uint8_t*>(rhs_q6),
-        static_cast<hip_bfloat16*>(out));
+    if (hot_exact) {
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(supersonic_qwen35_matmul_mmq_q8_1_q6_k_kernel<true>),
+            dim3(grid_x, grid_y, grid_z),
+            dim3(32, 8),
+            shared_bytes,
+            0,
+            batch_elems,
+            m,
+            n,
+            k,
+            static_cast<const uint8_t*>(q8),
+            static_cast<const uint8_t*>(rhs_q6),
+            static_cast<const hip_bfloat16*>(residual),
+            static_cast<hip_bfloat16*>(out));
+    } else {
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(supersonic_qwen35_matmul_mmq_q8_1_q6_k_kernel<false>),
+            dim3(grid_x, grid_y, grid_z),
+            dim3(32, 8),
+            shared_bytes,
+            0,
+            batch_elems,
+            m,
+            n,
+            k,
+            static_cast<const uint8_t*>(q8),
+            static_cast<const uint8_t*>(rhs_q6),
+            static_cast<const hip_bfloat16*>(residual),
+            static_cast<hip_bfloat16*>(out));
+    }
     hipError_t launch_err = hipGetLastError();
     hipError_t sync_err = maybe_sync();
     if (launch_err != hipSuccess) return 306;
     if (sync_err != hipSuccess) return 307;
+    return 0;
+}
+
+static int matmul_q6_k_m16_argmax_device(
+    int device_ordinal,
+    size_t batch_elems,
+    int m,
+    int n,
+    int k,
+    const void* lhs,
+    const void* rhs_q6,
+    void* block_best_vals,
+    void* block_best_indices,
+    void* out_indices
+) {
+    ScopedHipDevice scoped(device_ordinal);
+    if (!device_supports_wmma_bf16(device_ordinal)) return 340;
+    if (m != 16 || n <= 0 || k <= 0 || (n % 16) != 0 || (k % 256) != 0) return 341;
+    if (lhs == nullptr || rhs_q6 == nullptr || block_best_vals == nullptr ||
+        block_best_indices == nullptr || out_indices == nullptr) return 342;
+
+    const int tiles = n / 16;
+    const int grid_z = static_cast<int>(batch_elems);
+    const bool trunc_dequant =
+        std::getenv("SUPERSONIC_DFLASH_DISABLE_GGML_TRUNC_DEQUANT") == nullptr;
+    if (trunc_dequant) {
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(supersonic_qwen35_matmul_q6_k_m16_tile_argmax_kernel<true>),
+            dim3(tiles, 1, grid_z),
+            dim3(32),
+            0,
+            0,
+            batch_elems,
+            n,
+            k,
+            static_cast<const hip_bfloat16*>(lhs),
+            static_cast<const uint8_t*>(rhs_q6),
+            static_cast<float*>(block_best_vals),
+            static_cast<uint32_t*>(block_best_indices));
+    } else {
+        hipLaunchKernelGGL(
+            HIP_KERNEL_NAME(supersonic_qwen35_matmul_q6_k_m16_tile_argmax_kernel<false>),
+            dim3(tiles, 1, grid_z),
+            dim3(32),
+            0,
+            0,
+            batch_elems,
+            n,
+            k,
+            static_cast<const hip_bfloat16*>(lhs),
+            static_cast<const uint8_t*>(rhs_q6),
+            static_cast<float*>(block_best_vals),
+            static_cast<uint32_t*>(block_best_indices));
+    }
+    hipError_t launch_err = hipGetLastError();
+    if (launch_err != hipSuccess) return 343;
+
+    hipLaunchKernelGGL(
+        supersonic_qwen35_reduce_m16_tile_argmax_kernel,
+        dim3(16, grid_z),
+        dim3(256),
+        0,
+        0,
+        batch_elems,
+        tiles,
+        static_cast<const float*>(block_best_vals),
+        static_cast<const uint32_t*>(block_best_indices),
+        static_cast<uint32_t*>(out_indices));
+    launch_err = hipGetLastError();
+    hipError_t sync_err = maybe_sync();
+    if (launch_err != hipSuccess) return 344;
+    if (sync_err != hipSuccess) return 345;
     return 0;
 }
 
@@ -4476,6 +4900,33 @@ extern "C" int supersonic_qwen35_4b_hip_matmul_int4_dequant(
     }
 }
 
+extern "C" int supersonic_qwen35_4b_hip_matmul_int4_dequant_residual_add(
+    int dtype,
+    size_t device_ordinal,
+    size_t batch_elems,
+    int m, int n, int k,
+    const void* lhs,
+    const void* rhs_int4,
+    const void* scale,
+    const void* zero,
+    const void* awq_inv_scale,
+    int group_size,
+    int quant_type,
+    const void* residual,
+    void* out) {
+    (void)scale;
+    (void)zero;
+    (void)group_size;
+    switch (dtype) {
+    case 2:
+        return matmul_int4_dequant_residual_add_bf16_device(
+            static_cast<int>(device_ordinal), batch_elems, m, n, k,
+            lhs, rhs_int4, awq_inv_scale, quant_type, residual, out);
+    default:
+        return 319;
+    }
+}
+
 extern "C" int supersonic_qwen35_4b_hip_matmul_ggml_pair_dequant(
     int dtype,
     size_t device_ordinal,
@@ -4493,6 +4944,26 @@ extern "C" int supersonic_qwen35_4b_hip_matmul_ggml_pair_dequant(
             lhs, rhs_first, rhs_second, quant_type, out);
     default:
         return 298;
+    }
+}
+
+extern "C" int supersonic_qwen35_4b_hip_matmul_ggml_pair_swiglu(
+    int dtype,
+    size_t device_ordinal,
+    size_t batch_elems,
+    int m, int n_each, int k,
+    const void* lhs,
+    const void* rhs_gate,
+    const void* rhs_up,
+    int quant_type,
+    void* out) {
+    switch (dtype) {
+    case 2:
+        return matmul_ggml_pair_swiglu_wmma_bf16_device(
+            static_cast<int>(device_ordinal), batch_elems, m, n_each, k,
+            lhs, rhs_gate, rhs_up, quant_type, out);
+    default:
+        return 327;
     }
 }
 
@@ -4527,9 +4998,51 @@ extern "C" int supersonic_qwen35_4b_hip_matmul_mmq_q8_1_q6_k(
     switch (dtype) {
     case 2:
         return matmul_mmq_q8_1_q6_k_device(
-            static_cast<int>(device_ordinal), batch_elems, m, n, k, q8, rhs_q6, out);
+            static_cast<int>(device_ordinal), batch_elems, m, n, k, q8, rhs_q6, nullptr, out);
     default:
         return 308;
+    }
+}
+
+extern "C" int supersonic_qwen35_4b_hip_matmul_mmq_q8_1_q6_k_residual_add(
+    int dtype,
+    size_t device_ordinal,
+    size_t batch_elems,
+    int m,
+    int n,
+    int k,
+    const void* q8,
+    const void* rhs_q6,
+    const void* residual,
+    void* out) {
+    switch (dtype) {
+    case 2:
+        return matmul_mmq_q8_1_q6_k_device(
+            static_cast<int>(device_ordinal), batch_elems, m, n, k, q8, rhs_q6, residual, out);
+    default:
+        return 330;
+    }
+}
+
+extern "C" int supersonic_qwen35_4b_hip_matmul_q6_k_m16_argmax(
+    int dtype,
+    size_t device_ordinal,
+    size_t batch_elems,
+    int m,
+    int n,
+    int k,
+    const void* lhs,
+    const void* rhs_q6,
+    void* block_best_vals,
+    void* block_best_indices,
+    void* out_indices) {
+    switch (dtype) {
+    case 2:
+        return matmul_q6_k_m16_argmax_device(
+            static_cast<int>(device_ordinal), batch_elems, m, n, k,
+            lhs, rhs_q6, block_best_vals, block_best_indices, out_indices);
+    default:
+        return 346;
     }
 }
 

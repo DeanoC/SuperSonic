@@ -182,6 +182,87 @@ fn dflash_tree_delta_q8_direct_attention_matches_extract_path() -> Result<()> {
     Ok(())
 }
 
+#[test]
+#[ignore = "requires a HIP GPU and /dev/kfd access"]
+fn dflash_append_delta_q8_direct_attention_matches_extract_path() -> Result<()> {
+    let ordinal = 0usize;
+    let inputs = Inputs::new();
+    let gpu = inputs.upload(ordinal)?;
+
+    let trace_bytes = q8_trace_bytes(BH, SEQ, K, V);
+    let mut old_out = GpuBuffer::zeros(ordinal, ScalarType::F32, &[BH, SEQ + K, V])?;
+    let mut old_trace = GpuBuffer::zeros(ordinal, ScalarType::U8, &[trace_bytes])?;
+    let mut old_attn = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[BH, SEQ, V])?;
+    let mut old_state = GpuBuffer::zeros(ordinal, ScalarType::F32, &[BH, K, V])?;
+    let mut direct_state = upload_f32(ordinal, &[BH, K, V], &inputs.initial)?;
+    let mut direct_attn = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[BH, SEQ, V])?;
+    let mut direct_trace = GpuBuffer::zeros(ordinal, ScalarType::U8, &[trace_bytes])?;
+
+    kernel_ffi::prefill_ffi::delta_recurrent_prefill_capture_q8_trace(
+        ordinal,
+        ScalarType::F32,
+        BH,
+        SEQ,
+        K,
+        V,
+        &gpu.initial,
+        &gpu.query,
+        &gpu.key,
+        &gpu.value,
+        &gpu.beta,
+        &gpu.g,
+        &mut old_out,
+        &mut old_trace,
+    )?;
+    kernel_ffi::prefill_ffi::dflash_extract_recurrent_attn(
+        ordinal,
+        BH,
+        SEQ,
+        K,
+        V,
+        &old_out,
+        &mut old_state,
+        &mut old_attn,
+    )?;
+
+    assert!(
+        kernel_ffi::prefill_ffi::delta_recurrent_prefill_capture_q8_trace_attn(
+            ordinal,
+            ScalarType::F32,
+            BH,
+            SEQ,
+            K,
+            V,
+            &mut direct_state,
+            &gpu.query,
+            &gpu.key,
+            &gpu.value,
+            &gpu.beta,
+            &gpu.g,
+            &mut direct_attn,
+            &mut direct_trace,
+        )?
+    );
+
+    assert_eq!(
+        old_attn.to_host_bytes()?,
+        direct_attn.to_host_bytes()?,
+        "direct append BF16 attention output must match extract path"
+    );
+    assert_eq!(
+        old_trace.to_host_bytes()?,
+        direct_trace.to_host_bytes()?,
+        "direct append path must preserve Q8 rollback trace bytes"
+    );
+    assert_close(
+        "direct append recurrent state",
+        &download_f32(&old_state)?,
+        &download_f32(&direct_state)?,
+        1.0e-5,
+    )?;
+    Ok(())
+}
+
 struct Inputs {
     initial: Vec<f32>,
     query: Vec<f32>,
