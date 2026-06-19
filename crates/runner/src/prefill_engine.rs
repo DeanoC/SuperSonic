@@ -471,6 +471,68 @@ fn matmul_proj(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn matmul_proj_residual_add_inplace(
+    ordinal: usize,
+    batch: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    lhs: &GpuBuffer,
+    weight: &GpuBuffer,
+    scale: Option<&GpuBuffer>,
+    int8_scale: Option<&GpuBuffer>,
+    out_residual: &mut GpuBuffer,
+    int4_scale: Option<&GpuBuffer>,
+    int4_zero: Option<&GpuBuffer>,
+    int4_awq_inv_scale: Option<&GpuBuffer>,
+    int4_group_size: usize,
+) -> Result<bool> {
+    if env::var_os("SUPERSONIC_DFLASH_DISABLE_TREE_RESIDUAL_FUSED_MATMUL").is_some()
+        || gpu_hal::current_backend() != Backend::Hip
+        || batch != 1
+        || m != 16
+        || scale.is_some()
+        || int8_scale.is_some()
+        || int4_awq_inv_scale.is_some()
+    {
+        return Ok(false);
+    }
+
+    let qtype = qwen35::weights::infer_lowbit_type(weight, k, int4_scale.is_some());
+    let raw_ggml = matches!(
+        qtype,
+        qwen35::weights::LOWBIT_GGML_Q8_0
+            | qwen35::weights::LOWBIT_GGML_Q4_K
+            | qwen35::weights::LOWBIT_GGML_Q5_K
+            | qwen35::weights::LOWBIT_GGML_Q6_K
+    );
+    if !raw_ggml {
+        return Ok(false);
+    }
+
+    let sc = int4_scale.unwrap_or(weight);
+    let zr = int4_zero.unwrap_or(weight);
+    let residual: &GpuBuffer = unsafe { &*(out_residual as *const GpuBuffer) };
+    prefill_ffi::matmul_rhs_transposed_int4_residual_add(
+        ordinal,
+        batch,
+        m,
+        n,
+        k,
+        lhs,
+        weight,
+        sc,
+        zr,
+        int4_awq_inv_scale,
+        int4_group_size,
+        qtype,
+        residual,
+        out_residual,
+    )
+    .map_err(|e| anyhow::anyhow!("matmul_int4 residual add: {e}"))
+}
+
 fn mmq_q8_1_workspace_bytes(batch: usize, m: usize, k: usize) -> usize {
     const Q8_BLOCK: usize = 128;
     const Q8_BLOCK_BYTES: usize = 144;
@@ -508,8 +570,35 @@ pub(crate) fn q6_k_mmq_lm_head_enabled(m: usize) -> bool {
     env::var_os("SUPERSONIC_ENABLE_Q6_K_MMQ_LM_HEAD").is_some() || m == 8
 }
 
+fn q6_k_lm_head_argmax_fused_enabled() -> bool {
+    env::var_os("SUPERSONIC_DFLASH_DISABLE_Q6_K_LM_HEAD_ARGMAX_FUSED").is_none()
+}
+
 fn q6_k_mmq_mlp_down_enabled() -> bool {
     env::var_os("SUPERSONIC_DISABLE_Q6_K_MMQ_MLP_DOWN").is_none()
+}
+
+fn q6_k_mmq_mlp_down_residual_fused_enabled() -> bool {
+    env::var_os("SUPERSONIC_DFLASH_DISABLE_Q6_K_MMQ_MLP_DOWN_RESIDUAL_FUSED").is_none()
+}
+
+fn ggml_mlp_gate_up_pair_enabled() -> bool {
+    env::var_os("SUPERSONIC_DFLASH_DISABLE_GGML_MLP_GATE_UP_PAIR").is_none()
+        && env::var_os("SUPERSONIC_DFLASH_DISABLE_GGML_PAIR_M16_QTYPE").is_none()
+}
+
+fn ggml_mlp_gate_up_swiglu_fused_enabled() -> bool {
+    env::var_os("SUPERSONIC_DFLASH_DISABLE_GGML_MLP_GATE_UP_SWIGLU_FUSED").is_none()
+}
+
+fn raw_ggml_qtype(qtype: i32) -> bool {
+    matches!(
+        qtype,
+        qwen35::weights::LOWBIT_GGML_Q8_0
+            | qwen35::weights::LOWBIT_GGML_Q4_K
+            | qwen35::weights::LOWBIT_GGML_Q5_K
+            | qwen35::weights::LOWBIT_GGML_Q6_K
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -556,6 +645,144 @@ pub(crate) fn maybe_matmul_q6_k_mmq_lm_head(
     .map_err(|e| anyhow::anyhow!("q6_k_mmq lm_head quantize q8_1: {e}"))?;
     prefill_ffi::matmul_mmq_q8_1_q6_k(ordinal, batch, m, n, k, &q8_workspace, weight, out)
         .map_err(|e| anyhow::anyhow!("q6_k_mmq lm_head matmul: {e}"))?;
+    Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn maybe_matmul_q6_k_lm_head_argmax(
+    ordinal: usize,
+    batch: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    qtype: i32,
+    awq_inv_scale: Option<&GpuBuffer>,
+    lhs: &GpuBuffer,
+    weight: &GpuBuffer,
+    block_best_vals: &mut GpuBuffer,
+    block_best_indices: &mut GpuBuffer,
+    out_indices: &mut GpuBuffer,
+) -> Result<bool> {
+    if !q6_k_lm_head_argmax_fused_enabled()
+        || gpu_hal::current_backend() != Backend::Hip
+        || batch != 1
+        || m != 16
+        || n == 0
+        || k == 0
+        || n % 16 != 0
+        || k % 256 != 0
+        || qtype != qwen35::weights::LOWBIT_GGML_Q6_K
+        || awq_inv_scale.is_some()
+    {
+        return Ok(false);
+    }
+
+    prefill_ffi::matmul_q6_k_m16_argmax(
+        ordinal,
+        batch,
+        m,
+        n,
+        k,
+        lhs,
+        weight,
+        block_best_vals,
+        block_best_indices,
+        out_indices,
+    )
+    .map_err(|e| anyhow::anyhow!("q6_k lm_head fused argmax: {e}"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn maybe_matmul_ggml_mlp_gate_up_pair(
+    ordinal: usize,
+    batch: usize,
+    m: usize,
+    n_each: usize,
+    k: usize,
+    lhs: &GpuBuffer,
+    gate_weight: &GpuBuffer,
+    gate_scale: Option<&GpuBuffer>,
+    gate_int8_scale: Option<&GpuBuffer>,
+    gate_int4_scale: Option<&GpuBuffer>,
+    gate_int4_zero: Option<&GpuBuffer>,
+    gate_awq_inv_scale: Option<&GpuBuffer>,
+    up_weight: &GpuBuffer,
+    up_scale: Option<&GpuBuffer>,
+    up_int8_scale: Option<&GpuBuffer>,
+    up_int4_scale: Option<&GpuBuffer>,
+    up_int4_zero: Option<&GpuBuffer>,
+    up_awq_inv_scale: Option<&GpuBuffer>,
+    packed_gate_up: &mut GpuBuffer,
+    swiglu_out: &mut GpuBuffer,
+) -> Result<bool> {
+    if !ggml_mlp_gate_up_pair_enabled()
+        || gpu_hal::current_backend() != Backend::Hip
+        || batch != 1
+        || m != 16
+        || n_each == 0
+        || k == 0
+        || n_each % 16 != 0
+        || k % 256 != 0
+        || gate_scale.is_some()
+        || gate_int8_scale.is_some()
+        || gate_int4_scale.is_some()
+        || gate_int4_zero.is_some()
+        || gate_awq_inv_scale.is_some()
+        || up_scale.is_some()
+        || up_int8_scale.is_some()
+        || up_int4_scale.is_some()
+        || up_int4_zero.is_some()
+        || up_awq_inv_scale.is_some()
+    {
+        return Ok(false);
+    }
+
+    let gate_qtype = qwen35::weights::infer_lowbit_type(gate_weight, k, false);
+    let up_qtype = qwen35::weights::infer_lowbit_type(up_weight, k, false);
+    if gate_qtype != up_qtype || !raw_ggml_qtype(gate_qtype) {
+        return Ok(false);
+    }
+
+    if ggml_mlp_gate_up_swiglu_fused_enabled()
+        && prefill_ffi::matmul_rhs_transposed_ggml_pair_swiglu(
+            ordinal,
+            batch,
+            m,
+            n_each,
+            k,
+            lhs,
+            gate_weight,
+            up_weight,
+            gate_qtype,
+            swiglu_out,
+        )
+        .map_err(|e| anyhow::anyhow!("ggml MLP gate/up fused SwiGLU: {e}"))?
+    {
+        return Ok(true);
+    }
+
+    prefill_ffi::matmul_rhs_transposed_ggml_pair(
+        ordinal,
+        batch,
+        m,
+        n_each,
+        k,
+        lhs,
+        gate_weight,
+        up_weight,
+        gate_qtype,
+        packed_gate_up,
+    )
+    .map_err(|e| anyhow::anyhow!("ggml MLP gate/up pair matmul: {e}"))?;
+    prefill_ffi::swiglu_mul_split(
+        ordinal,
+        ScalarType::BF16,
+        m,
+        n_each,
+        packed_gate_up,
+        swiglu_out,
+    )
+    .map_err(|e| anyhow::anyhow!("ggml MLP gate/up split SwiGLU: {e}"))?;
     Ok(true)
 }
 
@@ -618,6 +845,80 @@ fn maybe_matmul_q6_k_mmq_mlp_down(
     .map_err(|e| anyhow::anyhow!("q6_k_mmq MLP down quantize q8_1: {e}"))?;
     prefill_ffi::matmul_mmq_q8_1_q6_k(ordinal, batch, m, n, k, q8_workspace, weight, out)
         .map_err(|e| anyhow::anyhow!("q6_k_mmq MLP down matmul: {e}"))?;
+    Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn maybe_matmul_q6_k_mmq_mlp_down_residual_add(
+    ordinal: usize,
+    batch: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    qtype: i32,
+    scale: Option<&GpuBuffer>,
+    int4_scale: Option<&GpuBuffer>,
+    int4_zero: Option<&GpuBuffer>,
+    awq_inv_scale: Option<&GpuBuffer>,
+    lhs: &GpuBuffer,
+    weight: &GpuBuffer,
+    out_residual: &mut GpuBuffer,
+    q8_workspace: &mut Option<GpuBuffer>,
+) -> Result<bool> {
+    if !q6_k_mmq_mlp_down_enabled()
+        || !q6_k_mmq_mlp_down_residual_fused_enabled()
+        || gpu_hal::current_backend() != Backend::Hip
+        || batch != 1
+        || m == 0
+        || n == 0
+        || k == 0
+        || qtype != qwen35::weights::LOWBIT_GGML_Q6_K
+        || scale.is_some()
+        || int4_scale.is_some()
+        || int4_zero.is_some()
+        || awq_inv_scale.is_some()
+        || k % 256 != 0
+    {
+        return Ok(false);
+    }
+
+    if !prefill_ffi::device_supports_wmma_i8(ordinal)
+        .map_err(|e| anyhow::anyhow!("q6_k_mmq MLP down residual arch probe: {e}"))?
+    {
+        return Ok(false);
+    }
+
+    let q8_workspace = ensure_mmq_q8_1_workspace(
+        q8_workspace,
+        ordinal,
+        batch,
+        m,
+        k,
+        "q6_k_mmq MLP down residual q8 workspace",
+    )?;
+    prefill_ffi::quantize_mmq_q8_1(
+        ordinal,
+        batch,
+        m,
+        k,
+        lhs,
+        qwen35::weights::LOWBIT_GGML_Q6_K,
+        q8_workspace,
+    )
+    .map_err(|e| anyhow::anyhow!("q6_k_mmq MLP down residual quantize q8_1: {e}"))?;
+    let residual: &GpuBuffer = unsafe { &*(out_residual as *const GpuBuffer) };
+    prefill_ffi::matmul_mmq_q8_1_q6_k_residual_add(
+        ordinal,
+        batch,
+        m,
+        n,
+        k,
+        q8_workspace,
+        weight,
+        residual,
+        out_residual,
+    )
+    .map_err(|e| anyhow::anyhow!("q6_k_mmq MLP down residual matmul: {e}"))?;
     Ok(true)
 }
 
@@ -1169,71 +1470,103 @@ pub fn compute_greedy_for_range(
         "range greedy final norm",
     )?;
 
-    let mut logits_buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[count, vocab_size])
-        .map_err(|e| anyhow::anyhow!("range greedy logits alloc: {e}"))?;
+    let mut out_index = GpuBuffer::zeros(ordinal, ScalarType::U32, &[count])
+        .map_err(|e| anyhow::anyhow!("range greedy argmax alloc: {e}"))?;
+    let mut fused_argmax = false;
     if let Some((qtype, scale, zero)) = weights.lm_head_lowbit_params(hidden_dim) {
-        if !maybe_matmul_q6_k_mmq_lm_head(
-            ordinal,
-            1,
-            count,
-            vocab_size,
-            hidden_dim,
-            qtype,
-            weights.lm_head_awq_inv_scale.as_ref(),
-            &normed,
-            &*weights.lm_head,
-            &mut logits_buf,
-        )? {
-            prefill_ffi::matmul_rhs_transposed_int4(
+        if count == 16 {
+            let lm_head_tiles = (vocab_size + 15) / 16;
+            let mut block_best_vals =
+                GpuBuffer::alloc(ordinal, ScalarType::F32, &[count, lm_head_tiles])
+                    .map_err(|e| anyhow::anyhow!("range greedy block-best vals alloc: {e}"))?;
+            let mut block_best_indices =
+                GpuBuffer::alloc(ordinal, ScalarType::U32, &[count, lm_head_tiles])
+                    .map_err(|e| anyhow::anyhow!("range greedy block-best indices alloc: {e}"))?;
+            fused_argmax = maybe_matmul_q6_k_lm_head_argmax(
                 ordinal,
+                1,
+                count,
+                vocab_size,
+                hidden_dim,
+                qtype,
+                weights.lm_head_awq_inv_scale.as_ref(),
+                &normed,
+                &*weights.lm_head,
+                &mut block_best_vals,
+                &mut block_best_indices,
+                &mut out_index,
+            )?;
+        }
+        if !fused_argmax {
+            let mut logits_buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[count, vocab_size])
+                .map_err(|e| anyhow::anyhow!("range greedy logits alloc: {e}"))?;
+            if !maybe_matmul_q6_k_mmq_lm_head(
+                ordinal,
+                1,
+                count,
+                vocab_size,
+                hidden_dim,
+                qtype,
+                weights.lm_head_awq_inv_scale.as_ref(),
+                &normed,
+                &*weights.lm_head,
+                &mut logits_buf,
+            )? {
+                prefill_ffi::matmul_rhs_transposed_int4(
+                    ordinal,
+                    1,
+                    count,
+                    vocab_size,
+                    hidden_dim,
+                    &normed,
+                    &*weights.lm_head,
+                    scale,
+                    zero,
+                    weights.lm_head_awq_inv_scale.as_ref(),
+                    weights.int4_group_size,
+                    qtype,
+                    &mut logits_buf,
+                )
+                .map_err(|e| anyhow::anyhow!("range greedy lm_head int4: {e}"))?;
+            }
+            prefill_ffi::argmax_bf16_rows(ordinal, count, vocab_size, &logits_buf, &mut out_index)
+                .map_err(|e| anyhow::anyhow!("range greedy argmax: {e}"))?;
+        }
+    } else {
+        let mut logits_buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[count, vocab_size])
+            .map_err(|e| anyhow::anyhow!("range greedy logits alloc: {e}"))?;
+        if count > 1 {
+            kernel_ffi::matmul_rhs_transposed_4b(
+                ordinal,
+                ScalarType::BF16,
                 1,
                 count,
                 vocab_size,
                 hidden_dim,
                 &normed,
                 &*weights.lm_head,
-                scale,
-                zero,
-                weights.lm_head_awq_inv_scale.as_ref(),
-                weights.int4_group_size,
-                qtype,
                 &mut logits_buf,
             )
-            .map_err(|e| anyhow::anyhow!("range greedy lm_head int4: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("range greedy lm_head tiled: {e}"))?;
+        } else {
+            let mut counter = GpuBuffer::zeros(ordinal, ScalarType::U32, &[1])
+                .map_err(|e| anyhow::anyhow!("range greedy matvec counter: {e}"))?;
+            kernel_ffi::standalone_matvec(
+                ordinal,
+                ScalarType::BF16,
+                &mut logits_buf,
+                &normed,
+                &*weights.lm_head,
+                hidden_dim,
+                vocab_size,
+                &mut counter,
+            )
+            .map_err(|e| anyhow::anyhow!("range greedy lm_head matvec: {e}"))?;
         }
-    } else if count > 1 {
-        kernel_ffi::matmul_rhs_transposed_4b(
-            ordinal,
-            ScalarType::BF16,
-            1,
-            count,
-            vocab_size,
-            hidden_dim,
-            &normed,
-            &*weights.lm_head,
-            &mut logits_buf,
-        )
-        .map_err(|e| anyhow::anyhow!("range greedy lm_head tiled: {e}"))?;
-    } else {
-        let mut counter = GpuBuffer::zeros(ordinal, ScalarType::U32, &[1])
-            .map_err(|e| anyhow::anyhow!("range greedy matvec counter: {e}"))?;
-        kernel_ffi::standalone_matvec(
-            ordinal,
-            ScalarType::BF16,
-            &mut logits_buf,
-            &normed,
-            &*weights.lm_head,
-            hidden_dim,
-            vocab_size,
-            &mut counter,
-        )
-        .map_err(|e| anyhow::anyhow!("range greedy lm_head matvec: {e}"))?;
+        prefill_ffi::argmax_bf16_rows(ordinal, count, vocab_size, &logits_buf, &mut out_index)
+            .map_err(|e| anyhow::anyhow!("range greedy argmax: {e}"))?;
     }
 
-    let mut out_index = GpuBuffer::zeros(ordinal, ScalarType::U32, &[count])
-        .map_err(|e| anyhow::anyhow!("range greedy argmax alloc: {e}"))?;
-    prefill_ffi::argmax_bf16_rows(ordinal, count, vocab_size, &logits_buf, &mut out_index)
-        .map_err(|e| anyhow::anyhow!("range greedy argmax: {e}"))?;
     let ids_bytes = out_index
         .to_host_bytes()
         .map_err(|e| anyhow::anyhow!("range greedy ids D2H: {e}"))?;
@@ -2081,6 +2414,8 @@ pub struct PrefillTreeVerifyCache {
     visibility_gpu: GpuBuffer,
     greedy_logits_gpu: GpuBuffer,
     greedy_indices_gpu: GpuBuffer,
+    greedy_block_best_vals_gpu: GpuBuffer,
+    greedy_block_best_indices_gpu: GpuBuffer,
     token_id_bytes: Vec<u8>,
     position_bytes: Vec<u8>,
     parent_id_bytes: Vec<u8>,
@@ -2111,6 +2446,13 @@ impl PrefillTreeVerifyCache {
                 .map_err(|e| anyhow::anyhow!("tree cache greedy logits alloc: {e}"))?;
         let greedy_indices_gpu = GpuBuffer::alloc(ordinal, ScalarType::U32, &[tree_len])
             .map_err(|e| anyhow::anyhow!("tree cache greedy indices alloc: {e}"))?;
+        let lm_head_tiles = (config.vocab_size + 15) / 16;
+        let greedy_block_best_vals_gpu =
+            GpuBuffer::alloc(ordinal, ScalarType::F32, &[tree_len, lm_head_tiles])
+                .map_err(|e| anyhow::anyhow!("tree cache greedy block-best vals alloc: {e}"))?;
+        let greedy_block_best_indices_gpu =
+            GpuBuffer::alloc(ordinal, ScalarType::U32, &[tree_len, lm_head_tiles])
+                .map_err(|e| anyhow::anyhow!("tree cache greedy block-best indices alloc: {e}"))?;
 
         Ok(Self {
             tree_len,
@@ -2124,6 +2466,8 @@ impl PrefillTreeVerifyCache {
             visibility_gpu,
             greedy_logits_gpu,
             greedy_indices_gpu,
+            greedy_block_best_vals_gpu,
+            greedy_block_best_indices_gpu,
             token_id_bytes: Vec::with_capacity(tree_len * 4),
             position_bytes: Vec::with_capacity(tree_len * 4),
             parent_id_bytes: Vec::with_capacity(tree_len * 4),
@@ -2285,8 +2629,9 @@ impl PrefillTreeVerifyCache {
             "tree cache greedy final norm",
         )?;
 
+        let mut fused_argmax = false;
         if let Some((qtype, scale, zero)) = weights.lm_head_lowbit_params(hidden_dim) {
-            if !maybe_matmul_q6_k_mmq_lm_head(
+            fused_argmax = maybe_matmul_q6_k_lm_head_argmax(
                 self.ordinal,
                 1,
                 self.tree_len,
@@ -2296,24 +2641,40 @@ impl PrefillTreeVerifyCache {
                 weights.lm_head_awq_inv_scale.as_ref(),
                 &self.scratch.normed,
                 &*weights.lm_head,
-                &mut self.greedy_logits_gpu,
-            )? {
-                prefill_ffi::matmul_rhs_transposed_int4(
+                &mut self.greedy_block_best_vals_gpu,
+                &mut self.greedy_block_best_indices_gpu,
+                &mut self.greedy_indices_gpu,
+            )?;
+            if !fused_argmax {
+                if !maybe_matmul_q6_k_mmq_lm_head(
                     self.ordinal,
                     1,
                     self.tree_len,
                     vocab_size,
                     hidden_dim,
+                    qtype,
+                    weights.lm_head_awq_inv_scale.as_ref(),
                     &self.scratch.normed,
                     &*weights.lm_head,
-                    scale,
-                    zero,
-                    weights.lm_head_awq_inv_scale.as_ref(),
-                    weights.int4_group_size,
-                    qtype,
                     &mut self.greedy_logits_gpu,
-                )
-                .map_err(|e| anyhow::anyhow!("tree cache greedy lm_head int4: {e}"))?;
+                )? {
+                    prefill_ffi::matmul_rhs_transposed_int4(
+                        self.ordinal,
+                        1,
+                        self.tree_len,
+                        vocab_size,
+                        hidden_dim,
+                        &self.scratch.normed,
+                        &*weights.lm_head,
+                        scale,
+                        zero,
+                        weights.lm_head_awq_inv_scale.as_ref(),
+                        weights.int4_group_size,
+                        qtype,
+                        &mut self.greedy_logits_gpu,
+                    )
+                    .map_err(|e| anyhow::anyhow!("tree cache greedy lm_head int4: {e}"))?;
+                }
             }
         } else if self.tree_len > 1 {
             kernel_ffi::matmul_rhs_transposed_4b(
@@ -2344,14 +2705,16 @@ impl PrefillTreeVerifyCache {
             .map_err(|e| anyhow::anyhow!("tree cache greedy lm_head matvec: {e}"))?;
         }
 
-        prefill_ffi::argmax_bf16_rows(
-            self.ordinal,
-            self.tree_len,
-            vocab_size,
-            &self.greedy_logits_gpu,
-            &mut self.greedy_indices_gpu,
-        )
-        .map_err(|e| anyhow::anyhow!("tree cache greedy argmax: {e}"))?;
+        if !fused_argmax {
+            prefill_ffi::argmax_bf16_rows(
+                self.ordinal,
+                self.tree_len,
+                vocab_size,
+                &self.greedy_logits_gpu,
+                &mut self.greedy_indices_gpu,
+            )
+            .map_err(|e| anyhow::anyhow!("tree cache greedy argmax: {e}"))?;
+        }
         let ids_bytes = self
             .greedy_indices_gpu
             .to_host_bytes()
@@ -5917,32 +6280,50 @@ fn prefill_full_attention_layer(
         }
     }
 
-    // 15. O projection
-    matmul_proj(
-        ordinal,
-        1,
-        chunk_len,
-        hidden_dim,
-        q_dim,
-        &scratch.proj_buf,
-        &fw.o_proj_w,
-        fw.o_proj_scale.as_ref(),
-        fw.o_proj_int8_scale.as_ref(),
-        weights.fp8_block_size,
-        &mut scratch.proj_buf2,
-        fw.o_proj_int4_scale.as_ref(),
-        fw.o_proj_int4_zero.as_ref(),
-        fw.o_proj_awq_inv_scale.as_ref(),
-        weights.int4_group_size,
-    )?;
+    // 15-16. O projection + residual
+    let fused_residual = !scratch.has_f32_activation_carry()
+        && matmul_proj_residual_add_inplace(
+            ordinal,
+            1,
+            chunk_len,
+            hidden_dim,
+            q_dim,
+            &scratch.proj_buf,
+            &fw.o_proj_w,
+            fw.o_proj_scale.as_ref(),
+            fw.o_proj_int8_scale.as_ref(),
+            &mut scratch.hidden,
+            fw.o_proj_int4_scale.as_ref(),
+            fw.o_proj_int4_zero.as_ref(),
+            fw.o_proj_awq_inv_scale.as_ref(),
+            weights.int4_group_size,
+        )?;
+    if !fused_residual {
+        matmul_proj(
+            ordinal,
+            1,
+            chunk_len,
+            hidden_dim,
+            q_dim,
+            &scratch.proj_buf,
+            &fw.o_proj_w,
+            fw.o_proj_scale.as_ref(),
+            fw.o_proj_int8_scale.as_ref(),
+            weights.fp8_block_size,
+            &mut scratch.proj_buf2,
+            fw.o_proj_int4_scale.as_ref(),
+            fw.o_proj_int4_zero.as_ref(),
+            fw.o_proj_awq_inv_scale.as_ref(),
+            weights.int4_group_size,
+        )?;
 
-    // 16. Residual
-    scratch.residual_add_from_source(
-        ordinal,
-        chunk_len * hidden_dim,
-        ResidualSource::ProjBuf2,
-        "attention residual",
-    )?;
+        scratch.residual_add_from_source(
+            ordinal,
+            chunk_len * hidden_dim,
+            ResidualSource::ProjBuf2,
+            "attention residual",
+        )?;
+    }
 
     Ok(())
 }
@@ -6466,31 +6847,50 @@ fn prefill_tree_full_attention_layer(
         }
     }
 
-    matmul_proj(
-        ordinal,
-        1,
-        tree_len,
-        hidden_dim,
-        q_dim,
-        &scratch.proj_buf,
-        &fw.o_proj_w,
-        fw.o_proj_scale.as_ref(),
-        fw.o_proj_int8_scale.as_ref(),
-        weights.fp8_block_size,
-        &mut scratch.proj_buf2,
-        fw.o_proj_int4_scale.as_ref(),
-        fw.o_proj_int4_zero.as_ref(),
-        fw.o_proj_awq_inv_scale.as_ref(),
-        weights.int4_group_size,
-    )?;
+    let fused_residual = !scratch.has_f32_activation_carry()
+        && matmul_proj_residual_add_inplace(
+            ordinal,
+            1,
+            tree_len,
+            hidden_dim,
+            q_dim,
+            &scratch.proj_buf,
+            &fw.o_proj_w,
+            fw.o_proj_scale.as_ref(),
+            fw.o_proj_int8_scale.as_ref(),
+            &mut scratch.hidden,
+            fw.o_proj_int4_scale.as_ref(),
+            fw.o_proj_int4_zero.as_ref(),
+            fw.o_proj_awq_inv_scale.as_ref(),
+            weights.int4_group_size,
+        )?;
+    if !fused_residual {
+        matmul_proj(
+            ordinal,
+            1,
+            tree_len,
+            hidden_dim,
+            q_dim,
+            &scratch.proj_buf,
+            &fw.o_proj_w,
+            fw.o_proj_scale.as_ref(),
+            fw.o_proj_int8_scale.as_ref(),
+            weights.fp8_block_size,
+            &mut scratch.proj_buf2,
+            fw.o_proj_int4_scale.as_ref(),
+            fw.o_proj_int4_zero.as_ref(),
+            fw.o_proj_awq_inv_scale.as_ref(),
+            weights.int4_group_size,
+        )?;
 
-    residual_add(
-        ordinal,
-        tree_len * hidden_dim,
-        &mut scratch.hidden,
-        &scratch.proj_buf2,
-    )
-    .map_err(|e| anyhow::anyhow!("tree layer {idx} attention residual: {e}"))?;
+        residual_add(
+            ordinal,
+            tree_len * hidden_dim,
+            &mut scratch.hidden,
+            &scratch.proj_buf2,
+        )
+        .map_err(|e| anyhow::anyhow!("tree layer {idx} attention residual: {e}"))?;
+    }
 
     Ok(())
 }
@@ -7271,88 +7671,127 @@ fn prefill_linear_attention_layer(
     let state_elems = nv * khd * vhd;
     let elem_bytes_f32 = ScalarType::F32.size_in_bytes();
     let out_rows = chunk_len + khd;
-    let zero_recurrent;
-    let recurrent_initial = if let Some(rec_state) = state.layers[idx].recurrent_state.as_ref() {
-        rec_state
-    } else {
-        zero_recurrent = GpuBuffer::zeros(ordinal, ScalarType::F32, &[nv, khd, vhd])
-            .map_err(|e| anyhow::anyhow!("zero recurrent alloc: {e}"))?;
-        &zero_recurrent
-    };
-
-    if let Some(capture) = append_capture.as_mut() {
-        if capture.recurrent_trace.dtype() == ScalarType::U8 {
-            prefill_ffi::delta_recurrent_prefill_capture_q8_trace(
-                ordinal,
-                ScalarType::F32,
-                nv, // batch_heads
-                chunk_len,
-                khd,
-                vhd,
-                recurrent_initial,
-                &scratch.linear_q_trans,
-                &scratch.linear_k_trans,
-                &scratch.linear_v_trans,
-                &scratch.linear_beta,
-                &scratch.linear_g,
-                &mut scratch.linear_delta_out,
-                &mut capture.recurrent_trace,
-            )
-            .map_err(|e| anyhow::anyhow!("layer {idx} delta recurrent Q8 trace capture: {e}"))?;
-        } else if capture.recurrent_trace.dtype() == ScalarType::BF16 {
-            prefill_ffi::delta_recurrent_prefill_capture_bf16_trace(
-                ordinal,
-                ScalarType::F32,
-                nv, // batch_heads
-                chunk_len,
-                khd,
-                vhd,
-                recurrent_initial,
-                &scratch.linear_q_trans,
-                &scratch.linear_k_trans,
-                &scratch.linear_v_trans,
-                &scratch.linear_beta,
-                &scratch.linear_g,
-                &mut scratch.linear_delta_out,
-                &mut capture.recurrent_trace,
-            )
-            .map_err(|e| anyhow::anyhow!("layer {idx} delta recurrent BF16 trace capture: {e}"))?;
-        } else {
-            prefill_ffi::delta_recurrent_prefill_capture(
-                ordinal,
-                ScalarType::F32,
-                nv, // batch_heads
-                chunk_len,
-                khd,
-                vhd,
-                recurrent_initial,
-                &scratch.linear_q_trans,
-                &scratch.linear_k_trans,
-                &scratch.linear_v_trans,
-                &scratch.linear_beta,
-                &scratch.linear_g,
-                &mut scratch.linear_delta_out,
-                &mut capture.recurrent_trace,
-            )
-            .map_err(|e| anyhow::anyhow!("layer {idx} delta recurrent capture: {e}"))?;
+    let mut recurrent_attn_direct = false;
+    if !trace_linear_debug {
+        if let Some(capture) = append_capture.as_mut() {
+            if capture.recurrent_trace.dtype() == ScalarType::U8 {
+                if let Some(rec_state) = state.layers[idx].recurrent_state.as_mut() {
+                    recurrent_attn_direct =
+                        prefill_ffi::delta_recurrent_prefill_capture_q8_trace_attn(
+                            ordinal,
+                            ScalarType::F32,
+                            nv, // batch_heads
+                            chunk_len,
+                            khd,
+                            vhd,
+                            rec_state,
+                            &scratch.linear_q_trans,
+                            &scratch.linear_k_trans,
+                            &scratch.linear_v_trans,
+                            &scratch.linear_beta,
+                            &scratch.linear_g,
+                            &mut scratch.linear_attn_output,
+                            &mut capture.recurrent_trace,
+                        )
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "layer {idx} delta recurrent Q8 trace direct attention: {e}"
+                            )
+                        })?;
+                }
+            }
         }
-    } else {
-        prefill_ffi::delta_recurrent_prefill(
-            ordinal,
-            ScalarType::F32,
-            nv, // batch_heads
-            chunk_len,
-            khd,
-            vhd,
-            recurrent_initial,
-            &scratch.linear_q_trans,
-            &scratch.linear_k_trans,
-            &scratch.linear_v_trans,
-            &scratch.linear_beta,
-            &scratch.linear_g,
-            &mut scratch.linear_delta_out,
-        )
-        .map_err(|e| anyhow::anyhow!("layer {idx} delta recurrent: {e}"))?;
+    }
+
+    if !recurrent_attn_direct {
+        let zero_recurrent;
+        let recurrent_initial = if let Some(rec_state) = state.layers[idx].recurrent_state.as_ref()
+        {
+            rec_state
+        } else {
+            zero_recurrent = GpuBuffer::zeros(ordinal, ScalarType::F32, &[nv, khd, vhd])
+                .map_err(|e| anyhow::anyhow!("zero recurrent alloc: {e}"))?;
+            &zero_recurrent
+        };
+
+        if let Some(capture) = append_capture.as_mut() {
+            if capture.recurrent_trace.dtype() == ScalarType::U8 {
+                prefill_ffi::delta_recurrent_prefill_capture_q8_trace(
+                    ordinal,
+                    ScalarType::F32,
+                    nv, // batch_heads
+                    chunk_len,
+                    khd,
+                    vhd,
+                    recurrent_initial,
+                    &scratch.linear_q_trans,
+                    &scratch.linear_k_trans,
+                    &scratch.linear_v_trans,
+                    &scratch.linear_beta,
+                    &scratch.linear_g,
+                    &mut scratch.linear_delta_out,
+                    &mut capture.recurrent_trace,
+                )
+                .map_err(|e| {
+                    anyhow::anyhow!("layer {idx} delta recurrent Q8 trace capture: {e}")
+                })?;
+            } else if capture.recurrent_trace.dtype() == ScalarType::BF16 {
+                prefill_ffi::delta_recurrent_prefill_capture_bf16_trace(
+                    ordinal,
+                    ScalarType::F32,
+                    nv, // batch_heads
+                    chunk_len,
+                    khd,
+                    vhd,
+                    recurrent_initial,
+                    &scratch.linear_q_trans,
+                    &scratch.linear_k_trans,
+                    &scratch.linear_v_trans,
+                    &scratch.linear_beta,
+                    &scratch.linear_g,
+                    &mut scratch.linear_delta_out,
+                    &mut capture.recurrent_trace,
+                )
+                .map_err(|e| {
+                    anyhow::anyhow!("layer {idx} delta recurrent BF16 trace capture: {e}")
+                })?;
+            } else {
+                prefill_ffi::delta_recurrent_prefill_capture(
+                    ordinal,
+                    ScalarType::F32,
+                    nv, // batch_heads
+                    chunk_len,
+                    khd,
+                    vhd,
+                    recurrent_initial,
+                    &scratch.linear_q_trans,
+                    &scratch.linear_k_trans,
+                    &scratch.linear_v_trans,
+                    &scratch.linear_beta,
+                    &scratch.linear_g,
+                    &mut scratch.linear_delta_out,
+                    &mut capture.recurrent_trace,
+                )
+                .map_err(|e| anyhow::anyhow!("layer {idx} delta recurrent capture: {e}"))?;
+            }
+        } else {
+            prefill_ffi::delta_recurrent_prefill(
+                ordinal,
+                ScalarType::F32,
+                nv, // batch_heads
+                chunk_len,
+                khd,
+                vhd,
+                recurrent_initial,
+                &scratch.linear_q_trans,
+                &scratch.linear_k_trans,
+                &scratch.linear_v_trans,
+                &scratch.linear_beta,
+                &scratch.linear_g,
+                &mut scratch.linear_delta_out,
+            )
+            .map_err(|e| anyhow::anyhow!("layer {idx} delta recurrent: {e}"))?;
+        }
     }
 
     // 12. Extract recurrent state from delta_out and write F32 directly back to
@@ -7367,7 +7806,10 @@ fn prefill_linear_attention_layer(
     let mut attn_output_f32_debug: Option<Vec<u8>> = None;
 
     if !trace_linear_debug {
-        if let Some(ref mut rec_state) = state.layers[idx].recurrent_state {
+        if recurrent_attn_direct {
+            // Direct recurrent capture already wrote BF16 attention output and
+            // updated the persistent F32 recurrent state.
+        } else if let Some(ref mut rec_state) = state.layers[idx].recurrent_state {
             prefill_ffi::dflash_extract_recurrent_attn(
                 ordinal,
                 nv,
@@ -7560,24 +8002,45 @@ fn prefill_linear_attention_layer(
         trace.gated = bytes[start..start + row_bytes].to_vec();
     }
 
-    // 16. O projection: [S, val_dim] × out_proj_w [hidden, val_dim]^T → [S, hidden]
-    matmul_proj(
-        ordinal,
-        1,
-        chunk_len,
-        hidden_dim,
-        val_dim,
-        &scratch.linear_gated_s_first,
-        &lw.out_proj_w,
-        lw.out_proj_scale.as_ref(),
-        lw.out_proj_int8_scale.as_ref(),
-        weights.fp8_block_size,
-        &mut scratch.proj_buf2,
-        lw.out_proj_int4_scale.as_ref(),
-        lw.out_proj_int4_zero.as_ref(),
-        lw.out_proj_awq_inv_scale.as_ref(),
-        weights.int4_group_size,
-    )?;
+    // 16-17. O projection + residual:
+    // [S, val_dim] × out_proj_w [hidden, val_dim]^T → hidden += [S, hidden].
+    let fused_residual = !trace_linear_debug
+        && !scratch.has_f32_activation_carry()
+        && matmul_proj_residual_add_inplace(
+            ordinal,
+            1,
+            chunk_len,
+            hidden_dim,
+            val_dim,
+            &scratch.linear_gated_s_first,
+            &lw.out_proj_w,
+            lw.out_proj_scale.as_ref(),
+            lw.out_proj_int8_scale.as_ref(),
+            &mut scratch.hidden,
+            lw.out_proj_int4_scale.as_ref(),
+            lw.out_proj_int4_zero.as_ref(),
+            lw.out_proj_awq_inv_scale.as_ref(),
+            weights.int4_group_size,
+        )?;
+    if !fused_residual {
+        matmul_proj(
+            ordinal,
+            1,
+            chunk_len,
+            hidden_dim,
+            val_dim,
+            &scratch.linear_gated_s_first,
+            &lw.out_proj_w,
+            lw.out_proj_scale.as_ref(),
+            lw.out_proj_int8_scale.as_ref(),
+            weights.fp8_block_size,
+            &mut scratch.proj_buf2,
+            lw.out_proj_int4_scale.as_ref(),
+            lw.out_proj_int4_zero.as_ref(),
+            lw.out_proj_awq_inv_scale.as_ref(),
+            weights.int4_group_size,
+        )?;
+    }
     if trace_linear_debug {
         let trace = linear_debug_trace
             .as_mut()
@@ -7591,13 +8054,14 @@ fn prefill_linear_attention_layer(
         trace.proj_out = bytes[start..start + row_bytes].to_vec();
     }
 
-    // 17. Residual: hidden += O projection output
-    scratch.residual_add_from_source(
-        ordinal,
-        chunk_len * hidden_dim,
-        ResidualSource::ProjBuf2,
-        "linear attn residual",
-    )?;
+    if !fused_residual {
+        scratch.residual_add_from_source(
+            ordinal,
+            chunk_len * hidden_dim,
+            ResidualSource::ProjBuf2,
+            "linear attn residual",
+        )?;
+    }
 
     Ok(())
 }
@@ -8414,31 +8878,50 @@ fn prefill_tree_linear_attention_layer(
         .map_err(|e| anyhow::anyhow!("tree layer {idx} gated transpose: {e}"))?;
     }
 
-    matmul_proj(
-        ordinal,
-        1,
-        tree_len,
-        hidden_dim,
-        val_dim,
-        &scratch.linear_gated_s_first,
-        &lw.out_proj_w,
-        lw.out_proj_scale.as_ref(),
-        lw.out_proj_int8_scale.as_ref(),
-        weights.fp8_block_size,
-        &mut scratch.proj_buf2,
-        lw.out_proj_int4_scale.as_ref(),
-        lw.out_proj_int4_zero.as_ref(),
-        lw.out_proj_awq_inv_scale.as_ref(),
-        weights.int4_group_size,
-    )?;
+    let fused_residual = !scratch.has_f32_activation_carry()
+        && matmul_proj_residual_add_inplace(
+            ordinal,
+            1,
+            tree_len,
+            hidden_dim,
+            val_dim,
+            &scratch.linear_gated_s_first,
+            &lw.out_proj_w,
+            lw.out_proj_scale.as_ref(),
+            lw.out_proj_int8_scale.as_ref(),
+            &mut scratch.hidden,
+            lw.out_proj_int4_scale.as_ref(),
+            lw.out_proj_int4_zero.as_ref(),
+            lw.out_proj_awq_inv_scale.as_ref(),
+            weights.int4_group_size,
+        )?;
+    if !fused_residual {
+        matmul_proj(
+            ordinal,
+            1,
+            tree_len,
+            hidden_dim,
+            val_dim,
+            &scratch.linear_gated_s_first,
+            &lw.out_proj_w,
+            lw.out_proj_scale.as_ref(),
+            lw.out_proj_int8_scale.as_ref(),
+            weights.fp8_block_size,
+            &mut scratch.proj_buf2,
+            lw.out_proj_int4_scale.as_ref(),
+            lw.out_proj_int4_zero.as_ref(),
+            lw.out_proj_awq_inv_scale.as_ref(),
+            weights.int4_group_size,
+        )?;
 
-    residual_add(
-        ordinal,
-        tree_len * hidden_dim,
-        &mut scratch.hidden,
-        &scratch.proj_buf2,
-    )
-    .map_err(|e| anyhow::anyhow!("tree layer {idx} linear attn residual: {e}"))?;
+        residual_add(
+            ordinal,
+            tree_len * hidden_dim,
+            &mut scratch.hidden,
+            &scratch.proj_buf2,
+        )
+        .map_err(|e| anyhow::anyhow!("tree layer {idx} linear attn residual: {e}"))?;
+    }
 
     Ok(())
 }
@@ -8455,88 +8938,113 @@ fn prefill_mlp_layer(
     let hidden_dim = config.hidden_size;
     let intermediate = config.intermediate_size;
 
-    // gate_proj: normed [seq, hidden] x gate_w [intermediate, hidden]^T -> [seq, intermediate]
-    if let Some(sc) = lw.gate_proj_int8_scale.as_ref() {
-        matmul_int8_mixed_host(
-            ordinal,
-            1,
-            seq_len,
-            intermediate,
-            hidden_dim,
-            &scratch.normed,
-            weights,
-            &format!(
-                "{}.layers.{idx}.mlp.gate_proj.weight",
-                weights.weight_prefix
-            ),
-            &lw.gate_proj_w,
-            sc,
-            &mut scratch.proj_buf,
-        )?;
-    } else {
-        matmul_proj(
-            ordinal,
-            1,
-            seq_len,
-            intermediate,
-            hidden_dim,
-            &scratch.normed,
-            &lw.gate_proj_w,
-            lw.gate_proj_scale.as_ref(),
-            lw.gate_proj_int8_scale.as_ref(),
-            weights.fp8_block_size,
-            &mut scratch.proj_buf,
-            lw.gate_proj_int4_scale.as_ref(),
-            lw.gate_proj_int4_zero.as_ref(),
-            lw.gate_proj_awq_inv_scale.as_ref(),
-            weights.int4_group_size,
-        )?;
-    }
-
-    // up_proj: normed [seq, hidden] x up_w [intermediate, hidden]^T -> [seq, intermediate]
-    if let Some(sc) = lw.up_proj_int8_scale.as_ref() {
-        matmul_int8_mixed_host(
-            ordinal,
-            1,
-            seq_len,
-            intermediate,
-            hidden_dim,
-            &scratch.normed,
-            weights,
-            &format!("{}.layers.{idx}.mlp.up_proj.weight", weights.weight_prefix),
-            &lw.up_proj_w,
-            sc,
-            &mut scratch.proj_buf2,
-        )?;
-    } else {
-        matmul_proj(
-            ordinal,
-            1,
-            seq_len,
-            intermediate,
-            hidden_dim,
-            &scratch.normed,
-            &lw.up_proj_w,
-            lw.up_proj_scale.as_ref(),
-            lw.up_proj_int8_scale.as_ref(),
-            weights.fp8_block_size,
-            &mut scratch.proj_buf2,
-            lw.up_proj_int4_scale.as_ref(),
-            lw.up_proj_int4_zero.as_ref(),
-            lw.up_proj_awq_inv_scale.as_ref(),
-            weights.int4_group_size,
-        )?;
-    }
-
-    // SwiGLU: out = silu(gate) * up
-    prefill_ffi::swiglu_mul(
+    let paired_gate_up = maybe_matmul_ggml_mlp_gate_up_pair(
         ordinal,
-        ScalarType::BF16,
-        seq_len * intermediate,
-        &scratch.proj_buf,
-        &scratch.proj_buf2,
+        1,
+        seq_len,
+        intermediate,
+        hidden_dim,
+        &scratch.normed,
+        &lw.gate_proj_w,
+        lw.gate_proj_scale.as_ref(),
+        lw.gate_proj_int8_scale.as_ref(),
+        lw.gate_proj_int4_scale.as_ref(),
+        lw.gate_proj_int4_zero.as_ref(),
+        lw.gate_proj_awq_inv_scale.as_ref(),
+        &lw.up_proj_w,
+        lw.up_proj_scale.as_ref(),
+        lw.up_proj_int8_scale.as_ref(),
+        lw.up_proj_int4_scale.as_ref(),
+        lw.up_proj_int4_zero.as_ref(),
+        lw.up_proj_awq_inv_scale.as_ref(),
+        &mut scratch.proj_buf,
         &mut scratch.mlp_buf,
     )?;
+
+    if !paired_gate_up {
+        // gate_proj: normed [seq, hidden] x gate_w [intermediate, hidden]^T -> [seq, intermediate]
+        if let Some(sc) = lw.gate_proj_int8_scale.as_ref() {
+            matmul_int8_mixed_host(
+                ordinal,
+                1,
+                seq_len,
+                intermediate,
+                hidden_dim,
+                &scratch.normed,
+                weights,
+                &format!(
+                    "{}.layers.{idx}.mlp.gate_proj.weight",
+                    weights.weight_prefix
+                ),
+                &lw.gate_proj_w,
+                sc,
+                &mut scratch.proj_buf,
+            )?;
+        } else {
+            matmul_proj(
+                ordinal,
+                1,
+                seq_len,
+                intermediate,
+                hidden_dim,
+                &scratch.normed,
+                &lw.gate_proj_w,
+                lw.gate_proj_scale.as_ref(),
+                lw.gate_proj_int8_scale.as_ref(),
+                weights.fp8_block_size,
+                &mut scratch.proj_buf,
+                lw.gate_proj_int4_scale.as_ref(),
+                lw.gate_proj_int4_zero.as_ref(),
+                lw.gate_proj_awq_inv_scale.as_ref(),
+                weights.int4_group_size,
+            )?;
+        }
+
+        // up_proj: normed [seq, hidden] x up_w [intermediate, hidden]^T -> [seq, intermediate]
+        if let Some(sc) = lw.up_proj_int8_scale.as_ref() {
+            matmul_int8_mixed_host(
+                ordinal,
+                1,
+                seq_len,
+                intermediate,
+                hidden_dim,
+                &scratch.normed,
+                weights,
+                &format!("{}.layers.{idx}.mlp.up_proj.weight", weights.weight_prefix),
+                &lw.up_proj_w,
+                sc,
+                &mut scratch.proj_buf2,
+            )?;
+        } else {
+            matmul_proj(
+                ordinal,
+                1,
+                seq_len,
+                intermediate,
+                hidden_dim,
+                &scratch.normed,
+                &lw.up_proj_w,
+                lw.up_proj_scale.as_ref(),
+                lw.up_proj_int8_scale.as_ref(),
+                weights.fp8_block_size,
+                &mut scratch.proj_buf2,
+                lw.up_proj_int4_scale.as_ref(),
+                lw.up_proj_int4_zero.as_ref(),
+                lw.up_proj_awq_inv_scale.as_ref(),
+                weights.int4_group_size,
+            )?;
+        }
+
+        // SwiGLU: out = silu(gate) * up
+        prefill_ffi::swiglu_mul(
+            ordinal,
+            ScalarType::BF16,
+            seq_len * intermediate,
+            &scratch.proj_buf,
+            &scratch.proj_buf2,
+            &mut scratch.mlp_buf,
+        )?;
+    }
 
     // down_proj: mlp_buf [seq, intermediate] x down_w [hidden, intermediate]^T -> [seq, hidden]
     if let Some(sc) = lw.down_proj_int8_scale.as_ref() {
@@ -8556,29 +9064,22 @@ fn prefill_mlp_layer(
             sc,
             &mut scratch.proj_buf,
         )?;
+        scratch.residual_add_from_source(
+            ordinal,
+            seq_len * hidden_dim,
+            ResidualSource::ProjBuf,
+            "MLP residual",
+        )?;
     } else {
         let down_qtype = qwen35::weights::infer_lowbit_type(
             &lw.down_proj_w,
             intermediate,
             lw.down_proj_int4_scale.is_some(),
         );
-        if !maybe_matmul_q6_k_mmq_mlp_down(
-            ordinal,
-            1,
-            seq_len,
-            hidden_dim,
-            intermediate,
-            down_qtype,
-            lw.down_proj_scale.as_ref(),
-            lw.down_proj_int4_scale.as_ref(),
-            lw.down_proj_int4_zero.as_ref(),
-            lw.down_proj_awq_inv_scale.as_ref(),
-            &scratch.mlp_buf,
-            &lw.down_proj_w,
-            &mut scratch.proj_buf,
-            &mut scratch.q6_k_mmq_q8_workspace,
-        )? {
-            matmul_proj(
+        let fused_down_residual = down_qtype != qwen35::weights::LOWBIT_GGML_Q6_K
+            && env::var_os("SUPERSONIC_DFLASH_DISABLE_MLP_DOWN_RESIDUAL_FUSED_MATMUL").is_none()
+            && !scratch.has_f32_activation_carry()
+            && matmul_proj_residual_add_inplace(
                 ordinal,
                 1,
                 seq_len,
@@ -8588,23 +9089,73 @@ fn prefill_mlp_layer(
                 &lw.down_proj_w,
                 lw.down_proj_scale.as_ref(),
                 lw.down_proj_int8_scale.as_ref(),
-                weights.fp8_block_size,
-                &mut scratch.proj_buf,
+                &mut scratch.hidden,
                 lw.down_proj_int4_scale.as_ref(),
                 lw.down_proj_int4_zero.as_ref(),
                 lw.down_proj_awq_inv_scale.as_ref(),
                 weights.int4_group_size,
             )?;
+        let q6_fused_down_residual = !fused_down_residual
+            && !scratch.has_f32_activation_carry()
+            && maybe_matmul_q6_k_mmq_mlp_down_residual_add(
+                ordinal,
+                1,
+                seq_len,
+                hidden_dim,
+                intermediate,
+                down_qtype,
+                lw.down_proj_scale.as_ref(),
+                lw.down_proj_int4_scale.as_ref(),
+                lw.down_proj_int4_zero.as_ref(),
+                lw.down_proj_awq_inv_scale.as_ref(),
+                &scratch.mlp_buf,
+                &lw.down_proj_w,
+                &mut scratch.hidden,
+                &mut scratch.q6_k_mmq_q8_workspace,
+            )?;
+        if !fused_down_residual && !q6_fused_down_residual {
+            if !maybe_matmul_q6_k_mmq_mlp_down(
+                ordinal,
+                1,
+                seq_len,
+                hidden_dim,
+                intermediate,
+                down_qtype,
+                lw.down_proj_scale.as_ref(),
+                lw.down_proj_int4_scale.as_ref(),
+                lw.down_proj_int4_zero.as_ref(),
+                lw.down_proj_awq_inv_scale.as_ref(),
+                &scratch.mlp_buf,
+                &lw.down_proj_w,
+                &mut scratch.proj_buf,
+                &mut scratch.q6_k_mmq_q8_workspace,
+            )? {
+                matmul_proj(
+                    ordinal,
+                    1,
+                    seq_len,
+                    hidden_dim,
+                    intermediate,
+                    &scratch.mlp_buf,
+                    &lw.down_proj_w,
+                    lw.down_proj_scale.as_ref(),
+                    lw.down_proj_int8_scale.as_ref(),
+                    weights.fp8_block_size,
+                    &mut scratch.proj_buf,
+                    lw.down_proj_int4_scale.as_ref(),
+                    lw.down_proj_int4_zero.as_ref(),
+                    lw.down_proj_awq_inv_scale.as_ref(),
+                    weights.int4_group_size,
+                )?;
+            }
+            scratch.residual_add_from_source(
+                ordinal,
+                seq_len * hidden_dim,
+                ResidualSource::ProjBuf,
+                "MLP residual",
+            )?;
         }
     }
-
-    // Residual: hidden += down_proj output
-    scratch.residual_add_from_source(
-        ordinal,
-        seq_len * hidden_dim,
-        ResidualSource::ProjBuf,
-        "MLP residual",
-    )?;
 
     Ok(())
 }

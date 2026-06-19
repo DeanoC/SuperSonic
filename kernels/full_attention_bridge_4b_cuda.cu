@@ -3809,6 +3809,108 @@ extern "C" int supersonic_qwen35_4b_hip_matmul_int4_dequant(
     }
 }
 
+extern "C" int supersonic_qwen35_4b_hip_matmul_int4_dequant_residual_add(
+    int dtype,
+    size_t device_ordinal,
+    size_t batch_elems,
+    int m, int n, int k,
+    const void* lhs,
+    const void* rhs_int4,
+    const void* scale,
+    const void* zero,
+    const void* awq_inv_scale,
+    int group_size,
+    int quant_type,
+    const void* residual,
+    void* out) {
+    (void)dtype; (void)device_ordinal; (void)batch_elems;
+    (void)m; (void)n; (void)k; (void)lhs; (void)rhs_int4;
+    (void)scale; (void)zero; (void)awq_inv_scale; (void)group_size;
+    (void)quant_type; (void)residual; (void)out;
+    return 312;
+}
+
+extern "C" int supersonic_qwen35_4b_hip_matmul_ggml_pair_dequant(
+    int dtype,
+    size_t device_ordinal,
+    size_t batch_elems,
+    int m, int n_each, int k,
+    const void* lhs,
+    const void* rhs_first,
+    const void* rhs_second,
+    int quant_type,
+    void* out) {
+    (void)dtype; (void)device_ordinal; (void)batch_elems;
+    (void)m; (void)n_each; (void)k; (void)lhs; (void)rhs_first;
+    (void)rhs_second; (void)quant_type; (void)out;
+    return 322;
+}
+
+extern "C" int supersonic_qwen35_4b_hip_matmul_ggml_pair_swiglu(
+    int dtype,
+    size_t device_ordinal,
+    size_t batch_elems,
+    int m, int n_each, int k,
+    const void* lhs,
+    const void* rhs_gate,
+    const void* rhs_up,
+    int quant_type,
+    void* out) {
+    (void)dtype; (void)device_ordinal; (void)batch_elems;
+    (void)m; (void)n_each; (void)k; (void)lhs; (void)rhs_gate;
+    (void)rhs_up; (void)quant_type; (void)out;
+    return 322;
+}
+
+extern "C" int supersonic_qwen35_4b_hip_matmul_mmq_q8_1_q6_k(
+    int dtype,
+    size_t device_ordinal,
+    size_t batch_elems,
+    int m,
+    int n,
+    int k,
+    const void* q8,
+    const void* rhs_q6,
+    void* out) {
+    (void)dtype; (void)device_ordinal; (void)batch_elems;
+    (void)m; (void)n; (void)k; (void)q8; (void)rhs_q6; (void)out;
+    return 305;
+}
+
+extern "C" int supersonic_qwen35_4b_hip_matmul_mmq_q8_1_q6_k_residual_add(
+    int dtype,
+    size_t device_ordinal,
+    size_t batch_elems,
+    int m,
+    int n,
+    int k,
+    const void* q8,
+    const void* rhs_q6,
+    const void* residual,
+    void* out) {
+    (void)dtype; (void)device_ordinal; (void)batch_elems;
+    (void)m; (void)n; (void)k; (void)q8; (void)rhs_q6; (void)residual; (void)out;
+    return 305;
+}
+
+extern "C" int supersonic_qwen35_4b_hip_matmul_q6_k_m16_argmax(
+    int dtype,
+    size_t device_ordinal,
+    size_t batch_elems,
+    int m,
+    int n,
+    int k,
+    const void* lhs,
+    const void* rhs_q6,
+    void* block_best_vals,
+    void* block_best_indices,
+    void* out_indices) {
+    (void)dtype; (void)device_ordinal; (void)batch_elems;
+    (void)m; (void)n; (void)k; (void)lhs; (void)rhs_q6;
+    (void)block_best_vals; (void)block_best_indices; (void)out_indices;
+    return 340;
+}
+
 template <typename T>
 int matmul_int8_device(
     int device_ordinal,

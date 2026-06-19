@@ -1750,23 +1750,49 @@ fn draft_forward_and_sample(
             block_size * vocab
         );
     }
+    let need_draft_logits = ddtree_probe_config.is_some();
+    let mut fused_argmax = false;
     if let Some((lm_head_qtype, scale, zero)) = target_weights.lm_head_lowbit_params(hidden) {
-        kernel_ffi::prefill_ffi::matmul_rhs_transposed_int4(
-            ordinal,
-            1,          // batch
-            block_size, // m
-            vocab,      // n
-            hidden,     // k
-            &draft_scratch.final_hidden,
-            lm_head_buf,
-            scale,
-            zero,
-            target_weights.lm_head_awq_inv_scale.as_ref(),
-            target_weights.int4_group_size,
-            lm_head_qtype,
-            &mut draft_scratch.logits,
-        )
-        .map_err(|e| anyhow!("draft lm_head low-bit matmul: {e}"))?;
+        if !need_draft_logits
+            && env::var_os("SUPERSONIC_DFLASH_DISABLE_Q6_K_LM_HEAD_ARGMAX_FUSED").is_none()
+            && block_size == 16
+            && vocab % 16 == 0
+            && hidden % 256 == 0
+            && lm_head_qtype == qwen35::weights::LOWBIT_GGML_Q6_K
+            && target_weights.lm_head_awq_inv_scale.is_none()
+        {
+            fused_argmax = kernel_ffi::prefill_ffi::matmul_q6_k_m16_argmax(
+                ordinal,
+                1,          // batch
+                block_size, // m
+                vocab,      // n
+                hidden,     // k
+                &draft_scratch.final_hidden,
+                lm_head_buf,
+                &mut draft_scratch.lm_head_block_best_vals,
+                &mut draft_scratch.lm_head_block_best_indices,
+                &mut draft_scratch.argmax_indices,
+            )
+            .map_err(|e| anyhow!("draft lm_head fused argmax: {e}"))?;
+        }
+        if !fused_argmax {
+            kernel_ffi::prefill_ffi::matmul_rhs_transposed_int4(
+                ordinal,
+                1,          // batch
+                block_size, // m
+                vocab,      // n
+                hidden,     // k
+                &draft_scratch.final_hidden,
+                lm_head_buf,
+                scale,
+                zero,
+                target_weights.lm_head_awq_inv_scale.as_ref(),
+                target_weights.int4_group_size,
+                lm_head_qtype,
+                &mut draft_scratch.logits,
+            )
+            .map_err(|e| anyhow!("draft lm_head low-bit matmul: {e}"))?;
+        }
     } else {
         kernel_ffi::matmul_rhs_transposed_4b(
             ordinal,
@@ -1787,14 +1813,16 @@ fn draft_forward_and_sample(
 
     // 5) GPU argmax per position, then D2H only the token IDs.
     let t_argmax = Instant::now();
-    kernel_ffi::prefill_ffi::argmax_bf16_rows(
-        ordinal,
-        block_size,
-        vocab,
-        &draft_scratch.logits,
-        &mut draft_scratch.argmax_indices,
-    )
-    .map_err(|e| anyhow!("draft logits argmax: {e}"))?;
+    if !fused_argmax {
+        kernel_ffi::prefill_ffi::argmax_bf16_rows(
+            ordinal,
+            block_size,
+            vocab,
+            &draft_scratch.logits,
+            &mut draft_scratch.argmax_indices,
+        )
+        .map_err(|e| anyhow!("draft logits argmax: {e}"))?;
+    }
     let argmax_bytes = draft_scratch
         .argmax_indices
         .to_host_bytes()

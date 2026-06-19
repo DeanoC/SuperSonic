@@ -1153,6 +1153,24 @@ unsafe extern "C" {
         out: *mut c_void,
     ) -> c_int;
 
+    fn supersonic_qwen35_4b_hip_matmul_int4_dequant_residual_add(
+        dtype: c_int,
+        device_ordinal: usize,
+        batch_elems: usize,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        lhs: *const c_void,
+        rhs_int4: *const c_void,
+        scale: *const c_void,
+        zero: *const c_void,
+        awq_inv_scale: *const c_void,
+        group_size: c_int,
+        quant_type: c_int,
+        residual: *const c_void,
+        out: *mut c_void,
+    ) -> c_int;
+
     fn supersonic_qwen35_4b_hip_matmul_ggml_pair_dequant(
         dtype: c_int,
         device_ordinal: usize,
@@ -1163,6 +1181,20 @@ unsafe extern "C" {
         lhs: *const c_void,
         rhs_first: *const c_void,
         rhs_second: *const c_void,
+        quant_type: c_int,
+        out: *mut c_void,
+    ) -> c_int;
+
+    fn supersonic_qwen35_4b_hip_matmul_ggml_pair_swiglu(
+        dtype: c_int,
+        device_ordinal: usize,
+        batch_elems: usize,
+        m: c_int,
+        n_each: c_int,
+        k: c_int,
+        lhs: *const c_void,
+        rhs_gate: *const c_void,
+        rhs_up: *const c_void,
         quant_type: c_int,
         out: *mut c_void,
     ) -> c_int;
@@ -1188,6 +1220,33 @@ unsafe extern "C" {
         q8: *const c_void,
         rhs_q6: *const c_void,
         out: *mut c_void,
+    ) -> c_int;
+
+    fn supersonic_qwen35_4b_hip_matmul_mmq_q8_1_q6_k_residual_add(
+        dtype: c_int,
+        device_ordinal: usize,
+        batch_elems: usize,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        q8: *const c_void,
+        rhs_q6: *const c_void,
+        residual: *const c_void,
+        out: *mut c_void,
+    ) -> c_int;
+
+    fn supersonic_qwen35_4b_hip_matmul_q6_k_m16_argmax(
+        dtype: c_int,
+        device_ordinal: usize,
+        batch_elems: usize,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        lhs: *const c_void,
+        rhs_q6: *const c_void,
+        block_best_vals: *mut c_void,
+        block_best_indices: *mut c_void,
+        out_indices: *mut c_void,
     ) -> c_int;
 
     fn supersonic_qwen35_4b_hip_device_supports_wmma_i8(
@@ -1558,6 +1617,23 @@ unsafe extern "C" {
         beta: *const c_void,
         g: *const c_void,
         out: *mut c_void,
+        state_trace: *mut c_void,
+    ) -> c_int;
+
+    fn supersonic_qwen35_hip_delta_recurrent_prefill_capture_q8_trace_attn(
+        dtype: c_int,
+        device_ordinal: usize,
+        batch_heads: usize,
+        seq_len: usize,
+        k_head_dim: usize,
+        v_head_dim: usize,
+        recurrent_state: *mut c_void,
+        query: *const c_void,
+        key: *const c_void,
+        value: *const c_void,
+        beta: *const c_void,
+        g: *const c_void,
+        attn_output: *mut c_void,
         state_trace: *mut c_void,
     ) -> c_int;
 
@@ -3084,6 +3160,71 @@ pub fn delta_recurrent_prefill_capture_q8_trace(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn delta_recurrent_prefill_capture_q8_trace_attn(
+    ordinal: usize,
+    dtype: ScalarType,
+    batch_heads: usize,
+    seq_len: usize,
+    k_head_dim: usize,
+    v_head_dim: usize,
+    recurrent_state: &mut GpuBuffer,
+    query: &GpuBuffer,
+    key: &GpuBuffer,
+    value: &GpuBuffer,
+    beta: &GpuBuffer,
+    g: &GpuBuffer,
+    attn_output: &mut GpuBuffer,
+    state_trace: &mut GpuBuffer,
+) -> Result<bool, GpuError> {
+    if std::env::var_os("SUPERSONIC_DFLASH_DISABLE_APPEND_RECURRENT_WARP32").is_some() {
+        return Ok(false);
+    }
+    if recurrent_state.backend() == Backend::Metal {
+        return Ok(false);
+    }
+    if dtype != ScalarType::F32
+        || recurrent_state.dtype() != ScalarType::F32
+        || attn_output.dtype() != ScalarType::BF16
+        || state_trace.dtype() != ScalarType::U8
+        || k_head_dim != 128
+        || v_head_dim != 128
+    {
+        return Ok(false);
+    }
+    ffi_profile_time_result(
+        "qwen.delta_recurrent_prefill_capture_q8_trace_attn",
+        ordinal,
+        || {
+            let status = unsafe {
+                supersonic_qwen35_hip_delta_recurrent_prefill_capture_q8_trace_attn(
+                    dtype.kernel_dtype_code(),
+                    ordinal,
+                    batch_heads,
+                    seq_len,
+                    k_head_dim,
+                    v_head_dim,
+                    recurrent_state.as_mut_ptr(),
+                    query.as_ptr(),
+                    key.as_ptr(),
+                    value.as_ptr(),
+                    beta.as_ptr(),
+                    g.as_ptr(),
+                    attn_output.as_mut_ptr(),
+                    state_trace.as_mut_ptr(),
+                )
+            };
+            if status != 0 {
+                return Err(ffi_error(format!(
+                    "delta_recurrent_prefill_capture_q8_trace_attn failed: {status}"
+                )));
+            }
+            Ok(())
+        },
+    )?;
+    Ok(true)
+}
+
 /// Parent-aware DeltaNet accumulation for tree-structured DFlash verify.
 ///
 /// `parent_ids[t]` is `-1` for a node whose parent is the already-committed
@@ -4384,6 +4525,70 @@ pub fn matmul_rhs_transposed_int4(
     })
 }
 
+/// Raw GGML low-bit m16 matmul with a BF16 residual-add epilogue.
+///
+/// Returns `Ok(false)` when the HIP kernel does not handle the shape/qtype, so
+/// callers can fall back to `matmul_rhs_transposed_int4` plus `element_add`.
+#[allow(clippy::too_many_arguments)]
+pub fn matmul_rhs_transposed_int4_residual_add(
+    ordinal: usize,
+    batch_elems: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    lhs: &GpuBuffer,
+    rhs_int4: &GpuBuffer,
+    scale: &GpuBuffer,
+    zero: &GpuBuffer,
+    awq_inv_scale: Option<&GpuBuffer>,
+    group_size: usize,
+    quant_type: i32,
+    residual: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<bool, GpuError> {
+    if out.backend() == Backend::Metal {
+        return Ok(false);
+    }
+    let profile_key = if std::env::var_os("SUPERSONIC_DFLASH_PROFILE_FFI_SHAPES").is_some() {
+        format!(
+            "qwen.matmul_rhs_transposed_int4_residual_add[b={} m={} n={} k={} g={} qt={}]",
+            batch_elems, m, n, k, group_size, quant_type
+        )
+    } else {
+        "qwen.matmul_rhs_transposed_int4_residual_add".to_string()
+    };
+    ffi_profile_time_result_key(profile_key, ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_4b_hip_matmul_int4_dequant_residual_add(
+                ScalarType::BF16.kernel_dtype_code(),
+                ordinal,
+                batch_elems,
+                m as c_int,
+                n as c_int,
+                k as c_int,
+                lhs.as_ptr(),
+                rhs_int4.as_ptr(),
+                scale.as_ptr(),
+                zero.as_ptr(),
+                awq_inv_scale
+                    .map(|buf| buf.as_ptr())
+                    .unwrap_or(std::ptr::null()),
+                group_size as c_int,
+                quant_type as c_int,
+                residual.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        };
+        match status {
+            0 => Ok(true),
+            312..=316 | 319 => Ok(false),
+            _ => Err(ffi_error(format!(
+                "matmul_rhs_transposed_int4_residual_add failed: {status}"
+            ))),
+        }
+    })
+}
+
 /// GGML low-bit pair matmul: out `[batch, m, 2 * n_each]` contains
 /// `[lhs * rhs_first^T, lhs * rhs_second^T]` per row.
 pub fn matmul_rhs_transposed_ggml_pair(
@@ -4433,6 +4638,57 @@ pub fn matmul_rhs_transposed_ggml_pair(
             )));
         }
         Ok(())
+    })
+}
+
+/// GGML low-bit pair matmul plus SwiGLU epilogue:
+/// out `[batch, m, n_each] = silu(lhs * rhs_gate^T) * (lhs * rhs_up^T)`.
+pub fn matmul_rhs_transposed_ggml_pair_swiglu(
+    ordinal: usize,
+    batch_elems: usize,
+    m: usize,
+    n_each: usize,
+    k: usize,
+    lhs: &GpuBuffer,
+    rhs_gate: &GpuBuffer,
+    rhs_up: &GpuBuffer,
+    quant_type: i32,
+    out: &mut GpuBuffer,
+) -> Result<bool, GpuError> {
+    if out.backend() == Backend::Metal {
+        return Ok(false);
+    }
+    let profile_key = if std::env::var_os("SUPERSONIC_DFLASH_PROFILE_FFI_SHAPES").is_some() {
+        format!(
+            "qwen.matmul_rhs_transposed_ggml_pair_swiglu[b={} m={} n_each={} k={} qt={}]",
+            batch_elems, m, n_each, k, quant_type
+        )
+    } else {
+        "qwen.matmul_rhs_transposed_ggml_pair_swiglu".to_string()
+    };
+    ffi_profile_time_result_key(profile_key, ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_4b_hip_matmul_ggml_pair_swiglu(
+                ScalarType::BF16.kernel_dtype_code(),
+                ordinal,
+                batch_elems,
+                m as c_int,
+                n_each as c_int,
+                k as c_int,
+                lhs.as_ptr(),
+                rhs_gate.as_ptr(),
+                rhs_up.as_ptr(),
+                quant_type as c_int,
+                out.as_mut_ptr(),
+            )
+        };
+        match status {
+            0 => Ok(true),
+            322..=324 | 327 => Ok(false),
+            _ => Err(ffi_error(format!(
+                "matmul_rhs_transposed_ggml_pair_swiglu failed: {status}"
+            ))),
+        }
     })
 }
 
@@ -4525,6 +4781,98 @@ pub fn matmul_mmq_q8_1_q6_k(
             return Err(ffi_error(format!("matmul_mmq_q8_1_q6_k failed: {status}")));
         }
         Ok(())
+    })
+}
+
+pub fn matmul_mmq_q8_1_q6_k_residual_add(
+    ordinal: usize,
+    batch_elems: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    q8: &GpuBuffer,
+    rhs_q6: &GpuBuffer,
+    residual: &GpuBuffer,
+    out: &mut GpuBuffer,
+) -> Result<(), GpuError> {
+    if out.backend() == Backend::Metal {
+        return Err(ffi_error(
+            "matmul_mmq_q8_1_q6_k_residual_add is only implemented for HIP/CUDA backends"
+                .to_string(),
+        ));
+    }
+    let profile_key = if std::env::var_os("SUPERSONIC_DFLASH_PROFILE_FFI_SHAPES").is_some() {
+        format!("qwen.matmul_mmq_q8_1_q6_k_residual_add[b={batch_elems} m={m} n={n} k={k}]")
+    } else {
+        "qwen.matmul_mmq_q8_1_q6_k_residual_add".to_string()
+    };
+    ffi_profile_time_result_key(profile_key, ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_4b_hip_matmul_mmq_q8_1_q6_k_residual_add(
+                ScalarType::BF16.kernel_dtype_code(),
+                ordinal,
+                batch_elems,
+                m as c_int,
+                n as c_int,
+                k as c_int,
+                q8.as_ptr(),
+                rhs_q6.as_ptr(),
+                residual.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!(
+                "matmul_mmq_q8_1_q6_k_residual_add failed: {status}"
+            )));
+        }
+        Ok(())
+    })
+}
+
+pub fn matmul_q6_k_m16_argmax(
+    ordinal: usize,
+    batch_elems: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+    lhs: &GpuBuffer,
+    rhs_q6: &GpuBuffer,
+    block_best_vals: &mut GpuBuffer,
+    block_best_indices: &mut GpuBuffer,
+    out_indices: &mut GpuBuffer,
+) -> Result<bool, GpuError> {
+    if out_indices.backend() == Backend::Metal {
+        return Ok(false);
+    }
+    let profile_key = if std::env::var_os("SUPERSONIC_DFLASH_PROFILE_FFI_SHAPES").is_some() {
+        format!("qwen.matmul_q6_k_m16_argmax[b={batch_elems} m={m} n={n} k={k}]")
+    } else {
+        "qwen.matmul_q6_k_m16_argmax".to_string()
+    };
+    ffi_profile_time_result_key(profile_key, ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_4b_hip_matmul_q6_k_m16_argmax(
+                ScalarType::BF16.kernel_dtype_code(),
+                ordinal,
+                batch_elems,
+                m as c_int,
+                n as c_int,
+                k as c_int,
+                lhs.as_ptr(),
+                rhs_q6.as_ptr(),
+                block_best_vals.as_mut_ptr(),
+                block_best_indices.as_mut_ptr(),
+                out_indices.as_mut_ptr(),
+            )
+        };
+        match status {
+            0 => Ok(true),
+            340..=349 => Ok(false),
+            _ => Err(ffi_error(format!(
+                "matmul_q6_k_m16_argmax failed: {status}"
+            ))),
+        }
     })
 }
 

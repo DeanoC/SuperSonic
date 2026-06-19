@@ -924,6 +924,43 @@ int delta_recurrent_prefill_capture_q8_trace_f32_k128_device(
     return 0;
 }
 
+int delta_recurrent_prefill_capture_q8_trace_attn_f32_k128_device(
+    int device_ordinal,
+    int batch_heads,
+    int seq_len,
+    void* recurrent_state,
+    const void* query,
+    const void* key,
+    const void* value,
+    const void* beta,
+    const void* g,
+    void* attn_output,
+    void* state_trace
+) {
+    ScopedHipDevice scoped(device_ordinal);
+    if (recurrent_state == nullptr || attn_output == nullptr || state_trace == nullptr) return 69;
+    constexpr int threads = 32;
+    hipLaunchKernelGGL(
+        supersonic_qwen35_delta_recurrent_prefill_capture_q8_trace_attn_bf16_transposed_f32_k128_warp32_kernel,
+        dim3(128, batch_heads),
+        dim3(threads),
+        0,
+        0,
+        batch_heads,
+        seq_len,
+        static_cast<float*>(recurrent_state),
+        static_cast<const float*>(query),
+        static_cast<const float*>(key),
+        static_cast<const float*>(value),
+        static_cast<const float*>(beta),
+        static_cast<const float*>(g),
+        static_cast<hip_bfloat16*>(attn_output),
+        static_cast<uint8_t*>(state_trace));
+    if (hipGetLastError() != hipSuccess) return 67;
+    if (maybe_sync() != hipSuccess) return 68;
+    return 0;
+}
+
 int delta_recurrent_tree_prefill_capture_f32_k128_device(
     int device_ordinal,
     int batch_heads,
@@ -1057,24 +1094,47 @@ int delta_recurrent_tree_prefill_capture_q8_trace_attn_f32_k128_device(
 ) {
     ScopedHipDevice scoped(device_ordinal);
     if (parent_ids == nullptr || attn_output == nullptr || state_trace == nullptr) return 69;
-    constexpr int threads = 128;
-    hipLaunchKernelGGL(
-        supersonic_qwen35_delta_recurrent_tree_prefill_capture_q8_trace_attn_bf16_transposed_f32_k128_kernel,
-        dim3(128, batch_heads),
-        dim3(threads),
-        0,
-        0,
-        batch_heads,
-        seq_len,
-        static_cast<const float*>(initial_state),
-        static_cast<const float*>(query),
-        static_cast<const float*>(key),
-        static_cast<const float*>(value),
-        static_cast<const float*>(beta),
-        static_cast<const float*>(g),
-        static_cast<const int*>(parent_ids),
-        static_cast<hip_bfloat16*>(attn_output),
-        static_cast<uint8_t*>(state_trace));
+    const bool enable_warp32 =
+        std::getenv("SUPERSONIC_DFLASH_DISABLE_TREE_RECURRENT_WARP32") == nullptr;
+    if (enable_warp32) {
+        constexpr int threads = 32;
+        hipLaunchKernelGGL(
+            supersonic_qwen35_delta_recurrent_tree_prefill_capture_q8_trace_attn_bf16_transposed_f32_k128_warp32_kernel,
+            dim3(128, batch_heads),
+            dim3(threads),
+            0,
+            0,
+            batch_heads,
+            seq_len,
+            static_cast<const float*>(initial_state),
+            static_cast<const float*>(query),
+            static_cast<const float*>(key),
+            static_cast<const float*>(value),
+            static_cast<const float*>(beta),
+            static_cast<const float*>(g),
+            static_cast<const int*>(parent_ids),
+            static_cast<hip_bfloat16*>(attn_output),
+            static_cast<uint8_t*>(state_trace));
+    } else {
+        constexpr int threads = 128;
+        hipLaunchKernelGGL(
+            supersonic_qwen35_delta_recurrent_tree_prefill_capture_q8_trace_attn_bf16_transposed_f32_k128_kernel,
+            dim3(128, batch_heads),
+            dim3(threads),
+            0,
+            0,
+            batch_heads,
+            seq_len,
+            static_cast<const float*>(initial_state),
+            static_cast<const float*>(query),
+            static_cast<const float*>(key),
+            static_cast<const float*>(value),
+            static_cast<const float*>(beta),
+            static_cast<const float*>(g),
+            static_cast<const int*>(parent_ids),
+            static_cast<hip_bfloat16*>(attn_output),
+            static_cast<uint8_t*>(state_trace));
+    }
     if (hipGetLastError() != hipSuccess) return 67;
     if (maybe_sync() != hipSuccess) return 68;
     return 0;
@@ -3610,6 +3670,38 @@ extern "C" int supersonic_qwen35_hip_delta_recurrent_prefill_capture_q8_trace(
         beta,
         g,
         out,
+        state_trace);
+}
+
+extern "C" int supersonic_qwen35_hip_delta_recurrent_prefill_capture_q8_trace_attn(
+    int dtype,
+    size_t device_ordinal,
+    size_t batch_heads,
+    size_t seq_len,
+    size_t k_head_dim,
+    size_t v_head_dim,
+    void* recurrent_state,
+    const void* query,
+    const void* key,
+    const void* value,
+    const void* beta,
+    const void* g,
+    void* attn_output,
+    void* state_trace) {
+    if (dtype != 1 || k_head_dim != 128 || v_head_dim != 128) {
+        return 66;
+    }
+    return delta_recurrent_prefill_capture_q8_trace_attn_f32_k128_device(
+        static_cast<int>(device_ordinal),
+        static_cast<int>(batch_heads),
+        static_cast<int>(seq_len),
+        recurrent_state,
+        query,
+        key,
+        value,
+        beta,
+        g,
+        attn_output,
         state_trace);
 }
 

@@ -277,6 +277,125 @@ fn run_ggml_case_shape(
     Ok(())
 }
 
+fn run_ggml_residual_add_case(
+    ordinal: usize,
+    name: &str,
+    qtype: i32,
+    row_fn: fn(usize) -> (Vec<u8>, Vec<f32>),
+) -> Result<()> {
+    let m = 16usize;
+    let n = 64usize;
+    let k = 512usize;
+    println!("=== {name} residual add: m={m} n={n} k={k} ===");
+    let lhs = make_bench_lhs(m, k);
+    let rhs = make_ggml_k_slab(n, k, qtype, row_fn)?;
+    let row_bytes = ggml_row_bytes_for(qtype, k)?;
+    let mut residual = vec![0f32; m * n];
+    for mi in 0..m {
+        for ni in 0..n {
+            let x = (mi as f32 + 1.0) * 0.013 + (ni as f32) * 0.007;
+            residual[mi * n + ni] = bf16_round(x.cos() * 0.5);
+        }
+    }
+
+    let lhs_gpu =
+        GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[m, k], &f32_to_bf16_bytes(&lhs))
+            .map_err(|e| anyhow!("lhs upload: {e}"))?;
+    let rhs_gpu = GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[n, row_bytes], &rhs)
+        .map_err(|e| anyhow!("rhs upload: {e}"))?;
+    let dummy_gpu = GpuBuffer::from_host_bytes(
+        ordinal,
+        ScalarType::BF16,
+        &[1, 1],
+        &f32_to_bf16_bytes(&[0.0]),
+    )
+    .map_err(|e| anyhow!("dummy upload: {e}"))?;
+    let residual_bytes = f32_to_bf16_bytes(&residual);
+    let residual_gpu =
+        GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[m, n], &residual_bytes)
+            .map_err(|e| anyhow!("residual upload: {e}"))?;
+    let mut proj_gpu = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[m, n])
+        .map_err(|e| anyhow!("proj alloc: {e}"))?;
+    let mut ref_gpu = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[m, n])
+        .map_err(|e| anyhow!("ref alloc: {e}"))?;
+    let mut fused_gpu =
+        GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[m, n], &residual_bytes)
+            .map_err(|e| anyhow!("fused residual upload: {e}"))?;
+
+    prefill_ffi::matmul_rhs_transposed_int4(
+        ordinal,
+        1,
+        m,
+        n,
+        k,
+        &lhs_gpu,
+        &rhs_gpu,
+        &dummy_gpu,
+        &dummy_gpu,
+        None,
+        128,
+        qtype,
+        &mut proj_gpu,
+    )
+    .map_err(|e| anyhow!("regular ggml matmul: {e}"))?;
+    prefill_ffi::element_add(
+        ordinal,
+        ScalarType::BF16,
+        m * n,
+        &residual_gpu,
+        &proj_gpu,
+        &mut ref_gpu,
+    )
+    .map_err(|e| anyhow!("reference residual add: {e}"))?;
+
+    let fused_residual_ref: &GpuBuffer = unsafe { &*(&fused_gpu as *const GpuBuffer) };
+    let handled = prefill_ffi::matmul_rhs_transposed_int4_residual_add(
+        ordinal,
+        1,
+        m,
+        n,
+        k,
+        &lhs_gpu,
+        &rhs_gpu,
+        &dummy_gpu,
+        &dummy_gpu,
+        None,
+        128,
+        qtype,
+        fused_residual_ref,
+        &mut fused_gpu,
+    )
+    .map_err(|e| anyhow!("fused residual matmul: {e}"))?;
+    if !handled {
+        return Err(anyhow!(
+            "{name} residual add was not handled by fused kernel"
+        ));
+    }
+
+    let ref_bytes = ref_gpu
+        .to_host_bytes()
+        .map_err(|e| anyhow!("ref d2h: {e}"))?;
+    let fused_bytes = fused_gpu
+        .to_host_bytes()
+        .map_err(|e| anyhow!("fused d2h: {e}"))?;
+    let ref_host = bf16_bytes_to_f32(&ref_bytes);
+    let fused_host = bf16_bytes_to_f32(&fused_bytes);
+    let mut nbad = 0usize;
+    let mut max_abs = 0f32;
+    for i in 0..(m * n) {
+        let d = (ref_host[i] - fused_host[i]).abs();
+        max_abs = max_abs.max(d);
+        if ref_bytes[2 * i..2 * i + 2] != fused_bytes[2 * i..2 * i + 2] {
+            nbad += 1;
+        }
+    }
+    println!("  max_abs={max_abs:.5e} byte_mismatch={nbad}/{}", m * n);
+    if nbad > 0 {
+        return Err(anyhow!("{name} residual add mismatches reference path"));
+    }
+    Ok(())
+}
+
 fn ggml_row_bytes_for(qtype: i32, k: usize) -> Result<usize> {
     qwen35::weights::ggml_k_row_bytes(qtype, k)
         .ok_or_else(|| anyhow!("unsupported GGML qtype {qtype} for k={k}"))
@@ -596,6 +715,368 @@ fn bench_ggml_hot_shape(
     Ok(())
 }
 
+fn bench_ggml_pair_m16_hot_shape(
+    ordinal: usize,
+    name: &str,
+    qtype: i32,
+    row_fn: fn(usize) -> (Vec<u8>, Vec<f32>),
+    n_each: usize,
+    k: usize,
+    iterations: usize,
+) -> Result<()> {
+    let m = 16usize;
+    let row_bytes = ggml_row_bytes_for(qtype, k)?;
+    println!(
+        "=== bench {name} pair m16: m={m} n_each={n_each} k={k} row_bytes={row_bytes} iters={iterations} ==="
+    );
+
+    let lhs = make_bench_lhs(m, k);
+    let rhs_first = make_ggml_k_slab(n_each, k, qtype, row_fn)?;
+    let rhs_second = make_ggml_k_slab(n_each, k, qtype, row_fn)?;
+    let lhs_gpu =
+        GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[m, k], &f32_to_bf16_bytes(&lhs))
+            .map_err(|e| anyhow!("lhs upload: {e}"))?;
+    let rhs_first_gpu =
+        GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[n_each, row_bytes], &rhs_first)
+            .map_err(|e| anyhow!("rhs_first upload: {e}"))?;
+    let rhs_second_gpu =
+        GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[n_each, row_bytes], &rhs_second)
+            .map_err(|e| anyhow!("rhs_second upload: {e}"))?;
+    let dummy_gpu = GpuBuffer::from_host_bytes(
+        ordinal,
+        ScalarType::BF16,
+        &[1, 1],
+        &f32_to_bf16_bytes(&[0.0]),
+    )
+    .map_err(|e| anyhow!("dummy upload: {e}"))?;
+    let mut out_first = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[m, n_each])
+        .map_err(|e| anyhow!("out_first alloc: {e}"))?;
+    let mut out_second = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[m, n_each])
+        .map_err(|e| anyhow!("out_second alloc: {e}"))?;
+    let mut out_pair = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[m, n_each * 2])
+        .map_err(|e| anyhow!("out_pair alloc: {e}"))?;
+    let mut out_swiglu_ref = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[m, n_each])
+        .map_err(|e| anyhow!("out_swiglu_ref alloc: {e}"))?;
+    let mut out_swiglu_fused = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[m, n_each])
+        .map_err(|e| anyhow!("out_swiglu_fused alloc: {e}"))?;
+
+    for _ in 0..3 {
+        prefill_ffi::matmul_rhs_transposed_int4(
+            ordinal,
+            1,
+            m,
+            n_each,
+            k,
+            &lhs_gpu,
+            &rhs_first_gpu,
+            &dummy_gpu,
+            &dummy_gpu,
+            None,
+            128,
+            qtype,
+            &mut out_first,
+        )
+        .map_err(|e| anyhow!("warmup first ggml matmul: {e}"))?;
+        prefill_ffi::matmul_rhs_transposed_int4(
+            ordinal,
+            1,
+            m,
+            n_each,
+            k,
+            &lhs_gpu,
+            &rhs_second_gpu,
+            &dummy_gpu,
+            &dummy_gpu,
+            None,
+            128,
+            qtype,
+            &mut out_second,
+        )
+        .map_err(|e| anyhow!("warmup second ggml matmul: {e}"))?;
+        prefill_ffi::matmul_rhs_transposed_ggml_pair(
+            ordinal,
+            1,
+            m,
+            n_each,
+            k,
+            &lhs_gpu,
+            &rhs_first_gpu,
+            &rhs_second_gpu,
+            qtype,
+            &mut out_pair,
+        )
+        .map_err(|e| anyhow!("warmup pair ggml matmul: {e}"))?;
+        prefill_ffi::swiglu_mul_split(
+            ordinal,
+            ScalarType::BF16,
+            m,
+            n_each,
+            &out_pair,
+            &mut out_swiglu_ref,
+        )
+        .map_err(|e| anyhow!("warmup pair swiglu split: {e}"))?;
+        let fused = prefill_ffi::matmul_rhs_transposed_ggml_pair_swiglu(
+            ordinal,
+            1,
+            m,
+            n_each,
+            k,
+            &lhs_gpu,
+            &rhs_first_gpu,
+            &rhs_second_gpu,
+            qtype,
+            &mut out_swiglu_fused,
+        )
+        .map_err(|e| anyhow!("warmup fused pair swiglu: {e}"))?;
+        if !fused {
+            return Err(anyhow!("fused pair swiglu unsupported for {name}"));
+        }
+    }
+    gpu_hal::sync(ordinal).map_err(|e| anyhow!("warmup sync: {e}"))?;
+
+    let first_bytes = out_first
+        .to_host_bytes()
+        .map_err(|e| anyhow!("first d2h: {e}"))?;
+    let second_bytes = out_second
+        .to_host_bytes()
+        .map_err(|e| anyhow!("second d2h: {e}"))?;
+    let pair_bytes = out_pair
+        .to_host_bytes()
+        .map_err(|e| anyhow!("pair d2h: {e}"))?;
+    let first_host = bf16_bytes_to_f32(&first_bytes);
+    let second_host = bf16_bytes_to_f32(&second_bytes);
+    let pair_host = bf16_bytes_to_f32(&pair_bytes);
+    let mut byte_mismatch = 0usize;
+    let mut max_abs = 0f32;
+    for row in 0..m {
+        for col in 0..n_each {
+            let sep_idx = row * n_each + col;
+            let pair_first_idx = row * n_each * 2 + col;
+            let pair_second_idx = row * n_each * 2 + n_each + col;
+            max_abs = max_abs.max((first_host[sep_idx] - pair_host[pair_first_idx]).abs());
+            max_abs = max_abs.max((second_host[sep_idx] - pair_host[pair_second_idx]).abs());
+            if first_bytes[2 * sep_idx..2 * sep_idx + 2]
+                != pair_bytes[2 * pair_first_idx..2 * pair_first_idx + 2]
+            {
+                byte_mismatch += 1;
+            }
+            if second_bytes[2 * sep_idx..2 * sep_idx + 2]
+                != pair_bytes[2 * pair_second_idx..2 * pair_second_idx + 2]
+            {
+                byte_mismatch += 1;
+            }
+        }
+    }
+    println!(
+        "  pair_vs_two_fixed_m16 max_abs={max_abs:.5e} byte_mismatch={byte_mismatch}/{}",
+        m * n_each * 2
+    );
+
+    prefill_ffi::swiglu_mul_split(
+        ordinal,
+        ScalarType::BF16,
+        m,
+        n_each,
+        &out_pair,
+        &mut out_swiglu_ref,
+    )
+    .map_err(|e| anyhow!("reference pair swiglu split: {e}"))?;
+    let fused = prefill_ffi::matmul_rhs_transposed_ggml_pair_swiglu(
+        ordinal,
+        1,
+        m,
+        n_each,
+        k,
+        &lhs_gpu,
+        &rhs_first_gpu,
+        &rhs_second_gpu,
+        qtype,
+        &mut out_swiglu_fused,
+    )
+    .map_err(|e| anyhow!("fused pair swiglu: {e}"))?;
+    if !fused {
+        return Err(anyhow!("fused pair swiglu unsupported for {name}"));
+    }
+    gpu_hal::sync(ordinal).map_err(|e| anyhow!("fused parity sync: {e}"))?;
+    let swiglu_ref_bytes = out_swiglu_ref
+        .to_host_bytes()
+        .map_err(|e| anyhow!("swiglu ref d2h: {e}"))?;
+    let swiglu_fused_bytes = out_swiglu_fused
+        .to_host_bytes()
+        .map_err(|e| anyhow!("swiglu fused d2h: {e}"))?;
+    let swiglu_ref_host = bf16_bytes_to_f32(&swiglu_ref_bytes);
+    let swiglu_fused_host = bf16_bytes_to_f32(&swiglu_fused_bytes);
+    let mut swiglu_byte_mismatch = 0usize;
+    let mut swiglu_max_abs = 0f32;
+    for idx in 0..m * n_each {
+        swiglu_max_abs = swiglu_max_abs.max((swiglu_ref_host[idx] - swiglu_fused_host[idx]).abs());
+        if swiglu_ref_bytes[2 * idx..2 * idx + 2] != swiglu_fused_bytes[2 * idx..2 * idx + 2] {
+            swiglu_byte_mismatch += 1;
+        }
+    }
+    println!(
+        "  fused_swiglu_vs_pair_split max_abs={swiglu_max_abs:.5e} byte_mismatch={swiglu_byte_mismatch}/{}",
+        m * n_each
+    );
+    if swiglu_byte_mismatch != 0 {
+        return Err(anyhow!("fused pair swiglu byte mismatch for {name}"));
+    }
+
+    let mut separate_samples = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let start = Instant::now();
+        prefill_ffi::matmul_rhs_transposed_int4(
+            ordinal,
+            1,
+            m,
+            n_each,
+            k,
+            &lhs_gpu,
+            &rhs_first_gpu,
+            &dummy_gpu,
+            &dummy_gpu,
+            None,
+            128,
+            qtype,
+            &mut out_first,
+        )
+        .map_err(|e| anyhow!("bench first ggml matmul: {e}"))?;
+        prefill_ffi::matmul_rhs_transposed_int4(
+            ordinal,
+            1,
+            m,
+            n_each,
+            k,
+            &lhs_gpu,
+            &rhs_second_gpu,
+            &dummy_gpu,
+            &dummy_gpu,
+            None,
+            128,
+            qtype,
+            &mut out_second,
+        )
+        .map_err(|e| anyhow!("bench second ggml matmul: {e}"))?;
+        gpu_hal::sync(ordinal).map_err(|e| anyhow!("bench separate sync: {e}"))?;
+        separate_samples.push(start.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    let mut pair_samples = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let start = Instant::now();
+        prefill_ffi::matmul_rhs_transposed_ggml_pair(
+            ordinal,
+            1,
+            m,
+            n_each,
+            k,
+            &lhs_gpu,
+            &rhs_first_gpu,
+            &rhs_second_gpu,
+            qtype,
+            &mut out_pair,
+        )
+        .map_err(|e| anyhow!("bench pair ggml matmul: {e}"))?;
+        gpu_hal::sync(ordinal).map_err(|e| anyhow!("bench pair sync: {e}"))?;
+        pair_samples.push(start.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    let mut pair_swiglu_samples = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let start = Instant::now();
+        prefill_ffi::matmul_rhs_transposed_ggml_pair(
+            ordinal,
+            1,
+            m,
+            n_each,
+            k,
+            &lhs_gpu,
+            &rhs_first_gpu,
+            &rhs_second_gpu,
+            qtype,
+            &mut out_pair,
+        )
+        .map_err(|e| anyhow!("bench pair ggml matmul before swiglu: {e}"))?;
+        prefill_ffi::swiglu_mul_split(
+            ordinal,
+            ScalarType::BF16,
+            m,
+            n_each,
+            &out_pair,
+            &mut out_swiglu_ref,
+        )
+        .map_err(|e| anyhow!("bench pair swiglu split: {e}"))?;
+        gpu_hal::sync(ordinal).map_err(|e| anyhow!("bench pair swiglu sync: {e}"))?;
+        pair_swiglu_samples.push(start.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    let mut fused_swiglu_samples = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let start = Instant::now();
+        let fused = prefill_ffi::matmul_rhs_transposed_ggml_pair_swiglu(
+            ordinal,
+            1,
+            m,
+            n_each,
+            k,
+            &lhs_gpu,
+            &rhs_first_gpu,
+            &rhs_second_gpu,
+            qtype,
+            &mut out_swiglu_fused,
+        )
+        .map_err(|e| anyhow!("bench fused pair swiglu: {e}"))?;
+        if !fused {
+            return Err(anyhow!(
+                "fused pair swiglu unsupported during bench for {name}"
+            ));
+        }
+        gpu_hal::sync(ordinal).map_err(|e| anyhow!("bench fused swiglu sync: {e}"))?;
+        fused_swiglu_samples.push(start.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    separate_samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    pair_samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    pair_swiglu_samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    fused_swiglu_samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let separate_mean = separate_samples.iter().sum::<f64>() / separate_samples.len() as f64;
+    let pair_mean = pair_samples.iter().sum::<f64>() / pair_samples.len() as f64;
+    let pair_swiglu_mean =
+        pair_swiglu_samples.iter().sum::<f64>() / pair_swiglu_samples.len() as f64;
+    let fused_swiglu_mean =
+        fused_swiglu_samples.iter().sum::<f64>() / fused_swiglu_samples.len() as f64;
+    let separate_p50 = separate_samples[separate_samples.len() / 2];
+    let pair_p50 = pair_samples[pair_samples.len() / 2];
+    let pair_swiglu_p50 = pair_swiglu_samples[pair_swiglu_samples.len() / 2];
+    let fused_swiglu_p50 = fused_swiglu_samples[fused_swiglu_samples.len() / 2];
+    let separate_p90 =
+        separate_samples[((separate_samples.len() * 9) / 10).min(separate_samples.len() - 1)];
+    let pair_p90 = pair_samples[((pair_samples.len() * 9) / 10).min(pair_samples.len() - 1)];
+    let pair_swiglu_p90 = pair_swiglu_samples
+        [((pair_swiglu_samples.len() * 9) / 10).min(pair_swiglu_samples.len() - 1)];
+    let fused_swiglu_p90 = fused_swiglu_samples
+        [((fused_swiglu_samples.len() * 9) / 10).min(fused_swiglu_samples.len() - 1)];
+    println!(
+        "  two_fixed_m16 mean_ms={separate_mean:.4} p50_ms={separate_p50:.4} p90_ms={separate_p90:.4}"
+    );
+    println!("  pair_ffi mean_ms={pair_mean:.4} p50_ms={pair_p50:.4} p90_ms={pair_p90:.4}");
+    println!(
+        "  pair_ffi_vs_two_fixed speedup={:.3}x",
+        separate_mean / pair_mean
+    );
+    println!(
+        "  pair_plus_swiglu mean_ms={pair_swiglu_mean:.4} p50_ms={pair_swiglu_p50:.4} p90_ms={pair_swiglu_p90:.4}"
+    );
+    println!(
+        "  fused_pair_swiglu mean_ms={fused_swiglu_mean:.4} p50_ms={fused_swiglu_p50:.4} p90_ms={fused_swiglu_p90:.4}"
+    );
+    println!(
+        "  fused_pair_swiglu_vs_pair_plus_swiglu speedup={:.3}x",
+        pair_swiglu_mean / fused_swiglu_mean
+    );
+    Ok(())
+}
+
 fn mmq_q8_1_workspace_bytes(batch: usize, m: usize, k: usize) -> Result<usize> {
     if k % 128 != 0 {
         return Err(anyhow!(
@@ -663,16 +1144,28 @@ fn bench_mmq_q6_matmul_hot_shape(
     );
 
     let lhs = make_bench_lhs(m, k);
+    let residual = make_bench_lhs(m, n);
     let rhs = make_ggml_k_slab(n, k, qwen35::weights::LOWBIT_GGML_Q6_K, ggml_q6k_row)?;
     let lhs_gpu =
         GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[m, k], &f32_to_bf16_bytes(&lhs))
             .map_err(|e| anyhow!("lhs upload: {e}"))?;
+    let residual_gpu = GpuBuffer::from_host_bytes(
+        ordinal,
+        ScalarType::BF16,
+        &[m, n],
+        &f32_to_bf16_bytes(&residual),
+    )
+    .map_err(|e| anyhow!("residual upload: {e}"))?;
     let rhs_gpu = GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[n, row_bytes], &rhs)
         .map_err(|e| anyhow!("rhs upload: {e}"))?;
     let mut q8_gpu = GpuBuffer::alloc(ordinal, ScalarType::U8, &[workspace_bytes])
         .map_err(|e| anyhow!("q8 workspace alloc: {e}"))?;
     let mut out_gpu = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[m, n])
         .map_err(|e| anyhow!("out alloc: {e}"))?;
+    let mut out_residual_ref = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[m, n])
+        .map_err(|e| anyhow!("out residual ref alloc: {e}"))?;
+    let mut out_residual_fused = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[m, n])
+        .map_err(|e| anyhow!("out residual fused alloc: {e}"))?;
 
     prefill_ffi::quantize_mmq_q8_1(
         ordinal,
@@ -687,8 +1180,77 @@ fn bench_mmq_q6_matmul_hot_shape(
     for _ in 0..3 {
         prefill_ffi::matmul_mmq_q8_1_q6_k(ordinal, 1, m, n, k, &q8_gpu, &rhs_gpu, &mut out_gpu)
             .map_err(|e| anyhow!("warmup q6 mmq matmul: {e}"))?;
+        prefill_ffi::element_add(
+            ordinal,
+            ScalarType::BF16,
+            m * n,
+            &residual_gpu,
+            &out_gpu,
+            &mut out_residual_ref,
+        )
+        .map_err(|e| anyhow!("warmup q6 mmq residual ref: {e}"))?;
+        prefill_ffi::matmul_mmq_q8_1_q6_k_residual_add(
+            ordinal,
+            1,
+            m,
+            n,
+            k,
+            &q8_gpu,
+            &rhs_gpu,
+            &residual_gpu,
+            &mut out_residual_fused,
+        )
+        .map_err(|e| anyhow!("warmup q6 mmq residual fused: {e}"))?;
     }
     gpu_hal::sync(ordinal).map_err(|e| anyhow!("warmup sync: {e}"))?;
+
+    prefill_ffi::matmul_mmq_q8_1_q6_k(ordinal, 1, m, n, k, &q8_gpu, &rhs_gpu, &mut out_gpu)
+        .map_err(|e| anyhow!("parity q6 mmq matmul: {e}"))?;
+    prefill_ffi::element_add(
+        ordinal,
+        ScalarType::BF16,
+        m * n,
+        &residual_gpu,
+        &out_gpu,
+        &mut out_residual_ref,
+    )
+    .map_err(|e| anyhow!("parity q6 mmq residual ref: {e}"))?;
+    prefill_ffi::matmul_mmq_q8_1_q6_k_residual_add(
+        ordinal,
+        1,
+        m,
+        n,
+        k,
+        &q8_gpu,
+        &rhs_gpu,
+        &residual_gpu,
+        &mut out_residual_fused,
+    )
+    .map_err(|e| anyhow!("parity q6 mmq residual fused: {e}"))?;
+    gpu_hal::sync(ordinal).map_err(|e| anyhow!("q6 mmq residual parity sync: {e}"))?;
+    let ref_bytes = out_residual_ref
+        .to_host_bytes()
+        .map_err(|e| anyhow!("q6 mmq residual ref d2h: {e}"))?;
+    let fused_bytes = out_residual_fused
+        .to_host_bytes()
+        .map_err(|e| anyhow!("q6 mmq residual fused d2h: {e}"))?;
+    let ref_host = bf16_bytes_to_f32(&ref_bytes);
+    let fused_host = bf16_bytes_to_f32(&fused_bytes);
+    let mut byte_mismatch = 0usize;
+    let mut max_abs = 0f32;
+    for idx in 0..m * n {
+        max_abs = max_abs.max((ref_host[idx] - fused_host[idx]).abs());
+        if ref_bytes[2 * idx..2 * idx + 2] != fused_bytes[2 * idx..2 * idx + 2] {
+            byte_mismatch += 1;
+        }
+    }
+    println!(
+        "  residual_fused_vs_mmq_plus_add max_abs={max_abs:.5e} byte_mismatch={byte_mismatch}/{}",
+        m * n
+    );
+    if byte_mismatch != 0 {
+        return Err(anyhow!("{name} residual fused byte mismatch"));
+    }
 
     let mut samples = Vec::with_capacity(iterations);
     for _ in 0..iterations {
@@ -699,11 +1261,165 @@ fn bench_mmq_q6_matmul_hot_shape(
         samples.push(start.elapsed().as_secs_f64() * 1000.0);
     }
 
+    let mut residual_ref_samples = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let start = Instant::now();
+        prefill_ffi::matmul_mmq_q8_1_q6_k(ordinal, 1, m, n, k, &q8_gpu, &rhs_gpu, &mut out_gpu)
+            .map_err(|e| anyhow!("bench q6 mmq residual matmul: {e}"))?;
+        prefill_ffi::element_add(
+            ordinal,
+            ScalarType::BF16,
+            m * n,
+            &residual_gpu,
+            &out_gpu,
+            &mut out_residual_ref,
+        )
+        .map_err(|e| anyhow!("bench q6 mmq residual add: {e}"))?;
+        gpu_hal::sync(ordinal).map_err(|e| anyhow!("bench residual ref sync: {e}"))?;
+        residual_ref_samples.push(start.elapsed().as_secs_f64() * 1000.0);
+    }
+
+    let mut residual_fused_samples = Vec::with_capacity(iterations);
+    for _ in 0..iterations {
+        let start = Instant::now();
+        prefill_ffi::matmul_mmq_q8_1_q6_k_residual_add(
+            ordinal,
+            1,
+            m,
+            n,
+            k,
+            &q8_gpu,
+            &rhs_gpu,
+            &residual_gpu,
+            &mut out_residual_fused,
+        )
+        .map_err(|e| anyhow!("bench q6 mmq residual fused: {e}"))?;
+        gpu_hal::sync(ordinal).map_err(|e| anyhow!("bench residual fused sync: {e}"))?;
+        residual_fused_samples.push(start.elapsed().as_secs_f64() * 1000.0);
+    }
+
     samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    residual_ref_samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    residual_fused_samples.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let mean = samples.iter().sum::<f64>() / samples.len() as f64;
     let p50 = samples[samples.len() / 2];
     let p90 = samples[((samples.len() * 9) / 10).min(samples.len() - 1)];
     println!("  mean_ms={mean:.4} p50_ms={p50:.4} p90_ms={p90:.4}");
+    let residual_ref_mean =
+        residual_ref_samples.iter().sum::<f64>() / residual_ref_samples.len() as f64;
+    let residual_fused_mean =
+        residual_fused_samples.iter().sum::<f64>() / residual_fused_samples.len() as f64;
+    let residual_ref_p50 = residual_ref_samples[residual_ref_samples.len() / 2];
+    let residual_fused_p50 = residual_fused_samples[residual_fused_samples.len() / 2];
+    let residual_ref_p90 = residual_ref_samples
+        [((residual_ref_samples.len() * 9) / 10).min(residual_ref_samples.len() - 1)];
+    let residual_fused_p90 = residual_fused_samples
+        [((residual_fused_samples.len() * 9) / 10).min(residual_fused_samples.len() - 1)];
+    println!(
+        "  mmq_plus_add mean_ms={residual_ref_mean:.4} p50_ms={residual_ref_p50:.4} p90_ms={residual_ref_p90:.4}"
+    );
+    println!(
+        "  mmq_residual_fused mean_ms={residual_fused_mean:.4} p50_ms={residual_fused_p50:.4} p90_ms={residual_fused_p90:.4}"
+    );
+    println!(
+        "  mmq_residual_fused_vs_mmq_plus_add speedup={:.3}x",
+        residual_ref_mean / residual_fused_mean
+    );
+    Ok(())
+}
+
+fn run_q6_k_m16_argmax_case(ordinal: usize) -> Result<()> {
+    let m = 16usize;
+    let n = 256usize;
+    let k = 512usize;
+    let row_bytes = ggml_row_bytes_for(qwen35::weights::LOWBIT_GGML_Q6_K, k)?;
+    let tiles = n / 16;
+    println!("=== q6_k m16 fused argmax parity: m={m} n={n} k={k} ===");
+
+    let lhs = make_bench_lhs(m, k);
+    let rhs = make_ggml_k_slab(n, k, qwen35::weights::LOWBIT_GGML_Q6_K, ggml_q6k_row)?;
+    let lhs_gpu =
+        GpuBuffer::from_host_bytes(ordinal, ScalarType::BF16, &[m, k], &f32_to_bf16_bytes(&lhs))
+            .map_err(|e| anyhow!("argmax lhs upload: {e}"))?;
+    let rhs_gpu = GpuBuffer::from_host_bytes(ordinal, ScalarType::U8, &[n, row_bytes], &rhs)
+        .map_err(|e| anyhow!("argmax rhs upload: {e}"))?;
+    let mut logits_gpu = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[m, n])
+        .map_err(|e| anyhow!("argmax logits alloc: {e}"))?;
+    let mut ref_indices = GpuBuffer::zeros(ordinal, ScalarType::U32, &[m])
+        .map_err(|e| anyhow!("argmax ref indices alloc: {e}"))?;
+    let mut fused_indices = GpuBuffer::zeros(ordinal, ScalarType::U32, &[m])
+        .map_err(|e| anyhow!("argmax fused indices alloc: {e}"))?;
+    let mut block_best_vals = GpuBuffer::zeros(ordinal, ScalarType::F32, &[m, tiles])
+        .map_err(|e| anyhow!("argmax block vals alloc: {e}"))?;
+    let mut block_best_indices = GpuBuffer::zeros(ordinal, ScalarType::U32, &[m, tiles])
+        .map_err(|e| anyhow!("argmax block indices alloc: {e}"))?;
+
+    prefill_ffi::matmul_rhs_transposed_int4(
+        ordinal,
+        1,
+        m,
+        n,
+        k,
+        &lhs_gpu,
+        &rhs_gpu,
+        &rhs_gpu,
+        &rhs_gpu,
+        None,
+        128,
+        qwen35::weights::LOWBIT_GGML_Q6_K,
+        &mut logits_gpu,
+    )
+    .map_err(|e| anyhow!("argmax reference q6 lm_head matmul: {e}"))?;
+    prefill_ffi::argmax_bf16_rows(ordinal, m, n, &logits_gpu, &mut ref_indices)
+        .map_err(|e| anyhow!("argmax reference rows: {e}"))?;
+    let fused = prefill_ffi::matmul_q6_k_m16_argmax(
+        ordinal,
+        1,
+        m,
+        n,
+        k,
+        &lhs_gpu,
+        &rhs_gpu,
+        &mut block_best_vals,
+        &mut block_best_indices,
+        &mut fused_indices,
+    )
+    .map_err(|e| anyhow!("argmax fused q6: {e}"))?;
+    if !fused {
+        return Err(anyhow!("q6_k m16 fused argmax unsupported"));
+    }
+    gpu_hal::sync(ordinal).map_err(|e| anyhow!("argmax fused sync: {e}"))?;
+
+    let ref_bytes = ref_indices
+        .to_host_bytes()
+        .map_err(|e| anyhow!("argmax ref d2h: {e}"))?;
+    let fused_bytes = fused_indices
+        .to_host_bytes()
+        .map_err(|e| anyhow!("argmax fused d2h: {e}"))?;
+    let mut mismatches = 0usize;
+    for row in 0..m {
+        let start = row * 4;
+        let ref_id = u32::from_le_bytes([
+            ref_bytes[start],
+            ref_bytes[start + 1],
+            ref_bytes[start + 2],
+            ref_bytes[start + 3],
+        ]);
+        let fused_id = u32::from_le_bytes([
+            fused_bytes[start],
+            fused_bytes[start + 1],
+            fused_bytes[start + 2],
+            fused_bytes[start + 3],
+        ]);
+        if ref_id != fused_id {
+            mismatches += 1;
+            println!("  row={row} ref_id={ref_id} fused_id={fused_id}");
+        }
+    }
+    println!("  fused_argmax_mismatches={mismatches}/{m}");
+    if mismatches != 0 {
+        return Err(anyhow!("q6_k m16 fused argmax mismatch"));
+    }
     Ok(())
 }
 
@@ -716,6 +1432,10 @@ fn maybe_run_ggml_hot_benches(ordinal: usize) -> Result<()> {
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(20)
         .max(1);
+    if std::env::var_os("SUPERSONIC_INT4_TEST_BENCH_Q6_DOWN_M16_ONLY").is_some() {
+        bench_mmq_q6_matmul_hot_shape(ordinal, "Q6_K down hot m16", 16, 5_120, 17_408, iterations)?;
+        return Ok(());
+    }
     bench_ggml_hot_shape(
         ordinal,
         "Q4_K mlp gate/up hot",
@@ -946,6 +1666,17 @@ fn maybe_run_ggml_hot_benches(ordinal: usize) -> Result<()> {
             "Q6_K mid linear hot m16",
             16,
             10_240,
+            5_120,
+            iterations,
+        )?;
+    }
+    if std::env::var_os("SUPERSONIC_INT4_TEST_BENCH_GGML_PAIR_M16").is_some() {
+        bench_ggml_pair_m16_hot_shape(
+            ordinal,
+            "Q4_K mlp gate/up hot",
+            qwen35::weights::LOWBIT_GGML_Q4_K,
+            ggml_q4k_row,
+            17_408,
             5_120,
             iterations,
         )?;
@@ -1261,11 +1992,30 @@ fn main() -> Result<()> {
         32,
         256,
     )?;
+    run_ggml_residual_add_case(
+        ordinal,
+        "GGML Q4_K m16",
+        qwen35::weights::LOWBIT_GGML_Q4_K,
+        ggml_q4k_row,
+    )?;
+    run_ggml_residual_add_case(
+        ordinal,
+        "GGML Q5_K m16",
+        qwen35::weights::LOWBIT_GGML_Q5_K,
+        ggml_q5k_row,
+    )?;
+    run_ggml_residual_add_case(
+        ordinal,
+        "GGML Q6_K m16",
+        qwen35::weights::LOWBIT_GGML_Q6_K,
+        ggml_q6k_row,
+    )?;
     run_mmq_q8_quant_case(ordinal, "GGML Q4_K", qwen35::weights::LOWBIT_GGML_Q4_K)?;
     run_mmq_q8_quant_case(ordinal, "GGML Q5_K", qwen35::weights::LOWBIT_GGML_Q5_K)?;
     run_mmq_q8_quant_case(ordinal, "GGML Q6_K", qwen35::weights::LOWBIT_GGML_Q6_K)?;
     run_mmq_q6_matmul_case(ordinal, "GGML Q6_K MMQ m8", 8, 128, 256)?;
     run_mmq_q6_matmul_case(ordinal, "GGML Q6_K MMQ m16", 16, 128, 512)?;
+    run_q6_k_m16_argmax_case(ordinal)?;
     maybe_run_ggml_hot_benches(ordinal)?;
 
     Ok(())

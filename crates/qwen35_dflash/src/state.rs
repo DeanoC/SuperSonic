@@ -57,6 +57,8 @@ pub struct DFlashScratch {
     pub final_hidden: GpuBuffer,
     pub logits: GpuBuffer,
     pub argmax_indices: GpuBuffer,
+    pub lm_head_block_best_vals: GpuBuffer,
+    pub lm_head_block_best_indices: GpuBuffer,
 
     // Small scratch for the work-stealing matvec counter.
     pub matvec_counter: GpuBuffer,
@@ -126,6 +128,16 @@ impl DFlashScratch {
             final_hidden: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, q_len, hidden])?,
             logits: GpuBuffer::zeros(ordinal, ScalarType::BF16, &[q_len, vocab])?,
             argmax_indices: GpuBuffer::zeros(ordinal, ScalarType::U32, &[q_len])?,
+            lm_head_block_best_vals: GpuBuffer::zeros(
+                ordinal,
+                ScalarType::F32,
+                &[q_len, (vocab + 15) / 16],
+            )?,
+            lm_head_block_best_indices: GpuBuffer::zeros(
+                ordinal,
+                ScalarType::U32,
+                &[q_len, (vocab + 15) / 16],
+            )?,
 
             matvec_counter: GpuBuffer::zeros(ordinal, ScalarType::F32, &[1])?,
         })
