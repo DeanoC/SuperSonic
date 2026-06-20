@@ -128,6 +128,7 @@ impl fmt::Display for ModelVariant {
 pub enum GpuArch {
     Gfx1100,
     Gfx1150,
+    Gfx1201,
     Gfx942,
     Sm86,
     Sm90,
@@ -142,6 +143,7 @@ impl GpuArch {
             Backend::Hip => match name.trim().split(':').next().unwrap_or(name.trim()) {
                 "gfx1100" => Self::Gfx1100,
                 "gfx1150" => Self::Gfx1150,
+                "gfx1201" => Self::Gfx1201,
                 "gfx942" => Self::Gfx942,
                 other => Self::Unknown(other.to_owned()),
             },
@@ -164,6 +166,7 @@ impl fmt::Display for GpuArch {
         match self {
             Self::Gfx1100 => write!(f, "gfx1100"),
             Self::Gfx1150 => write!(f, "gfx1150"),
+            Self::Gfx1201 => write!(f, "gfx1201"),
             Self::Gfx942 => write!(f, "gfx942"),
             Self::Sm86 => write!(f, "sm86"),
             Self::Sm90 => write!(f, "sm90"),
@@ -192,9 +195,11 @@ pub struct ArchProfile {
 impl ArchProfile {
     pub fn for_arch(arch: &GpuArch) -> Self {
         let memory = match arch {
-            GpuArch::Gfx1100 | GpuArch::Gfx942 | GpuArch::Sm86 | GpuArch::Sm90 => {
-                MemoryArchitecture::Discrete
-            }
+            GpuArch::Gfx1100
+            | GpuArch::Gfx1201
+            | GpuArch::Gfx942
+            | GpuArch::Sm86
+            | GpuArch::Sm90 => MemoryArchitecture::Discrete,
             GpuArch::Gfx1150 | GpuArch::AppleM4 | GpuArch::AppleM5Max => {
                 MemoryArchitecture::Unified
             }
@@ -420,6 +425,89 @@ static REGISTRY: &[RegistryEntry] = &[
         model: ModelVariant::Qwen3_6_27B,
         backend: Backend::Hip,
         arch: GpuArch::Gfx1100,
+        vram: VramBudget {
+            fixed_bytes: 22 * GIB,
+            overhead_factor: 1.05,
+        },
+        params: FamilyParams::Qwen35(Qwen35KernelParams {
+            // Qwen3.6-27B: qkv 8192 + z 6144 + b/a 48 each.
+            proj_buf_floats: 16480,
+            // Floor for 3*nh*hd + nh*aligned_kv_t at short contexts.
+            // The runner still expands this from --context-size.
+            attn_scratch_floats: 24576,
+            weight_prefix: "model.language_model",
+            kv_chunk_size: 256,
+            use_4b_kernel: true,
+        }),
+    },
+    RegistryEntry {
+        model: ModelVariant::Qwen3_5_0_8B,
+        backend: Backend::Hip,
+        arch: GpuArch::Gfx1201,
+        vram: VramBudget {
+            fixed_bytes: 2 * GIB,
+            overhead_factor: 1.1,
+        },
+        params: FamilyParams::Qwen35(Qwen35KernelParams {
+            proj_buf_floats: 8224,
+            attn_scratch_floats: 16384,
+            weight_prefix: "model.language_model",
+            kv_chunk_size: 256,
+            use_4b_kernel: true,
+        }),
+    },
+    RegistryEntry {
+        model: ModelVariant::Qwen3_5_2B,
+        backend: Backend::Hip,
+        arch: GpuArch::Gfx1201,
+        vram: VramBudget {
+            fixed_bytes: 5 * GIB,
+            overhead_factor: 1.1,
+        },
+        params: FamilyParams::Qwen35(Qwen35KernelParams {
+            proj_buf_floats: 8224,
+            attn_scratch_floats: 16384,
+            weight_prefix: "model.language_model",
+            kv_chunk_size: 256,
+            use_4b_kernel: true,
+        }),
+    },
+    RegistryEntry {
+        model: ModelVariant::Qwen3_5_4B,
+        backend: Backend::Hip,
+        arch: GpuArch::Gfx1201,
+        vram: VramBudget {
+            fixed_bytes: 10 * GIB,
+            overhead_factor: 1.1,
+        },
+        params: FamilyParams::Qwen35(Qwen35KernelParams {
+            proj_buf_floats: 12352,
+            attn_scratch_floats: 16384,
+            weight_prefix: "model.language_model",
+            kv_chunk_size: 256,
+            use_4b_kernel: true,
+        }),
+    },
+    RegistryEntry {
+        model: ModelVariant::Qwen3_5_9B,
+        backend: Backend::Hip,
+        arch: GpuArch::Gfx1201,
+        vram: VramBudget {
+            fixed_bytes: 18 * GIB,
+            overhead_factor: 1.1,
+        },
+        params: FamilyParams::Qwen35(Qwen35KernelParams {
+            proj_buf_floats: 12352,
+            attn_scratch_floats: 16384,
+            weight_prefix: "model.language_model",
+            kv_chunk_size: 256,
+            use_4b_kernel: true,
+        }),
+    },
+    RegistryEntry {
+        model: ModelVariant::Qwen3_6_27B,
+        backend: Backend::Hip,
+        arch: GpuArch::Gfx1201,
         vram: VramBudget {
             fixed_bytes: 22 * GIB,
             overhead_factor: 1.05,
@@ -1250,6 +1338,34 @@ mod tests {
     }
 
     #[test]
+    fn hip_gfx1201_registry_includes_rdna4_dense_qwen_targets() {
+        assert_eq!(
+            GpuArch::from_backend_name(&Backend::Hip, "gfx1201"),
+            GpuArch::Gfx1201
+        );
+        assert_eq!(
+            GpuArch::from_backend_name(&Backend::Hip, "gfx1201:sramecc+:xnack-"),
+            GpuArch::Gfx1201
+        );
+        let profile = ArchProfile::for_arch(&GpuArch::Gfx1201);
+        assert_eq!(profile.memory, MemoryArchitecture::Discrete);
+        assert_eq!(profile.buffer_policy, BufferPolicy::all_default());
+
+        for model in [
+            ModelVariant::Qwen3_5_0_8B,
+            ModelVariant::Qwen3_5_2B,
+            ModelVariant::Qwen3_5_4B,
+            ModelVariant::Qwen3_5_9B,
+            ModelVariant::Qwen3_6_27B,
+        ] {
+            assert!(lookup(&model, &Backend::Hip, &GpuArch::Gfx1201).is_some());
+            assert!(supported_archs_for(&model, &Backend::Hip)
+                .iter()
+                .any(|arch| arch == "gfx1201"));
+        }
+    }
+
+    #[test]
     fn hip_gfx942_registry_includes_cdna_targets() {
         assert_eq!(
             GpuArch::from_backend_name(&Backend::Hip, "gfx942"),
@@ -1295,6 +1411,21 @@ mod tests {
     fn hip_gfx1100_qwen36_27b_registry_params_match_geometry() {
         let entry = lookup(&ModelVariant::Qwen3_6_27B, &Backend::Hip, &GpuArch::Gfx1100)
             .expect("qwen3.6-27b HIP gfx1100 registry entry");
+        match entry.params {
+            FamilyParams::Qwen35(params) => {
+                assert_eq!(params.weight_prefix, "model.language_model");
+                assert!(params.use_4b_kernel);
+                assert_eq!(params.proj_buf_floats, 16_480);
+                assert_eq!(params.attn_scratch_floats, 24_576);
+            }
+            _ => panic!("qwen3.6-27b must use the Qwen hybrid-attention engine"),
+        }
+    }
+
+    #[test]
+    fn hip_gfx1201_qwen36_27b_registry_params_match_geometry() {
+        let entry = lookup(&ModelVariant::Qwen3_6_27B, &Backend::Hip, &GpuArch::Gfx1201)
+            .expect("qwen3.6-27b HIP gfx1201 registry entry");
         match entry.params {
             FamilyParams::Qwen35(params) => {
                 assert_eq!(params.weight_prefix, "model.language_model");

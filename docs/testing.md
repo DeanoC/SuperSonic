@@ -21,6 +21,11 @@ export SUPERSONIC_MODEL_DIR_4B=/path/to/Qwen3.5-4B
 ./tests/gfx1150/run.sh
 ./tests/gfx1150/run_4b.sh
 
+# gfx1201 (RDNA 4 / R9700) — starter RDNA4 lane
+HIP_VISIBLE_DEVICES=1 ./tests/gfx1201/run_matrix.sh
+QWEN36_27B_MODEL_DIR=/path/to/supersonic-qwen36-27b-lucebox \
+  HIP_VISIBLE_DEVICES=1 ./tests/gfx1201/run_matrix.sh
+
 # sm86 (RTX 3090-class) — Qwen3.5-0.8B / 4B
 SUPERSONIC_BACKENDS=cuda ./tests/sm86/run.sh /path/to/Qwen3.5-0.8B
 SUPERSONIC_BACKENDS=cuda ./tests/sm86/run_4b.sh /path/to/Qwen3.5-4B
@@ -80,6 +85,13 @@ TIMEOUT=180 ./tests/gfx1150/run.sh /path/to/model
 The persistent decode megakernel can occasionally hang the GPU at 100% utilization. The test script has a timeout (default 120s) and will report failure rather than blocking forever. If this happens you may need to reset the GPU (`rocm-smi --resetgpu`) or reboot before re-running.
 
 For CUDA specifically, treat `sm86` as the validated target for now. Other NVIDIA architectures may work, but they are not yet part of the checked support matrix.
+
+For HIP `gfx1201`, `tests/gfx1201/run_matrix.sh` is the bring-up gate. It
+builds a dual `gfx1100,gfx1201` HIP binary, runs the RDNA4 WMMA/int4 kernel
+harness, then runs a short Qwen3.6 27B Q4KM-GPTQ smoke and the Lucebox/DFlash
+smoke when local artifacts are available. Qwen3.5 rows in
+`supported-matrix.md` should stay TBM until that script grows per-model token
+checks for the local R9700.
 
 For Metal specifically, Apple M4 remains the small Qwen3.5 validation lane.
 Apple M5 Max is the current large-model lane: it covers Qwen3.5 BF16 smokes,

@@ -6,9 +6,10 @@ which GPU architecture. The cells below track *correctness* — see
 and [docs/feature-compatibility.md](feature-compatibility.md) for the
 runtime-feature compatibility grid.
 
-Six backend surfaces are validated or in bring-up today:
+Seven backend surfaces are validated or in bring-up today:
 
 - **HIP / `gfx1100`** — AMD Radeon RX 7900 XTX (RDNA 3, 24 GiB)
+- **HIP / `gfx1201`** — AMD Radeon AI PRO R9700 (RDNA 4, 32 GiB bring-up)
 - **HIP / `gfx1150`** — AMD Radeon 890M iGPU (RDNA 3.5)
 - **HIP / `gfx942`** — AMD Instinct MI300X-class (CDNA 3, wave64 bring-up)
 - **CUDA / `sm86`** — NVIDIA RTX 3090-class (Ampere)
@@ -48,6 +49,28 @@ Six backend surfaces are validated or in bring-up today:
   releases (see [docs/bake-distribution.md](bake-distribution.md));
   producer workflow is unchanged. `--fp8-runtime` and `--kv-fp8` are
   not wired for the MoE family.
+
+### HIP on `gfx1201`
+
+RDNA 4 is a new bring-up lane. `gfx1201` is a first-class HIP registry arch
+and uses the gfx12 BF16/i8 WMMA adapter path for low-bit Qwen matmuls. The
+Qwen3.5 rows are registered and buildable, but remain TBM until the
+architecture-specific smoke matrix promotes them with token/parity results.
+
+| Model           | BF16 | INT4 | FP8 runtime | FP8 KV |
+|-----------------|:----:|:----:|:-----------:|:------:|
+| qwen3.5-0.8b    | TBM¹ | TBM¹ |     TBM¹    |  TBM¹  |
+| qwen3.5-2b      | TBM¹ | TBM¹ |     TBM¹    |  TBM¹  |
+| qwen3.5-4b      | TBM¹ | TBM¹ |     TBM¹    |  TBM¹  |
+| qwen3.5-9b      | TBM¹ | TBM¹ |     TBM¹    |  TBM¹  |
+| qwen3.6-27b     |  —   |  ✅² |      —      |   —    |
+
+¹ Registry and dual-arch HIP build coverage are present for `gfx1201`; run
+  `tests/gfx1201/run_matrix.sh` with local model dirs before promoting these
+  cells from TBM to validated support.
+² Validated on R9700 / `gfx1201` on 2026-06-20 with the RDNA4 BF16/i8 WMMA
+  harness, a direct `qwen3.6-27b --q4km-gptq` smoke, and Lucebox/DFlash
+  Qwen3.6 27B smokes. Sustained decode still needs RDNA4-specific profiling.
 
 ### HIP on `gfx1150`
 
