@@ -186,28 +186,40 @@ __device__ inline void qwen36_moe_attn_step_device(
             const int lane_half = lane_in_wave >> 4;
             const uint8_t* slab_packed =
                 reinterpret_cast<const uint8_t*>(q_proj_w);
+            const int q_pair_rows = num_heads * head_dim;
             for (;;) {
                 __shared__ unsigned int row_base_s;
                 if (tid == 0) row_base_s = atomicAdd(&counters[0], 128u);
                 __syncthreads();
                 const int row_base = static_cast<int>(row_base_s);
-                if (row_base >= q_out_dim) break;
+                if (row_base >= q_pair_rows) break;
 
-                const int rhs_row = row_base + wave_id * 16 + lane_row;
-                const bool in_range = rhs_row < q_out_dim;
-                const uint8_t* slab_row = in_range
+                const int pair_row = row_base + wave_id * 16 + lane_row;
+                const bool in_range = pair_row < q_pair_rows;
+                const int head = pair_row / head_dim;
+                const int dim = pair_row - head * head_dim;
+                const int q_row = head * 2 * head_dim + dim;
+                const int gate_row = q_row + head_dim;
+                const uint8_t* q_slab_row = in_range
                     ? slab_packed +
-                      static_cast<size_t>(rhs_row) * (hidden / 2)
+                      static_cast<size_t>(q_row) * (hidden / 2)
                     : nullptr;
-                qwen36_float8 acc = wmma_int4_matvec_partial_16rows(
-                    slab_row,
-                    static_cast<const hip_bfloat16*>(q_proj_scale),
-                    static_cast<const hip_bfloat16*>(q_proj_zero),
-                    rhs_row, in_range,
-                    x_norm_lds, hidden,
-                    gsc_q, quant_group_size, lane_row);
+                const uint8_t* gate_slab_row = in_range
+                    ? slab_packed +
+                      static_cast<size_t>(gate_row) * (hidden / 2)
+                    : nullptr;
+                qwen36_float8_pair q_gate_acc =
+                    wmma_int4_pair_matvec_partial_16rows(
+                        q_slab_row, q_row,
+                        gate_slab_row, gate_row,
+                        static_cast<const hip_bfloat16*>(q_proj_scale),
+                        static_cast<const hip_bfloat16*>(q_proj_zero),
+                        in_range,
+                        x_norm_lds, hidden,
+                        gsc_q, quant_group_size, lane_row);
                 if (lane_half == 0 && in_range) {
-                    workspace[rhs_row] = bf16_round_rne_f32(acc[0]);
+                    workspace[q_row] = bf16_round_rne_f32(q_gate_acc.first[0]);
+                    workspace[gate_row] = bf16_round_rne_f32(q_gate_acc.second[0]);
                 }
                 __syncthreads();
             }
@@ -380,6 +392,47 @@ __device__ inline void qwen36_moe_attn_step_device(
         const int lane_row = lane_in_wave & 15;
         const int lane_half = lane_in_wave >> 4;
 
+        // Production INT4 has K and V row counts aligned to the 128-row
+        // WMMA work tile. Run both slabs through one work pool so the tiny
+        // Hkv*d projections expose twice as many block tasks and skip the
+        // internal K->V counter-reset barrier.
+        if (k_proj_scale != nullptr && v_proj_scale != nullptr && !fp8_mode) {
+            const uint8_t* k_slab_packed =
+                reinterpret_cast<const uint8_t*>(k_proj_w);
+            const uint8_t* v_slab_packed =
+                reinterpret_cast<const uint8_t*>(v_proj_w);
+            for (;;) {
+                __shared__ unsigned int row_base_s;
+                if (tid == 0) row_base_s = atomicAdd(&counters[0], 128u);
+                __syncthreads();
+                const int row_base = static_cast<int>(row_base_s);
+                if (row_base >= kv_total_rows) break;
+
+                const int kv_row = row_base + wave_id * 16 + lane_row;
+                const bool in_range = kv_row < kv_total_rows;
+                const bool is_v = kv_row >= Hkv * d;
+                const int rhs_row = is_v ? (kv_row - Hkv * d) : kv_row;
+                const uint8_t* slab_packed = is_v ? v_slab_packed : k_slab_packed;
+                const hip_bfloat16* slab_scale = is_v ? v_proj_scale : k_proj_scale;
+                const hip_bfloat16* slab_zero = is_v ? v_proj_zero : k_proj_zero;
+                const int dst_off = (is_v ? OFF_V_RAW : OFF_K_RAW) + rhs_row;
+                const uint8_t* slab_row = in_range
+                    ? slab_packed +
+                      static_cast<size_t>(rhs_row) * (hidden / 2)
+                    : nullptr;
+                qwen36_float8 acc = wmma_int4_matvec_partial_16rows(
+                    slab_row,
+                    static_cast<const hip_bfloat16*>(slab_scale),
+                    static_cast<const hip_bfloat16*>(slab_zero),
+                    rhs_row, in_range,
+                    x_norm_lds, hidden,
+                    gsc_kv, quant_group_size, lane_row);
+                if (lane_half == 0 && in_range) {
+                    workspace[dst_off] = bf16_round_rne_f32(acc[0]);
+                }
+                __syncthreads();
+            }
+        } else {
         // ------- Sub-pool 1: k_proj -------
         if (k_proj_scale != nullptr && !fp8_mode) {
             const uint8_t* slab_packed =
@@ -516,6 +569,7 @@ __device__ inline void qwen36_moe_attn_step_device(
                 }
                 __syncthreads();
             }
+        }
         }
     } else
 #endif
@@ -671,7 +725,8 @@ __device__ inline void qwen36_moe_attn_step_device(
                 const float b = workspace[src_off + h * d + half + i];
                 // freq = position * theta^(-i/half) = position / theta^(i/half).
                 // Match PyTorch's `theta ** (i/half)` ≡ exp((i/half) * log(theta)).
-                const float exponent = (static_cast<float>(i) / static_cast<float>(half)) * theta_log;
+                const float exponent =
+                    (static_cast<float>(i) / static_cast<float>(half)) * theta_log;
                 const float inv_freq = expf(-exponent);
                 const float freq = static_cast<float>(position) * inv_freq;
                 const float c = bf16_round_rne_f32(cosf(freq));
@@ -836,14 +891,21 @@ __device__ inline void qwen36_moe_attn_step_device(
         // block per head. Long cached contexts split KV into tiles so all CUs
         // can work on one head's history before a second pass combines the
         // tile-local softmax partials.
-        const int attn_tile_t = 384;
+        const int attn_tile_t = 8;
         const int attn_tile_stride = d + 2;
         const int attn_tile_count =
             (kv_len + attn_tile_t - 1) / attn_tile_t;
+        const int max_attn_tile_count =
+            (kv_max_t + attn_tile_t - 1) / attn_tile_t;
+        const int tiled_score_stride = max_attn_tile_count * attn_tile_stride;
+        const int attn_score_stride =
+            ((kv_max_t > attn_tile_t) && (d <= block_size))
+                ? ((kv_max_t > tiled_score_stride) ? kv_max_t : tiled_score_stride)
+                : kv_max_t;
         const bool use_tiled_attn =
             (kv_cache_k != nullptr) && (kv_len > attn_tile_t) &&
             (d <= block_size) &&
-            (attn_tile_count * attn_tile_stride <= kv_max_t);
+            (attn_tile_count * attn_tile_stride <= attn_score_stride);
 
         if (use_tiled_attn) {
             const bool use_fp8_kv = (kv_scale_k != nullptr);
@@ -899,7 +961,7 @@ __device__ inline void qwen36_moe_attn_step_device(
                 const int t0 = tile * attn_tile_t;
                 const int t1 = (t0 + attn_tile_t < kv_len) ? (t0 + attn_tile_t) : kv_len;
                 float* partials =
-                    workspace + OFF_SCORES + hq * kv_max_t + tile * attn_tile_stride;
+                    workspace + OFF_SCORES + hq * attn_score_stride + tile * attn_tile_stride;
 
                 float tile_m = -INFINITY;
                 float tile_l = 0.0f;
@@ -987,7 +1049,7 @@ __device__ inline void qwen36_moe_attn_step_device(
                 float global_m = -INFINITY;
                 for (int tile = 0; tile < attn_tile_count; tile++) {
                     const float* partials =
-                        workspace + OFF_SCORES + hq * kv_max_t + tile * attn_tile_stride;
+                        workspace + OFF_SCORES + hq * attn_score_stride + tile * attn_tile_stride;
                     global_m = fmaxf(global_m, partials[0]);
                 }
 
@@ -995,7 +1057,7 @@ __device__ inline void qwen36_moe_attn_step_device(
                 float global_acc = 0.0f;
                 for (int tile = 0; tile < attn_tile_count; tile++) {
                     const float* partials =
-                        workspace + OFF_SCORES + hq * kv_max_t + tile * attn_tile_stride;
+                        workspace + OFF_SCORES + hq * attn_score_stride + tile * attn_tile_stride;
                     const float w = expf(partials[0] - global_m);
                     global_l += partials[1] * w;
                     if (tid < d) {

@@ -111,6 +111,31 @@ pub fn full_attn_workspace_floats(geom: &MultiLayerGeom) -> usize {
     6 * h * d + 4 * hkv * d + geom.hidden as usize
 }
 
+/// Per-Q-head score/partial stride for cached full attention.
+///
+/// The HIP full-attn decode path switches to tile-local online-softmax
+/// partials for histories longer than this tile. Each tile needs `[m, l]`
+/// plus one accumulator per head-dim lane, so the score workspace must be
+/// wider than the raw `kv_max_t` score row once tiling is possible.
+pub const FULL_ATTN_DECODE_TILE_T: usize = 8;
+
+pub fn full_attn_score_workspace_stride(geom: &MultiLayerGeom, kv_max_t: usize) -> usize {
+    if kv_max_t == 0 {
+        return 0;
+    }
+    let d = geom.head_dim as usize;
+    if kv_max_t > FULL_ATTN_DECODE_TILE_T && d <= 256 {
+        let tile_count = kv_max_t.div_ceil(FULL_ATTN_DECODE_TILE_T);
+        kv_max_t.max(tile_count * (d + 2))
+    } else {
+        kv_max_t
+    }
+}
+
+pub fn full_attn_score_workspace_floats(geom: &MultiLayerGeom, kv_max_t: usize) -> usize {
+    (geom.num_attention_heads as usize) * full_attn_score_workspace_stride(geom, kv_max_t)
+}
+
 /// BF16 elements sufficient for the full-attn parity launcher's largest
 /// stage (stage 3 publishes q_rot || k_rot, the widest output).
 pub(crate) fn full_attn_output_elems(geom: &MultiLayerGeom) -> usize {
@@ -2027,14 +2052,15 @@ fn run_chained_decode_impl_with_cache_pos(
             );
     let attn_extra_regions = full_attn_tap_regions.max(1);
     let attn_extra = if max_kv_t > 0 {
-        geom.num_attention_heads as usize * max_kv_t * attn_extra_regions
+        let profile_tap_extra = geom.num_attention_heads as usize * max_kv_t * attn_extra_regions;
+        profile_tap_extra.max(full_attn_score_workspace_floats(geom, max_kv_t))
     } else {
         0
     };
 
     // Shared attention scratch: sized for the larger of (full, linear).
     let attn_ws_floats =
-        full_attn_workspace_floats(geom).max(linear_attn_workspace_floats(geom)) + attn_extra;
+        (full_attn_workspace_floats(geom) + attn_extra).max(linear_attn_workspace_floats(geom));
     let attn_out_elems = full_attn_output_elems(geom).max(linear_attn_output_elems(geom));
     let mut attn_output = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[attn_out_elems])
         .context("alloc attn_output")?;

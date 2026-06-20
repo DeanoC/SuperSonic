@@ -89,7 +89,9 @@ __device__ inline void qwen36_moe_linear_step_device(
     float* __restrict__            workspace,
     unsigned int* __restrict__     counters,
     unsigned int* __restrict__     barrier_counter,
-    unsigned int* __restrict__     barrier_flag) {
+    unsigned int* __restrict__     barrier_flag,
+    bool                           suppress_stage_publish = false,
+    bool                           mutate_state = true) {
     (void)conv1d_w;
     (void)conv1d_bias;
     (void)dt_bias;
@@ -326,7 +328,7 @@ __device__ inline void qwen36_moe_linear_step_device(
                                    &counters[0]);
 
         // ------- Sub-pool 3: in_proj_a + in_proj_b (always BF16, V each) -
-        // 2*V rows total — small enough that a single fused scalar pool
+        // 2*V rows total -- small enough that a single fused scalar pool
         // beats WMMA tiling overhead. Branches on `is_b` to pick slab
         // and dst offset.
         for (;;) {
@@ -453,10 +455,12 @@ __device__ inline void qwen36_moe_linear_step_device(
     // stages publish their own intermediates and keep qkv_raw in workspace
     // (where Phase C — depthwise conv1d — will read it).
     if (stage == 1) {
-        for (int i = tid + blockIdx.x * block_size;
-             i < qkv_dim;
-             i += block_size * num_blocks) {
-            output[i] = static_cast<T>(workspace[OFF_QKV_RAW + i]);
+        if (!suppress_stage_publish) {
+            for (int i = tid + blockIdx.x * block_size;
+                 i < qkv_dim;
+                 i += block_size * num_blocks) {
+                output[i] = static_cast<T>(workspace[OFF_QKV_RAW + i]);
+            }
         }
         return;
     }
@@ -526,14 +530,16 @@ __device__ inline void qwen36_moe_linear_step_device(
         // Shift conv_state_before left by one and append the new qkv_raw
         // at position kstate-1, store back as BF16. Each thread owns its
         // channel's row — no cross-thread races.
-        for (int t = 0; t < kstate - 1; ++t) {
-            conv_state[ch * kstate + t] =
-                static_cast<T>(conv_in[t + 1]);
+        if (mutate_state) {
+            for (int t = 0; t < kstate - 1; ++t) {
+                conv_state[ch * kstate + t] =
+                    static_cast<T>(conv_in[t + 1]);
+            }
+            conv_state[ch * kstate + (kstate - 1)] = static_cast<T>(new_qkv);
         }
-        conv_state[ch * kstate + (kstate - 1)] = static_cast<T>(new_qkv);
 
         // Stage 2 publishes silu_out to the host-visible output buffer.
-        if (stage == 2) {
+        if (stage == 2 && !suppress_stage_publish) {
             output[ch] = static_cast<T>(silu_out);
         }
     }
@@ -644,14 +650,14 @@ __device__ inline void qwen36_moe_linear_step_device(
                 const float qs = bf16_round_rne_f32(qn * q_scale);
                 workspace[q_dst + i] = qs;
                 workspace[k_dst + i] = kn;
-                if (stage == 3) {
+                if (stage == 3 && !suppress_stage_publish) {
                     output[vhead * k_dim + i]               = static_cast<T>(qs);
                     output[V * k_dim + vhead * k_dim + i]   = static_cast<T>(kn);
                 }
             }
             // V is reshape-only of v_raw (silu_out's third partition); no
             // arithmetic, just publish for stage 3 verification.
-            if (stage == 3) {
+            if (stage == 3 && !suppress_stage_publish) {
                 const int v_src = OFF_QKV_RAW + 2 * key_dim + vhead * v_dim;
                 for (int i = tid; i < v_dim; i += block_size) {
                     const float vv = workspace[v_src + i];
@@ -743,33 +749,34 @@ __device__ inline void qwen36_moe_linear_step_device(
             const int kv_off    = OFF_K_REP + h * k_dim;
             const int qv_off    = OFF_Q_REP + h * k_dim;
             const int v_off     = OFF_QKV_RAW + 2 * key_dim + h * v_dim;
-            const int total_state = k_dim * v_dim;
 
-            // Step 1: decay.
-            for (int e = tid; e < total_state; e += block_size) {
-                recurrent_state[state_off + e] *= head_gstep;
+            // Step 1 is folded into the two consumers below. The recurrent
+            // state is conceptually decayed before the KV reduction, but
+            // writing that whole matrix and then reading it again costs a
+            // large memory pass per linear layer.
+
+            // Step 2: kv_mem[j] = sum_i(decayed_state[h, i, j] * k_rep[h, i]).
+            // Use the block's 8 waves as independent column reducers. The
+            // previous full-block loop paid a block reduction plus several
+            // syncthreads for every j; on 35B that is 128 columns per head.
+            const int wave_id = tid >> 5;
+            const int lane = tid & 31;
+            for (int j_base = 0; j_base < v_dim; j_base += 8) {
+                const int j = j_base + wave_id;
+                float partial = 0.0f;
+                if (j < v_dim) {
+                    for (int i = lane; i < k_dim; i += warpSize) {
+                        const float decayed =
+                            recurrent_state[state_off + i * v_dim + j] * head_gstep;
+                        partial += decayed * workspace[kv_off + i];
+                    }
+                }
+                const float sum = qwen36_wave_sum(partial);
+                if (lane == 0 && j < v_dim) {
+                    kv_mem_lds[j] = sum;
+                }
             }
             __syncthreads();
-
-            // Step 2: kv_mem[j] = sum_i(state[h, i, j] * k_rep[h, i]).
-            // Loop over j; for each j do a block-wide reduction over i.
-            for (int j = 0; j < v_dim; ++j) {
-                float partial = 0.0f;
-                for (int i = tid; i < k_dim; i += block_size) {
-                    partial += recurrent_state[state_off + i * v_dim + j] *
-                               workspace[kv_off + i];
-                }
-                shared_scratch[tid] = partial;
-                __syncthreads();
-                for (int s = block_size / 2; s > 0; s >>= 1) {
-                    if (tid < s) shared_scratch[tid] += shared_scratch[tid + s];
-                    __syncthreads();
-                }
-                if (tid == 0) {
-                    kv_mem_lds[j] = shared_scratch[0];
-                }
-                __syncthreads();
-            }
 
             // Step 3: delta[j] = (v_heads[h, j] - kv_mem[j]) * beta[h].
             for (int j = tid; j < v_dim; j += block_size) {
@@ -778,40 +785,46 @@ __device__ inline void qwen36_moe_linear_step_device(
             }
             __syncthreads();
 
-            // Step 4: state[h, i, j] += k_rep[h, i] * delta[j].
+            // Step 4: state[h, i, j] = decayed_state[h, i, j] +
+            //                          k_rep[h, i] * delta[j].
+            const int total_state = k_dim * v_dim;
             for (int e = tid; e < total_state; e += block_size) {
                 const int i = e / v_dim;
                 const int j = e - i * v_dim;
-                recurrent_state[state_off + e] +=
-                    workspace[kv_off + i] * delta_lds[j];
+                const float decayed = recurrent_state[state_off + e] * head_gstep;
+                if (mutate_state) {
+                    recurrent_state[state_off + e] =
+                        decayed + workspace[kv_off + i] * delta_lds[j];
+                }
             }
             __syncthreads();
 
             // Step 5: recurrent_out[h, j] = sum_i(state[h, i, j] * q_scaled[h, i]).
-            for (int j = 0; j < v_dim; ++j) {
+            for (int j_base = 0; j_base < v_dim; j_base += 8) {
+                const int j = j_base + wave_id;
                 float partial = 0.0f;
-                for (int i = tid; i < k_dim; i += block_size) {
-                    partial += recurrent_state[state_off + i * v_dim + j] *
-                               workspace[qv_off + i];
+                if (j < v_dim) {
+                    for (int i = lane; i < k_dim; i += warpSize) {
+                        const float state_v = mutate_state
+                            ? recurrent_state[state_off + i * v_dim + j]
+                            : recurrent_state[state_off + i * v_dim + j] * head_gstep
+                              + workspace[kv_off + i] * delta_lds[j];
+                        partial += state_v * workspace[qv_off + i];
+                    }
                 }
-                shared_scratch[tid] = partial;
-                __syncthreads();
-                for (int s = block_size / 2; s > 0; s >>= 1) {
-                    if (tid < s) shared_scratch[tid] += shared_scratch[tid + s];
-                    __syncthreads();
-                }
-                if (tid == 0) {
+                const float sum = qwen36_wave_sum(partial);
+                if (lane == 0 && j < v_dim) {
                     // Match oracle's `recurrent_out.to(dtype)` — F32 → BF16
                     // cast happens here so Phase H reads BF16-precision
                     // values regardless of stage.
-                    const float r = bf16_round_rne_f32(shared_scratch[0]);
+                    const float r = bf16_round_rne_f32(sum);
                     workspace[OFF_REC_OUT + h * v_dim + j] = r;
-                    if (stage == 4) {
+                    if (stage == 4 && !suppress_stage_publish) {
                         output[h * v_dim + j] = static_cast<T>(r);
                     }
                 }
-                __syncthreads();
             }
+            __syncthreads();
         }
     }
 
@@ -908,6 +921,8 @@ __device__ inline void qwen36_moe_linear_step_device(
         if constexpr (USE_WMMA) {
             if (out_int4) {
                 const int gsc_o = qd / quant_group_size;
+                constexpr int rows_per_task = 64;
+                constexpr int active_waves = rows_per_task / 16;
                 const int wave_id = tid >> 5;
                 const int lane_in_wave = tid & 31;
                 const int lane_row = lane_in_wave & 15;
@@ -917,13 +932,13 @@ __device__ inline void qwen36_moe_linear_step_device(
                     reinterpret_cast<const uint8_t*>(out_proj_w);
                 for (;;) {
                     __shared__ unsigned int row_base_s;
-                    if (tid == 0) row_base_s = atomicAdd(&counters[0], 128u);
+                    if (tid == 0) row_base_s = atomicAdd(&counters[0], rows_per_task);
                     __syncthreads();
                     const int row_base = static_cast<int>(row_base_s);
                     if (row_base >= hidden) break;
 
                     const int rhs_row = row_base + wave_id * 16 + lane_row;
-                    const bool in_range = rhs_row < hidden;
+                    const bool in_range = (wave_id < active_waves) && (rhs_row < hidden);
                     const uint8_t* slab_row = in_range
                         ? slab_packed +
                           static_cast<size_t>(rhs_row) * (qd / 2)

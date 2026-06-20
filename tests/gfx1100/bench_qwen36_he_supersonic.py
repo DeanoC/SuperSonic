@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Run SuperSonic Qwen3.6 over the Lucebox HumanEval DFlash prompts.
 
-This is a comparison harness, not a correctness gate: Lucebox benchmarks a
-Qwen3.6-27B GGUF target plus DFlash draft. SuperSonic can run the same
-tokenizer/config/source GGUF through a Q4KM-sourced native INT4 package on HIP.
-The prompt set and generation length are kept identical.
+This is a comparison harness, not a correctness gate. It can run either the
+Lucebox-style Qwen3.6-27B GGUF target plus DFlash draft, or the native
+Qwen3.6-35B-A3B MoE path over the same HumanEval prompt set.
 """
 
 from __future__ import annotations
@@ -26,6 +25,14 @@ DEFAULT_LUCEBOX_HE_JSONL = Path(
 )
 DEFAULT_SUPERSONIC_DFLASH_DRAFT_DIR = Path("/mnt/data/tmp/qwen36-27b-dflash-q8-bf16")
 DEFAULT_LUCEBOX_DRAFT_DIR = Path("/mnt/data/lucebox-hub/models/draft")
+DEFAULT_27B_MODEL = "qwen3.6-27b"
+DEFAULT_27B_MODEL_DIR = Path("/mnt/data/tmp/supersonic-qwen36-27b-lucebox")
+DEFAULT_27B_QUANT = "q4km-gptq"
+DEFAULT_35B_A3B_MODEL = "qwen3.6-35b-a3b"
+DEFAULT_35B_A3B_MODEL_DIR = Path("/mnt/data/models/Qwen3.6-35B-A3B")
+DEFAULT_35B_A3B_QUANT = "int4"
+DEFAULT_OUT_JSON = Path("target/qwen36_he_supersonic.json")
+DEFAULT_35B_A3B_OUT_JSON = Path("target/qwen36_35b_a3b_he_supersonic.json")
 DEFAULT_CONTEXT_SIZE = 512
 LUCEBOX_SERVING_CONTEXT_SIZE = 1024
 LUCEBOX_DRAFT_ALIASES = {
@@ -51,6 +58,22 @@ RESULT_RE = re.compile(
     r"decode_ms=(?P<decode_ms>[0-9.]+)\s+"
     r"ms_per_(?:step|tok)=(?P<ms_per_step>[0-9.]+)"
 )
+
+
+TARGET_PROFILES = {
+    "qwen36-27b-lucebox": {
+        "model": DEFAULT_27B_MODEL,
+        "model_dir": DEFAULT_27B_MODEL_DIR,
+        "quant": DEFAULT_27B_QUANT,
+        "out_json": DEFAULT_OUT_JSON,
+    },
+    "qwen36-35b-a3b": {
+        "model": DEFAULT_35B_A3B_MODEL,
+        "model_dir": DEFAULT_35B_A3B_MODEL_DIR,
+        "quant": DEFAULT_35B_A3B_QUANT,
+        "out_json": DEFAULT_35B_A3B_OUT_JSON,
+    },
+}
 
 
 def load_lucebox_script_prompts(path: Path) -> list[tuple[str, str]]:
@@ -132,6 +155,29 @@ def resolve_dflash_draft(args: argparse.Namespace) -> tuple[Path, Path | None, s
     if config_dir is None:
         config_dir = DEFAULT_SUPERSONIC_DFLASH_DRAFT_DIR
     return Path(config_dir), Path(gguf) if gguf else None, label
+
+
+def apply_target_profile(args: argparse.Namespace) -> None:
+    profile = TARGET_PROFILES[args.target_profile]
+    if args.model is None:
+        args.model = profile["model"]
+    if args.model_dir is None:
+        args.model_dir = profile["model_dir"]
+    if args.quant is None:
+        args.quant = profile["quant"]
+    if args.out_json is None:
+        args.out_json = profile["out_json"]
+
+
+def apply_lucebox_serving_mode(args: argparse.Namespace) -> None:
+    args.prompt_source = "jsonl"
+    args.prompt_format = "chatml-no-thinking"
+    args.ignore_eos = False
+    if args.target_profile == "qwen36-27b-lucebox":
+        args.dflash = True
+        args.dflash_draft_variant = args.dflash_draft_variant or "lucebox-q4-k-m"
+    if args.context_size == DEFAULT_CONTEXT_SIZE:
+        args.context_size = LUCEBOX_SERVING_CONTEXT_SIZE
 
 
 def run_one(args: argparse.Namespace, name: str, prompt: str, warmup: bool = False) -> dict:
@@ -217,19 +263,47 @@ def run_one(args: argparse.Namespace, name: str, prompt: str, warmup: bool = Fal
     return row
 
 
+def build_summary(rows: list[dict]) -> dict:
+    ok = [r for r in rows if r.get("returncode") == 0 and "tok_s" in r]
+    total_generated = sum(r["generated_tokens"] for r in ok)
+    total_decode_ms = sum(r["decode_ms"] for r in ok)
+    return {
+        "count": len(ok),
+        "mean_tok_s": sum(r["tok_s"] for r in ok) / len(ok),
+        "weighted_tok_s": (1000.0 * total_generated / total_decode_ms)
+        if total_decode_ms
+        else 0.0,
+        "mean_ms_per_step": sum(r["ms_per_step"] for r in ok) / len(ok),
+        "min_tok_s": min(r["tok_s"] for r in ok),
+        "max_tok_s": max(r["tok_s"] for r in ok),
+        "total_generated_tokens": total_generated,
+        "total_decode_ms": total_decode_ms,
+        "stopped_early_count": sum(1 for r in ok if r.get("stopped_early")),
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", type=Path, default=Path("target/release/supersonic"))
-    parser.add_argument("--model", default="qwen3.6-27b")
+    parser.add_argument(
+        "--target-profile",
+        choices=sorted(TARGET_PROFILES),
+        default="qwen36-27b-lucebox",
+        help=(
+            "Default model/model-dir/quant/output bundle. Explicit individual "
+            "arguments still take precedence."
+        ),
+    )
+    parser.add_argument("--model", default=None)
     parser.add_argument(
         "--model-dir",
         type=Path,
-        default=Path("/mnt/data/tmp/supersonic-qwen36-27b-lucebox"),
+        default=None,
     )
     parser.add_argument(
         "--quant",
         choices=["q4km-gptq", "q4km", "int4", "none"],
-        default="q4km-gptq",
+        default=None,
     )
     parser.add_argument("--lucebox-bench", type=Path, default=DEFAULT_LUCEBOX_BENCH)
     parser.add_argument("--lucebox-jsonl", type=Path, default=DEFAULT_LUCEBOX_HE_JSONL)
@@ -292,17 +366,12 @@ def main() -> int:
         ),
     )
     parser.add_argument("--dflash-block", type=int, default=0)
-    parser.add_argument("--out-json", type=Path, default=Path("target/qwen36_he_supersonic.json"))
+    parser.add_argument("--out-json", type=Path, default=None)
     args = parser.parse_args()
 
+    apply_target_profile(args)
     if args.lucebox_serving_mode:
-        args.prompt_source = "jsonl"
-        args.prompt_format = "chatml-no-thinking"
-        args.ignore_eos = False
-        args.dflash = True
-        args.dflash_draft_variant = args.dflash_draft_variant or "lucebox-q4-k-m"
-        if args.context_size == DEFAULT_CONTEXT_SIZE:
-            args.context_size = LUCEBOX_SERVING_CONTEXT_SIZE
+        apply_lucebox_serving_mode(args)
     if args.stop_on_eos:
         args.ignore_eos = False
 
@@ -346,15 +415,7 @@ def main() -> int:
     ok = [r for r in rows if r.get("returncode") == 0 and "tok_s" in r]
     if not ok:
         return 1
-    summary = {
-        "count": len(ok),
-        "mean_tok_s": sum(r["tok_s"] for r in ok) / len(ok),
-        "mean_ms_per_step": sum(r["ms_per_step"] for r in ok) / len(ok),
-        "min_tok_s": min(r["tok_s"] for r in ok),
-        "max_tok_s": max(r["tok_s"] for r in ok),
-        "total_generated_tokens": sum(r["generated_tokens"] for r in ok),
-        "stopped_early_count": sum(1 for r in ok if r.get("stopped_early")),
-    }
+    summary = build_summary(rows)
     dflash_draft_dir, dflash_draft_gguf, dflash_draft_label = resolve_dflash_draft(args)
     payload = {
         "schema": "supersonic-qwen36-he-comparison-v2",

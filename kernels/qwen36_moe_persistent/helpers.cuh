@@ -14,15 +14,23 @@
 // namespace and translation unit; they are NOT shared with the qwen35
 // kernels.
 //
-// The numerics match `oracle/bake_int4.py`'s reconstruction exactly:
-//   recon = bf16_round_rne_f32(nibble * scale - zero * scale)
-// (single rounding through BF16 at the end).
+// The production decode path intentionally uses a fast reconstruction:
+//   recon = nibble * scale - zero * scale
+// This differs from the original oracle's per-nibble BF16 RNE but was kept
+// after 35B A3B full-harness benchmarking as a measured decode win.
 
 #pragma once
 
 #include "../qwen36_moe_cuda_prelude.cuh"
 
 namespace qwen36_moe {
+
+__device__ __forceinline__ float qwen36_wave_sum(float value) {
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        value += __shfl_down(value, offset);
+    }
+    return value;
+}
 
 // Round an F32 value to BF16 precision (round-to-nearest-even) and widen
 // back to F32. Used at every "BF16 store" point so that intermediate F32
@@ -81,14 +89,14 @@ __device__ inline void int4_dequant_8(
     if (g0 == g7) {
         float s = static_cast<float>(scales[sb + g0]);
         float zs = static_cast<float>(zeros[sb + g0]) * s;
-        out[0] = bf16_round_rne_f32(static_cast<float>(n0) * s - zs);
-        out[1] = bf16_round_rne_f32(static_cast<float>(n1) * s - zs);
-        out[2] = bf16_round_rne_f32(static_cast<float>(n2) * s - zs);
-        out[3] = bf16_round_rne_f32(static_cast<float>(n3) * s - zs);
-        out[4] = bf16_round_rne_f32(static_cast<float>(n4) * s - zs);
-        out[5] = bf16_round_rne_f32(static_cast<float>(n5) * s - zs);
-        out[6] = bf16_round_rne_f32(static_cast<float>(n6) * s - zs);
-        out[7] = bf16_round_rne_f32(static_cast<float>(n7) * s - zs);
+        out[0] = static_cast<float>(n0) * s - zs;
+        out[1] = static_cast<float>(n1) * s - zs;
+        out[2] = static_cast<float>(n2) * s - zs;
+        out[3] = static_cast<float>(n3) * s - zs;
+        out[4] = static_cast<float>(n4) * s - zs;
+        out[5] = static_cast<float>(n5) * s - zs;
+        out[6] = static_cast<float>(n6) * s - zs;
+        out[7] = static_cast<float>(n7) * s - zs;
     } else {
         float s0 = static_cast<float>(scales[sb + g0]);
         float zs0 = static_cast<float>(zeros[sb + g0]) * s0;
@@ -98,7 +106,7 @@ __device__ inline void int4_dequant_8(
             int gi = (col + idx) / gsz; \
             float si = (gi == g0) ? s0 : s1; \
             float zsi = (gi == g0) ? zs0 : zs1; \
-            out[idx] = bf16_round_rne_f32(static_cast<float>(ni) * si - zsi); \
+            out[idx] = static_cast<float>(ni) * si - zsi; \
         } while(0)
         I4DQ(0, n0); I4DQ(1, n1); I4DQ(2, n2); I4DQ(3, n3);
         I4DQ(4, n4); I4DQ(5, n5); I4DQ(6, n6); I4DQ(7, n7);
@@ -118,6 +126,11 @@ __device__ inline void int4_dequant_8(
 #ifdef SUPERSONIC_QWEN36_HAS_WMMA_BF16
 typedef short  qwen36_short16 __attribute__((ext_vector_type(16)));
 typedef float  qwen36_float8  __attribute__((ext_vector_type(8)));
+
+struct qwen36_float8_pair {
+    qwen36_float8 first;
+    qwen36_float8 second;
+};
 #endif
 
 // Work-stealing matvec inner loop for an INT4 slab `[out_rows, in_cols/2]`.
@@ -167,6 +180,50 @@ __device__ inline float int4_dq8_matvec_partial(
     return partial;
 }
 
+struct qwen36_float_pair {
+    float first;
+    float second;
+};
+
+__device__ inline qwen36_float_pair int4_dq8_pair_matvec_partial_same_row(
+    const uint8_t*      __restrict__ packed_a,
+    const hip_bfloat16* __restrict__ scales_a,
+    const hip_bfloat16* __restrict__ zeros_a,
+    const uint8_t*      __restrict__ packed_b,
+    const hip_bfloat16* __restrict__ scales_b,
+    const hip_bfloat16* __restrict__ zeros_b,
+    const float*        __restrict__ x,
+    int my_row, int cols, int gsz,
+    int tid, int block_size
+) {
+    const int byte_cols  = cols / 2;
+    const int scale_cols = cols / gsz;
+    const int scale_row  = my_row / gsz;
+    const size_t row_byte_off = static_cast<size_t>(my_row) * byte_cols;
+
+    float partial_a = 0.0f;
+    float partial_b = 0.0f;
+    for (int col_start = tid * 8; col_start < cols; col_start += block_size * 8) {
+        const uint32_t pk_a = *reinterpret_cast<const uint32_t*>(
+            &packed_a[row_byte_off + col_start / 2]);
+        const uint32_t pk_b = *reinterpret_cast<const uint32_t*>(
+            &packed_b[row_byte_off + col_start / 2]);
+        float dq_a[8];
+        float dq_b[8];
+        int4_dequant_8(pk_a, scales_a, zeros_a,
+                       scale_row, col_start, scale_cols, gsz, dq_a);
+        int4_dequant_8(pk_b, scales_b, zeros_b,
+                       scale_row, col_start, scale_cols, gsz, dq_b);
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const float xv = x[col_start + i];
+            partial_a += dq_a[i] * xv;
+            partial_b += dq_b[i] * xv;
+        }
+    }
+    return {partial_a, partial_b};
+}
+
 #ifdef SUPERSONIC_QWEN36_HAS_WMMA_BF16
 // WMMA INT4 GEMV tile: each invocation runs one wave32's worth of work,
 // computing 16 output rows of `acc[0]` (one row of the 16x16 WMMA C tile)
@@ -183,7 +240,7 @@ __device__ inline float int4_dq8_matvec_partial(
 //                 m=1 GEMV pads M=1..15 with zero)
 //     B operand = [16 dequanted rows × 16 cols] of int4 weights at
 //                 (rhs_row_idx + lane_row, kk..kk+16) — same dequant
-//                 formula as int4_dequant_8 (`bf16_round_rne_f32(nibble*s - z*s)`)
+//                 formula as int4_dequant_8 (`nibble*s - z*s`)
 //     acc      += A × B  (F32 accumulate, K=16 per WMMA)
 //
 // Returns: lanes 0..15 (lane_half==0) hold acc[0] = C[0, lane_row], the
@@ -254,8 +311,8 @@ __device__ inline qwen36_float8 wmma_int4_matvec_partial_16rows(
                 uint8_t pk = slab_packed_row[byte_base + i];
                 int n0 = pk & 0xF;
                 int n1 = (pk >> 4) & 0xF;
-                float v0 = bf16_round_rne_f32(static_cast<float>(n0) * s - zs);
-                float v1 = bf16_round_rne_f32(static_cast<float>(n1) * s - zs);
+                float v0 = static_cast<float>(n0) * s - zs;
+                float v1 = static_cast<float>(n1) * s - zs;
                 uint32_t b0_bits, b1_bits;
                 __builtin_memcpy(&b0_bits, &v0, 4);
                 __builtin_memcpy(&b1_bits, &v1, 4);
@@ -271,6 +328,92 @@ __device__ inline qwen36_float8 wmma_int4_matvec_partial_16rows(
     }
     return acc;
 }
+
+__device__ inline qwen36_float8_pair wmma_int4_pair_matvec_partial_16rows(
+    const uint8_t*      __restrict__ slab_packed_row_a,  // [hidden/2] u8 (this lane's row, may be nullptr)
+    int                              rhs_row_idx_a,
+    const uint8_t*      __restrict__ slab_packed_row_b,  // [hidden/2] u8 (this lane's row, may be nullptr)
+    int                              rhs_row_idx_b,
+    const hip_bfloat16* __restrict__ slab_scale,         // [.] BF16 (slab origin)
+    const hip_bfloat16* __restrict__ slab_zero,          // [.] BF16
+    bool                             rhs_in_range,
+    const float*        __restrict__ x_norm_lds_f32,
+    int                              hidden,
+    int                              gsc,
+    int                              group_size,
+    int                              lane_row
+) {
+    qwen36_float8 acc_a = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    qwen36_float8 acc_b = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    const int gsr_idx_a = rhs_row_idx_a / group_size;
+    const int gsr_idx_b = rhs_row_idx_b / group_size;
+
+    for (int kk = 0; kk < hidden; kk += 16) {
+        qwen36_short16 a;
+        if (lane_row == 0) {
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                uint32_t bits;
+                float v = x_norm_lds_f32[kk + i];
+                __builtin_memcpy(&bits, &v, 4);
+                a[i] = static_cast<short>(bits >> 16);
+            }
+        } else {
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) a[i] = 0;
+        }
+
+        qwen36_short16 b_a;
+        qwen36_short16 b_b;
+        if (rhs_in_range) {
+            const int gsc_idx = kk / group_size;
+            const int scale_idx_a = gsr_idx_a * gsc + gsc_idx;
+            const int scale_idx_b = gsr_idx_b * gsc + gsc_idx;
+            const float s_a  = static_cast<float>(slab_scale[scale_idx_a]);
+            const float z_a  = static_cast<float>(slab_zero[scale_idx_a]);
+            const float zs_a = z_a * s_a;
+            const float s_b  = static_cast<float>(slab_scale[scale_idx_b]);
+            const float z_b  = static_cast<float>(slab_zero[scale_idx_b]);
+            const float zs_b = z_b * s_b;
+            const int byte_base = kk >> 1;
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                uint8_t pk_a = slab_packed_row_a[byte_base + i];
+                int n0_a = pk_a & 0xF;
+                int n1_a = (pk_a >> 4) & 0xF;
+                float v0_a = static_cast<float>(n0_a) * s_a - zs_a;
+                float v1_a = static_cast<float>(n1_a) * s_a - zs_a;
+                uint32_t b0_bits_a, b1_bits_a;
+                __builtin_memcpy(&b0_bits_a, &v0_a, 4);
+                __builtin_memcpy(&b1_bits_a, &v1_a, 4);
+                b_a[2 * i]     = static_cast<short>(b0_bits_a >> 16);
+                b_a[2 * i + 1] = static_cast<short>(b1_bits_a >> 16);
+
+                uint8_t pk_b = slab_packed_row_b[byte_base + i];
+                int n0_b = pk_b & 0xF;
+                int n1_b = (pk_b >> 4) & 0xF;
+                float v0_b = static_cast<float>(n0_b) * s_b - zs_b;
+                float v1_b = static_cast<float>(n1_b) * s_b - zs_b;
+                uint32_t b0_bits_b, b1_bits_b;
+                __builtin_memcpy(&b0_bits_b, &v0_b, 4);
+                __builtin_memcpy(&b1_bits_b, &v1_b, 4);
+                b_b[2 * i]     = static_cast<short>(b0_bits_b >> 16);
+                b_b[2 * i + 1] = static_cast<short>(b1_bits_b >> 16);
+            }
+        } else {
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                b_a[i] = 0;
+                b_b[i] = 0;
+            }
+        }
+
+        acc_a = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b_a, acc_a);
+        acc_b = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b_b, acc_b);
+    }
+    return {acc_a, acc_b};
+}
+
 #endif // SUPERSONIC_QWEN36_HAS_WMMA_BF16
 
 // Single-element dequant for non-8-aligned tails. `cols` is the unpacked
@@ -290,8 +433,7 @@ __device__ inline float int4_dequant_scalar(
     int si = (row / group_size) * ((cols + group_size - 1) / group_size)
            + col / group_size;
     float s = static_cast<float>(scales[si]);
-    return bf16_round_rne_f32(
-        static_cast<float>(nibble) * s - static_cast<float>(zeros[si]) * s);
+    return static_cast<float>(nibble) * s - static_cast<float>(zeros[si]) * s;
 }
 
 __device__ inline float fp8_e4m3_to_float(uint8_t byte) {

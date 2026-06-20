@@ -74,8 +74,13 @@ __device__ inline void qwen36_moe_lm_head_device(
     const T* __restrict__          input_hidden,    // [hidden] BF16
     const T* __restrict__          final_norm_w,    // [hidden] BF16
     const T* __restrict__          lm_head_w,       // [vocab, hidden] BF16
-    T*       __restrict__          logits_out,      // [vocab] BF16
-    unsigned int* __restrict__     counters
+    T*       __restrict__          logits_out,      // [vocab] BF16, nullable
+    unsigned int* __restrict__     top1_out,        // [1] U32, nullable
+    float*   __restrict__          top1_scratch,    // [2 * gridDim.x] F32
+    unsigned int* __restrict__     counters,
+    unsigned int* __restrict__     barrier_counter,
+    unsigned int* __restrict__     barrier_flag,
+    int                            num_blocks
 ) {
     const int tid        = threadIdx.x;
     const int block_size = static_cast<int>(blockDim.x);
@@ -116,6 +121,8 @@ __device__ inline void qwen36_moe_lm_head_device(
     __syncthreads();
 
     // -- Phase B: work-stealing matvec over vocab rows ---------------------
+    float local_best = -INFINITY;
+    int local_best_idx = 0;
 #ifdef SUPERSONIC_QWEN36_HAS_WMMA_BF16
     if constexpr (USE_WMMA) {
         // Same wave32 layout the standalone WMMA kernel uses, dropped
@@ -158,7 +165,8 @@ __device__ inline void qwen36_moe_lm_head_device(
                         // Each F32 occupies 2 u16 slots (LE: low, high);
                         // the BF16 bits are the high u16 (offset
                         // 2*idx + 1).
-                        a[i] = static_cast<short>(x_norm_lds_u16[2 * (kk + i) + 1]);
+                        a[i] = static_cast<short>(
+                            x_norm_lds_u16[2 * (kk + i) + 1]);
                     }
                 } else {
                     #pragma unroll
@@ -189,7 +197,8 @@ __device__ inline void qwen36_moe_lm_head_device(
                     for (int i = 0; i < 16; ++i) {
                         int kc = k_main + i;
                         if (kc < hidden) {
-                            a[i] = static_cast<short>(x_norm_lds_u16[2 * kc + 1]);
+                            a[i] = static_cast<short>(
+                                x_norm_lds_u16[2 * kc + 1]);
                         }
                     }
                 }
@@ -209,8 +218,16 @@ __device__ inline void qwen36_moe_lm_head_device(
             // Lanes with lane_half==0 carry C[0, lane_row]. Each wave's
             // 16 such lanes write the wave's 16-row tile.
             if (lane_half == 0 && in_range) {
-                logits_out[rhs_row] =
-                    static_cast<T>(bf16_round_rne_f32(acc[0]));
+                const float logit = bf16_round_rne_f32(acc[0]);
+                if (logits_out != nullptr) {
+                    logits_out[rhs_row] = static_cast<T>(logit);
+                }
+                if (top1_out != nullptr &&
+                    (logit > local_best ||
+                     (logit == local_best && rhs_row < local_best_idx))) {
+                    local_best = logit;
+                    local_best_idx = rhs_row;
+                }
             }
             __syncthreads();
         }
@@ -239,10 +256,80 @@ __device__ inline void qwen36_moe_lm_head_device(
                 __syncthreads();
             }
             if (tid == 0) {
-                logits_out[my_row] =
-                    static_cast<T>(bf16_round_rne_f32(shared_scratch[0]));
+                const float logit = bf16_round_rne_f32(shared_scratch[0]);
+                if (logits_out != nullptr) {
+                    logits_out[my_row] = static_cast<T>(logit);
+                }
+                if (top1_out != nullptr &&
+                    (logit > local_best ||
+                     (logit == local_best && my_row < local_best_idx))) {
+                    local_best = logit;
+                    local_best_idx = my_row;
+                }
             }
             __syncthreads();
+        }
+    }
+
+    if (top1_out != nullptr) {
+        // Reduce each block's best vocab row. `x_norm_lds` is no longer
+        // needed after the matvec, so reuse its first block_size entries as
+        // integer scratch without increasing dynamic LDS.
+        shared_scratch[tid] = local_best;
+        x_norm_lds[tid] = __int_as_float(local_best_idx);
+        __syncthreads();
+        for (int s = block_size / 2; s > 0; s >>= 1) {
+            if (tid < s) {
+                const float a = shared_scratch[tid];
+                const float b = shared_scratch[tid + s];
+                const int ia = __float_as_int(x_norm_lds[tid]);
+                const int ib = __float_as_int(x_norm_lds[tid + s]);
+                if (b > a || (b == a && ib < ia)) {
+                    shared_scratch[tid] = b;
+                    x_norm_lds[tid] = __int_as_float(ib);
+                }
+            }
+            __syncthreads();
+        }
+
+        if (tid == 0) {
+            top1_scratch[blockIdx.x] = shared_scratch[0];
+            top1_scratch[num_blocks + blockIdx.x] = x_norm_lds[0];
+        }
+        grid_barrier(barrier_counter, barrier_flag, num_blocks);
+
+        // Final grid-wide reduction on block 0. Supports override grids larger
+        // than block_size by first having each thread scan a stride.
+        if (blockIdx.x == 0) {
+            float best = -INFINITY;
+            int best_idx = 0;
+            for (int i = tid; i < num_blocks; i += block_size) {
+                const float v = top1_scratch[i];
+                const int idx = __float_as_int(top1_scratch[num_blocks + i]);
+                if (v > best || (v == best && idx < best_idx)) {
+                    best = v;
+                    best_idx = idx;
+                }
+            }
+            shared_scratch[tid] = best;
+            x_norm_lds[tid] = __int_as_float(best_idx);
+            __syncthreads();
+            for (int s = block_size / 2; s > 0; s >>= 1) {
+                if (tid < s) {
+                    const float a = shared_scratch[tid];
+                    const float b = shared_scratch[tid + s];
+                    const int ia = __float_as_int(x_norm_lds[tid]);
+                    const int ib = __float_as_int(x_norm_lds[tid + s]);
+                    if (b > a || (b == a && ib < ia)) {
+                        shared_scratch[tid] = b;
+                        x_norm_lds[tid] = __int_as_float(ib);
+                    }
+                }
+                __syncthreads();
+            }
+            if (tid == 0) {
+                top1_out[0] = static_cast<unsigned int>(__float_as_int(x_norm_lds[0]));
+            }
         }
     }
 }

@@ -1,8 +1,265 @@
 # Qwen3.6 Lucebox Parity Log
 
-Last updated: 2026-06-18
+Last updated: 2026-06-19
 
-Purpose: durable working log for the Qwen3.6-27B DFlash Lucebox parity effort on RX 7900 XTX / gfx1100. Keep this file current before and after profiling or benchmark runs so context compaction does not cause stale results, repeated sweeps, or reverted experiments to be treated as new evidence.
+Purpose: durable working log for the Qwen3.6 Lucebox parity efforts on RX 7900 XTX / gfx1100, including the original 27B DFlash track and the newer 35B A3B local-benchmark track. Keep this file current before and after profiling or benchmark runs so context compaction does not cause stale results, repeated sweeps, or reverted experiments to be treated as new evidence.
+
+## 2026-06-19 Checkpoint: 35B A3B Local Lucebox Stack
+
+This is the authoritative memory for the Qwen3.6-35B-A3B local-benchmark parity slice. Read this section before starting another 35B kernel experiment.
+
+Baselines and current keeper:
+
+- Lucebox baseline was run from `/home/deano/projects/lucebox-hub/server` with `.venv/bin/python scripts/bench_he.py --target-profile qwen36-35b-a3b --n-gen 256 --skip-tokenize`: decode mean `78.18 tok/s`, prefill `970.08 tok/s`.
+- Supersonic pre-slice keeper: `target/qwen36_35b_a3b_raw_script_10x256_linear_qkvz_fused.json`, weighted `48.45181315769551 tok/s`, mean `48.406637480666404 tok/s`, total decode `52836.0 ms`.
+- Current Supersonic keeper: `target/qwen36_35b_a3b_raw_script_10x256_fullattn_q_gate_pair_wmma.json`, weighted `63.375748873595086 tok/s`, mean `63.37227197518149 tok/s`, total decode `40394.0 ms`.
+- Previous Supersonic keeper: `target/qwen36_35b_a3b_raw_script_10x256_ffn_direct_mid_pair_wmma.json`, weighted `63.09303758471965 tok/s`, mean `63.13242332829803 tok/s`, total decode `40575.0 ms`.
+- Previous Supersonic keeper: `target/qwen36_35b_a3b_raw_script_10x256_shared_pair_scalar.json`, weighted `61.46163449534236 tok/s`, mean `61.463303794592136 tok/s`, total decode `41652.0 ms`.
+- Previous Supersonic keeper: `target/qwen36_35b_a3b_raw_script_10x256_fullattn_kv_combined_wmma.json`, weighted `60.13342102790567 tok/s`, mean `60.13318379670013 tok/s`, total decode `42572.0 ms`.
+- Previous Supersonic keeper: `target/qwen36_35b_a3b_raw_script_10x256_shared_direct_mid_scalar.json`, weighted `59.078740884334906 tok/s`, mean `59.06759153365489 tok/s`, total decode `43332.0 ms`.
+- Previous Supersonic keeper: `target/qwen36_35b_a3b_raw_script_10x256_ffn_direct_mid_wmma_raw.json`, weighted `58.502250965515664 tok/s`, mean `58.548731610147115 tok/s`, total decode `43759.0 ms`.
+- Previous Supersonic keeper: `target/qwen36_35b_a3b_raw_script_10x256_linear_outproj_tile64.json`, weighted `57.75130842808157 tok/s`, mean `57.77102039113525 tok/s`, total decode `44328.0 ms`.
+- Previous Supersonic keeper: `target/qwen36_35b_a3b_raw_script_10x256_reset16_onebarrier.json`, weighted `57.26428811094956 tok/s`, mean `57.27459969437247 tok/s`, total decode `44705.0 ms`.
+- Previous Supersonic keeper: `target/qwen36_35b_a3b_raw_script_10x256_fullattn_tile8.json`, weighted `57.161996204086186 tok/s`, mean `57.208911777877304 tok/s`, total decode `44785.0 ms`.
+- Previous Supersonic keeper: `target/qwen36_35b_a3b_raw_script_10x256_fullattn_tile16.json`, weighted `57.09442883268656 tok/s`, mean `57.11223040165311 tok/s`, total decode `44838.0 ms`.
+- Previous Supersonic keeper: `target/qwen36_35b_a3b_raw_script_10x256_fullattn_tile32.json`, weighted `56.832056832056836 tok/s`, mean `56.85101621542299 tok/s`, total decode `45045.0 ms`.
+- Previous Supersonic keeper: `target/qwen36_35b_a3b_raw_script_10x256_fullattn_tile64.json`, weighted `56.390149345786156 tok/s`, mean `56.40267050151467 tok/s`, total decode `45398.0 ms`.
+- Previous Supersonic keeper: `target/qwen36_35b_a3b_raw_script_10x256_fullattn_tile128.json`, weighted `55.50015175822747 tok/s`, mean `55.52554211772089 tok/s`, total decode `46126.0 ms`.
+- Previous Supersonic keeper: `target/qwen36_35b_a3b_raw_script_10x256_fast_dequant.json`, weighted `51.41181668474113 tok/s`, mean `51.394279761205894 tok/s`, total decode `49794.0 ms`.
+- Previous Supersonic keeper: `target/qwen36_35b_a3b_raw_script_10x256_no_hnorm_store.json`, weighted `49.32942808694312 tok/s`, mean `49.33859425900592 tok/s`, total decode `51896.0 ms`.
+- Previous Supersonic keeper: `target/qwen36_35b_a3b_raw_script_10x256_ffn_jk_fused.json`, weighted `49.20049200492005 tok/s`, mean `49.19222423802477 tok/s`, total decode `52032.0 ms`.
+
+Kept changes:
+
+- Added Supersonic local benchmark harness support for `qwen36-35b-a3b`, model `qwen3.6-35b-a3b`, model dir `/mnt/data/models/Qwen3.6-35B-A3B`, quant `int4`, and summary fields including `weighted_tok_s` and `total_decode_ms`.
+- Folded persistent LM-head greedy top1 into the decode kernel for greedy decode. Artifact: `target/qwen36_35b_a3b_raw_script_10x256_folded_top1.json`, weighted `49.15703368024886 tok/s`, mean `49.14392905788375 tok/s`, total decode `52078.0 ms`.
+- Kept FFN Phase J/K tail fusion in `kernels/qwen36_moe_persistent/ffn_phase.cuh`, avoiding the `MOE_OUT` workspace store/read plus barrier on the full stage. Artifact: `target/qwen36_35b_a3b_raw_script_10x256_ffn_jk_fused.json`, weighted `49.20049200492005 tok/s`.
+- Removed the unused FFN `OFF_H_NORM` global scratch store while leaving the workspace layout unchanged. Artifact: `target/qwen36_35b_a3b_raw_script_10x256_no_hnorm_store.json`, weighted `49.32942808694312 tok/s`; 1x64 artifact `target/qwen36_35b_a3b_raw_script_1x64_no_hnorm_store.json`, weighted `51.90592051905921 tok/s`.
+- Removed per-nibble BF16 RNE from hot INT4 dequant helpers in `kernels/qwen36_moe_persistent/helpers.cuh`. Artifact: `target/qwen36_35b_a3b_raw_script_10x256_fast_dequant.json`, weighted `51.41181668474113 tok/s`; 1x64 artifact `target/qwen36_35b_a3b_raw_script_1x64_fast_dequant.json`, weighted `54.34782608695652 tok/s`.
+- Enabled cached full-attention tiled partials and swept the tile size to 8 tokens by widening the per-head score workspace stride. Current artifact: `target/qwen36_35b_a3b_raw_script_10x256_fullattn_tile8.json`, weighted `57.161996204086186 tok/s`; 1x64 artifact `target/qwen36_35b_a3b_raw_script_1x64_fullattn_tile8.json`, weighted `58.023572076155936 tok/s`. Previous tile16 artifact: `target/qwen36_35b_a3b_raw_script_10x256_fullattn_tile16.json`, weighted `57.09442883268656 tok/s`.
+- Folded persistent `reset_counters_16` from two grid barriers to one release barrier that resets all 16 counter slots before publishing the next phase. Artifact: `target/qwen36_35b_a3b_raw_script_10x256_reset16_onebarrier.json`, weighted `57.26428811094956 tok/s`; 1x64 artifact `target/qwen36_35b_a3b_raw_script_1x64_reset16_onebarrier.json`, weighted `58.12897366030881 tok/s`.
+- Changed linear-attention Phase I out-projection WMMA work distribution from 128 rows per block to 64 rows per block so 32 blocks, rather than 16, participate in the 2048-row projection on gfx1100. Artifact: `target/qwen36_35b_a3b_raw_script_10x256_linear_outproj_tile64.json`, weighted `57.75130842808157 tok/s`; 1x64 artifact `target/qwen36_35b_a3b_raw_script_1x64_linear_outproj_tile64.json`, weighted `58.661778185151235 tok/s`.
+- Added FFN Phase G direct-mid WMMA for production INT4 stages: paired gate/up WMMA rows write `EXPERT_MID` directly, skipping legacy Phase H and one grid barrier while keeping the stage-3 profiling path on the old layout. Comparable raw-script artifacts: `target/qwen36_35b_a3b_raw_script_1x64_ffn_direct_mid_wmma_raw.json`, weighted `59.424326833797586 tok/s`, output hash unchanged versus the tile64 keeper; `target/qwen36_35b_a3b_raw_script_10x256_ffn_direct_mid_wmma_raw.json`, weighted `58.502250965515664 tok/s`, mean `58.548731610147115 tok/s`, total decode `43759 ms`, generated `2560`, stopped early `0`. The combined generated-id hash matches the previous keeper (`ff860cdeccf012aa228409b82418219848ca9350b30e2eaab87d66527cf07ae9`).
+- Added shared-expert scalar direct-mid path in Phase D: shared gate/up remain scalar INT4 matvecs, but each shared row computes gate and up together, writes `OFF_SHARED_MID` directly, and skips Phase E plus one grid barrier. This is distinct from the rejected shared-expert WMMA direct-mid path. Validation passed `cargo fmt --check`, release build, and persistent-vs-chained parity before benchmarking. Artifacts: `target/qwen36_35b_a3b_raw_script_1x64_shared_direct_mid_scalar.json`, weighted `60.0375234521576 tok/s`, total decode `1066 ms`, generated-id hash `ee96d4ba3ccc01df68bed07b652eb1d37277bdafc224c5628c62c3055fe9e5ed`; `target/qwen36_35b_a3b_raw_script_10x256_shared_direct_mid_scalar.json`, weighted `59.078740884334906 tok/s`, mean `59.06759153365489 tok/s`, total decode `43332 ms`, generated `2560`, stopped early `0`. The 10x256 combined generated-id hash matches the previous direct-mid WMMA keeper under the current parser (`aba29b816293e7d63b078e7c987f290751e4d22280d1ab4cea7f756bf3647a01`).
+- Combined full-attention Phase D K/V INT4 WMMA into one work pool when both projections are INT4: K and V rows are aligned to the 128-row WMMA work tile, so the combined pool doubles available tasks for the small `Hkv*d` projections and removes the internal K->V counter-reset barrier. This is distinct from the rejected attention tile-size sweeps. Validation passed release build and persistent-vs-chained parity before benchmarking. Artifacts: `target/qwen36_35b_a3b_raw_script_1x64_fullattn_kv_combined_wmma.json`, weighted `61.12702960840497 tok/s`, total decode `1047 ms`, generated-id hash `ee96d4ba3ccc01df68bed07b652eb1d37277bdafc224c5628c62c3055fe9e5ed`; `target/qwen36_35b_a3b_raw_script_10x256_fullattn_kv_combined_wmma.json`, weighted `60.13342102790567 tok/s`, mean `60.13318379670013 tok/s`, total decode `42572 ms`, generated `2560`, stopped early `0`. The 10x256 combined generated-id hash matches the previous keeper (`aba29b816293e7d63b078e7c987f290751e4d22280d1ab4cea7f756bf3647a01`).
+- Paired the shared-expert scalar direct-mid INT4 gate/up row dot products: the kept scalar direct-mid path now computes shared gate and up partials for the same row in one column loop and reduces both in parallel, reusing the normalized hidden load and cutting one reduction/barrier chain per shared row. This is distinct from the rejected shared-expert WMMA direct-mid path; it preserves each row's accumulation order and generated-token hash. Validation passed release build and persistent-vs-chained parity before benchmarking. Artifacts: `target/qwen36_35b_a3b_raw_script_1x64_shared_pair_scalar.json`, weighted `62.56109481915934 tok/s`, total decode `1023 ms`, generated-id hash `ee96d4ba3ccc01df68bed07b652eb1d37277bdafc224c5628c62c3055fe9e5ed`; `target/qwen36_35b_a3b_raw_script_10x256_shared_pair_scalar.json`, weighted `61.46163449534236 tok/s`, mean `61.463303794592136 tok/s`, total decode `41652 ms`, generated `2560`, stopped early `0`. The 10x256 combined generated-id hash matches the previous keeper (`aba29b816293e7d63b078e7c987f290751e4d22280d1ab4cea7f756bf3647a01`).
+- Paired routed FFN direct-mid WMMA helper for production INT4 Phase G: the kept direct-mid path still computes separate gate and up WMMA accumulations with their original scale rows, but now packs the shared activation operand once per 16-wide K tile and returns both accumulators. Validation passed `cargo fmt --check`, release build, and exact multilayer persistent parity. Artifacts: `target/qwen36_35b_a3b_raw_script_1x64_ffn_direct_mid_pair_wmma.json`, weighted `64.1925777331996 tok/s`, total decode `997 ms`, generated-id hash `6d8b16636e45b2b337e69eac8a115d7bff2f8297af849557e1852811b324ad3e`; `target/qwen36_35b_a3b_raw_script_10x256_ffn_direct_mid_pair_wmma.json`, weighted `63.09303758471965 tok/s`, mean `63.13242332829803 tok/s`, total decode `40575 ms`, generated `2560`, stopped early `0`. The parsed 10x256 generated-id hash matches the previous shared-pair keeper (`aba29b816293e7d63b078e7c987f290751e4d22280d1ab4cea7f756bf3647a01`).
+- Paired full-attention Q/gate INT4 WMMA projection rows in Phase B: the full-attention q_proj INT4 path now computes the paired Q and gate rows with one activation packing pass per 16-wide K tile, preserving the original row writes into `workspace`. Validation passed `cargo fmt --check`, release build, exact multilayer persistent parity, and generated-token hash checks. Artifacts: `target/qwen36_35b_a3b_raw_script_1x64_fullattn_q_gate_pair_wmma.json`, weighted `64.45115810674723 tok/s`, total decode `993 ms`, generated-id hash `ee96d4ba3ccc01df68bed07b652eb1d37277bdafc224c5628c62c3055fe9e5ed`; `target/qwen36_35b_a3b_raw_script_10x256_fullattn_q_gate_pair_wmma.json`, weighted `63.375748873595086 tok/s`, mean `63.37227197518149 tok/s`, total decode `40394 ms`, generated `2560`, stopped early `0`. The parsed 10x256 generated-id hash matches the previous keeper (`aba29b816293e7d63b078e7c987f290751e4d22280d1ab4cea7f756bf3647a01`).
+- Added diagnostic `SUPERSONIC_QWEN36_DISABLE_PERSISTENT_WMMA=1` to force the non-WMMA persistent template. This is not a keeper path: 1x8 smoke was `62.7 ms/token` versus default `18.3 ms/token`, mostly because folded lm-head falls back to scalar.
+- Unit tests for the benchmark harness passed with `/home/deano/venvs/rocm/bin/python -m unittest -q tests.test_qwen36_he_supersonic_bench`. `pytest` is not installed in `/home/deano/venvs/rocm`.
+- Persistent-vs-chained synthetic parity is back online after updating `crates/runner/tests/qwen36_moe_multilayer_parity.rs` for the current `PersistentScratch::run(..., download_final_hidden)` signature. Command passed: `SUPERSONIC_QWEN36_MULTILAYER_ORACLE_JSON=/tmp/qwen36_ml_direct_mid_check.json HIP_ARCH=gfx1100 cargo test --release -p runner --test qwen36_moe_multilayer_parity multilayer_persistent_decode_matches_chained -- --nocapture`.
+- FFN oracle passed for the J/K fusion: `[parity ffn step5 int4 output_hidden] n=2048 exact=784 max_abs=3.12500e-2 mean_abs=5.63657e-3 cos_sim=0.9999897`.
+
+AMD profiling evidence:
+
+- ROCm profiler path: `/opt/rocm-7.1.1/bin/rocprofv3`.
+- Direct 35B A3B 1x32 profile directory: `target/rocprof_folded_top1_1x32/`.
+- Top kernel rows from `trace_kernel_stats.csv`: batched prefill grouped expert 40 calls / `801.417509 ms`; linear step prefill 3720 calls / `668.964004 ms`; persistent decode 32 calls / `612.811826 ms`, avg `19.1503695625 ms`.
+- App stage timers are skewed after folded-top1 because the skipped final-hidden D2H wait appears at the token/top1 read point. Use rocprof kernel rows for guidance.
+- Fresh direct Lucebox daemon one-prompt check: Qwen3.6-35B-A3B Q4_K_M reports all experts fit in VRAM (`10240 hot experts, 0 cold experts`, `20.10 GiB` on GPU, tok_embd CPU-only) and generated 32 tokens at `77.1 tok/s`. The gap is not caused by Lucebox hot/cold CPU overlap or speculative decode; it is an all-GPU graph/kernel gap.
+- Fresh Lucebox 10-prompt `--n-gen 32` no-draft check: decode mean `79.74 tok/s`, range `73.3-80.9`, prefill mean `967.47 tok/s`.
+- Fresh Supersonic segmented FFN stage profile: `target/qwen36_35b_profile/rocprof_current_ffn_stage_1x4/ss35b_current_ffn_stage_1x4_kernel_trace.csv`. App timer: total `38.580 ms/token` with FFN stage profiling overhead; parsed persistent launches show stage5/full FFN avg `0.15355854375 ms/layer` and attention avg `0.2283797625 ms/layer`.
+- Fresh Supersonic segmented linear stage profile: `target/qwen36_35b_profile/rocprof_current_linear_stage_1x4/ss35b_current_linear_stage_1x4_kernel_trace.csv`. Parsed persistent launches: full-attn `0.282334625 ms/layer`, linear stage5/full `0.1829586833 ms/layer`, FFN `0.18433230625 ms/layer`.
+- Tile16 unsegmented 1x64 rocprof trace:
+  `target/qwen36_35b_profile/rocprof_tile16_raw_1x64/ss35b_tile16_raw_1x64_kernel_stats.csv`.
+  Top decode row: `qwen36_moe_persistent_decode_kernel`, 64 calls,
+  total `1100.170 ms`, avg `17.1901 ms`, `42.26%` of traced runtime.
+  Prefill rows remain large in whole-program stats:
+  grouped expert `710.504 ms`, linear step `628.494 ms`.
+- Tile16 segmented FFN stage profile:
+  `target/qwen36_35b_profile/tile16_1x4_ffn_stage_profile.json` and
+  `target/qwen36_35b_profile/rocprof_tile16_ffn_stage_1x4/ss35b_tile16_ffn_stage_1x4_kernel_trace.csv`.
+  FFI rows: attn-only mean `0.2621 ms`, FFN stage4 `0.2013 ms`,
+  stage3 `0.1875 ms`, stage5/full `0.1857 ms`, stage2 `0.1107 ms`,
+  stage1 `0.0728 ms`.
+- Tile16 segmented linear stage profile:
+  `target/qwen36_35b_profile/tile16_1x4_linear_stage_profile.json` and
+  `target/qwen36_35b_profile/rocprof_tile16_linear_stage_1x4/ss35b_tile16_linear_stage_1x4_kernel_trace.csv`.
+  FFI rows: FFN-only mean `0.2168 ms`, linear stage5/full
+  `0.2121 ms`, stage4 `0.1374 ms`, stage1 `0.1356 ms`, stage3
+  `0.1124 ms`, stage2 `0.1097 ms`, full-attn-only `0.3169 ms`.
+- Fresh shared-direct-mid scalar segmented FFI profiles before the combined
+  K/V experiment:
+  `target/qwen36_35b_profile/shared_direct_mid_scalar_1x2_ffn_stage_ffi.json`
+  and
+  `target/qwen36_35b_profile/shared_direct_mid_scalar_1x2_linear_stage_ffi.json`.
+  FFN profile rows: full-attn-only mean `0.2569 ms`, FFN stage4
+  `0.1905 ms`, stage3 `0.1792 ms`, stage5/full `0.1743 ms`, stage2
+  `0.0967 ms`, stage1 `0.0672 ms`. Linear profile rows: FFN-only
+  `0.2065 ms`, linear stage5/full `0.2000 ms`, linear stage1
+  `0.1374 ms`, linear stage4 `0.1320 ms`, full-attn-only `0.3100 ms`.
+- Fresh combined-K/V keeper segmented FFI profiles:
+  `target/qwen36_35b_profile/fullattn_kv_combined_1x2_ffn_stage_ffi.json`
+  and
+  `target/qwen36_35b_profile/fullattn_kv_combined_1x2_linear_stage_ffi.json`.
+  FFN profile rows: full-attn-only mean `0.2473 ms`, FFN stage4
+  `0.1902 ms`, stage3 `0.1794 ms`, stage5/full `0.1747 ms`, stage2
+  `0.0967 ms`, stage1 `0.0669 ms`. Linear profile rows: FFN-only
+  `0.2059 ms`, linear stage5/full `0.1999 ms`, linear stage1
+  `0.1375 ms`, linear stage4 `0.1316 ms`, linear stage3 `0.1067 ms`,
+  linear stage2 `0.1019 ms`, full-attn-only `0.2799 ms`.
+- Fresh shared-pair-scalar keeper segmented FFI profiles:
+  `target/qwen36_35b_profile/shared_pair_scalar_1x2_ffn_stage_segmented_ffi.json`
+  and
+  `target/qwen36_35b_profile/shared_pair_scalar_1x2_linear_stage_segmented_ffi.json`.
+  FFN profile rows: full-attn-only mean `0.2521 ms`, FFN stage4
+  `0.1834 ms`, stage3 `0.1728 ms`, stage5/full `0.1678 ms`, stage2
+  `0.0897 ms`, stage1 `0.0678 ms`, argmax `0.3821 ms`. Linear profile
+  rows: FFN-only `0.1988 ms`, linear stage5/full `0.2002 ms`, linear
+  stage1 `0.1365 ms`, linear stage4 `0.1324 ms`, linear stage3
+  `0.1071 ms`, linear stage2 `0.1022 ms`, full-attn-only `0.2814 ms`,
+  argmax `0.2906 ms`. The failed parallel/non-segmented profile attempts
+  under `target/qwen36_35b_profile/shared_pair_scalar_1x2_*_stage_ffi.json`
+  should be ignored because they collided on VRAM or missed segmented
+  profiling.
+- Fresh current-keeper unsegmented rocprof trace after reverting the 96-row
+  FFN tile probe:
+  `target/qwen36_35b_profile/rocprof_shared_pair_current_1x32/ss35b_shared_pair_current_1x32_kernel_stats.csv`
+  and `target/qwen36_35b_profile/shared_pair_current_1x32_rocprof.json`.
+  The one-prompt 1x32 smoke stayed at `62.50 tok/s`; `rocprofv3` reports the
+  persistent decode kernel as `32` calls, total `508.952 ms`, average
+  `15.904740 ms`. Whole-program top rows are prefill-heavy for this short
+  trace: grouped expert prefill `709.825 ms`, linear step prefill
+  `598.376 ms`, then persistent decode `508.952 ms`. Use the persistent row
+  and segmented FFI profiles for decode optimization decisions; do not
+  mistake one-prompt whole-program percentages for decode-only attribution.
+- Fresh unsegmented rocprof trace after the paired routed FFN direct-mid WMMA
+  keeper:
+  `target/qwen36_35b_profile/rocprof_pair_wmma_current_1x32/ss35b_pair_wmma_current_1x32_kernel_stats.csv`
+  and `target/qwen36_35b_profile/pair_wmma_current_1x32_rocprof.json`.
+  The one-prompt 1x32 smoke held at weighted `64.0 tok/s`; `rocprofv3`
+  reports the persistent decode kernel as `32` calls, total `496.596 ms`,
+  average `15.518638 ms`, versus the previous shared-pair current trace at
+  `508.952 ms` total and `15.904740 ms` average.
+- Fresh unsegmented rocprof trace after the paired full-attention Q/gate WMMA
+  keeper:
+  `target/qwen36_35b_profile/rocprof_qgate_current_1x32/ss35b_qgate_current_1x32_kernel_stats.csv`
+  and `target/qwen36_35b_profile/qgate_current_1x32_rocprof.json`.
+  The one-prompt 1x32 smoke was weighted `64.38631790744466 tok/s`; `rocprofv3`
+  reports the persistent decode kernel as `32` calls, total `493.905 ms`,
+  average `15.434519 ms`, versus the paired-routed-FFN trace at `496.596 ms`
+  total and `15.518638 ms` average. Whole-program top rows remain prefill-heavy
+  for this short trace: grouped expert prefill `708.985 ms`, linear step
+  prefill `595.578 ms`, then persistent decode `493.905 ms`.
+- Lucebox comparison trace found at
+  `/home/deano/projects/lucebox-hub/server/target/profile_35b_1x64/lucebox35b_1x64_kernel_stats.csv`.
+  Its top rows are many ggml/llama.cpp qtype matvec kernels rather than a
+  Supersonic-style persistent megakernel, so direct row-by-row kernel timing
+  comparisons are not apples-to-apples. The useful inference is that Lucebox's
+  lead is likely matvec kernel maturity/quant layout plus graph scheduling,
+  not hot/cold expert overlap on this all-GPU 35B run.
+
+Rejected 35B A3B experiments:
+
+- Do not use the serving-mode direct-mid artifacts as keeper evidence against the raw-script Lucebox baseline: `target/qwen36_35b_a3b_raw_script_10x256_ffn_direct_mid_wmma.json` was actually ChatML/no-thinking serving mode (`prompt_source=jsonl`, `context_size=1024`, `eos_policy=stop`) and stopped early on `9/10` prompts. The comparable raw-script direct-mid artifact above is the keeper evidence.
+- FFN direct-mid WMMA 64-row work tile: correctness/parity passed, but 1x64 raw artifact `target/qwen36_35b_a3b_raw_script_1x64_ffn_direct_mid_tile64.json` regressed to weighted `55.25 tok/s` versus the 128-row direct-mid keeper `59.42 tok/s`. Reverted. Do not retry smaller direct-mid row tiles unless the block/wave mapping changes materially.
+- Linear recurrent Phase G tiled by `(V-head, 8 value columns)`: correctness passed, but 1x64 artifact `target/qwen36_35b_a3b_raw_script_1x64_linear_g_tiled.json` was `51.02 tok/s`, slower than the keeper 1x64 J/K fusion artifact at `51.77993527508091 tok/s`. Reverted.
+- Linear recurrent Phase G tiled by `(V-head, 32 value columns)`: correctness passed, but 1x64 artifact `target/qwen36_35b_a3b_raw_script_1x64_linear_g_tile32.json` was `51.28 tok/s`, slower than the same keeper. Reverted.
+- Forced non-WMMA persistent template: much slower (`62.7 ms/token` on 1x8 versus default `18.3 ms/token`). Do not disable persistent WMMA globally for 35B.
+- Do not repeat Phase G value-column work decomposition unless the design materially reduces atomics, synchronization, or control overhead. The simple work-stealing variants lost despite preserving linear oracle exactness (`exact=2040`, `max_abs=7.81250e-3`, `cos_sim=1.0000000`).
+- Full-attention direct gated-attn write: Phase G wrote `OFF_GATED`
+  directly for stage5/full decode and skipped Phase H plus one barrier.
+  Build and persistent-vs-chained parity passed, and generated-token hash
+  matched. 1x64 artifact:
+  `target/qwen36_35b_a3b_raw_script_1x64_fullattn_direct_gated.json`,
+  weighted `61.010486177311726 tok/s`, total decode `1049 ms`. This was
+  slightly slower than the current 1x64 keeper
+  `target/qwen36_35b_a3b_raw_script_1x64_fullattn_kv_combined_wmma.json`,
+  weighted `61.12702960840497 tok/s`, total decode `1047 ms`, so it was
+  rejected and reverted. Do not retry this direct-gated Phase G shape unless
+  the attention/o_proj input path changes materially.
+- Linear Phase G closed-form `rec_out = q_mem + delta * (k dot q)`:
+  build and persistent-vs-chained parity passed. 1x64 artifact
+  `target/qwen36_35b_a3b_raw_script_1x64_linear_qmem_rec_out.json` improved
+  to weighted `61.77606177606177 tok/s`, total decode `1036 ms`, with the
+  1x64 generated-token hash unchanged. Full 10x256 artifact
+  `target/qwen36_35b_a3b_raw_script_10x256_linear_qmem_rec_out.json` improved
+  to weighted `60.765743312207746 tok/s`, total decode `42129 ms`, but the
+  combined generated-token hash changed to
+  `e2554abcaea7b709239edf93f56be3d4818db088661723bfe8048cc5a48604d2`
+  versus keeper hash
+  `aba29b816293e7d63b078e7c987f290751e4d22280d1ab4cea7f756bf3647a01`.
+  Rejected and reverted because the algebraic regrouping perturbs generation
+  on several prompts despite synthetic parity.
+- Linear Phase G exact-order fused update plus `rec_out`: build and
+  persistent-vs-chained parity passed, and 1x64 generated-token hash matched,
+  but artifact
+  `target/qwen36_35b_a3b_raw_script_1x64_linear_fused_update_rec_out_exact.json`
+  regressed to weighted `59.9250936329588 tok/s`, total decode `1068 ms`
+  versus the current keeper's `61.12702960840497 tok/s`, total decode
+  `1047 ms`. Rejected and reverted. Do not retry Phase G update/rec_out
+  fusion unless the memory layout or per-column write coalescing changes
+  materially.
+- Linear Phase B paired BF16 `a`/`b` projection rows: build and
+  persistent-vs-chained parity passed, and the 1x64 generated-token hash
+  matched the current keeper. Artifact
+  `target/qwen36_35b_a3b_raw_script_1x64_linear_pair_ab.json` was effectively
+  tied but slightly slower, weighted `62.4390243902439 tok/s`, total decode
+  `1025 ms`, versus current keeper
+  `target/qwen36_35b_a3b_raw_script_1x64_shared_pair_scalar.json`, weighted
+  `62.56109481915934 tok/s`, total decode `1023 ms`. Rejected and reverted.
+  Do not retry this row-pairing shape unless the small BF16 projection path or
+  block-level reduction strategy changes materially.
+- Persistent full-attention RoPE row hoist/precomputed BF16 cos/sin row: build
+  and exact persistent-vs-chained parity passed, but the 1x64 artifact
+  `target/qwen36_35b_a3b_raw_script_1x64_persistent_rope_row.json` regressed
+  to weighted `62.01550387596899 tok/s`, total decode `1032 ms`, versus the
+  current keeper
+  `target/qwen36_35b_a3b_raw_script_1x64_shared_pair_scalar.json`, weighted
+  `62.56109481915934 tok/s`, total decode `1023 ms`. The generated-token hash
+  stayed `ee96d4ba3ccc01df68bed07b652eb1d37277bdafc224c5628c62c3055fe9e5ed`.
+  Rejected and reverted. Do not retry host-uploaded per-token RoPE rows unless
+  the row is generated on-device or avoids the extra per-token H2D overhead.
+- Persistent full-attention on-device RoPE row hoist: build and exact
+  persistent-vs-chained parity passed, but the 1x64 artifact
+  `target/qwen36_35b_a3b_raw_script_1x64_ondevice_rope_row.json` regressed to
+  weighted `61.77606177606177 tok/s`, total decode `1036 ms`, versus the
+  current keeper's weighted `62.56109481915934 tok/s`, total decode `1023 ms`.
+  The generated-token hash stayed
+  `ee96d4ba3ccc01df68bed07b652eb1d37277bdafc224c5628c62c3055fe9e5ed`.
+  Rejected and reverted. The extra full-grid barrier and global scratch traffic
+  outweighed removing repeated Phase F trig, so do not retry this per-layer
+  global-workspace RoPE-row shape.
+- Persistent decode block-count sweep: a temporary
+  `SUPERSONIC_QWEN36_PERSISTENT_BLOCKS` host override, clamped to resident CU
+  count, tested `96`, `88`, `80`, `72`, `64`, `56`, and `48` blocks on 1x64
+  raw decode with artifacts
+  `target/qwen36_35b_a3b_raw_script_1x64_blocks_${b}_live.json`. The `48` to
+  `96` block range tied within measurement resolution at `1023-1024 ms` total
+  decode, weighted `62.50-62.561 tok/s`. The 8-block sanity artifact
+  `target/qwen36_35b_a3b_raw_script_1x64_blocks_8_live.json` collapsed to
+  weighted `16.322366743178 tok/s`, total decode `3921 ms`, confirming the
+  override worked. Rejected and reverted. Do not reduce the persistent grid
+  below one block per CU for this kernel without a larger remapping of work
+  units and barriers.
+- FFN routed down-projection WMMA 96-row work tile: changed only the routed
+  Phase I down-projection tile from `128` rows/task to `96` rows/task with six
+  active waves per block. Build and exact persistent-vs-chained parity passed,
+  but the 1x64 raw artifact
+  `target/qwen36_35b_a3b_raw_script_1x64_ffn_down_tile96.json` regressed to
+  weighted `61.53846153846154 tok/s`, total decode `1040 ms`, versus the
+  current 1x64 keeper weighted `62.56109481915934 tok/s`, total decode
+  `1023 ms`. Rejected and reverted. Do not retry routed FFN down-projection
+  partial tiles between `64` and `128` rows without a larger remapping than
+  simply reducing active waves per block.
+- Full-attention Phase I `o_proj` paired adjacent-row WMMA: build and exact
+  persistent-vs-chained parity passed, and the 1x64 generated-token hash
+  stayed `ee96d4ba3ccc01df68bed07b652eb1d37277bdafc224c5628c62c3055fe9e5ed`,
+  but both tested work-queue shapes regressed. Artifact
+  `target/qwen36_35b_a3b_raw_script_1x64_fullattn_oproj_pair_wmma.json`
+  used `128` pair rows/task and regressed to weighted
+  `63.618290258449306 tok/s`, total decode `1006 ms`; artifact
+  `target/qwen36_35b_a3b_raw_script_1x64_fullattn_oproj_pair64_wmma.json`
+  used `64` pair rows/task and also landed at `1006 ms`. Current 1x64 keeper
+  `target/qwen36_35b_a3b_raw_script_1x64_fullattn_q_gate_pair_wmma.json`
+  is weighted `64.45115810674723 tok/s`, total decode `993 ms`. Rejected and
+  reverted; do not retry generic adjacent-row pairing on full-attention
+  `o_proj` unless register pressure or row scheduling changes materially.
+
+Next 35B A3B guidance:
+
+- The 35B gap to Lucebox remains large: about `63.38 tok/s` weighted Supersonic versus `78.18 tok/s` Lucebox decode mean.
+- Before another change, start from this log plus the rocprof kernel rows, then target a high-attribution kernel path. Do not spend another cycle on small launch cleanup, global WMMA disable, or Phase G tiling without new profiling evidence.
 
 ## Compaction Recovery Checkpoint
 
@@ -1469,3 +1726,1743 @@ Reject decision:
   - `cargo fmt --check`
   - `cargo check -p runner --bin supersonic`
   - `HIP_ARCH=gfx1100 cargo build --release --bin supersonic`
+
+## Rejected Slice: Qwen3.6 35B Folded lm_head Native INT4
+
+Date: 2026-06-19.
+
+Reason to try:
+
+- The folded BF16 lm_head reads about 970 MiB per generated token on
+  Qwen3.6 35B A3B.
+- The bake includes native INT4 sidecars for `lm_head.weight`, so using
+  the packed weight directly in the folded persistent tail looked like a
+  plausible bandwidth win.
+
+Implementation tried:
+
+- Added an experimental `SUPERSONIC_QWEN36_FOLDED_LM_HEAD_INT4=1` gate.
+- Uploaded `lm_head.weight`, `lm_head.weight_int4_scale`, and
+  `lm_head.weight_int4_zero` sidecars during decode session setup.
+- Added a native INT4 dequant path in the folded lm_head device phase.
+- First version selected the path at runtime; second version specialized
+  the branch at compile time to avoid a default-path codegen penalty.
+
+Validation while the experiment was present:
+
+1. Functional smoke:
+   - 16-token BF16 folded generated ids matched the gated INT4 path exactly.
+   - BF16 smoke: `decode_ms=301`, `ms_per_step=18.8`.
+   - INT4 smoke: `decode_ms=290`, `ms_per_step=18.2`.
+2. Runtime-branch A/B:
+   - INT4 1x64 artifact:
+     `target/qwen36_35b_a3b_raw_script_1x64_lmhead_int4.json`
+   - BF16 recheck artifact:
+     `target/qwen36_35b_a3b_raw_script_1x64_bf16_lmhead_recheck.json`
+   - Both measured about `51.28 tok/s`, below the previous keeper 1x64
+     run, indicating the default path regressed.
+3. Compile-time-specialized A/B:
+   - BF16 1x64 artifact:
+     `target/qwen36_35b_a3b_raw_script_1x64_bf16_lmhead_specialized.json`
+   - INT4 1x64 artifact:
+     `target/qwen36_35b_a3b_raw_script_1x64_lmhead_int4_specialized.json`
+   - INT4 1x64 improved to about `51.81 tok/s`, but did not exceed the
+     no-H-norm-store keeper 1x64 artifact.
+4. Full 10x256 validation:
+   - INT4 specialized artifact:
+     `target/qwen36_35b_a3b_raw_script_10x256_lmhead_int4_specialized.json`
+   - Result: mean `49.2659 tok/s`, weighted `49.2488 tok/s`,
+     total decode `51981 ms`.
+   - BF16 post-gate artifact:
+     `target/qwen36_35b_a3b_raw_script_10x256_bf16_lmhead_post_int4gate.json`
+   - Result: mean `48.8328 tok/s`, weighted `48.8056 tok/s`,
+     total decode `52453 ms`.
+
+Reject decision:
+
+- Reverted the native INT4 folded lm_head experiment completely.
+- Do not retry this shape without a materially different design: the
+  tiny smoke win did not survive the full harness, and the added code was
+  able to perturb the BF16 keeper path.
+
+Rollback validation:
+
+1. Removed all experiment symbols from the Rust/HIP folded lm_head path:
+   `lm_head_scale`, `lm_head_zero`, `lm_head_group`, `lm_head_int4`,
+   `SUPERSONIC_QWEN36_FOLDED_LM_HEAD_INT4`, and `LM_HEAD_INT4`.
+2. `cargo build --release -p runner --bin supersonic`: passed with
+   existing warnings.
+3. `/home/deano/venvs/rocm/bin/python -m unittest -q tests.test_qwen36_he_supersonic_bench`:
+   passed, 9 tests.
+4. 1x64 rollback artifact:
+   `target/qwen36_35b_a3b_raw_script_1x64_after_lmhead_int4_revert.json`
+   - mean `51.8135 tok/s`, weighted `51.8639 tok/s`,
+     total decode `1234 ms`.
+5. 10x256 rollback artifact:
+   `target/qwen36_35b_a3b_raw_script_10x256_after_lmhead_int4_revert.json`
+   - mean `49.3144 tok/s`, weighted `49.3066 tok/s`,
+     total decode `51920 ms`.
+   - This is effectively back to the current keeper:
+     `target/qwen36_35b_a3b_raw_script_10x256_no_hnorm_store.json`
+     at mean `49.3386 tok/s`, weighted `49.3294 tok/s`,
+     total decode `51896 ms`.
+
+Current status:
+
+- Current Supersonic 35B keeper remains the no-H-norm-store folded top1
+  path at about `49.33 tok/s` weighted on 10x256.
+- Lucebox 35B A3B no-draft reference remains about `78.18 tok/s` decode
+  mean on the comparable 10-prompt `n_gen=256` stack.
+- Supersonic has not yet matched Lucebox 35B A3B.
+
+## Diagnostic Slice: Qwen3.6 Decode FFI/HAL Profile Gate
+
+Date: 2026-06-19.
+
+Reason:
+
+- The full persistent decode megakernel hides internal layer/stage timing
+  from ordinary stage timing output.
+- `persistent_decode_launch_range` already records useful operation names
+  through `ffi_profile_time_result`, including:
+  - `qwen36.persistent_decode`
+  - `qwen36.persistent_attn_only`
+  - `qwen36.persistent_ffn_only`
+  - `qwen36.persistent_ffn_stage{1..5}`
+  - `qwen36.persistent_linear_stage{1..5}`
+- There was no Qwen3.6 generation-only switch to enable those profiles
+  without mixing in prefill.
+
+Implemented:
+
+- Added `Qwen36DecodeProfileScope`, enabled by
+  `SUPERSONIC_QWEN36_PROFILE_FFI=1`.
+- The scope starts at the first generation step and finishes after the
+  generation loop, so prefill does not pollute decode profiles.
+- It enables both:
+  - `kernel_ffi::prefill_ffi::ffi_profile_*`, for per-op launch timing
+    with sync around each profiled op,
+  - `gpu_hal::hal_profile_*`, for copy/sync/memset accounting.
+- It prints machine-readable stderr lines:
+  - `[qwen36-decode-ffi-profile]`
+  - `[qwen36-decode-ffi-profile-op]`
+  - `[qwen36-decode-hal-profile-op]`
+
+Validation:
+
+1. `cargo fmt --check`: passed.
+2. `cargo build --release -p runner --bin supersonic`: passed with
+   existing warnings.
+3. Full-path short profile:
+   - Artifact:
+     `target/qwen36_35b_a3b_raw_script_1x8_decode_ffi_profile.json`
+   - Result: mean `51.5464 tok/s`, weighted `51.6129 tok/s`,
+     total decode `155 ms`.
+   - Profile:
+     - `qwen36.persistent_decode`: 8 calls, mean `19.2902 ms`,
+       total `154.321 ms`, max `22.221 ms`.
+     - HAL had no allocations; generation H2D was `32768` bytes and D2H
+       was `32` bytes, matching folded top1 token-id D2H rather than
+       full logits D2H.
+   - Interpretation: the new profile gate does not materially perturb the
+     current short full-path keeper measurement.
+4. FFN cumulative-stage profile:
+   - Artifact:
+     `target/qwen36_35b_a3b_raw_script_1x1_ffn_stage_decode_ffi_profile.json`
+   - Result under profiling/segmentation: mean `18.6567 tok/s`,
+     weighted `18.5185 tok/s`; use only for attribution.
+   - Profile:
+     - `qwen36.persistent_attn_only`: 40 calls, mean `0.3291 ms`,
+       total `13.165 ms`.
+     - `qwen36.persistent_ffn_stage1`: 40 calls, mean `0.0712 ms`,
+       total `2.849 ms`.
+     - `qwen36.persistent_ffn_stage2`: 40 calls, mean `0.1083 ms`,
+       total `4.330 ms`.
+     - `qwen36.persistent_ffn_stage3`: 40 calls, mean `0.1947 ms`,
+       total `7.789 ms`.
+     - `qwen36.persistent_ffn_stage4`: 40 calls, mean `0.2151 ms`,
+       total `8.605 ms`.
+     - `qwen36.persistent_ffn_stage5`: 40 calls, mean `0.1926 ms`,
+       total `7.705 ms`.
+   - Interpretation: stage kernels are profiling variants, not strictly
+     monotonic cumulative timings. They are most useful for A/B within
+     the same stage label after a code edit.
+5. Linear cumulative-stage profile:
+   - Artifact:
+     `target/qwen36_35b_a3b_raw_script_1x1_linear_stage_decode_ffi_profile.json`
+   - Result under profiling/segmentation: mean `22.0751 tok/s`,
+     weighted `22.2222 tok/s`; use only for attribution.
+   - Profile:
+     - `qwen36.persistent_ffn_only`: 40 calls, mean `0.2362 ms`,
+       total `9.446 ms`.
+     - `qwen36.persistent_attn_only`: 10 calls, mean `0.4691 ms`,
+       total `4.691 ms`.
+     - `qwen36.persistent_linear_stage1`: 30 calls, mean `0.1643 ms`,
+       total `4.929 ms`.
+     - `qwen36.persistent_linear_stage2`: 30 calls, mean `0.1134 ms`,
+       total `3.403 ms`.
+     - `qwen36.persistent_linear_stage3`: 30 calls, mean `0.1161 ms`,
+       total `3.483 ms`.
+     - `qwen36.persistent_linear_stage4`: 30 calls, mean `0.1436 ms`,
+       total `4.308 ms`.
+     - `qwen36.persistent_linear_stage5`: 30 calls, mean `0.2306 ms`,
+       total `6.919 ms`.
+
+Use for next slice:
+
+- Use `SUPERSONIC_QWEN36_PROFILE_FFI=1` on 1-token segmented stage runs
+  for fast, synced A/B evidence before paying for 10x256.
+- Treat profile/segmented tok/s as attribution only; keeper decisions
+  still require the regular full 10x256 harness.
+- The next promising target should reduce the full-path
+  `qwen36.persistent_decode` mean below the current ~`19.3 ms/token`
+  short-run baseline, then confirm on 10x256.
+
+## Kept Slice: Fast INT4 Dequant Without Per-Nibble BF16 RNE
+
+Change:
+
+- In `kernels/qwen36_moe_persistent/helpers.cuh`, removed the
+  `bf16_round_rne_f32(...)` call from the hot INT4 dequant helpers:
+  - `int4_dequant_8`,
+  - the fallback dequant macro inside `int4_dequant_8`,
+  - `wmma_int4_matvec_partial_16rows`,
+  - `int4_dequant_scalar`.
+- The helpers now reconstruct `float(nibble) * scale - zero * scale`
+  directly. This changes exact dequant math, so it was treated as a
+  speed-plus-smoke-check experiment rather than a bit-exact refactor.
+
+Rationale:
+
+- The previous helper rounded each reconstructed nibble value to BF16 in
+  scalar and WMMA-adjacent hot paths.
+- Lucebox parity requires a large decode gain, and the BF16 RNE operation
+  sits directly in the persistent decode inner work.
+
+Validation:
+
+1. `cargo build --release -p runner --bin supersonic`: passed with
+   existing warnings before benchmarking this slice.
+2. `cargo fmt --check`: passed.
+3. `/home/deano/venvs/rocm/bin/python -m unittest -q
+   tests.test_qwen36_he_supersonic_bench`: 9 tests passed.
+4. Short profiled full-path run:
+   - Artifact:
+     `target/qwen36_35b_a3b_raw_script_1x8_fast_dequant_profile.json`
+   - Result: mean `54.0541 tok/s`, weighted `54.0541 tok/s`,
+     total decode `148 ms`.
+   - Profile:
+     - `qwen36.persistent_decode`: 8 calls, mean `18.4441 ms`,
+       total `147.552 ms`, max `21.630 ms`.
+   - Previous comparable profile:
+     `target/qwen36_35b_a3b_raw_script_1x8_decode_ffi_profile.json`
+     had mean `51.5464 tok/s` and persistent decode mean
+     `19.2902 ms`.
+5. Short normal run:
+   - Artifact: `target/qwen36_35b_a3b_raw_script_1x64_fast_dequant.json`
+   - Result: mean `54.3478 tok/s`, weighted `54.3478 tok/s`,
+     total decode `1177 ms`.
+   - Smoke: generated a coherent completion for `has_close_elements`.
+6. Full keeper run:
+   - Artifact:
+     `target/qwen36_35b_a3b_raw_script_10x256_fast_dequant.json`
+   - Result: mean `51.3943 tok/s`, weighted `51.4118 tok/s`,
+     total decode `49794 ms`, range `50.25 - 52.36 tok/s`.
+
+Decision:
+
+- Keep this slice.
+- It improves the current Supersonic 35B A3B full-run keeper from
+  weighted `49.3294 tok/s` and `51896 ms` total decode to weighted
+  `51.4118 tok/s` and `49794 ms` total decode.
+- It is still far short of the Lucebox 35B A3B no-draft baseline:
+  weighted/mean decode target remains about `78.18 tok/s`.
+
+Use for next slice:
+
+- Treat `target/qwen36_35b_a3b_raw_script_10x256_fast_dequant.json` as
+  the new Supersonic full-run keeper unless a later quality check rejects
+  the non-RNE dequant math.
+- The remaining gap is too large for launch overhead or tiny scalar
+  cleanup alone; the next slice should target a structural persistent
+  decode cost, likely routed expert/linear-attention memory traffic or
+  a Lucebox-vs-Supersonic algorithmic difference.
+
+## Kept Slice: Full-Attention Cached Tile128 Workspace
+
+Date: 2026-06-19.
+
+Reason:
+
+- Post fast-dequant segmented profiling showed full attention was still
+  expensive: about `0.435 ms/layer` for the 10 full-attention layers.
+- The cached full-attention tiled path in
+  `kernels/qwen36_moe_persistent/full_attn_phase.cuh` was effectively
+  unreachable for the 35B benchmark geometry. With `head_dim=256`,
+  `attn_tile_stride=d+2=258`, and `kv_max_t=512`, the old guard required
+  `tile_count * 258 <= kv_max_t`, so any real multi-tile history failed
+  and decode used the one-block-per-Q-head serial history loop.
+
+Change:
+
+- Added `FULL_ATTN_DECODE_TILE_T=128` and score-workspace sizing helpers
+  in `crates/runner/src/qwen36_moe/decode.rs`.
+- Updated persistent decode, chained decode, MTP, and per-token batched
+  fallback scratch allocation to size cached full-attention score storage
+  by the widened per-head partial stride.
+- In `kernels/qwen36_moe_persistent/full_attn_phase.cuh`, lowered
+  `attn_tile_t` from `384` to `128` and changed tile partial addressing
+  to use a derived `attn_score_stride` while leaving KV-cache indexing on
+  `kv_max_t`.
+- Updated the INT4 helper comment to reflect the kept fast-dequant math.
+
+Validation:
+
+1. `cargo fmt`: applied.
+2. `cargo build --release -p runner --bin supersonic`: passed with
+   existing warnings.
+3. `cargo fmt --check`: passed after benchmarking.
+4. `/home/deano/venvs/rocm/bin/python -m unittest -q
+   tests.test_qwen36_he_supersonic_bench`: 9 tests passed.
+5. Short profiled full-path run:
+   - Artifact:
+     `target/qwen36_35b_a3b_raw_script_1x8_fullattn_tile128_profile.json`
+   - Result: mean `54.3478 tok/s`, weighted `54.0541 tok/s`,
+     total decode `148 ms`.
+   - Profile:
+     - `qwen36.persistent_decode`: 8 calls, mean `18.3611 ms`,
+       total `146.889 ms`, max `21.372 ms`.
+   - Comparable fast-dequant profile:
+     `target/qwen36_35b_a3b_raw_script_1x8_fast_dequant_profile.json`
+     had persistent decode mean `18.4441 ms`.
+6. Short normal run:
+   - Artifact:
+     `target/qwen36_35b_a3b_raw_script_1x64_fullattn_tile128.json`
+   - Result: mean `55.5556 tok/s`, weighted `55.5556 tok/s`,
+     total decode `1152 ms`.
+   - Comparable fast-dequant artifact:
+     `target/qwen36_35b_a3b_raw_script_1x64_fast_dequant.json` at
+     mean/weighted `54.3478 tok/s`.
+7. Full keeper run:
+   - Artifact:
+     `target/qwen36_35b_a3b_raw_script_10x256_fullattn_tile128.json`
+   - Result: mean `55.5255 tok/s`, weighted `55.5002 tok/s`,
+     total decode `46126 ms`, range `54.95 - 55.87 tok/s`.
+
+Decision:
+
+- Keep this slice.
+- It improves the previous Supersonic 35B A3B full-run keeper from
+  weighted `51.4118 tok/s` and `49794 ms` total decode to weighted
+  `55.5002 tok/s` and `46126 ms` total decode.
+- It is still short of the Lucebox 35B A3B no-draft baseline:
+  decode target remains about `78.18 tok/s`.
+
+Use for next slice:
+
+- Treat `target/qwen36_35b_a3b_raw_script_10x256_fullattn_tile128.json`
+  as the new Supersonic full-run keeper.
+- The tile128 win shows the remaining gap includes under-parallelized
+  structural work, not just scalar dequant cost. Next candidates should
+  look for similar occupancy/parallelism issues in linear attention and
+  routed/shared FFN, or compare Lucebox's per-layer scheduling directly
+  against Supersonic's persistent megakernel.
+
+Post-keep attribution:
+
+1. Linear-stage profile over 64 generated tokens:
+   - Artifact:
+     `target/qwen36_35b_a3b_raw_script_1x64_fullattn_tile128_linear_stage_profile.json`
+   - Profiling-only result: mean `26.04 tok/s`.
+   - FFI rows:
+     - `qwen36.persistent_ffn_only`: 2560 calls, mean `0.2021 ms`,
+       total `517.354 ms`.
+     - `qwen36.persistent_linear_stage5`: 1920 calls, mean `0.1997 ms`,
+       total `383.343 ms`.
+     - `qwen36.persistent_attn_only`: 640 calls, mean `0.3928 ms`,
+       total `251.376 ms`.
+     - `qwen36.persistent_linear_stage4`: 1920 calls, mean `0.1264 ms`,
+       total `242.663 ms`.
+     - `qwen36.persistent_linear_stage1`: 1920 calls, mean `0.1201 ms`,
+       total `230.523 ms`.
+     - `qwen36.persistent_linear_stage3`: 1920 calls, mean `0.1016 ms`,
+       total `195.156 ms`.
+     - `qwen36.persistent_linear_stage2`: 1920 calls, mean `0.1014 ms`,
+       total `194.702 ms`.
+2. FFN-stage profile over 64 generated tokens:
+   - Artifact:
+     `target/qwen36_35b_a3b_raw_script_1x64_fullattn_tile128_ffn_stage_profile.json`
+   - Profiling-only result: mean `21.28 tok/s`.
+   - FFI rows:
+     - `qwen36.persistent_attn_only`: 2560 calls, mean `0.2671 ms`,
+       total `683.751 ms`.
+     - `qwen36.persistent_ffn_stage4`: 2560 calls, mean `0.1889 ms`,
+       total `483.593 ms`.
+     - `qwen36.persistent_ffn_stage3`: 2560 calls, mean `0.1771 ms`,
+       total `453.368 ms`.
+     - `qwen36.persistent_ffn_stage5`: 2560 calls, mean `0.1752 ms`,
+       total `448.517 ms`.
+     - `qwen36.persistent_ffn_stage2`: 2560 calls, mean `0.1021 ms`,
+       total `261.334 ms`.
+     - `qwen36.persistent_ffn_stage1`: 2560 calls, mean `0.0638 ms`,
+       total `163.454 ms`.
+
+## Kept Slice: Full-Attention Tile64 Sweep
+
+Date: 2026-06-19.
+
+Reason:
+
+- Tile128 proved the cached full-attention path was under-parallelized.
+- The 1x64 post-tile128 run was still full-attention sensitive, so a
+  smaller tile was worth a cheap sweep before moving to FFN/linear work.
+
+Change:
+
+- Changed `FULL_ATTN_DECODE_TILE_T` in
+  `crates/runner/src/qwen36_moe/decode.rs` from `128` to `64`.
+- Changed the matching HIP `attn_tile_t` literal in
+  `kernels/qwen36_moe_persistent/full_attn_phase.cuh` from `128` to
+  `64`.
+- The widened score/partial workspace formula already added by the
+  tile128 slice covers the larger tile count.
+
+Validation:
+
+1. `cargo fmt --check`: passed.
+2. `cargo build --release -p runner --bin supersonic`: passed with
+   existing warnings.
+3. `/home/deano/venvs/rocm/bin/python -m unittest -q
+   tests.test_qwen36_he_supersonic_bench`: 9 tests passed.
+4. Short normal run:
+   - Artifact:
+     `target/qwen36_35b_a3b_raw_script_1x64_fullattn_tile64.json`
+   - Result: mean `57.4713 tok/s`, weighted `57.4713 tok/s`,
+     total decode `1114 ms`.
+   - Comparable tile128 artifact:
+     `target/qwen36_35b_a3b_raw_script_1x64_fullattn_tile128.json`
+     at mean/weighted `55.5556 tok/s`.
+5. Full keeper run:
+   - Artifact:
+     `target/qwen36_35b_a3b_raw_script_10x256_fullattn_tile64.json`
+   - Result: mean `56.4027 tok/s`, weighted `56.3901 tok/s`,
+     total decode `45398 ms`, range `55.87 - 56.82 tok/s`.
+
+Decision:
+
+- Keep this slice.
+- It improves the previous tile128 full-run keeper from weighted
+  `55.5002 tok/s` and `46126 ms` total decode to weighted
+  `56.3901 tok/s` and `45398 ms` total decode.
+- Lucebox 35B A3B no-draft remains well ahead at about `78.18 tok/s`.
+
+Use for next slice:
+
+- Treat `target/qwen36_35b_a3b_raw_script_10x256_fullattn_tile64.json`
+  as the new Supersonic full-run keeper.
+- Another full-attention tile sweep below 64 may be possible, but the
+  remaining gap likely needs work in FFN stage3-5 and linear stage5 too.
+
+## Kept Slice: Full-Attention Tile32 Sweep
+
+Date: 2026-06-19.
+
+Reason:
+
+- Tile64 still improved over tile128, so one more smaller tile sweep was
+  cheap enough to test before moving away from full-attention tiling.
+
+Change:
+
+- Changed `FULL_ATTN_DECODE_TILE_T` in
+  `crates/runner/src/qwen36_moe/decode.rs` from `64` to `32`.
+- Changed the matching HIP `attn_tile_t` literal in
+  `kernels/qwen36_moe_persistent/full_attn_phase.cuh` from `64` to
+  `32`.
+
+Validation:
+
+1. `cargo fmt --check`: passed.
+2. `cargo build --release -p runner --bin supersonic`: passed with
+   existing warnings.
+3. `/home/deano/venvs/rocm/bin/python -m unittest -q
+   tests.test_qwen36_he_supersonic_bench`: 9 tests passed.
+4. Short normal run:
+   - Artifact:
+     `target/qwen36_35b_a3b_raw_script_1x64_fullattn_tile32.json`
+   - Result: mean `57.8035 tok/s`, weighted `57.8035 tok/s`,
+     total decode `1107 ms`.
+   - Comparable tile64 artifact:
+     `target/qwen36_35b_a3b_raw_script_1x64_fullattn_tile64.json`
+     at mean/weighted `57.4713 tok/s`.
+5. Full keeper run:
+   - Artifact:
+     `target/qwen36_35b_a3b_raw_script_10x256_fullattn_tile32.json`
+   - Result: mean `56.8510 tok/s`, weighted `56.8321 tok/s`,
+     total decode `45045 ms`, range `56.50 - 57.14 tok/s`.
+
+Decision:
+
+- Keep this slice.
+- It improves the previous tile64 full-run keeper from weighted
+  `56.3901 tok/s` and `45398 ms` total decode to weighted
+  `56.8321 tok/s` and `45045 ms` total decode.
+- The gain is much smaller than tile128 and tile64. Treat further
+  full-attention tile sweeps as lower priority unless a profile shows
+  full attention dominates again.
+
+Use for next slice:
+
+- Treat `target/qwen36_35b_a3b_raw_script_10x256_fullattn_tile32.json`
+  as the new Supersonic full-run keeper.
+- Move to FFN stage3-5 or linear stage5 structural work next; the
+  remaining gap to Lucebox is still about `56.83 tok/s` versus
+  `78.18 tok/s`.
+
+## Rejected Slice: FFN Phase H All-Group-Blocks
+
+Date: 2026-06-19.
+
+Reason:
+
+- FFN stage profiling showed stage3-5 remained meaningful after the
+  full-attention tile sweep.
+- Phase H (`mid = silu(gate) * up`) used only `sub_id == 0` for each
+  active expert group, leaving the other blocks assigned to that group
+  idle for the 512-element loop on 35B-A3B.
+
+Experiment:
+
+- Changed Phase H in `kernels/qwen36_moe_persistent/ffn_phase.cuh` so
+  all blocks assigned to an active expert group processed strided chunks
+  of the `I=512` mid vector.
+- The existing grid barrier before Phase I remained the publish point.
+
+Validation:
+
+1. `cargo fmt --check`: passed.
+2. `cargo build --release -p runner --bin supersonic`: passed with
+   existing warnings.
+3. Normal 1x64 run:
+   - Artifact:
+     `target/qwen36_35b_a3b_raw_script_1x64_ffn_phaseh_allblocks.json`
+   - Result: mean/weighted `57.8035 tok/s`, total decode `1107 ms`.
+   - This tied the current tile32 keeper's 1x64 artifact:
+     `target/qwen36_35b_a3b_raw_script_1x64_fullattn_tile32.json`.
+4. First attempt to run the FFN-stage profile concurrently with the 1x64
+   normal run failed during layer load with HIP OOM after VMM fallback.
+   Do not run two Qwen3.6 35B profile/bench jobs concurrently on this
+   24 GiB card.
+5. Rerun FFN-stage profile alone:
+   - Artifact:
+     `target/qwen36_35b_a3b_raw_script_1x64_ffn_phaseh_allblocks_ffn_stage_profile.json`
+   - Profiling-only result: mean `21.65 tok/s`.
+   - FFI rows:
+     - `qwen36.persistent_ffn_stage4`: mean `0.1893 ms` versus prior
+       `0.1889 ms`.
+     - `qwen36.persistent_ffn_stage3`: mean `0.1772 ms` versus prior
+       `0.1771 ms`.
+     - `qwen36.persistent_ffn_stage5`: mean `0.1744 ms` versus prior
+       `0.1752 ms`.
+
+Decision:
+
+- Rejected and reverted.
+- The end-to-end 1x64 result tied, and the FFN stage rows were
+  neutral/noisy: stage5 barely improved while stage3/4 did not.
+- Do not retry this exact Phase H striding shape unless a new profile
+  shows Phase H itself dominates rather than the surrounding matvecs.
+
+## Kept Slice: Full-Attention Decode Tile16
+
+Date: 2026-06-19.
+
+Reason:
+
+- Tile32 had become the current full-attention keeper, but the remaining
+  gap to Lucebox was still large enough to justify one smaller cached
+  attention tile.
+
+Experiment:
+
+- Changed `FULL_ATTN_DECODE_TILE_T` in
+  `crates/runner/src/qwen36_moe/decode.rs` from `32` to `16`.
+- Changed the matching HIP tile constant in
+  `kernels/qwen36_moe_persistent/full_attn_phase.cuh` from `32` to `16`.
+- Left the widened per-head score workspace path intact.
+
+Validation:
+
+1. Pre-run build status for the tile16 patch:
+   `cargo fmt --check && cargo build --release -p runner --bin supersonic`
+   passed with existing warnings.
+2. 1x64 filter:
+   - Artifact:
+     `target/qwen36_35b_a3b_raw_script_1x64_fullattn_tile16.json`
+   - Result: mean `57.80346820809248 tok/s`, weighted
+     `57.971014492753625 tok/s`, total decode `1104 ms`.
+   - Comparable tile32 artifact:
+     `target/qwen36_35b_a3b_raw_script_1x64_fullattn_tile32.json`
+     at mean `57.80346820809248 tok/s`, weighted
+     `57.70964833183048 tok/s`, total decode `1109 ms`.
+3. Full keeper run:
+   - Artifact:
+     `target/qwen36_35b_a3b_raw_script_10x256_fullattn_tile16.json`
+   - Result: mean `57.11223040165311 tok/s`, weighted
+     `57.09442883268656 tok/s`, total decode `44838 ms`, range
+     `56.18 - 57.47 tok/s`.
+   - Comparable tile32 artifact:
+     `target/qwen36_35b_a3b_raw_script_10x256_fullattn_tile32.json`
+     at mean `56.85101621542299 tok/s`, weighted
+     `56.832056832056836 tok/s`, total decode `45045 ms`.
+
+Decision:
+
+- Keep this slice.
+- It improves the previous tile32 full-run keeper from weighted
+  `56.8321 tok/s` and `45045 ms` total decode to weighted
+  `57.0944 tok/s` and `44838 ms` total decode.
+- The current gap to Lucebox 35B A3B no-draft is still large:
+  `57.09 tok/s` weighted Supersonic versus about `78.18 tok/s`
+  Lucebox decode mean.
+
+## Kept Slice: Full-Attention Decode Tile8
+
+Date: 2026-06-19.
+
+Reason:
+
+- Full-attention tile sweeps have improved monotonically so far:
+  tile128 `55.50`, tile64 `56.39`, tile32 `56.83`, tile16
+  `57.09` weighted tok/s on the 10x256 raw-script benchmark.
+- Try tile8 as one final small-tile probe before moving back to larger
+  FFN/linear structural work.
+
+Plan:
+
+- Change both host and HIP full-attention decode tile constants from
+  `16` to `8`.
+- Run a 1x64 filter first and compare against tile16. Only run 10x256 if
+  the filter beats the tile16 keeper.
+
+Validation:
+
+1. `cargo fmt --check && cargo build --release -p runner --bin supersonic`
+   passed with existing warnings.
+2. 1x64 filter:
+   - Artifact:
+     `target/qwen36_35b_a3b_raw_script_1x64_fullattn_tile8.json`
+   - Result: mean `58.139534883720934 tok/s`, weighted
+     `58.023572076155936 tok/s`, total decode `1103 ms`.
+   - Comparable tile16 artifact:
+     `target/qwen36_35b_a3b_raw_script_1x64_fullattn_tile16.json`
+     at mean `57.80346820809248 tok/s`, weighted
+     `57.971014492753625 tok/s`, total decode `1104 ms`.
+3. Full keeper run:
+   - Artifact:
+     `target/qwen36_35b_a3b_raw_script_10x256_fullattn_tile8.json`
+   - Result: mean `57.208911777877304 tok/s`, weighted
+     `57.161996204086186 tok/s`, total decode `44785 ms`, range
+     `56.82 - 57.47 tok/s`.
+   - Comparable tile16 artifact:
+     `target/qwen36_35b_a3b_raw_script_10x256_fullattn_tile16.json`
+     at mean `57.11223040165311 tok/s`, weighted
+     `57.09442883268656 tok/s`, total decode `44838 ms`.
+
+Decision:
+
+- Keep this slice.
+- It improves the previous tile16 full-run keeper by `53 ms` total decode
+  on the 10x256 benchmark.
+- The gain is small. Only continue to tile4 because the sweep remains
+  monotonic; stop the small-tile sweep if tile4 does not beat tile8 on the
+  1x64 filter.
+
+## Rejected Slice: Full-Attention Decode Tile4
+
+Date: 2026-06-19.
+
+Reason:
+
+- Tile128 -> tile64 -> tile32 -> tile16 -> tile8 improved monotonically,
+  so tile4 was tried as the final small-tile probe.
+
+Experiment:
+
+- Changed `FULL_ATTN_DECODE_TILE_T` in
+  `crates/runner/src/qwen36_moe/decode.rs` from `8` to `4`.
+- Changed the matching HIP tile constant in
+  `kernels/qwen36_moe_persistent/full_attn_phase.cuh` from `8` to `4`.
+
+Validation:
+
+1. `cargo fmt --check && cargo build --release -p runner --bin supersonic`
+   passed with existing warnings.
+2. 1x64 filter:
+   - Artifact:
+     `target/qwen36_35b_a3b_raw_script_1x64_fullattn_tile4.json`
+   - Result: mean `57.80346820809248 tok/s`, weighted
+     `57.86618444846293 tok/s`, total decode `1106 ms`.
+   - Comparable tile8 artifact:
+     `target/qwen36_35b_a3b_raw_script_1x64_fullattn_tile8.json`
+     at mean `58.139534883720934 tok/s`, weighted
+     `58.023572076155936 tok/s`, total decode `1103 ms`.
+
+Decision:
+
+- Rejected and reverted to tile8.
+- Stop the simple full-attention tile sweep here. Tile8 is the keeper;
+  tile4 lost on the cheap filter.
+
+## Kept Slice: One-Barrier Persistent Counter Reset
+
+Date: 2026-06-19.
+
+Reason:
+
+- `reset_counters_16` in
+  `kernels/qwen36_moe_persistent/persistent_decode.hip` used two full
+  grid barriers around sixteen counter stores.
+- The existing single-counter helper already used the safer/faster pattern:
+  the last arriving block resets the counter before releasing the barrier.
+- The full persistent path calls `reset_counters_16` between attention and
+  FFN, between layers, and before folded lm_head, so halving this barrier
+  sequence is small but repeated about 80 times per generated token.
+
+Experiment:
+
+- Rewrote `reset_counters_16` to use one grid-wide barrier:
+  each block arrives, the last-arriving block's thread 0 clears
+  `counters[0..15]`, then releases `barrier_flag`.
+- This preserves the ordering invariant: no block can enter the next phase
+  until every block reached the reset point and all 16 counter slots are
+  cleared.
+
+Validation:
+
+1. `cargo fmt --check && cargo build --release -p runner --bin supersonic`
+   passed with existing warnings.
+2. 1x64 filter:
+   - Artifact:
+     `target/qwen36_35b_a3b_raw_script_1x64_reset16_onebarrier.json`
+   - Result: mean `58.139534883720934 tok/s`, weighted
+     `58.12897366030881 tok/s`, total decode `1101 ms`.
+   - Comparable tile8 artifact:
+     `target/qwen36_35b_a3b_raw_script_1x64_fullattn_tile8.json`
+     at mean `58.139534883720934 tok/s`, weighted
+     `58.023572076155936 tok/s`, total decode `1103 ms`.
+3. Full keeper run:
+   - Artifact:
+     `target/qwen36_35b_a3b_raw_script_10x256_reset16_onebarrier.json`
+   - Result: mean `57.27459969437247 tok/s`, weighted
+     `57.26428811094956 tok/s`, total decode `44705 ms`, range
+     `57.14 - 57.80 tok/s`.
+   - Comparable tile8 artifact:
+     `target/qwen36_35b_a3b_raw_script_10x256_fullattn_tile8.json`
+     at mean `57.208911777877304 tok/s`, weighted
+     `57.161996204086186 tok/s`, total decode `44785 ms`.
+
+Decision:
+
+- Keep this slice.
+- It improves the previous tile8 full-run keeper by `80 ms` total decode
+  on the 10x256 benchmark.
+- The gain is small but from a correctness-preserving synchronization
+  cleanup on a repeated full-path barrier.
+
+## Rejected Slice: Post-FFN Counter0-Only Reset
+
+Date: 2026-06-19.
+
+Reason:
+
+- After FFN, the next layer's attention and the folded lm_head only consume
+  `counters[0]`, while the next all-counter reset still happens before FFN.
+- Tried replacing the post-FFN and pre-lm_head `reset_counters_16` calls
+  with `grid_barrier_reset_counter(..., &counters[0])`.
+
+Validation:
+
+1. `cargo fmt --check && cargo build --release -p runner --bin supersonic`
+   passed with existing warnings.
+2. 1x64 filter:
+   - Artifact:
+     `target/qwen36_35b_a3b_raw_script_1x64_postffn_counter0_reset.json`
+   - Result: mean `58.139534883720934 tok/s`, weighted
+     `58.12897366030881 tok/s`, total decode `1101 ms`.
+   - This exactly tied the current one-barrier keeper's 1x64 artifact:
+     `target/qwen36_35b_a3b_raw_script_1x64_reset16_onebarrier.json`.
+
+Decision:
+
+- Rejected and reverted.
+- The simplification was correct-looking but did not beat the filter, so
+  keep the clearer all-16 reset at those boundaries.
+
+## Kept Slice: Linear Out-Projection WMMA Tile64
+
+Date: 2026-06-19.
+
+Reason:
+
+- Current segmented attribution showed linear stage5/full linear attention
+  remained hot at about `0.2041 ms/layer` across 30 linear layers.
+- Linear Phase I out-projection used one block to process 128 output rows.
+  For the 35B-A3B geometry (`hidden=2048`) that creates only 16 block tasks,
+  underfilling the 96-CU RX 7900 XTX during the out-projection.
+
+Experiment:
+
+- In `kernels/qwen36_moe_persistent/linear_attn_phase.cuh`, changed the
+  Phase I INT4 WMMA out-projection work distribution from 128 rows per task
+  to 64 rows per task.
+- This lets 32 blocks participate in the 2048-row projection. Each active
+  row is still computed by the same WMMA helper and keeps the same arithmetic
+  order per row; only the block/wave assignment changes.
+
+Validation:
+
+1. `cargo fmt --check && cargo build --release -p runner --bin supersonic`
+   passed with existing warnings.
+2. 1x64 filter:
+   - Artifact:
+     `target/qwen36_35b_a3b_raw_script_1x64_linear_outproj_tile64.json`
+   - Result: mean `58.8235294117647 tok/s`, weighted
+     `58.661778185151235 tok/s`, total decode `1091 ms`.
+   - Comparable previous keeper artifact:
+     `target/qwen36_35b_a3b_raw_script_1x64_reset16_onebarrier.json`
+     at mean `58.139534883720934 tok/s`, weighted
+     `58.12897366030881 tok/s`, total decode `1101 ms`.
+3. Full keeper run:
+   - Artifact:
+     `target/qwen36_35b_a3b_raw_script_10x256_linear_outproj_tile64.json`
+   - Result: mean `57.77102039113525 tok/s`, weighted
+     `57.75130842808157 tok/s`, total decode `44328 ms`, range
+     `57.47 - 58.14 tok/s`.
+   - Comparable previous keeper artifact:
+     `target/qwen36_35b_a3b_raw_script_10x256_reset16_onebarrier.json`
+     at mean `57.27459969437247 tok/s`, weighted
+     `57.26428811094956 tok/s`, total decode `44705 ms`.
+
+Decision:
+
+- Keep this slice.
+- It improves the previous full-run keeper by `377 ms` total decode on the
+  10x256 benchmark.
+- Follow-up: test 32 rows per task as a cheap filter. If it loses, keep
+  tile64 and apply the same occupancy lens to other single-counter WMMA
+  row loops, especially full-attention output projection.
+
+## Rejected Slice: Linear Out-Projection WMMA Tile32
+
+Date: 2026-06-19.
+
+Reason:
+
+- Tile64 improved the linear out-projection by increasing the number of
+  participating blocks from 16 to 32. Tile32 was tested as the next occupancy
+  point, using 64 participating blocks but only two active waves per block.
+
+Validation:
+
+1. `cargo fmt --check && cargo build --release -p runner --bin supersonic`
+   passed with existing warnings.
+2. 1x64 filter:
+   - Artifact:
+     `target/qwen36_35b_a3b_raw_script_1x64_linear_outproj_tile32.json`
+   - Result: mean `54.6448087431694 tok/s`, weighted
+     `54.5144804088586 tok/s`, total decode `1174 ms`.
+   - Comparable tile64 artifact:
+     `target/qwen36_35b_a3b_raw_script_1x64_linear_outproj_tile64.json`
+     at mean `58.8235294117647 tok/s`, weighted
+     `58.661778185151235 tok/s`, total decode `1091 ms`.
+
+Decision:
+
+- Rejected and reverted to tile64.
+- The lower per-block wave utilization dominates; do not use 32-row tasks
+  for this projection shape.
+
+## Rejected Slice: FFN Shared-Expert Down WMMA Tile64
+
+Date: 2026-06-19.
+
+Reason:
+
+- FFN Phase F shared-expert down projection has a single-counter WMMA row loop
+  over `hidden=2048`, so it looked similar to the linear out-projection
+  underfill fixed by 64-row tasks.
+- Tested changing Phase F from 128 rows per task to 64 rows per task, with
+  four active waves per block.
+
+Validation:
+
+1. `cargo fmt --check && cargo build --release -p runner --bin supersonic`
+   passed with existing warnings.
+2. 1x64 filter:
+   - Artifact:
+     `target/qwen36_35b_a3b_raw_script_1x64_ffn_shared_down_tile64.json`
+   - Result: mean `58.47953216374268 tok/s`, weighted
+     `58.50091407678245 tok/s`, total decode `1094 ms`.
+   - Comparable current keeper artifact:
+     `target/qwen36_35b_a3b_raw_script_1x64_linear_outproj_tile64.json`
+     at mean `58.8235294117647 tok/s`, weighted
+     `58.661778185151235 tok/s`, total decode `1091 ms`.
+
+Decision:
+
+- Rejected and reverted.
+- The shared down projection did not benefit from the linear out-projection
+  row-task split; keep Phase F at 128 rows per task unless a materially new
+  tiling strategy changes the work balance.
+
+## Rejected Slice: Full-Attention Out-Projection WMMA Tile64
+
+Date: 2026-06-19.
+
+Reason:
+
+- Full-attention Phase I `o_proj` also uses a single-counter WMMA row loop
+  over `hidden=2048`.
+- Tested the same 64-row task split that improved linear-attention
+  out-projection.
+
+Validation:
+
+1. `cargo fmt --check && cargo build --release -p runner --bin supersonic`
+   passed with existing warnings.
+2. 1x64 filter:
+   - Artifact:
+     `target/qwen36_35b_a3b_raw_script_1x64_full_attn_outproj_tile64.json`
+   - Result: mean `58.47953216374268 tok/s`, weighted
+     `58.50091407678245 tok/s`, total decode `1094 ms`.
+   - Comparable current keeper artifact:
+     `target/qwen36_35b_a3b_raw_script_1x64_linear_outproj_tile64.json`
+     at mean `58.8235294117647 tok/s`, weighted
+     `58.661778185151235 tok/s`, total decode `1091 ms`.
+
+Decision:
+
+- Rejected and reverted.
+- The linear out-projection tile64 win does not transfer to full-attention
+  `o_proj`; keep this loop at 128 rows per task unless the projection kernel
+  is rebalanced more substantially.
+
+## Rejected Slice: FFN Routed Gate/Down WMMA Tile64
+
+Date: 2026-06-19.
+
+Reason:
+
+- FFN routed expert Phase G and Phase I use per-top-k-group WMMA work-stealing
+  loops. For 35B-A3B each expert group has a small number of 128-row tasks,
+  so 64-row tasks were tested to expose more work items per group while
+  preserving the same per-row WMMA arithmetic.
+
+Validation:
+
+1. `cargo fmt --check && cargo build --release -p runner --bin supersonic`
+   passed with existing warnings.
+2. 1x64 filter:
+   - Artifact:
+     `target/qwen36_35b_a3b_raw_script_1x64_ffn_routed_gi_tile64.json`
+   - Result: mean `55.24861878453038 tok/s`, weighted
+     `55.41125541125541 tok/s`, total decode `1155 ms`.
+   - Comparable current keeper artifact:
+     `target/qwen36_35b_a3b_raw_script_1x64_linear_outproj_tile64.json`
+     at mean `58.8235294117647 tok/s`, weighted
+     `58.661778185151235 tok/s`, total decode `1091 ms`.
+
+Decision:
+
+- Rejected and reverted.
+- The extra per-group tasks do not offset the lower active waves per block;
+  keep routed FFN Phase G/I at 128 rows per task.
+
+## Rejected Slice: Shared-Expert Direct-Mid WMMA
+
+Date: 2026-06-19.
+
+Reason:
+
+- Routed expert gate/up direct-mid WMMA improved 35B-A3B by writing
+  `EXPERT_MID` directly and removing the legacy activation pass/barrier.
+- Tested the same idea for the shared expert by computing shared gate/up WMMA
+  directly into `OFF_SHARED_MID` and skipping Phase E's activation barrier.
+
+Validation:
+
+1. Build and parity passed before the speed filter:
+   - `cargo fmt --check`
+   - `HIP_ARCH=gfx1100 cargo build --release -p runner --bin supersonic`
+   - `SUPERSONIC_QWEN36_MULTILAYER_ORACLE_JSON=/tmp/qwen36_ml_direct_mid_check.json HIP_ARCH=gfx1100 cargo test --release -p runner --test qwen36_moe_multilayer_parity multilayer_persistent_decode_matches_chained -- --nocapture`
+2. 1x64 filter:
+   - Artifact:
+     `target/qwen36_35b_a3b_raw_script_1x64_shared_direct_mid_wmma.json`
+   - Result: mean `56.17977528089887 tok/s`, weighted
+     `56.28847845206684 tok/s`, total decode `1137 ms`.
+   - Comparable current keeper artifact:
+     `target/qwen36_35b_a3b_raw_script_1x64_ffn_direct_mid_wmma_raw.json`
+     at mean `59.52380952380952 tok/s`, weighted
+     `59.424326833797586 tok/s`, total decode `1077 ms`.
+   - Generated-token hash matched the keeper:
+     `ee96d4ba3ccc01df68bed07b652eb1d37277bdafc224c5628c62c3055fe9e5ed`.
+
+Decision:
+
+- Rejected and reverted.
+- The shared expert's scalar Phase D/E remains faster than the paired WMMA
+  direct-mid path on this 1x64 filter. Do not retry shared direct-mid unless
+  the block/wave mapping changes materially.
+
+## Rejected Slice: FFN Router BF16 WMMA
+
+Date: 2026-06-19.
+
+Reason:
+
+- FFN stage1 profiling attributed about `0.064 ms/layer` to the early FFN
+  path, which includes post-attention RMS, router gate, softmax, and top-k.
+- Tested a BF16 WMMA matvec helper for the router gate (`256 x 2048` BF16)
+  to replace the scalar one-output-row-per-block reduction in Phase B.
+
+Validation:
+
+1. Build passed:
+   - `cargo fmt --check`
+   - `HIP_ARCH=gfx1100 cargo build --release -p runner --bin supersonic`
+2. Persistent parity passed against the existing oracle:
+   - `SUPERSONIC_QWEN36_MULTILAYER_ORACLE_JSON=/tmp/qwen36_ml_direct_mid_check.json HIP_ARCH=gfx1100 cargo test --release -p runner --test qwen36_moe_multilayer_parity multilayer_persistent_decode_matches_chained -- --nocapture`
+3. 1x64 filter:
+   - Artifact:
+     `target/qwen36_35b_a3b_raw_script_1x64_router_bf16_wmma.json`
+   - Result: mean `57.4712643678161 tok/s`, weighted
+     `57.502246181491465 tok/s`, total decode `1113 ms`.
+   - Comparable current keeper artifact:
+     `target/qwen36_35b_a3b_raw_script_1x64_ffn_direct_mid_wmma_raw.json`
+     at mean `59.52380952380952 tok/s`, weighted
+     `59.424326833797586 tok/s`, total decode `1077 ms`.
+   - Generated-token hash matched the keeper:
+     `ee96d4ba3ccc01df68bed07b652eb1d37277bdafc224c5628c62c3055fe9e5ed`.
+
+Decision:
+
+- Rejected and reverted.
+- The router has only 256 rows; the BF16 WMMA tile path underfilled the GPU
+  despite producing matching output. Keep the scalar router matvec unless a
+  materially different wave/task mapping is introduced.
+
+## Rejected Slice: Router Top-K Over Logits
+
+Date: 2026-06-19.
+
+Reason:
+
+- Tested a narrower router Phase C change: keep the full softmax denominator
+  for parity, but avoid writing all 256 BF16-rounded probabilities by doing
+  top-k over router logits and materializing only the selected probabilities.
+- This targeted the FFN/router slice without changing expert selection math.
+
+Validation:
+
+1. Build and parity passed before the speed filter:
+   - `cargo fmt --check`
+   - `HIP_ARCH=gfx1100 cargo build --release -p runner --bin supersonic`
+   - `SUPERSONIC_QWEN36_MULTILAYER_ORACLE_JSON=/tmp/qwen36_ml_direct_mid_check.json HIP_ARCH=gfx1100 cargo test --release -p runner --test qwen36_moe_multilayer_parity multilayer_persistent_decode_matches_chained -- --nocapture`
+2. 1x64 filter:
+   - Artifact:
+     `target/qwen36_35b_a3b_raw_script_1x64_router_topk_logits.json`
+   - Result: mean `62.5 tok/s`, weighted `62.37816764132553 tok/s`,
+     total decode `1026 ms`.
+   - Comparable current keeper artifact:
+     `target/qwen36_35b_a3b_raw_script_1x64_shared_pair_scalar.json`
+     at mean `62.5 tok/s`, weighted `62.56109481915934 tok/s`,
+     total decode `1023 ms`.
+   - Generated-token hash matched the keeper:
+     `a68b412c4282555f15546cf6e1fc42893b7e07f271557ceb021821098dd66c1b`.
+3. After rejection, the Phase C source was restored to the full
+   probability-materialization path and the restored build/parity check
+   passed again with exact final-hidden equality.
+
+Decision:
+
+- Rejected and reverted.
+- The router scratch write is not a current bottleneck at the 1x64 filter
+  granularity; do not retry top-k-over-logits without a larger router-stage
+  remapping.
+
+## Benchmark Stack Status: Lucebox 35B/A3B Local Artifacts
+
+Date: 2026-06-19.
+
+Status:
+
+- The local Lucebox HumanEval benchmark stack already has a
+  `qwen36-35b-a3b` target profile in
+  `/home/deano/projects/lucebox-hub/server/scripts/bench_he.py`.
+- That profile uses the no-draft `qwen35moe` daemon path and points at:
+  - target GGUF:
+    `/home/deano/projects/lucebox-hub/server/models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf`
+  - tokenizer: `Qwen/Qwen3.6-35B-A3B`
+  - runner binary:
+    `/home/deano/projects/lucebox-hub/server/build/test_dflash`
+- The corresponding Supersonic comparison harness profile is
+  `qwen36-35b-a3b` in
+  `tests/gfx1100/bench_qwen36_he_supersonic.py`, pointing at
+  `/mnt/data/models/Qwen3.6-35B-A3B`.
+
+Added:
+
+- Extended Lucebox `scripts/bench_he.py` with `--out-json` so 35B Lucebox
+  runs can produce durable JSON artifacts with mean/weighted decode speed,
+  prefill speed, token totals, and per-prompt rows.
+- Added unit coverage in Lucebox `scripts/test_bench_he.py` for the JSON
+  payload summary path.
+
+Validation:
+
+- `/home/deano/projects/lucebox-hub/server/.venv/bin/python -m unittest scripts.test_bench_he`
+  passed: `7` tests.
+- `/home/deano/projects/lucebox-hub/server/.venv/bin/python -m py_compile scripts/bench_he.py scripts/test_bench_he.py`
+  passed.
+
+Note:
+
+- A live `--out-json` smoke was not run because the counted 35B prompt cache
+  was absent; running it would tokenize and load the full `21G` GGUF. Existing
+  model and binary files are present.
+
+## Rejected Slice: Linear Value/Z Paired WMMA
+
+Date: 2026-06-19.
+
+Reason:
+
+- Tested a linear-attention Phase B WMMA pairing that computed the qkv value
+  slice and z projection together. The two projections share the same
+  activation vector and row count, so this was the next structural pairing
+  after the accepted FFN gate/up and full-attention Q/gate pairs.
+- The candidate added a dual-scale paired WMMA helper because qkv and z use
+  separate INT4 scale/zero slabs.
+
+Validation:
+
+1. Candidate build and exact multilayer parity passed before speed filtering:
+   - `HIP_ARCH=gfx1100 cargo build --release -p runner --bin supersonic`
+   - `SUPERSONIC_QWEN36_MULTILAYER_ORACLE_JSON=/tmp/qwen36_ml_direct_mid_check.json HIP_ARCH=gfx1100 cargo test --release -p runner --test qwen36_moe_multilayer_parity multilayer_persistent_decode_matches_chained -- --nocapture`
+   - persistent and segmented persistent final hidden remained exact:
+     `exact=256 max_abs=0 mean_abs=0 cos_sim=1`.
+2. 1x64 filter:
+   - Artifact:
+     `target/qwen36_35b_a3b_raw_script_1x64_linear_value_z_pair_wmma.json`
+   - Result: mean `63.291139240506325 tok/s`, weighted
+     `63.116370808678504 tok/s`, total decode `1014 ms`, stopped early `0`.
+   - Comparable current keeper artifact:
+     `target/qwen36_35b_a3b_raw_script_1x64_fullattn_q_gate_pair_wmma.json`
+     at mean `64.51612903225806 tok/s`, weighted `64.45115810674723 tok/s`,
+     total decode `993 ms`.
+   - Generated-token hash matched the keeper:
+     `ee96d4ba3ccc01df68bed07b652eb1d37277bdafc224c5628c62c3055fe9e5ed`.
+3. After rejection, the dual-scale helper and linear value/Z fused pool were
+   reverted. Restored checks passed:
+   - `cargo fmt --check`
+   - `git diff --check`
+   - `HIP_ARCH=gfx1100 cargo build --release -p runner --bin supersonic`
+
+Decision:
+
+- Rejected and reverted.
+- Do not retry value/Z paired WMMA as a simple dual-scale fusion. It reduces
+  virtual row work, but the extra paired dequant/register pressure lost about
+  `21 ms` over the 64-token filter.
+
+## Rejected Slice: Skip Final Post-FFN Counter Reset
+
+Date: 2026-06-19.
+
+Reason:
+
+- The full persistent loop performs `reset_counters_16` after each layer's
+  FFN, and the folded lm-head path then performs another `reset_counters_16`
+  before reading the final hidden state.
+- Tested skipping the post-FFN reset only for the final layer, relying on the
+  lm-head reset to publish the final hidden state and clear counters.
+
+Validation:
+
+1. Candidate checks passed before speed filtering:
+   - `cargo fmt --check`
+   - `git diff --check`
+   - `HIP_ARCH=gfx1100 cargo build --release -p runner --bin supersonic`
+   - `SUPERSONIC_QWEN36_MULTILAYER_ORACLE_JSON=/tmp/qwen36_ml_direct_mid_check.json HIP_ARCH=gfx1100 cargo test --release -p runner --test qwen36_moe_multilayer_parity multilayer_persistent_decode_matches_chained -- --nocapture`
+   - persistent and segmented persistent final hidden remained exact:
+     `exact=256 max_abs=0 mean_abs=0 cos_sim=1`.
+2. 1x64 filter:
+   - Artifact:
+     `target/qwen36_35b_a3b_raw_script_1x64_skip_final_postffn_reset.json`
+   - Result: mean `61.349693251533736 tok/s`, weighted
+     `61.30268199233716 tok/s`, total decode `1044 ms`, stopped early `0`.
+   - Comparable current keeper artifact:
+     `target/qwen36_35b_a3b_raw_script_1x64_fullattn_q_gate_pair_wmma.json`
+     at mean `64.51612903225806 tok/s`, weighted `64.45115810674723 tok/s`,
+     total decode `993 ms`.
+   - Generated-token hash matched the keeper:
+     `ee96d4ba3ccc01df68bed07b652eb1d37277bdafc224c5628c62c3055fe9e5ed`.
+3. After rejection, the unconditional post-FFN reset was restored. Restored
+   checks passed:
+   - `cargo fmt --check`
+   - `git diff --check`
+   - `HIP_ARCH=gfx1100 cargo build --release -p runner --bin supersonic`
+
+Decision:
+
+- Rejected and reverted.
+- Even though the ordering was exact, removing this final reset hurt the
+  scheduler/timing path by `51 ms` over the 64-token filter. Keep the
+  unconditional post-FFN reset.
+
+## Rejected Slice: Linear Recurrent Update/Output Fusion
+
+Date: 2026-06-19.
+
+Reason:
+
+- Linear-attention Phase G updated the recurrent state matrix in one full pass
+  and then immediately reread the updated matrix for the q-scaled recurrent
+  output reduction.
+- Tested fusing the state update into the per-column reduction: each wave lane
+  computed the same F32 `new_state`, optionally wrote it when `mutate_state`
+  was true, and used it immediately for `recurrent_out`.
+
+Validation:
+
+1. Candidate checks passed before speed filtering:
+   - `cargo fmt --check`
+   - `git diff --check`
+   - `HIP_ARCH=gfx1100 cargo build --release -p runner --bin supersonic`
+   - `SUPERSONIC_QWEN36_MULTILAYER_ORACLE_JSON=/tmp/qwen36_ml_direct_mid_check.json HIP_ARCH=gfx1100 cargo test --release -p runner --test qwen36_moe_multilayer_parity multilayer_persistent_decode_matches_chained -- --nocapture`
+   - persistent and segmented persistent final hidden remained exact:
+     `exact=256 max_abs=0 mean_abs=0 cos_sim=1`.
+2. 1x64 filter:
+   - Artifact:
+     `target/qwen36_35b_a3b_raw_script_1x64_linear_recurrent_fused_update_out.json`
+   - Result: mean `60.24096385542168 tok/s`, weighted
+     `60.093896713615024 tok/s`, total decode `1065 ms`, stopped early `0`.
+   - Comparable current keeper artifact:
+     `target/qwen36_35b_a3b_raw_script_1x64_fullattn_q_gate_pair_wmma.json`
+     at mean `64.51612903225806 tok/s`, weighted `64.45115810674723 tok/s`,
+     total decode `993 ms`.
+   - Generated-token hash matched the keeper:
+     `ee96d4ba3ccc01df68bed07b652eb1d37277bdafc224c5628c62c3055fe9e5ed`.
+3. After rejection, the two-pass recurrent update/reduction path was restored.
+   Restored checks passed:
+   - `cargo fmt --check`
+   - `git diff --check`
+   - `HIP_ARCH=gfx1100 cargo build --release -p runner --bin supersonic`
+
+Decision:
+
+- Rejected and reverted.
+- Do not retry simple Step 4/5 fusion for linear recurrent state. Despite
+  exact output, the wave-level fused loop lost `72 ms` over the 64-token
+  filter, likely from worse store/reduction scheduling.
+
+## Rejected Slice: Full-Attention K/V Paired WMMA
+
+Date: 2026-06-19.
+
+Reason:
+
+- The current full-attention Phase D production INT4 path already combines K
+  and V into one WMMA work pool over `2 * Hkv * d` virtual rows, avoiding the
+  internal K-to-V counter reset while keeping enough 128-row work tiles live.
+- Tested pairing K and V for the same `Hkv * d` row: each wave packed the
+  normalized activation once and fed separate K/V INT4 sidecars into two WMMA
+  accumulators through a temporary dual-scale paired helper.
+
+Validation:
+
+1. Candidate checks passed before speed filtering:
+   - `cargo fmt --check`
+   - `git diff --check`
+   - `HIP_ARCH=gfx1100 cargo build --release -p runner --bin supersonic`
+   - `SUPERSONIC_QWEN36_MULTILAYER_ORACLE_JSON=/tmp/qwen36_ml_direct_mid_check.json HIP_ARCH=gfx1100 cargo test --release -p runner --test qwen36_moe_multilayer_parity multilayer_persistent_decode_matches_chained -- --nocapture`
+   - persistent and segmented persistent final hidden remained exact:
+     `exact=256 max_abs=0 mean_abs=0 cos_sim=1`.
+2. 1x64 filter:
+   - Artifact:
+     `target/qwen36_35b_a3b_raw_script_1x64_fullattn_kv_pair_wmma.json`
+   - Result: mean `60.97560975609757 tok/s`, weighted
+     `60.836501901140686 tok/s`, total decode `1052 ms`, stopped early
+     `0`.
+   - Comparable current keeper artifact:
+     `target/qwen36_35b_a3b_raw_script_1x64_fullattn_q_gate_pair_wmma.json`
+     at mean `64.51612903225806 tok/s`, weighted `64.45115810674723 tok/s`,
+     total decode `993 ms`.
+   - Generated-token hash matched the keeper:
+     `ee96d4ba3ccc01df68bed07b652eb1d37277bdafc224c5628c62c3055fe9e5ed`.
+3. After rejection, the temporary dual-scale helper and paired K/V branch were
+   reverted. Restored checks passed:
+   - `cargo fmt --check`
+   - `git diff --check`
+   - `HIP_ARCH=gfx1100 cargo build --release -p runner --bin supersonic`
+
+Decision:
+
+- Rejected and reverted.
+- Do not retry simple full-attention K/V paired WMMA. Although outputs were
+  exact, halving the virtual work rows and adding the paired dequant/register
+  pressure lost `59 ms` over the 64-token filter.
+
+## Rejected Slice: Linear-Attention Q/K Paired WMMA
+
+Date: 2026-06-19.
+
+Reason:
+
+- Linear-attention Phase B stores Q then K rows in the same `in_proj_qkv`
+  INT4 slab with the same sidecars. The full-attention Q/gate paired WMMA
+  keeper showed that pairing adjacent logical rows can save activation packing
+  work when the row layout is favorable.
+- Tested pairing the Q/K rows for the first `key_dim` rows while leaving the
+  V rows in the existing single-row WMMA path. The candidate used the existing
+  same-sidecar paired WMMA helper and had an aligned-geometry fallback for
+  non-128-row Q/K boundaries.
+
+Validation:
+
+1. Candidate checks passed before speed filtering:
+   - `cargo fmt --check`
+   - `git diff --check`
+   - `HIP_ARCH=gfx1100 cargo build --release -p runner --bin supersonic`
+   - `SUPERSONIC_QWEN36_MULTILAYER_ORACLE_JSON=/tmp/qwen36_ml_direct_mid_check.json HIP_ARCH=gfx1100 cargo test --release -p runner --test qwen36_moe_multilayer_parity multilayer_persistent_decode_matches_chained -- --nocapture`
+   - persistent and segmented persistent final hidden remained exact:
+     `exact=256 max_abs=0 mean_abs=0 cos_sim=1`.
+2. 1x64 filter:
+   - Artifact:
+     `target/qwen36_35b_a3b_raw_script_1x64_linear_qk_pair_wmma.json`
+   - Result: mean `62.11180124223602 tok/s`, weighted
+     `62.2568093385214 tok/s`, total decode `1028 ms`, stopped early
+     `0`.
+   - Comparable current keeper artifact:
+     `target/qwen36_35b_a3b_raw_script_1x64_fullattn_q_gate_pair_wmma.json`
+     at mean `64.51612903225806 tok/s`, weighted `64.45115810674723 tok/s`,
+     total decode `993 ms`.
+   - Generated-token hash matched the keeper:
+     `ee96d4ba3ccc01df68bed07b652eb1d37277bdafc224c5628c62c3055fe9e5ed`.
+3. After rejection, the paired Q/K branch was reverted. Restored checks
+   passed:
+   - `cargo fmt --check`
+   - `git diff --check`
+   - `HIP_ARCH=gfx1100 cargo build --release -p runner --bin supersonic`
+
+Decision:
+
+- Rejected and reverted.
+- Do not retry simple linear-attention Q/K paired WMMA. It preserved ordering
+  and generated-token output, but reducing the virtual QKV row work and mixing
+  paired/single WMMA paths lost `35 ms` over the 64-token filter.
+
+## Rejected Slice: Folded LM-Head WMMA Rows-Per-Task 256
+
+Date: 2026-06-19.
+
+Reason:
+
+- The folded lm-head WMMA path was still claiming 128 vocab rows per block per
+  `atomicAdd`: 8 waves each compute one 16-row WMMA tile.
+- Tested claiming 256 vocab rows per block per `atomicAdd`, with each wave
+  computing two 16-row WMMA tiles before the block synchronizes. The goal was
+  to reduce lm-head work-queue atomic/sync overhead without changing per-row
+  math or the folded top1 tie-break behavior.
+
+Validation:
+
+1. Candidate checks passed before speed filtering:
+   - `cargo fmt --check`
+   - `git diff --check`
+   - `HIP_ARCH=gfx1100 cargo build --release -p runner --bin supersonic`
+   - `SUPERSONIC_QWEN36_MULTILAYER_ORACLE_JSON=/tmp/qwen36_ml_direct_mid_check.json HIP_ARCH=gfx1100 cargo test --release -p runner --test qwen36_moe_multilayer_parity multilayer_persistent_decode_matches_chained -- --nocapture`
+   - persistent and segmented persistent final hidden remained exact:
+     `exact=256 max_abs=0 mean_abs=0 cos_sim=1`.
+2. 1x64 filter:
+   - Artifact:
+     `target/qwen36_35b_a3b_raw_script_1x64_lmhead_rows256.json`
+   - Result: script displayed `61.73 tok/s`; structured weighted throughput
+     from the JSON rows was `61.53846153846153 tok/s`, total decode `1040 ms`,
+     stopped early `0`.
+   - Comparable current keeper artifact:
+     `target/qwen36_35b_a3b_raw_script_1x64_fullattn_q_gate_pair_wmma.json`
+     at weighted `64.45115810674723 tok/s`, total decode `993 ms`.
+   - Generated-token hash matched the keeper:
+     `ee96d4ba3ccc01df68bed07b652eb1d37277bdafc224c5628c62c3055fe9e5ed`.
+3. After rejection, the rows-per-task sweep was reverted back to 128 rows.
+   Restored checks passed:
+   - `cargo fmt --check`
+   - `git diff --check`
+   - `HIP_ARCH=gfx1100 cargo build --release -p runner --bin supersonic`
+
+Decision:
+
+- Rejected and reverted.
+- Do not retry simple folded lm-head 256-row work claims. It preserved output
+  ordering, but the extra per-claim WMMA work reduced scheduling/fairness enough
+  to lose `47 ms` over the 64-token filter.
+
+## Rejected Slice: Linear QKV/Z Combined WMMA Work Queue
+
+Date: 2026-06-19.
+
+Reason:
+
+- Current-qgate segmented profiles still attributed meaningful time to linear
+  Phase B/linear stage1. The existing linear-attention WMMA path runs
+  `in_proj_qkv` and `in_proj_z` as separate INT4 WMMA work queues with a
+  grid barrier/counter reset between them.
+- Tested a combined qkv+z work queue that did not pair rows or add a second
+  accumulator. Each wave still computed one projection row with the original
+  per-row accumulation order and selected the qkv or z scale slab per row. The
+  goal was only to remove the internal qkv-to-z barrier and reset.
+
+Validation:
+
+1. Candidate checks passed before speed filtering:
+   - `cargo fmt --check`
+   - `git diff --check`
+   - `HIP_ARCH=gfx1100 cargo build --release -p runner --bin supersonic`
+   - `SUPERSONIC_QWEN36_MULTILAYER_ORACLE_JSON=/tmp/qwen36_ml_direct_mid_check.json HIP_ARCH=gfx1100 cargo test --release -p runner --test qwen36_moe_multilayer_parity multilayer_persistent_decode_matches_chained -- --nocapture`
+   - persistent and segmented persistent final hidden remained exact:
+     `exact=256 max_abs=0 mean_abs=0 cos_sim=1`.
+2. 1x64 filter:
+   - Artifact:
+     `target/qwen36_35b_a3b_raw_script_1x64_linear_qkvz_combined_wmma.json`
+   - Result: displayed mean rounded to `64.52 tok/s`, but structured weighted
+     throughput was `64.321608040201 tok/s`, total decode `995 ms`, stopped
+     early `0`.
+   - Comparable current keeper artifact:
+     `target/qwen36_35b_a3b_raw_script_1x64_fullattn_q_gate_pair_wmma.json`
+     at weighted `64.45115810674723 tok/s`, total decode `993 ms`.
+   - Generated-token hash matched the keeper:
+     `ee96d4ba3ccc01df68bed07b652eb1d37277bdafc224c5628c62c3055fe9e5ed`.
+3. After rejection, the combined qkv/z queue was reverted back to split qkv
+   and z queues. Restored checks passed:
+   - `cargo fmt --check`
+   - `git diff --check`
+   - `HIP_ARCH=gfx1100 cargo build --release -p runner --bin supersonic`
+
+Decision:
+
+- Rejected and reverted.
+- Do not retry simple qkv/z queue combination. Removing the internal barrier
+  preserved output ordering but still lost `2 ms` on the 64-token filter,
+  likely from branch/scale-selection overhead and reduced scheduling shape.
+
+## Rejected Slice: Full-Attention Tile8 Wave-Parallel Scores
+
+Date: 2026-06-19.
+
+Reason:
+
+- The kept full-attention tiled decode path uses `attn_tile_t=8`. Each tile
+  task still computes every token score with a full-block reduction over
+  `head_dim=256`, then walks the eight token scores in order for online
+  softmax/value accumulation.
+- Tested replacing the per-token full-block reductions with one wave per token:
+  eight waves compute the eight tile scores into shared storage, then the
+  existing softmax/value loop consumes those scores in token order. The goal was
+  to remove up to eight block-wide score reductions and their synchronizations
+  per tile.
+
+Validation:
+
+1. Candidate checks passed before speed filtering:
+   - `cargo fmt --check`
+   - `git diff --check`
+   - `HIP_ARCH=gfx1100 cargo build --release -p runner --bin supersonic`
+   - `SUPERSONIC_QWEN36_MULTILAYER_ORACLE_JSON=/tmp/qwen36_ml_direct_mid_check.json HIP_ARCH=gfx1100 cargo test --release -p runner --test qwen36_moe_multilayer_parity multilayer_persistent_decode_matches_chained -- --nocapture`
+   - persistent and segmented persistent final hidden remained exact:
+     `exact=256 max_abs=0 mean_abs=0 cos_sim=1`.
+2. 1x64 filter:
+   - Artifact:
+     `target/qwen36_35b_a3b_raw_script_1x64_fullattn_tile_wave_scores.json`
+   - Result: displayed `62.11 tok/s`; structured row throughput
+     `62.11180124223602 tok/s`, total decode `1028 ms`, generated `64`,
+     stopped early `0`.
+   - Comparable current keeper artifact:
+     `target/qwen36_35b_a3b_raw_script_1x64_fullattn_q_gate_pair_wmma.json`
+     at weighted `64.45115810674723 tok/s`, total decode `993 ms`.
+   - Generated-token hash matched the keeper:
+     `ee96d4ba3ccc01df68bed07b652eb1d37277bdafc224c5628c62c3055fe9e5ed`.
+3. After rejection, the wave-score hunk was reverted back to the original
+   serial per-token full-block score reductions inside the tile8 loop.
+   Restored checks passed:
+   - `cargo fmt --check`
+   - `git diff --check`
+   - `HIP_ARCH=gfx1100 cargo build --release -p runner --bin supersonic`
+
+Decision:
+
+- Rejected and reverted.
+- Do not retry simple wave-parallel score computation inside tile8. It
+  preserved generated output but lost `35 ms` on the 64-token filter, likely
+  because each wave only covers 256 score dimensions and the added shared score
+  handoff plus lower per-score parallelism outweighs the removed block
+  reductions.
+
+## Rejected Slice: Linear Phase C Conv4 Unroll
+
+Date: 2026-06-19.
+
+Reason:
+
+- Current segmented linear profiles still show nontrivial cost outside the
+  out-projection, and 35B A3B uses `conv_kernel_dim=4` for the linear-attention
+  depthwise conv over QKV channels.
+- Tested a shape-specific Phase C fast path in
+  `kernels/qwen36_moe_persistent/linear_attn_phase.cuh` that replaced the
+  runtime `conv_in[KERNEL_MAX]` load/dot/state-shift loops with explicit
+  `c0/c1/c2/new_qkv` loads, four multiply-adds in the same order, and explicit
+  three-slot state update. The generic fallback remained for other kernel
+  sizes.
+
+Validation:
+
+1. Candidate checks passed before speed filtering:
+   - `cargo fmt --check`
+   - `git diff --check`
+   - `HIP_ARCH=gfx1100 cargo build --release -p runner --bin supersonic`
+   - `SUPERSONIC_QWEN36_MULTILAYER_ORACLE_JSON=/tmp/qwen36_ml_direct_mid_check.json HIP_ARCH=gfx1100 cargo test --release -p runner --test qwen36_moe_multilayer_parity multilayer_persistent_decode_matches_chained -- --nocapture`
+   - persistent and segmented persistent final hidden remained exact:
+     `exact=256 max_abs=0 mean_abs=0 cos_sim=1`.
+2. 1x64 filter:
+   - Artifact:
+     `target/qwen36_35b_a3b_raw_script_1x64_linear_conv4_unroll.json`
+   - Result: displayed `61.35 tok/s`; structured weighted throughput
+     `61.53846153846153 tok/s`, total decode `1040 ms`, generated `64`,
+     stopped early `0`.
+   - Comparable current keeper artifact:
+     `target/qwen36_35b_a3b_raw_script_1x64_fullattn_q_gate_pair_wmma.json`
+     at weighted `64.45115810674723 tok/s`, total decode `993 ms`.
+   - Generated-token hash matched the keeper:
+     `ee96d4ba3ccc01df68bed07b652eb1d37277bdafc224c5628c62c3055fe9e5ed`.
+3. After rejection, the conv4 fast path was reverted back to the generic
+   Phase C loop. Restored checks passed:
+   - `cargo fmt --check`
+   - `git diff --check`
+   - `HIP_ARCH=gfx1100 cargo build --release -p runner --bin supersonic`
+
+Decision:
+
+- Rejected and reverted.
+- Do not retry simple `conv_kernel_dim=4` unrolling in linear Phase C. It
+  preserved output but lost `47 ms` on the 64-token filter, likely from
+  increased register/code pressure or worse compiler scheduling versus the
+  compact loop form.
+
+## Fresh Current-QGate Segmented Profiles
+
+Date: 2026-06-19.
+
+- Refreshed segmented FFI profiles after reverting the rejected conv4 unroll,
+  so these correspond to the current q-gate keeper:
+  - `target/qwen36_35b_profile/qgate_current_1x2_ffn_stage_segmented_ffi.json`
+  - `target/qwen36_35b_profile/qgate_current_1x2_linear_stage_segmented_ffi.json`
+- FFN-stage segmented rows:
+  - full-attn-only mean `0.2724 ms`
+  - FFN stage3 `0.1726 ms`
+  - FFN stage4 `0.1709 ms`
+  - FFN stage5/full `0.1500 ms`
+  - FFN stage2 `0.0895 ms`
+  - FFN stage1 `0.0677 ms`
+  - argmax `0.3800 ms`
+- Linear-stage segmented rows:
+  - FFN-only mean `0.1870 ms`
+  - linear stage5/full `0.2257 ms`
+  - linear stage1 `0.1636 ms`
+  - linear stage4 `0.1570 ms`
+  - linear stage3 `0.1306 ms`
+  - linear stage2 `0.1277 ms`
+  - full-attn-only `0.2777 ms`
+  - argmax `0.4027 ms`
+
+Interpretation:
+
+- Use these as attribution only; segmented FFI timings perturb throughput.
+- The next best isolated target is still linear attention, especially stage5
+  and projection/state work. FFN stage5 is no longer the obvious first target
+  after the direct-mid and pair-WMMA wins.
+
+## Rejected Slice: Linear Out-Projection WMMA Tile96
+
+Date: 2026-06-19.
+
+Reason:
+
+- The kept linear Phase I out-projection uses `rows_per_task=64`, with four
+  active waves per block, after the earlier `128 -> 64` win and `32` rejection.
+- Tested the missing midpoint `rows_per_task=96`, with six active waves per
+  block. This preserves per-row WMMA math and generated output; it only changes
+  work-claim granularity and active waves.
+
+Validation:
+
+1. Candidate checks passed before speed filtering:
+   - `cargo fmt --check`
+   - `git diff --check`
+   - `HIP_ARCH=gfx1100 cargo build --release -p runner --bin supersonic`
+   - `SUPERSONIC_QWEN36_MULTILAYER_ORACLE_JSON=/tmp/qwen36_ml_direct_mid_check.json HIP_ARCH=gfx1100 cargo test --release -p runner --test qwen36_moe_multilayer_parity multilayer_persistent_decode_matches_chained -- --nocapture`
+   - persistent and segmented persistent final hidden remained exact:
+     `exact=256 max_abs=0 mean_abs=0 cos_sim=1`.
+2. 1x64 filter:
+   - Artifact:
+     `target/qwen36_35b_a3b_raw_script_1x64_linear_outproj_tile96.json`
+   - Result: displayed `60.98 tok/s`; structured weighted throughput
+     `60.95238095238095 tok/s`, total decode `1050 ms`, generated `64`,
+     stopped early `0`.
+   - Comparable current keeper artifact:
+     `target/qwen36_35b_a3b_raw_script_1x64_fullattn_q_gate_pair_wmma.json`
+     at weighted `64.45115810674723 tok/s`, total decode `993 ms`.
+   - Generated-token hash matched the keeper:
+     `ee96d4ba3ccc01df68bed07b652eb1d37277bdafc224c5628c62c3055fe9e5ed`.
+3. After rejection, the work tile was reverted back to `rows_per_task=64`.
+   Restored checks passed:
+   - `cargo fmt --check`
+   - `git diff --check`
+   - `HIP_ARCH=gfx1100 cargo build --release -p runner --bin supersonic`
+
+Decision:
+
+- Rejected and reverted.
+- Do not retry intermediate linear out-projection row tiles by simple
+  `rows_per_task` adjustment. `64` remains the best tested shape; `96` lost
+  `57 ms` on the 64-token filter and `32` was already rejected.
+
+## Rejected Slice: Linear Reduction Zero-Lane Skip
+
+Date: 2026-06-19.
+
+Reason:
+
+- Linear Phase D and Phase H reduce live dimensions of `128` with a
+  `block_size=256` scratch array. The attempted optimization skipped the first
+  `s=128` reduction step, because lanes `128..255` appear to contribute zero
+  partials for these reductions.
+- This was intended to preserve summation over the nonzero lanes while saving
+  one reduction add and barrier per norm reduction.
+
+Validation:
+
+1. Candidate pre-checks passed:
+   - `cargo fmt --check`
+   - `git diff --check`
+   - `HIP_ARCH=gfx1100 cargo build --release -p runner --bin supersonic`
+2. Exact multilayer parity failed:
+   - Command:
+     `SUPERSONIC_QWEN36_MULTILAYER_ORACLE_JSON=/tmp/qwen36_ml_direct_mid_check.json HIP_ARCH=gfx1100 cargo test --release -p runner --test qwen36_moe_multilayer_parity multilayer_persistent_decode_matches_chained -- --nocapture`
+   - Result:
+     `[parity persistent vs chained final_hidden] n=256 exact=0 max_abs=3.36250e1 mean_abs=8.62972e0 cos_sim=0.0260963`
+   - Failure threshold: `max_abs 33.625 exceeds tolerance 0.001`.
+3. After rejection, the two reduction loops were restored to
+   `for (int s = block_size / 2; s > 0; s >>= 1)`.
+   Restored checks passed:
+   - `cargo fmt --check`
+   - `git diff --check`
+   - `HIP_ARCH=gfx1100 cargo build --release -p runner --bin supersonic`
+
+Decision:
+
+- Rejected and reverted before any speed benchmark.
+- Do not retry simple zero-lane skipping in these linear reductions. The
+  apparently zero upper lanes are part of the existing exact behavior, likely
+  because the full `block_size/2` tree also controls synchronization and stale
+  shared-scratch visibility in a way the chained parity test catches.
+
+## Rejected Slice: Router Top-K Shared Probability Buffer
+
+Date: 2026-06-19.
+
+Reason:
+
+- FFN Phase C computes router probabilities, then runs `top_k=8` argmax
+  reductions over `num_experts=256`, masking the winning probability in
+  `workspace[OFF_ROUTER_PROBS]` after each iteration.
+- Tested keeping the 256 BF16-rounded probabilities in `shared_scratch` for
+  the top-k loop and masking that shared buffer instead. This preserved the
+  existing value/index reduction tree and top-k tie-break rule, while avoiding
+  repeated global scratch reads/writes during top-k selection.
+
+Validation:
+
+1. Candidate checks passed before speed filtering:
+   - `cargo fmt --check`
+   - `git diff --check`
+   - `HIP_ARCH=gfx1100 cargo build --release -p runner --bin supersonic`
+   - `SUPERSONIC_QWEN36_MULTILAYER_ORACLE_JSON=/tmp/qwen36_ml_direct_mid_check.json HIP_ARCH=gfx1100 cargo test --release -p runner --test qwen36_moe_multilayer_parity multilayer_persistent_decode_matches_chained -- --nocapture`
+   - persistent and segmented persistent final hidden remained exact:
+     `exact=256 max_abs=0 mean_abs=0 cos_sim=1`.
+2. 1x64 filter:
+   - Artifact:
+     `target/qwen36_35b_a3b_raw_script_1x64_router_topk_shared.json`
+   - Result: displayed `60.98 tok/s`; structured weighted throughput
+     `61.06870229007633 tok/s`, total decode `1048 ms`, generated `64`,
+     stopped early `0`.
+   - Comparable current keeper artifact:
+     `target/qwen36_35b_a3b_raw_script_1x64_fullattn_q_gate_pair_wmma.json`
+     at weighted `64.45115810674723 tok/s`, total decode `993 ms`.
+   - Generated-token hash matched the keeper:
+     `ee96d4ba3ccc01df68bed07b652eb1d37277bdafc224c5628c62c3055fe9e5ed`.
+3. After rejection, the router top-k loop was restored to the global
+   `OFF_ROUTER_PROBS` masking shape. Restored checks passed:
+   - `cargo fmt --check`
+   - `git diff --check`
+   - `HIP_ARCH=gfx1100 cargo build --release -p runner --bin supersonic`
+
+Decision:
+
+- Rejected and reverted.
+- Do not retry this shared-probability top-k buffering shape. The saved
+  global scratch traffic is tiny relative to the added shared-memory pressure
+  and synchronization shape, and it lost `55 ms` on the 64-token filter.
+
+## Rejected Slice: Folded LM-Head WMMA Tail-Sync Removal
+
+Date: 2026-06-19.
+
+Reason:
+
+- The folded persistent lm-head WMMA work-stealing loop ended each claimed
+  128-row vocab tile with `__syncthreads()` after per-wave logit/top1 updates.
+- Tested removing that tail barrier because the next loop iteration begins with
+  a row-claim atomic and another `__syncthreads()`. The work tile, WMMA math,
+  BF16 rounding, and top1 reduction were unchanged.
+
+Validation:
+
+1. Candidate checks passed before speed filtering:
+   - `cargo fmt --check`
+   - `git diff --check`
+   - `HIP_ARCH=gfx1100 cargo build --release -p runner --bin supersonic`
+   - `SUPERSONIC_QWEN36_MULTILAYER_ORACLE_JSON=/tmp/qwen36_ml_direct_mid_check.json HIP_ARCH=gfx1100 cargo test --release -p runner --test qwen36_moe_multilayer_parity multilayer_persistent_decode_matches_chained -- --nocapture`
+   - persistent and segmented persistent final hidden remained exact:
+     `exact=256 max_abs=0 mean_abs=0 cos_sim=1`.
+2. 1x64 filter:
+   - Artifact:
+     `target/qwen36_35b_a3b_raw_script_1x64_lmhead_no_tail_sync.json`
+   - Result: displayed `61.35 tok/s`; structured weighted throughput
+     `61.185468451242826 tok/s`, total decode `1046 ms`, generated `64`,
+     stopped early `0`.
+   - Comparable current keeper artifact:
+     `target/qwen36_35b_a3b_raw_script_1x64_fullattn_q_gate_pair_wmma.json`
+     at weighted `64.45115810674723 tok/s`, total decode `993 ms`.
+   - Generated-token hash matched the keeper:
+     `ee96d4ba3ccc01df68bed07b652eb1d37277bdafc224c5628c62c3055fe9e5ed`.
+3. After rejection, the tail `__syncthreads()` was restored in the folded
+   lm-head WMMA loop.
+
+Decision:
+
+- Rejected and reverted.
+- Do not retry simple folded lm-head WMMA tail-sync removal. The barrier is
+  performance-positive for the current loop shape, likely by preserving cleaner
+  block-level scheduling/shared state before the next work claim, and removing
+  it lost `53 ms` on the 64-token filter.

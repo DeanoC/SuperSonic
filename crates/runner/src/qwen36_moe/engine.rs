@@ -16,7 +16,7 @@ use kernel_ffi::qwen36_moe::{
 use model_store::manifest::QuantProfile;
 use model_store::BakedStore;
 
-use crate::profiling::PrefillProfileScope;
+use crate::profiling::{PrefillProfileScope, Qwen36DecodeProfileScope};
 use crate::qwen36_moe_cli::bake::{ensure_qwen36_bake, select_decode_bake};
 use crate::qwen36_moe_cli::chain::{run_chain_step, Qwen36ChainStep};
 use crate::qwen36_moe_cli::decode_loop::Qwen36DecodeLoopState;
@@ -697,6 +697,7 @@ fn decode_text(
     let mut prefill_embed_elapsed = std::time::Duration::ZERO;
     let mut prefill_chain_elapsed = std::time::Duration::ZERO;
     let mut generation_wall_start = None;
+    let mut decode_profile = None;
     let mut moe_routes = MoeRouteRuntime::new(
         geom.num_layers as usize,
         geom.top_k as usize,
@@ -812,7 +813,11 @@ fn decode_text(
         }
         let is_gen_step = step + 1 >= effective_prompt_len;
         if is_gen_step && generation_wall_start.is_none() {
+            if let Some(profile) = prefill_profile.take() {
+                profile.finish()?;
+            }
             generation_wall_start = Some(std::time::Instant::now());
+            decode_profile = Some(Qwen36DecodeProfileScope::new_from_env());
         }
         // Per-step (rope, cache) pair. Dense mode: rope == cache.
         // SpecPrefill mode: rope on absolute prompt timeline, cache
@@ -924,16 +929,43 @@ fn decode_text(
         // into final_hidden_buf. The host then D2Hs `logits_buf`
         // directly. On prefill steps logits aren't needed; on the
         // chained path the explicit lm_head_launch path stays.
-        let fold = if is_gen_step {
-            Some(crate::qwen36_moe_persistent_decode::LmHeadFold {
-                final_norm_w: &final_norm_w_buf,
-                lm_head_w: &lm_head_w_buf,
-                logits_out: &mut logits_buf,
-                vocab: geom.vocab,
-            })
+        let disable_folded_lm_head =
+            std::env::var_os("SUPERSONIC_QWEN36_DISABLE_FOLDED_LM_HEAD").is_some();
+        let folded_top1_enabled = matches!(logits_buf.backend(), Backend::Metal | Backend::Hip)
+            && (sampling.temperature <= 0.0 || sampling.top_k == 1)
+            && !dump_last_logits
+            && std::env::var_os("SUPERSONIC_QWEN36_DUMP_LOGITS").is_none()
+            && std::env::var_os("SUPERSONIC_METAL_DISABLE_QWEN36_LM_HEAD_GPU_ARGMAX").is_none();
+        let fold = if is_gen_step && !disable_folded_lm_head {
+            if folded_top1_enabled {
+                Some(crate::qwen36_moe_persistent_decode::LmHeadFold {
+                    final_norm_w: &final_norm_w_buf,
+                    lm_head_w: &lm_head_w_buf,
+                    logits_out: None,
+                    top1_out: Some(&mut counter_buf),
+                    vocab: geom.vocab,
+                })
+            } else {
+                Some(crate::qwen36_moe_persistent_decode::LmHeadFold {
+                    final_norm_w: &final_norm_w_buf,
+                    lm_head_w: &lm_head_w_buf,
+                    logits_out: Some(&mut logits_buf),
+                    top1_out: None,
+                    vocab: geom.vocab,
+                })
+            }
         } else {
             None
         };
+        let final_hidden_observer_enabled = std::env::var_os("SUPERSONIC_QWEN36_DUMP_FINAL_HIDDEN")
+            .is_some()
+            || std::env::var_os("SUPERSONIC_QWEN36_FINAL_HIDDEN_TAP").is_some()
+            || std::env::var_os("SUPERSONIC_QWEN36_DOWNSTREAM_PARITY_TAP").is_some();
+        let download_final_hidden = !is_gen_step
+            || fold.is_none()
+            || final_hidden_observer_enabled
+            || emit_stage_timings
+            || mtp_buffers.is_some();
         let chain_step = run_chain_step(Qwen36ChainStep {
             ordinal,
             geom: &geom,
@@ -949,9 +981,11 @@ fn decode_text(
             is_gen_step,
             emit_stage_timings,
             fold,
+            download_final_hidden,
         })?;
         let outputs = chain_step.outputs;
         let lm_head_folded = chain_step.lm_head_folded;
+        let lm_head_folded_top1 = chain_step.lm_head_folded_top1;
         let t_chain_step = t1.elapsed();
         loop_state.position += 1;
 
@@ -977,6 +1011,7 @@ fn decode_text(
             geom: &geom,
             step,
             lm_head_folded,
+            lm_head_folded_top1,
             dump_last_logits,
             tokenizer: tokenizer.as_ref(),
             sampling,
@@ -1052,6 +1087,9 @@ fn decode_text(
 
     if let Some(profile) = prefill_profile.take() {
         profile.finish()?;
+    }
+    if let Some(profile) = decode_profile.take() {
+        profile.finish();
     }
 
     print_last_logits_if_requested(dump_last_logits, &loop_state.last_logits_bytes);

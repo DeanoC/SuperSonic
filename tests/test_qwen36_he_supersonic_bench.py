@@ -81,6 +81,88 @@ class BenchQwen36HeSuperSonicTests(unittest.TestCase):
             bench.DEFAULT_LUCEBOX_DRAFT_DIR / "dflash-draft-3.6-q4_k_m.gguf",
         )
 
+    def test_apply_target_profile_sets_qwen36_35b_a3b_defaults(self):
+        args = types.SimpleNamespace(
+            target_profile="qwen36-35b-a3b",
+            model=None,
+            model_dir=None,
+            quant=None,
+            out_json=None,
+        )
+
+        bench.apply_target_profile(args)
+
+        self.assertEqual(args.model, "qwen3.6-35b-a3b")
+        self.assertEqual(args.model_dir, bench.DEFAULT_35B_A3B_MODEL_DIR)
+        self.assertEqual(args.quant, "int4")
+        self.assertEqual(args.out_json, bench.DEFAULT_35B_A3B_OUT_JSON)
+
+    def test_apply_target_profile_preserves_explicit_args(self):
+        args = types.SimpleNamespace(
+            target_profile="qwen36-35b-a3b",
+            model="custom-model",
+            model_dir=Path("/custom/model"),
+            quant="none",
+            out_json=Path("/tmp/custom.json"),
+        )
+
+        bench.apply_target_profile(args)
+
+        self.assertEqual(args.model, "custom-model")
+        self.assertEqual(args.model_dir, Path("/custom/model"))
+        self.assertEqual(args.quant, "none")
+        self.assertEqual(args.out_json, Path("/tmp/custom.json"))
+
+    def test_lucebox_serving_mode_does_not_enable_dflash_for_35b_a3b(self):
+        args = types.SimpleNamespace(
+            target_profile="qwen36-35b-a3b",
+            prompt_source="script",
+            prompt_format="raw",
+            ignore_eos=True,
+            dflash=False,
+            dflash_draft_variant=None,
+            context_size=bench.DEFAULT_CONTEXT_SIZE,
+        )
+
+        bench.apply_lucebox_serving_mode(args)
+
+        self.assertEqual(args.prompt_source, "jsonl")
+        self.assertEqual(args.prompt_format, "chatml-no-thinking")
+        self.assertFalse(args.ignore_eos)
+        self.assertFalse(args.dflash)
+        self.assertIsNone(args.dflash_draft_variant)
+        self.assertEqual(args.context_size, bench.LUCEBOX_SERVING_CONTEXT_SIZE)
+
+    def test_build_summary_includes_token_weighted_throughput(self):
+        rows = [
+            {
+                "returncode": 0,
+                "tok_s": 25.0,
+                "generated_tokens": 10,
+                "decode_ms": 400.0,
+                "ms_per_step": 40.0,
+                "stopped_early": False,
+            },
+            {
+                "returncode": 0,
+                "tok_s": 50.0,
+                "generated_tokens": 20,
+                "decode_ms": 400.0,
+                "ms_per_step": 20.0,
+                "stopped_early": True,
+            },
+            {"returncode": 1},
+        ]
+
+        summary = bench.build_summary(rows)
+
+        self.assertEqual(summary["count"], 2)
+        self.assertEqual(summary["mean_tok_s"], 37.5)
+        self.assertEqual(summary["weighted_tok_s"], 37.5)
+        self.assertEqual(summary["total_generated_tokens"], 30)
+        self.assertEqual(summary["total_decode_ms"], 800.0)
+        self.assertEqual(summary["stopped_early_count"], 1)
+
     def test_run_one_sets_gguf_env_and_stop_on_eos_command(self):
         args = types.SimpleNamespace(
             binary=Path("target/release/supersonic"),

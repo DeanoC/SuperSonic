@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use gpu_hal::GpuBuffer;
+use gpu_hal::{Backend, GpuBuffer};
 
 use crate::qwen36_moe_types::MultiLayerGeom;
 
@@ -69,18 +69,34 @@ pub(crate) fn launch_lm_head_top1_from_final_hidden_bytes(
         buffers.counter,
     )
     .context("gpu lm_head launch")?;
-    launch_top1_from_logits(geom, buffers.logits, buffers.counter)
+    launch_top1_from_logits(ordinal, geom, buffers.logits, buffers.counter)
 }
 
 pub(crate) fn launch_top1_from_logits(
+    ordinal: usize,
     geom: &MultiLayerGeom,
     logits: &GpuBuffer,
     out_index: &mut GpuBuffer,
 ) -> Result<u32> {
-    kernel_ffi::metal_argmax_bf16_into(logits, out_index, geom.vocab as usize)
-        .context("metal argmax over lm_head logits")?;
-    if kernel_ffi::prefill_ffi::metal_batch_is_active() {
-        kernel_ffi::prefill_ffi::flush_metal_batch().context("flush metal argmax batch")?;
+    match logits.backend() {
+        Backend::Metal => {
+            kernel_ffi::metal_argmax_bf16_into(logits, out_index, geom.vocab as usize)
+                .context("metal argmax over lm_head logits")?;
+            if kernel_ffi::prefill_ffi::metal_batch_is_active() {
+                kernel_ffi::prefill_ffi::flush_metal_batch().context("flush metal argmax batch")?;
+            }
+        }
+        Backend::Hip => {
+            kernel_ffi::prefill_ffi::argmax_bf16_rows(
+                ordinal,
+                1,
+                geom.vocab as usize,
+                logits,
+                out_index,
+            )
+            .context("HIP argmax over lm_head logits")?;
+        }
+        other => anyhow::bail!("GPU argmax over lm_head logits is not available for {other:?}"),
     }
     let bytes = out_index
         .to_host_bytes()

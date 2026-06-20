@@ -1113,6 +1113,7 @@ extern "C" int qwen36_moe_hip_persistent_decode_launch(
     const void*   final_norm_w,           // [hidden] BF16, nullable
     const void*   lm_head_w,              // [vocab, hidden] BF16, nullable
     void*         logits_out,             // [vocab] BF16, nullable
+    unsigned int* top1_out,               // [1] U32, nullable
     unsigned int* counters,
     unsigned int* barrier_counter,
     unsigned int* barrier_flag) {
@@ -1125,7 +1126,7 @@ extern "C" int qwen36_moe_hip_persistent_decode_launch(
     // caller downloads `hidden_ping` for the result.
     if (layers == nullptr) return 133;
     if (hidden <= 0 || num_experts <= 0 || top_k <= 0) return 134;
-    if (mode < 0 || mode > 2) return 140;
+    if (mode < 0 || mode > 13) return 140;
     if (start_layer < 0 || start_layer >= num_layers) return 141;
     if (mode == 0) {
         if (end_layer_exclusive <= start_layer ||
@@ -1133,9 +1134,10 @@ extern "C" int qwen36_moe_hip_persistent_decode_launch(
             return 142;
         }
     } else {
-        // Router-only and FFN-only are single-layer segmented sparse-VMM
-        // entry points. The host remaps between the two launches, so folded
-        // lm_head is intentionally available only to the full-step mode.
+        // Router-only, attention-only, FFN-only, and FFN staged-profile
+        // modes are single-layer segmented sparse-VMM/profile entry points.
+        // The host may remap between launches, so folded lm_head is
+        // intentionally available only to the full-step mode.
         end_layer_exclusive = start_layer + 1;
     }
     // FFN's concurrent-experts dispatch uses counters[group_id] for Phase G
@@ -1162,9 +1164,11 @@ extern "C" int qwen36_moe_hip_persistent_decode_launch(
     // Mixed state would silently skip lm_head while pretending to do
     // it — reject up front so the caller catches the misuse.
     const bool lm_head_on = (final_norm_w != nullptr) || (lm_head_w != nullptr) ||
-                            (logits_out != nullptr) || (vocab > 0);
+                            (logits_out != nullptr) || (top1_out != nullptr) ||
+                            (vocab > 0);
     const bool lm_head_complete = (final_norm_w != nullptr) && (lm_head_w != nullptr) &&
-                                  (logits_out != nullptr) && (vocab > 0);
+                                  ((logits_out != nullptr) || (top1_out != nullptr)) &&
+                                  (vocab > 0);
     if (lm_head_on && !lm_head_complete) return 139;
     if (lm_head_on && (mode != 0 || end_layer_exclusive != num_layers)) return 143;
     if (token_ids != nullptr && lm_head_on) return 149;
@@ -1257,7 +1261,10 @@ extern "C" int qwen36_moe_hip_persistent_decode_launch(
     // would force BF16-only models onto the scalar lm_head fallback
     // even on WMMA-capable hardware (Codex P1 review on PR #140), so
     // the gate now asks only "is the device WMMA-capable".
+    const bool disable_wmma =
+        std::getenv("SUPERSONIC_QWEN36_DISABLE_PERSISTENT_WMMA") != nullptr;
     const bool use_wmma =
+        !disable_wmma &&
         device_supports_wmma_bf16(static_cast<int>(device_ordinal));
 
     if (use_wmma) {
@@ -1280,6 +1287,7 @@ extern "C" int qwen36_moe_hip_persistent_decode_launch(
             static_cast<const hip_bfloat16*>(final_norm_w),
             static_cast<const hip_bfloat16*>(lm_head_w),
             static_cast<hip_bfloat16*>(logits_out),
+            top1_out,
             counters, barrier_counter, barrier_flag);
     } else {
         hipLaunchKernelGGL(
@@ -1301,6 +1309,7 @@ extern "C" int qwen36_moe_hip_persistent_decode_launch(
             static_cast<const hip_bfloat16*>(final_norm_w),
             static_cast<const hip_bfloat16*>(lm_head_w),
             static_cast<hip_bfloat16*>(logits_out),
+            top1_out,
             counters, barrier_counter, barrier_flag);
     }
 

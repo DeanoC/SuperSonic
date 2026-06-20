@@ -35,11 +35,13 @@ pub(crate) struct Qwen36ChainStep<'a> {
     pub(crate) is_gen_step: bool,
     pub(crate) emit_stage_timings: bool,
     pub(crate) fold: Option<LmHeadFold<'a>>,
+    pub(crate) download_final_hidden: bool,
 }
 
 pub(crate) struct Qwen36ChainStepOutput {
     pub(crate) outputs: DecodeOutputs,
     pub(crate) lm_head_folded: bool,
+    pub(crate) lm_head_folded_top1: bool,
 }
 
 pub(crate) fn run_chain_step(mut args: Qwen36ChainStep<'_>) -> Result<Qwen36ChainStepOutput> {
@@ -56,6 +58,7 @@ pub(crate) fn run_chain_step(mut args: Qwen36ChainStep<'_>) -> Result<Qwen36Chai
     let cache = args.position.cache;
 
     let mut lm_head_folded = false;
+    let mut lm_head_folded_top1 = false;
     let outputs = if let Some(scratch) = args.persistent_scratch.as_deref_mut() {
         // Persistent kernel takes (rope, cache) directly. The
         // megakernel's full-attn phase consumes cache_pos via
@@ -104,15 +107,38 @@ pub(crate) fn run_chain_step(mut args: Qwen36ChainStep<'_>) -> Result<Qwen36Chai
                     )
                 })?
         } else {
-            lm_head_folded = args.fold.is_some();
-            scratch
-                .run(args.ordinal, args.initial_hidden, rope, cache, args.fold)
-                .with_context(|| {
-                    format!(
-                        "persistent decode (step {}, rope {}, cache {})",
-                        args.step, rope, cache
+            if std::env::var_os("SUPERSONIC_QWEN36_SEGMENTED_PROFILE").is_some() {
+                drop(args.fold);
+                scratch
+                    .run_segmented_profile(args.ordinal, args.initial_hidden, rope, cache)
+                    .with_context(|| {
+                        format!(
+                            "persistent segmented profile decode (step {}, rope {}, cache {})",
+                            args.step, rope, cache
+                        )
+                    })?
+            } else {
+                lm_head_folded = args.fold.is_some();
+                lm_head_folded_top1 = args
+                    .fold
+                    .as_ref()
+                    .is_some_and(|fold| fold.top1_out.is_some());
+                scratch
+                    .run(
+                        args.ordinal,
+                        args.initial_hidden,
+                        rope,
+                        cache,
+                        args.fold,
+                        args.download_final_hidden,
                     )
-                })?
+                    .with_context(|| {
+                        format!(
+                            "persistent decode (step {}, rope {}, cache {})",
+                            args.step, rope, cache
+                        )
+                    })?
+            }
         }
     } else {
         // Chained fallback for when the persistent megakernel isn't
@@ -236,5 +262,6 @@ pub(crate) fn run_chain_step(mut args: Qwen36ChainStep<'_>) -> Result<Qwen36Chai
     Ok(Qwen36ChainStepOutput {
         outputs,
         lm_head_folded,
+        lm_head_folded_top1,
     })
 }
