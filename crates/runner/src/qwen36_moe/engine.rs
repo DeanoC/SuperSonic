@@ -813,6 +813,9 @@ fn decode_text(
         }
         let is_gen_step = step + 1 >= effective_prompt_len;
         if is_gen_step && generation_wall_start.is_none() {
+            if let Some(profile) = prefill_profile.take() {
+                profile.finish()?;
+            }
             generation_wall_start = Some(std::time::Instant::now());
             decode_profile = Some(Qwen36DecodeProfileScope::new_from_env());
         }
@@ -961,6 +964,7 @@ fn decode_text(
         let download_final_hidden = !is_gen_step
             || fold.is_none()
             || final_hidden_observer_enabled
+            || emit_stage_timings
             || mtp_buffers.is_some();
         let chain_step = run_chain_step(Qwen36ChainStep {
             ordinal,
