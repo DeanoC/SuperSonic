@@ -185,7 +185,7 @@ weight load. Qwen3.6-MoE only.
 
 Flags: governed by `--qwen36-moe-prefetch-policy <name>` and a few
 `--qwen36-moe-*` tuning flags. See
-[qwen36-moe-plan.md](qwen36-moe-plan.md).
+[plans/qwen36-moe-plan.md](plans/qwen36-moe-plan.md).
 
 Support:
 

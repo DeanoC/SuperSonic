@@ -402,8 +402,8 @@ only if the report explains the new bottleneck and updates the next track.
 
 ## References
 
-- SuperSonic DFlash reference: [dflash.md](dflash.md)
-- SuperSonic performance headline table: [performance.md](performance.md)
+- SuperSonic DFlash reference: [dflash.md](../dflash.md)
+- SuperSonic performance headline table: [performance.md](../performance.md)
 - Lucebox local repo: `/home/deano/projects/lucebox-hub/README.md`
 - Lucebox AMD notes: `/home/deano/projects/lucebox-hub/server/README.md`
 - Lucebox gfx1100 HIP perf plan:

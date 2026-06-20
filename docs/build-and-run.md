@@ -211,7 +211,8 @@ correctness path.
 
 The current `qwen3.5-0.8b` CUDA `sm86` optimization record, benchmark progression,
 remaining gap to Lucebox, and carry-forward process for the other supported Qwen3.5
-CUDA models are tracked in [docs/qwen35-sm86-optimization.md](qwen35-sm86-optimization.md).
+CUDA models are tracked in
+[optimization/qwen35-sm86-optimization.md](optimization/qwen35-sm86-optimization.md).
 
 For a one-token Nsight Compute pass over the non-4B persistent decode kernel on
 `sm86`, use:
@@ -254,7 +255,7 @@ Current best verified result on this box for that lane is commit `5a34190`:
 That single-stream lane is for Lucebox-style native-kernel optimization work.
 `qwen3.5-4b --batch-size 2` remains the validated batched throughput lane.
 Detailed CUDA `sm86` history for both the `0.8B` and `4B` hero lanes lives in
-[docs/qwen35-sm86-optimization.md](qwen35-sm86-optimization.md).
+[optimization/qwen35-sm86-optimization.md](optimization/qwen35-sm86-optimization.md).
 
 ## Metal
 

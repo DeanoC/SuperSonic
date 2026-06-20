@@ -43,7 +43,7 @@ slices repeatedly.
 ## Microbenchmark — root cause
 
 Standalone hipcc bench
-([`tests/gfx1150/membench_l2_bypass.hip`](../tests/gfx1150/membench_l2_bypass.hip)),
+([`tests/gfx1150/membench_l2_bypass.hip`](../../tests/gfx1150/membench_l2_bypass.hip)),
 peak GPU clocks (`power_dpm_force_performance_level=high`):
 
 | test                                    | discrete | unified | ratio |
