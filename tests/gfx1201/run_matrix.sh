@@ -27,6 +27,7 @@ LUCEBOX_N_GEN="${LUCEBOX_N_GEN:-16}"
 LUCEBOX_WARMUP_NEW_TOKENS="${LUCEBOX_WARMUP_NEW_TOKENS:-4}"
 LUCEBOX_LIMIT="${LUCEBOX_LIMIT:-1}"
 LUCEBOX_OUT_JSON="${LUCEBOX_OUT_JSON:-$REPO_ROOT/target/qwen36_he_supersonic_gfx1201_smoke.json}"
+LUCEBOX_HE_JSONL="${LUCEBOX_HE_JSONL:-/home/deano/projects/lucebox-hub/harness/benchmarks/prompts/bench_he.jsonl}"
 LUCEBOX_DRAFT_DIR="${LUCEBOX_DRAFT_DIR:-/mnt/data/tmp/qwen36-27b-dflash-q8-bf16}"
 LUCEBOX_Q8_DRAFT_GGUF="${LUCEBOX_Q8_DRAFT_GGUF:-/mnt/data/lucebox-hub/models/draft/dflash-draft-3.6-q8_0.gguf}"
 
@@ -78,6 +79,7 @@ echo ""
 
 lucebox_available=0
 if [ -f "$QWEN36_27B_MODEL_DIR/config.json" ] && \
+   [ -f "$LUCEBOX_HE_JSONL" ] && \
    [ -d "$LUCEBOX_DRAFT_DIR" ] && \
    [ -f "$LUCEBOX_Q8_DRAFT_GGUF" ]; then
     lucebox_available=1
@@ -107,6 +109,7 @@ if [ "$run_lucebox" = "1" ]; then
     if [ "$lucebox_available" != "1" ]; then
         echo "ERROR: Lucebox artifacts are missing:" >&2
         echo "  QWEN36_27B_MODEL_DIR=$QWEN36_27B_MODEL_DIR" >&2
+        echo "  LUCEBOX_HE_JSONL=$LUCEBOX_HE_JSONL" >&2
         echo "  LUCEBOX_DRAFT_DIR=$LUCEBOX_DRAFT_DIR" >&2
         echo "  LUCEBOX_Q8_DRAFT_GGUF=$LUCEBOX_Q8_DRAFT_GGUF" >&2
         exit 1
@@ -117,6 +120,9 @@ if [ "$run_lucebox" = "1" ]; then
         --target-profile qwen36-27b-lucebox \
         --model-dir "$QWEN36_27B_MODEL_DIR" \
         --backend hip \
+        --prompt-source jsonl \
+        --prompt-format chatml-no-thinking \
+        --lucebox-jsonl "$LUCEBOX_HE_JSONL" \
         --dflash \
         --dflash-draft-dir "$LUCEBOX_DRAFT_DIR" \
         --dflash-draft-gguf "$LUCEBOX_Q8_DRAFT_GGUF" \
