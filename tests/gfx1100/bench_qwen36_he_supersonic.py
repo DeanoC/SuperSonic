@@ -206,6 +206,9 @@ def run_one(args: argparse.Namespace, name: str, prompt: str, warmup: bool = Fal
     ]
     if args.prompt_no_special_tokens:
         cmd.append("--prompt-no-special-tokens")
+    allow_untested_gpu = getattr(args, "allow_untested_gpu", None)
+    if allow_untested_gpu:
+        cmd.extend(["--allow-untested-gpu", allow_untested_gpu])
     if args.quant != "none":
         cmd.append(f"--{args.quant}")
     if args.ignore_eos:
@@ -341,6 +344,14 @@ def main() -> int:
     )
     parser.add_argument("--emit-stage-timings", action="store_true")
     parser.add_argument("--kv-fp8", action="store_true")
+    parser.add_argument(
+        "--allow-untested-gpu",
+        default=None,
+        help=(
+            "Forward SuperSonic's --allow-untested-gpu override, e.g. reuse "
+            "gfx1100 registry policy on a newly detected HIP arch."
+        ),
+    )
     parser.add_argument("--dflash", action="store_true")
     parser.add_argument(
         "--dflash-draft-variant",
@@ -428,6 +439,7 @@ def main() -> int:
         "dflash_draft_gguf": str(dflash_draft_gguf) if args.dflash and dflash_draft_gguf else None,
         "dflash_block": args.dflash_block if args.dflash_block else None,
         "backend": args.backend,
+        "allow_untested_gpu": args.allow_untested_gpu,
         "context_size": args.context_size,
         "n_gen": args.n_gen,
         "eos_policy": "ignore" if args.ignore_eos else "stop",

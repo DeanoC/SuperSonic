@@ -3616,11 +3616,13 @@ int matmul_rhs_transposed_tiled_device(
     return 0;
 }
 
-// Cached per-device arch flag: does this device support RDNA3 WMMA intrinsics?
-// gfx11xx (RDNA3 / RDNA3.5) supports v_wmma_f32_16x16x16_bf16; older arches
-// (gfx10, gfx9, CDNA gfx9xx) do not, and gfx12 uses a different opcode the
-// kernel isn't compiled for yet. Env var SUPERSONIC_QWEN4B_DISABLE_WMMA=1
-// forces the scalar path for debugging / perf comparison.
+// Cached per-device arch flag: does this device support the validated RDNA WMMA
+// path? gfx11xx (RDNA3 / RDNA3.5) supports the original wave32 BF16/i8 layout.
+// gfx12xx (RDNA4) uses the new `_gfx12` operand layout, adapted in
+// full_attention_4b.hip.
+//
+// Env var SUPERSONIC_QWEN4B_DISABLE_WMMA=1 forces the scalar path for debugging
+// / perf comparison.
 //
 // `supersonic-serve` can call this concurrently from multiple request threads,
 // so initialization goes through `std::call_once` — plain non-atomic writes
@@ -3638,8 +3640,12 @@ static bool device_supports_wmma_bf16(int device_ordinal) {
         hipDeviceProp_t props;
         if (hipGetDeviceProperties(&props, ordinal) != hipSuccess) return false;
         const char* arch = props.gcnArchName;
-        return arch && arch[0] == 'g' && arch[1] == 'f' && arch[2] == 'x' &&
-               arch[3] == '1' && arch[4] == '1';
+        if (!arch || arch[0] != 'g' || arch[1] != 'f' || arch[2] != 'x' ||
+            arch[3] != '1') {
+            return false;
+        }
+        if (arch[4] == '1') return true;
+        return arch[4] == '2';
     };
 
     if (device_ordinal < 0 || device_ordinal >= 16) {
@@ -3657,11 +3663,29 @@ static bool device_supports_wmma_bf16(int device_ordinal) {
 }
 
 static bool device_supports_wmma_i8(int device_ordinal) {
-    // Keep i8 WMMA aligned with the same runtime gfx11 arch probe used by the
-    // BF16 WMMA paths. Host-side `__gfx1100__` style macros are not a reliable
-    // guard for this bridge function even when the HIP device code is built for
-    // gfx1100.
-    return device_supports_wmma_bf16(device_ordinal);
+    // gfx12 i8 WMMA drops the gfx11 operand replication and uses a narrower
+    // packed A/B operand. The device code adapts the existing four-word packed
+    // fragments to the gfx12 two-word form.
+    if (!device_supports_wmma_bf16(device_ordinal)) return false;
+
+    auto probe_arch = [](int ordinal) -> bool {
+        hipDeviceProp_t props;
+        if (hipGetDeviceProperties(&props, ordinal) != hipSuccess) return false;
+        const char* arch = props.gcnArchName;
+        return arch && arch[0] == 'g' && arch[1] == 'f' && arch[2] == 'x' &&
+               arch[3] == '1' && (arch[4] == '1' || arch[4] == '2');
+    };
+
+    if (device_ordinal < 0 || device_ordinal >= 16) {
+        return probe_arch(device_ordinal);
+    }
+
+    static std::once_flag device_once[16];
+    static bool cached[16] = {false};
+    std::call_once(device_once[device_ordinal], [&] {
+        cached[device_ordinal] = probe_arch(device_ordinal);
+    });
+    return cached[device_ordinal];
 }
 
 static int matmul_rhs_transposed_tiled_wmma_bf16_device(

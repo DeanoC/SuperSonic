@@ -24,6 +24,11 @@ explicitly says otherwise: Qwen3.6 persistent decode, KV-FP8, VMM,
 SpecPrefill/DFlash-style speculative paths, MoE prefetch, and batching are not
 part of the Apple M5 Max feature surface today.
 
+HIP `gfx1201` is a new RDNA 4 bring-up lane. It has first-class registry/build
+support, RDNA4 BF16/i8 WMMA kernel coverage, and Qwen3.6 27B Q4KM-GPTQ/DFlash
+smokes; broader feature cells stay TBM until the `tests/gfx1201` matrix
+promotes them with per-model validation.
+
 ## How to read
 
 - **✅** = validated end-to-end (parity test or oracle agreement).
@@ -66,17 +71,17 @@ Support:
 The `sm86` CUDA column also applies to `sm90` unless a per-arch note says
 otherwise; the current H100 path is an inherited CUDA compatibility lane.
 
-| Model            | gfx1100 | gfx1150 | gfx942 | sm86  | apple-m4 |
-|------------------|:-------:|:-------:|:------:|:-----:|:--------:|
-| qwen3.5-0.8b     |    ✅   |   ✅    |  ✅¹  |  ✅   |    —     |
-| qwen3.5-2b       |    ✅   |   ✅    |  ✅¹  |  ✅   |    —     |
-| qwen3.5-4b       |    ✅   |   ✅    |  ✅¹  |  ✅   |    —     |
-| qwen3.5-9b       |    ✅   |   ✅    |  ✅¹  |  ✅   |    —     |
-| qwen3.6-35b-a3b  |   ✅⁴   |    —    |   —   |   —   |    —     |
-| gemma4-e2b       |   ✅²   |    —    |   —   |   —   |    —     |
-| gemma4-e4b       |   ✅²   |    —    |   —   |   —   |    —     |
-| phi4-mini        |    ✅   |   ✅    |  ✅²  |  ✅   |    —     |
-| llama3.1-8b      |    —    |    —    |   —   |  ✅³  |    —     |
+| Model            | gfx1100 | gfx1150 | gfx1201 | gfx942 | sm86  | apple-m4 |
+|------------------|:-------:|:-------:|:-------:|:------:|:-----:|:--------:|
+| qwen3.5-0.8b     |    ✅   |   ✅    |   TBM   |  ✅¹  |  ✅   |    —     |
+| qwen3.5-2b       |    ✅   |   ✅    |   TBM   |  ✅¹  |  ✅   |    —     |
+| qwen3.5-4b       |    ✅   |   ✅    |   TBM   |  ✅¹  |  ✅   |    —     |
+| qwen3.5-9b       |    ✅   |   ✅    |   TBM   |  ✅¹  |  ✅   |    —     |
+| qwen3.6-35b-a3b  |   ✅⁴   |    —    |    —    |   —   |   —   |    —     |
+| gemma4-e2b       |   ✅²   |    —    |    —    |   —   |   —   |    —     |
+| gemma4-e4b       |   ✅²   |    —    |    —    |   —   |   —   |    —     |
+| phi4-mini        |    ✅   |   ✅    |    —    |  ✅²  |  ✅   |    —     |
+| llama3.1-8b      |    —    |    —    |    —    |   —   |  ✅³  |    —     |
 
 ¹ gfx942 KV-FP8 uses replayed GPU prefill for the single-sequence path.
 ² Gemma 4 KV-FP8 requires `--batch-size 1`, cannot combine with `--int4`.
@@ -103,9 +108,9 @@ Support:
 The CUDA `sm86` column also applies to `sm90` for VMM: no VMM surface is
 registered for CUDA dense/Qwen3.6-MoE today.
 
-| Model            | gfx1100 | gfx1150 | gfx942 | sm86  |
-|------------------|:-------:|:-------:|:------:|:-----:|
-| qwen3.6-35b-a3b  |    ✅   |    —    |   —    |   —   |
+| Model            | gfx1100 | gfx1150 | gfx1201 | gfx942 | sm86  |
+|------------------|:-------:|:-------:|:-------:|:------:|:-----:|
+| qwen3.6-35b-a3b  |    ✅   |    —    |    —    |   —    |   —   |
 
 Other models do not enable VMM today; the dense KV allocator is
 sufficient.
@@ -139,9 +144,9 @@ Support:
 
 The CUDA `sm86` rejection also applies to `sm90`.
 
-| Target × Draft                 | gfx1100 | gfx1150 | gfx942 | sm86 |
-|--------------------------------|:-------:|:-------:|:------:|:----:|
-| qwen3.5-9b BF16 + qwen3.5-0.8b |    ✅   |   TBM   |  TBM   |  ❌¹ |
+| Target × Draft                 | gfx1100 | gfx1150 | gfx1201 | gfx942 | sm86 |
+|--------------------------------|:-------:|:-------:|:-------:|:------:|:----:|
+| qwen3.5-9b BF16 + qwen3.5-0.8b |    ✅   |   TBM   |   TBM   |  TBM   |  ❌¹ |
 
 ¹ CUDA bridge returns "not implemented" for the look-ahead and
 RoPE-indirect kernels. Validation rejects upfront.
@@ -161,12 +166,16 @@ Support:
 
 The CUDA `sm86` rejection also applies to `sm90`.
 
-| Target          | gfx1100 | gfx1150 | gfx942 | sm86 |
-|-----------------|:-------:|:-------:|:------:|:----:|
-| qwen3.5-9b INT4 |    ✅   |   ✅    |  TBM   |  ❌  |
+| Target                                      | gfx1100 | gfx1150 | gfx1201 | gfx942 | sm86 |
+|---------------------------------------------|:-------:|:-------:|:-------:|:------:|:----:|
+| qwen3.5-9b INT4                             |    ✅   |   ✅    |   TBM   |  TBM   |  ❌  |
+| qwen3.6-27b Q4KM-GPTQ + Lucebox q8_0 draft  |    ✅¹  |    —    |    ✅¹   |   —    |  ❌  |
 
 CUDA support is not currently planned; the B-block fused verify is
 HIP-megakernel-specific.
+
+¹ Qwen3.6 27B DFlash is the Lucebox comparison lane. The `gfx1201` cell is a
+  starter RDNA4 smoke, not a completed sustained-decode tuning result.
 
 ### 6. MoE expert prefetch
 
@@ -183,9 +192,9 @@ Support:
 The CUDA `sm86` column also applies to `sm90`: no CUDA MoE prefetch lane is
 registered today.
 
-| Model            | gfx1100 | gfx1150 | gfx942 | sm86 |
-|------------------|:-------:|:-------:|:------:|:----:|
-| qwen3.6-35b-a3b  |    ✅   |    —    |   —    |   —  |
+| Model            | gfx1100 | gfx1150 | gfx1201 | gfx942 | sm86 |
+|------------------|:-------:|:-------:|:-------:|:------:|:----:|
+| qwen3.6-35b-a3b  |    ✅   |    —    |    —    |   —    |   —  |
 
 ### 7. Certified KV (Llama 3.1)
 
@@ -202,9 +211,9 @@ Support:
 The CUDA `sm86` column also applies to `sm90`; H100 inherits the same
 certified-KV feature gates pending dedicated quality/performance runs.
 
-| Model        | gfx1100 | gfx1150 | gfx942 | sm86 |
-|--------------|:-------:|:-------:|:------:|:----:|
-| llama3.1-8b  |    —    |    —    |   —    |  ✅  |
+| Model        | gfx1100 | gfx1150 | gfx1201 | gfx942 | sm86 |
+|--------------|:-------:|:-------:|:-------:|:------:|:----:|
+| llama3.1-8b  |    —    |    —    |    —    |   —    |  ✅  |
 
 CUDA-only; the BF16 step-copy fallback added in PR #177 unblocks the
 non-certified BF16 component decode on HIP, but certified mode itself

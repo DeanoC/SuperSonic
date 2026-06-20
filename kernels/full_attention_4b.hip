@@ -2947,7 +2947,7 @@ __global__ void supersonic_qwen35_matmul_rhs_transposed_tiled_kernel(
 }
 
 // =============================================================================
-// RDNA3 WMMA BF16 prefill matmul (wave32, 16x16x16 f32-accumulate), tiled.
+// RDNA WMMA BF16 prefill matmul (wave32, 16x16x16 f32-accumulate), tiled.
 //
 // Computes: out[batch, m, n] = lhs[batch, m, k] × rhs[batch, n, k]^T
 //
@@ -2967,12 +2967,132 @@ __global__ void supersonic_qwen35_matmul_rhs_transposed_tiled_kernel(
     defined(__gfx1152__)
 #define SUPERSONIC_HAS_WMMA_BF16 1
 #define SUPERSONIC_HAS_WMMA_I8 1
+#define SUPERSONIC_WMMA_GFX12 0
+#elif defined(__gfx1200__) || defined(__gfx1201__)
+#define SUPERSONIC_HAS_WMMA_BF16 1
+#define SUPERSONIC_HAS_WMMA_I8 1
+#define SUPERSONIC_WMMA_GFX12 1
 #endif
 
 typedef short  supersonic_short16 __attribute__((ext_vector_type(16)));
+typedef short  supersonic_short8  __attribute__((ext_vector_type(8)));
 typedef float  supersonic_float8  __attribute__((ext_vector_type(8)));
+typedef int    supersonic_i32x2  __attribute__((ext_vector_type(2)));
 typedef int    supersonic_i32x4  __attribute__((ext_vector_type(4)));
 typedef int    supersonic_i32x8  __attribute__((ext_vector_type(8)));
+
+#ifdef SUPERSONIC_HAS_WMMA_BF16
+__device__ __forceinline__ float supersonic_shfl_float8_at(
+    supersonic_float8 values,
+    int elem,
+    int src_lane
+) {
+    float out = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const float v = __shfl(values[i], src_lane, 32);
+        if (i == elem) out = v;
+    }
+    return out;
+}
+
+__device__ __forceinline__ supersonic_float8 supersonic_wmma_bf16(
+    supersonic_short16 a,
+    supersonic_short16 b,
+    supersonic_float8 acc
+) {
+#if SUPERSONIC_WMMA_GFX12
+    const int lane = threadIdx.x & 31;
+    const int lane_col = lane & 15;
+    const int lane_group = lane >> 4;
+
+    supersonic_short8 a12;
+    supersonic_short8 b12;
+    supersonic_float8 c12;
+
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int row = lane_group * 8 + i;
+        a12[i] = a[row];
+        b12[i] = b[row];
+
+        const int old_src_lane = ((row & 1) ? 16 : 0) + lane_col;
+        c12[i] = supersonic_shfl_float8_at(acc, row >> 1, old_src_lane);
+    }
+
+    supersonic_float8 d12 =
+        __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a12, b12, c12);
+    supersonic_float8 out;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int old_row = 2 * i + lane_group;
+        const int new_src_lane = ((old_row >= 8) ? 16 : 0) + lane_col;
+        out[i] = supersonic_shfl_float8_at(d12, old_row & 7, new_src_lane);
+    }
+    return out;
+#else
+    return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, acc);
+#endif
+}
+#endif
+
+#ifdef SUPERSONIC_HAS_WMMA_I8
+__device__ __forceinline__ int supersonic_shfl_i32x8_at(
+    supersonic_i32x8 values,
+    int elem,
+    int src_lane
+) {
+    int out = 0;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int v = __shfl(values[i], src_lane, 32);
+        if (i == elem) out = v;
+    }
+    return out;
+}
+
+__device__ __forceinline__ supersonic_i32x8 supersonic_wmma_i8_iu8(
+    supersonic_i32x4 a,
+    supersonic_i32x4 b,
+    supersonic_i32x8 acc
+) {
+#if SUPERSONIC_WMMA_GFX12
+    const int lane = threadIdx.x & 31;
+    const int lane_col = lane & 15;
+    const int lane_group = lane >> 4;
+
+    supersonic_i32x2 a12;
+    supersonic_i32x2 b12;
+    supersonic_i32x8 c12;
+
+    #pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const int packed_idx = lane_group * 2 + i;
+        a12[i] = a[packed_idx];
+        b12[i] = b[packed_idx];
+    }
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int row = lane_group * 8 + i;
+        const int old_src_lane = ((row & 1) ? 16 : 0) + lane_col;
+        c12[i] = supersonic_shfl_i32x8_at(acc, row >> 1, old_src_lane);
+    }
+
+    supersonic_i32x8 d12 =
+        __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true, a12, true, b12, c12, false);
+    supersonic_i32x8 out;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int old_row = 2 * i + lane_group;
+        const int new_src_lane = ((old_row >= 8) ? 16 : 0) + lane_col;
+        out[i] = supersonic_shfl_i32x8_at(d12, old_row & 7, new_src_lane);
+    }
+    return out;
+#else
+    return __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a, true, b, acc, false);
+#endif
+}
+#endif
 
 __device__ inline uint16_t f32_to_f16_bits_rne(float x) {
     __half h = __float2half_rn(x);
@@ -3381,10 +3501,10 @@ void supersonic_qwen35_matmul_rhs_transposed_tiled_wmma_kernel(
                 b1[i] = static_cast<short>(s_rhs[b1_row * TILED_WMMA_LDS_STRIDE + k_off + i]);
             }
 
-            acc00 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a0, b0, acc00);
-            acc01 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a0, b1, acc01);
-            acc10 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a1, b0, acc10);
-            acc11 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a1, b1, acc11);
+            acc00 = supersonic_wmma_bf16(a0, b0, acc00);
+            acc01 = supersonic_wmma_bf16(a0, b1, acc01);
+            acc10 = supersonic_wmma_bf16(a1, b0, acc10);
+            acc11 = supersonic_wmma_bf16(a1, b1, acc11);
         }
         __syncthreads();
     }
@@ -3442,10 +3562,10 @@ void supersonic_qwen35_matmul_rhs_transposed_tiled_wmma_kernel(
                 b1[i] = static_cast<short>(s_rhs[b1_row * TILED_WMMA_LDS_STRIDE + k_off + i]);
             }
 
-            acc00 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a0, b0, acc00);
-            acc01 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a0, b1, acc01);
-            acc10 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a1, b0, acc10);
-            acc11 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a1, b1, acc11);
+            acc00 = supersonic_wmma_bf16(a0, b0, acc00);
+            acc01 = supersonic_wmma_bf16(a0, b1, acc01);
+            acc10 = supersonic_wmma_bf16(a1, b0, acc10);
+            acc11 = supersonic_wmma_bf16(a1, b1, acc11);
         }
     }
 
@@ -3539,7 +3659,7 @@ __global__ void supersonic_qwen35_matmul_rhs_transposed_wmma_small_m_kernel(
             #pragma unroll
             for (int i = 0; i < 16; ++i) b[i] = 0;
         }
-        acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, acc);
+        acc = supersonic_wmma_bf16(a, b, acc);
     }
 
     if (k_main != k) {
@@ -3559,7 +3679,7 @@ __global__ void supersonic_qwen35_matmul_rhs_transposed_wmma_small_m_kernel(
                 if (kc < k) b[i] = static_cast<short>(rhs_row_u16[kc]);
             }
         }
-        acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, acc);
+        acc = supersonic_wmma_bf16(a, b, acc);
     }
 
     const int out_col = tile_col + lane_row;
@@ -3875,10 +3995,10 @@ void supersonic_qwen35_matmul_fp8_dequant_wmma_kernel(
                 b1[i] = static_cast<short>(s_rhs[b1_row * TILED_WMMA_LDS_STRIDE + k_off + i]);
             }
 
-            acc00 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a0, b0, acc00);
-            acc01 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a0, b1, acc01);
-            acc10 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a1, b0, acc10);
-            acc11 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a1, b1, acc11);
+            acc00 = supersonic_wmma_bf16(a0, b0, acc00);
+            acc01 = supersonic_wmma_bf16(a0, b1, acc01);
+            acc10 = supersonic_wmma_bf16(a1, b0, acc10);
+            acc11 = supersonic_wmma_bf16(a1, b1, acc11);
         }
         __syncthreads();
     }
@@ -3943,10 +4063,10 @@ void supersonic_qwen35_matmul_fp8_dequant_wmma_kernel(
                 b1[i] = static_cast<short>(s_rhs[b1_row * TILED_WMMA_LDS_STRIDE + k_off + i]);
             }
 
-            acc00 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a0, b0, acc00);
-            acc01 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a0, b1, acc01);
-            acc10 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a1, b0, acc10);
-            acc11 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a1, b1, acc11);
+            acc00 = supersonic_wmma_bf16(a0, b0, acc00);
+            acc01 = supersonic_wmma_bf16(a0, b1, acc01);
+            acc10 = supersonic_wmma_bf16(a1, b0, acc10);
+            acc11 = supersonic_wmma_bf16(a1, b1, acc11);
         }
     }
 
@@ -4202,7 +4322,7 @@ __global__ void supersonic_qwen35_matmul_int4_dequant_wmma_small_m_kernel(
             for (int i = 0; i < 16; ++i) b[i] = 0;
         }
 
-        acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, acc);
+        acc = supersonic_wmma_bf16(a, b, acc);
     }
     if (k_main != k) {
         supersonic_short16 a = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
@@ -4251,7 +4371,7 @@ __global__ void supersonic_qwen35_matmul_int4_dequant_wmma_small_m_kernel(
                 }
             }
         }
-        acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, acc);
+        acc = supersonic_wmma_bf16(a, b, acc);
     }
 
     const int out_col = tile_col + lane_row;
@@ -4516,8 +4636,7 @@ __device__ __forceinline__ void supersonic_mmq_i8_wmma_16x4(
     supersonic_i32x8* acc = reinterpret_cast<supersonic_i32x8*>(c);
     const supersonic_i32x4* avec = reinterpret_cast<const supersonic_i32x4*>(a);
     const supersonic_i32x4* bvec = reinterpret_cast<const supersonic_i32x4*>(b);
-    acc[0] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(
-        true, avec[0], true, bvec[0], acc[0], false);
+    acc[0] = supersonic_wmma_i8_iu8(avec[0], bvec[0], acc[0]);
 #else
     (void)c; (void)a; (void)b;
 #endif
@@ -4719,7 +4838,7 @@ void supersonic_qwen35_matmul_ggml_dequant_wmma_small_m_qtype_kernel(
             for (int i = 0; i < 16; ++i) b[i] = 0;
         }
 
-        acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, acc);
+        acc = supersonic_wmma_bf16(a, b, acc);
     }
 
     if (k_main != k) {
@@ -4747,7 +4866,7 @@ void supersonic_qwen35_matmul_ggml_dequant_wmma_small_m_qtype_kernel(
                 }
             }
         }
-        acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, acc);
+        acc = supersonic_wmma_bf16(a, b, acc);
     }
 
     const int out_col = tile_col + lane_row;
@@ -4827,7 +4946,7 @@ void supersonic_qwen35_matmul_ggml_dequant_wmma_m8_qtype_kernel(
                 b[i] = static_cast<short>(bits[i]);
             }
 
-            acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, acc);
+            acc = supersonic_wmma_bf16(a, b, acc);
         }
     }
 
@@ -4899,7 +5018,7 @@ void supersonic_qwen35_matmul_ggml_dequant_wmma_m16_qtype_kernel(
                 b[i] = static_cast<short>(bits[i]);
             }
 
-            acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, acc);
+            acc = supersonic_wmma_bf16(a, b, acc);
         }
     }
 
@@ -4982,7 +5101,7 @@ void supersonic_qwen35_matmul_q6_k_m16_tile_argmax_kernel(
                 b[i] = static_cast<short>(bits[i]);
             }
 
-            acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, acc);
+            acc = supersonic_wmma_bf16(a, b, acc);
         }
     }
 
@@ -5127,7 +5246,7 @@ void supersonic_qwen35_matmul_ggml_pair_wmma_m16_qtype_kernel(
                 b[i] = static_cast<short>(bits[i]);
             }
 
-            acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, acc);
+            acc = supersonic_wmma_bf16(a, b, acc);
         }
     }
 
@@ -5202,7 +5321,7 @@ void supersonic_qwen35_matmul_ggml_pair_swiglu_wmma_m16_qtype_kernel(
             for (int i = 0; i < 16; ++i) {
                 gate_b[i] = static_cast<short>(gate_bits[i]);
             }
-            gate_acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, gate_b, gate_acc);
+            gate_acc = supersonic_wmma_bf16(a, gate_b, gate_acc);
 
             uint16_t up_bits[16];
             ggml_k_dequant_16_bf16_bits_from_block_fixed<QTYPE, TRUNC_DEQUANT>(
@@ -5212,7 +5331,7 @@ void supersonic_qwen35_matmul_ggml_pair_swiglu_wmma_m16_qtype_kernel(
             for (int i = 0; i < 16; ++i) {
                 up_b[i] = static_cast<short>(up_bits[i]);
             }
-            up_acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, up_b, up_acc);
+            up_acc = supersonic_wmma_bf16(a, up_b, up_acc);
         }
     }
 
@@ -5299,7 +5418,7 @@ __global__ void supersonic_qwen35_matmul_ggml_pair_wmma_small_m_kernel(
             for (int i = 0; i < 16; ++i) b[i] = 0;
         }
 
-        acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, acc);
+        acc = supersonic_wmma_bf16(a, b, acc);
     }
 
     if (k_main != k) {
@@ -5322,7 +5441,7 @@ __global__ void supersonic_qwen35_matmul_ggml_pair_wmma_small_m_kernel(
                 }
             }
         }
-        acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, acc);
+        acc = supersonic_wmma_bf16(a, b, acc);
     }
 
     if (out_col_idx < n_out) {
@@ -5447,7 +5566,7 @@ void supersonic_qwen35_matmul_int4_dequant_wmma_small_m_n64_kernel(
             for (int i = 0; i < 16; ++i) b[i] = 0;
         }
 
-        acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, acc);
+        acc = supersonic_wmma_bf16(a, b, acc);
         __syncthreads();
     }
 
@@ -5509,7 +5628,7 @@ void supersonic_qwen35_matmul_int4_dequant_wmma_small_m_n64_kernel(
                 }
             }
         }
-        acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, acc);
+        acc = supersonic_wmma_bf16(a, b, acc);
     }
 
     const int out_col = rhs_row_idx;
@@ -5701,10 +5820,10 @@ void supersonic_qwen35_matmul_int4_dequant_wmma_kernel(
                 b1[i] = static_cast<short>(s_rhs[b1_row * TILED_WMMA_LDS_STRIDE + k_off + i]);
             }
 
-            acc00 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a0, b0, acc00);
-            acc01 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a0, b1, acc01);
-            acc10 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a1, b0, acc10);
-            acc11 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a1, b1, acc11);
+            acc00 = supersonic_wmma_bf16(a0, b0, acc00);
+            acc01 = supersonic_wmma_bf16(a0, b1, acc01);
+            acc10 = supersonic_wmma_bf16(a1, b0, acc10);
+            acc11 = supersonic_wmma_bf16(a1, b1, acc11);
         }
         __syncthreads();
     }
@@ -5829,10 +5948,10 @@ void supersonic_qwen35_matmul_int4_dequant_wmma_kernel(
                 b1[i] = static_cast<short>(s_rhs[b1_row * TILED_WMMA_LDS_STRIDE + k_off + i]);
             }
 
-            acc00 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a0, b0, acc00);
-            acc01 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a0, b1, acc01);
-            acc10 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a1, b0, acc10);
-            acc11 = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a1, b1, acc11);
+            acc00 = supersonic_wmma_bf16(a0, b0, acc00);
+            acc01 = supersonic_wmma_bf16(a0, b1, acc01);
+            acc10 = supersonic_wmma_bf16(a1, b0, acc10);
+            acc11 = supersonic_wmma_bf16(a1, b1, acc11);
         }
     }
 

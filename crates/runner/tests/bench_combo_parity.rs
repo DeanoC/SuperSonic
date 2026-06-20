@@ -51,6 +51,7 @@ fn bench_combo_table_mentions_every_runner_supported_pair() {
         ("phi4-mini", "kv-fp8", "Gfx1100"),
         ("qwen3.6-35b-a3b", "int4", "Gfx1100"),
         ("qwen3.6-35b-a3b", "kv-fp8", "Gfx1100"),
+        ("qwen3.6-27b", "q4km-gptq", "Gfx1201"),
         ("qwen3.6-35b-a3b", "int4", "AppleM5Max"),
         ("qwen3.5-35b-a3b", "q4km-gptq", "AppleM5Max"),
         ("qwen3.5-35b-a3b", "q4km", "AppleM5Max"),

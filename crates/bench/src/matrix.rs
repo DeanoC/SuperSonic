@@ -16,6 +16,7 @@ use std::process::Command;
 pub enum BenchArch {
     Gfx1100,
     Gfx1150,
+    Gfx1201,
     Sm86,
     AppleM4,
     AppleM5Max,
@@ -26,6 +27,7 @@ impl BenchArch {
         Some(match s {
             "gfx1100" => Self::Gfx1100,
             "gfx1150" => Self::Gfx1150,
+            "gfx1201" => Self::Gfx1201,
             "sm86" => Self::Sm86,
             "apple-m4" => Self::AppleM4,
             "apple-m5-max" => Self::AppleM5Max,
@@ -36,6 +38,7 @@ impl BenchArch {
         match self {
             Self::Gfx1100 => "gfx1100",
             Self::Gfx1150 => "gfx1150",
+            Self::Gfx1201 => "gfx1201",
             Self::Sm86 => "sm86",
             Self::AppleM4 => "apple-m4",
             Self::AppleM5Max => "apple-m5-max",
@@ -44,7 +47,7 @@ impl BenchArch {
 
     pub fn backend(&self) -> Option<&'static str> {
         match self {
-            Self::Gfx1100 | Self::Gfx1150 => Some("hip"),
+            Self::Gfx1100 | Self::Gfx1150 | Self::Gfx1201 => Some("hip"),
             Self::Sm86 => Some("cuda"),
             Self::AppleM4 | Self::AppleM5Max => Some("metal"),
         }
@@ -275,6 +278,15 @@ pub static SUPPORTED_COMBOS: &[ComboDescriptor] = &[
         quant: "kv-fp8",
         arch: BenchArch::Gfx1100,
         min_vram_gib: 21.0,
+    },
+    // RDNA4 starter lane: keep this to the smoke-validated Qwen3.6 27B
+    // Q4KM-GPTQ combo until the wider Qwen3.5 gfx1201 matrix is promoted
+    // from TBM in docs/supported-matrix.md.
+    ComboDescriptor {
+        model: "qwen3.6-27b",
+        quant: "q4km-gptq",
+        arch: BenchArch::Gfx1201,
+        min_vram_gib: 10.0,
     },
     // Apple M5 Max Metal v1: Qwen3.6 INT4 chained decode only. This is the
     // main-target harness lane; persistent decode, KV-FP8, speculative decode,

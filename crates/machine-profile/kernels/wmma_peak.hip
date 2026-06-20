@@ -7,28 +7,50 @@
 // proven pattern in this repo (see gemma4.hip, qwen36_moe helpers.cuh).
 // Defined unconditionally — they're harmless on archs without wmma builtins.
 typedef _Float16 mp_half16  __attribute__((ext_vector_type(16)));
+typedef _Float16 mp_half8   __attribute__((ext_vector_type(8)));
 typedef short    mp_short16 __attribute__((ext_vector_type(16)));
+typedef short    mp_short8  __attribute__((ext_vector_type(8)));
 typedef float    mp_float8  __attribute__((ext_vector_type(8)));
 typedef int8_t   mp_i8x16   __attribute__((ext_vector_type(16)));
+typedef int32_t  mp_i32x2   __attribute__((ext_vector_type(2)));
 typedef int32_t  mp_i32x8   __attribute__((ext_vector_type(8)));
 
-// Detect wmma builtins per-dtype via clang's __has_builtin. Each --offload-arch=X
-// slice gets its own preprocessor state, so the real-vs-fallback decision is
-// taken per arch by the toolchain — no hardcoded arch list to maintain.
+// Detect wmma builtins per-dtype via clang's __has_builtin, but keep the
+// executable path matched to the generation-specific operand ABI. gfx11 uses
+// the original 256-bit A/B operands; gfx12 uses the new 128-bit `_gfx12`
+// builtins with no explicit A/B replication.
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || \
+    defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__) || \
+    defined(__gfx1152__)
+#define MP_ARCH_CAN_SELECT_WMMA 1
+#define MP_ARCH_WMMA_GFX12 0
+#elif defined(__gfx1200__) || defined(__gfx1201__)
+#define MP_ARCH_CAN_SELECT_WMMA 1
+#define MP_ARCH_WMMA_GFX12 1
+#else
+#define MP_ARCH_CAN_SELECT_WMMA 0
+#define MP_ARCH_WMMA_GFX12 0
+#endif
 
-#if defined(__has_builtin) && __has_builtin(__builtin_amdgcn_wmma_f32_16x16x16_f16_w32)
+#if MP_ARCH_CAN_SELECT_WMMA && !MP_ARCH_WMMA_GFX12 && defined(__has_builtin) && __has_builtin(__builtin_amdgcn_wmma_f32_16x16x16_f16_w32)
+#define MP_HAS_WMMA_F16 1
+#elif MP_ARCH_CAN_SELECT_WMMA && MP_ARCH_WMMA_GFX12 && defined(__has_builtin) && __has_builtin(__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12)
 #define MP_HAS_WMMA_F16 1
 #else
 #define MP_HAS_WMMA_F16 0
 #endif
 
-#if defined(__has_builtin) && __has_builtin(__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32)
+#if MP_ARCH_CAN_SELECT_WMMA && !MP_ARCH_WMMA_GFX12 && defined(__has_builtin) && __has_builtin(__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32)
+#define MP_HAS_WMMA_BF16 1
+#elif MP_ARCH_CAN_SELECT_WMMA && MP_ARCH_WMMA_GFX12 && defined(__has_builtin) && __has_builtin(__builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12)
 #define MP_HAS_WMMA_BF16 1
 #else
 #define MP_HAS_WMMA_BF16 0
 #endif
 
-#if defined(__has_builtin) && __has_builtin(__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32)
+#if MP_ARCH_CAN_SELECT_WMMA && !MP_ARCH_WMMA_GFX12 && defined(__has_builtin) && __has_builtin(__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32)
+#define MP_HAS_WMMA_I8 1
+#elif MP_ARCH_CAN_SELECT_WMMA && MP_ARCH_WMMA_GFX12 && defined(__has_builtin) && __has_builtin(__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12)
 #define MP_HAS_WMMA_I8 1
 #else
 #define MP_HAS_WMMA_I8 0
@@ -37,11 +59,20 @@ typedef int32_t  mp_i32x8   __attribute__((ext_vector_type(8)));
 #if MP_HAS_WMMA_F16
 extern "C" __global__ void mp_wmma_peak_f16_kernel(uint64_t iters, float *sink)
 {
+#if MP_ARCH_WMMA_GFX12
+    mp_half8 a = {};
+    mp_half8 b = {};
+#else
     mp_half16 a = {};
     mp_half16 b = {};
+#endif
     mp_float8 c = {};
     for (uint64_t i = 0; i < iters; ++i) {
+#if MP_ARCH_WMMA_GFX12
+        c = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, c);
+#else
         c = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
+#endif
     }
     if (threadIdx.x == 0 && c[0] < -1e30f) sink[blockIdx.x] = c[0];
 }
@@ -55,11 +86,20 @@ extern "C" __global__ void mp_wmma_peak_f16_kernel(uint64_t iters, float *sink)
 #if MP_HAS_WMMA_BF16
 extern "C" __global__ void mp_wmma_peak_bf16_kernel(uint64_t iters, float *sink)
 {
+#if MP_ARCH_WMMA_GFX12
+    mp_short8 a = {};
+    mp_short8 b = {};
+#else
     mp_short16 a = {};
     mp_short16 b = {};
+#endif
     mp_float8  c = {};
     for (uint64_t i = 0; i < iters; ++i) {
+#if MP_ARCH_WMMA_GFX12
+        c = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a, b, c);
+#else
         c = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, c);
+#endif
     }
     if (threadIdx.x == 0 && c[0] < -1e30f) sink[blockIdx.x] = c[0];
 }
@@ -73,11 +113,20 @@ extern "C" __global__ void mp_wmma_peak_bf16_kernel(uint64_t iters, float *sink)
 #if MP_HAS_WMMA_I8
 extern "C" __global__ void mp_wmma_peak_i8_kernel(uint64_t iters, int *sink)
 {
+#if MP_ARCH_WMMA_GFX12
+    mp_i32x2 a = {};
+    mp_i32x2 b = {};
+#else
     mp_i8x16 a = {};
     mp_i8x16 b = {};
+#endif
     mp_i32x8 c = {};
     for (uint64_t i = 0; i < iters; ++i) {
+#if MP_ARCH_WMMA_GFX12
+        c = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true, a, true, b, c, false);
+#else
         c = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, a, true, b, c, false);
+#endif
     }
     if (threadIdx.x == 0 && c[0] < -2000000000) sink[blockIdx.x] = c[0];
 }
