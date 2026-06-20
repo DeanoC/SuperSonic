@@ -3010,11 +3010,14 @@ __device__ __forceinline__ supersonic_float8 supersonic_wmma_bf16(
     supersonic_short8 b12;
     supersonic_float8 c12;
 
+    // gfx12 A/B fragments interleave the two 8-row halves as 0..3,8..11
+    // for lanes 0..15 and 4..7,12..15 for lanes 16..31.
     #pragma unroll
     for (int i = 0; i < 8; ++i) {
         const int row = lane_group * 8 + i;
-        a12[i] = a[row];
-        b12[i] = b[row];
+        const int ab_row = lane_group * 4 + (i & 3) + ((i >> 2) * 8);
+        a12[i] = a[ab_row];
+        b12[i] = b[ab_row];
 
         const int old_src_lane = ((row & 1) ? 16 : 0) + lane_col;
         c12[i] = supersonic_shfl_float8_at(acc, row >> 1, old_src_lane);
@@ -3065,9 +3068,10 @@ __device__ __forceinline__ supersonic_i32x8 supersonic_wmma_i8_iu8(
     supersonic_i32x2 b12;
     supersonic_i32x8 c12;
 
+    // Packed i8 uses the same A/B permutation at 4-element word granularity.
     #pragma unroll
     for (int i = 0; i < 2; ++i) {
-        const int packed_idx = lane_group * 2 + i;
+        const int packed_idx = lane_group + 2 * i;
         a12[i] = a[packed_idx];
         b12[i] = b[packed_idx];
     }
