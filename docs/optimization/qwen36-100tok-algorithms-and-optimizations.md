@@ -5,7 +5,7 @@ Last updated: 2026-06-19
 This note explains how SuperSonic reached `100 tok/s` mean throughput on the
 Lucebox-style Qwen3.6-27B DFlash benchmark on RX 7900 XTX / `gfx1100`.
 It is the readable companion to the raw working log in
-`docs/qwen36-lucebox-parity-log.md`.
+`docs/optimization/qwen36-lucebox-parity-log.md`.
 
 The headline result is:
 
@@ -355,9 +355,9 @@ HIP kernels:
 
 Benchmark and profiling history:
 
-- `docs/qwen36-lucebox-parity-log.md`
+- `docs/optimization/qwen36-lucebox-parity-log.md`
   - authoritative run log, artifacts, keep/reject decisions.
-- `docs/qwen36-lucebox-next-roofline.md`
+- `docs/optimization/qwen36-lucebox-next-roofline.md`
   - roofline/profiling setup and earlier PR #264 performance baseline.
 
 ## Validation Summary

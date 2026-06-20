@@ -4,7 +4,7 @@ This document records the current `qwen3.5-4b` CUDA `sm86` hero lane, the
 current warmed baselines captured on this machine, and the early experiments
 that were tried and intentionally not kept.
 
-It is the `4B` companion to [qwen35-sm86-optimization.md](/workspace/SuperSonic/docs/qwen35-sm86-optimization.md),
+It is the `4B` companion to [qwen35-sm86-optimization.md](qwen35-sm86-optimization.md),
 which remains the completed `0.8B` reference workflow.
 
 ## Production Throughput Lane

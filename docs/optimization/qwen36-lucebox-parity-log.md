@@ -276,7 +276,7 @@ Current exact next action:
 - Active next-performance branch: `codex/qwen36-100tok-profile2`.
 - Source on merged `main` is `c89b257 Merge pull request #264 from DeanoC/codex/qwen36-next-roofline`.
 - Source on merged `main` has `DDTREE_DEFAULT_BUDGET = 15` and `DDTREE_DEFAULT_TOP_K = 4` in `crates/runner/src/qwen35_dflash_engine.rs`.
-- New roofline report: `docs/qwen36-lucebox-next-roofline.md`.
+- New roofline report: `docs/optimization/qwen36-lucebox-next-roofline.md`.
 - Current confirmed best:
   - `target/qwen36_100tok_profile2/append_recurrent_warp32_direct_10x256.json`: mean 100.86 tok/s, weighted 99.40 tok/s, min 87.87, max 118.20, generated 1654, stopped early 10/10.
   - Repeat `target/qwen36_100tok_profile2/append_recurrent_warp32_direct_10x256_rerun.json`: mean 100.79 tok/s, weighted 99.38 tok/s, min 87.87, max 117.92, generated 1654, stopped early 10/10.
@@ -645,7 +645,7 @@ Run GPU benchmarks with escalated permissions; sandboxed runs cannot access the 
   - `crates/runner/src/qwen35_dflash_engine.rs`: tree GPU tap capture path, direct tree rollback commit wiring through the owned commit path, and `DDTREE_DEFAULT_BUDGET = 15`.
   - `kernels/full_attention_bridge.cpp`: validated RMSNorm and generic SwiGLU hard-sync removal.
   - `kernels/full_attention_bridge_4b.cpp`: validated i8 WMMA support-probe fix for Q6_K MMQ; lm-head perf follow-up rejected/no-promote.
-  - `docs/qwen36-lucebox-parity-log.md`: this durable log.
+  - `docs/optimization/qwen36-lucebox-parity-log.md`: this durable log.
 
 ## Benchmark Rules That Matter
 

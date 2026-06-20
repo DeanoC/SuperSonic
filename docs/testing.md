@@ -3,6 +3,8 @@
 End-to-end test runner, prerequisites, and notes on adding tests for a
 new machine. For unit tests run via `cargo test`, see the per-crate
 README files (`crates/runner/`, `crates/kernel-ffi/`, etc.).
+For repeatable performance, Lucebox, external-reference, and profiler commands,
+see [benchmarks.md](benchmarks.md).
 
 Tests are machine-specific — each GPU architecture has its own test script under `tests/`. A test runs the full decode pipeline with PyTorch oracle validation and checks that the output delta is below a threshold.
 
@@ -94,66 +96,11 @@ smoke when local artifacts are available. Qwen3.5 rows in
 checks for the local R9700.
 
 For Metal specifically, Apple M4 remains the small Qwen3.5 validation lane.
-Apple M5 Max is the current large-model lane: it covers Qwen3.5 BF16 smokes,
-Qwen3/Qwen3.6 MoE INT4 smokes, Gemma 4 BF16/INT4 smokes, and Phi-4 mini
-BF16/INT4/FP8-runtime smokes through the component/chained Metal paths. The
-Qwen3.6-MoE Apple M5 Max performance gate is
-`bench-perf --arch apple-m5-max --models qwen3.6-35b-a3b --quants int4`.
-For the public llama.cpp-style Qwen3.5-35B-A3B Q4_K_M comparison on M5 Max,
-run the SuperSonic Q4_K_M-sourced GPTQ/native-INT4 Metal control lane:
-
-```bash
-SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" \
-  cargo run --release -p supersonic-bench --bin bench-perf -- \
-  --preset qwen35-q4km-m5-max-gen512
-```
-
-This preset records the SuperSonic generation benchmark with a 512-token
-generation run, `--q4km-gptq`, `--context-size 1024`, one 512-token warmup, five
-measured repetitions, and no extra attribution/profile passes. SuperSonic
-currently seeds the run with the model BOS token for an empty prompt, so the
-recorded row is "1 prompt token + 512 generated".
-
-External references are measured through the adapter harness after pinning
-local engine versions in `tools/external/llama-cpp-version.txt` and
-`tools/external/mlx-lm-version.txt`. For Homebrew llama.cpp builds, the pin is
-captured from `llama-cli --version` while the measurement still runs through
-`llama-bench`. The llama.cpp adapter consumes the raw GGUF Q4_K_M file:
-
-```bash
-python3 -m oracle.bench.external.external_main \
-  --engine llama.cpp \
-  --models qwen3.5-35b-a3b \
-  --quants q4km \
-  --model-dir qwen3.5-35b-a3b=/path/to/qwen3.5-35b-a3b-q4_k_m.gguf \
-  --prompt "" \
-  --prompt-tokens 0 \
-  --context-size 1024 \
-  --max-new-tokens 512 \
-  --measurement-runs 5
-```
-
-The MLX adapter consumes a matching MLX model directory and records that
-artifact kind in the JSON cell:
-
-```bash
-python3 -m oracle.bench.external.external_main \
-  --engine mlx-lm \
-  --models qwen3.5-35b-a3b \
-  --quants q4km \
-  --model-dir qwen3.5-35b-a3b=/path/to/mlx/qwen3.5-35b-a3b-q4 \
-  --prompt "" \
-  --prompt-tokens 0 \
-  --context-size 1024 \
-  --max-new-tokens 512 \
-  --measurement-runs 5
-```
-
-Those JSON cells record the exact command, engine version, workload settings,
-samples, median `ms_per_step`, derived `tok_per_s`, and engine-specific notes
-such as llama-bench's batch defaults. Raw `--q4km` is now a staged SuperSonic
-headline Metal row after the local correctness gates and 512-token benchmark;
-keep it separate from the faster `q4km-gptq` control lane.
+Apple M5 Max is the current large-model correctness lane: it covers Qwen3.5
+BF16 smokes, Qwen3/Qwen3.6 MoE INT4 smokes, Gemma 4 BF16/INT4 smokes, and
+Phi-4 mini BF16/INT4/FP8-runtime smokes through the component/chained Metal
+paths. The corresponding benchmark and external-reference commands live in
+[benchmarks.md](benchmarks.md).
 
 To inspect a raw Q4_K_M bake before benchmarking it in SuperSonic, run the
 manifest audit. It reads `manifest.json` and `config.json` only, reports every

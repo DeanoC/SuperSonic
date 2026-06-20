@@ -155,7 +155,7 @@ see [docs/dflash.md](dflash.md).
   corpus with the kernel-accurate deterministic Python oracle. The live
   PyTorch BF16 oracle remains `10/12`, which layer replay diagnostics attribute
   to PyTorch BF16 accumulation sensitivity. See
-  [docs/phi4-cuda-parity.md](phi4-cuda-parity.md). FP8-runtime uses the
+  [docs/bringup/phi4-cuda-parity.md](bringup/phi4-cuda-parity.md). FP8-runtime uses the
   downloadable FP8-native bake and passes the PyTorch oracle on CUDA. FP8-KV
   has descriptor/kernel hooks but still needs CUDA bake/validation work.
 ³ Gemma 4 CUDA v1 is native `gemma4-e2b` BF16 only and requires

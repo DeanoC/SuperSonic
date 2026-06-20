@@ -702,7 +702,7 @@ certified-vs-dense delta `+0.015` ppl. Use:
 
 CUDA `sm86` tracks detailed kernel-level optimization history for both the
 `0.8B` and `4B` hero lanes in
-[qwen35-sm86-optimization.md](qwen35-sm86-optimization.md).
+[optimization/qwen35-sm86-optimization.md](optimization/qwen35-sm86-optimization.md).
 
 ## CUDA — `sm90` (NVIDIA H100 80GB HBM3)
 

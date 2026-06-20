@@ -40,6 +40,8 @@ to disable network fetches.
   (model, arch, quant), summarized as headline matrices.
 - **[Detailed performance](docs/detailed_performance.md)** — methodology,
   attribution tables, historical logs, and runtime-feature impact.
+- **[Benchmarks](docs/benchmarks.md)** — repeatable test, benchmark,
+  Lucebox, and profiling commands, including the Qwen3.6 27B 100 tok/s run.
 - **[Build and run](docs/build-and-run.md)** — per-backend build commands
   and the validated `supersonic` invocation set.
 - **[OpenAI-compatible server](docs/server.md)** — `supersonic-serve`
@@ -50,7 +52,7 @@ to disable network fetches.
   per-feature parity tests.
 - **[DFlash speculative decode](docs/dflash.md)** — Qwen3.5-9B INT4
   speculative decode design and milestones.
-- **[Qwen3-30B-A3B HIP bring-up](docs/qwen3-30b-a3b-hip.md)** —
+- **[Qwen3-30B-A3B HIP bring-up](docs/bringup/qwen3-30b-a3b-hip.md)** —
   separate Qwen3 MoE scaffolding and INT4 bake contract for HIP.
 - **[SpecPrefill](docs/specprefill.md)** — long-prompt TTFT optimization
   via speculator-driven sparse prefill.

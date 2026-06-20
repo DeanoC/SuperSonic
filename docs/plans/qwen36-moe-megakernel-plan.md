@@ -299,6 +299,6 @@ These resolve naturally during 3a-e — none should reshape the design.
   - `kernels/qwen36_moe.hip::qwen36_moe_descriptor_walk_stub` — existing
     skeleton with cooperative launch + grid barrier. Phase 3e replaces
     its body.
-  - `docs/qwen36-moe-pr4c-plan.md::Step 4` — the original plan note that
+  - `docs/plans/qwen36-moe-pr4c-plan.md::Step 4` — the original plan note that
     deferred this work; this doc supersedes it with a concrete
     decomposition.
