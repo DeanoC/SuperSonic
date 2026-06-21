@@ -3,6 +3,9 @@
 `kernel-lab` is a KernelBench-style harness for isolated SuperSonic kernels.
 It is intentionally in this repository because the tasks call the same
 `gpu-hal` and `kernel-ffi` launch paths as the runtime and parity tests.
+See the [repo architecture map](repo-architecture.md) and
+[consolidation roadmap](consolidation-roadmap.md) for how kernel-lab fits into
+the broader lab and validation tooling.
 
 V1 evaluates candidate worktrees. Run it once on a baseline checkout and once
 on a candidate checkout, then compare the two run directories.

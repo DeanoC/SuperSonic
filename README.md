@@ -48,8 +48,13 @@ to disable network fetches.
   endpoints and harness compatibility notes.
 - **[Producing release bakes](docs/bake-distribution.md)** — how to
   produce, sign, and publish bakes for a new model variant.
-- **[Testing](docs/testing.md)** — E2E test runner, prerequisites, and
-  per-feature parity tests.
+- **[Testing gates](docs/testing.md)** — E2E test runner, prerequisites,
+  architecture scripts, and per-feature parity tests.
+- **[Development architecture](docs/development/repo-architecture.md)** —
+  repository ownership boundaries for runner, runtime, model crates, FFI,
+  kernels, tests, and docs.
+- **[Consolidation roadmap](docs/development/consolidation-roadmap.md)** —
+  staged cleanup plan and non-breaking inventory for current tools.
 - **[DFlash speculative decode](docs/dflash.md)** — Qwen3.5-9B INT4
   speculative decode design and milestones.
 - **[Qwen3-30B-A3B HIP bring-up](docs/bringup/qwen3-30b-a3b-hip.md)** —
