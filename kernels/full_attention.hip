@@ -1864,6 +1864,9 @@ void supersonic_qwen35_delta_recurrent_prefill_capture_q8_trace_attn_bf16_transp
     const int token_stride_v = seq_len * V;
     const int token_stride_s = seq_len;
     const int state_base = bh * state_stride + v_idx;
+    const int query_key_base = bh * token_stride_k;
+    const int value_base = bh * token_stride_v;
+    const int scalar_base = bh * token_stride_s;
 
     float state0 = recurrent_state[state_base + (lane + 0 * QK8_0) * V];
     float state1 = recurrent_state[state_base + (lane + 1 * QK8_0) * V];
@@ -1871,9 +1874,9 @@ void supersonic_qwen35_delta_recurrent_prefill_capture_q8_trace_attn_bf16_transp
     float state3 = recurrent_state[state_base + (lane + 3 * QK8_0) * V];
 
     for (int t = 0; t < seq_len; ++t) {
-        const int key_row = bh * token_stride_k + t * K;
-        const int value_row = bh * token_stride_v + t * V;
-        const int beta_row = bh * token_stride_s + t;
+        const int key_row = query_key_base + t * K;
+        const int value_row = value_base + t * V;
+        const int beta_row = scalar_base + t;
         const float g_t = expf(g[beta_row]);
         const float beta_t = beta[beta_row];
         const float value_t = value[value_row + v_idx];
@@ -1887,11 +1890,10 @@ void supersonic_qwen35_delta_recurrent_prefill_capture_q8_trace_attn_bf16_transp
         state2 *= g_t;
         state3 *= g_t;
 
-        const float kv0 = supersonic_qwen35_wave_sum(state0 * k0);
-        const float kv1 = supersonic_qwen35_wave_sum(state1 * k1);
-        const float kv2 = supersonic_qwen35_wave_sum(state2 * k2);
-        const float kv3 = supersonic_qwen35_wave_sum(state3 * k3);
-        const float kv_mem = __shfl((kv0 + kv2) + (kv1 + kv3), 0);
+        const float kv_mem = __shfl(
+            supersonic_qwen35_wave_sum(
+                (state0 * k0 + state2 * k2) + (state1 * k1 + state3 * k3)),
+            0);
         const float delta = (value_t - kv_mem) * beta_t;
 
         state0 += k0 * delta;
@@ -1913,19 +1915,19 @@ void supersonic_qwen35_delta_recurrent_prefill_capture_q8_trace_attn_bf16_transp
         const float d1 = amax1 / 127.0f;
         const float d2 = amax2 / 127.0f;
         const float d3 = amax3 / 127.0f;
-        const float id0 = d0 == 0.0f ? 0.0f : 1.0f / d0;
-        const float id1 = d1 == 0.0f ? 0.0f : 1.0f / d1;
-        const float id2 = d2 == 0.0f ? 0.0f : 1.0f / d2;
-        const float id3 = d3 == 0.0f ? 0.0f : 1.0f / d3;
+        const float id0 = amax0 == 0.0f ? 0.0f : __builtin_amdgcn_rcpf(amax0) * 127.0f;
+        const float id1 = amax1 == 0.0f ? 0.0f : __builtin_amdgcn_rcpf(amax1) * 127.0f;
+        const float id2 = amax2 == 0.0f ? 0.0f : __builtin_amdgcn_rcpf(amax2) * 127.0f;
+        const float id3 = amax3 == 0.0f ? 0.0f : __builtin_amdgcn_rcpf(amax3) * 127.0f;
         const int q0 = static_cast<int>(roundf(state0 * id0));
         const int q1 = static_cast<int>(roundf(state1 * id1));
         const int q2 = static_cast<int>(roundf(state2 * id2));
         const int q3 = static_cast<int>(roundf(state3 * id3));
-        const int trace_row = (bh * seq_len + t) * V + v_idx;
-        const int row_base0 = (trace_row * (K / QK8_0) + 0) * Q8_0_BLOCK_BYTES;
-        const int row_base1 = (trace_row * (K / QK8_0) + 1) * Q8_0_BLOCK_BYTES;
-        const int row_base2 = (trace_row * (K / QK8_0) + 2) * Q8_0_BLOCK_BYTES;
-        const int row_base3 = (trace_row * (K / QK8_0) + 3) * Q8_0_BLOCK_BYTES;
+        const int row_base0 =
+            (((scalar_base + t) * V + v_idx) * (K / QK8_0)) * Q8_0_BLOCK_BYTES;
+        const int row_base1 = row_base0 + Q8_0_BLOCK_BYTES;
+        const int row_base2 = row_base1 + Q8_0_BLOCK_BYTES;
+        const int row_base3 = row_base2 + Q8_0_BLOCK_BYTES;
         if (lane == 0) {
             qwen35_store_q8_0_block_scale(state_trace + row_base0, __float2half(d0));
             qwen35_store_q8_0_block_scale(state_trace + row_base1, __float2half(d1));
@@ -1941,13 +1943,10 @@ void supersonic_qwen35_delta_recurrent_prefill_capture_q8_trace_attn_bf16_transp
         const float q1v = query[key_row + lane + 1 * QK8_0];
         const float q2v = query[key_row + lane + 2 * QK8_0];
         const float q3v = query[key_row + lane + 3 * QK8_0];
-        const float out0 = supersonic_qwen35_wave_sum(state0 * q0v);
-        const float out1 = supersonic_qwen35_wave_sum(state1 * q1v);
-        const float out2 = supersonic_qwen35_wave_sum(state2 * q2v);
-        const float out3 = supersonic_qwen35_wave_sum(state3 * q3v);
+        const float out = supersonic_qwen35_wave_sum(
+            (state0 * q0v + state2 * q2v) + (state1 * q1v + state3 * q3v));
         if (lane == 0) {
-            attn_output[(bh * seq_len + t) * V + v_idx] =
-                hip_bfloat16((out0 + out2) + (out1 + out3));
+            attn_output[(bh * seq_len + t) * V + v_idx] = hip_bfloat16(out);
         }
     }
 
@@ -2311,11 +2310,10 @@ void supersonic_qwen35_delta_recurrent_tree_prefill_capture_q8_trace_attn_bf16_t
         state2 *= g_t;
         state3 *= g_t;
 
-        const float kv0 = supersonic_qwen35_wave_sum(state0 * k0);
-        const float kv1 = supersonic_qwen35_wave_sum(state1 * k1);
-        const float kv2 = supersonic_qwen35_wave_sum(state2 * k2);
-        const float kv3 = supersonic_qwen35_wave_sum(state3 * k3);
-        const float kv_mem = __shfl((kv0 + kv2) + (kv1 + kv3), 0);
+        const float kv_mem = __shfl(
+            supersonic_qwen35_wave_sum(
+                (state0 * k0 + state2 * k2) + (state1 * k1 + state3 * k3)),
+            0);
         const float delta = (value_t - kv_mem) * beta_t;
 
         state0 += k0 * delta;
@@ -2360,19 +2358,15 @@ void supersonic_qwen35_delta_recurrent_tree_prefill_capture_q8_trace_attn_bf16_t
         state_trace[row_base1 + 2 + lane] = static_cast<uint8_t>(static_cast<int8_t>(q1));
         state_trace[row_base2 + 2 + lane] = static_cast<uint8_t>(static_cast<int8_t>(q2));
         state_trace[row_base3 + 2 + lane] = static_cast<uint8_t>(static_cast<int8_t>(q3));
-        __syncthreads();
 
         const float q0v = query[key_row + lane + 0 * QK8_0];
         const float q1v = query[key_row + lane + 1 * QK8_0];
         const float q2v = query[key_row + lane + 2 * QK8_0];
         const float q3v = query[key_row + lane + 3 * QK8_0];
-        const float out0 = supersonic_qwen35_wave_sum(state0 * q0v);
-        const float out1 = supersonic_qwen35_wave_sum(state1 * q1v);
-        const float out2 = supersonic_qwen35_wave_sum(state2 * q2v);
-        const float out3 = supersonic_qwen35_wave_sum(state3 * q3v);
+        const float out = supersonic_qwen35_wave_sum(
+            (state0 * q0v + state2 * q2v) + (state1 * q1v + state3 * q3v));
         if (lane == 0) {
-            attn_output[(bh * seq_len + t) * V + v_idx] =
-                hip_bfloat16((out0 + out2) + (out1 + out3));
+            attn_output[(bh * seq_len + t) * V + v_idx] = hip_bfloat16(out);
         }
     }
 }

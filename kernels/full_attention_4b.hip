@@ -3037,6 +3037,37 @@ __device__ __forceinline__ supersonic_float8 supersonic_wmma_bf16(
     return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(a, b, acc);
 #endif
 }
+
+#if SUPERSONIC_WMMA_GFX12
+__device__ __forceinline__ supersonic_float8 supersonic_wmma_bf16_gfx12_acc(
+    supersonic_short16 a,
+    supersonic_short16 b,
+    supersonic_float8 acc12
+) {
+    const int lane = threadIdx.x & 31;
+    const int lane_group = lane >> 4;
+
+    supersonic_short8 a12;
+    supersonic_short8 b12;
+
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int ab_row = lane_group * 4 + (i & 3) + ((i >> 2) * 8);
+        a12[i] = a[ab_row];
+        b12[i] = b[ab_row];
+    }
+
+    return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a12, b12, acc12);
+}
+
+__device__ __forceinline__ supersonic_float8 supersonic_wmma_bf16_gfx12_native_acc(
+    supersonic_short8 a12,
+    supersonic_short8 b12,
+    supersonic_float8 acc12
+) {
+    return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a12, b12, acc12);
+}
+#endif
 #endif
 
 #ifdef SUPERSONIC_HAS_WMMA_I8
@@ -3399,6 +3430,146 @@ __device__ inline void ggml_k_dequant_16_bf16_bits_from_row_fixed(
     ggml_k_dequant_16_bf16_bits_from_block_fixed<QTYPE, TRUNC_DEQUANT>(b, inb, out);
 }
 
+#if SUPERSONIC_WMMA_GFX12
+template <bool TRUNC_DEQUANT = true>
+__device__ inline supersonic_short8 ggml_q8_0_dequant_bf16_gfx12_fragment(
+    const uint8_t* block_data,
+    int inb,
+    int lane_group
+) {
+    const int subblock = inb / 32;
+    const int idx = inb - subblock * 32;
+    const uint8_t* b = block_data + subblock * 34;
+    const float d = ggml_f16_to_f32_unaligned(b);
+    const int8_t* qs = reinterpret_cast<const int8_t*>(b + 2);
+
+    supersonic_short8 out;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int ab_row = lane_group * 4 + (i & 3) + ((i >> 2) * 8);
+        out[i] = static_cast<short>(
+            ggml_small_m_bf16_bits<TRUNC_DEQUANT>(
+                d * static_cast<float>(qs[idx + ab_row])));
+    }
+    return out;
+}
+
+template <bool TRUNC_DEQUANT = true>
+__device__ inline supersonic_short8 ggml_q4_k_dequant_bf16_gfx12_fragment(
+    const uint8_t* block_data,
+    int inb,
+    int lane_group
+) {
+    const float d = ggml_f16_to_f32_unaligned(block_data);
+    const float dmin = ggml_f16_to_f32_unaligned(block_data + 2);
+    const uint8_t* sc = block_data + 4;
+    const uint8_t* qs = block_data + 16;
+    const int g = inb / 64;
+    const int sub = (inb % 64) / 32;
+    const int idx = inb % 32;
+    const int j = 2 * g + sub;
+    int scale = 0;
+    int minv = 0;
+    ggml_q4_k_scale_min(sc, j, scale, minv);
+    const float ds = d * static_cast<float>(scale);
+    const float dminv = dmin * static_cast<float>(minv);
+
+    supersonic_short8 out;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int ab_row = lane_group * 4 + (i & 3) + ((i >> 2) * 8);
+        const uint8_t qbyte = qs[g * 32 + idx + ab_row];
+        const int q = sub != 0 ? ((qbyte >> 4) & 0x0F) : (qbyte & 0x0F);
+        out[i] = static_cast<short>(
+            ggml_small_m_bf16_bits<TRUNC_DEQUANT>(ds * static_cast<float>(q) - dminv));
+    }
+    return out;
+}
+
+template <bool TRUNC_DEQUANT = true>
+__device__ inline supersonic_short8 ggml_q5_k_dequant_bf16_gfx12_fragment(
+    const uint8_t* block_data,
+    int inb,
+    int lane_group
+) {
+    const float d = ggml_f16_to_f32_unaligned(block_data);
+    const float dmin = ggml_f16_to_f32_unaligned(block_data + 2);
+    const uint8_t* sc = block_data + 4;
+    const uint8_t* qh = block_data + 16;
+    const uint8_t* ql = block_data + 48;
+    const int g = inb / 64;
+    const int sub = (inb % 64) / 32;
+    const int idx = inb % 32;
+    const int j = 2 * g + sub;
+    int scale = 0;
+    int minv = 0;
+    ggml_q4_k_scale_min(sc, j, scale, minv);
+    const int hi_mask = sub != 0 ? (2 << (2 * g)) : (1 << (2 * g));
+    const float ds = d * static_cast<float>(scale);
+    const float dminv = dmin * static_cast<float>(minv);
+
+    supersonic_short8 out;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int ab_row = lane_group * 4 + (i & 3) + ((i >> 2) * 8);
+        const uint8_t qbyte = ql[g * 32 + idx + ab_row];
+        const int lo = sub != 0 ? ((qbyte >> 4) & 0x0F) : (qbyte & 0x0F);
+        const int hi = (qh[idx + ab_row] & hi_mask) ? 16 : 0;
+        out[i] = static_cast<short>(
+            ggml_small_m_bf16_bits<TRUNC_DEQUANT>(ds * static_cast<float>(lo + hi) - dminv));
+    }
+    return out;
+}
+
+template <bool TRUNC_DEQUANT = true>
+__device__ inline supersonic_short8 ggml_q6_k_dequant_bf16_gfx12_fragment(
+    const uint8_t* block_data,
+    int inb,
+    int lane_group
+) {
+    const uint8_t* ql = block_data;
+    const uint8_t* qh = block_data + 128;
+    const int8_t* sc = reinterpret_cast<const int8_t*>(block_data + 192);
+    const float d = ggml_f16_to_f32_unaligned(block_data + 208);
+    const int half_idx = inb / 128;
+    const int pos = inb - half_idx * 128;
+    const int idx = pos % 32;
+    int scale_idx = half_idx * 8 + idx / 16;
+    const uint8_t* ql_base = ql + half_idx * 64 + idx;
+    int qh_shift = 0;
+    bool high_nibble = false;
+    if (pos < 32) {
+        qh_shift = 0;
+    } else if (pos < 64) {
+        ql_base += 32;
+        qh_shift = 2;
+        scale_idx += 2;
+    } else if (pos < 96) {
+        qh_shift = 4;
+        scale_idx += 4;
+        high_nibble = true;
+    } else {
+        ql_base += 32;
+        qh_shift = 6;
+        scale_idx += 6;
+        high_nibble = true;
+    }
+    const uint8_t* qh_base = qh + half_idx * 32 + idx;
+    const float ds = d * static_cast<float>(sc[scale_idx]);
+
+    supersonic_short8 out;
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int ab_row = lane_group * 4 + (i & 3) + ((i >> 2) * 8);
+        const int lo = high_nibble ? ((ql_base[ab_row] >> 4) & 0x0F) : (ql_base[ab_row] & 0x0F);
+        const int hi = static_cast<int>(((qh_base[ab_row] >> qh_shift) & 3) << 4);
+        out[i] = static_cast<short>(
+            ggml_small_m_bf16_bits<TRUNC_DEQUANT>(ds * static_cast<float>(lo + hi - 32)));
+    }
+    return out;
+}
+#endif
+
 // Tile dimensions.
 constexpr int TILED_WMMA_BM = 64;   // output tile rows (m)
 constexpr int TILED_WMMA_BN = 64;   // output tile cols (n)
@@ -3692,6 +3863,128 @@ __global__ void supersonic_qwen35_matmul_rhs_transposed_wmma_small_m_kernel(
         #pragma unroll
         for (int i = 0; i < 8; ++i) {
             int out_row = tile_row + 2 * i + lane_half;
+            if (out_row < m) {
+                out[out_batch_base + static_cast<size_t>(out_row) * n + out_col] =
+                    hip_bfloat16(acc[i]);
+            }
+        }
+    }
+#else
+    (void)batch_elems; (void)m; (void)n; (void)k;
+    (void)lhs; (void)rhs; (void)out;
+#endif
+}
+
+template <bool HOT_EXACT = false>
+__global__ void supersonic_qwen35_matmul_rhs_transposed_wmma_small_m_gfx12_kernel(
+    size_t batch_elems,
+    int m,
+    int n,
+    int k,
+    const hip_bfloat16* __restrict__ lhs,
+    const hip_bfloat16* __restrict__ rhs,
+    hip_bfloat16* __restrict__ out
+) {
+#if defined(SUPERSONIC_HAS_WMMA_BF16) && SUPERSONIC_WMMA_GFX12
+    const int lane = threadIdx.x;
+    const int lane_row = lane & 15;
+    const int lane_group = lane >> 4;
+    const int batch = blockIdx.z;
+    const int tile_row = blockIdx.y * 16;
+    const int tile_col = blockIdx.x * 16;
+
+    const int lhs_row_idx = tile_row + lane_row;
+    const int rhs_row_idx = tile_col + lane_row;
+    const bool lhs_in_range = HOT_EXACT || lhs_row_idx < m;
+    const bool rhs_in_range = HOT_EXACT || rhs_row_idx < n;
+
+    const size_t lhs_row_base = static_cast<size_t>(batch) * m * k +
+                                static_cast<size_t>(lhs_row_idx) * k;
+    const size_t rhs_row_base = static_cast<size_t>(batch) * n * k +
+                                static_cast<size_t>(rhs_row_idx) * k;
+
+    const uint16_t* lhs_row_u16 = reinterpret_cast<const uint16_t*>(lhs) + lhs_row_base;
+    const uint16_t* rhs_row_u16 = reinterpret_cast<const uint16_t*>(rhs) + rhs_row_base;
+
+    supersonic_float8 acc = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+
+    const int k_main = k & ~15;
+    for (int kk = 0; kk < k_main; kk += 16) {
+        supersonic_short8 a;
+        supersonic_short8 b;
+        if constexpr (HOT_EXACT) {
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int ab_row = lane_group * 4 + (i & 3) + ((i >> 2) * 8);
+                a[i] = static_cast<short>(lhs_row_u16[kk + ab_row]);
+            }
+        } else if (lhs_in_range) {
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int ab_row = lane_group * 4 + (i & 3) + ((i >> 2) * 8);
+                a[i] = static_cast<short>(lhs_row_u16[kk + ab_row]);
+            }
+        } else {
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) a[i] = 0;
+        }
+        if constexpr (HOT_EXACT) {
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int ab_row = lane_group * 4 + (i & 3) + ((i >> 2) * 8);
+                b[i] = static_cast<short>(rhs_row_u16[kk + ab_row]);
+            }
+        } else if (rhs_in_range) {
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int ab_row = lane_group * 4 + (i & 3) + ((i >> 2) * 8);
+                b[i] = static_cast<short>(rhs_row_u16[kk + ab_row]);
+            }
+        } else {
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) b[i] = 0;
+        }
+        acc = supersonic_wmma_bf16_gfx12_native_acc(a, b, acc);
+    }
+
+    if constexpr (!HOT_EXACT) {
+        if (k_main != k) {
+            supersonic_short8 a = {0, 0, 0, 0, 0, 0, 0, 0};
+            supersonic_short8 b = {0, 0, 0, 0, 0, 0, 0, 0};
+            if (lhs_in_range) {
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    const int ab_row = lane_group * 4 + (i & 3) + ((i >> 2) * 8);
+                    int kc = k_main + ab_row;
+                    if (kc < k) a[i] = static_cast<short>(lhs_row_u16[kc]);
+                }
+            }
+            if (rhs_in_range) {
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    const int ab_row = lane_group * 4 + (i & 3) + ((i >> 2) * 8);
+                    int kc = k_main + ab_row;
+                    if (kc < k) b[i] = static_cast<short>(rhs_row_u16[kc]);
+                }
+            }
+            acc = supersonic_wmma_bf16_gfx12_native_acc(a, b, acc);
+        }
+    }
+
+    const int out_col = tile_col + lane_row;
+    if constexpr (HOT_EXACT) {
+        const size_t out_batch_base = static_cast<size_t>(batch) * m * n;
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            int out_row = tile_row + lane_group * 8 + i;
+            out[out_batch_base + static_cast<size_t>(out_row) * n + out_col] =
+                hip_bfloat16(acc[i]);
+        }
+    } else if (out_col < n) {
+        const size_t out_batch_base = static_cast<size_t>(batch) * m * n;
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            int out_row = tile_row + lane_group * 8 + i;
             if (out_row < m) {
                 out[out_batch_base + static_cast<size_t>(out_row) * n + out_col] =
                     hip_bfloat16(acc[i]);
@@ -4527,15 +4820,26 @@ __device__ __forceinline__ void supersonic_mmq_load_q6_k_tile_128(
     for (int i0 = 0; i0 < MMQ_Y; i0 += nrows * NWARPS) {
         const int i = i0 + threadIdx.y * nrows + threadIdx.x / threads_per_row;
         const int row = tile_n + i;
-        const bool valid = HOT_EXACT_N || row < n;
-        const int safe_row = HOT_EXACT_N ? row : (row < n ? row : n - 1);
-        const uint8_t* b = rhs_q6 + batch_base +
-                           static_cast<size_t>(safe_row) * row_bytes +
-                           static_cast<size_t>(q6_block) * Q6_BLOCK_BYTES;
 
         int q0 = 0;
         int q1 = 0;
-        if (valid) {
+        if constexpr (HOT_EXACT_N) {
+            const uint8_t* b = rhs_q6 + batch_base +
+                               static_cast<size_t>(row) * row_bytes +
+                               static_cast<size_t>(q6_block) * Q6_BLOCK_BYTES;
+            const int ql = supersonic_get_int_b2(b, txi);
+            const int ql0 = (ql >> 0) & 0x0F0F0F0F;
+            const int ql1 = (ql >> 4) & 0x0F0F0F0F;
+            const int qh = supersonic_get_int_b2(
+                b + 128, (QI6_K / 4) * (txi / (QI6_K / 2)) + txi % (QI6_K / 4));
+            const int qh0 = ((qh >> ((txi & 0x08) >> 2)) << 4) & 0x30303030;
+            const int qh1 =  (qh >> ((txi & 0x08) >> 2))       & 0x30303030;
+            q0 = supersonic_sub_i8x4(ql0 | qh0, 32);
+            q1 = supersonic_sub_i8x4(ql1 | qh1, 32);
+        } else if (row < n) {
+            const uint8_t* b = rhs_q6 + batch_base +
+                               static_cast<size_t>(row) * row_bytes +
+                               static_cast<size_t>(q6_block) * Q6_BLOCK_BYTES;
             const int ql = supersonic_get_int_b2(b, txi);
             const int ql0 = (ql >> 0) & 0x0F0F0F0F;
             const int ql1 = (ql >> 4) & 0x0F0F0F0F;
@@ -4605,6 +4909,34 @@ __device__ __forceinline__ void supersonic_mmq_load_q8_1_tile_16(
     constexpr int Q8_BLOCK_BYTES = 144;
     const int blocks_per_row = k / 128;
 
+    if constexpr (HOT_EXACT_M16) {
+        const int tid = threadIdx.y * 32 + threadIdx.x;
+        const size_t batch_q8_base =
+            static_cast<size_t>(batch) * blocks_per_row * m +
+            static_cast<size_t>(q8_block) * m;
+
+        int l = tid;
+        int row = l / MMQ_TILE_Y_K;
+        int word = l - row * MMQ_TILE_Y_K;
+        size_t block = (batch_q8_base + static_cast<size_t>(tile_m + row)) * Q8_BLOCK_BYTES;
+        tile_y[l] = reinterpret_cast<const int*>(q8 + block)[word];
+
+        l = tid + 8 * 32;
+        row = l / MMQ_TILE_Y_K;
+        word = l - row * MMQ_TILE_Y_K;
+        block = (batch_q8_base + static_cast<size_t>(tile_m + row)) * Q8_BLOCK_BYTES;
+        tile_y[l] = reinterpret_cast<const int*>(q8 + block)[word];
+
+        if (tid < MMQ_X * MMQ_TILE_Y_K - 2 * 8 * 32) {
+            l = tid + 2 * 8 * 32;
+            row = l / MMQ_TILE_Y_K;
+            word = l - row * MMQ_TILE_Y_K;
+            block = (batch_q8_base + static_cast<size_t>(tile_m + row)) * Q8_BLOCK_BYTES;
+            tile_y[l] = reinterpret_cast<const int*>(q8 + block)[word];
+        }
+        return;
+    }
+
     for (int l0 = 0; l0 < MMQ_X * MMQ_TILE_Y_K; l0 += 8 * 32) {
         const int l = l0 + threadIdx.y * 32 + threadIdx.x;
         if (l >= MMQ_X * MMQ_TILE_Y_K) {
@@ -4614,13 +4946,7 @@ __device__ __forceinline__ void supersonic_mmq_load_q8_1_tile_16(
         const int word = l - row * MMQ_TILE_Y_K;
         const int global_row = tile_m + row;
         int v = 0;
-        if constexpr (HOT_EXACT_M16) {
-            const size_t block =
-                (static_cast<size_t>(batch) * blocks_per_row * m +
-                 static_cast<size_t>(q8_block) * m + global_row) *
-                Q8_BLOCK_BYTES;
-            v = reinterpret_cast<const int*>(q8 + block)[word];
-        } else if (global_row < m) {
+        if (global_row < m) {
             const size_t block =
                 (static_cast<size_t>(batch) * blocks_per_row * m +
                  static_cast<size_t>(q8_block) * m + global_row) *
@@ -4645,6 +4971,35 @@ __device__ __forceinline__ void supersonic_mmq_i8_wmma_16x4(
     (void)c; (void)a; (void)b;
 #endif
 }
+
+#if SUPERSONIC_WMMA_GFX12
+__device__ __forceinline__ supersonic_i32x8 supersonic_mmq_i8_wmma_16x4_gfx12_native(
+    const int a[4],
+    const int b[4]
+) {
+#ifdef SUPERSONIC_HAS_WMMA_I8
+    const int lane = threadIdx.x & 31;
+    const int lane_group = lane >> 4;
+
+    supersonic_i32x2 a12;
+    supersonic_i32x2 b12;
+    supersonic_i32x8 c12 = {0, 0, 0, 0, 0, 0, 0, 0};
+
+    #pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const int packed_idx = lane_group + 2 * i;
+        a12[i] = a[packed_idx];
+        b12[i] = b[packed_idx];
+    }
+
+    return __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(
+        true, a12, true, b12, c12, false);
+#else
+    (void)a; (void)b;
+    return {0, 0, 0, 0, 0, 0, 0, 0};
+#endif
+}
+#endif
 
 __device__ __forceinline__ void supersonic_mmq_vec_dot_q6_k_q8_1_wmma(
     const int* __restrict__ tile_x,
@@ -4694,7 +5049,58 @@ __device__ __forceinline__ void supersonic_mmq_vec_dot_q6_k_q8_1_wmma(
     }
 }
 
-template <bool HOT_EXACT = false>
+#if SUPERSONIC_WMMA_GFX12
+__device__ __forceinline__ void supersonic_mmq_vec_dot_q6_k_q8_1_wmma_gfx12_native(
+    const int* __restrict__ tile_x,
+    const int* __restrict__ tile_y,
+    float sum[8],
+    int k00
+) {
+    constexpr int MMQ_TILE_NE_K = 32;
+    constexpr int MMQ_TILE_Y_K = 36;
+    constexpr int QI6_K = 32;
+    constexpr int QI8_1 = 8;
+    constexpr int MMQ_MMA_TILE_X_K_Q6_K =
+        2 * MMQ_TILE_NE_K + MMQ_TILE_NE_K / QI6_K + MMQ_TILE_NE_K / 8 + 7;
+
+    const int* x_qs = tile_x;
+    const float* x_df = reinterpret_cast<const float*>(x_qs + 2 * MMQ_TILE_NE_K);
+    const int* x_sc = reinterpret_cast<const int*>(x_df + MMQ_TILE_NE_K / QI6_K);
+    const int* y_qs = tile_y + 4;
+    const float* y_df = reinterpret_cast<const float*>(tile_y);
+    const int lane = threadIdx.x & 31;
+    const int lane_row = lane & 15;
+    const int lane_group = lane >> 4;
+    const int i0 = threadIdx.y * 16;
+
+    for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += 4) {
+        const int k0 = k00 + k01;
+        int a[4];
+        int b[4];
+        #pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            a[l] = x_qs[(i0 + lane_row) * MMQ_MMA_TILE_X_K_Q6_K + k0 + l];
+            b[l] = y_qs[lane_row * MMQ_TILE_Y_K + k01 + l];
+        }
+
+        const supersonic_i32x8 c = supersonic_mmq_i8_wmma_16x4_gfx12_native(a, b);
+
+        const int j = lane_row;
+        const float dB = y_df[j * MMQ_TILE_Y_K + k01 / QI8_1];
+        #pragma unroll
+        for (int l = 0; l < 8; ++l) {
+            const int i = i0 + lane_group * 8 + l;
+            const int8_t* sc =
+                reinterpret_cast<const int8_t*>(x_sc + i * MMQ_MMA_TILE_X_K_Q6_K + k00 / 16);
+            const float dA = x_df[i * MMQ_MMA_TILE_X_K_Q6_K];
+            sum[l] += static_cast<float>(c[l]) * static_cast<float>(sc[k01 / 4]) * dA * dB;
+        }
+    }
+}
+
+#endif
+
+template <bool HOT_EXACT = false, bool HAS_RESIDUAL = false>
 __global__ __launch_bounds__(256, 2)
 void supersonic_qwen35_matmul_mmq_q8_1_q6_k_kernel(
     size_t batch_elems,
@@ -4751,7 +5157,7 @@ void supersonic_qwen35_matmul_mmq_q8_1_q6_k_kernel(
         if constexpr (HOT_EXACT) {
             const size_t out_idx = out_base + static_cast<size_t>(out_row) * n + out_col;
             const hip_bfloat16 projected(sum[l]);
-            if (residual != nullptr) {
+            if constexpr (HAS_RESIDUAL) {
                 out[out_idx] = hip_bfloat16(static_cast<float>(residual[out_idx]) +
                                            static_cast<float>(projected));
             } else {
@@ -4760,7 +5166,87 @@ void supersonic_qwen35_matmul_mmq_q8_1_q6_k_kernel(
         } else if (out_row < m && out_col < n) {
             const size_t out_idx = out_base + static_cast<size_t>(out_row) * n + out_col;
             const hip_bfloat16 projected(sum[l]);
-            if (residual != nullptr) {
+            if constexpr (HAS_RESIDUAL) {
+                out[out_idx] = hip_bfloat16(static_cast<float>(residual[out_idx]) +
+                                           static_cast<float>(projected));
+            } else {
+                out[out_idx] = projected;
+            }
+        }
+    }
+#else
+    (void)batch_elems; (void)m; (void)n; (void)k;
+    (void)q8; (void)rhs_q6; (void)residual; (void)out;
+#endif
+}
+
+template <bool HOT_EXACT = false, bool HAS_RESIDUAL = false>
+__global__ __launch_bounds__(256, 2)
+void supersonic_qwen35_matmul_mmq_q8_1_q6_k_gfx12_kernel(
+    size_t batch_elems,
+    int m,
+    int n,
+    int k,
+    const uint8_t* __restrict__ q8,
+    const uint8_t* __restrict__ rhs_q6,
+    const hip_bfloat16* __restrict__ residual,
+    hip_bfloat16* __restrict__ out
+) {
+#if defined(SUPERSONIC_HAS_WMMA_I8) && SUPERSONIC_WMMA_GFX12
+    constexpr int MMQ_X = 16;
+    constexpr int MMQ_Y = 128;
+    constexpr int MMQ_MMA_TILE_X_K_Q6_K = 76;
+    constexpr int PADDED_TILE_Y_INTS = 768;
+
+    const int tile_n = blockIdx.x * MMQ_Y;
+    const int tile_m = blockIdx.y * MMQ_X;
+    const int batch = blockIdx.z;
+    if (static_cast<size_t>(batch) >= batch_elems) {
+        return;
+    }
+
+    extern __shared__ int supersonic_mmq_smem[];
+    int* tile_y = supersonic_mmq_smem;
+    int* tile_x = supersonic_mmq_smem + PADDED_TILE_Y_INTS;
+    float sum[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+
+    const int q6_blocks = k / 256;
+    for (int block = 0; block < q6_blocks; ++block) {
+        supersonic_mmq_load_q6_k_tile_128<HOT_EXACT>(
+            rhs_q6, tile_x, batch, tile_n, n, k, block);
+        supersonic_mmq_load_q8_1_tile_16<HOT_EXACT>(
+            q8, tile_y, batch, tile_m, m, k, 2 * block);
+        __syncthreads();
+        supersonic_mmq_vec_dot_q6_k_q8_1_wmma_gfx12_native(tile_x, tile_y, sum, 0);
+        __syncthreads();
+
+        supersonic_mmq_load_q8_1_tile_16<HOT_EXACT>(
+            q8, tile_y, batch, tile_m, m, k, 2 * block + 1);
+        __syncthreads();
+        supersonic_mmq_vec_dot_q6_k_q8_1_wmma_gfx12_native(tile_x, tile_y, sum, 32);
+        __syncthreads();
+    }
+
+    const int lane = threadIdx.x & 31;
+    const int out_row = tile_m + (lane & 15);
+    const int lane_group = lane >> 4;
+    const size_t out_base = static_cast<size_t>(batch) * m * static_cast<size_t>(n);
+    #pragma unroll
+    for (int l = 0; l < 8; ++l) {
+        const int out_col = tile_n + threadIdx.y * 16 + lane_group * 8 + l;
+        if constexpr (HOT_EXACT) {
+            const size_t out_idx = out_base + static_cast<size_t>(out_row) * n + out_col;
+            const hip_bfloat16 projected(sum[l]);
+            if constexpr (HAS_RESIDUAL) {
+                out[out_idx] = hip_bfloat16(static_cast<float>(residual[out_idx]) +
+                                           static_cast<float>(projected));
+            } else {
+                out[out_idx] = projected;
+            }
+        } else if (out_row < m && out_col < n) {
+            const size_t out_idx = out_base + static_cast<size_t>(out_row) * n + out_col;
+            const hip_bfloat16 projected(sum[l]);
+            if constexpr (HAS_RESIDUAL) {
                 out[out_idx] = hip_bfloat16(static_cast<float>(residual[out_idx]) +
                                            static_cast<float>(projected));
             } else {
@@ -4968,6 +5454,100 @@ void supersonic_qwen35_matmul_ggml_dequant_wmma_m8_qtype_kernel(
 #endif
 }
 
+template <int QTYPE, bool TRUNC_DEQUANT = false>
+__global__ __launch_bounds__(32, 4)
+void supersonic_qwen35_matmul_ggml_dequant_wmma_m8_qtype_gfx12_kernel(
+    size_t batch_elems,
+    int n,
+    int k,
+    const hip_bfloat16* __restrict__ lhs,
+    const uint8_t* __restrict__ rhs_int4,
+    hip_bfloat16* __restrict__ out
+) {
+#if defined(SUPERSONIC_HAS_WMMA_BF16) && SUPERSONIC_WMMA_GFX12
+    const int lane = threadIdx.x;
+    const int lane_row = lane & 15;
+    const int lane_group = lane >> 4;
+    const int batch = blockIdx.z;
+    const int tile_col = blockIdx.x * 16;
+    const int rhs_row_idx = tile_col + lane_row;
+
+    const int block_bytes = ggml_k_block_bytes_fixed<QTYPE>();
+    const int blocks = k / 256;
+    const int row_bytes = blocks * block_bytes;
+
+    const size_t lhs_row_base = static_cast<size_t>(batch) * 8 * static_cast<size_t>(k) +
+                                static_cast<size_t>(lane_row) * k;
+    const size_t rhs_row_base = static_cast<size_t>(batch) * n * static_cast<size_t>(row_bytes) +
+                                static_cast<size_t>(rhs_row_idx) * row_bytes;
+
+    const uint16_t* lhs_row_u16 = reinterpret_cast<const uint16_t*>(lhs) + lhs_row_base;
+    const uint8_t* rhs_row_u8 = rhs_int4 + rhs_row_base;
+    const bool lhs_in_range = lane_row < 8;
+
+    supersonic_float8 acc = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+
+    for (int block = 0; block < blocks; ++block) {
+        const uint8_t* rhs_block = rhs_row_u8 + block * block_bytes;
+        const int kk_block = block * 256;
+        #pragma unroll
+        for (int sub = 0; sub < 16; ++sub) {
+            const int kk = kk_block + sub * 16;
+            supersonic_short8 a;
+            if (lhs_in_range) {
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    const int ab_row = lane_group * 4 + (i & 3) + ((i >> 2) * 8);
+                    a[i] = static_cast<short>(lhs_row_u16[kk + ab_row]);
+                }
+            } else {
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) a[i] = 0;
+            }
+
+            supersonic_short8 b;
+            if constexpr (QTYPE == QWEN35_LOWBIT_GGML_Q8_0) {
+                b = ggml_q8_0_dequant_bf16_gfx12_fragment<TRUNC_DEQUANT>(
+                    rhs_block, sub * 16, lane_group);
+            } else if constexpr (QTYPE == QWEN35_LOWBIT_GGML_Q4_K) {
+                b = ggml_q4_k_dequant_bf16_gfx12_fragment<TRUNC_DEQUANT>(
+                    rhs_block, sub * 16, lane_group);
+            } else if constexpr (QTYPE == QWEN35_LOWBIT_GGML_Q5_K) {
+                b = ggml_q5_k_dequant_bf16_gfx12_fragment<TRUNC_DEQUANT>(
+                    rhs_block, sub * 16, lane_group);
+            } else if constexpr (QTYPE == QWEN35_LOWBIT_GGML_Q6_K) {
+                b = ggml_q6_k_dequant_bf16_gfx12_fragment<TRUNC_DEQUANT>(
+                    rhs_block, sub * 16, lane_group);
+            } else {
+                uint16_t bits[16];
+                ggml_k_dequant_16_bf16_bits_from_block_fixed<QTYPE, TRUNC_DEQUANT>(
+                    rhs_block, sub * 16, bits);
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    const int ab_row = lane_group * 4 + (i & 3) + ((i >> 2) * 8);
+                    b[i] = static_cast<short>(bits[ab_row]);
+                }
+            }
+
+            acc = supersonic_wmma_bf16_gfx12_native_acc(a, b, acc);
+        }
+    }
+
+    if (lane_group == 0) {
+        const int out_col = tile_col + lane_row;
+        const size_t out_batch_base = static_cast<size_t>(batch) * 8 * static_cast<size_t>(n);
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            out[out_batch_base + static_cast<size_t>(i) * n + out_col] =
+                hip_bfloat16(acc[i]);
+        }
+    }
+#else
+    (void)batch_elems; (void)n; (void)k;
+    (void)lhs; (void)rhs_int4; (void)out;
+#endif
+}
+
 template <int QTYPE, bool TRUNC_DEQUANT = false, bool ADD_RESIDUAL = false>
 __global__ __launch_bounds__(32, 4)
 void supersonic_qwen35_matmul_ggml_dequant_wmma_m16_qtype_kernel(
@@ -5031,6 +5611,100 @@ void supersonic_qwen35_matmul_ggml_dequant_wmma_m16_qtype_kernel(
     #pragma unroll
     for (int i = 0; i < 8; ++i) {
         const int out_row = 2 * i + lane_half;
+        const size_t out_idx = out_batch_base + static_cast<size_t>(out_row) * n + out_col;
+        hip_bfloat16 projected(acc[i]);
+        if constexpr (ADD_RESIDUAL) {
+            const float summed = static_cast<float>(residual[out_idx]) + static_cast<float>(projected);
+            out[out_idx] = hip_bfloat16(summed);
+        } else {
+            out[out_idx] = projected;
+        }
+    }
+#else
+    (void)batch_elems; (void)n; (void)k;
+    (void)lhs; (void)rhs_int4; (void)residual; (void)out;
+#endif
+}
+
+template <int QTYPE, bool TRUNC_DEQUANT = false, bool ADD_RESIDUAL = false>
+__global__ __launch_bounds__(32, 4)
+void supersonic_qwen35_matmul_ggml_dequant_wmma_m16_qtype_gfx12_kernel(
+    size_t batch_elems,
+    int n,
+    int k,
+    const hip_bfloat16* __restrict__ lhs,
+    const uint8_t* __restrict__ rhs_int4,
+    const hip_bfloat16* __restrict__ residual,
+    hip_bfloat16* __restrict__ out
+) {
+#if defined(SUPERSONIC_HAS_WMMA_BF16) && SUPERSONIC_WMMA_GFX12
+    const int lane = threadIdx.x;
+    const int lane_row = lane & 15;
+    const int lane_group = lane >> 4;
+    const int batch = blockIdx.z;
+    const int tile_col = blockIdx.x * 16;
+    const int rhs_row_idx = tile_col + lane_row;
+
+    const int block_bytes = ggml_k_block_bytes_fixed<QTYPE>();
+    const int blocks = k / 256;
+    const int row_bytes = blocks * block_bytes;
+
+    const size_t lhs_row_base = static_cast<size_t>(batch) * 16 * static_cast<size_t>(k) +
+                                static_cast<size_t>(lane_row) * k;
+    const size_t rhs_row_base = static_cast<size_t>(batch) * n * static_cast<size_t>(row_bytes) +
+                                static_cast<size_t>(rhs_row_idx) * row_bytes;
+
+    const uint16_t* lhs_row_u16 = reinterpret_cast<const uint16_t*>(lhs) + lhs_row_base;
+    const uint8_t* rhs_row_u8 = rhs_int4 + rhs_row_base;
+
+    supersonic_float8 acc = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+
+    for (int block = 0; block < blocks; ++block) {
+        const uint8_t* rhs_block = rhs_row_u8 + block * block_bytes;
+        const int kk_block = block * 256;
+        #pragma unroll
+        for (int sub = 0; sub < 16; ++sub) {
+            const int kk = kk_block + sub * 16;
+            supersonic_short8 a;
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int ab_row = lane_group * 4 + (i & 3) + ((i >> 2) * 8);
+                a[i] = static_cast<short>(lhs_row_u16[kk + ab_row]);
+            }
+
+            supersonic_short8 b;
+            if constexpr (QTYPE == QWEN35_LOWBIT_GGML_Q8_0) {
+                b = ggml_q8_0_dequant_bf16_gfx12_fragment<TRUNC_DEQUANT>(
+                    rhs_block, sub * 16, lane_group);
+            } else if constexpr (QTYPE == QWEN35_LOWBIT_GGML_Q4_K) {
+                b = ggml_q4_k_dequant_bf16_gfx12_fragment<TRUNC_DEQUANT>(
+                    rhs_block, sub * 16, lane_group);
+            } else if constexpr (QTYPE == QWEN35_LOWBIT_GGML_Q5_K) {
+                b = ggml_q5_k_dequant_bf16_gfx12_fragment<TRUNC_DEQUANT>(
+                    rhs_block, sub * 16, lane_group);
+            } else if constexpr (QTYPE == QWEN35_LOWBIT_GGML_Q6_K) {
+                b = ggml_q6_k_dequant_bf16_gfx12_fragment<TRUNC_DEQUANT>(
+                    rhs_block, sub * 16, lane_group);
+            } else {
+                uint16_t bits[16];
+                ggml_k_dequant_16_bf16_bits_from_block_fixed<QTYPE, TRUNC_DEQUANT>(
+                    rhs_block, sub * 16, bits);
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    const int ab_row = lane_group * 4 + (i & 3) + ((i >> 2) * 8);
+                    b[i] = static_cast<short>(bits[ab_row]);
+                }
+            }
+
+            acc = supersonic_wmma_bf16_gfx12_native_acc(a, b, acc);
+        }
+    }
+
+    const int out_col = tile_col + lane_row;
+    const size_t out_batch_base = static_cast<size_t>(batch) * 16 * static_cast<size_t>(n);
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int out_row = lane_group * 8 + i;
         const size_t out_idx = out_batch_base + static_cast<size_t>(out_row) * n + out_col;
         hip_bfloat16 projected(acc[i]);
         if constexpr (ADD_RESIDUAL) {
@@ -5141,6 +5815,98 @@ void supersonic_qwen35_matmul_q6_k_m16_tile_argmax_kernel(
 #endif
 }
 
+template <bool TRUNC_DEQUANT = true>
+__global__ __launch_bounds__(32, 4)
+void supersonic_qwen35_matmul_q6_k_m16_tile_argmax_gfx12_kernel(
+    size_t batch_elems,
+    int n,
+    int k,
+    const hip_bfloat16* __restrict__ lhs,
+    const uint8_t* __restrict__ rhs_q6,
+    float* __restrict__ block_best_vals,
+    uint32_t* __restrict__ block_best_indices
+) {
+#if defined(SUPERSONIC_HAS_WMMA_BF16) && SUPERSONIC_WMMA_GFX12
+    __shared__ float tile_vals[16][16];
+
+    const int lane = threadIdx.x;
+    const int lane_row = lane & 15;
+    const int lane_group = lane >> 4;
+    const int batch = blockIdx.z;
+    if (static_cast<size_t>(batch) >= batch_elems) {
+        return;
+    }
+
+    const int tile_col = blockIdx.x * 16;
+    const int rhs_row_idx = tile_col + lane_row;
+    const int block_bytes = ggml_k_block_bytes_fixed<QWEN35_LOWBIT_GGML_Q6_K>();
+    const int blocks = k / 256;
+    const int row_bytes = blocks * block_bytes;
+
+    const size_t lhs_row_base = static_cast<size_t>(batch) * 16 * static_cast<size_t>(k) +
+                                static_cast<size_t>(lane_row) * k;
+    const size_t rhs_row_base = static_cast<size_t>(batch) * n * static_cast<size_t>(row_bytes) +
+                                static_cast<size_t>(rhs_row_idx) * row_bytes;
+
+    const uint16_t* lhs_row_u16 = reinterpret_cast<const uint16_t*>(lhs) + lhs_row_base;
+    const uint8_t* rhs_row_u8 = rhs_q6 + rhs_row_base;
+
+    supersonic_float8 acc = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+
+    for (int block = 0; block < blocks; ++block) {
+        const uint8_t* rhs_block = rhs_row_u8 + block * block_bytes;
+        const int kk_block = block * 256;
+        #pragma unroll
+        for (int sub = 0; sub < 16; ++sub) {
+            const int kk = kk_block + sub * 16;
+            supersonic_short8 a;
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int ab_row = lane_group * 4 + (i & 3) + ((i >> 2) * 8);
+                a[i] = static_cast<short>(lhs_row_u16[kk + ab_row]);
+            }
+
+            const supersonic_short8 b =
+                ggml_q6_k_dequant_bf16_gfx12_fragment<TRUNC_DEQUANT>(
+                    rhs_block, sub * 16, lane_group);
+
+            acc = supersonic_wmma_bf16_gfx12_native_acc(a, b, acc);
+        }
+    }
+
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int out_row = lane_group * 8 + i;
+        const hip_bfloat16 rounded(acc[i]);
+        tile_vals[out_row][lane_row] = static_cast<float>(rounded);
+    }
+    __syncthreads();
+
+    if (lane < 16) {
+        const int row = lane;
+        float best_val = -1.0e30f;
+        uint32_t best_idx = 0;
+        #pragma unroll
+        for (int c = 0; c < 16; ++c) {
+            const float val = tile_vals[row][c];
+            const uint32_t idx = static_cast<uint32_t>(tile_col + c);
+            if (val > best_val || (val == best_val && idx < best_idx)) {
+                best_val = val;
+                best_idx = idx;
+            }
+        }
+        const size_t tiles = gridDim.x;
+        const size_t out =
+            (static_cast<size_t>(batch) * tiles + blockIdx.x) * 16 + row;
+        block_best_vals[out] = best_val;
+        block_best_indices[out] = best_idx;
+    }
+#else
+    (void)batch_elems; (void)n; (void)k; (void)lhs; (void)rhs_q6;
+    (void)block_best_vals; (void)block_best_indices;
+#endif
+}
+
 __global__ void supersonic_qwen35_reduce_m16_tile_argmax_kernel(
     size_t batch_elems,
     int tiles,
@@ -5164,6 +5930,58 @@ __global__ void supersonic_qwen35_reduce_m16_tile_argmax_kernel(
     for (int tile = static_cast<int>(tid); tile < tiles; tile += blockDim.x) {
         const float val = block_best_vals[base + tile];
         const uint32_t idx = block_best_indices[base + tile];
+        if (val > best_val || (val == best_val && idx < best_idx)) {
+            best_val = val;
+            best_idx = idx;
+        }
+    }
+
+    shared_vals[tid] = best_val;
+    shared_idx[tid] = best_idx;
+    __syncthreads();
+
+    for (unsigned int offset = blockDim.x / 2; offset > 0; offset >>= 1) {
+        if (tid < offset) {
+            const float rhs_val = shared_vals[tid + offset];
+            const uint32_t rhs_idx = shared_idx[tid + offset];
+            if (rhs_val > shared_vals[tid] ||
+                (rhs_val == shared_vals[tid] && rhs_idx < shared_idx[tid])) {
+                shared_vals[tid] = rhs_val;
+                shared_idx[tid] = rhs_idx;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        out_indices[static_cast<size_t>(batch) * 16 + row] = shared_idx[0];
+    }
+}
+
+__global__ void supersonic_qwen35_reduce_m16_tile_argmax_tile_major_kernel(
+    size_t batch_elems,
+    int tiles,
+    const float* __restrict__ block_best_vals,
+    const uint32_t* __restrict__ block_best_indices,
+    uint32_t* __restrict__ out_indices
+) {
+    __shared__ float shared_vals[256];
+    __shared__ uint32_t shared_idx[256];
+
+    const int row = blockIdx.x;
+    const int batch = blockIdx.y;
+    if (row >= 16 || static_cast<size_t>(batch) >= batch_elems) {
+        return;
+    }
+    const unsigned int tid = threadIdx.x;
+    const size_t base = static_cast<size_t>(batch) * 16 * static_cast<size_t>(tiles) + row;
+
+    float best_val = -1.0e30f;
+    uint32_t best_idx = 0;
+    for (int tile = static_cast<int>(tid); tile < tiles; tile += blockDim.x) {
+        const size_t offset = base + static_cast<size_t>(tile) * 16;
+        const float val = block_best_vals[offset];
+        const uint32_t idx = block_best_indices[offset];
         if (val > best_val || (val == best_val && idx < best_idx)) {
             best_val = val;
             best_idx = idx;
@@ -5271,6 +6089,93 @@ void supersonic_qwen35_matmul_ggml_pair_wmma_m16_qtype_kernel(
 
 template <int QTYPE, bool TRUNC_DEQUANT = false>
 __global__ __launch_bounds__(32, 8)
+void supersonic_qwen35_matmul_ggml_pair_wmma_m16_qtype_gfx12_kernel(
+    size_t batch_elems,
+    int n_each,
+    int k,
+    const hip_bfloat16* __restrict__ lhs,
+    const uint8_t* __restrict__ rhs_first,
+    const uint8_t* __restrict__ rhs_second,
+    hip_bfloat16* __restrict__ out
+) {
+#if defined(SUPERSONIC_HAS_WMMA_BF16) && SUPERSONIC_WMMA_GFX12
+    const int lane = threadIdx.x;
+    const int lane_row = lane & 15;
+    const int lane_group = lane >> 4;
+    const int batch = blockIdx.z;
+    const int tile_col = blockIdx.x * 16;
+    const int out_col_idx = tile_col + lane_row;
+    const int n_out = n_each * 2;
+    const bool second = out_col_idx >= n_each;
+    const int rhs_row_idx = second ? out_col_idx - n_each : out_col_idx;
+    const uint8_t* rhs_base_ptr = second ? rhs_second : rhs_first;
+
+    const int block_bytes = ggml_k_block_bytes_fixed<QTYPE>();
+    const int blocks = k / 256;
+    const int row_bytes = blocks * block_bytes;
+
+    const size_t lhs_row_base = static_cast<size_t>(batch) * 16 * static_cast<size_t>(k) +
+                                static_cast<size_t>(lane_row) * k;
+    const size_t rhs_row_base = static_cast<size_t>(batch) * n_each * static_cast<size_t>(row_bytes) +
+                                static_cast<size_t>(rhs_row_idx) * row_bytes;
+
+    const uint16_t* lhs_row_u16 = reinterpret_cast<const uint16_t*>(lhs) + lhs_row_base;
+    const uint8_t* rhs_row_u8 = rhs_base_ptr + rhs_row_base;
+
+    supersonic_float8 acc = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+
+    for (int block = 0; block < blocks; ++block) {
+        const uint8_t* rhs_block = rhs_row_u8 + block * block_bytes;
+        const int kk_block = block * 256;
+        #pragma unroll
+        for (int sub = 0; sub < 16; ++sub) {
+            const int kk = kk_block + sub * 16;
+            supersonic_short8 a;
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int ab_row = lane_group * 4 + (i & 3) + ((i >> 2) * 8);
+                a[i] = static_cast<short>(lhs_row_u16[kk + ab_row]);
+            }
+
+            supersonic_short8 b;
+            if constexpr (QTYPE == QWEN35_LOWBIT_GGML_Q4_K) {
+                b = ggml_q4_k_dequant_bf16_gfx12_fragment<TRUNC_DEQUANT>(
+                    rhs_block, sub * 16, lane_group);
+            } else if constexpr (QTYPE == QWEN35_LOWBIT_GGML_Q5_K) {
+                b = ggml_q5_k_dequant_bf16_gfx12_fragment<TRUNC_DEQUANT>(
+                    rhs_block, sub * 16, lane_group);
+            } else {
+                uint16_t bits[16];
+                ggml_k_dequant_16_bf16_bits_from_block_fixed<QTYPE, TRUNC_DEQUANT>(
+                    rhs_block, sub * 16, bits);
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    const int ab_row = lane_group * 4 + (i & 3) + ((i >> 2) * 8);
+                    b[i] = static_cast<short>(bits[ab_row]);
+                }
+            }
+
+            acc = supersonic_wmma_bf16_gfx12_native_acc(a, b, acc);
+        }
+    }
+
+    if (out_col_idx < n_out) {
+        const size_t out_batch_base = static_cast<size_t>(batch) * 16 * static_cast<size_t>(n_out);
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int out_row = lane_group * 8 + i;
+            out[out_batch_base + static_cast<size_t>(out_row) * n_out + out_col_idx] =
+                hip_bfloat16(acc[i]);
+        }
+    }
+#else
+    (void)batch_elems; (void)n_each; (void)k;
+    (void)lhs; (void)rhs_first; (void)rhs_second; (void)out;
+#endif
+}
+
+template <int QTYPE, bool TRUNC_DEQUANT = false>
+__global__ __launch_bounds__(32, 8)
 void supersonic_qwen35_matmul_ggml_pair_swiglu_wmma_m16_qtype_kernel(
     size_t batch_elems,
     int n_each,
@@ -5344,6 +6249,117 @@ void supersonic_qwen35_matmul_ggml_pair_swiglu_wmma_m16_qtype_kernel(
         #pragma unroll
         for (int i = 0; i < 8; ++i) {
             const int out_row = 2 * i + lane_half;
+            const hip_bfloat16 gate_bf16(gate_acc[i]);
+            const hip_bfloat16 up_bf16(up_acc[i]);
+            const float gate_x = static_cast<float>(gate_bf16);
+            const float up_x = static_cast<float>(up_bf16);
+            const float silu = gate_x / (1.0f + expf(-gate_x));
+            out[out_batch_base + static_cast<size_t>(out_row) * n_each + out_col_idx] =
+                hip_bfloat16(silu * up_x);
+        }
+    }
+#else
+    (void)batch_elems; (void)n_each; (void)k;
+    (void)lhs; (void)rhs_gate; (void)rhs_up; (void)out;
+#endif
+}
+
+template <int QTYPE, bool TRUNC_DEQUANT = false>
+__global__ __launch_bounds__(32, 8)
+void supersonic_qwen35_matmul_ggml_pair_swiglu_wmma_m16_qtype_gfx12_kernel(
+    size_t batch_elems,
+    int n_each,
+    int k,
+    const hip_bfloat16* __restrict__ lhs,
+    const uint8_t* __restrict__ rhs_gate,
+    const uint8_t* __restrict__ rhs_up,
+    hip_bfloat16* __restrict__ out
+) {
+#if defined(SUPERSONIC_HAS_WMMA_BF16) && SUPERSONIC_WMMA_GFX12
+    const int lane = threadIdx.x;
+    const int lane_row = lane & 15;
+    const int lane_group = lane >> 4;
+    const int batch = blockIdx.z;
+    const int tile_col = blockIdx.x * 16;
+    const int out_col_idx = tile_col + lane_row;
+
+    const int block_bytes = ggml_k_block_bytes_fixed<QTYPE>();
+    const int blocks = k / 256;
+    const int row_bytes = blocks * block_bytes;
+
+    const size_t lhs_row_base = static_cast<size_t>(batch) * 16 * static_cast<size_t>(k) +
+                                static_cast<size_t>(lane_row) * k;
+    const size_t rhs_row_base = static_cast<size_t>(batch) * n_each * static_cast<size_t>(row_bytes) +
+                                static_cast<size_t>(out_col_idx) * row_bytes;
+
+    const uint16_t* lhs_row_u16 = reinterpret_cast<const uint16_t*>(lhs) + lhs_row_base;
+    const uint8_t* rhs_gate_row_u8 = rhs_gate + rhs_row_base;
+    const uint8_t* rhs_up_row_u8 = rhs_up + rhs_row_base;
+
+    supersonic_float8 gate_acc = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    supersonic_float8 up_acc = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+
+    for (int block = 0; block < blocks; ++block) {
+        const uint8_t* rhs_gate_block = rhs_gate_row_u8 + block * block_bytes;
+        const uint8_t* rhs_up_block = rhs_up_row_u8 + block * block_bytes;
+        const int kk_block = block * 256;
+        #pragma unroll
+        for (int sub = 0; sub < 16; ++sub) {
+            const int kk = kk_block + sub * 16;
+            supersonic_short8 a;
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int ab_row = lane_group * 4 + (i & 3) + ((i >> 2) * 8);
+                a[i] = static_cast<short>(lhs_row_u16[kk + ab_row]);
+            }
+
+            supersonic_short8 gate_b;
+            supersonic_short8 up_b;
+            if constexpr (QTYPE == QWEN35_LOWBIT_GGML_Q8_0) {
+                gate_b = ggml_q8_0_dequant_bf16_gfx12_fragment<TRUNC_DEQUANT>(
+                    rhs_gate_block, sub * 16, lane_group);
+                up_b = ggml_q8_0_dequant_bf16_gfx12_fragment<TRUNC_DEQUANT>(
+                    rhs_up_block, sub * 16, lane_group);
+            } else if constexpr (QTYPE == QWEN35_LOWBIT_GGML_Q4_K) {
+                gate_b = ggml_q4_k_dequant_bf16_gfx12_fragment<TRUNC_DEQUANT>(
+                    rhs_gate_block, sub * 16, lane_group);
+                up_b = ggml_q4_k_dequant_bf16_gfx12_fragment<TRUNC_DEQUANT>(
+                    rhs_up_block, sub * 16, lane_group);
+            } else if constexpr (QTYPE == QWEN35_LOWBIT_GGML_Q5_K) {
+                gate_b = ggml_q5_k_dequant_bf16_gfx12_fragment<TRUNC_DEQUANT>(
+                    rhs_gate_block, sub * 16, lane_group);
+                up_b = ggml_q5_k_dequant_bf16_gfx12_fragment<TRUNC_DEQUANT>(
+                    rhs_up_block, sub * 16, lane_group);
+            } else if constexpr (QTYPE == QWEN35_LOWBIT_GGML_Q6_K) {
+                gate_b = ggml_q6_k_dequant_bf16_gfx12_fragment<TRUNC_DEQUANT>(
+                    rhs_gate_block, sub * 16, lane_group);
+                up_b = ggml_q6_k_dequant_bf16_gfx12_fragment<TRUNC_DEQUANT>(
+                    rhs_up_block, sub * 16, lane_group);
+            } else {
+                uint16_t gate_bits[16];
+                uint16_t up_bits[16];
+                ggml_k_dequant_16_bf16_bits_from_block_fixed<QTYPE, TRUNC_DEQUANT>(
+                    rhs_gate_block, sub * 16, gate_bits);
+                ggml_k_dequant_16_bf16_bits_from_block_fixed<QTYPE, TRUNC_DEQUANT>(
+                    rhs_up_block, sub * 16, up_bits);
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) {
+                    const int ab_row = lane_group * 4 + (i & 3) + ((i >> 2) * 8);
+                    gate_b[i] = static_cast<short>(gate_bits[ab_row]);
+                    up_b[i] = static_cast<short>(up_bits[ab_row]);
+                }
+            }
+
+            gate_acc = supersonic_wmma_bf16_gfx12_native_acc(a, gate_b, gate_acc);
+            up_acc = supersonic_wmma_bf16_gfx12_native_acc(a, up_b, up_acc);
+        }
+    }
+
+    if (out_col_idx < n_each) {
+        const size_t out_batch_base = static_cast<size_t>(batch) * 16 * static_cast<size_t>(n_each);
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int out_row = lane_group * 8 + i;
             const hip_bfloat16 gate_bf16(gate_acc[i]);
             const hip_bfloat16 up_bf16(up_acc[i]);
             const float gate_x = static_cast<float>(gate_bf16);
@@ -5987,6 +7003,134 @@ void supersonic_qwen35_matmul_int4_dequant_wmma_kernel(
 #endif
 }
 
+__global__ __launch_bounds__(128, 2)
+void supersonic_qwen35_matmul_ggml_q8_0_wmma_gfx12_large_m_kernel(
+    size_t batch_elems,
+    int m,
+    int n,
+    int k,
+    const hip_bfloat16* __restrict__ lhs,    // [batch, m, k]
+    const uint8_t* __restrict__ rhs_q8,      // [batch, n, row_bytes]
+    hip_bfloat16* __restrict__ out           // [batch, m, n]
+) {
+#if defined(SUPERSONIC_HAS_WMMA_BF16) && SUPERSONIC_WMMA_GFX12
+    const int tid      = threadIdx.x;
+    const int lane     = tid & 31;
+    const int wid      = tid >> 5;
+    const int wave_row = wid >> 1;
+    const int wave_col = wid & 1;
+    const int lane_row = lane & 15;
+    const int lane_group = lane >> 4;
+
+    const int batch   = blockIdx.z;
+    const int blk_row = blockIdx.y * TILED_WMMA_BM;
+    const int blk_col = blockIdx.x * TILED_WMMA_BN;
+
+    __shared__ uint16_t s_lhs[TILED_WMMA_BM * TILED_WMMA_LDS_STRIDE];
+    __shared__ uint16_t s_rhs[TILED_WMMA_BN * TILED_WMMA_LDS_STRIDE];
+
+    const uint16_t* lhs_u16 = reinterpret_cast<const uint16_t*>(lhs);
+    const int row_bytes = (k / 32) * 34;
+    const size_t lhs_batch_base = static_cast<size_t>(batch) * m * k;
+    const size_t rhs_batch_base = static_cast<size_t>(batch) * n * static_cast<size_t>(row_bytes);
+
+    supersonic_float8 acc00 = {0.f,0.f,0.f,0.f,0.f,0.f,0.f,0.f};
+    supersonic_float8 acc01 = {0.f,0.f,0.f,0.f,0.f,0.f,0.f,0.f};
+    supersonic_float8 acc10 = {0.f,0.f,0.f,0.f,0.f,0.f,0.f,0.f};
+    supersonic_float8 acc11 = {0.f,0.f,0.f,0.f,0.f,0.f,0.f,0.f};
+
+    constexpr int K_COL_HALVES = TILED_WMMA_BK / 32;
+    constexpr int K_Q8_PASSES = TILED_WMMA_BK / 32;
+    constexpr int K_CHUNKS = TILED_WMMA_BK / 16;
+
+    for (int kk0 = 0; kk0 < k; kk0 += TILED_WMMA_BK) {
+        #pragma unroll
+        for (int iter = 0; iter < 16; ++iter) {
+            const int lds_row = wid * 16 + iter;
+            const int gr = blk_row + lds_row;
+            #pragma unroll
+            for (int ch = 0; ch < K_COL_HALVES; ++ch) {
+                const int col = ch * 32 + lane;
+                uint16_t v = 0;
+                if (gr < m) {
+                    v = lhs_u16[lhs_batch_base + static_cast<size_t>(gr) * k + kk0 + col];
+                }
+                s_lhs[lds_row * TILED_WMMA_LDS_STRIDE + col] = v;
+            }
+        }
+
+        #pragma unroll
+        for (int iter = 0; iter < 16; ++iter) {
+            const int lds_row = wid * 16 + iter;
+            const int gc = blk_col + lds_row;
+            #pragma unroll
+            for (int pass = 0; pass < K_Q8_PASSES; ++pass) {
+                const int col0 = pass * 32;
+                uint16_t qbits = 0;
+                if (gc < n) {
+                    const uint8_t* block = rhs_q8 + rhs_batch_base +
+                        static_cast<size_t>(gc) * row_bytes + ((kk0 + col0) / 32) * 34;
+                    const float d = ggml_f16_to_f32_unaligned(block);
+                    const int8_t q = reinterpret_cast<const int8_t*>(block + 2)[lane];
+                    qbits = f32_to_bf16_bits_rne_finite(d * static_cast<float>(q));
+                }
+                s_rhs[lds_row * TILED_WMMA_LDS_STRIDE + col0 + lane] = qbits;
+            }
+        }
+        __syncthreads();
+
+        #pragma unroll
+        for (int kchunk = 0; kchunk < K_CHUNKS; ++kchunk) {
+            const int k_off = kchunk * 16;
+            supersonic_short8 a0, a1, b0, b1;
+            const int a0_row = wave_row * 32 + lane_row;
+            const int a1_row = wave_row * 32 + 16 + lane_row;
+            const int b0_row = wave_col * 32 + lane_row;
+            const int b1_row = wave_col * 32 + 16 + lane_row;
+
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int ab_col = lane_group * 4 + (i & 3) + ((i >> 2) * 8);
+                a0[i] = static_cast<short>(s_lhs[a0_row * TILED_WMMA_LDS_STRIDE + k_off + ab_col]);
+                a1[i] = static_cast<short>(s_lhs[a1_row * TILED_WMMA_LDS_STRIDE + k_off + ab_col]);
+                b0[i] = static_cast<short>(s_rhs[b0_row * TILED_WMMA_LDS_STRIDE + k_off + ab_col]);
+                b1[i] = static_cast<short>(s_rhs[b1_row * TILED_WMMA_LDS_STRIDE + k_off + ab_col]);
+            }
+
+            acc00 = supersonic_wmma_bf16_gfx12_native_acc(a0, b0, acc00);
+            acc01 = supersonic_wmma_bf16_gfx12_native_acc(a0, b1, acc01);
+            acc10 = supersonic_wmma_bf16_gfx12_native_acc(a1, b0, acc10);
+            acc11 = supersonic_wmma_bf16_gfx12_native_acc(a1, b1, acc11);
+        }
+        __syncthreads();
+    }
+
+    const size_t out_batch_base = static_cast<size_t>(batch) * m * n;
+    const int sub_row_base = blk_row + wave_row * 32;
+    const int sub_col_base = blk_col + wave_col * 32;
+
+    auto store_sub = [&](const supersonic_float8& acc, int sub_row_off, int sub_col_off) {
+        const int out_col = sub_col_base + sub_col_off + lane_row;
+        if (out_col < n) {
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int out_row = sub_row_base + sub_row_off + lane_group * 8 + i;
+                if (out_row < m) {
+                    out[out_batch_base + static_cast<size_t>(out_row) * n + out_col] =
+                        hip_bfloat16(acc[i]);
+                }
+            }
+        }
+    };
+    store_sub(acc00, 0,  0);
+    store_sub(acc01, 0,  16);
+    store_sub(acc10, 16, 0);
+    store_sub(acc11, 16, 16);
+#else
+    (void)batch_elems; (void)m; (void)n; (void)k; (void)lhs; (void)rhs_q8; (void)out;
+#endif
+}
+
 template <typename T>
 __global__ void supersonic_qwen35_int4_sparse_outlier_add_kernel(
     int rows,
@@ -6394,21 +7538,23 @@ __global__ void supersonic_qwen35_rms_norm_kernel(
         partial += x * x;
     }
 
-    __shared__ float shared_sum[256];
-    shared_sum[tid] = partial;
+    __shared__ float shared_inv_rms;
+    __shared__ float shared_warp_sum[8];
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const float warp_sum = supersonic_qwen35_wave_sum(partial);
+    if (lane == 0) {
+        shared_warp_sum[warp] = warp_sum;
+    }
     __syncthreads();
 
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            shared_sum[tid] += shared_sum[tid + stride];
+    if (warp == 0) {
+        float block_sum = lane < (blockDim.x + 31) / 32 ? shared_warp_sum[lane] : 0.0f;
+        block_sum = supersonic_qwen35_wave_sum(block_sum);
+        if (lane == 0) {
+            const float mean = block_sum / static_cast<float>(n_cols);
+            shared_inv_rms = rsqrtf(mean + eps);
         }
-        __syncthreads();
-    }
-
-    __shared__ float shared_inv_rms;
-    if (tid == 0) {
-        const float mean = shared_sum[0] / static_cast<float>(n_cols);
-        shared_inv_rms = rsqrtf(mean + eps);
     }
     __syncthreads();
 
@@ -6543,28 +7689,30 @@ __global__ void supersonic_qwen35_rms_norm_gated_kernel(
         partial += x * x;
     }
 
-    __shared__ float shared_sum[256];
-    shared_sum[tid] = partial;
+    __shared__ float shared_inv_rms;
+    __shared__ float shared_warp_sum[8];
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const float warp_sum = supersonic_qwen35_wave_sum(partial);
+    if (lane == 0) {
+        shared_warp_sum[warp] = warp_sum;
+    }
     __syncthreads();
 
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            shared_sum[tid] += shared_sum[tid + stride];
+    if (warp == 0) {
+        float block_sum = lane < (blockDim.x + 31) / 32 ? shared_warp_sum[lane] : 0.0f;
+        block_sum = supersonic_qwen35_wave_sum(block_sum);
+        if (lane == 0) {
+            const float mean = block_sum / static_cast<float>(n_cols);
+            shared_inv_rms = rsqrtf(mean + eps);
         }
-        __syncthreads();
-    }
-
-    __shared__ float shared_inv_rms;
-    if (tid == 0) {
-        const float mean = shared_sum[0] / static_cast<float>(n_cols);
-        shared_inv_rms = rsqrtf(mean + eps);
     }
     __syncthreads();
 
     for (int col = tid; col < n_cols; col += blockDim.x) {
         const float x = supersonic_qwen35_to_float(row_hidden[col]);
         const float gate_x = supersonic_qwen35_to_float(row_gate[col]);
-    const float gate_silu = gate_x * supersonic_qwen35_sigmoid_fast(gate_x);
+        const float gate_silu = gate_x * supersonic_qwen35_sigmoid_fast(gate_x);
         const float weight_val = supersonic_qwen35_to_float(weight[col]);
         row_out[col] =
             supersonic_qwen35_from_float<T>(x * shared_inv_rms * weight_val * gate_silu);
