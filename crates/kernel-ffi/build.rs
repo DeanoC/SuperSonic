@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -35,11 +36,18 @@ fn detect_hip_archs() -> Vec<String> {
         return Vec::new();
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    stdout
+    let archs: BTreeSet<String> = stdout
         .split_whitespace()
-        .find(|token| token.starts_with("gfx"))
-        .map(|s| vec![s.to_owned()])
-        .unwrap_or_default()
+        .filter_map(|token| {
+            let token = token.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+            let suffix = token.strip_prefix("gfx")?;
+            if suffix.is_empty() || !suffix.chars().all(|c| c.is_ascii_hexdigit()) {
+                return None;
+            }
+            Some(token.to_owned())
+        })
+        .collect();
+    archs.into_iter().collect()
 }
 
 fn detect_cuda_archs() -> Vec<String> {

@@ -3192,36 +3192,40 @@ pub fn delta_recurrent_prefill_capture_q8_trace_attn(
     {
         return Ok(false);
     }
-    ffi_profile_time_result(
-        "qwen.delta_recurrent_prefill_capture_q8_trace_attn",
-        ordinal,
-        || {
-            let status = unsafe {
-                supersonic_qwen35_hip_delta_recurrent_prefill_capture_q8_trace_attn(
-                    dtype.kernel_dtype_code(),
-                    ordinal,
-                    batch_heads,
-                    seq_len,
-                    k_head_dim,
-                    v_head_dim,
-                    recurrent_state.as_mut_ptr(),
-                    query.as_ptr(),
-                    key.as_ptr(),
-                    value.as_ptr(),
-                    beta.as_ptr(),
-                    g.as_ptr(),
-                    attn_output.as_mut_ptr(),
-                    state_trace.as_mut_ptr(),
-                )
-            };
-            if status != 0 {
-                return Err(ffi_error(format!(
-                    "delta_recurrent_prefill_capture_q8_trace_attn failed: {status}"
-                )));
-            }
-            Ok(())
-        },
-    )?;
+    let profile_key = if std::env::var_os("SUPERSONIC_DFLASH_PROFILE_FFI_SHAPES").is_some() {
+        format!(
+            "qwen.delta_recurrent_prefill_capture_q8_trace_attn[bh={} s={} k={} v={}]",
+            batch_heads, seq_len, k_head_dim, v_head_dim
+        )
+    } else {
+        "qwen.delta_recurrent_prefill_capture_q8_trace_attn".to_string()
+    };
+    ffi_profile_time_result_key(profile_key, ordinal, || {
+        let status = unsafe {
+            supersonic_qwen35_hip_delta_recurrent_prefill_capture_q8_trace_attn(
+                dtype.kernel_dtype_code(),
+                ordinal,
+                batch_heads,
+                seq_len,
+                k_head_dim,
+                v_head_dim,
+                recurrent_state.as_mut_ptr(),
+                query.as_ptr(),
+                key.as_ptr(),
+                value.as_ptr(),
+                beta.as_ptr(),
+                g.as_ptr(),
+                attn_output.as_mut_ptr(),
+                state_trace.as_mut_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!(
+                "delta_recurrent_prefill_capture_q8_trace_attn failed: {status}"
+            )));
+        }
+        Ok(())
+    })?;
     Ok(true)
 }
 
@@ -5076,7 +5080,15 @@ pub fn rms_norm_rows(
             metal_host::rms_norm_rows(dtype, n_rows, n_cols, eps, true, input, weight, out)
         });
     }
-    ffi_profile_time_result("qwen.rms_norm_rows", ordinal, || {
+    let profile_key = if std::env::var_os("SUPERSONIC_DFLASH_PROFILE_FFI_SHAPES").is_some() {
+        format!(
+            "qwen.rms_norm_rows[rows={} cols={} dtype={:?}]",
+            n_rows, n_cols, dtype
+        )
+    } else {
+        "qwen.rms_norm_rows".to_string()
+    };
+    ffi_profile_time_result_key(profile_key, ordinal, || {
         let status = unsafe {
             supersonic_qwen35_hip_rms_norm(
                 dtype.kernel_dtype_code(),
@@ -5138,7 +5150,15 @@ pub fn rms_norm_rows_plain(
             metal_host::rms_norm_rows(dtype, n_rows, n_cols, eps, false, input, weight, out)
         });
     }
-    ffi_profile_time_result("qwen.rms_norm_rows_plain", ordinal, || {
+    let profile_key = if std::env::var_os("SUPERSONIC_DFLASH_PROFILE_FFI_SHAPES").is_some() {
+        format!(
+            "qwen.rms_norm_rows_plain[rows={} cols={} dtype={:?}]",
+            n_rows, n_cols, dtype
+        )
+    } else {
+        "qwen.rms_norm_rows_plain".to_string()
+    };
+    ffi_profile_time_result_key(profile_key, ordinal, || {
         let status = unsafe {
             supersonic_qwen35_hip_rms_norm(
                 dtype.kernel_dtype_code(),
@@ -5201,26 +5221,36 @@ pub fn rms_norm_rows_plain_inplace(
             metal_host::rms_norm_rows(dtype, n_rows, n_cols, eps, false, &input, weight, data)
         });
     }
-    let ptr = data.as_mut_ptr();
-    let status = unsafe {
-        supersonic_qwen35_hip_rms_norm(
-            dtype.kernel_dtype_code(),
-            ordinal,
-            n_rows,
-            n_cols,
-            eps,
-            0,
-            ptr,
-            weight.as_ptr(),
-            ptr,
+    let profile_key = if std::env::var_os("SUPERSONIC_DFLASH_PROFILE_FFI_SHAPES").is_some() {
+        format!(
+            "qwen.rms_norm_rows_plain_inplace[rows={} cols={} dtype={:?}]",
+            n_rows, n_cols, dtype
         )
+    } else {
+        "qwen.rms_norm_rows_plain_inplace".to_string()
     };
-    if status != 0 {
-        return Err(ffi_error(format!(
-            "rms_norm_rows_plain_inplace failed: {status}"
-        )));
-    }
-    Ok(())
+    ffi_profile_time_result_key(profile_key, ordinal, || {
+        let ptr = data.as_mut_ptr();
+        let status = unsafe {
+            supersonic_qwen35_hip_rms_norm(
+                dtype.kernel_dtype_code(),
+                ordinal,
+                n_rows,
+                n_cols,
+                eps,
+                0,
+                ptr,
+                weight.as_ptr(),
+                ptr,
+            )
+        };
+        if status != 0 {
+            return Err(ffi_error(format!(
+                "rms_norm_rows_plain_inplace failed: {status}"
+            )));
+        }
+        Ok(())
+    })
 }
 
 /// In-place `lhs += rhs`. Aliasing lhs and out in the underlying kernel is
