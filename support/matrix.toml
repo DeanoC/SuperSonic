@@ -22,13 +22,11 @@ notes = "RDNA3 7900 XTX Qwen3.5 lanes are the mature HIP baseline."
 id = "hip-gfx1100-qwen36-35b-a3b-int4"
 backend = "hip"
 arch = "gfx1100"
-status = "validated"
+status = "experimental"
 models = ["qwen3.6-35b-a3b"]
 quants = ["int4"]
 support_doc = "docs/supported-matrix.md#hip-on-gfx1100"
-gate_scripts = ["tests/gfx1100/run_matrix.sh"]
-benchmark_doc = "docs/benchmarks.md#lucebox-qwen36-27b-7900-xtx"
-notes = "BF16 is intentionally unsupported for the FP8-native checkpoint; INT4 is the supported HIP lane."
+notes = "BF16 is intentionally unsupported for the FP8-native checkpoint. The Markdown matrix documents the INT4 lane, but this manifest keeps it experimental until a named gfx1100 35B gate exists."
 
 [[entry]]
 id = "hip-gfx1201-qwen35-tbm"
@@ -139,16 +137,57 @@ gate_scripts = ["tests/metal/qwen35_bughunt_gate.sh"]
 notes = "Apple M4 remains the small Qwen3.5 Metal validation lane."
 
 [[entry]]
-id = "metal-apple-m5-max-large-model-smokes"
+id = "metal-apple-m5-max-qwen3-moe-int4"
 backend = "metal"
 arch = "apple-m5-max"
 status = "validated"
-models = ["qwen3-30b-a3b", "qwen3.6-35b-a3b", "gemma4-e2b", "gemma4-e4b", "phi4-mini"]
+models = ["qwen3-30b-a3b"]
+quants = ["int4"]
+support_doc = "docs/supported-matrix.md#metal-on-apple-m4-apple-m5-max"
+gate_commands = [
+  "cargo test --release -p runner --test metal_large_model_smoke -- --ignored --nocapture",
+]
+benchmark_doc = "docs/benchmarks.md#external-references"
+notes = "Apple M5 Max Qwen3 MoE INT4 correctness lane through component and chained Metal paths."
+
+[[entry]]
+id = "metal-apple-m5-max-qwen36-moe-int4"
+backend = "metal"
+arch = "apple-m5-max"
+status = "validated"
+models = ["qwen3.6-35b-a3b"]
+quants = ["int4"]
+support_doc = "docs/supported-matrix.md#metal-on-apple-m4-apple-m5-max"
+gate_commands = [
+  "cargo test --release -p runner --test qwen36_moe_metal_smoke -- --ignored --nocapture",
+]
+benchmark_doc = "docs/benchmarks.md#external-references"
+notes = "Apple M5 Max Qwen3.6 MoE INT4 correctness lane through component and chained Metal paths."
+
+[[entry]]
+id = "metal-apple-m5-max-gemma4-bf16-int4"
+backend = "metal"
+arch = "apple-m5-max"
+status = "validated"
+models = ["gemma4-e2b", "gemma4-e4b"]
+quants = ["bf16", "int4"]
+support_doc = "docs/supported-matrix.md#metal-on-apple-m4-apple-m5-max"
+gate_commands = [
+  "cargo test --release -p runner --test metal_large_model_smoke -- --ignored --nocapture",
+]
+benchmark_doc = "docs/benchmarks.md#external-references"
+notes = "Apple M5 Max Gemma 4 BF16 and INT4 correctness lane."
+
+[[entry]]
+id = "metal-apple-m5-max-phi4-bf16-int4-fp8"
+backend = "metal"
+arch = "apple-m5-max"
+status = "validated"
+models = ["phi4-mini"]
 quants = ["bf16", "int4", "fp8-runtime"]
 support_doc = "docs/supported-matrix.md#metal-on-apple-m4-apple-m5-max"
 gate_commands = [
   "cargo test --release -p runner --test metal_large_model_smoke -- --ignored --nocapture",
-  "cargo test --release -p runner --test qwen36_moe_metal_smoke -- --ignored --nocapture",
 ]
 benchmark_doc = "docs/benchmarks.md#external-references"
-notes = "Apple M5 Max large-model correctness lane through component and chained Metal paths."
+notes = "Apple M5 Max Phi-4 mini BF16, INT4, and FP8-runtime correctness lane."
