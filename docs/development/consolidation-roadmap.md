@@ -136,7 +136,7 @@ Target behavior:
 | --- | --- | --- |
 | PR 2 | Add a `tools/` classification path, `crates/runner/src/bin/lab/` convention, or metadata manifest. Keep wrapper aliases for existing binary names. | Existing `cargo run --bin ...` commands continue to work. |
 | PR 3 | Extract shared runtime/generation/session interfaces so `supersonic-runtime` no longer depends on `runner`. | Build runner, runtime, and server; keep CLI behavior unchanged. |
-| PR 4 | Introduce a single capability/support data source used by docs/tests where practical. | Generated or checked docs must still be easy to review. |
+| PR 4 | Introduce `support/matrix.toml` as the seed capability/support data source used by docs/tests where practical. | Validate the manifest with `python3 tools/check-support-matrix.py`; generated or checked docs must still be easy to review. |
 | PR 5 | Split `kernel-ffi/build.rs` into model/backend compile groups with default behavior preserved. | Compare old default behavior with grouped builds on one representative backend. |
 | PR 6+ | Move larger model-specific runtime implementations out of `runner` once public interfaces are stable. | One benchmark or parity artifact for each moved runtime path. |
 
