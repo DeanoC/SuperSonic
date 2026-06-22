@@ -1,14 +1,14 @@
 use std::time::Instant;
 
 use anyhow::{anyhow, bail, Context, Result};
-use runner::decode_engine::DecodeEngine;
-use runner::gemma4_engine::Gemma4Engine;
-use runner::gemma4_int4_engine::Gemma4Int4Engine;
 use supersonic_core::registry::{self, Backend, FamilyParams};
 
 use crate::bakes::{
     ensure_gemma4_int4_bake_available, ensure_qwen35_bake_available, selected_bake_variant,
 };
+use crate::decode_engine::DecodeEngine;
+use crate::gemma4_engine::Gemma4Engine;
+use crate::gemma4_int4_engine::Gemma4Int4Engine;
 use crate::session::InferenceSession;
 use crate::state::LoaderConfig;
 

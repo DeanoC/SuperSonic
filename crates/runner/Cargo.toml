@@ -86,6 +86,7 @@ path = "src/bin/qwen36_q4km_manifest_audit.rs"
 
 [dependencies]
 machine-profile = { path = "../machine-profile" }
+supersonic-runtime = { path = "../runtime" }
 supersonic-core = { path = "../core" }
 gpu-hal = { path = "../gpu-hal" }
 kernel-ffi = { path = "../kernel-ffi" }

@@ -25,9 +25,10 @@ crossings rarer and easier to remove.
 
 These are known seams to clean up after this documentation foundation lands:
 
-- `supersonic-runtime` currently depends on `runner`. Shared generation,
-  request/session, and response types should move into `runtime` or a small
-  shared crate so the runtime boundary is library-first.
+- `runner` still carries compatibility shims and larger model-specific runtime
+  paths while public APIs settle. Keep moving stable generation/session code
+  toward `runtime` or a small shared crate so the runtime boundary stays
+  library-first.
 - `crates/runner/src/bin/*` contains stable-ish validation tools, true
   microbenches, diagnostics, and lab experiments in one flat namespace. Command
   names must keep working, but the repo needs a classification layer before
