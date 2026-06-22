@@ -6,9 +6,9 @@
 
 use anyhow::{anyhow, Result};
 
-use runner::decode_engine::DecodeEngine;
-use runner::gemma4_engine::Gemma4Engine;
-use runner::gemma4_int4_engine::Gemma4Int4Engine;
+use crate::decode_engine::{DecodeEngine, DecodeEngineSnapshot};
+use crate::gemma4_engine::{Gemma4Engine, Gemma4EngineSnapshot};
+use crate::gemma4_int4_engine::{Gemma4Int4Engine, Gemma4Int4EngineSnapshot};
 
 pub enum InferenceSession {
     Qwen(DecodeEngine),
@@ -17,9 +17,9 @@ pub enum InferenceSession {
 }
 
 pub enum SessionSnapshot {
-    Qwen(runner::decode_engine::DecodeEngineSnapshot),
-    Gemma4Bf16(runner::gemma4_engine::Gemma4EngineSnapshot),
-    Gemma4Int4(runner::gemma4_int4_engine::Gemma4Int4EngineSnapshot),
+    Qwen(DecodeEngineSnapshot),
+    Gemma4Bf16(Gemma4EngineSnapshot),
+    Gemma4Int4(Gemma4Int4EngineSnapshot),
 }
 
 impl SessionSnapshot {

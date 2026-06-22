@@ -1873,6 +1873,7 @@ dependencies = [
  "serde",
  "serde_json",
  "supersonic-core",
+ "supersonic-runtime",
  "tempfile",
  "tokenizers",
 ]
@@ -2201,16 +2202,19 @@ name = "supersonic-runtime"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "gemma4",
  "gpu-hal",
+ "half",
  "kernel-ffi",
+ "memmap2",
  "minijinja",
  "minijinja-contrib",
  "model-store",
  "qwen35",
  "rand 0.8.6",
  "rand_chacha 0.3.1",
- "runner",
+ "safetensors",
  "serde",
  "serde_json",
  "sha2",

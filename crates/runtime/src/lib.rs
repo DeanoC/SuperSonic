@@ -9,12 +9,18 @@ pub(crate) mod backend_resolver;
 pub(crate) mod bakes;
 pub(crate) mod builders;
 pub mod chat_template;
+pub mod decode_engine;
+pub mod gemma4_engine;
+pub mod gemma4_int4_engine;
 pub mod generate;
 pub mod ids;
+pub mod oracle;
+pub mod prefill_engine;
 pub mod prefix_cache;
 pub mod sampling;
 pub mod session;
 pub mod state;
+pub mod tensor_bytes;
 
 pub use state::{build, LoaderConfig, ServerState};
 pub use supersonic_core::{backend, capabilities, registry};
