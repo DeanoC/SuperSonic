@@ -51,6 +51,11 @@ Classification:
 
 Current runner binary inventory:
 
+The checked source of truth is
+[`tools/tool-inventory.toml`](../../tools/tool-inventory.toml). Validate it with
+`python3 tools/check-tool-inventory.py`. The table below is the human-readable
+summary and should stay aligned with the manifest until it is generated.
+
 | Command | Current file | Class | Future home |
 | --- | --- | --- | --- |
 | `supersonic` | `crates/runner/src/main.rs` | stable | Keep as the primary CLI until runtime/server APIs are fully split. |
