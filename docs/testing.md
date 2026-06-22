@@ -6,6 +6,11 @@ README files (`crates/runner/`, `crates/kernel-ffi/`, etc.).
 For repeatable performance, Lucebox, external-reference, and profiler commands,
 see [benchmarks.md](benchmarks.md).
 
+Support lanes with named gates are being captured in
+[`support/matrix.toml`](../support/matrix.toml). Run
+`python3 tools/check-support-matrix.py` after changing supported architectures,
+gate scripts, or benchmark references.
+
 Tests are machine-specific — each GPU architecture has its own test script under `tests/`. A test runs the full decode pipeline with PyTorch oracle validation and checks that the output delta is below a threshold.
 
 ### Running tests

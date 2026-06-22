@@ -6,6 +6,12 @@ which GPU architecture. The cells below track *correctness* — see
 and [docs/feature-compatibility.md](feature-compatibility.md) for the
 runtime-feature compatibility grid.
 
+The first machine-readable seed for this matrix lives in
+[`support/matrix.toml`](../support/matrix.toml). Validate it with
+`python3 tools/check-support-matrix.py`. For now this Markdown table remains
+the reviewed operator-facing source, and the manifest records the high-value
+lanes that already have named gates or benchmark references.
+
 Seven backend surfaces are validated or in bring-up today:
 
 - **HIP / `gfx1100`** — AMD Radeon RX 7900 XTX (RDNA 3, 24 GiB)
