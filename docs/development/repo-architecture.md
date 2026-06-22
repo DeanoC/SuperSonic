@@ -62,4 +62,5 @@ These are known seams to clean up after this documentation foundation lands:
 - [Testing gates](../testing.md)
 - [Benchmark recipes](../benchmarks.md)
 - [Kernel lab](kernel-lab.md)
+- [Kernel build groups](kernel-build-groups.md)
 - [Consolidation roadmap](consolidation-roadmap.md)

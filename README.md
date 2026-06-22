@@ -55,6 +55,8 @@ to disable network fetches.
   kernels, tests, and docs.
 - **[Consolidation roadmap](docs/development/consolidation-roadmap.md)** —
   staged cleanup plan and non-breaking inventory for current tools.
+- **[Kernel build groups](docs/development/kernel-build-groups.md)** —
+  checked scaffold for future backend/model compile groups in `kernel-ffi`.
 - **[DFlash speculative decode](docs/dflash.md)** — Qwen3.5-9B INT4
   speculative decode design and milestones.
 - **[Qwen3-30B-A3B HIP bring-up](docs/bringup/qwen3-30b-a3b-hip.md)** —

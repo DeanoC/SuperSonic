@@ -1,0 +1,208 @@
+# Machine-readable kernel bridge group scaffold.
+#
+# This manifest documents the current broad compile surface without changing
+# default build behavior. The build script still compiles all groups for the
+# selected backend; later PRs can use these ids for opt-in grouped builds.
+
+version = 1
+
+[[group]]
+id = "hip-qwen35"
+backend = "hip"
+model_family = "qwen3.5"
+default_compiled = true
+notes = "Dense Qwen3.5 HIP attention and prefill bridge family."
+kernel_sources = [
+  "kernels/full_attention.hip",
+  "kernels/full_attention_4b.hip",
+  "kernels/prefill_helpers.hip",
+]
+rust_modules = [
+  "crates/kernel-ffi/src/qwen35.rs",
+  "crates/kernel-ffi/src/prefill_ffi.rs",
+]
+
+[[group.bridge]]
+source = "kernels/full_attention_bridge.cpp"
+object = "qwen35_megakernel_hip.o"
+
+[[group.bridge]]
+source = "kernels/full_attention_bridge_4b.cpp"
+object = "qwen35_4b_megakernel_hip.o"
+
+[[group.bridge]]
+source = "kernels/prefill_helpers_bridge.cpp"
+object = "qwen35_prefill_helpers_hip.o"
+
+[[group]]
+id = "hip-gemma4"
+backend = "hip"
+model_family = "gemma4"
+default_compiled = true
+notes = "Gemma 4 HIP bridge family."
+kernel_sources = ["kernels/gemma4.hip"]
+rust_modules = ["crates/kernel-ffi/src/gemma4.rs"]
+
+[[group.bridge]]
+source = "kernels/gemma4_bridge.cpp"
+object = "gemma4_hip.o"
+
+[[group]]
+id = "hip-phi4"
+backend = "hip"
+model_family = "phi4"
+default_compiled = true
+notes = "Phi-4 HIP bridge family."
+kernel_sources = ["kernels/phi4.hip"]
+rust_modules = ["crates/kernel-ffi/src/phi4.rs"]
+
+[[group.bridge]]
+source = "kernels/phi4_bridge.cpp"
+object = "phi4_hip.o"
+
+[[group]]
+id = "hip-dflash"
+backend = "hip"
+model_family = "qwen3.5-dflash"
+default_compiled = true
+notes = "DFlash draft HIP bridge family."
+kernel_sources = ["kernels/dflash_draft.hip"]
+rust_modules = ["crates/kernel-ffi/src/dflash.rs"]
+
+[[group.bridge]]
+source = "kernels/dflash_draft_bridge.cpp"
+object = "dflash_draft_hip.o"
+
+[[group]]
+id = "hip-qwen36-moe"
+backend = "hip"
+model_family = "qwen3.6-moe"
+default_compiled = true
+notes = "Qwen3.6 MoE HIP bridge, persistent decode, and batched prefill family."
+kernel_sources = [
+  "kernels/qwen36_moe.hip",
+  "kernels/qwen36_moe_persistent/helpers.cuh",
+  "kernels/qwen36_moe_persistent/full_attn_phase.cuh",
+  "kernels/qwen36_moe_persistent/linear_attn_phase.cuh",
+  "kernels/qwen36_moe_persistent/ffn_phase.cuh",
+  "kernels/qwen36_moe_persistent/lm_head_phase.cuh",
+  "kernels/qwen36_moe_persistent/persistent_decode.hip",
+  "kernels/qwen36_moe_persistent/batched_prefill_attn_full.cuh",
+  "kernels/qwen36_moe_persistent/batched_prefill_grouped_expert.cuh",
+  "kernels/qwen36_moe_persistent/batched_prefill_router_permute.cuh",
+  "kernels/qwen36_moe_persistent/batched_prefill_unpermute_combine.cuh",
+]
+rust_modules = ["crates/kernel-ffi/src/qwen36_moe.rs"]
+
+[[group.bridge]]
+source = "kernels/qwen36_moe_bridge.cpp"
+object = "qwen36_moe_hip.o"
+
+[[group]]
+id = "hip-qwen3-moe"
+backend = "hip"
+model_family = "qwen3-moe"
+default_compiled = true
+notes = "Qwen3 MoE HIP bridge family."
+kernel_sources = ["kernels/qwen3_moe.hip"]
+rust_modules = ["crates/kernel-ffi/src/qwen3_moe.rs"]
+
+[[group.bridge]]
+source = "kernels/qwen3_moe_bridge.cpp"
+object = "qwen3_moe_hip.o"
+
+[[group]]
+id = "cuda-qwen35"
+backend = "cuda"
+model_family = "qwen3.5"
+default_compiled = true
+notes = "Dense Qwen3.5 CUDA attention and prefill bridge family."
+kernel_sources = [
+  "kernels/full_attention_cuda.cuh",
+  "kernels/full_attention_4b_cuda.cuh",
+  "kernels/prefill_helpers_cuda.cuh",
+]
+rust_modules = [
+  "crates/kernel-ffi/src/qwen35.rs",
+  "crates/kernel-ffi/src/prefill_ffi.rs",
+]
+
+[[group.bridge]]
+source = "kernels/full_attention_bridge_cuda.cu"
+object = "qwen35_megakernel_cuda.o"
+
+[[group.bridge]]
+source = "kernels/full_attention_bridge_4b_cuda.cu"
+object = "qwen35_4b_megakernel_cuda.o"
+
+[[group.bridge]]
+source = "kernels/prefill_helpers_bridge_cuda.cu"
+object = "qwen35_prefill_helpers_cuda.o"
+
+[[group]]
+id = "cuda-llama31"
+backend = "cuda"
+model_family = "llama3.1"
+default_compiled = true
+notes = "Llama 3.1 certified-KV CUDA bridge family."
+kernel_sources = []
+rust_modules = ["crates/kernel-ffi/src/certified_kv.rs"]
+
+[[group.bridge]]
+source = "kernels/certified_kv_bridge_cuda.cu"
+object = "llama31_certified_kv_cuda.o"
+
+[[group]]
+id = "cuda-phi4"
+backend = "cuda"
+model_family = "phi4"
+default_compiled = true
+notes = "Phi-4 CUDA bridge family."
+kernel_sources = ["kernels/phi4_cuda.cuh"]
+rust_modules = ["crates/kernel-ffi/src/phi4.rs"]
+
+[[group.bridge]]
+source = "kernels/phi4_bridge_cuda.cu"
+object = "phi4_cuda.o"
+
+[[group]]
+id = "cuda-gemma4"
+backend = "cuda"
+model_family = "gemma4"
+default_compiled = true
+notes = "Gemma 4 CUDA bridge family."
+kernel_sources = ["kernels/gemma4_cuda.cuh"]
+rust_modules = ["crates/kernel-ffi/src/gemma4.rs"]
+
+[[group.bridge]]
+source = "kernels/gemma4_bridge_cuda.cu"
+object = "gemma4_cuda.o"
+
+[[group]]
+id = "cuda-qwen36-moe"
+backend = "cuda"
+model_family = "qwen3.6-moe"
+default_compiled = true
+notes = "Qwen3.6 MoE CUDA bridge family."
+kernel_sources = ["kernels/qwen36_moe_cuda_prelude.cuh"]
+rust_modules = ["crates/kernel-ffi/src/qwen36_moe.rs"]
+
+[[group.bridge]]
+source = "kernels/qwen36_moe_bridge_cuda.cu"
+object = "qwen36_moe_cuda.o"
+
+[[group]]
+id = "metal-host-stubs"
+backend = "metal"
+model_family = "metal-host"
+default_compiled = true
+notes = "Metal host/native link layer compiled by cc on macOS."
+kernel_sources = []
+native_sources = [
+  "crates/kernel-ffi/src/metal_link_stubs.cc",
+  "crates/kernel-ffi/src/metal_native.mm",
+]
+rust_modules = [
+  "crates/kernel-ffi/src/metal_host.rs",
+  "crates/kernel-ffi/src/metal_native.rs",
+]

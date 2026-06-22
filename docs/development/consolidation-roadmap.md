@@ -126,6 +126,9 @@ Target behavior:
 - Default builds preserve today's behavior until grouped builds are proven.
 - Feature groups are named by backend and model family, not by incidental file
   layout.
+- The checked group scaffold lives in
+  [`crates/kernel-ffi/kernel-groups.toml`](../../crates/kernel-ffi/kernel-groups.toml)
+  and is validated by `python3 tools/check-kernel-groups.py`.
 - Kernel-lab and architecture smoke scripts identify the minimum coverage for
   each group.
 - Profiling hooks remain available through `kernel-ffi` typed wrappers.
@@ -137,7 +140,7 @@ Target behavior:
 | PR 2 | Add a `tools/` classification path, `crates/runner/src/bin/lab/` convention, or metadata manifest. Keep wrapper aliases for existing binary names. | Existing `cargo run --bin ...` commands continue to work. |
 | PR 3 | Extract shared runtime/generation/session interfaces so `supersonic-runtime` no longer depends on `runner`. | Build runner, runtime, and server; keep CLI behavior unchanged. |
 | PR 4 | Introduce `support/matrix.toml` as the seed capability/support data source used by docs/tests where practical. | Validate the manifest with `python3 tools/check-support-matrix.py`; generated or checked docs must still be easy to review. |
-| PR 5 | Split `kernel-ffi/build.rs` into model/backend compile groups with default behavior preserved. | Compare old default behavior with grouped builds on one representative backend. |
+| PR 5 | Add the `kernel-ffi` model/backend group scaffold and split `build.rs` around named bridge groups with default behavior preserved. | Validate `crates/kernel-ffi/kernel-groups.toml` with `python3 tools/check-kernel-groups.py`; compare old default behavior with grouped builds on one representative backend before narrowing defaults. |
 | PR 6+ | Move larger model-specific runtime implementations out of `runner` once public interfaces are stable. | One benchmark or parity artifact for each moved runtime path. |
 
 ## First PR Test Plan
