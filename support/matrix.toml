@@ -48,7 +48,7 @@ models = ["qwen3.6-27b"]
 quants = ["int4"]
 support_doc = "docs/supported-matrix.md#hip-on-gfx1201"
 gate_scripts = ["tests/gfx1201/run_matrix.sh"]
-benchmark_doc = "docs/benchmarks.md#rdna4-r9700-smoke-benchmark"
+benchmark_doc = "docs/benchmarks.md#rdna4--r9700-smoke-benchmark"
 notes = "R9700 starter lane: RDNA4 WMMA/int4 harness, direct smoke, and optional Lucebox/DFlash smoke."
 
 [[entry]]
@@ -107,7 +107,7 @@ gate_scripts = ["tests/sm86/run_gemma4.sh"]
 notes = "Native Gemma 4 CUDA v1 lane; batch size is constrained by the support doc."
 
 [[entry]]
-id = "cuda-sm90-inherited-cuda-lanes"
+id = "cuda-sm90-qwen35-inherited-all-lanes"
 backend = "cuda"
 arch = "sm90"
 status = "inherited"
@@ -116,14 +116,41 @@ models = [
   "qwen3.5-2b",
   "qwen3.5-4b",
   "qwen3.5-9b",
-  "gemma4-e2b",
-  "phi4-mini",
-  "llama3.1-8b",
 ]
 quants = ["bf16", "int4", "fp8-runtime", "kv-fp8"]
 support_doc = "docs/supported-matrix.md#cuda-on-sm90"
-benchmark_doc = "docs/detailed_performance.md#cuda-sm90-nvidia-h100-80gb-hbm3"
-notes = "H100 lane currently inherits CUDA sm86 registry geometry and kernel families unless otherwise noted."
+benchmark_doc = "docs/detailed_performance.md#cuda--sm90-nvidia-h100-80gb-hbm3"
+notes = "H100 Qwen3.5 lanes currently inherit CUDA sm86 registry geometry and kernel families unless otherwise noted."
+
+[[entry]]
+id = "cuda-sm90-gemma4-e2b-inherited-bf16"
+backend = "cuda"
+arch = "sm90"
+status = "inherited"
+models = ["gemma4-e2b"]
+quants = ["bf16"]
+support_doc = "docs/supported-matrix.md#cuda-on-sm90"
+notes = "H100 Gemma 4 E2B inherits the CUDA BF16 lane; INT4, FP8-runtime, and KV-FP8 are not advertised."
+
+[[entry]]
+id = "cuda-sm90-phi4-mini-inherited-non-kv"
+backend = "cuda"
+arch = "sm90"
+status = "inherited"
+models = ["phi4-mini"]
+quants = ["bf16", "int4", "fp8-runtime"]
+support_doc = "docs/supported-matrix.md#cuda-on-sm90"
+notes = "H100 Phi-4 mini inherits BF16, INT4, and FP8-runtime lanes; KV-FP8 remains pending in the support table."
+
+[[entry]]
+id = "cuda-sm90-llama31-8b-inherited-bf16-kv"
+backend = "cuda"
+arch = "sm90"
+status = "inherited"
+models = ["llama3.1-8b"]
+quants = ["bf16", "kv-fp8"]
+support_doc = "docs/supported-matrix.md#cuda-on-sm90"
+notes = "H100 Llama 3.1 8B inherits BF16 and KV-FP8 lanes only."
 
 [[entry]]
 id = "metal-apple-m4-qwen35-bf16"
@@ -132,7 +159,7 @@ arch = "apple-m4"
 status = "validated"
 models = ["qwen3.5-0.8b", "qwen3.5-2b", "qwen3.5-4b", "qwen3.5-9b"]
 quants = ["bf16"]
-support_doc = "docs/supported-matrix.md#metal-on-apple-m4-apple-m5-max"
+support_doc = "docs/supported-matrix.md#metal-on-apple-m4--apple-m5-max"
 gate_scripts = ["tests/metal/qwen35_bughunt_gate.sh"]
 notes = "Apple M4 remains the small Qwen3.5 Metal validation lane."
 
@@ -143,7 +170,7 @@ arch = "apple-m5-max"
 status = "validated"
 models = ["qwen3-30b-a3b"]
 quants = ["int4"]
-support_doc = "docs/supported-matrix.md#metal-on-apple-m4-apple-m5-max"
+support_doc = "docs/supported-matrix.md#metal-on-apple-m4--apple-m5-max"
 gate_commands = [
   "cargo test --release -p runner --test metal_large_model_smoke -- --ignored --nocapture",
 ]
@@ -157,7 +184,7 @@ arch = "apple-m5-max"
 status = "validated"
 models = ["qwen3.6-35b-a3b"]
 quants = ["int4"]
-support_doc = "docs/supported-matrix.md#metal-on-apple-m4-apple-m5-max"
+support_doc = "docs/supported-matrix.md#metal-on-apple-m4--apple-m5-max"
 gate_commands = [
   "cargo test --release -p runner --test qwen36_moe_metal_smoke -- --ignored --nocapture",
 ]
@@ -171,7 +198,7 @@ arch = "apple-m5-max"
 status = "validated"
 models = ["gemma4-e2b", "gemma4-e4b"]
 quants = ["bf16", "int4"]
-support_doc = "docs/supported-matrix.md#metal-on-apple-m4-apple-m5-max"
+support_doc = "docs/supported-matrix.md#metal-on-apple-m4--apple-m5-max"
 gate_commands = [
   "cargo test --release -p runner --test metal_large_model_smoke -- --ignored --nocapture",
 ]
@@ -185,7 +212,7 @@ arch = "apple-m5-max"
 status = "validated"
 models = ["phi4-mini"]
 quants = ["bf16", "int4", "fp8-runtime"]
-support_doc = "docs/supported-matrix.md#metal-on-apple-m4-apple-m5-max"
+support_doc = "docs/supported-matrix.md#metal-on-apple-m4--apple-m5-max"
 gate_commands = [
   "cargo test --release -p runner --test metal_large_model_smoke -- --ignored --nocapture",
 ]

@@ -38,8 +38,7 @@ def rel(path: Path) -> str:
 def slugify_heading(text: str) -> str:
     text = text.strip().lower().replace("`", "")
     text = re.sub(r"[^a-z0-9 -]", "", text)
-    text = re.sub(r"\s+", "-", text)
-    text = re.sub(r"-+", "-", text)
+    text = re.sub(r"\s", "-", text)
     return text.strip("-")
 
 
