@@ -27,7 +27,7 @@ python3 tools/check-kernel-groups.py
 | `cuda-llama31` | CUDA | Llama 3.1 certified-KV CUDA bridge. |
 | `cuda-phi4` | CUDA | Phi-4 CUDA bridge. |
 | `cuda-gemma4` | CUDA | Gemma 4 CUDA bridge. |
-| `cuda-qwen36-moe` | CUDA | Qwen3.6 MoE CUDA bridge. |
+| `cuda-qwen36-moe` | CUDA | Qwen3.6 MoE CUDA bridge and shared Qwen3.6 source closure. |
 | `metal-host-stubs` | Metal | Metal host/native link layer compiled by `cc` on macOS. |
 
 ## Guardrails

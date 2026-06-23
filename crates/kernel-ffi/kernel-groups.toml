@@ -183,8 +183,22 @@ id = "cuda-qwen36-moe"
 backend = "cuda"
 model_family = "qwen3.6-moe"
 default_compiled = true
-notes = "Qwen3.6 MoE CUDA bridge family."
-kernel_sources = ["kernels/qwen36_moe_cuda_prelude.cuh"]
+notes = "Qwen3.6 MoE CUDA bridge family, including the shared bridge source closure."
+kernel_sources = [
+  "kernels/qwen36_moe_cuda_prelude.cuh",
+  "kernels/qwen36_moe_bridge.cpp",
+  "kernels/qwen36_moe.hip",
+  "kernels/qwen36_moe_persistent/helpers.cuh",
+  "kernels/qwen36_moe_persistent/full_attn_phase.cuh",
+  "kernels/qwen36_moe_persistent/linear_attn_phase.cuh",
+  "kernels/qwen36_moe_persistent/ffn_phase.cuh",
+  "kernels/qwen36_moe_persistent/lm_head_phase.cuh",
+  "kernels/qwen36_moe_persistent/persistent_decode.hip",
+  "kernels/qwen36_moe_persistent/batched_prefill_attn_full.cuh",
+  "kernels/qwen36_moe_persistent/batched_prefill_grouped_expert.cuh",
+  "kernels/qwen36_moe_persistent/batched_prefill_router_permute.cuh",
+  "kernels/qwen36_moe_persistent/batched_prefill_unpermute_combine.cuh",
+]
 rust_modules = ["crates/kernel-ffi/src/qwen36_moe.rs"]
 
 [[group.bridge]]
