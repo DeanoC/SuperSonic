@@ -209,45 +209,160 @@ fn archive(out_dir: &Path, lib_name: &str, objects: &[PathBuf], context: &str) {
     println!("cargo:rustc-link-lib=static={lib_name}");
 }
 
+#[derive(Clone, Copy)]
+struct KernelBridge {
+    group: &'static str,
+    src_name: &'static str,
+    obj_name: &'static str,
+    context: &'static str,
+}
+
+// Group ids are an audit scaffold for the future build split. The default build
+// still compiles every bridge listed for the selected backend.
+const HIP_BRIDGES: &[KernelBridge] = &[
+    KernelBridge {
+        group: "hip-qwen35",
+        src_name: "full_attention_bridge.cpp",
+        obj_name: "qwen35_megakernel_hip.o",
+        context: "building qwen35 megakernel HIP bridge",
+    },
+    KernelBridge {
+        group: "hip-qwen35",
+        src_name: "full_attention_bridge_4b.cpp",
+        obj_name: "qwen35_4b_megakernel_hip.o",
+        context: "building qwen35-4b megakernel HIP bridge",
+    },
+    KernelBridge {
+        group: "hip-qwen35",
+        src_name: "prefill_helpers_bridge.cpp",
+        obj_name: "qwen35_prefill_helpers_hip.o",
+        context: "building prefill helpers HIP bridge",
+    },
+    KernelBridge {
+        group: "hip-gemma4",
+        src_name: "gemma4_bridge.cpp",
+        obj_name: "gemma4_hip.o",
+        context: "building Gemma 4 HIP bridge",
+    },
+    KernelBridge {
+        group: "hip-phi4",
+        src_name: "phi4_bridge.cpp",
+        obj_name: "phi4_hip.o",
+        context: "building Phi-4 HIP bridge",
+    },
+    KernelBridge {
+        group: "hip-dflash",
+        src_name: "dflash_draft_bridge.cpp",
+        obj_name: "dflash_draft_hip.o",
+        context: "building DFlash draft HIP bridge",
+    },
+    KernelBridge {
+        group: "hip-qwen36-moe",
+        src_name: "qwen36_moe_bridge.cpp",
+        obj_name: "qwen36_moe_hip.o",
+        context: "building Qwen3.6-MoE HIP bridge",
+    },
+    KernelBridge {
+        group: "hip-qwen3-moe",
+        src_name: "qwen3_moe_bridge.cpp",
+        obj_name: "qwen3_moe_hip.o",
+        context: "building Qwen3-MoE HIP bridge",
+    },
+];
+
+const CUDA_BRIDGES: &[KernelBridge] = &[
+    KernelBridge {
+        group: "cuda-qwen35",
+        src_name: "full_attention_bridge_cuda.cu",
+        obj_name: "qwen35_megakernel_cuda.o",
+        context: "building qwen35 megakernel CUDA bridge",
+    },
+    KernelBridge {
+        group: "cuda-qwen35",
+        src_name: "full_attention_bridge_4b_cuda.cu",
+        obj_name: "qwen35_4b_megakernel_cuda.o",
+        context: "building qwen35-4b megakernel CUDA bridge",
+    },
+    KernelBridge {
+        group: "cuda-qwen35",
+        src_name: "prefill_helpers_bridge_cuda.cu",
+        obj_name: "qwen35_prefill_helpers_cuda.o",
+        context: "building prefill helpers CUDA bridge",
+    },
+    KernelBridge {
+        group: "cuda-llama31",
+        src_name: "certified_kv_bridge_cuda.cu",
+        obj_name: "llama31_certified_kv_cuda.o",
+        context: "building Llama31 certified KV CUDA bridge",
+    },
+    KernelBridge {
+        group: "cuda-phi4",
+        src_name: "phi4_bridge_cuda.cu",
+        obj_name: "phi4_cuda.o",
+        context: "building Phi-4 CUDA bridge",
+    },
+    KernelBridge {
+        group: "cuda-gemma4",
+        src_name: "gemma4_bridge_cuda.cu",
+        obj_name: "gemma4_cuda.o",
+        context: "building Gemma 4 CUDA bridge",
+    },
+    KernelBridge {
+        group: "cuda-qwen36-moe",
+        src_name: "qwen36_moe_bridge_cuda.cu",
+        obj_name: "qwen36_moe_cuda.o",
+        context: "building Qwen3.6-MoE CUDA bridge",
+    },
+];
+
+const KERNEL_RERUN_PATHS: &[&str] = &[
+    "full_attention.hip",
+    "full_attention_4b.hip",
+    "prefill_helpers.hip",
+    "full_attention_bridge.cpp",
+    "full_attention_bridge_4b.cpp",
+    "prefill_helpers_bridge.cpp",
+    "gemma4.hip",
+    "gemma4_bridge.cpp",
+    "phi4.hip",
+    "phi4_bridge.cpp",
+    "dflash_draft.hip",
+    "dflash_draft_bridge.cpp",
+    "qwen36_moe.hip",
+    "qwen36_moe_cuda_prelude.cuh",
+    "qwen36_moe_bridge.cpp",
+    "qwen36_moe_bridge_cuda.cu",
+    "qwen3_moe.hip",
+    "qwen3_moe_bridge.cpp",
+    "qwen36_moe_persistent/helpers.cuh",
+    "qwen36_moe_persistent/full_attn_phase.cuh",
+    "qwen36_moe_persistent/linear_attn_phase.cuh",
+    "qwen36_moe_persistent/ffn_phase.cuh",
+    "qwen36_moe_persistent/lm_head_phase.cuh",
+    "qwen36_moe_persistent/persistent_decode.hip",
+    "qwen36_moe_persistent/batched_prefill_attn_full.cuh",
+    "qwen36_moe_persistent/batched_prefill_grouped_expert.cuh",
+    "qwen36_moe_persistent/batched_prefill_router_permute.cuh",
+    "qwen36_moe_persistent/batched_prefill_unpermute_combine.cuh",
+    "full_attention_cuda.cuh",
+    "full_attention_4b_cuda.cuh",
+    "prefill_helpers_cuda.cuh",
+    "full_attention_bridge_cuda.cu",
+    "full_attention_bridge_4b_cuda.cu",
+    "prefill_helpers_bridge_cuda.cu",
+    "certified_kv_bridge_cuda.cu",
+    "phi4_cuda.cuh",
+    "phi4_bridge_cuda.cu",
+    "gemma4_cuda.cuh",
+    "gemma4_bridge_cuda.cu",
+];
+
+fn bridge_group_list(sources: &[KernelBridge]) -> String {
+    let groups: BTreeSet<&str> = sources.iter().map(|source| source.group).collect();
+    groups.into_iter().collect::<Vec<_>>().join(", ")
+}
+
 fn compile_hip(kernel_dir: &Path, out_dir: &Path) {
-    let sources = [
-        (
-            "full_attention_bridge.cpp",
-            "qwen35_megakernel_hip.o",
-            "building qwen35 megakernel HIP bridge",
-        ),
-        (
-            "full_attention_bridge_4b.cpp",
-            "qwen35_4b_megakernel_hip.o",
-            "building qwen35-4b megakernel HIP bridge",
-        ),
-        (
-            "prefill_helpers_bridge.cpp",
-            "qwen35_prefill_helpers_hip.o",
-            "building prefill helpers HIP bridge",
-        ),
-        (
-            "gemma4_bridge.cpp",
-            "gemma4_hip.o",
-            "building Gemma 4 HIP bridge",
-        ),
-        ("phi4_bridge.cpp", "phi4_hip.o", "building Phi-4 HIP bridge"),
-        (
-            "dflash_draft_bridge.cpp",
-            "dflash_draft_hip.o",
-            "building DFlash draft HIP bridge",
-        ),
-        (
-            "qwen36_moe_bridge.cpp",
-            "qwen36_moe_hip.o",
-            "building Qwen3.6-MoE HIP bridge",
-        ),
-        (
-            "qwen3_moe_bridge.cpp",
-            "qwen3_moe_hip.o",
-            "building Qwen3-MoE HIP bridge",
-        ),
-    ];
     let archs = detect_hip_archs();
     if archs.is_empty() {
         println!("cargo:warning=no HIP arch detected (set HIP_ARCH or install rocminfo); kernel binary may not run on the target GPU");
@@ -257,11 +372,17 @@ fn compile_hip(kernel_dir: &Path, out_dir: &Path) {
             archs.join(", ")
         );
     }
+    if verbose_build_warnings() {
+        println!(
+            "cargo:warning=building HIP bridge groups: {}",
+            bridge_group_list(HIP_BRIDGES)
+        );
+    }
 
     let mut objects = Vec::new();
-    for (src_name, obj_name, context) in sources {
+    for source in HIP_BRIDGES {
         let mut cmd = Command::new("hipcc");
-        let obj_path = out_dir.join(obj_name);
+        let obj_path = out_dir.join(source.obj_name);
         cmd.arg("-std=c++17")
             .arg("-O3")
             .arg("-fPIC")
@@ -270,13 +391,13 @@ fn compile_hip(kernel_dir: &Path, out_dir: &Path) {
             .arg("-x")
             .arg("hip")
             .arg("-c")
-            .arg(kernel_dir.join(src_name))
+            .arg(kernel_dir.join(source.src_name))
             .arg("-o")
             .arg(&obj_path);
         for arch in &archs {
             cmd.arg(format!("--offload-arch={arch}"));
         }
-        run(&mut cmd, context);
+        run(&mut cmd, source.context);
         objects.push(obj_path);
     }
 
@@ -299,55 +420,22 @@ fn compile_hip(kernel_dir: &Path, out_dir: &Path) {
 }
 
 fn compile_cuda(kernel_dir: &Path, out_dir: &Path) {
-    let sources = [
-        (
-            "full_attention_bridge_cuda.cu",
-            "qwen35_megakernel_cuda.o",
-            "building qwen35 megakernel CUDA bridge",
-        ),
-        (
-            "full_attention_bridge_4b_cuda.cu",
-            "qwen35_4b_megakernel_cuda.o",
-            "building qwen35-4b megakernel CUDA bridge",
-        ),
-        (
-            "prefill_helpers_bridge_cuda.cu",
-            "qwen35_prefill_helpers_cuda.o",
-            "building prefill helpers CUDA bridge",
-        ),
-        (
-            "certified_kv_bridge_cuda.cu",
-            "llama31_certified_kv_cuda.o",
-            "building Llama31 certified KV CUDA bridge",
-        ),
-        (
-            "phi4_bridge_cuda.cu",
-            "phi4_cuda.o",
-            "building Phi-4 CUDA bridge",
-        ),
-        (
-            "gemma4_bridge_cuda.cu",
-            "gemma4_cuda.o",
-            "building Gemma 4 CUDA bridge",
-        ),
-        (
-            "qwen36_moe_bridge_cuda.cu",
-            "qwen36_moe_cuda.o",
-            "building Qwen3.6-MoE CUDA bridge",
-        ),
-    ];
     let archs = detect_cuda_archs();
     if verbose_build_warnings() {
         println!(
             "cargo:warning=building CUDA kernels for arch(es): {}",
             archs.join(", ")
         );
+        println!(
+            "cargo:warning=building CUDA bridge groups: {}",
+            bridge_group_list(CUDA_BRIDGES)
+        );
     }
 
     let mut objects = Vec::new();
-    for (src_name, obj_name, context) in sources {
+    for source in CUDA_BRIDGES {
         let mut cmd = Command::new("nvcc");
-        let obj_path = out_dir.join(obj_name);
+        let obj_path = out_dir.join(source.obj_name);
         cmd.arg("-std=c++17")
             .arg("-O3")
             .arg("--use_fast_math")
@@ -356,7 +444,7 @@ fn compile_cuda(kernel_dir: &Path, out_dir: &Path) {
             .arg("-I")
             .arg(kernel_dir)
             .arg("-c")
-            .arg(kernel_dir.join(src_name))
+            .arg(kernel_dir.join(source.src_name))
             .arg("-o")
             .arg(&obj_path);
         for arch in &archs {
@@ -364,7 +452,7 @@ fn compile_cuda(kernel_dir: &Path, out_dir: &Path) {
                 "-gencode=arch=compute_{arch},code=[sm_{arch},compute_{arch}]"
             ));
         }
-        run(&mut cmd, context);
+        run(&mut cmd, source.context);
         objects.push(obj_path);
     }
 
@@ -389,6 +477,9 @@ fn compile_cuda(kernel_dir: &Path, out_dir: &Path) {
 }
 
 fn compile_metal_stubs(manifest_dir: &Path) {
+    if verbose_build_warnings() {
+        println!("cargo:warning=building Metal bridge groups: metal-host-stubs");
+    }
     cc::Build::new()
         .cpp(true)
         .file(manifest_dir.join("src/metal_link_stubs.cc"))
@@ -459,43 +550,7 @@ fn main() {
         .and_then(|p| p.parent())
         .expect("cannot find workspace root")
         .join("kernels");
-    for path in [
-        "full_attention.hip",
-        "full_attention_4b.hip",
-        "prefill_helpers.hip",
-        "full_attention_bridge.cpp",
-        "full_attention_bridge_4b.cpp",
-        "prefill_helpers_bridge.cpp",
-        "gemma4.hip",
-        "gemma4_bridge.cpp",
-        "phi4.hip",
-        "phi4_bridge.cpp",
-        "dflash_draft.hip",
-        "dflash_draft_bridge.cpp",
-        "qwen36_moe.hip",
-        "qwen36_moe_cuda_prelude.cuh",
-        "qwen36_moe_bridge.cpp",
-        "qwen36_moe_bridge_cuda.cu",
-        "qwen3_moe.hip",
-        "qwen3_moe_bridge.cpp",
-        "qwen36_moe_persistent/helpers.cuh",
-        "qwen36_moe_persistent/full_attn_phase.cuh",
-        "qwen36_moe_persistent/linear_attn_phase.cuh",
-        "qwen36_moe_persistent/ffn_phase.cuh",
-        "qwen36_moe_persistent/lm_head_phase.cuh",
-        "qwen36_moe_persistent/persistent_decode.hip",
-        "full_attention_cuda.cuh",
-        "full_attention_4b_cuda.cuh",
-        "prefill_helpers_cuda.cuh",
-        "full_attention_bridge_cuda.cu",
-        "full_attention_bridge_4b_cuda.cu",
-        "prefill_helpers_bridge_cuda.cu",
-        "certified_kv_bridge_cuda.cu",
-        "phi4_cuda.cuh",
-        "phi4_bridge_cuda.cu",
-        "gemma4_cuda.cuh",
-        "gemma4_bridge_cuda.cu",
-    ] {
+    for path in KERNEL_RERUN_PATHS {
         println!("cargo:rerun-if-changed={}", kernel_dir.join(path).display());
     }
     println!(
