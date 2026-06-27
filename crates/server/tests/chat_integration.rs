@@ -44,6 +44,7 @@ fn load_test_config() -> Option<LoaderConfig> {
     let q4km_gptq = std::env::var("SUPERSONIC_TEST_Q4KM_GPTQ").is_ok();
     let fp8 = std::env::var("SUPERSONIC_TEST_FP8_RUNTIME").is_ok();
     let kv_fp8 = std::env::var("SUPERSONIC_TEST_KV_FP8").is_ok();
+    let dflash = std::env::var("SUPERSONIC_TEST_DFLASH").is_ok();
     let max_ctx = std::env::var("SUPERSONIC_TEST_MAX_CONTEXT")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -59,6 +60,14 @@ fn load_test_config() -> Option<LoaderConfig> {
         q4km_gptq,
         fp8_runtime: fp8,
         kv_fp8,
+        dflash,
+        dflash_draft_dir: std::env::var("SUPERSONIC_TEST_DFLASH_DRAFT_DIR")
+            .ok()
+            .map(PathBuf::from),
+        dflash_block: std::env::var("SUPERSONIC_TEST_DFLASH_BLOCK")
+            .ok()
+            .and_then(|s| s.parse().ok()),
+        dflash_tap_layers: std::env::var("SUPERSONIC_TEST_DFLASH_TAP_LAYERS").ok(),
         api_key: None,
         cors_allow_origin: None,
         response_store_max_entries: 1024,

@@ -10,6 +10,7 @@ pub(crate) mod bakes;
 pub(crate) mod builders;
 pub mod chat_template;
 pub mod decode_engine;
+pub mod dflash;
 pub mod gemma4_engine;
 pub mod gemma4_int4_engine;
 pub mod generate;

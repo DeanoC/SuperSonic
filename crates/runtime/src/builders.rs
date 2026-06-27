@@ -7,6 +7,7 @@ use crate::bakes::{
     ensure_gemma4_int4_bake_available, ensure_qwen35_bake_available, selected_bake_variant,
 };
 use crate::decode_engine::DecodeEngine;
+use crate::dflash::{DFlashOptions, DFlashSession};
 use crate::gemma4_engine::Gemma4Engine;
 use crate::gemma4_int4_engine::Gemma4Int4Engine;
 use crate::session::InferenceSession;
@@ -58,6 +59,9 @@ pub(crate) fn build_qwen(
     )
     .map_err(|e| anyhow!("load baked weights: {e}"))?;
     tracing::info!("weights loaded in {:.0}ms", t0.elapsed().as_millis());
+    if cfg.dflash && !weights.is_int4 {
+        bail!("--dflash target loader did not produce low-bit weights");
+    }
 
     let attn_scratch_floats =
         params
@@ -83,7 +87,27 @@ pub(crate) fn build_qwen(
     .with_context(|| "build Qwen3.5 DecodeEngine")?;
     engine.set_decode_context_limit(context_tokens);
 
-    Ok((InferenceSession::Qwen(engine), eos_ids))
+    if cfg.dflash {
+        let draft_dir = cfg
+            .dflash_draft_dir
+            .clone()
+            .ok_or_else(|| anyhow!("--dflash requires --dflash-draft-dir"))?;
+        let dflash = DFlashSession::new(
+            engine,
+            DFlashOptions {
+                draft_dir,
+                block: cfg.dflash_block,
+                tap_layers: cfg.dflash_tap_layers.clone(),
+            },
+            &entry.model,
+            &text_config,
+            context_tokens,
+            cfg.device,
+        )?;
+        Ok((InferenceSession::QwenDFlash(dflash), eos_ids))
+    } else {
+        Ok((InferenceSession::Qwen(engine), eos_ids))
+    }
 }
 
 pub(crate) fn build_gemma4(
