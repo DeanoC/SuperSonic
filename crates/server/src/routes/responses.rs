@@ -263,11 +263,7 @@ pub async fn create(
             model,
             created_at,
             parsed,
-            usage(
-                result.prompt_tokens,
-                result.completion_tokens,
-                result.cached_prompt_tokens,
-            ),
+            usage(&result.stats),
             response_cache_key,
         );
         insert_response(
@@ -345,14 +341,14 @@ fn response_sse_stream(
                         }
                     }
                 }
-                generate::GenEvent::Done { prompt_tokens, completion_tokens, cached_prompt_tokens, .. } => {
+                generate::GenEvent::Done { stats, .. } => {
                     let parsed = parse_assistant_output(&raw);
                     let stored = build_response(
                         id.clone(),
                         model.clone(),
                         created_at,
                         parsed,
-                        usage(prompt_tokens, completion_tokens, cached_prompt_tokens),
+                        usage(&stats),
                         cache_key.clone(),
                     );
                     insert_response(

@@ -93,11 +93,7 @@ pub async fn completions(
                 logprobs: None,
                 finish_reason: result.finish.as_str(),
             }],
-            usage: usage(
-                result.prompt_tokens,
-                result.completion_tokens,
-                result.cached_prompt_tokens,
-            ),
+            usage: usage(&result.stats),
         };
         Ok(Json(resp).into_response())
     }

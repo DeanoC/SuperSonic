@@ -20,7 +20,7 @@ use crate::output::{parse_assistant_output, AssistantOutput};
 use crate::prefix_cache::{self, CacheRequest, CacheRetention};
 use crate::schemas::{
     ChatCompletionChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse,
-    ChatStreamChoice, ChatStreamChunk, ChatStreamDelta, PromptTokensDetails, Usage,
+    ChatStreamChoice, ChatStreamChunk, ChatStreamDelta, Usage,
 };
 use crate::state::ServerState;
 
@@ -116,32 +116,14 @@ pub async fn completions(
                     tool_calls: parsed.tool_calls,
                 },
             }],
-            usage: Usage {
-                prompt_tokens: result.prompt_tokens,
-                completion_tokens: result.completion_tokens,
-                total_tokens: result.prompt_tokens + result.completion_tokens,
-                prompt_tokens_details: Some(PromptTokensDetails {
-                    cached_tokens: result.cached_prompt_tokens,
-                }),
-            },
+            usage: usage(&result.stats),
         };
         Ok(Json(resp).into_response())
     }
 }
 
-pub(crate) fn usage(
-    prompt_tokens: u32,
-    completion_tokens: u32,
-    cached_prompt_tokens: u32,
-) -> Usage {
-    Usage {
-        prompt_tokens,
-        completion_tokens,
-        total_tokens: prompt_tokens + completion_tokens,
-        prompt_tokens_details: Some(PromptTokensDetails {
-            cached_tokens: cached_prompt_tokens,
-        }),
-    }
+pub(crate) fn usage(stats: &generate::GenerationStats) -> Usage {
+    Usage::from_generation_stats(stats)
 }
 
 pub(crate) fn cache_request(
@@ -281,12 +263,7 @@ fn parsed_chat_events(
                         }
                     }
                 }
-                generate::GenEvent::Done {
-                    reason,
-                    prompt_tokens,
-                    completion_tokens,
-                    cached_prompt_tokens,
-                } => {
+                generate::GenEvent::Done { reason, stats } => {
                     let parsed = parse_assistant_output(&raw);
                     let done_reason = finish_reason(reason.as_str(), &parsed);
                     yield Ok(sse::json_event(&chat_chunk(
@@ -309,11 +286,7 @@ fn parsed_chat_events(
                             created,
                             model: model.clone(),
                             choices: Vec::new(),
-                            usage: Some(usage(
-                                prompt_tokens,
-                                completion_tokens,
-                                cached_prompt_tokens,
-                            )),
+                            usage: Some(usage(&stats)),
                         }));
                     }
                     yield Ok(Event::default().data("[DONE]"));

@@ -16,7 +16,7 @@ use crate::backend_resolver::resolve_backend;
 use crate::bakes::ensure_hf_metadata_present;
 use crate::builders::{build_gemma4, build_qwen};
 use crate::chat_template::ChatTemplate;
-use crate::generate::MockGeneration;
+use crate::generate::{GenerationTelemetry, MockGeneration};
 use crate::prefix_cache::{PrefixCache, PrefixCacheConfig};
 use crate::session::InferenceSession;
 use supersonic_core::capabilities::{capabilities_for_variant, ModelCapabilities};
@@ -39,6 +39,7 @@ pub struct ServerState {
     pub cors_allow_origin: Option<String>,
     pub response_store_max_entries: usize,
     pub scheduler: Arc<GenerationScheduler>,
+    pub telemetry: GenerationTelemetry,
     pub capabilities: ModelCapabilities,
     pub prefix_cache: Arc<PrefixCache>,
 }
@@ -229,6 +230,7 @@ pub fn build(cfg: LoaderConfig) -> Result<ServerState> {
             cfg.max_queued_requests,
             cfg.queue_timeout_ms,
         )),
+        telemetry: GenerationTelemetry::default(),
         capabilities,
         prefix_cache: Arc::new(PrefixCache::new(PrefixCacheConfig {
             enabled: prefix_cache_enabled,

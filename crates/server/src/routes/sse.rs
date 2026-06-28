@@ -31,20 +31,11 @@ where
                 GenEvent::Token(text) => {
                     yield Ok::<_, Infallible>(json_event(&token_chunk(text)));
                 }
-                GenEvent::Done {
-                    reason,
-                    prompt_tokens,
-                    completion_tokens,
-                    cached_prompt_tokens,
-                } => {
-                    yield Ok(json_event(&done_chunk(reason, Some(Usage {
-                        prompt_tokens,
-                        completion_tokens,
-                        total_tokens: prompt_tokens + completion_tokens,
-                        prompt_tokens_details: Some(crate::schemas::PromptTokensDetails {
-                            cached_tokens: cached_prompt_tokens,
-                        }),
-                    }))));
+                GenEvent::Done { reason, stats } => {
+                    yield Ok(json_event(&done_chunk(
+                        reason,
+                        Some(Usage::from_generation_stats(&stats)),
+                    )));
                     yield Ok(Event::default().data("[DONE]"));
                     return;
                 }

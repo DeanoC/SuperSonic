@@ -52,6 +52,7 @@ fn test_state_with_scheduler(
         cors_allow_origin: Some("*".to_string()),
         response_store_max_entries: 1024,
         scheduler: Arc::new(scheduler),
+        telemetry: server::generate::GenerationTelemetry::default(),
         capabilities: capabilities::capabilities_for_variant(
             &registry::ModelVariant::Qwen3_5_0_8B,
             registry::Backend::Cuda,
@@ -561,10 +562,15 @@ async fn mock_auth_cors_and_model_mismatch() {
         .expect("metrics text");
     assert!(metrics.contains("supersonic_active_requests"));
     assert!(metrics.contains("supersonic_queued_requests"));
+    assert!(metrics.contains("supersonic_generation_active"));
+    assert!(metrics.contains("supersonic_generation_queued"));
     assert!(metrics.contains("supersonic_prefix_cache_hits"));
     assert!(metrics.contains("supersonic_prefix_cache_cached_tokens"));
     assert!(metrics.contains("supersonic_prefix_cache_resident_bytes"));
     assert!(metrics.contains("supersonic_prefix_cache_admission_skips"));
+    assert!(metrics.contains("supersonic_dflash_last_rounds"));
+    assert!(metrics.contains("supersonic_dflash_last_accepted_total"));
+    assert!(metrics.contains("supersonic_dflash_last_decode_ms"));
 
     let cors = h
         .client

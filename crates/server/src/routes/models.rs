@@ -143,12 +143,17 @@ pub async fn capabilities(
 
 pub async fn metrics(State(state): State<Arc<ServerState>>) -> impl IntoResponse {
     let queue = generate::scheduler_snapshot(&state);
+    let generation = generate::telemetry_snapshot(&state);
     let cache = state.prefix_cache.stats();
     let body = format!(
         "# TYPE supersonic_active_requests gauge\n\
          supersonic_active_requests {}\n\
          # TYPE supersonic_queued_requests gauge\n\
          supersonic_queued_requests {}\n\
+         # TYPE supersonic_generation_active gauge\n\
+         supersonic_generation_active {}\n\
+         # TYPE supersonic_generation_queued gauge\n\
+         supersonic_generation_queued {}\n\
          # TYPE supersonic_max_queued_requests gauge\n\
          supersonic_max_queued_requests {}\n\
          # TYPE supersonic_queue_timeout_ms gauge\n\
@@ -176,9 +181,17 @@ pub async fn metrics(State(state): State<Arc<ServerState>>) -> impl IntoResponse
          # TYPE supersonic_prefix_cache_restore_failures counter\n\
          supersonic_prefix_cache_restore_failures {}\n\
          # TYPE supersonic_prefix_cache_admission_skips counter\n\
-         supersonic_prefix_cache_admission_skips {}\n",
+         supersonic_prefix_cache_admission_skips {}\n\
+         # TYPE supersonic_dflash_last_rounds gauge\n\
+         supersonic_dflash_last_rounds {}\n\
+         # TYPE supersonic_dflash_last_accepted_total gauge\n\
+         supersonic_dflash_last_accepted_total {}\n\
+         # TYPE supersonic_dflash_last_decode_ms gauge\n\
+         supersonic_dflash_last_decode_ms {}\n",
         queue.active,
         queue.queued,
+        generation.active,
+        generation.queued,
         queue.max_queue,
         queue.queue_timeout_ms,
         state.max_context,
@@ -193,6 +206,9 @@ pub async fn metrics(State(state): State<Arc<ServerState>>) -> impl IntoResponse
         cache.disk_reads,
         cache.restore_failures,
         cache.admission_skips,
+        generation.dflash.last_rounds,
+        generation.dflash.last_accepted_total,
+        generation.dflash.last_decode_ms,
     );
     ([(CONTENT_TYPE, "text/plain; version=0.0.4")], body)
 }
