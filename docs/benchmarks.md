@@ -182,6 +182,40 @@ profiling. Longer R9700 performance sweeps should write to a dedicated
 `target/qwen36_gfx1201_*` directory and record `HIP_VISIBLE_DEVICES`, clocks,
 and whether the binary was built for both `gfx1100,gfx1201`.
 
+## Production Server Smoke: Qwen3.6 27B DFlash
+
+This smoke checks the production-facing path rather than the CLI benchmark
+path. It assumes `supersonic-serve` was built with HIP and the local Qwen3.6
+27B target/draft artifacts exist.
+
+```bash
+SUPERSONIC_BACKENDS=hip HIP_ARCH=gfx1100,gfx1201 \
+  cargo build --release -p server
+
+SUPERSONIC_BACKENDS=hip HIP_VISIBLE_DEVICES="${HIP_VISIBLE_DEVICES:-0}" \
+target/release/supersonic-serve \
+  --backend hip \
+  --model qwen3.6-27b \
+  --model-dir "$MODEL_DIR" \
+  --max-context 4096 \
+  --q4km-gptq \
+  --dflash \
+  --dflash-draft-dir "$DRAFT_DIR" \
+  --host 127.0.0.1 \
+  --port 8013 \
+  --api-key local \
+  --no-download \
+  --prefix-cache-disable
+```
+
+Then run the OpenAI-compatible smoke:
+
+```bash
+SUPERSONIC_BASE_URL=http://127.0.0.1:8013 \
+SUPERSONIC_API_KEY=local \
+node scripts/openai_compat_smoke.mjs
+```
+
 ## ROCm Profiling
 
 Use the isolated ROCm 7.1.1 profiler/runtime stack on the RX 7900 XTX machine:

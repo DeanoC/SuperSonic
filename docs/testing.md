@@ -100,6 +100,13 @@ smoke when local artifacts are available. Qwen3.5 rows in
 `supported-matrix.md` should stay TBM until that script grows per-model token
 checks for the local R9700.
 
+For the production inference refactor, the baseline HIP gate is the existing
+`tests/gfx1201/run_matrix.sh` starter matrix plus the `gfx1100` Qwen3.6 Lucebox
+benchmark recipe in `docs/benchmarks.md`. Runtime/server refactor PRs that touch
+DFlash, Qwen3.6-27B loading, kernel groups, or generation scheduling must state
+whether they ran this gate, skipped it for lack of local artifacts, or used a
+smaller compile/unit-test gate because the change was docs-only.
+
 For Metal specifically, Apple M4 remains the small Qwen3.5 validation lane.
 Apple M5 Max is the current large-model correctness lane: it covers Qwen3.5
 BF16 smokes, Qwen3/Qwen3.6 MoE INT4 smokes, Gemma 4 BF16/INT4 smokes, and
