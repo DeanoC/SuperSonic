@@ -23,5 +23,8 @@ pub mod session;
 pub mod state;
 pub mod tensor_bytes;
 
-pub use state::{build, LoaderConfig, ServerState};
+pub use state::{
+    build, resolve_runtime_policy, LoaderConfig, RuntimeConfig, RuntimeLane, RuntimePolicy,
+    ServerState,
+};
 pub use supersonic_core::{backend, capabilities, registry};

@@ -100,6 +100,19 @@ pub struct LoaderConfig {
 /// remains as a compatibility alias for the existing server/tests.
 pub type RuntimeConfig = LoaderConfig;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeLane {
+    PlainDecode,
+    NativeDFlash,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimePolicy {
+    pub lane: RuntimeLane,
+    pub low_bit_target_required: bool,
+    pub prefix_cache_allowed: bool,
+}
+
 pub fn build(cfg: LoaderConfig) -> Result<ServerState> {
     validate_flag_exclusions(&cfg)?;
     /* ---- backend + GPU detection ---- */
@@ -113,7 +126,7 @@ pub fn build(cfg: LoaderConfig) -> Result<ServerState> {
             registry::supported_models_list().join(", ")
         )
     })?;
-    validate_runtime_policy(&cfg, &variant, backend)?;
+    let runtime_policy = validate_runtime_policy(&cfg, &variant, backend)?;
 
     let (arch_name, total_vram, warp_size) = match backend {
         Backend::Hip => {
@@ -197,6 +210,7 @@ pub fn build(cfg: LoaderConfig) -> Result<ServerState> {
         .prefix_cache_dir
         .clone()
         .unwrap_or_else(|| cfg.model_dir.join(".supersonic/serve-cache/v1"));
+    let prefix_cache_enabled = effective_prefix_cache_enabled(&cfg, runtime_policy);
 
     Ok(ServerState {
         server_instance_id: NEXT_SERVER_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
@@ -217,7 +231,7 @@ pub fn build(cfg: LoaderConfig) -> Result<ServerState> {
         )),
         capabilities,
         prefix_cache: Arc::new(PrefixCache::new(PrefixCacheConfig {
-            enabled: cfg.prefix_cache_enabled,
+            enabled: prefix_cache_enabled,
             dir: cache_dir,
             min_tokens: cfg.prefix_cache_min_tokens,
             max_entries: cfg.prefix_cache_max_entries,
@@ -248,11 +262,7 @@ fn validate_flag_exclusions(cfg: &LoaderConfig) -> Result<()> {
     Ok(())
 }
 
-fn validate_runtime_policy(
-    cfg: &LoaderConfig,
-    variant: &ModelVariant,
-    backend: Backend,
-) -> Result<()> {
+pub fn resolve_runtime_policy(cfg: &LoaderConfig, variant: &ModelVariant) -> Result<RuntimePolicy> {
     let q4km_like = cfg.q4km || cfg.q4km_gptq;
     if cfg.dflash {
         if !matches!(
@@ -275,7 +285,31 @@ fn validate_runtime_policy(
                 bail!("--dflash-block must be greater than 0");
             }
         }
+        return Ok(RuntimePolicy {
+            lane: RuntimeLane::NativeDFlash,
+            low_bit_target_required: true,
+            prefix_cache_allowed: false,
+        });
     }
+
+    Ok(RuntimePolicy {
+        lane: RuntimeLane::PlainDecode,
+        low_bit_target_required: false,
+        prefix_cache_allowed: true,
+    })
+}
+
+fn effective_prefix_cache_enabled(cfg: &LoaderConfig, policy: RuntimePolicy) -> bool {
+    cfg.prefix_cache_enabled && policy.prefix_cache_allowed
+}
+
+fn validate_runtime_policy(
+    cfg: &LoaderConfig,
+    variant: &ModelVariant,
+    backend: Backend,
+) -> Result<RuntimePolicy> {
+    let runtime_policy = resolve_runtime_policy(cfg, variant)?;
+    let q4km_like = cfg.q4km || cfg.q4km_gptq;
     if q4km_like
         && !matches!(
             variant.family(),
@@ -313,7 +347,7 @@ fn validate_runtime_policy(
     }
 
     match variant.family() {
-        ModelFamily::Qwen35 | ModelFamily::Gemma4 => Ok(()),
+        ModelFamily::Qwen35 | ModelFamily::Gemma4 => Ok(runtime_policy),
         ModelFamily::Qwen3Moe => {
             bail!("qwen3-30b-a3b MoE runtime is not implemented yet")
         }
@@ -365,7 +399,7 @@ mod tests {
         }
     }
 
-    fn err_contains(result: Result<()>, needle: &str) {
+    fn err_contains<T: std::fmt::Debug>(result: Result<T>, needle: &str) {
         let err = result.expect_err("expected policy error").to_string();
         assert!(
             err.contains(needle),
@@ -454,6 +488,21 @@ mod tests {
         c.int4 = true;
         c.dflash_draft_dir = Some(PathBuf::from("/tmp/dflash"));
         validate_runtime_policy(&c, &ModelVariant::Qwen3_5_9B, Backend::Cuda).unwrap();
+    }
+
+    #[test]
+    fn policy_disables_prefix_cache_for_native_dflash() {
+        let mut c = cfg();
+        c.dflash = true;
+        c.q4km_gptq = true;
+        c.dflash_draft_dir = Some(PathBuf::from("/tmp/dflash"));
+
+        let policy = resolve_runtime_policy(&c, &ModelVariant::Qwen3_6_27B).unwrap();
+
+        assert_eq!(policy.lane, RuntimeLane::NativeDFlash);
+        assert!(policy.low_bit_target_required);
+        assert!(!policy.prefix_cache_allowed);
+        assert!(!effective_prefix_cache_enabled(&c, policy));
     }
 
     #[test]
