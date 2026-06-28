@@ -266,6 +266,12 @@ The smoke covers model list/retrieve, Chat Completions, streaming Chat
 Completions with usage, legacy Completions, Responses create/get/delete,
 tokenization, and metrics.
 
+For production refactor PRs, this smoke is the minimum client-compatibility
+gate. It must cover Chat Completions, Responses create/get/delete, tokenization,
+streaming, and explicit unsupported-feature errors. For DFlash server mode, the
+smoke should be run with `--prefix-cache-disable` or rely on runtime policy to
+disable prefix-cache admission automatically.
+
 ## Prefix Cache Smoke
 
 With a server already running, verify exact-prefix reuse and metrics:
