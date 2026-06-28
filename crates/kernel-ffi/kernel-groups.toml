@@ -92,7 +92,14 @@ kernel_sources = [
   "kernels/qwen36_moe_persistent/batched_prefill_router_permute.cuh",
   "kernels/qwen36_moe_persistent/batched_prefill_unpermute_combine.cuh",
 ]
-rust_modules = ["crates/kernel-ffi/src/qwen36_moe.rs"]
+rust_modules = [
+  "crates/kernel-ffi/src/qwen36_moe/mod.rs",
+  "crates/kernel-ffi/src/qwen36_moe/profile.rs",
+  "crates/kernel-ffi/src/qwen36_moe/descriptors.rs",
+  "crates/kernel-ffi/src/qwen36_moe/launch.rs",
+  "crates/kernel-ffi/src/qwen36_moe/persistent.rs",
+  "crates/kernel-ffi/src/qwen36_moe/prefill.rs",
+]
 
 [[group.bridge]]
 source = "kernels/qwen36_moe_bridge.cpp"
@@ -199,7 +206,14 @@ kernel_sources = [
   "kernels/qwen36_moe_persistent/batched_prefill_router_permute.cuh",
   "kernels/qwen36_moe_persistent/batched_prefill_unpermute_combine.cuh",
 ]
-rust_modules = ["crates/kernel-ffi/src/qwen36_moe.rs"]
+rust_modules = [
+  "crates/kernel-ffi/src/qwen36_moe/mod.rs",
+  "crates/kernel-ffi/src/qwen36_moe/profile.rs",
+  "crates/kernel-ffi/src/qwen36_moe/descriptors.rs",
+  "crates/kernel-ffi/src/qwen36_moe/launch.rs",
+  "crates/kernel-ffi/src/qwen36_moe/persistent.rs",
+  "crates/kernel-ffi/src/qwen36_moe/prefill.rs",
+]
 
 [[group.bridge]]
 source = "kernels/qwen36_moe_bridge_cuda.cu"
