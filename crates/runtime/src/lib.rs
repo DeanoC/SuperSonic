@@ -18,6 +18,7 @@ pub mod ids;
 pub mod oracle;
 pub mod prefill_engine;
 pub mod prefix_cache;
+pub mod qwen36_moe;
 pub mod qwen36_moe_config;
 pub mod sampling;
 pub mod session;

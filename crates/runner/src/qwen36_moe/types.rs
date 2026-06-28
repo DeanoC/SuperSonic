@@ -4,15 +4,10 @@
 use std::ffi::c_void;
 
 use gpu_hal::{GpuBuffer, ScalarType};
-
-/// Hybrid pattern: every 4th layer is full attention. Indices 3, 7, 11, ...
-/// are full; everything else is linear. Matches Qwen3.6-MoE 35B-A3B.
-pub const HYBRID_FULL_ATTN_STRIDE: i32 = 4;
-
-/// `true` when `layer_idx + 1` is a multiple of [`HYBRID_FULL_ATTN_STRIDE`].
-pub fn is_full_attn_layer(layer_idx: i32) -> bool {
-    (layer_idx + 1) % HYBRID_FULL_ATTN_STRIDE == 0
-}
+#[allow(unused_imports)]
+pub use supersonic_runtime::qwen36_moe::types::{
+    is_full_attn_layer, PositionPair, HYBRID_FULL_ATTN_STRIDE,
+};
 
 /// Geometry the chained decoder needs at every layer + the lm_head.
 /// Mirrors the synthetic + production cases.
@@ -42,45 +37,6 @@ pub struct MultiLayerGeom {
     pub moe_intermediate: i32,
     pub shared_intermediate: i32,
     pub top_k: i32,
-}
-
-/// Per-step position pair. Decouples the absolute RoPE rotation
-/// timeline from the KV cache slot index. They differ in
-/// SpecPrefill mode where kept tokens land in compact slots while
-/// still rotating at their original prompt positions; MTP-style
-/// decoupling uses the same shape (RoPE = base + k, cache slot = k).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PositionPair {
-    /// Absolute RoPE position (always-advancing timeline). Equals
-    /// `kept_positions[step]` during SpecPrefill prefill, and
-    /// `prompt_ids.len() + gen_offset` during generation.
-    pub rope: i32,
-    /// KV cache slot index. Equals `rope` in dense decode; equals
-    /// the compact slot count (`loop_state.position`) in
-    /// SpecPrefill mode.
-    pub cache: i32,
-}
-
-impl PositionPair {
-    /// Dense-decode shortcut: rope and cache slot agree.
-    #[inline]
-    pub const fn dense(p: i32) -> Self {
-        Self { rope: p, cache: p }
-    }
-
-    /// Decoupled SpecPrefill / MTP-style pair.
-    #[inline]
-    pub const fn split(rope: i32, cache: i32) -> Self {
-        Self { rope, cache }
-    }
-
-    /// `true` when rope and cache agree — i.e. the dense case.
-    /// Useful for the chained-fallback branch in chain.rs that only
-    /// needs the cache_pos sibling fns when the two diverge.
-    #[inline]
-    pub const fn is_dense(self) -> bool {
-        self.rope == self.cache
-    }
 }
 
 /// Per-layer attention weight buffers. The two variants are mutually

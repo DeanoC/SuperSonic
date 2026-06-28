@@ -1993,6 +1993,7 @@ dependencies = [
  "model-store",
  "qwen35",
  "qwen35_dflash",
+ "qwen36_moe",
  "rand 0.8.6",
  "rand_chacha 0.3.1",
  "safetensors",
