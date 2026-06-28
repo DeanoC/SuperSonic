@@ -15,7 +15,7 @@ use tokio::sync::{OwnedSemaphorePermit, TryAcquireError};
 
 use crate::prefix_cache::CacheRequest;
 use crate::sampling::{rng_from_seed, sample};
-use crate::session::InferenceSession;
+use crate::session::{should_use_dflash_generation, InferenceSession};
 use crate::state::ServerState;
 
 const CACHE_ANCHOR_SUFFIX_TOKENS: usize = 16;
@@ -311,7 +311,8 @@ fn run(
         .as_ref()
         .ok_or_else(|| anyhow!("no inference session configured"))?;
     let mut guard = session.blocking_lock();
-    if guard.is_dflash() {
+    let features = guard.features();
+    if should_use_dflash_generation(features) {
         if cache.is_some() {
             tracing::debug!("prefix cache skipped for DFlash session");
         }
@@ -333,6 +334,9 @@ fn run(
             &tx,
         );
         return Ok(());
+    }
+    if !features.plain_prefill_decode {
+        anyhow::bail!("loaded session does not expose a supported generation path");
     }
 
     let prefill_logits = if let Some(cache_req) = cache.as_ref() {
