@@ -58,6 +58,23 @@ struct Cli {
     #[arg(long)]
     kv_fp8: bool,
 
+    /// Enable DFlash speculative decoding for dense Qwen low-bit targets.
+    #[arg(long)]
+    dflash: bool,
+
+    /// HuggingFace-style DFlash draft model directory.
+    #[arg(long)]
+    dflash_draft_dir: Option<PathBuf>,
+
+    /// DFlash speculative block size. Defaults to the draft block size for
+    /// qwen3.6-27b and 3 for qwen3.5-9b.
+    #[arg(long)]
+    dflash_block: Option<usize>,
+
+    /// Comma-separated target layer indices used as DFlash draft taps.
+    #[arg(long)]
+    dflash_tap_layers: Option<String>,
+
     /// Listen address.
     #[arg(long, default_value = "127.0.0.1")]
     host: String,
@@ -165,6 +182,10 @@ fn main() -> Result<()> {
         q4km_gptq: cli.q4km_gptq,
         fp8_runtime: cli.fp8_runtime,
         kv_fp8: cli.kv_fp8,
+        dflash: cli.dflash,
+        dflash_draft_dir: cli.dflash_draft_dir,
+        dflash_block: cli.dflash_block,
+        dflash_tap_layers: cli.dflash_tap_layers,
         api_key: cli.api_key,
         cors_allow_origin: cli.cors_allow_origin,
         response_store_max_entries: cli.response_store_max_entries,

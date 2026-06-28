@@ -50,6 +50,83 @@ Optional deployment flags:
   - `--prefix-cache-disk-ttl-secs N` controls `24h` metadata retention. The
     default is `86400`.
 
+### Native DFlash Server Mode
+
+`supersonic-serve` can host the native DFlash speculative decoder directly.
+This is the preferred OpenCode path; it keeps the target and draft resident in
+one long-lived process and avoids the older Python CLI shim.
+
+Current constraints:
+
+- supported targets are `qwen3.5-9b` and `qwen3.6-27b`;
+- the target must be loaded from a low-bit bake (`--int4`, `--q4km`, or
+  `--q4km-gptq`);
+- `--dflash-draft-dir` must point at a HuggingFace-style DFlash draft
+  checkpoint directory;
+- `--kv-fp8` is rejected for DFlash server mode;
+- prefix caching should be disabled for this path until DFlash snapshot/restore
+  support is added to the cache.
+
+Example R9700 / `gfx1201` OpenCode server:
+
+```bash
+SUPERSONIC_BACKENDS=hip HIP_ARCH=gfx1100,gfx1201 \
+target/release/supersonic-serve \
+  --backend hip \
+  --device 1 \
+  --model qwen3.6-27b \
+  --model-dir /mnt/data/tmp/supersonic-qwen36-27b-lucebox \
+  --max-context 4096 \
+  --q4km \
+  --dflash \
+  --dflash-draft-dir /mnt/data/tmp/qwen36-27b-dflash-q8-bf16 \
+  --host 127.0.0.1 \
+  --port 8013 \
+  --api-key local \
+  --no-download \
+  --prefix-cache-disable
+```
+
+Optional DFlash tuning flags:
+
+- `--dflash-block N` overrides the checkpoint block size. The override must
+  divide the draft block size.
+- `--dflash-tap-layers 1,16,31,46,61` overrides target tap layers. By default
+  the runtime uses model-appropriate taps and the draft checkpoint metadata.
+
+For OpenCode, configure an OpenAI-compatible provider with:
+
+```json
+{
+  "provider": {
+    "supersonic-dflash": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "SuperSonic native DFlash server",
+      "options": {
+        "baseURL": "http://127.0.0.1:8013/v1",
+        "apiKey": "local"
+      },
+      "models": {
+        "qwen3.6-27b": {
+          "name": "Qwen3.6 27B via SuperSonic DFlash Q4KM",
+          "limit": {
+            "context": 4096,
+            "output": 512
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+The initial OpenCode smoke profile is functional but prefill-bound: a tiny
+direct chat request returns in about 0.52 s, while a minimal OpenCode agent
+prompt of roughly 225 input tokens spends about 4.3 s in model prefill. Running
+OpenCode attached to a warm `opencode serve` process trims roughly one second
+of wrapper overhead, but the main optimization target is still DFlash/target
+prefill for agent-sized prompts.
+
 ## Endpoints
 
 - `GET /`, `GET /v1`, `GET /health`, `GET /v1/health`, `GET /ready`,

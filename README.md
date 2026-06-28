@@ -45,7 +45,7 @@ to disable network fetches.
 - **[Build and run](docs/build-and-run.md)** — per-backend build commands
   and the validated `supersonic` invocation set.
 - **[OpenAI-compatible server](docs/server.md)** — `supersonic-serve`
-  endpoints and harness compatibility notes.
+  endpoints, OpenCode setup, and harness compatibility notes.
 - **[Producing release bakes](docs/bake-distribution.md)** — how to
   produce, sign, and publish bakes for a new model variant.
 - **[Testing gates](docs/testing.md)** — E2E test runner, prerequisites,
@@ -57,8 +57,8 @@ to disable network fetches.
   staged cleanup plan and non-breaking inventory for current tools.
 - **[Kernel build groups](docs/development/kernel-build-groups.md)** —
   checked scaffold for future backend/model compile groups in `kernel-ffi`.
-- **[DFlash speculative decode](docs/dflash.md)** — Qwen3.5-9B INT4
-  speculative decode design and milestones.
+- **[DFlash speculative decode](docs/dflash.md)** — Qwen3.5/Qwen3.6 INT4
+  speculative decode design, server mode, and milestones.
 - **[Qwen3-30B-A3B HIP bring-up](docs/bringup/qwen3-30b-a3b-hip.md)** —
   separate Qwen3 MoE scaffolding and INT4 bake contract for HIP.
 - **[SpecPrefill](docs/specprefill.md)** — long-prompt TTFT optimization

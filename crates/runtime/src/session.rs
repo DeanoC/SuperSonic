@@ -7,11 +7,13 @@
 use anyhow::{anyhow, Result};
 
 use crate::decode_engine::{DecodeEngine, DecodeEngineSnapshot};
+use crate::dflash::{DFlashGenerateOutput, DFlashSession};
 use crate::gemma4_engine::{Gemma4Engine, Gemma4EngineSnapshot};
 use crate::gemma4_int4_engine::{Gemma4Int4Engine, Gemma4Int4EngineSnapshot};
 
 pub enum InferenceSession {
     Qwen(DecodeEngine),
+    QwenDFlash(DFlashSession),
     Gemma4Bf16(Gemma4Engine),
     Gemma4Int4(Gemma4Int4Engine),
 }
@@ -63,6 +65,7 @@ impl InferenceSession {
     pub fn reset(&mut self) -> Result<()> {
         match self {
             Self::Qwen(e) => e.reset(),
+            Self::QwenDFlash(e) => e.reset(),
             Self::Gemma4Bf16(e) => e.reset(),
             Self::Gemma4Int4(e) => e.reset(),
         }
@@ -73,6 +76,9 @@ impl InferenceSession {
     pub fn prefill(&mut self, prompt_ids: &[u32]) -> Result<Vec<f32>> {
         match self {
             Self::Qwen(e) => e.prefill_native(prompt_ids),
+            Self::QwenDFlash(_) => Err(anyhow!(
+                "plain prefill is not exposed for DFlash sessions; use DFlash generation"
+            )),
             Self::Gemma4Bf16(e) => e.prefill(prompt_ids),
             Self::Gemma4Int4(e) => e.prefill(prompt_ids),
         }
@@ -83,6 +89,9 @@ impl InferenceSession {
     pub fn decode_step(&mut self, token_id: u32, pos: usize) -> Result<Vec<f32>> {
         match self {
             Self::Qwen(e) => e.decode_step(token_id, pos),
+            Self::QwenDFlash(_) => Err(anyhow!(
+                "plain decode_step is not exposed for DFlash sessions; use DFlash generation"
+            )),
             Self::Gemma4Bf16(e) => e.decode_step(token_id, pos),
             Self::Gemma4Int4(e) => e.decode_step(token_id, pos),
         }
@@ -96,6 +105,9 @@ impl InferenceSession {
     pub fn decode_step_replay(&mut self, token_history: &[u32]) -> Result<Vec<f32>> {
         match self {
             Self::Qwen(e) => e.decode_step_replay(token_history),
+            Self::QwenDFlash(_) => Err(anyhow!(
+                "replay-prefill decode is not implemented for DFlash sessions"
+            )),
             Self::Gemma4Bf16(_) | Self::Gemma4Int4(_) => Err(anyhow!(
                 "replay-prefill decode is only implemented for the Qwen3.5 engine"
             )),
@@ -105,6 +117,9 @@ impl InferenceSession {
     pub fn snapshot_prefix(&self, logits: Vec<f32>) -> Result<SessionSnapshot> {
         match self {
             Self::Qwen(e) => Ok(SessionSnapshot::Qwen(e.snapshot_prefix(logits)?)),
+            Self::QwenDFlash(_) => Err(anyhow!(
+                "prefix cache snapshots are disabled for DFlash sessions"
+            )),
             Self::Gemma4Bf16(e) => Ok(SessionSnapshot::Gemma4Bf16(e.snapshot_prefix(logits)?)),
             Self::Gemma4Int4(e) => Ok(SessionSnapshot::Gemma4Int4(e.snapshot_prefix(logits)?)),
         }
@@ -113,6 +128,7 @@ impl InferenceSession {
     pub fn prefix_snapshot_bytes(&self, logits_len: usize) -> usize {
         match self {
             Self::Qwen(e) => e.prefix_snapshot_bytes(logits_len),
+            Self::QwenDFlash(_) => usize::MAX,
             Self::Gemma4Bf16(e) => e.prefix_snapshot_bytes(logits_len),
             Self::Gemma4Int4(e) => e.prefix_snapshot_bytes(logits_len),
         }
@@ -121,6 +137,9 @@ impl InferenceSession {
     pub fn restore_prefix(&mut self, snapshot: SessionSnapshot) -> Result<Vec<f32>> {
         match (self, snapshot) {
             (Self::Qwen(e), SessionSnapshot::Qwen(s)) => e.restore_prefix_owned(s),
+            (Self::QwenDFlash(_), _) => Err(anyhow!(
+                "prefix cache restore is disabled for DFlash sessions"
+            )),
             (Self::Gemma4Bf16(e), SessionSnapshot::Gemma4Bf16(s)) => e.restore_prefix(&s),
             (Self::Gemma4Int4(e), SessionSnapshot::Gemma4Int4(s)) => e.restore_prefix(&s),
             _ => Err(anyhow!(
@@ -132,9 +151,28 @@ impl InferenceSession {
     pub fn load_disk_prefix(&self, bytes: &[u8]) -> Result<SessionSnapshot> {
         match self {
             Self::Qwen(e) => Ok(SessionSnapshot::Qwen(e.load_prefix_snapshot_bytes(bytes)?)),
+            Self::QwenDFlash(_) => Err(anyhow!(
+                "disk prefix snapshots are disabled for DFlash sessions"
+            )),
             Self::Gemma4Bf16(_) | Self::Gemma4Int4(_) => Err(anyhow!(
                 "disk prefix snapshots are currently implemented for Qwen only"
             )),
+        }
+    }
+
+    pub fn is_dflash(&self) -> bool {
+        matches!(self, Self::QwenDFlash(_))
+    }
+
+    pub fn generate_dflash_greedy(
+        &mut self,
+        prompt_ids: &[u32],
+        max_tokens: usize,
+        eos_ids: &[u32],
+    ) -> Result<DFlashGenerateOutput> {
+        match self {
+            Self::QwenDFlash(session) => session.generate_greedy(prompt_ids, max_tokens, eos_ids),
+            _ => Err(anyhow!("loaded session is not a DFlash session")),
         }
     }
 }

@@ -311,6 +311,30 @@ fn run(
         .as_ref()
         .ok_or_else(|| anyhow!("no inference session configured"))?;
     let mut guard = session.blocking_lock();
+    if guard.is_dflash() {
+        if cache.is_some() {
+            tracing::debug!("prefix cache skipped for DFlash session");
+        }
+        let output =
+            guard.generate_dflash_greedy(&prompt_ids, params.max_tokens, &state.eos_ids)?;
+        tracing::info!(
+            rounds = output.rounds_run,
+            accepted = output.accepted_total,
+            generated = output.token_ids.len(),
+            decode_ms = output.decode_ms,
+            "DFlash generation complete"
+        );
+        emit_generated_ids(
+            &tokenizer,
+            &state.eos_ids,
+            prompt_tokens,
+            &output.token_ids,
+            &params,
+            &tx,
+        );
+        return Ok(());
+    }
+
     let prefill_logits = if let Some(cache_req) = cache.as_ref() {
         if let Some(hit) = state.prefix_cache.lookup(cache_req, &prompt_ids) {
             match guard.restore_prefix(hit.snapshot) {
@@ -436,6 +460,10 @@ fn run(
             break FinishReason::Stop;
         }
 
+        if finish_after_emitted_token(completion_tokens, params.max_tokens).is_some() {
+            break FinishReason::Length;
+        }
+
         let pos = prompt_ids.len() + emitted_ids.len() - 1;
         let raw_next_logits = guard.decode_step(next_token, pos)?;
         state_token_ids.push(next_token);
@@ -468,6 +496,62 @@ fn run(
         cached_prompt_tokens,
     });
     Ok(())
+}
+
+fn emit_generated_ids(
+    tokenizer: &Tokenizer,
+    eos_ids: &[u32],
+    prompt_tokens: u32,
+    token_ids: &[u32],
+    params: &GenParams,
+    tx: &UnboundedSender<GenEvent>,
+) {
+    let mut emitted_ids: Vec<u32> = Vec::with_capacity(token_ids.len());
+    let mut prev_decoded = String::new();
+    let mut completion_tokens = 0u32;
+    let mut finish = if token_ids.len() >= params.max_tokens {
+        FinishReason::Length
+    } else {
+        FinishReason::Stop
+    };
+
+    for &token_id in token_ids {
+        if eos_ids.contains(&token_id) {
+            finish = FinishReason::Stop;
+            break;
+        }
+        if completion_tokens as usize >= params.max_tokens {
+            finish = FinishReason::Length;
+            break;
+        }
+        emitted_ids.push(token_id);
+        completion_tokens += 1;
+
+        let decoded = detokenize(tokenizer, &emitted_ids);
+        if let Some(stop_at) = find_earliest_stop(&decoded, &params.stop) {
+            let trimmed = &decoded[..stop_at];
+            let delta = incremental_delta(&prev_decoded, trimmed);
+            if !delta.is_empty() {
+                let _ = tx.send(GenEvent::Token(delta));
+            }
+            finish = FinishReason::Stop;
+            break;
+        }
+
+        let delta = incremental_delta(&prev_decoded, &decoded);
+        prev_decoded = decoded;
+        if !delta.is_empty() && tx.send(GenEvent::Token(delta)).is_err() {
+            finish = FinishReason::Stop;
+            break;
+        }
+    }
+
+    let _ = tx.send(GenEvent::Done {
+        reason: finish,
+        prompt_tokens,
+        completion_tokens,
+        cached_prompt_tokens: 0,
+    });
 }
 
 fn prefill_with_cache_anchor(
@@ -556,6 +640,14 @@ fn find_earliest_stop(text: &str, stops: &[String]) -> Option<usize> {
         .min()
 }
 
+fn finish_after_emitted_token(completion_tokens: u32, max_tokens: usize) -> Option<FinishReason> {
+    if completion_tokens as usize >= max_tokens {
+        Some(FinishReason::Length)
+    } else {
+        None
+    }
+}
+
 /// Drain the full event stream and return the concatenated text plus the
 /// terminating event. Used by non-streaming responses.
 ///
@@ -611,7 +703,7 @@ pub type Session = InferenceSession;
 
 #[cfg(test)]
 mod tests {
-    use super::incremental_delta;
+    use super::{finish_after_emitted_token, incremental_delta, FinishReason};
 
     #[test]
     fn prefix_case_returns_suffix() {
@@ -655,5 +747,14 @@ mod tests {
         let prev = "foo";
         let now = "bar";
         assert_eq!(incremental_delta(prev, now), "bar");
+    }
+
+    #[test]
+    fn final_budgeted_token_finishes_before_next_decode_step() {
+        assert!(matches!(
+            finish_after_emitted_token(1, 1),
+            Some(FinishReason::Length)
+        ));
+        assert!(finish_after_emitted_token(1, 2).is_none());
     }
 }

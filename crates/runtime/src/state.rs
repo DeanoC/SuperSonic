@@ -75,6 +75,10 @@ pub struct LoaderConfig {
     pub q4km_gptq: bool,
     pub fp8_runtime: bool,
     pub kv_fp8: bool,
+    pub dflash: bool,
+    pub dflash_draft_dir: Option<PathBuf>,
+    pub dflash_block: Option<usize>,
+    pub dflash_tap_layers: Option<String>,
     pub api_key: Option<String>,
     pub cors_allow_origin: Option<String>,
     pub response_store_max_entries: usize,
@@ -250,6 +254,28 @@ fn validate_runtime_policy(
     backend: Backend,
 ) -> Result<()> {
     let q4km_like = cfg.q4km || cfg.q4km_gptq;
+    if cfg.dflash {
+        if !matches!(
+            variant,
+            ModelVariant::Qwen3_5_9B | ModelVariant::Qwen3_6_27B
+        ) {
+            bail!("--dflash is supported for --model qwen3.5-9b and qwen3.6-27b (got {variant})");
+        }
+        if !(cfg.int4 || q4km_like) {
+            bail!("--dflash requires a low-bit target bake (--int4, --q4km, or --q4km-gptq)");
+        }
+        if cfg.dflash_draft_dir.is_none() {
+            bail!("--dflash requires --dflash-draft-dir");
+        }
+        if cfg.kv_fp8 {
+            bail!("--dflash does not support --kv-fp8");
+        }
+        if let Some(block) = cfg.dflash_block {
+            if block == 0 {
+                bail!("--dflash-block must be greater than 0");
+            }
+        }
+    }
     if q4km_like
         && !matches!(
             variant.family(),
@@ -258,8 +284,17 @@ fn validate_runtime_policy(
     {
         bail!("--q4km/--q4km-gptq are currently supported only for Qwen models");
     }
-    if q4km_like && backend != Backend::Cuda {
-        bail!("--q4km/--q4km-gptq are currently supported only on CUDA");
+    if q4km_like
+        && !(backend == Backend::Cuda
+            || (backend == Backend::Hip
+                && matches!(
+                    variant.family(),
+                    ModelFamily::Qwen35 | ModelFamily::Qwen36Moe
+                )))
+    {
+        bail!(
+            "--q4km/--q4km-gptq are currently supported only on CUDA Qwen paths and HIP Qwen3.5/3.6 paths"
+        );
     }
 
     if backend == Backend::Metal {
@@ -310,6 +345,10 @@ mod tests {
             q4km_gptq: false,
             fp8_runtime: false,
             kv_fp8: false,
+            dflash: false,
+            dflash_draft_dir: None,
+            dflash_block: None,
+            dflash_tap_layers: None,
             api_key: None,
             cors_allow_origin: None,
             response_store_max_entries: 1024,
@@ -363,12 +402,79 @@ mod tests {
     }
 
     #[test]
-    fn policy_rejects_q4km_outside_cuda() {
+    fn policy_allows_q4km_for_qwen35_family_on_hip() {
+        let mut c = cfg();
+        c.q4km_gptq = true;
+        validate_runtime_policy(&c, &ModelVariant::Qwen3_5_0_8B, Backend::Hip).unwrap();
+
+        let mut c = cfg();
+        c.q4km_gptq = true;
+        validate_runtime_policy(&c, &ModelVariant::Qwen3_6_27B, Backend::Hip).unwrap();
+    }
+
+    #[test]
+    fn policy_rejects_q4km_on_unsupported_backend_family_pairs() {
         let mut c = cfg();
         c.q4km_gptq = true;
         err_contains(
+            validate_runtime_policy(&c, &ModelVariant::Qwen3_30B_A3B, Backend::Hip),
+            "CUDA Qwen paths and HIP Qwen3.5/3.6 paths",
+        );
+    }
+
+    #[test]
+    fn policy_rejects_dflash_without_lowbit_target_and_draft_dir() {
+        let mut c = cfg();
+        c.dflash = true;
+        err_contains(
+            validate_runtime_policy(&c, &ModelVariant::Qwen3_6_27B, Backend::Hip),
+            "requires a low-bit target bake",
+        );
+
+        let mut c = cfg();
+        c.dflash = true;
+        c.q4km = true;
+        err_contains(
+            validate_runtime_policy(&c, &ModelVariant::Qwen3_6_27B, Backend::Hip),
+            "requires --dflash-draft-dir",
+        );
+    }
+
+    #[test]
+    fn policy_allows_dflash_for_supported_dense_qwen_lowbit_targets() {
+        let mut c = cfg();
+        c.dflash = true;
+        c.q4km = true;
+        c.dflash_draft_dir = Some(PathBuf::from("/tmp/dflash"));
+        validate_flag_exclusions(&c).unwrap();
+        validate_runtime_policy(&c, &ModelVariant::Qwen3_6_27B, Backend::Hip).unwrap();
+
+        let mut c = cfg();
+        c.dflash = true;
+        c.int4 = true;
+        c.dflash_draft_dir = Some(PathBuf::from("/tmp/dflash"));
+        validate_runtime_policy(&c, &ModelVariant::Qwen3_5_9B, Backend::Cuda).unwrap();
+    }
+
+    #[test]
+    fn policy_rejects_dflash_for_non_dflash_targets_and_kv_fp8() {
+        let mut c = cfg();
+        c.dflash = true;
+        c.q4km = true;
+        c.dflash_draft_dir = Some(PathBuf::from("/tmp/dflash"));
+        err_contains(
             validate_runtime_policy(&c, &ModelVariant::Qwen3_5_0_8B, Backend::Hip),
-            "supported only on CUDA",
+            "supported for --model qwen3.5-9b and qwen3.6-27b",
+        );
+
+        let mut c = cfg();
+        c.dflash = true;
+        c.q4km = true;
+        c.kv_fp8 = true;
+        c.dflash_draft_dir = Some(PathBuf::from("/tmp/dflash"));
+        err_contains(
+            validate_runtime_policy(&c, &ModelVariant::Qwen3_6_27B, Backend::Hip),
+            "does not support --kv-fp8",
         );
     }
 

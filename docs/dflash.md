@@ -306,7 +306,58 @@ natural home of M3 (speculative loop), not M2. The forward function signature
 should accept `(ctx, noise, position_ids, past_kv)` so M3 can drive it without
 refactoring.
 
-## 9. References
+## 9. Native server and OpenCode mode
+
+The V0 production path is now a native `supersonic-serve` session rather than a
+Python OpenAI shim around repeated CLI calls. The server creates one
+GPU-resident `DFlashSession`, owns the target `DecodeEngine`, draft weights,
+draft scratch/state, rotary tables, and tap-history buffer, then services
+OpenAI-compatible Chat Completions through the normal server queue.
+
+The server path intentionally has a narrower surface than plain generation:
+
+- model support: `qwen3.5-9b` and `qwen3.6-27b`;
+- target weights: low-bit only (`--int4`, `--q4km`, or `--q4km-gptq`);
+- required draft: `--dflash-draft-dir <hf-style-dir>`;
+- rejected features: `--kv-fp8`, prefix-cache snapshot/restore, and the plain
+  incremental prefill/decode session APIs;
+- v0 streaming behavior: generation is computed by the DFlash loop and then
+  emitted through the existing Chat Completions stream shape.
+
+The Qwen3.6 27B OpenCode smoke currently uses:
+
+```bash
+SUPERSONIC_BACKENDS=hip HIP_ARCH=gfx1100,gfx1201 \
+target/release/supersonic-serve \
+  --model qwen3.6-27b \
+  --model-dir /mnt/data/tmp/supersonic-qwen36-27b-lucebox \
+  --backend hip \
+  --device 1 \
+  --max-context 4096 \
+  --q4km \
+  --dflash \
+  --dflash-draft-dir /mnt/data/tmp/qwen36-27b-dflash-q8-bf16 \
+  --host 127.0.0.1 \
+  --port 8013 \
+  --api-key local \
+  --no-download \
+  --prefix-cache-disable
+```
+
+Observed local profile on R9700 / `gfx1201`:
+
+| lane | prompt size | average wall time | note |
+|---|---:|---:|---|
+| direct Chat Completions | ~19 input tokens | ~0.52 s | tiny smoke prompt |
+| direct Chat Completions | ~236 input tokens | ~4.28 s | isolates prefill cost |
+| OpenCode `run` | ~225 input tokens | ~5.81 s | cold OpenCode process |
+| OpenCode `run --attach` | ~225 input tokens | ~4.74 s | warm `opencode serve` |
+
+That makes the next performance target clear: OpenCode wrapper overhead is
+secondary; DFlash/target prefill for 200-300 token prompts dominates first
+token latency.
+
+## 10. References
 
 - `/home/deano/models/qwen35-9b-dflash/dflash.py` (local canonical)
 - `/home/deano/models/qwen35-9b-dflash/config.json`

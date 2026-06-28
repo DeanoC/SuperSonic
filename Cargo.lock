@@ -2212,6 +2212,7 @@ dependencies = [
  "minijinja-contrib",
  "model-store",
  "qwen35",
+ "qwen35_dflash",
  "rand 0.8.6",
  "rand_chacha 0.3.1",
  "safetensors",
