@@ -27,6 +27,15 @@ impl fmt::Display for ModelFamily {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArchitectureFamily {
+    QwenHybridDense,
+    QwenHybridMoE,
+    Gemma4,
+    Phi4,
+    Llama31,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelVariant {
     Qwen3_5_0_8B,
@@ -101,6 +110,22 @@ impl ModelVariant {
             Self::Gemma4_E2B | Self::Gemma4_E4B => ModelFamily::Gemma4,
             Self::Phi4_Mini => ModelFamily::Phi4,
             Self::Llama3_1_8B => ModelFamily::Llama31,
+        }
+    }
+
+    pub fn architecture_family(&self) -> ArchitectureFamily {
+        match self {
+            Self::Qwen3_5_0_8B
+            | Self::Qwen3_5_2B
+            | Self::Qwen3_5_4B
+            | Self::Qwen3_5_9B
+            | Self::Qwen3_6_27B => ArchitectureFamily::QwenHybridDense,
+            Self::Qwen3_5_35B_A3B | Self::Qwen3_30B_A3B | Self::Qwen3_6_35B_A3B => {
+                ArchitectureFamily::QwenHybridMoE
+            }
+            Self::Gemma4_E2B | Self::Gemma4_E4B => ArchitectureFamily::Gemma4,
+            Self::Phi4_Mini => ArchitectureFamily::Phi4,
+            Self::Llama3_1_8B => ArchitectureFamily::Llama31,
         }
     }
 }
@@ -1455,6 +1480,18 @@ mod tests {
         assert_eq!(ModelVariant::Qwen3_6_35B_A3B.to_string(), "qwen3.6-35b-a3b");
         assert!(supported_models_list().contains(&"qwen3.6-27b"));
         assert!(supported_models_list().contains(&"qwen3.6-35b-a3b"));
+    }
+
+    #[test]
+    fn qwen36_27b_is_dense_hybrid_architecture() {
+        assert_eq!(
+            ModelVariant::Qwen3_6_27B.architecture_family(),
+            ArchitectureFamily::QwenHybridDense
+        );
+        assert_eq!(
+            ModelVariant::Qwen3_6_35B_A3B.architecture_family(),
+            ArchitectureFamily::QwenHybridMoE
+        );
     }
 
     #[test]
