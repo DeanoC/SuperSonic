@@ -143,6 +143,18 @@ Target behavior:
 | PR 5 | Add the `kernel-ffi` model/backend group scaffold and split `build.rs` around named bridge groups with default behavior preserved. | Validate `crates/kernel-ffi/kernel-groups.toml` with `python3 tools/check-kernel-groups.py`; compare old default behavior with grouped builds on one representative backend before narrowing defaults. |
 | PR 6+ | Move larger model-specific runtime implementations out of `runner` once public interfaces are stable. | One benchmark or parity artifact for each moved runtime path. |
 
+## Production Inference Refactor Track
+
+The production inference refactor is tracked in
+[`docs/superpowers/plans/2026-06-28-production-inference-refactor.md`](../superpowers/plans/2026-06-28-production-inference-refactor.md).
+It promotes the native HIP `qwen3.6-27b` DFlash server lane first, then moves
+Qwen3.6 MoE runtime pieces behind `supersonic-runtime` once the server/session
+contract is stable.
+
+Promotion rule: a lane is product-ready only when it has a support-matrix row,
+a named validation gate, an operator-facing server command when applicable, and
+a repeatable benchmark or smoke recipe.
+
 ## First PR Test Plan
 
 - Run `git diff --check`.

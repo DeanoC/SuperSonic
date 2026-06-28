@@ -49,7 +49,7 @@ quants = ["int4"]
 support_doc = "docs/supported-matrix.md#hip-on-gfx1201"
 gate_scripts = ["tests/gfx1201/run_matrix.sh"]
 benchmark_doc = "docs/benchmarks.md#rdna4--r9700-smoke-benchmark"
-notes = "R9700 starter lane: RDNA4 WMMA/int4 harness, direct smoke, and optional Lucebox/DFlash smoke."
+notes = "R9700 starter lane: RDNA4 WMMA/int4 harness, direct smoke, optional Lucebox/DFlash smoke, and native server smoke when local target/draft artifacts are present."
 
 [[entry]]
 id = "hip-gfx1150-qwen35-all-lanes"

@@ -1,31 +1,21 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use gpu_hal::Backend;
+use supersonic_runtime::qwen36_moe_config::{
+    parse_bool_flag, parse_moe_expert_vmm_mode, parse_moe_prefetch_ranks,
+    parse_moe_transition_min_observations, parse_optional_nonzero_usize,
+    parse_optional_positive_u32_or_disabled, parse_optional_positive_usize,
+    parse_positive_usize_with_default, parse_unit_interval_with_default,
+    DEFAULT_MOE_PREFETCH_EVICT_MIN_PROBABILITY,
+};
 
 use crate::qwen36_moe_telemetry::{MoeIslandPrefetchMode, MoeSparseTelemetry};
 
 pub(crate) const DEFAULT_SPARSE_MOE_PREFETCH_RANKS: usize = 4;
 pub(crate) const DEFAULT_SPARSE_MOE_TRANSITION_MIN_OBSERVATIONS: u32 = 1;
-pub(crate) const DEFAULT_SPARSE_MOE_PREFETCH_EVICT_MIN_PROBABILITY: f64 = 0.90;
+pub(crate) const DEFAULT_SPARSE_MOE_PREFETCH_EVICT_MIN_PROBABILITY: f64 =
+    DEFAULT_MOE_PREFETCH_EVICT_MIN_PROBABILITY;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MoeExpertVmmMode {
-    Auto,
-    Disabled,
-    Force,
-}
-
-impl MoeExpertVmmMode {
-    pub(crate) fn from_env() -> Result<Self> {
-        match std::env::var("SUPERSONIC_VMM_MOE_ISLANDS").ok().as_deref() {
-            None => Ok(Self::Auto),
-            Some("0") => Ok(Self::Disabled),
-            Some("1") => Ok(Self::Force),
-            Some(other) => Err(anyhow!(
-                "SUPERSONIC_VMM_MOE_ISLANDS must be unset, 0, or 1; got {other:?}"
-            )),
-        }
-    }
-}
+pub(crate) use supersonic_runtime::qwen36_moe_config::MoeExpertVmmMode;
 
 pub(crate) struct MoeRuntimeConfig {
     pub(crate) vmm_mode: MoeExpertVmmMode,
@@ -54,28 +44,19 @@ pub(crate) enum Qwen36KvVmmMode {
 }
 
 pub(crate) fn moe_island_cap_experts_from_env() -> Result<Option<usize>> {
-    let Some(raw) = std::env::var("SUPERSONIC_MOE_ISLAND_CAP_EXPERTS").ok() else {
-        return Ok(None);
-    };
-    let cap = raw.parse::<usize>().with_context(|| {
-        format!("parse SUPERSONIC_MOE_ISLAND_CAP_EXPERTS={raw:?} as positive integer")
-    })?;
-    if cap == 0 {
-        anyhow::bail!("SUPERSONIC_MOE_ISLAND_CAP_EXPERTS must be > 0");
-    }
-    Ok(Some(cap))
+    let raw = std::env::var("SUPERSONIC_MOE_ISLAND_CAP_EXPERTS").ok();
+    parse_optional_positive_usize("SUPERSONIC_MOE_ISLAND_CAP_EXPERTS", raw.as_deref())
+}
+
+pub(crate) fn moe_expert_vmm_mode_from_env() -> Result<MoeExpertVmmMode> {
+    let raw = std::env::var("SUPERSONIC_VMM_MOE_ISLANDS").ok();
+    parse_moe_expert_vmm_mode("SUPERSONIC_VMM_MOE_ISLANDS", raw.as_deref())
 }
 
 pub(crate) fn moe_island_protected_experts_from_env_value(
     raw: Option<&str>,
 ) -> Result<Option<usize>> {
-    let Some(raw) = raw else {
-        return Ok(None);
-    };
-    let value = raw.parse::<usize>().with_context(|| {
-        format!("parse SUPERSONIC_MOE_ISLAND_PROTECTED_EXPERTS={raw:?} as non-negative integer")
-    })?;
-    Ok((value > 0).then_some(value))
+    parse_optional_nonzero_usize("SUPERSONIC_MOE_ISLAND_PROTECTED_EXPERTS", raw)
 }
 
 pub(crate) fn moe_island_protected_experts_from_env() -> Result<Option<usize>> {
@@ -86,13 +67,7 @@ pub(crate) fn moe_island_protected_experts_from_env() -> Result<Option<usize>> {
 pub(crate) fn moe_island_fixed_hot_experts_from_env_value(
     raw: Option<&str>,
 ) -> Result<Option<usize>> {
-    let Some(raw) = raw else {
-        return Ok(None);
-    };
-    let value = raw.parse::<usize>().with_context(|| {
-        format!("parse SUPERSONIC_MOE_ISLAND_FIXED_HOT_EXPERTS={raw:?} as non-negative integer")
-    })?;
-    Ok((value > 0).then_some(value))
+    parse_optional_nonzero_usize("SUPERSONIC_MOE_ISLAND_FIXED_HOT_EXPERTS", raw)
 }
 
 pub(crate) fn moe_island_fixed_hot_experts_from_env() -> Result<Option<usize>> {
@@ -105,36 +80,7 @@ pub(crate) fn moe_island_prefetch_ranks_from_env_value(
     mode: MoeIslandPrefetchMode,
     top_k: usize,
 ) -> Result<usize> {
-    match mode {
-        MoeIslandPrefetchMode::Disabled => {
-            if raw.is_some() {
-                anyhow::bail!(
-                    "SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS requires \
-                     SUPERSONIC_MOE_ISLAND_PREFETCH=previous-token, \
-                     previous-token-resident, or transition"
-                );
-            }
-            Ok(0)
-        }
-        MoeIslandPrefetchMode::PreviousToken
-        | MoeIslandPrefetchMode::PreviousTokenResidentOnly
-        | MoeIslandPrefetchMode::Transition => match raw {
-            None | Some("all") => Ok(top_k),
-            Some(value) => {
-                let ranks = value.parse::<usize>().with_context(|| {
-                    format!(
-                        "parse SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS={value:?} as positive integer"
-                    )
-                })?;
-                if ranks == 0 || ranks > top_k {
-                    anyhow::bail!(
-                        "SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS must be in 1..={top_k}; got {ranks}"
-                    );
-                }
-                Ok(ranks)
-            }
-        },
-    }
+    parse_moe_prefetch_ranks("SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS", raw, mode, top_k)
 }
 
 pub(crate) fn moe_island_prefetch_mode_from_env_for_sparse(
@@ -163,22 +109,11 @@ pub(crate) fn moe_island_prefetch_transition_min_observations_from_env_value(
     raw: Option<&str>,
     mode: MoeIslandPrefetchMode,
 ) -> Result<u32> {
-    if !mode.transition_weighted() {
-        if raw.is_some() {
-            anyhow::bail!(
-                "SUPERSONIC_MOE_ISLAND_PREFETCH_TRANSITION_MIN_OBS requires \
-                 SUPERSONIC_MOE_ISLAND_PREFETCH=transition"
-            );
-        }
-        return Ok(0);
-    }
-
-    let Some(value) = raw else {
-        return Ok(32);
-    };
-    value.parse::<u32>().with_context(|| {
-        format!("parse SUPERSONIC_MOE_ISLAND_PREFETCH_TRANSITION_MIN_OBS={value:?} as integer")
-    })
+    parse_moe_transition_min_observations(
+        "SUPERSONIC_MOE_ISLAND_PREFETCH_TRANSITION_MIN_OBS",
+        raw,
+        mode,
+    )
 }
 
 pub(crate) fn moe_island_prefetch_transition_min_observations_for_sparse(
@@ -193,13 +128,7 @@ pub(crate) fn moe_island_prefetch_transition_min_observations_for_sparse(
 }
 
 pub(crate) fn moe_island_async_prefetch_from_env_value(raw: Option<&str>) -> Result<bool> {
-    match raw {
-        None | Some("0") | Some("off") | Some("disabled") | Some("false") => Ok(false),
-        Some("1") | Some("on") | Some("enabled") | Some("true") => Ok(true),
-        Some(other) => Err(anyhow!(
-            "SUPERSONIC_MOE_ISLAND_ASYNC_PREFETCH must be unset, 0, 1, off, on, disabled, enabled, false, or true; got {other:?}"
-        )),
-    }
+    parse_bool_flag("SUPERSONIC_MOE_ISLAND_ASYNC_PREFETCH", raw)
 }
 
 pub(crate) fn moe_island_async_prefetch_from_env() -> Result<bool> {
@@ -208,16 +137,7 @@ pub(crate) fn moe_island_async_prefetch_from_env() -> Result<bool> {
 }
 
 pub(crate) fn moe_island_async_staging_pages_from_env_value(raw: Option<&str>) -> Result<usize> {
-    let Some(raw) = raw else {
-        return Ok(4);
-    };
-    let pages = raw.parse::<usize>().with_context(|| {
-        format!("parse SUPERSONIC_MOE_ISLAND_ASYNC_STAGING_PAGES={raw:?} as positive integer")
-    })?;
-    if pages == 0 {
-        anyhow::bail!("SUPERSONIC_MOE_ISLAND_ASYNC_STAGING_PAGES must be > 0");
-    }
-    Ok(pages)
+    parse_positive_usize_with_default("SUPERSONIC_MOE_ISLAND_ASYNC_STAGING_PAGES", raw, 4)
 }
 
 pub(crate) fn moe_island_async_staging_pages_from_env() -> Result<usize> {
@@ -226,13 +146,7 @@ pub(crate) fn moe_island_async_staging_pages_from_env() -> Result<usize> {
 }
 
 pub(crate) fn moe_island_prefetch_evict_from_env_value(raw: Option<&str>) -> Result<bool> {
-    match raw {
-        None | Some("0") | Some("off") | Some("disabled") | Some("false") => Ok(false),
-        Some("1") | Some("on") | Some("enabled") | Some("true") => Ok(true),
-        Some(other) => Err(anyhow!(
-            "SUPERSONIC_MOE_ISLAND_PREFETCH_EVICT must be unset, 0, 1, off, on, disabled, enabled, false, or true; got {other:?}"
-        )),
-    }
+    parse_bool_flag("SUPERSONIC_MOE_ISLAND_PREFETCH_EVICT", raw)
 }
 
 pub(crate) fn moe_island_prefetch_evict_from_env() -> Result<bool> {
@@ -243,18 +157,11 @@ pub(crate) fn moe_island_prefetch_evict_from_env() -> Result<bool> {
 pub(crate) fn moe_island_prefetch_evict_min_probability_from_env_value(
     raw: Option<&str>,
 ) -> Result<f64> {
-    let Some(raw) = raw else {
-        return Ok(DEFAULT_SPARSE_MOE_PREFETCH_EVICT_MIN_PROBABILITY);
-    };
-    let probability = raw.parse::<f64>().with_context(|| {
-        format!("parse SUPERSONIC_MOE_ISLAND_PREFETCH_EVICT_MIN_PROB={raw:?} as probability")
-    })?;
-    if !(0.0..=1.0).contains(&probability) {
-        anyhow::bail!(
-            "SUPERSONIC_MOE_ISLAND_PREFETCH_EVICT_MIN_PROB must be in 0.0..=1.0; got {probability}"
-        );
-    }
-    Ok(probability)
+    parse_unit_interval_with_default(
+        "SUPERSONIC_MOE_ISLAND_PREFETCH_EVICT_MIN_PROB",
+        raw,
+        DEFAULT_SPARSE_MOE_PREFETCH_EVICT_MIN_PROBABILITY,
+    )
 }
 
 pub(crate) fn moe_island_prefetch_evict_min_probability_from_env() -> Result<f64> {
@@ -263,13 +170,7 @@ pub(crate) fn moe_island_prefetch_evict_min_probability_from_env() -> Result<f64
 }
 
 pub(crate) fn moe_island_protect_demand_from_env_value(raw: Option<&str>) -> Result<bool> {
-    match raw {
-        None | Some("0") | Some("off") | Some("disabled") | Some("false") => Ok(false),
-        Some("1") | Some("on") | Some("enabled") | Some("true") => Ok(true),
-        Some(other) => Err(anyhow!(
-            "SUPERSONIC_MOE_ISLAND_PROTECT_DEMAND must be unset, 0, 1, off, on, disabled, enabled, false, or true; got {other:?}"
-        )),
-    }
+    parse_bool_flag("SUPERSONIC_MOE_ISLAND_PROTECT_DEMAND", raw)
 }
 
 pub(crate) fn moe_island_protect_demand_from_env() -> Result<bool> {
@@ -280,20 +181,7 @@ pub(crate) fn moe_island_protect_demand_from_env() -> Result<bool> {
 pub(crate) fn moe_island_hot_protect_min_hits_from_env_value(
     raw: Option<&str>,
 ) -> Result<Option<u32>> {
-    let Some(raw) = raw else {
-        return Ok(None);
-    };
-    match raw {
-        "0" | "off" | "disabled" | "false" => return Ok(None),
-        _ => {}
-    }
-    let min_hits = raw.parse::<u32>().with_context(|| {
-        format!("parse SUPERSONIC_MOE_ISLAND_HOT_PROTECT_MIN_HITS={raw:?} as positive integer")
-    })?;
-    if min_hits == 0 {
-        anyhow::bail!("SUPERSONIC_MOE_ISLAND_HOT_PROTECT_MIN_HITS must be > 0");
-    }
-    Ok(Some(min_hits))
+    parse_optional_positive_u32_or_disabled("SUPERSONIC_MOE_ISLAND_HOT_PROTECT_MIN_HITS", raw)
 }
 
 pub(crate) fn moe_island_hot_protect_min_hits_from_env() -> Result<Option<u32>> {
@@ -304,20 +192,7 @@ pub(crate) fn moe_island_hot_protect_min_hits_from_env() -> Result<Option<u32>> 
 pub(crate) fn moe_island_fixed_hot_min_hits_from_env_value(
     raw: Option<&str>,
 ) -> Result<Option<u32>> {
-    let Some(raw) = raw else {
-        return Ok(None);
-    };
-    match raw {
-        "0" | "off" | "disabled" | "false" => return Ok(None),
-        _ => {}
-    }
-    let min_hits = raw.parse::<u32>().with_context(|| {
-        format!("parse SUPERSONIC_MOE_ISLAND_FIXED_HOT_MIN_HITS={raw:?} as positive integer")
-    })?;
-    if min_hits == 0 {
-        anyhow::bail!("SUPERSONIC_MOE_ISLAND_FIXED_HOT_MIN_HITS must be > 0");
-    }
-    Ok(Some(min_hits))
+    parse_optional_positive_u32_or_disabled("SUPERSONIC_MOE_ISLAND_FIXED_HOT_MIN_HITS", raw)
 }
 
 pub(crate) fn moe_island_fixed_hot_min_hits_from_env() -> Result<Option<u32>> {
@@ -331,7 +206,7 @@ pub(crate) fn prepare_moe_runtime_config(
     backend: Backend,
     top_k: usize,
 ) -> Result<MoeRuntimeConfig> {
-    let mut vmm_mode = MoeExpertVmmMode::from_env()?;
+    let mut vmm_mode = moe_expert_vmm_mode_from_env()?;
     if backend == Backend::Cuda {
         if vmm_mode == MoeExpertVmmMode::Force {
             anyhow::bail!(

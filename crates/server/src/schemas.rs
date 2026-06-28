@@ -117,6 +117,19 @@ pub struct Usage {
     pub prompt_tokens_details: Option<PromptTokensDetails>,
 }
 
+impl Usage {
+    pub fn from_generation_stats(stats: &crate::generate::GenerationStats) -> Self {
+        Self {
+            prompt_tokens: stats.prompt_tokens,
+            completion_tokens: stats.completion_tokens,
+            total_tokens: stats.prompt_tokens + stats.completion_tokens,
+            prompt_tokens_details: Some(PromptTokensDetails {
+                cached_tokens: stats.cached_prompt_tokens,
+            }),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct PromptTokensDetails {
     pub cached_tokens: u32,

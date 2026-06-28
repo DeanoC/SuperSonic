@@ -78,6 +78,11 @@ architecture-specific smoke matrix promotes them with token/parity results.
   harness, a direct `qwen3.6-27b --q4km-gptq` smoke, and Lucebox/DFlash
   Qwen3.6 27B smokes. Sustained decode still needs RDNA4-specific profiling.
 
+Naming note: `qwen3.6-27b` uses the dense Qwen hybrid-attention runtime shape,
+while `qwen3.6-35b-a3b` uses the MoE runtime shape. The CLI model names stay
+marketing/model identifiers; runtime code distinguishes architecture family
+separately so production paths can share only the pieces that actually match.
+
 ### HIP on `gfx1150`
 
 | Model            | BF16 | INT4 | FP8 runtime | FP8 KV |

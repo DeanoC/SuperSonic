@@ -52,6 +52,7 @@ fn test_state_with_scheduler(
         cors_allow_origin: Some("*".to_string()),
         response_store_max_entries: 1024,
         scheduler: Arc::new(scheduler),
+        telemetry: server::generate::GenerationTelemetry::default(),
         capabilities: capabilities::capabilities_for_variant(
             &registry::ModelVariant::Qwen3_5_0_8B,
             registry::Backend::Cuda,
@@ -177,6 +178,14 @@ async fn mock_chat_non_stream_parses_reasoning_and_tools() {
         choice["message"]["tool_calls"][0]["function"]["name"],
         "lookup"
     );
+    assert!(resp["usage"]["prompt_tokens"].as_u64().unwrap() > 0);
+    assert!(resp["usage"]["completion_tokens"].as_u64().unwrap() > 0);
+    assert_eq!(
+        resp["usage"]["total_tokens"].as_u64().unwrap(),
+        resp["usage"]["prompt_tokens"].as_u64().unwrap()
+            + resp["usage"]["completion_tokens"].as_u64().unwrap()
+    );
+    assert_eq!(resp["usage"]["prompt_tokens_details"]["cached_tokens"], 0);
 
     let unsupported = h
         .client
@@ -191,6 +200,42 @@ async fn mock_chat_non_stream_parses_reasoning_and_tools() {
         .await
         .expect("send unsupported");
     assert_eq!(unsupported.status(), reqwest::StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mock_required_tool_choice_returns_400() {
+    let h = spawn("hello").await;
+    let tools = json!([{"type": "function", "function": {"name": "lookup"}}]);
+
+    let chat = h
+        .client
+        .post(format!("{}/v1/chat/completions", h.base))
+        .bearer_auth("secret")
+        .json(&json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": tools,
+            "tool_choice": "required",
+            "max_completion_tokens": 1
+        }))
+        .send()
+        .await
+        .expect("chat required");
+    assert_eq!(chat.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    let responses = h
+        .client
+        .post(format!("{}/v1/responses", h.base))
+        .bearer_auth("secret")
+        .json(&json!({
+            "input": "hi",
+            "tools": [{"type": "function", "function": {"name": "lookup"}}],
+            "tool_choice": "required",
+            "max_output_tokens": 1
+        }))
+        .send()
+        .await
+        .expect("responses required");
+    assert_eq!(responses.status(), reqwest::StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -239,6 +284,58 @@ async fn mock_responses_get_delete_roundtrip() {
         .await
         .expect("json");
     assert_eq!(deleted["deleted"], true);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mock_responses_previous_response_tool_loop_shape() {
+    let h = spawn(
+        "<tool_call>\n<function=lookup>\n<parameter=query>\nweather\n</parameter>\n</function>\n</tool_call>",
+    )
+    .await;
+    let first: Value = h
+        .client
+        .post(format!("{}/v1/responses", h.base))
+        .bearer_auth("secret")
+        .json(&json!({
+            "input": "need weather",
+            "tools": [{"type": "function", "function": {"name": "lookup"}}],
+            "max_output_tokens": 8
+        }))
+        .send()
+        .await
+        .expect("first response")
+        .json()
+        .await
+        .expect("first json");
+    let first_id = first["id"].as_str().expect("first id");
+    assert_eq!(first["output"][0]["type"], "function_call");
+    assert_eq!(first["output"][0]["name"], "lookup");
+    let call_id = first["output"][0]["call_id"]
+        .as_str()
+        .expect("call id")
+        .to_string();
+
+    let second_http = h
+        .client
+        .post(format!("{}/v1/responses", h.base))
+        .bearer_auth("secret")
+        .json(&json!({
+            "previous_response_id": first_id,
+            "input": [{
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": "{\"forecast\":\"sunny\"}"
+            }],
+            "max_output_tokens": 4
+        }))
+        .send()
+        .await
+        .expect("second response");
+    let status = second_http.status();
+    let second: Value = second_http.json().await.expect("second json");
+    assert_eq!(status, reqwest::StatusCode::OK, "body={second}");
+    assert_ne!(second["id"], first["id"]);
+    assert_eq!(second["output"][0]["type"], "function_call");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -465,10 +562,15 @@ async fn mock_auth_cors_and_model_mismatch() {
         .expect("metrics text");
     assert!(metrics.contains("supersonic_active_requests"));
     assert!(metrics.contains("supersonic_queued_requests"));
+    assert!(metrics.contains("supersonic_generation_active"));
+    assert!(metrics.contains("supersonic_generation_queued"));
     assert!(metrics.contains("supersonic_prefix_cache_hits"));
     assert!(metrics.contains("supersonic_prefix_cache_cached_tokens"));
     assert!(metrics.contains("supersonic_prefix_cache_resident_bytes"));
     assert!(metrics.contains("supersonic_prefix_cache_admission_skips"));
+    assert!(metrics.contains("supersonic_dflash_last_rounds"));
+    assert!(metrics.contains("supersonic_dflash_last_accepted_total"));
+    assert!(metrics.contains("supersonic_dflash_last_decode_ms"));
 
     let cors = h
         .client

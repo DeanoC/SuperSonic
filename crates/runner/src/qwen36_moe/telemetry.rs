@@ -11,70 +11,7 @@ use crate::qwen36_moe_types::ExpertRoute;
 
 const MIB: f64 = (1024 * 1024) as f64;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MoeIslandPrefetchMode {
-    Disabled,
-    PreviousToken,
-    PreviousTokenResidentOnly,
-    Transition,
-}
-
-impl MoeIslandPrefetchMode {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::Disabled => "disabled",
-            Self::PreviousToken => "previous-token",
-            Self::PreviousTokenResidentOnly => "previous-token-resident",
-            Self::Transition => "transition",
-        }
-    }
-
-    pub(crate) fn uses_previous_token_routes(self) -> bool {
-        matches!(
-            self,
-            Self::PreviousToken | Self::PreviousTokenResidentOnly | Self::Transition
-        )
-    }
-
-    pub(crate) fn resident_only(self) -> bool {
-        matches!(self, Self::PreviousTokenResidentOnly)
-    }
-
-    pub(crate) fn transition_weighted(self) -> bool {
-        matches!(self, Self::Transition)
-    }
-
-    pub(crate) fn from_env() -> Result<Self> {
-        Self::from_env_value(
-            std::env::var("SUPERSONIC_MOE_ISLAND_PREFETCH")
-                .ok()
-                .as_deref(),
-        )
-    }
-
-    pub(crate) fn from_env_value(raw: Option<&str>) -> Result<Self> {
-        match raw {
-            None | Some("0") | Some("off") | Some("disabled") => Ok(Self::Disabled),
-            Some("previous-token") | Some("previous_token") | Some("prev-token") => {
-                Ok(Self::PreviousToken)
-            }
-            Some("previous-token-resident")
-            | Some("previous_token_resident")
-            | Some("prev-token-resident")
-            | Some("resident-previous-token") => Ok(Self::PreviousTokenResidentOnly),
-            Some("transition") | Some("transition-weighted") | Some("transition_weighted") => {
-                Ok(Self::Transition)
-            }
-            Some(other) => anyhow::bail!(
-                "SUPERSONIC_MOE_ISLAND_PREFETCH must be unset, 0, off, disabled, \
-                 previous-token, previous_token, prev-token, previous-token-resident, \
-                 previous_token_resident, prev-token-resident, resident-previous-token, \
-                 transition, transition-weighted, or transition_weighted; \
-                 got {other:?}"
-            ),
-        }
-    }
-}
+pub(crate) use supersonic_runtime::qwen36_moe_config::MoeIslandPrefetchMode;
 
 pub(crate) fn print_and_write_moe_residency_summary(
     manager: &MoeExpertResidencyManager,

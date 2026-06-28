@@ -18,10 +18,15 @@ pub mod ids;
 pub mod oracle;
 pub mod prefill_engine;
 pub mod prefix_cache;
+pub mod qwen36_moe;
+pub mod qwen36_moe_config;
 pub mod sampling;
 pub mod session;
 pub mod state;
 pub mod tensor_bytes;
 
-pub use state::{build, LoaderConfig, ServerState};
+pub use state::{
+    build, resolve_runtime_policy, LoaderConfig, RuntimeConfig, RuntimeLane, RuntimePolicy,
+    ServerState,
+};
 pub use supersonic_core::{backend, capabilities, registry};

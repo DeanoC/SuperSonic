@@ -19,6 +19,7 @@ async function main() {
   const retrieved = await client.models.retrieve(model);
   console.log("model", retrieved.id);
 
+  console.log("[smoke] chat.completions");
   const chat = await client.chat.completions.create({
     model,
     messages: [
@@ -69,6 +70,7 @@ async function main() {
     }),
   );
 
+  console.log("[smoke] responses");
   const response = await client.responses.create({
     model,
     input: "Say hi",
@@ -90,6 +92,7 @@ async function main() {
   const deleted = await client.responses.delete(response.id);
   console.log("response_delete", compact(deleted));
 
+  console.log("[smoke] tokenize");
   const tokenize = await fetch(baseURL.replace(/\/v1$/, "") + "/tokenize", {
     method: "POST",
     headers: {

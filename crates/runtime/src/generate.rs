@@ -4,7 +4,7 @@
 //! unbounded channel so the HTTP layer can either collect them into one
 //! response or stream them as SSE.
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,7 +15,7 @@ use tokio::sync::{OwnedSemaphorePermit, TryAcquireError};
 
 use crate::prefix_cache::CacheRequest;
 use crate::sampling::{rng_from_seed, sample};
-use crate::session::InferenceSession;
+use crate::session::{should_use_dflash_generation, InferenceSession};
 use crate::state::ServerState;
 
 const CACHE_ANCHOR_SUFFIX_TOKENS: usize = 16;
@@ -42,6 +42,31 @@ impl Default for GenParams {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct GenerationStats {
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+    pub cached_prompt_tokens: u32,
+    pub dflash_rounds: Option<usize>,
+    pub dflash_accepted_total: Option<usize>,
+    pub decode_ms: Option<f64>,
+}
+
+impl GenerationStats {
+    pub fn token_counts(
+        prompt_tokens: u32,
+        completion_tokens: u32,
+        cached_prompt_tokens: u32,
+    ) -> Self {
+        Self {
+            prompt_tokens,
+            completion_tokens,
+            cached_prompt_tokens,
+            ..Self::default()
+        }
+    }
+}
+
 pub enum GenEvent {
     /// A chunk of output text. May be empty if the decoded token produced
     /// no new characters (e.g. a BPE continuation piece that the tokenizer
@@ -50,12 +75,55 @@ pub enum GenEvent {
     /// Terminal event: generation ended with this reason.
     Done {
         reason: FinishReason,
-        prompt_tokens: u32,
-        completion_tokens: u32,
-        cached_prompt_tokens: u32,
+        stats: GenerationStats,
     },
     /// Terminal error event: generation failed; no more events will arrive.
     Error(String),
+}
+
+#[derive(Debug, Default)]
+pub struct GenerationTelemetry {
+    dflash_last_rounds: AtomicUsize,
+    dflash_last_accepted_total: AtomicUsize,
+    dflash_last_decode_ms_bits: AtomicU64,
+}
+
+impl GenerationTelemetry {
+    pub fn record(&self, stats: &GenerationStats) {
+        if let Some(rounds) = stats.dflash_rounds {
+            self.dflash_last_rounds.store(rounds, Ordering::SeqCst);
+        }
+        if let Some(accepted_total) = stats.dflash_accepted_total {
+            self.dflash_last_accepted_total
+                .store(accepted_total, Ordering::SeqCst);
+        }
+        if let Some(decode_ms) = stats.decode_ms {
+            self.dflash_last_decode_ms_bits
+                .store(decode_ms.to_bits(), Ordering::SeqCst);
+        }
+    }
+
+    pub fn snapshot(&self) -> DFlashTelemetrySnapshot {
+        DFlashTelemetrySnapshot {
+            last_rounds: self.dflash_last_rounds.load(Ordering::SeqCst),
+            last_accepted_total: self.dflash_last_accepted_total.load(Ordering::SeqCst),
+            last_decode_ms: f64::from_bits(self.dflash_last_decode_ms_bits.load(Ordering::SeqCst)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DFlashTelemetrySnapshot {
+    pub last_rounds: usize,
+    pub last_accepted_total: usize,
+    pub last_decode_ms: f64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GenerationTelemetrySnapshot {
+    pub active: usize,
+    pub queued: usize,
+    pub dflash: DFlashTelemetrySnapshot,
 }
 
 #[derive(Debug, Clone)]
@@ -221,7 +289,7 @@ async fn run_with_permit(
     scheduler.active.fetch_add(1, Ordering::SeqCst);
 
     if let Some(mock) = state.mock_generation.clone() {
-        run_mock(mock, &prompt_ids, &params, &tx).await;
+        run_mock(mock, &prompt_ids, &params, &state.telemetry, &tx).await;
         scheduler.active.fetch_sub(1, Ordering::SeqCst);
         drop(permit);
         return;
@@ -251,10 +319,20 @@ pub fn scheduler_snapshot(state: &ServerState) -> SchedulerSnapshot {
     }
 }
 
+pub fn telemetry_snapshot(state: &ServerState) -> GenerationTelemetrySnapshot {
+    let queue = scheduler_snapshot(state);
+    GenerationTelemetrySnapshot {
+        active: queue.active,
+        queued: queue.queued,
+        dflash: state.telemetry.snapshot(),
+    }
+}
+
 async fn run_mock(
     mock: MockGeneration,
     prompt_ids: &[u32],
     params: &GenParams,
+    telemetry: &GenerationTelemetry,
     tx: &UnboundedSender<GenEvent>,
 ) {
     for chunk in &mock.chunks {
@@ -267,20 +345,24 @@ async fn run_mock(
         tokio::task::yield_now().await;
     }
     let completion_tokens = mock.chunks.iter().filter(|s| !s.is_empty()).count() as u32;
-    let _ = tx.send(GenEvent::Done {
-        reason: if params.max_tokens == 0 {
+    send_done(
+        telemetry,
+        tx,
+        if params.max_tokens == 0 {
             FinishReason::Length
         } else {
             mock.finish
         },
-        prompt_tokens: prompt_ids.len() as u32,
-        completion_tokens: if params.max_tokens == 0 {
-            0
-        } else {
-            completion_tokens
-        },
-        cached_prompt_tokens: 0,
-    });
+        GenerationStats::token_counts(
+            prompt_ids.len() as u32,
+            if params.max_tokens == 0 {
+                0
+            } else {
+                completion_tokens
+            },
+            0,
+        ),
+    );
 }
 
 fn run(
@@ -297,12 +379,12 @@ fn run(
     // Zero-token request: return an empty completion without touching the
     // engine. OpenAI semantics: `max_tokens=0` means no completion tokens.
     if params.max_tokens == 0 {
-        let _ = tx.send(GenEvent::Done {
-            reason: FinishReason::Length,
-            prompt_tokens,
-            completion_tokens: 0,
-            cached_prompt_tokens: 0,
-        });
+        send_done(
+            &state.telemetry,
+            &tx,
+            FinishReason::Length,
+            GenerationStats::token_counts(prompt_tokens, 0, 0),
+        );
         return Ok(());
     }
 
@@ -311,7 +393,8 @@ fn run(
         .as_ref()
         .ok_or_else(|| anyhow!("no inference session configured"))?;
     let mut guard = session.blocking_lock();
-    if guard.is_dflash() {
+    let features = guard.features();
+    if should_use_dflash_generation(features) {
         if cache.is_some() {
             tracing::debug!("prefix cache skipped for DFlash session");
         }
@@ -327,12 +410,22 @@ fn run(
         emit_generated_ids(
             &tokenizer,
             &state.eos_ids,
-            prompt_tokens,
             &output.token_ids,
             &params,
+            GenerationStats {
+                prompt_tokens,
+                dflash_rounds: Some(output.rounds_run),
+                dflash_accepted_total: Some(output.accepted_total),
+                decode_ms: Some(output.decode_ms),
+                ..GenerationStats::default()
+            },
+            &state.telemetry,
             &tx,
         );
         return Ok(());
+    }
+    if !features.plain_prefill_decode {
+        anyhow::bail!("loaded session does not expose a supported generation path");
     }
 
     let prefill_logits = if let Some(cache_req) = cache.as_ref() {
@@ -489,21 +582,22 @@ fn run(
         }
     }
 
-    let _ = tx.send(GenEvent::Done {
-        reason: finish,
-        prompt_tokens,
-        completion_tokens,
-        cached_prompt_tokens,
-    });
+    send_done(
+        &state.telemetry,
+        &tx,
+        finish,
+        GenerationStats::token_counts(prompt_tokens, completion_tokens, cached_prompt_tokens),
+    );
     Ok(())
 }
 
 fn emit_generated_ids(
     tokenizer: &Tokenizer,
     eos_ids: &[u32],
-    prompt_tokens: u32,
     token_ids: &[u32],
     params: &GenParams,
+    mut stats: GenerationStats,
+    telemetry: &GenerationTelemetry,
     tx: &UnboundedSender<GenEvent>,
 ) {
     let mut emitted_ids: Vec<u32> = Vec::with_capacity(token_ids.len());
@@ -546,12 +640,18 @@ fn emit_generated_ids(
         }
     }
 
-    let _ = tx.send(GenEvent::Done {
-        reason: finish,
-        prompt_tokens,
-        completion_tokens,
-        cached_prompt_tokens: 0,
-    });
+    stats.completion_tokens = completion_tokens;
+    send_done(telemetry, tx, finish, stats);
+}
+
+fn send_done(
+    telemetry: &GenerationTelemetry,
+    tx: &UnboundedSender<GenEvent>,
+    reason: FinishReason,
+    stats: GenerationStats,
+) {
+    telemetry.record(&stats);
+    let _ = tx.send(GenEvent::Done { reason, stats });
 }
 
 fn prefill_with_cache_anchor(
@@ -657,22 +757,13 @@ fn finish_after_emitted_token(completion_tokens: u32, max_tokens: usize) -> Opti
 pub async fn collect(mut rx: UnboundedReceiver<GenEvent>) -> Result<CollectedResult> {
     let mut text = String::new();
     let mut finish: Option<FinishReason> = None;
-    let mut prompt_tokens = 0;
-    let mut completion_tokens = 0;
-    let mut cached_prompt_tokens = 0;
+    let mut stats = GenerationStats::default();
     while let Some(ev) = rx.recv().await {
         match ev {
             GenEvent::Token(s) => text.push_str(&s),
-            GenEvent::Done {
-                reason,
-                prompt_tokens: p,
-                completion_tokens: c,
-                cached_prompt_tokens: cached,
-            } => {
+            GenEvent::Done { reason, stats: s } => {
                 finish = Some(reason);
-                prompt_tokens = p;
-                completion_tokens = c;
-                cached_prompt_tokens = cached;
+                stats = s;
                 break;
             }
             GenEvent::Error(msg) => return Err(anyhow!(msg)),
@@ -684,18 +775,14 @@ pub async fn collect(mut rx: UnboundedReceiver<GenEvent>) -> Result<CollectedRes
     Ok(CollectedResult {
         text,
         finish,
-        prompt_tokens,
-        completion_tokens,
-        cached_prompt_tokens,
+        stats,
     })
 }
 
 pub struct CollectedResult {
     pub text: String,
     pub finish: FinishReason,
-    pub prompt_tokens: u32,
-    pub completion_tokens: u32,
-    pub cached_prompt_tokens: u32,
+    pub stats: GenerationStats,
 }
 
 /// Re-export kept so downstream route modules can name the session type.

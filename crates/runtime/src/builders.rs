@@ -18,13 +18,19 @@ pub(crate) fn build_qwen(
     entry: &'static registry::RegistryEntry,
     context_tokens: usize,
 ) -> Result<(InferenceSession, Vec<u32>)> {
+    if entry.model.architecture_family() != registry::ArchitectureFamily::QwenHybridDense {
+        bail!(
+            "build_qwen requires Qwen hybrid dense architecture (got {})",
+            entry.model
+        );
+    }
     let mut params = match &entry.params {
         FamilyParams::Qwen35(p) => *p,
-        FamilyParams::Qwen3Moe(_) => unreachable!("caller filtered to Qwen3.5"),
-        FamilyParams::Qwen36Moe(_) => unreachable!("caller filtered to Qwen3.5"),
-        FamilyParams::Gemma4(_) => unreachable!("caller filtered to Qwen"),
-        FamilyParams::Phi4(_) => unreachable!("caller filtered to Qwen"),
-        FamilyParams::Llama31(_) => unreachable!("caller filtered to Qwen"),
+        FamilyParams::Qwen3Moe(_) => unreachable!("caller filtered to Qwen hybrid dense"),
+        FamilyParams::Qwen36Moe(_) => unreachable!("caller filtered to Qwen hybrid dense"),
+        FamilyParams::Gemma4(_) => unreachable!("caller filtered to Qwen hybrid dense"),
+        FamilyParams::Phi4(_) => unreachable!("caller filtered to Qwen hybrid dense"),
+        FamilyParams::Llama31(_) => unreachable!("caller filtered to Qwen hybrid dense"),
     };
 
     // INT4 decode lives in the 4B kernel; force-route 0.8B through it.

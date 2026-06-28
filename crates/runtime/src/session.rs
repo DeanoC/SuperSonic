@@ -11,6 +11,18 @@ use crate::dflash::{DFlashGenerateOutput, DFlashSession};
 use crate::gemma4_engine::{Gemma4Engine, Gemma4EngineSnapshot};
 use crate::gemma4_int4_engine::{Gemma4Int4Engine, Gemma4Int4EngineSnapshot};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionFeatures {
+    pub plain_prefill_decode: bool,
+    pub native_dflash_generate: bool,
+    pub prefix_snapshot: bool,
+    pub disk_prefix_snapshot: bool,
+}
+
+pub fn should_use_dflash_generation(features: SessionFeatures) -> bool {
+    features.native_dflash_generate
+}
+
 pub enum InferenceSession {
     Qwen(DecodeEngine),
     QwenDFlash(DFlashSession),
@@ -60,6 +72,29 @@ impl SessionSnapshot {
 }
 
 impl InferenceSession {
+    pub fn features(&self) -> SessionFeatures {
+        match self {
+            Self::Qwen(_) => SessionFeatures {
+                plain_prefill_decode: true,
+                native_dflash_generate: false,
+                prefix_snapshot: true,
+                disk_prefix_snapshot: true,
+            },
+            Self::QwenDFlash(_) => SessionFeatures {
+                plain_prefill_decode: false,
+                native_dflash_generate: true,
+                prefix_snapshot: false,
+                disk_prefix_snapshot: false,
+            },
+            Self::Gemma4Bf16(_) | Self::Gemma4Int4(_) => SessionFeatures {
+                plain_prefill_decode: true,
+                native_dflash_generate: false,
+                prefix_snapshot: true,
+                disk_prefix_snapshot: false,
+            },
+        }
+    }
+
     /// Reset per-prompt state (KV caches, conv/recurrent). Weights and
     /// scratch allocations stay resident.
     pub fn reset(&mut self) -> Result<()> {
@@ -174,5 +209,26 @@ impl InferenceSession {
             Self::QwenDFlash(session) => session.generate_greedy(prompt_ids, max_tokens, eos_ids),
             _ => Err(anyhow!("loaded session is not a DFlash session")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generation_mode_uses_dflash_only_when_session_exposes_it() {
+        assert!(should_use_dflash_generation(SessionFeatures {
+            plain_prefill_decode: false,
+            native_dflash_generate: true,
+            prefix_snapshot: false,
+            disk_prefix_snapshot: false,
+        }));
+        assert!(!should_use_dflash_generation(SessionFeatures {
+            plain_prefill_decode: true,
+            native_dflash_generate: false,
+            prefix_snapshot: true,
+            disk_prefix_snapshot: true,
+        }));
     }
 }

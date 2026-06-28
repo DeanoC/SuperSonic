@@ -7,6 +7,7 @@ mod metal_native;
 pub mod phi4;
 pub mod prefill_ffi;
 mod qwen35;
+#[path = "qwen36_moe/mod.rs"]
 pub mod qwen36_moe;
 pub mod qwen3_moe;
 
