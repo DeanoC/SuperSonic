@@ -1,203 +1,35 @@
-use anyhow::{anyhow, Result};
+use std::ops::{Deref, DerefMut};
+
+use anyhow::Result;
 use gpu_hal::Backend;
 use supersonic_runtime::qwen36_moe_config::{
-    parse_bool_flag, parse_moe_expert_vmm_mode, parse_moe_prefetch_ranks,
-    parse_moe_transition_min_observations, parse_optional_nonzero_usize,
-    parse_optional_positive_u32_or_disabled, parse_optional_positive_usize,
-    parse_positive_usize_with_default, parse_unit_interval_with_default,
-    DEFAULT_MOE_PREFETCH_EVICT_MIN_PROBABILITY,
+    qwen36_kv_vmm_mode_from_env_value, should_use_qwen36_kv_vmm as should_use_qwen36_kv_vmm_mode,
+    Qwen36MoeRuntimeConfig, Qwen36MoeRuntimeConfigInputs,
 };
 
-use crate::qwen36_moe_telemetry::{MoeIslandPrefetchMode, MoeSparseTelemetry};
+use crate::qwen36_moe_telemetry::MoeSparseTelemetry;
 
-pub(crate) const DEFAULT_SPARSE_MOE_PREFETCH_RANKS: usize = 4;
-pub(crate) const DEFAULT_SPARSE_MOE_TRANSITION_MIN_OBSERVATIONS: u32 = 1;
-pub(crate) const DEFAULT_SPARSE_MOE_PREFETCH_EVICT_MIN_PROBABILITY: f64 =
-    DEFAULT_MOE_PREFETCH_EVICT_MIN_PROBABILITY;
-
-pub(crate) use supersonic_runtime::qwen36_moe_config::MoeExpertVmmMode;
+pub(crate) use supersonic_runtime::qwen36_moe_config::{
+    should_try_moe_expert_vmm, MoeExpertVmmMode,
+};
 
 pub(crate) struct MoeRuntimeConfig {
-    pub(crate) vmm_mode: MoeExpertVmmMode,
-    pub(crate) island_cap_experts: Option<usize>,
-    pub(crate) protected_experts: Option<usize>,
-    pub(crate) fixed_hot_experts: Option<usize>,
-    pub(crate) sparse_requested: bool,
-    pub(crate) prefetch_mode: MoeIslandPrefetchMode,
-    pub(crate) prefetch_ranks: usize,
-    pub(crate) transition_min_observations: u32,
-    pub(crate) async_prefetch: bool,
-    pub(crate) async_staging_pages: usize,
-    pub(crate) prefetch_evict: bool,
-    pub(crate) prefetch_evict_min_probability: f64,
-    pub(crate) protect_demand_routes: bool,
-    pub(crate) hot_protect_min_hits: Option<u32>,
-    pub(crate) fixed_hot_min_hits: Option<u32>,
+    policy: Qwen36MoeRuntimeConfig,
     pub(crate) sparse_telemetry: Option<MoeSparseTelemetry>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Qwen36KvVmmMode {
-    Auto,
-    Disabled,
-    Force,
-}
+impl Deref for MoeRuntimeConfig {
+    type Target = Qwen36MoeRuntimeConfig;
 
-pub(crate) fn moe_island_cap_experts_from_env() -> Result<Option<usize>> {
-    let raw = std::env::var("SUPERSONIC_MOE_ISLAND_CAP_EXPERTS").ok();
-    parse_optional_positive_usize("SUPERSONIC_MOE_ISLAND_CAP_EXPERTS", raw.as_deref())
-}
-
-pub(crate) fn moe_expert_vmm_mode_from_env() -> Result<MoeExpertVmmMode> {
-    let raw = std::env::var("SUPERSONIC_VMM_MOE_ISLANDS").ok();
-    parse_moe_expert_vmm_mode("SUPERSONIC_VMM_MOE_ISLANDS", raw.as_deref())
-}
-
-pub(crate) fn moe_island_protected_experts_from_env_value(
-    raw: Option<&str>,
-) -> Result<Option<usize>> {
-    parse_optional_nonzero_usize("SUPERSONIC_MOE_ISLAND_PROTECTED_EXPERTS", raw)
-}
-
-pub(crate) fn moe_island_protected_experts_from_env() -> Result<Option<usize>> {
-    let raw = std::env::var("SUPERSONIC_MOE_ISLAND_PROTECTED_EXPERTS").ok();
-    moe_island_protected_experts_from_env_value(raw.as_deref())
-}
-
-pub(crate) fn moe_island_fixed_hot_experts_from_env_value(
-    raw: Option<&str>,
-) -> Result<Option<usize>> {
-    parse_optional_nonzero_usize("SUPERSONIC_MOE_ISLAND_FIXED_HOT_EXPERTS", raw)
-}
-
-pub(crate) fn moe_island_fixed_hot_experts_from_env() -> Result<Option<usize>> {
-    let raw = std::env::var("SUPERSONIC_MOE_ISLAND_FIXED_HOT_EXPERTS").ok();
-    moe_island_fixed_hot_experts_from_env_value(raw.as_deref())
-}
-
-pub(crate) fn moe_island_prefetch_ranks_from_env_value(
-    raw: Option<&str>,
-    mode: MoeIslandPrefetchMode,
-    top_k: usize,
-) -> Result<usize> {
-    parse_moe_prefetch_ranks("SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS", raw, mode, top_k)
-}
-
-pub(crate) fn moe_island_prefetch_mode_from_env_for_sparse(
-    sparse_moe_requested: bool,
-) -> Result<MoeIslandPrefetchMode> {
-    let raw = std::env::var("SUPERSONIC_MOE_ISLAND_PREFETCH").ok();
-    match raw.as_deref() {
-        None if sparse_moe_requested => Ok(MoeIslandPrefetchMode::Transition),
-        _ => MoeIslandPrefetchMode::from_env_value(raw.as_deref()),
+    fn deref(&self) -> &Self::Target {
+        &self.policy
     }
 }
 
-pub(crate) fn moe_island_prefetch_ranks_from_env_for_sparse(
-    mode: MoeIslandPrefetchMode,
-    top_k: usize,
-    sparse_moe_requested: bool,
-) -> Result<usize> {
-    let raw = std::env::var("SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS").ok();
-    if raw.is_none() && sparse_moe_requested && mode == MoeIslandPrefetchMode::Transition {
-        return Ok(DEFAULT_SPARSE_MOE_PREFETCH_RANKS.min(top_k));
+impl DerefMut for MoeRuntimeConfig {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.policy
     }
-    moe_island_prefetch_ranks_from_env_value(raw.as_deref(), mode, top_k)
-}
-
-pub(crate) fn moe_island_prefetch_transition_min_observations_from_env_value(
-    raw: Option<&str>,
-    mode: MoeIslandPrefetchMode,
-) -> Result<u32> {
-    parse_moe_transition_min_observations(
-        "SUPERSONIC_MOE_ISLAND_PREFETCH_TRANSITION_MIN_OBS",
-        raw,
-        mode,
-    )
-}
-
-pub(crate) fn moe_island_prefetch_transition_min_observations_for_sparse(
-    mode: MoeIslandPrefetchMode,
-    sparse_moe_requested: bool,
-) -> Result<u32> {
-    let raw = std::env::var("SUPERSONIC_MOE_ISLAND_PREFETCH_TRANSITION_MIN_OBS").ok();
-    if raw.is_none() && sparse_moe_requested && mode == MoeIslandPrefetchMode::Transition {
-        return Ok(DEFAULT_SPARSE_MOE_TRANSITION_MIN_OBSERVATIONS);
-    }
-    moe_island_prefetch_transition_min_observations_from_env_value(raw.as_deref(), mode)
-}
-
-pub(crate) fn moe_island_async_prefetch_from_env_value(raw: Option<&str>) -> Result<bool> {
-    parse_bool_flag("SUPERSONIC_MOE_ISLAND_ASYNC_PREFETCH", raw)
-}
-
-pub(crate) fn moe_island_async_prefetch_from_env() -> Result<bool> {
-    let raw = std::env::var("SUPERSONIC_MOE_ISLAND_ASYNC_PREFETCH").ok();
-    moe_island_async_prefetch_from_env_value(raw.as_deref())
-}
-
-pub(crate) fn moe_island_async_staging_pages_from_env_value(raw: Option<&str>) -> Result<usize> {
-    parse_positive_usize_with_default("SUPERSONIC_MOE_ISLAND_ASYNC_STAGING_PAGES", raw, 4)
-}
-
-pub(crate) fn moe_island_async_staging_pages_from_env() -> Result<usize> {
-    let raw = std::env::var("SUPERSONIC_MOE_ISLAND_ASYNC_STAGING_PAGES").ok();
-    moe_island_async_staging_pages_from_env_value(raw.as_deref())
-}
-
-pub(crate) fn moe_island_prefetch_evict_from_env_value(raw: Option<&str>) -> Result<bool> {
-    parse_bool_flag("SUPERSONIC_MOE_ISLAND_PREFETCH_EVICT", raw)
-}
-
-pub(crate) fn moe_island_prefetch_evict_from_env() -> Result<bool> {
-    let raw = std::env::var("SUPERSONIC_MOE_ISLAND_PREFETCH_EVICT").ok();
-    moe_island_prefetch_evict_from_env_value(raw.as_deref())
-}
-
-pub(crate) fn moe_island_prefetch_evict_min_probability_from_env_value(
-    raw: Option<&str>,
-) -> Result<f64> {
-    parse_unit_interval_with_default(
-        "SUPERSONIC_MOE_ISLAND_PREFETCH_EVICT_MIN_PROB",
-        raw,
-        DEFAULT_SPARSE_MOE_PREFETCH_EVICT_MIN_PROBABILITY,
-    )
-}
-
-pub(crate) fn moe_island_prefetch_evict_min_probability_from_env() -> Result<f64> {
-    let raw = std::env::var("SUPERSONIC_MOE_ISLAND_PREFETCH_EVICT_MIN_PROB").ok();
-    moe_island_prefetch_evict_min_probability_from_env_value(raw.as_deref())
-}
-
-pub(crate) fn moe_island_protect_demand_from_env_value(raw: Option<&str>) -> Result<bool> {
-    parse_bool_flag("SUPERSONIC_MOE_ISLAND_PROTECT_DEMAND", raw)
-}
-
-pub(crate) fn moe_island_protect_demand_from_env() -> Result<bool> {
-    let raw = std::env::var("SUPERSONIC_MOE_ISLAND_PROTECT_DEMAND").ok();
-    moe_island_protect_demand_from_env_value(raw.as_deref())
-}
-
-pub(crate) fn moe_island_hot_protect_min_hits_from_env_value(
-    raw: Option<&str>,
-) -> Result<Option<u32>> {
-    parse_optional_positive_u32_or_disabled("SUPERSONIC_MOE_ISLAND_HOT_PROTECT_MIN_HITS", raw)
-}
-
-pub(crate) fn moe_island_hot_protect_min_hits_from_env() -> Result<Option<u32>> {
-    let raw = std::env::var("SUPERSONIC_MOE_ISLAND_HOT_PROTECT_MIN_HITS").ok();
-    moe_island_hot_protect_min_hits_from_env_value(raw.as_deref())
-}
-
-pub(crate) fn moe_island_fixed_hot_min_hits_from_env_value(
-    raw: Option<&str>,
-) -> Result<Option<u32>> {
-    parse_optional_positive_u32_or_disabled("SUPERSONIC_MOE_ISLAND_FIXED_HOT_MIN_HITS", raw)
-}
-
-pub(crate) fn moe_island_fixed_hot_min_hits_from_env() -> Result<Option<u32>> {
-    let raw = std::env::var("SUPERSONIC_MOE_ISLAND_FIXED_HOT_MIN_HITS").ok();
-    moe_island_fixed_hot_min_hits_from_env_value(raw.as_deref())
 }
 
 pub(crate) fn prepare_moe_runtime_config(
@@ -206,139 +38,46 @@ pub(crate) fn prepare_moe_runtime_config(
     backend: Backend,
     top_k: usize,
 ) -> Result<MoeRuntimeConfig> {
-    let mut vmm_mode = moe_expert_vmm_mode_from_env()?;
-    if backend == Backend::Cuda {
-        if vmm_mode == MoeExpertVmmMode::Force {
-            anyhow::bail!(
-                "SUPERSONIC_VMM_MOE_ISLANDS=1 is not supported for Qwen3.6-MoE CUDA v1; \
-                 unset it or use SUPERSONIC_VMM_MOE_ISLANDS=0"
-            );
-        }
-        vmm_mode = MoeExpertVmmMode::Disabled;
-    }
-    let island_cap_experts = moe_island_cap_experts_from_env()?;
-    let protected_experts = moe_island_protected_experts_from_env()?;
-    let fixed_hot_experts = moe_island_fixed_hot_experts_from_env()?;
-    if island_cap_experts.is_some() && speculative_decode {
-        anyhow::bail!(
-            "SUPERSONIC_MOE_ISLAND_CAP_EXPERTS sparse residency is not wired through speculative decode yet"
-        );
-    }
-    if island_cap_experts.is_some() && vmm_mode == MoeExpertVmmMode::Disabled {
-        anyhow::bail!(
-            "SUPERSONIC_MOE_ISLAND_CAP_EXPERTS requires VMM expert slabs; unset SUPERSONIC_VMM_MOE_ISLANDS=0"
-        );
-    }
+    let vmm_mode = std::env::var("SUPERSONIC_VMM_MOE_ISLANDS").ok();
+    let island_cap_experts = std::env::var("SUPERSONIC_MOE_ISLAND_CAP_EXPERTS").ok();
+    let protected_experts = std::env::var("SUPERSONIC_MOE_ISLAND_PROTECTED_EXPERTS").ok();
+    let fixed_hot_experts = std::env::var("SUPERSONIC_MOE_ISLAND_FIXED_HOT_EXPERTS").ok();
+    let prefetch_mode = std::env::var("SUPERSONIC_MOE_ISLAND_PREFETCH").ok();
+    let prefetch_ranks = std::env::var("SUPERSONIC_MOE_ISLAND_PREFETCH_RANKS").ok();
+    let transition_min_observations =
+        std::env::var("SUPERSONIC_MOE_ISLAND_PREFETCH_TRANSITION_MIN_OBS").ok();
+    let async_prefetch = std::env::var("SUPERSONIC_MOE_ISLAND_ASYNC_PREFETCH").ok();
+    let async_staging_pages = std::env::var("SUPERSONIC_MOE_ISLAND_ASYNC_STAGING_PAGES").ok();
+    let prefetch_evict = std::env::var("SUPERSONIC_MOE_ISLAND_PREFETCH_EVICT").ok();
+    let prefetch_evict_min_probability =
+        std::env::var("SUPERSONIC_MOE_ISLAND_PREFETCH_EVICT_MIN_PROB").ok();
+    let protect_demand_routes = std::env::var("SUPERSONIC_MOE_ISLAND_PROTECT_DEMAND").ok();
+    let hot_protect_min_hits = std::env::var("SUPERSONIC_MOE_ISLAND_HOT_PROTECT_MIN_HITS").ok();
+    let fixed_hot_min_hits = std::env::var("SUPERSONIC_MOE_ISLAND_FIXED_HOT_MIN_HITS").ok();
 
-    let sparse_requested = island_cap_experts.is_some();
-    let prefetch_mode = moe_island_prefetch_mode_from_env_for_sparse(sparse_requested)?;
-    let prefetch_ranks =
-        moe_island_prefetch_ranks_from_env_for_sparse(prefetch_mode, top_k, sparse_requested)?;
-    let transition_min_observations = moe_island_prefetch_transition_min_observations_for_sparse(
-        prefetch_mode,
-        sparse_requested,
-    )?;
-    let async_prefetch = moe_island_async_prefetch_from_env()?;
-    let async_staging_pages = moe_island_async_staging_pages_from_env()?;
-    let prefetch_evict = moe_island_prefetch_evict_from_env()?;
-    let prefetch_evict_min_probability = moe_island_prefetch_evict_min_probability_from_env()?;
-    let protect_demand_routes = moe_island_protect_demand_from_env()?;
-    let hot_protect_min_hits = moe_island_hot_protect_min_hits_from_env()?;
-    let fixed_hot_min_hits = moe_island_fixed_hot_min_hits_from_env()?;
-    if prefetch_mode != MoeIslandPrefetchMode::Disabled && !sparse_requested {
-        anyhow::bail!("SUPERSONIC_MOE_ISLAND_PREFETCH requires SUPERSONIC_MOE_ISLAND_CAP_EXPERTS");
-    }
-    if prefetch_evict {
-        if !sparse_requested {
-            anyhow::bail!(
-                "SUPERSONIC_MOE_ISLAND_PREFETCH_EVICT requires SUPERSONIC_MOE_ISLAND_CAP_EXPERTS"
-            );
-        }
-        if prefetch_mode == MoeIslandPrefetchMode::Disabled {
-            anyhow::bail!(
-                "SUPERSONIC_MOE_ISLAND_PREFETCH_EVICT=1 requires SUPERSONIC_MOE_ISLAND_PREFETCH=previous-token, previous-token-resident, or transition"
-            );
-        }
-    }
-    if !prefetch_evict && std::env::var("SUPERSONIC_MOE_ISLAND_PREFETCH_EVICT_MIN_PROB").is_ok() {
-        anyhow::bail!(
-            "SUPERSONIC_MOE_ISLAND_PREFETCH_EVICT_MIN_PROB requires SUPERSONIC_MOE_ISLAND_PREFETCH_EVICT=1"
-        );
-    }
-    if async_prefetch {
-        if !sparse_requested {
-            anyhow::bail!(
-                "SUPERSONIC_MOE_ISLAND_ASYNC_PREFETCH requires SUPERSONIC_MOE_ISLAND_CAP_EXPERTS"
-            );
-        }
-        if backend != Backend::Hip {
-            anyhow::bail!(
-                "SUPERSONIC_MOE_ISLAND_ASYNC_PREFETCH=1 is HIP-only in v1; backend={backend}"
-            );
-        }
-        if prefetch_mode == MoeIslandPrefetchMode::Disabled {
-            anyhow::bail!(
-                "SUPERSONIC_MOE_ISLAND_ASYNC_PREFETCH=1 requires SUPERSONIC_MOE_ISLAND_PREFETCH=previous-token, previous-token-resident, or transition"
-            );
-        }
-    }
-    if protected_experts.is_some() && !sparse_requested {
-        anyhow::bail!(
-            "SUPERSONIC_MOE_ISLAND_PROTECTED_EXPERTS requires SUPERSONIC_MOE_ISLAND_CAP_EXPERTS"
-        );
-    }
-    if fixed_hot_experts.is_some() && !sparse_requested {
-        anyhow::bail!(
-            "SUPERSONIC_MOE_ISLAND_FIXED_HOT_EXPERTS requires SUPERSONIC_MOE_ISLAND_CAP_EXPERTS"
-        );
-    }
-    if protect_demand_routes {
-        if !sparse_requested {
-            anyhow::bail!(
-                "SUPERSONIC_MOE_ISLAND_PROTECT_DEMAND requires SUPERSONIC_MOE_ISLAND_CAP_EXPERTS"
-            );
-        }
-        if protected_experts.is_none() {
-            anyhow::bail!(
-                "SUPERSONIC_MOE_ISLAND_PROTECT_DEMAND=1 requires SUPERSONIC_MOE_ISLAND_PROTECTED_EXPERTS"
-            );
-        }
-    }
-    if hot_protect_min_hits.is_some() {
-        if !sparse_requested {
-            anyhow::bail!(
-                "SUPERSONIC_MOE_ISLAND_HOT_PROTECT_MIN_HITS requires SUPERSONIC_MOE_ISLAND_CAP_EXPERTS"
-            );
-        }
-        if protected_experts.is_none() {
-            anyhow::bail!(
-                "SUPERSONIC_MOE_ISLAND_HOT_PROTECT_MIN_HITS requires SUPERSONIC_MOE_ISLAND_PROTECTED_EXPERTS"
-            );
-        }
-    }
-    if fixed_hot_min_hits.is_some() {
-        if !sparse_requested {
-            anyhow::bail!(
-                "SUPERSONIC_MOE_ISLAND_FIXED_HOT_MIN_HITS requires SUPERSONIC_MOE_ISLAND_CAP_EXPERTS"
-            );
-        }
-        if fixed_hot_experts.is_none() {
-            anyhow::bail!(
-                "SUPERSONIC_MOE_ISLAND_FIXED_HOT_MIN_HITS requires SUPERSONIC_MOE_ISLAND_FIXED_HOT_EXPERTS"
-            );
-        }
-    }
-    if fixed_hot_experts.is_some() && fixed_hot_min_hits.is_none() {
-        anyhow::bail!(
-            "SUPERSONIC_MOE_ISLAND_FIXED_HOT_EXPERTS requires SUPERSONIC_MOE_ISLAND_FIXED_HOT_MIN_HITS"
-        );
-    }
+    let inputs = Qwen36MoeRuntimeConfigInputs {
+        vmm_mode: vmm_mode.as_deref(),
+        island_cap_experts: island_cap_experts.as_deref(),
+        protected_experts: protected_experts.as_deref(),
+        fixed_hot_experts: fixed_hot_experts.as_deref(),
+        prefetch_mode: prefetch_mode.as_deref(),
+        prefetch_ranks: prefetch_ranks.as_deref(),
+        transition_min_observations: transition_min_observations.as_deref(),
+        async_prefetch: async_prefetch.as_deref(),
+        async_staging_pages: async_staging_pages.as_deref(),
+        prefetch_evict: prefetch_evict.as_deref(),
+        prefetch_evict_min_probability: prefetch_evict_min_probability.as_deref(),
+        protect_demand_routes: protect_demand_routes.as_deref(),
+        hot_protect_min_hits: hot_protect_min_hits.as_deref(),
+        fixed_hot_min_hits: fixed_hot_min_hits.as_deref(),
+    };
+    let policy = Qwen36MoeRuntimeConfig::from_inputs(&inputs, speculative_decode, backend, top_k)?;
 
     let sparse_telemetry = MoeSparseTelemetry::from_env(
-        sparse_requested,
+        policy.sparse_requested,
         persistent_decode,
-        prefetch_mode,
-        prefetch_ranks,
+        policy.prefetch_mode,
+        policy.prefetch_ranks,
     )?;
     if let Some(path) = sparse_telemetry
         .as_ref()
@@ -351,352 +90,13 @@ pub(crate) fn prepare_moe_runtime_config(
     }
 
     Ok(MoeRuntimeConfig {
-        vmm_mode,
-        island_cap_experts,
-        protected_experts,
-        fixed_hot_experts,
-        sparse_requested,
-        prefetch_mode,
-        prefetch_ranks,
-        transition_min_observations,
-        async_prefetch,
-        async_staging_pages,
-        prefetch_evict,
-        prefetch_evict_min_probability,
-        protect_demand_routes,
-        hot_protect_min_hits,
-        fixed_hot_min_hits,
+        policy,
         sparse_telemetry,
     })
 }
 
-pub(crate) fn qwen36_kv_vmm_mode_from_env_value(
-    raw: Option<&str>,
-    backend: Backend,
-) -> Result<Qwen36KvVmmMode> {
-    match raw {
-        None if backend == Backend::Hip => Ok(Qwen36KvVmmMode::Auto),
-        None => Ok(Qwen36KvVmmMode::Disabled),
-        Some("0") => Ok(Qwen36KvVmmMode::Disabled),
-        Some("1") => Ok(Qwen36KvVmmMode::Force),
-        Some(other) => Err(anyhow!(
-            "SUPERSONIC_VMM_KV must be unset, 0, or 1 for Qwen3.6-MoE; got {other:?}"
-        )),
-    }
-}
-
 pub(crate) fn should_use_qwen36_kv_vmm(backend: Backend, ordinal: usize) -> Result<bool> {
-    let mode = qwen36_kv_vmm_mode_from_env_value(
-        std::env::var("SUPERSONIC_VMM_KV").ok().as_deref(),
-        backend,
-    )?;
-    let requested = match mode {
-        Qwen36KvVmmMode::Disabled => return Ok(false),
-        Qwen36KvVmmMode::Auto | Qwen36KvVmmMode::Force => true,
-    };
-    if !gpu_hal::vmm_is_supported(backend, ordinal) {
-        if mode == Qwen36KvVmmMode::Force {
-            eprintln!(
-                "[vmm] SUPERSONIC_VMM_KV=1 requested for Qwen3.6-MoE but backend={backend} \
-                 device {ordinal} does not support VMM; using dense KV buffers"
-            );
-        } else {
-            eprintln!(
-                "[vmm] Qwen3.6-MoE HIP KV VMM auto-enable skipped because backend={backend} \
-                 device {ordinal} does not support VMM; using dense KV buffers"
-            );
-        }
-        return Ok(false);
-    }
-    Ok(requested)
-}
-
-pub(crate) fn should_try_moe_expert_vmm(
-    mode: MoeExpertVmmMode,
-    backend: Backend,
-    has_int4_weights: bool,
-    weight_mode_label: &str,
-    ordinal: usize,
-) -> Result<bool> {
-    if mode == MoeExpertVmmMode::Disabled {
-        return Ok(false);
-    }
-    if !has_int4_weights {
-        if mode == MoeExpertVmmMode::Force {
-            anyhow::bail!(
-                "SUPERSONIC_VMM_MOE_ISLANDS=1 requires Qwen3.6-MoE INT4 weights; got {weight_mode_label}"
-            );
-        }
-        return Ok(false);
-    }
-    let supported = gpu_hal::vmm_is_supported(backend, ordinal);
-    if !supported {
-        if mode == MoeExpertVmmMode::Force {
-            anyhow::bail!(
-                "SUPERSONIC_VMM_MOE_ISLANDS=1 requested but backend={backend} VMM is unsupported on device {ordinal}"
-            );
-        }
-        return Ok(false);
-    }
-    Ok(true)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        moe_island_fixed_hot_experts_from_env_value, moe_island_fixed_hot_min_hits_from_env_value,
-        moe_island_hot_protect_min_hits_from_env_value, moe_island_prefetch_evict_from_env_value,
-        moe_island_prefetch_evict_min_probability_from_env_value,
-        moe_island_prefetch_ranks_from_env_value,
-        moe_island_prefetch_transition_min_observations_from_env_value,
-        moe_island_protect_demand_from_env_value, qwen36_kv_vmm_mode_from_env_value,
-        Qwen36KvVmmMode,
-    };
-    use crate::qwen36_moe_telemetry::MoeIslandPrefetchMode;
-    use gpu_hal::Backend;
-
-    #[test]
-    fn qwen36_kv_vmm_defaults_to_auto_on_hip_only() {
-        assert_eq!(
-            qwen36_kv_vmm_mode_from_env_value(None, Backend::Hip).unwrap(),
-            Qwen36KvVmmMode::Auto
-        );
-        assert_eq!(
-            qwen36_kv_vmm_mode_from_env_value(None, Backend::Cuda).unwrap(),
-            Qwen36KvVmmMode::Disabled
-        );
-        assert_eq!(
-            qwen36_kv_vmm_mode_from_env_value(None, Backend::Metal).unwrap(),
-            Qwen36KvVmmMode::Disabled
-        );
-    }
-
-    #[test]
-    fn qwen36_kv_vmm_env_override_is_explicit() {
-        assert_eq!(
-            qwen36_kv_vmm_mode_from_env_value(Some("0"), Backend::Hip).unwrap(),
-            Qwen36KvVmmMode::Disabled
-        );
-        assert_eq!(
-            qwen36_kv_vmm_mode_from_env_value(Some("1"), Backend::Cuda).unwrap(),
-            Qwen36KvVmmMode::Force
-        );
-        assert!(qwen36_kv_vmm_mode_from_env_value(Some("yes"), Backend::Hip).is_err());
-    }
-
-    #[test]
-    fn moe_prefetch_ranks_default_to_all_previous_token_routes() {
-        assert_eq!(
-            moe_island_prefetch_ranks_from_env_value(
-                None,
-                MoeIslandPrefetchMode::PreviousToken,
-                8,
-            )
-            .unwrap(),
-            8
-        );
-        assert_eq!(
-            moe_island_prefetch_ranks_from_env_value(
-                Some("all"),
-                MoeIslandPrefetchMode::PreviousTokenResidentOnly,
-                8,
-            )
-            .unwrap(),
-            8
-        );
-    }
-
-    #[test]
-    fn moe_prefetch_ranks_accept_rank_limited_previous_token_routes() {
-        assert_eq!(
-            moe_island_prefetch_ranks_from_env_value(
-                Some("1"),
-                MoeIslandPrefetchMode::PreviousToken,
-                8,
-            )
-            .unwrap(),
-            1
-        );
-        assert_eq!(
-            moe_island_prefetch_ranks_from_env_value(
-                Some("4"),
-                MoeIslandPrefetchMode::PreviousTokenResidentOnly,
-                8,
-            )
-            .unwrap(),
-            4
-        );
-        assert_eq!(
-            moe_island_prefetch_ranks_from_env_value(
-                Some("2"),
-                MoeIslandPrefetchMode::Transition,
-                8,
-            )
-            .unwrap(),
-            2
-        );
-    }
-
-    #[test]
-    fn moe_prefetch_ranks_reject_disabled_or_out_of_range_values() {
-        assert_eq!(
-            moe_island_prefetch_ranks_from_env_value(None, MoeIslandPrefetchMode::Disabled, 8)
-                .unwrap(),
-            0
-        );
-        assert!(moe_island_prefetch_ranks_from_env_value(
-            Some("1"),
-            MoeIslandPrefetchMode::Disabled,
-            8,
-        )
-        .is_err());
-        assert!(moe_island_prefetch_ranks_from_env_value(
-            Some("0"),
-            MoeIslandPrefetchMode::PreviousToken,
-            8,
-        )
-        .is_err());
-        assert!(moe_island_prefetch_ranks_from_env_value(
-            Some("9"),
-            MoeIslandPrefetchMode::Transition,
-            8,
-        )
-        .is_err());
-    }
-
-    #[test]
-    fn moe_transition_min_observations_defaults_only_for_transition_mode() {
-        assert_eq!(
-            moe_island_prefetch_transition_min_observations_from_env_value(
-                None,
-                MoeIslandPrefetchMode::Transition,
-            )
-            .unwrap(),
-            32
-        );
-        assert_eq!(
-            moe_island_prefetch_transition_min_observations_from_env_value(
-                Some("4"),
-                MoeIslandPrefetchMode::Transition,
-            )
-            .unwrap(),
-            4
-        );
-        assert_eq!(
-            moe_island_prefetch_transition_min_observations_from_env_value(
-                None,
-                MoeIslandPrefetchMode::PreviousToken,
-            )
-            .unwrap(),
-            0
-        );
-        assert!(
-            moe_island_prefetch_transition_min_observations_from_env_value(
-                Some("4"),
-                MoeIslandPrefetchMode::PreviousToken,
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn moe_prefetch_evict_env_accepts_boolean_aliases() {
-        assert!(!moe_island_prefetch_evict_from_env_value(None).unwrap());
-        assert!(!moe_island_prefetch_evict_from_env_value(Some("0")).unwrap());
-        assert!(!moe_island_prefetch_evict_from_env_value(Some("off")).unwrap());
-        assert!(!moe_island_prefetch_evict_from_env_value(Some("false")).unwrap());
-        assert!(moe_island_prefetch_evict_from_env_value(Some("1")).unwrap());
-        assert!(moe_island_prefetch_evict_from_env_value(Some("on")).unwrap());
-        assert!(moe_island_prefetch_evict_from_env_value(Some("true")).unwrap());
-        assert!(moe_island_prefetch_evict_from_env_value(Some("yes")).is_err());
-    }
-
-    #[test]
-    fn moe_prefetch_evict_min_probability_accepts_unit_interval() {
-        assert_eq!(
-            moe_island_prefetch_evict_min_probability_from_env_value(None).unwrap(),
-            0.90
-        );
-        assert_eq!(
-            moe_island_prefetch_evict_min_probability_from_env_value(Some("0")).unwrap(),
-            0.0
-        );
-        assert_eq!(
-            moe_island_prefetch_evict_min_probability_from_env_value(Some("1.0")).unwrap(),
-            1.0
-        );
-        assert!(moe_island_prefetch_evict_min_probability_from_env_value(Some("-0.1")).is_err());
-        assert!(moe_island_prefetch_evict_min_probability_from_env_value(Some("1.1")).is_err());
-    }
-
-    #[test]
-    fn moe_protect_demand_env_accepts_boolean_aliases() {
-        assert!(!moe_island_protect_demand_from_env_value(None).unwrap());
-        assert!(!moe_island_protect_demand_from_env_value(Some("0")).unwrap());
-        assert!(!moe_island_protect_demand_from_env_value(Some("off")).unwrap());
-        assert!(!moe_island_protect_demand_from_env_value(Some("false")).unwrap());
-        assert!(moe_island_protect_demand_from_env_value(Some("1")).unwrap());
-        assert!(moe_island_protect_demand_from_env_value(Some("on")).unwrap());
-        assert!(moe_island_protect_demand_from_env_value(Some("true")).unwrap());
-        assert!(moe_island_protect_demand_from_env_value(Some("yes")).is_err());
-    }
-
-    #[test]
-    fn moe_hot_protect_min_hits_accepts_positive_integer_or_disabled() {
-        assert_eq!(
-            moe_island_hot_protect_min_hits_from_env_value(None).unwrap(),
-            None
-        );
-        assert_eq!(
-            moe_island_hot_protect_min_hits_from_env_value(Some("0")).unwrap(),
-            None
-        );
-        assert_eq!(
-            moe_island_hot_protect_min_hits_from_env_value(Some("off")).unwrap(),
-            None
-        );
-        assert_eq!(
-            moe_island_hot_protect_min_hits_from_env_value(Some("32")).unwrap(),
-            Some(32)
-        );
-        assert!(moe_island_hot_protect_min_hits_from_env_value(Some("yes")).is_err());
-    }
-
-    #[test]
-    fn moe_fixed_hot_experts_accepts_non_negative_integer() {
-        assert_eq!(
-            moe_island_fixed_hot_experts_from_env_value(None).unwrap(),
-            None
-        );
-        assert_eq!(
-            moe_island_fixed_hot_experts_from_env_value(Some("0")).unwrap(),
-            None
-        );
-        assert_eq!(
-            moe_island_fixed_hot_experts_from_env_value(Some("64")).unwrap(),
-            Some(64)
-        );
-        assert!(moe_island_fixed_hot_experts_from_env_value(Some("yes")).is_err());
-    }
-
-    #[test]
-    fn moe_fixed_hot_min_hits_accepts_positive_integer_or_disabled() {
-        assert_eq!(
-            moe_island_fixed_hot_min_hits_from_env_value(None).unwrap(),
-            None
-        );
-        assert_eq!(
-            moe_island_fixed_hot_min_hits_from_env_value(Some("0")).unwrap(),
-            None
-        );
-        assert_eq!(
-            moe_island_fixed_hot_min_hits_from_env_value(Some("off")).unwrap(),
-            None
-        );
-        assert_eq!(
-            moe_island_fixed_hot_min_hits_from_env_value(Some("32")).unwrap(),
-            Some(32)
-        );
-        assert!(moe_island_fixed_hot_min_hits_from_env_value(Some("yes")).is_err());
-    }
+    let raw = std::env::var("SUPERSONIC_VMM_KV").ok();
+    let mode = qwen36_kv_vmm_mode_from_env_value(raw.as_deref(), backend)?;
+    should_use_qwen36_kv_vmm_mode(mode, backend, ordinal)
 }
