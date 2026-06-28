@@ -8,4 +8,5 @@ pub mod config {
     pub use crate::qwen36_moe_config::*;
 }
 
+pub mod decode_loop;
 pub mod types;
