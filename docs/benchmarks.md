@@ -128,6 +128,17 @@ target/qwen36_100tok_profile2/append_recurrent_warp32_direct_10x256_repeat.json
 
 It reported `100.79 tok/s` mean and `99.38 tok/s` weighted.
 
+Production refactor validation from 2026-06-28, after the runtime/server
+boundary cleanup, used the same local 27B target and Q8 DFlash draft artifacts
+but forced the full 256-token cap for every HumanEval prompt. The artifact:
+
+```text
+target/qwen36_production_refactor/current_10x256.json
+```
+
+It reported `42.641 ms/tok`, `24.38 tok/s` mean, `23.45 tok/s` weighted,
+generated `2560` total tokens, and stopped early on `0` prompts.
+
 Reference notes:
 
 - Algorithm summary:
@@ -181,6 +192,18 @@ Use this as a correctness and availability check before doing sustained RDNA4
 profiling. Longer R9700 performance sweeps should write to a dedicated
 `target/qwen36_gfx1201_*` directory and record `HIP_VISIBLE_DEVICES`, clocks,
 and whether the binary was built for both `gfx1100,gfx1201`.
+
+The 2026-06-28 production refactor validation ran the full starter matrix with
+Lucebox/DFlash artifacts available:
+
+```bash
+HIP_VISIBLE_DEVICES=1 RUN_LUCEBOX=1 ./tests/gfx1201/run_matrix.sh
+```
+
+The matrix passed the RDNA4 WMMA/int4 harness, direct Qwen3.6 27B smoke, and
+one-prompt Lucebox/DFlash smoke. The smoke artifact
+`target/qwen36_he_supersonic_gfx1201_smoke.json` reported `60.24 ms/tok`,
+`16.60 tok/s`, `16` generated tokens, and `0` early stops.
 
 ## Production Server Smoke: Qwen3.6 27B DFlash
 

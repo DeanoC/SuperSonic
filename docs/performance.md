@@ -23,6 +23,17 @@ runs, and runtime-feature deltas, see
 | phi4-mini | 38.3 ms / 26.1 tok/s | 39.7 ms / 25.2 tok/s | 53.1 ms / 18.8 tok/s | 78.1 ms / 12.8 tok/s |
 | qwen3.6-35b-a3b | - | 28.3 ms / 35.3 tok/s | - | 28.5 ms / 35.1 tok/s |
 
+Production-lane validation for `qwen3.6-27b` Q4KM-GPTQ plus native DFlash on
+2026-06-28 used the Lucebox HumanEval 10-prompt suite at a 256-token cap:
+`42.641 ms/tok`, `24.38 tok/s` mean, `23.45 tok/s` weighted, `2560` generated
+tokens, and `0` early stops.
+
+### `gfx1201` — Radeon AI PRO R9700, 32 GiB
+
+| Model | Option | ms/tok | tok/s |
+|---|---|---:|---:|
+| qwen3.6-27b | Q4KM-GPTQ + native DFlash, HumanEval smoke, 16 generated tokens | 60.24 | 16.60 |
+
 ### `gfx1150` — Radeon 890M iGPU
 
 | Model | Option | ms/tok | tok/s |
