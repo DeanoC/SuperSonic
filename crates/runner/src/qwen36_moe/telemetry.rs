@@ -11,6 +11,9 @@ use crate::qwen36_moe_types::ExpertRoute;
 
 const MIB: f64 = (1024 * 1024) as f64;
 
+pub(crate) use supersonic_runtime::qwen36_moe::route_telemetry::{
+    MoeRouteTelemetry, MoeTransitionPredictor,
+};
 pub(crate) use supersonic_runtime::qwen36_moe_config::MoeIslandPrefetchMode;
 
 pub(crate) fn print_and_write_moe_residency_summary(
@@ -123,6 +126,34 @@ pub(crate) fn print_and_write_moe_residency_summary(
         );
     }
     Ok(())
+}
+
+pub(crate) fn record_moe_route_telemetry(
+    telemetry: &mut MoeRouteTelemetry,
+    manager: &MoeExpertResidencyManager,
+    layer_idx: usize,
+    routes: &[ExpertRoute],
+    previous_routes: &[usize],
+) {
+    for route in routes {
+        if route.rank >= telemetry.observations_by_rank.len() {
+            continue;
+        }
+        telemetry.record_route_observation(route, previous_routes);
+        let gate_up = MoeExpertKey {
+            layer_idx,
+            expert_idx: route.expert_idx,
+            projection: MoeExpertProjection::GateUp,
+        };
+        let down = MoeExpertKey {
+            layer_idx,
+            expert_idx: route.expert_idx,
+            projection: MoeExpertProjection::Down,
+        };
+        if manager.is_resident(gate_up) && manager.is_resident(down) {
+            telemetry.record_resident_before(route.rank);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -311,92 +342,6 @@ mod tests {
     }
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct MoeTransitionPredictor {
-    top_k: usize,
-    min_observations: u32,
-    observations_by_previous_rank: Vec<u32>,
-    repeated_current_by_previous_rank: Vec<u32>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct MoeTransitionCandidate {
-    pub(crate) expert_idx: usize,
-    pub(crate) previous_rank: usize,
-    pub(crate) repeats: u32,
-    pub(crate) observations: u32,
-}
-
-impl MoeTransitionCandidate {
-    pub(crate) fn reuse_probability(self) -> f64 {
-        if self.observations == 0 {
-            0.0
-        } else {
-            self.repeats as f64 / self.observations as f64
-        }
-    }
-}
-
-impl MoeTransitionPredictor {
-    pub(crate) fn new(top_k: usize, min_observations: u32) -> Self {
-        Self {
-            top_k,
-            min_observations,
-            observations_by_previous_rank: vec![0; top_k],
-            repeated_current_by_previous_rank: vec![0; top_k],
-        }
-    }
-
-    pub(crate) fn update(&mut self, routes: &[ExpertRoute], previous_routes: &[usize]) {
-        for (previous_rank, &expert_idx) in previous_routes.iter().take(self.top_k).enumerate() {
-            self.observations_by_previous_rank[previous_rank] =
-                self.observations_by_previous_rank[previous_rank].saturating_add(1);
-            if routes.iter().any(|route| route.expert_idx == expert_idx) {
-                self.repeated_current_by_previous_rank[previous_rank] =
-                    self.repeated_current_by_previous_rank[previous_rank].saturating_add(1);
-            }
-        }
-    }
-
-    pub(crate) fn scored_candidates(
-        &self,
-        previous_routes: &[usize],
-        limit: usize,
-    ) -> Vec<MoeTransitionCandidate> {
-        let mut scored = Vec::new();
-        for (previous_rank, &expert_idx) in previous_routes.iter().take(self.top_k).enumerate() {
-            let observations = self.observations_by_previous_rank[previous_rank];
-            if observations < self.min_observations {
-                continue;
-            }
-            let repeats = self.repeated_current_by_previous_rank[previous_rank];
-            if repeats == 0 {
-                continue;
-            }
-            scored.push(MoeTransitionCandidate {
-                expert_idx,
-                previous_rank,
-                repeats,
-                observations,
-            });
-        }
-        scored.sort_by(|a, b| {
-            let lhs = (a.repeats as u64) * (b.observations as u64);
-            let rhs = (b.repeats as u64) * (a.observations as u64);
-            rhs.cmp(&lhs)
-                .then_with(|| a.previous_rank.cmp(&b.previous_rank))
-        });
-        scored.into_iter().take(limit).collect()
-    }
-
-    pub(crate) fn candidates(&self, previous_routes: &[usize], limit: usize) -> Vec<usize> {
-        self.scored_candidates(previous_routes, limit)
-            .into_iter()
-            .map(|candidate| candidate.expert_idx)
-            .collect()
-    }
-}
-
 pub(crate) struct MoeRouteRuntime {
     pub(crate) previous_topk_by_layer: Vec<Vec<usize>>,
     pub(crate) route_telemetry: Option<MoeRouteTelemetry>,
@@ -484,207 +429,6 @@ pub(crate) struct MoeSparseTelemetry {
     peak_page_backed_slices: usize,
     pub(crate) peak_resident_bytes: usize,
     peak_logical_resident_bytes: usize,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct MoeRouteTelemetry {
-    pub(crate) observations_by_rank: Vec<u64>,
-    pub(crate) resident_before_by_rank: Vec<u64>,
-    pub(crate) repeated_previous_by_rank: Vec<u64>,
-    pub(crate) repeated_previous_rank_by_current_rank: Vec<Vec<u64>>,
-    pub(crate) weight_sum_by_rank: Vec<f64>,
-}
-
-impl MoeRouteTelemetry {
-    pub(crate) fn new(top_k: usize) -> Self {
-        Self {
-            observations_by_rank: vec![0; top_k],
-            resident_before_by_rank: vec![0; top_k],
-            repeated_previous_by_rank: vec![0; top_k],
-            repeated_previous_rank_by_current_rank: vec![vec![0; top_k]; top_k],
-            weight_sum_by_rank: vec![0.0; top_k],
-        }
-    }
-
-    pub(crate) fn record_route_observation(
-        &mut self,
-        route: &ExpertRoute,
-        previous_routes: &[usize],
-    ) {
-        if route.rank >= self.observations_by_rank.len() {
-            return;
-        }
-        self.observations_by_rank[route.rank] += 1;
-        self.weight_sum_by_rank[route.rank] += route.weight as f64;
-        if let Some(previous_rank) = previous_routes
-            .iter()
-            .position(|&expert_idx| expert_idx == route.expert_idx)
-        {
-            self.repeated_previous_by_rank[route.rank] += 1;
-            if let Some(row) = self
-                .repeated_previous_rank_by_current_rank
-                .get_mut(route.rank)
-            {
-                if let Some(cell) = row.get_mut(previous_rank) {
-                    *cell += 1;
-                }
-            }
-        }
-    }
-
-    pub(crate) fn record(
-        &mut self,
-        manager: &MoeExpertResidencyManager,
-        layer_idx: usize,
-        routes: &[ExpertRoute],
-        previous_routes: &[usize],
-    ) {
-        for route in routes {
-            if route.rank >= self.observations_by_rank.len() {
-                continue;
-            }
-            self.record_route_observation(route, previous_routes);
-            let gate_up = MoeExpertKey {
-                layer_idx,
-                expert_idx: route.expert_idx,
-                projection: MoeExpertProjection::GateUp,
-            };
-            let down = MoeExpertKey {
-                layer_idx,
-                expert_idx: route.expert_idx,
-                projection: MoeExpertProjection::Down,
-            };
-            if manager.is_resident(gate_up) && manager.is_resident(down) {
-                self.resident_before_by_rank[route.rank] += 1;
-            }
-        }
-    }
-
-    pub(crate) fn to_json(&self) -> serde_json::Value {
-        fn probability(count: u64, observations: u64) -> f64 {
-            if observations == 0 {
-                0.0
-            } else {
-                count as f64 / observations as f64
-            }
-        }
-
-        let avg_weight_by_rank: Vec<f64> = self
-            .weight_sum_by_rank
-            .iter()
-            .zip(&self.observations_by_rank)
-            .map(|(sum, count)| {
-                if *count == 0 {
-                    0.0
-                } else {
-                    sum / *count as f64
-                }
-            })
-            .collect();
-        let repeated_previous_probability_by_current_rank: Vec<f64> = self
-            .repeated_previous_by_rank
-            .iter()
-            .zip(&self.observations_by_rank)
-            .map(|(count, observations)| probability(*count, *observations))
-            .collect();
-        let same_rank_repeat_probability_by_rank: Vec<f64> = self
-            .repeated_previous_rank_by_current_rank
-            .iter()
-            .enumerate()
-            .map(|(rank, row)| {
-                probability(
-                    row.get(rank).copied().unwrap_or(0),
-                    self.observations_by_rank.get(rank).copied().unwrap_or(0),
-                )
-            })
-            .collect();
-        let top_k = self.observations_by_rank.len();
-        let mut repeated_current_by_previous_rank = vec![0u64; top_k];
-        let mut best_previous_rank_by_current_rank = vec![None; top_k];
-        let mut best_current_rank_by_previous_rank = vec![None; top_k];
-        let mut best_transition: Option<(usize, usize, u64)> = None;
-        for (current_rank, row) in self
-            .repeated_previous_rank_by_current_rank
-            .iter()
-            .enumerate()
-        {
-            let mut best_previous: Option<(usize, u64)> = None;
-            for (previous_rank, &count) in row.iter().enumerate() {
-                if previous_rank < repeated_current_by_previous_rank.len() {
-                    repeated_current_by_previous_rank[previous_rank] += count;
-                }
-                if count > 0
-                    && best_previous
-                        .map(|(_, best_count)| count > best_count)
-                        .unwrap_or(true)
-                {
-                    best_previous = Some((previous_rank, count));
-                }
-                if count > 0
-                    && best_transition
-                        .map(|(_, _, best_count)| count > best_count)
-                        .unwrap_or(true)
-                {
-                    best_transition = Some((current_rank, previous_rank, count));
-                }
-            }
-            best_previous_rank_by_current_rank[current_rank] =
-                best_previous.map(|(previous_rank, _)| previous_rank);
-        }
-        for previous_rank in 0..top_k {
-            let mut best_current: Option<(usize, u64)> = None;
-            for (current_rank, row) in self
-                .repeated_previous_rank_by_current_rank
-                .iter()
-                .enumerate()
-            {
-                let count = row.get(previous_rank).copied().unwrap_or(0);
-                if count > 0
-                    && best_current
-                        .map(|(_, best_count)| count > best_count)
-                        .unwrap_or(true)
-                {
-                    best_current = Some((current_rank, count));
-                }
-            }
-            best_current_rank_by_previous_rank[previous_rank] =
-                best_current.map(|(current_rank, _)| current_rank);
-        }
-        let repeated_current_probability_by_previous_rank: Vec<f64> =
-            repeated_current_by_previous_rank
-                .iter()
-                .zip(&self.observations_by_rank)
-                .map(|(count, observations)| probability(*count, *observations))
-                .collect();
-        let best_transition_json = best_transition.map(|(current_rank, previous_rank, count)| {
-            serde_json::json!({
-                "current_rank": current_rank,
-                "previous_rank": previous_rank,
-                "count": count,
-                "probability_by_current_rank": probability(
-                    count,
-                    self.observations_by_rank
-                        .get(current_rank)
-                        .copied()
-                        .unwrap_or(0),
-                ),
-            })
-        });
-        serde_json::json!({
-            "observations_by_rank": &self.observations_by_rank,
-            "resident_before_by_rank": &self.resident_before_by_rank,
-            "repeated_previous_by_rank": &self.repeated_previous_by_rank,
-            "repeated_previous_probability_by_current_rank": repeated_previous_probability_by_current_rank,
-            "repeated_previous_rank_by_current_rank": &self.repeated_previous_rank_by_current_rank,
-            "same_rank_repeat_probability_by_rank": same_rank_repeat_probability_by_rank,
-            "repeated_current_by_previous_rank": repeated_current_by_previous_rank,
-            "repeated_current_probability_by_previous_rank": repeated_current_probability_by_previous_rank,
-            "best_previous_rank_by_current_rank": best_previous_rank_by_current_rank,
-            "best_current_rank_by_previous_rank": best_current_rank_by_previous_rank,
-            "best_transition": best_transition_json,
-            "avg_weight_by_rank": avg_weight_by_rank,
-        })
-    }
 }
 
 impl MoeSparseTelemetry {

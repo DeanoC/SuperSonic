@@ -9,4 +9,7 @@ pub mod config {
 }
 
 pub mod decode_loop;
+pub mod residency;
+pub mod route_telemetry;
+pub mod speculative;
 pub mod types;

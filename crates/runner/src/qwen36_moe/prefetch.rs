@@ -6,7 +6,7 @@ use model_store::BakedStore;
 use crate::qwen36_moe_residency::MoeExpertResidencyManager;
 use crate::qwen36_moe_residency_types::{MoeExpertKey, MoeExpertProjection};
 use crate::qwen36_moe_telemetry::{
-    MoeIslandPrefetchMode, MoeRouteTelemetry, MoeTransitionPredictor,
+    record_moe_route_telemetry, MoeIslandPrefetchMode, MoeRouteTelemetry, MoeTransitionPredictor,
 };
 use crate::qwen36_moe_types::{ExpertPrefetchPhase, ExpertRoute};
 
@@ -135,7 +135,7 @@ fn ensure_demand_routes(
         .map(Vec::as_slice)
         .unwrap_or(&[]);
     if let Some(route_telemetry) = route_telemetry {
-        route_telemetry.record(manager, layer_idx, routes, previous_routes);
+        record_moe_route_telemetry(route_telemetry, manager, layer_idx, routes, previous_routes);
     }
     if let Some(predictors) = transition_predictors {
         if let Some(predictor) = predictors.get_mut(layer_idx) {

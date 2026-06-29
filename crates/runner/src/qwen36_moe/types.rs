@@ -335,12 +335,7 @@ pub enum ExpertPrefetchPhase {
     Demand,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct ExpertRoute {
-    pub rank: usize,
-    pub expert_idx: usize,
-    pub weight: f32,
-}
+pub use supersonic_runtime::qwen36_moe::route_telemetry::ExpertRoute;
 
 #[cfg(test)]
 mod tests {
