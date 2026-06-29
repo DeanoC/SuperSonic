@@ -182,6 +182,58 @@ impl Config {
         self.text_config = self.text_config.normalized();
         self
     }
+
+    pub fn from_flm_qwen36_dense(flm: &model_store::FlmQwen36DenseConfig) -> Self {
+        let mut layer_types = vec!["linear_attention".to_string(); flm.num_hidden_layers];
+        for &idx in &flm.full_attention_layers {
+            if let Some(slot) = layer_types.get_mut(idx) {
+                *slot = "full_attention".to_string();
+            }
+        }
+
+        Self {
+            text_config: TextConfig {
+                vocab_size: flm.vocab_size,
+                hidden_size: flm.hidden_size,
+                intermediate_size: flm.intermediate_size,
+                num_hidden_layers: flm.num_hidden_layers,
+                num_attention_heads: flm.num_attention_heads,
+                num_key_value_heads: flm.num_key_value_heads,
+                hidden_act: activation_from_flm_id(flm.activation_id),
+                max_position_embeddings: flm.max_position_embeddings,
+                rms_norm_eps: flm.rms_norm_eps,
+                rms_norm_add_unit_offset: false,
+                tie_word_embeddings: flm.tie_word_embeddings,
+                eos_token_id: Some(serde_json::Value::Array(
+                    flm.eos_token_ids
+                        .iter()
+                        .map(|&id| serde_json::json!(id))
+                        .collect(),
+                )),
+                head_dim: flm.head_dim,
+                linear_conv_kernel_dim: flm.linear_conv_kernel_dim,
+                linear_key_head_dim: flm.linear_key_head_dim,
+                linear_value_head_dim: flm.linear_value_head_dim,
+                linear_num_key_heads: flm.linear_num_key_heads,
+                linear_num_value_heads: flm.linear_num_value_heads,
+                layer_types,
+                rope_parameters: Some(RopeParameters {
+                    rope_type: "default".to_string(),
+                    rope_theta: flm.rope_theta,
+                    partial_rotary_factor: flm.partial_rotary_factor,
+                }),
+            },
+        }
+    }
+}
+
+fn activation_from_flm_id(activation_id: u8) -> Activation {
+    match activation_id {
+        0 => Activation::Gelu,
+        1 => Activation::Silu,
+        2 => Activation::Swiglu,
+        _ => Activation::Silu,
+    }
 }
 
 /// Load config.json from a model directory.
@@ -256,5 +308,39 @@ mod tests {
         assert_eq!(text.rope_theta(), 10_000_000.0);
         assert_eq!(text.kv_bytes_per_token(2), 65_536);
         assert!(!text.rms_norm_add_unit_offset);
+    }
+
+    #[test]
+    fn builds_text_config_from_flm_qwen36_dense_descriptor() {
+        let flm = model_store::FlmQwen36DenseConfig {
+            vocab_size: 248320,
+            hidden_size: 5120,
+            intermediate_size: 17408,
+            num_hidden_layers: 64,
+            num_attention_heads: 24,
+            num_key_value_heads: 4,
+            head_dim: 256,
+            max_position_embeddings: 262144,
+            linear_conv_kernel_dim: 4,
+            linear_key_head_dim: 128,
+            linear_value_head_dim: 128,
+            linear_num_key_heads: 16,
+            linear_num_value_heads: 48,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10000000.0,
+            partial_rotary_factor: 0.25,
+            activation_id: 1,
+            tie_word_embeddings: false,
+            eos_token_ids: vec![248044],
+            full_attention_layers: (3..64).step_by(4).collect(),
+        };
+
+        let config = Config::from_flm_qwen36_dense(&flm).normalized();
+
+        assert_eq!(config.text_config.hidden_size, 5120);
+        assert_eq!(config.text_config.num_full_attention_layers(), 16);
+        assert_eq!(config.text_config.linear_value_dim(), 6144);
+        assert_eq!(config.text_config.rope_theta(), 10000000.0);
+        assert_eq!(config.text_config.eos_token_ids(), vec![248044]);
     }
 }

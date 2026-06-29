@@ -1,5 +1,8 @@
+use std::path::Path;
+
 use anyhow::Result;
 
+use crate::flm_model_source::{is_flm_model_path, FlmModelSource};
 use crate::registry::{Backend, GpuArch, ModelVariant, Qwen35KernelParams};
 use crate::Cli;
 
@@ -15,8 +18,7 @@ pub(crate) struct Qwen35Policy {
 }
 
 pub(crate) fn load_qwen35_startup(cli: &Cli) -> Result<Qwen35Startup> {
-    let config = qwen35::config::load_config(&cli.model_dir)
-        .map_err(|e| anyhow::anyhow!("loading config.json: {e}"))?;
+    let config = load_qwen35_config(cli)?;
     let text_config = config.text_config;
     eprintln!(
         "[config] hidden={} layers={} vocab={} heads={} kv_heads={} head_dim={}",
@@ -50,6 +52,31 @@ pub(crate) fn load_qwen35_startup(cli: &Cli) -> Result<Qwen35Startup> {
         prompt_ids,
         context_tokens,
     })
+}
+
+fn load_qwen35_config(cli: &Cli) -> Result<qwen35::config::Config> {
+    if is_flm_model_path(&cli.model_dir) {
+        return load_flm_qwen35_config(&cli.model_dir, cli.int4);
+    }
+
+    if !cli.model_dir.join("config.json").exists() {
+        if let Some(flm_file) = cli.flm_file.as_deref() {
+            return load_flm_qwen35_config(flm_file, cli.int4);
+        }
+    }
+
+    qwen35::config::load_config(&cli.model_dir)
+        .map_err(|e| anyhow::anyhow!("loading config.json: {e}"))
+}
+
+fn load_flm_qwen35_config(path: &Path, int4_runtime: bool) -> Result<qwen35::config::Config> {
+    eprintln!(
+        "[config] loading FLM runtime descriptor at {}",
+        path.display()
+    );
+    FlmModelSource::open(path, int4_runtime)
+        .and_then(|source| source.qwen_config())
+        .map_err(|e| anyhow::anyhow!("loading FLM Qwen config: {e}"))
 }
 
 pub(crate) fn validate_qwen35_startup(

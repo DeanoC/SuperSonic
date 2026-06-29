@@ -17,6 +17,7 @@ pub mod backend_runtime;
 pub mod bughunt;
 pub mod decode_engine;
 pub mod dflash_ddtree;
+pub mod flm_model_source;
 pub mod gemma4_engine;
 pub mod gemma4_int4_engine;
 pub mod oracle;

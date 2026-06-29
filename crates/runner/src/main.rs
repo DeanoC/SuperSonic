@@ -6,6 +6,7 @@ mod certified_kv;
 mod cli;
 mod decode_engine;
 mod dflash_ddtree;
+mod flm_model_source;
 mod gemma4_engine;
 mod gemma4_int4_engine;
 mod gemma4_runtime;
