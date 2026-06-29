@@ -11,11 +11,11 @@ pub(crate) struct Cli {
     #[arg(long, default_value = "qwen3.5-0.8b")]
     pub(crate) model: String,
 
-    /// Path to HuggingFace model directory (containing config.json + safetensors)
+    /// Path to a HuggingFace model directory or self-contained FLM container.
     #[arg(long)]
     pub(crate) model_dir: PathBuf,
 
-    /// Load weights from an FLM container instead of a SuperSonic bake.
+    /// Compatibility override for FLM weights. Prefer --model-dir model.flm.
     #[arg(long)]
     pub(crate) flm_file: Option<PathBuf>,
 
@@ -547,4 +547,22 @@ pub(crate) struct Cli {
     ///   coverage and future research.
     #[arg(long, default_value = "cosine")]
     pub(crate) specprefill_algorithm: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+
+    use super::Cli;
+
+    #[test]
+    fn help_advertises_flm_model_dir_as_main_path() {
+        let mut cmd = Cli::command();
+        let mut help = Vec::new();
+        cmd.write_long_help(&mut help).unwrap();
+        let help = String::from_utf8(help).unwrap();
+
+        assert!(help.contains("self-contained FLM container"), "{help}");
+        assert!(help.contains("Prefer --model-dir model.flm"), "{help}");
+    }
 }
