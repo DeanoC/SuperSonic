@@ -184,14 +184,43 @@ impl Config {
     }
 
     pub fn from_flm_qwen36_dense(flm: &model_store::FlmQwen36DenseConfig) -> Self {
+        Self::try_from_flm_qwen36_dense(flm)
+            .unwrap_or_else(|e| panic!("invalid FLM Qwen3.6 dense config: {e}"))
+    }
+
+    pub fn try_from_flm_qwen36_dense(
+        flm: &model_store::FlmQwen36DenseConfig,
+    ) -> Result<Self, String> {
+        validate_positive("vocab_size", flm.vocab_size)?;
+        validate_positive("hidden_size", flm.hidden_size)?;
+        validate_positive("intermediate_size", flm.intermediate_size)?;
+        validate_positive("num_hidden_layers", flm.num_hidden_layers)?;
+        validate_positive("num_attention_heads", flm.num_attention_heads)?;
+        validate_positive("num_key_value_heads", flm.num_key_value_heads)?;
+        validate_positive("head_dim", flm.head_dim)?;
+        validate_positive("max_position_embeddings", flm.max_position_embeddings)?;
+        validate_positive("linear_conv_kernel_dim", flm.linear_conv_kernel_dim)?;
+        validate_positive("linear_key_head_dim", flm.linear_key_head_dim)?;
+        validate_positive("linear_value_head_dim", flm.linear_value_head_dim)?;
+        validate_positive("linear_num_key_heads", flm.linear_num_key_heads)?;
+        validate_positive("linear_num_value_heads", flm.linear_num_value_heads)?;
+        validate_positive_finite("rms_norm_eps", flm.rms_norm_eps)?;
+        validate_positive_finite("rope_theta", flm.rope_theta)?;
+        validate_positive_finite("partial_rotary_factor", flm.partial_rotary_factor)?;
+
+        let hidden_act = activation_from_flm_id(flm.activation_id)?;
         let mut layer_types = vec!["linear_attention".to_string(); flm.num_hidden_layers];
         for &idx in &flm.full_attention_layers {
-            if let Some(slot) = layer_types.get_mut(idx) {
-                *slot = "full_attention".to_string();
-            }
+            let slot = layer_types.get_mut(idx).ok_or_else(|| {
+                format!(
+                    "full_attention_layers contains {idx}, but num_hidden_layers is {}",
+                    flm.num_hidden_layers
+                )
+            })?;
+            *slot = "full_attention".to_string();
         }
 
-        Self {
+        Ok(Self {
             text_config: TextConfig {
                 vocab_size: flm.vocab_size,
                 hidden_size: flm.hidden_size,
@@ -199,7 +228,7 @@ impl Config {
                 num_hidden_layers: flm.num_hidden_layers,
                 num_attention_heads: flm.num_attention_heads,
                 num_key_value_heads: flm.num_key_value_heads,
-                hidden_act: activation_from_flm_id(flm.activation_id),
+                hidden_act,
                 max_position_embeddings: flm.max_position_embeddings,
                 rms_norm_eps: flm.rms_norm_eps,
                 rms_norm_add_unit_offset: false,
@@ -223,16 +252,34 @@ impl Config {
                     partial_rotary_factor: flm.partial_rotary_factor,
                 }),
             },
-        }
+        })
     }
 }
 
-fn activation_from_flm_id(activation_id: u8) -> Activation {
+fn validate_positive(field: &str, value: usize) -> Result<(), String> {
+    if value == 0 {
+        Err(format!("{field} must be non-zero"))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_positive_finite(field: &str, value: f64) -> Result<(), String> {
+    if !value.is_finite() {
+        Err(format!("{field} must be finite"))
+    } else if value <= 0.0 {
+        Err(format!("{field} must be positive"))
+    } else {
+        Ok(())
+    }
+}
+
+fn activation_from_flm_id(activation_id: u8) -> Result<Activation, String> {
     match activation_id {
-        0 => Activation::Gelu,
-        1 => Activation::Silu,
-        2 => Activation::Swiglu,
-        _ => Activation::Silu,
+        0 => Ok(Activation::Gelu),
+        1 => Ok(Activation::Silu),
+        2 => Ok(Activation::Swiglu),
+        _ => Err(format!("unknown activation_id {activation_id}")),
     }
 }
 
@@ -249,6 +296,31 @@ pub fn load_config(model_dir: &std::path::Path) -> Result<Config, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn flm_qwen36_dense_descriptor() -> model_store::FlmQwen36DenseConfig {
+        model_store::FlmQwen36DenseConfig {
+            vocab_size: 248320,
+            hidden_size: 5120,
+            intermediate_size: 17408,
+            num_hidden_layers: 64,
+            num_attention_heads: 24,
+            num_key_value_heads: 4,
+            head_dim: 256,
+            max_position_embeddings: 262144,
+            linear_conv_kernel_dim: 4,
+            linear_key_head_dim: 128,
+            linear_value_head_dim: 128,
+            linear_num_key_heads: 16,
+            linear_num_value_heads: 48,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10000000.0,
+            partial_rotary_factor: 0.25,
+            activation_id: 1,
+            tie_word_embeddings: false,
+            eos_token_ids: vec![248044],
+            full_attention_layers: (3..64).step_by(4).collect(),
+        }
+    }
 
     #[test]
     fn parses_qwen36_27b_text_config_geometry() {
@@ -312,35 +384,39 @@ mod tests {
 
     #[test]
     fn builds_text_config_from_flm_qwen36_dense_descriptor() {
-        let flm = model_store::FlmQwen36DenseConfig {
-            vocab_size: 248320,
-            hidden_size: 5120,
-            intermediate_size: 17408,
-            num_hidden_layers: 64,
-            num_attention_heads: 24,
-            num_key_value_heads: 4,
-            head_dim: 256,
-            max_position_embeddings: 262144,
-            linear_conv_kernel_dim: 4,
-            linear_key_head_dim: 128,
-            linear_value_head_dim: 128,
-            linear_num_key_heads: 16,
-            linear_num_value_heads: 48,
-            rms_norm_eps: 1e-6,
-            rope_theta: 10000000.0,
-            partial_rotary_factor: 0.25,
-            activation_id: 1,
-            tie_word_embeddings: false,
-            eos_token_ids: vec![248044],
-            full_attention_layers: (3..64).step_by(4).collect(),
-        };
+        let flm = flm_qwen36_dense_descriptor();
 
-        let config = Config::from_flm_qwen36_dense(&flm).normalized();
+        let config = Config::try_from_flm_qwen36_dense(&flm)
+            .unwrap()
+            .normalized();
 
         assert_eq!(config.text_config.hidden_size, 5120);
         assert_eq!(config.text_config.num_full_attention_layers(), 16);
         assert_eq!(config.text_config.linear_value_dim(), 6144);
         assert_eq!(config.text_config.rope_theta(), 10000000.0);
         assert_eq!(config.text_config.eos_token_ids(), vec![248044]);
+    }
+
+    #[test]
+    fn rejects_unknown_activation_id_from_flm_qwen36_dense_descriptor() {
+        let mut flm = flm_qwen36_dense_descriptor();
+        flm.activation_id = 99;
+
+        let err = Config::try_from_flm_qwen36_dense(&flm).unwrap_err();
+
+        assert!(err.contains("activation_id"), "{err}");
+        assert!(err.contains("99"), "{err}");
+    }
+
+    #[test]
+    fn rejects_out_of_range_full_attention_layer_from_flm_qwen36_dense_descriptor() {
+        let mut flm = flm_qwen36_dense_descriptor();
+        flm.full_attention_layers.push(64);
+
+        let err = Config::try_from_flm_qwen36_dense(&flm).unwrap_err();
+
+        assert!(err.contains("full_attention_layers"), "{err}");
+        assert!(err.contains("64"), "{err}");
+        assert!(err.contains("num_hidden_layers"), "{err}");
     }
 }

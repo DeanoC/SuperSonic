@@ -5,6 +5,7 @@ use std::time::Instant;
 use anyhow::Result;
 use model_store::manifest::QuantProfile;
 
+use crate::flm_model_source::is_flm_model_path;
 use crate::registry::ModelVariant;
 use crate::Cli;
 
@@ -171,6 +172,10 @@ pub(crate) fn should_fetch_bake(
 
 pub(crate) fn should_fetch_exact_bake(download_bake: bool, local_version_ok: bool) -> bool {
     download_bake || !local_version_ok
+}
+
+pub(crate) fn flm_source_is_authoritative(cli: &Cli) -> bool {
+    cli.flm_file.is_some() || is_flm_model_path(&cli.model_dir)
 }
 
 pub(crate) fn load_qwen35_weights(
@@ -407,6 +412,9 @@ pub(crate) fn run_q4km_baker(cli: &Cli, bake_dir: &Path) -> Result<()> {
 /// tarball bundles HF metadata under `hf/`, which the downloader extracts
 /// into `--model-dir` before anything else reads from it.
 pub(crate) fn ensure_hf_metadata_present(cli: &Cli, model_variant: &ModelVariant) -> Result<bool> {
+    if flm_source_is_authoritative(cli) {
+        return Ok(false);
+    }
     if cli.no_bake || cli.no_download {
         return Ok(false);
     }
@@ -436,11 +444,20 @@ mod tests {
     use clap::Parser;
     use model_store::manifest::QuantProfile;
 
-    use super::{effective_quant_profile, should_fetch_bake, should_fetch_exact_bake};
+    use super::{
+        effective_quant_profile, flm_source_is_authoritative, should_fetch_bake,
+        should_fetch_exact_bake,
+    };
     use crate::Cli;
 
     fn cli(extra: &[&str]) -> Cli {
         let mut args = vec!["supersonic", "--model-dir", "/tmp/model", "--dry-run"];
+        args.extend_from_slice(extra);
+        Cli::parse_from(args)
+    }
+
+    fn cli_with_model_dir(model_dir: &str, extra: &[&str]) -> Cli {
+        let mut args = vec!["supersonic", "--model-dir", model_dir, "--dry-run"];
         args.extend_from_slice(extra);
         Cli::parse_from(args)
     }
@@ -463,6 +480,22 @@ mod tests {
     #[test]
     fn forced_exact_bake_fetch_ignores_metadata_bootstrap() {
         assert!(should_fetch_exact_bake(true, true));
+    }
+
+    #[test]
+    fn flm_file_is_authoritative_for_hf_metadata_bootstrap() {
+        assert!(flm_source_is_authoritative(&cli(&[
+            "--flm-file",
+            "/tmp/model.flm"
+        ])));
+    }
+
+    #[test]
+    fn flm_model_dir_is_authoritative_for_hf_metadata_bootstrap() {
+        assert!(flm_source_is_authoritative(&cli_with_model_dir(
+            "/tmp/model.flm",
+            &[]
+        )));
     }
 
     #[test]

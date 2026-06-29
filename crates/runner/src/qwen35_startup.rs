@@ -30,7 +30,7 @@ pub(crate) fn load_qwen35_startup(cli: &Cli) -> Result<Qwen35Startup> {
         text_config.head_dim,
     );
 
-    let tokenizer_path = cli.model_dir.join("tokenizer.json");
+    let tokenizer_path = tokenizer_json_path(cli)?;
     let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
         .map_err(|e| anyhow::anyhow!("load tokenizer: {e}"))?;
     let encoding = tokenizer
@@ -55,18 +55,18 @@ pub(crate) fn load_qwen35_startup(cli: &Cli) -> Result<Qwen35Startup> {
 }
 
 fn load_qwen35_config(cli: &Cli) -> Result<qwen35::config::Config> {
-    if is_flm_model_path(&cli.model_dir) {
-        return load_flm_qwen35_config(&cli.model_dir, cli.int4);
-    }
-
-    if !cli.model_dir.join("config.json").exists() {
-        if let Some(flm_file) = cli.flm_file.as_deref() {
-            return load_flm_qwen35_config(flm_file, cli.int4);
-        }
+    if let Some(flm_path) = flm_config_path(cli) {
+        return load_flm_qwen35_config(flm_path, cli.int4);
     }
 
     qwen35::config::load_config(&cli.model_dir)
         .map_err(|e| anyhow::anyhow!("loading config.json: {e}"))
+}
+
+fn flm_config_path(cli: &Cli) -> Option<&Path> {
+    cli.flm_file
+        .as_deref()
+        .or_else(|| is_flm_model_path(&cli.model_dir).then_some(cli.model_dir.as_path()))
 }
 
 fn load_flm_qwen35_config(path: &Path, int4_runtime: bool) -> Result<qwen35::config::Config> {
@@ -77,6 +77,57 @@ fn load_flm_qwen35_config(path: &Path, int4_runtime: bool) -> Result<qwen35::con
     FlmModelSource::open(path, int4_runtime)
         .and_then(|source| source.qwen_config())
         .map_err(|e| anyhow::anyhow!("loading FLM Qwen config: {e}"))
+}
+
+fn tokenizer_json_path(cli: &Cli) -> Result<std::path::PathBuf> {
+    if is_flm_model_path(&cli.model_dir) {
+        anyhow::bail!(
+            "FLM tokenizer loading is not wired yet for --model-dir {}; use --flm-file with a model directory containing tokenizer.json until FLM tokenizer assets are wired",
+            cli.model_dir.display()
+        );
+    }
+    Ok(cli.model_dir.join("tokenizer.json"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use clap::Parser;
+
+    use super::{flm_config_path, tokenizer_json_path};
+    use crate::Cli;
+
+    fn cli(model_dir: &str, extra: &[&str]) -> Cli {
+        let mut args = vec!["supersonic", "--model-dir", model_dir, "--dry-run"];
+        args.extend_from_slice(extra);
+        Cli::parse_from(args)
+    }
+
+    #[test]
+    fn flm_file_is_authoritative_for_qwen_config_even_with_model_dir_metadata() {
+        let cli = cli("/tmp/model-with-config", &["--flm-file", "/tmp/model.flm"]);
+
+        assert_eq!(flm_config_path(&cli), Some(Path::new("/tmp/model.flm")));
+    }
+
+    #[test]
+    fn flm_model_dir_is_authoritative_for_qwen_config() {
+        let cli = cli("/tmp/model.flm", &[]);
+
+        assert_eq!(flm_config_path(&cli), Some(Path::new("/tmp/model.flm")));
+    }
+
+    #[test]
+    fn flm_model_dir_rejects_tokenizer_json_path_until_tokenizer_assets_are_wired() {
+        let cli = cli("/tmp/model.flm", &[]);
+
+        let err = tokenizer_json_path(&cli).unwrap_err().to_string();
+
+        assert!(err.contains("tokenizer"), "{err}");
+        assert!(err.contains("FLM"), "{err}");
+        assert!(err.contains("not wired"), "{err}");
+    }
 }
 
 pub(crate) fn validate_qwen35_startup(

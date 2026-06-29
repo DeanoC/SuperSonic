@@ -31,7 +31,13 @@ impl FlmModelSource {
         let cfg = runtime.qwen36_config().ok_or_else(|| {
             anyhow::anyhow!("FLM {} is not Qwen3.6 dense v1", self.path.display())
         })?;
-        Ok(qwen35::config::Config::from_flm_qwen36_dense(cfg).normalized())
+        let config = qwen35::config::Config::try_from_flm_qwen36_dense(cfg).map_err(|e| {
+            anyhow::anyhow!(
+                "invalid FLM Qwen3.6 dense config in {}: {e}",
+                self.path.display()
+            )
+        })?;
+        Ok(config.normalized())
     }
 }
 
