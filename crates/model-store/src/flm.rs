@@ -78,10 +78,10 @@ pub struct FlmCodecDescriptor {
 #[derive(Debug, Clone, PartialEq)]
 pub struct FlmTensorAbiDescriptor {
     pub abi_id: u32,
-    pub architecture: String,
-    pub tensor_format: String,
-    pub producer: String,
-    pub version: String,
+    pub weight_prefix: String,
+    pub int4_packed_suffix: String,
+    pub int4_scale_suffix: String,
+    pub int4_shape_suffix: String,
 }
 
 #[derive(Debug, Clone)]
@@ -142,8 +142,14 @@ impl FlmRuntimeDirectory {
         &self.codecs
     }
 
-    pub fn codec(&self, id: u16) -> Option<&FlmCodecDescriptor> {
+    pub fn codec_by_id(&self, id: u16) -> Option<&FlmCodecDescriptor> {
         self.codecs.iter().find(|codec| codec.codec_id == id)
+    }
+
+    pub fn codec_by_semantic_id(&self, semantic_id: u16) -> Option<&FlmCodecDescriptor> {
+        self.codecs
+            .iter()
+            .find(|codec| codec.semantic_id as u16 == semantic_id)
     }
 
     pub fn tensor_abi(&self) -> &FlmTensorAbiDescriptor {
@@ -225,10 +231,22 @@ fn parse_section_table(buf: &[u8]) -> Result<HashMap<u32, SectionRange>, Error> 
                 "FLM runtime section {section_id} overlaps a previous section"
             )));
         }
+        if range.offset != previous_end {
+            return Err(Error::Other(format!(
+                "FLM runtime section {section_id} is not contiguous (offset={}, expected={previous_end})",
+                range.offset
+            )));
+        }
         previous_end = range
             .offset
             .checked_add(range.len)
             .ok_or_else(|| Error::Other("FLM runtime section range overflows".to_string()))?;
+    }
+    if previous_end != buf.len() {
+        return Err(Error::Other(format!(
+            "FLM runtime has trailing bytes after sections (final_end={previous_end}, len={})",
+            buf.len()
+        )));
     }
     Ok(sections)
 }
@@ -400,17 +418,20 @@ fn parse_codec_table(buf: &[u8]) -> Result<Vec<FlmCodecDescriptor>, Error> {
 fn parse_tensor_abi(buf: &[u8]) -> Result<FlmTensorAbiDescriptor, Error> {
     let mut offset = 0usize;
     let abi_id = read_u32_advance(buf, &mut offset, "FLM tensor ABI id")?;
-    let architecture = read_string_advance(buf, &mut offset, "FLM tensor ABI architecture")?;
-    let tensor_format = read_string_advance(buf, &mut offset, "FLM tensor ABI format")?;
-    let producer = read_string_advance(buf, &mut offset, "FLM tensor ABI producer")?;
-    let version = read_string_advance(buf, &mut offset, "FLM tensor ABI version")?;
+    let weight_prefix = read_string_advance(buf, &mut offset, "FLM tensor ABI weight_prefix")?;
+    let int4_packed_suffix =
+        read_string_advance(buf, &mut offset, "FLM tensor ABI int4_packed_suffix")?;
+    let int4_scale_suffix =
+        read_string_advance(buf, &mut offset, "FLM tensor ABI int4_scale_suffix")?;
+    let int4_shape_suffix =
+        read_string_advance(buf, &mut offset, "FLM tensor ABI int4_shape_suffix")?;
     ensure_consumed(buf, offset, "FLM tensor ABI")?;
     Ok(FlmTensorAbiDescriptor {
         abi_id,
-        architecture,
-        tensor_format,
-        producer,
-        version,
+        weight_prefix,
+        int4_packed_suffix,
+        int4_scale_suffix,
+        int4_shape_suffix,
     })
 }
 
@@ -418,6 +439,7 @@ fn parse_assets(table: &[u8], payloads: &[u8]) -> Result<HashMap<u32, FlmAsset>,
     let mut offset = 0usize;
     let count = read_count(table, &mut offset, "FLM asset count")?;
     let mut assets = HashMap::with_capacity(count);
+    let mut payload_ranges = Vec::with_capacity(count);
     for idx in 0..count {
         let asset_id = read_u32_advance(table, &mut offset, "FLM asset_id")?;
         let payload_offset = u32_to_usize(read_u32_advance(
@@ -436,6 +458,11 @@ fn parse_assets(table: &[u8], payloads: &[u8]) -> Result<HashMap<u32, FlmAsset>,
         let kind = std::str::from_utf8(kind_bytes)
             .map_err(|e| Error::Other(format!("FLM asset {asset_id} kind is not UTF-8: {e}")))?
             .to_string();
+        let payload_end = payload_offset.checked_add(payload_len).ok_or_else(|| {
+            Error::Other(format!(
+                "FLM asset {asset_id} payload range overflows (offset={payload_offset}, len={payload_len})"
+            ))
+        })?;
         let payload = read_exact_range(
             payloads,
             payload_offset,
@@ -443,6 +470,7 @@ fn parse_assets(table: &[u8], payloads: &[u8]) -> Result<HashMap<u32, FlmAsset>,
             &format!("FLM asset {asset_id} payload"),
         )?
         .to_vec();
+        payload_ranges.push((payload_offset, payload_end, asset_id));
         if assets
             .insert(
                 asset_id,
@@ -461,6 +489,27 @@ fn parse_assets(table: &[u8], payloads: &[u8]) -> Result<HashMap<u32, FlmAsset>,
         debug_assert!(idx < count);
     }
     ensure_consumed(table, offset, "FLM asset table")?;
+    payload_ranges.sort_by_key(|(payload_offset, _, asset_id)| (*payload_offset, *asset_id));
+    let mut previous_end = 0usize;
+    for (payload_offset, payload_end, asset_id) in payload_ranges {
+        if payload_offset < previous_end {
+            return Err(Error::Other(format!(
+                "FLM asset {asset_id} payload overlap (offset={payload_offset}, previous_end={previous_end})"
+            )));
+        }
+        if payload_offset != previous_end {
+            return Err(Error::Other(format!(
+                "FLM asset {asset_id} payload gap (offset={payload_offset}, expected={previous_end})"
+            )));
+        }
+        previous_end = payload_end;
+    }
+    if previous_end != payloads.len() {
+        return Err(Error::Other(format!(
+            "FLM assets have trailing payload bytes (final_end={previous_end}, len={})",
+            payloads.len()
+        )));
+    }
     Ok(assets)
 }
 
@@ -576,6 +625,22 @@ mod tests {
         out.extend_from_slice(value.as_bytes());
     }
 
+    fn read_u16_at(buf: &[u8], offset: usize) -> u16 {
+        u16::from_le_bytes(buf[offset..offset + 2].try_into().unwrap())
+    }
+
+    fn read_u32_at(buf: &[u8], offset: usize) -> u32 {
+        u32::from_le_bytes(buf[offset..offset + 4].try_into().unwrap())
+    }
+
+    fn put_u16_at(buf: &mut [u8], offset: usize, value: u16) {
+        buf[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_u32_at(buf: &mut [u8], offset: usize, value: u32) {
+        buf[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
     fn build_qwen_config_section() -> Vec<u8> {
         let mut out = Vec::new();
         for value in [
@@ -610,9 +675,9 @@ mod tests {
         let mut out = Vec::new();
         write_u32(&mut out, 3);
         for (codec_id, semantic_id, layout_id, decoder_id, flags) in [
-            (CODEC_RAW_BF16 as u8, 1u8, 1u16, 1u16, 0u32),
-            (CODEC_SYM_INT4_G128_BF16 as u8, 2u8, 2u16, 2u16, 0u32),
-            (CODEC_RAW_I64 as u8, 3u8, 1u16, 1u16, 0u32),
+            (0u8, CODEC_RAW_BF16 as u8, 1u16, 1u16, 0u32),
+            (1u8, CODEC_SYM_INT4_G128_BF16 as u8, 2u16, 2u16, 0u32),
+            (2u8, CODEC_RAW_I64 as u8, 1u16, 1u16, 0u32),
         ] {
             out.push(codec_id);
             out.push(semantic_id);
@@ -626,10 +691,10 @@ mod tests {
     fn build_tensor_abi_section() -> Vec<u8> {
         let mut out = Vec::new();
         write_u32(&mut out, TENSOR_ABI_QWEN3_6_DENSE_CT_INT4_V1);
-        write_string(&mut out, "qwen3.6-dense");
-        write_string(&mut out, "compressed-tensors-int4");
-        write_string(&mut out, "geo-quant");
-        write_string(&mut out, "v1");
+        write_string(&mut out, "model.language_model");
+        write_string(&mut out, ".weight_packed");
+        write_string(&mut out, ".weight_scale");
+        write_string(&mut out, ".weight_shape");
         out
     }
 
@@ -682,6 +747,101 @@ mod tests {
         out
     }
 
+    fn section_record_offset(runtime: &[u8], section_id: u32) -> usize {
+        let count = read_u16_at(runtime, 10) as usize;
+        for idx in 0..count {
+            let offset = 12 + idx * 12;
+            if read_u32_at(runtime, offset) == section_id {
+                return offset;
+            }
+        }
+        panic!("missing section {section_id}");
+    }
+
+    fn section_range(runtime: &[u8], section_id: u32) -> (usize, usize) {
+        let record = section_record_offset(runtime, section_id);
+        (
+            read_u32_at(runtime, record + 4) as usize,
+            read_u32_at(runtime, record + 8) as usize,
+        )
+    }
+
+    fn insert_gap_before_section(runtime: &mut Vec<u8>, section_id: u32) {
+        let (gap_offset, _) = section_range(runtime, section_id);
+        runtime.insert(gap_offset, 0);
+        let count = read_u16_at(runtime, 10) as usize;
+        for idx in 0..count {
+            let record = 12 + idx * 12;
+            let offset = read_u32_at(runtime, record + 4) as usize;
+            if offset >= gap_offset {
+                put_u32_at(runtime, record + 4, (offset + 1) as u32);
+            }
+        }
+    }
+
+    fn asset_payload_record(runtime: &[u8], asset_id: u32) -> (usize, usize, usize) {
+        let (table_offset, _) = section_range(runtime, SECTION_ASSET_TABLE);
+        let count = read_u32_at(runtime, table_offset) as usize;
+        let mut offset = table_offset + 4;
+        for _ in 0..count {
+            let current_id = read_u32_at(runtime, offset);
+            let payload_offset = read_u32_at(runtime, offset + 4) as usize;
+            let payload_len = read_u32_at(runtime, offset + 8) as usize;
+            let kind_len = read_u32_at(runtime, offset + 12) as usize;
+            if current_id == asset_id {
+                return (offset + 4, payload_offset, payload_len);
+            }
+            offset += 16 + kind_len;
+        }
+        panic!("missing asset {asset_id}");
+    }
+
+    fn insert_asset_payload_gap_before_asset(runtime: &mut Vec<u8>, asset_id: u32) {
+        let (payload_section_offset, payload_section_len) =
+            section_range(runtime, SECTION_ASSET_PAYLOADS);
+        let (_, gap_offset, _) = asset_payload_record(runtime, asset_id);
+        runtime.insert(payload_section_offset + gap_offset, 0);
+
+        let payload_record = section_record_offset(runtime, SECTION_ASSET_PAYLOADS);
+        put_u32_at(
+            runtime,
+            payload_record + 8,
+            (payload_section_len + 1) as u32,
+        );
+
+        let (table_offset, _) = section_range(runtime, SECTION_ASSET_TABLE);
+        let count = read_u32_at(runtime, table_offset) as usize;
+        let mut offset = table_offset + 4;
+        for _ in 0..count {
+            let payload_offset = read_u32_at(runtime, offset + 4) as usize;
+            if payload_offset >= gap_offset {
+                put_u32_at(runtime, offset + 4, (payload_offset + 1) as u32);
+            }
+            let kind_len = read_u32_at(runtime, offset + 12) as usize;
+            offset += 16 + kind_len;
+        }
+    }
+
+    fn append_asset_payload_trailing_byte(runtime: &mut Vec<u8>) {
+        let (_, payload_section_len) = section_range(runtime, SECTION_ASSET_PAYLOADS);
+        runtime.push(0);
+        let payload_record = section_record_offset(runtime, SECTION_ASSET_PAYLOADS);
+        put_u32_at(
+            runtime,
+            payload_record + 8,
+            (payload_section_len + 1) as u32,
+        );
+    }
+
+    fn expect_parse_error_contains(runtime: &[u8], needle: &str) {
+        let err = FlmRuntimeDirectory::parse(runtime).expect_err("runtime should be rejected");
+        let text = err.to_string();
+        assert!(
+            text.contains(needle),
+            "expected error to contain {needle:?}, got {text:?}"
+        );
+    }
+
     #[test]
     fn parses_runtime_directory_with_qwen_config_and_assets() {
         let runtime = build_test_runtime_directory();
@@ -692,5 +852,89 @@ mod tests {
         assert_eq!(parsed.qwen36_config().unwrap().full_attention_layers[0], 3);
         assert_eq!(parsed.tokenizer().unwrap().vocab_asset_id, 1);
         assert_eq!(parsed.asset(4).unwrap().kind, "tokenizer_regex");
+        assert_eq!(parsed.tensor_abi().weight_prefix, "model.language_model");
+        assert_eq!(parsed.tensor_abi().int4_packed_suffix, ".weight_packed");
+        assert_eq!(parsed.tensor_abi().int4_scale_suffix, ".weight_scale");
+        assert_eq!(parsed.tensor_abi().int4_shape_suffix, ".weight_shape");
+        assert_eq!(
+            parsed.codec_by_id(0).unwrap().semantic_id as u16,
+            CODEC_RAW_BF16
+        );
+        assert_eq!(
+            parsed.codec_by_id(1).unwrap().semantic_id as u16,
+            CODEC_SYM_INT4_G128_BF16
+        );
+        assert_eq!(
+            parsed.codec_by_semantic_id(CODEC_RAW_I64).unwrap().codec_id,
+            2
+        );
+    }
+
+    #[test]
+    fn rejects_bad_magic_and_version() {
+        let mut runtime = build_test_runtime_directory();
+        runtime[0] = b'X';
+        expect_parse_error_contains(&runtime, "bad FLM runtime magic");
+
+        let mut runtime = build_test_runtime_directory();
+        put_u16_at(&mut runtime, 8, 2);
+        expect_parse_error_contains(&runtime, "unsupported FLM runtime version");
+    }
+
+    #[test]
+    fn rejects_duplicate_section_ids() {
+        let mut runtime = build_test_runtime_directory();
+        let record = section_record_offset(&runtime, SECTION_ASSET_PAYLOADS);
+        put_u32_at(&mut runtime, record, SECTION_ASSET_TABLE);
+        expect_parse_error_contains(&runtime, "duplicate section");
+    }
+
+    #[test]
+    fn rejects_runtime_section_gap_and_trailing_bytes() {
+        let mut runtime = build_test_runtime_directory();
+        insert_gap_before_section(&mut runtime, SECTION_TOKENIZER);
+        expect_parse_error_contains(&runtime, "not contiguous");
+
+        let mut runtime = build_test_runtime_directory();
+        runtime.push(0);
+        expect_parse_error_contains(&runtime, "trailing bytes");
+    }
+
+    #[test]
+    fn rejects_duplicate_asset_ids_and_invalid_asset_utf8() {
+        let mut runtime = build_test_runtime_directory();
+        let (asset2_field, _, _) = asset_payload_record(&runtime, 2);
+        put_u32_at(&mut runtime, asset2_field - 4, 1);
+        expect_parse_error_contains(&runtime, "duplicate asset");
+
+        let mut runtime = build_test_runtime_directory();
+        let (table_offset, _) = section_range(&runtime, SECTION_ASSET_TABLE);
+        runtime[table_offset + 4 + 16] = 0xff;
+        expect_parse_error_contains(&runtime, "not UTF-8");
+    }
+
+    #[test]
+    fn rejects_asset_payload_gap_overlap_and_trailing_bytes() {
+        let mut runtime = build_test_runtime_directory();
+        insert_asset_payload_gap_before_asset(&mut runtime, 2);
+        expect_parse_error_contains(&runtime, "payload gap");
+
+        let mut runtime = build_test_runtime_directory();
+        let (_, asset1_offset, _) = asset_payload_record(&runtime, 1);
+        let (asset2_offset_field, _, _) = asset_payload_record(&runtime, 2);
+        put_u32_at(&mut runtime, asset2_offset_field, asset1_offset as u32);
+        expect_parse_error_contains(&runtime, "payload overlap");
+
+        let mut runtime = build_test_runtime_directory();
+        append_asset_payload_trailing_byte(&mut runtime);
+        expect_parse_error_contains(&runtime, "trailing payload");
+    }
+
+    #[test]
+    fn rejects_malformed_tensor_abi() {
+        let mut runtime = build_test_runtime_directory();
+        let (abi_offset, _) = section_range(&runtime, SECTION_TENSOR_ABI);
+        put_u32_at(&mut runtime, abi_offset + 4, 999_999);
+        expect_parse_error_contains(&runtime, "FLM tensor ABI weight_prefix");
     }
 }

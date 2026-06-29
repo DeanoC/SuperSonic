@@ -791,6 +791,141 @@ mod tests {
         buf.extend_from_slice(&value.to_le_bytes());
     }
 
+    fn push_u16(buf: &mut Vec<u8>, value: u16) {
+        buf.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn push_u32(buf: &mut Vec<u8>, value: u32) {
+        buf.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn push_f64(buf: &mut Vec<u8>, value: f64) {
+        buf.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn push_string(buf: &mut Vec<u8>, value: &str) {
+        push_u32(buf, value.len() as u32);
+        buf.extend_from_slice(value.as_bytes());
+    }
+
+    fn build_test_runtime_directory() -> Vec<u8> {
+        fn config_section() -> Vec<u8> {
+            let mut out = Vec::new();
+            for value in [
+                151_936u32, 5120, 27_648, 62, 40, 8, 128, 262_144, 128, 256, 256, 16, 32,
+            ] {
+                push_u32(&mut out, value);
+            }
+            push_f64(&mut out, 1e-6);
+            push_f64(&mut out, 10_000_000.0);
+            out.push(1);
+            out.push(0);
+            push_u32(&mut out, 1);
+            push_f64(&mut out, 0.25);
+            push_u32(&mut out, 151_645);
+            push_u32(&mut out, 1);
+            push_u32(&mut out, 3);
+            out
+        }
+
+        fn tokenizer_section() -> Vec<u8> {
+            let mut out = Vec::new();
+            for value in [
+                1u32,
+                crate::flm::TOKENIZER_QWEN_BPE_V1,
+                151_936,
+                1,
+                2,
+                3,
+                4,
+                0,
+            ] {
+                push_u32(&mut out, value);
+            }
+            out
+        }
+
+        fn codec_section() -> Vec<u8> {
+            let mut out = Vec::new();
+            push_u32(&mut out, 3);
+            for (codec_id, semantic_id, layout_id, decoder_id, flags) in [
+                (0u8, crate::flm::CODEC_RAW_BF16 as u8, 1u16, 1u16, 0u32),
+                (
+                    1u8,
+                    crate::flm::CODEC_SYM_INT4_G128_BF16 as u8,
+                    2u16,
+                    2u16,
+                    0u32,
+                ),
+                (2u8, crate::flm::CODEC_RAW_I64 as u8, 1u16, 1u16, 0u32),
+            ] {
+                out.push(codec_id);
+                out.push(semantic_id);
+                push_u16(&mut out, layout_id);
+                push_u16(&mut out, decoder_id);
+                push_u32(&mut out, flags);
+            }
+            out
+        }
+
+        fn tensor_abi_section() -> Vec<u8> {
+            let mut out = Vec::new();
+            push_u32(&mut out, crate::flm::TENSOR_ABI_QWEN3_6_DENSE_CT_INT4_V1);
+            push_string(&mut out, "model.language_model");
+            push_string(&mut out, ".weight_packed");
+            push_string(&mut out, ".weight_scale");
+            push_string(&mut out, ".weight_shape");
+            out
+        }
+
+        fn asset_sections() -> (Vec<u8>, Vec<u8>) {
+            let assets = [
+                (1u32, "tokenizer_vocab", b"vocab".as_slice()),
+                (2u32, "tokenizer_merges", b"merges".as_slice()),
+                (3u32, "tokenizer_added_tokens", b"[]".as_slice()),
+                (4u32, "tokenizer_regex", br#"\p{L}+"#.as_slice()),
+            ];
+            let mut table = Vec::new();
+            let mut payloads = Vec::new();
+            push_u32(&mut table, assets.len() as u32);
+            for (asset_id, kind, payload) in assets {
+                push_u32(&mut table, asset_id);
+                push_u32(&mut table, payloads.len() as u32);
+                push_u32(&mut table, payload.len() as u32);
+                push_u32(&mut table, kind.len() as u32);
+                table.extend_from_slice(kind.as_bytes());
+                payloads.extend_from_slice(payload);
+            }
+            (table, payloads)
+        }
+
+        let (asset_table, asset_payloads) = asset_sections();
+        let sections = [
+            (1u32, config_section()),
+            (2u32, tokenizer_section()),
+            (3u32, codec_section()),
+            (4u32, tensor_abi_section()),
+            (5u32, asset_table),
+            (6u32, asset_payloads),
+        ];
+        let header_len = 12 + sections.len() * 12;
+        let mut offset = header_len as u32;
+        let mut out = Vec::new();
+        out.extend_from_slice(b"FLMRUN1\0");
+        push_u16(&mut out, 1);
+        push_u16(&mut out, sections.len() as u16);
+        for (section_id, data) in &sections {
+            push_u32(&mut out, *section_id);
+            push_u32(&mut out, offset);
+            push_u32(&mut out, data.len() as u32);
+            offset += data.len() as u32;
+        }
+        for (_, data) in sections {
+            out.extend_from_slice(&data);
+        }
+        out
+    }
+
     fn write_temp_flm(data: &[u8]) -> tempfile::NamedTempFile {
         let mut file = tempfile::NamedTempFile::new().expect("temp FLM file");
         file.write_all(data).expect("write FLM fixture");
@@ -838,6 +973,69 @@ mod tests {
         let norm = store.meta("model.norm.weight").unwrap();
         assert_eq!(norm.dtype, "bf16");
         assert_eq!(norm.shape, vec![2]);
+    }
+
+    #[test]
+    fn open_flm_parses_runtime_directory_when_offsets_present() {
+        let mut data = build_test_flm(&[TestFlmTensor {
+            name: "model.embed_tokens.weight",
+            shape: vec![2, 4],
+            dtype: 4,
+            payload: (0u8..8).collect(),
+        }]);
+        let runtime = build_test_runtime_directory();
+        let runtime_offset = data.len();
+        data.extend_from_slice(&runtime);
+        put_u64(&mut data, 168, runtime_offset as u64);
+        put_u64(&mut data, 176, runtime.len() as u64);
+        let file = write_temp_flm(&data);
+
+        let store = BakedStore::open_flm(file.path()).expect("open FLM with runtime");
+        let runtime = store.flm_runtime().expect("parsed runtime");
+
+        assert_eq!(runtime.qwen36_config().unwrap().hidden_size, 5120);
+        assert_eq!(runtime.tensor_abi().weight_prefix, "model.language_model");
+        assert_eq!(
+            runtime.asset_by_kind("tokenizer_regex").unwrap().asset_id,
+            4
+        );
+    }
+
+    #[test]
+    fn open_flm_rejects_half_zero_runtime_directory_fields() {
+        let mut offset_only = build_test_flm(&[TestFlmTensor {
+            name: "model.embed_tokens.weight",
+            shape: vec![2, 4],
+            dtype: 4,
+            payload: (0u8..8).collect(),
+        }]);
+        put_u64(&mut offset_only, 168, 4096);
+        let file = write_temp_flm(&offset_only);
+        let err = match BakedStore::open_flm(file.path()) {
+            Ok(_) => panic!("zero runtime len should fail"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("length is zero"),
+            "unexpected error: {err}"
+        );
+
+        let mut len_only = build_test_flm(&[TestFlmTensor {
+            name: "model.embed_tokens.weight",
+            shape: vec![2, 4],
+            dtype: 4,
+            payload: (0u8..8).collect(),
+        }]);
+        put_u64(&mut len_only, 176, 16);
+        let file = write_temp_flm(&len_only);
+        let err = match BakedStore::open_flm(file.path()) {
+            Ok(_) => panic!("zero runtime offset should fail"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("offset is zero"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
