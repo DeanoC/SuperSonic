@@ -174,8 +174,17 @@ pub(crate) fn should_fetch_exact_bake(download_bake: bool, local_version_ok: boo
     download_bake || !local_version_ok
 }
 
-pub(crate) fn flm_source_is_authoritative(cli: &Cli) -> bool {
-    cli.flm_file.is_some() || is_flm_model_path(&cli.model_dir)
+pub(crate) fn effective_flm_source(cli: &Cli) -> Option<&Path> {
+    cli.flm_file
+        .as_deref()
+        .or_else(|| is_flm_model_path(&cli.model_dir).then_some(cli.model_dir.as_path()))
+}
+
+pub(crate) fn flm_source_is_authoritative_for_model(
+    cli: &Cli,
+    model_variant: &ModelVariant,
+) -> bool {
+    matches!(model_variant, ModelVariant::Qwen3_6_27B) && effective_flm_source(cli).is_some()
 }
 
 pub(crate) fn load_qwen35_weights(
@@ -199,7 +208,7 @@ pub(crate) fn load_qwen35_weights(
     }
 
     let profile = effective_quant_profile(cli)?;
-    if let Some(flm_file) = cli.flm_file.as_deref() {
+    if let Some(flm_file) = effective_flm_source(cli) {
         let options = model_store::FlmLoadOptions {
             compressed_tensors_int4_aliases: profile.is_native_int4_runtime(),
         };
@@ -412,7 +421,7 @@ pub(crate) fn run_q4km_baker(cli: &Cli, bake_dir: &Path) -> Result<()> {
 /// tarball bundles HF metadata under `hf/`, which the downloader extracts
 /// into `--model-dir` before anything else reads from it.
 pub(crate) fn ensure_hf_metadata_present(cli: &Cli, model_variant: &ModelVariant) -> Result<bool> {
-    if flm_source_is_authoritative(cli) {
+    if flm_source_is_authoritative_for_model(cli, model_variant) {
         return Ok(false);
     }
     if cli.no_bake || cli.no_download {
@@ -441,13 +450,16 @@ pub(crate) fn ensure_hf_metadata_present(cli: &Cli, model_variant: &ModelVariant
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use clap::Parser;
     use model_store::manifest::QuantProfile;
 
     use super::{
-        effective_quant_profile, flm_source_is_authoritative, should_fetch_bake,
-        should_fetch_exact_bake,
+        effective_flm_source, effective_quant_profile, flm_source_is_authoritative_for_model,
+        should_fetch_bake, should_fetch_exact_bake,
     };
+    use crate::registry::ModelVariant;
     use crate::Cli;
 
     fn cli(extra: &[&str]) -> Cli {
@@ -484,18 +496,54 @@ mod tests {
 
     #[test]
     fn flm_file_is_authoritative_for_hf_metadata_bootstrap() {
-        assert!(flm_source_is_authoritative(&cli(&[
-            "--flm-file",
-            "/tmp/model.flm"
-        ])));
+        assert!(flm_source_is_authoritative_for_model(
+            &cli(&["--flm-file", "/tmp/model.flm"]),
+            &ModelVariant::Qwen3_6_27B
+        ));
     }
 
     #[test]
     fn flm_model_dir_is_authoritative_for_hf_metadata_bootstrap() {
-        assert!(flm_source_is_authoritative(&cli_with_model_dir(
-            "/tmp/model.flm",
-            &[]
-        )));
+        assert!(flm_source_is_authoritative_for_model(
+            &cli_with_model_dir("/tmp/model.flm", &[]),
+            &ModelVariant::Qwen3_6_27B
+        ));
+    }
+
+    #[test]
+    fn flm_file_is_not_authoritative_for_gemma_hf_metadata_bootstrap() {
+        assert!(!flm_source_is_authoritative_for_model(
+            &cli(&["--flm-file", "/tmp/model.flm"]),
+            &ModelVariant::Gemma4_E2B
+        ));
+    }
+
+    #[test]
+    fn flm_model_dir_is_not_authoritative_for_gemma_hf_metadata_bootstrap() {
+        assert!(!flm_source_is_authoritative_for_model(
+            &cli_with_model_dir("/tmp/model.flm", &[]),
+            &ModelVariant::Gemma4_E2B
+        ));
+    }
+
+    #[test]
+    fn effective_flm_source_prefers_explicit_flm_file() {
+        let cli = cli_with_model_dir("/tmp/model-dir.flm", &["--flm-file", "/tmp/explicit.flm"]);
+
+        assert_eq!(
+            effective_flm_source(&cli),
+            Some(Path::new("/tmp/explicit.flm"))
+        );
+    }
+
+    #[test]
+    fn effective_flm_source_uses_flm_model_dir_without_explicit_flm_file() {
+        let cli = cli_with_model_dir("/tmp/model-dir.flm", &[]);
+
+        assert_eq!(
+            effective_flm_source(&cli),
+            Some(Path::new("/tmp/model-dir.flm"))
+        );
     }
 
     #[test]
