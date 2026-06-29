@@ -665,7 +665,7 @@ mod tests {
 
     fn build_tokenizer_section() -> Vec<u8> {
         let mut out = Vec::new();
-        for value in [1u32, TOKENIZER_QWEN_BPE_V1, 151_936, 1, 2, 3, 4, 0] {
+        for value in [0u32, TOKENIZER_QWEN_BPE_V1, 151_936, 1, 2, 3, 4, 0] {
             write_u32(&mut out, value);
         }
         out
@@ -675,9 +675,9 @@ mod tests {
         let mut out = Vec::new();
         write_u32(&mut out, 3);
         for (codec_id, semantic_id, layout_id, decoder_id, flags) in [
-            (0u8, CODEC_RAW_BF16 as u8, 1u16, 1u16, 0u32),
-            (1u8, CODEC_SYM_INT4_G128_BF16 as u8, 2u16, 2u16, 0u32),
-            (2u8, CODEC_RAW_I64 as u8, 1u16, 1u16, 0u32),
+            (0u8, CODEC_RAW_BF16 as u8, 0u16, 0u16, 0u32),
+            (1u8, CODEC_SYM_INT4_G128_BF16 as u8, 0u16, 1u16, 0u32),
+            (2u8, CODEC_RAW_I64 as u8, 0u16, 0u16, 0u32),
         ] {
             out.push(codec_id);
             out.push(semantic_id);
@@ -779,6 +779,12 @@ mod tests {
         }
     }
 
+    fn overlap_section_with_previous(runtime: &mut [u8], section_id: u32) {
+        let record = section_record_offset(runtime, section_id);
+        let offset = read_u32_at(runtime, record + 4);
+        put_u32_at(runtime, record + 4, offset - 1);
+    }
+
     fn asset_payload_record(runtime: &[u8], asset_id: u32) -> (usize, usize, usize) {
         let (table_offset, _) = section_range(runtime, SECTION_ASSET_TABLE);
         let count = read_u32_at(runtime, table_offset) as usize;
@@ -850,6 +856,7 @@ mod tests {
         assert_eq!(parsed.architecture_id, ARCH_QWEN3_6_DENSE);
         assert_eq!(parsed.qwen36_config().unwrap().hidden_size, 5120);
         assert_eq!(parsed.qwen36_config().unwrap().full_attention_layers[0], 3);
+        assert_eq!(parsed.tokenizer().unwrap().tokenizer_id, 0);
         assert_eq!(parsed.tokenizer().unwrap().vocab_asset_id, 1);
         assert_eq!(parsed.asset(4).unwrap().kind, "tokenizer_regex");
         assert_eq!(parsed.tensor_abi().weight_prefix, "model.language_model");
@@ -860,10 +867,16 @@ mod tests {
             parsed.codec_by_id(0).unwrap().semantic_id as u16,
             CODEC_RAW_BF16
         );
+        assert_eq!(parsed.codec_by_id(0).unwrap().layout_id, 0);
+        assert_eq!(parsed.codec_by_id(0).unwrap().decoder_id, 0);
         assert_eq!(
             parsed.codec_by_id(1).unwrap().semantic_id as u16,
             CODEC_SYM_INT4_G128_BF16
         );
+        assert_eq!(parsed.codec_by_id(1).unwrap().layout_id, 0);
+        assert_eq!(parsed.codec_by_id(1).unwrap().decoder_id, 1);
+        assert_eq!(parsed.codec_by_id(2).unwrap().layout_id, 0);
+        assert_eq!(parsed.codec_by_id(2).unwrap().decoder_id, 0);
         assert_eq!(
             parsed.codec_by_semantic_id(CODEC_RAW_I64).unwrap().codec_id,
             2
@@ -894,6 +907,10 @@ mod tests {
         let mut runtime = build_test_runtime_directory();
         insert_gap_before_section(&mut runtime, SECTION_TOKENIZER);
         expect_parse_error_contains(&runtime, "not contiguous");
+
+        let mut runtime = build_test_runtime_directory();
+        overlap_section_with_previous(&mut runtime, SECTION_TOKENIZER);
+        expect_parse_error_contains(&runtime, "overlap");
 
         let mut runtime = build_test_runtime_directory();
         runtime.push(0);

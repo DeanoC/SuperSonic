@@ -831,7 +831,7 @@ mod tests {
         fn tokenizer_section() -> Vec<u8> {
             let mut out = Vec::new();
             for value in [
-                1u32,
+                0u32,
                 crate::flm::TOKENIZER_QWEN_BPE_V1,
                 151_936,
                 1,
@@ -849,15 +849,15 @@ mod tests {
             let mut out = Vec::new();
             push_u32(&mut out, 3);
             for (codec_id, semantic_id, layout_id, decoder_id, flags) in [
-                (0u8, crate::flm::CODEC_RAW_BF16 as u8, 1u16, 1u16, 0u32),
+                (0u8, crate::flm::CODEC_RAW_BF16 as u8, 0u16, 0u16, 0u32),
                 (
                     1u8,
                     crate::flm::CODEC_SYM_INT4_G128_BF16 as u8,
-                    2u16,
-                    2u16,
+                    0u16,
+                    1u16,
                     0u32,
                 ),
-                (2u8, crate::flm::CODEC_RAW_I64 as u8, 1u16, 1u16, 0u32),
+                (2u8, crate::flm::CODEC_RAW_I64 as u8, 0u16, 0u16, 0u32),
             ] {
                 out.push(codec_id);
                 out.push(semantic_id);
@@ -994,6 +994,13 @@ mod tests {
         let runtime = store.flm_runtime().expect("parsed runtime");
 
         assert_eq!(runtime.qwen36_config().unwrap().hidden_size, 5120);
+        assert_eq!(runtime.tokenizer().unwrap().tokenizer_id, 0);
+        assert_eq!(runtime.codec_by_id(0).unwrap().layout_id, 0);
+        assert_eq!(runtime.codec_by_id(0).unwrap().decoder_id, 0);
+        assert_eq!(runtime.codec_by_id(1).unwrap().layout_id, 0);
+        assert_eq!(runtime.codec_by_id(1).unwrap().decoder_id, 1);
+        assert_eq!(runtime.codec_by_id(2).unwrap().layout_id, 0);
+        assert_eq!(runtime.codec_by_id(2).unwrap().decoder_id, 0);
         assert_eq!(runtime.tensor_abi().weight_prefix, "model.language_model");
         assert_eq!(
             runtime.asset_by_kind("tokenizer_regex").unwrap().asset_id,
