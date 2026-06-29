@@ -22,6 +22,7 @@ pub(crate) fn validate_global_flags(
     if cli.q4km && cli.q4km_gptq {
         anyhow::bail!("--q4km is mutually exclusive with --q4km-gptq");
     }
+    crate::bakes::validate_effective_flm_source_model(cli, model_variant)?;
     if q4km_like && cli.int8 {
         anyhow::bail!("--q4km/--q4km-gptq are mutually exclusive with --int8");
     }
@@ -154,6 +155,40 @@ mod tests {
         let mut args = vec!["supersonic", "--model-dir", "/tmp/model", "--dry-run"];
         args.extend_from_slice(extra);
         Cli::parse_from(args)
+    }
+
+    fn cli_with_model_dir(model_dir: &str, extra: &[&str]) -> Cli {
+        let mut args = vec!["supersonic", "--model-dir", model_dir, "--dry-run"];
+        args.extend_from_slice(extra);
+        Cli::parse_from(args)
+    }
+
+    #[test]
+    fn rejects_flm_file_for_non_qwen36_dense_model() {
+        let err = validate_global_flags(
+            &cli(&["--flm-file", "/tmp/model.flm"]),
+            &ModelVariant::Gemma4_E2B,
+            Backend::Hip,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("FLM"), "{err}");
+        assert!(err.contains("qwen3.6-27b"), "{err}");
+    }
+
+    #[test]
+    fn rejects_flm_model_dir_for_non_qwen36_dense_model() {
+        let err = validate_global_flags(
+            &cli_with_model_dir("/tmp/model.flm", &[]),
+            &ModelVariant::Phi4_Mini,
+            Backend::Hip,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("FLM"), "{err}");
+        assert!(err.contains("qwen3.6-27b"), "{err}");
     }
 
     #[test]

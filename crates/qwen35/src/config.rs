@@ -213,21 +213,6 @@ impl Config {
                 flm.partial_rotary_factor
             ));
         }
-        let attention_hidden = flm
-            .num_attention_heads
-            .checked_mul(flm.head_dim)
-            .ok_or_else(|| {
-                format!(
-                    "num_attention_heads {} * head_dim {} overflows",
-                    flm.num_attention_heads, flm.head_dim
-                )
-            })?;
-        if flm.hidden_size != attention_hidden {
-            return Err(format!(
-                "hidden_size {} must equal num_attention_heads {} * head_dim {}",
-                flm.hidden_size, flm.num_attention_heads, flm.head_dim
-            ));
-        }
         if flm.num_key_value_heads > flm.num_attention_heads {
             return Err(format!(
                 "num_key_value_heads {} must be <= num_attention_heads {}",
@@ -351,7 +336,7 @@ mod tests {
             hidden_size: 5120,
             intermediate_size: 17408,
             num_hidden_layers: 64,
-            num_attention_heads: 20,
+            num_attention_heads: 24,
             num_key_value_heads: 4,
             head_dim: 256,
             max_position_embeddings: 262144,
@@ -446,6 +431,22 @@ mod tests {
     }
 
     #[test]
+    fn accepts_real_qwen36_dense_attention_projection_geometry_from_flm_descriptor() {
+        let mut flm = flm_qwen36_dense_descriptor();
+        flm.hidden_size = 5120;
+        flm.num_attention_heads = 24;
+        flm.head_dim = 256;
+
+        let config = Config::try_from_flm_qwen36_dense(&flm)
+            .unwrap()
+            .normalized();
+
+        assert_eq!(config.text_config.hidden_size, 5120);
+        assert_eq!(config.text_config.num_attention_heads, 24);
+        assert_eq!(config.text_config.head_dim, 256);
+    }
+
+    #[test]
     fn rejects_unknown_activation_id_from_flm_qwen36_dense_descriptor() {
         let mut flm = flm_qwen36_dense_descriptor();
         flm.activation_id = 99;
@@ -469,18 +470,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_hidden_size_head_geometry_mismatch_from_flm_qwen36_dense_descriptor() {
-        let mut flm = flm_qwen36_dense_descriptor();
-        flm.head_dim = 128;
-
-        let err = Config::try_from_flm_qwen36_dense(&flm).unwrap_err();
-
-        assert!(err.contains("hidden_size"), "{err}");
-        assert!(err.contains("num_attention_heads"), "{err}");
-        assert!(err.contains("head_dim"), "{err}");
-    }
-
-    #[test]
     fn rejects_more_kv_heads_than_attention_heads_from_flm_qwen36_dense_descriptor() {
         let mut flm = flm_qwen36_dense_descriptor();
         flm.num_key_value_heads = 25;
@@ -494,7 +483,7 @@ mod tests {
     #[test]
     fn rejects_attention_heads_not_divisible_by_kv_heads_from_flm_qwen36_dense_descriptor() {
         let mut flm = flm_qwen36_dense_descriptor();
-        flm.num_key_value_heads = 6;
+        flm.num_key_value_heads = 5;
 
         let err = Config::try_from_flm_qwen36_dense(&flm).unwrap_err();
 

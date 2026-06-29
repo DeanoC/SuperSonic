@@ -203,7 +203,7 @@ pub(crate) fn validate_effective_flm_source_model(
         "--model-dir"
     };
     anyhow::bail!(
-        "{source_flag} {} currently supports only --model qwen3.6-27b; got --model {}",
+        "FLM source from {source_flag} {} currently supports only --model qwen3.6-27b; got --model {}",
         flm_source.display(),
         model_variant
     );
