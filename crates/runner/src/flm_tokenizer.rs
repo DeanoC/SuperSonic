@@ -125,30 +125,36 @@ fn build_qwen_bpe_tokenizer(assets: QwenBpeAssets) -> Result<Tokenizer> {
     tokenizer.with_decoder(Some(ByteLevel::new(false, false, false)));
 
     for token in added_tokens {
-        match tokenizer.token_to_id(&token.content) {
-            Some(actual) if actual == token.id => {}
-            Some(actual) => bail!(
-                "FLM tokenizer added token id {} for {:?} does not match model id {actual}",
-                token.id,
-                token.content
-            ),
-            None => bail!(
-                "FLM tokenizer added token {:?} with id {} is not present in BPE vocab",
-                token.content,
-                token.id
-            ),
-        }
+        let QwenAddedToken {
+            id,
+            content,
+            single_word,
+            lstrip,
+            rstrip,
+            normalized,
+            special,
+        } = token;
 
-        let added = AddedToken::from(token.content, token.special)
-            .single_word(token.single_word)
-            .lstrip(token.lstrip)
-            .rstrip(token.rstrip)
-            .normalized(token.normalized)
-            .special(token.special);
+        let added = AddedToken::from(content.clone(), special)
+            .single_word(single_word)
+            .lstrip(lstrip)
+            .rstrip(rstrip)
+            .normalized(normalized)
+            .special(special);
         if added.special {
             tokenizer.add_special_tokens(&[added]);
         } else {
             tokenizer.add_tokens(&[added]);
+        }
+
+        match tokenizer.token_to_id(&content) {
+            Some(actual) if actual == id => {}
+            Some(actual) => bail!(
+                "FLM tokenizer added token id {id} for {content:?} does not match assigned/model id {actual}"
+            ),
+            None => bail!(
+                "FLM tokenizer added token {content:?} with id {id} was not registered"
+            ),
         }
     }
 
@@ -409,7 +415,7 @@ mod tests {
     fn parses_synthetic_assets_and_builds_qwen_bpe_tokenizer() {
         let assets = QwenBpeAssets::parse(
             TOKENIZER_QWEN_BPE_V1,
-            9,
+            8,
             &vocab_asset(&[
                 (0, "H"),
                 (1, "e"),
@@ -419,7 +425,6 @@ mod tests {
                 (5, "Hel"),
                 (6, "Hell"),
                 (7, "Hello"),
-                (8, "<|endoftext|>"),
             ]),
             &merges_asset(&[("H", "e"), ("He", "l"), ("Hel", "l"), ("Hell", "o")]),
             &added_tokens_asset(&[(8, "<|endoftext|>", [0, 0, 0, 0, 1])]),
