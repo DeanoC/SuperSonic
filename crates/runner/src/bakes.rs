@@ -187,6 +187,28 @@ pub(crate) fn flm_source_is_authoritative_for_model(
     matches!(model_variant, ModelVariant::Qwen3_6_27B) && effective_flm_source(cli).is_some()
 }
 
+pub(crate) fn validate_effective_flm_source_model(
+    cli: &Cli,
+    model_variant: &ModelVariant,
+) -> Result<()> {
+    let Some(flm_source) = effective_flm_source(cli) else {
+        return Ok(());
+    };
+    if *model_variant == ModelVariant::Qwen3_6_27B {
+        return Ok(());
+    }
+    let source_flag = if cli.flm_file.is_some() {
+        "--flm-file"
+    } else {
+        "--model-dir"
+    };
+    anyhow::bail!(
+        "{source_flag} {} currently supports only --model qwen3.6-27b; got --model {}",
+        flm_source.display(),
+        model_variant
+    );
+}
+
 pub(crate) fn load_qwen35_weights(
     cli: &Cli,
     model_variant: &ModelVariant,
@@ -196,6 +218,8 @@ pub(crate) fn load_qwen35_weights(
     bootstrap_downloaded: bool,
     q4km_like: bool,
 ) -> Result<qwen35::weights::Qwen35Weights> {
+    validate_effective_flm_source_model(cli, model_variant)?;
+
     if cli.no_bake {
         eprintln!("[weights] loading from safetensors (--no-bake)...");
         return qwen35::weights::Qwen35Weights::load(
@@ -457,7 +481,7 @@ mod tests {
 
     use super::{
         effective_flm_source, effective_quant_profile, flm_source_is_authoritative_for_model,
-        should_fetch_bake, should_fetch_exact_bake,
+        should_fetch_bake, should_fetch_exact_bake, validate_effective_flm_source_model,
     };
     use crate::registry::ModelVariant;
     use crate::Cli;
@@ -544,6 +568,20 @@ mod tests {
             effective_flm_source(&cli),
             Some(Path::new("/tmp/model-dir.flm"))
         );
+    }
+
+    #[test]
+    fn effective_flm_source_requires_qwen36_27b_model_variant() {
+        let err = validate_effective_flm_source_model(
+            &cli(&["--flm-file", "/tmp/model.flm"]),
+            &ModelVariant::Qwen3_5_0_8B,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("--flm-file"), "{err}");
+        assert!(err.contains("qwen3.6-27b"), "{err}");
+        assert!(err.contains("qwen3.5-0.8b"), "{err}");
     }
 
     #[test]

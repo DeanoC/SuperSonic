@@ -234,6 +234,27 @@ impl Config {
                 flm.num_key_value_heads, flm.num_attention_heads
             ));
         }
+        if flm.num_attention_heads % flm.num_key_value_heads != 0 {
+            return Err(format!(
+                "num_attention_heads {} must be divisible by num_key_value_heads {}",
+                flm.num_attention_heads, flm.num_key_value_heads
+            ));
+        }
+        let rotary_dim = flm.head_dim as f64 * flm.partial_rotary_factor;
+        let rounded_rotary_dim = rotary_dim.round();
+        if (rotary_dim - rounded_rotary_dim).abs() > f64::EPSILON {
+            return Err(format!(
+                "rotary_dim must be an integer, got head_dim {} * partial_rotary_factor {} = {}",
+                flm.head_dim, flm.partial_rotary_factor, rotary_dim
+            ));
+        }
+        let rotary_dim = rounded_rotary_dim as usize;
+        if rotary_dim == 0 || rotary_dim % 2 != 0 {
+            return Err(format!(
+                "rotary_dim must be positive and even, got head_dim {} * partial_rotary_factor {} = {}",
+                flm.head_dim, flm.partial_rotary_factor, rotary_dim
+            ));
+        }
 
         let hidden_act = activation_from_flm_id(flm.activation_id)?;
         let mut layer_types = vec!["linear_attention".to_string(); flm.num_hidden_layers];
@@ -468,5 +489,29 @@ mod tests {
 
         assert!(err.contains("num_key_value_heads"), "{err}");
         assert!(err.contains("num_attention_heads"), "{err}");
+    }
+
+    #[test]
+    fn rejects_attention_heads_not_divisible_by_kv_heads_from_flm_qwen36_dense_descriptor() {
+        let mut flm = flm_qwen36_dense_descriptor();
+        flm.num_key_value_heads = 6;
+
+        let err = Config::try_from_flm_qwen36_dense(&flm).unwrap_err();
+
+        assert!(err.contains("num_attention_heads"), "{err}");
+        assert!(err.contains("num_key_value_heads"), "{err}");
+        assert!(err.contains("divisible"), "{err}");
+    }
+
+    #[test]
+    fn rejects_non_integral_rotary_dim_from_flm_qwen36_dense_descriptor() {
+        let mut flm = flm_qwen36_dense_descriptor();
+        flm.partial_rotary_factor = 0.3;
+
+        let err = Config::try_from_flm_qwen36_dense(&flm).unwrap_err();
+
+        assert!(err.contains("rotary_dim"), "{err}");
+        assert!(err.contains("head_dim"), "{err}");
+        assert!(err.contains("partial_rotary_factor"), "{err}");
     }
 }

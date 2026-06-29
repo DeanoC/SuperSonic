@@ -2,6 +2,7 @@ use std::path::Path;
 
 use anyhow::Result;
 
+use crate::bakes::validate_effective_flm_source_model;
 use crate::flm_model_source::{is_flm_model_path, FlmModelSource};
 use crate::registry::{Backend, GpuArch, ModelVariant, Qwen35KernelParams};
 use crate::Cli;
@@ -95,13 +96,24 @@ mod tests {
 
     use clap::Parser;
 
-    use super::{flm_config_path, tokenizer_json_path};
+    use super::{flm_config_path, tokenizer_json_path, validate_qwen35_startup};
+    use crate::registry::{Backend, GpuArch, ModelVariant, Qwen35KernelParams};
     use crate::Cli;
 
     fn cli(model_dir: &str, extra: &[&str]) -> Cli {
         let mut args = vec!["supersonic", "--model-dir", model_dir, "--dry-run"];
         args.extend_from_slice(extra);
         Cli::parse_from(args)
+    }
+
+    fn qwen35_params() -> Qwen35KernelParams {
+        Qwen35KernelParams {
+            proj_buf_floats: 0,
+            attn_scratch_floats: 0,
+            weight_prefix: "",
+            kv_chunk_size: 1,
+            use_4b_kernel: false,
+        }
     }
 
     #[test]
@@ -128,6 +140,28 @@ mod tests {
         assert!(err.contains("FLM"), "{err}");
         assert!(err.contains("not wired"), "{err}");
     }
+
+    #[test]
+    fn flm_file_requires_qwen36_27b_model_variant() {
+        let cli = cli("/tmp/model-dir", &["--flm-file", "/tmp/model.flm"]);
+        let params = qwen35_params();
+
+        let err = match validate_qwen35_startup(
+            &cli,
+            &ModelVariant::Qwen3_5_0_8B,
+            &params,
+            Backend::Hip,
+            &GpuArch::Gfx1100,
+            false,
+        ) {
+            Ok(_) => panic!("expected FLM model-variant validation error"),
+            Err(err) => err.to_string(),
+        };
+
+        assert!(err.contains("--flm-file"), "{err}");
+        assert!(err.contains("qwen3.6-27b"), "{err}");
+        assert!(err.contains("qwen3.5-0.8b"), "{err}");
+    }
 }
 
 pub(crate) fn validate_qwen35_startup(
@@ -138,6 +172,8 @@ pub(crate) fn validate_qwen35_startup(
     registry_arch: &GpuArch,
     q4km_like: bool,
 ) -> Result<Qwen35Policy> {
+    validate_effective_flm_source_model(cli, model_variant)?;
+
     if cli.trace_prefill_layers && !cli.validate {
         anyhow::bail!("--trace-prefill-layers requires --validate");
     }
