@@ -19,6 +19,10 @@ pub(crate) struct Cli {
     #[arg(long)]
     pub(crate) flm_file: Option<PathBuf>,
 
+    /// Verify BLAKE3 FLM payload hashes before using an FLM source.
+    #[arg(long)]
+    pub(crate) verify_flm_hashes: bool,
+
     /// Text prompt (will be tokenized). Required unless --dry-run is set.
     #[arg(long, required_unless_present = "dry_run", default_value = "")]
     pub(crate) prompt: String,
@@ -564,5 +568,6 @@ mod tests {
 
         assert!(help.contains("self-contained FLM container"), "{help}");
         assert!(help.contains("Prefer --model-dir model.flm"), "{help}");
+        assert!(help.contains("--verify-flm-hashes"), "{help}");
     }
 }

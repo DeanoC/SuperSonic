@@ -16,6 +16,7 @@ impl FlmModelSource {
             path,
             model_store::FlmLoadOptions {
                 compressed_tensors_int4_aliases: int4_runtime,
+                ..Default::default()
             },
         )?;
         Ok(Self {

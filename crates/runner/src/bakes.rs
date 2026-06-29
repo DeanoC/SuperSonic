@@ -252,12 +252,18 @@ pub(crate) fn load_qwen35_weights(
     if let Some(flm_file) = effective_flm_source(cli) {
         let options = model_store::FlmLoadOptions {
             compressed_tensors_int4_aliases: profile.is_native_int4_runtime(),
+            verify_block_hashes: cli.verify_flm_hashes,
         };
         eprintln!(
-            "[weights] loading FLM container at {}{}",
+            "[weights] loading FLM container at {}{}{}",
             flm_file.display(),
             if options.compressed_tensors_int4_aliases {
                 " (compressed-tensors INT4 aliases enabled)"
+            } else {
+                ""
+            },
+            if options.verify_block_hashes {
+                " (BLAKE3 hash verification enabled)"
             } else {
                 ""
             }

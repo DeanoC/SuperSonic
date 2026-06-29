@@ -14,6 +14,7 @@ const FLM_MAGIC: &[u8; 8] = b"FLM1\0\0\0\0";
 const FLM_SUPERBLOCK_SIZE: usize = 4096;
 const FLM_INDEX_RECORD_SIZE: usize = 64;
 const FLM_SHARD_DESC_SIZE: usize = 24;
+const FLM_HASH_RECORD_SIZE: usize = 40;
 const FLM_DTYPE_FP32: u16 = 0;
 const FLM_DTYPE_FP16: u16 = 1;
 const FLM_DTYPE_BF16: u16 = 2;
@@ -24,6 +25,12 @@ const FLM_DTYPE_INT64: u16 = 6;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FlmLoadOptions {
+    /// Verify BLAKE3 payload hashes for FLM tensors that reference the block
+    /// hash table. This reads and hashes the referenced payload bytes during
+    /// open, so callers should opt in when integrity matters more than startup
+    /// latency.
+    pub verify_block_hashes: bool,
+
     /// Expose compressed-tensors INT4 triples as SuperSonic's native INT4
     /// packed-weight contract:
     ///
@@ -44,6 +51,8 @@ struct FlmSuperblock {
     index_len: usize,
     metadata_offset: usize,
     metadata_len: usize,
+    hashtable_offset: usize,
+    hashtable_len: usize,
     shard_table_offset: usize,
     shard_count: usize,
     runtime_dir_offset: usize,
@@ -142,6 +151,11 @@ fn flm_parse_superblock(buf: &[u8]) -> Result<FlmSuperblock, Error> {
         "FLM metadata_offset",
     )?;
     let metadata_len = u64_to_usize(read_u64(sb, 48, "FLM metadata_len")?, "FLM metadata_len")?;
+    let hashtable_offset = u64_to_usize(
+        read_u64(sb, 72, "FLM hashtable_offset")?,
+        "FLM hashtable_offset",
+    )?;
+    let hashtable_len = u64_to_usize(read_u64(sb, 80, "FLM hashtable_len")?, "FLM hashtable_len")?;
     let shard_table_offset = u64_to_usize(
         read_u64(sb, 88, "FLM shard_table_offset")?,
         "FLM shard_table_offset",
@@ -171,6 +185,8 @@ fn flm_parse_superblock(buf: &[u8]) -> Result<FlmSuperblock, Error> {
         index_len,
         metadata_offset,
         metadata_len,
+        hashtable_offset,
+        hashtable_len,
         shard_table_offset,
         shard_count,
         runtime_dir_offset,
@@ -323,6 +339,111 @@ fn flm_build_index(
     Ok(index)
 }
 
+fn flm_verify_block_hashes(
+    buf: &[u8],
+    sb: &FlmSuperblock,
+    strings: &[String],
+    shards: &HashMap<u32, FlmShard>,
+) -> Result<(), Error> {
+    if sb.hashtable_offset == 0 && sb.hashtable_len != 0 {
+        return Err(Error::Other(format!(
+            "FLM block hash table length is {} but offset is zero",
+            sb.hashtable_len
+        )));
+    }
+    if sb.hashtable_offset != 0 && sb.hashtable_len == 0 {
+        return Err(Error::Other(format!(
+            "FLM block hash table offset is {} but length is zero",
+            sb.hashtable_offset
+        )));
+    }
+    if sb.hashtable_len % FLM_HASH_RECORD_SIZE != 0 {
+        return Err(Error::Other(format!(
+            "FLM block hash table length {} is not a multiple of {FLM_HASH_RECORD_SIZE}",
+            sb.hashtable_len
+        )));
+    }
+
+    let hash_records = sb.hashtable_len / FLM_HASH_RECORD_SIZE;
+    let hashtable = if sb.hashtable_len == 0 {
+        &[][..]
+    } else {
+        read_exact_range(
+            buf,
+            sb.hashtable_offset,
+            sb.hashtable_len,
+            "FLM block hash table",
+        )?
+    };
+    let index_blob = read_exact_range(buf, sb.index_offset, sb.index_len, "FLM tensor index")?;
+
+    for idx in 0..sb.tensor_count {
+        let off = idx * FLM_INDEX_RECORD_SIZE;
+        let rec = read_exact_range(index_blob, off, FLM_INDEX_RECORD_SIZE, "FLM tensor record")?;
+        let block_hash_idx = read_u32(rec, 58, "FLM tensor block_hash_idx")? as usize;
+        if block_hash_idx == 0 {
+            continue;
+        }
+        if block_hash_idx > hash_records {
+            return Err(Error::Other(format!(
+                "FLM tensor {idx} references block_hash_idx {block_hash_idx}, but hash table has {hash_records} records"
+            )));
+        }
+
+        let name_id = read_u32(rec, 0, "FLM tensor name_id")? as usize;
+        let name = strings.get(name_id).ok_or_else(|| {
+            Error::Other(format!(
+                "FLM tensor {idx} references missing string table id {name_id}"
+            ))
+        })?;
+        let shard_id = read_u32(rec, 8, "FLM tensor shard_id")?;
+        let shard_offset = read_u64(rec, 12, "FLM tensor shard_offset")?;
+        let stored_len = read_u64(rec, 20, "FLM tensor stored_len")?;
+        let hash_off = (block_hash_idx - 1) * FLM_HASH_RECORD_SIZE;
+        let expected_digest = read_exact_range(hashtable, hash_off, 32, "FLM block hash digest")?;
+        let expected_len = read_u64(hashtable, hash_off + 32, "FLM block hash stored_len")?;
+        if expected_len != stored_len {
+            return Err(Error::Other(format!(
+                "FLM tensor {name} block_hash_idx {block_hash_idx} stored_len mismatch: index has {stored_len}, hash table has {expected_len}"
+            )));
+        }
+
+        let shard = shards.get(&shard_id).ok_or_else(|| {
+            Error::Other(format!(
+                "FLM tensor {name} references missing shard {shard_id}"
+            ))
+        })?;
+        let shard_end = shard_offset.checked_add(stored_len).ok_or_else(|| {
+            Error::Other(format!(
+                "FLM tensor {name} shard range overflows (offset={shard_offset}, len={stored_len})"
+            ))
+        })?;
+        if shard_end > shard.length {
+            return Err(Error::Other(format!(
+                "FLM tensor {name} extends past shard {shard_id} (offset={shard_offset}, len={stored_len}, shard_len={})",
+                shard.length
+            )));
+        }
+        let file_offset = shard.offset.checked_add(shard_offset).ok_or_else(|| {
+            Error::Other(format!(
+                "FLM tensor {name} file offset overflows (shard_offset={}, tensor_offset={shard_offset})",
+                shard.offset
+            ))
+        })?;
+        let payload_offset = u64_to_usize(file_offset, "FLM tensor payload offset")?;
+        let payload_len = u64_to_usize(stored_len, "FLM tensor stored_len")?;
+        let payload = read_exact_range(buf, payload_offset, payload_len, "FLM tensor payload")?;
+        let actual = blake3::hash(payload);
+        if actual.as_bytes().as_slice() != expected_digest {
+            return Err(Error::Other(format!(
+                "FLM tensor {name} block_hash_idx {block_hash_idx} hash mismatch"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 fn bf16_eight_bytes(len: usize) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(len);
     for _ in 0..(len / 2) {
@@ -438,6 +559,9 @@ impl BakedStore {
         let strings = flm_read_string_table(&mmap, &sb)?;
         let shards = flm_read_shards(&mmap, &sb)?;
         let mut index = flm_build_index(&mmap, &sb, &strings, &shards)?;
+        if options.verify_block_hashes {
+            flm_verify_block_hashes(&mmap, &sb, &strings, &shards)?;
+        }
         let mut synthetic = HashMap::new();
         if options.compressed_tensors_int4_aliases {
             add_compressed_tensors_int4_aliases(&mut index, &mut synthetic);
@@ -693,6 +817,7 @@ mod tests {
     const TEST_FLM_SUPERBLOCK_SIZE: usize = 4096;
     const TEST_FLM_INDEX_RECORD_SIZE: usize = 64;
     const TEST_FLM_SHARD_DESC_SIZE: usize = 24;
+    const TEST_FLM_HASH_RECORD_SIZE: usize = 40;
 
     struct TestFlmTensor {
         name: &'static str,
@@ -721,6 +846,15 @@ mod tests {
     }
 
     fn build_test_flm(tensors: &[TestFlmTensor]) -> Vec<u8> {
+        build_test_flm_inner(tensors, None)
+    }
+
+    fn build_test_flm_with_hashes(tensors: &[TestFlmTensor], hashes: &[[u8; 32]]) -> Vec<u8> {
+        assert_eq!(tensors.len(), hashes.len());
+        build_test_flm_inner(tensors, Some(hashes))
+    }
+
+    fn build_test_flm_inner(tensors: &[TestFlmTensor], hashes: Option<&[[u8; 32]]>) -> Vec<u8> {
         let alignment = 256usize;
         let mut out = vec![0u8; TEST_FLM_SUPERBLOCK_SIZE];
 
@@ -747,6 +881,9 @@ mod tests {
             for (dim_idx, dim) in tensor.shape.iter().enumerate() {
                 put_u32(&mut rec, 42 + dim_idx * 4, *dim);
             }
+            if hashes.is_some() {
+                put_u32(&mut rec, 58, (idx + 1) as u32);
+            }
             records.extend_from_slice(&rec);
         }
         out.extend_from_slice(&records);
@@ -760,6 +897,17 @@ mod tests {
         }
         put_u32_at_vec(&mut out, 0);
         let metadata_len = out.len() - metadata_offset;
+
+        let mut hashtable_offset = 0usize;
+        let mut hashtable_len = 0usize;
+        if let Some(hashes) = hashes {
+            hashtable_offset = out.len();
+            hashtable_len = hashes.len() * TEST_FLM_HASH_RECORD_SIZE;
+            for (tensor, digest) in tensors.iter().zip(hashes.iter()) {
+                out.extend_from_slice(digest);
+                out.extend_from_slice(&(tensor.payload.len() as u64).to_le_bytes());
+            }
+        }
 
         let shard_table_offset = out.len();
         out.resize(out.len() + TEST_FLM_SHARD_DESC_SIZE, 0);
@@ -779,6 +927,8 @@ mod tests {
         put_u64(&mut out, 32, index_len as u64);
         put_u64(&mut out, 40, metadata_offset as u64);
         put_u64(&mut out, 48, metadata_len as u64);
+        put_u64(&mut out, 72, hashtable_offset as u64);
+        put_u64(&mut out, 80, hashtable_len as u64);
         put_u64(&mut out, 88, shard_table_offset as u64);
         put_u32(&mut out, 96, 1);
         put_u32(&mut out, 100, alignment as u32);
@@ -1009,6 +1159,49 @@ mod tests {
     }
 
     #[test]
+    fn open_flm_verify_hashes_rejects_tampered_payload() {
+        let mut data = build_test_flm_with_hashes(
+            &[TestFlmTensor {
+                name: "model.embed_tokens.weight",
+                shape: vec![4],
+                dtype: 4,
+                payload: b"good".to_vec(),
+            }],
+            &[[
+                0x4a, 0xe7, 0x5b, 0x23, 0x49, 0xdb, 0x30, 0x92, 0xa6, 0xa3, 0x34, 0x36, 0x25, 0xa6,
+                0xaa, 0x7b, 0xa4, 0xbb, 0x32, 0x98, 0x49, 0x1a, 0xca, 0xc2, 0x02, 0xc4, 0x68, 0x47,
+                0xb9, 0xef, 0x31, 0xc8,
+            ]],
+        );
+        let shard_table_offset = read_u64(&data, 88, "test FLM shard table offset")
+            .expect("shard table offset") as usize;
+        let payload_offset = read_u64(&data, shard_table_offset + 4, "test FLM shard file offset")
+            .expect("shard file offset") as usize;
+        data[payload_offset] ^= 0xff;
+        let file = write_temp_flm(&data);
+
+        let err = match BakedStore::open_flm_with_options(
+            file.path(),
+            FlmLoadOptions {
+                compressed_tensors_int4_aliases: false,
+                verify_block_hashes: true,
+            },
+        ) {
+            Ok(_) => panic!("tampered FLM payload should fail verification"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string().contains("hash mismatch"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.to_string().contains("model.embed_tokens.weight"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn open_flm_rejects_half_zero_runtime_directory_fields() {
         let mut offset_only = build_test_flm(&[TestFlmTensor {
             name: "model.embed_tokens.weight",
@@ -1075,6 +1268,7 @@ mod tests {
             file.path(),
             crate::store::FlmLoadOptions {
                 compressed_tensors_int4_aliases: true,
+                ..Default::default()
             },
         )
         .expect("open FLM with CT aliases");
@@ -1247,6 +1441,7 @@ mod tests {
             Path::new(&flm_path_str),
             FlmLoadOptions {
                 compressed_tensors_int4_aliases: true,
+                verify_block_hashes: true,
             },
         )
         .expect("open qwen3.6-27b FLM");

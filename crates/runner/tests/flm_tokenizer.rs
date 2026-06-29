@@ -20,6 +20,7 @@ fn flm_native_qwen_bpe_tokenizer_matches_embedded_hf_json_for_basic_prompt() {
         &path,
         FlmLoadOptions {
             compressed_tensors_int4_aliases: true,
+            verify_block_hashes: true,
         },
     )
     .expect("open runnable FLM fixture");
