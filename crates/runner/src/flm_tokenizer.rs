@@ -124,6 +124,8 @@ fn build_qwen_bpe_tokenizer(assets: QwenBpeAssets) -> Result<Tokenizer> {
     tokenizer.with_post_processor(Some(ByteLevel::new(false, false, false)));
     tokenizer.with_decoder(Some(ByteLevel::new(false, false, false)));
 
+    // tokenizers assigns added-token IDs sequentially after the BPE vocab, so
+    // FLM added-token records must be emitted in HF/id order.
     for token in added_tokens {
         let QwenAddedToken {
             id,
@@ -437,6 +439,10 @@ mod tests {
 
         assert_eq!(ids, vec![7]);
         assert_eq!(tokenizer.token_to_id("<|endoftext|>"), Some(8));
+        assert_eq!(
+            tokenizer.encode("<|endoftext|>", false).unwrap().get_ids(),
+            &[8]
+        );
     }
 
     #[test]
@@ -557,5 +563,23 @@ mod tests {
 
         assert!(err.contains("added token id"), "{err}");
         assert!(err.contains("does not match"), "{err}");
+    }
+
+    #[test]
+    fn rejects_added_token_id_gap_after_base_vocab() {
+        let assets = QwenBpeAssets::parse(
+            TOKENIZER_QWEN_BPE_V1,
+            1,
+            &vocab_asset(&[(0, "a")]),
+            &merges_asset(&[]),
+            &added_tokens_asset(&[(2, "<|gap|>", [0, 0, 0, 0, 1])]),
+            br"\S+",
+        )
+        .expect("parse assets");
+
+        let err = build_qwen_bpe_tokenizer(assets).unwrap_err().to_string();
+
+        assert!(err.contains("added token id 2"), "{err}");
+        assert!(err.contains("does not match assigned/model id 1"), "{err}");
     }
 }
