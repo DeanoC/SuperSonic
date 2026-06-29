@@ -209,6 +209,22 @@ pub(crate) fn validate_effective_flm_source_model(
     );
 }
 
+pub(crate) fn validate_flm_weight_source_options(cli: &Cli, q4km_like: bool) -> Result<()> {
+    if effective_flm_source(cli).is_none() {
+        return Ok(());
+    }
+    if cli.no_bake {
+        anyhow::bail!("FLM sources and --no-bake are mutually exclusive");
+    }
+    if q4km_like {
+        anyhow::bail!("FLM sources are not wired for --q4km/--q4km-gptq bakes");
+    }
+    if cli.int8 {
+        anyhow::bail!("FLM sources are not wired for --int8 bakes");
+    }
+    Ok(())
+}
+
 pub(crate) fn load_qwen35_weights(
     cli: &Cli,
     model_variant: &ModelVariant,
@@ -219,6 +235,7 @@ pub(crate) fn load_qwen35_weights(
     q4km_like: bool,
 ) -> Result<qwen35::weights::Qwen35Weights> {
     validate_effective_flm_source_model(cli, model_variant)?;
+    validate_flm_weight_source_options(cli, q4km_like)?;
 
     if cli.no_bake {
         eprintln!("[weights] loading from safetensors (--no-bake)...");
@@ -482,6 +499,7 @@ mod tests {
     use super::{
         effective_flm_source, effective_quant_profile, flm_source_is_authoritative_for_model,
         should_fetch_bake, should_fetch_exact_bake, validate_effective_flm_source_model,
+        validate_flm_weight_source_options,
     };
     use crate::registry::ModelVariant;
     use crate::Cli;
@@ -582,6 +600,19 @@ mod tests {
         assert!(err.contains("--flm-file"), "{err}");
         assert!(err.contains("qwen3.6-27b"), "{err}");
         assert!(err.contains("qwen3.5-0.8b"), "{err}");
+    }
+
+    #[test]
+    fn flm_model_dir_no_bake_is_rejected_by_weight_source_options() {
+        let err = validate_flm_weight_source_options(
+            &cli_with_model_dir("/tmp/model.flm", &["--no-bake"]),
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("FLM"), "{err}");
+        assert!(err.contains("--no-bake"), "{err}");
     }
 
     #[test]

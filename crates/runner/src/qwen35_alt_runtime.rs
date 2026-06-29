@@ -1,6 +1,6 @@
 use anyhow::Result;
 
-use crate::bakes::{cli_variant, ensure_hf_metadata_present};
+use crate::bakes::{cli_variant, effective_flm_source, ensure_hf_metadata_present};
 use crate::policy::q4km_like;
 use crate::registry::{ModelVariant, RegistryEntry};
 use crate::{
@@ -14,6 +14,8 @@ pub(crate) fn run_qwen35_alt_runtime_if_requested(
     ordinal: usize,
     total_vram: u64,
 ) -> Result<bool> {
+    reject_flm_alt_runtime_if_requested(cli)?;
+
     if cli.dflash {
         run_qwen35_dflash(cli, model_variant, entry, ordinal, total_vram)?;
         return Ok(true);
@@ -28,6 +30,25 @@ pub(crate) fn run_qwen35_alt_runtime_if_requested(
     }
 
     Ok(false)
+}
+
+pub(crate) fn reject_flm_alt_runtime_if_requested(cli: &Cli) -> Result<()> {
+    let Some(flm_source) = effective_flm_source(cli) else {
+        return Ok(());
+    };
+    if cli.dflash {
+        anyhow::bail!(
+            "FLM source {} is not supported with --dflash because the DFlash runtime still reads config.json/tokenizer.json from --model-dir",
+            flm_source.display()
+        );
+    }
+    if cli.specprefill_draft_dir.is_some() {
+        anyhow::bail!(
+            "FLM source {} is not supported with --specprefill-draft-dir because the SpecPrefill runtime is not FLM-aware",
+            flm_source.display()
+        );
+    }
+    Ok(())
 }
 
 fn run_qwen35_dflash(
@@ -114,13 +135,45 @@ mod tests {
     use clap::Parser;
     use model_store::fetch::BakeVariant;
 
-    use super::dflash_local_bake_ok;
+    use super::{dflash_local_bake_ok, reject_flm_alt_runtime_if_requested};
     use crate::Cli;
 
     fn cli(extra: &[&str]) -> Cli {
         let mut args = vec!["supersonic", "--model-dir", "/tmp/model", "--dry-run"];
         args.extend_from_slice(extra);
         Cli::parse_from(args)
+    }
+
+    fn cli_with_model_dir(model_dir: &str, extra: &[&str]) -> Cli {
+        let mut args = vec!["supersonic", "--model-dir", model_dir, "--dry-run"];
+        args.extend_from_slice(extra);
+        Cli::parse_from(args)
+    }
+
+    #[test]
+    fn rejects_flm_source_for_dflash_before_dispatch() {
+        let err = reject_flm_alt_runtime_if_requested(&cli_with_model_dir(
+            "/tmp/model.flm",
+            &["--dflash", "--dflash-draft-dir", "/tmp/draft"],
+        ))
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("FLM"), "{err}");
+        assert!(err.contains("--dflash"), "{err}");
+    }
+
+    #[test]
+    fn rejects_flm_source_for_specprefill_before_dispatch() {
+        let err = reject_flm_alt_runtime_if_requested(&cli_with_model_dir(
+            "/tmp/model.flm",
+            &["--specprefill-draft-dir", "/tmp/draft"],
+        ))
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("FLM"), "{err}");
+        assert!(err.contains("--specprefill-draft-dir"), "{err}");
     }
 
     #[test]
