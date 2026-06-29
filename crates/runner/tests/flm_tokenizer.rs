@@ -9,8 +9,20 @@ fn flm_native_qwen_bpe_tokenizer_matches_embedded_hf_json_for_basic_prompt() {
         return;
     };
     let path = PathBuf::from(path);
-    let store = BakedStore::open_flm_with_options(&path, FlmLoadOptions::default())
-        .expect("open runnable FLM fixture");
+    if !path.exists() {
+        eprintln!(
+            "skipping: SUPERSONIC_QWEN36_27B_RUNNABLE_FLM path does not exist: {}",
+            path.display()
+        );
+        return;
+    }
+    let store = BakedStore::open_flm_with_options(
+        &path,
+        FlmLoadOptions {
+            compressed_tensors_int4_aliases: true,
+        },
+    )
+    .expect("open runnable FLM fixture");
     let runtime = match store.flm_runtime() {
         Some(runtime) => runtime,
         None => {
@@ -32,8 +44,8 @@ fn flm_native_qwen_bpe_tokenizer_matches_embedded_hf_json_for_basic_prompt() {
         .expect("load embedded Hugging Face tokenizer oracle");
 
     for prompt in ["Hello", "The quick brown fox", "GPU quantization"] {
-        let native_ids = native.encode(prompt, false).unwrap().get_ids().to_vec();
-        let oracle_ids = oracle.encode(prompt, false).unwrap().get_ids().to_vec();
+        let native_ids = native.encode(prompt, true).unwrap().get_ids().to_vec();
+        let oracle_ids = oracle.encode(prompt, true).unwrap().get_ids().to_vec();
         assert_eq!(native_ids, oracle_ids, "prompt={prompt:?}");
     }
 }

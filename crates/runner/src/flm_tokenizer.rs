@@ -38,6 +38,7 @@ struct QwenAddedToken {
 impl QwenBpeAssets {
     fn parse(
         algorithm_id: u32,
+        descriptor_vocab_size: u32,
         vocab: &[u8],
         merges: &[u8],
         added_tokens: &[u8],
@@ -48,8 +49,10 @@ impl QwenBpeAssets {
                 "unsupported FLM tokenizer algorithm_id {algorithm_id}; expected TOKENIZER_QWEN_BPE_V1 ({TOKENIZER_QWEN_BPE_V1})"
             );
         }
+        let vocab = parse_vocab(vocab)?;
+        validate_vocab_ids(&vocab, descriptor_vocab_size)?;
         Ok(Self {
-            vocab: parse_vocab(vocab)?,
+            vocab,
             merges: parse_merges(merges)?,
             added_tokens: parse_added_tokens(added_tokens)?,
             regex: parse_regex(regex)?,
@@ -68,14 +71,14 @@ pub fn load_qwen_bpe_from_flm(
     let added_tokens = asset_payload(runtime, descriptor.added_tokens_asset_id, ADDED_TOKENS_KIND)?;
     let regex = asset_payload(runtime, descriptor.regex_asset_id, REGEX_KIND)?;
 
-    let assets = QwenBpeAssets::parse(descriptor.algorithm_id, vocab, merges, added_tokens, regex)?;
-    if assets.vocab.len() != descriptor.vocab_size as usize {
-        bail!(
-            "FLM tokenizer vocab_size descriptor mismatch: descriptor={} asset={}",
-            descriptor.vocab_size,
-            assets.vocab.len()
-        );
-    }
+    let assets = QwenBpeAssets::parse(
+        descriptor.algorithm_id,
+        descriptor.vocab_size,
+        vocab,
+        merges,
+        added_tokens,
+        regex,
+    )?;
     build_qwen_bpe_tokenizer(assets)
 }
 
@@ -154,9 +157,14 @@ fn build_qwen_bpe_tokenizer(assets: QwenBpeAssets) -> Result<Tokenizer> {
 
 fn parse_vocab(buf: &[u8]) -> Result<Vocab> {
     let mut reader = BinaryReader::new(VOCAB_KIND, buf);
-    let count = reader.read_u32("count")? as usize;
-    let mut vocab = Vocab::with_capacity(count);
-    let mut ids = HashSet::with_capacity(count);
+    let count = reader.read_record_count(8)?;
+    let mut vocab = Vocab::new();
+    vocab
+        .try_reserve(count)
+        .map_err(|e| anyhow!("{VOCAB_KIND} cannot reserve {count} vocab entries: {e}"))?;
+    let mut ids = HashSet::new();
+    ids.try_reserve(count)
+        .map_err(|e| anyhow!("{VOCAB_KIND} cannot reserve {count} vocab ids: {e}"))?;
     for index in 0..count {
         let id = reader.read_u32(&format!("record {index} id"))?;
         if !ids.insert(id) {
@@ -171,11 +179,36 @@ fn parse_vocab(buf: &[u8]) -> Result<Vocab> {
     Ok(vocab)
 }
 
+fn validate_vocab_ids(vocab: &Vocab, descriptor_vocab_size: u32) -> Result<()> {
+    if vocab.len() != descriptor_vocab_size as usize {
+        bail!(
+            "FLM tokenizer vocab_size descriptor mismatch: descriptor={} asset={}",
+            descriptor_vocab_size,
+            vocab.len()
+        );
+    }
+
+    for id in vocab.values().copied() {
+        if id >= descriptor_vocab_size {
+            bail!(
+                "{VOCAB_KIND} vocab id {id} is outside descriptor vocab_size {descriptor_vocab_size}"
+            );
+        }
+    }
+
+    Ok(())
+}
+
 fn parse_merges(buf: &[u8]) -> Result<Vec<(String, String)>> {
     let mut reader = BinaryReader::new(MERGES_KIND, buf);
-    let count = reader.read_u32("count")? as usize;
-    let mut merges = Vec::with_capacity(count);
-    let mut seen = HashSet::with_capacity(count);
+    let count = reader.read_record_count(8)?;
+    let mut merges = Vec::new();
+    merges
+        .try_reserve(count)
+        .map_err(|e| anyhow!("{MERGES_KIND} cannot reserve {count} merges: {e}"))?;
+    let mut seen = HashSet::new();
+    seen.try_reserve(count)
+        .map_err(|e| anyhow!("{MERGES_KIND} cannot reserve {count} merge keys: {e}"))?;
     for index in 0..count {
         let left = reader.read_string(&format!("record {index} left"))?;
         let right = reader.read_string(&format!("record {index} right"))?;
@@ -190,10 +223,18 @@ fn parse_merges(buf: &[u8]) -> Result<Vec<(String, String)>> {
 
 fn parse_added_tokens(buf: &[u8]) -> Result<Vec<QwenAddedToken>> {
     let mut reader = BinaryReader::new(ADDED_TOKENS_KIND, buf);
-    let count = reader.read_u32("count")? as usize;
-    let mut tokens = Vec::with_capacity(count);
-    let mut ids = HashSet::with_capacity(count);
-    let mut contents = HashSet::with_capacity(count);
+    let count = reader.read_record_count(13)?;
+    let mut tokens = Vec::new();
+    tokens
+        .try_reserve(count)
+        .map_err(|e| anyhow!("{ADDED_TOKENS_KIND} cannot reserve {count} added tokens: {e}"))?;
+    let mut ids = HashSet::new();
+    ids.try_reserve(count)
+        .map_err(|e| anyhow!("{ADDED_TOKENS_KIND} cannot reserve {count} added token ids: {e}"))?;
+    let mut contents = HashSet::new();
+    contents.try_reserve(count).map_err(|e| {
+        anyhow!("{ADDED_TOKENS_KIND} cannot reserve {count} added token contents: {e}")
+    })?;
     for index in 0..count {
         let id = reader.read_u32(&format!("record {index} id"))?;
         if !ids.insert(id) {
@@ -243,6 +284,19 @@ impl<'a> BinaryReader<'a> {
         let mut value = [0u8; 4];
         value.copy_from_slice(bytes);
         Ok(u32::from_le_bytes(value))
+    }
+
+    fn read_record_count(&mut self, min_record_size: usize) -> Result<usize> {
+        let count = self.read_u32("count")? as usize;
+        let remaining = self.buf.len() - self.offset;
+        let max_possible = remaining / min_record_size;
+        if count > max_possible {
+            bail!(
+                "{} count {count} exceeds remaining payload capacity: remaining={remaining}, min_record_size={min_record_size}, max_possible={max_possible}",
+                self.label
+            );
+        }
+        Ok(count)
     }
 
     fn read_string(&mut self, field: &str) -> Result<String> {
@@ -345,10 +399,17 @@ mod tests {
         out
     }
 
+    fn count_only_asset(count: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        u32_le(&mut out, count);
+        out
+    }
+
     #[test]
     fn parses_synthetic_assets_and_builds_qwen_bpe_tokenizer() {
         let assets = QwenBpeAssets::parse(
             TOKENIZER_QWEN_BPE_V1,
+            9,
             &vocab_asset(&[
                 (0, "H"),
                 (1, "e"),
@@ -377,6 +438,7 @@ mod tests {
     fn rejects_duplicate_vocab_ids() {
         let err = QwenBpeAssets::parse(
             TOKENIZER_QWEN_BPE_V1,
+            2,
             &vocab_asset(&[(0, "a"), (0, "b")]),
             &merges_asset(&[]),
             &added_tokens_asset(&[]),
@@ -389,12 +451,60 @@ mod tests {
     }
 
     #[test]
+    fn rejects_vocab_count_that_exceeds_remaining_payload_capacity() {
+        let err = parse_vocab(&count_only_asset(1_000_000))
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("tokenizer_vocab count"), "{err}");
+        assert!(err.contains("exceeds remaining payload"), "{err}");
+    }
+
+    #[test]
+    fn rejects_merges_count_that_exceeds_remaining_payload_capacity() {
+        let err = parse_merges(&count_only_asset(1_000_000))
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("tokenizer_merges count"), "{err}");
+        assert!(err.contains("exceeds remaining payload"), "{err}");
+    }
+
+    #[test]
+    fn rejects_added_tokens_count_that_exceeds_remaining_payload_capacity() {
+        let err = parse_added_tokens(&count_only_asset(1_000_000))
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("tokenizer_added_tokens count"), "{err}");
+        assert!(err.contains("exceeds remaining payload"), "{err}");
+    }
+
+    #[test]
+    fn rejects_vocab_id_outside_descriptor_vocab_size() {
+        let err = QwenBpeAssets::parse(
+            TOKENIZER_QWEN_BPE_V1,
+            1,
+            &vocab_asset(&[(999_999, "a")]),
+            &merges_asset(&[]),
+            &added_tokens_asset(&[]),
+            br"\S+",
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("vocab id 999999"), "{err}");
+        assert!(err.contains("descriptor vocab_size 1"), "{err}");
+    }
+
+    #[test]
     fn rejects_truncated_merges_asset() {
         let mut merges = merges_asset(&[("a", "b")]);
         merges.pop();
 
         let err = QwenBpeAssets::parse(
             TOKENIZER_QWEN_BPE_V1,
+            2,
             &vocab_asset(&[(0, "a"), (1, "b")]),
             &merges,
             &added_tokens_asset(&[]),
@@ -414,6 +524,7 @@ mod tests {
     fn rejects_bad_added_token_flags() {
         let err = QwenBpeAssets::parse(
             TOKENIZER_QWEN_BPE_V1,
+            1,
             &vocab_asset(&[(0, "a")]),
             &merges_asset(&[]),
             &added_tokens_asset(&[(0, "a", [0, 2, 0, 1, 0])]),
@@ -429,6 +540,7 @@ mod tests {
     fn rejects_added_token_id_mismatch_for_existing_vocab_token() {
         let assets = QwenBpeAssets::parse(
             TOKENIZER_QWEN_BPE_V1,
+            1,
             &vocab_asset(&[(0, "a")]),
             &merges_asset(&[]),
             &added_tokens_asset(&[(1, "a", [0, 0, 0, 1, 0])]),
