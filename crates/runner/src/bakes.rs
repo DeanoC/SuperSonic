@@ -194,6 +194,30 @@ pub(crate) fn load_qwen35_weights(
     }
 
     let profile = effective_quant_profile(cli)?;
+    if let Some(flm_file) = cli.flm_file.as_deref() {
+        let options = model_store::FlmLoadOptions {
+            compressed_tensors_int4_aliases: profile.is_native_int4_runtime(),
+        };
+        eprintln!(
+            "[weights] loading FLM container at {}{}",
+            flm_file.display(),
+            if options.compressed_tensors_int4_aliases {
+                " (compressed-tensors INT4 aliases enabled)"
+            } else {
+                ""
+            }
+        );
+        let store = model_store::BakedStore::open_flm_with_options(flm_file, options)
+            .map_err(|e| anyhow::anyhow!("open FLM store: {e}"))?;
+        return qwen35::weights::Qwen35Weights::load_baked(
+            &store,
+            text_config,
+            ordinal,
+            weight_prefix,
+        )
+        .map_err(|e| anyhow::anyhow!("load FLM weights: {e}"));
+    }
+
     let variant = model_store::fetch::variant_from_quant_profile(profile);
     let mut bake_dir = variant.bake_dir(&cli.model_dir);
     let _lock = model_store::BakeLock::acquire(&cli.model_dir)

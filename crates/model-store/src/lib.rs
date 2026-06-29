@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use manifest::{Manifest, QuantProfile, CONVERTER_VERSION, FORMAT_VERSION};
 
 pub use baker::{bake_phi4, bake_qwen35};
-pub use store::BakedStore;
+pub use store::{BakedStore, FlmLoadOptions};
 
 /// Error type for bake and load operations.
 #[derive(Debug, thiserror::Error)]

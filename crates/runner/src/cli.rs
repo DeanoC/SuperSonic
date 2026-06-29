@@ -15,6 +15,10 @@ pub(crate) struct Cli {
     #[arg(long)]
     pub(crate) model_dir: PathBuf,
 
+    /// Load weights from an FLM container instead of a SuperSonic bake.
+    #[arg(long)]
+    pub(crate) flm_file: Option<PathBuf>,
+
     /// Text prompt (will be tokenized). Required unless --dry-run is set.
     #[arg(long, required_unless_present = "dry_run", default_value = "")]
     pub(crate) prompt: String,

@@ -10,12 +10,57 @@ use memmap2::Mmap;
 use crate::manifest::{LayoutTag, Manifest, TensorMeta};
 use crate::Error;
 
+const FLM_MAGIC: &[u8; 8] = b"FLM1\0\0\0\0";
+const FLM_SUPERBLOCK_SIZE: usize = 4096;
+const FLM_INDEX_RECORD_SIZE: usize = 64;
+const FLM_SHARD_DESC_SIZE: usize = 24;
+const FLM_DTYPE_FP32: u16 = 0;
+const FLM_DTYPE_FP16: u16 = 1;
+const FLM_DTYPE_BF16: u16 = 2;
+const FLM_DTYPE_FP8_E4M3: u16 = 3;
+const FLM_DTYPE_UINT8: u16 = 4;
+const FLM_DTYPE_INT32: u16 = 5;
+const FLM_DTYPE_INT64: u16 = 6;
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FlmLoadOptions {
+    /// Expose compressed-tensors INT4 triples as SuperSonic's native INT4
+    /// packed-weight contract:
+    ///
+    ///   `<base>.weight_packed` -> `<base>.weight` as u8 nibbles
+    ///   `<base>.weight_scale`  -> `<base>.weight_int4_scale`
+    ///   synthetic BF16 8.0     -> `<base>.weight_int4_zero`
+    ///
+    /// The raw FLM tensor names remain present. This is intentionally opt-in
+    /// because it interprets geo-quant/compressed-tensors symmetric INT4
+    /// semantics for a runtime that expects scale+zero sidecars.
+    pub compressed_tensors_int4_aliases: bool,
+}
+
+#[derive(Debug, Clone)]
+struct FlmSuperblock {
+    tensor_count: usize,
+    index_offset: usize,
+    index_len: usize,
+    metadata_offset: usize,
+    metadata_len: usize,
+    shard_table_offset: usize,
+    shard_count: usize,
+}
+
+#[derive(Debug, Clone)]
+struct FlmShard {
+    offset: u64,
+    length: u64,
+}
+
 /// A memory-mapped baked weight store for fast GPU loading.
 pub struct BakedStore {
     _mmap: Mmap,
     data: *const u8,
     data_len: usize,
     index: HashMap<String, TensorMeta>,
+    synthetic: HashMap<String, Vec<u8>>,
 }
 
 // Safety: the mmap is immutable and lives as long as BakedStore.
@@ -24,6 +69,317 @@ unsafe impl Sync for BakedStore {}
 
 fn parse_dtype(name: &str) -> Result<ScalarType, Error> {
     ScalarType::from_name(name).ok_or_else(|| Error::UnsupportedDtype(name.to_string()))
+}
+
+fn read_exact_range<'a>(
+    buf: &'a [u8],
+    offset: usize,
+    len: usize,
+    what: &str,
+) -> Result<&'a [u8], Error> {
+    let end = offset.checked_add(len).ok_or_else(|| {
+        Error::Other(format!(
+            "{what}: range overflows (offset={offset}, len={len})"
+        ))
+    })?;
+    if end > buf.len() {
+        return Err(Error::Other(format!(
+            "{what}: range [{offset}, {end}) exceeds file length {}",
+            buf.len()
+        )));
+    }
+    Ok(&buf[offset..end])
+}
+
+fn read_u16(buf: &[u8], offset: usize, what: &str) -> Result<u16, Error> {
+    let bytes: [u8; 2] = read_exact_range(buf, offset, 2, what)?
+        .try_into()
+        .expect("slice length checked");
+    Ok(u16::from_le_bytes(bytes))
+}
+
+fn read_u32(buf: &[u8], offset: usize, what: &str) -> Result<u32, Error> {
+    let bytes: [u8; 4] = read_exact_range(buf, offset, 4, what)?
+        .try_into()
+        .expect("slice length checked");
+    Ok(u32::from_le_bytes(bytes))
+}
+
+fn read_u64(buf: &[u8], offset: usize, what: &str) -> Result<u64, Error> {
+    let bytes: [u8; 8] = read_exact_range(buf, offset, 8, what)?
+        .try_into()
+        .expect("slice length checked");
+    Ok(u64::from_le_bytes(bytes))
+}
+
+fn u64_to_usize(value: u64, what: &str) -> Result<usize, Error> {
+    usize::try_from(value).map_err(|_| Error::Other(format!("{what}: {value} does not fit usize")))
+}
+
+fn flm_parse_superblock(buf: &[u8]) -> Result<FlmSuperblock, Error> {
+    let sb = read_exact_range(buf, 0, FLM_SUPERBLOCK_SIZE, "FLM superblock")?;
+    if &sb[..8] != FLM_MAGIC {
+        return Err(Error::Other(format!(
+            "bad FLM magic: expected {:?}, got {:?}",
+            FLM_MAGIC,
+            &sb[..8]
+        )));
+    }
+    let version = read_u32(sb, 8, "FLM format_version")?;
+    if version != 1 {
+        return Err(Error::Other(format!(
+            "unsupported FLM format_version {version}; expected 1"
+        )));
+    }
+    let tensor_count = u64_to_usize(read_u64(sb, 16, "FLM tensor_count")?, "FLM tensor_count")?;
+    let index_offset = u64_to_usize(read_u64(sb, 24, "FLM index_offset")?, "FLM index_offset")?;
+    let index_len = u64_to_usize(read_u64(sb, 32, "FLM index_len")?, "FLM index_len")?;
+    let metadata_offset = u64_to_usize(
+        read_u64(sb, 40, "FLM metadata_offset")?,
+        "FLM metadata_offset",
+    )?;
+    let metadata_len = u64_to_usize(read_u64(sb, 48, "FLM metadata_len")?, "FLM metadata_len")?;
+    let shard_table_offset = u64_to_usize(
+        read_u64(sb, 88, "FLM shard_table_offset")?,
+        "FLM shard_table_offset",
+    )?;
+    let shard_count = read_u32(sb, 96, "FLM shard_count")? as usize;
+
+    let expected_index_len = tensor_count
+        .checked_mul(FLM_INDEX_RECORD_SIZE)
+        .ok_or_else(|| Error::Other("FLM index length overflows".to_string()))?;
+    if index_len < expected_index_len {
+        return Err(Error::Other(format!(
+            "FLM index_len {index_len} shorter than tensor_count stride {expected_index_len}"
+        )));
+    }
+
+    Ok(FlmSuperblock {
+        tensor_count,
+        index_offset,
+        index_len,
+        metadata_offset,
+        metadata_len,
+        shard_table_offset,
+        shard_count,
+    })
+}
+
+fn flm_read_string_table(buf: &[u8], sb: &FlmSuperblock) -> Result<Vec<String>, Error> {
+    let meta = read_exact_range(buf, sb.metadata_offset, sb.metadata_len, "FLM metadata")?;
+    if meta.len() < 4 {
+        return Err(Error::Other(
+            "FLM metadata missing string table length".to_string(),
+        ));
+    }
+    let mut offset = 0usize;
+    let count = read_u32(meta, offset, "FLM string count")? as usize;
+    offset += 4;
+    let mut strings = Vec::with_capacity(count);
+    for idx in 0..count {
+        let len = read_u32(meta, offset, "FLM string length")? as usize;
+        offset += 4;
+        let bytes = read_exact_range(meta, offset, len, "FLM string bytes")?;
+        offset += len;
+        let text = std::str::from_utf8(bytes)
+            .map_err(|e| Error::Other(format!("FLM string table entry {idx} is not UTF-8: {e}")))?;
+        strings.push(text.to_string());
+    }
+    Ok(strings)
+}
+
+fn flm_read_shards(buf: &[u8], sb: &FlmSuperblock) -> Result<HashMap<u32, FlmShard>, Error> {
+    let table_len = sb
+        .shard_count
+        .checked_mul(FLM_SHARD_DESC_SIZE)
+        .ok_or_else(|| Error::Other("FLM shard table length overflows".to_string()))?;
+    let table = read_exact_range(buf, sb.shard_table_offset, table_len, "FLM shard table")?;
+    let mut shards = HashMap::with_capacity(sb.shard_count);
+    for idx in 0..sb.shard_count {
+        let off = idx * FLM_SHARD_DESC_SIZE;
+        let shard_id = read_u32(table, off, "FLM shard_id")?;
+        let file_offset = read_u64(table, off + 4, "FLM shard file offset")?;
+        let length = read_u64(table, off + 12, "FLM shard length")?;
+        let end = file_offset.checked_add(length).ok_or_else(|| {
+            Error::Other(format!(
+                "FLM shard {shard_id} range overflows (offset={file_offset}, len={length})"
+            ))
+        })?;
+        if end > buf.len() as u64 {
+            return Err(Error::Other(format!(
+                "FLM shard {shard_id} extends past end of file (offset={file_offset}, len={length}, file_len={})",
+                buf.len()
+            )));
+        }
+        shards.insert(
+            shard_id,
+            FlmShard {
+                offset: file_offset,
+                length,
+            },
+        );
+    }
+    Ok(shards)
+}
+
+fn flm_dtype_name(dtype: u16) -> Result<&'static str, Error> {
+    match dtype {
+        FLM_DTYPE_FP32 => Ok("f32"),
+        FLM_DTYPE_FP16 => Ok("f16"),
+        FLM_DTYPE_BF16 => Ok("bf16"),
+        FLM_DTYPE_FP8_E4M3 => Ok("f8_e4m3"),
+        FLM_DTYPE_UINT8 => Ok("u8"),
+        // SuperSonic's HAL only needs byte width for packed INT4 payloads; u32
+        // preserves the 4-byte element layout of compressed-tensors int32.
+        FLM_DTYPE_INT32 => Ok("u32"),
+        FLM_DTYPE_INT64 => Ok("i64"),
+        other => Err(Error::UnsupportedDtype(format!("FLM dtype id {other}"))),
+    }
+}
+
+fn flm_build_index(
+    buf: &[u8],
+    sb: &FlmSuperblock,
+    strings: &[String],
+    shards: &HashMap<u32, FlmShard>,
+) -> Result<HashMap<String, TensorMeta>, Error> {
+    let index_blob = read_exact_range(buf, sb.index_offset, sb.index_len, "FLM tensor index")?;
+    let mut index = HashMap::with_capacity(sb.tensor_count);
+    for idx in 0..sb.tensor_count {
+        let off = idx * FLM_INDEX_RECORD_SIZE;
+        let rec = read_exact_range(index_blob, off, FLM_INDEX_RECORD_SIZE, "FLM tensor record")?;
+        let name_id = read_u32(rec, 0, "FLM tensor name_id")? as usize;
+        let name = strings.get(name_id).ok_or_else(|| {
+            Error::Other(format!(
+                "FLM tensor {idx} references missing string table id {name_id}"
+            ))
+        })?;
+        let shard_id = read_u32(rec, 8, "FLM tensor shard_id")?;
+        let shard_offset = read_u64(rec, 12, "FLM tensor shard_offset")?;
+        let stored_len = read_u64(rec, 20, "FLM tensor stored_len")?;
+        let dtype = read_u16(rec, 36, "FLM tensor dtype")?;
+        let codec = rec[40];
+        let n_dims = rec[41] as usize;
+        let inline_dims = n_dims.min(4);
+        let mut shape = Vec::with_capacity(inline_dims);
+        for dim_idx in 0..inline_dims {
+            shape.push(read_u32(rec, 42 + dim_idx * 4, "FLM tensor shape")? as usize);
+        }
+        let shard = shards.get(&shard_id).ok_or_else(|| {
+            Error::Other(format!(
+                "FLM tensor {name} references missing shard {shard_id}"
+            ))
+        })?;
+        let shard_end = shard_offset.checked_add(stored_len).ok_or_else(|| {
+            Error::Other(format!(
+                "FLM tensor {name} shard range overflows (offset={shard_offset}, len={stored_len})"
+            ))
+        })?;
+        if shard_end > shard.length {
+            return Err(Error::Other(format!(
+                "FLM tensor {name} extends past shard {shard_id} (offset={shard_offset}, len={stored_len}, shard_len={})",
+                shard.length
+            )));
+        }
+        let file_offset = shard.offset.checked_add(shard_offset).ok_or_else(|| {
+            Error::Other(format!(
+                "FLM tensor {name} file offset overflows (shard_offset={}, tensor_offset={shard_offset})",
+                shard.offset
+            ))
+        })?;
+
+        let dtype_name = if codec == 0 {
+            flm_dtype_name(dtype)?
+        } else {
+            // Unknown/non-native codecs are still inspectable as raw bytes.
+            "u8"
+        };
+
+        index.insert(
+            name.clone(),
+            TensorMeta {
+                name: name.clone(),
+                shape,
+                dtype: dtype_name.to_string(),
+                layout: LayoutTag::Raw,
+                offset: file_offset,
+                byte_len: stored_len,
+            },
+        );
+    }
+    Ok(index)
+}
+
+fn bf16_eight_bytes(len: usize) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(len);
+    for _ in 0..(len / 2) {
+        bytes.extend_from_slice(&[0x00, 0x41]);
+    }
+    bytes
+}
+
+fn add_compressed_tensors_int4_aliases(
+    index: &mut HashMap<String, TensorMeta>,
+    synthetic: &mut HashMap<String, Vec<u8>>,
+) {
+    let snapshot: Vec<(String, TensorMeta)> = index
+        .iter()
+        .map(|(name, meta)| (name.clone(), meta.clone()))
+        .collect();
+    for (packed_name, packed_meta) in snapshot {
+        let Some(base) = packed_name.strip_suffix(".weight_packed") else {
+            continue;
+        };
+        if packed_meta.dtype != "u32" || packed_meta.shape.len() != 2 {
+            continue;
+        }
+        let scale_name = format!("{base}.weight_scale");
+        let Some(scale_meta) = index.get(&scale_name).cloned() else {
+            continue;
+        };
+        if scale_meta.dtype != "bf16" || scale_meta.shape.len() != 2 {
+            continue;
+        }
+
+        let alias_weight = format!("{base}.weight");
+        index
+            .entry(alias_weight.clone())
+            .or_insert_with(|| TensorMeta {
+                name: alias_weight,
+                shape: vec![packed_meta.shape[0], packed_meta.shape[1] * 4],
+                dtype: "u8".to_string(),
+                layout: LayoutTag::Int4Quantized,
+                offset: packed_meta.offset,
+                byte_len: packed_meta.byte_len,
+            });
+
+        let alias_scale = format!("{base}.weight_int4_scale");
+        index
+            .entry(alias_scale.clone())
+            .or_insert_with(|| TensorMeta {
+                name: alias_scale,
+                shape: scale_meta.shape.clone(),
+                dtype: scale_meta.dtype.clone(),
+                layout: LayoutTag::Raw,
+                offset: scale_meta.offset,
+                byte_len: scale_meta.byte_len,
+            });
+
+        let alias_zero = format!("{base}.weight_int4_zero");
+        index
+            .entry(alias_zero.clone())
+            .or_insert_with(|| TensorMeta {
+                name: alias_zero.clone(),
+                shape: scale_meta.shape.clone(),
+                dtype: "bf16".to_string(),
+                layout: LayoutTag::Raw,
+                offset: 0,
+                byte_len: scale_meta.byte_len,
+            });
+        synthetic
+            .entry(alias_zero)
+            .or_insert_with(|| bf16_eight_bytes(scale_meta.byte_len as usize));
+    }
 }
 
 impl BakedStore {
@@ -49,6 +405,35 @@ impl BakedStore {
             data,
             data_len,
             index,
+            synthetic: HashMap::new(),
+        })
+    }
+
+    /// Open an FLM container directly as a BakedStore-compatible byte index.
+    pub fn open_flm(path: &Path) -> Result<Self, Error> {
+        Self::open_flm_with_options(path, FlmLoadOptions::default())
+    }
+
+    /// Open an FLM container with optional compatibility aliases.
+    pub fn open_flm_with_options(path: &Path, options: FlmLoadOptions) -> Result<Self, Error> {
+        let file = File::open(path)?;
+        let mmap = unsafe { Mmap::map(&file)? };
+        let data = mmap.as_ptr();
+        let data_len = mmap.len();
+        let sb = flm_parse_superblock(&mmap)?;
+        let strings = flm_read_string_table(&mmap, &sb)?;
+        let shards = flm_read_shards(&mmap, &sb)?;
+        let mut index = flm_build_index(&mmap, &sb, &strings, &shards)?;
+        let mut synthetic = HashMap::new();
+        if options.compressed_tensors_int4_aliases {
+            add_compressed_tensors_int4_aliases(&mut index, &mut synthetic);
+        }
+        Ok(Self {
+            _mmap: mmap,
+            data,
+            data_len,
+            index,
+            synthetic,
         })
     }
 
@@ -70,20 +455,41 @@ impl BakedStore {
         self.index.get(name).map(|m| &m.layout)
     }
 
+    fn tensor_bytes(&self, name: &str, meta: &TensorMeta) -> Result<&[u8], Error> {
+        if let Some(bytes) = self.synthetic.get(name) {
+            if bytes.len() != meta.byte_len as usize {
+                return Err(Error::Other(format!(
+                    "synthetic tensor '{}' byte_len={} does not match metadata byte_len={}",
+                    name,
+                    bytes.len(),
+                    meta.byte_len
+                )));
+            }
+            return Ok(bytes);
+        }
+        let start = meta.offset as usize;
+        let end = start.checked_add(meta.byte_len as usize).ok_or_else(|| {
+            Error::Other(format!(
+                "tensor '{name}' byte range overflows (offset={}, len={})",
+                meta.offset, meta.byte_len
+            ))
+        })?;
+        if end > self.data_len {
+            return Err(Error::Other(format!(
+                "tensor '{}' extends past end of weight store (offset={}, len={}, file_len={})",
+                name, meta.offset, meta.byte_len, self.data_len,
+            )));
+        }
+        Ok(unsafe { std::slice::from_raw_parts(self.data.add(start), meta.byte_len as usize) })
+    }
+
     /// Return the raw mmap-backed bytes of a tensor. Useful for tensors that
     /// are too large to upload to GPU in full (e.g. Gemma 4's
     /// `embed_tokens_per_layer`, which is row-accessed per-token). The slice
     /// lives as long as the `BakedStore`'s mmap.
     pub fn raw_bytes(&self, name: &str) -> Option<&[u8]> {
         let meta = self.index.get(name)?;
-        let start = meta.offset as usize;
-        let end = start + meta.byte_len as usize;
-        if end > self.data_len {
-            return None;
-        }
-        let slice =
-            unsafe { std::slice::from_raw_parts(self.data.add(start), meta.byte_len as usize) };
-        Some(slice)
+        self.tensor_bytes(name, meta).ok()
     }
 
     pub fn raw_byte_range(
@@ -96,20 +502,7 @@ impl BakedStore {
             .index
             .get(name)
             .ok_or_else(|| Error::NotFound(name.to_string()))?;
-        let tensor_end = (meta.offset as usize)
-            .checked_add(meta.byte_len as usize)
-            .ok_or_else(|| {
-                Error::Other(format!(
-                    "tensor '{name}' byte range overflows (offset={}, len={})",
-                    meta.offset, meta.byte_len
-                ))
-            })?;
-        if tensor_end > self.data_len {
-            return Err(Error::Other(format!(
-                "tensor '{}' extends past end of weights.bin (offset={}, len={}, file_len={})",
-                name, meta.offset, meta.byte_len, self.data_len,
-            )));
-        }
+        let bytes = self.tensor_bytes(name, meta)?;
         let range_end = byte_offset.checked_add(byte_len).ok_or_else(|| {
             Error::Other(format!(
                 "tensor '{name}' raw range overflows: offset={byte_offset} len={byte_len}"
@@ -121,12 +514,7 @@ impl BakedStore {
                 meta.byte_len
             )));
         }
-        Ok(unsafe {
-            std::slice::from_raw_parts(
-                self.data.add(meta.offset as usize).add(byte_offset),
-                byte_len,
-            )
-        })
+        Ok(&bytes[byte_offset..range_end])
     }
 
     /// Load a tensor from the baked store directly to GPU memory.
@@ -136,18 +524,7 @@ impl BakedStore {
             .index
             .get(name)
             .ok_or_else(|| Error::NotFound(name.to_string()))?;
-
-        let start = meta.offset as usize;
-        let end = start + meta.byte_len as usize;
-        if end > self.data_len {
-            return Err(Error::Other(format!(
-                "tensor '{}' extends past end of weights.bin (offset={}, len={}, file_len={})",
-                name, meta.offset, meta.byte_len, self.data_len,
-            )));
-        }
-
-        let slice =
-            unsafe { std::slice::from_raw_parts(self.data.add(start), meta.byte_len as usize) };
+        let slice = self.tensor_bytes(name, meta)?;
         let dtype = parse_dtype(&meta.dtype)?;
         let buf = GpuBuffer::from_host_bytes(ordinal, dtype, &meta.shape, slice)?;
         Ok(buf)
@@ -187,18 +564,7 @@ impl BakedStore {
             .index
             .get(name)
             .ok_or_else(|| Error::NotFound(name.to_string()))?;
-
-        let start = meta.offset as usize;
-        let end = start + meta.byte_len as usize;
-        if end > self.data_len {
-            return Err(Error::Other(format!(
-                "tensor '{}' extends past end of weights.bin (offset={}, len={}, file_len={})",
-                name, meta.offset, meta.byte_len, self.data_len,
-            )));
-        }
-
-        let slice =
-            unsafe { std::slice::from_raw_parts(self.data.add(start), meta.byte_len as usize) };
+        let slice = self.tensor_bytes(name, meta)?;
         let dtype = parse_dtype(&meta.dtype)?;
         let expected_len = meta
             .shape
@@ -239,20 +605,6 @@ impl BakedStore {
             .index
             .get(name)
             .ok_or_else(|| Error::NotFound(name.to_string()))?;
-        let tensor_end = (meta.offset as usize)
-            .checked_add(meta.byte_len as usize)
-            .ok_or_else(|| {
-                Error::Other(format!(
-                    "tensor '{name}' byte range overflows (offset={}, len={})",
-                    meta.offset, meta.byte_len
-                ))
-            })?;
-        if tensor_end > self.data_len {
-            return Err(Error::Other(format!(
-                "tensor '{}' extends past end of weights.bin (offset={}, len={}, file_len={})",
-                name, meta.offset, meta.byte_len, self.data_len,
-            )));
-        }
         let range_end = byte_offset.checked_add(byte_len).ok_or_else(|| {
             Error::Other(format!(
                 "tensor '{name}' load range overflows: offset={byte_offset} len={byte_len}"
@@ -264,6 +616,7 @@ impl BakedStore {
                 meta.byte_len
             )));
         }
+        let src_bytes = self.tensor_bytes(name, meta)?;
 
         let dtype = parse_dtype(&meta.dtype)?;
         let ordinal = arena.device_ordinal();
@@ -282,7 +635,7 @@ impl BakedStore {
             )));
         }
         buffer.map_range_bytes(byte_offset, byte_len)?;
-        let src = unsafe { self.data.add(meta.offset as usize).add(byte_offset) as *const _ };
+        let src = unsafe { src_bytes.as_ptr().add(byte_offset) as *const _ };
         copy_h2d(ordinal, buffer.offset_mut_ptr(byte_offset), src, byte_len)?;
         sync(ordinal)?;
         Ok(())
@@ -299,6 +652,216 @@ impl BakedStore {
 mod tests {
     use super::*;
     use crate::manifest::{LayoutTag, Manifest, TensorMeta, FORMAT_VERSION};
+    use std::io::Write;
+
+    const TEST_FLM_SUPERBLOCK_SIZE: usize = 4096;
+    const TEST_FLM_INDEX_RECORD_SIZE: usize = 64;
+    const TEST_FLM_SHARD_DESC_SIZE: usize = 24;
+
+    struct TestFlmTensor {
+        name: &'static str,
+        shape: Vec<u32>,
+        dtype: u16,
+        payload: Vec<u8>,
+    }
+
+    fn put_u16(buf: &mut [u8], off: usize, value: u16) {
+        buf[off..off + 2].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_u32(buf: &mut [u8], off: usize, value: u32) {
+        buf[off..off + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_u64(buf: &mut [u8], off: usize, value: u64) {
+        buf[off..off + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn align_len(buf: &mut Vec<u8>, alignment: usize) {
+        let rem = buf.len() % alignment;
+        if rem != 0 {
+            buf.resize(buf.len() + (alignment - rem), 0);
+        }
+    }
+
+    fn build_test_flm(tensors: &[TestFlmTensor]) -> Vec<u8> {
+        let alignment = 256usize;
+        let mut out = vec![0u8; TEST_FLM_SUPERBLOCK_SIZE];
+
+        let index_offset = out.len();
+        let mut shard = Vec::new();
+        let mut records = Vec::new();
+        for (idx, tensor) in tensors.iter().enumerate() {
+            assert!(tensor.shape.len() <= 4);
+            let shard_offset = shard.len();
+            shard.extend_from_slice(&tensor.payload);
+
+            let mut rec = [0u8; TEST_FLM_INDEX_RECORD_SIZE];
+            put_u32(&mut rec, 0, idx as u32);
+            put_u16(&mut rec, 4, 0);
+            put_u16(&mut rec, 6, 0);
+            put_u32(&mut rec, 8, 0);
+            put_u64(&mut rec, 12, shard_offset as u64);
+            put_u64(&mut rec, 20, tensor.payload.len() as u64);
+            put_u64(&mut rec, 28, tensor.payload.len() as u64);
+            put_u16(&mut rec, 36, tensor.dtype);
+            put_u16(&mut rec, 38, tensor.dtype);
+            rec[40] = 0;
+            rec[41] = tensor.shape.len() as u8;
+            for (dim_idx, dim) in tensor.shape.iter().enumerate() {
+                put_u32(&mut rec, 42 + dim_idx * 4, *dim);
+            }
+            records.extend_from_slice(&rec);
+        }
+        out.extend_from_slice(&records);
+        let index_len = records.len();
+
+        let metadata_offset = out.len();
+        put_u32_at_vec(&mut out, tensors.len() as u32);
+        for tensor in tensors {
+            put_u32_at_vec(&mut out, tensor.name.len() as u32);
+            out.extend_from_slice(tensor.name.as_bytes());
+        }
+        put_u32_at_vec(&mut out, 0);
+        let metadata_len = out.len() - metadata_offset;
+
+        let shard_table_offset = out.len();
+        out.resize(out.len() + TEST_FLM_SHARD_DESC_SIZE, 0);
+        align_len(&mut out, alignment);
+        let shard_offset = out.len();
+        out.extend_from_slice(&shard);
+
+        put_u32(&mut out, shard_table_offset, 0);
+        put_u64(&mut out, shard_table_offset + 4, shard_offset as u64);
+        put_u64(&mut out, shard_table_offset + 12, shard.len() as u64);
+        out[shard_table_offset + 20] = 5;
+
+        out[0..8].copy_from_slice(b"FLM1\0\0\0\0");
+        put_u32(&mut out, 8, 1);
+        put_u64(&mut out, 16, tensors.len() as u64);
+        put_u64(&mut out, 24, index_offset as u64);
+        put_u64(&mut out, 32, index_len as u64);
+        put_u64(&mut out, 40, metadata_offset as u64);
+        put_u64(&mut out, 48, metadata_len as u64);
+        put_u64(&mut out, 88, shard_table_offset as u64);
+        put_u32(&mut out, 96, 1);
+        put_u32(&mut out, 100, alignment as u32);
+        put_u64(&mut out, 104, shard.len() as u64);
+        put_u16(&mut out, 156, 1);
+        out
+    }
+
+    fn put_u32_at_vec(buf: &mut Vec<u8>, value: u32) {
+        buf.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn write_temp_flm(data: &[u8]) -> tempfile::NamedTempFile {
+        let mut file = tempfile::NamedTempFile::new().expect("temp FLM file");
+        file.write_all(data).expect("write FLM fixture");
+        file.flush().expect("flush FLM fixture");
+        file
+    }
+
+    #[test]
+    fn open_flm_exposes_mmap_backed_tensor_bytes() {
+        let data = build_test_flm(&[
+            TestFlmTensor {
+                name: "model.embed_tokens.weight",
+                shape: vec![2, 4],
+                dtype: 4,
+                payload: (0u8..8).collect(),
+            },
+            TestFlmTensor {
+                name: "model.norm.weight",
+                shape: vec![2],
+                dtype: 2,
+                payload: vec![0x00, 0x3f, 0x00, 0x40],
+            },
+        ]);
+        let file = write_temp_flm(&data);
+
+        let store = BakedStore::open_flm(file.path()).expect("open FLM");
+
+        assert!(store.contains("model.embed_tokens.weight"));
+        let meta = store.meta("model.embed_tokens.weight").unwrap();
+        assert_eq!(meta.shape, vec![2, 4]);
+        assert_eq!(meta.dtype, "u8");
+        assert_eq!(meta.layout, LayoutTag::Raw);
+        assert_eq!(
+            store.raw_bytes("model.embed_tokens.weight").unwrap(),
+            &(0u8..8).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            store
+                .raw_byte_range("model.embed_tokens.weight", 2, 3)
+                .unwrap(),
+            &[2, 3, 4]
+        );
+
+        let norm = store.meta("model.norm.weight").unwrap();
+        assert_eq!(norm.dtype, "bf16");
+        assert_eq!(norm.shape, vec![2]);
+    }
+
+    #[test]
+    fn open_flm_can_synthesize_compressed_tensors_int4_aliases() {
+        let packed = vec![0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe];
+        let scale = vec![0x00, 0x3f, 0x00, 0x40];
+        let data = build_test_flm(&[
+            TestFlmTensor {
+                name: "model.layers.0.mlp.gate_proj.weight_packed",
+                shape: vec![2, 1],
+                dtype: 5,
+                payload: packed.clone(),
+            },
+            TestFlmTensor {
+                name: "model.layers.0.mlp.gate_proj.weight_scale",
+                shape: vec![2, 1],
+                dtype: 2,
+                payload: scale.clone(),
+            },
+            TestFlmTensor {
+                name: "model.layers.0.mlp.gate_proj.weight_shape",
+                shape: vec![2],
+                dtype: 6,
+                payload: vec![2, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0],
+            },
+        ]);
+        let file = write_temp_flm(&data);
+
+        let store = BakedStore::open_flm_with_options(
+            file.path(),
+            crate::store::FlmLoadOptions {
+                compressed_tensors_int4_aliases: true,
+            },
+        )
+        .expect("open FLM with CT aliases");
+
+        let weight = store
+            .meta("model.layers.0.mlp.gate_proj.weight")
+            .expect("aliased weight");
+        assert_eq!(weight.dtype, "u8");
+        assert_eq!(weight.shape, vec![2, 4]);
+        assert_eq!(weight.layout, LayoutTag::Int4Quantized);
+        assert_eq!(
+            store
+                .raw_bytes("model.layers.0.mlp.gate_proj.weight")
+                .unwrap(),
+            packed.as_slice()
+        );
+        assert_eq!(
+            store
+                .raw_bytes("model.layers.0.mlp.gate_proj.weight_int4_scale")
+                .unwrap(),
+            scale.as_slice()
+        );
+        assert_eq!(
+            store
+                .raw_bytes("model.layers.0.mlp.gate_proj.weight_int4_zero")
+                .unwrap(),
+            &[0x00, 0x41, 0x00, 0x41]
+        );
+    }
 
     /// End-to-end loadability test against a real Qwen3.6-MoE bake.
     /// Skipped when `SUPERSONIC_QWEN36_MOE_BAKE_DIR` is unset so CI / non-bake
@@ -426,6 +989,57 @@ mod tests {
             "[bake-validate] OK — {} tensors, weights.bin {} MiB",
             store.index.len(),
             weights_len / (1024 * 1024),
+        );
+    }
+
+    #[test]
+    fn flm_qwen36_27b_loadable_with_ct_aliases() {
+        let Ok(flm_path_str) = std::env::var("SUPERSONIC_QWEN36_27B_FLM") else {
+            eprintln!(
+                "skip: SUPERSONIC_QWEN36_27B_FLM not set. Point it at an FLM \
+                 file like qwen36-27b-int4.flm to validate full-artifact FLM loadability."
+            );
+            return;
+        };
+        let store = BakedStore::open_flm_with_options(
+            Path::new(&flm_path_str),
+            FlmLoadOptions {
+                compressed_tensors_int4_aliases: true,
+            },
+        )
+        .expect("open qwen3.6-27b FLM");
+
+        let embed = store
+            .meta("model.language_model.embed_tokens.weight")
+            .expect("embed_tokens missing");
+        assert_eq!(embed.dtype, "bf16");
+        assert_eq!(embed.shape, vec![248320, 5120]);
+        assert_eq!(embed.byte_len, 2_542_796_800);
+
+        let packed_name = "model.language_model.layers.0.linear_attn.in_proj_qkv.weight_packed";
+        let alias_name = "model.language_model.layers.0.linear_attn.in_proj_qkv.weight";
+        let packed = store.meta(packed_name).expect("packed CT tensor missing");
+        let alias = store.meta(alias_name).expect("native INT4 alias missing");
+        assert_eq!(packed.dtype, "u32");
+        assert_eq!(alias.dtype, "u8");
+        assert_eq!(alias.layout, LayoutTag::Int4Quantized);
+        assert_eq!(alias.shape, vec![10240, 2560]);
+        assert_eq!(alias.offset, packed.offset);
+        assert_eq!(alias.byte_len, packed.byte_len);
+
+        let scale = store
+            .raw_bytes("model.language_model.layers.0.linear_attn.in_proj_qkv.weight_int4_scale")
+            .expect("aliased scale bytes");
+        assert_eq!(scale.len(), 819_200);
+        let zero = store
+            .raw_bytes("model.language_model.layers.0.linear_attn.in_proj_qkv.weight_int4_zero")
+            .expect("synthetic zero bytes");
+        assert_eq!(zero.len(), scale.len());
+        assert!(zero.chunks_exact(2).all(|pair| pair == [0x00, 0x41]));
+
+        eprintln!(
+            "[flm-validate] OK — {} tensors including CT aliases",
+            store.index.len()
         );
     }
 

@@ -59,6 +59,15 @@ pub(crate) fn validate_global_flags(
             "--q4km-gptq is currently supported on CUDA Qwen paths, HIP Qwen3.5/3.6 paths, and Metal Qwen3.5/3.6 MoE"
         );
     }
+    if cli.flm_file.is_some() && cli.no_bake {
+        anyhow::bail!("--flm-file and --no-bake are mutually exclusive");
+    }
+    if cli.flm_file.is_some() && q4km_like {
+        anyhow::bail!("--flm-file is not wired for --q4km/--q4km-gptq bakes");
+    }
+    if cli.flm_file.is_some() && cli.int8 {
+        anyhow::bail!("--flm-file is not wired for --int8 bakes");
+    }
     if matches!(model_variant.family(), ModelFamily::Qwen3Moe) {
         if !cli.int4 || profile != QuantProfile::Int4Gptq {
             anyhow::bail!("qwen3-30b-a3b v1 requires --int4 / int4-gptq");
