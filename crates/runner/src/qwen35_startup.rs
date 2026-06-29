@@ -4,6 +4,7 @@ use anyhow::Result;
 
 use crate::bakes::validate_effective_flm_source_model;
 use crate::flm_model_source::{is_flm_model_path, FlmModelSource};
+use crate::flm_tokenizer::load_qwen_bpe_from_flm;
 use crate::registry::{Backend, GpuArch, ModelVariant, Qwen35KernelParams};
 use crate::Cli;
 
@@ -16,6 +17,12 @@ pub(crate) struct Qwen35Startup {
 
 pub(crate) struct Qwen35Policy {
     pub(crate) trace_kv_cache_enabled: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QwenTokenizerSource<'a> {
+    Flm(&'a Path),
+    TokenizerJson(&'a Path),
 }
 
 pub(crate) fn load_qwen35_startup(cli: &Cli) -> Result<Qwen35Startup> {
@@ -31,9 +38,7 @@ pub(crate) fn load_qwen35_startup(cli: &Cli) -> Result<Qwen35Startup> {
         text_config.head_dim,
     );
 
-    let tokenizer_path = tokenizer_json_path(cli)?;
-    let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
-        .map_err(|e| anyhow::anyhow!("load tokenizer: {e}"))?;
+    let tokenizer = load_qwen_tokenizer(cli)?;
     let encoding = tokenizer
         .encode(cli.prompt.as_str(), !cli.prompt_no_special_tokens)
         .map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
@@ -80,14 +85,38 @@ fn load_flm_qwen35_config(path: &Path, int4_runtime: bool) -> Result<qwen35::con
         .map_err(|e| anyhow::anyhow!("loading FLM Qwen config: {e}"))
 }
 
-fn tokenizer_json_path(cli: &Cli) -> Result<std::path::PathBuf> {
-    if is_flm_model_path(&cli.model_dir) {
-        anyhow::bail!(
-            "FLM tokenizer loading is not wired yet for --model-dir {}; use --flm-file with a model directory containing tokenizer.json until FLM tokenizer assets are wired",
-            cli.model_dir.display()
-        );
+pub(crate) fn qwen_tokenizer_source(cli: &Cli) -> QwenTokenizerSource<'_> {
+    if let Some(path) = flm_config_path(cli) {
+        QwenTokenizerSource::Flm(path)
+    } else {
+        QwenTokenizerSource::TokenizerJson(&cli.model_dir)
     }
-    Ok(cli.model_dir.join("tokenizer.json"))
+}
+
+fn load_qwen_tokenizer(cli: &Cli) -> Result<tokenizers::Tokenizer> {
+    match qwen_tokenizer_source(cli) {
+        QwenTokenizerSource::Flm(path) => {
+            eprintln!(
+                "[tokenizer] loading FLM tokenizer assets at {}",
+                path.display()
+            );
+            let source = FlmModelSource::open(path, cli.int4)
+                .map_err(|e| anyhow::anyhow!("opening FLM tokenizer source: {e}"))?;
+            let runtime = source.store.flm_runtime().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "FLM {} has no runtime directory for tokenizer",
+                    path.display()
+                )
+            })?;
+            load_qwen_bpe_from_flm(runtime)
+                .map_err(|e| anyhow::anyhow!("loading FLM Qwen tokenizer: {e}"))
+        }
+        QwenTokenizerSource::TokenizerJson(model_dir) => {
+            let tokenizer_path = model_dir.join("tokenizer.json");
+            tokenizers::Tokenizer::from_file(&tokenizer_path)
+                .map_err(|e| anyhow::anyhow!("load tokenizer: {e}"))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -96,7 +125,9 @@ mod tests {
 
     use clap::Parser;
 
-    use super::{flm_config_path, tokenizer_json_path, validate_qwen35_startup};
+    use super::{
+        flm_config_path, qwen_tokenizer_source, validate_qwen35_startup, QwenTokenizerSource,
+    };
     use crate::registry::{Backend, GpuArch, ModelVariant, Qwen35KernelParams};
     use crate::Cli;
 
@@ -131,14 +162,19 @@ mod tests {
     }
 
     #[test]
-    fn flm_model_dir_rejects_tokenizer_json_path_until_tokenizer_assets_are_wired() {
-        let cli = cli("/tmp/model.flm", &[]);
+    fn effective_flm_source_selects_flm_native_tokenizer_without_tokenizer_json() {
+        let flm_model_cli = cli("/tmp/model.flm", &[]);
 
-        let err = tokenizer_json_path(&cli).unwrap_err().to_string();
+        assert_eq!(
+            qwen_tokenizer_source(&flm_model_cli),
+            QwenTokenizerSource::Flm(Path::new("/tmp/model.flm"))
+        );
 
-        assert!(err.contains("tokenizer"), "{err}");
-        assert!(err.contains("FLM"), "{err}");
-        assert!(err.contains("not wired"), "{err}");
+        let flm_file_cli = cli("/tmp/model-dir", &["--flm-file", "/tmp/model.flm"]);
+        assert_eq!(
+            qwen_tokenizer_source(&flm_file_cli),
+            QwenTokenizerSource::Flm(Path::new("/tmp/model.flm"))
+        );
     }
 
     #[test]

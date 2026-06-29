@@ -7,6 +7,7 @@ mod cli;
 mod decode_engine;
 mod dflash_ddtree;
 mod flm_model_source;
+mod flm_tokenizer;
 mod gemma4_engine;
 mod gemma4_int4_engine;
 mod gemma4_runtime;
