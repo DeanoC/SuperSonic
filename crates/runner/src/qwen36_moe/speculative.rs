@@ -55,7 +55,7 @@
 //!   check confirms our drafts match `vllm.spec_decode.eagle.propose`.
 #![allow(dead_code)]
 
-pub(crate) use supersonic_runtime::qwen36_moe::speculative::SpeculativeStepResult;
+pub use supersonic_runtime::qwen36_moe::speculative::SpeculativeStepResult;
 #[cfg(test)]
 use supersonic_runtime::qwen36_moe::speculative::{
     accept_prefix_greedy, accept_prefix_greedy_partial,
