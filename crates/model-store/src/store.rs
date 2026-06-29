@@ -46,6 +46,8 @@ struct FlmSuperblock {
     metadata_len: usize,
     shard_table_offset: usize,
     shard_count: usize,
+    runtime_dir_offset: usize,
+    runtime_dir_len: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -61,6 +63,7 @@ pub struct BakedStore {
     data_len: usize,
     index: HashMap<String, TensorMeta>,
     synthetic: HashMap<String, Vec<u8>>,
+    runtime: Option<crate::flm::FlmRuntimeDirectory>,
 }
 
 // Safety: the mmap is immutable and lives as long as BakedStore.
@@ -144,6 +147,14 @@ fn flm_parse_superblock(buf: &[u8]) -> Result<FlmSuperblock, Error> {
         "FLM shard_table_offset",
     )?;
     let shard_count = read_u32(sb, 96, "FLM shard_count")? as usize;
+    let runtime_dir_offset = u64_to_usize(
+        read_u64(sb, 168, "FLM runtime_dir_offset")?,
+        "FLM runtime_dir_offset",
+    )?;
+    let runtime_dir_len = u64_to_usize(
+        read_u64(sb, 176, "FLM runtime_dir_len")?,
+        "FLM runtime_dir_len",
+    )?;
 
     let expected_index_len = tensor_count
         .checked_mul(FLM_INDEX_RECORD_SIZE)
@@ -162,6 +173,8 @@ fn flm_parse_superblock(buf: &[u8]) -> Result<FlmSuperblock, Error> {
         metadata_len,
         shard_table_offset,
         shard_count,
+        runtime_dir_offset,
+        runtime_dir_len,
     })
 }
 
@@ -406,6 +419,7 @@ impl BakedStore {
             data_len,
             index,
             synthetic: HashMap::new(),
+            runtime: None,
         })
     }
 
@@ -428,12 +442,30 @@ impl BakedStore {
         if options.compressed_tensors_int4_aliases {
             add_compressed_tensors_int4_aliases(&mut index, &mut synthetic);
         }
+        let runtime = match (sb.runtime_dir_offset, sb.runtime_dir_len) {
+            (0, 0) => None,
+            (0, len) => {
+                return Err(Error::Other(format!(
+                    "FLM runtime directory length is {len} but offset is zero"
+                )));
+            }
+            (offset, 0) => {
+                return Err(Error::Other(format!(
+                    "FLM runtime directory offset is {offset} but length is zero"
+                )));
+            }
+            (offset, len) => {
+                let runtime = read_exact_range(&mmap, offset, len, "FLM runtime directory")?;
+                Some(crate::flm::FlmRuntimeDirectory::parse(runtime)?)
+            }
+        };
         Ok(Self {
             _mmap: mmap,
             data,
             data_len,
             index,
             synthetic,
+            runtime,
         })
     }
 
@@ -453,6 +485,10 @@ impl BakedStore {
 
     pub fn layout(&self, name: &str) -> Option<&LayoutTag> {
         self.index.get(name).map(|m| &m.layout)
+    }
+
+    pub fn flm_runtime(&self) -> Option<&crate::flm::FlmRuntimeDirectory> {
+        self.runtime.as_ref()
     }
 
     fn tensor_bytes(&self, name: &str, meta: &TensorMeta) -> Result<&[u8], Error> {
@@ -782,6 +818,7 @@ mod tests {
 
         let store = BakedStore::open_flm(file.path()).expect("open FLM");
 
+        assert!(store.flm_runtime().is_none());
         assert!(store.contains("model.embed_tokens.weight"));
         let meta = store.meta("model.embed_tokens.weight").unwrap();
         assert_eq!(meta.shape, vec![2, 4]);
