@@ -43,7 +43,8 @@ use runner::qwen36_moe_mtp::{
     run_mtp_layer_step,
 };
 use runner::qwen36_moe_speculative::{
-    run_speculative_decode_step, run_speculative_decode_step_batched, SpeculativeStepResult,
+    accept_prefix_greedy, accept_prefix_greedy_partial, run_speculative_decode_step,
+    run_speculative_decode_step_batched, AcceptPrefixOutcome, SpeculativeStepResult,
 };
 use runner::qwen36_moe_types::{FullAttnKvCache, MtpLayerBuffers, MultiLayerGeom, PositionPair};
 use safetensors::SafeTensors;
@@ -70,6 +71,18 @@ fn bf16_bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
             f32::from_bits(bits << 16)
         })
         .collect()
+}
+
+#[test]
+fn runner_speculative_accept_prefix_helpers_remain_public() {
+    let outcome: AcceptPrefixOutcome = accept_prefix_greedy(&[11, 12, 13], &[11, 12, 99, 100]);
+    assert_eq!(outcome.accepted_drafts, vec![11, 12]);
+    assert_eq!(outcome.corrected_token, 99);
+    assert_eq!(outcome.emitted(), vec![11, 12, 99]);
+
+    let partial = accept_prefix_greedy_partial(&[21, 22, 23], &[21, 20]);
+    assert_eq!(partial.accepted_drafts, vec![21]);
+    assert_eq!(partial.corrected_token, 20);
 }
 
 /// Inline sharded-safetensors loader. Mirrors `UnbakedLoader` in

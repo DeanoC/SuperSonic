@@ -56,9 +56,9 @@
 #![allow(dead_code)]
 
 pub use supersonic_runtime::qwen36_moe::speculative::SpeculativeStepResult;
-#[cfg(test)]
-use supersonic_runtime::qwen36_moe::speculative::{
-    accept_prefix_greedy, accept_prefix_greedy_partial,
+#[allow(unused_imports)]
+pub use supersonic_runtime::qwen36_moe::speculative::{
+    accept_prefix_greedy, accept_prefix_greedy_partial, AcceptPrefixOutcome,
 };
 
 // ============================================================================
