@@ -1,7 +1,10 @@
 use std::collections::HashSet;
 
 use anyhow::{anyhow, bail, Context, Result};
-use model_store::flm::TOKENIZER_QWEN_BPE_V1;
+use model_store::flm::{
+    ASSET_TOKENIZER_ADDED_TOKENS, ASSET_TOKENIZER_MERGES, ASSET_TOKENIZER_REGEX,
+    ASSET_TOKENIZER_VOCAB, TOKENIZER_QWEN_BPE_V1,
+};
 use tokenizers::models::bpe::{Vocab, BPE};
 use tokenizers::normalizers::unicode::NFC;
 use tokenizers::pre_tokenizers::byte_level::ByteLevel;
@@ -66,10 +69,30 @@ pub fn load_qwen_bpe_from_flm(
     let descriptor = runtime
         .tokenizer()
         .ok_or_else(|| anyhow!("FLM runtime has no tokenizer descriptor"))?;
-    let vocab = asset_payload(runtime, descriptor.vocab_asset_id, VOCAB_KIND)?;
-    let merges = asset_payload(runtime, descriptor.merges_asset_id, MERGES_KIND)?;
-    let added_tokens = asset_payload(runtime, descriptor.added_tokens_asset_id, ADDED_TOKENS_KIND)?;
-    let regex = asset_payload(runtime, descriptor.regex_asset_id, REGEX_KIND)?;
+    let vocab = asset_payload(
+        runtime,
+        descriptor.vocab_asset_id,
+        ASSET_TOKENIZER_VOCAB,
+        "tokenizer_vocab",
+    )?;
+    let merges = asset_payload(
+        runtime,
+        descriptor.merges_asset_id,
+        ASSET_TOKENIZER_MERGES,
+        "tokenizer_merges",
+    )?;
+    let added_tokens = asset_payload(
+        runtime,
+        descriptor.added_tokens_asset_id,
+        ASSET_TOKENIZER_ADDED_TOKENS,
+        "tokenizer_added_tokens",
+    )?;
+    let regex = asset_payload(
+        runtime,
+        descriptor.regex_asset_id,
+        ASSET_TOKENIZER_REGEX,
+        "tokenizer_regex",
+    )?;
 
     let assets = QwenBpeAssets::parse(
         descriptor.algorithm_id,
@@ -85,15 +108,16 @@ pub fn load_qwen_bpe_from_flm(
 fn asset_payload<'a>(
     runtime: &'a model_store::FlmRuntimeDirectory,
     asset_id: u32,
-    expected_kind: &str,
+    expected_kind_id: u16,
+    expected_kind_name: &str,
 ) -> Result<&'a [u8]> {
     let asset = runtime
         .asset(asset_id)
-        .ok_or_else(|| anyhow!("FLM tokenizer missing {expected_kind} asset id {asset_id}"))?;
-    if asset.kind != expected_kind {
+        .ok_or_else(|| anyhow!("FLM tokenizer {expected_kind_name} asset {asset_id} missing"))?;
+    if asset.kind_id != expected_kind_id {
         bail!(
-            "FLM tokenizer asset id {asset_id} has kind {}; expected {expected_kind}",
-            asset.kind
+            "FLM tokenizer asset id {asset_id} has kind_id {}; expected {expected_kind_name} ({expected_kind_id})",
+            asset.kind_id
         );
     }
     Ok(&asset.payload)

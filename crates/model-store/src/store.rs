@@ -452,27 +452,111 @@ fn bf16_eight_bytes(len: usize) -> Vec<u8> {
     bytes
 }
 
-fn add_compressed_tensors_int4_aliases(
-    index: &mut HashMap<String, TensorMeta>,
-    synthetic: &mut HashMap<String, Vec<u8>>,
-) {
-    let snapshot: Vec<(String, TensorMeta)> = index
+fn manifest_row_shape(row: &crate::flm::FlmTensorManifestRow) -> Vec<usize> {
+    row.shape[..row.rank as usize]
         .iter()
-        .map(|(name, meta)| (name.clone(), meta.clone()))
-        .collect();
-    for (packed_name, packed_meta) in snapshot {
-        let Some(base) = packed_name.strip_suffix(".weight_packed") else {
-            continue;
-        };
-        if packed_meta.dtype != "u32" || packed_meta.shape.len() != 2 {
+        .map(|&dim| dim as usize)
+        .collect()
+}
+
+fn validate_flm_manifest_against_index(
+    runtime: &crate::flm::FlmRuntimeDirectory,
+    index: &HashMap<String, TensorMeta>,
+) -> Result<(), Error> {
+    for row in &runtime.tensor_manifest().rows {
+        if row.flags & crate::flm::MANIFEST_FLAG_DERIVED_ALIAS != 0 {
             continue;
         }
-        let scale_name = format!("{base}.weight_scale");
-        let Some(scale_meta) = index.get(&scale_name).cloned() else {
+        let Some(meta) = index.get(&row.name) else {
+            if row.flags & crate::flm::MANIFEST_FLAG_REQUIRED != 0 {
+                return Err(Error::Other(format!(
+                    "FLM manifest required tensor {} missing from index",
+                    row.name
+                )));
+            }
             continue;
         };
-        if scale_meta.dtype != "bf16" || scale_meta.shape.len() != 2 {
+        if meta.shape != manifest_row_shape(row) {
+            return Err(Error::Other(format!(
+                "FLM manifest shape mismatch for {}",
+                row.name
+            )));
+        }
+        if flm_dtype_name(row.dtype)? != meta.dtype {
+            return Err(Error::Other(format!(
+                "FLM manifest dtype mismatch for {}",
+                row.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct ManifestInt4Group<'a> {
+    packed: Option<&'a crate::flm::FlmTensorManifestRow>,
+    scale: Option<&'a crate::flm::FlmTensorManifestRow>,
+    required: bool,
+}
+
+fn add_manifest_int4_aliases(
+    runtime: &crate::flm::FlmRuntimeDirectory,
+    index: &mut HashMap<String, TensorMeta>,
+    synthetic: &mut HashMap<String, Vec<u8>>,
+) -> Result<(), Error> {
+    let mut groups: HashMap<u32, ManifestInt4Group<'_>> = HashMap::new();
+    for row in &runtime.tensor_manifest().rows {
+        if row.group_id == 0 {
             continue;
+        }
+        let group = groups.entry(row.group_id).or_default();
+        group.required |= row.flags & crate::flm::MANIFEST_FLAG_REQUIRED != 0;
+        match row.companion_kind {
+            crate::flm::MANIFEST_COMPANION_PACKED => group.packed = Some(row),
+            crate::flm::MANIFEST_COMPANION_SCALE => group.scale = Some(row),
+            _ => {}
+        }
+    }
+
+    for (group_id, group) in groups {
+        let (Some(packed_row), Some(scale_row)) = (group.packed, group.scale) else {
+            if group.required {
+                return Err(Error::Other(format!(
+                    "FLM manifest required INT4 group {group_id} missing packed or scale tensor"
+                )));
+            }
+            continue;
+        };
+
+        let Some(base) = packed_row.name.strip_suffix(".weight_packed") else {
+            return Err(Error::Other(format!(
+                "FLM manifest INT4 packed tensor {} does not end with .weight_packed",
+                packed_row.name
+            )));
+        };
+        let Some(packed_meta) = index.get(&packed_row.name).cloned() else {
+            if group.required {
+                return Err(Error::Other(format!(
+                    "FLM manifest required INT4 packed tensor {} missing from index",
+                    packed_row.name
+                )));
+            }
+            continue;
+        };
+        let Some(scale_meta) = index.get(&scale_row.name).cloned() else {
+            if group.required {
+                return Err(Error::Other(format!(
+                    "FLM manifest required INT4 scale tensor {} missing from index",
+                    scale_row.name
+                )));
+            }
+            continue;
+        };
+        if packed_meta.shape.len() != 2 {
+            return Err(Error::Other(format!(
+                "FLM manifest INT4 packed tensor {} shape must be rank 2",
+                packed_row.name
+            )));
         }
 
         let alias_weight = format!("{base}.weight");
@@ -514,6 +598,7 @@ fn add_compressed_tensors_int4_aliases(
             .entry(alias_zero)
             .or_insert_with(|| bf16_eight_bytes(scale_meta.byte_len as usize));
     }
+    Ok(())
 }
 
 impl BakedStore {
@@ -559,13 +644,6 @@ impl BakedStore {
         let strings = flm_read_string_table(&mmap, &sb)?;
         let shards = flm_read_shards(&mmap, &sb)?;
         let mut index = flm_build_index(&mmap, &sb, &strings, &shards)?;
-        if options.verify_block_hashes {
-            flm_verify_block_hashes(&mmap, &sb, &strings, &shards)?;
-        }
-        let mut synthetic = HashMap::new();
-        if options.compressed_tensors_int4_aliases {
-            add_compressed_tensors_int4_aliases(&mut index, &mut synthetic);
-        }
         let runtime = match (sb.runtime_dir_offset, sb.runtime_dir_len) {
             (0, 0) => None,
             (0, len) => {
@@ -583,6 +661,18 @@ impl BakedStore {
                 Some(crate::flm::FlmRuntimeDirectory::parse(runtime)?)
             }
         };
+        if options.verify_block_hashes {
+            flm_verify_block_hashes(&mmap, &sb, &strings, &shards)?;
+        }
+        if let Some(runtime) = runtime.as_ref() {
+            validate_flm_manifest_against_index(runtime, &index)?;
+        }
+        let mut synthetic = HashMap::new();
+        if options.compressed_tensors_int4_aliases {
+            if let Some(runtime) = runtime.as_ref() {
+                add_manifest_int4_aliases(runtime, &mut index, &mut synthetic)?;
+            }
+        }
         Ok(Self {
             _mmap: mmap,
             data,
@@ -958,111 +1048,204 @@ mod tests {
         buf.extend_from_slice(value.as_bytes());
     }
 
-    fn build_test_runtime_directory() -> Vec<u8> {
-        fn config_section() -> Vec<u8> {
-            let mut out = Vec::new();
-            for value in [
-                151_936u32, 5120, 27_648, 62, 40, 8, 128, 262_144, 128, 256, 256, 16, 32,
-            ] {
-                push_u32(&mut out, value);
-            }
-            push_f64(&mut out, 1e-6);
-            push_f64(&mut out, 10_000_000.0);
-            out.push(1);
-            out.push(0);
-            push_u32(&mut out, 1);
-            push_f64(&mut out, 0.25);
-            push_u32(&mut out, 151_645);
-            push_u32(&mut out, 1);
-            push_u32(&mut out, 3);
-            out
-        }
+    struct TestManifestRow {
+        name: &'static str,
+        role_id: u32,
+        group_id: u32,
+        companion_kind: u8,
+        rank: u8,
+        dtype: u16,
+        logical_dtype: u16,
+        codec_id: u8,
+        flags: u8,
+        shape: [u32; 4],
+    }
 
-        fn tokenizer_section() -> Vec<u8> {
-            let mut out = Vec::new();
-            for value in [
+    fn runtime_config_section() -> Vec<u8> {
+        let mut out = Vec::new();
+        for value in [
+            151_936u32, 5120, 27_648, 62, 40, 8, 128, 262_144, 128, 256, 256, 16, 32,
+        ] {
+            push_u32(&mut out, value);
+        }
+        push_f64(&mut out, 1e-6);
+        push_f64(&mut out, 10_000_000.0);
+        out.push(1);
+        out.push(0);
+        push_u32(&mut out, 2);
+        push_f64(&mut out, 0.25);
+        push_u32(&mut out, 151_645);
+        push_u32(&mut out, 151_643);
+        push_u32(&mut out, 3);
+        push_u32(&mut out, 3);
+        push_u32(&mut out, 7);
+        push_u32(&mut out, 11);
+        out
+    }
+
+    fn runtime_tokenizer_section() -> Vec<u8> {
+        let mut out = Vec::new();
+        for value in [
+            0u32,
+            crate::flm::TOKENIZER_QWEN_BPE_V1,
+            151_936,
+            1,
+            2,
+            3,
+            4,
+            0,
+        ] {
+            push_u32(&mut out, value);
+        }
+        out
+    }
+
+    fn runtime_codec_section() -> Vec<u8> {
+        let mut out = Vec::new();
+        push_u32(&mut out, 3);
+        for (codec_id, semantic_id, layout_id, decoder_id, flags) in [
+            (0u8, crate::flm::CODEC_RAW_BF16 as u8, 0u16, 0u16, 0u32),
+            (
+                1u8,
+                crate::flm::CODEC_SYM_INT4_G128_BF16 as u8,
+                0u16,
+                1u16,
                 0u32,
-                crate::flm::TOKENIZER_QWEN_BPE_V1,
-                151_936,
-                1,
-                2,
-                3,
-                4,
+            ),
+            (2u8, crate::flm::CODEC_RAW_I64 as u8, 0u16, 0u16, 0u32),
+        ] {
+            out.push(codec_id);
+            out.push(semantic_id);
+            push_u16(&mut out, layout_id);
+            push_u16(&mut out, decoder_id);
+            push_u32(&mut out, flags);
+        }
+        out
+    }
+
+    fn runtime_tensor_abi_section() -> Vec<u8> {
+        let mut out = Vec::new();
+        push_u32(&mut out, crate::flm::TENSOR_ABI_QWEN3_6_DENSE_CT_INT4_V1);
+        push_string(&mut out, "model.language_model");
+        push_string(&mut out, ".weight_packed");
+        push_string(&mut out, ".weight_scale");
+        push_string(&mut out, ".weight_shape");
+        out
+    }
+
+    fn runtime_asset_sections() -> (Vec<u8>, Vec<u8>) {
+        let assets = [
+            (
+                1u32,
+                crate::flm::ASSET_TOKENIZER_VOCAB,
+                crate::flm::ASSET_FLAG_REQUIRED_FOR_RUNTIME,
+                "tokenizer_vocab",
+                b"vocab".as_slice(),
+            ),
+            (
+                2u32,
+                crate::flm::ASSET_TOKENIZER_MERGES,
+                crate::flm::ASSET_FLAG_REQUIRED_FOR_RUNTIME,
+                "tokenizer_merges",
+                b"merges".as_slice(),
+            ),
+            (
+                3u32,
+                crate::flm::ASSET_TOKENIZER_ADDED_TOKENS,
                 0,
-            ] {
-                push_u32(&mut out, value);
+                "tokenizer_added_tokens",
+                b"[]".as_slice(),
+            ),
+            (
+                4u32,
+                crate::flm::ASSET_TOKENIZER_REGEX,
+                crate::flm::ASSET_FLAG_REQUIRED_FOR_RUNTIME,
+                "tokenizer_regex",
+                br#"\p{L}+"#.as_slice(),
+            ),
+        ];
+        let mut table = Vec::new();
+        let mut payloads = Vec::new();
+        push_u32(&mut table, assets.len() as u32);
+        for (asset_id, kind_id, flags, name, payload) in assets {
+            push_u32(&mut table, asset_id);
+            push_u32(&mut table, payloads.len() as u32);
+            push_u32(&mut table, payload.len() as u32);
+            push_u16(&mut table, kind_id);
+            push_u16(&mut table, flags);
+            push_u32(&mut table, name.len() as u32);
+            table.extend_from_slice(name.as_bytes());
+            payloads.extend_from_slice(payload);
+        }
+        (table, payloads)
+    }
+
+    fn runtime_model_descriptor_section() -> Vec<u8> {
+        let mut out = Vec::new();
+        push_u16(&mut out, 1);
+        push_u16(&mut out, crate::flm::MODEL_QWEN3_6_DENSE_V1);
+        push_u32(&mut out, 1);
+        push_u32(&mut out, 0);
+        push_u32(&mut out, crate::flm::TENSOR_ABI_QWEN3_6_DENSE_CT_INT4_V1);
+        push_u32(
+            &mut out,
+            crate::flm::QUANT_PROFILE_QWEN3_6_DENSE_CT_INT4_G128_BF16_V1,
+        );
+        push_u32(&mut out, 0);
+        out
+    }
+
+    fn runtime_tensor_manifest_section(rows: &[TestManifestRow]) -> Vec<u8> {
+        let mut string_pool = Vec::new();
+        let mut names = Vec::with_capacity(rows.len());
+        for row in rows {
+            let offset = string_pool.len() as u32;
+            string_pool.extend_from_slice(row.name.as_bytes());
+            names.push((offset, row.name.len() as u16));
+        }
+
+        let mut out = Vec::new();
+        push_u16(&mut out, 1);
+        push_u16(&mut out, 40);
+        push_u32(&mut out, rows.len() as u32);
+        push_u32(&mut out, string_pool.len() as u32);
+        for (row, (name_offset, name_len)) in rows.iter().zip(names) {
+            push_u32(&mut out, row.role_id);
+            push_u32(&mut out, row.group_id);
+            out.push(row.companion_kind);
+            out.push(row.rank);
+            push_u16(&mut out, row.dtype);
+            push_u16(&mut out, row.logical_dtype);
+            out.push(row.codec_id);
+            out.push(row.flags);
+            for dim in row.shape {
+                push_u32(&mut out, dim);
             }
-            out
+            push_u32(&mut out, name_offset);
+            push_u16(&mut out, name_len);
+            push_u16(&mut out, 0);
         }
+        out.extend_from_slice(&string_pool);
+        out
+    }
 
-        fn codec_section() -> Vec<u8> {
-            let mut out = Vec::new();
-            push_u32(&mut out, 3);
-            for (codec_id, semantic_id, layout_id, decoder_id, flags) in [
-                (0u8, crate::flm::CODEC_RAW_BF16 as u8, 0u16, 0u16, 0u32),
-                (
-                    1u8,
-                    crate::flm::CODEC_SYM_INT4_G128_BF16 as u8,
-                    0u16,
-                    1u16,
-                    0u32,
-                ),
-                (2u8, crate::flm::CODEC_RAW_I64 as u8, 0u16, 0u16, 0u32),
-            ] {
-                out.push(codec_id);
-                out.push(semantic_id);
-                push_u16(&mut out, layout_id);
-                push_u16(&mut out, decoder_id);
-                push_u32(&mut out, flags);
-            }
-            out
-        }
-
-        fn tensor_abi_section() -> Vec<u8> {
-            let mut out = Vec::new();
-            push_u32(&mut out, crate::flm::TENSOR_ABI_QWEN3_6_DENSE_CT_INT4_V1);
-            push_string(&mut out, "model.language_model");
-            push_string(&mut out, ".weight_packed");
-            push_string(&mut out, ".weight_scale");
-            push_string(&mut out, ".weight_shape");
-            out
-        }
-
-        fn asset_sections() -> (Vec<u8>, Vec<u8>) {
-            let assets = [
-                (1u32, "tokenizer_vocab", b"vocab".as_slice()),
-                (2u32, "tokenizer_merges", b"merges".as_slice()),
-                (3u32, "tokenizer_added_tokens", b"[]".as_slice()),
-                (4u32, "tokenizer_regex", br#"\p{L}+"#.as_slice()),
-            ];
-            let mut table = Vec::new();
-            let mut payloads = Vec::new();
-            push_u32(&mut table, assets.len() as u32);
-            for (asset_id, kind, payload) in assets {
-                push_u32(&mut table, asset_id);
-                push_u32(&mut table, payloads.len() as u32);
-                push_u32(&mut table, payload.len() as u32);
-                push_u32(&mut table, kind.len() as u32);
-                table.extend_from_slice(kind.as_bytes());
-                payloads.extend_from_slice(payload);
-            }
-            (table, payloads)
-        }
-
-        let (asset_table, asset_payloads) = asset_sections();
+    fn build_test_runtime_directory_with_manifest(rows: &[TestManifestRow]) -> Vec<u8> {
+        let (asset_table, asset_payloads) = runtime_asset_sections();
         let sections = [
-            (1u32, config_section()),
-            (2u32, tokenizer_section()),
-            (3u32, codec_section()),
-            (4u32, tensor_abi_section()),
+            (1u32, runtime_config_section()),
+            (2u32, runtime_tokenizer_section()),
+            (3u32, runtime_codec_section()),
+            (4u32, runtime_tensor_abi_section()),
             (5u32, asset_table),
             (6u32, asset_payloads),
+            (7u32, runtime_model_descriptor_section()),
+            (8u32, runtime_tensor_manifest_section(rows)),
         ];
         let header_len = 16 + sections.len() * 12;
         let mut offset = header_len as u32;
         let mut out = Vec::new();
         out.extend_from_slice(b"FLMRUN1\0");
-        push_u16(&mut out, 2);
+        push_u16(&mut out, 3);
         push_u16(&mut out, sections.len() as u16);
         push_u32(&mut out, crate::flm::ARCH_QWEN3_6_DENSE);
         for (section_id, data) in &sections {
@@ -1075,6 +1258,102 @@ mod tests {
             out.extend_from_slice(&data);
         }
         out
+    }
+
+    fn build_test_runtime_directory() -> Vec<u8> {
+        build_test_runtime_directory_with_manifest(&[])
+    }
+
+    fn append_runtime_directory(data: &mut Vec<u8>, runtime: &[u8]) {
+        let runtime_offset = data.len();
+        data.extend_from_slice(runtime);
+        put_u64(data, 168, runtime_offset as u64);
+        put_u64(data, 176, runtime.len() as u64);
+    }
+
+    fn build_test_flm_with_runtime_manifest_group() -> Vec<u8> {
+        let mut data = build_test_flm(&[
+            TestFlmTensor {
+                name: "model.language_model.layers.0.mlp.gate_proj.weight_packed",
+                shape: vec![128, 16],
+                dtype: FLM_DTYPE_INT32,
+                payload: vec![0; 128],
+            },
+            TestFlmTensor {
+                name: "model.language_model.layers.0.mlp.gate_proj.weight_scale",
+                shape: vec![128, 1],
+                dtype: FLM_DTYPE_BF16,
+                payload: vec![0; 256],
+            },
+            TestFlmTensor {
+                name: "model.language_model.layers.0.mlp.gate_proj.weight_shape",
+                shape: vec![2],
+                dtype: FLM_DTYPE_INT64,
+                payload: vec![0; 16],
+            },
+        ]);
+        let runtime = build_test_runtime_directory_with_manifest(&[
+            TestManifestRow {
+                name: "model.language_model.layers.0.mlp.gate_proj.weight_packed",
+                role_id: 1,
+                group_id: 7,
+                companion_kind: crate::flm::MANIFEST_COMPANION_PACKED,
+                rank: 2,
+                dtype: FLM_DTYPE_INT32,
+                logical_dtype: FLM_DTYPE_UINT8,
+                codec_id: 1,
+                flags: crate::flm::MANIFEST_FLAG_REQUIRED,
+                shape: [128, 16, 0, 0],
+            },
+            TestManifestRow {
+                name: "model.language_model.layers.0.mlp.gate_proj.weight_scale",
+                role_id: 1,
+                group_id: 7,
+                companion_kind: crate::flm::MANIFEST_COMPANION_SCALE,
+                rank: 2,
+                dtype: FLM_DTYPE_BF16,
+                logical_dtype: FLM_DTYPE_BF16,
+                codec_id: 0,
+                flags: crate::flm::MANIFEST_FLAG_REQUIRED,
+                shape: [128, 1, 0, 0],
+            },
+            TestManifestRow {
+                name: "model.language_model.layers.0.mlp.gate_proj.weight_shape",
+                role_id: 1,
+                group_id: 7,
+                companion_kind: crate::flm::MANIFEST_COMPANION_SHAPE,
+                rank: 1,
+                dtype: FLM_DTYPE_INT64,
+                logical_dtype: FLM_DTYPE_INT64,
+                codec_id: 2,
+                flags: crate::flm::MANIFEST_FLAG_REQUIRED,
+                shape: [2, 0, 0, 0],
+            },
+        ]);
+        append_runtime_directory(&mut data, &runtime);
+        data
+    }
+
+    fn corrupt_first_manifest_shape(data: &mut [u8], value: u32) {
+        let runtime_offset =
+            read_u64(data, 168, "test FLM runtime offset").expect("runtime offset") as usize;
+        let runtime = &data[runtime_offset..];
+        let section_count =
+            read_u16(runtime, 10, "test FLM section count").expect("section count") as usize;
+        let mut manifest_offset = None;
+        for idx in 0..section_count {
+            let record = 16 + idx * 12;
+            let section_id = read_u32(runtime, record, "test FLM section id").expect("section id");
+            if section_id == 8 {
+                manifest_offset = Some(
+                    read_u32(runtime, record + 4, "test FLM manifest offset")
+                        .expect("manifest offset") as usize,
+                );
+                break;
+            }
+        }
+        let shape_offset = runtime_offset + manifest_offset.expect("manifest section") + 12 + 16;
+        put_u32(data, shape_offset, value);
     }
 
     fn write_temp_flm(data: &[u8]) -> tempfile::NamedTempFile {
@@ -1240,29 +1519,82 @@ mod tests {
     }
 
     #[test]
-    fn open_flm_can_synthesize_compressed_tensors_int4_aliases() {
-        let packed = vec![0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe];
-        let scale = vec![0x00, 0x3f, 0x00, 0x40];
-        let data = build_test_flm(&[
+    fn open_flm_builds_int4_aliases_from_manifest_groups() {
+        let data = build_test_flm_with_runtime_manifest_group();
+        let file = write_temp_flm(&data);
+        let store = BakedStore::open_flm_with_options(
+            file.path(),
+            FlmLoadOptions {
+                compressed_tensors_int4_aliases: true,
+                verify_block_hashes: false,
+            },
+        )
+        .expect("open FLM with manifest aliases");
+
+        let alias = store
+            .meta("model.language_model.layers.0.mlp.gate_proj.weight")
+            .expect("native alias");
+        assert_eq!(alias.layout, LayoutTag::Int4Quantized);
+        assert_eq!(alias.dtype, "u8");
+        assert_eq!(alias.shape, vec![128, 64]);
+    }
+
+    #[test]
+    fn open_flm_rejects_required_manifest_shape_mismatch() {
+        let mut data = build_test_flm_with_runtime_manifest_group();
+        corrupt_first_manifest_shape(&mut data, 999);
+        let file = write_temp_flm(&data);
+        let err = match BakedStore::open_flm_with_options(
+            file.path(),
+            FlmLoadOptions {
+                compressed_tensors_int4_aliases: true,
+                verify_block_hashes: false,
+            },
+        ) {
+            Ok(_) => panic!("manifest mismatch should fail"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("manifest"));
+    }
+
+    #[test]
+    fn open_flm_does_not_alias_suffix_tensors_absent_from_manifest_group() {
+        let mut data = build_test_flm(&[
             TestFlmTensor {
-                name: "model.layers.0.mlp.gate_proj.weight_packed",
-                shape: vec![2, 1],
-                dtype: 5,
-                payload: packed.clone(),
+                name: "model.language_model.layers.0.mlp.gate_proj.weight_packed",
+                shape: vec![128, 16],
+                dtype: FLM_DTYPE_INT32,
+                payload: vec![0; 128],
             },
             TestFlmTensor {
-                name: "model.layers.0.mlp.gate_proj.weight_scale",
-                shape: vec![2, 1],
-                dtype: 2,
-                payload: scale.clone(),
-            },
-            TestFlmTensor {
-                name: "model.layers.0.mlp.gate_proj.weight_shape",
-                shape: vec![2],
-                dtype: 6,
-                payload: vec![2, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0],
+                name: "model.language_model.layers.0.mlp.gate_proj.weight_scale",
+                shape: vec![128, 1],
+                dtype: FLM_DTYPE_BF16,
+                payload: vec![0; 256],
             },
         ]);
+        let runtime = build_test_runtime_directory();
+        append_runtime_directory(&mut data, &runtime);
+        let file = write_temp_flm(&data);
+
+        let store = BakedStore::open_flm_with_options(
+            file.path(),
+            FlmLoadOptions {
+                compressed_tensors_int4_aliases: true,
+                verify_block_hashes: false,
+            },
+        )
+        .expect("open FLM with empty manifest");
+
+        assert!(store
+            .meta("model.language_model.layers.0.mlp.gate_proj.weight")
+            .is_none());
+    }
+
+    #[test]
+    fn open_flm_can_synthesize_compressed_tensors_int4_aliases() {
+        let data = build_test_flm_with_runtime_manifest_group();
         let file = write_temp_flm(&data);
 
         let store = BakedStore::open_flm_with_options(
@@ -1275,28 +1607,28 @@ mod tests {
         .expect("open FLM with CT aliases");
 
         let weight = store
-            .meta("model.layers.0.mlp.gate_proj.weight")
+            .meta("model.language_model.layers.0.mlp.gate_proj.weight")
             .expect("aliased weight");
         assert_eq!(weight.dtype, "u8");
-        assert_eq!(weight.shape, vec![2, 4]);
+        assert_eq!(weight.shape, vec![128, 64]);
         assert_eq!(weight.layout, LayoutTag::Int4Quantized);
         assert_eq!(
             store
-                .raw_bytes("model.layers.0.mlp.gate_proj.weight")
+                .raw_bytes("model.language_model.layers.0.mlp.gate_proj.weight")
                 .unwrap(),
-            packed.as_slice()
+            &[0; 128]
         );
         assert_eq!(
             store
-                .raw_bytes("model.layers.0.mlp.gate_proj.weight_int4_scale")
+                .raw_bytes("model.language_model.layers.0.mlp.gate_proj.weight_int4_scale")
                 .unwrap(),
-            scale.as_slice()
+            &[0; 256]
         );
         assert_eq!(
             store
-                .raw_bytes("model.layers.0.mlp.gate_proj.weight_int4_zero")
+                .raw_bytes("model.language_model.layers.0.mlp.gate_proj.weight_int4_zero")
                 .unwrap(),
-            &[0x00, 0x41, 0x00, 0x41]
+            vec![0x00, 0x41].repeat(128).as_slice()
         );
     }
 
