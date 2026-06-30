@@ -2329,6 +2329,46 @@ mod tests {
     }
 
     #[test]
+    fn flm_qwen36_27b_direct_views_upload_to_hip() {
+        let Ok(flm_path_str) = std::env::var("SUPERSONIC_QWEN36_27B_FLM_HIP_UPLOAD") else {
+            eprintln!(
+                "skip: SUPERSONIC_QWEN36_27B_FLM_HIP_UPLOAD not set. Point it at an FLM \
+                 file like qwen36-27b-int4.flm to validate HIP uploads."
+            );
+            return;
+        };
+        gpu_hal::set_backend(gpu_hal::Backend::Hip);
+        let store = BakedStore::open_flm_with_options(
+            Path::new(&flm_path_str),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                verify_block_hashes: false,
+            },
+        )
+        .expect("open qwen3.6-27b FLM");
+
+        let weight = store
+            .load_to_gpu(
+                "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
+                0,
+            )
+            .expect("upload INT4 logical alias with direct view");
+        assert_eq!(weight.dtype(), ScalarType::U8);
+        assert_eq!(weight.shape(), &[10240, 2560]);
+
+        let scale = store
+            .load_to_gpu(
+                "model.language_model.layers.0.linear_attn.in_proj_qkv.weight_int4_scale",
+                0,
+            )
+            .expect("upload INT4 scale alias with direct view");
+        assert_eq!(scale.dtype(), ScalarType::BF16);
+        assert_eq!(scale.shape(), &[10240, 40]);
+
+        eprintln!("[flm-upload] OK — FLM direct views uploaded to HIP");
+    }
+
+    #[test]
     fn virtual_arena_loads_baked_weight_and_expert_tensors() {
         gpu_hal::set_backend(gpu_hal::Backend::Hip);
         if !gpu_hal::vmm_is_supported(gpu_hal::Backend::Hip, 0) {
