@@ -26,9 +26,30 @@ pub const MANIFEST_COMPANION_SYNTHETIC_ZERO: u8 = 4;
 pub const MANIFEST_FLAG_REQUIRED: u8 = 1 << 0;
 pub const MANIFEST_FLAG_OPTIONAL: u8 = 1 << 1;
 pub const MANIFEST_FLAG_DERIVED_ALIAS: u8 = 1 << 3;
+pub const STORAGE_ROLE_VALUE: u16 = 0;
+pub const STORAGE_ROLE_PACKED: u16 = 1;
+pub const STORAGE_ROLE_SCALE: u16 = 2;
+pub const STORAGE_ROLE_ZERO: u16 = 3;
+pub const STORAGE_ROLE_SHAPE: u16 = 4;
+pub const STORAGE_ABI_KIND_GROUP_QUANT: u16 = 1;
+pub const STORAGE_ABI_ID_NONE: u16 = 0;
+pub const LAYOUT_ID_DEFAULT: u16 = 0;
+pub const QUANT_FLAG_SYMMETRIC: u16 = 1 << 0;
+pub const LOGICAL_TENSOR_ROLE_WEIGHT: u16 = 1;
+pub const LOGICAL_TENSOR_ROLE_QUANTIZED_WEIGHT: u16 = 2;
+pub const LOGICAL_TENSOR_FLAG_REQUIRED: u16 = 1 << 0;
+pub const STORAGE_BINDING_FLAG_REQUIRED: u16 = 1 << 0;
+pub const VALUE_FORMAT_SYM_INT4: u16 = 2;
+pub const CONSUME_STRATEGY_DIRECT: u16 = 1;
+pub const PLAN_STREAM_DEFAULT: u16 = 0;
+pub const PLAN_PRIORITY_DEFAULT: u16 = 0;
+pub const PLAN_STEP_FLAG_NONE: u32 = 0;
+pub const FLM_DTYPE_BF16: u16 = 2;
+pub const FLM_DTYPE_INT32: u16 = 5;
+pub const FLM_DTYPE_INT64: u16 = 6;
 
 const RUNTIME_MAGIC: &[u8; 8] = b"FLMRUN1\0";
-const RUNTIME_VERSION: u16 = 3;
+const RUNTIME_VERSION: u16 = 4;
 const SECTION_CONFIG_QWEN36_DENSE: u32 = 1;
 const SECTION_TOKENIZER: u32 = 2;
 const SECTION_CODEC_TABLE: u32 = 3;
@@ -37,6 +58,10 @@ const SECTION_ASSET_TABLE: u32 = 5;
 const SECTION_ASSET_PAYLOADS: u32 = 6;
 const SECTION_MODEL_DESCRIPTOR: u32 = 7;
 const SECTION_TENSOR_MANIFEST: u32 = 8;
+const SECTION_STORAGE_ABI_TABLE: u32 = 9;
+const SECTION_LOGICAL_TENSOR_TABLE: u32 = 10;
+const SECTION_STORAGE_BINDING_TABLE: u32 = 11;
+const SECTION_PLAN_STEP_TABLE: u32 = 12;
 const SECTION_RECORD_SIZE: usize = 12;
 const HEADER_PREFIX_SIZE: usize = 16;
 const CONFIG_FIXED_SIZE: usize = 13 * 4 + 2 * 8 + 2 + 4;
@@ -45,6 +70,14 @@ const CODEC_RECORD_SIZE: usize = 10;
 const MODEL_DESCRIPTOR_SIZE: usize = 24;
 const TENSOR_MANIFEST_HEADER_SIZE: usize = 12;
 const TENSOR_MANIFEST_ROW_SIZE: usize = 40;
+const STORAGE_ABI_HEADER_SIZE: usize = 12;
+const STORAGE_ABI_ROW_SIZE: usize = 21;
+const LOGICAL_TENSOR_HEADER_SIZE: usize = 12;
+const LOGICAL_TENSOR_ROW_SIZE: usize = 44;
+const STORAGE_BINDING_HEADER_SIZE: usize = 12;
+const STORAGE_BINDING_ROW_SIZE: usize = 20;
+const PLAN_STEP_HEADER_SIZE: usize = 8;
+const PLAN_STEP_ROW_SIZE: usize = 16;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FlmQwen36DenseConfig {
@@ -139,6 +172,52 @@ pub struct FlmTensorManifest {
     pub rows: Vec<FlmTensorManifestRow>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct FlmStorageAbi {
+    pub storage_abi_id: u16,
+    pub abi_kind_id: u16,
+    pub codec_semantic_id: u16,
+    pub layout_id: u16,
+    pub bits: u8,
+    pub group_size: u16,
+    pub quant_flags: u16,
+    pub params: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FlmLogicalTensor {
+    pub tensor_id: u32,
+    pub name: String,
+    pub role_id: u16,
+    pub rank: u8,
+    pub shape: [u32; 4],
+    pub value_format_id: u16,
+    pub reconstruction_dtype: u16,
+    pub storage_binding_start: u32,
+    pub storage_binding_count: u16,
+    pub flags: u16,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FlmStorageBinding {
+    pub logical_tensor_id: u32,
+    pub storage_role: u16,
+    pub tensor_name: String,
+    pub storage_dtype: u16,
+    pub storage_abi_id: u16,
+    pub flags: u16,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FlmPlanStep {
+    pub logical_tensor_id: u32,
+    pub consume_strategy: u16,
+    pub target_layout_id: u16,
+    pub stream_id: u16,
+    pub priority: u16,
+    pub flags: u32,
+}
+
 #[derive(Debug, Clone)]
 pub struct FlmRuntimeDirectory {
     pub architecture_id: u32,
@@ -149,6 +228,10 @@ pub struct FlmRuntimeDirectory {
     tensor_abi: FlmTensorAbiDescriptor,
     model_descriptor: FlmModelDescriptor,
     tensor_manifest: FlmTensorManifest,
+    storage_abis: Vec<FlmStorageAbi>,
+    logical_tensors: Vec<FlmLogicalTensor>,
+    storage_bindings: Vec<FlmStorageBinding>,
+    plan_steps: Vec<FlmPlanStep>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -173,6 +256,34 @@ impl FlmRuntimeDirectory {
         )?;
         let tensor_manifest =
             parse_tensor_manifest(section(buf, &sections, SECTION_TENSOR_MANIFEST)?)?;
+        let stage3_ids = [
+            SECTION_STORAGE_ABI_TABLE,
+            SECTION_LOGICAL_TENSOR_TABLE,
+            SECTION_STORAGE_BINDING_TABLE,
+            SECTION_PLAN_STEP_TABLE,
+        ];
+        let has_stage3 = stage3_ids
+            .iter()
+            .any(|section_id| sections.contains_key(section_id));
+        if has_stage3
+            && !stage3_ids
+                .iter()
+                .all(|section_id| sections.contains_key(section_id))
+        {
+            return Err(Error::Other(
+                "FLM runtime has incomplete Stage 3 storage tables".to_string(),
+            ));
+        }
+        let (storage_abis, logical_tensors, storage_bindings, plan_steps) = if has_stage3 {
+            (
+                parse_storage_abis(section(buf, &sections, SECTION_STORAGE_ABI_TABLE)?)?,
+                parse_logical_tensors(section(buf, &sections, SECTION_LOGICAL_TENSOR_TABLE)?)?,
+                parse_storage_bindings(section(buf, &sections, SECTION_STORAGE_BINDING_TABLE)?)?,
+                parse_plan_steps(section(buf, &sections, SECTION_PLAN_STEP_TABLE)?)?,
+            )
+        } else {
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+        };
 
         Ok(Self {
             architecture_id,
@@ -183,6 +294,10 @@ impl FlmRuntimeDirectory {
             tensor_abi,
             model_descriptor,
             tensor_manifest,
+            storage_abis,
+            logical_tensors,
+            storage_bindings,
+            plan_steps,
         })
     }
 
@@ -227,6 +342,22 @@ impl FlmRuntimeDirectory {
     pub fn tensor_manifest(&self) -> &FlmTensorManifest {
         &self.tensor_manifest
     }
+
+    pub fn storage_abis(&self) -> &[FlmStorageAbi] {
+        &self.storage_abis
+    }
+
+    pub fn logical_tensors(&self) -> &[FlmLogicalTensor] {
+        &self.logical_tensors
+    }
+
+    pub fn storage_bindings(&self) -> &[FlmStorageBinding] {
+        &self.storage_bindings
+    }
+
+    pub fn plan_steps(&self) -> &[FlmPlanStep] {
+        &self.plan_steps
+    }
 }
 
 fn parse_section_table(buf: &[u8]) -> Result<(u32, HashMap<u32, SectionRange>), Error> {
@@ -266,7 +397,7 @@ fn parse_section_table(buf: &[u8]) -> Result<(u32, HashMap<u32, SectionRange>), 
     for idx in 0..section_count {
         let off = HEADER_PREFIX_SIZE + idx * SECTION_RECORD_SIZE;
         let section_id = read_u32(buf, off, "FLM runtime section id")?;
-        if !(SECTION_CONFIG_QWEN36_DENSE..=SECTION_TENSOR_MANIFEST).contains(&section_id) {
+        if !(SECTION_CONFIG_QWEN36_DENSE..=SECTION_PLAN_STEP_TABLE).contains(&section_id) {
             return Err(Error::Other(format!(
                 "FLM runtime section {idx} has unknown id {section_id}"
             )));
@@ -801,6 +932,365 @@ fn parse_tensor_manifest(buf: &[u8]) -> Result<FlmTensorManifest, Error> {
     Ok(FlmTensorManifest { rows })
 }
 
+fn parse_storage_abis(buf: &[u8]) -> Result<Vec<FlmStorageAbi>, Error> {
+    read_exact_range(buf, 0, STORAGE_ABI_HEADER_SIZE, "FLM storage ABI header")?;
+    let version = read_u16(buf, 0, "FLM storage ABI version")?;
+    if version != 1 {
+        return Err(Error::Other(format!(
+            "unsupported FLM storage ABI table version {version}"
+        )));
+    }
+    let row_stride = read_u16(buf, 2, "FLM storage ABI row_stride")? as usize;
+    if row_stride != STORAGE_ABI_ROW_SIZE {
+        return Err(Error::Other(format!(
+            "FLM storage ABI row stride {row_stride}; expected {STORAGE_ABI_ROW_SIZE}"
+        )));
+    }
+    let row_count = u32_to_usize(read_u32(buf, 4, "FLM storage ABI row_count")?)?;
+    let params_len = u32_to_usize(read_u32(buf, 8, "FLM storage ABI params_len")?)?;
+    let rows_len = row_count
+        .checked_mul(row_stride)
+        .ok_or_else(|| Error::Other("FLM storage ABI row table length overflows".to_string()))?;
+    let params_offset = STORAGE_ABI_HEADER_SIZE
+        .checked_add(rows_len)
+        .ok_or_else(|| Error::Other("FLM storage ABI params offset overflows".to_string()))?;
+    let expected_len = params_offset
+        .checked_add(params_len)
+        .ok_or_else(|| Error::Other("FLM storage ABI length overflows".to_string()))?;
+    if buf.len() != expected_len {
+        return Err(Error::Other(format!(
+            "FLM storage ABI table has len {}; expected {expected_len}",
+            buf.len()
+        )));
+    }
+    let params = read_exact_range(buf, params_offset, params_len, "FLM storage ABI params")?;
+
+    let mut rows = Vec::with_capacity(row_count);
+    let mut seen_ids = HashSet::new();
+    for idx in 0..row_count {
+        let row_offset = STORAGE_ABI_HEADER_SIZE + idx * row_stride;
+        let row = read_exact_range(buf, row_offset, row_stride, "FLM storage ABI row")?;
+        let mut offset = 0usize;
+        let storage_abi_id = read_u16_advance(row, &mut offset, "FLM storage ABI id")?;
+        let abi_kind_id = read_u16_advance(row, &mut offset, "FLM storage ABI kind")?;
+        let codec_semantic_id =
+            read_u16_advance(row, &mut offset, "FLM storage ABI codec semantic id")?;
+        let layout_id = read_u16_advance(row, &mut offset, "FLM storage ABI layout id")?;
+        let bits = read_u8_advance(row, &mut offset, "FLM storage ABI bits")?;
+        let group_size = read_u16_advance(row, &mut offset, "FLM storage ABI group size")?;
+        let quant_flags = read_u16_advance(row, &mut offset, "FLM storage ABI quant flags")?;
+        let param_offset = u32_to_usize(read_u32_advance(
+            row,
+            &mut offset,
+            "FLM storage ABI param offset",
+        )?)?;
+        let param_len = u32_to_usize(read_u32_advance(
+            row,
+            &mut offset,
+            "FLM storage ABI param len",
+        )?)?;
+        ensure_consumed(row, offset, "FLM storage ABI row")?;
+        if !seen_ids.insert(storage_abi_id) {
+            return Err(Error::Other(format!(
+                "FLM storage ABI table has duplicate id {storage_abi_id}"
+            )));
+        }
+        let param_bytes = read_exact_range(
+            params,
+            param_offset,
+            param_len,
+            "FLM storage ABI params range",
+        )?
+        .to_vec();
+        rows.push(FlmStorageAbi {
+            storage_abi_id,
+            abi_kind_id,
+            codec_semantic_id,
+            layout_id,
+            bits,
+            group_size,
+            quant_flags,
+            params: param_bytes,
+        });
+    }
+    Ok(rows)
+}
+
+fn parse_logical_tensors(buf: &[u8]) -> Result<Vec<FlmLogicalTensor>, Error> {
+    read_exact_range(
+        buf,
+        0,
+        LOGICAL_TENSOR_HEADER_SIZE,
+        "FLM logical tensor header",
+    )?;
+    let version = read_u16(buf, 0, "FLM logical tensor version")?;
+    if version != 1 {
+        return Err(Error::Other(format!(
+            "unsupported FLM logical tensor table version {version}"
+        )));
+    }
+    let row_stride = read_u16(buf, 2, "FLM logical tensor row_stride")? as usize;
+    if row_stride != LOGICAL_TENSOR_ROW_SIZE {
+        return Err(Error::Other(format!(
+            "FLM logical tensor row stride {row_stride}; expected {LOGICAL_TENSOR_ROW_SIZE}"
+        )));
+    }
+    let row_count = u32_to_usize(read_u32(buf, 4, "FLM logical tensor row_count")?)?;
+    let string_pool_len = u32_to_usize(read_u32(buf, 8, "FLM logical tensor string_pool_len")?)?;
+    let rows_len = row_count
+        .checked_mul(row_stride)
+        .ok_or_else(|| Error::Other("FLM logical tensor row table length overflows".to_string()))?;
+    let string_pool_offset = LOGICAL_TENSOR_HEADER_SIZE
+        .checked_add(rows_len)
+        .ok_or_else(|| {
+            Error::Other("FLM logical tensor string pool offset overflows".to_string())
+        })?;
+    let expected_len = string_pool_offset
+        .checked_add(string_pool_len)
+        .ok_or_else(|| Error::Other("FLM logical tensor length overflows".to_string()))?;
+    if buf.len() != expected_len {
+        return Err(Error::Other(format!(
+            "FLM logical tensor table has len {}; expected {expected_len}",
+            buf.len()
+        )));
+    }
+    let string_pool = read_exact_range(
+        buf,
+        string_pool_offset,
+        string_pool_len,
+        "FLM logical tensor string pool",
+    )?;
+
+    let mut rows = Vec::with_capacity(row_count);
+    let mut seen_ids = HashSet::new();
+    for idx in 0..row_count {
+        let row_offset = LOGICAL_TENSOR_HEADER_SIZE + idx * row_stride;
+        let row = read_exact_range(buf, row_offset, row_stride, "FLM logical tensor row")?;
+        let mut offset = 0usize;
+        let tensor_id = read_u32_advance(row, &mut offset, "FLM logical tensor id")?;
+        let name_offset = u32_to_usize(read_u32_advance(
+            row,
+            &mut offset,
+            "FLM logical tensor name offset",
+        )?)?;
+        let name_len = read_u16_advance(row, &mut offset, "FLM logical tensor name len")? as usize;
+        let role_id = read_u16_advance(row, &mut offset, "FLM logical tensor role id")?;
+        let rank = read_u8_advance(row, &mut offset, "FLM logical tensor rank")?;
+        let reserved0 = read_u8_advance(row, &mut offset, "FLM logical tensor reserved0")?;
+        if rank > 4 {
+            return Err(Error::Other(format!(
+                "FLM logical tensor row {idx} rank {rank} exceeds 4"
+            )));
+        }
+        if reserved0 != 0 {
+            return Err(Error::Other(format!(
+                "FLM logical tensor row {idx} reserved0 is nonzero ({reserved0})"
+            )));
+        }
+        let mut shape = [0u32; 4];
+        for (dim_idx, dim) in shape.iter_mut().enumerate() {
+            *dim = read_u32_advance(
+                row,
+                &mut offset,
+                &format!("FLM logical tensor shape[{dim_idx}]"),
+            )?;
+        }
+        if shape[rank as usize..].iter().any(|dim| *dim != 0) {
+            return Err(Error::Other(format!(
+                "FLM logical tensor row {idx} has nonzero shape beyond rank {rank}"
+            )));
+        }
+        let value_format_id =
+            read_u16_advance(row, &mut offset, "FLM logical tensor value format")?;
+        let reconstruction_dtype =
+            read_u16_advance(row, &mut offset, "FLM logical tensor reconstruction dtype")?;
+        let storage_binding_start =
+            read_u32_advance(row, &mut offset, "FLM logical tensor storage binding start")?;
+        let storage_binding_count =
+            read_u16_advance(row, &mut offset, "FLM logical tensor storage binding count")?;
+        let flags = read_u16_advance(row, &mut offset, "FLM logical tensor flags")?;
+        let reserved1 = read_u16_advance(row, &mut offset, "FLM logical tensor reserved1")?;
+        ensure_consumed(row, offset, "FLM logical tensor row")?;
+        if reserved1 != 0 {
+            return Err(Error::Other(format!(
+                "FLM logical tensor row {idx} reserved1 is nonzero ({reserved1})"
+            )));
+        }
+        if !seen_ids.insert(tensor_id) {
+            return Err(Error::Other(format!(
+                "FLM logical tensor table has duplicate id {tensor_id}"
+            )));
+        }
+        let name_bytes = read_exact_range(
+            string_pool,
+            name_offset,
+            name_len,
+            "FLM logical tensor string",
+        )?;
+        let name = std::str::from_utf8(name_bytes)
+            .map_err(|e| {
+                Error::Other(format!(
+                    "FLM logical tensor string for row {idx} is not UTF-8: {e}"
+                ))
+            })?
+            .to_string();
+        rows.push(FlmLogicalTensor {
+            tensor_id,
+            name,
+            role_id,
+            rank,
+            shape,
+            value_format_id,
+            reconstruction_dtype,
+            storage_binding_start,
+            storage_binding_count,
+            flags,
+        });
+    }
+    Ok(rows)
+}
+
+fn parse_storage_bindings(buf: &[u8]) -> Result<Vec<FlmStorageBinding>, Error> {
+    read_exact_range(
+        buf,
+        0,
+        STORAGE_BINDING_HEADER_SIZE,
+        "FLM storage binding header",
+    )?;
+    let version = read_u16(buf, 0, "FLM storage binding version")?;
+    if version != 1 {
+        return Err(Error::Other(format!(
+            "unsupported FLM storage binding table version {version}"
+        )));
+    }
+    let row_stride = read_u16(buf, 2, "FLM storage binding row_stride")? as usize;
+    if row_stride != STORAGE_BINDING_ROW_SIZE {
+        return Err(Error::Other(format!(
+            "FLM storage binding row stride {row_stride}; expected {STORAGE_BINDING_ROW_SIZE}"
+        )));
+    }
+    let row_count = u32_to_usize(read_u32(buf, 4, "FLM storage binding row_count")?)?;
+    let string_pool_len = u32_to_usize(read_u32(buf, 8, "FLM storage binding string_pool_len")?)?;
+    let rows_len = row_count.checked_mul(row_stride).ok_or_else(|| {
+        Error::Other("FLM storage binding row table length overflows".to_string())
+    })?;
+    let string_pool_offset = STORAGE_BINDING_HEADER_SIZE
+        .checked_add(rows_len)
+        .ok_or_else(|| {
+            Error::Other("FLM storage binding string pool offset overflows".to_string())
+        })?;
+    let expected_len = string_pool_offset
+        .checked_add(string_pool_len)
+        .ok_or_else(|| Error::Other("FLM storage binding length overflows".to_string()))?;
+    if buf.len() != expected_len {
+        return Err(Error::Other(format!(
+            "FLM storage binding table has len {}; expected {expected_len}",
+            buf.len()
+        )));
+    }
+    let string_pool = read_exact_range(
+        buf,
+        string_pool_offset,
+        string_pool_len,
+        "FLM storage binding string pool",
+    )?;
+
+    let mut rows = Vec::with_capacity(row_count);
+    for idx in 0..row_count {
+        let row_offset = STORAGE_BINDING_HEADER_SIZE + idx * row_stride;
+        let row = read_exact_range(buf, row_offset, row_stride, "FLM storage binding row")?;
+        let mut offset = 0usize;
+        let logical_tensor_id =
+            read_u32_advance(row, &mut offset, "FLM storage binding logical tensor id")?;
+        let name_offset = u32_to_usize(read_u32_advance(
+            row,
+            &mut offset,
+            "FLM storage binding name offset",
+        )?)?;
+        let name_len = read_u16_advance(row, &mut offset, "FLM storage binding name len")? as usize;
+        let storage_role = read_u16_advance(row, &mut offset, "FLM storage binding role")?;
+        let storage_dtype = read_u16_advance(row, &mut offset, "FLM storage binding dtype")?;
+        let storage_abi_id = read_u16_advance(row, &mut offset, "FLM storage binding ABI id")?;
+        let flags = read_u16_advance(row, &mut offset, "FLM storage binding flags")?;
+        let reserved = read_u16_advance(row, &mut offset, "FLM storage binding reserved")?;
+        ensure_consumed(row, offset, "FLM storage binding row")?;
+        if reserved != 0 {
+            return Err(Error::Other(format!(
+                "FLM storage binding row {idx} reserved field is nonzero ({reserved})"
+            )));
+        }
+        let name_bytes = read_exact_range(
+            string_pool,
+            name_offset,
+            name_len,
+            "FLM storage binding string",
+        )?;
+        let tensor_name = std::str::from_utf8(name_bytes)
+            .map_err(|e| {
+                Error::Other(format!(
+                    "FLM storage binding string for row {idx} is not UTF-8: {e}"
+                ))
+            })?
+            .to_string();
+        rows.push(FlmStorageBinding {
+            logical_tensor_id,
+            storage_role,
+            tensor_name,
+            storage_dtype,
+            storage_abi_id,
+            flags,
+        });
+    }
+    Ok(rows)
+}
+
+fn parse_plan_steps(buf: &[u8]) -> Result<Vec<FlmPlanStep>, Error> {
+    read_exact_range(buf, 0, PLAN_STEP_HEADER_SIZE, "FLM plan step header")?;
+    let version = read_u16(buf, 0, "FLM plan step version")?;
+    if version != 1 {
+        return Err(Error::Other(format!(
+            "unsupported FLM plan step table version {version}"
+        )));
+    }
+    let row_stride = read_u16(buf, 2, "FLM plan step row_stride")? as usize;
+    if row_stride != PLAN_STEP_ROW_SIZE {
+        return Err(Error::Other(format!(
+            "FLM plan step row stride {row_stride}; expected {PLAN_STEP_ROW_SIZE}"
+        )));
+    }
+    let row_count = u32_to_usize(read_u32(buf, 4, "FLM plan step row_count")?)?;
+    let rows_len = row_count
+        .checked_mul(row_stride)
+        .ok_or_else(|| Error::Other("FLM plan step row table length overflows".to_string()))?;
+    let expected_len = PLAN_STEP_HEADER_SIZE
+        .checked_add(rows_len)
+        .ok_or_else(|| Error::Other("FLM plan step length overflows".to_string()))?;
+    if buf.len() != expected_len {
+        return Err(Error::Other(format!(
+            "FLM plan step table has len {}; expected {expected_len}",
+            buf.len()
+        )));
+    }
+
+    let mut rows = Vec::with_capacity(row_count);
+    for idx in 0..row_count {
+        let row_offset = PLAN_STEP_HEADER_SIZE + idx * row_stride;
+        let row = read_exact_range(buf, row_offset, row_stride, "FLM plan step row")?;
+        let mut offset = 0usize;
+        rows.push(FlmPlanStep {
+            logical_tensor_id: read_u32_advance(row, &mut offset, "FLM plan step logical id")?,
+            consume_strategy: read_u16_advance(row, &mut offset, "FLM plan step consume strategy")?,
+            target_layout_id: read_u16_advance(row, &mut offset, "FLM plan step target layout")?,
+            stream_id: read_u16_advance(row, &mut offset, "FLM plan step stream id")?,
+            priority: read_u16_advance(row, &mut offset, "FLM plan step priority")?,
+            flags: read_u32_advance(row, &mut offset, "FLM plan step flags")?,
+        });
+        ensure_consumed(row, offset, "FLM plan step row")?;
+        debug_assert!(idx < row_count);
+    }
+    Ok(rows)
+}
+
 fn read_exact_range<'a>(
     buf: &'a [u8],
     offset: usize,
@@ -1115,6 +1605,137 @@ mod tests {
         out
     }
 
+    fn build_stage3_storage_abi_section() -> Vec<u8> {
+        let mut out = Vec::new();
+        write_u16(&mut out, 1);
+        write_u16(&mut out, STORAGE_ABI_ROW_SIZE as u16);
+        write_u32(&mut out, 1);
+        write_u32(&mut out, 0);
+        write_u16(&mut out, 1);
+        write_u16(&mut out, STORAGE_ABI_KIND_GROUP_QUANT);
+        write_u16(&mut out, CODEC_SYM_INT4_G128_BF16);
+        write_u16(&mut out, LAYOUT_ID_DEFAULT);
+        out.push(4);
+        write_u16(&mut out, 128);
+        write_u16(&mut out, QUANT_FLAG_SYMMETRIC);
+        write_u32(&mut out, 0);
+        write_u32(&mut out, 0);
+        out
+    }
+
+    fn build_stage3_logical_tensor_section() -> Vec<u8> {
+        let name = b"model.language_model.layers.0.mlp.gate_proj.weight";
+        let mut out = Vec::new();
+        write_u16(&mut out, 1);
+        write_u16(&mut out, LOGICAL_TENSOR_ROW_SIZE as u16);
+        write_u32(&mut out, 1);
+        write_u32(&mut out, name.len() as u32);
+        write_u32(&mut out, 1);
+        write_u32(&mut out, 0);
+        write_u16(&mut out, name.len() as u16);
+        write_u16(&mut out, LOGICAL_TENSOR_ROLE_QUANTIZED_WEIGHT);
+        out.push(2);
+        out.push(0);
+        for dim in [128u32, 64, 0, 0] {
+            write_u32(&mut out, dim);
+        }
+        write_u16(&mut out, VALUE_FORMAT_SYM_INT4);
+        write_u16(&mut out, FLM_DTYPE_BF16);
+        write_u32(&mut out, 0);
+        write_u16(&mut out, 3);
+        write_u16(&mut out, LOGICAL_TENSOR_FLAG_REQUIRED);
+        write_u16(&mut out, 0);
+        out.extend_from_slice(name);
+        out
+    }
+
+    fn build_stage3_storage_binding_section() -> Vec<u8> {
+        let names: [(&[u8], u16, u16); 3] = [
+            (
+                b"storage/l0_gate_packed",
+                STORAGE_ROLE_PACKED,
+                FLM_DTYPE_INT32,
+            ),
+            (b"storage/l0_gate_scale", STORAGE_ROLE_SCALE, FLM_DTYPE_BF16),
+            (
+                b"storage/l0_gate_shape",
+                STORAGE_ROLE_SHAPE,
+                FLM_DTYPE_INT64,
+            ),
+        ];
+        let pool_len: usize = names.iter().map(|(name, _, _)| name.len()).sum();
+        let mut out = Vec::new();
+        write_u16(&mut out, 1);
+        write_u16(&mut out, STORAGE_BINDING_ROW_SIZE as u16);
+        write_u32(&mut out, names.len() as u32);
+        write_u32(&mut out, pool_len as u32);
+        let mut pool_offset = 0u32;
+        let mut pool = Vec::new();
+        for (name, role, dtype) in names {
+            write_u32(&mut out, 1);
+            write_u32(&mut out, pool_offset);
+            write_u16(&mut out, name.len() as u16);
+            write_u16(&mut out, role);
+            write_u16(&mut out, dtype);
+            write_u16(&mut out, 1);
+            write_u16(&mut out, STORAGE_BINDING_FLAG_REQUIRED);
+            write_u16(&mut out, 0);
+            pool.extend_from_slice(name);
+            pool_offset += name.len() as u32;
+        }
+        out.extend_from_slice(&pool);
+        out
+    }
+
+    fn build_stage3_plan_step_section() -> Vec<u8> {
+        let mut out = Vec::new();
+        write_u16(&mut out, 1);
+        write_u16(&mut out, PLAN_STEP_ROW_SIZE as u16);
+        write_u32(&mut out, 1);
+        write_u32(&mut out, 1);
+        write_u16(&mut out, CONSUME_STRATEGY_DIRECT);
+        write_u16(&mut out, LAYOUT_ID_DEFAULT);
+        write_u16(&mut out, PLAN_STREAM_DEFAULT);
+        write_u16(&mut out, PLAN_PRIORITY_DEFAULT);
+        write_u32(&mut out, PLAN_STEP_FLAG_NONE);
+        out
+    }
+
+    fn build_test_runtime_directory_with_stage3_tables() -> Vec<u8> {
+        let (asset_table, asset_payloads) = build_asset_sections();
+        let sections = [
+            (1u32, build_qwen_config_section()),
+            (2u32, build_tokenizer_section()),
+            (3u32, build_codec_table_section()),
+            (4u32, build_tensor_abi_section()),
+            (5u32, asset_table),
+            (6u32, asset_payloads),
+            (7u32, build_model_descriptor_section()),
+            (8u32, build_tensor_manifest_section()),
+            (9u32, build_stage3_storage_abi_section()),
+            (10u32, build_stage3_logical_tensor_section()),
+            (11u32, build_stage3_storage_binding_section()),
+            (12u32, build_stage3_plan_step_section()),
+        ];
+        let header_len = 8 + 2 + 2 + 4 + sections.len() * 12;
+        let mut offset = header_len as u32;
+        let mut out = Vec::new();
+        out.extend_from_slice(b"FLMRUN1\0");
+        write_u16(&mut out, RUNTIME_VERSION);
+        write_u16(&mut out, sections.len() as u16);
+        write_u32(&mut out, ARCH_QWEN3_6_DENSE);
+        for (section_id, data) in &sections {
+            write_u32(&mut out, *section_id);
+            write_u32(&mut out, offset);
+            write_u32(&mut out, data.len() as u32);
+            offset += data.len() as u32;
+        }
+        for (_, data) in sections {
+            out.extend_from_slice(&data);
+        }
+        out
+    }
+
     fn build_test_runtime_directory() -> Vec<u8> {
         let (asset_table, asset_payloads) = build_asset_sections();
         let sections = [
@@ -1131,7 +1752,7 @@ mod tests {
         let mut offset = header_len as u32;
         let mut out = Vec::new();
         out.extend_from_slice(b"FLMRUN1\0");
-        write_u16(&mut out, 3);
+        write_u16(&mut out, RUNTIME_VERSION);
         write_u16(&mut out, sections.len() as u16);
         write_u32(&mut out, ARCH_QWEN3_6_DENSE);
         for (section_id, data) in &sections {
@@ -1302,20 +1923,40 @@ mod tests {
     }
 
     #[test]
+    fn parses_stage3_storage_tables() {
+        let runtime = build_test_runtime_directory_with_stage3_tables();
+        let parsed = FlmRuntimeDirectory::parse(&runtime).expect("parse runtime v4");
+
+        assert_eq!(parsed.storage_abis()[0].storage_abi_id, 1);
+        assert_eq!(
+            parsed.logical_tensors()[0].name,
+            "model.language_model.layers.0.mlp.gate_proj.weight"
+        );
+        assert_eq!(
+            parsed.storage_bindings()[0].tensor_name,
+            "storage/l0_gate_packed"
+        );
+        assert_eq!(
+            parsed.plan_steps()[0].consume_strategy,
+            CONSUME_STRATEGY_DIRECT
+        );
+    }
+
+    #[test]
     fn rejects_bad_magic_and_version() {
         let mut runtime = build_test_runtime_directory();
         runtime[0] = b'X';
         expect_parse_error_contains(&runtime, "bad FLM runtime magic");
 
         let mut runtime = build_test_runtime_directory();
-        put_u16_at(&mut runtime, 8, 4);
+        put_u16_at(&mut runtime, 8, RUNTIME_VERSION + 1);
         expect_parse_error_contains(&runtime, "unsupported FLM runtime version");
     }
 
     #[test]
-    fn parses_runtime_v3_model_descriptor_asset_kinds_and_tensor_manifest() {
+    fn parses_runtime_v4_model_descriptor_asset_kinds_and_tensor_manifest() {
         let runtime = build_test_runtime_directory();
-        let parsed = FlmRuntimeDirectory::parse(&runtime).expect("parse runtime v3");
+        let parsed = FlmRuntimeDirectory::parse(&runtime).expect("parse runtime v4");
 
         assert_eq!(parsed.model_descriptor().model_id, MODEL_QWEN3_6_DENSE_V1);
         assert_eq!(
