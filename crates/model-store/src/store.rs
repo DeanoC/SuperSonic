@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
 
@@ -68,6 +68,12 @@ struct FlmIndexEntry {
     stored_len: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TensorUploadView {
+    dtype: String,
+    shape: Vec<usize>,
+}
+
 /// A memory-mapped baked weight store for fast GPU loading.
 pub struct BakedStore {
     _mmap: Mmap,
@@ -75,6 +81,7 @@ pub struct BakedStore {
     data_len: usize,
     index: HashMap<String, TensorMeta>,
     synthetic: HashMap<String, Vec<u8>>,
+    upload_views: HashMap<String, TensorUploadView>,
     runtime: Option<crate::flm::FlmRuntimeDirectory>,
 }
 
@@ -665,12 +672,13 @@ fn add_stage3_int4_aliases(
     runtime: &crate::flm::FlmRuntimeDirectory,
     index: &mut HashMap<String, TensorMeta>,
     synthetic: &mut HashMap<String, Vec<u8>>,
+    upload_views: &mut HashMap<String, TensorUploadView>,
 ) -> Result<(), Error> {
-    let direct_plan: HashSet<u32> = runtime
+    let direct_plan: HashMap<(u32, u16), &crate::flm::FlmPlanStep> = runtime
         .plan_steps()
         .iter()
         .filter(|step| step.consume_strategy == crate::flm::CONSUME_STRATEGY_DIRECT)
-        .map(|step| step.logical_tensor_id)
+        .map(|step| ((step.logical_tensor_id, step.storage_role), step))
         .collect();
     let mut by_logical: HashMap<u32, Vec<&crate::flm::FlmStorageBinding>> = HashMap::new();
     for binding in runtime.storage_bindings() {
@@ -684,9 +692,19 @@ fn add_stage3_int4_aliases(
         if logical.value_format_id != crate::flm::VALUE_FORMAT_SYM_INT4 {
             continue;
         }
-        if !direct_plan.contains(&logical.tensor_id) {
+        let Some(packed_step) =
+            direct_plan.get(&(logical.tensor_id, crate::flm::STORAGE_ROLE_PACKED))
+        else {
             continue;
-        }
+        };
+        let scale_step = direct_plan
+            .get(&(logical.tensor_id, crate::flm::STORAGE_ROLE_SCALE))
+            .ok_or_else(|| {
+                Error::Other(format!(
+                    "FLM Stage 3 INT4 tensor {} missing scale direct plan",
+                    logical.name
+                ))
+            })?;
         let owned = by_logical.get(&logical.tensor_id).ok_or_else(|| {
             Error::Other(format!(
                 "FLM Stage 3 logical tensor {} has no storage bindings",
@@ -740,6 +758,10 @@ fn add_stage3_int4_aliases(
             )));
         }
         let shape = vec![logical.shape[0] as usize, logical.shape[1] as usize];
+        let packed_view = TensorUploadView {
+            dtype: flm_dtype_name(packed_step.target_dtype)?.to_string(),
+            shape: flm_plan_target_shape(packed_step)?,
+        };
         index
             .entry(logical.name.clone())
             .or_insert_with(|| TensorMeta {
@@ -750,19 +772,29 @@ fn add_stage3_int4_aliases(
                 offset: packed_meta.offset,
                 byte_len: packed_meta.byte_len,
             });
+        upload_views
+            .entry(logical.name.clone())
+            .or_insert(packed_view);
 
         let base = logical.name.trim_end_matches(".weight");
         let scale_alias = format!("{base}.weight_int4_scale");
-        let scale_dtype = flm_dtype_name(logical.reconstruction_dtype)?;
+        let scale_dtype = flm_dtype_name(scale_step.target_dtype)?;
+        let scale_shape = flm_plan_target_shape(scale_step)?;
         index
             .entry(scale_alias.clone())
             .or_insert_with(|| TensorMeta {
-                name: scale_alias,
-                shape: scale_meta.shape.clone(),
+                name: scale_alias.clone(),
+                shape: scale_shape.clone(),
                 dtype: scale_dtype.to_string(),
                 layout: LayoutTag::Raw,
                 offset: scale_meta.offset,
                 byte_len: scale_meta.byte_len,
+            });
+        upload_views
+            .entry(scale_alias)
+            .or_insert_with(|| TensorUploadView {
+                dtype: scale_dtype.to_string(),
+                shape: scale_shape.clone(),
             });
 
         let zero_alias = format!("{base}.weight_int4_zero");
@@ -770,7 +802,7 @@ fn add_stage3_int4_aliases(
             .entry(zero_alias.clone())
             .or_insert_with(|| TensorMeta {
                 name: zero_alias.clone(),
-                shape: scale_meta.shape.clone(),
+                shape: scale_shape,
                 dtype: "bf16".to_string(),
                 layout: LayoutTag::Raw,
                 offset: 0,
@@ -781,6 +813,27 @@ fn add_stage3_int4_aliases(
             .or_insert_with(|| bf16_eight_bytes(scale_meta.byte_len as usize));
     }
     Ok(())
+}
+
+fn flm_plan_target_shape(step: &crate::flm::FlmPlanStep) -> Result<Vec<usize>, Error> {
+    let rank = usize::from(step.target_rank);
+    if rank > step.target_shape.len() {
+        return Err(Error::Other(format!(
+            "FLM plan step target rank {} exceeds stored shape rank {}",
+            step.target_rank,
+            step.target_shape.len()
+        )));
+    }
+    step.target_shape[..rank]
+        .iter()
+        .map(|dim| {
+            usize::try_from(*dim).map_err(|_| {
+                Error::Other(format!(
+                    "FLM plan step target dimension {dim} does not fit usize"
+                ))
+            })
+        })
+        .collect()
 }
 
 impl BakedStore {
@@ -807,6 +860,7 @@ impl BakedStore {
             data_len,
             index,
             synthetic: HashMap::new(),
+            upload_views: HashMap::new(),
             runtime: None,
         })
     }
@@ -851,10 +905,16 @@ impl BakedStore {
             validate_flm_manifest_against_index(runtime, &index_entries)?;
         }
         let mut synthetic = HashMap::new();
+        let mut upload_views = HashMap::new();
         if options.flm_int4_logical_aliases {
             if let Some(runtime) = runtime.as_ref() {
                 if !runtime.logical_tensors().is_empty() {
-                    add_stage3_int4_aliases(runtime, &mut index, &mut synthetic)?;
+                    add_stage3_int4_aliases(
+                        runtime,
+                        &mut index,
+                        &mut synthetic,
+                        &mut upload_views,
+                    )?;
                 } else {
                     add_manifest_int4_aliases(runtime, &mut index, &mut synthetic)?;
                 }
@@ -866,6 +926,7 @@ impl BakedStore {
             data_len,
             index,
             synthetic,
+            upload_views,
             runtime,
         })
     }
@@ -890,6 +951,11 @@ impl BakedStore {
 
     pub fn flm_runtime(&self) -> Option<&crate::flm::FlmRuntimeDirectory> {
         self.runtime.as_ref()
+    }
+
+    #[cfg(test)]
+    fn upload_view(&self, name: &str) -> Option<&TensorUploadView> {
+        self.upload_views.get(name)
     }
 
     fn tensor_bytes(&self, name: &str, meta: &TensorMeta) -> Result<&[u8], Error> {
@@ -962,8 +1028,11 @@ impl BakedStore {
             .get(name)
             .ok_or_else(|| Error::NotFound(name.to_string()))?;
         let slice = self.tensor_bytes(name, meta)?;
-        let dtype = parse_dtype(&meta.dtype)?;
-        let upload_shape = gpu_upload_shape(meta)?;
+        let (dtype, upload_shape) = if let Some(view) = self.upload_views.get(name) {
+            (parse_dtype(&view.dtype)?, view.shape.clone())
+        } else {
+            (parse_dtype(&meta.dtype)?, gpu_upload_shape(meta)?)
+        };
         let buf = GpuBuffer::from_host_bytes(ordinal, dtype, &upload_shape, slice)?;
         Ok(buf)
     }
@@ -1542,11 +1611,33 @@ mod tests {
     fn runtime_stage3_plan_step_section() -> Vec<u8> {
         let mut out = Vec::new();
         push_u16(&mut out, 1);
-        push_u16(&mut out, 16);
+        push_u16(&mut out, 38);
+        push_u32(&mut out, 2);
+
         push_u32(&mut out, 1);
-        push_u32(&mut out, 1);
+        push_u16(&mut out, crate::flm::STORAGE_ROLE_PACKED);
         push_u16(&mut out, crate::flm::CONSUME_STRATEGY_DIRECT);
         push_u16(&mut out, crate::flm::LAYOUT_ID_DEFAULT);
+        push_u16(&mut out, FLM_DTYPE_UINT8);
+        out.push(2);
+        out.push(0);
+        for dim in [128u32, 32, 0, 0] {
+            push_u32(&mut out, dim);
+        }
+        push_u16(&mut out, crate::flm::PLAN_STREAM_DEFAULT);
+        push_u16(&mut out, crate::flm::PLAN_PRIORITY_DEFAULT);
+        push_u32(&mut out, crate::flm::PLAN_STEP_FLAG_NONE);
+
+        push_u32(&mut out, 1);
+        push_u16(&mut out, crate::flm::STORAGE_ROLE_SCALE);
+        push_u16(&mut out, crate::flm::CONSUME_STRATEGY_DIRECT);
+        push_u16(&mut out, crate::flm::LAYOUT_ID_DEFAULT);
+        push_u16(&mut out, FLM_DTYPE_BF16);
+        out.push(2);
+        out.push(0);
+        for dim in [128u32, 1, 0, 0] {
+            push_u32(&mut out, dim);
+        }
         push_u16(&mut out, crate::flm::PLAN_STREAM_DEFAULT);
         push_u16(&mut out, crate::flm::PLAN_PRIORITY_DEFAULT);
         push_u32(&mut out, crate::flm::PLAN_STEP_FLAG_NONE);
@@ -1926,6 +2017,18 @@ mod tests {
         assert_eq!(alias.layout, LayoutTag::Int4Quantized);
         assert_eq!(alias.dtype, "u8");
         assert_eq!(alias.shape, vec![128, 64]);
+
+        let upload_view = store
+            .upload_view("model.language_model.layers.0.mlp.gate_proj.weight")
+            .expect("native logical INT4 upload view");
+        assert_eq!(upload_view.dtype, "u8");
+        assert_eq!(upload_view.shape, vec![128, 32]);
+
+        let scale_view = store
+            .upload_view("model.language_model.layers.0.mlp.gate_proj.weight_int4_scale")
+            .expect("native scale upload view");
+        assert_eq!(scale_view.dtype, "bf16");
+        assert_eq!(scale_view.shape, vec![128, 1]);
     }
 
     #[test]
