@@ -44,7 +44,7 @@ const TOKENIZER_SIZE: usize = 8 * 4;
 const CODEC_RECORD_SIZE: usize = 10;
 const MODEL_DESCRIPTOR_SIZE: usize = 24;
 const TENSOR_MANIFEST_HEADER_SIZE: usize = 12;
-const TENSOR_MANIFEST_ROW_SIZE: usize = 44;
+const TENSOR_MANIFEST_ROW_SIZE: usize = 40;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FlmQwen36DenseConfig {
@@ -1088,7 +1088,6 @@ mod tests {
         write_u32(out, name_offset);
         write_u16(out, name_len);
         write_u16(out, 0);
-        write_u32(out, 0);
     }
 
     fn build_tensor_manifest_section() -> Vec<u8> {
@@ -1345,6 +1344,20 @@ mod tests {
         let row_name_len = manifest_offset + 12 + 4 + 4 + 1 + 1 + 2 + 2 + 1 + 1 + 16 + 4;
         put_u16_at(&mut runtime, row_name_len, u16::MAX);
         expect_parse_error_contains(&runtime, "manifest string");
+    }
+
+    #[test]
+    fn uses_geo_manifest_row_stride_40_and_rejects_reserved_u16() {
+        let runtime = build_test_runtime_directory();
+        let (manifest_offset, manifest_len) = section_range(&runtime, SECTION_TENSOR_MANIFEST);
+        let string_pool_len = read_u32_at(&runtime, manifest_offset + 8) as usize;
+        assert_eq!(read_u16_at(&runtime, manifest_offset + 2), 40);
+        assert_eq!(manifest_len, 12 + 40 + string_pool_len);
+
+        let mut runtime = runtime;
+        let row_reserved = manifest_offset + 12 + 4 + 4 + 1 + 1 + 2 + 2 + 1 + 1 + 16 + 4 + 2;
+        put_u16_at(&mut runtime, row_reserved, 1);
+        expect_parse_error_contains(&runtime, "reserved");
     }
 
     #[test]
