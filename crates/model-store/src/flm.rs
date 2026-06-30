@@ -45,6 +45,7 @@ pub const PLAN_STREAM_DEFAULT: u16 = 0;
 pub const PLAN_PRIORITY_DEFAULT: u16 = 0;
 pub const PLAN_STEP_FLAG_NONE: u32 = 0;
 pub const FLM_DTYPE_BF16: u16 = 2;
+pub const FLM_DTYPE_UINT8: u16 = 4;
 pub const FLM_DTYPE_INT32: u16 = 5;
 pub const FLM_DTYPE_INT64: u16 = 6;
 
@@ -77,7 +78,7 @@ const LOGICAL_TENSOR_ROW_SIZE: usize = 44;
 const STORAGE_BINDING_HEADER_SIZE: usize = 12;
 const STORAGE_BINDING_ROW_SIZE: usize = 20;
 const PLAN_STEP_HEADER_SIZE: usize = 8;
-const PLAN_STEP_ROW_SIZE: usize = 16;
+const PLAN_STEP_ROW_SIZE: usize = 38;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FlmQwen36DenseConfig {
@@ -211,8 +212,12 @@ pub struct FlmStorageBinding {
 #[derive(Debug, Clone, PartialEq)]
 pub struct FlmPlanStep {
     pub logical_tensor_id: u32,
+    pub storage_role: u16,
     pub consume_strategy: u16,
     pub target_layout_id: u16,
+    pub target_dtype: u16,
+    pub target_rank: u8,
+    pub target_shape: [u32; 4],
     pub stream_id: u16,
     pub priority: u16,
     pub flags: u32,
@@ -1277,10 +1282,43 @@ fn parse_plan_steps(buf: &[u8]) -> Result<Vec<FlmPlanStep>, Error> {
         let row_offset = PLAN_STEP_HEADER_SIZE + idx * row_stride;
         let row = read_exact_range(buf, row_offset, row_stride, "FLM plan step row")?;
         let mut offset = 0usize;
+        let logical_tensor_id = read_u32_advance(row, &mut offset, "FLM plan step logical id")?;
+        let storage_role = read_u16_advance(row, &mut offset, "FLM plan step storage role")?;
+        let consume_strategy =
+            read_u16_advance(row, &mut offset, "FLM plan step consume strategy")?;
+        let target_layout_id = read_u16_advance(row, &mut offset, "FLM plan step target layout")?;
+        let target_dtype = read_u16_advance(row, &mut offset, "FLM plan step target dtype")?;
+        let target_rank = read_u8_advance(row, &mut offset, "FLM plan step target rank")?;
+        let reserved0 = read_u8_advance(row, &mut offset, "FLM plan step reserved0")?;
+        if reserved0 != 0 {
+            return Err(Error::Other(format!(
+                "FLM plan step row {idx} reserved0={reserved0}; expected 0"
+            )));
+        }
+        if target_rank > 4 {
+            return Err(Error::Other(format!(
+                "FLM plan step row {idx} target rank {target_rank} exceeds 4"
+            )));
+        }
+        let mut target_shape = [0u32; 4];
+        for dim in &mut target_shape {
+            *dim = read_u32_advance(row, &mut offset, "FLM plan step target shape")?;
+        }
+        for (dim_idx, dim) in target_shape.iter().enumerate().skip(target_rank as usize) {
+            if *dim != 0 {
+                return Err(Error::Other(format!(
+                    "FLM plan step row {idx} target_shape[{dim_idx}]={dim}; expected 0 beyond rank"
+                )));
+            }
+        }
         rows.push(FlmPlanStep {
-            logical_tensor_id: read_u32_advance(row, &mut offset, "FLM plan step logical id")?,
-            consume_strategy: read_u16_advance(row, &mut offset, "FLM plan step consume strategy")?,
-            target_layout_id: read_u16_advance(row, &mut offset, "FLM plan step target layout")?,
+            logical_tensor_id,
+            storage_role,
+            consume_strategy,
+            target_layout_id,
+            target_dtype,
+            target_rank,
+            target_shape,
             stream_id: read_u16_advance(row, &mut offset, "FLM plan step stream id")?,
             priority: read_u16_advance(row, &mut offset, "FLM plan step priority")?,
             flags: read_u32_advance(row, &mut offset, "FLM plan step flags")?,
@@ -1691,10 +1729,32 @@ mod tests {
         let mut out = Vec::new();
         write_u16(&mut out, 1);
         write_u16(&mut out, PLAN_STEP_ROW_SIZE as u16);
+        write_u32(&mut out, 2);
+
         write_u32(&mut out, 1);
-        write_u32(&mut out, 1);
+        write_u16(&mut out, STORAGE_ROLE_PACKED);
         write_u16(&mut out, CONSUME_STRATEGY_DIRECT);
         write_u16(&mut out, LAYOUT_ID_DEFAULT);
+        write_u16(&mut out, FLM_DTYPE_UINT8);
+        out.push(2);
+        out.push(0);
+        for dim in [128u32, 32, 0, 0] {
+            write_u32(&mut out, dim);
+        }
+        write_u16(&mut out, PLAN_STREAM_DEFAULT);
+        write_u16(&mut out, PLAN_PRIORITY_DEFAULT);
+        write_u32(&mut out, PLAN_STEP_FLAG_NONE);
+
+        write_u32(&mut out, 1);
+        write_u16(&mut out, STORAGE_ROLE_SCALE);
+        write_u16(&mut out, CONSUME_STRATEGY_DIRECT);
+        write_u16(&mut out, LAYOUT_ID_DEFAULT);
+        write_u16(&mut out, FLM_DTYPE_BF16);
+        out.push(2);
+        out.push(0);
+        for dim in [128u32, 1, 0, 0] {
+            write_u32(&mut out, dim);
+        }
         write_u16(&mut out, PLAN_STREAM_DEFAULT);
         write_u16(&mut out, PLAN_PRIORITY_DEFAULT);
         write_u32(&mut out, PLAN_STEP_FLAG_NONE);
@@ -1940,6 +2000,13 @@ mod tests {
             parsed.plan_steps()[0].consume_strategy,
             CONSUME_STRATEGY_DIRECT
         );
+        assert_eq!(parsed.plan_steps()[0].storage_role, STORAGE_ROLE_PACKED);
+        assert_eq!(parsed.plan_steps()[0].target_dtype, FLM_DTYPE_UINT8);
+        assert_eq!(parsed.plan_steps()[0].target_rank, 2);
+        assert_eq!(parsed.plan_steps()[0].target_shape, [128, 32, 0, 0]);
+        assert_eq!(parsed.plan_steps()[1].storage_role, STORAGE_ROLE_SCALE);
+        assert_eq!(parsed.plan_steps()[1].target_dtype, FLM_DTYPE_BF16);
+        assert_eq!(parsed.plan_steps()[1].target_shape, [128, 1, 0, 0]);
     }
 
     #[test]
