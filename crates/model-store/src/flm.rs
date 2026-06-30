@@ -10,7 +10,7 @@ pub const CODEC_SYM_INT4_G128_BF16: u16 = 2;
 pub const CODEC_RAW_I64: u16 = 3;
 
 const RUNTIME_MAGIC: &[u8; 8] = b"FLMRUN1\0";
-const RUNTIME_VERSION: u16 = 1;
+const RUNTIME_VERSION: u16 = 2;
 const SECTION_CONFIG_QWEN36_DENSE: u32 = 1;
 const SECTION_TOKENIZER: u32 = 2;
 const SECTION_CODEC_TABLE: u32 = 3;
@@ -18,7 +18,7 @@ const SECTION_TENSOR_ABI: u32 = 4;
 const SECTION_ASSET_TABLE: u32 = 5;
 const SECTION_ASSET_PAYLOADS: u32 = 6;
 const SECTION_RECORD_SIZE: usize = 12;
-const HEADER_PREFIX_SIZE: usize = 12;
+const HEADER_PREFIX_SIZE: usize = 16;
 const CONFIG_FIXED_SIZE: usize = 13 * 4 + 2 * 8 + 2 + 4;
 const TOKENIZER_SIZE: usize = 8 * 4;
 const CODEC_RECORD_SIZE: usize = 10;
@@ -102,7 +102,7 @@ struct SectionRange {
 
 impl FlmRuntimeDirectory {
     pub fn parse(buf: &[u8]) -> Result<Self, Error> {
-        let sections = parse_section_table(buf)?;
+        let (architecture_id, sections) = parse_section_table(buf)?;
         let config = parse_qwen36_config(section(buf, &sections, SECTION_CONFIG_QWEN36_DENSE)?)?;
         let tokenizer = parse_tokenizer(section(buf, &sections, SECTION_TOKENIZER)?)?;
         let codecs = parse_codec_table(section(buf, &sections, SECTION_CODEC_TABLE)?)?;
@@ -113,7 +113,7 @@ impl FlmRuntimeDirectory {
         )?;
 
         Ok(Self {
-            architecture_id: ARCH_QWEN3_6_DENSE,
+            architecture_id,
             config,
             tokenizer,
             assets,
@@ -157,7 +157,7 @@ impl FlmRuntimeDirectory {
     }
 }
 
-fn parse_section_table(buf: &[u8]) -> Result<HashMap<u32, SectionRange>, Error> {
+fn parse_section_table(buf: &[u8]) -> Result<(u32, HashMap<u32, SectionRange>), Error> {
     let magic = read_exact_range(buf, 0, RUNTIME_MAGIC.len(), "FLM runtime magic")?;
     if magic != RUNTIME_MAGIC {
         return Err(Error::Other(format!(
@@ -172,8 +172,13 @@ fn parse_section_table(buf: &[u8]) -> Result<HashMap<u32, SectionRange>, Error> 
             "unsupported FLM runtime version {version}; expected {RUNTIME_VERSION}"
         )));
     }
-
     let section_count = read_u16(buf, 10, "FLM runtime section count")? as usize;
+    let architecture_id = read_u32(buf, 12, "FLM runtime architecture_id")?;
+    if architecture_id != ARCH_QWEN3_6_DENSE {
+        return Err(Error::Other(format!(
+            "unsupported FLM runtime architecture {architecture_id}"
+        )));
+    }
     let header_len = HEADER_PREFIX_SIZE
         .checked_add(
             section_count
@@ -248,7 +253,7 @@ fn parse_section_table(buf: &[u8]) -> Result<HashMap<u32, SectionRange>, Error> 
             buf.len()
         )));
     }
-    Ok(sections)
+    Ok((architecture_id, sections))
 }
 
 fn section<'a>(
@@ -729,12 +734,13 @@ mod tests {
             (5u32, asset_table),
             (6u32, asset_payloads),
         ];
-        let header_len = 8 + 2 + 2 + sections.len() * 12;
+        let header_len = 8 + 2 + 2 + 4 + sections.len() * 12;
         let mut offset = header_len as u32;
         let mut out = Vec::new();
         out.extend_from_slice(b"FLMRUN1\0");
-        write_u16(&mut out, 1);
+        write_u16(&mut out, 2);
         write_u16(&mut out, sections.len() as u16);
+        write_u32(&mut out, ARCH_QWEN3_6_DENSE);
         for (section_id, data) in &sections {
             write_u32(&mut out, *section_id);
             write_u32(&mut out, offset);
@@ -750,7 +756,7 @@ mod tests {
     fn section_record_offset(runtime: &[u8], section_id: u32) -> usize {
         let count = read_u16_at(runtime, 10) as usize;
         for idx in 0..count {
-            let offset = 12 + idx * 12;
+            let offset = 16 + idx * 12;
             if read_u32_at(runtime, offset) == section_id {
                 return offset;
             }
@@ -771,7 +777,7 @@ mod tests {
         runtime.insert(gap_offset, 0);
         let count = read_u16_at(runtime, 10) as usize;
         for idx in 0..count {
-            let record = 12 + idx * 12;
+            let record = 16 + idx * 12;
             let offset = read_u32_at(runtime, record + 4) as usize;
             if offset >= gap_offset {
                 put_u32_at(runtime, record + 4, (offset + 1) as u32);
@@ -890,8 +896,15 @@ mod tests {
         expect_parse_error_contains(&runtime, "bad FLM runtime magic");
 
         let mut runtime = build_test_runtime_directory();
-        put_u16_at(&mut runtime, 8, 2);
+        put_u16_at(&mut runtime, 8, 3);
         expect_parse_error_contains(&runtime, "unsupported FLM runtime version");
+    }
+
+    #[test]
+    fn rejects_unknown_runtime_architecture_id() {
+        let mut runtime = build_test_runtime_directory();
+        put_u32_at(&mut runtime, 12, 999);
+        expect_parse_error_contains(&runtime, "architecture");
     }
 
     #[test]

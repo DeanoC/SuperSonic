@@ -1058,12 +1058,13 @@ mod tests {
             (5u32, asset_table),
             (6u32, asset_payloads),
         ];
-        let header_len = 12 + sections.len() * 12;
+        let header_len = 16 + sections.len() * 12;
         let mut offset = header_len as u32;
         let mut out = Vec::new();
         out.extend_from_slice(b"FLMRUN1\0");
-        push_u16(&mut out, 1);
+        push_u16(&mut out, 2);
         push_u16(&mut out, sections.len() as u16);
+        push_u32(&mut out, crate::flm::ARCH_QWEN3_6_DENSE);
         for (section_id, data) in &sections {
             push_u32(&mut out, *section_id);
             push_u32(&mut out, offset);
