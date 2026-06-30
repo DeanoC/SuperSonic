@@ -86,6 +86,35 @@ fn parse_dtype(name: &str) -> Result<ScalarType, Error> {
     ScalarType::from_name(name).ok_or_else(|| Error::UnsupportedDtype(name.to_string()))
 }
 
+fn gpu_upload_shape(meta: &TensorMeta) -> Result<Vec<usize>, Error> {
+    if matches!(meta.layout, LayoutTag::Int4Quantized) {
+        let byte_len = usize::try_from(meta.byte_len).map_err(|_| {
+            Error::Other(format!(
+                "tensor '{}' byte_len={} does not fit usize",
+                meta.name, meta.byte_len
+            ))
+        })?;
+        if meta.shape.len() == 2 {
+            let rows = meta.shape[0];
+            if rows == 0 {
+                return Err(Error::Other(format!(
+                    "tensor '{}' INT4 upload shape has zero rows",
+                    meta.name
+                )));
+            }
+            if byte_len % rows != 0 {
+                return Err(Error::Other(format!(
+                    "tensor '{}' INT4 byte_len={} is not divisible by rows={}",
+                    meta.name, meta.byte_len, rows
+                )));
+            }
+            return Ok(vec![rows, byte_len / rows]);
+        }
+        return Ok(vec![byte_len]);
+    }
+    Ok(meta.shape.clone())
+}
+
 fn read_exact_range<'a>(
     buf: &'a [u8],
     offset: usize,
@@ -934,7 +963,8 @@ impl BakedStore {
             .ok_or_else(|| Error::NotFound(name.to_string()))?;
         let slice = self.tensor_bytes(name, meta)?;
         let dtype = parse_dtype(&meta.dtype)?;
-        let buf = GpuBuffer::from_host_bytes(ordinal, dtype, &meta.shape, slice)?;
+        let upload_shape = gpu_upload_shape(meta)?;
+        let buf = GpuBuffer::from_host_bytes(ordinal, dtype, &upload_shape, slice)?;
         Ok(buf)
     }
 
@@ -1899,6 +1929,23 @@ mod tests {
     }
 
     #[test]
+    fn gpu_upload_shape_uses_packed_row_bytes_for_logical_int4_aliases() {
+        let meta = TensorMeta {
+            name: "model.language_model.layers.0.linear_attn.in_proj_qkv.weight".to_string(),
+            shape: vec![17408, 5120],
+            dtype: "u8".to_string(),
+            layout: LayoutTag::Int4Quantized,
+            offset: 0,
+            byte_len: 44_564_480,
+        };
+
+        let upload_shape = gpu_upload_shape(&meta).expect("upload shape");
+
+        assert_eq!(meta.shape, vec![17408, 5120]);
+        assert_eq!(upload_shape, vec![17408, 2560]);
+    }
+
+    #[test]
     fn open_flm_rejects_required_manifest_shape_mismatch() {
         let mut data = build_test_flm_with_runtime_manifest_group();
         corrupt_first_manifest_shape(&mut data, 999);
@@ -2154,7 +2201,7 @@ mod tests {
         assert_eq!(packed.dtype, "u8");
         assert_eq!(alias.dtype, "u8");
         assert_eq!(alias.layout, LayoutTag::Int4Quantized);
-        assert_eq!(alias.shape, vec![10240, 2560]);
+        assert_eq!(alias.shape, vec![10240, 5120]);
         assert_eq!(alias.offset, packed.offset);
         assert_eq!(alias.byte_len, packed.byte_len);
 
@@ -2173,7 +2220,7 @@ mod tests {
         assert!(zero.chunks_exact(2).all(|pair| pair == [0x00, 0x41]));
 
         eprintln!(
-            "[flm-validate] OK — {} tensors including CT aliases",
+            "[flm-validate] OK — {} tensors including FLM logical aliases",
             store.index.len()
         );
     }
