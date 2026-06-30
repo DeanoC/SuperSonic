@@ -65,6 +65,16 @@ struct FlmShard {
     length: u64,
 }
 
+#[derive(Debug, Clone)]
+struct FlmIndexEntry {
+    name: String,
+    shape: Vec<usize>,
+    dtype: u16,
+    codec: u8,
+    file_offset: u64,
+    stored_len: u64,
+}
+
 /// A memory-mapped baked weight store for fast GPU loading.
 pub struct BakedStore {
     _mmap: Mmap,
@@ -266,14 +276,14 @@ fn flm_dtype_name(dtype: u16) -> Result<&'static str, Error> {
     }
 }
 
-fn flm_build_index(
+fn flm_read_index_entries(
     buf: &[u8],
     sb: &FlmSuperblock,
     strings: &[String],
     shards: &HashMap<u32, FlmShard>,
-) -> Result<HashMap<String, TensorMeta>, Error> {
+) -> Result<HashMap<String, FlmIndexEntry>, Error> {
     let index_blob = read_exact_range(buf, sb.index_offset, sb.index_len, "FLM tensor index")?;
-    let mut index = HashMap::with_capacity(sb.tensor_count);
+    let mut entries = HashMap::with_capacity(sb.tensor_count);
     for idx in 0..sb.tensor_count {
         let off = idx * FLM_INDEX_RECORD_SIZE;
         let rec = read_exact_range(index_blob, off, FLM_INDEX_RECORD_SIZE, "FLM tensor record")?;
@@ -317,22 +327,43 @@ fn flm_build_index(
             ))
         })?;
 
-        let dtype_name = if codec == 0 {
-            flm_dtype_name(dtype)?
+        entries.insert(
+            name.clone(),
+            FlmIndexEntry {
+                name: name.clone(),
+                shape,
+                dtype,
+                codec,
+                file_offset,
+                stored_len,
+            },
+        );
+    }
+    Ok(entries)
+}
+
+fn flm_build_index(
+    entries: &HashMap<String, FlmIndexEntry>,
+) -> Result<HashMap<String, TensorMeta>, Error> {
+    let mut index = HashMap::with_capacity(entries.len());
+    for entry in entries.values() {
+        let dtype_name = if entry.codec == 0 {
+            flm_dtype_name(entry.dtype)?
         } else {
-            // Unknown/non-native codecs are still inspectable as raw bytes.
+            // Coded tensors are exposed as raw byte payloads until a runtime
+            // alias maps them onto a native SuperSonic layout.
             "u8"
         };
 
         index.insert(
-            name.clone(),
+            entry.name.clone(),
             TensorMeta {
-                name: name.clone(),
-                shape,
+                name: entry.name.clone(),
+                shape: entry.shape.clone(),
                 dtype: dtype_name.to_string(),
                 layout: LayoutTag::Raw,
-                offset: file_offset,
-                byte_len: stored_len,
+                offset: entry.file_offset,
+                byte_len: entry.stored_len,
             },
         );
     }
@@ -461,13 +492,13 @@ fn manifest_row_shape(row: &crate::flm::FlmTensorManifestRow) -> Vec<usize> {
 
 fn validate_flm_manifest_against_index(
     runtime: &crate::flm::FlmRuntimeDirectory,
-    index: &HashMap<String, TensorMeta>,
+    entries: &HashMap<String, FlmIndexEntry>,
 ) -> Result<(), Error> {
     for row in &runtime.tensor_manifest().rows {
         if row.flags & crate::flm::MANIFEST_FLAG_DERIVED_ALIAS != 0 {
             continue;
         }
-        let Some(meta) = index.get(&row.name) else {
+        let Some(entry) = entries.get(&row.name) else {
             if row.flags & crate::flm::MANIFEST_FLAG_REQUIRED != 0 {
                 return Err(Error::Other(format!(
                     "FLM manifest required tensor {} missing from index",
@@ -476,15 +507,21 @@ fn validate_flm_manifest_against_index(
             }
             continue;
         };
-        if meta.shape != manifest_row_shape(row) {
+        if entry.shape != manifest_row_shape(row) {
             return Err(Error::Other(format!(
                 "FLM manifest shape mismatch for {}",
                 row.name
             )));
         }
-        if flm_dtype_name(row.dtype)? != meta.dtype {
+        if row.dtype != entry.dtype {
             return Err(Error::Other(format!(
                 "FLM manifest dtype mismatch for {}",
+                row.name
+            )));
+        }
+        if row.codec_id != entry.codec {
+            return Err(Error::Other(format!(
+                "FLM manifest codec mismatch for {}",
                 row.name
             )));
         }
@@ -572,12 +609,13 @@ fn add_manifest_int4_aliases(
             });
 
         let alias_scale = format!("{base}.weight_int4_scale");
+        let alias_scale_dtype = flm_dtype_name(scale_row.logical_dtype)?;
         index
             .entry(alias_scale.clone())
             .or_insert_with(|| TensorMeta {
                 name: alias_scale,
                 shape: scale_meta.shape.clone(),
-                dtype: scale_meta.dtype.clone(),
+                dtype: alias_scale_dtype.to_string(),
                 layout: LayoutTag::Raw,
                 offset: scale_meta.offset,
                 byte_len: scale_meta.byte_len,
@@ -643,7 +681,8 @@ impl BakedStore {
         let sb = flm_parse_superblock(&mmap)?;
         let strings = flm_read_string_table(&mmap, &sb)?;
         let shards = flm_read_shards(&mmap, &sb)?;
-        let mut index = flm_build_index(&mmap, &sb, &strings, &shards)?;
+        let index_entries = flm_read_index_entries(&mmap, &sb, &strings, &shards)?;
+        let mut index = flm_build_index(&index_entries)?;
         let runtime = match (sb.runtime_dir_offset, sb.runtime_dir_len) {
             (0, 0) => None,
             (0, len) => {
@@ -665,7 +704,7 @@ impl BakedStore {
             flm_verify_block_hashes(&mmap, &sb, &strings, &shards)?;
         }
         if let Some(runtime) = runtime.as_ref() {
-            validate_flm_manifest_against_index(runtime, &index)?;
+            validate_flm_manifest_against_index(runtime, &index_entries)?;
         }
         let mut synthetic = HashMap::new();
         if options.compressed_tensors_int4_aliases {
@@ -913,6 +952,7 @@ mod tests {
         name: &'static str,
         shape: Vec<u32>,
         dtype: u16,
+        codec: u8,
         payload: Vec<u8>,
     }
 
@@ -966,7 +1006,7 @@ mod tests {
             put_u64(&mut rec, 28, tensor.payload.len() as u64);
             put_u16(&mut rec, 36, tensor.dtype);
             put_u16(&mut rec, 38, tensor.dtype);
-            rec[40] = 0;
+            rec[40] = tensor.codec;
             rec[41] = tensor.shape.len() as u8;
             for (dim_idx, dim) in tensor.shape.iter().enumerate() {
                 put_u32(&mut rec, 42 + dim_idx * 4, *dim);
@@ -1277,18 +1317,21 @@ mod tests {
                 name: "model.language_model.layers.0.mlp.gate_proj.weight_packed",
                 shape: vec![128, 16],
                 dtype: FLM_DTYPE_INT32,
+                codec: 1,
                 payload: vec![0; 128],
             },
             TestFlmTensor {
                 name: "model.language_model.layers.0.mlp.gate_proj.weight_scale",
                 shape: vec![128, 1],
                 dtype: FLM_DTYPE_BF16,
+                codec: 1,
                 payload: vec![0; 256],
             },
             TestFlmTensor {
                 name: "model.language_model.layers.0.mlp.gate_proj.weight_shape",
                 shape: vec![2],
                 dtype: FLM_DTYPE_INT64,
+                codec: 2,
                 payload: vec![0; 16],
             },
         ]);
@@ -1313,7 +1356,7 @@ mod tests {
                 rank: 2,
                 dtype: FLM_DTYPE_BF16,
                 logical_dtype: FLM_DTYPE_BF16,
-                codec_id: 0,
+                codec_id: 1,
                 flags: crate::flm::MANIFEST_FLAG_REQUIRED,
                 shape: [128, 1, 0, 0],
             },
@@ -1370,12 +1413,14 @@ mod tests {
                 name: "model.embed_tokens.weight",
                 shape: vec![2, 4],
                 dtype: 4,
+                codec: 0,
                 payload: (0u8..8).collect(),
             },
             TestFlmTensor {
                 name: "model.norm.weight",
                 shape: vec![2],
                 dtype: 2,
+                codec: 0,
                 payload: vec![0x00, 0x3f, 0x00, 0x40],
             },
         ]);
@@ -1411,6 +1456,7 @@ mod tests {
             name: "model.embed_tokens.weight",
             shape: vec![2, 4],
             dtype: 4,
+            codec: 0,
             payload: (0u8..8).collect(),
         }]);
         let runtime = build_test_runtime_directory();
@@ -1445,6 +1491,7 @@ mod tests {
                 name: "model.embed_tokens.weight",
                 shape: vec![4],
                 dtype: 4,
+                codec: 0,
                 payload: b"good".to_vec(),
             }],
             &[[
@@ -1487,6 +1534,7 @@ mod tests {
             name: "model.embed_tokens.weight",
             shape: vec![2, 4],
             dtype: 4,
+            codec: 0,
             payload: (0u8..8).collect(),
         }]);
         put_u64(&mut offset_only, 168, 4096);
@@ -1504,6 +1552,7 @@ mod tests {
             name: "model.embed_tokens.weight",
             shape: vec![2, 4],
             dtype: 4,
+            codec: 0,
             payload: (0u8..8).collect(),
         }]);
         put_u64(&mut len_only, 176, 16);
@@ -1537,6 +1586,11 @@ mod tests {
         assert_eq!(alias.layout, LayoutTag::Int4Quantized);
         assert_eq!(alias.dtype, "u8");
         assert_eq!(alias.shape, vec![128, 64]);
+        let scale = store
+            .meta("model.language_model.layers.0.mlp.gate_proj.weight_int4_scale")
+            .expect("native scale alias");
+        assert_eq!(scale.dtype, "bf16");
+        assert_eq!(scale.shape, vec![128, 1]);
     }
 
     #[test]
@@ -1565,12 +1619,14 @@ mod tests {
                 name: "model.language_model.layers.0.mlp.gate_proj.weight_packed",
                 shape: vec![128, 16],
                 dtype: FLM_DTYPE_INT32,
+                codec: 1,
                 payload: vec![0; 128],
             },
             TestFlmTensor {
                 name: "model.language_model.layers.0.mlp.gate_proj.weight_scale",
                 shape: vec![128, 1],
                 dtype: FLM_DTYPE_BF16,
+                codec: 0,
                 payload: vec![0; 256],
             },
         ]);
@@ -1790,7 +1846,7 @@ mod tests {
         let alias_name = "model.language_model.layers.0.linear_attn.in_proj_qkv.weight";
         let packed = store.meta(packed_name).expect("packed CT tensor missing");
         let alias = store.meta(alias_name).expect("native INT4 alias missing");
-        assert_eq!(packed.dtype, "u32");
+        assert_eq!(packed.dtype, "u8");
         assert_eq!(alias.dtype, "u8");
         assert_eq!(alias.layout, LayoutTag::Int4Quantized);
         assert_eq!(alias.shape, vec![10240, 2560]);
@@ -1801,6 +1857,10 @@ mod tests {
             .raw_bytes("model.language_model.layers.0.linear_attn.in_proj_qkv.weight_int4_scale")
             .expect("aliased scale bytes");
         assert_eq!(scale.len(), 819_200);
+        let scale_meta = store
+            .meta("model.language_model.layers.0.linear_attn.in_proj_qkv.weight_int4_scale")
+            .expect("aliased scale meta");
+        assert_eq!(scale_meta.dtype, "bf16");
         let zero = store
             .raw_bytes("model.language_model.layers.0.linear_attn.in_proj_qkv.weight_int4_zero")
             .expect("synthetic zero bytes");

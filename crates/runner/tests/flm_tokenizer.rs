@@ -50,3 +50,45 @@ fn flm_native_qwen_bpe_tokenizer_matches_embedded_hf_json_for_basic_prompt() {
         assert_eq!(native_ids, oracle_ids, "prompt={prompt:?}");
     }
 }
+
+#[test]
+fn flm_native_qwen_bpe_tokenizer_loads_without_hf_json() {
+    let Some(path) = std::env::var_os("SUPERSONIC_QWEN36_27B_NO_HF_FLM") else {
+        eprintln!("skipping: SUPERSONIC_QWEN36_27B_NO_HF_FLM is unset");
+        return;
+    };
+    let path = PathBuf::from(path);
+    if !path.exists() {
+        eprintln!(
+            "skipping: SUPERSONIC_QWEN36_27B_NO_HF_FLM path does not exist: {}",
+            path.display()
+        );
+        return;
+    }
+    let store = BakedStore::open_flm_with_options(
+        &path,
+        FlmLoadOptions {
+            compressed_tensors_int4_aliases: true,
+            verify_block_hashes: true,
+        },
+    )
+    .expect("open no-HF runnable FLM fixture");
+    let runtime = store
+        .flm_runtime()
+        .expect("no-HF FLM fixture has a runtime directory");
+
+    assert!(runtime.asset_by_kind("hf_tokenizer_json").is_none());
+
+    let native = runner::flm_tokenizer::load_qwen_bpe_from_flm(runtime)
+        .expect("load native Qwen BPE tokenizer from FLM assets");
+    let hello = native.encode("Hello", true).unwrap().get_ids().to_vec();
+    let quantization = native
+        .encode("GPU quantization", true)
+        .unwrap()
+        .get_ids()
+        .to_vec();
+
+    assert!(!hello.is_empty());
+    assert!(!quantization.is_empty());
+    assert_ne!(hello, quantization);
+}
