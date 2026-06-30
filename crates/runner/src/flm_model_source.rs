@@ -15,7 +15,7 @@ impl FlmModelSource {
         let store = model_store::BakedStore::open_flm_with_options(
             path,
             model_store::FlmLoadOptions {
-                compressed_tensors_int4_aliases: int4_runtime,
+                flm_int4_logical_aliases: int4_runtime,
                 ..Default::default()
             },
         )?;
