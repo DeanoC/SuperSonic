@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::Error;
 
@@ -8,20 +8,43 @@ pub const TENSOR_ABI_QWEN3_6_DENSE_CT_INT4_V1: u32 = 1;
 pub const CODEC_RAW_BF16: u16 = 1;
 pub const CODEC_SYM_INT4_G128_BF16: u16 = 2;
 pub const CODEC_RAW_I64: u16 = 3;
+pub const MODEL_QWEN3_6_DENSE_V1: u16 = 1;
+pub const QUANT_PROFILE_QWEN3_6_DENSE_CT_INT4_G128_BF16_V1: u32 = 1;
+pub const ASSET_TOKENIZER_VOCAB: u16 = 1;
+pub const ASSET_TOKENIZER_MERGES: u16 = 2;
+pub const ASSET_TOKENIZER_ADDED_TOKENS: u16 = 3;
+pub const ASSET_TOKENIZER_REGEX: u16 = 4;
+pub const ASSET_HF_CONFIG_JSON: u16 = 101;
+pub const ASSET_HF_TOKENIZER_JSON: u16 = 102;
+pub const ASSET_FLAG_REQUIRED_FOR_RUNTIME: u16 = 1 << 0;
+pub const ASSET_FLAG_COMPATIBILITY_ONLY: u16 = 1 << 1;
+pub const MANIFEST_COMPANION_NONE: u8 = 0;
+pub const MANIFEST_COMPANION_PACKED: u8 = 1;
+pub const MANIFEST_COMPANION_SCALE: u8 = 2;
+pub const MANIFEST_COMPANION_SHAPE: u8 = 3;
+pub const MANIFEST_COMPANION_SYNTHETIC_ZERO: u8 = 4;
+pub const MANIFEST_FLAG_REQUIRED: u8 = 1 << 0;
+pub const MANIFEST_FLAG_OPTIONAL: u8 = 1 << 1;
+pub const MANIFEST_FLAG_DERIVED_ALIAS: u8 = 1 << 3;
 
 const RUNTIME_MAGIC: &[u8; 8] = b"FLMRUN1\0";
-const RUNTIME_VERSION: u16 = 2;
+const RUNTIME_VERSION: u16 = 3;
 const SECTION_CONFIG_QWEN36_DENSE: u32 = 1;
 const SECTION_TOKENIZER: u32 = 2;
 const SECTION_CODEC_TABLE: u32 = 3;
 const SECTION_TENSOR_ABI: u32 = 4;
 const SECTION_ASSET_TABLE: u32 = 5;
 const SECTION_ASSET_PAYLOADS: u32 = 6;
+const SECTION_MODEL_DESCRIPTOR: u32 = 7;
+const SECTION_TENSOR_MANIFEST: u32 = 8;
 const SECTION_RECORD_SIZE: usize = 12;
 const HEADER_PREFIX_SIZE: usize = 16;
 const CONFIG_FIXED_SIZE: usize = 13 * 4 + 2 * 8 + 2 + 4;
 const TOKENIZER_SIZE: usize = 8 * 4;
 const CODEC_RECORD_SIZE: usize = 10;
+const MODEL_DESCRIPTOR_SIZE: usize = 24;
+const TENSOR_MANIFEST_HEADER_SIZE: usize = 12;
+const TENSOR_MANIFEST_ROW_SIZE: usize = 44;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FlmQwen36DenseConfig {
@@ -62,7 +85,9 @@ pub struct FlmTokenizerDescriptor {
 #[derive(Debug, Clone, PartialEq)]
 pub struct FlmAsset {
     pub asset_id: u32,
-    pub kind: String,
+    pub kind_id: u16,
+    pub flags: u16,
+    pub name: String,
     pub payload: Vec<u8>,
 }
 
@@ -84,6 +109,36 @@ pub struct FlmTensorAbiDescriptor {
     pub int4_shape_suffix: String,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct FlmModelDescriptor {
+    pub descriptor_version: u16,
+    pub model_id: u16,
+    pub config_section_id: u32,
+    pub tokenizer_id: u32,
+    pub tensor_abi_id: u32,
+    pub quant_profile_id: u32,
+    pub flags: u32,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FlmTensorManifestRow {
+    pub role_id: u32,
+    pub group_id: u32,
+    pub companion_kind: u8,
+    pub rank: u8,
+    pub dtype: u16,
+    pub logical_dtype: u16,
+    pub codec_id: u8,
+    pub flags: u8,
+    pub shape: [u32; 4],
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FlmTensorManifest {
+    pub rows: Vec<FlmTensorManifestRow>,
+}
+
 #[derive(Debug, Clone)]
 pub struct FlmRuntimeDirectory {
     pub architecture_id: u32,
@@ -92,6 +147,8 @@ pub struct FlmRuntimeDirectory {
     pub assets: HashMap<u32, FlmAsset>,
     codecs: Vec<FlmCodecDescriptor>,
     tensor_abi: FlmTensorAbiDescriptor,
+    model_descriptor: FlmModelDescriptor,
+    tensor_manifest: FlmTensorManifest,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -107,10 +164,15 @@ impl FlmRuntimeDirectory {
         let tokenizer = parse_tokenizer(section(buf, &sections, SECTION_TOKENIZER)?)?;
         let codecs = parse_codec_table(section(buf, &sections, SECTION_CODEC_TABLE)?)?;
         let tensor_abi = parse_tensor_abi(section(buf, &sections, SECTION_TENSOR_ABI)?)?;
+        let model_descriptor =
+            parse_model_descriptor(section(buf, &sections, SECTION_MODEL_DESCRIPTOR)?)?;
+        validate_model_descriptor(&model_descriptor, &tokenizer, &tensor_abi)?;
         let assets = parse_assets(
             section(buf, &sections, SECTION_ASSET_TABLE)?,
             section(buf, &sections, SECTION_ASSET_PAYLOADS)?,
         )?;
+        let tensor_manifest =
+            parse_tensor_manifest(section(buf, &sections, SECTION_TENSOR_MANIFEST)?)?;
 
         Ok(Self {
             architecture_id,
@@ -119,6 +181,8 @@ impl FlmRuntimeDirectory {
             assets,
             codecs,
             tensor_abi,
+            model_descriptor,
+            tensor_manifest,
         })
     }
 
@@ -135,7 +199,7 @@ impl FlmRuntimeDirectory {
     }
 
     pub fn asset_by_kind(&self, kind: &str) -> Option<&FlmAsset> {
-        self.assets.values().find(|asset| asset.kind == kind)
+        self.assets.values().find(|asset| asset.name == kind)
     }
 
     pub fn codecs(&self) -> &[FlmCodecDescriptor] {
@@ -154,6 +218,14 @@ impl FlmRuntimeDirectory {
 
     pub fn tensor_abi(&self) -> &FlmTensorAbiDescriptor {
         &self.tensor_abi
+    }
+
+    pub fn model_descriptor(&self) -> &FlmModelDescriptor {
+        &self.model_descriptor
+    }
+
+    pub fn tensor_manifest(&self) -> &FlmTensorManifest {
+        &self.tensor_manifest
     }
 }
 
@@ -194,7 +266,7 @@ fn parse_section_table(buf: &[u8]) -> Result<(u32, HashMap<u32, SectionRange>), 
     for idx in 0..section_count {
         let off = HEADER_PREFIX_SIZE + idx * SECTION_RECORD_SIZE;
         let section_id = read_u32(buf, off, "FLM runtime section id")?;
-        if !(SECTION_CONFIG_QWEN36_DENSE..=SECTION_ASSET_PAYLOADS).contains(&section_id) {
+        if !(SECTION_CONFIG_QWEN36_DENSE..=SECTION_TENSOR_MANIFEST).contains(&section_id) {
             return Err(Error::Other(format!(
                 "FLM runtime section {idx} has unknown id {section_id}"
             )));
@@ -217,7 +289,7 @@ fn parse_section_table(buf: &[u8]) -> Result<(u32, HashMap<u32, SectionRange>), 
         }
     }
 
-    for required in SECTION_CONFIG_QWEN36_DENSE..=SECTION_ASSET_PAYLOADS {
+    for required in SECTION_CONFIG_QWEN36_DENSE..=SECTION_TENSOR_MANIFEST {
         if !sections.contains_key(&required) {
             return Err(Error::Other(format!(
                 "FLM runtime missing required section {required}"
@@ -440,6 +512,78 @@ fn parse_tensor_abi(buf: &[u8]) -> Result<FlmTensorAbiDescriptor, Error> {
     })
 }
 
+fn parse_model_descriptor(buf: &[u8]) -> Result<FlmModelDescriptor, Error> {
+    if buf.len() != MODEL_DESCRIPTOR_SIZE {
+        return Err(Error::Other(format!(
+            "FLM model descriptor section has len {}; expected {MODEL_DESCRIPTOR_SIZE}",
+            buf.len()
+        )));
+    }
+    let mut offset = 0usize;
+    let descriptor = FlmModelDescriptor {
+        descriptor_version: read_u16_advance(buf, &mut offset, "FLM model descriptor version")?,
+        model_id: read_u16_advance(buf, &mut offset, "FLM model descriptor model_id")?,
+        config_section_id: read_u32_advance(
+            buf,
+            &mut offset,
+            "FLM model descriptor config_section_id",
+        )?,
+        tokenizer_id: read_u32_advance(buf, &mut offset, "FLM model descriptor tokenizer_id")?,
+        tensor_abi_id: read_u32_advance(buf, &mut offset, "FLM model descriptor tensor_abi_id")?,
+        quant_profile_id: read_u32_advance(
+            buf,
+            &mut offset,
+            "FLM model descriptor quant_profile_id",
+        )?,
+        flags: read_u32_advance(buf, &mut offset, "FLM model descriptor flags")?,
+    };
+    if descriptor.descriptor_version != 1 {
+        return Err(Error::Other(format!(
+            "unsupported FLM model descriptor version {}",
+            descriptor.descriptor_version
+        )));
+    }
+    Ok(descriptor)
+}
+
+fn validate_model_descriptor(
+    descriptor: &FlmModelDescriptor,
+    tokenizer: &FlmTokenizerDescriptor,
+    tensor_abi: &FlmTensorAbiDescriptor,
+) -> Result<(), Error> {
+    if descriptor.config_section_id != SECTION_CONFIG_QWEN36_DENSE {
+        return Err(Error::Other(format!(
+            "FLM model descriptor references unsupported config section {}",
+            descriptor.config_section_id
+        )));
+    }
+    if descriptor.tokenizer_id != tokenizer.tokenizer_id {
+        return Err(Error::Other(format!(
+            "FLM model descriptor tokenizer_id {} does not match tokenizer {}",
+            descriptor.tokenizer_id, tokenizer.tokenizer_id
+        )));
+    }
+    if descriptor.tensor_abi_id != tensor_abi.abi_id {
+        return Err(Error::Other(format!(
+            "FLM model descriptor tensor_abi_id {} does not match tensor ABI {}",
+            descriptor.tensor_abi_id, tensor_abi.abi_id
+        )));
+    }
+    if descriptor.model_id != MODEL_QWEN3_6_DENSE_V1 {
+        return Err(Error::Other(format!(
+            "unsupported FLM model id {}",
+            descriptor.model_id
+        )));
+    }
+    if descriptor.quant_profile_id != QUANT_PROFILE_QWEN3_6_DENSE_CT_INT4_G128_BF16_V1 {
+        return Err(Error::Other(format!(
+            "unsupported FLM quant profile id {}",
+            descriptor.quant_profile_id
+        )));
+    }
+    Ok(())
+}
+
 fn parse_assets(table: &[u8], payloads: &[u8]) -> Result<HashMap<u32, FlmAsset>, Error> {
     let mut offset = 0usize;
     let count = read_count(table, &mut offset, "FLM asset count")?;
@@ -457,11 +601,13 @@ fn parse_assets(table: &[u8], payloads: &[u8]) -> Result<HashMap<u32, FlmAsset>,
             &mut offset,
             "FLM asset payload_len",
         )?)?;
-        let kind_len = u32_to_usize(read_u32_advance(table, &mut offset, "FLM asset kind_len")?)?;
-        let kind_bytes = read_exact_range(table, offset, kind_len, "FLM asset kind")?;
-        offset += kind_len;
-        let kind = std::str::from_utf8(kind_bytes)
-            .map_err(|e| Error::Other(format!("FLM asset {asset_id} kind is not UTF-8: {e}")))?
+        let kind_id = read_u16_advance(table, &mut offset, "FLM asset kind_id")?;
+        let flags = read_u16_advance(table, &mut offset, "FLM asset flags")?;
+        let name_len = u32_to_usize(read_u32_advance(table, &mut offset, "FLM asset name_len")?)?;
+        let name_bytes = read_exact_range(table, offset, name_len, "FLM asset name")?;
+        offset += name_len;
+        let name = std::str::from_utf8(name_bytes)
+            .map_err(|e| Error::Other(format!("FLM asset {asset_id} name is not UTF-8: {e}")))?
             .to_string();
         let payload_end = payload_offset.checked_add(payload_len).ok_or_else(|| {
             Error::Other(format!(
@@ -481,7 +627,9 @@ fn parse_assets(table: &[u8], payloads: &[u8]) -> Result<HashMap<u32, FlmAsset>,
                 asset_id,
                 FlmAsset {
                     asset_id,
-                    kind,
+                    kind_id,
+                    flags,
+                    name,
                     payload,
                 },
             )
@@ -516,6 +664,141 @@ fn parse_assets(table: &[u8], payloads: &[u8]) -> Result<HashMap<u32, FlmAsset>,
         )));
     }
     Ok(assets)
+}
+
+fn parse_tensor_manifest(buf: &[u8]) -> Result<FlmTensorManifest, Error> {
+    read_exact_range(
+        buf,
+        0,
+        TENSOR_MANIFEST_HEADER_SIZE,
+        "FLM tensor manifest header",
+    )?;
+    let version = read_u16(buf, 0, "FLM tensor manifest version")?;
+    if version != 1 {
+        return Err(Error::Other(format!(
+            "unsupported FLM tensor manifest version {version}"
+        )));
+    }
+    let row_stride = read_u16(buf, 2, "FLM tensor manifest row_stride")? as usize;
+    if row_stride != TENSOR_MANIFEST_ROW_SIZE {
+        return Err(Error::Other(format!(
+            "FLM tensor manifest row stride {row_stride}; expected {TENSOR_MANIFEST_ROW_SIZE}"
+        )));
+    }
+    let row_count = u32_to_usize(read_u32(buf, 4, "FLM tensor manifest row_count")?)?;
+    let string_pool_len = u32_to_usize(read_u32(buf, 8, "FLM tensor manifest string_pool_len")?)?;
+    let rows_len = row_count.checked_mul(row_stride).ok_or_else(|| {
+        Error::Other("FLM tensor manifest row table length overflows".to_string())
+    })?;
+    let string_pool_offset = TENSOR_MANIFEST_HEADER_SIZE
+        .checked_add(rows_len)
+        .ok_or_else(|| {
+            Error::Other("FLM tensor manifest string pool offset overflows".to_string())
+        })?;
+    let expected_len = string_pool_offset
+        .checked_add(string_pool_len)
+        .ok_or_else(|| Error::Other("FLM tensor manifest length overflows".to_string()))?;
+    if buf.len() != expected_len {
+        return Err(Error::Other(format!(
+            "FLM tensor manifest has len {}; expected {expected_len}",
+            buf.len()
+        )));
+    }
+    let string_pool = read_exact_range(
+        buf,
+        string_pool_offset,
+        string_pool_len,
+        "FLM tensor manifest string pool",
+    )?;
+
+    let mut rows = Vec::with_capacity(row_count);
+    let mut required_names = HashSet::new();
+    for idx in 0..row_count {
+        let row_offset = TENSOR_MANIFEST_HEADER_SIZE + idx * row_stride;
+        let row = read_exact_range(buf, row_offset, row_stride, "FLM tensor manifest row")?;
+        let mut offset = 0usize;
+        let role_id = read_u32_advance(row, &mut offset, "FLM tensor manifest role_id")?;
+        let group_id = read_u32_advance(row, &mut offset, "FLM tensor manifest group_id")?;
+        let companion_kind =
+            read_u8_advance(row, &mut offset, "FLM tensor manifest companion_kind")?;
+        let rank = read_u8_advance(row, &mut offset, "FLM tensor manifest rank")?;
+        if rank > 4 {
+            return Err(Error::Other(format!(
+                "FLM tensor manifest row {idx} rank {rank} exceeds 4"
+            )));
+        }
+        let dtype = read_u16_advance(row, &mut offset, "FLM tensor manifest dtype")?;
+        let logical_dtype =
+            read_u16_advance(row, &mut offset, "FLM tensor manifest logical_dtype")?;
+        let codec_id = read_u8_advance(row, &mut offset, "FLM tensor manifest codec_id")?;
+        let flags = read_u8_advance(row, &mut offset, "FLM tensor manifest flags")?;
+        let mut shape = [0u32; 4];
+        for (dim_idx, dim) in shape.iter_mut().enumerate() {
+            *dim = read_u32_advance(
+                row,
+                &mut offset,
+                &format!("FLM tensor manifest shape[{dim_idx}]"),
+            )?;
+        }
+        let name_offset = u32_to_usize(read_u32_advance(
+            row,
+            &mut offset,
+            "FLM tensor manifest name_offset",
+        )?)?;
+        let name_len = read_u16_advance(row, &mut offset, "FLM tensor manifest name_len")? as usize;
+        let reserved = read_u16_advance(row, &mut offset, "FLM tensor manifest reserved")?;
+        if reserved != 0 {
+            return Err(Error::Other(format!(
+                "FLM tensor manifest row {idx} reserved field is nonzero ({reserved})"
+            )));
+        }
+        let name_end = name_offset.checked_add(name_len).ok_or_else(|| {
+            Error::Other(format!(
+                "FLM tensor manifest string range overflows for row {idx}"
+            ))
+        })?;
+        let name_bytes = read_exact_range(
+            string_pool,
+            name_offset,
+            name_len,
+            "FLM tensor manifest string",
+        )
+        .map_err(|e| {
+            Error::Other(format!(
+                "FLM tensor manifest string bounds invalid for row {idx}: {e}"
+            ))
+        })?;
+        if name_end > string_pool_len {
+            return Err(Error::Other(format!(
+                "FLM tensor manifest string bounds invalid for row {idx}"
+            )));
+        }
+        let name = std::str::from_utf8(name_bytes)
+            .map_err(|e| {
+                Error::Other(format!(
+                    "FLM tensor manifest string for row {idx} is not UTF-8: {e}"
+                ))
+            })?
+            .to_string();
+        if flags & MANIFEST_FLAG_REQUIRED != 0 && !required_names.insert(name.clone()) {
+            return Err(Error::Other(format!(
+                "FLM tensor manifest has duplicate required name {name}"
+            )));
+        }
+        rows.push(FlmTensorManifestRow {
+            role_id,
+            group_id,
+            companion_kind,
+            rank,
+            dtype,
+            logical_dtype,
+            codec_id,
+            flags,
+            shape,
+            name,
+        });
+    }
+    Ok(FlmTensorManifest { rows })
 }
 
 fn read_exact_range<'a>(
@@ -557,6 +840,12 @@ fn read_f64(buf: &[u8], offset: usize, what: &str) -> Result<f64, Error> {
         .try_into()
         .expect("slice length checked");
     Ok(f64::from_le_bytes(bytes))
+}
+
+fn read_u8_advance(buf: &[u8], offset: &mut usize, what: &str) -> Result<u8, Error> {
+    let value = read_exact_range(buf, *offset, 1, what)?[0];
+    *offset += 1;
+    Ok(value)
 }
 
 fn read_u16_advance(buf: &[u8], offset: &mut usize, what: &str) -> Result<u16, Error> {
@@ -670,7 +959,16 @@ mod tests {
 
     fn build_tokenizer_section() -> Vec<u8> {
         let mut out = Vec::new();
-        for value in [0u32, TOKENIZER_QWEN_BPE_V1, 151_936, 1, 2, 3, 4, 0] {
+        for value in [
+            TOKENIZER_QWEN_BPE_V1,
+            TOKENIZER_QWEN_BPE_V1,
+            151_936,
+            1,
+            2,
+            3,
+            4,
+            0,
+        ] {
             write_u32(&mut out, value);
         }
         out
@@ -705,23 +1003,117 @@ mod tests {
 
     fn build_asset_sections() -> (Vec<u8>, Vec<u8>) {
         let assets = [
-            (1u32, "tokenizer_vocab", br#"{"hello":0}"#.as_slice()),
-            (2u32, "tokenizer_merges", b"#version: 0.2\n".as_slice()),
-            (3u32, "tokenizer_added_tokens", b"[]".as_slice()),
-            (4u32, "tokenizer_regex", br#"\p{L}+"#.as_slice()),
+            (
+                1u32,
+                ASSET_TOKENIZER_VOCAB,
+                ASSET_FLAG_REQUIRED_FOR_RUNTIME,
+                "tokenizer_vocab",
+                br#"{"hello":0}"#.as_slice(),
+            ),
+            (
+                2u32,
+                ASSET_TOKENIZER_MERGES,
+                ASSET_FLAG_REQUIRED_FOR_RUNTIME,
+                "tokenizer_merges",
+                b"#version: 0.2\n".as_slice(),
+            ),
+            (
+                3u32,
+                ASSET_TOKENIZER_ADDED_TOKENS,
+                0,
+                "tokenizer_added_tokens",
+                b"[]".as_slice(),
+            ),
+            (
+                4u32,
+                ASSET_TOKENIZER_REGEX,
+                ASSET_FLAG_REQUIRED_FOR_RUNTIME,
+                "tokenizer_regex",
+                br#"\p{L}+"#.as_slice(),
+            ),
         ];
         let mut table = Vec::new();
         let mut payloads = Vec::new();
         write_u32(&mut table, assets.len() as u32);
-        for (asset_id, kind, payload) in assets {
+        for (asset_id, kind_id, flags, name, payload) in assets {
             write_u32(&mut table, asset_id);
             write_u32(&mut table, payloads.len() as u32);
             write_u32(&mut table, payload.len() as u32);
-            write_u32(&mut table, kind.len() as u32);
-            table.extend_from_slice(kind.as_bytes());
+            write_u16(&mut table, kind_id);
+            write_u16(&mut table, flags);
+            write_u32(&mut table, name.len() as u32);
+            table.extend_from_slice(name.as_bytes());
             payloads.extend_from_slice(payload);
         }
         (table, payloads)
+    }
+
+    fn build_model_descriptor_section() -> Vec<u8> {
+        let mut out = Vec::new();
+        write_u16(&mut out, 1);
+        write_u16(&mut out, MODEL_QWEN3_6_DENSE_V1);
+        write_u32(&mut out, SECTION_CONFIG_QWEN36_DENSE);
+        write_u32(&mut out, TOKENIZER_QWEN_BPE_V1);
+        write_u32(&mut out, TENSOR_ABI_QWEN3_6_DENSE_CT_INT4_V1);
+        write_u32(&mut out, QUANT_PROFILE_QWEN3_6_DENSE_CT_INT4_G128_BF16_V1);
+        write_u32(&mut out, 0);
+        out
+    }
+
+    fn write_manifest_row(
+        out: &mut Vec<u8>,
+        role_id: u32,
+        group_id: u32,
+        companion_kind: u8,
+        rank: u8,
+        dtype: u16,
+        logical_dtype: u16,
+        codec_id: u8,
+        flags: u8,
+        shape: [u32; 4],
+        name_offset: u32,
+        name_len: u16,
+    ) {
+        write_u32(out, role_id);
+        write_u32(out, group_id);
+        out.push(companion_kind);
+        out.push(rank);
+        write_u16(out, dtype);
+        write_u16(out, logical_dtype);
+        out.push(codec_id);
+        out.push(flags);
+        for dim in shape {
+            write_u32(out, dim);
+        }
+        write_u32(out, name_offset);
+        write_u16(out, name_len);
+        write_u16(out, 0);
+        write_u32(out, 0);
+    }
+
+    fn build_tensor_manifest_section() -> Vec<u8> {
+        let names = b"model.language_model.layers.0.mlp.gate_proj.weight_packed";
+        let mut out = Vec::new();
+        write_u16(&mut out, 1);
+        write_u16(&mut out, TENSOR_MANIFEST_ROW_SIZE as u16);
+        write_u32(&mut out, 1);
+        write_u32(&mut out, names.len() as u32);
+        write_manifest_row(
+            &mut out,
+            1,
+            0,
+            MANIFEST_COMPANION_PACKED,
+            2,
+            CODEC_SYM_INT4_G128_BF16,
+            CODEC_SYM_INT4_G128_BF16,
+            1,
+            MANIFEST_FLAG_REQUIRED,
+            [5120, 27648, 0, 0],
+            0,
+            names.len() as u16,
+        );
+        out.extend_from_slice(names);
+        out
     }
 
     fn build_test_runtime_directory() -> Vec<u8> {
@@ -733,12 +1125,14 @@ mod tests {
             (4u32, build_tensor_abi_section()),
             (5u32, asset_table),
             (6u32, asset_payloads),
+            (7u32, build_model_descriptor_section()),
+            (8u32, build_tensor_manifest_section()),
         ];
         let header_len = 8 + 2 + 2 + 4 + sections.len() * 12;
         let mut offset = header_len as u32;
         let mut out = Vec::new();
         out.extend_from_slice(b"FLMRUN1\0");
-        write_u16(&mut out, 2);
+        write_u16(&mut out, 3);
         write_u16(&mut out, sections.len() as u16);
         write_u32(&mut out, ARCH_QWEN3_6_DENSE);
         for (section_id, data) in &sections {
@@ -791,6 +1185,17 @@ mod tests {
         put_u32_at(runtime, record + 4, offset - 1);
     }
 
+    fn shift_sections_after(runtime: &mut [u8], insert_offset: usize, amount: usize) {
+        let count = read_u16_at(runtime, 10) as usize;
+        for idx in 0..count {
+            let record = 16 + idx * 12;
+            let offset = read_u32_at(runtime, record + 4) as usize;
+            if offset >= insert_offset {
+                put_u32_at(runtime, record + 4, (offset + amount) as u32);
+            }
+        }
+    }
+
     fn asset_payload_record(runtime: &[u8], asset_id: u32) -> (usize, usize, usize) {
         let (table_offset, _) = section_range(runtime, SECTION_ASSET_TABLE);
         let count = read_u32_at(runtime, table_offset) as usize;
@@ -799,11 +1204,11 @@ mod tests {
             let current_id = read_u32_at(runtime, offset);
             let payload_offset = read_u32_at(runtime, offset + 4) as usize;
             let payload_len = read_u32_at(runtime, offset + 8) as usize;
-            let kind_len = read_u32_at(runtime, offset + 12) as usize;
+            let name_len = read_u32_at(runtime, offset + 16) as usize;
             if current_id == asset_id {
                 return (offset + 4, payload_offset, payload_len);
             }
-            offset += 16 + kind_len;
+            offset += 20 + name_len;
         }
         panic!("missing asset {asset_id}");
     }
@@ -812,7 +1217,9 @@ mod tests {
         let (payload_section_offset, payload_section_len) =
             section_range(runtime, SECTION_ASSET_PAYLOADS);
         let (_, gap_offset, _) = asset_payload_record(runtime, asset_id);
-        runtime.insert(payload_section_offset + gap_offset, 0);
+        let insert_offset = payload_section_offset + gap_offset;
+        runtime.insert(insert_offset, 0);
+        shift_sections_after(runtime, insert_offset, 1);
 
         let payload_record = section_record_offset(runtime, SECTION_ASSET_PAYLOADS);
         put_u32_at(
@@ -829,14 +1236,17 @@ mod tests {
             if payload_offset >= gap_offset {
                 put_u32_at(runtime, offset + 4, (payload_offset + 1) as u32);
             }
-            let kind_len = read_u32_at(runtime, offset + 12) as usize;
-            offset += 16 + kind_len;
+            let name_len = read_u32_at(runtime, offset + 16) as usize;
+            offset += 20 + name_len;
         }
     }
 
     fn append_asset_payload_trailing_byte(runtime: &mut Vec<u8>) {
-        let (_, payload_section_len) = section_range(runtime, SECTION_ASSET_PAYLOADS);
-        runtime.push(0);
+        let (payload_section_offset, payload_section_len) =
+            section_range(runtime, SECTION_ASSET_PAYLOADS);
+        let insert_offset = payload_section_offset + payload_section_len;
+        runtime.insert(insert_offset, 0);
+        shift_sections_after(runtime, insert_offset, 1);
         let payload_record = section_record_offset(runtime, SECTION_ASSET_PAYLOADS);
         put_u32_at(
             runtime,
@@ -862,9 +1272,12 @@ mod tests {
         assert_eq!(parsed.architecture_id, ARCH_QWEN3_6_DENSE);
         assert_eq!(parsed.qwen36_config().unwrap().hidden_size, 5120);
         assert_eq!(parsed.qwen36_config().unwrap().full_attention_layers[0], 3);
-        assert_eq!(parsed.tokenizer().unwrap().tokenizer_id, 0);
+        assert_eq!(
+            parsed.tokenizer().unwrap().tokenizer_id,
+            TOKENIZER_QWEN_BPE_V1
+        );
         assert_eq!(parsed.tokenizer().unwrap().vocab_asset_id, 1);
-        assert_eq!(parsed.asset(4).unwrap().kind, "tokenizer_regex");
+        assert_eq!(parsed.asset(4).unwrap().name, "tokenizer_regex");
         assert_eq!(parsed.tensor_abi().weight_prefix, "model.language_model");
         assert_eq!(parsed.tensor_abi().int4_packed_suffix, ".weight_packed");
         assert_eq!(parsed.tensor_abi().int4_scale_suffix, ".weight_scale");
@@ -896,8 +1309,42 @@ mod tests {
         expect_parse_error_contains(&runtime, "bad FLM runtime magic");
 
         let mut runtime = build_test_runtime_directory();
-        put_u16_at(&mut runtime, 8, 3);
+        put_u16_at(&mut runtime, 8, 4);
         expect_parse_error_contains(&runtime, "unsupported FLM runtime version");
+    }
+
+    #[test]
+    fn parses_runtime_v3_model_descriptor_asset_kinds_and_tensor_manifest() {
+        let runtime = build_test_runtime_directory();
+        let parsed = FlmRuntimeDirectory::parse(&runtime).expect("parse runtime v3");
+
+        assert_eq!(parsed.model_descriptor().model_id, MODEL_QWEN3_6_DENSE_V1);
+        assert_eq!(
+            parsed.model_descriptor().quant_profile_id,
+            QUANT_PROFILE_QWEN3_6_DENSE_CT_INT4_G128_BF16_V1
+        );
+        assert_eq!(parsed.asset(1).unwrap().kind_id, ASSET_TOKENIZER_VOCAB);
+        assert!(parsed.asset(1).unwrap().flags & ASSET_FLAG_REQUIRED_FOR_RUNTIME != 0);
+        assert!(parsed.tensor_manifest().rows.iter().any(|row| {
+            row.name == "model.language_model.layers.0.mlp.gate_proj.weight_packed"
+                && row.companion_kind == MANIFEST_COMPANION_PACKED
+        }));
+    }
+
+    #[test]
+    fn rejects_runtime_v2_on_normal_parser_path() {
+        let mut runtime = build_test_runtime_directory();
+        put_u16_at(&mut runtime, 8, 2);
+        expect_parse_error_contains(&runtime, "unsupported FLM runtime version");
+    }
+
+    #[test]
+    fn rejects_manifest_string_bounds() {
+        let mut runtime = build_test_runtime_directory();
+        let (manifest_offset, _) = section_range(&runtime, SECTION_TENSOR_MANIFEST);
+        let row_name_len = manifest_offset + 12 + 4 + 4 + 1 + 1 + 2 + 2 + 1 + 1 + 16 + 4;
+        put_u16_at(&mut runtime, row_name_len, u16::MAX);
+        expect_parse_error_contains(&runtime, "manifest string");
     }
 
     #[test]
@@ -939,7 +1386,7 @@ mod tests {
 
         let mut runtime = build_test_runtime_directory();
         let (table_offset, _) = section_range(&runtime, SECTION_ASSET_TABLE);
-        runtime[table_offset + 4 + 16] = 0xff;
+        runtime[table_offset + 4 + 20] = 0xff;
         expect_parse_error_contains(&runtime, "not UTF-8");
     }
 
