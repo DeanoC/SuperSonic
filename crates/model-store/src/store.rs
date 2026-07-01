@@ -167,6 +167,29 @@ fn u64_to_usize(value: u64, what: &str) -> Result<usize, Error> {
     usize::try_from(value).map_err(|_| Error::Other(format!("{what}: {value} does not fit usize")))
 }
 
+fn flm_crc64_ecma(data: &[u8]) -> u64 {
+    let mut crc = 0u64;
+    const POLY: u64 = 0x42F0_E1EB_A9EA_3693;
+    for byte in data {
+        crc ^= (*byte as u64) << 56;
+        for _ in 0..8 {
+            crc = if crc & (1 << 63) != 0 {
+                (crc << 1) ^ POLY
+            } else {
+                crc << 1
+            };
+        }
+    }
+    crc
+}
+
+fn flm_head_crc64(head: &[u8]) -> Result<u64, Error> {
+    let mut checked = head.to_vec();
+    read_exact_range(&checked, 144, 8, "FLM head CRC64 field")?;
+    checked[144..152].fill(0);
+    Ok(flm_crc64_ecma(&checked))
+}
+
 fn flm_parse_superblock(buf: &[u8]) -> Result<FlmSuperblock, Error> {
     let sb = read_exact_range(buf, 0, FLM_SUPERBLOCK_SIZE, "FLM superblock")?;
     if &sb[..8] != FLM_MAGIC {
@@ -199,6 +222,19 @@ fn flm_parse_superblock(buf: &[u8]) -> Result<FlmSuperblock, Error> {
         read_u64(sb, 88, "FLM shard_table_offset")?,
         "FLM shard_table_offset",
     )?;
+    if shard_table_offset < FLM_SUPERBLOCK_SIZE {
+        return Err(Error::Other(format!(
+            "malformed FLM head CRC region: shard_table_offset={shard_table_offset}"
+        )));
+    }
+    let stored_head_crc64 = read_u64(sb, 144, "FLM head_crc64")?;
+    let head = read_exact_range(buf, 0, shard_table_offset, "FLM head CRC64 region")?;
+    let actual_head_crc64 = flm_head_crc64(head)?;
+    if stored_head_crc64 != actual_head_crc64 {
+        return Err(Error::Other(format!(
+            "FLM head CRC mismatch: stored={stored_head_crc64}, computed={actual_head_crc64}"
+        )));
+    }
     let shard_count = read_u32(sb, 96, "FLM shard_count")? as usize;
     let runtime_dir_offset = u64_to_usize(
         read_u64(sb, 168, "FLM runtime_dir_offset")?,
@@ -1193,6 +1229,14 @@ mod tests {
         }
     }
 
+    fn put_head_crc64(buf: &mut [u8]) {
+        let shard_table_offset =
+            read_u64(buf, 88, "test FLM shard table offset").expect("shard table offset") as usize;
+        put_u64(buf, 144, 0);
+        let crc = flm_head_crc64(&buf[..shard_table_offset]).expect("head CRC64");
+        put_u64(buf, 144, crc);
+    }
+
     fn build_test_flm(tensors: &[TestFlmTensor]) -> Vec<u8> {
         build_test_flm_inner(tensors, None)
     }
@@ -1282,6 +1326,7 @@ mod tests {
         put_u32(&mut out, 100, alignment as u32);
         put_u64(&mut out, 104, shard.len() as u64);
         put_u16(&mut out, 156, 1);
+        put_head_crc64(&mut out);
         out
     }
 
@@ -1713,6 +1758,7 @@ mod tests {
         data.extend_from_slice(runtime);
         put_u64(data, 168, runtime_offset as u64);
         put_u64(data, 176, runtime.len() as u64);
+        put_head_crc64(data);
     }
 
     fn build_test_flm_with_runtime_manifest_group() -> Vec<u8> {
@@ -1811,6 +1857,11 @@ mod tests {
     }
 
     #[test]
+    fn flm_crc64_ecma_matches_standard_check_vector() {
+        assert_eq!(flm_crc64_ecma(b"123456789"), 0x6C40_DF5F_0B49_7347);
+    }
+
+    #[test]
     fn open_flm_exposes_mmap_backed_tensor_bytes() {
         let data = build_test_flm(&[
             TestFlmTensor {
@@ -1855,6 +1906,29 @@ mod tests {
     }
 
     #[test]
+    fn open_flm_rejects_bad_head_crc64() {
+        let mut data = build_test_flm(&[TestFlmTensor {
+            name: "model.embed_tokens.weight",
+            shape: vec![4],
+            dtype: 4,
+            codec: 0,
+            payload: b"good".to_vec(),
+        }]);
+        put_u64(&mut data, 144, 1);
+        let file = write_temp_flm(&data);
+
+        let err = match BakedStore::open_flm(file.path()) {
+            Ok(_) => panic!("bad FLM head CRC64 should fail verification"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string().contains("head CRC"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn open_flm_parses_runtime_directory_when_offsets_present() {
         let mut data = build_test_flm(&[TestFlmTensor {
             name: "model.embed_tokens.weight",
@@ -1868,6 +1942,7 @@ mod tests {
         data.extend_from_slice(&runtime);
         put_u64(&mut data, 168, runtime_offset as u64);
         put_u64(&mut data, 176, runtime.len() as u64);
+        put_head_crc64(&mut data);
         let file = write_temp_flm(&data);
 
         let store = BakedStore::open_flm(file.path()).expect("open FLM with runtime");
@@ -1942,6 +2017,7 @@ mod tests {
             payload: (0u8..8).collect(),
         }]);
         put_u64(&mut offset_only, 168, 4096);
+        put_head_crc64(&mut offset_only);
         let file = write_temp_flm(&offset_only);
         let err = match BakedStore::open_flm(file.path()) {
             Ok(_) => panic!("zero runtime len should fail"),
@@ -1960,6 +2036,7 @@ mod tests {
             payload: (0u8..8).collect(),
         }]);
         put_u64(&mut len_only, 176, 16);
+        put_head_crc64(&mut len_only);
         let file = write_temp_flm(&len_only);
         let err = match BakedStore::open_flm(file.path()) {
             Ok(_) => panic!("zero runtime offset should fail"),
