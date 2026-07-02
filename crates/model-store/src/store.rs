@@ -4172,6 +4172,101 @@ mod tests {
     }
 
     #[test]
+    fn flm_qwen36_35b_mxfp4_preserve_lowbit_loadable() {
+        let Ok(flm_path_str) = std::env::var("SUPERSONIC_QWEN36_35B_MXFP4_FLM") else {
+            eprintln!(
+                "skip: SUPERSONIC_QWEN36_35B_MXFP4_FLM not set. Point it at a \
+                 preserve-lowbit Qwen3.6-35B-A3B-MXFP4 FLM to validate full MoE \
+                 MXFP4 aliases."
+            );
+            return;
+        };
+        let store = BakedStore::open_flm_with_options(
+            Path::new(&flm_path_str),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                verify_block_hashes: true,
+            },
+        )
+        .expect("open qwen3.6-35b MXFP4 FLM");
+
+        let runtime = store.flm_runtime().expect("runtime directory");
+        let moe = runtime.qwen36_moe_config().expect("MoE runtime config");
+        assert_eq!(moe.hidden_size, 2048);
+        assert_eq!(moe.num_hidden_layers, 40);
+        assert_eq!(moe.num_experts, 256);
+        assert_eq!(moe.num_experts_per_tok, 8);
+
+        let raw_count = runtime
+            .logical_tensors()
+            .iter()
+            .filter(|logical| logical.value_format_id == crate::flm::VALUE_FORMAT_RAW_DENSE)
+            .count();
+        let mxfp4_count = runtime
+            .logical_tensors()
+            .iter()
+            .filter(|logical| logical.value_format_id == crate::flm::VALUE_FORMAT_MXFP4_E2M1)
+            .count();
+        assert_eq!(raw_count, 463);
+        assert_eq!(mxfp4_count, 30_870);
+
+        let embed = store
+            .meta("model.language_model.embed_tokens.weight")
+            .expect("embed_tokens missing");
+        assert_eq!(embed.dtype, "bf16");
+        assert_eq!(embed.shape, vec![248320, 2048]);
+        assert_eq!(embed.byte_len, 1_017_118_720);
+
+        let lm_head = store.meta("lm_head.weight").expect("lm_head missing");
+        assert_eq!(lm_head.dtype, "bf16");
+        assert_eq!(lm_head.shape, vec![248320, 2048]);
+        assert_eq!(lm_head.byte_len, 1_017_118_720);
+
+        let qkv_name = "model.language_model.layers.0.linear_attn.in_proj_qkv.weight";
+        let qkv = store.meta(qkv_name).expect("MXFP4 qkv logical alias");
+        assert_eq!(qkv.dtype, "u8");
+        assert_eq!(qkv.shape, vec![8192, 2048]);
+        assert_eq!(qkv.byte_len, 8_388_608);
+        assert_eq!(
+            store.upload_view(qkv_name).expect("MXFP4 qkv upload view"),
+            &TensorUploadView {
+                dtype: "u8".to_string(),
+                shape: vec![8192, 1024],
+            }
+        );
+        let qkv_scale = store
+            .meta("model.language_model.layers.0.linear_attn.in_proj_qkv.weight_mxfp4_scale")
+            .expect("MXFP4 qkv scale alias");
+        assert_eq!(qkv_scale.dtype, "u8");
+        assert_eq!(qkv_scale.shape, vec![8192, 64]);
+
+        let expert_name = "model.language_model.layers.0.mlp.experts.0.gate_proj.weight";
+        let expert = store.meta(expert_name).expect("MXFP4 expert logical alias");
+        assert_eq!(expert.dtype, "u8");
+        assert_eq!(expert.shape, vec![512, 2048]);
+        assert_eq!(expert.byte_len, 524_288);
+        assert_eq!(
+            store
+                .upload_view(expert_name)
+                .expect("MXFP4 expert upload view"),
+            &TensorUploadView {
+                dtype: "u8".to_string(),
+                shape: vec![512, 1024],
+            }
+        );
+        let expert_scale = store
+            .meta("model.language_model.layers.0.mlp.experts.0.gate_proj.weight_mxfp4_scale")
+            .expect("MXFP4 expert scale alias");
+        assert_eq!(expert_scale.dtype, "u8");
+        assert_eq!(expert_scale.shape, vec![512, 64]);
+
+        eprintln!(
+            "[flm-validate] OK — {} tensors including 35B MXFP4 aliases",
+            store.index.len()
+        );
+    }
+
+    #[test]
     fn flm_qwen36_27b_direct_views_upload_to_hip() {
         let Ok(flm_path_str) = std::env::var("SUPERSONIC_QWEN36_27B_FLM_HIP_UPLOAD") else {
             eprintln!(
@@ -4292,6 +4387,46 @@ mod tests {
         assert_eq!(fp8.shape(), &[8192, 2048]);
 
         eprintln!("[flm-upload] OK — 35B NVFP4 FLM direct views uploaded to HIP");
+    }
+
+    #[test]
+    fn flm_qwen36_35b_mxfp4_direct_views_upload_to_hip() {
+        let Ok(flm_path_str) = std::env::var("SUPERSONIC_QWEN36_35B_MXFP4_FLM_HIP_UPLOAD") else {
+            eprintln!(
+                "skip: SUPERSONIC_QWEN36_35B_MXFP4_FLM_HIP_UPLOAD not set. Point it at a \
+                 preserve-lowbit Qwen3.6-35B-A3B-MXFP4 FLM to validate HIP uploads."
+            );
+            return;
+        };
+        gpu_hal::set_backend(gpu_hal::Backend::Hip);
+        let store = BakedStore::open_flm_with_options(
+            Path::new(&flm_path_str),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                verify_block_hashes: false,
+            },
+        )
+        .expect("open qwen3.6-35b MXFP4 FLM");
+
+        let expert = store
+            .load_to_gpu(
+                "model.language_model.layers.0.mlp.experts.0.gate_proj.weight",
+                0,
+            )
+            .expect("upload MXFP4 expert logical alias with direct view");
+        assert_eq!(expert.dtype(), ScalarType::U8);
+        assert_eq!(expert.shape(), &[512, 1024]);
+
+        let expert_scale = store
+            .load_to_gpu(
+                "model.language_model.layers.0.mlp.experts.0.gate_proj.weight_mxfp4_scale",
+                0,
+            )
+            .expect("upload MXFP4 expert scale alias with direct view");
+        assert_eq!(expert_scale.dtype(), ScalarType::U8);
+        assert_eq!(expert_scale.shape(), &[512, 64]);
+
+        eprintln!("[flm-upload] OK — 35B MXFP4 FLM direct views uploaded to HIP");
     }
 
     #[test]
