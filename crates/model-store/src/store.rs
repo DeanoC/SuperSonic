@@ -2635,6 +2635,64 @@ mod tests {
     }
 
     #[test]
+    fn flm_tiny_qwen36_raw_fp32_and_int4_aliases_loadable() {
+        let Ok(flm_path_str) = std::env::var("SUPERSONIC_TINY_QWEN36_FLM") else {
+            eprintln!(
+                "skip: SUPERSONIC_TINY_QWEN36_FLM not set. Point it at a tiny \
+                 converter-produced Qwen3.6 FLM to validate Stage 3 raw VALUE and \
+                 INT4 aliases."
+            );
+            return;
+        };
+        let store = BakedStore::open_flm_with_options(
+            Path::new(&flm_path_str),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                verify_block_hashes: true,
+            },
+        )
+        .expect("open tiny qwen3.6 FLM");
+
+        let raw_name = "model.language_model.layers.0.linear_attn.A_log";
+        let raw = store.meta(raw_name).expect("raw FP32 logical tensor");
+        assert_eq!(raw.layout, LayoutTag::Raw);
+        assert_eq!(raw.dtype, "f32");
+        assert_eq!(raw.shape, vec![4]);
+        assert_eq!(raw.byte_len, 16);
+        let raw_view = store
+            .upload_view(raw_name)
+            .expect("raw FP32 direct upload view");
+        assert_eq!(raw_view.dtype, "f32");
+        assert_eq!(raw_view.shape, vec![4]);
+
+        let packed_name = "model.language_model.layers.0.linear_attn.out_proj.weight_packed";
+        let alias_name = "model.language_model.layers.0.linear_attn.out_proj.weight";
+        let packed = store.meta(packed_name).expect("packed INT4 storage tensor");
+        let alias = store.meta(alias_name).expect("logical INT4 alias");
+        assert_eq!(alias.layout, LayoutTag::Int4Quantized);
+        assert_eq!(alias.dtype, "u8");
+        assert_eq!(alias.shape, vec![8, 128]);
+        assert_eq!(alias.offset, packed.offset);
+        assert_eq!(alias.byte_len, packed.byte_len);
+        let alias_view = store
+            .upload_view(alias_name)
+            .expect("logical INT4 direct upload view");
+        assert_eq!(alias_view.dtype, "u8");
+        assert_eq!(alias_view.shape, vec![8, 64]);
+
+        let runtime = store.flm_runtime().expect("runtime directory");
+        let raw_logical = runtime
+            .logical_tensors()
+            .iter()
+            .find(|logical| logical.name == raw_name)
+            .expect("raw logical runtime row");
+        assert_eq!(
+            raw_logical.value_format_id,
+            crate::flm::VALUE_FORMAT_RAW_DENSE
+        );
+    }
+
+    #[test]
     fn flm_qwen36_27b_direct_views_upload_to_hip() {
         let Ok(flm_path_str) = std::env::var("SUPERSONIC_QWEN36_27B_FLM_HIP_UPLOAD") else {
             eprintln!(
