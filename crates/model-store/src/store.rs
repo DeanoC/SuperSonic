@@ -3788,6 +3788,77 @@ mod tests {
     }
 
     #[test]
+    fn flm_qwen36_27b_fp8_preserve_lowbit_loadable() {
+        let Ok(flm_path_str) = std::env::var("SUPERSONIC_QWEN36_27B_FP8_FLM") else {
+            eprintln!(
+                "skip: SUPERSONIC_QWEN36_27B_FP8_FLM not set. Point it at a \
+                 preserve-lowbit Qwen3.6-27B-FP8 FLM to validate Stage 3 FP8 \
+                 block-scale aliases."
+            );
+            return;
+        };
+        let store = BakedStore::open_flm_with_options(
+            Path::new(&flm_path_str),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                verify_block_hashes: true,
+            },
+        )
+        .expect("open qwen3.6-27b FP8 FLM");
+
+        let embed = store
+            .meta("model.language_model.embed_tokens.weight")
+            .expect("embed_tokens missing");
+        assert_eq!(embed.dtype, "bf16");
+        assert_eq!(embed.shape, vec![248320, 5120]);
+        assert_eq!(embed.byte_len, 2_542_796_800);
+
+        let fp8_name = "model.language_model.layers.0.linear_attn.in_proj_qkv.weight";
+        let fp8 = store
+            .meta(fp8_name)
+            .expect("Qwen FP8 logical alias missing");
+        assert_eq!(fp8.layout, LayoutTag::Raw);
+        assert_eq!(fp8.dtype, "f8_e4m3");
+        assert_eq!(fp8.shape, vec![10240, 5120]);
+        assert_eq!(fp8.byte_len, 52_428_800);
+        assert_eq!(
+            store
+                .upload_view(fp8_name)
+                .expect("Qwen FP8 direct upload view"),
+            &TensorUploadView {
+                dtype: "f8_e4m3".to_string(),
+                shape: vec![10240, 5120],
+            }
+        );
+
+        let scale_alias = concat!(
+            "model.language_model.layers.0.linear_attn.in_proj_qkv.",
+            "weight_fp8_e4m3_b128_bf16_scale_inv"
+        );
+        let scale = store
+            .meta(scale_alias)
+            .expect("Qwen FP8 inverse-scale alias missing");
+        assert_eq!(scale.dtype, "bf16");
+        assert_eq!(scale.shape, vec![80, 40]);
+        assert_eq!(scale.byte_len, 6_400);
+
+        let runtime = store.flm_runtime().expect("runtime directory");
+        let fp8_logical_count = runtime
+            .logical_tensors()
+            .iter()
+            .filter(|logical| {
+                logical.value_format_id == crate::flm::VALUE_FORMAT_FP8_E4M3_B128_BF16_INV
+            })
+            .count();
+        assert_eq!(fp8_logical_count, 407);
+
+        eprintln!(
+            "[flm-validate] OK — {} tensors including Qwen FP8 block-scale aliases",
+            store.index.len()
+        );
+    }
+
+    #[test]
     fn flm_tiny_qwen36_raw_fp32_and_int4_aliases_loadable() {
         let Ok(flm_path_str) = std::env::var("SUPERSONIC_TINY_QWEN36_FLM") else {
             eprintln!(
@@ -4054,6 +4125,49 @@ mod tests {
         assert_eq!(scale.shape(), &[10240, 40]);
 
         eprintln!("[flm-upload] OK — FLM direct views uploaded to HIP");
+    }
+
+    #[test]
+    fn flm_qwen36_27b_fp8_direct_views_upload_to_hip() {
+        let Ok(flm_path_str) = std::env::var("SUPERSONIC_QWEN36_27B_FP8_FLM_HIP_UPLOAD") else {
+            eprintln!(
+                "skip: SUPERSONIC_QWEN36_27B_FP8_FLM_HIP_UPLOAD not set. Point it at a \
+                 preserve-lowbit Qwen3.6-27B-FP8 FLM to validate HIP uploads."
+            );
+            return;
+        };
+        gpu_hal::set_backend(gpu_hal::Backend::Hip);
+        let store = BakedStore::open_flm_with_options(
+            Path::new(&flm_path_str),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                verify_block_hashes: false,
+            },
+        )
+        .expect("open qwen3.6-27b FP8 FLM");
+
+        let weight = store
+            .load_to_gpu(
+                "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
+                0,
+            )
+            .expect("upload Qwen FP8 logical alias with direct view");
+        assert_eq!(weight.dtype(), ScalarType::F8E4M3);
+        assert_eq!(weight.shape(), &[10240, 5120]);
+
+        let scale = store
+            .load_to_gpu(
+                concat!(
+                    "model.language_model.layers.0.linear_attn.in_proj_qkv.",
+                    "weight_fp8_e4m3_b128_bf16_scale_inv"
+                ),
+                0,
+            )
+            .expect("upload Qwen FP8 scale_inv alias with direct view");
+        assert_eq!(scale.dtype(), ScalarType::BF16);
+        assert_eq!(scale.shape(), &[80, 40]);
+
+        eprintln!("[flm-upload] OK — Qwen FP8 FLM direct views uploaded to HIP");
     }
 
     #[test]
