@@ -3859,6 +3859,115 @@ mod tests {
     }
 
     #[test]
+    fn flm_qwen36_27b_nvfp4_preserve_lowbit_loadable() {
+        let Ok(flm_path_str) = std::env::var("SUPERSONIC_QWEN36_27B_NVFP4_FLM") else {
+            eprintln!(
+                "skip: SUPERSONIC_QWEN36_27B_NVFP4_FLM not set. Point it at a \
+                 preserve-lowbit nvidia/Qwen3.6-27B-NVFP4 FLM to validate dense \
+                 NVFP4/FP8 aliases."
+            );
+            return;
+        };
+        let store = BakedStore::open_flm_with_options(
+            Path::new(&flm_path_str),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                verify_block_hashes: true,
+            },
+        )
+        .expect("open qwen3.6-27b NVFP4 FLM");
+
+        let runtime = store.flm_runtime().expect("runtime directory");
+        let dense = runtime.qwen36_config().expect("dense runtime config");
+        assert_eq!(dense.hidden_size, 5120);
+        assert_eq!(dense.num_hidden_layers, 64);
+        assert_eq!(dense.intermediate_size, 17408);
+
+        let raw_count = runtime
+            .logical_tensors()
+            .iter()
+            .filter(|logical| logical.value_format_id == crate::flm::VALUE_FORMAT_RAW_DENSE)
+            .count();
+        let nvfp4_count = runtime
+            .logical_tensors()
+            .iter()
+            .filter(|logical| logical.value_format_id == crate::flm::VALUE_FORMAT_NVFP4_E2M1)
+            .count();
+        let fp8_scalar_count = runtime
+            .logical_tensors()
+            .iter()
+            .filter(|logical| logical.value_format_id == crate::flm::VALUE_FORMAT_FP8_E4M3_F32)
+            .count();
+        assert_eq!(raw_count, 450);
+        assert_eq!(nvfp4_count, 193);
+        assert_eq!(fp8_scalar_count, 208);
+
+        let embed = store
+            .meta("model.language_model.embed_tokens.weight")
+            .expect("embed_tokens missing");
+        assert_eq!(embed.dtype, "bf16");
+        assert_eq!(embed.shape, vec![248320, 5120]);
+        assert_eq!(embed.byte_len, 2_542_796_800);
+
+        let lm_head = store.meta("lm_head.weight").expect("lm_head missing");
+        assert_eq!(lm_head.dtype, "u8");
+        assert_eq!(lm_head.shape, vec![248320, 5120]);
+        assert_eq!(lm_head.byte_len, 635_699_200);
+        assert_eq!(
+            store
+                .upload_view("lm_head.weight")
+                .expect("NVFP4 lm_head upload view"),
+            &TensorUploadView {
+                dtype: "u8".to_string(),
+                shape: vec![248320, 2560],
+            }
+        );
+        assert!(store.contains("lm_head.weight_nvfp4_scale"));
+        assert!(store.contains("lm_head.weight_nvfp4_global_scale"));
+        assert!(store.contains("lm_head.weight_nvfp4_input_scale"));
+
+        let mlp_name = "model.language_model.layers.0.mlp.down_proj.weight";
+        let mlp = store.meta(mlp_name).expect("NVFP4 MLP logical alias");
+        assert_eq!(mlp.dtype, "u8");
+        assert_eq!(mlp.shape, vec![5120, 17408]);
+        assert_eq!(mlp.byte_len, 44_564_480);
+        assert_eq!(
+            store.upload_view(mlp_name).expect("NVFP4 MLP upload view"),
+            &TensorUploadView {
+                dtype: "u8".to_string(),
+                shape: vec![5120, 8704],
+            }
+        );
+        assert!(store.contains("model.language_model.layers.0.mlp.down_proj.weight_nvfp4_scale"));
+        assert!(
+            store.contains("model.language_model.layers.0.mlp.down_proj.weight_nvfp4_global_scale")
+        );
+        assert!(
+            store.contains("model.language_model.layers.0.mlp.down_proj.weight_nvfp4_input_scale")
+        );
+
+        let fp8_name = "model.language_model.layers.0.linear_attn.in_proj_qkv.weight";
+        assert_eq!(
+            store.upload_view(fp8_name).expect("FP8 scalar upload view"),
+            &TensorUploadView {
+                dtype: "f8_e4m3".to_string(),
+                shape: vec![10240, 5120],
+            }
+        );
+        assert!(store.contains(
+            "model.language_model.layers.0.linear_attn.in_proj_qkv.weight_fp8_e4m3_f32_scale"
+        ));
+        assert!(store.contains(
+            "model.language_model.layers.0.linear_attn.in_proj_qkv.weight_fp8_e4m3_f32_input_scale"
+        ));
+
+        eprintln!(
+            "[flm-validate] OK — {} tensors including 27B NVFP4/FP8 aliases",
+            store.index.len()
+        );
+    }
+
+    #[test]
     fn flm_tiny_qwen36_raw_fp32_and_int4_aliases_loadable() {
         let Ok(flm_path_str) = std::env::var("SUPERSONIC_TINY_QWEN36_FLM") else {
             eprintln!(
@@ -4347,6 +4456,43 @@ mod tests {
         assert_eq!(scale.shape(), &[80, 40]);
 
         eprintln!("[flm-upload] OK — Qwen FP8 FLM direct views uploaded to HIP");
+    }
+
+    #[test]
+    fn flm_qwen36_27b_nvfp4_direct_views_upload_to_hip() {
+        let Ok(flm_path_str) = std::env::var("SUPERSONIC_QWEN36_27B_NVFP4_FLM_HIP_UPLOAD") else {
+            eprintln!(
+                "skip: SUPERSONIC_QWEN36_27B_NVFP4_FLM_HIP_UPLOAD not set. Point it at a \
+                 preserve-lowbit nvidia/Qwen3.6-27B-NVFP4 FLM to validate HIP uploads."
+            );
+            return;
+        };
+        gpu_hal::set_backend(gpu_hal::Backend::Hip);
+        let store = BakedStore::open_flm_with_options(
+            Path::new(&flm_path_str),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                verify_block_hashes: false,
+            },
+        )
+        .expect("open qwen3.6-27b NVFP4 FLM");
+
+        let mlp = store
+            .load_to_gpu("model.language_model.layers.0.mlp.down_proj.weight", 0)
+            .expect("upload NVFP4 MLP logical alias with direct view");
+        assert_eq!(mlp.dtype(), ScalarType::U8);
+        assert_eq!(mlp.shape(), &[5120, 8704]);
+
+        let fp8 = store
+            .load_to_gpu(
+                "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
+                0,
+            )
+            .expect("upload FP8 scalar logical alias with direct view");
+        assert_eq!(fp8.dtype(), ScalarType::F8E4M3);
+        assert_eq!(fp8.shape(), &[10240, 5120]);
+
+        eprintln!("[flm-upload] OK — 27B NVFP4 FLM direct views uploaded to HIP");
     }
 
     #[test]
