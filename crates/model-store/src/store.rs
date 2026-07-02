@@ -1068,9 +1068,7 @@ fn add_stage3_lowbit_aliases(
         if matches!(
             logical.value_format_id,
             crate::flm::VALUE_FORMAT_NVFP4_E2M1 | crate::flm::VALUE_FORMAT_FP8_E4M3_F32
-        )
-            && direct_plan
-                .contains_key(&(logical.tensor_id, crate::flm::STORAGE_ROLE_INPUT_SCALE))
+        ) && direct_plan.contains_key(&(logical.tensor_id, crate::flm::STORAGE_ROLE_INPUT_SCALE))
         {
             let step = direct_plan
                 .get(&(logical.tensor_id, crate::flm::STORAGE_ROLE_INPUT_SCALE))
@@ -1723,13 +1721,7 @@ mod tests {
                 1u16,
                 0u32,
             ),
-            (
-                6u8,
-                crate::flm::CODEC_FP8_E4M3_F32 as u8,
-                0u16,
-                1u16,
-                0u32,
-            ),
+            (6u8, crate::flm::CODEC_FP8_E4M3_F32 as u8, 0u16, 1u16, 0u32),
         ] {
             out.push(codec_id);
             out.push(semantic_id);
@@ -2659,8 +2651,14 @@ mod tests {
             (7u32, runtime_model_descriptor_section()),
             (8u32, runtime_tensor_manifest_section(&[])),
             (9u32, runtime_stage3_lowbit_storage_abi_section()),
-            (10u32, runtime_stage3_modelopt_nvfp4_logical_tensor_section()),
-            (11u32, runtime_stage3_modelopt_nvfp4_storage_binding_section()),
+            (
+                10u32,
+                runtime_stage3_modelopt_nvfp4_logical_tensor_section(),
+            ),
+            (
+                11u32,
+                runtime_stage3_modelopt_nvfp4_storage_binding_section(),
+            ),
             (12u32, runtime_stage3_modelopt_nvfp4_plan_step_section()),
         ];
         let header_len = 16 + sections.len() * 12;
@@ -3347,7 +3345,9 @@ mod tests {
         assert_eq!(input.shape, vec![1]);
         assert_eq!(
             store
-                .upload_view("model.language_model.layers.0.linear_attn.out_proj.weight_nvfp4_input_scale")
+                .upload_view(
+                    "model.language_model.layers.0.linear_attn.out_proj.weight_nvfp4_input_scale"
+                )
                 .expect("NVFP4 input scale upload view"),
             &TensorUploadView {
                 dtype: "f32".to_string(),
@@ -3831,7 +3831,9 @@ mod tests {
         assert_eq!(nv.dtype, "u8");
         assert_eq!(nv.shape, vec![128, 128]);
         assert_eq!(
-            store.upload_view(nv_name).expect("ModelOpt NVFP4 upload view"),
+            store
+                .upload_view(nv_name)
+                .expect("ModelOpt NVFP4 upload view"),
             &TensorUploadView {
                 dtype: "u8".to_string(),
                 shape: vec![128, 64],
@@ -3854,6 +3856,53 @@ mod tests {
         ));
         assert!(store.contains(
             "model.language_model.layers.0.linear_attn.in_proj_qkv.weight_fp8_e4m3_f32_input_scale"
+        ));
+    }
+
+    #[test]
+    fn flm_tiny_qwen36_moe_modelopt_lowbit_aliases_loadable() {
+        let Ok(flm_path_str) = std::env::var("SUPERSONIC_TINY_QWEN36_MOE_FLM") else {
+            eprintln!(
+                "skip: SUPERSONIC_TINY_QWEN36_MOE_FLM not set. Point it at a tiny \
+                 descriptor-produced Qwen3.6 MoE FLM to validate runtime parsing and \
+                 ModelOpt expert aliases."
+            );
+            return;
+        };
+        let store = BakedStore::open_flm_with_options(
+            Path::new(&flm_path_str),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                verify_block_hashes: true,
+            },
+        )
+        .expect("open tiny ModelOpt low-bit qwen3.6 MoE FLM");
+
+        let runtime = store.flm_runtime().expect("runtime directory");
+        assert!(runtime.qwen36_config().is_none());
+        let moe = runtime.qwen36_moe_config().expect("MoE runtime config");
+        assert_eq!(moe.hidden_size, 4);
+        assert_eq!(moe.num_experts, 2);
+        assert_eq!(moe.num_experts_per_tok, 1);
+        assert_eq!(moe.mrope_section, [11, 11, 10]);
+
+        let expert_name = "model.language_model.layers.0.mlp.experts.0.gate_proj.weight";
+        let expert = store
+            .meta(expert_name)
+            .expect("ModelOpt expert logical tensor");
+        assert_eq!(expert.dtype, "u8");
+        assert_eq!(expert.shape, vec![2, 2]);
+        assert_eq!(
+            store
+                .upload_view(expert_name)
+                .expect("ModelOpt expert upload view"),
+            &TensorUploadView {
+                dtype: "u8".to_string(),
+                shape: vec![2, 1],
+            }
+        );
+        assert!(store.contains(
+            "model.language_model.layers.0.mlp.experts.0.gate_proj.weight_nvfp4_input_scale"
         ));
     }
 

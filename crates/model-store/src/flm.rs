@@ -3,8 +3,10 @@ use std::collections::{HashMap, HashSet};
 use crate::Error;
 
 pub const ARCH_QWEN3_6_DENSE: u32 = 1;
+pub const ARCH_QWEN3_6_MOE: u32 = 2;
 pub const TOKENIZER_QWEN_BPE_V1: u32 = 1;
 pub const TENSOR_ABI_QWEN3_6_DENSE_CT_INT4_V1: u32 = 1;
+pub const TENSOR_ABI_QWEN3_6_MOE_MIXED_LOWBIT_V1: u32 = 2;
 pub const CODEC_RAW_BF16: u16 = 1;
 pub const CODEC_SYM_INT4_G128_BF16: u16 = 2;
 pub const CODEC_RAW_I64: u16 = 3;
@@ -13,7 +15,9 @@ pub const CODEC_MXFP4_E2M1_B32_E8M0: u16 = 5;
 pub const CODEC_MXFP8_E4M3_B32_E8M0: u16 = 6;
 pub const CODEC_FP8_E4M3_F32: u16 = 7;
 pub const MODEL_QWEN3_6_DENSE_V1: u16 = 1;
+pub const MODEL_QWEN3_6_MOE_V1: u16 = 2;
 pub const QUANT_PROFILE_QWEN3_6_DENSE_CT_INT4_G128_BF16_V1: u32 = 1;
+pub const QUANT_PROFILE_QWEN3_6_MOE_MIXED_LOWBIT_V1: u32 = 2;
 pub const ASSET_TOKENIZER_VOCAB: u16 = 1;
 pub const ASSET_TOKENIZER_MERGES: u16 = 2;
 pub const ASSET_TOKENIZER_ADDED_TOKENS: u16 = 3;
@@ -77,9 +81,11 @@ const SECTION_STORAGE_ABI_TABLE: u32 = 9;
 const SECTION_LOGICAL_TENSOR_TABLE: u32 = 10;
 const SECTION_STORAGE_BINDING_TABLE: u32 = 11;
 const SECTION_PLAN_STEP_TABLE: u32 = 12;
+const SECTION_CONFIG_QWEN36_MOE: u32 = 13;
 const SECTION_RECORD_SIZE: usize = 12;
 const HEADER_PREFIX_SIZE: usize = 16;
 const CONFIG_FIXED_SIZE: usize = 13 * 4 + 2 * 8 + 2 + 4;
+const MOE_CONFIG_FIXED_SIZE: usize = 17 * 4 + 2 * 8 + 5 + 4;
 const TOKENIZER_SIZE: usize = 8 * 4;
 const CODEC_RECORD_SIZE: usize = 10;
 const MODEL_DESCRIPTOR_SIZE: usize = 24;
@@ -116,6 +122,38 @@ pub struct FlmQwen36DenseConfig {
     pub tie_word_embeddings: bool,
     pub eos_token_ids: Vec<u32>,
     pub full_attention_layers: Vec<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FlmQwen36MoeConfig {
+    pub vocab_size: usize,
+    pub hidden_size: usize,
+    pub moe_intermediate_size: usize,
+    pub shared_expert_intermediate_size: usize,
+    pub num_hidden_layers: usize,
+    pub num_attention_heads: usize,
+    pub num_key_value_heads: usize,
+    pub head_dim: usize,
+    pub max_position_embeddings: usize,
+    pub linear_conv_kernel_dim: usize,
+    pub linear_key_head_dim: usize,
+    pub linear_value_head_dim: usize,
+    pub linear_num_key_heads: usize,
+    pub linear_num_value_heads: usize,
+    pub num_experts: usize,
+    pub num_experts_per_tok: usize,
+    pub mtp_num_hidden_layers: usize,
+    pub rms_norm_eps: f64,
+    pub rope_theta: f64,
+    pub partial_rotary_factor: f64,
+    pub activation_id: u8,
+    pub tie_word_embeddings: bool,
+    pub attn_output_gate: bool,
+    pub mtp_use_dedicated_embeddings: bool,
+    pub mrope_interleaved: bool,
+    pub eos_token_ids: Vec<u32>,
+    pub full_attention_layers: Vec<usize>,
+    pub mrope_section: [u32; 3],
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -241,6 +279,7 @@ pub struct FlmPlanStep {
 pub struct FlmRuntimeDirectory {
     pub architecture_id: u32,
     pub config: FlmQwen36DenseConfig,
+    pub moe_config: Option<FlmQwen36MoeConfig>,
     pub tokenizer: FlmTokenizerDescriptor,
     pub assets: HashMap<u32, FlmAsset>,
     codecs: Vec<FlmCodecDescriptor>,
@@ -262,13 +301,21 @@ struct SectionRange {
 impl FlmRuntimeDirectory {
     pub fn parse(buf: &[u8]) -> Result<Self, Error> {
         let (architecture_id, sections) = parse_section_table(buf)?;
-        let config = parse_qwen36_config(section(buf, &sections, SECTION_CONFIG_QWEN36_DENSE)?)?;
+        let (config, moe_config) = if architecture_id == ARCH_QWEN3_6_MOE {
+            let moe = parse_qwen36_moe_config(section(buf, &sections, SECTION_CONFIG_QWEN36_MOE)?)?;
+            (dense_config_from_moe(&moe), Some(moe))
+        } else {
+            (
+                parse_qwen36_config(section(buf, &sections, SECTION_CONFIG_QWEN36_DENSE)?)?,
+                None,
+            )
+        };
         let tokenizer = parse_tokenizer(section(buf, &sections, SECTION_TOKENIZER)?)?;
         let codecs = parse_codec_table(section(buf, &sections, SECTION_CODEC_TABLE)?)?;
         let tensor_abi = parse_tensor_abi(section(buf, &sections, SECTION_TENSOR_ABI)?)?;
         let model_descriptor =
             parse_model_descriptor(section(buf, &sections, SECTION_MODEL_DESCRIPTOR)?)?;
-        validate_model_descriptor(&model_descriptor, &tokenizer, &tensor_abi)?;
+        validate_model_descriptor(&model_descriptor, architecture_id, &tokenizer, &tensor_abi)?;
         let assets = parse_assets(
             section(buf, &sections, SECTION_ASSET_TABLE)?,
             section(buf, &sections, SECTION_ASSET_PAYLOADS)?,
@@ -307,6 +354,7 @@ impl FlmRuntimeDirectory {
         Ok(Self {
             architecture_id,
             config,
+            moe_config,
             tokenizer,
             assets,
             codecs,
@@ -322,6 +370,12 @@ impl FlmRuntimeDirectory {
 
     pub fn qwen36_config(&self) -> Option<&FlmQwen36DenseConfig> {
         (self.architecture_id == ARCH_QWEN3_6_DENSE).then_some(&self.config)
+    }
+
+    pub fn qwen36_moe_config(&self) -> Option<&FlmQwen36MoeConfig> {
+        (self.architecture_id == ARCH_QWEN3_6_MOE)
+            .then_some(self.moe_config.as_ref())
+            .flatten()
     }
 
     pub fn tokenizer(&self) -> Option<&FlmTokenizerDescriptor> {
@@ -379,6 +433,16 @@ impl FlmRuntimeDirectory {
     }
 }
 
+fn config_section_id_for_architecture(architecture_id: u32) -> Result<u32, Error> {
+    match architecture_id {
+        ARCH_QWEN3_6_DENSE => Ok(SECTION_CONFIG_QWEN36_DENSE),
+        ARCH_QWEN3_6_MOE => Ok(SECTION_CONFIG_QWEN36_MOE),
+        other => Err(Error::Other(format!(
+            "unsupported FLM runtime architecture {other}"
+        ))),
+    }
+}
+
 fn parse_section_table(buf: &[u8]) -> Result<(u32, HashMap<u32, SectionRange>), Error> {
     let magic = read_exact_range(buf, 0, RUNTIME_MAGIC.len(), "FLM runtime magic")?;
     if magic != RUNTIME_MAGIC {
@@ -396,11 +460,12 @@ fn parse_section_table(buf: &[u8]) -> Result<(u32, HashMap<u32, SectionRange>), 
     }
     let section_count = read_u16(buf, 10, "FLM runtime section count")? as usize;
     let architecture_id = read_u32(buf, 12, "FLM runtime architecture_id")?;
-    if architecture_id != ARCH_QWEN3_6_DENSE {
+    if architecture_id != ARCH_QWEN3_6_DENSE && architecture_id != ARCH_QWEN3_6_MOE {
         return Err(Error::Other(format!(
             "unsupported FLM runtime architecture {architecture_id}"
         )));
     }
+    let config_section_id = config_section_id_for_architecture(architecture_id)?;
     let header_len = HEADER_PREFIX_SIZE
         .checked_add(
             section_count
@@ -416,7 +481,7 @@ fn parse_section_table(buf: &[u8]) -> Result<(u32, HashMap<u32, SectionRange>), 
     for idx in 0..section_count {
         let off = HEADER_PREFIX_SIZE + idx * SECTION_RECORD_SIZE;
         let section_id = read_u32(buf, off, "FLM runtime section id")?;
-        if !(SECTION_CONFIG_QWEN36_DENSE..=SECTION_PLAN_STEP_TABLE).contains(&section_id) {
+        if !(SECTION_CONFIG_QWEN36_DENSE..=SECTION_CONFIG_QWEN36_MOE).contains(&section_id) {
             return Err(Error::Other(format!(
                 "FLM runtime section {idx} has unknown id {section_id}"
             )));
@@ -439,7 +504,16 @@ fn parse_section_table(buf: &[u8]) -> Result<(u32, HashMap<u32, SectionRange>), 
         }
     }
 
-    for required in SECTION_CONFIG_QWEN36_DENSE..=SECTION_TENSOR_MANIFEST {
+    for required in [
+        config_section_id,
+        SECTION_TOKENIZER,
+        SECTION_CODEC_TABLE,
+        SECTION_TENSOR_ABI,
+        SECTION_ASSET_TABLE,
+        SECTION_ASSET_PAYLOADS,
+        SECTION_MODEL_DESCRIPTOR,
+        SECTION_TENSOR_MANIFEST,
+    ] {
         if !sections.contains_key(&required) {
             return Err(Error::Other(format!(
                 "FLM runtime missing required section {required}"
@@ -572,6 +646,140 @@ fn parse_qwen36_config(buf: &[u8]) -> Result<FlmQwen36DenseConfig, Error> {
     })
 }
 
+fn parse_qwen36_moe_config(buf: &[u8]) -> Result<FlmQwen36MoeConfig, Error> {
+    read_exact_range(
+        buf,
+        0,
+        MOE_CONFIG_FIXED_SIZE + 8 + 12,
+        "FLM qwen moe config",
+    )?;
+    let mut offset = 0usize;
+    let vocab_size = read_usize(buf, &mut offset, "FLM qwen moe vocab_size")?;
+    let hidden_size = read_usize(buf, &mut offset, "FLM qwen moe hidden_size")?;
+    let moe_intermediate_size = read_usize(buf, &mut offset, "FLM qwen moe moe_intermediate_size")?;
+    let shared_expert_intermediate_size = read_usize(
+        buf,
+        &mut offset,
+        "FLM qwen moe shared_expert_intermediate_size",
+    )?;
+    let num_hidden_layers = read_usize(buf, &mut offset, "FLM qwen moe num_hidden_layers")?;
+    let num_attention_heads = read_usize(buf, &mut offset, "FLM qwen moe num_attention_heads")?;
+    let num_key_value_heads = read_usize(buf, &mut offset, "FLM qwen moe num_key_value_heads")?;
+    let head_dim = read_usize(buf, &mut offset, "FLM qwen moe head_dim")?;
+    let max_position_embeddings =
+        read_usize(buf, &mut offset, "FLM qwen moe max_position_embeddings")?;
+    let linear_conv_kernel_dim =
+        read_usize(buf, &mut offset, "FLM qwen moe linear_conv_kernel_dim")?;
+    let linear_key_head_dim = read_usize(buf, &mut offset, "FLM qwen moe linear_key_head_dim")?;
+    let linear_value_head_dim = read_usize(buf, &mut offset, "FLM qwen moe linear_value_head_dim")?;
+    let linear_num_key_heads = read_usize(buf, &mut offset, "FLM qwen moe linear_num_key_heads")?;
+    let linear_num_value_heads =
+        read_usize(buf, &mut offset, "FLM qwen moe linear_num_value_heads")?;
+    let num_experts = read_usize(buf, &mut offset, "FLM qwen moe num_experts")?;
+    let num_experts_per_tok = read_usize(buf, &mut offset, "FLM qwen moe num_experts_per_tok")?;
+    let mtp_num_hidden_layers = read_usize(buf, &mut offset, "FLM qwen moe mtp_num_hidden_layers")?;
+    let rms_norm_eps = read_f64_advance(buf, &mut offset, "FLM qwen moe rms_norm_eps")?;
+    let rope_theta = read_f64_advance(buf, &mut offset, "FLM qwen moe rope_theta")?;
+    let activation_id = read_u8_advance(buf, &mut offset, "FLM qwen moe activation_id")?;
+    let tie_word_embeddings =
+        read_bool_advance(buf, &mut offset, "FLM qwen moe tie_word_embeddings")?;
+    let attn_output_gate = read_bool_advance(buf, &mut offset, "FLM qwen moe attn_output_gate")?;
+    let mtp_use_dedicated_embeddings = read_bool_advance(
+        buf,
+        &mut offset,
+        "FLM qwen moe mtp_use_dedicated_embeddings",
+    )?;
+    let mrope_interleaved = read_bool_advance(buf, &mut offset, "FLM qwen moe mrope_interleaved")?;
+    let eos_count = read_count(buf, &mut offset, "FLM qwen moe eos_count")?;
+    let partial_rotary_factor =
+        read_f64_advance(buf, &mut offset, "FLM qwen moe partial_rotary_factor")?;
+
+    let mut eos_token_ids = Vec::with_capacity(eos_count);
+    for idx in 0..eos_count {
+        eos_token_ids.push(read_u32_advance(
+            buf,
+            &mut offset,
+            &format!("FLM qwen moe eos token id {idx}"),
+        )?);
+    }
+
+    let layer_count = read_count(buf, &mut offset, "FLM qwen moe full attention layer count")?;
+    let mut full_attention_layers = Vec::with_capacity(layer_count);
+    for idx in 0..layer_count {
+        full_attention_layers.push(read_usize(
+            buf,
+            &mut offset,
+            &format!("FLM qwen moe full attention layer {idx}"),
+        )?);
+    }
+
+    let mut mrope_section = [0u32; 3];
+    for (idx, value) in mrope_section.iter_mut().enumerate() {
+        *value = read_u32_advance(
+            buf,
+            &mut offset,
+            &format!("FLM qwen moe mrope_section {idx}"),
+        )?;
+    }
+
+    ensure_consumed(buf, offset, "FLM qwen moe config")?;
+    Ok(FlmQwen36MoeConfig {
+        vocab_size,
+        hidden_size,
+        moe_intermediate_size,
+        shared_expert_intermediate_size,
+        num_hidden_layers,
+        num_attention_heads,
+        num_key_value_heads,
+        head_dim,
+        max_position_embeddings,
+        linear_conv_kernel_dim,
+        linear_key_head_dim,
+        linear_value_head_dim,
+        linear_num_key_heads,
+        linear_num_value_heads,
+        num_experts,
+        num_experts_per_tok,
+        mtp_num_hidden_layers,
+        rms_norm_eps,
+        rope_theta,
+        partial_rotary_factor,
+        activation_id,
+        tie_word_embeddings,
+        attn_output_gate,
+        mtp_use_dedicated_embeddings,
+        mrope_interleaved,
+        eos_token_ids,
+        full_attention_layers,
+        mrope_section,
+    })
+}
+
+fn dense_config_from_moe(moe: &FlmQwen36MoeConfig) -> FlmQwen36DenseConfig {
+    FlmQwen36DenseConfig {
+        vocab_size: moe.vocab_size,
+        hidden_size: moe.hidden_size,
+        intermediate_size: moe.moe_intermediate_size,
+        num_hidden_layers: moe.num_hidden_layers,
+        num_attention_heads: moe.num_attention_heads,
+        num_key_value_heads: moe.num_key_value_heads,
+        head_dim: moe.head_dim,
+        max_position_embeddings: moe.max_position_embeddings,
+        linear_conv_kernel_dim: moe.linear_conv_kernel_dim,
+        linear_key_head_dim: moe.linear_key_head_dim,
+        linear_value_head_dim: moe.linear_value_head_dim,
+        linear_num_key_heads: moe.linear_num_key_heads,
+        linear_num_value_heads: moe.linear_num_value_heads,
+        rms_norm_eps: moe.rms_norm_eps,
+        rope_theta: moe.rope_theta,
+        partial_rotary_factor: moe.partial_rotary_factor,
+        activation_id: moe.activation_id,
+        tie_word_embeddings: moe.tie_word_embeddings,
+        eos_token_ids: moe.eos_token_ids.clone(),
+        full_attention_layers: moe.full_attention_layers.clone(),
+    }
+}
+
 fn parse_tokenizer(buf: &[u8]) -> Result<FlmTokenizerDescriptor, Error> {
     if buf.len() != TOKENIZER_SIZE {
         return Err(Error::Other(format!(
@@ -698,10 +906,35 @@ fn parse_model_descriptor(buf: &[u8]) -> Result<FlmModelDescriptor, Error> {
 
 fn validate_model_descriptor(
     descriptor: &FlmModelDescriptor,
+    architecture_id: u32,
     tokenizer: &FlmTokenizerDescriptor,
     tensor_abi: &FlmTensorAbiDescriptor,
 ) -> Result<(), Error> {
-    if descriptor.config_section_id != SECTION_CONFIG_QWEN36_DENSE {
+    let (
+        expected_model_id,
+        expected_config_section_id,
+        expected_tensor_abi_id,
+        expected_quant_profile_id,
+    ) = match architecture_id {
+        ARCH_QWEN3_6_DENSE => (
+            MODEL_QWEN3_6_DENSE_V1,
+            SECTION_CONFIG_QWEN36_DENSE,
+            TENSOR_ABI_QWEN3_6_DENSE_CT_INT4_V1,
+            QUANT_PROFILE_QWEN3_6_DENSE_CT_INT4_G128_BF16_V1,
+        ),
+        ARCH_QWEN3_6_MOE => (
+            MODEL_QWEN3_6_MOE_V1,
+            SECTION_CONFIG_QWEN36_MOE,
+            TENSOR_ABI_QWEN3_6_MOE_MIXED_LOWBIT_V1,
+            QUANT_PROFILE_QWEN3_6_MOE_MIXED_LOWBIT_V1,
+        ),
+        other => {
+            return Err(Error::Other(format!(
+                "unsupported FLM runtime architecture {other}"
+            )));
+        }
+    };
+    if descriptor.config_section_id != expected_config_section_id {
         return Err(Error::Other(format!(
             "FLM model descriptor references unsupported config section {}",
             descriptor.config_section_id
@@ -719,13 +952,19 @@ fn validate_model_descriptor(
             descriptor.tensor_abi_id, tensor_abi.abi_id
         )));
     }
-    if descriptor.model_id != MODEL_QWEN3_6_DENSE_V1 {
+    if descriptor.tensor_abi_id != expected_tensor_abi_id {
+        return Err(Error::Other(format!(
+            "FLM model descriptor tensor_abi_id {} does not match architecture {}",
+            descriptor.tensor_abi_id, architecture_id
+        )));
+    }
+    if descriptor.model_id != expected_model_id {
         return Err(Error::Other(format!(
             "unsupported FLM model id {}",
             descriptor.model_id
         )));
     }
-    if descriptor.quant_profile_id != QUANT_PROFILE_QWEN3_6_DENSE_CT_INT4_G128_BF16_V1 {
+    if descriptor.quant_profile_id != expected_quant_profile_id {
         return Err(Error::Other(format!(
             "unsupported FLM quant profile id {}",
             descriptor.quant_profile_id
@@ -1390,6 +1629,16 @@ fn read_u8_advance(buf: &[u8], offset: &mut usize, what: &str) -> Result<u8, Err
     Ok(value)
 }
 
+fn read_bool_advance(buf: &[u8], offset: &mut usize, what: &str) -> Result<bool, Error> {
+    match read_u8_advance(buf, offset, what)? {
+        0 => Ok(false),
+        1 => Ok(true),
+        other => Err(Error::Other(format!(
+            "{what} has invalid bool value {other}"
+        ))),
+    }
+}
+
 fn read_u16_advance(buf: &[u8], offset: &mut usize, what: &str) -> Result<u16, Error> {
     let value = read_u16(buf, *offset, what)?;
     *offset += 2;
@@ -1499,6 +1748,33 @@ mod tests {
         out
     }
 
+    fn build_qwen_moe_config_section() -> Vec<u8> {
+        let mut out = Vec::new();
+        for value in [
+            248_320u32, 2048, 512, 512, 40, 16, 2, 256, 262_144, 4, 128, 128, 16, 32, 256, 8, 1,
+        ] {
+            write_u32(&mut out, value);
+        }
+        write_f64(&mut out, 1e-6);
+        write_f64(&mut out, 10_000_000.0);
+        out.push(1);
+        out.push(0);
+        out.push(1);
+        out.push(0);
+        out.push(1);
+        write_u32(&mut out, 1);
+        write_f64(&mut out, 0.25);
+        write_u32(&mut out, 248_044);
+        write_u32(&mut out, 10);
+        for layer in [3u32, 7, 11, 15, 19, 23, 27, 31, 35, 39] {
+            write_u32(&mut out, layer);
+        }
+        for value in [11u32, 11, 10] {
+            write_u32(&mut out, value);
+        }
+        out
+    }
+
     fn build_tokenizer_section() -> Vec<u8> {
         let mut out = Vec::new();
         for value in [
@@ -1536,6 +1812,16 @@ mod tests {
     fn build_tensor_abi_section() -> Vec<u8> {
         let mut out = Vec::new();
         write_u32(&mut out, TENSOR_ABI_QWEN3_6_DENSE_CT_INT4_V1);
+        write_string(&mut out, "model.language_model");
+        write_string(&mut out, ".weight_packed");
+        write_string(&mut out, ".weight_scale");
+        write_string(&mut out, ".weight_shape");
+        out
+    }
+
+    fn build_moe_tensor_abi_section() -> Vec<u8> {
+        let mut out = Vec::new();
+        write_u32(&mut out, TENSOR_ABI_QWEN3_6_MOE_MIXED_LOWBIT_V1);
         write_string(&mut out, "model.language_model");
         write_string(&mut out, ".weight_packed");
         write_string(&mut out, ".weight_scale");
@@ -1598,6 +1884,18 @@ mod tests {
         write_u32(&mut out, TOKENIZER_QWEN_BPE_V1);
         write_u32(&mut out, TENSOR_ABI_QWEN3_6_DENSE_CT_INT4_V1);
         write_u32(&mut out, QUANT_PROFILE_QWEN3_6_DENSE_CT_INT4_G128_BF16_V1);
+        write_u32(&mut out, 0);
+        out
+    }
+
+    fn build_moe_model_descriptor_section() -> Vec<u8> {
+        let mut out = Vec::new();
+        write_u16(&mut out, 1);
+        write_u16(&mut out, MODEL_QWEN3_6_MOE_V1);
+        write_u32(&mut out, SECTION_CONFIG_QWEN36_MOE);
+        write_u32(&mut out, TOKENIZER_QWEN_BPE_V1);
+        write_u32(&mut out, TENSOR_ABI_QWEN3_6_MOE_MIXED_LOWBIT_V1);
+        write_u32(&mut out, QUANT_PROFILE_QWEN3_6_MOE_MIXED_LOWBIT_V1);
         write_u32(&mut out, 0);
         out
     }
@@ -1841,6 +2139,37 @@ mod tests {
         out
     }
 
+    fn build_test_moe_runtime_directory() -> Vec<u8> {
+        let (asset_table, asset_payloads) = build_asset_sections();
+        let sections = [
+            (SECTION_CONFIG_QWEN36_MOE, build_qwen_moe_config_section()),
+            (2u32, build_tokenizer_section()),
+            (3u32, build_codec_table_section()),
+            (4u32, build_moe_tensor_abi_section()),
+            (5u32, asset_table),
+            (6u32, asset_payloads),
+            (7u32, build_moe_model_descriptor_section()),
+            (8u32, build_tensor_manifest_section()),
+        ];
+        let header_len = 8 + 2 + 2 + 4 + sections.len() * 12;
+        let mut offset = header_len as u32;
+        let mut out = Vec::new();
+        out.extend_from_slice(b"FLMRUN1\0");
+        write_u16(&mut out, RUNTIME_VERSION);
+        write_u16(&mut out, sections.len() as u16);
+        write_u32(&mut out, ARCH_QWEN3_6_MOE);
+        for (section_id, data) in &sections {
+            write_u32(&mut out, *section_id);
+            write_u32(&mut out, offset);
+            write_u32(&mut out, data.len() as u32);
+            offset += data.len() as u32;
+        }
+        for (_, data) in sections {
+            out.extend_from_slice(&data);
+        }
+        out
+    }
+
     fn section_record_offset(runtime: &[u8], section_id: u32) -> usize {
         let count = read_u16_at(runtime, 10) as usize;
         for idx in 0..count {
@@ -1994,6 +2323,23 @@ mod tests {
             parsed.codec_by_semantic_id(CODEC_RAW_I64).unwrap().codec_id,
             2
         );
+    }
+
+    #[test]
+    fn parses_runtime_directory_with_qwen_moe_config() {
+        let runtime = build_test_moe_runtime_directory();
+        let parsed = FlmRuntimeDirectory::parse(&runtime).expect("parse moe runtime");
+
+        assert_eq!(parsed.architecture_id, ARCH_QWEN3_6_MOE);
+        assert!(parsed.qwen36_config().is_none());
+        assert_eq!(parsed.qwen36_moe_config().unwrap().hidden_size, 2048);
+        assert_eq!(parsed.qwen36_moe_config().unwrap().num_experts, 256);
+        assert_eq!(parsed.qwen36_moe_config().unwrap().num_experts_per_tok, 8);
+        assert_eq!(
+            parsed.qwen36_moe_config().unwrap().mrope_section,
+            [11, 11, 10]
+        );
+        assert_eq!(parsed.model_descriptor().model_id, MODEL_QWEN3_6_MOE_V1);
     }
 
     #[test]
