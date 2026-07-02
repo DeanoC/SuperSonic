@@ -962,6 +962,11 @@ fn add_stage3_lowbit_aliases(
                     crate::flm::STORAGE_ROLE_VALUE,
                     &[(crate::flm::STORAGE_ROLE_SCALE, "scale")],
                 ),
+                crate::flm::VALUE_FORMAT_FP8_E4M3_F32 => (
+                    "fp8_e4m3_f32",
+                    crate::flm::STORAGE_ROLE_VALUE,
+                    &[(crate::flm::STORAGE_ROLE_SCALE, "scale")],
+                ),
                 _ => continue,
             };
 
@@ -995,22 +1000,24 @@ fn add_stage3_lowbit_aliases(
         let primary_dtype = flm_dtype_name(primary_step.target_dtype)?.to_string();
         let primary_upload_shape = flm_plan_target_shape(primary_step)?;
         let logical_shape = flm_logical_shape(logical)?;
-        index
-            .entry(logical.name.clone())
-            .or_insert_with(|| TensorMeta {
+        index.insert(
+            logical.name.clone(),
+            TensorMeta {
                 name: logical.name.clone(),
                 shape: logical_shape,
                 dtype: primary_dtype.clone(),
                 layout: LayoutTag::Raw,
                 offset: primary_meta.offset,
                 byte_len: primary_meta.byte_len,
-            });
-        upload_views
-            .entry(logical.name.clone())
-            .or_insert_with(|| TensorUploadView {
+            },
+        );
+        upload_views.insert(
+            logical.name.clone(),
+            TensorUploadView {
                 dtype: primary_dtype,
                 shape: primary_upload_shape,
-            });
+            },
+        );
 
         let alias_base = logical
             .name
@@ -1043,6 +1050,49 @@ fn add_stage3_lowbit_aliases(
             let dtype = flm_dtype_name(step.target_dtype)?;
             let shape = flm_plan_target_shape(step)?;
             let alias = format!("{alias_base}.weight_{format_tag}_{suffix}");
+            index.entry(alias.clone()).or_insert_with(|| TensorMeta {
+                name: alias.clone(),
+                shape: shape.clone(),
+                dtype: dtype.to_string(),
+                layout: LayoutTag::Raw,
+                offset: meta.offset,
+                byte_len: meta.byte_len,
+            });
+            upload_views
+                .entry(alias)
+                .or_insert_with(|| TensorUploadView {
+                    dtype: dtype.to_string(),
+                    shape,
+                });
+        }
+        if matches!(
+            logical.value_format_id,
+            crate::flm::VALUE_FORMAT_NVFP4_E2M1 | crate::flm::VALUE_FORMAT_FP8_E4M3_F32
+        )
+            && direct_plan
+                .contains_key(&(logical.tensor_id, crate::flm::STORAGE_ROLE_INPUT_SCALE))
+        {
+            let step = direct_plan
+                .get(&(logical.tensor_id, crate::flm::STORAGE_ROLE_INPUT_SCALE))
+                .expect("checked input scale plan");
+            let binding = owned
+                .iter()
+                .find(|binding| binding.storage_role == crate::flm::STORAGE_ROLE_INPUT_SCALE)
+                .ok_or_else(|| {
+                    Error::Other(format!(
+                        "FLM Stage 3 {format_tag} tensor {} missing input_scale binding",
+                        logical.name
+                    ))
+                })?;
+            let meta = index.get(&binding.tensor_name).cloned().ok_or_else(|| {
+                Error::Other(format!(
+                    "FLM Stage 3 sidecar tensor {} missing from index",
+                    binding.tensor_name
+                ))
+            })?;
+            let dtype = flm_dtype_name(step.target_dtype)?;
+            let shape = flm_plan_target_shape(step)?;
+            let alias = format!("{alias_base}.weight_{format_tag}_input_scale");
             index.entry(alias.clone()).or_insert_with(|| TensorMeta {
                 name: alias.clone(),
                 shape: shape.clone(),
@@ -1641,7 +1691,7 @@ mod tests {
 
     fn runtime_codec_section() -> Vec<u8> {
         let mut out = Vec::new();
-        push_u32(&mut out, 6);
+        push_u32(&mut out, 7);
         for (codec_id, semantic_id, layout_id, decoder_id, flags) in [
             (0u8, crate::flm::CODEC_RAW_BF16 as u8, 0u16, 0u16, 0u32),
             (
@@ -1669,6 +1719,13 @@ mod tests {
             (
                 5u8,
                 crate::flm::CODEC_MXFP8_E4M3_B32_E8M0 as u8,
+                0u16,
+                1u16,
+                0u32,
+            ),
+            (
+                6u8,
+                crate::flm::CODEC_FP8_E4M3_F32 as u8,
                 0u16,
                 1u16,
                 0u32,
@@ -2096,20 +2153,49 @@ mod tests {
         let mut out = Vec::new();
         push_u16(&mut out, 1);
         push_u16(&mut out, 21);
-        push_u32(&mut out, 3);
+        push_u32(&mut out, 4);
         push_u32(&mut out, 0);
-        for (storage_abi_id, codec_semantic_id, bits, group_size) in [
-            (2u16, crate::flm::CODEC_NVFP4_E2M1_B16_E4M3_F32, 4u8, 16u16),
-            (3u16, crate::flm::CODEC_MXFP4_E2M1_B32_E8M0, 4u8, 32u16),
-            (4u16, crate::flm::CODEC_MXFP8_E4M3_B32_E8M0, 8u8, 32u16),
+        for (storage_abi_id, abi_kind, codec_semantic_id, bits, group_size, flags) in [
+            (
+                2u16,
+                crate::flm::STORAGE_ABI_KIND_GROUP_QUANT,
+                crate::flm::CODEC_NVFP4_E2M1_B16_E4M3_F32,
+                4u8,
+                16u16,
+                crate::flm::QUANT_FLAG_SYMMETRIC,
+            ),
+            (
+                3u16,
+                crate::flm::STORAGE_ABI_KIND_GROUP_QUANT,
+                crate::flm::CODEC_MXFP4_E2M1_B32_E8M0,
+                4u8,
+                32u16,
+                crate::flm::QUANT_FLAG_SYMMETRIC,
+            ),
+            (
+                4u16,
+                crate::flm::STORAGE_ABI_KIND_GROUP_QUANT,
+                crate::flm::CODEC_MXFP8_E4M3_B32_E8M0,
+                8u8,
+                32u16,
+                crate::flm::QUANT_FLAG_SYMMETRIC,
+            ),
+            (
+                5u16,
+                crate::flm::STORAGE_ABI_KIND_SCALED_FLOAT,
+                crate::flm::CODEC_FP8_E4M3_F32,
+                8u8,
+                0u16,
+                0u16,
+            ),
         ] {
             push_u16(&mut out, storage_abi_id);
-            push_u16(&mut out, crate::flm::STORAGE_ABI_KIND_GROUP_QUANT);
+            push_u16(&mut out, abi_kind);
             push_u16(&mut out, codec_semantic_id);
             push_u16(&mut out, crate::flm::LAYOUT_ID_DEFAULT);
             out.push(bits);
             push_u16(&mut out, group_size);
-            push_u16(&mut out, crate::flm::QUANT_FLAG_SYMMETRIC);
+            push_u16(&mut out, flags);
             push_u32(&mut out, 0);
             push_u32(&mut out, 0);
         }
@@ -2357,6 +2443,300 @@ mod tests {
             out.extend_from_slice(&data);
         }
         out
+    }
+
+    fn runtime_stage3_modelopt_nvfp4_logical_tensor_section() -> Vec<u8> {
+        let rows = [
+            (
+                3u32,
+                "model.language_model.layers.0.linear_attn.out_proj.weight",
+                crate::flm::VALUE_FORMAT_NVFP4_E2M1,
+                [128u32, 128, 0, 0],
+                0u32,
+                4u16,
+            ),
+            (
+                4u32,
+                "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
+                crate::flm::VALUE_FORMAT_FP8_E4M3_F32,
+                [32u32, 128, 0, 0],
+                4u32,
+                3u16,
+            ),
+        ];
+        let pool_len: usize = rows.iter().map(|(_, name, _, _, _, _)| name.len()).sum();
+        let mut out = Vec::new();
+        push_u16(&mut out, 1);
+        push_u16(&mut out, 44);
+        push_u32(&mut out, rows.len() as u32);
+        push_u32(&mut out, pool_len as u32);
+        let mut pool = Vec::new();
+        let mut name_offset = 0u32;
+        for (tensor_id, name, value_format, shape, binding_start, binding_count) in rows {
+            push_u32(&mut out, tensor_id);
+            push_u32(&mut out, name_offset);
+            push_u16(&mut out, name.len() as u16);
+            push_u16(&mut out, crate::flm::LOGICAL_TENSOR_ROLE_QUANTIZED_WEIGHT);
+            out.push(2);
+            out.push(0);
+            for dim in shape {
+                push_u32(&mut out, dim);
+            }
+            push_u16(&mut out, value_format);
+            push_u16(&mut out, FLM_DTYPE_BF16);
+            push_u32(&mut out, binding_start);
+            push_u16(&mut out, binding_count);
+            push_u16(&mut out, crate::flm::LOGICAL_TENSOR_FLAG_REQUIRED);
+            push_u16(&mut out, 0);
+            pool.extend_from_slice(name.as_bytes());
+            name_offset += name.len() as u32;
+        }
+        out.extend_from_slice(&pool);
+        out
+    }
+
+    fn runtime_stage3_modelopt_nvfp4_storage_binding_section() -> Vec<u8> {
+        let nv_base = "model.language_model.layers.0.linear_attn.out_proj";
+        let fp8_base = "model.language_model.layers.0.linear_attn.in_proj_qkv";
+        let rows: [(u32, String, u16, u16, u16); 7] = [
+            (
+                3,
+                format!("{nv_base}.weight"),
+                crate::flm::STORAGE_ROLE_PACKED,
+                FLM_DTYPE_UINT8,
+                2,
+            ),
+            (
+                3,
+                format!("{nv_base}.weight_scale"),
+                crate::flm::STORAGE_ROLE_SCALE,
+                FLM_DTYPE_FP8_E4M3,
+                2,
+            ),
+            (
+                3,
+                format!("{nv_base}.weight_scale_2"),
+                crate::flm::STORAGE_ROLE_GLOBAL_SCALE,
+                FLM_DTYPE_FP32,
+                2,
+            ),
+            (
+                3,
+                format!("{nv_base}.input_scale"),
+                crate::flm::STORAGE_ROLE_INPUT_SCALE,
+                FLM_DTYPE_FP32,
+                2,
+            ),
+            (
+                4,
+                format!("{fp8_base}.weight"),
+                crate::flm::STORAGE_ROLE_VALUE,
+                FLM_DTYPE_FP8_E4M3,
+                5,
+            ),
+            (
+                4,
+                format!("{fp8_base}.weight_scale"),
+                crate::flm::STORAGE_ROLE_SCALE,
+                FLM_DTYPE_FP32,
+                5,
+            ),
+            (
+                4,
+                format!("{fp8_base}.input_scale"),
+                crate::flm::STORAGE_ROLE_INPUT_SCALE,
+                FLM_DTYPE_FP32,
+                5,
+            ),
+        ];
+        let pool_len: usize = rows.iter().map(|(_, name, _, _, _)| name.len()).sum();
+        let mut out = Vec::new();
+        push_u16(&mut out, 1);
+        push_u16(&mut out, 20);
+        push_u32(&mut out, rows.len() as u32);
+        push_u32(&mut out, pool_len as u32);
+        let mut pool = Vec::new();
+        let mut name_offset = 0u32;
+        for (logical_tensor_id, name, role, dtype, abi_id) in rows {
+            push_u32(&mut out, logical_tensor_id);
+            push_u32(&mut out, name_offset);
+            push_u16(&mut out, name.len() as u16);
+            push_u16(&mut out, role);
+            push_u16(&mut out, dtype);
+            push_u16(&mut out, abi_id);
+            push_u16(&mut out, crate::flm::STORAGE_BINDING_FLAG_REQUIRED);
+            push_u16(&mut out, 0);
+            pool.extend_from_slice(name.as_bytes());
+            name_offset += name.len() as u32;
+        }
+        out.extend_from_slice(&pool);
+        out
+    }
+
+    fn runtime_stage3_modelopt_nvfp4_plan_step_section() -> Vec<u8> {
+        let rows: [(u32, u16, u16, u8, [u32; 4]); 7] = [
+            (
+                3,
+                crate::flm::STORAGE_ROLE_PACKED,
+                FLM_DTYPE_UINT8,
+                2,
+                [128, 64, 0, 0],
+            ),
+            (
+                3,
+                crate::flm::STORAGE_ROLE_SCALE,
+                FLM_DTYPE_FP8_E4M3,
+                2,
+                [128, 8, 0, 0],
+            ),
+            (
+                3,
+                crate::flm::STORAGE_ROLE_GLOBAL_SCALE,
+                FLM_DTYPE_FP32,
+                1,
+                [1, 0, 0, 0],
+            ),
+            (
+                3,
+                crate::flm::STORAGE_ROLE_INPUT_SCALE,
+                FLM_DTYPE_FP32,
+                1,
+                [1, 0, 0, 0],
+            ),
+            (
+                4,
+                crate::flm::STORAGE_ROLE_VALUE,
+                FLM_DTYPE_FP8_E4M3,
+                2,
+                [32, 128, 0, 0],
+            ),
+            (
+                4,
+                crate::flm::STORAGE_ROLE_SCALE,
+                FLM_DTYPE_FP32,
+                1,
+                [1, 0, 0, 0],
+            ),
+            (
+                4,
+                crate::flm::STORAGE_ROLE_INPUT_SCALE,
+                FLM_DTYPE_FP32,
+                1,
+                [1, 0, 0, 0],
+            ),
+        ];
+        let mut out = Vec::new();
+        push_u16(&mut out, 1);
+        push_u16(&mut out, 38);
+        push_u32(&mut out, rows.len() as u32);
+        for (logical_tensor_id, role, dtype, rank, shape) in rows {
+            push_u32(&mut out, logical_tensor_id);
+            push_u16(&mut out, role);
+            push_u16(&mut out, crate::flm::CONSUME_STRATEGY_DIRECT);
+            push_u16(&mut out, crate::flm::LAYOUT_ID_DEFAULT);
+            push_u16(&mut out, dtype);
+            out.push(rank);
+            out.push(0);
+            for dim in shape {
+                push_u32(&mut out, dim);
+            }
+            push_u16(&mut out, crate::flm::PLAN_STREAM_DEFAULT);
+            push_u16(&mut out, crate::flm::PLAN_PRIORITY_DEFAULT);
+            push_u32(&mut out, crate::flm::PLAN_STEP_FLAG_NONE);
+        }
+        out
+    }
+
+    fn build_test_runtime_directory_with_modelopt_nvfp4_stage3_tables() -> Vec<u8> {
+        let (asset_table, asset_payloads) = runtime_asset_sections();
+        let sections = [
+            (1u32, runtime_config_section()),
+            (2u32, runtime_tokenizer_section()),
+            (3u32, runtime_codec_section()),
+            (4u32, runtime_tensor_abi_section()),
+            (5u32, asset_table),
+            (6u32, asset_payloads),
+            (7u32, runtime_model_descriptor_section()),
+            (8u32, runtime_tensor_manifest_section(&[])),
+            (9u32, runtime_stage3_lowbit_storage_abi_section()),
+            (10u32, runtime_stage3_modelopt_nvfp4_logical_tensor_section()),
+            (11u32, runtime_stage3_modelopt_nvfp4_storage_binding_section()),
+            (12u32, runtime_stage3_modelopt_nvfp4_plan_step_section()),
+        ];
+        let header_len = 16 + sections.len() * 12;
+        let mut offset = header_len as u32;
+        let mut out = Vec::new();
+        out.extend_from_slice(b"FLMRUN1\0");
+        push_u16(&mut out, 4);
+        push_u16(&mut out, sections.len() as u16);
+        push_u32(&mut out, crate::flm::ARCH_QWEN3_6_DENSE);
+        for (section_id, data) in &sections {
+            push_u32(&mut out, *section_id);
+            push_u32(&mut out, offset);
+            push_u32(&mut out, data.len() as u32);
+            offset += data.len() as u32;
+        }
+        for (_, data) in sections {
+            out.extend_from_slice(&data);
+        }
+        out
+    }
+
+    fn build_test_flm_with_modelopt_nvfp4_stage3_bindings() -> Vec<u8> {
+        let mut data = build_test_flm(&[
+            TestFlmTensor {
+                name: "model.language_model.layers.0.linear_attn.out_proj.weight",
+                shape: vec![128, 64],
+                dtype: FLM_DTYPE_UINT8,
+                codec: 3,
+                payload: vec![0x11; 128 * 64],
+            },
+            TestFlmTensor {
+                name: "model.language_model.layers.0.linear_attn.out_proj.weight_scale",
+                shape: vec![128, 8],
+                dtype: FLM_DTYPE_FP8_E4M3,
+                codec: 3,
+                payload: vec![0x3f; 128 * 8],
+            },
+            TestFlmTensor {
+                name: "model.language_model.layers.0.linear_attn.out_proj.weight_scale_2",
+                shape: vec![1],
+                dtype: FLM_DTYPE_FP32,
+                codec: 0,
+                payload: vec![0, 0, 128, 63],
+            },
+            TestFlmTensor {
+                name: "model.language_model.layers.0.linear_attn.out_proj.input_scale",
+                shape: vec![1],
+                dtype: FLM_DTYPE_FP32,
+                codec: 0,
+                payload: vec![0, 0, 0, 64],
+            },
+            TestFlmTensor {
+                name: "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
+                shape: vec![32, 128],
+                dtype: FLM_DTYPE_FP8_E4M3,
+                codec: 6,
+                payload: vec![0x33; 32 * 128],
+            },
+            TestFlmTensor {
+                name: "model.language_model.layers.0.linear_attn.in_proj_qkv.weight_scale",
+                shape: vec![1],
+                dtype: FLM_DTYPE_FP32,
+                codec: 6,
+                payload: vec![0, 0, 0, 63],
+            },
+            TestFlmTensor {
+                name: "model.language_model.layers.0.linear_attn.in_proj_qkv.input_scale",
+                shape: vec![1],
+                dtype: FLM_DTYPE_FP32,
+                codec: 0,
+                payload: vec![0, 0, 64, 64],
+            },
+        ]);
+        let runtime = build_test_runtime_directory_with_modelopt_nvfp4_stage3_tables();
+        append_runtime_directory(&mut data, &runtime);
+        data
     }
 
     fn build_test_flm_with_stage3_lowbit_bindings() -> Vec<u8> {
@@ -2934,6 +3314,87 @@ mod tests {
     }
 
     #[test]
+    fn open_flm_builds_modelopt_nvfp4_same_name_packed_direct_view() {
+        let data = build_test_flm_with_modelopt_nvfp4_stage3_bindings();
+        let file = write_temp_flm(&data);
+
+        let store = BakedStore::open_flm_with_options(
+            file.path(),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                verify_block_hashes: false,
+            },
+        )
+        .expect("open FLM with ModelOpt NVFP4 Stage 3 bindings");
+
+        let nv_name = "model.language_model.layers.0.linear_attn.out_proj.weight";
+        let nv = store.meta(nv_name).expect("NVFP4 logical tensor");
+        assert_eq!(nv.layout, LayoutTag::Raw);
+        assert_eq!(nv.dtype, "u8");
+        assert_eq!(nv.shape, vec![128, 128]);
+        assert_eq!(nv.byte_len, 128 * 64);
+        assert_eq!(
+            store.upload_view(nv_name).expect("NVFP4 upload view"),
+            &TensorUploadView {
+                dtype: "u8".to_string(),
+                shape: vec![128, 64],
+            }
+        );
+        let input = store
+            .meta("model.language_model.layers.0.linear_attn.out_proj.weight_nvfp4_input_scale")
+            .expect("NVFP4 input scale alias");
+        assert_eq!(input.dtype, "f32");
+        assert_eq!(input.shape, vec![1]);
+        assert_eq!(
+            store
+                .upload_view("model.language_model.layers.0.linear_attn.out_proj.weight_nvfp4_input_scale")
+                .expect("NVFP4 input scale upload view"),
+            &TensorUploadView {
+                dtype: "f32".to_string(),
+                shape: vec![1],
+            }
+        );
+    }
+
+    #[test]
+    fn open_flm_builds_fp8_scalar_stage3_direct_view() {
+        let data = build_test_flm_with_modelopt_nvfp4_stage3_bindings();
+        let file = write_temp_flm(&data);
+
+        let store = BakedStore::open_flm_with_options(
+            file.path(),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                verify_block_hashes: false,
+            },
+        )
+        .expect("open FLM with FP8 scalar Stage 3 bindings");
+
+        let fp8_name = "model.language_model.layers.0.linear_attn.in_proj_qkv.weight";
+        let fp8 = store.meta(fp8_name).expect("FP8 scalar logical tensor");
+        assert_eq!(fp8.layout, LayoutTag::Raw);
+        assert_eq!(fp8.dtype, "f8_e4m3");
+        assert_eq!(fp8.shape, vec![32, 128]);
+        assert_eq!(
+            store.upload_view(fp8_name).expect("FP8 scalar upload view"),
+            &TensorUploadView {
+                dtype: "f8_e4m3".to_string(),
+                shape: vec![32, 128],
+            }
+        );
+        let scale = store
+            .meta("model.language_model.layers.0.linear_attn.in_proj_qkv.weight_fp8_e4m3_f32_scale")
+            .expect("FP8 scalar scale alias");
+        assert_eq!(scale.dtype, "f32");
+        assert_eq!(scale.shape, vec![1]);
+        let input = store
+            .meta("model.language_model.layers.0.linear_attn.in_proj_qkv.weight_fp8_e4m3_f32_input_scale")
+            .expect("FP8 scalar input scale alias");
+        assert_eq!(input.dtype, "f32");
+        assert_eq!(input.shape, vec![1]);
+    }
+
+    #[test]
     fn gpu_upload_shape_uses_packed_row_bytes_for_logical_int4_aliases() {
         let meta = TensorMeta {
             name: "model.language_model.layers.0.linear_attn.in_proj_qkv.weight".to_string(),
@@ -3345,6 +3806,55 @@ mod tests {
         );
         assert!(store
             .contains("model.language_model.layers.0.linear_attn.in_proj_qkv.weight_mxfp8_scale"));
+    }
+
+    #[test]
+    fn flm_tiny_qwen36_modelopt_lowbit_aliases_loadable() {
+        let Ok(flm_path_str) = std::env::var("SUPERSONIC_TINY_QWEN36_MODELOPT_FLM") else {
+            eprintln!(
+                "skip: SUPERSONIC_TINY_QWEN36_MODELOPT_FLM not set. Point it at a tiny \
+                 descriptor-produced Qwen3.6 FLM to validate ModelOpt NVFP4/FP8 Stage 3 aliases."
+            );
+            return;
+        };
+        let store = BakedStore::open_flm_with_options(
+            Path::new(&flm_path_str),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                verify_block_hashes: true,
+            },
+        )
+        .expect("open tiny ModelOpt low-bit qwen3.6 FLM");
+
+        let nv_name = "model.language_model.layers.0.linear_attn.out_proj.weight";
+        let nv = store.meta(nv_name).expect("ModelOpt NVFP4 logical tensor");
+        assert_eq!(nv.dtype, "u8");
+        assert_eq!(nv.shape, vec![128, 128]);
+        assert_eq!(
+            store.upload_view(nv_name).expect("ModelOpt NVFP4 upload view"),
+            &TensorUploadView {
+                dtype: "u8".to_string(),
+                shape: vec![128, 64],
+            }
+        );
+        assert!(store.contains(
+            "model.language_model.layers.0.linear_attn.out_proj.weight_nvfp4_input_scale"
+        ));
+
+        let fp8_name = "model.language_model.layers.0.linear_attn.in_proj_qkv.weight";
+        assert_eq!(
+            store.upload_view(fp8_name).expect("FP8 scalar upload view"),
+            &TensorUploadView {
+                dtype: "f8_e4m3".to_string(),
+                shape: vec![32, 128],
+            }
+        );
+        assert!(store.contains(
+            "model.language_model.layers.0.linear_attn.in_proj_qkv.weight_fp8_e4m3_f32_scale"
+        ));
+        assert!(store.contains(
+            "model.language_model.layers.0.linear_attn.in_proj_qkv.weight_fp8_e4m3_f32_input_scale"
+        ));
     }
 
     #[test]
