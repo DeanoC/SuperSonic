@@ -704,6 +704,77 @@ fn add_manifest_int4_aliases(
     Ok(())
 }
 
+fn add_stage3_raw_value_aliases(
+    runtime: &crate::flm::FlmRuntimeDirectory,
+    index: &mut HashMap<String, TensorMeta>,
+    upload_views: &mut HashMap<String, TensorUploadView>,
+) -> Result<(), Error> {
+    let direct_plan: HashMap<(u32, u16), &crate::flm::FlmPlanStep> = runtime
+        .plan_steps()
+        .iter()
+        .filter(|step| step.consume_strategy == crate::flm::CONSUME_STRATEGY_DIRECT)
+        .map(|step| ((step.logical_tensor_id, step.storage_role), step))
+        .collect();
+    let mut by_logical: HashMap<u32, Vec<&crate::flm::FlmStorageBinding>> = HashMap::new();
+    for binding in runtime.storage_bindings() {
+        by_logical
+            .entry(binding.logical_tensor_id)
+            .or_default()
+            .push(binding);
+    }
+
+    for logical in runtime.logical_tensors() {
+        if logical.value_format_id != crate::flm::VALUE_FORMAT_RAW_DENSE {
+            continue;
+        }
+        let Some(value_step) =
+            direct_plan.get(&(logical.tensor_id, crate::flm::STORAGE_ROLE_VALUE))
+        else {
+            continue;
+        };
+        let owned = by_logical.get(&logical.tensor_id).ok_or_else(|| {
+            Error::Other(format!(
+                "FLM Stage 3 logical tensor {} has no storage bindings",
+                logical.name
+            ))
+        })?;
+        let value = owned
+            .iter()
+            .find(|binding| binding.storage_role == crate::flm::STORAGE_ROLE_VALUE)
+            .ok_or_else(|| {
+                Error::Other(format!(
+                    "FLM Stage 3 raw VALUE tensor {} missing value binding",
+                    logical.name
+                ))
+            })?;
+        let value_meta = index.get(&value.tensor_name).cloned().ok_or_else(|| {
+            Error::Other(format!(
+                "FLM Stage 3 raw VALUE tensor {} missing from index",
+                value.tensor_name
+            ))
+        })?;
+        let view_dtype = flm_dtype_name(value_step.target_dtype)?.to_string();
+        let view_shape = flm_plan_target_shape(value_step)?;
+        index
+            .entry(logical.name.clone())
+            .or_insert_with(|| TensorMeta {
+                name: logical.name.clone(),
+                shape: view_shape.clone(),
+                dtype: view_dtype.clone(),
+                layout: LayoutTag::Raw,
+                offset: value_meta.offset,
+                byte_len: value_meta.byte_len,
+            });
+        upload_views
+            .entry(logical.name.clone())
+            .or_insert(TensorUploadView {
+                dtype: view_dtype,
+                shape: view_shape,
+            });
+    }
+    Ok(())
+}
+
 fn add_stage3_int4_aliases(
     runtime: &crate::flm::FlmRuntimeDirectory,
     index: &mut HashMap<String, TensorMeta>,
@@ -945,6 +1016,7 @@ impl BakedStore {
         if options.flm_int4_logical_aliases {
             if let Some(runtime) = runtime.as_ref() {
                 if !runtime.logical_tensors().is_empty() {
+                    add_stage3_raw_value_aliases(runtime, &mut index, &mut upload_views)?;
                     add_stage3_int4_aliases(
                         runtime,
                         &mut index,
@@ -1585,6 +1657,15 @@ mod tests {
         out
     }
 
+    fn runtime_stage3_empty_storage_abi_section() -> Vec<u8> {
+        let mut out = Vec::new();
+        push_u16(&mut out, 1);
+        push_u16(&mut out, 21);
+        push_u32(&mut out, 0);
+        push_u32(&mut out, 0);
+        out
+    }
+
     fn runtime_stage3_logical_tensor_section() -> Vec<u8> {
         let name = b"model.language_model.layers.0.mlp.gate_proj.weight";
         let mut out = Vec::new();
@@ -1605,6 +1686,32 @@ mod tests {
         push_u16(&mut out, FLM_DTYPE_BF16);
         push_u32(&mut out, 0);
         push_u16(&mut out, 3);
+        push_u16(&mut out, crate::flm::LOGICAL_TENSOR_FLAG_REQUIRED);
+        push_u16(&mut out, 0);
+        out.extend_from_slice(name);
+        out
+    }
+
+    fn runtime_stage3_raw_value_logical_tensor_section() -> Vec<u8> {
+        let name = b"model.language_model.layers.0.linear_attn.A_log";
+        let mut out = Vec::new();
+        push_u16(&mut out, 1);
+        push_u16(&mut out, 44);
+        push_u32(&mut out, 1);
+        push_u32(&mut out, name.len() as u32);
+        push_u32(&mut out, 2);
+        push_u32(&mut out, 0);
+        push_u16(&mut out, name.len() as u16);
+        push_u16(&mut out, crate::flm::LOGICAL_TENSOR_ROLE_WEIGHT);
+        out.push(1);
+        out.push(0);
+        for dim in [4u32, 0, 0, 0] {
+            push_u32(&mut out, dim);
+        }
+        push_u16(&mut out, crate::flm::VALUE_FORMAT_RAW_DENSE);
+        push_u16(&mut out, FLM_DTYPE_FP32);
+        push_u32(&mut out, 0);
+        push_u16(&mut out, 1);
         push_u16(&mut out, crate::flm::LOGICAL_TENSOR_FLAG_REQUIRED);
         push_u16(&mut out, 0);
         out.extend_from_slice(name);
@@ -1653,6 +1760,25 @@ mod tests {
         out
     }
 
+    fn runtime_stage3_raw_value_storage_binding_section() -> Vec<u8> {
+        let name = b"storage/l0_a_log";
+        let mut out = Vec::new();
+        push_u16(&mut out, 1);
+        push_u16(&mut out, 20);
+        push_u32(&mut out, 1);
+        push_u32(&mut out, name.len() as u32);
+        push_u32(&mut out, 2);
+        push_u32(&mut out, 0);
+        push_u16(&mut out, name.len() as u16);
+        push_u16(&mut out, crate::flm::STORAGE_ROLE_VALUE);
+        push_u16(&mut out, FLM_DTYPE_FP32);
+        push_u16(&mut out, crate::flm::STORAGE_ABI_ID_NONE);
+        push_u16(&mut out, crate::flm::STORAGE_BINDING_FLAG_REQUIRED);
+        push_u16(&mut out, 0);
+        out.extend_from_slice(name);
+        out
+    }
+
     fn runtime_stage3_plan_step_section() -> Vec<u8> {
         let mut out = Vec::new();
         push_u16(&mut out, 1);
@@ -1689,6 +1815,28 @@ mod tests {
         out
     }
 
+    fn runtime_stage3_raw_value_plan_step_section() -> Vec<u8> {
+        let mut out = Vec::new();
+        push_u16(&mut out, 1);
+        push_u16(&mut out, 38);
+        push_u32(&mut out, 1);
+
+        push_u32(&mut out, 2);
+        push_u16(&mut out, crate::flm::STORAGE_ROLE_VALUE);
+        push_u16(&mut out, crate::flm::CONSUME_STRATEGY_DIRECT);
+        push_u16(&mut out, crate::flm::LAYOUT_ID_DEFAULT);
+        push_u16(&mut out, FLM_DTYPE_FP32);
+        out.push(1);
+        out.push(0);
+        for dim in [4u32, 0, 0, 0] {
+            push_u32(&mut out, dim);
+        }
+        push_u16(&mut out, crate::flm::PLAN_STREAM_DEFAULT);
+        push_u16(&mut out, crate::flm::PLAN_PRIORITY_DEFAULT);
+        push_u32(&mut out, crate::flm::PLAN_STEP_FLAG_NONE);
+        out
+    }
+
     fn build_test_runtime_directory_with_stage3_tables() -> Vec<u8> {
         let (asset_table, asset_payloads) = runtime_asset_sections();
         let sections = [
@@ -1704,6 +1852,41 @@ mod tests {
             (10u32, runtime_stage3_logical_tensor_section()),
             (11u32, runtime_stage3_storage_binding_section()),
             (12u32, runtime_stage3_plan_step_section()),
+        ];
+        let header_len = 16 + sections.len() * 12;
+        let mut offset = header_len as u32;
+        let mut out = Vec::new();
+        out.extend_from_slice(b"FLMRUN1\0");
+        push_u16(&mut out, 4);
+        push_u16(&mut out, sections.len() as u16);
+        push_u32(&mut out, crate::flm::ARCH_QWEN3_6_DENSE);
+        for (section_id, data) in &sections {
+            push_u32(&mut out, *section_id);
+            push_u32(&mut out, offset);
+            push_u32(&mut out, data.len() as u32);
+            offset += data.len() as u32;
+        }
+        for (_, data) in sections {
+            out.extend_from_slice(&data);
+        }
+        out
+    }
+
+    fn build_test_runtime_directory_with_raw_value_stage3_tables() -> Vec<u8> {
+        let (asset_table, asset_payloads) = runtime_asset_sections();
+        let sections = [
+            (1u32, runtime_config_section()),
+            (2u32, runtime_tokenizer_section()),
+            (3u32, runtime_codec_section()),
+            (4u32, runtime_tensor_abi_section()),
+            (5u32, asset_table),
+            (6u32, asset_payloads),
+            (7u32, runtime_model_descriptor_section()),
+            (8u32, runtime_tensor_manifest_section(&[])),
+            (9u32, runtime_stage3_empty_storage_abi_section()),
+            (10u32, runtime_stage3_raw_value_logical_tensor_section()),
+            (11u32, runtime_stage3_raw_value_storage_binding_section()),
+            (12u32, runtime_stage3_raw_value_plan_step_section()),
         ];
         let header_len = 16 + sections.len() * 12;
         let mut offset = header_len as u32;
@@ -1749,6 +1932,19 @@ mod tests {
             },
         ]);
         let runtime = build_test_runtime_directory_with_stage3_tables();
+        append_runtime_directory(&mut data, &runtime);
+        data
+    }
+
+    fn build_test_flm_with_stage3_raw_value_binding() -> Vec<u8> {
+        let mut data = build_test_flm(&[TestFlmTensor {
+            name: "storage/l0_a_log",
+            shape: vec![4],
+            dtype: FLM_DTYPE_FP32,
+            codec: 0,
+            payload: vec![0; 16],
+        }]);
+        let runtime = build_test_runtime_directory_with_raw_value_stage3_tables();
         append_runtime_directory(&mut data, &runtime);
         data
     }
@@ -2106,6 +2302,39 @@ mod tests {
             .expect("native scale upload view");
         assert_eq!(scale_view.dtype, "bf16");
         assert_eq!(scale_view.shape, vec![128, 1]);
+    }
+
+    #[test]
+    fn open_flm_builds_raw_fp32_value_alias_from_stage3_binding() {
+        let data = build_test_flm_with_stage3_raw_value_binding();
+        let file = write_temp_flm(&data);
+
+        let store = BakedStore::open_flm_with_options(
+            file.path(),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                verify_block_hashes: false,
+            },
+        )
+        .expect("open FLM with raw Stage 3 value binding");
+
+        let storage = store.meta("storage/l0_a_log").expect("storage tensor");
+        assert_eq!(storage.dtype, "f32");
+        assert_eq!(storage.shape, vec![4]);
+
+        let logical_name = "model.language_model.layers.0.linear_attn.A_log";
+        let alias = store.meta(logical_name).expect("raw logical value alias");
+        assert_eq!(alias.layout, LayoutTag::Raw);
+        assert_eq!(alias.dtype, "f32");
+        assert_eq!(alias.shape, vec![4]);
+        assert_eq!(alias.offset, storage.offset);
+        assert_eq!(alias.byte_len, 16);
+
+        let upload_view = store
+            .upload_view(logical_name)
+            .expect("raw logical value upload view");
+        assert_eq!(upload_view.dtype, "f32");
+        assert_eq!(upload_view.shape, vec![4]);
     }
 
     #[test]
