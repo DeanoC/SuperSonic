@@ -972,6 +972,11 @@ fn add_stage3_lowbit_aliases(
                     crate::flm::STORAGE_ROLE_VALUE,
                     &[(crate::flm::STORAGE_ROLE_SCALE, "scale_inv")],
                 ),
+                crate::flm::VALUE_FORMAT_FP8_E4M3_B64_BF16 => (
+                    "fp8_e4m3_b64_bf16",
+                    crate::flm::STORAGE_ROLE_VALUE,
+                    &[(crate::flm::STORAGE_ROLE_SCALE, "scale")],
+                ),
                 _ => continue,
             };
 
@@ -4626,6 +4631,131 @@ mod tests {
     }
 
     #[test]
+    fn flm_qwen36_35b_mxfp8_preserve_lowbit_loadable() {
+        let Ok(flm_path_str) = std::env::var("SUPERSONIC_QWEN36_35B_MXFP8_FLM") else {
+            eprintln!(
+                "skip: SUPERSONIC_QWEN36_35B_MXFP8_FLM not set. Point it at a \
+                 preserve-lowbit mlx-community/Qwen3.6-35B-A3B-mxfp8 FLM to \
+                 validate full MoE MXFP8 aliases."
+            );
+            return;
+        };
+        let store = BakedStore::open_flm_with_options(
+            Path::new(&flm_path_str),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                verify_block_hashes: true,
+            },
+        )
+        .expect("open qwen3.6-35b MXFP8 FLM");
+
+        let runtime = store.flm_runtime().expect("runtime directory");
+        let moe = runtime.qwen36_moe_config().expect("MoE runtime config");
+        assert_eq!(moe.hidden_size, 2048);
+        assert_eq!(moe.num_hidden_layers, 40);
+        assert_eq!(moe.num_experts, 256);
+        assert_eq!(moe.num_experts_per_tok, 8);
+
+        let raw_count = runtime
+            .logical_tensors()
+            .iter()
+            .filter(|logical| logical.value_format_id == crate::flm::VALUE_FORMAT_RAW_DENSE)
+            .count();
+        let mxfp8_count = runtime
+            .logical_tensors()
+            .iter()
+            .filter(|logical| logical.value_format_id == crate::flm::VALUE_FORMAT_MXFP8_E4M3)
+            .count();
+        let fp8_b64_count = runtime
+            .logical_tensors()
+            .iter()
+            .filter(|logical| logical.value_format_id == crate::flm::VALUE_FORMAT_FP8_E4M3_B64_BF16)
+            .count();
+        assert_eq!(raw_count, 221);
+        assert_eq!(mxfp8_count, 432);
+        assert_eq!(fp8_b64_count, 80);
+
+        let embed_name = "model.language_model.embed_tokens.weight";
+        let embed = store.meta(embed_name).expect("MXFP8 embed logical alias");
+        assert_eq!(embed.dtype, "f8_e4m3");
+        assert_eq!(embed.shape, vec![248320, 2048]);
+        assert_eq!(embed.byte_len, 508_559_360);
+        assert_eq!(
+            store
+                .upload_view(embed_name)
+                .expect("MXFP8 embed upload view"),
+            &TensorUploadView {
+                dtype: "f8_e4m3".to_string(),
+                shape: vec![248320, 2048],
+            }
+        );
+        let embed_scale = store
+            .meta("model.language_model.embed_tokens.weight_mxfp8_scale")
+            .expect("MXFP8 embed scale alias");
+        assert_eq!(embed_scale.dtype, "u8");
+        assert_eq!(embed_scale.shape, vec![248320, 64]);
+
+        let qkv_name = "model.language_model.layers.0.linear_attn.in_proj_qkv.weight";
+        let qkv = store.meta(qkv_name).expect("MXFP8 qkv logical alias");
+        assert_eq!(qkv.dtype, "f8_e4m3");
+        assert_eq!(qkv.shape, vec![8192, 2048]);
+        assert_eq!(qkv.byte_len, 16_777_216);
+        let qkv_scale = store
+            .meta("model.language_model.layers.0.linear_attn.in_proj_qkv.weight_mxfp8_scale")
+            .expect("MXFP8 qkv scale alias");
+        assert_eq!(qkv_scale.dtype, "u8");
+        assert_eq!(qkv_scale.shape, vec![8192, 64]);
+
+        let switch_name = "model.language_model.layers.0.mlp.switch_mlp.down_proj.weight";
+        let switch = store
+            .meta(switch_name)
+            .expect("rank-3 MXFP8 switch MLP logical alias");
+        assert_eq!(switch.dtype, "f8_e4m3");
+        assert_eq!(switch.shape, vec![256, 2048, 512]);
+        assert_eq!(switch.byte_len, 268_435_456);
+        assert_eq!(
+            store
+                .upload_view(switch_name)
+                .expect("rank-3 MXFP8 switch MLP upload view"),
+            &TensorUploadView {
+                dtype: "f8_e4m3".to_string(),
+                shape: vec![256, 2048, 512],
+            }
+        );
+        let switch_scale = store
+            .meta("model.language_model.layers.0.mlp.switch_mlp.down_proj.weight_mxfp8_scale")
+            .expect("rank-3 MXFP8 switch MLP scale alias");
+        assert_eq!(switch_scale.dtype, "u8");
+        assert_eq!(switch_scale.shape, vec![256, 2048, 16]);
+
+        let gate_name = "model.language_model.layers.0.mlp.gate.weight";
+        let gate = store
+            .meta(gate_name)
+            .expect("FP8-B64-BF16 gate logical alias");
+        assert_eq!(gate.dtype, "f8_e4m3");
+        assert_eq!(gate.shape, vec![256, 2048]);
+        assert_eq!(gate.byte_len, 524_288);
+        let gate_scale = store
+            .meta("model.language_model.layers.0.mlp.gate.weight_fp8_e4m3_b64_bf16_scale")
+            .expect("FP8-B64-BF16 gate scale alias");
+        assert_eq!(gate_scale.dtype, "bf16");
+        assert_eq!(gate_scale.shape, vec![256, 32]);
+
+        let shared_gate_scale = store
+            .meta(
+                "model.language_model.layers.0.mlp.shared_expert_gate.weight_fp8_e4m3_b64_bf16_scale",
+            )
+            .expect("FP8-B64-BF16 shared expert gate scale alias");
+        assert_eq!(shared_gate_scale.dtype, "bf16");
+        assert_eq!(shared_gate_scale.shape, vec![1, 32]);
+
+        eprintln!(
+            "[flm-validate] OK — {} tensors including 35B MXFP8/FP8-B64 aliases",
+            store.index.len()
+        );
+    }
+
+    #[test]
     fn flm_qwen36_27b_direct_views_upload_to_hip() {
         let Ok(flm_path_str) = std::env::var("SUPERSONIC_QWEN36_27B_FLM_HIP_UPLOAD") else {
             eprintln!(
@@ -4897,6 +5027,61 @@ mod tests {
         assert_eq!(expert_scale.shape(), &[512, 64]);
 
         eprintln!("[flm-upload] OK — 35B MXFP4 FLM direct views uploaded to HIP");
+    }
+
+    #[test]
+    fn flm_qwen36_35b_mxfp8_direct_views_upload_to_hip() {
+        let Ok(flm_path_str) = std::env::var("SUPERSONIC_QWEN36_35B_MXFP8_FLM_HIP_UPLOAD") else {
+            eprintln!(
+                "skip: SUPERSONIC_QWEN36_35B_MXFP8_FLM_HIP_UPLOAD not set. Point it at a \
+                 preserve-lowbit mlx-community/Qwen3.6-35B-A3B-mxfp8 FLM to validate HIP uploads."
+            );
+            return;
+        };
+        gpu_hal::set_backend(gpu_hal::Backend::Hip);
+        let store = BakedStore::open_flm_with_options(
+            Path::new(&flm_path_str),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                verify_block_hashes: false,
+            },
+        )
+        .expect("open qwen3.6-35b MXFP8 FLM");
+
+        let shared = store
+            .load_to_gpu(
+                "model.language_model.layers.0.mlp.shared_expert.down_proj.weight",
+                0,
+            )
+            .expect("upload MXFP8 shared expert logical alias with direct view");
+        assert_eq!(shared.dtype(), ScalarType::F8E4M3);
+        assert_eq!(shared.shape(), &[2048, 512]);
+
+        let shared_scale = store
+            .load_to_gpu(
+                "model.language_model.layers.0.mlp.shared_expert.down_proj.weight_mxfp8_scale",
+                0,
+            )
+            .expect("upload MXFP8 shared expert scale alias with direct view");
+        assert_eq!(shared_scale.dtype(), ScalarType::U8);
+        assert_eq!(shared_scale.shape(), &[2048, 16]);
+
+        let gate = store
+            .load_to_gpu("model.language_model.layers.0.mlp.gate.weight", 0)
+            .expect("upload FP8-B64-BF16 gate logical alias with direct view");
+        assert_eq!(gate.dtype(), ScalarType::F8E4M3);
+        assert_eq!(gate.shape(), &[256, 2048]);
+
+        let gate_scale = store
+            .load_to_gpu(
+                "model.language_model.layers.0.mlp.gate.weight_fp8_e4m3_b64_bf16_scale",
+                0,
+            )
+            .expect("upload FP8-B64-BF16 gate scale alias with direct view");
+        assert_eq!(gate_scale.dtype(), ScalarType::BF16);
+        assert_eq!(gate_scale.shape(), &[256, 32]);
+
+        eprintln!("[flm-upload] OK — 35B MXFP8 FLM direct views uploaded to HIP");
     }
 
     #[test]
