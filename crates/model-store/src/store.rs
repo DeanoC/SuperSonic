@@ -3968,6 +3968,131 @@ mod tests {
     }
 
     #[test]
+    fn flm_qwen36_27b_mxfp4_preserve_lowbit_loadable() {
+        let Ok(flm_path_str) = std::env::var("SUPERSONIC_QWEN36_27B_MXFP4_FLM") else {
+            eprintln!(
+                "skip: SUPERSONIC_QWEN36_27B_MXFP4_FLM not set. Point it at a \
+                 preserve-lowbit OsaurusAI/Qwen3.6-27B-MXFP4 FLM to validate \
+                 dense MXFP4 aliases."
+            );
+            return;
+        };
+        let store = BakedStore::open_flm_with_options(
+            Path::new(&flm_path_str),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                verify_block_hashes: true,
+            },
+        )
+        .expect("open qwen3.6-27b MXFP4 FLM");
+
+        let runtime = store.flm_runtime().expect("runtime directory");
+        let dense = runtime.qwen36_config().expect("dense runtime config");
+        assert_eq!(dense.hidden_size, 5120);
+        assert_eq!(dense.num_hidden_layers, 64);
+        assert_eq!(dense.intermediate_size, 17408);
+
+        let raw_count = runtime
+            .logical_tensors()
+            .iter()
+            .filter(|logical| logical.value_format_id == crate::flm::VALUE_FORMAT_RAW_DENSE)
+            .count();
+        let mxfp4_count = runtime
+            .logical_tensors()
+            .iter()
+            .filter(|logical| logical.value_format_id == crate::flm::VALUE_FORMAT_MXFP4_E2M1)
+            .count();
+        assert_eq!(raw_count, 353);
+        assert_eq!(mxfp4_count, 498);
+
+        let embed_name = "model.language_model.embed_tokens.weight";
+        let embed = store.meta(embed_name).expect("MXFP4 embed logical alias");
+        assert_eq!(embed.dtype, "u8");
+        assert_eq!(embed.shape, vec![248320, 5120]);
+        assert_eq!(embed.byte_len, 635_699_200);
+        assert_eq!(
+            store
+                .upload_view(embed_name)
+                .expect("MXFP4 embed upload view"),
+            &TensorUploadView {
+                dtype: "u8".to_string(),
+                shape: vec![248320, 2560],
+            }
+        );
+        let embed_scale = store
+            .meta("model.language_model.embed_tokens.weight_mxfp4_scale")
+            .expect("MXFP4 embed scale alias");
+        assert_eq!(embed_scale.dtype, "u8");
+        assert_eq!(embed_scale.shape, vec![248320, 160]);
+
+        let lm_head = store.meta("lm_head.weight").expect("lm_head missing");
+        assert_eq!(lm_head.dtype, "u8");
+        assert_eq!(lm_head.shape, vec![248320, 5120]);
+        assert_eq!(lm_head.byte_len, 635_699_200);
+        assert_eq!(
+            store
+                .upload_view("lm_head.weight")
+                .expect("MXFP4 lm_head upload view"),
+            &TensorUploadView {
+                dtype: "u8".to_string(),
+                shape: vec![248320, 2560],
+            }
+        );
+        let lm_head_scale = store
+            .meta("lm_head.weight_mxfp4_scale")
+            .expect("MXFP4 lm_head scale alias");
+        assert_eq!(lm_head_scale.dtype, "u8");
+        assert_eq!(lm_head_scale.shape, vec![248320, 160]);
+
+        let qkv_name = "model.language_model.layers.0.linear_attn.in_proj_qkv.weight";
+        let qkv = store.meta(qkv_name).expect("MXFP4 qkv logical alias");
+        assert_eq!(qkv.dtype, "u8");
+        assert_eq!(qkv.shape, vec![10240, 5120]);
+        assert_eq!(qkv.byte_len, 26_214_400);
+        assert_eq!(
+            store.upload_view(qkv_name).expect("MXFP4 qkv upload view"),
+            &TensorUploadView {
+                dtype: "u8".to_string(),
+                shape: vec![10240, 2560],
+            }
+        );
+        let qkv_scale = store
+            .meta("model.language_model.layers.0.linear_attn.in_proj_qkv.weight_mxfp4_scale")
+            .expect("MXFP4 qkv scale alias");
+        assert_eq!(qkv_scale.dtype, "u8");
+        assert_eq!(qkv_scale.shape, vec![10240, 160]);
+
+        let mlp_name = "model.language_model.layers.0.mlp.down_proj.weight";
+        let mlp = store.meta(mlp_name).expect("MXFP4 MLP logical alias");
+        assert_eq!(mlp.dtype, "u8");
+        assert_eq!(mlp.shape, vec![5120, 17408]);
+        assert_eq!(mlp.byte_len, 44_564_480);
+        assert_eq!(
+            store.upload_view(mlp_name).expect("MXFP4 MLP upload view"),
+            &TensorUploadView {
+                dtype: "u8".to_string(),
+                shape: vec![5120, 8704],
+            }
+        );
+        let mlp_scale = store
+            .meta("model.language_model.layers.0.mlp.down_proj.weight_mxfp4_scale")
+            .expect("MXFP4 MLP scale alias");
+        assert_eq!(mlp_scale.dtype, "u8");
+        assert_eq!(mlp_scale.shape, vec![5120, 544]);
+
+        let conv = store
+            .meta("model.language_model.layers.0.linear_attn.conv1d.weight")
+            .expect("conv1d raw tensor");
+        assert_eq!(conv.dtype, "bf16");
+        assert_eq!(conv.shape, vec![10240, 4, 1]);
+
+        eprintln!(
+            "[flm-validate] OK — {} tensors including 27B MXFP4 aliases",
+            store.index.len()
+        );
+    }
+
+    #[test]
     fn flm_tiny_qwen36_raw_fp32_and_int4_aliases_loadable() {
         let Ok(flm_path_str) = std::env::var("SUPERSONIC_TINY_QWEN36_FLM") else {
             eprintln!(
@@ -4493,6 +4618,43 @@ mod tests {
         assert_eq!(fp8.shape(), &[10240, 5120]);
 
         eprintln!("[flm-upload] OK — 27B NVFP4 FLM direct views uploaded to HIP");
+    }
+
+    #[test]
+    fn flm_qwen36_27b_mxfp4_direct_views_upload_to_hip() {
+        let Ok(flm_path_str) = std::env::var("SUPERSONIC_QWEN36_27B_MXFP4_FLM_HIP_UPLOAD") else {
+            eprintln!(
+                "skip: SUPERSONIC_QWEN36_27B_MXFP4_FLM_HIP_UPLOAD not set. Point it at a \
+                 preserve-lowbit OsaurusAI/Qwen3.6-27B-MXFP4 FLM to validate HIP uploads."
+            );
+            return;
+        };
+        gpu_hal::set_backend(gpu_hal::Backend::Hip);
+        let store = BakedStore::open_flm_with_options(
+            Path::new(&flm_path_str),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                verify_block_hashes: false,
+            },
+        )
+        .expect("open qwen3.6-27b MXFP4 FLM");
+
+        let mlp = store
+            .load_to_gpu("model.language_model.layers.0.mlp.down_proj.weight", 0)
+            .expect("upload MXFP4 MLP logical alias with direct view");
+        assert_eq!(mlp.dtype(), ScalarType::U8);
+        assert_eq!(mlp.shape(), &[5120, 8704]);
+
+        let mlp_scale = store
+            .load_to_gpu(
+                "model.language_model.layers.0.mlp.down_proj.weight_mxfp4_scale",
+                0,
+            )
+            .expect("upload MXFP4 MLP scale alias with direct view");
+        assert_eq!(mlp_scale.dtype(), ScalarType::U8);
+        assert_eq!(mlp_scale.shape(), &[5120, 544]);
+
+        eprintln!("[flm-upload] OK — 27B MXFP4 FLM direct views uploaded to HIP");
     }
 
     #[test]
