@@ -967,6 +967,11 @@ fn add_stage3_lowbit_aliases(
                     crate::flm::STORAGE_ROLE_VALUE,
                     &[(crate::flm::STORAGE_ROLE_SCALE, "scale")],
                 ),
+                crate::flm::VALUE_FORMAT_FP8_E4M3_B128_BF16_INV => (
+                    "fp8_e4m3_b128_bf16",
+                    crate::flm::STORAGE_ROLE_VALUE,
+                    &[(crate::flm::STORAGE_ROLE_SCALE, "scale_inv")],
+                ),
                 _ => continue,
             };
 
@@ -1689,7 +1694,7 @@ mod tests {
 
     fn runtime_codec_section() -> Vec<u8> {
         let mut out = Vec::new();
-        push_u32(&mut out, 7);
+        push_u32(&mut out, 8);
         for (codec_id, semantic_id, layout_id, decoder_id, flags) in [
             (0u8, crate::flm::CODEC_RAW_BF16 as u8, 0u16, 0u16, 0u32),
             (
@@ -1722,6 +1727,13 @@ mod tests {
                 0u32,
             ),
             (6u8, crate::flm::CODEC_FP8_E4M3_F32 as u8, 0u16, 1u16, 0u32),
+            (
+                7u8,
+                crate::flm::CODEC_FP8_E4M3_B128_BF16_INV as u8,
+                0u16,
+                1u16,
+                0u32,
+            ),
         ] {
             out.push(codec_id);
             out.push(semantic_id);
@@ -2145,7 +2157,7 @@ mod tests {
         let mut out = Vec::new();
         push_u16(&mut out, 1);
         push_u16(&mut out, 21);
-        push_u32(&mut out, 4);
+        push_u32(&mut out, 5);
         push_u32(&mut out, 0);
         for (storage_abi_id, abi_kind, codec_semantic_id, bits, group_size, flags) in [
             (
@@ -2178,6 +2190,14 @@ mod tests {
                 crate::flm::CODEC_FP8_E4M3_F32,
                 8u8,
                 0u16,
+                0u16,
+            ),
+            (
+                6u16,
+                crate::flm::STORAGE_ABI_KIND_SCALED_FLOAT,
+                crate::flm::CODEC_FP8_E4M3_B128_BF16_INV,
+                8u8,
+                128u16,
                 0u16,
             ),
         ] {
@@ -2220,6 +2240,14 @@ mod tests {
                 5u32,
                 2u16,
             ),
+            (
+                6u32,
+                "model.language_model.layers.0.self_attn.q_proj.weight",
+                crate::flm::VALUE_FORMAT_FP8_E4M3_B128_BF16_INV,
+                [96u32, 128, 0, 0],
+                7u32,
+                2u16,
+            ),
         ];
         let pool_len: usize = rows.iter().map(|(_, name, _, _, _, _)| name.len()).sum();
         let mut out = Vec::new();
@@ -2253,7 +2281,7 @@ mod tests {
     }
 
     fn runtime_stage3_lowbit_storage_binding_section() -> Vec<u8> {
-        let rows: [(u32, &str, u16, u16, u16); 7] = [
+        let rows: [(u32, &str, u16, u16, u16); 9] = [
             (
                 3,
                 "storage/nv_packed",
@@ -2303,6 +2331,20 @@ mod tests {
                 FLM_DTYPE_UINT8,
                 4,
             ),
+            (
+                6,
+                "storage/qwen_fp8_value",
+                crate::flm::STORAGE_ROLE_VALUE,
+                FLM_DTYPE_FP8_E4M3,
+                6,
+            ),
+            (
+                6,
+                "storage/qwen_fp8_scale_inv",
+                crate::flm::STORAGE_ROLE_SCALE,
+                FLM_DTYPE_BF16,
+                6,
+            ),
         ];
         let pool_len: usize = rows.iter().map(|(_, name, _, _, _)| name.len()).sum();
         let mut out = Vec::new();
@@ -2329,7 +2371,7 @@ mod tests {
     }
 
     fn runtime_stage3_lowbit_plan_step_section() -> Vec<u8> {
-        let rows: [(u32, u16, u16, u8, [u32; 4]); 7] = [
+        let rows: [(u32, u16, u16, u8, [u32; 4]); 9] = [
             (
                 3,
                 crate::flm::STORAGE_ROLE_PACKED,
@@ -2378,6 +2420,20 @@ mod tests {
                 FLM_DTYPE_UINT8,
                 2,
                 [32, 4, 0, 0],
+            ),
+            (
+                6,
+                crate::flm::STORAGE_ROLE_VALUE,
+                FLM_DTYPE_FP8_E4M3,
+                2,
+                [96, 128, 0, 0],
+            ),
+            (
+                6,
+                crate::flm::STORAGE_ROLE_SCALE,
+                FLM_DTYPE_BF16,
+                2,
+                [1, 1, 0, 0],
             ),
         ];
         let mut out = Vec::new();
@@ -2787,6 +2843,20 @@ mod tests {
                 dtype: FLM_DTYPE_UINT8,
                 codec: 5,
                 payload: vec![127; 32 * 4],
+            },
+            TestFlmTensor {
+                name: "storage/qwen_fp8_value",
+                shape: vec![96, 128],
+                dtype: FLM_DTYPE_FP8_E4M3,
+                codec: 7,
+                payload: vec![0x44; 96 * 128],
+            },
+            TestFlmTensor {
+                name: "storage/qwen_fp8_scale_inv",
+                shape: vec![1, 1],
+                dtype: FLM_DTYPE_BF16,
+                codec: 7,
+                payload: vec![0, 63],
             },
         ]);
         let runtime = build_test_runtime_directory_with_lowbit_stage3_tables();
@@ -3300,6 +3370,28 @@ mod tests {
         assert_eq!(mx8_scale.dtype, "u8");
         assert_eq!(mx8_scale.shape, vec![32, 4]);
 
+        let qwen_fp8_name = "model.language_model.layers.0.self_attn.q_proj.weight";
+        let qwen_fp8 = store
+            .meta(qwen_fp8_name)
+            .expect("Qwen FP8 block-scale logical alias");
+        assert_eq!(qwen_fp8.layout, LayoutTag::Raw);
+        assert_eq!(qwen_fp8.dtype, "f8_e4m3");
+        assert_eq!(qwen_fp8.shape, vec![96, 128]);
+        assert_eq!(
+            store
+                .upload_view(qwen_fp8_name)
+                .expect("Qwen FP8 block-scale upload view"),
+            &TensorUploadView {
+                dtype: "f8_e4m3".to_string(),
+                shape: vec![96, 128],
+            }
+        );
+        let qwen_fp8_scale = store
+            .meta("model.language_model.layers.0.self_attn.q_proj.weight_fp8_e4m3_b128_bf16_scale_inv")
+            .expect("Qwen FP8 block-scale inverse scale alias");
+        assert_eq!(qwen_fp8_scale.dtype, "bf16");
+        assert_eq!(qwen_fp8_scale.shape, vec![1, 1]);
+
         let runtime = store.flm_runtime().expect("runtime directory");
         let by_name = runtime
             .logical_tensors()
@@ -3309,6 +3401,10 @@ mod tests {
         assert_eq!(by_name[nv_name], crate::flm::VALUE_FORMAT_NVFP4_E2M1);
         assert_eq!(by_name[mx4_name], crate::flm::VALUE_FORMAT_MXFP4_E2M1);
         assert_eq!(by_name[mx8_name], crate::flm::VALUE_FORMAT_MXFP8_E4M3);
+        assert_eq!(
+            by_name[qwen_fp8_name],
+            crate::flm::VALUE_FORMAT_FP8_E4M3_B128_BF16_INV
+        );
     }
 
     #[test]
@@ -3806,6 +3902,20 @@ mod tests {
         );
         assert!(store
             .contains("model.language_model.layers.0.linear_attn.in_proj_qkv.weight_mxfp8_scale"));
+
+        let qwen_fp8_name = "model.language_model.layers.0.self_attn.q_proj.weight";
+        assert_eq!(
+            store
+                .upload_view(qwen_fp8_name)
+                .expect("Qwen FP8 block-scale upload view"),
+            &TensorUploadView {
+                dtype: "f8_e4m3".to_string(),
+                shape: vec![8, 128],
+            }
+        );
+        assert!(store.contains(
+            "model.language_model.layers.0.self_attn.q_proj.weight_fp8_e4m3_b128_bf16_scale_inv"
+        ));
     }
 
     #[test]
