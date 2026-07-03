@@ -565,7 +565,7 @@ fn decode_text(
         let source_label = flm.source.path.display().to_string();
         validate_qwen36_decode_weight_mode(flm.weight_mode, backend, &source_label)?;
         println!(
-            "  loading from FLM: {} ({})",
+            "[qwen36-moe] loading weights from already-open FLM source at {} ({})",
             source_label,
             flm.weight_mode.display_name(),
         );

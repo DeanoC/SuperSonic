@@ -23,6 +23,7 @@ const MIB: f64 = (1024 * 1024) as f64;
 pub struct DryRunReport {
     pub config: Config,
     pub kernel_params: Qwen36MoeKernelParams,
+    pub flm_source_label: Option<PathBuf>,
     pub checkpoint: CheckpointAccount,
     pub int4_projected_bytes: u64,
     pub state: StateAccount,
@@ -185,7 +186,7 @@ pub fn run_qwen36_moe_dry_run_with_config(
     let mut dtype_mismatches = Vec::new();
     let mut loader_warning = flm_source_label.map(|path| {
         format!(
-            "FLM source {} supplies runtime weights directly; bake and safetensors accounting skipped",
+            "FLM source {} supplies runtime weights directly; HF tensor accounting skipped",
             path.display()
         )
     });
@@ -262,6 +263,7 @@ pub fn run_qwen36_moe_dry_run_with_config(
     Ok(DryRunReport {
         config,
         kernel_params,
+        flm_source_label: flm_source_label.map(Path::to_path_buf),
         checkpoint,
         int4_projected_bytes,
         state,
@@ -553,6 +555,9 @@ mod tests {
             "{warning}"
         );
         assert_eq!(report.config.text_config.num_hidden_layers, 4);
+        assert_eq!(report.flm_source_label.as_deref(), Some(flm_path.as_path()));
+        assert!(!warning.contains("safetensors"), "{warning}");
+        assert!(!warning.contains("bake"), "{warning}");
         assert!(report.bake.is_none());
         assert!(report.on_disk_bytes.is_none());
         assert!(report.on_disk_tensor_count.is_none());
@@ -691,7 +696,16 @@ pub fn print_report(report: &DryRunReport) {
         report.state.total_bytes as f64 / GIB
     );
     println!();
-    if let (Some(on_disk), Some(count)) = (report.on_disk_bytes, report.on_disk_tensor_count) {
+    if let Some(path) = &report.flm_source_label {
+        println!("[FLM source]");
+        println!("  path:            {}", path.display());
+        println!("  runtime:         config, tokenizer, and tensor table supplied by FLM");
+        if let Some(w) = &report.loader_warning {
+            println!("  WARNING: {w}");
+        }
+        println!();
+    } else if let (Some(on_disk), Some(count)) = (report.on_disk_bytes, report.on_disk_tensor_count)
+    {
         println!("[on-disk safetensors]");
         println!("  tensor count:    {count}");
         println!(
@@ -718,14 +732,24 @@ pub fn print_report(report: &DryRunReport) {
                 println!("    - {n}");
             }
         }
+        if let Some(w) = &report.loader_warning {
+            println!("  WARNING: {w}");
+        }
+        println!();
     } else {
         println!("[on-disk safetensors] not present at model-dir; analytic numbers only");
+        if let Some(w) = &report.loader_warning {
+            println!("  WARNING: {w}");
+        }
+        println!();
     }
-    if let Some(w) = &report.loader_warning {
-        println!("  WARNING: {w}");
-    }
-    println!();
-    if let Some(bake) = &report.bake {
+    if let Some(path) = &report.flm_source_label {
+        println!(
+            "[FLM runtime weights] ready-for-decode: YES (source={})",
+            path.display()
+        );
+        println!();
+    } else if let Some(bake) = &report.bake {
         println!("[INT4 baked package]");
         println!("  bake_dir:        {}", bake.bake_dir.display());
         println!(
