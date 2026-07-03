@@ -5,7 +5,7 @@ use std::time::Instant;
 use anyhow::Result;
 use model_store::manifest::QuantProfile;
 
-use crate::flm_model_source::{is_flm_model_path, FlmModelSourceOptions};
+use crate::flm_model_source::{is_flm_model_path, FlmModelSource, FlmModelSourceOptions};
 use crate::registry::ModelVariant;
 use crate::Cli;
 
@@ -233,6 +233,26 @@ pub(crate) fn flm_source_open_options(cli: &Cli) -> Result<FlmModelSourceOptions
     })
 }
 
+pub(crate) fn load_qwen35_weights_from_flm_source(
+    cli: &Cli,
+    model_variant: &ModelVariant,
+    text_config: &qwen35::config::TextConfig,
+    ordinal: usize,
+    weight_prefix: &str,
+    q4km_like: bool,
+    source: &FlmModelSource,
+) -> Result<qwen35::weights::Qwen35Weights> {
+    validate_effective_flm_source_model(cli, model_variant)?;
+    validate_flm_weight_source_options(cli, q4km_like)?;
+
+    eprintln!(
+        "[weights] loading FLM weights from already-open source at {}",
+        source.path.display()
+    );
+    qwen35::weights::Qwen35Weights::load_baked(&source.store, text_config, ordinal, weight_prefix)
+        .map_err(|e| anyhow::anyhow!("load FLM weights: {e}"))
+}
+
 pub(crate) fn load_qwen35_weights(
     cli: &Cli,
     model_variant: &ModelVariant,
@@ -256,16 +276,12 @@ pub(crate) fn load_qwen35_weights(
         .map_err(|e| anyhow::anyhow!("load weights: {e}"));
     }
 
-    let profile = effective_quant_profile(cli)?;
     if let Some(flm_file) = effective_flm_source(cli) {
-        let options = model_store::FlmLoadOptions {
-            flm_int4_logical_aliases: profile.is_native_int4_runtime(),
-            verify_block_hashes: cli.verify_flm_hashes,
-        };
+        let options = flm_source_open_options(cli)?;
         eprintln!(
-            "[weights] loading FLM container at {}{}{}",
+            "[flm] opening model source at {}{}{}",
             flm_file.display(),
-            if options.flm_int4_logical_aliases {
+            if options.int4_runtime {
                 " (FLM logical INT4 aliases enabled)"
             } else {
                 ""
@@ -276,17 +292,20 @@ pub(crate) fn load_qwen35_weights(
                 ""
             }
         );
-        let store = model_store::BakedStore::open_flm_with_options(flm_file, options)
+        let source = FlmModelSource::open_with_options(flm_file, options)
             .map_err(|e| anyhow::anyhow!("open FLM store: {e}"))?;
-        return qwen35::weights::Qwen35Weights::load_baked(
-            &store,
+        return load_qwen35_weights_from_flm_source(
+            cli,
+            model_variant,
             text_config,
             ordinal,
             weight_prefix,
-        )
-        .map_err(|e| anyhow::anyhow!("load FLM weights: {e}"));
+            q4km_like,
+            &source,
+        );
     }
 
+    let profile = effective_quant_profile(cli)?;
     let variant = model_store::fetch::variant_from_quant_profile(profile);
     let mut bake_dir = variant.bake_dir(&cli.model_dir);
     let _lock = model_store::BakeLock::acquire(&cli.model_dir)

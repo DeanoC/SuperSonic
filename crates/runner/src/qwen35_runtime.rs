@@ -72,6 +72,7 @@ pub(crate) fn run_qwen35(
         tokenizer,
         prompt_ids,
         context_tokens,
+        flm_source,
     } = load_qwen35_startup(&cli)?;
     check_qwen35_vram(
         &cli,
@@ -95,6 +96,7 @@ pub(crate) fn run_qwen35(
         &cli,
         &model_variant,
         &text_config,
+        flm_source.as_ref(),
         params,
         backend,
         gpu_arch,

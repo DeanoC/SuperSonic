@@ -1,7 +1,8 @@
 use anyhow::Result;
 
-use crate::bakes::load_qwen35_weights;
+use crate::bakes::{load_qwen35_weights, load_qwen35_weights_from_flm_source};
 use crate::decode_engine::DecodeEngine;
+use crate::flm_model_source::FlmModelSource;
 use crate::registry::{self, Backend, GpuArch, ModelVariant, Qwen35KernelParams, RegistryEntry};
 use crate::Cli;
 
@@ -30,6 +31,7 @@ pub(crate) fn load_qwen35_engine(
     cli: &Cli,
     model_variant: &ModelVariant,
     text_config: &qwen35::config::TextConfig,
+    flm_source: Option<&FlmModelSource>,
     params: &Qwen35KernelParams,
     backend: Backend,
     gpu_arch: GpuArch,
@@ -39,15 +41,27 @@ pub(crate) fn load_qwen35_engine(
     context_tokens: usize,
 ) -> Result<Qwen35EngineSetup> {
     let t0 = std::time::Instant::now();
-    let weights = load_qwen35_weights(
-        cli,
-        model_variant,
-        text_config,
-        ordinal,
-        params.weight_prefix,
-        bootstrap_downloaded,
-        q4km_like,
-    )?;
+    let weights = if let Some(source) = flm_source {
+        load_qwen35_weights_from_flm_source(
+            cli,
+            model_variant,
+            text_config,
+            ordinal,
+            params.weight_prefix,
+            q4km_like,
+            source,
+        )?
+    } else {
+        load_qwen35_weights(
+            cli,
+            model_variant,
+            text_config,
+            ordinal,
+            params.weight_prefix,
+            bootstrap_downloaded,
+            q4km_like,
+        )?
+    };
     if weights.is_fp8 {
         eprintln!(
             "[weights] FP8 runtime dequant active (block_size={})",
