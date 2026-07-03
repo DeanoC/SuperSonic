@@ -21,11 +21,10 @@ fn qwen36_dense_flm_model_dir_runs_without_hf_snapshot() {
     };
     let path = PathBuf::from(path);
     if !path.exists() {
-        eprintln!(
-            "skipping: SUPERSONIC_QWEN36_27B_NO_HF_FLM path does not exist: {}",
+        panic!(
+            "SUPERSONIC_QWEN36_27B_NO_HF_FLM is set but the path does not exist: {}",
             path.display()
         );
-        return;
     }
 
     let backend =
