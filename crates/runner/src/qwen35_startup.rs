@@ -2,8 +2,8 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use crate::bakes::{effective_quant_profile, validate_effective_flm_source_model};
-use crate::flm_model_source::{is_flm_model_path, FlmModelSource, FlmModelSourceOptions};
+use crate::bakes::{flm_source_open_options, validate_effective_flm_source_model};
+use crate::flm_model_source::{is_flm_model_path, FlmModelSource};
 use crate::registry::{Backend, GpuArch, ModelVariant, Qwen35KernelParams};
 use crate::Cli;
 
@@ -12,6 +12,7 @@ pub(crate) struct Qwen35Startup {
     pub(crate) tokenizer: tokenizers::Tokenizer,
     pub(crate) prompt_ids: Vec<u32>,
     pub(crate) context_tokens: usize,
+    pub(crate) flm_source: Option<FlmModelSource>,
 }
 
 pub(crate) struct Qwen35Policy {
@@ -57,6 +58,7 @@ pub(crate) fn load_qwen35_startup(cli: &Cli) -> Result<Qwen35Startup> {
         tokenizer,
         prompt_ids,
         context_tokens,
+        flm_source,
     })
 }
 
@@ -64,17 +66,24 @@ fn open_flm_startup_source(cli: &Cli) -> Result<Option<FlmModelSource>> {
     let Some(path) = flm_config_path(cli) else {
         return Ok(None);
     };
-    FlmModelSource::open_with_options(path, flm_startup_open_options(cli)?)
+    let options = flm_source_open_options(cli)?;
+    eprintln!(
+        "[flm] opening model source at {}{}{}",
+        path.display(),
+        if options.int4_runtime {
+            " (FLM logical INT4 aliases enabled)"
+        } else {
+            ""
+        },
+        if options.verify_block_hashes {
+            " (BLAKE3 hash verification enabled)"
+        } else {
+            ""
+        }
+    );
+    FlmModelSource::open_with_options(path, options)
         .map(Some)
         .map_err(|e| anyhow::anyhow!("opening FLM startup source {}: {e}", path.display()))
-}
-
-fn flm_startup_open_options(cli: &Cli) -> Result<FlmModelSourceOptions> {
-    let profile = effective_quant_profile(cli)?;
-    Ok(FlmModelSourceOptions {
-        int4_runtime: profile.is_native_int4_runtime(),
-        verify_block_hashes: false,
-    })
 }
 
 fn load_qwen35_config(
@@ -146,8 +155,7 @@ mod tests {
     use clap::Parser;
 
     use super::{
-        flm_config_path, flm_startup_open_options, qwen_tokenizer_source, validate_qwen35_startup,
-        QwenTokenizerSource,
+        flm_config_path, qwen_tokenizer_source, validate_qwen35_startup, QwenTokenizerSource,
     };
     use crate::registry::{Backend, GpuArch, ModelVariant, Qwen35KernelParams};
     use crate::Cli;
@@ -196,36 +204,6 @@ mod tests {
             qwen_tokenizer_source(&flm_file_cli),
             QwenTokenizerSource::Flm(Path::new("/tmp/model.flm"))
         );
-    }
-
-    #[test]
-    fn flm_startup_open_options_track_cli_quant_flags() {
-        let cli = cli("/tmp/model.flm", &["--int4"]);
-
-        let options = flm_startup_open_options(&cli).expect("valid quant flags");
-
-        assert!(options.int4_runtime);
-        assert!(!options.verify_block_hashes);
-    }
-
-    #[test]
-    fn flm_startup_open_options_defer_payload_hash_verification_to_weights() {
-        let cli = cli("/tmp/model.flm", &["--int4", "--verify-flm-hashes"]);
-
-        let options = flm_startup_open_options(&cli).expect("valid quant flags");
-
-        assert!(options.int4_runtime);
-        assert!(!options.verify_block_hashes);
-    }
-
-    #[test]
-    fn flm_startup_open_options_track_weight_quant_profile_aliases() {
-        let cli = cli("/tmp/model.flm", &["--weight-quant", "int4-gptq"]);
-
-        let options = flm_startup_open_options(&cli).expect("valid quant flags");
-
-        assert!(options.int4_runtime);
-        assert!(!options.verify_block_hashes);
     }
 
     #[test]

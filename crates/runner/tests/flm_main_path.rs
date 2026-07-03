@@ -13,6 +13,11 @@ fn combined_output(output: &std::process::Output) -> String {
 }
 
 #[cfg(target_os = "linux")]
+fn occurrence_count(haystack: &str, needle: &str) -> usize {
+    haystack.match_indices(needle).count()
+}
+
+#[cfg(target_os = "linux")]
 #[test]
 fn qwen36_dense_flm_model_dir_runs_without_hf_snapshot() {
     let Some(path) = std::env::var_os("SUPERSONIC_QWEN36_27B_NO_HF_FLM") else {
@@ -74,13 +79,22 @@ fn qwen36_dense_flm_model_dir_runs_without_hf_snapshot() {
         combined.contains("[tokenizer] loading FLM tokenizer assets"),
         "tokenizer was not loaded from FLM:\n{combined}"
     );
+    assert_eq!(
+        occurrence_count(&combined, "[flm] opening model source"),
+        1,
+        "FLM main path should open the source exactly once:\n{combined}"
+    );
     assert!(
-        combined.contains("[weights] loading FLM container"),
-        "weights were not loaded from FLM:\n{combined}"
+        combined.contains("[weights] loading FLM weights from already-open source"),
+        "weights were not loaded from the already-open FLM source:\n{combined}"
     );
     assert!(
         combined.contains("BLAKE3 hash verification enabled"),
-        "--verify-flm-hashes was not threaded to FLM weight loading:\n{combined}"
+        "--verify-flm-hashes was not threaded to the single FLM source open:\n{combined}"
+    );
+    assert!(
+        !combined.contains("[weights] loading FLM container"),
+        "FLM main path reopened the FLM container during weight loading:\n{combined}"
     );
     assert!(
         combined.contains("[tokens] "),
