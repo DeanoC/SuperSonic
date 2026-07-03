@@ -117,13 +117,41 @@ pub fn run_qwen36_moe_dry_run(
     no_bake: bool,
     ordinal: usize,
 ) -> Result<DryRunReport> {
+    let config = qwen36_moe::config::load_config(model_dir)
+        .map_err(|e| anyhow!("parse config.json: {e}"))?;
+
+    run_qwen36_moe_dry_run_with_config(
+        model_dir,
+        None,
+        config,
+        entry,
+        total_vram,
+        context_size,
+        context_size_source,
+        batch_size,
+        kv_fp8,
+        no_bake,
+        ordinal,
+    )
+}
+
+pub fn run_qwen36_moe_dry_run_with_config(
+    model_dir: &Path,
+    flm_source_label: Option<&Path>,
+    config: Config,
+    entry: &RegistryEntry,
+    total_vram: u64,
+    context_size: usize,
+    context_size_source: ContextSizeSource,
+    batch_size: usize,
+    kv_fp8: bool,
+    no_bake: bool,
+    ordinal: usize,
+) -> Result<DryRunReport> {
     let kernel_params = match entry.params {
         FamilyParams::Qwen36Moe(p) => p,
         _ => return Err(anyhow!("registry entry is not Qwen36Moe family")),
     };
-
-    let config = qwen36_moe::config::load_config(model_dir)
-        .map_err(|e| anyhow!("parse config.json: {e}"))?;
 
     sanity_check_kernel_params(&config.text_config, &kernel_params)?;
 
@@ -146,14 +174,25 @@ pub fn run_qwen36_moe_dry_run(
     let layout = StateLayout::new(context_size, batch_size, kv_fp8, sidecar_window);
     let state = StateAccount::from_config(&config.text_config, layout);
 
-    let bake = inspect_bake(model_dir, &config.text_config, weight_prefix, ordinal);
+    let bake = flm_source_label
+        .is_none()
+        .then(|| inspect_bake(model_dir, &config.text_config, weight_prefix, ordinal))
+        .flatten();
 
     let mut on_disk_bytes = None;
     let mut on_disk_tensor_count = None;
     let mut missing_tensors = Vec::new();
     let mut dtype_mismatches = Vec::new();
-    let mut loader_warning = None;
-    if !no_bake_only_safetensors(model_dir, no_bake) {
+    let mut loader_warning = flm_source_label.map(|path| {
+        format!(
+            "FLM source {} supplies runtime weights directly; bake and safetensors accounting skipped",
+            path.display()
+        )
+    });
+    if flm_source_label.is_some() {
+        // FLM carries the authoritative runtime descriptor and weight storage.
+        // The legacy dry-run audit below is specific to HF safetensors dirs.
+    } else if !no_bake_only_safetensors(model_dir, no_bake) {
         // Bake-only dry-run path. Today the detailed tensor/dtype audit still
         // uses safetensors; bake inspection below covers on-disk package size.
     } else if !has_safetensors(model_dir) {
@@ -434,6 +473,92 @@ fn sanity_check_kernel_params(config: &TextConfig, params: &Qwen36MoeKernelParam
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::registry::{lookup, Backend, GpuArch, ModelVariant};
+    use qwen36_moe::config::Activation;
+
+    fn small_moe_config() -> Config {
+        Config {
+            text_config: TextConfig {
+                vocab_size: 1024,
+                hidden_size: 256,
+                num_hidden_layers: 4,
+                num_attention_heads: 4,
+                num_key_value_heads: 2,
+                max_position_embeddings: 4096,
+                rms_norm_eps: 1e-6,
+                hidden_act: Activation::Silu,
+                tie_word_embeddings: false,
+                eos_token_id: None,
+                bos_token_id: None,
+                head_dim: 64,
+                full_attention_interval: 4,
+                attn_output_gate: false,
+                linear_conv_kernel_dim: 4,
+                linear_key_head_dim: 64,
+                linear_value_head_dim: 64,
+                linear_num_key_heads: 2,
+                linear_num_value_heads: 4,
+                layer_types: Vec::new(),
+                rope_parameters: None,
+                num_experts: 4,
+                num_experts_per_tok: 2,
+                moe_intermediate_size: 64,
+                shared_expert_intermediate_size: 64,
+                norm_topk_prob: true,
+                router_aux_loss_coef: 0.001,
+                mlp_only_layers: Vec::new(),
+                decoder_sparse_step: None,
+            },
+            architectures: Vec::new(),
+            model_type: None,
+        }
+        .normalized()
+    }
+
+    #[test]
+    fn flm_dry_run_uses_supplied_config_without_safetensors_audit() {
+        let temp = tempfile::tempdir().expect("temp model dir");
+        let flm_path = temp.path().join("model.flm");
+        let entry = lookup(
+            &ModelVariant::Qwen3_6_35B_A3B,
+            &Backend::Hip,
+            &GpuArch::Gfx1100,
+        )
+        .expect("qwen3.6 MoE HIP registry entry");
+
+        let report = run_qwen36_moe_dry_run_with_config(
+            temp.path(),
+            Some(&flm_path),
+            small_moe_config(),
+            entry,
+            24 * 1024 * 1024 * 1024,
+            16,
+            ContextSizeSource::Explicit,
+            1,
+            false,
+            false,
+            0,
+        )
+        .expect("dry-run from FLM config");
+
+        let warning = report.loader_warning.expect("FLM source warning");
+        assert!(warning.contains("FLM source"), "{warning}");
+        assert!(
+            warning.contains(&flm_path.display().to_string()),
+            "{warning}"
+        );
+        assert_eq!(report.config.text_config.num_hidden_layers, 4);
+        assert!(report.bake.is_none());
+        assert!(report.on_disk_bytes.is_none());
+        assert!(report.on_disk_tensor_count.is_none());
+        assert!(report.missing_tensors.is_empty());
+        assert!(report.dtype_mismatches.is_empty());
+    }
 }
 
 pub fn print_report(report: &DryRunReport) {
