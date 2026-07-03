@@ -503,9 +503,9 @@ mod tests {
     use model_store::manifest::QuantProfile;
 
     use super::{
-        effective_flm_source, effective_quant_profile, flm_source_is_authoritative_for_model,
-        should_fetch_bake, should_fetch_exact_bake, validate_effective_flm_source_model,
-        validate_flm_weight_source_options,
+        effective_flm_source, effective_quant_profile, ensure_hf_metadata_present,
+        flm_source_is_authoritative_for_model, should_fetch_bake, should_fetch_exact_bake,
+        validate_effective_flm_source_model, validate_flm_weight_source_options,
     };
     use crate::registry::ModelVariant;
     use crate::Cli;
@@ -556,6 +556,19 @@ mod tests {
             &cli_with_model_dir("/tmp/model.flm", &[]),
             &ModelVariant::Qwen3_6_27B
         ));
+    }
+
+    #[test]
+    fn qwen36_flm_model_dir_skips_hf_metadata_bootstrap_even_without_config() {
+        let cli = cli_with_model_dir(
+            "/tmp/qwen36-27b-no-hf.flm",
+            &["--int4", "--verify-flm-hashes"],
+        );
+
+        let downloaded = ensure_hf_metadata_present(&cli, &ModelVariant::Qwen3_6_27B)
+            .expect("authoritative FLM source should bypass HF metadata bootstrap");
+
+        assert!(!downloaded);
     }
 
     #[test]
