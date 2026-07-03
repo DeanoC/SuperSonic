@@ -1,5 +1,10 @@
+use std::path::Path;
+
 use anyhow::Result;
 
+use crate::bakes::validate_effective_flm_source_model;
+use crate::flm_model_source::{is_flm_model_path, FlmModelSource};
+use crate::flm_tokenizer::load_qwen_bpe_from_flm;
 use crate::registry::{Backend, GpuArch, ModelVariant, Qwen35KernelParams};
 use crate::Cli;
 
@@ -14,9 +19,14 @@ pub(crate) struct Qwen35Policy {
     pub(crate) trace_kv_cache_enabled: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QwenTokenizerSource<'a> {
+    Flm(&'a Path),
+    TokenizerJson(&'a Path),
+}
+
 pub(crate) fn load_qwen35_startup(cli: &Cli) -> Result<Qwen35Startup> {
-    let config = qwen35::config::load_config(&cli.model_dir)
-        .map_err(|e| anyhow::anyhow!("loading config.json: {e}"))?;
+    let config = load_qwen35_config(cli)?;
     let text_config = config.text_config;
     eprintln!(
         "[config] hidden={} layers={} vocab={} heads={} kv_heads={} head_dim={}",
@@ -28,9 +38,7 @@ pub(crate) fn load_qwen35_startup(cli: &Cli) -> Result<Qwen35Startup> {
         text_config.head_dim,
     );
 
-    let tokenizer_path = cli.model_dir.join("tokenizer.json");
-    let tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
-        .map_err(|e| anyhow::anyhow!("load tokenizer: {e}"))?;
+    let tokenizer = load_qwen_tokenizer(cli)?;
     let encoding = tokenizer
         .encode(cli.prompt.as_str(), !cli.prompt_no_special_tokens)
         .map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
@@ -52,6 +60,146 @@ pub(crate) fn load_qwen35_startup(cli: &Cli) -> Result<Qwen35Startup> {
     })
 }
 
+fn load_qwen35_config(cli: &Cli) -> Result<qwen35::config::Config> {
+    if let Some(flm_path) = flm_config_path(cli) {
+        return load_flm_qwen35_config(flm_path, cli.int4);
+    }
+
+    qwen35::config::load_config(&cli.model_dir)
+        .map_err(|e| anyhow::anyhow!("loading config.json: {e}"))
+}
+
+fn flm_config_path(cli: &Cli) -> Option<&Path> {
+    cli.flm_file
+        .as_deref()
+        .or_else(|| is_flm_model_path(&cli.model_dir).then_some(cli.model_dir.as_path()))
+}
+
+fn load_flm_qwen35_config(path: &Path, int4_runtime: bool) -> Result<qwen35::config::Config> {
+    eprintln!(
+        "[config] loading FLM runtime descriptor at {}",
+        path.display()
+    );
+    FlmModelSource::open(path, int4_runtime)
+        .and_then(|source| source.qwen_config())
+        .map_err(|e| anyhow::anyhow!("loading FLM Qwen config: {e}"))
+}
+
+pub(crate) fn qwen_tokenizer_source(cli: &Cli) -> QwenTokenizerSource<'_> {
+    if let Some(path) = flm_config_path(cli) {
+        QwenTokenizerSource::Flm(path)
+    } else {
+        QwenTokenizerSource::TokenizerJson(&cli.model_dir)
+    }
+}
+
+fn load_qwen_tokenizer(cli: &Cli) -> Result<tokenizers::Tokenizer> {
+    match qwen_tokenizer_source(cli) {
+        QwenTokenizerSource::Flm(path) => {
+            eprintln!(
+                "[tokenizer] loading FLM tokenizer assets at {}",
+                path.display()
+            );
+            let source = FlmModelSource::open(path, cli.int4)
+                .map_err(|e| anyhow::anyhow!("opening FLM tokenizer source: {e}"))?;
+            let runtime = source.store.flm_runtime().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "FLM {} has no runtime directory for tokenizer",
+                    path.display()
+                )
+            })?;
+            load_qwen_bpe_from_flm(runtime)
+                .map_err(|e| anyhow::anyhow!("loading FLM Qwen tokenizer: {e}"))
+        }
+        QwenTokenizerSource::TokenizerJson(model_dir) => {
+            let tokenizer_path = model_dir.join("tokenizer.json");
+            tokenizers::Tokenizer::from_file(&tokenizer_path)
+                .map_err(|e| anyhow::anyhow!("load tokenizer: {e}"))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use clap::Parser;
+
+    use super::{
+        flm_config_path, qwen_tokenizer_source, validate_qwen35_startup, QwenTokenizerSource,
+    };
+    use crate::registry::{Backend, GpuArch, ModelVariant, Qwen35KernelParams};
+    use crate::Cli;
+
+    fn cli(model_dir: &str, extra: &[&str]) -> Cli {
+        let mut args = vec!["supersonic", "--model-dir", model_dir, "--dry-run"];
+        args.extend_from_slice(extra);
+        Cli::parse_from(args)
+    }
+
+    fn qwen35_params() -> Qwen35KernelParams {
+        Qwen35KernelParams {
+            proj_buf_floats: 0,
+            attn_scratch_floats: 0,
+            weight_prefix: "",
+            kv_chunk_size: 1,
+            use_4b_kernel: false,
+        }
+    }
+
+    #[test]
+    fn flm_file_is_authoritative_for_qwen_config_even_with_model_dir_metadata() {
+        let cli = cli("/tmp/model-with-config", &["--flm-file", "/tmp/model.flm"]);
+
+        assert_eq!(flm_config_path(&cli), Some(Path::new("/tmp/model.flm")));
+    }
+
+    #[test]
+    fn flm_model_dir_is_authoritative_for_qwen_config() {
+        let cli = cli("/tmp/model.flm", &[]);
+
+        assert_eq!(flm_config_path(&cli), Some(Path::new("/tmp/model.flm")));
+    }
+
+    #[test]
+    fn effective_flm_source_selects_flm_native_tokenizer_without_tokenizer_json() {
+        let flm_model_cli = cli("/tmp/model.flm", &[]);
+
+        assert_eq!(
+            qwen_tokenizer_source(&flm_model_cli),
+            QwenTokenizerSource::Flm(Path::new("/tmp/model.flm"))
+        );
+
+        let flm_file_cli = cli("/tmp/model-dir", &["--flm-file", "/tmp/model.flm"]);
+        assert_eq!(
+            qwen_tokenizer_source(&flm_file_cli),
+            QwenTokenizerSource::Flm(Path::new("/tmp/model.flm"))
+        );
+    }
+
+    #[test]
+    fn flm_file_requires_qwen36_27b_model_variant() {
+        let cli = cli("/tmp/model-dir", &["--flm-file", "/tmp/model.flm"]);
+        let params = qwen35_params();
+
+        let err = match validate_qwen35_startup(
+            &cli,
+            &ModelVariant::Qwen3_5_0_8B,
+            &params,
+            Backend::Hip,
+            &GpuArch::Gfx1100,
+            false,
+        ) {
+            Ok(_) => panic!("expected FLM model-variant validation error"),
+            Err(err) => err.to_string(),
+        };
+
+        assert!(err.contains("--flm-file"), "{err}");
+        assert!(err.contains("qwen3.6-27b"), "{err}");
+        assert!(err.contains("qwen3.5-0.8b"), "{err}");
+    }
+}
+
 pub(crate) fn validate_qwen35_startup(
     cli: &Cli,
     model_variant: &ModelVariant,
@@ -60,6 +208,8 @@ pub(crate) fn validate_qwen35_startup(
     registry_arch: &GpuArch,
     q4km_like: bool,
 ) -> Result<Qwen35Policy> {
+    validate_effective_flm_source_model(cli, model_variant)?;
+
     if cli.trace_prefill_layers && !cli.validate {
         anyhow::bail!("--trace-prefill-layers requires --validate");
     }

@@ -5,6 +5,7 @@ use std::time::Instant;
 use anyhow::Result;
 use model_store::manifest::QuantProfile;
 
+use crate::flm_model_source::is_flm_model_path;
 use crate::registry::ModelVariant;
 use crate::Cli;
 
@@ -173,6 +174,57 @@ pub(crate) fn should_fetch_exact_bake(download_bake: bool, local_version_ok: boo
     download_bake || !local_version_ok
 }
 
+pub(crate) fn effective_flm_source(cli: &Cli) -> Option<&Path> {
+    cli.flm_file
+        .as_deref()
+        .or_else(|| is_flm_model_path(&cli.model_dir).then_some(cli.model_dir.as_path()))
+}
+
+pub(crate) fn flm_source_is_authoritative_for_model(
+    cli: &Cli,
+    model_variant: &ModelVariant,
+) -> bool {
+    matches!(model_variant, ModelVariant::Qwen3_6_27B) && effective_flm_source(cli).is_some()
+}
+
+pub(crate) fn validate_effective_flm_source_model(
+    cli: &Cli,
+    model_variant: &ModelVariant,
+) -> Result<()> {
+    let Some(flm_source) = effective_flm_source(cli) else {
+        return Ok(());
+    };
+    if *model_variant == ModelVariant::Qwen3_6_27B {
+        return Ok(());
+    }
+    let source_flag = if cli.flm_file.is_some() {
+        "--flm-file"
+    } else {
+        "--model-dir"
+    };
+    anyhow::bail!(
+        "FLM source from {source_flag} {} currently supports only --model qwen3.6-27b; got --model {}",
+        flm_source.display(),
+        model_variant
+    );
+}
+
+pub(crate) fn validate_flm_weight_source_options(cli: &Cli, q4km_like: bool) -> Result<()> {
+    if effective_flm_source(cli).is_none() {
+        return Ok(());
+    }
+    if cli.no_bake {
+        anyhow::bail!("FLM sources and --no-bake are mutually exclusive");
+    }
+    if q4km_like {
+        anyhow::bail!("FLM sources are not wired for --q4km/--q4km-gptq bakes");
+    }
+    if cli.int8 {
+        anyhow::bail!("FLM sources are not wired for --int8 bakes");
+    }
+    Ok(())
+}
+
 pub(crate) fn load_qwen35_weights(
     cli: &Cli,
     model_variant: &ModelVariant,
@@ -182,6 +234,9 @@ pub(crate) fn load_qwen35_weights(
     bootstrap_downloaded: bool,
     q4km_like: bool,
 ) -> Result<qwen35::weights::Qwen35Weights> {
+    validate_effective_flm_source_model(cli, model_variant)?;
+    validate_flm_weight_source_options(cli, q4km_like)?;
+
     if cli.no_bake {
         eprintln!("[weights] loading from safetensors (--no-bake)...");
         return qwen35::weights::Qwen35Weights::load(
@@ -194,6 +249,36 @@ pub(crate) fn load_qwen35_weights(
     }
 
     let profile = effective_quant_profile(cli)?;
+    if let Some(flm_file) = effective_flm_source(cli) {
+        let options = model_store::FlmLoadOptions {
+            flm_int4_logical_aliases: profile.is_native_int4_runtime(),
+            verify_block_hashes: cli.verify_flm_hashes,
+        };
+        eprintln!(
+            "[weights] loading FLM container at {}{}{}",
+            flm_file.display(),
+            if options.flm_int4_logical_aliases {
+                " (FLM logical INT4 aliases enabled)"
+            } else {
+                ""
+            },
+            if options.verify_block_hashes {
+                " (BLAKE3 hash verification enabled)"
+            } else {
+                ""
+            }
+        );
+        let store = model_store::BakedStore::open_flm_with_options(flm_file, options)
+            .map_err(|e| anyhow::anyhow!("open FLM store: {e}"))?;
+        return qwen35::weights::Qwen35Weights::load_baked(
+            &store,
+            text_config,
+            ordinal,
+            weight_prefix,
+        )
+        .map_err(|e| anyhow::anyhow!("load FLM weights: {e}"));
+    }
+
     let variant = model_store::fetch::variant_from_quant_profile(profile);
     let mut bake_dir = variant.bake_dir(&cli.model_dir);
     let _lock = model_store::BakeLock::acquire(&cli.model_dir)
@@ -383,6 +468,9 @@ pub(crate) fn run_q4km_baker(cli: &Cli, bake_dir: &Path) -> Result<()> {
 /// tarball bundles HF metadata under `hf/`, which the downloader extracts
 /// into `--model-dir` before anything else reads from it.
 pub(crate) fn ensure_hf_metadata_present(cli: &Cli, model_variant: &ModelVariant) -> Result<bool> {
+    if flm_source_is_authoritative_for_model(cli, model_variant) {
+        return Ok(false);
+    }
     if cli.no_bake || cli.no_download {
         return Ok(false);
     }
@@ -409,14 +497,27 @@ pub(crate) fn ensure_hf_metadata_present(cli: &Cli, model_variant: &ModelVariant
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use clap::Parser;
     use model_store::manifest::QuantProfile;
 
-    use super::{effective_quant_profile, should_fetch_bake, should_fetch_exact_bake};
+    use super::{
+        effective_flm_source, effective_quant_profile, flm_source_is_authoritative_for_model,
+        should_fetch_bake, should_fetch_exact_bake, validate_effective_flm_source_model,
+        validate_flm_weight_source_options,
+    };
+    use crate::registry::ModelVariant;
     use crate::Cli;
 
     fn cli(extra: &[&str]) -> Cli {
         let mut args = vec!["supersonic", "--model-dir", "/tmp/model", "--dry-run"];
+        args.extend_from_slice(extra);
+        Cli::parse_from(args)
+    }
+
+    fn cli_with_model_dir(model_dir: &str, extra: &[&str]) -> Cli {
+        let mut args = vec!["supersonic", "--model-dir", model_dir, "--dry-run"];
         args.extend_from_slice(extra);
         Cli::parse_from(args)
     }
@@ -439,6 +540,85 @@ mod tests {
     #[test]
     fn forced_exact_bake_fetch_ignores_metadata_bootstrap() {
         assert!(should_fetch_exact_bake(true, true));
+    }
+
+    #[test]
+    fn flm_file_is_authoritative_for_hf_metadata_bootstrap() {
+        assert!(flm_source_is_authoritative_for_model(
+            &cli(&["--flm-file", "/tmp/model.flm"]),
+            &ModelVariant::Qwen3_6_27B
+        ));
+    }
+
+    #[test]
+    fn flm_model_dir_is_authoritative_for_hf_metadata_bootstrap() {
+        assert!(flm_source_is_authoritative_for_model(
+            &cli_with_model_dir("/tmp/model.flm", &[]),
+            &ModelVariant::Qwen3_6_27B
+        ));
+    }
+
+    #[test]
+    fn flm_file_is_not_authoritative_for_gemma_hf_metadata_bootstrap() {
+        assert!(!flm_source_is_authoritative_for_model(
+            &cli(&["--flm-file", "/tmp/model.flm"]),
+            &ModelVariant::Gemma4_E2B
+        ));
+    }
+
+    #[test]
+    fn flm_model_dir_is_not_authoritative_for_gemma_hf_metadata_bootstrap() {
+        assert!(!flm_source_is_authoritative_for_model(
+            &cli_with_model_dir("/tmp/model.flm", &[]),
+            &ModelVariant::Gemma4_E2B
+        ));
+    }
+
+    #[test]
+    fn effective_flm_source_prefers_explicit_flm_file() {
+        let cli = cli_with_model_dir("/tmp/model-dir.flm", &["--flm-file", "/tmp/explicit.flm"]);
+
+        assert_eq!(
+            effective_flm_source(&cli),
+            Some(Path::new("/tmp/explicit.flm"))
+        );
+    }
+
+    #[test]
+    fn effective_flm_source_uses_flm_model_dir_without_explicit_flm_file() {
+        let cli = cli_with_model_dir("/tmp/model-dir.flm", &[]);
+
+        assert_eq!(
+            effective_flm_source(&cli),
+            Some(Path::new("/tmp/model-dir.flm"))
+        );
+    }
+
+    #[test]
+    fn effective_flm_source_requires_qwen36_27b_model_variant() {
+        let err = validate_effective_flm_source_model(
+            &cli(&["--flm-file", "/tmp/model.flm"]),
+            &ModelVariant::Qwen3_5_0_8B,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("--flm-file"), "{err}");
+        assert!(err.contains("qwen3.6-27b"), "{err}");
+        assert!(err.contains("qwen3.5-0.8b"), "{err}");
+    }
+
+    #[test]
+    fn flm_model_dir_no_bake_is_rejected_by_weight_source_options() {
+        let err = validate_flm_weight_source_options(
+            &cli_with_model_dir("/tmp/model.flm", &["--no-bake"]),
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("FLM"), "{err}");
+        assert!(err.contains("--no-bake"), "{err}");
     }
 
     #[test]

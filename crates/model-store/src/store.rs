@@ -10,12 +10,79 @@ use memmap2::Mmap;
 use crate::manifest::{LayoutTag, Manifest, TensorMeta};
 use crate::Error;
 
+const FLM_MAGIC: &[u8; 8] = b"FLM1\0\0\0\0";
+const FLM_SUPERBLOCK_SIZE: usize = 4096;
+const FLM_INDEX_RECORD_SIZE: usize = 64;
+const FLM_SHARD_DESC_SIZE: usize = 24;
+const FLM_HASH_RECORD_SIZE: usize = 40;
+const FLM_DTYPE_FP32: u16 = 0;
+const FLM_DTYPE_FP16: u16 = 1;
+const FLM_DTYPE_BF16: u16 = 2;
+const FLM_DTYPE_FP8_E4M3: u16 = 3;
+const FLM_DTYPE_UINT8: u16 = 4;
+const FLM_DTYPE_INT32: u16 = 5;
+const FLM_DTYPE_INT64: u16 = 6;
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FlmLoadOptions {
+    /// Verify BLAKE3 payload hashes for FLM tensors that reference the block
+    /// hash table. This reads and hashes the referenced payload bytes during
+    /// open, so callers should opt in when integrity matters more than startup
+    /// latency.
+    pub verify_block_hashes: bool,
+
+    /// Expose FLM logical INT4 weights as SuperSonic's native INT4
+    /// packed-weight contract. Stage 3 logical/storage bindings are preferred;
+    /// manifest groups remain as a transition fallback for older fixtures.
+    pub flm_int4_logical_aliases: bool,
+}
+
+#[derive(Debug, Clone)]
+struct FlmSuperblock {
+    tensor_count: usize,
+    index_offset: usize,
+    index_len: usize,
+    metadata_offset: usize,
+    metadata_len: usize,
+    hashtable_offset: usize,
+    hashtable_len: usize,
+    shard_table_offset: usize,
+    shard_count: usize,
+    runtime_dir_offset: usize,
+    runtime_dir_len: usize,
+}
+
+#[derive(Debug, Clone)]
+struct FlmShard {
+    offset: u64,
+    length: u64,
+}
+
+#[derive(Debug, Clone)]
+struct FlmIndexEntry {
+    name: String,
+    shape: Vec<usize>,
+    dtype: u16,
+    codec: u8,
+    file_offset: u64,
+    stored_len: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TensorUploadView {
+    dtype: String,
+    shape: Vec<usize>,
+}
+
 /// A memory-mapped baked weight store for fast GPU loading.
 pub struct BakedStore {
     _mmap: Mmap,
     data: *const u8,
     data_len: usize,
     index: HashMap<String, TensorMeta>,
+    synthetic: HashMap<String, Vec<u8>>,
+    upload_views: HashMap<String, TensorUploadView>,
+    runtime: Option<crate::flm::FlmRuntimeDirectory>,
 }
 
 // Safety: the mmap is immutable and lives as long as BakedStore.
@@ -24,6 +91,1077 @@ unsafe impl Sync for BakedStore {}
 
 fn parse_dtype(name: &str) -> Result<ScalarType, Error> {
     ScalarType::from_name(name).ok_or_else(|| Error::UnsupportedDtype(name.to_string()))
+}
+
+fn gpu_upload_shape(meta: &TensorMeta) -> Result<Vec<usize>, Error> {
+    if matches!(meta.layout, LayoutTag::Int4Quantized) {
+        let byte_len = usize::try_from(meta.byte_len).map_err(|_| {
+            Error::Other(format!(
+                "tensor '{}' byte_len={} does not fit usize",
+                meta.name, meta.byte_len
+            ))
+        })?;
+        if meta.shape.len() == 2 {
+            let rows = meta.shape[0];
+            if rows == 0 {
+                return Err(Error::Other(format!(
+                    "tensor '{}' INT4 upload shape has zero rows",
+                    meta.name
+                )));
+            }
+            if byte_len % rows != 0 {
+                return Err(Error::Other(format!(
+                    "tensor '{}' INT4 byte_len={} is not divisible by rows={}",
+                    meta.name, meta.byte_len, rows
+                )));
+            }
+            return Ok(vec![rows, byte_len / rows]);
+        }
+        return Ok(vec![byte_len]);
+    }
+    Ok(meta.shape.clone())
+}
+
+fn read_exact_range<'a>(
+    buf: &'a [u8],
+    offset: usize,
+    len: usize,
+    what: &str,
+) -> Result<&'a [u8], Error> {
+    let end = offset.checked_add(len).ok_or_else(|| {
+        Error::Other(format!(
+            "{what}: range overflows (offset={offset}, len={len})"
+        ))
+    })?;
+    if end > buf.len() {
+        return Err(Error::Other(format!(
+            "{what}: range [{offset}, {end}) exceeds file length {}",
+            buf.len()
+        )));
+    }
+    Ok(&buf[offset..end])
+}
+
+fn read_u16(buf: &[u8], offset: usize, what: &str) -> Result<u16, Error> {
+    let bytes: [u8; 2] = read_exact_range(buf, offset, 2, what)?
+        .try_into()
+        .expect("slice length checked");
+    Ok(u16::from_le_bytes(bytes))
+}
+
+fn read_u32(buf: &[u8], offset: usize, what: &str) -> Result<u32, Error> {
+    let bytes: [u8; 4] = read_exact_range(buf, offset, 4, what)?
+        .try_into()
+        .expect("slice length checked");
+    Ok(u32::from_le_bytes(bytes))
+}
+
+fn read_u64(buf: &[u8], offset: usize, what: &str) -> Result<u64, Error> {
+    let bytes: [u8; 8] = read_exact_range(buf, offset, 8, what)?
+        .try_into()
+        .expect("slice length checked");
+    Ok(u64::from_le_bytes(bytes))
+}
+
+fn u64_to_usize(value: u64, what: &str) -> Result<usize, Error> {
+    usize::try_from(value).map_err(|_| Error::Other(format!("{what}: {value} does not fit usize")))
+}
+
+fn flm_crc64_ecma(data: &[u8]) -> u64 {
+    let mut crc = 0u64;
+    const POLY: u64 = 0x42F0_E1EB_A9EA_3693;
+    for byte in data {
+        crc ^= (*byte as u64) << 56;
+        for _ in 0..8 {
+            crc = if crc & (1 << 63) != 0 {
+                (crc << 1) ^ POLY
+            } else {
+                crc << 1
+            };
+        }
+    }
+    crc
+}
+
+fn flm_head_crc64(head: &[u8]) -> Result<u64, Error> {
+    let mut checked = head.to_vec();
+    read_exact_range(&checked, 144, 8, "FLM head CRC64 field")?;
+    checked[144..152].fill(0);
+    Ok(flm_crc64_ecma(&checked))
+}
+
+fn flm_parse_superblock(buf: &[u8]) -> Result<FlmSuperblock, Error> {
+    let sb = read_exact_range(buf, 0, FLM_SUPERBLOCK_SIZE, "FLM superblock")?;
+    if &sb[..8] != FLM_MAGIC {
+        return Err(Error::Other(format!(
+            "bad FLM magic: expected {:?}, got {:?}",
+            FLM_MAGIC,
+            &sb[..8]
+        )));
+    }
+    let version = read_u32(sb, 8, "FLM format_version")?;
+    if version != 1 {
+        return Err(Error::Other(format!(
+            "unsupported FLM format_version {version}; expected 1"
+        )));
+    }
+    let tensor_count = u64_to_usize(read_u64(sb, 16, "FLM tensor_count")?, "FLM tensor_count")?;
+    let index_offset = u64_to_usize(read_u64(sb, 24, "FLM index_offset")?, "FLM index_offset")?;
+    let index_len = u64_to_usize(read_u64(sb, 32, "FLM index_len")?, "FLM index_len")?;
+    let metadata_offset = u64_to_usize(
+        read_u64(sb, 40, "FLM metadata_offset")?,
+        "FLM metadata_offset",
+    )?;
+    let metadata_len = u64_to_usize(read_u64(sb, 48, "FLM metadata_len")?, "FLM metadata_len")?;
+    let hashtable_offset = u64_to_usize(
+        read_u64(sb, 72, "FLM hashtable_offset")?,
+        "FLM hashtable_offset",
+    )?;
+    let hashtable_len = u64_to_usize(read_u64(sb, 80, "FLM hashtable_len")?, "FLM hashtable_len")?;
+    let shard_table_offset = u64_to_usize(
+        read_u64(sb, 88, "FLM shard_table_offset")?,
+        "FLM shard_table_offset",
+    )?;
+    if shard_table_offset < FLM_SUPERBLOCK_SIZE {
+        return Err(Error::Other(format!(
+            "malformed FLM head CRC region: shard_table_offset={shard_table_offset}"
+        )));
+    }
+    let stored_head_crc64 = read_u64(sb, 144, "FLM head_crc64")?;
+    let head = read_exact_range(buf, 0, shard_table_offset, "FLM head CRC64 region")?;
+    let actual_head_crc64 = flm_head_crc64(head)?;
+    if stored_head_crc64 != actual_head_crc64 {
+        return Err(Error::Other(format!(
+            "FLM head CRC mismatch: stored={stored_head_crc64}, computed={actual_head_crc64}"
+        )));
+    }
+    let shard_count = read_u32(sb, 96, "FLM shard_count")? as usize;
+    let runtime_dir_offset = u64_to_usize(
+        read_u64(sb, 168, "FLM runtime_dir_offset")?,
+        "FLM runtime_dir_offset",
+    )?;
+    let runtime_dir_len = u64_to_usize(
+        read_u64(sb, 176, "FLM runtime_dir_len")?,
+        "FLM runtime_dir_len",
+    )?;
+
+    let expected_index_len = tensor_count
+        .checked_mul(FLM_INDEX_RECORD_SIZE)
+        .ok_or_else(|| Error::Other("FLM index length overflows".to_string()))?;
+    if index_len < expected_index_len {
+        return Err(Error::Other(format!(
+            "FLM index_len {index_len} shorter than tensor_count stride {expected_index_len}"
+        )));
+    }
+
+    Ok(FlmSuperblock {
+        tensor_count,
+        index_offset,
+        index_len,
+        metadata_offset,
+        metadata_len,
+        hashtable_offset,
+        hashtable_len,
+        shard_table_offset,
+        shard_count,
+        runtime_dir_offset,
+        runtime_dir_len,
+    })
+}
+
+fn flm_read_string_table(buf: &[u8], sb: &FlmSuperblock) -> Result<Vec<String>, Error> {
+    let meta = read_exact_range(buf, sb.metadata_offset, sb.metadata_len, "FLM metadata")?;
+    if meta.len() < 4 {
+        return Err(Error::Other(
+            "FLM metadata missing string table length".to_string(),
+        ));
+    }
+    let mut offset = 0usize;
+    let count = read_u32(meta, offset, "FLM string count")? as usize;
+    offset += 4;
+    let mut strings = Vec::with_capacity(count);
+    for idx in 0..count {
+        let len = read_u32(meta, offset, "FLM string length")? as usize;
+        offset += 4;
+        let bytes = read_exact_range(meta, offset, len, "FLM string bytes")?;
+        offset += len;
+        let text = std::str::from_utf8(bytes)
+            .map_err(|e| Error::Other(format!("FLM string table entry {idx} is not UTF-8: {e}")))?;
+        strings.push(text.to_string());
+    }
+    Ok(strings)
+}
+
+fn flm_read_shards(buf: &[u8], sb: &FlmSuperblock) -> Result<HashMap<u32, FlmShard>, Error> {
+    let table_len = sb
+        .shard_count
+        .checked_mul(FLM_SHARD_DESC_SIZE)
+        .ok_or_else(|| Error::Other("FLM shard table length overflows".to_string()))?;
+    let table = read_exact_range(buf, sb.shard_table_offset, table_len, "FLM shard table")?;
+    let mut shards = HashMap::with_capacity(sb.shard_count);
+    for idx in 0..sb.shard_count {
+        let off = idx * FLM_SHARD_DESC_SIZE;
+        let shard_id = read_u32(table, off, "FLM shard_id")?;
+        let file_offset = read_u64(table, off + 4, "FLM shard file offset")?;
+        let length = read_u64(table, off + 12, "FLM shard length")?;
+        let end = file_offset.checked_add(length).ok_or_else(|| {
+            Error::Other(format!(
+                "FLM shard {shard_id} range overflows (offset={file_offset}, len={length})"
+            ))
+        })?;
+        if end > buf.len() as u64 {
+            return Err(Error::Other(format!(
+                "FLM shard {shard_id} extends past end of file (offset={file_offset}, len={length}, file_len={})",
+                buf.len()
+            )));
+        }
+        shards.insert(
+            shard_id,
+            FlmShard {
+                offset: file_offset,
+                length,
+            },
+        );
+    }
+    Ok(shards)
+}
+
+fn flm_dtype_name(dtype: u16) -> Result<&'static str, Error> {
+    match dtype {
+        FLM_DTYPE_FP32 => Ok("f32"),
+        FLM_DTYPE_FP16 => Ok("f16"),
+        FLM_DTYPE_BF16 => Ok("bf16"),
+        FLM_DTYPE_FP8_E4M3 => Ok("f8_e4m3"),
+        FLM_DTYPE_UINT8 => Ok("u8"),
+        // SuperSonic's HAL only needs byte width for packed INT4 payloads; u32
+        // preserves the 4-byte element layout of compressed-tensors int32.
+        FLM_DTYPE_INT32 => Ok("u32"),
+        FLM_DTYPE_INT64 => Ok("i64"),
+        other => Err(Error::UnsupportedDtype(format!("FLM dtype id {other}"))),
+    }
+}
+
+fn flm_read_index_entries(
+    buf: &[u8],
+    sb: &FlmSuperblock,
+    strings: &[String],
+    shards: &HashMap<u32, FlmShard>,
+) -> Result<HashMap<String, FlmIndexEntry>, Error> {
+    let index_blob = read_exact_range(buf, sb.index_offset, sb.index_len, "FLM tensor index")?;
+    let mut entries = HashMap::with_capacity(sb.tensor_count);
+    for idx in 0..sb.tensor_count {
+        let off = idx * FLM_INDEX_RECORD_SIZE;
+        let rec = read_exact_range(index_blob, off, FLM_INDEX_RECORD_SIZE, "FLM tensor record")?;
+        let name_id = read_u32(rec, 0, "FLM tensor name_id")? as usize;
+        let name = strings.get(name_id).ok_or_else(|| {
+            Error::Other(format!(
+                "FLM tensor {idx} references missing string table id {name_id}"
+            ))
+        })?;
+        let shard_id = read_u32(rec, 8, "FLM tensor shard_id")?;
+        let shard_offset = read_u64(rec, 12, "FLM tensor shard_offset")?;
+        let stored_len = read_u64(rec, 20, "FLM tensor stored_len")?;
+        let dtype = read_u16(rec, 36, "FLM tensor dtype")?;
+        let codec = rec[40];
+        let n_dims = rec[41] as usize;
+        let inline_dims = n_dims.min(4);
+        let mut shape = Vec::with_capacity(inline_dims);
+        for dim_idx in 0..inline_dims {
+            shape.push(read_u32(rec, 42 + dim_idx * 4, "FLM tensor shape")? as usize);
+        }
+        let shard = shards.get(&shard_id).ok_or_else(|| {
+            Error::Other(format!(
+                "FLM tensor {name} references missing shard {shard_id}"
+            ))
+        })?;
+        let shard_end = shard_offset.checked_add(stored_len).ok_or_else(|| {
+            Error::Other(format!(
+                "FLM tensor {name} shard range overflows (offset={shard_offset}, len={stored_len})"
+            ))
+        })?;
+        if shard_end > shard.length {
+            return Err(Error::Other(format!(
+                "FLM tensor {name} extends past shard {shard_id} (offset={shard_offset}, len={stored_len}, shard_len={})",
+                shard.length
+            )));
+        }
+        let file_offset = shard.offset.checked_add(shard_offset).ok_or_else(|| {
+            Error::Other(format!(
+                "FLM tensor {name} file offset overflows (shard_offset={}, tensor_offset={shard_offset})",
+                shard.offset
+            ))
+        })?;
+
+        entries.insert(
+            name.clone(),
+            FlmIndexEntry {
+                name: name.clone(),
+                shape,
+                dtype,
+                codec,
+                file_offset,
+                stored_len,
+            },
+        );
+    }
+    Ok(entries)
+}
+
+fn flm_build_index(
+    entries: &HashMap<String, FlmIndexEntry>,
+) -> Result<HashMap<String, TensorMeta>, Error> {
+    let mut index = HashMap::with_capacity(entries.len());
+    for entry in entries.values() {
+        let dtype_name = if entry.codec == 0 {
+            flm_dtype_name(entry.dtype)?
+        } else {
+            // Coded tensors are exposed as raw byte payloads until a runtime
+            // alias maps them onto a native SuperSonic layout.
+            "u8"
+        };
+
+        index.insert(
+            entry.name.clone(),
+            TensorMeta {
+                name: entry.name.clone(),
+                shape: entry.shape.clone(),
+                dtype: dtype_name.to_string(),
+                layout: LayoutTag::Raw,
+                offset: entry.file_offset,
+                byte_len: entry.stored_len,
+            },
+        );
+    }
+    Ok(index)
+}
+
+fn flm_verify_block_hashes(
+    buf: &[u8],
+    sb: &FlmSuperblock,
+    strings: &[String],
+    shards: &HashMap<u32, FlmShard>,
+) -> Result<(), Error> {
+    if sb.hashtable_offset == 0 && sb.hashtable_len != 0 {
+        return Err(Error::Other(format!(
+            "FLM block hash table length is {} but offset is zero",
+            sb.hashtable_len
+        )));
+    }
+    if sb.hashtable_offset != 0 && sb.hashtable_len == 0 {
+        return Err(Error::Other(format!(
+            "FLM block hash table offset is {} but length is zero",
+            sb.hashtable_offset
+        )));
+    }
+    if sb.hashtable_len % FLM_HASH_RECORD_SIZE != 0 {
+        return Err(Error::Other(format!(
+            "FLM block hash table length {} is not a multiple of {FLM_HASH_RECORD_SIZE}",
+            sb.hashtable_len
+        )));
+    }
+
+    let hash_records = sb.hashtable_len / FLM_HASH_RECORD_SIZE;
+    let hashtable = if sb.hashtable_len == 0 {
+        &[][..]
+    } else {
+        read_exact_range(
+            buf,
+            sb.hashtable_offset,
+            sb.hashtable_len,
+            "FLM block hash table",
+        )?
+    };
+    let index_blob = read_exact_range(buf, sb.index_offset, sb.index_len, "FLM tensor index")?;
+
+    for idx in 0..sb.tensor_count {
+        let off = idx * FLM_INDEX_RECORD_SIZE;
+        let rec = read_exact_range(index_blob, off, FLM_INDEX_RECORD_SIZE, "FLM tensor record")?;
+        let block_hash_idx = read_u32(rec, 58, "FLM tensor block_hash_idx")? as usize;
+        if block_hash_idx == 0 {
+            continue;
+        }
+        if block_hash_idx > hash_records {
+            return Err(Error::Other(format!(
+                "FLM tensor {idx} references block_hash_idx {block_hash_idx}, but hash table has {hash_records} records"
+            )));
+        }
+
+        let name_id = read_u32(rec, 0, "FLM tensor name_id")? as usize;
+        let name = strings.get(name_id).ok_or_else(|| {
+            Error::Other(format!(
+                "FLM tensor {idx} references missing string table id {name_id}"
+            ))
+        })?;
+        let shard_id = read_u32(rec, 8, "FLM tensor shard_id")?;
+        let shard_offset = read_u64(rec, 12, "FLM tensor shard_offset")?;
+        let stored_len = read_u64(rec, 20, "FLM tensor stored_len")?;
+        let hash_off = (block_hash_idx - 1) * FLM_HASH_RECORD_SIZE;
+        let expected_digest = read_exact_range(hashtable, hash_off, 32, "FLM block hash digest")?;
+        let expected_len = read_u64(hashtable, hash_off + 32, "FLM block hash stored_len")?;
+        if expected_len != stored_len {
+            return Err(Error::Other(format!(
+                "FLM tensor {name} block_hash_idx {block_hash_idx} stored_len mismatch: index has {stored_len}, hash table has {expected_len}"
+            )));
+        }
+
+        let shard = shards.get(&shard_id).ok_or_else(|| {
+            Error::Other(format!(
+                "FLM tensor {name} references missing shard {shard_id}"
+            ))
+        })?;
+        let shard_end = shard_offset.checked_add(stored_len).ok_or_else(|| {
+            Error::Other(format!(
+                "FLM tensor {name} shard range overflows (offset={shard_offset}, len={stored_len})"
+            ))
+        })?;
+        if shard_end > shard.length {
+            return Err(Error::Other(format!(
+                "FLM tensor {name} extends past shard {shard_id} (offset={shard_offset}, len={stored_len}, shard_len={})",
+                shard.length
+            )));
+        }
+        let file_offset = shard.offset.checked_add(shard_offset).ok_or_else(|| {
+            Error::Other(format!(
+                "FLM tensor {name} file offset overflows (shard_offset={}, tensor_offset={shard_offset})",
+                shard.offset
+            ))
+        })?;
+        let payload_offset = u64_to_usize(file_offset, "FLM tensor payload offset")?;
+        let payload_len = u64_to_usize(stored_len, "FLM tensor stored_len")?;
+        let payload = read_exact_range(buf, payload_offset, payload_len, "FLM tensor payload")?;
+        let actual = blake3::hash(payload);
+        if actual.as_bytes().as_slice() != expected_digest {
+            return Err(Error::Other(format!(
+                "FLM tensor {name} block_hash_idx {block_hash_idx} hash mismatch"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn bf16_eight_bytes(len: usize) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(len);
+    for _ in 0..(len / 2) {
+        bytes.extend_from_slice(&[0x00, 0x41]);
+    }
+    bytes
+}
+
+fn manifest_row_shape(row: &crate::flm::FlmTensorManifestRow) -> Vec<usize> {
+    row.shape[..row.rank as usize]
+        .iter()
+        .map(|&dim| dim as usize)
+        .collect()
+}
+
+fn validate_flm_manifest_against_index(
+    runtime: &crate::flm::FlmRuntimeDirectory,
+    entries: &HashMap<String, FlmIndexEntry>,
+) -> Result<(), Error> {
+    for row in &runtime.tensor_manifest().rows {
+        if row.flags & crate::flm::MANIFEST_FLAG_DERIVED_ALIAS != 0 {
+            continue;
+        }
+        let Some(entry) = entries.get(&row.name) else {
+            if row.flags & crate::flm::MANIFEST_FLAG_REQUIRED != 0 {
+                return Err(Error::Other(format!(
+                    "FLM manifest required tensor {} missing from index",
+                    row.name
+                )));
+            }
+            continue;
+        };
+        if entry.shape != manifest_row_shape(row) {
+            return Err(Error::Other(format!(
+                "FLM manifest shape mismatch for {}",
+                row.name
+            )));
+        }
+        if row.dtype != entry.dtype {
+            return Err(Error::Other(format!(
+                "FLM manifest dtype mismatch for {}",
+                row.name
+            )));
+        }
+        if row.codec_id != entry.codec {
+            return Err(Error::Other(format!(
+                "FLM manifest codec mismatch for {}",
+                row.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct ManifestInt4Group<'a> {
+    packed: Option<&'a crate::flm::FlmTensorManifestRow>,
+    scale: Option<&'a crate::flm::FlmTensorManifestRow>,
+    required: bool,
+}
+
+fn add_manifest_int4_aliases(
+    runtime: &crate::flm::FlmRuntimeDirectory,
+    index: &mut HashMap<String, TensorMeta>,
+    synthetic: &mut HashMap<String, Vec<u8>>,
+) -> Result<(), Error> {
+    let mut groups: HashMap<u32, ManifestInt4Group<'_>> = HashMap::new();
+    for row in &runtime.tensor_manifest().rows {
+        if row.group_id == 0 {
+            continue;
+        }
+        let group = groups.entry(row.group_id).or_default();
+        group.required |= row.flags & crate::flm::MANIFEST_FLAG_REQUIRED != 0;
+        match row.companion_kind {
+            crate::flm::MANIFEST_COMPANION_PACKED => group.packed = Some(row),
+            crate::flm::MANIFEST_COMPANION_SCALE => group.scale = Some(row),
+            _ => {}
+        }
+    }
+
+    for (group_id, group) in groups {
+        let (Some(packed_row), Some(scale_row)) = (group.packed, group.scale) else {
+            if group.required {
+                return Err(Error::Other(format!(
+                    "FLM manifest required INT4 group {group_id} missing packed or scale tensor"
+                )));
+            }
+            continue;
+        };
+
+        let Some(base) = packed_row.name.strip_suffix(".weight_packed") else {
+            return Err(Error::Other(format!(
+                "FLM manifest INT4 packed tensor {} does not end with .weight_packed",
+                packed_row.name
+            )));
+        };
+        let Some(packed_meta) = index.get(&packed_row.name).cloned() else {
+            if group.required {
+                return Err(Error::Other(format!(
+                    "FLM manifest required INT4 packed tensor {} missing from index",
+                    packed_row.name
+                )));
+            }
+            continue;
+        };
+        let Some(scale_meta) = index.get(&scale_row.name).cloned() else {
+            if group.required {
+                return Err(Error::Other(format!(
+                    "FLM manifest required INT4 scale tensor {} missing from index",
+                    scale_row.name
+                )));
+            }
+            continue;
+        };
+        if packed_meta.shape.len() != 2 {
+            return Err(Error::Other(format!(
+                "FLM manifest INT4 packed tensor {} shape must be rank 2",
+                packed_row.name
+            )));
+        }
+
+        let alias_weight = format!("{base}.weight");
+        index
+            .entry(alias_weight.clone())
+            .or_insert_with(|| TensorMeta {
+                name: alias_weight,
+                shape: vec![packed_meta.shape[0], packed_meta.shape[1] * 4],
+                dtype: "u8".to_string(),
+                layout: LayoutTag::Int4Quantized,
+                offset: packed_meta.offset,
+                byte_len: packed_meta.byte_len,
+            });
+
+        let alias_scale = format!("{base}.weight_int4_scale");
+        let alias_scale_dtype = flm_dtype_name(scale_row.logical_dtype)?;
+        index
+            .entry(alias_scale.clone())
+            .or_insert_with(|| TensorMeta {
+                name: alias_scale,
+                shape: scale_meta.shape.clone(),
+                dtype: alias_scale_dtype.to_string(),
+                layout: LayoutTag::Raw,
+                offset: scale_meta.offset,
+                byte_len: scale_meta.byte_len,
+            });
+
+        let alias_zero = format!("{base}.weight_int4_zero");
+        index
+            .entry(alias_zero.clone())
+            .or_insert_with(|| TensorMeta {
+                name: alias_zero.clone(),
+                shape: scale_meta.shape.clone(),
+                dtype: "bf16".to_string(),
+                layout: LayoutTag::Raw,
+                offset: 0,
+                byte_len: scale_meta.byte_len,
+            });
+        synthetic
+            .entry(alias_zero)
+            .or_insert_with(|| bf16_eight_bytes(scale_meta.byte_len as usize));
+    }
+    Ok(())
+}
+
+fn add_stage3_raw_value_aliases(
+    runtime: &crate::flm::FlmRuntimeDirectory,
+    index: &mut HashMap<String, TensorMeta>,
+    upload_views: &mut HashMap<String, TensorUploadView>,
+) -> Result<(), Error> {
+    let direct_plan: HashMap<(u32, u16), &crate::flm::FlmPlanStep> = runtime
+        .plan_steps()
+        .iter()
+        .filter(|step| step.consume_strategy == crate::flm::CONSUME_STRATEGY_DIRECT)
+        .map(|step| ((step.logical_tensor_id, step.storage_role), step))
+        .collect();
+    let mut by_logical: HashMap<u32, Vec<&crate::flm::FlmStorageBinding>> = HashMap::new();
+    for binding in runtime.storage_bindings() {
+        by_logical
+            .entry(binding.logical_tensor_id)
+            .or_default()
+            .push(binding);
+    }
+
+    for logical in runtime.logical_tensors() {
+        if logical.value_format_id != crate::flm::VALUE_FORMAT_RAW_DENSE {
+            continue;
+        }
+        let Some(value_step) =
+            direct_plan.get(&(logical.tensor_id, crate::flm::STORAGE_ROLE_VALUE))
+        else {
+            continue;
+        };
+        let owned = by_logical.get(&logical.tensor_id).ok_or_else(|| {
+            Error::Other(format!(
+                "FLM Stage 3 logical tensor {} has no storage bindings",
+                logical.name
+            ))
+        })?;
+        let value = owned
+            .iter()
+            .find(|binding| binding.storage_role == crate::flm::STORAGE_ROLE_VALUE)
+            .ok_or_else(|| {
+                Error::Other(format!(
+                    "FLM Stage 3 raw VALUE tensor {} missing value binding",
+                    logical.name
+                ))
+            })?;
+        let value_meta = index.get(&value.tensor_name).cloned().ok_or_else(|| {
+            Error::Other(format!(
+                "FLM Stage 3 raw VALUE tensor {} missing from index",
+                value.tensor_name
+            ))
+        })?;
+        let view_dtype = flm_dtype_name(value_step.target_dtype)?.to_string();
+        let view_shape = flm_plan_target_shape(value_step)?;
+        index
+            .entry(logical.name.clone())
+            .or_insert_with(|| TensorMeta {
+                name: logical.name.clone(),
+                shape: view_shape.clone(),
+                dtype: view_dtype.clone(),
+                layout: LayoutTag::Raw,
+                offset: value_meta.offset,
+                byte_len: value_meta.byte_len,
+            });
+        upload_views
+            .entry(logical.name.clone())
+            .or_insert(TensorUploadView {
+                dtype: view_dtype,
+                shape: view_shape,
+            });
+    }
+    Ok(())
+}
+
+fn add_stage3_int4_aliases(
+    runtime: &crate::flm::FlmRuntimeDirectory,
+    index: &mut HashMap<String, TensorMeta>,
+    synthetic: &mut HashMap<String, Vec<u8>>,
+    upload_views: &mut HashMap<String, TensorUploadView>,
+) -> Result<(), Error> {
+    let direct_plan: HashMap<(u32, u16), &crate::flm::FlmPlanStep> = runtime
+        .plan_steps()
+        .iter()
+        .filter(|step| step.consume_strategy == crate::flm::CONSUME_STRATEGY_DIRECT)
+        .map(|step| ((step.logical_tensor_id, step.storage_role), step))
+        .collect();
+    let mut by_logical: HashMap<u32, Vec<&crate::flm::FlmStorageBinding>> = HashMap::new();
+    for binding in runtime.storage_bindings() {
+        by_logical
+            .entry(binding.logical_tensor_id)
+            .or_default()
+            .push(binding);
+    }
+
+    for logical in runtime.logical_tensors() {
+        if logical.value_format_id != crate::flm::VALUE_FORMAT_SYM_INT4 {
+            continue;
+        }
+        let Some(packed_step) =
+            direct_plan.get(&(logical.tensor_id, crate::flm::STORAGE_ROLE_PACKED))
+        else {
+            continue;
+        };
+        let scale_step = direct_plan
+            .get(&(logical.tensor_id, crate::flm::STORAGE_ROLE_SCALE))
+            .ok_or_else(|| {
+                Error::Other(format!(
+                    "FLM Stage 3 INT4 tensor {} missing scale direct plan",
+                    logical.name
+                ))
+            })?;
+        let owned = by_logical.get(&logical.tensor_id).ok_or_else(|| {
+            Error::Other(format!(
+                "FLM Stage 3 logical tensor {} has no storage bindings",
+                logical.name
+            ))
+        })?;
+        let packed = owned
+            .iter()
+            .find(|binding| binding.storage_role == crate::flm::STORAGE_ROLE_PACKED)
+            .ok_or_else(|| {
+                Error::Other(format!(
+                    "FLM Stage 3 INT4 tensor {} missing packed binding",
+                    logical.name
+                ))
+            })?;
+        let scale = owned
+            .iter()
+            .find(|binding| binding.storage_role == crate::flm::STORAGE_ROLE_SCALE)
+            .ok_or_else(|| {
+                Error::Other(format!(
+                    "FLM Stage 3 INT4 tensor {} missing scale binding",
+                    logical.name
+                ))
+            })?;
+        owned
+            .iter()
+            .find(|binding| binding.storage_role == crate::flm::STORAGE_ROLE_SHAPE)
+            .ok_or_else(|| {
+                Error::Other(format!(
+                    "FLM Stage 3 INT4 tensor {} missing shape binding",
+                    logical.name
+                ))
+            })?;
+        let packed_meta = index.get(&packed.tensor_name).cloned().ok_or_else(|| {
+            Error::Other(format!(
+                "FLM Stage 3 packed tensor {} missing from index",
+                packed.tensor_name
+            ))
+        })?;
+        let scale_meta = index.get(&scale.tensor_name).cloned().ok_or_else(|| {
+            Error::Other(format!(
+                "FLM Stage 3 scale tensor {} missing from index",
+                scale.tensor_name
+            ))
+        })?;
+        let rank = logical.rank as usize;
+        if rank != 2 {
+            return Err(Error::Other(format!(
+                "FLM Stage 3 INT4 tensor {} rank {} is unsupported",
+                logical.name, logical.rank
+            )));
+        }
+        let shape = vec![logical.shape[0] as usize, logical.shape[1] as usize];
+        let packed_view = TensorUploadView {
+            dtype: flm_dtype_name(packed_step.target_dtype)?.to_string(),
+            shape: flm_plan_target_shape(packed_step)?,
+        };
+        index
+            .entry(logical.name.clone())
+            .or_insert_with(|| TensorMeta {
+                name: logical.name.clone(),
+                shape,
+                dtype: "u8".to_string(),
+                layout: LayoutTag::Int4Quantized,
+                offset: packed_meta.offset,
+                byte_len: packed_meta.byte_len,
+            });
+        upload_views
+            .entry(logical.name.clone())
+            .or_insert(packed_view);
+
+        let base = logical.name.trim_end_matches(".weight");
+        let scale_alias = format!("{base}.weight_int4_scale");
+        let scale_dtype = flm_dtype_name(scale_step.target_dtype)?;
+        let scale_shape = flm_plan_target_shape(scale_step)?;
+        index
+            .entry(scale_alias.clone())
+            .or_insert_with(|| TensorMeta {
+                name: scale_alias.clone(),
+                shape: scale_shape.clone(),
+                dtype: scale_dtype.to_string(),
+                layout: LayoutTag::Raw,
+                offset: scale_meta.offset,
+                byte_len: scale_meta.byte_len,
+            });
+        upload_views
+            .entry(scale_alias)
+            .or_insert_with(|| TensorUploadView {
+                dtype: scale_dtype.to_string(),
+                shape: scale_shape.clone(),
+            });
+
+        let zero_alias = format!("{base}.weight_int4_zero");
+        index
+            .entry(zero_alias.clone())
+            .or_insert_with(|| TensorMeta {
+                name: zero_alias.clone(),
+                shape: scale_shape,
+                dtype: "bf16".to_string(),
+                layout: LayoutTag::Raw,
+                offset: 0,
+                byte_len: scale_meta.byte_len,
+            });
+        synthetic
+            .entry(zero_alias)
+            .or_insert_with(|| bf16_eight_bytes(scale_meta.byte_len as usize));
+    }
+    Ok(())
+}
+
+fn add_stage3_lowbit_aliases(
+    runtime: &crate::flm::FlmRuntimeDirectory,
+    index: &mut HashMap<String, TensorMeta>,
+    upload_views: &mut HashMap<String, TensorUploadView>,
+) -> Result<(), Error> {
+    let direct_plan: HashMap<(u32, u16), &crate::flm::FlmPlanStep> = runtime
+        .plan_steps()
+        .iter()
+        .filter(|step| step.consume_strategy == crate::flm::CONSUME_STRATEGY_DIRECT)
+        .map(|step| ((step.logical_tensor_id, step.storage_role), step))
+        .collect();
+    let mut by_logical: HashMap<u32, Vec<&crate::flm::FlmStorageBinding>> = HashMap::new();
+    for binding in runtime.storage_bindings() {
+        by_logical
+            .entry(binding.logical_tensor_id)
+            .or_default()
+            .push(binding);
+    }
+
+    for logical in runtime.logical_tensors() {
+        let (format_tag, primary_role, sidecars): (&str, u16, &[(u16, &str)]) =
+            match logical.value_format_id {
+                crate::flm::VALUE_FORMAT_NVFP4_E2M1 => (
+                    "nvfp4",
+                    crate::flm::STORAGE_ROLE_PACKED,
+                    &[
+                        (crate::flm::STORAGE_ROLE_SCALE, "scale"),
+                        (crate::flm::STORAGE_ROLE_GLOBAL_SCALE, "global_scale"),
+                    ],
+                ),
+                crate::flm::VALUE_FORMAT_MXFP4_E2M1 => (
+                    "mxfp4",
+                    crate::flm::STORAGE_ROLE_PACKED,
+                    &[(crate::flm::STORAGE_ROLE_SCALE, "scale")],
+                ),
+                crate::flm::VALUE_FORMAT_MXFP8_E4M3 => (
+                    "mxfp8",
+                    crate::flm::STORAGE_ROLE_VALUE,
+                    &[(crate::flm::STORAGE_ROLE_SCALE, "scale")],
+                ),
+                crate::flm::VALUE_FORMAT_FP8_E4M3_F32 => (
+                    "fp8_e4m3_f32",
+                    crate::flm::STORAGE_ROLE_VALUE,
+                    &[(crate::flm::STORAGE_ROLE_SCALE, "scale")],
+                ),
+                crate::flm::VALUE_FORMAT_FP8_E4M3_B128_BF16_INV => (
+                    "fp8_e4m3_b128_bf16",
+                    crate::flm::STORAGE_ROLE_VALUE,
+                    &[(crate::flm::STORAGE_ROLE_SCALE, "scale_inv")],
+                ),
+                crate::flm::VALUE_FORMAT_FP8_E4M3_B64_BF16 => (
+                    "fp8_e4m3_b64_bf16",
+                    crate::flm::STORAGE_ROLE_VALUE,
+                    &[(crate::flm::STORAGE_ROLE_SCALE, "scale")],
+                ),
+                _ => continue,
+            };
+
+        let Some(primary_step) = direct_plan.get(&(logical.tensor_id, primary_role)) else {
+            return Err(Error::Other(format!(
+                "FLM Stage 3 {format_tag} tensor {} missing primary direct plan",
+                logical.name
+            )));
+        };
+        let owned = by_logical.get(&logical.tensor_id).ok_or_else(|| {
+            Error::Other(format!(
+                "FLM Stage 3 logical tensor {} has no storage bindings",
+                logical.name
+            ))
+        })?;
+        let primary = owned
+            .iter()
+            .find(|binding| binding.storage_role == primary_role)
+            .ok_or_else(|| {
+                Error::Other(format!(
+                    "FLM Stage 3 {format_tag} tensor {} missing primary binding",
+                    logical.name
+                ))
+            })?;
+        let primary_meta = index.get(&primary.tensor_name).cloned().ok_or_else(|| {
+            Error::Other(format!(
+                "FLM Stage 3 primary tensor {} missing from index",
+                primary.tensor_name
+            ))
+        })?;
+        let primary_dtype = flm_dtype_name(primary_step.target_dtype)?.to_string();
+        let primary_upload_shape = flm_plan_target_shape(primary_step)?;
+        let logical_shape = flm_logical_shape(logical)?;
+        index.insert(
+            logical.name.clone(),
+            TensorMeta {
+                name: logical.name.clone(),
+                shape: logical_shape,
+                dtype: primary_dtype.clone(),
+                layout: LayoutTag::Raw,
+                offset: primary_meta.offset,
+                byte_len: primary_meta.byte_len,
+            },
+        );
+        upload_views.insert(
+            logical.name.clone(),
+            TensorUploadView {
+                dtype: primary_dtype,
+                shape: primary_upload_shape,
+            },
+        );
+
+        let alias_base = logical
+            .name
+            .strip_suffix(".weight")
+            .unwrap_or(&logical.name);
+        for (role, suffix) in sidecars {
+            let step = direct_plan
+                .get(&(logical.tensor_id, *role))
+                .ok_or_else(|| {
+                    Error::Other(format!(
+                        "FLM Stage 3 {format_tag} tensor {} missing {suffix} direct plan",
+                        logical.name
+                    ))
+                })?;
+            let binding = owned
+                .iter()
+                .find(|binding| binding.storage_role == *role)
+                .ok_or_else(|| {
+                    Error::Other(format!(
+                        "FLM Stage 3 {format_tag} tensor {} missing {suffix} binding",
+                        logical.name
+                    ))
+                })?;
+            let meta = index.get(&binding.tensor_name).cloned().ok_or_else(|| {
+                Error::Other(format!(
+                    "FLM Stage 3 sidecar tensor {} missing from index",
+                    binding.tensor_name
+                ))
+            })?;
+            let dtype = flm_dtype_name(step.target_dtype)?;
+            let shape = flm_plan_target_shape(step)?;
+            let alias = format!("{alias_base}.weight_{format_tag}_{suffix}");
+            index.entry(alias.clone()).or_insert_with(|| TensorMeta {
+                name: alias.clone(),
+                shape: shape.clone(),
+                dtype: dtype.to_string(),
+                layout: LayoutTag::Raw,
+                offset: meta.offset,
+                byte_len: meta.byte_len,
+            });
+            upload_views
+                .entry(alias)
+                .or_insert_with(|| TensorUploadView {
+                    dtype: dtype.to_string(),
+                    shape,
+                });
+        }
+        if matches!(
+            logical.value_format_id,
+            crate::flm::VALUE_FORMAT_NVFP4_E2M1 | crate::flm::VALUE_FORMAT_FP8_E4M3_F32
+        ) && direct_plan.contains_key(&(logical.tensor_id, crate::flm::STORAGE_ROLE_INPUT_SCALE))
+        {
+            let step = direct_plan
+                .get(&(logical.tensor_id, crate::flm::STORAGE_ROLE_INPUT_SCALE))
+                .expect("checked input scale plan");
+            let binding = owned
+                .iter()
+                .find(|binding| binding.storage_role == crate::flm::STORAGE_ROLE_INPUT_SCALE)
+                .ok_or_else(|| {
+                    Error::Other(format!(
+                        "FLM Stage 3 {format_tag} tensor {} missing input_scale binding",
+                        logical.name
+                    ))
+                })?;
+            let meta = index.get(&binding.tensor_name).cloned().ok_or_else(|| {
+                Error::Other(format!(
+                    "FLM Stage 3 sidecar tensor {} missing from index",
+                    binding.tensor_name
+                ))
+            })?;
+            let dtype = flm_dtype_name(step.target_dtype)?;
+            let shape = flm_plan_target_shape(step)?;
+            let alias = format!("{alias_base}.weight_{format_tag}_input_scale");
+            index.entry(alias.clone()).or_insert_with(|| TensorMeta {
+                name: alias.clone(),
+                shape: shape.clone(),
+                dtype: dtype.to_string(),
+                layout: LayoutTag::Raw,
+                offset: meta.offset,
+                byte_len: meta.byte_len,
+            });
+            upload_views
+                .entry(alias)
+                .or_insert_with(|| TensorUploadView {
+                    dtype: dtype.to_string(),
+                    shape,
+                });
+        }
+    }
+    Ok(())
+}
+
+fn flm_logical_shape(logical: &crate::flm::FlmLogicalTensor) -> Result<Vec<usize>, Error> {
+    let rank = usize::from(logical.rank);
+    if rank > logical.shape.len() {
+        return Err(Error::Other(format!(
+            "FLM logical tensor {} rank {} exceeds stored shape rank {}",
+            logical.name,
+            logical.rank,
+            logical.shape.len()
+        )));
+    }
+    logical.shape[..rank]
+        .iter()
+        .map(|dim| {
+            usize::try_from(*dim).map_err(|_| {
+                Error::Other(format!(
+                    "FLM logical tensor {} dimension {dim} does not fit usize",
+                    logical.name
+                ))
+            })
+        })
+        .collect()
+}
+
+fn flm_plan_target_shape(step: &crate::flm::FlmPlanStep) -> Result<Vec<usize>, Error> {
+    let rank = usize::from(step.target_rank);
+    if rank > step.target_shape.len() {
+        return Err(Error::Other(format!(
+            "FLM plan step target rank {} exceeds stored shape rank {}",
+            step.target_rank,
+            step.target_shape.len()
+        )));
+    }
+    step.target_shape[..rank]
+        .iter()
+        .map(|dim| {
+            usize::try_from(*dim).map_err(|_| {
+                Error::Other(format!(
+                    "FLM plan step target dimension {dim} does not fit usize"
+                ))
+            })
+        })
+        .collect()
 }
 
 impl BakedStore {
@@ -49,6 +1187,77 @@ impl BakedStore {
             data,
             data_len,
             index,
+            synthetic: HashMap::new(),
+            upload_views: HashMap::new(),
+            runtime: None,
+        })
+    }
+
+    /// Open an FLM container directly as a BakedStore-compatible byte index.
+    pub fn open_flm(path: &Path) -> Result<Self, Error> {
+        Self::open_flm_with_options(path, FlmLoadOptions::default())
+    }
+
+    /// Open an FLM container with optional compatibility aliases.
+    pub fn open_flm_with_options(path: &Path, options: FlmLoadOptions) -> Result<Self, Error> {
+        let file = File::open(path)?;
+        let mmap = unsafe { Mmap::map(&file)? };
+        let data = mmap.as_ptr();
+        let data_len = mmap.len();
+        let sb = flm_parse_superblock(&mmap)?;
+        let strings = flm_read_string_table(&mmap, &sb)?;
+        let shards = flm_read_shards(&mmap, &sb)?;
+        let index_entries = flm_read_index_entries(&mmap, &sb, &strings, &shards)?;
+        let mut index = flm_build_index(&index_entries)?;
+        let runtime = match (sb.runtime_dir_offset, sb.runtime_dir_len) {
+            (0, 0) => None,
+            (0, len) => {
+                return Err(Error::Other(format!(
+                    "FLM runtime directory length is {len} but offset is zero"
+                )));
+            }
+            (offset, 0) => {
+                return Err(Error::Other(format!(
+                    "FLM runtime directory offset is {offset} but length is zero"
+                )));
+            }
+            (offset, len) => {
+                let runtime = read_exact_range(&mmap, offset, len, "FLM runtime directory")?;
+                Some(crate::flm::FlmRuntimeDirectory::parse(runtime)?)
+            }
+        };
+        if options.verify_block_hashes {
+            flm_verify_block_hashes(&mmap, &sb, &strings, &shards)?;
+        }
+        if let Some(runtime) = runtime.as_ref() {
+            validate_flm_manifest_against_index(runtime, &index_entries)?;
+        }
+        let mut synthetic = HashMap::new();
+        let mut upload_views = HashMap::new();
+        if options.flm_int4_logical_aliases {
+            if let Some(runtime) = runtime.as_ref() {
+                if !runtime.logical_tensors().is_empty() {
+                    add_stage3_raw_value_aliases(runtime, &mut index, &mut upload_views)?;
+                    add_stage3_int4_aliases(
+                        runtime,
+                        &mut index,
+                        &mut synthetic,
+                        &mut upload_views,
+                    )?;
+                    add_stage3_lowbit_aliases(runtime, &mut index, &mut upload_views)?;
+                } else {
+                    add_manifest_int4_aliases(runtime, &mut index, &mut synthetic)?;
+                }
+            }
+        }
+        Ok(Self {
+            _mmap: mmap,
+            data,
+            data_len,
+            index,
+            synthetic,
+            upload_views,
+            runtime,
         })
     }
 
@@ -70,20 +1279,50 @@ impl BakedStore {
         self.index.get(name).map(|m| &m.layout)
     }
 
+    pub fn flm_runtime(&self) -> Option<&crate::flm::FlmRuntimeDirectory> {
+        self.runtime.as_ref()
+    }
+
+    #[cfg(test)]
+    fn upload_view(&self, name: &str) -> Option<&TensorUploadView> {
+        self.upload_views.get(name)
+    }
+
+    fn tensor_bytes(&self, name: &str, meta: &TensorMeta) -> Result<&[u8], Error> {
+        if let Some(bytes) = self.synthetic.get(name) {
+            if bytes.len() != meta.byte_len as usize {
+                return Err(Error::Other(format!(
+                    "synthetic tensor '{}' byte_len={} does not match metadata byte_len={}",
+                    name,
+                    bytes.len(),
+                    meta.byte_len
+                )));
+            }
+            return Ok(bytes);
+        }
+        let start = meta.offset as usize;
+        let end = start.checked_add(meta.byte_len as usize).ok_or_else(|| {
+            Error::Other(format!(
+                "tensor '{name}' byte range overflows (offset={}, len={})",
+                meta.offset, meta.byte_len
+            ))
+        })?;
+        if end > self.data_len {
+            return Err(Error::Other(format!(
+                "tensor '{}' extends past end of weight store (offset={}, len={}, file_len={})",
+                name, meta.offset, meta.byte_len, self.data_len,
+            )));
+        }
+        Ok(unsafe { std::slice::from_raw_parts(self.data.add(start), meta.byte_len as usize) })
+    }
+
     /// Return the raw mmap-backed bytes of a tensor. Useful for tensors that
     /// are too large to upload to GPU in full (e.g. Gemma 4's
     /// `embed_tokens_per_layer`, which is row-accessed per-token). The slice
     /// lives as long as the `BakedStore`'s mmap.
     pub fn raw_bytes(&self, name: &str) -> Option<&[u8]> {
         let meta = self.index.get(name)?;
-        let start = meta.offset as usize;
-        let end = start + meta.byte_len as usize;
-        if end > self.data_len {
-            return None;
-        }
-        let slice =
-            unsafe { std::slice::from_raw_parts(self.data.add(start), meta.byte_len as usize) };
-        Some(slice)
+        self.tensor_bytes(name, meta).ok()
     }
 
     pub fn raw_byte_range(
@@ -96,20 +1335,7 @@ impl BakedStore {
             .index
             .get(name)
             .ok_or_else(|| Error::NotFound(name.to_string()))?;
-        let tensor_end = (meta.offset as usize)
-            .checked_add(meta.byte_len as usize)
-            .ok_or_else(|| {
-                Error::Other(format!(
-                    "tensor '{name}' byte range overflows (offset={}, len={})",
-                    meta.offset, meta.byte_len
-                ))
-            })?;
-        if tensor_end > self.data_len {
-            return Err(Error::Other(format!(
-                "tensor '{}' extends past end of weights.bin (offset={}, len={}, file_len={})",
-                name, meta.offset, meta.byte_len, self.data_len,
-            )));
-        }
+        let bytes = self.tensor_bytes(name, meta)?;
         let range_end = byte_offset.checked_add(byte_len).ok_or_else(|| {
             Error::Other(format!(
                 "tensor '{name}' raw range overflows: offset={byte_offset} len={byte_len}"
@@ -121,12 +1347,7 @@ impl BakedStore {
                 meta.byte_len
             )));
         }
-        Ok(unsafe {
-            std::slice::from_raw_parts(
-                self.data.add(meta.offset as usize).add(byte_offset),
-                byte_len,
-            )
-        })
+        Ok(&bytes[byte_offset..range_end])
     }
 
     /// Load a tensor from the baked store directly to GPU memory.
@@ -136,20 +1357,13 @@ impl BakedStore {
             .index
             .get(name)
             .ok_or_else(|| Error::NotFound(name.to_string()))?;
-
-        let start = meta.offset as usize;
-        let end = start + meta.byte_len as usize;
-        if end > self.data_len {
-            return Err(Error::Other(format!(
-                "tensor '{}' extends past end of weights.bin (offset={}, len={}, file_len={})",
-                name, meta.offset, meta.byte_len, self.data_len,
-            )));
-        }
-
-        let slice =
-            unsafe { std::slice::from_raw_parts(self.data.add(start), meta.byte_len as usize) };
-        let dtype = parse_dtype(&meta.dtype)?;
-        let buf = GpuBuffer::from_host_bytes(ordinal, dtype, &meta.shape, slice)?;
+        let slice = self.tensor_bytes(name, meta)?;
+        let (dtype, upload_shape) = if let Some(view) = self.upload_views.get(name) {
+            (parse_dtype(&view.dtype)?, view.shape.clone())
+        } else {
+            (parse_dtype(&meta.dtype)?, gpu_upload_shape(meta)?)
+        };
+        let buf = GpuBuffer::from_host_bytes(ordinal, dtype, &upload_shape, slice)?;
         Ok(buf)
     }
 
@@ -187,18 +1401,7 @@ impl BakedStore {
             .index
             .get(name)
             .ok_or_else(|| Error::NotFound(name.to_string()))?;
-
-        let start = meta.offset as usize;
-        let end = start + meta.byte_len as usize;
-        if end > self.data_len {
-            return Err(Error::Other(format!(
-                "tensor '{}' extends past end of weights.bin (offset={}, len={}, file_len={})",
-                name, meta.offset, meta.byte_len, self.data_len,
-            )));
-        }
-
-        let slice =
-            unsafe { std::slice::from_raw_parts(self.data.add(start), meta.byte_len as usize) };
+        let slice = self.tensor_bytes(name, meta)?;
         let dtype = parse_dtype(&meta.dtype)?;
         let expected_len = meta
             .shape
@@ -239,20 +1442,6 @@ impl BakedStore {
             .index
             .get(name)
             .ok_or_else(|| Error::NotFound(name.to_string()))?;
-        let tensor_end = (meta.offset as usize)
-            .checked_add(meta.byte_len as usize)
-            .ok_or_else(|| {
-                Error::Other(format!(
-                    "tensor '{name}' byte range overflows (offset={}, len={})",
-                    meta.offset, meta.byte_len
-                ))
-            })?;
-        if tensor_end > self.data_len {
-            return Err(Error::Other(format!(
-                "tensor '{}' extends past end of weights.bin (offset={}, len={}, file_len={})",
-                name, meta.offset, meta.byte_len, self.data_len,
-            )));
-        }
         let range_end = byte_offset.checked_add(byte_len).ok_or_else(|| {
             Error::Other(format!(
                 "tensor '{name}' load range overflows: offset={byte_offset} len={byte_len}"
@@ -264,6 +1453,7 @@ impl BakedStore {
                 meta.byte_len
             )));
         }
+        let src_bytes = self.tensor_bytes(name, meta)?;
 
         let dtype = parse_dtype(&meta.dtype)?;
         let ordinal = arena.device_ordinal();
@@ -282,7 +1472,7 @@ impl BakedStore {
             )));
         }
         buffer.map_range_bytes(byte_offset, byte_len)?;
-        let src = unsafe { self.data.add(meta.offset as usize).add(byte_offset) as *const _ };
+        let src = unsafe { src_bytes.as_ptr().add(byte_offset) as *const _ };
         copy_h2d(ordinal, buffer.offset_mut_ptr(byte_offset), src, byte_len)?;
         sync(ordinal)?;
         Ok(())
@@ -299,6 +1489,2123 @@ impl BakedStore {
 mod tests {
     use super::*;
     use crate::manifest::{LayoutTag, Manifest, TensorMeta, FORMAT_VERSION};
+    use std::io::Write;
+
+    const TEST_FLM_SUPERBLOCK_SIZE: usize = 4096;
+    const TEST_FLM_INDEX_RECORD_SIZE: usize = 64;
+    const TEST_FLM_SHARD_DESC_SIZE: usize = 24;
+    const TEST_FLM_HASH_RECORD_SIZE: usize = 40;
+
+    struct TestFlmTensor {
+        name: &'static str,
+        shape: Vec<u32>,
+        dtype: u16,
+        codec: u8,
+        payload: Vec<u8>,
+    }
+
+    fn put_u16(buf: &mut [u8], off: usize, value: u16) {
+        buf[off..off + 2].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_u32(buf: &mut [u8], off: usize, value: u32) {
+        buf[off..off + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_u64(buf: &mut [u8], off: usize, value: u64) {
+        buf[off..off + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn align_len(buf: &mut Vec<u8>, alignment: usize) {
+        let rem = buf.len() % alignment;
+        if rem != 0 {
+            buf.resize(buf.len() + (alignment - rem), 0);
+        }
+    }
+
+    fn put_head_crc64(buf: &mut [u8]) {
+        let shard_table_offset =
+            read_u64(buf, 88, "test FLM shard table offset").expect("shard table offset") as usize;
+        put_u64(buf, 144, 0);
+        let crc = flm_head_crc64(&buf[..shard_table_offset]).expect("head CRC64");
+        put_u64(buf, 144, crc);
+    }
+
+    fn build_test_flm(tensors: &[TestFlmTensor]) -> Vec<u8> {
+        build_test_flm_inner(tensors, None)
+    }
+
+    fn build_test_flm_with_hashes(tensors: &[TestFlmTensor], hashes: &[[u8; 32]]) -> Vec<u8> {
+        assert_eq!(tensors.len(), hashes.len());
+        build_test_flm_inner(tensors, Some(hashes))
+    }
+
+    fn build_test_flm_inner(tensors: &[TestFlmTensor], hashes: Option<&[[u8; 32]]>) -> Vec<u8> {
+        let alignment = 256usize;
+        let mut out = vec![0u8; TEST_FLM_SUPERBLOCK_SIZE];
+
+        let index_offset = out.len();
+        let mut shard = Vec::new();
+        let mut records = Vec::new();
+        for (idx, tensor) in tensors.iter().enumerate() {
+            assert!(tensor.shape.len() <= 4);
+            let shard_offset = shard.len();
+            shard.extend_from_slice(&tensor.payload);
+
+            let mut rec = [0u8; TEST_FLM_INDEX_RECORD_SIZE];
+            put_u32(&mut rec, 0, idx as u32);
+            put_u16(&mut rec, 4, 0);
+            put_u16(&mut rec, 6, 0);
+            put_u32(&mut rec, 8, 0);
+            put_u64(&mut rec, 12, shard_offset as u64);
+            put_u64(&mut rec, 20, tensor.payload.len() as u64);
+            put_u64(&mut rec, 28, tensor.payload.len() as u64);
+            put_u16(&mut rec, 36, tensor.dtype);
+            put_u16(&mut rec, 38, tensor.dtype);
+            rec[40] = tensor.codec;
+            rec[41] = tensor.shape.len() as u8;
+            for (dim_idx, dim) in tensor.shape.iter().enumerate() {
+                put_u32(&mut rec, 42 + dim_idx * 4, *dim);
+            }
+            if hashes.is_some() {
+                put_u32(&mut rec, 58, (idx + 1) as u32);
+            }
+            records.extend_from_slice(&rec);
+        }
+        out.extend_from_slice(&records);
+        let index_len = records.len();
+
+        let metadata_offset = out.len();
+        put_u32_at_vec(&mut out, tensors.len() as u32);
+        for tensor in tensors {
+            put_u32_at_vec(&mut out, tensor.name.len() as u32);
+            out.extend_from_slice(tensor.name.as_bytes());
+        }
+        put_u32_at_vec(&mut out, 0);
+        let metadata_len = out.len() - metadata_offset;
+
+        let mut hashtable_offset = 0usize;
+        let mut hashtable_len = 0usize;
+        if let Some(hashes) = hashes {
+            hashtable_offset = out.len();
+            hashtable_len = hashes.len() * TEST_FLM_HASH_RECORD_SIZE;
+            for (tensor, digest) in tensors.iter().zip(hashes.iter()) {
+                out.extend_from_slice(digest);
+                out.extend_from_slice(&(tensor.payload.len() as u64).to_le_bytes());
+            }
+        }
+
+        let shard_table_offset = out.len();
+        out.resize(out.len() + TEST_FLM_SHARD_DESC_SIZE, 0);
+        align_len(&mut out, alignment);
+        let shard_offset = out.len();
+        out.extend_from_slice(&shard);
+
+        put_u32(&mut out, shard_table_offset, 0);
+        put_u64(&mut out, shard_table_offset + 4, shard_offset as u64);
+        put_u64(&mut out, shard_table_offset + 12, shard.len() as u64);
+        out[shard_table_offset + 20] = 5;
+
+        out[0..8].copy_from_slice(b"FLM1\0\0\0\0");
+        put_u32(&mut out, 8, 1);
+        put_u64(&mut out, 16, tensors.len() as u64);
+        put_u64(&mut out, 24, index_offset as u64);
+        put_u64(&mut out, 32, index_len as u64);
+        put_u64(&mut out, 40, metadata_offset as u64);
+        put_u64(&mut out, 48, metadata_len as u64);
+        put_u64(&mut out, 72, hashtable_offset as u64);
+        put_u64(&mut out, 80, hashtable_len as u64);
+        put_u64(&mut out, 88, shard_table_offset as u64);
+        put_u32(&mut out, 96, 1);
+        put_u32(&mut out, 100, alignment as u32);
+        put_u64(&mut out, 104, shard.len() as u64);
+        put_u16(&mut out, 156, 1);
+        put_head_crc64(&mut out);
+        out
+    }
+
+    fn put_u32_at_vec(buf: &mut Vec<u8>, value: u32) {
+        buf.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn push_u16(buf: &mut Vec<u8>, value: u16) {
+        buf.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn push_u32(buf: &mut Vec<u8>, value: u32) {
+        buf.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn push_f64(buf: &mut Vec<u8>, value: f64) {
+        buf.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn push_string(buf: &mut Vec<u8>, value: &str) {
+        push_u32(buf, value.len() as u32);
+        buf.extend_from_slice(value.as_bytes());
+    }
+
+    struct TestManifestRow {
+        name: &'static str,
+        role_id: u32,
+        group_id: u32,
+        companion_kind: u8,
+        rank: u8,
+        dtype: u16,
+        logical_dtype: u16,
+        codec_id: u8,
+        flags: u8,
+        shape: [u32; 4],
+    }
+
+    fn runtime_config_section() -> Vec<u8> {
+        let mut out = Vec::new();
+        for value in [
+            151_936u32, 5120, 27_648, 62, 40, 8, 128, 262_144, 128, 256, 256, 16, 32,
+        ] {
+            push_u32(&mut out, value);
+        }
+        push_f64(&mut out, 1e-6);
+        push_f64(&mut out, 10_000_000.0);
+        out.push(1);
+        out.push(0);
+        push_u32(&mut out, 2);
+        push_f64(&mut out, 0.25);
+        push_u32(&mut out, 151_645);
+        push_u32(&mut out, 151_643);
+        push_u32(&mut out, 3);
+        push_u32(&mut out, 3);
+        push_u32(&mut out, 7);
+        push_u32(&mut out, 11);
+        out
+    }
+
+    fn runtime_tokenizer_section() -> Vec<u8> {
+        let mut out = Vec::new();
+        for value in [
+            0u32,
+            crate::flm::TOKENIZER_QWEN_BPE_V1,
+            151_936,
+            1,
+            2,
+            3,
+            4,
+            0,
+        ] {
+            push_u32(&mut out, value);
+        }
+        out
+    }
+
+    fn runtime_codec_section() -> Vec<u8> {
+        let mut out = Vec::new();
+        push_u32(&mut out, 8);
+        for (codec_id, semantic_id, layout_id, decoder_id, flags) in [
+            (0u8, crate::flm::CODEC_RAW_BF16 as u8, 0u16, 0u16, 0u32),
+            (
+                1u8,
+                crate::flm::CODEC_SYM_INT4_G128_BF16 as u8,
+                0u16,
+                1u16,
+                0u32,
+            ),
+            (2u8, crate::flm::CODEC_RAW_I64 as u8, 0u16, 0u16, 0u32),
+            (
+                3u8,
+                crate::flm::CODEC_NVFP4_E2M1_B16_E4M3_F32 as u8,
+                0u16,
+                1u16,
+                0u32,
+            ),
+            (
+                4u8,
+                crate::flm::CODEC_MXFP4_E2M1_B32_E8M0 as u8,
+                0u16,
+                1u16,
+                0u32,
+            ),
+            (
+                5u8,
+                crate::flm::CODEC_MXFP8_E4M3_B32_E8M0 as u8,
+                0u16,
+                1u16,
+                0u32,
+            ),
+            (6u8, crate::flm::CODEC_FP8_E4M3_F32 as u8, 0u16, 1u16, 0u32),
+            (
+                7u8,
+                crate::flm::CODEC_FP8_E4M3_B128_BF16_INV as u8,
+                0u16,
+                1u16,
+                0u32,
+            ),
+        ] {
+            out.push(codec_id);
+            out.push(semantic_id);
+            push_u16(&mut out, layout_id);
+            push_u16(&mut out, decoder_id);
+            push_u32(&mut out, flags);
+        }
+        out
+    }
+
+    fn runtime_tensor_abi_section() -> Vec<u8> {
+        let mut out = Vec::new();
+        push_u32(&mut out, crate::flm::TENSOR_ABI_QWEN3_6_DENSE_CT_INT4_V1);
+        push_string(&mut out, "model.language_model");
+        push_string(&mut out, ".weight_packed");
+        push_string(&mut out, ".weight_scale");
+        push_string(&mut out, ".weight_shape");
+        out
+    }
+
+    fn runtime_asset_sections() -> (Vec<u8>, Vec<u8>) {
+        let assets = [
+            (
+                1u32,
+                crate::flm::ASSET_TOKENIZER_VOCAB,
+                crate::flm::ASSET_FLAG_REQUIRED_FOR_RUNTIME,
+                "tokenizer_vocab",
+                b"vocab".as_slice(),
+            ),
+            (
+                2u32,
+                crate::flm::ASSET_TOKENIZER_MERGES,
+                crate::flm::ASSET_FLAG_REQUIRED_FOR_RUNTIME,
+                "tokenizer_merges",
+                b"merges".as_slice(),
+            ),
+            (
+                3u32,
+                crate::flm::ASSET_TOKENIZER_ADDED_TOKENS,
+                0,
+                "tokenizer_added_tokens",
+                b"[]".as_slice(),
+            ),
+            (
+                4u32,
+                crate::flm::ASSET_TOKENIZER_REGEX,
+                crate::flm::ASSET_FLAG_REQUIRED_FOR_RUNTIME,
+                "tokenizer_regex",
+                br#"\p{L}+"#.as_slice(),
+            ),
+        ];
+        let mut table = Vec::new();
+        let mut payloads = Vec::new();
+        push_u32(&mut table, assets.len() as u32);
+        for (asset_id, kind_id, flags, name, payload) in assets {
+            push_u32(&mut table, asset_id);
+            push_u32(&mut table, payloads.len() as u32);
+            push_u32(&mut table, payload.len() as u32);
+            push_u16(&mut table, kind_id);
+            push_u16(&mut table, flags);
+            push_u32(&mut table, name.len() as u32);
+            table.extend_from_slice(name.as_bytes());
+            payloads.extend_from_slice(payload);
+        }
+        (table, payloads)
+    }
+
+    fn runtime_model_descriptor_section() -> Vec<u8> {
+        let mut out = Vec::new();
+        push_u16(&mut out, 1);
+        push_u16(&mut out, crate::flm::MODEL_QWEN3_6_DENSE_V1);
+        push_u32(&mut out, 1);
+        push_u32(&mut out, 0);
+        push_u32(&mut out, crate::flm::TENSOR_ABI_QWEN3_6_DENSE_CT_INT4_V1);
+        push_u32(
+            &mut out,
+            crate::flm::QUANT_PROFILE_QWEN3_6_DENSE_CT_INT4_G128_BF16_V1,
+        );
+        push_u32(&mut out, 0);
+        out
+    }
+
+    fn runtime_tensor_manifest_section(rows: &[TestManifestRow]) -> Vec<u8> {
+        let mut string_pool = Vec::new();
+        let mut names = Vec::with_capacity(rows.len());
+        for row in rows {
+            let offset = string_pool.len() as u32;
+            string_pool.extend_from_slice(row.name.as_bytes());
+            names.push((offset, row.name.len() as u16));
+        }
+
+        let mut out = Vec::new();
+        push_u16(&mut out, 1);
+        push_u16(&mut out, 40);
+        push_u32(&mut out, rows.len() as u32);
+        push_u32(&mut out, string_pool.len() as u32);
+        for (row, (name_offset, name_len)) in rows.iter().zip(names) {
+            push_u32(&mut out, row.role_id);
+            push_u32(&mut out, row.group_id);
+            out.push(row.companion_kind);
+            out.push(row.rank);
+            push_u16(&mut out, row.dtype);
+            push_u16(&mut out, row.logical_dtype);
+            out.push(row.codec_id);
+            out.push(row.flags);
+            for dim in row.shape {
+                push_u32(&mut out, dim);
+            }
+            push_u32(&mut out, name_offset);
+            push_u16(&mut out, name_len);
+            push_u16(&mut out, 0);
+        }
+        out.extend_from_slice(&string_pool);
+        out
+    }
+
+    fn build_test_runtime_directory_with_manifest(rows: &[TestManifestRow]) -> Vec<u8> {
+        let (asset_table, asset_payloads) = runtime_asset_sections();
+        let sections = [
+            (1u32, runtime_config_section()),
+            (2u32, runtime_tokenizer_section()),
+            (3u32, runtime_codec_section()),
+            (4u32, runtime_tensor_abi_section()),
+            (5u32, asset_table),
+            (6u32, asset_payloads),
+            (7u32, runtime_model_descriptor_section()),
+            (8u32, runtime_tensor_manifest_section(rows)),
+        ];
+        let header_len = 16 + sections.len() * 12;
+        let mut offset = header_len as u32;
+        let mut out = Vec::new();
+        out.extend_from_slice(b"FLMRUN1\0");
+        push_u16(&mut out, 4);
+        push_u16(&mut out, sections.len() as u16);
+        push_u32(&mut out, crate::flm::ARCH_QWEN3_6_DENSE);
+        for (section_id, data) in &sections {
+            push_u32(&mut out, *section_id);
+            push_u32(&mut out, offset);
+            push_u32(&mut out, data.len() as u32);
+            offset += data.len() as u32;
+        }
+        for (_, data) in sections {
+            out.extend_from_slice(&data);
+        }
+        out
+    }
+
+    fn build_test_runtime_directory() -> Vec<u8> {
+        build_test_runtime_directory_with_manifest(&[])
+    }
+
+    fn runtime_stage3_storage_abi_section() -> Vec<u8> {
+        let mut out = Vec::new();
+        push_u16(&mut out, 1);
+        push_u16(&mut out, 21);
+        push_u32(&mut out, 1);
+        push_u32(&mut out, 0);
+        push_u16(&mut out, 1);
+        push_u16(&mut out, crate::flm::STORAGE_ABI_KIND_GROUP_QUANT);
+        push_u16(&mut out, crate::flm::CODEC_SYM_INT4_G128_BF16);
+        push_u16(&mut out, crate::flm::LAYOUT_ID_DEFAULT);
+        out.push(4);
+        push_u16(&mut out, 128);
+        push_u16(&mut out, crate::flm::QUANT_FLAG_SYMMETRIC);
+        push_u32(&mut out, 0);
+        push_u32(&mut out, 0);
+        out
+    }
+
+    fn runtime_stage3_empty_storage_abi_section() -> Vec<u8> {
+        let mut out = Vec::new();
+        push_u16(&mut out, 1);
+        push_u16(&mut out, 21);
+        push_u32(&mut out, 0);
+        push_u32(&mut out, 0);
+        out
+    }
+
+    fn runtime_stage3_logical_tensor_section() -> Vec<u8> {
+        let name = b"model.language_model.layers.0.mlp.gate_proj.weight";
+        let mut out = Vec::new();
+        push_u16(&mut out, 1);
+        push_u16(&mut out, 44);
+        push_u32(&mut out, 1);
+        push_u32(&mut out, name.len() as u32);
+        push_u32(&mut out, 1);
+        push_u32(&mut out, 0);
+        push_u16(&mut out, name.len() as u16);
+        push_u16(&mut out, crate::flm::LOGICAL_TENSOR_ROLE_QUANTIZED_WEIGHT);
+        out.push(2);
+        out.push(0);
+        for dim in [128u32, 64, 0, 0] {
+            push_u32(&mut out, dim);
+        }
+        push_u16(&mut out, crate::flm::VALUE_FORMAT_SYM_INT4);
+        push_u16(&mut out, FLM_DTYPE_BF16);
+        push_u32(&mut out, 0);
+        push_u16(&mut out, 3);
+        push_u16(&mut out, crate::flm::LOGICAL_TENSOR_FLAG_REQUIRED);
+        push_u16(&mut out, 0);
+        out.extend_from_slice(name);
+        out
+    }
+
+    fn runtime_stage3_raw_value_logical_tensor_section() -> Vec<u8> {
+        let name = b"model.language_model.layers.0.linear_attn.A_log";
+        let mut out = Vec::new();
+        push_u16(&mut out, 1);
+        push_u16(&mut out, 44);
+        push_u32(&mut out, 1);
+        push_u32(&mut out, name.len() as u32);
+        push_u32(&mut out, 2);
+        push_u32(&mut out, 0);
+        push_u16(&mut out, name.len() as u16);
+        push_u16(&mut out, crate::flm::LOGICAL_TENSOR_ROLE_WEIGHT);
+        out.push(1);
+        out.push(0);
+        for dim in [4u32, 0, 0, 0] {
+            push_u32(&mut out, dim);
+        }
+        push_u16(&mut out, crate::flm::VALUE_FORMAT_RAW_DENSE);
+        push_u16(&mut out, FLM_DTYPE_FP32);
+        push_u32(&mut out, 0);
+        push_u16(&mut out, 1);
+        push_u16(&mut out, crate::flm::LOGICAL_TENSOR_FLAG_REQUIRED);
+        push_u16(&mut out, 0);
+        out.extend_from_slice(name);
+        out
+    }
+
+    fn runtime_stage3_storage_binding_section() -> Vec<u8> {
+        let rows: [(&[u8], u16, u16); 3] = [
+            (
+                b"storage/l0_gate_packed",
+                crate::flm::STORAGE_ROLE_PACKED,
+                FLM_DTYPE_INT32,
+            ),
+            (
+                b"storage/l0_gate_scale",
+                crate::flm::STORAGE_ROLE_SCALE,
+                FLM_DTYPE_BF16,
+            ),
+            (
+                b"storage/l0_gate_shape",
+                crate::flm::STORAGE_ROLE_SHAPE,
+                FLM_DTYPE_INT64,
+            ),
+        ];
+        let pool_len: usize = rows.iter().map(|(name, _, _)| name.len()).sum();
+        let mut out = Vec::new();
+        push_u16(&mut out, 1);
+        push_u16(&mut out, 20);
+        push_u32(&mut out, rows.len() as u32);
+        push_u32(&mut out, pool_len as u32);
+        let mut pool = Vec::new();
+        let mut name_offset = 0u32;
+        for (name, role, dtype) in rows {
+            push_u32(&mut out, 1);
+            push_u32(&mut out, name_offset);
+            push_u16(&mut out, name.len() as u16);
+            push_u16(&mut out, role);
+            push_u16(&mut out, dtype);
+            push_u16(&mut out, 1);
+            push_u16(&mut out, crate::flm::STORAGE_BINDING_FLAG_REQUIRED);
+            push_u16(&mut out, 0);
+            pool.extend_from_slice(name);
+            name_offset += name.len() as u32;
+        }
+        out.extend_from_slice(&pool);
+        out
+    }
+
+    fn runtime_stage3_raw_value_storage_binding_section() -> Vec<u8> {
+        let name = b"storage/l0_a_log";
+        let mut out = Vec::new();
+        push_u16(&mut out, 1);
+        push_u16(&mut out, 20);
+        push_u32(&mut out, 1);
+        push_u32(&mut out, name.len() as u32);
+        push_u32(&mut out, 2);
+        push_u32(&mut out, 0);
+        push_u16(&mut out, name.len() as u16);
+        push_u16(&mut out, crate::flm::STORAGE_ROLE_VALUE);
+        push_u16(&mut out, FLM_DTYPE_FP32);
+        push_u16(&mut out, crate::flm::STORAGE_ABI_ID_NONE);
+        push_u16(&mut out, crate::flm::STORAGE_BINDING_FLAG_REQUIRED);
+        push_u16(&mut out, 0);
+        out.extend_from_slice(name);
+        out
+    }
+
+    fn runtime_stage3_plan_step_section() -> Vec<u8> {
+        let mut out = Vec::new();
+        push_u16(&mut out, 1);
+        push_u16(&mut out, 38);
+        push_u32(&mut out, 2);
+
+        push_u32(&mut out, 1);
+        push_u16(&mut out, crate::flm::STORAGE_ROLE_PACKED);
+        push_u16(&mut out, crate::flm::CONSUME_STRATEGY_DIRECT);
+        push_u16(&mut out, crate::flm::LAYOUT_ID_DEFAULT);
+        push_u16(&mut out, FLM_DTYPE_UINT8);
+        out.push(2);
+        out.push(0);
+        for dim in [128u32, 32, 0, 0] {
+            push_u32(&mut out, dim);
+        }
+        push_u16(&mut out, crate::flm::PLAN_STREAM_DEFAULT);
+        push_u16(&mut out, crate::flm::PLAN_PRIORITY_DEFAULT);
+        push_u32(&mut out, crate::flm::PLAN_STEP_FLAG_NONE);
+
+        push_u32(&mut out, 1);
+        push_u16(&mut out, crate::flm::STORAGE_ROLE_SCALE);
+        push_u16(&mut out, crate::flm::CONSUME_STRATEGY_DIRECT);
+        push_u16(&mut out, crate::flm::LAYOUT_ID_DEFAULT);
+        push_u16(&mut out, FLM_DTYPE_BF16);
+        out.push(2);
+        out.push(0);
+        for dim in [128u32, 1, 0, 0] {
+            push_u32(&mut out, dim);
+        }
+        push_u16(&mut out, crate::flm::PLAN_STREAM_DEFAULT);
+        push_u16(&mut out, crate::flm::PLAN_PRIORITY_DEFAULT);
+        push_u32(&mut out, crate::flm::PLAN_STEP_FLAG_NONE);
+        out
+    }
+
+    fn runtime_stage3_raw_value_plan_step_section() -> Vec<u8> {
+        let mut out = Vec::new();
+        push_u16(&mut out, 1);
+        push_u16(&mut out, 38);
+        push_u32(&mut out, 1);
+
+        push_u32(&mut out, 2);
+        push_u16(&mut out, crate::flm::STORAGE_ROLE_VALUE);
+        push_u16(&mut out, crate::flm::CONSUME_STRATEGY_DIRECT);
+        push_u16(&mut out, crate::flm::LAYOUT_ID_DEFAULT);
+        push_u16(&mut out, FLM_DTYPE_FP32);
+        out.push(1);
+        out.push(0);
+        for dim in [4u32, 0, 0, 0] {
+            push_u32(&mut out, dim);
+        }
+        push_u16(&mut out, crate::flm::PLAN_STREAM_DEFAULT);
+        push_u16(&mut out, crate::flm::PLAN_PRIORITY_DEFAULT);
+        push_u32(&mut out, crate::flm::PLAN_STEP_FLAG_NONE);
+        out
+    }
+
+    fn build_test_runtime_directory_with_stage3_tables() -> Vec<u8> {
+        let (asset_table, asset_payloads) = runtime_asset_sections();
+        let sections = [
+            (1u32, runtime_config_section()),
+            (2u32, runtime_tokenizer_section()),
+            (3u32, runtime_codec_section()),
+            (4u32, runtime_tensor_abi_section()),
+            (5u32, asset_table),
+            (6u32, asset_payloads),
+            (7u32, runtime_model_descriptor_section()),
+            (8u32, runtime_tensor_manifest_section(&[])),
+            (9u32, runtime_stage3_storage_abi_section()),
+            (10u32, runtime_stage3_logical_tensor_section()),
+            (11u32, runtime_stage3_storage_binding_section()),
+            (12u32, runtime_stage3_plan_step_section()),
+        ];
+        let header_len = 16 + sections.len() * 12;
+        let mut offset = header_len as u32;
+        let mut out = Vec::new();
+        out.extend_from_slice(b"FLMRUN1\0");
+        push_u16(&mut out, 4);
+        push_u16(&mut out, sections.len() as u16);
+        push_u32(&mut out, crate::flm::ARCH_QWEN3_6_DENSE);
+        for (section_id, data) in &sections {
+            push_u32(&mut out, *section_id);
+            push_u32(&mut out, offset);
+            push_u32(&mut out, data.len() as u32);
+            offset += data.len() as u32;
+        }
+        for (_, data) in sections {
+            out.extend_from_slice(&data);
+        }
+        out
+    }
+
+    fn build_test_runtime_directory_with_raw_value_stage3_tables() -> Vec<u8> {
+        let (asset_table, asset_payloads) = runtime_asset_sections();
+        let sections = [
+            (1u32, runtime_config_section()),
+            (2u32, runtime_tokenizer_section()),
+            (3u32, runtime_codec_section()),
+            (4u32, runtime_tensor_abi_section()),
+            (5u32, asset_table),
+            (6u32, asset_payloads),
+            (7u32, runtime_model_descriptor_section()),
+            (8u32, runtime_tensor_manifest_section(&[])),
+            (9u32, runtime_stage3_empty_storage_abi_section()),
+            (10u32, runtime_stage3_raw_value_logical_tensor_section()),
+            (11u32, runtime_stage3_raw_value_storage_binding_section()),
+            (12u32, runtime_stage3_raw_value_plan_step_section()),
+        ];
+        let header_len = 16 + sections.len() * 12;
+        let mut offset = header_len as u32;
+        let mut out = Vec::new();
+        out.extend_from_slice(b"FLMRUN1\0");
+        push_u16(&mut out, 4);
+        push_u16(&mut out, sections.len() as u16);
+        push_u32(&mut out, crate::flm::ARCH_QWEN3_6_DENSE);
+        for (section_id, data) in &sections {
+            push_u32(&mut out, *section_id);
+            push_u32(&mut out, offset);
+            push_u32(&mut out, data.len() as u32);
+            offset += data.len() as u32;
+        }
+        for (_, data) in sections {
+            out.extend_from_slice(&data);
+        }
+        out
+    }
+
+    fn runtime_stage3_lowbit_storage_abi_section() -> Vec<u8> {
+        let mut out = Vec::new();
+        push_u16(&mut out, 1);
+        push_u16(&mut out, 21);
+        push_u32(&mut out, 5);
+        push_u32(&mut out, 0);
+        for (storage_abi_id, abi_kind, codec_semantic_id, bits, group_size, flags) in [
+            (
+                2u16,
+                crate::flm::STORAGE_ABI_KIND_GROUP_QUANT,
+                crate::flm::CODEC_NVFP4_E2M1_B16_E4M3_F32,
+                4u8,
+                16u16,
+                crate::flm::QUANT_FLAG_SYMMETRIC,
+            ),
+            (
+                3u16,
+                crate::flm::STORAGE_ABI_KIND_GROUP_QUANT,
+                crate::flm::CODEC_MXFP4_E2M1_B32_E8M0,
+                4u8,
+                32u16,
+                crate::flm::QUANT_FLAG_SYMMETRIC,
+            ),
+            (
+                4u16,
+                crate::flm::STORAGE_ABI_KIND_GROUP_QUANT,
+                crate::flm::CODEC_MXFP8_E4M3_B32_E8M0,
+                8u8,
+                32u16,
+                crate::flm::QUANT_FLAG_SYMMETRIC,
+            ),
+            (
+                5u16,
+                crate::flm::STORAGE_ABI_KIND_SCALED_FLOAT,
+                crate::flm::CODEC_FP8_E4M3_F32,
+                8u8,
+                0u16,
+                0u16,
+            ),
+            (
+                6u16,
+                crate::flm::STORAGE_ABI_KIND_SCALED_FLOAT,
+                crate::flm::CODEC_FP8_E4M3_B128_BF16_INV,
+                8u8,
+                128u16,
+                0u16,
+            ),
+        ] {
+            push_u16(&mut out, storage_abi_id);
+            push_u16(&mut out, abi_kind);
+            push_u16(&mut out, codec_semantic_id);
+            push_u16(&mut out, crate::flm::LAYOUT_ID_DEFAULT);
+            out.push(bits);
+            push_u16(&mut out, group_size);
+            push_u16(&mut out, flags);
+            push_u32(&mut out, 0);
+            push_u32(&mut out, 0);
+        }
+        out
+    }
+
+    fn runtime_stage3_lowbit_logical_tensor_section() -> Vec<u8> {
+        let rows = [
+            (
+                3u32,
+                "model.language_model.layers.0.linear_attn.out_proj.weight",
+                crate::flm::VALUE_FORMAT_NVFP4_E2M1,
+                [128u32, 128, 0, 0],
+                0u32,
+                3u16,
+            ),
+            (
+                4u32,
+                "model.language_model.layers.0.linear_attn.in_proj_z.weight",
+                crate::flm::VALUE_FORMAT_MXFP4_E2M1,
+                [64u32, 128, 0, 0],
+                3u32,
+                2u16,
+            ),
+            (
+                5u32,
+                "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
+                crate::flm::VALUE_FORMAT_MXFP8_E4M3,
+                [32u32, 128, 0, 0],
+                5u32,
+                2u16,
+            ),
+            (
+                6u32,
+                "model.language_model.layers.0.self_attn.q_proj.weight",
+                crate::flm::VALUE_FORMAT_FP8_E4M3_B128_BF16_INV,
+                [96u32, 128, 0, 0],
+                7u32,
+                2u16,
+            ),
+        ];
+        let pool_len: usize = rows.iter().map(|(_, name, _, _, _, _)| name.len()).sum();
+        let mut out = Vec::new();
+        push_u16(&mut out, 1);
+        push_u16(&mut out, 44);
+        push_u32(&mut out, rows.len() as u32);
+        push_u32(&mut out, pool_len as u32);
+        let mut pool = Vec::new();
+        let mut name_offset = 0u32;
+        for (tensor_id, name, value_format, shape, binding_start, binding_count) in rows {
+            push_u32(&mut out, tensor_id);
+            push_u32(&mut out, name_offset);
+            push_u16(&mut out, name.len() as u16);
+            push_u16(&mut out, crate::flm::LOGICAL_TENSOR_ROLE_QUANTIZED_WEIGHT);
+            out.push(2);
+            out.push(0);
+            for dim in shape {
+                push_u32(&mut out, dim);
+            }
+            push_u16(&mut out, value_format);
+            push_u16(&mut out, FLM_DTYPE_BF16);
+            push_u32(&mut out, binding_start);
+            push_u16(&mut out, binding_count);
+            push_u16(&mut out, crate::flm::LOGICAL_TENSOR_FLAG_REQUIRED);
+            push_u16(&mut out, 0);
+            pool.extend_from_slice(name.as_bytes());
+            name_offset += name.len() as u32;
+        }
+        out.extend_from_slice(&pool);
+        out
+    }
+
+    fn runtime_stage3_lowbit_storage_binding_section() -> Vec<u8> {
+        let rows: [(u32, &str, u16, u16, u16); 9] = [
+            (
+                3,
+                "storage/nv_packed",
+                crate::flm::STORAGE_ROLE_PACKED,
+                FLM_DTYPE_UINT8,
+                2,
+            ),
+            (
+                3,
+                "storage/nv_scale",
+                crate::flm::STORAGE_ROLE_SCALE,
+                FLM_DTYPE_FP8_E4M3,
+                2,
+            ),
+            (
+                3,
+                "storage/nv_global",
+                crate::flm::STORAGE_ROLE_GLOBAL_SCALE,
+                FLM_DTYPE_FP32,
+                2,
+            ),
+            (
+                4,
+                "storage/mx4_packed",
+                crate::flm::STORAGE_ROLE_PACKED,
+                FLM_DTYPE_UINT8,
+                3,
+            ),
+            (
+                4,
+                "storage/mx4_scale",
+                crate::flm::STORAGE_ROLE_SCALE,
+                FLM_DTYPE_UINT8,
+                3,
+            ),
+            (
+                5,
+                "storage/mx8_value",
+                crate::flm::STORAGE_ROLE_VALUE,
+                FLM_DTYPE_FP8_E4M3,
+                4,
+            ),
+            (
+                5,
+                "storage/mx8_scale",
+                crate::flm::STORAGE_ROLE_SCALE,
+                FLM_DTYPE_UINT8,
+                4,
+            ),
+            (
+                6,
+                "storage/qwen_fp8_value",
+                crate::flm::STORAGE_ROLE_VALUE,
+                FLM_DTYPE_FP8_E4M3,
+                6,
+            ),
+            (
+                6,
+                "storage/qwen_fp8_scale_inv",
+                crate::flm::STORAGE_ROLE_SCALE,
+                FLM_DTYPE_BF16,
+                6,
+            ),
+        ];
+        let pool_len: usize = rows.iter().map(|(_, name, _, _, _)| name.len()).sum();
+        let mut out = Vec::new();
+        push_u16(&mut out, 1);
+        push_u16(&mut out, 20);
+        push_u32(&mut out, rows.len() as u32);
+        push_u32(&mut out, pool_len as u32);
+        let mut pool = Vec::new();
+        let mut name_offset = 0u32;
+        for (logical_tensor_id, name, role, dtype, abi_id) in rows {
+            push_u32(&mut out, logical_tensor_id);
+            push_u32(&mut out, name_offset);
+            push_u16(&mut out, name.len() as u16);
+            push_u16(&mut out, role);
+            push_u16(&mut out, dtype);
+            push_u16(&mut out, abi_id);
+            push_u16(&mut out, crate::flm::STORAGE_BINDING_FLAG_REQUIRED);
+            push_u16(&mut out, 0);
+            pool.extend_from_slice(name.as_bytes());
+            name_offset += name.len() as u32;
+        }
+        out.extend_from_slice(&pool);
+        out
+    }
+
+    fn runtime_stage3_lowbit_plan_step_section() -> Vec<u8> {
+        let rows: [(u32, u16, u16, u8, [u32; 4]); 9] = [
+            (
+                3,
+                crate::flm::STORAGE_ROLE_PACKED,
+                FLM_DTYPE_UINT8,
+                2,
+                [128, 64, 0, 0],
+            ),
+            (
+                3,
+                crate::flm::STORAGE_ROLE_SCALE,
+                FLM_DTYPE_FP8_E4M3,
+                2,
+                [128, 8, 0, 0],
+            ),
+            (
+                3,
+                crate::flm::STORAGE_ROLE_GLOBAL_SCALE,
+                FLM_DTYPE_FP32,
+                1,
+                [1, 0, 0, 0],
+            ),
+            (
+                4,
+                crate::flm::STORAGE_ROLE_PACKED,
+                FLM_DTYPE_UINT8,
+                2,
+                [64, 64, 0, 0],
+            ),
+            (
+                4,
+                crate::flm::STORAGE_ROLE_SCALE,
+                FLM_DTYPE_UINT8,
+                2,
+                [64, 4, 0, 0],
+            ),
+            (
+                5,
+                crate::flm::STORAGE_ROLE_VALUE,
+                FLM_DTYPE_FP8_E4M3,
+                2,
+                [32, 128, 0, 0],
+            ),
+            (
+                5,
+                crate::flm::STORAGE_ROLE_SCALE,
+                FLM_DTYPE_UINT8,
+                2,
+                [32, 4, 0, 0],
+            ),
+            (
+                6,
+                crate::flm::STORAGE_ROLE_VALUE,
+                FLM_DTYPE_FP8_E4M3,
+                2,
+                [96, 128, 0, 0],
+            ),
+            (
+                6,
+                crate::flm::STORAGE_ROLE_SCALE,
+                FLM_DTYPE_BF16,
+                2,
+                [1, 1, 0, 0],
+            ),
+        ];
+        let mut out = Vec::new();
+        push_u16(&mut out, 1);
+        push_u16(&mut out, 38);
+        push_u32(&mut out, rows.len() as u32);
+        for (logical_tensor_id, role, dtype, rank, shape) in rows {
+            push_u32(&mut out, logical_tensor_id);
+            push_u16(&mut out, role);
+            push_u16(&mut out, crate::flm::CONSUME_STRATEGY_DIRECT);
+            push_u16(&mut out, crate::flm::LAYOUT_ID_DEFAULT);
+            push_u16(&mut out, dtype);
+            out.push(rank);
+            out.push(0);
+            for dim in shape {
+                push_u32(&mut out, dim);
+            }
+            push_u16(&mut out, crate::flm::PLAN_STREAM_DEFAULT);
+            push_u16(&mut out, crate::flm::PLAN_PRIORITY_DEFAULT);
+            push_u32(&mut out, crate::flm::PLAN_STEP_FLAG_NONE);
+        }
+        out
+    }
+
+    fn build_test_runtime_directory_with_lowbit_stage3_tables() -> Vec<u8> {
+        let (asset_table, asset_payloads) = runtime_asset_sections();
+        let sections = [
+            (1u32, runtime_config_section()),
+            (2u32, runtime_tokenizer_section()),
+            (3u32, runtime_codec_section()),
+            (4u32, runtime_tensor_abi_section()),
+            (5u32, asset_table),
+            (6u32, asset_payloads),
+            (7u32, runtime_model_descriptor_section()),
+            (8u32, runtime_tensor_manifest_section(&[])),
+            (9u32, runtime_stage3_lowbit_storage_abi_section()),
+            (10u32, runtime_stage3_lowbit_logical_tensor_section()),
+            (11u32, runtime_stage3_lowbit_storage_binding_section()),
+            (12u32, runtime_stage3_lowbit_plan_step_section()),
+        ];
+        let header_len = 16 + sections.len() * 12;
+        let mut offset = header_len as u32;
+        let mut out = Vec::new();
+        out.extend_from_slice(b"FLMRUN1\0");
+        push_u16(&mut out, 4);
+        push_u16(&mut out, sections.len() as u16);
+        push_u32(&mut out, crate::flm::ARCH_QWEN3_6_DENSE);
+        for (section_id, data) in &sections {
+            push_u32(&mut out, *section_id);
+            push_u32(&mut out, offset);
+            push_u32(&mut out, data.len() as u32);
+            offset += data.len() as u32;
+        }
+        for (_, data) in sections {
+            out.extend_from_slice(&data);
+        }
+        out
+    }
+
+    fn runtime_stage3_modelopt_nvfp4_logical_tensor_section() -> Vec<u8> {
+        let rows = [
+            (
+                3u32,
+                "model.language_model.layers.0.linear_attn.out_proj.weight",
+                crate::flm::VALUE_FORMAT_NVFP4_E2M1,
+                [128u32, 128, 0, 0],
+                0u32,
+                4u16,
+            ),
+            (
+                4u32,
+                "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
+                crate::flm::VALUE_FORMAT_FP8_E4M3_F32,
+                [32u32, 128, 0, 0],
+                4u32,
+                3u16,
+            ),
+        ];
+        let pool_len: usize = rows.iter().map(|(_, name, _, _, _, _)| name.len()).sum();
+        let mut out = Vec::new();
+        push_u16(&mut out, 1);
+        push_u16(&mut out, 44);
+        push_u32(&mut out, rows.len() as u32);
+        push_u32(&mut out, pool_len as u32);
+        let mut pool = Vec::new();
+        let mut name_offset = 0u32;
+        for (tensor_id, name, value_format, shape, binding_start, binding_count) in rows {
+            push_u32(&mut out, tensor_id);
+            push_u32(&mut out, name_offset);
+            push_u16(&mut out, name.len() as u16);
+            push_u16(&mut out, crate::flm::LOGICAL_TENSOR_ROLE_QUANTIZED_WEIGHT);
+            out.push(2);
+            out.push(0);
+            for dim in shape {
+                push_u32(&mut out, dim);
+            }
+            push_u16(&mut out, value_format);
+            push_u16(&mut out, FLM_DTYPE_BF16);
+            push_u32(&mut out, binding_start);
+            push_u16(&mut out, binding_count);
+            push_u16(&mut out, crate::flm::LOGICAL_TENSOR_FLAG_REQUIRED);
+            push_u16(&mut out, 0);
+            pool.extend_from_slice(name.as_bytes());
+            name_offset += name.len() as u32;
+        }
+        out.extend_from_slice(&pool);
+        out
+    }
+
+    fn runtime_stage3_modelopt_nvfp4_storage_binding_section() -> Vec<u8> {
+        let nv_base = "model.language_model.layers.0.linear_attn.out_proj";
+        let fp8_base = "model.language_model.layers.0.linear_attn.in_proj_qkv";
+        let rows: [(u32, String, u16, u16, u16); 7] = [
+            (
+                3,
+                format!("{nv_base}.weight"),
+                crate::flm::STORAGE_ROLE_PACKED,
+                FLM_DTYPE_UINT8,
+                2,
+            ),
+            (
+                3,
+                format!("{nv_base}.weight_scale"),
+                crate::flm::STORAGE_ROLE_SCALE,
+                FLM_DTYPE_FP8_E4M3,
+                2,
+            ),
+            (
+                3,
+                format!("{nv_base}.weight_scale_2"),
+                crate::flm::STORAGE_ROLE_GLOBAL_SCALE,
+                FLM_DTYPE_FP32,
+                2,
+            ),
+            (
+                3,
+                format!("{nv_base}.input_scale"),
+                crate::flm::STORAGE_ROLE_INPUT_SCALE,
+                FLM_DTYPE_FP32,
+                2,
+            ),
+            (
+                4,
+                format!("{fp8_base}.weight"),
+                crate::flm::STORAGE_ROLE_VALUE,
+                FLM_DTYPE_FP8_E4M3,
+                5,
+            ),
+            (
+                4,
+                format!("{fp8_base}.weight_scale"),
+                crate::flm::STORAGE_ROLE_SCALE,
+                FLM_DTYPE_FP32,
+                5,
+            ),
+            (
+                4,
+                format!("{fp8_base}.input_scale"),
+                crate::flm::STORAGE_ROLE_INPUT_SCALE,
+                FLM_DTYPE_FP32,
+                5,
+            ),
+        ];
+        let pool_len: usize = rows.iter().map(|(_, name, _, _, _)| name.len()).sum();
+        let mut out = Vec::new();
+        push_u16(&mut out, 1);
+        push_u16(&mut out, 20);
+        push_u32(&mut out, rows.len() as u32);
+        push_u32(&mut out, pool_len as u32);
+        let mut pool = Vec::new();
+        let mut name_offset = 0u32;
+        for (logical_tensor_id, name, role, dtype, abi_id) in rows {
+            push_u32(&mut out, logical_tensor_id);
+            push_u32(&mut out, name_offset);
+            push_u16(&mut out, name.len() as u16);
+            push_u16(&mut out, role);
+            push_u16(&mut out, dtype);
+            push_u16(&mut out, abi_id);
+            push_u16(&mut out, crate::flm::STORAGE_BINDING_FLAG_REQUIRED);
+            push_u16(&mut out, 0);
+            pool.extend_from_slice(name.as_bytes());
+            name_offset += name.len() as u32;
+        }
+        out.extend_from_slice(&pool);
+        out
+    }
+
+    fn runtime_stage3_modelopt_nvfp4_plan_step_section() -> Vec<u8> {
+        let rows: [(u32, u16, u16, u8, [u32; 4]); 7] = [
+            (
+                3,
+                crate::flm::STORAGE_ROLE_PACKED,
+                FLM_DTYPE_UINT8,
+                2,
+                [128, 64, 0, 0],
+            ),
+            (
+                3,
+                crate::flm::STORAGE_ROLE_SCALE,
+                FLM_DTYPE_FP8_E4M3,
+                2,
+                [128, 8, 0, 0],
+            ),
+            (
+                3,
+                crate::flm::STORAGE_ROLE_GLOBAL_SCALE,
+                FLM_DTYPE_FP32,
+                1,
+                [1, 0, 0, 0],
+            ),
+            (
+                3,
+                crate::flm::STORAGE_ROLE_INPUT_SCALE,
+                FLM_DTYPE_FP32,
+                1,
+                [1, 0, 0, 0],
+            ),
+            (
+                4,
+                crate::flm::STORAGE_ROLE_VALUE,
+                FLM_DTYPE_FP8_E4M3,
+                2,
+                [32, 128, 0, 0],
+            ),
+            (
+                4,
+                crate::flm::STORAGE_ROLE_SCALE,
+                FLM_DTYPE_FP32,
+                1,
+                [1, 0, 0, 0],
+            ),
+            (
+                4,
+                crate::flm::STORAGE_ROLE_INPUT_SCALE,
+                FLM_DTYPE_FP32,
+                1,
+                [1, 0, 0, 0],
+            ),
+        ];
+        let mut out = Vec::new();
+        push_u16(&mut out, 1);
+        push_u16(&mut out, 38);
+        push_u32(&mut out, rows.len() as u32);
+        for (logical_tensor_id, role, dtype, rank, shape) in rows {
+            push_u32(&mut out, logical_tensor_id);
+            push_u16(&mut out, role);
+            push_u16(&mut out, crate::flm::CONSUME_STRATEGY_DIRECT);
+            push_u16(&mut out, crate::flm::LAYOUT_ID_DEFAULT);
+            push_u16(&mut out, dtype);
+            out.push(rank);
+            out.push(0);
+            for dim in shape {
+                push_u32(&mut out, dim);
+            }
+            push_u16(&mut out, crate::flm::PLAN_STREAM_DEFAULT);
+            push_u16(&mut out, crate::flm::PLAN_PRIORITY_DEFAULT);
+            push_u32(&mut out, crate::flm::PLAN_STEP_FLAG_NONE);
+        }
+        out
+    }
+
+    fn build_test_runtime_directory_with_modelopt_nvfp4_stage3_tables() -> Vec<u8> {
+        let (asset_table, asset_payloads) = runtime_asset_sections();
+        let sections = [
+            (1u32, runtime_config_section()),
+            (2u32, runtime_tokenizer_section()),
+            (3u32, runtime_codec_section()),
+            (4u32, runtime_tensor_abi_section()),
+            (5u32, asset_table),
+            (6u32, asset_payloads),
+            (7u32, runtime_model_descriptor_section()),
+            (8u32, runtime_tensor_manifest_section(&[])),
+            (9u32, runtime_stage3_lowbit_storage_abi_section()),
+            (
+                10u32,
+                runtime_stage3_modelopt_nvfp4_logical_tensor_section(),
+            ),
+            (
+                11u32,
+                runtime_stage3_modelopt_nvfp4_storage_binding_section(),
+            ),
+            (12u32, runtime_stage3_modelopt_nvfp4_plan_step_section()),
+        ];
+        let header_len = 16 + sections.len() * 12;
+        let mut offset = header_len as u32;
+        let mut out = Vec::new();
+        out.extend_from_slice(b"FLMRUN1\0");
+        push_u16(&mut out, 4);
+        push_u16(&mut out, sections.len() as u16);
+        push_u32(&mut out, crate::flm::ARCH_QWEN3_6_DENSE);
+        for (section_id, data) in &sections {
+            push_u32(&mut out, *section_id);
+            push_u32(&mut out, offset);
+            push_u32(&mut out, data.len() as u32);
+            offset += data.len() as u32;
+        }
+        for (_, data) in sections {
+            out.extend_from_slice(&data);
+        }
+        out
+    }
+
+    fn build_test_flm_with_modelopt_nvfp4_stage3_bindings() -> Vec<u8> {
+        let mut data = build_test_flm(&[
+            TestFlmTensor {
+                name: "model.language_model.layers.0.linear_attn.out_proj.weight",
+                shape: vec![128, 64],
+                dtype: FLM_DTYPE_UINT8,
+                codec: 3,
+                payload: vec![0x11; 128 * 64],
+            },
+            TestFlmTensor {
+                name: "model.language_model.layers.0.linear_attn.out_proj.weight_scale",
+                shape: vec![128, 8],
+                dtype: FLM_DTYPE_FP8_E4M3,
+                codec: 3,
+                payload: vec![0x3f; 128 * 8],
+            },
+            TestFlmTensor {
+                name: "model.language_model.layers.0.linear_attn.out_proj.weight_scale_2",
+                shape: vec![1],
+                dtype: FLM_DTYPE_FP32,
+                codec: 0,
+                payload: vec![0, 0, 128, 63],
+            },
+            TestFlmTensor {
+                name: "model.language_model.layers.0.linear_attn.out_proj.input_scale",
+                shape: vec![1],
+                dtype: FLM_DTYPE_FP32,
+                codec: 0,
+                payload: vec![0, 0, 0, 64],
+            },
+            TestFlmTensor {
+                name: "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
+                shape: vec![32, 128],
+                dtype: FLM_DTYPE_FP8_E4M3,
+                codec: 6,
+                payload: vec![0x33; 32 * 128],
+            },
+            TestFlmTensor {
+                name: "model.language_model.layers.0.linear_attn.in_proj_qkv.weight_scale",
+                shape: vec![1],
+                dtype: FLM_DTYPE_FP32,
+                codec: 6,
+                payload: vec![0, 0, 0, 63],
+            },
+            TestFlmTensor {
+                name: "model.language_model.layers.0.linear_attn.in_proj_qkv.input_scale",
+                shape: vec![1],
+                dtype: FLM_DTYPE_FP32,
+                codec: 0,
+                payload: vec![0, 0, 64, 64],
+            },
+        ]);
+        let runtime = build_test_runtime_directory_with_modelopt_nvfp4_stage3_tables();
+        append_runtime_directory(&mut data, &runtime);
+        data
+    }
+
+    fn build_test_flm_with_stage3_lowbit_bindings() -> Vec<u8> {
+        let mut data = build_test_flm(&[
+            TestFlmTensor {
+                name: "storage/nv_packed",
+                shape: vec![128, 64],
+                dtype: FLM_DTYPE_UINT8,
+                codec: 3,
+                payload: vec![0x11; 128 * 64],
+            },
+            TestFlmTensor {
+                name: "storage/nv_scale",
+                shape: vec![128, 8],
+                dtype: FLM_DTYPE_FP8_E4M3,
+                codec: 3,
+                payload: vec![0x3f; 128 * 8],
+            },
+            TestFlmTensor {
+                name: "storage/nv_global",
+                shape: vec![1],
+                dtype: FLM_DTYPE_FP32,
+                codec: 0,
+                payload: vec![0, 0, 128, 63],
+            },
+            TestFlmTensor {
+                name: "storage/mx4_packed",
+                shape: vec![64, 64],
+                dtype: FLM_DTYPE_UINT8,
+                codec: 4,
+                payload: vec![0x22; 64 * 64],
+            },
+            TestFlmTensor {
+                name: "storage/mx4_scale",
+                shape: vec![64, 4],
+                dtype: FLM_DTYPE_UINT8,
+                codec: 4,
+                payload: vec![127; 64 * 4],
+            },
+            TestFlmTensor {
+                name: "storage/mx8_value",
+                shape: vec![32, 128],
+                dtype: FLM_DTYPE_FP8_E4M3,
+                codec: 5,
+                payload: vec![0x33; 32 * 128],
+            },
+            TestFlmTensor {
+                name: "storage/mx8_scale",
+                shape: vec![32, 4],
+                dtype: FLM_DTYPE_UINT8,
+                codec: 5,
+                payload: vec![127; 32 * 4],
+            },
+            TestFlmTensor {
+                name: "storage/qwen_fp8_value",
+                shape: vec![96, 128],
+                dtype: FLM_DTYPE_FP8_E4M3,
+                codec: 7,
+                payload: vec![0x44; 96 * 128],
+            },
+            TestFlmTensor {
+                name: "storage/qwen_fp8_scale_inv",
+                shape: vec![1, 1],
+                dtype: FLM_DTYPE_BF16,
+                codec: 7,
+                payload: vec![0, 63],
+            },
+        ]);
+        let runtime = build_test_runtime_directory_with_lowbit_stage3_tables();
+        append_runtime_directory(&mut data, &runtime);
+        data
+    }
+
+    fn build_test_flm_with_stage3_logical_bindings() -> Vec<u8> {
+        let mut data = build_test_flm(&[
+            TestFlmTensor {
+                name: "storage/l0_gate_packed",
+                shape: vec![128, 16],
+                dtype: FLM_DTYPE_INT32,
+                codec: 1,
+                payload: vec![0; 128],
+            },
+            TestFlmTensor {
+                name: "storage/l0_gate_scale",
+                shape: vec![128, 1],
+                dtype: FLM_DTYPE_BF16,
+                codec: 1,
+                payload: vec![0; 256],
+            },
+            TestFlmTensor {
+                name: "storage/l0_gate_shape",
+                shape: vec![2],
+                dtype: FLM_DTYPE_INT64,
+                codec: 2,
+                payload: vec![0; 16],
+            },
+        ]);
+        let runtime = build_test_runtime_directory_with_stage3_tables();
+        append_runtime_directory(&mut data, &runtime);
+        data
+    }
+
+    fn build_test_flm_with_stage3_raw_value_binding() -> Vec<u8> {
+        let mut data = build_test_flm(&[TestFlmTensor {
+            name: "storage/l0_a_log",
+            shape: vec![4],
+            dtype: FLM_DTYPE_FP32,
+            codec: 0,
+            payload: vec![0; 16],
+        }]);
+        let runtime = build_test_runtime_directory_with_raw_value_stage3_tables();
+        append_runtime_directory(&mut data, &runtime);
+        data
+    }
+
+    fn append_runtime_directory(data: &mut Vec<u8>, runtime: &[u8]) {
+        let runtime_offset = data.len();
+        data.extend_from_slice(runtime);
+        put_u64(data, 168, runtime_offset as u64);
+        put_u64(data, 176, runtime.len() as u64);
+        put_head_crc64(data);
+    }
+
+    fn build_test_flm_with_runtime_manifest_group() -> Vec<u8> {
+        let mut data = build_test_flm(&[
+            TestFlmTensor {
+                name: "model.language_model.layers.0.mlp.gate_proj.weight_packed",
+                shape: vec![128, 16],
+                dtype: FLM_DTYPE_INT32,
+                codec: 1,
+                payload: vec![0; 128],
+            },
+            TestFlmTensor {
+                name: "model.language_model.layers.0.mlp.gate_proj.weight_scale",
+                shape: vec![128, 1],
+                dtype: FLM_DTYPE_BF16,
+                codec: 1,
+                payload: vec![0; 256],
+            },
+            TestFlmTensor {
+                name: "model.language_model.layers.0.mlp.gate_proj.weight_shape",
+                shape: vec![2],
+                dtype: FLM_DTYPE_INT64,
+                codec: 2,
+                payload: vec![0; 16],
+            },
+        ]);
+        let runtime = build_test_runtime_directory_with_manifest(&[
+            TestManifestRow {
+                name: "model.language_model.layers.0.mlp.gate_proj.weight_packed",
+                role_id: 1,
+                group_id: 7,
+                companion_kind: crate::flm::MANIFEST_COMPANION_PACKED,
+                rank: 2,
+                dtype: FLM_DTYPE_INT32,
+                logical_dtype: FLM_DTYPE_UINT8,
+                codec_id: 1,
+                flags: crate::flm::MANIFEST_FLAG_REQUIRED,
+                shape: [128, 16, 0, 0],
+            },
+            TestManifestRow {
+                name: "model.language_model.layers.0.mlp.gate_proj.weight_scale",
+                role_id: 1,
+                group_id: 7,
+                companion_kind: crate::flm::MANIFEST_COMPANION_SCALE,
+                rank: 2,
+                dtype: FLM_DTYPE_BF16,
+                logical_dtype: FLM_DTYPE_BF16,
+                codec_id: 1,
+                flags: crate::flm::MANIFEST_FLAG_REQUIRED,
+                shape: [128, 1, 0, 0],
+            },
+            TestManifestRow {
+                name: "model.language_model.layers.0.mlp.gate_proj.weight_shape",
+                role_id: 1,
+                group_id: 7,
+                companion_kind: crate::flm::MANIFEST_COMPANION_SHAPE,
+                rank: 1,
+                dtype: FLM_DTYPE_INT64,
+                logical_dtype: FLM_DTYPE_INT64,
+                codec_id: 2,
+                flags: crate::flm::MANIFEST_FLAG_REQUIRED,
+                shape: [2, 0, 0, 0],
+            },
+        ]);
+        append_runtime_directory(&mut data, &runtime);
+        data
+    }
+
+    fn corrupt_first_manifest_shape(data: &mut [u8], value: u32) {
+        let runtime_offset =
+            read_u64(data, 168, "test FLM runtime offset").expect("runtime offset") as usize;
+        let runtime = &data[runtime_offset..];
+        let section_count =
+            read_u16(runtime, 10, "test FLM section count").expect("section count") as usize;
+        let mut manifest_offset = None;
+        for idx in 0..section_count {
+            let record = 16 + idx * 12;
+            let section_id = read_u32(runtime, record, "test FLM section id").expect("section id");
+            if section_id == 8 {
+                manifest_offset = Some(
+                    read_u32(runtime, record + 4, "test FLM manifest offset")
+                        .expect("manifest offset") as usize,
+                );
+                break;
+            }
+        }
+        let shape_offset = runtime_offset + manifest_offset.expect("manifest section") + 12 + 16;
+        put_u32(data, shape_offset, value);
+    }
+
+    fn write_temp_flm(data: &[u8]) -> tempfile::NamedTempFile {
+        let mut file = tempfile::NamedTempFile::new().expect("temp FLM file");
+        file.write_all(data).expect("write FLM fixture");
+        file.flush().expect("flush FLM fixture");
+        file
+    }
+
+    #[test]
+    fn flm_crc64_ecma_matches_standard_check_vector() {
+        assert_eq!(flm_crc64_ecma(b"123456789"), 0x6C40_DF5F_0B49_7347);
+    }
+
+    #[test]
+    fn open_flm_exposes_mmap_backed_tensor_bytes() {
+        let data = build_test_flm(&[
+            TestFlmTensor {
+                name: "model.embed_tokens.weight",
+                shape: vec![2, 4],
+                dtype: 4,
+                codec: 0,
+                payload: (0u8..8).collect(),
+            },
+            TestFlmTensor {
+                name: "model.norm.weight",
+                shape: vec![2],
+                dtype: 2,
+                codec: 0,
+                payload: vec![0x00, 0x3f, 0x00, 0x40],
+            },
+        ]);
+        let file = write_temp_flm(&data);
+
+        let store = BakedStore::open_flm(file.path()).expect("open FLM");
+
+        assert!(store.flm_runtime().is_none());
+        assert!(store.contains("model.embed_tokens.weight"));
+        let meta = store.meta("model.embed_tokens.weight").unwrap();
+        assert_eq!(meta.shape, vec![2, 4]);
+        assert_eq!(meta.dtype, "u8");
+        assert_eq!(meta.layout, LayoutTag::Raw);
+        assert_eq!(
+            store.raw_bytes("model.embed_tokens.weight").unwrap(),
+            &(0u8..8).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            store
+                .raw_byte_range("model.embed_tokens.weight", 2, 3)
+                .unwrap(),
+            &[2, 3, 4]
+        );
+
+        let norm = store.meta("model.norm.weight").unwrap();
+        assert_eq!(norm.dtype, "bf16");
+        assert_eq!(norm.shape, vec![2]);
+    }
+
+    #[test]
+    fn open_flm_rejects_bad_head_crc64() {
+        let mut data = build_test_flm(&[TestFlmTensor {
+            name: "model.embed_tokens.weight",
+            shape: vec![4],
+            dtype: 4,
+            codec: 0,
+            payload: b"good".to_vec(),
+        }]);
+        put_u64(&mut data, 144, 1);
+        let file = write_temp_flm(&data);
+
+        let err = match BakedStore::open_flm(file.path()) {
+            Ok(_) => panic!("bad FLM head CRC64 should fail verification"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string().contains("head CRC"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn open_flm_parses_runtime_directory_when_offsets_present() {
+        let mut data = build_test_flm(&[TestFlmTensor {
+            name: "model.embed_tokens.weight",
+            shape: vec![2, 4],
+            dtype: 4,
+            codec: 0,
+            payload: (0u8..8).collect(),
+        }]);
+        let runtime = build_test_runtime_directory();
+        let runtime_offset = data.len();
+        data.extend_from_slice(&runtime);
+        put_u64(&mut data, 168, runtime_offset as u64);
+        put_u64(&mut data, 176, runtime.len() as u64);
+        put_head_crc64(&mut data);
+        let file = write_temp_flm(&data);
+
+        let store = BakedStore::open_flm(file.path()).expect("open FLM with runtime");
+        let runtime = store.flm_runtime().expect("parsed runtime");
+
+        assert_eq!(runtime.qwen36_config().unwrap().hidden_size, 5120);
+        assert_eq!(runtime.tokenizer().unwrap().tokenizer_id, 0);
+        assert_eq!(runtime.codec_by_id(0).unwrap().layout_id, 0);
+        assert_eq!(runtime.codec_by_id(0).unwrap().decoder_id, 0);
+        assert_eq!(runtime.codec_by_id(1).unwrap().layout_id, 0);
+        assert_eq!(runtime.codec_by_id(1).unwrap().decoder_id, 1);
+        assert_eq!(runtime.codec_by_id(2).unwrap().layout_id, 0);
+        assert_eq!(runtime.codec_by_id(2).unwrap().decoder_id, 0);
+        assert_eq!(runtime.tensor_abi().weight_prefix, "model.language_model");
+        assert_eq!(
+            runtime.asset_by_kind("tokenizer_regex").unwrap().asset_id,
+            4
+        );
+    }
+
+    #[test]
+    fn open_flm_verify_hashes_rejects_tampered_payload() {
+        let mut data = build_test_flm_with_hashes(
+            &[TestFlmTensor {
+                name: "model.embed_tokens.weight",
+                shape: vec![4],
+                dtype: 4,
+                codec: 0,
+                payload: b"good".to_vec(),
+            }],
+            &[[
+                0x4a, 0xe7, 0x5b, 0x23, 0x49, 0xdb, 0x30, 0x92, 0xa6, 0xa3, 0x34, 0x36, 0x25, 0xa6,
+                0xaa, 0x7b, 0xa4, 0xbb, 0x32, 0x98, 0x49, 0x1a, 0xca, 0xc2, 0x02, 0xc4, 0x68, 0x47,
+                0xb9, 0xef, 0x31, 0xc8,
+            ]],
+        );
+        let shard_table_offset = read_u64(&data, 88, "test FLM shard table offset")
+            .expect("shard table offset") as usize;
+        let payload_offset = read_u64(&data, shard_table_offset + 4, "test FLM shard file offset")
+            .expect("shard file offset") as usize;
+        data[payload_offset] ^= 0xff;
+        let file = write_temp_flm(&data);
+
+        let err = match BakedStore::open_flm_with_options(
+            file.path(),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: false,
+                verify_block_hashes: true,
+            },
+        ) {
+            Ok(_) => panic!("tampered FLM payload should fail verification"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string().contains("hash mismatch"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.to_string().contains("model.embed_tokens.weight"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn open_flm_rejects_half_zero_runtime_directory_fields() {
+        let mut offset_only = build_test_flm(&[TestFlmTensor {
+            name: "model.embed_tokens.weight",
+            shape: vec![2, 4],
+            dtype: 4,
+            codec: 0,
+            payload: (0u8..8).collect(),
+        }]);
+        put_u64(&mut offset_only, 168, 4096);
+        put_head_crc64(&mut offset_only);
+        let file = write_temp_flm(&offset_only);
+        let err = match BakedStore::open_flm(file.path()) {
+            Ok(_) => panic!("zero runtime len should fail"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("length is zero"),
+            "unexpected error: {err}"
+        );
+
+        let mut len_only = build_test_flm(&[TestFlmTensor {
+            name: "model.embed_tokens.weight",
+            shape: vec![2, 4],
+            dtype: 4,
+            codec: 0,
+            payload: (0u8..8).collect(),
+        }]);
+        put_u64(&mut len_only, 176, 16);
+        put_head_crc64(&mut len_only);
+        let file = write_temp_flm(&len_only);
+        let err = match BakedStore::open_flm(file.path()) {
+            Ok(_) => panic!("zero runtime offset should fail"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("offset is zero"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn open_flm_builds_int4_aliases_from_manifest_groups() {
+        let data = build_test_flm_with_runtime_manifest_group();
+        let file = write_temp_flm(&data);
+        let store = BakedStore::open_flm_with_options(
+            file.path(),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                verify_block_hashes: false,
+            },
+        )
+        .expect("open FLM with manifest aliases");
+
+        let alias = store
+            .meta("model.language_model.layers.0.mlp.gate_proj.weight")
+            .expect("native alias");
+        assert_eq!(alias.layout, LayoutTag::Int4Quantized);
+        assert_eq!(alias.dtype, "u8");
+        assert_eq!(alias.shape, vec![128, 64]);
+        let scale = store
+            .meta("model.language_model.layers.0.mlp.gate_proj.weight_int4_scale")
+            .expect("native scale alias");
+        assert_eq!(scale.dtype, "bf16");
+        assert_eq!(scale.shape, vec![128, 1]);
+    }
+
+    #[test]
+    fn open_flm_builds_int4_aliases_from_stage3_bindings_without_suffix_inference() {
+        let data = build_test_flm_with_stage3_logical_bindings();
+        let file = write_temp_flm(&data);
+
+        let store = BakedStore::open_flm_with_options(
+            file.path(),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                verify_block_hashes: false,
+            },
+        )
+        .expect("open FLM with Stage 3 bindings");
+
+        let alias = store
+            .meta("model.language_model.layers.0.mlp.gate_proj.weight")
+            .expect("native logical INT4 alias");
+        assert_eq!(alias.layout, LayoutTag::Int4Quantized);
+        assert_eq!(alias.dtype, "u8");
+        assert_eq!(alias.shape, vec![128, 64]);
+
+        let upload_view = store
+            .upload_view("model.language_model.layers.0.mlp.gate_proj.weight")
+            .expect("native logical INT4 upload view");
+        assert_eq!(upload_view.dtype, "u8");
+        assert_eq!(upload_view.shape, vec![128, 32]);
+
+        let scale_view = store
+            .upload_view("model.language_model.layers.0.mlp.gate_proj.weight_int4_scale")
+            .expect("native scale upload view");
+        assert_eq!(scale_view.dtype, "bf16");
+        assert_eq!(scale_view.shape, vec![128, 1]);
+    }
+
+    #[test]
+    fn open_flm_builds_raw_fp32_value_alias_from_stage3_binding() {
+        let data = build_test_flm_with_stage3_raw_value_binding();
+        let file = write_temp_flm(&data);
+
+        let store = BakedStore::open_flm_with_options(
+            file.path(),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                verify_block_hashes: false,
+            },
+        )
+        .expect("open FLM with raw Stage 3 value binding");
+
+        let storage = store.meta("storage/l0_a_log").expect("storage tensor");
+        assert_eq!(storage.dtype, "f32");
+        assert_eq!(storage.shape, vec![4]);
+
+        let logical_name = "model.language_model.layers.0.linear_attn.A_log";
+        let alias = store.meta(logical_name).expect("raw logical value alias");
+        assert_eq!(alias.layout, LayoutTag::Raw);
+        assert_eq!(alias.dtype, "f32");
+        assert_eq!(alias.shape, vec![4]);
+        assert_eq!(alias.offset, storage.offset);
+        assert_eq!(alias.byte_len, 16);
+
+        let upload_view = store
+            .upload_view(logical_name)
+            .expect("raw logical value upload view");
+        assert_eq!(upload_view.dtype, "f32");
+        assert_eq!(upload_view.shape, vec![4]);
+    }
+
+    #[test]
+    fn open_flm_builds_nvfp4_and_mxfp_stage3_direct_views() {
+        let data = build_test_flm_with_stage3_lowbit_bindings();
+        let file = write_temp_flm(&data);
+
+        let store = BakedStore::open_flm_with_options(
+            file.path(),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                verify_block_hashes: false,
+            },
+        )
+        .expect("open FLM with low-bit Stage 3 bindings");
+
+        let nv_name = "model.language_model.layers.0.linear_attn.out_proj.weight";
+        let nv = store.meta(nv_name).expect("NVFP4 logical alias");
+        let nv_storage = store.meta("storage/nv_packed").expect("NVFP4 storage");
+        assert_eq!(nv.layout, LayoutTag::Raw);
+        assert_eq!(nv.dtype, "u8");
+        assert_eq!(nv.shape, vec![128, 128]);
+        assert_eq!(nv.offset, nv_storage.offset);
+        assert_eq!(nv.byte_len, nv_storage.byte_len);
+        assert_eq!(
+            store.upload_view(nv_name).expect("NVFP4 upload view"),
+            &TensorUploadView {
+                dtype: "u8".to_string(),
+                shape: vec![128, 64],
+            }
+        );
+        let nv_scale = store
+            .meta("model.language_model.layers.0.linear_attn.out_proj.weight_nvfp4_scale")
+            .expect("NVFP4 scale alias");
+        assert_eq!(nv_scale.dtype, "f8_e4m3");
+        assert_eq!(nv_scale.shape, vec![128, 8]);
+        let nv_global = store
+            .meta("model.language_model.layers.0.linear_attn.out_proj.weight_nvfp4_global_scale")
+            .expect("NVFP4 global scale alias");
+        assert_eq!(nv_global.dtype, "f32");
+        assert_eq!(nv_global.shape, vec![1]);
+
+        let mx4_name = "model.language_model.layers.0.linear_attn.in_proj_z.weight";
+        let mx4 = store.meta(mx4_name).expect("MXFP4 logical alias");
+        assert_eq!(mx4.layout, LayoutTag::Raw);
+        assert_eq!(mx4.dtype, "u8");
+        assert_eq!(mx4.shape, vec![64, 128]);
+        assert_eq!(
+            store.upload_view(mx4_name).expect("MXFP4 upload view"),
+            &TensorUploadView {
+                dtype: "u8".to_string(),
+                shape: vec![64, 64],
+            }
+        );
+        let mx4_scale = store
+            .meta("model.language_model.layers.0.linear_attn.in_proj_z.weight_mxfp4_scale")
+            .expect("MXFP4 scale alias");
+        assert_eq!(mx4_scale.dtype, "u8");
+        assert_eq!(mx4_scale.shape, vec![64, 4]);
+
+        let mx8_name = "model.language_model.layers.0.linear_attn.in_proj_qkv.weight";
+        let mx8 = store.meta(mx8_name).expect("MXFP8 logical alias");
+        assert_eq!(mx8.layout, LayoutTag::Raw);
+        assert_eq!(mx8.dtype, "f8_e4m3");
+        assert_eq!(mx8.shape, vec![32, 128]);
+        assert_eq!(
+            store.upload_view(mx8_name).expect("MXFP8 upload view"),
+            &TensorUploadView {
+                dtype: "f8_e4m3".to_string(),
+                shape: vec![32, 128],
+            }
+        );
+        let mx8_scale = store
+            .meta("model.language_model.layers.0.linear_attn.in_proj_qkv.weight_mxfp8_scale")
+            .expect("MXFP8 scale alias");
+        assert_eq!(mx8_scale.dtype, "u8");
+        assert_eq!(mx8_scale.shape, vec![32, 4]);
+
+        let qwen_fp8_name = "model.language_model.layers.0.self_attn.q_proj.weight";
+        let qwen_fp8 = store
+            .meta(qwen_fp8_name)
+            .expect("Qwen FP8 block-scale logical alias");
+        assert_eq!(qwen_fp8.layout, LayoutTag::Raw);
+        assert_eq!(qwen_fp8.dtype, "f8_e4m3");
+        assert_eq!(qwen_fp8.shape, vec![96, 128]);
+        assert_eq!(
+            store
+                .upload_view(qwen_fp8_name)
+                .expect("Qwen FP8 block-scale upload view"),
+            &TensorUploadView {
+                dtype: "f8_e4m3".to_string(),
+                shape: vec![96, 128],
+            }
+        );
+        let qwen_fp8_scale = store
+            .meta("model.language_model.layers.0.self_attn.q_proj.weight_fp8_e4m3_b128_bf16_scale_inv")
+            .expect("Qwen FP8 block-scale inverse scale alias");
+        assert_eq!(qwen_fp8_scale.dtype, "bf16");
+        assert_eq!(qwen_fp8_scale.shape, vec![1, 1]);
+
+        let runtime = store.flm_runtime().expect("runtime directory");
+        let by_name = runtime
+            .logical_tensors()
+            .iter()
+            .map(|logical| (logical.name.as_str(), logical.value_format_id))
+            .collect::<HashMap<_, _>>();
+        assert_eq!(by_name[nv_name], crate::flm::VALUE_FORMAT_NVFP4_E2M1);
+        assert_eq!(by_name[mx4_name], crate::flm::VALUE_FORMAT_MXFP4_E2M1);
+        assert_eq!(by_name[mx8_name], crate::flm::VALUE_FORMAT_MXFP8_E4M3);
+        assert_eq!(
+            by_name[qwen_fp8_name],
+            crate::flm::VALUE_FORMAT_FP8_E4M3_B128_BF16_INV
+        );
+    }
+
+    #[test]
+    fn open_flm_builds_modelopt_nvfp4_same_name_packed_direct_view() {
+        let data = build_test_flm_with_modelopt_nvfp4_stage3_bindings();
+        let file = write_temp_flm(&data);
+
+        let store = BakedStore::open_flm_with_options(
+            file.path(),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                verify_block_hashes: false,
+            },
+        )
+        .expect("open FLM with ModelOpt NVFP4 Stage 3 bindings");
+
+        let nv_name = "model.language_model.layers.0.linear_attn.out_proj.weight";
+        let nv = store.meta(nv_name).expect("NVFP4 logical tensor");
+        assert_eq!(nv.layout, LayoutTag::Raw);
+        assert_eq!(nv.dtype, "u8");
+        assert_eq!(nv.shape, vec![128, 128]);
+        assert_eq!(nv.byte_len, 128 * 64);
+        assert_eq!(
+            store.upload_view(nv_name).expect("NVFP4 upload view"),
+            &TensorUploadView {
+                dtype: "u8".to_string(),
+                shape: vec![128, 64],
+            }
+        );
+        let input = store
+            .meta("model.language_model.layers.0.linear_attn.out_proj.weight_nvfp4_input_scale")
+            .expect("NVFP4 input scale alias");
+        assert_eq!(input.dtype, "f32");
+        assert_eq!(input.shape, vec![1]);
+        assert_eq!(
+            store
+                .upload_view(
+                    "model.language_model.layers.0.linear_attn.out_proj.weight_nvfp4_input_scale"
+                )
+                .expect("NVFP4 input scale upload view"),
+            &TensorUploadView {
+                dtype: "f32".to_string(),
+                shape: vec![1],
+            }
+        );
+    }
+
+    #[test]
+    fn open_flm_builds_fp8_scalar_stage3_direct_view() {
+        let data = build_test_flm_with_modelopt_nvfp4_stage3_bindings();
+        let file = write_temp_flm(&data);
+
+        let store = BakedStore::open_flm_with_options(
+            file.path(),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                verify_block_hashes: false,
+            },
+        )
+        .expect("open FLM with FP8 scalar Stage 3 bindings");
+
+        let fp8_name = "model.language_model.layers.0.linear_attn.in_proj_qkv.weight";
+        let fp8 = store.meta(fp8_name).expect("FP8 scalar logical tensor");
+        assert_eq!(fp8.layout, LayoutTag::Raw);
+        assert_eq!(fp8.dtype, "f8_e4m3");
+        assert_eq!(fp8.shape, vec![32, 128]);
+        assert_eq!(
+            store.upload_view(fp8_name).expect("FP8 scalar upload view"),
+            &TensorUploadView {
+                dtype: "f8_e4m3".to_string(),
+                shape: vec![32, 128],
+            }
+        );
+        let scale = store
+            .meta("model.language_model.layers.0.linear_attn.in_proj_qkv.weight_fp8_e4m3_f32_scale")
+            .expect("FP8 scalar scale alias");
+        assert_eq!(scale.dtype, "f32");
+        assert_eq!(scale.shape, vec![1]);
+        let input = store
+            .meta("model.language_model.layers.0.linear_attn.in_proj_qkv.weight_fp8_e4m3_f32_input_scale")
+            .expect("FP8 scalar input scale alias");
+        assert_eq!(input.dtype, "f32");
+        assert_eq!(input.shape, vec![1]);
+    }
+
+    #[test]
+    fn gpu_upload_shape_uses_packed_row_bytes_for_logical_int4_aliases() {
+        let meta = TensorMeta {
+            name: "model.language_model.layers.0.linear_attn.in_proj_qkv.weight".to_string(),
+            shape: vec![17408, 5120],
+            dtype: "u8".to_string(),
+            layout: LayoutTag::Int4Quantized,
+            offset: 0,
+            byte_len: 44_564_480,
+        };
+
+        let upload_shape = gpu_upload_shape(&meta).expect("upload shape");
+
+        assert_eq!(meta.shape, vec![17408, 5120]);
+        assert_eq!(upload_shape, vec![17408, 2560]);
+    }
+
+    #[test]
+    fn open_flm_rejects_required_manifest_shape_mismatch() {
+        let mut data = build_test_flm_with_runtime_manifest_group();
+        corrupt_first_manifest_shape(&mut data, 999);
+        let file = write_temp_flm(&data);
+        let err = match BakedStore::open_flm_with_options(
+            file.path(),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                verify_block_hashes: false,
+            },
+        ) {
+            Ok(_) => panic!("manifest mismatch should fail"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("manifest"));
+    }
+
+    #[test]
+    fn open_flm_does_not_alias_suffix_tensors_absent_from_manifest_group() {
+        let mut data = build_test_flm(&[
+            TestFlmTensor {
+                name: "model.language_model.layers.0.mlp.gate_proj.weight_packed",
+                shape: vec![128, 16],
+                dtype: FLM_DTYPE_INT32,
+                codec: 1,
+                payload: vec![0; 128],
+            },
+            TestFlmTensor {
+                name: "model.language_model.layers.0.mlp.gate_proj.weight_scale",
+                shape: vec![128, 1],
+                dtype: FLM_DTYPE_BF16,
+                codec: 0,
+                payload: vec![0; 256],
+            },
+        ]);
+        let runtime = build_test_runtime_directory();
+        append_runtime_directory(&mut data, &runtime);
+        let file = write_temp_flm(&data);
+
+        let store = BakedStore::open_flm_with_options(
+            file.path(),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                verify_block_hashes: false,
+            },
+        )
+        .expect("open FLM with empty manifest");
+
+        assert!(store
+            .meta("model.language_model.layers.0.mlp.gate_proj.weight")
+            .is_none());
+    }
+
+    #[test]
+    fn open_flm_can_synthesize_manifest_int4_aliases() {
+        let data = build_test_flm_with_runtime_manifest_group();
+        let file = write_temp_flm(&data);
+
+        let store = BakedStore::open_flm_with_options(
+            file.path(),
+            crate::store::FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                ..Default::default()
+            },
+        )
+        .expect("open FLM with manifest aliases");
+
+        let weight = store
+            .meta("model.language_model.layers.0.mlp.gate_proj.weight")
+            .expect("aliased weight");
+        assert_eq!(weight.dtype, "u8");
+        assert_eq!(weight.shape, vec![128, 64]);
+        assert_eq!(weight.layout, LayoutTag::Int4Quantized);
+        assert_eq!(
+            store
+                .raw_bytes("model.language_model.layers.0.mlp.gate_proj.weight")
+                .unwrap(),
+            &[0; 128]
+        );
+        assert_eq!(
+            store
+                .raw_bytes("model.language_model.layers.0.mlp.gate_proj.weight_int4_scale")
+                .unwrap(),
+            &[0; 256]
+        );
+        assert_eq!(
+            store
+                .raw_bytes("model.language_model.layers.0.mlp.gate_proj.weight_int4_zero")
+                .unwrap(),
+            vec![0x00, 0x41].repeat(128).as_slice()
+        );
+    }
 
     /// End-to-end loadability test against a real Qwen3.6-MoE bake.
     /// Skipped when `SUPERSONIC_QWEN36_MOE_BAKE_DIR` is unset so CI / non-bake
@@ -427,6 +3734,1354 @@ mod tests {
             store.index.len(),
             weights_len / (1024 * 1024),
         );
+    }
+
+    #[test]
+    fn flm_qwen36_27b_loadable_with_ct_aliases() {
+        let Ok(flm_path_str) = std::env::var("SUPERSONIC_QWEN36_27B_FLM") else {
+            eprintln!(
+                "skip: SUPERSONIC_QWEN36_27B_FLM not set. Point it at an FLM \
+                 file like qwen36-27b-int4.flm to validate full-artifact FLM loadability."
+            );
+            return;
+        };
+        let store = BakedStore::open_flm_with_options(
+            Path::new(&flm_path_str),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                verify_block_hashes: true,
+            },
+        )
+        .expect("open qwen3.6-27b FLM");
+
+        let embed = store
+            .meta("model.language_model.embed_tokens.weight")
+            .expect("embed_tokens missing");
+        assert_eq!(embed.dtype, "bf16");
+        assert_eq!(embed.shape, vec![248320, 5120]);
+        assert_eq!(embed.byte_len, 2_542_796_800);
+
+        let packed_name = "model.language_model.layers.0.linear_attn.in_proj_qkv.weight_packed";
+        let alias_name = "model.language_model.layers.0.linear_attn.in_proj_qkv.weight";
+        let packed = store.meta(packed_name).expect("packed CT tensor missing");
+        let alias = store.meta(alias_name).expect("native INT4 alias missing");
+        assert_eq!(packed.dtype, "u8");
+        assert_eq!(alias.dtype, "u8");
+        assert_eq!(alias.layout, LayoutTag::Int4Quantized);
+        assert_eq!(alias.shape, vec![10240, 5120]);
+        assert_eq!(alias.offset, packed.offset);
+        assert_eq!(alias.byte_len, packed.byte_len);
+
+        let scale = store
+            .raw_bytes("model.language_model.layers.0.linear_attn.in_proj_qkv.weight_int4_scale")
+            .expect("aliased scale bytes");
+        assert_eq!(scale.len(), 819_200);
+        let scale_meta = store
+            .meta("model.language_model.layers.0.linear_attn.in_proj_qkv.weight_int4_scale")
+            .expect("aliased scale meta");
+        assert_eq!(scale_meta.dtype, "bf16");
+        let zero = store
+            .raw_bytes("model.language_model.layers.0.linear_attn.in_proj_qkv.weight_int4_zero")
+            .expect("synthetic zero bytes");
+        assert_eq!(zero.len(), scale.len());
+        assert!(zero.chunks_exact(2).all(|pair| pair == [0x00, 0x41]));
+
+        eprintln!(
+            "[flm-validate] OK — {} tensors including FLM logical aliases",
+            store.index.len()
+        );
+    }
+
+    #[test]
+    fn flm_qwen36_27b_fp8_preserve_lowbit_loadable() {
+        let Ok(flm_path_str) = std::env::var("SUPERSONIC_QWEN36_27B_FP8_FLM") else {
+            eprintln!(
+                "skip: SUPERSONIC_QWEN36_27B_FP8_FLM not set. Point it at a \
+                 preserve-lowbit Qwen3.6-27B-FP8 FLM to validate Stage 3 FP8 \
+                 block-scale aliases."
+            );
+            return;
+        };
+        let store = BakedStore::open_flm_with_options(
+            Path::new(&flm_path_str),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                verify_block_hashes: true,
+            },
+        )
+        .expect("open qwen3.6-27b FP8 FLM");
+
+        let embed = store
+            .meta("model.language_model.embed_tokens.weight")
+            .expect("embed_tokens missing");
+        assert_eq!(embed.dtype, "bf16");
+        assert_eq!(embed.shape, vec![248320, 5120]);
+        assert_eq!(embed.byte_len, 2_542_796_800);
+
+        let fp8_name = "model.language_model.layers.0.linear_attn.in_proj_qkv.weight";
+        let fp8 = store
+            .meta(fp8_name)
+            .expect("Qwen FP8 logical alias missing");
+        assert_eq!(fp8.layout, LayoutTag::Raw);
+        assert_eq!(fp8.dtype, "f8_e4m3");
+        assert_eq!(fp8.shape, vec![10240, 5120]);
+        assert_eq!(fp8.byte_len, 52_428_800);
+        assert_eq!(
+            store
+                .upload_view(fp8_name)
+                .expect("Qwen FP8 direct upload view"),
+            &TensorUploadView {
+                dtype: "f8_e4m3".to_string(),
+                shape: vec![10240, 5120],
+            }
+        );
+
+        let scale_alias = concat!(
+            "model.language_model.layers.0.linear_attn.in_proj_qkv.",
+            "weight_fp8_e4m3_b128_bf16_scale_inv"
+        );
+        let scale = store
+            .meta(scale_alias)
+            .expect("Qwen FP8 inverse-scale alias missing");
+        assert_eq!(scale.dtype, "bf16");
+        assert_eq!(scale.shape, vec![80, 40]);
+        assert_eq!(scale.byte_len, 6_400);
+
+        let runtime = store.flm_runtime().expect("runtime directory");
+        let fp8_logical_count = runtime
+            .logical_tensors()
+            .iter()
+            .filter(|logical| {
+                logical.value_format_id == crate::flm::VALUE_FORMAT_FP8_E4M3_B128_BF16_INV
+            })
+            .count();
+        assert_eq!(fp8_logical_count, 407);
+
+        eprintln!(
+            "[flm-validate] OK — {} tensors including Qwen FP8 block-scale aliases",
+            store.index.len()
+        );
+    }
+
+    #[test]
+    fn flm_qwen36_27b_nvfp4_preserve_lowbit_loadable() {
+        let Ok(flm_path_str) = std::env::var("SUPERSONIC_QWEN36_27B_NVFP4_FLM") else {
+            eprintln!(
+                "skip: SUPERSONIC_QWEN36_27B_NVFP4_FLM not set. Point it at a \
+                 preserve-lowbit nvidia/Qwen3.6-27B-NVFP4 FLM to validate dense \
+                 NVFP4/FP8 aliases."
+            );
+            return;
+        };
+        let store = BakedStore::open_flm_with_options(
+            Path::new(&flm_path_str),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                verify_block_hashes: true,
+            },
+        )
+        .expect("open qwen3.6-27b NVFP4 FLM");
+
+        let runtime = store.flm_runtime().expect("runtime directory");
+        let dense = runtime.qwen36_config().expect("dense runtime config");
+        assert_eq!(dense.hidden_size, 5120);
+        assert_eq!(dense.num_hidden_layers, 64);
+        assert_eq!(dense.intermediate_size, 17408);
+
+        let raw_count = runtime
+            .logical_tensors()
+            .iter()
+            .filter(|logical| logical.value_format_id == crate::flm::VALUE_FORMAT_RAW_DENSE)
+            .count();
+        let nvfp4_count = runtime
+            .logical_tensors()
+            .iter()
+            .filter(|logical| logical.value_format_id == crate::flm::VALUE_FORMAT_NVFP4_E2M1)
+            .count();
+        let fp8_scalar_count = runtime
+            .logical_tensors()
+            .iter()
+            .filter(|logical| logical.value_format_id == crate::flm::VALUE_FORMAT_FP8_E4M3_F32)
+            .count();
+        assert_eq!(raw_count, 450);
+        assert_eq!(nvfp4_count, 193);
+        assert_eq!(fp8_scalar_count, 208);
+
+        let embed = store
+            .meta("model.language_model.embed_tokens.weight")
+            .expect("embed_tokens missing");
+        assert_eq!(embed.dtype, "bf16");
+        assert_eq!(embed.shape, vec![248320, 5120]);
+        assert_eq!(embed.byte_len, 2_542_796_800);
+
+        let lm_head = store.meta("lm_head.weight").expect("lm_head missing");
+        assert_eq!(lm_head.dtype, "u8");
+        assert_eq!(lm_head.shape, vec![248320, 5120]);
+        assert_eq!(lm_head.byte_len, 635_699_200);
+        assert_eq!(
+            store
+                .upload_view("lm_head.weight")
+                .expect("NVFP4 lm_head upload view"),
+            &TensorUploadView {
+                dtype: "u8".to_string(),
+                shape: vec![248320, 2560],
+            }
+        );
+        assert!(store.contains("lm_head.weight_nvfp4_scale"));
+        assert!(store.contains("lm_head.weight_nvfp4_global_scale"));
+        assert!(store.contains("lm_head.weight_nvfp4_input_scale"));
+
+        let mlp_name = "model.language_model.layers.0.mlp.down_proj.weight";
+        let mlp = store.meta(mlp_name).expect("NVFP4 MLP logical alias");
+        assert_eq!(mlp.dtype, "u8");
+        assert_eq!(mlp.shape, vec![5120, 17408]);
+        assert_eq!(mlp.byte_len, 44_564_480);
+        assert_eq!(
+            store.upload_view(mlp_name).expect("NVFP4 MLP upload view"),
+            &TensorUploadView {
+                dtype: "u8".to_string(),
+                shape: vec![5120, 8704],
+            }
+        );
+        assert!(store.contains("model.language_model.layers.0.mlp.down_proj.weight_nvfp4_scale"));
+        assert!(
+            store.contains("model.language_model.layers.0.mlp.down_proj.weight_nvfp4_global_scale")
+        );
+        assert!(
+            store.contains("model.language_model.layers.0.mlp.down_proj.weight_nvfp4_input_scale")
+        );
+
+        let fp8_name = "model.language_model.layers.0.linear_attn.in_proj_qkv.weight";
+        assert_eq!(
+            store.upload_view(fp8_name).expect("FP8 scalar upload view"),
+            &TensorUploadView {
+                dtype: "f8_e4m3".to_string(),
+                shape: vec![10240, 5120],
+            }
+        );
+        assert!(store.contains(
+            "model.language_model.layers.0.linear_attn.in_proj_qkv.weight_fp8_e4m3_f32_scale"
+        ));
+        assert!(store.contains(
+            "model.language_model.layers.0.linear_attn.in_proj_qkv.weight_fp8_e4m3_f32_input_scale"
+        ));
+
+        eprintln!(
+            "[flm-validate] OK — {} tensors including 27B NVFP4/FP8 aliases",
+            store.index.len()
+        );
+    }
+
+    #[test]
+    fn flm_qwen36_27b_mxfp4_preserve_lowbit_loadable() {
+        let Ok(flm_path_str) = std::env::var("SUPERSONIC_QWEN36_27B_MXFP4_FLM") else {
+            eprintln!(
+                "skip: SUPERSONIC_QWEN36_27B_MXFP4_FLM not set. Point it at a \
+                 preserve-lowbit OsaurusAI/Qwen3.6-27B-MXFP4 FLM to validate \
+                 dense MXFP4 aliases."
+            );
+            return;
+        };
+        let store = BakedStore::open_flm_with_options(
+            Path::new(&flm_path_str),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                verify_block_hashes: true,
+            },
+        )
+        .expect("open qwen3.6-27b MXFP4 FLM");
+
+        let runtime = store.flm_runtime().expect("runtime directory");
+        let dense = runtime.qwen36_config().expect("dense runtime config");
+        assert_eq!(dense.hidden_size, 5120);
+        assert_eq!(dense.num_hidden_layers, 64);
+        assert_eq!(dense.intermediate_size, 17408);
+
+        let raw_count = runtime
+            .logical_tensors()
+            .iter()
+            .filter(|logical| logical.value_format_id == crate::flm::VALUE_FORMAT_RAW_DENSE)
+            .count();
+        let mxfp4_count = runtime
+            .logical_tensors()
+            .iter()
+            .filter(|logical| logical.value_format_id == crate::flm::VALUE_FORMAT_MXFP4_E2M1)
+            .count();
+        assert_eq!(raw_count, 353);
+        assert_eq!(mxfp4_count, 498);
+
+        let embed_name = "model.language_model.embed_tokens.weight";
+        let embed = store.meta(embed_name).expect("MXFP4 embed logical alias");
+        assert_eq!(embed.dtype, "u8");
+        assert_eq!(embed.shape, vec![248320, 5120]);
+        assert_eq!(embed.byte_len, 635_699_200);
+        assert_eq!(
+            store
+                .upload_view(embed_name)
+                .expect("MXFP4 embed upload view"),
+            &TensorUploadView {
+                dtype: "u8".to_string(),
+                shape: vec![248320, 2560],
+            }
+        );
+        let embed_scale = store
+            .meta("model.language_model.embed_tokens.weight_mxfp4_scale")
+            .expect("MXFP4 embed scale alias");
+        assert_eq!(embed_scale.dtype, "u8");
+        assert_eq!(embed_scale.shape, vec![248320, 160]);
+
+        let lm_head = store.meta("lm_head.weight").expect("lm_head missing");
+        assert_eq!(lm_head.dtype, "u8");
+        assert_eq!(lm_head.shape, vec![248320, 5120]);
+        assert_eq!(lm_head.byte_len, 635_699_200);
+        assert_eq!(
+            store
+                .upload_view("lm_head.weight")
+                .expect("MXFP4 lm_head upload view"),
+            &TensorUploadView {
+                dtype: "u8".to_string(),
+                shape: vec![248320, 2560],
+            }
+        );
+        let lm_head_scale = store
+            .meta("lm_head.weight_mxfp4_scale")
+            .expect("MXFP4 lm_head scale alias");
+        assert_eq!(lm_head_scale.dtype, "u8");
+        assert_eq!(lm_head_scale.shape, vec![248320, 160]);
+
+        let qkv_name = "model.language_model.layers.0.linear_attn.in_proj_qkv.weight";
+        let qkv = store.meta(qkv_name).expect("MXFP4 qkv logical alias");
+        assert_eq!(qkv.dtype, "u8");
+        assert_eq!(qkv.shape, vec![10240, 5120]);
+        assert_eq!(qkv.byte_len, 26_214_400);
+        assert_eq!(
+            store.upload_view(qkv_name).expect("MXFP4 qkv upload view"),
+            &TensorUploadView {
+                dtype: "u8".to_string(),
+                shape: vec![10240, 2560],
+            }
+        );
+        let qkv_scale = store
+            .meta("model.language_model.layers.0.linear_attn.in_proj_qkv.weight_mxfp4_scale")
+            .expect("MXFP4 qkv scale alias");
+        assert_eq!(qkv_scale.dtype, "u8");
+        assert_eq!(qkv_scale.shape, vec![10240, 160]);
+
+        let mlp_name = "model.language_model.layers.0.mlp.down_proj.weight";
+        let mlp = store.meta(mlp_name).expect("MXFP4 MLP logical alias");
+        assert_eq!(mlp.dtype, "u8");
+        assert_eq!(mlp.shape, vec![5120, 17408]);
+        assert_eq!(mlp.byte_len, 44_564_480);
+        assert_eq!(
+            store.upload_view(mlp_name).expect("MXFP4 MLP upload view"),
+            &TensorUploadView {
+                dtype: "u8".to_string(),
+                shape: vec![5120, 8704],
+            }
+        );
+        let mlp_scale = store
+            .meta("model.language_model.layers.0.mlp.down_proj.weight_mxfp4_scale")
+            .expect("MXFP4 MLP scale alias");
+        assert_eq!(mlp_scale.dtype, "u8");
+        assert_eq!(mlp_scale.shape, vec![5120, 544]);
+
+        let conv = store
+            .meta("model.language_model.layers.0.linear_attn.conv1d.weight")
+            .expect("conv1d raw tensor");
+        assert_eq!(conv.dtype, "bf16");
+        assert_eq!(conv.shape, vec![10240, 4, 1]);
+
+        eprintln!(
+            "[flm-validate] OK — {} tensors including 27B MXFP4 aliases",
+            store.index.len()
+        );
+    }
+
+    #[test]
+    fn flm_qwen36_27b_mxfp8_preserve_lowbit_loadable() {
+        let Ok(flm_path_str) = std::env::var("SUPERSONIC_QWEN36_27B_MXFP8_FLM") else {
+            eprintln!(
+                "skip: SUPERSONIC_QWEN36_27B_MXFP8_FLM not set. Point it at a \
+                 preserve-lowbit mlx-community/Qwen3.6-27B-mxfp8 FLM to validate \
+                 dense MXFP8 aliases."
+            );
+            return;
+        };
+        let store = BakedStore::open_flm_with_options(
+            Path::new(&flm_path_str),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                verify_block_hashes: true,
+            },
+        )
+        .expect("open qwen3.6-27b MXFP8 FLM");
+
+        let runtime = store.flm_runtime().expect("runtime directory");
+        let dense = runtime.qwen36_config().expect("dense runtime config");
+        assert_eq!(dense.hidden_size, 5120);
+        assert_eq!(dense.num_hidden_layers, 64);
+        assert_eq!(dense.intermediate_size, 17408);
+
+        let raw_count = runtime
+            .logical_tensors()
+            .iter()
+            .filter(|logical| logical.value_format_id == crate::flm::VALUE_FORMAT_RAW_DENSE)
+            .count();
+        let mxfp8_count = runtime
+            .logical_tensors()
+            .iter()
+            .filter(|logical| logical.value_format_id == crate::flm::VALUE_FORMAT_MXFP8_E4M3)
+            .count();
+        assert_eq!(raw_count, 353);
+        assert_eq!(mxfp8_count, 498);
+
+        let embed_name = "model.language_model.embed_tokens.weight";
+        let embed = store.meta(embed_name).expect("MXFP8 embed logical alias");
+        assert_eq!(embed.dtype, "f8_e4m3");
+        assert_eq!(embed.shape, vec![248320, 5120]);
+        assert_eq!(embed.byte_len, 1_271_398_400);
+        assert_eq!(
+            store
+                .upload_view(embed_name)
+                .expect("MXFP8 embed upload view"),
+            &TensorUploadView {
+                dtype: "f8_e4m3".to_string(),
+                shape: vec![248320, 5120],
+            }
+        );
+        let embed_scale = store
+            .meta("model.language_model.embed_tokens.weight_mxfp8_scale")
+            .expect("MXFP8 embed scale alias");
+        assert_eq!(embed_scale.dtype, "u8");
+        assert_eq!(embed_scale.shape, vec![248320, 160]);
+
+        let lm_head = store.meta("lm_head.weight").expect("lm_head missing");
+        assert_eq!(lm_head.dtype, "f8_e4m3");
+        assert_eq!(lm_head.shape, vec![248320, 5120]);
+        assert_eq!(lm_head.byte_len, 1_271_398_400);
+        assert_eq!(
+            store
+                .upload_view("lm_head.weight")
+                .expect("MXFP8 lm_head upload view"),
+            &TensorUploadView {
+                dtype: "f8_e4m3".to_string(),
+                shape: vec![248320, 5120],
+            }
+        );
+        let lm_head_scale = store
+            .meta("lm_head.weight_mxfp8_scale")
+            .expect("MXFP8 lm_head scale alias");
+        assert_eq!(lm_head_scale.dtype, "u8");
+        assert_eq!(lm_head_scale.shape, vec![248320, 160]);
+
+        let qkv_name = "model.language_model.layers.0.linear_attn.in_proj_qkv.weight";
+        let qkv = store.meta(qkv_name).expect("MXFP8 qkv logical alias");
+        assert_eq!(qkv.dtype, "f8_e4m3");
+        assert_eq!(qkv.shape, vec![10240, 5120]);
+        assert_eq!(qkv.byte_len, 52_428_800);
+        assert_eq!(
+            store.upload_view(qkv_name).expect("MXFP8 qkv upload view"),
+            &TensorUploadView {
+                dtype: "f8_e4m3".to_string(),
+                shape: vec![10240, 5120],
+            }
+        );
+        let qkv_scale = store
+            .meta("model.language_model.layers.0.linear_attn.in_proj_qkv.weight_mxfp8_scale")
+            .expect("MXFP8 qkv scale alias");
+        assert_eq!(qkv_scale.dtype, "u8");
+        assert_eq!(qkv_scale.shape, vec![10240, 160]);
+
+        let mlp_name = "model.language_model.layers.0.mlp.down_proj.weight";
+        let mlp = store.meta(mlp_name).expect("MXFP8 MLP logical alias");
+        assert_eq!(mlp.dtype, "f8_e4m3");
+        assert_eq!(mlp.shape, vec![5120, 17408]);
+        assert_eq!(mlp.byte_len, 89_128_960);
+        assert_eq!(
+            store.upload_view(mlp_name).expect("MXFP8 MLP upload view"),
+            &TensorUploadView {
+                dtype: "f8_e4m3".to_string(),
+                shape: vec![5120, 17408],
+            }
+        );
+        let mlp_scale = store
+            .meta("model.language_model.layers.0.mlp.down_proj.weight_mxfp8_scale")
+            .expect("MXFP8 MLP scale alias");
+        assert_eq!(mlp_scale.dtype, "u8");
+        assert_eq!(mlp_scale.shape, vec![5120, 544]);
+
+        let conv = store
+            .meta("model.language_model.layers.0.linear_attn.conv1d.weight")
+            .expect("conv1d raw tensor");
+        assert_eq!(conv.dtype, "bf16");
+        assert_eq!(conv.shape, vec![10240, 4, 1]);
+
+        eprintln!(
+            "[flm-validate] OK — {} tensors including 27B MXFP8 aliases",
+            store.index.len()
+        );
+    }
+
+    #[test]
+    fn flm_tiny_qwen36_raw_fp32_and_int4_aliases_loadable() {
+        let Ok(flm_path_str) = std::env::var("SUPERSONIC_TINY_QWEN36_FLM") else {
+            eprintln!(
+                "skip: SUPERSONIC_TINY_QWEN36_FLM not set. Point it at a tiny \
+                 converter-produced Qwen3.6 FLM to validate Stage 3 raw VALUE and \
+                 INT4 aliases."
+            );
+            return;
+        };
+        let store = BakedStore::open_flm_with_options(
+            Path::new(&flm_path_str),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                verify_block_hashes: true,
+            },
+        )
+        .expect("open tiny qwen3.6 FLM");
+
+        let raw_name = "model.language_model.layers.0.linear_attn.A_log";
+        let raw = store.meta(raw_name).expect("raw FP32 logical tensor");
+        assert_eq!(raw.layout, LayoutTag::Raw);
+        assert_eq!(raw.dtype, "f32");
+        assert_eq!(raw.shape, vec![4]);
+        assert_eq!(raw.byte_len, 16);
+        let raw_view = store
+            .upload_view(raw_name)
+            .expect("raw FP32 direct upload view");
+        assert_eq!(raw_view.dtype, "f32");
+        assert_eq!(raw_view.shape, vec![4]);
+
+        let packed_name = "model.language_model.layers.0.linear_attn.out_proj.weight_packed";
+        let alias_name = "model.language_model.layers.0.linear_attn.out_proj.weight";
+        let packed = store.meta(packed_name).expect("packed INT4 storage tensor");
+        let alias = store.meta(alias_name).expect("logical INT4 alias");
+        assert_eq!(alias.layout, LayoutTag::Int4Quantized);
+        assert_eq!(alias.dtype, "u8");
+        assert_eq!(alias.shape, vec![8, 128]);
+        assert_eq!(alias.offset, packed.offset);
+        assert_eq!(alias.byte_len, packed.byte_len);
+        let alias_view = store
+            .upload_view(alias_name)
+            .expect("logical INT4 direct upload view");
+        assert_eq!(alias_view.dtype, "u8");
+        assert_eq!(alias_view.shape, vec![8, 64]);
+
+        let runtime = store.flm_runtime().expect("runtime directory");
+        let raw_logical = runtime
+            .logical_tensors()
+            .iter()
+            .find(|logical| logical.name == raw_name)
+            .expect("raw logical runtime row");
+        assert_eq!(
+            raw_logical.value_format_id,
+            crate::flm::VALUE_FORMAT_RAW_DENSE
+        );
+    }
+
+    #[test]
+    fn flm_tiny_qwen36_lowbit_aliases_loadable() {
+        let Ok(flm_path_str) = std::env::var("SUPERSONIC_TINY_QWEN36_LOWBIT_FLM") else {
+            eprintln!(
+                "skip: SUPERSONIC_TINY_QWEN36_LOWBIT_FLM not set. Point it at a tiny \
+                 descriptor-produced Qwen3.6 FLM to validate NVFP4/MXFP Stage 3 aliases."
+            );
+            return;
+        };
+        let store = BakedStore::open_flm_with_options(
+            Path::new(&flm_path_str),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                verify_block_hashes: true,
+            },
+        )
+        .expect("open tiny low-bit qwen3.6 FLM");
+
+        let nv_name = "model.language_model.layers.0.linear_attn.out_proj.weight";
+        let nv = store.meta(nv_name).expect("NVFP4 logical tensor");
+        assert_eq!(nv.dtype, "u8");
+        assert_eq!(nv.shape, vec![128, 128]);
+        assert_eq!(
+            store.upload_view(nv_name).expect("NVFP4 upload view"),
+            &TensorUploadView {
+                dtype: "u8".to_string(),
+                shape: vec![128, 64],
+            }
+        );
+        assert!(
+            store.contains("model.language_model.layers.0.linear_attn.out_proj.weight_nvfp4_scale")
+        );
+        assert!(store.contains(
+            "model.language_model.layers.0.linear_attn.out_proj.weight_nvfp4_global_scale"
+        ));
+
+        let mx4_name = "model.language_model.layers.0.linear_attn.in_proj_z.weight";
+        assert_eq!(
+            store.upload_view(mx4_name).expect("MXFP4 upload view"),
+            &TensorUploadView {
+                dtype: "u8".to_string(),
+                shape: vec![64, 64],
+            }
+        );
+        assert!(store
+            .contains("model.language_model.layers.0.linear_attn.in_proj_z.weight_mxfp4_scale"));
+
+        let mx8_name = "model.language_model.layers.0.linear_attn.in_proj_qkv.weight";
+        assert_eq!(
+            store.upload_view(mx8_name).expect("MXFP8 upload view"),
+            &TensorUploadView {
+                dtype: "f8_e4m3".to_string(),
+                shape: vec![32, 128],
+            }
+        );
+        assert!(store
+            .contains("model.language_model.layers.0.linear_attn.in_proj_qkv.weight_mxfp8_scale"));
+
+        let qwen_fp8_name = "model.language_model.layers.0.self_attn.q_proj.weight";
+        assert_eq!(
+            store
+                .upload_view(qwen_fp8_name)
+                .expect("Qwen FP8 block-scale upload view"),
+            &TensorUploadView {
+                dtype: "f8_e4m3".to_string(),
+                shape: vec![8, 128],
+            }
+        );
+        assert!(store.contains(
+            "model.language_model.layers.0.self_attn.q_proj.weight_fp8_e4m3_b128_bf16_scale_inv"
+        ));
+    }
+
+    #[test]
+    fn flm_tiny_qwen36_modelopt_lowbit_aliases_loadable() {
+        let Ok(flm_path_str) = std::env::var("SUPERSONIC_TINY_QWEN36_MODELOPT_FLM") else {
+            eprintln!(
+                "skip: SUPERSONIC_TINY_QWEN36_MODELOPT_FLM not set. Point it at a tiny \
+                 descriptor-produced Qwen3.6 FLM to validate ModelOpt NVFP4/FP8 Stage 3 aliases."
+            );
+            return;
+        };
+        let store = BakedStore::open_flm_with_options(
+            Path::new(&flm_path_str),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                verify_block_hashes: true,
+            },
+        )
+        .expect("open tiny ModelOpt low-bit qwen3.6 FLM");
+
+        let nv_name = "model.language_model.layers.0.linear_attn.out_proj.weight";
+        let nv = store.meta(nv_name).expect("ModelOpt NVFP4 logical tensor");
+        assert_eq!(nv.dtype, "u8");
+        assert_eq!(nv.shape, vec![128, 128]);
+        assert_eq!(
+            store
+                .upload_view(nv_name)
+                .expect("ModelOpt NVFP4 upload view"),
+            &TensorUploadView {
+                dtype: "u8".to_string(),
+                shape: vec![128, 64],
+            }
+        );
+        assert!(store.contains(
+            "model.language_model.layers.0.linear_attn.out_proj.weight_nvfp4_input_scale"
+        ));
+
+        let fp8_name = "model.language_model.layers.0.linear_attn.in_proj_qkv.weight";
+        assert_eq!(
+            store.upload_view(fp8_name).expect("FP8 scalar upload view"),
+            &TensorUploadView {
+                dtype: "f8_e4m3".to_string(),
+                shape: vec![32, 128],
+            }
+        );
+        assert!(store.contains(
+            "model.language_model.layers.0.linear_attn.in_proj_qkv.weight_fp8_e4m3_f32_scale"
+        ));
+        assert!(store.contains(
+            "model.language_model.layers.0.linear_attn.in_proj_qkv.weight_fp8_e4m3_f32_input_scale"
+        ));
+    }
+
+    #[test]
+    fn flm_tiny_qwen36_moe_modelopt_lowbit_aliases_loadable() {
+        let Ok(flm_path_str) = std::env::var("SUPERSONIC_TINY_QWEN36_MOE_FLM") else {
+            eprintln!(
+                "skip: SUPERSONIC_TINY_QWEN36_MOE_FLM not set. Point it at a tiny \
+                 descriptor-produced Qwen3.6 MoE FLM to validate runtime parsing and \
+                 ModelOpt expert aliases."
+            );
+            return;
+        };
+        let store = BakedStore::open_flm_with_options(
+            Path::new(&flm_path_str),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                verify_block_hashes: true,
+            },
+        )
+        .expect("open tiny ModelOpt low-bit qwen3.6 MoE FLM");
+
+        let runtime = store.flm_runtime().expect("runtime directory");
+        assert!(runtime.qwen36_config().is_none());
+        let moe = runtime.qwen36_moe_config().expect("MoE runtime config");
+        assert_eq!(moe.hidden_size, 4);
+        assert_eq!(moe.num_experts, 2);
+        assert_eq!(moe.num_experts_per_tok, 1);
+        assert_eq!(moe.mrope_section, [11, 11, 10]);
+
+        let expert_name = "model.language_model.layers.0.mlp.experts.0.gate_proj.weight";
+        let expert = store
+            .meta(expert_name)
+            .expect("ModelOpt expert logical tensor");
+        assert_eq!(expert.dtype, "u8");
+        assert_eq!(expert.shape, vec![2, 2]);
+        assert_eq!(
+            store
+                .upload_view(expert_name)
+                .expect("ModelOpt expert upload view"),
+            &TensorUploadView {
+                dtype: "u8".to_string(),
+                shape: vec![2, 1],
+            }
+        );
+        assert!(store.contains(
+            "model.language_model.layers.0.mlp.experts.0.gate_proj.weight_nvfp4_input_scale"
+        ));
+    }
+
+    #[test]
+    fn flm_qwen36_35b_nvfp4_preserve_lowbit_loadable() {
+        let Ok(flm_path_str) = std::env::var("SUPERSONIC_QWEN36_35B_NVFP4_FLM") else {
+            eprintln!(
+                "skip: SUPERSONIC_QWEN36_35B_NVFP4_FLM not set. Point it at a \
+                 preserve-lowbit nvidia/Qwen3.6-35B-A3B-NVFP4 FLM to validate \
+                 full MoE ModelOpt aliases."
+            );
+            return;
+        };
+        let store = BakedStore::open_flm_with_options(
+            Path::new(&flm_path_str),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                verify_block_hashes: true,
+            },
+        )
+        .expect("open qwen3.6-35b NVFP4 FLM");
+
+        let runtime = store.flm_runtime().expect("runtime directory");
+        let moe = runtime.qwen36_moe_config().expect("MoE runtime config");
+        assert_eq!(moe.hidden_size, 2048);
+        assert_eq!(moe.num_hidden_layers, 40);
+        assert_eq!(moe.num_experts, 256);
+        assert_eq!(moe.num_experts_per_tok, 8);
+
+        let nvfp4_count = runtime
+            .logical_tensors()
+            .iter()
+            .filter(|logical| logical.value_format_id == crate::flm::VALUE_FORMAT_NVFP4_E2M1)
+            .count();
+        let fp8_scalar_count = runtime
+            .logical_tensors()
+            .iter()
+            .filter(|logical| logical.value_format_id == crate::flm::VALUE_FORMAT_FP8_E4M3_F32)
+            .count();
+        assert_eq!(nvfp4_count, 30_841);
+        assert_eq!(fp8_scalar_count, 130);
+
+        let embed = store
+            .meta("model.language_model.embed_tokens.weight")
+            .expect("embed_tokens missing");
+        assert_eq!(embed.dtype, "bf16");
+        assert_eq!(embed.shape, vec![248320, 2048]);
+        assert_eq!(embed.byte_len, 1_017_118_720);
+
+        let lm_head = store.meta("lm_head.weight").expect("lm_head missing");
+        assert_eq!(lm_head.dtype, "u8");
+        assert_eq!(lm_head.shape, vec![248320, 2048]);
+        assert_eq!(lm_head.byte_len, 254_279_680);
+        assert_eq!(
+            store
+                .upload_view("lm_head.weight")
+                .expect("NVFP4 lm_head upload view"),
+            &TensorUploadView {
+                dtype: "u8".to_string(),
+                shape: vec![248320, 1024],
+            }
+        );
+        assert!(store.contains("lm_head.weight_nvfp4_scale"));
+        assert!(store.contains("lm_head.weight_nvfp4_global_scale"));
+        assert!(store.contains("lm_head.weight_nvfp4_input_scale"));
+
+        let fp8_name = "model.language_model.layers.0.linear_attn.in_proj_qkv.weight";
+        assert_eq!(
+            store.upload_view(fp8_name).expect("FP8 scalar upload view"),
+            &TensorUploadView {
+                dtype: "f8_e4m3".to_string(),
+                shape: vec![8192, 2048],
+            }
+        );
+        assert!(store.contains(
+            "model.language_model.layers.0.linear_attn.in_proj_qkv.weight_fp8_e4m3_f32_scale"
+        ));
+        assert!(store.contains(
+            "model.language_model.layers.0.linear_attn.in_proj_qkv.weight_fp8_e4m3_f32_input_scale"
+        ));
+
+        eprintln!(
+            "[flm-validate] OK — {} tensors including 35B NVFP4/FP8 aliases",
+            store.index.len()
+        );
+    }
+
+    #[test]
+    fn flm_qwen36_35b_mxfp4_preserve_lowbit_loadable() {
+        let Ok(flm_path_str) = std::env::var("SUPERSONIC_QWEN36_35B_MXFP4_FLM") else {
+            eprintln!(
+                "skip: SUPERSONIC_QWEN36_35B_MXFP4_FLM not set. Point it at a \
+                 preserve-lowbit Qwen3.6-35B-A3B-MXFP4 FLM to validate full MoE \
+                 MXFP4 aliases."
+            );
+            return;
+        };
+        let store = BakedStore::open_flm_with_options(
+            Path::new(&flm_path_str),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                verify_block_hashes: true,
+            },
+        )
+        .expect("open qwen3.6-35b MXFP4 FLM");
+
+        let runtime = store.flm_runtime().expect("runtime directory");
+        let moe = runtime.qwen36_moe_config().expect("MoE runtime config");
+        assert_eq!(moe.hidden_size, 2048);
+        assert_eq!(moe.num_hidden_layers, 40);
+        assert_eq!(moe.num_experts, 256);
+        assert_eq!(moe.num_experts_per_tok, 8);
+
+        let raw_count = runtime
+            .logical_tensors()
+            .iter()
+            .filter(|logical| logical.value_format_id == crate::flm::VALUE_FORMAT_RAW_DENSE)
+            .count();
+        let mxfp4_count = runtime
+            .logical_tensors()
+            .iter()
+            .filter(|logical| logical.value_format_id == crate::flm::VALUE_FORMAT_MXFP4_E2M1)
+            .count();
+        assert_eq!(raw_count, 463);
+        assert_eq!(mxfp4_count, 30_870);
+
+        let embed = store
+            .meta("model.language_model.embed_tokens.weight")
+            .expect("embed_tokens missing");
+        assert_eq!(embed.dtype, "bf16");
+        assert_eq!(embed.shape, vec![248320, 2048]);
+        assert_eq!(embed.byte_len, 1_017_118_720);
+
+        let lm_head = store.meta("lm_head.weight").expect("lm_head missing");
+        assert_eq!(lm_head.dtype, "bf16");
+        assert_eq!(lm_head.shape, vec![248320, 2048]);
+        assert_eq!(lm_head.byte_len, 1_017_118_720);
+
+        let qkv_name = "model.language_model.layers.0.linear_attn.in_proj_qkv.weight";
+        let qkv = store.meta(qkv_name).expect("MXFP4 qkv logical alias");
+        assert_eq!(qkv.dtype, "u8");
+        assert_eq!(qkv.shape, vec![8192, 2048]);
+        assert_eq!(qkv.byte_len, 8_388_608);
+        assert_eq!(
+            store.upload_view(qkv_name).expect("MXFP4 qkv upload view"),
+            &TensorUploadView {
+                dtype: "u8".to_string(),
+                shape: vec![8192, 1024],
+            }
+        );
+        let qkv_scale = store
+            .meta("model.language_model.layers.0.linear_attn.in_proj_qkv.weight_mxfp4_scale")
+            .expect("MXFP4 qkv scale alias");
+        assert_eq!(qkv_scale.dtype, "u8");
+        assert_eq!(qkv_scale.shape, vec![8192, 64]);
+
+        let expert_name = "model.language_model.layers.0.mlp.experts.0.gate_proj.weight";
+        let expert = store.meta(expert_name).expect("MXFP4 expert logical alias");
+        assert_eq!(expert.dtype, "u8");
+        assert_eq!(expert.shape, vec![512, 2048]);
+        assert_eq!(expert.byte_len, 524_288);
+        assert_eq!(
+            store
+                .upload_view(expert_name)
+                .expect("MXFP4 expert upload view"),
+            &TensorUploadView {
+                dtype: "u8".to_string(),
+                shape: vec![512, 1024],
+            }
+        );
+        let expert_scale = store
+            .meta("model.language_model.layers.0.mlp.experts.0.gate_proj.weight_mxfp4_scale")
+            .expect("MXFP4 expert scale alias");
+        assert_eq!(expert_scale.dtype, "u8");
+        assert_eq!(expert_scale.shape, vec![512, 64]);
+
+        eprintln!(
+            "[flm-validate] OK — {} tensors including 35B MXFP4 aliases",
+            store.index.len()
+        );
+    }
+
+    #[test]
+    fn flm_qwen36_35b_mxfp8_preserve_lowbit_loadable() {
+        let Ok(flm_path_str) = std::env::var("SUPERSONIC_QWEN36_35B_MXFP8_FLM") else {
+            eprintln!(
+                "skip: SUPERSONIC_QWEN36_35B_MXFP8_FLM not set. Point it at a \
+                 preserve-lowbit mlx-community/Qwen3.6-35B-A3B-mxfp8 FLM to \
+                 validate full MoE MXFP8 aliases."
+            );
+            return;
+        };
+        let store = BakedStore::open_flm_with_options(
+            Path::new(&flm_path_str),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                verify_block_hashes: true,
+            },
+        )
+        .expect("open qwen3.6-35b MXFP8 FLM");
+
+        let runtime = store.flm_runtime().expect("runtime directory");
+        let moe = runtime.qwen36_moe_config().expect("MoE runtime config");
+        assert_eq!(moe.hidden_size, 2048);
+        assert_eq!(moe.num_hidden_layers, 40);
+        assert_eq!(moe.num_experts, 256);
+        assert_eq!(moe.num_experts_per_tok, 8);
+
+        let raw_count = runtime
+            .logical_tensors()
+            .iter()
+            .filter(|logical| logical.value_format_id == crate::flm::VALUE_FORMAT_RAW_DENSE)
+            .count();
+        let mxfp8_count = runtime
+            .logical_tensors()
+            .iter()
+            .filter(|logical| logical.value_format_id == crate::flm::VALUE_FORMAT_MXFP8_E4M3)
+            .count();
+        let fp8_b64_count = runtime
+            .logical_tensors()
+            .iter()
+            .filter(|logical| logical.value_format_id == crate::flm::VALUE_FORMAT_FP8_E4M3_B64_BF16)
+            .count();
+        assert_eq!(raw_count, 221);
+        assert_eq!(mxfp8_count, 432);
+        assert_eq!(fp8_b64_count, 80);
+
+        let embed_name = "model.language_model.embed_tokens.weight";
+        let embed = store.meta(embed_name).expect("MXFP8 embed logical alias");
+        assert_eq!(embed.dtype, "f8_e4m3");
+        assert_eq!(embed.shape, vec![248320, 2048]);
+        assert_eq!(embed.byte_len, 508_559_360);
+        assert_eq!(
+            store
+                .upload_view(embed_name)
+                .expect("MXFP8 embed upload view"),
+            &TensorUploadView {
+                dtype: "f8_e4m3".to_string(),
+                shape: vec![248320, 2048],
+            }
+        );
+        let embed_scale = store
+            .meta("model.language_model.embed_tokens.weight_mxfp8_scale")
+            .expect("MXFP8 embed scale alias");
+        assert_eq!(embed_scale.dtype, "u8");
+        assert_eq!(embed_scale.shape, vec![248320, 64]);
+
+        let qkv_name = "model.language_model.layers.0.linear_attn.in_proj_qkv.weight";
+        let qkv = store.meta(qkv_name).expect("MXFP8 qkv logical alias");
+        assert_eq!(qkv.dtype, "f8_e4m3");
+        assert_eq!(qkv.shape, vec![8192, 2048]);
+        assert_eq!(qkv.byte_len, 16_777_216);
+        let qkv_scale = store
+            .meta("model.language_model.layers.0.linear_attn.in_proj_qkv.weight_mxfp8_scale")
+            .expect("MXFP8 qkv scale alias");
+        assert_eq!(qkv_scale.dtype, "u8");
+        assert_eq!(qkv_scale.shape, vec![8192, 64]);
+
+        let switch_name = "model.language_model.layers.0.mlp.switch_mlp.down_proj.weight";
+        let switch = store
+            .meta(switch_name)
+            .expect("rank-3 MXFP8 switch MLP logical alias");
+        assert_eq!(switch.dtype, "f8_e4m3");
+        assert_eq!(switch.shape, vec![256, 2048, 512]);
+        assert_eq!(switch.byte_len, 268_435_456);
+        assert_eq!(
+            store
+                .upload_view(switch_name)
+                .expect("rank-3 MXFP8 switch MLP upload view"),
+            &TensorUploadView {
+                dtype: "f8_e4m3".to_string(),
+                shape: vec![256, 2048, 512],
+            }
+        );
+        let switch_scale = store
+            .meta("model.language_model.layers.0.mlp.switch_mlp.down_proj.weight_mxfp8_scale")
+            .expect("rank-3 MXFP8 switch MLP scale alias");
+        assert_eq!(switch_scale.dtype, "u8");
+        assert_eq!(switch_scale.shape, vec![256, 2048, 16]);
+
+        let gate_name = "model.language_model.layers.0.mlp.gate.weight";
+        let gate = store
+            .meta(gate_name)
+            .expect("FP8-B64-BF16 gate logical alias");
+        assert_eq!(gate.dtype, "f8_e4m3");
+        assert_eq!(gate.shape, vec![256, 2048]);
+        assert_eq!(gate.byte_len, 524_288);
+        let gate_scale = store
+            .meta("model.language_model.layers.0.mlp.gate.weight_fp8_e4m3_b64_bf16_scale")
+            .expect("FP8-B64-BF16 gate scale alias");
+        assert_eq!(gate_scale.dtype, "bf16");
+        assert_eq!(gate_scale.shape, vec![256, 32]);
+
+        let shared_gate_scale = store
+            .meta(
+                "model.language_model.layers.0.mlp.shared_expert_gate.weight_fp8_e4m3_b64_bf16_scale",
+            )
+            .expect("FP8-B64-BF16 shared expert gate scale alias");
+        assert_eq!(shared_gate_scale.dtype, "bf16");
+        assert_eq!(shared_gate_scale.shape, vec![1, 32]);
+
+        eprintln!(
+            "[flm-validate] OK — {} tensors including 35B MXFP8/FP8-B64 aliases",
+            store.index.len()
+        );
+    }
+
+    #[test]
+    fn flm_qwen36_27b_direct_views_upload_to_hip() {
+        let Ok(flm_path_str) = std::env::var("SUPERSONIC_QWEN36_27B_FLM_HIP_UPLOAD") else {
+            eprintln!(
+                "skip: SUPERSONIC_QWEN36_27B_FLM_HIP_UPLOAD not set. Point it at an FLM \
+                 file like qwen36-27b-int4.flm to validate HIP uploads."
+            );
+            return;
+        };
+        gpu_hal::set_backend(gpu_hal::Backend::Hip);
+        let store = BakedStore::open_flm_with_options(
+            Path::new(&flm_path_str),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                verify_block_hashes: false,
+            },
+        )
+        .expect("open qwen3.6-27b FLM");
+
+        let weight = store
+            .load_to_gpu(
+                "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
+                0,
+            )
+            .expect("upload INT4 logical alias with direct view");
+        assert_eq!(weight.dtype(), ScalarType::U8);
+        assert_eq!(weight.shape(), &[10240, 2560]);
+
+        let scale = store
+            .load_to_gpu(
+                "model.language_model.layers.0.linear_attn.in_proj_qkv.weight_int4_scale",
+                0,
+            )
+            .expect("upload INT4 scale alias with direct view");
+        assert_eq!(scale.dtype(), ScalarType::BF16);
+        assert_eq!(scale.shape(), &[10240, 40]);
+
+        eprintln!("[flm-upload] OK — FLM direct views uploaded to HIP");
+    }
+
+    #[test]
+    fn flm_qwen36_27b_fp8_direct_views_upload_to_hip() {
+        let Ok(flm_path_str) = std::env::var("SUPERSONIC_QWEN36_27B_FP8_FLM_HIP_UPLOAD") else {
+            eprintln!(
+                "skip: SUPERSONIC_QWEN36_27B_FP8_FLM_HIP_UPLOAD not set. Point it at a \
+                 preserve-lowbit Qwen3.6-27B-FP8 FLM to validate HIP uploads."
+            );
+            return;
+        };
+        gpu_hal::set_backend(gpu_hal::Backend::Hip);
+        let store = BakedStore::open_flm_with_options(
+            Path::new(&flm_path_str),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                verify_block_hashes: false,
+            },
+        )
+        .expect("open qwen3.6-27b FP8 FLM");
+
+        let weight = store
+            .load_to_gpu(
+                "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
+                0,
+            )
+            .expect("upload Qwen FP8 logical alias with direct view");
+        assert_eq!(weight.dtype(), ScalarType::F8E4M3);
+        assert_eq!(weight.shape(), &[10240, 5120]);
+
+        let scale = store
+            .load_to_gpu(
+                concat!(
+                    "model.language_model.layers.0.linear_attn.in_proj_qkv.",
+                    "weight_fp8_e4m3_b128_bf16_scale_inv"
+                ),
+                0,
+            )
+            .expect("upload Qwen FP8 scale_inv alias with direct view");
+        assert_eq!(scale.dtype(), ScalarType::BF16);
+        assert_eq!(scale.shape(), &[80, 40]);
+
+        eprintln!("[flm-upload] OK — Qwen FP8 FLM direct views uploaded to HIP");
+    }
+
+    #[test]
+    fn flm_qwen36_27b_nvfp4_direct_views_upload_to_hip() {
+        let Ok(flm_path_str) = std::env::var("SUPERSONIC_QWEN36_27B_NVFP4_FLM_HIP_UPLOAD") else {
+            eprintln!(
+                "skip: SUPERSONIC_QWEN36_27B_NVFP4_FLM_HIP_UPLOAD not set. Point it at a \
+                 preserve-lowbit nvidia/Qwen3.6-27B-NVFP4 FLM to validate HIP uploads."
+            );
+            return;
+        };
+        gpu_hal::set_backend(gpu_hal::Backend::Hip);
+        let store = BakedStore::open_flm_with_options(
+            Path::new(&flm_path_str),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                verify_block_hashes: false,
+            },
+        )
+        .expect("open qwen3.6-27b NVFP4 FLM");
+
+        let mlp = store
+            .load_to_gpu("model.language_model.layers.0.mlp.down_proj.weight", 0)
+            .expect("upload NVFP4 MLP logical alias with direct view");
+        assert_eq!(mlp.dtype(), ScalarType::U8);
+        assert_eq!(mlp.shape(), &[5120, 8704]);
+
+        let fp8 = store
+            .load_to_gpu(
+                "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
+                0,
+            )
+            .expect("upload FP8 scalar logical alias with direct view");
+        assert_eq!(fp8.dtype(), ScalarType::F8E4M3);
+        assert_eq!(fp8.shape(), &[10240, 5120]);
+
+        eprintln!("[flm-upload] OK — 27B NVFP4 FLM direct views uploaded to HIP");
+    }
+
+    #[test]
+    fn flm_qwen36_27b_mxfp4_direct_views_upload_to_hip() {
+        let Ok(flm_path_str) = std::env::var("SUPERSONIC_QWEN36_27B_MXFP4_FLM_HIP_UPLOAD") else {
+            eprintln!(
+                "skip: SUPERSONIC_QWEN36_27B_MXFP4_FLM_HIP_UPLOAD not set. Point it at a \
+                 preserve-lowbit OsaurusAI/Qwen3.6-27B-MXFP4 FLM to validate HIP uploads."
+            );
+            return;
+        };
+        gpu_hal::set_backend(gpu_hal::Backend::Hip);
+        let store = BakedStore::open_flm_with_options(
+            Path::new(&flm_path_str),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                verify_block_hashes: false,
+            },
+        )
+        .expect("open qwen3.6-27b MXFP4 FLM");
+
+        let mlp = store
+            .load_to_gpu("model.language_model.layers.0.mlp.down_proj.weight", 0)
+            .expect("upload MXFP4 MLP logical alias with direct view");
+        assert_eq!(mlp.dtype(), ScalarType::U8);
+        assert_eq!(mlp.shape(), &[5120, 8704]);
+
+        let mlp_scale = store
+            .load_to_gpu(
+                "model.language_model.layers.0.mlp.down_proj.weight_mxfp4_scale",
+                0,
+            )
+            .expect("upload MXFP4 MLP scale alias with direct view");
+        assert_eq!(mlp_scale.dtype(), ScalarType::U8);
+        assert_eq!(mlp_scale.shape(), &[5120, 544]);
+
+        eprintln!("[flm-upload] OK — 27B MXFP4 FLM direct views uploaded to HIP");
+    }
+
+    #[test]
+    fn flm_qwen36_27b_mxfp8_direct_views_upload_to_hip() {
+        let Ok(flm_path_str) = std::env::var("SUPERSONIC_QWEN36_27B_MXFP8_FLM_HIP_UPLOAD") else {
+            eprintln!(
+                "skip: SUPERSONIC_QWEN36_27B_MXFP8_FLM_HIP_UPLOAD not set. Point it at a \
+                 preserve-lowbit mlx-community/Qwen3.6-27B-mxfp8 FLM to validate HIP uploads."
+            );
+            return;
+        };
+        gpu_hal::set_backend(gpu_hal::Backend::Hip);
+        let store = BakedStore::open_flm_with_options(
+            Path::new(&flm_path_str),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                verify_block_hashes: false,
+            },
+        )
+        .expect("open qwen3.6-27b MXFP8 FLM");
+
+        let mlp = store
+            .load_to_gpu("model.language_model.layers.0.mlp.down_proj.weight", 0)
+            .expect("upload MXFP8 MLP logical alias with direct view");
+        assert_eq!(mlp.dtype(), ScalarType::F8E4M3);
+        assert_eq!(mlp.shape(), &[5120, 17408]);
+
+        let mlp_scale = store
+            .load_to_gpu(
+                "model.language_model.layers.0.mlp.down_proj.weight_mxfp8_scale",
+                0,
+            )
+            .expect("upload MXFP8 MLP scale alias with direct view");
+        assert_eq!(mlp_scale.dtype(), ScalarType::U8);
+        assert_eq!(mlp_scale.shape(), &[5120, 544]);
+
+        eprintln!("[flm-upload] OK — 27B MXFP8 FLM direct views uploaded to HIP");
+    }
+
+    #[test]
+    fn flm_qwen36_35b_nvfp4_direct_views_upload_to_hip() {
+        let Ok(flm_path_str) = std::env::var("SUPERSONIC_QWEN36_35B_NVFP4_FLM_HIP_UPLOAD") else {
+            eprintln!(
+                "skip: SUPERSONIC_QWEN36_35B_NVFP4_FLM_HIP_UPLOAD not set. Point it at a \
+                 preserve-lowbit nvidia/Qwen3.6-35B-A3B-NVFP4 FLM to validate HIP uploads."
+            );
+            return;
+        };
+        gpu_hal::set_backend(gpu_hal::Backend::Hip);
+        let store = BakedStore::open_flm_with_options(
+            Path::new(&flm_path_str),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                verify_block_hashes: false,
+            },
+        )
+        .expect("open qwen3.6-35b NVFP4 FLM");
+
+        let expert = store
+            .load_to_gpu(
+                "model.language_model.layers.0.mlp.experts.0.gate_proj.weight",
+                0,
+            )
+            .expect("upload NVFP4 expert logical alias with direct view");
+        assert_eq!(expert.dtype(), ScalarType::U8);
+        assert_eq!(expert.shape(), &[512, 1024]);
+
+        let fp8 = store
+            .load_to_gpu(
+                "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
+                0,
+            )
+            .expect("upload FP8 scalar logical alias with direct view");
+        assert_eq!(fp8.dtype(), ScalarType::F8E4M3);
+        assert_eq!(fp8.shape(), &[8192, 2048]);
+
+        eprintln!("[flm-upload] OK — 35B NVFP4 FLM direct views uploaded to HIP");
+    }
+
+    #[test]
+    fn flm_qwen36_35b_mxfp4_direct_views_upload_to_hip() {
+        let Ok(flm_path_str) = std::env::var("SUPERSONIC_QWEN36_35B_MXFP4_FLM_HIP_UPLOAD") else {
+            eprintln!(
+                "skip: SUPERSONIC_QWEN36_35B_MXFP4_FLM_HIP_UPLOAD not set. Point it at a \
+                 preserve-lowbit Qwen3.6-35B-A3B-MXFP4 FLM to validate HIP uploads."
+            );
+            return;
+        };
+        gpu_hal::set_backend(gpu_hal::Backend::Hip);
+        let store = BakedStore::open_flm_with_options(
+            Path::new(&flm_path_str),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                verify_block_hashes: false,
+            },
+        )
+        .expect("open qwen3.6-35b MXFP4 FLM");
+
+        let expert = store
+            .load_to_gpu(
+                "model.language_model.layers.0.mlp.experts.0.gate_proj.weight",
+                0,
+            )
+            .expect("upload MXFP4 expert logical alias with direct view");
+        assert_eq!(expert.dtype(), ScalarType::U8);
+        assert_eq!(expert.shape(), &[512, 1024]);
+
+        let expert_scale = store
+            .load_to_gpu(
+                "model.language_model.layers.0.mlp.experts.0.gate_proj.weight_mxfp4_scale",
+                0,
+            )
+            .expect("upload MXFP4 expert scale alias with direct view");
+        assert_eq!(expert_scale.dtype(), ScalarType::U8);
+        assert_eq!(expert_scale.shape(), &[512, 64]);
+
+        eprintln!("[flm-upload] OK — 35B MXFP4 FLM direct views uploaded to HIP");
+    }
+
+    #[test]
+    fn flm_qwen36_35b_mxfp8_direct_views_upload_to_hip() {
+        let Ok(flm_path_str) = std::env::var("SUPERSONIC_QWEN36_35B_MXFP8_FLM_HIP_UPLOAD") else {
+            eprintln!(
+                "skip: SUPERSONIC_QWEN36_35B_MXFP8_FLM_HIP_UPLOAD not set. Point it at a \
+                 preserve-lowbit mlx-community/Qwen3.6-35B-A3B-mxfp8 FLM to validate HIP uploads."
+            );
+            return;
+        };
+        gpu_hal::set_backend(gpu_hal::Backend::Hip);
+        let store = BakedStore::open_flm_with_options(
+            Path::new(&flm_path_str),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                verify_block_hashes: false,
+            },
+        )
+        .expect("open qwen3.6-35b MXFP8 FLM");
+
+        let shared = store
+            .load_to_gpu(
+                "model.language_model.layers.0.mlp.shared_expert.down_proj.weight",
+                0,
+            )
+            .expect("upload MXFP8 shared expert logical alias with direct view");
+        assert_eq!(shared.dtype(), ScalarType::F8E4M3);
+        assert_eq!(shared.shape(), &[2048, 512]);
+
+        let shared_scale = store
+            .load_to_gpu(
+                "model.language_model.layers.0.mlp.shared_expert.down_proj.weight_mxfp8_scale",
+                0,
+            )
+            .expect("upload MXFP8 shared expert scale alias with direct view");
+        assert_eq!(shared_scale.dtype(), ScalarType::U8);
+        assert_eq!(shared_scale.shape(), &[2048, 16]);
+
+        let gate = store
+            .load_to_gpu("model.language_model.layers.0.mlp.gate.weight", 0)
+            .expect("upload FP8-B64-BF16 gate logical alias with direct view");
+        assert_eq!(gate.dtype(), ScalarType::F8E4M3);
+        assert_eq!(gate.shape(), &[256, 2048]);
+
+        let gate_scale = store
+            .load_to_gpu(
+                "model.language_model.layers.0.mlp.gate.weight_fp8_e4m3_b64_bf16_scale",
+                0,
+            )
+            .expect("upload FP8-B64-BF16 gate scale alias with direct view");
+        assert_eq!(gate_scale.dtype(), ScalarType::BF16);
+        assert_eq!(gate_scale.shape(), &[256, 32]);
+
+        eprintln!("[flm-upload] OK — 35B MXFP8 FLM direct views uploaded to HIP");
     }
 
     #[test]

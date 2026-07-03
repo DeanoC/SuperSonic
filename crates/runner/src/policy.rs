@@ -19,9 +19,11 @@ pub(crate) fn validate_global_flags(
 ) -> Result<()> {
     let q4km_like = q4km_like(cli);
     let profile = crate::bakes::effective_quant_profile(cli)?;
+    let has_flm_source = crate::bakes::effective_flm_source(cli).is_some();
     if cli.q4km && cli.q4km_gptq {
         anyhow::bail!("--q4km is mutually exclusive with --q4km-gptq");
     }
+    crate::bakes::validate_effective_flm_source_model(cli, model_variant)?;
     if q4km_like && cli.int8 {
         anyhow::bail!("--q4km/--q4km-gptq are mutually exclusive with --int8");
     }
@@ -58,6 +60,15 @@ pub(crate) fn validate_global_flags(
         anyhow::bail!(
             "--q4km-gptq is currently supported on CUDA Qwen paths, HIP Qwen3.5/3.6 paths, and Metal Qwen3.5/3.6 MoE"
         );
+    }
+    if has_flm_source && cli.no_bake {
+        anyhow::bail!("FLM sources and --no-bake are mutually exclusive");
+    }
+    if has_flm_source && q4km_like {
+        anyhow::bail!("FLM sources are not wired for --q4km/--q4km-gptq bakes");
+    }
+    if has_flm_source && cli.int8 {
+        anyhow::bail!("FLM sources are not wired for --int8 bakes");
     }
     if matches!(model_variant.family(), ModelFamily::Qwen3Moe) {
         if !cli.int4 || profile != QuantProfile::Int4Gptq {
@@ -145,6 +156,82 @@ mod tests {
         let mut args = vec!["supersonic", "--model-dir", "/tmp/model", "--dry-run"];
         args.extend_from_slice(extra);
         Cli::parse_from(args)
+    }
+
+    fn cli_with_model_dir(model_dir: &str, extra: &[&str]) -> Cli {
+        let mut args = vec!["supersonic", "--model-dir", model_dir, "--dry-run"];
+        args.extend_from_slice(extra);
+        Cli::parse_from(args)
+    }
+
+    #[test]
+    fn rejects_flm_file_for_non_qwen36_dense_model() {
+        let err = validate_global_flags(
+            &cli(&["--flm-file", "/tmp/model.flm"]),
+            &ModelVariant::Gemma4_E2B,
+            Backend::Hip,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("FLM"), "{err}");
+        assert!(err.contains("qwen3.6-27b"), "{err}");
+    }
+
+    #[test]
+    fn rejects_flm_model_dir_for_non_qwen36_dense_model() {
+        let err = validate_global_flags(
+            &cli_with_model_dir("/tmp/model.flm", &[]),
+            &ModelVariant::Phi4_Mini,
+            Backend::Hip,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("FLM"), "{err}");
+        assert!(err.contains("qwen3.6-27b"), "{err}");
+    }
+
+    #[test]
+    fn rejects_flm_model_dir_with_no_bake() {
+        let err = validate_global_flags(
+            &cli_with_model_dir("/tmp/model.flm", &["--no-bake"]),
+            &ModelVariant::Qwen3_6_27B,
+            Backend::Hip,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("FLM"), "{err}");
+        assert!(err.contains("--no-bake"), "{err}");
+    }
+
+    #[test]
+    fn rejects_flm_model_dir_with_q4km() {
+        let err = validate_global_flags(
+            &cli_with_model_dir("/tmp/model.flm", &["--q4km"]),
+            &ModelVariant::Qwen3_6_27B,
+            Backend::Hip,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("FLM"), "{err}");
+        assert!(err.contains("--q4km"), "{err}");
+    }
+
+    #[test]
+    fn rejects_flm_model_dir_with_int8() {
+        let err = validate_global_flags(
+            &cli_with_model_dir("/tmp/model.flm", &["--int8"]),
+            &ModelVariant::Qwen3_6_27B,
+            Backend::Hip,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("FLM"), "{err}");
+        assert!(err.contains("--int8"), "{err}");
     }
 
     #[test]

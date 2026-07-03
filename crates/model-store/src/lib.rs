@@ -1,5 +1,6 @@
 pub mod baker;
 pub mod fetch;
+pub mod flm;
 pub mod manifest;
 pub mod store;
 pub mod transforms;
@@ -9,7 +10,10 @@ use std::path::{Path, PathBuf};
 use manifest::{Manifest, QuantProfile, CONVERTER_VERSION, FORMAT_VERSION};
 
 pub use baker::{bake_phi4, bake_qwen35};
-pub use store::BakedStore;
+pub use flm::{
+    FlmAsset, FlmQwen36DenseConfig, FlmQwen36MoeConfig, FlmRuntimeDirectory, FlmTokenizerDescriptor,
+};
+pub use store::{BakedStore, FlmLoadOptions};
 
 /// Error type for bake and load operations.
 #[derive(Debug, thiserror::Error)]

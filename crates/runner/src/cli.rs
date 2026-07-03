@@ -11,9 +11,17 @@ pub(crate) struct Cli {
     #[arg(long, default_value = "qwen3.5-0.8b")]
     pub(crate) model: String,
 
-    /// Path to HuggingFace model directory (containing config.json + safetensors)
+    /// Path to a HuggingFace model directory or self-contained FLM container.
     #[arg(long)]
     pub(crate) model_dir: PathBuf,
+
+    /// Compatibility override for FLM weights. Prefer --model-dir model.flm.
+    #[arg(long)]
+    pub(crate) flm_file: Option<PathBuf>,
+
+    /// Verify BLAKE3 FLM payload hashes before using an FLM source.
+    #[arg(long)]
+    pub(crate) verify_flm_hashes: bool,
 
     /// Text prompt (will be tokenized). Required unless --dry-run is set.
     #[arg(long, required_unless_present = "dry_run", default_value = "")]
@@ -543,4 +551,23 @@ pub(crate) struct Cli {
     ///   coverage and future research.
     #[arg(long, default_value = "cosine")]
     pub(crate) specprefill_algorithm: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+
+    use super::Cli;
+
+    #[test]
+    fn help_advertises_flm_model_dir_as_main_path() {
+        let mut cmd = Cli::command();
+        let mut help = Vec::new();
+        cmd.write_long_help(&mut help).unwrap();
+        let help = String::from_utf8(help).unwrap();
+
+        assert!(help.contains("self-contained FLM container"), "{help}");
+        assert!(help.contains("Prefer --model-dir model.flm"), "{help}");
+        assert!(help.contains("--verify-flm-hashes"), "{help}");
+    }
 }
