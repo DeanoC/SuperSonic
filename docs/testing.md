@@ -90,7 +90,8 @@ SUPERSONIC_QWEN36_27B_NO_HF_FLM=/mnt/data/runs/geo-quant/qwen36-27b-int4-stage3-
 ```
 
 The runner smoke asserts that config, tokenizer, and weights come from FLM,
-that BLAKE3 verification is enabled, and that no `[fetch]` or `[bake]` path is
+that BLAKE3 verification is enabled on the single FLM source open, that weights
+load from the already-open source, and that no `[fetch]` or `[bake]` path is
 entered.
 
 ### Adding tests for a new machine
