@@ -73,7 +73,7 @@ fn flm_startup_open_options(cli: &Cli) -> Result<FlmModelSourceOptions> {
     let profile = effective_quant_profile(cli)?;
     Ok(FlmModelSourceOptions {
         int4_runtime: profile.is_native_int4_runtime(),
-        verify_block_hashes: cli.verify_flm_hashes,
+        verify_block_hashes: false,
     })
 }
 
@@ -199,13 +199,23 @@ mod tests {
     }
 
     #[test]
-    fn flm_startup_open_options_track_cli_runtime_flags() {
+    fn flm_startup_open_options_track_cli_quant_flags() {
+        let cli = cli("/tmp/model.flm", &["--int4"]);
+
+        let options = flm_startup_open_options(&cli).expect("valid quant flags");
+
+        assert!(options.int4_runtime);
+        assert!(!options.verify_block_hashes);
+    }
+
+    #[test]
+    fn flm_startup_open_options_defer_payload_hash_verification_to_weights() {
         let cli = cli("/tmp/model.flm", &["--int4", "--verify-flm-hashes"]);
 
         let options = flm_startup_open_options(&cli).expect("valid quant flags");
 
         assert!(options.int4_runtime);
-        assert!(options.verify_block_hashes);
+        assert!(!options.verify_block_hashes);
     }
 
     #[test]

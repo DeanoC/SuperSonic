@@ -19,7 +19,7 @@ pub(crate) struct Cli {
     #[arg(long)]
     pub(crate) flm_file: Option<PathBuf>,
 
-    /// Verify BLAKE3 FLM payload hashes before using an FLM source.
+    /// Verify BLAKE3 FLM tensor payload hashes while loading FLM weights.
     #[arg(long)]
     pub(crate) verify_flm_hashes: bool,
 
