@@ -5,6 +5,21 @@ pub fn is_flm_model_path(path: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FlmModelSourceOptions {
+    pub int4_runtime: bool,
+    pub verify_block_hashes: bool,
+}
+
+impl FlmModelSourceOptions {
+    pub fn to_load_options(self) -> model_store::FlmLoadOptions {
+        model_store::FlmLoadOptions {
+            flm_int4_logical_aliases: self.int4_runtime,
+            verify_block_hashes: self.verify_block_hashes,
+        }
+    }
+}
+
 pub struct FlmModelSource {
     pub path: std::path::PathBuf,
     pub store: model_store::BakedStore,
@@ -12,23 +27,35 @@ pub struct FlmModelSource {
 
 impl FlmModelSource {
     pub fn open(path: &std::path::Path, int4_runtime: bool) -> anyhow::Result<Self> {
-        let store = model_store::BakedStore::open_flm_with_options(
+        Self::open_with_options(
             path,
-            model_store::FlmLoadOptions {
-                flm_int4_logical_aliases: int4_runtime,
+            FlmModelSourceOptions {
+                int4_runtime,
                 ..Default::default()
             },
-        )?;
+        )
+    }
+
+    pub fn open_with_options(
+        path: &std::path::Path,
+        options: FlmModelSourceOptions,
+    ) -> anyhow::Result<Self> {
+        let store =
+            model_store::BakedStore::open_flm_with_options(path, options.to_load_options())?;
         Ok(Self {
             path: path.to_path_buf(),
             store,
         })
     }
 
+    pub fn runtime(&self) -> anyhow::Result<&model_store::FlmRuntimeDirectory> {
+        self.store
+            .flm_runtime()
+            .ok_or_else(|| anyhow::anyhow!("FLM {} has no runtime directory", self.path.display()))
+    }
+
     pub fn qwen_config(&self) -> anyhow::Result<qwen35::config::Config> {
-        let runtime = self.store.flm_runtime().ok_or_else(|| {
-            anyhow::anyhow!("FLM {} has no runtime directory", self.path.display())
-        })?;
+        let runtime = self.runtime()?;
         let cfg = runtime.qwen36_config().ok_or_else(|| {
             anyhow::anyhow!("FLM {} is not Qwen3.6 dense v1", self.path.display())
         })?;
@@ -39,6 +66,11 @@ impl FlmModelSource {
             )
         })?;
         Ok(config.normalized())
+    }
+
+    pub fn qwen_tokenizer(&self) -> anyhow::Result<tokenizers::Tokenizer> {
+        crate::flm_tokenizer::load_qwen_bpe_from_flm(self.runtime()?)
+            .map_err(|e| anyhow::anyhow!("loading FLM Qwen tokenizer: {e}"))
     }
 }
 
@@ -52,5 +84,25 @@ mod tests {
         assert!(is_flm_model_path(std::path::Path::new("QWEN36.FLM")));
         assert!(!is_flm_model_path(std::path::Path::new("qwen36")));
         assert!(!is_flm_model_path(std::path::Path::new("qwen36.bin")));
+    }
+
+    #[test]
+    fn open_options_enable_int4_aliases_and_hash_verification() {
+        let load = FlmModelSourceOptions {
+            int4_runtime: true,
+            verify_block_hashes: true,
+        }
+        .to_load_options();
+
+        assert!(load.flm_int4_logical_aliases);
+        assert!(load.verify_block_hashes);
+    }
+
+    #[test]
+    fn default_open_options_do_not_enable_runtime_conversions_or_hashes() {
+        let load = FlmModelSourceOptions::default().to_load_options();
+
+        assert!(!load.flm_int4_logical_aliases);
+        assert!(!load.verify_block_hashes);
     }
 }
