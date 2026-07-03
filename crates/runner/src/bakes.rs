@@ -5,7 +5,7 @@ use std::time::Instant;
 use anyhow::Result;
 use model_store::manifest::QuantProfile;
 
-use crate::flm_model_source::is_flm_model_path;
+use crate::flm_model_source::{is_flm_model_path, FlmModelSourceOptions};
 use crate::registry::ModelVariant;
 use crate::Cli;
 
@@ -223,6 +223,14 @@ pub(crate) fn validate_flm_weight_source_options(cli: &Cli, q4km_like: bool) -> 
         anyhow::bail!("FLM sources are not wired for --int8 bakes");
     }
     Ok(())
+}
+
+pub(crate) fn flm_source_open_options(cli: &Cli) -> Result<FlmModelSourceOptions> {
+    let profile = effective_quant_profile(cli)?;
+    Ok(FlmModelSourceOptions {
+        int4_runtime: profile.is_native_int4_runtime(),
+        verify_block_hashes: cli.verify_flm_hashes,
+    })
 }
 
 pub(crate) fn load_qwen35_weights(
@@ -504,8 +512,9 @@ mod tests {
 
     use super::{
         effective_flm_source, effective_quant_profile, ensure_hf_metadata_present,
-        flm_source_is_authoritative_for_model, should_fetch_bake, should_fetch_exact_bake,
-        validate_effective_flm_source_model, validate_flm_weight_source_options,
+        flm_source_is_authoritative_for_model, flm_source_open_options, should_fetch_bake,
+        should_fetch_exact_bake, validate_effective_flm_source_model,
+        validate_flm_weight_source_options,
     };
     use crate::registry::ModelVariant;
     use crate::Cli;
@@ -605,6 +614,26 @@ mod tests {
             effective_flm_source(&cli),
             Some(Path::new("/tmp/model-dir.flm"))
         );
+    }
+
+    #[test]
+    fn flm_source_open_options_enable_hash_verification_for_single_source() {
+        let cli = cli_with_model_dir("/tmp/model.flm", &["--int4", "--verify-flm-hashes"]);
+
+        let options = flm_source_open_options(&cli).expect("valid FLM source options");
+
+        assert!(options.int4_runtime);
+        assert!(options.verify_block_hashes);
+    }
+
+    #[test]
+    fn flm_source_open_options_keep_hash_verification_opt_in() {
+        let cli = cli_with_model_dir("/tmp/model.flm", &["--int4"]);
+
+        let options = flm_source_open_options(&cli).expect("valid FLM source options");
+
+        assert!(options.int4_runtime);
+        assert!(!options.verify_block_hashes);
     }
 
     #[test]

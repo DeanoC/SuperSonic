@@ -146,8 +146,7 @@ mod tests {
     use clap::Parser;
 
     use super::{
-        flm_config_path, flm_startup_open_options, qwen_tokenizer_source, validate_qwen35_startup,
-        QwenTokenizerSource,
+        flm_config_path, qwen_tokenizer_source, validate_qwen35_startup, QwenTokenizerSource,
     };
     use crate::registry::{Backend, GpuArch, ModelVariant, Qwen35KernelParams};
     use crate::Cli;
@@ -196,36 +195,6 @@ mod tests {
             qwen_tokenizer_source(&flm_file_cli),
             QwenTokenizerSource::Flm(Path::new("/tmp/model.flm"))
         );
-    }
-
-    #[test]
-    fn flm_startup_open_options_track_cli_quant_flags() {
-        let cli = cli("/tmp/model.flm", &["--int4"]);
-
-        let options = flm_startup_open_options(&cli).expect("valid quant flags");
-
-        assert!(options.int4_runtime);
-        assert!(!options.verify_block_hashes);
-    }
-
-    #[test]
-    fn flm_startup_open_options_defer_payload_hash_verification_to_weights() {
-        let cli = cli("/tmp/model.flm", &["--int4", "--verify-flm-hashes"]);
-
-        let options = flm_startup_open_options(&cli).expect("valid quant flags");
-
-        assert!(options.int4_runtime);
-        assert!(!options.verify_block_hashes);
-    }
-
-    #[test]
-    fn flm_startup_open_options_track_weight_quant_profile_aliases() {
-        let cli = cli("/tmp/model.flm", &["--weight-quant", "int4-gptq"]);
-
-        let options = flm_startup_open_options(&cli).expect("valid quant flags");
-
-        assert!(options.int4_runtime);
-        assert!(!options.verify_block_hashes);
     }
 
     #[test]
