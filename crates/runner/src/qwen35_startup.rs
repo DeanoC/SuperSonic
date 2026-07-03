@@ -2,7 +2,7 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use crate::bakes::validate_effective_flm_source_model;
+use crate::bakes::{effective_quant_profile, validate_effective_flm_source_model};
 use crate::flm_model_source::{is_flm_model_path, FlmModelSource, FlmModelSourceOptions};
 use crate::registry::{Backend, GpuArch, ModelVariant, Qwen35KernelParams};
 use crate::Cli;
@@ -64,16 +64,17 @@ fn open_flm_startup_source(cli: &Cli) -> Result<Option<FlmModelSource>> {
     let Some(path) = flm_config_path(cli) else {
         return Ok(None);
     };
-    FlmModelSource::open_with_options(path, flm_startup_open_options(cli))
+    FlmModelSource::open_with_options(path, flm_startup_open_options(cli)?)
         .map(Some)
         .map_err(|e| anyhow::anyhow!("opening FLM startup source {}: {e}", path.display()))
 }
 
-fn flm_startup_open_options(cli: &Cli) -> FlmModelSourceOptions {
-    FlmModelSourceOptions {
-        int4_runtime: cli.int4,
+fn flm_startup_open_options(cli: &Cli) -> Result<FlmModelSourceOptions> {
+    let profile = effective_quant_profile(cli)?;
+    Ok(FlmModelSourceOptions {
+        int4_runtime: profile.is_native_int4_runtime(),
         verify_block_hashes: cli.verify_flm_hashes,
-    }
+    })
 }
 
 fn load_qwen35_config(
@@ -201,10 +202,20 @@ mod tests {
     fn flm_startup_open_options_track_cli_runtime_flags() {
         let cli = cli("/tmp/model.flm", &["--int4", "--verify-flm-hashes"]);
 
-        let options = flm_startup_open_options(&cli);
+        let options = flm_startup_open_options(&cli).expect("valid quant flags");
 
         assert!(options.int4_runtime);
         assert!(options.verify_block_hashes);
+    }
+
+    #[test]
+    fn flm_startup_open_options_track_weight_quant_profile_aliases() {
+        let cli = cli("/tmp/model.flm", &["--weight-quant", "int4-gptq"]);
+
+        let options = flm_startup_open_options(&cli).expect("valid quant flags");
+
+        assert!(options.int4_runtime);
+        assert!(!options.verify_block_hashes);
     }
 
     #[test]

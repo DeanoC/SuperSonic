@@ -26,16 +26,6 @@ pub struct FlmModelSource {
 }
 
 impl FlmModelSource {
-    pub fn open(path: &std::path::Path, int4_runtime: bool) -> anyhow::Result<Self> {
-        Self::open_with_options(
-            path,
-            FlmModelSourceOptions {
-                int4_runtime,
-                ..Default::default()
-            },
-        )
-    }
-
     pub fn open_with_options(
         path: &std::path::Path,
         options: FlmModelSourceOptions,
