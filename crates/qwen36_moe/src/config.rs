@@ -234,6 +234,141 @@ impl Config {
         self.text_config = self.text_config.normalized();
         self
     }
+
+    pub fn try_from_flm_qwen36_moe(flm: &model_store::FlmQwen36MoeConfig) -> Result<Self, String> {
+        validate_positive("vocab_size", flm.vocab_size)?;
+        validate_positive("hidden_size", flm.hidden_size)?;
+        validate_positive("moe_intermediate_size", flm.moe_intermediate_size)?;
+        validate_positive(
+            "shared_expert_intermediate_size",
+            flm.shared_expert_intermediate_size,
+        )?;
+        validate_positive("num_hidden_layers", flm.num_hidden_layers)?;
+        validate_positive("num_attention_heads", flm.num_attention_heads)?;
+        validate_positive("num_key_value_heads", flm.num_key_value_heads)?;
+        validate_positive("head_dim", flm.head_dim)?;
+        validate_positive("max_position_embeddings", flm.max_position_embeddings)?;
+        validate_positive("linear_conv_kernel_dim", flm.linear_conv_kernel_dim)?;
+        validate_positive("linear_key_head_dim", flm.linear_key_head_dim)?;
+        validate_positive("linear_value_head_dim", flm.linear_value_head_dim)?;
+        validate_positive("linear_num_key_heads", flm.linear_num_key_heads)?;
+        validate_positive("linear_num_value_heads", flm.linear_num_value_heads)?;
+        validate_positive("num_experts", flm.num_experts)?;
+        validate_positive("num_experts_per_tok", flm.num_experts_per_tok)?;
+        validate_positive_finite("rms_norm_eps", flm.rms_norm_eps)?;
+        validate_positive_finite("rope_theta", flm.rope_theta)?;
+        validate_positive_finite("partial_rotary_factor", flm.partial_rotary_factor)?;
+        if flm.partial_rotary_factor > 1.0 {
+            return Err(format!(
+                "partial_rotary_factor must be <= 1.0, got {}",
+                flm.partial_rotary_factor
+            ));
+        }
+        if flm.num_experts_per_tok > flm.num_experts {
+            return Err(format!(
+                "num_experts_per_tok {} must be <= num_experts {}",
+                flm.num_experts_per_tok, flm.num_experts
+            ));
+        }
+        let rotary_dim = flm.head_dim as f64 * flm.partial_rotary_factor;
+        let rounded_rotary_dim = rotary_dim.round();
+        if (rotary_dim - rounded_rotary_dim).abs() > f64::EPSILON {
+            return Err(format!(
+                "rotary_dim must be an integer, got head_dim {} * partial_rotary_factor {} = {}",
+                flm.head_dim, flm.partial_rotary_factor, rotary_dim
+            ));
+        }
+
+        let hidden_act = activation_from_flm_id(flm.activation_id)?;
+        let mut layer_types = vec!["linear_attention".to_string(); flm.num_hidden_layers];
+        for &idx in &flm.full_attention_layers {
+            let slot = layer_types.get_mut(idx).ok_or_else(|| {
+                format!(
+                    "full_attention_layers contains {idx}, but num_hidden_layers is {}",
+                    flm.num_hidden_layers
+                )
+            })?;
+            *slot = "full_attention".to_string();
+        }
+
+        let config = Self {
+            text_config: TextConfig {
+                vocab_size: flm.vocab_size,
+                hidden_size: flm.hidden_size,
+                num_hidden_layers: flm.num_hidden_layers,
+                num_attention_heads: flm.num_attention_heads,
+                num_key_value_heads: flm.num_key_value_heads,
+                max_position_embeddings: flm.max_position_embeddings,
+                rms_norm_eps: flm.rms_norm_eps,
+                hidden_act,
+                tie_word_embeddings: flm.tie_word_embeddings,
+                eos_token_id: Some(serde_json::Value::Array(
+                    flm.eos_token_ids
+                        .iter()
+                        .map(|&id| serde_json::json!(id))
+                        .collect(),
+                )),
+                bos_token_id: None,
+                head_dim: flm.head_dim,
+                full_attention_interval: 4,
+                attn_output_gate: flm.attn_output_gate,
+                linear_conv_kernel_dim: flm.linear_conv_kernel_dim,
+                linear_key_head_dim: flm.linear_key_head_dim,
+                linear_value_head_dim: flm.linear_value_head_dim,
+                linear_num_key_heads: flm.linear_num_key_heads,
+                linear_num_value_heads: flm.linear_num_value_heads,
+                layer_types,
+                rope_parameters: Some(RopeParameters {
+                    rope_type: "default".to_string(),
+                    rope_theta: flm.rope_theta,
+                    partial_rotary_factor: flm.partial_rotary_factor,
+                    mrope_interleaved: flm.mrope_interleaved,
+                    mrope_section: flm.mrope_section.iter().map(|&v| v as usize).collect(),
+                }),
+                num_experts: flm.num_experts,
+                num_experts_per_tok: flm.num_experts_per_tok,
+                moe_intermediate_size: flm.moe_intermediate_size,
+                shared_expert_intermediate_size: flm.shared_expert_intermediate_size,
+                norm_topk_prob: true,
+                router_aux_loss_coef: 0.001,
+                mlp_only_layers: Vec::new(),
+                decoder_sparse_step: None,
+            },
+            architectures: vec!["Qwen3_5MoeForConditionalGeneration".to_string()],
+            model_type: Some("qwen3_5_moe".to_string()),
+        }
+        .normalized();
+
+        validate(&config)?;
+        Ok(config)
+    }
+}
+
+fn validate_positive(field: &str, value: usize) -> Result<(), String> {
+    if value == 0 {
+        Err(format!("{field} must be non-zero"))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_positive_finite(field: &str, value: f64) -> Result<(), String> {
+    if !value.is_finite() {
+        Err(format!("{field} must be finite"))
+    } else if value <= 0.0 {
+        Err(format!("{field} must be positive"))
+    } else {
+        Ok(())
+    }
+}
+
+fn activation_from_flm_id(activation_id: u8) -> Result<Activation, String> {
+    match activation_id {
+        0 => Ok(Activation::Gelu),
+        1 => Ok(Activation::Silu),
+        2 => Ok(Activation::Swiglu),
+        _ => Err(format!("unknown activation_id {activation_id}")),
+    }
 }
 
 pub fn load_config(model_dir: &std::path::Path) -> Result<Config, String> {
@@ -451,6 +586,93 @@ mod tests {
         assert_eq!(t.bos_token_ids(), vec![248044]);
 
         assert_eq!(t.kv_bytes_per_token(2), (2 * 2 * 256 * 2 * 10) as u64);
+    }
+
+    fn flm_qwen36_moe_descriptor() -> model_store::FlmQwen36MoeConfig {
+        model_store::FlmQwen36MoeConfig {
+            vocab_size: 248320,
+            hidden_size: 2048,
+            moe_intermediate_size: 512,
+            shared_expert_intermediate_size: 512,
+            num_hidden_layers: 40,
+            num_attention_heads: 16,
+            num_key_value_heads: 2,
+            head_dim: 256,
+            max_position_embeddings: 262144,
+            linear_conv_kernel_dim: 4,
+            linear_key_head_dim: 128,
+            linear_value_head_dim: 128,
+            linear_num_key_heads: 16,
+            linear_num_value_heads: 32,
+            num_experts: 256,
+            num_experts_per_tok: 8,
+            mtp_num_hidden_layers: 0,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10_000_000.0,
+            partial_rotary_factor: 0.25,
+            activation_id: 1,
+            tie_word_embeddings: false,
+            attn_output_gate: true,
+            mtp_use_dedicated_embeddings: false,
+            mrope_interleaved: true,
+            eos_token_ids: vec![248044],
+            full_attention_layers: (3..40).step_by(4).collect(),
+            mrope_section: [11, 11, 10],
+        }
+    }
+
+    #[test]
+    fn builds_text_config_from_flm_qwen36_moe_descriptor() {
+        let config = Config::try_from_flm_qwen36_moe(&flm_qwen36_moe_descriptor())
+            .expect("valid FLM MoE descriptor")
+            .normalized();
+
+        let text = &config.text_config;
+        assert_eq!(text.vocab_size, 248320);
+        assert_eq!(text.hidden_size, 2048);
+        assert_eq!(text.num_hidden_layers, 40);
+        assert_eq!(text.num_full_attention_layers(), 10);
+        assert_eq!(text.num_linear_attention_layers(), 30);
+        assert_eq!(text.num_experts, 256);
+        assert_eq!(text.num_experts_per_tok, 8);
+        assert_eq!(text.linear_value_dim(), 4096);
+        assert_eq!(text.rope_theta(), 10_000_000.0);
+        assert_eq!(text.eos_token_ids(), vec![248044]);
+        assert!(text.attn_output_gate);
+        assert_eq!(
+            text.rope_parameters.as_ref().unwrap().mrope_section,
+            vec![11, 11, 10]
+        );
+    }
+
+    #[test]
+    fn rejects_flm_qwen36_moe_descriptor_with_bad_expert_topk() {
+        let mut flm = flm_qwen36_moe_descriptor();
+        flm.num_experts_per_tok = 257;
+
+        let err = Config::try_from_flm_qwen36_moe(&flm).unwrap_err();
+
+        assert!(err.contains("num_experts_per_tok"), "{err}");
+    }
+
+    #[test]
+    fn rejects_flm_qwen36_moe_descriptor_with_bad_full_attention_layer() {
+        let mut flm = flm_qwen36_moe_descriptor();
+        flm.full_attention_layers.push(40);
+
+        let err = Config::try_from_flm_qwen36_moe(&flm).unwrap_err();
+
+        assert!(err.contains("full_attention_layers"), "{err}");
+    }
+
+    #[test]
+    fn rejects_flm_qwen36_moe_descriptor_with_unknown_activation() {
+        let mut flm = flm_qwen36_moe_descriptor();
+        flm.activation_id = 99;
+
+        let err = Config::try_from_flm_qwen36_moe(&flm).unwrap_err();
+
+        assert!(err.contains("activation_id"), "{err}");
     }
 
     #[test]

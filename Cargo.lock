@@ -1460,6 +1460,7 @@ name = "qwen36_moe"
 version = "0.1.0"
 dependencies = [
  "memmap2",
+ "model-store",
  "safetensors",
  "serde",
  "serde_json",

@@ -58,6 +58,19 @@ impl FlmModelSource {
         Ok(config.normalized())
     }
 
+    pub fn qwen_moe_config(&self) -> anyhow::Result<qwen36_moe::config::Config> {
+        let runtime = self.runtime()?;
+        let cfg = runtime
+            .qwen36_moe_config()
+            .ok_or_else(|| anyhow::anyhow!("FLM {} is not Qwen3.6 MoE v1", self.path.display()))?;
+        qwen36_moe::config::Config::try_from_flm_qwen36_moe(cfg).map_err(|e| {
+            anyhow::anyhow!(
+                "invalid FLM Qwen3.6 MoE config in {}: {e}",
+                self.path.display()
+            )
+        })
+    }
+
     pub fn qwen_tokenizer(&self) -> anyhow::Result<tokenizers::Tokenizer> {
         crate::flm_tokenizer::load_qwen_bpe_from_flm(self.runtime()?)
             .map_err(|e| anyhow::anyhow!("loading FLM Qwen tokenizer: {e}"))
