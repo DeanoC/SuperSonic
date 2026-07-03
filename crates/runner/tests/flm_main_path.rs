@@ -91,7 +91,13 @@ fn qwen36_dense_flm_model_dir_runs_without_hf_snapshot() {
         "decode did not emit generated text JSON:\n{combined}"
     );
 
-    for forbidden in ["[fetch]", "[bake]", "config.json", "tokenizer.json", ".supersonic"] {
+    for forbidden in [
+        "[fetch]",
+        "[bake]",
+        "config.json",
+        "tokenizer.json",
+        ".supersonic",
+    ] {
         assert!(
             !combined.contains(forbidden),
             "FLM main path unexpectedly referenced {forbidden:?}:\n{combined}"

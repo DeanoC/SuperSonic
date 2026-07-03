@@ -145,8 +145,8 @@ mod tests {
     use clap::Parser;
 
     use super::{
-        flm_config_path, flm_startup_open_options, qwen_tokenizer_source,
-        validate_qwen35_startup, QwenTokenizerSource,
+        flm_config_path, flm_startup_open_options, qwen_tokenizer_source, validate_qwen35_startup,
+        QwenTokenizerSource,
     };
     use crate::registry::{Backend, GpuArch, ModelVariant, Qwen35KernelParams};
     use crate::Cli;
