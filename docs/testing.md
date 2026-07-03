@@ -65,6 +65,34 @@ SUPERSONIC_TEST_MODEL_ROOT="$HOME/.cache/supersonic-metal-models" \
   cargo test --release -p runner --test qwen36_moe_metal_smoke -- --ignored --nocapture
 ```
 
+### FLM Main-Path Smoke
+
+The Qwen3.6 27B dense FLM path treats the `.flm` file as the complete model
+source. A runnable no-HF artifact must validate under geo-quant's
+`runnable-no-hf` profile before it is used for SuperSonic smoke tests:
+
+```bash
+/home/deano/.config/superpowers/worktrees/geo-quant/flm-export/.venv-rocm/bin/python \
+  -m geoquant.formats.flm_validate \
+  /mnt/data/runs/geo-quant/qwen36-27b-int4-stage3-direct.flm \
+  --profile runnable-no-hf \
+  --verify-payload-hashes
+```
+
+Then run the storage upload and runner smoke gates:
+
+```bash
+SUPERSONIC_QWEN36_27B_FLM_HIP_UPLOAD=/mnt/data/runs/geo-quant/qwen36-27b-int4-stage3-direct.flm \
+  cargo test -q -p model-store flm_qwen36_27b_direct_views_upload_to_hip -- --nocapture
+
+SUPERSONIC_QWEN36_27B_NO_HF_FLM=/mnt/data/runs/geo-quant/qwen36-27b-int4-stage3-direct.flm \
+  cargo test -q -p runner --test flm_main_path -- --nocapture
+```
+
+The runner smoke asserts that config, tokenizer, and weights come from FLM,
+that BLAKE3 verification is enabled, and that no `[fetch]` or `[bake]` path is
+entered.
+
 ### Adding tests for a new machine
 
 1. Create `tests/<gpu_arch>/run.sh` (copy an existing one as a starting point)
