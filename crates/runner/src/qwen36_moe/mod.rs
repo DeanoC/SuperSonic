@@ -4,6 +4,7 @@ pub(crate) mod chain;
 pub(crate) mod decode_loop;
 pub(crate) mod dry_run;
 pub(crate) mod engine;
+pub(crate) mod flm_source;
 pub(crate) mod generation;
 pub(crate) mod geom;
 pub(crate) mod host;
