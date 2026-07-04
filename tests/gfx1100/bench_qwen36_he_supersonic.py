@@ -63,6 +63,7 @@ RESULT_RE = re.compile(
     r"ms_per_(?:step|tok)=(?P<ms_per_step>[0-9.]+)"
 )
 LIFECYCLE_RE = re.compile(r"\[qwen36-moe lifecycle-timings\]\s+(?P<body>.+)")
+STARTUP_RE = re.compile(r"\[qwen36-moe startup-timings\]\s+(?P<body>.+)")
 TIMING_KV_RE = re.compile(r"(?P<key>[a-zA-Z_]+)=(?P<value>-?[0-9]+(?:\.[0-9]+)?)")
 INFERRED_MODEL_RE = re.compile(
     r"\[flm\]\s+inferred model (?P<model>\S+) from runtime descriptor"
@@ -188,6 +189,17 @@ def resolve_dflash_draft(args: argparse.Namespace) -> tuple[Path, Path | None, s
 
 def parse_lifecycle_timings(text: str) -> dict[str, float] | None:
     match = LIFECYCLE_RE.search(text)
+    if not match:
+        return None
+    values = {
+        item.group("key"): float(item.group("value"))
+        for item in TIMING_KV_RE.finditer(match.group("body"))
+    }
+    return values or None
+
+
+def parse_startup_timings(text: str) -> dict[str, float] | None:
+    match = STARTUP_RE.search(text)
     if not match:
         return None
     values = {
@@ -339,6 +351,9 @@ def run_one(args: argparse.Namespace, name: str, prompt: str, warmup: bool = Fal
     lifecycle_timings = parse_lifecycle_timings(combined)
     if lifecycle_timings:
         row["lifecycle_timings"] = lifecycle_timings
+    startup_timings = parse_startup_timings(combined)
+    if startup_timings:
+        row["startup_timings"] = startup_timings
     resolved_model = parse_inferred_model(combined)
     if resolved_model:
         row["resolved_model"] = resolved_model
@@ -389,6 +404,19 @@ def build_summary(rows: list[dict]) -> dict:
         summary["mean_lifecycle_timings"] = {
             key: sum(row["lifecycle_timings"][key] for row in ok) / len(ok)
             for key in lifecycle_keys
+        }
+    startup_keys = sorted(
+        {
+            key
+            for row in ok
+            for key in row.get("startup_timings", {}).keys()
+            if all(key in other.get("startup_timings", {}) for other in ok)
+        }
+    )
+    if startup_keys:
+        summary["mean_startup_timings"] = {
+            key: sum(row["startup_timings"][key] for row in ok) / len(ok)
+            for key in startup_keys
         }
     flm_weight_modes = sorted(
         {row["flm_weight_mode"] for row in ok if row.get("flm_weight_mode")}

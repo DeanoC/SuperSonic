@@ -256,6 +256,67 @@ class BenchQwen36HeSuperSonicTests(unittest.TestCase):
             },
         )
 
+    def test_parse_qwen36_startup_timings(self):
+        output = (
+            "[qwen36-moe startup-timings] flm_source_open_ms=123.456 "
+            "bake_prepare_ms=0.000 dry_run_ms=4.500 "
+            "pre_decode_total_ms=127.956\n"
+        )
+
+        self.assertEqual(
+            bench.parse_startup_timings(output),
+            {
+                "flm_source_open_ms": 123.456,
+                "bake_prepare_ms": 0.0,
+                "dry_run_ms": 4.5,
+                "pre_decode_total_ms": 127.956,
+            },
+        )
+
+    def test_build_summary_includes_mean_startup_timings_when_present(self):
+        rows = [
+            {
+                "returncode": 0,
+                "tok_s": 25.0,
+                "generated_tokens": 10,
+                "decode_ms": 400.0,
+                "ms_per_step": 40.0,
+                "stopped_early": False,
+                "startup_timings": {
+                    "flm_source_open_ms": 100.0,
+                    "bake_prepare_ms": 0.0,
+                    "dry_run_ms": 4.0,
+                    "pre_decode_total_ms": 104.0,
+                },
+            },
+            {
+                "returncode": 0,
+                "tok_s": 50.0,
+                "generated_tokens": 20,
+                "decode_ms": 400.0,
+                "ms_per_step": 20.0,
+                "stopped_early": False,
+                "startup_timings": {
+                    "flm_source_open_ms": 200.0,
+                    "bake_prepare_ms": 0.0,
+                    "dry_run_ms": 6.0,
+                    "pre_decode_total_ms": 206.0,
+                },
+            },
+        ]
+
+        summary = bench.build_summary(rows)
+
+        self.assertEqual(
+            summary["mean_startup_timings"],
+            {
+                "flm_source_open_ms": 150.0,
+                "bake_prepare_ms": 0.0,
+                "dry_run_ms": 5.0,
+                "pre_decode_total_ms": 155.0,
+            },
+        )
+
     def test_build_summary_includes_flm_direct_execution_evidence(self):
         rows = [
             {
@@ -384,6 +445,9 @@ class BenchQwen36HeSuperSonicTests(unittest.TestCase):
                 "native_int4=330 bf16_fallback=0\n"
                 "[FLM runtime weights] ready-for-decode: YES "
                 "(source=/tmp/qwen36.flm)\n"
+                "[qwen36-moe startup-timings] flm_source_open_ms=123.456 "
+                "bake_prepare_ms=0.000 dry_run_ms=4.500 "
+                "pre_decode_total_ms=127.956\n"
                 "[result] prompt_tokens=1 generated_tokens=1 decode_ms=41 "
                 "ms_per_step=41.0\n"
                 "[qwen36-moe lifecycle-timings] prompt_setup_ms=55.351 "
@@ -415,6 +479,15 @@ class BenchQwen36HeSuperSonicTests(unittest.TestCase):
                 "raw_dense": 363,
                 "native_int4": 330,
                 "bf16_fallback": 0,
+            },
+        )
+        self.assertEqual(
+            row["startup_timings"],
+            {
+                "flm_source_open_ms": 123.456,
+                "bake_prepare_ms": 0.0,
+                "dry_run_ms": 4.5,
+                "pre_decode_total_ms": 127.956,
             },
         )
         self.assertEqual(

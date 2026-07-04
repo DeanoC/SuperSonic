@@ -190,6 +190,44 @@ fn validate_qwen36_decode_weight_mode(
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct Qwen36StartupTimings {
+    flm_source_open: std::time::Duration,
+    bake_prepare: std::time::Duration,
+    dry_run: std::time::Duration,
+}
+
+impl Qwen36StartupTimings {
+    fn pre_decode_total(self) -> std::time::Duration {
+        self.flm_source_open + self.bake_prepare + self.dry_run
+    }
+
+    fn print_if_requested(self, emit_stage_timings: bool) {
+        if !emit_stage_timings {
+            return;
+        }
+        eprintln!(
+            "[qwen36-moe startup-timings] {}",
+            format_qwen36_startup_timings(&self)
+        );
+    }
+}
+
+fn qwen36_duration_ms(duration: std::time::Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
+}
+
+fn format_qwen36_startup_timings(timings: &Qwen36StartupTimings) -> String {
+    format!(
+        "flm_source_open_ms={:.3} bake_prepare_ms={:.3} \
+         dry_run_ms={:.3} pre_decode_total_ms={:.3}",
+        qwen36_duration_ms(timings.flm_source_open),
+        qwen36_duration_ms(timings.bake_prepare),
+        qwen36_duration_ms(timings.dry_run),
+        qwen36_duration_ms(timings.pre_decode_total()),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,6 +249,21 @@ mod tests {
     fn hip_decode_allows_non_int4_weight_mode_for_development_path() {
         validate_qwen36_decode_weight_mode(Qwen36WeightMode::Bf16, Backend::Hip, "model.flm")
             .expect("HIP development path can still choose BF16/FP8");
+    }
+
+    #[test]
+    fn formats_startup_timings_for_machine_parsing() {
+        let timings = Qwen36StartupTimings {
+            flm_source_open: std::time::Duration::from_micros(1_500),
+            bake_prepare: std::time::Duration::ZERO,
+            dry_run: std::time::Duration::from_micros(2_250),
+        };
+
+        assert_eq!(
+            format_qwen36_startup_timings(&timings),
+            "flm_source_open_ms=1.500 bake_prepare_ms=0.000 \
+             dry_run_ms=2.250 pre_decode_total_ms=3.750"
+        );
     }
 }
 
@@ -377,11 +430,20 @@ fn run_inner(
     validate_persistent_kv_fp8_flags(cli)?;
     validate_cuda_v1_flags(cli, entry)?;
     validate_metal_v1_flags(cli, entry)?;
+
+    let mut startup_timings = Qwen36StartupTimings::default();
+    let flm_source_open_start = std::time::Instant::now();
     let flm_source = open_qwen36_moe_flm_source(cli)?;
+    if flm_source.is_some() {
+        startup_timings.flm_source_open = flm_source_open_start.elapsed();
+    }
     if flm_source.is_none() {
+        let bake_prepare_start = std::time::Instant::now();
         ensure_qwen36_bake(cli, entry)?;
+        startup_timings.bake_prepare = bake_prepare_start.elapsed();
     }
 
+    let dry_run_start = std::time::Instant::now();
     let report = if let Some(flm) = flm_source.as_ref() {
         run_qwen36_moe_dry_run_with_config(
             &cli.model_dir,
@@ -410,7 +472,9 @@ fn run_inner(
             cli.device,
         )?
     };
+    startup_timings.dry_run = dry_run_start.elapsed();
     print_report(&report);
+    startup_timings.print_if_requested(cli.emit_stage_timings);
     if cli.dry_run {
         return Ok(());
     }
