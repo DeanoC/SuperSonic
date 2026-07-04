@@ -4,6 +4,7 @@ use model_store::BakedStore;
 
 use crate::bakes::{
     effective_flm_source, flm_source_open_options, validate_effective_flm_source_model,
+    validate_flm_weight_source_options,
 };
 use crate::flm_model_source::FlmModelSource;
 use crate::qwen36_moe_cli::layers::Qwen36WeightMode;
@@ -64,6 +65,7 @@ pub(crate) fn open_qwen36_moe_flm_source(cli: &Cli) -> Result<Option<Qwen36MoeFl
         return Ok(None);
     };
     validate_effective_flm_source_model(cli, &ModelVariant::Qwen3_6_35B_A3B)?;
+    validate_flm_weight_source_options(cli, crate::policy::q4km_like(cli))?;
     let options = flm_source_open_options(cli)?;
     eprintln!(
         "[flm] opening model source at {}{}{}",
@@ -98,9 +100,23 @@ pub(crate) fn open_qwen36_moe_flm_source(cli: &Cli) -> Result<Option<Qwen36MoeFl
 
 #[cfg(test)]
 mod tests {
+    use clap::Parser;
     use model_store::manifest::LayoutTag;
 
     use super::*;
+
+    fn cli(extra: &[&str]) -> Cli {
+        let mut args = vec![
+            "supersonic",
+            "--model",
+            "qwen3.6-35b-a3b",
+            "--model-dir",
+            "/tmp/qwen36-moe-missing.flm",
+            "--dry-run",
+        ];
+        args.extend_from_slice(extra);
+        Cli::parse_from(args)
+    }
 
     #[test]
     fn maps_moe_mixed_lowbit_flm_to_int4_weight_mode() {
@@ -157,5 +173,25 @@ mod tests {
         assert!(err.contains("Qwen3.6 MoE FLM"), "{err}");
         assert!(err.contains("INT4"), "{err}");
         assert!(err.contains("Raw"), "{err}");
+    }
+
+    #[test]
+    fn rejects_incompatible_quant_flags_before_opening_flm_source() {
+        for flag in ["--q4km", "--q4km-gptq", "--int8"] {
+            let err = match open_qwen36_moe_flm_source(&cli(&[flag])) {
+                Ok(_) => panic!("incompatible FLM quant flag {flag} should fail before file open"),
+                Err(err) => err.to_string(),
+            };
+
+            assert!(err.contains("FLM"), "{err}");
+            assert!(
+                err.contains(flag) || err.contains("--q4km/--q4km-gptq"),
+                "error should identify {flag}: {err}"
+            );
+            assert!(
+                !err.contains("opening Qwen3.6 MoE FLM source"),
+                "validation should run before source open: {err}"
+            );
+        }
     }
 }
