@@ -186,7 +186,7 @@ target/release/qwen36_flm_upload_probe \
   --device 0 \
   --tensor model.language_model.layers.0.mlp.experts.gate_up_proj \
   --iters 1 \
-  --storage-direct \
+  --only-storage-direct \
   --json
 ```
 
@@ -194,7 +194,9 @@ On ROCm 7.2+ hipFile, the JSON should include a `storage-direct` record with
 nonzero `copy_storage_to_device_ms` and `copy_storage_to_device_bytes`. On a
 build without hipFile support, the same command should fail with the explicit
 `ROCm >= 7.2 with hipfile.h and libhipfile` diagnostic before measuring an
-accidental pageable fallback.
+accidental pageable fallback. Use `--storage-direct` instead when you want the
+same run to compare pageable and pinned H2D baselines before the storage-direct
+attempt.
 
 Do not use tiny tensors such as `linear_attn.dt_bias` for the storage-direct
 smoke. They are valid FLM payloads, but their byte length is below the 4 KiB

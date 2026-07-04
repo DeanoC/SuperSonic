@@ -105,16 +105,18 @@ enter execution through stable virtual allocations. A GPU-direct backend should
 therefore target extent-to-virtual-allocation range loads so the direct FLM plan
 can become resident in the execution layout without a dense staging detour.
 
-The `qwen36_flm_upload_probe` binary also has a focused `--storage-direct`
-mode for ROCm 7.2 bring-up. It asks `BakedStore` for the selected tensor's
-absolute FLM file range and calls the same HAL `copy_storage_to_device` boundary
-used by the virtual arena backend. On builds without hipFile support this mode
-must fail with the explicit hipFile requirement; on a ROCm 7.2+ hipFile system
-it should emit `copy_storage_to_device_*` profile fields that can be compared
-against the pageable, pinned, and registered modes. Because strict hipFile uses
-`O_DIRECT`, the probe rejects storage-direct ranges whose file offset or length
-is not 4 KiB aligned. Small tensors such as `linear_attn.dt_bias` remain valid
-FLM payloads, but they are not standalone tensor-granular hipFile transfer
+The `qwen36_flm_upload_probe` binary also has focused storage-direct modes for
+ROCm 7.2 bring-up. `--only-storage-direct` asks `BakedStore` for the selected
+tensor's absolute FLM file range and calls the same HAL
+`copy_storage_to_device` boundary used by the virtual arena backend, without
+measuring pageable or pinned baselines first. On builds without hipFile support
+this mode must fail with the explicit hipFile requirement; on a ROCm 7.2+
+hipFile system it should emit `copy_storage_to_device_*` profile fields. Use the
+older `--storage-direct` mode when the same run should compare pageable and
+pinned H2D baselines before the storage-direct attempt. Because strict hipFile
+uses `O_DIRECT`, the probe rejects storage-direct ranges whose file offset or
+length is not 4 KiB aligned. Small tensors such as `linear_attn.dt_bias` remain
+valid FLM payloads, but they are not standalone tensor-granular hipFile transfer
 candidates; use block-aligned expert slabs for storage-direct bring-up.
 
 FLM itself should describe the tensor storage extents, layout ABI, direct plan,

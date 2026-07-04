@@ -33,6 +33,16 @@ struct Args {
     registered: bool,
     #[arg(long)]
     storage_direct: bool,
+    #[arg(long)]
+    only_storage_direct: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UploadMode {
+    Pageable,
+    Pinned,
+    Registered,
+    StorageDirect,
 }
 
 #[derive(Debug, Serialize)]
@@ -114,6 +124,20 @@ fn ensure_storage_direct_range_alignment(tensor: &str, file_offset: u64, len: us
         );
     }
     Ok(())
+}
+
+fn selected_upload_modes(args: &Args) -> Vec<UploadMode> {
+    if args.only_storage_direct {
+        return vec![UploadMode::StorageDirect];
+    }
+    let mut modes = vec![UploadMode::Pageable, UploadMode::Pinned];
+    if args.registered {
+        modes.push(UploadMode::Registered);
+    }
+    if args.storage_direct {
+        modes.push(UploadMode::StorageDirect);
+    }
+    modes
 }
 
 fn round_up_to(value: usize, align: usize) -> Result<usize> {
@@ -500,29 +524,21 @@ fn main() -> Result<()> {
     .with_context(|| format!("open store {}", args.model_dir.display()))?;
 
     let mut records = Vec::new();
+    let modes = selected_upload_modes(&args);
     for tensor in &args.tensor {
-        records.push(run_pageable_upload(
-            &store,
-            tensor,
-            args.device,
-            args.iters,
-        )?);
-        records.push(run_pinned_upload(&store, tensor, args.device, args.iters)?);
-        if args.registered {
-            records.push(run_registered_upload(
-                &store,
-                tensor,
-                args.device,
-                args.iters,
-            )?);
-        }
-        if args.storage_direct {
-            records.push(run_storage_direct_upload(
-                &store,
-                tensor,
-                args.device,
-                args.iters,
-            )?);
+        for mode in &modes {
+            records.push(match mode {
+                UploadMode::Pageable => {
+                    run_pageable_upload(&store, tensor, args.device, args.iters)?
+                }
+                UploadMode::Pinned => run_pinned_upload(&store, tensor, args.device, args.iters)?,
+                UploadMode::Registered => {
+                    run_registered_upload(&store, tensor, args.device, args.iters)?
+                }
+                UploadMode::StorageDirect => {
+                    run_storage_direct_upload(&store, tensor, args.device, args.iters)?
+                }
+            });
         }
     }
     if args.json {
@@ -656,6 +672,36 @@ mod tests {
         ])
         .unwrap();
         assert!(args.storage_direct);
+    }
+
+    #[test]
+    fn only_storage_direct_selects_no_baseline_upload_modes() {
+        let default_args = Args::try_parse_from([
+            "qwen36_flm_upload_probe",
+            "--model-dir",
+            "model.flm",
+            "--tensor",
+            "tensor",
+        ])
+        .unwrap();
+        assert_eq!(
+            selected_upload_modes(&default_args),
+            vec![UploadMode::Pageable, UploadMode::Pinned]
+        );
+
+        let direct_args = Args::try_parse_from([
+            "qwen36_flm_upload_probe",
+            "--model-dir",
+            "model.flm",
+            "--tensor",
+            "tensor",
+            "--only-storage-direct",
+        ])
+        .unwrap();
+        assert_eq!(
+            selected_upload_modes(&direct_args),
+            vec![UploadMode::StorageDirect]
+        );
     }
 
     #[test]
