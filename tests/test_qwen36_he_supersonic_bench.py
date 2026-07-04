@@ -113,6 +113,15 @@ class BenchQwen36HeSuperSonicTests(unittest.TestCase):
         self.assertEqual(args.quant, "none")
         self.assertEqual(args.out_json, bench.DEFAULT_35B_A3B_FLM_OUT_JSON)
 
+    def test_qwen36_35b_a3b_flm_profile_points_at_current_e2e_artifact(self):
+        self.assertEqual(
+            bench.DEFAULT_35B_A3B_FLM_MODEL_DIR,
+            Path(
+                "/mnt/data/tmp/flm-first-class-e2e-20260704/"
+                "qwen36-35b-a3b-supersonic-native-int4.flm"
+            ),
+        )
+
     def test_apply_target_profile_preserves_explicit_args(self):
         args = types.SimpleNamespace(
             target_profile="qwen36-35b-a3b",
