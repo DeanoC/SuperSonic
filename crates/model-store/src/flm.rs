@@ -308,6 +308,76 @@ pub struct FlmRuntimeDirectory {
     logical_tensors: Vec<FlmLogicalTensor>,
     storage_bindings: Vec<FlmStorageBinding>,
     plan_steps: Vec<FlmPlanStep>,
+    stage3_indexes: FlmRuntimeStage3Indexes,
+}
+
+#[derive(Debug, Clone, Default)]
+struct FlmRuntimeStage3Indexes {
+    logical_by_name: HashMap<String, usize>,
+    storage_abi_by_id: HashMap<u16, usize>,
+    storage_binding_by_logical_role: HashMap<(u32, u16), usize>,
+    direct_plan_by_logical_role: HashMap<(u32, u16), usize>,
+}
+
+impl FlmRuntimeStage3Indexes {
+    fn build(
+        storage_abis: &[FlmStorageAbi],
+        logical_tensors: &[FlmLogicalTensor],
+        storage_bindings: &[FlmStorageBinding],
+        plan_steps: &[FlmPlanStep],
+    ) -> Result<Self, Error> {
+        let mut indexes = Self::default();
+
+        for (idx, abi) in storage_abis.iter().enumerate() {
+            indexes.storage_abi_by_id.insert(abi.storage_abi_id, idx);
+        }
+
+        for (idx, logical) in logical_tensors.iter().enumerate() {
+            if indexes
+                .logical_by_name
+                .insert(logical.name.clone(), idx)
+                .is_some()
+            {
+                return Err(Error::Other(format!(
+                    "FLM Stage 3 has duplicate logical tensor name {}",
+                    logical.name
+                )));
+            }
+        }
+
+        for (idx, binding) in storage_bindings.iter().enumerate() {
+            let key = (binding.logical_tensor_id, binding.storage_role);
+            if indexes
+                .storage_binding_by_logical_role
+                .insert(key, idx)
+                .is_some()
+            {
+                return Err(Error::Other(format!(
+                    "FLM Stage 3 has duplicate storage binding for logical tensor {} role {}",
+                    binding.logical_tensor_id, binding.storage_role
+                )));
+            }
+        }
+
+        for (idx, step) in plan_steps.iter().enumerate() {
+            if step.consume_strategy != CONSUME_STRATEGY_DIRECT {
+                continue;
+            }
+            let key = (step.logical_tensor_id, step.storage_role);
+            if indexes
+                .direct_plan_by_logical_role
+                .insert(key, idx)
+                .is_some()
+            {
+                return Err(Error::Other(format!(
+                    "FLM Stage 3 has duplicate direct plan for logical tensor {} role {}",
+                    step.logical_tensor_id, step.storage_role
+                )));
+            }
+        }
+
+        Ok(indexes)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -394,6 +464,13 @@ impl FlmRuntimeDirectory {
             (Vec::new(), Vec::new(), Vec::new(), Vec::new())
         };
 
+        let stage3_indexes = FlmRuntimeStage3Indexes::build(
+            &storage_abis,
+            &logical_tensors,
+            &storage_bindings,
+            &plan_steps,
+        )?;
+
         Ok(Self {
             architecture_id,
             config,
@@ -408,6 +485,7 @@ impl FlmRuntimeDirectory {
             logical_tensors,
             storage_bindings,
             plan_steps,
+            stage3_indexes,
         })
     }
 
@@ -479,13 +557,10 @@ impl FlmRuntimeDirectory {
         &self,
         logical_name: &str,
     ) -> Result<Option<FlmStage3DirectWeightKind>, Error> {
-        let Some(logical) = self
-            .logical_tensors
-            .iter()
-            .find(|logical| logical.name == logical_name)
-        else {
+        let Some(logical_idx) = self.stage3_indexes.logical_by_name.get(logical_name) else {
             return Ok(None);
         };
+        let logical = &self.logical_tensors[*logical_idx];
 
         match logical.value_format_id {
             VALUE_FORMAT_RAW_DENSE => {
@@ -513,9 +588,10 @@ impl FlmRuntimeDirectory {
         let packed_step = self.required_direct_plan_step(logical, STORAGE_ROLE_PACKED)?;
         let scale_step = self.required_direct_plan_step(logical, STORAGE_ROLE_SCALE)?;
         let storage_abi = self
-            .storage_abis
-            .iter()
-            .find(|abi| abi.storage_abi_id == packed.storage_abi_id)
+            .stage3_indexes
+            .storage_abi_by_id
+            .get(&packed.storage_abi_id)
+            .map(|idx| &self.storage_abis[*idx])
             .ok_or_else(|| {
                 Error::Other(format!(
                     "FLM Stage 3 tensor {} references missing storage ABI {}",
@@ -578,12 +654,10 @@ impl FlmRuntimeDirectory {
         logical: &FlmLogicalTensor,
         storage_role: u16,
     ) -> Result<&FlmStorageBinding, Error> {
-        self.storage_bindings
-            .iter()
-            .find(|binding| {
-                binding.logical_tensor_id == logical.tensor_id
-                    && binding.storage_role == storage_role
-            })
+        self.stage3_indexes
+            .storage_binding_by_logical_role
+            .get(&(logical.tensor_id, storage_role))
+            .map(|idx| &self.storage_bindings[*idx])
             .ok_or_else(|| {
                 Error::Other(format!(
                     "FLM Stage 3 tensor {} missing storage binding role {}",
@@ -597,13 +671,10 @@ impl FlmRuntimeDirectory {
         logical: &FlmLogicalTensor,
         storage_role: u16,
     ) -> Result<&FlmPlanStep, Error> {
-        self.plan_steps
-            .iter()
-            .find(|step| {
-                step.logical_tensor_id == logical.tensor_id
-                    && step.storage_role == storage_role
-                    && step.consume_strategy == CONSUME_STRATEGY_DIRECT
-            })
+        self.stage3_indexes
+            .direct_plan_by_logical_role
+            .get(&(logical.tensor_id, storage_role))
+            .map(|idx| &self.plan_steps[*idx])
             .ok_or_else(|| {
                 Error::Other(format!(
                     "FLM Stage 3 tensor {} missing direct plan role {}",
@@ -2399,6 +2470,36 @@ mod tests {
         }
     }
 
+    fn duplicate_string_table_row(runtime: &mut Vec<u8>, section_id: u32, header_len: usize) {
+        let (section_offset, section_len) = section_range(runtime, section_id);
+        let row_stride = read_u16_at(runtime, section_offset + 2) as usize;
+        let row_count = read_u32_at(runtime, section_offset + 4) as usize;
+        let insert_offset = section_offset + header_len + row_count * row_stride;
+        let row_copy =
+            runtime[section_offset + header_len..section_offset + header_len + row_stride].to_vec();
+
+        runtime.splice(insert_offset..insert_offset, row_copy);
+        shift_sections_after(runtime, insert_offset, row_stride);
+        put_u32_at(runtime, section_offset + 4, (row_count + 1) as u32);
+        let record = section_record_offset(runtime, section_id);
+        put_u32_at(runtime, record + 8, (section_len + row_stride) as u32);
+    }
+
+    fn duplicate_fixed_row(runtime: &mut Vec<u8>, section_id: u32, header_len: usize) {
+        let (section_offset, section_len) = section_range(runtime, section_id);
+        let row_stride = read_u16_at(runtime, section_offset + 2) as usize;
+        let row_count = read_u32_at(runtime, section_offset + 4) as usize;
+        let insert_offset = section_offset + section_len;
+        let row_copy =
+            runtime[section_offset + header_len..section_offset + header_len + row_stride].to_vec();
+
+        runtime.splice(insert_offset..insert_offset, row_copy);
+        shift_sections_after(runtime, insert_offset, row_stride);
+        put_u32_at(runtime, section_offset + 4, (row_count + 1) as u32);
+        let record = section_record_offset(runtime, section_id);
+        put_u32_at(runtime, record + 8, (section_len + row_stride) as u32);
+    }
+
     fn asset_payload_record(runtime: &[u8], asset_id: u32) -> (usize, usize, usize) {
         let (table_offset, _) = section_range(runtime, SECTION_ASSET_TABLE);
         let count = read_u32_at(runtime, table_offset) as usize;
@@ -2547,6 +2648,41 @@ mod tests {
         assert_eq!(parsed.plan_steps()[1].storage_role, STORAGE_ROLE_SCALE);
         assert_eq!(parsed.plan_steps()[1].target_dtype, FLM_DTYPE_BF16);
         assert_eq!(parsed.plan_steps()[1].target_shape, [128, 1, 0, 0]);
+    }
+
+    #[test]
+    fn rejects_duplicate_stage3_logical_tensor_names() {
+        let mut runtime = build_test_runtime_directory_with_stage3_tables();
+        duplicate_string_table_row(
+            &mut runtime,
+            SECTION_LOGICAL_TENSOR_TABLE,
+            LOGICAL_TENSOR_HEADER_SIZE,
+        );
+        let (logical_offset, _) = section_range(&runtime, SECTION_LOGICAL_TENSOR_TABLE);
+        let duplicate_row = logical_offset + LOGICAL_TENSOR_HEADER_SIZE + LOGICAL_TENSOR_ROW_SIZE;
+        put_u32_at(&mut runtime, duplicate_row, 2);
+
+        expect_parse_error_contains(&runtime, "duplicate logical tensor name");
+    }
+
+    #[test]
+    fn rejects_duplicate_stage3_storage_binding_roles() {
+        let mut runtime = build_test_runtime_directory_with_stage3_tables();
+        duplicate_string_table_row(
+            &mut runtime,
+            SECTION_STORAGE_BINDING_TABLE,
+            STORAGE_BINDING_HEADER_SIZE,
+        );
+
+        expect_parse_error_contains(&runtime, "duplicate storage binding");
+    }
+
+    #[test]
+    fn rejects_duplicate_stage3_direct_plan_roles() {
+        let mut runtime = build_test_runtime_directory_with_stage3_tables();
+        duplicate_fixed_row(&mut runtime, SECTION_PLAN_STEP_TABLE, PLAN_STEP_HEADER_SIZE);
+
+        expect_parse_error_contains(&runtime, "duplicate direct plan");
     }
 
     #[test]
