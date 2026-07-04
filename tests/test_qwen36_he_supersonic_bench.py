@@ -451,6 +451,83 @@ class BenchQwen36HeSuperSonicTests(unittest.TestCase):
             },
         )
 
+    def test_build_summary_derives_flm_load_speed_metrics(self):
+        rows = [
+            {
+                "returncode": 0,
+                "tok_s": 25.0,
+                "generated_tokens": 10,
+                "decode_ms": 400.0,
+                "ms_per_step": 40.0,
+                "stopped_early": False,
+                "lifecycle_timings": {
+                    "layer_load_copy_h_to_d_ms": 500.0,
+                    "layer_load_copy_h_to_d_bytes": 8 * 1024 * 1024 * 1024,
+                },
+                "hal_profile_ops": {
+                    "copy_h2d": {
+                        "calls": 8,
+                        "mean_ms": 25.0,
+                        "total_ms": 200.0,
+                        "max_ms": 50.0,
+                        "total_bytes": 6 * 1024 * 1024 * 1024,
+                    },
+                    "copy_storage_to_device": {
+                        "calls": 2,
+                        "mean_ms": 100.0,
+                        "total_ms": 200.0,
+                        "max_ms": 125.0,
+                        "total_bytes": 4 * 1024 * 1024 * 1024,
+                    },
+                },
+            },
+            {
+                "returncode": 0,
+                "tok_s": 50.0,
+                "generated_tokens": 20,
+                "decode_ms": 400.0,
+                "ms_per_step": 20.0,
+                "stopped_early": False,
+                "lifecycle_timings": {
+                    "layer_load_copy_h_to_d_ms": 1000.0,
+                    "layer_load_copy_h_to_d_bytes": 16 * 1024 * 1024 * 1024,
+                },
+                "hal_profile_ops": {
+                    "copy_h2d": {
+                        "calls": 12,
+                        "mean_ms": 50.0,
+                        "total_ms": 600.0,
+                        "max_ms": 100.0,
+                        "total_bytes": 18 * 1024 * 1024 * 1024,
+                    },
+                    "copy_storage_to_device": {
+                        "calls": 3,
+                        "mean_ms": 200.0,
+                        "total_ms": 600.0,
+                        "max_ms": 250.0,
+                        "total_bytes": 12 * 1024 * 1024 * 1024,
+                    },
+                },
+            },
+        ]
+
+        summary = bench.build_summary(rows)
+
+        self.assertEqual(
+            summary["flm_load_speed"],
+            {
+                "layer_load_copy_h_to_d_bytes": 24 * 1024 * 1024 * 1024,
+                "layer_load_copy_h_to_d_ms": 1500.0,
+                "layer_load_copy_h_to_d_gib_s": 16.0,
+                "copy_h2d_bytes": 24 * 1024 * 1024 * 1024,
+                "copy_h2d_ms": 800.0,
+                "copy_h2d_gib_s": 30.0,
+                "copy_storage_to_device_bytes": 16 * 1024 * 1024 * 1024,
+                "copy_storage_to_device_ms": 800.0,
+                "copy_storage_to_device_gib_s": 20.0,
+            },
+        )
+
     def test_build_summary_includes_mean_sparse_metrics_when_present(self):
         rows = [
             {

@@ -165,7 +165,8 @@ python3 tests/gfx1100/bench_qwen36_he_supersonic.py \
   --limit 1 \
   --n-gen 1 \
   --no-warmup \
-  --emit-stage-timings
+  --emit-stage-timings \
+  --hal-profile
 ```
 
 This FLM target profile passes the `.flm` as `--model-dir` without `--model`,
@@ -173,7 +174,10 @@ so the run measures the same descriptor-inferred first-class path as the direct
 smoke above. The resulting JSON records `model: null`,
 `resolved_model: qwen3.6-35b-a3b`, decode throughput, and parsed
 `[qwen36-moe lifecycle-timings]` fields such as `model_source_ms`,
-`layer_load_ms`, `generation_wall_ms`, and `total_wall_ms`.
+`layer_load_ms`, `generation_wall_ms`, and `total_wall_ms`. With
+`--hal-profile`, `summary.flm_load_speed` also records aggregate FLM transfer
+bytes, elapsed milliseconds, and GiB/s for `copy_h2d`; on a hipFile-enabled
+host it records the same values for `copy_storage_to_device`.
 
 To validate ROCm 7.2 hipFile storage-to-device transfer on a host with
 `hipfile.h`, `libhipfile`, and passing `/opt/rocm/bin/ais-check`, use the FLM

@@ -39,6 +39,7 @@ DEFAULT_35B_A3B_OUT_JSON = Path("target/qwen36_35b_a3b_he_supersonic.json")
 DEFAULT_35B_A3B_FLM_OUT_JSON = Path("target/qwen36_35b_a3b_flm_he_supersonic.json")
 DEFAULT_CONTEXT_SIZE = 512
 LUCEBOX_SERVING_CONTEXT_SIZE = 1024
+GIB = 1024.0 * 1024.0 * 1024.0
 LUCEBOX_DRAFT_ALIASES = {
     "supersonic-q8-bf16": {
         "label": "supersonic-q8-bf16",
@@ -461,6 +462,62 @@ def mean_common_numeric_field(rows: list[dict], field: str) -> dict[str, float] 
     }
 
 
+def gib_per_second(bytes_count: int | float, elapsed_ms: int | float) -> float:
+    if elapsed_ms <= 0:
+        return 0.0
+    return (float(bytes_count) / GIB) / (float(elapsed_ms) / 1000.0)
+
+
+def build_flm_load_speed_summary(rows: list[dict]) -> dict[str, float | int] | None:
+    summary: dict[str, float | int] = {}
+    h2d_rows = [
+        row
+        for row in rows
+        if "layer_load_copy_h_to_d_bytes" in row.get("lifecycle_timings", {})
+        and "layer_load_copy_h_to_d_ms" in row.get("lifecycle_timings", {})
+    ]
+    if h2d_rows:
+        h2d_bytes = sum(
+            int(row["lifecycle_timings"]["layer_load_copy_h_to_d_bytes"])
+            for row in h2d_rows
+        )
+        h2d_ms = sum(
+            float(row["lifecycle_timings"]["layer_load_copy_h_to_d_ms"])
+            for row in h2d_rows
+        )
+        if h2d_bytes > 0 and h2d_ms > 0:
+            summary.update(
+                {
+                    "layer_load_copy_h_to_d_bytes": h2d_bytes,
+                    "layer_load_copy_h_to_d_ms": h2d_ms,
+                    "layer_load_copy_h_to_d_gib_s": gib_per_second(h2d_bytes, h2d_ms),
+                }
+            )
+
+    for op in ("copy_h2d", "copy_storage_to_device"):
+        op_rows = [row for row in rows if op in row.get("hal_profile_ops", {})]
+        if not op_rows:
+            continue
+        op_bytes = sum(
+            int(row["hal_profile_ops"][op]["total_bytes"])
+            for row in op_rows
+        )
+        op_ms = sum(
+            float(row["hal_profile_ops"][op]["total_ms"])
+            for row in op_rows
+        )
+        if op_bytes <= 0 or op_ms <= 0:
+            continue
+        summary.update(
+            {
+                f"{op}_bytes": op_bytes,
+                f"{op}_ms": op_ms,
+                f"{op}_gib_s": gib_per_second(op_bytes, op_ms),
+            }
+        )
+    return summary or None
+
+
 def build_summary(rows: list[dict]) -> dict:
     ok = [r for r in rows if r.get("returncode") == 0 and "tok_s" in r]
     total_generated = sum(r["generated_tokens"] for r in ok)
@@ -543,6 +600,9 @@ def build_summary(rows: list[dict]) -> dict:
             }
             for op in hal_op_names
         }
+    flm_load_speed = build_flm_load_speed_summary(ok)
+    if flm_load_speed:
+        summary["flm_load_speed"] = flm_load_speed
     return summary
 
 
