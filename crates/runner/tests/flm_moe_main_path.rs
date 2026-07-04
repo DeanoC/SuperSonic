@@ -122,7 +122,6 @@ fn qwen36_moe_flm_model_dir_runs_without_hf_snapshot() {
     ]);
     cmd.arg(&path);
     cmd.args([
-        "--int4",
         "--verify-flm-hashes",
         "--prompt",
         "Hello",
@@ -178,13 +177,7 @@ fn qwen36_moe_ct_int4_flm_dry_run_consumes_source_without_hf_snapshot() {
         "--model-dir",
     ]);
     cmd.arg(&path);
-    cmd.args([
-        "--int4",
-        "--context-size",
-        "16",
-        "--no-download",
-        "--dry-run",
-    ]);
+    cmd.args(["--context-size", "16", "--no-download", "--dry-run"]);
 
     let output = cmd
         .output()

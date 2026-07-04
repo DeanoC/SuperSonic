@@ -234,7 +234,7 @@ pub(crate) fn validate_flm_weight_source_options(cli: &Cli, q4km_like: bool) -> 
 pub(crate) fn flm_source_open_options(cli: &Cli) -> Result<FlmModelSourceOptions> {
     let profile = effective_quant_profile(cli)?;
     Ok(FlmModelSourceOptions {
-        int4_runtime: profile.is_native_int4_runtime(),
+        int4_runtime: effective_flm_source(cli).is_some() || profile.is_native_int4_runtime(),
         verify_block_hashes: cli.verify_flm_hashes,
     })
 }
@@ -594,10 +594,7 @@ mod tests {
 
     #[test]
     fn qwen36_flm_model_dir_skips_hf_metadata_bootstrap_even_without_config() {
-        let cli = cli_with_model_dir(
-            "/tmp/qwen36-27b-no-hf.flm",
-            &["--int4", "--verify-flm-hashes"],
-        );
+        let cli = cli_with_model_dir("/tmp/qwen36-27b-no-hf.flm", &["--verify-flm-hashes"]);
 
         let downloaded = ensure_hf_metadata_present(&cli, &ModelVariant::Qwen3_6_27B)
             .expect("authoritative FLM source should bypass HF metadata bootstrap");
@@ -608,17 +605,14 @@ mod tests {
     #[test]
     fn flm_model_dir_is_authoritative_for_qwen36_moe_hf_metadata_bootstrap() {
         assert!(flm_source_is_authoritative_for_model(
-            &cli_with_model_dir("/tmp/qwen36-35b-a3b.flm", &["--int4"]),
+            &cli_with_model_dir("/tmp/qwen36-35b-a3b.flm", &[]),
             &ModelVariant::Qwen3_6_35B_A3B
         ));
     }
 
     #[test]
     fn qwen36_moe_flm_model_dir_skips_hf_metadata_bootstrap_even_without_config() {
-        let cli = cli_with_model_dir(
-            "/tmp/qwen36-35b-a3b-no-hf.flm",
-            &["--int4", "--verify-flm-hashes"],
-        );
+        let cli = cli_with_model_dir("/tmp/qwen36-35b-a3b-no-hf.flm", &["--verify-flm-hashes"]);
 
         let downloaded = ensure_hf_metadata_present(&cli, &ModelVariant::Qwen3_6_35B_A3B)
             .expect("authoritative MoE FLM source should bypass HF metadata bootstrap");
@@ -629,7 +623,7 @@ mod tests {
     #[test]
     fn effective_flm_source_accepts_qwen36_moe_model_variant() {
         validate_effective_flm_source_model(
-            &cli_with_model_dir("/tmp/qwen36-35b-a3b.flm", &["--int4"]),
+            &cli_with_model_dir("/tmp/qwen36-35b-a3b.flm", &[]),
             &ModelVariant::Qwen3_6_35B_A3B,
         )
         .expect("qwen3.6-35b-a3b FLM should be accepted");
@@ -683,7 +677,7 @@ mod tests {
 
     #[test]
     fn flm_source_open_options_keep_hash_verification_opt_in() {
-        let cli = cli_with_model_dir("/tmp/model.flm", &["--int4"]);
+        let cli = cli_with_model_dir("/tmp/model.flm", &[]);
 
         let options = flm_source_open_options(&cli).expect("valid FLM source options");
 

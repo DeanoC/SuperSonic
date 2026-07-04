@@ -99,9 +99,10 @@ HIP decode path. Validate the native SuperSonic-layout artifact with
 geo-quant's no-HF profile first:
 
 ```bash
-/home/deano/.config/superpowers/worktrees/geo-quant/flm-export/.venv-rocm/bin/python \
-  -m geoquant.formats.flm_validate \
-  /mnt/data/runs/geo-quant/qwen36-35b-a3b-supersonic-native-int4.flm \
+PYTHONPATH=/home/deano/.config/superpowers/worktrees/geo-quant/flm-first-class-path \
+  /home/deano/projects/geo-quant/.venv-rocm/bin/python \
+  /home/deano/.config/superpowers/worktrees/geo-quant/flm-first-class-path/scripts/flm_validate.py \
+  /mnt/data/tmp/flm-native-complete-path/qwen36-35b-a3b-supersonic-native-int4.flm \
   --profile runnable-no-hf \
   --verify-payload-hashes
 ```
@@ -110,22 +111,43 @@ The model-store loader can validate the same artifact's native aliases without
 running generation:
 
 ```bash
-SUPERSONIC_QWEN36_35B_NATIVE_INT4_FLM=/mnt/data/runs/geo-quant/qwen36-35b-a3b-supersonic-native-int4.flm \
+SUPERSONIC_QWEN36_35B_NATIVE_INT4_FLM=/mnt/data/tmp/flm-native-complete-path/qwen36-35b-a3b-supersonic-native-int4.flm \
   cargo test -q -p model-store flm_qwen36_35b_native_int4_loadable -- --nocapture
 ```
 
 Then run the env-gated MoE runner smoke:
 
 ```bash
-SUPERSONIC_QWEN36_35B_A3B_NO_HF_FLM=/mnt/data/runs/geo-quant/qwen36-35b-a3b-supersonic-native-int4.flm \
+SUPERSONIC_QWEN36_35B_A3B_NO_HF_FLM=/mnt/data/tmp/flm-native-complete-path/qwen36-35b-a3b-supersonic-native-int4.flm \
   cargo test -q -p runner --test flm_moe_main_path -- --nocapture
 ```
 
 The MoE smoke runs one generated token with `--model qwen3.6-35b-a3b`,
-`--int4`, `--verify-flm-hashes`, and no HF snapshot. It asserts the MoE config,
-tokenizer, and weights all come from the single FLM source, that the FLM is
-opened exactly once, and that the run does not enter fetch, bake, config JSON,
-tokenizer JSON, safetensors, or `.supersonic` paths.
+`--verify-flm-hashes`, and no HF snapshot. It intentionally does not pass
+`--int4`: SuperSonic infers the executable weight mode from the FLM tensor
+views. The smoke asserts the MoE config, tokenizer, and weights all come from
+the single FLM source, that the FLM is opened exactly once, and that the run
+does not enter fetch, bake, config JSON, tokenizer JSON, safetensors, or
+`.supersonic` paths.
+
+For a direct manual smoke with load/decode timing, run the FLM as the model
+directory:
+
+```bash
+cargo run -q -p runner --bin supersonic -- \
+  --model qwen3.6-35b-a3b \
+  --model-dir /mnt/data/tmp/flm-native-complete-path/qwen36-35b-a3b-supersonic-native-int4.flm \
+  --backend hip \
+  --device 0 \
+  --prompt "Hello" \
+  --max-new-tokens 1 \
+  --context-size 16 \
+  --emit-stage-timings
+```
+
+For fast-load timing, leave `--verify-flm-hashes` off; enabling it reads and
+hashes the payload bytes during open and is an integrity check rather than the
+normal latency path.
 
 Compressed-tensors INT4 FLMs from geo-quant are tested separately through the
 portable fallback path. That path exposes logical CT INT4 weights as BF16 views
