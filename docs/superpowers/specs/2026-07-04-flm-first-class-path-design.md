@@ -57,6 +57,15 @@ falling back to pageable H2D. A real fast-path verification requires ROCm 7.2+
 hipFile, `ais-check` passing, and the FLM payload on a supported local NVMe
 filesystem such as ext4 or xfs.
 
+The hipFile bridge must run in strict direct mode when selected by SuperSonic:
+it disables hipFile compatibility fallback with `hipFileSetParameterBool` before
+opening the driver path, opens the FLM with `O_DIRECT`, registers the target
+device buffer range with `hipFileBufRegister`, performs the `hipFileRead`, and
+deregisters the buffer before returning. This keeps the explicit
+`GpuDirectStorage` backend from being satisfied by hipFile's POSIX fallback or
+an internal bounce path while we are trying to measure direct storage-to-device
+load performance.
+
 The runtime selector is `SUPERSONIC_FLM_VIRTUAL_TRANSFER_BACKEND`. It defaults
 to `pageable-h2d`; `gpu-direct-storage`, `gds`, or `hipfile` selects the named
 storage-to-device backend for MoE expert virtual arena loads, covering both

@@ -79,6 +79,17 @@ extern "C" int supersonic_hipfile_read_to_device(
         return 1;
     }
 
+    hipFileError_t compat_status =
+        hipFileSetParameterBool(hipFileParamPropertiesAllowCompatMode, false);
+    if (compat_status.err != hipFileSuccess) {
+        set_error(
+            err_buf,
+            err_buf_len,
+            hipfile_error("hipFileSetParameterBool(AllowCompatMode=false)", compat_status));
+        close(fd);
+        return 1;
+    }
+
     hipFileDescr_t desc{};
     desc.type = hipFileHandleTypeOpaqueFD;
     desc.handle.fd = fd;
@@ -88,6 +99,14 @@ extern "C" int supersonic_hipfile_read_to_device(
     hipFileError_t status = hipFileHandleRegister(&handle, &desc);
     if (status.err != hipFileSuccess) {
         set_error(err_buf, err_buf_len, hipfile_error("hipFileHandleRegister", status));
+        close(fd);
+        return 1;
+    }
+
+    hipFileError_t buf_status = hipFileBufRegister(dst, len, 0);
+    if (buf_status.err != hipFileSuccess) {
+        set_error(err_buf, err_buf_len, hipfile_error("hipFileBufRegister", buf_status));
+        hipFileHandleDeregister(handle);
         close(fd);
         return 1;
     }
@@ -102,17 +121,29 @@ extern "C" int supersonic_hipfile_read_to_device(
             static_cast<hoff_t>(copied));
         if (nread < 0) {
             set_error(err_buf, err_buf_len, hipfile_read_error(nread));
+            hipFileError_t cleanup_status = hipFileBufDeregister(dst);
+            (void)cleanup_status;
             hipFileHandleDeregister(handle);
             close(fd);
             return 1;
         }
         if (nread == 0) {
             set_error(err_buf, err_buf_len, "hipFileRead reached EOF before requested length");
+            hipFileError_t cleanup_status = hipFileBufDeregister(dst);
+            (void)cleanup_status;
             hipFileHandleDeregister(handle);
             close(fd);
             return 1;
         }
         copied += static_cast<size_t>(nread);
+    }
+
+    hipFileError_t dereg_status = hipFileBufDeregister(dst);
+    if (dereg_status.err != hipFileSuccess) {
+        set_error(err_buf, err_buf_len, hipfile_error("hipFileBufDeregister", dereg_status));
+        hipFileHandleDeregister(handle);
+        close(fd);
+        return 1;
     }
 
     hipFileHandleDeregister(handle);
