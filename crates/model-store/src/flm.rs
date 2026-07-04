@@ -286,6 +286,13 @@ pub struct FlmRuntimeIdentity {
     pub model_id: u16,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlmStage3DirectWeightKind {
+    RawDense,
+    CtInt4Bf16Fallback,
+    NativeInt4,
+}
+
 #[derive(Debug, Clone)]
 pub struct FlmRuntimeDirectory {
     pub architecture_id: u32,
@@ -466,6 +473,143 @@ impl FlmRuntimeDirectory {
 
     pub fn plan_steps(&self) -> &[FlmPlanStep] {
         &self.plan_steps
+    }
+
+    pub fn stage3_direct_weight_kind(
+        &self,
+        logical_name: &str,
+    ) -> Result<Option<FlmStage3DirectWeightKind>, Error> {
+        let Some(logical) = self
+            .logical_tensors
+            .iter()
+            .find(|logical| logical.name == logical_name)
+        else {
+            return Ok(None);
+        };
+
+        match logical.value_format_id {
+            VALUE_FORMAT_RAW_DENSE => {
+                let value = self.required_storage_binding(logical, STORAGE_ROLE_VALUE)?;
+                let value_step = self.required_direct_plan_step(logical, STORAGE_ROLE_VALUE)?;
+                if value.storage_dtype != value_step.target_dtype {
+                    return Err(Error::Other(format!(
+                        "FLM Stage 3 raw tensor {} storage dtype {} does not match direct target dtype {}",
+                        logical.name, value.storage_dtype, value_step.target_dtype
+                    )));
+                }
+                Ok(Some(FlmStage3DirectWeightKind::RawDense))
+            }
+            VALUE_FORMAT_SYM_INT4 => self.stage3_direct_int4_weight_kind(logical),
+            _ => Ok(None),
+        }
+    }
+
+    fn stage3_direct_int4_weight_kind(
+        &self,
+        logical: &FlmLogicalTensor,
+    ) -> Result<Option<FlmStage3DirectWeightKind>, Error> {
+        let packed = self.required_storage_binding(logical, STORAGE_ROLE_PACKED)?;
+        let scale = self.required_storage_binding(logical, STORAGE_ROLE_SCALE)?;
+        let packed_step = self.required_direct_plan_step(logical, STORAGE_ROLE_PACKED)?;
+        let scale_step = self.required_direct_plan_step(logical, STORAGE_ROLE_SCALE)?;
+        let storage_abi = self
+            .storage_abis
+            .iter()
+            .find(|abi| abi.storage_abi_id == packed.storage_abi_id)
+            .ok_or_else(|| {
+                Error::Other(format!(
+                    "FLM Stage 3 tensor {} references missing storage ABI {}",
+                    logical.name, packed.storage_abi_id
+                ))
+            })?;
+
+        if packed.storage_dtype == FLM_DTYPE_INT32 {
+            self.required_storage_binding(logical, STORAGE_ROLE_SHAPE)?;
+            if scale.storage_dtype != FLM_DTYPE_BF16 || scale_step.target_dtype != FLM_DTYPE_BF16 {
+                return Err(Error::Other(format!(
+                    "FLM Stage 3 CT INT4 tensor {} requires BF16 scale storage/direct dtype",
+                    logical.name
+                )));
+            }
+            if storage_abi.codec_semantic_id != CODEC_SYM_INT4_G128_BF16 || storage_abi.bits != 4 {
+                return Err(Error::Other(format!(
+                    "FLM Stage 3 CT INT4 tensor {} uses unsupported ABI codec={} bits={}",
+                    logical.name, storage_abi.codec_semantic_id, storage_abi.bits
+                )));
+            }
+            return Ok(Some(FlmStage3DirectWeightKind::CtInt4Bf16Fallback));
+        }
+
+        if packed.storage_dtype != FLM_DTYPE_UINT8 || packed_step.target_dtype != FLM_DTYPE_UINT8 {
+            return Err(Error::Other(format!(
+                "FLM Stage 3 native INT4 tensor {} requires u8 packed storage/direct dtype",
+                logical.name
+            )));
+        }
+        if storage_abi.codec_semantic_id != CODEC_SUPERSONIC_NATIVE_INT4_G128_BF16
+            || storage_abi.bits != 4
+            || storage_abi.group_size != 128
+        {
+            return Err(Error::Other(format!(
+                "FLM Stage 3 native INT4 tensor {} uses unsupported ABI codec={} bits={} group_size={}",
+                logical.name,
+                storage_abi.codec_semantic_id,
+                storage_abi.bits,
+                storage_abi.group_size
+            )));
+        }
+        let zero = self.required_storage_binding(logical, STORAGE_ROLE_ZERO)?;
+        let zero_step = self.required_direct_plan_step(logical, STORAGE_ROLE_ZERO)?;
+        if scale.storage_dtype != FLM_DTYPE_BF16
+            || scale_step.target_dtype != FLM_DTYPE_BF16
+            || zero.storage_dtype != FLM_DTYPE_BF16
+            || zero_step.target_dtype != FLM_DTYPE_BF16
+        {
+            return Err(Error::Other(format!(
+                "FLM Stage 3 native INT4 tensor {} requires BF16 scale/zero storage and direct dtypes",
+                logical.name
+            )));
+        }
+        Ok(Some(FlmStage3DirectWeightKind::NativeInt4))
+    }
+
+    fn required_storage_binding(
+        &self,
+        logical: &FlmLogicalTensor,
+        storage_role: u16,
+    ) -> Result<&FlmStorageBinding, Error> {
+        self.storage_bindings
+            .iter()
+            .find(|binding| {
+                binding.logical_tensor_id == logical.tensor_id
+                    && binding.storage_role == storage_role
+            })
+            .ok_or_else(|| {
+                Error::Other(format!(
+                    "FLM Stage 3 tensor {} missing storage binding role {}",
+                    logical.name, storage_role
+                ))
+            })
+    }
+
+    fn required_direct_plan_step(
+        &self,
+        logical: &FlmLogicalTensor,
+        storage_role: u16,
+    ) -> Result<&FlmPlanStep, Error> {
+        self.plan_steps
+            .iter()
+            .find(|step| {
+                step.logical_tensor_id == logical.tensor_id
+                    && step.storage_role == storage_role
+                    && step.consume_strategy == CONSUME_STRATEGY_DIRECT
+            })
+            .ok_or_else(|| {
+                Error::Other(format!(
+                    "FLM Stage 3 tensor {} missing direct plan role {}",
+                    logical.name, storage_role
+                ))
+            })
     }
 }
 

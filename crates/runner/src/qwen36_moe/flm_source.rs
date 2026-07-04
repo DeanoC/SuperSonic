@@ -1,4 +1,6 @@
 use anyhow::{anyhow, Result};
+use model_store::flm::FlmStage3DirectWeightKind;
+#[cfg(test)]
 use model_store::manifest::LayoutTag;
 use model_store::BakedStore;
 
@@ -36,12 +38,45 @@ fn qwen36_moe_flm_weight_mode(probe: Option<(&LayoutTag, &str)>) -> Result<Qwen3
 fn qwen36_moe_flm_weight_selection_for_store(
     store: &BakedStore,
 ) -> Result<Qwen36MoeFlmWeightSelection> {
-    let probe = store
-        .meta(QWEN36_MOE_WEIGHT_MODE_PROBE)
-        .map(|meta| (&meta.layout, meta.dtype.as_str()));
-    qwen36_moe_flm_weight_selection_from_probe(probe)
+    let runtime = store.flm_runtime().ok_or_else(|| {
+        anyhow!(
+            "Qwen3.6 MoE FLM source requires a runtime direct weight plan for {}",
+            QWEN36_MOE_WEIGHT_MODE_PROBE
+        )
+    })?;
+    let kind = runtime
+        .stage3_direct_weight_kind(QWEN36_MOE_WEIGHT_MODE_PROBE)
+        .map_err(|err| {
+            anyhow!(
+                "Qwen3.6 MoE FLM direct weight plan for {} is unsupported: {err}",
+                QWEN36_MOE_WEIGHT_MODE_PROBE
+            )
+        })?;
+    qwen36_moe_flm_weight_selection_from_stage3_kind(kind)
 }
 
+fn qwen36_moe_flm_weight_selection_from_stage3_kind(
+    kind: Option<FlmStage3DirectWeightKind>,
+) -> Result<Qwen36MoeFlmWeightSelection> {
+    match kind {
+        Some(FlmStage3DirectWeightKind::NativeInt4) => Ok(Qwen36MoeFlmWeightSelection {
+            mode: Qwen36WeightMode::Int4,
+            label: "INT4 native FLM",
+        }),
+        Some(
+            FlmStage3DirectWeightKind::CtInt4Bf16Fallback | FlmStage3DirectWeightKind::RawDense,
+        ) => Ok(Qwen36MoeFlmWeightSelection {
+            mode: Qwen36WeightMode::Bf16,
+            label: "BF16",
+        }),
+        None => Err(anyhow!(
+            "Qwen3.6 MoE FLM source requires a compatible direct weight plan for {}",
+            QWEN36_MOE_WEIGHT_MODE_PROBE
+        )),
+    }
+}
+
+#[cfg(test)]
 fn qwen36_moe_flm_weight_selection_from_probe(
     probe: Option<(&LayoutTag, &str)>,
 ) -> Result<Qwen36MoeFlmWeightSelection> {
@@ -101,6 +136,7 @@ pub(crate) fn open_qwen36_moe_flm_source(cli: &Cli) -> Result<Option<Qwen36MoeFl
 #[cfg(test)]
 mod tests {
     use clap::Parser;
+    use model_store::flm::FlmStage3DirectWeightKind;
     use model_store::manifest::LayoutTag;
 
     use super::*;
@@ -119,11 +155,46 @@ mod tests {
     }
 
     #[test]
-    fn maps_moe_mixed_lowbit_flm_to_int4_weight_mode() {
-        let mode =
-            qwen36_moe_flm_weight_mode(None).expect("missing probe fixtures default to INT4");
+    fn maps_native_stage3_direct_plan_to_int4_weight_mode() {
+        let selection = qwen36_moe_flm_weight_selection_from_stage3_kind(Some(
+            FlmStage3DirectWeightKind::NativeInt4,
+        ))
+        .expect("native Stage 3 direct plan should select native INT4");
 
-        assert_eq!(mode, Qwen36WeightMode::Int4);
+        assert_eq!(selection.mode, Qwen36WeightMode::Int4);
+        assert_eq!(selection.label, "INT4 native FLM");
+    }
+
+    #[test]
+    fn maps_ct_stage3_direct_plan_to_bf16_fallback_weight_mode() {
+        let selection = qwen36_moe_flm_weight_selection_from_stage3_kind(Some(
+            FlmStage3DirectWeightKind::CtInt4Bf16Fallback,
+        ))
+        .expect("CT Stage 3 direct plan should select BF16 fallback");
+
+        assert_eq!(selection.mode, Qwen36WeightMode::Bf16);
+        assert_eq!(selection.label, "BF16");
+    }
+
+    #[test]
+    fn maps_raw_dense_stage3_direct_plan_to_bf16_weight_mode() {
+        let selection = qwen36_moe_flm_weight_selection_from_stage3_kind(Some(
+            FlmStage3DirectWeightKind::RawDense,
+        ))
+        .expect("raw dense Stage 3 direct plan should select BF16");
+
+        assert_eq!(selection.mode, Qwen36WeightMode::Bf16);
+        assert_eq!(selection.label, "BF16");
+    }
+
+    #[test]
+    fn rejects_missing_stage3_direct_weight_plan() {
+        let err = qwen36_moe_flm_weight_selection_from_stage3_kind(None)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("direct weight plan"), "{err}");
+        assert!(err.contains(QWEN36_MOE_WEIGHT_MODE_PROBE), "{err}");
     }
 
     #[test]

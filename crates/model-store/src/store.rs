@@ -3940,6 +3940,86 @@ mod tests {
     }
 
     #[test]
+    fn flm_runtime_classifies_ct_int4_stage3_plan_as_bf16_fallback() {
+        let data = build_test_flm_with_stage3_logical_bindings();
+        let file = write_temp_flm(&data);
+
+        let store = BakedStore::open_flm_with_options(
+            file.path(),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                verify_block_hashes: false,
+            },
+        )
+        .expect("open CT INT4 Stage 3 FLM");
+
+        let kind = store
+            .flm_runtime()
+            .expect("runtime directory")
+            .stage3_direct_weight_kind("model.language_model.layers.0.mlp.gate_proj.weight")
+            .expect("classify direct weight kind");
+
+        assert_eq!(
+            kind,
+            Some(crate::flm::FlmStage3DirectWeightKind::CtInt4Bf16Fallback)
+        );
+    }
+
+    #[test]
+    fn flm_runtime_classifies_native_int4_stage3_plan() {
+        let data = build_test_flm_with_stage3_native_int4_bindings();
+        let file = write_temp_flm(&data);
+
+        let store = BakedStore::open_flm_with_options(
+            file.path(),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                verify_block_hashes: false,
+            },
+        )
+        .expect("open native INT4 Stage 3 FLM");
+
+        let kind = store
+            .flm_runtime()
+            .expect("runtime directory")
+            .stage3_direct_weight_kind("model.language_model.layers.0.mlp.experts.gate_up_proj")
+            .expect("classify direct weight kind");
+
+        assert_eq!(
+            kind,
+            Some(crate::flm::FlmStage3DirectWeightKind::NativeInt4)
+        );
+    }
+
+    #[test]
+    fn flm_runtime_classifies_raw_dense_stage3_plan() {
+        let data = build_test_flm_with_stage3_raw_value_binding();
+        let file = write_temp_flm(&data);
+
+        let store = BakedStore::open_flm_with_options(
+            file.path(),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                verify_block_hashes: false,
+            },
+        )
+        .expect("open raw dense Stage 3 FLM");
+
+        let runtime = store.flm_runtime().expect("runtime directory");
+        let kind = runtime
+            .stage3_direct_weight_kind("model.language_model.layers.0.linear_attn.A_log")
+            .expect("classify direct weight kind");
+
+        assert_eq!(kind, Some(crate::flm::FlmStage3DirectWeightKind::RawDense));
+        assert_eq!(
+            runtime
+                .stage3_direct_weight_kind("model.language_model.layers.0.missing.weight")
+                .expect("missing logical tensor is not an error"),
+            None
+        );
+    }
+
+    #[test]
     fn open_flm_rejects_native_int4_stage3_binding_with_non_native_abi() {
         let mut data = build_test_flm_with_stage3_native_int4_bindings();
         put_first_storage_abi_codec_semantic(&mut data, crate::flm::CODEC_SYM_INT4_G128_BF16);
