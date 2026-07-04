@@ -58,11 +58,7 @@ pub(crate) fn prepare_prompt_with_tokenizer(
         .as_ref()
         .and_then(|v| v.as_u64())
         .unwrap_or(0) as u32;
-    let eos_id = text_config
-        .eos_token_id
-        .as_ref()
-        .and_then(|v| v.as_u64())
-        .map(|v| v as u32);
+    let eos_id = text_config.eos_token_ids().into_iter().next();
 
     let prompt_ids = match (&tokenizer, prompt.is_empty()) {
         (Some(tok), false) => {
@@ -145,6 +141,17 @@ mod tests {
             .expect("prompt setup");
 
         assert!(setup.tokenizer.is_some());
+        assert_eq!(setup.prompt_ids, vec![7]);
+        assert_eq!(setup.eos_id, Some(9));
+    }
+
+    #[test]
+    fn prepare_prompt_uses_first_eos_from_token_id_array() {
+        let mut config = text_config_with_bos_eos();
+        config.eos_token_id = Some(serde_json::json!([9, 10]));
+
+        let setup = prepare_prompt_with_tokenizer(None, &config, "").expect("prompt setup");
+
         assert_eq!(setup.prompt_ids, vec![7]);
         assert_eq!(setup.eos_id, Some(9));
     }
