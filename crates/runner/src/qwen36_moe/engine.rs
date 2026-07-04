@@ -48,7 +48,10 @@ use crate::qwen36_moe_cli::vmm::{
     load_decode_layers_with_vmm_strategy, print_virtual_kv_stats_if_active,
     virtual_kv_stats_for_layers, Qwen36LayerLoadTimings,
 };
-use crate::qwen36_moe_cli::vmm_config::{prepare_moe_runtime_config, should_use_qwen36_kv_vmm};
+use crate::qwen36_moe_cli::vmm_config::{
+    effective_moe_expert_vmm_mode_for_transfer_backend, prepare_moe_runtime_config,
+    should_use_qwen36_kv_vmm,
+};
 use crate::qwen36_moe_logits::XorshiftRng;
 use crate::qwen36_moe_speculative::SpeculativeStepResult;
 use crate::qwen36_moe_telemetry::{print_and_write_moe_residency_summary, MoeRouteRuntime};
@@ -1022,6 +1025,11 @@ fn decode_text(
         gpu_hal::hal_profile_set_enabled(true);
         gpu_hal::hal_profile_reset();
     }
+    let effective_moe_vmm_mode = effective_moe_expert_vmm_mode_for_transfer_backend(
+        moe_runtime.vmm_mode,
+        moe_runtime.island_cap_experts,
+        moe_runtime.virtual_transfer_backend,
+    )?;
     let loaded_layers = match load_decode_layers_with_vmm_strategy(
         &store,
         ordinal,
@@ -1033,7 +1041,7 @@ fn decode_text(
         kv_max_t,
         kv_fp8,
         kv_vmm,
-        moe_runtime.vmm_mode,
+        effective_moe_vmm_mode,
         moe_runtime.island_cap_experts,
         moe_runtime.protected_experts,
         moe_runtime.fixed_hot_experts,
@@ -1044,6 +1052,7 @@ fn decode_text(
         moe_runtime.async_staging_pages,
         moe_runtime.prefetch_evict,
         moe_runtime.prefetch_evict_min_probability,
+        moe_runtime.virtual_transfer_backend,
         persistent_decode,
     ) {
         Ok(loaded_layers) => loaded_layers,

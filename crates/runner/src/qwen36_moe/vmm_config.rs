@@ -2,6 +2,7 @@ use std::ops::{Deref, DerefMut};
 
 use anyhow::Result;
 use gpu_hal::Backend;
+use model_store::VirtualArenaTransferBackend;
 use supersonic_runtime::qwen36_moe_config::{
     qwen36_kv_vmm_mode_from_env_value, should_use_qwen36_kv_vmm as should_use_qwen36_kv_vmm_mode,
     Qwen36MoeRuntimeConfig, Qwen36MoeRuntimeConfigInputs,
@@ -16,6 +17,7 @@ pub(crate) use supersonic_runtime::qwen36_moe_config::{
 pub(crate) struct MoeRuntimeConfig {
     policy: Qwen36MoeRuntimeConfig,
     pub(crate) sparse_telemetry: Option<MoeSparseTelemetry>,
+    pub(crate) virtual_transfer_backend: VirtualArenaTransferBackend,
 }
 
 impl Deref for MoeRuntimeConfig {
@@ -54,6 +56,7 @@ pub(crate) fn prepare_moe_runtime_config(
     let protect_demand_routes = std::env::var("SUPERSONIC_MOE_ISLAND_PROTECT_DEMAND").ok();
     let hot_protect_min_hits = std::env::var("SUPERSONIC_MOE_ISLAND_HOT_PROTECT_MIN_HITS").ok();
     let fixed_hot_min_hits = std::env::var("SUPERSONIC_MOE_ISLAND_FIXED_HOT_MIN_HITS").ok();
+    let virtual_transfer_backend = std::env::var("SUPERSONIC_FLM_VIRTUAL_TRANSFER_BACKEND").ok();
 
     let inputs = Qwen36MoeRuntimeConfigInputs {
         vmm_mode: vmm_mode.as_deref(),
@@ -92,6 +95,9 @@ pub(crate) fn prepare_moe_runtime_config(
     Ok(MoeRuntimeConfig {
         policy,
         sparse_telemetry,
+        virtual_transfer_backend: virtual_arena_transfer_backend_from_env_value(
+            virtual_transfer_backend.as_deref(),
+        )?,
     })
 }
 
@@ -99,4 +105,121 @@ pub(crate) fn should_use_qwen36_kv_vmm(backend: Backend, ordinal: usize) -> Resu
     let raw = std::env::var("SUPERSONIC_VMM_KV").ok();
     let mode = qwen36_kv_vmm_mode_from_env_value(raw.as_deref(), backend)?;
     should_use_qwen36_kv_vmm_mode(mode, backend, ordinal)
+}
+
+pub(crate) fn effective_moe_expert_vmm_mode_for_transfer_backend(
+    mode: MoeExpertVmmMode,
+    island_cap_experts: Option<usize>,
+    backend: VirtualArenaTransferBackend,
+) -> Result<MoeExpertVmmMode> {
+    if backend == VirtualArenaTransferBackend::PageableH2d || island_cap_experts.is_some() {
+        return Ok(mode);
+    }
+    match mode {
+        MoeExpertVmmMode::Auto => Ok(MoeExpertVmmMode::Force),
+        MoeExpertVmmMode::Force => Ok(MoeExpertVmmMode::Force),
+        MoeExpertVmmMode::Disabled => anyhow::bail!(
+            "SUPERSONIC_FLM_VIRTUAL_TRANSFER_BACKEND=gpu-direct-storage requires MoE expert VMM; \
+             unset SUPERSONIC_VMM_MOE_ISLANDS=0"
+        ),
+    }
+}
+
+pub(crate) fn virtual_arena_transfer_backend_from_env_value(
+    value: Option<&str>,
+) -> Result<VirtualArenaTransferBackend> {
+    let Some(value) = value else {
+        return Ok(VirtualArenaTransferBackend::PageableH2d);
+    };
+    let value = value.trim().to_ascii_lowercase();
+    if value.is_empty() {
+        return Ok(VirtualArenaTransferBackend::PageableH2d);
+    }
+    match value.as_str() {
+        "pageable" | "pageable-h2d" | "h2d" => Ok(VirtualArenaTransferBackend::PageableH2d),
+        "gpu-direct-storage" | "gpu_direct_storage" | "gds" | "hipfile" => {
+            Ok(VirtualArenaTransferBackend::GpuDirectStorage)
+        }
+        _ => anyhow::bail!(
+            "SUPERSONIC_FLM_VIRTUAL_TRANSFER_BACKEND must be one of \
+             pageable-h2d, gpu-direct-storage, gds, or hipfile (got {value:?})"
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use model_store::VirtualArenaTransferBackend;
+
+    #[test]
+    fn flm_virtual_transfer_backend_env_defaults_to_pageable_h2d() {
+        assert_eq!(
+            virtual_arena_transfer_backend_from_env_value(None).unwrap(),
+            VirtualArenaTransferBackend::PageableH2d
+        );
+        assert_eq!(
+            virtual_arena_transfer_backend_from_env_value(Some("")).unwrap(),
+            VirtualArenaTransferBackend::PageableH2d
+        );
+        assert_eq!(
+            virtual_arena_transfer_backend_from_env_value(Some("pageable-h2d")).unwrap(),
+            VirtualArenaTransferBackend::PageableH2d
+        );
+    }
+
+    #[test]
+    fn flm_virtual_transfer_backend_env_accepts_direct_storage_aliases() {
+        for value in ["gpu-direct-storage", "gds", "hipfile"] {
+            assert_eq!(
+                virtual_arena_transfer_backend_from_env_value(Some(value)).unwrap(),
+                VirtualArenaTransferBackend::GpuDirectStorage
+            );
+        }
+    }
+
+    #[test]
+    fn flm_virtual_transfer_backend_env_rejects_unknown_values() {
+        let err = virtual_arena_transfer_backend_from_env_value(Some("maybe")).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("SUPERSONIC_FLM_VIRTUAL_TRANSFER_BACKEND"));
+    }
+
+    #[test]
+    fn flm_direct_transfer_backend_forces_eager_virtual_expert_route() {
+        assert_eq!(
+            effective_moe_expert_vmm_mode_for_transfer_backend(
+                MoeExpertVmmMode::Auto,
+                None,
+                VirtualArenaTransferBackend::GpuDirectStorage,
+            )
+            .unwrap(),
+            MoeExpertVmmMode::Force
+        );
+        assert_eq!(
+            effective_moe_expert_vmm_mode_for_transfer_backend(
+                MoeExpertVmmMode::Auto,
+                None,
+                VirtualArenaTransferBackend::PageableH2d,
+            )
+            .unwrap(),
+            MoeExpertVmmMode::Auto
+        );
+        assert!(effective_moe_expert_vmm_mode_for_transfer_backend(
+            MoeExpertVmmMode::Disabled,
+            None,
+            VirtualArenaTransferBackend::GpuDirectStorage,
+        )
+        .is_err());
+        assert_eq!(
+            effective_moe_expert_vmm_mode_for_transfer_backend(
+                MoeExpertVmmMode::Auto,
+                Some(8),
+                VirtualArenaTransferBackend::GpuDirectStorage,
+            )
+            .unwrap(),
+            MoeExpertVmmMode::Auto
+        );
+    }
 }

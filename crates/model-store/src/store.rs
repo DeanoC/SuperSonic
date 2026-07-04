@@ -2049,13 +2049,30 @@ impl BakedStore {
         name: &str,
         role: VirtualAllocationRole,
     ) -> Result<usize, Error> {
+        self.load_to_virtual_arena_with_backend(
+            arena,
+            name,
+            role,
+            VirtualArenaTransferBackend::PageableH2d,
+        )
+    }
+
+    /// Load a tensor into a role-tagged virtual allocation through an explicit
+    /// transfer backend.
+    pub fn load_to_virtual_arena_with_backend(
+        &self,
+        arena: &mut VirtualArena,
+        name: &str,
+        role: VirtualAllocationRole,
+        backend: VirtualArenaTransferBackend,
+    ) -> Result<usize, Error> {
         let id = self.reserve_virtual_arena(arena, name, role)?;
         let len = self
             .index
             .get(name)
             .ok_or_else(|| Error::NotFound(name.to_string()))?
             .byte_len as usize;
-        self.load_range_to_virtual_arena(arena, id, name, 0, len)?;
+        self.load_range_to_virtual_arena_with_backend(arena, id, name, 0, len, backend)?;
         Ok(id)
     }
 
@@ -6875,6 +6892,75 @@ mod tests {
                 VirtualArenaTransferBackend::GpuDirectStorage,
             )
             .expect_err("GPU-direct storage backend should be named but not silently emulated");
+        let profile = gpu_hal::hal_profile_snapshot();
+        gpu_hal::hal_profile_set_enabled(false);
+
+        assert!(
+            err.to_string().contains("GPU-direct storage"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            profile
+                .entries
+                .iter()
+                .all(|entry| entry.op != "copy_h2d" && entry.op != "vmm_map_no_sync"),
+            "GPU-direct backend must not fall back to pageable mapping/copy: {:?}",
+            profile.entries
+        );
+        assert_eq!(arena.stats().logical_resident_bytes, 0);
+    }
+
+    #[test]
+    fn virtual_arena_full_load_honors_explicit_gpu_direct_backend() {
+        gpu_hal::set_backend(gpu_hal::Backend::Hip);
+        if !gpu_hal::vmm_is_supported(gpu_hal::Backend::Hip, 0) {
+            eprintln!("skip: HIP VMM unsupported on this device/runtime");
+            return;
+        }
+        if gpu_hal::storage_to_device_is_supported(gpu_hal::Backend::Hip) {
+            eprintln!("skip: native storage-to-device transfer available on this runtime");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bake_dir = tmp.path();
+        std::fs::write(crate::weights_bin_path(bake_dir), vec![9u8; 4096])
+            .expect("write weights.bin");
+        let manifest = Manifest {
+            format_version: FORMAT_VERSION,
+            converter_version: 1,
+            model_family: "test".to_string(),
+            quant_profile: None,
+            source_format: None,
+            source_quant: None,
+            quant_method: None,
+            tensors: vec![TensorMeta {
+                name: "model.layers.0.mlp.experts.down_proj".to_string(),
+                shape: vec![4096],
+                dtype: "u8".to_string(),
+                layout: LayoutTag::Int4Quantized,
+                offset: 0,
+                byte_len: 4096,
+            }],
+        };
+        std::fs::write(
+            crate::manifest_path(bake_dir),
+            serde_json::to_string(&manifest).expect("serialize manifest"),
+        )
+        .expect("write manifest");
+
+        let store = BakedStore::open(bake_dir).expect("open synthetic bake");
+        let mut arena = BakedStore::virtual_weight_arena(0);
+        gpu_hal::hal_profile_set_enabled(true);
+        gpu_hal::hal_profile_reset();
+        let err = store
+            .load_to_virtual_arena_with_backend(
+                &mut arena,
+                "model.layers.0.mlp.experts.down_proj",
+                gpu_hal::VirtualAllocationRole::MoeExpert,
+                VirtualArenaTransferBackend::GpuDirectStorage,
+            )
+            .expect_err("full virtual load should honor explicit GPU-direct backend");
         let profile = gpu_hal::hal_profile_snapshot();
         gpu_hal::hal_profile_set_enabled(false);
 

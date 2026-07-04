@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use gpu_hal::{Backend, VirtualArena};
-use model_store::BakedStore;
+use model_store::{BakedStore, VirtualArenaTransferBackend};
 use qwen36_moe::config::TextConfig;
 
 use crate::qwen36_moe_cli::layers::{load_all_layer_buffers, Qwen36WeightMode};
@@ -58,6 +58,7 @@ pub(crate) fn load_decode_layers_with_vmm_strategy(
     moe_async_staging_pages: usize,
     moe_prefetch_evict: bool,
     moe_prefetch_evict_min_probability: f64,
+    moe_virtual_transfer_backend: VirtualArenaTransferBackend,
     persistent_decode: bool,
 ) -> Result<Qwen36DecodeLayers> {
     if let Some(cap_experts) = moe_island_cap_experts {
@@ -78,7 +79,8 @@ pub(crate) fn load_decode_layers_with_vmm_strategy(
             unreachable!("forced VMM expert check should either return true or error");
         }
         let config = MoeExpertResidencyConfig::new(1)?.with_prefetch_evict(moe_prefetch_evict);
-        let mut manager = MoeExpertResidencyManager::new(ordinal, config);
+        let mut manager = MoeExpertResidencyManager::new(ordinal, config)
+            .with_virtual_transfer_backend(moe_virtual_transfer_backend);
         let buffers_start = std::time::Instant::now();
         let layers = load_all_layer_buffers(
             store,
@@ -92,6 +94,7 @@ pub(crate) fn load_decode_layers_with_vmm_strategy(
             kv_vmm,
             None,
             Some(&mut manager),
+            moe_virtual_transfer_backend,
         )
         .context("reserve Qwen3.6-MoE routed experts for sparse VMM residency")?;
         let buffers_elapsed = buffers_start.elapsed();
@@ -102,7 +105,9 @@ pub(crate) fn load_decode_layers_with_vmm_strategy(
         manager
             .set_max_resident_pages(max_resident_pages)
             .context("apply sparse MoE page budget")?;
-        if moe_async_prefetch {
+        let storage_direct =
+            moe_virtual_transfer_backend == VirtualArenaTransferBackend::GpuDirectStorage;
+        if moe_async_prefetch && !storage_direct {
             manager
                 .enable_async_prefetch(moe_async_staging_pages)
                 .context("enable sparse MoE async prefetch")?;
@@ -165,10 +170,18 @@ pub(crate) fn load_decode_layers_with_vmm_strategy(
                 );
             }
         }
-        if moe_async_prefetch {
+        if moe_async_prefetch && !storage_direct {
             println!(
                 "  [vmm] sparse MoE async page-in active (staging_pages={moe_async_staging_pages})"
             );
+        }
+        if storage_direct {
+            println!("  [vmm] sparse MoE virtual page-in transfer backend: gpu-direct-storage");
+            if moe_async_prefetch {
+                println!(
+                    "  [vmm] sparse MoE async page-in disabled for gpu-direct-storage backend"
+                );
+            }
         }
         if moe_prefetch_evict {
             println!(
@@ -210,6 +223,7 @@ pub(crate) fn load_decode_layers_with_vmm_strategy(
             kv_vmm,
             Some(&mut arena),
             None,
+            moe_virtual_transfer_backend,
         ) {
             Ok(layers) => {
                 let buffers_elapsed = buffers_start.elapsed();
@@ -260,6 +274,7 @@ pub(crate) fn load_decode_layers_with_vmm_strategy(
         kv_vmm,
         None,
         None,
+        moe_virtual_transfer_backend,
     )?;
     let buffers_elapsed = buffers_start.elapsed();
     Ok(Qwen36DecodeLayers {

@@ -5,7 +5,7 @@ use gpu_hal::{
     current_backend, Backend, GpuBuffer, ScalarType, VirtualAllocationRole, VirtualArena,
 };
 use model_store::manifest::LayoutTag;
-use model_store::{BakedStore, TensorStorageExtent};
+use model_store::{BakedStore, TensorStorageExtent, VirtualArenaTransferBackend};
 use qwen36_moe::config::TextConfig;
 
 use crate::qwen36_moe_residency::MoeExpertResidencyManager;
@@ -53,10 +53,16 @@ fn load_to_virtual_resident_weight(
     store: &BakedStore,
     arena: &mut VirtualArena,
     name: &str,
+    transfer_backend: VirtualArenaTransferBackend,
 ) -> Result<ResidentWeight> {
     let resolved = resolve_qwen36_store_name(store, name);
     let id = store
-        .load_to_virtual_arena(arena, resolved.as_ref(), VirtualAllocationRole::MoeExpert)
+        .load_to_virtual_arena_with_backend(
+            arena,
+            resolved.as_ref(),
+            VirtualAllocationRole::MoeExpert,
+            transfer_backend,
+        )
         .with_context(|| format!("BakedStore::load_to_virtual_arena({name})"))?;
     let allocation = arena
         .allocation(id)
@@ -338,6 +344,7 @@ pub(crate) fn load_layer_buffers(
     kv_vmm: bool,
     mut expert_arena: Option<&mut VirtualArena>,
     mut expert_residency: Option<&mut MoeExpertResidencyManager>,
+    expert_virtual_transfer_backend: VirtualArenaTransferBackend,
 ) -> Result<LayerBuffers> {
     let lp = format!("{weight_prefix}.layers.{layer_idx}");
 
@@ -923,6 +930,7 @@ pub(crate) fn load_layer_buffers(
                     store,
                     &mut **arena,
                     &format!("{mp}.experts.gate_up_proj"),
+                    expert_virtual_transfer_backend,
                 )?,
                 None => {
                     load_to_resident_weight(store, ordinal, &format!("{mp}.experts.gate_up_proj"))?
@@ -944,6 +952,7 @@ pub(crate) fn load_layer_buffers(
                     store,
                     &mut **arena,
                     &format!("{mp}.experts.down_proj"),
+                    expert_virtual_transfer_backend,
                 )?,
                 None => {
                     load_to_resident_weight(store, ordinal, &format!("{mp}.experts.down_proj"))?
@@ -988,6 +997,7 @@ pub(crate) fn load_all_layer_buffers(
     kv_vmm: bool,
     mut expert_arena: Option<&mut VirtualArena>,
     mut expert_residency: Option<&mut MoeExpertResidencyManager>,
+    expert_virtual_transfer_backend: VirtualArenaTransferBackend,
 ) -> Result<Vec<LayerBuffers>> {
     let mut layers = Vec::with_capacity(geom.num_layers as usize);
     for li in 0..geom.num_layers as usize {
@@ -1004,6 +1014,7 @@ pub(crate) fn load_all_layer_buffers(
             kv_vmm,
             expert_arena.as_deref_mut(),
             expert_residency.as_deref_mut(),
+            expert_virtual_transfer_backend,
         )
         .with_context(|| format!("load layer {li} weights"))?;
         layers.push(layer);
