@@ -977,6 +977,55 @@ class BenchQwen36HeSuperSonicTests(unittest.TestCase):
             },
         )
 
+    def test_run_one_flm_profile_fails_without_first_class_flm_evidence(self):
+        args = types.SimpleNamespace(
+            binary=Path("target/release/supersonic"),
+            backend="hip",
+            model=None,
+            model_dir=bench.DEFAULT_35B_A3B_FLM_MODEL_DIR,
+            context_size=16,
+            warmup_new_tokens=1,
+            n_gen=1,
+            seed=1,
+            prompt_no_special_tokens=False,
+            quant="none",
+            ignore_eos=True,
+            emit_stage_timings=True,
+            kv_fp8=False,
+            dflash=False,
+            dflash_block=0,
+            dflash_draft_variant=None,
+            dflash_draft_dir=bench.DEFAULT_SUPERSONIC_DFLASH_DRAFT_DIR,
+            dflash_draft_gguf=None,
+            timeout=10,
+            tail_chars=200,
+            allow_untested_gpu=None,
+            hal_profile=False,
+            runner_env=[],
+            flm_virtual_transfer_backend=None,
+        )
+        completed = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="",
+            stderr="[result] prompt_tokens=1 generated_tokens=1 decode_ms=10 ms_per_step=10\n",
+        )
+
+        with mock.patch.object(bench.subprocess, "run", return_value=completed):
+            row = bench.run_one(args, "case", "Hello")
+
+        self.assertEqual(row["returncode"], 1)
+        self.assertEqual(row["runner_returncode"], 0)
+        self.assertEqual(
+            row["benchmark_validation_errors"],
+            [
+                "FLM run did not report inferred model from runtime descriptor",
+                "FLM run did not report INT4 native FLM weight mode",
+                "FLM run did not report ready-for-decode YES",
+                "FLM run did not report native INT4 direct plan coverage",
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

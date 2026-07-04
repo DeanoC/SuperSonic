@@ -295,6 +295,32 @@ def parse_runner_env_overrides(items: list[str] | None) -> dict[str, str]:
     return overrides
 
 
+def requires_flm_first_class_evidence(args: argparse.Namespace) -> bool:
+    model_dir = getattr(args, "model_dir", None)
+    return isinstance(model_dir, Path) and model_dir.suffix == ".flm"
+
+
+def flm_first_class_validation_errors(args: argparse.Namespace, row: dict) -> list[str]:
+    errors: list[str] = []
+    if (
+        getattr(args, "model", None) is None
+        and row.get("resolved_model") != DEFAULT_35B_A3B_MODEL
+    ):
+        errors.append("FLM run did not report inferred model from runtime descriptor")
+    if row.get("flm_weight_mode") != "INT4 native FLM":
+        errors.append("FLM run did not report INT4 native FLM weight mode")
+    if row.get("flm_ready_for_decode") is not True:
+        errors.append("FLM run did not report ready-for-decode YES")
+    direct_profile = row.get("flm_direct_profile")
+    if (
+        not isinstance(direct_profile, dict)
+        or int(direct_profile.get("native_int4", 0)) <= 0
+        or int(direct_profile.get("bf16_fallback", 0)) != 0
+    ):
+        errors.append("FLM run did not report native INT4 direct plan coverage")
+    return errors
+
+
 def apply_target_profile(args: argparse.Namespace) -> None:
     profile = TARGET_PROFILES[args.target_profile]
     if args.model is None:
@@ -442,6 +468,12 @@ def run_one(args: argparse.Namespace, name: str, prompt: str, warmup: bool = Fal
         row["dflash_draft_label"] = dflash_draft_label
         row["dflash_draft_dir"] = str(dflash_draft_dir)
         row["dflash_draft_gguf"] = str(dflash_draft_gguf) if dflash_draft_gguf else None
+    if proc.returncode == 0 and requires_flm_first_class_evidence(args):
+        validation_errors = flm_first_class_validation_errors(args, row)
+        if validation_errors:
+            row["runner_returncode"] = proc.returncode
+            row["returncode"] = 1
+            row["benchmark_validation_errors"] = validation_errors
     return row
 
 
