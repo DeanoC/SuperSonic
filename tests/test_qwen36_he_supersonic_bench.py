@@ -702,6 +702,48 @@ class BenchQwen36HeSuperSonicTests(unittest.TestCase):
             },
         )
 
+    def test_run_one_forwards_flm_virtual_transfer_backend_flag(self):
+        args = types.SimpleNamespace(
+            binary=Path("target/release/supersonic"),
+            backend="hip",
+            model=None,
+            model_dir=bench.DEFAULT_35B_A3B_FLM_MODEL_DIR,
+            context_size=16,
+            warmup_new_tokens=1,
+            n_gen=1,
+            seed=1,
+            prompt_no_special_tokens=False,
+            quant="none",
+            ignore_eos=True,
+            emit_stage_timings=True,
+            kv_fp8=False,
+            dflash=False,
+            dflash_block=0,
+            dflash_draft_variant=None,
+            dflash_draft_dir=bench.DEFAULT_SUPERSONIC_DFLASH_DRAFT_DIR,
+            dflash_draft_gguf=None,
+            timeout=10,
+            tail_chars=200,
+            allow_untested_gpu=None,
+            hal_profile=False,
+            runner_env=[],
+            flm_virtual_transfer_backend="hipfile",
+        )
+        completed = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="",
+            stderr="[result] prompt_tokens=1 generated_tokens=1 decode_ms=10 ms_per_step=10\n",
+        )
+
+        with mock.patch.object(bench.subprocess, "run", return_value=completed) as run:
+            row = bench.run_one(args, "case", "Hello")
+
+        cmd = run.call_args.args[0]
+        self.assertIn("--flm-virtual-transfer-backend", cmd)
+        self.assertIn("hipfile", cmd)
+        self.assertEqual(row["flm_virtual_transfer_backend"], "hipfile")
+
     def test_run_one_flm_profile_omits_int4_and_records_lifecycle_timings(self):
         args = types.SimpleNamespace(
             binary=Path("target/release/supersonic"),

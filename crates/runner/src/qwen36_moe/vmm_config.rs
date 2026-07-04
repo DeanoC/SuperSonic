@@ -39,6 +39,7 @@ pub(crate) fn prepare_moe_runtime_config(
     persistent_decode: bool,
     backend: Backend,
     top_k: usize,
+    flm_virtual_transfer_backend_cli: Option<&str>,
 ) -> Result<MoeRuntimeConfig> {
     let vmm_mode = std::env::var("SUPERSONIC_VMM_MOE_ISLANDS").ok();
     let island_cap_experts = std::env::var("SUPERSONIC_MOE_ISLAND_CAP_EXPERTS").ok();
@@ -56,7 +57,8 @@ pub(crate) fn prepare_moe_runtime_config(
     let protect_demand_routes = std::env::var("SUPERSONIC_MOE_ISLAND_PROTECT_DEMAND").ok();
     let hot_protect_min_hits = std::env::var("SUPERSONIC_MOE_ISLAND_HOT_PROTECT_MIN_HITS").ok();
     let fixed_hot_min_hits = std::env::var("SUPERSONIC_MOE_ISLAND_FIXED_HOT_MIN_HITS").ok();
-    let virtual_transfer_backend = std::env::var("SUPERSONIC_FLM_VIRTUAL_TRANSFER_BACKEND").ok();
+    let virtual_transfer_backend_env =
+        std::env::var("SUPERSONIC_FLM_VIRTUAL_TRANSFER_BACKEND").ok();
 
     let inputs = Qwen36MoeRuntimeConfigInputs {
         vmm_mode: vmm_mode.as_deref(),
@@ -95,8 +97,9 @@ pub(crate) fn prepare_moe_runtime_config(
     Ok(MoeRuntimeConfig {
         policy,
         sparse_telemetry,
-        virtual_transfer_backend: virtual_arena_transfer_backend_from_env_value(
-            virtual_transfer_backend.as_deref(),
+        virtual_transfer_backend: virtual_arena_transfer_backend_from_cli_or_env_value(
+            flm_virtual_transfer_backend_cli,
+            virtual_transfer_backend_env.as_deref(),
         )?,
     })
 }
@@ -119,7 +122,7 @@ pub(crate) fn effective_moe_expert_vmm_mode_for_transfer_backend(
         MoeExpertVmmMode::Auto => Ok(MoeExpertVmmMode::Force),
         MoeExpertVmmMode::Force => Ok(MoeExpertVmmMode::Force),
         MoeExpertVmmMode::Disabled => anyhow::bail!(
-            "SUPERSONIC_FLM_VIRTUAL_TRANSFER_BACKEND=gpu-direct-storage requires MoE expert VMM; \
+            "FLM virtual transfer backend gpu-direct-storage requires MoE expert VMM; \
              unset SUPERSONIC_VMM_MOE_ISLANDS=0"
         ),
     }
@@ -127,6 +130,25 @@ pub(crate) fn effective_moe_expert_vmm_mode_for_transfer_backend(
 
 pub(crate) fn virtual_arena_transfer_backend_from_env_value(
     value: Option<&str>,
+) -> Result<VirtualArenaTransferBackend> {
+    virtual_arena_transfer_backend_from_value(value, "SUPERSONIC_FLM_VIRTUAL_TRANSFER_BACKEND")
+}
+
+pub(crate) fn virtual_arena_transfer_backend_from_cli_or_env_value(
+    cli_value: Option<&str>,
+    env_value: Option<&str>,
+) -> Result<VirtualArenaTransferBackend> {
+    match cli_value {
+        Some(value) => {
+            virtual_arena_transfer_backend_from_value(Some(value), "--flm-virtual-transfer-backend")
+        }
+        None => virtual_arena_transfer_backend_from_env_value(env_value),
+    }
+}
+
+fn virtual_arena_transfer_backend_from_value(
+    value: Option<&str>,
+    source_label: &str,
 ) -> Result<VirtualArenaTransferBackend> {
     let Some(value) = value else {
         return Ok(VirtualArenaTransferBackend::PageableH2d);
@@ -141,8 +163,8 @@ pub(crate) fn virtual_arena_transfer_backend_from_env_value(
             Ok(VirtualArenaTransferBackend::GpuDirectStorage)
         }
         _ => anyhow::bail!(
-            "SUPERSONIC_FLM_VIRTUAL_TRANSFER_BACKEND must be one of \
-             pageable-h2d, gpu-direct-storage, gds, or hipfile (got {value:?})"
+            "{source_label} must be one of pageable-h2d, gpu-direct-storage, gds, or hipfile \
+             (got {value:?})"
         ),
     }
 }
@@ -184,6 +206,40 @@ mod tests {
         assert!(err
             .to_string()
             .contains("SUPERSONIC_FLM_VIRTUAL_TRANSFER_BACKEND"));
+    }
+
+    #[test]
+    fn flm_virtual_transfer_backend_cli_value_overrides_env_value() {
+        assert_eq!(
+            virtual_arena_transfer_backend_from_cli_or_env_value(
+                Some("pageable-h2d"),
+                Some("hipfile"),
+            )
+            .unwrap(),
+            VirtualArenaTransferBackend::PageableH2d
+        );
+        assert_eq!(
+            virtual_arena_transfer_backend_from_cli_or_env_value(Some("hipfile"), Some("h2d"))
+                .unwrap(),
+            VirtualArenaTransferBackend::GpuDirectStorage
+        );
+    }
+
+    #[test]
+    fn flm_virtual_transfer_backend_env_remains_fallback_when_cli_omitted() {
+        assert_eq!(
+            virtual_arena_transfer_backend_from_cli_or_env_value(None, Some("hipfile")).unwrap(),
+            VirtualArenaTransferBackend::GpuDirectStorage
+        );
+    }
+
+    #[test]
+    fn flm_virtual_transfer_backend_reports_cli_flag_for_bad_cli_value() {
+        let err =
+            virtual_arena_transfer_backend_from_cli_or_env_value(Some("maybe"), Some("hipfile"))
+                .unwrap_err();
+
+        assert!(err.to_string().contains("--flm-virtual-transfer-backend"));
     }
 
     #[test]

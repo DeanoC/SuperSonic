@@ -76,18 +76,20 @@ deregisters the buffer before returning. This keeps the explicit
 an internal bounce path while we are trying to measure direct storage-to-device
 load performance.
 
-The runtime selector is `SUPERSONIC_FLM_VIRTUAL_TRANSFER_BACKEND`. It defaults
-to `pageable-h2d`; `gpu-direct-storage`, `gds`, or `hipfile` selects the named
-storage-to-device backend for MoE expert virtual arena loads, covering both
-sparse residency page-in and eager virtual expert slab loads. This selector is
-deliberately explicit while hipFile availability is platform-dependent. If it
-is forced on a build without hipFile support, the loader must fail before
-pageable mapping/copy rather than timing an accidental fallback. Selecting
-`hipfile` without `SUPERSONIC_MOE_ISLAND_CAP_EXPERTS` forces the eager routed
-expert VMM path so a dense-fit model cannot silently bypass the requested
-storage-to-device backend. Current sparse async MoE page-in uses pinned host
-staging, so the `hipfile` backend disables that async staging path until direct
-asynchronous storage reads are implemented.
+The runtime selector is `--flm-virtual-transfer-backend`, with
+`SUPERSONIC_FLM_VIRTUAL_TRANSFER_BACKEND` kept as an environment fallback. It
+defaults to `pageable-h2d`; `gpu-direct-storage`, `gds`, or `hipfile` selects
+the named storage-to-device backend for MoE expert virtual arena loads, covering
+both sparse residency page-in and eager virtual expert slab loads. This selector
+is deliberately explicit while hipFile availability is platform-dependent, and
+the CLI value wins over the env var when both are present. If it is forced on a
+build without hipFile support, the loader must fail before pageable mapping/copy
+rather than timing an accidental fallback. Selecting `hipfile` without
+`SUPERSONIC_MOE_ISLAND_CAP_EXPERTS` forces the eager routed expert VMM path so a
+dense-fit model cannot silently bypass the requested storage-to-device backend.
+Current sparse async MoE page-in uses pinned host staging, so the `hipfile`
+backend disables that async staging path until direct asynchronous storage reads
+are implemented.
 
 SuperSonic should expose a concrete storage-extent descriptor for direct
 file-backed tensors before adding transfer backends. The descriptor names the
@@ -140,7 +142,7 @@ Automated coverage should include:
 - unit tests proving FLM open options enable runtime aliases independent of CLI quant flags;
 - unit tests proving Qwen3.6 MoE FLM weight selection is file-probe driven;
 - model-store tests proving Qwen3.6 linear-attention direct raw values match the SuperSonic runtime bake byte-for-byte;
-- runner tests proving `SUPERSONIC_FLM_VIRTUAL_TRANSFER_BACKEND` parses direct-storage aliases and that forced `GpuDirectStorage` does not fall back to pageable mapping/copy when unsupported;
+- runner tests proving `--flm-virtual-transfer-backend` / `SUPERSONIC_FLM_VIRTUAL_TRANSFER_BACKEND` parse direct-storage aliases, CLI selection overrides the env fallback, and forced `GpuDirectStorage` does not fall back to pageable mapping/copy when unsupported;
 - upload-probe tests proving `--storage-direct` is explicit and records `copy_storage_to_device` timing/byte counters separately from H2D counters;
 - env-gated integration tests that run the real 35B A3B FLM with no HF snapshot and no `--int4`;
 - docs with canonical geo-quant export and SuperSonic run commands.

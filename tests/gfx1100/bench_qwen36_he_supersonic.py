@@ -346,6 +346,9 @@ def run_one(args: argparse.Namespace, name: str, prompt: str, warmup: bool = Fal
     allow_untested_gpu = getattr(args, "allow_untested_gpu", None)
     if allow_untested_gpu:
         cmd.extend(["--allow-untested-gpu", allow_untested_gpu])
+    flm_virtual_transfer_backend = getattr(args, "flm_virtual_transfer_backend", None)
+    if flm_virtual_transfer_backend:
+        cmd.extend(["--flm-virtual-transfer-backend", flm_virtual_transfer_backend])
     if args.quant != "none":
         cmd.append(f"--{args.quant}")
     if args.ignore_eos:
@@ -390,6 +393,8 @@ def run_one(args: argparse.Namespace, name: str, prompt: str, warmup: bool = Fal
     }
     if runner_env_overrides:
         row["runner_env"] = runner_env_overrides
+    if flm_virtual_transfer_backend:
+        row["flm_virtual_transfer_backend"] = flm_virtual_transfer_backend
     if match:
         row.update(
             {
@@ -600,6 +605,15 @@ def main() -> int:
     )
     parser.add_argument("--emit-stage-timings", action="store_true")
     parser.add_argument(
+        "--flm-virtual-transfer-backend",
+        choices=["pageable-h2d", "gpu-direct-storage", "gds", "hipfile"],
+        default=None,
+        help=(
+            "Forward SuperSonic's FLM virtual transfer backend selector. "
+            "Explicit CLI selection takes precedence over runner env overrides."
+        ),
+    )
+    parser.add_argument(
         "--hal-profile",
         action="store_true",
         help="Enable the runner HAL op dump and parse [hal-profile-op] rows into JSON.",
@@ -717,6 +731,7 @@ def main() -> int:
         "dflash_block": args.dflash_block if args.dflash_block else None,
         "backend": args.backend,
         "allow_untested_gpu": args.allow_untested_gpu,
+        "flm_virtual_transfer_backend": args.flm_virtual_transfer_backend,
         "context_size": args.context_size,
         "n_gen": args.n_gen,
         "eos_policy": "ignore" if args.ignore_eos else "stop",

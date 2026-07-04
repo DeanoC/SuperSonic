@@ -836,6 +836,7 @@ fn run_inner(
         cli.ignore_eos,
         keep_mask,
         cli.progress_heartbeat_seconds,
+        cli.flm_virtual_transfer_backend.as_deref(),
     )?;
     Ok(())
 }
@@ -880,6 +881,7 @@ fn decode_text(
     ignore_eos: bool,
     keep_mask: Option<Vec<bool>>,
     progress_heartbeat_seconds: f64,
+    flm_virtual_transfer_backend_cli: Option<&str>,
 ) -> Result<()> {
     validate_speculative_sampling(speculative_decode, sampling)?;
 
@@ -1006,6 +1008,7 @@ fn decode_text(
         persistent_decode,
         backend,
         geom.top_k as usize,
+        flm_virtual_transfer_backend_cli,
     )?;
     let kv_vmm = should_use_qwen36_kv_vmm(backend, ordinal)?;
     progress(
