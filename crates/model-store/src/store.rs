@@ -912,16 +912,18 @@ fn add_stage3_raw_value_aliases(
         })?;
         let view_dtype = flm_dtype_name(value_step.target_dtype)?.to_string();
         let view_shape = flm_plan_target_shape(value_step)?;
-        index
-            .entry(logical.name.clone())
-            .or_insert_with(|| TensorMeta {
+        let view_layout = stage3_raw_value_alias_layout(&logical.name, &view_shape);
+        index.insert(
+            logical.name.clone(),
+            TensorMeta {
                 name: logical.name.clone(),
                 shape: view_shape.clone(),
                 dtype: view_dtype.clone(),
-                layout: LayoutTag::Raw,
+                layout: view_layout,
                 offset: value_meta.offset,
                 byte_len: value_meta.byte_len,
-            });
+            },
+        );
         upload_views
             .entry(logical.name.clone())
             .or_insert(TensorUploadView {
@@ -930,6 +932,29 @@ fn add_stage3_raw_value_aliases(
             });
     }
     Ok(())
+}
+
+fn stage3_raw_value_alias_layout(name: &str, shape: &[usize]) -> LayoutTag {
+    if name.contains(".linear_attn.") {
+        if name.ends_with(".conv1d.weight") && shape.len() == 2 {
+            return LayoutTag::DepthwiseConvSqueezed;
+        }
+        if name.ends_with(".dt_bias")
+            && shape.len() == 3
+            && shape.first() == Some(&1)
+            && shape.get(1) == Some(&1)
+        {
+            return LayoutTag::HeadBiasReshaped;
+        }
+        if name.ends_with(".A_log")
+            && shape.len() == 3
+            && shape.first() == Some(&1)
+            && shape.get(1) == Some(&1)
+        {
+            return LayoutTag::HeadExpReshaped;
+        }
+    }
+    LayoutTag::Raw
 }
 
 fn stage3_int4_sidecar_alias(logical_name: &str, suffix: &str) -> String {
@@ -4029,6 +4054,35 @@ mod tests {
             .expect("raw logical value upload view");
         assert_eq!(upload_view.dtype, "f32");
         assert_eq!(upload_view.shape, vec![4]);
+    }
+
+    #[test]
+    fn stage3_raw_value_alias_layout_marks_qwen_linear_attention_runtime_shapes() {
+        assert_eq!(
+            stage3_raw_value_alias_layout(
+                "model.language_model.layers.0.linear_attn.conv1d.weight",
+                &[8192, 4],
+            ),
+            LayoutTag::DepthwiseConvSqueezed
+        );
+        assert_eq!(
+            stage3_raw_value_alias_layout(
+                "model.language_model.layers.0.linear_attn.dt_bias",
+                &[1, 1, 32],
+            ),
+            LayoutTag::HeadBiasReshaped
+        );
+        assert_eq!(
+            stage3_raw_value_alias_layout(
+                "model.language_model.layers.0.linear_attn.A_log",
+                &[1, 1, 32],
+            ),
+            LayoutTag::HeadExpReshaped
+        );
+        assert_eq!(
+            stage3_raw_value_alias_layout("model.language_model.layers.0.linear_attn.A_log", &[32],),
+            LayoutTag::Raw
+        );
     }
 
     #[test]

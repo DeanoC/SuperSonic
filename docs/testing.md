@@ -112,8 +112,15 @@ running generation:
 
 ```bash
 SUPERSONIC_QWEN36_35B_NATIVE_INT4_FLM=/mnt/data/tmp/flm-native-complete-path/qwen36-35b-a3b-supersonic-native-int4.flm \
-  cargo test -q -p model-store flm_qwen36_35b_native_int4_loadable -- --nocapture
+SUPERSONIC_QWEN36_35B_NATIVE_INT4_BAKE_DIR=/mnt/data/models/Qwen3.6-35B-A3B/.supersonic/v2-int4-gptq \
+  cargo test -q -p model-store --test flm_qwen36_native_layout -- --nocapture
 ```
+
+This guard compares the FLM direct values for Qwen3.6 linear attention against
+the SuperSonic runtime bake: `conv1d.weight` must already be
+`DepthwiseConvSqueezed`, `dt_bias` must be `[1, 1, H]`, and `A_log` must already
+be exponentiated BF16 `[1, 1, H]`. The loader labels and binds those bytes; it
+does not perform HF-layout reshapes in the normal FLM path.
 
 Then run the env-gated MoE runner smoke:
 
@@ -138,9 +145,9 @@ cargo run -q -p runner --bin supersonic -- \
   --model-dir /mnt/data/tmp/flm-native-complete-path/qwen36-35b-a3b-supersonic-native-int4.flm \
   --backend hip \
   --device 0 \
-  --prompt "Hello" \
+  --prompt "one two three four five six" \
   --max-new-tokens 1 \
-  --context-size 16 \
+  --context-size 64 \
   --emit-stage-timings
 ```
 
