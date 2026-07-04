@@ -998,6 +998,16 @@ fn add_stage3_int4_aliases(
                 scale.tensor_name
             ))
         })?;
+        let storage_abi = runtime
+            .storage_abis()
+            .iter()
+            .find(|abi| abi.storage_abi_id == packed.storage_abi_id)
+            .ok_or_else(|| {
+                Error::Other(format!(
+                    "FLM Stage 3 INT4 tensor {} references missing storage ABI {}",
+                    logical.name, packed.storage_abi_id
+                ))
+            })?;
         if packed.storage_dtype == FLM_DTYPE_INT32 {
             shape_binding.ok_or_else(|| {
                 Error::Other(format!(
@@ -1018,16 +1028,6 @@ fn add_stage3_int4_aliases(
                     logical.name, scale.storage_dtype
                 )));
             }
-            let storage_abi = runtime
-                .storage_abis()
-                .iter()
-                .find(|abi| abi.storage_abi_id == packed.storage_abi_id)
-                .ok_or_else(|| {
-                    Error::Other(format!(
-                        "FLM Stage 3 INT4 tensor {} references missing storage ABI {}",
-                        logical.name, packed.storage_abi_id
-                    ))
-                })?;
             if storage_abi.codec_semantic_id != crate::flm::CODEC_SYM_INT4_G128_BF16
                 || storage_abi.bits != 4
             {
@@ -1071,6 +1071,24 @@ fn add_stage3_int4_aliases(
                     group_size,
                 });
             continue;
+        }
+        if packed.storage_dtype != FLM_DTYPE_UINT8 {
+            return Err(Error::Other(format!(
+                "FLM Stage 3 native INT4 tensor {} packed binding dtype {} is unsupported",
+                logical.name, packed.storage_dtype
+            )));
+        }
+        if storage_abi.codec_semantic_id != crate::flm::CODEC_SUPERSONIC_NATIVE_INT4_G128_BF16
+            || storage_abi.bits != 4
+            || storage_abi.group_size != 128
+        {
+            return Err(Error::Other(format!(
+                "FLM Stage 3 native INT4 tensor {} uses unsupported native INT4 ABI codec={} bits={} group_size={}",
+                logical.name,
+                storage_abi.codec_semantic_id,
+                storage_abi.bits,
+                storage_abi.group_size
+            )));
         }
         let packed_view = TensorUploadView {
             dtype: flm_dtype_name(packed_step.target_dtype)?.to_string(),
@@ -3530,25 +3548,34 @@ mod tests {
     }
 
     fn corrupt_first_manifest_shape(data: &mut [u8], value: u32) {
+        let manifest_offset = runtime_section_offset(data, 8);
+        let shape_offset = manifest_offset + 12 + 16;
+        put_u32(data, shape_offset, value);
+    }
+
+    fn runtime_section_offset(data: &[u8], wanted_section_id: u32) -> usize {
         let runtime_offset =
             read_u64(data, 168, "test FLM runtime offset").expect("runtime offset") as usize;
         let runtime = &data[runtime_offset..];
         let section_count =
             read_u16(runtime, 10, "test FLM section count").expect("section count") as usize;
-        let mut manifest_offset = None;
         for idx in 0..section_count {
             let record = 16 + idx * 12;
             let section_id = read_u32(runtime, record, "test FLM section id").expect("section id");
-            if section_id == 8 {
-                manifest_offset = Some(
-                    read_u32(runtime, record + 4, "test FLM manifest offset")
-                        .expect("manifest offset") as usize,
-                );
-                break;
+            if section_id == wanted_section_id {
+                let section_offset = read_u32(runtime, record + 4, "test FLM section offset")
+                    .expect("section offset") as usize;
+                return runtime_offset + section_offset;
             }
         }
-        let shape_offset = runtime_offset + manifest_offset.expect("manifest section") + 12 + 16;
-        put_u32(data, shape_offset, value);
+        panic!("missing runtime section {wanted_section_id}");
+    }
+
+    fn put_first_storage_abi_codec_semantic(data: &mut [u8], codec_semantic_id: u16) {
+        let storage_abi_offset = runtime_section_offset(data, 9);
+        let row_offset = storage_abi_offset + 12;
+        let codec_semantic_offset = row_offset + 4;
+        put_u16(data, codec_semantic_offset, codec_semantic_id);
     }
 
     fn write_temp_flm(data: &[u8]) -> tempfile::NamedTempFile {
@@ -3842,6 +3869,29 @@ mod tests {
         assert_eq!(
             store.raw_bytes(&zero_name).expect("native INT4 zero bytes"),
             test_bf16_bytes([8.0; 4]).as_slice()
+        );
+    }
+
+    #[test]
+    fn open_flm_rejects_native_int4_stage3_binding_with_non_native_abi() {
+        let mut data = build_test_flm_with_stage3_native_int4_bindings();
+        put_first_storage_abi_codec_semantic(&mut data, crate::flm::CODEC_SYM_INT4_G128_BF16);
+        let file = write_temp_flm(&data);
+
+        let err = match BakedStore::open_flm_with_options(
+            file.path(),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                verify_block_hashes: false,
+            },
+        ) {
+            Ok(_) => panic!("native INT4 Stage 3 binding with non-native ABI should fail"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string().contains("unsupported native INT4 ABI"),
+            "unexpected error: {err}"
         );
     }
 
@@ -5089,6 +5139,82 @@ mod tests {
         assert!(store.contains(
             "model.language_model.layers.0.mlp.experts.0.gate_proj.weight_nvfp4_input_scale"
         ));
+    }
+
+    #[test]
+    fn flm_qwen36_35b_native_int4_loadable() {
+        let Ok(flm_path_str) = std::env::var("SUPERSONIC_QWEN36_35B_NATIVE_INT4_FLM") else {
+            eprintln!(
+                "skip: SUPERSONIC_QWEN36_35B_NATIVE_INT4_FLM not set. Point it at a \
+                 SuperSonic-native INT4 Qwen3.6-35B-A3B FLM to validate full MoE \
+                 native aliases."
+            );
+            return;
+        };
+        let store = BakedStore::open_flm_with_options(
+            Path::new(&flm_path_str),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                verify_block_hashes: true,
+            },
+        )
+        .expect("open qwen3.6-35b native INT4 FLM");
+
+        let runtime = store.flm_runtime().expect("runtime directory");
+        assert!(runtime.qwen36_config().is_none());
+        let moe = runtime.qwen36_moe_config().expect("MoE runtime config");
+        assert_eq!(moe.hidden_size, 2048);
+        assert_eq!(moe.num_hidden_layers, 40);
+        assert_eq!(moe.num_experts, 256);
+        assert_eq!(moe.num_experts_per_tok, 8);
+
+        let expert_name = "model.language_model.layers.0.mlp.experts.gate_up_proj";
+        let expert = store
+            .meta(expert_name)
+            .expect("native INT4 fused expert logical tensor");
+        assert_eq!(expert.layout, LayoutTag::Int4Quantized);
+        assert_eq!(expert.dtype, "u8");
+        assert_eq!(expert.shape, vec![256, 1024, 1024]);
+        assert_eq!(expert.byte_len, 268_435_456);
+        assert_eq!(
+            store
+                .upload_view(expert_name)
+                .expect("native INT4 fused expert upload view"),
+            &TensorUploadView {
+                dtype: "u8".to_string(),
+                shape: vec![256, 1024, 1024],
+            }
+        );
+
+        let expert_scale = store
+            .meta("model.language_model.layers.0.mlp.experts.gate_up_proj_int4_scale")
+            .expect("native INT4 fused expert scale");
+        assert_eq!(expert_scale.dtype, "bf16");
+        assert_eq!(expert_scale.shape, vec![256, 8, 16]);
+        let expert_zero = store
+            .meta("model.language_model.layers.0.mlp.experts.gate_up_proj_int4_zero")
+            .expect("native INT4 fused expert zero plane");
+        assert_eq!(expert_zero.dtype, "bf16");
+        assert_eq!(expert_zero.shape, vec![256, 8, 16]);
+
+        let qkv_name = "model.language_model.layers.0.linear_attn.in_proj_qkv.weight";
+        let qkv = store.meta(qkv_name).expect("native INT4 linear qkv tensor");
+        assert_eq!(qkv.layout, LayoutTag::Int4Quantized);
+        assert_eq!(qkv.dtype, "u8");
+        assert_eq!(qkv.shape, vec![8192, 1024]);
+        assert_eq!(qkv.byte_len, 8_388_608);
+
+        let embed = store
+            .meta("model.language_model.embed_tokens.weight")
+            .expect("embed_tokens missing");
+        assert_eq!(embed.dtype, "bf16");
+        assert_eq!(embed.shape, vec![248320, 2048]);
+        assert_eq!(embed.byte_len, 1_017_118_720);
+
+        eprintln!(
+            "[flm-validate] OK — {} tensors including 35B native INT4 aliases",
+            store.index.len()
+        );
     }
 
     #[test]

@@ -106,6 +106,14 @@ geo-quant's no-HF profile first:
   --verify-payload-hashes
 ```
 
+The model-store loader can validate the same artifact's native aliases without
+running generation:
+
+```bash
+SUPERSONIC_QWEN36_35B_NATIVE_INT4_FLM=/mnt/data/runs/geo-quant/qwen36-35b-a3b-supersonic-native-int4.flm \
+  cargo test -q -p model-store flm_qwen36_35b_native_int4_loadable -- --nocapture
+```
+
 Then run the env-gated MoE runner smoke:
 
 ```bash
