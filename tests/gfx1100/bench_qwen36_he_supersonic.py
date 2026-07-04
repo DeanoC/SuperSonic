@@ -70,6 +70,13 @@ INFERRED_MODEL_RE = re.compile(
 FLM_WEIGHT_MODE_RE = re.compile(
     r"\[qwen36-moe\]\s+FLM weight mode:\s+(?P<mode>[^\r\n]+)"
 )
+FLM_DIRECT_PROFILE_RE = re.compile(
+    r"\[qwen36-moe\]\s+FLM direct plans:\s+"
+    r"required=(?P<required>\d+)\s+"
+    r"raw_dense=(?P<raw_dense>\d+)\s+"
+    r"native_int4=(?P<native_int4>\d+)\s+"
+    r"bf16_fallback=(?P<bf16_fallback>\d+)"
+)
 FLM_READY_RE = re.compile(
     r"\[FLM runtime weights\]\s+ready-for-decode:\s+(?P<ready>YES|NO)"
     r"(?:\s+\((?P<detail>[^\r\n)]*)\))?"
@@ -204,6 +211,18 @@ def parse_flm_weight_mode(text: str) -> str | None:
     return match.group("mode").strip()
 
 
+def parse_flm_direct_profile(text: str) -> dict[str, int] | None:
+    match = FLM_DIRECT_PROFILE_RE.search(text)
+    if not match:
+        return None
+    return {
+        "required": int(match.group("required")),
+        "raw_dense": int(match.group("raw_dense")),
+        "native_int4": int(match.group("native_int4")),
+        "bf16_fallback": int(match.group("bf16_fallback")),
+    }
+
+
 def parse_flm_ready_for_decode(text: str) -> dict[str, bool | str] | None:
     match = FLM_READY_RE.search(text)
     if not match:
@@ -326,6 +345,9 @@ def run_one(args: argparse.Namespace, name: str, prompt: str, warmup: bool = Fal
     flm_weight_mode = parse_flm_weight_mode(combined)
     if flm_weight_mode:
         row["flm_weight_mode"] = flm_weight_mode
+    flm_direct_profile = parse_flm_direct_profile(combined)
+    if flm_direct_profile:
+        row["flm_direct_profile"] = flm_direct_profile
     flm_ready = parse_flm_ready_for_decode(combined)
     if flm_ready is not None:
         row["flm_ready_for_decode"] = flm_ready["ready"]
@@ -377,6 +399,13 @@ def build_summary(rows: list[dict]) -> dict:
         summary["flm_ready_for_decode_count"] = sum(
             1 for row in ok if row.get("flm_ready_for_decode")
         )
+    flm_direct_profiles = []
+    for row in ok:
+        profile = row.get("flm_direct_profile")
+        if profile and profile not in flm_direct_profiles:
+            flm_direct_profiles.append(profile)
+    if flm_direct_profiles:
+        summary["flm_direct_profiles"] = flm_direct_profiles
     return summary
 
 

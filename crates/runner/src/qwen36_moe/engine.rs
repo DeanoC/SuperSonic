@@ -386,6 +386,7 @@ fn run_inner(
         run_qwen36_moe_dry_run_with_config(
             &cli.model_dir,
             Some(&flm.source.path),
+            Some(flm.direct_profile),
             flm.config.clone(),
             entry,
             total_vram,

@@ -6,6 +6,7 @@ use model_store::BakedStore;
 use qwen36_moe::weights::{
     expected_tensor_specs, TensorRole, DEFAULT_PREFIX as QWEN36_MOE_WEIGHT_PREFIX,
 };
+use std::fmt;
 
 use crate::bakes::{
     effective_flm_source, flm_source_open_options, validate_effective_flm_source_model,
@@ -26,12 +27,35 @@ pub(crate) struct Qwen36MoeFlmSource {
     pub(crate) tokenizer: tokenizers::Tokenizer,
     pub(crate) weight_mode: Qwen36WeightMode,
     pub(crate) weight_mode_label: &'static str,
+    pub(crate) direct_profile: Qwen36MoeFlmDirectProfile,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Qwen36MoeFlmWeightSelection {
     mode: Qwen36WeightMode,
     label: &'static str,
+    direct_profile: Qwen36MoeFlmDirectProfile,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Qwen36MoeFlmDirectProfile {
+    /// SuperSonic runtime-required logical weights covered by direct plans.
+    /// This is intentionally smaller than the full FLM tensor table, which
+    /// also contains storage sidecars and compatibility/runtime assets.
+    pub(crate) required_tensors: usize,
+    pub(crate) raw_dense: usize,
+    pub(crate) native_int4: usize,
+    pub(crate) bf16_fallback: usize,
+}
+
+impl fmt::Display for Qwen36MoeFlmDirectProfile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "required={} raw_dense={} native_int4={} bf16_fallback={}",
+            self.required_tensors, self.raw_dense, self.native_int4, self.bf16_fallback
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,11 +160,15 @@ where
 {
     let mut native_int4_name: Option<String> = None;
     let mut fallback_name: Option<String> = None;
+    let mut direct_profile = Qwen36MoeFlmDirectProfile::default();
 
     for (name, expected, kind) in plans {
         let name = name.into();
+        direct_profile.required_tensors += 1;
         match (expected, kind) {
-            (RequiredFlmDirectWeightKind::RawDense, Some(FlmStage3DirectWeightKind::RawDense)) => {}
+            (RequiredFlmDirectWeightKind::RawDense, Some(FlmStage3DirectWeightKind::RawDense)) => {
+                direct_profile.raw_dense += 1;
+            }
             (RequiredFlmDirectWeightKind::RawDense, Some(other)) => {
                 return Err(anyhow!(
                     "Qwen3.6 MoE FLM expected raw dense direct plan for {name}, got {other:?}"
@@ -154,6 +182,7 @@ where
                 Some(FlmStage3DirectWeightKind::NativeInt4),
             ) => {
                 native_int4_name.get_or_insert(name);
+                direct_profile.native_int4 += 1;
             }
             (
                 RequiredFlmDirectWeightKind::QuantizedProjection,
@@ -163,6 +192,7 @@ where
                 ),
             ) => {
                 fallback_name.get_or_insert(name);
+                direct_profile.bf16_fallback += 1;
             }
             (RequiredFlmDirectWeightKind::QuantizedProjection, None) => {
                 return Err(anyhow!("missing direct weight plan for {name}"));
@@ -180,11 +210,13 @@ where
         Ok(Qwen36MoeFlmWeightSelection {
             mode: Qwen36WeightMode::Int4,
             label: "INT4 native FLM",
+            direct_profile,
         })
     } else {
         Ok(Qwen36MoeFlmWeightSelection {
             mode: Qwen36WeightMode::Bf16,
             label: "BF16",
+            direct_profile,
         })
     }
 }
@@ -197,12 +229,29 @@ fn qwen36_moe_flm_weight_selection_from_stage3_kind(
         Some(FlmStage3DirectWeightKind::NativeInt4) => Ok(Qwen36MoeFlmWeightSelection {
             mode: Qwen36WeightMode::Int4,
             label: "INT4 native FLM",
+            direct_profile: Qwen36MoeFlmDirectProfile {
+                required_tensors: 1,
+                native_int4: 1,
+                ..Qwen36MoeFlmDirectProfile::default()
+            },
         }),
-        Some(
-            FlmStage3DirectWeightKind::CtInt4Bf16Fallback | FlmStage3DirectWeightKind::RawDense,
-        ) => Ok(Qwen36MoeFlmWeightSelection {
+        Some(FlmStage3DirectWeightKind::CtInt4Bf16Fallback) => Ok(Qwen36MoeFlmWeightSelection {
             mode: Qwen36WeightMode::Bf16,
             label: "BF16",
+            direct_profile: Qwen36MoeFlmDirectProfile {
+                required_tensors: 1,
+                bf16_fallback: 1,
+                ..Qwen36MoeFlmDirectProfile::default()
+            },
+        }),
+        Some(FlmStage3DirectWeightKind::RawDense) => Ok(Qwen36MoeFlmWeightSelection {
+            mode: Qwen36WeightMode::Bf16,
+            label: "BF16",
+            direct_profile: Qwen36MoeFlmDirectProfile {
+                required_tensors: 1,
+                raw_dense: 1,
+                ..Qwen36MoeFlmDirectProfile::default()
+            },
         }),
         None => Err(anyhow!(
             "Qwen3.6 MoE FLM source requires a compatible direct weight plan for {}",
@@ -219,10 +268,20 @@ fn qwen36_moe_flm_weight_selection_from_probe(
         Some((LayoutTag::Raw, "bf16")) => Ok(Qwen36MoeFlmWeightSelection {
             mode: Qwen36WeightMode::Bf16,
             label: "BF16",
+            direct_profile: Qwen36MoeFlmDirectProfile {
+                required_tensors: 1,
+                bf16_fallback: 1,
+                ..Qwen36MoeFlmDirectProfile::default()
+            },
         }),
         Some((LayoutTag::Int4Quantized, "u8")) | None => Ok(Qwen36MoeFlmWeightSelection {
             mode: Qwen36WeightMode::Int4,
             label: "INT4 native FLM",
+            direct_profile: Qwen36MoeFlmDirectProfile {
+                required_tensors: 1,
+                native_int4: 1,
+                ..Qwen36MoeFlmDirectProfile::default()
+            },
         }),
         other => Err(anyhow!(
             "Qwen3.6 MoE FLM source requires a native INT4 or BF16 fallback probe; got {other:?}"
@@ -260,12 +319,17 @@ pub(crate) fn open_qwen36_moe_flm_source(cli: &Cli) -> Result<Option<Qwen36MoeFl
     let weight_selection =
         qwen36_moe_flm_weight_selection_for_store(&source.store, &config.text_config)?;
     eprintln!("[qwen36-moe] FLM weight mode: {}", weight_selection.label);
+    eprintln!(
+        "[qwen36-moe] FLM direct plans: {}",
+        weight_selection.direct_profile
+    );
     Ok(Some(Qwen36MoeFlmSource {
         source,
         config,
         tokenizer,
         weight_mode: weight_selection.mode,
         weight_mode_label: weight_selection.label,
+        direct_profile: weight_selection.direct_profile,
     }))
 }
 
@@ -425,6 +489,19 @@ mod tests {
 
         assert_eq!(selection.mode, Qwen36WeightMode::Int4);
         assert_eq!(selection.label, "INT4 native FLM");
+        assert_eq!(
+            selection.direct_profile,
+            Qwen36MoeFlmDirectProfile {
+                required_tensors: 3,
+                raw_dense: 1,
+                native_int4: 2,
+                bf16_fallback: 0,
+            }
+        );
+        assert_eq!(
+            selection.direct_profile.to_string(),
+            "required=3 raw_dense=1 native_int4=2 bf16_fallback=0"
+        );
     }
 
     #[test]

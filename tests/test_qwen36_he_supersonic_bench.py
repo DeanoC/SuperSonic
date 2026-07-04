@@ -161,11 +161,22 @@ class BenchQwen36HeSuperSonicTests(unittest.TestCase):
     def test_parse_flm_direct_execution_signals(self):
         output = (
             "[qwen36-moe] FLM weight mode: INT4 native FLM\n"
+            "[qwen36-moe] FLM direct plans: required=693 raw_dense=363 "
+            "native_int4=330 bf16_fallback=0\n"
             "[FLM runtime weights] ready-for-decode: YES "
             "(source=/tmp/qwen36.flm)\n"
         )
 
         self.assertEqual(bench.parse_flm_weight_mode(output), "INT4 native FLM")
+        self.assertEqual(
+            bench.parse_flm_direct_profile(output),
+            {
+                "required": 693,
+                "raw_dense": 363,
+                "native_int4": 330,
+                "bf16_fallback": 0,
+            },
+        )
         self.assertEqual(
             bench.parse_flm_ready_for_decode(output),
             {"ready": True, "detail": "source=/tmp/qwen36.flm"},
@@ -256,6 +267,12 @@ class BenchQwen36HeSuperSonicTests(unittest.TestCase):
                 "stopped_early": False,
                 "flm_weight_mode": "INT4 native FLM",
                 "flm_ready_for_decode": True,
+                "flm_direct_profile": {
+                    "required": 693,
+                    "raw_dense": 363,
+                    "native_int4": 330,
+                    "bf16_fallback": 0,
+                },
             },
             {
                 "returncode": 0,
@@ -273,6 +290,17 @@ class BenchQwen36HeSuperSonicTests(unittest.TestCase):
 
         self.assertEqual(summary["flm_weight_modes"], ["INT4 native FLM"])
         self.assertEqual(summary["flm_ready_for_decode_count"], 1)
+        self.assertEqual(
+            summary["flm_direct_profiles"],
+            [
+                {
+                    "required": 693,
+                    "raw_dense": 363,
+                    "native_int4": 330,
+                    "bf16_fallback": 0,
+                }
+            ],
+        )
 
     def test_run_one_sets_gguf_env_and_stop_on_eos_command(self):
         args = types.SimpleNamespace(
@@ -352,6 +380,8 @@ class BenchQwen36HeSuperSonicTests(unittest.TestCase):
             stderr=(
                 "[flm] inferred model qwen3.6-35b-a3b from runtime descriptor\n"
                 "[qwen36-moe] FLM weight mode: INT4 native FLM\n"
+                "[qwen36-moe] FLM direct plans: required=693 raw_dense=363 "
+                "native_int4=330 bf16_fallback=0\n"
                 "[FLM runtime weights] ready-for-decode: YES "
                 "(source=/tmp/qwen36.flm)\n"
                 "[result] prompt_tokens=1 generated_tokens=1 decode_ms=41 "
@@ -378,6 +408,15 @@ class BenchQwen36HeSuperSonicTests(unittest.TestCase):
         self.assertEqual(row["flm_weight_mode"], "INT4 native FLM")
         self.assertTrue(row["flm_ready_for_decode"])
         self.assertEqual(row["flm_ready_for_decode_detail"], "source=/tmp/qwen36.flm")
+        self.assertEqual(
+            row["flm_direct_profile"],
+            {
+                "required": 693,
+                "raw_dense": 363,
+                "native_int4": 330,
+                "bf16_fallback": 0,
+            },
+        )
         self.assertEqual(
             row["lifecycle_timings"],
             {

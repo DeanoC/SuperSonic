@@ -12,6 +12,7 @@ use qwen36_moe::weights::{
     checkpoint_dtype_acceptable, expected_tensor_specs, CheckpointAccount, CheckpointDtype,
 };
 
+use crate::qwen36_moe_cli::flm_source::Qwen36MoeFlmDirectProfile;
 use crate::qwen36_moe_cli::layers::{
     resolve_qwen36_store_name, store_contains_qwen36, store_layout_qwen36,
 };
@@ -24,6 +25,7 @@ pub struct DryRunReport {
     pub config: Config,
     pub kernel_params: Qwen36MoeKernelParams,
     pub flm_source_label: Option<PathBuf>,
+    pub flm_direct_profile: Option<Qwen36MoeFlmDirectProfile>,
     pub checkpoint: CheckpointAccount,
     pub int4_projected_bytes: u64,
     pub state: StateAccount,
@@ -124,6 +126,7 @@ pub fn run_qwen36_moe_dry_run(
     run_qwen36_moe_dry_run_with_config(
         model_dir,
         None,
+        None,
         config,
         entry,
         total_vram,
@@ -139,6 +142,7 @@ pub fn run_qwen36_moe_dry_run(
 pub fn run_qwen36_moe_dry_run_with_config(
     model_dir: &Path,
     flm_source_label: Option<&Path>,
+    flm_direct_profile: Option<Qwen36MoeFlmDirectProfile>,
     config: Config,
     entry: &RegistryEntry,
     total_vram: u64,
@@ -264,6 +268,7 @@ pub fn run_qwen36_moe_dry_run_with_config(
         config,
         kernel_params,
         flm_source_label: flm_source_label.map(Path::to_path_buf),
+        flm_direct_profile,
         checkpoint,
         int4_projected_bytes,
         state,
@@ -536,6 +541,7 @@ mod tests {
         let report = run_qwen36_moe_dry_run_with_config(
             temp.path(),
             Some(&flm_path),
+            None,
             small_moe_config(),
             entry,
             24 * 1024 * 1024 * 1024,
@@ -563,6 +569,42 @@ mod tests {
         assert!(report.on_disk_tensor_count.is_none());
         assert!(report.missing_tensors.is_empty());
         assert!(report.dtype_mismatches.is_empty());
+    }
+
+    #[test]
+    fn flm_dry_run_keeps_direct_plan_profile() {
+        let temp = tempfile::tempdir().expect("temp model dir");
+        let flm_path = temp.path().join("model.flm");
+        let entry = lookup(
+            &ModelVariant::Qwen3_6_35B_A3B,
+            &Backend::Hip,
+            &GpuArch::Gfx1100,
+        )
+        .expect("qwen3.6 MoE HIP registry entry");
+        let direct_profile = crate::qwen36_moe_cli::flm_source::Qwen36MoeFlmDirectProfile {
+            required_tensors: 693,
+            raw_dense: 363,
+            native_int4: 330,
+            bf16_fallback: 0,
+        };
+
+        let report = run_qwen36_moe_dry_run_with_config(
+            temp.path(),
+            Some(&flm_path),
+            Some(direct_profile),
+            small_moe_config(),
+            entry,
+            24 * 1024 * 1024 * 1024,
+            16,
+            ContextSizeSource::Explicit,
+            1,
+            false,
+            false,
+            0,
+        )
+        .expect("dry-run from FLM config");
+
+        assert_eq!(report.flm_direct_profile, Some(direct_profile));
     }
 }
 
@@ -700,6 +742,9 @@ pub fn print_report(report: &DryRunReport) {
         println!("[FLM source]");
         println!("  path:            {}", path.display());
         println!("  runtime:         config, tokenizer, and tensor table supplied by FLM");
+        if let Some(profile) = report.flm_direct_profile {
+            println!("  direct plans:    {profile}");
+        }
         if let Some(w) = &report.loader_warning {
             println!("  WARNING: {w}");
         }
@@ -744,10 +789,18 @@ pub fn print_report(report: &DryRunReport) {
         println!();
     }
     if let Some(path) = &report.flm_source_label {
-        println!(
-            "[FLM runtime weights] ready-for-decode: YES (source={})",
-            path.display()
-        );
+        if let Some(profile) = report.flm_direct_profile {
+            println!(
+                "[FLM runtime weights] ready-for-decode: YES (source={} direct_plans={})",
+                path.display(),
+                profile
+            );
+        } else {
+            println!(
+                "[FLM runtime weights] ready-for-decode: YES (source={})",
+                path.display()
+            );
+        }
         println!();
     } else if let Some(bake) = &report.bake {
         println!("[INT4 baked package]");
