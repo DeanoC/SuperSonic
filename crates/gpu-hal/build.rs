@@ -81,13 +81,65 @@ fn has_libcudart(dir: &Path) -> bool {
         })
 }
 
+fn detect_hipfile_root() -> Option<PathBuf> {
+    for var in ["HIPFILE_ROOT", "ROCM_PATH", "ROCM_HOME"] {
+        if let Ok(value) = env::var(var) {
+            let path = PathBuf::from(value);
+            if path.join("include/hipfile.h").exists() && has_libhipfile(&path.join("lib")) {
+                return Some(path);
+            }
+            if path.join("include/hipfile.h").exists() && has_libhipfile(&path.join("lib64")) {
+                return Some(path);
+            }
+        }
+    }
+
+    [
+        PathBuf::from("/opt/rocm"),
+        PathBuf::from("/usr"),
+        PathBuf::from("/usr/local"),
+    ]
+    .into_iter()
+    .find(|path| {
+        path.join("include/hipfile.h").exists()
+            && (has_libhipfile(&path.join("lib")) || has_libhipfile(&path.join("lib64")))
+    })
+}
+
+fn detect_hipfile_lib_dir(root: &Path) -> Option<PathBuf> {
+    [root.join("lib"), root.join("lib64")]
+        .into_iter()
+        .find(|path| has_libhipfile(path))
+}
+
+fn has_libhipfile(dir: &Path) -> bool {
+    if dir.join("libhipfile.so").exists() {
+        return true;
+    }
+    fs::read_dir(dir)
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.filter_map(Result::ok))
+        .any(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("libhipfile.so.")
+        })
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src/metal_bridge.mm");
+    println!("cargo:rerun-if-changed=src/hipfile_bridge.cc");
     println!("cargo:rerun-if-env-changed=SUPERSONIC_BACKENDS");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
+    println!("cargo:rerun-if-env-changed=HIPFILE_ROOT");
+    println!("cargo:rerun-if-env-changed=ROCM_PATH");
+    println!("cargo:rerun-if-env-changed=ROCM_HOME");
     println!("cargo:rustc-check-cfg=cfg(supersonic_backend_hip)");
+    println!("cargo:rustc-check-cfg=cfg(supersonic_backend_hipfile)");
     println!("cargo:rustc-check-cfg=cfg(supersonic_backend_cuda)");
     println!("cargo:rustc-check-cfg=cfg(supersonic_backend_metal)");
 
@@ -134,6 +186,20 @@ fn main() {
 
     if enable_hip {
         println!("cargo:rustc-cfg=supersonic_backend_hip");
+        if let Some(hipfile_root) = detect_hipfile_root() {
+            if let Some(hipfile_lib_dir) = detect_hipfile_lib_dir(&hipfile_root) {
+                let mut build = cc::Build::new();
+                build
+                    .cpp(true)
+                    .file("src/hipfile_bridge.cc")
+                    .include(hipfile_root.join("include"))
+                    .flag("-std=c++17");
+                build.compile("gpu_hal_hipfile");
+                println!("cargo:rustc-link-search=native={}", hipfile_lib_dir.display());
+                println!("cargo:rustc-link-lib=hipfile");
+                println!("cargo:rustc-cfg=supersonic_backend_hipfile");
+            }
+        }
     }
     if enable_cuda {
         if let Some(cuda_lib_dir) = detect_cuda_lib_dir() {

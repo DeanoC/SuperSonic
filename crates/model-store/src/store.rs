@@ -2161,24 +2161,24 @@ impl BakedStore {
                 transfer_range.extent.storage_shape
             )));
         }
-        match backend {
-            VirtualArenaTransferBackend::PageableH2d => {}
-            VirtualArenaTransferBackend::GpuDirectStorage => {
-                return Err(Error::Gpu(gpu_hal::GpuError::Unsupported(format!(
-                    "GPU-direct storage-to-virtual-arena transfer is not implemented yet \
-                     (source={} offset={} len={})",
-                    transfer_range.extent.source_path.display(),
-                    transfer_range.file_offset,
-                    transfer_range.byte_len
-                ))));
-            }
-        }
         let src_byte_offset = u64_to_usize(
             transfer_range.tensor_byte_offset,
             "virtual arena source byte offset",
         )?;
         let src_byte_len =
             u64_to_usize(transfer_range.byte_len, "virtual arena source byte length")?;
+        match backend {
+            VirtualArenaTransferBackend::PageableH2d => {}
+            VirtualArenaTransferBackend::GpuDirectStorage => {
+                buffer.copy_storage_range_bytes_no_sync(
+                    byte_offset,
+                    &transfer_range.extent.source_path,
+                    transfer_range.file_offset,
+                    src_byte_len,
+                )?;
+                return Ok(());
+            }
+        }
         let src_bytes = self.raw_byte_range(name, src_byte_offset, src_byte_len)?;
         // The source tensor bytes are copied into the mapped range before the
         // allocation is observed as loaded, so clearing new pages first only

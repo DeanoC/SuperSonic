@@ -20,10 +20,10 @@ pub use backend::{
 pub use buffer::{GpuBuffer, HostBuffer};
 pub use error::GpuError;
 pub use ops::{
-    copy_d2d, copy_d2h, copy_h2d, copy_h2d_async, hal_profile_reset, hal_profile_set_enabled,
-    hal_profile_snapshot, memset_zeros, memset_zeros_async, query_device_info, set_device, sync,
-    GpuEvent, GpuStream, HalProfileEntry, HalProfileSnapshot, PinnedHostBuffer,
-    RegisteredHostBuffer,
+    copy_d2d, copy_d2h, copy_h2d, copy_h2d_async, copy_storage_to_device, hal_profile_reset,
+    hal_profile_set_enabled, hal_profile_snapshot, memset_zeros, memset_zeros_async,
+    query_device_info, set_device, storage_to_device_is_supported, sync, GpuEvent, GpuStream,
+    HalProfileEntry, HalProfileSnapshot, PinnedHostBuffer, RegisteredHostBuffer,
 };
 pub use scalar_type::ScalarType;
 pub use vmm::{

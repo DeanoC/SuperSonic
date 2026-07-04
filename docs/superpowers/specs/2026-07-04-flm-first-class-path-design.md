@@ -45,8 +45,17 @@ the same FLM tensor extent metadata with multiple implementations:
 - pageable host-to-device copy as the portable fallback;
 - explicitly pinned or registered host staging for experiments and fallback
   paths;
-- GPU-direct storage-to-device transfer when the platform and file/device
-  alignment support it.
+- ROCm `hipFile` storage-to-device transfer when ROCm 7.2+ hipFile is
+  installed and the file/device/filesystem constraints are satisfied.
+
+On ROCm, the storage-direct backend is specifically `hipFile`, AMD's cuFile-like
+API. SuperSonic should detect `hipfile.h` and `libhipfile` at build time and
+compile a small bridge that reads FLM file ranges directly into device memory.
+When hipFile is absent, as on the current Fedora 44 ROCm 7.1.1 setup, the
+`GpuDirectStorage` backend must return `Unsupported` before mapping VMM pages or
+falling back to pageable H2D. A real fast-path verification requires ROCm 7.2+
+hipFile, `ais-check` passing, and the FLM payload on a supported local NVMe
+filesystem such as ext4 or xfs.
 
 SuperSonic should expose a concrete storage-extent descriptor for direct
 file-backed tensors before adding transfer backends. The descriptor names the
