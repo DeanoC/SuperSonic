@@ -1,9 +1,9 @@
 #![cfg(supersonic_backend_hip)]
 
 use gpu_hal::{
-    copy_h2d, hal_profile_reset, hal_profile_set_enabled, hal_profile_snapshot, set_backend,
-    storage_to_device_is_supported, sync, vmm_is_supported, Backend, ScalarType,
-    VirtualAllocationRole, VirtualArena, VirtualBacking, VirtualBuffer,
+    copy_h2d, copy_storage_to_device, hal_profile_reset, hal_profile_set_enabled,
+    hal_profile_snapshot, set_backend, storage_to_device_is_supported, sync, vmm_is_supported,
+    Backend, ScalarType, VirtualAllocationRole, VirtualArena, VirtualBacking, VirtualBuffer,
 };
 use std::path::Path;
 
@@ -32,6 +32,40 @@ fn assert_bytes_eq(label: &str, got: &[u8], expected: &[u8]) {
         &expected[..expected.len().min(16)],
         &got[start..end],
         &expected[start..end]
+    );
+}
+
+#[test]
+fn storage_direct_copy_rejects_unaligned_direct_io_ranges() {
+    set_backend(Backend::Hip);
+    let ptr = std::ptr::NonNull::<u8>::dangling().as_ptr().cast();
+
+    let err = copy_storage_to_device(
+        0,
+        ptr,
+        Path::new("/tmp/supersonic-test-storage-direct.flm"),
+        4096,
+        64,
+    )
+    .expect_err("sub-block direct-I/O length should be rejected before backend dispatch");
+    assert!(
+        err.to_string()
+            .contains("length 64 is not 4096-byte aligned"),
+        "{err}"
+    );
+
+    let err = copy_storage_to_device(
+        0,
+        ptr,
+        Path::new("/tmp/supersonic-test-storage-direct.flm"),
+        512,
+        4096,
+    )
+    .expect_err("unaligned direct-I/O offset should be rejected before backend dispatch");
+    assert!(
+        err.to_string()
+            .contains("source offset 512 is not 4096-byte aligned"),
+        "{err}"
     );
 }
 

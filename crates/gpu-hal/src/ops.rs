@@ -38,6 +38,7 @@ unsafe extern "C" {
 
 static HAL_PROFILE_ENABLED: AtomicBool = AtomicBool::new(false);
 static HAL_PROFILE: OnceLock<Mutex<HalProfileAccumulator>> = OnceLock::new();
+const STORAGE_DIRECT_BLOCK_ALIGNMENT: usize = 4096;
 
 #[derive(Debug, Clone)]
 pub struct HalProfileEntry {
@@ -967,6 +968,16 @@ pub fn copy_storage_to_device(
         return Err(GpuError::InvalidArg(
             "copy_storage_to_device: source path must not be empty".into(),
         ));
+    }
+    if source_offset % STORAGE_DIRECT_BLOCK_ALIGNMENT as u64 != 0 {
+        return Err(GpuError::InvalidArg(format!(
+            "copy_storage_to_device: source offset {source_offset} is not {STORAGE_DIRECT_BLOCK_ALIGNMENT}-byte aligned"
+        )));
+    }
+    if len % STORAGE_DIRECT_BLOCK_ALIGNMENT != 0 {
+        return Err(GpuError::InvalidArg(format!(
+            "copy_storage_to_device: length {len} is not {STORAGE_DIRECT_BLOCK_ALIGNMENT}-byte aligned"
+        )));
     }
     let backend = current_backend();
     ensure_storage_to_device_supported(backend, source_path, source_offset, len)?;
