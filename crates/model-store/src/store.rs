@@ -1843,7 +1843,10 @@ impl BakedStore {
                 meta.shape
             )));
         }
-        buffer.map_range_bytes(byte_offset, byte_len)?;
+        // The source tensor bytes are copied into the mapped range before the
+        // allocation is observed as loaded, so clearing new pages first only
+        // adds startup bandwidth.
+        buffer.map_range_bytes_no_sync(byte_offset, byte_len)?;
         let src = unsafe { src_bytes.as_ptr().add(byte_offset) as *const _ };
         copy_h2d(ordinal, buffer.offset_mut_ptr(byte_offset), src, byte_len)?;
         sync(ordinal)?;
@@ -6150,6 +6153,78 @@ mod tests {
             .expect("read virtual expert");
         assert_eq!(weight, weights[..4096]);
         assert_eq!(expert, weights[4096..]);
+    }
+
+    #[test]
+    fn virtual_arena_load_initializes_mapped_pages_by_copy_without_clearing() {
+        gpu_hal::set_backend(gpu_hal::Backend::Hip);
+        if !gpu_hal::vmm_is_supported(gpu_hal::Backend::Hip, 0) {
+            eprintln!("skip: HIP VMM unsupported on this device/runtime");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bake_dir = tmp.path();
+        let weights = (0..4096)
+            .map(|idx| (idx as u8).wrapping_mul(17).wrapping_add(3))
+            .collect::<Vec<_>>();
+        std::fs::write(crate::weights_bin_path(bake_dir), &weights).expect("write weights.bin");
+        let manifest = Manifest {
+            format_version: FORMAT_VERSION,
+            converter_version: 1,
+            model_family: "test".to_string(),
+            quant_profile: None,
+            source_format: None,
+            source_quant: None,
+            quant_method: None,
+            tensors: vec![TensorMeta {
+                name: "model.layers.0.mlp.experts.gate_up_proj".to_string(),
+                shape: vec![4096],
+                dtype: "u8".to_string(),
+                layout: LayoutTag::Int4Quantized,
+                offset: 0,
+                byte_len: 4096,
+            }],
+        };
+        std::fs::write(
+            crate::manifest_path(bake_dir),
+            serde_json::to_string(&manifest).expect("serialize manifest"),
+        )
+        .expect("write manifest");
+
+        let store = BakedStore::open(bake_dir).expect("open synthetic bake");
+        let mut arena = BakedStore::virtual_weight_arena(0);
+
+        gpu_hal::hal_profile_set_enabled(true);
+        gpu_hal::hal_profile_reset();
+        let allocation_id = store
+            .load_to_virtual_arena(
+                &mut arena,
+                "model.layers.0.mlp.experts.gate_up_proj",
+                gpu_hal::VirtualAllocationRole::MoeExpert,
+            )
+            .expect("load virtual expert");
+        let profile = gpu_hal::hal_profile_snapshot();
+        gpu_hal::hal_profile_set_enabled(false);
+
+        assert!(
+            profile.entries.iter().any(|entry| entry.op == "vmm_map_no_sync"),
+            "expected virtual upload to map pages with no-clear initialization, got {:?}",
+            profile.entries
+        );
+        assert!(
+            profile.entries.iter().all(|entry| entry.op != "memset_zeros"),
+            "virtual upload should not clear pages before immediately copying tensor bytes: {:?}",
+            profile.entries
+        );
+
+        let loaded = arena
+            .allocation(allocation_id)
+            .expect("expert allocation")
+            .buffer()
+            .to_host_bytes()
+            .expect("read virtual expert");
+        assert_eq!(loaded, weights);
     }
 
     #[test]
