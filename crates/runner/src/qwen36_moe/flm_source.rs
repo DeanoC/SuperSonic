@@ -7,6 +7,7 @@ use qwen36_moe::weights::{
     expected_tensor_specs, TensorRole, DEFAULT_PREFIX as QWEN36_MOE_WEIGHT_PREFIX,
 };
 use std::fmt;
+use std::time::{Duration, Instant};
 
 use crate::bakes::{
     effective_flm_source, flm_source_open_options, validate_effective_flm_source_model,
@@ -24,10 +25,29 @@ const QWEN36_MOE_WEIGHT_MODE_PROBE: &str =
 pub(crate) struct Qwen36MoeFlmSource {
     pub(crate) source: FlmModelSource,
     pub(crate) config: qwen36_moe::config::Config,
-    pub(crate) tokenizer: tokenizers::Tokenizer,
     pub(crate) weight_mode: Qwen36WeightMode,
     pub(crate) weight_mode_label: &'static str,
     pub(crate) direct_profile: Qwen36MoeFlmDirectProfile,
+    pub(crate) timings: Qwen36MoeFlmSourceOpenTimings,
+}
+
+impl Qwen36MoeFlmSource {
+    pub(crate) fn load_tokenizer_timed(
+        &self,
+    ) -> Result<crate::flm_tokenizer::QwenBpeTokenizerLoad> {
+        self.source.qwen_tokenizer_timed()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Qwen36MoeFlmSourceOpenTimings {
+    pub(crate) store_open: Duration,
+    pub(crate) config: Duration,
+    pub(crate) tokenizer: Duration,
+    pub(crate) tokenizer_assets: Duration,
+    pub(crate) tokenizer_parse: Duration,
+    pub(crate) tokenizer_build: Duration,
+    pub(crate) direct_plan: Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -310,14 +330,19 @@ pub(crate) fn open_qwen36_moe_flm_source(cli: &Cli) -> Result<Option<Qwen36MoeFl
             ""
         }
     );
+    let mut timings = Qwen36MoeFlmSourceOpenTimings::default();
+    let store_open_start = Instant::now();
     let source = FlmModelSource::open_with_options(path, options)
         .map_err(|e| anyhow!("opening Qwen3.6 MoE FLM source {}: {e}", path.display()))?;
+    timings.store_open = store_open_start.elapsed();
     eprintln!("[qwen36-moe] loading config from FLM runtime descriptor");
+    let config_start = Instant::now();
     let config = source.qwen_moe_config()?;
-    eprintln!("[qwen36-moe] loading tokenizer from FLM assets");
-    let tokenizer = source.qwen_tokenizer()?;
+    timings.config = config_start.elapsed();
+    let direct_plan_start = Instant::now();
     let weight_selection =
         qwen36_moe_flm_weight_selection_for_store(&source.store, &config.text_config)?;
+    timings.direct_plan = direct_plan_start.elapsed();
     eprintln!("[qwen36-moe] FLM weight mode: {}", weight_selection.label);
     eprintln!(
         "[qwen36-moe] FLM direct plans: {}",
@@ -326,10 +351,10 @@ pub(crate) fn open_qwen36_moe_flm_source(cli: &Cli) -> Result<Option<Qwen36MoeFl
     Ok(Some(Qwen36MoeFlmSource {
         source,
         config,
-        tokenizer,
         weight_mode: weight_selection.mode,
         weight_mode_label: weight_selection.label,
         direct_profile: weight_selection.direct_profile,
+        timings,
     }))
 }
 

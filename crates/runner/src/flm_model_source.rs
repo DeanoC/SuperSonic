@@ -75,6 +75,13 @@ impl FlmModelSource {
         crate::flm_tokenizer::load_qwen_bpe_from_flm(self.runtime()?)
             .map_err(|e| anyhow::anyhow!("loading FLM Qwen tokenizer: {e}"))
     }
+
+    pub fn qwen_tokenizer_timed(
+        &self,
+    ) -> anyhow::Result<crate::flm_tokenizer::QwenBpeTokenizerLoad> {
+        crate::flm_tokenizer::load_qwen_bpe_from_flm_timed(self.runtime()?)
+            .map_err(|e| anyhow::anyhow!("loading FLM Qwen tokenizer: {e}"))
+    }
 }
 
 #[cfg(test)]

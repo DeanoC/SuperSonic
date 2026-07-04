@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use model_store::flm::{
@@ -38,6 +39,18 @@ struct QwenAddedToken {
     special: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct QwenBpeTokenizerTimings {
+    pub asset_lookup: Duration,
+    pub parse: Duration,
+    pub build: Duration,
+}
+
+pub struct QwenBpeTokenizerLoad {
+    pub tokenizer: Tokenizer,
+    pub timings: QwenBpeTokenizerTimings,
+}
+
 impl QwenBpeAssets {
     fn parse(
         algorithm_id: u32,
@@ -66,6 +79,14 @@ impl QwenBpeAssets {
 pub fn load_qwen_bpe_from_flm(
     runtime: &model_store::FlmRuntimeDirectory,
 ) -> Result<tokenizers::Tokenizer> {
+    Ok(load_qwen_bpe_from_flm_timed(runtime)?.tokenizer)
+}
+
+pub fn load_qwen_bpe_from_flm_timed(
+    runtime: &model_store::FlmRuntimeDirectory,
+) -> Result<QwenBpeTokenizerLoad> {
+    let mut timings = QwenBpeTokenizerTimings::default();
+    let asset_start = Instant::now();
     let descriptor = runtime
         .tokenizer()
         .ok_or_else(|| anyhow!("FLM runtime has no tokenizer descriptor"))?;
@@ -93,7 +114,9 @@ pub fn load_qwen_bpe_from_flm(
         ASSET_TOKENIZER_REGEX,
         "tokenizer_regex",
     )?;
+    timings.asset_lookup = asset_start.elapsed();
 
+    let parse_start = Instant::now();
     let assets = QwenBpeAssets::parse(
         descriptor.algorithm_id,
         descriptor.vocab_size,
@@ -102,7 +125,13 @@ pub fn load_qwen_bpe_from_flm(
         added_tokens,
         regex,
     )?;
-    build_qwen_bpe_tokenizer(assets)
+    timings.parse = parse_start.elapsed();
+
+    let build_start = Instant::now();
+    let tokenizer = build_qwen_bpe_tokenizer(assets)?;
+    timings.build = build_start.elapsed();
+
+    Ok(QwenBpeTokenizerLoad { tokenizer, timings })
 }
 
 fn asset_payload<'a>(

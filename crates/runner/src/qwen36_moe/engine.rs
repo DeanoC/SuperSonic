@@ -193,6 +193,13 @@ fn validate_qwen36_decode_weight_mode(
 #[derive(Clone, Copy, Debug, Default)]
 struct Qwen36StartupTimings {
     flm_source_open: std::time::Duration,
+    flm_store_open: std::time::Duration,
+    flm_config: std::time::Duration,
+    flm_tokenizer: std::time::Duration,
+    flm_tokenizer_assets: std::time::Duration,
+    flm_tokenizer_parse: std::time::Duration,
+    flm_tokenizer_build: std::time::Duration,
+    flm_direct_plan: std::time::Duration,
     bake_prepare: std::time::Duration,
     dry_run: std::time::Duration,
 }
@@ -219,12 +226,71 @@ fn qwen36_duration_ms(duration: std::time::Duration) -> f64 {
 
 fn format_qwen36_startup_timings(timings: &Qwen36StartupTimings) -> String {
     format!(
-        "flm_source_open_ms={:.3} bake_prepare_ms={:.3} \
+        "flm_source_open_ms={:.3} flm_store_open_ms={:.3} \
+         flm_config_ms={:.3} flm_tokenizer_ms={:.3} \
+         flm_tokenizer_assets_ms={:.3} flm_tokenizer_parse_ms={:.3} \
+         flm_tokenizer_build_ms={:.3} flm_direct_plan_ms={:.3} \
+         bake_prepare_ms={:.3} \
          dry_run_ms={:.3} pre_decode_total_ms={:.3}",
         qwen36_duration_ms(timings.flm_source_open),
+        qwen36_duration_ms(timings.flm_store_open),
+        qwen36_duration_ms(timings.flm_config),
+        qwen36_duration_ms(timings.flm_tokenizer),
+        qwen36_duration_ms(timings.flm_tokenizer_assets),
+        qwen36_duration_ms(timings.flm_tokenizer_parse),
+        qwen36_duration_ms(timings.flm_tokenizer_build),
+        qwen36_duration_ms(timings.flm_direct_plan),
         qwen36_duration_ms(timings.bake_prepare),
         qwen36_duration_ms(timings.dry_run),
         qwen36_duration_ms(timings.pre_decode_total()),
+    )
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct Qwen36LifecycleTimings {
+    prompt_setup: std::time::Duration,
+    flm_tokenizer: std::time::Duration,
+    flm_tokenizer_assets: std::time::Duration,
+    flm_tokenizer_parse: std::time::Duration,
+    flm_tokenizer_build: std::time::Duration,
+    model_source: std::time::Duration,
+    layer_load: std::time::Duration,
+    session: std::time::Duration,
+    prefill_steps: usize,
+    prefill_embed: std::time::Duration,
+    prefill_chain: std::time::Duration,
+    generation_wall: Option<f64>,
+    total_wall: std::time::Duration,
+}
+
+impl Qwen36LifecycleTimings {
+    fn prefill_total(self) -> std::time::Duration {
+        self.prefill_embed + self.prefill_chain
+    }
+}
+
+fn format_qwen36_lifecycle_timings(timings: &Qwen36LifecycleTimings) -> String {
+    format!(
+        "prompt_setup_ms={:.3} flm_tokenizer_ms={:.3} \
+         flm_tokenizer_assets_ms={:.3} flm_tokenizer_parse_ms={:.3} \
+         flm_tokenizer_build_ms={:.3} model_source_ms={:.3} \
+         layer_load_ms={:.3} session_ms={:.3} prefill_steps={} \
+         prefill_embed_ms={:.3} prefill_chain_ms={:.3} \
+         prefill_total_ms={:.3} generation_wall_ms={:.3} total_wall_ms={:.3}",
+        qwen36_duration_ms(timings.prompt_setup),
+        qwen36_duration_ms(timings.flm_tokenizer),
+        qwen36_duration_ms(timings.flm_tokenizer_assets),
+        qwen36_duration_ms(timings.flm_tokenizer_parse),
+        qwen36_duration_ms(timings.flm_tokenizer_build),
+        qwen36_duration_ms(timings.model_source),
+        qwen36_duration_ms(timings.layer_load),
+        qwen36_duration_ms(timings.session),
+        timings.prefill_steps,
+        qwen36_duration_ms(timings.prefill_embed),
+        qwen36_duration_ms(timings.prefill_chain),
+        qwen36_duration_ms(timings.prefill_total()),
+        timings.generation_wall.unwrap_or(0.0),
+        qwen36_duration_ms(timings.total_wall),
     )
 }
 
@@ -255,14 +321,55 @@ mod tests {
     fn formats_startup_timings_for_machine_parsing() {
         let timings = Qwen36StartupTimings {
             flm_source_open: std::time::Duration::from_micros(1_500),
+            flm_store_open: std::time::Duration::from_micros(500),
+            flm_config: std::time::Duration::from_micros(250),
+            flm_tokenizer: std::time::Duration::from_micros(625),
+            flm_tokenizer_assets: std::time::Duration::from_micros(25),
+            flm_tokenizer_parse: std::time::Duration::from_micros(275),
+            flm_tokenizer_build: std::time::Duration::from_micros(325),
+            flm_direct_plan: std::time::Duration::from_micros(125),
             bake_prepare: std::time::Duration::ZERO,
             dry_run: std::time::Duration::from_micros(2_250),
         };
 
         assert_eq!(
             format_qwen36_startup_timings(&timings),
-            "flm_source_open_ms=1.500 bake_prepare_ms=0.000 \
+            "flm_source_open_ms=1.500 flm_store_open_ms=0.500 \
+             flm_config_ms=0.250 flm_tokenizer_ms=0.625 \
+             flm_tokenizer_assets_ms=0.025 flm_tokenizer_parse_ms=0.275 \
+             flm_tokenizer_build_ms=0.325 flm_direct_plan_ms=0.125 \
+             bake_prepare_ms=0.000 \
              dry_run_ms=2.250 pre_decode_total_ms=3.750"
+        );
+    }
+
+    #[test]
+    fn formats_lifecycle_timings_with_lazy_flm_tokenizer_breakdown() {
+        let timings = Qwen36LifecycleTimings {
+            prompt_setup: std::time::Duration::from_micros(5_000),
+            flm_tokenizer: std::time::Duration::from_micros(625),
+            flm_tokenizer_assets: std::time::Duration::from_micros(25),
+            flm_tokenizer_parse: std::time::Duration::from_micros(275),
+            flm_tokenizer_build: std::time::Duration::from_micros(325),
+            model_source: std::time::Duration::from_micros(1_500),
+            layer_load: std::time::Duration::from_micros(2_500),
+            session: std::time::Duration::from_micros(3_500),
+            prefill_steps: 2,
+            prefill_embed: std::time::Duration::from_micros(100),
+            prefill_chain: std::time::Duration::from_micros(200),
+            generation_wall: Some(4.5),
+            total_wall: std::time::Duration::from_micros(9_000),
+        };
+
+        assert_eq!(
+            format_qwen36_lifecycle_timings(&timings),
+            "prompt_setup_ms=5.000 flm_tokenizer_ms=0.625 \
+             flm_tokenizer_assets_ms=0.025 flm_tokenizer_parse_ms=0.275 \
+             flm_tokenizer_build_ms=0.325 model_source_ms=1.500 \
+             layer_load_ms=2.500 session_ms=3.500 prefill_steps=2 \
+             prefill_embed_ms=0.100 prefill_chain_ms=0.200 \
+             prefill_total_ms=0.300 generation_wall_ms=4.500 \
+             total_wall_ms=9.000"
         );
     }
 }
@@ -434,8 +541,15 @@ fn run_inner(
     let mut startup_timings = Qwen36StartupTimings::default();
     let flm_source_open_start = std::time::Instant::now();
     let flm_source = open_qwen36_moe_flm_source(cli)?;
-    if flm_source.is_some() {
+    if let Some(flm) = flm_source.as_ref() {
         startup_timings.flm_source_open = flm_source_open_start.elapsed();
+        startup_timings.flm_store_open = flm.timings.store_open;
+        startup_timings.flm_config = flm.timings.config;
+        startup_timings.flm_tokenizer = flm.timings.tokenizer;
+        startup_timings.flm_tokenizer_assets = flm.timings.tokenizer_assets;
+        startup_timings.flm_tokenizer_parse = flm.timings.tokenizer_parse;
+        startup_timings.flm_tokenizer_build = flm.timings.tokenizer_build;
+        startup_timings.flm_direct_plan = flm.timings.direct_plan;
     }
     if flm_source.is_none() {
         let bake_prepare_start = std::time::Instant::now();
@@ -595,9 +709,16 @@ fn decode_text(
 
     progress("prompt_setup", "start".to_string(), true);
     let prompt_setup_start = std::time::Instant::now();
+    let mut flm_tokenizer_elapsed = std::time::Duration::ZERO;
+    let mut flm_tokenizer_timings = crate::flm_tokenizer::QwenBpeTokenizerTimings::default();
     let prompt_setup = if let Some(flm) = flm_source {
+        eprintln!("[qwen36-moe] loading tokenizer from FLM assets");
+        let tokenizer_start = std::time::Instant::now();
+        let tokenizer_load = flm.load_tokenizer_timed()?;
+        flm_tokenizer_elapsed = tokenizer_start.elapsed();
+        flm_tokenizer_timings = tokenizer_load.timings;
         prepare_prompt_with_tokenizer(
-            Some(flm.tokenizer.clone()),
+            Some(tokenizer_load.tokenizer),
             &report.config.text_config,
             prompt,
         )?
@@ -1279,23 +1400,24 @@ fn decode_text(
     }
     stage_timings.print_if_requested(emit_stage_timings);
     if emit_stage_timings {
-        let to_ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
-        let prefill_total_ms = to_ms(prefill_embed_elapsed + prefill_chain_elapsed);
-        eprintln!(
-            "[qwen36-moe lifecycle-timings] prompt_setup_ms={:.3} \
-             model_source_ms={:.3} layer_load_ms={:.3} session_ms={:.3} \
-             prefill_steps={} prefill_embed_ms={:.3} prefill_chain_ms={:.3} \
-             prefill_total_ms={:.3} generation_wall_ms={:.3} total_wall_ms={:.3}",
-            to_ms(prompt_setup_elapsed),
-            to_ms(model_source_elapsed),
-            to_ms(layer_load_elapsed),
-            to_ms(session_elapsed),
+        let lifecycle_timings = Qwen36LifecycleTimings {
+            prompt_setup: prompt_setup_elapsed,
+            flm_tokenizer: flm_tokenizer_elapsed,
+            flm_tokenizer_assets: flm_tokenizer_timings.asset_lookup,
+            flm_tokenizer_parse: flm_tokenizer_timings.parse,
+            flm_tokenizer_build: flm_tokenizer_timings.build,
+            model_source: model_source_elapsed,
+            layer_load: layer_load_elapsed,
+            session: session_elapsed,
             prefill_steps,
-            to_ms(prefill_embed_elapsed),
-            to_ms(prefill_chain_elapsed),
-            prefill_total_ms,
-            generation_wall_ms.unwrap_or(0.0),
-            to_ms(decode_wall_start.elapsed()),
+            prefill_embed: prefill_embed_elapsed,
+            prefill_chain: prefill_chain_elapsed,
+            generation_wall: generation_wall_ms,
+            total_wall: decode_wall_start.elapsed(),
+        };
+        eprintln!(
+            "[qwen36-moe lifecycle-timings] {}",
+            format_qwen36_lifecycle_timings(&lifecycle_timings),
         );
     }
     if let Some(stats) = mtp_acceptance_stats.as_ref() {
