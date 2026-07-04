@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::ffi::c_int;
 use std::ffi::c_void;
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use gpu_hal::{
     copy_h2d, copy_h2d_async, current_backend, sync, Backend, GpuBuffer, GpuStream,
@@ -174,10 +174,32 @@ struct CtSymInt4Bf16Fallback {
 }
 
 /// A memory-mapped baked weight store for fast GPU loading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TensorStorageSourceKind {
+    BakedWeights,
+    FlmContainer,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TensorStorageExtent {
+    pub source_kind: TensorStorageSourceKind,
+    pub source_path: PathBuf,
+    pub name: String,
+    pub file_offset: u64,
+    pub byte_len: u64,
+    pub storage_dtype: String,
+    pub storage_shape: Vec<usize>,
+    pub layout: LayoutTag,
+    pub upload_dtype: String,
+    pub upload_shape: Vec<usize>,
+}
+
 pub struct BakedStore {
     _mmap: Mmap,
     data: *const u8,
     data_len: usize,
+    source_kind: TensorStorageSourceKind,
+    source_path: PathBuf,
     index: HashMap<String, TensorMeta>,
     synthetic: HashMap<String, Vec<u8>>,
     upload_views: HashMap<String, TensorUploadView>,
@@ -1558,7 +1580,10 @@ impl BakedStore {
         let manifest_text = std::fs::read_to_string(crate::manifest_path(bake_dir))?;
         let manifest: Manifest = serde_json::from_str(&manifest_text)?;
 
-        let weights_file = File::open(crate::weights_bin_path(bake_dir))?;
+        let weights_path = crate::weights_bin_path(bake_dir);
+        let weights_file = File::open(&weights_path)?;
+        let source_path =
+            std::fs::canonicalize(&weights_path).unwrap_or_else(|_| weights_path.clone());
         let mmap = unsafe { Mmap::map(&weights_file)? };
 
         let data = mmap.as_ptr();
@@ -1573,6 +1598,8 @@ impl BakedStore {
             _mmap: mmap,
             data,
             data_len,
+            source_kind: TensorStorageSourceKind::BakedWeights,
+            source_path,
             index,
             synthetic: HashMap::new(),
             upload_views: HashMap::new(),
@@ -1589,6 +1616,7 @@ impl BakedStore {
     /// Open an FLM container with optional compatibility aliases.
     pub fn open_flm_with_options(path: &Path, options: FlmLoadOptions) -> Result<Self, Error> {
         let file = File::open(path)?;
+        let source_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         let mmap = unsafe { Mmap::map(&file)? };
         let data = mmap.as_ptr();
         let data_len = mmap.len();
@@ -1643,6 +1671,8 @@ impl BakedStore {
             _mmap: mmap,
             data,
             data_len,
+            source_kind: TensorStorageSourceKind::FlmContainer,
+            source_path,
             index,
             synthetic,
             upload_views,
@@ -1806,6 +1836,41 @@ impl BakedStore {
         Ok(&bytes[byte_offset..range_end])
     }
 
+    /// Return the concrete file extent for a direct file-backed tensor.
+    ///
+    /// This is the storage-side descriptor future transfer backends need: the
+    /// source file identity plus byte extent, alongside both the bytes-on-disk
+    /// metadata and the runtime upload view. Synthesized and transformed
+    /// aliases return `Ok(None)` because there is no single source-file extent
+    /// that can be transferred directly.
+    pub fn tensor_storage_extent(&self, name: &str) -> Result<Option<TensorStorageExtent>, Error> {
+        let meta = self
+            .index
+            .get(name)
+            .ok_or_else(|| Error::NotFound(name.to_string()))?;
+        if self.synthetic.contains_key(name) || self.ct_int4_bf16_fallbacks.contains_key(name) {
+            return Ok(None);
+        }
+        self.tensor_bytes(name, meta)?;
+        let (upload_dtype, upload_shape) = if let Some(view) = self.upload_views.get(name) {
+            (view.dtype.clone(), view.shape.clone())
+        } else {
+            (meta.dtype.clone(), gpu_upload_shape(meta)?)
+        };
+        Ok(Some(TensorStorageExtent {
+            source_kind: self.source_kind,
+            source_path: self.source_path.clone(),
+            name: name.to_string(),
+            file_offset: meta.offset,
+            byte_len: meta.byte_len,
+            storage_dtype: meta.dtype.clone(),
+            storage_shape: meta.shape.clone(),
+            layout: meta.layout.clone(),
+            upload_dtype,
+            upload_shape,
+        }))
+    }
+
     /// Load a tensor from the baked store to GPU memory.
     /// Direct tensors borrow mmap bytes; transformed FLM logical aliases
     /// materialize a temporary host fallback payload before upload.
@@ -1837,21 +1902,24 @@ impl BakedStore {
                 "registered mmap upload is currently implemented for HIP only".into(),
             )));
         }
-        let meta = self
-            .index
-            .get(name)
-            .ok_or_else(|| Error::NotFound(name.to_string()))?;
-        let (dtype, upload_shape, payload) = self.upload_payload(name, meta)?;
-        let Cow::Borrowed(bytes) = payload else {
-            return Err(Error::Other(format!(
-                "tensor '{name}' is not backed by the store mmap and cannot use registered upload"
-            )));
-        };
+        let extent = self.tensor_storage_extent(name)?.ok_or_else(|| {
+            Error::Other(format!(
+                "tensor '{name}' is not a direct file-backed extent and cannot use registered upload"
+            ))
+        })?;
+        let byte_offset = u64_to_usize(extent.file_offset, "registered upload file offset")?;
+        let byte_len = u64_to_usize(extent.byte_len, "registered upload byte length")?;
+        let dtype = parse_dtype(&extent.upload_dtype)?;
+        let upload_shape = extent.upload_shape;
+        let bytes = self.raw_byte_range(name, 0, byte_len)?;
+        let data_start = (self.data as usize)
+            .checked_add(byte_offset)
+            .ok_or_else(|| Error::Other("registered upload data pointer overflows".into()))?;
         let range = host_registration_range_for_mmap_slice(
             self.data as usize,
             self.data_len,
-            bytes.as_ptr() as usize,
-            bytes.len(),
+            data_start,
+            byte_len,
             host_page_size(),
         )?;
         let elems = upload_shape
@@ -3846,6 +3914,45 @@ mod tests {
     }
 
     #[test]
+    fn open_flm_exposes_file_storage_extent_for_direct_tensor() {
+        let data = build_test_flm(&[
+            TestFlmTensor {
+                name: "model.embed_tokens.weight",
+                shape: vec![2, 4],
+                dtype: 4,
+                codec: 0,
+                payload: (0u8..8).collect(),
+            },
+            TestFlmTensor {
+                name: "model.norm.weight",
+                shape: vec![2],
+                dtype: 2,
+                codec: 0,
+                payload: vec![0x00, 0x3f, 0x00, 0x40],
+            },
+        ]);
+        let file = write_temp_flm(&data);
+        let store = BakedStore::open_flm(file.path()).expect("open FLM");
+        let meta = store.meta("model.norm.weight").expect("norm meta");
+
+        let extent = store
+            .tensor_storage_extent("model.norm.weight")
+            .expect("storage extent")
+            .expect("direct FLM tensor should expose a file extent");
+
+        assert_eq!(extent.source_kind, TensorStorageSourceKind::FlmContainer);
+        assert_eq!(extent.source_path, file.path());
+        assert_eq!(extent.name, "model.norm.weight");
+        assert_eq!(extent.file_offset, meta.offset);
+        assert_eq!(extent.byte_len, meta.byte_len);
+        assert_eq!(extent.storage_dtype, "bf16");
+        assert_eq!(extent.storage_shape, vec![2]);
+        assert_eq!(extent.layout, LayoutTag::Raw);
+        assert_eq!(extent.upload_dtype, "bf16");
+        assert_eq!(extent.upload_shape, vec![2]);
+    }
+
+    #[test]
     fn host_registration_range_is_bounded_by_page_rounded_mmap() {
         let range = host_registration_range_for_mmap_slice(0x1000, 0x2500, 0x2234, 0x40, 4096)
             .expect("registration range");
@@ -4145,6 +4252,13 @@ mod tests {
             kind,
             Some(crate::flm::FlmStage3DirectWeightKind::CtInt4Bf16Fallback)
         );
+        assert!(
+            store
+                .tensor_storage_extent("model.language_model.layers.0.mlp.gate_proj.weight")
+                .expect("CT fallback storage extent")
+                .is_none(),
+            "CT fallback aliases are materialized transforms and must not expose a single file extent"
+        );
     }
 
     #[test]
@@ -4171,6 +4285,17 @@ mod tests {
             kind,
             Some(crate::flm::FlmStage3DirectWeightKind::NativeInt4)
         );
+        let extent = store
+            .tensor_storage_extent("model.language_model.layers.0.mlp.experts.gate_up_proj")
+            .expect("native INT4 extent")
+            .expect("native INT4 direct tensor should expose file extent");
+        assert_eq!(extent.source_kind, TensorStorageSourceKind::FlmContainer);
+        assert_eq!(extent.source_path, file.path());
+        assert_eq!(extent.storage_dtype, "u8");
+        assert_eq!(extent.storage_shape, vec![2, 256, 64]);
+        assert_eq!(extent.layout, LayoutTag::Int4Quantized);
+        assert_eq!(extent.upload_dtype, "u8");
+        assert_eq!(extent.upload_shape, vec![2, 256, 64]);
     }
 
     #[test]

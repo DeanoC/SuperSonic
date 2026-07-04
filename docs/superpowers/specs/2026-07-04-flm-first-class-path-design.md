@@ -48,6 +48,14 @@ the same FLM tensor extent metadata with multiple implementations:
 - GPU-direct storage-to-device transfer when the platform and file/device
   alignment support it.
 
+SuperSonic should expose a concrete storage-extent descriptor for direct
+file-backed tensors before adding transfer backends. The descriptor names the
+source file, byte offset, byte length, storage dtype/shape/layout, and runtime
+upload dtype/shape. Synthesized or transformed fallback aliases must not expose
+a single direct extent. This keeps future GPU-direct work from inferring file
+identity through mmap pointers or conflating packed storage shape with the
+execution view.
+
 FLM itself should describe the tensor storage extents, layout ABI, direct plan,
 and integrity information. The inference engine chooses the best transfer
 backend for the current platform without changing FLM semantics.
