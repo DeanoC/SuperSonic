@@ -299,6 +299,7 @@ class BenchQwen36HeSuperSonicTests(unittest.TestCase):
             returncode=0,
             stdout="",
             stderr=(
+                "[flm] inferred model qwen3.6-35b-a3b from runtime descriptor\n"
                 "[result] prompt_tokens=1 generated_tokens=1 decode_ms=41 "
                 "ms_per_step=41.0\n"
                 "[qwen36-moe lifecycle-timings] prompt_setup_ms=55.351 "
@@ -319,6 +320,7 @@ class BenchQwen36HeSuperSonicTests(unittest.TestCase):
         self.assertNotIn("--int4", cmd)
         self.assertIn("--emit-stage-timings", cmd)
         self.assertEqual(row["generated_tokens"], 1)
+        self.assertEqual(row.get("resolved_model"), "qwen3.6-35b-a3b")
         self.assertEqual(
             row["lifecycle_timings"],
             {

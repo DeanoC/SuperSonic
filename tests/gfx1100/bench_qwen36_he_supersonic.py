@@ -64,6 +64,9 @@ RESULT_RE = re.compile(
 )
 LIFECYCLE_RE = re.compile(r"\[qwen36-moe lifecycle-timings\]\s+(?P<body>.+)")
 TIMING_KV_RE = re.compile(r"(?P<key>[a-zA-Z_]+)=(?P<value>-?[0-9]+(?:\.[0-9]+)?)")
+INFERRED_MODEL_RE = re.compile(
+    r"\[flm\]\s+inferred model (?P<model>\S+) from runtime descriptor"
+)
 
 
 TARGET_PROFILES = {
@@ -180,6 +183,13 @@ def parse_lifecycle_timings(text: str) -> dict[str, float] | None:
     return values or None
 
 
+def parse_inferred_model(text: str) -> str | None:
+    match = INFERRED_MODEL_RE.search(text)
+    if not match:
+        return None
+    return match.group("model")
+
+
 def apply_target_profile(args: argparse.Namespace) -> None:
     profile = TARGET_PROFILES[args.target_profile]
     if args.model is None:
@@ -285,6 +295,9 @@ def run_one(args: argparse.Namespace, name: str, prompt: str, warmup: bool = Fal
     lifecycle_timings = parse_lifecycle_timings(combined)
     if lifecycle_timings:
         row["lifecycle_timings"] = lifecycle_timings
+    resolved_model = parse_inferred_model(combined)
+    if resolved_model:
+        row["resolved_model"] = resolved_model
     if args.dflash:
         row["dflash_draft_label"] = dflash_draft_label
         row["dflash_draft_dir"] = str(dflash_draft_dir)
@@ -468,9 +481,14 @@ def main() -> int:
         return 1
     summary = build_summary(rows)
     dflash_draft_dir, dflash_draft_gguf, dflash_draft_label = resolve_dflash_draft(args)
+    resolved_model = args.model or next(
+        (row["resolved_model"] for row in rows if row.get("resolved_model")),
+        None,
+    )
     payload = {
         "schema": "supersonic-qwen36-he-comparison-v2",
         "model": args.model,
+        "resolved_model": resolved_model,
         "model_dir": str(args.model_dir),
         "quant": args.quant,
         "dflash": args.dflash,

@@ -163,7 +163,8 @@ python3 tests/gfx1100/bench_qwen36_he_supersonic.py \
 
 This FLM target profile passes the `.flm` as `--model-dir` without `--model`,
 so the run measures the same descriptor-inferred first-class path as the direct
-smoke above. The resulting JSON includes both decode throughput and parsed
+smoke above. The resulting JSON records `model: null`,
+`resolved_model: qwen3.6-35b-a3b`, decode throughput, and parsed
 `[qwen36-moe lifecycle-timings]` fields such as `model_source_ms`,
 `layer_load_ms`, `generation_wall_ms`, and `total_wall_ms`.
 
