@@ -212,9 +212,10 @@ pub enum VirtualArenaTransferBackend {
     PageableH2d,
     /// Storage-to-device transfer from the source file range into virtual memory.
     ///
-    /// This backend is named now so callers can select and test the boundary,
-    /// but it returns `Unsupported` until gpu-hal grows the corresponding
-    /// storage-to-device primitive.
+    /// On HIP this routes through the optional hipFile storage-to-device
+    /// primitive when it is compiled in. Builds or backends without a concrete
+    /// storage-direct implementation return `Unsupported` before pageable
+    /// mapping/copy fallback.
     GpuDirectStorage,
 }
 
@@ -2143,9 +2144,10 @@ impl BakedStore {
     /// Load a direct file-backed tensor range into a virtual allocation through
     /// an explicit transfer backend.
     ///
-    /// `PageableH2d` is the current implementation. `GpuDirectStorage` is the
-    /// first-class FLM target backend, but currently reports `Unsupported`
-    /// instead of silently falling back to pageable H2D.
+    /// `PageableH2d` is the portable fallback. `GpuDirectStorage` is the
+    /// first-class FLM target backend and reports `Unsupported` instead of
+    /// silently falling back when the selected HAL backend has no concrete
+    /// storage-to-device implementation.
     pub fn load_range_to_virtual_arena_with_backend(
         &self,
         arena: &mut VirtualArena,

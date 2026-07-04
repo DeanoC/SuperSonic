@@ -1,9 +1,9 @@
 #![cfg(supersonic_backend_hip)]
 
 use gpu_hal::{
-    copy_h2d, hal_profile_reset, hal_profile_set_enabled, hal_profile_snapshot, set_backend, sync,
-    vmm_is_supported, Backend, ScalarType, VirtualAllocationRole, VirtualArena, VirtualBacking,
-    VirtualBuffer,
+    copy_h2d, hal_profile_reset, hal_profile_set_enabled, hal_profile_snapshot, set_backend,
+    storage_to_device_is_supported, sync, vmm_is_supported, Backend, ScalarType,
+    VirtualAllocationRole, VirtualArena, VirtualBacking, VirtualBuffer,
 };
 use std::path::Path;
 
@@ -168,6 +168,13 @@ fn vmm_storage_direct_copy_is_explicit_without_pageable_fallback() {
             .contains("GPU-direct storage-to-device transfer"),
         "unexpected error: {err}"
     );
+    if !storage_to_device_is_supported(Backend::Hip) {
+        assert!(
+            err.to_string().contains("hipFile support is not compiled")
+                && err.to_string().contains("ROCm >= 7.2"),
+            "unsupported HIP storage-direct error should explain the missing hipFile build support: {err}"
+        );
+    }
     assert!(
         profile
             .entries

@@ -935,8 +935,15 @@ pub(crate) fn ensure_storage_to_device_supported(
     if storage_to_device_is_supported(backend) {
         return Ok(());
     }
+    let reason = match backend {
+        Backend::Hip => {
+            "hipFile support is not compiled; ROCm >= 7.2 with hipfile.h and libhipfile is required"
+        }
+        Backend::Cuda => "CUDA storage-to-device transfer is not implemented yet",
+        Backend::Metal => "Metal storage-to-device transfer is not implemented",
+    };
     Err(GpuError::Unsupported(format!(
-        "GPU-direct storage-to-device transfer is not implemented for {backend} \
+        "GPU-direct storage-to-device transfer is not available for {backend}: {reason} \
          (source={} offset={} len={})",
         source_path.display(),
         source_offset,
