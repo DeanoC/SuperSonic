@@ -14,7 +14,10 @@ pub use flm::{
     FlmAsset, FlmQwen36DenseConfig, FlmQwen36MoeConfig, FlmRuntimeDirectory, FlmRuntimeIdentity,
     FlmTokenizerDescriptor,
 };
-pub use store::{read_flm_runtime_identity, BakedStore, FlmLoadOptions};
+pub use store::{
+    read_flm_runtime_identity, BakedStore, FlmLoadOptions, TensorStorageExtent,
+    TensorStorageSourceKind,
+};
 
 /// Error type for bake and load operations.
 #[derive(Debug, thiserror::Error)]

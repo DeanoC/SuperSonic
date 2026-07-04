@@ -56,6 +56,12 @@ a single direct extent. This keeps future GPU-direct work from inferring file
 identity through mmap pointers or conflating packed storage shape with the
 execution view.
 
+For Qwen3.6 MoE, the highest-value transfer boundary is the virtual arena range
+loader, not only dense `GpuBuffer` construction: routed expert slabs already
+enter execution through stable virtual allocations. A GPU-direct backend should
+therefore target extent-to-virtual-allocation range loads so the direct FLM plan
+can become resident in the execution layout without a dense staging detour.
+
 FLM itself should describe the tensor storage extents, layout ABI, direct plan,
 and integrity information. The inference engine chooses the best transfer
 backend for the current platform without changing FLM semantics.

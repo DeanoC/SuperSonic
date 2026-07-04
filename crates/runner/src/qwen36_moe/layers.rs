@@ -5,7 +5,7 @@ use gpu_hal::{
     current_backend, Backend, GpuBuffer, ScalarType, VirtualAllocationRole, VirtualArena,
 };
 use model_store::manifest::LayoutTag;
-use model_store::BakedStore;
+use model_store::{BakedStore, TensorStorageExtent};
 use qwen36_moe::config::TextConfig;
 
 use crate::qwen36_moe_residency::MoeExpertResidencyManager;
@@ -22,8 +22,8 @@ use crate::qwen36_moe_types::{
 pub(crate) fn load_to_gpu(store: &BakedStore, ordinal: usize, name: &str) -> Result<GpuBuffer> {
     let resolved = resolve_qwen36_store_name(store, name);
     if registered_mmap_upload_enabled() && current_backend() == Backend::Hip {
-        if let Some(meta) = store.meta(resolved.as_ref()) {
-            if should_use_registered_mmap_upload(resolved.as_ref(), &meta.dtype, meta.byte_len) {
+        if let Ok(Some(extent)) = store.tensor_storage_extent(resolved.as_ref()) {
+            if should_use_registered_mmap_upload_for_extent(&extent) {
                 match store.load_to_gpu_registered_mmap(resolved.as_ref(), ordinal) {
                     Ok(buffer) => return Ok(buffer),
                     Err(err) => {
@@ -119,38 +119,82 @@ fn registered_mmap_upload_env_value_enabled(value: Option<&str>) -> bool {
     )
 }
 
-fn should_use_registered_mmap_upload(name: &str, dtype: &str, byte_len: u64) -> bool {
-    dtype == "u8"
-        && byte_len >= REGISTERED_MMAP_UPLOAD_MIN_BYTES
-        && name.ends_with(".mlp.experts.gate_up_proj")
+fn should_use_registered_mmap_upload_for_extent(extent: &TensorStorageExtent) -> bool {
+    extent.storage_dtype == "u8"
+        && extent.upload_dtype == "u8"
+        && extent.byte_len >= REGISTERED_MMAP_UPLOAD_MIN_BYTES
+        && matches!(extent.layout, LayoutTag::Int4Quantized)
+        && extent.name.ends_with(".mlp.experts.gate_up_proj")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use model_store::{TensorStorageExtent, TensorStorageSourceKind};
+    use std::path::PathBuf;
+
+    fn test_extent(
+        name: &str,
+        byte_len: u64,
+        storage_dtype: &str,
+        layout: LayoutTag,
+    ) -> TensorStorageExtent {
+        TensorStorageExtent {
+            source_kind: TensorStorageSourceKind::FlmContainer,
+            source_path: PathBuf::from("/tmp/model.flm"),
+            name: name.to_string(),
+            file_offset: 4096,
+            byte_len,
+            storage_dtype: storage_dtype.to_string(),
+            storage_shape: vec![128, 8192, 256],
+            layout,
+            upload_dtype: storage_dtype.to_string(),
+            upload_shape: vec![128, 8192, 256],
+        }
+    }
 
     #[test]
     fn registered_mmap_upload_policy_targets_native_int4_gate_up_slabs() {
-        assert!(should_use_registered_mmap_upload(
+        assert!(should_use_registered_mmap_upload_for_extent(&test_extent(
             "model.language_model.layers.0.mlp.experts.gate_up_proj",
-            "u8",
             268_435_456,
-        ));
-        assert!(!should_use_registered_mmap_upload(
+            "u8",
+            LayoutTag::Int4Quantized,
+        )));
+        assert!(!should_use_registered_mmap_upload_for_extent(&test_extent(
             "model.language_model.layers.0.mlp.experts.down_proj",
+            268_435_456,
             "u8",
-            134_217_728,
-        ));
-        assert!(!should_use_registered_mmap_upload(
+            LayoutTag::Int4Quantized,
+        )));
+        assert!(!should_use_registered_mmap_upload_for_extent(&test_extent(
             "lm_head.weight",
-            "bf16",
             1_017_118_720,
-        ));
-        assert!(!should_use_registered_mmap_upload(
+            "bf16",
+            LayoutTag::Raw,
+        )));
+        assert!(!should_use_registered_mmap_upload_for_extent(&test_extent(
             "mtp.layers.0.mlp.experts.gate_up_proj",
-            "u8",
             524_288,
-        ));
+            "u8",
+            LayoutTag::Int4Quantized,
+        )));
+    }
+
+    #[test]
+    fn registered_mmap_upload_policy_requires_native_int4_extent() {
+        assert!(!should_use_registered_mmap_upload_for_extent(&test_extent(
+            "model.language_model.layers.0.mlp.experts.gate_up_proj",
+            268_435_456,
+            "u8",
+            LayoutTag::Raw,
+        )));
+        assert!(should_use_registered_mmap_upload_for_extent(&test_extent(
+            "model.language_model.layers.0.mlp.experts.gate_up_proj",
+            268_435_456,
+            "u8",
+            LayoutTag::Int4Quantized,
+        )));
     }
 
     #[test]
