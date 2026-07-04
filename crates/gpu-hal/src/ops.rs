@@ -622,6 +622,104 @@ impl Drop for PinnedHostBuffer {
     }
 }
 
+/// RAII wrapper around externally owned host memory registered for faster H2D.
+///
+/// The wrapper does not own the underlying bytes. It only owns the backend
+/// registration and unregisters the exact pointer at drop time.
+pub struct RegisteredHostBuffer {
+    backend: Backend,
+    ordinal: usize,
+    ptr: NonNull<c_void>,
+    len_bytes: usize,
+}
+
+unsafe impl Send for RegisteredHostBuffer {}
+unsafe impl Sync for RegisteredHostBuffer {}
+
+impl RegisteredHostBuffer {
+    /// Register an externally owned host range with the active backend.
+    ///
+    /// # Safety
+    ///
+    /// `ptr..ptr+len_bytes` must stay valid and mapped for the lifetime of the
+    /// returned wrapper, and it must satisfy the backend's host-registration
+    /// alignment requirements. The same range must not be concurrently
+    /// unregistered elsewhere.
+    pub unsafe fn new(ordinal: usize, ptr: *mut c_void, len_bytes: usize) -> Result<Self> {
+        let ptr = NonNull::new(ptr).ok_or_else(|| {
+            GpuError::InvalidArg("RegisteredHostBuffer::new: null host pointer".into())
+        })?;
+        if len_bytes == 0 {
+            return Err(GpuError::InvalidArg(
+                "RegisteredHostBuffer::new: len_bytes must be > 0".into(),
+            ));
+        }
+        let backend = current_backend();
+        hal_profile_time("host_register", len_bytes, || {
+            with_device_impl(backend, ordinal, || match backend {
+                Backend::Hip => {
+                    #[cfg(supersonic_backend_hip)]
+                    {
+                        let status = unsafe { hipHostRegister(ptr.as_ptr(), len_bytes, 0) };
+                        if status != 0 {
+                            return Err(backend_error(Backend::Hip, "hipHostRegister", status));
+                        }
+                        Ok(())
+                    }
+                    #[cfg(not(supersonic_backend_hip))]
+                    Err(GpuError::InvalidArg("HIP backend not compiled".into()))
+                }
+                Backend::Cuda => Err(GpuError::Unsupported(
+                    "RegisteredHostBuffer is not implemented for CUDA yet".into(),
+                )),
+                Backend::Metal => Err(GpuError::Unsupported(
+                    "RegisteredHostBuffer is not implemented for Metal".into(),
+                )),
+            })
+        })?;
+        Ok(Self {
+            backend,
+            ordinal,
+            ptr,
+            len_bytes,
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.len_bytes
+    }
+
+    pub fn as_ptr(&self) -> *const c_void {
+        self.ptr.as_ptr()
+    }
+}
+
+impl Drop for RegisteredHostBuffer {
+    fn drop(&mut self) {
+        let backend = self.backend;
+        let ordinal = self.ordinal;
+        let ptr = self.ptr.as_ptr();
+        let len_bytes = self.len_bytes;
+        let _ = hal_profile_time("host_unregister", len_bytes, || {
+            with_device_impl(backend, ordinal, || match backend {
+                Backend::Hip => {
+                    #[cfg(supersonic_backend_hip)]
+                    {
+                        let status = unsafe { hipHostUnregister(ptr) };
+                        if status != 0 {
+                            return Err(backend_error(Backend::Hip, "hipHostUnregister", status));
+                        }
+                        Ok(())
+                    }
+                    #[cfg(not(supersonic_backend_hip))]
+                    Err(GpuError::InvalidArg("HIP backend not compiled".into()))
+                }
+                Backend::Cuda | Backend::Metal => Ok(()),
+            })
+        });
+    }
+}
+
 /// Allocate `len_bytes` of device memory, zeroed. Same allocator-dispatch
 /// behavior as [`alloc`].
 pub(crate) fn alloc_zeros(
