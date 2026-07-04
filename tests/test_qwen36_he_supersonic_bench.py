@@ -108,7 +108,7 @@ class BenchQwen36HeSuperSonicTests(unittest.TestCase):
 
         bench.apply_target_profile(args)
 
-        self.assertEqual(args.model, "qwen3.6-35b-a3b")
+        self.assertIsNone(args.model)
         self.assertEqual(args.model_dir, bench.DEFAULT_35B_A3B_FLM_MODEL_DIR)
         self.assertEqual(args.quant, "none")
         self.assertEqual(args.out_json, bench.DEFAULT_35B_A3B_FLM_OUT_JSON)
@@ -273,7 +273,7 @@ class BenchQwen36HeSuperSonicTests(unittest.TestCase):
         args = types.SimpleNamespace(
             binary=Path("target/release/supersonic"),
             backend="hip",
-            model="qwen3.6-35b-a3b",
+            model=None,
             model_dir=bench.DEFAULT_35B_A3B_FLM_MODEL_DIR,
             context_size=16,
             warmup_new_tokens=1,
@@ -314,6 +314,8 @@ class BenchQwen36HeSuperSonicTests(unittest.TestCase):
         cmd = run.call_args.args[0]
         self.assertIn("--model-dir", cmd)
         self.assertIn(str(bench.DEFAULT_35B_A3B_FLM_MODEL_DIR), cmd)
+        self.assertNotIn("--model", cmd)
+        self.assertNotIn("qwen3.6-35b-a3b", cmd)
         self.assertNotIn("--int4", cmd)
         self.assertIn("--emit-stage-timings", cmd)
         self.assertEqual(row["generated_tokens"], 1)

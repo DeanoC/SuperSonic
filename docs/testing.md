@@ -161,7 +161,9 @@ python3 tests/gfx1100/bench_qwen36_he_supersonic.py \
   --emit-stage-timings
 ```
 
-The resulting JSON includes both decode throughput and parsed
+This FLM target profile passes the `.flm` as `--model-dir` without `--model`,
+so the run measures the same descriptor-inferred first-class path as the direct
+smoke above. The resulting JSON includes both decode throughput and parsed
 `[qwen36-moe lifecycle-timings]` fields such as `model_source_ms`,
 `layer_load_ms`, `generation_wall_ms`, and `total_wall_ms`.
 

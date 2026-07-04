@@ -80,7 +80,7 @@ TARGET_PROFILES = {
         "out_json": DEFAULT_35B_A3B_OUT_JSON,
     },
     "qwen36-35b-a3b-flm": {
-        "model": DEFAULT_35B_A3B_MODEL,
+        "model": None,
         "model_dir": DEFAULT_35B_A3B_FLM_MODEL_DIR,
         "quant": "none",
         "out_json": DEFAULT_35B_A3B_FLM_OUT_JSON,
@@ -209,8 +209,6 @@ def run_one(args: argparse.Namespace, name: str, prompt: str, warmup: bool = Fal
         str(args.binary),
         "--backend",
         args.backend,
-        "--model",
-        args.model,
         "--model-dir",
         str(args.model_dir),
         "--prompt",
@@ -227,6 +225,8 @@ def run_one(args: argparse.Namespace, name: str, prompt: str, warmup: bool = Fal
         str(args.seed),
         "--no-download",
     ]
+    if args.model is not None:
+        cmd.extend(["--model", args.model])
     if args.prompt_no_special_tokens:
         cmd.append("--prompt-no-special-tokens")
     allow_untested_gpu = getattr(args, "allow_untested_gpu", None)
