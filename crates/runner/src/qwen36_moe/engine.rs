@@ -942,6 +942,24 @@ fn decode_text(
     };
     print_prompt_summary(prompt, &prompt_ids);
 
+    let geom = build_multi_layer_geom(&report.config.text_config, &report.kernel_params);
+
+    set_backend(backend);
+
+    // KV cache size: needs to fit prompt_len + max_new past tokens. Sized
+    // generously here since per-layer KV is small (10 full-attn layers ×
+    // [kv_max_t, Hkv*d=512] BF16 = 10 KiB per token of context).
+    let kv_max_t = prompt_ids.len() + max_new;
+
+    let mut moe_runtime = prepare_moe_runtime_config(
+        speculative_decode,
+        persistent_decode,
+        backend,
+        geom.top_k as usize,
+        flm_virtual_transfer_backend_cli,
+    )?;
+    let kv_vmm = should_use_qwen36_kv_vmm(backend, ordinal)?;
+
     progress(
         "prompt_setup",
         format!("done prompt_tokens={}", prompt_ids.len()),
@@ -983,15 +1001,6 @@ fn decode_text(
     let model_source_elapsed = source_open_start.elapsed();
     progress(source_phase, format!("done source={source_label}"), true);
 
-    let geom = build_multi_layer_geom(&report.config.text_config, &report.kernel_params);
-
-    set_backend(backend);
-
-    // KV cache size: needs to fit prompt_len + max_new past tokens. Sized
-    // generously here since per-layer KV is small (10 full-attn layers ×
-    // [kv_max_t, Hkv*d=512] BF16 = 10 KiB per token of context).
-    let kv_max_t = prompt_ids.len() + max_new;
-
     println!(
         "  loading {} layers ({} INT4 sidecar sets, KV cache cap = {} tokens)…",
         geom.num_layers,
@@ -1003,14 +1012,6 @@ fn decode_text(
         kv_max_t,
     );
 
-    let mut moe_runtime = prepare_moe_runtime_config(
-        speculative_decode,
-        persistent_decode,
-        backend,
-        geom.top_k as usize,
-        flm_virtual_transfer_backend_cli,
-    )?;
-    let kv_vmm = should_use_qwen36_kv_vmm(backend, ordinal)?;
     progress(
         "layer_load",
         format!(

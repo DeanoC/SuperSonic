@@ -94,13 +94,16 @@ pub(crate) fn prepare_moe_runtime_config(
         );
     }
 
+    let virtual_transfer_backend = virtual_arena_transfer_backend_from_cli_or_env_value(
+        flm_virtual_transfer_backend_cli,
+        virtual_transfer_backend_env.as_deref(),
+    )?;
+    validate_virtual_transfer_backend_supported(backend, virtual_transfer_backend)?;
+
     Ok(MoeRuntimeConfig {
         policy,
         sparse_telemetry,
-        virtual_transfer_backend: virtual_arena_transfer_backend_from_cli_or_env_value(
-            flm_virtual_transfer_backend_cli,
-            virtual_transfer_backend_env.as_deref(),
-        )?,
+        virtual_transfer_backend,
     })
 }
 
@@ -126,6 +129,27 @@ pub(crate) fn effective_moe_expert_vmm_mode_for_transfer_backend(
              unset SUPERSONIC_VMM_MOE_ISLANDS=0"
         ),
     }
+}
+
+pub(crate) fn validate_virtual_transfer_backend_supported(
+    backend: Backend,
+    transfer_backend: VirtualArenaTransferBackend,
+) -> Result<()> {
+    if transfer_backend == VirtualArenaTransferBackend::PageableH2d
+        || gpu_hal::storage_to_device_is_supported(backend)
+    {
+        return Ok(());
+    }
+    let reason = match backend {
+        Backend::Hip => {
+            "hipFile support is not compiled; ROCm >= 7.2 with hipfile.h and libhipfile is required"
+        }
+        Backend::Cuda => "CUDA storage-to-device transfer is not implemented yet",
+        Backend::Metal => "Metal storage-to-device transfer is not implemented",
+    };
+    anyhow::bail!(
+        "FLM virtual transfer backend gpu-direct-storage is not available for {backend}: {reason}"
+    )
 }
 
 pub(crate) fn virtual_arena_transfer_backend_from_env_value(
@@ -240,6 +264,28 @@ mod tests {
                 .unwrap_err();
 
         assert!(err.to_string().contains("--flm-virtual-transfer-backend"));
+    }
+
+    #[test]
+    fn flm_direct_transfer_backend_requires_storage_to_device_support() {
+        assert!(validate_virtual_transfer_backend_supported(
+            Backend::Hip,
+            VirtualArenaTransferBackend::PageableH2d,
+        )
+        .is_ok());
+
+        if !gpu_hal::storage_to_device_is_supported(Backend::Hip) {
+            let err = validate_virtual_transfer_backend_supported(
+                Backend::Hip,
+                VirtualArenaTransferBackend::GpuDirectStorage,
+            )
+            .expect_err("HIP direct transfer should be rejected when hipFile is unavailable");
+
+            assert!(
+                err.to_string().contains("hipFile support is not compiled"),
+                "{err}"
+            );
+        }
     }
 
     #[test]
