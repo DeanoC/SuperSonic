@@ -1,10 +1,14 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
+#[cfg(unix)]
+use std::ffi::c_int;
+use std::ffi::c_void;
 use std::fs::File;
 use std::path::Path;
 
 use gpu_hal::{
-    copy_h2d, sync, GpuBuffer, ScalarType, VirtualAllocationRole, VirtualArena, VirtualBacking,
+    copy_h2d, copy_h2d_async, current_backend, sync, Backend, GpuBuffer, GpuStream,
+    RegisteredHostBuffer, ScalarType, VirtualAllocationRole, VirtualArena, VirtualBacking,
 };
 use memmap2::Mmap;
 
@@ -23,6 +27,92 @@ const FLM_DTYPE_FP8_E4M3: u16 = 3;
 const FLM_DTYPE_UINT8: u16 = 4;
 const FLM_DTYPE_INT32: u16 = 5;
 const FLM_DTYPE_INT64: u16 = 6;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HostRegistrationRange {
+    ptr: *mut c_void,
+    len: usize,
+    data_offset: usize,
+}
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn getpagesize() -> c_int;
+}
+
+fn host_page_size() -> usize {
+    #[cfg(unix)]
+    {
+        let page_size = unsafe { getpagesize() };
+        if page_size > 0 {
+            return page_size as usize;
+        }
+    }
+    4096
+}
+
+fn round_up_to(value: usize, align: usize) -> Result<usize, Error> {
+    if align == 0 {
+        return Err(Error::Other("alignment must be > 0".into()));
+    }
+    let remainder = value % align;
+    if remainder == 0 {
+        return Ok(value);
+    }
+    value
+        .checked_add(align - remainder)
+        .ok_or_else(|| Error::Other("round_up_to overflow".into()))
+}
+
+fn host_registration_range_for_mmap_slice(
+    mmap_start: usize,
+    mmap_len: usize,
+    data_start: usize,
+    data_len: usize,
+    page_size: usize,
+) -> Result<HostRegistrationRange, Error> {
+    if mmap_len == 0 {
+        return Err(Error::Other(
+            "host registration requires a non-empty mmap backing".into(),
+        ));
+    }
+    if data_len == 0 {
+        return Err(Error::Other(
+            "host registration requires a non-empty data slice".into(),
+        ));
+    }
+    if page_size == 0 {
+        return Err(Error::Other(
+            "host registration requires page_size > 0".into(),
+        ));
+    }
+    let mmap_end = mmap_start
+        .checked_add(mmap_len)
+        .ok_or_else(|| Error::Other("mmap backing range overflows".into()))?;
+    let data_end = data_start
+        .checked_add(data_len)
+        .ok_or_else(|| Error::Other("data slice range overflows".into()))?;
+    if data_start < mmap_start || data_end > mmap_end {
+        return Err(Error::Other(format!(
+            "data slice [{data_start:#x}, {data_end:#x}) is outside mmap backing \
+             [{mmap_start:#x}, {mmap_end:#x})"
+        )));
+    }
+    let register_start = data_start - (data_start % page_size);
+    let register_end = round_up_to(data_end, page_size)?;
+    let mmap_page_end = round_up_to(mmap_end, page_size)?;
+    if register_start < mmap_start - (mmap_start % page_size) || register_end > mmap_page_end {
+        return Err(Error::Other(format!(
+            "host registration range [{register_start:#x}, {register_end:#x}) is outside \
+             page-rounded mmap backing ending at {mmap_page_end:#x}"
+        )));
+    }
+    Ok(HostRegistrationRange {
+        ptr: register_start as *mut c_void,
+        len: register_end - register_start,
+        data_offset: data_start - register_start,
+    })
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FlmLoadOptions {
@@ -1727,6 +1817,78 @@ impl BakedStore {
         let (dtype, upload_shape, payload) = self.upload_payload(name, meta)?;
         let buf = GpuBuffer::from_host_bytes(ordinal, dtype, &upload_shape, payload.as_ref())?;
         Ok(buf)
+    }
+
+    /// Load a direct mmap-backed tensor through backend host registration.
+    ///
+    /// This is an opt-in diagnostic/experimental path for callers that have
+    /// already determined registration is worthwhile for the tensor
+    /// shape/layout. It is not the first-class FLM fast-load target; direct FLM
+    /// plans should still prefer GPU-resident layouts such as virtual expert
+    /// slabs. The registered path deliberately rejects transformed or
+    /// synthetic payloads because those are not backed by this store's mmap.
+    pub fn load_to_gpu_registered_mmap(
+        &self,
+        name: &str,
+        ordinal: usize,
+    ) -> Result<GpuBuffer, Error> {
+        if current_backend() != Backend::Hip {
+            return Err(Error::Gpu(gpu_hal::GpuError::Unsupported(
+                "registered mmap upload is currently implemented for HIP only".into(),
+            )));
+        }
+        let meta = self
+            .index
+            .get(name)
+            .ok_or_else(|| Error::NotFound(name.to_string()))?;
+        let (dtype, upload_shape, payload) = self.upload_payload(name, meta)?;
+        let Cow::Borrowed(bytes) = payload else {
+            return Err(Error::Other(format!(
+                "tensor '{name}' is not backed by the store mmap and cannot use registered upload"
+            )));
+        };
+        let range = host_registration_range_for_mmap_slice(
+            self.data as usize,
+            self.data_len,
+            bytes.as_ptr() as usize,
+            bytes.len(),
+            host_page_size(),
+        )?;
+        let elems = upload_shape
+            .iter()
+            .try_fold(1usize, |acc, dim| acc.checked_mul(*dim))
+            .ok_or_else(|| {
+                Error::Other(format!(
+                    "tensor '{name}' upload shape {:?} overflows element count",
+                    upload_shape
+                ))
+            })?;
+        let expected_bytes = elems.checked_mul(dtype.size_in_bytes()).ok_or_else(|| {
+            Error::Other(format!(
+                "tensor '{name}' upload shape {:?} overflows byte count",
+                upload_shape
+            ))
+        })?;
+        if bytes.len() != expected_bytes {
+            return Err(Error::Other(format!(
+                "tensor '{name}' registered upload expected {expected_bytes} bytes from dtype={dtype:?} shape={upload_shape:?}, got {}",
+                bytes.len()
+            )));
+        }
+
+        let stream = GpuStream::new_nonblocking(ordinal)?;
+        let mut buffer = GpuBuffer::alloc(ordinal, dtype, &upload_shape)?;
+        let registered = unsafe { RegisteredHostBuffer::new(ordinal, range.ptr, range.len)? };
+        copy_h2d_async(
+            ordinal,
+            &stream,
+            buffer.as_mut_ptr(),
+            bytes.as_ptr() as *const c_void,
+            bytes.len(),
+        )?;
+        stream.synchronize()?;
+        drop(registered);
+        Ok(buffer)
     }
 
     /// Load a tensor into a role-tagged virtual allocation.
@@ -3681,6 +3843,23 @@ mod tests {
         let norm = store.meta("model.norm.weight").unwrap();
         assert_eq!(norm.dtype, "bf16");
         assert_eq!(norm.shape, vec![2]);
+    }
+
+    #[test]
+    fn host_registration_range_is_bounded_by_page_rounded_mmap() {
+        let range = host_registration_range_for_mmap_slice(0x1000, 0x2500, 0x2234, 0x40, 4096)
+            .expect("registration range");
+
+        assert_eq!(range.ptr as usize, 0x2000);
+        assert_eq!(range.len, 0x1000);
+        assert_eq!(range.data_offset, 0x234);
+
+        let err = host_registration_range_for_mmap_slice(0x1000, 0x100, 0x0fff, 0x20, 4096)
+            .expect_err("slice outside mmap should fail");
+        assert!(
+            err.to_string().contains("outside mmap backing"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -6208,12 +6387,18 @@ mod tests {
         gpu_hal::hal_profile_set_enabled(false);
 
         assert!(
-            profile.entries.iter().any(|entry| entry.op == "vmm_map_no_sync"),
+            profile
+                .entries
+                .iter()
+                .any(|entry| entry.op == "vmm_map_no_sync"),
             "expected virtual upload to map pages with no-clear initialization, got {:?}",
             profile.entries
         );
         assert!(
-            profile.entries.iter().all(|entry| entry.op != "memset_zeros"),
+            profile
+                .entries
+                .iter()
+                .all(|entry| entry.op != "memset_zeros"),
             "virtual upload should not clear pages before immediately copying tensor bytes: {:?}",
             profile.entries
         );

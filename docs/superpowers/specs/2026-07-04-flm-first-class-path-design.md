@@ -24,6 +24,34 @@ SuperSonic should treat `.flm` as authoritative for FLM-backed runs:
 
 This keeps the direct path first-class while preserving fallbacks for FLM artifacts that carry CT-style or BF16 views.
 
+## Transfer Strategy
+
+The first-class FLM path should not treat file-backed `mmap` plus host
+registration as the architectural endpoint. `mmap` remains the portable source
+view for fast tensor-table access and normal host-to-device fallback. The
+preferred SuperSonic path is still to load compatible FLM tensor extents into
+the GPU-resident layout the execution plan consumes directly, such as Qwen3.6
+MoE virtual expert slabs.
+
+HIP host registration of mmap-backed payloads is useful as an opt-in diagnostic
+or dense-fallback experiment, but it is not GPU-direct IO. Its cost depends on
+filesystem cache state, page faults, driver page pinning, and concurrent GPU
+memory pressure. Therefore the normal FLM path must not enable registered mmap
+uploads by default.
+
+The next fast-load boundary should be a loader transfer abstraction that can use
+the same FLM tensor extent metadata with multiple implementations:
+
+- pageable host-to-device copy as the portable fallback;
+- explicitly pinned or registered host staging for experiments and fallback
+  paths;
+- GPU-direct storage-to-device transfer when the platform and file/device
+  alignment support it.
+
+FLM itself should describe the tensor storage extents, layout ABI, direct plan,
+and integrity information. The inference engine chooses the best transfer
+backend for the current platform without changing FLM semantics.
+
 ## Data Flow
 
 1. CLI resolves an effective FLM source from `--flm-file` or `.flm` `--model-dir`.

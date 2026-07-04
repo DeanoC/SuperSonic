@@ -1,7 +1,9 @@
 use std::borrow::Cow;
 
 use anyhow::{anyhow, Context, Result};
-use gpu_hal::{GpuBuffer, ScalarType, VirtualAllocationRole, VirtualArena};
+use gpu_hal::{
+    current_backend, Backend, GpuBuffer, ScalarType, VirtualAllocationRole, VirtualArena,
+};
 use model_store::manifest::LayoutTag;
 use model_store::BakedStore;
 use qwen36_moe::config::TextConfig;
@@ -19,6 +21,21 @@ use crate::qwen36_moe_types::{
 /// runs as part of the dry-run, so a missing tensor here is a real bug).
 pub(crate) fn load_to_gpu(store: &BakedStore, ordinal: usize, name: &str) -> Result<GpuBuffer> {
     let resolved = resolve_qwen36_store_name(store, name);
+    if registered_mmap_upload_enabled() && current_backend() == Backend::Hip {
+        if let Some(meta) = store.meta(resolved.as_ref()) {
+            if should_use_registered_mmap_upload(resolved.as_ref(), &meta.dtype, meta.byte_len) {
+                match store.load_to_gpu_registered_mmap(resolved.as_ref(), ordinal) {
+                    Ok(buffer) => return Ok(buffer),
+                    Err(err) => {
+                        eprintln!(
+                            "[flm] registered mmap upload failed for {}; falling back to pageable upload: {err}",
+                            resolved.as_ref()
+                        );
+                    }
+                }
+            }
+        }
+    }
     store
         .load_to_gpu(resolved.as_ref(), ordinal)
         .with_context(|| format!("BakedStore::load_to_gpu({name})"))
@@ -83,6 +100,71 @@ pub(crate) fn store_contains_qwen36(store: &BakedStore, name: &str) -> bool {
 
 pub(crate) fn store_layout_qwen36<'a>(store: &'a BakedStore, name: &str) -> Option<&'a LayoutTag> {
     store.layout(resolve_qwen36_store_name(store, name).as_ref())
+}
+
+const REGISTERED_MMAP_UPLOAD_MIN_BYTES: u64 = 256 * 1024 * 1024;
+
+fn registered_mmap_upload_enabled() -> bool {
+    registered_mmap_upload_env_value_enabled(
+        std::env::var("SUPERSONIC_FLM_REGISTERED_UPLOAD")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn registered_mmap_upload_env_value_enabled(value: Option<&str>) -> bool {
+    matches!(
+        value.map(|value| value.to_ascii_lowercase()),
+        Some(value) if matches!(value.as_str(), "1" | "true" | "on" | "yes")
+    )
+}
+
+fn should_use_registered_mmap_upload(name: &str, dtype: &str, byte_len: u64) -> bool {
+    dtype == "u8"
+        && byte_len >= REGISTERED_MMAP_UPLOAD_MIN_BYTES
+        && name.ends_with(".mlp.experts.gate_up_proj")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registered_mmap_upload_policy_targets_native_int4_gate_up_slabs() {
+        assert!(should_use_registered_mmap_upload(
+            "model.language_model.layers.0.mlp.experts.gate_up_proj",
+            "u8",
+            268_435_456,
+        ));
+        assert!(!should_use_registered_mmap_upload(
+            "model.language_model.layers.0.mlp.experts.down_proj",
+            "u8",
+            134_217_728,
+        ));
+        assert!(!should_use_registered_mmap_upload(
+            "lm_head.weight",
+            "bf16",
+            1_017_118_720,
+        ));
+        assert!(!should_use_registered_mmap_upload(
+            "mtp.layers.0.mlp.experts.gate_up_proj",
+            "u8",
+            524_288,
+        ));
+    }
+
+    #[test]
+    fn registered_mmap_upload_is_opt_in() {
+        assert!(!registered_mmap_upload_env_value_enabled(None));
+        assert!(registered_mmap_upload_env_value_enabled(Some("1")));
+        assert!(registered_mmap_upload_env_value_enabled(Some("true")));
+        assert!(registered_mmap_upload_env_value_enabled(Some("on")));
+        assert!(registered_mmap_upload_env_value_enabled(Some("yes")));
+        assert!(!registered_mmap_upload_env_value_enabled(Some("0")));
+        assert!(!registered_mmap_upload_env_value_enabled(Some("false")));
+        assert!(!registered_mmap_upload_env_value_enabled(Some("off")));
+        assert!(!registered_mmap_upload_env_value_enabled(Some("no")));
+    }
 }
 
 pub(crate) fn resolve_qwen36_store_name<'a>(store: &BakedStore, name: &'a str) -> Cow<'a, str> {
