@@ -175,6 +175,27 @@ smoke above. The resulting JSON records `model: null`,
 `[qwen36-moe lifecycle-timings]` fields such as `model_source_ms`,
 `layer_load_ms`, `generation_wall_ms`, and `total_wall_ms`.
 
+To validate ROCm 7.2 hipFile storage-to-device transfer on a host with
+`hipfile.h`, `libhipfile`, and passing `/opt/rocm/bin/ais-check`, use the FLM
+upload probe's storage-direct mode on a small direct tensor first:
+
+```bash
+target/release/qwen36_flm_upload_probe \
+  --model-dir /mnt/data/tmp/flm-first-class-e2e-20260704/qwen36-35b-a3b-supersonic-native-int4-aligned.flm \
+  --backend hip \
+  --device 0 \
+  --tensor model.language_model.layers.0.linear_attn.dt_bias \
+  --iters 1 \
+  --storage-direct \
+  --json
+```
+
+On ROCm 7.2+ hipFile, the JSON should include a `storage-direct` record with
+nonzero `copy_storage_to_device_ms` and `copy_storage_to_device_bytes`. On a
+build without hipFile support, the same command should fail with the explicit
+`ROCm >= 7.2 with hipfile.h and libhipfile` diagnostic before measuring an
+accidental pageable fallback.
+
 Compressed-tensors INT4 FLMs from geo-quant are tested separately through the
 portable fallback path. That path exposes logical CT INT4 weights as BF16 views
 when SuperSonic does not have a compatible direct execution plan:

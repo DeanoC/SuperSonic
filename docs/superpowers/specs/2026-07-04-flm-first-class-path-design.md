@@ -4,13 +4,23 @@
 
 Make an FLM file exported by geo-quant a first-class SuperSonic model source. A normal run should pass the FLM path as `--model-dir`, require no Hugging Face snapshot, require no quantization flag such as `--int4`, and load the executable weight mode directly from the file metadata.
 
-## Current State
+## Original Gap
 
 The current merged path can load the latest native INT4 Qwen3.6 MoE FLM only when the user also passes `--int4`. Without that flag SuperSonic opens the FLM, reads the runtime config and tokenizer, then rejects the file because the default CLI quantization profile is BF16. That makes the CLI flag, not the FLM, the source of truth.
 
 The latest geo-quant native INT4 artifact proves the direct path exists: with `--int4`, SuperSonic reports `INT4 native FLM` and reaches the dry-run ready-for-decode path. The first-class gap is selection and ergonomics, not the underlying native tensor layout.
 
 The e2e implementation also exposed a stricter direct-layout requirement: Qwen3.6 linear-attention raw tensors must be stored in the SuperSonic runtime layout inside the FLM. In particular, `linear_attn.conv1d.weight` is the squeezed depthwise-conv view, `linear_attn.dt_bias` is `[1, 1, H]`, and `linear_attn.A_log` is exponentiated BF16 `[1, 1, H]`. A runnable FLM should contain those direct values; SuperSonic labels and validates them, but does not reshape HF checkpoint payloads on the normal path.
+
+## Implementation State
+
+The active branch has closed the original source-selection gap for the
+Qwen3.6 35B-A3B path: `--model-dir <file.flm>` is enough, `--model` can be
+inferred from the FLM runtime descriptor, and no `--int4` flag is required.
+The current measured path is still pageable host-to-device transfer from the
+aligned FLM payload into the direct native INT4 runtime layout. Real
+storage-to-device performance remains unproven on this workstation because the
+host stack is Fedora 44 with ROCm/HIP 7.1.1 and no `hipfile.h`/`libhipfile`.
 
 ## Architecture
 
@@ -93,6 +103,14 @@ enter execution through stable virtual allocations. A GPU-direct backend should
 therefore target extent-to-virtual-allocation range loads so the direct FLM plan
 can become resident in the execution layout without a dense staging detour.
 
+The `qwen36_flm_upload_probe` binary also has a focused `--storage-direct`
+mode for ROCm 7.2 bring-up. It asks `BakedStore` for the selected tensor's
+absolute FLM file range and calls the same HAL `copy_storage_to_device` boundary
+used by the virtual arena backend. On builds without hipFile support this mode
+must fail with the explicit hipFile requirement; on a ROCm 7.2+ hipFile system
+it should emit `copy_storage_to_device_*` profile fields that can be compared
+against the pageable, pinned, and registered modes.
+
 FLM itself should describe the tensor storage extents, layout ABI, direct plan,
 and integrity information. The inference engine chooses the best transfer
 backend for the current platform without changing FLM semantics.
@@ -119,6 +137,7 @@ Automated coverage should include:
 - unit tests proving Qwen3.6 MoE FLM weight selection is file-probe driven;
 - model-store tests proving Qwen3.6 linear-attention direct raw values match the SuperSonic runtime bake byte-for-byte;
 - runner tests proving `SUPERSONIC_FLM_VIRTUAL_TRANSFER_BACKEND` parses direct-storage aliases and that forced `GpuDirectStorage` does not fall back to pageable mapping/copy when unsupported;
+- upload-probe tests proving `--storage-direct` is explicit and records `copy_storage_to_device` timing/byte counters separately from H2D counters;
 - env-gated integration tests that run the real 35B A3B FLM with no HF snapshot and no `--int4`;
 - docs with canonical geo-quant export and SuperSonic run commands.
 

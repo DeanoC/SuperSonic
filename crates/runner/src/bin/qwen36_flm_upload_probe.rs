@@ -1,8 +1,9 @@
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use gpu_hal::{
-    copy_h2d_async, hal_profile_reset, hal_profile_set_enabled, hal_profile_snapshot, sync,
-    Backend, GpuBuffer, GpuStream, PinnedHostBuffer, RegisteredHostBuffer, ScalarType,
+    copy_h2d_async, copy_storage_to_device, hal_profile_reset, hal_profile_set_enabled,
+    hal_profile_snapshot, sync, Backend, GpuBuffer, GpuStream, PinnedHostBuffer,
+    RegisteredHostBuffer, ScalarType,
 };
 use model_store::{BakedStore, FlmLoadOptions};
 use serde::Serialize;
@@ -13,7 +14,7 @@ use std::{ffi::c_void, path::PathBuf, time::Instant};
 const MIB: f64 = 1024.0 * 1024.0;
 
 #[derive(Debug, Parser)]
-#[command(about = "Probe FLM/BakedStore H2D upload modes for selected tensors")]
+#[command(about = "Probe FLM/BakedStore tensor upload modes for selected tensors")]
 struct Args {
     #[arg(long)]
     model_dir: PathBuf,
@@ -29,6 +30,8 @@ struct Args {
     json: bool,
     #[arg(long)]
     registered: bool,
+    #[arg(long)]
+    storage_direct: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -47,8 +50,10 @@ struct UploadProbeRecord {
     hal_total_ms: f64,
     copy_h2d_ms: f64,
     copy_h2d_async_ms: f64,
+    copy_storage_to_device_ms: f64,
     copy_h2d_bytes: u64,
     copy_h2d_async_bytes: u64,
+    copy_storage_to_device_bytes: u64,
     alloc_ms: f64,
     alloc_bytes: u64,
 }
@@ -339,6 +344,82 @@ fn run_registered_upload(
     ))
 }
 
+fn run_storage_direct_upload(
+    store: &BakedStore,
+    tensor: &str,
+    device: usize,
+    iters: usize,
+) -> Result<UploadProbeRecord> {
+    let meta = store
+        .meta(tensor)
+        .with_context(|| format!("tensor not found: {tensor}"))?;
+    let bytes = usize::try_from(meta.byte_len)
+        .with_context(|| format!("tensor {tensor} byte_len does not fit usize"))?;
+    let range = store
+        .tensor_storage_range(tensor, 0, bytes)
+        .with_context(|| format!("storage range for tensor {tensor}"))?
+        .with_context(|| format!("tensor {tensor} is not backed by a direct storage range"))?;
+    let dtype = ScalarType::from_name(&range.extent.upload_dtype).with_context(|| {
+        format!(
+            "tensor {tensor} has unsupported upload dtype {} for storage-direct probe",
+            range.extent.upload_dtype
+        )
+    })?;
+    let shape = range.extent.upload_shape.clone();
+    let expected_bytes = shape
+        .iter()
+        .try_fold(dtype.size_in_bytes(), |acc, dim| acc.checked_mul(*dim))
+        .with_context(|| format!("tensor {tensor} upload shape {:?} overflows", shape))?;
+    if expected_bytes != bytes {
+        bail!(
+            "tensor {tensor} storage-direct probe expected {expected_bytes} bytes from upload dtype/shape, got {bytes}"
+        );
+    }
+
+    hal_profile_set_enabled(true);
+    hal_profile_reset();
+    let start = Instant::now();
+    let mut device_wait_ms = 0.0;
+    for _ in 0..iters {
+        let mut buffer =
+            GpuBuffer::alloc(device, dtype, &shape).context("allocate probe device buffer")?;
+        let wait_start = Instant::now();
+        copy_storage_to_device(
+            device,
+            buffer.as_mut_ptr(),
+            &range.extent.source_path,
+            range.file_offset,
+            bytes,
+        )
+        .with_context(|| {
+            format!(
+                "storage-direct upload tensor {tensor} from {} offset={} bytes={bytes}",
+                range.extent.source_path.display(),
+                range.file_offset
+            )
+        })?;
+        sync(device).context("sync after storage-direct upload")?;
+        device_wait_ms += wait_start.elapsed().as_secs_f64() * 1000.0;
+        drop(buffer);
+    }
+    let total_ms = start.elapsed().as_secs_f64() * 1000.0;
+    let snapshot = hal_profile_snapshot();
+    hal_profile_set_enabled(false);
+    Ok(record_from_snapshot(
+        tensor,
+        "storage-direct",
+        range.extent.upload_dtype,
+        bytes,
+        iters,
+        total_ms,
+        0.0,
+        0.0,
+        0.0,
+        device_wait_ms,
+        &snapshot,
+    ))
+}
+
 fn record_from_snapshot(
     tensor: &str,
     mode: &'static str,
@@ -367,8 +448,10 @@ fn record_from_snapshot(
         hal_total_ms: snapshot.total_ms,
         copy_h2d_ms: entry_total_ms(snapshot, "copy_h2d"),
         copy_h2d_async_ms: entry_total_ms(snapshot, "copy_h2d_async"),
+        copy_storage_to_device_ms: entry_total_ms(snapshot, "copy_storage_to_device"),
         copy_h2d_bytes: entry_total_bytes(snapshot, "copy_h2d"),
         copy_h2d_async_bytes: entry_total_bytes(snapshot, "copy_h2d_async"),
+        copy_storage_to_device_bytes: entry_total_bytes(snapshot, "copy_storage_to_device"),
         alloc_ms: entry_total_ms(snapshot, "alloc"),
         alloc_bytes: entry_total_bytes(snapshot, "alloc"),
     }
@@ -416,13 +499,21 @@ fn main() -> Result<()> {
                 args.iters,
             )?);
         }
+        if args.storage_direct {
+            records.push(run_storage_direct_upload(
+                &store,
+                tensor,
+                args.device,
+                args.iters,
+            )?);
+        }
     }
     if args.json {
         println!("{}", serde_json::to_string_pretty(&records)?);
     } else {
         for record in &records {
             println!(
-                "[upload-probe] tensor={} mode={} dtype={} bytes={} iters={} total_ms={:.3} mib_s={:.1} host_stage_ms={:.3} host_pinned_alloc_ms={:.3} host_register_ms={:.3} device_wait_ms={:.3} copy_h2d_ms={:.3} copy_h2d_async_ms={:.3} alloc_ms={:.3}",
+                "[upload-probe] tensor={} mode={} dtype={} bytes={} iters={} total_ms={:.3} mib_s={:.1} host_stage_ms={:.3} host_pinned_alloc_ms={:.3} host_register_ms={:.3} device_wait_ms={:.3} copy_h2d_ms={:.3} copy_h2d_async_ms={:.3} copy_storage_to_device_ms={:.3} alloc_ms={:.3}",
                 record.tensor,
                 record.mode,
                 record.dtype,
@@ -436,6 +527,7 @@ fn main() -> Result<()> {
                 record.device_wait_ms,
                 record.copy_h2d_ms,
                 record.copy_h2d_async_ms,
+                record.copy_storage_to_device_ms,
                 record.alloc_ms,
             );
         }
@@ -472,7 +564,14 @@ mod tests {
 
     #[test]
     fn records_device_wait_wall_time() {
-        let snapshot = gpu_hal::HalProfileSnapshot::default();
+        let mut snapshot = gpu_hal::HalProfileSnapshot::default();
+        snapshot.entries.push(gpu_hal::HalProfileEntry {
+            op: "copy_storage_to_device".to_string(),
+            calls: 2,
+            total_ms: 3.25,
+            max_ms: 2.0,
+            total_bytes: 8192,
+        });
         let record = record_from_snapshot(
             "tensor",
             "pinned",
@@ -490,6 +589,8 @@ mod tests {
         assert_eq!(record.host_pinned_alloc_ms, 1.5);
         assert_eq!(record.host_register_ms, 0.75);
         assert_eq!(record.device_wait_ms, 7.5);
+        assert_eq!(record.copy_storage_to_device_ms, 3.25);
+        assert_eq!(record.copy_storage_to_device_bytes, 8192);
     }
 
     #[test]
@@ -514,6 +615,30 @@ mod tests {
         ])
         .unwrap();
         assert!(args.registered);
+    }
+
+    #[test]
+    fn storage_direct_mode_is_opt_in() {
+        let args = Args::try_parse_from([
+            "qwen36_flm_upload_probe",
+            "--model-dir",
+            "model.flm",
+            "--tensor",
+            "tensor",
+        ])
+        .unwrap();
+        assert!(!args.storage_direct);
+
+        let args = Args::try_parse_from([
+            "qwen36_flm_upload_probe",
+            "--model-dir",
+            "model.flm",
+            "--tensor",
+            "tensor",
+            "--storage-direct",
+        ])
+        .unwrap();
+        assert!(args.storage_direct);
     }
 
     #[test]
