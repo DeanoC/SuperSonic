@@ -64,7 +64,9 @@ RESULT_RE = re.compile(
 )
 LIFECYCLE_RE = re.compile(r"\[qwen36-moe lifecycle-timings\]\s+(?P<body>.+)")
 STARTUP_RE = re.compile(r"\[qwen36-moe startup-timings\]\s+(?P<body>.+)")
-TIMING_KV_RE = re.compile(r"(?P<key>[a-zA-Z_]+)=(?P<value>-?[0-9]+(?:\.[0-9]+)?)")
+SPARSE_RESIDENCY_RE = re.compile(r"\[vmm\]\s+MoE island residency:\s+(?P<body>.+)")
+SPARSE_BREAKDOWN_RE = re.compile(r"\[qwen36-moe sparse-breakdown\]\s+(?P<body>.+)")
+TIMING_KV_RE = re.compile(r"(?P<key>[a-zA-Z_][a-zA-Z0-9_]*)=(?P<value>-?[0-9]+(?:\.[0-9]+)?)")
 INFERRED_MODEL_RE = re.compile(
     r"\[flm\]\s+inferred model (?P<model>\S+) from runtime descriptor"
 )
@@ -199,22 +201,36 @@ def parse_lifecycle_timings(text: str) -> dict[str, float] | None:
     match = LIFECYCLE_RE.search(text)
     if not match:
         return None
-    values = {
-        item.group("key"): float(item.group("value"))
-        for item in TIMING_KV_RE.finditer(match.group("body"))
-    }
-    return values or None
+    return parse_numeric_kv_body(match.group("body"))
 
 
 def parse_startup_timings(text: str) -> dict[str, float] | None:
     match = STARTUP_RE.search(text)
     if not match:
         return None
+    return parse_numeric_kv_body(match.group("body"))
+
+
+def parse_numeric_kv_body(body: str) -> dict[str, float] | None:
     values = {
         item.group("key"): float(item.group("value"))
-        for item in TIMING_KV_RE.finditer(match.group("body"))
+        for item in TIMING_KV_RE.finditer(body)
     }
     return values or None
+
+
+def parse_sparse_residency(text: str) -> dict[str, float] | None:
+    matches = list(SPARSE_RESIDENCY_RE.finditer(text))
+    if not matches:
+        return None
+    return parse_numeric_kv_body(matches[-1].group("body"))
+
+
+def parse_sparse_breakdown(text: str) -> dict[str, float] | None:
+    matches = list(SPARSE_BREAKDOWN_RE.finditer(text))
+    if not matches:
+        return None
+    return parse_numeric_kv_body(matches[-1].group("body"))
 
 
 def parse_inferred_model(text: str) -> str | None:
@@ -266,6 +282,16 @@ def parse_hal_profile_ops(text: str) -> dict[str, dict[str, float | int]] | None
         for match in HAL_PROFILE_OP_RE.finditer(text)
     }
     return ops or None
+
+
+def parse_runner_env_overrides(items: list[str] | None) -> dict[str, str]:
+    overrides: dict[str, str] = {}
+    for item in items or []:
+        key, sep, value = item.partition("=")
+        if not sep or not key:
+            raise ValueError(f"runner env override must be KEY=VALUE, got: {item!r}")
+        overrides[key] = value
+    return overrides
 
 
 def apply_target_profile(args: argparse.Namespace) -> None:
@@ -341,6 +367,8 @@ def run_one(args: argparse.Namespace, name: str, prompt: str, warmup: bool = Fal
         env["SUPERSONIC_METAL_PROFILE"] = "1"
     if dflash_draft_gguf is not None:
         env["SUPERSONIC_DFLASH_DRAFT_GGUF"] = str(dflash_draft_gguf)
+    runner_env_overrides = parse_runner_env_overrides(getattr(args, "runner_env", []))
+    env.update(runner_env_overrides)
 
     start = time.monotonic()
     proc = subprocess.run(
@@ -360,6 +388,8 @@ def run_one(args: argparse.Namespace, name: str, prompt: str, warmup: bool = Fal
         "stdout_tail": proc.stdout[-args.tail_chars :],
         "stderr_tail": proc.stderr[-args.tail_chars :],
     }
+    if runner_env_overrides:
+        row["runner_env"] = runner_env_overrides
     if match:
         row.update(
             {
@@ -379,6 +409,12 @@ def run_one(args: argparse.Namespace, name: str, prompt: str, warmup: bool = Fal
     startup_timings = parse_startup_timings(combined)
     if startup_timings:
         row["startup_timings"] = startup_timings
+    sparse_residency = parse_sparse_residency(combined)
+    if sparse_residency:
+        row["sparse_residency"] = sparse_residency
+    sparse_breakdown = parse_sparse_breakdown(combined)
+    if sparse_breakdown:
+        row["sparse_breakdown"] = sparse_breakdown
     resolved_model = parse_inferred_model(combined)
     if resolved_model:
         row["resolved_model"] = resolved_model
@@ -401,6 +437,23 @@ def run_one(args: argparse.Namespace, name: str, prompt: str, warmup: bool = Fal
         row["dflash_draft_dir"] = str(dflash_draft_dir)
         row["dflash_draft_gguf"] = str(dflash_draft_gguf) if dflash_draft_gguf else None
     return row
+
+
+def mean_common_numeric_field(rows: list[dict], field: str) -> dict[str, float] | None:
+    keys = sorted(
+        {
+            key
+            for row in rows
+            for key in row.get(field, {}).keys()
+            if all(key in other.get(field, {}) for other in rows)
+        }
+    )
+    if not keys:
+        return None
+    return {
+        key: sum(row[field][key] for row in rows) / len(rows)
+        for key in keys
+    }
 
 
 def build_summary(rows: list[dict]) -> dict:
@@ -446,6 +499,12 @@ def build_summary(rows: list[dict]) -> dict:
             key: sum(row["startup_timings"][key] for row in ok) / len(ok)
             for key in startup_keys
         }
+    mean_sparse_residency = mean_common_numeric_field(ok, "sparse_residency")
+    if mean_sparse_residency:
+        summary["mean_sparse_residency"] = mean_sparse_residency
+    mean_sparse_breakdown = mean_common_numeric_field(ok, "sparse_breakdown")
+    if mean_sparse_breakdown:
+        summary["mean_sparse_breakdown"] = mean_sparse_breakdown
     flm_weight_modes = sorted(
         {row["flm_weight_mode"] for row in ok if row.get("flm_weight_mode")}
     )
@@ -545,6 +604,16 @@ def main() -> int:
         action="store_true",
         help="Enable the runner HAL op dump and parse [hal-profile-op] rows into JSON.",
     )
+    parser.add_argument(
+        "--runner-env",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help=(
+            "Forward an environment override to the SuperSonic process. "
+            "Repeat for multiple overrides."
+        ),
+    )
     parser.add_argument("--kv-fp8", action="store_true")
     parser.add_argument(
         "--allow-untested-gpu",
@@ -587,6 +656,7 @@ def main() -> int:
         apply_lucebox_serving_mode(args)
     if args.stop_on_eos:
         args.ignore_eos = False
+    runner_env_overrides = parse_runner_env_overrides(args.runner_env)
 
     if not args.binary.exists():
         raise FileNotFoundError(args.binary)
@@ -655,6 +725,7 @@ def main() -> int:
         "lucebox_bench": str(args.lucebox_bench),
         "lucebox_jsonl": str(args.lucebox_jsonl),
         "lucebox_serving_mode": args.lucebox_serving_mode,
+        "runner_env": runner_env_overrides or None,
         "summary": summary,
         "rows": rows,
     }

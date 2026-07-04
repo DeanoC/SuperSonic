@@ -301,6 +301,45 @@ class BenchQwen36HeSuperSonicTests(unittest.TestCase):
             },
         )
 
+    def test_parse_sparse_residency_and_breakdown_metrics(self):
+        output = (
+            "[vmm] MoE island residency: resident_slices=17 peak_slices=19 "
+            "resident_pages=16 peak_pages=16 uploaded=161448.00MiB "
+            "unmapped=161416.00MiB resident=32.00MiB peak_resident=32.00MiB "
+            "total_vmm_resident=72.00MiB total_vmm_reserved=15400.00MiB\n"
+            "[qwen36-moe sparse-breakdown] route_d2h_calls=3510 "
+            "route_d2h_ms=84284.259 route_d2h_avg_ms=24.013 "
+            "demand_prefetch_calls=160 demand_prefetch_ms=16185.783 "
+            "demand_prefetch_avg_ms=101.161\n"
+        )
+
+        self.assertEqual(
+            bench.parse_sparse_residency(output),
+            {
+                "resident_slices": 17.0,
+                "peak_slices": 19.0,
+                "resident_pages": 16.0,
+                "peak_pages": 16.0,
+                "uploaded": 161448.0,
+                "unmapped": 161416.0,
+                "resident": 32.0,
+                "peak_resident": 32.0,
+                "total_vmm_resident": 72.0,
+                "total_vmm_reserved": 15400.0,
+            },
+        )
+        self.assertEqual(
+            bench.parse_sparse_breakdown(output),
+            {
+                "route_d2h_calls": 3510.0,
+                "route_d2h_ms": 84284.259,
+                "route_d2h_avg_ms": 24.013,
+                "demand_prefetch_calls": 160.0,
+                "demand_prefetch_ms": 16185.783,
+                "demand_prefetch_avg_ms": 101.161,
+            },
+        )
+
     def test_build_summary_includes_mean_startup_timings_when_present(self):
         rows = [
             {
@@ -409,6 +448,63 @@ class BenchQwen36HeSuperSonicTests(unittest.TestCase):
                     "max_ms": 6.0,
                     "total_bytes": 200.0,
                 }
+            },
+        )
+
+    def test_build_summary_includes_mean_sparse_metrics_when_present(self):
+        rows = [
+            {
+                "returncode": 0,
+                "tok_s": 25.0,
+                "generated_tokens": 10,
+                "decode_ms": 400.0,
+                "ms_per_step": 40.0,
+                "stopped_early": False,
+                "sparse_residency": {
+                    "uploaded": 160000.0,
+                    "resident": 32.0,
+                    "peak_resident": 32.0,
+                },
+                "sparse_breakdown": {
+                    "route_d2h_avg_ms": 24.0,
+                    "demand_prefetch_avg_ms": 100.0,
+                    "cap8_only": 1.0,
+                },
+            },
+            {
+                "returncode": 0,
+                "tok_s": 50.0,
+                "generated_tokens": 20,
+                "decode_ms": 400.0,
+                "ms_per_step": 20.0,
+                "stopped_early": False,
+                "sparse_residency": {
+                    "uploaded": 170000.0,
+                    "resident": 64.0,
+                    "peak_resident": 64.0,
+                },
+                "sparse_breakdown": {
+                    "route_d2h_avg_ms": 26.0,
+                    "demand_prefetch_avg_ms": 110.0,
+                },
+            },
+        ]
+
+        summary = bench.build_summary(rows)
+
+        self.assertEqual(
+            summary["mean_sparse_residency"],
+            {
+                "peak_resident": 48.0,
+                "resident": 48.0,
+                "uploaded": 165000.0,
+            },
+        )
+        self.assertEqual(
+            summary["mean_sparse_breakdown"],
+            {
+                "demand_prefetch_avg_ms": 105.0,
+                "route_d2h_avg_ms": 25.0,
             },
         )
 
@@ -541,6 +637,70 @@ class BenchQwen36HeSuperSonicTests(unittest.TestCase):
 
         env = run.call_args.kwargs["env"]
         self.assertEqual(env["SUPERSONIC_METAL_PROFILE"], "1")
+
+    def test_run_one_sets_runner_env_and_records_sparse_metrics(self):
+        args = types.SimpleNamespace(
+            binary=Path("target/release/supersonic"),
+            backend="hip",
+            model=None,
+            model_dir=bench.DEFAULT_35B_A3B_FLM_MODEL_DIR,
+            context_size=16,
+            warmup_new_tokens=1,
+            n_gen=1,
+            seed=1,
+            prompt_no_special_tokens=False,
+            quant="none",
+            ignore_eos=True,
+            emit_stage_timings=True,
+            kv_fp8=False,
+            dflash=False,
+            dflash_block=0,
+            dflash_draft_variant=None,
+            dflash_draft_dir=bench.DEFAULT_SUPERSONIC_DFLASH_DRAFT_DIR,
+            dflash_draft_gguf=None,
+            timeout=10,
+            tail_chars=200,
+            allow_untested_gpu=None,
+            hal_profile=True,
+            runner_env=["SUPERSONIC_MOE_ISLAND_CAP_EXPERTS=8"],
+        )
+        completed = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="",
+            stderr=(
+                "[vmm] MoE island residency: resident_pages=16 uploaded=161448.00MiB "
+                "resident=32.00MiB peak_resident=32.00MiB\n"
+                "[result] prompt_tokens=1 generated_tokens=1 decode_ms=10 "
+                "ms_per_step=10\n"
+                "[qwen36-moe sparse-breakdown] route_d2h_calls=3510 "
+                "route_d2h_ms=84284.259 demand_prefetch_avg_ms=101.161\n"
+            ),
+        )
+
+        with mock.patch.object(bench.subprocess, "run", return_value=completed) as run:
+            row = bench.run_one(args, "case", "Hello")
+
+        env = run.call_args.kwargs["env"]
+        self.assertEqual(env["SUPERSONIC_MOE_ISLAND_CAP_EXPERTS"], "8")
+        self.assertEqual(row["runner_env"], {"SUPERSONIC_MOE_ISLAND_CAP_EXPERTS": "8"})
+        self.assertEqual(
+            row["sparse_residency"],
+            {
+                "resident_pages": 16.0,
+                "uploaded": 161448.0,
+                "resident": 32.0,
+                "peak_resident": 32.0,
+            },
+        )
+        self.assertEqual(
+            row["sparse_breakdown"],
+            {
+                "route_d2h_calls": 3510.0,
+                "route_d2h_ms": 84284.259,
+                "demand_prefetch_avg_ms": 101.161,
+            },
+        )
 
     def test_run_one_flm_profile_omits_int4_and_records_lifecycle_timings(self):
         args = types.SimpleNamespace(
