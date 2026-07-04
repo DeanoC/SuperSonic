@@ -16,7 +16,7 @@ pub use flm::{
 };
 pub use store::{
     read_flm_runtime_identity, BakedStore, FlmLoadOptions, TensorStorageExtent, TensorStorageRange,
-    TensorStorageSourceKind,
+    TensorStorageSourceKind, VirtualArenaTransferBackend,
 };
 
 /// Error type for bake and load operations.

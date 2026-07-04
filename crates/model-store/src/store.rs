@@ -206,6 +206,18 @@ pub struct TensorStorageRange {
     pub byte_len: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VirtualArenaTransferBackend {
+    /// Map virtual pages and copy from the mmap-backed host slice with normal H2D.
+    PageableH2d,
+    /// Storage-to-device transfer from the source file range into virtual memory.
+    ///
+    /// This backend is named now so callers can select and test the boundary,
+    /// but it returns `Unsupported` until gpu-hal grows the corresponding
+    /// storage-to-device primitive.
+    GpuDirectStorage,
+}
+
 pub struct BakedStore {
     _mmap: Mmap,
     data: *const u8,
@@ -2101,6 +2113,31 @@ impl BakedStore {
         byte_offset: usize,
         byte_len: usize,
     ) -> Result<(), Error> {
+        self.load_range_to_virtual_arena_with_backend(
+            arena,
+            allocation_id,
+            name,
+            byte_offset,
+            byte_len,
+            VirtualArenaTransferBackend::PageableH2d,
+        )
+    }
+
+    /// Load a direct file-backed tensor range into a virtual allocation through
+    /// an explicit transfer backend.
+    ///
+    /// `PageableH2d` is the current implementation. `GpuDirectStorage` is the
+    /// first-class FLM target backend, but currently reports `Unsupported`
+    /// instead of silently falling back to pageable H2D.
+    pub fn load_range_to_virtual_arena_with_backend(
+        &self,
+        arena: &mut VirtualArena,
+        allocation_id: usize,
+        name: &str,
+        byte_offset: usize,
+        byte_len: usize,
+        backend: VirtualArenaTransferBackend,
+    ) -> Result<(), Error> {
         let transfer_range = self.tensor_storage_range(name, byte_offset, byte_len)?.ok_or_else(|| {
             Error::Other(format!(
                 "tensor '{name}' is not a direct file-backed extent and cannot be range-loaded into a virtual arena"
@@ -2123,6 +2160,18 @@ impl BakedStore {
                 transfer_range.extent.storage_dtype,
                 transfer_range.extent.storage_shape
             )));
+        }
+        match backend {
+            VirtualArenaTransferBackend::PageableH2d => {}
+            VirtualArenaTransferBackend::GpuDirectStorage => {
+                return Err(Error::Gpu(gpu_hal::GpuError::Unsupported(format!(
+                    "GPU-direct storage-to-virtual-arena transfer is not implemented yet \
+                     (source={} offset={} len={})",
+                    transfer_range.extent.source_path.display(),
+                    transfer_range.file_offset,
+                    transfer_range.byte_len
+                ))));
+            }
         }
         let src_byte_offset = u64_to_usize(
             transfer_range.tensor_byte_offset,
@@ -6688,6 +6737,160 @@ mod tests {
             .to_host_bytes()
             .expect("read virtual expert");
         assert_eq!(loaded, weights);
+    }
+
+    #[test]
+    fn virtual_arena_range_load_supports_explicit_pageable_backend() {
+        gpu_hal::set_backend(gpu_hal::Backend::Hip);
+        if !gpu_hal::vmm_is_supported(gpu_hal::Backend::Hip, 0) {
+            eprintln!("skip: HIP VMM unsupported on this device/runtime");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bake_dir = tmp.path();
+        let weights = (0..4096)
+            .map(|idx| (idx as u8).wrapping_mul(19).wrapping_add(11))
+            .collect::<Vec<_>>();
+        std::fs::write(crate::weights_bin_path(bake_dir), &weights).expect("write weights.bin");
+        let manifest = Manifest {
+            format_version: FORMAT_VERSION,
+            converter_version: 1,
+            model_family: "test".to_string(),
+            quant_profile: None,
+            source_format: None,
+            source_quant: None,
+            quant_method: None,
+            tensors: vec![TensorMeta {
+                name: "model.layers.0.mlp.experts.gate_up_proj".to_string(),
+                shape: vec![4096],
+                dtype: "u8".to_string(),
+                layout: LayoutTag::Int4Quantized,
+                offset: 0,
+                byte_len: 4096,
+            }],
+        };
+        std::fs::write(
+            crate::manifest_path(bake_dir),
+            serde_json::to_string(&manifest).expect("serialize manifest"),
+        )
+        .expect("write manifest");
+
+        let store = BakedStore::open(bake_dir).expect("open synthetic bake");
+        let mut arena = BakedStore::virtual_weight_arena(0);
+        let allocation_id = store
+            .reserve_virtual_arena(
+                &mut arena,
+                "model.layers.0.mlp.experts.gate_up_proj",
+                gpu_hal::VirtualAllocationRole::MoeExpert,
+            )
+            .expect("reserve virtual expert");
+
+        gpu_hal::hal_profile_set_enabled(true);
+        gpu_hal::hal_profile_reset();
+        store
+            .load_range_to_virtual_arena_with_backend(
+                &mut arena,
+                allocation_id,
+                "model.layers.0.mlp.experts.gate_up_proj",
+                0,
+                2048,
+                VirtualArenaTransferBackend::PageableH2d,
+            )
+            .expect("explicit pageable range load");
+        let profile = gpu_hal::hal_profile_snapshot();
+        gpu_hal::hal_profile_set_enabled(false);
+
+        assert!(
+            profile
+                .entries
+                .iter()
+                .any(|entry| entry.op == "vmm_map_no_sync"),
+            "expected explicit pageable backend to map virtual pages for upload, got {:?}",
+            profile.entries
+        );
+        let loaded = arena
+            .allocation(allocation_id)
+            .expect("expert allocation")
+            .buffer()
+            .to_host_prefix_bytes(2048)
+            .expect("read virtual expert");
+        assert_eq!(loaded, weights[..2048]);
+    }
+
+    #[test]
+    fn virtual_arena_range_load_names_gpu_direct_backend_without_fallback() {
+        gpu_hal::set_backend(gpu_hal::Backend::Hip);
+        if !gpu_hal::vmm_is_supported(gpu_hal::Backend::Hip, 0) {
+            eprintln!("skip: HIP VMM unsupported on this device/runtime");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bake_dir = tmp.path();
+        std::fs::write(crate::weights_bin_path(bake_dir), vec![7u8; 4096])
+            .expect("write weights.bin");
+        let manifest = Manifest {
+            format_version: FORMAT_VERSION,
+            converter_version: 1,
+            model_family: "test".to_string(),
+            quant_profile: None,
+            source_format: None,
+            source_quant: None,
+            quant_method: None,
+            tensors: vec![TensorMeta {
+                name: "model.layers.0.mlp.experts.gate_up_proj".to_string(),
+                shape: vec![4096],
+                dtype: "u8".to_string(),
+                layout: LayoutTag::Int4Quantized,
+                offset: 0,
+                byte_len: 4096,
+            }],
+        };
+        std::fs::write(
+            crate::manifest_path(bake_dir),
+            serde_json::to_string(&manifest).expect("serialize manifest"),
+        )
+        .expect("write manifest");
+
+        let store = BakedStore::open(bake_dir).expect("open synthetic bake");
+        let mut arena = BakedStore::virtual_weight_arena(0);
+        let allocation_id = store
+            .reserve_virtual_arena(
+                &mut arena,
+                "model.layers.0.mlp.experts.gate_up_proj",
+                gpu_hal::VirtualAllocationRole::MoeExpert,
+            )
+            .expect("reserve virtual expert");
+
+        gpu_hal::hal_profile_set_enabled(true);
+        gpu_hal::hal_profile_reset();
+        let err = store
+            .load_range_to_virtual_arena_with_backend(
+                &mut arena,
+                allocation_id,
+                "model.layers.0.mlp.experts.gate_up_proj",
+                0,
+                4096,
+                VirtualArenaTransferBackend::GpuDirectStorage,
+            )
+            .expect_err("GPU-direct storage backend should be named but not silently emulated");
+        let profile = gpu_hal::hal_profile_snapshot();
+        gpu_hal::hal_profile_set_enabled(false);
+
+        assert!(
+            err.to_string().contains("GPU-direct storage"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            profile
+                .entries
+                .iter()
+                .all(|entry| entry.op != "copy_h2d" && entry.op != "vmm_map_no_sync"),
+            "GPU-direct backend must not fall back to pageable mapping/copy: {:?}",
+            profile.entries
+        );
+        assert_eq!(arena.stats().logical_resident_bytes, 0);
     }
 
     #[test]
