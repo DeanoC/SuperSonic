@@ -91,7 +91,7 @@ Document the canonical SuperSonic command without `--int4`:
 ```bash
 cargo run -q -p runner --bin supersonic -- \
   --model qwen3.6-35b-a3b \
-  --model-dir /mnt/data/tmp/flm-first-class-e2e-20260704/qwen36-35b-a3b-supersonic-native-int4.flm \
+  --model-dir /mnt/data/tmp/flm-first-class-e2e-20260704/qwen36-35b-a3b-supersonic-native-int4-aligned.flm \
   --backend hip \
   --device 0 \
   --prompt "Hello" \
@@ -114,7 +114,7 @@ Run:
 
 ```bash
 /home/deano/.config/superpowers/worktrees/geo-quant/flm-first-class-path/.venv-rocm/bin/python scripts/flm_validate.py \
-  /mnt/data/tmp/flm-first-class-e2e-20260704/qwen36-35b-a3b-supersonic-native-int4.flm \
+  /mnt/data/tmp/flm-first-class-e2e-20260704/qwen36-35b-a3b-supersonic-native-int4-aligned.flm \
   --profile runnable-no-hf
 ```
 
@@ -127,7 +127,7 @@ Run:
 ```bash
 cargo run -q -p runner --bin supersonic -- \
   --model qwen3.6-35b-a3b \
-  --model-dir /mnt/data/tmp/flm-first-class-e2e-20260704/qwen36-35b-a3b-supersonic-native-int4.flm \
+  --model-dir /mnt/data/tmp/flm-first-class-e2e-20260704/qwen36-35b-a3b-supersonic-native-int4-aligned.flm \
   --backend hip \
   --device 0 \
   --dry-run \
@@ -144,7 +144,7 @@ Run:
 ```bash
 cargo run -q -p runner --bin supersonic -- \
   --model qwen3.6-35b-a3b \
-  --model-dir /mnt/data/tmp/flm-first-class-e2e-20260704/qwen36-35b-a3b-supersonic-native-int4.flm \
+  --model-dir /mnt/data/tmp/flm-first-class-e2e-20260704/qwen36-35b-a3b-supersonic-native-int4-aligned.flm \
   --backend hip \
   --device 0 \
   --prompt "Hello" \

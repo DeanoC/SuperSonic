@@ -102,7 +102,7 @@ geo-quant's no-HF profile first:
 PYTHONPATH=/home/deano/.config/superpowers/worktrees/geo-quant/flm-first-class-path \
   /home/deano/projects/geo-quant/.venv-rocm/bin/python \
   /home/deano/.config/superpowers/worktrees/geo-quant/flm-first-class-path/scripts/flm_validate.py \
-  /mnt/data/tmp/flm-first-class-e2e-20260704/qwen36-35b-a3b-supersonic-native-int4.flm \
+  /mnt/data/tmp/flm-first-class-e2e-20260704/qwen36-35b-a3b-supersonic-native-int4-aligned.flm \
   --profile runnable-no-hf \
   --verify-payload-hashes
 ```
@@ -111,7 +111,7 @@ The model-store loader can validate the same artifact's native aliases without
 running generation:
 
 ```bash
-SUPERSONIC_QWEN36_35B_NATIVE_INT4_FLM=/mnt/data/tmp/flm-first-class-e2e-20260704/qwen36-35b-a3b-supersonic-native-int4.flm \
+SUPERSONIC_QWEN36_35B_NATIVE_INT4_FLM=/mnt/data/tmp/flm-first-class-e2e-20260704/qwen36-35b-a3b-supersonic-native-int4-aligned.flm \
 SUPERSONIC_QWEN36_35B_NATIVE_INT4_BAKE_DIR=/mnt/data/models/Qwen3.6-35B-A3B/.supersonic/v2-int4-gptq \
   cargo test -q -p model-store --test flm_qwen36_native_layout -- --nocapture
 ```
@@ -125,7 +125,7 @@ does not perform HF-layout reshapes in the normal FLM path.
 Then run the env-gated MoE runner smoke:
 
 ```bash
-SUPERSONIC_QWEN36_35B_A3B_NO_HF_FLM=/mnt/data/tmp/flm-first-class-e2e-20260704/qwen36-35b-a3b-supersonic-native-int4.flm \
+SUPERSONIC_QWEN36_35B_A3B_NO_HF_FLM=/mnt/data/tmp/flm-first-class-e2e-20260704/qwen36-35b-a3b-supersonic-native-int4-aligned.flm \
   cargo test -q -p runner --test flm_moe_main_path -- --nocapture
 ```
 
@@ -142,7 +142,7 @@ directory:
 
 ```bash
 cargo run -q -p runner --bin supersonic -- \
-  --model-dir /mnt/data/tmp/flm-first-class-e2e-20260704/qwen36-35b-a3b-supersonic-native-int4.flm \
+  --model-dir /mnt/data/tmp/flm-first-class-e2e-20260704/qwen36-35b-a3b-supersonic-native-int4-aligned.flm \
   --backend hip \
   --device 0 \
   --prompt "one two three four five six" \
