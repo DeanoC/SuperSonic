@@ -97,6 +97,22 @@ class BenchQwen36HeSuperSonicTests(unittest.TestCase):
         self.assertEqual(args.quant, "int4")
         self.assertEqual(args.out_json, bench.DEFAULT_35B_A3B_OUT_JSON)
 
+    def test_apply_target_profile_sets_qwen36_35b_a3b_flm_defaults(self):
+        args = types.SimpleNamespace(
+            target_profile="qwen36-35b-a3b-flm",
+            model=None,
+            model_dir=None,
+            quant=None,
+            out_json=None,
+        )
+
+        bench.apply_target_profile(args)
+
+        self.assertEqual(args.model, "qwen3.6-35b-a3b")
+        self.assertEqual(args.model_dir, bench.DEFAULT_35B_A3B_FLM_MODEL_DIR)
+        self.assertEqual(args.quant, "none")
+        self.assertEqual(args.out_json, bench.DEFAULT_35B_A3B_FLM_OUT_JSON)
+
     def test_apply_target_profile_preserves_explicit_args(self):
         args = types.SimpleNamespace(
             target_profile="qwen36-35b-a3b",
@@ -163,6 +179,50 @@ class BenchQwen36HeSuperSonicTests(unittest.TestCase):
         self.assertEqual(summary["total_decode_ms"], 800.0)
         self.assertEqual(summary["stopped_early_count"], 1)
 
+    def test_build_summary_includes_mean_lifecycle_timings_when_present(self):
+        rows = [
+            {
+                "returncode": 0,
+                "tok_s": 25.0,
+                "generated_tokens": 10,
+                "decode_ms": 400.0,
+                "ms_per_step": 40.0,
+                "stopped_early": False,
+                "lifecycle_timings": {
+                    "model_source_ms": 0.010,
+                    "layer_load_ms": 6000.0,
+                    "generation_wall_ms": 40.0,
+                    "total_wall_ms": 6400.0,
+                },
+            },
+            {
+                "returncode": 0,
+                "tok_s": 50.0,
+                "generated_tokens": 20,
+                "decode_ms": 400.0,
+                "ms_per_step": 20.0,
+                "stopped_early": False,
+                "lifecycle_timings": {
+                    "model_source_ms": 0.030,
+                    "layer_load_ms": 5000.0,
+                    "generation_wall_ms": 50.0,
+                    "total_wall_ms": 5600.0,
+                },
+            },
+        ]
+
+        summary = bench.build_summary(rows)
+
+        self.assertEqual(
+            summary["mean_lifecycle_timings"],
+            {
+                "model_source_ms": 0.020,
+                "layer_load_ms": 5500.0,
+                "generation_wall_ms": 45.0,
+                "total_wall_ms": 6000.0,
+            },
+        )
+
     def test_run_one_sets_gguf_env_and_stop_on_eos_command(self):
         args = types.SimpleNamespace(
             binary=Path("target/release/supersonic"),
@@ -208,6 +268,70 @@ class BenchQwen36HeSuperSonicTests(unittest.TestCase):
         self.assertEqual(row["generated_tokens"], 97)
         self.assertTrue(row["stopped_early"])
         self.assertEqual(row["dflash_draft_label"], "lucebox-q8-0")
+
+    def test_run_one_flm_profile_omits_int4_and_records_lifecycle_timings(self):
+        args = types.SimpleNamespace(
+            binary=Path("target/release/supersonic"),
+            backend="hip",
+            model="qwen3.6-35b-a3b",
+            model_dir=bench.DEFAULT_35B_A3B_FLM_MODEL_DIR,
+            context_size=16,
+            warmup_new_tokens=1,
+            n_gen=1,
+            seed=1,
+            prompt_no_special_tokens=False,
+            quant="none",
+            ignore_eos=True,
+            emit_stage_timings=True,
+            kv_fp8=False,
+            dflash=False,
+            dflash_block=0,
+            dflash_draft_variant=None,
+            dflash_draft_dir=bench.DEFAULT_SUPERSONIC_DFLASH_DRAFT_DIR,
+            dflash_draft_gguf=None,
+            timeout=10,
+            tail_chars=200,
+            allow_untested_gpu=None,
+        )
+
+        completed = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="",
+            stderr=(
+                "[result] prompt_tokens=1 generated_tokens=1 decode_ms=41 "
+                "ms_per_step=41.0\n"
+                "[qwen36-moe lifecycle-timings] prompt_setup_ms=55.351 "
+                "model_source_ms=0.009 layer_load_ms=5744.555 session_ms=466.101 "
+                "prefill_steps=0 prefill_embed_ms=0.000 prefill_chain_ms=0.000 "
+                "prefill_total_ms=0.000 generation_wall_ms=41.006 "
+                "total_wall_ms=6307.287\n"
+            ),
+        )
+        with mock.patch.object(bench.subprocess, "run", return_value=completed) as run:
+            row = bench.run_one(args, "case", "Hello")
+
+        cmd = run.call_args.args[0]
+        self.assertIn("--model-dir", cmd)
+        self.assertIn(str(bench.DEFAULT_35B_A3B_FLM_MODEL_DIR), cmd)
+        self.assertNotIn("--int4", cmd)
+        self.assertIn("--emit-stage-timings", cmd)
+        self.assertEqual(row["generated_tokens"], 1)
+        self.assertEqual(
+            row["lifecycle_timings"],
+            {
+                "prompt_setup_ms": 55.351,
+                "model_source_ms": 0.009,
+                "layer_load_ms": 5744.555,
+                "session_ms": 466.101,
+                "prefill_steps": 0.0,
+                "prefill_embed_ms": 0.0,
+                "prefill_chain_ms": 0.0,
+                "prefill_total_ms": 0.0,
+                "generation_wall_ms": 41.006,
+                "total_wall_ms": 6307.287,
+            },
+        )
 
 
 if __name__ == "__main__":

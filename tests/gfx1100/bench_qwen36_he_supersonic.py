@@ -30,9 +30,13 @@ DEFAULT_27B_MODEL_DIR = Path("/mnt/data/tmp/supersonic-qwen36-27b-lucebox")
 DEFAULT_27B_QUANT = "q4km-gptq"
 DEFAULT_35B_A3B_MODEL = "qwen3.6-35b-a3b"
 DEFAULT_35B_A3B_MODEL_DIR = Path("/mnt/data/models/Qwen3.6-35B-A3B")
+DEFAULT_35B_A3B_FLM_MODEL_DIR = Path(
+    "/mnt/data/tmp/flm-native-complete-path/qwen36-35b-a3b-supersonic-native-int4.flm"
+)
 DEFAULT_35B_A3B_QUANT = "int4"
 DEFAULT_OUT_JSON = Path("target/qwen36_he_supersonic.json")
 DEFAULT_35B_A3B_OUT_JSON = Path("target/qwen36_35b_a3b_he_supersonic.json")
+DEFAULT_35B_A3B_FLM_OUT_JSON = Path("target/qwen36_35b_a3b_flm_he_supersonic.json")
 DEFAULT_CONTEXT_SIZE = 512
 LUCEBOX_SERVING_CONTEXT_SIZE = 1024
 LUCEBOX_DRAFT_ALIASES = {
@@ -58,6 +62,8 @@ RESULT_RE = re.compile(
     r"decode_ms=(?P<decode_ms>[0-9.]+)\s+"
     r"ms_per_(?:step|tok)=(?P<ms_per_step>[0-9.]+)"
 )
+LIFECYCLE_RE = re.compile(r"\[qwen36-moe lifecycle-timings\]\s+(?P<body>.+)")
+TIMING_KV_RE = re.compile(r"(?P<key>[a-zA-Z_]+)=(?P<value>-?[0-9]+(?:\.[0-9]+)?)")
 
 
 TARGET_PROFILES = {
@@ -72,6 +78,12 @@ TARGET_PROFILES = {
         "model_dir": DEFAULT_35B_A3B_MODEL_DIR,
         "quant": DEFAULT_35B_A3B_QUANT,
         "out_json": DEFAULT_35B_A3B_OUT_JSON,
+    },
+    "qwen36-35b-a3b-flm": {
+        "model": DEFAULT_35B_A3B_MODEL,
+        "model_dir": DEFAULT_35B_A3B_FLM_MODEL_DIR,
+        "quant": "none",
+        "out_json": DEFAULT_35B_A3B_FLM_OUT_JSON,
     },
 }
 
@@ -155,6 +167,17 @@ def resolve_dflash_draft(args: argparse.Namespace) -> tuple[Path, Path | None, s
     if config_dir is None:
         config_dir = DEFAULT_SUPERSONIC_DFLASH_DRAFT_DIR
     return Path(config_dir), Path(gguf) if gguf else None, label
+
+
+def parse_lifecycle_timings(text: str) -> dict[str, float] | None:
+    match = LIFECYCLE_RE.search(text)
+    if not match:
+        return None
+    values = {
+        item.group("key"): float(item.group("value"))
+        for item in TIMING_KV_RE.finditer(match.group("body"))
+    }
+    return values or None
 
 
 def apply_target_profile(args: argparse.Namespace) -> None:
@@ -259,6 +282,9 @@ def run_one(args: argparse.Namespace, name: str, prompt: str, warmup: bool = Fal
                 "tok_s": 1000.0 / float(match.group("ms_per_step")),
             }
         )
+    lifecycle_timings = parse_lifecycle_timings(combined)
+    if lifecycle_timings:
+        row["lifecycle_timings"] = lifecycle_timings
     if args.dflash:
         row["dflash_draft_label"] = dflash_draft_label
         row["dflash_draft_dir"] = str(dflash_draft_dir)
@@ -270,7 +296,7 @@ def build_summary(rows: list[dict]) -> dict:
     ok = [r for r in rows if r.get("returncode") == 0 and "tok_s" in r]
     total_generated = sum(r["generated_tokens"] for r in ok)
     total_decode_ms = sum(r["decode_ms"] for r in ok)
-    return {
+    summary = {
         "count": len(ok),
         "mean_tok_s": sum(r["tok_s"] for r in ok) / len(ok),
         "weighted_tok_s": (1000.0 * total_generated / total_decode_ms)
@@ -283,6 +309,20 @@ def build_summary(rows: list[dict]) -> dict:
         "total_decode_ms": total_decode_ms,
         "stopped_early_count": sum(1 for r in ok if r.get("stopped_early")),
     }
+    lifecycle_keys = sorted(
+        {
+            key
+            for row in ok
+            for key in row.get("lifecycle_timings", {}).keys()
+            if all(key in other.get("lifecycle_timings", {}) for other in ok)
+        }
+    )
+    if lifecycle_keys:
+        summary["mean_lifecycle_timings"] = {
+            key: sum(row["lifecycle_timings"][key] for row in ok) / len(ok)
+            for key in lifecycle_keys
+        }
+    return summary
 
 
 def main() -> int:

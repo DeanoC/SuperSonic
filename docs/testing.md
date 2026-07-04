@@ -149,6 +149,23 @@ For fast-load timing, leave `--verify-flm-hashes` off; enabling it reads and
 hashes the payload bytes during open and is an integrity check rather than the
 normal latency path.
 
+The Qwen3.6 benchmark harness has a matching FLM target profile. Build the
+runner binary first, then record a small timing JSON with:
+
+```bash
+python3 tests/gfx1100/bench_qwen36_he_supersonic.py \
+  --binary target/release/supersonic \
+  --target-profile qwen36-35b-a3b-flm \
+  --limit 1 \
+  --n-gen 1 \
+  --no-warmup \
+  --emit-stage-timings
+```
+
+The resulting JSON includes both decode throughput and parsed
+`[qwen36-moe lifecycle-timings]` fields such as `model_source_ms`,
+`layer_load_ms`, `generation_wall_ms`, and `total_wall_ms`.
+
 Compressed-tensors INT4 FLMs from geo-quant are tested separately through the
 portable fallback path. That path exposes logical CT INT4 weights as BF16 views
 when SuperSonic does not have a compatible direct execution plan:
