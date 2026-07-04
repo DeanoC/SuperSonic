@@ -67,6 +67,13 @@ TIMING_KV_RE = re.compile(r"(?P<key>[a-zA-Z_]+)=(?P<value>-?[0-9]+(?:\.[0-9]+)?)
 INFERRED_MODEL_RE = re.compile(
     r"\[flm\]\s+inferred model (?P<model>\S+) from runtime descriptor"
 )
+FLM_WEIGHT_MODE_RE = re.compile(
+    r"\[qwen36-moe\]\s+FLM weight mode:\s+(?P<mode>[^\r\n]+)"
+)
+FLM_READY_RE = re.compile(
+    r"\[FLM runtime weights\]\s+ready-for-decode:\s+(?P<ready>YES|NO)"
+    r"(?:\s+\((?P<detail>[^\r\n)]*)\))?"
+)
 
 
 TARGET_PROFILES = {
@@ -190,6 +197,24 @@ def parse_inferred_model(text: str) -> str | None:
     return match.group("model")
 
 
+def parse_flm_weight_mode(text: str) -> str | None:
+    match = FLM_WEIGHT_MODE_RE.search(text)
+    if not match:
+        return None
+    return match.group("mode").strip()
+
+
+def parse_flm_ready_for_decode(text: str) -> dict[str, bool | str] | None:
+    match = FLM_READY_RE.search(text)
+    if not match:
+        return None
+    result: dict[str, bool | str] = {"ready": match.group("ready") == "YES"}
+    detail = match.group("detail")
+    if detail:
+        result["detail"] = detail
+    return result
+
+
 def apply_target_profile(args: argparse.Namespace) -> None:
     profile = TARGET_PROFILES[args.target_profile]
     if args.model is None:
@@ -298,6 +323,14 @@ def run_one(args: argparse.Namespace, name: str, prompt: str, warmup: bool = Fal
     resolved_model = parse_inferred_model(combined)
     if resolved_model:
         row["resolved_model"] = resolved_model
+    flm_weight_mode = parse_flm_weight_mode(combined)
+    if flm_weight_mode:
+        row["flm_weight_mode"] = flm_weight_mode
+    flm_ready = parse_flm_ready_for_decode(combined)
+    if flm_ready is not None:
+        row["flm_ready_for_decode"] = flm_ready["ready"]
+        if "detail" in flm_ready:
+            row["flm_ready_for_decode_detail"] = flm_ready["detail"]
     if args.dflash:
         row["dflash_draft_label"] = dflash_draft_label
         row["dflash_draft_dir"] = str(dflash_draft_dir)
@@ -335,6 +368,15 @@ def build_summary(rows: list[dict]) -> dict:
             key: sum(row["lifecycle_timings"][key] for row in ok) / len(ok)
             for key in lifecycle_keys
         }
+    flm_weight_modes = sorted(
+        {row["flm_weight_mode"] for row in ok if row.get("flm_weight_mode")}
+    )
+    if flm_weight_modes:
+        summary["flm_weight_modes"] = flm_weight_modes
+    if any("flm_ready_for_decode" in row for row in ok):
+        summary["flm_ready_for_decode_count"] = sum(
+            1 for row in ok if row.get("flm_ready_for_decode")
+        )
     return summary
 
 
@@ -509,6 +551,10 @@ def main() -> int:
         "summary": summary,
         "rows": rows,
     }
+    if "flm_weight_modes" in summary:
+        payload["flm_weight_modes"] = summary["flm_weight_modes"]
+    if "flm_ready_for_decode_count" in summary:
+        payload["flm_ready_for_decode_count"] = summary["flm_ready_for_decode_count"]
     args.out_json.parent.mkdir(parents=True, exist_ok=True)
     args.out_json.write_text(json.dumps(payload, indent=2))
     print("-" * 70)
