@@ -911,10 +911,17 @@ fn add_stage3_raw_value_aliases(
     Ok(())
 }
 
+fn stage3_int4_sidecar_alias(logical_name: &str, suffix: &str) -> String {
+    if let Some(base) = logical_name.strip_suffix(".weight") {
+        format!("{base}.weight_int4_{suffix}")
+    } else {
+        format!("{logical_name}_int4_{suffix}")
+    }
+}
+
 fn add_stage3_int4_aliases(
     runtime: &crate::flm::FlmRuntimeDirectory,
     index: &mut HashMap<String, TensorMeta>,
-    synthetic: &mut HashMap<String, Vec<u8>>,
     upload_views: &mut HashMap<String, TensorUploadView>,
     ct_int4_bf16_fallbacks: &mut HashMap<String, CtSymInt4Bf16Fallback>,
 ) -> Result<(), Error> {
@@ -973,15 +980,12 @@ fn add_stage3_int4_aliases(
                     logical.name
                 ))
             })?;
-        owned
+        let shape_binding = owned
             .iter()
-            .find(|binding| binding.storage_role == crate::flm::STORAGE_ROLE_SHAPE)
-            .ok_or_else(|| {
-                Error::Other(format!(
-                    "FLM Stage 3 INT4 tensor {} missing shape binding",
-                    logical.name
-                ))
-            })?;
+            .find(|binding| binding.storage_role == crate::flm::STORAGE_ROLE_SHAPE);
+        let zero = owned
+            .iter()
+            .find(|binding| binding.storage_role == crate::flm::STORAGE_ROLE_ZERO);
         let packed_meta = index.get(&packed.tensor_name).cloned().ok_or_else(|| {
             Error::Other(format!(
                 "FLM Stage 3 packed tensor {} missing from index",
@@ -994,15 +998,20 @@ fn add_stage3_int4_aliases(
                 scale.tensor_name
             ))
         })?;
-        let rank = logical.rank as usize;
-        if rank != 2 {
-            return Err(Error::Other(format!(
-                "FLM Stage 3 INT4 tensor {} rank {} is unsupported",
-                logical.name, logical.rank
-            )));
-        }
-        let shape = vec![logical.shape[0] as usize, logical.shape[1] as usize];
         if packed.storage_dtype == FLM_DTYPE_INT32 {
+            shape_binding.ok_or_else(|| {
+                Error::Other(format!(
+                    "FLM Stage 3 INT4 tensor {} missing shape binding",
+                    logical.name
+                ))
+            })?;
+            if logical.rank != 2 {
+                return Err(Error::Other(format!(
+                    "FLM Stage 3 INT4 tensor {} rank {} is unsupported for CT BF16 fallback",
+                    logical.name, logical.rank
+                )));
+            }
+            let shape = vec![logical.shape[0] as usize, logical.shape[1] as usize];
             if scale.storage_dtype != FLM_DTYPE_BF16 {
                 return Err(Error::Other(format!(
                     "FLM Stage 3 INT4 tensor {} scale binding dtype {} is unsupported for BF16 fallback",
@@ -1067,22 +1076,43 @@ fn add_stage3_int4_aliases(
             dtype: flm_dtype_name(packed_step.target_dtype)?.to_string(),
             shape: flm_plan_target_shape(packed_step)?,
         };
-        index
-            .entry(logical.name.clone())
-            .or_insert_with(|| TensorMeta {
+        let zero = zero.ok_or_else(|| {
+            Error::Other(format!(
+                "FLM Stage 3 native INT4 tensor {} missing zero binding",
+                logical.name
+            ))
+        })?;
+        let zero_step = direct_plan
+            .get(&(logical.tensor_id, crate::flm::STORAGE_ROLE_ZERO))
+            .ok_or_else(|| {
+                Error::Other(format!(
+                    "FLM Stage 3 native INT4 tensor {} missing zero direct plan",
+                    logical.name
+                ))
+            })?;
+        let zero_meta = index.get(&zero.tensor_name).cloned().ok_or_else(|| {
+            Error::Other(format!(
+                "FLM Stage 3 zero tensor {} missing from index",
+                zero.tensor_name
+            ))
+        })?;
+        let packed_shape = packed_view.shape.clone();
+        index.insert(
+            logical.name.clone(),
+            TensorMeta {
                 name: logical.name.clone(),
-                shape,
+                shape: packed_shape,
                 dtype: "u8".to_string(),
                 layout: LayoutTag::Int4Quantized,
                 offset: packed_meta.offset,
                 byte_len: packed_meta.byte_len,
-            });
+            },
+        );
         upload_views
             .entry(logical.name.clone())
             .or_insert(packed_view);
 
-        let base = logical.name.trim_end_matches(".weight");
-        let scale_alias = format!("{base}.weight_int4_scale");
+        let scale_alias = stage3_int4_sidecar_alias(&logical.name, "scale");
         let scale_dtype = flm_dtype_name(scale_step.target_dtype)?;
         let scale_shape = flm_plan_target_shape(scale_step)?;
         index
@@ -1102,20 +1132,25 @@ fn add_stage3_int4_aliases(
                 shape: scale_shape.clone(),
             });
 
-        let zero_alias = format!("{base}.weight_int4_zero");
+        let zero_alias = stage3_int4_sidecar_alias(&logical.name, "zero");
+        let zero_dtype = flm_dtype_name(zero_step.target_dtype)?;
+        let zero_shape = flm_plan_target_shape(zero_step)?;
         index
             .entry(zero_alias.clone())
             .or_insert_with(|| TensorMeta {
                 name: zero_alias.clone(),
-                shape: scale_shape,
-                dtype: "bf16".to_string(),
+                shape: zero_shape.clone(),
+                dtype: zero_dtype.to_string(),
                 layout: LayoutTag::Raw,
-                offset: 0,
-                byte_len: scale_meta.byte_len,
+                offset: zero_meta.offset,
+                byte_len: zero_meta.byte_len,
             });
-        synthetic
+        upload_views
             .entry(zero_alias)
-            .or_insert_with(|| bf16_eight_bytes(scale_meta.byte_len as usize));
+            .or_insert_with(|| TensorUploadView {
+                dtype: zero_dtype.to_string(),
+                shape: zero_shape,
+            });
     }
     Ok(())
 }
@@ -1441,7 +1476,6 @@ impl BakedStore {
                     add_stage3_int4_aliases(
                         runtime,
                         &mut index,
-                        &mut synthetic,
                         &mut upload_views,
                         &mut ct_int4_bf16_fallbacks,
                     )?;
@@ -2002,7 +2036,7 @@ mod tests {
 
     fn runtime_codec_section() -> Vec<u8> {
         let mut out = Vec::new();
-        push_u32(&mut out, 8);
+        push_u32(&mut out, 10);
         for (codec_id, semantic_id, layout_id, decoder_id, flags) in [
             (0u8, crate::flm::CODEC_RAW_BF16 as u8, 0u16, 0u16, 0u32),
             (
@@ -2038,6 +2072,20 @@ mod tests {
             (
                 7u8,
                 crate::flm::CODEC_FP8_E4M3_B128_BF16_INV as u8,
+                0u16,
+                1u16,
+                0u32,
+            ),
+            (
+                8u8,
+                crate::flm::CODEC_FP8_E4M3_B64_BF16 as u8,
+                0u16,
+                1u16,
+                0u32,
+            ),
+            (
+                9u8,
+                crate::flm::CODEC_SUPERSONIC_NATIVE_INT4_G128_BF16 as u8,
                 0u16,
                 1u16,
                 0u32,
@@ -2391,6 +2439,135 @@ mod tests {
         out
     }
 
+    fn runtime_stage3_native_int4_storage_abi_section() -> Vec<u8> {
+        let mut out = Vec::new();
+        push_u16(&mut out, 1);
+        push_u16(&mut out, 21);
+        push_u32(&mut out, 1);
+        push_u32(&mut out, 0);
+        push_u16(&mut out, 8);
+        push_u16(&mut out, crate::flm::STORAGE_ABI_KIND_GROUP_QUANT);
+        push_u16(&mut out, crate::flm::CODEC_SUPERSONIC_NATIVE_INT4_G128_BF16);
+        push_u16(&mut out, crate::flm::LAYOUT_ID_DEFAULT);
+        out.push(4);
+        push_u16(&mut out, 128);
+        push_u16(&mut out, crate::flm::QUANT_FLAG_SYMMETRIC);
+        push_u32(&mut out, 0);
+        push_u32(&mut out, 0);
+        out
+    }
+
+    fn runtime_stage3_native_int4_logical_tensor_section() -> Vec<u8> {
+        let name = b"model.language_model.layers.0.mlp.experts.gate_up_proj";
+        let mut out = Vec::new();
+        push_u16(&mut out, 1);
+        push_u16(&mut out, 44);
+        push_u32(&mut out, 1);
+        push_u32(&mut out, name.len() as u32);
+        push_u32(&mut out, 1);
+        push_u32(&mut out, 0);
+        push_u16(&mut out, name.len() as u16);
+        push_u16(&mut out, crate::flm::LOGICAL_TENSOR_ROLE_QUANTIZED_WEIGHT);
+        out.push(3);
+        out.push(0);
+        for dim in [2u32, 256, 128, 0] {
+            push_u32(&mut out, dim);
+        }
+        push_u16(&mut out, crate::flm::VALUE_FORMAT_SYM_INT4);
+        push_u16(&mut out, FLM_DTYPE_BF16);
+        push_u32(&mut out, 0);
+        push_u16(&mut out, 3);
+        push_u16(&mut out, crate::flm::LOGICAL_TENSOR_FLAG_REQUIRED);
+        push_u16(&mut out, 0);
+        out.extend_from_slice(name);
+        out
+    }
+
+    fn runtime_stage3_native_int4_storage_binding_section() -> Vec<u8> {
+        let rows: [(&[u8], u16, u16); 3] = [
+            (
+                b"model.language_model.layers.0.mlp.experts.gate_up_proj",
+                crate::flm::STORAGE_ROLE_PACKED,
+                FLM_DTYPE_UINT8,
+            ),
+            (
+                b"model.language_model.layers.0.mlp.experts.gate_up_proj_int4_scale",
+                crate::flm::STORAGE_ROLE_SCALE,
+                FLM_DTYPE_BF16,
+            ),
+            (
+                b"model.language_model.layers.0.mlp.experts.gate_up_proj_int4_zero",
+                crate::flm::STORAGE_ROLE_ZERO,
+                FLM_DTYPE_BF16,
+            ),
+        ];
+        let pool_len: usize = rows.iter().map(|(name, _, _)| name.len()).sum();
+        let mut out = Vec::new();
+        push_u16(&mut out, 1);
+        push_u16(&mut out, 20);
+        push_u32(&mut out, rows.len() as u32);
+        push_u32(&mut out, pool_len as u32);
+        let mut pool = Vec::new();
+        let mut name_offset = 0u32;
+        for (name, role, dtype) in rows {
+            push_u32(&mut out, 1);
+            push_u32(&mut out, name_offset);
+            push_u16(&mut out, name.len() as u16);
+            push_u16(&mut out, role);
+            push_u16(&mut out, dtype);
+            push_u16(&mut out, 8);
+            push_u16(&mut out, crate::flm::STORAGE_BINDING_FLAG_REQUIRED);
+            push_u16(&mut out, 0);
+            pool.extend_from_slice(name);
+            name_offset += name.len() as u32;
+        }
+        out.extend_from_slice(&pool);
+        out
+    }
+
+    fn runtime_stage3_native_int4_plan_step_section() -> Vec<u8> {
+        let mut out = Vec::new();
+        push_u16(&mut out, 1);
+        push_u16(&mut out, 38);
+        push_u32(&mut out, 3);
+
+        for (role, dtype, rank, shape) in [
+            (
+                crate::flm::STORAGE_ROLE_PACKED,
+                FLM_DTYPE_UINT8,
+                3u8,
+                [2u32, 256, 64, 0],
+            ),
+            (
+                crate::flm::STORAGE_ROLE_SCALE,
+                FLM_DTYPE_BF16,
+                3u8,
+                [2u32, 2, 1, 0],
+            ),
+            (
+                crate::flm::STORAGE_ROLE_ZERO,
+                FLM_DTYPE_BF16,
+                3u8,
+                [2u32, 2, 1, 0],
+            ),
+        ] {
+            push_u32(&mut out, 1);
+            push_u16(&mut out, role);
+            push_u16(&mut out, crate::flm::CONSUME_STRATEGY_DIRECT);
+            push_u16(&mut out, crate::flm::LAYOUT_ID_DEFAULT);
+            push_u16(&mut out, dtype);
+            out.push(rank);
+            out.push(0);
+            for dim in shape {
+                push_u32(&mut out, dim);
+            }
+            push_u16(&mut out, crate::flm::PLAN_STREAM_DEFAULT);
+            push_u16(&mut out, crate::flm::PLAN_PRIORITY_DEFAULT);
+            push_u32(&mut out, crate::flm::PLAN_STEP_FLAG_NONE);
+        }
+        out
+    }
+
     fn build_test_runtime_directory_with_stage3_tables() -> Vec<u8> {
         let (asset_table, asset_payloads) = runtime_asset_sections();
         let sections = [
@@ -2406,6 +2583,41 @@ mod tests {
             (10u32, runtime_stage3_logical_tensor_section()),
             (11u32, runtime_stage3_storage_binding_section()),
             (12u32, runtime_stage3_plan_step_section()),
+        ];
+        let header_len = 16 + sections.len() * 12;
+        let mut offset = header_len as u32;
+        let mut out = Vec::new();
+        out.extend_from_slice(b"FLMRUN1\0");
+        push_u16(&mut out, 4);
+        push_u16(&mut out, sections.len() as u16);
+        push_u32(&mut out, crate::flm::ARCH_QWEN3_6_DENSE);
+        for (section_id, data) in &sections {
+            push_u32(&mut out, *section_id);
+            push_u32(&mut out, offset);
+            push_u32(&mut out, data.len() as u32);
+            offset += data.len() as u32;
+        }
+        for (_, data) in sections {
+            out.extend_from_slice(&data);
+        }
+        out
+    }
+
+    fn build_test_runtime_directory_with_native_int4_stage3_tables() -> Vec<u8> {
+        let (asset_table, asset_payloads) = runtime_asset_sections();
+        let sections = [
+            (1u32, runtime_config_section()),
+            (2u32, runtime_tokenizer_section()),
+            (3u32, runtime_codec_section()),
+            (4u32, runtime_tensor_abi_section()),
+            (5u32, asset_table),
+            (6u32, asset_payloads),
+            (7u32, runtime_model_descriptor_section()),
+            (8u32, runtime_tensor_manifest_section(&[])),
+            (9u32, runtime_stage3_native_int4_storage_abi_section()),
+            (10u32, runtime_stage3_native_int4_logical_tensor_section()),
+            (11u32, runtime_stage3_native_int4_storage_binding_section()),
+            (12u32, runtime_stage3_native_int4_plan_step_section()),
         ];
         let header_len = 16 + sections.len() * 12;
         let mut offset = header_len as u32;
@@ -3201,6 +3413,35 @@ mod tests {
         data
     }
 
+    fn build_test_flm_with_stage3_native_int4_bindings() -> Vec<u8> {
+        let mut data = build_test_flm(&[
+            TestFlmTensor {
+                name: "model.language_model.layers.0.mlp.experts.gate_up_proj",
+                shape: vec![2, 256, 64],
+                dtype: FLM_DTYPE_UINT8,
+                codec: 9,
+                payload: vec![0xab; 2 * 256 * 64],
+            },
+            TestFlmTensor {
+                name: "model.language_model.layers.0.mlp.experts.gate_up_proj_int4_scale",
+                shape: vec![2, 2, 1],
+                dtype: FLM_DTYPE_BF16,
+                codec: 0,
+                payload: test_bf16_bytes([1.0, 2.0, 3.0, 4.0]),
+            },
+            TestFlmTensor {
+                name: "model.language_model.layers.0.mlp.experts.gate_up_proj_int4_zero",
+                shape: vec![2, 2, 1],
+                dtype: FLM_DTYPE_BF16,
+                codec: 0,
+                payload: test_bf16_bytes([8.0; 4]),
+            },
+        ]);
+        let runtime = build_test_runtime_directory_with_native_int4_stage3_tables();
+        append_runtime_directory(&mut data, &runtime);
+        data
+    }
+
     fn build_test_flm_with_stage3_raw_value_binding() -> Vec<u8> {
         let mut data = build_test_flm(&[TestFlmTensor {
             name: "storage/l0_a_log",
@@ -3562,6 +3803,46 @@ mod tests {
             .expect("logical INT4 fallback upload view");
         assert_eq!(upload_view.dtype, "bf16");
         assert_eq!(upload_view.shape, vec![128, 64]);
+    }
+
+    #[test]
+    fn open_flm_builds_native_int4_stage3_binding_with_zero_plane() {
+        let data = build_test_flm_with_stage3_native_int4_bindings();
+        let file = write_temp_flm(&data);
+
+        let store = BakedStore::open_flm_with_options(
+            file.path(),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                verify_block_hashes: false,
+            },
+        )
+        .expect("open FLM with native INT4 Stage 3 bindings");
+
+        let name = "model.language_model.layers.0.mlp.experts.gate_up_proj";
+        let weight = store.meta(name).expect("native INT4 logical tensor");
+        assert_eq!(weight.layout, LayoutTag::Int4Quantized);
+        assert_eq!(weight.dtype, "u8");
+        assert_eq!(weight.shape, vec![2, 256, 64]);
+        assert_eq!(weight.byte_len, (2 * 256 * 64) as u64);
+
+        let upload_view = store.upload_view(name).expect("native INT4 upload view");
+        assert_eq!(upload_view.dtype, "u8");
+        assert_eq!(upload_view.shape, vec![2, 256, 64]);
+
+        let scale_name = format!("{name}_int4_scale");
+        let scale = store.meta(&scale_name).expect("native INT4 scale plane");
+        assert_eq!(scale.dtype, "bf16");
+        assert_eq!(scale.shape, vec![2, 2, 1]);
+
+        let zero_name = format!("{name}_int4_zero");
+        let zero = store.meta(&zero_name).expect("native INT4 zero plane");
+        assert_eq!(zero.dtype, "bf16");
+        assert_eq!(zero.shape, vec![2, 2, 1]);
+        assert_eq!(
+            store.raw_bytes(&zero_name).expect("native INT4 zero bytes"),
+            test_bf16_bytes([8.0; 4]).as_slice()
+        );
     }
 
     #[test]
