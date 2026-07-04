@@ -184,7 +184,10 @@ pub(crate) fn flm_source_is_authoritative_for_model(
     cli: &Cli,
     model_variant: &ModelVariant,
 ) -> bool {
-    matches!(model_variant, ModelVariant::Qwen3_6_27B) && effective_flm_source(cli).is_some()
+    matches!(
+        model_variant,
+        ModelVariant::Qwen3_6_27B | ModelVariant::Qwen3_6_35B_A3B
+    ) && effective_flm_source(cli).is_some()
 }
 
 pub(crate) fn validate_effective_flm_source_model(
@@ -194,7 +197,10 @@ pub(crate) fn validate_effective_flm_source_model(
     let Some(flm_source) = effective_flm_source(cli) else {
         return Ok(());
     };
-    if *model_variant == ModelVariant::Qwen3_6_27B {
+    if matches!(
+        model_variant,
+        ModelVariant::Qwen3_6_27B | ModelVariant::Qwen3_6_35B_A3B
+    ) {
         return Ok(());
     }
     let source_flag = if cli.flm_file.is_some() {
@@ -203,7 +209,7 @@ pub(crate) fn validate_effective_flm_source_model(
         "--model-dir"
     };
     anyhow::bail!(
-        "FLM source from {source_flag} {} currently supports only --model qwen3.6-27b; got --model {}",
+        "FLM source from {source_flag} {} currently supports only --model qwen3.6-27b or qwen3.6-35b-a3b; got --model {}",
         flm_source.display(),
         model_variant
     );
@@ -597,6 +603,36 @@ mod tests {
             .expect("authoritative FLM source should bypass HF metadata bootstrap");
 
         assert!(!downloaded);
+    }
+
+    #[test]
+    fn flm_model_dir_is_authoritative_for_qwen36_moe_hf_metadata_bootstrap() {
+        assert!(flm_source_is_authoritative_for_model(
+            &cli_with_model_dir("/tmp/qwen36-35b-a3b.flm", &["--int4"]),
+            &ModelVariant::Qwen3_6_35B_A3B
+        ));
+    }
+
+    #[test]
+    fn qwen36_moe_flm_model_dir_skips_hf_metadata_bootstrap_even_without_config() {
+        let cli = cli_with_model_dir(
+            "/tmp/qwen36-35b-a3b-no-hf.flm",
+            &["--int4", "--verify-flm-hashes"],
+        );
+
+        let downloaded = ensure_hf_metadata_present(&cli, &ModelVariant::Qwen3_6_35B_A3B)
+            .expect("authoritative MoE FLM source should bypass HF metadata bootstrap");
+
+        assert!(!downloaded);
+    }
+
+    #[test]
+    fn effective_flm_source_accepts_qwen36_moe_model_variant() {
+        validate_effective_flm_source_model(
+            &cli_with_model_dir("/tmp/qwen36-35b-a3b.flm", &["--int4"]),
+            &ModelVariant::Qwen3_6_35B_A3B,
+        )
+        .expect("qwen3.6-35b-a3b FLM should be accepted");
     }
 
     #[test]

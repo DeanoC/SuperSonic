@@ -20,10 +20,14 @@ use crate::profiling::{PrefillProfileScope, Qwen36DecodeProfileScope};
 use crate::qwen36_moe_cli::bake::{ensure_qwen36_bake, select_decode_bake};
 use crate::qwen36_moe_cli::chain::{run_chain_step, Qwen36ChainStep};
 use crate::qwen36_moe_cli::decode_loop::Qwen36DecodeLoopState;
-use crate::qwen36_moe_cli::dry_run::{print_report, run_qwen36_moe_dry_run, DryRunReport};
+use crate::qwen36_moe_cli::dry_run::{
+    print_report, run_qwen36_moe_dry_run, run_qwen36_moe_dry_run_with_config, DryRunReport,
+};
+use crate::qwen36_moe_cli::flm_source::{open_qwen36_moe_flm_source, Qwen36MoeFlmSource};
 use crate::qwen36_moe_cli::generation::{run_generation_step, Qwen36GenerationStep};
 use crate::qwen36_moe_cli::geom::build_multi_layer_geom;
 use crate::qwen36_moe_cli::host::{lookup_embed_row, lookup_embed_row_timed};
+use crate::qwen36_moe_cli::layers::Qwen36WeightMode;
 use crate::qwen36_moe_cli::output::{
     print_decode_stream_start, print_generation_summary, print_last_logits_if_requested,
     print_sampling_summary,
@@ -34,7 +38,8 @@ use crate::qwen36_moe_cli::policy::{
     validate_persistent_kv_fp8_flags,
 };
 use crate::qwen36_moe_cli::prompt::{
-    prepare_prompt, print_prompt_summary, validate_speculative_sampling,
+    prepare_prompt, prepare_prompt_with_tokenizer, print_prompt_summary,
+    validate_speculative_sampling,
 };
 use crate::qwen36_moe_cli::session::{prepare_decode_session, Qwen36DecodeSession};
 use crate::qwen36_moe_cli::spec_verify::{run_speculative_extension, Qwen36SpeculativeExtension};
@@ -158,6 +163,69 @@ fn prewarm_qwen36_mps_static_topn_if_requested(
         elapsed.as_secs_f64() * 1000.0
     );
     Ok(elapsed)
+}
+
+fn validate_qwen36_decode_weight_mode(
+    weight_mode: Qwen36WeightMode,
+    backend: Backend,
+    source_label: &str,
+) -> Result<()> {
+    if weight_mode.is_int4() {
+        return Ok(());
+    }
+    match backend {
+        Backend::Cuda => anyhow::bail!(
+            "Qwen3.6-35B-A3B CUDA v1 requires an INT4-compatible source; \
+             selected {} from {}",
+            weight_mode.display_name(),
+            source_label,
+        ),
+        Backend::Metal => anyhow::bail!(
+            "Qwen3.6-35B-A3B Metal v1 requires an INT4-GPTQ-compatible source; \
+             selected {} from {}",
+            weight_mode.display_name(),
+            source_label,
+        ),
+        _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::qwen36_moe_cli::layers::Qwen36WeightMode;
+
+    #[test]
+    fn cuda_decode_rejects_non_int4_flm_source_weight_mode_with_source_label() {
+        let err =
+            validate_qwen36_decode_weight_mode(Qwen36WeightMode::Bf16, Backend::Cuda, "model.flm")
+                .unwrap_err()
+                .to_string();
+
+        assert!(err.contains("CUDA"), "{err}");
+        assert!(err.contains("INT4"), "{err}");
+        assert!(err.contains("model.flm"), "{err}");
+    }
+
+    #[test]
+    fn hip_decode_allows_non_int4_weight_mode_for_development_path() {
+        validate_qwen36_decode_weight_mode(Qwen36WeightMode::Bf16, Backend::Hip, "model.flm")
+            .expect("HIP development path can still choose BF16/FP8");
+    }
+}
+
+enum DecodeStore<'a> {
+    Borrowed(&'a BakedStore),
+    Owned(BakedStore),
+}
+
+impl<'a> DecodeStore<'a> {
+    fn as_store(&self) -> &BakedStore {
+        match self {
+            DecodeStore::Borrowed(store) => store,
+            DecodeStore::Owned(store) => store,
+        }
+    }
 }
 
 /// Compute the `(rope, cache)` PositionPair for one step of the
@@ -309,19 +377,38 @@ fn run_inner(
     validate_persistent_kv_fp8_flags(cli)?;
     validate_cuda_v1_flags(cli, entry)?;
     validate_metal_v1_flags(cli, entry)?;
-    ensure_qwen36_bake(cli, entry)?;
+    let flm_source = open_qwen36_moe_flm_source(cli)?;
+    if flm_source.is_none() {
+        ensure_qwen36_bake(cli, entry)?;
+    }
 
-    let report = run_qwen36_moe_dry_run(
-        &cli.model_dir,
-        entry,
-        total_vram,
-        context_size,
-        context_size_source,
-        cli.batch_size.max(1),
-        cli.kv_fp8,
-        cli.no_bake,
-        cli.device,
-    )?;
+    let report = if let Some(flm) = flm_source.as_ref() {
+        run_qwen36_moe_dry_run_with_config(
+            &cli.model_dir,
+            Some(&flm.source.path),
+            flm.config.clone(),
+            entry,
+            total_vram,
+            context_size,
+            context_size_source,
+            cli.batch_size.max(1),
+            cli.kv_fp8,
+            cli.no_bake,
+            cli.device,
+        )?
+    } else {
+        run_qwen36_moe_dry_run(
+            &cli.model_dir,
+            entry,
+            total_vram,
+            context_size,
+            context_size_source,
+            cli.batch_size.max(1),
+            cli.kv_fp8,
+            cli.no_bake,
+            cli.device,
+        )?
+    };
     print_report(&report);
     if cli.dry_run {
         return Ok(());
@@ -357,6 +444,7 @@ fn run_inner(
         // opt-out for A/B comparison or bisecting megakernel regressions.
         entry.backend != Backend::Metal && !cli.no_persistent_decode,
         cli.kv_fp8,
+        flm_source.as_ref(),
         cli.dump_last_logits,
         cli.profile_prefill,
         cli.profile_prefill_json.as_deref(),
@@ -400,6 +488,7 @@ fn decode_text(
     ordinal: usize,
     persistent_decode: bool,
     kv_fp8: bool,
+    flm_source: Option<&Qwen36MoeFlmSource>,
     dump_last_logits: bool,
     profile_prefill: bool,
     profile_prefill_json: Option<&Path>,
@@ -441,7 +530,15 @@ fn decode_text(
 
     progress("prompt_setup", "start".to_string(), true);
     let prompt_setup_start = std::time::Instant::now();
-    let prompt_setup = prepare_prompt(model_dir, &report.config.text_config, prompt)?;
+    let prompt_setup = if let Some(flm) = flm_source {
+        prepare_prompt_with_tokenizer(
+            Some(flm.tokenizer.clone()),
+            &report.config.text_config,
+            prompt,
+        )?
+    } else {
+        prepare_prompt(model_dir, &report.config.text_config, prompt)?
+    };
     let prompt_setup_elapsed = prompt_setup_start.elapsed();
     let tokenizer = prompt_setup.tokenizer;
     let prompt_ids = prompt_setup.prompt_ids;
@@ -457,37 +554,42 @@ fn decode_text(
         format!("done prompt_tokens={}", prompt_ids.len()),
         true,
     );
-    progress("bake_open", "start".to_string(), true);
-    let bake_open_start = std::time::Instant::now();
-    let bake = select_decode_bake(model_dir, quant_profile, int4_runtime)?;
-    if !bake.weight_mode.is_int4() {
-        match backend {
-            Backend::Cuda => anyhow::bail!(
-                "Qwen3.6-35B-A3B CUDA v1 requires an INT4/q4km bake; selected {} from {}",
-                bake.weight_mode.display_name(),
-                bake.bake_dir.display(),
-            ),
-            Backend::Metal => anyhow::bail!(
-                "Qwen3.6-35B-A3B Metal v1 requires an INT4-GPTQ bake; selected {} from {}",
-                bake.weight_mode.display_name(),
-                bake.bake_dir.display(),
-            ),
-            _ => {}
-        }
-    }
-    println!(
-        "  loading from bake: {} ({})",
-        bake.bake_dir.display(),
-        bake.weight_mode.display_name(),
-    );
-    let store = BakedStore::open(&bake.bake_dir)
-        .with_context(|| format!("open BakedStore at {}", bake.bake_dir.display()))?;
-    let bake_open_elapsed = bake_open_start.elapsed();
-    progress(
-        "bake_open",
-        format!("done bake_dir={}", bake.bake_dir.display()),
-        true,
-    );
+    let source_phase = if flm_source.is_some() {
+        "flm_source"
+    } else {
+        "bake_open"
+    };
+    progress(source_phase, "start".to_string(), true);
+    let source_open_start = std::time::Instant::now();
+    let (decode_store, weight_mode, source_label) = if let Some(flm) = flm_source {
+        let source_label = flm.source.path.display().to_string();
+        validate_qwen36_decode_weight_mode(flm.weight_mode, backend, &source_label)?;
+        println!(
+            "[qwen36-moe] loading weights from already-open FLM source at {} ({})",
+            source_label,
+            flm.weight_mode.display_name(),
+        );
+        (
+            DecodeStore::Borrowed(&flm.source.store),
+            flm.weight_mode,
+            source_label,
+        )
+    } else {
+        let bake = select_decode_bake(model_dir, quant_profile, int4_runtime)?;
+        let source_label = bake.bake_dir.display().to_string();
+        validate_qwen36_decode_weight_mode(bake.weight_mode, backend, &source_label)?;
+        println!(
+            "  loading from bake: {} ({})",
+            source_label,
+            bake.weight_mode.display_name(),
+        );
+        let store = BakedStore::open(&bake.bake_dir)
+            .with_context(|| format!("open BakedStore at {}", bake.bake_dir.display()))?;
+        (DecodeStore::Owned(store), bake.weight_mode, source_label)
+    };
+    let store = decode_store.as_store();
+    let model_source_elapsed = source_open_start.elapsed();
+    progress(source_phase, format!("done source={source_label}"), true);
 
     let geom = build_multi_layer_geom(&report.config.text_config, &report.kernel_params);
 
@@ -501,7 +603,7 @@ fn decode_text(
     println!(
         "  loading {} layers ({} INT4 sidecar sets, KV cache cap = {} tokens)…",
         geom.num_layers,
-        if bake.weight_mode.is_int4() {
+        if weight_mode.is_int4() {
             geom.num_layers
         } else {
             0
@@ -532,7 +634,7 @@ fn decode_text(
         &geom,
         &report.config.text_config,
         weight_prefix,
-        bake.weight_mode,
+        weight_mode,
         kv_max_t,
         kv_fp8,
         kv_vmm,
@@ -1117,11 +1219,11 @@ fn decode_text(
         let prefill_total_ms = to_ms(prefill_embed_elapsed + prefill_chain_elapsed);
         eprintln!(
             "[qwen36-moe lifecycle-timings] prompt_setup_ms={:.3} \
-             bake_open_ms={:.3} layer_load_ms={:.3} session_ms={:.3} \
+             model_source_ms={:.3} layer_load_ms={:.3} session_ms={:.3} \
              prefill_steps={} prefill_embed_ms={:.3} prefill_chain_ms={:.3} \
              prefill_total_ms={:.3} generation_wall_ms={:.3} total_wall_ms={:.3}",
             to_ms(prompt_setup_elapsed),
-            to_ms(bake_open_elapsed),
+            to_ms(model_source_elapsed),
             to_ms(layer_load_elapsed),
             to_ms(session_elapsed),
             prefill_steps,
