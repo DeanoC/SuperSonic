@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Result};
-use model_store::manifest::QuantProfile;
+use model_store::manifest::{LayoutTag, QuantProfile};
+use model_store::BakedStore;
 
 use crate::bakes::{
     effective_flm_source, effective_quant_profile, flm_source_open_options,
@@ -10,6 +11,9 @@ use crate::qwen36_moe_cli::layers::Qwen36WeightMode;
 use crate::registry::ModelVariant;
 use crate::Cli;
 
+const QWEN36_MOE_WEIGHT_MODE_PROBE: &str =
+    "model.language_model.layers.0.linear_attn.in_proj_qkv.weight";
+
 pub(crate) struct Qwen36MoeFlmSource {
     pub(crate) source: FlmModelSource,
     pub(crate) config: qwen36_moe::config::Config,
@@ -17,12 +21,36 @@ pub(crate) struct Qwen36MoeFlmSource {
     pub(crate) weight_mode: Qwen36WeightMode,
 }
 
-pub(crate) fn qwen36_moe_flm_weight_mode(profile: QuantProfile) -> Result<Qwen36WeightMode> {
+#[cfg(test)]
+fn qwen36_moe_flm_weight_mode(profile: QuantProfile) -> Result<Qwen36WeightMode> {
+    qwen36_moe_flm_weight_mode_from_probe(profile, None)
+}
+
+fn qwen36_moe_flm_weight_mode_for_store(
+    store: &BakedStore,
+    profile: QuantProfile,
+) -> Result<Qwen36WeightMode> {
+    let probe = store
+        .meta(QWEN36_MOE_WEIGHT_MODE_PROBE)
+        .map(|meta| (&meta.layout, meta.dtype.as_str()));
+    qwen36_moe_flm_weight_mode_from_probe(profile, probe)
+}
+
+fn qwen36_moe_flm_weight_mode_from_probe(
+    profile: QuantProfile,
+    probe: Option<(&LayoutTag, &str)>,
+) -> Result<Qwen36WeightMode> {
     match profile {
         QuantProfile::Int4Gptq
         | QuantProfile::Int4Awq
         | QuantProfile::Int4Autoround
-        | QuantProfile::Int4Hqq => Ok(Qwen36WeightMode::Int4),
+        | QuantProfile::Int4Hqq => {
+            if matches!(probe, Some((LayoutTag::Raw, "bf16"))) {
+                Ok(Qwen36WeightMode::Bf16)
+            } else {
+                Ok(Qwen36WeightMode::Int4)
+            }
+        }
         other => Err(anyhow!(
             "Qwen3.6 MoE FLM main path currently supports only INT4-compatible profiles; got {other}"
         )),
@@ -55,7 +83,12 @@ pub(crate) fn open_qwen36_moe_flm_source(cli: &Cli) -> Result<Option<Qwen36MoeFl
     let config = source.qwen_moe_config()?;
     eprintln!("[qwen36-moe] loading tokenizer from FLM assets");
     let tokenizer = source.qwen_tokenizer()?;
-    let weight_mode = qwen36_moe_flm_weight_mode(effective_quant_profile(cli)?)?;
+    let weight_mode =
+        qwen36_moe_flm_weight_mode_for_store(&source.store, effective_quant_profile(cli)?)?;
+    eprintln!(
+        "[qwen36-moe] FLM weight mode: {}",
+        weight_mode.display_name()
+    );
     Ok(Some(Qwen36MoeFlmSource {
         source,
         config,
@@ -66,7 +99,7 @@ pub(crate) fn open_qwen36_moe_flm_source(cli: &Cli) -> Result<Option<Qwen36MoeFl
 
 #[cfg(test)]
 mod tests {
-    use model_store::manifest::QuantProfile;
+    use model_store::manifest::{LayoutTag, QuantProfile};
 
     use super::*;
 
@@ -74,6 +107,28 @@ mod tests {
     fn maps_moe_mixed_lowbit_flm_to_int4_weight_mode() {
         let mode =
             qwen36_moe_flm_weight_mode(QuantProfile::Int4Gptq).expect("INT4 profile is supported");
+
+        assert_eq!(mode, Qwen36WeightMode::Int4);
+    }
+
+    #[test]
+    fn maps_ct_int4_bf16_fallback_probe_to_bf16_weight_mode() {
+        let mode = qwen36_moe_flm_weight_mode_from_probe(
+            QuantProfile::Int4Gptq,
+            Some((&LayoutTag::Raw, "bf16")),
+        )
+        .expect("CT INT4 fallback is supported through BF16 load");
+
+        assert_eq!(mode, Qwen36WeightMode::Bf16);
+    }
+
+    #[test]
+    fn keeps_native_int4_probe_on_int4_weight_mode() {
+        let mode = qwen36_moe_flm_weight_mode_from_probe(
+            QuantProfile::Int4Gptq,
+            Some((&LayoutTag::Raw, "u8")),
+        )
+        .expect("native INT4 FLM payload is supported");
 
         assert_eq!(mode, Qwen36WeightMode::Int4);
     }

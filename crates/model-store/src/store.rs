@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
@@ -31,9 +32,9 @@ pub struct FlmLoadOptions {
     /// latency.
     pub verify_block_hashes: bool,
 
-    /// Expose FLM logical INT4 weights as SuperSonic's native INT4
-    /// packed-weight contract. Stage 3 logical/storage bindings are preferred;
-    /// manifest groups remain as a transition fallback for older fixtures.
+    /// Expose FLM logical INT4 weights through loadable tensor aliases. Stage 3
+    /// logical/storage bindings are preferred; manifest groups remain as a
+    /// transition fallback for older fixtures.
     pub flm_int4_logical_aliases: bool,
 }
 
@@ -74,6 +75,14 @@ struct TensorUploadView {
     shape: Vec<usize>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CtSymInt4Bf16Fallback {
+    packed_tensor: String,
+    scale_tensor: String,
+    shape: Vec<usize>,
+    group_size: usize,
+}
+
 /// A memory-mapped baked weight store for fast GPU loading.
 pub struct BakedStore {
     _mmap: Mmap,
@@ -82,6 +91,7 @@ pub struct BakedStore {
     index: HashMap<String, TensorMeta>,
     synthetic: HashMap<String, Vec<u8>>,
     upload_views: HashMap<String, TensorUploadView>,
+    ct_int4_bf16_fallbacks: HashMap<String, CtSymInt4Bf16Fallback>,
     runtime: Option<crate::flm::FlmRuntimeDirectory>,
 }
 
@@ -548,6 +558,132 @@ fn bf16_eight_bytes(len: usize) -> Vec<u8> {
     bytes
 }
 
+fn flm_ct_sym_int4_to_bf16(
+    packed_bytes: &[u8],
+    packed_shape: &[usize],
+    scale_bytes: &[u8],
+    scale_shape: &[usize],
+    logical_shape: &[usize],
+    group_size: usize,
+    tensor_name: &str,
+) -> Result<Vec<u8>, Error> {
+    if logical_shape.len() != 2 {
+        return Err(Error::Other(format!(
+            "FLM CT INT4 fallback tensor {tensor_name} logical shape must be rank 2, got {logical_shape:?}"
+        )));
+    }
+    if packed_shape.len() != 2 {
+        return Err(Error::Other(format!(
+            "FLM CT INT4 fallback tensor {tensor_name} packed shape must be rank 2, got {packed_shape:?}"
+        )));
+    }
+    if scale_shape.len() != 2 {
+        return Err(Error::Other(format!(
+            "FLM CT INT4 fallback tensor {tensor_name} scale shape must be rank 2, got {scale_shape:?}"
+        )));
+    }
+    if group_size == 0 {
+        return Err(Error::Other(format!(
+            "FLM CT INT4 fallback tensor {tensor_name} has zero group size"
+        )));
+    }
+    let rows = logical_shape[0];
+    let cols = logical_shape[1];
+    let packed_rows = packed_shape[0];
+    let packed_cols = packed_shape[1];
+    if packed_rows != rows {
+        return Err(Error::Other(format!(
+            "FLM CT INT4 fallback tensor {tensor_name} packed rows {} != logical rows {rows}",
+            packed_rows
+        )));
+    }
+    let required_packed_cols = cols.div_ceil(8);
+    if packed_cols < required_packed_cols {
+        return Err(Error::Other(format!(
+            "FLM CT INT4 fallback tensor {tensor_name} packed columns {} cannot cover logical cols {cols}",
+            packed_cols
+        )));
+    }
+    let expected_packed_len = packed_rows
+        .checked_mul(packed_cols)
+        .and_then(|words| words.checked_mul(4))
+        .ok_or_else(|| {
+            Error::Other(format!(
+                "FLM CT INT4 fallback tensor {tensor_name} packed byte length overflows"
+            ))
+        })?;
+    if packed_bytes.len() != expected_packed_len {
+        return Err(Error::Other(format!(
+            "FLM CT INT4 fallback tensor {tensor_name} packed byte length {} != expected {expected_packed_len}",
+            packed_bytes.len()
+        )));
+    }
+
+    let scale_rows = scale_shape[0];
+    let scale_cols = scale_shape[1];
+    if scale_rows != rows {
+        return Err(Error::Other(format!(
+            "FLM CT INT4 fallback tensor {tensor_name} scale rows {} != logical rows {rows}",
+            scale_rows
+        )));
+    }
+    let required_scale_cols = cols.div_ceil(group_size);
+    if scale_cols < required_scale_cols {
+        return Err(Error::Other(format!(
+            "FLM CT INT4 fallback tensor {tensor_name} scale columns {} cannot cover {cols} cols with group size {group_size}",
+            scale_cols
+        )));
+    }
+    let expected_scale_len = scale_rows
+        .checked_mul(scale_cols)
+        .and_then(|values| values.checked_mul(2))
+        .ok_or_else(|| {
+            Error::Other(format!(
+                "FLM CT INT4 fallback tensor {tensor_name} scale byte length overflows"
+            ))
+        })?;
+    if scale_bytes.len() != expected_scale_len {
+        return Err(Error::Other(format!(
+            "FLM CT INT4 fallback tensor {tensor_name} scale byte length {} != expected {expected_scale_len}",
+            scale_bytes.len()
+        )));
+    }
+
+    let out_len = rows
+        .checked_mul(cols)
+        .and_then(|values| values.checked_mul(2))
+        .ok_or_else(|| {
+            Error::Other(format!(
+                "FLM CT INT4 fallback tensor {tensor_name} BF16 byte length overflows"
+            ))
+        })?;
+    let mut out = Vec::with_capacity(out_len);
+    for row in 0..rows {
+        for col in 0..cols {
+            let packed_index = row * packed_cols + col / 8;
+            let packed_offset = packed_index * 4;
+            let word = u32::from_le_bytes([
+                packed_bytes[packed_offset],
+                packed_bytes[packed_offset + 1],
+                packed_bytes[packed_offset + 2],
+                packed_bytes[packed_offset + 3],
+            ]);
+            let nibble = ((word >> ((col % 8) * 4)) & 0x0f) as i32;
+            let code = nibble - 8;
+            let scale_index = row * scale_cols + col / group_size;
+            let scale_offset = scale_index * 2;
+            let scale = half::bf16::from_le_bytes([
+                scale_bytes[scale_offset],
+                scale_bytes[scale_offset + 1],
+            ])
+            .to_f32();
+            let value = code as f32 * scale;
+            out.extend_from_slice(&half::bf16::from_f32(value).to_le_bytes());
+        }
+    }
+    Ok(out)
+}
+
 fn manifest_row_shape(row: &crate::flm::FlmTensorManifestRow) -> Vec<usize> {
     row.shape[..row.rank as usize]
         .iter()
@@ -780,6 +916,7 @@ fn add_stage3_int4_aliases(
     index: &mut HashMap<String, TensorMeta>,
     synthetic: &mut HashMap<String, Vec<u8>>,
     upload_views: &mut HashMap<String, TensorUploadView>,
+    ct_int4_bf16_fallbacks: &mut HashMap<String, CtSymInt4Bf16Fallback>,
 ) -> Result<(), Error> {
     let direct_plan: HashMap<(u32, u16), &crate::flm::FlmPlanStep> = runtime
         .plan_steps()
@@ -865,6 +1002,67 @@ fn add_stage3_int4_aliases(
             )));
         }
         let shape = vec![logical.shape[0] as usize, logical.shape[1] as usize];
+        if packed.storage_dtype == FLM_DTYPE_INT32 {
+            if scale.storage_dtype != FLM_DTYPE_BF16 {
+                return Err(Error::Other(format!(
+                    "FLM Stage 3 INT4 tensor {} scale binding dtype {} is unsupported for BF16 fallback",
+                    logical.name, scale.storage_dtype
+                )));
+            }
+            let storage_abi = runtime
+                .storage_abis()
+                .iter()
+                .find(|abi| abi.storage_abi_id == packed.storage_abi_id)
+                .ok_or_else(|| {
+                    Error::Other(format!(
+                        "FLM Stage 3 INT4 tensor {} references missing storage ABI {}",
+                        logical.name, packed.storage_abi_id
+                    ))
+                })?;
+            if storage_abi.codec_semantic_id != crate::flm::CODEC_SYM_INT4_G128_BF16
+                || storage_abi.bits != 4
+            {
+                return Err(Error::Other(format!(
+                    "FLM Stage 3 INT4 tensor {} uses unsupported CT fallback ABI codec={} bits={}",
+                    logical.name, storage_abi.codec_semantic_id, storage_abi.bits
+                )));
+            }
+            let group_size = usize::from(storage_abi.group_size);
+            let byte_len = shape
+                .iter()
+                .try_fold(2usize, |acc, dim| acc.checked_mul(*dim))
+                .ok_or_else(|| {
+                    Error::Other(format!(
+                        "FLM Stage 3 INT4 tensor {} BF16 fallback byte_len overflows",
+                        logical.name
+                    ))
+                })?;
+            index
+                .entry(logical.name.clone())
+                .or_insert_with(|| TensorMeta {
+                    name: logical.name.clone(),
+                    shape: shape.clone(),
+                    dtype: "bf16".to_string(),
+                    layout: LayoutTag::Raw,
+                    offset: packed_meta.offset,
+                    byte_len: byte_len as u64,
+                });
+            upload_views
+                .entry(logical.name.clone())
+                .or_insert_with(|| TensorUploadView {
+                    dtype: "bf16".to_string(),
+                    shape: shape.clone(),
+                });
+            ct_int4_bf16_fallbacks
+                .entry(logical.name.clone())
+                .or_insert_with(|| CtSymInt4Bf16Fallback {
+                    packed_tensor: packed.tensor_name.clone(),
+                    scale_tensor: scale.tensor_name.clone(),
+                    shape,
+                    group_size,
+                });
+            continue;
+        }
         let packed_view = TensorUploadView {
             dtype: flm_dtype_name(packed_step.target_dtype)?.to_string(),
             shape: flm_plan_target_shape(packed_step)?,
@@ -1189,6 +1387,7 @@ impl BakedStore {
             index,
             synthetic: HashMap::new(),
             upload_views: HashMap::new(),
+            ct_int4_bf16_fallbacks: HashMap::new(),
             runtime: None,
         })
     }
@@ -1234,6 +1433,7 @@ impl BakedStore {
         }
         let mut synthetic = HashMap::new();
         let mut upload_views = HashMap::new();
+        let mut ct_int4_bf16_fallbacks = HashMap::new();
         if options.flm_int4_logical_aliases {
             if let Some(runtime) = runtime.as_ref() {
                 if !runtime.logical_tensors().is_empty() {
@@ -1243,6 +1443,7 @@ impl BakedStore {
                         &mut index,
                         &mut synthetic,
                         &mut upload_views,
+                        &mut ct_int4_bf16_fallbacks,
                     )?;
                     add_stage3_lowbit_aliases(runtime, &mut index, &mut upload_views)?;
                 } else {
@@ -1257,6 +1458,7 @@ impl BakedStore {
             index,
             synthetic,
             upload_views,
+            ct_int4_bf16_fallbacks,
             runtime,
         })
     }
@@ -1286,6 +1488,64 @@ impl BakedStore {
     #[cfg(test)]
     fn upload_view(&self, name: &str) -> Option<&TensorUploadView> {
         self.upload_views.get(name)
+    }
+
+    fn materialize_ct_int4_bf16_fallback(
+        &self,
+        name: &str,
+        fallback: &CtSymInt4Bf16Fallback,
+    ) -> Result<Vec<u8>, Error> {
+        let packed_meta = self
+            .index
+            .get(&fallback.packed_tensor)
+            .ok_or_else(|| Error::NotFound(fallback.packed_tensor.clone()))?;
+        let scale_meta = self
+            .index
+            .get(&fallback.scale_tensor)
+            .ok_or_else(|| Error::NotFound(fallback.scale_tensor.clone()))?;
+        let packed_bytes = self.tensor_bytes(&fallback.packed_tensor, packed_meta)?;
+        let scale_bytes = self.tensor_bytes(&fallback.scale_tensor, scale_meta)?;
+        flm_ct_sym_int4_to_bf16(
+            packed_bytes,
+            &packed_meta.shape,
+            scale_bytes,
+            &scale_meta.shape,
+            &fallback.shape,
+            fallback.group_size,
+            name,
+        )
+    }
+
+    fn upload_payload<'a>(
+        &'a self,
+        name: &str,
+        meta: &'a TensorMeta,
+    ) -> Result<(ScalarType, Vec<usize>, Cow<'a, [u8]>), Error> {
+        if let Some(fallback) = self.ct_int4_bf16_fallbacks.get(name) {
+            let bytes = self.materialize_ct_int4_bf16_fallback(name, fallback)?;
+            return Ok((ScalarType::BF16, fallback.shape.clone(), Cow::Owned(bytes)));
+        }
+
+        let slice = self.tensor_bytes(name, meta)?;
+        let (dtype, upload_shape) = if let Some(view) = self.upload_views.get(name) {
+            (parse_dtype(&view.dtype)?, view.shape.clone())
+        } else {
+            (parse_dtype(&meta.dtype)?, gpu_upload_shape(meta)?)
+        };
+        Ok((dtype, upload_shape, Cow::Borrowed(slice)))
+    }
+
+    #[cfg(test)]
+    fn materialize_upload_for_test(
+        &self,
+        name: &str,
+    ) -> Result<(ScalarType, Vec<usize>, Vec<u8>), Error> {
+        let meta = self
+            .index
+            .get(name)
+            .ok_or_else(|| Error::NotFound(name.to_string()))?;
+        let (dtype, shape, bytes) = self.upload_payload(name, meta)?;
+        Ok((dtype, shape, bytes.into_owned()))
     }
 
     fn tensor_bytes(&self, name: &str, meta: &TensorMeta) -> Result<&[u8], Error> {
@@ -1321,6 +1581,9 @@ impl BakedStore {
     /// `embed_tokens_per_layer`, which is row-accessed per-token). The slice
     /// lives as long as the `BakedStore`'s mmap.
     pub fn raw_bytes(&self, name: &str) -> Option<&[u8]> {
+        if self.ct_int4_bf16_fallbacks.contains_key(name) {
+            return None;
+        }
         let meta = self.index.get(name)?;
         self.tensor_bytes(name, meta).ok()
     }
@@ -1335,6 +1598,11 @@ impl BakedStore {
             .index
             .get(name)
             .ok_or_else(|| Error::NotFound(name.to_string()))?;
+        if self.ct_int4_bf16_fallbacks.contains_key(name) {
+            return Err(Error::Other(format!(
+                "tensor '{name}' is a transformed FLM logical alias and has no raw byte range"
+            )));
+        }
         let bytes = self.tensor_bytes(name, meta)?;
         let range_end = byte_offset.checked_add(byte_len).ok_or_else(|| {
             Error::Other(format!(
@@ -1350,20 +1618,16 @@ impl BakedStore {
         Ok(&bytes[byte_offset..range_end])
     }
 
-    /// Load a tensor from the baked store directly to GPU memory.
-    /// One memcpy (H2D), zero parsing or transformation.
+    /// Load a tensor from the baked store to GPU memory.
+    /// Direct tensors borrow mmap bytes; transformed FLM logical aliases
+    /// materialize a temporary host fallback payload before upload.
     pub fn load_to_gpu(&self, name: &str, ordinal: usize) -> Result<GpuBuffer, Error> {
         let meta = self
             .index
             .get(name)
             .ok_or_else(|| Error::NotFound(name.to_string()))?;
-        let slice = self.tensor_bytes(name, meta)?;
-        let (dtype, upload_shape) = if let Some(view) = self.upload_views.get(name) {
-            (parse_dtype(&view.dtype)?, view.shape.clone())
-        } else {
-            (parse_dtype(&meta.dtype)?, gpu_upload_shape(meta)?)
-        };
-        let buf = GpuBuffer::from_host_bytes(ordinal, dtype, &upload_shape, slice)?;
+        let (dtype, upload_shape, payload) = self.upload_payload(name, meta)?;
+        let buf = GpuBuffer::from_host_bytes(ordinal, dtype, &upload_shape, payload.as_ref())?;
         Ok(buf)
     }
 
@@ -1401,6 +1665,11 @@ impl BakedStore {
             .index
             .get(name)
             .ok_or_else(|| Error::NotFound(name.to_string()))?;
+        if self.ct_int4_bf16_fallbacks.contains_key(name) {
+            return Err(Error::Other(format!(
+                "tensor '{name}' is a transformed FLM logical alias and cannot be reserved in a virtual arena"
+            )));
+        }
         let slice = self.tensor_bytes(name, meta)?;
         let dtype = parse_dtype(&meta.dtype)?;
         let expected_len = meta
@@ -1442,6 +1711,11 @@ impl BakedStore {
             .index
             .get(name)
             .ok_or_else(|| Error::NotFound(name.to_string()))?;
+        if self.ct_int4_bf16_fallbacks.contains_key(name) {
+            return Err(Error::Other(format!(
+                "tensor '{name}' is a transformed FLM logical alias and cannot be range-loaded into a virtual arena"
+            )));
+        }
         let range_end = byte_offset.checked_add(byte_len).ok_or_else(|| {
             Error::Other(format!(
                 "tensor '{name}' load range overflows: offset={byte_offset} len={byte_len}"
@@ -1643,6 +1917,35 @@ mod tests {
     fn push_string(buf: &mut Vec<u8>, value: &str) {
         push_u32(buf, value.len() as u32);
         buf.extend_from_slice(value.as_bytes());
+    }
+
+    fn test_bf16_bytes(values: impl IntoIterator<Item = f32>) -> Vec<u8> {
+        values
+            .into_iter()
+            .flat_map(|value| half::bf16::from_f32(value).to_le_bytes())
+            .collect()
+    }
+
+    fn test_ct_int4_packed_bytes(
+        rows: usize,
+        cols: usize,
+        mut code_at: impl FnMut(usize, usize) -> i32,
+    ) -> Vec<u8> {
+        assert_eq!(cols % 8, 0);
+        let mut out = Vec::with_capacity(rows * cols / 2);
+        for row in 0..rows {
+            for packed_col in 0..(cols / 8) {
+                let mut word = 0u32;
+                for lane in 0..8 {
+                    let col = packed_col * 8 + lane;
+                    let code = code_at(row, col);
+                    assert!((-8..=7).contains(&code));
+                    word |= ((code + 8) as u32) << (lane * 4);
+                }
+                out.extend_from_slice(&word.to_le_bytes());
+            }
+        }
+        out
     }
 
     struct TestManifestRow {
@@ -2873,17 +3176,17 @@ mod tests {
         let mut data = build_test_flm(&[
             TestFlmTensor {
                 name: "storage/l0_gate_packed",
-                shape: vec![128, 16],
+                shape: vec![128, 8],
                 dtype: FLM_DTYPE_INT32,
                 codec: 1,
-                payload: vec![0; 128],
+                payload: test_ct_int4_packed_bytes(128, 64, |_row, col| (col % 16) as i32 - 8),
             },
             TestFlmTensor {
                 name: "storage/l0_gate_scale",
                 shape: vec![128, 1],
                 dtype: FLM_DTYPE_BF16,
                 codec: 1,
-                payload: vec![0; 256],
+                payload: test_bf16_bytes((0..128).map(|row| if row % 2 == 0 { 1.0 } else { 0.5 })),
             },
             TestFlmTensor {
                 name: "storage/l0_gate_shape",
@@ -3233,7 +3536,7 @@ mod tests {
     }
 
     #[test]
-    fn open_flm_builds_int4_aliases_from_stage3_bindings_without_suffix_inference() {
+    fn open_flm_builds_ct_int4_stage3_binding_as_bf16_fallback() {
         let data = build_test_flm_with_stage3_logical_bindings();
         let file = write_temp_flm(&data);
 
@@ -3248,22 +3551,78 @@ mod tests {
 
         let alias = store
             .meta("model.language_model.layers.0.mlp.gate_proj.weight")
-            .expect("native logical INT4 alias");
-        assert_eq!(alias.layout, LayoutTag::Int4Quantized);
-        assert_eq!(alias.dtype, "u8");
+            .expect("logical INT4 fallback alias");
+        assert_eq!(alias.layout, LayoutTag::Raw);
+        assert_eq!(alias.dtype, "bf16");
         assert_eq!(alias.shape, vec![128, 64]);
+        assert_eq!(alias.byte_len, 128 * 64 * 2);
 
         let upload_view = store
             .upload_view("model.language_model.layers.0.mlp.gate_proj.weight")
-            .expect("native logical INT4 upload view");
-        assert_eq!(upload_view.dtype, "u8");
-        assert_eq!(upload_view.shape, vec![128, 32]);
+            .expect("logical INT4 fallback upload view");
+        assert_eq!(upload_view.dtype, "bf16");
+        assert_eq!(upload_view.shape, vec![128, 64]);
+    }
 
-        let scale_view = store
-            .upload_view("model.language_model.layers.0.mlp.gate_proj.weight_int4_scale")
-            .expect("native scale upload view");
-        assert_eq!(scale_view.dtype, "bf16");
-        assert_eq!(scale_view.shape, vec![128, 1]);
+    #[test]
+    fn open_flm_materializes_ct_int4_stage3_fallback_upload_bytes() {
+        let data = build_test_flm_with_stage3_logical_bindings();
+        let file = write_temp_flm(&data);
+
+        let store = BakedStore::open_flm_with_options(
+            file.path(),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                verify_block_hashes: false,
+            },
+        )
+        .expect("open FLM with Stage 3 bindings");
+
+        let logical_name = "model.language_model.layers.0.mlp.gate_proj.weight";
+        let (dtype, shape, bytes) = store
+            .materialize_upload_for_test(logical_name)
+            .expect("materialize CT INT4 BF16 fallback");
+        assert_eq!(dtype, ScalarType::BF16);
+        assert_eq!(shape, vec![128, 64]);
+
+        let expected = test_bf16_bytes((0..128).flat_map(|row| {
+            (0..64).map(move |col| {
+                let code = (col % 16) as i32 - 8;
+                let scale = if row % 2 == 0 { 1.0 } else { 0.5 };
+                code as f32 * scale
+            })
+        }));
+        assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn open_flm_rejects_virtual_arena_for_ct_int4_stage3_fallback_alias() {
+        let data = build_test_flm_with_stage3_logical_bindings();
+        let file = write_temp_flm(&data);
+
+        let store = BakedStore::open_flm_with_options(
+            file.path(),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                verify_block_hashes: false,
+            },
+        )
+        .expect("open FLM with Stage 3 bindings");
+
+        let mut arena = BakedStore::virtual_weight_arena(0);
+        let err = store
+            .reserve_virtual_arena(
+                &mut arena,
+                "model.language_model.layers.0.mlp.gate_proj.weight",
+                VirtualAllocationRole::Weights,
+            )
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("transformed FLM logical alias"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -5082,6 +5441,46 @@ mod tests {
         assert_eq!(gate_scale.shape(), &[256, 32]);
 
         eprintln!("[flm-upload] OK — 35B MXFP8 FLM direct views uploaded to HIP");
+    }
+
+    #[test]
+    fn flm_qwen36_35b_ct_int4_fallback_uploads_bf16_to_hip() {
+        let Ok(flm_path_str) = std::env::var("SUPERSONIC_QWEN36_35B_CT_INT4_FLM_HIP_UPLOAD") else {
+            eprintln!(
+                "skip: SUPERSONIC_QWEN36_35B_CT_INT4_FLM_HIP_UPLOAD not set. Point it at a \
+                 compressed-tensors INT4 Qwen3.6-35B-A3B FLM."
+            );
+            return;
+        };
+        gpu_hal::set_backend(gpu_hal::Backend::Hip);
+        let store = BakedStore::open_flm_with_options(
+            Path::new(&flm_path_str),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                verify_block_hashes: false,
+            },
+        )
+        .expect("open qwen3.6-35b CT INT4 FLM");
+
+        let logical_name = "model.language_model.layers.0.linear_attn.in_proj_qkv.weight";
+        let meta = store
+            .meta(logical_name)
+            .expect("CT INT4 logical BF16 fallback alias");
+        assert_eq!(meta.layout, LayoutTag::Raw);
+        assert_eq!(meta.dtype, "bf16");
+        assert_eq!(meta.shape, vec![8192, 2048]);
+        assert!(
+            store.raw_bytes(logical_name).is_none(),
+            "transformed fallback aliases must not expose raw mmap bytes"
+        );
+
+        let weight = store
+            .load_to_gpu(logical_name, 0)
+            .expect("upload CT INT4 logical alias through BF16 fallback");
+        assert_eq!(weight.dtype(), ScalarType::BF16);
+        assert_eq!(weight.shape(), &[8192, 2048]);
+
+        eprintln!("[flm-upload] OK — 35B CT INT4 fallback uploaded BF16 logical view to HIP");
     }
 
     #[test]

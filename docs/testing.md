@@ -95,12 +95,13 @@ load from the already-open source, and that no `[fetch]` or `[bake]` path is
 entered.
 
 The Qwen3.6 35B-A3B MoE FLM path uses the same single-source contract for the
-HIP decode path. Validate the artifact with geo-quant's no-HF profile first:
+HIP decode path. Validate the native SuperSonic-layout artifact with
+geo-quant's no-HF profile first:
 
 ```bash
 /home/deano/.config/superpowers/worktrees/geo-quant/flm-export/.venv-rocm/bin/python \
   -m geoquant.formats.flm_validate \
-  /mnt/data/runs/geo-quant/qwen36-35b-a3b-int4-stage3-direct.flm \
+  /mnt/data/runs/geo-quant/qwen36-35b-a3b-supersonic-native-int4.flm \
   --profile runnable-no-hf \
   --verify-payload-hashes
 ```
@@ -108,7 +109,7 @@ HIP decode path. Validate the artifact with geo-quant's no-HF profile first:
 Then run the env-gated MoE runner smoke:
 
 ```bash
-SUPERSONIC_QWEN36_35B_A3B_NO_HF_FLM=/mnt/data/runs/geo-quant/qwen36-35b-a3b-int4-stage3-direct.flm \
+SUPERSONIC_QWEN36_35B_A3B_NO_HF_FLM=/mnt/data/runs/geo-quant/qwen36-35b-a3b-supersonic-native-int4.flm \
   cargo test -q -p runner --test flm_moe_main_path -- --nocapture
 ```
 
@@ -117,6 +118,19 @@ The MoE smoke runs one generated token with `--model qwen3.6-35b-a3b`,
 tokenizer, and weights all come from the single FLM source, that the FLM is
 opened exactly once, and that the run does not enter fetch, bake, config JSON,
 tokenizer JSON, safetensors, or `.supersonic` paths.
+
+Compressed-tensors INT4 FLMs from geo-quant are tested separately through the
+portable fallback path. That path exposes logical CT INT4 weights as BF16 views
+when SuperSonic does not have a compatible direct execution plan:
+
+```bash
+SUPERSONIC_QWEN36_35B_CT_INT4_FLM_HIP_UPLOAD=/mnt/data/runs/geo-quant/qwen36-35b-a3b-int4-stage3-direct.flm \
+  cargo test -q -p model-store flm_qwen36_35b_ct_int4_fallback_uploads_bf16_to_hip -- --nocapture
+
+SUPERSONIC_QWEN36_35B_CT_INT4_FLM_DRY_RUN=/mnt/data/runs/geo-quant/qwen36-35b-a3b-int4-stage3-direct.flm \
+  cargo test -q -p runner --test flm_moe_main_path \
+    qwen36_moe_ct_int4_flm_dry_run_consumes_source_without_hf_snapshot -- --nocapture
+```
 
 ### Adding tests for a new machine
 
