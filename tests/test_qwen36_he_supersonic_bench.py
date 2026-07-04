@@ -446,11 +446,21 @@ class BenchQwen36HeSuperSonicTests(unittest.TestCase):
                 "[FLM runtime weights] ready-for-decode: YES "
                 "(source=/tmp/qwen36.flm)\n"
                 "[qwen36-moe startup-timings] flm_source_open_ms=123.456 "
+                "flm_tokenizer_parse_vocab_ms=0.000 "
+                "flm_tokenizer_parse_vocab_ids_ms=0.000 "
+                "flm_tokenizer_parse_merges_ms=0.000 "
+                "flm_tokenizer_parse_added_tokens_ms=0.000 "
+                "flm_tokenizer_parse_regex_ms=0.000 "
                 "bake_prepare_ms=0.000 dry_run_ms=4.500 "
                 "pre_decode_total_ms=127.956\n"
                 "[result] prompt_tokens=1 generated_tokens=1 decode_ms=41 "
                 "ms_per_step=41.0\n"
                 "[qwen36-moe lifecycle-timings] prompt_setup_ms=55.351 "
+                "flm_tokenizer_parse_vocab_ms=10.000 "
+                "flm_tokenizer_parse_vocab_ids_ms=0.500 "
+                "flm_tokenizer_parse_merges_ms=5.000 "
+                "flm_tokenizer_parse_added_tokens_ms=0.250 "
+                "flm_tokenizer_parse_regex_ms=0.125 "
                 "model_source_ms=0.009 layer_load_ms=5744.555 session_ms=466.101 "
                 "prefill_steps=0 prefill_embed_ms=0.000 prefill_chain_ms=0.000 "
                 "prefill_total_ms=0.000 generation_wall_ms=41.006 "
@@ -485,6 +495,11 @@ class BenchQwen36HeSuperSonicTests(unittest.TestCase):
             row["startup_timings"],
             {
                 "flm_source_open_ms": 123.456,
+                "flm_tokenizer_parse_vocab_ms": 0.0,
+                "flm_tokenizer_parse_vocab_ids_ms": 0.0,
+                "flm_tokenizer_parse_merges_ms": 0.0,
+                "flm_tokenizer_parse_added_tokens_ms": 0.0,
+                "flm_tokenizer_parse_regex_ms": 0.0,
                 "bake_prepare_ms": 0.0,
                 "dry_run_ms": 4.5,
                 "pre_decode_total_ms": 127.956,
@@ -494,6 +509,11 @@ class BenchQwen36HeSuperSonicTests(unittest.TestCase):
             row["lifecycle_timings"],
             {
                 "prompt_setup_ms": 55.351,
+                "flm_tokenizer_parse_vocab_ms": 10.0,
+                "flm_tokenizer_parse_vocab_ids_ms": 0.5,
+                "flm_tokenizer_parse_merges_ms": 5.0,
+                "flm_tokenizer_parse_added_tokens_ms": 0.25,
+                "flm_tokenizer_parse_regex_ms": 0.125,
                 "model_source_ms": 0.009,
                 "layer_load_ms": 5744.555,
                 "session_ms": 466.101,

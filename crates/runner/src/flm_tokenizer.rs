@@ -43,7 +43,22 @@ struct QwenAddedToken {
 pub struct QwenBpeTokenizerTimings {
     pub asset_lookup: Duration,
     pub parse: Duration,
+    pub parse_vocab: Duration,
+    pub parse_vocab_ids: Duration,
+    pub parse_merges: Duration,
+    pub parse_added_tokens: Duration,
+    pub parse_regex: Duration,
     pub build: Duration,
+}
+
+impl QwenBpeTokenizerTimings {
+    pub fn parse_phase_total(&self) -> Duration {
+        self.parse_vocab
+            + self.parse_vocab_ids
+            + self.parse_merges
+            + self.parse_added_tokens
+            + self.parse_regex
+    }
 }
 
 pub struct QwenBpeTokenizerLoad {
@@ -52,6 +67,7 @@ pub struct QwenBpeTokenizerLoad {
 }
 
 impl QwenBpeAssets {
+    #[cfg(test)]
     fn parse(
         algorithm_id: u32,
         descriptor_vocab_size: u32,
@@ -60,18 +76,47 @@ impl QwenBpeAssets {
         added_tokens: &[u8],
         regex: &[u8],
     ) -> Result<Self> {
+        let mut timings = QwenBpeTokenizerTimings::default();
+        Self::parse_timed(
+            algorithm_id,
+            descriptor_vocab_size,
+            vocab,
+            merges,
+            added_tokens,
+            regex,
+            &mut timings,
+        )
+    }
+
+    fn parse_timed(
+        algorithm_id: u32,
+        descriptor_vocab_size: u32,
+        vocab: &[u8],
+        merges: &[u8],
+        added_tokens: &[u8],
+        regex: &[u8],
+        timings: &mut QwenBpeTokenizerTimings,
+    ) -> Result<Self> {
         if algorithm_id != TOKENIZER_QWEN_BPE_V1 {
             bail!(
                 "unsupported FLM tokenizer algorithm_id {algorithm_id}; expected TOKENIZER_QWEN_BPE_V1 ({TOKENIZER_QWEN_BPE_V1})"
             );
         }
-        let vocab = parse_vocab(vocab)?;
-        validate_vocab_ids(&vocab, descriptor_vocab_size)?;
+        let vocab = timed_tokenizer_phase(&mut timings.parse_vocab, || parse_vocab(vocab))?;
+        timed_tokenizer_phase(&mut timings.parse_vocab_ids, || {
+            validate_vocab_ids(&vocab, descriptor_vocab_size)
+        })?;
+        let merges = timed_tokenizer_phase(&mut timings.parse_merges, || parse_merges(merges))?;
+        let added_tokens = timed_tokenizer_phase(&mut timings.parse_added_tokens, || {
+            parse_added_tokens(added_tokens)
+        })?;
+        let regex = timed_tokenizer_phase(&mut timings.parse_regex, || parse_regex(regex))?;
+        timings.parse = timings.parse_phase_total();
         Ok(Self {
             vocab,
-            merges: parse_merges(merges)?,
-            added_tokens: parse_added_tokens(added_tokens)?,
-            regex: parse_regex(regex)?,
+            merges,
+            added_tokens,
+            regex,
         })
     }
 }
@@ -116,22 +161,28 @@ pub fn load_qwen_bpe_from_flm_timed(
     )?;
     timings.asset_lookup = asset_start.elapsed();
 
-    let parse_start = Instant::now();
-    let assets = QwenBpeAssets::parse(
+    let assets = QwenBpeAssets::parse_timed(
         descriptor.algorithm_id,
         descriptor.vocab_size,
         vocab,
         merges,
         added_tokens,
         regex,
+        &mut timings,
     )?;
-    timings.parse = parse_start.elapsed();
 
     let build_start = Instant::now();
     let tokenizer = build_qwen_bpe_tokenizer(assets)?;
     timings.build = build_start.elapsed();
 
     Ok(QwenBpeTokenizerLoad { tokenizer, timings })
+}
+
+fn timed_tokenizer_phase<T>(slot: &mut Duration, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    let start = Instant::now();
+    let value = f()?;
+    *slot = start.elapsed();
+    Ok(value)
 }
 
 fn asset_payload<'a>(
@@ -466,6 +517,32 @@ mod tests {
         out
     }
 
+    fn generated_vocab_asset(count: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        u32_le(&mut out, count);
+        for id in 0..count {
+            let token = format!("tok{id}");
+            u32_le(&mut out, id);
+            u32_le(&mut out, token.len() as u32);
+            out.extend_from_slice(token.as_bytes());
+        }
+        out
+    }
+
+    fn generated_merges_asset(count: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        u32_le(&mut out, count);
+        for index in 0..count {
+            let left = format!("l{index}");
+            let right = format!("r{index}");
+            u32_le(&mut out, left.len() as u32);
+            out.extend_from_slice(left.as_bytes());
+            u32_le(&mut out, right.len() as u32);
+            out.extend_from_slice(right.as_bytes());
+        }
+        out
+    }
+
     #[test]
     fn parses_synthetic_assets_and_builds_qwen_bpe_tokenizer() {
         let assets = QwenBpeAssets::parse(
@@ -496,6 +573,36 @@ mod tests {
             tokenizer.encode("<|endoftext|>", false).unwrap().get_ids(),
             &[8]
         );
+    }
+
+    #[test]
+    fn timed_parse_records_tokenizer_asset_phase_breakdown() {
+        let vocab = generated_vocab_asset(1024);
+        let merges = generated_merges_asset(512);
+        let added_tokens = added_tokens_asset(&[(1024, "<|endoftext|>", [0, 0, 0, 0, 1])]);
+        let mut timings = QwenBpeTokenizerTimings::default();
+
+        let assets = QwenBpeAssets::parse_timed(
+            TOKENIZER_QWEN_BPE_V1,
+            1024,
+            &vocab,
+            &merges,
+            &added_tokens,
+            br"\S+",
+            &mut timings,
+        )
+        .expect("timed parse synthetic assets");
+
+        assert_eq!(timings.parse, timings.parse_phase_total());
+        assert!(timings.parse > std::time::Duration::ZERO);
+        assert!(timings.parse_vocab > std::time::Duration::ZERO);
+        assert!(timings.parse_vocab_ids > std::time::Duration::ZERO);
+        assert!(timings.parse_merges > std::time::Duration::ZERO);
+        assert!(timings.parse_added_tokens > std::time::Duration::ZERO);
+        assert!(timings.parse_regex > std::time::Duration::ZERO);
+        assert_eq!(assets.vocab.len(), 1024);
+        assert_eq!(assets.merges.len(), 512);
+        assert_eq!(assets.added_tokens.len(), 1);
     }
 
     #[test]

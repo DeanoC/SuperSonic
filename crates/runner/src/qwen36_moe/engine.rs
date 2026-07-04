@@ -198,6 +198,11 @@ struct Qwen36StartupTimings {
     flm_tokenizer: std::time::Duration,
     flm_tokenizer_assets: std::time::Duration,
     flm_tokenizer_parse: std::time::Duration,
+    flm_tokenizer_parse_vocab: std::time::Duration,
+    flm_tokenizer_parse_vocab_ids: std::time::Duration,
+    flm_tokenizer_parse_merges: std::time::Duration,
+    flm_tokenizer_parse_added_tokens: std::time::Duration,
+    flm_tokenizer_parse_regex: std::time::Duration,
     flm_tokenizer_build: std::time::Duration,
     flm_direct_plan: std::time::Duration,
     bake_prepare: std::time::Duration,
@@ -229,6 +234,11 @@ fn format_qwen36_startup_timings(timings: &Qwen36StartupTimings) -> String {
         "flm_source_open_ms={:.3} flm_store_open_ms={:.3} \
          flm_config_ms={:.3} flm_tokenizer_ms={:.3} \
          flm_tokenizer_assets_ms={:.3} flm_tokenizer_parse_ms={:.3} \
+         flm_tokenizer_parse_vocab_ms={:.3} \
+         flm_tokenizer_parse_vocab_ids_ms={:.3} \
+         flm_tokenizer_parse_merges_ms={:.3} \
+         flm_tokenizer_parse_added_tokens_ms={:.3} \
+         flm_tokenizer_parse_regex_ms={:.3} \
          flm_tokenizer_build_ms={:.3} flm_direct_plan_ms={:.3} \
          bake_prepare_ms={:.3} \
          dry_run_ms={:.3} pre_decode_total_ms={:.3}",
@@ -238,6 +248,11 @@ fn format_qwen36_startup_timings(timings: &Qwen36StartupTimings) -> String {
         qwen36_duration_ms(timings.flm_tokenizer),
         qwen36_duration_ms(timings.flm_tokenizer_assets),
         qwen36_duration_ms(timings.flm_tokenizer_parse),
+        qwen36_duration_ms(timings.flm_tokenizer_parse_vocab),
+        qwen36_duration_ms(timings.flm_tokenizer_parse_vocab_ids),
+        qwen36_duration_ms(timings.flm_tokenizer_parse_merges),
+        qwen36_duration_ms(timings.flm_tokenizer_parse_added_tokens),
+        qwen36_duration_ms(timings.flm_tokenizer_parse_regex),
         qwen36_duration_ms(timings.flm_tokenizer_build),
         qwen36_duration_ms(timings.flm_direct_plan),
         qwen36_duration_ms(timings.bake_prepare),
@@ -252,6 +267,11 @@ struct Qwen36LifecycleTimings {
     flm_tokenizer: std::time::Duration,
     flm_tokenizer_assets: std::time::Duration,
     flm_tokenizer_parse: std::time::Duration,
+    flm_tokenizer_parse_vocab: std::time::Duration,
+    flm_tokenizer_parse_vocab_ids: std::time::Duration,
+    flm_tokenizer_parse_merges: std::time::Duration,
+    flm_tokenizer_parse_added_tokens: std::time::Duration,
+    flm_tokenizer_parse_regex: std::time::Duration,
     flm_tokenizer_build: std::time::Duration,
     model_source: std::time::Duration,
     layer_load: std::time::Duration,
@@ -273,6 +293,11 @@ fn format_qwen36_lifecycle_timings(timings: &Qwen36LifecycleTimings) -> String {
     format!(
         "prompt_setup_ms={:.3} flm_tokenizer_ms={:.3} \
          flm_tokenizer_assets_ms={:.3} flm_tokenizer_parse_ms={:.3} \
+         flm_tokenizer_parse_vocab_ms={:.3} \
+         flm_tokenizer_parse_vocab_ids_ms={:.3} \
+         flm_tokenizer_parse_merges_ms={:.3} \
+         flm_tokenizer_parse_added_tokens_ms={:.3} \
+         flm_tokenizer_parse_regex_ms={:.3} \
          flm_tokenizer_build_ms={:.3} model_source_ms={:.3} \
          layer_load_ms={:.3} session_ms={:.3} prefill_steps={} \
          prefill_embed_ms={:.3} prefill_chain_ms={:.3} \
@@ -281,6 +306,11 @@ fn format_qwen36_lifecycle_timings(timings: &Qwen36LifecycleTimings) -> String {
         qwen36_duration_ms(timings.flm_tokenizer),
         qwen36_duration_ms(timings.flm_tokenizer_assets),
         qwen36_duration_ms(timings.flm_tokenizer_parse),
+        qwen36_duration_ms(timings.flm_tokenizer_parse_vocab),
+        qwen36_duration_ms(timings.flm_tokenizer_parse_vocab_ids),
+        qwen36_duration_ms(timings.flm_tokenizer_parse_merges),
+        qwen36_duration_ms(timings.flm_tokenizer_parse_added_tokens),
+        qwen36_duration_ms(timings.flm_tokenizer_parse_regex),
         qwen36_duration_ms(timings.flm_tokenizer_build),
         qwen36_duration_ms(timings.model_source),
         qwen36_duration_ms(timings.layer_load),
@@ -326,6 +356,11 @@ mod tests {
             flm_tokenizer: std::time::Duration::from_micros(625),
             flm_tokenizer_assets: std::time::Duration::from_micros(25),
             flm_tokenizer_parse: std::time::Duration::from_micros(275),
+            flm_tokenizer_parse_vocab: std::time::Duration::from_micros(100),
+            flm_tokenizer_parse_vocab_ids: std::time::Duration::from_micros(25),
+            flm_tokenizer_parse_merges: std::time::Duration::from_micros(75),
+            flm_tokenizer_parse_added_tokens: std::time::Duration::from_micros(50),
+            flm_tokenizer_parse_regex: std::time::Duration::from_micros(25),
             flm_tokenizer_build: std::time::Duration::from_micros(325),
             flm_direct_plan: std::time::Duration::from_micros(125),
             bake_prepare: std::time::Duration::ZERO,
@@ -337,6 +372,11 @@ mod tests {
             "flm_source_open_ms=1.500 flm_store_open_ms=0.500 \
              flm_config_ms=0.250 flm_tokenizer_ms=0.625 \
              flm_tokenizer_assets_ms=0.025 flm_tokenizer_parse_ms=0.275 \
+             flm_tokenizer_parse_vocab_ms=0.100 \
+             flm_tokenizer_parse_vocab_ids_ms=0.025 \
+             flm_tokenizer_parse_merges_ms=0.075 \
+             flm_tokenizer_parse_added_tokens_ms=0.050 \
+             flm_tokenizer_parse_regex_ms=0.025 \
              flm_tokenizer_build_ms=0.325 flm_direct_plan_ms=0.125 \
              bake_prepare_ms=0.000 \
              dry_run_ms=2.250 pre_decode_total_ms=3.750"
@@ -350,6 +390,11 @@ mod tests {
             flm_tokenizer: std::time::Duration::from_micros(625),
             flm_tokenizer_assets: std::time::Duration::from_micros(25),
             flm_tokenizer_parse: std::time::Duration::from_micros(275),
+            flm_tokenizer_parse_vocab: std::time::Duration::from_micros(100),
+            flm_tokenizer_parse_vocab_ids: std::time::Duration::from_micros(25),
+            flm_tokenizer_parse_merges: std::time::Duration::from_micros(75),
+            flm_tokenizer_parse_added_tokens: std::time::Duration::from_micros(50),
+            flm_tokenizer_parse_regex: std::time::Duration::from_micros(25),
             flm_tokenizer_build: std::time::Duration::from_micros(325),
             model_source: std::time::Duration::from_micros(1_500),
             layer_load: std::time::Duration::from_micros(2_500),
@@ -365,6 +410,11 @@ mod tests {
             format_qwen36_lifecycle_timings(&timings),
             "prompt_setup_ms=5.000 flm_tokenizer_ms=0.625 \
              flm_tokenizer_assets_ms=0.025 flm_tokenizer_parse_ms=0.275 \
+             flm_tokenizer_parse_vocab_ms=0.100 \
+             flm_tokenizer_parse_vocab_ids_ms=0.025 \
+             flm_tokenizer_parse_merges_ms=0.075 \
+             flm_tokenizer_parse_added_tokens_ms=0.050 \
+             flm_tokenizer_parse_regex_ms=0.025 \
              flm_tokenizer_build_ms=0.325 model_source_ms=1.500 \
              layer_load_ms=2.500 session_ms=3.500 prefill_steps=2 \
              prefill_embed_ms=0.100 prefill_chain_ms=0.200 \
@@ -1405,6 +1455,11 @@ fn decode_text(
             flm_tokenizer: flm_tokenizer_elapsed,
             flm_tokenizer_assets: flm_tokenizer_timings.asset_lookup,
             flm_tokenizer_parse: flm_tokenizer_timings.parse,
+            flm_tokenizer_parse_vocab: flm_tokenizer_timings.parse_vocab,
+            flm_tokenizer_parse_vocab_ids: flm_tokenizer_timings.parse_vocab_ids,
+            flm_tokenizer_parse_merges: flm_tokenizer_timings.parse_merges,
+            flm_tokenizer_parse_added_tokens: flm_tokenizer_timings.parse_added_tokens,
+            flm_tokenizer_parse_regex: flm_tokenizer_timings.parse_regex,
             flm_tokenizer_build: flm_tokenizer_timings.build,
             model_source: model_source_elapsed,
             layer_load: layer_load_elapsed,
