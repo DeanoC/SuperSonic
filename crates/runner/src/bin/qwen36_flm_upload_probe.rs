@@ -12,6 +12,7 @@ use std::ffi::c_int;
 use std::{ffi::c_void, path::PathBuf, time::Instant};
 
 const MIB: f64 = 1024.0 * 1024.0;
+const STORAGE_DIRECT_BLOCK_ALIGNMENT: usize = 4096;
 
 #[derive(Debug, Parser)]
 #[command(about = "Probe FLM/BakedStore tensor upload modes for selected tensors")]
@@ -98,6 +99,21 @@ fn mib_per_second(bytes: usize, elapsed_ms: f64) -> f64 {
         return 0.0;
     }
     (bytes as f64 / MIB) / (elapsed_ms / 1000.0)
+}
+
+fn ensure_storage_direct_range_alignment(tensor: &str, file_offset: u64, len: usize) -> Result<()> {
+    let block = STORAGE_DIRECT_BLOCK_ALIGNMENT as u64;
+    if file_offset % block != 0 {
+        bail!(
+            "tensor {tensor} storage-direct file offset {file_offset} is not {STORAGE_DIRECT_BLOCK_ALIGNMENT}-byte aligned"
+        );
+    }
+    if len % STORAGE_DIRECT_BLOCK_ALIGNMENT != 0 {
+        bail!(
+            "tensor {tensor} storage-direct length {len} is not {STORAGE_DIRECT_BLOCK_ALIGNMENT}-byte aligned"
+        );
+    }
+    Ok(())
 }
 
 fn round_up_to(value: usize, align: usize) -> Result<usize> {
@@ -375,6 +391,7 @@ fn run_storage_direct_upload(
             "tensor {tensor} storage-direct probe expected {expected_bytes} bytes from upload dtype/shape, got {bytes}"
         );
     }
+    ensure_storage_direct_range_alignment(tensor, range.file_offset, bytes)?;
 
     hal_profile_set_enabled(true);
     hal_profile_reset();
@@ -639,6 +656,27 @@ mod tests {
         ])
         .unwrap();
         assert!(args.storage_direct);
+    }
+
+    #[test]
+    fn storage_direct_range_requires_block_aligned_offset_and_length() {
+        assert!(ensure_storage_direct_range_alignment("expert", 4096, 8192).is_ok());
+
+        let err = ensure_storage_direct_range_alignment("dt_bias", 4096, 64)
+            .expect_err("sub-block tensor length must not be sent to direct storage");
+        assert!(
+            err.to_string()
+                .contains("length 64 is not 4096-byte aligned"),
+            "{err}"
+        );
+
+        let err = ensure_storage_direct_range_alignment("expert", 512, 8192)
+            .expect_err("unaligned file offset must not be sent to direct storage");
+        assert!(
+            err.to_string()
+                .contains("file offset 512 is not 4096-byte aligned"),
+            "{err}"
+        );
     }
 
     #[test]

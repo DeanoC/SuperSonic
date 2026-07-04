@@ -177,14 +177,14 @@ smoke above. The resulting JSON records `model: null`,
 
 To validate ROCm 7.2 hipFile storage-to-device transfer on a host with
 `hipfile.h`, `libhipfile`, and passing `/opt/rocm/bin/ais-check`, use the FLM
-upload probe's storage-direct mode on a small direct tensor first:
+upload probe's storage-direct mode on a block-aligned expert tensor first:
 
 ```bash
 target/release/qwen36_flm_upload_probe \
   --model-dir /mnt/data/tmp/flm-first-class-e2e-20260704/qwen36-35b-a3b-supersonic-native-int4-aligned.flm \
   --backend hip \
   --device 0 \
-  --tensor model.language_model.layers.0.linear_attn.dt_bias \
+  --tensor model.language_model.layers.0.mlp.experts.gate_up_proj \
   --iters 1 \
   --storage-direct \
   --json
@@ -195,6 +195,10 @@ nonzero `copy_storage_to_device_ms` and `copy_storage_to_device_bytes`. On a
 build without hipFile support, the same command should fail with the explicit
 `ROCm >= 7.2 with hipfile.h and libhipfile` diagnostic before measuring an
 accidental pageable fallback.
+
+Do not use tiny tensors such as `linear_attn.dt_bias` for the storage-direct
+smoke. They are valid FLM payloads, but their byte length is below the 4 KiB
+direct-I/O block size; the probe rejects such ranges before calling hipFile.
 
 Compressed-tensors INT4 FLMs from geo-quant are tested separately through the
 portable fallback path. That path exposes logical CT INT4 weights as BF16 views

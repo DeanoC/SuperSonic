@@ -109,7 +109,11 @@ absolute FLM file range and calls the same HAL `copy_storage_to_device` boundary
 used by the virtual arena backend. On builds without hipFile support this mode
 must fail with the explicit hipFile requirement; on a ROCm 7.2+ hipFile system
 it should emit `copy_storage_to_device_*` profile fields that can be compared
-against the pageable, pinned, and registered modes.
+against the pageable, pinned, and registered modes. Because strict hipFile uses
+`O_DIRECT`, the probe rejects storage-direct ranges whose file offset or length
+is not 4 KiB aligned. Small tensors such as `linear_attn.dt_bias` remain valid
+FLM payloads, but they are not standalone tensor-granular hipFile transfer
+candidates; use block-aligned expert slabs for storage-direct bring-up.
 
 FLM itself should describe the tensor storage extents, layout ABI, direct plan,
 and integrity information. The inference engine chooses the best transfer
