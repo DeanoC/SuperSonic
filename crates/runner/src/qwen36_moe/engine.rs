@@ -566,8 +566,7 @@ fn decode_text(
         validate_qwen36_decode_weight_mode(flm.weight_mode, backend, &source_label)?;
         println!(
             "[qwen36-moe] loading weights from already-open FLM source at {} ({})",
-            source_label,
-            flm.weight_mode.display_name(),
+            source_label, flm.weight_mode_label,
         );
         (
             DecodeStore::Borrowed(&flm.source.store),

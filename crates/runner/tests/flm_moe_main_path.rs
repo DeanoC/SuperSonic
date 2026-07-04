@@ -37,8 +37,13 @@ fn assert_moe_flm_main_path_contract(combined: &str) {
         "weights were not loaded from the already-open FLM source:\n{combined}"
     );
     assert!(
-        combined.contains("[qwen36-moe] FLM weight mode: "),
+        combined.contains("[qwen36-moe] FLM weight mode: INT4 native FLM"),
         "FLM weight mode was not reported:\n{combined}"
+    );
+    assert!(
+        combined.contains("loading weights from already-open FLM source")
+            && combined.contains("(INT4 native FLM)"),
+        "native FLM source load was not labeled as native INT4:\n{combined}"
     );
     assert!(
         combined.contains("BLAKE3 hash verification enabled"),
@@ -60,6 +65,7 @@ fn assert_moe_flm_main_path_contract(combined: &str) {
         "tokenizer.json",
         "safetensors",
         ".supersonic",
+        "INT4 GPTQ",
     ] {
         assert!(
             !combined.contains(forbidden),
@@ -75,8 +81,8 @@ fn moe_flm_main_path_output_contract_accepts_expected_logs() {
 [flm] opening model source at /tmp/qwen36-35b-a3b.flm (FLM logical INT4 aliases enabled) (BLAKE3 hash verification enabled)
 [qwen36-moe] loading config from FLM runtime descriptor
 [qwen36-moe] loading tokenizer from FLM assets
-[qwen36-moe] FLM weight mode: INT4 GPTQ
-[qwen36-moe] loading weights from already-open FLM source at /tmp/qwen36-35b-a3b.flm (INT4 GPTQ)
+[qwen36-moe] FLM weight mode: INT4 native FLM
+[qwen36-moe] loading weights from already-open FLM source at /tmp/qwen36-35b-a3b.flm (INT4 native FLM)
   Generated ids: [123]
 [result] prompt_tokens=1 generated_tokens=1 decode_ms=1 ms_per_step=1.0
 ";
