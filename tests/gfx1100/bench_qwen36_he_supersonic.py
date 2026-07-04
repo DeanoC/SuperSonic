@@ -82,6 +82,14 @@ FLM_READY_RE = re.compile(
     r"\[FLM runtime weights\]\s+ready-for-decode:\s+(?P<ready>YES|NO)"
     r"(?:\s+\((?P<detail>[^\r\n)]*)\))?"
 )
+HAL_PROFILE_OP_RE = re.compile(
+    r"\[hal-profile-op\]\s+op=(?P<op>\S+)\s+"
+    r"calls=(?P<calls>\d+)\s+"
+    r"mean_ms=(?P<mean_ms>[0-9.]+)\s+"
+    r"total_ms=(?P<total_ms>[0-9.]+)\s+"
+    r"max_ms=(?P<max_ms>[0-9.]+)\s+"
+    r"total_bytes=(?P<total_bytes>\d+)"
+)
 
 
 TARGET_PROFILES = {
@@ -246,6 +254,20 @@ def parse_flm_ready_for_decode(text: str) -> dict[str, bool | str] | None:
     return result
 
 
+def parse_hal_profile_ops(text: str) -> dict[str, dict[str, float | int]] | None:
+    ops = {
+        match.group("op"): {
+            "calls": int(match.group("calls")),
+            "mean_ms": float(match.group("mean_ms")),
+            "total_ms": float(match.group("total_ms")),
+            "max_ms": float(match.group("max_ms")),
+            "total_bytes": int(match.group("total_bytes")),
+        }
+        for match in HAL_PROFILE_OP_RE.finditer(text)
+    }
+    return ops or None
+
+
 def apply_target_profile(args: argparse.Namespace) -> None:
     profile = TARGET_PROFILES[args.target_profile]
     if args.model is None:
@@ -314,6 +336,9 @@ def run_one(args: argparse.Namespace, name: str, prompt: str, warmup: bool = Fal
 
     env = os.environ.copy()
     env["SUPERSONIC_BACKENDS"] = args.backend
+    if getattr(args, "hal_profile", False):
+        # This runner hook emits gpu-hal rows as [hal-profile-op] lines.
+        env["SUPERSONIC_METAL_PROFILE"] = "1"
     if dflash_draft_gguf is not None:
         env["SUPERSONIC_DFLASH_DRAFT_GGUF"] = str(dflash_draft_gguf)
 
@@ -368,6 +393,9 @@ def run_one(args: argparse.Namespace, name: str, prompt: str, warmup: bool = Fal
         row["flm_ready_for_decode"] = flm_ready["ready"]
         if "detail" in flm_ready:
             row["flm_ready_for_decode_detail"] = flm_ready["detail"]
+    hal_profile_ops = parse_hal_profile_ops(combined)
+    if hal_profile_ops:
+        row["hal_profile_ops"] = hal_profile_ops
     if args.dflash:
         row["dflash_draft_label"] = dflash_draft_label
         row["dflash_draft_dir"] = str(dflash_draft_dir)
@@ -434,6 +462,23 @@ def build_summary(rows: list[dict]) -> dict:
             flm_direct_profiles.append(profile)
     if flm_direct_profiles:
         summary["flm_direct_profiles"] = flm_direct_profiles
+    hal_op_names = sorted(
+        {
+            op
+            for row in ok
+            for op in row.get("hal_profile_ops", {}).keys()
+            if all(op in other.get("hal_profile_ops", {}) for other in ok)
+        }
+    )
+    if hal_op_names:
+        hal_metrics = ("calls", "mean_ms", "total_ms", "max_ms", "total_bytes")
+        summary["mean_hal_profile_ops"] = {
+            op: {
+                metric: sum(row["hal_profile_ops"][op][metric] for row in ok) / len(ok)
+                for metric in hal_metrics
+            }
+            for op in hal_op_names
+        }
     return summary
 
 
@@ -495,6 +540,11 @@ def main() -> int:
         default=True,
     )
     parser.add_argument("--emit-stage-timings", action="store_true")
+    parser.add_argument(
+        "--hal-profile",
+        action="store_true",
+        help="Enable the runner HAL op dump and parse [hal-profile-op] rows into JSON.",
+    )
     parser.add_argument("--kv-fp8", action="store_true")
     parser.add_argument(
         "--allow-untested-gpu",

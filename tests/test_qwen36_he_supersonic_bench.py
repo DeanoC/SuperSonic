@@ -273,6 +273,34 @@ class BenchQwen36HeSuperSonicTests(unittest.TestCase):
             },
         )
 
+    def test_parse_hal_profile_ops(self):
+        output = (
+            "[hal-profile-op] op=copy_h2d calls=1518 mean_ms=0.5289 "
+            "total_ms=802.919 max_ms=38.764 total_bytes=17908409344\n"
+            "[hal-profile-op] op=vmm_map_no_sync calls=80 mean_ms=0.0243 "
+            "total_ms=1.942 max_ms=0.043 total_bytes=16106127360\n"
+        )
+
+        self.assertEqual(
+            bench.parse_hal_profile_ops(output),
+            {
+                "copy_h2d": {
+                    "calls": 1518,
+                    "mean_ms": 0.5289,
+                    "total_ms": 802.919,
+                    "max_ms": 38.764,
+                    "total_bytes": 17908409344,
+                },
+                "vmm_map_no_sync": {
+                    "calls": 80,
+                    "mean_ms": 0.0243,
+                    "total_ms": 1.942,
+                    "max_ms": 0.043,
+                    "total_bytes": 16106127360,
+                },
+            },
+        )
+
     def test_build_summary_includes_mean_startup_timings_when_present(self):
         rows = [
             {
@@ -314,6 +342,73 @@ class BenchQwen36HeSuperSonicTests(unittest.TestCase):
                 "bake_prepare_ms": 0.0,
                 "dry_run_ms": 5.0,
                 "pre_decode_total_ms": 155.0,
+            },
+        )
+
+    def test_build_summary_includes_mean_hal_profile_ops_when_present(self):
+        rows = [
+            {
+                "returncode": 0,
+                "tok_s": 25.0,
+                "generated_tokens": 10,
+                "decode_ms": 400.0,
+                "ms_per_step": 40.0,
+                "stopped_early": False,
+                "hal_profile_ops": {
+                    "copy_h2d": {
+                        "calls": 10,
+                        "mean_ms": 1.0,
+                        "total_ms": 10.0,
+                        "max_ms": 4.0,
+                        "total_bytes": 100,
+                    },
+                    "vmm_map_no_sync": {
+                        "calls": 2,
+                        "mean_ms": 0.5,
+                        "total_ms": 1.0,
+                        "max_ms": 0.7,
+                        "total_bytes": 200,
+                    },
+                },
+            },
+            {
+                "returncode": 0,
+                "tok_s": 50.0,
+                "generated_tokens": 20,
+                "decode_ms": 400.0,
+                "ms_per_step": 20.0,
+                "stopped_early": False,
+                "hal_profile_ops": {
+                    "copy_h2d": {
+                        "calls": 20,
+                        "mean_ms": 2.0,
+                        "total_ms": 40.0,
+                        "max_ms": 8.0,
+                        "total_bytes": 300,
+                    },
+                    "vmm_map": {
+                        "calls": 1,
+                        "mean_ms": 0.4,
+                        "total_ms": 0.4,
+                        "max_ms": 0.4,
+                        "total_bytes": 50,
+                    },
+                },
+            },
+        ]
+
+        summary = bench.build_summary(rows)
+
+        self.assertEqual(
+            summary["mean_hal_profile_ops"],
+            {
+                "copy_h2d": {
+                    "calls": 15.0,
+                    "mean_ms": 1.5,
+                    "total_ms": 25.0,
+                    "max_ms": 6.0,
+                    "total_bytes": 200.0,
+                }
             },
         )
 
@@ -409,6 +504,44 @@ class BenchQwen36HeSuperSonicTests(unittest.TestCase):
         self.assertTrue(row["stopped_early"])
         self.assertEqual(row["dflash_draft_label"], "lucebox-q8-0")
 
+    def test_run_one_hal_profile_sets_runner_profile_env(self):
+        args = types.SimpleNamespace(
+            binary=Path("target/release/supersonic"),
+            backend="hip",
+            model=None,
+            model_dir=bench.DEFAULT_35B_A3B_FLM_MODEL_DIR,
+            context_size=16,
+            warmup_new_tokens=1,
+            n_gen=1,
+            seed=1,
+            prompt_no_special_tokens=False,
+            quant="none",
+            ignore_eos=True,
+            emit_stage_timings=True,
+            kv_fp8=False,
+            dflash=False,
+            dflash_block=0,
+            dflash_draft_variant=None,
+            dflash_draft_dir=bench.DEFAULT_SUPERSONIC_DFLASH_DRAFT_DIR,
+            dflash_draft_gguf=None,
+            timeout=10,
+            tail_chars=200,
+            allow_untested_gpu=None,
+            hal_profile=True,
+        )
+        completed = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="",
+            stderr="[result] prompt_tokens=1 generated_tokens=1 decode_ms=10 ms_per_step=10\n",
+        )
+
+        with mock.patch.object(bench.subprocess, "run", return_value=completed) as run:
+            bench.run_one(args, "case", "Hello")
+
+        env = run.call_args.kwargs["env"]
+        self.assertEqual(env["SUPERSONIC_METAL_PROFILE"], "1")
+
     def test_run_one_flm_profile_omits_int4_and_records_lifecycle_timings(self):
         args = types.SimpleNamespace(
             binary=Path("target/release/supersonic"),
@@ -478,6 +611,8 @@ class BenchQwen36HeSuperSonicTests(unittest.TestCase):
                 "prefill_steps=0 prefill_embed_ms=0.000 prefill_chain_ms=0.000 "
                 "prefill_total_ms=0.000 generation_wall_ms=41.006 "
                 "total_wall_ms=6307.287\n"
+                "[hal-profile-op] op=copy_h2d calls=1518 mean_ms=0.5289 "
+                "total_ms=802.919 max_ms=38.764 total_bytes=17908409344\n"
             ),
         )
         with mock.patch.object(bench.subprocess, "run", return_value=completed) as run:
@@ -548,6 +683,18 @@ class BenchQwen36HeSuperSonicTests(unittest.TestCase):
                 "prefill_total_ms": 0.0,
                 "generation_wall_ms": 41.006,
                 "total_wall_ms": 6307.287,
+            },
+        )
+        self.assertEqual(
+            row["hal_profile_ops"],
+            {
+                "copy_h2d": {
+                    "calls": 1518,
+                    "mean_ms": 0.5289,
+                    "total_ms": 802.919,
+                    "max_ms": 38.764,
+                    "total_bytes": 17908409344,
+                }
             },
         )
 
