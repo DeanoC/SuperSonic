@@ -15,7 +15,7 @@ pub use flm::{
     FlmTokenizerDescriptor,
 };
 pub use store::{
-    read_flm_runtime_identity, BakedStore, FlmLoadOptions, TensorStorageExtent,
+    read_flm_runtime_identity, BakedStore, FlmLoadOptions, TensorStorageExtent, TensorStorageRange,
     TensorStorageSourceKind,
 };
 

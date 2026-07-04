@@ -194,6 +194,18 @@ pub struct TensorStorageExtent {
     pub upload_shape: Vec<usize>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TensorStorageRange {
+    /// Full direct file-backed tensor extent this range comes from.
+    pub extent: TensorStorageExtent,
+    /// Byte offset inside the tensor payload.
+    pub tensor_byte_offset: u64,
+    /// Absolute byte offset in the source file for this range.
+    pub file_offset: u64,
+    /// Number of bytes in this range.
+    pub byte_len: u64,
+}
+
 pub struct BakedStore {
     _mmap: Mmap,
     data: *const u8,
@@ -1871,6 +1883,60 @@ impl BakedStore {
         }))
     }
 
+    /// Return the concrete file range for a direct tensor subrange.
+    ///
+    /// Virtual allocation loaders use this as the source-side transfer
+    /// descriptor: current backends copy from the mmap, while future
+    /// storage-to-GPU backends can use `file_offset` and `byte_len` directly.
+    pub fn tensor_storage_range(
+        &self,
+        name: &str,
+        byte_offset: usize,
+        byte_len: usize,
+    ) -> Result<Option<TensorStorageRange>, Error> {
+        let Some(extent) = self.tensor_storage_extent(name)? else {
+            return Ok(None);
+        };
+        let tensor_byte_offset = u64::try_from(byte_offset).map_err(|_| {
+            Error::Other(format!(
+                "tensor '{name}' storage range offset does not fit u64: {byte_offset}"
+            ))
+        })?;
+        let byte_len_u64 = u64::try_from(byte_len).map_err(|_| {
+            Error::Other(format!(
+                "tensor '{name}' storage range length does not fit u64: {byte_len}"
+            ))
+        })?;
+        let range_end = tensor_byte_offset
+            .checked_add(byte_len_u64)
+            .ok_or_else(|| {
+                Error::Other(format!(
+                    "tensor '{name}' storage range overflows: offset={byte_offset} len={byte_len}"
+                ))
+            })?;
+        if range_end > extent.byte_len {
+            return Err(Error::Other(format!(
+                "tensor '{name}' storage range [{byte_offset}, {range_end}) exceeds byte_len={}",
+                extent.byte_len
+            )));
+        }
+        let file_offset = extent
+            .file_offset
+            .checked_add(tensor_byte_offset)
+            .ok_or_else(|| {
+                Error::Other(format!(
+                    "tensor '{name}' storage range file offset overflows: base={} offset={byte_offset}",
+                    extent.file_offset
+                ))
+            })?;
+        Ok(Some(TensorStorageRange {
+            extent,
+            tensor_byte_offset,
+            file_offset,
+            byte_len: byte_len_u64,
+        }))
+    }
+
     /// Load a tensor from the baked store to GPU memory.
     /// Direct tensors borrow mmap bytes; transformed FLM logical aliases
     /// materialize a temporary host fallback payload before upload.
@@ -1989,39 +2055,39 @@ impl BakedStore {
         name: &str,
         role: VirtualAllocationRole,
     ) -> Result<usize, Error> {
-        let meta = self
-            .index
-            .get(name)
-            .ok_or_else(|| Error::NotFound(name.to_string()))?;
         if self.ct_int4_bf16_fallbacks.contains_key(name) {
             return Err(Error::Other(format!(
                 "tensor '{name}' is a transformed FLM logical alias and cannot be reserved in a virtual arena"
             )));
         }
-        let slice = self.tensor_bytes(name, meta)?;
-        let dtype = parse_dtype(&meta.dtype)?;
-        let expected_len = meta
-            .shape
+        let extent = self.tensor_storage_extent(name)?.ok_or_else(|| {
+            Error::Other(format!(
+                "tensor '{name}' is not a direct file-backed extent and cannot be reserved in a virtual arena"
+            ))
+        })?;
+        let dtype = parse_dtype(&extent.storage_dtype)?;
+        let expected_len = extent
+            .storage_shape
             .iter()
             .try_fold(dtype.size_in_bytes(), |acc, dim| acc.checked_mul(*dim))
             .ok_or_else(|| {
                 Error::Other(format!(
                     "tensor '{}' shape {:?} overflows byte-size calculation",
-                    name, meta.shape
+                    name, extent.storage_shape
                 ))
             })?;
-        if slice.len() != expected_len {
+        if extent.byte_len != expected_len as u64 {
             return Err(Error::Other(format!(
                 "tensor '{}' manifest byte_len={} does not match dtype={} shape={:?} expected_bytes={}",
                 name,
-                slice.len(),
-                meta.dtype,
-                meta.shape,
+                extent.byte_len,
+                extent.storage_dtype,
+                extent.storage_shape,
                 expected_len,
             )));
         }
         arena
-            .reserve(name.to_string(), role, dtype, &meta.shape)
+            .reserve(name.to_string(), role, dtype, &extent.storage_shape)
             .map_err(Error::from)
     }
 
@@ -2035,50 +2101,47 @@ impl BakedStore {
         byte_offset: usize,
         byte_len: usize,
     ) -> Result<(), Error> {
-        let meta = self
-            .index
-            .get(name)
-            .ok_or_else(|| Error::NotFound(name.to_string()))?;
-        if self.ct_int4_bf16_fallbacks.contains_key(name) {
-            return Err(Error::Other(format!(
-                "tensor '{name}' is a transformed FLM logical alias and cannot be range-loaded into a virtual arena"
-            )));
-        }
-        let range_end = byte_offset.checked_add(byte_len).ok_or_else(|| {
+        let transfer_range = self.tensor_storage_range(name, byte_offset, byte_len)?.ok_or_else(|| {
             Error::Other(format!(
-                "tensor '{name}' load range overflows: offset={byte_offset} len={byte_len}"
+                "tensor '{name}' is not a direct file-backed extent and cannot be range-loaded into a virtual arena"
             ))
         })?;
-        if range_end > meta.byte_len as usize {
-            return Err(Error::Other(format!(
-                "tensor '{name}' load range [{byte_offset}, {range_end}) exceeds byte_len={}",
-                meta.byte_len
-            )));
-        }
-        let src_bytes = self.tensor_bytes(name, meta)?;
-
-        let dtype = parse_dtype(&meta.dtype)?;
+        let dtype = parse_dtype(&transfer_range.extent.storage_dtype)?;
         let ordinal = arena.device_ordinal();
         let allocation = arena.allocation_mut(allocation_id).ok_or_else(|| {
             Error::Other(format!("virtual allocation id {allocation_id} missing"))
         })?;
         let buffer = allocation.buffer_mut();
-        if buffer.dtype() != dtype || buffer.shape() != meta.shape.as_slice() {
+        if buffer.dtype() != dtype
+            || buffer.shape() != transfer_range.extent.storage_shape.as_slice()
+        {
             return Err(Error::Other(format!(
                 "virtual allocation id {allocation_id} does not match tensor '{name}' \
                  (allocation dtype={:?} shape={:?}, tensor dtype={} shape={:?})",
                 buffer.dtype(),
                 buffer.shape(),
-                meta.dtype,
-                meta.shape
+                transfer_range.extent.storage_dtype,
+                transfer_range.extent.storage_shape
             )));
         }
+        let src_byte_offset = u64_to_usize(
+            transfer_range.tensor_byte_offset,
+            "virtual arena source byte offset",
+        )?;
+        let src_byte_len =
+            u64_to_usize(transfer_range.byte_len, "virtual arena source byte length")?;
+        let src_bytes = self.raw_byte_range(name, src_byte_offset, src_byte_len)?;
         // The source tensor bytes are copied into the mapped range before the
         // allocation is observed as loaded, so clearing new pages first only
         // adds startup bandwidth.
-        buffer.map_range_bytes_no_sync(byte_offset, byte_len)?;
-        let src = unsafe { src_bytes.as_ptr().add(byte_offset) as *const _ };
-        copy_h2d(ordinal, buffer.offset_mut_ptr(byte_offset), src, byte_len)?;
+        buffer.map_range_bytes_no_sync(byte_offset, src_byte_len)?;
+        let src = src_bytes.as_ptr() as *const _;
+        copy_h2d(
+            ordinal,
+            buffer.offset_mut_ptr(byte_offset),
+            src,
+            src_byte_len,
+        )?;
         sync(ordinal)?;
         Ok(())
     }
@@ -3953,6 +4016,42 @@ mod tests {
     }
 
     #[test]
+    fn open_flm_exposes_file_storage_range_for_direct_tensor_slice() {
+        let data = build_test_flm(&[TestFlmTensor {
+            name: "model.norm.weight",
+            shape: vec![4],
+            dtype: 2,
+            codec: 0,
+            payload: vec![0x00, 0x3f, 0x00, 0x40, 0x00, 0x41, 0x00, 0x42],
+        }]);
+        let file = write_temp_flm(&data);
+        let store = BakedStore::open_flm(file.path()).expect("open FLM");
+        let meta = store.meta("model.norm.weight").expect("norm meta");
+
+        let range = store
+            .tensor_storage_range("model.norm.weight", 2, 4)
+            .expect("storage range")
+            .expect("direct FLM tensor slice should expose a file range");
+
+        assert_eq!(
+            range.extent.source_kind,
+            TensorStorageSourceKind::FlmContainer
+        );
+        assert_eq!(range.extent.source_path, file.path());
+        assert_eq!(range.extent.name, "model.norm.weight");
+        assert_eq!(range.extent.file_offset, meta.offset);
+        assert_eq!(range.extent.byte_len, meta.byte_len);
+        assert_eq!(range.tensor_byte_offset, 2);
+        assert_eq!(range.byte_len, 4);
+        assert_eq!(range.file_offset, meta.offset + 2);
+        assert_eq!(range.extent.storage_dtype, "bf16");
+        assert_eq!(range.extent.storage_shape, vec![4]);
+        assert_eq!(range.extent.layout, LayoutTag::Raw);
+        assert_eq!(range.extent.upload_dtype, "bf16");
+        assert_eq!(range.extent.upload_shape, vec![4]);
+    }
+
+    #[test]
     fn host_registration_range_is_bounded_by_page_rounded_mmap() {
         let range = host_registration_range_for_mmap_slice(0x1000, 0x2500, 0x2234, 0x40, 4096)
             .expect("registration range");
@@ -4411,6 +4510,37 @@ mod tests {
     }
 
     #[test]
+    fn open_flm_rejects_virtual_arena_for_synthesized_manifest_alias() {
+        let data = build_test_flm_with_runtime_manifest_group();
+        let file = write_temp_flm(&data);
+
+        let store = BakedStore::open_flm_with_options(
+            file.path(),
+            crate::store::FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                ..Default::default()
+            },
+        )
+        .expect("open FLM with manifest aliases");
+
+        let mut arena = BakedStore::virtual_weight_arena(0);
+        let err = store
+            .reserve_virtual_arena(
+                &mut arena,
+                "model.language_model.layers.0.mlp.gate_proj.weight_int4_zero",
+                VirtualAllocationRole::Weights,
+            )
+            .expect_err("synthetic aliases must not reserve virtual direct storage")
+            .to_string();
+
+        assert!(
+            err.contains("not a direct file-backed extent"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(arena.stats().allocations, 0);
+    }
+
+    #[test]
     fn open_flm_builds_raw_fp32_value_alias_from_stage3_binding() {
         let data = build_test_flm_with_stage3_raw_value_binding();
         let file = write_temp_flm(&data);
@@ -4777,6 +4907,29 @@ mod tests {
                 .raw_bytes("model.language_model.layers.0.mlp.gate_proj.weight_int4_zero")
                 .unwrap(),
             vec![0x00, 0x41].repeat(128).as_slice()
+        );
+        assert!(store
+            .tensor_storage_range("model.language_model.layers.0.mlp.gate_proj.weight", 0, 64)
+            .expect("packed alias storage range")
+            .is_some());
+        assert!(store
+            .tensor_storage_range(
+                "model.language_model.layers.0.mlp.gate_proj.weight_int4_scale",
+                0,
+                64,
+            )
+            .expect("scale alias storage range")
+            .is_some());
+        assert!(
+            store
+                .tensor_storage_range(
+                    "model.language_model.layers.0.mlp.gate_proj.weight_int4_zero",
+                    0,
+                    64,
+                )
+                .expect("synthetic zero storage range")
+                .is_none(),
+            "synthesized zero aliases must not expose direct file-backed transfer ranges"
         );
     }
 
