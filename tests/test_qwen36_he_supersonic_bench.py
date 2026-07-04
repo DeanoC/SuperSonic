@@ -461,7 +461,20 @@ class BenchQwen36HeSuperSonicTests(unittest.TestCase):
                 "flm_tokenizer_parse_merges_ms=5.000 "
                 "flm_tokenizer_parse_added_tokens_ms=0.250 "
                 "flm_tokenizer_parse_regex_ms=0.125 "
-                "model_source_ms=0.009 layer_load_ms=5744.555 session_ms=466.101 "
+                "model_source_ms=0.009 layer_load_ms=5744.555 "
+                "layer_load_buffers_ms=5400.000 "
+                "layer_load_vmm_setup_ms=10.000 "
+                "layer_load_prewarm_ms=0.000 "
+                "layer_load_hal_ms=4500.000 "
+                "layer_load_alloc_ms=1200.000 "
+                "layer_load_copy_h_to_d_ms=3000.000 "
+                "layer_load_memset_ms=100.000 "
+                "layer_load_vmm_ms=200.000 "
+                "layer_load_alloc_bytes=123456 "
+                "layer_load_copy_h_to_d_bytes=654321 "
+                "layer_load_memset_bytes=4096 "
+                "layer_load_vmm_bytes=8192 "
+                "session_ms=466.101 "
                 "prefill_steps=0 prefill_embed_ms=0.000 prefill_chain_ms=0.000 "
                 "prefill_total_ms=0.000 generation_wall_ms=41.006 "
                 "total_wall_ms=6307.287\n"
@@ -516,6 +529,18 @@ class BenchQwen36HeSuperSonicTests(unittest.TestCase):
                 "flm_tokenizer_parse_regex_ms": 0.125,
                 "model_source_ms": 0.009,
                 "layer_load_ms": 5744.555,
+                "layer_load_buffers_ms": 5400.0,
+                "layer_load_vmm_setup_ms": 10.0,
+                "layer_load_prewarm_ms": 0.0,
+                "layer_load_hal_ms": 4500.0,
+                "layer_load_alloc_ms": 1200.0,
+                "layer_load_copy_h_to_d_ms": 3000.0,
+                "layer_load_memset_ms": 100.0,
+                "layer_load_vmm_ms": 200.0,
+                "layer_load_alloc_bytes": 123456.0,
+                "layer_load_copy_h_to_d_bytes": 654321.0,
+                "layer_load_memset_bytes": 4096.0,
+                "layer_load_vmm_bytes": 8192.0,
                 "session_ms": 466.101,
                 "prefill_steps": 0.0,
                 "prefill_embed_ms": 0.0,

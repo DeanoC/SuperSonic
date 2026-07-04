@@ -46,7 +46,7 @@ use crate::qwen36_moe_cli::spec_verify::{run_speculative_extension, Qwen36Specul
 use crate::qwen36_moe_cli::timing::{Qwen36StageTimingTotals, SamplingParams};
 use crate::qwen36_moe_cli::vmm::{
     load_decode_layers_with_vmm_strategy, print_virtual_kv_stats_if_active,
-    virtual_kv_stats_for_layers,
+    virtual_kv_stats_for_layers, Qwen36LayerLoadTimings,
 };
 use crate::qwen36_moe_cli::vmm_config::{prepare_moe_runtime_config, should_use_qwen36_kv_vmm};
 use crate::qwen36_moe_logits::XorshiftRng;
@@ -275,6 +275,7 @@ struct Qwen36LifecycleTimings {
     flm_tokenizer_build: std::time::Duration,
     model_source: std::time::Duration,
     layer_load: std::time::Duration,
+    layer_load_profile: Qwen36LayerLoadTimings,
     session: std::time::Duration,
     prefill_steps: usize,
     prefill_embed: std::time::Duration,
@@ -299,7 +300,13 @@ fn format_qwen36_lifecycle_timings(timings: &Qwen36LifecycleTimings) -> String {
          flm_tokenizer_parse_added_tokens_ms={:.3} \
          flm_tokenizer_parse_regex_ms={:.3} \
          flm_tokenizer_build_ms={:.3} model_source_ms={:.3} \
-         layer_load_ms={:.3} session_ms={:.3} prefill_steps={} \
+         layer_load_ms={:.3} layer_load_buffers_ms={:.3} \
+         layer_load_vmm_setup_ms={:.3} layer_load_prewarm_ms={:.3} \
+         layer_load_hal_ms={:.3} layer_load_alloc_ms={:.3} \
+         layer_load_copy_h_to_d_ms={:.3} layer_load_memset_ms={:.3} \
+         layer_load_vmm_ms={:.3} layer_load_alloc_bytes={} \
+         layer_load_copy_h_to_d_bytes={} layer_load_memset_bytes={} \
+         layer_load_vmm_bytes={} session_ms={:.3} prefill_steps={} \
          prefill_embed_ms={:.3} prefill_chain_ms={:.3} \
          prefill_total_ms={:.3} generation_wall_ms={:.3} total_wall_ms={:.3}",
         qwen36_duration_ms(timings.prompt_setup),
@@ -314,6 +321,18 @@ fn format_qwen36_lifecycle_timings(timings: &Qwen36LifecycleTimings) -> String {
         qwen36_duration_ms(timings.flm_tokenizer_build),
         qwen36_duration_ms(timings.model_source),
         qwen36_duration_ms(timings.layer_load),
+        qwen36_duration_ms(timings.layer_load_profile.buffers),
+        qwen36_duration_ms(timings.layer_load_profile.vmm_setup),
+        qwen36_duration_ms(timings.layer_load_profile.prewarm),
+        qwen36_duration_ms(timings.layer_load_profile.hal_total),
+        qwen36_duration_ms(timings.layer_load_profile.hal_alloc),
+        qwen36_duration_ms(timings.layer_load_profile.hal_copy_h_to_d),
+        qwen36_duration_ms(timings.layer_load_profile.hal_memset),
+        qwen36_duration_ms(timings.layer_load_profile.hal_vmm),
+        timings.layer_load_profile.hal_alloc_bytes,
+        timings.layer_load_profile.hal_copy_h_to_d_bytes,
+        timings.layer_load_profile.hal_memset_bytes,
+        timings.layer_load_profile.hal_vmm_bytes,
         qwen36_duration_ms(timings.session),
         timings.prefill_steps,
         qwen36_duration_ms(timings.prefill_embed),
@@ -322,6 +341,44 @@ fn format_qwen36_lifecycle_timings(timings: &Qwen36LifecycleTimings) -> String {
         timings.generation_wall.unwrap_or(0.0),
         qwen36_duration_ms(timings.total_wall),
     )
+}
+
+fn qwen36_layer_load_hal_timings(snapshot: &gpu_hal::HalProfileSnapshot) -> Qwen36LayerLoadTimings {
+    let mut timings = Qwen36LayerLoadTimings {
+        hal_total: std::time::Duration::from_secs_f64(snapshot.total_ms / 1000.0),
+        hal_alloc_bytes: snapshot.alloc_bytes,
+        hal_copy_h_to_d_bytes: snapshot.h2d_bytes,
+        hal_memset_bytes: snapshot.memset_bytes,
+        ..Default::default()
+    };
+
+    for entry in &snapshot.entries {
+        let duration = std::time::Duration::from_secs_f64(entry.total_ms / 1000.0);
+        match entry.op.as_str() {
+            "alloc" => timings.hal_alloc += duration,
+            "copy_h2d" => timings.hal_copy_h_to_d += duration,
+            "memset_zeros" => timings.hal_memset += duration,
+            op if op.starts_with("vmm_") => {
+                timings.hal_vmm += duration;
+                timings.hal_vmm_bytes += entry.total_bytes;
+            }
+            _ => {}
+        }
+    }
+
+    timings
+}
+
+fn qwen36_should_profile_layer_load_hal(
+    emit_stage_timings: bool,
+    external_hal_profile_active: bool,
+) -> bool {
+    emit_stage_timings && !external_hal_profile_active
+}
+
+fn qwen36_external_hal_profile_env_active() -> bool {
+    std::env::var_os("SUPERSONIC_HAL_PROFILE").is_some()
+        || std::env::var_os("SUPERSONIC_METAL_PROFILE").is_some()
 }
 
 #[cfg(test)]
@@ -398,6 +455,20 @@ mod tests {
             flm_tokenizer_build: std::time::Duration::from_micros(325),
             model_source: std::time::Duration::from_micros(1_500),
             layer_load: std::time::Duration::from_micros(2_500),
+            layer_load_profile: Qwen36LayerLoadTimings {
+                buffers: std::time::Duration::from_micros(1_100),
+                vmm_setup: std::time::Duration::from_micros(200),
+                prewarm: std::time::Duration::from_micros(300),
+                hal_total: std::time::Duration::from_micros(1_000),
+                hal_alloc: std::time::Duration::from_micros(400),
+                hal_copy_h_to_d: std::time::Duration::from_micros(500),
+                hal_memset: std::time::Duration::from_micros(50),
+                hal_vmm: std::time::Duration::from_micros(50),
+                hal_alloc_bytes: 1_024,
+                hal_copy_h_to_d_bytes: 2_048,
+                hal_memset_bytes: 512,
+                hal_vmm_bytes: 4_096,
+            },
             session: std::time::Duration::from_micros(3_500),
             prefill_steps: 2,
             prefill_embed: std::time::Duration::from_micros(100),
@@ -416,11 +487,92 @@ mod tests {
              flm_tokenizer_parse_added_tokens_ms=0.050 \
              flm_tokenizer_parse_regex_ms=0.025 \
              flm_tokenizer_build_ms=0.325 model_source_ms=1.500 \
-             layer_load_ms=2.500 session_ms=3.500 prefill_steps=2 \
+             layer_load_ms=2.500 layer_load_buffers_ms=1.100 \
+             layer_load_vmm_setup_ms=0.200 layer_load_prewarm_ms=0.300 \
+             layer_load_hal_ms=1.000 layer_load_alloc_ms=0.400 \
+             layer_load_copy_h_to_d_ms=0.500 layer_load_memset_ms=0.050 \
+             layer_load_vmm_ms=0.050 layer_load_alloc_bytes=1024 \
+             layer_load_copy_h_to_d_bytes=2048 layer_load_memset_bytes=512 \
+             layer_load_vmm_bytes=4096 session_ms=3.500 prefill_steps=2 \
              prefill_embed_ms=0.100 prefill_chain_ms=0.200 \
              prefill_total_ms=0.300 generation_wall_ms=4.500 \
              total_wall_ms=9.000"
         );
+    }
+
+    #[test]
+    fn layer_load_hal_timings_group_transfer_and_vmm_ops() {
+        let snapshot = gpu_hal::HalProfileSnapshot {
+            total_calls: 5,
+            total_ms: 7.0,
+            alloc_calls: 1,
+            alloc_bytes: 1_024,
+            free_calls: 0,
+            h2d_bytes: 2_048,
+            d2h_bytes: 0,
+            d2d_bytes: 0,
+            memset_bytes: 512,
+            sync_calls: 0,
+            entries: vec![
+                gpu_hal::HalProfileEntry {
+                    op: "alloc".to_string(),
+                    calls: 1,
+                    total_ms: 1.5,
+                    max_ms: 1.5,
+                    total_bytes: 1_024,
+                },
+                gpu_hal::HalProfileEntry {
+                    op: "copy_h2d".to_string(),
+                    calls: 1,
+                    total_ms: 2.5,
+                    max_ms: 2.5,
+                    total_bytes: 2_048,
+                },
+                gpu_hal::HalProfileEntry {
+                    op: "memset_zeros".to_string(),
+                    calls: 1,
+                    total_ms: 0.75,
+                    max_ms: 0.75,
+                    total_bytes: 512,
+                },
+                gpu_hal::HalProfileEntry {
+                    op: "vmm_reserve".to_string(),
+                    calls: 1,
+                    total_ms: 1.0,
+                    max_ms: 1.0,
+                    total_bytes: 3_000,
+                },
+                gpu_hal::HalProfileEntry {
+                    op: "vmm_map".to_string(),
+                    calls: 1,
+                    total_ms: 1.25,
+                    max_ms: 1.25,
+                    total_bytes: 1_096,
+                },
+            ],
+        };
+
+        let timings = qwen36_layer_load_hal_timings(&snapshot);
+
+        assert_eq!(timings.hal_total, std::time::Duration::from_micros(7_000));
+        assert_eq!(timings.hal_alloc, std::time::Duration::from_micros(1_500));
+        assert_eq!(
+            timings.hal_copy_h_to_d,
+            std::time::Duration::from_micros(2_500)
+        );
+        assert_eq!(timings.hal_memset, std::time::Duration::from_micros(750));
+        assert_eq!(timings.hal_vmm, std::time::Duration::from_micros(2_250));
+        assert_eq!(timings.hal_alloc_bytes, 1_024);
+        assert_eq!(timings.hal_copy_h_to_d_bytes, 2_048);
+        assert_eq!(timings.hal_memset_bytes, 512);
+        assert_eq!(timings.hal_vmm_bytes, 4_096);
+    }
+
+    #[test]
+    fn layer_load_hal_profile_only_enables_for_isolated_stage_timings() {
+        assert!(qwen36_should_profile_layer_load_hal(true, false));
+        assert!(!qwen36_should_profile_layer_load_hal(false, false));
+        assert!(!qwen36_should_profile_layer_load_hal(true, true));
     }
 }
 
@@ -862,7 +1014,15 @@ fn decode_text(
         true,
     );
     let layer_load_start = std::time::Instant::now();
-    let loaded_layers = load_decode_layers_with_vmm_strategy(
+    let profile_layer_load_hal = qwen36_should_profile_layer_load_hal(
+        emit_stage_timings,
+        qwen36_external_hal_profile_env_active(),
+    );
+    if profile_layer_load_hal {
+        gpu_hal::hal_profile_set_enabled(true);
+        gpu_hal::hal_profile_reset();
+    }
+    let loaded_layers = match load_decode_layers_with_vmm_strategy(
         &store,
         ordinal,
         backend,
@@ -885,10 +1045,44 @@ fn decode_text(
         moe_runtime.prefetch_evict,
         moe_runtime.prefetch_evict_min_probability,
         persistent_decode,
-    )?;
+    ) {
+        Ok(loaded_layers) => loaded_layers,
+        Err(err) => {
+            if profile_layer_load_hal {
+                gpu_hal::hal_profile_set_enabled(false);
+            }
+            return Err(err);
+        }
+    };
     let mut layers = loaded_layers.layers;
-    let _ffn_prewarm_elapsed =
-        prewarm_qwen36_mps_static_topn_if_requested(ordinal, backend, &geom, &mut layers)?;
+    let mut layer_load_profile = loaded_layers.timings;
+    let ffn_prewarm_elapsed =
+        match prewarm_qwen36_mps_static_topn_if_requested(ordinal, backend, &geom, &mut layers) {
+            Ok(elapsed) => elapsed,
+            Err(err) => {
+                if profile_layer_load_hal {
+                    gpu_hal::hal_profile_set_enabled(false);
+                }
+                return Err(err);
+            }
+        };
+    layer_load_profile.prewarm = ffn_prewarm_elapsed;
+    if profile_layer_load_hal {
+        let hal_timings = qwen36_layer_load_hal_timings(&gpu_hal::hal_profile_snapshot());
+        layer_load_profile = Qwen36LayerLoadTimings {
+            hal_total: hal_timings.hal_total,
+            hal_alloc: hal_timings.hal_alloc,
+            hal_copy_h_to_d: hal_timings.hal_copy_h_to_d,
+            hal_memset: hal_timings.hal_memset,
+            hal_vmm: hal_timings.hal_vmm,
+            hal_alloc_bytes: hal_timings.hal_alloc_bytes,
+            hal_copy_h_to_d_bytes: hal_timings.hal_copy_h_to_d_bytes,
+            hal_memset_bytes: hal_timings.hal_memset_bytes,
+            hal_vmm_bytes: hal_timings.hal_vmm_bytes,
+            ..layer_load_profile
+        };
+        gpu_hal::hal_profile_set_enabled(false);
+    }
     let layer_load_elapsed = layer_load_start.elapsed();
     let _moe_expert_arena = loaded_layers.moe_expert_arena;
     let mut _moe_expert_residency = loaded_layers.moe_expert_residency;
@@ -1463,6 +1657,7 @@ fn decode_text(
             flm_tokenizer_build: flm_tokenizer_timings.build,
             model_source: model_source_elapsed,
             layer_load: layer_load_elapsed,
+            layer_load_profile,
             session: session_elapsed,
             prefill_steps,
             prefill_embed: prefill_embed_elapsed,
