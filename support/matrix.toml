@@ -29,6 +29,21 @@ support_doc = "docs/supported-matrix.md#hip-on-gfx1100"
 notes = "BF16 is intentionally unsupported for the FP8-native checkpoint. The Markdown matrix documents the INT4 lane, but this manifest keeps it experimental until a named gfx1100 35B gate exists."
 
 [[entry]]
+id = "hip-gfx1100-qwen36-35b-a3b-flm-int4"
+backend = "hip"
+arch = "gfx1100"
+status = "experimental"
+models = ["qwen3.6-35b-a3b"]
+quants = ["int4"]
+model_sources = ["flm"]
+support_doc = "docs/supported-matrix.md#hip-on-gfx1100"
+gate_commands = [
+  "SUPERSONIC_QWEN36_35B_A3B_NO_HF_FLM=/mnt/data/tmp/flm-first-class-e2e-20260704/qwen36-35b-a3b-supersonic-native-int4-aligned.flm cargo test -q -p runner --test flm_moe_main_path -- --nocapture",
+]
+benchmark_doc = "docs/testing.md#flm-main-path-smoke"
+notes = "First-class no-HF FLM lane: model identity, tokenizer, direct native INT4 weight mode, and load/decode timing come from the FLM artifact rather than HF sidecars or --int4."
+
+[[entry]]
 id = "hip-gfx1201-qwen35-tbm"
 backend = "hip"
 arch = "gfx1201"
