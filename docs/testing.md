@@ -99,9 +99,9 @@ HIP decode path. Validate the native SuperSonic-layout artifact with
 geo-quant's no-HF profile first:
 
 ```bash
-PYTHONPATH=/home/deano/.config/superpowers/worktrees/geo-quant/flm-first-class-path \
-  /home/deano/projects/geo-quant/.venv-rocm/bin/python \
-  /home/deano/.config/superpowers/worktrees/geo-quant/flm-first-class-path/scripts/flm_validate.py \
+cd /home/deano/.config/superpowers/worktrees/geo-quant/flm-direct-io-alignment
+/home/deano/projects/geo-quant/.venv-rocm/bin/python \
+  -m geoquant.formats.flm_validate \
   /mnt/data/tmp/flm-first-class-e2e-20260704/qwen36-35b-a3b-supersonic-native-int4-aligned.flm \
   --profile runnable-no-hf \
   --verify-payload-hashes
