@@ -89,9 +89,10 @@ use policy::{
 };
 use profiling::MetalProfileScope;
 use qwen35_runtime::run_qwen35;
-use registry::{ModelFamily, ModelVariant};
+use registry::ModelFamily;
 use supersonic_core::backend::{BackendChoice, BACKEND_CHOICES};
 fn main() -> Result<()> {
+    let model_arg_present = bakes::cli_args_include_model(std::env::args_os());
     let cli = Cli::parse();
     let _metal_profile_scope = MetalProfileScope::new();
     let ordinal = cli.device;
@@ -105,14 +106,8 @@ fn main() -> Result<()> {
     let backend = resolve_backend(backend_choice, ordinal)?;
     gpu_hal::set_backend(backend);
 
-    // 1. Parse model variant
-    let model_variant = ModelVariant::from_cli_str(&cli.model).ok_or_else(|| {
-        anyhow::anyhow!(
-            "Unknown model '{}'. Supported models: {}",
-            cli.model,
-            registry::supported_models_list().join(", ")
-        )
-    })?;
+    // 1. Resolve model variant from explicit CLI choice or a self-contained FLM descriptor.
+    let model_variant = bakes::resolve_model_variant(&cli, model_arg_present)?;
 
     validate_global_flags(&cli, &model_variant, backend)?;
     let q4km_like = q4km_like(&cli);

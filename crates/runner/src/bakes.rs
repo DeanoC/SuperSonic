@@ -1,4 +1,5 @@
 use std::env;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -178,6 +179,74 @@ pub(crate) fn effective_flm_source(cli: &Cli) -> Option<&Path> {
     cli.flm_file
         .as_deref()
         .or_else(|| is_flm_model_path(&cli.model_dir).then_some(cli.model_dir.as_path()))
+}
+
+pub(crate) fn cli_args_include_model<I, S>(args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    args.into_iter().any(|arg| {
+        let arg = arg.as_ref();
+        arg == OsStr::new("--model")
+            || arg
+                .to_str()
+                .map(|arg| arg.starts_with("--model="))
+                .unwrap_or(false)
+    })
+}
+
+fn parse_cli_model_variant(model: &str) -> Result<ModelVariant> {
+    ModelVariant::from_cli_str(model).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Unknown model '{}'. Supported models: {}",
+            model,
+            crate::registry::supported_models_list().join(", ")
+        )
+    })
+}
+
+pub(crate) fn model_variant_from_flm_identity(
+    identity: model_store::FlmRuntimeIdentity,
+) -> Option<ModelVariant> {
+    match (identity.architecture_id, identity.model_id) {
+        (model_store::flm::ARCH_QWEN3_6_DENSE, model_store::flm::MODEL_QWEN3_6_DENSE_V1) => {
+            Some(ModelVariant::Qwen3_6_27B)
+        }
+        (model_store::flm::ARCH_QWEN3_6_MOE, model_store::flm::MODEL_QWEN3_6_MOE_V1) => {
+            Some(ModelVariant::Qwen3_6_35B_A3B)
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn resolve_model_variant(cli: &Cli, model_arg_present: bool) -> Result<ModelVariant> {
+    if model_arg_present {
+        return parse_cli_model_variant(&cli.model);
+    }
+
+    if let Some(flm_source) = effective_flm_source(cli) {
+        let identity = model_store::read_flm_runtime_identity(flm_source)
+            .map_err(|e| anyhow::anyhow!("read FLM runtime identity: {e}"))?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "FLM source {} has no runtime descriptor; pass --model explicitly",
+                    flm_source.display()
+                )
+            })?;
+        let model_variant = model_variant_from_flm_identity(identity).ok_or_else(|| {
+            anyhow::anyhow!(
+                "FLM source {} has unsupported runtime identity architecture_id={} model_id={}",
+                flm_source.display(),
+                identity.architecture_id,
+                identity.model_id
+            )
+        })?;
+        eprintln!("[flm] inferred model {model_variant} from runtime descriptor");
+        return Ok(model_variant);
+    }
+
+    parse_cli_model_variant(&cli.model)
 }
 
 pub(crate) fn flm_source_is_authoritative_for_model(
@@ -536,10 +605,10 @@ mod tests {
     use model_store::manifest::QuantProfile;
 
     use super::{
-        effective_flm_source, effective_quant_profile, ensure_hf_metadata_present,
-        flm_source_is_authoritative_for_model, flm_source_open_options, should_fetch_bake,
-        should_fetch_exact_bake, validate_effective_flm_source_model,
-        validate_flm_weight_source_options,
+        cli_args_include_model, effective_flm_source, effective_quant_profile,
+        ensure_hf_metadata_present, flm_source_is_authoritative_for_model, flm_source_open_options,
+        model_variant_from_flm_identity, should_fetch_bake, should_fetch_exact_bake,
+        validate_effective_flm_source_model, validate_flm_weight_source_options,
     };
     use crate::registry::ModelVariant;
     use crate::Cli;
@@ -554,6 +623,53 @@ mod tests {
         let mut args = vec!["supersonic", "--model-dir", model_dir, "--dry-run"];
         args.extend_from_slice(extra);
         Cli::parse_from(args)
+    }
+
+    #[test]
+    fn cli_args_include_model_detects_separate_and_equals_forms() {
+        assert!(cli_args_include_model([
+            "supersonic",
+            "--model",
+            "qwen3.6-27b"
+        ]));
+        assert!(cli_args_include_model([
+            "supersonic",
+            "--model=qwen3.6-35b-a3b"
+        ]));
+        assert!(!cli_args_include_model([
+            "supersonic",
+            "--model-dir",
+            "/tmp/model.flm"
+        ]));
+    }
+
+    #[test]
+    fn flm_runtime_identity_selects_model_variant() {
+        assert_eq!(
+            model_variant_from_flm_identity(model_store::FlmRuntimeIdentity {
+                architecture_id: model_store::flm::ARCH_QWEN3_6_DENSE,
+                model_id: model_store::flm::MODEL_QWEN3_6_DENSE_V1,
+            }),
+            Some(ModelVariant::Qwen3_6_27B)
+        );
+        assert_eq!(
+            model_variant_from_flm_identity(model_store::FlmRuntimeIdentity {
+                architecture_id: model_store::flm::ARCH_QWEN3_6_MOE,
+                model_id: model_store::flm::MODEL_QWEN3_6_MOE_V1,
+            }),
+            Some(ModelVariant::Qwen3_6_35B_A3B)
+        );
+    }
+
+    #[test]
+    fn flm_runtime_identity_rejects_mismatched_model_id() {
+        assert_eq!(
+            model_variant_from_flm_identity(model_store::FlmRuntimeIdentity {
+                architecture_id: model_store::flm::ARCH_QWEN3_6_MOE,
+                model_id: model_store::flm::MODEL_QWEN3_6_DENSE_V1,
+            }),
+            None
+        );
     }
 
     #[test]

@@ -7,7 +7,7 @@ use crate::certified_kv;
 #[derive(Parser)]
 #[command(name = "supersonic", about = "SuperSonic — optimized LLM inference")]
 pub(crate) struct Cli {
-    /// Model variant (e.g. "qwen3.5-0.8b")
+    /// Model variant (e.g. "qwen3.5-0.8b"). Omitted FLM sources infer this from the runtime descriptor.
     #[arg(long, default_value = "qwen3.5-0.8b")]
     pub(crate) model: String,
 

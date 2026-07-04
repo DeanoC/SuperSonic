@@ -99,6 +99,27 @@ pub struct BakedStore {
 unsafe impl Send for BakedStore {}
 unsafe impl Sync for BakedStore {}
 
+pub fn read_flm_runtime_identity(
+    path: &Path,
+) -> Result<Option<crate::flm::FlmRuntimeIdentity>, Error> {
+    let file = File::open(path)?;
+    let mmap = unsafe { Mmap::map(&file)? };
+    let sb = flm_parse_superblock(&mmap)?;
+    match (sb.runtime_dir_offset, sb.runtime_dir_len) {
+        (0, 0) => Ok(None),
+        (0, len) => Err(Error::Other(format!(
+            "FLM runtime directory length is {len} but offset is zero"
+        ))),
+        (offset, 0) => Err(Error::Other(format!(
+            "FLM runtime directory offset is {offset} but length is zero"
+        ))),
+        (offset, len) => {
+            let runtime = read_exact_range(&mmap, offset, len, "FLM runtime directory")?;
+            crate::flm::FlmRuntimeDirectory::parse_identity(runtime).map(Some)
+        }
+    }
+}
+
 fn parse_dtype(name: &str) -> Result<ScalarType, Error> {
     ScalarType::from_name(name).ok_or_else(|| Error::UnsupportedDtype(name.to_string()))
 }
@@ -3690,6 +3711,27 @@ mod tests {
             runtime.asset_by_kind("tokenizer_regex").unwrap().asset_id,
             4
         );
+    }
+
+    #[test]
+    fn read_flm_runtime_identity_reads_model_descriptor_without_store_open() {
+        let mut data = build_test_flm(&[TestFlmTensor {
+            name: "model.embed_tokens.weight",
+            shape: vec![2, 4],
+            dtype: 4,
+            codec: 0,
+            payload: (0u8..8).collect(),
+        }]);
+        let runtime = build_test_runtime_directory();
+        append_runtime_directory(&mut data, &runtime);
+        let file = write_temp_flm(&data);
+
+        let identity = read_flm_runtime_identity(file.path())
+            .expect("read runtime identity")
+            .unwrap();
+
+        assert_eq!(identity.architecture_id, crate::flm::ARCH_QWEN3_6_DENSE);
+        assert_eq!(identity.model_id, crate::flm::MODEL_QWEN3_6_DENSE_V1);
     }
 
     #[test]

@@ -280,6 +280,12 @@ pub struct FlmPlanStep {
     pub flags: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlmRuntimeIdentity {
+    pub architecture_id: u32,
+    pub model_id: u16,
+}
+
 #[derive(Debug, Clone)]
 pub struct FlmRuntimeDirectory {
     pub architecture_id: u32,
@@ -304,6 +310,31 @@ struct SectionRange {
 }
 
 impl FlmRuntimeDirectory {
+    pub fn parse_identity(buf: &[u8]) -> Result<FlmRuntimeIdentity, Error> {
+        let (architecture_id, sections) = parse_section_table(buf)?;
+        let model_descriptor =
+            parse_model_descriptor(section(buf, &sections, SECTION_MODEL_DESCRIPTOR)?)?;
+        let expected_model_id = match architecture_id {
+            ARCH_QWEN3_6_DENSE => MODEL_QWEN3_6_DENSE_V1,
+            ARCH_QWEN3_6_MOE => MODEL_QWEN3_6_MOE_V1,
+            other => {
+                return Err(Error::Other(format!(
+                    "unsupported FLM runtime architecture {other}"
+                )));
+            }
+        };
+        if model_descriptor.model_id != expected_model_id {
+            return Err(Error::Other(format!(
+                "FLM model descriptor model_id {} does not match architecture {} (expected {})",
+                model_descriptor.model_id, architecture_id, expected_model_id
+            )));
+        }
+        Ok(FlmRuntimeIdentity {
+            architecture_id,
+            model_id: model_descriptor.model_id,
+        })
+    }
+
     pub fn parse(buf: &[u8]) -> Result<Self, Error> {
         let (architecture_id, sections) = parse_section_table(buf)?;
         let (config, moe_config) = if architecture_id == ARCH_QWEN3_6_MOE {

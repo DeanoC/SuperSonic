@@ -148,6 +148,62 @@ fn qwen36_moe_flm_model_dir_runs_without_hf_snapshot() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn qwen36_moe_flm_model_dir_infers_model_when_model_flag_is_omitted() {
+    let Some(path) = std::env::var_os("SUPERSONIC_QWEN36_35B_A3B_NO_HF_FLM") else {
+        eprintln!("skipping: SUPERSONIC_QWEN36_35B_A3B_NO_HF_FLM is unset");
+        return;
+    };
+    let path = PathBuf::from(path);
+    if !path.exists() {
+        panic!(
+            "SUPERSONIC_QWEN36_35B_A3B_NO_HF_FLM is set but the path does not exist: {}",
+            path.display()
+        );
+    }
+
+    let backend =
+        std::env::var("SUPERSONIC_FLM_MAIN_PATH_BACKEND").unwrap_or_else(|_| "hip".to_string());
+    let device =
+        std::env::var("SUPERSONIC_FLM_MAIN_PATH_DEVICE").unwrap_or_else(|_| "0".to_string());
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_supersonic"));
+    cmd.args([
+        "--backend",
+        backend.as_str(),
+        "--device",
+        device.as_str(),
+        "--model-dir",
+    ]);
+    cmd.arg(&path);
+    cmd.args(["--context-size", "16", "--no-download", "--dry-run"]);
+
+    let output = cmd
+        .output()
+        .unwrap_or_else(|e| panic!("run supersonic Qwen3.6-MoE FLM auto-model dry-run: {e}"));
+    let combined = combined_output(&output);
+
+    assert!(
+        output.status.success(),
+        "Qwen3.6-MoE FLM auto-model dry-run failed with status {:?}:\n{}",
+        output.status.code(),
+        combined
+    );
+    assert!(
+        combined.contains("[qwen3.6-moe] dry-run summary"),
+        "dry-run summary was not emitted:\n{combined}"
+    );
+    assert!(
+        combined.contains("[FLM runtime weights] ready-for-decode: YES"),
+        "FLM runtime weights were not reported ready:\n{combined}"
+    );
+    assert!(
+        !combined.contains("got --model qwen3.5-0.8b"),
+        "FLM auto-model path still used the default qwen3.5 model:\n{combined}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn qwen36_moe_ct_int4_flm_dry_run_consumes_source_without_hf_snapshot() {
     let Some(path) = std::env::var_os("SUPERSONIC_QWEN36_35B_CT_INT4_FLM_DRY_RUN") else {
         eprintln!("skipping: SUPERSONIC_QWEN36_35B_CT_INT4_FLM_DRY_RUN is unset");

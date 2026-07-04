@@ -122,20 +122,19 @@ SUPERSONIC_QWEN36_35B_A3B_NO_HF_FLM=/mnt/data/tmp/flm-native-complete-path/qwen3
   cargo test -q -p runner --test flm_moe_main_path -- --nocapture
 ```
 
-The MoE smoke runs one generated token with `--model qwen3.6-35b-a3b`,
-`--verify-flm-hashes`, and no HF snapshot. It intentionally does not pass
-`--int4`: SuperSonic infers the executable weight mode from the FLM tensor
-views. The smoke asserts the MoE config, tokenizer, and weights all come from
-the single FLM source, that the FLM is opened exactly once, and that the run
-does not enter fetch, bake, config JSON, tokenizer JSON, safetensors, or
-`.supersonic` paths.
+The MoE smoke runs one generated token with no HF snapshot. The FLM runtime
+descriptor supplies the model identity, and the smoke also covers omitting
+`--model` entirely. It intentionally does not pass `--int4`: SuperSonic infers
+the executable weight mode from the FLM tensor views. The smoke asserts the MoE
+config, tokenizer, and weights all come from the single FLM source, that the FLM
+is opened exactly once, and that the run does not enter fetch, bake, config
+JSON, tokenizer JSON, safetensors, or `.supersonic` paths.
 
 For a direct manual smoke with load/decode timing, run the FLM as the model
 directory:
 
 ```bash
 cargo run -q -p runner --bin supersonic -- \
-  --model qwen3.6-35b-a3b \
   --model-dir /mnt/data/tmp/flm-native-complete-path/qwen36-35b-a3b-supersonic-native-int4.flm \
   --backend hip \
   --device 0 \
