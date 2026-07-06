@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use gpu_hal::{Backend, VirtualArena};
-use model_store::BakedStore;
+use model_store::{BakedStore, VirtualArenaTransferBackend};
 use qwen36_moe::config::TextConfig;
 
 use crate::qwen36_moe_cli::layers::{load_all_layer_buffers, Qwen36WeightMode};
@@ -12,10 +12,27 @@ use crate::qwen36_moe_types::{AttnLayerBuffers, LayerBuffers, MultiLayerGeom};
 
 const MIB: f64 = (1024 * 1024) as f64;
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Qwen36LayerLoadTimings {
+    pub(crate) buffers: std::time::Duration,
+    pub(crate) vmm_setup: std::time::Duration,
+    pub(crate) prewarm: std::time::Duration,
+    pub(crate) hal_total: std::time::Duration,
+    pub(crate) hal_alloc: std::time::Duration,
+    pub(crate) hal_copy_h_to_d: std::time::Duration,
+    pub(crate) hal_memset: std::time::Duration,
+    pub(crate) hal_vmm: std::time::Duration,
+    pub(crate) hal_alloc_bytes: u64,
+    pub(crate) hal_copy_h_to_d_bytes: u64,
+    pub(crate) hal_memset_bytes: u64,
+    pub(crate) hal_vmm_bytes: u64,
+}
+
 pub(crate) struct Qwen36DecodeLayers {
     pub(crate) layers: Vec<LayerBuffers>,
     pub(crate) moe_expert_arena: Option<VirtualArena>,
     pub(crate) moe_expert_residency: Option<MoeExpertResidencyManager>,
+    pub(crate) timings: Qwen36LayerLoadTimings,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -41,6 +58,7 @@ pub(crate) fn load_decode_layers_with_vmm_strategy(
     moe_async_staging_pages: usize,
     moe_prefetch_evict: bool,
     moe_prefetch_evict_min_probability: f64,
+    moe_virtual_transfer_backend: VirtualArenaTransferBackend,
     persistent_decode: bool,
 ) -> Result<Qwen36DecodeLayers> {
     if let Some(cap_experts) = moe_island_cap_experts {
@@ -61,7 +79,9 @@ pub(crate) fn load_decode_layers_with_vmm_strategy(
             unreachable!("forced VMM expert check should either return true or error");
         }
         let config = MoeExpertResidencyConfig::new(1)?.with_prefetch_evict(moe_prefetch_evict);
-        let mut manager = MoeExpertResidencyManager::new(ordinal, config);
+        let mut manager = MoeExpertResidencyManager::new(ordinal, config)
+            .with_virtual_transfer_backend(moe_virtual_transfer_backend);
+        let buffers_start = std::time::Instant::now();
         let layers = load_all_layer_buffers(
             store,
             ordinal,
@@ -74,15 +94,20 @@ pub(crate) fn load_decode_layers_with_vmm_strategy(
             kv_vmm,
             None,
             Some(&mut manager),
+            moe_virtual_transfer_backend,
         )
         .context("reserve Qwen3.6-MoE routed experts for sparse VMM residency")?;
+        let buffers_elapsed = buffers_start.elapsed();
+        let vmm_setup_start = std::time::Instant::now();
         let max_resident_pages = manager
             .page_budget_for_routed_experts(cap_experts)
             .context("derive sparse MoE page budget from routed expert tensor layout")?;
         manager
             .set_max_resident_pages(max_resident_pages)
             .context("apply sparse MoE page budget")?;
-        if moe_async_prefetch {
+        let storage_direct =
+            moe_virtual_transfer_backend == VirtualArenaTransferBackend::GpuDirectStorage;
+        if moe_async_prefetch && !storage_direct {
             manager
                 .enable_async_prefetch(moe_async_staging_pages)
                 .context("enable sparse MoE async prefetch")?;
@@ -145,10 +170,18 @@ pub(crate) fn load_decode_layers_with_vmm_strategy(
                 );
             }
         }
-        if moe_async_prefetch {
+        if moe_async_prefetch && !storage_direct {
             println!(
                 "  [vmm] sparse MoE async page-in active (staging_pages={moe_async_staging_pages})"
             );
+        }
+        if storage_direct {
+            println!("  [vmm] sparse MoE virtual page-in transfer backend: gpu-direct-storage");
+            if moe_async_prefetch {
+                println!(
+                    "  [vmm] sparse MoE async page-in disabled for gpu-direct-storage backend"
+                );
+            }
         }
         if moe_prefetch_evict {
             println!(
@@ -156,10 +189,16 @@ pub(crate) fn load_decode_layers_with_vmm_strategy(
                  (transition_min_probability={moe_prefetch_evict_min_probability:.2})"
             );
         }
+        let vmm_setup_elapsed = vmm_setup_start.elapsed();
         return Ok(Qwen36DecodeLayers {
             layers,
             moe_expert_arena: None,
             moe_expert_residency: Some(manager),
+            timings: Qwen36LayerLoadTimings {
+                buffers: buffers_elapsed,
+                vmm_setup: vmm_setup_elapsed,
+                ..Default::default()
+            },
         });
     }
 
@@ -171,6 +210,7 @@ pub(crate) fn load_decode_layers_with_vmm_strategy(
         ordinal,
     )? {
         let mut arena = BakedStore::virtual_weight_arena(ordinal);
+        let buffers_start = std::time::Instant::now();
         match load_all_layer_buffers(
             store,
             ordinal,
@@ -183,8 +223,11 @@ pub(crate) fn load_decode_layers_with_vmm_strategy(
             kv_vmm,
             Some(&mut arena),
             None,
+            moe_virtual_transfer_backend,
         ) {
             Ok(layers) => {
+                let buffers_elapsed = buffers_start.elapsed();
+                let vmm_setup_start = std::time::Instant::now();
                 let stats = arena.stats();
                 println!(
                     "  [vmm] Qwen3.6-MoE routed expert slabs active on backend={} device {ordinal}: \
@@ -196,10 +239,16 @@ pub(crate) fn load_decode_layers_with_vmm_strategy(
                     stats.resident_bytes as f64 / MIB,
                     stats.reserved_bytes as f64 / MIB,
                 );
+                let vmm_setup_elapsed = vmm_setup_start.elapsed();
                 return Ok(Qwen36DecodeLayers {
                     layers,
                     moe_expert_arena: Some(arena),
                     moe_expert_residency: None,
+                    timings: Qwen36LayerLoadTimings {
+                        buffers: buffers_elapsed,
+                        vmm_setup: vmm_setup_elapsed,
+                        ..Default::default()
+                    },
                 });
             }
             Err(err) if moe_vmm_mode == MoeExpertVmmMode::Auto => {
@@ -212,6 +261,7 @@ pub(crate) fn load_decode_layers_with_vmm_strategy(
         }
     }
 
+    let buffers_start = std::time::Instant::now();
     let layers = load_all_layer_buffers(
         store,
         ordinal,
@@ -224,11 +274,17 @@ pub(crate) fn load_decode_layers_with_vmm_strategy(
         kv_vmm,
         None,
         None,
+        moe_virtual_transfer_backend,
     )?;
+    let buffers_elapsed = buffers_start.elapsed();
     Ok(Qwen36DecodeLayers {
         layers,
         moe_expert_arena: None,
         moe_expert_residency: None,
+        timings: Qwen36LayerLoadTimings {
+            buffers: buffers_elapsed,
+            ..Default::default()
+        },
     })
 }
 

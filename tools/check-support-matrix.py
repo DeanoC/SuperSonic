@@ -19,6 +19,7 @@ MANIFEST = ROOT / "support" / "matrix.toml"
 VALID_BACKENDS = {"hip", "cuda", "metal"}
 VALID_STATUSES = {"validated", "tbm", "experimental", "inherited", "pending", "unsupported"}
 VALID_QUANTS = {"bf16", "int4", "fp8-runtime", "kv-fp8", "int8"}
+VALID_MODEL_SOURCES = {"hf-snapshot", "flm"}
 EXPECTED_ARCHES = {
     "gfx1100",
     "gfx1150",
@@ -74,6 +75,42 @@ def require_string_list(entry_id: str, entry: dict[str, object], key: str, error
     return value
 
 
+def model_sources_for_entry(
+    entry_id: str,
+    entry: dict[str, object],
+    errors: list[str],
+) -> list[str]:
+    value = entry.get("model_sources", ["hf-snapshot"])
+    if (
+        not isinstance(value, list)
+        or not value
+        or not all(isinstance(v, str) and v for v in value)
+    ):
+        errors.append(f"{entry_id}: model_sources must be a non-empty string list")
+        return []
+    for source in value:
+        if source not in VALID_MODEL_SOURCES:
+            errors.append(f"{entry_id}: unknown model source {source!r}")
+    return value
+
+
+def lane_key_for_entry(
+    entry: dict[str, object],
+) -> tuple[str, str, tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    backend = entry["backend"]
+    arch = entry["arch"]
+    models = entry["models"]
+    quants = entry["quants"]
+    model_sources = entry.get("model_sources", ["hf-snapshot"])
+    return (
+        str(backend),
+        str(arch),
+        tuple(sorted(str(model) for model in models)),
+        tuple(sorted(str(quant) for quant in quants)),
+        tuple(sorted(str(source) for source in model_sources)),
+    )
+
+
 def main() -> int:
     errors: list[str] = []
     with MANIFEST.open("rb") as handle:
@@ -89,7 +126,9 @@ def main() -> int:
 
     seen_ids: set[str] = set()
     seen_arches: set[str] = set()
-    seen_lane_keys: set[tuple[str, str, tuple[str, ...], tuple[str, ...]]] = set()
+    seen_lane_keys: set[
+        tuple[str, str, tuple[str, ...], tuple[str, ...], tuple[str, ...]]
+    ] = set()
 
     for index, entry in enumerate(entries, start=1):
         if not isinstance(entry, dict):
@@ -125,10 +164,20 @@ def main() -> int:
             if quant not in VALID_QUANTS:
                 errors.append(f"{entry_id}: unknown quant {quant!r}")
 
+        model_sources = model_sources_for_entry(entry_id, entry, errors)
+
         if isinstance(backend, str) and isinstance(arch, str) and models and quants:
-            lane_key = (backend, arch, tuple(sorted(models)), tuple(sorted(quants)))
+            lane_key = lane_key_for_entry(
+                {
+                    "backend": backend,
+                    "arch": arch,
+                    "models": models,
+                    "quants": quants,
+                    "model_sources": model_sources or ["hf-snapshot"],
+                }
+            )
             if lane_key in seen_lane_keys:
-                errors.append(f"{entry_id}: duplicate backend/arch/models/quants lane")
+                errors.append(f"{entry_id}: duplicate backend/arch/models/quants/model_sources lane")
             seen_lane_keys.add(lane_key)
 
         validate_doc_ref(f"{entry_id}.support_doc", entry.get("support_doc"), errors)

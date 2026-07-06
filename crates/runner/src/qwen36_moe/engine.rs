@@ -46,9 +46,12 @@ use crate::qwen36_moe_cli::spec_verify::{run_speculative_extension, Qwen36Specul
 use crate::qwen36_moe_cli::timing::{Qwen36StageTimingTotals, SamplingParams};
 use crate::qwen36_moe_cli::vmm::{
     load_decode_layers_with_vmm_strategy, print_virtual_kv_stats_if_active,
-    virtual_kv_stats_for_layers,
+    virtual_kv_stats_for_layers, Qwen36LayerLoadTimings,
 };
-use crate::qwen36_moe_cli::vmm_config::{prepare_moe_runtime_config, should_use_qwen36_kv_vmm};
+use crate::qwen36_moe_cli::vmm_config::{
+    effective_moe_expert_vmm_mode_for_transfer_backend, prepare_moe_runtime_config,
+    should_use_qwen36_kv_vmm,
+};
 use crate::qwen36_moe_logits::XorshiftRng;
 use crate::qwen36_moe_speculative::SpeculativeStepResult;
 use crate::qwen36_moe_telemetry::{print_and_write_moe_residency_summary, MoeRouteRuntime};
@@ -190,6 +193,197 @@ fn validate_qwen36_decode_weight_mode(
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct Qwen36StartupTimings {
+    flm_source_open: std::time::Duration,
+    flm_store_open: std::time::Duration,
+    flm_config: std::time::Duration,
+    flm_tokenizer: std::time::Duration,
+    flm_tokenizer_assets: std::time::Duration,
+    flm_tokenizer_parse: std::time::Duration,
+    flm_tokenizer_parse_vocab: std::time::Duration,
+    flm_tokenizer_parse_vocab_ids: std::time::Duration,
+    flm_tokenizer_parse_merges: std::time::Duration,
+    flm_tokenizer_parse_added_tokens: std::time::Duration,
+    flm_tokenizer_parse_regex: std::time::Duration,
+    flm_tokenizer_build: std::time::Duration,
+    flm_direct_plan: std::time::Duration,
+    bake_prepare: std::time::Duration,
+    dry_run: std::time::Duration,
+}
+
+impl Qwen36StartupTimings {
+    fn pre_decode_total(self) -> std::time::Duration {
+        self.flm_source_open + self.bake_prepare + self.dry_run
+    }
+
+    fn print_if_requested(self, emit_stage_timings: bool) {
+        if !emit_stage_timings {
+            return;
+        }
+        eprintln!(
+            "[qwen36-moe startup-timings] {}",
+            format_qwen36_startup_timings(&self)
+        );
+    }
+}
+
+fn qwen36_duration_ms(duration: std::time::Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
+}
+
+fn format_qwen36_startup_timings(timings: &Qwen36StartupTimings) -> String {
+    format!(
+        "flm_source_open_ms={:.3} flm_store_open_ms={:.3} \
+         flm_config_ms={:.3} flm_tokenizer_ms={:.3} \
+         flm_tokenizer_assets_ms={:.3} flm_tokenizer_parse_ms={:.3} \
+         flm_tokenizer_parse_vocab_ms={:.3} \
+         flm_tokenizer_parse_vocab_ids_ms={:.3} \
+         flm_tokenizer_parse_merges_ms={:.3} \
+         flm_tokenizer_parse_added_tokens_ms={:.3} \
+         flm_tokenizer_parse_regex_ms={:.3} \
+         flm_tokenizer_build_ms={:.3} flm_direct_plan_ms={:.3} \
+         bake_prepare_ms={:.3} \
+         dry_run_ms={:.3} pre_decode_total_ms={:.3}",
+        qwen36_duration_ms(timings.flm_source_open),
+        qwen36_duration_ms(timings.flm_store_open),
+        qwen36_duration_ms(timings.flm_config),
+        qwen36_duration_ms(timings.flm_tokenizer),
+        qwen36_duration_ms(timings.flm_tokenizer_assets),
+        qwen36_duration_ms(timings.flm_tokenizer_parse),
+        qwen36_duration_ms(timings.flm_tokenizer_parse_vocab),
+        qwen36_duration_ms(timings.flm_tokenizer_parse_vocab_ids),
+        qwen36_duration_ms(timings.flm_tokenizer_parse_merges),
+        qwen36_duration_ms(timings.flm_tokenizer_parse_added_tokens),
+        qwen36_duration_ms(timings.flm_tokenizer_parse_regex),
+        qwen36_duration_ms(timings.flm_tokenizer_build),
+        qwen36_duration_ms(timings.flm_direct_plan),
+        qwen36_duration_ms(timings.bake_prepare),
+        qwen36_duration_ms(timings.dry_run),
+        qwen36_duration_ms(timings.pre_decode_total()),
+    )
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct Qwen36LifecycleTimings {
+    prompt_setup: std::time::Duration,
+    flm_tokenizer: std::time::Duration,
+    flm_tokenizer_assets: std::time::Duration,
+    flm_tokenizer_parse: std::time::Duration,
+    flm_tokenizer_parse_vocab: std::time::Duration,
+    flm_tokenizer_parse_vocab_ids: std::time::Duration,
+    flm_tokenizer_parse_merges: std::time::Duration,
+    flm_tokenizer_parse_added_tokens: std::time::Duration,
+    flm_tokenizer_parse_regex: std::time::Duration,
+    flm_tokenizer_build: std::time::Duration,
+    model_source: std::time::Duration,
+    layer_load: std::time::Duration,
+    layer_load_profile: Qwen36LayerLoadTimings,
+    session: std::time::Duration,
+    prefill_steps: usize,
+    prefill_embed: std::time::Duration,
+    prefill_chain: std::time::Duration,
+    generation_wall: Option<f64>,
+    total_wall: std::time::Duration,
+}
+
+impl Qwen36LifecycleTimings {
+    fn prefill_total(self) -> std::time::Duration {
+        self.prefill_embed + self.prefill_chain
+    }
+}
+
+fn format_qwen36_lifecycle_timings(timings: &Qwen36LifecycleTimings) -> String {
+    format!(
+        "prompt_setup_ms={:.3} flm_tokenizer_ms={:.3} \
+         flm_tokenizer_assets_ms={:.3} flm_tokenizer_parse_ms={:.3} \
+         flm_tokenizer_parse_vocab_ms={:.3} \
+         flm_tokenizer_parse_vocab_ids_ms={:.3} \
+         flm_tokenizer_parse_merges_ms={:.3} \
+         flm_tokenizer_parse_added_tokens_ms={:.3} \
+         flm_tokenizer_parse_regex_ms={:.3} \
+         flm_tokenizer_build_ms={:.3} model_source_ms={:.3} \
+         layer_load_ms={:.3} layer_load_buffers_ms={:.3} \
+         layer_load_vmm_setup_ms={:.3} layer_load_prewarm_ms={:.3} \
+         layer_load_hal_ms={:.3} layer_load_alloc_ms={:.3} \
+         layer_load_copy_h_to_d_ms={:.3} layer_load_memset_ms={:.3} \
+         layer_load_vmm_ms={:.3} layer_load_alloc_bytes={} \
+         layer_load_copy_h_to_d_bytes={} layer_load_memset_bytes={} \
+         layer_load_vmm_bytes={} session_ms={:.3} prefill_steps={} \
+         prefill_embed_ms={:.3} prefill_chain_ms={:.3} \
+         prefill_total_ms={:.3} generation_wall_ms={:.3} total_wall_ms={:.3}",
+        qwen36_duration_ms(timings.prompt_setup),
+        qwen36_duration_ms(timings.flm_tokenizer),
+        qwen36_duration_ms(timings.flm_tokenizer_assets),
+        qwen36_duration_ms(timings.flm_tokenizer_parse),
+        qwen36_duration_ms(timings.flm_tokenizer_parse_vocab),
+        qwen36_duration_ms(timings.flm_tokenizer_parse_vocab_ids),
+        qwen36_duration_ms(timings.flm_tokenizer_parse_merges),
+        qwen36_duration_ms(timings.flm_tokenizer_parse_added_tokens),
+        qwen36_duration_ms(timings.flm_tokenizer_parse_regex),
+        qwen36_duration_ms(timings.flm_tokenizer_build),
+        qwen36_duration_ms(timings.model_source),
+        qwen36_duration_ms(timings.layer_load),
+        qwen36_duration_ms(timings.layer_load_profile.buffers),
+        qwen36_duration_ms(timings.layer_load_profile.vmm_setup),
+        qwen36_duration_ms(timings.layer_load_profile.prewarm),
+        qwen36_duration_ms(timings.layer_load_profile.hal_total),
+        qwen36_duration_ms(timings.layer_load_profile.hal_alloc),
+        qwen36_duration_ms(timings.layer_load_profile.hal_copy_h_to_d),
+        qwen36_duration_ms(timings.layer_load_profile.hal_memset),
+        qwen36_duration_ms(timings.layer_load_profile.hal_vmm),
+        timings.layer_load_profile.hal_alloc_bytes,
+        timings.layer_load_profile.hal_copy_h_to_d_bytes,
+        timings.layer_load_profile.hal_memset_bytes,
+        timings.layer_load_profile.hal_vmm_bytes,
+        qwen36_duration_ms(timings.session),
+        timings.prefill_steps,
+        qwen36_duration_ms(timings.prefill_embed),
+        qwen36_duration_ms(timings.prefill_chain),
+        qwen36_duration_ms(timings.prefill_total()),
+        timings.generation_wall.unwrap_or(0.0),
+        qwen36_duration_ms(timings.total_wall),
+    )
+}
+
+fn qwen36_layer_load_hal_timings(snapshot: &gpu_hal::HalProfileSnapshot) -> Qwen36LayerLoadTimings {
+    let mut timings = Qwen36LayerLoadTimings {
+        hal_total: std::time::Duration::from_secs_f64(snapshot.total_ms / 1000.0),
+        hal_alloc_bytes: snapshot.alloc_bytes,
+        hal_copy_h_to_d_bytes: snapshot.h2d_bytes,
+        hal_memset_bytes: snapshot.memset_bytes,
+        ..Default::default()
+    };
+
+    for entry in &snapshot.entries {
+        let duration = std::time::Duration::from_secs_f64(entry.total_ms / 1000.0);
+        match entry.op.as_str() {
+            "alloc" => timings.hal_alloc += duration,
+            "copy_h2d" => timings.hal_copy_h_to_d += duration,
+            "memset_zeros" => timings.hal_memset += duration,
+            op if op.starts_with("vmm_") => {
+                timings.hal_vmm += duration;
+                timings.hal_vmm_bytes += entry.total_bytes;
+            }
+            _ => {}
+        }
+    }
+
+    timings
+}
+
+fn qwen36_should_profile_layer_load_hal(
+    emit_stage_timings: bool,
+    external_hal_profile_active: bool,
+) -> bool {
+    emit_stage_timings && !external_hal_profile_active
+}
+
+fn qwen36_external_hal_profile_env_active() -> bool {
+    std::env::var_os("SUPERSONIC_HAL_PROFILE").is_some()
+        || std::env::var_os("SUPERSONIC_METAL_PROFILE").is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,6 +405,177 @@ mod tests {
     fn hip_decode_allows_non_int4_weight_mode_for_development_path() {
         validate_qwen36_decode_weight_mode(Qwen36WeightMode::Bf16, Backend::Hip, "model.flm")
             .expect("HIP development path can still choose BF16/FP8");
+    }
+
+    #[test]
+    fn formats_startup_timings_for_machine_parsing() {
+        let timings = Qwen36StartupTimings {
+            flm_source_open: std::time::Duration::from_micros(1_500),
+            flm_store_open: std::time::Duration::from_micros(500),
+            flm_config: std::time::Duration::from_micros(250),
+            flm_tokenizer: std::time::Duration::from_micros(625),
+            flm_tokenizer_assets: std::time::Duration::from_micros(25),
+            flm_tokenizer_parse: std::time::Duration::from_micros(275),
+            flm_tokenizer_parse_vocab: std::time::Duration::from_micros(100),
+            flm_tokenizer_parse_vocab_ids: std::time::Duration::from_micros(25),
+            flm_tokenizer_parse_merges: std::time::Duration::from_micros(75),
+            flm_tokenizer_parse_added_tokens: std::time::Duration::from_micros(50),
+            flm_tokenizer_parse_regex: std::time::Duration::from_micros(25),
+            flm_tokenizer_build: std::time::Duration::from_micros(325),
+            flm_direct_plan: std::time::Duration::from_micros(125),
+            bake_prepare: std::time::Duration::ZERO,
+            dry_run: std::time::Duration::from_micros(2_250),
+        };
+
+        assert_eq!(
+            format_qwen36_startup_timings(&timings),
+            "flm_source_open_ms=1.500 flm_store_open_ms=0.500 \
+             flm_config_ms=0.250 flm_tokenizer_ms=0.625 \
+             flm_tokenizer_assets_ms=0.025 flm_tokenizer_parse_ms=0.275 \
+             flm_tokenizer_parse_vocab_ms=0.100 \
+             flm_tokenizer_parse_vocab_ids_ms=0.025 \
+             flm_tokenizer_parse_merges_ms=0.075 \
+             flm_tokenizer_parse_added_tokens_ms=0.050 \
+             flm_tokenizer_parse_regex_ms=0.025 \
+             flm_tokenizer_build_ms=0.325 flm_direct_plan_ms=0.125 \
+             bake_prepare_ms=0.000 \
+             dry_run_ms=2.250 pre_decode_total_ms=3.750"
+        );
+    }
+
+    #[test]
+    fn formats_lifecycle_timings_with_lazy_flm_tokenizer_breakdown() {
+        let timings = Qwen36LifecycleTimings {
+            prompt_setup: std::time::Duration::from_micros(5_000),
+            flm_tokenizer: std::time::Duration::from_micros(625),
+            flm_tokenizer_assets: std::time::Duration::from_micros(25),
+            flm_tokenizer_parse: std::time::Duration::from_micros(275),
+            flm_tokenizer_parse_vocab: std::time::Duration::from_micros(100),
+            flm_tokenizer_parse_vocab_ids: std::time::Duration::from_micros(25),
+            flm_tokenizer_parse_merges: std::time::Duration::from_micros(75),
+            flm_tokenizer_parse_added_tokens: std::time::Duration::from_micros(50),
+            flm_tokenizer_parse_regex: std::time::Duration::from_micros(25),
+            flm_tokenizer_build: std::time::Duration::from_micros(325),
+            model_source: std::time::Duration::from_micros(1_500),
+            layer_load: std::time::Duration::from_micros(2_500),
+            layer_load_profile: Qwen36LayerLoadTimings {
+                buffers: std::time::Duration::from_micros(1_100),
+                vmm_setup: std::time::Duration::from_micros(200),
+                prewarm: std::time::Duration::from_micros(300),
+                hal_total: std::time::Duration::from_micros(1_000),
+                hal_alloc: std::time::Duration::from_micros(400),
+                hal_copy_h_to_d: std::time::Duration::from_micros(500),
+                hal_memset: std::time::Duration::from_micros(50),
+                hal_vmm: std::time::Duration::from_micros(50),
+                hal_alloc_bytes: 1_024,
+                hal_copy_h_to_d_bytes: 2_048,
+                hal_memset_bytes: 512,
+                hal_vmm_bytes: 4_096,
+            },
+            session: std::time::Duration::from_micros(3_500),
+            prefill_steps: 2,
+            prefill_embed: std::time::Duration::from_micros(100),
+            prefill_chain: std::time::Duration::from_micros(200),
+            generation_wall: Some(4.5),
+            total_wall: std::time::Duration::from_micros(9_000),
+        };
+
+        assert_eq!(
+            format_qwen36_lifecycle_timings(&timings),
+            "prompt_setup_ms=5.000 flm_tokenizer_ms=0.625 \
+             flm_tokenizer_assets_ms=0.025 flm_tokenizer_parse_ms=0.275 \
+             flm_tokenizer_parse_vocab_ms=0.100 \
+             flm_tokenizer_parse_vocab_ids_ms=0.025 \
+             flm_tokenizer_parse_merges_ms=0.075 \
+             flm_tokenizer_parse_added_tokens_ms=0.050 \
+             flm_tokenizer_parse_regex_ms=0.025 \
+             flm_tokenizer_build_ms=0.325 model_source_ms=1.500 \
+             layer_load_ms=2.500 layer_load_buffers_ms=1.100 \
+             layer_load_vmm_setup_ms=0.200 layer_load_prewarm_ms=0.300 \
+             layer_load_hal_ms=1.000 layer_load_alloc_ms=0.400 \
+             layer_load_copy_h_to_d_ms=0.500 layer_load_memset_ms=0.050 \
+             layer_load_vmm_ms=0.050 layer_load_alloc_bytes=1024 \
+             layer_load_copy_h_to_d_bytes=2048 layer_load_memset_bytes=512 \
+             layer_load_vmm_bytes=4096 session_ms=3.500 prefill_steps=2 \
+             prefill_embed_ms=0.100 prefill_chain_ms=0.200 \
+             prefill_total_ms=0.300 generation_wall_ms=4.500 \
+             total_wall_ms=9.000"
+        );
+    }
+
+    #[test]
+    fn layer_load_hal_timings_group_transfer_and_vmm_ops() {
+        let snapshot = gpu_hal::HalProfileSnapshot {
+            total_calls: 5,
+            total_ms: 7.0,
+            alloc_calls: 1,
+            alloc_bytes: 1_024,
+            free_calls: 0,
+            h2d_bytes: 2_048,
+            d2h_bytes: 0,
+            d2d_bytes: 0,
+            memset_bytes: 512,
+            sync_calls: 0,
+            entries: vec![
+                gpu_hal::HalProfileEntry {
+                    op: "alloc".to_string(),
+                    calls: 1,
+                    total_ms: 1.5,
+                    max_ms: 1.5,
+                    total_bytes: 1_024,
+                },
+                gpu_hal::HalProfileEntry {
+                    op: "copy_h2d".to_string(),
+                    calls: 1,
+                    total_ms: 2.5,
+                    max_ms: 2.5,
+                    total_bytes: 2_048,
+                },
+                gpu_hal::HalProfileEntry {
+                    op: "memset_zeros".to_string(),
+                    calls: 1,
+                    total_ms: 0.75,
+                    max_ms: 0.75,
+                    total_bytes: 512,
+                },
+                gpu_hal::HalProfileEntry {
+                    op: "vmm_reserve".to_string(),
+                    calls: 1,
+                    total_ms: 1.0,
+                    max_ms: 1.0,
+                    total_bytes: 3_000,
+                },
+                gpu_hal::HalProfileEntry {
+                    op: "vmm_map".to_string(),
+                    calls: 1,
+                    total_ms: 1.25,
+                    max_ms: 1.25,
+                    total_bytes: 1_096,
+                },
+            ],
+        };
+
+        let timings = qwen36_layer_load_hal_timings(&snapshot);
+
+        assert_eq!(timings.hal_total, std::time::Duration::from_micros(7_000));
+        assert_eq!(timings.hal_alloc, std::time::Duration::from_micros(1_500));
+        assert_eq!(
+            timings.hal_copy_h_to_d,
+            std::time::Duration::from_micros(2_500)
+        );
+        assert_eq!(timings.hal_memset, std::time::Duration::from_micros(750));
+        assert_eq!(timings.hal_vmm, std::time::Duration::from_micros(2_250));
+        assert_eq!(timings.hal_alloc_bytes, 1_024);
+        assert_eq!(timings.hal_copy_h_to_d_bytes, 2_048);
+        assert_eq!(timings.hal_memset_bytes, 512);
+        assert_eq!(timings.hal_vmm_bytes, 4_096);
+    }
+
+    #[test]
+    fn layer_load_hal_profile_only_enables_for_isolated_stage_timings() {
+        assert!(qwen36_should_profile_layer_load_hal(true, false));
+        assert!(!qwen36_should_profile_layer_load_hal(false, false));
+        assert!(!qwen36_should_profile_layer_load_hal(true, true));
     }
 }
 
@@ -377,15 +742,32 @@ fn run_inner(
     validate_persistent_kv_fp8_flags(cli)?;
     validate_cuda_v1_flags(cli, entry)?;
     validate_metal_v1_flags(cli, entry)?;
+
+    let mut startup_timings = Qwen36StartupTimings::default();
+    let flm_source_open_start = std::time::Instant::now();
     let flm_source = open_qwen36_moe_flm_source(cli)?;
+    if let Some(flm) = flm_source.as_ref() {
+        startup_timings.flm_source_open = flm_source_open_start.elapsed();
+        startup_timings.flm_store_open = flm.timings.store_open;
+        startup_timings.flm_config = flm.timings.config;
+        startup_timings.flm_tokenizer = flm.timings.tokenizer;
+        startup_timings.flm_tokenizer_assets = flm.timings.tokenizer_assets;
+        startup_timings.flm_tokenizer_parse = flm.timings.tokenizer_parse;
+        startup_timings.flm_tokenizer_build = flm.timings.tokenizer_build;
+        startup_timings.flm_direct_plan = flm.timings.direct_plan;
+    }
     if flm_source.is_none() {
+        let bake_prepare_start = std::time::Instant::now();
         ensure_qwen36_bake(cli, entry)?;
+        startup_timings.bake_prepare = bake_prepare_start.elapsed();
     }
 
+    let dry_run_start = std::time::Instant::now();
     let report = if let Some(flm) = flm_source.as_ref() {
         run_qwen36_moe_dry_run_with_config(
             &cli.model_dir,
             Some(&flm.source.path),
+            Some(flm.direct_profile),
             flm.config.clone(),
             entry,
             total_vram,
@@ -409,7 +791,9 @@ fn run_inner(
             cli.device,
         )?
     };
+    startup_timings.dry_run = dry_run_start.elapsed();
     print_report(&report);
+    startup_timings.print_if_requested(cli.emit_stage_timings);
     if cli.dry_run {
         return Ok(());
     }
@@ -452,6 +836,7 @@ fn run_inner(
         cli.ignore_eos,
         keep_mask,
         cli.progress_heartbeat_seconds,
+        cli.flm_virtual_transfer_backend.as_deref(),
     )?;
     Ok(())
 }
@@ -496,6 +881,7 @@ fn decode_text(
     ignore_eos: bool,
     keep_mask: Option<Vec<bool>>,
     progress_heartbeat_seconds: f64,
+    flm_virtual_transfer_backend_cli: Option<&str>,
 ) -> Result<()> {
     validate_speculative_sampling(speculative_decode, sampling)?;
 
@@ -530,9 +916,16 @@ fn decode_text(
 
     progress("prompt_setup", "start".to_string(), true);
     let prompt_setup_start = std::time::Instant::now();
+    let mut flm_tokenizer_elapsed = std::time::Duration::ZERO;
+    let mut flm_tokenizer_timings = crate::flm_tokenizer::QwenBpeTokenizerTimings::default();
     let prompt_setup = if let Some(flm) = flm_source {
+        eprintln!("[qwen36-moe] loading tokenizer from FLM assets");
+        let tokenizer_start = std::time::Instant::now();
+        let tokenizer_load = flm.load_tokenizer_timed()?;
+        flm_tokenizer_elapsed = tokenizer_start.elapsed();
+        flm_tokenizer_timings = tokenizer_load.timings;
         prepare_prompt_with_tokenizer(
-            Some(flm.tokenizer.clone()),
+            Some(tokenizer_load.tokenizer),
             &report.config.text_config,
             prompt,
         )?
@@ -548,6 +941,24 @@ fn decode_text(
         prompt_setup.eos_id
     };
     print_prompt_summary(prompt, &prompt_ids);
+
+    let geom = build_multi_layer_geom(&report.config.text_config, &report.kernel_params);
+
+    set_backend(backend);
+
+    // KV cache size: needs to fit prompt_len + max_new past tokens. Sized
+    // generously here since per-layer KV is small (10 full-attn layers ×
+    // [kv_max_t, Hkv*d=512] BF16 = 10 KiB per token of context).
+    let kv_max_t = prompt_ids.len() + max_new;
+
+    let mut moe_runtime = prepare_moe_runtime_config(
+        speculative_decode,
+        persistent_decode,
+        backend,
+        geom.top_k as usize,
+        flm_virtual_transfer_backend_cli,
+    )?;
+    let kv_vmm = should_use_qwen36_kv_vmm(backend, ordinal)?;
 
     progress(
         "prompt_setup",
@@ -590,15 +1001,6 @@ fn decode_text(
     let model_source_elapsed = source_open_start.elapsed();
     progress(source_phase, format!("done source={source_label}"), true);
 
-    let geom = build_multi_layer_geom(&report.config.text_config, &report.kernel_params);
-
-    set_backend(backend);
-
-    // KV cache size: needs to fit prompt_len + max_new past tokens. Sized
-    // generously here since per-layer KV is small (10 full-attn layers ×
-    // [kv_max_t, Hkv*d=512] BF16 = 10 KiB per token of context).
-    let kv_max_t = prompt_ids.len() + max_new;
-
     println!(
         "  loading {} layers ({} INT4 sidecar sets, KV cache cap = {} tokens)…",
         geom.num_layers,
@@ -610,13 +1012,6 @@ fn decode_text(
         kv_max_t,
     );
 
-    let mut moe_runtime = prepare_moe_runtime_config(
-        speculative_decode,
-        persistent_decode,
-        backend,
-        geom.top_k as usize,
-    )?;
-    let kv_vmm = should_use_qwen36_kv_vmm(backend, ordinal)?;
     progress(
         "layer_load",
         format!(
@@ -626,7 +1021,20 @@ fn decode_text(
         true,
     );
     let layer_load_start = std::time::Instant::now();
-    let loaded_layers = load_decode_layers_with_vmm_strategy(
+    let profile_layer_load_hal = qwen36_should_profile_layer_load_hal(
+        emit_stage_timings,
+        qwen36_external_hal_profile_env_active(),
+    );
+    if profile_layer_load_hal {
+        gpu_hal::hal_profile_set_enabled(true);
+        gpu_hal::hal_profile_reset();
+    }
+    let effective_moe_vmm_mode = effective_moe_expert_vmm_mode_for_transfer_backend(
+        moe_runtime.vmm_mode,
+        moe_runtime.island_cap_experts,
+        moe_runtime.virtual_transfer_backend,
+    )?;
+    let loaded_layers = match load_decode_layers_with_vmm_strategy(
         &store,
         ordinal,
         backend,
@@ -637,7 +1045,7 @@ fn decode_text(
         kv_max_t,
         kv_fp8,
         kv_vmm,
-        moe_runtime.vmm_mode,
+        effective_moe_vmm_mode,
         moe_runtime.island_cap_experts,
         moe_runtime.protected_experts,
         moe_runtime.fixed_hot_experts,
@@ -648,11 +1056,46 @@ fn decode_text(
         moe_runtime.async_staging_pages,
         moe_runtime.prefetch_evict,
         moe_runtime.prefetch_evict_min_probability,
+        moe_runtime.virtual_transfer_backend,
         persistent_decode,
-    )?;
+    ) {
+        Ok(loaded_layers) => loaded_layers,
+        Err(err) => {
+            if profile_layer_load_hal {
+                gpu_hal::hal_profile_set_enabled(false);
+            }
+            return Err(err);
+        }
+    };
     let mut layers = loaded_layers.layers;
-    let _ffn_prewarm_elapsed =
-        prewarm_qwen36_mps_static_topn_if_requested(ordinal, backend, &geom, &mut layers)?;
+    let mut layer_load_profile = loaded_layers.timings;
+    let ffn_prewarm_elapsed =
+        match prewarm_qwen36_mps_static_topn_if_requested(ordinal, backend, &geom, &mut layers) {
+            Ok(elapsed) => elapsed,
+            Err(err) => {
+                if profile_layer_load_hal {
+                    gpu_hal::hal_profile_set_enabled(false);
+                }
+                return Err(err);
+            }
+        };
+    layer_load_profile.prewarm = ffn_prewarm_elapsed;
+    if profile_layer_load_hal {
+        let hal_timings = qwen36_layer_load_hal_timings(&gpu_hal::hal_profile_snapshot());
+        layer_load_profile = Qwen36LayerLoadTimings {
+            hal_total: hal_timings.hal_total,
+            hal_alloc: hal_timings.hal_alloc,
+            hal_copy_h_to_d: hal_timings.hal_copy_h_to_d,
+            hal_memset: hal_timings.hal_memset,
+            hal_vmm: hal_timings.hal_vmm,
+            hal_alloc_bytes: hal_timings.hal_alloc_bytes,
+            hal_copy_h_to_d_bytes: hal_timings.hal_copy_h_to_d_bytes,
+            hal_memset_bytes: hal_timings.hal_memset_bytes,
+            hal_vmm_bytes: hal_timings.hal_vmm_bytes,
+            ..layer_load_profile
+        };
+        gpu_hal::hal_profile_set_enabled(false);
+    }
     let layer_load_elapsed = layer_load_start.elapsed();
     let _moe_expert_arena = loaded_layers.moe_expert_arena;
     let mut _moe_expert_residency = loaded_layers.moe_expert_residency;
@@ -1214,23 +1657,30 @@ fn decode_text(
     }
     stage_timings.print_if_requested(emit_stage_timings);
     if emit_stage_timings {
-        let to_ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
-        let prefill_total_ms = to_ms(prefill_embed_elapsed + prefill_chain_elapsed);
-        eprintln!(
-            "[qwen36-moe lifecycle-timings] prompt_setup_ms={:.3} \
-             model_source_ms={:.3} layer_load_ms={:.3} session_ms={:.3} \
-             prefill_steps={} prefill_embed_ms={:.3} prefill_chain_ms={:.3} \
-             prefill_total_ms={:.3} generation_wall_ms={:.3} total_wall_ms={:.3}",
-            to_ms(prompt_setup_elapsed),
-            to_ms(model_source_elapsed),
-            to_ms(layer_load_elapsed),
-            to_ms(session_elapsed),
+        let lifecycle_timings = Qwen36LifecycleTimings {
+            prompt_setup: prompt_setup_elapsed,
+            flm_tokenizer: flm_tokenizer_elapsed,
+            flm_tokenizer_assets: flm_tokenizer_timings.asset_lookup,
+            flm_tokenizer_parse: flm_tokenizer_timings.parse,
+            flm_tokenizer_parse_vocab: flm_tokenizer_timings.parse_vocab,
+            flm_tokenizer_parse_vocab_ids: flm_tokenizer_timings.parse_vocab_ids,
+            flm_tokenizer_parse_merges: flm_tokenizer_timings.parse_merges,
+            flm_tokenizer_parse_added_tokens: flm_tokenizer_timings.parse_added_tokens,
+            flm_tokenizer_parse_regex: flm_tokenizer_timings.parse_regex,
+            flm_tokenizer_build: flm_tokenizer_timings.build,
+            model_source: model_source_elapsed,
+            layer_load: layer_load_elapsed,
+            layer_load_profile,
+            session: session_elapsed,
             prefill_steps,
-            to_ms(prefill_embed_elapsed),
-            to_ms(prefill_chain_elapsed),
-            prefill_total_ms,
-            generation_wall_ms.unwrap_or(0.0),
-            to_ms(decode_wall_start.elapsed()),
+            prefill_embed: prefill_embed_elapsed,
+            prefill_chain: prefill_chain_elapsed,
+            generation_wall: generation_wall_ms,
+            total_wall: decode_wall_start.elapsed(),
+        };
+        eprintln!(
+            "[qwen36-moe lifecycle-timings] {}",
+            format_qwen36_lifecycle_timings(&lifecycle_timings),
         );
     }
     if let Some(stats) = mtp_acceptance_stats.as_ref() {

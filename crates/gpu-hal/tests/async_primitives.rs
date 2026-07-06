@@ -1,13 +1,39 @@
 use gpu_hal::{
     copy_d2h, copy_h2d_async, current_backend, memset_zeros_async, set_backend, Backend, GpuBuffer,
-    GpuEvent, GpuStream, PinnedHostBuffer, ScalarType,
+    GpuEvent, GpuStream, PinnedHostBuffer, RegisteredHostBuffer, ScalarType,
 };
+use std::alloc::{alloc_zeroed, dealloc, Layout};
+use std::ptr::NonNull;
 
 struct BackendRestore(Backend);
 
 impl Drop for BackendRestore {
     fn drop(&mut self) {
         set_backend(self.0);
+    }
+}
+
+struct AlignedHostPage {
+    ptr: NonNull<u8>,
+    layout: Layout,
+}
+
+impl AlignedHostPage {
+    fn new(len: usize, align: usize) -> Self {
+        let layout = Layout::from_size_align(len, align).expect("aligned host page layout");
+        let ptr = NonNull::new(unsafe { alloc_zeroed(layout) })
+            .expect("allocate aligned host page for registration smoke");
+        Self { ptr, layout }
+    }
+
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.ptr.as_ptr()
+    }
+}
+
+impl Drop for AlignedHostPage {
+    fn drop(&mut self) {
+        unsafe { dealloc(self.ptr.as_ptr(), self.layout) };
     }
 }
 
@@ -26,6 +52,22 @@ fn pinned_host_buffer_smoke() {
     pinned.as_mut_slice()[4095] = 23;
     assert_eq!(pinned.as_slice()[0], 17);
     assert_eq!(pinned.as_slice()[4095], 23);
+}
+
+#[test]
+fn registered_host_buffer_smoke() {
+    let _restore = BackendRestore(current_backend());
+    set_backend(Backend::Hip);
+    let mut page = AlignedHostPage::new(4096, 4096);
+    let registered = match unsafe { RegisteredHostBuffer::new(0, page.as_mut_ptr().cast(), 4096) } {
+        Ok(buffer) => buffer,
+        Err(err) => {
+            eprintln!("skip: HIP host registration unavailable: {err}");
+            return;
+        }
+    };
+    assert_eq!(registered.len(), 4096);
+    assert_eq!(registered.as_ptr(), page.as_mut_ptr().cast());
 }
 
 #[test]

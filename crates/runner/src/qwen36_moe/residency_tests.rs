@@ -1,6 +1,7 @@
 use super::*;
 use gpu_hal::{Backend, VirtualAllocationRole};
 use model_store::manifest::{LayoutTag, Manifest, TensorMeta, FORMAT_VERSION};
+use model_store::VirtualArenaTransferBackend;
 use std::sync::Mutex;
 
 static VMM_BACKEND_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -859,6 +860,63 @@ fn store_range_upload_keeps_stable_virtual_pointer() {
                 .to_host_range_bytes(4096, 4096)
                 .expect("read expert 1");
             assert!(bytes.iter().all(|b| *b == 2));
+        },
+    );
+}
+
+#[test]
+fn direct_storage_transfer_backend_does_not_pageable_fallback() {
+    with_supported_vmm_backend(
+        "direct_storage_transfer_backend_does_not_pageable_fallback",
+        |_backend| {
+            if gpu_hal::storage_to_device_is_supported(gpu_hal::current_backend()) {
+                eprintln!("skip: native storage-to-device transfer available on this runtime");
+                return;
+            }
+            gpu_hal::hal_profile_set_enabled(true);
+            gpu_hal::hal_profile_reset();
+            let tmp = synthetic_store(2, 4096);
+            let store = BakedStore::open(tmp.path()).expect("open synthetic store");
+            let mut manager =
+                MoeExpertResidencyManager::new(0, MoeExpertResidencyConfig::new(1).unwrap())
+                    .with_virtual_transfer_backend(VirtualArenaTransferBackend::GpuDirectStorage);
+            manager
+                .register_tensor(
+                    &store,
+                    0,
+                    MoeExpertProjection::GateUp,
+                    "model.layers.0.mlp.experts.gate_up_proj",
+                    2,
+                )
+                .expect("register tensor");
+
+            let err = manager
+                .ensure_resident(
+                    &store,
+                    MoeExpertKey {
+                        layer_idx: 0,
+                        expert_idx: 0,
+                        projection: MoeExpertProjection::GateUp,
+                    },
+                )
+                .expect_err("unsupported direct storage backend should fail");
+            let profile = gpu_hal::hal_profile_snapshot();
+            gpu_hal::hal_profile_set_enabled(false);
+            let err_chain = format!("{err:#}");
+            assert!(
+                err_chain.contains("GPU-direct storage-to-device"),
+                "unexpected direct storage error: {err_chain}"
+            );
+            assert!(
+                profile
+                    .entries
+                    .iter()
+                    .all(|entry| entry.op != "copy_h2d" && entry.op != "vmm_map_no_sync"),
+                "GPU-direct backend must not fall back to pageable mapping/copy: {:?}",
+                profile.entries
+            );
+            assert_eq!(manager.stats().resident_pages, 0);
+            assert_eq!(manager.arena().stats().logical_resident_bytes, 0);
         },
     );
 }

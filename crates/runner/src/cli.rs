@@ -7,7 +7,7 @@ use crate::certified_kv;
 #[derive(Parser)]
 #[command(name = "supersonic", about = "SuperSonic — optimized LLM inference")]
 pub(crate) struct Cli {
-    /// Model variant (e.g. "qwen3.5-0.8b")
+    /// Model variant (e.g. "qwen3.5-0.8b"). Omitted FLM sources infer this from the runtime descriptor.
     #[arg(long, default_value = "qwen3.5-0.8b")]
     pub(crate) model: String,
 
@@ -22,6 +22,10 @@ pub(crate) struct Cli {
     /// Verify BLAKE3 FLM tensor payload hashes while loading FLM weights.
     #[arg(long)]
     pub(crate) verify_flm_hashes: bool,
+
+    /// FLM virtual tensor transfer backend: pageable-h2d, gpu-direct-storage, gds, or hipfile.
+    #[arg(long)]
+    pub(crate) flm_virtual_transfer_backend: Option<String>,
 
     /// Text prompt (will be tokenized). Required unless --dry-run is set.
     #[arg(long, required_unless_present = "dry_run", default_value = "")]
@@ -556,6 +560,7 @@ pub(crate) struct Cli {
 #[cfg(test)]
 mod tests {
     use clap::CommandFactory;
+    use clap::Parser;
 
     use super::Cli;
 
@@ -569,5 +574,20 @@ mod tests {
         assert!(help.contains("self-contained FLM container"), "{help}");
         assert!(help.contains("Prefer --model-dir model.flm"), "{help}");
         assert!(help.contains("--verify-flm-hashes"), "{help}");
+    }
+
+    #[test]
+    fn parses_flm_virtual_transfer_backend_flag() {
+        let cli = Cli::try_parse_from([
+            "supersonic",
+            "--model-dir",
+            "model.flm",
+            "--flm-virtual-transfer-backend",
+            "hipfile",
+            "--dry-run",
+        ])
+        .unwrap();
+
+        assert_eq!(cli.flm_virtual_transfer_backend.as_deref(), Some("hipfile"));
     }
 }

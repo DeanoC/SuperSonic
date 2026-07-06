@@ -1,9 +1,11 @@
 #![cfg(supersonic_backend_hip)]
 
 use gpu_hal::{
-    copy_h2d, set_backend, sync, vmm_is_supported, Backend, ScalarType, VirtualAllocationRole,
-    VirtualArena, VirtualBacking, VirtualBuffer,
+    copy_h2d, copy_storage_to_device, hal_profile_reset, hal_profile_set_enabled,
+    hal_profile_snapshot, set_backend, storage_to_device_is_supported, sync, vmm_is_supported,
+    Backend, ScalarType, VirtualAllocationRole, VirtualArena, VirtualBacking, VirtualBuffer,
 };
+use std::path::Path;
 
 fn pattern_bytes(n: usize) -> Vec<u8> {
     (0..n)
@@ -30,6 +32,40 @@ fn assert_bytes_eq(label: &str, got: &[u8], expected: &[u8]) {
         &expected[..expected.len().min(16)],
         &got[start..end],
         &expected[start..end]
+    );
+}
+
+#[test]
+fn storage_direct_copy_rejects_unaligned_direct_io_ranges() {
+    set_backend(Backend::Hip);
+    let ptr = std::ptr::NonNull::<u8>::dangling().as_ptr().cast();
+
+    let err = copy_storage_to_device(
+        0,
+        ptr,
+        Path::new("/tmp/supersonic-test-storage-direct.flm"),
+        4096,
+        64,
+    )
+    .expect_err("sub-block direct-I/O length should be rejected before backend dispatch");
+    assert!(
+        err.to_string()
+            .contains("length 64 is not 4096-byte aligned"),
+        "{err}"
+    );
+
+    let err = copy_storage_to_device(
+        0,
+        ptr,
+        Path::new("/tmp/supersonic-test-storage-direct.flm"),
+        512,
+        4096,
+    )
+    .expect_err("unaligned direct-I/O offset should be rejected before backend dispatch");
+    assert!(
+        err.to_string()
+            .contains("source offset 512 is not 4096-byte aligned"),
+        "{err}"
     );
 }
 
@@ -135,6 +171,53 @@ fn vmm_sparse_range_round_trip_stable_pointer() {
             "coarse HIP VMM pages map both test islands into one readable prefix"
         );
     }
+}
+
+#[test]
+fn vmm_storage_direct_copy_is_explicit_without_pageable_fallback() {
+    set_backend(Backend::Hip);
+    if !vmm_is_supported(Backend::Hip, 0) {
+        eprintln!("skip: HIP VMM unsupported on this device/runtime");
+        return;
+    }
+
+    let mut buf = VirtualBuffer::reserve(0, ScalarType::U8, &[1 << 20], VirtualBacking::Discard)
+        .expect("reserve virtual buffer");
+
+    hal_profile_set_enabled(true);
+    hal_profile_reset();
+    let err = buf
+        .copy_storage_range_bytes_no_sync(
+            0,
+            Path::new("/tmp/supersonic-test-storage-direct.flm"),
+            4096,
+            4096,
+        )
+        .expect_err("storage-direct copy should be named but not silently emulated");
+    let profile = hal_profile_snapshot();
+    hal_profile_set_enabled(false);
+
+    assert!(
+        err.to_string()
+            .contains("GPU-direct storage-to-device transfer"),
+        "unexpected error: {err}"
+    );
+    if !storage_to_device_is_supported(Backend::Hip) {
+        assert!(
+            err.to_string().contains("hipFile support is not compiled")
+                && err.to_string().contains("ROCm >= 7.2"),
+            "unsupported HIP storage-direct error should explain the missing hipFile build support: {err}"
+        );
+    }
+    assert!(
+        profile
+            .entries
+            .iter()
+            .all(|entry| entry.op != "copy_h2d" && entry.op != "vmm_map_no_sync"),
+        "storage-direct copy must not fall back to pageable mapping/copy: {:?}",
+        profile.entries
+    );
+    assert_eq!(buf.stats().logical_resident_bytes, 0);
 }
 
 #[test]

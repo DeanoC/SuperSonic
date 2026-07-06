@@ -1,9 +1,11 @@
 use std::borrow::Cow;
 
 use anyhow::{anyhow, Context, Result};
-use gpu_hal::{GpuBuffer, ScalarType, VirtualAllocationRole, VirtualArena};
+use gpu_hal::{
+    current_backend, Backend, GpuBuffer, ScalarType, VirtualAllocationRole, VirtualArena,
+};
 use model_store::manifest::LayoutTag;
-use model_store::BakedStore;
+use model_store::{BakedStore, TensorStorageExtent, VirtualArenaTransferBackend};
 use qwen36_moe::config::TextConfig;
 
 use crate::qwen36_moe_residency::MoeExpertResidencyManager;
@@ -19,6 +21,21 @@ use crate::qwen36_moe_types::{
 /// runs as part of the dry-run, so a missing tensor here is a real bug).
 pub(crate) fn load_to_gpu(store: &BakedStore, ordinal: usize, name: &str) -> Result<GpuBuffer> {
     let resolved = resolve_qwen36_store_name(store, name);
+    if registered_mmap_upload_enabled() && current_backend() == Backend::Hip {
+        if let Ok(Some(extent)) = store.tensor_storage_extent(resolved.as_ref()) {
+            if should_use_registered_mmap_upload_for_extent(&extent) {
+                match store.load_to_gpu_registered_mmap(resolved.as_ref(), ordinal) {
+                    Ok(buffer) => return Ok(buffer),
+                    Err(err) => {
+                        eprintln!(
+                            "[flm] registered mmap upload failed for {}; falling back to pageable upload: {err}",
+                            resolved.as_ref()
+                        );
+                    }
+                }
+            }
+        }
+    }
     store
         .load_to_gpu(resolved.as_ref(), ordinal)
         .with_context(|| format!("BakedStore::load_to_gpu({name})"))
@@ -36,10 +53,16 @@ fn load_to_virtual_resident_weight(
     store: &BakedStore,
     arena: &mut VirtualArena,
     name: &str,
+    transfer_backend: VirtualArenaTransferBackend,
 ) -> Result<ResidentWeight> {
     let resolved = resolve_qwen36_store_name(store, name);
     let id = store
-        .load_to_virtual_arena(arena, resolved.as_ref(), VirtualAllocationRole::MoeExpert)
+        .load_to_virtual_arena_with_backend(
+            arena,
+            resolved.as_ref(),
+            VirtualAllocationRole::MoeExpert,
+            transfer_backend,
+        )
         .with_context(|| format!("BakedStore::load_to_virtual_arena({name})"))?;
     let allocation = arena
         .allocation(id)
@@ -83,6 +106,115 @@ pub(crate) fn store_contains_qwen36(store: &BakedStore, name: &str) -> bool {
 
 pub(crate) fn store_layout_qwen36<'a>(store: &'a BakedStore, name: &str) -> Option<&'a LayoutTag> {
     store.layout(resolve_qwen36_store_name(store, name).as_ref())
+}
+
+const REGISTERED_MMAP_UPLOAD_MIN_BYTES: u64 = 256 * 1024 * 1024;
+
+fn registered_mmap_upload_enabled() -> bool {
+    registered_mmap_upload_env_value_enabled(
+        std::env::var("SUPERSONIC_FLM_REGISTERED_UPLOAD")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn registered_mmap_upload_env_value_enabled(value: Option<&str>) -> bool {
+    matches!(
+        value.map(|value| value.to_ascii_lowercase()),
+        Some(value) if matches!(value.as_str(), "1" | "true" | "on" | "yes")
+    )
+}
+
+fn should_use_registered_mmap_upload_for_extent(extent: &TensorStorageExtent) -> bool {
+    extent.storage_dtype == "u8"
+        && extent.upload_dtype == "u8"
+        && extent.byte_len >= REGISTERED_MMAP_UPLOAD_MIN_BYTES
+        && matches!(extent.layout, LayoutTag::Int4Quantized)
+        && extent.name.ends_with(".mlp.experts.gate_up_proj")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use model_store::{TensorStorageExtent, TensorStorageSourceKind};
+    use std::path::PathBuf;
+
+    fn test_extent(
+        name: &str,
+        byte_len: u64,
+        storage_dtype: &str,
+        layout: LayoutTag,
+    ) -> TensorStorageExtent {
+        TensorStorageExtent {
+            source_kind: TensorStorageSourceKind::FlmContainer,
+            source_path: PathBuf::from("/tmp/model.flm"),
+            name: name.to_string(),
+            file_offset: 4096,
+            byte_len,
+            storage_dtype: storage_dtype.to_string(),
+            storage_shape: vec![128, 8192, 256],
+            layout,
+            upload_dtype: storage_dtype.to_string(),
+            upload_shape: vec![128, 8192, 256],
+        }
+    }
+
+    #[test]
+    fn registered_mmap_upload_policy_targets_native_int4_gate_up_slabs() {
+        assert!(should_use_registered_mmap_upload_for_extent(&test_extent(
+            "model.language_model.layers.0.mlp.experts.gate_up_proj",
+            268_435_456,
+            "u8",
+            LayoutTag::Int4Quantized,
+        )));
+        assert!(!should_use_registered_mmap_upload_for_extent(&test_extent(
+            "model.language_model.layers.0.mlp.experts.down_proj",
+            268_435_456,
+            "u8",
+            LayoutTag::Int4Quantized,
+        )));
+        assert!(!should_use_registered_mmap_upload_for_extent(&test_extent(
+            "lm_head.weight",
+            1_017_118_720,
+            "bf16",
+            LayoutTag::Raw,
+        )));
+        assert!(!should_use_registered_mmap_upload_for_extent(&test_extent(
+            "mtp.layers.0.mlp.experts.gate_up_proj",
+            524_288,
+            "u8",
+            LayoutTag::Int4Quantized,
+        )));
+    }
+
+    #[test]
+    fn registered_mmap_upload_policy_requires_native_int4_extent() {
+        assert!(!should_use_registered_mmap_upload_for_extent(&test_extent(
+            "model.language_model.layers.0.mlp.experts.gate_up_proj",
+            268_435_456,
+            "u8",
+            LayoutTag::Raw,
+        )));
+        assert!(should_use_registered_mmap_upload_for_extent(&test_extent(
+            "model.language_model.layers.0.mlp.experts.gate_up_proj",
+            268_435_456,
+            "u8",
+            LayoutTag::Int4Quantized,
+        )));
+    }
+
+    #[test]
+    fn registered_mmap_upload_is_opt_in() {
+        assert!(!registered_mmap_upload_env_value_enabled(None));
+        assert!(registered_mmap_upload_env_value_enabled(Some("1")));
+        assert!(registered_mmap_upload_env_value_enabled(Some("true")));
+        assert!(registered_mmap_upload_env_value_enabled(Some("on")));
+        assert!(registered_mmap_upload_env_value_enabled(Some("yes")));
+        assert!(!registered_mmap_upload_env_value_enabled(Some("0")));
+        assert!(!registered_mmap_upload_env_value_enabled(Some("false")));
+        assert!(!registered_mmap_upload_env_value_enabled(Some("off")));
+        assert!(!registered_mmap_upload_env_value_enabled(Some("no")));
+    }
 }
 
 pub(crate) fn resolve_qwen36_store_name<'a>(store: &BakedStore, name: &'a str) -> Cow<'a, str> {
@@ -212,6 +344,7 @@ pub(crate) fn load_layer_buffers(
     kv_vmm: bool,
     mut expert_arena: Option<&mut VirtualArena>,
     mut expert_residency: Option<&mut MoeExpertResidencyManager>,
+    expert_virtual_transfer_backend: VirtualArenaTransferBackend,
 ) -> Result<LayerBuffers> {
     let lp = format!("{weight_prefix}.layers.{layer_idx}");
 
@@ -797,6 +930,7 @@ pub(crate) fn load_layer_buffers(
                     store,
                     &mut **arena,
                     &format!("{mp}.experts.gate_up_proj"),
+                    expert_virtual_transfer_backend,
                 )?,
                 None => {
                     load_to_resident_weight(store, ordinal, &format!("{mp}.experts.gate_up_proj"))?
@@ -818,6 +952,7 @@ pub(crate) fn load_layer_buffers(
                     store,
                     &mut **arena,
                     &format!("{mp}.experts.down_proj"),
+                    expert_virtual_transfer_backend,
                 )?,
                 None => {
                     load_to_resident_weight(store, ordinal, &format!("{mp}.experts.down_proj"))?
@@ -862,6 +997,7 @@ pub(crate) fn load_all_layer_buffers(
     kv_vmm: bool,
     mut expert_arena: Option<&mut VirtualArena>,
     mut expert_residency: Option<&mut MoeExpertResidencyManager>,
+    expert_virtual_transfer_backend: VirtualArenaTransferBackend,
 ) -> Result<Vec<LayerBuffers>> {
     let mut layers = Vec::with_capacity(geom.num_layers as usize);
     for li in 0..geom.num_layers as usize {
@@ -878,6 +1014,7 @@ pub(crate) fn load_all_layer_buffers(
             kv_vmm,
             expert_arena.as_deref_mut(),
             expert_residency.as_deref_mut(),
+            expert_virtual_transfer_backend,
         )
         .with_context(|| format!("load layer {li} weights"))?;
         layers.push(layer);

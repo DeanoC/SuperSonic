@@ -30,11 +30,16 @@ DEFAULT_27B_MODEL_DIR = Path("/mnt/data/tmp/supersonic-qwen36-27b-lucebox")
 DEFAULT_27B_QUANT = "q4km-gptq"
 DEFAULT_35B_A3B_MODEL = "qwen3.6-35b-a3b"
 DEFAULT_35B_A3B_MODEL_DIR = Path("/mnt/data/models/Qwen3.6-35B-A3B")
+DEFAULT_35B_A3B_FLM_MODEL_DIR = Path(
+    "/mnt/data/tmp/flm-first-class-e2e-20260704/qwen36-35b-a3b-supersonic-native-int4-aligned.flm"
+)
 DEFAULT_35B_A3B_QUANT = "int4"
 DEFAULT_OUT_JSON = Path("target/qwen36_he_supersonic.json")
 DEFAULT_35B_A3B_OUT_JSON = Path("target/qwen36_35b_a3b_he_supersonic.json")
+DEFAULT_35B_A3B_FLM_OUT_JSON = Path("target/qwen36_35b_a3b_flm_he_supersonic.json")
 DEFAULT_CONTEXT_SIZE = 512
 LUCEBOX_SERVING_CONTEXT_SIZE = 1024
+GIB = 1024.0 * 1024.0 * 1024.0
 LUCEBOX_DRAFT_ALIASES = {
     "supersonic-q8-bf16": {
         "label": "supersonic-q8-bf16",
@@ -58,6 +63,36 @@ RESULT_RE = re.compile(
     r"decode_ms=(?P<decode_ms>[0-9.]+)\s+"
     r"ms_per_(?:step|tok)=(?P<ms_per_step>[0-9.]+)"
 )
+LIFECYCLE_RE = re.compile(r"\[qwen36-moe lifecycle-timings\]\s+(?P<body>.+)")
+STARTUP_RE = re.compile(r"\[qwen36-moe startup-timings\]\s+(?P<body>.+)")
+SPARSE_RESIDENCY_RE = re.compile(r"\[vmm\]\s+MoE island residency:\s+(?P<body>.+)")
+SPARSE_BREAKDOWN_RE = re.compile(r"\[qwen36-moe sparse-breakdown\]\s+(?P<body>.+)")
+TIMING_KV_RE = re.compile(r"(?P<key>[a-zA-Z_][a-zA-Z0-9_]*)=(?P<value>-?[0-9]+(?:\.[0-9]+)?)")
+INFERRED_MODEL_RE = re.compile(
+    r"\[flm\]\s+inferred model (?P<model>\S+) from runtime descriptor"
+)
+FLM_WEIGHT_MODE_RE = re.compile(
+    r"\[qwen36-moe\]\s+FLM weight mode:\s+(?P<mode>[^\r\n]+)"
+)
+FLM_DIRECT_PROFILE_RE = re.compile(
+    r"\[qwen36-moe\]\s+FLM direct plans:\s+"
+    r"required=(?P<required>\d+)\s+"
+    r"raw_dense=(?P<raw_dense>\d+)\s+"
+    r"native_int4=(?P<native_int4>\d+)\s+"
+    r"bf16_fallback=(?P<bf16_fallback>\d+)"
+)
+FLM_READY_RE = re.compile(
+    r"\[FLM runtime weights\]\s+ready-for-decode:\s+(?P<ready>YES|NO)"
+    r"(?:\s+\((?P<detail>[^\r\n)]*)\))?"
+)
+HAL_PROFILE_OP_RE = re.compile(
+    r"\[hal-profile-op\]\s+op=(?P<op>\S+)\s+"
+    r"calls=(?P<calls>\d+)\s+"
+    r"mean_ms=(?P<mean_ms>[0-9.]+)\s+"
+    r"total_ms=(?P<total_ms>[0-9.]+)\s+"
+    r"max_ms=(?P<max_ms>[0-9.]+)\s+"
+    r"total_bytes=(?P<total_bytes>\d+)"
+)
 
 
 TARGET_PROFILES = {
@@ -72,6 +107,12 @@ TARGET_PROFILES = {
         "model_dir": DEFAULT_35B_A3B_MODEL_DIR,
         "quant": DEFAULT_35B_A3B_QUANT,
         "out_json": DEFAULT_35B_A3B_OUT_JSON,
+    },
+    "qwen36-35b-a3b-flm": {
+        "model": None,
+        "model_dir": DEFAULT_35B_A3B_FLM_MODEL_DIR,
+        "quant": "none",
+        "out_json": DEFAULT_35B_A3B_FLM_OUT_JSON,
     },
 }
 
@@ -157,6 +198,129 @@ def resolve_dflash_draft(args: argparse.Namespace) -> tuple[Path, Path | None, s
     return Path(config_dir), Path(gguf) if gguf else None, label
 
 
+def parse_lifecycle_timings(text: str) -> dict[str, float] | None:
+    match = LIFECYCLE_RE.search(text)
+    if not match:
+        return None
+    return parse_numeric_kv_body(match.group("body"))
+
+
+def parse_startup_timings(text: str) -> dict[str, float] | None:
+    match = STARTUP_RE.search(text)
+    if not match:
+        return None
+    return parse_numeric_kv_body(match.group("body"))
+
+
+def parse_numeric_kv_body(body: str) -> dict[str, float] | None:
+    values = {
+        item.group("key"): float(item.group("value"))
+        for item in TIMING_KV_RE.finditer(body)
+    }
+    return values or None
+
+
+def parse_sparse_residency(text: str) -> dict[str, float] | None:
+    matches = list(SPARSE_RESIDENCY_RE.finditer(text))
+    if not matches:
+        return None
+    return parse_numeric_kv_body(matches[-1].group("body"))
+
+
+def parse_sparse_breakdown(text: str) -> dict[str, float] | None:
+    matches = list(SPARSE_BREAKDOWN_RE.finditer(text))
+    if not matches:
+        return None
+    return parse_numeric_kv_body(matches[-1].group("body"))
+
+
+def parse_inferred_model(text: str) -> str | None:
+    match = INFERRED_MODEL_RE.search(text)
+    if not match:
+        return None
+    return match.group("model")
+
+
+def parse_flm_weight_mode(text: str) -> str | None:
+    match = FLM_WEIGHT_MODE_RE.search(text)
+    if not match:
+        return None
+    return match.group("mode").strip()
+
+
+def parse_flm_direct_profile(text: str) -> dict[str, int] | None:
+    match = FLM_DIRECT_PROFILE_RE.search(text)
+    if not match:
+        return None
+    return {
+        "required": int(match.group("required")),
+        "raw_dense": int(match.group("raw_dense")),
+        "native_int4": int(match.group("native_int4")),
+        "bf16_fallback": int(match.group("bf16_fallback")),
+    }
+
+
+def parse_flm_ready_for_decode(text: str) -> dict[str, bool | str] | None:
+    match = FLM_READY_RE.search(text)
+    if not match:
+        return None
+    result: dict[str, bool | str] = {"ready": match.group("ready") == "YES"}
+    detail = match.group("detail")
+    if detail:
+        result["detail"] = detail
+    return result
+
+
+def parse_hal_profile_ops(text: str) -> dict[str, dict[str, float | int]] | None:
+    ops = {
+        match.group("op"): {
+            "calls": int(match.group("calls")),
+            "mean_ms": float(match.group("mean_ms")),
+            "total_ms": float(match.group("total_ms")),
+            "max_ms": float(match.group("max_ms")),
+            "total_bytes": int(match.group("total_bytes")),
+        }
+        for match in HAL_PROFILE_OP_RE.finditer(text)
+    }
+    return ops or None
+
+
+def parse_runner_env_overrides(items: list[str] | None) -> dict[str, str]:
+    overrides: dict[str, str] = {}
+    for item in items or []:
+        key, sep, value = item.partition("=")
+        if not sep or not key:
+            raise ValueError(f"runner env override must be KEY=VALUE, got: {item!r}")
+        overrides[key] = value
+    return overrides
+
+
+def requires_flm_first_class_evidence(args: argparse.Namespace) -> bool:
+    model_dir = getattr(args, "model_dir", None)
+    return isinstance(model_dir, Path) and model_dir.suffix == ".flm"
+
+
+def flm_first_class_validation_errors(args: argparse.Namespace, row: dict) -> list[str]:
+    errors: list[str] = []
+    if (
+        getattr(args, "model", None) is None
+        and row.get("resolved_model") != DEFAULT_35B_A3B_MODEL
+    ):
+        errors.append("FLM run did not report inferred model from runtime descriptor")
+    if row.get("flm_weight_mode") != "INT4 native FLM":
+        errors.append("FLM run did not report INT4 native FLM weight mode")
+    if row.get("flm_ready_for_decode") is not True:
+        errors.append("FLM run did not report ready-for-decode YES")
+    direct_profile = row.get("flm_direct_profile")
+    if (
+        not isinstance(direct_profile, dict)
+        or int(direct_profile.get("native_int4", 0)) <= 0
+        or int(direct_profile.get("bf16_fallback", 0)) != 0
+    ):
+        errors.append("FLM run did not report native INT4 direct plan coverage")
+    return errors
+
+
 def apply_target_profile(args: argparse.Namespace) -> None:
     profile = TARGET_PROFILES[args.target_profile]
     if args.model is None:
@@ -186,8 +350,6 @@ def run_one(args: argparse.Namespace, name: str, prompt: str, warmup: bool = Fal
         str(args.binary),
         "--backend",
         args.backend,
-        "--model",
-        args.model,
         "--model-dir",
         str(args.model_dir),
         "--prompt",
@@ -204,11 +366,16 @@ def run_one(args: argparse.Namespace, name: str, prompt: str, warmup: bool = Fal
         str(args.seed),
         "--no-download",
     ]
+    if args.model is not None:
+        cmd.extend(["--model", args.model])
     if args.prompt_no_special_tokens:
         cmd.append("--prompt-no-special-tokens")
     allow_untested_gpu = getattr(args, "allow_untested_gpu", None)
     if allow_untested_gpu:
         cmd.extend(["--allow-untested-gpu", allow_untested_gpu])
+    flm_virtual_transfer_backend = getattr(args, "flm_virtual_transfer_backend", None)
+    if flm_virtual_transfer_backend:
+        cmd.extend(["--flm-virtual-transfer-backend", flm_virtual_transfer_backend])
     if args.quant != "none":
         cmd.append(f"--{args.quant}")
     if args.ignore_eos:
@@ -225,8 +392,13 @@ def run_one(args: argparse.Namespace, name: str, prompt: str, warmup: bool = Fal
 
     env = os.environ.copy()
     env["SUPERSONIC_BACKENDS"] = args.backend
+    if getattr(args, "hal_profile", False):
+        # This runner hook emits gpu-hal rows as [hal-profile-op] lines.
+        env["SUPERSONIC_METAL_PROFILE"] = "1"
     if dflash_draft_gguf is not None:
         env["SUPERSONIC_DFLASH_DRAFT_GGUF"] = str(dflash_draft_gguf)
+    runner_env_overrides = parse_runner_env_overrides(getattr(args, "runner_env", []))
+    env.update(runner_env_overrides)
 
     start = time.monotonic()
     proc = subprocess.run(
@@ -246,6 +418,10 @@ def run_one(args: argparse.Namespace, name: str, prompt: str, warmup: bool = Fal
         "stdout_tail": proc.stdout[-args.tail_chars :],
         "stderr_tail": proc.stderr[-args.tail_chars :],
     }
+    if runner_env_overrides:
+        row["runner_env"] = runner_env_overrides
+    if flm_virtual_transfer_backend:
+        row["flm_virtual_transfer_backend"] = flm_virtual_transfer_backend
     if match:
         row.update(
             {
@@ -259,18 +435,126 @@ def run_one(args: argparse.Namespace, name: str, prompt: str, warmup: bool = Fal
                 "tok_s": 1000.0 / float(match.group("ms_per_step")),
             }
         )
+    lifecycle_timings = parse_lifecycle_timings(combined)
+    if lifecycle_timings:
+        row["lifecycle_timings"] = lifecycle_timings
+    startup_timings = parse_startup_timings(combined)
+    if startup_timings:
+        row["startup_timings"] = startup_timings
+    sparse_residency = parse_sparse_residency(combined)
+    if sparse_residency:
+        row["sparse_residency"] = sparse_residency
+    sparse_breakdown = parse_sparse_breakdown(combined)
+    if sparse_breakdown:
+        row["sparse_breakdown"] = sparse_breakdown
+    resolved_model = parse_inferred_model(combined)
+    if resolved_model:
+        row["resolved_model"] = resolved_model
+    flm_weight_mode = parse_flm_weight_mode(combined)
+    if flm_weight_mode:
+        row["flm_weight_mode"] = flm_weight_mode
+    flm_direct_profile = parse_flm_direct_profile(combined)
+    if flm_direct_profile:
+        row["flm_direct_profile"] = flm_direct_profile
+    flm_ready = parse_flm_ready_for_decode(combined)
+    if flm_ready is not None:
+        row["flm_ready_for_decode"] = flm_ready["ready"]
+        if "detail" in flm_ready:
+            row["flm_ready_for_decode_detail"] = flm_ready["detail"]
+    hal_profile_ops = parse_hal_profile_ops(combined)
+    if hal_profile_ops:
+        row["hal_profile_ops"] = hal_profile_ops
     if args.dflash:
         row["dflash_draft_label"] = dflash_draft_label
         row["dflash_draft_dir"] = str(dflash_draft_dir)
         row["dflash_draft_gguf"] = str(dflash_draft_gguf) if dflash_draft_gguf else None
+    if proc.returncode == 0 and requires_flm_first_class_evidence(args):
+        validation_errors = flm_first_class_validation_errors(args, row)
+        if validation_errors:
+            row["runner_returncode"] = proc.returncode
+            row["returncode"] = 1
+            row["benchmark_validation_errors"] = validation_errors
     return row
+
+
+def mean_common_numeric_field(rows: list[dict], field: str) -> dict[str, float] | None:
+    keys = sorted(
+        {
+            key
+            for row in rows
+            for key in row.get(field, {}).keys()
+            if all(key in other.get(field, {}) for other in rows)
+        }
+    )
+    if not keys:
+        return None
+    return {
+        key: sum(row[field][key] for row in rows) / len(rows)
+        for key in keys
+    }
+
+
+def gib_per_second(bytes_count: int | float, elapsed_ms: int | float) -> float:
+    if elapsed_ms <= 0:
+        return 0.0
+    return (float(bytes_count) / GIB) / (float(elapsed_ms) / 1000.0)
+
+
+def build_flm_load_speed_summary(rows: list[dict]) -> dict[str, float | int] | None:
+    summary: dict[str, float | int] = {}
+    h2d_rows = [
+        row
+        for row in rows
+        if "layer_load_copy_h_to_d_bytes" in row.get("lifecycle_timings", {})
+        and "layer_load_copy_h_to_d_ms" in row.get("lifecycle_timings", {})
+    ]
+    if h2d_rows:
+        h2d_bytes = sum(
+            int(row["lifecycle_timings"]["layer_load_copy_h_to_d_bytes"])
+            for row in h2d_rows
+        )
+        h2d_ms = sum(
+            float(row["lifecycle_timings"]["layer_load_copy_h_to_d_ms"])
+            for row in h2d_rows
+        )
+        if h2d_bytes > 0 and h2d_ms > 0:
+            summary.update(
+                {
+                    "layer_load_copy_h_to_d_bytes": h2d_bytes,
+                    "layer_load_copy_h_to_d_ms": h2d_ms,
+                    "layer_load_copy_h_to_d_gib_s": gib_per_second(h2d_bytes, h2d_ms),
+                }
+            )
+
+    for op in ("copy_h2d", "copy_storage_to_device"):
+        op_rows = [row for row in rows if op in row.get("hal_profile_ops", {})]
+        if not op_rows:
+            continue
+        op_bytes = sum(
+            int(row["hal_profile_ops"][op]["total_bytes"])
+            for row in op_rows
+        )
+        op_ms = sum(
+            float(row["hal_profile_ops"][op]["total_ms"])
+            for row in op_rows
+        )
+        if op_bytes <= 0 or op_ms <= 0:
+            continue
+        summary.update(
+            {
+                f"{op}_bytes": op_bytes,
+                f"{op}_ms": op_ms,
+                f"{op}_gib_s": gib_per_second(op_bytes, op_ms),
+            }
+        )
+    return summary or None
 
 
 def build_summary(rows: list[dict]) -> dict:
     ok = [r for r in rows if r.get("returncode") == 0 and "tok_s" in r]
     total_generated = sum(r["generated_tokens"] for r in ok)
     total_decode_ms = sum(r["decode_ms"] for r in ok)
-    return {
+    summary = {
         "count": len(ok),
         "mean_tok_s": sum(r["tok_s"] for r in ok) / len(ok),
         "weighted_tok_s": (1000.0 * total_generated / total_decode_ms)
@@ -283,6 +567,75 @@ def build_summary(rows: list[dict]) -> dict:
         "total_decode_ms": total_decode_ms,
         "stopped_early_count": sum(1 for r in ok if r.get("stopped_early")),
     }
+    lifecycle_keys = sorted(
+        {
+            key
+            for row in ok
+            for key in row.get("lifecycle_timings", {}).keys()
+            if all(key in other.get("lifecycle_timings", {}) for other in ok)
+        }
+    )
+    if lifecycle_keys:
+        summary["mean_lifecycle_timings"] = {
+            key: sum(row["lifecycle_timings"][key] for row in ok) / len(ok)
+            for key in lifecycle_keys
+        }
+    startup_keys = sorted(
+        {
+            key
+            for row in ok
+            for key in row.get("startup_timings", {}).keys()
+            if all(key in other.get("startup_timings", {}) for other in ok)
+        }
+    )
+    if startup_keys:
+        summary["mean_startup_timings"] = {
+            key: sum(row["startup_timings"][key] for row in ok) / len(ok)
+            for key in startup_keys
+        }
+    mean_sparse_residency = mean_common_numeric_field(ok, "sparse_residency")
+    if mean_sparse_residency:
+        summary["mean_sparse_residency"] = mean_sparse_residency
+    mean_sparse_breakdown = mean_common_numeric_field(ok, "sparse_breakdown")
+    if mean_sparse_breakdown:
+        summary["mean_sparse_breakdown"] = mean_sparse_breakdown
+    flm_weight_modes = sorted(
+        {row["flm_weight_mode"] for row in ok if row.get("flm_weight_mode")}
+    )
+    if flm_weight_modes:
+        summary["flm_weight_modes"] = flm_weight_modes
+    if any("flm_ready_for_decode" in row for row in ok):
+        summary["flm_ready_for_decode_count"] = sum(
+            1 for row in ok if row.get("flm_ready_for_decode")
+        )
+    flm_direct_profiles = []
+    for row in ok:
+        profile = row.get("flm_direct_profile")
+        if profile and profile not in flm_direct_profiles:
+            flm_direct_profiles.append(profile)
+    if flm_direct_profiles:
+        summary["flm_direct_profiles"] = flm_direct_profiles
+    hal_op_names = sorted(
+        {
+            op
+            for row in ok
+            for op in row.get("hal_profile_ops", {}).keys()
+            if all(op in other.get("hal_profile_ops", {}) for other in ok)
+        }
+    )
+    if hal_op_names:
+        hal_metrics = ("calls", "mean_ms", "total_ms", "max_ms", "total_bytes")
+        summary["mean_hal_profile_ops"] = {
+            op: {
+                metric: sum(row["hal_profile_ops"][op][metric] for row in ok) / len(ok)
+                for metric in hal_metrics
+            }
+            for op in hal_op_names
+        }
+    flm_load_speed = build_flm_load_speed_summary(ok)
+    if flm_load_speed:
+        summary["flm_load_speed"] = flm_load_speed
+    return summary
 
 
 def main() -> int:
@@ -343,6 +696,30 @@ def main() -> int:
         default=True,
     )
     parser.add_argument("--emit-stage-timings", action="store_true")
+    parser.add_argument(
+        "--flm-virtual-transfer-backend",
+        choices=["pageable-h2d", "gpu-direct-storage", "gds", "hipfile"],
+        default=None,
+        help=(
+            "Forward SuperSonic's FLM virtual transfer backend selector. "
+            "Explicit CLI selection takes precedence over runner env overrides."
+        ),
+    )
+    parser.add_argument(
+        "--hal-profile",
+        action="store_true",
+        help="Enable the runner HAL op dump and parse [hal-profile-op] rows into JSON.",
+    )
+    parser.add_argument(
+        "--runner-env",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help=(
+            "Forward an environment override to the SuperSonic process. "
+            "Repeat for multiple overrides."
+        ),
+    )
     parser.add_argument("--kv-fp8", action="store_true")
     parser.add_argument(
         "--allow-untested-gpu",
@@ -385,6 +762,7 @@ def main() -> int:
         apply_lucebox_serving_mode(args)
     if args.stop_on_eos:
         args.ignore_eos = False
+    runner_env_overrides = parse_runner_env_overrides(args.runner_env)
 
     if not args.binary.exists():
         raise FileNotFoundError(args.binary)
@@ -428,9 +806,14 @@ def main() -> int:
         return 1
     summary = build_summary(rows)
     dflash_draft_dir, dflash_draft_gguf, dflash_draft_label = resolve_dflash_draft(args)
+    resolved_model = args.model or next(
+        (row["resolved_model"] for row in rows if row.get("resolved_model")),
+        None,
+    )
     payload = {
         "schema": "supersonic-qwen36-he-comparison-v2",
         "model": args.model,
+        "resolved_model": resolved_model,
         "model_dir": str(args.model_dir),
         "quant": args.quant,
         "dflash": args.dflash,
@@ -440,6 +823,7 @@ def main() -> int:
         "dflash_block": args.dflash_block if args.dflash_block else None,
         "backend": args.backend,
         "allow_untested_gpu": args.allow_untested_gpu,
+        "flm_virtual_transfer_backend": args.flm_virtual_transfer_backend,
         "context_size": args.context_size,
         "n_gen": args.n_gen,
         "eos_policy": "ignore" if args.ignore_eos else "stop",
@@ -448,9 +832,14 @@ def main() -> int:
         "lucebox_bench": str(args.lucebox_bench),
         "lucebox_jsonl": str(args.lucebox_jsonl),
         "lucebox_serving_mode": args.lucebox_serving_mode,
+        "runner_env": runner_env_overrides or None,
         "summary": summary,
         "rows": rows,
     }
+    if "flm_weight_modes" in summary:
+        payload["flm_weight_modes"] = summary["flm_weight_modes"]
+    if "flm_ready_for_decode_count" in summary:
+        payload["flm_ready_for_decode_count"] = summary["flm_ready_for_decode_count"]
     args.out_json.parent.mkdir(parents=True, exist_ok=True)
     args.out_json.write_text(json.dumps(payload, indent=2))
     print("-" * 70)

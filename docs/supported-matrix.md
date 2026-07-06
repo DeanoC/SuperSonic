@@ -54,7 +54,10 @@ Seven backend surfaces are validated or in bring-up today:
   rigs carry, so consumers pull the published bake from GitHub
   releases (see [docs/bake-distribution.md](bake-distribution.md));
   producer workflow is unchanged. `--fp8-runtime` and `--kv-fp8` are
-  not wired for the MoE family.
+  not wired for the MoE family. An experimental no-HF FLM source lane is
+  also tracked for the native INT4 artifact: config, tokenizer, model identity,
+  direct weight mode, and load/decode timing come from the `.flm` file instead
+  of HF sidecars, `.supersonic`, or a required `--int4` flag.
 
 ### HIP on `gfx1201`
 

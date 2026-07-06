@@ -11,9 +11,13 @@ use manifest::{Manifest, QuantProfile, CONVERTER_VERSION, FORMAT_VERSION};
 
 pub use baker::{bake_phi4, bake_qwen35};
 pub use flm::{
-    FlmAsset, FlmQwen36DenseConfig, FlmQwen36MoeConfig, FlmRuntimeDirectory, FlmTokenizerDescriptor,
+    FlmAsset, FlmQwen36DenseConfig, FlmQwen36MoeConfig, FlmRuntimeDirectory, FlmRuntimeIdentity,
+    FlmTokenizerDescriptor,
 };
-pub use store::{BakedStore, FlmLoadOptions};
+pub use store::{
+    read_flm_runtime_identity, BakedStore, FlmLoadOptions, TensorStorageExtent, TensorStorageRange,
+    TensorStorageSourceKind, VirtualArenaTransferBackend,
+};
 
 /// Error type for bake and load operations.
 #[derive(Debug, thiserror::Error)]

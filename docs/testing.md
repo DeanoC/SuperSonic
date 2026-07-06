@@ -99,9 +99,10 @@ HIP decode path. Validate the native SuperSonic-layout artifact with
 geo-quant's no-HF profile first:
 
 ```bash
-/home/deano/.config/superpowers/worktrees/geo-quant/flm-export/.venv-rocm/bin/python \
+cd /home/deano/.config/superpowers/worktrees/geo-quant/flm-direct-io-alignment
+/home/deano/projects/geo-quant/.venv-rocm/bin/python \
   -m geoquant.formats.flm_validate \
-  /mnt/data/runs/geo-quant/qwen36-35b-a3b-supersonic-native-int4.flm \
+  /mnt/data/tmp/flm-first-class-e2e-20260704/qwen36-35b-a3b-supersonic-native-int4-aligned.flm \
   --profile runnable-no-hf \
   --verify-payload-hashes
 ```
@@ -110,22 +111,100 @@ The model-store loader can validate the same artifact's native aliases without
 running generation:
 
 ```bash
-SUPERSONIC_QWEN36_35B_NATIVE_INT4_FLM=/mnt/data/runs/geo-quant/qwen36-35b-a3b-supersonic-native-int4.flm \
-  cargo test -q -p model-store flm_qwen36_35b_native_int4_loadable -- --nocapture
+SUPERSONIC_QWEN36_35B_NATIVE_INT4_FLM=/mnt/data/tmp/flm-first-class-e2e-20260704/qwen36-35b-a3b-supersonic-native-int4-aligned.flm \
+SUPERSONIC_QWEN36_35B_NATIVE_INT4_BAKE_DIR=/mnt/data/models/Qwen3.6-35B-A3B/.supersonic/v2-int4-gptq \
+  cargo test -q -p model-store --test flm_qwen36_native_layout -- --nocapture
 ```
+
+This guard compares the FLM direct values for Qwen3.6 linear attention against
+the SuperSonic runtime bake: `conv1d.weight` must already be
+`DepthwiseConvSqueezed`, `dt_bias` must be `[1, 1, H]`, and `A_log` must already
+be exponentiated BF16 `[1, 1, H]`. The loader labels and binds those bytes; it
+does not perform HF-layout reshapes in the normal FLM path.
 
 Then run the env-gated MoE runner smoke:
 
 ```bash
-SUPERSONIC_QWEN36_35B_A3B_NO_HF_FLM=/mnt/data/runs/geo-quant/qwen36-35b-a3b-supersonic-native-int4.flm \
+SUPERSONIC_QWEN36_35B_A3B_NO_HF_FLM=/mnt/data/tmp/flm-first-class-e2e-20260704/qwen36-35b-a3b-supersonic-native-int4-aligned.flm \
   cargo test -q -p runner --test flm_moe_main_path -- --nocapture
 ```
 
-The MoE smoke runs one generated token with `--model qwen3.6-35b-a3b`,
-`--int4`, `--verify-flm-hashes`, and no HF snapshot. It asserts the MoE config,
-tokenizer, and weights all come from the single FLM source, that the FLM is
-opened exactly once, and that the run does not enter fetch, bake, config JSON,
-tokenizer JSON, safetensors, or `.supersonic` paths.
+The MoE smoke runs one generated token with no HF snapshot. The FLM runtime
+descriptor supplies the model identity, and the smoke also covers omitting
+`--model` entirely. It intentionally does not pass `--int4`: SuperSonic infers
+the executable weight mode from the FLM tensor views. The smoke asserts the MoE
+config, tokenizer, and weights all come from the single FLM source, that the FLM
+is opened exactly once, and that the run does not enter fetch, bake, config
+JSON, tokenizer JSON, safetensors, or `.supersonic` paths.
+
+For a direct manual smoke with load/decode timing, run the FLM as the model
+directory:
+
+```bash
+cargo run -q -p runner --bin supersonic -- \
+  --model-dir /mnt/data/tmp/flm-first-class-e2e-20260704/qwen36-35b-a3b-supersonic-native-int4-aligned.flm \
+  --backend hip \
+  --device 0 \
+  --prompt "one two three four five six" \
+  --max-new-tokens 1 \
+  --context-size 64 \
+  --emit-stage-timings
+```
+
+For fast-load timing, leave `--verify-flm-hashes` off; enabling it reads and
+hashes the payload bytes during open and is an integrity check rather than the
+normal latency path.
+
+The Qwen3.6 benchmark harness has a matching FLM target profile. Build the
+runner binary first, then record a small timing JSON with:
+
+```bash
+python3 tests/gfx1100/bench_qwen36_he_supersonic.py \
+  --binary target/release/supersonic \
+  --target-profile qwen36-35b-a3b-flm \
+  --limit 1 \
+  --n-gen 1 \
+  --no-warmup \
+  --emit-stage-timings \
+  --hal-profile
+```
+
+This FLM target profile passes the `.flm` as `--model-dir` without `--model`,
+so the run measures the same descriptor-inferred first-class path as the direct
+smoke above. The resulting JSON records `model: null`,
+`resolved_model: qwen3.6-35b-a3b`, decode throughput, and parsed
+`[qwen36-moe lifecycle-timings]` fields such as `model_source_ms`,
+`layer_load_ms`, `generation_wall_ms`, and `total_wall_ms`. With
+`--hal-profile`, `summary.flm_load_speed` also records aggregate FLM transfer
+bytes, elapsed milliseconds, and GiB/s for `copy_h2d`; on a hipFile-enabled
+host it records the same values for `copy_storage_to_device`.
+
+To validate ROCm 7.2 hipFile storage-to-device transfer on a host with
+`hipfile.h`, `libhipfile`, and passing `/opt/rocm/bin/ais-check`, use the FLM
+upload probe's storage-direct mode on a block-aligned expert tensor first:
+
+```bash
+target/release/qwen36_flm_upload_probe \
+  --model-dir /mnt/data/tmp/flm-first-class-e2e-20260704/qwen36-35b-a3b-supersonic-native-int4-aligned.flm \
+  --backend hip \
+  --device 0 \
+  --tensor model.language_model.layers.0.mlp.experts.gate_up_proj \
+  --iters 1 \
+  --only-storage-direct \
+  --json
+```
+
+On ROCm 7.2+ hipFile, the JSON should include a `storage-direct` record with
+nonzero `copy_storage_to_device_ms` and `copy_storage_to_device_bytes`. On a
+build without hipFile support, the same command should fail with the explicit
+`ROCm >= 7.2 with hipfile.h and libhipfile` diagnostic before measuring an
+accidental pageable fallback. Use `--storage-direct` instead when you want the
+same run to compare pageable and pinned H2D baselines before the storage-direct
+attempt.
+
+Do not use tiny tensors such as `linear_attn.dt_bias` for the storage-direct
+smoke. They are valid FLM payloads, but their byte length is below the 4 KiB
+direct-I/O block size; the probe rejects such ranges before calling hipFile.
 
 Compressed-tensors INT4 FLMs from geo-quant are tested separately through the
 portable fallback path. That path exposes logical CT INT4 weights as BF16 views

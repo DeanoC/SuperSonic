@@ -1,6 +1,11 @@
 use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::collections::BTreeMap;
+#[cfg(supersonic_backend_hipfile)]
+use std::ffi::{c_char, CStr, CString};
 use std::ffi::{c_int, c_void};
+#[cfg(all(unix, supersonic_backend_hipfile))]
+use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -18,8 +23,22 @@ use crate::hip_sys::*;
 use crate::metal_sys::*;
 use crate::scalar_type::ScalarType;
 
+#[cfg(supersonic_backend_hipfile)]
+unsafe extern "C" {
+    fn supersonic_hipfile_read_to_device(
+        ordinal: c_int,
+        path: *const c_char,
+        dst: *mut c_void,
+        source_offset: u64,
+        len: usize,
+        err_buf: *mut c_char,
+        err_buf_len: usize,
+    ) -> c_int;
+}
+
 static HAL_PROFILE_ENABLED: AtomicBool = AtomicBool::new(false);
 static HAL_PROFILE: OnceLock<Mutex<HalProfileAccumulator>> = OnceLock::new();
+const STORAGE_DIRECT_BLOCK_ALIGNMENT: usize = 4096;
 
 #[derive(Debug, Clone)]
 pub struct HalProfileEntry {
@@ -622,6 +641,104 @@ impl Drop for PinnedHostBuffer {
     }
 }
 
+/// RAII wrapper around externally owned host memory registered for faster H2D.
+///
+/// The wrapper does not own the underlying bytes. It only owns the backend
+/// registration and unregisters the exact pointer at drop time.
+pub struct RegisteredHostBuffer {
+    backend: Backend,
+    ordinal: usize,
+    ptr: NonNull<c_void>,
+    len_bytes: usize,
+}
+
+unsafe impl Send for RegisteredHostBuffer {}
+unsafe impl Sync for RegisteredHostBuffer {}
+
+impl RegisteredHostBuffer {
+    /// Register an externally owned host range with the active backend.
+    ///
+    /// # Safety
+    ///
+    /// `ptr..ptr+len_bytes` must stay valid and mapped for the lifetime of the
+    /// returned wrapper, and it must satisfy the backend's host-registration
+    /// alignment requirements. The same range must not be concurrently
+    /// unregistered elsewhere.
+    pub unsafe fn new(ordinal: usize, ptr: *mut c_void, len_bytes: usize) -> Result<Self> {
+        let ptr = NonNull::new(ptr).ok_or_else(|| {
+            GpuError::InvalidArg("RegisteredHostBuffer::new: null host pointer".into())
+        })?;
+        if len_bytes == 0 {
+            return Err(GpuError::InvalidArg(
+                "RegisteredHostBuffer::new: len_bytes must be > 0".into(),
+            ));
+        }
+        let backend = current_backend();
+        hal_profile_time("host_register", len_bytes, || {
+            with_device_impl(backend, ordinal, || match backend {
+                Backend::Hip => {
+                    #[cfg(supersonic_backend_hip)]
+                    {
+                        let status = unsafe { hipHostRegister(ptr.as_ptr(), len_bytes, 0) };
+                        if status != 0 {
+                            return Err(backend_error(Backend::Hip, "hipHostRegister", status));
+                        }
+                        Ok(())
+                    }
+                    #[cfg(not(supersonic_backend_hip))]
+                    Err(GpuError::InvalidArg("HIP backend not compiled".into()))
+                }
+                Backend::Cuda => Err(GpuError::Unsupported(
+                    "RegisteredHostBuffer is not implemented for CUDA yet".into(),
+                )),
+                Backend::Metal => Err(GpuError::Unsupported(
+                    "RegisteredHostBuffer is not implemented for Metal".into(),
+                )),
+            })
+        })?;
+        Ok(Self {
+            backend,
+            ordinal,
+            ptr,
+            len_bytes,
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.len_bytes
+    }
+
+    pub fn as_ptr(&self) -> *const c_void {
+        self.ptr.as_ptr()
+    }
+}
+
+impl Drop for RegisteredHostBuffer {
+    fn drop(&mut self) {
+        let backend = self.backend;
+        let ordinal = self.ordinal;
+        let ptr = self.ptr.as_ptr();
+        let len_bytes = self.len_bytes;
+        let _ = hal_profile_time("host_unregister", len_bytes, || {
+            with_device_impl(backend, ordinal, || match backend {
+                Backend::Hip => {
+                    #[cfg(supersonic_backend_hip)]
+                    {
+                        let status = unsafe { hipHostUnregister(ptr) };
+                        if status != 0 {
+                            return Err(backend_error(Backend::Hip, "hipHostUnregister", status));
+                        }
+                        Ok(())
+                    }
+                    #[cfg(not(supersonic_backend_hip))]
+                    Err(GpuError::InvalidArg("HIP backend not compiled".into()))
+                }
+                Backend::Cuda | Backend::Metal => Ok(()),
+            })
+        });
+    }
+}
+
 /// Allocate `len_bytes` of device memory, zeroed. Same allocator-dispatch
 /// behavior as [`alloc`].
 pub(crate) fn alloc_zeros(
@@ -791,6 +908,151 @@ pub fn copy_h2d_async(
             )),
         })
     })
+}
+
+pub fn storage_to_device_is_supported(backend: Backend) -> bool {
+    match backend {
+        Backend::Hip => hipfile_is_compiled(),
+        Backend::Cuda | Backend::Metal => false,
+    }
+}
+
+#[cfg(supersonic_backend_hipfile)]
+fn hipfile_is_compiled() -> bool {
+    true
+}
+
+#[cfg(not(supersonic_backend_hipfile))]
+fn hipfile_is_compiled() -> bool {
+    false
+}
+
+pub(crate) fn ensure_storage_to_device_supported(
+    backend: Backend,
+    source_path: &Path,
+    source_offset: u64,
+    len: usize,
+) -> Result<()> {
+    if storage_to_device_is_supported(backend) {
+        return Ok(());
+    }
+    let reason = match backend {
+        Backend::Hip => {
+            "hipFile support is not compiled; ROCm >= 7.2 with hipfile.h and libhipfile is required"
+        }
+        Backend::Cuda => "CUDA storage-to-device transfer is not implemented yet",
+        Backend::Metal => "Metal storage-to-device transfer is not implemented",
+    };
+    Err(GpuError::Unsupported(format!(
+        "GPU-direct storage-to-device transfer is not available for {backend}: {reason} \
+         (source={} offset={} len={})",
+        source_path.display(),
+        source_offset,
+        len
+    )))
+}
+
+pub fn copy_storage_to_device(
+    ordinal: usize,
+    dst: *mut c_void,
+    source_path: &Path,
+    source_offset: u64,
+    len: usize,
+) -> Result<()> {
+    if dst.is_null() || len == 0 {
+        return Err(GpuError::InvalidArg(
+            "copy_storage_to_device: null pointer or zero len".into(),
+        ));
+    }
+    if source_path.as_os_str().is_empty() {
+        return Err(GpuError::InvalidArg(
+            "copy_storage_to_device: source path must not be empty".into(),
+        ));
+    }
+    if source_offset % STORAGE_DIRECT_BLOCK_ALIGNMENT as u64 != 0 {
+        return Err(GpuError::InvalidArg(format!(
+            "copy_storage_to_device: source offset {source_offset} is not {STORAGE_DIRECT_BLOCK_ALIGNMENT}-byte aligned"
+        )));
+    }
+    if len % STORAGE_DIRECT_BLOCK_ALIGNMENT != 0 {
+        return Err(GpuError::InvalidArg(format!(
+            "copy_storage_to_device: length {len} is not {STORAGE_DIRECT_BLOCK_ALIGNMENT}-byte aligned"
+        )));
+    }
+    let backend = current_backend();
+    ensure_storage_to_device_supported(backend, source_path, source_offset, len)?;
+    hal_profile_time("copy_storage_to_device", len, || {
+        with_device_impl(backend, ordinal, || match backend {
+            Backend::Hip => {
+                copy_storage_to_device_hipfile(ordinal, dst, source_path, source_offset, len)
+            }
+            Backend::Cuda => Err(GpuError::Unsupported(
+                "copy_storage_to_device is not implemented for CUDA yet".into(),
+            )),
+            Backend::Metal => Err(GpuError::Unsupported(
+                "copy_storage_to_device is not implemented for Metal".into(),
+            )),
+        })
+    })
+}
+
+#[cfg(supersonic_backend_hipfile)]
+fn copy_storage_to_device_hipfile(
+    ordinal: usize,
+    dst: *mut c_void,
+    source_path: &Path,
+    source_offset: u64,
+    len: usize,
+) -> Result<()> {
+    #[cfg(unix)]
+    let path_bytes = source_path.as_os_str().as_bytes();
+    #[cfg(not(unix))]
+    let path_bytes = source_path
+        .to_str()
+        .ok_or_else(|| GpuError::InvalidArg("hipFile source path is not valid UTF-8".into()))?
+        .as_bytes();
+    let path = CString::new(path_bytes).map_err(|_| {
+        GpuError::InvalidArg(format!(
+            "hipFile source path contains an interior NUL: {}",
+            source_path.display()
+        ))
+    })?;
+    let mut err_buf = vec![0i8; 512];
+    let status = unsafe {
+        supersonic_hipfile_read_to_device(
+            ordinal as c_int,
+            path.as_ptr(),
+            dst,
+            source_offset,
+            len,
+            err_buf.as_mut_ptr(),
+            err_buf.len(),
+        )
+    };
+    if status == 0 {
+        return Ok(());
+    }
+    let message = unsafe { CStr::from_ptr(err_buf.as_ptr()) }
+        .to_string_lossy()
+        .into_owned();
+    Err(GpuError::backend(
+        Backend::Hip,
+        format!("hipFile storage-to-device transfer failed: {message}"),
+    ))
+}
+
+#[cfg(not(supersonic_backend_hipfile))]
+fn copy_storage_to_device_hipfile(
+    _ordinal: usize,
+    _dst: *mut c_void,
+    _source_path: &Path,
+    _source_offset: u64,
+    _len: usize,
+) -> Result<()> {
+    Err(GpuError::Unsupported(
+        "hipFile support is not compiled; ROCm >= 7.2 with hipfile.h and libhipfile is required"
+            .into(),
+    ))
 }
 
 /// Copy from device memory to host memory.

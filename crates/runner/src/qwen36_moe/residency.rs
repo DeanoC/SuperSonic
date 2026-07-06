@@ -12,7 +12,7 @@ use gpu_hal::{
     copy_h2d_async, memset_zeros_async, Backend, GpuEvent, GpuStream, PinnedHostBuffer,
     VirtualAllocationRole, VirtualArena, VirtualBacking,
 };
-use model_store::BakedStore;
+use model_store::{BakedStore, VirtualArenaTransferBackend};
 
 use crate::qwen36_moe_residency_pages::{
     oldest_protected_page, page_spans, prune_protected_pages, ranges_overlap,
@@ -66,6 +66,7 @@ pub struct MoeExpertResidencyManager {
     fixed_hot_misses: u64,
     fixed_hot_skipped: u64,
     fixed_hot_evicted_pages: u64,
+    virtual_transfer_backend: VirtualArenaTransferBackend,
     async_page_in: Option<AsyncPageIn>,
     pending_pages: HashMap<ResidentPageKey, PendingPage>,
     async_scheduled_pages: u64,
@@ -134,6 +135,7 @@ impl MoeExpertResidencyManager {
             fixed_hot_misses: 0,
             fixed_hot_skipped: 0,
             fixed_hot_evicted_pages: 0,
+            virtual_transfer_backend: VirtualArenaTransferBackend::PageableH2d,
             async_page_in: None,
             pending_pages: HashMap::new(),
             async_scheduled_pages: 0,
@@ -144,6 +146,11 @@ impl MoeExpertResidencyManager {
             async_uploaded_bytes: 0,
             async_pending_pages_peak: 0,
         }
+    }
+
+    pub fn with_virtual_transfer_backend(mut self, backend: VirtualArenaTransferBackend) -> Self {
+        self.virtual_transfer_backend = backend;
+        self
     }
 
     pub fn arena(&self) -> &VirtualArena {
@@ -650,12 +657,13 @@ impl MoeExpertResidencyManager {
             }
 
             store
-                .load_range_to_virtual_arena(
+                .load_range_to_virtual_arena_with_backend(
                     &mut self.arena,
                     allocation_id,
                     &name,
                     span.offset,
                     span.copy_len,
+                    self.virtual_transfer_backend,
                 )
                 .with_context(|| {
                     format!(
@@ -707,6 +715,9 @@ impl MoeExpertResidencyManager {
         span: PageSpan,
     ) -> Result<bool> {
         if self.async_page_in.is_none() {
+            return Ok(false);
+        }
+        if self.virtual_transfer_backend != VirtualArenaTransferBackend::PageableH2d {
             return Ok(false);
         }
         self.promote_completed_pending_pages()?;

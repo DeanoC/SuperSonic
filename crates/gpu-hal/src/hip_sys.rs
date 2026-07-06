@@ -65,6 +65,8 @@ unsafe extern "C" {
         host_ptr: *mut c_void,
         flags: c_uint,
     ) -> c_int;
+    pub(crate) fn hipHostRegister(ptr: *mut c_void, size: usize, flags: c_uint) -> c_int;
+    pub(crate) fn hipHostUnregister(ptr: *mut c_void) -> c_int;
     pub(crate) fn hipMemcpy(
         dst: *mut c_void,
         src: *const c_void,

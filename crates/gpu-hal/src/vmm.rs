@@ -1,6 +1,7 @@
 #[cfg(supersonic_backend_cuda)]
 use std::ffi::c_int;
 use std::ffi::c_void;
+use std::path::Path;
 use std::ptr::NonNull;
 
 use crate::backend::{current_backend, Backend};
@@ -437,6 +438,35 @@ impl VirtualBuffer {
             self.mappings.push(mapping);
             self.mapped_bytes = self.mapped_bytes.max(seg_offset + seg_len);
         }
+        Ok(())
+    }
+
+    /// Copy a source file range into this virtual buffer without staging
+    /// through a pageable host slice.
+    ///
+    /// Unsupported backends return before mapping any virtual pages, so callers
+    /// cannot accidentally get a pageable H2D fallback when they requested a
+    /// storage-direct transfer.
+    pub fn copy_storage_range_bytes_no_sync(
+        &mut self,
+        dst_offset: usize,
+        source_path: &Path,
+        source_offset: u64,
+        len: usize,
+    ) -> Result<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        ops::ensure_storage_to_device_supported(self.backend, source_path, source_offset, len)?;
+        self.map_range_bytes_no_sync(dst_offset, len)?;
+        ops::copy_storage_to_device(
+            self.device_ordinal,
+            self.offset_mut_ptr(dst_offset),
+            source_path,
+            source_offset,
+            len,
+        )?;
+        ops::sync(self.device_ordinal)?;
         Ok(())
     }
 

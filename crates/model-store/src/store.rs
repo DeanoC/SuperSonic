@@ -1,10 +1,14 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
+#[cfg(unix)]
+use std::ffi::c_int;
+use std::ffi::c_void;
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use gpu_hal::{
-    copy_h2d, sync, GpuBuffer, ScalarType, VirtualAllocationRole, VirtualArena, VirtualBacking,
+    copy_h2d, copy_h2d_async, current_backend, sync, Backend, GpuBuffer, GpuStream,
+    RegisteredHostBuffer, ScalarType, VirtualAllocationRole, VirtualArena, VirtualBacking,
 };
 use memmap2::Mmap;
 
@@ -23,6 +27,92 @@ const FLM_DTYPE_FP8_E4M3: u16 = 3;
 const FLM_DTYPE_UINT8: u16 = 4;
 const FLM_DTYPE_INT32: u16 = 5;
 const FLM_DTYPE_INT64: u16 = 6;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HostRegistrationRange {
+    ptr: *mut c_void,
+    len: usize,
+    data_offset: usize,
+}
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn getpagesize() -> c_int;
+}
+
+fn host_page_size() -> usize {
+    #[cfg(unix)]
+    {
+        let page_size = unsafe { getpagesize() };
+        if page_size > 0 {
+            return page_size as usize;
+        }
+    }
+    4096
+}
+
+fn round_up_to(value: usize, align: usize) -> Result<usize, Error> {
+    if align == 0 {
+        return Err(Error::Other("alignment must be > 0".into()));
+    }
+    let remainder = value % align;
+    if remainder == 0 {
+        return Ok(value);
+    }
+    value
+        .checked_add(align - remainder)
+        .ok_or_else(|| Error::Other("round_up_to overflow".into()))
+}
+
+fn host_registration_range_for_mmap_slice(
+    mmap_start: usize,
+    mmap_len: usize,
+    data_start: usize,
+    data_len: usize,
+    page_size: usize,
+) -> Result<HostRegistrationRange, Error> {
+    if mmap_len == 0 {
+        return Err(Error::Other(
+            "host registration requires a non-empty mmap backing".into(),
+        ));
+    }
+    if data_len == 0 {
+        return Err(Error::Other(
+            "host registration requires a non-empty data slice".into(),
+        ));
+    }
+    if page_size == 0 {
+        return Err(Error::Other(
+            "host registration requires page_size > 0".into(),
+        ));
+    }
+    let mmap_end = mmap_start
+        .checked_add(mmap_len)
+        .ok_or_else(|| Error::Other("mmap backing range overflows".into()))?;
+    let data_end = data_start
+        .checked_add(data_len)
+        .ok_or_else(|| Error::Other("data slice range overflows".into()))?;
+    if data_start < mmap_start || data_end > mmap_end {
+        return Err(Error::Other(format!(
+            "data slice [{data_start:#x}, {data_end:#x}) is outside mmap backing \
+             [{mmap_start:#x}, {mmap_end:#x})"
+        )));
+    }
+    let register_start = data_start - (data_start % page_size);
+    let register_end = round_up_to(data_end, page_size)?;
+    let mmap_page_end = round_up_to(mmap_end, page_size)?;
+    if register_start < mmap_start - (mmap_start % page_size) || register_end > mmap_page_end {
+        return Err(Error::Other(format!(
+            "host registration range [{register_start:#x}, {register_end:#x}) is outside \
+             page-rounded mmap backing ending at {mmap_page_end:#x}"
+        )));
+    }
+    Ok(HostRegistrationRange {
+        ptr: register_start as *mut c_void,
+        len: register_end - register_start,
+        data_offset: data_start - register_start,
+    })
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FlmLoadOptions {
@@ -84,10 +174,57 @@ struct CtSymInt4Bf16Fallback {
 }
 
 /// A memory-mapped baked weight store for fast GPU loading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TensorStorageSourceKind {
+    BakedWeights,
+    FlmContainer,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TensorStorageExtent {
+    pub source_kind: TensorStorageSourceKind,
+    pub source_path: PathBuf,
+    pub name: String,
+    pub file_offset: u64,
+    pub byte_len: u64,
+    pub storage_dtype: String,
+    pub storage_shape: Vec<usize>,
+    pub layout: LayoutTag,
+    pub upload_dtype: String,
+    pub upload_shape: Vec<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TensorStorageRange {
+    /// Full direct file-backed tensor extent this range comes from.
+    pub extent: TensorStorageExtent,
+    /// Byte offset inside the tensor payload.
+    pub tensor_byte_offset: u64,
+    /// Absolute byte offset in the source file for this range.
+    pub file_offset: u64,
+    /// Number of bytes in this range.
+    pub byte_len: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VirtualArenaTransferBackend {
+    /// Map virtual pages and copy from the mmap-backed host slice with normal H2D.
+    PageableH2d,
+    /// Storage-to-device transfer from the source file range into virtual memory.
+    ///
+    /// On HIP this routes through the optional hipFile storage-to-device
+    /// primitive when it is compiled in. Builds or backends without a concrete
+    /// storage-direct implementation return `Unsupported` before pageable
+    /// mapping/copy fallback.
+    GpuDirectStorage,
+}
+
 pub struct BakedStore {
     _mmap: Mmap,
     data: *const u8,
     data_len: usize,
+    source_kind: TensorStorageSourceKind,
+    source_path: PathBuf,
     index: HashMap<String, TensorMeta>,
     synthetic: HashMap<String, Vec<u8>>,
     upload_views: HashMap<String, TensorUploadView>,
@@ -98,6 +235,27 @@ pub struct BakedStore {
 // Safety: the mmap is immutable and lives as long as BakedStore.
 unsafe impl Send for BakedStore {}
 unsafe impl Sync for BakedStore {}
+
+pub fn read_flm_runtime_identity(
+    path: &Path,
+) -> Result<Option<crate::flm::FlmRuntimeIdentity>, Error> {
+    let file = File::open(path)?;
+    let mmap = unsafe { Mmap::map(&file)? };
+    let sb = flm_parse_superblock(&mmap)?;
+    match (sb.runtime_dir_offset, sb.runtime_dir_len) {
+        (0, 0) => Ok(None),
+        (0, len) => Err(Error::Other(format!(
+            "FLM runtime directory length is {len} but offset is zero"
+        ))),
+        (offset, 0) => Err(Error::Other(format!(
+            "FLM runtime directory offset is {offset} but length is zero"
+        ))),
+        (offset, len) => {
+            let runtime = read_exact_range(&mmap, offset, len, "FLM runtime directory")?;
+            crate::flm::FlmRuntimeDirectory::parse_identity(runtime).map(Some)
+        }
+    }
+}
 
 fn parse_dtype(name: &str) -> Result<ScalarType, Error> {
     ScalarType::from_name(name).ok_or_else(|| Error::UnsupportedDtype(name.to_string()))
@@ -891,16 +1049,18 @@ fn add_stage3_raw_value_aliases(
         })?;
         let view_dtype = flm_dtype_name(value_step.target_dtype)?.to_string();
         let view_shape = flm_plan_target_shape(value_step)?;
-        index
-            .entry(logical.name.clone())
-            .or_insert_with(|| TensorMeta {
+        let view_layout = stage3_raw_value_alias_layout(&logical.name, &view_shape);
+        index.insert(
+            logical.name.clone(),
+            TensorMeta {
                 name: logical.name.clone(),
                 shape: view_shape.clone(),
                 dtype: view_dtype.clone(),
-                layout: LayoutTag::Raw,
+                layout: view_layout,
                 offset: value_meta.offset,
                 byte_len: value_meta.byte_len,
-            });
+            },
+        );
         upload_views
             .entry(logical.name.clone())
             .or_insert(TensorUploadView {
@@ -909,6 +1069,29 @@ fn add_stage3_raw_value_aliases(
             });
     }
     Ok(())
+}
+
+fn stage3_raw_value_alias_layout(name: &str, shape: &[usize]) -> LayoutTag {
+    if name.contains(".linear_attn.") {
+        if name.ends_with(".conv1d.weight") && shape.len() == 2 {
+            return LayoutTag::DepthwiseConvSqueezed;
+        }
+        if name.ends_with(".dt_bias")
+            && shape.len() == 3
+            && shape.first() == Some(&1)
+            && shape.get(1) == Some(&1)
+        {
+            return LayoutTag::HeadBiasReshaped;
+        }
+        if name.ends_with(".A_log")
+            && shape.len() == 3
+            && shape.first() == Some(&1)
+            && shape.get(1) == Some(&1)
+        {
+            return LayoutTag::HeadExpReshaped;
+        }
+    }
+    LayoutTag::Raw
 }
 
 fn stage3_int4_sidecar_alias(logical_name: &str, suffix: &str) -> String {
@@ -1422,7 +1605,10 @@ impl BakedStore {
         let manifest_text = std::fs::read_to_string(crate::manifest_path(bake_dir))?;
         let manifest: Manifest = serde_json::from_str(&manifest_text)?;
 
-        let weights_file = File::open(crate::weights_bin_path(bake_dir))?;
+        let weights_path = crate::weights_bin_path(bake_dir);
+        let weights_file = File::open(&weights_path)?;
+        let source_path =
+            std::fs::canonicalize(&weights_path).unwrap_or_else(|_| weights_path.clone());
         let mmap = unsafe { Mmap::map(&weights_file)? };
 
         let data = mmap.as_ptr();
@@ -1437,6 +1623,8 @@ impl BakedStore {
             _mmap: mmap,
             data,
             data_len,
+            source_kind: TensorStorageSourceKind::BakedWeights,
+            source_path,
             index,
             synthetic: HashMap::new(),
             upload_views: HashMap::new(),
@@ -1453,6 +1641,7 @@ impl BakedStore {
     /// Open an FLM container with optional compatibility aliases.
     pub fn open_flm_with_options(path: &Path, options: FlmLoadOptions) -> Result<Self, Error> {
         let file = File::open(path)?;
+        let source_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         let mmap = unsafe { Mmap::map(&file)? };
         let data = mmap.as_ptr();
         let data_len = mmap.len();
@@ -1507,6 +1696,8 @@ impl BakedStore {
             _mmap: mmap,
             data,
             data_len,
+            source_kind: TensorStorageSourceKind::FlmContainer,
+            source_path,
             index,
             synthetic,
             upload_views,
@@ -1670,6 +1861,95 @@ impl BakedStore {
         Ok(&bytes[byte_offset..range_end])
     }
 
+    /// Return the concrete file extent for a direct file-backed tensor.
+    ///
+    /// This is the storage-side descriptor future transfer backends need: the
+    /// source file identity plus byte extent, alongside both the bytes-on-disk
+    /// metadata and the runtime upload view. Synthesized and transformed
+    /// aliases return `Ok(None)` because there is no single source-file extent
+    /// that can be transferred directly.
+    pub fn tensor_storage_extent(&self, name: &str) -> Result<Option<TensorStorageExtent>, Error> {
+        let meta = self
+            .index
+            .get(name)
+            .ok_or_else(|| Error::NotFound(name.to_string()))?;
+        if self.synthetic.contains_key(name) || self.ct_int4_bf16_fallbacks.contains_key(name) {
+            return Ok(None);
+        }
+        self.tensor_bytes(name, meta)?;
+        let (upload_dtype, upload_shape) = if let Some(view) = self.upload_views.get(name) {
+            (view.dtype.clone(), view.shape.clone())
+        } else {
+            (meta.dtype.clone(), gpu_upload_shape(meta)?)
+        };
+        Ok(Some(TensorStorageExtent {
+            source_kind: self.source_kind,
+            source_path: self.source_path.clone(),
+            name: name.to_string(),
+            file_offset: meta.offset,
+            byte_len: meta.byte_len,
+            storage_dtype: meta.dtype.clone(),
+            storage_shape: meta.shape.clone(),
+            layout: meta.layout.clone(),
+            upload_dtype,
+            upload_shape,
+        }))
+    }
+
+    /// Return the concrete file range for a direct tensor subrange.
+    ///
+    /// Virtual allocation loaders use this as the source-side transfer
+    /// descriptor: current backends copy from the mmap, while future
+    /// storage-to-GPU backends can use `file_offset` and `byte_len` directly.
+    pub fn tensor_storage_range(
+        &self,
+        name: &str,
+        byte_offset: usize,
+        byte_len: usize,
+    ) -> Result<Option<TensorStorageRange>, Error> {
+        let Some(extent) = self.tensor_storage_extent(name)? else {
+            return Ok(None);
+        };
+        let tensor_byte_offset = u64::try_from(byte_offset).map_err(|_| {
+            Error::Other(format!(
+                "tensor '{name}' storage range offset does not fit u64: {byte_offset}"
+            ))
+        })?;
+        let byte_len_u64 = u64::try_from(byte_len).map_err(|_| {
+            Error::Other(format!(
+                "tensor '{name}' storage range length does not fit u64: {byte_len}"
+            ))
+        })?;
+        let range_end = tensor_byte_offset
+            .checked_add(byte_len_u64)
+            .ok_or_else(|| {
+                Error::Other(format!(
+                    "tensor '{name}' storage range overflows: offset={byte_offset} len={byte_len}"
+                ))
+            })?;
+        if range_end > extent.byte_len {
+            return Err(Error::Other(format!(
+                "tensor '{name}' storage range [{byte_offset}, {range_end}) exceeds byte_len={}",
+                extent.byte_len
+            )));
+        }
+        let file_offset = extent
+            .file_offset
+            .checked_add(tensor_byte_offset)
+            .ok_or_else(|| {
+                Error::Other(format!(
+                    "tensor '{name}' storage range file offset overflows: base={} offset={byte_offset}",
+                    extent.file_offset
+                ))
+            })?;
+        Ok(Some(TensorStorageRange {
+            extent,
+            tensor_byte_offset,
+            file_offset,
+            byte_len: byte_len_u64,
+        }))
+    }
+
     /// Load a tensor from the baked store to GPU memory.
     /// Direct tensors borrow mmap bytes; transformed FLM logical aliases
     /// materialize a temporary host fallback payload before upload.
@@ -1681,6 +1961,81 @@ impl BakedStore {
         let (dtype, upload_shape, payload) = self.upload_payload(name, meta)?;
         let buf = GpuBuffer::from_host_bytes(ordinal, dtype, &upload_shape, payload.as_ref())?;
         Ok(buf)
+    }
+
+    /// Load a direct mmap-backed tensor through backend host registration.
+    ///
+    /// This is an opt-in diagnostic/experimental path for callers that have
+    /// already determined registration is worthwhile for the tensor
+    /// shape/layout. It is not the first-class FLM fast-load target; direct FLM
+    /// plans should still prefer GPU-resident layouts such as virtual expert
+    /// slabs. The registered path deliberately rejects transformed or
+    /// synthetic payloads because those are not backed by this store's mmap.
+    pub fn load_to_gpu_registered_mmap(
+        &self,
+        name: &str,
+        ordinal: usize,
+    ) -> Result<GpuBuffer, Error> {
+        if current_backend() != Backend::Hip {
+            return Err(Error::Gpu(gpu_hal::GpuError::Unsupported(
+                "registered mmap upload is currently implemented for HIP only".into(),
+            )));
+        }
+        let extent = self.tensor_storage_extent(name)?.ok_or_else(|| {
+            Error::Other(format!(
+                "tensor '{name}' is not a direct file-backed extent and cannot use registered upload"
+            ))
+        })?;
+        let byte_offset = u64_to_usize(extent.file_offset, "registered upload file offset")?;
+        let byte_len = u64_to_usize(extent.byte_len, "registered upload byte length")?;
+        let dtype = parse_dtype(&extent.upload_dtype)?;
+        let upload_shape = extent.upload_shape;
+        let bytes = self.raw_byte_range(name, 0, byte_len)?;
+        let data_start = (self.data as usize)
+            .checked_add(byte_offset)
+            .ok_or_else(|| Error::Other("registered upload data pointer overflows".into()))?;
+        let range = host_registration_range_for_mmap_slice(
+            self.data as usize,
+            self.data_len,
+            data_start,
+            byte_len,
+            host_page_size(),
+        )?;
+        let elems = upload_shape
+            .iter()
+            .try_fold(1usize, |acc, dim| acc.checked_mul(*dim))
+            .ok_or_else(|| {
+                Error::Other(format!(
+                    "tensor '{name}' upload shape {:?} overflows element count",
+                    upload_shape
+                ))
+            })?;
+        let expected_bytes = elems.checked_mul(dtype.size_in_bytes()).ok_or_else(|| {
+            Error::Other(format!(
+                "tensor '{name}' upload shape {:?} overflows byte count",
+                upload_shape
+            ))
+        })?;
+        if bytes.len() != expected_bytes {
+            return Err(Error::Other(format!(
+                "tensor '{name}' registered upload expected {expected_bytes} bytes from dtype={dtype:?} shape={upload_shape:?}, got {}",
+                bytes.len()
+            )));
+        }
+
+        let stream = GpuStream::new_nonblocking(ordinal)?;
+        let mut buffer = GpuBuffer::alloc(ordinal, dtype, &upload_shape)?;
+        let registered = unsafe { RegisteredHostBuffer::new(ordinal, range.ptr, range.len)? };
+        copy_h2d_async(
+            ordinal,
+            &stream,
+            buffer.as_mut_ptr(),
+            bytes.as_ptr() as *const c_void,
+            bytes.len(),
+        )?;
+        stream.synchronize()?;
+        drop(registered);
+        Ok(buffer)
     }
 
     /// Load a tensor into a role-tagged virtual allocation.
@@ -1695,13 +2050,30 @@ impl BakedStore {
         name: &str,
         role: VirtualAllocationRole,
     ) -> Result<usize, Error> {
+        self.load_to_virtual_arena_with_backend(
+            arena,
+            name,
+            role,
+            VirtualArenaTransferBackend::PageableH2d,
+        )
+    }
+
+    /// Load a tensor into a role-tagged virtual allocation through an explicit
+    /// transfer backend.
+    pub fn load_to_virtual_arena_with_backend(
+        &self,
+        arena: &mut VirtualArena,
+        name: &str,
+        role: VirtualAllocationRole,
+        backend: VirtualArenaTransferBackend,
+    ) -> Result<usize, Error> {
         let id = self.reserve_virtual_arena(arena, name, role)?;
         let len = self
             .index
             .get(name)
             .ok_or_else(|| Error::NotFound(name.to_string()))?
             .byte_len as usize;
-        self.load_range_to_virtual_arena(arena, id, name, 0, len)?;
+        self.load_range_to_virtual_arena_with_backend(arena, id, name, 0, len, backend)?;
         Ok(id)
     }
 
@@ -1713,39 +2085,39 @@ impl BakedStore {
         name: &str,
         role: VirtualAllocationRole,
     ) -> Result<usize, Error> {
-        let meta = self
-            .index
-            .get(name)
-            .ok_or_else(|| Error::NotFound(name.to_string()))?;
         if self.ct_int4_bf16_fallbacks.contains_key(name) {
             return Err(Error::Other(format!(
                 "tensor '{name}' is a transformed FLM logical alias and cannot be reserved in a virtual arena"
             )));
         }
-        let slice = self.tensor_bytes(name, meta)?;
-        let dtype = parse_dtype(&meta.dtype)?;
-        let expected_len = meta
-            .shape
+        let extent = self.tensor_storage_extent(name)?.ok_or_else(|| {
+            Error::Other(format!(
+                "tensor '{name}' is not a direct file-backed extent and cannot be reserved in a virtual arena"
+            ))
+        })?;
+        let dtype = parse_dtype(&extent.storage_dtype)?;
+        let expected_len = extent
+            .storage_shape
             .iter()
             .try_fold(dtype.size_in_bytes(), |acc, dim| acc.checked_mul(*dim))
             .ok_or_else(|| {
                 Error::Other(format!(
                     "tensor '{}' shape {:?} overflows byte-size calculation",
-                    name, meta.shape
+                    name, extent.storage_shape
                 ))
             })?;
-        if slice.len() != expected_len {
+        if extent.byte_len != expected_len as u64 {
             return Err(Error::Other(format!(
                 "tensor '{}' manifest byte_len={} does not match dtype={} shape={:?} expected_bytes={}",
                 name,
-                slice.len(),
-                meta.dtype,
-                meta.shape,
+                extent.byte_len,
+                extent.storage_dtype,
+                extent.storage_shape,
                 expected_len,
             )));
         }
         arena
-            .reserve(name.to_string(), role, dtype, &meta.shape)
+            .reserve(name.to_string(), role, dtype, &extent.storage_shape)
             .map_err(Error::from)
     }
 
@@ -1759,47 +2131,85 @@ impl BakedStore {
         byte_offset: usize,
         byte_len: usize,
     ) -> Result<(), Error> {
-        let meta = self
-            .index
-            .get(name)
-            .ok_or_else(|| Error::NotFound(name.to_string()))?;
-        if self.ct_int4_bf16_fallbacks.contains_key(name) {
-            return Err(Error::Other(format!(
-                "tensor '{name}' is a transformed FLM logical alias and cannot be range-loaded into a virtual arena"
-            )));
-        }
-        let range_end = byte_offset.checked_add(byte_len).ok_or_else(|| {
+        self.load_range_to_virtual_arena_with_backend(
+            arena,
+            allocation_id,
+            name,
+            byte_offset,
+            byte_len,
+            VirtualArenaTransferBackend::PageableH2d,
+        )
+    }
+
+    /// Load a direct file-backed tensor range into a virtual allocation through
+    /// an explicit transfer backend.
+    ///
+    /// `PageableH2d` is the portable fallback. `GpuDirectStorage` is the
+    /// first-class FLM target backend and reports `Unsupported` instead of
+    /// silently falling back when the selected HAL backend has no concrete
+    /// storage-to-device implementation.
+    pub fn load_range_to_virtual_arena_with_backend(
+        &self,
+        arena: &mut VirtualArena,
+        allocation_id: usize,
+        name: &str,
+        byte_offset: usize,
+        byte_len: usize,
+        backend: VirtualArenaTransferBackend,
+    ) -> Result<(), Error> {
+        let transfer_range = self.tensor_storage_range(name, byte_offset, byte_len)?.ok_or_else(|| {
             Error::Other(format!(
-                "tensor '{name}' load range overflows: offset={byte_offset} len={byte_len}"
+                "tensor '{name}' is not a direct file-backed extent and cannot be range-loaded into a virtual arena"
             ))
         })?;
-        if range_end > meta.byte_len as usize {
-            return Err(Error::Other(format!(
-                "tensor '{name}' load range [{byte_offset}, {range_end}) exceeds byte_len={}",
-                meta.byte_len
-            )));
-        }
-        let src_bytes = self.tensor_bytes(name, meta)?;
-
-        let dtype = parse_dtype(&meta.dtype)?;
+        let dtype = parse_dtype(&transfer_range.extent.storage_dtype)?;
         let ordinal = arena.device_ordinal();
         let allocation = arena.allocation_mut(allocation_id).ok_or_else(|| {
             Error::Other(format!("virtual allocation id {allocation_id} missing"))
         })?;
         let buffer = allocation.buffer_mut();
-        if buffer.dtype() != dtype || buffer.shape() != meta.shape.as_slice() {
+        if buffer.dtype() != dtype
+            || buffer.shape() != transfer_range.extent.storage_shape.as_slice()
+        {
             return Err(Error::Other(format!(
                 "virtual allocation id {allocation_id} does not match tensor '{name}' \
                  (allocation dtype={:?} shape={:?}, tensor dtype={} shape={:?})",
                 buffer.dtype(),
                 buffer.shape(),
-                meta.dtype,
-                meta.shape
+                transfer_range.extent.storage_dtype,
+                transfer_range.extent.storage_shape
             )));
         }
-        buffer.map_range_bytes(byte_offset, byte_len)?;
-        let src = unsafe { src_bytes.as_ptr().add(byte_offset) as *const _ };
-        copy_h2d(ordinal, buffer.offset_mut_ptr(byte_offset), src, byte_len)?;
+        let src_byte_offset = u64_to_usize(
+            transfer_range.tensor_byte_offset,
+            "virtual arena source byte offset",
+        )?;
+        let src_byte_len =
+            u64_to_usize(transfer_range.byte_len, "virtual arena source byte length")?;
+        match backend {
+            VirtualArenaTransferBackend::PageableH2d => {}
+            VirtualArenaTransferBackend::GpuDirectStorage => {
+                buffer.copy_storage_range_bytes_no_sync(
+                    byte_offset,
+                    &transfer_range.extent.source_path,
+                    transfer_range.file_offset,
+                    src_byte_len,
+                )?;
+                return Ok(());
+            }
+        }
+        let src_bytes = self.raw_byte_range(name, src_byte_offset, src_byte_len)?;
+        // The source tensor bytes are copied into the mapped range before the
+        // allocation is observed as loaded, so clearing new pages first only
+        // adds startup bandwidth.
+        buffer.map_range_bytes_no_sync(byte_offset, src_byte_len)?;
+        let src = src_bytes.as_ptr() as *const _;
+        copy_h2d(
+            ordinal,
+            buffer.offset_mut_ptr(byte_offset),
+            src,
+            src_byte_len,
+        )?;
         sync(ordinal)?;
         Ok(())
     }
@@ -3635,6 +4045,98 @@ mod tests {
     }
 
     #[test]
+    fn open_flm_exposes_file_storage_extent_for_direct_tensor() {
+        let data = build_test_flm(&[
+            TestFlmTensor {
+                name: "model.embed_tokens.weight",
+                shape: vec![2, 4],
+                dtype: 4,
+                codec: 0,
+                payload: (0u8..8).collect(),
+            },
+            TestFlmTensor {
+                name: "model.norm.weight",
+                shape: vec![2],
+                dtype: 2,
+                codec: 0,
+                payload: vec![0x00, 0x3f, 0x00, 0x40],
+            },
+        ]);
+        let file = write_temp_flm(&data);
+        let store = BakedStore::open_flm(file.path()).expect("open FLM");
+        let meta = store.meta("model.norm.weight").expect("norm meta");
+
+        let extent = store
+            .tensor_storage_extent("model.norm.weight")
+            .expect("storage extent")
+            .expect("direct FLM tensor should expose a file extent");
+
+        assert_eq!(extent.source_kind, TensorStorageSourceKind::FlmContainer);
+        assert_eq!(extent.source_path, file.path());
+        assert_eq!(extent.name, "model.norm.weight");
+        assert_eq!(extent.file_offset, meta.offset);
+        assert_eq!(extent.byte_len, meta.byte_len);
+        assert_eq!(extent.storage_dtype, "bf16");
+        assert_eq!(extent.storage_shape, vec![2]);
+        assert_eq!(extent.layout, LayoutTag::Raw);
+        assert_eq!(extent.upload_dtype, "bf16");
+        assert_eq!(extent.upload_shape, vec![2]);
+    }
+
+    #[test]
+    fn open_flm_exposes_file_storage_range_for_direct_tensor_slice() {
+        let data = build_test_flm(&[TestFlmTensor {
+            name: "model.norm.weight",
+            shape: vec![4],
+            dtype: 2,
+            codec: 0,
+            payload: vec![0x00, 0x3f, 0x00, 0x40, 0x00, 0x41, 0x00, 0x42],
+        }]);
+        let file = write_temp_flm(&data);
+        let store = BakedStore::open_flm(file.path()).expect("open FLM");
+        let meta = store.meta("model.norm.weight").expect("norm meta");
+
+        let range = store
+            .tensor_storage_range("model.norm.weight", 2, 4)
+            .expect("storage range")
+            .expect("direct FLM tensor slice should expose a file range");
+
+        assert_eq!(
+            range.extent.source_kind,
+            TensorStorageSourceKind::FlmContainer
+        );
+        assert_eq!(range.extent.source_path, file.path());
+        assert_eq!(range.extent.name, "model.norm.weight");
+        assert_eq!(range.extent.file_offset, meta.offset);
+        assert_eq!(range.extent.byte_len, meta.byte_len);
+        assert_eq!(range.tensor_byte_offset, 2);
+        assert_eq!(range.byte_len, 4);
+        assert_eq!(range.file_offset, meta.offset + 2);
+        assert_eq!(range.extent.storage_dtype, "bf16");
+        assert_eq!(range.extent.storage_shape, vec![4]);
+        assert_eq!(range.extent.layout, LayoutTag::Raw);
+        assert_eq!(range.extent.upload_dtype, "bf16");
+        assert_eq!(range.extent.upload_shape, vec![4]);
+    }
+
+    #[test]
+    fn host_registration_range_is_bounded_by_page_rounded_mmap() {
+        let range = host_registration_range_for_mmap_slice(0x1000, 0x2500, 0x2234, 0x40, 4096)
+            .expect("registration range");
+
+        assert_eq!(range.ptr as usize, 0x2000);
+        assert_eq!(range.len, 0x1000);
+        assert_eq!(range.data_offset, 0x234);
+
+        let err = host_registration_range_for_mmap_slice(0x1000, 0x100, 0x0fff, 0x20, 4096)
+            .expect_err("slice outside mmap should fail");
+        assert!(
+            err.to_string().contains("outside mmap backing"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn open_flm_rejects_bad_head_crc64() {
         let mut data = build_test_flm(&[TestFlmTensor {
             name: "model.embed_tokens.weight",
@@ -3690,6 +4192,27 @@ mod tests {
             runtime.asset_by_kind("tokenizer_regex").unwrap().asset_id,
             4
         );
+    }
+
+    #[test]
+    fn read_flm_runtime_identity_reads_model_descriptor_without_store_open() {
+        let mut data = build_test_flm(&[TestFlmTensor {
+            name: "model.embed_tokens.weight",
+            shape: vec![2, 4],
+            dtype: 4,
+            codec: 0,
+            payload: (0u8..8).collect(),
+        }]);
+        let runtime = build_test_runtime_directory();
+        append_runtime_directory(&mut data, &runtime);
+        let file = write_temp_flm(&data);
+
+        let identity = read_flm_runtime_identity(file.path())
+            .expect("read runtime identity")
+            .unwrap();
+
+        assert_eq!(identity.architecture_id, crate::flm::ARCH_QWEN3_6_DENSE);
+        assert_eq!(identity.model_id, crate::flm::MODEL_QWEN3_6_DENSE_V1);
     }
 
     #[test]
@@ -3873,6 +4396,104 @@ mod tests {
     }
 
     #[test]
+    fn flm_runtime_classifies_ct_int4_stage3_plan_as_bf16_fallback() {
+        let data = build_test_flm_with_stage3_logical_bindings();
+        let file = write_temp_flm(&data);
+
+        let store = BakedStore::open_flm_with_options(
+            file.path(),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                verify_block_hashes: false,
+            },
+        )
+        .expect("open CT INT4 Stage 3 FLM");
+
+        let kind = store
+            .flm_runtime()
+            .expect("runtime directory")
+            .stage3_direct_weight_kind("model.language_model.layers.0.mlp.gate_proj.weight")
+            .expect("classify direct weight kind");
+
+        assert_eq!(
+            kind,
+            Some(crate::flm::FlmStage3DirectWeightKind::CtInt4Bf16Fallback)
+        );
+        assert!(
+            store
+                .tensor_storage_extent("model.language_model.layers.0.mlp.gate_proj.weight")
+                .expect("CT fallback storage extent")
+                .is_none(),
+            "CT fallback aliases are materialized transforms and must not expose a single file extent"
+        );
+    }
+
+    #[test]
+    fn flm_runtime_classifies_native_int4_stage3_plan() {
+        let data = build_test_flm_with_stage3_native_int4_bindings();
+        let file = write_temp_flm(&data);
+
+        let store = BakedStore::open_flm_with_options(
+            file.path(),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                verify_block_hashes: false,
+            },
+        )
+        .expect("open native INT4 Stage 3 FLM");
+
+        let kind = store
+            .flm_runtime()
+            .expect("runtime directory")
+            .stage3_direct_weight_kind("model.language_model.layers.0.mlp.experts.gate_up_proj")
+            .expect("classify direct weight kind");
+
+        assert_eq!(
+            kind,
+            Some(crate::flm::FlmStage3DirectWeightKind::NativeInt4)
+        );
+        let extent = store
+            .tensor_storage_extent("model.language_model.layers.0.mlp.experts.gate_up_proj")
+            .expect("native INT4 extent")
+            .expect("native INT4 direct tensor should expose file extent");
+        assert_eq!(extent.source_kind, TensorStorageSourceKind::FlmContainer);
+        assert_eq!(extent.source_path, file.path());
+        assert_eq!(extent.storage_dtype, "u8");
+        assert_eq!(extent.storage_shape, vec![2, 256, 64]);
+        assert_eq!(extent.layout, LayoutTag::Int4Quantized);
+        assert_eq!(extent.upload_dtype, "u8");
+        assert_eq!(extent.upload_shape, vec![2, 256, 64]);
+    }
+
+    #[test]
+    fn flm_runtime_classifies_raw_dense_stage3_plan() {
+        let data = build_test_flm_with_stage3_raw_value_binding();
+        let file = write_temp_flm(&data);
+
+        let store = BakedStore::open_flm_with_options(
+            file.path(),
+            FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                verify_block_hashes: false,
+            },
+        )
+        .expect("open raw dense Stage 3 FLM");
+
+        let runtime = store.flm_runtime().expect("runtime directory");
+        let kind = runtime
+            .stage3_direct_weight_kind("model.language_model.layers.0.linear_attn.A_log")
+            .expect("classify direct weight kind");
+
+        assert_eq!(kind, Some(crate::flm::FlmStage3DirectWeightKind::RawDense));
+        assert_eq!(
+            runtime
+                .stage3_direct_weight_kind("model.language_model.layers.0.missing.weight")
+                .expect("missing logical tensor is not an error"),
+            None
+        );
+    }
+
+    #[test]
     fn open_flm_rejects_native_int4_stage3_binding_with_non_native_abi() {
         let mut data = build_test_flm_with_stage3_native_int4_bindings();
         put_first_storage_abi_codec_semantic(&mut data, crate::flm::CODEC_SYM_INT4_G128_BF16);
@@ -3957,6 +4578,37 @@ mod tests {
     }
 
     #[test]
+    fn open_flm_rejects_virtual_arena_for_synthesized_manifest_alias() {
+        let data = build_test_flm_with_runtime_manifest_group();
+        let file = write_temp_flm(&data);
+
+        let store = BakedStore::open_flm_with_options(
+            file.path(),
+            crate::store::FlmLoadOptions {
+                flm_int4_logical_aliases: true,
+                ..Default::default()
+            },
+        )
+        .expect("open FLM with manifest aliases");
+
+        let mut arena = BakedStore::virtual_weight_arena(0);
+        let err = store
+            .reserve_virtual_arena(
+                &mut arena,
+                "model.language_model.layers.0.mlp.gate_proj.weight_int4_zero",
+                VirtualAllocationRole::Weights,
+            )
+            .expect_err("synthetic aliases must not reserve virtual direct storage")
+            .to_string();
+
+        assert!(
+            err.contains("not a direct file-backed extent"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(arena.stats().allocations, 0);
+    }
+
+    #[test]
     fn open_flm_builds_raw_fp32_value_alias_from_stage3_binding() {
         let data = build_test_flm_with_stage3_raw_value_binding();
         let file = write_temp_flm(&data);
@@ -3987,6 +4639,35 @@ mod tests {
             .expect("raw logical value upload view");
         assert_eq!(upload_view.dtype, "f32");
         assert_eq!(upload_view.shape, vec![4]);
+    }
+
+    #[test]
+    fn stage3_raw_value_alias_layout_marks_qwen_linear_attention_runtime_shapes() {
+        assert_eq!(
+            stage3_raw_value_alias_layout(
+                "model.language_model.layers.0.linear_attn.conv1d.weight",
+                &[8192, 4],
+            ),
+            LayoutTag::DepthwiseConvSqueezed
+        );
+        assert_eq!(
+            stage3_raw_value_alias_layout(
+                "model.language_model.layers.0.linear_attn.dt_bias",
+                &[1, 1, 32],
+            ),
+            LayoutTag::HeadBiasReshaped
+        );
+        assert_eq!(
+            stage3_raw_value_alias_layout(
+                "model.language_model.layers.0.linear_attn.A_log",
+                &[1, 1, 32],
+            ),
+            LayoutTag::HeadExpReshaped
+        );
+        assert_eq!(
+            stage3_raw_value_alias_layout("model.language_model.layers.0.linear_attn.A_log", &[32],),
+            LayoutTag::Raw
+        );
     }
 
     #[test]
@@ -4294,6 +4975,29 @@ mod tests {
                 .raw_bytes("model.language_model.layers.0.mlp.gate_proj.weight_int4_zero")
                 .unwrap(),
             vec![0x00, 0x41].repeat(128).as_slice()
+        );
+        assert!(store
+            .tensor_storage_range("model.language_model.layers.0.mlp.gate_proj.weight", 0, 64)
+            .expect("packed alias storage range")
+            .is_some());
+        assert!(store
+            .tensor_storage_range(
+                "model.language_model.layers.0.mlp.gate_proj.weight_int4_scale",
+                0,
+                64,
+            )
+            .expect("scale alias storage range")
+            .is_some());
+        assert!(
+            store
+                .tensor_storage_range(
+                    "model.language_model.layers.0.mlp.gate_proj.weight_int4_zero",
+                    0,
+                    64,
+                )
+                .expect("synthetic zero storage range")
+                .is_none(),
+            "synthesized zero aliases must not expose direct file-backed transfer ranges"
         );
     }
 
@@ -5974,6 +6678,307 @@ mod tests {
             .expect("read virtual expert");
         assert_eq!(weight, weights[..4096]);
         assert_eq!(expert, weights[4096..]);
+    }
+
+    #[test]
+    fn virtual_arena_load_initializes_mapped_pages_by_copy_without_clearing() {
+        gpu_hal::set_backend(gpu_hal::Backend::Hip);
+        if !gpu_hal::vmm_is_supported(gpu_hal::Backend::Hip, 0) {
+            eprintln!("skip: HIP VMM unsupported on this device/runtime");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bake_dir = tmp.path();
+        let weights = (0..4096)
+            .map(|idx| (idx as u8).wrapping_mul(17).wrapping_add(3))
+            .collect::<Vec<_>>();
+        std::fs::write(crate::weights_bin_path(bake_dir), &weights).expect("write weights.bin");
+        let manifest = Manifest {
+            format_version: FORMAT_VERSION,
+            converter_version: 1,
+            model_family: "test".to_string(),
+            quant_profile: None,
+            source_format: None,
+            source_quant: None,
+            quant_method: None,
+            tensors: vec![TensorMeta {
+                name: "model.layers.0.mlp.experts.gate_up_proj".to_string(),
+                shape: vec![4096],
+                dtype: "u8".to_string(),
+                layout: LayoutTag::Int4Quantized,
+                offset: 0,
+                byte_len: 4096,
+            }],
+        };
+        std::fs::write(
+            crate::manifest_path(bake_dir),
+            serde_json::to_string(&manifest).expect("serialize manifest"),
+        )
+        .expect("write manifest");
+
+        let store = BakedStore::open(bake_dir).expect("open synthetic bake");
+        let mut arena = BakedStore::virtual_weight_arena(0);
+
+        gpu_hal::hal_profile_set_enabled(true);
+        gpu_hal::hal_profile_reset();
+        let allocation_id = store
+            .load_to_virtual_arena(
+                &mut arena,
+                "model.layers.0.mlp.experts.gate_up_proj",
+                gpu_hal::VirtualAllocationRole::MoeExpert,
+            )
+            .expect("load virtual expert");
+        let profile = gpu_hal::hal_profile_snapshot();
+        gpu_hal::hal_profile_set_enabled(false);
+
+        assert!(
+            profile
+                .entries
+                .iter()
+                .any(|entry| entry.op == "vmm_map_no_sync"),
+            "expected virtual upload to map pages with no-clear initialization, got {:?}",
+            profile.entries
+        );
+        assert!(
+            profile
+                .entries
+                .iter()
+                .all(|entry| entry.op != "memset_zeros"),
+            "virtual upload should not clear pages before immediately copying tensor bytes: {:?}",
+            profile.entries
+        );
+
+        let loaded = arena
+            .allocation(allocation_id)
+            .expect("expert allocation")
+            .buffer()
+            .to_host_bytes()
+            .expect("read virtual expert");
+        assert_eq!(loaded, weights);
+    }
+
+    #[test]
+    fn virtual_arena_range_load_supports_explicit_pageable_backend() {
+        gpu_hal::set_backend(gpu_hal::Backend::Hip);
+        if !gpu_hal::vmm_is_supported(gpu_hal::Backend::Hip, 0) {
+            eprintln!("skip: HIP VMM unsupported on this device/runtime");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bake_dir = tmp.path();
+        let weights = (0..4096)
+            .map(|idx| (idx as u8).wrapping_mul(19).wrapping_add(11))
+            .collect::<Vec<_>>();
+        std::fs::write(crate::weights_bin_path(bake_dir), &weights).expect("write weights.bin");
+        let manifest = Manifest {
+            format_version: FORMAT_VERSION,
+            converter_version: 1,
+            model_family: "test".to_string(),
+            quant_profile: None,
+            source_format: None,
+            source_quant: None,
+            quant_method: None,
+            tensors: vec![TensorMeta {
+                name: "model.layers.0.mlp.experts.gate_up_proj".to_string(),
+                shape: vec![4096],
+                dtype: "u8".to_string(),
+                layout: LayoutTag::Int4Quantized,
+                offset: 0,
+                byte_len: 4096,
+            }],
+        };
+        std::fs::write(
+            crate::manifest_path(bake_dir),
+            serde_json::to_string(&manifest).expect("serialize manifest"),
+        )
+        .expect("write manifest");
+
+        let store = BakedStore::open(bake_dir).expect("open synthetic bake");
+        let mut arena = BakedStore::virtual_weight_arena(0);
+        let allocation_id = store
+            .reserve_virtual_arena(
+                &mut arena,
+                "model.layers.0.mlp.experts.gate_up_proj",
+                gpu_hal::VirtualAllocationRole::MoeExpert,
+            )
+            .expect("reserve virtual expert");
+
+        gpu_hal::hal_profile_set_enabled(true);
+        gpu_hal::hal_profile_reset();
+        store
+            .load_range_to_virtual_arena_with_backend(
+                &mut arena,
+                allocation_id,
+                "model.layers.0.mlp.experts.gate_up_proj",
+                0,
+                2048,
+                VirtualArenaTransferBackend::PageableH2d,
+            )
+            .expect("explicit pageable range load");
+        let profile = gpu_hal::hal_profile_snapshot();
+        gpu_hal::hal_profile_set_enabled(false);
+
+        assert!(
+            profile
+                .entries
+                .iter()
+                .any(|entry| entry.op == "vmm_map_no_sync"),
+            "expected explicit pageable backend to map virtual pages for upload, got {:?}",
+            profile.entries
+        );
+        let loaded = arena
+            .allocation(allocation_id)
+            .expect("expert allocation")
+            .buffer()
+            .to_host_prefix_bytes(2048)
+            .expect("read virtual expert");
+        assert_eq!(loaded, weights[..2048]);
+    }
+
+    #[test]
+    fn virtual_arena_range_load_names_gpu_direct_backend_without_fallback() {
+        gpu_hal::set_backend(gpu_hal::Backend::Hip);
+        if !gpu_hal::vmm_is_supported(gpu_hal::Backend::Hip, 0) {
+            eprintln!("skip: HIP VMM unsupported on this device/runtime");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bake_dir = tmp.path();
+        std::fs::write(crate::weights_bin_path(bake_dir), vec![7u8; 4096])
+            .expect("write weights.bin");
+        let manifest = Manifest {
+            format_version: FORMAT_VERSION,
+            converter_version: 1,
+            model_family: "test".to_string(),
+            quant_profile: None,
+            source_format: None,
+            source_quant: None,
+            quant_method: None,
+            tensors: vec![TensorMeta {
+                name: "model.layers.0.mlp.experts.gate_up_proj".to_string(),
+                shape: vec![4096],
+                dtype: "u8".to_string(),
+                layout: LayoutTag::Int4Quantized,
+                offset: 0,
+                byte_len: 4096,
+            }],
+        };
+        std::fs::write(
+            crate::manifest_path(bake_dir),
+            serde_json::to_string(&manifest).expect("serialize manifest"),
+        )
+        .expect("write manifest");
+
+        let store = BakedStore::open(bake_dir).expect("open synthetic bake");
+        let mut arena = BakedStore::virtual_weight_arena(0);
+        let allocation_id = store
+            .reserve_virtual_arena(
+                &mut arena,
+                "model.layers.0.mlp.experts.gate_up_proj",
+                gpu_hal::VirtualAllocationRole::MoeExpert,
+            )
+            .expect("reserve virtual expert");
+
+        gpu_hal::hal_profile_set_enabled(true);
+        gpu_hal::hal_profile_reset();
+        let err = store
+            .load_range_to_virtual_arena_with_backend(
+                &mut arena,
+                allocation_id,
+                "model.layers.0.mlp.experts.gate_up_proj",
+                0,
+                4096,
+                VirtualArenaTransferBackend::GpuDirectStorage,
+            )
+            .expect_err("GPU-direct storage backend should be named but not silently emulated");
+        let profile = gpu_hal::hal_profile_snapshot();
+        gpu_hal::hal_profile_set_enabled(false);
+
+        assert!(
+            err.to_string().contains("GPU-direct storage"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            profile
+                .entries
+                .iter()
+                .all(|entry| entry.op != "copy_h2d" && entry.op != "vmm_map_no_sync"),
+            "GPU-direct backend must not fall back to pageable mapping/copy: {:?}",
+            profile.entries
+        );
+        assert_eq!(arena.stats().logical_resident_bytes, 0);
+    }
+
+    #[test]
+    fn virtual_arena_full_load_honors_explicit_gpu_direct_backend() {
+        gpu_hal::set_backend(gpu_hal::Backend::Hip);
+        if !gpu_hal::vmm_is_supported(gpu_hal::Backend::Hip, 0) {
+            eprintln!("skip: HIP VMM unsupported on this device/runtime");
+            return;
+        }
+        if gpu_hal::storage_to_device_is_supported(gpu_hal::Backend::Hip) {
+            eprintln!("skip: native storage-to-device transfer available on this runtime");
+            return;
+        }
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bake_dir = tmp.path();
+        std::fs::write(crate::weights_bin_path(bake_dir), vec![9u8; 4096])
+            .expect("write weights.bin");
+        let manifest = Manifest {
+            format_version: FORMAT_VERSION,
+            converter_version: 1,
+            model_family: "test".to_string(),
+            quant_profile: None,
+            source_format: None,
+            source_quant: None,
+            quant_method: None,
+            tensors: vec![TensorMeta {
+                name: "model.layers.0.mlp.experts.down_proj".to_string(),
+                shape: vec![4096],
+                dtype: "u8".to_string(),
+                layout: LayoutTag::Int4Quantized,
+                offset: 0,
+                byte_len: 4096,
+            }],
+        };
+        std::fs::write(
+            crate::manifest_path(bake_dir),
+            serde_json::to_string(&manifest).expect("serialize manifest"),
+        )
+        .expect("write manifest");
+
+        let store = BakedStore::open(bake_dir).expect("open synthetic bake");
+        let mut arena = BakedStore::virtual_weight_arena(0);
+        gpu_hal::hal_profile_set_enabled(true);
+        gpu_hal::hal_profile_reset();
+        let err = store
+            .load_to_virtual_arena_with_backend(
+                &mut arena,
+                "model.layers.0.mlp.experts.down_proj",
+                gpu_hal::VirtualAllocationRole::MoeExpert,
+                VirtualArenaTransferBackend::GpuDirectStorage,
+            )
+            .expect_err("full virtual load should honor explicit GPU-direct backend");
+        let profile = gpu_hal::hal_profile_snapshot();
+        gpu_hal::hal_profile_set_enabled(false);
+
+        assert!(
+            err.to_string().contains("GPU-direct storage"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            profile
+                .entries
+                .iter()
+                .all(|entry| entry.op != "copy_h2d" && entry.op != "vmm_map_no_sync"),
+            "GPU-direct backend must not fall back to pageable mapping/copy: {:?}",
+            profile.entries
+        );
+        assert_eq!(arena.stats().logical_resident_bytes, 0);
     }
 
     #[test]

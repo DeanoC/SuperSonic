@@ -2,7 +2,7 @@ use std::path::Path;
 
 use anyhow::{anyhow, Context, Result};
 use gpu_hal::{set_backend, Backend};
-use model_store::BakedStore;
+use model_store::{BakedStore, VirtualArenaTransferBackend};
 
 use crate::qwen36_moe_cli::dry_run::DryRunReport;
 use crate::qwen36_moe_cli::geom::build_multi_layer_geom;
@@ -80,6 +80,7 @@ pub(crate) fn decode_first_token(
             false,
             None,
             None,
+            VirtualArenaTransferBackend::PageableH2d,
         )
         .with_context(|| format!("load layer {li} weights"))?;
         layers.push(layer);

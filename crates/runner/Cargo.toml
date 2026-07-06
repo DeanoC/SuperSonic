@@ -81,6 +81,10 @@ name = "qwen36_ffn_expert_microbench"
 path = "src/bin/qwen36_ffn_expert_microbench.rs"
 
 [[bin]]
+name = "qwen36_flm_upload_probe"
+path = "src/bin/qwen36_flm_upload_probe.rs"
+
+[[bin]]
 name = "qwen36_q4km_manifest_audit"
 path = "src/bin/qwen36_q4km_manifest_audit.rs"
 

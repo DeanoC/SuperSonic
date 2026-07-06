@@ -280,6 +280,19 @@ pub struct FlmPlanStep {
     pub flags: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlmRuntimeIdentity {
+    pub architecture_id: u32,
+    pub model_id: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlmStage3DirectWeightKind {
+    RawDense,
+    CtInt4Bf16Fallback,
+    NativeInt4,
+}
+
 #[derive(Debug, Clone)]
 pub struct FlmRuntimeDirectory {
     pub architecture_id: u32,
@@ -295,6 +308,76 @@ pub struct FlmRuntimeDirectory {
     logical_tensors: Vec<FlmLogicalTensor>,
     storage_bindings: Vec<FlmStorageBinding>,
     plan_steps: Vec<FlmPlanStep>,
+    stage3_indexes: FlmRuntimeStage3Indexes,
+}
+
+#[derive(Debug, Clone, Default)]
+struct FlmRuntimeStage3Indexes {
+    logical_by_name: HashMap<String, usize>,
+    storage_abi_by_id: HashMap<u16, usize>,
+    storage_binding_by_logical_role: HashMap<(u32, u16), usize>,
+    direct_plan_by_logical_role: HashMap<(u32, u16), usize>,
+}
+
+impl FlmRuntimeStage3Indexes {
+    fn build(
+        storage_abis: &[FlmStorageAbi],
+        logical_tensors: &[FlmLogicalTensor],
+        storage_bindings: &[FlmStorageBinding],
+        plan_steps: &[FlmPlanStep],
+    ) -> Result<Self, Error> {
+        let mut indexes = Self::default();
+
+        for (idx, abi) in storage_abis.iter().enumerate() {
+            indexes.storage_abi_by_id.insert(abi.storage_abi_id, idx);
+        }
+
+        for (idx, logical) in logical_tensors.iter().enumerate() {
+            if indexes
+                .logical_by_name
+                .insert(logical.name.clone(), idx)
+                .is_some()
+            {
+                return Err(Error::Other(format!(
+                    "FLM Stage 3 has duplicate logical tensor name {}",
+                    logical.name
+                )));
+            }
+        }
+
+        for (idx, binding) in storage_bindings.iter().enumerate() {
+            let key = (binding.logical_tensor_id, binding.storage_role);
+            if indexes
+                .storage_binding_by_logical_role
+                .insert(key, idx)
+                .is_some()
+            {
+                return Err(Error::Other(format!(
+                    "FLM Stage 3 has duplicate storage binding for logical tensor {} role {}",
+                    binding.logical_tensor_id, binding.storage_role
+                )));
+            }
+        }
+
+        for (idx, step) in plan_steps.iter().enumerate() {
+            if step.consume_strategy != CONSUME_STRATEGY_DIRECT {
+                continue;
+            }
+            let key = (step.logical_tensor_id, step.storage_role);
+            if indexes
+                .direct_plan_by_logical_role
+                .insert(key, idx)
+                .is_some()
+            {
+                return Err(Error::Other(format!(
+                    "FLM Stage 3 has duplicate direct plan for logical tensor {} role {}",
+                    step.logical_tensor_id, step.storage_role
+                )));
+            }
+        }
+
+        Ok(indexes)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -304,6 +387,31 @@ struct SectionRange {
 }
 
 impl FlmRuntimeDirectory {
+    pub fn parse_identity(buf: &[u8]) -> Result<FlmRuntimeIdentity, Error> {
+        let (architecture_id, sections) = parse_section_table(buf)?;
+        let model_descriptor =
+            parse_model_descriptor(section(buf, &sections, SECTION_MODEL_DESCRIPTOR)?)?;
+        let expected_model_id = match architecture_id {
+            ARCH_QWEN3_6_DENSE => MODEL_QWEN3_6_DENSE_V1,
+            ARCH_QWEN3_6_MOE => MODEL_QWEN3_6_MOE_V1,
+            other => {
+                return Err(Error::Other(format!(
+                    "unsupported FLM runtime architecture {other}"
+                )));
+            }
+        };
+        if model_descriptor.model_id != expected_model_id {
+            return Err(Error::Other(format!(
+                "FLM model descriptor model_id {} does not match architecture {} (expected {})",
+                model_descriptor.model_id, architecture_id, expected_model_id
+            )));
+        }
+        Ok(FlmRuntimeIdentity {
+            architecture_id,
+            model_id: model_descriptor.model_id,
+        })
+    }
+
     pub fn parse(buf: &[u8]) -> Result<Self, Error> {
         let (architecture_id, sections) = parse_section_table(buf)?;
         let (config, moe_config) = if architecture_id == ARCH_QWEN3_6_MOE {
@@ -356,6 +464,13 @@ impl FlmRuntimeDirectory {
             (Vec::new(), Vec::new(), Vec::new(), Vec::new())
         };
 
+        let stage3_indexes = FlmRuntimeStage3Indexes::build(
+            &storage_abis,
+            &logical_tensors,
+            &storage_bindings,
+            &plan_steps,
+        )?;
+
         Ok(Self {
             architecture_id,
             config,
@@ -370,6 +485,7 @@ impl FlmRuntimeDirectory {
             logical_tensors,
             storage_bindings,
             plan_steps,
+            stage3_indexes,
         })
     }
 
@@ -435,6 +551,136 @@ impl FlmRuntimeDirectory {
 
     pub fn plan_steps(&self) -> &[FlmPlanStep] {
         &self.plan_steps
+    }
+
+    pub fn stage3_direct_weight_kind(
+        &self,
+        logical_name: &str,
+    ) -> Result<Option<FlmStage3DirectWeightKind>, Error> {
+        let Some(logical_idx) = self.stage3_indexes.logical_by_name.get(logical_name) else {
+            return Ok(None);
+        };
+        let logical = &self.logical_tensors[*logical_idx];
+
+        match logical.value_format_id {
+            VALUE_FORMAT_RAW_DENSE => {
+                let value = self.required_storage_binding(logical, STORAGE_ROLE_VALUE)?;
+                let value_step = self.required_direct_plan_step(logical, STORAGE_ROLE_VALUE)?;
+                if value.storage_dtype != value_step.target_dtype {
+                    return Err(Error::Other(format!(
+                        "FLM Stage 3 raw tensor {} storage dtype {} does not match direct target dtype {}",
+                        logical.name, value.storage_dtype, value_step.target_dtype
+                    )));
+                }
+                Ok(Some(FlmStage3DirectWeightKind::RawDense))
+            }
+            VALUE_FORMAT_SYM_INT4 => self.stage3_direct_int4_weight_kind(logical),
+            _ => Ok(None),
+        }
+    }
+
+    fn stage3_direct_int4_weight_kind(
+        &self,
+        logical: &FlmLogicalTensor,
+    ) -> Result<Option<FlmStage3DirectWeightKind>, Error> {
+        let packed = self.required_storage_binding(logical, STORAGE_ROLE_PACKED)?;
+        let scale = self.required_storage_binding(logical, STORAGE_ROLE_SCALE)?;
+        let packed_step = self.required_direct_plan_step(logical, STORAGE_ROLE_PACKED)?;
+        let scale_step = self.required_direct_plan_step(logical, STORAGE_ROLE_SCALE)?;
+        let storage_abi = self
+            .stage3_indexes
+            .storage_abi_by_id
+            .get(&packed.storage_abi_id)
+            .map(|idx| &self.storage_abis[*idx])
+            .ok_or_else(|| {
+                Error::Other(format!(
+                    "FLM Stage 3 tensor {} references missing storage ABI {}",
+                    logical.name, packed.storage_abi_id
+                ))
+            })?;
+
+        if packed.storage_dtype == FLM_DTYPE_INT32 {
+            self.required_storage_binding(logical, STORAGE_ROLE_SHAPE)?;
+            if scale.storage_dtype != FLM_DTYPE_BF16 || scale_step.target_dtype != FLM_DTYPE_BF16 {
+                return Err(Error::Other(format!(
+                    "FLM Stage 3 CT INT4 tensor {} requires BF16 scale storage/direct dtype",
+                    logical.name
+                )));
+            }
+            if storage_abi.codec_semantic_id != CODEC_SYM_INT4_G128_BF16 || storage_abi.bits != 4 {
+                return Err(Error::Other(format!(
+                    "FLM Stage 3 CT INT4 tensor {} uses unsupported ABI codec={} bits={}",
+                    logical.name, storage_abi.codec_semantic_id, storage_abi.bits
+                )));
+            }
+            return Ok(Some(FlmStage3DirectWeightKind::CtInt4Bf16Fallback));
+        }
+
+        if packed.storage_dtype != FLM_DTYPE_UINT8 || packed_step.target_dtype != FLM_DTYPE_UINT8 {
+            return Err(Error::Other(format!(
+                "FLM Stage 3 native INT4 tensor {} requires u8 packed storage/direct dtype",
+                logical.name
+            )));
+        }
+        if storage_abi.codec_semantic_id != CODEC_SUPERSONIC_NATIVE_INT4_G128_BF16
+            || storage_abi.bits != 4
+            || storage_abi.group_size != 128
+        {
+            return Err(Error::Other(format!(
+                "FLM Stage 3 native INT4 tensor {} uses unsupported ABI codec={} bits={} group_size={}",
+                logical.name,
+                storage_abi.codec_semantic_id,
+                storage_abi.bits,
+                storage_abi.group_size
+            )));
+        }
+        let zero = self.required_storage_binding(logical, STORAGE_ROLE_ZERO)?;
+        let zero_step = self.required_direct_plan_step(logical, STORAGE_ROLE_ZERO)?;
+        if scale.storage_dtype != FLM_DTYPE_BF16
+            || scale_step.target_dtype != FLM_DTYPE_BF16
+            || zero.storage_dtype != FLM_DTYPE_BF16
+            || zero_step.target_dtype != FLM_DTYPE_BF16
+        {
+            return Err(Error::Other(format!(
+                "FLM Stage 3 native INT4 tensor {} requires BF16 scale/zero storage and direct dtypes",
+                logical.name
+            )));
+        }
+        Ok(Some(FlmStage3DirectWeightKind::NativeInt4))
+    }
+
+    fn required_storage_binding(
+        &self,
+        logical: &FlmLogicalTensor,
+        storage_role: u16,
+    ) -> Result<&FlmStorageBinding, Error> {
+        self.stage3_indexes
+            .storage_binding_by_logical_role
+            .get(&(logical.tensor_id, storage_role))
+            .map(|idx| &self.storage_bindings[*idx])
+            .ok_or_else(|| {
+                Error::Other(format!(
+                    "FLM Stage 3 tensor {} missing storage binding role {}",
+                    logical.name, storage_role
+                ))
+            })
+    }
+
+    fn required_direct_plan_step(
+        &self,
+        logical: &FlmLogicalTensor,
+        storage_role: u16,
+    ) -> Result<&FlmPlanStep, Error> {
+        self.stage3_indexes
+            .direct_plan_by_logical_role
+            .get(&(logical.tensor_id, storage_role))
+            .map(|idx| &self.plan_steps[*idx])
+            .ok_or_else(|| {
+                Error::Other(format!(
+                    "FLM Stage 3 tensor {} missing direct plan role {}",
+                    logical.name, storage_role
+                ))
+            })
     }
 }
 
@@ -2224,6 +2470,36 @@ mod tests {
         }
     }
 
+    fn duplicate_string_table_row(runtime: &mut Vec<u8>, section_id: u32, header_len: usize) {
+        let (section_offset, section_len) = section_range(runtime, section_id);
+        let row_stride = read_u16_at(runtime, section_offset + 2) as usize;
+        let row_count = read_u32_at(runtime, section_offset + 4) as usize;
+        let insert_offset = section_offset + header_len + row_count * row_stride;
+        let row_copy =
+            runtime[section_offset + header_len..section_offset + header_len + row_stride].to_vec();
+
+        runtime.splice(insert_offset..insert_offset, row_copy);
+        shift_sections_after(runtime, insert_offset, row_stride);
+        put_u32_at(runtime, section_offset + 4, (row_count + 1) as u32);
+        let record = section_record_offset(runtime, section_id);
+        put_u32_at(runtime, record + 8, (section_len + row_stride) as u32);
+    }
+
+    fn duplicate_fixed_row(runtime: &mut Vec<u8>, section_id: u32, header_len: usize) {
+        let (section_offset, section_len) = section_range(runtime, section_id);
+        let row_stride = read_u16_at(runtime, section_offset + 2) as usize;
+        let row_count = read_u32_at(runtime, section_offset + 4) as usize;
+        let insert_offset = section_offset + section_len;
+        let row_copy =
+            runtime[section_offset + header_len..section_offset + header_len + row_stride].to_vec();
+
+        runtime.splice(insert_offset..insert_offset, row_copy);
+        shift_sections_after(runtime, insert_offset, row_stride);
+        put_u32_at(runtime, section_offset + 4, (row_count + 1) as u32);
+        let record = section_record_offset(runtime, section_id);
+        put_u32_at(runtime, record + 8, (section_len + row_stride) as u32);
+    }
+
     fn asset_payload_record(runtime: &[u8], asset_id: u32) -> (usize, usize, usize) {
         let (table_offset, _) = section_range(runtime, SECTION_ASSET_TABLE);
         let count = read_u32_at(runtime, table_offset) as usize;
@@ -2372,6 +2648,41 @@ mod tests {
         assert_eq!(parsed.plan_steps()[1].storage_role, STORAGE_ROLE_SCALE);
         assert_eq!(parsed.plan_steps()[1].target_dtype, FLM_DTYPE_BF16);
         assert_eq!(parsed.plan_steps()[1].target_shape, [128, 1, 0, 0]);
+    }
+
+    #[test]
+    fn rejects_duplicate_stage3_logical_tensor_names() {
+        let mut runtime = build_test_runtime_directory_with_stage3_tables();
+        duplicate_string_table_row(
+            &mut runtime,
+            SECTION_LOGICAL_TENSOR_TABLE,
+            LOGICAL_TENSOR_HEADER_SIZE,
+        );
+        let (logical_offset, _) = section_range(&runtime, SECTION_LOGICAL_TENSOR_TABLE);
+        let duplicate_row = logical_offset + LOGICAL_TENSOR_HEADER_SIZE + LOGICAL_TENSOR_ROW_SIZE;
+        put_u32_at(&mut runtime, duplicate_row, 2);
+
+        expect_parse_error_contains(&runtime, "duplicate logical tensor name");
+    }
+
+    #[test]
+    fn rejects_duplicate_stage3_storage_binding_roles() {
+        let mut runtime = build_test_runtime_directory_with_stage3_tables();
+        duplicate_string_table_row(
+            &mut runtime,
+            SECTION_STORAGE_BINDING_TABLE,
+            STORAGE_BINDING_HEADER_SIZE,
+        );
+
+        expect_parse_error_contains(&runtime, "duplicate storage binding");
+    }
+
+    #[test]
+    fn rejects_duplicate_stage3_direct_plan_roles() {
+        let mut runtime = build_test_runtime_directory_with_stage3_tables();
+        duplicate_fixed_row(&mut runtime, SECTION_PLAN_STEP_TABLE, PLAN_STEP_HEADER_SIZE);
+
+        expect_parse_error_contains(&runtime, "duplicate direct plan");
     }
 
     #[test]
