@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import math
 import os
 import subprocess
 import sys
@@ -188,11 +189,14 @@ def supersonic_benchmark_command(
     return command
 
 
-def _as_int(value: object) -> int:
-    try:
-        return int(value or 0)
-    except (TypeError, ValueError):
-        return 0
+def _as_int(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and math.isfinite(value) and value.is_integer():
+        return int(value)
+    return None
 
 
 def _as_float(value: object) -> float:
@@ -225,7 +229,7 @@ def first_class_errors(payload: dict) -> list[str]:
             errors.append(f"row {index} has nonzero return code")
         if row.get("resolved_model") != EXPECTED_RESOLVED_MODEL:
             errors.append(f"row {index} resolved model is not qwen3.6-35b-a3b")
-        if _as_int(row.get("generated_tokens")) <= 0:
+        if (_as_int(row.get("generated_tokens")) or 0) <= 0:
             errors.append(f"row {index} generated tokens is zero")
         if row.get("flm_weight_mode") != EXPECTED_FLM_WEIGHT_MODE:
             errors.append(f"row {index} FLM weight mode is not INT4 native FLM")
@@ -238,9 +242,10 @@ def first_class_errors(payload: dict) -> list[str]:
         if not isinstance(direct_profile, dict):
             errors.append(f"row {index} has no FLM direct profile")
         else:
-            if _as_int(direct_profile.get("native_int4")) <= 0:
+            if (_as_int(direct_profile.get("native_int4")) or 0) <= 0:
                 errors.append(f"row {index} has no native INT4 direct plans")
-            if _as_int(direct_profile.get("bf16_fallback")) != 0:
+            bf16_fallback = _as_int(direct_profile.get("bf16_fallback"))
+            if bf16_fallback is None or bf16_fallback != 0:
                 errors.append(f"row {index} has BF16 fallback direct plans")
             if direct_profile not in valid_direct_profiles:
                 valid_direct_profiles.append(direct_profile)
@@ -251,14 +256,14 @@ def first_class_errors(payload: dict) -> list[str]:
     if not isinstance(summary, dict):
         return errors + ["report summary is not an object"]
 
-    summary_count = _as_int(summary.get("count"))
+    summary_count = _as_int(summary.get("count")) or 0
     if summary_count <= 0:
         errors.append("summary count is zero")
     if rows and summary_count != len(rows):
         errors.append("summary count does not match benchmark rows")
     if summary.get("flm_weight_modes") != [EXPECTED_FLM_WEIGHT_MODE]:
         errors.append("summary FLM weight modes do not match row evidence")
-    if _as_int(summary.get("flm_ready_for_decode_count")) != ready_count:
+    if (_as_int(summary.get("flm_ready_for_decode_count")) or 0) != ready_count:
         errors.append("summary ready for decode count does not match row evidence")
 
     summary_direct_profiles = summary.get("flm_direct_profiles")
@@ -273,16 +278,19 @@ def first_class_errors(payload: dict) -> list[str]:
         errors.append("summary has no FLM load speed")
         return errors
     transfer_bytes = max(
-        _as_int(load_speed.get("copy_h2d_bytes")),
-        _as_int(load_speed.get("copy_storage_to_device_bytes")),
+        _as_int(load_speed.get("copy_h2d_bytes")) or 0,
+        _as_int(load_speed.get("copy_storage_to_device_bytes")) or 0,
     )
-    transfer_gib_s = max(
+    transfer_gib_s_values = (
         _as_float(load_speed.get("copy_h2d_gib_s")),
         _as_float(load_speed.get("copy_storage_to_device_gib_s")),
     )
     if transfer_bytes <= 0:
         errors.append("summary has no transfer bytes")
-    if transfer_gib_s <= 0:
+    if (
+        not all(math.isfinite(rate) for rate in transfer_gib_s_values)
+        or max(transfer_gib_s_values) <= 0
+    ):
         errors.append("summary has no transfer GiB/s")
     return errors
 

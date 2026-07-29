@@ -315,6 +315,20 @@ class Qwen36FlmFirstClassE2ETests(unittest.TestCase):
 
         self.assert_report_rejected(payload, "BF16 fallback")
 
+    def test_report_rejects_fractional_bf16_direct_plan_fallback(self):
+        payload = self.valid_report()
+        payload["rows"][0]["flm_direct_profile"]["bf16_fallback"] = 0.5
+        payload["summary"]["flm_direct_profiles"][0]["bf16_fallback"] = 0.5
+
+        self.assert_report_rejected(payload, "BF16 fallback")
+
+    def test_report_rejects_nonnumeric_bf16_direct_plan_fallback(self):
+        payload = self.valid_report()
+        payload["rows"][0]["flm_direct_profile"]["bf16_fallback"] = "none"
+        payload["summary"]["flm_direct_profiles"][0]["bf16_fallback"] = "none"
+
+        self.assert_report_rejected(payload, "BF16 fallback")
+
     def test_report_rejects_missing_transfer_bytes(self):
         payload = self.valid_report()
         payload["summary"]["flm_load_speed"].pop("copy_h2d_bytes")
@@ -336,6 +350,12 @@ class Qwen36FlmFirstClassE2ETests(unittest.TestCase):
     def test_report_rejects_zero_transfer_speed(self):
         payload = self.valid_report()
         payload["summary"]["flm_load_speed"]["copy_h2d_gib_s"] = 0.0
+
+        self.assert_report_rejected(payload, "transfer GiB/s")
+
+    def test_report_rejects_nan_transfer_speed(self):
+        payload = self.valid_report()
+        payload["summary"]["flm_load_speed"]["copy_h2d_gib_s"] = float("nan")
 
         self.assert_report_rejected(payload, "transfer GiB/s")
 
