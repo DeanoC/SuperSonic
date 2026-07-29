@@ -31,7 +31,8 @@ DEFAULT_27B_QUANT = "q4km-gptq"
 DEFAULT_35B_A3B_MODEL = "qwen3.6-35b-a3b"
 DEFAULT_35B_A3B_MODEL_DIR = Path("/mnt/data/models/Qwen3.6-35B-A3B")
 DEFAULT_35B_A3B_FLM_MODEL_DIR = Path(
-    "/mnt/data/tmp/flm-first-class-e2e-20260704/qwen36-35b-a3b-supersonic-native-int4-aligned.flm"
+    "/mnt/data/runs/geo-quant/"
+    "qwen36-35b-a3b-supersonic-native-int4-current.flm"
 )
 DEFAULT_35B_A3B_QUANT = "int4"
 DEFAULT_OUT_JSON = Path("target/qwen36_he_supersonic.json")

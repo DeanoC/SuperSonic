@@ -117,8 +117,8 @@ class BenchQwen36HeSuperSonicTests(unittest.TestCase):
         self.assertEqual(
             bench.DEFAULT_35B_A3B_FLM_MODEL_DIR,
             Path(
-                "/mnt/data/tmp/flm-first-class-e2e-20260704/"
-                "qwen36-35b-a3b-supersonic-native-int4-aligned.flm"
+                "/mnt/data/runs/geo-quant/"
+                "qwen36-35b-a3b-supersonic-native-int4-current.flm"
             ),
         )
 
