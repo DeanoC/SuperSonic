@@ -5,6 +5,7 @@ import argparse
 import json
 import math
 import os
+import signal
 import subprocess
 import sys
 from enum import Enum, auto
@@ -26,6 +27,10 @@ DEFAULT_FLM = Path(
     "qwen36-35b-a3b-supersonic-native-int4-current.flm"
 )
 E2E_PROMPT = {"id": "flm-first-class-e2e", "prompt": "Hello"}
+PROCESS_TERMINATION_GRACE_SECONDS = 5
+STORAGE_DIRECT_BACKENDS = frozenset(
+    {"gpu-direct-storage", "gds", "hipfile"}
+)
 
 
 class ArtifactAction(Enum):
@@ -87,21 +92,54 @@ def run_command(
     check: bool = True,
     capture_output: bool = False,
 ) -> subprocess.CompletedProcess[str]:
+    stdout = subprocess.PIPE if capture_output else None
+    stderr = subprocess.PIPE if capture_output else None
     try:
-        result = subprocess.run(
+        process = subprocess.Popen(
             command,
             cwd=cwd,
             text=True,
-            timeout=timeout,
-            capture_output=capture_output,
+            stdout=stdout,
+            stderr=stderr,
+            start_new_session=True,
         )
+    except OSError as exc:
+        raise PhaseError(f"{phase} failed to start: {exc}: {' '.join(command)}") from exc
+    try:
+        command_stdout, command_stderr = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired as exc:
+        _terminate_and_reap_process_group(process)
         raise PhaseError(f"{phase} timed out after {timeout}s") from exc
+    except OSError as exc:
+        raise PhaseError(f"{phase} failed while running: {exc}") from exc
+    result = subprocess.CompletedProcess(
+        command,
+        process.returncode,
+        command_stdout,
+        command_stderr,
+    )
     if check and result.returncode != 0:
         raise PhaseError(
             f"{phase} failed with exit {result.returncode}: {' '.join(command)}"
         )
     return result
+
+
+def _terminate_and_reap_process_group(process: subprocess.Popen[str]) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        process.communicate(timeout=PROCESS_TERMINATION_GRACE_SECONDS)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    process.communicate()
 
 
 def probe_validation(args: argparse.Namespace, artifact: Path) -> bool:
@@ -117,9 +155,34 @@ def probe_validation(args: argparse.Namespace, artifact: Path) -> bool:
 
 
 def choose_artifact_action(args: argparse.Namespace) -> ArtifactAction:
-    if args.regenerate or not args.flm.exists():
+    try:
+        artifact_exists = args.flm.exists()
+    except OSError as exc:
+        raise PhaseError(f"input discovery failed for FLM artifact: {exc}") from exc
+    if args.regenerate or not artifact_exists:
         return ArtifactAction.REGENERATE
     return ArtifactAction.REUSE
+
+
+def discover_inputs(args: argparse.Namespace, action: ArtifactAction) -> None:
+    required = [
+        (args.geoquant_root, "geo-quant root", Path.is_dir),
+        (args.geoquant_python, "geo-quant Python", Path.is_file),
+        (args.binary, "SuperSonic binary", Path.is_file),
+        (BENCH_SCRIPT, "benchmark script", Path.is_file),
+    ]
+    if action is ArtifactAction.REGENERATE:
+        required.append((args.hf_source, "HF source", Path.is_dir))
+    else:
+        required.append((args.flm, "FLM artifact", Path.is_file))
+
+    for path, label, predicate in required:
+        try:
+            exists = predicate(path)
+        except OSError as exc:
+            raise PhaseError(f"input discovery failed for {label}: {exc}") from exc
+        if not exists:
+            raise PhaseError(f"input discovery failed: {label} does not exist: {path}")
 
 
 def partial_artifact_path(artifact: Path) -> Path:
@@ -151,6 +214,7 @@ def prepare_artifact(args: argparse.Namespace) -> Path:
             "regenerating",
             flush=True,
         )
+        discover_inputs(args, ArtifactAction.REGENERATE)
 
     partial = partial_artifact_path(args.flm)
     if partial.exists():
@@ -168,7 +232,10 @@ def prepare_artifact(args: argparse.Namespace) -> Path:
         timeout=args.validation_timeout,
         phase="payload validation",
     )
-    os.replace(partial, args.flm)
+    try:
+        os.replace(partial, args.flm)
+    except OSError as exc:
+        raise PhaseError(f"artifact promotion failed: {exc}") from exc
     return args.flm
 
 
@@ -212,20 +279,73 @@ def _as_int(value: object) -> int | None:
     return None
 
 
-def _as_float(value: object) -> float:
+def _as_float(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
     try:
-        return float(value or 0.0)
-    except (TypeError, ValueError):
-        return 0.0
+        parsed = float(value)
+    except (OverflowError, TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) else None
 
 
-def first_class_errors(payload: dict) -> list[str]:
+def _transfer_pair(
+    load_speed: dict,
+    prefix: str,
+) -> tuple[int | None, float | None]:
+    return (
+        _as_int(load_speed.get(f"{prefix}_bytes")),
+        _as_float(load_speed.get(f"{prefix}_gib_s")),
+    )
+
+
+def _valid_transfer_pair(pair: tuple[int | None, float | None]) -> bool:
+    byte_count, rate = pair
+    return byte_count is not None and byte_count > 0 and rate is not None and rate > 0
+
+
+def _transfer_errors(load_speed: dict, requested_backend: str | None) -> list[str]:
+    prefixes = (
+        ["copy_storage_to_device"]
+        if requested_backend in STORAGE_DIRECT_BACKENDS
+        else ["copy_h2d"]
+        if requested_backend == "pageable-h2d"
+        else ["copy_h2d", "copy_storage_to_device"]
+    )
+    pairs = [(prefix, _transfer_pair(load_speed, prefix)) for prefix in prefixes]
+    if any(_valid_transfer_pair(pair) for _, pair in pairs):
+        return []
+
+    if requested_backend in STORAGE_DIRECT_BACKENDS:
+        return ["summary has no positive finite storage-to-device transfer byte/rate evidence"]
+    if requested_backend == "pageable-h2d":
+        return ["summary has no positive finite pageable H2D transfer byte/rate evidence"]
+
+    has_bytes = any(
+        byte_count is not None and byte_count > 0
+        for _, (byte_count, _) in pairs
+    )
+    has_rate = any(rate is not None and rate > 0 for _, (_, rate) in pairs)
+    if not has_bytes:
+        return ["summary has no transfer bytes"]
+    if not has_rate:
+        return ["summary has no transfer GiB/s"]
+    return ["summary has no matching transfer byte/rate evidence"]
+
+
+def first_class_errors(
+    payload: dict,
+    *,
+    requested_backend: str | None = None,
+) -> list[str]:
     if not isinstance(payload, dict):
         return ["report payload is not an object"]
 
     errors: list[str] = []
     if payload.get("resolved_model") != EXPECTED_RESOLVED_MODEL:
         errors.append("report resolved model is not qwen3.6-35b-a3b")
+    if payload.get("flm_virtual_transfer_backend") != requested_backend:
+        errors.append("report backend selector does not match the requested backend")
 
     rows = payload.get("rows")
     if not isinstance(rows, list) or not rows:
@@ -238,8 +358,11 @@ def first_class_errors(payload: dict) -> list[str]:
         if not isinstance(row, dict):
             errors.append(f"row {index} is not an object")
             continue
-        if row.get("returncode") != 0:
-            errors.append(f"row {index} has nonzero return code")
+        return_code = _as_int(row.get("returncode"))
+        if return_code is None or return_code != 0:
+            errors.append(f"row {index} has invalid or nonzero return code")
+        if row.get("flm_virtual_transfer_backend") != requested_backend:
+            errors.append(f"row {index} backend selector does not match the request")
         if row.get("resolved_model") != EXPECTED_RESOLVED_MODEL:
             errors.append(f"row {index} resolved model is not qwen3.6-35b-a3b")
         if (_as_int(row.get("generated_tokens")) or 0) <= 0:
@@ -280,37 +403,31 @@ def first_class_errors(payload: dict) -> list[str]:
         errors.append("summary ready for decode count does not match row evidence")
 
     summary_direct_profiles = summary.get("flm_direct_profiles")
-    if (
-        not isinstance(summary_direct_profiles, list)
-        or any(profile not in summary_direct_profiles for profile in valid_direct_profiles)
-    ):
+    if summary_direct_profiles != valid_direct_profiles:
         errors.append("summary FLM direct profiles do not match row evidence")
 
     load_speed = summary.get("flm_load_speed")
     if not isinstance(load_speed, dict):
         errors.append("summary has no FLM load speed")
         return errors
-    transfer_bytes = max(
-        _as_int(load_speed.get("copy_h2d_bytes")) or 0,
-        _as_int(load_speed.get("copy_storage_to_device_bytes")) or 0,
-    )
-    transfer_gib_s_values = (
-        _as_float(load_speed.get("copy_h2d_gib_s")),
-        _as_float(load_speed.get("copy_storage_to_device_gib_s")),
-    )
-    if transfer_bytes <= 0:
-        errors.append("summary has no transfer bytes")
-    if (
-        not all(math.isfinite(rate) for rate in transfer_gib_s_values)
-        or max(transfer_gib_s_values) <= 0
-    ):
-        errors.append("summary has no transfer GiB/s")
+    errors.extend(_transfer_errors(load_speed, requested_backend))
     return errors
 
 
-def validate_benchmark_report(path: Path) -> dict:
-    payload = json.loads(path.read_text())
-    errors = first_class_errors(payload)
+def validate_benchmark_report(
+    path: Path,
+    *,
+    requested_backend: str | None = None,
+) -> dict:
+    try:
+        report_text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise PhaseError(f"report evidence failed to read {path}: {exc}") from exc
+    try:
+        payload = json.loads(report_text)
+    except json.JSONDecodeError as exc:
+        raise PhaseError(f"report evidence contains invalid JSON: {exc}") from exc
+    errors = first_class_errors(payload, requested_backend=requested_backend)
     if errors:
         raise PhaseError("report evidence failed: " + "; ".join(errors))
     return payload
@@ -360,6 +477,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--n-gen", type=_positive_int, default=1)
     parser.add_argument("--context-size", type=_positive_int, default=512)
     parser.add_argument("--inference-timeout", type=_positive_int, default=900)
+    parser.add_argument("--inference-cleanup-grace", type=_positive_int, default=30)
     parser.add_argument(
         "--flm-virtual-transfer-backend",
         choices=["pageable-h2d", "gpu-direct-storage", "gds", "hipfile"],
@@ -368,7 +486,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--out-json",
         type=Path,
-        default=Path("target/qwen36_35b_a3b_flm_he_supersonic.json"),
+        default=Path("target/qwen36_35b_a3b_flm_first_class_e2e.json"),
     )
     return parser
 
@@ -380,9 +498,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def print_summary(payload: dict, artifact: Path) -> None:
     summary = payload["summary"]
     load_speed = summary["flm_load_speed"]
+    prefixes = (
+        ["copy_storage_to_device"]
+        if payload.get("flm_virtual_transfer_backend") in STORAGE_DIRECT_BACKENDS
+        else ["copy_h2d"]
+        if payload.get("flm_virtual_transfer_backend") == "pageable-h2d"
+        else ["copy_h2d", "copy_storage_to_device"]
+    )
     transfer_gib_s = max(
-        _as_float(load_speed.get("copy_h2d_gib_s")),
-        _as_float(load_speed.get("copy_storage_to_device_gib_s")),
+        rate
+        for prefix in prefixes
+        for byte_count, rate in [_transfer_pair(load_speed, prefix)]
+        if byte_count is not None and byte_count > 0 and rate is not None and rate > 0
     )
     print(
         "[flm-e2e] first-class evidence: "
@@ -394,15 +521,20 @@ def print_summary(payload: dict, artifact: Path) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    action = choose_artifact_action(args)
+    discover_inputs(args, action)
     artifact = prepare_artifact(args)
     write_benchmark_prompts(benchmark_prompt_path(args.out_json))
     run_command(
         supersonic_benchmark_command(args, artifact),
         cwd=ROOT,
-        timeout=args.inference_timeout,
+        timeout=args.limit * args.inference_timeout + args.inference_cleanup_grace,
         phase="SuperSonic inference",
     )
-    payload = validate_benchmark_report(args.out_json)
+    payload = validate_benchmark_report(
+        args.out_json,
+        requested_backend=args.flm_virtual_transfer_backend,
+    )
     print_summary(payload, artifact)
     return 0
 

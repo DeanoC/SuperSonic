@@ -123,11 +123,11 @@ For low-level diagnosis, validate the native SuperSonic-layout artifact with
 geo-quant's no-HF profile:
 
 ```bash
-cd /home/deano/.config/superpowers/worktrees/geo-quant/flm-direct-io-alignment
+cd /home/deano/projects/geo-quant
 /home/deano/projects/geo-quant/.venv-rocm/bin/python \
   -m geoquant.formats.flm_validate \
   /mnt/data/runs/geo-quant/qwen36-35b-a3b-supersonic-native-int4-current.flm \
-  --profile runnable-no-hf \
+  --profile supersonic-qwen36-moe-native-int4 \
   --verify-payload-hashes
 ```
 
