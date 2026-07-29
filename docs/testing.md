@@ -203,6 +203,10 @@ smoke above. The resulting JSON records `model: null`,
 bytes, elapsed milliseconds, and GiB/s for `copy_h2d`; on a hipFile-enabled
 host it records the same values for `copy_storage_to_device`.
 
+This machine runs ROCm 7.1.1, so hipFile performance validation is out of
+scope here; the ROCm 7.2+ commands below are reference diagnostics for a
+compatible host.
+
 To validate ROCm 7.2 hipFile storage-to-device transfer on a host with
 `hipfile.h`, `libhipfile`, and passing `/opt/rocm/bin/ais-check`, use the FLM
 upload probe's storage-direct mode on a block-aligned expert tensor first:
