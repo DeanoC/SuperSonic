@@ -187,6 +187,21 @@ class Qwen36FlmFirstClassE2ETests(unittest.TestCase):
         self.assertIn("--emit-stage-timings", command)
         self.assertIn("--hal-profile", command)
         self.assertEqual(command[command.index("--out-json") + 1], str(args.out_json))
+        self.assertEqual(command[command.index("--prompt-source") + 1], "jsonl")
+        self.assertEqual(
+            command[command.index("--lucebox-jsonl") + 1],
+            str(runner.benchmark_prompt_path(args.out_json)),
+        )
+
+    def test_writes_portable_single_prompt_for_benchmark(self):
+        prompt_path = self.tmp_path / "flm-e2e-prompts.jsonl"
+
+        runner.write_benchmark_prompts(prompt_path)
+
+        self.assertEqual(
+            json.loads(prompt_path.read_text()),
+            {"id": "flm-first-class-e2e", "prompt": "Hello"},
+        )
 
     def test_supersonic_command_forwards_explicit_virtual_transfer_backend(self):
         args = self.args(flm_virtual_transfer_backend="gpu-direct-storage")

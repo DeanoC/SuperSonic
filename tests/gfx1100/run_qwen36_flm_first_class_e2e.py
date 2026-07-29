@@ -25,6 +25,7 @@ DEFAULT_FLM = Path(
     "/mnt/data/runs/geo-quant/"
     "qwen36-35b-a3b-supersonic-native-int4-current.flm"
 )
+E2E_PROMPT = {"id": "flm-first-class-e2e", "prompt": "Hello"}
 
 
 class ArtifactAction(Enum):
@@ -125,6 +126,15 @@ def partial_artifact_path(artifact: Path) -> Path:
     return artifact.with_name(f".{artifact.name}.partial-{os.getpid()}")
 
 
+def benchmark_prompt_path(out_json: Path) -> Path:
+    return out_json.with_suffix(".prompts.jsonl")
+
+
+def write_benchmark_prompts(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(E2E_PROMPT) + "\n", encoding="utf-8")
+
+
 def prepare_artifact(args: argparse.Namespace) -> Path:
     action = choose_artifact_action(args)
     if action is ArtifactAction.REUSE and probe_validation(args, args.flm):
@@ -172,6 +182,9 @@ def supersonic_benchmark_command(
         "--binary", str(args.binary),
         "--target-profile", "qwen36-35b-a3b-flm",
         "--model-dir", str(artifact),
+        "--prompt-source", "jsonl",
+        "--lucebox-jsonl", str(benchmark_prompt_path(args.out_json)),
+        "--prompt-format", "raw",
         "--limit", str(args.limit),
         "--n-gen", str(args.n_gen),
         "--warmup-new-tokens", "1",
@@ -382,6 +395,7 @@ def print_summary(payload: dict, artifact: Path) -> None:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     artifact = prepare_artifact(args)
+    write_benchmark_prompts(benchmark_prompt_path(args.out_json))
     run_command(
         supersonic_benchmark_command(args, artifact),
         cwd=ROOT,
