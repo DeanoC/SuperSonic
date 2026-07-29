@@ -199,7 +199,8 @@ def test_regenerate_preserves_existing_artifact_until_promotion(self):
 
 def test_invalid_artifact_selects_safe_regeneration(self):
     args = self.args(flm=self.existing_flm)
-    # probe_validation returns False; assert export targets a sibling partial.
+    # probe_validation returns False; assert export targets a sibling partial
+    # and stdout identifies the existing artifact as stale or incompatible.
 ```
 
 - [ ] **Step 6: Run artifact-decision tests and confirm the red state**
@@ -270,6 +271,12 @@ def prepare_artifact(args: argparse.Namespace) -> Path:
             phase="payload validation",
         )
         return args.flm
+    if reuse:
+        print(
+            f"[flm-e2e] existing artifact is stale or incompatible: {args.flm}; "
+            "regenerating",
+            flush=True,
+        )
 
     partial = partial_artifact_path(args.flm)
     if partial.exists():
