@@ -279,6 +279,29 @@ def _as_int(value: object) -> int | None:
     return None
 
 
+def _canonical_direct_profile(
+    profile: object,
+) -> tuple[dict[object, int] | None, list[object]]:
+    if not isinstance(profile, dict):
+        return None, ["profile"]
+    canonical: dict[object, int] = {}
+    invalid_fields: list[object] = []
+    for field, value in profile.items():
+        parsed = _as_int(value)
+        if parsed is None:
+            invalid_fields.append(field)
+        else:
+            canonical[field] = parsed
+    return (canonical if not invalid_fields else None), invalid_fields
+
+
+def _direct_profile_field_label(field: object) -> str:
+    return {
+        "native_int4": "native INT4",
+        "bf16_fallback": "BF16 fallback",
+    }.get(field, str(field))
+
+
 def _as_float(value: object) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
@@ -378,13 +401,22 @@ def first_class_errors(
         if not isinstance(direct_profile, dict):
             errors.append(f"row {index} has no FLM direct profile")
         else:
-            if (_as_int(direct_profile.get("native_int4")) or 0) <= 0:
-                errors.append(f"row {index} has no native INT4 direct plans")
-            bf16_fallback = _as_int(direct_profile.get("bf16_fallback"))
-            if bf16_fallback is None or bf16_fallback != 0:
-                errors.append(f"row {index} has BF16 fallback direct plans")
-            if direct_profile not in valid_direct_profiles:
-                valid_direct_profiles.append(direct_profile)
+            canonical_profile, invalid_fields = _canonical_direct_profile(
+                direct_profile
+            )
+            for field in invalid_fields:
+                errors.append(
+                    f"row {index} has invalid "
+                    f"{_direct_profile_field_label(field)} direct profile field"
+                )
+            if canonical_profile is not None:
+                if (canonical_profile.get("native_int4") or 0) <= 0:
+                    errors.append(f"row {index} has no native INT4 direct plans")
+                bf16_fallback = canonical_profile.get("bf16_fallback")
+                if bf16_fallback is None or bf16_fallback != 0:
+                    errors.append(f"row {index} has BF16 fallback direct plans")
+                if canonical_profile not in valid_direct_profiles:
+                    valid_direct_profiles.append(canonical_profile)
         if row.get("benchmark_validation_errors"):
             errors.append(f"row {index} has benchmark validation errors")
 
@@ -403,7 +435,21 @@ def first_class_errors(
         errors.append("summary ready for decode count does not match row evidence")
 
     summary_direct_profiles = summary.get("flm_direct_profiles")
-    if summary_direct_profiles != valid_direct_profiles:
+    canonical_summary_profiles: list[dict[object, int]] = []
+    summary_profiles_valid = isinstance(summary_direct_profiles, list)
+    if summary_profiles_valid:
+        for profile in summary_direct_profiles:
+            canonical_profile, invalid_fields = _canonical_direct_profile(profile)
+            for field in invalid_fields:
+                errors.append(
+                    "summary has invalid "
+                    f"{_direct_profile_field_label(field)} direct profile field"
+                )
+            if canonical_profile is not None:
+                canonical_summary_profiles.append(canonical_profile)
+            else:
+                summary_profiles_valid = False
+    if not summary_profiles_valid or canonical_summary_profiles != valid_direct_profiles:
         errors.append("summary FLM direct profiles do not match row evidence")
 
     load_speed = summary.get("flm_load_speed")

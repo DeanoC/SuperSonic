@@ -431,6 +431,12 @@ class Qwen36FlmFirstClassE2ETests(unittest.TestCase):
 
         self.assert_report_rejected(payload, "BF16 fallback")
 
+    def test_report_rejects_boolean_summary_direct_profile_field(self):
+        payload = self.valid_report()
+        payload["summary"]["flm_direct_profiles"][0]["bf16_fallback"] = False
+
+        self.assert_report_rejected(payload, "direct profiles")
+
     def test_report_rejects_extra_summary_direct_profile(self):
         payload = self.valid_report()
         payload["summary"]["flm_direct_profiles"].append({
