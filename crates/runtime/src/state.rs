@@ -10,6 +10,7 @@ use std::sync::Arc;
 use tokenizers::Tokenizer;
 use tokio::sync::{Mutex, Semaphore};
 
+pub use model_store::flm::{ARCH_QWEN3_6_MOE, MODEL_QWEN3_6_MOE_V1};
 use supersonic_core::registry::{self, Backend, GpuArch, ModelFamily, ModelVariant};
 
 use crate::backend_resolver::resolve_backend;
@@ -20,8 +21,9 @@ use crate::generate::{GenerationTelemetry, MockGeneration};
 use crate::prefix_cache::{PrefixCache, PrefixCacheConfig};
 use crate::session::InferenceSession;
 use supersonic_core::capabilities::{
-    capabilities_for_variant, FlmDirectProfile, FlmLoadEvidence, FlmStartupDurations,
-    FlmTransferBackend, ModelCapabilities, ServingFeatures,
+    capabilities_for_variant, FlmDirectProfile, FlmLoadEvidence, FlmLoadWindowProfileDurations,
+    FlmSourceOpenDurations, FlmStartupDurations, FlmTransferBackend, ModelCapabilities,
+    ServingFeatures,
 };
 
 #[path = "model_source.rs"]
@@ -327,6 +329,7 @@ pub fn build_resolved(
 fn project_qwen36_load_evidence(
     evidence: &crate::qwen36_moe::engine::Qwen36MoeLoadEvidence,
 ) -> Result<FlmLoadEvidence> {
+    validate_startup_timing_hierarchy(evidence)?;
     let source_file = evidence
         .flm_path
         .file_name()
@@ -356,15 +359,19 @@ fn project_qwen36_load_evidence(
         source_bytes: evidence.source_bytes,
         device_upload_bytes: evidence.device_upload_bytes,
         startup: FlmStartupDurations {
-            source_open: evidence.source_open_duration,
-            store_open: evidence.store_open_duration,
-            config: evidence.config_duration,
-            descriptor: evidence.descriptor_duration,
-            tokenizer: evidence.tokenizer_duration,
-            plan: evidence.plan_duration,
-            allocation: evidence.allocation_duration,
-            upload: evidence.upload_duration,
             total: evidence.total_duration,
+            source_open: FlmSourceOpenDurations {
+                total: evidence.source_open_duration,
+                store_open: evidence.store_open_duration,
+                config: evidence.config_duration,
+                direct_plan: evidence.plan_duration,
+            },
+            tokenizer: evidence.tokenizer_duration,
+            descriptor: evidence.descriptor_duration,
+        },
+        load_window_profile: FlmLoadWindowProfileDurations {
+            allocation_api: evidence.allocation_duration,
+            upload_api: evidence.upload_duration,
         },
         load_sequence: evidence.load_sequence,
         source_open_count: evidence.source_open_count,
@@ -376,6 +383,37 @@ fn project_qwen36_load_evidence(
             disk_prefix_snapshot: features.disk_prefix_snapshot,
         },
     })
+}
+
+fn validate_startup_timing_hierarchy(
+    evidence: &crate::qwen36_moe::engine::Qwen36MoeLoadEvidence,
+) -> Result<()> {
+    let source_open_exclusive = evidence
+        .store_open_duration
+        .checked_add(evidence.config_duration)
+        .and_then(|duration| duration.checked_add(evidence.plan_duration))
+        .ok_or_else(|| anyhow!("Qwen3.6 FLM source-open exclusive phases overflow"))?;
+    if source_open_exclusive > evidence.source_open_duration {
+        bail!(
+            "Qwen3.6 FLM source-open exclusive phases {:?} exceed aggregate {:?}",
+            source_open_exclusive,
+            evidence.source_open_duration
+        );
+    }
+
+    let startup_exclusive = evidence
+        .source_open_duration
+        .checked_add(evidence.tokenizer_duration)
+        .and_then(|duration| duration.checked_add(evidence.descriptor_duration))
+        .ok_or_else(|| anyhow!("Qwen3.6 FLM startup exclusive components overflow"))?;
+    if startup_exclusive > evidence.total_duration {
+        bail!(
+            "Qwen3.6 FLM startup exclusive components {:?} exceed total {:?}",
+            startup_exclusive,
+            evidence.total_duration
+        );
+    }
+    Ok(())
 }
 
 fn prefix_cache_config(
@@ -604,9 +642,9 @@ mod tests {
     fn qwen36_load_evidence(path: &str) -> crate::qwen36_moe::engine::Qwen36MoeLoadEvidence {
         crate::qwen36_moe::engine::Qwen36MoeLoadEvidence {
             flm_path: PathBuf::from(path),
-            architecture_id: 2,
-            model_id: 1,
-            storage_abi_ids: vec![3, 7],
+            architecture_id: model_store::flm::ARCH_QWEN3_6_MOE,
+            model_id: model_store::flm::MODEL_QWEN3_6_MOE_V1,
+            storage_abi_ids: vec![8],
             direct_profile: crate::qwen36_moe::source::Qwen36MoeDirectProfile {
                 required_tensors: 693,
                 raw_dense: 363,
@@ -616,12 +654,12 @@ mod tests {
             transfer_backend: model_store::VirtualArenaTransferBackend::PageableH2d,
             source_bytes: 8_000_000_000,
             device_upload_bytes: 7_000_000_000,
-            source_open_duration: std::time::Duration::from_millis(10),
-            store_open_duration: std::time::Duration::from_millis(20),
-            config_duration: std::time::Duration::from_millis(30),
+            source_open_duration: std::time::Duration::from_millis(120),
+            store_open_duration: std::time::Duration::from_millis(80),
+            config_duration: std::time::Duration::from_millis(10),
             descriptor_duration: std::time::Duration::from_millis(40),
             tokenizer_duration: std::time::Duration::from_millis(50),
-            plan_duration: std::time::Duration::from_millis(60),
+            plan_duration: std::time::Duration::from_millis(20),
             allocation_duration: std::time::Duration::from_millis(70),
             upload_duration: std::time::Duration::from_millis(80),
             total_duration: std::time::Duration::from_millis(1250),
@@ -690,9 +728,12 @@ mod tests {
         let projected = project_qwen36_load_evidence(&evidence).expect("FLM evidence projection");
 
         assert_eq!(projected.source_file, "qwen36-native.flm");
-        assert_eq!(projected.architecture_id, 2);
-        assert_eq!(projected.model_id, 1);
-        assert_eq!(projected.storage_abi_ids, vec![3, 7]);
+        assert_eq!(
+            projected.architecture_id,
+            model_store::flm::ARCH_QWEN3_6_MOE
+        );
+        assert_eq!(projected.model_id, model_store::flm::MODEL_QWEN3_6_MOE_V1);
+        assert_eq!(projected.storage_abi_ids, vec![8]);
         assert_eq!(projected.direct_profile.required_weights, 693);
         assert_eq!(projected.direct_profile.raw_dense_weights, 363);
         assert_eq!(projected.direct_profile.native_int4_direct_weights, 330);
@@ -703,6 +744,14 @@ mod tests {
             projected.startup.total,
             std::time::Duration::from_millis(1250)
         );
+        assert_eq!(
+            projected.startup.source_open.total,
+            std::time::Duration::from_millis(120)
+        );
+        assert_eq!(
+            projected.load_window_profile.upload_api,
+            std::time::Duration::from_millis(80)
+        );
         assert_eq!(projected.load_sequence, 1);
         assert_eq!(projected.source_open_count, 1);
         assert_eq!(projected.resident_allocation_count, 42);
@@ -710,6 +759,26 @@ mod tests {
         assert!(!projected.features.native_dflash_generate);
         assert!(!projected.features.prefix_snapshot);
         assert!(!projected.features.disk_prefix_snapshot);
+    }
+
+    #[test]
+    fn flm_load_evidence_projection_rejects_impossible_startup_timing_hierarchies() {
+        let mut source_children_exceed_aggregate =
+            qwen36_load_evidence("/models/private/qwen36-native.flm");
+        source_children_exceed_aggregate.source_open_duration =
+            std::time::Duration::from_millis(100);
+        err_contains(
+            project_qwen36_load_evidence(&source_children_exceed_aggregate),
+            "source-open exclusive phases",
+        );
+
+        let mut startup_components_exceed_total =
+            qwen36_load_evidence("/models/private/qwen36-native.flm");
+        startup_components_exceed_total.total_duration = std::time::Duration::from_millis(200);
+        err_contains(
+            project_qwen36_load_evidence(&startup_components_exceed_total),
+            "startup exclusive components",
+        );
     }
 
     #[test]

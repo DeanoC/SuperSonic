@@ -19,16 +19,25 @@ pub struct FlmDirectProfile {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FlmStartupDurations {
-    pub source_open: Duration,
+pub struct FlmSourceOpenDurations {
+    pub total: Duration,
     pub store_open: Duration,
     pub config: Duration,
-    pub descriptor: Duration,
-    pub tokenizer: Duration,
-    pub plan: Duration,
-    pub allocation: Duration,
-    pub upload: Duration,
+    pub direct_plan: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlmStartupDurations {
     pub total: Duration,
+    pub source_open: FlmSourceOpenDurations,
+    pub tokenizer: Duration,
+    pub descriptor: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlmLoadWindowProfileDurations {
+    pub allocation_api: Duration,
+    pub upload_api: Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +59,7 @@ pub struct FlmLoadEvidence {
     pub source_bytes: u64,
     pub device_upload_bytes: u64,
     pub startup: FlmStartupDurations,
+    pub load_window_profile: FlmLoadWindowProfileDurations,
     pub load_sequence: u64,
     pub source_open_count: u64,
     pub resident_allocation_count: u64,
@@ -88,16 +98,25 @@ pub fn capabilities_for_variant(
     kv_fp8: bool,
 ) -> ModelCapabilities {
     let family = variant.family();
-    let serve_status = match family {
-        ModelFamily::Qwen35 | ModelFamily::Gemma4 => ServeStatus::Ready,
-        ModelFamily::Qwen3Moe => {
+    let serve_status = match variant {
+        ModelVariant::Qwen3_5_0_8B
+        | ModelVariant::Qwen3_5_2B
+        | ModelVariant::Qwen3_5_4B
+        | ModelVariant::Qwen3_5_9B
+        | ModelVariant::Qwen3_6_27B
+        | ModelVariant::Gemma4_E2B
+        | ModelVariant::Gemma4_E4B
+        | ModelVariant::Qwen3_6_35B_A3B => ServeStatus::Ready,
+        ModelVariant::Qwen3_5_35B_A3B => {
+            ServeStatus::CliOnly("Qwen3.5 MoE runtime is still wired through the CLI flow")
+        }
+        ModelVariant::Qwen3_30B_A3B => {
             ServeStatus::CliOnly("Qwen3 MoE runtime is still wired through the CLI flow")
         }
-        ModelFamily::Qwen36Moe => ServeStatus::Ready,
-        ModelFamily::Phi4 => {
+        ModelVariant::Phi4_Mini => {
             ServeStatus::CliOnly("Phi-4 runtime is still wired through the CLI flow")
         }
-        ModelFamily::Llama31 => {
+        ModelVariant::Llama3_1_8B => {
             ServeStatus::CliOnly("Llama 3.1 runtime is still wired through the CLI flow")
         }
     };
@@ -118,15 +137,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn capabilities_cover_every_model_family() {
+    fn capabilities_cover_every_model_variant() {
         let cases = [
             (ModelVariant::Qwen3_5_0_8B, ServeStatus::Ready),
-            (ModelVariant::Gemma4_E2B, ServeStatus::Ready),
+            (ModelVariant::Qwen3_5_2B, ServeStatus::Ready),
+            (ModelVariant::Qwen3_5_4B, ServeStatus::Ready),
+            (ModelVariant::Qwen3_5_9B, ServeStatus::Ready),
+            (
+                ModelVariant::Qwen3_5_35B_A3B,
+                ServeStatus::CliOnly("Qwen3.5 MoE runtime is still wired through the CLI flow"),
+            ),
             (
                 ModelVariant::Qwen3_30B_A3B,
                 ServeStatus::CliOnly("Qwen3 MoE runtime is still wired through the CLI flow"),
             ),
+            (ModelVariant::Qwen3_6_27B, ServeStatus::Ready),
             (ModelVariant::Qwen3_6_35B_A3B, ServeStatus::Ready),
+            (ModelVariant::Gemma4_E2B, ServeStatus::Ready),
+            (ModelVariant::Gemma4_E4B, ServeStatus::Ready),
             (
                 ModelVariant::Phi4_Mini,
                 ServeStatus::CliOnly("Phi-4 runtime is still wired through the CLI flow"),

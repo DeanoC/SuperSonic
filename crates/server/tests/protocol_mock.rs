@@ -6,7 +6,7 @@ use reqwest::Client;
 use serde_json::{json, Value};
 use server::generate::MockGeneration;
 use server::prefix_cache::{PrefixCache, PrefixCacheConfig};
-use server::state::{GenerationScheduler, ServerState};
+use server::state::{GenerationScheduler, ServerState, ARCH_QWEN3_6_MOE, MODEL_QWEN3_6_MOE_V1};
 use server::{capabilities, chat_template, registry};
 
 fn test_tokenizer() -> tokenizers::Tokenizer {
@@ -91,9 +91,9 @@ fn test_flm_state_with_scheduler(
     );
     state_mut.capabilities.flm = Some(capabilities::FlmLoadEvidence {
         source_file: "qwen36-native.flm".to_string(),
-        architecture_id: 2,
-        model_id: 1,
-        storage_abi_ids: vec![3, 7],
+        architecture_id: ARCH_QWEN3_6_MOE,
+        model_id: MODEL_QWEN3_6_MOE_V1,
+        storage_abi_ids: vec![8],
         direct_profile: capabilities::FlmDirectProfile {
             required_weights: 693,
             raw_dense_weights: 363,
@@ -104,15 +104,19 @@ fn test_flm_state_with_scheduler(
         source_bytes: 8_000_000_000,
         device_upload_bytes: 7_000_000_000,
         startup: capabilities::FlmStartupDurations {
-            source_open: Duration::from_millis(10),
-            store_open: Duration::from_millis(20),
-            config: Duration::from_millis(30),
+            total: Duration::from_millis(1250),
+            source_open: capabilities::FlmSourceOpenDurations {
+                total: Duration::from_millis(120),
+                store_open: Duration::from_millis(80),
+                config: Duration::from_millis(10),
+                direct_plan: Duration::from_millis(20),
+            },
             descriptor: Duration::from_millis(40),
             tokenizer: Duration::from_millis(50),
-            plan: Duration::from_millis(60),
-            allocation: Duration::from_millis(70),
-            upload: Duration::from_millis(80),
-            total: Duration::from_millis(1250),
+        },
+        load_window_profile: capabilities::FlmLoadWindowProfileDurations {
+            allocation_api: Duration::from_millis(70),
+            upload_api: Duration::from_millis(80),
         },
         load_sequence: 1,
         source_open_count: 1,
@@ -718,12 +722,48 @@ async fn capabilities_report_truthful_flm_evidence_without_path_leaks() {
     assert_eq!(capabilities["ready"], true);
     assert_eq!(capabilities["flm"]["source"], "flm");
     assert_eq!(capabilities["flm"]["file"], "qwen36-native.flm");
-    assert_eq!(capabilities["flm"]["model_id"], 1);
+    assert_eq!(capabilities["flm"]["architecture_id"], 2);
+    assert_eq!(capabilities["flm"]["model_id"], 2);
+    assert_eq!(capabilities["flm"]["storage_abi_ids"], json!([8]));
     assert_eq!(capabilities["flm"]["required_weights"], 693);
     assert_eq!(capabilities["flm"]["raw_dense_weights"], 363);
     assert_eq!(capabilities["flm"]["native_int4_direct_weights"], 330);
     assert_eq!(capabilities["flm"]["bf16_fallback_weights"], 0);
     assert_eq!(capabilities["flm"]["load_sequence"], 1);
+    assert_eq!(capabilities["flm"]["startup"]["total_seconds"], 1.25);
+    assert_eq!(
+        capabilities["flm"]["startup"]["exclusive_components"]["source_open"]["total_seconds"],
+        0.12
+    );
+    assert_eq!(
+        capabilities["flm"]["startup"]["exclusive_components"]["source_open"]["exclusive_phases"]
+            ["store_open_seconds"],
+        0.08
+    );
+    assert_eq!(
+        capabilities["flm"]["startup"]["exclusive_components"]["source_open"]["exclusive_phases"]
+            ["config_seconds"],
+        0.01
+    );
+    assert_eq!(
+        capabilities["flm"]["startup"]["exclusive_components"]["source_open"]["exclusive_phases"]
+            ["direct_plan_seconds"],
+        0.02
+    );
+    assert_eq!(
+        capabilities["flm"]["startup"]["exclusive_components"]["tokenizer_seconds"],
+        0.05
+    );
+    assert_eq!(
+        capabilities["flm"]["startup"]["exclusive_components"]["descriptor_seconds"],
+        0.04
+    );
+    assert!(capabilities["flm"]["startup"]
+        .get("source_open_seconds")
+        .is_none());
+    assert!(capabilities["flm"]["startup"]
+        .get("upload_seconds")
+        .is_none());
     assert_eq!(
         capabilities["flm"]["features"]["plain_prefill_decode"],
         true

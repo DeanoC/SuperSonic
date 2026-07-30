@@ -26,16 +26,29 @@ pub struct ListModelsResponse {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct FlmStartupEvidence {
-    pub source_open_seconds: f64,
+pub struct FlmSourceOpenPhasesEvidence {
     pub store_open_seconds: f64,
     pub config_seconds: f64,
-    pub descriptor_seconds: f64,
-    pub tokenizer_seconds: f64,
-    pub plan_seconds: f64,
-    pub allocation_seconds: f64,
-    pub upload_seconds: f64,
+    pub direct_plan_seconds: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FlmSourceOpenEvidence {
     pub total_seconds: f64,
+    pub exclusive_phases: FlmSourceOpenPhasesEvidence,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FlmStartupComponentsEvidence {
+    pub source_open: FlmSourceOpenEvidence,
+    pub tokenizer_seconds: f64,
+    pub descriptor_seconds: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FlmStartupEvidence {
+    pub total_seconds: f64,
+    pub exclusive_components: FlmStartupComponentsEvidence,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -89,15 +102,27 @@ impl From<&crate::capabilities::FlmLoadEvidence> for FlmEvidence {
             device_upload_bytes: evidence.device_upload_bytes,
             startup_seconds: evidence.startup.total.as_secs_f64(),
             startup: FlmStartupEvidence {
-                source_open_seconds: evidence.startup.source_open.as_secs_f64(),
-                store_open_seconds: evidence.startup.store_open.as_secs_f64(),
-                config_seconds: evidence.startup.config.as_secs_f64(),
-                descriptor_seconds: evidence.startup.descriptor.as_secs_f64(),
-                tokenizer_seconds: evidence.startup.tokenizer.as_secs_f64(),
-                plan_seconds: evidence.startup.plan.as_secs_f64(),
-                allocation_seconds: evidence.startup.allocation.as_secs_f64(),
-                upload_seconds: evidence.startup.upload.as_secs_f64(),
                 total_seconds: evidence.startup.total.as_secs_f64(),
+                exclusive_components: FlmStartupComponentsEvidence {
+                    source_open: FlmSourceOpenEvidence {
+                        total_seconds: evidence.startup.source_open.total.as_secs_f64(),
+                        exclusive_phases: FlmSourceOpenPhasesEvidence {
+                            store_open_seconds: evidence
+                                .startup
+                                .source_open
+                                .store_open
+                                .as_secs_f64(),
+                            config_seconds: evidence.startup.source_open.config.as_secs_f64(),
+                            direct_plan_seconds: evidence
+                                .startup
+                                .source_open
+                                .direct_plan
+                                .as_secs_f64(),
+                        },
+                    },
+                    tokenizer_seconds: evidence.startup.tokenizer.as_secs_f64(),
+                    descriptor_seconds: evidence.startup.descriptor.as_secs_f64(),
+                },
             },
             load_sequence: evidence.load_sequence,
             source_open_count: evidence.source_open_count,
