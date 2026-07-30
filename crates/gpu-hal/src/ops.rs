@@ -1370,6 +1370,11 @@ pub struct GpuEvent {
     raw: *mut c_void,
 }
 
+// SAFETY: `GpuEvent` exclusively owns its backend event handle. Operations and
+// destruction reselect the recorded device before touching that handle, so
+// transferring exclusive ownership to another thread is valid. It is not Sync.
+unsafe impl Send for GpuEvent {}
+
 /// RAII wrapper around a non-blocking backend stream.
 pub struct GpuStream {
     backend: Backend,
@@ -1377,6 +1382,9 @@ pub struct GpuStream {
     raw: *mut c_void,
 }
 
+// SAFETY: `GpuStream` exclusively owns its backend stream handle. Operations
+// and destruction reselect the recorded device before touching that handle, so
+// transferring exclusive ownership to another thread is valid. It is not Sync.
 unsafe impl Send for GpuStream {}
 
 impl GpuStream {

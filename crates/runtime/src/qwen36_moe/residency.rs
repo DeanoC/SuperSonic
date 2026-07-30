@@ -7,6 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
+use std::mem::ManuallyDrop;
 
 use anyhow::{anyhow, Context, Result};
 use gpu_hal::{
@@ -163,7 +164,7 @@ impl ExpertTensor {
 }
 
 pub struct MoeExpertResidencyManager {
-    arena: VirtualArena,
+    arena: ManuallyDrop<VirtualArena>,
     config: MoeExpertResidencyConfig,
     tensors: Vec<ExpertTensor>,
     tensor_by_layer_projection: HashMap<(usize, MoeExpertProjection), usize>,
@@ -213,6 +214,82 @@ pub struct MoeExpertResidencyManager {
     async_pending_pages_peak: usize,
 }
 
+// SAFETY: This manager is the owning aggregate for the VMM arena backing all
+// registered expert tensor pointers. Its Drop implementation synchronizes the
+// async page-in stream while its events, pinned staging, and arena remain alive,
+// destroys the async owners, and only then unmaps the arena. HIP operations
+// reselect the recorded device ordinal. Exclusive transfer is therefore valid.
+unsafe impl Send for MoeExpertResidencyManager {}
+
+struct ResidencyTeardownFailure<AsyncOwner, ArenaOwner> {
+    error: anyhow::Error,
+    _async_owner: ManuallyDrop<Option<AsyncOwner>>,
+    _arena_owner: ManuallyDrop<ArenaOwner>,
+}
+
+impl<AsyncOwner, ArenaOwner> ResidencyTeardownFailure<AsyncOwner, ArenaOwner> {
+    #[cfg(test)]
+    fn error(&self) -> &anyhow::Error {
+        &self.error
+    }
+
+    #[cfg(test)]
+    fn into_resources(self) -> (Option<AsyncOwner>, ArenaOwner) {
+        let Self {
+            error,
+            _async_owner: mut async_owner,
+            _arena_owner: mut arena_owner,
+        } = self;
+        drop(error);
+        // SAFETY: these owners are consumed exactly once from their
+        // ManuallyDrop wrappers.
+        unsafe {
+            (
+                ManuallyDrop::take(&mut async_owner),
+                ManuallyDrop::take(&mut arena_owner),
+            )
+        }
+    }
+
+    fn into_error_leaking_resources(self) -> anyhow::Error {
+        let Self {
+            error,
+            _async_owner: _,
+            _arena_owner: _,
+        } = self;
+        error
+    }
+}
+
+fn teardown_residency_resources<AsyncOwner, ArenaOwner>(
+    async_owner: Option<AsyncOwner>,
+    arena_owner: ArenaOwner,
+    synchronize: impl FnOnce(&AsyncOwner) -> Result<()>,
+) -> std::result::Result<(), ResidencyTeardownFailure<AsyncOwner, ArenaOwner>> {
+    let mut async_owner = ManuallyDrop::new(async_owner);
+    let mut arena_owner = ManuallyDrop::new(arena_owner);
+
+    if let Some(owner) = async_owner.as_ref() {
+        if let Err(error) = synchronize(owner) {
+            // SAFETY: both owners were placed in ManuallyDrop above and have
+            // not been taken. Ownership moves into the ordered failure value.
+            let async_owner = unsafe { ManuallyDrop::take(&mut async_owner) };
+            let arena_owner = unsafe { ManuallyDrop::take(&mut arena_owner) };
+            return Err(ResidencyTeardownFailure {
+                error,
+                _async_owner: ManuallyDrop::new(async_owner),
+                _arena_owner: ManuallyDrop::new(arena_owner),
+            });
+        }
+    }
+
+    // SAFETY: each owner is dropped exactly once. If async destruction panics,
+    // the arena remains in ManuallyDrop and is leaked rather than unmapped.
+    unsafe { ManuallyDrop::drop(&mut async_owner) };
+    unsafe { ManuallyDrop::drop(&mut arena_owner) };
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ResidencyAccessKind {
     Demand,
@@ -232,7 +309,7 @@ impl ResidencyAccessKind {
 impl MoeExpertResidencyManager {
     pub fn new(device_ordinal: usize, config: MoeExpertResidencyConfig) -> Self {
         Self {
-            arena: VirtualArena::new(device_ordinal, VirtualBacking::Discard),
+            arena: ManuallyDrop::new(VirtualArena::new(device_ordinal, VirtualBacking::Discard)),
             config,
             tensors: Vec::new(),
             tensor_by_layer_projection: HashMap::new(),
@@ -345,6 +422,9 @@ impl MoeExpertResidencyManager {
     }
 
     pub fn enable_async_prefetch(&mut self, staging_pages: usize) -> Result<()> {
+        if self.async_page_in.is_some() {
+            return Err(anyhow!("async MoE prefetch is already enabled"));
+        }
         if staging_pages == 0 {
             return Err(anyhow!("async MoE staging page count must be > 0"));
         }
@@ -1141,6 +1221,28 @@ impl MoeExpertResidencyManager {
             }
         }
         backed.len()
+    }
+}
+
+impl Drop for MoeExpertResidencyManager {
+    fn drop(&mut self) {
+        let async_owner = self.async_page_in.take();
+        // SAFETY: `arena` is wrapped in ManuallyDrop and this is the manager's
+        // only Drop implementation, so the arena is taken exactly once.
+        let arena_owner = unsafe { ManuallyDrop::take(&mut self.arena) };
+
+        if let Err(failure) = teardown_residency_resources(async_owner, arena_owner, |page_in| {
+            page_in
+                .stream
+                .synchronize()
+                .context("synchronize async expert page-in stream during shutdown")
+        }) {
+            let error = failure.into_error_leaking_resources();
+            tracing::error!(
+                error = %error,
+                "failed to drain async expert page-in stream; leaking async and VMM resources"
+            );
+        }
     }
 }
 

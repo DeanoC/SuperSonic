@@ -26,11 +26,6 @@ pub mod model_source;
 
 static NEXT_SERVER_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
 
-// SAFETY: the engine owns the virtual allocations backing its expert pointers,
-// and every server access is serialized through one mutex. Its HIP stream and
-// event operations reselect the recorded device before use or destruction.
-unsafe impl Send for crate::qwen36_moe::engine::Qwen36MoeEngine {}
-
 /// Per-process state shared across every HTTP request. Everything here is
 /// built once at startup.
 pub struct ServerState {
@@ -257,11 +252,8 @@ pub fn build_resolved(
         "server state ready"
     );
 
-    let cache_dir = cfg
-        .prefix_cache_dir
-        .clone()
-        .unwrap_or_else(|| cfg.model_dir.join(".supersonic/serve-cache/v1"));
-    let prefix_cache_enabled = effective_prefix_cache_enabled(&cfg, runtime_policy);
+    let prefix_cache_config =
+        prefix_cache_config(&cfg, &resolved.source, runtime_policy, total_vram);
 
     Ok(ServerState {
         server_instance_id: NEXT_SERVER_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
@@ -283,18 +275,38 @@ pub fn build_resolved(
         )),
         telemetry: GenerationTelemetry::default(),
         capabilities,
-        prefix_cache: Arc::new(PrefixCache::new(PrefixCacheConfig {
-            enabled: prefix_cache_enabled,
-            dir: cache_dir,
-            min_tokens: cfg.prefix_cache_min_tokens,
-            max_entries: cfg.prefix_cache_max_entries,
-            max_bytes: cfg
-                .prefix_cache_max_bytes
-                .unwrap_or_else(|| default_prefix_cache_max_bytes(total_vram)),
-            memory_ttl_secs: cfg.prefix_cache_memory_ttl_secs,
-            disk_ttl_secs: cfg.prefix_cache_disk_ttl_secs,
-        })),
+        prefix_cache: Arc::new(PrefixCache::new(prefix_cache_config)),
     })
+}
+
+fn prefix_cache_config(
+    cfg: &LoaderConfig,
+    source: &model_source::ModelSource,
+    policy: RuntimePolicy,
+    total_vram: u64,
+) -> PrefixCacheConfig {
+    let source_allows_cache = matches!(source, model_source::ModelSource::Directory(_));
+    let dir = cfg
+        .prefix_cache_dir
+        .clone()
+        .unwrap_or_else(|| match source {
+            model_source::ModelSource::Directory(_) => {
+                cfg.model_dir.join(".supersonic/serve-cache/v1")
+            }
+            model_source::ModelSource::Flm(_) => PathBuf::new(),
+        });
+
+    PrefixCacheConfig {
+        enabled: source_allows_cache && effective_prefix_cache_enabled(cfg, policy),
+        dir,
+        min_tokens: cfg.prefix_cache_min_tokens,
+        max_entries: cfg.prefix_cache_max_entries,
+        max_bytes: cfg
+            .prefix_cache_max_bytes
+            .unwrap_or_else(|| default_prefix_cache_max_bytes(total_vram)),
+        memory_ttl_secs: cfg.prefix_cache_memory_ttl_secs,
+        disk_ttl_secs: cfg.prefix_cache_disk_ttl_secs,
+    }
 }
 
 fn default_prefix_cache_max_bytes(total_vram: u64) -> usize {
@@ -354,7 +366,9 @@ fn validate_resolved_runtime_policy(
             if backend != Backend::Hip {
                 bail!("Qwen3.6 MoE FLM serving currently requires the HIP backend");
             }
-            resolve_runtime_policy(cfg, variant)
+            let mut policy = resolve_runtime_policy(cfg, variant)?;
+            policy.prefix_cache_allowed = false;
+            Ok(policy)
         }
     }
 }
@@ -581,8 +595,14 @@ mod tests {
         let c = cfg();
         let flm = model_source::ModelSource::Flm(PathBuf::from("/models/qwen36.flm"));
 
-        validate_resolved_runtime_policy(&c, &flm, &ModelVariant::Qwen3_6_35B_A3B, Backend::Hip)
-            .expect("Qwen3.6 MoE FLM on HIP");
+        let policy = validate_resolved_runtime_policy(
+            &c,
+            &flm,
+            &ModelVariant::Qwen3_6_35B_A3B,
+            Backend::Hip,
+        )
+        .expect("Qwen3.6 MoE FLM on HIP");
+        assert!(!policy.prefix_cache_allowed);
 
         err_contains(
             validate_resolved_runtime_policy(
@@ -596,6 +616,63 @@ mod tests {
         err_contains(
             validate_resolved_runtime_policy(&c, &flm, &ModelVariant::Qwen3_5_0_8B, Backend::Hip),
             "qwen3.6-35b-a3b",
+        );
+    }
+
+    #[test]
+    fn model_source_flm_prefix_cache_is_disabled_without_a_file_child_path() {
+        let mut c = cfg();
+        let flm_path = PathBuf::from("/models/qwen36.flm");
+        c.model_dir = flm_path.clone();
+        let source = model_source::ModelSource::Flm(flm_path.clone());
+        let policy = RuntimePolicy {
+            lane: RuntimeLane::PlainDecode,
+            low_bit_target_required: false,
+            prefix_cache_allowed: true,
+        };
+
+        let cache = prefix_cache_config(&c, &source, policy, 16 * 1024 * 1024 * 1024);
+
+        assert!(!cache.enabled);
+        assert!(cache.dir.as_os_str().is_empty());
+        assert!(!cache.dir.starts_with(flm_path));
+    }
+
+    #[test]
+    fn model_source_flm_prefix_cache_keeps_explicit_dir_but_remains_disabled() {
+        let mut c = cfg();
+        c.model_dir = PathBuf::from("/models/qwen36.flm");
+        c.prefix_cache_dir = Some(PathBuf::from("/var/cache/supersonic"));
+        let source = model_source::ModelSource::Flm(PathBuf::from("/models/qwen36.flm"));
+        let policy = RuntimePolicy {
+            lane: RuntimeLane::PlainDecode,
+            low_bit_target_required: false,
+            prefix_cache_allowed: true,
+        };
+
+        let cache = prefix_cache_config(&c, &source, policy, 16 * 1024 * 1024 * 1024);
+
+        assert!(!cache.enabled);
+        assert_eq!(cache.dir, PathBuf::from("/var/cache/supersonic"));
+    }
+
+    #[test]
+    fn model_source_directory_prefix_cache_preserves_legacy_default() {
+        let c = cfg();
+        let source =
+            model_source::ModelSource::Directory(PathBuf::from("/resolved/model-directory"));
+        let policy = RuntimePolicy {
+            lane: RuntimeLane::PlainDecode,
+            low_bit_target_required: false,
+            prefix_cache_allowed: true,
+        };
+
+        let cache = prefix_cache_config(&c, &source, policy, 16 * 1024 * 1024 * 1024);
+
+        assert!(cache.enabled);
+        assert_eq!(
+            cache.dir,
+            PathBuf::from("/tmp/model/.supersonic/serve-cache/v1")
         );
     }
 

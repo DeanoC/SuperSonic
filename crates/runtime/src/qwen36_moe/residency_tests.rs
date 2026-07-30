@@ -1,9 +1,11 @@
 use super::*;
+use crate::qwen36_moe::types::ExpertPrefetchPhase;
 use gpu_hal::{Backend, VirtualAllocationRole};
 use model_store::manifest::{LayoutTag, Manifest, TensorMeta, FORMAT_VERSION};
 use model_store::VirtualArenaTransferBackend;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 static TEST_DIR_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -36,6 +38,17 @@ struct BackendRestore(Backend);
 impl Drop for BackendRestore {
     fn drop(&mut self) {
         gpu_hal::set_backend(self.0);
+    }
+}
+
+struct DropProbe {
+    name: &'static str,
+    events: Arc<Mutex<Vec<&'static str>>>,
+}
+
+impl Drop for DropProbe {
+    fn drop(&mut self) {
+        self.events.lock().expect("drop event lock").push(self.name);
     }
 }
 
@@ -114,6 +127,124 @@ fn residency_stats_default_to_empty() {
     assert_eq!(stats.registered_tensors, 0);
     assert_eq!(stats.resident_pages, 0);
     assert_eq!(stats.async_pending_pages_peak, 0);
+}
+
+#[test]
+fn async_teardown_drops_async_resources_before_the_arena() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let async_owner = DropProbe {
+        name: "async",
+        events: events.clone(),
+    };
+    let arena_owner = DropProbe {
+        name: "arena",
+        events: events.clone(),
+    };
+
+    let result = teardown_residency_resources(Some(async_owner), arena_owner, |_| {
+        events.lock().expect("sync event lock").push("sync");
+        Ok(())
+    });
+
+    assert!(result.is_ok());
+    assert_eq!(
+        events.lock().expect("teardown event lock").as_slice(),
+        ["sync", "async", "arena"]
+    );
+}
+
+#[test]
+fn async_teardown_error_retains_both_resource_owners() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let async_owner = DropProbe {
+        name: "async",
+        events: events.clone(),
+    };
+    let arena_owner = DropProbe {
+        name: "arena",
+        events: events.clone(),
+    };
+
+    let failure = teardown_residency_resources(Some(async_owner), arena_owner, |_| {
+        events.lock().expect("sync event lock").push("sync");
+        Err(anyhow!("injected stream synchronization failure"))
+    })
+    .expect_err("synchronization failure must retain ownership");
+
+    assert!(failure
+        .error()
+        .to_string()
+        .contains("injected stream synchronization failure"));
+    assert_eq!(
+        events
+            .lock()
+            .expect("failed teardown event lock")
+            .as_slice(),
+        ["sync"]
+    );
+
+    let (async_owner, arena_owner) = failure.into_resources();
+    drop(async_owner);
+    drop(arena_owner);
+    assert_eq!(
+        events.lock().expect("cleanup event lock").as_slice(),
+        ["sync", "async", "arena"]
+    );
+}
+
+#[test]
+fn async_teardown_error_fallback_leaks_live_resources() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let async_owner = DropProbe {
+        name: "async",
+        events: events.clone(),
+    };
+    let arena_owner = DropProbe {
+        name: "arena",
+        events: events.clone(),
+    };
+
+    let failure = teardown_residency_resources(Some(async_owner), arena_owner, |_| {
+        events.lock().expect("sync event lock").push("sync");
+        Err(anyhow!("injected stream synchronization failure"))
+    })
+    .expect_err("synchronization failure must retain ownership");
+
+    let error = failure.into_error_leaking_resources();
+
+    assert!(error
+        .to_string()
+        .contains("injected stream synchronization failure"));
+    assert_eq!(
+        events.lock().expect("leak fallback event lock").as_slice(),
+        ["sync"]
+    );
+}
+
+#[test]
+fn async_teardown_panic_does_not_release_live_resources() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let async_owner = DropProbe {
+        name: "async",
+        events: events.clone(),
+    };
+    let arena_owner = DropProbe {
+        name: "arena",
+        events: events.clone(),
+    };
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = teardown_residency_resources(Some(async_owner), arena_owner, |_| {
+            events.lock().expect("sync event lock").push("sync");
+            panic!("injected synchronization panic");
+        });
+    }));
+
+    assert!(result.is_err());
+    assert_eq!(
+        events.lock().expect("panic event lock").as_slice(),
+        ["sync"]
+    );
 }
 
 fn vmm_backends() -> [Backend; 2] {
@@ -890,6 +1021,117 @@ fn async_prefetch_can_evict_when_enabled() {
         assert!(manager.is_resident(e1));
         assert_eq!(manager.stats().async_completed_pages, 1);
     });
+}
+
+#[test]
+fn moved_pending_predicted_prefetch_owner_drains_before_hip_drop() {
+    with_supported_vmm_backend(
+        "moved_pending_predicted_prefetch_owner_drains_before_hip_drop",
+        |backend| {
+            if backend != Backend::Hip {
+                return;
+            }
+            let probe_tmp = synthetic_store(1, 4096);
+            let probe_store = BakedStore::open(probe_tmp.path()).expect("open probe store");
+            let mut probe =
+                MoeExpertResidencyManager::new(0, MoeExpertResidencyConfig::new(1).unwrap());
+            probe
+                .register_tensor(
+                    &probe_store,
+                    0,
+                    MoeExpertProjection::GateUp,
+                    "model.layers.0.mlp.experts.gate_up_proj",
+                    1,
+                )
+                .expect("register probe tensor");
+            let expert_bytes = probe.tensors[0].page_bytes;
+
+            let tmp = synthetic_store(2, expert_bytes);
+            let store = BakedStore::open(tmp.path()).expect("open synthetic store");
+            let mut manager =
+                MoeExpertResidencyManager::new(0, MoeExpertResidencyConfig::new(2).unwrap());
+            for projection in [MoeExpertProjection::GateUp, MoeExpertProjection::Down] {
+                manager
+                    .register_tensor(
+                        &store,
+                        0,
+                        projection,
+                        "model.layers.0.mlp.experts.gate_up_proj",
+                        2,
+                    )
+                    .expect("register predicted-prefetch tensor");
+            }
+            manager
+                .enable_async_prefetch(2)
+                .expect("enable async prefetch");
+
+            let previous_topk_by_layer = vec![vec![1]];
+            let mut next_topk_by_layer = vec![Vec::new()];
+            crate::qwen36_moe::prefetch::handle_moe_expert_prefetch(
+                &mut manager,
+                &store,
+                crate::qwen36_moe_config::MoeIslandPrefetchMode::PreviousToken,
+                1,
+                0.9,
+                false,
+                None,
+                None,
+                &previous_topk_by_layer,
+                &mut next_topk_by_layer,
+                false,
+                None,
+                None,
+                None,
+                ExpertPrefetchPhase::Lookahead,
+                0,
+                &[],
+            )
+            .expect("schedule predicted prefetch");
+            assert_eq!(manager.stats().async_scheduled_pages, 2);
+            assert_eq!(manager.pending_pages.len(), 2);
+
+            std::thread::spawn(move || {
+                assert_eq!(manager.pending_pages.len(), 2);
+                drop(manager);
+            })
+            .join()
+            .expect("drop moved pending residency owner");
+        },
+    );
+}
+
+#[test]
+fn async_prefetch_rejects_reinitializing_the_live_owner() {
+    with_supported_vmm_backend(
+        "async_prefetch_rejects_reinitializing_the_live_owner",
+        |backend| {
+            if backend != Backend::Hip {
+                return;
+            }
+            let tmp = synthetic_store(1, 4096);
+            let store = BakedStore::open(tmp.path()).expect("open synthetic store");
+            let mut manager =
+                MoeExpertResidencyManager::new(0, MoeExpertResidencyConfig::new(1).unwrap());
+            manager
+                .register_tensor(
+                    &store,
+                    0,
+                    MoeExpertProjection::GateUp,
+                    "model.layers.0.mlp.experts.gate_up_proj",
+                    1,
+                )
+                .expect("register tensor");
+            manager
+                .enable_async_prefetch(1)
+                .expect("enable async prefetch");
+
+            let error = manager
+                .enable_async_prefetch(1)
+                .expect_err("async prefetch owner must not be replaced");
+
+            assert!(error.to_string().contains("already enabled"));
+        },
+    );
 }
 
 #[test]
