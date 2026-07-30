@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use futures::StreamExt;
 use reqwest::Client;
@@ -73,6 +74,68 @@ fn test_state_with_scheduler(
     })
 }
 
+fn test_flm_state_with_scheduler(
+    mock_generation: MockGeneration,
+    scheduler: GenerationScheduler,
+) -> Arc<ServerState> {
+    let mut state = test_state_with_scheduler(mock_generation, scheduler);
+    let state_mut = Arc::get_mut(&mut state).expect("unique test state");
+    state_mut.model_id = "qwen3.6-35b-a3b".to_string();
+    state_mut.model_family = registry::ModelFamily::Qwen36Moe;
+    state_mut.capabilities = capabilities::capabilities_for_variant(
+        &registry::ModelVariant::Qwen3_6_35B_A3B,
+        registry::Backend::Hip,
+        false,
+        false,
+        false,
+    );
+    state_mut.capabilities.flm = Some(capabilities::FlmLoadEvidence {
+        source_file: "qwen36-native.flm".to_string(),
+        architecture_id: 2,
+        model_id: 1,
+        storage_abi_ids: vec![3, 7],
+        direct_profile: capabilities::FlmDirectProfile {
+            required_weights: 693,
+            raw_dense_weights: 363,
+            native_int4_direct_weights: 330,
+            bf16_fallback_weights: 0,
+        },
+        transfer_backend: capabilities::FlmTransferBackend::PageableH2d,
+        source_bytes: 8_000_000_000,
+        device_upload_bytes: 7_000_000_000,
+        startup: capabilities::FlmStartupDurations {
+            source_open: Duration::from_millis(10),
+            store_open: Duration::from_millis(20),
+            config: Duration::from_millis(30),
+            descriptor: Duration::from_millis(40),
+            tokenizer: Duration::from_millis(50),
+            plan: Duration::from_millis(60),
+            allocation: Duration::from_millis(70),
+            upload: Duration::from_millis(80),
+            total: Duration::from_millis(1250),
+        },
+        load_sequence: 1,
+        source_open_count: 1,
+        resident_allocation_count: 42,
+        features: capabilities::ServingFeatures {
+            plain_prefill_decode: true,
+            native_dflash_generate: false,
+            prefix_snapshot: false,
+            disk_prefix_snapshot: false,
+        },
+    });
+    state_mut.prefix_cache = Arc::new(PrefixCache::new(PrefixCacheConfig {
+        enabled: false,
+        dir: std::path::PathBuf::new(),
+        min_tokens: 1,
+        max_entries: 1,
+        max_bytes: 64 * 1024 * 1024,
+        memory_ttl_secs: 600,
+        disk_ttl_secs: 86_400,
+    }));
+    state
+}
+
 fn next_test_server_instance_id() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -144,6 +207,15 @@ async fn collect_sse(resp: reqwest::Response) -> Vec<Value> {
         }
     }
     events
+}
+
+fn assert_metric(metrics: &str, name: &str, expected: &str) {
+    assert!(
+        metrics
+            .lines()
+            .any(|line| line == format!("{name} {expected}")),
+        "missing metric {name} {expected} in:\n{metrics}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -607,6 +679,159 @@ async fn mock_auth_cors_and_model_mismatch() {
     assert_eq!(unsupported.status(), reqwest::StatusCode::BAD_REQUEST);
 }
 
+#[test]
+fn capabilities_readiness_starts_false_and_integrity_loss_is_one_way() {
+    let state = test_state_with_scheduler(
+        MockGeneration::text("hello"),
+        GenerationScheduler::loading(32, 30_000),
+    );
+
+    assert!(!state.is_ready());
+    assert!(state.mark_loaded());
+    assert!(state.is_ready());
+
+    state.mark_integrity_lost();
+    assert!(!state.is_ready());
+    assert!(!state.mark_loaded());
+    assert!(!state.is_ready());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn capabilities_report_truthful_flm_evidence_without_path_leaks() {
+    let state = test_flm_state_with_scheduler(
+        MockGeneration::text("hello"),
+        GenerationScheduler::new(32, 30_000),
+    );
+    let h = spawn_with_state(state.clone()).await;
+
+    let capabilities: Value = h
+        .client
+        .get(format!("{}/v1/capabilities", h.base))
+        .bearer_auth("secret")
+        .send()
+        .await
+        .expect("capabilities")
+        .json()
+        .await
+        .expect("capabilities json");
+    assert_eq!(capabilities["model"], "qwen3.6-35b-a3b");
+    assert_eq!(capabilities["ready"], true);
+    assert_eq!(capabilities["flm"]["source"], "flm");
+    assert_eq!(capabilities["flm"]["file"], "qwen36-native.flm");
+    assert_eq!(capabilities["flm"]["model_id"], 1);
+    assert_eq!(capabilities["flm"]["required_weights"], 693);
+    assert_eq!(capabilities["flm"]["raw_dense_weights"], 363);
+    assert_eq!(capabilities["flm"]["native_int4_direct_weights"], 330);
+    assert_eq!(capabilities["flm"]["bf16_fallback_weights"], 0);
+    assert_eq!(capabilities["flm"]["load_sequence"], 1);
+    assert_eq!(
+        capabilities["flm"]["features"]["plain_prefill_decode"],
+        true
+    );
+    assert_eq!(
+        capabilities["flm"]["features"]["native_dflash_generate"],
+        false
+    );
+    assert_eq!(capabilities["flm"]["features"]["prefix_snapshot"], false);
+    assert_eq!(
+        capabilities["flm"]["features"]["disk_prefix_snapshot"],
+        false
+    );
+    assert_eq!(capabilities["prefix_cache"]["enabled"], false);
+    let rendered = serde_json::to_string(&capabilities).expect("capabilities serialization");
+    assert!(!rendered.contains("/models/private"));
+    assert!(!rendered.contains("resident_allocation_pointers"));
+    assert!(!rendered.contains("mapped_virtual_ranges"));
+
+    let health: Value = h
+        .client
+        .get(format!("{}/health", h.base))
+        .bearer_auth("secret")
+        .send()
+        .await
+        .expect("health")
+        .json()
+        .await
+        .expect("health json");
+    assert_eq!(health["ready"], true);
+    assert_eq!(health["flm"], capabilities["flm"]);
+
+    state.mark_integrity_lost();
+
+    let health = h
+        .client
+        .get(format!("{}/health", h.base))
+        .bearer_auth("secret")
+        .send()
+        .await
+        .expect("poisoned health");
+    assert_eq!(health.status(), reqwest::StatusCode::OK);
+    let health: Value = health.json().await.expect("poisoned health json");
+    assert_eq!(health["status"], "degraded");
+    assert_eq!(health["ready"], false);
+
+    let ready = h
+        .client
+        .get(format!("{}/ready", h.base))
+        .bearer_auth("secret")
+        .send()
+        .await
+        .expect("poisoned ready");
+    assert_eq!(ready.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    let ready: Value = ready.json().await.expect("poisoned ready json");
+    assert_eq!(ready["ready"], false);
+    assert_eq!(ready["flm"]["load_sequence"], 1);
+
+    let metrics = h
+        .client
+        .get(format!("{}/metrics", h.base))
+        .bearer_auth("secret")
+        .send()
+        .await
+        .expect("poisoned metrics")
+        .text()
+        .await
+        .expect("poisoned metrics text");
+    assert_metric(&metrics, "supersonic_ready", "0");
+    assert_metric(&metrics, "supersonic_model_loads_total", "1");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn capabilities_metrics_report_flm_load_and_serving_truth() {
+    let h = spawn_with_state(test_flm_state_with_scheduler(
+        MockGeneration::text("hello"),
+        GenerationScheduler::new(32, 30_000),
+    ))
+    .await;
+
+    let metrics = h
+        .client
+        .get(format!("{}/metrics", h.base))
+        .bearer_auth("secret")
+        .send()
+        .await
+        .expect("metrics")
+        .text()
+        .await
+        .expect("metrics text");
+
+    assert_metric(&metrics, "supersonic_ready", "1");
+    assert_metric(&metrics, "supersonic_active_requests", "0");
+    assert_metric(&metrics, "supersonic_queued_requests", "0");
+    assert_metric(&metrics, "supersonic_prefix_cache_enabled", "0");
+    assert_metric(&metrics, "supersonic_prefix_cache_entries", "0");
+    assert_metric(&metrics, "supersonic_prefix_cache_cached_tokens", "0");
+    assert_metric(&metrics, "supersonic_model_loads_total", "1");
+    assert_metric(&metrics, "supersonic_flm_native_int4_direct_weights", "330");
+    assert_metric(&metrics, "supersonic_flm_bf16_fallback_weights", "0");
+    assert_metric(&metrics, "supersonic_flm_source_bytes", "8000000000");
+    assert_metric(&metrics, "supersonic_flm_device_upload_bytes", "7000000000");
+    assert_metric(&metrics, "supersonic_flm_startup_seconds", "1.25");
+    assert!(!metrics.contains("qwen36-native.flm"));
+    assert!(!metrics.contains("/models/private"));
+    assert!(!metrics.contains('{'));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mock_generation_queue_full_returns_429() {
     let state = test_state_with_scheduler(
@@ -704,7 +929,7 @@ async fn mock_generation_queue_timeout_returns_503() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mock_queued_stream_disconnect_releases_queue_slot() {
-    let state = test_state_with_scheduler(
+    let state = test_flm_state_with_scheduler(
         MockGeneration {
             chunks: vec!["hello".to_string(), " world".to_string()],
             finish: server::generate::FinishReason::Stop,
@@ -771,6 +996,22 @@ async fn mock_queued_stream_disconnect_releases_queue_slot() {
 
     let first = first.await.expect("first join");
     assert_eq!(first.status(), reqwest::StatusCode::OK);
+
+    let metrics = h
+        .client
+        .get(format!("{}/metrics", h.base))
+        .bearer_auth("secret")
+        .send()
+        .await
+        .expect("metrics after disconnect")
+        .text()
+        .await
+        .expect("metrics text");
+    assert_metric(&metrics, "supersonic_active_requests", "0");
+    assert_metric(&metrics, "supersonic_queued_requests", "0");
+    assert_metric(&metrics, "supersonic_prefix_cache_enabled", "0");
+    assert_metric(&metrics, "supersonic_prefix_cache_entries", "0");
+    assert_metric(&metrics, "supersonic_prefix_cache_cached_tokens", "0");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

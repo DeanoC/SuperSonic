@@ -5,7 +5,7 @@
 
 use anyhow::{anyhow, bail, Result};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokenizers::Tokenizer;
 use tokio::sync::{Mutex, Semaphore};
@@ -19,7 +19,10 @@ use crate::chat_template::ChatTemplate;
 use crate::generate::{GenerationTelemetry, MockGeneration};
 use crate::prefix_cache::{PrefixCache, PrefixCacheConfig};
 use crate::session::InferenceSession;
-use supersonic_core::capabilities::{capabilities_for_variant, ModelCapabilities};
+use supersonic_core::capabilities::{
+    capabilities_for_variant, FlmDirectProfile, FlmLoadEvidence, FlmStartupDurations,
+    FlmTransferBackend, ModelCapabilities, ServingFeatures,
+};
 
 #[path = "model_source.rs"]
 pub mod model_source;
@@ -54,29 +57,55 @@ pub struct GenerationScheduler {
     pub queued: AtomicUsize,
     pub max_queue: usize,
     pub queue_timeout_ms: u64,
-    ready: AtomicBool,
+    readiness: AtomicU8,
 }
 
 impl GenerationScheduler {
+    const LOADING: u8 = 0;
+    const READY: u8 = 1;
+    const INTEGRITY_LOST: u8 = 2;
+
     pub fn new(max_queue: usize, queue_timeout_ms: u64) -> Self {
+        Self::with_readiness(max_queue, queue_timeout_ms, Self::READY)
+    }
+
+    pub fn loading(max_queue: usize, queue_timeout_ms: u64) -> Self {
+        Self::with_readiness(max_queue, queue_timeout_ms, Self::LOADING)
+    }
+
+    fn with_readiness(max_queue: usize, queue_timeout_ms: u64, readiness: u8) -> Self {
         Self {
             permits: Arc::new(Semaphore::new(1)),
             active: AtomicUsize::new(0),
             queued: AtomicUsize::new(0),
             max_queue,
             queue_timeout_ms,
-            ready: AtomicBool::new(true),
+            readiness: AtomicU8::new(readiness),
         }
     }
 }
 
 impl ServerState {
     pub fn is_ready(&self) -> bool {
-        self.scheduler.ready.load(Ordering::Acquire)
+        self.scheduler.readiness.load(Ordering::Acquire) == GenerationScheduler::READY
+    }
+
+    pub fn mark_loaded(&self) -> bool {
+        self.scheduler
+            .readiness
+            .compare_exchange(
+                GenerationScheduler::LOADING,
+                GenerationScheduler::READY,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
     }
 
     pub fn mark_integrity_lost(&self) {
-        self.scheduler.ready.store(false, Ordering::Release);
+        self.scheduler
+            .readiness
+            .store(GenerationScheduler::INTEGRITY_LOST, Ordering::Release);
     }
 }
 
@@ -164,7 +193,7 @@ pub fn build_resolved(
         }
     };
     let gpu_arch = GpuArch::from_backend_name(&backend, &arch_name);
-    let capabilities =
+    let mut capabilities =
         capabilities_for_variant(&variant, backend, cfg.int4, cfg.fp8_runtime, cfg.kv_fp8);
     tracing::info!(
         backend = %backend,
@@ -242,6 +271,7 @@ pub fn build_resolved(
                 cfg.device,
                 max_context,
             ))?;
+            capabilities.flm = Some(project_qwen36_load_evidence(engine.load_evidence())?);
             let tokenizer = Arc::new(engine.tokenizer().clone());
             let chat_template = Some(ChatTemplate::from_template_source(
                 engine.chat_template_source().to_owned(),
@@ -257,17 +287,10 @@ pub fn build_resolved(
         }
     };
 
-    tracing::info!(
-        model = %variant,
-        family = %variant.family(),
-        max_context,
-        "server state ready"
-    );
-
     let prefix_cache_config =
         prefix_cache_config(&cfg, &resolved.source, runtime_policy, total_vram);
 
-    Ok(ServerState {
+    let state = ServerState {
         server_instance_id: NEXT_SERVER_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
         model_id: variant.to_string(),
         model_family: variant.family(),
@@ -281,13 +304,77 @@ pub fn build_resolved(
         api_key: cfg.api_key,
         cors_allow_origin: cfg.cors_allow_origin,
         response_store_max_entries: cfg.response_store_max_entries,
-        scheduler: Arc::new(GenerationScheduler::new(
+        scheduler: Arc::new(GenerationScheduler::loading(
             cfg.max_queued_requests,
             cfg.queue_timeout_ms,
         )),
         telemetry: GenerationTelemetry::default(),
         capabilities,
         prefix_cache: Arc::new(PrefixCache::new(prefix_cache_config)),
+    };
+    if !state.mark_loaded() {
+        bail!("server readiness was poisoned before startup completed");
+    }
+    tracing::info!(
+        model = %variant,
+        family = %variant.family(),
+        max_context,
+        "server state ready"
+    );
+    Ok(state)
+}
+
+fn project_qwen36_load_evidence(
+    evidence: &crate::qwen36_moe::engine::Qwen36MoeLoadEvidence,
+) -> Result<FlmLoadEvidence> {
+    let source_file = evidence
+        .flm_path
+        .file_name()
+        .ok_or_else(|| anyhow!("Qwen3.6 FLM source path has no basename"))?
+        .to_string_lossy()
+        .into_owned();
+    let transfer_backend = match evidence.transfer_backend {
+        model_store::VirtualArenaTransferBackend::PageableH2d => FlmTransferBackend::PageableH2d,
+        model_store::VirtualArenaTransferBackend::GpuDirectStorage => {
+            FlmTransferBackend::GpuDirectStorage
+        }
+    };
+    let features = crate::session::qwen36_moe_features();
+
+    Ok(FlmLoadEvidence {
+        source_file,
+        architecture_id: evidence.architecture_id,
+        model_id: evidence.model_id,
+        storage_abi_ids: evidence.storage_abi_ids.clone(),
+        direct_profile: FlmDirectProfile {
+            required_weights: evidence.direct_profile.required_tensors,
+            raw_dense_weights: evidence.direct_profile.raw_dense,
+            native_int4_direct_weights: evidence.direct_profile.native_int4,
+            bf16_fallback_weights: evidence.direct_profile.bf16_fallback,
+        },
+        transfer_backend,
+        source_bytes: evidence.source_bytes,
+        device_upload_bytes: evidence.device_upload_bytes,
+        startup: FlmStartupDurations {
+            source_open: evidence.source_open_duration,
+            store_open: evidence.store_open_duration,
+            config: evidence.config_duration,
+            descriptor: evidence.descriptor_duration,
+            tokenizer: evidence.tokenizer_duration,
+            plan: evidence.plan_duration,
+            allocation: evidence.allocation_duration,
+            upload: evidence.upload_duration,
+            total: evidence.total_duration,
+        },
+        load_sequence: evidence.load_sequence,
+        source_open_count: evidence.source_open_count,
+        resident_allocation_count: evidence.resident_allocation_count,
+        features: ServingFeatures {
+            plain_prefill_decode: features.plain_prefill_decode,
+            native_dflash_generate: features.native_dflash_generate,
+            prefix_snapshot: features.prefix_snapshot,
+            disk_prefix_snapshot: features.disk_prefix_snapshot,
+        },
     })
 }
 
@@ -514,6 +601,41 @@ fn validate_runtime_policy(
 mod tests {
     use super::*;
 
+    fn qwen36_load_evidence(path: &str) -> crate::qwen36_moe::engine::Qwen36MoeLoadEvidence {
+        crate::qwen36_moe::engine::Qwen36MoeLoadEvidence {
+            flm_path: PathBuf::from(path),
+            architecture_id: 2,
+            model_id: 1,
+            storage_abi_ids: vec![3, 7],
+            direct_profile: crate::qwen36_moe::source::Qwen36MoeDirectProfile {
+                required_tensors: 693,
+                raw_dense: 363,
+                native_int4: 330,
+                bf16_fallback: 0,
+            },
+            transfer_backend: model_store::VirtualArenaTransferBackend::PageableH2d,
+            source_bytes: 8_000_000_000,
+            device_upload_bytes: 7_000_000_000,
+            source_open_duration: std::time::Duration::from_millis(10),
+            store_open_duration: std::time::Duration::from_millis(20),
+            config_duration: std::time::Duration::from_millis(30),
+            descriptor_duration: std::time::Duration::from_millis(40),
+            tokenizer_duration: std::time::Duration::from_millis(50),
+            plan_duration: std::time::Duration::from_millis(60),
+            allocation_duration: std::time::Duration::from_millis(70),
+            upload_duration: std::time::Duration::from_millis(80),
+            total_duration: std::time::Duration::from_millis(1250),
+            load_sequence: 1,
+            source_open_count: 1,
+            resident_allocation_count: 42,
+            resident_allocation_pointers: vec![0x1234],
+            mapped_virtual_ranges: Vec::new(),
+            config: None,
+            tokenizer_timings: crate::flm_tokenizer::QwenBpeTokenizerTimings::default(),
+            hal_profile: gpu_hal::HalProfileSnapshot::default(),
+        }
+    }
+
     fn cfg() -> LoaderConfig {
         LoaderConfig {
             model: "qwen3.5-0.8b".to_string(),
@@ -559,6 +681,35 @@ mod tests {
         fn assert_send<T: Send>() {}
 
         assert_send::<crate::qwen36_moe::engine::Qwen36MoeEngine>();
+    }
+
+    #[test]
+    fn flm_load_evidence_projection_is_basename_only_and_excludes_pointer_details() {
+        let evidence = qwen36_load_evidence("/models/private/qwen36-native.flm");
+
+        let projected = project_qwen36_load_evidence(&evidence).expect("FLM evidence projection");
+
+        assert_eq!(projected.source_file, "qwen36-native.flm");
+        assert_eq!(projected.architecture_id, 2);
+        assert_eq!(projected.model_id, 1);
+        assert_eq!(projected.storage_abi_ids, vec![3, 7]);
+        assert_eq!(projected.direct_profile.required_weights, 693);
+        assert_eq!(projected.direct_profile.raw_dense_weights, 363);
+        assert_eq!(projected.direct_profile.native_int4_direct_weights, 330);
+        assert_eq!(projected.direct_profile.bf16_fallback_weights, 0);
+        assert_eq!(projected.source_bytes, 8_000_000_000);
+        assert_eq!(projected.device_upload_bytes, 7_000_000_000);
+        assert_eq!(
+            projected.startup.total,
+            std::time::Duration::from_millis(1250)
+        );
+        assert_eq!(projected.load_sequence, 1);
+        assert_eq!(projected.source_open_count, 1);
+        assert_eq!(projected.resident_allocation_count, 42);
+        assert!(projected.features.plain_prefill_decode);
+        assert!(!projected.features.native_dflash_generate);
+        assert!(!projected.features.prefix_snapshot);
+        assert!(!projected.features.disk_prefix_snapshot);
     }
 
     #[test]

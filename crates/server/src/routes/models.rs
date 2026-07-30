@@ -1,10 +1,12 @@
 //! `GET /v1/models` — returns the single model loaded by this process.
 
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::extract::{Path, State};
+use axum::extract::{OriginalUri, Path, State};
 use axum::http::header::CONTENT_TYPE;
+use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 use serde::Serialize;
@@ -13,7 +15,7 @@ use crate::compat::validate_model;
 use crate::errors::ApiError;
 use crate::generate;
 use crate::prefix_cache::PrefixCacheStats;
-use crate::schemas::{ListModelsResponse, ModelObject};
+use crate::schemas::{FlmEvidence, ListModelsResponse, ModelObject};
 use crate::state::ServerState;
 
 pub async fn list(
@@ -49,28 +51,41 @@ fn model_object(state: &ServerState) -> ModelObject {
 #[derive(Debug, Serialize)]
 pub struct HealthResponse {
     pub status: &'static str,
+    pub ready: bool,
     pub model: String,
     pub max_context: usize,
     pub active_requests: usize,
     pub queued_requests: usize,
     pub max_queued_requests: usize,
     pub prefix_cache_entries: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flm: Option<FlmEvidence>,
 }
 
 pub async fn health(
+    OriginalUri(uri): OriginalUri,
     State(state): State<Arc<ServerState>>,
-) -> Result<Json<HealthResponse>, ApiError> {
+) -> impl IntoResponse {
     let queue = generate::scheduler_snapshot(&state);
     let cache = state.prefix_cache.stats();
-    Ok(Json(HealthResponse {
-        status: "ok",
+    let ready = state.is_ready();
+    let response = HealthResponse {
+        status: if ready { "ok" } else { "degraded" },
+        ready,
         model: state.model_id.clone(),
         max_context: state.max_context,
         active_requests: queue.active,
         queued_requests: queue.queued,
         max_queued_requests: queue.max_queue,
         prefix_cache_entries: cache.entries,
-    }))
+        flm: state.capabilities.flm.as_ref().map(FlmEvidence::from),
+    };
+    let status = if uri.path().ends_with("/ready") && !ready {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::OK
+    };
+    (status, Json(response))
 }
 
 #[derive(Debug, Serialize)]
@@ -78,6 +93,7 @@ pub struct CapabilitiesResponse {
     pub model: String,
     pub family: String,
     pub backend: String,
+    pub ready: bool,
     pub max_context: usize,
     pub endpoints: Vec<&'static str>,
     pub chat: bool,
@@ -89,6 +105,8 @@ pub struct CapabilitiesResponse {
     pub reasoning: bool,
     pub scheduler: SchedulerCapabilities,
     pub prefix_cache: PrefixCacheStats,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flm: Option<FlmEvidence>,
 }
 
 #[derive(Debug, Serialize)]
@@ -108,6 +126,7 @@ pub async fn capabilities(
         model: state.model_id.clone(),
         family: state.model_family.to_string(),
         backend: state.capabilities.backend.to_string(),
+        ready: state.is_ready(),
         max_context: state.max_context,
         endpoints: vec![
             "/v1/models",
@@ -138,6 +157,7 @@ pub async fn capabilities(
             queue_timeout_ms: queue.queue_timeout_ms,
         },
         prefix_cache: cache,
+        flm: state.capabilities.flm.as_ref().map(FlmEvidence::from),
     }))
 }
 
@@ -145,8 +165,10 @@ pub async fn metrics(State(state): State<Arc<ServerState>>) -> impl IntoResponse
     let queue = generate::scheduler_snapshot(&state);
     let generation = generate::telemetry_snapshot(&state);
     let cache = state.prefix_cache.stats();
-    let body = format!(
-        "# TYPE supersonic_active_requests gauge\n\
+    let mut body = format!(
+        "# TYPE supersonic_ready gauge\n\
+         supersonic_ready {}\n\
+         # TYPE supersonic_active_requests gauge\n\
          supersonic_active_requests {}\n\
          # TYPE supersonic_queued_requests gauge\n\
          supersonic_queued_requests {}\n\
@@ -160,6 +182,8 @@ pub async fn metrics(State(state): State<Arc<ServerState>>) -> impl IntoResponse
          supersonic_queue_timeout_ms {}\n\
          # TYPE supersonic_max_context gauge\n\
          supersonic_max_context {}\n\
+         # TYPE supersonic_prefix_cache_enabled gauge\n\
+         supersonic_prefix_cache_enabled {}\n\
          # TYPE supersonic_prefix_cache_entries gauge\n\
          supersonic_prefix_cache_entries {}\n\
          # TYPE supersonic_prefix_cache_resident_bytes gauge\n\
@@ -188,6 +212,7 @@ pub async fn metrics(State(state): State<Arc<ServerState>>) -> impl IntoResponse
          supersonic_dflash_last_accepted_total {}\n\
          # TYPE supersonic_dflash_last_decode_ms gauge\n\
          supersonic_dflash_last_decode_ms {}\n",
+        usize::from(state.is_ready()),
         queue.active,
         queue.queued,
         generation.active,
@@ -195,6 +220,7 @@ pub async fn metrics(State(state): State<Arc<ServerState>>) -> impl IntoResponse
         queue.max_queue,
         queue.queue_timeout_ms,
         state.max_context,
+        usize::from(cache.enabled),
         cache.entries,
         cache.resident_bytes,
         cache.max_bytes,
@@ -210,5 +236,28 @@ pub async fn metrics(State(state): State<Arc<ServerState>>) -> impl IntoResponse
         generation.dflash.last_accepted_total,
         generation.dflash.last_decode_ms,
     );
+    if let Some(flm) = state.capabilities.flm.as_ref() {
+        let _ = write!(
+            body,
+            "# TYPE supersonic_model_loads_total counter\n\
+             supersonic_model_loads_total {}\n\
+             # TYPE supersonic_flm_native_int4_direct_weights gauge\n\
+             supersonic_flm_native_int4_direct_weights {}\n\
+             # TYPE supersonic_flm_bf16_fallback_weights gauge\n\
+             supersonic_flm_bf16_fallback_weights {}\n\
+             # TYPE supersonic_flm_source_bytes gauge\n\
+             supersonic_flm_source_bytes {}\n\
+             # TYPE supersonic_flm_device_upload_bytes gauge\n\
+             supersonic_flm_device_upload_bytes {}\n\
+             # TYPE supersonic_flm_startup_seconds gauge\n\
+             supersonic_flm_startup_seconds {}\n",
+            flm.load_sequence,
+            flm.direct_profile.native_int4_direct_weights,
+            flm.direct_profile.bf16_fallback_weights,
+            flm.source_bytes,
+            flm.device_upload_bytes,
+            flm.startup.total.as_secs_f64(),
+        );
+    }
     ([(CONTENT_TYPE, "text/plain; version=0.0.4")], body)
 }
