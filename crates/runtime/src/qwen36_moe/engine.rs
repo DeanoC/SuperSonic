@@ -3346,6 +3346,56 @@ mod tests {
     }
 
     #[test]
+    fn profiled_gpu_load_error_preserves_overlapping_capture_ownership() {
+        let _backend_lock = crate::qwen36_moe::layer_loader::GPU_BACKEND_TEST_LOCK
+            .lock()
+            .expect("GPU backend test lock");
+        gpu_hal::hal_profile_set_enabled(false);
+        let mut survivor = None;
+
+        let (load_result, load_profile) = profile_gpu_load::<()>(|| {
+            survivor = Some(gpu_hal::HalProfileCapture::begin());
+            Err(anyhow::anyhow!("expected profiled load error"))
+        });
+
+        assert_eq!(
+            load_result.expect_err("load must fail").to_string(),
+            "expected profiled load error"
+        );
+        assert_eq!(load_profile.total_calls, 0);
+        assert!(
+            gpu_hal::hal_profile_enabled(),
+            "failed load disabled its surviving overlapping capture"
+        );
+        let _ = survivor.take().expect("surviving capture").finish();
+        assert!(!gpu_hal::hal_profile_enabled());
+    }
+
+    #[test]
+    fn profiled_gpu_load_unwind_preserves_overlapping_capture_ownership() {
+        let _backend_lock = crate::qwen36_moe::layer_loader::GPU_BACKEND_TEST_LOCK
+            .lock()
+            .expect("GPU backend test lock");
+        gpu_hal::hal_profile_set_enabled(false);
+        let mut survivor = None;
+
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = profile_gpu_load::<()>(|| -> Result<()> {
+                survivor = Some(gpu_hal::HalProfileCapture::begin());
+                panic!("expected profiled load unwind");
+            });
+        }));
+
+        assert!(unwind.is_err());
+        assert!(
+            gpu_hal::hal_profile_enabled(),
+            "unwinding load disabled its surviving overlapping capture"
+        );
+        let _ = survivor.take().expect("surviving capture").finish();
+        assert!(!gpu_hal::hal_profile_enabled());
+    }
+
+    #[test]
     fn profiled_gpu_load_preserves_outer_profile_and_returns_load_only_evidence() {
         let _backend_lock = crate::qwen36_moe::layer_loader::GPU_BACKEND_TEST_LOCK
             .lock()

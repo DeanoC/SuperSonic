@@ -7,7 +7,7 @@ use std::ffi::{c_int, c_void};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
@@ -36,7 +36,8 @@ unsafe extern "C" {
     ) -> c_int;
 }
 
-static HAL_PROFILE_ENABLED: AtomicBool = AtomicBool::new(false);
+static HAL_PROFILE_EXPLICIT_ENABLED: AtomicBool = AtomicBool::new(false);
+static HAL_PROFILE_ACTIVE_CAPTURES: AtomicUsize = AtomicUsize::new(0);
 static HAL_PROFILE: OnceLock<Mutex<HalProfileAccumulator>> = OnceLock::new();
 const STORAGE_DIRECT_BLOCK_ALIGNMENT: usize = 4096;
 
@@ -78,7 +79,6 @@ pub struct HalProfileSnapshot {
 #[must_use = "finish the capture to retain its HAL profile snapshot"]
 pub struct HalProfileCapture {
     id: u64,
-    disable_on_finish: bool,
     active: bool,
 }
 
@@ -91,10 +91,6 @@ struct HalProfileAccumulator {
 
 impl HalProfileCapture {
     pub fn begin() -> Self {
-        let disable_on_finish = !hal_profile_enabled();
-        if disable_on_finish {
-            hal_profile_set_enabled(true);
-        }
         let profile = HAL_PROFILE.get_or_init(|| Mutex::new(HalProfileAccumulator::default()));
         let mut profile = profile.lock().expect("HAL profile mutex poisoned");
         profile.next_capture_id = profile
@@ -103,11 +99,12 @@ impl HalProfileCapture {
             .expect("HAL profile capture id exhausted");
         let id = profile.next_capture_id;
         profile.captures.insert(id, BTreeMap::new());
-        Self {
-            id,
-            disable_on_finish,
-            active: true,
-        }
+        HAL_PROFILE_ACTIVE_CAPTURES
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                active.checked_add(1)
+            })
+            .expect("HAL profile capture count exhausted");
+        Self { id, active: true }
     }
 
     pub fn finish(mut self) -> HalProfileSnapshot {
@@ -118,19 +115,21 @@ impl HalProfileCapture {
         if !self.active {
             return HalProfileSnapshot::default();
         }
-        let entries = HAL_PROFILE
-            .get_or_init(|| Mutex::new(HalProfileAccumulator::default()))
-            .lock()
-            .expect("HAL profile mutex poisoned")
+        let profile = HAL_PROFILE.get_or_init(|| Mutex::new(HalProfileAccumulator::default()));
+        let mut profile = profile.lock().expect("HAL profile mutex poisoned");
+        let entries = profile
             .captures
             .remove(&self.id)
             .unwrap_or_default()
             .into_values()
             .collect();
-        if self.disable_on_finish {
-            hal_profile_set_enabled(false);
-        }
         self.active = false;
+        HAL_PROFILE_ACTIVE_CAPTURES
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                active.checked_sub(1)
+            })
+            .expect("HAL profile capture count underflow");
+        drop(profile);
         hal_profile_snapshot_from_entries(entries)
     }
 }
@@ -142,11 +141,12 @@ impl Drop for HalProfileCapture {
 }
 
 pub fn hal_profile_set_enabled(enabled: bool) {
-    HAL_PROFILE_ENABLED.store(enabled, Ordering::Relaxed);
+    HAL_PROFILE_EXPLICIT_ENABLED.store(enabled, Ordering::Release);
 }
 
 pub fn hal_profile_enabled() -> bool {
-    HAL_PROFILE_ENABLED.load(Ordering::Relaxed)
+    HAL_PROFILE_EXPLICIT_ENABLED.load(Ordering::Acquire)
+        || HAL_PROFILE_ACTIVE_CAPTURES.load(Ordering::Acquire) > 0
         || std::env::var_os("SUPERSONIC_HAL_PROFILE").is_some()
 }
 
@@ -1787,9 +1787,46 @@ pub fn byte_len(dtype: ScalarType, elems: usize) -> usize {
 
 #[cfg(test)]
 mod hal_profile_tests {
+    use std::ffi::OsString;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
     use super::*;
 
+    const HAL_PROFILE_ENV: &str = "SUPERSONIC_HAL_PROFILE";
     static PROFILE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    struct ProfileTestGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        env_value: Option<OsString>,
+    }
+
+    impl ProfileTestGuard {
+        fn new() -> Self {
+            let lock = PROFILE_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let env_value = std::env::var_os(HAL_PROFILE_ENV);
+            std::env::remove_var(HAL_PROFILE_ENV);
+            hal_profile_set_enabled(false);
+            hal_profile_reset();
+            Self {
+                _lock: lock,
+                env_value,
+            }
+        }
+    }
+
+    impl Drop for ProfileTestGuard {
+        fn drop(&mut self) {
+            hal_profile_set_enabled(false);
+            hal_profile_reset();
+            match &self.env_value {
+                Some(value) => std::env::set_var(HAL_PROFILE_ENV, value),
+                None => std::env::remove_var(HAL_PROFILE_ENV),
+            }
+        }
+    }
 
     fn entry<'a>(snapshot: &'a HalProfileSnapshot, op: &str) -> &'a HalProfileEntry {
         snapshot
@@ -1800,10 +1837,221 @@ mod hal_profile_tests {
     }
 
     #[test]
-    fn nested_capture_tracks_exact_max_while_outer_profile_continues() {
-        let _lock = PROFILE_TEST_LOCK.lock().expect("HAL profile test lock");
+    fn overlapping_captures_stay_enabled_until_both_drop_in_either_order() {
+        let _guard = ProfileTestGuard::new();
+
+        let first = HalProfileCapture::begin();
+        let second = HalProfileCapture::begin();
+        drop(first);
+        assert!(
+            hal_profile_enabled(),
+            "dropping the first capture disabled the second"
+        );
+        drop(second);
+        assert!(!hal_profile_enabled());
+
+        let first = HalProfileCapture::begin();
+        let second = HalProfileCapture::begin();
+        drop(second);
+        assert!(
+            hal_profile_enabled(),
+            "dropping the second capture disabled the first"
+        );
+        drop(first);
+        assert!(!hal_profile_enabled());
+    }
+
+    #[test]
+    fn surviving_capture_receives_samples_after_first_capture_drops() {
+        let _guard = ProfileTestGuard::new();
+        let first = HalProfileCapture::begin();
+        let survivor = HalProfileCapture::begin();
+
+        record_hal_profile_sample("copy_h2d", 4, 0.25);
+        drop(first);
+        assert!(hal_profile_enabled());
+        record_hal_profile_sample("copy_d2h", 8, 0.75);
+        let snapshot = survivor.finish();
+
+        assert!(!hal_profile_enabled());
+        assert_eq!(snapshot.total_calls, 2);
+        assert_eq!(snapshot.total_ms, 1.0);
+        assert_eq!(snapshot.h2d_bytes, 4);
+        assert_eq!(snapshot.d2h_bytes, 8);
+        assert_eq!(entry(&snapshot, "copy_h2d").calls, 1);
+        assert_eq!(entry(&snapshot, "copy_d2h").calls, 1);
+    }
+
+    #[test]
+    fn finish_and_drop_each_release_exactly_one_capture_owner() {
+        let _guard = ProfileTestGuard::new();
+        let finished = HalProfileCapture::begin();
+        let dropped = HalProfileCapture::begin();
+        record_hal_profile_sample("alloc", 32, 0.5);
+
+        let snapshot = finished.finish();
+        assert_eq!(snapshot.alloc_calls, 1);
+        assert!(
+            hal_profile_enabled(),
+            "finish and its subsequent Drop released more than one owner"
+        );
+        drop(dropped);
+        assert!(!hal_profile_enabled());
+    }
+
+    #[test]
+    fn explicit_process_enablement_outlives_capture_ownership() {
+        let _guard = ProfileTestGuard::new();
         hal_profile_set_enabled(true);
-        hal_profile_reset();
+        let finished = HalProfileCapture::begin();
+        let dropped = HalProfileCapture::begin();
+
+        let _ = finished.finish();
+        assert!(hal_profile_enabled());
+        drop(dropped);
+        assert!(hal_profile_enabled());
+        record_hal_profile_sample("sync", 0, 0.5);
+        assert_eq!(hal_profile_snapshot().sync_calls, 1);
+
+        hal_profile_set_enabled(false);
+        assert!(!hal_profile_enabled());
+    }
+
+    #[test]
+    fn active_capture_remains_effective_after_explicit_enablement_is_cleared() {
+        let _guard = ProfileTestGuard::new();
+        hal_profile_set_enabled(true);
+        let capture = HalProfileCapture::begin();
+
+        hal_profile_set_enabled(false);
+        assert!(hal_profile_enabled());
+        record_hal_profile_sample("copy_h2d", 16, 0.5);
+        let snapshot = capture.finish();
+
+        assert_eq!(snapshot.h2d_bytes, 16);
+        assert!(!hal_profile_enabled());
+    }
+
+    #[test]
+    fn active_capture_remains_effective_when_environment_enablement_is_removed() {
+        let _guard = ProfileTestGuard::new();
+        std::env::set_var(HAL_PROFILE_ENV, "1");
+        let capture = HalProfileCapture::begin();
+
+        std::env::remove_var(HAL_PROFILE_ENV);
+        assert!(hal_profile_enabled());
+        record_hal_profile_sample("copy_d2h", 16, 0.5);
+        let snapshot = capture.finish();
+
+        assert_eq!(snapshot.d2h_bytes, 16);
+        assert!(!hal_profile_enabled());
+
+        std::env::set_var(HAL_PROFILE_ENV, "1");
+        let capture = HalProfileCapture::begin();
+        let _ = capture.finish();
+        assert!(hal_profile_enabled());
+    }
+
+    #[test]
+    fn concurrent_capture_lifetimes_preserve_survivors_and_release_all_owners() {
+        const CAPTURE_THREADS: usize = 4;
+
+        let _guard = ProfileTestGuard::new();
+        let start = Arc::new(Barrier::new(CAPTURE_THREADS + 1));
+        let (capture_tx, capture_rx) = std::sync::mpsc::channel();
+        let mut begin_threads = Vec::new();
+        for index in 0..CAPTURE_THREADS {
+            let start = Arc::clone(&start);
+            let capture_tx = capture_tx.clone();
+            begin_threads.push(thread::spawn(move || {
+                start.wait();
+                capture_tx
+                    .send((index, HalProfileCapture::begin()))
+                    .expect("send concurrent capture");
+            }));
+        }
+        drop(capture_tx);
+        start.wait();
+
+        let mut captures = capture_rx.into_iter().collect::<Vec<_>>();
+        for begin_thread in begin_threads {
+            begin_thread.join().expect("concurrent capture begin");
+        }
+        captures.sort_by_key(|(index, _)| *index);
+        while captures.len() > 1 {
+            let (_, capture) = captures.remove(0);
+            thread::spawn(move || drop(capture))
+                .join()
+                .expect("cross-thread capture drop");
+            assert!(
+                hal_profile_enabled(),
+                "a concurrent capture close disabled a live peer"
+            );
+        }
+
+        let (_, last_concurrent_capture) = captures.pop().expect("remaining capture");
+        let survivor = HalProfileCapture::begin();
+        thread::spawn(move || drop(last_concurrent_capture))
+            .join()
+            .expect("last concurrent capture drop");
+        assert!(
+            hal_profile_enabled(),
+            "the last concurrent capture disabled a newer survivor"
+        );
+        record_hal_profile_sample("copy_d2d", 8, 0.5);
+        let survivor_snapshot = survivor.finish();
+        assert_eq!(survivor_snapshot.d2d_bytes, 8);
+        assert!(!hal_profile_enabled());
+
+        let ready = Arc::new(Barrier::new(CAPTURE_THREADS + 1));
+        let finish = Arc::new(Barrier::new(CAPTURE_THREADS + 1));
+        let mut finish_threads = Vec::new();
+        for _ in 0..CAPTURE_THREADS {
+            let ready = Arc::clone(&ready);
+            let finish = Arc::clone(&finish);
+            finish_threads.push(thread::spawn(move || {
+                let capture = HalProfileCapture::begin();
+                ready.wait();
+                finish.wait();
+                capture.finish()
+            }));
+        }
+        ready.wait();
+        assert!(hal_profile_enabled());
+        record_hal_profile_sample("memset_zeros", 32, 0.25);
+        finish.wait();
+        for finish_thread in finish_threads {
+            let snapshot = finish_thread.join().expect("concurrent capture finish");
+            assert_eq!(snapshot.memset_bytes, 32);
+        }
+        assert!(!hal_profile_enabled());
+    }
+
+    #[test]
+    fn unwinding_capture_releases_only_its_own_enablement() {
+        let _guard = ProfileTestGuard::new();
+        let mut survivor = None;
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _unwinding = HalProfileCapture::begin();
+            survivor = Some(HalProfileCapture::begin());
+            panic!("expected capture unwind");
+        }));
+
+        assert!(unwind.is_err());
+        assert!(
+            hal_profile_enabled(),
+            "unwinding capture disabled its surviving peer"
+        );
+        record_hal_profile_sample("copy_h2d", 8, 0.5);
+        let snapshot = survivor.take().expect("surviving capture").finish();
+        assert_eq!(snapshot.h2d_bytes, 8);
+        assert!(!hal_profile_enabled());
+    }
+
+    #[test]
+    fn nested_capture_tracks_exact_max_while_outer_profile_continues() {
+        let _guard = ProfileTestGuard::new();
+        hal_profile_set_enabled(true);
 
         record_hal_profile_sample("copy_h2d", 64, 10.0);
         let capture = HalProfileCapture::begin();
@@ -1811,7 +2059,6 @@ mod hal_profile_tests {
         let nested = capture.finish();
         record_hal_profile_sample("copy_d2h", 8, 2.0);
         let outer = hal_profile_snapshot();
-        hal_profile_set_enabled(false);
 
         let nested_h2d = entry(&nested, "copy_h2d");
         assert_eq!(nested.total_calls, 1);
