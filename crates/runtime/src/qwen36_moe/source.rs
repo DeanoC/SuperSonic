@@ -1,5 +1,7 @@
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
@@ -11,6 +13,55 @@ use qwen36_moe::weights::{
 
 use crate::flm_model_source::{FlmModelSource, FlmModelSourceOptions};
 
+struct Qwen36MoeSourceOpenObserverState {
+    path: PathBuf,
+    count: AtomicU64,
+}
+
+pub(crate) struct Qwen36MoeSourceOpenObserver {
+    state: Arc<Qwen36MoeSourceOpenObserverState>,
+}
+
+static SOURCE_OPEN_OBSERVERS: OnceLock<Mutex<Vec<Weak<Qwen36MoeSourceOpenObserverState>>>> =
+    OnceLock::new();
+
+impl Qwen36MoeSourceOpenObserver {
+    pub(crate) fn for_path(path: &Path) -> Self {
+        let state = Arc::new(Qwen36MoeSourceOpenObserverState {
+            path: path.to_owned(),
+            count: AtomicU64::new(0),
+        });
+        source_open_observers()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(Arc::downgrade(&state));
+        Self { state }
+    }
+
+    pub(crate) fn observed_count(&self) -> u64 {
+        self.state.count.load(Ordering::SeqCst)
+    }
+}
+
+fn source_open_observers() -> &'static Mutex<Vec<Weak<Qwen36MoeSourceOpenObserverState>>> {
+    SOURCE_OPEN_OBSERVERS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn record_source_open(path: &Path) {
+    source_open_observers()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .retain(|observer| {
+            let Some(observer) = observer.upgrade() else {
+                return false;
+            };
+            if observer.path == path {
+                observer.count.fetch_add(1, Ordering::SeqCst);
+            }
+            true
+        });
+}
+
 pub struct Qwen36MoeSource {
     pub source: FlmModelSource,
     pub config: qwen36_moe::config::Config,
@@ -21,6 +72,7 @@ pub struct Qwen36MoeSource {
 
 impl Qwen36MoeSource {
     pub fn open(path: &Path, options: FlmModelSourceOptions) -> Result<Self> {
+        record_source_open(path);
         let mut timings = Qwen36MoeSourceOpenTimings::default();
         let store_open_start = Instant::now();
         let source = FlmModelSource::open_with_options(path, options)

@@ -104,6 +104,7 @@ fn load_and_reset_preserve_resident_model() -> anyhow::Result<()> {
     assert!(dirty.route_observations > 0);
     assert!(dirty.transition_candidates > 0);
     assert!(dirty.next_position.is_some());
+    assert_eq!(dirty.source_open_count, loaded.source_open_count);
     assert!(
         dirty
             .mapped_virtual_ranges

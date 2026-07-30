@@ -26,7 +26,7 @@ use crate::qwen36_moe::persistent_decode::{
     build_int4_descs, build_kv_fp8_descs, build_layer_descs,
 };
 use crate::qwen36_moe::route_telemetry::{MoeRouteTelemetry, MoeTransitionPredictor};
-use crate::qwen36_moe::source::{Qwen36MoeSource, Qwen36WeightMode};
+use crate::qwen36_moe::source::{Qwen36MoeSource, Qwen36MoeSourceOpenObserver, Qwen36WeightMode};
 use crate::qwen36_moe::types::{
     AttnLayerBuffers, ExpertRoute, FullAttnKvCache, LayerBuffers, MultiLayerGeom,
 };
@@ -108,12 +108,15 @@ pub struct Qwen36MoeResetTestSnapshot {
 struct LoadEvidenceInput {
     direct_profile: Qwen36MoeDirectProfile,
     source_bytes: u64,
-    device_upload_bytes: u64,
     load_sequence: u64,
     source_open_count: u64,
 }
 
-fn build_load_evidence(input: LoadEvidenceInput) -> Result<Qwen36MoeLoadEvidence> {
+fn build_load_evidence(
+    input: LoadEvidenceInput,
+    profile: &HalProfileSnapshot,
+) -> Result<Qwen36MoeLoadEvidence> {
+    let upload = load_upload_profile_evidence(profile);
     if input.direct_profile.native_int4 == 0 {
         anyhow::bail!("Qwen3.6 load evidence requires positive native INT4 direct coverage");
     }
@@ -126,7 +129,7 @@ fn build_load_evidence(input: LoadEvidenceInput) -> Result<Qwen36MoeLoadEvidence
     if input.source_bytes == 0 {
         anyhow::bail!("Qwen3.6 load evidence requires positive FLM source bytes");
     }
-    if input.device_upload_bytes == 0 {
+    if upload.device_upload_bytes == 0 {
         anyhow::bail!("Qwen3.6 load evidence requires positive device-upload bytes");
     }
     if input.source_open_count == 0 {
@@ -140,13 +143,13 @@ fn build_load_evidence(input: LoadEvidenceInput) -> Result<Qwen36MoeLoadEvidence
         direct_profile: input.direct_profile,
         transfer_backend: VirtualArenaTransferBackend::PageableH2d,
         source_bytes: input.source_bytes,
-        device_upload_bytes: input.device_upload_bytes,
+        device_upload_bytes: upload.device_upload_bytes,
         source_open_duration: Duration::ZERO,
         descriptor_duration: Duration::ZERO,
         tokenizer_duration: Duration::ZERO,
         plan_duration: Duration::ZERO,
         allocation_duration: Duration::ZERO,
-        upload_duration: Duration::ZERO,
+        upload_duration: upload.upload_duration,
         total_duration: Duration::ZERO,
         load_sequence: input.load_sequence,
         source_open_count: input.source_open_count,
@@ -173,7 +176,7 @@ pub struct Qwen36MoeEngine {
     final_hidden: GpuBuffer,
     route_state: Qwen36MoeRouteState,
     next_position: Option<usize>,
-    source_open_count: u64,
+    source_open_observer: Qwen36MoeSourceOpenObserver,
     load_evidence: Qwen36MoeLoadEvidence,
     backend: Backend,
     device_ordinal: usize,
@@ -243,18 +246,17 @@ impl Qwen36MoeEngine {
         let total_start = Instant::now();
         validate_pre_source_load_policy(&config)?;
 
-        let mut source_open_count = 0;
+        let source_open_observer = Qwen36MoeSourceOpenObserver::for_path(&config.flm_path);
         let source_open_start = Instant::now();
-        let mut source = observe_source_open(&mut source_open_count, || {
-            Qwen36MoeSource::open(
-                &config.flm_path,
-                FlmModelSourceOptions {
-                    int4_runtime: true,
-                    verify_block_hashes: config.verify_block_hashes,
-                },
-            )
-        })?;
+        let mut source = Qwen36MoeSource::open(
+            &config.flm_path,
+            FlmModelSourceOptions {
+                int4_runtime: true,
+                verify_block_hashes: config.verify_block_hashes,
+            },
+        )?;
         let source_open_duration = source_open_start.elapsed();
+        let source_open_count = source_open_observer.observed_count();
         let runtime = source
             .source
             .runtime()
@@ -315,15 +317,16 @@ impl Qwen36MoeEngine {
         let source_bytes = std::fs::metadata(&config.flm_path)
             .with_context(|| format!("stat Qwen3.6 FLM {}", config.flm_path.display()))?
             .len();
-        let device_upload_bytes = device_upload_bytes(&hal_profile);
         let load_sequence = ENGINE_LOAD_SEQUENCE.fetch_add(1, Ordering::SeqCst) + 1;
-        let mut load_evidence = build_load_evidence(LoadEvidenceInput {
-            direct_profile: source.direct_profile,
-            source_bytes,
-            device_upload_bytes,
-            load_sequence,
-            source_open_count,
-        })?;
+        let mut load_evidence = build_load_evidence(
+            LoadEvidenceInput {
+                direct_profile: source.direct_profile,
+                source_bytes,
+                load_sequence,
+                source_open_count,
+            },
+            &hal_profile,
+        )?;
         load_evidence.flm_path = config.flm_path.clone();
         load_evidence.architecture_id = architecture_id;
         load_evidence.model_id = model_id;
@@ -341,9 +344,6 @@ impl Qwen36MoeEngine {
         load_evidence.plan_duration = source.timings.direct_plan;
         load_evidence.allocation_duration = profile_duration(&hal_profile, |op| {
             op == "alloc" || op.starts_with("vmm_reserve") || op.starts_with("vmm_map")
-        });
-        load_evidence.upload_duration = profile_duration(&hal_profile, |op| {
-            op == "copy_h2d" || op == "copy_storage_to_device" || op == "vmm_copy_h2d"
         });
         load_evidence.resident_allocation_pointers = collect_resident_allocation_pointers(
             &mut gpu.layers,
@@ -382,7 +382,7 @@ impl Qwen36MoeEngine {
             final_hidden: gpu.final_hidden,
             route_state,
             next_position: None,
-            source_open_count,
+            source_open_observer,
             load_evidence,
             backend: config.backend,
             device_ordinal: config.device_ordinal,
@@ -582,7 +582,7 @@ impl Qwen36MoeEngine {
             })
             .unwrap_or(0);
         Ok(Qwen36MoeResetTestSnapshot {
-            source_open_count: self.source_open_count,
+            source_open_count: self.source_open_observer.observed_count(),
             resident_allocation_pointers,
             mapped_virtual_ranges,
             persistent_descriptor_bytes,
@@ -954,16 +954,6 @@ fn is_unmapped_virtual_range_error(error: &GpuError) -> bool {
     )
 }
 
-fn observe_source_open<T>(
-    source_open_count: &mut u64,
-    open: impl FnOnce() -> Result<T>,
-) -> Result<T> {
-    *source_open_count = source_open_count
-        .checked_add(1)
-        .ok_or_else(|| anyhow!("Qwen3.6 source-open count overflow"))?;
-    open()
-}
-
 fn persistent_descriptor_duration(layers: &mut LoadedQwen36Layers) -> Result<Duration> {
     let (_, scratch, _) = layers.execution_parts();
     scratch
@@ -1315,17 +1305,30 @@ fn layer_load_strategy(
     Ok(Qwen36LayerLoadStrategy::Dense)
 }
 
-fn device_upload_bytes(profile: &HalProfileSnapshot) -> u64 {
-    profile
+struct LoadUploadProfileEvidence {
+    device_upload_bytes: u64,
+    upload_duration: Duration,
+}
+
+fn is_load_upload_operation(op: &str) -> bool {
+    matches!(op, "copy_h2d" | "copy_h2d_async" | "copy_storage_to_device")
+}
+
+fn load_upload_profile_evidence(profile: &HalProfileSnapshot) -> LoadUploadProfileEvidence {
+    let (device_upload_bytes, total_ms) = profile
         .entries
         .iter()
-        .filter(|entry| {
-            entry.op == "copy_h2d"
-                || entry.op == "copy_storage_to_device"
-                || entry.op == "vmm_copy_h2d"
-        })
-        .map(|entry| entry.total_bytes)
-        .sum()
+        .filter(|entry| is_load_upload_operation(&entry.op))
+        .fold((0u64, 0.0f64), |(bytes, milliseconds), entry| {
+            (
+                bytes.saturating_add(entry.total_bytes),
+                milliseconds + entry.total_ms,
+            )
+        });
+    LoadUploadProfileEvidence {
+        device_upload_bytes,
+        upload_duration: Duration::from_secs_f64(total_ms / 1000.0),
+    }
 }
 
 fn profile_duration(profile: &HalProfileSnapshot, include: impl Fn(&str) -> bool) -> Duration {
@@ -1708,19 +1711,24 @@ mod tests {
     use std::collections::HashSet;
     use std::ffi::c_void;
     use std::path::PathBuf;
+    use std::time::Duration;
 
-    use gpu_hal::{Backend, GpuBuffer, ScalarType, VirtualBacking, VirtualBuffer};
+    use gpu_hal::{
+        Backend, GpuBuffer, HalProfileEntry, HalProfileSnapshot, ScalarType, VirtualBacking,
+        VirtualBuffer,
+    };
     use model_store::flm::{ARCH_QWEN3_6_MOE, MODEL_QWEN3_6_MOE_V1};
     use model_store::VirtualArenaTransferBackend;
     use qwen36_moe::config::{Activation, RopeParameters, TextConfig};
 
     use super::{
-        build_load_evidence, observe_source_open, reset_full_attention_cache, reset_phase,
-        run_reset_transaction, validate_35b_a3b_config, validate_descriptor_pointer_ownership,
-        validate_load_contract, zero_gpu_buffer, zero_mapped_virtual_buffer, LoadEvidenceInput,
-        Qwen36MoeDirectProfile, Qwen36MoeEngine, Qwen36MoeLoadConfig, Qwen36MoeRouteState,
+        build_load_evidence, reset_full_attention_cache, reset_phase, run_reset_transaction,
+        validate_35b_a3b_config, validate_descriptor_pointer_ownership, validate_load_contract,
+        zero_gpu_buffer, zero_mapped_virtual_buffer, LoadEvidenceInput, Qwen36MoeDirectProfile,
+        Qwen36MoeEngine, Qwen36MoeLoadConfig, Qwen36MoeRouteState,
     };
     use crate::qwen36_moe::load_policy::Qwen36MoeLoadPolicy;
+    use crate::qwen36_moe::source::{Qwen36MoeSource, Qwen36MoeSourceOpenObserver};
     use crate::qwen36_moe::types::{ExpertRoute, FullAttnKvCache};
     use crate::qwen36_moe_config::{Qwen36KvVmmMode, Qwen36MoeRuntimeConfig};
 
@@ -1977,40 +1985,126 @@ mod tests {
 
     #[test]
     fn load_evidence_requires_positive_native_int4_and_zero_fallback() {
-        let evidence = build_load_evidence(LoadEvidenceInput {
-            direct_profile: Qwen36MoeDirectProfile {
-                required_tensors: 20,
-                raw_dense: 8,
-                native_int4: 12,
-                bf16_fallback: 0,
+        let evidence = build_load_evidence(
+            LoadEvidenceInput {
+                direct_profile: Qwen36MoeDirectProfile {
+                    required_tensors: 20,
+                    raw_dense: 8,
+                    native_int4: 12,
+                    bf16_fallback: 0,
+                },
+                source_bytes: 4096,
+                load_sequence: 7,
+                source_open_count: 1,
             },
-            source_bytes: 4096,
-            device_upload_bytes: 2048,
-            load_sequence: 7,
-            source_open_count: 1,
-        })
+            &HalProfileSnapshot {
+                entries: vec![HalProfileEntry {
+                    op: "copy_h2d".to_string(),
+                    calls: 1,
+                    total_ms: 2.0,
+                    max_ms: 2.0,
+                    total_bytes: 2048,
+                }],
+                ..HalProfileSnapshot::default()
+            },
+        )
         .expect("production load evidence");
 
         assert_eq!(evidence.direct_profile.native_int4, 12);
         assert_eq!(evidence.direct_profile.bf16_fallback, 0);
         assert_eq!(evidence.source_bytes, 4096);
         assert_eq!(evidence.device_upload_bytes, 2048);
+        assert_eq!(evidence.upload_duration, Duration::from_millis(2));
         assert_eq!(evidence.load_sequence, 7);
         assert_eq!(evidence.source_open_count, 1);
     }
 
     #[test]
-    fn source_open_evidence_counts_observed_attempts() {
-        let mut count = 0;
-        let opened = observe_source_open(&mut count, || Ok::<_, anyhow::Error>("source"))
-            .expect("observed source open");
-        assert_eq!(opened, "source");
-        assert_eq!(count, 1);
+    fn async_upload_profile_contributes_to_public_bytes_and_duration_evidence() {
+        let profile = HalProfileSnapshot {
+            entries: vec![
+                HalProfileEntry {
+                    op: "copy_h2d".to_string(),
+                    calls: 1,
+                    total_ms: 1.0,
+                    max_ms: 1.0,
+                    total_bytes: 100,
+                },
+                HalProfileEntry {
+                    op: "copy_h2d_async".to_string(),
+                    calls: 1,
+                    total_ms: 2.0,
+                    max_ms: 2.0,
+                    total_bytes: 200,
+                },
+                HalProfileEntry {
+                    op: "copy_storage_to_device".to_string(),
+                    calls: 1,
+                    total_ms: 4.0,
+                    max_ms: 4.0,
+                    total_bytes: 300,
+                },
+                HalProfileEntry {
+                    op: "vmm_copy_h2d".to_string(),
+                    calls: 1,
+                    total_ms: 8.0,
+                    max_ms: 8.0,
+                    total_bytes: 400,
+                },
+                HalProfileEntry {
+                    op: "copy_d2h".to_string(),
+                    calls: 1,
+                    total_ms: 16.0,
+                    max_ms: 16.0,
+                    total_bytes: 500,
+                },
+            ],
+            ..HalProfileSnapshot::default()
+        };
 
-        let err = observe_source_open(&mut count, || Err::<(), _>(anyhow::anyhow!("open failed")))
-            .expect_err("failed open is still an observed attempt");
-        assert!(err.to_string().contains("open failed"));
-        assert_eq!(count, 2);
+        let evidence = build_load_evidence(
+            LoadEvidenceInput {
+                direct_profile: Qwen36MoeDirectProfile {
+                    required_tensors: 2,
+                    raw_dense: 1,
+                    native_int4: 1,
+                    bf16_fallback: 0,
+                },
+                source_bytes: 4096,
+                load_sequence: 1,
+                source_open_count: 1,
+            },
+            &profile,
+        )
+        .expect("profiled load evidence");
+
+        assert_eq!(evidence.device_upload_bytes, 600);
+        assert_eq!(evidence.upload_duration, Duration::from_millis(7));
+    }
+
+    #[test]
+    fn source_open_evidence_observes_actual_boundary_attempts() {
+        let path = std::env::temp_dir().join(format!(
+            "supersonic-qwen36-source-observer-missing-{}.flm",
+            std::process::id()
+        ));
+        let observer = Qwen36MoeSourceOpenObserver::for_path(&path);
+        assert_eq!(observer.observed_count(), 0);
+
+        for expected_count in [1, 2] {
+            let err = match Qwen36MoeSource::open(
+                &path,
+                crate::flm_model_source::FlmModelSourceOptions {
+                    int4_runtime: true,
+                    verify_block_hashes: false,
+                },
+            ) {
+                Ok(_) => panic!("missing source must fail after the boundary is observed"),
+                Err(err) => err,
+            };
+            assert!(err.to_string().contains("opening Qwen3.6 MoE FLM source"));
+            assert_eq!(observer.observed_count(), expected_count);
+        }
     }
 
     #[test]
