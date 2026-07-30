@@ -86,6 +86,11 @@ FLM_READY_RE = re.compile(
     r"\[FLM runtime weights\]\s+ready-for-decode:\s+(?P<ready>YES|NO)"
     r"(?:\s+\((?P<detail>[^\r\n)]*)\))?"
 )
+RUNTIME_ENGINE_OWNERSHIP_RE = re.compile(
+    r"\[qwen36-moe\]\s+runtime engine ready:\s+"
+    r"load_sequence=(?P<load_sequence>\d+)\s+"
+    r"source_open_count=(?P<source_open_count>\d+)"
+)
 HAL_PROFILE_OP_RE = re.compile(
     r"\[hal-profile-op\]\s+op=(?P<op>\S+)\s+"
     r"calls=(?P<calls>\d+)\s+"
@@ -272,6 +277,16 @@ def parse_flm_ready_for_decode(text: str) -> dict[str, bool | str] | None:
     return result
 
 
+def parse_runtime_engine_ownership(text: str) -> list[dict[str, int]]:
+    return [
+        {
+            "load_sequence": int(match.group("load_sequence")),
+            "source_open_count": int(match.group("source_open_count")),
+        }
+        for match in RUNTIME_ENGINE_OWNERSHIP_RE.finditer(text)
+    ]
+
+
 def parse_hal_profile_ops(text: str) -> dict[str, dict[str, float | int]] | None:
     ops = {
         match.group("op"): {
@@ -319,6 +334,14 @@ def flm_first_class_validation_errors(args: argparse.Namespace, row: dict) -> li
         or int(direct_profile.get("bf16_fallback", 0)) != 0
     ):
         errors.append("FLM run did not report native INT4 direct plan coverage")
+    ownership = row.get("runtime_engine_ownership_markers")
+    if not isinstance(ownership, list) or len(ownership) != 1:
+        errors.append("FLM run did not report exactly one runtime engine ownership marker")
+    elif ownership[0] != {"load_sequence": 1, "source_open_count": 1}:
+        errors.append(
+            "FLM runtime engine ownership marker did not report "
+            "load_sequence=1 source_open_count=1"
+        )
     return errors
 
 
@@ -462,6 +485,9 @@ def run_one(args: argparse.Namespace, name: str, prompt: str, warmup: bool = Fal
         row["flm_ready_for_decode"] = flm_ready["ready"]
         if "detail" in flm_ready:
             row["flm_ready_for_decode_detail"] = flm_ready["detail"]
+    runtime_ownership = parse_runtime_engine_ownership(combined)
+    if runtime_ownership:
+        row["runtime_engine_ownership_markers"] = runtime_ownership
     hal_profile_ops = parse_hal_profile_ops(combined)
     if hal_profile_ops:
         row["hal_profile_ops"] = hal_profile_ops
@@ -608,6 +634,10 @@ def build_summary(rows: list[dict]) -> dict:
     if any("flm_ready_for_decode" in row for row in ok):
         summary["flm_ready_for_decode_count"] = sum(
             1 for row in ok if row.get("flm_ready_for_decode")
+        )
+    if any("runtime_engine_ownership_markers" in row for row in ok):
+        summary["runtime_engine_ready_count"] = sum(
+            len(row.get("runtime_engine_ownership_markers", [])) for row in ok
         )
     flm_direct_profiles = []
     for row in ok:

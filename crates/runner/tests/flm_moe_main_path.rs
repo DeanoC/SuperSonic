@@ -45,6 +45,17 @@ fn assert_moe_flm_main_path_contract(combined: &str) {
         combined.contains("[qwen36-moe] loading weights from already-open FLM source"),
         "weights were not loaded from the already-open FLM source:\n{combined}"
     );
+    for required in [
+        "[qwen3.6-moe] dry-run summary",
+        "[state accounting]",
+        "[VRAM budget]",
+        "[runtime residency]",
+    ] {
+        assert!(
+            combined.contains(required),
+            "FLM main path did not preserve {required:?} output:\n{combined}"
+        );
+    }
     assert!(
         combined.contains("[qwen36-moe] FLM weight mode: INT4 native FLM"),
         "FLM weight mode was not reported:\n{combined}"
@@ -99,6 +110,10 @@ fn moe_flm_main_path_output_contract_accepts_expected_logs() {
 [qwen36-moe] FLM weight mode: INT4 native FLM
 [qwen36-moe] FLM direct plans: required=693 raw_dense=363 native_int4=330 bf16_fallback=0
 [qwen36-moe] loading weights from already-open FLM source at /tmp/qwen36-35b-a3b.flm (INT4 native FLM)
+[qwen3.6-moe] dry-run summary
+[state accounting]
+[VRAM budget]
+[runtime residency]
 [qwen36-moe] runtime engine ready: load_sequence=1 source_open_count=1
   Generated ids: [123]
 [result] prompt_tokens=1 generated_tokens=1 decode_ms=1 ms_per_step=1.0

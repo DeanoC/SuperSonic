@@ -16,6 +16,8 @@ const MIB: f64 = (1024 * 1024) as f64;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Qwen36LayerLoadTimings {
+    pub(crate) detail_available: bool,
+    pub(crate) hal_available: bool,
     pub(crate) buffers: std::time::Duration,
     pub(crate) vmm_setup: std::time::Duration,
     pub(crate) prewarm: std::time::Duration,
@@ -165,6 +167,7 @@ pub(crate) fn load_decode_layers_with_vmm_strategy(
         return Ok(Qwen36LayerLoadResult {
             loaded,
             timings: Qwen36LayerLoadTimings {
+                detail_available: true,
                 buffers: buffers_elapsed,
                 vmm_setup: vmm_setup_elapsed,
                 ..Default::default()
@@ -216,6 +219,7 @@ pub(crate) fn load_decode_layers_with_vmm_strategy(
                 return Ok(Qwen36LayerLoadResult {
                     loaded,
                     timings: Qwen36LayerLoadTimings {
+                        detail_available: true,
                         buffers: buffers_elapsed,
                         vmm_setup: vmm_setup_elapsed,
                         ..Default::default()
@@ -249,6 +253,7 @@ pub(crate) fn load_decode_layers_with_vmm_strategy(
     Ok(Qwen36LayerLoadResult {
         loaded,
         timings: Qwen36LayerLoadTimings {
+            detail_available: true,
             buffers: buffers_elapsed,
             ..Default::default()
         },

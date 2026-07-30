@@ -27,6 +27,47 @@ fn parse<T: std::str::FromStr>(name: &str) -> Option<T> {
         .and_then(|value| value.parse::<T>().ok())
 }
 
+#[derive(Default)]
+pub(crate) struct Qwen36RunnerModeOptions {
+    pub(crate) execution: Qwen36ExecutionOptions,
+    pub(crate) legacy_prefill: bool,
+    pub(crate) runner_only_diagnostics: bool,
+    pub(crate) segmented_profile: bool,
+}
+
+impl Qwen36RunnerModeOptions {
+    pub(crate) fn runtime_engine_compatible(&self) -> bool {
+        !self.legacy_prefill && !self.runner_only_diagnostics && !self.segmented_profile
+    }
+}
+
+pub(crate) fn runner_mode_options_from_environment() -> Qwen36RunnerModeOptions {
+    let legacy_prefill = std::env::var("SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL")
+        .map(|value| value == "0")
+        .unwrap_or(false)
+        || flag("SUPERSONIC_QWEN36_DENSE_PREFILL_TOKEN_LOOP");
+    let runner_only_diagnostics = [
+        "SUPERSONIC_QWEN36_DISABLE_FOLDED_LM_HEAD",
+        "SUPERSONIC_QWEN36_DUMP_FINAL_HIDDEN",
+        "SUPERSONIC_QWEN36_DUMP_LOGITS",
+        "SUPERSONIC_QWEN36_FINAL_HIDDEN_TAP",
+        "SUPERSONIC_QWEN36_LOGITS_TAP",
+        "SUPERSONIC_QWEN36_DOWNSTREAM_PARITY_TAP",
+        "SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL_FEASIBILITY",
+        "SUPERSONIC_QWEN36_EXPERT_RESIDENCY_PROFILE",
+        "SUPERSONIC_QWEN36_PACK_CACHE_PROFILE",
+        "SUPERSONIC_MOE_ISLAND_TELEMETRY_JSON",
+    ]
+    .iter()
+    .any(|name| flag(name));
+    Qwen36RunnerModeOptions {
+        execution: execution_options_from_environment(),
+        legacy_prefill,
+        runner_only_diagnostics,
+        segmented_profile: flag("SUPERSONIC_QWEN36_SEGMENTED_PROFILE"),
+    }
+}
+
 pub(crate) fn execution_options_from_environment() -> Qwen36ExecutionOptions {
     let force_host_native = flag("SUPERSONIC_METAL_FORCE_HOST_NATIVE");
     let mut options = Qwen36ExecutionOptions::default();
@@ -284,4 +325,47 @@ pub(crate) fn load_options_from_environment() -> Qwen36LoadOptions {
             window_tokens: parse("SUPERSONIC_DEBUG_KV_FP8_BF16_SIDECAR_WINDOW"),
         })
         .with_diagnostic_observer(Arc::new(|message| eprintln!("{message}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_modes_accept_typed_batched_prefill_tuning() {
+        let mut modes = Qwen36RunnerModeOptions::default();
+        modes.execution.batched_prefill.attention = false;
+
+        assert!(modes.runtime_engine_compatible());
+    }
+
+    #[test]
+    fn runtime_modes_accept_typed_tap_route_and_stage_profiles() {
+        let mut modes = Qwen36RunnerModeOptions::default();
+        modes.execution.diagnostics.layer_output_tap = true;
+        modes.execution.diagnostics.route_profile.enabled = true;
+        modes.execution.diagnostics.ffn_stage_profile = true;
+
+        assert!(modes.runtime_engine_compatible());
+    }
+
+    #[test]
+    fn runtime_modes_reject_runner_only_segmented_profile() {
+        let modes = Qwen36RunnerModeOptions {
+            segmented_profile: true,
+            ..Qwen36RunnerModeOptions::default()
+        };
+
+        assert!(!modes.runtime_engine_compatible());
+    }
+
+    #[test]
+    fn runtime_modes_reject_runner_only_output_taps() {
+        let modes = Qwen36RunnerModeOptions {
+            runner_only_diagnostics: true,
+            ..Qwen36RunnerModeOptions::default()
+        };
+
+        assert!(!modes.runtime_engine_compatible());
+    }
 }

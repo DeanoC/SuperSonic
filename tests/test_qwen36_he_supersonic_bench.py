@@ -165,6 +165,8 @@ class BenchQwen36HeSuperSonicTests(unittest.TestCase):
             "native_int4=330 bf16_fallback=0\n"
             "[FLM runtime weights] ready-for-decode: YES "
             "(source=/tmp/qwen36.flm)\n"
+            "[qwen36-moe] runtime engine ready: "
+            "load_sequence=1 source_open_count=1\n"
         )
 
         self.assertEqual(bench.parse_flm_weight_mode(output), "INT4 native FLM")
@@ -180,6 +182,24 @@ class BenchQwen36HeSuperSonicTests(unittest.TestCase):
         self.assertEqual(
             bench.parse_flm_ready_for_decode(output),
             {"ready": True, "detail": "source=/tmp/qwen36.flm"},
+        )
+        self.assertEqual(
+            bench.parse_runtime_engine_ownership(output),
+            [{"load_sequence": 1, "source_open_count": 1}],
+        )
+
+    def test_runtime_engine_ownership_parser_preserves_duplicate_markers(self):
+        output = (
+            "[qwen36-moe] runtime engine ready: "
+            "load_sequence=1 source_open_count=1\n"
+        ) * 2
+
+        self.assertEqual(
+            bench.parse_runtime_engine_ownership(output),
+            [
+                {"load_sequence": 1, "source_open_count": 1},
+                {"load_sequence": 1, "source_open_count": 1},
+            ],
         )
 
     def test_build_summary_includes_token_weighted_throughput(self):
@@ -1023,6 +1043,7 @@ class BenchQwen36HeSuperSonicTests(unittest.TestCase):
                 "FLM run did not report INT4 native FLM weight mode",
                 "FLM run did not report ready-for-decode YES",
                 "FLM run did not report native INT4 direct plan coverage",
+                "FLM run did not report exactly one runtime engine ownership marker",
             ],
         )
 

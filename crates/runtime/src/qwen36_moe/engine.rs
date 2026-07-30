@@ -69,6 +69,22 @@ pub struct Qwen36MoeLoadConfig {
     pub max_context_len: usize,
     pub policy: Qwen36MoeLoadPolicy,
     pub verify_block_hashes: bool,
+    pub execution_options: Qwen36ExecutionOptions,
+    pub accurate_stage_timings: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Qwen36MoePrefillBoundary {
+    PrefixStarted,
+    FinalProductionStarted,
+}
+
+#[derive(Debug)]
+pub struct Qwen36MoePrefillOutput {
+    pub logits: Vec<f32>,
+    pub prefix_token_count: usize,
+    pub prefix_duration: Duration,
+    pub final_production_duration: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -93,6 +109,9 @@ pub struct Qwen36MoeLoadEvidence {
     pub resident_allocation_count: u64,
     pub resident_allocation_pointers: Vec<usize>,
     pub mapped_virtual_ranges: Vec<Qwen36MoeMappedVirtualRangeEvidence>,
+    pub config: Option<qwen36_moe::config::Config>,
+    pub tokenizer_timings: crate::flm_tokenizer::QwenBpeTokenizerTimings,
+    pub hal_profile: HalProfileSnapshot,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,6 +185,9 @@ fn build_load_evidence(
         resident_allocation_count: 0,
         resident_allocation_pointers: Vec::new(),
         mapped_virtual_ranges: Vec::new(),
+        config: None,
+        tokenizer_timings: crate::flm_tokenizer::QwenBpeTokenizerTimings::default(),
+        hal_profile: profile.clone(),
     })
 }
 
@@ -328,6 +350,7 @@ fn validate_serving_token_ids(token_ids: &[u32], vocab: usize, operation: &str) 
     Ok(())
 }
 
+#[cfg(test)]
 fn run_prefill_orchestration<B: Qwen36ServingBackend>(
     session: &mut Qwen36SessionPosition,
     prompt_ids: &[u32],
@@ -337,6 +360,31 @@ fn run_prefill_orchestration<B: Qwen36ServingBackend>(
     backend: &mut B,
     observer: &mut impl Qwen36ServingObserver,
 ) -> Result<Vec<f32>> {
+    let mut ignore_boundaries = |_| Ok(());
+    Ok(run_prefill_orchestration_with_boundaries(
+        session,
+        prompt_ids,
+        max_context_len,
+        vocab,
+        lm_head,
+        backend,
+        observer,
+        &mut ignore_boundaries,
+    )?
+    .logits)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_prefill_orchestration_with_boundaries<B: Qwen36ServingBackend>(
+    session: &mut Qwen36SessionPosition,
+    prompt_ids: &[u32],
+    max_context_len: usize,
+    vocab: usize,
+    lm_head: Qwen36LmHeadSelection,
+    backend: &mut B,
+    observer: &mut impl Qwen36ServingObserver,
+    boundary_observer: &mut impl FnMut(Qwen36MoePrefillBoundary) -> Result<()>,
+) -> Result<Qwen36MoePrefillOutput> {
     session.validate_prefill(prompt_ids.len(), max_context_len)?;
     validate_serving_token_ids(prompt_ids, vocab, "prefill")?;
 
@@ -346,27 +394,38 @@ fn run_prefill_orchestration<B: Qwen36ServingBackend>(
         .collect::<Vec<_>>();
     session.execution_started();
 
+    boundary_observer(Qwen36MoePrefillBoundary::PrefixStarted)?;
     observer.observe(Qwen36ServingEvent::Prefix {
         tokens: &prompt_ids[..final_index],
         positions: &positions,
     });
+    let prefix_start = Instant::now();
     backend.run_prefix(&prompt_ids[..final_index], &positions)?;
+    let prefix_duration = prefix_start.elapsed();
 
     let final_token = prompt_ids[final_index];
+    boundary_observer(Qwen36MoePrefillBoundary::FinalProductionStarted)?;
     observer.observe(Qwen36ServingEvent::ProductionToken {
         token_id: final_token,
         absolute_pos: final_index,
     });
     observer.observe(Qwen36ServingEvent::LmHead(lm_head));
+    let final_production_start = Instant::now();
     let pending = backend.run_production_token(final_token, final_index, lm_head)?;
     let logits = backend.complete_output(pending, lm_head)?;
+    let final_production_duration = final_production_start.elapsed();
     observer.observe(Qwen36ServingEvent::OutputCompleted);
 
     session.prefill_succeeded(prompt_ids.len());
     observer.observe(Qwen36ServingEvent::PositionCommitted {
         next_position: prompt_ids.len(),
     });
-    Ok(logits)
+    Ok(Qwen36MoePrefillOutput {
+        logits,
+        prefix_token_count: final_index,
+        prefix_duration,
+        final_production_duration,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -423,6 +482,8 @@ pub struct Qwen36MoeEngine {
     backend: Backend,
     device_ordinal: usize,
     max_context_len: usize,
+    execution_options: Qwen36ExecutionOptions,
+    accurate_stage_timings: bool,
 }
 
 struct Qwen36MoeRouteState {
@@ -508,6 +569,7 @@ impl Qwen36MoeRouteState {
         step: usize,
         fold: Option<LmHeadFold<'_>>,
         download_final_hidden: bool,
+        accurate_stage_timings: bool,
         execution: &Qwen36ExecutionOptions,
     ) -> Result<Qwen36ChainStepOutput> {
         let sparse = loaded_layers.has_sparse_expert_residency();
@@ -561,7 +623,7 @@ impl Qwen36MoeRouteState {
                 initial_hidden,
                 position,
                 step,
-                accurate_stage_timings: false,
+                accurate_stage_timings,
                 execution,
                 fold,
                 download_final_hidden,
@@ -633,10 +695,11 @@ impl Qwen36MoeEngine {
             .load_tokenizer_timed()
             .context("load Qwen3.6 FLM tokenizer")?;
         let tokenizer_duration = tokenizer_start.elapsed();
+        let tokenizer_timings = tokenizer_load.timings;
         source.timings.tokenizer = tokenizer_duration;
-        source.timings.tokenizer_assets = tokenizer_load.timings.asset_lookup;
-        source.timings.tokenizer_parse = tokenizer_load.timings.parse;
-        source.timings.tokenizer_build = tokenizer_load.timings.build;
+        source.timings.tokenizer_assets = tokenizer_timings.asset_lookup;
+        source.timings.tokenizer_parse = tokenizer_timings.parse;
+        source.timings.tokenizer_build = tokenizer_timings.build;
         let tokenizer = tokenizer_load.tokenizer;
         let eos_ids = source.config.text_config.eos_token_ids();
         if eos_ids.is_empty() {
@@ -714,6 +777,8 @@ impl Qwen36MoeEngine {
         load_evidence.resident_allocation_count =
             load_evidence.resident_allocation_pointers.len() as u64;
         load_evidence.mapped_virtual_ranges = collect_mapped_virtual_ranges(&gpu.layers);
+        load_evidence.config = Some(source.config.clone());
+        load_evidence.tokenizer_timings = tokenizer_timings;
 
         let route_state = Qwen36MoeRouteState::with_policy(
             geom.top_k as usize,
@@ -742,6 +807,8 @@ impl Qwen36MoeEngine {
             backend: config.backend,
             device_ordinal: config.device_ordinal,
             max_context_len: config.max_context_len,
+            execution_options: config.execution_options,
+            accurate_stage_timings: config.accurate_stage_timings,
         };
         engine.load_evidence.total_duration = total_start.elapsed();
         Ok(engine)
@@ -764,12 +831,20 @@ impl Qwen36MoeEngine {
     }
 
     pub fn prefill(&mut self, prompt_ids: &[u32]) -> Result<Vec<f32>> {
+        Ok(self.prefill_with_boundaries(prompt_ids, |_| Ok(()))?.logits)
+    }
+
+    pub fn prefill_with_boundaries(
+        &mut self,
+        prompt_ids: &[u32],
+        mut boundary_observer: impl FnMut(Qwen36MoePrefillBoundary) -> Result<()>,
+    ) -> Result<Qwen36MoePrefillOutput> {
         let lm_head = self.serving_lm_head_selection();
         let max_context_len = self.max_context_len;
         let vocab = self.geom.vocab as usize;
         let mut session = std::mem::take(&mut self.session_position);
         let mut observer = IgnoreServingEvents;
-        let result = run_prefill_orchestration(
+        let result = run_prefill_orchestration_with_boundaries(
             &mut session,
             prompt_ids,
             max_context_len,
@@ -777,6 +852,7 @@ impl Qwen36MoeEngine {
             lm_head,
             self,
             &mut observer,
+            &mut boundary_observer,
         );
         self.session_position = session;
         result
@@ -1099,7 +1175,8 @@ impl Qwen36ServingBackend for Qwen36MoeEngine {
     type PendingOutput = Qwen36ChainStepOutput;
 
     fn run_prefix(&mut self, tokens: &[u32], positions: &[PositionPair]) -> Result<()> {
-        let execution = Qwen36ExecutionOptions::default();
+        let execution = &self.execution_options;
+        let accurate_stage_timings = self.accurate_stage_timings;
         let ordinal = self.device_ordinal;
         let geom = &self.geom;
         let store = &self.source.source.store;
@@ -1132,7 +1209,8 @@ impl Qwen36ServingBackend for Qwen36MoeEngine {
                 step,
                 None,
                 false,
-                &execution,
+                accurate_stage_timings,
+                execution,
             )?;
             Ok(PrefillTokenTimings {
                 embed,
@@ -1147,8 +1225,8 @@ impl Qwen36ServingBackend for Qwen36MoeEngine {
             &mut self.layers,
             tokens,
             positions,
-            false,
-            &execution,
+            accurate_stage_timings,
+            execution,
             Some(&mut fallback),
             None,
             prefill_workspace,
@@ -1170,7 +1248,7 @@ impl Qwen36ServingBackend for Qwen36MoeEngine {
                  planned {lm_head:?}, current {expected:?}"
             );
         }
-        let execution = Qwen36ExecutionOptions::default();
+        let execution = &self.execution_options;
         let initial_hidden = lookup_embed_row(
             &self.source.source.store,
             QWEN36_35B_A3B_WEIGHT_PREFIX,
@@ -1202,7 +1280,8 @@ impl Qwen36ServingBackend for Qwen36MoeEngine {
             absolute_pos,
             fold,
             lm_head == Qwen36LmHeadSelection::SparseStandalone,
-            &execution,
+            self.accurate_stage_timings,
+            execution,
         )
     }
 
@@ -1224,23 +1303,20 @@ impl Qwen36ServingBackend for Qwen36MoeEngine {
                 .logits
                 .to_host_bytes()
                 .context("download Qwen3.6 folded serving logits")?,
-            Qwen36LmHeadSelection::SparseStandalone => {
-                let execution = Qwen36ExecutionOptions::default();
-                launch_lm_head_from_final_hidden_bytes(
-                    self.device_ordinal,
-                    &self.geom,
-                    &pending.outputs.final_hidden_bytes,
-                    &execution.prefill_kernel,
-                    LmHeadBuffers {
-                        final_norm_w: &self.final_norm_w,
-                        lm_head_w: &self.lm_head_w,
-                        final_hidden: &mut self.final_hidden,
-                        logits: &mut self.logits,
-                        counter: &mut self.counter,
-                    },
-                )
-                .context("run Qwen3.6 serving LM head")?
-            }
+            Qwen36LmHeadSelection::SparseStandalone => launch_lm_head_from_final_hidden_bytes(
+                self.device_ordinal,
+                &self.geom,
+                &pending.outputs.final_hidden_bytes,
+                &self.execution_options.prefill_kernel,
+                LmHeadBuffers {
+                    final_norm_w: &self.final_norm_w,
+                    lm_head_w: &self.lm_head_w,
+                    final_hidden: &mut self.final_hidden,
+                    logits: &mut self.logits,
+                    counter: &mut self.counter,
+                },
+            )
+            .context("run Qwen3.6 serving LM head")?,
         };
         Ok(bf16_bytes_to_f32(&logits_bytes))
     }
@@ -2300,11 +2376,12 @@ mod tests {
 
     use super::{
         build_load_evidence, reset_full_attention_cache, reset_phase, run_decode_orchestration,
-        run_prefill_orchestration, run_reset_transaction, validate_35b_a3b_config,
-        validate_descriptor_pointer_ownership, validate_load_contract, zero_gpu_buffer,
-        zero_mapped_virtual_buffer, LoadEvidenceInput, Qwen36LmHeadSelection,
-        Qwen36MoeDirectProfile, Qwen36MoeEngine, Qwen36MoeLoadConfig, Qwen36MoeRouteState,
-        Qwen36ServingBackend, Qwen36ServingEvent, Qwen36ServingObserver, Qwen36SessionPosition,
+        run_prefill_orchestration, run_prefill_orchestration_with_boundaries,
+        run_reset_transaction, validate_35b_a3b_config, validate_descriptor_pointer_ownership,
+        validate_load_contract, zero_gpu_buffer, zero_mapped_virtual_buffer, LoadEvidenceInput,
+        Qwen36ExecutionOptions, Qwen36LmHeadSelection, Qwen36MoeDirectProfile, Qwen36MoeEngine,
+        Qwen36MoeLoadConfig, Qwen36MoePrefillBoundary, Qwen36MoeRouteState, Qwen36ServingBackend,
+        Qwen36ServingEvent, Qwen36ServingObserver, Qwen36SessionPosition,
     };
     use crate::qwen36_moe::load_policy::Qwen36MoeLoadPolicy;
     use crate::qwen36_moe::source::{Qwen36MoeSource, Qwen36MoeSourceOpenObserver};
@@ -2681,6 +2758,41 @@ mod tests {
                 ]
             );
         }
+    }
+
+    #[test]
+    fn multi_token_prefill_exposes_prefix_and_final_production_boundaries_once() {
+        let mut session = Qwen36SessionPosition::default();
+        let mut backend = InjectedServingBackend::default();
+        let mut observer = RecordingServingObserver::default();
+        let mut boundaries = Vec::new();
+
+        let output = run_prefill_orchestration_with_boundaries(
+            &mut session,
+            &[7, 11, 13],
+            16,
+            32,
+            Qwen36LmHeadSelection::DenseFolded,
+            &mut backend,
+            &mut observer,
+            &mut |boundary| {
+                boundaries.push(boundary);
+                Ok(())
+            },
+        )
+        .expect("timed orchestrated prefill");
+
+        assert_eq!(
+            boundaries,
+            vec![
+                Qwen36MoePrefillBoundary::PrefixStarted,
+                Qwen36MoePrefillBoundary::FinalProductionStarted,
+            ]
+        );
+        assert_eq!(output.logits, vec![13.0, 2.0]);
+        assert_eq!(output.prefix_token_count, 2);
+        assert_eq!(backend.prefix_calls.len(), 1);
+        assert_eq!(backend.production_calls.len(), 1);
     }
 
     #[test]
@@ -3169,6 +3281,8 @@ mod tests {
                 virtual_transfer_backend: VirtualArenaTransferBackend::PageableH2d,
             },
             verify_block_hashes: false,
+            execution_options: Qwen36ExecutionOptions::default(),
+            accurate_stage_timings: false,
         };
 
         let err = match Qwen36MoeEngine::load(config) {

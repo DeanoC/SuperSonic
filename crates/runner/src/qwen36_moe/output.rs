@@ -18,6 +18,15 @@ pub(crate) fn print_runtime_engine_load_evidence(evidence: &Qwen36MoeLoadEvidenc
         evidence.flm_path.display(),
         evidence.direct_profile
     );
+    println!("[runtime residency]");
+    println!(
+        "  resident allocations: {}",
+        evidence.resident_allocation_count
+    );
+    println!(
+        "  mapped virtual ranges: {}",
+        evidence.mapped_virtual_ranges.len()
+    );
     eprintln!(
         "[qwen36-moe] runtime engine ready: load_sequence={} source_open_count={}",
         evidence.load_sequence, evidence.source_open_count

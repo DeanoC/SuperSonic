@@ -47,6 +47,9 @@ fn dense_load_reset_and_reuse_preserve_resident_model_without_serving_allocation
             virtual_transfer_backend: VirtualArenaTransferBackend::PageableH2d,
         },
         verify_block_hashes: false,
+        execution_options: supersonic_runtime::qwen36_moe::decode::Qwen36ExecutionOptions::default(
+        ),
+        accurate_stage_timings: false,
     })?;
 
     assert!(engine.tokenizer().get_vocab_size(false) > 0);
@@ -73,6 +76,12 @@ fn dense_load_reset_and_reuse_preserve_resident_model_without_serving_allocation
     assert!(evidence.resident_allocation_count > 0);
     assert!(!evidence.resident_allocation_pointers.is_empty());
     assert!(!evidence.mapped_virtual_ranges.is_empty());
+    assert!(evidence.config.is_some());
+    assert!(evidence.tokenizer_timings.asset_lookup > std::time::Duration::ZERO);
+    assert!(evidence.tokenizer_timings.parse > std::time::Duration::ZERO);
+    assert!(evidence.tokenizer_timings.build > std::time::Duration::ZERO);
+    assert!(evidence.hal_profile.total_calls > 0);
+    assert!(evidence.hal_profile.alloc_bytes > 0);
 
     let loaded = engine.test_only_reset_snapshot()?;
     assert!(loaded.mutable_nonzero_labels.is_empty());

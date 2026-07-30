@@ -2,6 +2,7 @@
 """Prepare a validated native-int4 Qwen3.6 FLM artifact for the E2E lane."""
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -10,6 +11,7 @@ import subprocess
 import sys
 from enum import Enum, auto
 from pathlib import Path
+from typing import NamedTuple
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -36,6 +38,24 @@ STORAGE_DIRECT_BACKENDS = frozenset(
 class ArtifactAction(Enum):
     REUSE = auto()
     REGENERATE = auto()
+
+
+class ArtifactPreparation(NamedTuple):
+    artifact: Path
+    action: str
+    source: Path
+    destination: Path
+    before_sha256: str | None
+    after_sha256: str
+
+    def evidence(self) -> dict[str, str | None]:
+        return {
+            "action": self.action,
+            "source": str(self.source),
+            "destination": str(self.destination),
+            "before_sha256": self.before_sha256,
+            "after_sha256": self.after_sha256,
+        }
 
 
 class PhaseError(RuntimeError):
@@ -159,9 +179,14 @@ def choose_artifact_action(args: argparse.Namespace) -> ArtifactAction:
         artifact_exists = args.flm.exists()
     except OSError as exc:
         raise PhaseError(f"input discovery failed for FLM artifact: {exc}") from exc
-    if args.regenerate or not artifact_exists:
+    if args.regenerate:
         return ArtifactAction.REGENERATE
-    return ArtifactAction.REUSE
+    if artifact_exists:
+        return ArtifactAction.REUSE
+    raise PhaseError(
+        f"input discovery failed: FLM artifact does not exist: {args.flm}; "
+        "pass --regenerate to create it explicitly"
+    )
 
 
 def discover_inputs(args: argparse.Namespace, action: ArtifactAction) -> None:
@@ -189,6 +214,27 @@ def partial_artifact_path(artifact: Path) -> Path:
     return artifact.with_name(f".{artifact.name}.partial-{os.getpid()}")
 
 
+def regenerated_artifact_path(artifact: Path) -> Path:
+    return artifact.with_name(f"{artifact.stem}.regenerated{artifact.suffix}")
+
+
+def regeneration_destination(args: argparse.Namespace) -> Path:
+    if args.regenerate_output is not None:
+        return args.regenerate_output
+    return regenerated_artifact_path(args.flm) if args.flm.exists() else args.flm
+
+
+def artifact_sha256(artifact: Path) -> str:
+    digest = hashlib.sha256()
+    try:
+        with artifact.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError as exc:
+        raise PhaseError(f"artifact digest failed for {artifact}: {exc}") from exc
+    return digest.hexdigest()
+
+
 def benchmark_prompt_path(out_json: Path) -> Path:
     return out_json.with_suffix(".prompts.jsonl")
 
@@ -198,28 +244,48 @@ def write_benchmark_prompts(path: Path) -> None:
     path.write_text(json.dumps(E2E_PROMPT) + "\n", encoding="utf-8")
 
 
-def prepare_artifact(args: argparse.Namespace) -> Path:
+def prepare_artifact(args: argparse.Namespace) -> ArtifactPreparation:
     action = choose_artifact_action(args)
-    if action is ArtifactAction.REUSE and probe_validation(args, args.flm):
+    if action is ArtifactAction.REUSE:
+        before_sha256 = artifact_sha256(args.flm)
+        if not probe_validation(args, args.flm):
+            raise PhaseError(
+                f"reuse validation failed for {args.flm}; "
+                "the supplied artifact was not modified"
+            )
         run_command(
             validate_command(args, args.flm, verify_payload_hashes=True),
             cwd=args.geoquant_root,
             timeout=args.validation_timeout,
             phase="payload validation",
         )
-        return args.flm
-    if action is ArtifactAction.REUSE:
-        print(
-            f"[flm-e2e] existing artifact is stale or incompatible: {args.flm}; "
-            "regenerating",
-            flush=True,
+        after_sha256 = artifact_sha256(args.flm)
+        if after_sha256 != before_sha256:
+            raise PhaseError(
+                f"reuse artifact changed during validation: {args.flm}; "
+                f"before={before_sha256} after={after_sha256}"
+            )
+        return ArtifactPreparation(
+            artifact=args.flm,
+            action="reuse",
+            source=args.flm,
+            destination=args.flm,
+            before_sha256=before_sha256,
+            after_sha256=after_sha256,
         )
-        discover_inputs(args, ArtifactAction.REGENERATE)
 
-    partial = partial_artifact_path(args.flm)
+    destination = regeneration_destination(args)
+    destination_exists = destination.exists()
+    if destination_exists and not args.overwrite_artifact:
+        raise PhaseError(
+            f"regeneration destination already exists: {destination}; "
+            "choose --regenerate-output or pass --overwrite-artifact"
+        )
+    before_sha256 = artifact_sha256(destination) if destination_exists else None
+    partial = partial_artifact_path(destination)
     if partial.exists():
         raise PhaseError(f"export target already exists: {partial}")
-    args.flm.parent.mkdir(parents=True, exist_ok=True)
+    destination.parent.mkdir(parents=True, exist_ok=True)
     run_command(
         export_command(args, partial),
         cwd=args.geoquant_root,
@@ -233,10 +299,17 @@ def prepare_artifact(args: argparse.Namespace) -> Path:
         phase="payload validation",
     )
     try:
-        os.replace(partial, args.flm)
+        os.replace(partial, destination)
     except OSError as exc:
         raise PhaseError(f"artifact promotion failed: {exc}") from exc
-    return args.flm
+    return ArtifactPreparation(
+        artifact=destination,
+        action="regenerate",
+        source=args.hf_source,
+        destination=destination,
+        before_sha256=before_sha256,
+        after_sha256=artifact_sha256(destination),
+    )
 
 
 def supersonic_benchmark_command(
@@ -377,6 +450,7 @@ def first_class_errors(
 
     valid_direct_profiles: list[dict] = []
     ready_count = 0
+    runtime_engine_ready_count = 0
     for index, row in enumerate(rows):
         if not isinstance(row, dict):
             errors.append(f"row {index} is not an object")
@@ -396,6 +470,25 @@ def first_class_errors(
             errors.append(f"row {index} is not ready for decode")
         else:
             ready_count += 1
+        ownership = row.get("runtime_engine_ownership_markers")
+        if not isinstance(ownership, list) or len(ownership) != 1:
+            errors.append(
+                f"row {index} must contain exactly one runtime engine ownership marker"
+            )
+        else:
+            runtime_engine_ready_count += 1
+            marker = ownership[0]
+            if not isinstance(marker, dict):
+                errors.append(f"row {index} runtime engine ownership marker is not an object")
+            else:
+                if _as_int(marker.get("load_sequence")) != 1:
+                    errors.append(
+                        f"row {index} runtime engine ownership must report load_sequence=1"
+                    )
+                if _as_int(marker.get("source_open_count")) != 1:
+                    errors.append(
+                        f"row {index} runtime engine ownership must report source_open_count=1"
+                    )
 
         direct_profile = row.get("flm_direct_profile")
         if not isinstance(direct_profile, dict):
@@ -433,6 +526,10 @@ def first_class_errors(
         errors.append("summary FLM weight modes do not match row evidence")
     if (_as_int(summary.get("flm_ready_for_decode_count")) or 0) != ready_count:
         errors.append("summary ready for decode count does not match row evidence")
+    if (
+        _as_int(summary.get("runtime_engine_ready_count")) or 0
+    ) != runtime_engine_ready_count:
+        errors.append("summary runtime engine ownership count does not match row evidence")
 
     summary_direct_profiles = summary.get("flm_direct_profiles")
     canonical_summary_profiles: list[dict[object, int]] = []
@@ -516,6 +613,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--quant-device", default="cuda")
     parser.add_argument("--regenerate", action="store_true")
+    parser.add_argument("--regenerate-output", type=Path)
+    parser.add_argument("--overwrite-artifact", action="store_true")
     parser.add_argument("--export-timeout", type=_positive_int, default=3600)
     parser.add_argument("--validation-timeout", type=_positive_int, default=1800)
     parser.add_argument("--binary", type=Path, default=ROOT / "target/release/supersonic")
@@ -565,11 +664,29 @@ def print_summary(payload: dict, artifact: Path) -> None:
     )
 
 
+def record_artifact_provenance(
+    path: Path,
+    preparation: ArtifactPreparation,
+) -> None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise PhaseError(f"artifact provenance failed to read report {path}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise PhaseError("artifact provenance report payload is not an object")
+    payload["artifact_provenance"] = preparation.evidence()
+    try:
+        path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    except OSError as exc:
+        raise PhaseError(f"artifact provenance failed to write report {path}: {exc}") from exc
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     action = choose_artifact_action(args)
     discover_inputs(args, action)
-    artifact = prepare_artifact(args)
+    preparation = prepare_artifact(args)
+    artifact = preparation.artifact
     write_benchmark_prompts(benchmark_prompt_path(args.out_json))
     run_command(
         supersonic_benchmark_command(args, artifact),
@@ -577,6 +694,7 @@ def main(argv: list[str] | None = None) -> int:
         timeout=args.limit * args.inference_timeout + args.inference_cleanup_grace,
         phase="SuperSonic inference",
     )
+    record_artifact_provenance(args.out_json, preparation)
     payload = validate_benchmark_report(
         args.out_json,
         requested_backend=args.flm_virtual_transfer_backend,

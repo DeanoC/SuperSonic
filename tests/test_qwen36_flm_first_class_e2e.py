@@ -1,4 +1,5 @@
 import importlib.util
+import hashlib
 import io
 import json
 import signal
@@ -35,6 +36,8 @@ class Qwen36FlmFirstClassE2ETests(unittest.TestCase):
             "flm": self.tmp_path / "model.flm",
             "quant_device": "cuda",
             "regenerate": False,
+            "regenerate_output": None,
+            "overwrite_artifact": False,
             "export_timeout": 3600,
             "validation_timeout": 1800,
             "binary": Path("/repo/supersonic"),
@@ -93,21 +96,37 @@ class Qwen36FlmFirstClassE2ETests(unittest.TestCase):
             ],
         )
 
-    def test_missing_artifact_exports_to_partial_then_promotes(self):
-        args = self.args()
+    def test_missing_artifact_requires_explicit_regeneration(self):
+        args = self.args(regenerate=False)
+
+        with self.assertRaisesRegex(runner.PhaseError, "--regenerate"):
+            runner.choose_artifact_action(args)
+
+    def test_explicit_regeneration_of_missing_artifact_promotes_to_requested_path(self):
+        args = self.args(regenerate=True)
+
+        def run_export(command, **_kwargs):
+            if "--flm-out" in command:
+                Path(command[command.index("--flm-out") + 1]).write_bytes(b"generated")
+
         with mock.patch.object(runner.os, "getpid", return_value=42), \
-                mock.patch.object(runner, "run_command") as run, \
-                mock.patch.object(runner.os, "replace") as replace:
+                mock.patch.object(runner, "run_command", side_effect=run_export) as run:
             result = runner.prepare_artifact(args)
 
         partial = self.tmp_path / ".model.flm.partial-42"
-        self.assertEqual(result, args.flm)
+        self.assertEqual(result.artifact, args.flm)
+        self.assertEqual(result.action, "regenerate")
+        self.assertIsNone(result.before_sha256)
+        self.assertEqual(
+            result.after_sha256,
+            hashlib.sha256(b"generated").hexdigest(),
+        )
         self.assertEqual(run.call_args_list[0].args[0], runner.export_command(args, partial))
         self.assertEqual(
             run.call_args_list[1].args[0],
             runner.validate_command(args, partial, verify_payload_hashes=True),
         )
-        replace.assert_called_once_with(partial, args.flm)
+        self.assertEqual(args.flm.read_bytes(), b"generated")
 
     def test_valid_artifact_is_reused_and_hash_verified(self):
         args = self.args(flm=self.existing_flm)
@@ -115,7 +134,13 @@ class Qwen36FlmFirstClassE2ETests(unittest.TestCase):
                 mock.patch.object(runner, "run_command") as run:
             result = runner.prepare_artifact(args)
 
-        self.assertEqual(result, args.flm)
+        expected_digest = hashlib.sha256(b"existing").hexdigest()
+        self.assertEqual(result.artifact, args.flm)
+        self.assertEqual(result.action, "reuse")
+        self.assertEqual(result.source, args.flm)
+        self.assertEqual(result.destination, args.flm)
+        self.assertEqual(result.before_sha256, expected_digest)
+        self.assertEqual(result.after_sha256, expected_digest)
         probe.assert_called_once_with(args, args.flm)
         run.assert_called_once_with(
             runner.validate_command(args, args.flm, verify_payload_hashes=True),
@@ -124,41 +149,82 @@ class Qwen36FlmFirstClassE2ETests(unittest.TestCase):
             phase="payload validation",
         )
 
-    def test_regenerate_preserves_existing_artifact_until_promotion(self):
+    def test_regenerate_preserves_existing_artifact_and_prefers_distinct_output(self):
         args = self.args(flm=self.existing_flm, regenerate=True)
+
+        def run_export(command, **_kwargs):
+            if "--flm-out" in command:
+                Path(command[command.index("--flm-out") + 1]).write_bytes(b"generated")
+
         with mock.patch.object(runner.os, "getpid", return_value=42), \
                 mock.patch.object(runner, "probe_validation") as probe, \
-                mock.patch.object(runner, "run_command") as run, \
-                mock.patch.object(runner.os, "replace") as replace:
+                mock.patch.object(runner, "run_command", side_effect=run_export) as run:
             result = runner.prepare_artifact(args)
 
-        partial = self.tmp_path / ".existing.flm.partial-42"
-        self.assertEqual(result, args.flm)
+        destination = self.tmp_path / "existing.regenerated.flm"
+        partial = self.tmp_path / ".existing.regenerated.flm.partial-42"
+        self.assertEqual(result.artifact, destination)
+        self.assertEqual(result.source, args.hf_source)
+        self.assertEqual(result.destination, destination)
+        self.assertEqual(self.existing_flm.read_bytes(), b"existing")
+        self.assertEqual(destination.read_bytes(), b"generated")
         probe.assert_not_called()
         self.assertEqual(run.call_args_list[0].args[0], runner.export_command(args, partial))
         self.assertEqual(run.call_args_list[1].args[0], runner.validate_command(
             args, partial, verify_payload_hashes=True
         ))
-        replace.assert_called_once_with(partial, args.flm)
 
-    def test_invalid_artifact_selects_safe_regeneration(self):
+    def test_invalid_reuse_fails_closed_without_export_or_overwrite(self):
         args = self.args(flm=self.existing_flm)
-        with mock.patch.object(runner.os, "getpid", return_value=42), \
-                mock.patch.object(runner, "probe_validation", return_value=False), \
-                mock.patch.object(runner, "discover_inputs"), \
-                mock.patch.object(runner, "run_command") as run, \
-                mock.patch.object(runner.os, "replace"):
-            with mock.patch("builtins.print") as print_mock:
-                result = runner.prepare_artifact(args)
+        with mock.patch.object(runner, "probe_validation", return_value=False), \
+                mock.patch.object(runner, "run_command") as run:
+            with self.assertRaisesRegex(runner.PhaseError, "reuse validation failed"):
+                runner.prepare_artifact(args)
 
-        partial = self.tmp_path / ".existing.flm.partial-42"
-        self.assertEqual(result, args.flm)
-        self.assertEqual(run.call_args_list[0].args[0], runner.export_command(args, partial))
-        print_mock.assert_called_once()
-        self.assertIn("stale or incompatible", print_mock.call_args.args[0])
+        run.assert_not_called()
+        self.assertEqual(self.existing_flm.read_bytes(), b"existing")
+
+    def test_regenerate_requires_overwrite_opt_in_for_same_destination(self):
+        args = self.args(
+            flm=self.existing_flm,
+            regenerate=True,
+            regenerate_output=self.existing_flm,
+        )
+
+        with self.assertRaisesRegex(runner.PhaseError, "--overwrite-artifact"):
+            runner.prepare_artifact(args)
+
+        self.assertEqual(self.existing_flm.read_bytes(), b"existing")
+
+    def test_explicit_overwrite_opt_in_can_replace_regeneration_destination(self):
+        args = self.args(
+            flm=self.existing_flm,
+            regenerate=True,
+            regenerate_output=self.existing_flm,
+            overwrite_artifact=True,
+        )
+
+        def run_export(command, **_kwargs):
+            if "--flm-out" in command:
+                Path(command[command.index("--flm-out") + 1]).write_bytes(b"generated")
+
+        with mock.patch.object(runner.os, "getpid", return_value=42), \
+                mock.patch.object(runner, "run_command", side_effect=run_export):
+            result = runner.prepare_artifact(args)
+
+        self.assertEqual(result.artifact, self.existing_flm)
+        self.assertEqual(
+            result.before_sha256,
+            hashlib.sha256(b"existing").hexdigest(),
+        )
+        self.assertEqual(
+            result.after_sha256,
+            hashlib.sha256(b"generated").hexdigest(),
+        )
+        self.assertEqual(self.existing_flm.read_bytes(), b"generated")
 
     def test_existing_partial_fails_closed(self):
-        args = self.args()
+        args = self.args(regenerate=True)
         partial = self.tmp_path / ".model.flm.partial-42"
         partial.write_bytes(b"partial")
         with mock.patch.object(runner.os, "getpid", return_value=42):
@@ -212,7 +278,7 @@ class Qwen36FlmFirstClassE2ETests(unittest.TestCase):
                 )
 
     def test_promotion_oserror_names_artifact_promotion_phase(self):
-        args = self.args()
+        args = self.args(regenerate=True)
         with mock.patch.object(runner.os, "getpid", return_value=42), \
                 mock.patch.object(runner, "run_command"), \
                 mock.patch.object(
@@ -237,6 +303,9 @@ class Qwen36FlmFirstClassE2ETests(unittest.TestCase):
         self.assertEqual(args.context_size, 512)
         self.assertEqual(args.inference_timeout, 900)
         self.assertEqual(args.inference_cleanup_grace, 30)
+        self.assertFalse(args.regenerate)
+        self.assertIsNone(args.regenerate_output)
+        self.assertFalse(args.overwrite_artifact)
 
     def test_supersonic_command_has_no_hf_model_or_quant_override(self):
         args = self.args()
@@ -288,6 +357,7 @@ class Qwen36FlmFirstClassE2ETests(unittest.TestCase):
                 "count": 1,
                 "flm_weight_modes": ["INT4 native FLM"],
                 "flm_ready_for_decode_count": 1,
+                "runtime_engine_ready_count": 1,
                 "flm_direct_profiles": [{
                     "required": 693,
                     "raw_dense": 363,
@@ -306,6 +376,10 @@ class Qwen36FlmFirstClassE2ETests(unittest.TestCase):
                 "generated_tokens": 1,
                 "flm_weight_mode": "INT4 native FLM",
                 "flm_ready_for_decode": True,
+                "runtime_engine_ownership_markers": [{
+                    "load_sequence": 1,
+                    "source_open_count": 1,
+                }],
                 "flm_direct_profile": {
                     "required": 693,
                     "raw_dense": 363,
@@ -404,6 +478,35 @@ class Qwen36FlmFirstClassE2ETests(unittest.TestCase):
         payload["rows"][0].pop("flm_ready_for_decode")
 
         self.assert_report_rejected(payload, "ready for decode")
+
+    def test_report_rejects_missing_runtime_engine_ownership(self):
+        payload = self.valid_report()
+        payload["rows"][0].pop("runtime_engine_ownership_markers")
+        payload["summary"]["runtime_engine_ready_count"] = 0
+
+        self.assert_report_rejected(payload, "runtime engine ownership")
+
+    def test_report_rejects_duplicate_runtime_engine_ownership(self):
+        payload = self.valid_report()
+        payload["rows"][0]["runtime_engine_ownership_markers"].append({
+            "load_sequence": 1,
+            "source_open_count": 1,
+        })
+        payload["summary"]["runtime_engine_ready_count"] = 2
+
+        self.assert_report_rejected(payload, "exactly one runtime engine ownership")
+
+    def test_report_rejects_wrong_runtime_engine_load_sequence(self):
+        payload = self.valid_report()
+        payload["rows"][0]["runtime_engine_ownership_markers"][0]["load_sequence"] = 2
+
+        self.assert_report_rejected(payload, "load_sequence=1")
+
+    def test_report_rejects_wrong_runtime_engine_source_open_count(self):
+        payload = self.valid_report()
+        payload["rows"][0]["runtime_engine_ownership_markers"][0]["source_open_count"] = 2
+
+        self.assert_report_rejected(payload, "source_open_count=1")
 
     def test_report_rejects_no_native_int4_direct_plans(self):
         payload = self.valid_report()
@@ -643,20 +746,35 @@ class Qwen36FlmFirstClassE2ETests(unittest.TestCase):
 
     def test_main_prepares_runs_and_validates_in_order(self):
         artifact = self.tmp_path / "prepared.flm"
+        artifact.write_bytes(b"prevalidated")
+        digest = runner.artifact_sha256(artifact)
         out_json = self.tmp_path / "benchmark.json"
         payload = self.valid_report()
         order = []
 
         def prepare(args):
             order.append("prepare")
-            return artifact
+            return runner.ArtifactPreparation(
+                artifact=artifact,
+                action="reuse",
+                source=artifact,
+                destination=artifact,
+                before_sha256=digest,
+                after_sha256=digest,
+            )
 
         def discover(args, action):
             order.append("discover")
-            self.assertIs(action, runner.ArtifactAction.REGENERATE)
+            self.assertIs(action, runner.ArtifactAction.REUSE)
 
         def run(*args, **kwargs):
             order.append("run")
+
+        def record(path, preparation):
+            order.append("record")
+            self.assertEqual(path, out_json)
+            self.assertEqual(preparation.before_sha256, digest)
+            self.assertEqual(preparation.after_sha256, digest)
 
         def validate(path, *, requested_backend):
             order.append("validate")
@@ -667,6 +785,7 @@ class Qwen36FlmFirstClassE2ETests(unittest.TestCase):
         with mock.patch.object(runner, "discover_inputs", side_effect=discover), \
                 mock.patch.object(runner, "prepare_artifact", side_effect=prepare), \
                 mock.patch.object(runner, "run_command", side_effect=run) as run_mock, \
+                mock.patch.object(runner, "record_artifact_provenance", side_effect=record), \
                 mock.patch.object(runner, "validate_benchmark_report", side_effect=validate), \
                 mock.patch.object(runner, "print_summary") as print_summary:
             result = runner.main([
@@ -678,7 +797,7 @@ class Qwen36FlmFirstClassE2ETests(unittest.TestCase):
             ])
 
         self.assertEqual(result, 0)
-        self.assertEqual(order, ["discover", "prepare", "run", "validate"])
+        self.assertEqual(order, ["discover", "prepare", "run", "record", "validate"])
         self.assertEqual(run_mock.call_args.kwargs, {
             "cwd": runner.ROOT,
             "timeout": 2717,
