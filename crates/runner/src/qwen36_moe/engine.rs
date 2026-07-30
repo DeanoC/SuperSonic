@@ -271,6 +271,30 @@ fn format_qwen36_startup_timings(timings: &Qwen36StartupTimings) -> String {
     )
 }
 
+fn runtime_startup_timings_from_evidence(
+    evidence: &supersonic_runtime::qwen36_moe::engine::Qwen36MoeLoadEvidence,
+    dry_run: std::time::Duration,
+) -> Qwen36StartupTimings {
+    let tokenizer = evidence.tokenizer_timings;
+    Qwen36StartupTimings {
+        flm_source_open: evidence.source_open_duration,
+        flm_store_open: evidence.store_open_duration,
+        flm_config: evidence.config_duration,
+        flm_tokenizer: evidence.tokenizer_duration,
+        flm_tokenizer_assets: tokenizer.asset_lookup,
+        flm_tokenizer_parse: tokenizer.parse,
+        flm_tokenizer_parse_vocab: tokenizer.parse_vocab,
+        flm_tokenizer_parse_vocab_ids: tokenizer.parse_vocab_ids,
+        flm_tokenizer_parse_merges: tokenizer.parse_merges,
+        flm_tokenizer_parse_added_tokens: tokenizer.parse_added_tokens,
+        flm_tokenizer_parse_regex: tokenizer.parse_regex,
+        flm_tokenizer_build: tokenizer.build,
+        flm_direct_plan: evidence.plan_duration,
+        dry_run,
+        ..Default::default()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct Qwen36LifecycleTimings {
     prompt_setup: std::time::Duration,
@@ -496,6 +520,46 @@ mod tests {
              bake_prepare_ms=0.000 \
              dry_run_ms=2.250 pre_decode_total_ms=3.750"
         );
+    }
+
+    #[test]
+    fn runtime_startup_timings_use_measured_store_and_config_evidence() {
+        let evidence = supersonic_runtime::qwen36_moe::engine::Qwen36MoeLoadEvidence {
+            flm_path: std::path::PathBuf::new(),
+            architecture_id: 0,
+            model_id: 0,
+            storage_abi_ids: Vec::new(),
+            direct_profile: supersonic_runtime::qwen36_moe::engine::Qwen36MoeDirectProfile::default(
+            ),
+            transfer_backend: model_store::VirtualArenaTransferBackend::PageableH2d,
+            source_bytes: 1,
+            device_upload_bytes: 1,
+            source_open_duration: std::time::Duration::from_micros(1_500),
+            store_open_duration: std::time::Duration::from_micros(1_250),
+            config_duration: std::time::Duration::from_micros(25),
+            descriptor_duration: std::time::Duration::ZERO,
+            tokenizer_duration: std::time::Duration::from_micros(500),
+            plan_duration: std::time::Duration::from_micros(100),
+            allocation_duration: std::time::Duration::ZERO,
+            upload_duration: std::time::Duration::ZERO,
+            total_duration: std::time::Duration::from_micros(2_500),
+            load_sequence: 1,
+            source_open_count: 1,
+            resident_allocation_count: 0,
+            resident_allocation_pointers: Vec::new(),
+            mapped_virtual_ranges: Vec::new(),
+            config: None,
+            tokenizer_timings: supersonic_runtime::flm_tokenizer::QwenBpeTokenizerTimings::default(
+            ),
+            hal_profile: gpu_hal::HalProfileSnapshot::default(),
+        };
+
+        let timings =
+            runtime_startup_timings_from_evidence(&evidence, std::time::Duration::from_micros(750));
+        let formatted = format_qwen36_startup_timings(&timings);
+
+        assert!(formatted.contains("flm_store_open_ms=1.250"));
+        assert!(formatted.contains("flm_config_ms=0.025"));
     }
 
     #[test]
@@ -1117,22 +1181,8 @@ fn run_with_runtime_engine(
     let dry_run_elapsed = dry_run_start.elapsed();
     print_runtime_engine_load_evidence(&evidence);
     let tokenizer_timings = evidence.tokenizer_timings;
-    Qwen36StartupTimings {
-        flm_source_open: evidence.source_open_duration,
-        flm_tokenizer: evidence.tokenizer_duration,
-        flm_tokenizer_assets: tokenizer_timings.asset_lookup,
-        flm_tokenizer_parse: tokenizer_timings.parse,
-        flm_tokenizer_parse_vocab: tokenizer_timings.parse_vocab,
-        flm_tokenizer_parse_vocab_ids: tokenizer_timings.parse_vocab_ids,
-        flm_tokenizer_parse_merges: tokenizer_timings.parse_merges,
-        flm_tokenizer_parse_added_tokens: tokenizer_timings.parse_added_tokens,
-        flm_tokenizer_parse_regex: tokenizer_timings.parse_regex,
-        flm_tokenizer_build: tokenizer_timings.build,
-        flm_direct_plan: evidence.plan_duration,
-        dry_run: dry_run_elapsed,
-        ..Default::default()
-    }
-    .print_if_requested(cli.emit_stage_timings);
+    runtime_startup_timings_from_evidence(&evidence, dry_run_elapsed)
+        .print_if_requested(cli.emit_stage_timings);
 
     println!();
     println!("=== Decode (Qwen3.6-MoE) ===");

@@ -18,6 +18,15 @@ fn occurrence_count(haystack: &str, needle: &str) -> usize {
 }
 
 #[cfg(target_os = "linux")]
+fn reported_timing_ms(combined: &str, name: &str) -> Option<f64> {
+    let marker = format!("{name}=");
+    combined
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix(&marker))
+        .and_then(|value| value.parse().ok())
+}
+
+#[cfg(target_os = "linux")]
 fn assert_moe_flm_main_path_contract(combined: &str) {
     assert!(
         combined.contains("[qwen36-moe] loading config from FLM runtime descriptor"),
@@ -45,6 +54,14 @@ fn assert_moe_flm_main_path_contract(combined: &str) {
         combined.contains("[qwen36-moe] loading weights from already-open FLM source"),
         "weights were not loaded from the already-open FLM source:\n{combined}"
     );
+    for timing in ["flm_store_open_ms", "flm_config_ms"] {
+        let measured = reported_timing_ms(combined, timing)
+            .unwrap_or_else(|| panic!("missing {timing} runtime startup evidence:\n{combined}"));
+        assert!(
+            measured > 0.0,
+            "{timing} must report its measured positive duration, got {measured}:\n{combined}"
+        );
+    }
     for required in [
         "[qwen3.6-moe] dry-run summary",
         "[state accounting]",
@@ -115,6 +132,7 @@ fn moe_flm_main_path_output_contract_accepts_expected_logs() {
 [VRAM budget]
 [runtime residency]
 [qwen36-moe] runtime engine ready: load_sequence=1 source_open_count=1
+[qwen36-moe startup-timings] flm_source_open_ms=25.550 flm_store_open_ms=25.008 flm_config_ms=0.011
   Generated ids: [123]
 [result] prompt_tokens=1 generated_tokens=1 decode_ms=1 ms_per_step=1.0
 ";
@@ -162,6 +180,7 @@ fn qwen36_moe_flm_model_dir_runs_without_hf_snapshot() {
         "--context-size",
         "16",
         "--no-download",
+        "--emit-stage-timings",
     ]);
 
     let output = cmd

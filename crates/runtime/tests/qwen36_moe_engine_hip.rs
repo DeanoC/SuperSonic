@@ -66,6 +66,8 @@ fn dense_load_reset_and_reuse_preserve_resident_model_without_serving_allocation
     assert!(evidence.device_upload_bytes > 0);
     assert_eq!(evidence.source_open_count, 1);
     assert!(evidence.source_open_duration > std::time::Duration::ZERO);
+    assert!(evidence.store_open_duration > std::time::Duration::ZERO);
+    assert!(evidence.config_duration > std::time::Duration::ZERO);
     assert!(evidence.descriptor_duration > std::time::Duration::ZERO);
     assert!(evidence.allocation_duration > std::time::Duration::ZERO);
     assert!(evidence.upload_duration > std::time::Duration::ZERO);

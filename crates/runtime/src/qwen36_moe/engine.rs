@@ -98,6 +98,8 @@ pub struct Qwen36MoeLoadEvidence {
     pub source_bytes: u64,
     pub device_upload_bytes: u64,
     pub source_open_duration: Duration,
+    pub store_open_duration: Duration,
+    pub config_duration: Duration,
     pub descriptor_duration: Duration,
     pub tokenizer_duration: Duration,
     pub plan_duration: Duration,
@@ -174,6 +176,8 @@ fn build_load_evidence(
         source_bytes: input.source_bytes,
         device_upload_bytes: upload.device_upload_bytes,
         source_open_duration: Duration::ZERO,
+        store_open_duration: Duration::ZERO,
+        config_duration: Duration::ZERO,
         descriptor_duration: Duration::ZERO,
         tokenizer_duration: Duration::ZERO,
         plan_duration: Duration::ZERO,
@@ -750,6 +754,8 @@ impl Qwen36MoeEngine {
         load_evidence.storage_abi_ids.dedup();
         load_evidence.transfer_backend = config.policy.virtual_transfer_backend;
         load_evidence.source_open_duration = source_open_duration;
+        load_evidence.store_open_duration = source.timings.store_open;
+        load_evidence.config_duration = source.timings.config;
         load_evidence.descriptor_duration = persistent_descriptor_duration(&mut gpu.layers)?;
         load_evidence.tokenizer_duration = tokenizer_duration;
         load_evidence.plan_duration = source.timings.direct_plan;
@@ -1799,12 +1805,76 @@ fn qwen36_geom(text: &qwen36_moe::config::TextConfig) -> MultiLayerGeom {
 }
 
 fn profile_gpu_load<T>(load: impl FnOnce() -> Result<T>) -> (Result<T>, HalProfileSnapshot) {
-    gpu_hal::hal_profile_set_enabled(true);
-    gpu_hal::hal_profile_reset();
+    let outer_profile_active = gpu_hal::hal_profile_enabled();
+    let before = gpu_hal::hal_profile_snapshot();
+    if !outer_profile_active {
+        gpu_hal::hal_profile_set_enabled(true);
+    }
     let result = load();
-    let profile = gpu_hal::hal_profile_snapshot();
-    gpu_hal::hal_profile_set_enabled(false);
-    (result, profile)
+    let after = gpu_hal::hal_profile_snapshot();
+    if !outer_profile_active {
+        gpu_hal::hal_profile_set_enabled(false);
+    }
+    (result, hal_profile_delta(&before, &after))
+}
+
+fn hal_profile_delta(
+    before: &HalProfileSnapshot,
+    after: &HalProfileSnapshot,
+) -> HalProfileSnapshot {
+    let mut delta = HalProfileSnapshot::default();
+    for after_entry in &after.entries {
+        let before_entry = before
+            .entries
+            .iter()
+            .find(|entry| entry.op == after_entry.op);
+        let calls = after_entry
+            .calls
+            .saturating_sub(before_entry.map_or(0, |entry| entry.calls));
+        let total_ms =
+            (after_entry.total_ms - before_entry.map_or(0.0, |entry| entry.total_ms)).max(0.0);
+        let total_bytes = after_entry
+            .total_bytes
+            .saturating_sub(before_entry.map_or(0, |entry| entry.total_bytes));
+        if calls == 0 && total_ms == 0.0 && total_bytes == 0 {
+            continue;
+        }
+        let max_ms = match before_entry {
+            None => after_entry.max_ms,
+            Some(entry) if after_entry.max_ms > entry.max_ms => after_entry.max_ms,
+            Some(_) => 0.0,
+        };
+        let entry = gpu_hal::HalProfileEntry {
+            op: after_entry.op.clone(),
+            calls,
+            total_ms,
+            max_ms,
+            total_bytes,
+        };
+        delta.total_calls += entry.calls;
+        delta.total_ms += entry.total_ms;
+        match entry.op.as_str() {
+            "alloc" => {
+                delta.alloc_calls += entry.calls;
+                delta.alloc_bytes += entry.total_bytes;
+            }
+            "free" => delta.free_calls += entry.calls,
+            "copy_h2d" => delta.h2d_bytes += entry.total_bytes,
+            "copy_d2h" => delta.d2h_bytes += entry.total_bytes,
+            "copy_d2d" => delta.d2d_bytes += entry.total_bytes,
+            "memset_zeros" => delta.memset_bytes += entry.total_bytes,
+            "sync" => delta.sync_calls += entry.calls,
+            _ => {}
+        }
+        delta.entries.push(entry);
+    }
+    delta.entries.sort_by(|lhs, rhs| {
+        rhs.total_ms
+            .partial_cmp(&lhs.total_ms)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| lhs.op.cmp(&rhs.op))
+    });
+    delta
 }
 
 fn load_resident_gpu_parts(
@@ -2375,13 +2445,14 @@ mod tests {
     use qwen36_moe::config::{Activation, RopeParameters, TextConfig};
 
     use super::{
-        build_load_evidence, reset_full_attention_cache, reset_phase, run_decode_orchestration,
-        run_prefill_orchestration, run_prefill_orchestration_with_boundaries,
-        run_reset_transaction, validate_35b_a3b_config, validate_descriptor_pointer_ownership,
-        validate_load_contract, zero_gpu_buffer, zero_mapped_virtual_buffer, LoadEvidenceInput,
-        Qwen36ExecutionOptions, Qwen36LmHeadSelection, Qwen36MoeDirectProfile, Qwen36MoeEngine,
-        Qwen36MoeLoadConfig, Qwen36MoePrefillBoundary, Qwen36MoeRouteState, Qwen36ServingBackend,
-        Qwen36ServingEvent, Qwen36ServingObserver, Qwen36SessionPosition,
+        build_load_evidence, profile_gpu_load, reset_full_attention_cache, reset_phase,
+        run_decode_orchestration, run_prefill_orchestration,
+        run_prefill_orchestration_with_boundaries, run_reset_transaction, validate_35b_a3b_config,
+        validate_descriptor_pointer_ownership, validate_load_contract, zero_gpu_buffer,
+        zero_mapped_virtual_buffer, LoadEvidenceInput, Qwen36ExecutionOptions,
+        Qwen36LmHeadSelection, Qwen36MoeDirectProfile, Qwen36MoeEngine, Qwen36MoeLoadConfig,
+        Qwen36MoePrefillBoundary, Qwen36MoeRouteState, Qwen36ServingBackend, Qwen36ServingEvent,
+        Qwen36ServingObserver, Qwen36SessionPosition,
     };
     use crate::qwen36_moe::load_policy::Qwen36MoeLoadPolicy;
     use crate::qwen36_moe::source::{Qwen36MoeSource, Qwen36MoeSourceOpenObserver};
@@ -3339,6 +3410,54 @@ mod tests {
         assert!(state.predictors.as_ref().expect("reset predictors")[0]
             .candidates(&[7, 13], 2)
             .is_empty());
+    }
+
+    #[test]
+    fn profiled_gpu_load_preserves_outer_profile_and_returns_load_only_evidence() {
+        let _backend_lock = crate::qwen36_moe::layer_loader::GPU_BACKEND_TEST_LOCK
+            .lock()
+            .expect("GPU backend test lock");
+        if !gpu_hal::is_backend_compiled(Backend::Hip) {
+            eprintln!("skip: HIP backend not compiled");
+            return;
+        }
+        gpu_hal::set_backend(Backend::Hip);
+        if gpu_hal::set_device(0).is_err() {
+            eprintln!("skip: HIP device 0 unavailable");
+            return;
+        }
+
+        gpu_hal::hal_profile_set_enabled(true);
+        gpu_hal::hal_profile_reset();
+        let _before_load = GpuBuffer::from_host_bytes(0, ScalarType::U8, &[16], &[0x11; 16])
+            .expect("profile outer pre-load upload");
+        let (load_result, load_profile) = profile_gpu_load(|| {
+            Ok(GpuBuffer::from_host_bytes(
+                0,
+                ScalarType::U8,
+                &[16],
+                &[0x22; 16],
+            )?)
+        });
+        let loaded = load_result.expect("profile nested load upload");
+
+        assert_eq!(load_profile.alloc_calls, 1);
+        assert_eq!(load_profile.h2d_bytes, 16);
+        assert_eq!(load_profile.d2h_bytes, 0);
+
+        assert_eq!(
+            loaded
+                .to_host_bytes()
+                .expect("profile outer post-load download"),
+            vec![0x22; 16]
+        );
+        let whole_run_profile = gpu_hal::hal_profile_snapshot();
+        gpu_hal::hal_profile_set_enabled(false);
+
+        assert_eq!(whole_run_profile.alloc_calls, 2);
+        assert_eq!(whole_run_profile.h2d_bytes, 32);
+        assert_eq!(whole_run_profile.d2h_bytes, 16);
+        assert!(whole_run_profile.total_calls > load_profile.total_calls);
     }
 
     #[test]
