@@ -374,6 +374,22 @@ impl FullAttnBatchScratch {
     }
 }
 
+pub(crate) struct Qwen36PrefillWorkspace {
+    max_tokens: usize,
+    max_position: usize,
+    rotary: RotaryTables,
+    full_attn: FullAttnBatchScratch,
+    chunk_hidden: GpuBuffer,
+    pos_ids: GpuBuffer,
+    attn_output: GpuBuffer,
+    attn_workspace: GpuBuffer,
+    ffn_output: GpuBuffer,
+    ffn_output_idx: GpuBuffer,
+    ffn_workspace: GpuBuffer,
+    sync_buf: GpuBuffer,
+    grouped_ffn: GroupedFfnScratch,
+}
+
 /// Consume explicit prefill tokens at explicit RoPE/KV positions.
 ///
 /// Callers retain the final prompt token for the generation-fold step. Sparse
@@ -393,6 +409,71 @@ pub fn run_batched_prefill(
     execution: &Qwen36ExecutionOptions,
     token_callback: Option<&mut PrefillTokenCallback<'_>>,
     progress_callback: Option<&mut PrefillProgressCallback<'_>>,
+) -> Result<BatchedPrefillTimings> {
+    run_batched_prefill_impl(
+        ordinal,
+        geom,
+        store,
+        weight_prefix,
+        loaded_layers,
+        tokens,
+        positions,
+        accurate_stage_timings,
+        execution,
+        token_callback,
+        progress_callback,
+        None,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_batched_prefill_with_workspace(
+    ordinal: usize,
+    geom: &MultiLayerGeom,
+    store: &BakedStore,
+    weight_prefix: &str,
+    loaded_layers: &mut LoadedQwen36Layers,
+    tokens: &[u32],
+    positions: &[PositionPair],
+    accurate_stage_timings: bool,
+    execution: &Qwen36ExecutionOptions,
+    token_callback: Option<&mut PrefillTokenCallback<'_>>,
+    progress_callback: Option<&mut PrefillProgressCallback<'_>>,
+    workspace: Option<&mut Qwen36PrefillWorkspace>,
+) -> Result<BatchedPrefillTimings> {
+    run_batched_prefill_impl(
+        ordinal,
+        geom,
+        store,
+        weight_prefix,
+        loaded_layers,
+        tokens,
+        positions,
+        accurate_stage_timings,
+        execution,
+        token_callback,
+        progress_callback,
+        workspace,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_batched_prefill_impl(
+    ordinal: usize,
+    geom: &MultiLayerGeom,
+    store: &BakedStore,
+    weight_prefix: &str,
+    loaded_layers: &mut LoadedQwen36Layers,
+    tokens: &[u32],
+    positions: &[PositionPair],
+    accurate_stage_timings: bool,
+    execution: &Qwen36ExecutionOptions,
+    token_callback: Option<&mut PrefillTokenCallback<'_>>,
+    progress_callback: Option<&mut PrefillProgressCallback<'_>>,
+    workspace: Option<&mut Qwen36PrefillWorkspace>,
+    allow_ephemeral_workspace: bool,
 ) -> Result<BatchedPrefillTimings> {
     if tokens.len() != positions.len() {
         return Err(anyhow!(
@@ -442,11 +523,10 @@ pub fn run_batched_prefill(
             progress_callback,
         );
     }
-    let (layers, _, _) = loaded_layers.execution_parts();
-
-    let max_kv_t = layers
+    let max_kv_t = loaded_layers
+        .layers()
         .iter()
-        .filter_map(|l| match &l.attn {
+        .filter_map(|layer| match &layer.attn {
             AttnLayerBuffers::Full {
                 kv_cache: Some(c), ..
             } => Some(c.kv_max_t as usize),
@@ -460,16 +540,28 @@ pub fn run_batched_prefill(
         .max()
         .unwrap_or(1);
     let max_pos = max_kv_t.max(max_rope_pos);
-    let rotary = RotaryTables::build(ordinal, max_pos, geom.rotary_dim as usize, geom.rope_theta)
-        .context("build rotary tables")?;
-
-    // Allocate scratch sized for the LARGEST chunk we might use; per-chunk
-    // code uses only the `n` prefix needed. At hidden=2048 hd=256 H=16 and
-    // MAX=1024 the heaviest buffer is q_thsd [H, N, hd] = 8 MB — fine for
-    // the 24 GiB target.
-    let scratch_n = PREFILL_CHUNK_SIZE_MAX.min(prefill_count.max(1));
-    let mut scratch = FullAttnBatchScratch::alloc(ordinal, geom, scratch_n, max_kv_t)
-        .context("alloc full-attn batched scratch (max chunk)")?;
+    let mut ephemeral_workspace;
+    let workspace = match workspace {
+        Some(workspace) => workspace,
+        None if allow_ephemeral_workspace => {
+            ephemeral_workspace = Qwen36PrefillWorkspace::alloc(
+                ordinal,
+                geom,
+                loaded_layers.layers(),
+                prefill_count,
+                max_pos,
+            )
+            .context("allocate ephemeral Qwen3.6 prefill workspace")?;
+            &mut ephemeral_workspace
+        }
+        None => {
+            anyhow::bail!(
+                "Qwen3.6 serving dense prefill requires its engine-owned reusable workspace"
+            );
+        }
+    };
+    workspace.validate_capacity(prefill_count, max_pos)?;
+    let (layers, _, _) = loaded_layers.execution_parts();
 
     let mut progress_callback = progress_callback;
     let prefill_start = Instant::now();
@@ -496,8 +588,7 @@ pub fn run_batched_prefill(
             execution,
             step,
             n,
-            &rotary,
-            &mut scratch,
+            workspace,
             &mut timings,
         )?;
 
@@ -571,17 +662,28 @@ fn process_chunk_batched(
     execution: &Qwen36ExecutionOptions,
     chunk_start: usize,
     n: usize,
-    rotary: &RotaryTables,
-    scratch: &mut FullAttnBatchScratch,
+    workspace: &mut Qwen36PrefillWorkspace,
     timings: &mut BatchedPrefillTimings,
 ) -> Result<()> {
     // Batched-attn enabled path: stage chunk on GPU and drive per-layer.
     let _ = accurate_stage_timings;
+    let Qwen36PrefillWorkspace {
+        rotary,
+        full_attn,
+        chunk_hidden,
+        pos_ids,
+        attn_output,
+        attn_workspace,
+        ffn_output,
+        ffn_output_idx,
+        ffn_workspace,
+        sync_buf,
+        grouped_ffn,
+        ..
+    } = workspace;
 
     // 1. Stage the N chunk tokens onto the GPU.
     let hidden = geom.hidden as usize;
-    let mut chunk_hidden =
-        GpuBuffer::zeros(ordinal, ScalarType::BF16, &[n, hidden]).context("alloc chunk_hidden")?;
     let t0 = Instant::now();
     stage_chunk_tokens_on_gpu(
         ordinal,
@@ -591,7 +693,7 @@ fn process_chunk_batched(
         chunk_start,
         n,
         tokens,
-        &mut chunk_hidden,
+        chunk_hidden,
     )?;
     let t_embed = t0.elapsed();
     timings.embed_total += t_embed;
@@ -606,10 +708,14 @@ fn process_chunk_batched(
         let pos_bytes = unsafe {
             std::slice::from_raw_parts(pos_ids_host.as_ptr() as *const u8, pos_ids_host.len() * 4)
         };
-        Some(
-            GpuBuffer::from_host_bytes(ordinal, ScalarType::U32, &[n], pos_bytes)
-                .context("upload sparse prefill pos_ids")?,
+        copy_h2d(
+            ordinal,
+            pos_ids.as_mut_ptr(),
+            pos_bytes.as_ptr().cast(),
+            pos_bytes.len(),
         )
+        .context("upload sparse prefill pos_ids")?;
+        Some(&*pos_ids)
     } else {
         None
     };
@@ -618,32 +724,7 @@ fn process_chunk_batched(
     // path. Set SUPERSONIC_QWEN36_MOE_GROUPED_FFN=0 to fall back to per-token
     // FFN inside the chunk while keeping the batched attention.
     let use_grouped_ffn = execution.batched_prefill.grouped_ffn;
-
-    // Per-token fallback workspaces. Always allocated — used either by
-    // linear-attn (always) or by per-token FFN (when grouped FFN is off).
-    let attn_ws_floats = (full_attn_workspace_floats(geom) + pertoken_attn_extra_kv(geom, layers))
-        .max(linear_attn_workspace_floats(geom));
-    let attn_out_elems = full_attn_output_elems(geom);
-    let mut attn_output = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[attn_out_elems])
-        .context("alloc attn_output")?;
-    let mut attn_workspace = GpuBuffer::zeros(ordinal, ScalarType::F32, &[attn_ws_floats])
-        .context("alloc attn_workspace")?;
-    let mut ffn_output = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[ffn_output_elems(geom)])
-        .context("alloc ffn_output")?;
-    let mut ffn_output_idx = GpuBuffer::zeros(ordinal, ScalarType::U32, &[geom.top_k as usize])
-        .context("alloc ffn_output_idx")?;
-    let mut ffn_workspace =
-        GpuBuffer::zeros(ordinal, ScalarType::F32, &[ffn_workspace_floats(geom)])
-            .context("alloc ffn_workspace")?;
-    let mut sync_buf =
-        GpuBuffer::zeros(ordinal, ScalarType::U8, &[96]).context("alloc sync_buf")?;
-
-    // M11 batched-FFN scratch — allocated once per chunk, reused per layer.
-    let mut grouped_scratch = if use_grouped_ffn {
-        Some(GroupedFfnScratch::alloc(ordinal, geom, n)?)
-    } else {
-        None
-    };
+    let mut grouped_scratch = use_grouped_ffn.then_some(grouped_ffn);
 
     let past_len_at_chunk_start = positions[chunk_start].cache.max(0) as usize;
 
@@ -678,7 +759,7 @@ fn process_chunk_batched(
                 geom,
                 n,
                 past_len_at_chunk_start,
-                &mut chunk_hidden,
+                chunk_hidden,
                 input_norm_w,
                 q_proj_w,
                 k_proj_w,
@@ -690,8 +771,8 @@ fn process_chunk_batched(
                 kv_cache,
                 execution,
                 rotary,
-                pos_ids.as_ref(),
-                scratch,
+                pos_ids,
+                full_attn,
             )
             .with_context(|| format!("batched full-attn layer {layer_idx}"))?;
         } else {
@@ -701,11 +782,11 @@ fn process_chunk_batched(
                 ordinal,
                 geom,
                 n,
-                &mut chunk_hidden,
+                chunk_hidden,
                 &mut layer.attn,
-                &mut attn_output,
-                &mut attn_workspace,
-                &mut sync_buf,
+                attn_output,
+                attn_workspace,
+                sync_buf,
                 execution,
             )
             .with_context(|| format!("pertoken linear-attn layer {layer_idx}"))?;
@@ -717,10 +798,10 @@ fn process_chunk_batched(
                 ordinal,
                 geom,
                 n,
-                &mut chunk_hidden,
+                chunk_hidden,
                 &layer.ffn,
                 scratch,
-                &mut sync_buf,
+                sync_buf,
                 execution,
             )
             .with_context(|| format!("batched grouped ffn layer {layer_idx}"))?;
@@ -730,12 +811,12 @@ fn process_chunk_batched(
                 geom,
                 layer_idx,
                 n,
-                &mut chunk_hidden,
+                chunk_hidden,
                 &layer.ffn,
-                &mut ffn_output,
-                &mut ffn_output_idx,
-                &mut ffn_workspace,
-                &mut sync_buf,
+                ffn_output,
+                ffn_output_idx,
+                ffn_workspace,
+                sync_buf,
                 execution,
             )
             .with_context(|| format!("pertoken ffn layer {layer_idx}"))?;
@@ -1956,9 +2037,10 @@ fn process_ffn_batched_grouped(
     _sync_buf: &mut GpuBuffer,
     execution: &Qwen36ExecutionOptions,
 ) -> Result<()> {
-    debug_assert_eq!(
-        scratch.n, n,
-        "GroupedFfnScratch sized for chunk_n != current n"
+    debug_assert!(
+        scratch.n >= n,
+        "GroupedFfnScratch capacity {} is smaller than chunk {n}",
+        scratch.n
     );
     let hidden = geom.hidden as usize;
     let num_experts = geom.num_experts as usize;
@@ -2569,6 +2651,182 @@ fn expand_scalar_gate_bf16(
     )
     .context("h2d expanded gate")?;
     Ok(())
+}
+
+impl Qwen36PrefillWorkspace {
+    pub(crate) fn allocate_for_engine(
+        ordinal: usize,
+        geom: &MultiLayerGeom,
+        loaded_layers: &LoadedQwen36Layers,
+        max_context_len: usize,
+    ) -> Result<Option<Self>> {
+        if max_context_len <= 1
+            || !supports_batched_path(
+                loaded_layers.layers(),
+                loaded_layers.has_sparse_expert_residency(),
+            )?
+        {
+            return Ok(None);
+        }
+        Self::alloc(
+            ordinal,
+            geom,
+            loaded_layers.layers(),
+            max_context_len - 1,
+            max_context_len,
+        )
+        .map(Some)
+    }
+
+    fn alloc(
+        ordinal: usize,
+        geom: &MultiLayerGeom,
+        layers: &[LayerBuffers],
+        max_tokens: usize,
+        max_position: usize,
+    ) -> Result<Self> {
+        let chunk_capacity = PREFILL_CHUNK_SIZE_MAX.min(max_tokens.max(1));
+        let max_kv_t = layers
+            .iter()
+            .filter_map(|layer| match &layer.attn {
+                AttnLayerBuffers::Full {
+                    kv_cache: Some(cache),
+                    ..
+                } => Some(cache.kv_max_t.max(1) as usize),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(1);
+        let rotary_capacity = max_position.max(max_kv_t).max(1);
+        let rotary = RotaryTables::build(
+            ordinal,
+            rotary_capacity,
+            geom.rotary_dim as usize,
+            geom.rope_theta,
+        )
+        .context("build reusable Qwen3.6 prefill rotary tables")?;
+        let full_attn = FullAttnBatchScratch::alloc(ordinal, geom, chunk_capacity, max_kv_t)
+            .context("allocate reusable Qwen3.6 full-attention prefill scratch")?;
+
+        let hidden = geom.hidden as usize;
+        let chunk_hidden = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[chunk_capacity, hidden])
+            .context("allocate reusable Qwen3.6 prefill chunk hidden")?;
+        let pos_ids = GpuBuffer::zeros(ordinal, ScalarType::U32, &[chunk_capacity])
+            .context("allocate reusable Qwen3.6 prefill position IDs")?;
+        let attn_ws_floats = (full_attn_workspace_floats(geom)
+            + pertoken_attn_extra_kv(geom, layers))
+        .max(linear_attn_workspace_floats(geom));
+        let attn_output =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[full_attn_output_elems(geom)])
+                .context("allocate reusable Qwen3.6 prefill attention output")?;
+        let attn_workspace = GpuBuffer::zeros(ordinal, ScalarType::F32, &[attn_ws_floats])
+            .context("allocate reusable Qwen3.6 prefill attention workspace")?;
+        let ffn_output = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[ffn_output_elems(geom)])
+            .context("allocate reusable Qwen3.6 prefill FFN output")?;
+        let ffn_output_idx = GpuBuffer::zeros(ordinal, ScalarType::U32, &[geom.top_k as usize])
+            .context("allocate reusable Qwen3.6 prefill FFN output indices")?;
+        let ffn_workspace =
+            GpuBuffer::zeros(ordinal, ScalarType::F32, &[ffn_workspace_floats(geom)])
+                .context("allocate reusable Qwen3.6 prefill FFN workspace")?;
+        let sync_buf = GpuBuffer::zeros(ordinal, ScalarType::U8, &[96])
+            .context("allocate reusable Qwen3.6 prefill sync buffer")?;
+        let grouped_ffn = GroupedFfnScratch::alloc(ordinal, geom, chunk_capacity)
+            .context("allocate reusable Qwen3.6 grouped-FFN prefill scratch")?;
+
+        Ok(Self {
+            max_tokens,
+            max_position: rotary_capacity,
+            rotary,
+            full_attn,
+            chunk_hidden,
+            pos_ids,
+            attn_output,
+            attn_workspace,
+            ffn_output,
+            ffn_output_idx,
+            ffn_workspace,
+            sync_buf,
+            grouped_ffn,
+        })
+    }
+
+    fn validate_capacity(&self, tokens: usize, max_position: usize) -> Result<()> {
+        if tokens > self.max_tokens {
+            anyhow::bail!(
+                "Qwen3.6 reusable prefill workspace token capacity exceeded: \
+                 requested {tokens}, capacity {}",
+                self.max_tokens
+            );
+        }
+        if max_position > self.max_position {
+            anyhow::bail!(
+                "Qwen3.6 reusable prefill workspace position capacity exceeded: \
+                 requested {max_position}, capacity {}",
+                self.max_position
+            );
+        }
+        Ok(())
+    }
+
+    pub(crate) fn allocation_pointers(&self) -> Vec<usize> {
+        let mut pointers = vec![
+            self.rotary.cos.as_ptr() as usize,
+            self.rotary.sin.as_ptr() as usize,
+        ];
+        for buffer in [
+            &self.full_attn.x_norm,
+            &self.full_attn.qg_raw,
+            &self.full_attn.q,
+            &self.full_attn.q_after,
+            &self.full_attn.gate,
+            &self.full_attn.k,
+            &self.full_attn.k_after,
+            &self.full_attn.v,
+            &self.full_attn.q_thsd,
+            &self.full_attn.kv_prefix_k,
+            &self.full_attn.kv_prefix_v,
+            &self.full_attn.k_thsd,
+            &self.full_attn.v_thsd,
+            &self.full_attn.attn_out_f32,
+            &self.full_attn.attn_out_nhd_f32,
+            &self.full_attn.attn_out_bf16,
+            &self.full_attn.gated,
+            &self.full_attn.o,
+            &self.chunk_hidden,
+            &self.pos_ids,
+            &self.attn_output,
+            &self.attn_workspace,
+            &self.ffn_output,
+            &self.ffn_output_idx,
+            &self.ffn_workspace,
+            &self.sync_buf,
+            &self.grouped_ffn.h_norm,
+            &self.grouped_ffn.router_logits_bf16,
+            &self.grouped_ffn.topk_idx,
+            &self.grouped_ffn.topk_weight,
+            &self.grouped_ffn.expert_offsets,
+            &self.grouped_ffn.permuted_token_idx,
+            &self.grouped_ffn.permuted_kpos,
+            &self.grouped_ffn.permuted_weight,
+            &self.grouped_ffn.permuted_inverse,
+            &self.grouped_ffn.expert_out,
+            &self.grouped_ffn.expert_mid,
+            &self.grouped_ffn.combined,
+            &self.grouped_ffn.expert_counters,
+            &self.grouped_ffn.shared_gate,
+            &self.grouped_ffn.shared_up,
+            &self.grouped_ffn.shared_silu_mul,
+            &self.grouped_ffn.shared_down,
+            &self.grouped_ffn.shared_gate_scalar,
+            &self.grouped_ffn.shared_out,
+            &self.grouped_ffn.shared_out_final,
+        ] {
+            pointers.push(buffer.as_ptr() as usize);
+        }
+        pointers.sort_unstable();
+        pointers.dedup();
+        pointers
+    }
 }
 
 #[cfg(test)]

@@ -31,7 +31,10 @@ use crate::qwen36_moe::persistent_decode::{
     build_int4_descs, build_kv_fp8_descs, build_layer_descs, LmHeadFold,
 };
 use crate::qwen36_moe::prefetch::handle_moe_expert_prefetch;
-use crate::qwen36_moe::prefill::{lookup_embed_row, run_batched_prefill, PrefillTokenTimings};
+use crate::qwen36_moe::prefill::{
+    lookup_embed_row, run_batched_prefill_with_workspace, PrefillTokenTimings,
+    Qwen36PrefillWorkspace,
+};
 use crate::qwen36_moe::route_telemetry::{MoeRouteTelemetry, MoeTransitionPredictor};
 use crate::qwen36_moe::source::{Qwen36MoeSource, Qwen36MoeSourceOpenObserver, Qwen36WeightMode};
 use crate::qwen36_moe::types::{
@@ -168,7 +171,17 @@ fn build_load_evidence(
 
 #[derive(Default)]
 struct Qwen36SessionPosition {
-    next: Option<usize>,
+    state: Qwen36SessionState,
+}
+
+#[derive(Default)]
+enum Qwen36SessionState {
+    #[default]
+    Ready,
+    Active {
+        next: usize,
+    },
+    NeedsReset,
 }
 
 impl Qwen36SessionPosition {
@@ -181,23 +194,43 @@ impl Qwen36SessionPosition {
                 "Qwen3.6 prefill prompt length {prompt_len} exceeds context {max_context_len}"
             );
         }
-        if let Some(next) = self.next {
-            anyhow::bail!(
-                "Qwen3.6 prefill requires reset before starting a new request; \
-                 current next absolute position is {next}"
-            );
+        match self.state {
+            Qwen36SessionState::Ready => {}
+            Qwen36SessionState::Active { next } => {
+                anyhow::bail!(
+                    "Qwen3.6 prefill requires reset before starting a new request; \
+                     current next absolute position is {next}"
+                );
+            }
+            Qwen36SessionState::NeedsReset => {
+                anyhow::bail!(
+                    "Qwen3.6 prefill requires reset after failed or incomplete serving execution"
+                );
+            }
         }
         Ok(())
     }
 
+    fn execution_started(&mut self) {
+        self.state = Qwen36SessionState::NeedsReset;
+    }
+
     fn prefill_succeeded(&mut self, prompt_len: usize) {
-        self.next = Some(prompt_len);
+        self.state = Qwen36SessionState::Active { next: prompt_len };
     }
 
     fn validate_decode(&self, absolute_pos: usize, max_context_len: usize) -> Result<()> {
-        let expected = self
-            .next
-            .ok_or_else(|| anyhow!("Qwen3.6 decode_step called before prefill"))?;
+        let expected = match self.state {
+            Qwen36SessionState::Ready => {
+                return Err(anyhow!("Qwen3.6 decode_step called before prefill"));
+            }
+            Qwen36SessionState::Active { next } => next,
+            Qwen36SessionState::NeedsReset => {
+                anyhow::bail!(
+                    "Qwen3.6 decode_step requires reset after failed or incomplete serving execution"
+                );
+            }
+        };
         if absolute_pos != expected {
             anyhow::bail!(
                 "Qwen3.6 decode_step expected absolute position {expected}, got {absolute_pos}"
@@ -213,21 +246,158 @@ impl Qwen36SessionPosition {
     }
 
     fn decode_succeeded(&mut self, absolute_pos: usize) -> Result<()> {
-        self.next = Some(
-            absolute_pos
-                .checked_add(1)
-                .ok_or_else(|| anyhow!("Qwen3.6 decode_step absolute position overflow"))?,
-        );
+        let next = absolute_pos
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("Qwen3.6 decode_step absolute position overflow"))?;
+        self.state = Qwen36SessionState::Active { next };
         Ok(())
     }
 
     fn reset(&mut self) {
-        self.next = None;
+        self.state = Qwen36SessionState::Ready;
     }
 
     fn next(&self) -> Option<usize> {
-        self.next
+        match self.state {
+            Qwen36SessionState::Active { next } => Some(next),
+            Qwen36SessionState::Ready | Qwen36SessionState::NeedsReset => None,
+        }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Qwen36LmHeadSelection {
+    DenseFolded,
+    SparseStandalone,
+}
+
+#[allow(dead_code)]
+enum Qwen36ServingEvent<'a> {
+    Prefix {
+        tokens: &'a [u32],
+        positions: &'a [PositionPair],
+    },
+    ProductionToken {
+        token_id: u32,
+        absolute_pos: usize,
+    },
+    LmHead(Qwen36LmHeadSelection),
+    OutputCompleted,
+    PositionCommitted {
+        next_position: usize,
+    },
+}
+
+trait Qwen36ServingObserver {
+    fn observe(&mut self, event: Qwen36ServingEvent<'_>);
+}
+
+struct IgnoreServingEvents;
+
+impl Qwen36ServingObserver for IgnoreServingEvents {
+    fn observe(&mut self, _event: Qwen36ServingEvent<'_>) {}
+}
+
+trait Qwen36ServingBackend {
+    type PendingOutput;
+
+    fn run_prefix(&mut self, tokens: &[u32], positions: &[PositionPair]) -> Result<()>;
+
+    fn run_production_token(
+        &mut self,
+        token_id: u32,
+        absolute_pos: usize,
+        lm_head: Qwen36LmHeadSelection,
+    ) -> Result<Self::PendingOutput>;
+
+    fn complete_output(
+        &mut self,
+        pending: Self::PendingOutput,
+        lm_head: Qwen36LmHeadSelection,
+    ) -> Result<Vec<f32>>;
+}
+
+fn validate_serving_token_ids(token_ids: &[u32], vocab: usize, operation: &str) -> Result<()> {
+    for (index, &token_id) in token_ids.iter().enumerate() {
+        if token_id as usize >= vocab {
+            anyhow::bail!(
+                "Qwen3.6 {operation} token {token_id} at index {index} is outside vocabulary {vocab}"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn run_prefill_orchestration<B: Qwen36ServingBackend>(
+    session: &mut Qwen36SessionPosition,
+    prompt_ids: &[u32],
+    max_context_len: usize,
+    vocab: usize,
+    lm_head: Qwen36LmHeadSelection,
+    backend: &mut B,
+    observer: &mut impl Qwen36ServingObserver,
+) -> Result<Vec<f32>> {
+    session.validate_prefill(prompt_ids.len(), max_context_len)?;
+    validate_serving_token_ids(prompt_ids, vocab, "prefill")?;
+
+    let final_index = prompt_ids.len() - 1;
+    let positions = (0..final_index)
+        .map(|position| PositionPair::dense(position as i32))
+        .collect::<Vec<_>>();
+    session.execution_started();
+
+    observer.observe(Qwen36ServingEvent::Prefix {
+        tokens: &prompt_ids[..final_index],
+        positions: &positions,
+    });
+    backend.run_prefix(&prompt_ids[..final_index], &positions)?;
+
+    let final_token = prompt_ids[final_index];
+    observer.observe(Qwen36ServingEvent::ProductionToken {
+        token_id: final_token,
+        absolute_pos: final_index,
+    });
+    observer.observe(Qwen36ServingEvent::LmHead(lm_head));
+    let pending = backend.run_production_token(final_token, final_index, lm_head)?;
+    let logits = backend.complete_output(pending, lm_head)?;
+    observer.observe(Qwen36ServingEvent::OutputCompleted);
+
+    session.prefill_succeeded(prompt_ids.len());
+    observer.observe(Qwen36ServingEvent::PositionCommitted {
+        next_position: prompt_ids.len(),
+    });
+    Ok(logits)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_decode_orchestration<B: Qwen36ServingBackend>(
+    session: &mut Qwen36SessionPosition,
+    token_id: u32,
+    absolute_pos: usize,
+    max_context_len: usize,
+    vocab: usize,
+    lm_head: Qwen36LmHeadSelection,
+    backend: &mut B,
+    observer: &mut impl Qwen36ServingObserver,
+) -> Result<Vec<f32>> {
+    session.validate_decode(absolute_pos, max_context_len)?;
+    validate_serving_token_ids(&[token_id], vocab, "decode_step")?;
+    session.execution_started();
+
+    observer.observe(Qwen36ServingEvent::ProductionToken {
+        token_id,
+        absolute_pos,
+    });
+    observer.observe(Qwen36ServingEvent::LmHead(lm_head));
+    let pending = backend.run_production_token(token_id, absolute_pos, lm_head)?;
+    let logits = backend.complete_output(pending, lm_head)?;
+    observer.observe(Qwen36ServingEvent::OutputCompleted);
+
+    session.decode_succeeded(absolute_pos)?;
+    observer.observe(Qwen36ServingEvent::PositionCommitted {
+        next_position: absolute_pos + 1,
+    });
+    Ok(logits)
 }
 
 #[allow(dead_code)]
@@ -245,6 +415,7 @@ pub struct Qwen36MoeEngine {
     logits: GpuBuffer,
     counter: GpuBuffer,
     final_hidden: GpuBuffer,
+    prefill_workspace: Option<Qwen36PrefillWorkspace>,
     route_state: Qwen36MoeRouteState,
     session_position: Qwen36SessionPosition,
     source_open_observer: Qwen36MoeSourceOpenObserver,
@@ -412,6 +583,7 @@ struct ResidentGpuParts {
     logits: GpuBuffer,
     counter: GpuBuffer,
     final_hidden: GpuBuffer,
+    prefill_workspace: Option<Qwen36PrefillWorkspace>,
 }
 
 impl Qwen36MoeEngine {
@@ -532,6 +704,13 @@ impl Qwen36MoeEngine {
                 &gpu.final_hidden,
             ],
         );
+        if let Some(workspace) = gpu.prefill_workspace.as_ref() {
+            load_evidence
+                .resident_allocation_pointers
+                .extend(workspace.allocation_pointers());
+            load_evidence.resident_allocation_pointers.sort_unstable();
+            load_evidence.resident_allocation_pointers.dedup();
+        }
         load_evidence.resident_allocation_count =
             load_evidence.resident_allocation_pointers.len() as u64;
         load_evidence.mapped_virtual_ranges = collect_mapped_virtual_ranges(&gpu.layers);
@@ -555,6 +734,7 @@ impl Qwen36MoeEngine {
             logits: gpu.logits,
             counter: gpu.counter,
             final_hidden: gpu.final_hidden,
+            prefill_workspace: gpu.prefill_workspace,
             route_state,
             session_position: Qwen36SessionPosition::default(),
             source_open_observer,
@@ -584,141 +764,55 @@ impl Qwen36MoeEngine {
     }
 
     pub fn prefill(&mut self, prompt_ids: &[u32]) -> Result<Vec<f32>> {
-        self.session_position
-            .validate_prefill(prompt_ids.len(), self.max_context_len)?;
-        let final_index = prompt_ids.len() - 1;
-        let positions = (0..final_index)
-            .map(|position| PositionPair::dense(position as i32))
-            .collect::<Vec<_>>();
-        let execution = Qwen36ExecutionOptions::default();
-
-        {
-            let ordinal = self.device_ordinal;
-            let geom = &self.geom;
-            let store = &self.source.source.store;
-            let route_state = &mut self.route_state;
-            let mut fallback = |callback_layers: &mut LoadedQwen36Layers,
-                                step: usize,
-                                token: u32,
-                                position: PositionPair|
-             -> Result<PrefillTokenTimings> {
-                let embed_start = Instant::now();
-                let initial_hidden = lookup_embed_row(
-                    store,
-                    QWEN36_35B_A3B_WEIGHT_PREFIX,
-                    token as usize,
-                    geom.hidden as usize,
-                )
-                .with_context(|| {
-                    format!("Qwen3.6 serving prefill embedding token {token} at step {step}")
-                })?;
-                let embed = embed_start.elapsed();
-                let chain_start = Instant::now();
-                route_state.run_step(
-                    ordinal,
-                    geom,
-                    store,
-                    callback_layers,
-                    &initial_hidden,
-                    position,
-                    step,
-                    None,
-                    false,
-                    &execution,
-                )?;
-                Ok(PrefillTokenTimings {
-                    embed,
-                    chain: chain_start.elapsed(),
-                })
-            };
-            run_batched_prefill(
-                ordinal,
-                geom,
-                store,
-                QWEN36_35B_A3B_WEIGHT_PREFIX,
-                &mut self.layers,
-                &prompt_ids[..final_index],
-                &positions,
-                false,
-                &execution,
-                Some(&mut fallback),
-                None,
-            )
-            .context("Qwen3.6 serving batched prefill")?;
-        }
-
-        let logits = self.run_production_step(prompt_ids[final_index], final_index, &execution)?;
-        self.session_position.prefill_succeeded(prompt_ids.len());
-        Ok(logits)
+        let lm_head = self.serving_lm_head_selection();
+        let max_context_len = self.max_context_len;
+        let vocab = self.geom.vocab as usize;
+        let mut session = std::mem::take(&mut self.session_position);
+        let mut observer = IgnoreServingEvents;
+        let result = run_prefill_orchestration(
+            &mut session,
+            prompt_ids,
+            max_context_len,
+            vocab,
+            lm_head,
+            self,
+            &mut observer,
+        );
+        self.session_position = session;
+        result
     }
 
     pub fn decode_step(&mut self, token_id: u32, absolute_pos: usize) -> Result<Vec<f32>> {
-        self.session_position
-            .validate_decode(absolute_pos, self.max_context_len)?;
-        let execution = Qwen36ExecutionOptions::default();
-        let logits = self.run_production_step(token_id, absolute_pos, &execution)?;
-        self.session_position.decode_succeeded(absolute_pos)?;
-        Ok(logits)
+        let lm_head = self.serving_lm_head_selection();
+        let max_context_len = self.max_context_len;
+        let vocab = self.geom.vocab as usize;
+        let mut session = std::mem::take(&mut self.session_position);
+        let mut observer = IgnoreServingEvents;
+        let result = run_decode_orchestration(
+            &mut session,
+            token_id,
+            absolute_pos,
+            max_context_len,
+            vocab,
+            lm_head,
+            self,
+            &mut observer,
+        );
+        self.session_position = session;
+        result
     }
 
-    fn run_production_step(
-        &mut self,
-        token_id: u32,
-        absolute_pos: usize,
-        execution: &Qwen36ExecutionOptions,
-    ) -> Result<Vec<f32>> {
-        let initial_hidden = lookup_embed_row(
-            &self.source.source.store,
-            QWEN36_35B_A3B_WEIGHT_PREFIX,
-            token_id as usize,
-            self.geom.hidden as usize,
-        )
-        .with_context(|| {
-            format!(
-                "Qwen3.6 serving embedding token {token_id} at absolute position {absolute_pos}"
-            )
-        })?;
-        let sparse = self.layers.has_sparse_expert_residency();
-        let fold = (!sparse).then_some(LmHeadFold {
-            final_norm_w: &self.final_norm_w,
-            lm_head_w: &self.lm_head_w,
-            logits_out: Some(&mut self.logits),
-            top1_out: None,
-            vocab: self.geom.vocab,
-        });
-        let output = self.route_state.run_step(
-            self.device_ordinal,
-            &self.geom,
-            &self.source.source.store,
-            &mut self.layers,
-            &initial_hidden,
-            PositionPair::dense(absolute_pos as i32),
-            absolute_pos,
-            fold,
-            sparse,
-            execution,
-        )?;
-        let logits_bytes = if output.lm_head_folded {
-            self.logits
-                .to_host_bytes()
-                .context("download Qwen3.6 folded serving logits")?
+    fn serving_lm_head_selection(&self) -> Qwen36LmHeadSelection {
+        if self.layers.has_sparse_expert_residency() {
+            Qwen36LmHeadSelection::SparseStandalone
         } else {
-            launch_lm_head_from_final_hidden_bytes(
-                self.device_ordinal,
-                &self.geom,
-                &output.outputs.final_hidden_bytes,
-                &execution.prefill_kernel,
-                LmHeadBuffers {
-                    final_norm_w: &self.final_norm_w,
-                    lm_head_w: &self.lm_head_w,
-                    final_hidden: &mut self.final_hidden,
-                    logits: &mut self.logits,
-                    counter: &mut self.counter,
-                },
-            )
-            .context("run Qwen3.6 serving LM head")?
-        };
-        Ok(bf16_bytes_to_f32(&logits_bytes))
+            Qwen36LmHeadSelection::DenseFolded
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn test_only_observed_load_sequence() -> u64 {
+        ENGINE_LOAD_SEQUENCE.load(Ordering::SeqCst)
     }
 
     #[doc(hidden)]
@@ -838,7 +932,7 @@ impl Qwen36MoeEngine {
     #[doc(hidden)]
     pub fn test_only_reset_snapshot(&mut self) -> Result<Qwen36MoeResetTestSnapshot> {
         gpu_hal::sync(self.device_ordinal).context("sync before reset test snapshot")?;
-        let resident_allocation_pointers = collect_resident_allocation_pointers(
+        let mut resident_allocation_pointers = collect_resident_allocation_pointers(
             &mut self.layers,
             [
                 &self.embed_w,
@@ -849,6 +943,11 @@ impl Qwen36MoeEngine {
                 &self.final_hidden,
             ],
         );
+        if let Some(workspace) = self.prefill_workspace.as_ref() {
+            resident_allocation_pointers.extend(workspace.allocation_pointers());
+            resident_allocation_pointers.sort_unstable();
+            resident_allocation_pointers.dedup();
+        }
         let mapped_virtual_ranges = collect_mapped_virtual_ranges(&self.layers);
         let (persistent_descriptor_bytes, mut mutable_nonzero_labels) = {
             let (layers, scratch, _) = self.layers.execution_parts();
@@ -960,7 +1059,7 @@ impl Qwen36MoeEngine {
     }
 
     fn validate_resident_identity(&mut self) -> Result<()> {
-        let current_pointers = collect_resident_allocation_pointers(
+        let mut current_pointers = collect_resident_allocation_pointers(
             &mut self.layers,
             [
                 &self.embed_w,
@@ -971,6 +1070,11 @@ impl Qwen36MoeEngine {
                 &self.final_hidden,
             ],
         );
+        if let Some(workspace) = self.prefill_workspace.as_ref() {
+            current_pointers.extend(workspace.allocation_pointers());
+            current_pointers.sort_unstable();
+            current_pointers.dedup();
+        }
         if current_pointers != self.load_evidence.resident_allocation_pointers {
             anyhow::bail!("resident allocation pointers changed across reset");
         }
@@ -988,6 +1092,157 @@ impl Qwen36MoeEngine {
             anyhow::bail!("mapped virtual addresses changed across reset");
         }
         Ok(())
+    }
+}
+
+impl Qwen36ServingBackend for Qwen36MoeEngine {
+    type PendingOutput = Qwen36ChainStepOutput;
+
+    fn run_prefix(&mut self, tokens: &[u32], positions: &[PositionPair]) -> Result<()> {
+        let execution = Qwen36ExecutionOptions::default();
+        let ordinal = self.device_ordinal;
+        let geom = &self.geom;
+        let store = &self.source.source.store;
+        let route_state = &mut self.route_state;
+        let prefill_workspace = self.prefill_workspace.as_mut();
+        let mut fallback = |callback_layers: &mut LoadedQwen36Layers,
+                            step: usize,
+                            token: u32,
+                            position: PositionPair|
+         -> Result<PrefillTokenTimings> {
+            let embed_start = Instant::now();
+            let initial_hidden = lookup_embed_row(
+                store,
+                QWEN36_35B_A3B_WEIGHT_PREFIX,
+                token as usize,
+                geom.hidden as usize,
+            )
+            .with_context(|| {
+                format!("Qwen3.6 serving prefill embedding token {token} at step {step}")
+            })?;
+            let embed = embed_start.elapsed();
+            let chain_start = Instant::now();
+            route_state.run_step(
+                ordinal,
+                geom,
+                store,
+                callback_layers,
+                &initial_hidden,
+                position,
+                step,
+                None,
+                false,
+                &execution,
+            )?;
+            Ok(PrefillTokenTimings {
+                embed,
+                chain: chain_start.elapsed(),
+            })
+        };
+        run_batched_prefill_with_workspace(
+            ordinal,
+            geom,
+            store,
+            QWEN36_35B_A3B_WEIGHT_PREFIX,
+            &mut self.layers,
+            tokens,
+            positions,
+            false,
+            &execution,
+            Some(&mut fallback),
+            None,
+            prefill_workspace,
+        )
+        .context("Qwen3.6 serving batched prefill")?;
+        Ok(())
+    }
+
+    fn run_production_token(
+        &mut self,
+        token_id: u32,
+        absolute_pos: usize,
+        lm_head: Qwen36LmHeadSelection,
+    ) -> Result<Self::PendingOutput> {
+        let expected = self.serving_lm_head_selection();
+        if lm_head != expected {
+            anyhow::bail!(
+                "Qwen3.6 serving LM-head selection changed during execution: \
+                 planned {lm_head:?}, current {expected:?}"
+            );
+        }
+        let execution = Qwen36ExecutionOptions::default();
+        let initial_hidden = lookup_embed_row(
+            &self.source.source.store,
+            QWEN36_35B_A3B_WEIGHT_PREFIX,
+            token_id as usize,
+            self.geom.hidden as usize,
+        )
+        .with_context(|| {
+            format!(
+                "Qwen3.6 serving embedding token {token_id} at absolute position {absolute_pos}"
+            )
+        })?;
+        let fold = match lm_head {
+            Qwen36LmHeadSelection::DenseFolded => Some(LmHeadFold {
+                final_norm_w: &self.final_norm_w,
+                lm_head_w: &self.lm_head_w,
+                logits_out: Some(&mut self.logits),
+                top1_out: None,
+                vocab: self.geom.vocab,
+            }),
+            Qwen36LmHeadSelection::SparseStandalone => None,
+        };
+        self.route_state.run_step(
+            self.device_ordinal,
+            &self.geom,
+            &self.source.source.store,
+            &mut self.layers,
+            &initial_hidden,
+            PositionPair::dense(absolute_pos as i32),
+            absolute_pos,
+            fold,
+            lm_head == Qwen36LmHeadSelection::SparseStandalone,
+            &execution,
+        )
+    }
+
+    fn complete_output(
+        &mut self,
+        pending: Self::PendingOutput,
+        lm_head: Qwen36LmHeadSelection,
+    ) -> Result<Vec<f32>> {
+        let expected_folded = lm_head == Qwen36LmHeadSelection::DenseFolded;
+        if pending.lm_head_folded != expected_folded {
+            anyhow::bail!(
+                "Qwen3.6 serving LM-head completion mismatch: selection {lm_head:?}, \
+                 chain folded={}",
+                pending.lm_head_folded
+            );
+        }
+        let logits_bytes = match lm_head {
+            Qwen36LmHeadSelection::DenseFolded => self
+                .logits
+                .to_host_bytes()
+                .context("download Qwen3.6 folded serving logits")?,
+            Qwen36LmHeadSelection::SparseStandalone => {
+                let execution = Qwen36ExecutionOptions::default();
+                launch_lm_head_from_final_hidden_bytes(
+                    self.device_ordinal,
+                    &self.geom,
+                    &pending.outputs.final_hidden_bytes,
+                    &execution.prefill_kernel,
+                    LmHeadBuffers {
+                        final_norm_w: &self.final_norm_w,
+                        lm_head_w: &self.lm_head_w,
+                        final_hidden: &mut self.final_hidden,
+                        logits: &mut self.logits,
+                        counter: &mut self.counter,
+                    },
+                )
+                .context("run Qwen3.6 serving LM head")?
+            }
+        };
+        Ok(bf16_bytes_to_f32(&logits_bytes))
     }
 }
 
@@ -1551,6 +1806,13 @@ fn load_resident_gpu_parts(
         &[geom.hidden as usize],
     )
     .context("allocate Qwen3.6 final hidden")?;
+    let prefill_workspace = Qwen36PrefillWorkspace::allocate_for_engine(
+        config.device_ordinal,
+        geom,
+        &layers,
+        config.max_context_len,
+    )
+    .context("allocate Qwen3.6 engine prefill workspace")?;
 
     Ok(ResidentGpuParts {
         layers,
@@ -1560,6 +1822,7 @@ fn load_resident_gpu_parts(
         logits,
         counter,
         final_hidden,
+        prefill_workspace,
     })
 }
 
@@ -2026,6 +2289,7 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
 
+    use anyhow::Result;
     use gpu_hal::{
         Backend, GpuBuffer, HalProfileEntry, HalProfileSnapshot, ScalarType, VirtualBacking,
         VirtualBuffer,
@@ -2035,17 +2299,389 @@ mod tests {
     use qwen36_moe::config::{Activation, RopeParameters, TextConfig};
 
     use super::{
-        build_load_evidence, reset_full_attention_cache, reset_phase, run_reset_transaction,
-        validate_35b_a3b_config, validate_descriptor_pointer_ownership, validate_load_contract,
-        zero_gpu_buffer, zero_mapped_virtual_buffer, LoadEvidenceInput, Qwen36MoeDirectProfile,
-        Qwen36MoeEngine, Qwen36MoeLoadConfig, Qwen36MoeRouteState, Qwen36SessionPosition,
+        build_load_evidence, reset_full_attention_cache, reset_phase, run_decode_orchestration,
+        run_prefill_orchestration, run_reset_transaction, validate_35b_a3b_config,
+        validate_descriptor_pointer_ownership, validate_load_contract, zero_gpu_buffer,
+        zero_mapped_virtual_buffer, LoadEvidenceInput, Qwen36LmHeadSelection,
+        Qwen36MoeDirectProfile, Qwen36MoeEngine, Qwen36MoeLoadConfig, Qwen36MoeRouteState,
+        Qwen36ServingBackend, Qwen36ServingEvent, Qwen36ServingObserver, Qwen36SessionPosition,
     };
     use crate::qwen36_moe::load_policy::Qwen36MoeLoadPolicy;
     use crate::qwen36_moe::source::{Qwen36MoeSource, Qwen36MoeSourceOpenObserver};
-    use crate::qwen36_moe::types::{ExpertRoute, FullAttnKvCache};
+    use crate::qwen36_moe::types::{ExpertRoute, FullAttnKvCache, PositionPair};
     use crate::qwen36_moe_config::{Qwen36KvVmmMode, Qwen36MoeRuntimeConfig};
 
     const MODEL_MAX_CONTEXT: usize = 262_144;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum RecordedServingEvent {
+        Prefix {
+            tokens: Vec<u32>,
+            positions: Vec<crate::qwen36_moe::types::PositionPair>,
+        },
+        ProductionToken {
+            token_id: u32,
+            absolute_pos: usize,
+        },
+        LmHead(Qwen36LmHeadSelection),
+        OutputCompleted,
+        PositionCommitted(usize),
+    }
+
+    #[derive(Default)]
+    struct RecordingServingObserver {
+        events: Vec<RecordedServingEvent>,
+    }
+
+    impl Qwen36ServingObserver for RecordingServingObserver {
+        fn observe(&mut self, event: Qwen36ServingEvent<'_>) {
+            self.events.push(match event {
+                Qwen36ServingEvent::Prefix { tokens, positions } => RecordedServingEvent::Prefix {
+                    tokens: tokens.to_vec(),
+                    positions: positions.to_vec(),
+                },
+                Qwen36ServingEvent::ProductionToken {
+                    token_id,
+                    absolute_pos,
+                } => RecordedServingEvent::ProductionToken {
+                    token_id,
+                    absolute_pos,
+                },
+                Qwen36ServingEvent::LmHead(selection) => RecordedServingEvent::LmHead(selection),
+                Qwen36ServingEvent::OutputCompleted => RecordedServingEvent::OutputCompleted,
+                Qwen36ServingEvent::PositionCommitted { next_position } => {
+                    RecordedServingEvent::PositionCommitted(next_position)
+                }
+            });
+        }
+    }
+
+    #[derive(Default)]
+    struct InjectedServingBackend {
+        prefix_calls: Vec<(Vec<u32>, Vec<PositionPair>)>,
+        production_calls: Vec<(u32, usize, Qwen36LmHeadSelection)>,
+        fail_final_token: bool,
+        fail_output: bool,
+    }
+
+    impl Qwen36ServingBackend for InjectedServingBackend {
+        type PendingOutput = (u32, usize);
+
+        fn run_prefix(&mut self, tokens: &[u32], positions: &[PositionPair]) -> Result<()> {
+            self.prefix_calls
+                .push((tokens.to_vec(), positions.to_vec()));
+            Ok(())
+        }
+
+        fn run_production_token(
+            &mut self,
+            token_id: u32,
+            absolute_pos: usize,
+            lm_head: Qwen36LmHeadSelection,
+        ) -> Result<Self::PendingOutput> {
+            self.production_calls
+                .push((token_id, absolute_pos, lm_head));
+            if self.fail_final_token {
+                anyhow::bail!("injected final-token failure");
+            }
+            Ok((token_id, absolute_pos))
+        }
+
+        fn complete_output(
+            &mut self,
+            pending: Self::PendingOutput,
+            _lm_head: Qwen36LmHeadSelection,
+        ) -> Result<Vec<f32>> {
+            if self.fail_output {
+                anyhow::bail!("injected output failure");
+            }
+            Ok(vec![pending.0 as f32, pending.1 as f32])
+        }
+    }
+
+    fn run_injected_prefill(
+        session: &mut Qwen36SessionPosition,
+        backend: &mut InjectedServingBackend,
+        observer: &mut RecordingServingObserver,
+        prompt: &[u32],
+        lm_head: Qwen36LmHeadSelection,
+    ) -> Result<Vec<f32>> {
+        run_prefill_orchestration(session, prompt, 16, 32, lm_head, backend, observer)
+    }
+
+    fn run_injected_decode(
+        session: &mut Qwen36SessionPosition,
+        backend: &mut InjectedServingBackend,
+        observer: &mut RecordingServingObserver,
+        token_id: u32,
+        absolute_pos: usize,
+        lm_head: Qwen36LmHeadSelection,
+    ) -> Result<Vec<f32>> {
+        run_decode_orchestration(
+            session,
+            token_id,
+            absolute_pos,
+            16,
+            32,
+            lm_head,
+            backend,
+            observer,
+        )
+    }
+
+    #[test]
+    fn prefill_prevalidates_every_token_before_execution_starts() {
+        let mut session = Qwen36SessionPosition::default();
+        let mut backend = InjectedServingBackend::default();
+        let mut observer = RecordingServingObserver::default();
+
+        let err = run_injected_prefill(
+            &mut session,
+            &mut backend,
+            &mut observer,
+            &[1, 2, 32],
+            Qwen36LmHeadSelection::DenseFolded,
+        )
+        .expect_err("out-of-vocabulary final token must fail before prefix execution");
+
+        assert!(err.to_string().contains("token 32"), "{err:#}");
+        assert!(err.to_string().contains("vocabulary 32"), "{err:#}");
+        assert!(backend.prefix_calls.is_empty());
+        assert!(backend.production_calls.is_empty());
+        assert!(observer.events.is_empty());
+        run_injected_prefill(
+            &mut session,
+            &mut backend,
+            &mut observer,
+            &[1, 2, 3],
+            Qwen36LmHeadSelection::DenseFolded,
+        )
+        .expect("prevalidation failure must not require reset");
+    }
+
+    #[test]
+    fn failed_prefill_final_token_requires_public_reset_before_retry() {
+        let mut session = Qwen36SessionPosition::default();
+        let mut backend = InjectedServingBackend {
+            fail_final_token: true,
+            ..InjectedServingBackend::default()
+        };
+        let mut observer = RecordingServingObserver::default();
+
+        let err = run_injected_prefill(
+            &mut session,
+            &mut backend,
+            &mut observer,
+            &[4, 5],
+            Qwen36LmHeadSelection::DenseFolded,
+        )
+        .expect_err("injected final-token failure");
+        assert!(err.to_string().contains("final-token"), "{err:#}");
+        assert_eq!(backend.prefix_calls.len(), 1);
+        assert_eq!(backend.production_calls.len(), 1);
+
+        backend.fail_final_token = false;
+        let retry = run_injected_prefill(
+            &mut session,
+            &mut backend,
+            &mut observer,
+            &[4, 5],
+            Qwen36LmHeadSelection::DenseFolded,
+        )
+        .expect_err("retry after mutation must require reset");
+        assert!(retry.to_string().contains("requires reset"), "{retry:#}");
+        assert_eq!(backend.prefix_calls.len(), 1);
+        assert_eq!(backend.production_calls.len(), 1);
+        let decode_retry = run_injected_decode(
+            &mut session,
+            &mut backend,
+            &mut observer,
+            6,
+            2,
+            Qwen36LmHeadSelection::DenseFolded,
+        )
+        .expect_err("decode after failed prefill must require reset");
+        assert!(
+            decode_retry.to_string().contains("requires reset"),
+            "{decode_retry:#}"
+        );
+
+        session.reset();
+        run_injected_prefill(
+            &mut session,
+            &mut backend,
+            &mut observer,
+            &[4, 5],
+            Qwen36LmHeadSelection::DenseFolded,
+        )
+        .expect("public reset permits a new prefill");
+    }
+
+    #[test]
+    fn failed_prefill_output_requires_public_reset_before_retry() {
+        let mut session = Qwen36SessionPosition::default();
+        let mut backend = InjectedServingBackend {
+            fail_output: true,
+            ..InjectedServingBackend::default()
+        };
+        let mut observer = RecordingServingObserver::default();
+
+        run_injected_prefill(
+            &mut session,
+            &mut backend,
+            &mut observer,
+            &[6, 7],
+            Qwen36LmHeadSelection::SparseStandalone,
+        )
+        .expect_err("injected prefill output failure");
+        let calls_after_failure = backend.production_calls.len();
+        let retry = run_injected_prefill(
+            &mut session,
+            &mut backend,
+            &mut observer,
+            &[6, 7],
+            Qwen36LmHeadSelection::SparseStandalone,
+        )
+        .expect_err("prefill output failure must require reset");
+
+        assert!(retry.to_string().contains("requires reset"), "{retry:#}");
+        assert_eq!(backend.production_calls.len(), calls_after_failure);
+        assert!(!observer
+            .events
+            .contains(&RecordedServingEvent::OutputCompleted));
+        assert!(!observer
+            .events
+            .iter()
+            .any(|event| matches!(event, RecordedServingEvent::PositionCommitted(_))));
+    }
+
+    #[test]
+    fn failed_decode_output_requires_public_reset_before_retry() {
+        let mut session = Qwen36SessionPosition::default();
+        let mut backend = InjectedServingBackend::default();
+        let mut observer = RecordingServingObserver::default();
+        run_injected_prefill(
+            &mut session,
+            &mut backend,
+            &mut observer,
+            &[8, 9],
+            Qwen36LmHeadSelection::SparseStandalone,
+        )
+        .expect("seed active session");
+        backend.fail_output = true;
+
+        run_injected_decode(
+            &mut session,
+            &mut backend,
+            &mut observer,
+            10,
+            2,
+            Qwen36LmHeadSelection::SparseStandalone,
+        )
+        .expect_err("injected decode output failure");
+        let calls_after_failure = backend.production_calls.len();
+        let retry = run_injected_decode(
+            &mut session,
+            &mut backend,
+            &mut observer,
+            10,
+            2,
+            Qwen36LmHeadSelection::SparseStandalone,
+        )
+        .expect_err("decode output retry must require reset");
+
+        assert!(retry.to_string().contains("requires reset"), "{retry:#}");
+        assert_eq!(backend.production_calls.len(), calls_after_failure);
+        let prefill_retry = run_injected_prefill(
+            &mut session,
+            &mut backend,
+            &mut observer,
+            &[8, 9],
+            Qwen36LmHeadSelection::SparseStandalone,
+        )
+        .expect_err("prefill after failed decode must require reset");
+        assert!(
+            prefill_retry.to_string().contains("requires reset"),
+            "{prefill_retry:#}"
+        );
+        session.reset();
+        let after_reset = run_injected_decode(
+            &mut session,
+            &mut backend,
+            &mut observer,
+            10,
+            2,
+            Qwen36LmHeadSelection::SparseStandalone,
+        )
+        .expect_err("reset requires a new prefill before decode");
+        assert!(
+            after_reset.to_string().contains("before prefill"),
+            "{after_reset:#}"
+        );
+    }
+
+    #[test]
+    fn orchestration_records_exact_prompt_split_lm_head_output_and_commit_order() {
+        for lm_head in [
+            Qwen36LmHeadSelection::DenseFolded,
+            Qwen36LmHeadSelection::SparseStandalone,
+        ] {
+            let mut session = Qwen36SessionPosition::default();
+            let mut backend = InjectedServingBackend::default();
+            let mut observer = RecordingServingObserver::default();
+
+            let logits = run_injected_prefill(
+                &mut session,
+                &mut backend,
+                &mut observer,
+                &[7, 11, 13],
+                lm_head,
+            )
+            .expect("orchestrated prefill");
+
+            assert_eq!(logits, vec![13.0, 2.0]);
+            assert_eq!(
+                observer.events,
+                vec![
+                    RecordedServingEvent::Prefix {
+                        tokens: vec![7, 11],
+                        positions: vec![PositionPair::dense(0), PositionPair::dense(1)],
+                    },
+                    RecordedServingEvent::ProductionToken {
+                        token_id: 13,
+                        absolute_pos: 2,
+                    },
+                    RecordedServingEvent::LmHead(lm_head),
+                    RecordedServingEvent::OutputCompleted,
+                    RecordedServingEvent::PositionCommitted(3),
+                ]
+            );
+            assert_eq!(
+                backend.prefix_calls,
+                vec![(
+                    vec![7, 11],
+                    vec![PositionPair::dense(0), PositionPair::dense(1)]
+                )]
+            );
+            assert_eq!(backend.production_calls, vec![(13, 2, lm_head)]);
+
+            observer.events.clear();
+            run_injected_decode(&mut session, &mut backend, &mut observer, 17, 3, lm_head)
+                .expect("orchestrated decode");
+            assert_eq!(
+                observer.events,
+                vec![
+                    RecordedServingEvent::ProductionToken {
+                        token_id: 17,
+                        absolute_pos: 3,
+                    },
+                    RecordedServingEvent::LmHead(lm_head),
+                    RecordedServingEvent::OutputCompleted,
+                    RecordedServingEvent::PositionCommitted(4),
+                ]
+            );
+        }
+    }
 
     #[test]
     fn session_prefill_rejects_an_empty_prompt() {

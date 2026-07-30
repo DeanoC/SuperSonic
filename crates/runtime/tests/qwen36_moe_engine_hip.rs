@@ -19,15 +19,15 @@ fn greedy_token(logits: &[f32]) -> u32 {
 }
 
 #[test]
-fn load_and_reset_preserve_resident_model() -> anyhow::Result<()> {
+fn dense_load_reset_and_reuse_preserve_resident_model_without_serving_allocations(
+) -> anyhow::Result<()> {
     let flm_path = PathBuf::from(
         std::env::var_os("SUPERSONIC_QWEN36_35B_A3B_NO_HF_FLM")
             .expect("SUPERSONIC_QWEN36_35B_A3B_NO_HF_FLM must name the production FLM"),
     );
     let moe = Qwen36MoeRuntimeConfig::from_inputs(
         &Qwen36MoeRuntimeConfigInputs {
-            vmm_mode: Some("1"),
-            island_cap_experts: Some("8"),
+            vmm_mode: Some("0"),
             ..Default::default()
         },
         false,
@@ -41,7 +41,7 @@ fn load_and_reset_preserve_resident_model() -> anyhow::Result<()> {
         max_context_len: 16_384,
         policy: Qwen36MoeLoadPolicy {
             persistent_decode: true,
-            kv_fp8: true,
+            kv_fp8: false,
             kv_vmm: Qwen36KvVmmMode::Force,
             moe,
             virtual_transfer_backend: VirtualArenaTransferBackend::PageableH2d,
@@ -93,7 +93,6 @@ fn load_and_reset_preserve_resident_model() -> anyhow::Result<()> {
         "linear-conv-state",
         "linear-recurrent-state",
         "kv-vmm",
-        "kv-scale",
         "kv-shadow",
         "persistent-scratch",
         "logits",
@@ -110,8 +109,8 @@ fn load_and_reset_preserve_resident_model() -> anyhow::Result<()> {
         );
     }
     assert!(dirty.route_history_entries > 0);
-    assert!(dirty.route_observations > 0);
-    assert!(dirty.transition_candidates > 0);
+    assert_eq!(dirty.route_observations, 0);
+    assert_eq!(dirty.transition_candidates, 0);
     assert!(dirty.next_position.is_some());
     assert_eq!(dirty.source_open_count, loaded.source_open_count);
     assert!(
@@ -165,9 +164,11 @@ fn load_and_reset_preserve_resident_model() -> anyhow::Result<()> {
         .get_ids()
         .to_vec();
     assert!(!prompt.is_empty());
-    let serving_load_sequence = engine.load_evidence().load_sequence;
+    let serving_load_sequence = Qwen36MoeEngine::test_only_observed_load_sequence();
     let serving_resident_pointers = after.resident_allocation_pointers.clone();
 
+    gpu_hal::hal_profile_set_enabled(true);
+    gpu_hal::hal_profile_reset();
     let first_prefill_logits = engine.prefill(&prompt)?;
     assert_eq!(first_prefill_logits.len(), 248_320);
     let mut generated_ids = vec![greedy_token(&first_prefill_logits)];
@@ -201,11 +202,27 @@ fn load_and_reset_preserve_resident_model() -> anyhow::Result<()> {
     }
 
     let reused = engine.test_only_reset_snapshot()?;
-    assert_eq!(engine.load_evidence().load_sequence, serving_load_sequence);
+    let serving_profile = gpu_hal::hal_profile_snapshot();
+    gpu_hal::hal_profile_set_enabled(false);
+
+    assert_eq!(
+        Qwen36MoeEngine::test_only_observed_load_sequence(),
+        serving_load_sequence
+    );
     assert_eq!(reused.source_open_count, evidence.source_open_count);
     assert_eq!(
         reused.resident_allocation_pointers,
         serving_resident_pointers
+    );
+    assert_eq!(serving_profile.alloc_calls, 0);
+    assert!(
+        serving_profile.entries.iter().all(|entry| {
+            !entry.op.starts_with("vmm_reserve")
+                && !entry.op.starts_with("vmm_map")
+                && !entry.op.starts_with("vmm_unmap")
+        }),
+        "{:?}",
+        serving_profile.entries
     );
     Ok(())
 }
