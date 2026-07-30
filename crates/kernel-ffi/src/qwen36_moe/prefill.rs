@@ -60,7 +60,7 @@ pub struct Qwen36MoeLaunchOptions {
     pub mps_bridge_cpu_transcode_lut: bool,
     pub mps_bridge_cpu_transcode_stream: bool,
     pub profile: bool,
-    pub route_profile: bool,
+    pub route_profile: Qwen36RouteProfileOptions,
     pub enable_ffn_expert_pack_cache: bool,
     pub disable_ffn_expert_pack_cache: bool,
     pub diagnostic_observer: Option<Arc<Qwen36MoeDiagnosticObserver>>,
@@ -10279,11 +10279,10 @@ fn ffn_step_stage1_5_metal_host(
     let active_experts: Vec<usize> = (0..active_groups)
         .map(|group| f32::to_bits(workspace[off_topk_idx + group]) as i32 as usize)
         .collect();
-    if options.map_or_else(qwen36_route_profile_enabled, |options| {
-        options.route_profile
-    }) {
-        qwen36_route_profile_record(&active_experts);
-    }
+    let route_profile = options
+        .map(|options| options.route_profile)
+        .unwrap_or_else(qwen36_route_profile_options_from_environment);
+    qwen36_route_profile_record_active_experts_with_options(&active_experts, &route_profile);
     if qwen36_ffn_expert_static_topn_partial_stage5_supported(params, weights, int4, options) {
         if let Some(()) = qwen36_try_static_topn_partial_packed_for_metal(
             output_ordinal,
@@ -12013,6 +12012,64 @@ pub fn lm_head_launch(
     x_normed_out_buf: Option<&mut GpuBuffer>,
     counter_buf: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    lm_head_launch_impl(
+        ordinal,
+        hidden,
+        vocab,
+        rms_norm_eps,
+        final_hidden_buf,
+        final_norm_w_buf,
+        lm_head_w_buf,
+        logits_buf,
+        x_normed_out_buf,
+        counter_buf,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn lm_head_launch_with_options(
+    ordinal: usize,
+    hidden: i32,
+    vocab: i32,
+    rms_norm_eps: f32,
+    final_hidden_buf: &GpuBuffer,
+    final_norm_w_buf: &GpuBuffer,
+    lm_head_w_buf: &GpuBuffer,
+    logits_buf: &mut GpuBuffer,
+    x_normed_out_buf: Option<&mut GpuBuffer>,
+    counter_buf: &mut GpuBuffer,
+    options: &crate::prefill_ffi::PrefillFfiLaunchOptions,
+) -> Result<(), GpuError> {
+    lm_head_launch_impl(
+        ordinal,
+        hidden,
+        vocab,
+        rms_norm_eps,
+        final_hidden_buf,
+        final_norm_w_buf,
+        lm_head_w_buf,
+        logits_buf,
+        x_normed_out_buf,
+        counter_buf,
+        Some(options),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lm_head_launch_impl(
+    ordinal: usize,
+    hidden: i32,
+    vocab: i32,
+    rms_norm_eps: f32,
+    final_hidden_buf: &GpuBuffer,
+    final_norm_w_buf: &GpuBuffer,
+    lm_head_w_buf: &GpuBuffer,
+    logits_buf: &mut GpuBuffer,
+    x_normed_out_buf: Option<&mut GpuBuffer>,
+    counter_buf: &mut GpuBuffer,
+    options: Option<&crate::prefill_ffi::PrefillFfiLaunchOptions>,
+) -> Result<(), GpuError> {
     if hidden <= 0 || vocab <= 0 {
         return Err(GpuError::InvalidArg(format!(
             "qwen36_moe::lm_head_launch: positive dims required, \
@@ -12032,6 +12089,7 @@ pub fn lm_head_launch(
             lm_head_w_buf,
             logits_buf,
             x_normed_out_buf,
+            options,
         );
     }
     let block_size: i32 = 256;
@@ -12119,6 +12177,64 @@ pub fn lm_head_batched_launch(
     logits_buf: &mut GpuBuffer,
     x_normed_out_buf: Option<&mut GpuBuffer>,
 ) -> Result<(), GpuError> {
+    lm_head_batched_launch_impl(
+        ordinal,
+        m,
+        hidden,
+        vocab,
+        rms_norm_eps,
+        final_hidden_buf,
+        final_norm_w_buf,
+        lm_head_w_buf,
+        logits_buf,
+        x_normed_out_buf,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn lm_head_batched_launch_with_options(
+    ordinal: usize,
+    m: i32,
+    hidden: i32,
+    vocab: i32,
+    rms_norm_eps: f32,
+    final_hidden_buf: &GpuBuffer,
+    final_norm_w_buf: &GpuBuffer,
+    lm_head_w_buf: &GpuBuffer,
+    logits_buf: &mut GpuBuffer,
+    x_normed_out_buf: Option<&mut GpuBuffer>,
+    options: &crate::prefill_ffi::PrefillFfiLaunchOptions,
+) -> Result<(), GpuError> {
+    lm_head_batched_launch_impl(
+        ordinal,
+        m,
+        hidden,
+        vocab,
+        rms_norm_eps,
+        final_hidden_buf,
+        final_norm_w_buf,
+        lm_head_w_buf,
+        logits_buf,
+        x_normed_out_buf,
+        Some(options),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lm_head_batched_launch_impl(
+    ordinal: usize,
+    m: i32,
+    hidden: i32,
+    vocab: i32,
+    rms_norm_eps: f32,
+    final_hidden_buf: &GpuBuffer,
+    final_norm_w_buf: &GpuBuffer,
+    lm_head_w_buf: &GpuBuffer,
+    logits_buf: &mut GpuBuffer,
+    x_normed_out_buf: Option<&mut GpuBuffer>,
+    options: Option<&crate::prefill_ffi::PrefillFfiLaunchOptions>,
+) -> Result<(), GpuError> {
     if hidden <= 0 || vocab <= 0 {
         return Err(GpuError::InvalidArg(format!(
             "qwen36_moe::lm_head_batched_launch: positive dims required, \
@@ -12143,6 +12259,7 @@ pub fn lm_head_batched_launch(
             lm_head_w_buf,
             logits_buf,
             x_normed_out_buf,
+            options,
         );
     }
     // M is bounded by min(16, LDS budget / row size). At hidden=2048 the
@@ -12233,6 +12350,7 @@ fn lm_head_launch_metal_bf16(
     lm_head_w_buf: &GpuBuffer,
     logits_buf: &mut GpuBuffer,
     x_normed_out_buf: Option<&mut GpuBuffer>,
+    options: Option<&crate::prefill_ffi::PrefillFfiLaunchOptions>,
 ) -> Result<(), GpuError> {
     let hidden = hidden as usize;
     let vocab = vocab as usize;
@@ -12243,27 +12361,56 @@ fn lm_head_launch_metal_bf16(
         owned_normed = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1, hidden])?;
         &mut owned_normed
     };
-    crate::prefill_ffi::rms_norm_rows(
-        ordinal,
-        ScalarType::BF16,
-        1,
-        hidden,
-        rms_norm_eps,
-        final_hidden_buf,
-        final_norm_w_buf,
-        normed,
-    )?;
-    crate::prefill_ffi::matmul_rhs_transposed(
-        ordinal,
-        ScalarType::BF16,
-        1,
-        1,
-        vocab,
-        hidden,
-        normed,
-        lm_head_w_buf,
-        logits_buf,
-    )
+    match options {
+        Some(options) => {
+            crate::prefill_ffi::rms_norm_rows_with_options(
+                ordinal,
+                ScalarType::BF16,
+                1,
+                hidden,
+                rms_norm_eps,
+                final_hidden_buf,
+                final_norm_w_buf,
+                normed,
+                options,
+            )?;
+            crate::prefill_ffi::matmul_rhs_transposed_with_options(
+                ordinal,
+                ScalarType::BF16,
+                1,
+                1,
+                vocab,
+                hidden,
+                normed,
+                lm_head_w_buf,
+                logits_buf,
+                options,
+            )
+        }
+        None => {
+            crate::prefill_ffi::rms_norm_rows(
+                ordinal,
+                ScalarType::BF16,
+                1,
+                hidden,
+                rms_norm_eps,
+                final_hidden_buf,
+                final_norm_w_buf,
+                normed,
+            )?;
+            crate::prefill_ffi::matmul_rhs_transposed(
+                ordinal,
+                ScalarType::BF16,
+                1,
+                1,
+                vocab,
+                hidden,
+                normed,
+                lm_head_w_buf,
+                logits_buf,
+            )
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -12278,6 +12425,7 @@ fn lm_head_batched_launch_metal_bf16(
     lm_head_w_buf: &GpuBuffer,
     logits_buf: &mut GpuBuffer,
     x_normed_out_buf: Option<&mut GpuBuffer>,
+    options: Option<&crate::prefill_ffi::PrefillFfiLaunchOptions>,
 ) -> Result<(), GpuError> {
     let m = m as usize;
     let hidden = hidden as usize;
@@ -12289,27 +12437,56 @@ fn lm_head_batched_launch_metal_bf16(
         owned_normed = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[m, hidden])?;
         &mut owned_normed
     };
-    crate::prefill_ffi::rms_norm_rows(
-        ordinal,
-        ScalarType::BF16,
-        m,
-        hidden,
-        rms_norm_eps,
-        final_hidden_buf,
-        final_norm_w_buf,
-        normed,
-    )?;
-    crate::prefill_ffi::matmul_rhs_transposed(
-        ordinal,
-        ScalarType::BF16,
-        1,
-        m,
-        vocab,
-        hidden,
-        normed,
-        lm_head_w_buf,
-        logits_buf,
-    )
+    match options {
+        Some(options) => {
+            crate::prefill_ffi::rms_norm_rows_with_options(
+                ordinal,
+                ScalarType::BF16,
+                m,
+                hidden,
+                rms_norm_eps,
+                final_hidden_buf,
+                final_norm_w_buf,
+                normed,
+                options,
+            )?;
+            crate::prefill_ffi::matmul_rhs_transposed_with_options(
+                ordinal,
+                ScalarType::BF16,
+                1,
+                m,
+                vocab,
+                hidden,
+                normed,
+                lm_head_w_buf,
+                logits_buf,
+                options,
+            )
+        }
+        None => {
+            crate::prefill_ffi::rms_norm_rows(
+                ordinal,
+                ScalarType::BF16,
+                m,
+                hidden,
+                rms_norm_eps,
+                final_hidden_buf,
+                final_norm_w_buf,
+                normed,
+            )?;
+            crate::prefill_ffi::matmul_rhs_transposed(
+                ordinal,
+                ScalarType::BF16,
+                1,
+                m,
+                vocab,
+                hidden,
+                normed,
+                lm_head_w_buf,
+                logits_buf,
+            )
+        }
+    }
 }
 
 /// Safe wrapper for the GPU MTP pre-fusion kernel (Phase 6.2c.1).
@@ -12627,6 +12804,99 @@ pub unsafe fn batched_prefill_grouped_expert_direct_metal_launch_raw(
     expert_mid: &mut GpuBuffer,
     combined: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    unsafe {
+        batched_prefill_grouped_expert_direct_metal_launch_raw_impl(
+            ordinal,
+            n_tokens,
+            top_k,
+            hidden,
+            moe_intermediate,
+            group_size,
+            x_norm,
+            topk_idx,
+            topk_weight,
+            gate_up_proj,
+            gate_up_scale,
+            gate_up_zero,
+            down_proj,
+            down_scale,
+            down_zero,
+            expert_mid,
+            combined,
+            None,
+        )
+    }
+}
+
+/// Options-aware variant used by runtime serving paths.
+///
+/// SAFETY: raw weight pointers must refer to live Metal buffers on `ordinal`.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn batched_prefill_grouped_expert_direct_metal_launch_raw_with_options(
+    ordinal: usize,
+    n_tokens: usize,
+    top_k: usize,
+    hidden: usize,
+    moe_intermediate: usize,
+    group_size: usize,
+    x_norm: &GpuBuffer,
+    topk_idx: &GpuBuffer,
+    topk_weight: &GpuBuffer,
+    gate_up_proj: *const c_void,
+    gate_up_scale: *const c_void,
+    gate_up_zero: *const c_void,
+    down_proj: *const c_void,
+    down_scale: *const c_void,
+    down_zero: *const c_void,
+    expert_mid: &mut GpuBuffer,
+    combined: &mut GpuBuffer,
+    options: &crate::prefill_ffi::PrefillFfiLaunchOptions,
+) -> Result<(), GpuError> {
+    unsafe {
+        batched_prefill_grouped_expert_direct_metal_launch_raw_impl(
+            ordinal,
+            n_tokens,
+            top_k,
+            hidden,
+            moe_intermediate,
+            group_size,
+            x_norm,
+            topk_idx,
+            topk_weight,
+            gate_up_proj,
+            gate_up_scale,
+            gate_up_zero,
+            down_proj,
+            down_scale,
+            down_zero,
+            expert_mid,
+            combined,
+            Some(options),
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn batched_prefill_grouped_expert_direct_metal_launch_raw_impl(
+    ordinal: usize,
+    n_tokens: usize,
+    top_k: usize,
+    hidden: usize,
+    moe_intermediate: usize,
+    group_size: usize,
+    x_norm: &GpuBuffer,
+    topk_idx: &GpuBuffer,
+    topk_weight: &GpuBuffer,
+    gate_up_proj: *const c_void,
+    gate_up_scale: *const c_void,
+    gate_up_zero: *const c_void,
+    down_proj: *const c_void,
+    down_scale: *const c_void,
+    down_zero: *const c_void,
+    expert_mid: &mut GpuBuffer,
+    combined: &mut GpuBuffer,
+    options: Option<&crate::prefill_ffi::PrefillFfiLaunchOptions>,
+) -> Result<(), GpuError> {
     let backend = x_norm.backend();
     if backend != Backend::Metal {
         return Err(GpuError::backend(
@@ -12710,30 +12980,46 @@ pub unsafe fn batched_prefill_grouped_expert_direct_metal_launch_raw(
         )));
     }
     let _ = ordinal;
-    crate::prefill_ffi::metal_profile_time(
+    let launch = || unsafe {
+        crate::metal_native::qwen36_batched_prefill_grouped_expert_direct(
+            n_tokens,
+            top_k,
+            hidden,
+            moe_intermediate,
+            group_size,
+            x_norm.as_ptr(),
+            topk_idx.as_ptr(),
+            topk_weight.as_ptr(),
+            gate_up_proj,
+            gate_up_scale,
+            gate_up_zero,
+            down_proj,
+            down_scale,
+            down_zero,
+            expert_mid.as_mut_ptr(),
+            combined.as_mut_ptr(),
+            true,
+        )
+    };
+    match options {
+        Some(options) => batched_prefill_grouped_expert_profile_with_options(options, launch),
+        None => crate::prefill_ffi::metal_profile_time(
+            "qwen36_batched_prefill_grouped_expert_direct",
+            "native",
+            launch,
+        ),
+    }
+}
+
+fn batched_prefill_grouped_expert_profile_with_options<T>(
+    options: &crate::prefill_ffi::PrefillFfiLaunchOptions,
+    launch: impl FnOnce() -> T,
+) -> T {
+    crate::prefill_ffi::metal_profile_time_explicit(
+        options.metal_profile,
         "qwen36_batched_prefill_grouped_expert_direct",
         "native",
-        || unsafe {
-            crate::metal_native::qwen36_batched_prefill_grouped_expert_direct(
-                n_tokens,
-                top_k,
-                hidden,
-                moe_intermediate,
-                group_size,
-                x_norm.as_ptr(),
-                topk_idx.as_ptr(),
-                topk_weight.as_ptr(),
-                gate_up_proj,
-                gate_up_scale,
-                gate_up_zero,
-                down_proj,
-                down_scale,
-                down_zero,
-                expert_mid.as_mut_ptr(),
-                combined.as_mut_ptr(),
-                true,
-            )
-        },
+        launch,
     )
 }
 
@@ -13142,6 +13428,66 @@ pub fn batched_prefill_unpermute_combine_launch(
 mod tests {
     use super::*;
     use std::mem::size_of;
+    use std::sync::Mutex;
+
+    static PROFILE_POLICY_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn lm_head_has_explicit_options_aware_single_and_batched_entry_points() {
+        let _ = lm_head_launch_with_options;
+        let _ = lm_head_batched_launch_with_options;
+    }
+
+    #[test]
+    fn route_recording_uses_explicit_enable_and_limit_policy() {
+        let _lock = PROFILE_POLICY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::prefill_ffi::metal_profile_set_enabled(false);
+        qwen36_route_profile_reset();
+        let enabled = Qwen36RouteProfileOptions {
+            enabled: true,
+            max_calls: 1,
+        };
+        qwen36_route_profile_record_active_experts_with_options(&[2, 3], &enabled);
+        qwen36_route_profile_record_active_experts_with_options(&[4, 5], &enabled);
+        let snapshot = qwen36_route_profile_snapshot();
+        assert_eq!(snapshot.calls, 1);
+        assert_eq!(snapshot.dropped_calls, 1);
+        assert_eq!(snapshot.route_calls[0].experts, vec![2, 3]);
+
+        qwen36_route_profile_reset();
+        crate::prefill_ffi::metal_profile_set_enabled(true);
+        let disabled = Qwen36RouteProfileOptions {
+            enabled: false,
+            max_calls: 1,
+        };
+        qwen36_route_profile_record_active_experts_with_options(&[6, 7], &disabled);
+        assert_eq!(qwen36_route_profile_snapshot().calls, 0);
+        crate::prefill_ffi::metal_profile_set_enabled(false);
+    }
+
+    #[test]
+    fn grouped_expert_profile_uses_explicit_policy_not_global_state() {
+        let _lock = PROFILE_POLICY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::prefill_ffi::metal_profile_reset();
+        crate::prefill_ffi::metal_profile_set_enabled(false);
+        let explicit_on = crate::prefill_ffi::PrefillFfiLaunchOptions {
+            metal_profile: true,
+            ..crate::prefill_ffi::PrefillFfiLaunchOptions::default()
+        };
+        batched_prefill_grouped_expert_profile_with_options(&explicit_on, || ());
+        assert_eq!(crate::prefill_ffi::metal_profile_snapshot().total_calls, 1);
+
+        crate::prefill_ffi::metal_profile_reset();
+        crate::prefill_ffi::metal_profile_set_enabled(true);
+        let explicit_off = crate::prefill_ffi::PrefillFfiLaunchOptions::default();
+        batched_prefill_grouped_expert_profile_with_options(&explicit_off, || ());
+        assert_eq!(crate::prefill_ffi::metal_profile_snapshot().total_calls, 0);
+        crate::prefill_ffi::metal_profile_set_enabled(false);
+    }
 
     #[test]
     fn descriptor_layout_offsets_documented() {

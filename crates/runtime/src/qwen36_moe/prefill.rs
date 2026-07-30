@@ -106,12 +106,13 @@ fn pick_chunk_size(remaining: usize) -> usize {
 const QUANT_TYPE_NATIVE_INT4: i32 = 4;
 
 /// Aggregated timings for the batched-prefill orchestrator pass.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct BatchedPrefillTimings {
     pub embed_total: Duration,
     pub chain_total: Duration,
     pub chunks: usize,
     pub tokens: usize,
+    pub boundary_hidden: Vec<(usize, Vec<u8>)>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -415,6 +416,12 @@ pub fn run_batched_prefill(
     let sparse_residency_active = loaded_layers.has_sparse_expert_residency();
     let supports_batched = batched_attn_enabled
         && supports_batched_path(loaded_layers.layers(), sparse_residency_active)?;
+    if !supports_batched
+        && execution.diagnostics.capture_prefill_boundary_hidden
+        && token_callback.is_some()
+    {
+        anyhow::bail!("Qwen3.6 prefill boundary hidden capture requires the runtime token path");
+    }
     validate_prefill_position_plan(
         positions,
         supports_batched,
@@ -738,6 +745,19 @@ fn process_chunk_batched(
     timings.chain_total += t_chain_elapsed;
 
     timings.tokens += n;
+    if execution.diagnostics.capture_prefill_boundary_hidden {
+        let mut hidden_bytes = vec![0u8; hidden * 2];
+        copy_d2h(
+            ordinal,
+            hidden_bytes.as_mut_ptr() as *mut c_void,
+            chunk_hidden.offset_ptr((n - 1) * hidden * 2),
+            hidden_bytes.len(),
+        )
+        .context("d2h batched prefill boundary hidden")?;
+        timings
+            .boundary_hidden
+            .push((chunk_start + n, hidden_bytes));
+    }
 
     Ok(())
 }
@@ -819,9 +839,10 @@ fn run_pertoken_chunked(
         let remaining = prefill_count - step;
         let chunk_end = step + pick_chunk_size(remaining).min(remaining);
         timings.chunks += 1;
+        let mut chunk_boundary_hidden = None;
 
         while step < chunk_end {
-            let token_timings = run_prefill_token(
+            let (token_timings, final_hidden_bytes) = run_prefill_token(
                 ordinal,
                 geom,
                 store,
@@ -837,7 +858,14 @@ fn run_pertoken_chunked(
             timings.embed_total += token_timings.embed;
             timings.chain_total += token_timings.chain;
             timings.tokens += 1;
+            chunk_boundary_hidden = final_hidden_bytes;
             step += 1;
+        }
+        if execution.diagnostics.capture_prefill_boundary_hidden {
+            let hidden_bytes = chunk_boundary_hidden.ok_or_else(|| {
+                anyhow!("Qwen3.6 prefill boundary hidden capture requires the runtime token path")
+            })?;
+            timings.boundary_hidden.push((step, hidden_bytes));
         }
         if let Some(callback) = progress_callback.as_deref_mut() {
             callback(&timings, prefill_count, step, prefill_start.elapsed());
@@ -859,9 +887,9 @@ fn run_prefill_token(
     accurate_stage_timings: bool,
     execution: &Qwen36ExecutionOptions,
     token_callback: Option<&mut PrefillTokenCallback<'_>>,
-) -> Result<PrefillTokenTimings> {
+) -> Result<(PrefillTokenTimings, Option<Vec<u8>>)> {
     if let Some(callback) = token_callback {
-        return callback(loaded_layers, step, token, position);
+        return callback(loaded_layers, step, token, position).map(|timings| (timings, None));
     }
 
     let embed_start = Instant::now();
@@ -870,7 +898,7 @@ fn run_prefill_token(
             .with_context(|| format!("embed lookup token {token} (batched prefill step {step})"))?;
     let embed = embed_start.elapsed();
     let chain_start = Instant::now();
-    run_chain_step(Qwen36ChainStep {
+    let output = run_chain_step(Qwen36ChainStep {
         ordinal,
         geom,
         loaded_layers,
@@ -883,10 +911,13 @@ fn run_prefill_token(
         download_final_hidden: true,
         expert_prefetch: None,
     })?;
-    Ok(PrefillTokenTimings {
-        embed,
-        chain: chain_start.elapsed(),
-    })
+    Ok((
+        PrefillTokenTimings {
+            embed,
+            chain: chain_start.elapsed(),
+        },
+        Some(output.outputs.final_hidden_bytes),
+    ))
 }
 
 fn lookup_embed_row(
@@ -1988,7 +2019,7 @@ fn process_ffn_batched_grouped(
     //    num_experts=256 this is 64*256*2 = 32 KiB D2H + 64*8*4 + 64*8*2 =
     //    ~2 KiB H2D per layer per chunk — negligible vs the matmul cost.
     //    (TODO: GPU softmax/top-K fusion as a future M12+ perf opportunity.)
-    let explicit_route_profile = execution.diagnostics.route_profile;
+    let explicit_route_profile = execution.diagnostics.route_profile.enabled;
     let use_metal_router_topk = scratch.router_logits_bf16.backend() == Backend::Metal
         && !execution.metal.force_host_native
         && !explicit_route_profile
@@ -2067,6 +2098,18 @@ fn process_ffn_batched_grouped(
                     probs[best_idx as usize] = f32::NEG_INFINITY;
                 }
             }
+            let selected = &topk_idx_host[token * top_k..(token + 1) * top_k];
+            if selected.iter().any(|&expert| expert < 0)
+                || selected.iter().any(|&expert| expert >= num_experts as i32)
+                || selected
+                    .iter()
+                    .enumerate()
+                    .any(|(rank, expert)| selected[..rank].contains(expert))
+            {
+                return Err(anyhow!(
+                    "router produced invalid top-k at token {token}: {selected:?}"
+                ));
+            }
             // Renormalise the top-K weights.
             let sum_k: f32 = (0..top_k)
                 .map(|k| bf16_bits_to_f32(topk_weight_host[token * top_k + k]))
@@ -2080,7 +2123,10 @@ fn process_ffn_batched_grouped(
             let active_experts: Vec<usize> = (0..top_k)
                 .map(|k| topk_idx_host[token * top_k + k].max(0) as usize)
                 .collect();
-            kernel_ffi::qwen36_moe::qwen36_route_profile_record_active_experts(&active_experts);
+            kernel_ffi::qwen36_moe::qwen36_route_profile_record_active_experts_with_options(
+                &active_experts,
+                &execution.diagnostics.route_profile,
+            );
         }
         copy_h2d(
             ordinal,
@@ -2104,7 +2150,7 @@ fn process_ffn_batched_grouped(
         // routed-expert compute. This is correctness-first and opt-in through
         // the outer Metal batched-prefill prototype gate.
         unsafe {
-            kernel_ffi::qwen36_moe::batched_prefill_grouped_expert_direct_metal_launch_raw(
+            kernel_ffi::qwen36_moe::batched_prefill_grouped_expert_direct_metal_launch_raw_with_options(
                 ordinal,
                 n,
                 top_k,
@@ -2122,6 +2168,7 @@ fn process_ffn_batched_grouped(
                 int4.down_proj_zero.as_ptr(),
                 &mut scratch.expert_mid,
                 &mut scratch.combined,
+                &execution.prefill_kernel,
             )
         }
         .map_err(|e| anyhow!("Metal direct grouped expert: {e}"))?;
@@ -2174,7 +2221,12 @@ fn process_ffn_batched_grouped(
             let logical = token as usize * top_k + kpos as usize;
             if inverse[logical] != -1 {
                 return Err(anyhow!(
-                    "M9 permutation collision at logical entry token={token} kpos={kpos}"
+                    "M9 permutation collision at logical entry token={token} kpos={kpos} \
+                     at dst={dst}, previously at dst={}; \
+                     first destinations={:?}/{:?}",
+                    inverse[logical],
+                    &perm_tok[..perm_tok.len().min(16)],
+                    &perm_kpos[..perm_kpos.len().min(16)],
                 ));
             }
             inverse[logical] = dst as i32;
@@ -2766,5 +2818,37 @@ mod orchestration_tests {
         assert_eq!(timings.tokens, 1025);
         assert_eq!(progress_calls, 3);
         assert_eq!(token_calls, 1025);
+    }
+
+    #[test]
+    fn boundary_capture_rejects_external_fallback_before_callback_dispatch() {
+        let tmp = TestDir::new();
+        let store = BakedStore::open(tmp.path()).expect("open synthetic store");
+        let mut loaded = LoadedQwen36Layers::dense(Vec::new(), Qwen36WeightMode::Bf16);
+        let mut execution = Qwen36ExecutionOptions::default();
+        execution.diagnostics.capture_prefill_boundary_hidden = true;
+        let mut callback_calls = 0usize;
+        let mut callback = |_loaded: &mut LoadedQwen36Layers, _, _, _| {
+            callback_calls += 1;
+            Ok(PrefillTokenTimings::default())
+        };
+
+        let err = run_batched_prefill(
+            0,
+            &empty_geom(),
+            &store,
+            "model.language_model",
+            &mut loaded,
+            &[0],
+            &[PositionPair::dense(0)],
+            false,
+            &execution,
+            Some(&mut callback),
+            None,
+        )
+        .expect_err("external fallback cannot provide boundary hidden");
+
+        assert!(err.to_string().contains("boundary hidden capture"));
+        assert_eq!(callback_calls, 0, "callback ran before preflight rejection");
     }
 }

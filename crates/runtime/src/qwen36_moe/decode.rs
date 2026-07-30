@@ -138,7 +138,8 @@ pub struct Qwen36DiagnosticOptions {
     pub routed_stage5_parity_tap_max_calls: Option<usize>,
     pub routed_stage5_parity_tap_position: Option<i32>,
     pub routed_stage5_parity_tap_layer: Option<usize>,
-    pub route_profile: bool,
+    pub route_profile: kernel_ffi::qwen36_moe::Qwen36RouteProfileOptions,
+    pub capture_prefill_boundary_hidden: bool,
     pub ffn_stage_profile: bool,
     pub linear_stage_profile: bool,
 }

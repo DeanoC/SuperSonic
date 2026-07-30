@@ -1457,6 +1457,8 @@ mod direct_load_tests {
             max_position_embeddings: 1024,
             full_attention_interval: 2,
             layer_types: vec!["full_attention".to_string(), "linear_attention".to_string()],
+            num_experts: 4,
+            num_experts_per_tok: 2,
             ..text_config()
         }
     }
@@ -1464,6 +1466,8 @@ mod direct_load_tests {
     fn orchestration_geom() -> MultiLayerGeom {
         MultiLayerGeom {
             num_layers: 2,
+            num_experts: 4,
+            top_k: 2,
             ..geom()
         }
     }
@@ -1518,11 +1522,13 @@ mod direct_load_tests {
         tensors: &mut Vec<TensorMeta>,
         name: String,
         shape: &[usize],
-        packed_nibble: u8,
+        packed_seed: u8,
         scale: f32,
+        varied: bool,
     ) {
         let mut packed_shape = shape.to_vec();
         *packed_shape.last_mut().expect("INT4 projection rank") /= 2;
+        let packed_len = packed_shape.iter().product();
         push_test_tensor(
             weights,
             tensors,
@@ -1530,7 +1536,21 @@ mod direct_load_tests {
             &packed_shape,
             "u8",
             LayoutTag::Int4Quantized,
-            vec![(packed_nibble << 4) | packed_nibble; packed_shape.iter().product()],
+            (0..packed_len)
+                .map(|idx| {
+                    let low = if varied {
+                        1 + (packed_seed as usize + idx * 3) % 6
+                    } else {
+                        packed_seed as usize
+                    };
+                    let high = if varied {
+                        1 + (packed_seed as usize + idx * 5 + 2) % 6
+                    } else {
+                        packed_seed as usize
+                    };
+                    ((high as u8) << 4) | low as u8
+                })
+                .collect(),
         );
         let sidecar_shape = match shape {
             [rows, cols] => vec![rows.div_ceil(128), cols.div_ceil(128)],
@@ -1544,7 +1564,13 @@ mod direct_load_tests {
             tensors,
             format!("{name}_int4_scale"),
             &sidecar_shape,
-            |_| scale,
+            |idx| {
+                if varied {
+                    scale * (0.8 + 0.15 * (idx % 5) as f32)
+                } else {
+                    scale
+                }
+            },
         );
         push_test_bf16(
             weights,
@@ -1601,7 +1627,15 @@ mod direct_load_tests {
                     (format!("{attn}.v_proj.weight"), vec![128, 128], 3, 0.001),
                     (format!("{attn}.o_proj.weight"), vec![128, 128], 1, 0.001),
                 ] {
-                    push_test_int4(&mut weights, &mut tensors, name, &shape, nibble, scale);
+                    push_test_int4(
+                        &mut weights,
+                        &mut tensors,
+                        name,
+                        &shape,
+                        nibble,
+                        scale,
+                        false,
+                    );
                 }
             } else {
                 let attn = format!("{prefix}.linear_attn");
@@ -1615,7 +1649,15 @@ mod direct_load_tests {
                     (format!("{attn}.in_proj_z.weight"), vec![128, 128], 2, 0.001),
                     (format!("{attn}.out_proj.weight"), vec![128, 128], 1, 0.001),
                 ] {
-                    push_test_int4(&mut weights, &mut tensors, name, &shape, nibble, scale);
+                    push_test_int4(
+                        &mut weights,
+                        &mut tensors,
+                        name,
+                        &shape,
+                        nibble,
+                        scale,
+                        false,
+                    );
                 }
                 for (suffix, shape, value) in [
                     ("in_proj_a.weight", vec![1, 128], 0.002),
@@ -1647,8 +1689,12 @@ mod direct_load_tests {
                 &mut weights,
                 &mut tensors,
                 format!("{mlp}.gate.weight"),
-                &[1, 128],
-                |idx| if idx % 2 == 0 { 0.01 } else { -0.01 },
+                &[4, 128],
+                |idx| {
+                    let expert = idx / 128;
+                    let column = idx % 128;
+                    ((((expert + 1) * 11 + column * (expert + 3)) % 29) as f32 - 14.0) * 0.012
+                },
             );
             push_test_bf16(
                 &mut weights,
@@ -1660,36 +1706,44 @@ mod direct_load_tests {
             for (name, shape, nibble, scale) in [
                 (
                     format!("{mlp}.experts.gate_up_proj"),
-                    vec![1, 256, 128],
+                    vec![4, 256, 128],
                     1,
-                    0.001,
+                    0.0015,
                 ),
                 (
                     format!("{mlp}.experts.down_proj"),
-                    vec![1, 128, 128],
-                    1,
-                    0.001,
+                    vec![4, 128, 128],
+                    3,
+                    0.0012,
                 ),
                 (
                     format!("{mlp}.shared_expert.gate_proj.weight"),
                     vec![128, 128],
                     1,
-                    0.001,
+                    0.0013,
                 ),
                 (
                     format!("{mlp}.shared_expert.up_proj.weight"),
                     vec![128, 128],
                     2,
-                    0.001,
+                    0.0016,
                 ),
                 (
                     format!("{mlp}.shared_expert.down_proj.weight"),
                     vec![128, 128],
-                    1,
-                    0.001,
+                    4,
+                    0.0012,
                 ),
             ] {
-                push_test_int4(&mut weights, &mut tensors, name, &shape, nibble, scale);
+                push_test_int4(
+                    &mut weights,
+                    &mut tensors,
+                    name,
+                    &shape,
+                    nibble,
+                    scale,
+                    true,
+                );
             }
         }
         (weights, tensors)
@@ -2045,23 +2099,6 @@ mod direct_load_tests {
             .collect()
     }
 
-    fn cosine_similarity(lhs: &[f32], rhs: &[f32]) -> f64 {
-        assert_eq!(lhs.len(), rhs.len());
-        let mut dot = 0.0f64;
-        let mut lhs_norm = 0.0f64;
-        let mut rhs_norm = 0.0f64;
-        for (&lhs, &rhs) in lhs.iter().zip(rhs) {
-            dot += lhs as f64 * rhs as f64;
-            lhs_norm += (lhs as f64).powi(2);
-            rhs_norm += (rhs as f64).powi(2);
-        }
-        if lhs_norm == 0.0 && rhs_norm == 0.0 {
-            1.0
-        } else {
-            dot / (lhs_norm.sqrt() * rhs_norm.sqrt())
-        }
-    }
-
     fn orchestration_state(loaded: &LoadedQwen36Layers) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
         let mut kv = Vec::new();
         let mut conv = Vec::new();
@@ -2103,6 +2140,82 @@ mod direct_load_tests {
         (kv, conv, recurrent)
     }
 
+    fn orchestration_kv_row(
+        loaded: &LoadedQwen36Layers,
+        cache_slot: usize,
+    ) -> (Vec<f32>, Vec<f32>) {
+        let cache = loaded
+            .layers()
+            .iter()
+            .find_map(|layer| match &layer.attn {
+                AttnLayerBuffers::Full {
+                    kv_cache: Some(cache),
+                    ..
+                } => Some(cache),
+                _ => None,
+            })
+            .expect("full-attention cache");
+        let row_elems = 128;
+        let row_bytes = row_elems * 2;
+        let start = cache_slot * row_bytes;
+        let end = start + row_bytes;
+        let k = cache
+            .k
+            .as_ref()
+            .expect("dense K cache")
+            .to_host_bytes()
+            .unwrap();
+        let v = cache
+            .v
+            .as_ref()
+            .expect("dense V cache")
+            .to_host_bytes()
+            .unwrap();
+        (bf16_values(&k[start..end]), bf16_values(&v[start..end]))
+    }
+
+    fn assert_finite_nonzero(label: &str, values: &[f32]) {
+        assert!(
+            values.iter().all(|value| value.is_finite()),
+            "{label} contains non-finite values"
+        );
+        let max_abs = values
+            .iter()
+            .map(|value| value.abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_abs > 1e-7, "{label} is unexpectedly all zero");
+    }
+
+    fn assert_abs_rel_close(
+        label: &str,
+        actual: &[f32],
+        expected: &[f32],
+        max_abs_limit: f32,
+        rel_l2_limit: f64,
+    ) {
+        assert_eq!(actual.len(), expected.len(), "{label} length");
+        assert_finite_nonzero(&format!("{label} actual"), actual);
+        assert_finite_nonzero(&format!("{label} expected"), expected);
+        let mut diff_sq = 0.0f64;
+        let mut expected_sq = 0.0f64;
+        let mut max_abs = 0.0f32;
+        let mut expected_max_abs = 0.0f32;
+        for (&actual, &expected) in actual.iter().zip(expected) {
+            let diff = (actual - expected).abs();
+            max_abs = max_abs.max(diff);
+            expected_max_abs = expected_max_abs.max(expected.abs());
+            diff_sq += (diff as f64).powi(2);
+            expected_sq += (expected as f64).powi(2);
+        }
+        let rel_l2 = diff_sq.sqrt() / expected_sq.sqrt().max(1e-12);
+        let allowed_max_abs = max_abs_limit + rel_l2_limit as f32 * expected_max_abs;
+        assert!(
+            max_abs <= allowed_max_abs && rel_l2 <= rel_l2_limit,
+            "{label} mismatch: max_abs={max_abs:.8} (combined limit {allowed_max_abs:.8}), \
+             rel_l2={rel_l2:.8} (limit {rel_l2_limit})"
+        );
+    }
+
     fn orchestration_embedding_row(token: u32) -> Vec<u8> {
         test_bf16_bytes(128, |column| {
             (((token as usize * 17 + column * 3) % 31) as f32 - 15.0) * 0.002
@@ -2140,6 +2253,7 @@ mod direct_load_tests {
             .expect("load complete native-INT4 orchestration owner")
         };
         let mut optimized = load();
+        let mut ungrouped = load();
         let mut pertoken = load();
         assert_eq!(
             classify_layer_weight_encoding(optimized.layers()).unwrap(),
@@ -2155,21 +2269,29 @@ mod direct_load_tests {
         let mut optimized_options = Qwen36ExecutionOptions::default();
         optimized_options.batched_prefill.attention = true;
         optimized_options.batched_prefill.grouped_ffn = true;
+        optimized_options
+            .diagnostics
+            .capture_prefill_boundary_hidden = true;
+        optimized_options.diagnostics.route_profile =
+            kernel_ffi::qwen36_moe::Qwen36RouteProfileOptions {
+                enabled: true,
+                max_calls: 1_026,
+            };
+        kernel_ffi::qwen36_moe::qwen36_route_profile_reset();
         let mut optimized_token_calls = 0usize;
         let mut optimized_token_callback =
             |_loaded: &mut LoadedQwen36Layers, _step, _token, _position| {
                 optimized_token_calls += 1;
                 Ok(crate::qwen36_moe::prefill::PrefillTokenTimings::default())
             };
-        let mut optimized_progress = 0usize;
+        let mut optimized_completions = Vec::new();
         let mut optimized_progress_callback =
             |_timings: &crate::qwen36_moe::prefill::BatchedPrefillTimings,
              total,
              completed,
              _elapsed| {
-                optimized_progress += 1;
                 assert_eq!(total, 513);
-                assert!(completed == 512 || completed == 513);
+                optimized_completions.push(completed);
             };
         let optimized_timings = run_batched_prefill(
             0,
@@ -2188,10 +2310,73 @@ mod direct_load_tests {
         assert_eq!(optimized_timings.chunks, 2);
         assert_eq!(optimized_timings.tokens, 513);
         assert_eq!(optimized_token_calls, 0);
-        assert_eq!(optimized_progress, 2);
+        assert_eq!(optimized_completions, vec![512, 513]);
+        assert_eq!(
+            optimized_timings
+                .boundary_hidden
+                .iter()
+                .map(|(completed, _)| *completed)
+                .collect::<Vec<_>>(),
+            vec![512, 513]
+        );
+
+        let routes = kernel_ffi::qwen36_moe::qwen36_route_profile_snapshot();
+        assert_eq!(routes.calls, 1_026);
+        assert_eq!(routes.dropped_calls, 0);
+        assert!(routes.route_calls.iter().all(|call| {
+            call.experts.len() == 2
+                && call.experts[0] != call.experts[1]
+                && call.experts.iter().all(|&expert| expert < 4)
+        }));
+        let mut routed_experts = routes
+            .route_calls
+            .iter()
+            .flat_map(|call| call.experts.iter().copied())
+            .collect::<Vec<_>>();
+        routed_experts.sort_unstable();
+        routed_experts.dedup();
+        assert!(
+            routed_experts.len() >= 3,
+            "fixture must exercise at least three routed experts, got {routed_experts:?}"
+        );
+
+        let mut ungrouped_options = optimized_options.clone();
+        ungrouped_options.batched_prefill.grouped_ffn = false;
+        ungrouped_options.diagnostics.route_profile =
+            kernel_ffi::qwen36_moe::Qwen36RouteProfileOptions::default();
+        let ungrouped_timings = run_batched_prefill(
+            0,
+            &geom,
+            &store,
+            "model.language_model",
+            &mut ungrouped,
+            &tokens,
+            &positions,
+            false,
+            &ungrouped_options,
+            None,
+            None,
+        )
+        .expect("public batched-attention per-token-FFN reference");
+        assert_eq!(ungrouped_timings.chunks, 2);
+        assert_eq!(ungrouped_timings.tokens, 513);
+        for ((completed, optimized_hidden), (_, ungrouped_hidden)) in optimized_timings
+            .boundary_hidden
+            .iter()
+            .zip(&ungrouped_timings.boundary_hidden)
+        {
+            assert_abs_rel_close(
+                &format!("grouped route/post-MoE boundary hidden at {completed}"),
+                &bf16_values(optimized_hidden),
+                &bf16_values(ungrouped_hidden),
+                0.08,
+                0.06,
+            );
+        }
 
         let mut pertoken_options = Qwen36ExecutionOptions::default();
         pertoken_options.batched_prefill.attention = false;
+        pertoken_options.diagnostics.capture_prefill_boundary_hidden = true;
         let pertoken_timings = run_batched_prefill(
             0,
             &geom,
@@ -2208,23 +2393,52 @@ mod direct_load_tests {
         .expect("public per-token runtime reference");
         assert_eq!(pertoken_timings.chunks, 2);
         assert_eq!(pertoken_timings.tokens, 513);
+        assert_eq!(
+            pertoken_timings
+                .boundary_hidden
+                .iter()
+                .map(|(completed, _)| *completed)
+                .collect::<Vec<_>>(),
+            vec![512, 513]
+        );
 
         let optimized_state = orchestration_state(&optimized);
         let pertoken_state = orchestration_state(&pertoken);
-        for (label, lhs, rhs, floor) in [
-            ("KV", &optimized_state.0, &pertoken_state.0, 0.995),
-            ("linear conv", &optimized_state.1, &pertoken_state.1, 0.995),
+        for (label, lhs, rhs, max_abs, rel_l2) in [
+            (
+                "linear conv",
+                &optimized_state.1,
+                &pertoken_state.1,
+                0.08,
+                0.08,
+            ),
             (
                 "linear recurrent",
                 &optimized_state.2,
                 &pertoken_state.2,
-                0.995,
+                0.08,
+                0.30,
             ),
         ] {
-            let cosine = cosine_similarity(lhs, rhs);
-            assert!(
-                cosine >= floor,
-                "{label} state cosine similarity {cosine:.8} is below {floor}"
+            assert_abs_rel_close(label, lhs, rhs, max_abs, rel_l2);
+        }
+
+        let (optimized_k, optimized_v) = orchestration_kv_row(&optimized, 512);
+        let (pertoken_k, pertoken_v) = orchestration_kv_row(&pertoken, 512);
+        assert_abs_rel_close("split cache K row", &optimized_k, &pertoken_k, 0.08, 0.08);
+        assert_abs_rel_close("split cache V row", &optimized_v, &pertoken_v, 0.08, 0.08);
+
+        for ((completed, optimized_hidden), (_, pertoken_hidden)) in optimized_timings
+            .boundary_hidden
+            .iter()
+            .zip(&pertoken_timings.boundary_hidden)
+        {
+            assert_abs_rel_close(
+                &format!("post-MoE boundary hidden at {completed}"),
+                &bf16_values(optimized_hidden),
+                &bf16_values(pertoken_hidden),
+                0.12,
+                0.08,
             );
         }
 
@@ -2258,13 +2472,12 @@ mod direct_load_tests {
             execution: &pertoken_options,
         })
         .expect("decode after per-token prefill");
-        let output_cosine = cosine_similarity(
+        assert_abs_rel_close(
+            "post-prefill split decode hidden",
             &bf16_values(&optimized_output.outputs.final_hidden_bytes),
             &bf16_values(&pertoken_output.outputs.final_hidden_bytes),
-        );
-        assert!(
-            output_cosine >= 0.995,
-            "post-prefill output cosine similarity {output_cosine:.8} is below 0.995"
+            0.12,
+            0.08,
         );
     }
 }

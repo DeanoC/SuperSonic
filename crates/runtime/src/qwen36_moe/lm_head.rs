@@ -161,6 +161,7 @@ pub fn launch_lm_head_from_final_hidden_bytes(
     ordinal: usize,
     geom: &MultiLayerGeom,
     final_hidden_bytes: &[u8],
+    launch_options: &kernel_ffi::prefill_ffi::PrefillFfiLaunchOptions,
     buffers: LmHeadBuffers<'_>,
 ) -> Result<Vec<u8>> {
     validate_lm_head_buffers(ordinal, geom, final_hidden_bytes, &buffers)?;
@@ -171,7 +172,7 @@ pub fn launch_lm_head_from_final_hidden_bytes(
         final_hidden_bytes.len(),
     )
     .context("h2d final_hidden -> final_hidden_buf")?;
-    kernel_ffi::qwen36_moe::lm_head_launch(
+    kernel_ffi::qwen36_moe::lm_head_launch_with_options(
         ordinal,
         geom.hidden,
         geom.vocab,
@@ -182,6 +183,7 @@ pub fn launch_lm_head_from_final_hidden_bytes(
         buffers.logits,
         None,
         buffers.counter,
+        launch_options,
     )
     .context("gpu lm_head launch")?;
     buffers
@@ -194,6 +196,7 @@ pub fn launch_lm_head_top1_from_final_hidden_bytes(
     ordinal: usize,
     geom: &MultiLayerGeom,
     final_hidden_bytes: &[u8],
+    launch_options: &kernel_ffi::prefill_ffi::PrefillFfiLaunchOptions,
     buffers: LmHeadBuffers<'_>,
 ) -> Result<u32> {
     validate_lm_head_buffers(ordinal, geom, final_hidden_bytes, &buffers)?;
@@ -204,7 +207,7 @@ pub fn launch_lm_head_top1_from_final_hidden_bytes(
         final_hidden_bytes.len(),
     )
     .context("h2d final_hidden -> final_hidden_buf")?;
-    kernel_ffi::qwen36_moe::lm_head_launch(
+    kernel_ffi::qwen36_moe::lm_head_launch_with_options(
         ordinal,
         geom.hidden,
         geom.vocab,
@@ -215,6 +218,7 @@ pub fn launch_lm_head_top1_from_final_hidden_bytes(
         buffers.logits,
         None,
         buffers.counter,
+        launch_options,
     )
     .context("gpu lm_head launch")?;
     launch_top1_from_logits(ordinal, geom, buffers.logits, buffers.counter)
@@ -375,6 +379,7 @@ mod tests {
             ordinal,
             &geom,
             &nonzero_hidden,
+            &kernel_ffi::prefill_ffi::PrefillFfiLaunchOptions::default(),
             LmHeadBuffers {
                 final_norm_w: &final_norm_w,
                 lm_head_w: &lm_head_w,

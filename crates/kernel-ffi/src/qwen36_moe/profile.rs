@@ -1,5 +1,5 @@
 const QWEN36_ROUTE_PROFILE_DEFAULT_LAYERS: usize = 40;
-const QWEN36_ROUTE_PROFILE_DEFAULT_MAX_CALLS: usize = 16_384;
+pub const QWEN36_ROUTE_PROFILE_DEFAULT_MAX_CALLS: usize = 16_384;
 const QWEN36_ROUTE_PROFILE_DEFAULT_CAPS: [usize; 6] = [2, 4, 8, 16, 32, 64];
 const QWEN36_BATCHED_PREFILL_PLAN_CHUNKS: [usize; 5] = [64, 128, 256, 512, 1024];
 
@@ -11,6 +11,21 @@ static QWEN36_BATCHED_PREFILL_FEASIBILITY_PROFILE: OnceLock<
 > = OnceLock::new();
 static QWEN36_FFN_ROUTER_PARITY_TAP_CALLS: AtomicUsize = AtomicUsize::new(0);
 static QWEN36_FFN_SHARED_PARITY_TAP_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Qwen36RouteProfileOptions {
+    pub enabled: bool,
+    pub max_calls: usize,
+}
+
+impl Default for Qwen36RouteProfileOptions {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_calls: QWEN36_ROUTE_PROFILE_DEFAULT_MAX_CALLS,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 struct Qwen36RouteProfileAccumulator {
@@ -631,8 +646,16 @@ pub fn qwen36_batched_prefill_feasibility_profile_enabled() -> bool {
 }
 
 pub fn qwen36_route_profile_record_active_experts(active_experts: &[usize]) {
-    if qwen36_route_profile_enabled() {
-        qwen36_route_profile_record(active_experts);
+    let options = qwen36_route_profile_options_from_environment();
+    qwen36_route_profile_record_active_experts_with_options(active_experts, &options);
+}
+
+pub fn qwen36_route_profile_record_active_experts_with_options(
+    active_experts: &[usize],
+    options: &Qwen36RouteProfileOptions,
+) {
+    if options.enabled {
+        qwen36_route_profile_record(active_experts, options.max_calls);
     }
 }
 
@@ -867,11 +890,18 @@ fn qwen36_route_profile_max_calls() -> usize {
         .unwrap_or(QWEN36_ROUTE_PROFILE_DEFAULT_MAX_CALLS)
 }
 
-fn qwen36_route_profile_record(active_experts: &[usize]) {
+fn qwen36_route_profile_options_from_environment() -> Qwen36RouteProfileOptions {
+    Qwen36RouteProfileOptions {
+        enabled: qwen36_route_profile_enabled(),
+        max_calls: qwen36_route_profile_max_calls(),
+    }
+}
+
+fn qwen36_route_profile_record(active_experts: &[usize], max_calls: usize) {
     let profile =
         QWEN36_ROUTE_PROFILE.get_or_init(|| Mutex::new(Qwen36RouteProfileAccumulator::default()));
     let mut profile = profile.lock().expect("qwen36 route profile mutex poisoned");
-    if profile.records.len() >= qwen36_route_profile_max_calls() {
+    if profile.records.len() >= max_calls {
         profile.dropped_calls += 1;
         return;
     }

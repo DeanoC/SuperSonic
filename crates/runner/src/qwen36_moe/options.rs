@@ -134,12 +134,23 @@ pub(crate) fn execution_options_from_environment() -> Qwen36ExecutionOptions {
         parse("SUPERSONIC_METAL_QWEN36_DECODE_BATCH_ROUTED_STAGE5_PARITY_TAP_POSITION");
     options.diagnostics.routed_stage5_parity_tap_layer =
         parse("SUPERSONIC_METAL_QWEN36_DECODE_BATCH_ROUTED_STAGE5_PARITY_TAP_LAYER");
-    options.diagnostics.route_profile = flag("SUPERSONIC_QWEN36_ROUTE_PROFILE");
+    let route_profile = kernel_ffi::qwen36_moe::Qwen36RouteProfileOptions {
+        enabled: options.metal.profile
+            || flag("SUPERSONIC_QWEN36_ROUTE_PROFILE")
+            || flag("SUPERSONIC_QWEN36_ROUTE_PROFILE_DUMP_CALLS")
+            || flag("SUPERSONIC_QWEN36_ROUTE_PROFILE_DUMP_TOPN_LAYERS")
+            || flag("SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL_FEASIBILITY"),
+        max_calls: parse("SUPERSONIC_QWEN36_ROUTE_PROFILE_MAX_CALLS")
+            .filter(|&value| value > 0)
+            .unwrap_or(kernel_ffi::qwen36_moe::QWEN36_ROUTE_PROFILE_DEFAULT_MAX_CALLS),
+    };
+    options.diagnostics.route_profile = route_profile;
     options.diagnostics.ffn_stage_profile = flag("SUPERSONIC_METAL_PROFILE_QWEN36_FFN_PHASES");
     options.diagnostics.linear_stage_profile =
         flag("SUPERSONIC_METAL_PROFILE_QWEN36_LINEAR_PHASES");
 
     options.kernel_launch = kernel_launch_options_from_environment(force_host_native);
+    options.kernel_launch.route_profile = route_profile;
     options.prefill_kernel = kernel_ffi::prefill_ffi::PrefillFfiLaunchOptions {
         force_host_native,
         force_host_rms_norm: flag("SUPERSONIC_METAL_FORCE_HOST_RMS_NORM"),
@@ -259,7 +270,7 @@ fn kernel_launch_options_from_environment(force_host_native: bool) -> Qwen36MoeL
             "SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_DIRECT_GATHER_STAGE5",
         ),
         profile: flag("SUPERSONIC_METAL_PROFILE"),
-        route_profile: flag("SUPERSONIC_QWEN36_ROUTE_PROFILE"),
+        route_profile: kernel_ffi::qwen36_moe::Qwen36RouteProfileOptions::default(),
         ..Qwen36MoeLaunchOptions::default()
     }
 }

@@ -60,6 +60,93 @@ mod explicit_options_tests {
         ));
         assert!(!prefill_profile_shapes(Some(&options)));
     }
+
+    #[test]
+    fn lm_head_metal_policy_ignores_opposite_ambient_flags() {
+        const FLAGS: [&str; 5] = [
+            "SUPERSONIC_METAL_FORCE_HOST_NATIVE",
+            "SUPERSONIC_METAL_FORCE_HOST_RMS_NORM",
+            "SUPERSONIC_METAL_FORCE_HOST_MATMUL",
+            "SUPERSONIC_METAL_DISABLE_GEMV_M1",
+            "SUPERSONIC_METAL_DISABLE_GEMV_M1_TILED",
+        ];
+        let previous: Vec<_> = FLAGS
+            .iter()
+            .map(|&name| (name, std::env::var_os(name)))
+            .collect();
+        for &name in &FLAGS {
+            unsafe {
+                std::env::set_var(name, "1");
+            }
+        }
+
+        let explicit_off = PrefillFfiLaunchOptions::default();
+        assert!(!prefill_native_disabled(Some(&explicit_off)));
+        assert!(!prefill_launch_flag(
+            Some(&explicit_off),
+            |options| options.force_host_rms_norm,
+            metal_force_host_rms_norm,
+        ));
+        assert!(!prefill_launch_flag(
+            Some(&explicit_off),
+            |options| options.force_host_matmul,
+            metal_force_host_matmul,
+        ));
+        assert!(!prefill_launch_flag(
+            Some(&explicit_off),
+            |options| options.disable_gemv_m1,
+            || std::env::var_os("SUPERSONIC_METAL_DISABLE_GEMV_M1").is_some(),
+        ));
+        assert!(!prefill_launch_flag(
+            Some(&explicit_off),
+            |options| options.disable_gemv_m1_tiled,
+            || std::env::var_os("SUPERSONIC_METAL_DISABLE_GEMV_M1_TILED").is_some(),
+        ));
+
+        for &name in &FLAGS {
+            unsafe {
+                std::env::remove_var(name);
+            }
+        }
+        let explicit_on = PrefillFfiLaunchOptions {
+            force_host_native: true,
+            force_host_rms_norm: true,
+            force_host_matmul: true,
+            disable_gemv_m1: true,
+            disable_gemv_m1_tiled: true,
+            ..PrefillFfiLaunchOptions::default()
+        };
+        assert!(prefill_native_disabled(Some(&explicit_on)));
+        assert!(prefill_launch_flag(
+            Some(&explicit_on),
+            |options| options.force_host_rms_norm,
+            metal_force_host_rms_norm,
+        ));
+        assert!(prefill_launch_flag(
+            Some(&explicit_on),
+            |options| options.force_host_matmul,
+            metal_force_host_matmul,
+        ));
+        assert!(prefill_launch_flag(
+            Some(&explicit_on),
+            |options| options.disable_gemv_m1,
+            || std::env::var_os("SUPERSONIC_METAL_DISABLE_GEMV_M1").is_some(),
+        ));
+        assert!(prefill_launch_flag(
+            Some(&explicit_on),
+            |options| options.disable_gemv_m1_tiled,
+            || std::env::var_os("SUPERSONIC_METAL_DISABLE_GEMV_M1_TILED").is_some(),
+        ));
+
+        for &(name, ref value) in &previous {
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
 }
 
 fn prefill_native_disabled(options: Option<&PrefillFfiLaunchOptions>) -> bool {
