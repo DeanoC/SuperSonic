@@ -17,6 +17,20 @@ target/release/supersonic-serve \
   --port 8080
 ```
 
+For the canonical Qwen3.6-35B-A3B native INT4 FLM, start the persistent server
+from the FLM alone:
+
+```bash
+target/release/supersonic-serve \
+  --flm-file /mnt/data/runs/geo-quant/qwen36-35b-a3b-supersonic-native-int4-current.flm \
+  --backend hip --device 0 --max-context 4096 \
+  --host 127.0.0.1 --port 8080 --api-key local --no-download
+```
+
+This first-class path resolves the model, tokenizer, native chat template, and
+native INT4 execution plan from the FLM. Do not add `--model`, `--model-dir`,
+or an INT4 layout flag to this invocation.
+
 Optional deployment flags:
 
 - `--api-key KEY` or `SUPERSONIC_API_KEY=KEY` requires
@@ -260,11 +274,20 @@ npm install openai@6 >/dev/null
 SUPERSONIC_BASE_URL=http://127.0.0.1:8080 \
 SUPERSONIC_API_KEY=secret \
 node /path/to/SuperSonic/scripts/openai_compat_smoke.mjs
+
+SUPERSONIC_BASE_URL=http://127.0.0.1:8080 \
+SUPERSONIC_API_KEY=secret \
+node /path/to/SuperSonic/scripts/openai_agent_tool_smoke.mjs
 ```
 
-The smoke covers model list/retrieve, Chat Completions, streaming Chat
-Completions with usage, legacy Completions, Responses create/get/delete,
-tokenization, and metrics.
+The compatibility smoke covers auth, model list/retrieve, tokenize/detokenize,
+Chat Completions, reasoning separation, terminal streaming usage, legacy
+Completions, Responses create/get/delete, streaming Responses terminal events,
+usage accounting, and a repeated warm request. The agent smoke requires a
+model-generated coding tool call and tool-result continuation through both
+Chat Completions and Responses. It then aborts a stream after the first delta
+and requires the authenticated health and metrics surfaces to report released
+active and queued work.
 
 The 2026-06-28 production refactor validation ran this harness against
 `qwen3.6-27b` Q4KM-GPTQ DFlash on HIP at `127.0.0.1:8013`, using `openai@6`

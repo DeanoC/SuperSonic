@@ -119,6 +119,37 @@ payload validation succeeds; a failed export or validation retains that
 partial file for diagnosis. The verifier invokes the SuperSonic subprocess
 with the FLM as `--model-dir` and does not pass an HF path to it.
 
+The persistent real-server gate starts `supersonic-serve` with `--flm-file` on
+an unused loopback port, installs `openai@6` under `target/` when needed, and
+runs the compatibility and coding-tool SDK smokes against the same resident
+process:
+
+```bash
+python3 tests/gfx1100/run_qwen36_flm_server_e2e.py \
+  --flm /mnt/data/runs/geo-quant/qwen36-35b-a3b-supersonic-native-int4-current.flm \
+  --binary /home/deano/projects/SuperSonicBase/target/release/supersonic-serve \
+  --device 0 \
+  --max-context 4096 \
+  --out-json target/qwen36_35b_a3b_flm_server_e2e.json
+```
+
+The gate polls authenticated `/ready`, validates exact FLM load evidence, runs
+Chat Completions and Responses non-streaming and streaming requests, performs
+both tool-result continuations, aborts an in-flight stream, and waits for queue
+release. It rejects a changed load sequence or model-load count after repeated
+requests. The structured report records requests, startup and transfer
+evidence, client-observed first-token/prefill/decode rates, and cancellation
+state. The adjacent `.server.log` retains server startup and failure output.
+
+Run its deterministic lifecycle and report contracts plus the real route
+protocol suite with:
+
+```bash
+python3 -m unittest tests.test_qwen36_flm_server_e2e -v
+CARGO_TARGET_DIR=/home/deano/projects/SuperSonicBase/target \
+  cargo test -q -p server
+```
+
 For low-level diagnosis, validate the native SuperSonic-layout artifact with
 geo-quant's no-HF profile:
 
