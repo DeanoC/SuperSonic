@@ -95,15 +95,39 @@ load from the already-open source, and that no `[fetch]` or `[bake]` path is
 entered.
 
 The Qwen3.6 35B-A3B MoE FLM path uses the same single-source contract for the
-HIP decode path. Validate the native SuperSonic-layout artifact with
-geo-quant's no-HF profile first:
+HIP decode path. The canonical producer-to-consumer gate prepares or reuses
+the native artifact, validates it, runs the benchmark, and checks first-class
+FLM evidence in the resulting JSON:
 
 ```bash
-cd /home/deano/.config/superpowers/worktrees/geo-quant/flm-direct-io-alignment
+cd /home/deano/projects/SuperSonicBase
+python3 tests/gfx1100/run_qwen36_flm_first_class_e2e.py \
+  --hf-source /mnt/data/models/Qwen3.6-35B-A3B \
+  --geoquant-root /home/deano/projects/geo-quant \
+  --geoquant-python /home/deano/projects/geo-quant/.venv-rocm/bin/python \
+  --flm /mnt/data/runs/geo-quant/qwen36-35b-a3b-supersonic-native-int4-current.flm \
+  --binary target/release/supersonic \
+  --out-json target/qwen36_35b_a3b_flm_first_class_e2e.json
+```
+
+By default, the verifier strictly reuses the artifact only after the
+`supersonic-qwen36-moe-native-int4` structural validation passes, then runs
+full payload verification with `--verify-payload-hashes`. Pass `--regenerate`
+to force a fresh geo-quant export. Exports are written to a PID-specific
+`.partial-*` file and are renamed into the canonical path only after full
+payload validation succeeds; a failed export or validation retains that
+partial file for diagnosis. The verifier invokes the SuperSonic subprocess
+with the FLM as `--model-dir` and does not pass an HF path to it.
+
+For low-level diagnosis, validate the native SuperSonic-layout artifact with
+geo-quant's no-HF profile:
+
+```bash
+cd /home/deano/projects/geo-quant
 /home/deano/projects/geo-quant/.venv-rocm/bin/python \
   -m geoquant.formats.flm_validate \
-  /mnt/data/tmp/flm-first-class-e2e-20260704/qwen36-35b-a3b-supersonic-native-int4-aligned.flm \
-  --profile runnable-no-hf \
+  /mnt/data/runs/geo-quant/qwen36-35b-a3b-supersonic-native-int4-current.flm \
+  --profile supersonic-qwen36-moe-native-int4 \
   --verify-payload-hashes
 ```
 
@@ -111,7 +135,7 @@ The model-store loader can validate the same artifact's native aliases without
 running generation:
 
 ```bash
-SUPERSONIC_QWEN36_35B_NATIVE_INT4_FLM=/mnt/data/tmp/flm-first-class-e2e-20260704/qwen36-35b-a3b-supersonic-native-int4-aligned.flm \
+SUPERSONIC_QWEN36_35B_NATIVE_INT4_FLM=/mnt/data/runs/geo-quant/qwen36-35b-a3b-supersonic-native-int4-current.flm \
 SUPERSONIC_QWEN36_35B_NATIVE_INT4_BAKE_DIR=/mnt/data/models/Qwen3.6-35B-A3B/.supersonic/v2-int4-gptq \
   cargo test -q -p model-store --test flm_qwen36_native_layout -- --nocapture
 ```
@@ -125,7 +149,7 @@ does not perform HF-layout reshapes in the normal FLM path.
 Then run the env-gated MoE runner smoke:
 
 ```bash
-SUPERSONIC_QWEN36_35B_A3B_NO_HF_FLM=/mnt/data/tmp/flm-first-class-e2e-20260704/qwen36-35b-a3b-supersonic-native-int4-aligned.flm \
+SUPERSONIC_QWEN36_35B_A3B_NO_HF_FLM=/mnt/data/runs/geo-quant/qwen36-35b-a3b-supersonic-native-int4-current.flm \
   cargo test -q -p runner --test flm_moe_main_path -- --nocapture
 ```
 
@@ -142,7 +166,7 @@ directory:
 
 ```bash
 cargo run -q -p runner --bin supersonic -- \
-  --model-dir /mnt/data/tmp/flm-first-class-e2e-20260704/qwen36-35b-a3b-supersonic-native-int4-aligned.flm \
+  --model-dir /mnt/data/runs/geo-quant/qwen36-35b-a3b-supersonic-native-int4-current.flm \
   --backend hip \
   --device 0 \
   --prompt "one two three four five six" \
@@ -179,13 +203,17 @@ smoke above. The resulting JSON records `model: null`,
 bytes, elapsed milliseconds, and GiB/s for `copy_h2d`; on a hipFile-enabled
 host it records the same values for `copy_storage_to_device`.
 
+This machine runs ROCm 7.1.1, so hipFile performance validation is out of
+scope here; the ROCm 7.2+ commands below are reference diagnostics for a
+compatible host.
+
 To validate ROCm 7.2 hipFile storage-to-device transfer on a host with
 `hipfile.h`, `libhipfile`, and passing `/opt/rocm/bin/ais-check`, use the FLM
 upload probe's storage-direct mode on a block-aligned expert tensor first:
 
 ```bash
 target/release/qwen36_flm_upload_probe \
-  --model-dir /mnt/data/tmp/flm-first-class-e2e-20260704/qwen36-35b-a3b-supersonic-native-int4-aligned.flm \
+  --model-dir /mnt/data/runs/geo-quant/qwen36-35b-a3b-supersonic-native-int4-current.flm \
   --backend hip \
   --device 0 \
   --tensor model.language_model.layers.0.mlp.experts.gate_up_proj \
