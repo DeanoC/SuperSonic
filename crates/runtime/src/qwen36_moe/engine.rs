@@ -1,11 +1,14 @@
 use std::collections::HashSet;
+use std::ffi::c_void;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
-use gpu_hal::{Backend, GpuBuffer, GpuError, HalProfileSnapshot, ScalarType, VirtualBuffer};
+use gpu_hal::{
+    Backend, GpuBuffer, GpuError, HalProfileSnapshot, ScalarType, VirtualBuffer, VirtualBufferStats,
+};
 use model_store::flm::{ARCH_QWEN3_6_MOE, MODEL_QWEN3_6_MOE_V1};
 use model_store::VirtualArenaTransferBackend;
 use tokenizers::Tokenizer;
@@ -24,7 +27,9 @@ use crate::qwen36_moe::persistent_decode::{
 };
 use crate::qwen36_moe::route_telemetry::{MoeRouteTelemetry, MoeTransitionPredictor};
 use crate::qwen36_moe::source::{Qwen36MoeSource, Qwen36WeightMode};
-use crate::qwen36_moe::types::{AttnLayerBuffers, LayerBuffers, MultiLayerGeom};
+use crate::qwen36_moe::types::{
+    AttnLayerBuffers, ExpertRoute, FullAttnKvCache, LayerBuffers, MultiLayerGeom,
+};
 use crate::qwen36_moe::weights::{load_to_gpu, prepare_lm_head_bf16};
 use crate::qwen36_moe_config::{
     should_try_moe_expert_vmm, should_use_qwen36_kv_vmm, MoeExpertVmmMode,
@@ -76,8 +81,28 @@ pub struct Qwen36MoeLoadEvidence {
     pub load_sequence: u64,
     pub source_open_count: u64,
     pub resident_allocation_count: u64,
-    pub resident_weight_pointers: Vec<usize>,
-    pub mapped_virtual_addresses: Vec<usize>,
+    pub resident_allocation_pointers: Vec<usize>,
+    pub mapped_virtual_ranges: Vec<Qwen36MoeMappedVirtualRangeEvidence>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Qwen36MoeMappedVirtualRangeEvidence {
+    pub address: usize,
+    pub stats: VirtualBufferStats,
+}
+
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Qwen36MoeResetTestSnapshot {
+    pub source_open_count: u64,
+    pub resident_allocation_pointers: Vec<usize>,
+    pub mapped_virtual_ranges: Vec<Qwen36MoeMappedVirtualRangeEvidence>,
+    pub persistent_descriptor_bytes: Vec<Vec<u8>>,
+    pub mutable_nonzero_labels: Vec<String>,
+    pub route_history_entries: usize,
+    pub route_observations: u64,
+    pub transition_candidates: usize,
+    pub next_position: Option<usize>,
 }
 
 struct LoadEvidenceInput {
@@ -85,6 +110,7 @@ struct LoadEvidenceInput {
     source_bytes: u64,
     device_upload_bytes: u64,
     load_sequence: u64,
+    source_open_count: u64,
 }
 
 fn build_load_evidence(input: LoadEvidenceInput) -> Result<Qwen36MoeLoadEvidence> {
@@ -103,6 +129,9 @@ fn build_load_evidence(input: LoadEvidenceInput) -> Result<Qwen36MoeLoadEvidence
     if input.device_upload_bytes == 0 {
         anyhow::bail!("Qwen3.6 load evidence requires positive device-upload bytes");
     }
+    if input.source_open_count == 0 {
+        anyhow::bail!("Qwen3.6 load evidence requires an observed source open");
+    }
     Ok(Qwen36MoeLoadEvidence {
         flm_path: PathBuf::new(),
         architecture_id: 0,
@@ -120,10 +149,10 @@ fn build_load_evidence(input: LoadEvidenceInput) -> Result<Qwen36MoeLoadEvidence
         upload_duration: Duration::ZERO,
         total_duration: Duration::ZERO,
         load_sequence: input.load_sequence,
-        source_open_count: 1,
+        source_open_count: input.source_open_count,
         resident_allocation_count: 0,
-        resident_weight_pointers: Vec::new(),
-        mapped_virtual_addresses: Vec::new(),
+        resident_allocation_pointers: Vec::new(),
+        mapped_virtual_ranges: Vec::new(),
     })
 }
 
@@ -144,6 +173,7 @@ pub struct Qwen36MoeEngine {
     final_hidden: GpuBuffer,
     route_state: Qwen36MoeRouteState,
     next_position: Option<usize>,
+    source_open_count: u64,
     load_evidence: Qwen36MoeLoadEvidence,
     backend: Backend,
     device_ordinal: usize,
@@ -213,13 +243,18 @@ impl Qwen36MoeEngine {
         let total_start = Instant::now();
         validate_pre_source_load_policy(&config)?;
 
-        let mut source = Qwen36MoeSource::open(
-            &config.flm_path,
-            FlmModelSourceOptions {
-                int4_runtime: true,
-                verify_block_hashes: config.verify_block_hashes,
-            },
-        )?;
+        let mut source_open_count = 0;
+        let source_open_start = Instant::now();
+        let mut source = observe_source_open(&mut source_open_count, || {
+            Qwen36MoeSource::open(
+                &config.flm_path,
+                FlmModelSourceOptions {
+                    int4_runtime: true,
+                    verify_block_hashes: config.verify_block_hashes,
+                },
+            )
+        })?;
+        let source_open_duration = source_open_start.elapsed();
         let runtime = source
             .source
             .runtime()
@@ -287,6 +322,7 @@ impl Qwen36MoeEngine {
             source_bytes,
             device_upload_bytes,
             load_sequence,
+            source_open_count,
         })?;
         load_evidence.flm_path = config.flm_path.clone();
         load_evidence.architecture_id = architecture_id;
@@ -299,22 +335,30 @@ impl Qwen36MoeEngine {
         load_evidence.storage_abi_ids.sort_unstable();
         load_evidence.storage_abi_ids.dedup();
         load_evidence.transfer_backend = config.policy.virtual_transfer_backend;
-        load_evidence.source_open_duration = source.timings.store_open;
-        load_evidence.descriptor_duration = source.timings.config;
+        load_evidence.source_open_duration = source_open_duration;
+        load_evidence.descriptor_duration = persistent_descriptor_duration(&mut gpu.layers)?;
         load_evidence.tokenizer_duration = tokenizer_duration;
         load_evidence.plan_duration = source.timings.direct_plan;
         load_evidence.allocation_duration = profile_duration(&hal_profile, |op| {
             op == "alloc" || op.starts_with("vmm_reserve") || op.starts_with("vmm_map")
         });
         load_evidence.upload_duration = profile_duration(&hal_profile, |op| {
-            op == "copy_h2d" || op == "copy_storage_to_device"
+            op == "copy_h2d" || op == "copy_storage_to_device" || op == "vmm_copy_h2d"
         });
+        load_evidence.resident_allocation_pointers = collect_resident_allocation_pointers(
+            &mut gpu.layers,
+            [
+                &gpu.embed_w,
+                &gpu.final_norm_w,
+                &gpu.lm_head_w,
+                &gpu.logits,
+                &gpu.counter,
+                &gpu.final_hidden,
+            ],
+        );
         load_evidence.resident_allocation_count =
-            hal_profile.alloc_calls + virtual_allocation_count(&gpu.layers) as u64;
-        load_evidence.resident_weight_pointers =
-            collect_resident_weight_pointers(&gpu.layers, &gpu);
-        load_evidence.mapped_virtual_addresses = collect_virtual_addresses(&gpu.layers);
-        load_evidence.total_duration = total_start.elapsed();
+            load_evidence.resident_allocation_pointers.len() as u64;
+        load_evidence.mapped_virtual_ranges = collect_mapped_virtual_ranges(&gpu.layers);
 
         let route_state = Qwen36MoeRouteState::new(
             geom.top_k as usize,
@@ -322,7 +366,7 @@ impl Qwen36MoeEngine {
             config.policy.moe.sparse_requested,
             config.policy.moe.transition_min_observations,
         );
-        Ok(Self {
+        let mut engine = Self {
             source,
             tokenizer,
             chat_template_source,
@@ -338,11 +382,14 @@ impl Qwen36MoeEngine {
             final_hidden: gpu.final_hidden,
             route_state,
             next_position: None,
+            source_open_count,
             load_evidence,
             backend: config.backend,
             device_ordinal: config.device_ordinal,
             max_context_len: config.max_context_len,
-        })
+        };
+        engine.load_evidence.total_duration = total_start.elapsed();
+        Ok(engine)
     }
 
     pub fn tokenizer(&self) -> &Tokenizer {
@@ -361,6 +408,192 @@ impl Qwen36MoeEngine {
         &self.load_evidence
     }
 
+    #[doc(hidden)]
+    pub fn test_only_dirty_reset_state(&mut self) -> Result<()> {
+        if gpu_hal::current_backend() != self.backend {
+            anyhow::bail!(
+                "Qwen3.6 dirty-reset hook backend mismatch: active {:?}, expected {:?}",
+                gpu_hal::current_backend(),
+                self.backend
+            );
+        }
+        gpu_hal::sync(self.device_ordinal).context("sync before dirty-reset hook")?;
+        let mut made_discontiguous = false;
+        {
+            let (layers, scratch, _) = self.layers.execution_parts();
+            for (layer_idx, layer) in layers.iter_mut().enumerate() {
+                match &mut layer.attn {
+                    AttnLayerBuffers::Linear {
+                        conv_state,
+                        recurrent_state,
+                        ..
+                    } => {
+                        dirty_gpu_buffer_first_byte(self.device_ordinal, conv_state).with_context(
+                            || format!("dirty layer-{layer_idx}-linear-conv-state"),
+                        )?;
+                        dirty_gpu_buffer_first_byte(self.device_ordinal, recurrent_state)
+                            .with_context(|| {
+                                format!("dirty layer-{layer_idx}-linear-recurrent-state")
+                            })?;
+                    }
+                    AttnLayerBuffers::Full {
+                        kv_cache: Some(cache),
+                        ..
+                    } => {
+                        for (label, buffer) in [
+                            ("k", cache.k.as_mut()),
+                            ("v", cache.v.as_mut()),
+                            ("scale-k", cache.kv_scale_k.as_mut()),
+                            ("scale-v", cache.kv_scale_v.as_mut()),
+                            ("shadow-k", cache.kv_shadow_k.as_mut()),
+                            ("shadow-v", cache.kv_shadow_v.as_mut()),
+                        ] {
+                            if let Some(buffer) = buffer {
+                                dirty_gpu_buffer_first_byte(self.device_ordinal, buffer)
+                                    .with_context(|| {
+                                        format!("dirty layer-{layer_idx}-kv-{label}")
+                                    })?;
+                            }
+                        }
+                        for (label, buffer) in [
+                            ("k", cache.virtual_kv_cache_k.as_mut()),
+                            ("v", cache.virtual_kv_cache_v.as_mut()),
+                        ] {
+                            if let Some(buffer) = buffer {
+                                if !made_discontiguous
+                                    && make_discontiguous_vmm_for_reset_test(buffer)?
+                                {
+                                    made_discontiguous = true;
+                                }
+                                dirty_mapped_virtual_pages(
+                                    self.device_ordinal,
+                                    &format!("layer-{layer_idx}-kv-vmm-{label}"),
+                                    buffer,
+                                )?;
+                            }
+                        }
+                        cache.kv_shadow_start = 17;
+                    }
+                    AttnLayerBuffers::Full { kv_cache: None, .. } => {}
+                }
+            }
+            scratch
+                .ok_or_else(|| anyhow!("Qwen3.6 dirty-reset hook requires persistent scratch"))?
+                .dirty_mutable_for_reset_test(self.device_ordinal)?;
+        }
+        if !made_discontiguous {
+            anyhow::bail!("Qwen3.6 dirty-reset hook requires a three-page KV VMM reservation");
+        }
+        for (label, buffer) in [
+            ("logits", &mut self.logits),
+            ("counter", &mut self.counter),
+            ("final-hidden", &mut self.final_hidden),
+        ] {
+            dirty_gpu_buffer_first_byte(self.device_ordinal, buffer)
+                .with_context(|| format!("dirty engine {label}"))?;
+        }
+
+        let routes = [
+            ExpertRoute {
+                rank: 0,
+                expert_idx: 7,
+                weight: 0.75,
+            },
+            ExpertRoute {
+                rank: 1,
+                expert_idx: 11,
+                weight: 0.25,
+            },
+        ];
+        self.route_state.previous_topk_by_layer[0] = vec![7, 11];
+        if let Some(telemetry) = self.route_state.telemetry.as_mut() {
+            for route in &routes {
+                telemetry.record_route_observation(route, &[7, 11]);
+                telemetry.record_resident_before(route.rank);
+            }
+        }
+        if let Some(predictors) = self.route_state.predictors.as_mut() {
+            let observations = self.route_state.transition_min_observations.max(1);
+            for _ in 0..observations {
+                predictors[0].update(&routes, &[7, 11]);
+            }
+        }
+        self.next_position = Some(73);
+        gpu_hal::sync(self.device_ordinal).context("sync after dirty-reset hook")
+    }
+
+    #[doc(hidden)]
+    pub fn test_only_reset_snapshot(&mut self) -> Result<Qwen36MoeResetTestSnapshot> {
+        gpu_hal::sync(self.device_ordinal).context("sync before reset test snapshot")?;
+        let resident_allocation_pointers = collect_resident_allocation_pointers(
+            &mut self.layers,
+            [
+                &self.embed_w,
+                &self.final_norm_w,
+                &self.lm_head_w,
+                &self.logits,
+                &self.counter,
+                &self.final_hidden,
+            ],
+        );
+        let mapped_virtual_ranges = collect_mapped_virtual_ranges(&self.layers);
+        let (persistent_descriptor_bytes, mut mutable_nonzero_labels) = {
+            let (layers, scratch, _) = self.layers.execution_parts();
+            let mut labels = collect_layer_mutable_nonzero_labels(layers)?;
+            let scratch = scratch
+                .ok_or_else(|| anyhow!("Qwen3.6 reset snapshot requires persistent scratch"))?;
+            labels.extend(scratch.mutable_nonzero_labels()?);
+            (scratch.descriptor_bytes()?, labels)
+        };
+        for (label, buffer) in [
+            ("logits", &self.logits),
+            ("counter", &self.counter),
+            ("final-hidden", &self.final_hidden),
+        ] {
+            if gpu_buffer_first_byte_nonzero(buffer)? {
+                mutable_nonzero_labels.push(label.to_string());
+            }
+        }
+        mutable_nonzero_labels.sort();
+        let route_history_entries = self
+            .route_state
+            .previous_topk_by_layer
+            .iter()
+            .map(Vec::len)
+            .sum();
+        let route_observations = self
+            .route_state
+            .telemetry
+            .as_ref()
+            .map(|telemetry| telemetry.observations_by_rank.iter().sum())
+            .unwrap_or(0);
+        let transition_candidates = self
+            .route_state
+            .predictors
+            .as_ref()
+            .map(|predictors| {
+                predictors
+                    .iter()
+                    .zip(&self.route_state.previous_topk_by_layer)
+                    .map(|(predictor, previous)| {
+                        predictor.candidates(previous, self.route_state.top_k).len()
+                    })
+                    .sum()
+            })
+            .unwrap_or(0);
+        Ok(Qwen36MoeResetTestSnapshot {
+            source_open_count: self.source_open_count,
+            resident_allocation_pointers,
+            mapped_virtual_ranges,
+            persistent_descriptor_bytes,
+            mutable_nonzero_labels,
+            route_history_entries,
+            route_observations,
+            transition_candidates,
+            next_position: self.next_position,
+        })
+    }
+
     pub fn reset(&mut self) -> Result<()> {
         if gpu_hal::current_backend() != self.backend {
             return reset_phase(
@@ -372,11 +605,21 @@ impl Qwen36MoeEngine {
                 )),
             );
         }
-        reset_phase(
-            "device-sync-before",
-            gpu_hal::sync(self.device_ordinal).map_err(anyhow::Error::from),
+        let ordinal = self.device_ordinal;
+        run_reset_transaction(
+            || gpu_hal::sync(ordinal).map_err(anyhow::Error::from),
+            || self.clear_mutable_state(),
+            || gpu_hal::sync(ordinal).map_err(anyhow::Error::from),
         )?;
+        reset_phase(
+            "descriptor-ownership",
+            validate_engine_pointer_ownership(&mut self.layers),
+        )?;
+        reset_phase("resident-identity", self.validate_resident_identity())?;
+        Ok(())
+    }
 
+    fn clear_mutable_state(&mut self) -> Result<()> {
         {
             let (layers, scratch, _) = self.layers.execution_parts();
             reset_phase(
@@ -385,20 +628,8 @@ impl Qwen36MoeEngine {
             )?;
             if let Some(scratch) = scratch {
                 reset_phase(
-                    "persistent-scratch-hidden",
-                    zero_gpu_buffer(
-                        self.device_ordinal,
-                        "persistent-scratch-hidden",
-                        &mut scratch.hidden_ping,
-                    ),
-                )?;
-                reset_phase(
-                    "persistent-scratch-workspace",
-                    zero_gpu_buffer(
-                        self.device_ordinal,
-                        "persistent-scratch-workspace",
-                        &mut scratch.workspace,
-                    ),
+                    "persistent-scratch",
+                    scratch.reset_mutable(self.device_ordinal),
                 )?;
             }
         }
@@ -412,31 +643,35 @@ impl Qwen36MoeEngine {
         }
         self.route_state.reset();
         self.next_position = None;
-
-        reset_phase(
-            "device-sync-after",
-            gpu_hal::sync(self.device_ordinal).map_err(anyhow::Error::from),
-        )?;
-        reset_phase(
-            "descriptor-ownership",
-            validate_engine_pointer_ownership(&mut self.layers),
-        )?;
-        reset_phase("resident-identity", self.validate_resident_identity())?;
         Ok(())
     }
 
-    fn validate_resident_identity(&self) -> Result<()> {
-        let current_pointers = collect_engine_resident_pointers(
-            &self.layers,
-            &self.embed_w,
-            &self.final_norm_w,
-            &self.lm_head_w,
+    fn validate_resident_identity(&mut self) -> Result<()> {
+        let current_pointers = collect_resident_allocation_pointers(
+            &mut self.layers,
+            [
+                &self.embed_w,
+                &self.final_norm_w,
+                &self.lm_head_w,
+                &self.logits,
+                &self.counter,
+                &self.final_hidden,
+            ],
         );
-        if current_pointers != self.load_evidence.resident_weight_pointers {
+        if current_pointers != self.load_evidence.resident_allocation_pointers {
             anyhow::bail!("resident allocation pointers changed across reset");
         }
-        let current_virtual_addresses = collect_virtual_addresses(&self.layers);
-        if current_virtual_addresses != self.load_evidence.mapped_virtual_addresses {
+        let current_virtual_addresses = collect_mapped_virtual_ranges(&self.layers)
+            .into_iter()
+            .map(|range| range.address)
+            .collect::<Vec<_>>();
+        let loaded_virtual_addresses = self
+            .load_evidence
+            .mapped_virtual_ranges
+            .iter()
+            .map(|range| range.address)
+            .collect::<Vec<_>>();
+        if current_virtual_addresses != loaded_virtual_addresses {
             anyhow::bail!("mapped virtual addresses changed across reset");
         }
         Ok(())
@@ -449,6 +684,24 @@ fn reset_phase<T>(phase: &str, result: Result<T>) -> Result<T> {
     })
 }
 
+fn run_reset_transaction(
+    sync_before: impl FnOnce() -> Result<()>,
+    clear: impl FnOnce() -> Result<()>,
+    sync_after: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    reset_phase("device-sync-before", sync_before())?;
+    let clear_result = clear();
+    let sync_after_result = reset_phase("device-sync-after", sync_after());
+    match (clear_result, sync_after_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(first), Ok(())) => Err(first),
+        (Ok(()), Err(sync_error)) => Err(sync_error),
+        (Err(first), Err(sync_error)) => Err(anyhow!(
+            "{first:#}; additionally, post-reset synchronization failed: {sync_error:#}"
+        )),
+    }
+}
+
 fn reset_layer_state(ordinal: usize, layers: &mut [LayerBuffers]) -> Result<()> {
     for (layer_idx, layer) in layers.iter_mut().enumerate() {
         match &mut layer.attn {
@@ -456,34 +709,7 @@ fn reset_layer_state(ordinal: usize, layers: &mut [LayerBuffers]) -> Result<()> 
                 kv_cache: Some(cache),
                 ..
             } => {
-                for (state, buffer) in [("k", cache.k.as_mut()), ("v", cache.v.as_mut())] {
-                    if let Some(buffer) = buffer {
-                        zero_gpu_buffer(ordinal, &format!("layer-{layer_idx}-kv-{state}"), buffer)?;
-                    }
-                }
-                for (state, buffer) in [
-                    ("scale-k", cache.kv_scale_k.as_mut()),
-                    ("scale-v", cache.kv_scale_v.as_mut()),
-                    ("shadow-k", cache.kv_shadow_k.as_mut()),
-                    ("shadow-v", cache.kv_shadow_v.as_mut()),
-                ] {
-                    if let Some(buffer) = buffer {
-                        zero_gpu_buffer(ordinal, &format!("layer-{layer_idx}-kv-{state}"), buffer)?;
-                    }
-                }
-                for (state, buffer) in [
-                    ("k", cache.virtual_kv_cache_k.as_mut()),
-                    ("v", cache.virtual_kv_cache_v.as_mut()),
-                ] {
-                    if let Some(buffer) = buffer {
-                        zero_mapped_virtual_buffer(
-                            ordinal,
-                            &format!("layer-{layer_idx}-kv-vmm-{state}"),
-                            buffer,
-                        )?;
-                    }
-                }
-                cache.kv_shadow_start = -1;
+                reset_full_attention_cache(ordinal, layer_idx, cache)?;
             }
             AttnLayerBuffers::Linear {
                 conv_state,
@@ -504,6 +730,42 @@ fn reset_layer_state(ordinal: usize, layers: &mut [LayerBuffers]) -> Result<()> 
             AttnLayerBuffers::Full { kv_cache: None, .. } => {}
         }
     }
+    Ok(())
+}
+
+fn reset_full_attention_cache(
+    ordinal: usize,
+    layer_idx: usize,
+    cache: &mut FullAttnKvCache,
+) -> Result<()> {
+    for (state, buffer) in [("k", cache.k.as_mut()), ("v", cache.v.as_mut())] {
+        if let Some(buffer) = buffer {
+            zero_gpu_buffer(ordinal, &format!("layer-{layer_idx}-kv-{state}"), buffer)?;
+        }
+    }
+    for (state, buffer) in [
+        ("scale-k", cache.kv_scale_k.as_mut()),
+        ("scale-v", cache.kv_scale_v.as_mut()),
+        ("shadow-k", cache.kv_shadow_k.as_mut()),
+        ("shadow-v", cache.kv_shadow_v.as_mut()),
+    ] {
+        if let Some(buffer) = buffer {
+            zero_gpu_buffer(ordinal, &format!("layer-{layer_idx}-kv-{state}"), buffer)?;
+        }
+    }
+    for (state, buffer) in [
+        ("k", cache.virtual_kv_cache_k.as_mut()),
+        ("v", cache.virtual_kv_cache_v.as_mut()),
+    ] {
+        if let Some(buffer) = buffer {
+            zero_mapped_virtual_buffer(
+                ordinal,
+                &format!("layer-{layer_idx}-kv-vmm-{state}"),
+                buffer,
+            )?;
+        }
+    }
+    cache.kv_shadow_start = -1;
     Ok(())
 }
 
@@ -544,6 +806,169 @@ fn zero_mapped_virtual_buffer(
         }
     }
     Ok(())
+}
+
+fn dirty_gpu_buffer_first_byte(ordinal: usize, buffer: &mut GpuBuffer) -> Result<()> {
+    let dirty = [0xa5u8];
+    gpu_hal::copy_h2d(
+        ordinal,
+        buffer.as_mut_ptr(),
+        dirty.as_ptr() as *const c_void,
+        dirty.len(),
+    )
+    .map_err(anyhow::Error::from)
+}
+
+fn gpu_buffer_first_byte_nonzero(buffer: &GpuBuffer) -> Result<bool> {
+    let mut byte = [0u8];
+    gpu_hal::copy_d2h(
+        buffer.device_ordinal(),
+        byte.as_mut_ptr() as *mut c_void,
+        buffer.as_ptr(),
+        byte.len(),
+    )
+    .map_err(anyhow::Error::from)?;
+    Ok(byte[0] != 0)
+}
+
+fn make_discontiguous_vmm_for_reset_test(buffer: &mut VirtualBuffer) -> Result<bool> {
+    let page = buffer.granularity();
+    if buffer.reserved_bytes() < page * 3 {
+        return Ok(false);
+    }
+    buffer
+        .unmap_range_discard(0, buffer.reserved_bytes())
+        .context("unmap KV VMM for discontiguous reset fixture")?;
+    buffer
+        .map_range_bytes(0, 1)
+        .context("map first KV VMM reset-fixture page")?;
+    buffer
+        .map_range_bytes(page * 2, 1)
+        .context("map third KV VMM reset-fixture page")?;
+    Ok(true)
+}
+
+fn dirty_mapped_virtual_pages(
+    ordinal: usize,
+    label: &str,
+    buffer: &mut VirtualBuffer,
+) -> Result<()> {
+    let dirty = [0xa5u8];
+    let page = buffer.granularity();
+    for offset in (0..buffer.mapped_bytes()).step_by(page) {
+        match buffer.to_host_range_bytes(offset, 1) {
+            Ok(_) => gpu_hal::copy_h2d(
+                ordinal,
+                buffer.offset_mut_ptr(offset),
+                dirty.as_ptr() as *const c_void,
+                dirty.len(),
+            )
+            .map_err(anyhow::Error::from)
+            .with_context(|| format!("dirty mapped {label} page at byte {offset}"))?,
+            Err(error) if is_unmapped_virtual_range_error(&error) => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("inspect mapped {label} page at byte {offset}"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn collect_layer_mutable_nonzero_labels(layers: &[LayerBuffers]) -> Result<Vec<String>> {
+    let mut labels = Vec::new();
+    for (layer_idx, layer) in layers.iter().enumerate() {
+        match &layer.attn {
+            AttnLayerBuffers::Linear {
+                conv_state,
+                recurrent_state,
+                ..
+            } => {
+                for (label, buffer) in [
+                    ("linear-conv-state", conv_state),
+                    ("linear-recurrent-state", recurrent_state),
+                ] {
+                    if gpu_buffer_first_byte_nonzero(buffer)? {
+                        labels.push(format!("layer-{layer_idx}-{label}"));
+                    }
+                }
+            }
+            AttnLayerBuffers::Full {
+                kv_cache: Some(cache),
+                ..
+            } => {
+                for (label, buffer) in [
+                    ("kv-dense-k", cache.k.as_ref()),
+                    ("kv-dense-v", cache.v.as_ref()),
+                    ("kv-scale-k", cache.kv_scale_k.as_ref()),
+                    ("kv-scale-v", cache.kv_scale_v.as_ref()),
+                    ("kv-shadow-k", cache.kv_shadow_k.as_ref()),
+                    ("kv-shadow-v", cache.kv_shadow_v.as_ref()),
+                ] {
+                    if let Some(buffer) = buffer {
+                        if gpu_buffer_first_byte_nonzero(buffer)? {
+                            labels.push(format!("layer-{layer_idx}-{label}"));
+                        }
+                    }
+                }
+                if cache.kv_shadow_start != -1 {
+                    labels.push(format!("layer-{layer_idx}-kv-shadow-start"));
+                }
+                for (label, buffer) in [
+                    ("k", cache.virtual_kv_cache_k.as_ref()),
+                    ("v", cache.virtual_kv_cache_v.as_ref()),
+                ] {
+                    if let Some(buffer) = buffer {
+                        let page = buffer.granularity();
+                        for offset in (0..buffer.mapped_bytes()).step_by(page) {
+                            match buffer.to_host_range_bytes(offset, 1) {
+                                Ok(bytes) if bytes[0] != 0 => labels.push(format!(
+                                    "layer-{layer_idx}-kv-vmm-{label}-page-{offset}"
+                                )),
+                                Ok(_) => {}
+                                Err(error) if is_unmapped_virtual_range_error(&error) => {}
+                                Err(error) => {
+                                    return Err(error).with_context(|| {
+                                        format!(
+                                            "inspect layer-{layer_idx}-kv-vmm-{label} page at byte {offset}"
+                                        )
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            AttnLayerBuffers::Full { kv_cache: None, .. } => {}
+        }
+    }
+    Ok(labels)
+}
+
+fn is_unmapped_virtual_range_error(error: &GpuError) -> bool {
+    matches!(
+        error,
+        GpuError::InvalidArg(message)
+            if message.starts_with("virtual D2H range")
+                && message.ends_with("is not fully mapped")
+    )
+}
+
+fn observe_source_open<T>(
+    source_open_count: &mut u64,
+    open: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    *source_open_count = source_open_count
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("Qwen3.6 source-open count overflow"))?;
+    open()
+}
+
+fn persistent_descriptor_duration(layers: &mut LoadedQwen36Layers) -> Result<Duration> {
+    let (_, scratch, _) = layers.execution_parts();
+    scratch
+        .map(|scratch| scratch.descriptor_duration())
+        .ok_or_else(|| anyhow!("Qwen3.6 persistent descriptor timing is unavailable"))
 }
 
 fn validate_pre_source_load_policy(config: &Qwen36MoeLoadConfig) -> Result<()> {
@@ -621,35 +1046,106 @@ fn validate_load_contract(
 }
 
 fn validate_35b_a3b_config(text: &qwen36_moe::config::TextConfig) -> Result<()> {
-    let actual = (
-        text.vocab_size,
-        text.hidden_size,
-        text.num_hidden_layers,
-        text.num_attention_heads,
-        text.num_key_value_heads,
-        text.head_dim,
-        text.num_experts,
-        text.num_experts_per_tok,
-        text.moe_intermediate_size,
-        text.shared_expert_intermediate_size,
-    );
-    let expected = (
-        QWEN36_35B_A3B_VOCAB,
-        QWEN36_35B_A3B_HIDDEN,
-        QWEN36_35B_A3B_LAYERS,
-        QWEN36_35B_A3B_ATTN_HEADS,
-        QWEN36_35B_A3B_KV_HEADS,
-        QWEN36_35B_A3B_HEAD_DIM,
-        QWEN36_35B_A3B_EXPERTS,
-        QWEN36_35B_A3B_TOP_K,
-        QWEN36_35B_A3B_MOE_INTERMEDIATE,
-        QWEN36_35B_A3B_SHARED_INTERMEDIATE,
-    );
-    if actual != expected {
-        anyhow::bail!(
-            "Qwen3.6 FLM model mismatch: got geometry {actual:?}, expected 35B-A3B {expected:?}"
-        );
+    macro_rules! require_canonical {
+        ($field:expr, $expected:expr, $label:literal) => {
+            if $field != $expected {
+                anyhow::bail!(
+                    "Qwen3.6 FLM 35B-A3B execution geometry mismatch for {}: got {:?}, expected {:?}",
+                    $label,
+                    $field,
+                    $expected
+                );
+            }
+        };
     }
+
+    require_canonical!(text.vocab_size, QWEN36_35B_A3B_VOCAB, "vocab_size");
+    require_canonical!(text.hidden_size, QWEN36_35B_A3B_HIDDEN, "hidden_size");
+    require_canonical!(
+        text.num_hidden_layers,
+        QWEN36_35B_A3B_LAYERS,
+        "num_hidden_layers"
+    );
+    require_canonical!(
+        text.num_attention_heads,
+        QWEN36_35B_A3B_ATTN_HEADS,
+        "num_attention_heads"
+    );
+    require_canonical!(
+        text.num_key_value_heads,
+        QWEN36_35B_A3B_KV_HEADS,
+        "num_key_value_heads"
+    );
+    require_canonical!(
+        text.max_position_embeddings,
+        262_144,
+        "max_position_embeddings"
+    );
+    require_canonical!(text.rms_norm_eps, 1e-6, "rms_norm_eps");
+    require_canonical!(
+        text.hidden_act,
+        qwen36_moe::config::Activation::Silu,
+        "hidden_act"
+    );
+    require_canonical!(text.tie_word_embeddings, false, "tie_word_embeddings");
+    require_canonical!(text.head_dim, QWEN36_35B_A3B_HEAD_DIM, "head_dim");
+    require_canonical!(text.full_attention_interval, 4, "full_attention_interval");
+    require_canonical!(text.attn_output_gate, true, "attn_output_gate");
+    require_canonical!(text.linear_conv_kernel_dim, 4, "linear_conv_kernel_dim");
+    require_canonical!(text.linear_key_head_dim, 128, "linear_key_head_dim");
+    require_canonical!(text.linear_value_head_dim, 128, "linear_value_head_dim");
+    require_canonical!(text.linear_num_key_heads, 16, "linear_num_key_heads");
+    require_canonical!(text.linear_num_value_heads, 32, "linear_num_value_heads");
+
+    let expected_layer_types = (0..QWEN36_35B_A3B_LAYERS)
+        .map(|index| {
+            if (index + 1) % 4 == 0 {
+                "full_attention".to_string()
+            } else {
+                "linear_attention".to_string()
+            }
+        })
+        .collect::<Vec<_>>();
+    require_canonical!(&text.layer_types, &expected_layer_types, "layer_types");
+    let rope = text.rope_parameters.clone().unwrap_or_default();
+    require_canonical!(rope.rope_type.as_str(), "default", "rope_type");
+    require_canonical!(rope.rope_theta, 10_000_000.0, "rope_theta");
+    require_canonical!(rope.partial_rotary_factor, 0.25, "partial_rotary_factor");
+    require_canonical!(rope.mrope_interleaved, true, "mrope_interleaved");
+    require_canonical!(
+        rope.mrope_section.as_slice(),
+        &[11, 11, 10],
+        "mrope_section"
+    );
+
+    require_canonical!(text.num_experts, QWEN36_35B_A3B_EXPERTS, "num_experts");
+    require_canonical!(
+        text.num_experts_per_tok,
+        QWEN36_35B_A3B_TOP_K,
+        "num_experts_per_tok"
+    );
+    require_canonical!(
+        text.moe_intermediate_size,
+        QWEN36_35B_A3B_MOE_INTERMEDIATE,
+        "moe_intermediate_size"
+    );
+    require_canonical!(
+        text.shared_expert_intermediate_size,
+        QWEN36_35B_A3B_SHARED_INTERMEDIATE,
+        "shared_expert_intermediate_size"
+    );
+    require_canonical!(text.norm_topk_prob, true, "norm_topk_prob");
+    require_canonical!(text.router_aux_loss_coef, 0.001, "router_aux_loss_coef");
+    require_canonical!(
+        text.mlp_only_layers.as_slice(),
+        &[] as &[usize],
+        "mlp_only_layers"
+    );
+    require_canonical!(
+        text.decoder_sparse_step,
+        None::<usize>,
+        "decoder_sparse_step"
+    );
     Ok(())
 }
 
@@ -1130,34 +1626,13 @@ fn validate_descriptor_pointer_ownership(
     Ok(())
 }
 
-fn collect_resident_weight_pointers(
-    layers: &LoadedQwen36Layers,
-    gpu: &ResidentGpuParts,
-) -> Vec<usize> {
-    collect_engine_resident_pointers(layers, &gpu.embed_w, &gpu.final_norm_w, &gpu.lm_head_w)
-}
-
-fn collect_engine_resident_pointers(
-    layers: &LoadedQwen36Layers,
-    embed_w: &GpuBuffer,
-    final_norm_w: &GpuBuffer,
-    lm_head_w: &GpuBuffer,
+fn collect_resident_allocation_pointers(
+    layers: &mut LoadedQwen36Layers,
+    engine_buffers: [&GpuBuffer; 6],
 ) -> Vec<usize> {
     let mut pointers = collect_owned_layer_pointers(layers.layers())
         .into_iter()
         .collect::<Vec<_>>();
-    pointers.extend([
-        embed_w.as_ptr() as usize,
-        final_norm_w.as_ptr() as usize,
-        lm_head_w.as_ptr() as usize,
-    ]);
-    pointers.sort_unstable();
-    pointers.dedup();
-    pointers
-}
-
-fn collect_virtual_addresses(layers: &LoadedQwen36Layers) -> Vec<usize> {
-    let mut pointers = Vec::new();
     if let Some(arena) = layers.virtual_expert_arena() {
         pointers.extend(
             arena
@@ -1175,6 +1650,36 @@ fn collect_virtual_addresses(layers: &LoadedQwen36Layers) -> Vec<usize> {
                 .map(|allocation| allocation.buffer().as_ptr() as usize),
         );
     }
+    let (_, scratch, _) = layers.execution_parts();
+    if let Some(scratch) = scratch {
+        pointers.extend(scratch.allocation_pointers());
+    }
+    pointers.extend(engine_buffers.map(|buffer| buffer.as_ptr() as usize));
+    pointers.sort_unstable();
+    pointers.dedup();
+    pointers
+}
+
+fn collect_mapped_virtual_ranges(
+    layers: &LoadedQwen36Layers,
+) -> Vec<Qwen36MoeMappedVirtualRangeEvidence> {
+    let mut ranges = Vec::new();
+    let mut push = |buffer: &VirtualBuffer| {
+        ranges.push(Qwen36MoeMappedVirtualRangeEvidence {
+            address: buffer.as_ptr() as usize,
+            stats: buffer.stats(),
+        });
+    };
+    if let Some(arena) = layers.virtual_expert_arena() {
+        for allocation in arena.allocations() {
+            push(allocation.buffer());
+        }
+    }
+    if let Some(manager) = layers.sparse_expert_residency() {
+        for allocation in manager.arena().allocations() {
+            push(allocation.buffer());
+        }
+    }
     for layer in layers.layers() {
         let AttnLayerBuffers::Full {
             kv_cache: Some(cache),
@@ -1183,49 +1688,23 @@ fn collect_virtual_addresses(layers: &LoadedQwen36Layers) -> Vec<usize> {
         else {
             continue;
         };
-        pointers.extend(
-            [
-                cache.virtual_kv_cache_k.as_ref(),
-                cache.virtual_kv_cache_v.as_ref(),
-            ]
-            .into_iter()
-            .flatten()
-            .map(|buffer| buffer.as_ptr() as usize),
-        );
+        for buffer in [
+            cache.virtual_kv_cache_k.as_ref(),
+            cache.virtual_kv_cache_v.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            push(buffer);
+        }
     }
-    pointers.sort_unstable();
-    pointers.dedup();
-    pointers
-}
-
-fn virtual_allocation_count(layers: &LoadedQwen36Layers) -> usize {
-    let expert = layers
-        .virtual_expert_arena()
-        .map(|arena| arena.stats().allocations)
-        .unwrap_or(0)
-        + layers
-            .sparse_expert_residency()
-            .map(|manager| manager.arena().stats().allocations)
-            .unwrap_or(0);
-    let kv = layers
-        .layers()
-        .iter()
-        .map(|layer| match &layer.attn {
-            AttnLayerBuffers::Full {
-                kv_cache: Some(cache),
-                ..
-            } => {
-                usize::from(cache.virtual_kv_cache_k.is_some())
-                    + usize::from(cache.virtual_kv_cache_v.is_some())
-            }
-            _ => 0,
-        })
-        .sum::<usize>();
-    expert + kv
+    ranges.sort_unstable_by_key(|range| range.address);
+    ranges
 }
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::collections::HashSet;
     use std::ffi::c_void;
     use std::path::PathBuf;
@@ -1233,17 +1712,147 @@ mod tests {
     use gpu_hal::{Backend, GpuBuffer, ScalarType, VirtualBacking, VirtualBuffer};
     use model_store::flm::{ARCH_QWEN3_6_MOE, MODEL_QWEN3_6_MOE_V1};
     use model_store::VirtualArenaTransferBackend;
+    use qwen36_moe::config::{Activation, RopeParameters, TextConfig};
 
     use super::{
-        build_load_evidence, reset_phase, validate_descriptor_pointer_ownership,
+        build_load_evidence, observe_source_open, reset_full_attention_cache, reset_phase,
+        run_reset_transaction, validate_35b_a3b_config, validate_descriptor_pointer_ownership,
         validate_load_contract, zero_gpu_buffer, zero_mapped_virtual_buffer, LoadEvidenceInput,
         Qwen36MoeDirectProfile, Qwen36MoeEngine, Qwen36MoeLoadConfig, Qwen36MoeRouteState,
     };
     use crate::qwen36_moe::load_policy::Qwen36MoeLoadPolicy;
-    use crate::qwen36_moe::types::ExpertRoute;
+    use crate::qwen36_moe::types::{ExpertRoute, FullAttnKvCache};
     use crate::qwen36_moe_config::{Qwen36KvVmmMode, Qwen36MoeRuntimeConfig};
 
     const MODEL_MAX_CONTEXT: usize = 262_144;
+
+    fn canonical_35b_a3b_execution_config() -> TextConfig {
+        TextConfig {
+            vocab_size: 248_320,
+            hidden_size: 2048,
+            num_hidden_layers: 40,
+            num_attention_heads: 16,
+            num_key_value_heads: 2,
+            max_position_embeddings: 262_144,
+            rms_norm_eps: 1e-6,
+            hidden_act: Activation::Silu,
+            tie_word_embeddings: false,
+            eos_token_id: None,
+            bos_token_id: None,
+            head_dim: 256,
+            full_attention_interval: 4,
+            attn_output_gate: true,
+            linear_conv_kernel_dim: 4,
+            linear_key_head_dim: 128,
+            linear_value_head_dim: 128,
+            linear_num_key_heads: 16,
+            linear_num_value_heads: 32,
+            layer_types: (0..40)
+                .map(|index| {
+                    if (index + 1) % 4 == 0 {
+                        "full_attention".to_string()
+                    } else {
+                        "linear_attention".to_string()
+                    }
+                })
+                .collect(),
+            rope_parameters: Some(RopeParameters {
+                mrope_interleaved: true,
+                mrope_section: vec![11, 11, 10],
+                ..RopeParameters::default()
+            }),
+            num_experts: 256,
+            num_experts_per_tok: 8,
+            moe_intermediate_size: 512,
+            shared_expert_intermediate_size: 512,
+            norm_topk_prob: true,
+            router_aux_loss_coef: 0.001,
+            mlp_only_layers: Vec::new(),
+            decoder_sparse_step: None,
+        }
+    }
+
+    #[test]
+    fn canonical_35b_a3b_validation_covers_complete_execution_geometry() {
+        validate_35b_a3b_config(&canonical_35b_a3b_execution_config())
+            .expect("canonical execution geometry");
+
+        let mismatches: &[(&str, fn(&mut TextConfig))] = &[
+            ("vocab_size", |text| text.vocab_size -= 1),
+            ("hidden_size", |text| text.hidden_size -= 1),
+            ("num_hidden_layers", |text| text.num_hidden_layers -= 1),
+            ("num_attention_heads", |text| text.num_attention_heads -= 1),
+            ("num_key_value_heads", |text| text.num_key_value_heads -= 1),
+            ("max_position_embeddings", |text| {
+                text.max_position_embeddings -= 1
+            }),
+            ("rms_norm_eps", |text| text.rms_norm_eps = 1e-5),
+            ("hidden_act", |text| text.hidden_act = Activation::Gelu),
+            ("tie_word_embeddings", |text| {
+                text.tie_word_embeddings = true
+            }),
+            ("head_dim", |text| text.head_dim -= 1),
+            ("full_attention_interval", |text| {
+                text.full_attention_interval -= 1
+            }),
+            ("attn_output_gate", |text| text.attn_output_gate = false),
+            ("linear_conv_kernel_dim", |text| {
+                text.linear_conv_kernel_dim -= 1
+            }),
+            ("linear_key_head_dim", |text| text.linear_key_head_dim -= 1),
+            ("linear_value_head_dim", |text| {
+                text.linear_value_head_dim -= 1
+            }),
+            ("linear_num_key_heads", |text| {
+                text.linear_num_key_heads -= 1
+            }),
+            ("linear_num_value_heads", |text| {
+                text.linear_num_value_heads -= 1
+            }),
+            ("layer_types", |text| {
+                text.layer_types.swap(0, 3);
+            }),
+            ("rope_type", |text| {
+                text.rope_parameters.as_mut().unwrap().rope_type = "linear".to_string()
+            }),
+            ("rope_theta", |text| {
+                text.rope_parameters.as_mut().unwrap().rope_theta = 10_000.0
+            }),
+            ("partial_rotary_factor", |text| {
+                text.rope_parameters.as_mut().unwrap().partial_rotary_factor = 0.5
+            }),
+            ("mrope_interleaved", |text| {
+                text.rope_parameters.as_mut().unwrap().mrope_interleaved = false
+            }),
+            ("mrope_section", |text| {
+                text.rope_parameters.as_mut().unwrap().mrope_section.clear()
+            }),
+            ("num_experts", |text| text.num_experts -= 1),
+            ("num_experts_per_tok", |text| text.num_experts_per_tok -= 1),
+            ("moe_intermediate_size", |text| {
+                text.moe_intermediate_size -= 1
+            }),
+            ("shared_expert_intermediate_size", |text| {
+                text.shared_expert_intermediate_size -= 1
+            }),
+            ("norm_topk_prob", |text| text.norm_topk_prob = false),
+            ("router_aux_loss_coef", |text| {
+                text.router_aux_loss_coef = 0.0
+            }),
+            ("mlp_only_layers", |text| text.mlp_only_layers.push(0)),
+            ("decoder_sparse_step", |text| {
+                text.decoder_sparse_step = Some(1)
+            }),
+        ];
+        for &(field, mutate) in mismatches {
+            let mut text = canonical_35b_a3b_execution_config();
+            mutate(&mut text);
+            assert!(
+                validate_35b_a3b_config(&text).is_err(),
+                "{field} mismatch was accepted"
+            );
+        }
+    }
 
     #[test]
     fn load_contract_rejects_empty_or_out_of_model_context() {
@@ -1378,6 +1987,7 @@ mod tests {
             source_bytes: 4096,
             device_upload_bytes: 2048,
             load_sequence: 7,
+            source_open_count: 1,
         })
         .expect("production load evidence");
 
@@ -1386,6 +1996,21 @@ mod tests {
         assert_eq!(evidence.source_bytes, 4096);
         assert_eq!(evidence.device_upload_bytes, 2048);
         assert_eq!(evidence.load_sequence, 7);
+        assert_eq!(evidence.source_open_count, 1);
+    }
+
+    #[test]
+    fn source_open_evidence_counts_observed_attempts() {
+        let mut count = 0;
+        let opened = observe_source_open(&mut count, || Ok::<_, anyhow::Error>("source"))
+            .expect("observed source open");
+        assert_eq!(opened, "source");
+        assert_eq!(count, 1);
+
+        let err = observe_source_open(&mut count, || Err::<(), _>(anyhow::anyhow!("open failed")))
+            .expect_err("failed open is still an observed attempt");
+        assert!(err.to_string().contains("open failed"));
+        assert_eq!(count, 2);
     }
 
     #[test]
@@ -1501,6 +2126,83 @@ mod tests {
         assert_eq!(profile.alloc_calls, 0);
     }
 
+    #[test]
+    fn dense_fp8_kv_reset_clears_cache_scales_shadows_and_host_position() {
+        let _backend_lock = crate::qwen36_moe::layer_loader::GPU_BACKEND_TEST_LOCK
+            .lock()
+            .expect("GPU backend test lock");
+        if !gpu_hal::is_backend_compiled(Backend::Hip) {
+            eprintln!("skip: HIP backend not compiled");
+            return;
+        }
+        gpu_hal::set_backend(Backend::Hip);
+        if gpu_hal::set_device(0).is_err() {
+            eprintln!("skip: HIP device 0 unavailable");
+            return;
+        }
+        let mut cache = FullAttnKvCache {
+            k: Some(dirty_gpu_buffer()),
+            v: Some(dirty_gpu_buffer()),
+            kv_max_t: 8,
+            kv_scale_k: Some(dirty_gpu_buffer()),
+            kv_scale_v: Some(dirty_gpu_buffer()),
+            kv_shadow_k: Some(dirty_gpu_buffer()),
+            kv_shadow_v: Some(dirty_gpu_buffer()),
+            kv_shadow_start: 5,
+            kv_shadow_window: 8,
+            virtual_kv_cache_k: None,
+            virtual_kv_cache_v: None,
+            virtual_kv_max_t: None,
+        };
+        let pointers = [
+            cache.k.as_ref(),
+            cache.v.as_ref(),
+            cache.kv_scale_k.as_ref(),
+            cache.kv_scale_v.as_ref(),
+            cache.kv_shadow_k.as_ref(),
+            cache.kv_shadow_v.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|buffer| buffer.as_ptr() as usize)
+        .collect::<Vec<_>>();
+
+        gpu_hal::hal_profile_set_enabled(true);
+        gpu_hal::hal_profile_reset();
+        reset_full_attention_cache(0, 0, &mut cache).expect("reset dense FP8 KV cache");
+        reset_full_attention_cache(0, 0, &mut cache).expect("repeat dense FP8 KV reset");
+        let profile = gpu_hal::hal_profile_snapshot();
+        gpu_hal::hal_profile_set_enabled(false);
+
+        let buffers = [
+            cache.k.as_ref(),
+            cache.v.as_ref(),
+            cache.kv_scale_k.as_ref(),
+            cache.kv_scale_v.as_ref(),
+            cache.kv_shadow_k.as_ref(),
+            cache.kv_shadow_v.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        assert!(buffers.iter().all(|buffer| {
+            buffer
+                .to_host_bytes()
+                .expect("read reset dense KV state")
+                .iter()
+                .all(|byte| *byte == 0)
+        }));
+        assert_eq!(
+            buffers
+                .iter()
+                .map(|buffer| buffer.as_ptr() as usize)
+                .collect::<Vec<_>>(),
+            pointers
+        );
+        assert_eq!(cache.kv_shadow_start, -1);
+        assert_eq!(profile.alloc_calls, 0);
+    }
+
     fn dirty_gpu_buffer() -> GpuBuffer {
         GpuBuffer::from_host_bytes(0, ScalarType::U8, &[16], &[0xa5; 16])
             .expect("allocate dirty reset buffer")
@@ -1596,5 +2298,59 @@ mod tests {
         assert!(err.to_string().contains("integrity failure"), "{err:#}");
         assert!(err.to_string().contains("linear-state"), "{err:#}");
         assert!(err.to_string().contains("device lost"), "{err:#}");
+    }
+
+    #[test]
+    fn reset_attempts_post_sync_after_clear_failure_and_preserves_first_error() {
+        let phases = RefCell::new(Vec::new());
+        let err = run_reset_transaction(
+            || {
+                phases.borrow_mut().push("pre-sync");
+                Ok(())
+            },
+            || {
+                phases.borrow_mut().push("clear");
+                reset_phase("layer-state", Err(anyhow::anyhow!("clear failed")))
+            },
+            || {
+                phases.borrow_mut().push("post-sync");
+                Err(anyhow::anyhow!("sync failed"))
+            },
+        )
+        .expect_err("clear failure must propagate");
+
+        assert_eq!(*phases.borrow(), ["pre-sync", "clear", "post-sync"]);
+        let message = format!("{err:#}");
+        assert!(
+            message.starts_with(
+                "Qwen3.6 engine reset integrity failure during layer-state: clear failed"
+            ),
+            "{message}"
+        );
+        assert!(message.contains("device-sync-after"), "{message}");
+        assert!(message.contains("sync failed"), "{message}");
+    }
+
+    #[test]
+    fn reset_pre_sync_failure_does_not_start_clear_or_post_sync() {
+        let phases = RefCell::new(Vec::new());
+        let err = run_reset_transaction(
+            || {
+                phases.borrow_mut().push("pre-sync");
+                Err(anyhow::anyhow!("pre-sync failed"))
+            },
+            || {
+                phases.borrow_mut().push("clear");
+                Ok(())
+            },
+            || {
+                phases.borrow_mut().push("post-sync");
+                Ok(())
+            },
+        )
+        .expect_err("pre-sync failure must propagate");
+
+        assert_eq!(*phases.borrow(), ["pre-sync"]);
+        assert!(format!("{err:#}").contains("device-sync-before"));
     }
 }

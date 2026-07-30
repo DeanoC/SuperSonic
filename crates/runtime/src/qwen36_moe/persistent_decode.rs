@@ -36,6 +36,7 @@ use kernel_ffi::qwen36_moe::{
 
 use std::ffi::c_void;
 use std::os::raw::c_int;
+use std::time::{Duration, Instant};
 
 /// Compatibility alias for callers that use the persistent module's
 /// historical cache-position sentinel. Prefer
@@ -106,6 +107,7 @@ pub struct PersistentScratch {
     /// 96-byte sync_buf: counters[0..16] + barrier_counter (+64) +
     /// barrier_flag (+68). Bridge zeros it on every launch.
     sync_buf: GpuBuffer,
+    descriptor_duration: Duration,
 }
 
 fn persistent_supports_encoding(encoding: Qwen36LayerWeightEncoding) -> bool {
@@ -201,6 +203,29 @@ fn validate_lm_head_fold(
     Ok(())
 }
 
+fn dirty_gpu_buffer_first_byte(ordinal: usize, buffer: &mut GpuBuffer) -> Result<()> {
+    let dirty = [0xa5u8];
+    copy_h2d(
+        ordinal,
+        buffer.as_mut_ptr(),
+        dirty.as_ptr() as *const c_void,
+        dirty.len(),
+    )
+    .map_err(anyhow::Error::from)
+}
+
+fn gpu_buffer_first_byte_nonzero(buffer: &GpuBuffer) -> Result<bool> {
+    let mut byte = [0u8];
+    copy_d2h(
+        buffer.device_ordinal(),
+        byte.as_mut_ptr() as *mut c_void,
+        buffer.as_ptr(),
+        byte.len(),
+    )
+    .map_err(anyhow::Error::from)?;
+    Ok(byte[0] != 0)
+}
+
 impl PersistentScratch {
     fn validate_device(&self, ordinal: usize) -> Result<()> {
         let active_backend = gpu_hal::current_backend();
@@ -218,6 +243,89 @@ impl PersistentScratch {
             ));
         }
         Ok(())
+    }
+
+    pub(crate) fn reset_mutable(&mut self, ordinal: usize) -> Result<()> {
+        self.validate_device(ordinal)?;
+        for (label, buffer) in [
+            ("hidden_ping", &mut self.hidden_ping),
+            ("hidden_pong", &mut self.hidden_pong),
+            ("workspace", &mut self.workspace),
+            ("ffn_topk_idx_scratch", &mut self.ffn_topk_idx_scratch),
+            ("sync_buf", &mut self.sync_buf),
+        ] {
+            gpu_hal::memset_zeros(ordinal, buffer.as_mut_ptr(), buffer.len_bytes())
+                .with_context(|| format!("zero persistent scratch {label}"))?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn allocation_pointers(&self) -> Vec<usize> {
+        let mut pointers = vec![
+            self.layer_descs_dev.as_ptr() as usize,
+            self.hidden_ping.as_ptr() as usize,
+            self.hidden_pong.as_ptr() as usize,
+            self.workspace.as_ptr() as usize,
+            self.ffn_topk_idx_scratch.as_ptr() as usize,
+            self.sync_buf.as_ptr() as usize,
+        ];
+        pointers.extend(
+            [
+                self.int4_scales_dev.as_ref(),
+                self.kv_fp8_descs_dev.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            .map(|buffer| buffer.as_ptr() as usize),
+        );
+        pointers
+    }
+
+    pub(crate) fn descriptor_duration(&self) -> Duration {
+        self.descriptor_duration
+    }
+
+    pub(crate) fn descriptor_bytes(&self) -> Result<Vec<Vec<u8>>> {
+        [
+            Some(&self.layer_descs_dev),
+            self.int4_scales_dev.as_ref(),
+            self.kv_fp8_descs_dev.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|buffer| buffer.to_host_bytes().map_err(anyhow::Error::from))
+        .collect()
+    }
+
+    pub(crate) fn dirty_mutable_for_reset_test(&mut self, ordinal: usize) -> Result<()> {
+        self.validate_device(ordinal)?;
+        for (label, buffer) in [
+            ("hidden_ping", &mut self.hidden_ping),
+            ("hidden_pong", &mut self.hidden_pong),
+            ("workspace", &mut self.workspace),
+            ("ffn_topk_idx_scratch", &mut self.ffn_topk_idx_scratch),
+            ("sync_buf", &mut self.sync_buf),
+        ] {
+            dirty_gpu_buffer_first_byte(ordinal, buffer)
+                .with_context(|| format!("dirty persistent scratch {label}"))?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn mutable_nonzero_labels(&self) -> Result<Vec<String>> {
+        let mut labels = Vec::new();
+        for (label, buffer) in [
+            ("hidden-ping", &self.hidden_ping),
+            ("hidden-pong", &self.hidden_pong),
+            ("workspace", &self.workspace),
+            ("ffn-topk-index", &self.ffn_topk_idx_scratch),
+            ("sync-buffer", &self.sync_buf),
+        ] {
+            if gpu_buffer_first_byte_nonzero(buffer)? {
+                labels.push(format!("persistent-scratch-{label}"));
+            }
+        }
+        Ok(labels)
     }
 
     /// Build the descriptor array + allocate scratch. Mutably borrows
@@ -260,6 +368,7 @@ impl PersistentScratch {
                 _ => None,
             })
             .collect();
+        let descriptor_start = Instant::now();
         let descs = build_layer_descs(layers);
         let layer_descs_dev =
             upload_descs(ordinal, &descs).context("upload layer descriptor array")?;
@@ -273,6 +382,7 @@ impl PersistentScratch {
             }
             None => None,
         };
+        let descriptor_duration = descriptor_start.elapsed();
 
         let hidden = geom.hidden as usize;
         let hidden_ping = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[hidden])
@@ -339,6 +449,7 @@ impl PersistentScratch {
             workspace,
             ffn_topk_idx_scratch,
             sync_buf,
+            descriptor_duration,
         })
     }
 
@@ -1209,6 +1320,136 @@ mod tests {
     use super::*;
     use crate::qwen36_moe::types::{FfnLayerBuffers, ResidentWeight};
     use gpu_hal::{Backend, VirtualAllocationRole, VirtualArena, VirtualBacking};
+
+    #[test]
+    fn persistent_scratch_reset_clears_every_mutable_buffer_without_reallocation() {
+        let _backend_lock = crate::qwen36_moe::layer_loader::GPU_BACKEND_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !gpu_hal::is_backend_compiled(Backend::Hip) {
+            eprintln!("skip: HIP backend not compiled");
+            return;
+        }
+        gpu_hal::set_backend(Backend::Hip);
+        let ordinal = 0;
+        if gpu_hal::set_device(ordinal).is_err() {
+            eprintln!("skip: HIP device 0 unavailable");
+            return;
+        }
+
+        let mut scratch = dirty_persistent_scratch(ordinal);
+        let pointers = scratch.allocation_pointers();
+        let layer_descs = scratch
+            .layer_descs_dev
+            .to_host_bytes()
+            .expect("read layer descriptors");
+        let int4_descs = scratch
+            .int4_scales_dev
+            .as_ref()
+            .expect("int4 descriptors")
+            .to_host_bytes()
+            .expect("read int4 descriptors");
+        let kv_fp8_descs = scratch
+            .kv_fp8_descs_dev
+            .as_ref()
+            .expect("KV-FP8 descriptors")
+            .to_host_bytes()
+            .expect("read KV-FP8 descriptors");
+
+        gpu_hal::hal_profile_set_enabled(true);
+        gpu_hal::hal_profile_reset();
+        scratch
+            .reset_mutable(ordinal)
+            .expect("reset dirty persistent scratch");
+        scratch
+            .reset_mutable(ordinal)
+            .expect("repeat persistent scratch reset");
+        let profile = gpu_hal::hal_profile_snapshot();
+        gpu_hal::hal_profile_set_enabled(false);
+
+        for (label, buffer) in [
+            ("hidden_ping", &scratch.hidden_ping),
+            ("hidden_pong", &scratch.hidden_pong),
+            ("workspace", &scratch.workspace),
+            ("ffn_topk_idx_scratch", &scratch.ffn_topk_idx_scratch),
+            ("sync_buf", &scratch.sync_buf),
+        ] {
+            assert!(
+                buffer
+                    .to_host_bytes()
+                    .unwrap_or_else(|error| panic!("read {label}: {error}"))
+                    .iter()
+                    .all(|byte| *byte == 0),
+                "{label} remained dirty"
+            );
+        }
+        assert_eq!(scratch.allocation_pointers(), pointers);
+        assert_eq!(
+            scratch
+                .layer_descs_dev
+                .to_host_bytes()
+                .expect("read retained layer descriptors"),
+            layer_descs
+        );
+        assert_eq!(
+            scratch
+                .int4_scales_dev
+                .as_ref()
+                .expect("retained int4 descriptors")
+                .to_host_bytes()
+                .expect("read retained int4 descriptors"),
+            int4_descs
+        );
+        assert_eq!(
+            scratch
+                .kv_fp8_descs_dev
+                .as_ref()
+                .expect("retained KV-FP8 descriptors")
+                .to_host_bytes()
+                .expect("read retained KV-FP8 descriptors"),
+            kv_fp8_descs
+        );
+        assert_eq!(profile.alloc_calls, 0);
+    }
+
+    fn dirty_persistent_scratch(ordinal: usize) -> PersistentScratch {
+        let dirty = |dtype, shape: &[usize], bytes: usize| {
+            GpuBuffer::from_host_bytes(ordinal, dtype, shape, &vec![0xa5; bytes])
+                .expect("allocate dirty persistent buffer")
+        };
+        PersistentScratch {
+            geom: Qwen36MoePersistentGeom {
+                hidden: 2,
+                num_heads: 1,
+                num_kv_heads: 1,
+                head_dim: 2,
+                rotary_dim: 2,
+                num_k_heads: 1,
+                num_v_heads: 1,
+                head_k_dim: 2,
+                head_v_dim: 2,
+                conv_kernel_dim: 2,
+                num_experts: 1,
+                moe_intermediate: 2,
+                shared_intermediate: 2,
+                top_k: 1,
+                rope_theta: 10_000_000.0,
+                rms_norm_eps: 1e-6,
+            },
+            num_layers: 0,
+            layer_is_full_attention: Vec::new(),
+            full_attn_kv_capacities: Vec::new(),
+            layer_descs_dev: dirty(ScalarType::U8, &[16], 16),
+            int4_scales_dev: Some(dirty(ScalarType::U8, &[16], 16)),
+            kv_fp8_descs_dev: Some(dirty(ScalarType::U8, &[16], 16)),
+            hidden_ping: dirty(ScalarType::BF16, &[2], 4),
+            hidden_pong: dirty(ScalarType::BF16, &[2], 4),
+            workspace: dirty(ScalarType::F32, &[2], 8),
+            ffn_topk_idx_scratch: dirty(ScalarType::U32, &[1], 4),
+            sync_buf: dirty(ScalarType::U8, &[96], 96),
+            descriptor_duration: Duration::ZERO,
+        }
+    }
 
     #[test]
     fn persistent_mode_requires_supported_descriptor_encoding() {
