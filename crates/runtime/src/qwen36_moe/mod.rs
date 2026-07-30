@@ -10,6 +10,7 @@ pub mod config {
 pub mod chain;
 pub mod decode;
 pub mod decode_loop;
+pub mod engine;
 pub mod geometry;
 pub mod layer_loader;
 pub mod layers;
