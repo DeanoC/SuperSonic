@@ -32,20 +32,16 @@ pub mod qwen36_moe_logits;
 pub mod qwen36_moe_mtp;
 #[path = "qwen36_moe/persistent_decode.rs"]
 pub mod qwen36_moe_persistent_decode;
-#[path = "qwen36_moe/residency.rs"]
-pub mod qwen36_moe_residency;
-#[path = "qwen36_moe/residency_pages.rs"]
-pub mod qwen36_moe_residency_pages;
-#[path = "qwen36_moe/residency_types.rs"]
-pub mod qwen36_moe_residency_types;
+pub use supersonic_runtime::qwen36_moe::residency as qwen36_moe_residency;
+pub use supersonic_runtime::qwen36_moe::residency as qwen36_moe_residency_types;
+pub use supersonic_runtime::qwen36_moe::residency_pages as qwen36_moe_residency_pages;
 #[path = "qwen36_moe/speculative.rs"]
 pub mod qwen36_moe_speculative;
 #[path = "qwen36_moe/state.rs"]
 pub mod qwen36_moe_state;
 #[path = "qwen36_moe/telemetry.rs"]
 pub mod qwen36_moe_telemetry;
-#[path = "qwen36_moe/types.rs"]
-pub mod qwen36_moe_types;
+pub use supersonic_runtime::qwen36_moe::types as qwen36_moe_types;
 pub mod qwen36_q4km_audit;
 pub mod registry;
 pub mod specprefill;

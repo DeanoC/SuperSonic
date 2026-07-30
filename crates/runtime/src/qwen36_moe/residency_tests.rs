@@ -2,9 +2,36 @@ use super::*;
 use gpu_hal::{Backend, VirtualAllocationRole};
 use model_store::manifest::{LayoutTag, Manifest, TensorMeta, FORMAT_VERSION};
 use model_store::VirtualArenaTransferBackend;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 static VMM_BACKEND_TEST_LOCK: Mutex<()> = Mutex::new(());
+static TEST_DIR_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+struct TestDir(PathBuf);
+
+impl TestDir {
+    fn new() -> Self {
+        let suffix = TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "supersonic-runtime-qwen36-residency-{}-{suffix}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&path).expect("create test directory");
+        Self(path)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TestDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
 
 struct BackendRestore(Backend);
 
@@ -14,8 +41,8 @@ impl Drop for BackendRestore {
     }
 }
 
-fn synthetic_store(expert_count: usize, expert_bytes: usize) -> tempfile::TempDir {
-    let tmp = tempfile::tempdir().expect("tempdir");
+fn synthetic_store(expert_count: usize, expert_bytes: usize) -> TestDir {
+    let tmp = TestDir::new();
     let bake_dir = tmp.path();
     let total_bytes = expert_count * expert_bytes;
     let mut weights = vec![0u8; total_bytes];
@@ -47,6 +74,48 @@ fn synthetic_store(expert_count: usize, expert_bytes: usize) -> tempfile::TempDi
     )
     .expect("write manifest");
     tmp
+}
+
+fn reset_mutable_state(state: &mut [u8]) {
+    state.fill(0);
+}
+
+#[test]
+fn residency_config_rejects_zero_page_budget() {
+    assert!(MoeExpertResidencyConfig::new(0).is_err());
+    assert_eq!(
+        MoeExpertResidencyConfig::new(8)
+            .unwrap()
+            .with_prefetch_evict(true),
+        MoeExpertResidencyConfig {
+            max_resident_pages: 8,
+            prefetch_evict: true,
+        }
+    );
+}
+
+#[test]
+fn expert_keys_are_hashable_runtime_contracts() {
+    let key = MoeExpertKey {
+        layer_idx: 3,
+        expert_idx: 17,
+        projection: MoeExpertProjection::GateUp,
+    };
+    let mut set = std::collections::HashSet::new();
+
+    set.insert(key);
+
+    assert!(set.contains(&key));
+    assert_ne!(MoeExpertProjection::GateUp, MoeExpertProjection::Down);
+}
+
+#[test]
+fn residency_stats_default_to_empty() {
+    let stats = MoeExpertResidencyStats::default();
+
+    assert_eq!(stats.registered_tensors, 0);
+    assert_eq!(stats.resident_pages, 0);
+    assert_eq!(stats.async_pending_pages_peak, 0);
 }
 
 fn vmm_backends() -> [Backend; 2] {
@@ -94,6 +163,57 @@ fn reserves_expert_slab_without_resident_pages() {
         assert_eq!(arena_stats.logical_resident_bytes, 0);
         assert_eq!(arena_stats.mapping_count, 0);
     });
+}
+
+#[test]
+fn mutable_state_reset_preserves_mapped_expert_residency() {
+    with_supported_vmm_backend(
+        "mutable_state_reset_preserves_mapped_expert_residency",
+        |_backend| {
+            let tmp = synthetic_store(2, 4096);
+            let store = BakedStore::open(tmp.path()).expect("open synthetic store");
+            let mut manager =
+                MoeExpertResidencyManager::new(0, MoeExpertResidencyConfig::new(1).unwrap());
+            let reservation = manager
+                .register_tensor(
+                    &store,
+                    0,
+                    MoeExpertProjection::GateUp,
+                    "model.layers.0.mlp.experts.gate_up_proj",
+                    2,
+                )
+                .expect("register tensor");
+            let key = MoeExpertKey {
+                layer_idx: 0,
+                expert_idx: 0,
+                projection: MoeExpertProjection::GateUp,
+            };
+            manager.ensure_resident(&store, key).expect("map expert");
+
+            let resident_ptr = manager
+                .resident_weight(0, MoeExpertProjection::GateUp)
+                .expect("resident weight")
+                .as_ptr();
+            let stats_before_reset = manager.stats();
+            let arena_before_reset = manager.arena().stats();
+            let mut mutable_state = [0x5au8; 32];
+
+            reset_mutable_state(&mut mutable_state);
+
+            assert_eq!(mutable_state, [0; 32]);
+            assert!(manager.is_resident(key));
+            assert_eq!(manager.stats(), stats_before_reset);
+            assert_eq!(manager.arena().stats(), arena_before_reset);
+            assert_eq!(resident_ptr, reservation.ptr);
+            assert_eq!(
+                manager
+                    .resident_weight(0, MoeExpertProjection::GateUp)
+                    .expect("resident weight after reset")
+                    .as_ptr(),
+                resident_ptr
+            );
+        },
+    );
 }
 
 #[test]
