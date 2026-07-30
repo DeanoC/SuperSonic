@@ -113,6 +113,7 @@ pub(crate) fn run_batched_prefill_stub(
     kept_positions: &[usize],
     effective_prompt_len: usize,
     emit_stage_timings: bool,
+    execution: &supersonic_runtime::qwen36_moe::decode::Qwen36ExecutionOptions,
 ) -> Result<BatchedPrefillTimings> {
     let prefill_count = effective_prompt_len.saturating_sub(1);
     if prefill_count == 0 {
@@ -167,6 +168,7 @@ pub(crate) fn run_batched_prefill_stub(
                 emit_stage_timings,
                 fold: None,
                 download_final_hidden: true,
+                execution,
             })?;
             Ok(
                 supersonic_runtime::qwen36_moe::prefill::PrefillTokenTimings {
@@ -196,6 +198,7 @@ pub(crate) fn run_batched_prefill_stub(
         &tokens,
         &positions,
         emit_stage_timings,
+        execution,
         Some(&mut fallback),
         Some(&mut progress),
     )?;

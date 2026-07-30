@@ -98,6 +98,7 @@ pub(crate) fn load_decode_layers_with_vmm_strategy(
                 prefetch_evict: moe_prefetch_evict,
                 transfer_backend: moe_virtual_transfer_backend,
             }),
+            &crate::qwen36_moe_cli::options::load_options_from_environment(),
         )
         .context("reserve Qwen3.6-MoE routed experts for sparse VMM residency")?;
         let buffers_elapsed = buffers_start.elapsed();
@@ -192,6 +193,7 @@ pub(crate) fn load_decode_layers_with_vmm_strategy(
             Qwen36LayerLoadStrategy::VirtualExperts {
                 transfer_backend: moe_virtual_transfer_backend,
             },
+            &crate::qwen36_moe_cli::options::load_options_from_environment(),
         ) {
             Ok(loaded) => {
                 let buffers_elapsed = buffers_start.elapsed();
@@ -241,6 +243,7 @@ pub(crate) fn load_decode_layers_with_vmm_strategy(
         kv_fp8,
         kv_vmm,
         Qwen36LayerLoadStrategy::Dense,
+        &crate::qwen36_moe_cli::options::load_options_from_environment(),
     )?;
     let buffers_elapsed = buffers_start.elapsed();
     Ok(Qwen36LayerLoadResult {

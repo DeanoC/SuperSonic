@@ -883,12 +883,7 @@ fn decode_text(
     progress_heartbeat_seconds: f64,
     flm_virtual_transfer_backend_cli: Option<&str>,
 ) -> Result<()> {
-    let runtime_options =
-        supersonic_runtime::qwen36_moe::decode::Qwen36ExecutionOptions::from_pairs(
-            std::env::vars().filter(|(name, _)| name.starts_with("SUPERSONIC_")),
-        )
-        .with_diagnostic_observer(std::sync::Arc::new(|message| eprintln!("{message}")));
-    let _runtime_options_guard = runtime_options.install();
+    let runtime_options = crate::qwen36_moe_cli::options::execution_options_from_environment();
 
     validate_speculative_sampling(speculative_decode, sampling)?;
 
@@ -1339,6 +1334,7 @@ fn decode_text(
             &kept_positions,
             effective_prompt_len,
             emit_stage_timings,
+            &runtime_options,
         )?;
         eprintln!(
             "[qwen36-moe batched-prefill] chunks={} tokens={} embed_ms={:.1} chain_ms={:.1}",
@@ -1542,6 +1538,7 @@ fn decode_text(
             emit_stage_timings,
             fold,
             download_final_hidden,
+            execution: &runtime_options,
         })?;
         let outputs = chain_step.outputs;
         let lm_head_folded = chain_step.lm_head_folded;

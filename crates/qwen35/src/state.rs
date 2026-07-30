@@ -19,6 +19,21 @@ pub struct VirtualKvMemoryStats {
     pub mappings: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KvFp8SidecarOptions {
+    pub enabled: bool,
+    pub window_tokens: Option<usize>,
+}
+
+impl Default for KvFp8SidecarOptions {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            window_tokens: None,
+        }
+    }
+}
+
 pub fn kv_fp8_bf16_sidecar_enabled() -> bool {
     std::env::var_os("SUPERSONIC_DEBUG_DISABLE_KV_FP8_BF16_SIDECAR").is_none()
 }
@@ -27,6 +42,22 @@ pub fn kv_fp8_bf16_sidecar_window_tokens() -> Option<usize> {
     std::env::var("SUPERSONIC_DEBUG_KV_FP8_BF16_SIDECAR_WINDOW")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
+}
+
+#[cfg(test)]
+mod explicit_policy_tests {
+    use super::KvFp8SidecarOptions;
+
+    #[test]
+    fn kv_fp8_sidecar_policy_is_an_explicit_typed_value() {
+        let policy = KvFp8SidecarOptions {
+            enabled: false,
+            window_tokens: Some(17),
+        };
+
+        assert!(!policy.enabled);
+        assert_eq!(policy.window_tokens, Some(17));
+    }
 }
 
 /// Mutable per-layer state (KV cache, conv state, recurrent state).

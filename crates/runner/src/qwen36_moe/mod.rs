@@ -12,6 +12,7 @@ pub(crate) mod layers;
 pub(crate) mod legacy;
 pub(crate) mod lm_head;
 pub(crate) mod mtp_loader;
+pub(crate) mod options;
 pub(crate) mod output;
 pub(crate) mod policy;
 pub(crate) mod prefetch;

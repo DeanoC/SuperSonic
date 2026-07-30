@@ -4,9 +4,7 @@ use model_store::manifest::{LayoutTag, Manifest, TensorMeta, FORMAT_VERSION};
 use model_store::VirtualArenaTransferBackend;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
 
-static VMM_BACKEND_TEST_LOCK: Mutex<()> = Mutex::new(());
 static TEST_DIR_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 struct TestDir(PathBuf);
@@ -123,7 +121,7 @@ fn vmm_backends() -> [Backend; 2] {
 }
 
 fn with_supported_vmm_backend(test_name: &str, mut f: impl FnMut(Backend)) {
-    let _lock = VMM_BACKEND_TEST_LOCK
+    let _lock = crate::qwen36_moe::layer_loader::GPU_BACKEND_TEST_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let _restore_backend = BackendRestore(gpu_hal::current_backend());

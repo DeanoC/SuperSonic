@@ -1,3 +1,97 @@
+pub type Qwen36MoeDiagnosticObserver = dyn Fn(&str) + Send + Sync + 'static;
+
+#[derive(Clone, Default)]
+pub struct Qwen36MoeLaunchOptions {
+    pub force_host_native: bool,
+    pub full_attn_online: bool,
+    pub enable_full_attn_native: bool,
+    pub full_attn_score_tap: bool,
+    pub full_attn_prob_tap: bool,
+    pub full_attn_exp_tap: bool,
+    pub full_attn_denom_tap: bool,
+    pub disable_linear_int4_stage5: bool,
+    pub enable_ffn_int4_stage5: bool,
+    pub enable_ffn_int4_stage5_router: bool,
+    pub defer_ffn_router_stage5_wait: bool,
+    pub sync_ffn_router_stage5_wait: bool,
+    pub ffn_router_stage5_parity_tap: bool,
+    pub ffn_router_stage5_parity_tap_layer: Option<i32>,
+    pub ffn_router_stage5_parity_tap_max_calls: Option<usize>,
+    pub ffn_shared_stage5_parity_tap: bool,
+    pub ffn_shared_stage5_parity_tap_max_calls: Option<usize>,
+    pub ffn_stage5_shared_host_correction: bool,
+    pub ffn_stage5_shared_mid_host_correction: bool,
+    pub ffn_stage5_routed_host_correction: bool,
+    pub ffn_stage5_routed_down_host_recompute_correction: bool,
+    pub ffn_stage5_routed_down_host_recompute_correction_layer: Option<i32>,
+    pub ffn_stage5_residual_host_snap: bool,
+    pub ffn_stage5_residual_host_snap_layer: Option<i32>,
+    pub ffn_stage5_residual_host_snap_row: Option<usize>,
+    pub ffn_stage5_routed_gate_up_tap: bool,
+    pub ffn_stage5_routed_silu_tap: bool,
+    pub ffn_stage5_routed_finalize_tap: bool,
+    pub ffn_stage5_routed_tap_layer: Option<i32>,
+    pub enable_ffn_router_stage5_simd: bool,
+    pub enable_ffn_router_fused_exact: bool,
+    pub disable_ffn_router_stage5_exact_simd: bool,
+    pub enable_ffn_shared_tiled: bool,
+    pub enable_ffn_shared_gate_up_tiled: bool,
+    pub enable_ffn_shared_gate_up_exp2: bool,
+    pub disable_ffn_shared_gate_up_exact_simd: bool,
+    pub enable_ffn_shared_scalar_simd: bool,
+    pub enable_ffn_shared_scalar_exact_simd: bool,
+    pub enable_ffn_shared_down_tiled: bool,
+    pub enable_ffn_shared_down_exact_simd: bool,
+    pub defer_ffn_direct_gather_stage5_wait: bool,
+    pub enable_ffn_expert_gate_up_tiled: bool,
+    pub enable_ffn_expert_tiled_stage5: bool,
+    pub enable_ffn_expert_packed_stage5: bool,
+    pub enable_ffn_expert_direct_gather_stage5: bool,
+    pub enable_ffn_expert_gpu_pack_stage5: bool,
+    pub enable_ffn_expert_mps_bridge: bool,
+    pub enable_ffn_expert_mps_static_topn_partial: bool,
+    pub enable_ffn_expert_static_topn_partial: bool,
+    pub enable_ffn_expert_static_topn: bool,
+    pub static_topn_json: Option<Arc<str>>,
+    pub static_topn_capacity: Option<usize>,
+    pub enable_ffn_expert_pack_hotset: bool,
+    pub ffn_expert_hotset_capacity: Option<usize>,
+    pub mps_bridge_cpu_transcode: bool,
+    pub mps_bridge_cpu_transcode_lut: bool,
+    pub mps_bridge_cpu_transcode_stream: bool,
+    pub profile: bool,
+    pub route_profile: bool,
+    pub enable_ffn_expert_pack_cache: bool,
+    pub disable_ffn_expert_pack_cache: bool,
+    pub diagnostic_observer: Option<Arc<Qwen36MoeDiagnosticObserver>>,
+}
+
+impl Qwen36MoeLaunchOptions {
+    fn emit_diagnostic(&self, message: &str) {
+        if let Some(observer) = self.diagnostic_observer.as_ref() {
+            observer(message);
+        }
+    }
+}
+
+fn qwen36_launch_flag(
+    options: Option<&Qwen36MoeLaunchOptions>,
+    field: impl FnOnce(&Qwen36MoeLaunchOptions) -> bool,
+    environment_name: &str,
+) -> bool {
+    match options {
+        Some(options) => field(options),
+        None => std::env::var_os(environment_name).is_some(),
+    }
+}
+
+fn qwen36_emit_diagnostic(options: Option<&Qwen36MoeLaunchOptions>, message: String) {
+    match options {
+        Some(options) => options.emit_diagnostic(&message),
+        None => eprintln!("{message}"),
+    }
+}
+
 /// Geometry + position state for the staged-attention parity launcher.
 /// These are constants of the layer being tested; bundling them into a
 /// struct keeps the safe wrapper below from sprouting eight scalar args.
@@ -139,6 +233,47 @@ pub fn attn_step_launch(
     workspace: &mut GpuBuffer,
     sync_buf: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    attn_step_launch_impl(
+        ordinal, dtype, params, weights, int4, output, workspace, sync_buf, None,
+    )
+}
+
+pub fn attn_step_launch_with_options(
+    ordinal: usize,
+    dtype: ScalarType,
+    params: Qwen36MoeAttnStepParams,
+    weights: &Qwen36MoeAttnStepWeights,
+    int4: &Qwen36MoeAttnStepInt4,
+    output: &mut GpuBuffer,
+    workspace: &mut GpuBuffer,
+    sync_buf: &mut GpuBuffer,
+    options: &Qwen36MoeLaunchOptions,
+) -> Result<(), GpuError> {
+    attn_step_launch_impl(
+        ordinal,
+        dtype,
+        params,
+        weights,
+        int4,
+        output,
+        workspace,
+        sync_buf,
+        Some(options),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn attn_step_launch_impl(
+    ordinal: usize,
+    dtype: ScalarType,
+    params: Qwen36MoeAttnStepParams,
+    weights: &Qwen36MoeAttnStepWeights,
+    int4: &Qwen36MoeAttnStepInt4,
+    output: &mut GpuBuffer,
+    workspace: &mut GpuBuffer,
+    sync_buf: &mut GpuBuffer,
+    options: Option<&Qwen36MoeLaunchOptions>,
+) -> Result<(), GpuError> {
     if dtype != ScalarType::BF16 {
         return Err(GpuError::InvalidArg(format!(
             "qwen36_moe::attn_step_launch: only BF16 is wired, got {dtype:?}"
@@ -152,7 +287,9 @@ pub fn attn_step_launch(
     }
     let backend = output.backend();
     if backend == Backend::Metal {
-        return attn_step_stage1_5_metal_host(params, weights, int4, output, workspace, None);
+        return attn_step_stage1_5_metal_host(
+            params, weights, int4, output, workspace, None, options,
+        );
     }
 
     let counters = sync_buf.as_mut_ptr() as *mut c_uint;
@@ -259,18 +396,54 @@ pub unsafe fn attn_step_stage5_metal_host_into(
         output,
         workspace,
         Some((final_output, final_output_capacity)),
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn attn_step_stage5_metal_host_into_with_options(
+    params: Qwen36MoeAttnStepParams,
+    weights: &Qwen36MoeAttnStepWeights,
+    int4: &Qwen36MoeAttnStepInt4,
+    output: &mut GpuBuffer,
+    workspace: &mut GpuBuffer,
+    final_output: *mut c_void,
+    final_output_capacity: usize,
+    options: &Qwen36MoeLaunchOptions,
+) -> Result<(), GpuError> {
+    if output.backend() != Backend::Metal {
+        return Err(GpuError::backend(
+            output.backend(),
+            "qwen36_moe::attn_step_stage5_metal_host_into_with_options requires Metal output"
+                .into(),
+        ));
+    }
+    if params.stage != 5 {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::attn_step_stage5_metal_host_into_with_options requires stage=5, got {}",
+            params.stage
+        )));
+    }
+    attn_step_stage1_5_metal_host(
+        params,
+        weights,
+        int4,
+        output,
+        workspace,
+        Some((final_output, final_output_capacity)),
+        Some(options),
     )
 }
 
 const QWEN36_FULL_ATTN_NATIVE_MAX_SCORE_TOKENS: usize = 128;
 const QWEN36_FULL_ATTN_ONLINE_MAX_TOKENS: usize = 1024;
 
-fn qwen36_full_attn_online_enabled() -> bool {
-    std::env::var_os("SUPERSONIC_METAL_QWEN36_FULL_ATTN_ONLINE").is_some()
-}
-
-fn qwen36_full_attn_native_token_cap() -> usize {
-    if qwen36_full_attn_online_enabled() {
+fn qwen36_full_attn_native_token_cap(options: Option<&Qwen36MoeLaunchOptions>) -> usize {
+    if qwen36_launch_flag(
+        options,
+        |options| options.full_attn_online,
+        "SUPERSONIC_METAL_QWEN36_FULL_ATTN_ONLINE",
+    ) {
         QWEN36_FULL_ATTN_ONLINE_MAX_TOKENS
     } else {
         QWEN36_FULL_ATTN_NATIVE_MAX_SCORE_TOKENS
@@ -283,14 +456,46 @@ pub fn attn_step_stage5_metal_native_supported(
     int4: &Qwen36MoeAttnStepInt4,
     output_capacity: usize,
 ) -> bool {
+    attn_step_stage5_metal_native_supported_impl(params, weights, int4, output_capacity, None)
+}
+
+pub fn attn_step_stage5_metal_native_supported_with_options(
+    params: Qwen36MoeAttnStepParams,
+    weights: &Qwen36MoeAttnStepWeights,
+    int4: &Qwen36MoeAttnStepInt4,
+    output_capacity: usize,
+    options: &Qwen36MoeLaunchOptions,
+) -> bool {
+    attn_step_stage5_metal_native_supported_impl(
+        params,
+        weights,
+        int4,
+        output_capacity,
+        Some(options),
+    )
+}
+
+fn attn_step_stage5_metal_native_supported_impl(
+    params: Qwen36MoeAttnStepParams,
+    weights: &Qwen36MoeAttnStepWeights,
+    int4: &Qwen36MoeAttnStepInt4,
+    output_capacity: usize,
+    options: Option<&Qwen36MoeLaunchOptions>,
+) -> bool {
     let eff_cache_pos = if params.cache_pos >= 0 {
         params.cache_pos
     } else {
         params.position
     };
-    std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FULL_ATTN_NATIVE").is_some()
-        && std::env::var_os("SUPERSONIC_METAL_DISABLE_QWEN36_FULL_ATTN_NATIVE").is_none()
-        && params.stage == 5
+    qwen36_launch_flag(
+        options,
+        |options| options.enable_full_attn_native,
+        "SUPERSONIC_METAL_ENABLE_QWEN36_FULL_ATTN_NATIVE",
+    ) && !qwen36_launch_flag(
+        options,
+        |_| false,
+        "SUPERSONIC_METAL_DISABLE_QWEN36_FULL_ATTN_NATIVE",
+    ) && params.stage == 5
         && params.hidden == 2048
         && params.num_heads == 16
         && params.num_kv_heads == 2
@@ -298,7 +503,7 @@ pub fn attn_step_stage5_metal_native_supported(
         && params.rotary_dim >= 0
         && params.rotary_dim <= params.head_dim
         && eff_cache_pos >= 0
-        && (eff_cache_pos as usize) < qwen36_full_attn_native_token_cap()
+        && (eff_cache_pos as usize) < qwen36_full_attn_native_token_cap(options)
         && weights.kv_max_t > eff_cache_pos
         && int4.group_size == 128
         && qwen36_lowbit_native_int4(int4.q_proj_type)
@@ -306,7 +511,11 @@ pub fn attn_step_stage5_metal_native_supported(
         && qwen36_lowbit_native_int4(int4.v_proj_type)
         && qwen36_lowbit_native_int4(int4.o_proj_type)
         && output_capacity >= params.hidden as usize
-        && !crate::metal_native::disabled_by_env()
+        && !qwen36_launch_flag(
+            options,
+            |options| options.force_host_native,
+            "SUPERSONIC_METAL_FORCE_HOST_NATIVE",
+        )
         && !weights.input_hidden.is_null()
         && !weights.input_norm_w.is_null()
         && !weights.q_proj_w.is_null()
@@ -340,13 +549,81 @@ pub unsafe fn attn_step_stage5_metal_native_into(
     final_output_capacity: usize,
     wait_for_completion: bool,
 ) -> Result<(), GpuError> {
+    unsafe {
+        attn_step_stage5_metal_native_into_impl(
+            params,
+            weights,
+            int4,
+            rope_cos,
+            rope_sin,
+            output,
+            workspace,
+            final_output,
+            final_output_capacity,
+            wait_for_completion,
+            None,
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn attn_step_stage5_metal_native_into_with_options(
+    params: Qwen36MoeAttnStepParams,
+    weights: &Qwen36MoeAttnStepWeights,
+    int4: &Qwen36MoeAttnStepInt4,
+    rope_cos: *const c_void,
+    rope_sin: *const c_void,
+    output: &mut GpuBuffer,
+    workspace: &mut GpuBuffer,
+    final_output: *mut c_void,
+    final_output_capacity: usize,
+    wait_for_completion: bool,
+    options: &Qwen36MoeLaunchOptions,
+) -> Result<(), GpuError> {
+    unsafe {
+        attn_step_stage5_metal_native_into_impl(
+            params,
+            weights,
+            int4,
+            rope_cos,
+            rope_sin,
+            output,
+            workspace,
+            final_output,
+            final_output_capacity,
+            wait_for_completion,
+            Some(options),
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn attn_step_stage5_metal_native_into_impl(
+    params: Qwen36MoeAttnStepParams,
+    weights: &Qwen36MoeAttnStepWeights,
+    int4: &Qwen36MoeAttnStepInt4,
+    rope_cos: *const c_void,
+    rope_sin: *const c_void,
+    output: &mut GpuBuffer,
+    workspace: &mut GpuBuffer,
+    final_output: *mut c_void,
+    final_output_capacity: usize,
+    wait_for_completion: bool,
+    options: Option<&Qwen36MoeLaunchOptions>,
+) -> Result<(), GpuError> {
     if output.backend() != Backend::Metal {
         return Err(GpuError::backend(
             output.backend(),
             "qwen36_moe::attn_step_stage5_metal_native_into requires Metal output".into(),
         ));
     }
-    if !attn_step_stage5_metal_native_supported(params, weights, int4, final_output_capacity) {
+    if !attn_step_stage5_metal_native_supported_impl(
+        params,
+        weights,
+        int4,
+        final_output_capacity,
+        options,
+    ) {
         return Err(GpuError::InvalidArg(
             "qwen36_moe::attn_step_stage5_metal_native_into unsupported configuration".into(),
         ));
@@ -362,7 +639,7 @@ pub unsafe fn attn_step_stage5_metal_native_into(
             params.position,
             params.cache_pos,
             weights.kv_max_t as usize,
-            qwen36_full_attn_native_token_cap(),
+            qwen36_full_attn_native_token_cap(options),
             params.rms_norm_eps,
             params.rope_theta,
             rope_cos,
@@ -400,6 +677,7 @@ fn attn_step_stage1_5_metal_host(
     output: &mut GpuBuffer,
     workspace: &mut GpuBuffer,
     final_output_override: Option<(*mut c_void, usize)>,
+    options: Option<&Qwen36MoeLaunchOptions>,
 ) -> Result<(), GpuError> {
     if output.dtype() != ScalarType::BF16 || workspace.dtype() != ScalarType::F32 {
         return Err(GpuError::InvalidArg(format!(
@@ -515,29 +793,41 @@ fn attn_step_stage1_5_metal_host(
         q_normed_dim
     };
     let score_tap_elems = if params.stage >= 5
-        && std::env::var_os("SUPERSONIC_METAL_QWEN36_FULL_ATTN_SCORE_TAP").is_some()
-    {
+        && qwen36_launch_flag(
+            options,
+            |options| options.full_attn_score_tap,
+            "SUPERSONIC_METAL_QWEN36_FULL_ATTN_SCORE_TAP",
+        ) {
         num_heads * kv_len
     } else {
         0
     };
     let prob_tap_elems = if params.stage >= 5
-        && std::env::var_os("SUPERSONIC_METAL_QWEN36_FULL_ATTN_PROB_TAP").is_some()
-    {
+        && qwen36_launch_flag(
+            options,
+            |options| options.full_attn_prob_tap,
+            "SUPERSONIC_METAL_QWEN36_FULL_ATTN_PROB_TAP",
+        ) {
         num_heads * kv_len
     } else {
         0
     };
     let exp_tap_elems = if params.stage >= 5
-        && std::env::var_os("SUPERSONIC_METAL_QWEN36_FULL_ATTN_EXP_TAP").is_some()
-    {
+        && qwen36_launch_flag(
+            options,
+            |options| options.full_attn_exp_tap,
+            "SUPERSONIC_METAL_QWEN36_FULL_ATTN_EXP_TAP",
+        ) {
         num_heads * kv_len
     } else {
         0
     };
     let denom_tap_elems = if params.stage >= 5
-        && std::env::var_os("SUPERSONIC_METAL_QWEN36_FULL_ATTN_DENOM_TAP").is_some()
-    {
+        && qwen36_launch_flag(
+            options,
+            |options| options.full_attn_denom_tap,
+            "SUPERSONIC_METAL_QWEN36_FULL_ATTN_DENOM_TAP",
+        ) {
         num_heads
     } else {
         0
@@ -803,7 +1093,7 @@ fn attn_step_stage1_5_metal_host(
                 scores[t] = score;
                 max_score = max_score.max(score);
             }
-            if std::env::var_os("SUPERSONIC_METAL_QWEN36_FULL_ATTN_SCORE_TAP").is_some() {
+            if score_tap_elems > 0 {
                 let score_base = off_o_out + hidden + hq * kv_len;
                 let score_end = score_base + kv_len;
                 if score_end <= workspace.len() {
@@ -815,14 +1105,14 @@ fn attn_step_stage1_5_metal_host(
                 *score = (*score - max_score).exp();
                 denom += *score;
             }
-            if std::env::var_os("SUPERSONIC_METAL_QWEN36_FULL_ATTN_EXP_TAP").is_some() {
+            if exp_tap_elems > 0 {
                 let exp_base = off_o_out + hidden + score_tap_elems + prob_tap_elems + hq * kv_len;
                 let exp_end = exp_base + kv_len;
                 if exp_end <= workspace.len() {
                     workspace[exp_base..exp_end].copy_from_slice(&scores);
                 }
             }
-            if std::env::var_os("SUPERSONIC_METAL_QWEN36_FULL_ATTN_DENOM_TAP").is_some() {
+            if denom_tap_elems > 0 {
                 let denom_base =
                     off_o_out + hidden + score_tap_elems + prob_tap_elems + exp_tap_elems;
                 let denom_idx = denom_base + hq;
@@ -830,7 +1120,7 @@ fn attn_step_stage1_5_metal_host(
                     workspace[denom_idx] = denom;
                 }
             }
-            if std::env::var_os("SUPERSONIC_METAL_QWEN36_FULL_ATTN_PROB_TAP").is_some() {
+            if prob_tap_elems > 0 {
                 let prob_base = off_o_out + hidden + score_tap_elems + hq * kv_len;
                 let prob_end = prob_base + kv_len;
                 if prob_end <= workspace.len() {
@@ -1006,9 +1296,13 @@ fn qwen36_linear_int4_stage5_metal_native_supported(
     weights: &Qwen36MoeLinearStepWeights,
     int4: &Qwen36MoeLinearStepInt4,
     output_capacity: usize,
+    options: Option<&Qwen36MoeLaunchOptions>,
 ) -> bool {
-    std::env::var_os("SUPERSONIC_METAL_DISABLE_QWEN36_LINEAR_INT4_STAGE5").is_none()
-        && params.stage == 5
+    !qwen36_launch_flag(
+        options,
+        |options| options.disable_linear_int4_stage5,
+        "SUPERSONIC_METAL_DISABLE_QWEN36_LINEAR_INT4_STAGE5",
+    ) && params.stage == 5
         && params.hidden == 2048
         && params.num_k_heads == 16
         && params.num_v_heads == 32
@@ -1020,7 +1314,11 @@ fn qwen36_linear_int4_stage5_metal_native_supported(
         && qwen36_lowbit_native_int4(int4.in_proj_z_type)
         && qwen36_lowbit_native_int4(int4.out_proj_type)
         && output_capacity >= params.hidden as usize
-        && !crate::metal_native::disabled_by_env()
+        && !qwen36_launch_flag(
+            options,
+            |options| options.force_host_native,
+            "SUPERSONIC_METAL_FORCE_HOST_NATIVE",
+        )
         && !weights.input_hidden.is_null()
         && !weights.input_norm_w.is_null()
         && !weights.in_proj_qkv_w.is_null()
@@ -1056,6 +1354,47 @@ pub fn linear_step_launch(
     workspace: &mut GpuBuffer,
     sync_buf: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    linear_step_launch_impl(
+        ordinal, dtype, params, weights, int4, output, workspace, sync_buf, None,
+    )
+}
+
+pub fn linear_step_launch_with_options(
+    ordinal: usize,
+    dtype: ScalarType,
+    params: Qwen36MoeLinearStepParams,
+    weights: &Qwen36MoeLinearStepWeights,
+    int4: &Qwen36MoeLinearStepInt4,
+    output: &mut GpuBuffer,
+    workspace: &mut GpuBuffer,
+    sync_buf: &mut GpuBuffer,
+    options: &Qwen36MoeLaunchOptions,
+) -> Result<(), GpuError> {
+    linear_step_launch_impl(
+        ordinal,
+        dtype,
+        params,
+        weights,
+        int4,
+        output,
+        workspace,
+        sync_buf,
+        Some(options),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn linear_step_launch_impl(
+    ordinal: usize,
+    dtype: ScalarType,
+    params: Qwen36MoeLinearStepParams,
+    weights: &Qwen36MoeLinearStepWeights,
+    int4: &Qwen36MoeLinearStepInt4,
+    output: &mut GpuBuffer,
+    workspace: &mut GpuBuffer,
+    sync_buf: &mut GpuBuffer,
+    options: Option<&Qwen36MoeLaunchOptions>,
+) -> Result<(), GpuError> {
     if dtype != ScalarType::BF16 {
         return Err(GpuError::InvalidArg(format!(
             "qwen36_moe::linear_step_launch: only BF16 is wired, got {dtype:?}"
@@ -1073,7 +1412,7 @@ pub fn linear_step_launch(
     if backend == Backend::Metal {
         if params.stage <= 5 {
             return linear_step_stage1_5_metal_host(
-                params, weights, int4, output, workspace, None, true,
+                params, weights, int4, output, workspace, None, true, options,
             );
         }
         return Err(GpuError::InvalidArg(
@@ -1187,6 +1526,44 @@ pub unsafe fn linear_step_stage5_metal_native_into(
         workspace,
         Some((final_output, final_output_capacity)),
         wait_for_completion,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn linear_step_stage5_metal_native_into_with_options(
+    params: Qwen36MoeLinearStepParams,
+    weights: &Qwen36MoeLinearStepWeights,
+    int4: &Qwen36MoeLinearStepInt4,
+    output: &mut GpuBuffer,
+    workspace: &mut GpuBuffer,
+    final_output: *mut c_void,
+    final_output_capacity: usize,
+    wait_for_completion: bool,
+    options: &Qwen36MoeLaunchOptions,
+) -> Result<(), GpuError> {
+    if output.backend() != Backend::Metal {
+        return Err(GpuError::backend(
+            output.backend(),
+            "qwen36_moe::linear_step_stage5_metal_native_into_with_options requires Metal output"
+                .into(),
+        ));
+    }
+    if params.stage != 5 {
+        return Err(GpuError::InvalidArg(format!(
+            "qwen36_moe::linear_step_stage5_metal_native_into_with_options requires stage=5, got {}",
+            params.stage
+        )));
+    }
+    linear_step_stage1_5_metal_host(
+        params,
+        weights,
+        int4,
+        output,
+        workspace,
+        Some((final_output, final_output_capacity)),
+        wait_for_completion,
+        Some(options),
     )
 }
 
@@ -1198,6 +1575,7 @@ fn linear_step_stage1_5_metal_host(
     workspace: &mut GpuBuffer,
     final_output_override: Option<(*mut c_void, usize)>,
     wait_for_completion: bool,
+    options: Option<&Qwen36MoeLaunchOptions>,
 ) -> Result<(), GpuError> {
     if output.dtype() != ScalarType::BF16 || workspace.dtype() != ScalarType::F32 {
         return Err(GpuError::InvalidArg(format!(
@@ -1360,7 +1738,13 @@ fn linear_step_stage1_5_metal_host(
         )?;
     }
 
-    if qwen36_linear_int4_stage5_metal_native_supported(params, weights, int4, output_capacity) {
+    if qwen36_linear_int4_stage5_metal_native_supported(
+        params,
+        weights,
+        int4,
+        output_capacity,
+        options,
+    ) {
         return crate::prefill_ffi::metal_profile_time(
             "qwen36_linear_int4_stage5",
             "native",
@@ -1842,8 +2226,13 @@ fn qwen36_validate_dense_or_lowbit_sidecars(
     Ok(())
 }
 
-fn qwen36_stage5_env_or_raw_ggml(env_name: &str, int4: &Qwen36MoeFfnStepInt4) -> bool {
-    std::env::var_os(env_name).is_some()
+fn qwen36_stage5_enabled_or_raw_ggml(
+    options: Option<&Qwen36MoeLaunchOptions>,
+    explicit: impl FnOnce(&Qwen36MoeLaunchOptions) -> bool,
+    env_name: &str,
+    int4: &Qwen36MoeFfnStepInt4,
+) -> bool {
+    qwen36_launch_flag(options, explicit, env_name)
         || qwen36_lowbit_ggml_k(int4.gate_up_proj_type)
         || qwen36_lowbit_ggml_k(int4.down_proj_type)
 }
@@ -1852,16 +2241,25 @@ fn qwen36_ffn_int4_stage5_metal_native_supported(
     params: Qwen36MoeFfnStepParams,
     weights: &Qwen36MoeFfnStepWeights,
     int4: &Qwen36MoeFfnStepInt4,
+    options: Option<&Qwen36MoeLaunchOptions>,
 ) -> bool {
-    qwen36_stage5_env_or_raw_ggml("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5", int4)
-        && params.stage == 5
+    qwen36_stage5_enabled_or_raw_ggml(
+        options,
+        |options| options.enable_ffn_int4_stage5,
+        "SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5",
+        int4,
+    ) && params.stage == 5
         && params.hidden == 2048
         && params.num_experts == 256
         && params.moe_intermediate == 512
         && params.shared_intermediate == 512
         && params.top_k == 8
         && int4.group_size == 128
-        && !crate::metal_native::disabled_by_env()
+        && !qwen36_launch_flag(
+            options,
+            |options| options.force_host_native,
+            "SUPERSONIC_METAL_FORCE_HOST_NATIVE",
+        )
         && !weights.input_hidden.is_null()
         && !weights.shared_expert_gate_w.is_null()
         && !weights.shared_gate_proj_w.is_null()
@@ -1896,8 +2294,11 @@ fn qwen36_ffn_int4_stage5_router_metal_native_supported(
     params: Qwen36MoeFfnStepParams,
     weights: &Qwen36MoeFfnStepWeights,
     int4: &Qwen36MoeFfnStepInt4,
+    options: Option<&Qwen36MoeLaunchOptions>,
 ) -> bool {
-    qwen36_stage5_env_or_raw_ggml(
+    qwen36_stage5_enabled_or_raw_ggml(
+        options,
+        |options| options.enable_ffn_int4_stage5_router,
         "SUPERSONIC_METAL_ENABLE_QWEN36_FFN_INT4_STAGE5_ROUTER",
         int4,
     ) && params.stage == 5
@@ -1907,7 +2308,11 @@ fn qwen36_ffn_int4_stage5_router_metal_native_supported(
         && params.shared_intermediate == 512
         && params.top_k == 8
         && int4.group_size == 128
-        && !crate::metal_native::disabled_by_env()
+        && !qwen36_launch_flag(
+            options,
+            |options| options.force_host_native,
+            "SUPERSONIC_METAL_FORCE_HOST_NATIVE",
+        )
         && !weights.input_hidden.is_null()
         && !weights.post_attn_norm_w.is_null()
         && !weights.gate_w.is_null()
@@ -1945,13 +2350,28 @@ pub fn ffn_stage5_router_metal_native_supported(
     weights: &Qwen36MoeFfnStepWeights,
     int4: &Qwen36MoeFfnStepInt4,
 ) -> bool {
-    qwen36_ffn_int4_stage5_router_metal_native_supported(params, weights, int4)
+    qwen36_ffn_int4_stage5_router_metal_native_supported(params, weights, int4, None)
+}
+
+pub fn ffn_stage5_router_metal_native_supported_with_options(
+    params: Qwen36MoeFfnStepParams,
+    weights: &Qwen36MoeFfnStepWeights,
+    int4: &Qwen36MoeFfnStepInt4,
+    options: &Qwen36MoeLaunchOptions,
+) -> bool {
+    qwen36_ffn_int4_stage5_router_metal_native_supported(params, weights, int4, Some(options))
 }
 
 pub fn ffn_stage5_router_defer_wait_enabled() -> bool {
     std::env::var_os("SUPERSONIC_METAL_QWEN36_DEFER_FFN_ROUTER_STAGE5_WAIT").is_some()
         && std::env::var_os("SUPERSONIC_METAL_QWEN36_SYNC_FFN_ROUTER_STAGE5_WAIT").is_none()
         && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
+}
+
+pub fn ffn_stage5_router_defer_wait_enabled_with_options(options: &Qwen36MoeLaunchOptions) -> bool {
+    options.defer_ffn_router_stage5_wait
+        && !options.sync_ffn_router_stage5_wait
+        && !options.force_host_native
 }
 
 fn qwen36_ffn_router_stage5_parity_tap_enabled() -> bool {
@@ -2059,6 +2479,18 @@ fn qwen36_ffn_stage5_routed_tap_enabled_for_layer(layer_idx: i32) -> bool {
     qwen36_ffn_stage5_routed_tap_layer().map_or(true, |target| target == layer_idx)
 }
 
+fn qwen36_ffn_stage5_routed_tap_enabled_for_layer_with_options(
+    options: Option<&Qwen36MoeLaunchOptions>,
+    layer_idx: i32,
+) -> bool {
+    match options {
+        Some(options) => options
+            .ffn_stage5_routed_tap_layer
+            .map_or(true, |target| target == layer_idx),
+        None => qwen36_ffn_stage5_routed_tap_enabled_for_layer(layer_idx),
+    }
+}
+
 fn qwen36_ffn_router_stage5_simd_env_enabled() -> bool {
     std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_STAGE5_SIMD").is_some()
         && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
@@ -2083,6 +2515,23 @@ fn qwen36_ffn_router_stage5_path_label() -> &'static str {
     } else if qwen36_ffn_router_stage5_fused_exact_env_enabled() {
         "fused-exact"
     } else if qwen36_ffn_router_stage5_exact_simd_env_enabled() {
+        "exact-simd"
+    } else {
+        "serial"
+    }
+}
+
+fn qwen36_ffn_router_stage5_path_label_with_options(
+    options: Option<&Qwen36MoeLaunchOptions>,
+) -> &'static str {
+    let Some(options) = options else {
+        return qwen36_ffn_router_stage5_path_label();
+    };
+    if options.enable_ffn_router_stage5_simd && !options.force_host_native {
+        "simd"
+    } else if options.enable_ffn_router_fused_exact && !options.force_host_native {
+        "fused-exact"
+    } else if !options.disable_ffn_router_stage5_exact_simd && !options.force_host_native {
         "exact-simd"
     } else {
         "serial"
@@ -2124,6 +2573,47 @@ fn qwen36_ffn_shared_stage5_path_label() -> &'static str {
         all || std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_SHARED_DOWN_TILED").is_some();
     let down_exact = !down
         && std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_SHARED_DOWN_EXACT_SIMD").is_some();
+    match (
+        gate_up,
+        gate_up_exp2,
+        gate_up_exact,
+        scalar,
+        scalar_exact,
+        down,
+        down_exact,
+    ) {
+        (true, false, false, true, false, true, false) => "all_tiled",
+        (true, false, false, false, false, false, false) => "gate_up_tiled",
+        (false, true, false, false, false, false, false) => "gate_up_exp2",
+        (false, false, true, false, false, false, false) => "gate_up_exact_simd",
+        (false, false, true, false, true, false, false) => "gate_up_exact_simd+scalar_exact_simd",
+        (false, false, true, false, false, false, true) => "gate_up_exact_simd+down_exact_simd",
+        (false, false, true, false, true, false, true) => {
+            "gate_up_exact_simd+scalar_exact_simd+down_exact_simd"
+        }
+        (false, false, false, true, false, false, false) => "scalar_simd",
+        (false, false, false, false, true, false, false) => "scalar_exact_simd",
+        (false, false, false, false, false, true, false) => "down_tiled",
+        (false, false, false, false, false, false, true) => "down_exact_simd",
+        (false, false, false, false, false, false, false) => "host_order",
+        _ => "mixed",
+    }
+}
+
+fn qwen36_ffn_shared_stage5_path_label_with_options(
+    options: Option<&Qwen36MoeLaunchOptions>,
+) -> &'static str {
+    let Some(options) = options else {
+        return qwen36_ffn_shared_stage5_path_label();
+    };
+    let all = options.enable_ffn_shared_tiled;
+    let gate_up = all || options.enable_ffn_shared_gate_up_tiled;
+    let gate_up_exp2 = !gate_up && options.enable_ffn_shared_gate_up_exp2;
+    let gate_up_exact = !gate_up && !gate_up_exp2 && !options.disable_ffn_shared_gate_up_exact_simd;
+    let scalar = all || options.enable_ffn_shared_scalar_simd;
+    let scalar_exact = !scalar && options.enable_ffn_shared_scalar_exact_simd;
+    let down = all || options.enable_ffn_shared_down_tiled;
+    let down_exact = !down && options.enable_ffn_shared_down_exact_simd;
     match (
         gate_up,
         gate_up_exp2,
@@ -2676,6 +3166,7 @@ fn qwen36_join_f32(values: &[f32]) -> String {
 }
 
 fn qwen36_emit_ffn_router_stage5_parity_tap(
+    options: Option<&Qwen36MoeLaunchOptions>,
     ordinal: usize,
     layer_idx: i32,
     workspace: &GpuBuffer,
@@ -2690,7 +3181,11 @@ fn qwen36_emit_ffn_router_stage5_parity_tap(
     reference: &Qwen36FfnRouterReference,
 ) -> Result<(), GpuError> {
     let call = QWEN36_FFN_ROUTER_PARITY_TAP_CALLS.fetch_add(1, Ordering::Relaxed);
-    if call >= qwen36_ffn_router_stage5_parity_tap_max_calls() {
+    let max_calls = match options {
+        Some(options) => options.ffn_router_stage5_parity_tap_max_calls.unwrap_or(40),
+        None => qwen36_ffn_router_stage5_parity_tap_max_calls(),
+    };
+    if call >= max_calls {
         return Ok(());
     }
 
@@ -2733,9 +3228,9 @@ fn qwen36_emit_ffn_router_stage5_parity_tap(
         .copied()
         .unwrap_or(f32::NAN);
     let metal_logit_at_host_top = logits.get(host_top_logit_idx).copied().unwrap_or(f32::NAN);
-    let router_path = qwen36_ffn_router_stage5_path_label();
+    let router_path = qwen36_ffn_router_stage5_path_label_with_options(options);
 
-    eprintln!(
+    qwen36_emit_diagnostic(options, format!(
         "[qwen36-ffn-router-parity] call={} layer={} router_path={} topk_idx_match={} workspace_idx_match={} output_idx_match={} topk_first_mismatch={} workspace_first_idx_mismatch={} output_first_idx_mismatch={} h_norm_max_abs={:.8e} h_norm_argmax={} logits_max_abs={:.8e} logits_argmax={} host_top_logit_idx={} metal_top_logit_idx={} host_top_logit={:.8e} metal_top_logit={:.8e} host_logit_at_metal_top={:.8e} metal_logit_at_host_top={:.8e} topk_weight_max_abs={:.8e} topk_weight_argmax={} host_idx={} workspace_idx={} output_idx={} host_w={} metal_w={}",
         call,
         layer_idx,
@@ -2763,13 +3258,79 @@ fn qwen36_emit_ffn_router_stage5_parity_tap(
         qwen36_join_u32(output_topk_idx),
         qwen36_join_f32(&reference.topk_weight),
         qwen36_join_f32(topk_weight),
-    );
+    ));
 
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
 pub fn emit_decode_batch_router_stage5_parity_tap_from_host(
+    call: usize,
+    position: i32,
+    cache_pos: i32,
+    layer_idx: i32,
+    router_path: &str,
+    phase_profile: bool,
+    input: &[u16],
+    workspace: &[f32],
+    output_idx: &[u32],
+    params: Qwen36MoeFfnStepParams,
+    weights: &Qwen36MoeFfnStepWeights,
+    int4: &Qwen36MoeFfnStepInt4,
+) -> Result<(), GpuError> {
+    emit_decode_batch_router_stage5_parity_tap_from_host_impl(
+        None,
+        call,
+        position,
+        cache_pos,
+        layer_idx,
+        router_path,
+        phase_profile,
+        input,
+        workspace,
+        output_idx,
+        params,
+        weights,
+        int4,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn emit_decode_batch_router_stage5_parity_tap_from_host_with_options(
+    options: &Qwen36MoeLaunchOptions,
+    call: usize,
+    position: i32,
+    cache_pos: i32,
+    layer_idx: i32,
+    router_path: &str,
+    phase_profile: bool,
+    input: &[u16],
+    workspace: &[f32],
+    output_idx: &[u32],
+    params: Qwen36MoeFfnStepParams,
+    weights: &Qwen36MoeFfnStepWeights,
+    int4: &Qwen36MoeFfnStepInt4,
+) -> Result<(), GpuError> {
+    emit_decode_batch_router_stage5_parity_tap_from_host_impl(
+        Some(options),
+        call,
+        position,
+        cache_pos,
+        layer_idx,
+        router_path,
+        phase_profile,
+        input,
+        workspace,
+        output_idx,
+        params,
+        weights,
+        int4,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_decode_batch_router_stage5_parity_tap_from_host_impl(
+    options: Option<&Qwen36MoeLaunchOptions>,
     call: usize,
     position: i32,
     cache_pos: i32,
@@ -2795,7 +3356,7 @@ pub fn emit_decode_batch_router_stage5_parity_tap_from_host(
                 .into(),
         ));
     }
-    if !qwen36_ffn_int4_stage5_router_metal_native_supported(params, weights, int4) {
+    if !qwen36_ffn_int4_stage5_router_metal_native_supported(params, weights, int4, options) {
         return Err(GpuError::InvalidArg(
             "qwen36_moe::emit_decode_batch_router_stage5_parity_tap_from_host requires the Qwen3.6 Metal INT4 router stage-5 path"
                 .into(),
@@ -2879,7 +3440,7 @@ pub fn emit_decode_batch_router_stage5_parity_tap_from_host(
         .unwrap_or(f32::NAN);
     let metal_logit_at_host_top = logits.get(host_top_logit_idx).copied().unwrap_or(f32::NAN);
 
-    eprintln!(
+    qwen36_emit_diagnostic(options, format!(
         "[qwen36-decode-batch-router-parity] call={} position={} cache_pos={} layer={} router_path={} phase_profile={} topk_idx_match={} workspace_idx_match={} output_idx_match={} topk_first_mismatch={} workspace_first_idx_mismatch={} output_first_idx_mismatch={} h_norm_max_abs={:.8e} h_norm_argmax={} logits_max_abs={:.8e} logits_argmax={} host_top_logit_idx={} metal_top_logit_idx={} host_top_logit={:.8e} metal_top_logit={:.8e} host_logit_at_metal_top={:.8e} metal_logit_at_host_top={:.8e} topk_weight_max_abs={:.8e} topk_weight_argmax={} host_idx={} workspace_idx={} output_idx={} host_w={} metal_w={}",
         call,
         position,
@@ -2910,12 +3471,13 @@ pub fn emit_decode_batch_router_stage5_parity_tap_from_host(
         qwen36_join_u32(output_topk_idx),
         qwen36_join_f32(&reference.topk_weight),
         qwen36_join_f32(topk_weight),
-    );
+    ));
 
     Ok(())
 }
 
 fn qwen36_emit_ffn_shared_stage5_parity_tap(
+    options: Option<&Qwen36MoeLaunchOptions>,
     ordinal: usize,
     layer_idx: i32,
     workspace: &GpuBuffer,
@@ -2931,7 +3493,11 @@ fn qwen36_emit_ffn_shared_stage5_parity_tap(
     reference: &Qwen36FfnSharedReference,
 ) -> Result<(), GpuError> {
     let call = QWEN36_FFN_SHARED_PARITY_TAP_CALLS.fetch_add(1, Ordering::Relaxed);
-    if call >= qwen36_ffn_shared_stage5_parity_tap_max_calls() {
+    let max_calls = match options {
+        Some(options) => options.ffn_shared_stage5_parity_tap_max_calls.unwrap_or(40),
+        None => qwen36_ffn_shared_stage5_parity_tap_max_calls(),
+    };
+    if call >= max_calls {
         return Ok(());
     }
 
@@ -3025,11 +3591,11 @@ fn qwen36_emit_ffn_shared_stage5_parity_tap(
         shared_mid,
     );
 
-    eprintln!(
+    qwen36_emit_diagnostic(options, format!(
         "[qwen36-ffn-shared-parity] call={} layer={} shared_path={} shared_gate_max_abs={:.8e} shared_gate_argmax={} shared_up_max_abs={:.8e} shared_up_argmax={} shared_mid_max_abs={:.8e} shared_mid_argmax={} host_shared_gate_at_mid_argmax={:.8e} metal_shared_gate_at_mid_argmax={:.8e} host_shared_up_at_mid_argmax={:.8e} metal_shared_up_at_mid_argmax={:.8e} host_shared_mid_at_argmax={:.8e} metal_shared_mid_at_argmax={:.8e} shared_scalar_abs={:.8e} host_shared_scalar={:.8e} metal_shared_scalar={:.8e} shared_out_max_abs={:.8e} shared_out_argmax={} host_shared_out_at_argmax={:.8e} metal_shared_out_at_argmax={:.8e} host_shared_down_acc_at_out_argmax={:.8e} host_shared_gated_at_out_argmax={:.8e} host_shared_out_recomputed_at_argmax={:.8e} metal_mid_host_shared_down_acc_at_out_argmax={:.8e} metal_mid_host_shared_gated_at_out_argmax={:.8e} metal_mid_host_shared_out_at_argmax={:.8e}",
         call,
         layer_idx,
-        qwen36_ffn_shared_stage5_path_label(),
+        qwen36_ffn_shared_stage5_path_label_with_options(options),
         shared_gate_max_abs,
         shared_gate_argmax,
         shared_up_max_abs,
@@ -3055,13 +3621,14 @@ fn qwen36_emit_ffn_shared_stage5_parity_tap(
         metal_mid_host_shared_down_acc_at_out_argmax,
         metal_mid_host_shared_gated_at_out_argmax,
         metal_mid_host_shared_out_at_argmax,
-    );
+    ));
 
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
 fn qwen36_apply_ffn_shared_stage5_host_correction(
+    options: Option<&Qwen36MoeLaunchOptions>,
     ordinal: usize,
     layer_idx: i32,
     hidden: usize,
@@ -3142,10 +3709,10 @@ fn qwen36_apply_ffn_shared_stage5_host_correction(
     } else {
         first_changed_output as isize
     };
-    eprintln!(
+    qwen36_emit_diagnostic(options, format!(
         "[qwen36-ffn-shared-host-correction] layer={} shared_path={} hidden={} shared_out_max_abs={:.8e} shared_out_argmax={} host_shared_out_at_argmax={:.8e} metal_shared_out_at_argmax={:.8e} output_patch_max_abs={:.8e} output_patch_argmax={} changed_output_elems={} first_changed_output={}",
         layer_idx,
-        qwen36_ffn_shared_stage5_path_label(),
+        qwen36_ffn_shared_stage5_path_label_with_options(options),
         hidden,
         shared_out_max_abs,
         shared_out_argmax,
@@ -3155,13 +3722,14 @@ fn qwen36_apply_ffn_shared_stage5_host_correction(
         output_patch_argmax,
         changed_output_elems,
         first_changed_output,
-    );
+    ));
 
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
 fn qwen36_apply_ffn_shared_mid_stage5_host_correction(
+    options: Option<&Qwen36MoeLaunchOptions>,
     ordinal: usize,
     layer_idx: i32,
     hidden: usize,
@@ -3281,10 +3849,10 @@ fn qwen36_apply_ffn_shared_mid_stage5_host_correction(
     } else {
         first_changed_output as isize
     };
-    eprintln!(
+    qwen36_emit_diagnostic(options, format!(
         "[qwen36-ffn-shared-mid-host-correction] layer={} shared_path={} hidden={} shared_intermediate={} shared_mid_max_abs={:.8e} shared_mid_argmax={} host_shared_mid_at_argmax={:.8e} metal_shared_mid_at_argmax={:.8e} shared_out_patch_max_abs={:.8e} shared_out_patch_argmax={} host_shared_out_at_argmax={:.8e} metal_shared_out_at_argmax={:.8e} output_patch_max_abs={:.8e} output_patch_argmax={} changed_shared_mid_elems={} changed_shared_out_elems={} changed_output_elems={} first_changed_output={}",
         layer_idx,
-        qwen36_ffn_shared_stage5_path_label(),
+        qwen36_ffn_shared_stage5_path_label_with_options(options),
         hidden,
         shared_intermediate,
         shared_mid_max_abs,
@@ -3301,13 +3869,14 @@ fn qwen36_apply_ffn_shared_mid_stage5_host_correction(
         changed_shared_out_elems,
         changed_output_elems,
         first_changed_output,
-    );
+    ));
 
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
 fn qwen36_emit_ffn_routed_stage5_gate_up_tap(
+    options: Option<&Qwen36MoeLaunchOptions>,
     ordinal: usize,
     layer_idx: i32,
     hidden: usize,
@@ -3325,7 +3894,7 @@ fn qwen36_emit_ffn_routed_stage5_gate_up_tap(
     reference: &Qwen36FfnRoutedReference,
     router_reference: &Qwen36FfnRouterReference,
 ) -> Result<(), GpuError> {
-    if !qwen36_ffn_stage5_routed_tap_enabled_for_layer(layer_idx) {
+    if !qwen36_ffn_stage5_routed_tap_enabled_for_layer_with_options(options, layer_idx) {
         return Ok(());
     }
     crate::prefill_ffi::flush_metal_batch()?;
@@ -3361,7 +3930,9 @@ fn qwen36_emit_ffn_routed_stage5_gate_up_tap(
     let metal_expert_gu = &workspace_f32[off_expert_gu..off_expert_gu + expert_gu_len];
     let metal_expert_mid = &workspace_f32[off_expert_mid..off_expert_mid + expert_mid_len];
     let metal_topk_weight = &workspace_f32[off_topk_val..off_topk_val + top_k];
-    let silu_tap = qwen36_ffn_stage5_routed_silu_tap_enabled();
+    let silu_tap = options.map_or_else(qwen36_ffn_stage5_routed_silu_tap_enabled, |options| {
+        options.ffn_stage5_routed_silu_tap && !options.force_host_native
+    });
     let metal_topk_idx: Vec<u32> = workspace_f32[off_topk_idx..off_topk_idx + top_k]
         .iter()
         .map(|value| value.to_bits())
@@ -3580,7 +4151,7 @@ fn qwen36_emit_ffn_routed_stage5_gate_up_tap(
     }
 
     let router_path = qwen36_ffn_router_stage5_path_label();
-    eprintln!(
+    qwen36_emit_diagnostic(options, format!(
         "[qwen36-ffn-routed-gate-up-tap] layer={} router_path={} hidden={} top_k={} tap_second={} topk_idx_match={} topk_weight_max_abs={:.8e} topk_weight_argmax={} host_topk_weight_at_argmax={:.8e} metal_topk_weight_at_argmax={:.8e} expert_gate_max_abs={:.8e} expert_gate_argmax={} expert_up_max_abs={:.8e} expert_up_argmax={} expert_silu_max_abs={:.8e} expert_silu_argmax={} expert_mid_max_abs={:.8e} expert_mid_argmax={} expert_mid_group={} expert_mid_row={} host_expert_gate_at_mid_argmax={:.8e} metal_expert_gate_at_mid_argmax={:.8e} expert_gate_delta_at_mid_argmax={:.8e} host_expert_up_at_mid_argmax={:.8e} metal_expert_up_at_mid_argmax={:.8e} expert_up_delta_at_mid_argmax={:.8e} host_expert_silu_at_mid_argmax={:.8e} metal_expert_silu_at_mid_argmax={:.8e} expert_silu_delta_at_mid_argmax={:.8e} host_expert_mid_at_argmax={:.8e} metal_expert_mid_at_argmax={:.8e} host_expert_mid_recomputed_at_argmax={:.8e} metal_expert_mid_recomputed_at_argmax={:.8e} expert_mid_recompute_delta_at_argmax={:.8e} moe_out_max_abs={:.8e} moe_out_argmax={} host_moe_out_at_argmax={:.8e} metal_moe_out_at_argmax={:.8e} host_routed_down_acc_at_moe_argmax={:.8e} host_routed_moe_out_recomputed_at_argmax={:.8e} metal_mid_host_topk_down_acc_at_moe_argmax={:.8e} metal_mid_host_topk_moe_out_at_argmax={:.8e} metal_mid_metal_topk_down_acc_at_moe_argmax={:.8e} metal_mid_metal_topk_moe_out_at_argmax={:.8e} down_group_max_abs={:.8e} down_group_argmax={} host_down_at_group_argmax={:.8e} metal_mid_down_at_group_argmax={:.8e} topk_weight_at_down_group_argmax={:.8e} weighted_down_group_delta_at_argmax={:.8e} final_out_max_abs={:.8e} final_out_argmax={} host_final_out_at_argmax={:.8e} metal_final_out_at_argmax={:.8e}",
         layer_idx,
         router_path,
@@ -3636,7 +4207,7 @@ fn qwen36_emit_ffn_routed_stage5_gate_up_tap(
         final_out_argmax,
         host_final_out_at_argmax,
         metal_final_out_at_argmax,
-    );
+    ));
 
     Ok(())
 }
@@ -3803,6 +4374,7 @@ fn qwen36_build_routed_finalize_tap_row(
 
 #[allow(clippy::too_many_arguments)]
 fn qwen36_emit_ffn_routed_stage5_finalize_tap(
+    options: Option<&Qwen36MoeLaunchOptions>,
     ordinal: usize,
     layer_idx: i32,
     hidden: usize,
@@ -3821,7 +4393,7 @@ fn qwen36_emit_ffn_routed_stage5_finalize_tap(
     routed_reference: &Qwen36FfnRoutedReference,
     router_reference: &Qwen36FfnRouterReference,
 ) -> Result<(), GpuError> {
-    if !qwen36_ffn_stage5_routed_tap_enabled_for_layer(layer_idx) {
+    if !qwen36_ffn_stage5_routed_tap_enabled_for_layer_with_options(options, layer_idx) {
         return Ok(());
     }
     crate::prefill_ffi::flush_metal_batch()?;
@@ -3927,7 +4499,7 @@ fn qwen36_emit_ffn_routed_stage5_finalize_tap(
     );
 
     let router_path = qwen36_ffn_router_stage5_path_label();
-    eprintln!(
+    qwen36_emit_diagnostic(options, format!(
         "[qwen36-ffn-routed-finalize-tap] layer={} router_path={} hidden={} top_k={} topk_idx_match={} topk_weight_max_abs={:.8e} topk_weight_argmax={} shared_out_max_abs={:.8e} shared_out_argmax={} host_shared_out_at_argmax={:.8e} metal_shared_out_at_argmax={:.8e} moe_out_max_abs={:.8e} moe_out_argmax={} final_out_max_abs={:.8e} final_out_argmax={} moe_probe_row={} moe_input={:.8e} moe_host_moe={:.8e} moe_metal_moe={:.8e} moe_host_shared={:.8e} moe_metal_shared={:.8e} moe_host_final={:.8e} moe_metal_final={:.8e} moe_final_host_host={:.8e} moe_final_metal_moe_host_shared={:.8e} moe_final_host_moe_metal_shared={:.8e} moe_final_metal_moe_metal_shared={:.8e} moe_host_down_acc={:.8e} moe_host_moe_recomputed={:.8e} moe_metal_mid_host_topk_down_acc={:.8e} moe_metal_mid_host_topk_moe={:.8e} moe_metal_mid_metal_topk_down_acc={:.8e} moe_metal_mid_metal_topk_moe={:.8e} moe_final_metal_mid_host_topk_host_shared={:.8e} moe_final_metal_mid_host_topk_metal_shared={:.8e} moe_final_metal_mid_metal_topk_host_shared={:.8e} moe_final_metal_mid_metal_topk_metal_shared={:.8e} moe_metal_moe_matches_metal_mid_host_topk={} moe_metal_moe_matches_metal_mid_metal_topk={} moe_host_final_matches_host_moe_host_shared={} moe_metal_final_matches_metal_moe_metal_shared={} final_probe_row={} final_input={:.8e} final_host_moe={:.8e} final_metal_moe={:.8e} final_host_shared={:.8e} final_metal_shared={:.8e} final_host_final={:.8e} final_metal_final={:.8e} final_final_host_host={:.8e} final_final_metal_moe_host_shared={:.8e} final_final_host_moe_metal_shared={:.8e} final_final_metal_moe_metal_shared={:.8e} final_host_down_acc={:.8e} final_host_moe_recomputed={:.8e} final_metal_mid_host_topk_down_acc={:.8e} final_metal_mid_host_topk_moe={:.8e} final_metal_mid_metal_topk_down_acc={:.8e} final_metal_mid_metal_topk_moe={:.8e} final_final_metal_mid_host_topk_host_shared={:.8e} final_final_metal_mid_host_topk_metal_shared={:.8e} final_final_metal_mid_metal_topk_host_shared={:.8e} final_final_metal_mid_metal_topk_metal_shared={:.8e} final_metal_moe_matches_metal_mid_host_topk={} final_metal_moe_matches_metal_mid_metal_topk={} final_host_final_matches_host_moe_host_shared={} final_metal_final_matches_metal_moe_metal_shared={}",
         layer_idx,
         router_path,
@@ -3996,13 +4568,14 @@ fn qwen36_emit_ffn_routed_stage5_finalize_tap(
         final_probe.metal_moe_matches_metal_mid_metal_topk,
         final_probe.host_final_matches_host_moe_host_shared,
         final_probe.metal_final_matches_metal_moe_metal_shared,
-    );
+    ));
 
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
 fn qwen36_apply_ffn_routed_stage5_host_correction(
+    options: Option<&Qwen36MoeLaunchOptions>,
     ordinal: usize,
     layer_idx: i32,
     hidden: usize,
@@ -4215,7 +4788,7 @@ fn qwen36_apply_ffn_routed_stage5_host_correction(
         first_changed_output as isize
     };
     let router_path = qwen36_ffn_router_stage5_path_label();
-    eprintln!(
+    qwen36_emit_diagnostic(options, format!(
         "[qwen36-ffn-routed-host-correction] layer={} router_path={} hidden={} top_k={} topk_idx_match={} topk_weight_max_abs={:.8e} topk_weight_argmax={} host_topk_weight_at_argmax={:.8e} metal_topk_weight_at_argmax={:.8e} expert_mid_max_abs={:.8e} expert_mid_argmax={} expert_mid_group={} expert_mid_row={} host_expert_gate_at_mid_argmax={:.8e} metal_expert_gate_at_mid_argmax={:.8e} expert_gate_delta_at_mid_argmax={:.8e} host_expert_up_at_mid_argmax={:.8e} metal_expert_up_at_mid_argmax={:.8e} expert_up_delta_at_mid_argmax={:.8e} host_expert_silu_at_mid_argmax={:.8e} metal_expert_silu_at_mid_argmax={:.8e} expert_silu_delta_at_mid_argmax={:.8e} host_expert_mid_at_argmax={:.8e} metal_expert_mid_at_argmax={:.8e} host_expert_mid_recomputed_at_argmax={:.8e} metal_expert_mid_recomputed_at_argmax={:.8e} expert_mid_recompute_delta_at_argmax={:.8e} moe_out_max_abs={:.8e} moe_out_argmax={} host_moe_out_at_argmax={:.8e} metal_moe_out_at_argmax={:.8e} host_routed_down_acc_at_moe_argmax={:.8e} host_routed_moe_out_recomputed_at_argmax={:.8e} metal_mid_host_topk_down_acc_at_moe_argmax={:.8e} metal_mid_host_topk_moe_out_at_argmax={:.8e} metal_mid_metal_topk_down_acc_at_moe_argmax={:.8e} metal_mid_metal_topk_moe_out_at_argmax={:.8e} output_patch_max_abs={:.8e} output_patch_argmax={} host_final_out_at_argmax={:.8e} metal_final_out_at_argmax={:.8e} changed_output_elems={} first_changed_output={}",
         layer_idx,
         router_path,
@@ -4260,13 +4833,14 @@ fn qwen36_apply_ffn_routed_stage5_host_correction(
         metal_final_out_at_argmax,
         changed_output_elems,
         first_changed_output,
-    );
+    ));
 
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
 fn qwen36_apply_ffn_routed_down_stage5_host_recompute_correction(
+    options: Option<&Qwen36MoeLaunchOptions>,
     ordinal: usize,
     layer_idx: i32,
     hidden: usize,
@@ -4432,7 +5006,7 @@ fn qwen36_apply_ffn_routed_down_stage5_host_recompute_correction(
         first_changed_output as isize
     };
     let router_path = qwen36_ffn_router_stage5_path_label();
-    eprintln!(
+    qwen36_emit_diagnostic(options, format!(
         "[qwen36-ffn-routed-down-host-recompute-correction] layer={} router_path={} hidden={} top_k={} topk_idx_match={} topk_weight_max_abs={:.8e} topk_weight_argmax={} expert_mid_max_abs={:.8e} expert_mid_argmax={} expert_mid_group={} expert_mid_row={} host_expert_mid_at_argmax={:.8e} metal_expert_mid_at_argmax={:.8e} metal_moe_vs_recomputed_max_abs={:.8e} metal_moe_vs_recomputed_argmax={} recomputed_down_acc_at_moe_argmax={:.8e} recomputed_moe_at_moe_argmax={:.8e} host_moe_at_moe_argmax={:.8e} metal_moe_at_moe_argmax={:.8e} host_moe_vs_recomputed_max_abs={:.8e} host_moe_vs_recomputed_argmax={} recomputed_moe_at_host_argmax={:.8e} host_moe_at_host_argmax={:.8e} metal_moe_at_host_argmax={:.8e} output_patch_max_abs={:.8e} output_patch_argmax={} final_vs_host_max_abs={:.8e} final_vs_host_argmax={} host_final_at_final_argmax={:.8e} recomputed_final_at_final_argmax={:.8e} changed_moe_elems={} changed_output_elems={} first_changed_output={}",
         layer_idx,
         router_path,
@@ -4467,12 +5041,13 @@ fn qwen36_apply_ffn_routed_down_stage5_host_recompute_correction(
         changed_moe_elems,
         changed_output_elems,
         first_changed_output,
-    );
+    ));
 
     Ok(())
 }
 
 fn qwen36_apply_ffn_residual_stage5_host_snap(
+    options: Option<&Qwen36MoeLaunchOptions>,
     ordinal: usize,
     layer_idx: i32,
     hidden: usize,
@@ -4507,7 +5082,7 @@ fn qwen36_apply_ffn_residual_stage5_host_snap(
     let corrected_bits = f32_to_bf16_bits(corrected);
     output[row] = corrected_bits;
 
-    eprintln!(
+    qwen36_emit_diagnostic(options, format!(
         "[qwen36-ffn-residual-host-snap] layer={} row={} hidden={} host_final={:.8e} metal_final={:.8e} corrected_final={:.8e} patch_abs={:.8e} changed={}",
         layer_idx,
         row,
@@ -4517,13 +5092,75 @@ fn qwen36_apply_ffn_residual_stage5_host_snap(
         corrected,
         (corrected - before).abs(),
         (before_bits != corrected_bits) as u8,
-    );
+    ));
 
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
 pub fn emit_decode_batch_shared_stage5_parity_tap_from_host(
+    call: usize,
+    position: i32,
+    cache_pos: i32,
+    layer_idx: i32,
+    router_path: &str,
+    phase_profile: bool,
+    input: &[u16],
+    workspace: &[f32],
+    params: Qwen36MoeFfnStepParams,
+    weights: &Qwen36MoeFfnStepWeights,
+    int4: &Qwen36MoeFfnStepInt4,
+) -> Result<(), GpuError> {
+    emit_decode_batch_shared_stage5_parity_tap_from_host_impl(
+        None,
+        call,
+        position,
+        cache_pos,
+        layer_idx,
+        router_path,
+        phase_profile,
+        input,
+        workspace,
+        params,
+        weights,
+        int4,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn emit_decode_batch_shared_stage5_parity_tap_from_host_with_options(
+    options: &Qwen36MoeLaunchOptions,
+    call: usize,
+    position: i32,
+    cache_pos: i32,
+    layer_idx: i32,
+    router_path: &str,
+    phase_profile: bool,
+    input: &[u16],
+    workspace: &[f32],
+    params: Qwen36MoeFfnStepParams,
+    weights: &Qwen36MoeFfnStepWeights,
+    int4: &Qwen36MoeFfnStepInt4,
+) -> Result<(), GpuError> {
+    emit_decode_batch_shared_stage5_parity_tap_from_host_impl(
+        Some(options),
+        call,
+        position,
+        cache_pos,
+        layer_idx,
+        router_path,
+        phase_profile,
+        input,
+        workspace,
+        params,
+        weights,
+        int4,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_decode_batch_shared_stage5_parity_tap_from_host_impl(
+    options: Option<&Qwen36MoeLaunchOptions>,
     call: usize,
     position: i32,
     cache_pos: i32,
@@ -4548,7 +5185,7 @@ pub fn emit_decode_batch_shared_stage5_parity_tap_from_host(
                 .into(),
         ));
     }
-    if !qwen36_ffn_int4_stage5_router_metal_native_supported(params, weights, int4) {
+    if !qwen36_ffn_int4_stage5_router_metal_native_supported(params, weights, int4, options) {
         return Err(GpuError::InvalidArg(
             "qwen36_moe::emit_decode_batch_shared_stage5_parity_tap_from_host requires the Qwen3.6 Metal INT4 router stage-5 path"
                 .into(),
@@ -4705,7 +5342,7 @@ pub fn emit_decode_batch_shared_stage5_parity_tap_from_host(
         shared_mid,
     );
 
-    eprintln!(
+    qwen36_emit_diagnostic(options, format!(
         "[qwen36-decode-batch-shared-parity] call={} position={} cache_pos={} layer={} router_path={} phase_profile={} shared_path={} shared_gate_max_abs={:.8e} shared_gate_argmax={} shared_up_max_abs={:.8e} shared_up_argmax={} shared_mid_max_abs={:.8e} shared_mid_argmax={} host_shared_gate_at_mid_argmax={:.8e} metal_shared_gate_at_mid_argmax={:.8e} host_shared_up_at_mid_argmax={:.8e} metal_shared_up_at_mid_argmax={:.8e} host_shared_mid_at_argmax={:.8e} metal_shared_mid_at_argmax={:.8e} shared_scalar_abs={:.8e} host_shared_scalar={:.8e} metal_shared_scalar={:.8e} shared_out_max_abs={:.8e} shared_out_argmax={} host_shared_out_at_argmax={:.8e} metal_shared_out_at_argmax={:.8e} host_shared_down_acc_at_out_argmax={:.8e} host_shared_gated_at_out_argmax={:.8e} host_shared_out_recomputed_at_argmax={:.8e} metal_mid_host_shared_down_acc_at_out_argmax={:.8e} metal_mid_host_shared_gated_at_out_argmax={:.8e} metal_mid_host_shared_out_at_argmax={:.8e}",
         call,
         position,
@@ -4713,7 +5350,7 @@ pub fn emit_decode_batch_shared_stage5_parity_tap_from_host(
         layer_idx,
         router_path,
         phase_profile as u8,
-        qwen36_ffn_shared_stage5_path_label(),
+        qwen36_ffn_shared_stage5_path_label_with_options(options),
         shared_gate_max_abs,
         shared_gate_argmax,
         shared_up_max_abs,
@@ -4739,13 +5376,83 @@ pub fn emit_decode_batch_shared_stage5_parity_tap_from_host(
         metal_mid_host_shared_down_acc_at_out_argmax,
         metal_mid_host_shared_gated_at_out_argmax,
         metal_mid_host_shared_out_at_argmax,
-    );
+    ));
 
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
 pub fn emit_decode_batch_routed_stage5_parity_tap_from_host(
+    call: usize,
+    position: i32,
+    cache_pos: i32,
+    layer_idx: i32,
+    router_path: &str,
+    phase_profile: bool,
+    input: &[u16],
+    workspace: &[f32],
+    output: &[u16],
+    output_idx: &[u32],
+    params: Qwen36MoeFfnStepParams,
+    weights: &Qwen36MoeFfnStepWeights,
+    int4: &Qwen36MoeFfnStepInt4,
+) -> Result<(), GpuError> {
+    emit_decode_batch_routed_stage5_parity_tap_from_host_impl(
+        None,
+        call,
+        position,
+        cache_pos,
+        layer_idx,
+        router_path,
+        phase_profile,
+        input,
+        workspace,
+        output,
+        output_idx,
+        params,
+        weights,
+        int4,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn emit_decode_batch_routed_stage5_parity_tap_from_host_with_options(
+    options: &Qwen36MoeLaunchOptions,
+    call: usize,
+    position: i32,
+    cache_pos: i32,
+    layer_idx: i32,
+    router_path: &str,
+    phase_profile: bool,
+    input: &[u16],
+    workspace: &[f32],
+    output: &[u16],
+    output_idx: &[u32],
+    params: Qwen36MoeFfnStepParams,
+    weights: &Qwen36MoeFfnStepWeights,
+    int4: &Qwen36MoeFfnStepInt4,
+) -> Result<(), GpuError> {
+    emit_decode_batch_routed_stage5_parity_tap_from_host_impl(
+        Some(options),
+        call,
+        position,
+        cache_pos,
+        layer_idx,
+        router_path,
+        phase_profile,
+        input,
+        workspace,
+        output,
+        output_idx,
+        params,
+        weights,
+        int4,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_decode_batch_routed_stage5_parity_tap_from_host_impl(
+    options: Option<&Qwen36MoeLaunchOptions>,
     call: usize,
     position: i32,
     cache_pos: i32,
@@ -4772,7 +5479,7 @@ pub fn emit_decode_batch_routed_stage5_parity_tap_from_host(
                 .into(),
         ));
     }
-    if !qwen36_ffn_int4_stage5_router_metal_native_supported(params, weights, int4) {
+    if !qwen36_ffn_int4_stage5_router_metal_native_supported(params, weights, int4, options) {
         return Err(GpuError::InvalidArg(
             "qwen36_moe::emit_decode_batch_routed_stage5_parity_tap_from_host requires the Qwen3.6 Metal INT4 router stage-5 path"
                 .into(),
@@ -4931,7 +5638,7 @@ pub fn emit_decode_batch_routed_stage5_parity_tap_from_host(
         .unwrap_or(f32::NAN);
     let metal_final_out_at_argmax = final_out.get(final_out_argmax).copied().unwrap_or(f32::NAN);
 
-    eprintln!(
+    qwen36_emit_diagnostic(options, format!(
         "[qwen36-decode-batch-routed-parity] call={} position={} cache_pos={} layer={} router_path={} phase_profile={} topk_idx_match={} workspace_idx_match={} output_idx_match={} topk_first_mismatch={} workspace_first_idx_mismatch={} output_first_idx_mismatch={} topk_weight_max_abs={:.8e} topk_weight_argmax={} expert_mid_max_abs={:.8e} expert_mid_argmax={} host_expert_mid_at_argmax={:.8e} metal_expert_mid_at_argmax={:.8e} moe_out_max_abs={:.8e} moe_out_argmax={} host_moe_out_at_argmax={:.8e} metal_moe_out_at_argmax={:.8e} final_out_max_abs={:.8e} final_out_argmax={} host_final_out_at_argmax={:.8e} metal_final_out_at_argmax={:.8e} host_idx={} workspace_idx={} output_idx={} host_w={} metal_w={}",
         call,
         position,
@@ -4964,7 +5671,7 @@ pub fn emit_decode_batch_routed_stage5_parity_tap_from_host(
         qwen36_join_u32(output_topk_idx),
         qwen36_join_f32(&router_reference.topk_weight),
         qwen36_join_f32(topk_weight),
-    );
+    ));
 
     Ok(())
 }
@@ -4974,7 +5681,21 @@ pub fn ffn_expert_direct_gather_stage5_metal_native_supported(
     weights: &Qwen36MoeFfnStepWeights,
     int4: &Qwen36MoeFfnStepInt4,
 ) -> bool {
-    qwen36_ffn_expert_direct_gather_stage5_metal_native_supported(params, weights, int4)
+    qwen36_ffn_expert_direct_gather_stage5_metal_native_supported(params, weights, int4, None)
+}
+
+pub fn ffn_expert_direct_gather_stage5_metal_native_supported_with_options(
+    params: Qwen36MoeFfnStepParams,
+    weights: &Qwen36MoeFfnStepWeights,
+    int4: &Qwen36MoeFfnStepInt4,
+    options: &Qwen36MoeLaunchOptions,
+) -> bool {
+    qwen36_ffn_expert_direct_gather_stage5_metal_native_supported(
+        params,
+        weights,
+        int4,
+        Some(options),
+    )
 }
 
 pub fn ffn_expert_direct_gather_defer_wait_enabled() -> bool {
@@ -4982,19 +5703,33 @@ pub fn ffn_expert_direct_gather_defer_wait_enabled() -> bool {
         && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
 }
 
+pub fn ffn_expert_direct_gather_defer_wait_enabled_with_options(
+    options: &Qwen36MoeLaunchOptions,
+) -> bool {
+    options.defer_ffn_direct_gather_stage5_wait && !options.force_host_native
+}
+
 fn qwen36_ffn_expert_gate_up_tiled_metal_native_supported(
     params: Qwen36MoeFfnStepParams,
     weights: &Qwen36MoeFfnStepWeights,
     int4: &Qwen36MoeFfnStepInt4,
+    options: Option<&Qwen36MoeLaunchOptions>,
 ) -> bool {
-    std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_GATE_UP_TILED").is_some()
-        && params.stage >= 3
+    qwen36_launch_flag(
+        options,
+        |options| options.enable_ffn_expert_gate_up_tiled,
+        "SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_GATE_UP_TILED",
+    ) && params.stage >= 3
         && params.hidden == 2048
         && params.moe_intermediate == 512
         && params.top_k > 0
         && params.top_k <= 8
         && int4.group_size == 128
-        && !crate::metal_native::disabled_by_env()
+        && !qwen36_launch_flag(
+            options,
+            |options| options.force_host_native,
+            "SUPERSONIC_METAL_FORCE_HOST_NATIVE",
+        )
         && !weights.gate_up_proj_w.is_null()
         && !int4.gate_up_proj_scale.is_null()
         && !int4.gate_up_proj_zero.is_null()
@@ -5004,15 +5739,23 @@ fn qwen36_ffn_expert_tiled_stage5_metal_native_supported(
     params: Qwen36MoeFfnStepParams,
     weights: &Qwen36MoeFfnStepWeights,
     int4: &Qwen36MoeFfnStepInt4,
+    options: Option<&Qwen36MoeLaunchOptions>,
 ) -> bool {
-    std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_TILED_STAGE5").is_some()
-        && params.stage == 5
+    qwen36_launch_flag(
+        options,
+        |options| options.enable_ffn_expert_tiled_stage5,
+        "SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_TILED_STAGE5",
+    ) && params.stage == 5
         && params.hidden == 2048
         && params.num_experts == 256
         && params.moe_intermediate == 512
         && params.top_k == 8
         && int4.group_size == 128
-        && !crate::metal_native::disabled_by_env()
+        && !qwen36_launch_flag(
+            options,
+            |options| options.force_host_native,
+            "SUPERSONIC_METAL_FORCE_HOST_NATIVE",
+        )
         && !weights.input_hidden.is_null()
         && !weights.gate_up_proj_w.is_null()
         && !weights.down_proj_w.is_null()
@@ -5028,15 +5771,23 @@ fn qwen36_ffn_expert_packed_stage5_metal_native_supported(
     params: Qwen36MoeFfnStepParams,
     weights: &Qwen36MoeFfnStepWeights,
     int4: &Qwen36MoeFfnStepInt4,
+    options: Option<&Qwen36MoeLaunchOptions>,
 ) -> bool {
-    std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_PACKED_STAGE5").is_some()
-        && params.stage == 5
+    qwen36_launch_flag(
+        options,
+        |options| options.enable_ffn_expert_packed_stage5,
+        "SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_PACKED_STAGE5",
+    ) && params.stage == 5
         && params.hidden == 2048
         && params.num_experts == 256
         && params.moe_intermediate == 512
         && params.top_k == 8
         && int4.group_size == 128
-        && !crate::metal_native::disabled_by_env()
+        && !qwen36_launch_flag(
+            options,
+            |options| options.force_host_native,
+            "SUPERSONIC_METAL_FORCE_HOST_NATIVE",
+        )
         && !weights.input_hidden.is_null()
         && !weights.gate_up_proj_w.is_null()
         && !weights.down_proj_w.is_null()
@@ -5052,15 +5803,23 @@ fn qwen36_ffn_expert_direct_gather_stage5_metal_native_supported(
     params: Qwen36MoeFfnStepParams,
     weights: &Qwen36MoeFfnStepWeights,
     int4: &Qwen36MoeFfnStepInt4,
+    options: Option<&Qwen36MoeLaunchOptions>,
 ) -> bool {
-    std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_DIRECT_GATHER_STAGE5").is_some()
-        && params.stage == 5
+    qwen36_launch_flag(
+        options,
+        |options| options.enable_ffn_expert_direct_gather_stage5,
+        "SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_DIRECT_GATHER_STAGE5",
+    ) && params.stage == 5
         && params.hidden == 2048
         && params.num_experts == 256
         && params.moe_intermediate == 512
         && params.top_k == 8
         && int4.group_size == 128
-        && !crate::metal_native::disabled_by_env()
+        && !qwen36_launch_flag(
+            options,
+            |options| options.force_host_native,
+            "SUPERSONIC_METAL_FORCE_HOST_NATIVE",
+        )
         && !weights.input_hidden.is_null()
         && !weights.gate_up_proj_w.is_null()
         && !weights.down_proj_w.is_null()
@@ -5076,26 +5835,41 @@ fn qwen36_ffn_expert_gpu_pack_stage5_metal_native_supported(
     params: Qwen36MoeFfnStepParams,
     weights: &Qwen36MoeFfnStepWeights,
     int4: &Qwen36MoeFfnStepInt4,
+    options: Option<&Qwen36MoeLaunchOptions>,
 ) -> bool {
-    std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_GPU_PACK_STAGE5").is_some()
-        && qwen36_ffn_expert_packed_stage5_metal_native_supported(params, weights, int4)
+    qwen36_launch_flag(
+        options,
+        |options| options.enable_ffn_expert_gpu_pack_stage5,
+        "SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_GPU_PACK_STAGE5",
+    ) && qwen36_ffn_expert_packed_stage5_metal_native_supported(params, weights, int4, options)
 }
 
 fn qwen36_ffn_expert_mps_bridge_stage5_supported(
     params: Qwen36MoeFfnStepParams,
     weights: &Qwen36MoeFfnStepWeights,
     int4: &Qwen36MoeFfnStepInt4,
+    options: Option<&Qwen36MoeLaunchOptions>,
 ) -> bool {
-    let cpu_transcode =
-        std::env::var_os("SUPERSONIC_METAL_QWEN36_MPS_BRIDGE_CPU_TRANSCODE").is_some();
-    std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_MPS_BRIDGE").is_some()
-        && params.stage == 5
+    let cpu_transcode = qwen36_launch_flag(
+        options,
+        |options| options.mps_bridge_cpu_transcode,
+        "SUPERSONIC_METAL_QWEN36_MPS_BRIDGE_CPU_TRANSCODE",
+    );
+    qwen36_launch_flag(
+        options,
+        |options| options.enable_ffn_expert_mps_bridge,
+        "SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_MPS_BRIDGE",
+    ) && params.stage == 5
         && params.hidden == 2048
         && params.num_experts == 256
         && params.moe_intermediate == 512
         && params.top_k == 8
         && int4.group_size == 128
-        && !crate::metal_native::disabled_by_env()
+        && !qwen36_launch_flag(
+            options,
+            |options| options.force_host_native,
+            "SUPERSONIC_METAL_FORCE_HOST_NATIVE",
+        )
         && !weights.input_hidden.is_null()
         && !weights.gate_up_proj_w.is_null()
         && !weights.down_proj_w.is_null()
@@ -5120,15 +5894,23 @@ fn qwen36_ffn_expert_mps_static_topn_partial_stage5_supported(
     params: Qwen36MoeFfnStepParams,
     weights: &Qwen36MoeFfnStepWeights,
     int4: &Qwen36MoeFfnStepInt4,
+    options: Option<&Qwen36MoeLaunchOptions>,
 ) -> bool {
-    std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_MPS_STATIC_TOPN_PARTIAL").is_some()
-        && params.stage == 5
+    qwen36_launch_flag(
+        options,
+        |options| options.enable_ffn_expert_mps_static_topn_partial,
+        "SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_MPS_STATIC_TOPN_PARTIAL",
+    ) && params.stage == 5
         && params.hidden == 2048
         && params.num_experts == 256
         && params.moe_intermediate == 512
         && params.top_k == 8
         && int4.group_size == 128
-        && !crate::metal_native::disabled_by_env()
+        && !qwen36_launch_flag(
+            options,
+            |options| options.force_host_native,
+            "SUPERSONIC_METAL_FORCE_HOST_NATIVE",
+        )
         && !weights.input_hidden.is_null()
         && !weights.gate_up_proj_w.is_null()
         && !weights.down_proj_w.is_null()
@@ -5142,15 +5924,23 @@ fn qwen36_ffn_expert_static_topn_partial_stage5_supported(
     params: Qwen36MoeFfnStepParams,
     weights: &Qwen36MoeFfnStepWeights,
     int4: &Qwen36MoeFfnStepInt4,
+    options: Option<&Qwen36MoeLaunchOptions>,
 ) -> bool {
-    std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_STATIC_TOPN_PARTIAL").is_some()
-        && params.stage == 5
+    qwen36_launch_flag(
+        options,
+        |options| options.enable_ffn_expert_static_topn_partial,
+        "SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_STATIC_TOPN_PARTIAL",
+    ) && params.stage == 5
         && params.hidden == 2048
         && params.num_experts == 256
         && params.moe_intermediate == 512
         && params.top_k == 8
         && int4.group_size == 128
-        && !crate::metal_native::disabled_by_env()
+        && !qwen36_launch_flag(
+            options,
+            |options| options.force_host_native,
+            "SUPERSONIC_METAL_FORCE_HOST_NATIVE",
+        )
         && !weights.input_hidden.is_null()
         && !weights.gate_up_proj_w.is_null()
         && !weights.down_proj_w.is_null()
@@ -8349,6 +9139,66 @@ pub fn ffn_step_launch(
     workspace: &mut GpuBuffer,
     sync_buf: &mut GpuBuffer,
 ) -> Result<(), GpuError> {
+    ffn_step_launch_impl(
+        ordinal, dtype, params, weights, int4, output, output_idx, workspace, sync_buf, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn ffn_step_launch_with_options(
+    ordinal: usize,
+    dtype: ScalarType,
+    params: Qwen36MoeFfnStepParams,
+    weights: &Qwen36MoeFfnStepWeights,
+    int4: &Qwen36MoeFfnStepInt4,
+    output: &mut GpuBuffer,
+    output_idx: &mut GpuBuffer,
+    workspace: &mut GpuBuffer,
+    sync_buf: &mut GpuBuffer,
+    options: &Qwen36MoeLaunchOptions,
+) -> Result<(), GpuError> {
+    if options.enable_ffn_expert_packed_stage5
+        || options.enable_ffn_expert_gpu_pack_stage5
+        || options.enable_ffn_expert_mps_bridge
+        || options.enable_ffn_expert_mps_static_topn_partial
+        || options.enable_ffn_expert_static_topn_partial
+        || options.enable_ffn_expert_static_topn
+        || options.enable_ffn_expert_pack_hotset
+        || options.enable_ffn_expert_pack_cache
+    {
+        return Err(GpuError::InvalidArg(
+            "Qwen3.6 experimental expert packing/MPS/static-top-N policy is runner-owned and \
+             unavailable through the production runtime launch"
+                .into(),
+        ));
+    }
+    ffn_step_launch_impl(
+        ordinal,
+        dtype,
+        params,
+        weights,
+        int4,
+        output,
+        output_idx,
+        workspace,
+        sync_buf,
+        Some(options),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ffn_step_launch_impl(
+    ordinal: usize,
+    dtype: ScalarType,
+    params: Qwen36MoeFfnStepParams,
+    weights: &Qwen36MoeFfnStepWeights,
+    int4: &Qwen36MoeFfnStepInt4,
+    output: &mut GpuBuffer,
+    output_idx: &mut GpuBuffer,
+    workspace: &mut GpuBuffer,
+    sync_buf: &mut GpuBuffer,
+    options: Option<&Qwen36MoeLaunchOptions>,
+) -> Result<(), GpuError> {
     if dtype != ScalarType::BF16 {
         return Err(GpuError::InvalidArg(format!(
             "qwen36_moe::ffn_step_launch: only BF16 is wired, got {dtype:?}"
@@ -8385,7 +9235,7 @@ pub fn ffn_step_launch(
     let backend = output.backend();
     if backend == Backend::Metal {
         return ffn_step_stage1_5_metal_host(
-            ordinal, params, weights, int4, output, output_idx, workspace,
+            ordinal, params, weights, int4, output, output_idx, workspace, options,
         );
     }
 
@@ -8467,6 +9317,7 @@ fn ffn_step_stage1_5_metal_host(
     output: &mut GpuBuffer,
     output_idx: &mut GpuBuffer,
     workspace: &mut GpuBuffer,
+    options: Option<&Qwen36MoeLaunchOptions>,
 ) -> Result<(), GpuError> {
     if output.dtype() != ScalarType::BF16
         || output_idx.dtype() != ScalarType::U32
@@ -8576,7 +9427,7 @@ fn ffn_step_stage1_5_metal_host(
         )));
     }
 
-    if qwen36_ffn_int4_stage5_router_metal_native_supported(params, weights, int4) {
+    if qwen36_ffn_int4_stage5_router_metal_native_supported(params, weights, int4, options) {
         qwen36_validate_dense_or_int4_sidecars(
             int4.shared_gate_proj_type,
             int4.shared_gate_proj_scale,
@@ -8612,21 +9463,71 @@ fn ffn_step_stage1_5_metal_host(
             int4.group_size,
             "down_proj",
         )?;
-        let router_parity_tap =
-            qwen36_ffn_router_stage5_parity_tap_enabled_for_layer(params.layer_idx);
-        let shared_parity_tap = qwen36_ffn_shared_stage5_parity_tap_enabled();
-        let shared_host_correction = qwen36_ffn_stage5_shared_host_correction_enabled();
-        let shared_mid_host_correction = qwen36_ffn_stage5_shared_mid_host_correction_enabled();
-        let routed_host_correction = qwen36_ffn_stage5_routed_host_correction_enabled();
-        let routed_down_host_recompute_correction =
-            qwen36_ffn_stage5_routed_down_host_recompute_correction_enabled_for_layer(
-                params.layer_idx,
-            );
-        let residual_host_snap =
-            qwen36_ffn_stage5_residual_host_snap_enabled_for_layer(params.layer_idx);
-        let routed_gate_up_tap = qwen36_ffn_stage5_routed_gate_up_tap_enabled();
-        let routed_silu_tap = qwen36_ffn_stage5_routed_silu_tap_enabled();
-        let routed_finalize_tap = qwen36_ffn_stage5_routed_finalize_tap_enabled();
+        let router_parity_tap = options.map_or_else(
+            || qwen36_ffn_router_stage5_parity_tap_enabled_for_layer(params.layer_idx),
+            |options| {
+                options.ffn_router_stage5_parity_tap
+                    && !options.force_host_native
+                    && options
+                        .ffn_router_stage5_parity_tap_layer
+                        .map_or(true, |target| target == params.layer_idx)
+            },
+        );
+        let shared_parity_tap =
+            options.map_or_else(qwen36_ffn_shared_stage5_parity_tap_enabled, |options| {
+                options.ffn_shared_stage5_parity_tap
+                    && !options.force_host_native
+                    && !crate::prefill_ffi::metal_batch_is_active()
+            });
+        let shared_host_correction = options.map_or_else(
+            qwen36_ffn_stage5_shared_host_correction_enabled,
+            |options| options.ffn_stage5_shared_host_correction && !options.force_host_native,
+        );
+        let shared_mid_host_correction = options.map_or_else(
+            qwen36_ffn_stage5_shared_mid_host_correction_enabled,
+            |options| options.ffn_stage5_shared_mid_host_correction && !options.force_host_native,
+        );
+        let routed_host_correction = options.map_or_else(
+            qwen36_ffn_stage5_routed_host_correction_enabled,
+            |options| options.ffn_stage5_routed_host_correction && !options.force_host_native,
+        );
+        let routed_down_host_recompute_correction = options.map_or_else(
+            || {
+                qwen36_ffn_stage5_routed_down_host_recompute_correction_enabled_for_layer(
+                    params.layer_idx,
+                )
+            },
+            |options| {
+                options.ffn_stage5_routed_down_host_recompute_correction
+                    && !options.force_host_native
+                    && options
+                        .ffn_stage5_routed_down_host_recompute_correction_layer
+                        .map_or(true, |target| target == params.layer_idx)
+            },
+        );
+        let residual_host_snap = options.map_or_else(
+            || qwen36_ffn_stage5_residual_host_snap_enabled_for_layer(params.layer_idx),
+            |options| {
+                options.ffn_stage5_residual_host_snap
+                    && !options.force_host_native
+                    && options
+                        .ffn_stage5_residual_host_snap_layer
+                        .is_some_and(|target| target == params.layer_idx)
+                    && options.ffn_stage5_residual_host_snap_row.is_some()
+            },
+        );
+        let routed_gate_up_tap = options
+            .map_or_else(qwen36_ffn_stage5_routed_gate_up_tap_enabled, |options| {
+                options.ffn_stage5_routed_gate_up_tap && !options.force_host_native
+            });
+        let routed_silu_tap = options
+            .map_or_else(qwen36_ffn_stage5_routed_silu_tap_enabled, |options| {
+                options.ffn_stage5_routed_silu_tap && !options.force_host_native
+            });
+        let routed_finalize_tap = options
+            .map_or_else(qwen36_ffn_stage5_routed_finalize_tap_enabled, |options| {
+                options.ffn_stage5_routed_finalize_tap && !options.force_host_native
+            });
         if shared_host_correction
             || shared_mid_host_correction
             || routed_host_correction
@@ -8747,7 +9648,10 @@ fn ffn_step_stage1_5_metal_host(
         } else {
             None
         };
-        let wait_for_completion = !ffn_stage5_router_defer_wait_enabled();
+        let wait_for_completion = !match options {
+            Some(options) => ffn_stage5_router_defer_wait_enabled_with_options(options),
+            None => ffn_stage5_router_defer_wait_enabled(),
+        };
         let status = crate::prefill_ffi::metal_profile_time(
             "qwen36_ffn_int4_stage5_with_router",
             "native",
@@ -8796,6 +9700,7 @@ fn ffn_step_stage1_5_metal_host(
                     )
                 })?;
                 qwen36_emit_ffn_routed_stage5_gate_up_tap(
+                    options,
                     ordinal,
                     params.layer_idx,
                     hidden,
@@ -8833,6 +9738,7 @@ fn ffn_step_stage1_5_metal_host(
                     )
                 })?;
                 qwen36_emit_ffn_routed_stage5_finalize_tap(
+                    options,
                     ordinal,
                     params.layer_idx,
                     hidden,
@@ -8865,6 +9771,7 @@ fn ffn_step_stage1_5_metal_host(
                     )
                 })?;
                 qwen36_apply_ffn_shared_mid_stage5_host_correction(
+                    options,
                     ordinal,
                     params.layer_idx,
                     hidden,
@@ -8887,6 +9794,7 @@ fn ffn_step_stage1_5_metal_host(
                     )
                 })?;
                 qwen36_apply_ffn_shared_stage5_host_correction(
+                    options,
                     ordinal,
                     params.layer_idx,
                     hidden,
@@ -8906,6 +9814,7 @@ fn ffn_step_stage1_5_metal_host(
                     )
                 })?;
                 qwen36_apply_ffn_routed_down_stage5_host_recompute_correction(
+                    options,
                     ordinal,
                     params.layer_idx,
                     hidden,
@@ -8937,6 +9846,7 @@ fn ffn_step_stage1_5_metal_host(
                     )
                 })?;
                 qwen36_apply_ffn_routed_stage5_host_correction(
+                    options,
                     ordinal,
                     params.layer_idx,
                     hidden,
@@ -8966,12 +9876,17 @@ fn ffn_step_stage1_5_metal_host(
                         "qwen36_moe::ffn_step_launch: residual host snap missing reference".into(),
                     )
                 })?;
-                let row = qwen36_ffn_stage5_residual_host_snap_row().ok_or_else(|| {
+                let row = match options {
+                    Some(options) => options.ffn_stage5_residual_host_snap_row,
+                    None => qwen36_ffn_stage5_residual_host_snap_row(),
+                }
+                .ok_or_else(|| {
                     GpuError::InvalidArg(
                         "qwen36_moe::ffn_step_launch: residual host snap missing row".into(),
                     )
                 })?;
                 qwen36_apply_ffn_residual_stage5_host_snap(
+                    options,
                     ordinal,
                     params.layer_idx,
                     hidden,
@@ -8988,6 +9903,7 @@ fn ffn_step_stage1_5_metal_host(
                     )
                 })?;
                 qwen36_emit_ffn_router_stage5_parity_tap(
+                    options,
                     ordinal,
                     params.layer_idx,
                     workspace,
@@ -9004,6 +9920,7 @@ fn ffn_step_stage1_5_metal_host(
             }
             if let Some(reference) = shared_reference.as_ref() {
                 qwen36_emit_ffn_shared_stage5_parity_tap(
+                    options,
                     ordinal,
                     params.layer_idx,
                     workspace,
@@ -9161,7 +10078,7 @@ fn ffn_step_stage1_5_metal_host(
         "down_proj",
     )?;
 
-    if qwen36_ffn_int4_stage5_metal_native_supported(params, weights, int4) {
+    if qwen36_ffn_int4_stage5_metal_native_supported(params, weights, int4, options) {
         return crate::prefill_ffi::metal_profile_time(
             "qwen36_ffn_int4_stage5",
             "native",
@@ -9362,10 +10279,12 @@ fn ffn_step_stage1_5_metal_host(
     let active_experts: Vec<usize> = (0..active_groups)
         .map(|group| f32::to_bits(workspace[off_topk_idx + group]) as i32 as usize)
         .collect();
-    if qwen36_route_profile_enabled() {
+    if options.map_or_else(qwen36_route_profile_enabled, |options| {
+        options.route_profile
+    }) {
         qwen36_route_profile_record(&active_experts);
     }
-    if qwen36_ffn_expert_static_topn_partial_stage5_supported(params, weights, int4) {
+    if qwen36_ffn_expert_static_topn_partial_stage5_supported(params, weights, int4, options) {
         if let Some(()) = qwen36_try_static_topn_partial_packed_for_metal(
             output_ordinal,
             params,
@@ -9393,7 +10312,7 @@ fn ffn_step_stage1_5_metal_host(
             return Ok(());
         }
     }
-    if qwen36_ffn_expert_mps_static_topn_partial_stage5_supported(params, weights, int4) {
+    if qwen36_ffn_expert_mps_static_topn_partial_stage5_supported(params, weights, int4, options) {
         if let Some(()) = qwen36_try_mps_static_topn_partial_for_metal(
             output_ordinal,
             params,
@@ -9421,12 +10340,18 @@ fn ffn_step_stage1_5_metal_host(
             return Ok(());
         }
     }
-    if qwen36_ffn_expert_mps_bridge_stage5_supported(params, weights, int4) {
-        let cpu_transcode =
-            std::env::var_os("SUPERSONIC_METAL_QWEN36_MPS_BRIDGE_CPU_TRANSCODE").is_some();
+    if qwen36_ffn_expert_mps_bridge_stage5_supported(params, weights, int4, options) {
+        let cpu_transcode = qwen36_launch_flag(
+            options,
+            |options| options.mps_bridge_cpu_transcode,
+            "SUPERSONIC_METAL_QWEN36_MPS_BRIDGE_CPU_TRANSCODE",
+        );
         let mut bridge = if cpu_transcode {
-            let use_lut_pack =
-                std::env::var_os("SUPERSONIC_METAL_QWEN36_MPS_BRIDGE_CPU_TRANSCODE_LUT").is_some();
+            let use_lut_pack = qwen36_launch_flag(
+                options,
+                |options| options.mps_bridge_cpu_transcode_lut,
+                "SUPERSONIC_METAL_QWEN36_MPS_BRIDGE_CPU_TRANSCODE_LUT",
+            );
             let pack_op = if use_lut_pack {
                 "qwen36_ffn_int4_expert_mps_bridge_pack_f16_lut"
             } else {
@@ -9462,7 +10387,10 @@ fn ffn_step_stage1_5_metal_host(
                     )
                 },
             )?;
-            let profile_transcode = std::env::var_os("SUPERSONIC_METAL_PROFILE").is_some();
+            let profile_transcode = match options {
+                Some(options) => options.profile,
+                None => crate::prefill_ffi::metal_profile_enabled(),
+            };
             crate::prefill_ffi::metal_profile_time(
                 "qwen36_ffn_int4_expert_mps_transcode_int4_f16",
                 "native",
@@ -9518,7 +10446,8 @@ fn ffn_step_stage1_5_metal_host(
         )?;
         return Ok(());
     }
-    if qwen36_ffn_expert_direct_gather_stage5_metal_native_supported(params, weights, int4) {
+    if qwen36_ffn_expert_direct_gather_stage5_metal_native_supported(params, weights, int4, options)
+    {
         crate::prefill_ffi::metal_profile_time(
             "qwen36_ffn_int4_expert_direct_gather_stage5",
             "native",
@@ -9543,13 +10472,18 @@ fn ffn_step_stage1_5_metal_host(
                     off_shared_out,
                     off_expert_mid,
                     off_moe_out,
-                    !ffn_expert_direct_gather_defer_wait_enabled(),
+                    !match options {
+                        Some(options) => {
+                            ffn_expert_direct_gather_defer_wait_enabled_with_options(options)
+                        }
+                        None => ffn_expert_direct_gather_defer_wait_enabled(),
+                    },
                 )
             },
         )?;
         return Ok(());
     }
-    if qwen36_ffn_expert_packed_stage5_metal_native_supported(params, weights, int4) {
+    if qwen36_ffn_expert_packed_stage5_metal_native_supported(params, weights, int4, options) {
         let packed_stage5_reference = if qwen36_ffn_stage5_routed_gate_up_tap_enabled()
             || qwen36_ffn_stage5_routed_silu_tap_enabled()
             || qwen36_ffn_stage5_routed_finalize_tap_enabled()
@@ -9568,7 +10502,8 @@ fn ffn_step_stage1_5_metal_host(
         } else {
             None
         };
-        if qwen36_ffn_expert_gpu_pack_stage5_metal_native_supported(params, weights, int4) {
+        if qwen36_ffn_expert_gpu_pack_stage5_metal_native_supported(params, weights, int4, options)
+        {
             qwen36_with_gpu_pack_buffers_for_metal(
                 output_ordinal,
                 hidden,
@@ -9725,10 +10660,15 @@ fn ffn_step_stage1_5_metal_host(
         for group in 0..active_groups {
             workspace[off_topk_idx + group] = f32::from_bits(group as u32);
         }
-        let use_pack_cache =
-            std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_PACK_CACHE").is_some()
-                && std::env::var_os("SUPERSONIC_METAL_DISABLE_QWEN36_FFN_EXPERT_PACK_CACHE")
-                    .is_none();
+        let use_pack_cache = qwen36_launch_flag(
+            options,
+            |options| options.enable_ffn_expert_pack_cache,
+            "SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_PACK_CACHE",
+        ) && !qwen36_launch_flag(
+            options,
+            |options| options.disable_ffn_expert_pack_cache,
+            "SUPERSONIC_METAL_DISABLE_QWEN36_FFN_EXPERT_PACK_CACHE",
+        );
         if !use_pack_cache {
             let packed = crate::prefill_ffi::metal_profile_time(
                 "qwen36_ffn_int4_expert_pack_stage5",
@@ -9793,6 +10733,7 @@ fn ffn_step_stage1_5_metal_host(
                         || qwen36_ffn_stage5_routed_silu_tap_enabled()
                     {
                         qwen36_emit_ffn_routed_stage5_gate_up_tap(
+                            None,
                             output_ordinal,
                             params.layer_idx,
                             hidden,
@@ -9813,6 +10754,7 @@ fn ffn_step_stage1_5_metal_host(
                     }
                     if qwen36_ffn_stage5_routed_finalize_tap_enabled() {
                         qwen36_emit_ffn_routed_stage5_finalize_tap(
+                            None,
                             output_ordinal,
                             params.layer_idx,
                             hidden,
@@ -9834,6 +10776,7 @@ fn ffn_step_stage1_5_metal_host(
                     }
                     if qwen36_ffn_stage5_routed_host_correction_enabled() {
                         qwen36_apply_ffn_routed_stage5_host_correction(
+                            None,
                             output_ordinal,
                             params.layer_idx,
                             hidden,
@@ -9904,7 +10847,7 @@ fn ffn_step_stage1_5_metal_host(
         )?;
         return Ok(());
     }
-    if qwen36_ffn_expert_tiled_stage5_metal_native_supported(params, weights, int4) {
+    if qwen36_ffn_expert_tiled_stage5_metal_native_supported(params, weights, int4, options) {
         crate::prefill_ffi::metal_profile_time(
             "qwen36_ffn_int4_expert_gate_up_down_finalize_tiled",
             "native",
@@ -9937,7 +10880,7 @@ fn ffn_step_stage1_5_metal_host(
         return Ok(());
     }
 
-    if qwen36_ffn_expert_gate_up_tiled_metal_native_supported(params, weights, int4) {
+    if qwen36_ffn_expert_gate_up_tiled_metal_native_supported(params, weights, int4, options) {
         crate::prefill_ffi::metal_profile_time(
             "qwen36_ffn_int4_expert_gate_up_tiled",
             "native",
@@ -12386,6 +13329,22 @@ mod tests {
     }
 
     #[test]
+    fn qwen36_launch_wait_policy_uses_explicit_options() {
+        let mut options = Qwen36MoeLaunchOptions::default();
+        assert!(!ffn_stage5_router_defer_wait_enabled_with_options(&options));
+        assert!(!ffn_expert_direct_gather_defer_wait_enabled_with_options(
+            &options
+        ));
+
+        options.defer_ffn_router_stage5_wait = true;
+        options.defer_ffn_direct_gather_stage5_wait = true;
+        assert!(ffn_stage5_router_defer_wait_enabled_with_options(&options));
+        assert!(ffn_expert_direct_gather_defer_wait_enabled_with_options(
+            &options
+        ));
+    }
+
+    #[test]
     fn qwen36_static_topn_partial_requires_native_int4_layout() {
         const ENV: &str = "SUPERSONIC_METAL_ENABLE_QWEN36_FFN_EXPERT_STATIC_TOPN_PARTIAL";
         struct EnvRestore {
@@ -12445,18 +13404,18 @@ mod tests {
         };
 
         assert!(qwen36_ffn_expert_static_topn_partial_stage5_supported(
-            params, &weights, &int4
+            params, &weights, &int4, None
         ));
 
         int4.gate_up_proj_type = 12;
         assert!(!qwen36_ffn_expert_static_topn_partial_stage5_supported(
-            params, &weights, &int4
+            params, &weights, &int4, None
         ));
 
         int4.gate_up_proj_type = 4;
         int4.down_proj_type = 13;
         assert!(!qwen36_ffn_expert_static_topn_partial_stage5_supported(
-            params, &weights, &int4
+            params, &weights, &int4, None
         ));
     }
 

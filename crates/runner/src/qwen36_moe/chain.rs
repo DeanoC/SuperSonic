@@ -8,6 +8,7 @@ use crate::qwen36_moe_telemetry::{MoeRouteRuntime, MoeSparseTelemetrySnapshot};
 use crate::qwen36_moe_types::{
     DecodeOutputs, ExpertPrefetchPhase, ExpertRoute, MultiLayerGeom, PositionPair,
 };
+use supersonic_runtime::qwen36_moe::decode::Qwen36ExecutionOptions;
 use supersonic_runtime::qwen36_moe::layers::LoadedQwen36Layers;
 
 pub(crate) struct Qwen36ChainStep<'a> {
@@ -29,6 +30,7 @@ pub(crate) struct Qwen36ChainStep<'a> {
     pub(crate) emit_stage_timings: bool,
     pub(crate) fold: Option<LmHeadFold<'a>>,
     pub(crate) download_final_hidden: bool,
+    pub(crate) execution: &'a Qwen36ExecutionOptions,
 }
 
 pub(crate) struct Qwen36ChainStepOutput {
@@ -56,7 +58,13 @@ pub(crate) fn run_chain_step(args: Qwen36ChainStep<'_>) -> Result<Qwen36ChainSte
         drop(args.fold);
         let outputs = args
             .loaded_layers
-            .run_segmented_profile(args.ordinal, args.initial_hidden, rope, cache)
+            .run_segmented_profile(
+                args.ordinal,
+                args.initial_hidden,
+                rope,
+                cache,
+                args.execution,
+            )
             .with_context(|| {
                 format!(
                     "persistent segmented profile decode (step {}, rope {}, cache {})",
@@ -111,6 +119,7 @@ pub(crate) fn run_chain_step(args: Qwen36ChainStep<'_>) -> Result<Qwen36ChainSte
                 fold: args.fold,
                 download_final_hidden: args.download_final_hidden,
                 expert_prefetch,
+                execution: args.execution,
             },
         )?
     };

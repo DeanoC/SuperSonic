@@ -35,7 +35,7 @@ use runner::qwen36_moe_state::{restore_linear_attn_state, save_linear_attn_state
 use serde_json::Value;
 use std::ffi::c_void;
 use supersonic_runtime::qwen36_moe::chain::{run_chain_step, Qwen36ChainStep};
-use supersonic_runtime::qwen36_moe::decode::run_chained_decode;
+use supersonic_runtime::qwen36_moe::decode::{run_chained_decode, Qwen36ExecutionOptions};
 use supersonic_runtime::qwen36_moe::layer_loader::Qwen36WeightMode;
 use supersonic_runtime::qwen36_moe::layers::LoadedQwen36Layers;
 use supersonic_runtime::qwen36_moe::persistent_decode::{LmHeadFold, CACHE_POS_INHERIT};
@@ -737,6 +737,7 @@ fn multilayer_persistent_decode_matches_chained() {
     // recurrent_state per token).
     let snapshot =
         save_linear_attn_state(ordinal, loaded.layers()).expect("save_linear_attn_state");
+    let execution = Qwen36ExecutionOptions::default();
 
     // ---- Runtime-owned chained-path reference ----
     let chained = run_chain_step(Qwen36ChainStep {
@@ -750,6 +751,7 @@ fn multilayer_persistent_decode_matches_chained() {
         fold: None,
         download_final_hidden: true,
         expert_prefetch: None,
+        execution: &execution,
     })
     .expect("runtime chained decode")
     .outputs;
@@ -808,6 +810,7 @@ fn multilayer_persistent_decode_matches_chained() {
         }),
         download_final_hidden: true,
         expert_prefetch: None,
+        execution: &execution,
     })
     .expect("runtime persistent decode");
     assert!(persistent.lm_head_folded);

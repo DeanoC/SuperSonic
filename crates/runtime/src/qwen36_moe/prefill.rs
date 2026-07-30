@@ -41,12 +41,12 @@ use anyhow::{anyhow, Context, Result};
 use gpu_hal::{copy_d2h, copy_h2d, Backend, GpuBuffer, ScalarType};
 use kernel_ffi::prefill_ffi;
 use kernel_ffi::qwen36_moe::{
-    attn_step_launch, batched_prefill_grouped_expert_launch_raw,
-    batched_prefill_unpermute_combine_launch, ffn_step_launch, linear_step_launch,
-    linear_step_stage5_metal_native_into, Qwen36MoeAttnStepInt4, Qwen36MoeAttnStepParams,
-    Qwen36MoeAttnStepWeights, Qwen36MoeFfnStepInt4, Qwen36MoeFfnStepParams,
-    Qwen36MoeFfnStepWeights, Qwen36MoeLinearStepInt4, Qwen36MoeLinearStepParams,
-    Qwen36MoeLinearStepWeights,
+    attn_step_launch_with_options, batched_prefill_grouped_expert_launch_raw,
+    batched_prefill_unpermute_combine_launch, ffn_step_launch_with_options,
+    linear_step_launch_with_options, linear_step_stage5_metal_native_into_with_options,
+    Qwen36MoeAttnStepInt4, Qwen36MoeAttnStepParams, Qwen36MoeAttnStepWeights, Qwen36MoeFfnStepInt4,
+    Qwen36MoeFfnStepParams, Qwen36MoeFfnStepWeights, Qwen36MoeLinearStepInt4,
+    Qwen36MoeLinearStepParams, Qwen36MoeLinearStepWeights,
 };
 use model_store::BakedStore;
 
@@ -57,9 +57,9 @@ pub use kernel_ffi::qwen36_moe::{
 
 use crate::qwen36_moe::chain::{run_chain_step, Qwen36ChainStep};
 use crate::qwen36_moe::decode::{
-    execution_option, execution_option_os, ffn_output_elems, ffn_workspace_floats,
-    full_attn_output_elems, full_attn_score_workspace_floats, full_attn_workspace_floats,
-    linear_attn_workspace_floats, reset_sync_buf,
+    ffn_output_elems, ffn_workspace_floats, full_attn_output_elems,
+    full_attn_score_workspace_floats, full_attn_workspace_floats, linear_attn_workspace_floats,
+    reset_sync_buf, Qwen36ExecutionOptions,
 };
 use crate::qwen36_moe::layer_loader::{classify_layer_weight_encoding, Qwen36LayerWeightEncoding};
 use crate::qwen36_moe::layers::LoadedQwen36Layers;
@@ -217,8 +217,8 @@ fn validate_prefill_position_plan(
     Ok(())
 }
 
-fn metal_profile_enabled() -> bool {
-    execution_option_os("SUPERSONIC_METAL_PROFILE").is_some()
+fn metal_profile_enabled(execution: &Qwen36ExecutionOptions) -> bool {
+    execution.metal.profile
 }
 
 /// CPU-built RoPE cos/sin tables uploaded once per orchestrator invocation.
@@ -389,6 +389,7 @@ pub fn run_batched_prefill(
     tokens: &[u32],
     positions: &[PositionPair],
     accurate_stage_timings: bool,
+    execution: &Qwen36ExecutionOptions,
     token_callback: Option<&mut PrefillTokenCallback<'_>>,
     progress_callback: Option<&mut PrefillProgressCallback<'_>>,
 ) -> Result<BatchedPrefillTimings> {
@@ -401,13 +402,16 @@ pub fn run_batched_prefill(
     }
     let prefill_count = tokens.len();
     let mut timings = BatchedPrefillTimings::default();
+    if loaded_layers.has_sparse_expert_residency() && token_callback.is_none() {
+        anyhow::bail!(
+            "Qwen3.6 sparse prefill requires a fallback token callback with expert prefetch policy"
+        );
+    }
     if prefill_count == 0 {
         return Ok(timings);
     }
 
-    let batched_attn_enabled = execution_option("SUPERSONIC_QWEN36_MOE_BATCHED_ATTN")
-        .map(|value| value != "0")
-        .unwrap_or(true);
+    let batched_attn_enabled = execution.batched_prefill.attention;
     let sparse_residency_active = loaded_layers.has_sparse_expert_residency();
     let supports_batched = batched_attn_enabled
         && supports_batched_path(loaded_layers.layers(), sparse_residency_active)?;
@@ -426,6 +430,7 @@ pub fn run_batched_prefill(
             tokens,
             positions,
             accurate_stage_timings,
+            execution,
             token_callback,
             progress_callback,
         );
@@ -481,6 +486,7 @@ pub fn run_batched_prefill(
             tokens,
             positions,
             accurate_stage_timings,
+            execution,
             step,
             n,
             &rotary,
@@ -555,6 +561,7 @@ fn process_chunk_batched(
     tokens: &[u32],
     positions: &[PositionPair],
     accurate_stage_timings: bool,
+    execution: &Qwen36ExecutionOptions,
     chunk_start: usize,
     n: usize,
     rotary: &RotaryTables,
@@ -603,10 +610,7 @@ fn process_chunk_batched(
     // M13: grouped MoE FFN is the DEFAULT once we're on the batched-attn
     // path. Set SUPERSONIC_QWEN36_MOE_GROUPED_FFN=0 to fall back to per-token
     // FFN inside the chunk while keeping the batched attention.
-    let grouped_ffn_disabled = execution_option("SUPERSONIC_QWEN36_MOE_GROUPED_FFN")
-        .map(|v| v == "0")
-        .unwrap_or(false);
-    let use_grouped_ffn = !grouped_ffn_disabled;
+    let use_grouped_ffn = execution.batched_prefill.grouped_ffn;
 
     // Per-token fallback workspaces. Always allocated — used either by
     // linear-attn (always) or by per-token FFN (when grouped FFN is off).
@@ -677,6 +681,7 @@ fn process_chunk_batched(
                 o_proj_w,
                 int4,
                 kv_cache,
+                execution,
                 rotary,
                 pos_ids.as_ref(),
                 scratch,
@@ -694,6 +699,7 @@ fn process_chunk_batched(
                 &mut attn_output,
                 &mut attn_workspace,
                 &mut sync_buf,
+                execution,
             )
             .with_context(|| format!("pertoken linear-attn layer {layer_idx}"))?;
         }
@@ -708,6 +714,7 @@ fn process_chunk_batched(
                 &layer.ffn,
                 scratch,
                 &mut sync_buf,
+                execution,
             )
             .with_context(|| format!("batched grouped ffn layer {layer_idx}"))?;
         } else {
@@ -722,6 +729,7 @@ fn process_chunk_batched(
                 &mut ffn_output_idx,
                 &mut ffn_workspace,
                 &mut sync_buf,
+                execution,
             )
             .with_context(|| format!("pertoken ffn layer {layer_idx}"))?;
         }
@@ -793,6 +801,7 @@ fn run_pertoken_chunked(
     tokens: &[u32],
     positions: &[PositionPair],
     accurate_stage_timings: bool,
+    execution: &Qwen36ExecutionOptions,
     token_callback: Option<&mut PrefillTokenCallback<'_>>,
     progress_callback: Option<&mut PrefillProgressCallback<'_>>,
 ) -> Result<BatchedPrefillTimings> {
@@ -822,6 +831,7 @@ fn run_pertoken_chunked(
                 tokens[step],
                 positions[step],
                 accurate_stage_timings,
+                execution,
                 token_callback.as_deref_mut(),
             )?;
             timings.embed_total += token_timings.embed;
@@ -847,6 +857,7 @@ fn run_prefill_token(
     token: u32,
     position: PositionPair,
     accurate_stage_timings: bool,
+    execution: &Qwen36ExecutionOptions,
     token_callback: Option<&mut PrefillTokenCallback<'_>>,
 ) -> Result<PrefillTokenTimings> {
     if let Some(callback) = token_callback {
@@ -867,6 +878,7 @@ fn run_prefill_token(
         position,
         step,
         accurate_stage_timings,
+        execution,
         fold: None,
         download_final_hidden: true,
         expert_prefetch: None,
@@ -927,6 +939,7 @@ fn process_full_attn_layer_batched(
     o_proj_w: &GpuBuffer,
     int4: &FullAttnInt4Sidecars,
     kv_cache: &mut FullAttnKvCache,
+    execution: &Qwen36ExecutionOptions,
     rotary: &RotaryTables,
     pos_ids: Option<&GpuBuffer>,
     scratch: &mut FullAttnBatchScratch,
@@ -944,7 +957,7 @@ fn process_full_attn_layer_batched(
     let scale = 1.0f32 / (hd as f32).sqrt();
 
     // 1. RMSnorm rows (with add_unit_offset = HF (1+w) form).
-    prefill_ffi::rms_norm_rows(
+    prefill_ffi::rms_norm_rows_with_options(
         ordinal,
         ScalarType::BF16,
         n,
@@ -953,11 +966,12 @@ fn process_full_attn_layer_batched(
         chunk_hidden,
         input_norm_w,
         &mut scratch.x_norm,
+        &execution.prefill_kernel,
     )
     .map_err(|e| anyhow!("rms_norm_rows input: {e}"))?;
 
     // 2. Q/K/V projections (INT4).
-    prefill_ffi::matmul_rhs_transposed_int4(
+    prefill_ffi::matmul_rhs_transposed_int4_with_options(
         ordinal,
         1,
         n,
@@ -971,9 +985,10 @@ fn process_full_attn_layer_batched(
         group_size,
         qtype,
         &mut scratch.qg_raw,
+        &execution.prefill_kernel,
     )
     .map_err(|e| anyhow!("matmul q_proj: {e}"))?;
-    prefill_ffi::matmul_rhs_transposed_int4(
+    prefill_ffi::matmul_rhs_transposed_int4_with_options(
         ordinal,
         1,
         n,
@@ -987,9 +1002,10 @@ fn process_full_attn_layer_batched(
         group_size,
         qtype,
         &mut scratch.k,
+        &execution.prefill_kernel,
     )
     .map_err(|e| anyhow!("matmul k_proj: {e}"))?;
-    prefill_ffi::matmul_rhs_transposed_int4(
+    prefill_ffi::matmul_rhs_transposed_int4_with_options(
         ordinal,
         1,
         n,
@@ -1003,17 +1019,16 @@ fn process_full_attn_layer_batched(
         group_size,
         qtype,
         &mut scratch.v,
+        &execution.prefill_kernel,
     )
     .map_err(|e| anyhow!("matmul v_proj: {e}"))?;
 
     // 3. Split q+gate. qg_raw layout per row: [h0_q[hd], h0_gate[hd],
     //    h1_q[hd], h1_gate[hd], ...] — interleaved per-head halves.
-    let use_metal_split_qgate = chunk_hidden.backend() == Backend::Metal
-        && execution_option("SUPERSONIC_QWEN36_MOE_METAL_SPLIT_QGATE")
-            .map(|v| v != "0")
-            .unwrap_or(false);
+    let use_metal_split_qgate =
+        chunk_hidden.backend() == Backend::Metal && execution.batched_prefill.metal_split_qgate;
     if use_metal_split_qgate {
-        prefill_ffi::split_qgate(
+        prefill_ffi::split_qgate_with_options(
             ordinal,
             ScalarType::BF16,
             n,
@@ -1022,6 +1037,7 @@ fn process_full_attn_layer_batched(
             &scratch.qg_raw,
             &mut scratch.q,
             &mut scratch.gate,
+            &execution.prefill_kernel,
         )
         .map_err(|e| anyhow!("split qgate: {e}"))?;
     } else {
@@ -1043,7 +1059,7 @@ fn process_full_attn_layer_batched(
     }
 
     // 4. Per-head q_norm + k_norm (RMSnorm on rows of head_dim).
-    prefill_ffi::rms_norm_rows(
+    prefill_ffi::rms_norm_rows_with_options(
         ordinal,
         ScalarType::BF16,
         n * h,
@@ -1052,9 +1068,10 @@ fn process_full_attn_layer_batched(
         &scratch.q,
         q_norm_w,
         &mut scratch.q_after,
+        &execution.prefill_kernel,
     )
     .map_err(|e| anyhow!("rms_norm_rows q: {e}"))?;
-    prefill_ffi::rms_norm_rows(
+    prefill_ffi::rms_norm_rows_with_options(
         ordinal,
         ScalarType::BF16,
         n * hkv,
@@ -1063,6 +1080,7 @@ fn process_full_attn_layer_batched(
         &scratch.k,
         k_norm_w,
         &mut scratch.k_after,
+        &execution.prefill_kernel,
     )
     .map_err(|e| anyhow!("rms_norm_rows k: {e}"))?;
 
@@ -1097,7 +1115,7 @@ fn process_full_attn_layer_batched(
         )
         .map_err(|e| anyhow!("rope k indirect: {e}"))?;
     } else {
-        prefill_ffi::apply_rope_prefill(
+        prefill_ffi::apply_rope_prefill_with_options(
             ordinal,
             ScalarType::BF16,
             n,
@@ -1108,9 +1126,10 @@ fn process_full_attn_layer_batched(
             &rotary.sin,
             past_len,
             &mut scratch.q_after,
+            &execution.prefill_kernel,
         )
         .map_err(|e| anyhow!("rope q: {e}"))?;
-        prefill_ffi::apply_rope_prefill(
+        prefill_ffi::apply_rope_prefill_with_options(
             ordinal,
             ScalarType::BF16,
             n,
@@ -1121,6 +1140,7 @@ fn process_full_attn_layer_batched(
             &rotary.sin,
             past_len,
             &mut scratch.k_after,
+            &execution.prefill_kernel,
         )
         .map_err(|e| anyhow!("rope k: {e}"))?;
     }
@@ -1143,17 +1163,13 @@ fn process_full_attn_layer_batched(
     }
 
     let kv_len = past_len + n;
-    let metal_native_enabled = chunk_hidden.backend() == Backend::Metal
-        && execution_option_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none();
-    let use_metal_tmajor_full_attn = metal_native_enabled
-        && execution_option("SUPERSONIC_QWEN36_MOE_METAL_FULL_ATTN_TMAJOR")
-            .map(|v| v != "0")
-            .unwrap_or(false);
+    let metal_native_enabled =
+        chunk_hidden.backend() == Backend::Metal && !execution.metal.force_host_native;
+    let use_metal_tmajor_full_attn =
+        metal_native_enabled && execution.batched_prefill.metal_full_attn_tmajor;
     let use_metal_vec_full_attn = metal_native_enabled
         && !use_metal_tmajor_full_attn
-        && execution_option("SUPERSONIC_QWEN36_MOE_METAL_FULL_ATTN_VEC")
-            .map(|v| v != "0")
-            .unwrap_or(true);
+        && execution.batched_prefill.metal_full_attn_vec;
 
     if use_metal_tmajor_full_attn {
         // 7. Metal-only fast layout path. The native kernel reads the
@@ -1161,7 +1177,7 @@ fn process_full_attn_layer_batched(
         // `[N,H,D]` F32 output, avoiding the old prefix copy plus K/V/Q/output
         // transpose chain for every full-attention layer.
         unsafe {
-            prefill_ffi::metal_full_attention_prefill_tmajor_bf16_f32(
+            prefill_ffi::metal_full_attention_prefill_tmajor_bf16_f32_with_options(
                 h,
                 hkv,
                 n,
@@ -1173,12 +1189,13 @@ fn process_full_attn_layer_batched(
                 cache_k_ptr as *const c_void,
                 cache_v_ptr as *const c_void,
                 &mut scratch.attn_out_nhd_f32,
+                &execution.prefill_kernel,
             )
         }
         .map_err(|e| anyhow!("metal full_attention_prefill_tmajor: {e}"))?;
     } else if use_metal_vec_full_attn {
         unsafe {
-            prefill_ffi::metal_full_attention_prefill_tmajor_vec_bf16_f32(
+            prefill_ffi::metal_full_attention_prefill_tmajor_vec_bf16_f32_with_options(
                 h,
                 hkv,
                 n,
@@ -1190,13 +1207,14 @@ fn process_full_attn_layer_batched(
                 cache_k_ptr as *const c_void,
                 cache_v_ptr as *const c_void,
                 &mut scratch.attn_out_nhd_f32,
+                &execution.prefill_kernel,
             )
         }
         .map_err(|e| anyhow!("metal full_attention_prefill_tmajor_vec: {e}"))?;
     } else {
         // 7. Legacy layout path: transpose q [n, h, hd] -> [h, n, hd] and
         // materialize a compact head-major KV prefix for M3 input.
-        prefill_ffi::transpose_shd_hsd(
+        prefill_ffi::transpose_shd_hsd_with_options(
             ordinal,
             ScalarType::BF16,
             n,
@@ -1204,6 +1222,7 @@ fn process_full_attn_layer_batched(
             hd,
             &scratch.q_after,
             &mut scratch.q_thsd,
+            &execution.prefill_kernel,
         )
         .map_err(|e| anyhow!("transpose q s,h,d -> h,s,d: {e}"))?;
 
@@ -1222,7 +1241,7 @@ fn process_full_attn_layer_batched(
             kv_bytes,
         )
         .context("kv prefix copy V")?;
-        prefill_ffi::transpose_shd_hsd(
+        prefill_ffi::transpose_shd_hsd_with_options(
             ordinal,
             ScalarType::BF16,
             kv_len,
@@ -1230,9 +1249,10 @@ fn process_full_attn_layer_batched(
             hd,
             &scratch.kv_prefix_k,
             &mut scratch.k_thsd,
+            &execution.prefill_kernel,
         )
         .map_err(|e| anyhow!("transpose K: {e}"))?;
-        prefill_ffi::transpose_shd_hsd(
+        prefill_ffi::transpose_shd_hsd_with_options(
             ordinal,
             ScalarType::BF16,
             kv_len,
@@ -1240,6 +1260,7 @@ fn process_full_attn_layer_batched(
             hd,
             &scratch.kv_prefix_v,
             &mut scratch.v_thsd,
+            &execution.prefill_kernel,
         )
         .map_err(|e| anyhow!("transpose V: {e}"))?;
         let _ = kv_max_t;
@@ -1264,7 +1285,7 @@ fn process_full_attn_layer_batched(
         // 8. Transpose attn_out F32 [h, n, hd] -> [n, h, hd]. Do it via
         //    transpose_shd_hsd with s=h, h=n: it transposes [s, h, d] to
         //    [h, s, d], so passing s=h, h=n yields the desired [n, h, hd].
-        prefill_ffi::transpose_shd_hsd(
+        prefill_ffi::transpose_shd_hsd_with_options(
             ordinal,
             ScalarType::F32,
             h, // s
@@ -1272,36 +1293,39 @@ fn process_full_attn_layer_batched(
             hd,
             &scratch.attn_out_f32,
             &mut scratch.attn_out_nhd_f32,
+            &execution.prefill_kernel,
         )
         .map_err(|e| anyhow!("transpose attn_out h,n,d -> n,h,d: {e}"))?;
     }
 
     // 9. Cast F32 -> BF16.
-    prefill_ffi::cast(
+    prefill_ffi::cast_with_options(
         ordinal,
         ScalarType::F32,
         ScalarType::BF16,
         n * h * hd,
         &scratch.attn_out_nhd_f32,
         &mut scratch.attn_out_bf16,
+        &execution.prefill_kernel,
     )
     .map_err(|e| anyhow!("cast attn f32->bf16: {e}"))?;
 
     // 11. Apply attn_output_gate: gated = sigmoid(gate) * attn_out_bf16.
     //     `pfx_sigmoid_mul`: out = data * sigmoid(gate). Pass data=attn,
     //     gate=gate. Output BF16.
-    prefill_ffi::sigmoid_mul(
+    prefill_ffi::sigmoid_mul_with_options(
         ordinal,
         ScalarType::BF16,
         n * h * hd,
         &scratch.attn_out_bf16,
         &scratch.gate,
         &mut scratch.gated,
+        &execution.prefill_kernel,
     )
     .map_err(|e| anyhow!("sigmoid_mul: {e}"))?;
 
     // 12. O-projection (INT4).
-    prefill_ffi::matmul_rhs_transposed_int4(
+    prefill_ffi::matmul_rhs_transposed_int4_with_options(
         ordinal,
         1,
         n,
@@ -1315,16 +1339,18 @@ fn process_full_attn_layer_batched(
         group_size,
         qtype,
         &mut scratch.o,
+        &execution.prefill_kernel,
     )
     .map_err(|e| anyhow!("matmul o_proj: {e}"))?;
 
     // 13. Residual add: chunk_hidden += o.
-    prefill_ffi::element_add_inplace(
+    prefill_ffi::element_add_inplace_with_options(
         ordinal,
         ScalarType::BF16,
         n * hidden,
         chunk_hidden,
         &scratch.o,
+        &execution.prefill_kernel,
     )
     .map_err(|e| anyhow!("residual add: {e}"))?;
 
@@ -1345,6 +1371,7 @@ fn process_linear_attn_layer_pertoken(
     attn_output: &mut GpuBuffer,
     attn_workspace: &mut GpuBuffer,
     sync_buf: &mut GpuBuffer,
+    execution: &Qwen36ExecutionOptions,
 ) -> Result<()> {
     let hidden = geom.hidden as usize;
     let row_bytes = hidden * 2;
@@ -1409,11 +1436,9 @@ fn process_linear_attn_layer_pertoken(
     };
     let use_metal_direct_rows = chunk_hidden.backend() == Backend::Metal
         && int4_ptrs.group_size == 128
-        && execution_option_os("SUPERSONIC_METAL_PROFILE").is_none()
-        && execution_option_os("SUPERSONIC_METAL_DISABLE_BATCH").is_none()
-        && execution_option("SUPERSONIC_QWEN36_MOE_METAL_LINEAR_PREFILL_DIRECT")
-            .map(|v| v != "0")
-            .unwrap_or(true);
+        && !execution.metal.profile
+        && !execution.metal.disable_batch
+        && execution.batched_prefill.metal_linear_prefill_direct;
     let _metal_batch = if use_metal_direct_rows {
         let guard = prefill_ffi::MetalBatchGuard::begin()
             .map_err(|e| anyhow!("begin Metal linear direct-row batch: {e}"))?;
@@ -1450,7 +1475,7 @@ fn process_linear_attn_layer_pertoken(
                 (chunk_hidden.as_mut_ptr() as *mut u8).add(token_byte_off) as *mut c_void
             };
             unsafe {
-                linear_step_stage5_metal_native_into(
+                linear_step_stage5_metal_native_into_with_options(
                     params,
                     &weights,
                     &int4_ptrs,
@@ -1459,12 +1484,13 @@ fn process_linear_attn_layer_pertoken(
                     dst,
                     hidden,
                     false,
+                    &execution.kernel_launch,
                 )
             }
             .with_context(|| format!("linear_step_stage5_metal_native_into (pertoken t={t})"))?;
         } else {
             reset_sync_buf(ordinal, sync_buf).context("reset sync_buf (linear-attn pertoken)")?;
-            linear_step_launch(
+            linear_step_launch_with_options(
                 ordinal,
                 ScalarType::BF16,
                 params,
@@ -1473,6 +1499,7 @@ fn process_linear_attn_layer_pertoken(
                 attn_output,
                 attn_workspace,
                 sync_buf,
+                &execution.kernel_launch,
             )
             .with_context(|| format!("linear_step_launch (pertoken t={t})"))?;
             // Copy attn_output[..hidden] back into chunk_hidden[t]
@@ -1505,6 +1532,7 @@ fn process_full_attn_layer_pertoken(
     attn_output: &mut GpuBuffer,
     attn_workspace: &mut GpuBuffer,
     sync_buf: &mut GpuBuffer,
+    execution: &Qwen36ExecutionOptions,
 ) -> Result<()> {
     let hidden = geom.hidden as usize;
     let row_bytes = hidden * 2;
@@ -1593,7 +1621,7 @@ fn process_full_attn_layer_pertoken(
             kv_cache_v: kv_v_ptr,
             kv_max_t,
         };
-        attn_step_launch(
+        attn_step_launch_with_options(
             ordinal,
             ScalarType::BF16,
             params,
@@ -1602,6 +1630,7 @@ fn process_full_attn_layer_pertoken(
             attn_output,
             attn_workspace,
             sync_buf,
+            &execution.kernel_launch,
         )
         .with_context(|| format!("attn_step_launch (pertoken t={t})"))?;
         let dst =
@@ -1626,6 +1655,7 @@ fn process_ffn_pertoken(
     ffn_output_idx: &mut GpuBuffer,
     ffn_workspace: &mut GpuBuffer,
     sync_buf: &mut GpuBuffer,
+    execution: &Qwen36ExecutionOptions,
 ) -> Result<()> {
     let hidden = geom.hidden as usize;
     let row_bytes = hidden * 2;
@@ -1698,7 +1728,7 @@ fn process_ffn_pertoken(
             shared_down_proj_w: ffn.shared_down_proj_w.as_ptr(),
             shared_expert_gate_w: ffn.shared_expert_gate_w.as_ptr(),
         };
-        ffn_step_launch(
+        ffn_step_launch_with_options(
             ordinal,
             ScalarType::BF16,
             params,
@@ -1708,6 +1738,7 @@ fn process_ffn_pertoken(
             ffn_output_idx,
             ffn_workspace,
             sync_buf,
+            &execution.kernel_launch,
         )
         .with_context(|| format!("ffn_step_launch (pertoken t={t})"))?;
         let dst =
@@ -1892,6 +1923,7 @@ fn process_ffn_batched_grouped(
     ffn: &crate::qwen36_moe::types::FfnLayerBuffers,
     scratch: &mut GroupedFfnScratch,
     _sync_buf: &mut GpuBuffer,
+    execution: &Qwen36ExecutionOptions,
 ) -> Result<()> {
     debug_assert_eq!(
         scratch.n, n,
@@ -1917,7 +1949,7 @@ fn process_ffn_batched_grouped(
     let qtype = QUANT_TYPE_NATIVE_INT4;
 
     // 1. Post-attention RMSnorm (HF (1+w) form).
-    prefill_ffi::rms_norm_rows(
+    prefill_ffi::rms_norm_rows_with_options(
         ordinal,
         ScalarType::BF16,
         n,
@@ -1926,6 +1958,7 @@ fn process_ffn_batched_grouped(
         chunk_hidden,
         &ffn.post_attn_norm_w,
         &mut scratch.h_norm,
+        &execution.prefill_kernel,
     )
     .map_err(|e| anyhow!("rms_norm_rows post_attn: {e}"))?;
 
@@ -1935,7 +1968,7 @@ fn process_ffn_batched_grouped(
     //    Per-token kernel stores logits as `bf16_round_rne_f32(F32 dot)`
     //    in workspace (F32 storage); we keep them as BF16 here, then widen
     //    for the softmax — bit-exact equivalent.
-    prefill_ffi::matmul_rhs_transposed(
+    prefill_ffi::matmul_rhs_transposed_with_options(
         ordinal,
         ScalarType::BF16,
         1,
@@ -1945,6 +1978,7 @@ fn process_ffn_batched_grouped(
         &scratch.h_norm,
         &ffn.gate_w,
         &mut scratch.router_logits_bf16,
+        &execution.prefill_kernel,
     )
     .map_err(|e| anyhow!("router matmul: {e}"))?;
 
@@ -1954,20 +1988,13 @@ fn process_ffn_batched_grouped(
     //    num_experts=256 this is 64*256*2 = 32 KiB D2H + 64*8*4 + 64*8*2 =
     //    ~2 KiB H2D per layer per chunk — negligible vs the matmul cost.
     //    (TODO: GPU softmax/top-K fusion as a future M12+ perf opportunity.)
-    let explicit_route_profile = execution_option_os("SUPERSONIC_QWEN36_ROUTE_PROFILE").is_some()
-        || execution_option_os("SUPERSONIC_QWEN36_ROUTE_PROFILE_DUMP_CALLS").is_some()
-        || execution_option_os("SUPERSONIC_QWEN36_ROUTE_PROFILE_DUMP_TOPN_LAYERS").is_some()
-        || execution_option_os("SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL_FEASIBILITY").is_some()
-        || execution_option_os("SUPERSONIC_QWEN36_EXPERT_RESIDENCY_PROFILE").is_some()
-        || execution_option_os("SUPERSONIC_QWEN36_PACK_CACHE_PROFILE").is_some();
+    let explicit_route_profile = execution.diagnostics.route_profile;
     let use_metal_router_topk = scratch.router_logits_bf16.backend() == Backend::Metal
-        && execution_option_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
+        && !execution.metal.force_host_native
         && !explicit_route_profile
-        && execution_option_os("SUPERSONIC_METAL_PROFILE").is_none()
-        && execution_option_os("SUPERSONIC_METAL_DISABLE_BATCH").is_none()
-        && execution_option("SUPERSONIC_QWEN36_MOE_METAL_ROUTER_TOPK")
-            .map(|v| v != "0")
-            .unwrap_or(false);
+        && !execution.metal.profile
+        && !execution.metal.disable_batch
+        && execution.batched_prefill.metal_router_topk;
     let metal_router_expert_batch = if use_metal_router_topk {
         let guard = prefill_ffi::MetalBatchGuard::begin()
             .map_err(|e| anyhow!("begin Metal router/expert FFN batch: {e}"))?;
@@ -1978,13 +2005,14 @@ fn process_ffn_batched_grouped(
         None
     };
     if use_metal_router_topk {
-        prefill_ffi::qwen36_router_softmax_topk_bf16(
+        prefill_ffi::qwen36_router_softmax_topk_bf16_with_options(
             n,
             num_experts,
             top_k,
             &scratch.router_logits_bf16,
             &mut scratch.topk_idx,
             &mut scratch.topk_weight,
+            &execution.prefill_kernel,
         )
         .map_err(|e| anyhow!("Metal router softmax top-k: {e}"))?;
     } else {
@@ -2218,11 +2246,9 @@ fn process_ffn_batched_grouped(
     // expert tail in one command buffer by default. Profile runs split at
     // phase labels so the report can still attribute the work.
     let use_metal_shared_expert_batch = scratch.h_norm.backend() == Backend::Metal
-        && execution_option_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
-        && execution_option("SUPERSONIC_QWEN36_MOE_METAL_SHARED_EXPERT_BATCH")
-            .map(|v| v != "0")
-            .unwrap_or(true);
-    let metal_shared_profile = use_metal_shared_expert_batch && metal_profile_enabled();
+        && !execution.metal.force_host_native
+        && execution.batched_prefill.metal_shared_expert_batch;
+    let metal_shared_profile = use_metal_shared_expert_batch && metal_profile_enabled(execution);
     let metal_shared_start = metal_shared_profile.then(Instant::now);
     let metal_shared_batch = if use_metal_shared_expert_batch {
         let guard = prefill_ffi::MetalBatchGuard::begin()
@@ -2236,7 +2262,7 @@ fn process_ffn_batched_grouped(
 
     //    7a. shared_gate = INT4_matmul(h_norm, shared_gate_proj_w)
     //         shape [shared_intermediate, hidden] INT4 → out [N, shared_intermediate]
-    prefill_ffi::matmul_rhs_transposed_int4(
+    prefill_ffi::matmul_rhs_transposed_int4_with_options(
         ordinal,
         1,
         n,
@@ -2250,10 +2276,11 @@ fn process_ffn_batched_grouped(
         group_size,
         qtype,
         &mut scratch.shared_gate,
+        &execution.prefill_kernel,
     )
     .map_err(|e| anyhow!("matmul shared_gate_proj: {e}"))?;
     //    7b. shared_up = INT4_matmul(h_norm, shared_up_proj_w)
-    prefill_ffi::matmul_rhs_transposed_int4(
+    prefill_ffi::matmul_rhs_transposed_int4_with_options(
         ordinal,
         1,
         n,
@@ -2267,16 +2294,18 @@ fn process_ffn_batched_grouped(
         group_size,
         qtype,
         &mut scratch.shared_up,
+        &execution.prefill_kernel,
     )
     .map_err(|e| anyhow!("matmul shared_up_proj: {e}"))?;
     //    7c. shared_silu_mul = silu(shared_gate) * shared_up
-    prefill_ffi::swiglu_mul(
+    prefill_ffi::swiglu_mul_with_options(
         ordinal,
         ScalarType::BF16,
         n * shared_intermediate,
         &scratch.shared_gate,
         &scratch.shared_up,
         &mut scratch.shared_silu_mul,
+        &execution.prefill_kernel,
     )
     .map_err(|e| anyhow!("swiglu_mul shared: {e}"))?;
     if metal_shared_profile {
@@ -2287,7 +2316,7 @@ fn process_ffn_batched_grouped(
     }
     //    7d. shared_down = INT4_matmul(shared_silu_mul, shared_down_proj_w)
     //         shape [hidden, shared_intermediate] INT4 → out [N, hidden]
-    prefill_ffi::matmul_rhs_transposed_int4(
+    prefill_ffi::matmul_rhs_transposed_int4_with_options(
         ordinal,
         1,
         n,
@@ -2301,11 +2330,12 @@ fn process_ffn_batched_grouped(
         group_size,
         qtype,
         &mut scratch.shared_down,
+        &execution.prefill_kernel,
     )
     .map_err(|e| anyhow!("matmul shared_down_proj: {e}"))?;
     //    7e. shared_gate_scalar = BF16_matmul(h_norm, shared_expert_gate_w)
     //         shape [1, hidden] BF16 → out [N, 1]
-    prefill_ffi::matmul_rhs_transposed(
+    prefill_ffi::matmul_rhs_transposed_with_options(
         ordinal,
         ScalarType::BF16,
         1,
@@ -2315,6 +2345,7 @@ fn process_ffn_batched_grouped(
         &scratch.h_norm,
         &ffn.shared_expert_gate_w,
         &mut scratch.shared_gate_scalar,
+        &execution.prefill_kernel,
     )
     .map_err(|e| anyhow!("matmul shared_expert_gate: {e}"))?;
     //    7f. shared_out = sigmoid(shared_gate_scalar) * shared_down.
@@ -2322,13 +2353,14 @@ fn process_ffn_batched_grouped(
     //         round-trips through host memory as an expanded `[N, hidden]`
     //         buffer. HIP/CUDA keep the older explicit expansion path for now.
     if scratch.shared_down.backend() == Backend::Metal {
-        prefill_ffi::sigmoid_mul_row_scalar_bf16(
+        prefill_ffi::sigmoid_mul_row_scalar_bf16_with_options(
             ordinal,
             n,
             hidden,
             &scratch.shared_down,
             &scratch.shared_gate_scalar,
             &mut scratch.shared_out,
+            &execution.prefill_kernel,
         )
         .map_err(|e| anyhow!("sigmoid_mul_row_scalar shared: {e}"))?;
     } else {
@@ -2339,13 +2371,14 @@ fn process_ffn_batched_grouped(
             &scratch.shared_gate_scalar,
             &mut scratch.shared_out, // reuse shared_out as the temp expanded gate
         )?;
-        prefill_ffi::sigmoid_mul(
+        prefill_ffi::sigmoid_mul_with_options(
             ordinal,
             ScalarType::BF16,
             n * hidden,
             &scratch.shared_down,
             &scratch.shared_out,
             &mut scratch.shared_out_final,
+            &execution.prefill_kernel,
         )
         .map_err(|e| anyhow!("sigmoid_mul shared: {e}"))?;
         gpu_hal::copy_d2d(
@@ -2368,34 +2401,35 @@ fn process_ffn_batched_grouped(
     // two BF16 rounding points, but the current M5 Max smoke was slower than
     // the existing two-add sequence.
     let use_metal_fused_residual = chunk_hidden.backend() == Backend::Metal
-        && execution_option_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
+        && !execution.metal.force_host_native
         && use_metal_shared_expert_batch
-        && execution_option("SUPERSONIC_QWEN36_MOE_METAL_FUSED_FFN_RESIDUAL")
-            .map(|v| v != "0")
-            .unwrap_or(true);
+        && execution.batched_prefill.metal_fused_ffn_residual;
     if use_metal_fused_residual {
-        prefill_ffi::qwen36_ffn_residual_add_bf16(
+        prefill_ffi::qwen36_ffn_residual_add_bf16_with_options(
             n * hidden,
             chunk_hidden,
             &scratch.combined,
             &scratch.shared_out,
+            &execution.prefill_kernel,
         )
         .map_err(|e| anyhow!("fused residual add (combined + shared_out): {e}"))?;
     } else {
-        prefill_ffi::element_add_inplace(
+        prefill_ffi::element_add_inplace_with_options(
             ordinal,
             ScalarType::BF16,
             n * hidden,
             chunk_hidden,
             &scratch.combined,
+            &execution.prefill_kernel,
         )
         .map_err(|e| anyhow!("residual add (combined): {e}"))?;
-        prefill_ffi::element_add_inplace(
+        prefill_ffi::element_add_inplace_with_options(
             ordinal,
             ScalarType::BF16,
             n * hidden,
             chunk_hidden,
             &scratch.shared_out,
+            &execution.prefill_kernel,
         )
         .map_err(|e| anyhow!("residual add (shared_out): {e}"))?;
     }
@@ -2489,6 +2523,7 @@ fn expand_scalar_gate_bf16(
 mod orchestration_tests {
     use super::*;
     use crate::qwen36_moe::layer_loader::Qwen36WeightMode;
+    use crate::qwen36_moe::residency::{MoeExpertResidencyConfig, MoeExpertResidencyManager};
     use model_store::manifest::{Manifest, FORMAT_VERSION};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2573,6 +2608,66 @@ mod orchestration_tests {
         assert!(!optimized_prefill_supports_encoding(
             Qwen36LayerWeightEncoding::Fp8
         ));
+    }
+
+    #[test]
+    fn public_prefill_dispatches_bf16_ggml_fp8_and_sparse_owners_to_fallback() {
+        let tmp = TestDir::new();
+        let store = BakedStore::open(tmp.path()).expect("open synthetic store");
+        for mode in [
+            Qwen36WeightMode::Bf16,
+            Qwen36WeightMode::Q4Km,
+            Qwen36WeightMode::Fp8,
+        ] {
+            let mut loaded = LoadedQwen36Layers::dense(Vec::new(), mode);
+            let mut calls = 0usize;
+            let mut callback = |_loaded: &mut LoadedQwen36Layers, step, token, position| {
+                assert_eq!((step, token, position), (0, 0, PositionPair::dense(0)));
+                calls += 1;
+                Ok(PrefillTokenTimings::default())
+            };
+            run_batched_prefill(
+                0,
+                &empty_geom(),
+                &store,
+                "model.language_model",
+                &mut loaded,
+                &[0],
+                &[PositionPair::dense(0)],
+                false,
+                &Qwen36ExecutionOptions::default(),
+                Some(&mut callback),
+                None,
+            )
+            .unwrap_or_else(|err| panic!("{mode:?} public fallback failed: {err:#}"));
+            assert_eq!(calls, 1, "{mode:?} did not use the fallback callback");
+        }
+
+        let mut sparse = LoadedQwen36Layers::dense(Vec::new(), Qwen36WeightMode::Int4);
+        sparse.attach_test_sparse_expert_residency(MoeExpertResidencyManager::new(
+            0,
+            MoeExpertResidencyConfig::new(1).expect("sparse dispatch config"),
+        ));
+        let mut sparse_calls = 0usize;
+        let mut sparse_callback = |_loaded: &mut LoadedQwen36Layers, _, _, _| {
+            sparse_calls += 1;
+            Ok(PrefillTokenTimings::default())
+        };
+        run_batched_prefill(
+            0,
+            &empty_geom(),
+            &store,
+            "model.language_model",
+            &mut sparse,
+            &[0],
+            &[PositionPair::dense(0)],
+            false,
+            &Qwen36ExecutionOptions::default(),
+            Some(&mut sparse_callback),
+            None,
+        )
+        .expect("sparse public fallback");
+        assert_eq!(sparse_calls, 1);
     }
 
     #[test]
@@ -2661,6 +2756,7 @@ mod orchestration_tests {
             &tokens,
             &positions,
             false,
+            &Qwen36ExecutionOptions::default(),
             Some(&mut callback),
             Some(&mut progress),
         )

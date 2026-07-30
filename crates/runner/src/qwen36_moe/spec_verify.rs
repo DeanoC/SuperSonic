@@ -37,6 +37,7 @@ pub(crate) struct Qwen36SpecChainStep<'a> {
 }
 
 pub(crate) fn run_spec_chain_step(args: Qwen36SpecChainStep<'_>) -> Result<DecodeOutputs> {
+    let execution = crate::qwen36_moe_cli::options::execution_options_from_environment();
     let t_embed_start = std::time::Instant::now();
     let initial_hidden = lookup_embed_row(
         args.store,
@@ -71,6 +72,7 @@ pub(crate) fn run_spec_chain_step(args: Qwen36SpecChainStep<'_>) -> Result<Decod
             rope,
             cache,
             args.emit_stage_timings,
+            &execution,
         )?
     } else {
         run_chained_decode_fast(
@@ -80,6 +82,7 @@ pub(crate) fn run_spec_chain_step(args: Qwen36SpecChainStep<'_>) -> Result<Decod
             &initial_hidden,
             rope,
             args.emit_stage_timings,
+            &execution,
         )?
     };
     args.stage_timings

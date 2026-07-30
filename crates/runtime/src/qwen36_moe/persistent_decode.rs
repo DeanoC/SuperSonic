@@ -55,10 +55,14 @@ pub struct LmHeadFold<'a> {
 }
 
 use crate::qwen36_moe::decode::{
-    execution_option_os, ffn_workspace_floats, full_attn_score_workspace_floats,
-    full_attn_workspace_floats, linear_attn_workspace_floats, reset_sync_buf,
+    ffn_workspace_floats, full_attn_score_workspace_floats, full_attn_workspace_floats,
+    linear_attn_workspace_floats, reset_sync_buf, Qwen36ExecutionOptions,
 };
 use crate::qwen36_moe::layer_loader::{classify_layer_weight_encoding, Qwen36LayerWeightEncoding};
+use crate::qwen36_moe::layers::{
+    validate_persistent_embedding_request, validate_persistent_position_plan,
+    PersistentEmbeddingMetadata, PersistentKvCapacity,
+};
 use crate::qwen36_moe::lm_head::bf16_bytes_to_f32;
 use crate::qwen36_moe::types::{
     AttnLayerBuffers, DecodeOutputs, ExpertPrefetchPhase, ExpertRoute, LayerBuffers, MultiLayerGeom,
@@ -77,6 +81,7 @@ pub struct PersistentScratch {
     geom: Qwen36MoePersistentGeom,
     num_layers: usize,
     layer_is_full_attention: Vec<bool>,
+    full_attn_kv_capacities: Vec<PersistentKvCapacity>,
     /// `[num_layers]` descriptors uploaded as opaque U8 bytes.
     pub(crate) layer_descs_dev: GpuBuffer,
     /// `[num_layers]` INT4 sidecar descriptors. `None` for BF16 bakes.
@@ -197,6 +202,24 @@ fn validate_lm_head_fold(
 }
 
 impl PersistentScratch {
+    fn validate_device(&self, ordinal: usize) -> Result<()> {
+        let active_backend = gpu_hal::current_backend();
+        if self.hidden_ping.backend() != active_backend {
+            return Err(anyhow!(
+                "Qwen3.6 persistent scratch backend mismatch: active backend is \
+                 {active_backend:?}, scratch backend is {:?}",
+                self.hidden_ping.backend()
+            ));
+        }
+        if self.hidden_ping.device_ordinal() != ordinal {
+            return Err(anyhow!(
+                "Qwen3.6 persistent scratch device ordinal mismatch: got {ordinal}, expected {}",
+                self.hidden_ping.device_ordinal()
+            ));
+        }
+        Ok(())
+    }
+
     /// Build the descriptor array + allocate scratch. Mutably borrows
     /// `layers` only for descriptor construction (mutable state pointers
     /// are cached into the descs); subsequent [`Self::run`] calls don't
@@ -223,6 +246,20 @@ impl PersistentScratch {
         }
         let num_layers = layers.len();
         let layer_is_full_attention = layers.iter().map(LayerBuffers::is_full_attn).collect();
+        let full_attn_kv_capacities = layers
+            .iter()
+            .enumerate()
+            .filter_map(|(layer_idx, layer)| match &layer.attn {
+                AttnLayerBuffers::Full {
+                    kv_cache: Some(cache),
+                    ..
+                } => Some(PersistentKvCapacity {
+                    layer_idx,
+                    capacity: cache.kv_max_t,
+                }),
+                _ => None,
+            })
+            .collect();
         let descs = build_layer_descs(layers);
         let layer_descs_dev =
             upload_descs(ordinal, &descs).context("upload layer descriptor array")?;
@@ -293,6 +330,7 @@ impl PersistentScratch {
             geom: pgeom,
             num_layers,
             layer_is_full_attention,
+            full_attn_kv_capacities,
             layer_descs_dev,
             int4_scales_dev,
             kv_fp8_descs_dev,
@@ -328,6 +366,8 @@ impl PersistentScratch {
         lm_head_fold: Option<LmHeadFold<'_>>,
         download_final_hidden: bool,
     ) -> Result<DecodeOutputs> {
+        self.validate_device(ordinal)?;
+        validate_persistent_position_plan(position, cache_pos, 1, &self.full_attn_kv_capacities)?;
         let hidden_bytes = self.geom.hidden as usize * 2;
         if initial_hidden_bytes.len() != hidden_bytes {
             return Err(anyhow!(
@@ -432,6 +472,21 @@ impl PersistentScratch {
         position: i32,
         cache_pos: i32,
     ) -> Result<std::time::Duration> {
+        self.validate_device(ordinal)?;
+        validate_persistent_position_plan(position, cache_pos, 1, &self.full_attn_kv_capacities)?;
+        validate_persistent_embedding_request(
+            self.hidden_ping.backend(),
+            ordinal,
+            self.geom.hidden as usize,
+            PersistentEmbeddingMetadata {
+                backend: embed_w.backend(),
+                ordinal: embed_w.device_ordinal(),
+                dtype: embed_w.dtype(),
+                shape: embed_w.shape(),
+                len_bytes: embed_w.len_bytes(),
+            },
+            &[token_id],
+        )?;
         let t_launch = std::time::Instant::now();
         persistent_decode_launch_range(
             ordinal,
@@ -470,11 +525,28 @@ impl PersistentScratch {
         start_position: i32,
         start_cache_pos: i32,
     ) -> Result<std::time::Duration> {
+        self.validate_device(ordinal)?;
+        validate_persistent_position_plan(
+            start_position,
+            start_cache_pos,
+            token_ids.len(),
+            &self.full_attn_kv_capacities,
+        )?;
+        validate_persistent_embedding_request(
+            self.hidden_ping.backend(),
+            ordinal,
+            self.geom.hidden as usize,
+            PersistentEmbeddingMetadata {
+                backend: embed_w.backend(),
+                ordinal: embed_w.device_ordinal(),
+                dtype: embed_w.dtype(),
+                shape: embed_w.shape(),
+                len_bytes: embed_w.len_bytes(),
+            },
+            token_ids,
+        )?;
         if token_ids.is_empty() {
             return Ok(std::time::Duration::ZERO);
-        }
-        if token_ids.len() > i32::MAX as usize {
-            return Err(anyhow!("dense prefill token count exceeds i32::MAX"));
         }
         let token_bytes = unsafe {
             std::slice::from_raw_parts(
@@ -543,6 +615,8 @@ impl PersistentScratch {
     where
         F: FnMut(ExpertPrefetchPhase, usize, &[ExpertRoute]) -> Result<()>,
     {
+        self.validate_device(ordinal)?;
+        validate_persistent_position_plan(position, cache_pos, 1, &self.full_attn_kv_capacities)?;
         let hidden_bytes = self.geom.hidden as usize * 2;
         if initial_hidden_bytes.len() != hidden_bytes {
             return Err(anyhow!(
@@ -689,7 +763,10 @@ impl PersistentScratch {
         initial_hidden_bytes: &[u8],
         position: i32,
         cache_pos: i32,
+        execution: &Qwen36ExecutionOptions,
     ) -> Result<DecodeOutputs> {
+        self.validate_device(ordinal)?;
+        validate_persistent_position_plan(position, cache_pos, 1, &self.full_attn_kv_capacities)?;
         let hidden_bytes = self.geom.hidden as usize * 2;
         if initial_hidden_bytes.len() != hidden_bytes {
             return Err(anyhow!(
@@ -708,10 +785,8 @@ impl PersistentScratch {
 
         let mut attn_us = 0u64;
         let mut ffn_us = 0u64;
-        let ffn_stage_profile =
-            execution_option_os("SUPERSONIC_QWEN36_FFN_STAGE_PROFILE").is_some();
-        let linear_stage_profile =
-            execution_option_os("SUPERSONIC_QWEN36_LINEAR_STAGE_PROFILE").is_some();
+        let ffn_stage_profile = execution.diagnostics.ffn_stage_profile;
+        let linear_stage_profile = execution.diagnostics.linear_stage_profile;
         for layer_idx in 0..self.num_layers {
             if linear_stage_profile && !self.layer_is_full_attention[layer_idx] {
                 for stage in 1..=5 {
@@ -1183,6 +1258,9 @@ mod tests {
 
     #[test]
     fn layer_desc_uses_virtual_expert_weight_pointers() {
+        let _backend_lock = crate::qwen36_moe::layer_loader::GPU_BACKEND_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if !gpu_hal::is_backend_compiled(Backend::Hip) {
             eprintln!("skip: HIP backend not compiled");
             return;
