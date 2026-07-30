@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use model_store::flm::ASSET_CHAT_TEMPLATE_UTF8;
 use model_store::manifest::LayoutTag;
 use model_store::{BakedStore, FlmLoadOptions};
 
@@ -23,6 +24,24 @@ fn qwen36_35b_native_flm_linear_attention_aliases_match_supersonic_runtime_layou
     )
     .expect("open native Qwen3.6 MoE FLM");
     let bake = BakedStore::open(Path::new(&bake_dir)).expect("open SuperSonic native bake");
+
+    let runtime = flm.flm_runtime().expect("FLM runtime directory");
+    let template = runtime
+        .required_chat_template_source()
+        .expect("native chat template asset");
+    assert!(
+        !template.trim().is_empty(),
+        "native chat template source must be non-empty"
+    );
+    assert_eq!(
+        runtime
+            .assets
+            .values()
+            .filter(|asset| asset.kind_id == ASSET_CHAT_TEMPLATE_UTF8)
+            .count(),
+        1,
+        "native runtime must contain exactly one chat template asset"
+    );
 
     for (name, expected_layout, expected_shape) in [
         (

@@ -25,10 +25,12 @@ pub const ASSET_TOKENIZER_VOCAB: u16 = 1;
 pub const ASSET_TOKENIZER_MERGES: u16 = 2;
 pub const ASSET_TOKENIZER_ADDED_TOKENS: u16 = 3;
 pub const ASSET_TOKENIZER_REGEX: u16 = 4;
+pub const ASSET_CHAT_TEMPLATE_UTF8: u16 = 5;
 pub const ASSET_HF_CONFIG_JSON: u16 = 101;
 pub const ASSET_HF_TOKENIZER_JSON: u16 = 102;
 pub const ASSET_FLAG_REQUIRED_FOR_RUNTIME: u16 = 1 << 0;
 pub const ASSET_FLAG_COMPATIBILITY_ONLY: u16 = 1 << 1;
+pub const ASSET_FLAG_TEXT_UTF8: u16 = 1 << 2;
 pub const MANIFEST_COMPANION_NONE: u8 = 0;
 pub const MANIFEST_COMPANION_PACKED: u8 = 1;
 pub const MANIFEST_COMPANION_SCALE: u8 = 2;
@@ -509,6 +511,53 @@ impl FlmRuntimeDirectory {
 
     pub fn asset_by_kind(&self, kind: &str) -> Option<&FlmAsset> {
         self.assets.values().find(|asset| asset.name == kind)
+    }
+
+    pub fn required_chat_template_source(&self) -> Result<&str, Error> {
+        let matches: Vec<&FlmAsset> = self
+            .assets
+            .values()
+            .filter(|asset| asset.kind_id == ASSET_CHAT_TEMPLATE_UTF8)
+            .collect();
+        let asset = match matches.as_slice() {
+            [] => {
+                return Err(Error::Other(format!(
+                    "Qwen3.6 runtime requires one native chat template asset with kind_id={ASSET_CHAT_TEMPLATE_UTF8}"
+                )));
+            }
+            [asset] => *asset,
+            _ => {
+                return Err(Error::Other(format!(
+                    "Qwen3.6 runtime requires exactly one native chat template asset with kind_id={ASSET_CHAT_TEMPLATE_UTF8}, found {}",
+                    matches.len()
+                )));
+            }
+        };
+
+        if asset.name != "chat_template" {
+            return Err(Error::Other(format!(
+                "Qwen3.6 native chat template asset must be named 'chat_template', got {:?}",
+                asset.name
+            )));
+        }
+        let expected_flags = ASSET_FLAG_REQUIRED_FOR_RUNTIME | ASSET_FLAG_TEXT_UTF8;
+        if asset.flags != expected_flags {
+            return Err(Error::Other(format!(
+                "Qwen3.6 native chat template asset must have exactly flags={expected_flags}, got {}",
+                asset.flags
+            )));
+        }
+        let source = std::str::from_utf8(&asset.payload).map_err(|err| {
+            Error::Other(format!(
+                "Qwen3.6 runtime chat template asset: chat template is not UTF-8: {err}"
+            ))
+        })?;
+        if source.trim().is_empty() {
+            return Err(Error::Other(
+                "Qwen3.6 runtime chat template asset: chat template is empty".into(),
+            ));
+        }
+        Ok(source)
     }
 
     pub fn codecs(&self) -> &[FlmCodecDescriptor] {
@@ -2080,51 +2129,64 @@ mod tests {
         out
     }
 
-    fn build_asset_sections() -> (Vec<u8>, Vec<u8>) {
-        let assets = [
-            (
-                1u32,
-                ASSET_TOKENIZER_VOCAB,
-                ASSET_FLAG_REQUIRED_FOR_RUNTIME,
-                "tokenizer_vocab",
-                br#"{"hello":0}"#.as_slice(),
-            ),
-            (
-                2u32,
-                ASSET_TOKENIZER_MERGES,
-                ASSET_FLAG_REQUIRED_FOR_RUNTIME,
-                "tokenizer_merges",
-                b"#version: 0.2\n".as_slice(),
-            ),
-            (
-                3u32,
-                ASSET_TOKENIZER_ADDED_TOKENS,
-                0,
-                "tokenizer_added_tokens",
-                b"[]".as_slice(),
-            ),
-            (
-                4u32,
-                ASSET_TOKENIZER_REGEX,
-                ASSET_FLAG_REQUIRED_FOR_RUNTIME,
-                "tokenizer_regex",
-                br#"\p{L}+"#.as_slice(),
-            ),
-        ];
+    fn build_asset_sections(assets: &[FlmAsset]) -> (Vec<u8>, Vec<u8>) {
         let mut table = Vec::new();
         let mut payloads = Vec::new();
         write_u32(&mut table, assets.len() as u32);
-        for (asset_id, kind_id, flags, name, payload) in assets {
-            write_u32(&mut table, asset_id);
+        for asset in assets {
+            write_u32(&mut table, asset.asset_id);
             write_u32(&mut table, payloads.len() as u32);
-            write_u32(&mut table, payload.len() as u32);
-            write_u16(&mut table, kind_id);
-            write_u16(&mut table, flags);
-            write_u32(&mut table, name.len() as u32);
-            table.extend_from_slice(name.as_bytes());
-            payloads.extend_from_slice(payload);
+            write_u32(&mut table, asset.payload.len() as u32);
+            write_u16(&mut table, asset.kind_id);
+            write_u16(&mut table, asset.flags);
+            write_u32(&mut table, asset.name.len() as u32);
+            table.extend_from_slice(asset.name.as_bytes());
+            payloads.extend_from_slice(&asset.payload);
         }
         (table, payloads)
+    }
+
+    fn base_assets() -> Vec<FlmAsset> {
+        vec![
+            FlmAsset {
+                asset_id: 1,
+                kind_id: ASSET_TOKENIZER_VOCAB,
+                flags: ASSET_FLAG_REQUIRED_FOR_RUNTIME,
+                name: "tokenizer_vocab".into(),
+                payload: br#"{"hello":0}"#.to_vec(),
+            },
+            FlmAsset {
+                asset_id: 2,
+                kind_id: ASSET_TOKENIZER_MERGES,
+                flags: ASSET_FLAG_REQUIRED_FOR_RUNTIME,
+                name: "tokenizer_merges".into(),
+                payload: b"#version: 0.2\n".to_vec(),
+            },
+            FlmAsset {
+                asset_id: 3,
+                kind_id: ASSET_TOKENIZER_ADDED_TOKENS,
+                flags: 0,
+                name: "tokenizer_added_tokens".into(),
+                payload: b"[]".to_vec(),
+            },
+            FlmAsset {
+                asset_id: 4,
+                kind_id: ASSET_TOKENIZER_REGEX,
+                flags: ASSET_FLAG_REQUIRED_FOR_RUNTIME,
+                name: "tokenizer_regex".into(),
+                payload: br#"\p{L}+"#.to_vec(),
+            },
+        ]
+    }
+
+    fn chat_template_asset() -> FlmAsset {
+        FlmAsset {
+            asset_id: 5,
+            kind_id: ASSET_CHAT_TEMPLATE_UTF8,
+            flags: ASSET_FLAG_REQUIRED_FOR_RUNTIME | ASSET_FLAG_TEXT_UTF8,
+            name: "chat_template".into(),
+            payload: b"{% for message in messages %}{{ message.content }}{% endfor %}".to_vec(),
+        }
     }
 
     fn build_model_descriptor_section() -> Vec<u8> {
@@ -2325,7 +2387,8 @@ mod tests {
     }
 
     fn build_test_runtime_directory_with_stage3_tables() -> Vec<u8> {
-        let (asset_table, asset_payloads) = build_asset_sections();
+        let assets = base_assets();
+        let (asset_table, asset_payloads) = build_asset_sections(&assets);
         let sections = [
             (1u32, build_qwen_config_section()),
             (2u32, build_tokenizer_section()),
@@ -2359,8 +2422,8 @@ mod tests {
         out
     }
 
-    fn build_test_runtime_directory() -> Vec<u8> {
-        let (asset_table, asset_payloads) = build_asset_sections();
+    fn build_test_runtime_directory_with_assets(assets: &[FlmAsset]) -> Vec<u8> {
+        let (asset_table, asset_payloads) = build_asset_sections(assets);
         let sections = [
             (1u32, build_qwen_config_section()),
             (2u32, build_tokenizer_section()),
@@ -2390,8 +2453,13 @@ mod tests {
         out
     }
 
+    fn build_test_runtime_directory() -> Vec<u8> {
+        build_test_runtime_directory_with_assets(&base_assets())
+    }
+
     fn build_test_moe_runtime_directory() -> Vec<u8> {
-        let (asset_table, asset_payloads) = build_asset_sections();
+        let assets = base_assets();
+        let (asset_table, asset_payloads) = build_asset_sections(&assets);
         let sections = [
             (SECTION_CONFIG_QWEN36_MOE, build_qwen_moe_config_section()),
             (2u32, build_tokenizer_section()),
@@ -2810,5 +2878,127 @@ mod tests {
         let (abi_offset, _) = section_range(&runtime, SECTION_TENSOR_ABI);
         put_u32_at(&mut runtime, abi_offset + 4, 999_999);
         expect_parse_error_contains(&runtime, "FLM tensor ABI weight_prefix");
+    }
+
+    #[test]
+    fn flm_chat_template_round_trips_exact_source() {
+        let mut assets = base_assets();
+        assets.push(chat_template_asset());
+        let runtime = build_test_runtime_directory_with_assets(&assets);
+
+        let parsed = FlmRuntimeDirectory::parse(&runtime).expect("parse runtime");
+
+        assert_eq!(
+            parsed
+                .required_chat_template_source()
+                .expect("chat template"),
+            "{% for message in messages %}{{ message.content }}{% endfor %}"
+        );
+    }
+
+    #[test]
+    fn flm_chat_template_rejects_missing_duplicate_and_invalid_metadata() {
+        let missing = FlmRuntimeDirectory::parse(&build_test_runtime_directory())
+            .expect("parse runtime")
+            .required_chat_template_source()
+            .expect_err("missing chat template must fail");
+        assert_eq!(
+            missing.to_string(),
+            "Qwen3.6 runtime requires one native chat template asset with kind_id=5"
+        );
+
+        let mut duplicate_assets = base_assets();
+        duplicate_assets.push(chat_template_asset());
+        let mut duplicate = chat_template_asset();
+        duplicate.asset_id = 6;
+        duplicate_assets.push(duplicate);
+        let duplicate = FlmRuntimeDirectory::parse(&build_test_runtime_directory_with_assets(
+            &duplicate_assets,
+        ))
+        .expect("parse runtime")
+        .required_chat_template_source()
+        .expect_err("duplicate chat templates must fail");
+        assert_eq!(
+            duplicate.to_string(),
+            "Qwen3.6 runtime requires exactly one native chat template asset with kind_id=5, found 2"
+        );
+
+        let mut wrong_name_assets = base_assets();
+        let mut wrong_name = chat_template_asset();
+        wrong_name.name = "template".into();
+        wrong_name_assets.push(wrong_name);
+        let wrong_name = FlmRuntimeDirectory::parse(&build_test_runtime_directory_with_assets(
+            &wrong_name_assets,
+        ))
+        .expect("parse runtime")
+        .required_chat_template_source()
+        .expect_err("wrong chat template name must fail");
+        assert_eq!(
+            wrong_name.to_string(),
+            "Qwen3.6 native chat template asset must be named 'chat_template', got \"template\""
+        );
+
+        let mut wrong_flags_assets = base_assets();
+        let mut wrong_flags = chat_template_asset();
+        wrong_flags.flags = ASSET_FLAG_REQUIRED_FOR_RUNTIME;
+        wrong_flags_assets.push(wrong_flags);
+        let wrong_flags = FlmRuntimeDirectory::parse(&build_test_runtime_directory_with_assets(
+            &wrong_flags_assets,
+        ))
+        .expect("parse runtime")
+        .required_chat_template_source()
+        .expect_err("wrong chat template flags must fail");
+        assert_eq!(
+            wrong_flags.to_string(),
+            "Qwen3.6 native chat template asset must have exactly flags=5, got 1"
+        );
+    }
+
+    #[test]
+    fn flm_chat_template_rejects_invalid_utf8_and_empty_source() {
+        let mut invalid_utf8_assets = base_assets();
+        let mut invalid_utf8 = chat_template_asset();
+        invalid_utf8.payload = vec![0xff];
+        invalid_utf8_assets.push(invalid_utf8);
+        let invalid_utf8 = FlmRuntimeDirectory::parse(&build_test_runtime_directory_with_assets(
+            &invalid_utf8_assets,
+        ))
+        .expect("parse runtime")
+        .required_chat_template_source()
+        .expect_err("invalid UTF-8 chat template must fail");
+        assert!(invalid_utf8
+            .to_string()
+            .starts_with("Qwen3.6 runtime chat template asset: chat template is not UTF-8:"));
+
+        let mut empty_assets = base_assets();
+        let mut empty = chat_template_asset();
+        empty.payload = b" \n\t".to_vec();
+        empty_assets.push(empty);
+        let empty =
+            FlmRuntimeDirectory::parse(&build_test_runtime_directory_with_assets(&empty_assets))
+                .expect("parse runtime")
+                .required_chat_template_source()
+                .expect_err("empty chat template must fail");
+        assert_eq!(
+            empty.to_string(),
+            "Qwen3.6 runtime chat template asset: chat template is empty"
+        );
+    }
+
+    #[test]
+    fn flm_chat_template_keeps_unknown_asset_kinds_parseable() {
+        let mut assets = base_assets();
+        assets.push(FlmAsset {
+            asset_id: 99,
+            kind_id: u16::MAX,
+            flags: 0,
+            name: "future_asset".into(),
+            payload: Vec::new(),
+        });
+
+        let parsed = FlmRuntimeDirectory::parse(&build_test_runtime_directory_with_assets(&assets))
+            .expect("unknown future asset kind must remain parseable");
+
+        assert_eq!(parsed.asset(99).expect("future asset").kind_id, u16::MAX);
     }
 }
