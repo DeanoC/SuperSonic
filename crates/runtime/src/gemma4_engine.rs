@@ -655,7 +655,7 @@ fn clone_buffers(buffers: &[GpuBuffer], label: &str) -> Result<Vec<GpuBuffer>> {
         .enumerate()
         .map(|(i, b)| {
             b.clone_device()
-                .map_err(|e| anyhow!("{label} layer {i}: {e}"))
+                .with_context(|| format!("{label} layer {i}"))
         })
         .collect()
 }
@@ -1254,7 +1254,7 @@ impl Gemma4Engine {
                 bail!("Gemma 4 K prefix snapshot size mismatch at layer {i}");
             }
             gpu_hal::copy_d2d(self.device, dst.as_mut_ptr(), src.as_ptr(), src.len_bytes())
-                .map_err(|e| anyhow!("restore Gemma 4 K prefix layer {i}: {e}"))?;
+                .with_context(|| format!("restore Gemma 4 K prefix layer {i}"))?;
         }
         for (i, src) in snapshot.v_caches.iter().enumerate() {
             let dst = &mut self.v_caches[0][i];
@@ -1262,7 +1262,7 @@ impl Gemma4Engine {
                 bail!("Gemma 4 V prefix snapshot size mismatch at layer {i}");
             }
             gpu_hal::copy_d2d(self.device, dst.as_mut_ptr(), src.as_ptr(), src.len_bytes())
-                .map_err(|e| anyhow!("restore Gemma 4 V prefix layer {i}: {e}"))?;
+                .with_context(|| format!("restore Gemma 4 V prefix layer {i}"))?;
         }
         Ok(snapshot.logits.clone())
     }

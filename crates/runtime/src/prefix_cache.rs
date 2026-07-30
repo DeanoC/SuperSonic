@@ -9,7 +9,9 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::session::{SessionFeatures, SessionSnapshot};
+use crate::session::{
+    cache_operation_error, PrefixSnapshotOperation, SessionFeatures, SessionSnapshot,
+};
 
 const FORMAT_VERSION: u32 = 1;
 
@@ -162,13 +164,18 @@ impl PrefixCache {
         self.cfg.max_bytes == 0 || resident_bytes <= self.cfg.max_bytes
     }
 
-    pub fn lookup(&self, req: &CacheRequest, prompt_ids: &[u32]) -> Option<PrefixCacheHit> {
+    pub fn lookup(&self, req: &CacheRequest, prompt_ids: &[u32]) -> Result<Option<PrefixCacheHit>> {
         if !self.cfg.enabled || req.retention == CacheRetention::None {
-            return None;
+            return Ok(None);
         }
         let now = epoch_secs();
         let namespace = namespace(req);
-        let mut inner = self.entries.lock().ok()?;
+        let mut inner = self.entries.lock().map_err(|_| {
+            cache_operation_error(
+                PrefixSnapshotOperation::Restore,
+                anyhow::anyhow!("prefix cache lock poisoned"),
+            )
+        })?;
         self.prune_locked(&mut inner, now);
 
         let mut best_key: Option<String> = None;
@@ -187,29 +194,25 @@ impl PrefixCache {
 
         let Some(key) = best_key else {
             self.misses.fetch_add(1, Ordering::Relaxed);
-            return None;
+            return Ok(None);
         };
         let Some(entry) = inner.entries.get_mut(&key) else {
             self.misses.fetch_add(1, Ordering::Relaxed);
-            return None;
+            return Ok(None);
         };
         entry.last_used_secs = now;
-        let snapshot = match entry.snapshot.try_clone() {
-            Ok(snapshot) => snapshot,
-            Err(e) => {
-                tracing::warn!("prefix cache snapshot clone failed: {e}");
-                self.restore_failures.fetch_add(1, Ordering::Relaxed);
-                return None;
-            }
-        };
+        let snapshot = entry
+            .snapshot
+            .try_clone()
+            .map_err(|error| cache_operation_error(PrefixSnapshotOperation::Restore, error))?;
         touch_lru(&mut inner.lru, &key);
         self.hits.fetch_add(1, Ordering::Relaxed);
         self.cached_tokens
             .fetch_add(best_len as u64, Ordering::Relaxed);
-        Some(PrefixCacheHit {
+        Ok(Some(PrefixCacheHit {
             cached_tokens: best_len,
             snapshot,
-        })
+        }))
     }
 
     pub fn insert(
@@ -241,17 +244,14 @@ impl PrefixCache {
             );
             return Ok(());
         }
-        let disk_bytes = if req.retention == CacheRetention::TwentyFourHours {
-            match snapshot.to_disk_bytes() {
-                Ok(bytes) => Some(bytes),
-                Err(e) => {
-                    tracing::debug!("prefix cache disk snapshot skipped: {e}");
-                    None
-                }
-            }
-        } else {
-            None
-        };
+        let disk_bytes =
+            if req.retention == CacheRetention::TwentyFourHours {
+                Some(snapshot.to_disk_bytes().map_err(|error| {
+                    cache_operation_error(PrefixSnapshotOperation::Capture, error)
+                })?)
+            } else {
+                None
+            };
         let entry = PrefixCacheEntry {
             namespace: namespace.clone(),
             token_ids: token_ids.to_vec(),
@@ -261,10 +261,12 @@ impl PrefixCache {
             last_used_secs: now,
         };
 
-        let mut inner = self
-            .entries
-            .lock()
-            .map_err(|_| anyhow::anyhow!("prefix cache lock poisoned"))?;
+        let mut inner = self.entries.lock().map_err(|_| {
+            cache_operation_error(
+                PrefixSnapshotOperation::Capture,
+                anyhow::anyhow!("prefix cache lock poisoned"),
+            )
+        })?;
         if let Some(old) = inner.entries.insert(key.clone(), entry) {
             inner.resident_bytes = inner.resident_bytes.saturating_sub(old.resident_bytes);
         }
@@ -281,7 +283,8 @@ impl PrefixCache {
                 token_ids.len(),
                 expires_at_secs,
                 disk_bytes.as_deref(),
-            )?;
+            )
+            .map_err(|error| cache_operation_error(PrefixSnapshotOperation::Capture, error))?;
         }
         Ok(())
     }

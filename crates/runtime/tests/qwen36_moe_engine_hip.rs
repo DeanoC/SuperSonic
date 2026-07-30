@@ -1,12 +1,13 @@
 use std::path::PathBuf;
 
-use gpu_hal::Backend;
 use model_store::flm::{ARCH_QWEN3_6_MOE, MODEL_QWEN3_6_MOE_V1};
-use model_store::VirtualArenaTransferBackend;
-use supersonic_runtime::qwen36_moe::engine::{Qwen36MoeEngine, Qwen36MoeLoadConfig};
-use supersonic_runtime::qwen36_moe::load_policy::Qwen36MoeLoadPolicy;
-use supersonic_runtime::qwen36_moe_config::{
-    Qwen36KvVmmMode, Qwen36MoeRuntimeConfig, Qwen36MoeRuntimeConfigInputs,
+use supersonic_core::registry::ModelVariant;
+use supersonic_runtime::qwen36_moe::engine::Qwen36MoeEngine;
+use supersonic_runtime::session::InferenceSession;
+use supersonic_runtime::state::{
+    build_resolved,
+    model_source::{ModelSource, ResolvedModelSource},
+    LoaderConfig,
 };
 
 fn greedy_token(logits: &[f32]) -> u32 {
@@ -25,32 +26,56 @@ fn dense_load_reset_and_reuse_preserve_resident_model_without_serving_allocation
         std::env::var_os("SUPERSONIC_QWEN36_35B_A3B_NO_HF_FLM")
             .expect("SUPERSONIC_QWEN36_35B_A3B_NO_HF_FLM must name the production FLM"),
     );
-    let moe = Qwen36MoeRuntimeConfig::from_inputs(
-        &Qwen36MoeRuntimeConfigInputs {
-            vmm_mode: Some("0"),
-            ..Default::default()
-        },
-        false,
-        Backend::Hip,
-        8,
-    )?;
-    let mut engine = Qwen36MoeEngine::load(Qwen36MoeLoadConfig {
-        flm_path: flm_path.clone(),
-        backend: Backend::Hip,
-        device_ordinal: 0,
-        max_context_len: 16_384,
-        policy: Qwen36MoeLoadPolicy {
-            persistent_decode: true,
+    let state = build_resolved(
+        LoaderConfig {
+            model: ModelVariant::Qwen3_6_35B_A3B.to_string(),
+            model_dir: flm_path.clone(),
+            backend: "hip".to_string(),
+            device: 0,
+            max_context: 16_384,
+            int4: false,
+            q4km: false,
+            q4km_gptq: false,
+            fp8_runtime: false,
             kv_fp8: false,
-            kv_vmm: Qwen36KvVmmMode::Force,
-            moe,
-            virtual_transfer_backend: VirtualArenaTransferBackend::PageableH2d,
+            dflash: false,
+            dflash_draft_dir: None,
+            dflash_block: None,
+            dflash_tap_layers: None,
+            api_key: None,
+            cors_allow_origin: None,
+            response_store_max_entries: 16,
+            max_queued_requests: 4,
+            queue_timeout_ms: 1_000,
+            no_download: true,
+            prefix_cache_enabled: true,
+            prefix_cache_dir: None,
+            prefix_cache_min_tokens: 128,
+            prefix_cache_max_entries: 1,
+            prefix_cache_max_bytes: None,
+            prefix_cache_memory_ttl_secs: 600,
+            prefix_cache_disk_ttl_secs: 86_400,
         },
-        verify_block_hashes: false,
-        execution_options: supersonic_runtime::qwen36_moe::decode::Qwen36ExecutionOptions::default(
-        ),
-        accurate_stage_timings: false,
-    })?;
+        ResolvedModelSource {
+            source: ModelSource::Flm(flm_path.clone()),
+            model: ModelVariant::Qwen3_6_35B_A3B,
+        },
+    )?;
+    assert!(
+        state.qwen36_moe_engine.is_none(),
+        "FLM startup must not retain a compatibility engine owner"
+    );
+    let session = state
+        .session
+        .as_ref()
+        .expect("FLM startup must own the engine through InferenceSession");
+    assert_eq!(std::sync::Arc::strong_count(session), 1);
+    let mut session = session.blocking_lock();
+    assert_eq!(session.prefix_snapshot_bytes(1), usize::MAX);
+    let engine = match &mut *session {
+        InferenceSession::Qwen36Moe(engine) => engine,
+        _ => panic!("FLM startup must select the production Qwen3.6 session variant"),
+    };
 
     assert!(engine.tokenizer().get_vocab_size(false) > 0);
     assert!(!engine.chat_template_source().is_empty());

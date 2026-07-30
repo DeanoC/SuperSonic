@@ -28,8 +28,30 @@ use half::f16;
 
 use crate::layer_desc::MAX_BATCH_SIZE;
 
+fn qwen36_backend_error(backend: Backend, operation: &str, status: i32) -> GpuError {
+    GpuError::backend_status(backend, operation, status)
+}
+
 include!("profile.rs");
 include!("descriptors.rs");
 include!("launch.rs");
 include!("persistent.rs");
 include!("prefill.rs");
+
+#[cfg(test)]
+mod typed_status_tests {
+    use super::*;
+
+    #[test]
+    fn qwen36_launch_status_preserves_device_loss_identity() {
+        let error = qwen36_backend_error(Backend::Hip, "qwen36_moe persistent decode launch", 709);
+        assert!(matches!(
+            error,
+            GpuError::DeviceLost {
+                backend: Backend::Hip,
+                ref operation,
+                status: 709,
+            } if operation == "qwen36_moe persistent decode launch"
+        ));
+    }
+}

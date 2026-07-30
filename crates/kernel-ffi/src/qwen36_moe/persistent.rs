@@ -306,9 +306,10 @@ pub fn persistent_decode_launch_range(
             }
         };
         if status != 0 {
-            return Err(GpuError::backend(
+            return Err(qwen36_backend_error(
                 backend,
-                format!("qwen36_moe persistent decode launch failed with status {status}"),
+                "qwen36_moe persistent decode launch",
+                status,
             ));
         }
         Ok(())

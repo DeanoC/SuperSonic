@@ -16,8 +16,8 @@ use tokio::sync::{OwnedSemaphorePermit, TryAcquireError};
 use crate::prefix_cache::{supported_cache_request, CacheRequest};
 use crate::sampling::{rng_from_seed, sample};
 use crate::session::{
-    classify_session_failure, is_session_cancellation, should_use_dflash_generation,
-    InferenceSession, SessionFailureClass,
+    classify_session_failure, is_request_local_cache_failure, is_session_cancellation,
+    should_use_dflash_generation, InferenceSession, SessionFailureClass,
 };
 use crate::state::ServerState;
 
@@ -82,6 +82,21 @@ pub enum GenEvent {
     },
     /// Terminal error event: generation failed; no more events will arrive.
     Error(String),
+}
+
+trait GenerationEventSink {
+    fn is_closed(&self) -> bool;
+    fn send(&self, event: GenEvent) -> std::result::Result<(), GenEvent>;
+}
+
+impl GenerationEventSink for UnboundedSender<GenEvent> {
+    fn is_closed(&self) -> bool {
+        UnboundedSender::is_closed(self)
+    }
+
+    fn send(&self, event: GenEvent) -> std::result::Result<(), GenEvent> {
+        UnboundedSender::send(self, event).map_err(|error| error.0)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -302,6 +317,8 @@ async fn run_with_permit(
     }
 
     let scheduler_done = scheduler.clone();
+    let panic_state = state.clone();
+    let panic_tx = tx.clone();
     let join = tokio::task::spawn_blocking(move || {
         let result = run(state, prompt_ids, params, cache, tx.clone());
         if let Err(e) = result {
@@ -310,6 +327,12 @@ async fn run_with_permit(
     })
     .await;
     if let Err(e) = join {
+        if e.is_panic() {
+            panic_state.mark_integrity_lost();
+            let _ = panic_tx.send(GenEvent::Error(
+                "generation worker panicked; engine integrity is lost".to_string(),
+            ));
+        }
         tracing::error!("generation worker join error: {e}");
     }
     scheduler_done.active.fetch_sub(1, Ordering::SeqCst);
@@ -351,7 +374,7 @@ async fn run_mock(
         tokio::task::yield_now().await;
     }
     let completion_tokens = mock.chunks.iter().filter(|s| !s.is_empty()).count() as u32;
-    send_done(
+    let _ = send_done(
         telemetry,
         tx,
         if params.max_tokens == 0 {
@@ -371,17 +394,17 @@ async fn run_mock(
     );
 }
 
-fn run(
+fn run<S: GenerationEventSink>(
     state: Arc<ServerState>,
     prompt_ids: Vec<u32>,
     params: GenParams,
     cache: Option<CacheRequest>,
-    tx: UnboundedSender<GenEvent>,
+    tx: S,
 ) -> Result<()> {
     if !state.is_ready() {
         anyhow::bail!("inference server is not ready after an integrity failure");
     }
-    let result = run_inner(state.clone(), prompt_ids, params, cache, tx);
+    let result = run_inner(state.clone(), prompt_ids, params, cache, &tx);
     if let Err(error) = &result {
         if classify_session_failure(error) == SessionFailureClass::IntegrityLost {
             state.mark_integrity_lost();
@@ -391,12 +414,12 @@ fn run(
     result
 }
 
-fn run_inner(
+fn run_inner<S: GenerationEventSink>(
     state: Arc<ServerState>,
     prompt_ids: Vec<u32>,
     params: GenParams,
     cache: Option<CacheRequest>,
-    tx: UnboundedSender<GenEvent>,
+    tx: &S,
 ) -> Result<()> {
     let tokenizer = state.tokenizer.clone();
     let prompt_tokens = prompt_ids.len() as u32;
@@ -405,20 +428,26 @@ fn run_inner(
     // Zero-token request: return an empty completion without touching the
     // engine. OpenAI semantics: `max_tokens=0` means no completion tokens.
     if params.max_tokens == 0 {
-        send_done(
+        let _ = send_done(
             &state.telemetry,
-            &tx,
+            tx,
             FinishReason::Length,
             GenerationStats::token_counts(prompt_tokens, 0, 0),
         );
         return Ok(());
     }
 
+    if tx.is_closed() {
+        return Ok(());
+    }
     let session = state
         .session
         .as_ref()
         .ok_or_else(|| anyhow!("no inference session configured"))?;
     let mut guard = session.blocking_lock();
+    if tx.is_closed() {
+        return Ok(());
+    }
     let features = guard.features();
     if should_use_dflash_generation(features) {
         if cache.is_some() {
@@ -433,7 +462,7 @@ fn run_inner(
             decode_ms = output.decode_ms,
             "DFlash generation complete"
         );
-        emit_generated_ids(
+        if emit_generated_ids(
             &tokenizer,
             &state.eos_ids,
             &output.token_ids,
@@ -446,18 +475,38 @@ fn run_inner(
                 ..GenerationStats::default()
             },
             &state.telemetry,
-            &tx,
-        );
+            tx,
+        )
+        .is_err()
+        {
+            guard.reset()?;
+        }
         return Ok(());
     }
     if !features.plain_prefill_decode {
         anyhow::bail!("loaded session does not expose a supported generation path");
     }
     let cache = supported_cache_request(features, cache.as_ref());
+    let mut session_dirty = false;
 
     let prefill_result = (|| -> Result<Vec<f32>> {
         if let Some(cache_req) = cache {
-            if let Some(hit) = state.prefix_cache.lookup(cache_req, &prompt_ids) {
+            let memory_hit = match state.prefix_cache.lookup(cache_req, &prompt_ids) {
+                Ok(hit) => hit,
+                Err(error) => {
+                    if classify_session_failure(&error) == SessionFailureClass::IntegrityLost
+                        || !is_request_local_cache_failure(&error)
+                    {
+                        return Err(error);
+                    }
+                    tracing::warn!("prefix cache lookup failed: {error}");
+                    state.prefix_cache.record_restore_failure();
+                    None
+                }
+            };
+            if let Some(hit) = memory_hit {
+                check_cancelled(tx)?;
+                session_dirty = true;
                 match guard.restore_prefix(hit.snapshot) {
                     Ok(mut logits) => {
                         cached_prompt_tokens = hit.cached_tokens as u32;
@@ -475,6 +524,11 @@ fn run_inner(
                         Ok(logits)
                     }
                     Err(e) => {
+                        if classify_session_failure(&e) == SessionFailureClass::IntegrityLost
+                            || !is_request_local_cache_failure(&e)
+                        {
+                            return Err(e);
+                        }
                         tracing::warn!("prefix cache restore failed: {e}");
                         state.prefix_cache.record_restore_failure();
                         guard.reset()?;
@@ -483,61 +537,82 @@ fn run_inner(
                 }
             } else if let Some(hit) = state.prefix_cache.lookup_disk_bytes(cache_req, &prompt_ids) {
                 match guard.load_disk_prefix(&hit.bytes) {
-                    Ok(snapshot) => match guard.restore_prefix(snapshot) {
-                        Ok(mut logits) => {
-                            cached_prompt_tokens = hit.cached_tokens as u32;
-                            for (idx, token) in prompt_ids
-                                .iter()
-                                .copied()
-                                .enumerate()
-                                .skip(hit.cached_tokens)
-                            {
-                                if tx.is_closed() {
-                                    return Err(crate::session::SessionCancelled.into());
+                    Ok(snapshot) => {
+                        check_cancelled(tx)?;
+                        session_dirty = true;
+                        match guard.restore_prefix(snapshot) {
+                            Ok(mut logits) => {
+                                cached_prompt_tokens = hit.cached_tokens as u32;
+                                for (idx, token) in prompt_ids
+                                    .iter()
+                                    .copied()
+                                    .enumerate()
+                                    .skip(hit.cached_tokens)
+                                {
+                                    if tx.is_closed() {
+                                        return Err(crate::session::SessionCancelled.into());
+                                    }
+                                    logits = guard.decode_step(token, idx)?;
                                 }
-                                logits = guard.decode_step(token, idx)?;
+                                Ok(logits)
                             }
-                            Ok(logits)
+                            Err(e) => {
+                                if classify_session_failure(&e)
+                                    == SessionFailureClass::IntegrityLost
+                                    || !is_request_local_cache_failure(&e)
+                                {
+                                    return Err(e);
+                                }
+                                tracing::warn!("prefix cache disk restore failed: {e}");
+                                state.prefix_cache.record_restore_failure();
+                                guard.reset()?;
+                                prefill_with_cache_anchor(
+                                    &mut guard,
+                                    &state,
+                                    cache_req,
+                                    &prompt_ids,
+                                    tx,
+                                )
+                            }
                         }
-                        Err(e) => {
-                            tracing::warn!("prefix cache disk restore failed: {e}");
-                            state.prefix_cache.record_restore_failure();
-                            guard.reset()?;
-                            prefill_with_cache_anchor(
-                                &mut guard,
-                                &state,
-                                cache_req,
-                                &prompt_ids,
-                                &tx,
-                            )
-                        }
-                    },
+                    }
                     Err(e) => {
+                        if classify_session_failure(&e) == SessionFailureClass::IntegrityLost
+                            || !is_request_local_cache_failure(&e)
+                        {
+                            return Err(e);
+                        }
                         tracing::warn!("prefix cache disk load failed: {e}");
                         state.prefix_cache.record_restore_failure();
+                        check_cancelled(tx)?;
                         guard.reset()?;
-                        prefill_with_cache_anchor(&mut guard, &state, cache_req, &prompt_ids, &tx)
+                        session_dirty = true;
+                        prefill_with_cache_anchor(&mut guard, &state, cache_req, &prompt_ids, tx)
                     }
                 }
             } else {
+                check_cancelled(tx)?;
                 guard.reset()?;
-                prefill_with_cache_anchor(&mut guard, &state, cache_req, &prompt_ids, &tx)
+                session_dirty = true;
+                prefill_with_cache_anchor(&mut guard, &state, cache_req, &prompt_ids, tx)
             }
         } else {
+            check_cancelled(tx)?;
             guard.reset()?;
+            session_dirty = true;
             guard.prefill_cancellable(&prompt_ids, || tx.is_closed())
         }
     })();
     let prefill_logits = match prefill_result {
         Err(error) if is_session_cancellation(&error) => {
-            guard.reset()?;
+            cleanup_cancelled_session(&mut guard, &mut session_dirty)?;
             return Ok(());
         }
         result => result?,
     };
 
     if let Some(cache_req) = cache {
-        snapshot_prefix_if_admitted(&guard, &state, cache_req, &prompt_ids, &prefill_logits);
+        snapshot_prefix_if_admitted(&guard, &state, cache_req, &prompt_ids, &prefill_logits)?;
     }
 
     let mut rng = rng_from_seed(params.seed);
@@ -561,7 +636,7 @@ fn run_inner(
 
     let finish = loop {
         if tx.is_closed() {
-            guard.reset()?;
+            cleanup_cancelled_session(&mut guard, &mut session_dirty)?;
             return Ok(());
         }
 
@@ -594,7 +669,7 @@ fn run_inner(
             let delta = incremental_delta(&prev_decoded, trimmed);
             if !delta.is_empty() {
                 if tx.send(GenEvent::Token(delta)).is_err() {
-                    guard.reset()?;
+                    cleanup_cancelled_session(&mut guard, &mut session_dirty)?;
                     return Ok(());
                 }
             }
@@ -605,7 +680,7 @@ fn run_inner(
         prev_decoded = decoded;
 
         if !delta.is_empty() && tx.send(GenEvent::Token(delta)).is_err() {
-            guard.reset()?;
+            cleanup_cancelled_session(&mut guard, &mut session_dirty)?;
             return Ok(());
         }
 
@@ -634,28 +709,47 @@ fn run_inner(
                 cache_req,
                 &state_token_ids,
                 &current_logits,
-            );
+            )?;
         }
     }
 
-    send_done(
+    if send_done(
         &state.telemetry,
-        &tx,
+        tx,
         finish,
         GenerationStats::token_counts(prompt_tokens, completion_tokens, cached_prompt_tokens),
-    );
+    )
+    .is_err()
+    {
+        cleanup_cancelled_session(&mut guard, &mut session_dirty)?;
+    }
     Ok(())
 }
 
-fn emit_generated_ids(
+fn check_cancelled<S: GenerationEventSink>(tx: &S) -> Result<()> {
+    if tx.is_closed() {
+        Err(crate::session::SessionCancelled.into())
+    } else {
+        Ok(())
+    }
+}
+
+fn cleanup_cancelled_session(guard: &mut InferenceSession, session_dirty: &mut bool) -> Result<()> {
+    if std::mem::take(session_dirty) {
+        guard.reset()?;
+    }
+    Ok(())
+}
+
+fn emit_generated_ids<S: GenerationEventSink>(
     tokenizer: &Tokenizer,
     eos_ids: &[u32],
     token_ids: &[u32],
     params: &GenParams,
     mut stats: GenerationStats,
     telemetry: &GenerationTelemetry,
-    tx: &UnboundedSender<GenEvent>,
-) {
+    tx: &S,
+) -> std::result::Result<(), GenEvent> {
     let mut emitted_ids: Vec<u32> = Vec::with_capacity(token_ids.len());
     let mut prev_decoded = String::new();
     let mut completion_tokens = 0u32;
@@ -682,7 +776,7 @@ fn emit_generated_ids(
             let trimmed = &decoded[..stop_at];
             let delta = incremental_delta(&prev_decoded, trimmed);
             if !delta.is_empty() {
-                let _ = tx.send(GenEvent::Token(delta));
+                tx.send(GenEvent::Token(delta))?;
             }
             finish = FinishReason::Stop;
             break;
@@ -690,32 +784,31 @@ fn emit_generated_ids(
 
         let delta = incremental_delta(&prev_decoded, &decoded);
         prev_decoded = decoded;
-        if !delta.is_empty() && tx.send(GenEvent::Token(delta)).is_err() {
-            finish = FinishReason::Stop;
-            break;
+        if !delta.is_empty() {
+            tx.send(GenEvent::Token(delta))?;
         }
     }
 
     stats.completion_tokens = completion_tokens;
-    send_done(telemetry, tx, finish, stats);
+    send_done(telemetry, tx, finish, stats)
 }
 
-fn send_done(
+fn send_done<S: GenerationEventSink>(
     telemetry: &GenerationTelemetry,
-    tx: &UnboundedSender<GenEvent>,
+    tx: &S,
     reason: FinishReason,
     stats: GenerationStats,
-) {
+) -> std::result::Result<(), GenEvent> {
     telemetry.record(&stats);
-    let _ = tx.send(GenEvent::Done { reason, stats });
+    tx.send(GenEvent::Done { reason, stats })
 }
 
-fn prefill_with_cache_anchor(
+fn prefill_with_cache_anchor<S: GenerationEventSink>(
     guard: &mut InferenceSession,
     state: &ServerState,
     cache_req: &CacheRequest,
     prompt_ids: &[u32],
-    tx: &UnboundedSender<GenEvent>,
+    tx: &S,
 ) -> Result<Vec<f32>> {
     let min_tokens = state.prefix_cache.config().min_tokens;
     let Some(anchor_len) = prompt_ids.len().checked_sub(CACHE_ANCHOR_SUFFIX_TOKENS) else {
@@ -726,7 +819,7 @@ fn prefill_with_cache_anchor(
     }
 
     let mut logits = guard.prefill_cancellable(&prompt_ids[..anchor_len], || tx.is_closed())?;
-    snapshot_prefix_if_admitted(guard, state, cache_req, &prompt_ids[..anchor_len], &logits);
+    snapshot_prefix_if_admitted(guard, state, cache_req, &prompt_ids[..anchor_len], &logits)?;
     for (idx, token) in prompt_ids.iter().copied().enumerate().skip(anchor_len) {
         if tx.is_closed() {
             return Err(crate::session::SessionCancelled.into());
@@ -742,23 +835,36 @@ fn snapshot_prefix_if_admitted(
     cache_req: &CacheRequest,
     token_ids: &[u32],
     logits: &[f32],
-) {
+) -> Result<()> {
     if !guard.features().prefix_snapshot {
-        return;
+        return Ok(());
     }
     let estimate = guard.prefix_snapshot_bytes(logits.len());
     if !state.prefix_cache.can_admit(token_ids.len(), estimate) {
         state.prefix_cache.record_admission_skip();
-        return;
+        return Ok(());
     }
     match guard.snapshot_prefix(logits.to_vec()) {
         Ok(snapshot) => {
             if let Err(e) = state.prefix_cache.insert(cache_req, token_ids, snapshot) {
+                if classify_session_failure(&e) == SessionFailureClass::IntegrityLost
+                    || !is_request_local_cache_failure(&e)
+                {
+                    return Err(e);
+                }
                 tracing::warn!("prefix cache insert failed: {e}");
             }
         }
-        Err(e) => tracing::debug!("prefix cache snapshot skipped: {e}"),
+        Err(e) => {
+            if classify_session_failure(&e) == SessionFailureClass::IntegrityLost
+                || !is_request_local_cache_failure(&e)
+            {
+                return Err(e);
+            }
+            tracing::debug!("prefix cache snapshot skipped: {e}");
+        }
     }
+    Ok(())
 }
 
 fn detokenize(tokenizer: &Tokenizer, ids: &[u32]) -> String {
@@ -864,12 +970,36 @@ mod tests {
         GenParams,
     };
     use crate::prefix_cache::{CacheRequest, CacheRetention, PrefixCache, PrefixCacheConfig};
+    use crate::qwen36_moe::engine::Qwen36MoePrefillBoundary;
     use crate::session::{
         qwen36_moe_features, DeterministicSession, DeterministicSessionEvent, InferenceSession,
+        SessionFeatures, SessionSnapshot,
     };
     use crate::state::{GenerationScheduler, ServerState};
     use supersonic_core::capabilities::capabilities_for_variant;
     use supersonic_core::registry::{ModelFamily, ModelVariant};
+
+    #[derive(Clone, Default)]
+    struct FailDoneSink {
+        tokens: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl super::GenerationEventSink for FailDoneSink {
+        fn is_closed(&self) -> bool {
+            false
+        }
+
+        fn send(&self, event: GenEvent) -> std::result::Result<(), GenEvent> {
+            match event {
+                GenEvent::Done { .. } => Err(event),
+                GenEvent::Token(token) => {
+                    self.tokens.lock().unwrap().push(token);
+                    Ok(())
+                }
+                GenEvent::Error(_) => Ok(()),
+            }
+        }
+    }
 
     fn tokenizer() -> tokenizers::Tokenizer {
         tokenizers::Tokenizer::from_bytes(
@@ -943,6 +1073,37 @@ mod tests {
         }
     }
 
+    async fn wait_for_idle(state: &ServerState) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if state.scheduler.active.load(Ordering::SeqCst) == 0
+                    && state.scheduler.queued.load(Ordering::SeqCst) == 0
+                    && state.scheduler.permits.available_permits() == 1
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("generation scheduler must become idle");
+    }
+
+    fn assert_admission_released(state: &ServerState) {
+        assert_eq!(state.scheduler.active.load(Ordering::SeqCst), 0);
+        assert_eq!(state.scheduler.queued.load(Ordering::SeqCst), 0);
+        assert_eq!(state.scheduler.permits.available_permits(), 1);
+    }
+
+    fn snapshot_features() -> SessionFeatures {
+        SessionFeatures {
+            plain_prefill_decode: true,
+            native_dflash_generate: false,
+            prefix_snapshot: true,
+            disk_prefix_snapshot: false,
+        }
+    }
+
     #[test]
     fn prefix_case_returns_suffix() {
         assert_eq!(incremental_delta("Hello", "Hello, world"), ", world");
@@ -1003,7 +1164,7 @@ mod tests {
             vec![0.0, 5.0, 0.0],
             vec![vec![0.0, 0.0, 7.0]],
         );
-        let state = test_state(InferenceSession::Deterministic(backend));
+        let state = test_state(InferenceSession::test_qwen36_adapter(backend));
         let (tx, rx) = mpsc::unbounded_channel();
 
         run(
@@ -1023,6 +1184,10 @@ mod tests {
             *events.lock().unwrap(),
             [
                 DeterministicSessionEvent::Reset,
+                DeterministicSessionEvent::PrefillBoundary(Qwen36MoePrefillBoundary::PrefixStarted,),
+                DeterministicSessionEvent::PrefillBoundary(
+                    Qwen36MoePrefillBoundary::FinalProductionStarted,
+                ),
                 DeterministicSessionEvent::Prefill(vec![1, 2]),
                 DeterministicSessionEvent::Decode {
                     token_id: 1,
@@ -1044,7 +1209,7 @@ mod tests {
         let (backend, events) =
             DeterministicSession::new(qwen36_moe_features(), vec![0.0, 5.0, 0.0], Vec::new());
         let backend = backend.after_prefill(move || drop(rx));
-        let state = test_state(InferenceSession::Deterministic(backend));
+        let state = test_state(InferenceSession::test_qwen36_adapter(backend));
 
         run(state.clone(), vec![1, 2], params(4), None, tx).unwrap();
 
@@ -1053,6 +1218,10 @@ mod tests {
             *events.lock().unwrap(),
             [
                 DeterministicSessionEvent::Reset,
+                DeterministicSessionEvent::PrefillBoundary(Qwen36MoePrefillBoundary::PrefixStarted,),
+                DeterministicSessionEvent::PrefillBoundary(
+                    Qwen36MoePrefillBoundary::FinalProductionStarted,
+                ),
                 DeterministicSessionEvent::Prefill(vec![1, 2]),
                 DeterministicSessionEvent::Reset,
             ]
@@ -1063,13 +1232,15 @@ mod tests {
     fn integrity_failure_marks_server_unready_and_rejects_followup_generation() {
         let (backend, events) =
             DeterministicSession::new(qwen36_moe_features(), vec![0.0, 5.0, 0.0], Vec::new());
-        let state = test_state(InferenceSession::Deterministic(
-            backend.with_prefill_failure("HIP device lost during prefill"),
+        let state = test_state(InferenceSession::test_qwen36_adapter(
+            backend.with_prefill_device_loss(),
         ));
         let (tx, _rx) = mpsc::unbounded_channel();
 
         let error = run(state.clone(), vec![1], params(1), None, tx).unwrap_err();
-        assert!(error.to_string().contains("device lost"));
+        assert!(error
+            .downcast_ref::<gpu_hal::GpuError>()
+            .is_some_and(gpu_hal::GpuError::is_device_lost));
         assert!(!state.is_ready());
 
         let (tx, _rx) = mpsc::unbounded_channel();
@@ -1079,6 +1250,10 @@ mod tests {
             *events.lock().unwrap(),
             [
                 DeterministicSessionEvent::Reset,
+                DeterministicSessionEvent::PrefillBoundary(Qwen36MoePrefillBoundary::PrefixStarted,),
+                DeterministicSessionEvent::PrefillBoundary(
+                    Qwen36MoePrefillBoundary::FinalProductionStarted,
+                ),
                 DeterministicSessionEvent::Prefill(vec![1]),
             ]
         );
@@ -1088,7 +1263,7 @@ mod tests {
     fn request_local_failure_preserves_readiness_for_next_request() {
         let (backend, events) =
             DeterministicSession::new(qwen36_moe_features(), vec![0.0, 5.0, 0.0], Vec::new());
-        let state = test_state(InferenceSession::Deterministic(
+        let state = test_state(InferenceSession::test_qwen36_adapter(
             backend.with_prefill_failure("context limit exceeded"),
         ));
         let (tx, _rx) = mpsc::unbounded_channel();
@@ -1103,8 +1278,16 @@ mod tests {
             *events.lock().unwrap(),
             [
                 DeterministicSessionEvent::Reset,
+                DeterministicSessionEvent::PrefillBoundary(Qwen36MoePrefillBoundary::PrefixStarted,),
+                DeterministicSessionEvent::PrefillBoundary(
+                    Qwen36MoePrefillBoundary::FinalProductionStarted,
+                ),
                 DeterministicSessionEvent::Prefill(vec![1]),
                 DeterministicSessionEvent::Reset,
+                DeterministicSessionEvent::PrefillBoundary(Qwen36MoePrefillBoundary::PrefixStarted,),
+                DeterministicSessionEvent::PrefillBoundary(
+                    Qwen36MoePrefillBoundary::FinalProductionStarted,
+                ),
                 DeterministicSessionEvent::Prefill(vec![1]),
             ]
         );
@@ -1118,7 +1301,7 @@ mod tests {
         let backend = backend
             .with_reset_failures(vec![None, Some("reset sync failed")])
             .after_prefill(move || drop(rx));
-        let state = test_state(InferenceSession::Deterministic(backend));
+        let state = test_state(InferenceSession::test_qwen36_adapter(backend));
 
         let error = run(state.clone(), vec![1], params(4), None, tx).unwrap_err();
 
@@ -1128,6 +1311,10 @@ mod tests {
             *events.lock().unwrap(),
             [
                 DeterministicSessionEvent::Reset,
+                DeterministicSessionEvent::PrefillBoundary(Qwen36MoePrefillBoundary::PrefixStarted,),
+                DeterministicSessionEvent::PrefillBoundary(
+                    Qwen36MoePrefillBoundary::FinalProductionStarted,
+                ),
                 DeterministicSessionEvent::Prefill(vec![1]),
                 DeterministicSessionEvent::Reset,
             ]
@@ -1138,7 +1325,7 @@ mod tests {
     async fn spawn_rejects_unready_server_before_queue_or_stream_admission() {
         let (backend, events) =
             DeterministicSession::new(qwen36_moe_features(), vec![0.0, 5.0, 0.0], Vec::new());
-        let state = test_state(InferenceSession::Deterministic(backend));
+        let state = test_state(InferenceSession::test_qwen36_adapter(backend));
         state.mark_integrity_lost();
 
         let error = spawn(state.clone(), vec![1], params(1), None)
@@ -1149,5 +1336,281 @@ mod tests {
         assert_eq!(state.scheduler.active.load(Ordering::SeqCst), 0);
         assert_eq!(state.scheduler.queued.load(Ordering::SeqCst), 0);
         assert!(events.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn spawn_success_releases_permit_and_counters() {
+        let (backend, _) =
+            DeterministicSession::new(qwen36_moe_features(), vec![0.0, 5.0], Vec::new());
+        let state = test_state(InferenceSession::test_qwen36_adapter(backend));
+
+        let result = super::collect(spawn(state.clone(), vec![1], params(1), None).unwrap())
+            .await
+            .unwrap();
+        wait_for_idle(&state).await;
+
+        assert_eq!(result.stats.completion_tokens, 1);
+        assert!(state.is_ready());
+        assert_admission_released(&state);
+    }
+
+    #[tokio::test]
+    async fn spawn_cancellation_releases_permit_and_counters() {
+        let (backend, _) =
+            DeterministicSession::new(qwen36_moe_features(), vec![0.0, 5.0], Vec::new());
+        let state = test_state(InferenceSession::test_qwen36_adapter(backend));
+
+        let rx = spawn(state.clone(), vec![1], params(1), None).unwrap();
+        drop(rx);
+        wait_for_idle(&state).await;
+
+        assert!(state.is_ready());
+        assert_admission_released(&state);
+    }
+
+    #[tokio::test]
+    async fn spawn_request_error_releases_permit_and_counters() {
+        let (backend, _) =
+            DeterministicSession::new(qwen36_moe_features(), vec![0.0, 5.0], Vec::new());
+        let state = test_state(InferenceSession::test_qwen36_adapter(
+            backend.with_prefill_failure("request context limit exceeded"),
+        ));
+
+        let error = super::collect(spawn(state.clone(), vec![1], params(1), None).unwrap())
+            .await
+            .err()
+            .expect("request-local generation must fail");
+        wait_for_idle(&state).await;
+
+        assert!(error.to_string().contains("request context limit exceeded"));
+        assert!(state.is_ready());
+        assert_admission_released(&state);
+    }
+
+    #[tokio::test]
+    async fn spawn_integrity_loss_releases_permit_and_counters() {
+        let (backend, _) =
+            DeterministicSession::new(qwen36_moe_features(), vec![0.0, 5.0], Vec::new());
+        let state = test_state(InferenceSession::test_qwen36_adapter(
+            backend.with_prefill_device_loss(),
+        ));
+
+        let error = super::collect(spawn(state.clone(), vec![1], params(1), None).unwrap())
+            .await
+            .err()
+            .expect("integrity-lost generation must fail");
+        wait_for_idle(&state).await;
+
+        assert!(error.to_string().contains("status 709"));
+        assert!(!state.is_ready());
+        assert_admission_released(&state);
+    }
+
+    #[test]
+    fn typed_device_loss_during_cache_restore_poison_rejects_followup() {
+        let (backend, _) =
+            DeterministicSession::new(snapshot_features(), vec![0.0, 5.0], Vec::new());
+        let state = test_state(InferenceSession::Deterministic(
+            backend.with_restore_device_loss(),
+        ));
+        let cache = cache_request();
+        state
+            .prefix_cache
+            .insert(
+                &cache,
+                &[1, 2],
+                SessionSnapshot::Deterministic {
+                    logits: vec![0.0, 5.0],
+                },
+            )
+            .unwrap();
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let error = run(state.clone(), vec![1, 2], params(1), Some(cache), tx).unwrap_err();
+
+        assert!(error
+            .downcast_ref::<gpu_hal::GpuError>()
+            .is_some_and(gpu_hal::GpuError::is_device_lost));
+        assert!(!state.is_ready());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        assert!(run(state, vec![1], params(1), None, tx).is_err());
+    }
+
+    #[test]
+    fn typed_request_local_cache_restore_error_resets_and_retries() {
+        let (backend, events) =
+            DeterministicSession::new(snapshot_features(), vec![0.0, 5.0], Vec::new());
+        let state = test_state(InferenceSession::Deterministic(
+            backend.with_restore_request_local_cache_failure(),
+        ));
+        let cache = cache_request();
+        state
+            .prefix_cache
+            .insert(
+                &cache,
+                &[1, 2],
+                SessionSnapshot::Deterministic {
+                    logits: vec![0.0, 5.0],
+                },
+            )
+            .unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        run(state.clone(), vec![1, 2], params(1), Some(cache), tx).unwrap();
+
+        assert!(state.is_ready());
+        assert_eq!(done_stats(rx).completion_tokens, 1);
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                DeterministicSessionEvent::Reset,
+                DeterministicSessionEvent::Prefill(vec![1, 2]),
+            ]
+        );
+    }
+
+    #[test]
+    fn typed_device_loss_during_snapshot_capture_poison_rejects_followup() {
+        let (backend, _) =
+            DeterministicSession::new(snapshot_features(), vec![0.0, 5.0], Vec::new());
+        let state = test_state(InferenceSession::Deterministic(
+            backend.with_snapshot_device_loss(),
+        ));
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let error = run(
+            state.clone(),
+            vec![1, 2],
+            params(1),
+            Some(cache_request()),
+            tx,
+        )
+        .unwrap_err();
+
+        assert!(error
+            .downcast_ref::<gpu_hal::GpuError>()
+            .is_some_and(gpu_hal::GpuError::is_device_lost));
+        assert!(!state.is_ready());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        assert!(run(state, vec![1], params(1), None, tx).is_err());
+    }
+
+    #[tokio::test]
+    async fn blocking_worker_panic_poison_releases_admission_and_rejects_followup() {
+        let (backend, _) =
+            DeterministicSession::new(qwen36_moe_features(), vec![0.0, 5.0], Vec::new());
+        let state = test_state(InferenceSession::test_qwen36_adapter(
+            backend.with_prefill_panic(),
+        ));
+
+        let mut rx = spawn(state.clone(), vec![1], params(1), None).unwrap();
+        while rx.recv().await.is_some() {}
+        wait_for_idle(&state).await;
+
+        assert!(!state.is_ready());
+        assert_admission_released(&state);
+        assert!(spawn(state, vec![1], params(1), None).is_err());
+    }
+
+    #[test]
+    fn closed_before_worker_session_access_performs_no_reset() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        drop(rx);
+        let (backend, events) =
+            DeterministicSession::new(qwen36_moe_features(), vec![0.0, 5.0], Vec::new());
+        let state = test_state(InferenceSession::test_qwen36_adapter(backend));
+
+        run(state.clone(), vec![1], params(1), None, tx).unwrap();
+
+        assert!(state.is_ready());
+        assert!(events.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cancellation_at_each_qwen_prefill_boundary_cleans_up_exactly_once() {
+        for boundary in [
+            Qwen36MoePrefillBoundary::PrefixStarted,
+            Qwen36MoePrefillBoundary::FinalProductionStarted,
+        ] {
+            let (tx, rx) = mpsc::unbounded_channel();
+            let (backend, events) =
+                DeterministicSession::new(qwen36_moe_features(), vec![0.0, 5.0], Vec::new());
+            let backend = backend.close_at_prefill_boundary(boundary, move || drop(rx));
+            let state = test_state(InferenceSession::test_qwen36_adapter(backend));
+
+            run(state.clone(), vec![1, 2], params(2), None, tx).unwrap();
+
+            assert!(state.is_ready());
+            let events = events.lock().unwrap();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, DeterministicSessionEvent::Reset))
+                    .count(),
+                2,
+                "{boundary:?}: {events:?}"
+            );
+            assert_eq!(events.first(), Some(&DeterministicSessionEvent::Reset));
+            assert_eq!(events.last(), Some(&DeterministicSessionEvent::Reset));
+            assert!(events.contains(&DeterministicSessionEvent::PrefillBoundary(boundary)));
+            assert!(!events
+                .iter()
+                .any(|event| matches!(event, DeterministicSessionEvent::Decode { .. })));
+        }
+    }
+
+    #[test]
+    fn cancellation_after_decode_cleans_up_exactly_once() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (backend, events) = DeterministicSession::new(
+            qwen36_moe_features(),
+            vec![0.0, 5.0, 0.0],
+            vec![vec![0.0, 0.0, 7.0]],
+        );
+        let backend = backend.after_decode(move || drop(rx));
+        let state = test_state(InferenceSession::test_qwen36_adapter(backend));
+
+        run(state.clone(), vec![1, 2], params(3), None, tx).unwrap();
+
+        assert!(state.is_ready());
+        let events = events.lock().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, DeterministicSessionEvent::Reset))
+                .count(),
+            2,
+            "{events:?}"
+        );
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, DeterministicSessionEvent::Decode { .. })));
+        assert_eq!(events.last(), Some(&DeterministicSessionEvent::Reset));
+    }
+
+    #[test]
+    fn final_token_before_done_drop_cleans_up_and_propagates_reset_integrity_failure() {
+        let (backend, events) =
+            DeterministicSession::new(qwen36_moe_features(), vec![0.0, 5.0], Vec::new());
+        let backend =
+            backend.with_reset_failures(vec![None, Some("terminal cleanup reset failed")]);
+        let state = test_state(InferenceSession::test_qwen36_adapter(backend));
+        let sink = FailDoneSink::default();
+
+        let error = run(state.clone(), vec![1], params(1), None, sink.clone()).unwrap_err();
+
+        assert!(error.to_string().contains("terminal cleanup reset failed"));
+        assert!(!state.is_ready());
+        assert_eq!(sink.tokens.lock().unwrap().as_slice(), ["hello"]);
+        let events = events.lock().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, DeterministicSessionEvent::Reset))
+                .count(),
+            2,
+            "{events:?}"
+        );
+        assert_eq!(events.last(), Some(&DeterministicSessionEvent::Reset));
     }
 }

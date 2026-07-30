@@ -79,6 +79,32 @@ pub enum Qwen36MoePrefillBoundary {
     FinalProductionStarted,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Qwen36MoeIntegrityError {
+    ResidentAllocationsChanged,
+    MappedVirtualAddressesChanged,
+    DescriptorPointerNotOwned { label: String, pointer: usize },
+}
+
+impl std::fmt::Display for Qwen36MoeIntegrityError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ResidentAllocationsChanged => {
+                formatter.write_str("resident allocation pointers changed across reset")
+            }
+            Self::MappedVirtualAddressesChanged => {
+                formatter.write_str("mapped virtual addresses changed across reset")
+            }
+            Self::DescriptorPointerNotOwned { label, pointer } => write!(
+                formatter,
+                "Qwen3.6 descriptor pointer {label}={pointer:#x} is not engine-owned"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for Qwen36MoeIntegrityError {}
+
 #[derive(Debug)]
 pub struct Qwen36MoePrefillOutput {
     pub logits: Vec<f32>,
@@ -1158,7 +1184,7 @@ impl Qwen36MoeEngine {
             current_pointers.dedup();
         }
         if current_pointers != self.load_evidence.resident_allocation_pointers {
-            anyhow::bail!("resident allocation pointers changed across reset");
+            return Err(Qwen36MoeIntegrityError::ResidentAllocationsChanged.into());
         }
         let current_virtual_addresses = collect_mapped_virtual_ranges(&self.layers)
             .into_iter()
@@ -1171,7 +1197,7 @@ impl Qwen36MoeEngine {
             .map(|range| range.address)
             .collect::<Vec<_>>();
         if current_virtual_addresses != loaded_virtual_addresses {
-            anyhow::bail!("mapped virtual addresses changed across reset");
+            return Err(Qwen36MoeIntegrityError::MappedVirtualAddressesChanged.into());
         }
         Ok(())
     }
@@ -1330,7 +1356,8 @@ impl Qwen36ServingBackend for Qwen36MoeEngine {
 
 fn reset_phase<T>(phase: &str, result: Result<T>) -> Result<T> {
     result.map_err(|error| {
-        anyhow!("Qwen3.6 engine reset integrity failure during {phase}: {error:#}")
+        let context = format!("Qwen3.6 engine reset integrity failure during {phase}: {error:#}");
+        error.context(context)
     })
 }
 
@@ -2278,7 +2305,11 @@ fn validate_descriptor_pointer_ownership(
 ) -> Result<()> {
     for &(label, pointer) in descriptor_pointers {
         if pointer != 0 && !owned.contains(&pointer) {
-            anyhow::bail!("Qwen3.6 descriptor pointer {label}={pointer:#x} is not engine-owned");
+            return Err(Qwen36MoeIntegrityError::DescriptorPointerNotOwned {
+                label: label.to_owned(),
+                pointer,
+            }
+            .into());
         }
     }
     Ok(())
@@ -2383,9 +2414,9 @@ mod tests {
         run_prefill_orchestration_with_boundaries, run_reset_transaction, validate_35b_a3b_config,
         validate_descriptor_pointer_ownership, validate_load_contract, zero_gpu_buffer,
         zero_mapped_virtual_buffer, LoadEvidenceInput, Qwen36ExecutionOptions,
-        Qwen36LmHeadSelection, Qwen36MoeDirectProfile, Qwen36MoeEngine, Qwen36MoeLoadConfig,
-        Qwen36MoePrefillBoundary, Qwen36MoeRouteState, Qwen36ServingBackend, Qwen36ServingEvent,
-        Qwen36ServingObserver, Qwen36SessionPosition,
+        Qwen36LmHeadSelection, Qwen36MoeDirectProfile, Qwen36MoeEngine, Qwen36MoeIntegrityError,
+        Qwen36MoeLoadConfig, Qwen36MoePrefillBoundary, Qwen36MoeRouteState, Qwen36ServingBackend,
+        Qwen36ServingEvent, Qwen36ServingObserver, Qwen36SessionPosition,
     };
     use crate::qwen36_moe::load_policy::Qwen36MoeLoadPolicy;
     use crate::qwen36_moe::source::{Qwen36MoeSource, Qwen36MoeSourceOpenObserver};
@@ -3143,6 +3174,13 @@ mod tests {
         .expect_err("unowned descriptor pointer must fail");
         assert!(err.to_string().contains("experts_gate_up_w"), "{err:#}");
         assert!(err.to_string().contains("not engine-owned"), "{err:#}");
+        assert!(matches!(
+            err.downcast_ref::<Qwen36MoeIntegrityError>(),
+            Some(Qwen36MoeIntegrityError::DescriptorPointerNotOwned {
+                label,
+                pointer: 0x4000,
+            }) if label == "experts_gate_up_w"
+        ));
     }
 
     #[test]
@@ -3672,6 +3710,21 @@ mod tests {
         assert!(err.to_string().contains("integrity failure"), "{err:#}");
         assert!(err.to_string().contains("linear-state"), "{err:#}");
         assert!(err.to_string().contains("device lost"), "{err:#}");
+    }
+
+    #[test]
+    fn reset_phase_preserves_typed_integrity_source() {
+        let err = reset_phase::<()>(
+            "resident-identity",
+            Err(Qwen36MoeIntegrityError::ResidentAllocationsChanged.into()),
+        )
+        .expect_err("resident integrity failure must propagate");
+
+        assert!(err
+            .downcast_ref::<Qwen36MoeIntegrityError>()
+            .is_some_and(|error| {
+                matches!(error, Qwen36MoeIntegrityError::ResidentAllocationsChanged)
+            }));
     }
 
     #[test]

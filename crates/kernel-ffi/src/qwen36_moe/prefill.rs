@@ -356,9 +356,10 @@ fn attn_step_launch_impl(
         }
     };
     if status != 0 {
-        return Err(GpuError::backend(
+        return Err(qwen36_backend_error(
             backend,
-            format!("qwen36_moe attn_step launch failed with status {status}"),
+            "qwen36_moe attn_step launch",
+            status,
         ));
     }
     Ok(())
@@ -1483,9 +1484,10 @@ fn linear_step_launch_impl(
         }
     };
     if status != 0 {
-        return Err(GpuError::backend(
+        return Err(qwen36_backend_error(
             backend,
-            format!("qwen36_moe linear_step launch failed with status {status}"),
+            "qwen36_moe linear_step launch",
+            status,
         ));
     }
     Ok(())
@@ -9301,9 +9303,10 @@ fn ffn_step_launch_impl(
         }
     };
     if status != 0 {
-        return Err(GpuError::backend(
+        return Err(qwen36_backend_error(
             backend,
-            format!("qwen36_moe ffn_step launch failed with status {status}"),
+            "qwen36_moe ffn_step launch",
+            status,
         ));
     }
     Ok(())
@@ -11142,9 +11145,10 @@ pub fn int4_dequant_smoke_launch(
         Backend::Metal => unreachable!("Metal int4_dequant_smoke handled above"),
     };
     if status != 0 {
-        return Err(GpuError::backend(
+        return Err(qwen36_backend_error(
             backend,
-            format!("qwen36_moe int4_dequant_smoke_launch failed with status {status}"),
+            "qwen36_moe int4_dequant_smoke_launch",
+            status,
         ));
     }
     Ok(())
@@ -12134,9 +12138,10 @@ fn lm_head_launch_impl(
         }
     };
     if status != 0 {
-        return Err(GpuError::backend(
+        return Err(qwen36_backend_error(
             backend,
-            format!("qwen36_moe lm_head_launch failed with status {status}"),
+            "qwen36_moe lm_head_launch",
+            status,
         ));
     }
     Ok(())
@@ -12331,9 +12336,10 @@ fn lm_head_batched_launch_impl(
         ));
     }
     if status != 0 {
-        return Err(GpuError::backend(
+        return Err(qwen36_backend_error(
             backend,
-            format!("qwen36_moe lm_head_batched_launch failed with status {status}"),
+            "qwen36_moe lm_head_batched_launch",
+            status,
         ));
     }
     Ok(())
@@ -12587,9 +12593,10 @@ pub fn mtp_pre_fusion_launch(
         Backend::Metal => unreachable!("Metal mtp_pre_fusion handled above"),
     };
     if status != 0 {
-        return Err(GpuError::backend(
+        return Err(qwen36_backend_error(
             backend,
-            format!("qwen36_moe mtp_pre_fusion_launch failed with status {status}"),
+            "qwen36_moe mtp_pre_fusion_launch",
+            status,
         ));
     }
     Ok(())
@@ -12765,9 +12772,10 @@ pub fn batched_prefill_attn_full_launch(
         _ => unreachable!(),
     };
     if status != 0 {
-        return Err(GpuError::backend(
+        return Err(qwen36_backend_error(
             backend,
-            format!("qwen36_moe batched_prefill_attn_full_launch failed with status {status}"),
+            "qwen36_moe batched_prefill_attn_full_launch",
+            status,
         ));
     }
     Ok(())
@@ -13123,9 +13131,10 @@ pub fn batched_prefill_router_permute_launch(
         _ => unreachable!(),
     };
     if status != 0 {
-        return Err(GpuError::backend(
+        return Err(qwen36_backend_error(
             backend,
-            format!("qwen36_moe batched_prefill_router_permute_launch failed with status {status}"),
+            "qwen36_moe batched_prefill_router_permute_launch",
+            status,
         ));
     }
     Ok(())
@@ -13240,9 +13249,10 @@ pub fn batched_prefill_grouped_expert_launch(
         _ => unreachable!(),
     };
     if status != 0 {
-        return Err(GpuError::backend(
+        return Err(qwen36_backend_error(
             backend,
-            format!("qwen36_moe batched_prefill_grouped_expert_launch failed with status {status}"),
+            "qwen36_moe batched_prefill_grouped_expert_launch",
+            status,
         ));
     }
     let _ = (
@@ -13359,11 +13369,10 @@ pub unsafe fn batched_prefill_grouped_expert_launch_raw(
         _ => unreachable!(),
     };
     if status != 0 {
-        return Err(GpuError::backend(
+        return Err(qwen36_backend_error(
             backend,
-            format!(
-                "qwen36_moe batched_prefill_grouped_expert_launch_raw failed with status {status}"
-            ),
+            "qwen36_moe batched_prefill_grouped_expert_launch_raw",
+            status,
         ));
     }
     Ok(())
@@ -13439,11 +13448,10 @@ pub fn batched_prefill_unpermute_combine_launch(
         _ => unreachable!(),
     };
     if status != 0 {
-        return Err(GpuError::backend(
+        return Err(qwen36_backend_error(
             backend,
-            format!(
-                "qwen36_moe batched_prefill_unpermute_combine_launch failed with status {status}"
-            ),
+            "qwen36_moe batched_prefill_unpermute_combine_launch",
+            status,
         ));
     }
     Ok(())
