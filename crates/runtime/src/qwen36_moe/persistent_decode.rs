@@ -27,7 +27,7 @@
 //! gates on `--persistent-decode`).
 
 use anyhow::{anyhow, Context, Result};
-use gpu_hal::{copy_d2h, copy_h2d, sync, GpuBuffer, GpuError, ScalarType};
+use gpu_hal::{copy_d2h, copy_h2d, sync, Backend, GpuBuffer, GpuError, ScalarType};
 use kernel_ffi::qwen36_moe::{
     persistent_decode_launch, persistent_decode_launch_range, Qwen36MoeAttnStepParams,
     Qwen36MoeDecodeLayerDesc, Qwen36MoeInt4ScaleDesc, Qwen36MoeKVCacheFp8Desc,
@@ -55,9 +55,10 @@ pub struct LmHeadFold<'a> {
 }
 
 use crate::qwen36_moe::decode::{
-    ffn_workspace_floats, full_attn_score_workspace_floats, full_attn_workspace_floats,
-    linear_attn_workspace_floats, reset_sync_buf,
+    execution_option_os, ffn_workspace_floats, full_attn_score_workspace_floats,
+    full_attn_workspace_floats, linear_attn_workspace_floats, reset_sync_buf,
 };
+use crate::qwen36_moe::layer_loader::{classify_layer_weight_encoding, Qwen36LayerWeightEncoding};
 use crate::qwen36_moe::lm_head::bf16_bytes_to_f32;
 use crate::qwen36_moe::types::{
     AttnLayerBuffers, DecodeOutputs, ExpertPrefetchPhase, ExpertRoute, LayerBuffers, MultiLayerGeom,
@@ -73,33 +74,126 @@ use crate::qwen36_moe::types::{
 /// pointers cached in `layer_descs_dev`). If the engine ever re-allocates
 /// any layer's weight or state buffer, the scratch must be rebuilt.
 pub struct PersistentScratch {
-    pub geom: Qwen36MoePersistentGeom,
-    pub num_layers: usize,
-    pub layer_is_full_attention: Vec<bool>,
+    geom: Qwen36MoePersistentGeom,
+    num_layers: usize,
+    layer_is_full_attention: Vec<bool>,
     /// `[num_layers]` descriptors uploaded as opaque U8 bytes.
-    pub layer_descs_dev: GpuBuffer,
+    pub(crate) layer_descs_dev: GpuBuffer,
     /// `[num_layers]` INT4 sidecar descriptors. `None` for BF16 bakes.
-    pub int4_scales_dev: Option<GpuBuffer>,
+    int4_scales_dev: Option<GpuBuffer>,
     /// Optional GPU upload of `Vec<Qwen36MoeKVCacheFp8Desc>` (one entry
     /// per layer). `Some` when KV-FP8 is active.
-    pub kv_fp8_descs_dev: Option<GpuBuffer>,
+    kv_fp8_descs_dev: Option<GpuBuffer>,
     /// Two `[hidden]` BF16 buffers — kernel ping-pongs residuals through
     /// them. Per-step, host uploads the fresh `initial_hidden` into
     /// `hidden_ping`; the kernel returns the final hidden in
     /// `hidden_ping` (two swaps per layer cancel — see the kernel
     /// docstring for the math).
-    pub hidden_ping: GpuBuffer,
-    pub hidden_pong: GpuBuffer,
+    pub(crate) hidden_ping: GpuBuffer,
+    hidden_pong: GpuBuffer,
     /// F32 shared scratch sized for `max(full_attn, linear_attn, ffn)`
     /// workspace footprints.
-    pub workspace: GpuBuffer,
+    pub(crate) workspace: GpuBuffer,
     /// `[top_k]` i32. The full megakernel keeps this as internal FFN
     /// scratch; segmented sparse-VMM decode downloads it after router-only
     /// launches to know which expert pages to remap.
-    pub ffn_topk_idx_scratch: GpuBuffer,
+    ffn_topk_idx_scratch: GpuBuffer,
     /// 96-byte sync_buf: counters[0..16] + barrier_counter (+64) +
     /// barrier_flag (+68). Bridge zeros it on every launch.
-    pub sync_buf: GpuBuffer,
+    sync_buf: GpuBuffer,
+}
+
+fn persistent_supports_encoding(encoding: Qwen36LayerWeightEncoding) -> bool {
+    matches!(
+        encoding,
+        Qwen36LayerWeightEncoding::NativeInt4 | Qwen36LayerWeightEncoding::Fp8
+    )
+}
+
+fn validate_lm_head_fold(
+    ordinal: usize,
+    hidden: usize,
+    backend: Backend,
+    fold: &LmHeadFold<'_>,
+) -> Result<()> {
+    if fold.vocab <= 0 {
+        return Err(anyhow!(
+            "Qwen3.6 persistent lm-head fold requires positive vocab, got {}",
+            fold.vocab
+        ));
+    }
+    if fold.logits_out.is_some() == fold.top1_out.is_some() {
+        return Err(anyhow!(
+            "Qwen3.6 persistent lm-head fold requires exactly one logits or top1 output"
+        ));
+    }
+    let hidden_bytes = hidden
+        .checked_mul(2)
+        .ok_or_else(|| anyhow!("Qwen3.6 persistent lm-head hidden size overflow"))?;
+    let vocab = fold.vocab as usize;
+    let lm_head_bytes = vocab
+        .checked_mul(hidden)
+        .and_then(|elements| elements.checked_mul(2))
+        .ok_or_else(|| anyhow!("Qwen3.6 persistent lm-head weight size overflow"))?;
+    let validate =
+        |label: &str, buffer: &GpuBuffer, dtype: ScalarType, required_bytes: usize| -> Result<()> {
+            if buffer.backend() != backend {
+                return Err(anyhow!(
+                    "{label} backend mismatch: got {:?}, expected {backend:?}",
+                    buffer.backend()
+                ));
+            }
+            if buffer.device_ordinal() != ordinal {
+                return Err(anyhow!(
+                    "{label} device ordinal mismatch: got {}, expected {ordinal}",
+                    buffer.device_ordinal()
+                ));
+            }
+            if buffer.dtype() != dtype {
+                return Err(anyhow!(
+                    "{label} dtype mismatch: got {:?}, expected {dtype:?}",
+                    buffer.dtype()
+                ));
+            }
+            if buffer.len_bytes() < required_bytes {
+                return Err(anyhow!(
+                    "{label} buffer too small: got {} bytes, need at least {required_bytes}",
+                    buffer.len_bytes()
+                ));
+            }
+            Ok(())
+        };
+    validate(
+        "persistent final_norm",
+        fold.final_norm_w,
+        ScalarType::BF16,
+        hidden_bytes,
+    )?;
+    validate(
+        "persistent lm_head",
+        fold.lm_head_w,
+        ScalarType::BF16,
+        lm_head_bytes,
+    )?;
+    if let Some(logits) = fold.logits_out.as_deref() {
+        validate(
+            "persistent logits_out",
+            logits,
+            ScalarType::BF16,
+            vocab
+                .checked_mul(2)
+                .ok_or_else(|| anyhow!("Qwen3.6 persistent logits size overflow"))?,
+        )?;
+    }
+    if let Some(top1) = fold.top1_out.as_deref() {
+        validate(
+            "persistent top1_out",
+            top1,
+            ScalarType::U32,
+            std::mem::size_of::<u32>(),
+        )?;
+    }
+    Ok(())
 }
 
 impl PersistentScratch {
@@ -107,7 +201,26 @@ impl PersistentScratch {
     /// `layers` only for descriptor construction (mutable state pointers
     /// are cached into the descs); subsequent [`Self::run`] calls don't
     /// need `&mut layers`.
-    pub fn new(ordinal: usize, geom: &MultiLayerGeom, layers: &mut [LayerBuffers]) -> Result<Self> {
+    pub(crate) fn new(
+        ordinal: usize,
+        geom: &MultiLayerGeom,
+        layers: &mut [LayerBuffers],
+    ) -> Result<Self> {
+        if geom.hidden <= 0 || geom.num_layers < 0 {
+            return Err(anyhow!(
+                "invalid Qwen3.6 persistent geometry: hidden={} layers={}",
+                geom.hidden,
+                geom.num_layers
+            ));
+        }
+        let encoding = classify_layer_weight_encoding(layers)
+            .context("classify Qwen3.6 persistent layer weight encoding")?;
+        if !persistent_supports_encoding(encoding) {
+            return Err(anyhow!(
+                "Qwen3.6 persistent decode does not support {encoding:?} layer weights; \
+                 use the chained decode path"
+            ));
+        }
         let num_layers = layers.len();
         let layer_is_full_attention = layers.iter().map(LayerBuffers::is_full_attn).collect();
         let descs = build_layer_descs(layers);
@@ -222,6 +335,14 @@ impl PersistentScratch {
                 initial_hidden_bytes.len(),
                 hidden_bytes,
             ));
+        }
+        if let Some(fold) = lm_head_fold.as_ref() {
+            validate_lm_head_fold(
+                ordinal,
+                self.geom.hidden as usize,
+                self.hidden_ping.backend(),
+                fold,
+            )?;
         }
         copy_h2d(
             ordinal,
@@ -587,9 +708,10 @@ impl PersistentScratch {
 
         let mut attn_us = 0u64;
         let mut ffn_us = 0u64;
-        let ffn_stage_profile = std::env::var_os("SUPERSONIC_QWEN36_FFN_STAGE_PROFILE").is_some();
+        let ffn_stage_profile =
+            execution_option_os("SUPERSONIC_QWEN36_FFN_STAGE_PROFILE").is_some();
         let linear_stage_profile =
-            std::env::var_os("SUPERSONIC_QWEN36_LINEAR_STAGE_PROFILE").is_some();
+            execution_option_os("SUPERSONIC_QWEN36_LINEAR_STAGE_PROFILE").is_some();
         for layer_idx in 0..self.num_layers {
             if linear_stage_profile && !self.layer_is_full_attention[layer_idx] {
                 for stage in 1..=5 {
@@ -1012,6 +1134,44 @@ mod tests {
     use super::*;
     use crate::qwen36_moe::types::{FfnLayerBuffers, ResidentWeight};
     use gpu_hal::{Backend, VirtualAllocationRole, VirtualArena, VirtualBacking};
+
+    #[test]
+    fn persistent_mode_requires_supported_descriptor_encoding() {
+        assert!(persistent_supports_encoding(
+            Qwen36LayerWeightEncoding::NativeInt4
+        ));
+        assert!(persistent_supports_encoding(Qwen36LayerWeightEncoding::Fp8));
+        assert!(!persistent_supports_encoding(
+            Qwen36LayerWeightEncoding::Bf16
+        ));
+        assert!(!persistent_supports_encoding(
+            Qwen36LayerWeightEncoding::GgmlKBlock
+        ));
+    }
+
+    #[test]
+    fn persistent_fold_rejects_malformed_buffers_before_launch() {
+        let ordinal = 0;
+        let final_norm =
+            GpuBuffer::zeros(ordinal, ScalarType::BF16, &[2]).expect("alloc final norm");
+        let lm_head =
+            GpuBuffer::zeros(ordinal, ScalarType::F32, &[2, 2]).expect("alloc wrong lm head");
+        let mut logits = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[2]).expect("alloc logits");
+        let fold = LmHeadFold {
+            final_norm_w: &final_norm,
+            lm_head_w: &lm_head,
+            logits_out: Some(&mut logits),
+            top1_out: None,
+            vocab: 2,
+        };
+
+        let err = validate_lm_head_fold(ordinal, 2, final_norm.backend(), &fold)
+            .expect_err("wrong folded lm-head dtype must fail");
+
+        assert!(err
+            .to_string()
+            .contains("persistent lm_head dtype mismatch"));
+    }
 
     fn stub_bf16(ordinal: usize) -> Result<GpuBuffer> {
         Ok(GpuBuffer::zeros(ordinal, ScalarType::BF16, &[1])?)

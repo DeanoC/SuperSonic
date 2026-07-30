@@ -9,10 +9,9 @@ use crate::qwen36_moe_cli::decode_loop::Qwen36DecodeLoopState;
 use crate::qwen36_moe_cli::engine::current_position;
 use crate::qwen36_moe_cli::host::lookup_embed_row;
 use crate::qwen36_moe_cli::vmm_config::MoeRuntimeConfig;
-use crate::qwen36_moe_persistent_decode::PersistentScratch;
-use crate::qwen36_moe_residency::MoeExpertResidencyManager;
 use crate::qwen36_moe_telemetry::MoeRouteRuntime;
-use crate::qwen36_moe_types::{LayerBuffers, MultiLayerGeom};
+use crate::qwen36_moe_types::MultiLayerGeom;
+use supersonic_runtime::qwen36_moe::layers::LoadedQwen36Layers;
 
 pub(crate) use supersonic_runtime::qwen36_moe::prefill::{
     BatchedPrefillTimings, PREFILL_CHUNK_SIZE_WMMA_FULL,
@@ -105,9 +104,7 @@ pub(crate) fn run_batched_prefill_stub(
     geom: &MultiLayerGeom,
     store: &BakedStore,
     weight_prefix: &str,
-    layers: &mut [LayerBuffers],
-    persistent_scratch: Option<&mut PersistentScratch>,
-    moe_expert_residency: Option<&mut MoeExpertResidencyManager>,
+    loaded_layers: &mut LoadedQwen36Layers,
     moe_runtime: &mut MoeRuntimeConfig,
     moe_routes: &mut MoeRouteRuntime,
     loop_state: &mut Qwen36DecodeLoopState,
@@ -142,11 +139,8 @@ pub(crate) fn run_batched_prefill_stub(
         ));
     }
 
-    let sparse_residency_active = moe_expert_residency.is_some();
-    let mut moe_expert_residency = moe_expert_residency;
     let mut fallback =
-        |callback_layers: &mut [LayerBuffers],
-         callback_scratch: Option<&mut PersistentScratch>,
+        |callback_layers: &mut LoadedQwen36Layers,
          step: usize,
          token: u32,
          position|
@@ -163,9 +157,7 @@ pub(crate) fn run_batched_prefill_stub(
                 ordinal,
                 geom,
                 store,
-                layers: callback_layers,
-                persistent_scratch: callback_scratch,
-                moe_expert_residency: moe_expert_residency.as_deref_mut(),
+                loaded_layers: callback_layers,
                 moe_runtime,
                 moe_routes,
                 initial_hidden: &initial_hidden,
@@ -200,11 +192,9 @@ pub(crate) fn run_batched_prefill_stub(
         geom,
         store,
         weight_prefix,
-        layers,
-        persistent_scratch,
+        loaded_layers,
         &tokens,
         &positions,
-        sparse_residency_active,
         emit_stage_timings,
         Some(&mut fallback),
         Some(&mut progress),

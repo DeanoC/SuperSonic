@@ -883,6 +883,13 @@ fn decode_text(
     progress_heartbeat_seconds: f64,
     flm_virtual_transfer_backend_cli: Option<&str>,
 ) -> Result<()> {
+    let runtime_options =
+        supersonic_runtime::qwen36_moe::decode::Qwen36ExecutionOptions::from_pairs(
+            std::env::vars().filter(|(name, _)| name.starts_with("SUPERSONIC_")),
+        )
+        .with_diagnostic_observer(std::sync::Arc::new(|message| eprintln!("{message}")));
+    let _runtime_options_guard = runtime_options.install();
+
     validate_speculative_sampling(speculative_decode, sampling)?;
 
     if keep_mask.is_some() && speculative_decode {
@@ -951,13 +958,6 @@ fn decode_text(
     // [kv_max_t, Hkv*d=512] BF16 = 10 KiB per token of context).
     let kv_max_t = prompt_ids.len() + max_new;
 
-    let mut moe_runtime = prepare_moe_runtime_config(
-        speculative_decode,
-        persistent_decode,
-        backend,
-        geom.top_k as usize,
-        flm_virtual_transfer_backend_cli,
-    )?;
     let kv_vmm = should_use_qwen36_kv_vmm(backend, ordinal)?;
 
     progress(
@@ -1000,6 +1000,22 @@ fn decode_text(
     let store = decode_store.as_store();
     let model_source_elapsed = source_open_start.elapsed();
     progress(source_phase, format!("done source={source_label}"), true);
+    let persistent_decode = if persistent_decode && !weight_mode.supports_persistent_decode() {
+        eprintln!(
+            "  persistent decode is unavailable for {}; routing through runtime chained decode",
+            weight_mode.display_name()
+        );
+        false
+    } else {
+        persistent_decode
+    };
+    let mut moe_runtime = prepare_moe_runtime_config(
+        speculative_decode,
+        persistent_decode,
+        backend,
+        geom.top_k as usize,
+        flm_virtual_transfer_backend_cli,
+    )?;
 
     println!(
         "  loading {} layers ({} INT4 sidecar sets, KV cache cap = {} tokens)…",
@@ -1067,18 +1083,22 @@ fn decode_text(
             return Err(err);
         }
     };
-    let mut layers = loaded_layers.layers;
     let mut layer_load_profile = loaded_layers.timings;
-    let ffn_prewarm_elapsed =
-        match prewarm_qwen36_mps_static_topn_if_requested(ordinal, backend, &geom, &mut layers) {
-            Ok(elapsed) => elapsed,
-            Err(err) => {
-                if profile_layer_load_hal {
-                    gpu_hal::hal_profile_set_enabled(false);
-                }
-                return Err(err);
+    let mut loaded_layers = loaded_layers.loaded;
+    let ffn_prewarm_elapsed = match prewarm_qwen36_mps_static_topn_if_requested(
+        ordinal,
+        backend,
+        &geom,
+        loaded_layers.layers_mut_before_persistent()?,
+    ) {
+        Ok(elapsed) => elapsed,
+        Err(err) => {
+            if profile_layer_load_hal {
+                gpu_hal::hal_profile_set_enabled(false);
             }
-        };
+            return Err(err);
+        }
+    };
     layer_load_profile.prewarm = ffn_prewarm_elapsed;
     if profile_layer_load_hal {
         let hal_timings = qwen36_layer_load_hal_timings(&gpu_hal::hal_profile_snapshot());
@@ -1097,9 +1117,7 @@ fn decode_text(
         gpu_hal::hal_profile_set_enabled(false);
     }
     let layer_load_elapsed = layer_load_start.elapsed();
-    let _moe_expert_arena = loaded_layers.moe_expert_arena;
-    let mut _moe_expert_residency = loaded_layers.moe_expert_residency;
-    let virtual_kv_stats = virtual_kv_stats_for_layers(&layers);
+    let virtual_kv_stats = virtual_kv_stats_for_layers(loaded_layers.layers());
     print_virtual_kv_stats_if_active(virtual_kv_stats, kv_fp8, backend, ordinal);
     progress(
         "layer_load",
@@ -1126,7 +1144,7 @@ fn decode_text(
         batched_spec_verify,
         persistent_decode,
         max_speculative_tokens,
-        &mut layers,
+        &mut loaded_layers,
     )?;
     let session_elapsed = session_start.elapsed();
     progress(
@@ -1145,7 +1163,6 @@ fn decode_text(
         mut mtp_chain_scratch,
         embed_w_buf,
         mut linear_attn_snapshot,
-        mut persistent_scratch,
     } = session;
 
     print_decode_stream_start(tokenizer.as_ref(), &prompt_ids, max_new);
@@ -1195,7 +1212,7 @@ fn decode_text(
     }
     if kernel_ffi::qwen36_moe::qwen36_batched_prefill_feasibility_profile_enabled() {
         kernel_ffi::qwen36_moe::qwen36_batched_prefill_feasibility_profile_configure(
-            layers.len(),
+            loaded_layers.len(),
             geom.top_k as usize,
             geom.num_experts as usize,
             crate::qwen36_moe_cli::batched_prefill::PREFILL_CHUNK_SIZE_WMMA_FULL,
@@ -1271,13 +1288,15 @@ fn decode_text(
     if batched_prefill_disabled
         && dense_prefill_token_loop
         && keep_mask.is_none()
-        && _moe_expert_residency.is_none()
+        && !loaded_layers.has_sparse_expert_residency()
         && effective_prompt_len > 1
     {
-        if let (Some(scratch), Some(embed_w)) = (persistent_scratch.as_mut(), embed_w_buf.as_ref())
+        if let Some(embed_w) = embed_w_buf
+            .as_ref()
+            .filter(|_| loaded_layers.persistent_enabled())
         {
             let dense_prefill_count = effective_prompt_len - 1;
-            let t_prefill = scratch
+            let t_prefill = loaded_layers
                 .run_dense_prefill_tokens_from_device_embedding(
                     ordinal,
                     embed_w,
@@ -1311,9 +1330,7 @@ fn decode_text(
             &geom,
             &store,
             weight_prefix,
-            &mut layers,
-            persistent_scratch.as_mut(),
-            _moe_expert_residency.as_mut(),
+            &mut loaded_layers,
             &mut moe_runtime,
             &mut moe_routes,
             &mut loop_state,
@@ -1391,12 +1408,13 @@ fn decode_text(
             && dense_prefill_token_loop
             && !is_gen_step
             && keep_mask.is_none()
-            && _moe_expert_residency.is_none()
+            && !loaded_layers.has_sparse_expert_residency()
         {
-            if let (Some(scratch), Some(embed_w)) =
-                (persistent_scratch.as_mut(), embed_w_buf.as_ref())
+            if let Some(embed_w) = embed_w_buf
+                .as_ref()
+                .filter(|_| loaded_layers.persistent_enabled())
             {
-                let t_chain_step = scratch
+                let t_chain_step = loaded_layers
                     .run_from_device_embedding_no_download(
                         ordinal,
                         embed_w,
@@ -1514,9 +1532,7 @@ fn decode_text(
             ordinal,
             geom: &geom,
             store: &store,
-            layers: &mut layers,
-            persistent_scratch: persistent_scratch.as_mut(),
-            moe_expert_residency: _moe_expert_residency.as_mut(),
+            loaded_layers: &mut loaded_layers,
             moe_runtime: &mut moe_runtime,
             moe_routes: &mut moe_routes,
             initial_hidden: &initial_hidden,
@@ -1594,31 +1610,35 @@ fn decode_text(
             let h_base = outputs.final_hidden_bytes.clone();
             // Runs either batched or sequential speculative verify depending on
             // whether session setup allocated a linear-attn snapshot.
-            let result = run_speculative_extension(Qwen36SpeculativeExtension {
-                ordinal,
-                geom: &geom,
-                store: &store,
-                weight_prefix,
-                layers: &mut layers,
-                persistent_scratch: persistent_scratch.as_mut(),
-                mtp,
-                forward_scratch: fwd_scratch,
-                chain_scratch,
-                embed_w,
-                final_norm_w: &final_norm_w_buf,
-                lm_head_w: &lm_head_w_buf,
-                final_hidden: &mut final_hidden_buf,
-                logits: &mut logits_buf,
-                counter: &mut counter_buf,
-                linear_attn_snapshot: linear_attn_snapshot.as_mut(),
-                loop_state: &loop_state,
-                base_position: position,
-                h_base_in: &h_base,
-                first_token: next_token,
-                stage_timings: &mut stage_timings,
-                emit_stage_timings,
-                max_drafts: max_speculative_tokens,
-            })?;
+            let result = unsafe {
+                loaded_layers.with_experimental_parts(|layers, persistent_scratch| {
+                    run_speculative_extension(Qwen36SpeculativeExtension {
+                        ordinal,
+                        geom: &geom,
+                        store: &store,
+                        weight_prefix,
+                        layers,
+                        persistent_scratch,
+                        mtp,
+                        forward_scratch: fwd_scratch,
+                        chain_scratch,
+                        embed_w,
+                        final_norm_w: &final_norm_w_buf,
+                        lm_head_w: &lm_head_w_buf,
+                        final_hidden: &mut final_hidden_buf,
+                        logits: &mut logits_buf,
+                        counter: &mut counter_buf,
+                        linear_attn_snapshot: linear_attn_snapshot.as_mut(),
+                        loop_state: &loop_state,
+                        base_position: position,
+                        h_base_in: &h_base,
+                        first_token: next_token,
+                        stage_timings: &mut stage_timings,
+                        emit_stage_timings,
+                        max_drafts: max_speculative_tokens,
+                    })
+                })?
+            };
 
             if let Some(stats) = mtp_acceptance_stats.as_mut() {
                 stats.record(&result);
@@ -1646,7 +1666,7 @@ fn decode_text(
         eos_id,
         generation_wall_ms,
     );
-    if let Some(manager) = _moe_expert_residency.as_ref() {
+    if let Some(manager) = loaded_layers.sparse_expert_residency() {
         print_and_write_moe_residency_summary(
             manager,
             virtual_kv_stats,

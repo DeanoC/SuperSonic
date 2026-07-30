@@ -3,9 +3,10 @@ use gpu_hal::{GpuBuffer, ScalarType};
 use model_store::BakedStore;
 use qwen36_moe::config::TextConfig;
 
-use crate::qwen36_moe_cli::host::{host_load_bytes, load_lm_head_bf16};
 use crate::qwen36_moe_cli::layers::load_to_gpu;
-use crate::qwen36_moe_types::{LayerBuffers, MtpLayerBuffers, MultiLayerGeom};
+use crate::qwen36_moe_types::{MtpLayerBuffers, MultiLayerGeom};
+use supersonic_runtime::qwen36_moe::layers::LoadedQwen36Layers;
+use supersonic_runtime::qwen36_moe::weights::PreparedLmHeadSource;
 
 const MIB: f64 = (1024 * 1024) as f64;
 
@@ -20,7 +21,6 @@ pub(crate) struct Qwen36DecodeSession {
     pub(crate) mtp_chain_scratch: Option<crate::qwen36_moe_mtp::MtpChainScratch>,
     pub(crate) embed_w_buf: Option<GpuBuffer>,
     pub(crate) linear_attn_snapshot: Option<crate::qwen36_moe_state::LinearAttnSnapshot>,
-    pub(crate) persistent_scratch: Option<crate::qwen36_moe_persistent_decode::PersistentScratch>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -35,7 +35,7 @@ pub(crate) fn prepare_decode_session(
     batched_spec_verify: bool,
     persistent_decode: bool,
     max_speculative_tokens: usize,
-    layers: &mut Vec<LayerBuffers>,
+    loaded_layers: &mut LoadedQwen36Layers,
 ) -> Result<Qwen36DecodeSession> {
     let mtp_buffers_opt = if speculative_decode {
         match crate::qwen36_moe_cli::mtp_loader::load_mtp_buffers(store, ordinal, geom, kv_max_t)
@@ -66,10 +66,30 @@ pub(crate) fn prepare_decode_session(
         None
     };
 
-    let final_norm_bytes = host_load_bytes(store, &format!("{weight_prefix}.norm.weight"))
-        .context("load final norm")?;
-    let lm_head_bf16_bytes = load_lm_head_bf16(store, text_config, weight_prefix, geom)
-        .context("prepare lm_head BF16 buffer")?;
+    let prepared_lm_head = supersonic_runtime::qwen36_moe::weights::prepare_lm_head_bf16(
+        store,
+        text_config,
+        weight_prefix,
+        geom,
+    )
+    .context("prepare lm_head BF16 buffer")?;
+    match prepared_lm_head.source {
+        PreparedLmHeadSource::NativeInt4 => println!(
+            "  dequantized lm_head INT4 [{}, {}] to {:.1} MiB BF16",
+            geom.vocab,
+            geom.hidden,
+            prepared_lm_head.lm_head_bf16.len() as f64 / MIB,
+        ),
+        PreparedLmHeadSource::GgmlKBlock => println!(
+            "  dequantized lm_head GGML K-block [{}, {}] to {:.1} MiB BF16",
+            geom.vocab,
+            geom.hidden,
+            prepared_lm_head.lm_head_bf16.len() as f64 / MIB,
+        ),
+        PreparedLmHeadSource::TiedBf16 | PreparedLmHeadSource::StandaloneBf16 => {}
+    }
+    let final_norm_bytes = prepared_lm_head.final_norm_bf16;
+    let lm_head_bf16_bytes = prepared_lm_head.lm_head_bf16;
     println!(
         "  uploading lm_head BF16 ({:.1} MiB) and final norm ({:.1} KiB) to GPU…",
         lm_head_bf16_bytes.len() as f64 / MIB,
@@ -141,7 +161,7 @@ pub(crate) fn prepare_decode_session(
 
     let linear_attn_snapshot = if speculative_decode && batched_spec_verify {
         Some(
-            crate::qwen36_moe_state::save_linear_attn_state(ordinal, layers)
+            crate::qwen36_moe_state::save_linear_attn_state(ordinal, loaded_layers.layers())
                 .context("alloc linear-attn state snapshot for batched spec verify")?,
         )
     } else {
@@ -155,26 +175,26 @@ pub(crate) fn prepare_decode_session(
         );
     }
 
-    let persistent_scratch = if persistent_decode {
-        let scratch =
-            crate::qwen36_moe_persistent_decode::PersistentScratch::new(ordinal, geom, layers)
-                .context("alloc PersistentScratch for --persistent-decode")?;
+    if persistent_decode {
+        loaded_layers
+            .enable_persistent(ordinal, geom)
+            .context("alloc PersistentScratch for --persistent-decode")?;
+        let stats = loaded_layers
+            .persistent_scratch_stats()
+            .expect("persistent scratch was just enabled");
         println!(
             "  --persistent-decode: megakernel scratch allocated \
              (descs={}KiB, workspace={}KiB, ping/pong={}KiB){}",
-            scratch.layer_descs_dev.len_bytes() / 1024,
-            scratch.workspace.len_bytes() / 1024,
-            scratch.hidden_ping.len_bytes() / 1024,
+            stats.descriptor_bytes / 1024,
+            stats.workspace_bytes / 1024,
+            stats.hidden_bytes / 1024,
             if speculative_decode {
                 " — also routes spec-verify chains through persistent"
             } else {
                 ""
             },
         );
-        Some(scratch)
-    } else {
-        None
-    };
+    }
 
     Ok(Qwen36DecodeSession {
         final_norm_w_buf,
@@ -187,6 +207,5 @@ pub(crate) fn prepare_decode_session(
         mtp_chain_scratch,
         embed_w_buf,
         linear_attn_snapshot,
-        persistent_scratch,
     })
 }

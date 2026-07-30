@@ -57,11 +57,12 @@ pub use kernel_ffi::qwen36_moe::{
 
 use crate::qwen36_moe::chain::{run_chain_step, Qwen36ChainStep};
 use crate::qwen36_moe::decode::{
-    ffn_output_elems, ffn_workspace_floats, full_attn_output_elems,
-    full_attn_score_workspace_floats, full_attn_workspace_floats, linear_attn_workspace_floats,
-    reset_sync_buf,
+    execution_option, execution_option_os, ffn_output_elems, ffn_workspace_floats,
+    full_attn_output_elems, full_attn_score_workspace_floats, full_attn_workspace_floats,
+    linear_attn_workspace_floats, reset_sync_buf,
 };
-use crate::qwen36_moe::persistent_decode::PersistentScratch;
+use crate::qwen36_moe::layer_loader::{classify_layer_weight_encoding, Qwen36LayerWeightEncoding};
+use crate::qwen36_moe::layers::LoadedQwen36Layers;
 use crate::qwen36_moe::types::{
     AttnLayerBuffers, FullAttnInt4Sidecars, FullAttnKvCache, LayerBuffers, MultiLayerGeom,
     PositionPair,
@@ -119,20 +120,105 @@ pub struct PrefillTokenTimings {
     pub chain: Duration,
 }
 
-pub type PrefillTokenCallback<'a> = dyn FnMut(
-        &mut [LayerBuffers],
-        Option<&mut PersistentScratch>,
-        usize,
-        u32,
-        PositionPair,
-    ) -> Result<PrefillTokenTimings>
+/// Per-token hook for the non-batched fallback only.
+///
+/// Runtime invokes this exactly once per token when mode, KV, residency, or
+/// explicit execution options make the optimized batched path ineligible. It
+/// is never invoked for tokens processed by the optimized batched kernels.
+pub type PrefillFallbackTokenCallback<'a> = dyn FnMut(&mut LoadedQwen36Layers, usize, u32, PositionPair) -> Result<PrefillTokenTimings>
     + 'a;
 
+/// Compatibility alias retained for existing runner adapters.
+pub type PrefillTokenCallback<'a> = PrefillFallbackTokenCallback<'a>;
+
+/// Invoked once after every completed chunk on both optimized and fallback
+/// paths. `completed` and `timings.tokens` include the just-finished chunk.
 pub type PrefillProgressCallback<'a> =
     dyn FnMut(&BatchedPrefillTimings, usize, usize, Duration) + 'a;
 
+fn optimized_prefill_supports_encoding(encoding: Qwen36LayerWeightEncoding) -> bool {
+    encoding == Qwen36LayerWeightEncoding::NativeInt4
+}
+
+fn full_attn_kv_capacities(layers: &[LayerBuffers]) -> Vec<(usize, usize)> {
+    layers
+        .iter()
+        .enumerate()
+        .filter_map(|(layer_idx, layer)| match &layer.attn {
+            AttnLayerBuffers::Full {
+                kv_cache: Some(cache),
+                ..
+            } => Some((layer_idx, cache.kv_max_t.max(0) as usize)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn validate_prefill_position_plan(
+    positions: &[PositionPair],
+    batched: bool,
+    kv_capacities: &[(usize, usize)],
+) -> Result<()> {
+    for (step, position) in positions.iter().copied().enumerate() {
+        if position.rope < 0 || position.cache < 0 {
+            return Err(anyhow!(
+                "Qwen3.6 prefill positions must be non-negative: step {step} has \
+                 rope={} cache={}",
+                position.rope,
+                position.cache
+            ));
+        }
+        let cache = position.cache as usize;
+        for &(layer_idx, capacity) in kv_capacities {
+            if cache >= capacity {
+                return Err(anyhow!(
+                    "Qwen3.6 prefill KV capacity exceeded at layer {layer_idx}: \
+                     step {step} requests cache slot {cache}, capacity is {capacity}"
+                ));
+            }
+        }
+    }
+
+    if !batched {
+        return Ok(());
+    }
+    let mut chunk_start = 0usize;
+    while chunk_start < positions.len() {
+        let n = pick_chunk_size(positions.len() - chunk_start);
+        let chunk = &positions[chunk_start..chunk_start + n];
+        let cache_start = chunk[0].cache;
+        if chunk.iter().all(|position| position.is_dense()) {
+            let rope_start = chunk[0].rope;
+            for (offset, position) in chunk.iter().copied().enumerate() {
+                let expected = rope_start + offset as i32;
+                if position.rope != expected {
+                    return Err(anyhow!(
+                        "Qwen3.6 batched prefill requires contiguous RoPE positions when no \
+                         indirect IDs are used: step {} has rope {}, expected {expected}",
+                        chunk_start + offset,
+                        position.rope
+                    ));
+                }
+            }
+        }
+        for (offset, position) in chunk.iter().copied().enumerate() {
+            let expected = cache_start + offset as i32;
+            if position.cache != expected {
+                return Err(anyhow!(
+                    "Qwen3.6 batched prefill requires contiguous cache positions within each \
+                     chunk: step {} has cache {}, expected {expected}",
+                    chunk_start + offset,
+                    position.cache
+                ));
+            }
+        }
+        chunk_start += n;
+    }
+    Ok(())
+}
+
 fn metal_profile_enabled() -> bool {
-    std::env::var_os("SUPERSONIC_METAL_PROFILE").is_some()
+    execution_option_os("SUPERSONIC_METAL_PROFILE").is_some()
 }
 
 /// CPU-built RoPE cos/sin tables uploaded once per orchestrator invocation.
@@ -299,11 +385,9 @@ pub fn run_batched_prefill(
     geom: &MultiLayerGeom,
     store: &BakedStore,
     weight_prefix: &str,
-    layers: &mut [LayerBuffers],
-    persistent_scratch: Option<&mut PersistentScratch>,
+    loaded_layers: &mut LoadedQwen36Layers,
     tokens: &[u32],
     positions: &[PositionPair],
-    sparse_residency_active: bool,
     accurate_stage_timings: bool,
     token_callback: Option<&mut PrefillTokenCallback<'_>>,
     progress_callback: Option<&mut PrefillProgressCallback<'_>>,
@@ -321,21 +405,32 @@ pub fn run_batched_prefill(
         return Ok(timings);
     }
 
-    let supports_batched = supports_batched_path(layers, sparse_residency_active);
+    let batched_attn_enabled = execution_option("SUPERSONIC_QWEN36_MOE_BATCHED_ATTN")
+        .map(|value| value != "0")
+        .unwrap_or(true);
+    let sparse_residency_active = loaded_layers.has_sparse_expert_residency();
+    let supports_batched = batched_attn_enabled
+        && supports_batched_path(loaded_layers.layers(), sparse_residency_active)?;
+    validate_prefill_position_plan(
+        positions,
+        supports_batched,
+        &full_attn_kv_capacities(loaded_layers.layers()),
+    )?;
     if !supports_batched {
         return run_pertoken_chunked(
             ordinal,
             geom,
             store,
             weight_prefix,
-            layers,
-            persistent_scratch,
+            loaded_layers,
             tokens,
             positions,
             accurate_stage_timings,
             token_callback,
+            progress_callback,
         );
     }
+    let (layers, _, _) = loaded_layers.execution_parts();
 
     let max_kv_t = layers
         .iter()
@@ -364,8 +459,6 @@ pub fn run_batched_prefill(
     let mut scratch = FullAttnBatchScratch::alloc(ordinal, geom, scratch_n, max_kv_t)
         .context("alloc full-attn batched scratch (max chunk)")?;
 
-    let mut persistent_scratch = persistent_scratch;
-    let mut token_callback = token_callback;
     let mut progress_callback = progress_callback;
     let prefill_start = Instant::now();
 
@@ -385,11 +478,9 @@ pub fn run_batched_prefill(
             store,
             weight_prefix,
             layers,
-            persistent_scratch.as_deref_mut(),
             tokens,
             positions,
             accurate_stage_timings,
-            token_callback.as_deref_mut(),
             step,
             n,
             &rotary,
@@ -420,9 +511,14 @@ pub fn run_batched_prefill(
 ///   tensors upfront; per-step expert prefetch must run via `run_chain_step`
 ///   before FFN compute to page in any non-resident routed experts. The
 ///   batched FFN bypasses that hook, so it would read non-resident memory.
-fn supports_batched_path(layers: &[LayerBuffers], sparse_residency_active: bool) -> bool {
+fn supports_batched_path(layers: &[LayerBuffers], sparse_residency_active: bool) -> Result<bool> {
     if sparse_residency_active {
-        return false;
+        return Ok(false);
+    }
+    let encoding = classify_layer_weight_encoding(layers)
+        .context("classify Qwen3.6 prefill layer weight encoding")?;
+    if !optimized_prefill_supports_encoding(encoding) {
+        return Ok(false);
     }
     for l in layers {
         if let AttnLayerBuffers::Full {
@@ -430,18 +526,14 @@ fn supports_batched_path(layers: &[LayerBuffers], sparse_residency_active: bool)
         } = &l.attn
         {
             if c.kv_scale_k.is_some() || c.kv_scale_v.is_some() {
-                return false;
+                return Ok(false);
             }
         }
-        if let Some(int4) = &l.ffn.int4 {
-            // Negative group_size = FP8 weight sidecar mode (see
-            // kernels/qwen36_moe_persistent/ffn_phase.cuh:109).
-            if int4.group_size < 0 {
-                return false;
-            }
+        if matches!(&l.attn, AttnLayerBuffers::Full { kv_cache: None, .. }) {
+            return Ok(false);
         }
     }
-    true
+    Ok(true)
 }
 
 /// Per-chunk driver. Stages N tokens onto GPU as `[N, hidden]` BF16, then
@@ -460,53 +552,17 @@ fn process_chunk_batched(
     store: &BakedStore,
     weight_prefix: &str,
     layers: &mut [LayerBuffers],
-    mut persistent_scratch: Option<&mut PersistentScratch>,
     tokens: &[u32],
     positions: &[PositionPair],
     accurate_stage_timings: bool,
-    mut token_callback: Option<&mut PrefillTokenCallback<'_>>,
     chunk_start: usize,
     n: usize,
     rotary: &RotaryTables,
     scratch: &mut FullAttnBatchScratch,
     timings: &mut BatchedPrefillTimings,
 ) -> Result<()> {
-    // M13: batched M3 attention is the DEFAULT inside the orchestrator.
-    // Set SUPERSONIC_QWEN36_MOE_BATCHED_ATTN=0 to fall back to the
-    // per-token chain step inside the chunk (kept as a bisect/escape
-    // hatch — the orchestrator still runs but each chunk's tokens go
-    // through the existing per-token persistent megakernel one at a
-    // time, so the chunking adds no perf benefit, just structure).
-    let batched_attn_disabled = std::env::var("SUPERSONIC_QWEN36_MOE_BATCHED_ATTN")
-        .map(|v| v == "0")
-        .unwrap_or(false);
-
-    if batched_attn_disabled {
-        let _ = (rotary, scratch);
-        for inner in 0..n {
-            let step = chunk_start + inner;
-            let token_timings = run_prefill_token(
-                ordinal,
-                geom,
-                store,
-                weight_prefix,
-                layers,
-                persistent_scratch.as_deref_mut(),
-                step,
-                tokens[step],
-                positions[step],
-                accurate_stage_timings,
-                token_callback.as_deref_mut(),
-            )?;
-            timings.embed_total += token_timings.embed;
-            timings.chain_total += token_timings.chain;
-            timings.tokens += 1;
-        }
-        return Ok(());
-    }
-
     // Batched-attn enabled path: stage chunk on GPU and drive per-layer.
-    let _ = (persistent_scratch, token_callback, accurate_stage_timings);
+    let _ = accurate_stage_timings;
 
     // 1. Stage the N chunk tokens onto the GPU.
     let hidden = geom.hidden as usize;
@@ -547,7 +603,7 @@ fn process_chunk_batched(
     // M13: grouped MoE FFN is the DEFAULT once we're on the batched-attn
     // path. Set SUPERSONIC_QWEN36_MOE_GROUPED_FFN=0 to fall back to per-token
     // FFN inside the chunk while keeping the batched attention.
-    let grouped_ffn_disabled = std::env::var("SUPERSONIC_QWEN36_MOE_GROUPED_FFN")
+    let grouped_ffn_disabled = execution_option("SUPERSONIC_QWEN36_MOE_GROUPED_FFN")
         .map(|v| v == "0")
         .unwrap_or(false);
     let use_grouped_ffn = !grouped_ffn_disabled;
@@ -733,20 +789,21 @@ fn run_pertoken_chunked(
     geom: &MultiLayerGeom,
     store: &BakedStore,
     weight_prefix: &str,
-    layers: &mut [LayerBuffers],
-    persistent_scratch: Option<&mut PersistentScratch>,
+    loaded_layers: &mut LoadedQwen36Layers,
     tokens: &[u32],
     positions: &[PositionPair],
     accurate_stage_timings: bool,
     token_callback: Option<&mut PrefillTokenCallback<'_>>,
+    progress_callback: Option<&mut PrefillProgressCallback<'_>>,
 ) -> Result<BatchedPrefillTimings> {
     let prefill_count = tokens.len();
     let mut timings = BatchedPrefillTimings::default();
     if prefill_count == 0 {
         return Ok(timings);
     }
-    let mut persistent_scratch = persistent_scratch;
     let mut token_callback = token_callback;
+    let mut progress_callback = progress_callback;
+    let prefill_start = Instant::now();
 
     let mut step = 0usize;
     while step < prefill_count {
@@ -760,8 +817,7 @@ fn run_pertoken_chunked(
                 geom,
                 store,
                 weight_prefix,
-                layers,
-                persistent_scratch.as_deref_mut(),
+                loaded_layers,
                 step,
                 tokens[step],
                 positions[step],
@@ -773,6 +829,9 @@ fn run_pertoken_chunked(
             timings.tokens += 1;
             step += 1;
         }
+        if let Some(callback) = progress_callback.as_deref_mut() {
+            callback(&timings, prefill_count, step, prefill_start.elapsed());
+        }
     }
     Ok(timings)
 }
@@ -783,8 +842,7 @@ fn run_prefill_token(
     geom: &MultiLayerGeom,
     store: &BakedStore,
     weight_prefix: &str,
-    layers: &mut [LayerBuffers],
-    persistent_scratch: Option<&mut PersistentScratch>,
+    loaded_layers: &mut LoadedQwen36Layers,
     step: usize,
     token: u32,
     position: PositionPair,
@@ -792,7 +850,7 @@ fn run_prefill_token(
     token_callback: Option<&mut PrefillTokenCallback<'_>>,
 ) -> Result<PrefillTokenTimings> {
     if let Some(callback) = token_callback {
-        return callback(layers, persistent_scratch, step, token, position);
+        return callback(loaded_layers, step, token, position);
     }
 
     let embed_start = Instant::now();
@@ -804,8 +862,7 @@ fn run_prefill_token(
     run_chain_step(Qwen36ChainStep {
         ordinal,
         geom,
-        layers,
-        persistent_scratch,
+        loaded_layers,
         initial_hidden: &initial_hidden,
         position,
         step,
@@ -952,7 +1009,7 @@ fn process_full_attn_layer_batched(
     // 3. Split q+gate. qg_raw layout per row: [h0_q[hd], h0_gate[hd],
     //    h1_q[hd], h1_gate[hd], ...] — interleaved per-head halves.
     let use_metal_split_qgate = chunk_hidden.backend() == Backend::Metal
-        && std::env::var("SUPERSONIC_QWEN36_MOE_METAL_SPLIT_QGATE")
+        && execution_option("SUPERSONIC_QWEN36_MOE_METAL_SPLIT_QGATE")
             .map(|v| v != "0")
             .unwrap_or(false);
     if use_metal_split_qgate {
@@ -1087,14 +1144,14 @@ fn process_full_attn_layer_batched(
 
     let kv_len = past_len + n;
     let metal_native_enabled = chunk_hidden.backend() == Backend::Metal
-        && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none();
+        && execution_option_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none();
     let use_metal_tmajor_full_attn = metal_native_enabled
-        && std::env::var("SUPERSONIC_QWEN36_MOE_METAL_FULL_ATTN_TMAJOR")
+        && execution_option("SUPERSONIC_QWEN36_MOE_METAL_FULL_ATTN_TMAJOR")
             .map(|v| v != "0")
             .unwrap_or(false);
     let use_metal_vec_full_attn = metal_native_enabled
         && !use_metal_tmajor_full_attn
-        && std::env::var("SUPERSONIC_QWEN36_MOE_METAL_FULL_ATTN_VEC")
+        && execution_option("SUPERSONIC_QWEN36_MOE_METAL_FULL_ATTN_VEC")
             .map(|v| v != "0")
             .unwrap_or(true);
 
@@ -1352,9 +1409,9 @@ fn process_linear_attn_layer_pertoken(
     };
     let use_metal_direct_rows = chunk_hidden.backend() == Backend::Metal
         && int4_ptrs.group_size == 128
-        && std::env::var_os("SUPERSONIC_METAL_PROFILE").is_none()
-        && std::env::var_os("SUPERSONIC_METAL_DISABLE_BATCH").is_none()
-        && std::env::var("SUPERSONIC_QWEN36_MOE_METAL_LINEAR_PREFILL_DIRECT")
+        && execution_option_os("SUPERSONIC_METAL_PROFILE").is_none()
+        && execution_option_os("SUPERSONIC_METAL_DISABLE_BATCH").is_none()
+        && execution_option("SUPERSONIC_QWEN36_MOE_METAL_LINEAR_PREFILL_DIRECT")
             .map(|v| v != "0")
             .unwrap_or(true);
     let _metal_batch = if use_metal_direct_rows {
@@ -1897,18 +1954,18 @@ fn process_ffn_batched_grouped(
     //    num_experts=256 this is 64*256*2 = 32 KiB D2H + 64*8*4 + 64*8*2 =
     //    ~2 KiB H2D per layer per chunk — negligible vs the matmul cost.
     //    (TODO: GPU softmax/top-K fusion as a future M12+ perf opportunity.)
-    let explicit_route_profile = std::env::var_os("SUPERSONIC_QWEN36_ROUTE_PROFILE").is_some()
-        || std::env::var_os("SUPERSONIC_QWEN36_ROUTE_PROFILE_DUMP_CALLS").is_some()
-        || std::env::var_os("SUPERSONIC_QWEN36_ROUTE_PROFILE_DUMP_TOPN_LAYERS").is_some()
-        || std::env::var_os("SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL_FEASIBILITY").is_some()
-        || std::env::var_os("SUPERSONIC_QWEN36_EXPERT_RESIDENCY_PROFILE").is_some()
-        || std::env::var_os("SUPERSONIC_QWEN36_PACK_CACHE_PROFILE").is_some();
+    let explicit_route_profile = execution_option_os("SUPERSONIC_QWEN36_ROUTE_PROFILE").is_some()
+        || execution_option_os("SUPERSONIC_QWEN36_ROUTE_PROFILE_DUMP_CALLS").is_some()
+        || execution_option_os("SUPERSONIC_QWEN36_ROUTE_PROFILE_DUMP_TOPN_LAYERS").is_some()
+        || execution_option_os("SUPERSONIC_QWEN36_MOE_BATCHED_PREFILL_FEASIBILITY").is_some()
+        || execution_option_os("SUPERSONIC_QWEN36_EXPERT_RESIDENCY_PROFILE").is_some()
+        || execution_option_os("SUPERSONIC_QWEN36_PACK_CACHE_PROFILE").is_some();
     let use_metal_router_topk = scratch.router_logits_bf16.backend() == Backend::Metal
-        && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
+        && execution_option_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
         && !explicit_route_profile
-        && std::env::var_os("SUPERSONIC_METAL_PROFILE").is_none()
-        && std::env::var_os("SUPERSONIC_METAL_DISABLE_BATCH").is_none()
-        && std::env::var("SUPERSONIC_QWEN36_MOE_METAL_ROUTER_TOPK")
+        && execution_option_os("SUPERSONIC_METAL_PROFILE").is_none()
+        && execution_option_os("SUPERSONIC_METAL_DISABLE_BATCH").is_none()
+        && execution_option("SUPERSONIC_QWEN36_MOE_METAL_ROUTER_TOPK")
             .map(|v| v != "0")
             .unwrap_or(false);
     let metal_router_expert_batch = if use_metal_router_topk {
@@ -2161,8 +2218,8 @@ fn process_ffn_batched_grouped(
     // expert tail in one command buffer by default. Profile runs split at
     // phase labels so the report can still attribute the work.
     let use_metal_shared_expert_batch = scratch.h_norm.backend() == Backend::Metal
-        && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
-        && std::env::var("SUPERSONIC_QWEN36_MOE_METAL_SHARED_EXPERT_BATCH")
+        && execution_option_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
+        && execution_option("SUPERSONIC_QWEN36_MOE_METAL_SHARED_EXPERT_BATCH")
             .map(|v| v != "0")
             .unwrap_or(true);
     let metal_shared_profile = use_metal_shared_expert_batch && metal_profile_enabled();
@@ -2311,9 +2368,9 @@ fn process_ffn_batched_grouped(
     // two BF16 rounding points, but the current M5 Max smoke was slower than
     // the existing two-add sequence.
     let use_metal_fused_residual = chunk_hidden.backend() == Backend::Metal
-        && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
+        && execution_option_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
         && use_metal_shared_expert_batch
-        && std::env::var("SUPERSONIC_QWEN36_MOE_METAL_FUSED_FFN_RESIDUAL")
+        && execution_option("SUPERSONIC_QWEN36_MOE_METAL_FUSED_FFN_RESIDUAL")
             .map(|v| v != "0")
             .unwrap_or(true);
     if use_metal_fused_residual {
@@ -2426,4 +2483,192 @@ fn expand_scalar_gate_bf16(
     )
     .context("h2d expanded gate")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod orchestration_tests {
+    use super::*;
+    use crate::qwen36_moe::layer_loader::Qwen36WeightMode;
+    use model_store::manifest::{Manifest, FORMAT_VERSION};
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static TEST_DIR_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new() -> Self {
+            let suffix = TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "supersonic-runtime-qwen36-prefill-{}-{suffix}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&path).expect("create prefill test directory");
+            std::fs::write(model_store::weights_bin_path(&path), [0u8])
+                .expect("write synthetic weights");
+            let manifest = Manifest {
+                format_version: FORMAT_VERSION,
+                converter_version: 1,
+                model_family: "test-qwen36-prefill".to_string(),
+                quant_profile: None,
+                source_format: None,
+                source_quant: None,
+                quant_method: None,
+                tensors: Vec::new(),
+            };
+            std::fs::write(
+                model_store::manifest_path(&path),
+                serde_json::to_string(&manifest).expect("serialize synthetic manifest"),
+            )
+            .expect("write synthetic manifest");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn empty_geom() -> MultiLayerGeom {
+        MultiLayerGeom {
+            hidden: 1,
+            vocab: 1,
+            num_layers: 0,
+            rms_norm_eps: 1e-6,
+            num_attention_heads: 1,
+            num_kv_heads: 1,
+            head_dim: 1,
+            rotary_dim: 1,
+            rope_theta: 10_000.0,
+            num_k_heads: 1,
+            num_v_heads: 1,
+            head_k_dim: 1,
+            head_v_dim: 1,
+            conv_kernel_dim: 2,
+            num_experts: 1,
+            moe_intermediate: 1,
+            shared_intermediate: 1,
+            top_k: 1,
+        }
+    }
+
+    #[test]
+    fn optimized_prefill_mode_requires_complete_native_int4() {
+        assert!(optimized_prefill_supports_encoding(
+            Qwen36LayerWeightEncoding::NativeInt4
+        ));
+        assert!(!optimized_prefill_supports_encoding(
+            Qwen36LayerWeightEncoding::Bf16
+        ));
+        assert!(!optimized_prefill_supports_encoding(
+            Qwen36LayerWeightEncoding::GgmlKBlock
+        ));
+        assert!(!optimized_prefill_supports_encoding(
+            Qwen36LayerWeightEncoding::Fp8
+        ));
+    }
+
+    #[test]
+    fn batched_positions_reject_noncontiguous_dense_timeline() {
+        let err = validate_prefill_position_plan(
+            &[PositionPair::dense(3), PositionPair::dense(7)],
+            true,
+            &[(0, 16)],
+        )
+        .expect_err("noncontiguous dense positions must fail");
+        assert!(err.to_string().contains("contiguous RoPE"));
+    }
+
+    #[test]
+    fn batched_positions_reject_noncontiguous_cache_timeline() {
+        let err = validate_prefill_position_plan(
+            &[PositionPair::split(3, 0), PositionPair::split(7, 2)],
+            true,
+            &[(0, 16)],
+        )
+        .expect_err("noncontiguous cache positions must fail");
+        assert!(err.to_string().contains("contiguous cache"));
+    }
+
+    #[test]
+    fn positions_reject_negative_values_before_execution() {
+        for position in [PositionPair::split(-1, 0), PositionPair::split(0, -1)] {
+            let err = validate_prefill_position_plan(&[position], false, &[(0, 16)])
+                .expect_err("negative position must fail");
+            assert!(err.to_string().contains("non-negative"));
+        }
+    }
+
+    #[test]
+    fn positions_reject_writes_beyond_every_kv_capacity() {
+        let err = validate_prefill_position_plan(
+            &[PositionPair::dense(3), PositionPair::dense(4)],
+            true,
+            &[(0, 4), (1, 8)],
+        )
+        .expect_err("first layer KV cache is too small");
+        assert!(err.to_string().contains("KV capacity"));
+        assert!(err.to_string().contains("layer 0"));
+    }
+
+    #[test]
+    fn indirect_rope_ids_allow_split_rope_with_contiguous_cache() {
+        validate_prefill_position_plan(
+            &[PositionPair::split(3, 0), PositionPair::split(7, 1)],
+            true,
+            &[(0, 2)],
+        )
+        .expect("indirect RoPE IDs support noncontiguous absolute positions");
+    }
+
+    #[test]
+    fn public_prefill_fallback_reports_every_token_and_chunk() {
+        let tmp = TestDir::new();
+        let store = BakedStore::open(tmp.path()).expect("open synthetic store");
+        let tokens = vec![7u32; 1025];
+        let positions = (0..1025)
+            .map(|position| PositionPair::dense(position as i32))
+            .collect::<Vec<_>>();
+        let mut loaded = LoadedQwen36Layers::dense(Vec::new(), Qwen36WeightMode::Bf16);
+        let mut token_calls = 0usize;
+        let mut progress_calls = 0usize;
+        let mut callback = |_loaded: &mut LoadedQwen36Layers, step, token, position| {
+            assert_eq!(step, token_calls);
+            assert_eq!(token, 7);
+            assert_eq!(position, PositionPair::dense(step as i32));
+            token_calls += 1;
+            Ok(PrefillTokenTimings::default())
+        };
+        let mut progress = |timings: &BatchedPrefillTimings, total, completed, _elapsed| {
+            progress_calls += 1;
+            assert_eq!(total, 1025);
+            assert_eq!(timings.tokens, completed);
+        };
+
+        let timings = run_batched_prefill(
+            0,
+            &empty_geom(),
+            &store,
+            "model.language_model",
+            &mut loaded,
+            &tokens,
+            &positions,
+            false,
+            Some(&mut callback),
+            Some(&mut progress),
+        )
+        .expect("fallback prefill orchestration");
+
+        assert_eq!(timings.chunks, 3);
+        assert_eq!(timings.tokens, 1025);
+        assert_eq!(progress_calls, 3);
+        assert_eq!(token_calls, 1025);
+    }
 }

@@ -8,7 +8,11 @@ use model_store::manifest::LayoutTag;
 use model_store::{BakedStore, TensorStorageExtent, VirtualArenaTransferBackend};
 use qwen36_moe::config::TextConfig;
 
-use crate::qwen36_moe::residency::{MoeExpertProjection, MoeExpertResidencyManager};
+use crate::qwen36_moe::decode::{emit_runtime_diagnostic, execution_option};
+use crate::qwen36_moe::layers::LoadedQwen36Layers;
+use crate::qwen36_moe::residency::{
+    MoeExpertProjection, MoeExpertResidencyConfig, MoeExpertResidencyManager,
+};
 use crate::qwen36_moe::types::{
     AttnLayerBuffers, FfnInt4Sidecars, FfnLayerBuffers, FullAttnInt4Sidecars, FullAttnKvCache,
     LayerBuffers, LinearAttnInt4Sidecars, MultiLayerGeom, ResidentWeight,
@@ -26,10 +30,10 @@ pub fn load_to_gpu(store: &BakedStore, ordinal: usize, name: &str) -> Result<Gpu
                 match store.load_to_gpu_registered_mmap(resolved.as_ref(), ordinal) {
                     Ok(buffer) => return Ok(buffer),
                     Err(err) => {
-                        eprintln!(
+                        emit_runtime_diagnostic(format!(
                             "[flm] registered mmap upload failed for {}; falling back to pageable upload: {err}",
                             resolved.as_ref()
-                        );
+                        ));
                     }
                 }
             }
@@ -110,14 +114,14 @@ pub fn store_layout_qwen36<'a>(store: &'a BakedStore, name: &str) -> Option<&'a 
 const REGISTERED_MMAP_UPLOAD_MIN_BYTES: u64 = 256 * 1024 * 1024;
 
 fn registered_mmap_upload_enabled() -> bool {
-    registered_mmap_upload_env_value_enabled(
-        std::env::var("SUPERSONIC_FLM_REGISTERED_UPLOAD")
+    registered_mmap_upload_value_enabled(
+        execution_option("SUPERSONIC_FLM_REGISTERED_UPLOAD")
             .ok()
             .as_deref(),
     )
 }
 
-fn registered_mmap_upload_env_value_enabled(value: Option<&str>) -> bool {
+fn registered_mmap_upload_value_enabled(value: Option<&str>) -> bool {
     matches!(
         value.map(|value| value.to_ascii_lowercase()),
         Some(value) if matches!(value.as_str(), "1" | "true" | "on" | "yes")
@@ -204,15 +208,23 @@ mod tests {
 
     #[test]
     fn registered_mmap_upload_is_opt_in() {
-        assert!(!registered_mmap_upload_env_value_enabled(None));
-        assert!(registered_mmap_upload_env_value_enabled(Some("1")));
-        assert!(registered_mmap_upload_env_value_enabled(Some("true")));
-        assert!(registered_mmap_upload_env_value_enabled(Some("on")));
-        assert!(registered_mmap_upload_env_value_enabled(Some("yes")));
-        assert!(!registered_mmap_upload_env_value_enabled(Some("0")));
-        assert!(!registered_mmap_upload_env_value_enabled(Some("false")));
-        assert!(!registered_mmap_upload_env_value_enabled(Some("off")));
-        assert!(!registered_mmap_upload_env_value_enabled(Some("no")));
+        assert!(!registered_mmap_upload_value_enabled(None));
+        assert!(registered_mmap_upload_value_enabled(Some("1")));
+        assert!(registered_mmap_upload_value_enabled(Some("true")));
+        assert!(registered_mmap_upload_value_enabled(Some("on")));
+        assert!(registered_mmap_upload_value_enabled(Some("yes")));
+        assert!(!registered_mmap_upload_value_enabled(Some("0")));
+        assert!(!registered_mmap_upload_value_enabled(Some("false")));
+        assert!(!registered_mmap_upload_value_enabled(Some("off")));
+        assert!(!registered_mmap_upload_value_enabled(Some("no")));
+    }
+
+    #[test]
+    fn persistent_decode_support_is_limited_to_native_kernel_encodings() {
+        assert!(!Qwen36WeightMode::Bf16.supports_persistent_decode());
+        assert!(Qwen36WeightMode::Int4.supports_persistent_decode());
+        assert!(!Qwen36WeightMode::Q4Km.supports_persistent_decode());
+        assert!(Qwen36WeightMode::Fp8.supports_persistent_decode());
     }
 }
 
@@ -250,6 +262,26 @@ pub enum Qwen36WeightMode {
     Fp8,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct SparseExpertLoadOptions {
+    pub cap_experts: usize,
+    pub protected_experts: Option<usize>,
+    pub fixed_hot_experts: Option<usize>,
+    pub async_prefetch: bool,
+    pub async_staging_pages: usize,
+    pub prefetch_evict: bool,
+    pub transfer_backend: VirtualArenaTransferBackend,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum Qwen36LayerLoadStrategy {
+    Dense,
+    VirtualExperts {
+        transfer_backend: VirtualArenaTransferBackend,
+    },
+    SparseExperts(SparseExpertLoadOptions),
+}
+
 impl Qwen36WeightMode {
     pub fn is_int4(self) -> bool {
         matches!(self, Self::Int4 | Self::Q4Km)
@@ -263,6 +295,100 @@ impl Qwen36WeightMode {
             Self::Fp8 => "FP8 native",
         }
     }
+
+    pub fn supports_persistent_decode(self) -> bool {
+        matches!(self, Self::Int4 | Self::Fp8)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Qwen36LayerWeightEncoding {
+    Bf16,
+    NativeInt4,
+    GgmlKBlock,
+    Fp8,
+}
+
+fn classify_projection_set(
+    group_size: i32,
+    projection_types: &[i32],
+) -> Result<Qwen36LayerWeightEncoding> {
+    if group_size < 0 {
+        return Ok(Qwen36LayerWeightEncoding::Fp8);
+    }
+    if group_size != QWEN36_MOE_INT4_GROUP_SIZE {
+        return Err(anyhow!(
+            "unsupported Qwen3.6 low-bit group size {group_size}; expected {}",
+            QWEN36_MOE_INT4_GROUP_SIZE
+        ));
+    }
+    if projection_types
+        .iter()
+        .all(|&projection_type| projection_type == QWEN36_MOE_LOWBIT_NATIVE_INT4)
+    {
+        Ok(Qwen36LayerWeightEncoding::NativeInt4)
+    } else if projection_types.iter().all(|&projection_type| {
+        matches!(
+            projection_type,
+            QWEN36_MOE_LOWBIT_GGML_Q4_K | QWEN36_MOE_LOWBIT_GGML_Q5_K | QWEN36_MOE_LOWBIT_GGML_Q6_K
+        )
+    }) {
+        Ok(Qwen36LayerWeightEncoding::GgmlKBlock)
+    } else {
+        Err(anyhow!(
+            "mixed or unsupported Qwen3.6 projection types {projection_types:?}"
+        ))
+    }
+}
+
+pub fn classify_layer_weight_encoding(
+    layers: &[LayerBuffers],
+) -> Result<Qwen36LayerWeightEncoding> {
+    let mut stack_encoding = None;
+    for (layer_idx, layer) in layers.iter().enumerate() {
+        let attn_encoding = match &layer.attn {
+            AttnLayerBuffers::Full { int4: None, .. }
+            | AttnLayerBuffers::Linear { int4: None, .. } => Qwen36LayerWeightEncoding::Bf16,
+            AttnLayerBuffers::Full { int4: Some(s), .. } => classify_projection_set(
+                s.group_size,
+                &[s.q_proj_type, s.k_proj_type, s.v_proj_type, s.o_proj_type],
+            )?,
+            AttnLayerBuffers::Linear { int4: Some(s), .. } => classify_projection_set(
+                s.group_size,
+                &[s.in_proj_qkv_type, s.in_proj_z_type, s.out_proj_type],
+            )?,
+        };
+        let ffn_encoding = match &layer.ffn.int4 {
+            None => Qwen36LayerWeightEncoding::Bf16,
+            Some(s) => classify_projection_set(
+                s.group_size,
+                &[
+                    s.gate_up_proj_type,
+                    s.down_proj_type,
+                    s.shared_gate_proj_type,
+                    s.shared_up_proj_type,
+                    s.shared_down_proj_type,
+                ],
+            )?,
+        };
+        if attn_encoding != ffn_encoding {
+            return Err(anyhow!(
+                "Qwen3.6 layer {layer_idx} mixes {attn_encoding:?} attention with \
+                 {ffn_encoding:?} FFN weights"
+            ));
+        }
+        if let Some(expected) = stack_encoding {
+            if expected != attn_encoding {
+                return Err(anyhow!(
+                    "Qwen3.6 layer {layer_idx} uses {attn_encoding:?}, but earlier layers use \
+                     {expected:?}"
+                ));
+            }
+        } else {
+            stack_encoding = Some(attn_encoding);
+        }
+    }
+    Ok(stack_encoding.unwrap_or(Qwen36LayerWeightEncoding::Bf16))
 }
 
 fn ggml_lowbit_type_for_layout(store: &BakedStore, name: &str) -> Result<i32> {
@@ -984,7 +1110,7 @@ pub fn load_layer_buffers(
     Ok(LayerBuffers { attn, ffn })
 }
 
-pub fn load_all_layer_buffers(
+fn load_all_layer_buffers(
     store: &BakedStore,
     ordinal: usize,
     geom: &MultiLayerGeom,
@@ -1019,4 +1145,404 @@ pub fn load_all_layer_buffers(
         layers.push(layer);
     }
     Ok(layers)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn load_qwen36_layers(
+    store: &BakedStore,
+    ordinal: usize,
+    geom: &MultiLayerGeom,
+    text_config: &TextConfig,
+    weight_prefix: &str,
+    weight_mode: Qwen36WeightMode,
+    kv_max_t: usize,
+    kv_fp8: bool,
+    kv_vmm: bool,
+    strategy: Qwen36LayerLoadStrategy,
+) -> Result<LoadedQwen36Layers> {
+    match strategy {
+        Qwen36LayerLoadStrategy::Dense => {
+            let layers = load_all_layer_buffers(
+                store,
+                ordinal,
+                geom,
+                text_config,
+                weight_prefix,
+                weight_mode,
+                kv_max_t,
+                kv_fp8,
+                kv_vmm,
+                None,
+                None,
+                VirtualArenaTransferBackend::PageableH2d,
+            )
+            .context("load dense Qwen3.6 layers")?;
+            Ok(LoadedQwen36Layers::dense(layers, weight_mode))
+        }
+        Qwen36LayerLoadStrategy::VirtualExperts { transfer_backend } => {
+            let mut arena = BakedStore::virtual_weight_arena(ordinal);
+            let layers = load_all_layer_buffers(
+                store,
+                ordinal,
+                geom,
+                text_config,
+                weight_prefix,
+                weight_mode,
+                kv_max_t,
+                kv_fp8,
+                kv_vmm,
+                Some(&mut arena),
+                None,
+                transfer_backend,
+            )
+            .context("load Qwen3.6 routed experts into a virtual arena")?;
+            Ok(LoadedQwen36Layers::with_backing(
+                layers,
+                weight_mode,
+                Some(arena),
+                None,
+            ))
+        }
+        Qwen36LayerLoadStrategy::SparseExperts(options) => {
+            if options.cap_experts < geom.top_k as usize {
+                anyhow::bail!(
+                    "sparse expert capacity {} is smaller than model top_k={}",
+                    options.cap_experts,
+                    geom.top_k
+                );
+            }
+            let config =
+                MoeExpertResidencyConfig::new(1)?.with_prefetch_evict(options.prefetch_evict);
+            let mut manager = MoeExpertResidencyManager::new(ordinal, config)
+                .with_virtual_transfer_backend(options.transfer_backend);
+            let layers = load_all_layer_buffers(
+                store,
+                ordinal,
+                geom,
+                text_config,
+                weight_prefix,
+                weight_mode,
+                kv_max_t,
+                kv_fp8,
+                kv_vmm,
+                None,
+                Some(&mut manager),
+                options.transfer_backend,
+            )
+            .context("reserve Qwen3.6 routed experts for sparse residency")?;
+            let max_resident_pages = manager
+                .page_budget_for_routed_experts(options.cap_experts)
+                .context("derive sparse MoE page budget")?;
+            manager
+                .set_max_resident_pages(max_resident_pages)
+                .context("apply sparse MoE page budget")?;
+            if let Some(protected_experts) = options.protected_experts {
+                let pages = manager
+                    .page_budget_for_routed_experts(protected_experts)
+                    .context("derive sparse MoE protected page budget")?
+                    .min(max_resident_pages);
+                manager.set_max_protected_pages(pages);
+            }
+            if let Some(fixed_hot_experts) = options.fixed_hot_experts {
+                let pages = manager
+                    .page_budget_for_routed_experts(fixed_hot_experts)
+                    .context("derive sparse MoE fixed-hot page budget")?
+                    .min(max_resident_pages);
+                manager.set_max_fixed_hot_pages(pages);
+            }
+            if options.async_prefetch
+                && options.transfer_backend != VirtualArenaTransferBackend::GpuDirectStorage
+            {
+                manager
+                    .enable_async_prefetch(options.async_staging_pages)
+                    .context("enable sparse MoE async prefetch")?;
+            }
+            Ok(LoadedQwen36Layers::with_backing(
+                layers,
+                weight_mode,
+                None,
+                Some(manager),
+            ))
+        }
+    }
+}
+
+#[cfg(test)]
+mod direct_load_tests {
+    use super::*;
+    use model_store::manifest::{Manifest, TensorMeta, FORMAT_VERSION};
+    use qwen36_moe::config::Activation;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static TEST_DIR_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new(mode: Qwen36WeightMode) -> Self {
+            let suffix = TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "supersonic-runtime-qwen36-direct-load-{}-{suffix}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&path).expect("create direct-load test directory");
+            let (weights, tensors) = synthetic_layer_tensors(mode);
+            std::fs::write(model_store::weights_bin_path(&path), weights)
+                .expect("write synthetic weights");
+            let manifest = Manifest {
+                format_version: FORMAT_VERSION,
+                converter_version: 1,
+                model_family: "test-qwen36-direct-load".to_string(),
+                quant_profile: None,
+                source_format: None,
+                source_quant: None,
+                quant_method: None,
+                tensors,
+            };
+            std::fs::write(
+                model_store::manifest_path(&path),
+                serde_json::to_string(&manifest).expect("serialize synthetic manifest"),
+            )
+            .expect("write synthetic manifest");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn text_config() -> TextConfig {
+        TextConfig {
+            vocab_size: 128,
+            hidden_size: 128,
+            num_hidden_layers: 1,
+            num_attention_heads: 1,
+            num_key_value_heads: 1,
+            max_position_embeddings: 16,
+            rms_norm_eps: 1e-6,
+            hidden_act: Activation::Silu,
+            tie_word_embeddings: false,
+            eos_token_id: None,
+            bos_token_id: None,
+            head_dim: 128,
+            full_attention_interval: 1,
+            attn_output_gate: true,
+            linear_conv_kernel_dim: 2,
+            linear_key_head_dim: 128,
+            linear_value_head_dim: 128,
+            linear_num_key_heads: 1,
+            linear_num_value_heads: 1,
+            layer_types: vec!["full_attention".to_string()],
+            rope_parameters: None,
+            num_experts: 1,
+            num_experts_per_tok: 1,
+            moe_intermediate_size: 128,
+            shared_expert_intermediate_size: 128,
+            norm_topk_prob: true,
+            router_aux_loss_coef: 0.001,
+            mlp_only_layers: Vec::new(),
+            decoder_sparse_step: None,
+        }
+    }
+
+    fn geom() -> MultiLayerGeom {
+        MultiLayerGeom {
+            hidden: 128,
+            vocab: 128,
+            num_layers: 1,
+            rms_norm_eps: 1e-6,
+            num_attention_heads: 1,
+            num_kv_heads: 1,
+            head_dim: 128,
+            rotary_dim: 128,
+            rope_theta: 10_000.0,
+            num_k_heads: 1,
+            num_v_heads: 1,
+            head_k_dim: 128,
+            head_v_dim: 128,
+            conv_kernel_dim: 2,
+            num_experts: 1,
+            moe_intermediate: 128,
+            shared_intermediate: 128,
+            top_k: 1,
+        }
+    }
+
+    fn synthetic_layer_tensors(mode: Qwen36WeightMode) -> (Vec<u8>, Vec<TensorMeta>) {
+        let prefix = "model.language_model.layers.0";
+        let mut weights = Vec::new();
+        let mut tensors = Vec::new();
+        let mut push = |name: String, shape: &[usize], dtype: &str, layout: LayoutTag| {
+            let elem_bytes = if dtype == "bf16" { 2 } else { 1 };
+            let byte_len = shape.iter().product::<usize>() * elem_bytes;
+            let offset = weights.len() as u64;
+            weights.resize(weights.len() + byte_len, 0);
+            tensors.push(TensorMeta {
+                name,
+                shape: shape.to_vec(),
+                dtype: dtype.to_string(),
+                layout,
+                offset,
+                byte_len: byte_len as u64,
+            });
+        };
+        let bf16 = |name: &str,
+                    shape: &[usize],
+                    push: &mut dyn FnMut(String, &[usize], &str, LayoutTag)| {
+            push(name.to_string(), shape, "bf16", LayoutTag::Raw);
+        };
+
+        bf16(
+            &format!("{prefix}.input_layernorm.weight"),
+            &[128],
+            &mut push,
+        );
+        bf16(
+            &format!("{prefix}.self_attn.q_norm.weight"),
+            &[128],
+            &mut push,
+        );
+        bf16(
+            &format!("{prefix}.self_attn.k_norm.weight"),
+            &[128],
+            &mut push,
+        );
+        bf16(
+            &format!("{prefix}.post_attention_layernorm.weight"),
+            &[128],
+            &mut push,
+        );
+        bf16(&format!("{prefix}.mlp.gate.weight"), &[1, 128], &mut push);
+        bf16(
+            &format!("{prefix}.mlp.shared_expert_gate.weight"),
+            &[1, 128],
+            &mut push,
+        );
+
+        let projections = [
+            (format!("{prefix}.self_attn.q_proj.weight"), vec![256, 128]),
+            (format!("{prefix}.self_attn.k_proj.weight"), vec![128, 128]),
+            (format!("{prefix}.self_attn.v_proj.weight"), vec![128, 128]),
+            (format!("{prefix}.self_attn.o_proj.weight"), vec![128, 128]),
+            (
+                format!("{prefix}.mlp.experts.gate_up_proj"),
+                vec![1, 256, 128],
+            ),
+            (format!("{prefix}.mlp.experts.down_proj"), vec![1, 128, 128]),
+            (
+                format!("{prefix}.mlp.shared_expert.gate_proj.weight"),
+                vec![128, 128],
+            ),
+            (
+                format!("{prefix}.mlp.shared_expert.up_proj.weight"),
+                vec![128, 128],
+            ),
+            (
+                format!("{prefix}.mlp.shared_expert.down_proj.weight"),
+                vec![128, 128],
+            ),
+        ];
+        for (name, shape) in projections {
+            if mode == Qwen36WeightMode::Bf16 {
+                bf16(&name, &shape, &mut push);
+                continue;
+            }
+            let mut packed_shape = shape.clone();
+            *packed_shape.last_mut().expect("projection rank") /= 2;
+            push(name.clone(), &packed_shape, "u8", LayoutTag::Int4Quantized);
+            bf16(&format!("{name}_int4_scale"), &[1], &mut push);
+            bf16(&format!("{name}_int4_zero"), &[1], &mut push);
+        }
+        (weights, tensors)
+    }
+
+    fn load_direct(mode: Qwen36WeightMode) -> LoadedQwen36Layers {
+        let tmp = TestDir::new(mode);
+        let store = BakedStore::open(tmp.path()).expect("open synthetic direct-load store");
+        load_qwen36_layers(
+            &store,
+            0,
+            &geom(),
+            &text_config(),
+            "model.language_model",
+            mode,
+            4,
+            false,
+            false,
+            Qwen36LayerLoadStrategy::Dense,
+        )
+        .expect("runtime direct layer load")
+    }
+
+    #[test]
+    fn runtime_direct_load_owns_bf16_layers_and_kv_state() {
+        let loaded = load_direct(Qwen36WeightMode::Bf16);
+        assert_eq!(loaded.weight_mode(), Qwen36WeightMode::Bf16);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(
+            classify_layer_weight_encoding(loaded.layers()).expect("classify BF16"),
+            Qwen36LayerWeightEncoding::Bf16
+        );
+        let AttnLayerBuffers::Full {
+            q_proj_w,
+            int4,
+            kv_cache,
+            ..
+        } = &loaded.layers()[0].attn
+        else {
+            panic!("expected full-attention layer");
+        };
+        assert_eq!(q_proj_w.dtype(), ScalarType::BF16);
+        assert_eq!(q_proj_w.shape(), &[256, 128]);
+        assert!(int4.is_none());
+        assert_eq!(kv_cache.as_ref().expect("KV cache").kv_max_t, 4);
+        assert_eq!(
+            loaded.layers()[0].ffn.gate_up_proj_w.dtype(),
+            ScalarType::BF16
+        );
+        assert_eq!(
+            loaded.layers()[0].ffn.gate_up_proj_w.shape(),
+            &[1, 256, 128]
+        );
+        assert!(loaded.layers()[0].ffn.int4.is_none());
+    }
+
+    #[test]
+    fn runtime_direct_load_owns_native_int4_layers_and_sidecars() {
+        let loaded = load_direct(Qwen36WeightMode::Int4);
+        assert_eq!(loaded.weight_mode(), Qwen36WeightMode::Int4);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(
+            classify_layer_weight_encoding(loaded.layers()).expect("classify native INT4"),
+            Qwen36LayerWeightEncoding::NativeInt4
+        );
+        let AttnLayerBuffers::Full { q_proj_w, int4, .. } = &loaded.layers()[0].attn else {
+            panic!("expected full-attention layer");
+        };
+        assert_eq!(q_proj_w.dtype(), ScalarType::U8);
+        assert_eq!(q_proj_w.shape(), &[256, 64]);
+        let attn_int4 = int4.as_ref().expect("attention INT4 sidecars");
+        assert_eq!(attn_int4.q_proj_type, QWEN36_MOE_LOWBIT_NATIVE_INT4);
+        assert_eq!(attn_int4.q_proj_scale.dtype(), ScalarType::BF16);
+        assert_eq!(
+            loaded.layers()[0].ffn.gate_up_proj_w.dtype(),
+            ScalarType::U8
+        );
+        assert_eq!(loaded.layers()[0].ffn.gate_up_proj_w.shape(), &[16_384]);
+        let ffn_int4 = loaded.layers()[0]
+            .ffn
+            .int4
+            .as_ref()
+            .expect("FFN INT4 sidecars");
+        assert_eq!(ffn_int4.gate_up_proj_type, QWEN36_MOE_LOWBIT_NATIVE_INT4);
+        assert_eq!(ffn_int4.gate_up_proj_scale.dtype(), ScalarType::BF16);
+    }
 }

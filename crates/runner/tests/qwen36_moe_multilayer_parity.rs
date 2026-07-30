@@ -14,7 +14,7 @@
 //!
 //! ```bash
 //! ~/venvs/rocm/bin/python oracle/qwen36_moe_multilayer_oracle.py \
-//!     --mode synthetic --num-layers 4 --out /tmp/qwen36_ml.json
+//!     --mode synthetic --state fresh --num-layers 4 --out /tmp/qwen36_ml.json
 //! SUPERSONIC_QWEN36_MULTILAYER_ORACLE_JSON=/tmp/qwen36_ml.json \
 //!   cargo test --release -p runner --test qwen36_moe_multilayer_parity \
 //!     -- --nocapture
@@ -29,15 +29,19 @@
 //! so this file always builds and skips cleanly when HIP isn't available.
 
 use base64::Engine;
-use gpu_hal::{is_backend_compiled, set_backend, Backend, GpuBuffer, ScalarType};
+use gpu_hal::{copy_d2h, is_backend_compiled, set_backend, Backend, GpuBuffer, ScalarType};
 use runner::qwen36_moe_logits::{bf16_bytes_to_f32, host_final_norm_lm_head};
 use runner::qwen36_moe_state::{restore_linear_attn_state, save_linear_attn_state};
 use serde_json::Value;
+use std::ffi::c_void;
+use supersonic_runtime::qwen36_moe::chain::{run_chain_step, Qwen36ChainStep};
 use supersonic_runtime::qwen36_moe::decode::run_chained_decode;
-use supersonic_runtime::qwen36_moe::persistent_decode::{PersistentScratch, CACHE_POS_INHERIT};
+use supersonic_runtime::qwen36_moe::layer_loader::Qwen36WeightMode;
+use supersonic_runtime::qwen36_moe::layers::LoadedQwen36Layers;
+use supersonic_runtime::qwen36_moe::persistent_decode::{LmHeadFold, CACHE_POS_INHERIT};
 use supersonic_runtime::qwen36_moe::types::{
     is_full_attn_layer, AttnLayerBuffers, FfnInt4Sidecars, FfnLayerBuffers, FullAttnInt4Sidecars,
-    LayerBuffers, LinearAttnInt4Sidecars, MultiLayerGeom, ResidentWeight,
+    LayerBuffers, LinearAttnInt4Sidecars, MultiLayerGeom, PositionPair, ResidentWeight,
 };
 
 fn b64(input: &str) -> Vec<u8> {
@@ -499,7 +503,8 @@ fn multilayer_chained_decode_matches_oracle() {
         eprintln!(
             "skip: SUPERSONIC_QWEN36_MULTILAYER_ORACLE_JSON not set. Generate with \
              `~/venvs/rocm/bin/python oracle/qwen36_moe_multilayer_oracle.py \
-             --mode synthetic --num-layers 4 --out /tmp/qwen36_ml.json`."
+             --mode synthetic --state fresh --num-layers 4 \
+             --out /tmp/qwen36_ml.json`."
         );
         return;
     };
@@ -641,20 +646,17 @@ fn multilayer_chained_decode_matches_oracle() {
 // =============================================================================
 // Phase 3e: persistent decode megakernel parity test.
 //
-// Drives the production
-// `supersonic_runtime::qwen36_moe::persistent_decode::PersistentScratch` with the same
-// fixtures the chained-decode test uses, then asserts the final hidden
-// matches the chained path nearly bit-for-bit. The two paths run the
+// Drives the production runtime layer owner and chain dispatcher with the
+// same fixtures the chained-decode test uses, then asserts the final hidden
+// and folded lm-head logits match the chained path and oracle. The two paths run the
 // IDENTICAL `__device__` phase functions (extracted in Phase 3a-3d) — only
 // the launch orchestration differs (1 cooperative launch vs 80 step
 // launches, with `reset_counters_16` between phases inside the
 // megakernel). So the comparison floor is very tight (cos_sim ≥ 0.99999,
 // max_abs ≤ 1e-3).
 //
-// This test also validates the production module's `PersistentScratch`
-// path that the engine's `--persistent-decode` flag (Phase 3e.2) uses —
-// any regression in `build_layer_descs` / `build_int4_descs` /
-// `PersistentScratch::run` here will trip the engine path too.
+// This test also validates the production `LoadedQwen36Layers` descriptor
+// ownership and `run_chain_step` dispatch used by the engine.
 // =============================================================================
 
 #[test]
@@ -667,7 +669,8 @@ fn multilayer_persistent_decode_matches_chained() {
         eprintln!(
             "skip: SUPERSONIC_QWEN36_MULTILAYER_ORACLE_JSON not set. Generate with \
              `~/venvs/rocm/bin/python oracle/qwen36_moe_multilayer_oracle.py \
-             --mode synthetic --num-layers 4 --out /tmp/qwen36_ml.json`."
+             --mode synthetic --state fresh --int4 --num-layers 4 \
+             --out /tmp/qwen36_ml.json`."
         );
         return;
     };
@@ -720,37 +723,112 @@ fn multilayer_persistent_decode_matches_chained() {
     }
 
     let initial_hidden = b64_field(&json, "input_hidden");
+    let final_norm_w = b64_field(&json, "final_norm_w");
+    let lm_head_w = b64_field(&json, "lm_head_w");
+    let weight_mode = if int4_mode {
+        Qwen36WeightMode::Int4
+    } else {
+        Qwen36WeightMode::Bf16
+    };
+    let mut loaded = LoadedQwen36Layers::dense(layers, weight_mode);
 
     // Snapshot the linear-attn state so we can reset between the chained
     // and persistent runs (linear-attn mutates conv_state +
     // recurrent_state per token).
-    let snapshot = save_linear_attn_state(ordinal, &layers).expect("save_linear_attn_state");
+    let snapshot =
+        save_linear_attn_state(ordinal, loaded.layers()).expect("save_linear_attn_state");
 
-    // ---- Chained-path reference ----
-    let chained = run_chained_decode(ordinal, &geom, &mut layers, &initial_hidden, position)
-        .expect("chained decode");
+    // ---- Runtime-owned chained-path reference ----
+    let chained = run_chain_step(Qwen36ChainStep {
+        ordinal,
+        geom: &geom,
+        loaded_layers: &mut loaded,
+        initial_hidden: &initial_hidden,
+        position: PositionPair::dense(position),
+        step: 0,
+        accurate_stage_timings: false,
+        fold: None,
+        download_final_hidden: true,
+        expert_prefetch: None,
+    })
+    .expect("runtime chained decode")
+    .outputs;
 
     // Restore linear state to the pre-chained values so the persistent
     // run sees the same starting point.
-    restore_linear_attn_state(ordinal, &mut layers, &snapshot).expect("restore_linear_attn_state");
+    restore_linear_attn_state(
+        ordinal,
+        loaded
+            .layers_mut_before_persistent()
+            .expect("mutable layers before persistent descriptors"),
+        &snapshot,
+    )
+    .expect("restore_linear_attn_state");
 
-    // ---- Persistent megakernel run via the production wrapper ----
-    let mut scratch =
-        PersistentScratch::new(ordinal, &geom, &mut layers).expect("alloc PersistentScratch");
-    // Parity test only checks the layer chain — no lm_head fold here
-    // (the host-side `host_final_norm_lm_head` does the lm_head step
-    // for the chained-vs-oracle test).
-    let persistent_outputs = scratch
-        .run(
-            ordinal,
-            &initial_hidden,
-            position,
-            CACHE_POS_INHERIT,
-            None,
-            true,
-        )
-        .expect("PersistentScratch::run");
-    let persistent_final = persistent_outputs.final_hidden_bytes;
+    if !int4_mode {
+        let err = loaded
+            .enable_persistent(ordinal, &geom)
+            .expect_err("BF16 persistent execution must be rejected before mutation");
+        assert!(err.to_string().contains("does not support Bf16"));
+        return;
+    }
+
+    // ---- Persistent megakernel + folded lm-head via runtime dispatch ----
+    loaded
+        .enable_persistent(ordinal, &geom)
+        .expect("enable runtime persistent decode");
+    let final_norm_w_buf = upload_bf16(
+        ordinal,
+        &[geom.hidden as usize],
+        &final_norm_w,
+        "final norm",
+    );
+    let lm_head_w_buf = upload_bf16(
+        ordinal,
+        &[geom.vocab as usize, geom.hidden as usize],
+        &lm_head_w,
+        "lm head",
+    );
+    let mut logits_buf = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[geom.vocab as usize])
+        .expect("alloc folded logits");
+    let persistent = run_chain_step(Qwen36ChainStep {
+        ordinal,
+        geom: &geom,
+        loaded_layers: &mut loaded,
+        initial_hidden: &initial_hidden,
+        position: PositionPair::dense(position),
+        step: 0,
+        accurate_stage_timings: false,
+        fold: Some(LmHeadFold {
+            final_norm_w: &final_norm_w_buf,
+            lm_head_w: &lm_head_w_buf,
+            logits_out: Some(&mut logits_buf),
+            top1_out: None,
+            vocab: geom.vocab,
+        }),
+        download_final_hidden: true,
+        expert_prefetch: None,
+    })
+    .expect("runtime persistent decode");
+    assert!(persistent.lm_head_folded);
+    assert!(!persistent.lm_head_folded_top1);
+    let persistent_final = persistent.outputs.final_hidden_bytes;
+    let mut persistent_logits = vec![0u8; geom.vocab as usize * 2];
+    copy_d2h(
+        ordinal,
+        persistent_logits.as_mut_ptr() as *mut c_void,
+        logits_buf.as_ptr(),
+        persistent_logits.len(),
+    )
+    .expect("download folded lm-head logits");
+    let chained_logits = host_final_norm_lm_head(
+        &chained.final_hidden_bytes,
+        &final_norm_w,
+        &lm_head_w,
+        geom.hidden as usize,
+        geom.vocab as usize,
+        geom.rms_norm_eps,
+    );
 
     // The persistent kernel runs the IDENTICAL `__device__` phase
     // functions (full_attn_phase / linear_attn_phase / ffn_phase) the
@@ -766,22 +844,34 @@ fn multilayer_persistent_decode_matches_chained() {
         1e-3,
         0.99999,
     );
+    assert_parity_bf16(
+        "persistent folded lm-head vs chained host lm-head",
+        &persistent_logits,
+        &chained_logits,
+        0.05,
+        0.99999,
+    );
 
     // Segmented persistent is the sparse-VMM orchestration: each layer runs
     // attention + router top-k, returns to the host for remap, then resumes
     // that layer's FFN. With a no-op remap callback it must match the same
     // chained reference.
-    restore_linear_attn_state(ordinal, &mut layers, &snapshot)
-        .expect("restore_linear_attn_state before segmented persistent");
-    let segmented_outputs = scratch
-        .run_sparse_with_expert_prefetch(
-            ordinal,
-            &initial_hidden,
-            position,
-            CACHE_POS_INHERIT,
-            |_phase, _layer, _topk| Ok(()),
-        )
-        .expect("PersistentScratch::run_sparse_with_expert_prefetch");
+    let segmented_outputs = unsafe {
+        loaded.with_experimental_parts(|layers, scratch| {
+            restore_linear_attn_state(ordinal, layers, &snapshot)
+                .expect("restore_linear_attn_state before segmented persistent");
+            scratch
+                .expect("persistent scratch")
+                .run_sparse_with_expert_prefetch(
+                    ordinal,
+                    &initial_hidden,
+                    position,
+                    CACHE_POS_INHERIT,
+                    |_phase, _layer, _topk| Ok(()),
+                )
+        })
+    }
+    .expect("experimental segmented persistent comparison");
     assert_parity_bf16(
         "segmented persistent sparse vs chained final_hidden",
         &segmented_outputs.final_hidden_bytes,

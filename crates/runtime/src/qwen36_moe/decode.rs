@@ -24,8 +24,11 @@
 //! [`LayerBuffers`] vec gets populated.
 #![allow(dead_code)]
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use gpu_hal::{copy_d2h, memset_zeros, Backend, GpuBuffer, GpuError, ScalarType};
@@ -48,6 +51,73 @@ use crate::qwen36_moe::types::{
     AttnLayerBuffers, DecodeOutputs, ExpertPrefetchPhase, ExpertRoute, FullAttnKvCache,
     LayerBuffers, MultiLayerGeom,
 };
+
+pub type Qwen36DiagnosticObserver = dyn Fn(&str) + Send + Sync + 'static;
+
+#[derive(Clone, Default)]
+pub struct Qwen36ExecutionOptions {
+    values: HashMap<String, String>,
+    diagnostic_observer: Option<Arc<Qwen36DiagnosticObserver>>,
+}
+
+impl Qwen36ExecutionOptions {
+    pub fn from_pairs(pairs: impl IntoIterator<Item = (String, String)>) -> Self {
+        Self {
+            values: pairs.into_iter().collect(),
+            diagnostic_observer: None,
+        }
+    }
+
+    pub fn with_diagnostic_observer(mut self, observer: Arc<Qwen36DiagnosticObserver>) -> Self {
+        self.diagnostic_observer = Some(observer);
+        self
+    }
+
+    pub fn install(&self) -> Qwen36ExecutionOptionsGuard {
+        let previous = QWEN36_EXECUTION_OPTIONS.with(|current| current.replace(self.clone()));
+        Qwen36ExecutionOptionsGuard { previous }
+    }
+}
+
+pub struct Qwen36ExecutionOptionsGuard {
+    previous: Qwen36ExecutionOptions,
+}
+
+impl Drop for Qwen36ExecutionOptionsGuard {
+    fn drop(&mut self) {
+        QWEN36_EXECUTION_OPTIONS.with(|current| {
+            current.replace(std::mem::take(&mut self.previous));
+        });
+    }
+}
+
+thread_local! {
+    static QWEN36_EXECUTION_OPTIONS: RefCell<Qwen36ExecutionOptions> =
+        RefCell::new(Qwen36ExecutionOptions::default());
+}
+
+pub(crate) fn execution_option(name: &str) -> std::result::Result<String, ()> {
+    QWEN36_EXECUTION_OPTIONS.with(|current| current.borrow().values.get(name).cloned().ok_or(()))
+}
+
+pub(crate) fn execution_option_os(name: &str) -> Option<()> {
+    QWEN36_EXECUTION_OPTIONS
+        .with(|current| current.borrow().values.contains_key(name).then_some(()))
+}
+
+pub(crate) fn emit_runtime_diagnostic(message: String) {
+    QWEN36_EXECUTION_OPTIONS.with(|current| {
+        if let Some(observer) = current.borrow().diagnostic_observer.as_ref() {
+            observer(&message);
+        }
+    });
+}
+
+macro_rules! runtime_diagnostic {
+    ($($arg:tt)*) => {
+        emit_runtime_diagnostic(format!($($arg)*))
+    };
+}
 
 static QWEN36_DECODE_BATCH_ROUTE_SNAPSHOT_CALLS: AtomicUsize = AtomicUsize::new(0);
 static QWEN36_DECODE_BATCH_SHARED_PARITY_TAP_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -174,15 +244,15 @@ fn linear_attn_output_elems(geom: &MultiLayerGeom) -> usize {
 
 fn metal_linear_decode_direct_enabled(int4: &Qwen36MoeLinearStepInt4) -> bool {
     int4.group_size == 128
-        && std::env::var_os("SUPERSONIC_METAL_DISABLE_QWEN36_LINEAR_DECODE_DIRECT").is_none()
-        && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
-        && std::env::var_os("SUPERSONIC_METAL_DISABLE_QWEN36_LINEAR_INT4_STAGE5").is_none()
+        && execution_option_os("SUPERSONIC_METAL_DISABLE_QWEN36_LINEAR_DECODE_DIRECT").is_none()
+        && execution_option_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
+        && execution_option_os("SUPERSONIC_METAL_DISABLE_QWEN36_LINEAR_INT4_STAGE5").is_none()
 }
 
 fn metal_full_attn_decode_direct_enabled(int4: &Qwen36MoeAttnStepInt4) -> bool {
     int4.group_size == 128
-        && std::env::var_os("SUPERSONIC_METAL_DISABLE_QWEN36_FULL_ATTN_DECODE_DIRECT").is_none()
-        && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
+        && execution_option_os("SUPERSONIC_METAL_DISABLE_QWEN36_FULL_ATTN_DECODE_DIRECT").is_none()
+        && execution_option_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
 }
 
 /// FFN parity launcher workspace floats — copied from the per-block test
@@ -226,32 +296,33 @@ fn qwen36_metal_decode_batch_enabled(
     accurate_stage_timings: bool,
     has_expert_prefetch: bool,
 ) -> bool {
-    std::env::var_os("SUPERSONIC_METAL_QWEN36_DISABLE_DECODE_BATCH").is_none()
+    execution_option_os("SUPERSONIC_METAL_QWEN36_DISABLE_DECODE_BATCH").is_none()
         && !capture
         && !accurate_stage_timings
         && !has_expert_prefetch
-        && (std::env::var_os("SUPERSONIC_METAL_PROFILE_QWEN36_FFN_PHASES").is_none()
+        && (execution_option_os("SUPERSONIC_METAL_PROFILE_QWEN36_FFN_PHASES").is_none()
             || qwen36_metal_decode_batch_ffn_profile_phases_enabled())
-        && std::env::var_os("SUPERSONIC_METAL_QWEN36_FFN_ROUTER_STAGE5_PARITY_TAP").is_none()
+        && execution_option_os("SUPERSONIC_METAL_QWEN36_FFN_ROUTER_STAGE5_PARITY_TAP").is_none()
 }
 
 fn qwen36_metal_decode_batch_profile_phases_enabled() -> bool {
-    std::env::var_os("SUPERSONIC_METAL_QWEN36_DECODE_BATCH_PROFILE_PHASES").is_some()
+    execution_option_os("SUPERSONIC_METAL_QWEN36_DECODE_BATCH_PROFILE_PHASES").is_some()
 }
 
 fn qwen36_metal_decode_batch_profile_phases_deferred_enabled() -> bool {
-    std::env::var_os("SUPERSONIC_METAL_QWEN36_DECODE_BATCH_PROFILE_PHASES_DEFERRED").is_some()
+    execution_option_os("SUPERSONIC_METAL_QWEN36_DECODE_BATCH_PROFILE_PHASES_DEFERRED").is_some()
 }
 
 fn qwen36_metal_decode_batch_deferred_commits_enabled() -> bool {
-    std::env::var_os("SUPERSONIC_METAL_QWEN36_DECODE_BATCH_SYNC_PHASES").is_none()
+    execution_option_os("SUPERSONIC_METAL_QWEN36_DECODE_BATCH_SYNC_PHASES").is_none()
 }
 
 fn qwen36_metal_decode_batch_ffn_commit_interval() -> usize {
-    if let Some(value) = std::env::var("SUPERSONIC_METAL_QWEN36_DECODE_BATCH_FFN_COMMIT_INTERVAL")
-        .ok()
-        .and_then(|raw| raw.trim().parse::<usize>().ok())
-        .filter(|&value| value > 0)
+    if let Some(value) =
+        execution_option("SUPERSONIC_METAL_QWEN36_DECODE_BATCH_FFN_COMMIT_INTERVAL")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<usize>().ok())
+            .filter(|&value| value > 0)
     {
         return value;
     }
@@ -264,33 +335,33 @@ fn qwen36_metal_decode_batch_ffn_commit_interval() -> usize {
 }
 
 fn qwen36_metal_decode_batch_ffn_profile_phases_enabled() -> bool {
-    std::env::var_os("SUPERSONIC_METAL_QWEN36_DECODE_BATCH_PROFILE_FFN_PHASES").is_some()
+    execution_option_os("SUPERSONIC_METAL_QWEN36_DECODE_BATCH_PROFILE_FFN_PHASES").is_some()
 }
 
 fn qwen36_metal_decode_batch_route_snapshot_enabled() -> bool {
-    std::env::var_os("SUPERSONIC_METAL_QWEN36_DECODE_BATCH_ROUTE_SNAPSHOT").is_some()
+    execution_option_os("SUPERSONIC_METAL_QWEN36_DECODE_BATCH_ROUTE_SNAPSHOT").is_some()
 }
 
 fn qwen36_metal_decode_batch_shared_stage5_parity_tap_enabled() -> bool {
-    (std::env::var_os("SUPERSONIC_METAL_QWEN36_DECODE_BATCH_SHARED_STAGE5_PARITY_TAP").is_some()
-        || std::env::var_os("SUPERSONIC_METAL_QWEN36_FFN_SHARED_STAGE5_PARITY_TAP").is_some())
-        && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
+    (execution_option_os("SUPERSONIC_METAL_QWEN36_DECODE_BATCH_SHARED_STAGE5_PARITY_TAP").is_some()
+        || execution_option_os("SUPERSONIC_METAL_QWEN36_FFN_SHARED_STAGE5_PARITY_TAP").is_some())
+        && execution_option_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
 }
 
 fn qwen36_metal_decode_batch_routed_stage5_parity_tap_enabled() -> bool {
-    std::env::var_os("SUPERSONIC_METAL_QWEN36_DECODE_BATCH_ROUTED_STAGE5_PARITY_TAP").is_some()
-        && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
+    execution_option_os("SUPERSONIC_METAL_QWEN36_DECODE_BATCH_ROUTED_STAGE5_PARITY_TAP").is_some()
+        && execution_option_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
 }
 
 fn qwen36_metal_decode_batch_router_stage5_parity_tap_enabled() -> bool {
-    std::env::var_os("SUPERSONIC_METAL_QWEN36_DECODE_BATCH_ROUTER_STAGE5_PARITY_TAP").is_some()
-        && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
+    execution_option_os("SUPERSONIC_METAL_QWEN36_DECODE_BATCH_ROUTER_STAGE5_PARITY_TAP").is_some()
+        && execution_option_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
 }
 
 fn qwen36_metal_decode_batch_shared_stage5_parity_tap_max_calls() -> usize {
-    std::env::var("SUPERSONIC_METAL_QWEN36_DECODE_BATCH_SHARED_STAGE5_PARITY_TAP_MAX_CALLS")
+    execution_option("SUPERSONIC_METAL_QWEN36_DECODE_BATCH_SHARED_STAGE5_PARITY_TAP_MAX_CALLS")
         .or_else(|_| {
-            std::env::var("SUPERSONIC_METAL_QWEN36_FFN_SHARED_STAGE5_PARITY_TAP_MAX_CALLS")
+            execution_option("SUPERSONIC_METAL_QWEN36_FFN_SHARED_STAGE5_PARITY_TAP_MAX_CALLS")
         })
         .ok()
         .and_then(|raw| raw.parse::<usize>().ok())
@@ -299,15 +370,17 @@ fn qwen36_metal_decode_batch_shared_stage5_parity_tap_max_calls() -> usize {
 }
 
 fn qwen36_metal_decode_batch_shared_stage5_parity_tap_position() -> Option<i32> {
-    std::env::var("SUPERSONIC_METAL_QWEN36_DECODE_BATCH_SHARED_STAGE5_PARITY_TAP_POSITION")
-        .or_else(|_| std::env::var("SUPERSONIC_METAL_QWEN36_FFN_SHARED_STAGE5_PARITY_TAP_POSITION"))
+    execution_option("SUPERSONIC_METAL_QWEN36_DECODE_BATCH_SHARED_STAGE5_PARITY_TAP_POSITION")
+        .or_else(|_| {
+            execution_option("SUPERSONIC_METAL_QWEN36_FFN_SHARED_STAGE5_PARITY_TAP_POSITION")
+        })
         .ok()
         .and_then(|raw| raw.parse::<i32>().ok())
 }
 
 fn qwen36_metal_decode_batch_shared_stage5_parity_tap_layer() -> Option<usize> {
-    std::env::var("SUPERSONIC_METAL_QWEN36_DECODE_BATCH_SHARED_STAGE5_PARITY_TAP_LAYER")
-        .or_else(|_| std::env::var("SUPERSONIC_METAL_QWEN36_FFN_SHARED_STAGE5_PARITY_TAP_LAYER"))
+    execution_option("SUPERSONIC_METAL_QWEN36_DECODE_BATCH_SHARED_STAGE5_PARITY_TAP_LAYER")
+        .or_else(|_| execution_option("SUPERSONIC_METAL_QWEN36_FFN_SHARED_STAGE5_PARITY_TAP_LAYER"))
         .ok()
         .and_then(|raw| raw.parse::<usize>().ok())
 }
@@ -330,7 +403,7 @@ fn qwen36_metal_decode_batch_shared_stage5_parity_tap_matches(
 }
 
 fn qwen36_metal_decode_batch_router_stage5_parity_tap_max_calls() -> usize {
-    std::env::var("SUPERSONIC_METAL_QWEN36_DECODE_BATCH_ROUTER_STAGE5_PARITY_TAP_MAX_CALLS")
+    execution_option("SUPERSONIC_METAL_QWEN36_DECODE_BATCH_ROUTER_STAGE5_PARITY_TAP_MAX_CALLS")
         .ok()
         .and_then(|raw| raw.parse::<usize>().ok())
         .filter(|&value| value > 0)
@@ -338,13 +411,13 @@ fn qwen36_metal_decode_batch_router_stage5_parity_tap_max_calls() -> usize {
 }
 
 fn qwen36_metal_decode_batch_router_stage5_parity_tap_position() -> Option<i32> {
-    std::env::var("SUPERSONIC_METAL_QWEN36_DECODE_BATCH_ROUTER_STAGE5_PARITY_TAP_POSITION")
+    execution_option("SUPERSONIC_METAL_QWEN36_DECODE_BATCH_ROUTER_STAGE5_PARITY_TAP_POSITION")
         .ok()
         .and_then(|raw| raw.parse::<i32>().ok())
 }
 
 fn qwen36_metal_decode_batch_router_stage5_parity_tap_layer() -> Option<usize> {
-    std::env::var("SUPERSONIC_METAL_QWEN36_DECODE_BATCH_ROUTER_STAGE5_PARITY_TAP_LAYER")
+    execution_option("SUPERSONIC_METAL_QWEN36_DECODE_BATCH_ROUTER_STAGE5_PARITY_TAP_LAYER")
         .ok()
         .and_then(|raw| raw.parse::<usize>().ok())
 }
@@ -367,7 +440,7 @@ fn qwen36_metal_decode_batch_router_stage5_parity_tap_matches(
 }
 
 fn qwen36_metal_decode_batch_routed_stage5_parity_tap_max_calls() -> usize {
-    std::env::var("SUPERSONIC_METAL_QWEN36_DECODE_BATCH_ROUTED_STAGE5_PARITY_TAP_MAX_CALLS")
+    execution_option("SUPERSONIC_METAL_QWEN36_DECODE_BATCH_ROUTED_STAGE5_PARITY_TAP_MAX_CALLS")
         .ok()
         .and_then(|raw| raw.parse::<usize>().ok())
         .filter(|&value| value > 0)
@@ -375,13 +448,13 @@ fn qwen36_metal_decode_batch_routed_stage5_parity_tap_max_calls() -> usize {
 }
 
 fn qwen36_metal_decode_batch_routed_stage5_parity_tap_position() -> Option<i32> {
-    std::env::var("SUPERSONIC_METAL_QWEN36_DECODE_BATCH_ROUTED_STAGE5_PARITY_TAP_POSITION")
+    execution_option("SUPERSONIC_METAL_QWEN36_DECODE_BATCH_ROUTED_STAGE5_PARITY_TAP_POSITION")
         .ok()
         .and_then(|raw| raw.parse::<i32>().ok())
 }
 
 fn qwen36_metal_decode_batch_routed_stage5_parity_tap_layer() -> Option<usize> {
-    std::env::var("SUPERSONIC_METAL_QWEN36_DECODE_BATCH_ROUTED_STAGE5_PARITY_TAP_LAYER")
+    execution_option("SUPERSONIC_METAL_QWEN36_DECODE_BATCH_ROUTED_STAGE5_PARITY_TAP_LAYER")
         .ok()
         .and_then(|raw| raw.parse::<usize>().ok())
 }
@@ -404,7 +477,7 @@ fn qwen36_metal_decode_batch_routed_stage5_parity_tap_matches(
 }
 
 fn qwen36_layer_output_tap_enabled() -> bool {
-    std::env::var_os("SUPERSONIC_QWEN36_LAYER_OUTPUT_TAP").is_some()
+    execution_option_os("SUPERSONIC_QWEN36_LAYER_OUTPUT_TAP").is_some()
         || qwen36_layer_output_delta_tap_enabled()
 }
 
@@ -413,30 +486,30 @@ fn qwen36_layer_output_tap_should_snapshot(
     layer_idx: usize,
     phase_idx: usize,
 ) -> bool {
-    if std::env::var_os("SUPERSONIC_QWEN36_LAYER_OUTPUT_TAP").is_some() {
+    if execution_option_os("SUPERSONIC_QWEN36_LAYER_OUTPUT_TAP").is_some() {
         return true;
     }
     qwen36_layer_output_delta_tap_matches(position, layer_idx, phase_idx)
 }
 
 fn qwen36_layer_output_delta_tap_enabled() -> bool {
-    std::env::var_os("SUPERSONIC_QWEN36_LAYER_OUTPUT_DELTA_TAP").is_some()
+    execution_option_os("SUPERSONIC_QWEN36_LAYER_OUTPUT_DELTA_TAP").is_some()
 }
 
 fn qwen36_layer_output_delta_tap_position() -> Option<i32> {
-    std::env::var("SUPERSONIC_QWEN36_LAYER_OUTPUT_DELTA_TAP_POSITION")
+    execution_option("SUPERSONIC_QWEN36_LAYER_OUTPUT_DELTA_TAP_POSITION")
         .ok()
         .and_then(|raw| raw.parse::<i32>().ok())
 }
 
 fn qwen36_layer_output_delta_tap_layer() -> Option<usize> {
-    std::env::var("SUPERSONIC_QWEN36_LAYER_OUTPUT_DELTA_TAP_LAYER")
+    execution_option("SUPERSONIC_QWEN36_LAYER_OUTPUT_DELTA_TAP_LAYER")
         .ok()
         .and_then(|raw| raw.parse::<usize>().ok())
 }
 
 fn qwen36_layer_output_delta_tap_phase() -> Option<usize> {
-    let raw = std::env::var("SUPERSONIC_QWEN36_LAYER_OUTPUT_DELTA_TAP_PHASE").ok()?;
+    let raw = execution_option("SUPERSONIC_QWEN36_LAYER_OUTPUT_DELTA_TAP_PHASE").ok()?;
     LAYER_OUTPUT_TAP_PHASES
         .iter()
         .position(|phase| phase.eq_ignore_ascii_case(raw.trim()))
@@ -469,25 +542,25 @@ fn qwen36_layer_output_delta_tap_matches(
 }
 
 fn qwen36_metal_router_stage5_simd_env_enabled() -> bool {
-    std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_STAGE5_SIMD").is_some()
-        && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
+    execution_option_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_STAGE5_SIMD").is_some()
+        && execution_option_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
 }
 
 fn qwen36_metal_router_stage5_fused_exact_env_enabled() -> bool {
-    std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_FUSED_EXACT").is_some()
+    execution_option_os("SUPERSONIC_METAL_ENABLE_QWEN36_FFN_ROUTER_FUSED_EXACT").is_some()
         && !qwen36_metal_router_stage5_simd_env_enabled()
-        && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
+        && execution_option_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
 }
 
 fn qwen36_metal_router_stage5_exact_simd_enabled() -> bool {
-    std::env::var_os("SUPERSONIC_METAL_DISABLE_QWEN36_FFN_ROUTER_STAGE5_EXACT_SIMD").is_none()
+    execution_option_os("SUPERSONIC_METAL_DISABLE_QWEN36_FFN_ROUTER_STAGE5_EXACT_SIMD").is_none()
         && !qwen36_metal_router_stage5_simd_env_enabled()
         && !qwen36_metal_router_stage5_fused_exact_env_enabled()
-        && std::env::var_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
+        && execution_option_os("SUPERSONIC_METAL_FORCE_HOST_NATIVE").is_none()
 }
 
 fn qwen36_full_attn_native_layer_limit() -> Option<usize> {
-    std::env::var("SUPERSONIC_METAL_QWEN36_FULL_ATTN_NATIVE_MAX_LAYER")
+    execution_option("SUPERSONIC_METAL_QWEN36_FULL_ATTN_NATIVE_MAX_LAYER")
         .ok()
         .and_then(|raw| raw.trim().parse::<usize>().ok())
 }
@@ -668,7 +741,7 @@ fn emit_decode_batch_route_snapshot(
     let route_path = qwen36_metal_decode_batch_router_path_label();
     let phase_profile = qwen36_metal_decode_batch_phase_profile_enabled();
     let call = QWEN36_DECODE_BATCH_ROUTE_SNAPSHOT_CALLS.fetch_add(1, Ordering::Relaxed);
-    eprintln!(
+    runtime_diagnostic!(
         "[qwen36-decode-batch-route-snapshot] call={} position={} cache_pos={} router_path={} phase_profile={} layers={} top_k={} captured_layers={} entries={} first_layer={} last_layer={} checksum={} routes={}",
         call,
         position,
@@ -756,7 +829,7 @@ fn f32_word_head_hex(bytes: &[u8], elems: usize) -> String {
 }
 
 fn qwen36_full_attn_workspace_tap_word_count() -> Option<usize> {
-    std::env::var("SUPERSONIC_QWEN36_FULL_ATTN_WORKSPACE_TAP_WORDS")
+    execution_option("SUPERSONIC_QWEN36_FULL_ATTN_WORKSPACE_TAP_WORDS")
         .ok()
         .map(|raw| raw.trim().parse::<usize>().unwrap_or(16).max(1))
 }
@@ -772,7 +845,7 @@ fn emit_full_attn_workspace_tap_words(
     elems: usize,
 ) {
     if let Some(count) = qwen36_full_attn_workspace_tap_word_count() {
-        eprintln!(
+        runtime_diagnostic!(
             "[qwen36-full-attn-workspace-tap-words] position={} cache_pos={} path={} layer={} region={} elems={} words={}",
             position,
             cache_pos,
@@ -809,17 +882,17 @@ fn snapshot_layer_output(
 }
 
 fn qwen36_full_attn_kv_cache_tap_enabled() -> bool {
-    std::env::var_os("SUPERSONIC_QWEN36_FULL_ATTN_KV_CACHE_TAP").is_some()
+    execution_option_os("SUPERSONIC_QWEN36_FULL_ATTN_KV_CACHE_TAP").is_some()
 }
 
 fn qwen36_full_attn_kv_cache_tap_position() -> Option<i32> {
-    std::env::var("SUPERSONIC_QWEN36_FULL_ATTN_KV_CACHE_TAP_POSITION")
+    execution_option("SUPERSONIC_QWEN36_FULL_ATTN_KV_CACHE_TAP_POSITION")
         .ok()
         .and_then(|raw| raw.parse::<i32>().ok())
 }
 
 fn qwen36_full_attn_kv_cache_tap_layer() -> Option<usize> {
-    std::env::var("SUPERSONIC_QWEN36_FULL_ATTN_KV_CACHE_TAP_LAYER")
+    execution_option("SUPERSONIC_QWEN36_FULL_ATTN_KV_CACHE_TAP_LAYER")
         .ok()
         .and_then(|raw| raw.parse::<usize>().ok())
 }
@@ -842,17 +915,17 @@ fn qwen36_full_attn_kv_cache_tap_matches(position: i32, layer_idx: usize) -> boo
 }
 
 fn qwen36_full_attn_workspace_tap_enabled() -> bool {
-    std::env::var_os("SUPERSONIC_QWEN36_FULL_ATTN_WORKSPACE_TAP").is_some()
+    execution_option_os("SUPERSONIC_QWEN36_FULL_ATTN_WORKSPACE_TAP").is_some()
 }
 
 fn qwen36_full_attn_workspace_tap_position() -> Option<i32> {
-    std::env::var("SUPERSONIC_QWEN36_FULL_ATTN_WORKSPACE_TAP_POSITION")
+    execution_option("SUPERSONIC_QWEN36_FULL_ATTN_WORKSPACE_TAP_POSITION")
         .ok()
         .and_then(|raw| raw.parse::<i32>().ok())
 }
 
 fn qwen36_full_attn_workspace_tap_layer() -> Option<usize> {
-    std::env::var("SUPERSONIC_QWEN36_FULL_ATTN_WORKSPACE_TAP_LAYER")
+    execution_option("SUPERSONIC_QWEN36_FULL_ATTN_WORKSPACE_TAP_LAYER")
         .ok()
         .and_then(|raw| raw.parse::<usize>().ok())
 }
@@ -977,24 +1050,25 @@ fn emit_full_attn_workspace_tap(
     let eff_cache_pos = if cache_pos >= 0 { cache_pos } else { position };
     let kv_len = (eff_cache_pos + 1).max(0) as usize;
     let score_tap_elems =
-        if std::env::var_os("SUPERSONIC_METAL_QWEN36_FULL_ATTN_SCORE_TAP").is_some() {
+        if execution_option_os("SUPERSONIC_METAL_QWEN36_FULL_ATTN_SCORE_TAP").is_some() {
             num_heads * kv_len
         } else {
             0
         };
-    let prob_tap_elems = if std::env::var_os("SUPERSONIC_METAL_QWEN36_FULL_ATTN_PROB_TAP").is_some()
-    {
-        num_heads * kv_len
-    } else {
-        0
-    };
-    let exp_tap_elems = if std::env::var_os("SUPERSONIC_METAL_QWEN36_FULL_ATTN_EXP_TAP").is_some() {
-        num_heads * kv_len
-    } else {
-        0
-    };
+    let prob_tap_elems =
+        if execution_option_os("SUPERSONIC_METAL_QWEN36_FULL_ATTN_PROB_TAP").is_some() {
+            num_heads * kv_len
+        } else {
+            0
+        };
+    let exp_tap_elems =
+        if execution_option_os("SUPERSONIC_METAL_QWEN36_FULL_ATTN_EXP_TAP").is_some() {
+            num_heads * kv_len
+        } else {
+            0
+        };
     let denom_tap_elems =
-        if std::env::var_os("SUPERSONIC_METAL_QWEN36_FULL_ATTN_DENOM_TAP").is_some() {
+        if execution_option_os("SUPERSONIC_METAL_QWEN36_FULL_ATTN_DENOM_TAP").is_some() {
             num_heads
         } else {
             0
@@ -1032,7 +1106,7 @@ fn emit_full_attn_workspace_tap(
         let start_b = start * std::mem::size_of::<f32>();
         let end_b = start_b + elems * std::mem::size_of::<f32>();
         let bytes = &all[start_b..end_b];
-        eprintln!(
+        runtime_diagnostic!(
             "[qwen36-full-attn-workspace-tap] position={} cache_pos={} path={} layer={} region={} elems={} checksum={:016x} head16={}",
             position,
             cache_pos,
@@ -1049,7 +1123,7 @@ fn emit_full_attn_workspace_tap(
         let start_b = start * std::mem::size_of::<f32>();
         let end_b = start_b + score_tap_elems * std::mem::size_of::<f32>();
         let bytes = &all[start_b..end_b];
-        eprintln!(
+        runtime_diagnostic!(
             "[qwen36-full-attn-workspace-tap] position={} cache_pos={} path={} layer={} region=score_tap elems={} checksum={:016x} head16={}",
             position,
             cache_pos,
@@ -1074,7 +1148,7 @@ fn emit_full_attn_workspace_tap(
         let start_b = start * std::mem::size_of::<f32>();
         let end_b = start_b + prob_tap_elems * std::mem::size_of::<f32>();
         let bytes = &all[start_b..end_b];
-        eprintln!(
+        runtime_diagnostic!(
             "[qwen36-full-attn-workspace-tap] position={} cache_pos={} path={} layer={} region=prob_tap elems={} checksum={:016x} head16={}",
             position,
             cache_pos,
@@ -1099,7 +1173,7 @@ fn emit_full_attn_workspace_tap(
         let start_b = start * std::mem::size_of::<f32>();
         let end_b = start_b + exp_tap_elems * std::mem::size_of::<f32>();
         let bytes = &all[start_b..end_b];
-        eprintln!(
+        runtime_diagnostic!(
             "[qwen36-full-attn-workspace-tap] position={} cache_pos={} path={} layer={} region=exp_tap elems={} checksum={:016x} head16={}",
             position,
             cache_pos,
@@ -1124,7 +1198,7 @@ fn emit_full_attn_workspace_tap(
         let start_b = start * std::mem::size_of::<f32>();
         let end_b = start_b + denom_tap_elems * std::mem::size_of::<f32>();
         let bytes = &all[start_b..end_b];
-        eprintln!(
+        runtime_diagnostic!(
             "[qwen36-full-attn-workspace-tap] position={} cache_pos={} path={} layer={} region=denom_tap elems={} checksum={:016x} head16={}",
             position,
             cache_pos,
@@ -1168,7 +1242,7 @@ fn emit_full_attn_kv_cache_tap(
     } else {
         (byte_head_hex(&k_bytes, 16), byte_head_hex(&v_bytes, 16))
     };
-    eprintln!(
+    runtime_diagnostic!(
         "[qwen36-full-attn-kv-cache-tap] position={} cache_pos={} eff_cache_pos={} path={} layer={} kv_len={} kv_dim={} dtype={:?} k_bytes={} k_checksum={:016x} k_head={} v_bytes={} v_checksum={:016x} v_head={}",
         position,
         cache_pos,
@@ -1232,7 +1306,7 @@ fn emit_layer_output_taps(
                 }
             }
             let call = QWEN36_LAYER_OUTPUT_TAP_CALLS.fetch_add(1, Ordering::Relaxed);
-            eprintln!(
+            runtime_diagnostic!(
                 "[qwen36-layer-output-tap] call={} position={} cache_pos={} path={} phase_profile={} layer={} phase={} elems={} checksum={:016x} l2={:.8e} max_abs={:.8e} max_abs_idx={} head8={}",
                 call,
                 position,
@@ -1251,7 +1325,7 @@ fn emit_layer_output_taps(
             if qwen36_layer_output_delta_tap_matches(position, layer_idx, phase_idx) {
                 let delta_call =
                     QWEN36_LAYER_OUTPUT_DELTA_TAP_CALLS.fetch_add(1, Ordering::Relaxed);
-                eprintln!(
+                runtime_diagnostic!(
                     "[qwen36-layer-output-delta-tap] call={} position={} cache_pos={} path={} phase_profile={} layer={} phase={} elems={} checksum={:016x} bf16={}",
                     delta_call,
                     position,
@@ -1778,7 +1852,7 @@ fn download_hidden_bf16(
 ///     signal blow-up / collapse / NaN at production scale. Implies
 ///     `capture_per_layer` (we need the data to compute the norm).
 ///     Defaults from the `SUPERSONIC_QWEN36_DEBUG_TRACE_NORMS` env var
-///     — see `ChainedDecodeOptions::from_env`.
+///     through the explicit runtime execution options.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ChainedDecodeOptions {
     pub capture_per_layer: bool,
@@ -1796,10 +1870,9 @@ pub struct ChainedDecodeOptions {
 }
 
 impl ChainedDecodeOptions {
-    /// Default flags + the legacy `SUPERSONIC_QWEN36_DEBUG_TRACE_NORMS`
-    /// env var as the trace-norms enable. Production callers use this.
-    pub fn from_env() -> Self {
-        let trace_norms = std::env::var("SUPERSONIC_QWEN36_DEBUG_TRACE_NORMS")
+    /// Default flags plus explicitly installed runner diagnostics.
+    pub fn from_runtime_options() -> Self {
+        let trace_norms = execution_option("SUPERSONIC_QWEN36_DEBUG_TRACE_NORMS")
             .map(|v| !v.is_empty() && v != "0")
             .unwrap_or(false);
         Self {
@@ -1828,7 +1901,7 @@ pub fn run_chained_decode(
             // they call this entry point directly. The fast engine path
             // routes through `run_chained_decode_fast` (defined below).
             capture_per_layer: true,
-            trace_norms: ChainedDecodeOptions::from_env().trace_norms,
+            trace_norms: ChainedDecodeOptions::from_runtime_options().trace_norms,
             // The legacy capture path D2H-syncs every step anyway, so the
             // explicit per-step sync is redundant here (kept off).
             accurate_stage_timings: false,
@@ -1855,7 +1928,7 @@ pub fn run_chained_decode_fast(
     position: i32,
     accurate_stage_timings: bool,
 ) -> Result<DecodeOutputs> {
-    let mut options = ChainedDecodeOptions::from_env();
+    let mut options = ChainedDecodeOptions::from_runtime_options();
     options.accurate_stage_timings = accurate_stage_timings;
     run_chained_decode_with_options(
         ordinal,
@@ -1883,7 +1956,7 @@ pub fn run_chained_decode_fast_with_expert_prefetch(
     accurate_stage_timings: bool,
     expert_prefetch: &mut ExpertPrefetchCallback<'_>,
 ) -> Result<DecodeOutputs> {
-    let mut options = ChainedDecodeOptions::from_env();
+    let mut options = ChainedDecodeOptions::from_runtime_options();
     options.accurate_stage_timings = accurate_stage_timings;
     run_chained_decode_impl(
         ordinal,
@@ -1952,7 +2025,7 @@ pub fn run_chained_decode_fast_with_cache_pos(
     cache_pos: i32,
     accurate_stage_timings: bool,
 ) -> Result<DecodeOutputs> {
-    let mut options = ChainedDecodeOptions::from_env();
+    let mut options = ChainedDecodeOptions::from_runtime_options();
     options.accurate_stage_timings = accurate_stage_timings;
     run_chained_decode_impl_with_cache_pos(
         ordinal,
@@ -1979,7 +2052,7 @@ pub fn run_chained_decode_fast_with_expert_prefetch_and_cache_pos(
     accurate_stage_timings: bool,
     expert_prefetch: &mut ExpertPrefetchCallback<'_>,
 ) -> Result<DecodeOutputs> {
-    let mut options = ChainedDecodeOptions::from_env();
+    let mut options = ChainedDecodeOptions::from_runtime_options();
     options.accurate_stage_timings = accurate_stage_timings;
     run_chained_decode_impl_with_cache_pos(
         ordinal,
@@ -2044,11 +2117,15 @@ fn run_chained_decode_impl_with_cache_pos(
         .max()
         .unwrap_or(0);
     let full_attn_tap_regions =
-        usize::from(std::env::var_os("SUPERSONIC_METAL_QWEN36_FULL_ATTN_SCORE_TAP").is_some())
-            + usize::from(std::env::var_os("SUPERSONIC_METAL_QWEN36_FULL_ATTN_PROB_TAP").is_some())
-            + usize::from(std::env::var_os("SUPERSONIC_METAL_QWEN36_FULL_ATTN_EXP_TAP").is_some())
+        usize::from(execution_option_os("SUPERSONIC_METAL_QWEN36_FULL_ATTN_SCORE_TAP").is_some())
             + usize::from(
-                std::env::var_os("SUPERSONIC_METAL_QWEN36_FULL_ATTN_DENOM_TAP").is_some(),
+                execution_option_os("SUPERSONIC_METAL_QWEN36_FULL_ATTN_PROB_TAP").is_some(),
+            )
+            + usize::from(
+                execution_option_os("SUPERSONIC_METAL_QWEN36_FULL_ATTN_EXP_TAP").is_some(),
+            )
+            + usize::from(
+                execution_option_os("SUPERSONIC_METAL_QWEN36_FULL_ATTN_DENOM_TAP").is_some(),
             );
     let attn_extra_regions = full_attn_tap_regions.max(1);
     let attn_extra = if max_kv_t > 0 {
@@ -2077,7 +2154,7 @@ fn run_chained_decode_impl_with_cache_pos(
         .context("alloc ffn_workspace")?;
 
     let native_full_attn_rope = if hidden_a.backend() == Backend::Metal
-        && std::env::var_os("SUPERSONIC_METAL_ENABLE_QWEN36_FULL_ATTN_NATIVE").is_some()
+        && execution_option_os("SUPERSONIC_METAL_ENABLE_QWEN36_FULL_ATTN_NATIVE").is_some()
     {
         Some(
             DecodeRotaryRow::build(ordinal, position, geom.rotary_dim as usize, geom.rope_theta)
@@ -2113,7 +2190,7 @@ fn run_chained_decode_impl_with_cache_pos(
             .map(|x| x * x)
             .sum::<f32>()
             .sqrt();
-        eprintln!("[trace] step pos={position} init_hidden L2={init_norm:.4}");
+        runtime_diagnostic!("[trace] step pos={position} init_hidden L2={init_norm:.4}");
     }
 
     let metal_decode_batch_requested = hidden_a.backend() == Backend::Metal
@@ -2283,9 +2360,10 @@ fn run_chained_decode_impl_with_cache_pos(
             output_buf.backend() == Backend::Metal
                 && !capture
                 && expert_prefetch.is_none()
-                && std::env::var_os("SUPERSONIC_METAL_DISABLE_QWEN36_LINEAR_DECODE_DIRECT")
+                && execution_option_os("SUPERSONIC_METAL_DISABLE_QWEN36_LINEAR_DECODE_DIRECT")
                     .is_none()
-                && std::env::var_os("SUPERSONIC_METAL_DISABLE_QWEN36_LINEAR_INT4_STAGE5").is_none()
+                && execution_option_os("SUPERSONIC_METAL_DISABLE_QWEN36_LINEAR_INT4_STAGE5")
+                    .is_none()
                 && (metal_decode_batch_active || ffn_stage5_router_defer_wait_enabled())
                 && ffn_stage5_router_metal_native_supported(params, &weights, &int4)
         };
@@ -2656,7 +2734,7 @@ fn run_chained_decode_impl_with_cache_pos(
                 } else {
                     "lin "
                 };
-                eprintln!(
+                runtime_diagnostic!(
                     "[trace]   layer {layer_idx:2} {kind} attn  L2={l2:.4}{}",
                     if nan { " NaN!" } else { "" }
                 );
@@ -2958,7 +3036,7 @@ fn run_chained_decode_impl_with_cache_pos(
                 let v = bf16_bytes_to_f32(&ffn_out_bytes);
                 let l2 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
                 let nan = v.iter().any(|x| !x.is_finite());
-                eprintln!(
+                runtime_diagnostic!(
                     "[trace]   layer {layer_idx:2}      ffn   L2={l2:.4}{}",
                     if nan { " NaN!" } else { "" }
                 );
@@ -3087,8 +3165,42 @@ mod tests {
     use super::{
         decode_batch_route_snapshot_checksum, decode_batch_route_snapshot_u32,
         decode_batch_shared_snapshot_f32, decode_batch_shared_snapshot_u16,
-        format_decode_batch_route_snapshot,
+        emit_runtime_diagnostic, execution_option, format_decode_batch_route_snapshot,
+        Qwen36ExecutionOptions,
     };
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn execution_diagnostics_require_explicit_options_and_observer() {
+        assert!(execution_option("SUPERSONIC_TEST_OPTION").is_err());
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        let observer_messages = Arc::clone(&messages);
+        let options = Qwen36ExecutionOptions::from_pairs([(
+            "SUPERSONIC_TEST_OPTION".to_string(),
+            "selected-by-runner".to_string(),
+        )])
+        .with_diagnostic_observer(Arc::new(move |message| {
+            observer_messages
+                .lock()
+                .expect("lock diagnostic messages")
+                .push(message.to_string());
+        }));
+
+        {
+            let _guard = options.install();
+            assert_eq!(
+                execution_option("SUPERSONIC_TEST_OPTION").as_deref(),
+                Ok("selected-by-runner")
+            );
+            emit_runtime_diagnostic("runtime event".to_string());
+        }
+
+        assert!(execution_option("SUPERSONIC_TEST_OPTION").is_err());
+        assert_eq!(
+            *messages.lock().expect("lock diagnostic messages"),
+            vec!["runtime event".to_string()]
+        );
+    }
 
     #[test]
     fn decode_batch_route_snapshot_formats_captured_layers() {
