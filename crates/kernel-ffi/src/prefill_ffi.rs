@@ -30,6 +30,7 @@ pub struct PrefillFfiLaunchOptions {
     pub disable_int4_gemv_m1: bool,
     pub disable_int4_gemv_m1_tiled: bool,
     pub metal_profile: bool,
+    pub metal_profile_qwen36_ffn_phases: bool,
     pub ffi_profile_shapes: bool,
 }
 
@@ -447,7 +448,23 @@ pub extern "C" fn supersonic_metal_profile_record(
     if !metal_profile_enabled() || op.is_null() || path.is_null() || !elapsed_ms.is_finite() {
         return;
     }
+    record_metal_profile_ffi_sample(op, path, elapsed_ms);
+}
 
+#[no_mangle]
+pub extern "C" fn supersonic_metal_profile_record_explicit(
+    enabled: c_int,
+    op: *const c_char,
+    path: *const c_char,
+    elapsed_ms: f64,
+) {
+    if enabled == 0 || op.is_null() || path.is_null() || !elapsed_ms.is_finite() {
+        return;
+    }
+    record_metal_profile_ffi_sample(op, path, elapsed_ms);
+}
+
+fn record_metal_profile_ffi_sample(op: *const c_char, path: *const c_char, elapsed_ms: f64) {
     let op = unsafe { CStr::from_ptr(op) }.to_string_lossy().into_owned();
     let path = unsafe { CStr::from_ptr(path) }
         .to_string_lossy()

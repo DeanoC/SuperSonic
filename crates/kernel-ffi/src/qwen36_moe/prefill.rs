@@ -12981,25 +12981,50 @@ unsafe fn batched_prefill_grouped_expert_direct_metal_launch_raw_impl(
     }
     let _ = ordinal;
     let launch = || unsafe {
-        crate::metal_native::qwen36_batched_prefill_grouped_expert_direct(
-            n_tokens,
-            top_k,
-            hidden,
-            moe_intermediate,
-            group_size,
-            x_norm.as_ptr(),
-            topk_idx.as_ptr(),
-            topk_weight.as_ptr(),
-            gate_up_proj,
-            gate_up_scale,
-            gate_up_zero,
-            down_proj,
-            down_scale,
-            down_zero,
-            expert_mid.as_mut_ptr(),
-            combined.as_mut_ptr(),
-            true,
-        )
+        match options {
+            Some(options) => {
+                crate::metal_native::qwen36_batched_prefill_grouped_expert_direct_with_options(
+                    n_tokens,
+                    top_k,
+                    hidden,
+                    moe_intermediate,
+                    group_size,
+                    x_norm.as_ptr(),
+                    topk_idx.as_ptr(),
+                    topk_weight.as_ptr(),
+                    gate_up_proj,
+                    gate_up_scale,
+                    gate_up_zero,
+                    down_proj,
+                    down_scale,
+                    down_zero,
+                    expert_mid.as_mut_ptr(),
+                    combined.as_mut_ptr(),
+                    options.metal_profile,
+                    options.metal_profile_qwen36_ffn_phases,
+                    true,
+                )
+            }
+            None => crate::metal_native::qwen36_batched_prefill_grouped_expert_direct(
+                n_tokens,
+                top_k,
+                hidden,
+                moe_intermediate,
+                group_size,
+                x_norm.as_ptr(),
+                topk_idx.as_ptr(),
+                topk_weight.as_ptr(),
+                gate_up_proj,
+                gate_up_scale,
+                gate_up_zero,
+                down_proj,
+                down_scale,
+                down_zero,
+                expert_mid.as_mut_ptr(),
+                combined.as_mut_ptr(),
+                true,
+            ),
+        }
     };
     match options {
         Some(options) => batched_prefill_grouped_expert_profile_with_options(options, launch),
@@ -13432,6 +13457,96 @@ mod tests {
 
     static PROFILE_POLICY_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+    type ExplicitGroupedExpertNativeLauncher = unsafe fn(
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        *const c_void,
+        *const c_void,
+        *const c_void,
+        *const c_void,
+        *const c_void,
+        *const c_void,
+        *const c_void,
+        *const c_void,
+        *const c_void,
+        *mut c_void,
+        *mut c_void,
+        bool,
+        bool,
+        bool,
+    ) -> Result<(), GpuError>;
+
+    fn source_function<'a>(source: &'a str, marker: &str) -> &'a str {
+        let marker_start = source
+            .find(marker)
+            .unwrap_or_else(|| panic!("missing source marker: {marker}"));
+        let body_start = source[marker_start..]
+            .find('{')
+            .map(|offset| marker_start + offset)
+            .unwrap_or_else(|| panic!("missing function body for: {marker}"));
+        let mut depth = 0usize;
+        for (offset, ch) in source[body_start..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[marker_start..body_start + offset + 1];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unterminated function body for: {marker}");
+    }
+
+    #[test]
+    fn grouped_expert_native_profile_policy_has_compiled_abi_and_objcpp_wiring() {
+        let _: ExplicitGroupedExpertNativeLauncher =
+            crate::metal_native::qwen36_batched_prefill_grouped_expert_direct_with_options;
+
+        let rust_source = include_str!("../metal_native.rs");
+        let rust_explicit = source_function(
+            rust_source,
+            "pub(crate) unsafe fn qwen36_batched_prefill_grouped_expert_direct_with_options(",
+        );
+        assert!(rust_explicit
+            .contains("supersonic_metal_qwen36_batched_ffn_grouped_expert_direct_with_options("));
+        assert!(rust_explicit.contains("i32::from(profile_enabled)"));
+        assert!(rust_explicit.contains("i32::from(phase_profile_enabled)"));
+
+        let objcpp_source = include_str!("../metal_native.mm");
+        assert!(objcpp_source.contains("#include \"metal_native_ffi.h\""));
+        let objcpp_explicit = source_function(
+            objcpp_source,
+            "extern \"C\" int supersonic_metal_qwen36_batched_ffn_grouped_expert_direct_with_options(",
+        );
+        assert!(objcpp_explicit.contains("profile_enabled != 0"));
+        assert!(objcpp_explicit.contains("phase_profile_enabled != 0"));
+        assert!(objcpp_explicit.contains("qwen36_batched_ffn_grouped_expert_direct_impl("));
+        assert!(!objcpp_explicit.contains("qwen36_ffn_phase_profile_enabled()"));
+
+        let objcpp_legacy = source_function(
+            objcpp_source,
+            "extern \"C\" int supersonic_metal_qwen36_batched_ffn_grouped_expert_direct(",
+        );
+        assert!(objcpp_legacy.contains("MetalProfilePolicy::Ambient"));
+        assert!(objcpp_legacy.contains("qwen36_ffn_phase_profile_enabled()"));
+
+        let objcpp_impl = source_function(
+            objcpp_source,
+            "int qwen36_batched_ffn_grouped_expert_direct_impl(",
+        );
+        assert!(objcpp_impl.contains("MetalProfilePolicy profile_policy"));
+        assert!(objcpp_impl.contains("bool split_profile"));
+        assert!(objcpp_impl.contains("encode_or_submit_labeled_with_profile_policy("));
+        assert!(objcpp_impl.contains("encode_or_submit_labeled_async_with_profile_policy("));
+        assert!(!objcpp_impl.contains("qwen36_ffn_phase_profile_enabled()"));
+    }
+
     #[test]
     fn lm_head_has_explicit_options_aware_single_and_batched_entry_points() {
         let _ = lm_head_launch_with_options;
@@ -13487,6 +13602,209 @@ mod tests {
         batched_prefill_grouped_expert_profile_with_options(&explicit_off, || ());
         assert_eq!(crate::prefill_ffi::metal_profile_snapshot().total_calls, 0);
         crate::prefill_ffi::metal_profile_set_enabled(false);
+    }
+
+    #[cfg(all(target_os = "macos", supersonic_backend_metal))]
+    #[test]
+    fn real_metal_grouped_expert_launcher_obeys_explicit_profile_and_phase_policy() {
+        struct ProfilePolicyRestore {
+            profile_enabled: bool,
+            phase_profile_env: Option<std::ffi::OsString>,
+        }
+
+        impl Drop for ProfilePolicyRestore {
+            fn drop(&mut self) {
+                crate::prefill_ffi::metal_profile_reset();
+                crate::prefill_ffi::metal_profile_set_enabled(self.profile_enabled);
+                unsafe {
+                    match &self.phase_profile_env {
+                        Some(value) => {
+                            std::env::set_var("SUPERSONIC_METAL_PROFILE_QWEN36_FFN_PHASES", value)
+                        }
+                        None => std::env::remove_var("SUPERSONIC_METAL_PROFILE_QWEN36_FFN_PHASES"),
+                    }
+                }
+            }
+        }
+
+        fn entry_calls(
+            snapshot: &crate::prefill_ffi::MetalProfileSnapshot,
+            op: &str,
+            path: &str,
+        ) -> u64 {
+            snapshot
+                .entries
+                .iter()
+                .find(|entry| entry.op == op && entry.path == path)
+                .map_or(0, |entry| entry.calls)
+        }
+
+        let _lock = PROFILE_POLICY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _restore = ProfilePolicyRestore {
+            profile_enabled: crate::prefill_ffi::metal_profile_enabled(),
+            phase_profile_env: std::env::var_os("SUPERSONIC_METAL_PROFILE_QWEN36_FFN_PHASES"),
+        };
+        gpu_hal::set_backend(Backend::Metal);
+        let ordinal = 0usize;
+        let n_tokens = 1usize;
+        let top_k = 1usize;
+        let hidden = 2usize;
+        let moe_intermediate = 2usize;
+        let group_size = 2usize;
+
+        let x_norm = upload_bf16(ordinal, &[n_tokens, hidden], &[1.0, 0.5]);
+        let topk_idx = GpuBuffer::from_host_bytes(
+            ordinal,
+            ScalarType::U32,
+            &[n_tokens, top_k],
+            &0u32.to_le_bytes(),
+        )
+        .expect("upload top-k index");
+        let topk_weight = upload_bf16(ordinal, &[n_tokens, top_k], &[1.0]);
+        let (gate_up_proj, gate_up_scale, gate_up_zero) = upload_int4_rows(
+            ordinal,
+            2 * moe_intermediate,
+            hidden,
+            group_size,
+            &[vec![1, 2], vec![2, 1], vec![3, 1], vec![1, 3]],
+            0.25,
+        );
+        let (down_proj, down_scale, down_zero) = upload_int4_rows(
+            ordinal,
+            hidden,
+            moe_intermediate,
+            group_size,
+            &[vec![2, 1], vec![1, 2]],
+            0.25,
+        );
+        let mut expert_mid = GpuBuffer::zeros(
+            ordinal,
+            ScalarType::F32,
+            &[n_tokens * top_k, moe_intermediate],
+        )
+        .expect("allocate expert mid");
+        let mut combined = GpuBuffer::zeros(ordinal, ScalarType::BF16, &[n_tokens, hidden])
+            .expect("allocate combined");
+
+        let mut launch = |options: &crate::prefill_ffi::PrefillFfiLaunchOptions| unsafe {
+            batched_prefill_grouped_expert_direct_metal_launch_raw_with_options(
+                ordinal,
+                n_tokens,
+                top_k,
+                hidden,
+                moe_intermediate,
+                group_size,
+                &x_norm,
+                &topk_idx,
+                &topk_weight,
+                gate_up_proj.as_ptr(),
+                gate_up_scale.as_ptr(),
+                gate_up_zero.as_ptr(),
+                down_proj.as_ptr(),
+                down_scale.as_ptr(),
+                down_zero.as_ptr(),
+                &mut expert_mid,
+                &mut combined,
+                options,
+            )
+        };
+
+        unsafe {
+            std::env::remove_var("SUPERSONIC_METAL_PROFILE_QWEN36_FFN_PHASES");
+        }
+        crate::prefill_ffi::metal_profile_reset();
+        crate::prefill_ffi::metal_profile_set_enabled(false);
+        let explicit_on = crate::prefill_ffi::PrefillFfiLaunchOptions {
+            metal_profile: true,
+            metal_profile_qwen36_ffn_phases: true,
+            ..crate::prefill_ffi::PrefillFfiLaunchOptions::default()
+        };
+        launch(&explicit_on).expect("launch with explicit profiling enabled");
+        let explicit_on_snapshot = crate::prefill_ffi::metal_profile_snapshot();
+        assert_eq!(
+            entry_calls(
+                &explicit_on_snapshot,
+                "command_buffer_gpu:qwen36_batched_prefill_grouped_expert_gate_up",
+                "runtime",
+            ),
+            1
+        );
+        assert_eq!(
+            entry_calls(
+                &explicit_on_snapshot,
+                "command_buffer_gpu:qwen36_batched_prefill_grouped_expert_down_combine",
+                "runtime",
+            ),
+            1
+        );
+        assert_eq!(
+            entry_calls(
+                &explicit_on_snapshot,
+                "command_buffer_gpu:qwen36_batched_prefill_grouped_expert_direct",
+                "runtime",
+            ),
+            0
+        );
+        assert!(
+            entry_calls(&explicit_on_snapshot, "command_buffer_create", "runtime") >= 2,
+            "explicit-on/global-off must retain native runtime records: {explicit_on_snapshot:?}"
+        );
+
+        unsafe {
+            std::env::set_var("SUPERSONIC_METAL_PROFILE_QWEN36_FFN_PHASES", "1");
+        }
+        crate::prefill_ffi::metal_profile_reset();
+        crate::prefill_ffi::metal_profile_set_enabled(true);
+        let explicit_off = crate::prefill_ffi::PrefillFfiLaunchOptions::default();
+        launch(&explicit_off).expect("launch with explicit profiling disabled");
+        assert_eq!(
+            crate::prefill_ffi::metal_profile_snapshot().total_calls,
+            0,
+            "explicit-off/global-on must suppress outer and native records"
+        );
+
+        crate::prefill_ffi::metal_profile_reset();
+        let observe_explicit_phase_off = crate::prefill_ffi::PrefillFfiLaunchOptions {
+            metal_profile: true,
+            metal_profile_qwen36_ffn_phases: false,
+            ..crate::prefill_ffi::PrefillFfiLaunchOptions::default()
+        };
+        launch(&observe_explicit_phase_off).expect("launch with explicit phase profiling disabled");
+        let explicit_phase_off_snapshot = crate::prefill_ffi::metal_profile_snapshot();
+        assert_eq!(
+            entry_calls(
+                &explicit_phase_off_snapshot,
+                "command_buffer_gpu:qwen36_batched_prefill_grouped_expert_direct",
+                "runtime",
+            ),
+            1
+        );
+        assert_eq!(
+            entry_calls(
+                &explicit_phase_off_snapshot,
+                "command_buffer_gpu:qwen36_batched_prefill_grouped_expert_gate_up",
+                "runtime",
+            ),
+            0
+        );
+        assert_eq!(
+            entry_calls(
+                &explicit_phase_off_snapshot,
+                "command_buffer_gpu:qwen36_batched_prefill_grouped_expert_down_combine",
+                "runtime",
+            ),
+            0
+        );
+
+        crate::prefill_ffi::metal_profile_set_enabled(false);
+        let output = read_bf16(&combined);
+        assert!(
+            output.iter().all(|value| value.is_finite())
+                && output.iter().any(|value| *value != 0.0),
+            "real grouped-expert launcher produced invalid output: {output:?}"
+        );
     }
 
     #[test]

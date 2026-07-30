@@ -164,6 +164,7 @@ pub(crate) fn execution_options_from_environment() -> Qwen36ExecutionOptions {
         disable_int4_gemv_m1: flag("SUPERSONIC_METAL_DISABLE_INT4_GEMV_M1"),
         disable_int4_gemv_m1_tiled: flag("SUPERSONIC_METAL_DISABLE_INT4_GEMV_M1_TILED"),
         metal_profile: flag("SUPERSONIC_METAL_PROFILE"),
+        metal_profile_qwen36_ffn_phases: options.metal.profile_ffn_phases,
         ffi_profile_shapes: flag("SUPERSONIC_DFLASH_PROFILE_FFI_SHAPES"),
     };
     options.with_diagnostic_observer(Arc::new(|message| eprintln!("{message}")))
