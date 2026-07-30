@@ -13,9 +13,12 @@ use tokenizers::Tokenizer;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::{OwnedSemaphorePermit, TryAcquireError};
 
-use crate::prefix_cache::CacheRequest;
+use crate::prefix_cache::{supported_cache_request, CacheRequest};
 use crate::sampling::{rng_from_seed, sample};
-use crate::session::{should_use_dflash_generation, InferenceSession};
+use crate::session::{
+    classify_session_failure, is_session_cancellation, should_use_dflash_generation,
+    InferenceSession, SessionFailureClass,
+};
 use crate::state::ServerState;
 
 const CACHE_ANCHOR_SUFFIX_TOKENS: usize = 16;
@@ -218,6 +221,9 @@ pub fn spawn(
     params: GenParams,
     cache: Option<CacheRequest>,
 ) -> Result<UnboundedReceiver<GenEvent>> {
+    if !state.is_ready() {
+        anyhow::bail!("inference server is not ready after an integrity failure");
+    }
     let (tx, rx) = mpsc::unbounded_channel();
 
     let scheduler = state.scheduler.clone();
@@ -372,6 +378,26 @@ fn run(
     cache: Option<CacheRequest>,
     tx: UnboundedSender<GenEvent>,
 ) -> Result<()> {
+    if !state.is_ready() {
+        anyhow::bail!("inference server is not ready after an integrity failure");
+    }
+    let result = run_inner(state.clone(), prompt_ids, params, cache, tx);
+    if let Err(error) = &result {
+        if classify_session_failure(error) == SessionFailureClass::IntegrityLost {
+            state.mark_integrity_lost();
+            tracing::error!(error = %error, "generation lost engine integrity");
+        }
+    }
+    result
+}
+
+fn run_inner(
+    state: Arc<ServerState>,
+    prompt_ids: Vec<u32>,
+    params: GenParams,
+    cache: Option<CacheRequest>,
+    tx: UnboundedSender<GenEvent>,
+) -> Result<()> {
     let tokenizer = state.tokenizer.clone();
     let prompt_tokens = prompt_ids.len() as u32;
     let mut cached_prompt_tokens = 0u32;
@@ -427,32 +453,12 @@ fn run(
     if !features.plain_prefill_decode {
         anyhow::bail!("loaded session does not expose a supported generation path");
     }
+    let cache = supported_cache_request(features, cache.as_ref());
 
-    let prefill_logits = if let Some(cache_req) = cache.as_ref() {
-        if let Some(hit) = state.prefix_cache.lookup(cache_req, &prompt_ids) {
-            match guard.restore_prefix(hit.snapshot) {
-                Ok(mut logits) => {
-                    cached_prompt_tokens = hit.cached_tokens as u32;
-                    for (idx, token) in prompt_ids
-                        .iter()
-                        .copied()
-                        .enumerate()
-                        .skip(hit.cached_tokens)
-                    {
-                        logits = guard.decode_step(token, idx)?;
-                    }
-                    logits
-                }
-                Err(e) => {
-                    tracing::warn!("prefix cache restore failed: {e}");
-                    state.prefix_cache.record_restore_failure();
-                    guard.reset()?;
-                    guard.prefill(&prompt_ids)?
-                }
-            }
-        } else if let Some(hit) = state.prefix_cache.lookup_disk_bytes(cache_req, &prompt_ids) {
-            match guard.load_disk_prefix(&hit.bytes) {
-                Ok(snapshot) => match guard.restore_prefix(snapshot) {
+    let prefill_result = (|| -> Result<Vec<f32>> {
+        if let Some(cache_req) = cache {
+            if let Some(hit) = state.prefix_cache.lookup(cache_req, &prompt_ids) {
+                match guard.restore_prefix(hit.snapshot) {
                     Ok(mut logits) => {
                         cached_prompt_tokens = hit.cached_tokens as u32;
                         for (idx, token) in prompt_ids
@@ -461,34 +467,76 @@ fn run(
                             .enumerate()
                             .skip(hit.cached_tokens)
                         {
+                            if tx.is_closed() {
+                                return Err(crate::session::SessionCancelled.into());
+                            }
                             logits = guard.decode_step(token, idx)?;
                         }
-                        logits
+                        Ok(logits)
                     }
                     Err(e) => {
-                        tracing::warn!("prefix cache disk restore failed: {e}");
+                        tracing::warn!("prefix cache restore failed: {e}");
                         state.prefix_cache.record_restore_failure();
                         guard.reset()?;
-                        prefill_with_cache_anchor(&mut guard, &state, cache_req, &prompt_ids)?
+                        guard.prefill_cancellable(&prompt_ids, || tx.is_closed())
                     }
-                },
-                Err(e) => {
-                    tracing::warn!("prefix cache disk load failed: {e}");
-                    state.prefix_cache.record_restore_failure();
-                    guard.reset()?;
-                    prefill_with_cache_anchor(&mut guard, &state, cache_req, &prompt_ids)?
                 }
+            } else if let Some(hit) = state.prefix_cache.lookup_disk_bytes(cache_req, &prompt_ids) {
+                match guard.load_disk_prefix(&hit.bytes) {
+                    Ok(snapshot) => match guard.restore_prefix(snapshot) {
+                        Ok(mut logits) => {
+                            cached_prompt_tokens = hit.cached_tokens as u32;
+                            for (idx, token) in prompt_ids
+                                .iter()
+                                .copied()
+                                .enumerate()
+                                .skip(hit.cached_tokens)
+                            {
+                                if tx.is_closed() {
+                                    return Err(crate::session::SessionCancelled.into());
+                                }
+                                logits = guard.decode_step(token, idx)?;
+                            }
+                            Ok(logits)
+                        }
+                        Err(e) => {
+                            tracing::warn!("prefix cache disk restore failed: {e}");
+                            state.prefix_cache.record_restore_failure();
+                            guard.reset()?;
+                            prefill_with_cache_anchor(
+                                &mut guard,
+                                &state,
+                                cache_req,
+                                &prompt_ids,
+                                &tx,
+                            )
+                        }
+                    },
+                    Err(e) => {
+                        tracing::warn!("prefix cache disk load failed: {e}");
+                        state.prefix_cache.record_restore_failure();
+                        guard.reset()?;
+                        prefill_with_cache_anchor(&mut guard, &state, cache_req, &prompt_ids, &tx)
+                    }
+                }
+            } else {
+                guard.reset()?;
+                prefill_with_cache_anchor(&mut guard, &state, cache_req, &prompt_ids, &tx)
             }
         } else {
             guard.reset()?;
-            prefill_with_cache_anchor(&mut guard, &state, cache_req, &prompt_ids)?
+            guard.prefill_cancellable(&prompt_ids, || tx.is_closed())
         }
-    } else {
-        guard.reset()?;
-        guard.prefill(&prompt_ids)?
+    })();
+    let prefill_logits = match prefill_result {
+        Err(error) if is_session_cancellation(&error) => {
+            guard.reset()?;
+            return Ok(());
+        }
+        result => result?,
     };
 
-    if let Some(cache_req) = cache.as_ref() {
+    if let Some(cache_req) = cache {
         snapshot_prefix_if_admitted(&guard, &state, cache_req, &prompt_ids, &prefill_logits);
     }
 
@@ -512,6 +560,11 @@ fn run(
     let mut completion_tokens: u32 = 0;
 
     let finish = loop {
+        if tx.is_closed() {
+            guard.reset()?;
+            return Ok(());
+        }
+
         // Budget check first — prevents emitting a token when the caller
         // asked for `max_tokens == N` and we've already produced N.
         if completion_tokens as usize >= params.max_tokens {
@@ -540,7 +593,10 @@ fn run(
             let trimmed = &decoded[..stop_at];
             let delta = incremental_delta(&prev_decoded, trimmed);
             if !delta.is_empty() {
-                let _ = tx.send(GenEvent::Token(delta));
+                if tx.send(GenEvent::Token(delta)).is_err() {
+                    guard.reset()?;
+                    return Ok(());
+                }
             }
             break FinishReason::Stop;
         }
@@ -549,8 +605,8 @@ fn run(
         prev_decoded = decoded;
 
         if !delta.is_empty() && tx.send(GenEvent::Token(delta)).is_err() {
-            // Receiver dropped — client disconnected. Bail out.
-            break FinishReason::Stop;
+            guard.reset()?;
+            return Ok(());
         }
 
         if finish_after_emitted_token(completion_tokens, params.max_tokens).is_some() {
@@ -571,7 +627,7 @@ fn run(
     };
 
     if state_token_ids.len() > prompt_ids.len() {
-        if let Some(cache_req) = cache.as_ref() {
+        if let Some(cache_req) = cache {
             snapshot_prefix_if_admitted(
                 &guard,
                 &state,
@@ -659,18 +715,22 @@ fn prefill_with_cache_anchor(
     state: &ServerState,
     cache_req: &CacheRequest,
     prompt_ids: &[u32],
+    tx: &UnboundedSender<GenEvent>,
 ) -> Result<Vec<f32>> {
     let min_tokens = state.prefix_cache.config().min_tokens;
     let Some(anchor_len) = prompt_ids.len().checked_sub(CACHE_ANCHOR_SUFFIX_TOKENS) else {
-        return guard.prefill(prompt_ids);
+        return guard.prefill_cancellable(prompt_ids, || tx.is_closed());
     };
     if anchor_len < min_tokens || anchor_len == 0 {
-        return guard.prefill(prompt_ids);
+        return guard.prefill_cancellable(prompt_ids, || tx.is_closed());
     }
 
-    let mut logits = guard.prefill(&prompt_ids[..anchor_len])?;
+    let mut logits = guard.prefill_cancellable(&prompt_ids[..anchor_len], || tx.is_closed())?;
     snapshot_prefix_if_admitted(guard, state, cache_req, &prompt_ids[..anchor_len], &logits);
     for (idx, token) in prompt_ids.iter().copied().enumerate().skip(anchor_len) {
+        if tx.is_closed() {
+            return Err(crate::session::SessionCancelled.into());
+        }
         logits = guard.decode_step(token, idx)?;
     }
     Ok(logits)
@@ -683,6 +743,9 @@ fn snapshot_prefix_if_admitted(
     token_ids: &[u32],
     logits: &[f32],
 ) {
+    if !guard.features().prefix_snapshot {
+        return;
+    }
     let estimate = guard.prefix_snapshot_bytes(logits.len());
     if !state.prefix_cache.can_admit(token_ids.len(), estimate) {
         state.prefix_cache.record_admission_skip();
@@ -790,7 +853,95 @@ pub type Session = InferenceSession;
 
 #[cfg(test)]
 mod tests {
-    use super::{finish_after_emitted_token, incremental_delta, FinishReason};
+    use std::path::PathBuf;
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+
+    use tokio::sync::{mpsc, Mutex};
+
+    use super::{
+        finish_after_emitted_token, incremental_delta, run, spawn, FinishReason, GenEvent,
+        GenParams,
+    };
+    use crate::prefix_cache::{CacheRequest, CacheRetention, PrefixCache, PrefixCacheConfig};
+    use crate::session::{
+        qwen36_moe_features, DeterministicSession, DeterministicSessionEvent, InferenceSession,
+    };
+    use crate::state::{GenerationScheduler, ServerState};
+    use supersonic_core::capabilities::capabilities_for_variant;
+    use supersonic_core::registry::{ModelFamily, ModelVariant};
+
+    fn tokenizer() -> tokenizers::Tokenizer {
+        tokenizers::Tokenizer::from_bytes(
+            r#"{"version":"1.0","model":{"type":"WordLevel","vocab":{"[UNK]":0,"hello":1,"world":2},"unk_token":"[UNK]"}}"#,
+        )
+        .expect("deterministic tokenizer")
+    }
+
+    fn params(max_tokens: usize) -> GenParams {
+        GenParams {
+            temperature: 0.0,
+            top_p: 1.0,
+            max_tokens,
+            stop: Vec::new(),
+            seed: Some(7),
+        }
+    }
+
+    fn test_state(session: InferenceSession) -> Arc<ServerState> {
+        Arc::new(ServerState {
+            server_instance_id: 42,
+            model_id: "qwen3.6-35b-a3b".to_string(),
+            model_family: ModelFamily::Qwen36Moe,
+            tokenizer: Arc::new(tokenizer()),
+            chat_template: None,
+            session: Some(Arc::new(Mutex::new(session))),
+            qwen36_moe_engine: None,
+            mock_generation: None,
+            eos_ids: Vec::new(),
+            max_context: 64,
+            api_key: None,
+            cors_allow_origin: None,
+            response_store_max_entries: 16,
+            scheduler: Arc::new(GenerationScheduler::new(4, 1_000)),
+            telemetry: super::GenerationTelemetry::default(),
+            capabilities: capabilities_for_variant(
+                &ModelVariant::Qwen3_6_35B_A3B,
+                gpu_hal::Backend::Hip,
+                true,
+                false,
+                false,
+            ),
+            prefix_cache: Arc::new(PrefixCache::new(PrefixCacheConfig {
+                enabled: true,
+                dir: PathBuf::new(),
+                min_tokens: 1,
+                max_entries: 4,
+                max_bytes: 1024 * 1024,
+                memory_ttl_secs: 600,
+                disk_ttl_secs: 86_400,
+            })),
+        })
+    }
+
+    fn cache_request() -> CacheRequest {
+        CacheRequest {
+            key: Some("shared-prefix".to_string()),
+            retention: CacheRetention::InMemory,
+            scope: "qwen36-test".to_string(),
+        }
+    }
+
+    fn done_stats(mut rx: mpsc::UnboundedReceiver<GenEvent>) -> super::GenerationStats {
+        loop {
+            match rx.try_recv() {
+                Ok(GenEvent::Done { stats, .. }) => return stats,
+                Ok(GenEvent::Token(_)) => {}
+                Ok(GenEvent::Error(error)) => panic!("unexpected generation error: {error}"),
+                Err(error) => panic!("missing done event: {error}"),
+            }
+        }
+    }
 
     #[test]
     fn prefix_case_returns_suffix() {
@@ -843,5 +994,160 @@ mod tests {
             Some(FinishReason::Length)
         ));
         assert!(finish_after_emitted_token(1, 2).is_none());
+    }
+
+    #[test]
+    fn qwen36_generation_orders_session_calls_bounds_decode_and_bypasses_cache() {
+        let (backend, events) = DeterministicSession::new(
+            qwen36_moe_features(),
+            vec![0.0, 5.0, 0.0],
+            vec![vec![0.0, 0.0, 7.0]],
+        );
+        let state = test_state(InferenceSession::Deterministic(backend));
+        let (tx, rx) = mpsc::unbounded_channel();
+
+        run(
+            state.clone(),
+            vec![1, 2],
+            params(2),
+            Some(cache_request()),
+            tx,
+        )
+        .unwrap();
+
+        let stats = done_stats(rx);
+        assert_eq!(stats.prompt_tokens, 2);
+        assert_eq!(stats.completion_tokens, 2);
+        assert_eq!(stats.cached_prompt_tokens, 0);
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                DeterministicSessionEvent::Reset,
+                DeterministicSessionEvent::Prefill(vec![1, 2]),
+                DeterministicSessionEvent::Decode {
+                    token_id: 1,
+                    pos: 2,
+                },
+            ]
+        );
+        let cache = state.prefix_cache.stats();
+        assert_eq!(cache.hits, 0);
+        assert_eq!(cache.misses, 0);
+        assert_eq!(cache.cached_tokens, 0);
+        assert_eq!(cache.entries, 0);
+        assert_eq!(cache.admission_skips, 0);
+    }
+
+    #[test]
+    fn disconnect_after_prefill_resets_request_state_without_decoding() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (backend, events) =
+            DeterministicSession::new(qwen36_moe_features(), vec![0.0, 5.0, 0.0], Vec::new());
+        let backend = backend.after_prefill(move || drop(rx));
+        let state = test_state(InferenceSession::Deterministic(backend));
+
+        run(state.clone(), vec![1, 2], params(4), None, tx).unwrap();
+
+        assert!(state.is_ready());
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                DeterministicSessionEvent::Reset,
+                DeterministicSessionEvent::Prefill(vec![1, 2]),
+                DeterministicSessionEvent::Reset,
+            ]
+        );
+    }
+
+    #[test]
+    fn integrity_failure_marks_server_unready_and_rejects_followup_generation() {
+        let (backend, events) =
+            DeterministicSession::new(qwen36_moe_features(), vec![0.0, 5.0, 0.0], Vec::new());
+        let state = test_state(InferenceSession::Deterministic(
+            backend.with_prefill_failure("HIP device lost during prefill"),
+        ));
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let error = run(state.clone(), vec![1], params(1), None, tx).unwrap_err();
+        assert!(error.to_string().contains("device lost"));
+        assert!(!state.is_ready());
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let rejected = run(state.clone(), vec![1], params(1), None, tx).unwrap_err();
+        assert!(rejected.to_string().contains("not ready"));
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                DeterministicSessionEvent::Reset,
+                DeterministicSessionEvent::Prefill(vec![1]),
+            ]
+        );
+    }
+
+    #[test]
+    fn request_local_failure_preserves_readiness_for_next_request() {
+        let (backend, events) =
+            DeterministicSession::new(qwen36_moe_features(), vec![0.0, 5.0, 0.0], Vec::new());
+        let state = test_state(InferenceSession::Deterministic(
+            backend.with_prefill_failure("context limit exceeded"),
+        ));
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        run(state.clone(), vec![1], params(1), None, tx).unwrap_err();
+        assert!(state.is_ready());
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        run(state.clone(), vec![1], params(1), None, tx).unwrap();
+        assert_eq!(done_stats(rx).completion_tokens, 1);
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                DeterministicSessionEvent::Reset,
+                DeterministicSessionEvent::Prefill(vec![1]),
+                DeterministicSessionEvent::Reset,
+                DeterministicSessionEvent::Prefill(vec![1]),
+            ]
+        );
+    }
+
+    #[test]
+    fn cancellation_cleanup_reset_failure_loses_integrity() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (backend, events) =
+            DeterministicSession::new(qwen36_moe_features(), vec![0.0, 5.0, 0.0], Vec::new());
+        let backend = backend
+            .with_reset_failures(vec![None, Some("reset sync failed")])
+            .after_prefill(move || drop(rx));
+        let state = test_state(InferenceSession::Deterministic(backend));
+
+        let error = run(state.clone(), vec![1], params(4), None, tx).unwrap_err();
+
+        assert!(error.to_string().contains("reset sync failed"));
+        assert!(!state.is_ready());
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                DeterministicSessionEvent::Reset,
+                DeterministicSessionEvent::Prefill(vec![1]),
+                DeterministicSessionEvent::Reset,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_rejects_unready_server_before_queue_or_stream_admission() {
+        let (backend, events) =
+            DeterministicSession::new(qwen36_moe_features(), vec![0.0, 5.0, 0.0], Vec::new());
+        let state = test_state(InferenceSession::Deterministic(backend));
+        state.mark_integrity_lost();
+
+        let error = spawn(state.clone(), vec![1], params(1), None)
+            .err()
+            .expect("unready server must reject synchronously");
+
+        assert!(error.to_string().contains("not ready"));
+        assert_eq!(state.scheduler.active.load(Ordering::SeqCst), 0);
+        assert_eq!(state.scheduler.queued.load(Ordering::SeqCst), 0);
+        assert!(events.lock().unwrap().is_empty());
     }
 }

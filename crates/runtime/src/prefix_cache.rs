@@ -9,9 +9,16 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::session::SessionSnapshot;
+use crate::session::{SessionFeatures, SessionSnapshot};
 
 const FORMAT_VERSION: u32 = 1;
+
+pub fn supported_cache_request(
+    features: SessionFeatures,
+    request: Option<&CacheRequest>,
+) -> Option<&CacheRequest> {
+    features.prefix_snapshot.then_some(request).flatten()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheRetention {
@@ -538,6 +545,7 @@ pub fn scope_from_parts(model_id: &str, api_key: Option<&str>, user: Option<&str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::SessionFeatures;
 
     #[test]
     fn retention_parser_accepts_openai_shapes() {
@@ -628,6 +636,31 @@ mod tests {
             disk_ttl_secs: 86_400,
         });
         assert!(!disabled.can_admit(10, 10));
+    }
+
+    #[test]
+    fn unsupported_session_capability_bypasses_cache_request() {
+        let request = CacheRequest {
+            key: Some("shared-prefix".to_string()),
+            retention: CacheRetention::InMemory,
+            scope: "qwen36".to_string(),
+        };
+        let unsupported = SessionFeatures {
+            plain_prefill_decode: true,
+            native_dflash_generate: false,
+            prefix_snapshot: false,
+            disk_prefix_snapshot: false,
+        };
+        let supported = SessionFeatures {
+            prefix_snapshot: true,
+            ..unsupported
+        };
+
+        assert!(supported_cache_request(unsupported, Some(&request)).is_none());
+        assert!(std::ptr::eq(
+            supported_cache_request(supported, Some(&request)).unwrap(),
+            &request
+        ));
     }
 
     #[test]

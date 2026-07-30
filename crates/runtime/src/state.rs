@@ -5,7 +5,7 @@
 
 use anyhow::{anyhow, bail, Result};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokenizers::Tokenizer;
 use tokio::sync::{Mutex, Semaphore};
@@ -54,6 +54,7 @@ pub struct GenerationScheduler {
     pub queued: AtomicUsize,
     pub max_queue: usize,
     pub queue_timeout_ms: u64,
+    ready: AtomicBool,
 }
 
 impl GenerationScheduler {
@@ -64,7 +65,18 @@ impl GenerationScheduler {
             queued: AtomicUsize::new(0),
             max_queue,
             queue_timeout_ms,
+            ready: AtomicBool::new(true),
         }
+    }
+}
+
+impl ServerState {
+    pub fn is_ready(&self) -> bool {
+        self.scheduler.ready.load(Ordering::Acquire)
+    }
+
+    pub fn mark_integrity_lost(&self) {
+        self.scheduler.ready.store(false, Ordering::Release);
     }
 }
 
@@ -238,8 +250,8 @@ pub fn build_resolved(
             (
                 tokenizer,
                 chat_template,
+                Some(Arc::new(Mutex::new(InferenceSession::Qwen36Moe(engine)))),
                 None,
-                Some(Arc::new(Mutex::new(engine))),
                 eos_ids,
             )
         }
