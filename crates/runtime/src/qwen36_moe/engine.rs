@@ -1805,76 +1805,9 @@ fn qwen36_geom(text: &qwen36_moe::config::TextConfig) -> MultiLayerGeom {
 }
 
 fn profile_gpu_load<T>(load: impl FnOnce() -> Result<T>) -> (Result<T>, HalProfileSnapshot) {
-    let outer_profile_active = gpu_hal::hal_profile_enabled();
-    let before = gpu_hal::hal_profile_snapshot();
-    if !outer_profile_active {
-        gpu_hal::hal_profile_set_enabled(true);
-    }
+    let capture = gpu_hal::HalProfileCapture::begin();
     let result = load();
-    let after = gpu_hal::hal_profile_snapshot();
-    if !outer_profile_active {
-        gpu_hal::hal_profile_set_enabled(false);
-    }
-    (result, hal_profile_delta(&before, &after))
-}
-
-fn hal_profile_delta(
-    before: &HalProfileSnapshot,
-    after: &HalProfileSnapshot,
-) -> HalProfileSnapshot {
-    let mut delta = HalProfileSnapshot::default();
-    for after_entry in &after.entries {
-        let before_entry = before
-            .entries
-            .iter()
-            .find(|entry| entry.op == after_entry.op);
-        let calls = after_entry
-            .calls
-            .saturating_sub(before_entry.map_or(0, |entry| entry.calls));
-        let total_ms =
-            (after_entry.total_ms - before_entry.map_or(0.0, |entry| entry.total_ms)).max(0.0);
-        let total_bytes = after_entry
-            .total_bytes
-            .saturating_sub(before_entry.map_or(0, |entry| entry.total_bytes));
-        if calls == 0 && total_ms == 0.0 && total_bytes == 0 {
-            continue;
-        }
-        let max_ms = match before_entry {
-            None => after_entry.max_ms,
-            Some(entry) if after_entry.max_ms > entry.max_ms => after_entry.max_ms,
-            Some(_) => 0.0,
-        };
-        let entry = gpu_hal::HalProfileEntry {
-            op: after_entry.op.clone(),
-            calls,
-            total_ms,
-            max_ms,
-            total_bytes,
-        };
-        delta.total_calls += entry.calls;
-        delta.total_ms += entry.total_ms;
-        match entry.op.as_str() {
-            "alloc" => {
-                delta.alloc_calls += entry.calls;
-                delta.alloc_bytes += entry.total_bytes;
-            }
-            "free" => delta.free_calls += entry.calls,
-            "copy_h2d" => delta.h2d_bytes += entry.total_bytes,
-            "copy_d2h" => delta.d2h_bytes += entry.total_bytes,
-            "copy_d2d" => delta.d2d_bytes += entry.total_bytes,
-            "memset_zeros" => delta.memset_bytes += entry.total_bytes,
-            "sync" => delta.sync_calls += entry.calls,
-            _ => {}
-        }
-        delta.entries.push(entry);
-    }
-    delta.entries.sort_by(|lhs, rhs| {
-        rhs.total_ms
-            .partial_cmp(&lhs.total_ms)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| lhs.op.cmp(&rhs.op))
-    });
-    delta
+    (result, capture.finish())
 }
 
 fn load_resident_gpu_parts(
@@ -3444,6 +3377,20 @@ mod tests {
         assert_eq!(load_profile.alloc_calls, 1);
         assert_eq!(load_profile.h2d_bytes, 16);
         assert_eq!(load_profile.d2h_bytes, 0);
+        for op in ["alloc", "copy_h2d"] {
+            let entry = load_profile
+                .entries
+                .iter()
+                .find(|entry| entry.op == op)
+                .unwrap_or_else(|| panic!("missing load-only HAL profile entry {op}"));
+            assert!(entry.calls > 0, "{op} calls must be measured");
+            assert!(entry.total_ms > 0.0, "{op} total_ms must be measured");
+            assert!(entry.max_ms > 0.0, "{op} max_ms must be measured");
+            assert!(
+                entry.max_ms <= entry.total_ms,
+                "{op} max_ms cannot exceed total_ms"
+            );
+        }
 
         assert_eq!(
             loaded

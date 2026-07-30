@@ -74,9 +74,71 @@ pub struct HalProfileSnapshot {
     pub entries: Vec<HalProfileEntry>,
 }
 
+#[derive(Debug)]
+#[must_use = "finish the capture to retain its HAL profile snapshot"]
+pub struct HalProfileCapture {
+    id: u64,
+    disable_on_finish: bool,
+    active: bool,
+}
+
 #[derive(Debug, Default)]
 struct HalProfileAccumulator {
     entries: BTreeMap<String, HalProfileEntry>,
+    captures: BTreeMap<u64, BTreeMap<String, HalProfileEntry>>,
+    next_capture_id: u64,
+}
+
+impl HalProfileCapture {
+    pub fn begin() -> Self {
+        let disable_on_finish = !hal_profile_enabled();
+        if disable_on_finish {
+            hal_profile_set_enabled(true);
+        }
+        let profile = HAL_PROFILE.get_or_init(|| Mutex::new(HalProfileAccumulator::default()));
+        let mut profile = profile.lock().expect("HAL profile mutex poisoned");
+        profile.next_capture_id = profile
+            .next_capture_id
+            .checked_add(1)
+            .expect("HAL profile capture id exhausted");
+        let id = profile.next_capture_id;
+        profile.captures.insert(id, BTreeMap::new());
+        Self {
+            id,
+            disable_on_finish,
+            active: true,
+        }
+    }
+
+    pub fn finish(mut self) -> HalProfileSnapshot {
+        self.close()
+    }
+
+    fn close(&mut self) -> HalProfileSnapshot {
+        if !self.active {
+            return HalProfileSnapshot::default();
+        }
+        let entries = HAL_PROFILE
+            .get_or_init(|| Mutex::new(HalProfileAccumulator::default()))
+            .lock()
+            .expect("HAL profile mutex poisoned")
+            .captures
+            .remove(&self.id)
+            .unwrap_or_default()
+            .into_values()
+            .collect();
+        if self.disable_on_finish {
+            hal_profile_set_enabled(false);
+        }
+        self.active = false;
+        hal_profile_snapshot_from_entries(entries)
+    }
+}
+
+impl Drop for HalProfileCapture {
+    fn drop(&mut self) {
+        let _ = self.close();
+    }
 }
 
 pub fn hal_profile_set_enabled(enabled: bool) {
@@ -99,17 +161,21 @@ pub fn hal_profile_reset() {
 }
 
 pub fn hal_profile_snapshot() -> HalProfileSnapshot {
-    let mut snapshot = HalProfileSnapshot::default();
     let Some(profile) = HAL_PROFILE.get() else {
-        return snapshot;
+        return HalProfileSnapshot::default();
     };
-    let mut entries: Vec<_> = profile
+    let entries = profile
         .lock()
         .expect("HAL profile mutex poisoned")
         .entries
         .values()
         .cloned()
         .collect();
+    hal_profile_snapshot_from_entries(entries)
+}
+
+fn hal_profile_snapshot_from_entries(mut entries: Vec<HalProfileEntry>) -> HalProfileSnapshot {
+    let mut snapshot = HalProfileSnapshot::default();
     entries.sort_by(|lhs, rhs| {
         rhs.total_ms
             .partial_cmp(&lhs.total_ms)
@@ -139,20 +205,13 @@ pub fn hal_profile_snapshot() -> HalProfileSnapshot {
     snapshot
 }
 
-pub(crate) fn hal_profile_time<T, F>(op: &'static str, bytes: usize, f: F) -> T
-where
-    F: FnOnce() -> T,
-{
-    if !hal_profile_enabled() {
-        return f();
-    }
-    let start = Instant::now();
-    let result = f();
-    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-    let profile = HAL_PROFILE.get_or_init(|| Mutex::new(HalProfileAccumulator::default()));
-    let mut profile = profile.lock().expect("HAL profile mutex poisoned");
-    let entry = profile
-        .entries
+fn update_hal_profile_entry(
+    entries: &mut BTreeMap<String, HalProfileEntry>,
+    op: &'static str,
+    bytes: usize,
+    elapsed_ms: f64,
+) {
+    let entry = entries
         .entry(op.to_string())
         .or_insert_with(|| HalProfileEntry {
             op: op.to_string(),
@@ -165,6 +224,36 @@ where
     entry.total_ms += elapsed_ms;
     entry.max_ms = entry.max_ms.max(elapsed_ms);
     entry.total_bytes += bytes as u64;
+}
+
+#[cfg(test)]
+fn record_hal_profile_sample(op: &'static str, bytes: usize, elapsed_ms: f64) {
+    if !hal_profile_enabled() {
+        return;
+    }
+    record_enabled_hal_profile_sample(op, bytes, elapsed_ms);
+}
+
+fn record_enabled_hal_profile_sample(op: &'static str, bytes: usize, elapsed_ms: f64) {
+    let profile = HAL_PROFILE.get_or_init(|| Mutex::new(HalProfileAccumulator::default()));
+    let mut profile = profile.lock().expect("HAL profile mutex poisoned");
+    update_hal_profile_entry(&mut profile.entries, op, bytes, elapsed_ms);
+    for capture in profile.captures.values_mut() {
+        update_hal_profile_entry(capture, op, bytes, elapsed_ms);
+    }
+}
+
+pub(crate) fn hal_profile_time<T, F>(op: &'static str, bytes: usize, f: F) -> T
+where
+    F: FnOnce() -> T,
+{
+    if !hal_profile_enabled() {
+        return f();
+    }
+    let start = Instant::now();
+    let result = f();
+    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+    record_enabled_hal_profile_sample(op, bytes, elapsed_ms);
     result
 }
 
@@ -1694,6 +1783,57 @@ pub fn elem_count(shape: &[usize]) -> usize {
 /// Byte size for a given dtype and element count.
 pub fn byte_len(dtype: ScalarType, elems: usize) -> usize {
     elems * dtype.size_in_bytes()
+}
+
+#[cfg(test)]
+mod hal_profile_tests {
+    use super::*;
+
+    static PROFILE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn entry<'a>(snapshot: &'a HalProfileSnapshot, op: &str) -> &'a HalProfileEntry {
+        snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.op == op)
+            .unwrap_or_else(|| panic!("missing HAL profile entry {op}"))
+    }
+
+    #[test]
+    fn nested_capture_tracks_exact_max_while_outer_profile_continues() {
+        let _lock = PROFILE_TEST_LOCK.lock().expect("HAL profile test lock");
+        hal_profile_set_enabled(true);
+        hal_profile_reset();
+
+        record_hal_profile_sample("copy_h2d", 64, 10.0);
+        let capture = HalProfileCapture::begin();
+        record_hal_profile_sample("copy_h2d", 16, 1.0);
+        let nested = capture.finish();
+        record_hal_profile_sample("copy_d2h", 8, 2.0);
+        let outer = hal_profile_snapshot();
+        hal_profile_set_enabled(false);
+
+        let nested_h2d = entry(&nested, "copy_h2d");
+        assert_eq!(nested.total_calls, 1);
+        assert_eq!(nested.total_ms, 1.0);
+        assert_eq!(nested.h2d_bytes, 16);
+        assert_eq!(nested.d2h_bytes, 0);
+        assert_eq!(nested_h2d.calls, 1);
+        assert_eq!(nested_h2d.total_bytes, 16);
+        assert_eq!(nested_h2d.total_ms, 1.0);
+        assert_eq!(nested_h2d.max_ms, 1.0);
+
+        let outer_h2d = entry(&outer, "copy_h2d");
+        assert_eq!(outer.total_calls, 3);
+        assert_eq!(outer.total_ms, 13.0);
+        assert_eq!(outer.h2d_bytes, 80);
+        assert_eq!(outer.d2h_bytes, 8);
+        assert_eq!(outer_h2d.calls, 2);
+        assert_eq!(outer_h2d.total_bytes, 80);
+        assert_eq!(outer_h2d.total_ms, 11.0);
+        assert_eq!(outer_h2d.max_ms, 10.0);
+        assert_eq!(entry(&outer, "copy_d2h").max_ms, 2.0);
+    }
 }
 
 #[cfg(all(test, target_os = "macos", supersonic_backend_metal))]
