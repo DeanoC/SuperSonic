@@ -25,6 +25,8 @@ pub mod oracle;
 pub mod prefill_engine;
 pub mod profile;
 pub use supersonic_runtime::qwen36_moe::decode as qwen36_moe_decode;
+pub use supersonic_runtime::qwen36_moe::engine as qwen36_moe_engine;
+pub use supersonic_runtime::qwen36_moe::load_policy as qwen36_moe_load_policy;
 #[path = "qwen36_moe/logits.rs"]
 pub mod qwen36_moe_logits;
 #[path = "qwen36_moe/mtp.rs"]

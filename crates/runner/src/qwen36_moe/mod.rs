@@ -24,3 +24,5 @@ pub(crate) mod vmm;
 pub(crate) mod vmm_config;
 
 pub(crate) use engine::{run, run_with_sparse_prefill};
+pub(crate) use supersonic_runtime::qwen36_moe::engine::{Qwen36MoeEngine, Qwen36MoeLoadConfig};
+pub(crate) use supersonic_runtime::qwen36_moe::load_policy::Qwen36MoeLoadPolicy;

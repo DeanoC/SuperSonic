@@ -42,6 +42,18 @@ pub(crate) struct Qwen36StageTimingTotals {
 }
 
 impl Qwen36StageTimingTotals {
+    pub(crate) fn record_runtime_generation_step(
+        &mut self,
+        inference: Duration,
+        sample: Duration,
+        detok: Duration,
+    ) {
+        self.count_generation_step();
+        self.chain += inference;
+        self.sample += sample;
+        self.detok += detok;
+    }
+
     pub(crate) fn record_generation_step(
         &mut self,
         embed: Duration,
