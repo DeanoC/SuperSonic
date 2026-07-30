@@ -45,6 +45,7 @@ fn test_state_with_scheduler(
         tokenizer: Arc::new(test_tokenizer()),
         chat_template: Some(test_template()),
         session: None,
+        qwen36_moe_engine: None,
         mock_generation: Some(mock_generation),
         eos_ids: Vec::new(),
         max_context: 256,

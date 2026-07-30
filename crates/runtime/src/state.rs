@@ -21,7 +21,15 @@ use crate::prefix_cache::{PrefixCache, PrefixCacheConfig};
 use crate::session::InferenceSession;
 use supersonic_core::capabilities::{capabilities_for_variant, ModelCapabilities};
 
+#[path = "model_source.rs"]
+pub mod model_source;
+
 static NEXT_SERVER_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
+
+// SAFETY: the engine owns the virtual allocations backing its expert pointers,
+// and every server access is serialized through one mutex. Its HIP stream and
+// event operations reselect the recorded device before use or destruction.
+unsafe impl Send for crate::qwen36_moe::engine::Qwen36MoeEngine {}
 
 /// Per-process state shared across every HTTP request. Everything here is
 /// built once at startup.
@@ -32,6 +40,7 @@ pub struct ServerState {
     pub tokenizer: Arc<Tokenizer>,
     pub chat_template: Option<Arc<ChatTemplate>>,
     pub session: Option<Arc<Mutex<InferenceSession>>>,
+    pub qwen36_moe_engine: Option<Arc<Mutex<crate::qwen36_moe::engine::Qwen36MoeEngine>>>,
     pub mock_generation: Option<MockGeneration>,
     pub eos_ids: Vec<u32>,
     pub max_context: usize,
@@ -115,19 +124,25 @@ pub struct RuntimePolicy {
 }
 
 pub fn build(cfg: LoaderConfig) -> Result<ServerState> {
+    let resolved =
+        model_source::resolve_model_source(None, Some(cfg.model_dir.clone()), Some(&cfg.model))?;
+    build_resolved(cfg, resolved)
+}
+
+pub fn build_resolved(
+    cfg: LoaderConfig,
+    resolved: model_source::ResolvedModelSource,
+) -> Result<ServerState> {
     validate_flag_exclusions(&cfg)?;
+    validate_model_source_options(&cfg, &resolved.source)?;
+
     /* ---- backend + GPU detection ---- */
     let backend = resolve_backend(&cfg.backend, cfg.device)?;
     gpu_hal::set_backend(backend);
 
-    let variant = ModelVariant::from_cli_str(&cfg.model).ok_or_else(|| {
-        anyhow!(
-            "unknown --model '{}' (supported: {})",
-            cfg.model,
-            registry::supported_models_list().join(", ")
-        )
-    })?;
-    let runtime_policy = validate_runtime_policy(&cfg, &variant, backend)?;
+    let variant = resolved.model;
+    let runtime_policy =
+        validate_resolved_runtime_policy(&cfg, &resolved.source, &variant, backend)?;
 
     let (arch_name, total_vram, warp_size) = match backend {
         Backend::Hip => {
@@ -164,39 +179,74 @@ pub fn build(cfg: LoaderConfig) -> Result<ServerState> {
         )
     })?;
 
-    /* ---- HF metadata preflight ---- */
-    ensure_hf_metadata_present(&cfg)?;
-
-    /* ---- tokenizer + chat template ---- */
-    let tokenizer_path = cfg.model_dir.join("tokenizer.json");
-    if !tokenizer_path.exists() {
-        bail!(
-            "missing {} — cannot build tokenizer",
-            tokenizer_path.display()
-        );
-    }
-    let tokenizer =
-        Tokenizer::from_file(&tokenizer_path).map_err(|e| anyhow!("load tokenizer: {e}"))?;
-    let chat_template = ChatTemplate::try_load(&cfg.model_dir)?;
-    if chat_template.is_none() {
-        tracing::warn!(
-            "no chat_template in tokenizer_config.json — /v1/chat/completions will reject \
-             requests; /v1/completions still works"
-        );
-    }
-
     /* ---- engine construction ---- */
     let max_context = cfg.max_context.max(8);
-    let (session, eos_ids) = match variant.family() {
-        ModelFamily::Qwen35 => build_qwen(&cfg, entry, max_context)?,
-        ModelFamily::Qwen3Moe => bail!("qwen3-30b-a3b MoE runtime is not implemented yet"),
-        ModelFamily::Qwen36Moe => bail!("qwen3.6-35b-a3b MoE runtime is not implemented yet"),
-        ModelFamily::Gemma4 => build_gemma4(&cfg, entry, max_context)?,
-        ModelFamily::Phi4 => {
-            bail!("Phi-4 engine is under development — not yet exposed via supersonic-serve");
+    let (tokenizer, chat_template, session, qwen36_moe_engine, eos_ids) = match &resolved.source {
+        model_source::ModelSource::Directory(_) => {
+            ensure_hf_metadata_present(&cfg)?;
+
+            let tokenizer_path = cfg.model_dir.join("tokenizer.json");
+            if !tokenizer_path.exists() {
+                bail!(
+                    "missing {} — cannot build tokenizer",
+                    tokenizer_path.display()
+                );
+            }
+            let tokenizer = Tokenizer::from_file(&tokenizer_path)
+                .map_err(|e| anyhow!("load tokenizer: {e}"))?;
+            let chat_template = ChatTemplate::try_load(&cfg.model_dir)?;
+            if chat_template.is_none() {
+                tracing::warn!(
+                    "no chat_template in tokenizer_config.json — /v1/chat/completions will reject \
+                     requests; /v1/completions still works"
+                );
+            }
+
+            let (session, eos_ids) = match variant.family() {
+                ModelFamily::Qwen35 => build_qwen(&cfg, entry, max_context)?,
+                ModelFamily::Qwen3Moe => {
+                    bail!("qwen3-30b-a3b MoE runtime is not implemented yet")
+                }
+                ModelFamily::Qwen36Moe => {
+                    bail!("directory startup is not implemented for qwen3.6-35b-a3b")
+                }
+                ModelFamily::Gemma4 => build_gemma4(&cfg, entry, max_context)?,
+                ModelFamily::Phi4 => {
+                    bail!(
+                        "Phi-4 engine is under development — not yet exposed via supersonic-serve"
+                    );
+                }
+                ModelFamily::Llama31 => {
+                    bail!("Llama 3.1 is available through the supersonic CLI but is not wired into supersonic-serve yet");
+                }
+            };
+            (
+                Arc::new(tokenizer),
+                chat_template,
+                Some(Arc::new(Mutex::new(session))),
+                None,
+                eos_ids,
+            )
         }
-        ModelFamily::Llama31 => {
-            bail!("Llama 3.1 is available through the supersonic CLI but is not wired into supersonic-serve yet");
+        model_source::ModelSource::Flm(flm_path) => {
+            let engine = crate::qwen36_moe::engine::Qwen36MoeEngine::load(qwen36_moe_load_config(
+                flm_path.clone(),
+                backend,
+                cfg.device,
+                max_context,
+            ))?;
+            let tokenizer = Arc::new(engine.tokenizer().clone());
+            let chat_template = Some(ChatTemplate::from_template_source(
+                engine.chat_template_source().to_owned(),
+            )?);
+            let eos_ids = engine.eos_ids().to_vec();
+            (
+                tokenizer,
+                chat_template,
+                None,
+                Some(Arc::new(Mutex::new(engine))),
+                eos_ids,
+            )
         }
     };
 
@@ -217,9 +267,10 @@ pub fn build(cfg: LoaderConfig) -> Result<ServerState> {
         server_instance_id: NEXT_SERVER_INSTANCE_ID.fetch_add(1, Ordering::Relaxed),
         model_id: variant.to_string(),
         model_family: variant.family(),
-        tokenizer: Arc::new(tokenizer),
+        tokenizer,
         chat_template,
-        session: Some(Arc::new(Mutex::new(session))),
+        session,
+        qwen36_moe_engine,
         mock_generation: None,
         eos_ids,
         max_context,
@@ -262,6 +313,74 @@ fn validate_flag_exclusions(cfg: &LoaderConfig) -> Result<()> {
         bail!("--q4km/--q4km-gptq are mutually exclusive with --int4 and --fp8-runtime");
     }
     Ok(())
+}
+
+fn validate_model_source_options(
+    cfg: &LoaderConfig,
+    source: &model_source::ModelSource,
+) -> Result<()> {
+    if !matches!(source, model_source::ModelSource::Flm(_)) {
+        return Ok(());
+    }
+    if cfg.int4 || cfg.q4km || cfg.q4km_gptq || cfg.fp8_runtime || cfg.kv_fp8 {
+        bail!(
+            "FLM sources derive weight and cache formats from native descriptors; \
+             external quantization flags are not supported"
+        );
+    }
+    if cfg.dflash
+        || cfg.dflash_draft_dir.is_some()
+        || cfg.dflash_block.is_some()
+        || cfg.dflash_tap_layers.is_some()
+    {
+        bail!("DFlash options are not supported with FLM sources");
+    }
+    Ok(())
+}
+
+fn validate_resolved_runtime_policy(
+    cfg: &LoaderConfig,
+    source: &model_source::ModelSource,
+    variant: &ModelVariant,
+    backend: Backend,
+) -> Result<RuntimePolicy> {
+    validate_model_source_options(cfg, source)?;
+    match source {
+        model_source::ModelSource::Directory(_) => validate_runtime_policy(cfg, variant, backend),
+        model_source::ModelSource::Flm(_) => {
+            if *variant != ModelVariant::Qwen3_6_35B_A3B {
+                bail!("FLM serving currently requires --model qwen3.6-35b-a3b (got {variant})");
+            }
+            if backend != Backend::Hip {
+                bail!("Qwen3.6 MoE FLM serving currently requires the HIP backend");
+            }
+            resolve_runtime_policy(cfg, variant)
+        }
+    }
+}
+
+fn qwen36_moe_load_config(
+    flm_path: PathBuf,
+    backend: Backend,
+    device_ordinal: usize,
+    max_context_len: usize,
+) -> crate::qwen36_moe::engine::Qwen36MoeLoadConfig {
+    crate::qwen36_moe::engine::Qwen36MoeLoadConfig {
+        flm_path,
+        backend,
+        device_ordinal,
+        max_context_len,
+        policy: crate::qwen36_moe::load_policy::Qwen36MoeLoadPolicy {
+            persistent_decode: true,
+            kv_fp8: false,
+            kv_vmm: crate::qwen36_moe_config::Qwen36KvVmmMode::Auto,
+            moe: crate::qwen36_moe_config::Qwen36MoeRuntimeConfig::default(),
+            virtual_transfer_backend: model_store::VirtualArenaTransferBackend::PageableH2d,
+        },
+        verify_block_hashes: false,
+        execution_options: crate::qwen36_moe::decode::Qwen36ExecutionOptions::default(),
+        accurate_stage_timings: false,
+    }
 }
 
 pub fn resolve_runtime_policy(cfg: &LoaderConfig, variant: &ModelVariant) -> Result<RuntimePolicy> {
@@ -407,6 +526,104 @@ mod tests {
             err.contains(needle),
             "expected error containing {needle:?}, got {err:?}"
         );
+    }
+
+    #[test]
+    fn model_source_qwen36_engine_can_cross_server_worker_boundaries() {
+        fn assert_send<T: Send>() {}
+
+        assert_send::<crate::qwen36_moe::engine::Qwen36MoeEngine>();
+    }
+
+    #[test]
+    fn model_source_flm_rejects_external_quantization_flags() {
+        for set_flag in [
+            |c: &mut LoaderConfig| c.int4 = true,
+            |c: &mut LoaderConfig| c.q4km = true,
+            |c: &mut LoaderConfig| c.q4km_gptq = true,
+            |c: &mut LoaderConfig| c.fp8_runtime = true,
+            |c: &mut LoaderConfig| c.kv_fp8 = true,
+        ] {
+            let mut c = cfg();
+            set_flag(&mut c);
+            err_contains(
+                validate_model_source_options(
+                    &c,
+                    &model_source::ModelSource::Flm(PathBuf::from("/models/qwen36.flm")),
+                ),
+                "FLM sources",
+            );
+        }
+    }
+
+    #[test]
+    fn model_source_flm_rejects_dflash_flags() {
+        for set_flag in [
+            |c: &mut LoaderConfig| c.dflash = true,
+            |c: &mut LoaderConfig| c.dflash_draft_dir = Some(PathBuf::from("/models/draft")),
+            |c: &mut LoaderConfig| c.dflash_block = Some(4),
+            |c: &mut LoaderConfig| c.dflash_tap_layers = Some("1,2".to_string()),
+        ] {
+            let mut c = cfg();
+            set_flag(&mut c);
+            err_contains(
+                validate_model_source_options(
+                    &c,
+                    &model_source::ModelSource::Flm(PathBuf::from("/models/qwen36.flm")),
+                ),
+                "DFlash",
+            );
+        }
+    }
+
+    #[test]
+    fn model_source_flm_runtime_policy_is_hip_only_qwen36_moe() {
+        let c = cfg();
+        let flm = model_source::ModelSource::Flm(PathBuf::from("/models/qwen36.flm"));
+
+        validate_resolved_runtime_policy(&c, &flm, &ModelVariant::Qwen3_6_35B_A3B, Backend::Hip)
+            .expect("Qwen3.6 MoE FLM on HIP");
+
+        err_contains(
+            validate_resolved_runtime_policy(
+                &c,
+                &flm,
+                &ModelVariant::Qwen3_6_35B_A3B,
+                Backend::Cuda,
+            ),
+            "HIP",
+        );
+        err_contains(
+            validate_resolved_runtime_policy(&c, &flm, &ModelVariant::Qwen3_5_0_8B, Backend::Hip),
+            "qwen3.6-35b-a3b",
+        );
+    }
+
+    #[test]
+    fn model_source_flm_load_config_uses_resolved_server_policy() {
+        let load =
+            qwen36_moe_load_config(PathBuf::from("/models/qwen36.flm"), Backend::Hip, 3, 4096);
+
+        assert_eq!(load.flm_path, PathBuf::from("/models/qwen36.flm"));
+        assert_eq!(load.backend, Backend::Hip);
+        assert_eq!(load.device_ordinal, 3);
+        assert_eq!(load.max_context_len, 4096);
+        assert!(load.policy.persistent_decode);
+        assert!(!load.policy.kv_fp8);
+        assert_eq!(
+            load.policy.kv_vmm,
+            crate::qwen36_moe_config::Qwen36KvVmmMode::Auto
+        );
+        assert_eq!(
+            load.policy.moe,
+            crate::qwen36_moe_config::Qwen36MoeRuntimeConfig::default()
+        );
+        assert_eq!(
+            load.policy.virtual_transfer_backend,
+            model_store::VirtualArenaTransferBackend::PageableH2d
+        );
+        assert!(!load.verify_block_hashes);
+        assert!(!load.accurate_stage_timings);
     }
 
     #[test]
