@@ -1080,7 +1080,7 @@ fn process_full_attn_layer_batched(
         &mut scratch.x_norm,
         &execution.prefill_kernel,
     )
-    .map_err(|e| anyhow!("rms_norm_rows input: {e}"))?;
+    .context("rms_norm_rows input")?;
 
     // 2. Q/K/V projections (INT4).
     prefill_ffi::matmul_rhs_transposed_int4_with_options(
@@ -1099,7 +1099,7 @@ fn process_full_attn_layer_batched(
         &mut scratch.qg_raw,
         &execution.prefill_kernel,
     )
-    .map_err(|e| anyhow!("matmul q_proj: {e}"))?;
+    .context("matmul q_proj")?;
     prefill_ffi::matmul_rhs_transposed_int4_with_options(
         ordinal,
         1,
@@ -1116,7 +1116,7 @@ fn process_full_attn_layer_batched(
         &mut scratch.k,
         &execution.prefill_kernel,
     )
-    .map_err(|e| anyhow!("matmul k_proj: {e}"))?;
+    .context("matmul k_proj")?;
     prefill_ffi::matmul_rhs_transposed_int4_with_options(
         ordinal,
         1,
@@ -1133,7 +1133,7 @@ fn process_full_attn_layer_batched(
         &mut scratch.v,
         &execution.prefill_kernel,
     )
-    .map_err(|e| anyhow!("matmul v_proj: {e}"))?;
+    .context("matmul v_proj")?;
 
     // 3. Split q+gate. qg_raw layout per row: [h0_q[hd], h0_gate[hd],
     //    h1_q[hd], h1_gate[hd], ...] — interleaved per-head halves.
@@ -1151,7 +1151,7 @@ fn process_full_attn_layer_batched(
             &mut scratch.gate,
             &execution.prefill_kernel,
         )
-        .map_err(|e| anyhow!("split qgate: {e}"))?;
+        .context("split qgate")?;
     } else {
         let row_bytes = hd * 2;
         for nn in 0..n {
@@ -1182,7 +1182,7 @@ fn process_full_attn_layer_batched(
         &mut scratch.q_after,
         &execution.prefill_kernel,
     )
-    .map_err(|e| anyhow!("rms_norm_rows q: {e}"))?;
+    .context("rms_norm_rows q")?;
     prefill_ffi::rms_norm_rows_with_options(
         ordinal,
         ScalarType::BF16,
@@ -1194,7 +1194,7 @@ fn process_full_attn_layer_batched(
         &mut scratch.k_after,
         &execution.prefill_kernel,
     )
-    .map_err(|e| anyhow!("rms_norm_rows k: {e}"))?;
+    .context("rms_norm_rows k")?;
 
     // 5. RoPE on q and k. Dense uses compact positions
     // [past_len, past_len + n). Sparse SpecPrefill uses the original
@@ -1212,7 +1212,7 @@ fn process_full_attn_layer_batched(
             pos_ids,
             &mut scratch.q_after,
         )
-        .map_err(|e| anyhow!("rope q indirect: {e}"))?;
+        .context("rope q indirect")?;
         prefill_ffi::apply_rope_prefill_indirect(
             ordinal,
             ScalarType::BF16,
@@ -1225,7 +1225,7 @@ fn process_full_attn_layer_batched(
             pos_ids,
             &mut scratch.k_after,
         )
-        .map_err(|e| anyhow!("rope k indirect: {e}"))?;
+        .context("rope k indirect")?;
     } else {
         prefill_ffi::apply_rope_prefill_with_options(
             ordinal,
@@ -1240,7 +1240,7 @@ fn process_full_attn_layer_batched(
             &mut scratch.q_after,
             &execution.prefill_kernel,
         )
-        .map_err(|e| anyhow!("rope q: {e}"))?;
+        .context("rope q")?;
         prefill_ffi::apply_rope_prefill_with_options(
             ordinal,
             ScalarType::BF16,
@@ -1254,7 +1254,7 @@ fn process_full_attn_layer_batched(
             &mut scratch.k_after,
             &execution.prefill_kernel,
         )
-        .map_err(|e| anyhow!("rope k: {e}"))?;
+        .context("rope k")?;
     }
 
     // 6. KV cache write — append k_after, v to slots [past_len, past_len+n).
@@ -1304,7 +1304,7 @@ fn process_full_attn_layer_batched(
                 &execution.prefill_kernel,
             )
         }
-        .map_err(|e| anyhow!("metal full_attention_prefill_tmajor: {e}"))?;
+        .context("metal full_attention_prefill_tmajor")?;
     } else if use_metal_vec_full_attn {
         unsafe {
             prefill_ffi::metal_full_attention_prefill_tmajor_vec_bf16_f32_with_options(
@@ -1322,7 +1322,7 @@ fn process_full_attn_layer_batched(
                 &execution.prefill_kernel,
             )
         }
-        .map_err(|e| anyhow!("metal full_attention_prefill_tmajor_vec: {e}"))?;
+        .context("metal full_attention_prefill_tmajor_vec")?;
     } else {
         // 7. Legacy layout path: transpose q [n, h, hd] -> [h, n, hd] and
         // materialize a compact head-major KV prefix for M3 input.
@@ -1336,7 +1336,7 @@ fn process_full_attn_layer_batched(
             &mut scratch.q_thsd,
             &execution.prefill_kernel,
         )
-        .map_err(|e| anyhow!("transpose q s,h,d -> h,s,d: {e}"))?;
+        .context("transpose q s,h,d -> h,s,d")?;
 
         let kv_bytes = kv_len * row_kv_bytes;
         gpu_hal::copy_d2d(
@@ -1363,7 +1363,7 @@ fn process_full_attn_layer_batched(
             &mut scratch.k_thsd,
             &execution.prefill_kernel,
         )
-        .map_err(|e| anyhow!("transpose K: {e}"))?;
+        .context("transpose K")?;
         prefill_ffi::transpose_shd_hsd_with_options(
             ordinal,
             ScalarType::BF16,
@@ -1374,7 +1374,7 @@ fn process_full_attn_layer_batched(
             &mut scratch.v_thsd,
             &execution.prefill_kernel,
         )
-        .map_err(|e| anyhow!("transpose V: {e}"))?;
+        .context("transpose V")?;
         let _ = kv_max_t;
 
         batched_prefill_attn_full_launch(
@@ -1392,7 +1392,7 @@ fn process_full_attn_layer_batched(
             &scratch.v_thsd,
             &mut scratch.attn_out_f32,
         )
-        .map_err(|e| anyhow!("batched_prefill_attn_full_launch: {e}"))?;
+        .context("batched_prefill_attn_full_launch")?;
 
         // 8. Transpose attn_out F32 [h, n, hd] -> [n, h, hd]. Do it via
         //    transpose_shd_hsd with s=h, h=n: it transposes [s, h, d] to
@@ -1407,7 +1407,7 @@ fn process_full_attn_layer_batched(
             &mut scratch.attn_out_nhd_f32,
             &execution.prefill_kernel,
         )
-        .map_err(|e| anyhow!("transpose attn_out h,n,d -> n,h,d: {e}"))?;
+        .context("transpose attn_out h,n,d -> n,h,d")?;
     }
 
     // 9. Cast F32 -> BF16.
@@ -1420,7 +1420,7 @@ fn process_full_attn_layer_batched(
         &mut scratch.attn_out_bf16,
         &execution.prefill_kernel,
     )
-    .map_err(|e| anyhow!("cast attn f32->bf16: {e}"))?;
+    .context("cast attn f32->bf16")?;
 
     // 11. Apply attn_output_gate: gated = sigmoid(gate) * attn_out_bf16.
     //     `pfx_sigmoid_mul`: out = data * sigmoid(gate). Pass data=attn,
@@ -1434,7 +1434,7 @@ fn process_full_attn_layer_batched(
         &mut scratch.gated,
         &execution.prefill_kernel,
     )
-    .map_err(|e| anyhow!("sigmoid_mul: {e}"))?;
+    .context("sigmoid_mul")?;
 
     // 12. O-projection (INT4).
     prefill_ffi::matmul_rhs_transposed_int4_with_options(
@@ -1453,7 +1453,7 @@ fn process_full_attn_layer_batched(
         &mut scratch.o,
         &execution.prefill_kernel,
     )
-    .map_err(|e| anyhow!("matmul o_proj: {e}"))?;
+    .context("matmul o_proj")?;
 
     // 13. Residual add: chunk_hidden += o.
     prefill_ffi::element_add_inplace_with_options(
@@ -1464,7 +1464,7 @@ fn process_full_attn_layer_batched(
         &scratch.o,
         &execution.prefill_kernel,
     )
-    .map_err(|e| anyhow!("residual add: {e}"))?;
+    .context("residual add")?;
 
     Ok(())
 }
@@ -1552,10 +1552,10 @@ fn process_linear_attn_layer_pertoken(
         && !execution.metal.disable_batch
         && execution.batched_prefill.metal_linear_prefill_direct;
     let _metal_batch = if use_metal_direct_rows {
-        let guard = prefill_ffi::MetalBatchGuard::begin()
-            .map_err(|e| anyhow!("begin Metal linear direct-row batch: {e}"))?;
+        let guard =
+            prefill_ffi::MetalBatchGuard::begin().context("begin Metal linear direct-row batch")?;
         prefill_ffi::set_metal_batch_label("qwen36_linear_prefill_direct_rows")
-            .map_err(|e| anyhow!("label Metal linear direct-row batch: {e}"))?;
+            .context("label Metal linear direct-row batch")?;
         Some(guard)
     } else {
         None
@@ -1625,7 +1625,7 @@ fn process_linear_attn_layer_pertoken(
     if let Some(batch) = _metal_batch {
         batch
             .finish()
-            .map_err(|e| anyhow!("finish Metal linear direct-row batch: {e}"))?;
+            .context("finish Metal linear direct-row batch")?;
     }
     Ok(())
 }
@@ -2073,7 +2073,7 @@ fn process_ffn_batched_grouped(
         &mut scratch.h_norm,
         &execution.prefill_kernel,
     )
-    .map_err(|e| anyhow!("rms_norm_rows post_attn: {e}"))?;
+    .context("rms_norm_rows post_attn")?;
 
     // 2. Router matvec (BF16). gate_w is `[num_experts, hidden]` BF16, which
     //    matches the matmul_rhs_transposed contract:
@@ -2093,7 +2093,7 @@ fn process_ffn_batched_grouped(
         &mut scratch.router_logits_bf16,
         &execution.prefill_kernel,
     )
-    .map_err(|e| anyhow!("router matmul: {e}"))?;
+    .context("router matmul")?;
 
     // 3. Host softmax + top-K + renorm. D2H router_logits (BF16), widen to
     //    F32 per-element, run softmax + top-K + renorm matching the per-token
@@ -2109,10 +2109,10 @@ fn process_ffn_batched_grouped(
         && !execution.metal.disable_batch
         && execution.batched_prefill.metal_router_topk;
     let metal_router_expert_batch = if use_metal_router_topk {
-        let guard = prefill_ffi::MetalBatchGuard::begin()
-            .map_err(|e| anyhow!("begin Metal router/expert FFN batch: {e}"))?;
+        let guard =
+            prefill_ffi::MetalBatchGuard::begin().context("begin Metal router/expert FFN batch")?;
         prefill_ffi::set_metal_batch_label("qwen36_batched_prefill_router_expert_direct")
-            .map_err(|e| anyhow!("label Metal router/expert FFN batch: {e}"))?;
+            .context("label Metal router/expert FFN batch")?;
         Some(guard)
     } else {
         None
@@ -2127,7 +2127,7 @@ fn process_ffn_batched_grouped(
             &mut scratch.topk_weight,
             &execution.prefill_kernel,
         )
-        .map_err(|e| anyhow!("Metal router softmax top-k: {e}"))?;
+        .context("Metal router softmax top-k")?;
     } else {
         let mut logits_bytes = vec![0u8; n * num_experts * 2];
         copy_d2h(
@@ -2253,7 +2253,7 @@ fn process_ffn_batched_grouped(
                 &execution.prefill_kernel,
             )
         }
-        .map_err(|e| anyhow!("Metal direct grouped expert: {e}"))?;
+        .context("Metal direct grouped expert")?;
     } else {
         // 4a. M9 router permute.
         batched_prefill_router_permute_launch(
@@ -2268,7 +2268,7 @@ fn process_ffn_batched_grouped(
             &mut scratch.permuted_kpos,
             &mut scratch.permuted_weight,
         )
-        .map_err(|e| anyhow!("M9 router permute: {e}"))?;
+        .context("M9 router permute")?;
 
         // 4b. Build host-side inverse: for each (token, kpos) pair, the dst slot
         //     in the permuted_*[] arrays. M9's scatter is unstable (atomicAdd
@@ -2355,7 +2355,7 @@ fn process_ffn_batched_grouped(
                 &mut scratch.expert_counters,
             )
         }
-        .map_err(|e| anyhow!("M10 grouped expert: {e}"))?;
+        .context("M10 grouped expert")?;
 
         // 6. M11 unpermute + weighted combine.
         batched_prefill_unpermute_combine_launch(
@@ -2368,12 +2368,12 @@ fn process_ffn_batched_grouped(
             &scratch.expert_out,
             &mut scratch.combined,
         )
-        .map_err(|e| anyhow!("M11 unpermute combine: {e}"))?;
+        .context("M11 unpermute combine")?;
     }
     if let Some(batch) = metal_router_expert_batch {
         batch
             .finish()
-            .map_err(|e| anyhow!("finish Metal router/expert FFN batch: {e}"))?;
+            .context("finish Metal router/expert FFN batch")?;
     }
 
     // 7. Shared expert (batched primitives). On Metal, encode the shared
@@ -2385,10 +2385,10 @@ fn process_ffn_batched_grouped(
     let metal_shared_profile = use_metal_shared_expert_batch && metal_profile_enabled(execution);
     let metal_shared_start = metal_shared_profile.then(Instant::now);
     let metal_shared_batch = if use_metal_shared_expert_batch {
-        let guard = prefill_ffi::MetalBatchGuard::begin()
-            .map_err(|e| anyhow!("begin Metal shared FFN batch: {e}"))?;
+        let guard =
+            prefill_ffi::MetalBatchGuard::begin().context("begin Metal shared FFN batch")?;
         prefill_ffi::set_metal_batch_label("qwen36_batched_prefill_shared_expert_int4")
-            .map_err(|e| anyhow!("label Metal shared FFN batch: {e}"))?;
+            .context("label Metal shared FFN batch")?;
         Some(guard)
     } else {
         None
@@ -2412,7 +2412,7 @@ fn process_ffn_batched_grouped(
         &mut scratch.shared_gate,
         &execution.prefill_kernel,
     )
-    .map_err(|e| anyhow!("matmul shared_gate_proj: {e}"))?;
+    .context("matmul shared_gate_proj")?;
     //    7b. shared_up = INT4_matmul(h_norm, shared_up_proj_w)
     prefill_ffi::matmul_rhs_transposed_int4_with_options(
         ordinal,
@@ -2430,7 +2430,7 @@ fn process_ffn_batched_grouped(
         &mut scratch.shared_up,
         &execution.prefill_kernel,
     )
-    .map_err(|e| anyhow!("matmul shared_up_proj: {e}"))?;
+    .context("matmul shared_up_proj")?;
     //    7c. shared_silu_mul = silu(shared_gate) * shared_up
     prefill_ffi::swiglu_mul_with_options(
         ordinal,
@@ -2441,12 +2441,12 @@ fn process_ffn_batched_grouped(
         &mut scratch.shared_silu_mul,
         &execution.prefill_kernel,
     )
-    .map_err(|e| anyhow!("swiglu_mul shared: {e}"))?;
+    .context("swiglu_mul shared")?;
     if metal_shared_profile {
         prefill_ffi::commit_metal_batch_current("qwen36_batched_prefill_shared_gate_up")
-            .map_err(|e| anyhow!("profile commit Metal shared gate/up: {e}"))?;
+            .context("profile commit Metal shared gate/up")?;
         prefill_ffi::set_metal_batch_label("qwen36_batched_prefill_shared_down_scalar")
-            .map_err(|e| anyhow!("label Metal shared down/scalar: {e}"))?;
+            .context("label Metal shared down/scalar")?;
     }
     //    7d. shared_down = INT4_matmul(shared_silu_mul, shared_down_proj_w)
     //         shape [hidden, shared_intermediate] INT4 → out [N, hidden]
@@ -2466,7 +2466,7 @@ fn process_ffn_batched_grouped(
         &mut scratch.shared_down,
         &execution.prefill_kernel,
     )
-    .map_err(|e| anyhow!("matmul shared_down_proj: {e}"))?;
+    .context("matmul shared_down_proj")?;
     //    7e. shared_gate_scalar = BF16_matmul(h_norm, shared_expert_gate_w)
     //         shape [1, hidden] BF16 → out [N, 1]
     prefill_ffi::matmul_rhs_transposed_with_options(
@@ -2481,7 +2481,7 @@ fn process_ffn_batched_grouped(
         &mut scratch.shared_gate_scalar,
         &execution.prefill_kernel,
     )
-    .map_err(|e| anyhow!("matmul shared_expert_gate: {e}"))?;
+    .context("matmul shared_expert_gate")?;
     //    7f. shared_out = sigmoid(shared_gate_scalar) * shared_down.
     //         Metal uses a row-scalar kernel so the `[N, 1]` gate never
     //         round-trips through host memory as an expanded `[N, hidden]`
@@ -2496,7 +2496,7 @@ fn process_ffn_batched_grouped(
             &mut scratch.shared_out,
             &execution.prefill_kernel,
         )
-        .map_err(|e| anyhow!("sigmoid_mul_row_scalar shared: {e}"))?;
+        .context("sigmoid_mul_row_scalar shared")?;
     } else {
         expand_scalar_gate_bf16(
             ordinal,
@@ -2514,7 +2514,7 @@ fn process_ffn_batched_grouped(
             &mut scratch.shared_out_final,
             &execution.prefill_kernel,
         )
-        .map_err(|e| anyhow!("sigmoid_mul shared: {e}"))?;
+        .context("sigmoid_mul shared")?;
         gpu_hal::copy_d2d(
             ordinal,
             scratch.shared_out.as_mut_ptr(),
@@ -2525,9 +2525,9 @@ fn process_ffn_batched_grouped(
     }
     if metal_shared_profile {
         prefill_ffi::commit_metal_batch_current("qwen36_batched_prefill_shared_down_scalar")
-            .map_err(|e| anyhow!("profile commit Metal shared down/scalar: {e}"))?;
+            .context("profile commit Metal shared down/scalar")?;
         prefill_ffi::set_metal_batch_label("qwen36_batched_prefill_ffn_finalize")
-            .map_err(|e| anyhow!("label Metal FFN finalize: {e}"))?;
+            .context("label Metal FFN finalize")?;
     }
 
     // 8. Residual add: chunk_hidden += combined; chunk_hidden += shared_out.
@@ -2546,7 +2546,7 @@ fn process_ffn_batched_grouped(
             &scratch.shared_out,
             &execution.prefill_kernel,
         )
-        .map_err(|e| anyhow!("fused residual add (combined + shared_out): {e}"))?;
+        .context("fused residual add (combined + shared_out)")?;
     } else {
         prefill_ffi::element_add_inplace_with_options(
             ordinal,
@@ -2556,7 +2556,7 @@ fn process_ffn_batched_grouped(
             &scratch.combined,
             &execution.prefill_kernel,
         )
-        .map_err(|e| anyhow!("residual add (combined): {e}"))?;
+        .context("residual add (combined)")?;
         prefill_ffi::element_add_inplace_with_options(
             ordinal,
             ScalarType::BF16,
@@ -2565,12 +2565,10 @@ fn process_ffn_batched_grouped(
             &scratch.shared_out,
             &execution.prefill_kernel,
         )
-        .map_err(|e| anyhow!("residual add (shared_out): {e}"))?;
+        .context("residual add (shared_out)")?;
     }
     if let Some(batch) = metal_shared_batch {
-        batch
-            .finish()
-            .map_err(|e| anyhow!("finish Metal shared FFN batch: {e}"))?;
+        batch.finish().context("finish Metal shared FFN batch")?;
     }
     if let Some(start) = metal_shared_start {
         prefill_ffi::record_metal_profile_sample(
@@ -2578,7 +2576,7 @@ fn process_ffn_batched_grouped(
             "native",
             start.elapsed().as_secs_f64() * 1000.0,
         )
-        .map_err(|e| anyhow!("record Metal shared FFN profile: {e}"))?;
+        .context("record Metal shared FFN profile")?;
     }
 
     // Touch unused fields to keep the compiler happy on cfg(feature) gates.

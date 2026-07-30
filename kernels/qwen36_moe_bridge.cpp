@@ -71,6 +71,11 @@ bool sync_each_kernel_enabled() {
     return env != nullptr && env[0] != '\0' && env[0] != '0';
 }
 
+uint64_t backend_failure(int project_status, hipError_t native_status) {
+    return static_cast<uint32_t>(project_status) |
+           (static_cast<uint64_t>(static_cast<uint32_t>(native_status)) << 32);
+}
+
 struct ScopedHipDevice {
     int  previous = -1;
     bool changed  = false;
@@ -99,10 +104,19 @@ static_assert(sizeof(qwen36_moe::KVCacheFp8Desc) == 16,
 
 } // namespace
 
+extern "C" uint64_t supersonic_qwen36_encode_bridge_status(
+    int project_status,
+    int native_status
+) {
+    return native_status == 0
+        ? static_cast<uint32_t>(project_status)
+        : backend_failure(project_status, static_cast<hipError_t>(native_status));
+}
+
 // `dtype` encoding follows the Qwen/Gemma/Phi bridges: 0 = half, 2 = bf16.
 // The stub ignores dtype because it does no math; the real kernel will
 // branch on it.
-extern "C" int qwen36_moe_hip_stub_launch(
+extern "C" uint64_t qwen36_moe_hip_stub_launch(
     int                                  dtype,
     size_t                               device_ordinal,
     size_t                               num_layers,
@@ -122,9 +136,10 @@ extern "C" int qwen36_moe_hip_stub_launch(
     ScopedHipDevice scoped(static_cast<int>(device_ordinal));
 
     hipDeviceProp_t props;
-    if (hipGetDeviceProperties(&props, static_cast<int>(device_ordinal)) !=
-        hipSuccess) {
-        return 250;
+    hipError_t props_err =
+        hipGetDeviceProperties(&props, static_cast<int>(device_ordinal));
+    if (props_err != hipSuccess) {
+        return backend_failure(250, props_err);
     }
     const int num_blocks =
         props.multiProcessorCount > 0 ? props.multiProcessorCount : 16;
@@ -132,8 +147,9 @@ extern "C" int qwen36_moe_hip_stub_launch(
 
     // Zero the cooperative counter before launch. The kernel uses
     // `atomicAdd` to claim layer indices.
-    if (hipMemsetAsync(counters, 0, sizeof(unsigned int)) != hipSuccess) {
-        return 200;
+    hipError_t memset_err = hipMemsetAsync(counters, 0, sizeof(unsigned int));
+    if (memset_err != hipSuccess) {
+        return backend_failure(200, memset_err);
     }
 
     hipLaunchKernelGGL(qwen36_moe::qwen36_moe_descriptor_walk_stub,
@@ -149,15 +165,15 @@ extern "C" int qwen36_moe_hip_stub_launch(
     hipError_t launch_err = hipGetLastError();
     hipError_t sync_err =
         sync_each_kernel_enabled() ? hipDeviceSynchronize() : hipSuccess;
-    if (launch_err != hipSuccess) return 254;
-    if (sync_err != hipSuccess) return 255;
+    if (launch_err != hipSuccess) return backend_failure(254, launch_err);
+    if (sync_err != hipSuccess) return backend_failure(255, sync_err);
     return 0;
 }
 
 // PR 4b2 staged-attention parity launcher.
 // `dtype` follows the project convention: 2 = bf16. Other values are
 // rejected so the matching kernel template is unambiguous.
-extern "C" int qwen36_moe_hip_attn_step_launch(
+extern "C" uint64_t qwen36_moe_hip_attn_step_launch(
     int           dtype,
     size_t        device_ordinal,
     int           stage,
@@ -241,9 +257,10 @@ extern "C" int qwen36_moe_hip_attn_step_launch(
     ScopedHipDevice scoped(static_cast<int>(device_ordinal));
 
     hipDeviceProp_t props;
-    if (hipGetDeviceProperties(&props, static_cast<int>(device_ordinal)) !=
-        hipSuccess) {
-        return 250;
+    hipError_t props_err =
+        hipGetDeviceProperties(&props, static_cast<int>(device_ordinal));
+    if (props_err != hipSuccess) {
+        return backend_failure(250, props_err);
     }
     const int num_blocks =
         props.multiProcessorCount > 0 ? props.multiProcessorCount : 16;
@@ -253,8 +270,9 @@ extern "C" int qwen36_moe_hip_attn_step_launch(
     // expects all three to start at 0; sync_buf is documented as 32 zero
     // bytes by the Rust-side wrapper but a defence-in-depth memset here
     // keeps a misuse from corrupting the launch.
-    if (hipMemsetAsync(counters, 0, sizeof(unsigned int)) != hipSuccess) {
-        return 200;
+    hipError_t memset_err = hipMemsetAsync(counters, 0, sizeof(unsigned int));
+    if (memset_err != hipSuccess) {
+        return backend_failure(200, memset_err);
     }
 
     const size_t lds_bytes = static_cast<size_t>(hidden + block_size) * sizeof(float);
@@ -352,14 +370,14 @@ extern "C" int qwen36_moe_hip_attn_step_launch(
     // instead of the immediate per-step return; launch-config errors are
     // still caught here via `hipGetLastError`.
     hipError_t launch_err = hipGetLastError();
-    if (launch_err != hipSuccess) return 254;
+    if (launch_err != hipSuccess) return backend_failure(254, launch_err);
     return 0;
 }
 
 // PR 4b3 staged linear-attention parity launcher.
 // `dtype` follows the project convention: 2 = bf16. Other values are
 // rejected so the matching kernel template is unambiguous.
-extern "C" int qwen36_moe_hip_linear_step_launch(
+extern "C" uint64_t qwen36_moe_hip_linear_step_launch(
     int           dtype,
     size_t        device_ordinal,
     int           stage,
@@ -431,16 +449,18 @@ extern "C" int qwen36_moe_hip_linear_step_launch(
     ScopedHipDevice scoped(static_cast<int>(device_ordinal));
 
     hipDeviceProp_t props;
-    if (hipGetDeviceProperties(&props, static_cast<int>(device_ordinal)) !=
-        hipSuccess) {
-        return 250;
+    hipError_t props_err =
+        hipGetDeviceProperties(&props, static_cast<int>(device_ordinal));
+    if (props_err != hipSuccess) {
+        return backend_failure(250, props_err);
     }
     const int num_blocks =
         props.multiProcessorCount > 0 ? props.multiProcessorCount : 16;
     constexpr int block_size = 256;
 
-    if (hipMemsetAsync(counters, 0, sizeof(unsigned int)) != hipSuccess) {
-        return 200;
+    hipError_t memset_err = hipMemsetAsync(counters, 0, sizeof(unsigned int));
+    if (memset_err != hipSuccess) {
+        return backend_failure(200, memset_err);
     }
 
     const size_t lds_bytes = static_cast<size_t>(hidden + block_size) * sizeof(float);
@@ -535,14 +555,14 @@ extern "C" int qwen36_moe_hip_linear_step_launch(
     // Async dispatch: see attn_step_launch above for the rationale (default
     // stream serializes; chain-end D2H is the implicit barrier).
     hipError_t launch_err_lin = hipGetLastError();
-    if (launch_err_lin != hipSuccess) return 254;
+    if (launch_err_lin != hipSuccess) return backend_failure(254, launch_err_lin);
     return 0;
 }
 
 // PR 4b4 staged MoE FFN parity launcher.
 // `dtype` follows the project convention: 2 = bf16. Other values are
 // rejected so the matching kernel template is unambiguous.
-extern "C" int qwen36_moe_hip_ffn_step_launch(
+extern "C" uint64_t qwen36_moe_hip_ffn_step_launch(
     int           dtype,
     size_t        device_ordinal,
     int           stage,
@@ -621,9 +641,10 @@ extern "C" int qwen36_moe_hip_ffn_step_launch(
     ScopedHipDevice scoped(static_cast<int>(device_ordinal));
 
     hipDeviceProp_t props;
-    if (hipGetDeviceProperties(&props, static_cast<int>(device_ordinal)) !=
-        hipSuccess) {
-        return 250;
+    hipError_t props_err =
+        hipGetDeviceProperties(&props, static_cast<int>(device_ordinal));
+    if (props_err != hipSuccess) {
+        return backend_failure(250, props_err);
     }
     const int num_blocks =
         props.multiProcessorCount > 0 ? props.multiProcessorCount : 16;
@@ -635,8 +656,10 @@ extern "C" int qwen36_moe_hip_ffn_step_launch(
     // memset just guards single-launch callers (parity tests) that allocate
     // sync_buf via `GpuBuffer::zeros` (already zero) and would only fail if
     // someone reused a sync_buf without resetting.
-    if (hipMemsetAsync(counters, 0, 2 * top_k * sizeof(unsigned int)) != hipSuccess) {
-        return 200;
+    hipError_t memset_err =
+        hipMemsetAsync(counters, 0, 2 * top_k * sizeof(unsigned int));
+    if (memset_err != hipSuccess) {
+        return backend_failure(200, memset_err);
     }
 
     const size_t lds_bytes = static_cast<size_t>(hidden + block_size) * sizeof(float);
@@ -730,7 +753,7 @@ extern "C" int qwen36_moe_hip_ffn_step_launch(
 
     // Async dispatch: see attn_step_launch above for the rationale.
     hipError_t launch_err_ffn = hipGetLastError();
-    if (launch_err_ffn != hipSuccess) return 254;
+    if (launch_err_ffn != hipSuccess) return backend_failure(254, launch_err_ffn);
     return 0;
 }
 
@@ -738,7 +761,7 @@ extern "C" int qwen36_moe_hip_ffn_step_launch(
 // Drives `qwen36_moe::int4_dequant_smoke_kernel` over a small `[out_rows,
 // in_cols]` slab and writes both helpers' outputs to separate buffers.
 // The Rust-side test validates byte-for-byte against a host reference.
-extern "C" int qwen36_moe_hip_int4_dequant_smoke_launch(
+extern "C" uint64_t qwen36_moe_hip_int4_dequant_smoke_launch(
     size_t         device_ordinal,
     const uint8_t* packed,
     const void*    scale,
@@ -769,8 +792,8 @@ extern "C" int qwen36_moe_hip_int4_dequant_smoke_launch(
     hipError_t launch_err = hipGetLastError();
     hipError_t sync_err =
         sync_each_kernel_enabled() ? hipDeviceSynchronize() : hipSuccess;
-    if (launch_err != hipSuccess) return 254;
-    if (sync_err != hipSuccess) return 255;
+    if (launch_err != hipSuccess) return backend_failure(254, launch_err);
+    if (sync_err != hipSuccess) return backend_failure(255, sync_err);
     return 0;
 }
 
@@ -788,7 +811,7 @@ extern "C" int qwen36_moe_hip_int4_dequant_smoke_launch(
 //   - `hidden % block_size == 0` (block reduction lane scheme assumes it).
 //   - `vocab > 0`; the work-stealing loop self-terminates when
 //     `my_row >= vocab`.
-extern "C" int qwen36_moe_hip_lm_head_launch(
+extern "C" uint64_t qwen36_moe_hip_lm_head_launch(
     int           dtype,
     size_t        device_ordinal,
     int           hidden,
@@ -814,9 +837,10 @@ extern "C" int qwen36_moe_hip_lm_head_launch(
     ScopedHipDevice scoped(static_cast<int>(device_ordinal));
 
     hipDeviceProp_t props;
-    if (hipGetDeviceProperties(&props, static_cast<int>(device_ordinal)) !=
-        hipSuccess) {
-        return 250;
+    hipError_t props_err =
+        hipGetDeviceProperties(&props, static_cast<int>(device_ordinal));
+    if (props_err != hipSuccess) {
+        return backend_failure(250, props_err);
     }
 
     const int ordinal_int = static_cast<int>(device_ordinal);
@@ -852,8 +876,8 @@ extern "C" int qwen36_moe_hip_lm_head_launch(
         hipError_t launch_err = hipGetLastError();
         hipError_t sync_err =
             sync_each_kernel_enabled() ? hipDeviceSynchronize() : hipSuccess;
-        if (launch_err != hipSuccess) return 254;
-        if (sync_err != hipSuccess) return 255;
+        if (launch_err != hipSuccess) return backend_failure(254, launch_err);
+        if (sync_err != hipSuccess) return backend_failure(255, sync_err);
         return 0;
     }
 
@@ -862,8 +886,9 @@ extern "C" int qwen36_moe_hip_lm_head_launch(
         props.multiProcessorCount > 0 ? props.multiProcessorCount : 16;
     constexpr int block_size = 256;
 
-    if (hipMemsetAsync(counter, 0, sizeof(unsigned int)) != hipSuccess) {
-        return 200;
+    hipError_t memset_err = hipMemsetAsync(counter, 0, sizeof(unsigned int));
+    if (memset_err != hipSuccess) {
+        return backend_failure(200, memset_err);
     }
 
     // shared_scratch [block_size] + x_norm_lds [hidden], both F32.
@@ -886,8 +911,8 @@ extern "C" int qwen36_moe_hip_lm_head_launch(
     hipError_t launch_err = hipGetLastError();
     hipError_t sync_err =
         sync_each_kernel_enabled() ? hipDeviceSynchronize() : hipSuccess;
-    if (launch_err != hipSuccess) return 254;
-    if (sync_err != hipSuccess) return 255;
+    if (launch_err != hipSuccess) return backend_failure(254, launch_err);
+    if (sync_err != hipSuccess) return backend_failure(255, sync_err);
     return 0;
 }
 
@@ -899,7 +924,7 @@ extern "C" int qwen36_moe_hip_lm_head_launch(
 // in a single WMMA tile per vocab block. WMMA-only (gfx11xx + bf16);
 // callers that need a fallback should call the single-M launch in a
 // loop. Status codes match the single-M launcher.
-extern "C" int qwen36_moe_hip_lm_head_batched_launch(
+extern "C" uint64_t qwen36_moe_hip_lm_head_batched_launch(
     int           dtype,
     size_t        device_ordinal,
     int           m,                     // 1..=16
@@ -969,8 +994,8 @@ extern "C" int qwen36_moe_hip_lm_head_batched_launch(
     hipError_t launch_err = hipGetLastError();
     hipError_t sync_err =
         sync_each_kernel_enabled() ? hipDeviceSynchronize() : hipSuccess;
-    if (launch_err != hipSuccess) return 254;
-    if (sync_err != hipSuccess) return 255;
+    if (launch_err != hipSuccess) return backend_failure(254, launch_err);
+    if (sync_err != hipSuccess) return backend_failure(255, sync_err);
     return 0;
 }
 
@@ -982,7 +1007,7 @@ extern "C" int qwen36_moe_hip_lm_head_batched_launch(
 //   fused  = mtp.fc @ cat([e_norm, h_norm], dim=-1)
 // All BF16-rounded to match the Phase 6.2a Python oracle byte-for-byte
 // through the rounding boundary. Status codes match the lm_head launcher.
-extern "C" int qwen36_moe_hip_mtp_pre_fusion_launch(
+extern "C" uint64_t qwen36_moe_hip_mtp_pre_fusion_launch(
     int           dtype,
     size_t        device_ordinal,
     int           hidden,
@@ -1035,8 +1060,8 @@ extern "C" int qwen36_moe_hip_mtp_pre_fusion_launch(
     hipError_t launch_err = hipGetLastError();
     hipError_t sync_err =
         sync_each_kernel_enabled() ? hipDeviceSynchronize() : hipSuccess;
-    if (launch_err != hipSuccess) return 254;
-    if (sync_err != hipSuccess) return 255;
+    if (launch_err != hipSuccess) return backend_failure(254, launch_err);
+    if (sync_err != hipSuccess) return backend_failure(255, sync_err);
     return 0;
 }
 
@@ -1049,11 +1074,8 @@ extern "C" int qwen36_moe_hip_mtp_pre_fusion_launch(
 // phases. Replaces 81 step-kernel launches/token (40 attn + 40 ffn + 1
 // lm_head; lm_head still launches separately at this stage) with one.
 //
-// Returns:
-//   0   on success
-//   100..200  config-validation errors (see body)
-//   254 if `hipGetLastError` reports a launch failure
-//   255 if `hipDeviceSynchronize` reports a kernel failure
+// Returns the project status in the low word and the native HIP/CUDA runtime
+// status in the high word. Native status is zero for validation failures.
 //
 // Caller responsibility:
 //   - `hidden_ping` is uploaded with the initial hidden BF16 bytes; the
@@ -1067,7 +1089,7 @@ extern "C" int qwen36_moe_hip_mtp_pre_fusion_launch(
 //     barrier_flag at +68). Caller zeros the whole sync_buf before launch
 //     (this fn also zeros the entire 96 bytes defensively).
 
-extern "C" int qwen36_moe_hip_persistent_decode_launch(
+extern "C" uint64_t qwen36_moe_hip_persistent_decode_launch(
     int           dtype,
     size_t        device_ordinal,
     int           num_layers,
@@ -1224,9 +1246,10 @@ extern "C" int qwen36_moe_hip_persistent_decode_launch(
     ScopedHipDevice scoped(static_cast<int>(device_ordinal));
 
     hipDeviceProp_t props;
-    if (hipGetDeviceProperties(&props, static_cast<int>(device_ordinal)) !=
-        hipSuccess) {
-        return 250;
+    hipError_t props_err =
+        hipGetDeviceProperties(&props, static_cast<int>(device_ordinal));
+    if (props_err != hipSuccess) {
+        return backend_failure(250, props_err);
     }
     const int num_blocks =
         props.multiProcessorCount > 0 ? props.multiProcessorCount : 16;
@@ -1234,8 +1257,9 @@ extern "C" int qwen36_moe_hip_persistent_decode_launch(
 
     // Zero the full 96-byte sync_buf before launch — counters[0..16] (64
     // bytes) + barrier_counter (4) + barrier_flag (4) + 24 bytes of pad.
-    if (hipMemsetAsync(counters, 0, 96) != hipSuccess) {
-        return 200;
+    hipError_t memset_err = hipMemsetAsync(counters, 0, 96);
+    if (memset_err != hipSuccess) {
+        return backend_failure(200, memset_err);
     }
 
     const size_t lds_bytes =
@@ -1316,8 +1340,8 @@ extern "C" int qwen36_moe_hip_persistent_decode_launch(
     hipError_t launch_err = hipGetLastError();
     hipError_t sync_err =
         sync_each_kernel_enabled() ? hipDeviceSynchronize() : hipSuccess;
-    if (launch_err != hipSuccess) return 254;
-    if (sync_err != hipSuccess) return 255;
+    if (launch_err != hipSuccess) return backend_failure(254, launch_err);
+    if (sync_err != hipSuccess) return backend_failure(255, sync_err);
     return 0;
 }
 
@@ -1336,7 +1360,7 @@ extern "C" int qwen36_moe_hip_persistent_decode_launch(
 // launch_tiled guard from PR #219).
 // =============================================================================
 
-extern "C" int qwen36_moe_hip_batched_prefill_attn_full_launch(
+extern "C" uint64_t qwen36_moe_hip_batched_prefill_attn_full_launch(
     int           dtype,
     size_t        device_ordinal,
     int           batch_size,
@@ -1363,8 +1387,10 @@ extern "C" int qwen36_moe_hip_batched_prefill_attn_full_launch(
     ScopedHipDevice scoped(static_cast<int>(device_ordinal));
 
     hipDeviceProp_t props;
-    if (hipGetDeviceProperties(&props, static_cast<int>(device_ordinal)) != hipSuccess) {
-        return 250;
+    hipError_t props_err =
+        hipGetDeviceProperties(&props, static_cast<int>(device_ordinal));
+    if (props_err != hipSuccess) {
+        return backend_failure(250, props_err);
     }
     if (props.warpSize != 32) {
         // Fall through to the per-token path on wave64; this kernel
@@ -1413,8 +1439,8 @@ extern "C" int qwen36_moe_hip_batched_prefill_attn_full_launch(
 
     hipError_t launch_err = hipGetLastError();
     hipError_t sync_err   = hipDeviceSynchronize();
-    if (launch_err != hipSuccess) return 254;
-    if (sync_err != hipSuccess) return 255;
+    if (launch_err != hipSuccess) return backend_failure(254, launch_err);
+    if (sync_err != hipSuccess) return backend_failure(255, sync_err);
     return 0;
 }
 
@@ -1433,10 +1459,10 @@ extern "C" int qwen36_moe_hip_batched_prefill_attn_full_launch(
 //   141 num_experts > 256                  (LDS pinned at MAX_EXPERTS=256)
 //   142 top_k > 16                         (sanity bound)
 //   143 n_tokens * top_k > 16384           (would exceed reasonable scratch)
-//   254 launch error                       255 sync error
+//   254 launch error (with native status) 255 sync error (with native status)
 // =============================================================================
 
-extern "C" int qwen36_moe_hip_batched_prefill_router_permute_launch(
+extern "C" uint64_t qwen36_moe_hip_batched_prefill_router_permute_launch(
     size_t      device_ordinal,
     int         n_tokens,
     int         top_k,
@@ -1472,8 +1498,8 @@ extern "C" int qwen36_moe_hip_batched_prefill_router_permute_launch(
 
     hipError_t launch_err = hipGetLastError();
     hipError_t sync_err   = hipDeviceSynchronize();
-    if (launch_err != hipSuccess) return 254;
-    if (sync_err != hipSuccess) return 255;
+    if (launch_err != hipSuccess) return backend_failure(254, launch_err);
+    if (sync_err != hipSuccess) return backend_failure(255, sync_err);
     return 0;
 }
 
@@ -1502,11 +1528,11 @@ extern "C" int qwen36_moe_hip_batched_prefill_router_permute_launch(
 //   154 top_k * n_tokens > 16384
 //   155 dtype != bf16 (only path supported initially)
 //   156 LDS overflow (>48 KiB)
-//   254 launch error
-//   255 sync error
+//   254 launch error (with native status)
+//   255 sync error (with native status)
 // =============================================================================
 
-extern "C" int qwen36_moe_hip_batched_prefill_grouped_expert_launch(
+extern "C" uint64_t qwen36_moe_hip_batched_prefill_grouped_expert_launch(
     int           dtype,
     size_t        device_ordinal,
     int           n_tokens,
@@ -1547,8 +1573,10 @@ extern "C" int qwen36_moe_hip_batched_prefill_grouped_expert_launch(
     ScopedHipDevice scoped(static_cast<int>(device_ordinal));
 
     hipDeviceProp_t props;
-    if (hipGetDeviceProperties(&props, static_cast<int>(device_ordinal)) != hipSuccess) {
-        return 250;
+    hipError_t props_err =
+        hipGetDeviceProperties(&props, static_cast<int>(device_ordinal));
+    if (props_err != hipSuccess) {
+        return backend_failure(250, props_err);
     }
 
     constexpr int BLOCK = 256;
@@ -1605,8 +1633,8 @@ extern "C" int qwen36_moe_hip_batched_prefill_grouped_expert_launch(
 
     hipError_t launch_err = hipGetLastError();
     hipError_t sync_err   = hipDeviceSynchronize();
-    if (launch_err != hipSuccess) return 254;
-    if (sync_err != hipSuccess) return 255;
+    if (launch_err != hipSuccess) return backend_failure(254, launch_err);
+    if (sync_err != hipSuccess) return backend_failure(255, sync_err);
     return 0;
 }
 
@@ -1629,11 +1657,11 @@ extern "C" int qwen36_moe_hip_batched_prefill_grouped_expert_launch(
 //   162 dtype != bf16
 //   163 hidden too large (no shared scratch needed; this is a paranoia cap)
 //   164 reserved
-//   254 launch error
-//   255 sync error
+//   254 launch error (with native status)
+//   255 sync error (with native status)
 // =============================================================================
 
-extern "C" int qwen36_moe_hip_batched_prefill_unpermute_combine_launch(
+extern "C" uint64_t qwen36_moe_hip_batched_prefill_unpermute_combine_launch(
     int           dtype,
     size_t        device_ordinal,
     int           n_tokens,
@@ -1672,7 +1700,7 @@ extern "C" int qwen36_moe_hip_batched_prefill_unpermute_combine_launch(
 
     hipError_t launch_err = hipGetLastError();
     hipError_t sync_err   = hipDeviceSynchronize();
-    if (launch_err != hipSuccess) return 254;
-    if (sync_err != hipSuccess) return 255;
+    if (launch_err != hipSuccess) return backend_failure(254, launch_err);
+    if (sync_err != hipSuccess) return backend_failure(255, sync_err);
     return 0;
 }

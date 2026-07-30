@@ -2,7 +2,15 @@ use std::fmt;
 
 use crate::backend::Backend;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum BackendApi {
+    Runtime,
+    Driver,
+}
+
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum GpuError {
     Backend {
         backend: Backend,
@@ -10,11 +18,13 @@ pub enum GpuError {
     },
     BackendStatus {
         backend: Backend,
+        api: BackendApi,
         operation: String,
         status: i32,
     },
     DeviceLost {
         backend: Backend,
+        api: BackendApi,
         operation: String,
         status: i32,
     },
@@ -28,16 +38,27 @@ impl GpuError {
     }
 
     pub fn backend_status(backend: Backend, operation: impl Into<String>, status: i32) -> Self {
+        Self::backend_status_in(backend, BackendApi::Runtime, operation, status)
+    }
+
+    pub fn backend_status_in(
+        backend: Backend,
+        api: BackendApi,
+        operation: impl Into<String>,
+        status: i32,
+    ) -> Self {
         let operation = operation.into();
-        if is_device_loss_status(backend, status) {
+        if is_device_loss_status(backend, api, status) {
             Self::DeviceLost {
                 backend,
+                api,
                 operation,
                 status,
             }
         } else {
             Self::BackendStatus {
                 backend,
+                api,
                 operation,
                 status,
             }
@@ -55,11 +76,13 @@ impl fmt::Display for GpuError {
             Self::Backend { backend, message } => write!(f, "{backend} error: {message}"),
             Self::BackendStatus {
                 backend,
+                api: _,
                 operation,
                 status,
             }
             | Self::DeviceLost {
                 backend,
+                api: _,
                 operation,
                 status,
             } => write!(
@@ -80,51 +103,113 @@ pub(crate) fn backend_error(backend: Backend, op: &str, status: i32) -> GpuError
     GpuError::backend_status(backend, op, status)
 }
 
-fn is_device_loss_status(backend: Backend, status: i32) -> bool {
+#[cfg(supersonic_backend_cuda)]
+pub(crate) fn backend_driver_error(backend: Backend, op: &str, status: i32) -> GpuError {
+    GpuError::backend_status_in(backend, BackendApi::Driver, op, status)
+}
+
+fn is_device_loss_status(backend: Backend, api: BackendApi, status: i32) -> bool {
     match backend {
-        // HIP names 709 hipErrorContextIsDestroyed. CUDA runtime and driver
-        // APIs use 709 for a destroyed/lost context; the driver also exposes
-        // 46 as CUDA_ERROR_DEVICE_UNAVAILABLE.
         Backend::Hip => status == 709,
-        Backend::Cuda => matches!(status, 46 | 709),
+        Backend::Cuda => match api {
+            BackendApi::Runtime => {
+                matches!(status, 700 | 702 | 709 | 710 | 714..=719 | 911)
+            }
+            BackendApi::Driver => {
+                matches!(status, 226 | 700 | 702 | 709 | 710 | 714..=719 | 721 | 911)
+            }
+        },
         Backend::Metal => false,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Backend, GpuError};
+    use super::{Backend, BackendApi, GpuError};
 
     #[test]
-    fn backend_status_preserves_operation_and_maps_device_loss() {
-        let hip = GpuError::backend_status(Backend::Hip, "hipDeviceSynchronize", 709);
+    fn backend_status_preserves_operation_domain_and_maps_device_loss() {
+        let hip = GpuError::backend_status_in(
+            Backend::Hip,
+            BackendApi::Runtime,
+            "hipDeviceSynchronize",
+            709,
+        );
         assert!(matches!(
             hip,
             GpuError::DeviceLost {
                 backend: Backend::Hip,
+                api: BackendApi::Runtime,
                 ref operation,
                 status: 709,
             } if operation == "hipDeviceSynchronize"
         ));
 
-        let cuda = GpuError::backend_status(Backend::Cuda, "cudaMemcpy(D2H)", 709);
-        assert!(matches!(
-            cuda,
-            GpuError::DeviceLost {
-                backend: Backend::Cuda,
-                ref operation,
-                status: 709,
-            } if operation == "cudaMemcpy(D2H)"
-        ));
+        for api in [BackendApi::Runtime, BackendApi::Driver] {
+            let cuda = GpuError::backend_status_in(Backend::Cuda, api, "cuda operation", 709);
+            assert!(matches!(
+                cuda,
+                GpuError::DeviceLost {
+                    backend: Backend::Cuda,
+                    api: actual,
+                    ref operation,
+                    status: 709,
+                } if actual == api && operation == "cuda operation"
+            ));
+        }
 
         let ordinary = GpuError::backend_status(Backend::Hip, "hipMalloc", 2);
         assert!(matches!(
             ordinary,
             GpuError::BackendStatus {
                 backend: Backend::Hip,
+                api: BackendApi::Runtime,
                 ref operation,
                 status: 2,
             } if operation == "hipMalloc"
         ));
+    }
+
+    #[test]
+    fn cuda_unavailable_status_is_request_local_in_both_api_domains() {
+        for api in [BackendApi::Runtime, BackendApi::Driver] {
+            let error = GpuError::backend_status_in(Backend::Cuda, api, "availability", 46);
+            assert!(matches!(
+                error,
+                GpuError::BackendStatus {
+                    backend: Backend::Cuda,
+                    api: actual,
+                    status: 46,
+                    ..
+                } if actual == api
+            ));
+        }
+    }
+
+    #[test]
+    fn cuda_fatal_statuses_are_integrity_loss_in_their_native_domain() {
+        for api in [BackendApi::Runtime, BackendApi::Driver] {
+            for status in [700, 702, 709, 710, 714, 715, 716, 717, 718, 719, 911] {
+                let error =
+                    GpuError::backend_status_in(Backend::Cuda, api, "fatal operation", status);
+                assert!(
+                    error.is_device_lost(),
+                    "{api:?} status {status} must make the CUDA context unusable"
+                );
+            }
+        }
+
+        for status in [226, 721] {
+            let error = GpuError::backend_status_in(
+                Backend::Cuda,
+                BackendApi::Driver,
+                "driver fatal operation",
+                status,
+            );
+            assert!(
+                error.is_device_lost(),
+                "driver status {status} must make the CUDA context unusable"
+            );
+        }
     }
 }

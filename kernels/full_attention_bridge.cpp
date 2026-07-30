@@ -6,6 +6,13 @@
 
 namespace {
 
+int prefill_backend_failure(int project_status, hipError_t native_status) {
+    return static_cast<int>(
+        0x80000000u
+        | ((static_cast<uint32_t>(project_status) & 0x7fffu) << 16)
+        | (static_cast<uint32_t>(native_status) & 0xffffu));
+}
+
 struct ScopedHipDevice {
     int previous = -1;
     bool changed = false;
@@ -1950,8 +1957,14 @@ int swiglu_mul_device(
         static_cast<const T*>(gate),
         static_cast<const T*>(up),
         static_cast<T*>(out));
-    if (hipGetLastError() != hipSuccess) return 121;
-    if (maybe_sync() != hipSuccess) return 122;
+    const hipError_t launch_status = hipGetLastError();
+    if (launch_status != hipSuccess) {
+        return prefill_backend_failure(121, launch_status);
+    }
+    const hipError_t sync_status = maybe_sync();
+    if (sync_status != hipSuccess) {
+        return prefill_backend_failure(122, sync_status);
+    }
     return 0;
 }
 
@@ -2185,8 +2198,14 @@ int cast_device(
         total_elems,
         static_cast<const In*>(xs),
         static_cast<Out*>(out));
-    if (hipGetLastError() != hipSuccess) return 135;
-    if (hipDeviceSynchronize() != hipSuccess) return 136;
+    const hipError_t launch_status = hipGetLastError();
+    if (launch_status != hipSuccess) {
+        return prefill_backend_failure(135, launch_status);
+    }
+    const hipError_t sync_status = hipDeviceSynchronize();
+    if (sync_status != hipSuccess) {
+        return prefill_backend_failure(136, sync_status);
+    }
     return 0;
 }
 
@@ -2913,8 +2932,14 @@ int rms_norm_device(
         static_cast<const T*>(xs),
         static_cast<const T*>(weight),
         static_cast<T*>(out));
-    if (hipGetLastError() != hipSuccess) return 71;
-    if (maybe_sync() != hipSuccess) return 72;
+    const hipError_t launch_status = hipGetLastError();
+    if (launch_status != hipSuccess) {
+        return prefill_backend_failure(71, launch_status);
+    }
+    const hipError_t sync_status = maybe_sync();
+    if (sync_status != hipSuccess) {
+        return prefill_backend_failure(72, sync_status);
+    }
     return 0;
 }
 

@@ -285,9 +285,10 @@ pub struct DeterministicSession {
     features: SessionFeatures,
     events: Arc<Mutex<Vec<DeterministicSessionEvent>>>,
     reset_failures: VecDeque<Option<String>>,
+    after_reset: Option<Box<dyn FnOnce() + Send>>,
     prefill_logits: Vec<f32>,
     prefill_failure: Option<String>,
-    prefill_device_loss: bool,
+    prefill_gpu_status: Option<(gpu_hal::Backend, i32)>,
     decode_logits: VecDeque<Vec<f32>>,
     after_prefill: Option<Box<dyn FnOnce() + Send>>,
     prefill_panics: bool,
@@ -317,9 +318,10 @@ impl DeterministicSession {
                 features,
                 events: events.clone(),
                 reset_failures: VecDeque::new(),
+                after_reset: None,
                 prefill_logits,
                 prefill_failure: None,
-                prefill_device_loss: false,
+                prefill_gpu_status: None,
                 decode_logits: decode_logits.into(),
                 after_prefill: None,
                 prefill_panics: false,
@@ -346,7 +348,21 @@ impl DeterministicSession {
     }
 
     pub(crate) fn with_prefill_device_loss(mut self) -> Self {
-        self.prefill_device_loss = true;
+        self.prefill_gpu_status = Some((gpu_hal::Backend::Hip, 709));
+        self
+    }
+
+    pub(crate) fn with_prefill_gpu_status(
+        mut self,
+        backend: gpu_hal::Backend,
+        status: i32,
+    ) -> Self {
+        self.prefill_gpu_status = Some((backend, status));
+        self
+    }
+
+    pub(crate) fn after_first_reset(mut self, action: impl FnOnce() + Send + 'static) -> Self {
+        self.after_reset = Some(Box::new(action));
         self
     }
 
@@ -401,6 +417,9 @@ impl DeterministicSession {
         if let Some(Some(failure)) = self.reset_failures.pop_front() {
             return Err(anyhow!(failure));
         }
+        if let Some(action) = self.after_reset.take() {
+            action();
+        }
         Ok(())
     }
 
@@ -410,14 +429,8 @@ impl DeterministicSession {
         if let Some(action) = self.after_prefill.take() {
             action();
         }
-        if self.prefill_device_loss {
-            self.prefill_device_loss = false;
-            return Err(gpu_hal::GpuError::backend_status(
-                gpu_hal::Backend::Hip,
-                "test prefill",
-                709,
-            )
-            .into());
+        if let Some((backend, status)) = self.prefill_gpu_status.take() {
+            return Err(gpu_hal::GpuError::backend_status(backend, "test prefill", status).into());
         }
         if let Some(failure) = self.prefill_failure.take() {
             return Err(anyhow!(failure));
@@ -611,11 +624,21 @@ impl InferenceSession {
     pub fn prefill_cancellable(
         &mut self,
         prompt_ids: &[u32],
+        is_cancelled: impl FnMut() -> bool,
+    ) -> Result<Vec<f32>> {
+        self.prefill_cancellable_with_started(prompt_ids, is_cancelled, || {})
+    }
+
+    pub(crate) fn prefill_cancellable_with_started(
+        &mut self,
+        prompt_ids: &[u32],
         mut is_cancelled: impl FnMut() -> bool,
+        mut execution_started: impl FnMut(),
     ) -> Result<Vec<f32>> {
         if is_cancelled() {
             return Err(SessionCancelled.into());
         }
+        execution_started();
         let logits = match self {
             Self::Qwen36Moe(engine) => {
                 qwen36_prefill_cancellable(engine, prompt_ids, &mut is_cancelled)?

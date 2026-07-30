@@ -487,7 +487,7 @@ fn run_inner<S: GenerationEventSink>(
         anyhow::bail!("loaded session does not expose a supported generation path");
     }
     let cache = supported_cache_request(features, cache.as_ref());
-    let mut session_dirty = false;
+    let mut mutation_started = false;
 
     let prefill_result = (|| -> Result<Vec<f32>> {
         if let Some(cache_req) = cache {
@@ -506,7 +506,7 @@ fn run_inner<S: GenerationEventSink>(
             };
             if let Some(hit) = memory_hit {
                 check_cancelled(tx)?;
-                session_dirty = true;
+                mutation_started = true;
                 match guard.restore_prefix(hit.snapshot) {
                     Ok(mut logits) => {
                         cached_prompt_tokens = hit.cached_tokens as u32;
@@ -532,14 +532,20 @@ fn run_inner<S: GenerationEventSink>(
                         tracing::warn!("prefix cache restore failed: {e}");
                         state.prefix_cache.record_restore_failure();
                         guard.reset()?;
-                        guard.prefill_cancellable(&prompt_ids, || tx.is_closed())
+                        mutation_started = false;
+                        prefill_cancellable_tracking(
+                            &mut guard,
+                            &prompt_ids,
+                            tx,
+                            &mut mutation_started,
+                        )
                     }
                 }
             } else if let Some(hit) = state.prefix_cache.lookup_disk_bytes(cache_req, &prompt_ids) {
                 match guard.load_disk_prefix(&hit.bytes) {
                     Ok(snapshot) => {
                         check_cancelled(tx)?;
-                        session_dirty = true;
+                        mutation_started = true;
                         match guard.restore_prefix(snapshot) {
                             Ok(mut logits) => {
                                 cached_prompt_tokens = hit.cached_tokens as u32;
@@ -566,12 +572,14 @@ fn run_inner<S: GenerationEventSink>(
                                 tracing::warn!("prefix cache disk restore failed: {e}");
                                 state.prefix_cache.record_restore_failure();
                                 guard.reset()?;
+                                mutation_started = false;
                                 prefill_with_cache_anchor(
                                     &mut guard,
                                     &state,
                                     cache_req,
                                     &prompt_ids,
                                     tx,
+                                    &mut mutation_started,
                                 )
                             }
                         }
@@ -586,26 +594,40 @@ fn run_inner<S: GenerationEventSink>(
                         state.prefix_cache.record_restore_failure();
                         check_cancelled(tx)?;
                         guard.reset()?;
-                        session_dirty = true;
-                        prefill_with_cache_anchor(&mut guard, &state, cache_req, &prompt_ids, tx)
+                        mutation_started = false;
+                        prefill_with_cache_anchor(
+                            &mut guard,
+                            &state,
+                            cache_req,
+                            &prompt_ids,
+                            tx,
+                            &mut mutation_started,
+                        )
                     }
                 }
             } else {
                 check_cancelled(tx)?;
                 guard.reset()?;
-                session_dirty = true;
-                prefill_with_cache_anchor(&mut guard, &state, cache_req, &prompt_ids, tx)
+                mutation_started = false;
+                prefill_with_cache_anchor(
+                    &mut guard,
+                    &state,
+                    cache_req,
+                    &prompt_ids,
+                    tx,
+                    &mut mutation_started,
+                )
             }
         } else {
             check_cancelled(tx)?;
             guard.reset()?;
-            session_dirty = true;
-            guard.prefill_cancellable(&prompt_ids, || tx.is_closed())
+            mutation_started = false;
+            prefill_cancellable_tracking(&mut guard, &prompt_ids, tx, &mut mutation_started)
         }
     })();
     let prefill_logits = match prefill_result {
         Err(error) if is_session_cancellation(&error) => {
-            cleanup_cancelled_session(&mut guard, &mut session_dirty)?;
+            cleanup_cancelled_session(&mut guard, &mut mutation_started)?;
             return Ok(());
         }
         result => result?,
@@ -636,7 +658,7 @@ fn run_inner<S: GenerationEventSink>(
 
     let finish = loop {
         if tx.is_closed() {
-            cleanup_cancelled_session(&mut guard, &mut session_dirty)?;
+            cleanup_cancelled_session(&mut guard, &mut mutation_started)?;
             return Ok(());
         }
 
@@ -669,7 +691,7 @@ fn run_inner<S: GenerationEventSink>(
             let delta = incremental_delta(&prev_decoded, trimmed);
             if !delta.is_empty() {
                 if tx.send(GenEvent::Token(delta)).is_err() {
-                    cleanup_cancelled_session(&mut guard, &mut session_dirty)?;
+                    cleanup_cancelled_session(&mut guard, &mut mutation_started)?;
                     return Ok(());
                 }
             }
@@ -680,7 +702,7 @@ fn run_inner<S: GenerationEventSink>(
         prev_decoded = decoded;
 
         if !delta.is_empty() && tx.send(GenEvent::Token(delta)).is_err() {
-            cleanup_cancelled_session(&mut guard, &mut session_dirty)?;
+            cleanup_cancelled_session(&mut guard, &mut mutation_started)?;
             return Ok(());
         }
 
@@ -721,7 +743,7 @@ fn run_inner<S: GenerationEventSink>(
     )
     .is_err()
     {
-        cleanup_cancelled_session(&mut guard, &mut session_dirty)?;
+        cleanup_cancelled_session(&mut guard, &mut mutation_started)?;
     }
     Ok(())
 }
@@ -734,8 +756,11 @@ fn check_cancelled<S: GenerationEventSink>(tx: &S) -> Result<()> {
     }
 }
 
-fn cleanup_cancelled_session(guard: &mut InferenceSession, session_dirty: &mut bool) -> Result<()> {
-    if std::mem::take(session_dirty) {
+fn cleanup_cancelled_session(
+    guard: &mut InferenceSession,
+    mutation_started: &mut bool,
+) -> Result<()> {
+    if std::mem::take(mutation_started) {
         guard.reset()?;
     }
     Ok(())
@@ -809,16 +834,18 @@ fn prefill_with_cache_anchor<S: GenerationEventSink>(
     cache_req: &CacheRequest,
     prompt_ids: &[u32],
     tx: &S,
+    mutation_started: &mut bool,
 ) -> Result<Vec<f32>> {
     let min_tokens = state.prefix_cache.config().min_tokens;
     let Some(anchor_len) = prompt_ids.len().checked_sub(CACHE_ANCHOR_SUFFIX_TOKENS) else {
-        return guard.prefill_cancellable(prompt_ids, || tx.is_closed());
+        return prefill_cancellable_tracking(guard, prompt_ids, tx, mutation_started);
     };
     if anchor_len < min_tokens || anchor_len == 0 {
-        return guard.prefill_cancellable(prompt_ids, || tx.is_closed());
+        return prefill_cancellable_tracking(guard, prompt_ids, tx, mutation_started);
     }
 
-    let mut logits = guard.prefill_cancellable(&prompt_ids[..anchor_len], || tx.is_closed())?;
+    let mut logits =
+        prefill_cancellable_tracking(guard, &prompt_ids[..anchor_len], tx, mutation_started)?;
     snapshot_prefix_if_admitted(guard, state, cache_req, &prompt_ids[..anchor_len], &logits)?;
     for (idx, token) in prompt_ids.iter().copied().enumerate().skip(anchor_len) {
         if tx.is_closed() {
@@ -827,6 +854,19 @@ fn prefill_with_cache_anchor<S: GenerationEventSink>(
         logits = guard.decode_step(token, idx)?;
     }
     Ok(logits)
+}
+
+fn prefill_cancellable_tracking<S: GenerationEventSink>(
+    guard: &mut InferenceSession,
+    prompt_ids: &[u32],
+    tx: &S,
+    mutation_started: &mut bool,
+) -> Result<Vec<f32>> {
+    guard.prefill_cancellable_with_started(
+        prompt_ids,
+        || tx.is_closed(),
+        || *mutation_started = true,
+    )
 }
 
 fn snapshot_prefix_if_admitted(
@@ -1294,6 +1334,41 @@ mod tests {
     }
 
     #[test]
+    fn cuda_runtime_unavailable_status_46_preserves_readiness_for_followup() {
+        let (backend, _) =
+            DeterministicSession::new(qwen36_moe_features(), vec![0.0, 5.0], Vec::new());
+        let state = test_state(InferenceSession::test_qwen36_adapter(
+            backend.with_prefill_gpu_status(gpu_hal::Backend::Cuda, 46),
+        ));
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        run(state.clone(), vec![1], params(1), None, tx).unwrap_err();
+        assert!(state.is_ready());
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        run(state.clone(), vec![1], params(1), None, tx).unwrap();
+        assert_eq!(done_stats(rx).completion_tokens, 1);
+    }
+
+    #[test]
+    fn fatal_cuda_runtime_statuses_poison_readiness_and_reject_followup() {
+        for status in [700, 710] {
+            let (backend, _) =
+                DeterministicSession::new(qwen36_moe_features(), vec![0.0, 5.0], Vec::new());
+            let state = test_state(InferenceSession::test_qwen36_adapter(
+                backend.with_prefill_gpu_status(gpu_hal::Backend::Cuda, status),
+            ));
+            let (tx, _rx) = mpsc::unbounded_channel();
+
+            run(state.clone(), vec![1], params(1), None, tx).unwrap_err();
+            assert!(!state.is_ready(), "CUDA runtime status {status}");
+
+            let (tx, _rx) = mpsc::unbounded_channel();
+            assert!(run(state, vec![1], params(1), None, tx).is_err());
+        }
+    }
+
+    #[test]
     fn cancellation_cleanup_reset_failure_loses_integrity() {
         let (tx, rx) = mpsc::unbounded_channel();
         let (backend, events) =
@@ -1524,6 +1599,50 @@ mod tests {
 
         assert!(state.is_ready());
         assert!(events.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cancellation_at_clean_normal_prefill_handoff_does_not_reset_twice() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (backend, events) =
+            DeterministicSession::new(qwen36_moe_features(), vec![0.0, 5.0], Vec::new());
+        let backend = backend
+            .with_reset_failures(vec![None, Some("redundant reset sentinel")])
+            .after_first_reset(move || drop(rx));
+        let state = test_state(InferenceSession::test_qwen36_adapter(backend));
+
+        run(state.clone(), vec![1], params(1), None, tx).unwrap();
+
+        assert!(state.is_ready());
+        assert_eq!(*events.lock().unwrap(), [DeterministicSessionEvent::Reset]);
+    }
+
+    #[test]
+    fn cancellation_at_clean_cache_recovery_prefill_handoff_does_not_reset_twice() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (backend, events) =
+            DeterministicSession::new(snapshot_features(), vec![0.0, 5.0], Vec::new());
+        let backend = backend
+            .with_restore_request_local_cache_failure()
+            .with_reset_failures(vec![None, Some("redundant reset sentinel")])
+            .after_first_reset(move || drop(rx));
+        let state = test_state(InferenceSession::Deterministic(backend));
+        let cache = cache_request();
+        state
+            .prefix_cache
+            .insert(
+                &cache,
+                &[1, 2],
+                SessionSnapshot::Deterministic {
+                    logits: vec![0.0, 5.0],
+                },
+            )
+            .unwrap();
+
+        run(state.clone(), vec![1, 2], params(1), Some(cache), tx).unwrap();
+
+        assert!(state.is_ready());
+        assert_eq!(*events.lock().unwrap(), [DeterministicSessionEvent::Reset]);
     }
 
     #[test]

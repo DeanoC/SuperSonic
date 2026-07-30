@@ -18,6 +18,13 @@ static inline cudaError_t supersonic_cuda_malloc(void** ptr, size_t size) { retu
 
 namespace {
 
+int prefill_backend_failure(int project_status, cudaError_t native_status) {
+    return static_cast<int>(
+        0x80000000u
+        | ((static_cast<uint32_t>(project_status) & 0x7fffu) << 16)
+        | (static_cast<uint32_t>(native_status) & 0xffffu));
+}
+
 struct ScopedHipDevice {
     int previous = -1;
     bool changed = false;
@@ -3594,8 +3601,11 @@ int matmul_rhs_transposed_tiled_device(
         static_cast<const T*>(rhs),
         static_cast<T*>(out));
     cudaError_t launch_err = cudaGetLastError();
-    if (launch_err != cudaSuccess) return 270;
-    if (sync_each_kernel_enabled() && cudaDeviceSynchronize() != cudaSuccess) return 271;
+    if (launch_err != cudaSuccess) return prefill_backend_failure(270, launch_err);
+    if (sync_each_kernel_enabled()) {
+        const cudaError_t sync_status = cudaDeviceSynchronize();
+        if (sync_status != cudaSuccess) return prefill_backend_failure(271, sync_status);
+    }
     return 0;
 }
 
@@ -3780,8 +3790,8 @@ int matmul_int4_dequant_device(
         static_cast<T*>(out));
     cudaError_t launch_err = cudaGetLastError();
     cudaError_t sync_err = sync_each_kernel_enabled() ? cudaDeviceSynchronize() : cudaSuccess;
-    if (launch_err != cudaSuccess) return 270;
-    if (sync_err != cudaSuccess) return 271;
+    if (launch_err != cudaSuccess) return prefill_backend_failure(270, launch_err);
+    if (sync_err != cudaSuccess) return prefill_backend_failure(271, sync_err);
     return 0;
 }
 

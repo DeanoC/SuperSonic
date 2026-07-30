@@ -300,7 +300,7 @@ fn attn_step_launch_impl(
     let barrier_counter = unsafe { (counters as *mut u8).add(64) as *mut c_uint };
     let barrier_flag = unsafe { (counters as *mut u8).add(68) as *mut c_uint };
 
-    let status: c_int = match backend {
+    let status: Qwen36BridgeStatus = match backend {
         Backend::Hip | Backend::Cuda => {
             #[cfg(any(supersonic_backend_hip, supersonic_backend_cuda))]
             unsafe {
@@ -355,13 +355,7 @@ fn attn_step_launch_impl(
             unreachable!("Metal attn_step handled above");
         }
     };
-    if status != 0 {
-        return Err(qwen36_backend_error(
-            backend,
-            "qwen36_moe attn_step launch",
-            status,
-        ));
-    }
+    qwen36_bridge_result(backend, "qwen36_moe attn_step launch", status)?;
     Ok(())
 }
 
@@ -1429,7 +1423,7 @@ fn linear_step_launch_impl(
     let barrier_counter = unsafe { (counters as *mut u8).add(64) as *mut c_uint };
     let barrier_flag = unsafe { (counters as *mut u8).add(68) as *mut c_uint };
 
-    let status: c_int = match backend {
+    let status: Qwen36BridgeStatus = match backend {
         Backend::Hip | Backend::Cuda => {
             #[cfg(any(supersonic_backend_hip, supersonic_backend_cuda))]
             unsafe {
@@ -1483,13 +1477,7 @@ fn linear_step_launch_impl(
             unreachable!("Metal linear_step handled above");
         }
     };
-    if status != 0 {
-        return Err(qwen36_backend_error(
-            backend,
-            "qwen36_moe linear_step launch",
-            status,
-        ));
-    }
+    qwen36_bridge_result(backend, "qwen36_moe linear_step launch", status)?;
     Ok(())
 }
 
@@ -9249,7 +9237,7 @@ fn ffn_step_launch_impl(
     let barrier_counter = unsafe { (counters as *mut u8).add(64) as *mut c_uint };
     let barrier_flag = unsafe { (counters as *mut u8).add(68) as *mut c_uint };
 
-    let status: c_int = match backend {
+    let status: Qwen36BridgeStatus = match backend {
         Backend::Hip | Backend::Cuda => {
             #[cfg(any(supersonic_backend_hip, supersonic_backend_cuda))]
             unsafe {
@@ -9302,13 +9290,7 @@ fn ffn_step_launch_impl(
             unreachable!("Metal ffn_step handled above");
         }
     };
-    if status != 0 {
-        return Err(qwen36_backend_error(
-            backend,
-            "qwen36_moe ffn_step launch",
-            status,
-        ));
-    }
+    qwen36_bridge_result(backend, "qwen36_moe ffn_step launch", status)?;
     Ok(())
 }
 
@@ -11119,7 +11101,7 @@ pub fn int4_dequant_smoke_launch(
         );
     }
 
-    let status: c_int = match backend {
+    let status: Qwen36BridgeStatus = match backend {
         Backend::Hip | Backend::Cuda => {
             #[cfg(any(supersonic_backend_hip, supersonic_backend_cuda))]
             unsafe {
@@ -11144,13 +11126,7 @@ pub fn int4_dequant_smoke_launch(
         }
         Backend::Metal => unreachable!("Metal int4_dequant_smoke handled above"),
     };
-    if status != 0 {
-        return Err(qwen36_backend_error(
-            backend,
-            "qwen36_moe int4_dequant_smoke_launch",
-            status,
-        ));
-    }
+    qwen36_bridge_result(backend, "qwen36_moe int4_dequant_smoke_launch", status)?;
     Ok(())
 }
 
@@ -12108,7 +12084,7 @@ fn lm_head_launch_impl(
     let x_normed_ptr = x_normed_out_buf
         .map(|b| b.as_mut_ptr())
         .unwrap_or(std::ptr::null_mut());
-    let status: c_int = match backend {
+    let status: Qwen36BridgeStatus = match backend {
         Backend::Hip | Backend::Cuda => {
             #[cfg(any(supersonic_backend_hip, supersonic_backend_cuda))]
             unsafe {
@@ -12137,13 +12113,7 @@ fn lm_head_launch_impl(
             unreachable!("Metal handled above");
         }
     };
-    if status != 0 {
-        return Err(qwen36_backend_error(
-            backend,
-            "qwen36_moe lm_head_launch",
-            status,
-        ));
-    }
+    qwen36_bridge_result(backend, "qwen36_moe lm_head_launch", status)?;
     Ok(())
 }
 
@@ -12296,7 +12266,7 @@ fn lm_head_batched_launch_impl(
     let x_normed_ptr = x_normed_out_buf
         .map(|b| b.as_mut_ptr())
         .unwrap_or(std::ptr::null_mut());
-    let status: c_int = match backend {
+    let status: Qwen36BridgeStatus = match backend {
         Backend::Hip | Backend::Cuda => {
             #[cfg(any(supersonic_backend_hip, supersonic_backend_cuda))]
             unsafe {
@@ -12325,7 +12295,7 @@ fn lm_head_batched_launch_impl(
             unreachable!("Metal handled above");
         }
     };
-    if status == 138 {
+    if status.native_status() == 0 && status.project_status() == 138 {
         return Err(GpuError::backend(
             backend,
             format!(
@@ -12335,13 +12305,7 @@ fn lm_head_batched_launch_impl(
             ),
         ));
     }
-    if status != 0 {
-        return Err(qwen36_backend_error(
-            backend,
-            "qwen36_moe lm_head_batched_launch",
-            status,
-        ));
-    }
+    qwen36_bridge_result(backend, "qwen36_moe lm_head_batched_launch", status)?;
     Ok(())
 }
 
@@ -12564,7 +12528,7 @@ pub fn mtp_pre_fusion_launch(
         )));
     }
 
-    let status: c_int = match backend {
+    let status: Qwen36BridgeStatus = match backend {
         Backend::Hip | Backend::Cuda => {
             #[cfg(any(supersonic_backend_hip, supersonic_backend_cuda))]
             unsafe {
@@ -12592,13 +12556,7 @@ pub fn mtp_pre_fusion_launch(
         }
         Backend::Metal => unreachable!("Metal mtp_pre_fusion handled above"),
     };
-    if status != 0 {
-        return Err(qwen36_backend_error(
-            backend,
-            "qwen36_moe mtp_pre_fusion_launch",
-            status,
-        ));
-    }
+    qwen36_bridge_result(backend, "qwen36_moe mtp_pre_fusion_launch", status)?;
     Ok(())
 }
 
@@ -12724,7 +12682,7 @@ pub fn batched_prefill_attn_full_launch(
             "qwen36_moe::batched_prefill_attn_full_launch requires HIP or CUDA backend".to_string(),
         ));
     }
-    let status: c_int = match backend {
+    let status: Qwen36BridgeStatus = match backend {
         Backend::Hip | Backend::Cuda => {
             #[cfg(any(supersonic_backend_hip, supersonic_backend_cuda))]
             unsafe {
@@ -12771,13 +12729,11 @@ pub fn batched_prefill_attn_full_launch(
         }
         _ => unreachable!(),
     };
-    if status != 0 {
-        return Err(qwen36_backend_error(
-            backend,
-            "qwen36_moe batched_prefill_attn_full_launch",
-            status,
-        ));
-    }
+    qwen36_bridge_result(
+        backend,
+        "qwen36_moe batched_prefill_attn_full_launch",
+        status,
+    )?;
     Ok(())
 }
 
@@ -13090,7 +13046,7 @@ pub fn batched_prefill_router_permute_launch(
                 .to_string(),
         ));
     }
-    let status: c_int = match backend {
+    let status: Qwen36BridgeStatus = match backend {
         Backend::Hip | Backend::Cuda => {
             #[cfg(any(supersonic_backend_hip, supersonic_backend_cuda))]
             unsafe {
@@ -13130,13 +13086,11 @@ pub fn batched_prefill_router_permute_launch(
         }
         _ => unreachable!(),
     };
-    if status != 0 {
-        return Err(qwen36_backend_error(
-            backend,
-            "qwen36_moe batched_prefill_router_permute_launch",
-            status,
-        ));
-    }
+    qwen36_bridge_result(
+        backend,
+        "qwen36_moe batched_prefill_router_permute_launch",
+        status,
+    )?;
     Ok(())
 }
 
@@ -13191,7 +13145,7 @@ pub fn batched_prefill_grouped_expert_launch(
                 .to_string(),
         ));
     }
-    let status: c_int = match backend {
+    let status: Qwen36BridgeStatus = match backend {
         Backend::Hip | Backend::Cuda => {
             #[cfg(any(supersonic_backend_hip, supersonic_backend_cuda))]
             unsafe {
@@ -13248,13 +13202,11 @@ pub fn batched_prefill_grouped_expert_launch(
         }
         _ => unreachable!(),
     };
-    if status != 0 {
-        return Err(qwen36_backend_error(
-            backend,
-            "qwen36_moe batched_prefill_grouped_expert_launch",
-            status,
-        ));
-    }
+    qwen36_bridge_result(
+        backend,
+        "qwen36_moe batched_prefill_grouped_expert_launch",
+        status,
+    )?;
     let _ = (
         ordinal,
         n_tokens,
@@ -13311,7 +13263,7 @@ pub unsafe fn batched_prefill_grouped_expert_launch_raw(
                 .to_string(),
         ));
     }
-    let status: c_int = match backend {
+    let status: Qwen36BridgeStatus = match backend {
         Backend::Hip | Backend::Cuda => {
             #[cfg(any(supersonic_backend_hip, supersonic_backend_cuda))]
             {
@@ -13368,13 +13320,11 @@ pub unsafe fn batched_prefill_grouped_expert_launch_raw(
         }
         _ => unreachable!(),
     };
-    if status != 0 {
-        return Err(qwen36_backend_error(
-            backend,
-            "qwen36_moe batched_prefill_grouped_expert_launch_raw",
-            status,
-        ));
-    }
+    qwen36_bridge_result(
+        backend,
+        "qwen36_moe batched_prefill_grouped_expert_launch_raw",
+        status,
+    )?;
     Ok(())
 }
 
@@ -13410,7 +13360,7 @@ pub fn batched_prefill_unpermute_combine_launch(
                 .to_string(),
         ));
     }
-    let status: c_int = match backend {
+    let status: Qwen36BridgeStatus = match backend {
         Backend::Hip | Backend::Cuda => {
             #[cfg(any(supersonic_backend_hip, supersonic_backend_cuda))]
             unsafe {
@@ -13447,13 +13397,11 @@ pub fn batched_prefill_unpermute_combine_launch(
         }
         _ => unreachable!(),
     };
-    if status != 0 {
-        return Err(qwen36_backend_error(
-            backend,
-            "qwen36_moe batched_prefill_unpermute_combine_launch",
-            status,
-        ));
-    }
+    qwen36_bridge_result(
+        backend,
+        "qwen36_moe batched_prefill_unpermute_combine_launch",
+        status,
+    )?;
     Ok(())
 }
 

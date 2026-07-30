@@ -18,7 +18,7 @@ pub use backend::{
     MemoryArchitecture,
 };
 pub use buffer::{GpuBuffer, HostBuffer};
-pub use error::GpuError;
+pub use error::{BackendApi, GpuError};
 pub use ops::{
     copy_d2d, copy_d2h, copy_h2d, copy_h2d_async, copy_storage_to_device, hal_profile_enabled,
     hal_profile_reset, hal_profile_set_enabled, hal_profile_snapshot, memset_zeros,

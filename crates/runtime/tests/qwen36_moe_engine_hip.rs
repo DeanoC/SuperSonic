@@ -1,9 +1,16 @@
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use model_store::flm::{ARCH_QWEN3_6_MOE, MODEL_QWEN3_6_MOE_V1};
 use supersonic_core::registry::ModelVariant;
+use supersonic_runtime::generate::{collect, spawn, GenParams};
+use supersonic_runtime::prefix_cache::{CacheRequest, CacheRetention};
 use supersonic_runtime::qwen36_moe::engine::Qwen36MoeEngine;
-use supersonic_runtime::session::InferenceSession;
+use supersonic_runtime::session::{
+    InferenceSession, PrefixSnapshotOperation, UnsupportedPrefixSnapshot,
+};
 use supersonic_runtime::state::{
     build_resolved,
     model_source::{ModelSource, ResolvedModelSource},
@@ -26,7 +33,7 @@ fn dense_load_reset_and_reuse_preserve_resident_model_without_serving_allocation
         std::env::var_os("SUPERSONIC_QWEN36_35B_A3B_NO_HF_FLM")
             .expect("SUPERSONIC_QWEN36_35B_A3B_NO_HF_FLM must name the production FLM"),
     );
-    let state = build_resolved(
+    let state = Arc::new(build_resolved(
         LoaderConfig {
             model: ModelVariant::Qwen3_6_35B_A3B.to_string(),
             model_dir: flm_path.clone(),
@@ -60,7 +67,7 @@ fn dense_load_reset_and_reuse_preserve_resident_model_without_serving_allocation
             source: ModelSource::Flm(flm_path.clone()),
             model: ModelVariant::Qwen3_6_35B_A3B,
         },
-    )?;
+    )?);
     assert!(
         state.qwen36_moe_engine.is_none(),
         "FLM startup must not retain a compatibility engine owner"
@@ -70,8 +77,94 @@ fn dense_load_reset_and_reuse_preserve_resident_model_without_serving_allocation
         .as_ref()
         .expect("FLM startup must own the engine through InferenceSession");
     assert_eq!(std::sync::Arc::strong_count(session), 1);
+    let prompt = state
+        .tokenizer
+        .encode("Hello from Sofia", false)
+        .map_err(|error| anyhow::anyhow!("encode lifecycle prompt: {error}"))?
+        .get_ids()
+        .to_vec();
+    assert!(!prompt.is_empty());
+    {
+        let mut production_session = session.blocking_lock();
+        let features = production_session.features();
+        assert!(features.plain_prefill_decode);
+        assert!(!features.native_dflash_generate);
+        assert!(!features.prefix_snapshot);
+        assert!(!features.disk_prefix_snapshot);
+        assert_eq!(production_session.prefix_snapshot_bytes(1), usize::MAX);
+        for (operation, error) in [
+            (
+                PrefixSnapshotOperation::Capture,
+                production_session
+                    .snapshot_prefix(vec![1.0])
+                    .err()
+                    .expect("production snapshot capture must be unsupported"),
+            ),
+            (
+                PrefixSnapshotOperation::LoadDisk,
+                production_session
+                    .load_disk_prefix(b"snapshot")
+                    .err()
+                    .expect("production disk snapshot load must be unsupported"),
+            ),
+        ] {
+            let unsupported = error
+                .downcast_ref::<UnsupportedPrefixSnapshot>()
+                .expect("production Qwen3.6 snapshot failure must be typed");
+            assert_eq!(unsupported.operation(), operation);
+            assert_eq!(unsupported.session(), "Qwen3.6 MoE");
+        }
+        production_session.reset()?;
+        let logits = production_session.prefill_cancellable(&prompt, || false)?;
+        let token = greedy_token(&logits);
+        assert_eq!(
+            production_session.decode_step(token, prompt.len())?.len(),
+            248_320
+        );
+        production_session.reset()?;
+    }
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let generated = runtime.block_on(async {
+        let receiver = spawn(
+            state.clone(),
+            prompt.clone(),
+            GenParams {
+                temperature: 0.0,
+                top_p: 1.0,
+                max_tokens: 1,
+                stop: Vec::new(),
+                seed: Some(7),
+            },
+            Some(CacheRequest {
+                key: Some("production-qwen36".to_string()),
+                retention: CacheRetention::InMemory,
+                scope: "real-flm".to_string(),
+            }),
+        )?;
+        collect(receiver).await
+    })?;
+    assert_eq!(generated.stats.cached_prompt_tokens, 0);
+    let idle_deadline = Instant::now() + Duration::from_secs(10);
+    while state.scheduler.active.load(Ordering::SeqCst) != 0
+        || state.scheduler.queued.load(Ordering::SeqCst) != 0
+    {
+        assert!(
+            Instant::now() < idle_deadline,
+            "production Qwen3.6 worker did not release scheduler counters"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(state.scheduler.permits.available_permits(), 1);
+    let cache_stats = state.prefix_cache.stats();
+    assert_eq!(cache_stats.hits, 0);
+    assert_eq!(cache_stats.misses, 0);
+    assert_eq!(cache_stats.entries, 0);
+    session.blocking_lock().reset()?;
+
     let mut session = session.blocking_lock();
-    assert_eq!(session.prefix_snapshot_bytes(1), usize::MAX);
     let engine = match &mut *session {
         InferenceSession::Qwen36Moe(engine) => engine,
         _ => panic!("FLM startup must select the production Qwen3.6 session variant"),
@@ -193,13 +286,6 @@ fn dense_load_reset_and_reuse_preserve_resident_model_without_serving_allocation
         reset_profile.entries
     );
 
-    let prompt = engine
-        .tokenizer()
-        .encode("Hello from Sofia", false)
-        .map_err(|error| anyhow::anyhow!("encode lifecycle prompt: {error}"))?
-        .get_ids()
-        .to_vec();
-    assert!(!prompt.is_empty());
     let serving_load_sequence = Qwen36MoeEngine::test_only_observed_load_sequence();
     let serving_resident_pointers = after.resident_allocation_pointers.clone();
 

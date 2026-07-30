@@ -67,7 +67,7 @@ extern "C" {
         counters: *mut c_uint,
         barrier_counter: *mut c_uint,
         barrier_flag: *mut c_uint,
-    ) -> c_int;
+    ) -> Qwen36BridgeStatus;
 
     /// Phase 3e: persistent decode megakernel launcher. One cooperative
     /// HIP launch processes all `num_layers` of {attn or linear-attn, FFN}
@@ -149,7 +149,7 @@ extern "C" {
         counters: *mut c_uint,
         barrier_counter: *mut c_uint,
         barrier_flag: *mut c_uint,
-    ) -> c_int;
+    ) -> Qwen36BridgeStatus;
 
     /// PR 4b2 staged single-layer attention parity launcher. Runs the
     /// full-attention path through `stage` (1..=5) and writes the matching
@@ -212,7 +212,7 @@ extern "C" {
         counters: *mut c_uint,
         barrier_counter: *mut c_uint,
         barrier_flag: *mut c_uint,
-    ) -> c_int;
+    ) -> Qwen36BridgeStatus;
 
     /// PR 4b3 staged single-layer linear-attention parity launcher. Same
     /// staged-build-up discipline as `qwen36_moe_hip_attn_step_launch`,
@@ -275,7 +275,7 @@ extern "C" {
         counters: *mut c_uint,
         barrier_counter: *mut c_uint,
         barrier_flag: *mut c_uint,
-    ) -> c_int;
+    ) -> Qwen36BridgeStatus;
 
     /// PR 4b4 staged single-block MoE FFN parity launcher. Same staged-build-up
     /// discipline as `qwen36_moe_hip_attn_step_launch` and
@@ -332,7 +332,7 @@ extern "C" {
         gsz: c_int,
         dq_8_out: *mut f32,
         dq_scalar_out: *mut f32,
-    ) -> c_int;
+    ) -> Qwen36BridgeStatus;
 
     pub fn qwen36_moe_hip_ffn_step_launch(
         dtype: c_int,
@@ -370,7 +370,7 @@ extern "C" {
         counters: *mut c_uint,
         barrier_counter: *mut c_uint,
         barrier_flag: *mut c_uint,
-    ) -> c_int;
+    ) -> Qwen36BridgeStatus;
 
     /// Final RMSNorm + lm_head GEMV in a single kernel — replaces the
     /// host-side `host_final_norm_lm_head_f32` for qwen3.6-MoE.
@@ -403,7 +403,7 @@ extern "C" {
         // recurrent feed; null = base-decode behavior unchanged.
         x_normed_out: *mut c_void,
         counter: *mut c_uint,
-    ) -> c_int;
+    ) -> Qwen36BridgeStatus;
 
     /// FFI bridge for the batched lm_head WMMA kernel (Phase 6.4a). Wraps
     /// `qwen36_moe_lm_head_batched_wmma_kernel`. `m` is the runtime batch
@@ -425,7 +425,7 @@ extern "C" {
         lm_head_w: *const c_void,
         logits: *mut c_void,
         x_normed_out: *mut c_void,
-    ) -> c_int;
+    ) -> Qwen36BridgeStatus;
 
     /// FFI bridge for the MTP pre-fusion kernel (Phase 6.2c.1). Single-block
     /// launch: BF16 RMSNorms over `e_in` and `h_base` followed by a
@@ -446,7 +446,7 @@ extern "C" {
         e_norm_out: *mut c_void,
         h_norm_out: *mut c_void,
         fused_out: *mut c_void,
-    ) -> c_int;
+    ) -> Qwen36BridgeStatus;
 
     /// Stage A (M3) batched-Q full-attention prefill kernel. Standalone
     /// attention math: Q/K/V are pre-projected and pre-RoPE'd by the
@@ -484,7 +484,7 @@ extern "C" {
         key: *const c_void,
         value: *const c_void,
         out: *mut c_void,
-    ) -> c_int;
+    ) -> Qwen36BridgeStatus;
 
     /// Stage B (M9) router permutation kernel. Groups per-token top-K expert
     /// assignments by target expert (counting-sort, single block).
@@ -520,7 +520,7 @@ extern "C" {
         permuted_token_idx: *mut c_void,
         permuted_kpos: *mut c_void,
         permuted_weight: *mut c_void,
-    ) -> c_int;
+    ) -> Qwen36BridgeStatus;
 
     /// Stage B (M10) grouped-expert INT4 GEMM kernel. One launch processes
     /// ALL `num_experts` experts via persistent-block work-stealing on the
@@ -571,7 +571,7 @@ extern "C" {
         experts_down_zero: *const c_void,
         expert_out: *mut c_void,
         counters: *mut c_void,
-    ) -> c_int;
+    ) -> Qwen36BridgeStatus;
 
     /// Stage B (M11) unpermute + weighted combine kernel. Inverts the M9
     /// router permutation (host-built `permuted_inverse` table) and computes
@@ -606,7 +606,7 @@ extern "C" {
         permuted_weight: *const c_void,
         expert_out: *const c_void,
         combined: *mut c_void,
-    ) -> c_int;
+    ) -> Qwen36BridgeStatus;
 }
 
 /// Safe wrapper over the stub launch. The engine pre-allocates `sync_buf`
@@ -642,7 +642,7 @@ pub fn stub_launch(
     let barrier_counter = unsafe { (counters as *mut u8).add(64) as *mut c_uint };
     let barrier_flag = unsafe { (counters as *mut u8).add(68) as *mut c_uint };
 
-    let status: c_int = match backend {
+    let status: Qwen36BridgeStatus = match backend {
         Backend::Hip | Backend::Cuda => {
             #[cfg(any(supersonic_backend_hip, supersonic_backend_cuda))]
             unsafe {
@@ -670,12 +670,6 @@ pub fn stub_launch(
             ));
         }
     };
-    if status != 0 {
-        return Err(qwen36_backend_error(
-            backend,
-            "qwen36_moe stub launch",
-            status,
-        ));
-    }
+    qwen36_bridge_result(backend, "qwen36_moe stub launch", status)?;
     Ok(())
 }

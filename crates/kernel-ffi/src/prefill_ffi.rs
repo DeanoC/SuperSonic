@@ -982,6 +982,113 @@ fn ffi_error(msg: String) -> GpuError {
     }
 }
 
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PrefillBridgeStatus(i32);
+
+impl PrefillBridgeStatus {
+    // Native failures set bit 31, keep the project status in bits 16..30,
+    // and preserve the backend's 16-bit runtime status in bits 0..15.
+    const BACKEND_FAILURE_BIT: u32 = 1 << 31;
+
+    const fn project_status(self) -> i32 {
+        let raw = self.0 as u32;
+        if raw & Self::BACKEND_FAILURE_BIT == 0 {
+            self.0
+        } else {
+            ((raw >> 16) & 0x7fff) as i32
+        }
+    }
+
+    const fn native_status(self) -> i32 {
+        let raw = self.0 as u32;
+        if raw & Self::BACKEND_FAILURE_BIT == 0 {
+            0
+        } else {
+            (raw & 0xffff) as i32
+        }
+    }
+}
+
+fn prefill_bridge_result(
+    backend: Backend,
+    operation: &str,
+    raw_status: i32,
+) -> Result<(), GpuError> {
+    let status = PrefillBridgeStatus(raw_status);
+    let native_status = status.native_status();
+    if native_status != 0 {
+        return Err(GpuError::backend_status_in(
+            backend,
+            gpu_hal::BackendApi::Runtime,
+            operation,
+            native_status,
+        ));
+    }
+    let project_status = status.project_status();
+    if project_status != 0 {
+        return Err(GpuError::backend(
+            backend,
+            format!("{operation} failed with project status {project_status}"),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod typed_bridge_status_tests {
+    use super::*;
+
+    unsafe extern "C" {
+        fn supersonic_prefill_encode_bridge_status(
+            project_status: c_int,
+            native_status: c_int,
+        ) -> c_int;
+    }
+
+    fn encoded_status(project_status: i32, native_status: i32) -> i32 {
+        unsafe { supersonic_prefill_encode_bridge_status(project_status, native_status) }
+    }
+
+    #[test]
+    fn generic_prefill_status_conversion_preserves_native_and_project_failures() {
+        let native = prefill_bridge_result(Backend::Hip, "rms_norm_rows", encoded_status(302, 709))
+            .unwrap_err();
+        assert!(matches!(
+            native,
+            GpuError::DeviceLost {
+                backend: Backend::Hip,
+                api: gpu_hal::BackendApi::Runtime,
+                ref operation,
+                status: 709,
+            } if operation == "rms_norm_rows"
+        ));
+
+        let ordinary = prefill_bridge_result(Backend::Hip, "rms_norm_rows", encoded_status(301, 1))
+            .unwrap_err();
+        assert!(matches!(
+            ordinary,
+            GpuError::BackendStatus {
+                backend: Backend::Hip,
+                api: gpu_hal::BackendApi::Runtime,
+                ref operation,
+                status: 1,
+            } if operation == "rms_norm_rows"
+        ));
+
+        let validation =
+            prefill_bridge_result(Backend::Hip, "rms_norm_rows", encoded_status(340, 0))
+                .unwrap_err();
+        assert!(matches!(
+            validation,
+            GpuError::Backend {
+                backend: Backend::Hip,
+                ref message,
+            } if message == "rms_norm_rows failed with project status 340"
+        ));
+    }
+}
+
 unsafe extern "C" {
     // ---- Existing bridge functions (from full_attention_bridge.cpp) ----
 
@@ -2688,11 +2795,11 @@ pub fn full_attention_decode_flat(
             out.as_mut_ptr(),
         )
     };
-    if status != 0 {
-        return Err(ffi_error(format!(
-            "full_attention_decode_flat failed: {status}"
-        )));
-    }
+    prefill_bridge_result(
+        gpu_hal::current_backend(),
+        "full_attention_decode_flat",
+        status,
+    )?;
     Ok(())
 }
 
@@ -4304,9 +4411,7 @@ fn swiglu_mul_impl(
                 out.as_mut_ptr(),
             )
         };
-        if status != 0 {
-            return Err(ffi_error(format!("swiglu_mul failed: {status}")));
-        }
+        prefill_bridge_result(gpu_hal::current_backend(), "swiglu_mul", status)?;
         Ok(())
     })
 }
@@ -4435,11 +4540,11 @@ pub fn rms_norm_gated_sfirst_bf16(
                 out_sfirst.as_mut_ptr(),
             )
         };
-        if status != 0 {
-            return Err(ffi_error(format!(
-                "rms_norm_gated_sfirst_bf16 failed: {status}"
-            )));
-        }
+        prefill_bridge_result(
+            gpu_hal::current_backend(),
+            "rms_norm_gated_sfirst_bf16",
+            status,
+        )?;
         Ok(())
     })
 }
@@ -4718,9 +4823,7 @@ fn matmul_rhs_transposed_impl(
                 out.as_mut_ptr(),
             )
         };
-        if status != 0 {
-            return Err(ffi_error(format!("matmul_rhs_transposed failed: {status}")));
-        }
+        prefill_bridge_result(gpu_hal::current_backend(), "matmul_rhs_transposed", status)?;
         Ok(())
     })
 }
@@ -4989,11 +5092,11 @@ fn matmul_rhs_transposed_int4_impl(
                 out.as_mut_ptr(),
             )
         };
-        if status != 0 {
-            return Err(ffi_error(format!(
-                "matmul_rhs_transposed_int4 failed: {status}"
-            )));
-        }
+        prefill_bridge_result(
+            gpu_hal::current_backend(),
+            "matmul_rhs_transposed_int4",
+            status,
+        )?;
         Ok(())
     })
 }
@@ -5621,9 +5724,7 @@ fn rms_norm_rows_impl(
                 out.as_mut_ptr(),
             )
         };
-        if status != 0 {
-            return Err(ffi_error(format!("rms_norm_rows failed: {status}")));
-        }
+        prefill_bridge_result(gpu_hal::current_backend(), "rms_norm_rows", status)?;
         Ok(())
     })
 }
@@ -5691,9 +5792,7 @@ pub fn rms_norm_rows_plain(
                 out.as_mut_ptr(),
             )
         };
-        if status != 0 {
-            return Err(ffi_error(format!("rms_norm_rows_plain failed: {status}")));
-        }
+        prefill_bridge_result(gpu_hal::current_backend(), "rms_norm_rows_plain", status)?;
         Ok(())
     })
 }
@@ -5763,11 +5862,11 @@ pub fn rms_norm_rows_plain_inplace(
                 ptr,
             )
         };
-        if status != 0 {
-            return Err(ffi_error(format!(
-                "rms_norm_rows_plain_inplace failed: {status}"
-            )));
-        }
+        prefill_bridge_result(
+            gpu_hal::current_backend(),
+            "rms_norm_rows_plain_inplace",
+            status,
+        )?;
         Ok(())
     })
 }
@@ -5842,9 +5941,7 @@ fn element_add_inplace_impl(
             ptr,
         )
     };
-    if status != 0 {
-        return Err(ffi_error(format!("element_add_inplace failed: {status}")));
-    }
+    prefill_bridge_result(gpu_hal::current_backend(), "element_add_inplace", status)?;
     Ok(())
 }
 
@@ -6026,9 +6123,7 @@ fn cast_impl(
                 out.as_mut_ptr(),
             )
         };
-        if status != 0 {
-            return Err(ffi_error(format!("cast failed: {status}")));
-        }
+        prefill_bridge_result(gpu_hal::current_backend(), "cast", status)?;
         Ok(())
     })
 }
@@ -6069,9 +6164,7 @@ pub fn element_add(
                 out.as_mut_ptr(),
             )
         };
-        if status != 0 {
-            return Err(ffi_error(format!("element_add failed: {status}")));
-        }
+        prefill_bridge_result(gpu_hal::current_backend(), "element_add", status)?;
         Ok(())
     })
 }
@@ -6124,9 +6217,7 @@ pub fn argmax_bf16_rows(
                 out_index.as_mut_ptr(),
             )
         };
-        if status != 0 {
-            return Err(ffi_error(format!("argmax_bf16_rows failed: {status}")));
-        }
+        prefill_bridge_result(gpu_hal::current_backend(), "argmax_bf16_rows", status)?;
         Ok(())
     })
 }
@@ -6240,9 +6331,7 @@ fn apply_rope_prefill_impl(
                 data.as_mut_ptr(),
             )
         };
-        if status != 0 {
-            return Err(ffi_error(format!("apply_rope_prefill failed: {status}")));
-        }
+        prefill_bridge_result(gpu_hal::current_backend(), "apply_rope_prefill", status)?;
         Ok(())
     })
 }
@@ -6309,11 +6398,11 @@ pub fn apply_rope_prefill_indirect(
             data.as_mut_ptr(),
         )
     };
-    if status != 0 {
-        return Err(ffi_error(format!(
-            "apply_rope_prefill_indirect failed: {status}"
-        )));
-    }
+    prefill_bridge_result(
+        gpu_hal::current_backend(),
+        "apply_rope_prefill_indirect",
+        status,
+    )?;
     Ok(())
 }
 
@@ -6415,11 +6504,11 @@ pub fn lookahead_attention_scores(
             scores.as_mut_ptr(),
         )
     };
-    if status != 0 {
-        return Err(ffi_error(format!(
-            "lookahead_attention_scores failed: {status}"
-        )));
-    }
+    prefill_bridge_result(
+        gpu_hal::current_backend(),
+        "lookahead_attention_scores",
+        status,
+    )?;
     Ok(())
 }
 
@@ -6513,9 +6602,7 @@ pub fn pflash_cosine_score(
             scores.as_mut_ptr(),
         )
     };
-    if status != 0 {
-        return Err(ffi_error(format!("pflash_cosine_score failed: {status}")));
-    }
+    prefill_bridge_result(gpu_hal::current_backend(), "pflash_cosine_score", status)?;
     Ok(())
 }
 
@@ -6591,9 +6678,7 @@ fn transpose_shd_hsd_impl(
                 dst.as_mut_ptr(),
             )
         };
-        if status != 0 {
-            return Err(ffi_error(format!("transpose_shd_hsd failed: {status}")));
-        }
+        prefill_bridge_result(gpu_hal::current_backend(), "transpose_shd_hsd", status)?;
         Ok(())
     })
 }
@@ -6628,11 +6713,7 @@ pub fn transpose_shd_hsd_pair(
                 dst_b.as_mut_ptr(),
             )
         };
-        if status != 0 {
-            return Err(ffi_error(format!(
-                "transpose_shd_hsd_pair failed: {status}"
-            )));
-        }
+        prefill_bridge_result(gpu_hal::current_backend(), "transpose_shd_hsd_pair", status)?;
         Ok(())
     })
 }
@@ -6680,11 +6761,11 @@ pub fn transpose_shd_to_cache_bf16(
                 cache.as_mut_ptr(),
             )
         };
-        if status != 0 {
-            return Err(ffi_error(format!(
-                "transpose_shd_to_cache_bf16 failed: {status}"
-            )));
-        }
+        prefill_bridge_result(
+            gpu_hal::current_backend(),
+            "transpose_shd_to_cache_bf16",
+            status,
+        )?;
         Ok(())
     })
 }
@@ -6728,9 +6809,7 @@ pub fn transpose_pad_conv(
                 dst.as_mut_ptr(),
             )
         };
-        if status != 0 {
-            return Err(ffi_error(format!("transpose_pad_conv failed: {status}")));
-        }
+        prefill_bridge_result(gpu_hal::current_backend(), "transpose_pad_conv", status)?;
         Ok(())
     })
 }
@@ -6773,9 +6852,7 @@ pub fn extract_conv_state(
                 dst.as_mut_ptr(),
             )
         };
-        if status != 0 {
-            return Err(ffi_error(format!("extract_conv_state failed: {status}")));
-        }
+        prefill_bridge_result(gpu_hal::current_backend(), "extract_conv_state", status)?;
         Ok(())
     })
 }
@@ -6812,11 +6889,11 @@ pub fn prepare_conv_input_tail(
                 new_tail.as_mut_ptr(),
             )
         };
-        if status != 0 {
-            return Err(ffi_error(format!(
-                "prepare_conv_input_tail failed: {status}"
-            )));
-        }
+        prefill_bridge_result(
+            gpu_hal::current_backend(),
+            "prepare_conv_input_tail",
+            status,
+        )?;
         Ok(())
     })
 }
@@ -6881,9 +6958,7 @@ fn sigmoid_mul_impl(
                 out.as_mut_ptr(),
             )
         };
-        if status != 0 {
-            return Err(ffi_error(format!("sigmoid_mul failed: {status}")));
-        }
+        prefill_bridge_result(gpu_hal::current_backend(), "sigmoid_mul", status)?;
         Ok(())
     })
 }
@@ -6913,9 +6988,7 @@ pub fn sigmoid_mul_inplace(
                 data.as_mut_ptr(),
             )
         };
-        if status != 0 {
-            return Err(ffi_error(format!("sigmoid_mul_inplace failed: {status}")));
-        }
+        prefill_bridge_result(gpu_hal::current_backend(), "sigmoid_mul_inplace", status)?;
         Ok(())
     })
 }
@@ -6959,11 +7032,11 @@ pub fn cast_transpose_gate_hsd_to_shd_bf16(
                 out_shd.as_mut_ptr(),
             )
         };
-        if status != 0 {
-            return Err(ffi_error(format!(
-                "cast_transpose_gate_hsd_to_shd_bf16 failed: {status}"
-            )));
-        }
+        prefill_bridge_result(
+            gpu_hal::current_backend(),
+            "cast_transpose_gate_hsd_to_shd_bf16",
+            status,
+        )?;
         Ok(())
     })
 }
@@ -7067,9 +7140,7 @@ pub fn compute_beta_g(
                 g.as_mut_ptr(),
             )
         };
-        if status != 0 {
-            return Err(ffi_error(format!("compute_beta_g failed: {status}")));
-        }
+        prefill_bridge_result(gpu_hal::current_backend(), "compute_beta_g", status)?;
         Ok(())
     })
 }
@@ -7097,11 +7168,7 @@ pub fn compute_beta_g_ba_bf16(
                 g.as_mut_ptr(),
             )
         };
-        if status != 0 {
-            return Err(ffi_error(format!(
-                "compute_beta_g_ba_bf16 failed: {status}"
-            )));
-        }
+        prefill_bridge_result(gpu_hal::current_backend(), "compute_beta_g_ba_bf16", status)?;
         Ok(())
     })
 }
@@ -7155,11 +7222,11 @@ pub fn project_ba_compute_beta_g_bf16(
                 g.as_mut_ptr(),
             )
         };
-        if status != 0 {
-            return Err(ffi_error(format!(
-                "project_ba_compute_beta_g_bf16 failed: {status}"
-            )));
-        }
+        prefill_bridge_result(
+            gpu_hal::current_backend(),
+            "project_ba_compute_beta_g_bf16",
+            status,
+        )?;
         Ok(())
     })
 }
@@ -7252,9 +7319,7 @@ fn split_qgate_impl(
                 gate_out.as_mut_ptr(),
             )
         };
-        if status != 0 {
-            return Err(ffi_error(format!("split_qgate failed: {status}")));
-        }
+        prefill_bridge_result(gpu_hal::current_backend(), "split_qgate", status)?;
         Ok(())
     })
 }
@@ -7307,9 +7372,7 @@ pub fn split_qgate_norm_bf16(
                 gate_out.as_mut_ptr(),
             )
         };
-        if status != 0 {
-            return Err(ffi_error(format!("split_qgate_norm_bf16 failed: {status}")));
-        }
+        prefill_bridge_result(gpu_hal::current_backend(), "split_qgate_norm_bf16", status)?;
         Ok(())
     })
 }
@@ -7357,9 +7420,7 @@ pub fn split_qkv(
                 v.as_mut_ptr(),
             )
         };
-        if status != 0 {
-            return Err(ffi_error(format!("split_qkv failed: {status}")));
-        }
+        prefill_bridge_result(gpu_hal::current_backend(), "split_qkv", status)?;
         Ok(())
     })
 }
@@ -7392,9 +7453,7 @@ pub fn split_qkv_bf16_to_f32(
                 v.as_mut_ptr(),
             )
         };
-        if status != 0 {
-            return Err(ffi_error(format!("split_qkv_bf16_to_f32 failed: {status}")));
-        }
+        prefill_bridge_result(gpu_hal::current_backend(), "split_qkv_bf16_to_f32", status)?;
         Ok(())
     })
 }
@@ -7423,9 +7482,7 @@ pub fn split_kv_bf16(
                 v.as_mut_ptr(),
             )
         };
-        if status != 0 {
-            return Err(ffi_error(format!("split_kv_bf16 failed: {status}")));
-        }
+        prefill_bridge_result(gpu_hal::current_backend(), "split_kv_bf16", status)?;
         Ok(())
     })
 }
@@ -7466,11 +7523,11 @@ pub fn split_norm_transpose_qkv_bf16(
                 v.as_mut_ptr(),
             )
         };
-        if status != 0 {
-            return Err(ffi_error(format!(
-                "split_norm_transpose_qkv_bf16 failed: {status}"
-            )));
-        }
+        prefill_bridge_result(
+            gpu_hal::current_backend(),
+            "split_norm_transpose_qkv_bf16",
+            status,
+        )?;
         Ok(())
     })
 }
@@ -7501,9 +7558,7 @@ pub fn split_qkvz_bf16(
                 z.as_mut_ptr(),
             )
         };
-        if status != 0 {
-            return Err(ffi_error(format!("split_qkvz_bf16 failed: {status}")));
-        }
+        prefill_bridge_result(gpu_hal::current_backend(), "split_qkvz_bf16", status)?;
         Ok(())
     })
 }
@@ -7551,11 +7606,11 @@ pub fn repeat_interleave_heads(
                 dst.as_mut_ptr(),
             )
         };
-        if status != 0 {
-            return Err(ffi_error(format!(
-                "repeat_interleave_heads failed: {status}"
-            )));
-        }
+        prefill_bridge_result(
+            gpu_hal::current_backend(),
+            "repeat_interleave_heads",
+            status,
+        )?;
         Ok(())
     })
 }
@@ -7605,11 +7660,11 @@ pub fn repeat_interleave_transpose_hsd(
                 dst.as_mut_ptr(),
             )
         };
-        if status != 0 {
-            return Err(ffi_error(format!(
-                "repeat_interleave_transpose_hsd failed: {status}"
-            )));
-        }
+        prefill_bridge_result(
+            gpu_hal::current_backend(),
+            "repeat_interleave_transpose_hsd",
+            status,
+        )?;
         Ok(())
     })
 }
